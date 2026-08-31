@@ -98,6 +98,47 @@ func TestSQLViewExpansionNestedAliasesExecuteDifferentially(t *testing.T) {
 	}
 }
 
+func TestSQLViewExpansionSuppressesDefinitionOwnedComparisonPositions(t *testing.T) {
+	const definitionSource = `SELECT CASE WHEN a != b THEN 1 ELSE 0 END AS changed
+		FROM docs WHERE a <= b`
+	definition := SQLViewDefinition{Name: "compared", Query: definitionSource}
+	const outerSource = `SELECT changed FROM compared`
+	outer, err := sqlast.Parse(outerSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ExpandSQLViews(outerSource, outer, sqlViewMap{
+		"compared": definition,
+	}, SQLViewExpansionOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	expanded := outer.From[0].Query
+	if expanded == nil || expanded.Where == nil || expanded.Where.Value.Pos != -1 {
+		t.Fatalf("expanded WHERE comparison position = %+v, want unavailable", expanded)
+	}
+	searched := expanded.Columns[0].Scalar.Whens[0].Predicate
+	if searched == nil || searched.Value.Pos != -1 {
+		t.Fatalf("expanded CASE comparison = %+v, want unavailable position", searched)
+	}
+
+	// CREATE VIEW validation owns definitionSource and must keep using its
+	// exact offsets. Only a catalog definition rewritten into another source
+	// loses a meaningful client position.
+	direct, _, err := ExpandSQLViewDefinition(
+		definition, sqlViewMap{}, SQLViewExpansionOptions{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := direct.Where.Value.Pos, strings.Index(definitionSource, "<="); got != want {
+		t.Fatalf("direct definition WHERE position = %d, want %d", got, want)
+	}
+	directSearched := direct.Columns[0].Scalar.Whens[0].Predicate
+	if got, want := directSearched.Value.Pos, strings.Index(definitionSource, "!="); got != want {
+		t.Fatalf("direct definition CASE position = %d, want %d", got, want)
+	}
+}
+
 func TestSQLViewExpansionFailureNeverPublishesPartialAST(t *testing.T) {
 	views := sqlViewMap{
 		"good": {Name: "good", Query: `SELECT id FROM docs`},

@@ -31,13 +31,14 @@ type statementRelationJoin struct {
 	activeBytes [2]int64
 	final       *relationSpool
 
-	buckets []int32
-	next    []int32
-	hashes  []uint64
-	matched []uint32
-	epoch   uint32
-	seed    maphash.Seed
-	seeded  bool
+	buckets  []int32
+	next     []int32
+	hashes   []uint64
+	matched  []uint32
+	keyKinds []uint8
+	epoch    uint32
+	seed     maphash.Seed
+	seeded   bool
 
 	leftText    []byte
 	rightText   []byte
@@ -112,6 +113,12 @@ type relationJoinContains struct {
 	needle vibejson.Index
 }
 
+type relationJoinComparison struct {
+	left, right *sqlast.PathExpr
+	op          Op
+	pos         int
+}
+
 type relationJoinStage struct {
 	ref           *sqlast.TableRef
 	index         int
@@ -119,9 +126,15 @@ type relationJoinStage struct {
 	rightOffset   int
 	outputColumns int
 	keys          []relationJoinKey
-	using         []relationJoinUsing
-	contains      []relationJoinContains
-	algorithm     string
+	// keyPositions and keyReversed are cold SQL-diagnostic provenance. Keeping
+	// them parallel to keys preserves the compact relationJoinKey used by every
+	// hash/probe row while retaining the authored operator and operand order.
+	keyPositions []int
+	keyReversed  []bool
+	using        []relationJoinUsing
+	contains     []relationJoinContains
+	comparisons  []relationJoinComparison
+	algorithm    string
 }
 
 func (s *Statement) relationJoin() *statementRelationJoin {
@@ -303,6 +316,8 @@ func (s *Statement) prepareRelationJoin(
 			return fmt.Errorf("query: joined relation %q has no condition", stage.ref.Alias)
 		}
 		stage.keys = make([]relationJoinKey, len(cond.Keys))
+		stage.keyPositions = make([]int, len(cond.Keys))
+		stage.keyReversed = make([]bool, len(cond.Keys))
 		for k := range cond.Keys {
 			left, err := j.preparePath(cond.Keys[k].Left)
 			if err != nil {
@@ -314,6 +329,8 @@ func (s *Statement) prepareRelationJoin(
 			}
 			right.column -= stage.rightOffset
 			stage.keys[k] = relationJoinKey{left: left, right: right}
+			stage.keyPositions[k], stage.keyReversed[k] =
+				relationJoinKeyOperatorOrigin(cond, &cond.Keys[k])
 		}
 		stage.algorithm = "bounded-nested-loop"
 		if len(stage.keys) != 0 {
@@ -339,6 +356,38 @@ func (s *Statement) prepareRelationJoin(
 		}
 	}
 	return s.validateRelationReferences()
+}
+
+func relationJoinKeyOperatorOrigin(
+	condition *sqlast.JoinCond,
+	key *sqlast.JoinKeyCond,
+) (int, bool) {
+	if condition == nil || key == nil {
+		return -1, false
+	}
+	// PostgreSQL's synthesized USING equality has no authored operator token:
+	// undefined-operator diagnostics carry SQLSTATE/message but no position,
+	// even for a direct statement. Never substitute a column-name/key offset.
+	if condition.Using || condition.Expr == nil {
+		return -1, false
+	}
+	terms := []*sqlast.Expr{condition.Expr}
+	if condition.Expr != nil && condition.Expr.Kind == sqlast.ExprAnd {
+		terms = condition.Expr.Kids
+	}
+	for _, term := range terms {
+		if term == nil || term.Kind != sqlast.ExprCompare ||
+			term.Op != sqlast.OpEq || term.RightPath == nil {
+			continue
+		}
+		if term.Path == key.Left && term.RightPath == key.Right {
+			return term.Value.Pos, false
+		}
+		if term.Path == key.Right && term.RightPath == key.Left {
+			return term.Value.Pos, true
+		}
+	}
+	return -1, false
 }
 
 func (s *Statement) positionRelationJoinError(err error, path *sqlast.PathExpr) error {
@@ -508,6 +557,12 @@ func (j *statementRelationJoin) prepareExpr(expr *sqlast.Expr, stage *relationJo
 		}
 		stage.contains = append(stage.contains, relationJoinContains{
 			expr: expr, needle: needle,
+		})
+	}
+	if expr.Kind == sqlast.ExprCompare && expr.RightPath != nil {
+		stage.comparisons = append(stage.comparisons, relationJoinComparison{
+			left: expr.Path, right: expr.RightPath,
+			op: Op(expr.Op), pos: expr.Value.Pos,
 		})
 	}
 	if expr.Kind == sqlast.ExprLike && expr.Value.Kind == sqlast.OperandString {
@@ -815,12 +870,19 @@ func (j *statementRelationJoin) prepareStageWorkspace(
 	limit int64,
 	cancel *CancelFlag,
 ) (int64, error) {
+	if err := j.validateStageComparisonDomains(
+		stage, left, right, cancel,
+	); err != nil {
+		return 0, err
+	}
 	matchedBytes := int64(0)
 	if stage.ref.Join == sqlast.JoinFull {
 		matchedBytes = saturatedProduct(int64(right.rows), int64(unsafe.Sizeof(uint32(0))))
 	}
 	base := matchedBytes
 	if len(stage.keys) != 0 {
+		j.keyKinds = resize(j.keyKinds, len(stage.keys))
+		clear(j.keyKinds)
 		bucketCount, err := joinBuildBuckets(buildRows)
 		if err != nil {
 			return 0, err
@@ -851,7 +913,7 @@ func (j *statementRelationJoin) prepareStageWorkspace(
 				return 0, err
 			}
 			hash, known, err := j.hashStageRow(
-				stage, left, right, row, buildRight,
+				stage, left, right, row, buildRight, true,
 			)
 			if err != nil {
 				return 0, err
@@ -891,17 +953,169 @@ func (j *statementRelationJoin) prepareStageWorkspace(
 	return base, cancellationError(cancel)
 }
 
+// validateStageComparisonDomains resolves every authored path-to-path ON
+// operator before pair evaluation. Boolean short-circuiting and an empty hash
+// bucket may decide that no pair needs the residual value, but PostgreSQL has
+// already resolved its operator by then. Runtime-typed relations approximate
+// that static step from every live domain on each operand, without retaining
+// source text or allocating per execution.
+func (j *statementRelationJoin) validateStageComparisonDomains(
+	stage *relationJoinStage,
+	left, right *relationSpool,
+	cancel *CancelFlag,
+) error {
+	for at := range stage.comparisons {
+		if err := cancellationCheckpoint(cancel, at); err != nil {
+			return err
+		}
+		comparison := &stage.comparisons[at]
+		leftKinds, leftCount, err := j.stagePathKinds(
+			stage, comparison.left, left, right, -1, cancel,
+		)
+		if err != nil {
+			return err
+		}
+		rightKinds, rightCount, err := j.stagePathKinds(
+			stage, comparison.right, left, right, -1, cancel,
+		)
+		if err != nil {
+			return err
+		}
+		for l := 0; l < leftCount; l++ {
+			for r := 0; r < rightCount; r++ {
+				if _, err := compareSQLPathScalars(
+					comparison.pos,
+					scalar{kind: leftKinds[l]}, comparison.op,
+					scalar{kind: rightKinds[r]},
+				); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return cancellationError(cancel)
+}
+
+// validateLateralStageComparisonDomains is the APPLY counterpart of
+// validateStageComparisonDomains. Each materialized right relation belongs to
+// exactly one left row, so combining domains across different APPLY
+// invocations could invent comparisons PostgreSQL never evaluates. Authored
+// comparison order remains outermost, matching analysis-time operator
+// resolution; rows only supply the runtime domains for that comparison.
+func (j *statementRelationJoin) validateLateralStageComparisonDomains(
+	stage *relationJoinStage,
+	left *relationSpool,
+	rights []relationSpool,
+	cancel *CancelFlag,
+) error {
+	for at := range stage.comparisons {
+		if err := cancellationCheckpoint(cancel, at); err != nil {
+			return err
+		}
+		comparison := &stage.comparisons[at]
+		for lrow := 0; lrow < left.rows; lrow++ {
+			if err := cancellationCheckpoint(cancel, lrow); err != nil {
+				return err
+			}
+			if lrow >= len(rights) {
+				return fmt.Errorf("query: LATERAL right relation is missing")
+			}
+			right := &rights[lrow]
+			leftKinds, leftCount, err := j.stagePathKinds(
+				stage, comparison.left, left, right, lrow, cancel,
+			)
+			if err != nil {
+				return err
+			}
+			rightKinds, rightCount, err := j.stagePathKinds(
+				stage, comparison.right, left, right, lrow, cancel,
+			)
+			if err != nil {
+				return err
+			}
+			for l := 0; l < leftCount; l++ {
+				for r := 0; r < rightCount; r++ {
+					if _, err := compareSQLPathScalars(
+						comparison.pos,
+						scalar{kind: leftKinds[l]}, comparison.op,
+						scalar{kind: rightKinds[r]},
+					); err != nil {
+						return err
+					}
+				}
+			}
+		}
+	}
+	return cancellationError(cancel)
+}
+
+func (j *statementRelationJoin) stagePathKinds(
+	stage *relationJoinStage,
+	path *sqlast.PathExpr,
+	left, right *relationSpool,
+	leftRow int,
+	cancel *CancelFlag,
+) ([4]scalarKind, int, error) {
+	var kinds [4]scalarKind
+	prepared := j.preparedPath(path)
+	if prepared.column < 0 {
+		return kinds, 0, fmt.Errorf("query: ON path is not prepared")
+	}
+	spool := left
+	if path.MergedUsing == 0 && prepared.source == stage.index {
+		prepared.column -= stage.rightOffset
+		spool = right
+	}
+	lo, hi := 0, spool.rows
+	if spool == left && leftRow >= 0 {
+		if leftRow >= spool.rows {
+			return kinds, 0, fmt.Errorf("query: LATERAL left row is out of range")
+		}
+		lo, hi = leftRow, leftRow+1
+	}
+	count := 0
+	for row := lo; row < hi; row++ {
+		if err := cancellationCheckpoint(cancel, row-lo); err != nil {
+			return kinds, count, err
+		}
+		j.leftText = j.leftText[:0]
+		value, err := relationJoinPathScalar(
+			spool, row, prepared, &j.leftText,
+		)
+		if err != nil {
+			return kinds, count, err
+		}
+		if value.kind == kindNull {
+			continue
+		}
+		seen := false
+		for i := 0; i < count; i++ {
+			if kinds[i] == value.kind {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			kinds[count] = value.kind
+			count++
+		}
+	}
+	return kinds, count, cancellationError(cancel)
+}
+
 func (j *statementRelationJoin) hashStageRow(
 	stage *relationJoinStage,
 	left, right *relationSpool,
 	row int,
-	buildRight bool,
+	fromRight bool,
+	build bool,
 ) (uint64, bool, error) {
 	hash := uint64(0x9e3779b97f4a7c15)
+	known := true
 	for i := range stage.keys {
 		path := stage.keys[i].right
 		spool := right
-		if !buildRight {
+		if !fromRight {
 			path = stage.keys[i].left
 			spool = left
 		}
@@ -911,13 +1125,50 @@ func (j *statementRelationJoin) hashStageRow(
 			return 0, false, err
 		}
 		if value.kind == kindNull {
-			return 0, false, nil
+			known = false
+			continue
+		}
+		if build {
+			j.keyKinds[i] |= uint8(1) << value.kind
+		} else if err := validateRelationJoinKeyDomains(
+			stage.keyPositions[i], stage.keyReversed[i],
+			j.keyKinds[i], value, fromRight,
+		); err != nil {
+			return 0, false, err
 		}
 		part := hashJoinValue(j.seed, value)
 		hash ^= bits.RotateLeft64(part+uint64(i)*0x517cc1b727220a95, (i*17+11)&63)
 		hash *= 0x9ddfea08eb382d69
 	}
-	return hash, true, nil
+	return hash, known, nil
+}
+
+func validateRelationJoinKeyDomains(
+	operatorPos int,
+	reversed bool,
+	buildKinds uint8,
+	probe scalar,
+	probeRight bool,
+) error {
+	for kind := kindBool; kind <= kindContainer; kind++ {
+		if buildKinds&(uint8(1)<<kind) == 0 {
+			continue
+		}
+		built := scalar{kind: kind}
+		left, right := probe, built
+		if probeRight {
+			left, right = built, probe
+		}
+		if reversed {
+			left, right = right, left
+		}
+		if _, err := compareSQLPathScalars(
+			operatorPos, left, Eq, right,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func relationJoinPathScalar(
@@ -958,7 +1209,7 @@ func (j *statementRelationJoin) probeHash(
 	if !probeRight {
 		row = lrow
 	}
-	return j.hashStageRow(stage, left, right, row, probeRight)
+	return j.hashStageRow(stage, left, right, row, probeRight, false)
 }
 
 func (j *statementRelationJoin) keysMatch(
@@ -981,7 +1232,17 @@ func (j *statementRelationJoin) keysMatch(
 		if err != nil {
 			return false, err
 		}
-		if lv.kind == kindNull || rv.kind == kindNull || compareScalar(lv, rv) != 0 {
+		leftValue, rightValue := lv, rv
+		if stage.keyReversed[i] {
+			leftValue, rightValue = rightValue, leftValue
+		}
+		value, err := compareSQLPathScalars(
+			stage.keyPositions[i], leftValue, Eq, rightValue,
+		)
+		if err != nil {
+			return false, err
+		}
+		if value != triTrue {
 			return false, nil
 		}
 	}
@@ -1326,10 +1587,11 @@ func (j *statementRelationJoin) evalJoinExpr(
 			if err != nil {
 				return triFalse, err
 			}
-			if cell.kind == kindNull || rightCell.kind == kindNull {
-				value = triUnknown
-			} else {
-				value = boolTri(acceptSign(compareScalar(cell, rightCell), Op(expr.Op)))
+			value, err = compareSQLPathScalars(
+				expr.Value.Pos, cell, Op(expr.Op), rightCell,
+			)
+			if err != nil {
+				return triFalse, err
 			}
 		} else {
 			lit, known, err := j.joinOperand(expr.Value, args)

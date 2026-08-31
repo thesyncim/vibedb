@@ -353,9 +353,14 @@ func TestSQLLateralCorrelationSlotsHeapDurableIndexDifferential(t *testing.T) {
 						if backend == "durable" {
 							bounded = childExec.Stats.IndexBounded && childExec.Stats.IndexLookups != 0
 						}
-						if indexed != bounded {
-							t.Fatalf("dynamic correlation index bounded = %v, want %v (heap probes=%d durable stats=%+v)",
-								bounded, indexed, childExec.Workspace.storeIndexProbes, childExec.Stats)
+						// A schemaless path comparison must visit every live inner value:
+						// an exact posting can contain the matches, but using it as a
+						// candidate boundary would hide an incompatible-domain row that
+						// PostgreSQL reports as an undefined operator. A future typed
+						// schema proof may lower to the bounded scalar-comparison lane.
+						if bounded {
+							t.Fatalf("unproven SQL path comparison used an index boundary (heap probes=%d durable stats=%+v)",
+								childExec.Workspace.storeIndexProbes, childExec.Stats)
 						}
 					})
 				}

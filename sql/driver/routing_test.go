@@ -81,6 +81,13 @@ func neExpr(name string, v sqlast.Operand) *sqlast.Expr {
 	return &sqlast.Expr{Kind: sqlast.ExprCompare, Op: sqlast.OpNe, Path: pathExpr(name), Value: v}
 }
 
+func pathEqExpr(left, right string) *sqlast.Expr {
+	return &sqlast.Expr{
+		Kind: sqlast.ExprCompare, Op: sqlast.OpEq,
+		Path: pathExpr(left), RightPath: pathExpr(right),
+	}
+}
+
 func inExpr(name string, vs ...sqlast.Operand) *sqlast.Expr {
 	return &sqlast.Expr{Kind: sqlast.ExprIn, Path: pathExpr(name), List: vs}
 }
@@ -115,6 +122,23 @@ func TestConstraintProgramBind(t *testing.T) {
 			args:    []any{"a"},
 			want:    []distribution.DomainKind{distribution.DomainFinite},
 			wantLen: []int{1},
+		},
+		{
+			name:    "path equality is unbindable",
+			binding: binding,
+			where:   pathEqExpr("tenant_id", "other_id"),
+			want:    []distribution.DomainKind{distribution.DomainUnknown},
+			wantLen: []int{-1},
+		},
+		{
+			name:    "path equality disables sibling shard constraint",
+			binding: binding,
+			where: &sqlast.Expr{Kind: sqlast.ExprAnd, Kids: []*sqlast.Expr{
+				eqExpr("tenant_id", strOp("tenant-a")),
+				pathEqExpr("value", "other_value"),
+			}},
+			want:    []distribution.DomainKind{distribution.DomainUnknown},
+			wantLen: []int{-1},
 		},
 		{
 			name:    "equality raw number parameter",

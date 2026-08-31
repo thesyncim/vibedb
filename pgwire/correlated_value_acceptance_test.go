@@ -33,12 +33,12 @@ func seedCorrelatedValueWire(t *testing.T, c *testClient) {
 			`('{"id":"b_unknown","tenant":"t1","region":"r1","probe":12}'),` +
 			`('{"id":"c_empty_null","tenant":"t3","region":"r3","probe":null}'),` +
 			`('{"id":"d_known_no_match","tenant":"t5","region":"r5","probe":9}'),` +
-			`('{"id":"e_object","tenant":"t4","region":"r4","probe":{"b":2,"a":1}}'),` +
+			`('{"id":"e_text","tenant":"t4","region":"r4","probe":"needle"}'),` +
 			`('{"id":"f_decimal","tenant":"t7","region":"r7","probe":9007199254740993.000}')`,
 		`INSERT INTO cv_wire_inner VALUES ` +
 			`('{"id":"t1-match","tenant":"t1","region":"r1","value":10,"enabled":true}'),` +
 			`('{"id":"t1-null","tenant":"t1","region":"r1","value":null,"enabled":true}'),` +
-			`('{"id":"t4-object","tenant":"t4","region":"r4","value":{"a":1,"b":2},"enabled":true}'),` +
+			`('{"id":"t4-text","tenant":"t4","region":"r4","value":"needle","enabled":true}'),` +
 			`('{"id":"t5-known","tenant":"t5","region":"r5","value":8,"enabled":true}'),` +
 			`('{"id":"t7-decimal","tenant":"t7","region":"r7","value":9007199254740993,"enabled":true}')`,
 	} {
@@ -88,7 +88,7 @@ func TestPGWireCorrelatedValueSimpleExtendedAndNamedPrepared(t *testing.T) {
 		`SELECT 1 FROM cv_wire_inner AS i WHERE i.tenant = o.tenant ` +
 		`AND i.region = o.region) ORDER BY o.id`
 	requireCorrelatedValueWireRows(t, c, c.query(compositeExists),
-		[]string{`"a_match"`, `"b_unknown"`, `"d_known_no_match"`, `"e_object"`, `"f_decimal"`})
+		[]string{`"a_match"`, `"b_unknown"`, `"d_known_no_match"`, `"e_text"`, `"f_decimal"`})
 	directNotExists := strings.Replace(compositeExists,
 		"WHERE EXISTS (", "WHERE NOT (EXISTS (", 1)
 	directNotExists = strings.Replace(directNotExists, ") ORDER BY", ")) ORDER BY", 1)
@@ -97,7 +97,7 @@ func TestPGWireCorrelatedValueSimpleExtendedAndNamedPrepared(t *testing.T) {
 
 	correlatedIn := strings.ReplaceAll(correlatedValueWirePreparedSQL, "$1", "TRUE")
 	requireCorrelatedValueWireRows(t, c, c.query(correlatedIn),
-		[]string{`"a_match"`, `"e_object"`, `"f_decimal"`})
+		[]string{`"a_match"`, `"e_text"`, `"f_decimal"`})
 	correlatedNotIn := strings.Replace(correlatedIn, "o.probe IN (", "o.probe NOT IN (", 1)
 	requireCorrelatedValueWireRows(t, c, c.query(correlatedNotIn),
 		[]string{`"c_empty_null"`, `"d_known_no_match"`})
@@ -109,7 +109,7 @@ func TestPGWireCorrelatedValueSimpleExtendedAndNamedPrepared(t *testing.T) {
 
 	extended := extendedSQL(c, correlatedValueWirePreparedSQL, [][]byte{[]byte("true")})
 	requireCorrelatedValueWireRows(t, c, extended,
-		[]string{`"a_match"`, `"e_object"`, `"f_decimal"`})
+		[]string{`"a_match"`, `"e_text"`, `"f_decimal"`})
 
 	c.send(msgParse, parseMsg("correlated-value", correlatedValueWirePreparedSQL))
 	c.send(msgSync, nil)
@@ -122,9 +122,9 @@ func TestPGWireCorrelatedValueSimpleExtendedAndNamedPrepared(t *testing.T) {
 		value string
 		want  []string
 	}{
-		{"true", []string{`"a_match"`, `"e_object"`, `"f_decimal"`}},
+		{"true", []string{`"a_match"`, `"e_text"`, `"f_decimal"`}},
 		{"false", nil},
-		{"true", []string{`"a_match"`, `"e_object"`, `"f_decimal"`}},
+		{"true", []string{`"a_match"`, `"e_text"`, `"f_decimal"`}},
 	} {
 		messages := executeCorrelatedExistsWirePrepared(c, "correlated-value",
 			"correlated-value-"+strconv.Itoa(i), [][]byte{[]byte(run.value)})
@@ -277,5 +277,5 @@ func TestPGWireCorrelatedValueCancellationPublishesNoProtocolResultAndRecovers(t
 	recovered := executeCorrelatedExistsWirePrepared(c, "cancel-correlated-value",
 		"recovered-correlated-value-portal", [][]byte{[]byte("true")})
 	requireCorrelatedValueWireRows(t, c, recovered,
-		[]string{`"a_match"`, `"e_object"`, `"f_decimal"`})
+		[]string{`"a_match"`, `"e_text"`, `"f_decimal"`})
 }

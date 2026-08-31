@@ -88,17 +88,18 @@ type statementScalarDependencySpec struct {
 }
 
 type statementScalarPredicate struct {
-	kind     sqlast.ExprKind
-	op       sqlast.CmpOp
-	left     int32
-	right    int32
-	kids     []int32
-	negated  bool
-	pos      int
-	start    int32
-	end      int32
-	leftDom  scalarCaseDomain
-	rightDom scalarCaseDomain
+	kind        sqlast.ExprKind
+	op          sqlast.CmpOp
+	left        int32
+	right       int32
+	kids        []int32
+	negated     bool
+	pathCompare bool
+	pos         int
+	start       int32
+	end         int32
+	leftDom     scalarCaseDomain
+	rightDom    scalarCaseDomain
 }
 
 type statementScalarValue struct {
@@ -124,6 +125,7 @@ type statementScalarOrderRow struct {
 
 type statementScalarOrdered struct {
 	projectionEnd int
+	havingEnd     int
 	order         []statementScalarOrder
 	having        *havingProgram
 	rows          []statementScalarOrderRow
@@ -175,12 +177,15 @@ func selectHasScalar(tree *sqlast.SelectStmt) bool {
 			return true
 		}
 	}
-	return exprHasScalar(tree.Where)
+	return exprHasScalar(tree.Where) || exprHasScalar(tree.Having)
 }
 
 func selectNeedsPostScalarOrder(tree *sqlast.SelectStmt) bool {
 	if tree == nil || selectHasWindows(tree) {
 		return false
+	}
+	if exprHasScalar(tree.Having) {
+		return true
 	}
 	for i := range tree.OrderBy {
 		output := tree.OrderBy[i].Output - 1
@@ -199,7 +204,8 @@ func exprHasScalar(expr *sqlast.Expr) bool {
 	if expr == nil {
 		return false
 	}
-	if expr.Kind == sqlast.ExprScalarCompare || expr.Kind == sqlast.ExprScalarIsNull {
+	if expr.Kind == sqlast.ExprScalarCompare || expr.Kind == sqlast.ExprScalarIsNull ||
+		expr.Kind == sqlast.ExprScalarTruth {
 		return true
 	}
 	for _, kid := range expr.Kids {
@@ -263,7 +269,7 @@ func (s *Statement) prepareScalar(preserveUnknownOutput bool) error {
 	var outputStarts []int32
 	if postOrder {
 		runtime.ordered = new(statementScalarOrdered)
-		if s.tree.Having != nil {
+		if s.tree.Having != nil && !exprHasScalar(s.tree.Having) {
 			runtime.ordered.having = new(havingProgram)
 		}
 		outputStarts = make([]int32, 0, len(s.tree.Columns))
@@ -291,6 +297,22 @@ func (s *Statement) prepareScalar(preserveUnknownOutput bool) error {
 	}
 	if postOrder {
 		runtime.ordered.projectionEnd = len(runtime.nodes)
+		runtime.ordered.havingEnd = runtime.ordered.projectionEnd
+		if exprHasScalar(s.tree.Having) {
+			if !exprEntirelyScalar(s.tree.Having) {
+				return sqlast.NewFeatureNotSupportedError(
+					s.text, firstScalarExprPos(s.tree.Having),
+					"a computed HAVING predicate may combine only computed scalar boolean terms",
+				)
+			}
+			runtime.predRoots = append(runtime.predRoots, -1)
+			root, err := runtime.compilePredicate(s, s.tree.Having)
+			if err != nil {
+				return err
+			}
+			runtime.predRoots = append(runtime.predRoots, root)
+			runtime.ordered.havingEnd = len(runtime.nodes)
+		}
 		for i := range s.tree.OrderBy {
 			term := &s.tree.OrderBy[i]
 			var start, end, root int32
@@ -465,7 +487,10 @@ func firstScalarStatementPos(tree *sqlast.SelectStmt) int {
 			return tree.Columns[i].Scalar.Pos
 		}
 	}
-	return firstScalarExprPos(tree.Where)
+	if exprHasScalar(tree.Where) {
+		return firstScalarExprPos(tree.Where)
+	}
+	return firstScalarExprPos(tree.Having)
 }
 
 func firstScalarExprPos(expr *sqlast.Expr) int {
@@ -683,7 +708,7 @@ func exprEntirelyScalar(expr *sqlast.Expr) bool {
 		return false
 	}
 	switch expr.Kind {
-	case sqlast.ExprScalarCompare, sqlast.ExprScalarIsNull:
+	case sqlast.ExprScalarCompare, sqlast.ExprScalarIsNull, sqlast.ExprScalarTruth:
 		return true
 	case sqlast.ExprAnd, sqlast.ExprOr, sqlast.ExprNot:
 		for _, kid := range expr.Kids {
@@ -719,6 +744,12 @@ func (r *statementScalar) compilePredicate(s *Statement, expr *sqlast.Expr) (int
 		}
 		node.left, node.right = left, right
 	case sqlast.ExprScalarIsNull:
+		left, err := r.compileExpr(s, expr.ScalarLeft)
+		if err != nil {
+			return 0, err
+		}
+		node.left = left
+	case sqlast.ExprScalarTruth:
 		left, err := r.compileExpr(s, expr.ScalarLeft)
 		if err != nil {
 			return 0, err
@@ -1205,6 +1236,13 @@ func (r *statementScalar) evalPredicate(index int32) tri {
 		out = notTri(r.evalPredicate(node.kids[0]))
 	case sqlast.ExprScalarIsNull:
 		out = boolTri(r.values[node.left].value.kind == kindNull)
+	case sqlast.ExprScalarTruth:
+		value := r.values[node.left].value
+		if value.kind == kindNull {
+			out = triUnknown
+		} else {
+			out = boolTri(value.kind == kindBool && value.bval)
+		}
 	default:
 		left, right := r.values[node.left].value, r.values[node.right].value
 		if left.kind == kindNull || right.kind == kindNull {
@@ -1221,7 +1259,24 @@ func (r *statementScalar) evalPredicate(index int32) tri {
 
 func (r *statementScalar) keep() bool {
 	for _, root := range r.predRoots {
+		if root < 0 {
+			break
+		}
 		if r.evalPredicate(root) != triTrue {
+			return false
+		}
+	}
+	return true
+}
+
+func (r *statementScalar) keepHaving() bool {
+	having := false
+	for _, root := range r.predRoots {
+		if root < 0 {
+			having = true
+			continue
+		}
+		if having && r.evalPredicate(root) != triTrue {
 			return false
 		}
 	}
@@ -1515,6 +1570,23 @@ func (r *statementScalar) executeOrdered(
 		frame.intermediate.release(predicateCharge)
 		if !keep {
 			continue
+		}
+		if ordered.havingEnd > ordered.projectionEnd {
+			r.evalArena = r.evalArena[:0]
+			havingCharge := int64(0)
+			if err := r.evalNodes(
+				result, row, ordered.projectionEnd, ordered.havingEnd,
+				&r.evalArena, &exec.Workspace.aggregateBudget, &frame.intermediate,
+				&havingCharge, options.Cancel,
+			); err != nil {
+				frame.intermediate.release(havingCharge)
+				return Cursor{}, err
+			}
+			keep = r.keepHaving()
+			frame.intermediate.release(havingCharge)
+			if !keep {
+				continue
+			}
 		}
 		// HAVING reads the already-reduced dependency result. It must reject
 		// groups before any deferred sort key is evaluated and before

@@ -475,7 +475,8 @@ func asPGErrorAcyclic(err error) (mapped *pgError) {
 	}
 	var undefinedOperator *sqlast.UndefinedOperatorError
 	if errors.As(err, &undefinedOperator) {
-		return newError(sqlstateUndefinedFunction, undefinedOperator.Msg)
+		return newError(sqlstateUndefinedFunction, undefinedOperator.Msg).
+			withHint(undefinedOperator.SQLHint())
 	}
 	var duplicateCTE *sqlast.DuplicateCTEError
 	if errors.As(err, &duplicateCTE) {

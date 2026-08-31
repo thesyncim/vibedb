@@ -535,6 +535,12 @@ func (p *plan) runFileInto(
 		return fmt.Errorf("query: FromFile was given a nil snapshot")
 	}
 	stats := ExecStats{Workers: n.workers, RowsTotal: snapshot.Len()}
+	if rangeSource != nil && p.requiresSQLDomainScan() {
+		// A native primary range is an optimization hint over the complete
+		// snapshot, not a semantic source boundary. Runtime SQL operator
+		// resolution must see domains outside that range.
+		rangeSource = nil
+	}
 	if rangeSource != nil {
 		stats.PrimaryRangeBounded = true
 		result, boundedStats, runErr := p.runFileSnapshotBatched(
@@ -678,6 +684,7 @@ func (p *plan) runFileSnapshotBatched(
 	}
 	var skipFilter *durable.DataSkippingFilter
 	if candidateMasks == nil && overlay == nil && rangeSource == nil &&
+		!p.requiresSQLDomainScan() &&
 		work.remaining() >= durable.DataSkippingFilterMemoryBytes {
 		var enabled bool
 		enabled, err = p.fileDataSkippingFilter(

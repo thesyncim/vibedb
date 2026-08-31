@@ -55,6 +55,85 @@ func TestSQLScalarCaseSearchedSimpleNestedExactValuesAndSchema(t *testing.T) {
 	}
 }
 
+func TestSQLScalarCasePathComparisonsMatchWhereDomainsAndErrors(t *testing.T) {
+	segment := mustSegment(t,
+		`{"id":"equal","a":1,"b":1}`,
+		`{"id":"less","a":1,"b":2}`,
+		`{"id":"null","a":null,"b":2}`,
+		`{"id":"wide","a":9007199254740993,"b":9007199254740993.0}`,
+	)
+	statement, err := PrepareStatement(`SELECT id,
+		CASE WHEN a < b THEN 'less' WHEN a = b THEN 'equal' ELSE 'unknown' END
+		FROM docs ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var exec Exec
+	cursor, err := statement.RunInto(&exec, FromSegment(segment), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := [][2]string{
+		{`"equal"`, `"equal"`},
+		{`"less"`, `"less"`},
+		{`"null"`, `"unknown"`},
+		{`"wide"`, `"equal"`},
+	}
+	for row := range want {
+		if !cursor.Next() {
+			t.Fatalf("missing CASE path-comparison row %d", row)
+		}
+		for column := range want[row] {
+			if got := string(cursor.Cell(column).JSON()); got != want[row][column] {
+				t.Fatalf("row %d column %d = %s, want %s", row, column, got, want[row][column])
+			}
+		}
+	}
+	if cursor.Next() {
+		t.Fatal("unexpected CASE path-comparison row")
+	}
+
+	filtered, err := PrepareStatement(`SELECT id FROM docs
+		WHERE CASE WHEN NOT (a != b) THEN TRUE ELSE FALSE END = TRUE ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cursor, err = filtered.RunInto(&exec, FromSegment(segment), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{`"equal"`, `"wide"`} {
+		if !cursor.Next() || string(cursor.Cell(0).JSON()) != id {
+			t.Fatalf("CASE-in-WHERE row != %s", id)
+		}
+	}
+	if cursor.Next() {
+		t.Fatal("CASE-in-WHERE retained a false or UNKNOWN row")
+	}
+
+	const source = `SELECT CASE WHEN a != b THEN 1 ELSE 0 END FROM docs`
+	mismatch, err := PrepareStatement(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = mismatch.RunInto(&exec, FromSegment(mustSegment(t,
+		`{"a":1,"b":"1"}`,
+	)), nil)
+	var undefined *sqlast.UndefinedOperatorError
+	if !errors.As(err, &undefined) || undefined.Unpositioned ||
+		undefined.Left != "numeric" || undefined.Operator != "<>" ||
+		undefined.Right != "text" || undefined.Pos != strings.Index(source, "!=") {
+		t.Fatalf("CASE path mismatch = %T %+v", err, undefined)
+	}
+	var positioned *sqlast.ParseError
+	if !errors.As(err, &positioned) {
+		t.Fatalf("direct CASE path mismatch lost ParseError position: %T %v", err, err)
+	}
+	if exec.Result.RowCount != 0 {
+		t.Fatalf("failed CASE path comparison published %d rows", exec.Result.RowCount)
+	}
+}
+
 func TestSQLScalarCasePostgreSQLTypedCommonTypeValuesSchemaAndWarmAllocation(t *testing.T) {
 	statement, err := PrepareStatement(`SELECT
 		CASE WHEN TRUE THEN BOOL 't' ELSE 'off' END,

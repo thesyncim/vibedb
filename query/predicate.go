@@ -8,6 +8,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	sqlast "github.com/thesyncim/vibedb/sql"
 	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/document"
 	"github.com/thesyncim/vibejson/x/byteview"
@@ -31,15 +32,15 @@ const (
 // zero Predicate is not a valid condition — build one with a constructor.
 type Predicate struct {
 	kind predKind
-	// slot occupies padding that already preceded path. It is meaningful only
-	// for execution-bound internal leaves, so ordinary builder predicates keep
-	// both their size and their hot behavior.
+	// slot occupies padding that already preceded path. Internal leaves use it
+	// for a late-binding slot or, before compilation, a positioned diagnostic;
+	// ordinary builder predicates keep both their size and their hot behavior.
 	slot        int32
 	path        string
 	op          Op
 	value       any    // Cmp literal, inferred at compile
-	json        string // Contains needle
-	pattern     string // Like pattern, using '%' and '_' wildcards
+	json        string // Contains needle; predCmpPath right path
+	pattern     string // LIKE pattern
 	insensitive bool   // ILIKE uses Unicode simple case folding
 	values      []any  // In alternatives, inferred at compile
 	kids        []Predicate
@@ -85,7 +86,60 @@ const (
 	// predIsString is an internal SQL three-valued-logic guard for LIKE. It is
 	// not exported because the builder surface has no general JSON type tests.
 	predIsString
+	// predCmpPath is SQL's comparison between two extracted columns. It stays
+	// separate from predCmp so the literal comparison's optimized scan, probes,
+	// and object layout remain unchanged.
+	predCmpPath
+	// predCmpPathBound is the correlated form of predCmpPath: one local path is
+	// compared with one immutable outer scalar slot. It is deliberately not
+	// predCmpBound. A schemaless local collection may contain a live value whose
+	// SQL domain disagrees with the slot, and a scalar index would prune that row
+	// before the runtime can report PostgreSQL's undefined operator. Keeping a
+	// distinct kind makes every existing candidate and direct-answer switch fail
+	// closed to a full recheck unless a future schema proof explicitly lowers to
+	// the proven-domain predCmpBound lane.
+	predCmpPathBound
+	// predSQLInBound is the SQL-authored legacy JOIN leaf. Keeping it distinct
+	// from predInBound makes PostgreSQL domain validation opt-in at compile time:
+	// builder joins retain their existing hot match loop and total JSON order,
+	// while candidate planners that do not know this kind fail closed to a full
+	// scan and cannot prune a row that must raise 42883.
+	predSQLInBound
+	// predSQLAntiBound is the NOT EXISTS twin. It must not reuse predAntiBound:
+	// a live undefined equality operator aborts the statement before existential
+	// negation can turn an ordinary non-match into TRUE.
+	predSQLAntiBound
 )
+
+func comparePaths(left string, op Op, right string, operatorPos int) Predicate {
+	return Predicate{
+		kind: predCmpPath, slot: int32(operatorPos), path: left, op: op,
+		json: right,
+	}
+}
+
+// boundPathComparison is cold lowering provenance for a local-to-outer SQL
+// path comparison. Execution uses the normalized local-left operator, while
+// diagnostics retain the author's operand order and operator spelling. It is
+// carried through Predicate.value and then packed into compiledPredicate.lit,
+// so neither of the hot predicate structs grows.
+type boundPathComparison struct {
+	operatorPos int
+	authoredOp  Op
+	reversed    bool
+}
+
+func compareBoundPath(
+	local string,
+	op Op,
+	slot int,
+	comparison *boundPathComparison,
+) Predicate {
+	return Predicate{
+		kind: predCmpPathBound, path: local, op: op, slot: int32(slot),
+		value: comparison,
+	}
+}
 
 // Cmp compares the value at path against a typed literal. The literal's Go
 // type fixes the comparison type: bool, string, any signed or unsigned
@@ -365,11 +419,12 @@ type compiledPredicate struct {
 	lits    []scalar
 	needles []vibejson.Index
 
-	// slot addresses this node's late binding in the executing [Workspace],
-	// for predInBound and predAntiBound. It is an index rather than a pointer because a
-	// compiled plan is immutable and shared by every concurrent execution: the
-	// values a join collects belong to one Exec, so the plan may name where to
-	// find them but must never hold them.
+	// slot addresses this node's late binding in the executing [Workspace] for
+	// predInBound and predAntiBound, or the right extracted column for
+	// predCmpPath. It is an index rather than a pointer because a compiled plan
+	// is immutable and shared by every concurrent execution: the values a join
+	// collects belong to one Exec, so the plan may name where to find them but
+	// must never hold them.
 	slot int
 }
 
@@ -385,6 +440,40 @@ const inLinearMax = 8
 // recompilation of the same shape allocates none of them.
 func (c *compiler) compilePredicate(p Predicate, reg *pathRegistry) (*compiledPredicate, error) {
 	switch p.kind {
+	case predCmpPath:
+		left, err := c.addPath(reg, p.path)
+		if err != nil {
+			return nil, err
+		}
+		right, err := c.addPath(reg, p.json)
+		if err != nil {
+			return nil, err
+		}
+		cp := c.nodes.one()
+		*cp = compiledPredicate{
+			kind: predCmpPath, col: left, slot: right, op: p.op,
+			lit: scalar{ival: int64(p.slot)},
+		}
+		return cp, nil
+	case predCmpPathBound:
+		col, err := c.addPath(reg, p.path)
+		if err != nil {
+			return nil, err
+		}
+		provenance, ok := p.value.(*boundPathComparison)
+		if !ok || provenance == nil {
+			return nil, fmt.Errorf("query: correlated path comparison has no provenance")
+		}
+		cp := c.nodes.one()
+		*cp = compiledPredicate{
+			kind: predCmpPathBound, col: col, slot: int(p.slot), op: p.op,
+			lit: scalar{
+				ival: int64(provenance.operatorPos),
+				bval: provenance.reversed,
+				sval: sqlast.CmpOp(provenance.authoredOp).String(),
+			},
+		}
+		return cp, nil
 	case predCmp:
 		col, err := c.addPath(reg, p.path)
 		if err != nil {
@@ -799,6 +888,8 @@ func (p *compiledPredicate) readsColumn(col int) bool {
 		return false
 	case predCorrelationKnown:
 		return false
+	case predCmpPath:
+		return p.col == col || p.slot == col
 	default:
 		return p.col == col
 	}
@@ -912,6 +1003,35 @@ func (p *compiledPredicate) eval(cols [][]scalar, row int, s *evalScratch) bool 
 	switch p.kind {
 	case predCmp:
 		return evalCmp(cols[p.col][row], p.op, p.lit)
+	case predCmpPath:
+		if s.err != nil {
+			return false
+		}
+		left, right := cols[p.col][row], cols[p.slot][row]
+		value, err := compareSQLPathScalars(int(p.lit.ival), left, p.op, right)
+		if err != nil {
+			s.parkError(err)
+			return false
+		}
+		return value == triTrue
+	case predCmpPathBound:
+		if s.err != nil || p.slot < 0 || p.slot >= len(s.correlations) {
+			return false
+		}
+		left, right := cols[p.col][row], s.correlations[p.slot]
+		value, err := compareSQLPathScalars(int(p.lit.ival), left, p.op, right)
+		if err != nil {
+			// A left-authored outer operand was normalized to local-left execution.
+			// Reorient only the cold diagnostic; the already-normalized operator is
+			// exactly what the successful comparison must execute.
+			if comparison, ok := err.(*sqlPathComparisonError); ok && p.lit.bval {
+				comparison.left, comparison.right = comparison.right, comparison.left
+				comparison.operator = p.lit.sval
+			}
+			s.parkError(err)
+			return false
+		}
+		return value == triTrue
 	case predCmpBound:
 		if p.slot < 0 || p.slot >= len(s.correlations) {
 			return false
@@ -928,6 +1048,15 @@ func (p *compiledPredicate) eval(cols [][]scalar, row int, s *evalScratch) bool 
 		return cell.kind == kindString && likeMatch(p.pattern, cell.sval, p.insensitive)
 	case predInBound:
 		return s.binds[p.slot].matches(cols[p.col][row], &s.probes[p.slot])
+	case predSQLInBound:
+		return s.binds[p.slot].matchesSQL(
+			cols[p.col][row], &s.probes[p.slot], p.slot, joinOrigin(p.lit.ival),
+		)
+	case predSQLAntiBound:
+		matched := s.binds[p.slot].matchesSQL(
+			cols[p.col][row], &s.probes[p.slot], p.slot, joinOrigin(p.lit.ival),
+		)
+		return s.probes[p.slot].err == nil && !matched
 	case predAntiBound:
 		// This is existential negation, not SQL NOT applied to an UNKNOWN
 		// comparison. NULL/missing cannot find an equality partner, so matches

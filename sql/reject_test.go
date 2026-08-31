@@ -86,11 +86,9 @@ func TestRejectsSyntaxErrors(t *testing.T) {
 func TestRejectsNonPredicateExpressions(t *testing.T) {
 	runRejections(t, []rejection{
 		{"a bare path is not a condition", `SELECT a FROM t WHERE flag`, 26, "flag = TRUE"},
-		{"two paths do not compare", `SELECT a FROM t WHERE b = c`, 26, "right side of a comparison is a constant"},
 		{"NULL is not an operand", `SELECT a FROM t WHERE b = NULL`, 26, "IS NULL"},
 		{"NULL is not a membership alternative", `SELECT a FROM t WHERE b IN (1, NULL)`, 31, "IS NULL"},
 		{"an empty membership", `SELECT a FROM t WHERE b IN ()`, 28, "no alternatives"},
-		{"a double-quoted operand is an identifier", `SELECT a FROM t WHERE b = "x"`, 26, "single quotes"},
 		{"IS wants NULL or MISSING", `SELECT a FROM t WHERE b IS 1`, 27, "NULL or MISSING"},
 		{"IS TRUE", `SELECT a FROM t WHERE b IS TRUE`, 27, "flag = TRUE"},
 		{"NOT wants a leaf operator", `SELECT a FROM t WHERE b NOT 1`, 28, "IN, BETWEEN, or LIKE"},

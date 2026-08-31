@@ -95,7 +95,9 @@ type Join struct {
 	anti bool
 	// origin distinguishes an authored builder join from a proof-backed hidden
 	// SQL operator. Execution does not branch on it; EXPLAIN uses it to make the
-	// decorrelation decision observable.
+	// decorrelation decision observable. The high bits carry the cold catalog
+	// domain proof for SQL-created joins, preserving the pre-existing one-byte
+	// layout on 32-bit targets as well as native builds.
 	origin joinOrigin
 }
 
@@ -104,7 +106,31 @@ type joinOrigin uint8
 const (
 	joinOriginAuthored joinOrigin = iota
 	joinOriginDecorrelatedExists
+	// joinOriginSQL identifies the storage-aware JOIN selected by SQL lowering.
+	// The byte already exists in Join and planJoin; the distinct value lets the
+	// executor retain PostgreSQL's comparison-domain semantics without adding
+	// fields to either hot plan shape or changing builder joins.
+	joinOriginSQL
 )
+
+const joinOriginMask joinOrigin = 0x03
+
+func bareJoinOrigin(origin joinOrigin) joinOrigin {
+	return origin & joinOriginMask
+}
+
+func joinSQLDomain(origin joinOrigin) SQLPathDomain {
+	return SQLPathDomain(uint8(origin) >> 2)
+}
+
+func withJoinSQLDomain(origin joinOrigin, domain SQLPathDomain) joinOrigin {
+	return bareJoinOrigin(origin) | joinOrigin(uint8(domain)<<2)
+}
+
+func strictSQLJoinOrigin(origin joinOrigin) bool {
+	origin = bareJoinOrigin(origin)
+	return origin == joinOriginSQL || origin == joinOriginDecorrelatedExists
+}
 
 // JoinOn builds an equi-join against collection, matching each outer row's
 // value at outerPath against innerPath in the inner collection. innerPath is
@@ -248,18 +274,85 @@ func (c *compiler) compileJoins(q *Query, p *plan, values *pathRegistry) ([]*com
 		p.joins = append(p.joins, compiled)
 		if !compiled.left {
 			kind := predInBound
-			if compiled.anti {
+			if strictSQLJoinOrigin(compiled.origin) {
+				kind = predSQLInBound
+				if compiled.anti {
+					kind = predSQLAntiBound
+				}
+			} else if compiled.anti {
 				kind = predAntiBound
 			}
 			node := c.nodes.one()
 			*node = compiledPredicate{
 				kind: kind, col: compiled.outerPath, op: Eq, slot: compiled.slot,
 			}
+			if kind == predSQLInBound || kind == predSQLAntiBound {
+				node.lit.ival = int64(bareJoinOrigin(compiled.origin))
+			}
 			nodes = append(nodes, node)
 		}
 	}
 	c.planJoins = p.joins
 	return nodes, nil
+}
+
+// hasSQLJoinComparison is the no-I/O planner guard for runtime-typed legacy
+// SQL joins. Candidate pruning anywhere in the driving predicate could remove
+// a row whose ON comparison must report 42883, and LEFT JOIN has no predicate
+// leaf of its own, so the plan's cold join metadata is the authoritative test.
+func (p *plan) hasSQLJoinComparison() bool {
+	for i := range p.joins {
+		if runtimeSQLJoinComparison(&p.joins[i]) {
+			return true
+		}
+	}
+	return false
+}
+
+func runtimeSQLJoinComparison(join *planJoin) bool {
+	if join == nil {
+		return false
+	}
+	origin := bareJoinOrigin(join.origin)
+	return origin == joinOriginSQL ||
+		(origin == joinOriginDecorrelatedExists &&
+			joinSQLDomain(join.origin) == SQLPathDomainUnknown)
+}
+
+// validateSQLJoinOuterDomains resolves every runtime-typed SQL join operator
+// over the complete driving range before WHERE can short-circuit a row. The
+// columns are already filter columns because every join key is registered as
+// one; this pass therefore adds no extraction or storage and is absent from
+// builder joins and catalog-proven decorrelations. Row-major order preserves
+// the serial evaluator's first-error rule, including when parallel workers own
+// disjoint ascending ranges or durable batches complete out of order.
+func (p *plan) validateSQLJoinOuterDomains(
+	cols [][]scalar,
+	binds []joinBinding,
+	lo, hi int,
+	cancel *CancelFlag,
+) error {
+	if !p.hasSQLJoinComparison() {
+		return nil
+	}
+	for row := lo; row < hi; row++ {
+		if err := cancellationCheckpoint(cancel, row-lo); err != nil {
+			return err
+		}
+		for i := range p.joins {
+			join := &p.joins[i]
+			if !runtimeSQLJoinComparison(join) {
+				continue
+			}
+			if err := binds[join.slot].sqlComparisonError(
+				cols[join.outerPath][row], join.slot,
+				bareJoinOrigin(join.origin),
+			); err != nil {
+				return err
+			}
+		}
+	}
+	return cancellationError(cancel)
 }
 
 // conjoin ANDs the join leaves onto an existing WHERE, collapsing the two
@@ -332,6 +425,7 @@ func (c *compiler) compileJoin(j Join, index int, values *pathRegistry) (planJoi
 			return planJoin{}, err
 		}
 	}
+	ip.runtimeSQLPaths = ip.where.hasRuntimeSQLPathComparison()
 	ip.valuePaths = inner.paths
 	// Every inner column is a filter column. The inner side is not late
 	// materialized: its whole output is one join-key value per surviving row,
@@ -458,7 +552,12 @@ const (
 // pins is bounded by configuration rather than by the size of the largest
 // collection it ever ran against. [Workspace.Release] gives it back.
 type joinBinding struct {
-	mode joinBindMode
+	// sqlInnerKinds consumes the padding that already preceded lits, so SQL's
+	// cold diagnostic provenance does not widen a Workspace binding on either
+	// 32- or 64-bit targets. The compiled leaf/plan supplies its existing slot;
+	// this byte records only live domains observed on the build side.
+	mode          joinBindMode
+	sqlInnerKinds uint8
 
 	// lits is the collected inner join-key set, sorted by compareScalar and
 	// deduplicated exactly like a compile-time membership's. The deduplication
@@ -556,6 +655,7 @@ func (b *joinBinding) reset() {
 	clear(b.keys)
 	b.keys = b.keys[:0]
 	b.mode = joinBindNone
+	b.sqlInnerKinds = 0
 	b.snapshot = store.Snapshot{}
 	b.plan = nil
 	b.candidates = 0
@@ -682,6 +782,11 @@ func (j *planJoin) bind(
 		return fmt.Errorf(
 			"query: join: collection %q is not in the database snapshot", j.collection)
 	}
+	if runtimeSQLJoinComparison(j) && j.innerPath == joinPrimaryKey {
+		// Collection keys are a declared text domain even when the inner WHERE
+		// has no survivor (or the collection is empty).
+		b.sqlInnerKinds |= 1 << uint(kindString-1)
+	}
 
 	if j.fanOut {
 		// A fan-out clause has nothing to measure: the pairs have to be
@@ -692,6 +797,7 @@ func (j *planJoin) bind(
 			return err
 		}
 		b.mode = joinBindBuild
+		j.recordSQLInnerKinds(b)
 		if stats != nil {
 			stats.JoinBuilds++
 			stats.JoinBuildRows += uint64(len(b.build.rows))
@@ -730,6 +836,7 @@ func (j *planJoin) bind(
 	b.snapshot = inner
 	b.plan = j.inner
 	j.installStrategy(b, overflowed, stats)
+	j.recordSQLInnerKinds(b)
 	return b.scan.checkCanceled()
 }
 
@@ -842,9 +949,13 @@ func (j *planJoin) buildSide(
 			return err
 		}
 	}
-	masks, err := j.inner.storeCandidateMasks(inner, scan)
-	if err != nil {
-		return err
+	var masks []store.Mask
+	if !runtimeSQLJoinComparison(j) {
+		var err error
+		masks, err = j.inner.storeCandidateMasks(inner, scan)
+		if err != nil {
+			return err
+		}
 	}
 	if err := scan.checkCanceled(); err != nil {
 		return err
@@ -921,6 +1032,7 @@ func (j *planJoin) drainBuild(
 	); err != nil {
 		return err
 	}
+	j.observeSQLInnerKinds(b, ctx)
 	selected, err := j.inner.selectRows(ctx, nil, true, scan)
 	if err != nil {
 		return err
@@ -1000,9 +1112,13 @@ func (j *planJoin) collect(
 			return false, err
 		}
 	}
-	masks, err := j.inner.storeCandidateMasks(inner, scan)
-	if err != nil {
-		return false, err
+	var masks []store.Mask
+	if !runtimeSQLJoinComparison(j) {
+		var err error
+		masks, err = j.inner.storeCandidateMasks(inner, scan)
+		if err != nil {
+			return false, err
+		}
 	}
 	if err := scan.checkCanceled(); err != nil {
 		return false, err
@@ -1135,6 +1251,7 @@ func (j *planJoin) drain(
 	); err != nil {
 		return false, err
 	}
+	j.observeSQLInnerKinds(b, ctx)
 	selected, err := j.inner.selectRows(ctx, nil, true, scan)
 	if err != nil {
 		return false, err
@@ -1212,6 +1329,48 @@ func (j *planJoin) drain(
 		return true, nil
 	}
 	return false, nil
+}
+
+// recordSQLInnerKinds derives the live build-side domains once binding is
+// complete. It is a cold SQL-only pass: builder joins pay one origin check per
+// execution and keep every collection/bucket row loop exactly unchanged.
+// NULL/missing was already dropped by collection and records no domain.
+func (j *planJoin) recordSQLInnerKinds(b *joinBinding) {
+	if !strictSQLJoinOrigin(j.origin) {
+		return
+	}
+	switch b.mode {
+	case joinBindProbe:
+		// Only a physical-primary-key join can probe, and a key is text.
+		b.sqlInnerKinds |= 1 << uint(kindString-1)
+	case joinBindSet:
+		for i := range b.lits {
+			kind := b.lits[i].kind
+			b.sqlInnerKinds |= 1 << uint(kind-1)
+		}
+	case joinBindBuild:
+		for i := range b.build.values {
+			kind := b.build.values[i].kind
+			b.sqlInnerKinds |= 1 << uint(kind-1)
+		}
+	}
+}
+
+// observeSQLInnerKinds records join-key domains before the joined side's own
+// WHERE runs. SQL resolves the ON equality first, so an inner predicate may
+// remove rows from membership/build output but may not hide their operator
+// domains. Runtime SQL joins already force the complete live inner scan; this
+// loop only classifies the key column that scan extracted anyway.
+func (j *planJoin) observeSQLInnerKinds(b *joinBinding, ctx *execCtx) {
+	if !runtimeSQLJoinComparison(j) || j.innerPath == joinPrimaryKey {
+		return
+	}
+	for row := 0; row < ctx.rows; row++ {
+		kind := ctx.values[j.innerPath][row].kind
+		if kind != kindNull {
+			b.sqlInnerKinds |= 1 << uint(kind-1)
+		}
+	}
 }
 
 // keepFiltering re-decides, on the evidence of the rows already scanned,
@@ -1680,6 +1839,60 @@ func (b *joinBinding) matches(cell scalar, pr *joinProbe) bool {
 		return b.build.has(cell)
 	default:
 		return false
+	}
+}
+
+// matchesSQL is the SQL-only twin of matches. The compiled predicate kind
+// chooses it before the row loop, leaving builder joins on matches unchanged.
+// The build-side mask represents every live comparison the nested-loop SQL
+// semantics would eventually evaluate, so a heterogeneous domain cannot hide
+// behind a hash bucket or an exact candidate set as an innocent non-match.
+func (b *joinBinding) matchesSQL(
+	cell scalar,
+	pr *joinProbe,
+	slot int,
+	origin joinOrigin,
+) bool {
+	if pr.err != nil {
+		return false
+	}
+	if err := b.sqlComparisonError(cell, slot, origin); err != nil {
+		pr.err = err
+		return false
+	}
+	return b.matches(cell, pr)
+}
+
+// sqlComparisonError validates one live outer key against all live domains on
+// the SQL JOIN's build side. NULL/missing is UNKNOWN and an empty live build
+// side evaluates no comparison. JSON containers deliberately fail even when
+// both operands are containers: this surface follows PostgreSQL's json type,
+// which defines no equality operator.
+func (b *joinBinding) sqlComparisonError(
+	cell scalar,
+	slot int,
+	origin joinOrigin,
+) error {
+	if cell.kind == kindNull || b.sqlInnerKinds == 0 {
+		return nil
+	}
+	leftBit := uint8(1 << uint(cell.kind-1))
+	if cell.kind != kindContainer && b.sqlInnerKinds == leftBit {
+		return nil
+	}
+	rightKind := cell.kind
+	for kind := kindBool; kind <= kindContainer; kind++ {
+		bit := uint8(1 << uint(kind-1))
+		if b.sqlInnerKinds&bit != 0 && (cell.kind == kindContainer || kind != cell.kind) {
+			rightKind = kind
+			break
+		}
+	}
+	return &sqlJoinPathComparisonError{
+		slot:   slot,
+		origin: origin,
+		left:   sqlComparisonType(scalar{kind: cell.kind}),
+		right:  sqlComparisonType(scalar{kind: rightKind}),
 	}
 }
 

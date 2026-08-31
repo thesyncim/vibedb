@@ -301,26 +301,14 @@ func TestCorrelatedExistsPreparedDependencyDropFailsBeforeScanning(t *testing.T)
 	}
 }
 
-func TestCorrelatedExistsContainerKeysUseCanonicalStoredJSONIdentity(t *testing.T) {
+func TestCorrelatedExistsContainerKeysRejectUndefinedJSONEquality(t *testing.T) {
 	db := openTestDB(t)
 	for _, statement := range []string{
 		`CREATE TABLE ce_value_outer (id STRING PRIMARY KEY, match_key ANY)`,
 		`CREATE INDEX ce_value_outer_match ON ce_value_outer (match_key)`,
 		`CREATE TABLE ce_value_inner (id STRING PRIMARY KEY, match_key ANY)`,
-		`INSERT INTO ce_value_outer VALUES ` +
-			`('{"id":"a_array","match_key":[1,2]}'),` +
-			`('{"id":"b_object","match_key":{"a":1,"b":2}}'),` +
-			`('{"id":"c_object_order","match_key":{"b":2,"a":1}}'),` +
-			`('{"id":"d_scalar","match_key":"scalar"}'),` +
-			`('{"id":"e_array_order","match_key":[2,1]}'),` +
-			`('{"id":"f_object_value","match_key":{"a":1,"b":3}}'),` +
-			`('{"id":"g_object_member","match_key":{"a":1,"c":2}}'),` +
-			`('{"id":"h_missing"}')`,
-		`INSERT INTO ce_value_inner VALUES ` +
-			`('{"id":"i_scalar","match_key":"scalar"}'),` +
-			`('{"id":"i_array","match_key":[1,2]}'),` +
-			`('{"id":"i_object","match_key":{"a":1,"b":2}}'),` +
-			`('{"id":"i_object_duplicate","match_key":{"a":1,"b":2}}')`,
+		`INSERT INTO ce_value_outer VALUES ('{"id":"outer","match_key":[1,2]}')`,
+		`INSERT INTO ce_value_inner VALUES ('{"id":"inner","match_key":[1,2]}')`,
 	} {
 		if _, err := db.Exec(statement); err != nil {
 			t.Fatalf("%s: %v", statement, err)
@@ -328,19 +316,23 @@ func TestCorrelatedExistsContainerKeysUseCanonicalStoredJSONIdentity(t *testing.
 	}
 	exists := `SELECT o.id FROM ce_value_outer AS o WHERE EXISTS (` +
 		`SELECT 1 FROM ce_value_inner AS i WHERE i.match_key = o.match_key) ORDER BY o.id`
-	if got, want := correlatedExistsDriverIDs(t, db, exists),
-		[]string{"a_array", "b_object", "c_object_order", "d_scalar"}; !slices.Equal(got, want) {
-		t.Fatalf("container EXISTS rows = %v, want %v", got, want)
-	}
 	anti := `SELECT o.id FROM ce_value_outer AS o WHERE NOT EXISTS (` +
 		`SELECT 1 FROM ce_value_inner AS i WHERE i.match_key = o.match_key) ORDER BY o.id`
-	if got, want := correlatedExistsDriverIDs(t, db, anti),
-		[]string{"e_array_order", "f_object_value", "g_object_member", "h_missing"}; !slices.Equal(got, want) {
-		t.Fatalf("container NOT EXISTS rows = %v, want %v", got, want)
+	for _, source := range []string{exists, anti} {
+		rows, err := db.Query(source)
+		if rows != nil {
+			_ = rows.Close()
+		}
+		var undefined *sqlast.UndefinedOperatorError
+		if !errors.As(err, &undefined) || undefined.Left != "json" ||
+			undefined.Operator != "=" || undefined.Right != "json" ||
+			undefined.Unpositioned || undefined.Pos != strings.Index(source, "=") {
+			t.Fatalf("error = %T %+v", err, undefined)
+		}
 	}
 	if got := correlatedExistsDriverIDs(t, db,
-		`SELECT id FROM ce_value_outer WHERE id = 'a_array'`); !slices.Equal(got, []string{"a_array"}) {
-		t.Fatalf("connection reuse rows = %v, want [a_array]", got)
+		`SELECT id FROM ce_value_outer WHERE id = 'outer'`); !slices.Equal(got, []string{"outer"}) {
+		t.Fatalf("connection reuse rows = %v, want [outer]", got)
 	}
 }
 
@@ -815,18 +807,13 @@ func TestCorrelatedExistsDirectDurableStrategiesAndZeroAllocation(t *testing.T) 
 		`CREATE INDEX ce_stats_container_match ON ce_stats_container_outer (match_key)`,
 		`CREATE TABLE ce_stats_container_inner (id STRING PRIMARY KEY, match_key ANY)`,
 		`INSERT INTO ce_stats_container_outer VALUES ` +
-			`('{"id":"a_array","match_key":[1,2]}'),` +
-			`('{"id":"b_object","match_key":{"a":1,"b":2}}'),` +
-			`('{"id":"c_object_order","match_key":{"b":2,"a":1}}'),` +
-			`('{"id":"d_scalar","match_key":"scalar"}'),` +
-			`('{"id":"e_array_order","match_key":[2,1]}'),` +
-			`('{"id":"f_object_value","match_key":{"a":1,"b":3}}'),` +
-			`('{"id":"g_object_member","match_key":{"a":1,"c":2}}'),` +
-			`('{"id":"h_missing"}')`,
+			`('{"id":"a_match","match_key":"x"}'),` +
+			`('{"id":"b_match","match_key":"y"}'),` +
+			`('{"id":"c_unmatched","match_key":"none"}'),` +
+			`('{"id":"d_missing"}')`,
 		`INSERT INTO ce_stats_container_inner VALUES ` +
-			`('{"id":"i_scalar","match_key":"scalar"}'),` +
-			`('{"id":"i_array","match_key":[1,2]}'),` +
-			`('{"id":"i_object","match_key":{"a":1,"b":2}}')`,
+			`('{"id":"i_x","match_key":"x"}'),` +
+			`('{"id":"i_y","match_key":"y"}')`,
 	} {
 		correlatedExistsRuntimeExec(t, session, statement, nil)
 	}
@@ -839,7 +826,7 @@ func TestCorrelatedExistsDirectDurableStrategiesAndZeroAllocation(t *testing.T) 
 	if !container.statement.usesDirectDurableCatalog() {
 		t.Fatal("container decorrelation did not retain the direct durable catalog")
 	}
-	containerWant := [...]string{"a_array", "b_object", "c_object_order", "d_scalar"}
+	containerWant := [...]string{"a_match", "b_match"}
 	var containerCursor Cursor
 	runContainer := func() {
 		if err := container.QueryInto(ctx, nil, &containerCursor); err != nil {
@@ -872,8 +859,8 @@ func TestCorrelatedExistsDirectDurableStrategiesAndZeroAllocation(t *testing.T) 
 	if containerStats.IndexBounded || containerStats.IndexLookups != 0 {
 		t.Fatalf("container membership unsafely bounded/probed the outer index: %+v", containerStats)
 	}
-	if containerStats.RowsScanned != containerStats.RowsTotal || containerStats.RowsTotal != 8 {
-		t.Fatalf("container membership did not answer from one complete outer scan: %+v", containerStats)
+	if containerStats.RowsScanned != containerStats.RowsTotal || containerStats.RowsTotal != 4 {
+		t.Fatalf("schemaless membership did not answer from one complete outer scan: %+v", containerStats)
 	}
 	if containerStats.JoinMemberships+containerStats.JoinLookups != 1 ||
 		containerStats.JoinBuilds != 0 || containerStats.JoinPairs != 0 {
@@ -892,9 +879,7 @@ func TestCorrelatedExistsDirectDurableStrategiesAndZeroAllocation(t *testing.T) 
 	if !containerAnti.statement.usesDirectDurableCatalog() {
 		t.Fatal("container anti-decorrelation did not retain the direct durable catalog")
 	}
-	containerAntiWant := [...]string{
-		"e_array_order", "f_object_value", "g_object_member", "h_missing",
-	}
+	containerAntiWant := [...]string{"c_unmatched", "d_missing"}
 	var containerAntiCursor Cursor
 	runContainerAnti := func() {
 		if err := containerAnti.QueryInto(ctx, nil, &containerAntiCursor); err != nil {
@@ -926,7 +911,7 @@ func TestCorrelatedExistsDirectDurableStrategiesAndZeroAllocation(t *testing.T) 
 	containerAntiStats := containerAntiPlan.Plan.Analyze
 	if containerAntiStats.IndexBounded || containerAntiStats.IndexLookups != 0 ||
 		containerAntiStats.RowsScanned != containerAntiStats.RowsTotal ||
-		containerAntiStats.RowsTotal != 8 ||
+		containerAntiStats.RowsTotal != 4 ||
 		containerAntiStats.JoinMemberships+containerAntiStats.JoinLookups != 1 ||
 		containerAntiStats.JoinBuilds != 0 || containerAntiStats.JoinPairs != 0 {
 		t.Fatalf("container NOT EXISTS plan was not one full-scan adaptive anti-join: %+v",

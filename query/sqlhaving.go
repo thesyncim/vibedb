@@ -292,6 +292,13 @@ func (s *Statement) buildHaving(args []any) error {
 	if s.tree.Having == nil {
 		return nil
 	}
+	if scalar := s.scalarStatement(); scalar != nil &&
+		scalar.ordered != nil && scalar.ordered.havingEnd > scalar.ordered.projectionEnd {
+		// The scalar stage evaluates this predicate after reduction and before
+		// ORDER/OFFSET/LIMIT. Compiling it again as a cell/literal HAVING program
+		// would both lose CASE control flow and create a second comparator.
+		return nil
+	}
 	h := &s.having
 	if scalar := s.scalarStatement(); scalar != nil && scalar.ordered != nil &&
 		scalar.ordered.having != nil {

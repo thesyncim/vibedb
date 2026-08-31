@@ -10,6 +10,7 @@ import (
 	"testing"
 	"unsafe"
 
+	sqlast "github.com/thesyncim/vibedb/sql"
 	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibedb/store/durable"
 )
@@ -181,7 +182,7 @@ func TestGroupedCorrelatedMarkNullTruthTablesHeapAndDurable(t *testing.T) {
 	}
 }
 
-func TestGroupedCorrelatedMarkCanonicalContainersAndZeroWarmAlloc(t *testing.T) {
+func TestGroupedCorrelatedMarkRejectsContainerEquality(t *testing.T) {
 	outer := []string{
 		`{"id":"object","tenant":"o","bucket":"x","wanted":{"b":2,"a":{"z":1,"y":2}}}`,
 		`{"id":"array","tenant":"a","bucket":"x","wanted":[{"b":2,"a":1},3]}`,
@@ -192,27 +193,295 @@ func TestGroupedCorrelatedMarkCanonicalContainersAndZeroWarmAlloc(t *testing.T) 
 		`{"tenant":"o","bucket":"x","value":{"a":{"y":2,"z":1},"b":2},"active":true}`,
 		`{"tenant":"a","bucket":"x","value":[{"a":1,"b":2},3],"active":true}`,
 	}
-	db := markHeapDatabase(t, outer, inner)
+	heap := markHeapDatabase(t, outer, inner)
+	durableDB := markDurableDatabase(t, outer, inner)
+	files, err := durableDB.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = files.Close() }()
 	stmt, err := PrepareStatement(markSQL(`o.wanted IN ` + markChild))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer stmt.Release()
-	source := FromDatabase(db.Snapshot(), "mark_outer")
-	var exec Exec
-	if got := markRunIDs(t, stmt, source, &exec); !slices.Equal(got, []string{"array", "object"}) {
-		t.Fatalf("container ids = %v, want [array object]", got)
+	for _, backend := range []struct {
+		name string
+		src  Source
+	}{
+		{"heap", FromDatabase(heap.Snapshot(), "mark_outer")},
+		{"durable", FromFileDatabase(files, "mark_outer")},
+	} {
+		t.Run(backend.name, func(t *testing.T) {
+			var exec Exec
+			_, runErr := stmt.RunInto(&exec, backend.src, nil)
+			var undefined *sqlast.UndefinedOperatorError
+			if !errors.As(runErr, &undefined) || undefined.Left != "json" ||
+				undefined.Operator != "=" || undefined.Right != "json" {
+				t.Fatalf("container comparison error = %T %v", runErr, runErr)
+			}
+			if exec.Result.RowCount != 0 {
+				t.Fatalf("failed container comparison published %d rows", exec.Result.RowCount)
+			}
+		})
 	}
-	allocs := testing.AllocsPerRun(100, func() {
-		cursor, runErr := stmt.RunInto(&exec, source, nil)
-		if runErr != nil {
-			panic(runErr)
+}
+
+func TestGroupedCorrelatedMarkSQLComparisonDomainsHeapAndDurable(t *testing.T) {
+	tests := []struct {
+		name      string
+		predicate string
+		outer     string
+		inner     string
+		marker    string
+		left      string
+		op        string
+		right     string
+	}{
+		{
+			name:      "correlation inner-left",
+			predicate: `EXISTS ` + markChild,
+			outer:     `{"id":"bad","tenant":1,"bucket":"x","wanted":1}`,
+			inner:     `{"tenant":"1","bucket":"x","value":1,"active":true}`,
+			marker:    "i.tenant = o.tenant", left: "text", op: "=", right: "numeric",
+		},
+		{
+			name: "correlation outer-left",
+			predicate: `EXISTS (SELECT i.value FROM mark_inner i WHERE ` +
+				`o.tenant = i.tenant AND i.bucket = o.bucket AND i.active = TRUE)`,
+			outer:  `{"id":"bad","tenant":1,"bucket":"x","wanted":1}`,
+			inner:  `{"tenant":"1","bucket":"x","value":1,"active":true}`,
+			marker: "o.tenant = i.tenant", left: "numeric", op: "=", right: "text",
+		},
+		{
+			name:      "correlation container",
+			predicate: `EXISTS ` + markChild,
+			outer:     `{"id":"bad","tenant":{"a":1},"bucket":"x","wanted":1}`,
+			inner:     `{"tenant":{"a":1},"bucket":"x","value":1,"active":true}`,
+			marker:    "i.tenant = o.tenant", left: "json", op: "=", right: "json",
+		},
+		{
+			name:      "IN projection",
+			predicate: `o.wanted IN ` + markChild,
+			outer:     `{"id":"bad","tenant":"a","bucket":"x","wanted":1}`,
+			inner:     `{"tenant":"a","bucket":"x","value":"1","active":true}`,
+			marker:    " IN ", left: "numeric", op: "=", right: "text",
+		},
+		{
+			name:      "scalar projection",
+			predicate: `o.wanted < ` + markChild,
+			outer:     `{"id":"bad","tenant":"a","bucket":"x","wanted":1}`,
+			inner:     `{"tenant":"a","bucket":"x","value":"1","active":true}`,
+			marker:    " < ", left: "numeric", op: "<", right: "text",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			source := markSQL(test.predicate)
+			statement, err := PrepareStatement(source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer statement.Release()
+			heap := markHeapDatabase(t, []string{test.outer}, []string{test.inner})
+			durableDB := markDurableDatabase(t, []string{test.outer}, []string{test.inner})
+			files, err := durableDB.Snapshot()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = files.Close() }()
+			for _, backend := range []struct {
+				name string
+				src  Source
+			}{
+				{"heap", FromDatabase(heap.Snapshot(), "mark_outer")},
+				{"durable", FromFileDatabase(files, "mark_outer")},
+			} {
+				t.Run(backend.name, func(t *testing.T) {
+					var exec Exec
+					exec.Options.Workers = 4
+					_, runErr := statement.RunInto(&exec, backend.src, nil)
+					var undefined *sqlast.UndefinedOperatorError
+					if !errors.As(runErr, &undefined) || undefined.Unpositioned ||
+						undefined.Left != test.left || undefined.Operator != test.op ||
+						undefined.Right != test.right {
+						t.Fatalf("error = %T %+v", runErr, undefined)
+					}
+					wantPos := strings.Index(source, test.marker)
+					if strings.HasPrefix(test.marker, " ") {
+						wantPos++
+					} else {
+						wantPos += strings.Index(test.marker, "=")
+					}
+					if undefined.Pos != wantPos {
+						t.Fatalf("position = %d, want %d in %q", undefined.Pos, wantPos, source)
+					}
+					if exec.Result.RowCount != 0 {
+						t.Fatalf("failed comparison published %d rows", exec.Result.RowCount)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestGroupedCorrelatedMarkValidatesLiveKeysAfterNullHeapAndDurable(t *testing.T) {
+	outer := []string{`{"id":"bad","tenant":null,"bucket":1,"wanted":1}`}
+	inner := []string{`{"tenant":"x","bucket":"1","value":"1"}`}
+	child := `(SELECT i.value FROM mark_inner i WHERE ` +
+		`i.tenant = o.tenant AND i.bucket = o.bucket)`
+	heap := markHeapDatabase(t, outer, inner)
+	durableDB := markDurableDatabase(t, outer, inner)
+	files, err := durableDB.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = files.Close() }()
+	for _, predicate := range []string{
+		`EXISTS ` + child,
+		`o.wanted IN ` + child,
+		`o.wanted = ` + child,
+	} {
+		t.Run(predicate, func(t *testing.T) {
+			source := markSQL(predicate)
+			statement, err := PrepareStatement(source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer statement.Release()
+			for _, backend := range []struct {
+				name string
+				src  Source
+			}{
+				{"heap", FromDatabase(heap.Snapshot(), "mark_outer")},
+				{"durable", FromFileDatabase(files, "mark_outer")},
+			} {
+				t.Run(backend.name, func(t *testing.T) {
+					var exec Exec
+					_, runErr := statement.RunInto(&exec, backend.src, nil)
+					var undefined *sqlast.UndefinedOperatorError
+					if !errors.As(runErr, &undefined) || undefined.Left != "text" ||
+						undefined.Operator != "=" || undefined.Right != "numeric" ||
+						undefined.Pos != strings.LastIndex(source, "=") {
+						t.Fatalf("error = %T %+v", runErr, undefined)
+					}
+					if exec.Result.RowCount != 0 {
+						t.Fatalf("failed comparison published %d rows", exec.Result.RowCount)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestGroupedCorrelatedScalarOperatorResolutionPrecedesCardinality(t *testing.T) {
+	child := `(SELECT i.value FROM mark_inner i WHERE ` +
+		`i.tenant = o.tenant AND i.bucket = o.bucket)`
+	tests := []struct {
+		name      string
+		outer     string
+		inner     []string
+		undefined bool
+	}{
+		{
+			name:      "undefined operator before cardinality",
+			outer:     `{"id":"bad","tenant":"a","bucket":"x","wanted":1}`,
+			inner:     []string{`{"tenant":"a","bucket":"x","value":"1"}`, `{"tenant":"a","bucket":"x","value":"2"}`},
+			undefined: true,
+		},
+		{
+			name:  "compatible cardinality before null",
+			outer: `{"id":"bad","tenant":"a","bucket":"x","wanted":null}`,
+			inner: []string{`{"tenant":"a","bucket":"x","value":1}`, `{"tenant":"a","bucket":"x","value":2}`},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			heap := markHeapDatabase(t, []string{test.outer}, test.inner)
+			durableDB := markDurableDatabase(t, []string{test.outer}, test.inner)
+			files, err := durableDB.Snapshot()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = files.Close() }()
+			source := markSQL(`o.wanted = ` + child)
+			statement, err := PrepareStatement(source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer statement.Release()
+			for _, backend := range []struct {
+				name string
+				src  Source
+			}{
+				{"heap", FromDatabase(heap.Snapshot(), "mark_outer")},
+				{"durable", FromFileDatabase(files, "mark_outer")},
+			} {
+				t.Run(backend.name, func(t *testing.T) {
+					var exec Exec
+					_, runErr := statement.RunInto(&exec, backend.src, nil)
+					if test.undefined {
+						var undefined *sqlast.UndefinedOperatorError
+						if !errors.As(runErr, &undefined) || undefined.Left != "numeric" ||
+							undefined.Operator != "=" || undefined.Right != "text" ||
+							undefined.Pos != strings.Index(source, "=") {
+							t.Fatalf("error = %T %+v", runErr, undefined)
+						}
+					} else {
+						var cardinality *CardinalityViolationError
+						if !errors.As(runErr, &cardinality) {
+							t.Fatalf("error = %T %v, want cardinality", runErr, runErr)
+						}
+					}
+					if exec.Result.RowCount != 0 {
+						t.Fatalf("failed scalar comparison published %d rows", exec.Result.RowCount)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestGroupedCorrelatedMarkMultiworkerDurableFirstComparisonError(t *testing.T) {
+	outer := make([]string, 128)
+	for i := range outer {
+		outer[i] = fmt.Sprintf(
+			`{"id":"o%03d","tenant":%d,"bucket":"x","wanted":1}`,
+			i, i,
+		)
+	}
+	inner := []string{
+		`{"tenant":"0","bucket":"x","value":1,"active":true}`,
+	}
+	durableDB := markDurableDatabase(t, outer, inner)
+	files, err := durableDB.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = files.Close() }()
+	source := markSQL(`EXISTS ` + markChild)
+	statement, err := PrepareStatement(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer statement.Release()
+	for run := 0; run < 8; run++ {
+		var exec Exec
+		exec.Options.Workers = 4
+		_, runErr := statement.RunInto(
+			&exec, FromFileDatabase(files, "mark_outer"), nil,
+		)
+		var undefined *sqlast.UndefinedOperatorError
+		if !errors.As(runErr, &undefined) || undefined.Left != "text" ||
+			undefined.Operator != "=" || undefined.Right != "numeric" ||
+			undefined.Pos != strings.Index(source, "i.tenant = o.tenant")+
+				strings.Index("i.tenant = o.tenant", "=") {
+			t.Fatalf("run %d error = %T %+v", run, runErr, undefined)
 		}
-		for cursor.Next() {
+		if exec.Result.RowCount != 0 {
+			t.Fatalf("run %d published %d rows", run, exec.Result.RowCount)
 		}
-	})
-	if allocs != 0 {
-		t.Fatalf("warm canonical-container mark allocated %.2f times, want 0", allocs)
+		exec.Release()
 	}
 }
 

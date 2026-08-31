@@ -132,7 +132,7 @@ func TestCorrelatedValueProofClassifiesLegacyAndGroupedOperators(t *testing.T) {
 				wantKeys = append(wantKeys,
 					correlatedMarkKey{outer: "bucket", inner: "bucket"})
 			}
-			if !slices.Equal(proof.markKeys, wantKeys) {
+			if !sameCorrelatedMarkKeyPaths(proof.markKeys, wantKeys) {
 				t.Fatalf("mark keys = %+v, want %+v", proof.markKeys, wantKeys)
 			}
 
@@ -148,7 +148,7 @@ func TestCorrelatedValueProofClassifiesLegacyAndGroupedOperators(t *testing.T) {
 				mark := statement.q.marks[0]
 				if mark.kind != test.kind || mark.op != test.op ||
 					mark.probe != test.probe || mark.project != test.project ||
-					!slices.Equal(mark.keys, wantKeys) || !mark.hasWhere {
+					!slices.Equal(mark.keys, proof.markKeys) || !mark.hasWhere {
 					t.Fatalf("lowered mark = %+v, want kind=%d op=%d probe=%q project=%q keys=%+v where",
 						mark, test.kind, test.op, test.probe, test.project, wantKeys)
 				}
@@ -160,6 +160,18 @@ func TestCorrelatedValueProofClassifiesLegacyAndGroupedOperators(t *testing.T) {
 			}
 		})
 	}
+}
+
+func sameCorrelatedMarkKeyPaths(left, right []correlatedMarkKey) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i].outer != right[i].outer || left[i].inner != right[i].inner {
+			return false
+		}
+	}
+	return true
 }
 
 func TestCorrelatedValueDirectNotScalarComplements(t *testing.T) {

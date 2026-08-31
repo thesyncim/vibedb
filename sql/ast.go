@@ -659,7 +659,7 @@ type Segment struct {
 type ExprKind uint8
 
 const (
-	// ExprCompare is Path <op> Value.
+	// ExprCompare is Path <op> Value or Path <op> RightPath.
 	ExprCompare ExprKind = iota
 	// ExprIn is Path IN (List), or NOT IN when Negated.
 	ExprIn
@@ -769,10 +769,10 @@ type Expr struct {
 	// nodes and ExprConstant. It is nil for a COUNT(*) HAVING leaf, matching
 	// ResultColumn.
 	Path *PathExpr
-	// RightPath is the right operand of a comparison between two paths. JOIN ON
-	// always admits it; a LATERAL derived query also admits it in WHERE so its
-	// local path can compare directly with a captured outer path. Ordinary WHERE
-	// and HAVING leaves keep it nil and use Value or Subquery.
+	// RightPath is the right operand of a comparison between two paths. WHERE,
+	// JOIN ON, and searched CASE conditions admit it; a LATERAL derived query
+	// may therefore compare its local path directly with a captured outer path.
+	// HAVING keeps it nil and uses Value or Subquery.
 	RightPath *PathExpr
 	// ScalarLeft and ScalarRight are populated only by scalar predicate kinds.
 	// Keeping them cold avoids widening every existing path leaf with an

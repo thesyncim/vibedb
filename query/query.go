@@ -280,8 +280,14 @@ type plan struct {
 	// Workspace before the driving scan starts.
 	marks []planMark
 
-	grouped   bool
-	groupCols []int // value-column indices of GROUP BY paths
+	grouped bool
+	// runtimeSQLPaths marks a SQL-only path-to-path comparison whose live
+	// domains are not known until rows are classified. It consumes existing
+	// alignment padding beside the plan booleans, so builder plans and the plan
+	// layout do not grow. The flag keeps every physical optimizer from pruning
+	// a row that must report PostgreSQL's undefined-operator diagnostic.
+	runtimeSQLPaths bool
+	groupCols       []int // value-column indices of GROUP BY paths
 
 	hasAggregate bool
 	singleRow    bool // aggregates without GROUP BY: one result row
@@ -538,6 +544,7 @@ func (c *compiler) buildPlan(q *Query, p *plan) error {
 	if len(joinNodes) != 0 {
 		p.where = c.conjoin(p.where, joinNodes)
 	}
+	p.runtimeSQLPaths = p.where.hasRuntimeSQLPathComparison()
 
 	for _, g := range q.groupBy {
 		idx, err := c.addPath(values, g)
@@ -672,7 +679,7 @@ func (c *compiler) planJoinColumns(p *plan) error {
 		}
 		reads := len(j.innerCols) != 0 || len(j.innerNums) != 0
 		j.fanOut = j.left || (j.aliased && (reads || j.innerPath != joinPrimaryKey))
-		if j.origin == joinOriginDecorrelatedExists {
+		if bareJoinOrigin(j.origin) == joinOriginDecorrelatedExists {
 			// A decorrelated EXISTS is definitionally a filtering operator. Keep
 			// this invariant explicit so later alias/column-planning changes cannot
 			// accidentally turn duplicate matches into fan-out.

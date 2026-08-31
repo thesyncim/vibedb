@@ -404,6 +404,9 @@ func (j *planJoin) bindFile(
 		return fmt.Errorf(
 			"query: join: collection %q is not in the database snapshot", j.collection)
 	}
+	if runtimeSQLJoinComparison(j) && j.innerPath == joinPrimaryKey {
+		b.sqlInnerKinds |= 1 << uint(kindString-1)
+	}
 	if j.fanOut {
 		return fmt.Errorf(
 			"query: join: collection %q projects joined columns, which the durable "+
@@ -421,6 +424,7 @@ func (j *planJoin) bindFile(
 		b.ratio = joinFileEffectiveRatio(ratio)
 		b.plan = j.inner
 		j.installStrategy(b, false, stats)
+		j.recordSQLInnerKinds(b)
 		return b.scan.checkCanceled()
 	}
 
@@ -445,6 +449,7 @@ func (j *planJoin) bindFile(
 	b.file.snapshot = inner
 	b.plan = j.inner
 	j.installStrategy(b, overflowed, stats)
+	j.recordSQLInnerKinds(b)
 	return b.scan.checkCanceled()
 }
 
@@ -467,7 +472,7 @@ func (p *plan) runFileJoinedBatched(
 	if err := e.Workspace.checkCanceled(); err != nil {
 		return err
 	}
-	if p.hasLimit && p.limit == 0 {
+	if p.hasLimit && p.limit == 0 && !p.requiresSQLDomainScan() {
 		for i := range p.joins {
 			if _, ok := catalog.Collection(p.joins[i].collection); !ok {
 				return fmt.Errorf(
@@ -606,11 +611,16 @@ func (j *planJoin) collectFile(
 	if workBudget != nil {
 		remaining = workBudget.remaining()
 	}
-	masks, plannedBytes, err := j.inner.fileCandidateMasksBounded(
-		inner, &f.index, scan, remaining,
-	)
-	if err != nil {
-		return false, err
+	var masks []store.Mask
+	var plannedBytes int64
+	var err error
+	if !runtimeSQLJoinComparison(j) {
+		masks, plannedBytes, err = j.inner.fileCandidateMasksBounded(
+			inner, &f.index, scan, remaining,
+		)
+		if err != nil {
+			return false, err
+		}
 	}
 	if err := scan.checkCanceled(); err != nil {
 		return false, err
@@ -755,6 +765,7 @@ func (j *planJoin) drainFile(
 	if err := ctx.extract(j.inner, nil, scan); err != nil {
 		return false, err
 	}
+	j.observeSQLInnerKinds(b, ctx)
 	selected, err := j.inner.selectRows(ctx, nil, false, scan)
 	if err != nil {
 		return false, err

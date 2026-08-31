@@ -19,45 +19,58 @@ type statementCorrelationPlan struct {
 }
 
 type statementCorrelationReference struct {
-	expr *sqlast.Expr
-	slot int
+	expr       *sqlast.Expr
+	slot       int
+	comparison boundPathComparison
 }
 
-func (p *statementCorrelationPlan) slot(expr *sqlast.Expr) (int, bool) {
+func (p *statementCorrelationPlan) reference(
+	expr *sqlast.Expr,
+) (*statementCorrelationReference, bool) {
 	if p == nil || expr == nil {
-		return 0, false
+		return nil, false
 	}
 	for i := range p.references {
 		if p.references[i].expr == expr {
-			return p.references[i].slot, true
+			return &p.references[i], true
 		}
 	}
-	return 0, false
+	return nil, false
 }
 
 // correlationCompareForm lowers a local-to-outer comparison without turning
-// the outer value into an authored SQL parameter. predCmpBound is TRUE only
-// when both operands are known and the comparison accepts; the guard is TRUE
-// only over that same determinate domain. The ordinary leaf resolver can then
-// derive SQL FALSE as guard AND NOT(pred), preserving UNKNOWN under NOT.
+// the outer value into an authored SQL parameter. predCmpPathBound is TRUE only
+// when both operands have the same live scalar SQL domain and the comparison
+// accepts; the guard is TRUE only over that same non-NULL domain. The ordinary
+// leaf resolver can then derive SQL FALSE as guard AND NOT(pred), preserving
+// UNKNOWN under NOT.
 func (s *Statement) correlationCompareForm(
-	path *sqlast.PathExpr,
-	op sqlast.CmpOp,
-	slot int,
+	expr *sqlast.Expr,
+	reference *statementCorrelationReference,
 ) (leafForm, error) {
-	if s.correlation == nil || slot < 0 || slot >= s.correlation.slots {
-		return leafForm{}, fmt.Errorf("query: invalid prepared correlation slot %d", slot)
+	if expr == nil || expr.Path == nil {
+		return leafForm{}, fmt.Errorf("query: correlated path comparison has no local operand")
 	}
-	spec := s.spec(path)
+	if reference == nil || s.correlation == nil || reference.slot < 0 ||
+		reference.slot >= s.correlation.slots {
+		slot := -1
+		if reference != nil {
+			slot = reference.slot
+		}
+		return leafForm{}, fmt.Errorf(
+			"query: invalid prepared correlation slot %d", slot,
+		)
+	}
+	spec := s.spec(expr.Path)
 	return leafForm{
-		pred: Predicate{
-			kind: predCmpBound, path: spec, op: Op(op), slot: int32(slot),
-		},
+		pred: compareBoundPath(
+			spec, Op(expr.Op), reference.slot, &reference.comparison,
+		),
 		guard: Predicate{
 			kind: predAnd,
 			kids: s.c.pair(
 				s.c.not(IsNull(spec)),
-				Predicate{kind: predCorrelationKnown, slot: int32(slot)},
+				Predicate{kind: predCorrelationKnown, slot: int32(reference.slot)},
 			),
 		},
 	}, nil

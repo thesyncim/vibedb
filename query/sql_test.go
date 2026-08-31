@@ -266,7 +266,10 @@ func TestSQLThreeValuedLogicMatchesKleene(t *testing.T) {
 		bound := args[:stmt.NumParams()]
 		for i, set := range segments {
 			got := runStatement(t, stmt, FromSegment(set), bound...)
-			want := kleeneReference(tree, docsets[i], bound)
+			want, refErr := kleeneReference(tree, docsets[i], bound)
+			if refErr != nil {
+				t.Fatalf("reference WHERE %s: %v", predicate, refErr)
+			}
 			if got != want {
 				t.Fatalf("WHERE %s over corpus %d:\n got %s\nwant %s",
 					predicate, i, got, want)
@@ -309,7 +312,10 @@ func TestSQLThreeValuedLogicWithNullArguments(t *testing.T) {
 		bound := []any{nil}
 		for i, set := range segments {
 			got := runStatement(t, stmt, FromSegment(set), bound...)
-			want := kleeneReference(tree, docsets[i], bound)
+			want, refErr := kleeneReference(tree, docsets[i], bound)
+			if refErr != nil {
+				t.Fatalf("reference WHERE %s: %v", predicate, refErr)
+			}
 			if got != want {
 				t.Fatalf("WHERE %s (NULL argument) over corpus %d:\n got %s\nwant %s",
 					predicate, i, got, want)
@@ -343,7 +349,7 @@ func nullSegments(t *testing.T) ([]*store.Segment, [][]any) {
 
 // kleeneReference renders the rows "SELECT a, b, c WHERE <e>" must produce,
 // evaluating the filter with an explicit UNKNOWN.
-func kleeneReference(tree *sqlast.SelectStmt, docs []any, args []any) string {
+func kleeneReference(tree *sqlast.SelectStmt, docs []any, args []any) (string, error) {
 	var b strings.Builder
 	for i := range tree.Columns {
 		b.WriteByte('|')
@@ -351,7 +357,11 @@ func kleeneReference(tree *sqlast.SelectStmt, docs []any, args []any) string {
 	}
 	b.WriteByte('\n')
 	for _, doc := range docs {
-		if refTri(tree.Where, doc, args) != triTrue {
+		truth, err := refTri(tree.Where, doc, args)
+		if err != nil {
+			return "", err
+		}
+		if truth != triTrue {
 			continue
 		}
 		for i := range tree.Columns {
@@ -360,7 +370,7 @@ func kleeneReference(tree *sqlast.SelectStmt, docs []any, args []any) string {
 		}
 		b.WriteByte('\n')
 	}
-	return b.String()
+	return b.String(), nil
 }
 
 // refCellJSON renders a reference cell the way Cell.JSON renders the engine's.
@@ -387,35 +397,54 @@ func refCellJSON(c refCell) string {
 // lowering under test but the parsed tree: paths resolve through refResolve,
 // values classify through refClassify, and numbers compare through refCompare's
 // math/big rational order.
-func refTri(e *sqlast.Expr, doc any, args []any) tri {
+func refTri(e *sqlast.Expr, doc any, args []any) (tri, error) {
 	switch e.Kind {
 	case sqlast.ExprAnd:
 		out := triTrue
 		for _, kid := range e.Kids {
-			switch refTri(kid, doc, args) {
+			value, err := refTri(kid, doc, args)
+			if err != nil {
+				return triFalse, err
+			}
+			switch value {
 			case triFalse:
-				return triFalse
+				return triFalse, nil
 			case triUnknown:
 				out = triUnknown
 			}
 		}
-		return out
+		return out, nil
 	case sqlast.ExprOr:
 		out := triFalse
 		for _, kid := range e.Kids {
-			switch refTri(kid, doc, args) {
+			value, err := refTri(kid, doc, args)
+			if err != nil {
+				return triFalse, err
+			}
+			switch value {
 			case triTrue:
-				return triTrue
+				return triTrue, nil
 			case triUnknown:
 				out = triUnknown
 			}
 		}
-		return out
+		return out, nil
 	case sqlast.ExprNot:
-		return notTri(refTri(e.Kids[0], doc, args))
+		value, err := refTri(e.Kids[0], doc, args)
+		return notTri(value), err
 	}
+	return refLeafTri(e, [2]any{doc, nil}, false, args)
+}
 
-	value, present := refResolve(e.Path.Spec(), doc)
+func refLeafTri(e *sqlast.Expr, docs [2]any, joined bool, args []any) (tri, error) {
+	resolve := func(path *sqlast.PathExpr) (any, bool) {
+		doc := docs[0]
+		if joined && path.Source == 1 {
+			doc = docs[1]
+		}
+		return refResolve(path.Spec(), doc)
+	}
+	value, present := resolve(e.Path)
 	cell := refClassify(value, present)
 	var out tri
 	switch e.Kind {
@@ -433,7 +462,22 @@ func refTri(e *sqlast.Expr, doc any, args []any) tri {
 		// value.
 		out = refContainsTri(cell, e.Value.Text)
 	case sqlast.ExprCompare:
-		out = refCompareTri(cell, e.Op, e.Value, args)
+		if e.RightPath != nil {
+			rightValue, rightPresent := resolve(e.RightPath)
+			right := refClassify(rightValue, rightPresent)
+			if cell.kind == kindNull || right.kind == kindNull {
+				out = triUnknown
+			} else if cell.kind != right.kind || cell.kind == kindContainer {
+				return triFalse, fmt.Errorf(
+					"reference: operator does not exist for kinds %d %s %d",
+					cell.kind, e.Op.String(), right.kind,
+				)
+			} else {
+				out = boolTri(acceptSign(refCompare(cell, right), Op(e.Op)))
+			}
+		} else {
+			out = refCompareTri(cell, e.Op, e.Value, args)
+		}
 	case sqlast.ExprBetween:
 		out = andTri(
 			refCompareTri(cell, sqlast.OpGe, e.List[0], args),
@@ -442,9 +486,9 @@ func refTri(e *sqlast.Expr, doc any, args []any) tri {
 		out = refInTri(cell, e.List, args)
 	}
 	if e.Negated {
-		return notTri(out)
+		return notTri(out), nil
 	}
-	return out
+	return out, nil
 }
 
 func refCompareTri(cell refScalar, op sqlast.CmpOp, o sqlast.Operand, args []any) tri {
@@ -989,7 +1033,10 @@ func TestSQLJoinThreeValuedLogicMatchesKleene(t *testing.T) {
 		}
 		bound := args[:stmt.NumParams()]
 		got := runStatement(t, stmt, FromDatabase(db.Snapshot(), "d"), bound...)
-		want := joinKleeneReference(tree, driving, joined, bound)
+		want, refErr := joinKleeneReference(tree, driving, joined, bound)
+		if refErr != nil {
+			t.Fatalf("reference WHERE %s: %v", predicate, refErr)
+		}
 		if got != want {
 			t.Fatalf("WHERE %s:\n got %s\nwant %s", predicate, got, want)
 		}
@@ -1015,7 +1062,10 @@ func TestSQLLeftJoinNullExtendsUnmatchedRows(t *testing.T) {
 			t.Fatalf("reference parse(%q): %v", src, err)
 		}
 		got := runStatement(t, stmt, FromDatabase(db.Snapshot(), "d"))
-		want := joinKleeneReference(tree, driving, joined, nil)
+		want, refErr := joinKleeneReference(tree, driving, joined, nil)
+		if refErr != nil {
+			t.Fatalf("reference WHERE %s: %v", predicate, refErr)
+		}
 		if got != want {
 			t.Fatalf("WHERE %s:\n got %s\nwant %s", predicate, got, want)
 		}
@@ -1034,7 +1084,10 @@ func TestSQLLeftJoinNullableSideWhereRunsAfterExtension(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := runStatement(t, stmt, FromDatabase(db.Snapshot(), "d"))
-	want := joinKleeneReference(tree, driving, joined, nil)
+	want, refErr := joinKleeneReference(tree, driving, joined, nil)
+	if refErr != nil {
+		t.Fatal(refErr)
+	}
 	if got != want {
 		t.Fatalf("nullable-side WHERE:\n got %s\nwant %s", got, want)
 	}
@@ -1043,7 +1096,11 @@ func TestSQLLeftJoinNullableSideWhereRunsAfterExtension(t *testing.T) {
 // joinKleeneReference renders the rows the statement must produce, by nested
 // loop over the two decoded collections with the predicate applied to each pair
 // under Kleene's tables.
-func joinKleeneReference(tree *sqlast.SelectStmt, driving, joined []any, args []any) string {
+func joinKleeneReference(
+	tree *sqlast.SelectStmt,
+	driving, joined []any,
+	args []any,
+) (string, error) {
 	var b strings.Builder
 	for i := range tree.Columns {
 		b.WriteByte('|')
@@ -1068,8 +1125,14 @@ func joinKleeneReference(tree *sqlast.SelectStmt, driving, joined []any, args []
 			}
 			matched = true
 			pair := [2]any{outer, inner}
-			if tree.Where != nil && joinRefTri(tree.Where, pair, args) != triTrue {
-				continue
+			if tree.Where != nil {
+				truth, err := joinRefTri(tree.Where, pair, args)
+				if err != nil {
+					return "", err
+				}
+				if truth != triTrue {
+					continue
+				}
 			}
 			for i := range tree.Columns {
 				path := tree.Columns[i].Path
@@ -1083,8 +1146,14 @@ func joinKleeneReference(tree *sqlast.SelectStmt, driving, joined []any, args []
 			continue
 		}
 		pair := [2]any{outer, nil}
-		if tree.Where != nil && joinRefTri(tree.Where, pair, args) != triTrue {
-			continue
+		if tree.Where != nil {
+			truth, err := joinRefTri(tree.Where, pair, args)
+			if err != nil {
+				return "", err
+			}
+			if truth != triTrue {
+				continue
+			}
 		}
 		for i := range tree.Columns {
 			path := tree.Columns[i].Path
@@ -1094,40 +1163,49 @@ func joinKleeneReference(tree *sqlast.SelectStmt, driving, joined []any, args []
 		}
 		b.WriteByte('\n')
 	}
-	return b.String()
+	return b.String(), nil
 }
 
 // joinRefTri is refTri over a pair: a leaf resolves against the driving or the
 // joined document according to the range variable its path names, and the
 // boolean tables are the same three-valued ones.
-func joinRefTri(e *sqlast.Expr, pair [2]any, args []any) tri {
+func joinRefTri(e *sqlast.Expr, pair [2]any, args []any) (tri, error) {
 	switch e.Kind {
 	case sqlast.ExprAnd:
 		out := triTrue
 		for _, kid := range e.Kids {
-			switch joinRefTri(kid, pair, args) {
+			value, err := joinRefTri(kid, pair, args)
+			if err != nil {
+				return triFalse, err
+			}
+			switch value {
 			case triFalse:
-				return triFalse
+				return triFalse, nil
 			case triUnknown:
 				out = triUnknown
 			}
 		}
-		return out
+		return out, nil
 	case sqlast.ExprOr:
 		out := triFalse
 		for _, kid := range e.Kids {
-			switch joinRefTri(kid, pair, args) {
+			value, err := joinRefTri(kid, pair, args)
+			if err != nil {
+				return triFalse, err
+			}
+			switch value {
 			case triTrue:
-				return triTrue
+				return triTrue, nil
 			case triUnknown:
 				out = triUnknown
 			}
 		}
-		return out
+		return out, nil
 	case sqlast.ExprNot:
-		return notTri(joinRefTri(e.Kids[0], pair, args))
+		value, err := joinRefTri(e.Kids[0], pair, args)
+		return notTri(value), err
 	}
-	return refTri(e, pair[e.Path.Source], args)
+	return refLeafTri(e, pair, true, args)
 }
 
 // TestSQLJoinMatchesBuilder is the join lowering differential: a prepared

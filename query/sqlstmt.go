@@ -1157,7 +1157,7 @@ func (s *Statement) runDirectInto(e *Exec, src Source, args []any) (Cursor, erro
 		src = sourceIndependentSQLSource()
 	}
 	if err := s.q.RunInto(e, src); err != nil {
-		return Cursor{}, err
+		return Cursor{}, s.translateSQLPathComparisonError(err)
 	}
 	return s.cursor(&e.Result), nil
 }
@@ -1172,9 +1172,10 @@ func (s *Statement) runIntoFrame(
 	frame *statementFrame,
 	intermediateResource string,
 ) (Cursor, error) {
-	return s.runIntoFrameMode(
+	cursor, err := s.runIntoFrameMode(
 		e, src, args, frame, intermediateResource, nil, true,
 	)
+	return cursor, s.translateSQLPathComparisonError(err)
 }
 
 func (s *Statement) runIntoCorrelationFrame(
@@ -1189,9 +1190,10 @@ func (s *Statement) runIntoCorrelationFrame(
 	if s.correlation == nil {
 		return Cursor{}, fmt.Errorf("query: correlation values supplied to an ordinary statement")
 	}
-	return s.runIntoFrameMode(
+	cursor, err := s.runIntoFrameMode(
 		e, src, args, frame, intermediateResource, correlations, bindPlan,
 	)
+	return cursor, s.translateSQLPathComparisonError(err)
 }
 
 func (s *Statement) runIntoFrameMode(

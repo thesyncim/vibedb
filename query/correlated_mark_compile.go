@@ -75,13 +75,18 @@ func (c *compiler) compileMark(
 		return planMark{}, fmt.Errorf("query: correlated mark[%d] has invalid mode %d", index, m.kind)
 	}
 
-	var outerCols, innerCols []int
+	var outerCols, innerCols, keyPositions []int
+	var keyOuterFirst []bool
 	if index < len(c.planMarks) {
 		outerCols = c.planMarks[index].outer[:0]
 		innerCols = c.planMarks[index].innerKeys[:0]
+		keyPositions = c.planMarks[index].keyPositions[:0]
+		keyOuterFirst = c.planMarks[index].keyOuterFirst[:0]
 	}
 	outerCols = reserve(outerCols, len(m.keys))
 	innerCols = reserve(innerCols, len(m.keys))
+	keyPositions = reserve(keyPositions, len(m.keys))
+	keyOuterFirst = reserve(keyOuterFirst, len(m.keys))
 	innerReg := c.markRegistry(index)
 	for keyIndex := range m.keys {
 		key := m.keys[keyIndex]
@@ -101,6 +106,8 @@ func (c *compiler) compileMark(
 		}
 		outerCols = append(outerCols, outer)
 		innerCols = append(innerCols, inner)
+		keyPositions = append(keyPositions, key.operatorPos)
+		keyOuterFirst = append(keyOuterFirst, key.outerFirst)
 	}
 
 	probe, value := -1, -1
@@ -130,6 +137,7 @@ func (c *compiler) compileMark(
 		}
 		innerPlan.where = where
 	}
+	innerPlan.runtimeSQLPaths = innerPlan.where.hasRuntimeSQLPathComparison()
 	innerPlan.valuePaths = innerReg.paths
 	filterCols = reserve(filterCols, len(innerReg.paths))
 	for col := range innerReg.paths {
@@ -138,15 +146,19 @@ func (c *compiler) compileMark(
 	innerPlan.filterCols = filterCols
 
 	return planMark{
-		collection: m.collection,
-		inner:      innerPlan,
-		outer:      outerCols,
-		innerKeys:  innerCols,
-		probe:      probe,
-		value:      value,
-		slot:       index,
-		kind:       m.kind,
-		op:         m.op,
+		collection:    m.collection,
+		inner:         innerPlan,
+		outer:         outerCols,
+		innerKeys:     innerCols,
+		keyPositions:  keyPositions,
+		keyOuterFirst: keyOuterFirst,
+		probe:         probe,
+		value:         value,
+		slot:          index,
+		kind:          m.kind,
+		op:            m.op,
+		authoredOp:    m.authoredOp,
+		valuePos:      m.valuePos,
 	}, nil
 }
 

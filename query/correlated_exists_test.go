@@ -33,6 +33,49 @@ var correlatedExistsInnerDocs = []string{
 	`{"id":"i-null","k":null,"active":true}`,
 }
 
+// A decorrelated equality is still a SQL equality: live values only compare
+// inside one PostgreSQL domain. Keep the success corpus split by domain so the
+// differential tests exercise membership/lookup without relying on the old
+// query-layer total order between unrelated JSON scalar kinds.
+var correlatedExistsBoolOuterDocs = []string{
+	correlatedExistsOuterDocs[0],
+	correlatedExistsOuterDocs[1],
+	correlatedExistsOuterDocs[5],
+	correlatedExistsOuterDocs[6],
+}
+
+var correlatedExistsBoolInnerDocs = []string{
+	correlatedExistsInnerDocs[0],
+	correlatedExistsInnerDocs[1],
+	correlatedExistsInnerDocs[6],
+}
+
+var correlatedExistsNumberOuterDocs = []string{
+	correlatedExistsOuterDocs[2],
+	correlatedExistsOuterDocs[3],
+	correlatedExistsOuterDocs[5],
+	correlatedExistsOuterDocs[6],
+}
+
+var correlatedExistsNumberInnerDocs = []string{
+	correlatedExistsInnerDocs[2],
+	correlatedExistsInnerDocs[3],
+	correlatedExistsInnerDocs[4],
+	correlatedExistsInnerDocs[6],
+}
+
+var correlatedExistsStringOuterDocs = []string{
+	correlatedExistsOuterDocs[4],
+	correlatedExistsOuterDocs[5],
+	correlatedExistsOuterDocs[6],
+	correlatedExistsOuterDocs[7],
+}
+
+var correlatedExistsStringInnerDocs = []string{
+	correlatedExistsInnerDocs[5],
+	correlatedExistsInnerDocs[6],
+}
+
 func correlatedExistsHeapDatabase(
 	t testing.TB,
 	outerDocs, innerDocs []string,
@@ -184,93 +227,109 @@ func correlatedExistsOracle(
 }
 
 func TestSQLCorrelatedExistsDifferentialExactScalarsAndNoFanOut(t *testing.T) {
-	variants := [][]string{
-		nil,
-		correlatedExistsInnerDocs[:1],
-		correlatedExistsInnerDocs[:2],
-		correlatedExistsInnerDocs[2:4],
-		correlatedExistsInnerDocs[4:6],
-		correlatedExistsInnerDocs,
+	variants := []struct {
+		name      string
+		outerDocs []string
+		innerDocs []string
+	}{
+		{name: "empty", outerDocs: correlatedExistsOuterDocs},
+		{name: "boolean", outerDocs: correlatedExistsBoolOuterDocs, innerDocs: correlatedExistsBoolInnerDocs},
+		{name: "numeric", outerDocs: correlatedExistsNumberOuterDocs, innerDocs: correlatedExistsNumberInnerDocs},
+		{name: "text", outerDocs: correlatedExistsStringOuterDocs, innerDocs: correlatedExistsStringInnerDocs},
 	}
-	for variant, innerDocs := range variants {
-		for _, indexed := range []bool{false, true} {
-			db := correlatedExistsHeapDatabase(
-				t, correlatedExistsOuterDocs, innerDocs, indexed,
-			)
-			catalog := db.Snapshot()
-			for _, anti := range []bool{false, true} {
-				statement, err := PrepareStatement(correlatedExistsSQL(anti, false))
-				if err != nil {
-					t.Fatal(err)
-				}
-				for _, membershipMax := range []int{1, 1 << 20} {
-					exec := Exec{Options: ExecOptions{JoinMembershipMax: membershipMax}}
-					got := correlatedStatementIDs(
-						t, statement,
-						FromDatabase(catalog, statement.Collection()), &exec,
-					)
-					want := correlatedExistsOracle(
-						t, correlatedExistsOuterDocs, innerDocs, true, anti,
-					)
-					if !slices.Equal(got, want) {
-						t.Fatalf("variant=%d indexed=%t anti=%t max=%d ids=%v want=%v",
-							variant, indexed, anti, membershipMax, got, want)
+	for _, variant := range variants {
+		t.Run(variant.name, func(t *testing.T) {
+			for _, indexed := range []bool{false, true} {
+				db := correlatedExistsHeapDatabase(
+					t, variant.outerDocs, variant.innerDocs, indexed,
+				)
+				catalog := db.Snapshot()
+				for _, anti := range []bool{false, true} {
+					statement, err := PrepareStatement(correlatedExistsSQL(anti, false))
+					if err != nil {
+						t.Fatal(err)
 					}
-					if exec.Stats.JoinBuilds != 0 || exec.Stats.JoinPairs != 0 ||
-						exec.Stats.JoinMemberships != 1 {
-						t.Fatalf("decorrelated plan fanned out or did not bind once: %+v", exec.Stats)
+					for _, membershipMax := range []int{1, 1 << 20} {
+						exec := Exec{Options: ExecOptions{JoinMembershipMax: membershipMax}}
+						got := correlatedStatementIDs(
+							t, statement,
+							FromDatabase(catalog, statement.Collection()), &exec,
+						)
+						want := correlatedExistsOracle(
+							t, variant.outerDocs, variant.innerDocs, true, anti,
+						)
+						if !slices.Equal(got, want) {
+							t.Fatalf("indexed=%t anti=%t max=%d ids=%v want=%v",
+								indexed, anti, membershipMax, got, want)
+						}
+						if exec.Stats.JoinBuilds != 0 || exec.Stats.JoinPairs != 0 ||
+							exec.Stats.JoinMemberships != 1 {
+							t.Fatalf("decorrelated plan fanned out or did not bind once: %+v", exec.Stats)
+						}
+						exec.Release()
 					}
-					exec.Release()
+					statement.Release()
 				}
-				statement.Release()
 			}
-		}
+		})
 	}
 }
 
 func TestSQLCorrelatedExistsDurableDifferentialExactScalars(t *testing.T) {
-	for _, innerDocs := range [][]string{nil, correlatedExistsInnerDocs} {
-		for _, indexed := range []bool{false, true} {
-			database := correlatedExistsDurableDatabase(
-				t, correlatedExistsOuterDocs, innerDocs, indexed,
-			)
-			catalog, err := database.Snapshot()
-			if err != nil {
-				t.Fatal(err)
-			}
-			for _, anti := range []bool{false, true} {
-				statement, err := PrepareStatement(correlatedExistsSQL(anti, false))
+	variants := []struct {
+		name      string
+		outerDocs []string
+		innerDocs []string
+	}{
+		{name: "empty", outerDocs: correlatedExistsOuterDocs},
+		{name: "boolean", outerDocs: correlatedExistsBoolOuterDocs, innerDocs: correlatedExistsBoolInnerDocs},
+		{name: "numeric", outerDocs: correlatedExistsNumberOuterDocs, innerDocs: correlatedExistsNumberInnerDocs},
+		{name: "text", outerDocs: correlatedExistsStringOuterDocs, innerDocs: correlatedExistsStringInnerDocs},
+	}
+	for _, variant := range variants {
+		t.Run(variant.name, func(t *testing.T) {
+			for _, indexed := range []bool{false, true} {
+				database := correlatedExistsDurableDatabase(
+					t, variant.outerDocs, variant.innerDocs, indexed,
+				)
+				catalog, err := database.Snapshot()
 				if err != nil {
 					t.Fatal(err)
 				}
-				var exec Exec
-				got := correlatedStatementIDs(
-					t, statement, FromFileDatabase(catalog, "ce_outer"), &exec,
-				)
-				want := correlatedExistsOracle(
-					t, correlatedExistsOuterDocs, innerDocs, true, anti,
-				)
-				if !slices.Equal(got, want) {
-					t.Fatalf("inner=%d indexed=%t anti=%t rows=%v want=%v stats=%+v",
-						len(innerDocs), indexed, anti, got, want, exec.Stats)
+				for _, anti := range []bool{false, true} {
+					statement, err := PrepareStatement(correlatedExistsSQL(anti, false))
+					if err != nil {
+						t.Fatal(err)
+					}
+					var exec Exec
+					got := correlatedStatementIDs(
+						t, statement, FromFileDatabase(catalog, "ce_outer"), &exec,
+					)
+					want := correlatedExistsOracle(
+						t, variant.outerDocs, variant.innerDocs, true, anti,
+					)
+					if !slices.Equal(got, want) {
+						t.Fatalf("inner=%d indexed=%t anti=%t rows=%v want=%v stats=%+v",
+							len(variant.innerDocs), indexed, anti, got, want, exec.Stats)
+					}
+					if exec.Stats.JoinBuilds != 0 || exec.Stats.JoinPairs != 0 ||
+						exec.Stats.JoinMemberships != 1 {
+						t.Fatalf("durable decorrelation fanned out or rebound: %+v", exec.Stats)
+					}
+					statement.Release()
+					exec.Release()
 				}
-				if exec.Stats.JoinBuilds != 0 || exec.Stats.JoinPairs != 0 ||
-					exec.Stats.JoinMemberships != 1 {
-					t.Fatalf("durable decorrelation fanned out or rebound: %+v", exec.Stats)
+				if err := catalog.Close(); err != nil {
+					t.Fatal(err)
 				}
-				statement.Release()
-				exec.Release()
 			}
-			if err := catalog.Close(); err != nil {
-				t.Fatal(err)
-			}
-		}
+		})
 	}
 }
 
 func TestSQLCorrelatedNotExistsIsTwoValuedForNullMissingAndEmpty(t *testing.T) {
-	for _, innerDocs := range [][]string{nil, correlatedExistsInnerDocs} {
-		db := correlatedExistsHeapDatabase(t, correlatedExistsOuterDocs, innerDocs, true)
+	for _, innerDocs := range [][]string{nil, correlatedExistsStringInnerDocs} {
+		db := correlatedExistsHeapDatabase(t, correlatedExistsStringOuterDocs, innerDocs, true)
 		statement, err := PrepareStatement(correlatedExistsSQL(true, false))
 		if err != nil {
 			t.Fatal(err)
@@ -279,7 +338,7 @@ func TestSQLCorrelatedNotExistsIsTwoValuedForNullMissingAndEmpty(t *testing.T) {
 		got := correlatedStatementIDs(
 			t, statement, FromDatabase(db.Snapshot(), statement.Collection()), &exec,
 		)
-		want := correlatedExistsOracle(t, correlatedExistsOuterDocs, innerDocs, true, true)
+		want := correlatedExistsOracle(t, correlatedExistsStringOuterDocs, innerDocs, true, true)
 		if !slices.Equal(got, want) || !slices.Contains(got, "null") ||
 			!slices.Contains(got, "missing") {
 			t.Fatalf("inner=%d anti ids=%v want=%v", len(innerDocs), got, want)
@@ -288,8 +347,8 @@ func TestSQLCorrelatedNotExistsIsTwoValuedForNullMissingAndEmpty(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if p.where == nil || p.where.kind != predAntiBound {
-			t.Fatalf("anti predicate = %+v, want dedicated predAntiBound", p.where)
+		if p.where == nil || p.where.kind != predSQLAntiBound {
+			t.Fatalf("anti predicate = %+v, want dedicated predSQLAntiBound", p.where)
 		}
 		statement.Release()
 		exec.Release()
@@ -413,7 +472,7 @@ func TestSQLCorrelatedExistsCachesOnlyProofBackedParameterFreeLowering(t *testin
 	}
 	built, plan := statement.q.built, statement.q.built.plan
 	db := correlatedExistsHeapDatabase(
-		t, correlatedExistsOuterDocs, correlatedExistsInnerDocs, false,
+		t, correlatedExistsStringOuterDocs, correlatedExistsStringInnerDocs, false,
 	)
 	source := FromDatabase(db.Snapshot(), statement.Collection())
 	var exec Exec
@@ -530,97 +589,54 @@ func TestSQLMultipleCorrelatedExistsComposeWithoutFanOutOrWarmAllocations(t *tes
 	}
 }
 
-func TestSQLCorrelatedExistsCanonicalContainerEqualityIsIndexIndependent(t *testing.T) {
+func TestSQLCorrelatedExistsRejectsUndefinedDomainsWithoutIndexPruning(t *testing.T) {
 	tests := []struct {
-		name          string
-		outer         []string
-		inner         []string
-		exists        []string
-		anti          []string
-		indexCanBound bool
+		name                string
+		outer, inner        string
+		wantLeft, wantRight string
 	}{
 		{
-			name: "inner container disables scalar index pruning",
-			outer: []string{
-				`{"id":"scalar","k":"x"}`,
-				`{"id":"container_exact","k":[1,2]}`,
-				// SQL storage canonicalizes object key order before the query
-				// layer sees it, so an authored {"b":2,"a":1} arrives in this
-				// canonical stored representation and compares equal.
-				`{"id":"object_order_variant","k":{"a":1,"b":2}}`,
-				`{"id":"object_other_value","k":{"a":1,"b":3}}`,
-				`{"id":"array_other_order","k":[2,1]}`,
-				`{"id":"null","k":null}`,
-				`{"id":"missing"}`,
-			},
-			inner: []string{
-				`{"id":"i-scalar","k":"x","active":true}`,
-				`{"id":"i-container","k":[1,2],"active":true}`,
-				`{"id":"i-object","k":{"a":1,"b":2},"active":true}`,
-			},
-			exists: []string{"container_exact", "object_order_variant", "scalar"},
-			anti: []string{
-				"array_other_order", "missing", "null", "object_other_value",
-			},
+			name:      "numeric equals text",
+			outer:     `{"id":"outer","k":1}`,
+			inner:     `{"id":"inner","k":"1","active":true}`,
+			wantLeft:  "text",
+			wantRight: "numeric",
 		},
 		{
-			name: "scalar inner permits sound pruning of outer containers",
-			outer: []string{
-				`{"id":"scalar","k":"x"}`,
-				`{"id":"container","k":[1,2]}`,
-				`{"id":"null","k":null}`,
-				`{"id":"missing"}`,
-			},
-			inner:         []string{`{"id":"i","k":"x","active":true}`},
-			exists:        []string{"scalar"},
-			anti:          []string{"container", "missing", "null"},
-			indexCanBound: true,
+			name:      "json equals json",
+			outer:     `{"id":"outer","k":[1,2]}`,
+			inner:     `{"id":"inner","k":[1,2],"active":true}`,
+			wantLeft:  "json",
+			wantRight: "json",
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if test.indexCanBound {
-				for i := range 256 {
-					id := fmt.Sprintf("unmatched-%03d", i)
-					test.outer = append(test.outer, fmt.Sprintf(
-						`{"id":%q,"k":"absent-%03d"}`, id, i,
-					))
-					test.anti = append(test.anti, id)
-				}
-				slices.Sort(test.anti)
-			}
-			check := func(t *testing.T, source Source, indexed, durable bool) {
+			check := func(t *testing.T, source Source, indexed bool) {
 				t.Helper()
 				for _, anti := range []bool{false, true} {
-					statement, err := PrepareStatement(correlatedExistsSQL(anti, false))
+					sqlText := correlatedExistsSQL(anti, false)
+					statement, err := PrepareStatement(sqlText)
 					if err != nil {
 						t.Fatal(err)
 					}
 					var exec Exec
-					got := correlatedStatementIDs(t, statement, source, &exec)
-					want := test.exists
-					if anti {
-						want = test.anti
+					_, err = statement.RunInto(&exec, source, nil)
+					var undefined *sqlast.UndefinedOperatorError
+					if !errors.As(err, &undefined) {
+						t.Fatalf("indexed=%t anti=%t error=%T %v, want UndefinedOperatorError",
+							indexed, anti, err, err)
 					}
-					if !slices.Equal(got, want) {
-						t.Fatalf("indexed=%t anti=%t rows=%v want=%v stats=%+v",
-							indexed, anti, got, want, exec.Stats)
+					if undefined.Left != test.wantLeft || undefined.Operator != "=" ||
+						undefined.Right != test.wantRight || undefined.Unpositioned ||
+						undefined.Pos != strings.Index(sqlText, "=") {
+						t.Fatalf("indexed=%t anti=%t undefined operator=%+v",
+							indexed, anti, undefined)
 					}
-					bounded := exec.Workspace.storeIndexProbes != 0
-					lookups := exec.Workspace.storeIndexProbes
-					if durable {
-						bounded = exec.Stats.IndexBounded
-						lookups = exec.Stats.IndexLookups
-					}
-					expectBounded := test.indexCanBound && (!anti || !durable)
-					if indexed && bounded != expectBounded {
-						t.Fatalf("indexed existential leaf bounded=%t want=%t anti=%t durable=%t stats=%+v heap_probes=%d",
-							bounded, expectBounded, anti, durable, exec.Stats,
-							exec.Workspace.storeIndexProbes)
-					}
-					if (!indexed || !expectBounded) && lookups != 0 {
-						t.Fatalf("unsound/unconfigured index probes=%d durable=%t stats=%+v",
-							lookups, durable, exec.Stats)
+					if exec.Workspace.storeIndexProbes != 0 || exec.Stats.IndexBounded ||
+						exec.Stats.IndexLookups != 0 {
+						t.Fatalf("indexed=%t anti=%t runtime-typed EXISTS used index pruning: heap=%d stats=%+v",
+							indexed, anti, exec.Workspace.storeIndexProbes, exec.Stats)
 					}
 					statement.Release()
 					exec.Release()
@@ -628,19 +644,79 @@ func TestSQLCorrelatedExistsCanonicalContainerEqualityIsIndexIndependent(t *test
 			}
 
 			for _, indexed := range []bool{false, true} {
-				heap := correlatedExistsHeapDatabase(t, test.outer, test.inner, indexed)
-				check(t, FromDatabase(heap.Snapshot(), "ce_outer"), indexed, false)
+				heap := correlatedExistsHeapDatabase(t, []string{test.outer}, []string{test.inner}, indexed)
+				check(t, FromDatabase(heap.Snapshot(), "ce_outer"), indexed)
 			}
 			for _, indexed := range []bool{false, true} {
-				file := correlatedExistsDurableDatabase(t, test.outer, test.inner, indexed)
+				file := correlatedExistsDurableDatabase(t, []string{test.outer}, []string{test.inner}, indexed)
 				catalog, err := file.Snapshot()
 				if err != nil {
 					t.Fatal(err)
 				}
-				check(t, FromFileDatabase(catalog, "ce_outer"), indexed, true)
+				check(t, FromFileDatabase(catalog, "ce_outer"), indexed)
 				_ = catalog.Close()
 			}
 		})
+	}
+}
+
+func TestSQLCorrelatedExistsResolvesDomainsBeforeOuterAndInnerFilters(t *testing.T) {
+	outer := []string{
+		`{"id":"first","k":1,"enabled":false}`,
+		`{"id":"second","k":2,"enabled":false}`,
+	}
+	inner := []string{
+		`{"id":"inner","k":"1","active":false}`,
+	}
+	heap := correlatedExistsHeapDatabase(t, outer, inner, true)
+	file := correlatedExistsDurableDatabase(t, outer, inner, true)
+	catalog, err := file.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = catalog.Close() }()
+
+	for _, anti := range []bool{false, true} {
+		negation := ""
+		if anti {
+			negation = "NOT "
+		}
+		sourceText := `SELECT o.id FROM ce_outer o WHERE o.enabled = TRUE AND ` +
+			negation + `EXISTS (SELECT 1 FROM ce_inner i ` +
+			`WHERE i.k = o.k AND i.active = TRUE)`
+		operatorPos := strings.Index(sourceText, "i.k = o.k") + len("i.k ")
+		for _, backend := range []struct {
+			name   string
+			source Source
+			opts   ExecOptions
+		}{
+			{"heap", FromDatabase(heap.Snapshot(), "ce_outer"), ExecOptions{Workers: 4}},
+			{"durable", FromFileDatabase(catalog, "ce_outer"), ExecOptions{Workers: 4, BatchRows: 1}},
+		} {
+			t.Run(fmt.Sprintf("anti=%t/%s", anti, backend.name), func(t *testing.T) {
+				statement, err := PrepareStatement(sourceText)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer statement.Release()
+				var exec Exec
+				exec.Options = backend.opts
+				defer exec.Release()
+				for run := 0; run < 2; run++ {
+					_, err = statement.RunInto(&exec, backend.source, nil)
+					var undefined *sqlast.UndefinedOperatorError
+					if !errors.As(err, &undefined) || undefined.Left != "text" ||
+						undefined.Operator != "=" || undefined.Right != "numeric" ||
+						undefined.Unpositioned || undefined.Pos != operatorPos {
+						t.Fatalf("run=%d error=%T %+v", run, err, undefined)
+					}
+					if exec.Stats.IndexBounded || exec.Stats.IndexLookups != 0 ||
+						exec.Stats.DataSkippedRows != 0 {
+						t.Fatalf("run=%d runtime domain scan was pruned: %+v", run, exec.Stats)
+					}
+				}
+			})
+		}
 	}
 }
 
@@ -771,7 +847,7 @@ func unsupportedPosition(err *sqlast.FeatureNotSupportedError) int {
 
 func TestSQLCorrelatedExistsWarmExecutionIsAllocationFree(t *testing.T) {
 	db := correlatedExistsHeapDatabase(
-		t, correlatedExistsOuterDocs, correlatedExistsInnerDocs, true,
+		t, correlatedExistsStringOuterDocs, correlatedExistsStringInnerDocs, true,
 	)
 	statement, err := PrepareStatement(correlatedExistsSQL(false, true))
 	if err != nil {
