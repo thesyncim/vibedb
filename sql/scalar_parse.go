@@ -332,6 +332,17 @@ func (p *Parser) parseScalarBinary(
 				return nil, err
 			}
 			path := left.Path
+			if len(path.Segments) >= 2 {
+				for i := len(p.pending) - 1; i >= 0; i-- {
+					entry := &p.pending[i]
+					if entry.path == path {
+						if entry.nestedPos == 0 {
+							entry.nestedPos = pos + 1
+						}
+						break
+					}
+				}
+			}
 			segments := p.segs.allocDirty(len(path.Segments) + 1)
 			copy(segments, path.Segments)
 			segments[len(path.Segments)] = seg

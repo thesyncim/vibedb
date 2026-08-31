@@ -242,6 +242,10 @@ type InsertStmt struct {
 	// remain implicit because the document-derived primary key is the only
 	// unique key in this SQL surface.
 	OnConflictDoNothing bool
+	// OnConflictPos is the byte offset of ON in the authored ON CONFLICT clause.
+	// It is zero when no conflict action was written. Consumers should prefer the
+	// narrower OnConflictUpdate.Pos when diagnosing a DO UPDATE action.
+	OnConflictPos int
 	// OnConflictUpdate carries the alternative conflict action. It is nil when
 	// there is no DO UPDATE clause. The parser guarantees that this and
 	// OnConflictDoNothing are mutually exclusive.
@@ -261,14 +265,16 @@ type InsertStmt struct {
 
 // InsertConflictUpdate is the bounded assignment program of INSERT ... ON
 // CONFLICT DO UPDATE. It either replaces the complete conflicting document
-// from EXCLUDED."$doc", or replaces distinct declared top-level columns. The
-// two forms never mix.
+// from EXCLUDED."$doc", or replaces distinct declared top-level columns with
+// direct values or deterministic scalar expressions over the current row and
+// EXCLUDED. The two forms never mix.
 type InsertConflictUpdate struct {
 	// Doc is OperandExcluded naming DocumentColumn for the whole-document form.
 	// It is otherwise the zero operand and Assignments is non-empty.
 	Doc Operand
-	// Assignments are scalar literals/placeholders/NULL or OperandExcluded
-	// references to declared top-level candidate columns.
+	// Assignments use the same direct Operand fast path as ordinary UPDATE.
+	// Computed right-hand sides carry OperandExpression plus Expr; their paths
+	// use virtual Source 0 for the current row and Source 1 for EXCLUDED.
 	Assignments []UpdateAssignment
 	// Pos is the byte offset of UPDATE and SetPos is the first assignment.
 	Pos    int

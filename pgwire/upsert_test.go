@@ -1,9 +1,31 @@
 package pgwire
 
 import (
+	"errors"
 	"slices"
+	"strings"
 	"testing"
+
+	sqlast "github.com/thesyncim/vibedb/sql"
 )
+
+func TestPGWireUpsertBareConflictColumnAmbiguitySQLStateAndPosition(t *testing.T) {
+	const source = `INSERT INTO wire_upsert_ambiguity (id, a) VALUES ('x', 1) ON CONFLICT DO UPDATE SET a = a + 1`
+	_, err := sqlast.ParseStatement(source)
+	var ambiguous *sqlast.AmbiguousColumnError
+	if !errors.As(err, &ambiguous) {
+		t.Fatalf("bare conflict column error = %T %v, want *sql.AmbiguousColumnError", err, err)
+	}
+
+	pg := asPGErrorIn(err, source)
+	wantPosition := strings.LastIndex(source, "a + 1") + 1
+	if pg.code != sqlstateAmbiguousColumn || pg.position != wantPosition {
+		t.Fatalf(
+			"bare conflict column => code=%s position=%d, want %s/%d: %v",
+			pg.code, pg.position, sqlstateAmbiguousColumn, wantPosition, err,
+		)
+	}
+}
 
 func TestPGWireUpsertValuesExtendedMixedReturning(t *testing.T) {
 	c := connectSQLCatalog(t)

@@ -35,6 +35,8 @@ func FuzzParseStatement(f *testing.F) {
 		`INSERT INTO t SELECT returning, returning, returning, returning, returning, returning, returning, returning FROM src WHERE`,
 		`INSERT INTO t (id, active) VALUES ('a', TRUE), ('b', FALSE)`,
 		`INSERT INTO t (id, name) VALUES (?, ?) ON CONFLICT DO UPDATE SET name = EXCLUDED.name`,
+		`INSERT INTO t (id, n) VALUES (?, ?) ON CONFLICT DO UPDATE SET n = t.n + EXCLUDED.n + ?`,
+		`INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET state = CASE WHEN t.ready = TRUE THEN EXCLUDED.state ELSE t.state END`,
 		`INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET "$doc" = EXCLUDED."$doc" RETURNING id`,
 		`INSERT INTO t VALUES (`,
 		`UPDATE t SET "$doc" = ?`,
@@ -246,16 +248,27 @@ func checkInsert(t *testing.T, s *InsertStmt) {
 				t.Fatal("whole-document conflict update has an invalid source")
 			}
 		} else {
+			scope := SelectStmt{From: []TableRef{
+				{Name: s.Table, Alias: s.Table},
+				{Name: "excluded", Alias: "excluded"},
+			}}
 			seenTargets := make(map[string]struct{}, len(update.Assignments))
 			for i := range update.Assignments {
 				assignment := &update.Assignments[i]
-				if assignment.Expr != nil || assignment.Value.Kind == OperandExpression {
-					t.Fatalf("conflict assignment %d retained an ordinary UPDATE expression", i)
-				}
 				if _, duplicate := seenTargets[assignment.Column]; duplicate {
 					t.Fatalf("conflict target %q is assigned twice", assignment.Column)
 				}
 				seenTargets[assignment.Column] = struct{}{}
+				if assignment.Expr != nil {
+					if assignment.Value.Kind != OperandExpression {
+						t.Fatalf("conflict expression assignment %d has value kind %d", i, assignment.Value.Kind)
+					}
+					seen += checkScalarInvariants(t, &scope, assignment.Expr, nil)
+					continue
+				}
+				if assignment.Value.Kind == OperandExpression {
+					t.Fatalf("conflict assignment %d has an expression marker without an expression", i)
+				}
 				switch assignment.Value.Kind {
 				case OperandString, OperandNumber, OperandBool, OperandNull:
 				case OperandParam:
