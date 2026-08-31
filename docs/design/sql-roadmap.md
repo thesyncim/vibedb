@@ -13,6 +13,7 @@ stable.
 | **Complete (embedded)** | Row-dependent `UPDATE` expressions | Ordinary embedded `UPDATE` evaluates arithmetic, concatenation, unary expressions, casts, and `CASE` once per matched old row. Mixed assignments are simultaneous and atomic across `RETURNING`, transactions, primary-key checks, and local secondary/unique indexes. Mutation capture, maintained global indexes, and RF3 reject this shape with positioned `0A000` until they can transport exact postimages. |
 | **Complete** | `ALTER TABLE ... ADD COLUMN` | The embedded driver validates one additive schema in a replacement storage incarnation, retains indexes, and publishes atomically. The copy still blocks ordinary work under the catalog write lock. |
 | **Complete** | Primary-key `ON CONFLICT DO UPDATE` | Embedded `INSERT ... VALUES` supports whole-document replacement or declared top-level assignments from literals, placeholders, `NULL`, and `EXCLUDED`. The implicit primary key is the only target. |
+| **Complete (embedded)** | Conflict-action expressions | Embedded `INSERT ... VALUES ... ON CONFLICT DO UPDATE` evaluates arithmetic, concatenation, unary expressions, casts, and `CASE` over explicitly qualified current-row and `EXCLUDED` namespaces. Mixed assignments are simultaneous, exact-number preserving, statement-atomic, transaction-aware, and integrated with `RETURNING` plus local secondary/unique indexes. Distributed lanes retain their blanket conflict-action fence. |
 | **Complete** | Unique secondary constraints | Embedded `CREATE UNIQUE INDEX` enforces exact scalar tuples across build, DML, upsert, transactions, reopen, aliases, and drop. Default `NULLS DISTINCT` applies. RF3 SQL creation remains fail-closed. |
 
 These slices complete the original embedded P0 list. Embedded pgwire exposes
@@ -24,9 +25,8 @@ provide the same branch-aware and distributed uniqueness contracts.
 | Priority | Gap | Deliverable |
 | --- | --- | --- |
 | P1 | Complete migration cycle | Add defaults/backfill, set or drop nullability, and rename/drop/type migration through the same atomic rebuild path. |
-| P1 | Conflict-action expression parity | Let `ON CONFLICT DO UPDATE` combine the current row, `EXCLUDED`, parameters, and deterministic scalar expressions with the same simultaneous-assignment semantics as ordinary `UPDATE`. |
 | P1 | Distributed mutation postimages | Define one exact evaluated-postimage contract for mutation capture, maintained global indexes, and RF3, then remove the explicit computed-`UPDATE` fences lane by lane. |
-| P1 | Mutation target aliases | Parse and bind `UPDATE table AS alias` and qualified target-column reads without weakening ambiguous-column diagnostics. |
+| P1 | Mutation target aliases and conflict binding diagnostics | Parse and bind `UPDATE table AS alias` plus `INSERT INTO table AS alias`. Use the live catalog to distinguish an undeclared bare conflict reference (`42703`) from one present in both current and `EXCLUDED` (`42702`), and use an INSERT alias to disambiguate a target table literally named `excluded`. |
 | P1 | Common scalar functions | Start with `COALESCE`, `NULLIF`, `LOWER`, `UPPER`, `LENGTH`, substring, and bounded numeric/JSON helpers. |
 | P1 | Aggregate composability | Add `COUNT(DISTINCT ...)`, expression arguments, grouping expressions, and non-projected aggregates in `HAVING`. |
 | P1 | Constraint basics | Add `DEFAULT` and `CHECK`. Treat foreign keys as a separate product decision for the JSON-first embedded scope. |
@@ -41,12 +41,11 @@ transactions are outside the embedded must-have set.
 
 ## Fast next plan
 
-1. Extend the deterministic assignment projection with separate current-row
-   and `EXCLUDED` namespaces, then use it for conflict actions.
-2. Specify an exact postimage payload for capture and coordinator-owned index
+1. Specify an exact postimage payload for capture and coordinator-owned index
    maintenance; enable global-index and RF3 lanes only after replay tests prove
    identical results.
-3. Add mutation target aliases and the first common scalar functions without
+2. Add mutation target aliases and catalog-aware conflict-name diagnostics.
+3. Add the first common scalar functions without
    widening the expression grammar beyond executable runtime support.
 4. Add catalog metadata for `DEFAULT` and `CHECK`, then extend the existing
    storage-incarnation path with backfill and nullability changes.
