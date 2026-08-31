@@ -138,8 +138,8 @@ func runGatewayHotShardLiveChild(t testing.TB, fixture gatewayHotShardLiveFixtur
 		}
 	}
 
-	gatewayAddress := rf3CommandUnusedAddress(t)
-	gatewayControlAddress := rf3CommandUnusedAddress(t)
+	gatewayAddresses := rf3CommandUnusedAddresses(t, 2)
+	gatewayAddress, gatewayControlAddress := gatewayAddresses[0], gatewayAddresses[1]
 	capacityPath := gatewayHotShardLiveCapacity(t, fixture.root)
 	manifestPath := gatewayHotShardLiveManifest(
 		t, fixture, links, gatewayControlAddress,

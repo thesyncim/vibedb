@@ -112,6 +112,21 @@ func TestRF3CommandProcessDocuments(t *testing.T) {
 	}
 }
 
+func TestRF3CommandUnusedAddressesAreDistinct(t *testing.T) {
+	const count = 7
+	addresses := rf3CommandUnusedAddresses(t, count)
+	if len(addresses) != count {
+		t.Fatalf("address count = %d, want %d", len(addresses), count)
+	}
+	seen := make(map[string]struct{}, count)
+	for _, address := range addresses {
+		if _, duplicate := seen[address]; duplicate {
+			t.Fatalf("duplicate reserved address %q in %q", address, addresses)
+		}
+		seen[address] = struct{}{}
+	}
+}
+
 // TestServeRF3ShippedCompositionThreeProcesses is deliberately smaller than
 // the RF3 fault matrix. It proves only the shipped composition boundary: three
 // isolated command processes open prepared catalog members, publish both
@@ -219,9 +234,10 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 	// A cold store has no WAL incarnation yet. Its first adoption must mint 1;
 	// later incarnations require an existing durable WAL, not a fixture label.
 	const targetIncarnation = uint64(1)
+	targetAddresses := rf3CommandUnusedAddresses(t, 4)
 	targetListeners := rf3ManifestListeners{
-		Peer: rf3CommandUnusedAddress(t), Native: rf3CommandUnusedAddress(t),
-		Snapshot: rf3CommandUnusedAddress(t), Control: rf3CommandUnusedAddress(t),
+		Peer: targetAddresses[0], Native: targetAddresses[1],
+		Snapshot: targetAddresses[2], Control: targetAddresses[3],
 	}
 	target := rf3ManifestEnrolledTarget{
 		MemberID: 4, NodeID: targetNode, StoreID: targetStore,
@@ -279,6 +295,9 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 			target.PeerAddress, target.NativeAddress,
 			target.SnapshotAddress, target.ControlAddress,
 		)
+		if _, err := parseRF3Manifest(document); err != nil {
+			t.Fatalf("generated member %d manifest: %v", index+1, err)
+		}
 		if err := os.WriteFile(manifestPaths[index], document, 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -1026,17 +1045,19 @@ func rf3CommandRoundTrip(
 	return response
 }
 
-func rf3CommandUnusedAddress(t testing.TB) string {
+func rf3CommandUnusedAddresses(t testing.TB, count int) []string {
 	t.Helper()
-	listener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1")})
+	reservation, err := rf3testfixture.ReserveLoopbackAddresses(count)
 	if err != nil {
 		t.Fatal(err)
 	}
-	address := listener.Addr().String()
-	if err = listener.Close(); err != nil {
+	// Keep the whole cut bound until every address has been selected. Linux
+	// may immediately recycle an ephemeral port after an individual close.
+	addresses := append([]string(nil), reservation.Addresses...)
+	if err := reservation.Close(); err != nil {
 		t.Fatal(err)
 	}
-	return address
+	return addresses
 }
 
 func rf3CommandServingFence(fence shardservice.ReplicatedFence) raftservice.ServingFence {
