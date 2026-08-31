@@ -150,6 +150,7 @@ func TestGatewayDurableRF3MultiRelationChaosProcess(t *testing.T) {
 	latencies = append(latencies, client.ackTerminal(t, updateRaw))
 	fixture.restartShard(t, updateKilled)
 	fixture.waitMemberCaughtUpAllRoles(t, updateKilled, 45*time.Second)
+	fixture.waitAllRoleLeaders(t, -1, 30*time.Second)
 
 	deleteStatements := make([]serveStatement, 0, 12)
 	for ordinal := 0; ordinal < 12; ordinal += 2 {
