@@ -720,10 +720,12 @@ func (d *DMLStatement) ValidateUpdateExpressionBindings(args []any) error {
 // pre-update document and returns their values in computed-assignment order.
 // The returned cursor and its cells borrow e and remain valid only until e is
 // used again. Callers must consume exactly one row before the next evaluation.
+// maxDocumentBytes bounds the retained source row before it is copied.
 func (d *DMLStatement) EvaluateUpdateExpressions(
 	e *Exec,
 	document []byte,
 	args []any,
+	maxDocumentBytes int,
 ) (Cursor, error) {
 	if d == nil || d.kind != DMLUpdate || d.updateExpressions == nil {
 		return Cursor{}, fmt.Errorf("query: UPDATE has no computed assignments")
@@ -734,6 +736,13 @@ func (d *DMLStatement) EvaluateUpdateExpressions(
 	// The preceding filter or assignment result may still borrow the retained
 	// source. End that lifetime before Reset reuses its backing storage.
 	clearExecBorrowedViews(e)
+	e.Stats = ExecStats{}
+	if maxDocumentBytes <= 0 || len(document) > maxDocumentBytes {
+		return Cursor{}, fmt.Errorf(
+			"query: UPDATE expression source document has %d bytes, limit %d",
+			len(document), maxDocumentBytes,
+		)
+	}
 	if err := cancellationError(e.Options.Cancel); err != nil {
 		return Cursor{}, err
 	}

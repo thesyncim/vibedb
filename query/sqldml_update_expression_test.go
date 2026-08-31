@@ -1,8 +1,12 @@
 package query
 
 import (
+	"errors"
+	"strings"
 	"testing"
 )
+
+const updateExpressionTestDocumentLimit = 1 << 20
 
 func TestDMLUpdateExpressionsEvaluateOneOldRowSimultaneously(t *testing.T) {
 	statement, err := PrepareDML(
@@ -22,6 +26,7 @@ func TestDMLUpdateExpressionsEvaluateOneOldRowSimultaneously(t *testing.T) {
 	var exec Exec
 	cursor, err := statement.EvaluateUpdateExpressions(
 		&exec, []byte(`{"id":"row","a":1,"b":2}`), args,
+		updateExpressionTestDocumentLimit,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -52,6 +57,7 @@ func TestDMLUpdateExpressionsPreserveNullAndExactDecimal(t *testing.T) {
 		&exec,
 		[]byte(`{"exact":9007199254740992,"nil":null}`),
 		nil,
+		updateExpressionTestDocumentLimit,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -95,5 +101,47 @@ func TestDMLDirectUpdateAssignmentsKeepEvaluatorAbsent(t *testing.T) {
 	}
 	if err := statement.ValidateUpdateExpressionBindings([]any{"ok"}); err != nil {
 		t.Fatalf("direct assignment expression validation = %v", err)
+	}
+}
+
+func TestDMLUpdateExpressionsBoundSourceAndResetExecutionState(t *testing.T) {
+	statement, err := PrepareDML(`UPDATE docs SET value = value + 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer statement.Release()
+
+	document := []byte(`{"value":1}`)
+	exec := Exec{
+		Stats: ExecStats{RowsTotal: 41, IndexBounded: true},
+	}
+	exec.Result.RowCount = 7
+	if _, err := statement.EvaluateUpdateExpressions(
+		&exec, document, nil, len(document)-1,
+	); err == nil || !strings.Contains(err.Error(), "source document has 11 bytes, limit 10") {
+		t.Fatalf("oversize source error = %v", err)
+	}
+	if exec.Stats != (ExecStats{}) {
+		t.Fatalf("oversize source retained stale stats: %+v", exec.Stats)
+	}
+	if exec.Result.RowCount != 0 {
+		t.Fatalf("oversize source retained %d result rows", exec.Result.RowCount)
+	}
+
+	var cancel CancelFlag
+	cancel.Cancel()
+	exec.Options.Cancel = &cancel
+	exec.Stats = ExecStats{RowsTotal: 73, IndexBounded: true}
+	exec.Result.RowCount = 9
+	if _, err := statement.EvaluateUpdateExpressions(
+		&exec, document, nil, len(document),
+	); !errors.Is(err, ErrCanceled) {
+		t.Fatalf("pre-canceled evaluation error = %T %v, want ErrCanceled", err, err)
+	}
+	if exec.Stats != (ExecStats{}) {
+		t.Fatalf("pre-canceled evaluation retained stale stats: %+v", exec.Stats)
+	}
+	if exec.Result.RowCount != 0 {
+		t.Fatalf("pre-canceled evaluation retained %d result rows", exec.Result.RowCount)
 	}
 }
