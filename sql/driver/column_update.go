@@ -24,12 +24,12 @@ func ApplyColumnAssignments(document []byte, assignments []sqlast.UpdateAssignme
 	return applyColumnAssignments(document, nil, assignments, args, nil, maxBytes)
 }
 
-// ApplyColumnAssignmentsWithExpressions materializes an ordinary declared-
+// applyColumnAssignmentsWithExpressions materializes an ordinary declared-
 // column UPDATE using the one-row computed-assignment projection returned by
 // query.DMLStatement.EvaluateUpdateExpressions. Direct operands and computed
 // cells are collected before the document is patched, so every right-hand side
 // observes the same pre-update row.
-func ApplyColumnAssignmentsWithExpressions(
+func applyColumnAssignmentsWithExpressions(
 	document []byte,
 	assignments []sqlast.UpdateAssignment,
 	args []any,
@@ -58,7 +58,7 @@ func materializeColumnAssignments(
 	if err != nil {
 		return nil, err
 	}
-	return ApplyColumnAssignmentsWithExpressions(
+	return applyColumnAssignmentsWithExpressions(
 		document, assignments, args, &cursor, maxBytes,
 	)
 }
