@@ -1092,6 +1092,9 @@ func (t *tx) execMutationCore(
 			); err != nil {
 				return nil, err
 			}
+			if err := statement.ValidateConflictUpdateExpressionBindings(args); err != nil {
+				return nil, err
+			}
 		}
 		if prepared != nil && prepared.insertSource != nil {
 			var err error
@@ -1191,9 +1194,9 @@ func (t *tx) execMutationCore(
 			finalDocument := document
 			if found && conflictUpdate != nil {
 				if !conflictUpdate.WholeDocument() {
-					finalDocument, err = ApplyColumnAssignmentsWithExcluded(
-						scratch, document, conflictUpdate.Assignments,
-						args, limits.MaxDocumentBytes,
+					finalDocument, err = materializeConflictColumnAssignments(
+						statement, &t.conn.exec, scratch, document,
+						conflictUpdate.Assignments, args, limits.MaxDocumentBytes,
 					)
 					if err != nil {
 						t.conn.pointRaw = scratch

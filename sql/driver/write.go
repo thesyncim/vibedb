@@ -884,6 +884,9 @@ func (c *conn) insertLocked(
 		); err != nil {
 			return nil, err
 		}
+		if err := statement.ValidateConflictUpdateExpressionBindings(args); err != nil {
+			return nil, err
+		}
 	}
 
 	// Resolve and validate every candidate before deciding which conflict
@@ -981,10 +984,9 @@ func (c *conn) insertLocked(
 			finalDocument := candidate.document
 			if found && conflictUpdate != nil {
 				if !conflictUpdate.WholeDocument() {
-					finalDocument, err = ApplyColumnAssignmentsWithExcluded(
-						scratch, candidate.document,
-						conflictUpdate.Assignments, args,
-						limits.MaxDocumentBytes,
+					finalDocument, err = materializeConflictColumnAssignments(
+						statement, &c.exec, scratch, candidate.document,
+						conflictUpdate.Assignments, args, limits.MaxDocumentBytes,
 					)
 					if err != nil {
 						return nil, err
