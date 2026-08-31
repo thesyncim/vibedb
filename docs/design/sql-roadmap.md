@@ -14,6 +14,7 @@ stable.
 | **Complete** | `ALTER TABLE ... ADD COLUMN` | The embedded driver validates one additive schema in a replacement storage incarnation, retains indexes, and publishes atomically. The copy still blocks ordinary work under the catalog write lock. |
 | **Complete** | Primary-key `ON CONFLICT DO UPDATE` | Embedded `INSERT ... VALUES` supports whole-document replacement or declared top-level assignments from literals, placeholders, `NULL`, and `EXCLUDED`. The implicit primary key is the only target. |
 | **Complete (embedded)** | Conflict-action expressions | Embedded `INSERT ... VALUES ... ON CONFLICT DO UPDATE` evaluates arithmetic, concatenation, unary expressions, casts, and `CASE` over explicitly qualified current-row and `EXCLUDED` namespaces. Mixed assignments are simultaneous, exact-number preserving, statement-atomic, transaction-aware, and integrated with `RETURNING` plus local secondary/unique indexes. Distributed lanes retain their blanket conflict-action fence. |
+| **Complete (embedded)** | Mutation target aliases and conflict binding diagnostics | `UPDATE table [AS] alias` and `INSERT INTO table AS alias` preserve the physical collection while binding expressions and `RETURNING` through the effective target name. Aliases hide the original name, disambiguate a table literally named `excluded`, and pgwire reports hidden/ambiguous relations as `42P01`/`42P09`. Bare conflict-action names are classified eagerly against the transaction-visible catalog as declared-and-ambiguous (`42702`) or undefined (`42703`), including stale prepared plans. Distributed conflict actions remain fenced. |
 | **Complete** | Unique secondary constraints | Embedded `CREATE UNIQUE INDEX` enforces exact scalar tuples across build, DML, upsert, transactions, reopen, aliases, and drop. Default `NULLS DISTINCT` applies. RF3 SQL creation remains fail-closed. |
 
 These slices complete the original embedded P0 list. Embedded pgwire exposes
@@ -26,7 +27,6 @@ provide the same branch-aware and distributed uniqueness contracts.
 | --- | --- | --- |
 | P1 | Complete migration cycle | Add defaults/backfill, set or drop nullability, and rename/drop/type migration through the same atomic rebuild path. |
 | P1 | Distributed mutation postimages | Define one exact evaluated-postimage contract for mutation capture, maintained global indexes, and RF3, then remove the explicit computed-`UPDATE` fences lane by lane. |
-| P1 | Mutation target aliases and conflict binding diagnostics | Parse and bind `UPDATE table AS alias` plus `INSERT INTO table AS alias`. Use the live catalog to distinguish an undeclared bare conflict reference (`42703`) from one present in both current and `EXCLUDED` (`42702`), and use an INSERT alias to disambiguate a target table literally named `excluded`. |
 | P1 | Common scalar functions | Start with `COALESCE`, `NULLIF`, `LOWER`, `UPPER`, `LENGTH`, substring, and bounded numeric/JSON helpers. |
 | P1 | Aggregate composability | Add `COUNT(DISTINCT ...)`, expression arguments, grouping expressions, and non-projected aggregates in `HAVING`. |
 | P1 | Constraint basics | Add `DEFAULT` and `CHECK`. Treat foreign keys as a separate product decision for the JSON-first embedded scope. |
@@ -44,16 +44,15 @@ transactions are outside the embedded must-have set.
 1. Specify an exact postimage payload for capture and coordinator-owned index
    maintenance; enable global-index and RF3 lanes only after replay tests prove
    identical results.
-2. Add mutation target aliases and catalog-aware conflict-name diagnostics.
-3. Add the first common scalar functions without
+2. Add the first common scalar functions without
    widening the expression grammar beyond executable runtime support.
-4. Add catalog metadata for `DEFAULT` and `CHECK`, then extend the existing
+3. Add catalog metadata for `DEFAULT` and `CHECK`, then extend the existing
    storage-incarnation path with backfill and nullability changes.
-5. Add aggregate composability and a small SQL-visible vendor catalog in
+4. Add aggregate composability and a small SQL-visible vendor catalog in
    independent lanes.
-6. Add heap/range-planning parity and move local schema copies outside the
+5. Add heap/range-planning parity and move local schema copies outside the
    exclusive catalog lock.
-7. Promote an embedded feature to RF3 only after its coordinator, capture,
+6. Promote an embedded feature to RF3 only after its coordinator, capture,
    routing, and failure behavior can preserve the embedded invariant.
 
 Parser/AST, catalog encoding, mutation integration, and storage replacement
