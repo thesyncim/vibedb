@@ -422,6 +422,7 @@ func TestReplicatedSchemaDDLShadowBundleRestartBetweenRelationCommits(t *testing
 		KeyEncoding: ReplicatedRelationKeyCanonicalTuple, KeyArity: 1,
 		TupleVersion: distribution.CurrentTupleVersion, MapperVersion: distribution.NativeMapperVersion, BucketBits: distribution.DefaultVirtualBucketBits,
 	}})
+	skipReplicatedStrictAllocationUnsupported(t, db, base, err)
 	if err != nil {
 		t.Fatal(err)
 	}

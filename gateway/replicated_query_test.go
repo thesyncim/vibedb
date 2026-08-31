@@ -17,15 +17,16 @@ import (
 )
 
 type sqlRF3TestTransport struct {
-	mu         sync.Mutex
-	routes     map[raftmember.GroupKey]ReplicatedRoute
-	queries    int
-	fail       bool
-	sqlError   bool
-	nullResult bool
-	started    chan struct{}
-	lastParams []shardservice.Param
-	lastTypes  []sqldriver.ParamType
+	mu              sync.Mutex
+	routes          map[raftmember.GroupKey]ReplicatedRoute
+	queries         int
+	fail            bool
+	sqlError        bool
+	sqlErrorMessage string
+	nullResult      bool
+	started         chan struct{}
+	lastParams      []shardservice.Param
+	lastTypes       []sqldriver.ParamType
 }
 
 func (c *sqlRF3TestTransport) DoReplicated(ctx context.Context, endpoint ReplicatedEndpoint, req *shardservice.ReplicatedRequest) (*shardservice.ReplicatedResponse, error) {
@@ -76,7 +77,11 @@ func (c *sqlRF3TestTransport) DoReplicated(ctx context.Context, endpoint Replica
 		response = shardservice.RowsResponse([]shardservice.Column{{Name: name, TypeOID: 114}}, [][]shardservice.Cell{{{Null: true}}})
 	}
 	if c.sqlError {
-		response = shardservice.NewErrorResponse(shardservice.ErrorMalformedRequest, "SQL refused")
+		message := c.sqlErrorMessage
+		if message == "" {
+			message = "SQL refused"
+		}
+		response = shardservice.NewErrorResponse(shardservice.ErrorMalformedRequest, message)
 	}
 	if err := shardservice.EncodeResponse(&encoded, response); err != nil {
 		return nil, err
@@ -165,5 +170,19 @@ func TestRF3SQLReusesTargetingScatterGlobalOrderAndAggregate(t *testing.T) {
 	var sqlErr *ShardError
 	if result != nil || !errors.As(err, &sqlErr) {
 		t.Fatalf("SQL error became success: %+v %v", result, err)
+	}
+	if !errors.Is(err, ErrMalformedRequest) || sqlErr.SQLState() != "" {
+		t.Fatalf("legacy RF3 SQL error changed classification: %+v", sqlErr)
+	}
+	// Golden v1 envelope for 22012, message "division by zero", and authored
+	// byte position 9. This exercises both RF3 decode sites without importing a
+	// shardservice-internal constructor into the gateway.
+	client.sqlErrorMessage = "VDBSQL:ATIyMDEyAQAAAAkAEGRpdmlzaW9uIGJ5IHplcm8AAA"
+	result, err = executor.Query(context.Background(), Query{SQL: `SELECT id FROM messages WHERE id = 'a'`, Class: ClassBatch})
+	if result != nil || !errors.As(err, &sqlErr) || sqlErr.SQLState() != "22012" || sqlErr.Message != "division by zero" {
+		t.Fatalf("RF3 diagnostic error = result %+v, error %+v", result, err)
+	}
+	if position, ok := sqlErr.SQLPosition(); !ok || position != 9 {
+		t.Fatalf("RF3 SQL position = (%d, %v), want (9, true)", position, ok)
 	}
 }

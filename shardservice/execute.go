@@ -1828,6 +1828,11 @@ func classifyError(err error) *ShardResponse {
 		errors.Is(err, query.ErrAggregateBudget):
 		return NewErrorResponse(ErrorResourceLimit, err.Error())
 	default:
+		if diagnostic, ok := classifySQLDiagnostic(err); ok {
+			if response, encoded := newSQLDiagnosticResponse(diagnostic); encoded {
+				return response
+			}
+		}
 		return NewErrorResponse(ErrorMalformedRequest, err.Error())
 	}
 }

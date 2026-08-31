@@ -42,6 +42,10 @@ for each nonmatching script. Set `VIBEDB_PG_CORPUS_DIR` to reuse an existing
 checkout. CI uses the digest-pinned PostgreSQL 18.6 `psql` image recorded in
 `postgres.env` and uploads the complete report.
 
+Unapproved semantic mismatches remain observational so the report can expose
+the whole compatibility frontier. A timeout, a client/server failure, or a
+regression in an approved exact test always makes the command fail.
+
 The harness deliberately keeps PostgreSQL's statements, ordering, psql echo
 mode, and expected files intact. It only serializes the schedule and gives each
 script a hard timeout so unsupported or pathological features cannot consume

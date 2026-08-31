@@ -332,6 +332,6 @@ head -25 "$run_dir/error-signatures.txt" >> "$run_dir/report.md"
 printf '```\n' >> "$run_dir/report.md"
 printf '\nEvidence: %s\n' "$run_dir"
 
-if ((approved_failures > 0)); then
+if ((approved_failures > 0 || timeout_count > 0 || client_failure_count > 0)); then
   exit 1
 fi

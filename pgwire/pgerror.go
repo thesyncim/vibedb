@@ -333,6 +333,15 @@ func asPGErrorAcyclic(err error) (mapped *pgError) {
 		clone.withCause(err)
 		return &clone
 	}
+	var diagnostic interface{ SQLState() string }
+	if errors.As(err, &diagnostic) && validSQLState(diagnostic.SQLState()) {
+		result := newError(diagnostic.SQLState(), err.Error())
+		var hinted interface{ SQLHint() string }
+		if errors.As(err, &hinted) && hinted.SQLHint() != "" {
+			result.withHint(hinted.SQLHint())
+		}
+		return result.withCause(err)
+	}
 	// SQLSTATE is an additional protocol classification, not a replacement for
 	// the typed runtime failure. Keeping the complete original chain also means
 	// a joined, more-specific error selected below does not discard sibling
@@ -509,6 +518,12 @@ func asPGErrorIn(err error, src string) *pgError {
 		return invalidErrorTree()
 	}
 	e := asPGErrorAcyclic(err)
+	var diagnosticPosition interface{ SQLPosition() (int, bool) }
+	if e.position == 0 && errors.As(err, &diagnosticPosition) {
+		if position, ok := diagnosticPosition.SQLPosition(); ok {
+			e.position = charPosition(src, position)
+		}
+	}
 	var positioned interface{ Position() int }
 	if e.position == 0 && errors.As(err, &positioned) {
 		e.position = charPosition(src, positioned.Position())
@@ -518,6 +533,20 @@ func asPGErrorIn(err error, src string) *pgError {
 		e.position = charPosition(src, parse.Pos)
 	}
 	return e
+}
+
+func validSQLState(code string) bool {
+	if len(code) != 5 {
+		return false
+	}
+	for i := range code {
+		if code[i] < '0' || code[i] > '9' {
+			if code[i] < 'A' || code[i] > 'Z' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // charPosition converts a byte offset into the 1-based character index the

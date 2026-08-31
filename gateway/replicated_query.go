@@ -70,7 +70,7 @@ func (transport *ReplicatedSQLTransport) DoBatches(ctx context.Context, address 
 		return err
 	}
 	if result.Kind == shardservice.ResponseError {
-		return &ShardError{Kind: result.ErrorKind, Message: result.ErrorMessage}
+		return shardError(result)
 	}
 	var sequence uint32
 	batchRows := int(req.RowBatch.BatchRows)
@@ -176,7 +176,7 @@ func (executor *ReplicatedExecutor) QuerySQL(ctx context.Context, route Replicat
 				return nil, ErrReplicatedRoute
 			}
 			if result.Kind == shardservice.ResponseError {
-				return nil, &ShardError{Kind: result.ErrorKind, Message: result.ErrorMessage}
+				return nil, shardError(result)
 			}
 			if execution, ok := ctx.Value(replicatedSQLSnapshotKey{}).(*replicatedSQLAttempt); ok {
 				execution.mu.Lock()
