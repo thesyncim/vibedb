@@ -95,7 +95,8 @@ func TestReplicatedSchemaDDLTargetBuildsIndexedAndTruncatedImages(t *testing.T) 
 			}
 			if test.name == "alter-add-column" {
 				columns := tableInfoFromMeta("docs", catalog.Tables["docs"]).Columns
-				if len(columns) != 2 || columns[1].Path != "/department" || columns[1].Required {
+				if len(columns) != 2 || columns[0].Path != "/department" || columns[0].Required ||
+					columns[1].Path != "/id" || !columns[1].Required {
 					t.Fatalf("ALTER target columns = %+v", columns)
 				}
 			}
