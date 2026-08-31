@@ -37,7 +37,7 @@ func compilePrimaryRangeProgram(
 	where *sqlast.Expr,
 	primaryPath string,
 ) *primaryRangeProgram {
-	if where == nil || primaryPath == "" {
+	if where == nil || primaryPath == "" || containsRuntimeSQLPathComparison(where) {
 		return nil
 	}
 	program := &primaryRangeProgram{path: primaryPath}

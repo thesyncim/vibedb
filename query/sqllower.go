@@ -493,6 +493,7 @@ func (s *Statement) buildJoins(args []any) error {
 		if ref.Join == sqlast.JoinLeft {
 			join = LeftJoinOn(ref.Name, s.spec(cond.Left), s.localSpec(cond.Right))
 		}
+		join.origin = joinOriginSQL
 		s.q.joins = append(s.q.joins, join.As(ref.Alias))
 	}
 	if err := s.checkSingleFanOut(); err != nil {
@@ -741,14 +742,16 @@ func exprSource(e *sqlast.Expr) (source int, mixed bool) {
 		for _, kid := range e.Kids {
 			walk(kid)
 		}
-		if e.Path == nil {
-			return
-		}
-		switch {
-		case source < 0:
-			source = e.Path.Source
-		case source != e.Path.Source:
-			mixed = true
+		for _, path := range []*sqlast.PathExpr{e.Path, e.RightPath} {
+			if path == nil {
+				continue
+			}
+			switch {
+			case source < 0:
+				source = path.Source
+			case source != path.Source:
+				mixed = true
+			}
 		}
 	}
 	walk(e)
@@ -796,10 +799,26 @@ func (s *Statement) lowerNode(e *sqlast.Expr, wantTrue bool, args []any) (Predic
 func (s *Statement) combine(kind predKind, kids []*sqlast.Expr, wantTrue bool, args []any) (Predicate, error) {
 	base := len(s.stack)
 	defer func() { s.stack = s.stack[:base] }()
+	// PostgreSQL resolves every operator before boolean simplification. Keep a
+	// SQL path comparison reachable in the cold compiled tree even when TRUE OR
+	// or FALSE AND would otherwise fold its whole subtree away; execution uses
+	// that provenance for its domain-validation pass and still short-circuits
+	// the ordinary truth evaluation exactly as before.
+	preserveDomainAnalysis := false
+	for _, kid := range kids {
+		if sqlExprHasPathComparison(kid) {
+			preserveDomainAnalysis = true
+			break
+		}
+	}
 	for _, kid := range kids {
 		p, err := s.lowerNode(kid, wantTrue, args)
 		if err != nil {
 			return Predicate{}, err
+		}
+		if preserveDomainAnalysis {
+			s.stack = append(s.stack, p)
+			continue
 		}
 		if kind == predAnd {
 			if alwaysTrue(p) {
@@ -832,6 +851,21 @@ func (s *Statement) combine(kind predKind, kids []*sqlast.Expr, wantTrue bool, a
 		nodes = append(nodes, operands...)
 		return Predicate{kind: kind, kids: nodes}, nil
 	}
+}
+
+func sqlExprHasPathComparison(expr *sqlast.Expr) bool {
+	if expr == nil {
+		return false
+	}
+	if expr.Kind == sqlast.ExprCompare && expr.RightPath != nil {
+		return true
+	}
+	for _, child := range expr.Kids {
+		if sqlExprHasPathComparison(child) {
+			return true
+		}
+	}
+	return false
 }
 
 // lowerBetween lowers BETWEEN as the conjunction it denotes.
@@ -915,11 +949,14 @@ func (s *Statement) leafForm(e *sqlast.Expr, args []any) (leafForm, error) {
 	spec := s.spec(e.Path)
 	switch e.Kind {
 	case sqlast.ExprCompare:
-		if slot, ok := s.correlation.slot(e); ok {
-			return s.correlationCompareForm(e.Path, e.Op, slot)
+		if reference, ok := s.correlation.reference(e); ok {
+			return s.correlationCompareForm(e, reference)
 		}
 		if e.Subquery != nil {
 			return s.subqueryCompareForm(e)
+		}
+		if e.RightPath != nil {
+			return s.pathCompareForm(e)
 		}
 		return s.compareForm(e.Path, e.Op, e.Value, args)
 	case sqlast.ExprIn:
@@ -957,6 +994,25 @@ func (s *Statement) leafForm(e *sqlast.Expr, args []any) (leafForm, error) {
 	default:
 		return leafForm{}, fmt.Errorf("query: unsupported predicate in SQL lowering")
 	}
+}
+
+func (s *Statement) pathCompareForm(e *sqlast.Expr) (leafForm, error) {
+	left, right := s.spec(e.Path), s.spec(e.RightPath)
+	operatorPos := e.Value.Pos
+	if operatorPos == 0 {
+		operatorPos = e.Pos
+	}
+	guard := Predicate{
+		kind: predAnd,
+		kids: s.c.pair(
+			s.c.not(IsNull(left)),
+			s.c.not(IsNull(right)),
+		),
+	}
+	return leafForm{
+		pred:  comparePaths(left, Op(e.Op), right, operatorPos),
+		guard: guard,
+	}, nil
 }
 
 func (s *Statement) likeForm(e *sqlast.Expr, args []any) (leafForm, error) {

@@ -744,6 +744,8 @@ func (r *statementScalar) compileCasePredicate(s *Statement, expr *sqlast.Expr) 
 		}
 		node.left = left
 		if expr.RightPath != nil {
+			node.pathCompare = true
+			node.pos = expr.Value.Pos
 			node.right, err = r.compileDependency(s, expr.RightPath, sqlast.AggNone, expr.RightPath.Pos)
 		} else if expr.Subquery != nil {
 			return 0, sqlast.NewFeatureNotSupportedError(
@@ -998,6 +1000,14 @@ func (r *statementScalar) evalCasePredicate(
 		right := r.values[node.right]
 		if left.value.kind == kindNull || right.value.kind == kindNull {
 			value = triUnknown
+		} else if node.pathCompare {
+			var err error
+			value, err = compareSQLPathScalars(
+				node.pos, left.value, Op(node.op), right.value,
+			)
+			if err != nil {
+				return triFalse, err
+			}
 		} else if err := scalarCaseComparable(
 			left, node.leftDom, right, node.rightDom, node.pos,
 		); err != nil {

@@ -41,7 +41,7 @@ func isPrimaryPredicate(where *sqlast.Expr, primaryKey string) bool {
 // it against the current table incarnation with a string comparison and no
 // allocation.
 func primaryPredicateIdentity(where *sqlast.Expr) (path string, candidate bool) {
-	if where == nil || where.Path == nil {
+	if where == nil || where.Path == nil || where.RightPath != nil {
 		return "", false
 	}
 	switch where.Kind {
@@ -71,7 +71,7 @@ func compilePrimaryPointPredicate(
 	where *sqlast.Expr,
 	primaryPath string,
 ) *sqlast.Expr {
-	if where == nil || primaryPath == "" {
+	if where == nil || primaryPath == "" || containsRuntimeSQLPathComparison(where) {
 		return nil
 	}
 	var best *sqlast.Expr
@@ -81,6 +81,70 @@ func compilePrimaryPointPredicate(
 		where, primaryPath, &best, &bestRank, &bestKeys,
 	)
 	return best
+}
+
+// containsRuntimeSQLPathComparison is the storage-routing safety gate for an
+// authored operator whose domains come from live ANY/document values. A point
+// read, primary range, or shard constraint may not remove rows before that
+// operator is resolved. Predicate subqueries are included because their
+// correlation keys are still analyzed as part of the enclosing statement.
+func containsRuntimeSQLPathComparison(expr *sqlast.Expr) bool {
+	return expressionContainsRuntimeSQLPathComparison(expr, nil)
+}
+
+func expressionContainsRuntimeSQLPathComparison(
+	expr *sqlast.Expr,
+	seen []*sqlast.SelectStmt,
+) bool {
+	if expr == nil {
+		return false
+	}
+	if expr.Kind == sqlast.ExprCompare && expr.RightPath != nil {
+		return true
+	}
+	for _, child := range expr.Kids {
+		if expressionContainsRuntimeSQLPathComparison(child, seen) {
+			return true
+		}
+	}
+	return selectContainsRuntimeSQLPathComparison(expr.Subquery, seen)
+}
+
+func selectContainsRuntimeSQLPathComparison(
+	statement *sqlast.SelectStmt,
+	seen []*sqlast.SelectStmt,
+) bool {
+	if statement == nil {
+		return false
+	}
+	for _, prior := range seen {
+		if prior == statement {
+			return false
+		}
+	}
+	seen = append(seen, statement)
+	if expressionContainsRuntimeSQLPathComparison(statement.Where, seen) ||
+		expressionContainsRuntimeSQLPathComparison(statement.Having, seen) {
+		return true
+	}
+	for i := range statement.From {
+		relation := &statement.From[i]
+		if relation.On != nil &&
+			expressionContainsRuntimeSQLPathComparison(relation.On.Expr, seen) ||
+			selectContainsRuntimeSQLPathComparison(relation.Query, seen) {
+			return true
+		}
+	}
+	if statement.With != nil {
+		for i := range statement.With.CTEs {
+			if selectContainsRuntimeSQLPathComparison(
+				statement.With.CTEs[i].Query, seen,
+			) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func collectPrimaryPointPredicate(
@@ -128,6 +192,9 @@ func bindPrimaryPredicateKeys(
 ) ([]string, error) {
 	clear(dst)
 	keys := dst[:0]
+	if where == nil || where.RightPath != nil {
+		return keys, fmt.Errorf("vibedb: path comparison is not a primary-key point predicate")
+	}
 	var operands []sqlast.Operand
 	switch where.Kind {
 	case sqlast.ExprCompare:
@@ -188,6 +255,9 @@ func (c *conn) bindPointPredicateKeys(
 	c.pointKeys = c.pointKeys[:0]
 	c.pointKeyRaw = c.pointKeyRaw[:0]
 	c.pointKeyEnds = c.pointKeyEnds[:0]
+	if where == nil || where.RightPath != nil {
+		return c.pointKeys, fmt.Errorf("vibedb: path comparison is not a primary-key point predicate")
+	}
 
 	var operands []sqlast.Operand
 	switch where.Kind {

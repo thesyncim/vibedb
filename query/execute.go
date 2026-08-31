@@ -523,7 +523,7 @@ func (p *plan) runInto(dst *Result, s *store.Segment, w *Workspace, workers int)
 	if err := w.checkCanceled(); err != nil {
 		return err
 	}
-	if p.hasLimit && p.limit == 0 {
+	if p.hasLimit && p.limit == 0 && !p.requiresSQLDomainScan() {
 		return prepareResult(dst, p, 0)
 	}
 	if err := w.activeHeapWorkBudget().admitPlanner(
@@ -655,7 +655,9 @@ func (p *plan) runSnapshotInto(e *Exec, snapshot store.Snapshot, catalog store.D
 	// only an ordinary membership once its slot is filled. Binding here also
 	// means it happens on the calling goroutine, before any worker exists, which
 	// is what lets the bindings be shared read-only across the filter phase.
-	if p.hasLimit && p.limit == 0 {
+	// Runtime-typed SQL joins still bind and scan at LIMIT 0: PostgreSQL resolves
+	// the ON operator before LIMIT can discard its rows.
+	if p.hasLimit && p.limit == 0 && !p.requiresSQLDomainScan() {
 		for i := range p.joins {
 			if _, ok := catalog.Collection(p.joins[i].collection); !ok {
 				return fmt.Errorf(
@@ -1429,6 +1431,16 @@ func numericRawsCancelable(dst numColumn, raws []vibejson.RawValue, cancel *Canc
 }
 
 func (p *plan) selectRows(ctx *execCtx, candidates []int, compact bool, w *Workspace) ([]int, error) {
+	if err := p.validateSQLJoinOuterDomains(
+		ctx.values, w.eval.binds, 0, ctx.rows, w.cancel,
+	); err != nil {
+		return nil, err
+	}
+	if err := p.validateSQLPathDomains(
+		ctx.values, w.eval.correlations, 0, ctx.rows, w.cancel,
+	); err != nil {
+		return nil, err
+	}
 	selected := w.selected[:0]
 	cancel := w.cancel
 	if cancel != nil {
@@ -1533,7 +1545,7 @@ func selectSpanCancelable(
 }
 
 func (p *plan) candidateRows(s *store.Segment, w *Workspace) []int {
-	if p.where == nil || !s.Postings {
+	if p.where == nil || !s.Postings || p.requiresSQLDomainScan() {
 		return nil
 	}
 	rows, ok := p.where.candidates(s, w)
@@ -1910,8 +1922,18 @@ func (ctx *execCtx) expandPairs(p *plan, j *planJoin, b *joinBinding, selected [
 		if remaining >= 0 {
 			innerLimit = len(inner) + remaining
 		}
+		cell := ctx.values[joinCol][row]
+		if strictSQLJoinOrigin(j.origin) {
+			if err := b.sqlComparisonError(
+				cell, j.slot, bareJoinOrigin(j.origin),
+			); err != nil {
+				w.pairOuterScan, w.pairOuterRows = outerScan, outerRows
+				w.pairInner, w.pairInnerPair = inner, innerPair
+				return err
+			}
+		}
 		inner, found, overflow = b.build.appendMatches(
-			inner, ctx.values[joinCol][row], innerLimit,
+			inner, cell, innerLimit,
 		)
 		pairAt := len(outerScan)
 		if mapInner {

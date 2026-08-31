@@ -164,6 +164,7 @@ type explainJoinKey struct {
 type explainPredicate struct {
 	Kind       string             `json:"kind"`
 	Path       string             `json:"path,omitempty"`
+	RightPath  string             `json:"right_path,omitempty"`
 	Operator   string             `json:"operator,omitempty"`
 	ValueCount int                `json:"value_count,omitempty"`
 	Children   []explainPredicate `json:"children,omitempty"`
@@ -336,7 +337,7 @@ func (p *plan) explainJSONAnalysis(
 		access := "adaptive-semi-join"
 		if join.fanOut {
 			access = "hash-build-and-probe"
-		} else if join.origin == joinOriginDecorrelatedExists {
+		} else if bareJoinOrigin(join.origin) == joinOriginDecorrelatedExists {
 			access = "decorrelated-exists-semi"
 			if join.anti {
 				access = "decorrelated-exists-anti"
@@ -822,7 +823,9 @@ func explainPredicateSummary(predicate *compiledPredicate) string {
 	switch predicate.kind {
 	case predCmp:
 		return "comparison"
-	case predCmpBound:
+	case predCmpPath:
+		return "path-comparison"
+	case predCmpBound, predCmpPathBound:
 		return "correlation-comparison"
 	case predCorrelationKnown:
 		return "correlation-known"
@@ -840,9 +843,9 @@ func explainPredicateSummary(predicate *compiledPredicate) string {
 		return "not"
 	case predIn:
 		return "in"
-	case predInBound:
+	case predInBound, predSQLInBound:
 		return "join-match"
-	case predAntiBound:
+	case predAntiBound, predSQLAntiBound:
 		return "join-anti-match"
 	default:
 		return "unknown"
@@ -860,8 +863,10 @@ func explainPredicateTree(predicate *compiledPredicate, paths []compiledPath) *e
 		node.Path = predicate.boundPath
 	}
 	switch predicate.kind {
-	case predCmp, predCmpBound:
+	case predCmp, predCmpBound, predCmpPathBound:
 		node.Operator = explainOperator(predicate.op)
+	case predCmpPath:
+		node.Operator = sqlast.CmpOp(predicate.op).String()
 	case predCorrelationKnown:
 		node.Operator = "IS KNOWN"
 	case predContains:
@@ -870,11 +875,14 @@ func explainPredicateTree(predicate *compiledPredicate, paths []compiledPath) *e
 		node.Operator = "EXISTS"
 	case predIsNull:
 		node.Operator = "IS NULL"
-	case predIn, predInBound:
+	case predIn, predInBound, predSQLInBound:
 		node.Operator = "IN"
 		node.ValueCount = len(predicate.lits)
-	case predAntiBound:
+	case predAntiBound, predSQLAntiBound:
 		node.Operator = "NO MATCH"
+	}
+	if predicate.kind == predCmpPath && predicate.slot >= 0 && predicate.slot < len(paths) {
+		node.RightPath = paths[predicate.slot].spec
 	}
 	for _, child := range predicate.kids {
 		if explained := explainPredicateTree(child, paths); explained != nil {
@@ -888,7 +896,9 @@ func explainPredicateKind(kind predKind) string {
 	switch kind {
 	case predCmp:
 		return "comparison"
-	case predCmpBound:
+	case predCmpPath:
+		return "path-comparison"
+	case predCmpBound, predCmpPathBound:
 		return "correlation-comparison"
 	case predCorrelationKnown:
 		return "correlation-known"
@@ -906,9 +916,9 @@ func explainPredicateKind(kind predKind) string {
 		return "not"
 	case predIn:
 		return "in"
-	case predInBound:
+	case predInBound, predSQLInBound:
 		return "join-match"
-	case predAntiBound:
+	case predAntiBound, predSQLAntiBound:
 		return "join-anti-match"
 	default:
 		return "unknown"

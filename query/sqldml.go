@@ -663,10 +663,11 @@ const scanBatchBytes = 1 << 20
 // exactly one Filter at a time. It borrows the [Exec] it was made with and
 // stays valid until that Exec is reused by anything else.
 type Filter struct {
-	plan  *plan
-	e     *Exec
-	docs  store.Segment
-	visit func(key, doc []byte) error
+	plan      *plan
+	statement *Statement
+	e         *Exec
+	docs      store.Segment
+	visit     func(key, doc []byte) error
 
 	// The pending batch: keys packed end to end in keyBuf with one end-offset
 	// per row in keyEnds, and documents likewise in buf and ends. All four are
@@ -703,7 +704,7 @@ func (d *DMLStatement) Filter(e *Exec, args []any, visit func(key, doc []byte) e
 	// Drop the previous pass before any validation that can return without a
 	// Filter. In particular, a pre-canceled call must not leave the prepared
 	// statement retaining an Exec and callback the caller never received.
-	f.e, f.visit, f.plan, f.err = nil, nil, nil, nil
+	f.e, f.visit, f.plan, f.statement, f.err = nil, nil, nil, nil, nil
 	w := &e.Workspace
 	w.clearBorrowedViews()
 	w.cancel = e.Options.Cancel
@@ -746,7 +747,7 @@ func (d *DMLStatement) Filter(e *Exec, args []any, visit func(key, doc []byte) e
 	w.heapWorkParent = &w.heapWorkBudget
 	w.heapWorkTextReserved = 0
 	w.eval.setWork(&w.heapWorkBudget)
-	f.e, f.visit, f.plan = e, visit, p
+	f.e, f.visit, f.plan, f.statement = e, visit, p, d.filter
 	return f, nil
 }
 
@@ -871,6 +872,9 @@ func (f *Filter) flush() error {
 }
 
 func (f *Filter) fail(err error) error {
+	if f.statement != nil {
+		err = f.statement.translateSQLPathComparisonError(err)
+	}
 	f.err = err
 	if errors.Is(err, ErrCanceled) {
 		f.e.Workspace.clearBorrowedViews()

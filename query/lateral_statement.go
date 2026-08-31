@@ -718,6 +718,12 @@ func (c *lateralClone) compileGate(expr *sqlast.Expr) (lateralGateExpr, error) {
 		insensitive: expr.Insensitive, left: -1, right: -1,
 		value: expr.Value, list: expr.List,
 	}
+	if expr.RightPath != nil && gate.value.Pos == 0 {
+		// Parser-produced path comparisons carry the operator offset in Value.
+		// Keep the fallback for owned AST callers, but never replace the negative
+		// sentinel used by stored-view definitions.
+		gate.value.Pos = expr.Pos
+	}
 	switch expr.Kind {
 	case sqlast.ExprAnd, sqlast.ExprOr, sqlast.ExprNot:
 		gate.kids = make([]lateralGateExpr, len(expr.Kids))
@@ -807,11 +813,20 @@ func (c *lateralClone) cloneExpr(expr *sqlast.Expr) (*sqlast.Expr, error) {
 			)
 		}
 		clone.RightPath = nil
-		clone.Value = sqlast.Operand{}
-		c.mark(rightRef, rightBinding, true)
+		// RightPath is replaced by an execution slot, but Value.Pos still owns
+		// the authored operator offset (or the stored-view -1 sentinel).
+		clone.Value = sqlast.Operand{Pos: expr.Value.Pos}
+		c.mark(rightRef, rightBinding, false)
 		node := &clone
+		operatorPos := expr.Value.Pos
+		if operatorPos == 0 {
+			operatorPos = expr.Pos
+		}
 		c.correlation = append(c.correlation, statementCorrelationReference{
 			expr: node, slot: rightBinding,
+			comparison: boundPathComparison{
+				operatorPos: operatorPos, authoredOp: Op(expr.Op),
+			},
 		})
 		return node, nil
 	}
@@ -823,11 +838,18 @@ func (c *lateralClone) cloneExpr(expr *sqlast.Expr) (*sqlast.Expr, error) {
 	clone.Path = expr.RightPath
 	clone.RightPath = nil
 	clone.Op = lateralReverseComparison(expr.Op)
-	clone.Value = sqlast.Operand{}
-	c.mark(leftRef, leftBinding, true)
+	clone.Value = sqlast.Operand{Pos: expr.Value.Pos}
+	c.mark(leftRef, leftBinding, false)
 	node := &clone
+	operatorPos := expr.Value.Pos
+	if operatorPos == 0 {
+		operatorPos = expr.Pos
+	}
 	c.correlation = append(c.correlation, statementCorrelationReference{
 		expr: node, slot: leftBinding,
+		comparison: boundPathComparison{
+			operatorPos: operatorPos, authoredOp: Op(expr.Op), reversed: true,
+		},
 	})
 	return node, nil
 }
@@ -939,11 +961,13 @@ func (l *statementLateral) evalGate(
 				return triFalse, fmt.Errorf("query: invalid prepared LATERAL right gate binding")
 			}
 			right := l.slots[gate.right].value
-			if cell.kind == kindNull || right.kind == kindNull {
-				value = triUnknown
-			} else {
-				value = boolTri(acceptSign(compareScalar(cell, right), Op(gate.op)))
+			compared, compareErr := compareSQLPathScalars(
+				gate.value.Pos, cell, Op(gate.op), right,
+			)
+			if compareErr != nil {
+				return triFalse, compareErr
 			}
+			value = compared
 		} else {
 			literal, known, err := join.joinOperand(gate.value, l.args)
 			if err != nil {
@@ -1604,6 +1628,11 @@ func (l *statementLateral) runStage(
 	// proof strong enough to make reuse truthful yet.
 	if err := l.materializeRights(
 		join, op, owner, parent, src, rootArgs, left, frame,
+	); err != nil {
+		return 0, 0, err
+	}
+	if err := join.validateLateralStageComparisonDomains(
+		stage, left, l.rights, parent.Options.Cancel,
 	); err != nil {
 		return 0, 0, err
 	}

@@ -535,8 +535,10 @@ func (p *Parser) parseLeafTail(
 	if !ok {
 		return nil, p.errHere("expected a comparison operator, IS, IN, BETWEEN, or @> after a path; a bare path is not a condition, so a boolean field is tested as `flag = TRUE`")
 	}
+	operatorPos := p.tok.pos
 	p.advance()
-	pathComparison := ctx == ctxJoin || p.correlation != nil && p.correlation.capture != nil
+	pathComparison := ctx == ctxWhere || ctx == ctxJoin || p.inCaseTruth() ||
+		p.correlation != nil && p.correlation.capture != nil
 	if target, supported, known := scalarTypedStringHead(p.tok); known {
 		head := p.tok
 		p.advance()
@@ -593,7 +595,7 @@ func (p *Parser) parseLeafTail(
 		e := p.exprs.one()
 		*e = Expr{
 			Kind: ExprCompare, Op: op, Agg: agg, Column: -1,
-			Path: path, RightPath: right, Pos: pos,
+			Path: path, RightPath: right, Value: Operand{Pos: operatorPos}, Pos: pos,
 		}
 		return e, nil
 	}
@@ -607,7 +609,7 @@ func (p *Parser) parseLeafTail(
 		e := p.exprs.one()
 		*e = Expr{
 			Kind: ExprCompare, Op: op, Agg: agg, Column: -1,
-			Path: path, RightPath: right, Pos: pos,
+			Path: path, RightPath: right, Value: Operand{Pos: operatorPos}, Pos: pos,
 		}
 		return e, nil
 	}
@@ -625,7 +627,10 @@ func (p *Parser) parseLeafTail(
 				)
 			}
 			e := p.exprs.one()
-			*e = Expr{Kind: ExprCompare, Op: op, Agg: agg, Column: -1, Path: path, Subquery: sub, Pos: pos}
+			*e = Expr{
+				Kind: ExprCompare, Op: op, Agg: agg, Column: -1,
+				Path: path, Subquery: sub, Value: Operand{Pos: operatorPos}, Pos: pos,
+			}
 			return e, nil
 		}
 		return nil, p.errHere("a comparison parenthesis must contain a SELECT subquery")
@@ -708,7 +713,10 @@ func (p *Parser) parseInTail(
 			)
 		}
 		e := p.exprs.one()
-		*e = Expr{Kind: ExprIn, Negated: negated, Agg: agg, Column: -1, Path: path, Subquery: sub, Pos: pos}
+		*e = Expr{
+			Kind: ExprIn, Negated: negated, Agg: agg, Column: -1,
+			Path: path, Subquery: sub, Value: Operand{Pos: operatorPos}, Pos: pos,
+		}
 		return e, nil
 	}
 	if p.tok.kind == tokRParen {

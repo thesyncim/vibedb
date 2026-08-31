@@ -12,9 +12,74 @@ import (
 // state lets diagnostics and tests retain authored identity; execution uses
 // the rendered markKeys below and never revisits the parser tree.
 type statementCorrelatedKey struct {
-	outer   *sqlast.PathExpr
-	inner   *sqlast.PathExpr
-	binding int
+	outer       *sqlast.PathExpr
+	inner       *sqlast.PathExpr
+	binding     int
+	operatorPos int
+	outerFirst  bool
+	domain      SQLPathDomain
+}
+
+// SQLPathDomain is a trusted catalog proof for one declared SQL column's live
+// scalar domain. Missing and null remain neutral. Unknown means a schemaless
+// or union-typed path whose runtime comparisons must retain a complete scan so
+// an incompatible live value cannot be pruned before it reports 42883.
+type SQLPathDomain uint8
+
+const (
+	SQLPathDomainUnknown SQLPathDomain = iota
+	SQLPathDomainBoolean
+	SQLPathDomainNumeric
+	SQLPathDomainText
+)
+
+// ProveSQLPathComparisonDomains installs catalog-authenticated domain proofs
+// for single-key decorrelated EXISTS/NOT EXISTS comparisons. resolve is used
+// only during this call; neither it nor any source/schema object is retained.
+func (s *Statement) ProveSQLPathComparisonDomains(
+	resolve func(collection, pointer string) SQLPathDomain,
+) {
+	if s == nil || s.nested == nil || resolve == nil {
+		return
+	}
+	joinSlot := 0
+	for i := range s.nested.decorrelated {
+		proof := &s.nested.decorrelated[i]
+		if proof.mark {
+			continue
+		}
+		if len(proof.keys) == 1 && proof.subquery != nil && s.tree != nil &&
+			len(s.tree.From) != 0 && len(proof.subquery.From) != 0 {
+			key := &proof.keys[0]
+			outerSource, innerSource := key.outer.Source, key.inner.Source
+			if outerSource >= 0 && outerSource < len(s.tree.From) &&
+				innerSource >= 0 && innerSource < len(proof.subquery.From) {
+				outerDomain := resolve(
+					s.tree.From[outerSource].Name,
+					string(key.outer.AppendPointer(nil)),
+				)
+				innerDomain := resolve(
+					proof.subquery.From[innerSource].Name,
+					string(key.inner.AppendPointer(nil)),
+				)
+				if outerDomain != SQLPathDomainUnknown && outerDomain == innerDomain {
+					key.domain = outerDomain
+				}
+			}
+			if joinSlot < len(s.q.joins) {
+				s.q.joins[joinSlot].origin = withJoinSQLDomain(
+					s.q.joins[joinSlot].origin, key.domain,
+				)
+			}
+			if s.q.built != nil && s.q.built.plan != nil &&
+				joinSlot < len(s.q.built.plan.joins) {
+				s.q.built.plan.joins[joinSlot].origin = withJoinSQLDomain(
+					s.q.built.plan.joins[joinSlot].origin, key.domain,
+				)
+			}
+		}
+		joinSlot++
+	}
 }
 
 // statementDecorrelatedExists is the cold proof retained by one prepared SQL
@@ -212,6 +277,8 @@ func (s *Statement) proveCorrelatedPredicate(
 			}
 			keys = append(keys, statementCorrelatedKey{
 				outer: outer, inner: inner, binding: binding,
+				operatorPos: term.Value.Pos,
+				outerFirst:  leftBinding >= 0,
 			})
 			continue
 		}
@@ -245,8 +312,10 @@ func (s *Statement) proveCorrelatedPredicate(
 	markKeys := make([]correlatedMarkKey, len(keys))
 	for i := range keys {
 		markKeys[i] = correlatedMarkKey{
-			outer: s.spec(keys[i].outer),
-			inner: s.localSpec(keys[i].inner),
+			outer:       s.spec(keys[i].outer),
+			inner:       s.localSpec(keys[i].inner),
+			operatorPos: keys[i].operatorPos,
+			outerFirst:  keys[i].outerFirst,
 		}
 	}
 	var exists *sqlast.Expr
@@ -749,6 +818,8 @@ func (s *Statement) buildDecorrelatedExists(args []any) error {
 				keys:       proved.markKeys,
 				kind:       proved.kind,
 				op:         proved.op,
+				authoredOp: Op(proved.predicate.Op),
+				valuePos:   proved.predicate.Value.Pos,
 			}
 			if proved.probe != nil {
 				mark.probe = s.spec(proved.probe)
@@ -774,7 +845,9 @@ func (s *Statement) buildDecorrelatedExists(args []any) error {
 			s.localSpec(proved.inner),
 		)
 		join.anti = proved.anti
-		join.origin = joinOriginDecorrelatedExists
+		join.origin = withJoinSQLDomain(
+			joinOriginDecorrelatedExists, proved.keys[0].domain,
+		)
 		if proved.local != nil {
 			s.joinFilter = true
 			local, err := s.lowerNode(proved.local, true, args)

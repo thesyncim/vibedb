@@ -508,6 +508,16 @@ func (sw *scanWorker) classifyAndSelect(p *plan, ctx *execCtx, textNeed int) err
 				col[sw.lo+j] = classifyRawInto(r, &sw.text)
 			}
 		}
+		if err := p.validateSQLJoinOuterDomains(
+			ctx.values, sw.eval.binds, sw.lo, sw.hi, nil,
+		); err != nil {
+			return err
+		}
+		if err := p.validateSQLPathDomains(
+			ctx.values, sw.eval.correlations, sw.lo, sw.hi, nil,
+		); err != nil {
+			return err
+		}
 		if out, ok := p.where.selectSpan(sw.selected, ctx.values, sw.lo, sw.hi); ok {
 			sw.selected = out
 			return nil
@@ -527,6 +537,16 @@ func (sw *scanWorker) classifyAndSelect(p *plan, ctx *execCtx, textNeed int) err
 			}
 			col[sw.lo+j] = classifyRawInto(r, &sw.text)
 		}
+	}
+	if err := p.validateSQLJoinOuterDomains(
+		ctx.values, sw.eval.binds, sw.lo, sw.hi, sw.cancel,
+	); err != nil {
+		return err
+	}
+	if err := p.validateSQLPathDomains(
+		ctx.values, sw.eval.correlations, sw.lo, sw.hi, sw.cancel,
+	); err != nil {
+		return err
 	}
 	var err error
 	sw.selected, err = selectSpanCancelable(

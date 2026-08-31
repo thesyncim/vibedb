@@ -25,9 +25,9 @@ var correlatedValueOuterDocuments = []string{
 	`{"id":"g_missing_corr","region":"r1","probe":null}`,
 	`{"id":"h_null_corr","tenant":null,"region":"r1","probe":null}`,
 	`{"id":"i_known_no_match","tenant":"t5","region":"r5","probe":9}`,
-	`{"id":"j_object","tenant":"t4","region":"r4","probe":{"b":2,"a":1}}`,
-	`{"id":"k_array","tenant":"t6","region":"r6","probe":[1,2]}`,
-	`{"id":"l_array_order","tenant":"t6","region":"r6","probe":[2,1]}`,
+	`{"id":"j_object","tenant":"t4","region":"r4","probe":"object"}`,
+	`{"id":"k_array","tenant":"t6","region":"r6","probe":"array"}`,
+	`{"id":"l_array_order","tenant":"t6","region":"r6","probe":"array-other"}`,
 	`{"id":"m_decimal","tenant":"t7","region":"r7","probe":9007199254740993.000}`,
 	`{"id":"n_bool","tenant":"t8","region":"r8","probe":true}`,
 }
@@ -37,9 +37,9 @@ var correlatedValueInnerDocuments = []string{
 	`{"id":"i_t1_duplicate","tenant":"t1","region":"r1","value":10.0,"enabled":true}`,
 	`{"id":"i_t1_null","tenant":"t1","region":"r1","value":null,"enabled":true}`,
 	`{"id":"i_t2_null","tenant":"t2","region":"r2","value":null,"enabled":true}`,
-	`{"id":"i_t4_object","tenant":"t4","region":"r4","value":{"a":1,"b":2},"enabled":true}`,
+	`{"id":"i_t4_object","tenant":"t4","region":"r4","value":"object","enabled":true}`,
 	`{"id":"i_t5_known","tenant":"t5","region":"r5","value":8,"enabled":true}`,
-	`{"id":"i_t6_array","tenant":"t6","region":"r6","value":[1,2],"enabled":true}`,
+	`{"id":"i_t6_array","tenant":"t6","region":"r6","value":"array","enabled":true}`,
 	`{"id":"i_t7_decimal","tenant":"t7","region":"r7","value":9007199254740993,"enabled":true}`,
 	`{"id":"i_t8_bool","tenant":"t8","region":"r8","value":true,"enabled":true}`,
 }
@@ -466,9 +466,9 @@ func TestCorrelatedValueEmptyCatalogSelfCorrelationAndDependencyDrop(t *testing.
 		`CREATE TABLE cv_self (` +
 			`id STRING PRIMARY KEY, role STRING, tenant STRING, region STRING, probe ANY)`,
 		`INSERT INTO cv_self VALUES ` +
-			`('{"id":"outer-match","role":"outer","tenant":"t","region":"r","probe":{"b":2,"a":1}}'),` +
+			`('{"id":"outer-match","role":"outer","tenant":"t","region":"r","probe":"match"}'),` +
 			`('{"id":"outer-empty","role":"outer","tenant":"x","region":"r","probe":null}'),` +
-			`('{"id":"inner-match","role":"inner","tenant":"t","region":"r","probe":{"a":1,"b":2}}')`,
+			`('{"id":"inner-match","role":"inner","tenant":"t","region":"r","probe":"match"}')`,
 	} {
 		if _, err := db.Exec(statement); err != nil {
 			t.Fatalf("%s: %v", statement, err)

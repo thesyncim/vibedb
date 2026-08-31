@@ -22,12 +22,13 @@ var correlatedMarkCardinalityError = &CardinalityViolationError{}
 // zero, one, and more-than-one authored rows (including duplicate and NULL
 // projections). key addresses width consecutive retained scalars.
 type markGroup struct {
-	hash    uint64
-	key     int
-	next    int32
-	rows    uint8
-	hasNull bool
-	first   scalar
+	hash       uint64
+	key        int
+	next       int32
+	rows       uint8
+	valueKinds uint8
+	hasNull    bool
+	first      scalar
 }
 
 // markValue is one deduplicated non-NULL IN projection within a group.
@@ -50,7 +51,8 @@ type markFileSide struct {
 // live in text; the nested scan workspace and durable batch are private to the
 // build and never participate in probes.
 type markBinding struct {
-	plan planMark
+	plan     planMark
+	keyKinds []uint8
 
 	groups       []markGroup
 	keys         []scalar
@@ -96,6 +98,8 @@ func (b *markBinding) reset() {
 	b.leftReserved = 0
 	b.rightReserved = 0
 	b.plan = planMark{}
+	clear(b.keyKinds)
+	b.keyKinds = b.keyKinds[:0]
 	b.masks = b.masks[:0]
 	b.rows = b.rows[:0]
 	b.scan.clearBorrowedViews()
@@ -134,26 +138,42 @@ func markMix(hash, part uint64, index int) uint64 {
 }
 
 func (b *markBinding) hashInner(cols [][]scalar, row int, work *heapWorkBudget) (uint64, bool, error) {
+	if len(b.keyKinds) != len(b.plan.innerKeys) {
+		b.keyKinds = resize(b.keyKinds, len(b.plan.innerKeys))
+		clear(b.keyKinds)
+	}
 	hash := uint64(0x9e3779b97f4a7c15)
+	known := true
 	for i, col := range b.plan.innerKeys {
 		value := cols[col][row]
 		if value.kind == kindNull {
-			return 0, false, nil
+			known = false
+			continue
 		}
+		b.keyKinds[i] |= uint8(1) << uint8(value.kind)
 		part, err := b.hashBuildScalar(value, work)
 		if err != nil {
 			return 0, false, err
 		}
 		hash = markMix(hash, part, i)
 	}
-	return hash, true, nil
+	return hash, known, nil
 }
 
 func (b *markBinding) hashOuter(cols [][]scalar, row int, scratch *evalScratch) (uint64, bool) {
+	if scratch.err != nil {
+		return 0, false
+	}
 	hash := uint64(0x9e3779b97f4a7c15)
+	known := true
 	for i, col := range b.plan.outer {
 		value := cols[col][row]
 		if value.kind == kindNull {
+			known = false
+			continue
+		}
+		if err := b.validateKeyDomains(i, value); err != nil {
+			scratch.parkError(err)
 			return 0, false
 		}
 		part, ok := scratch.hashMarkScalar(b.seed, value)
@@ -162,7 +182,29 @@ func (b *markBinding) hashOuter(cols [][]scalar, row int, scratch *evalScratch) 
 		}
 		hash = markMix(hash, part, i)
 	}
-	return hash, true
+	return hash, known
+}
+
+func (b *markBinding) validateKeyDomains(index int, outer scalar) error {
+	if index < 0 || index >= len(b.keyKinds) || index >= len(b.plan.keyPositions) {
+		return nil
+	}
+	for kind := kindBool; kind <= kindContainer; kind++ {
+		if b.keyKinds[index]&(uint8(1)<<uint8(kind)) == 0 {
+			continue
+		}
+		inner := scalar{kind: kind}
+		left, right := inner, outer
+		if index < len(b.plan.keyOuterFirst) && b.plan.keyOuterFirst[index] {
+			left, right = outer, inner
+		}
+		if _, err := compareSQLPathScalars(
+			b.plan.keyPositions[index], left, Eq, right,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (b *markBinding) sameInnerKey(group *markGroup, cols [][]scalar, row int, work *heapWorkBudget) (bool, error) {
@@ -789,8 +831,12 @@ func (b *markBinding) addInnerRow(cols [][]scalar, row int, work *heapWorkBudget
 			g.hasNull = true
 			return nil
 		}
+		g.valueKinds |= uint8(1) << uint8(projected.kind)
 		return b.addValue(group, projected, work)
 	case correlatedMarkScalar:
+		if projected.kind != kindNull {
+			g.valueKinds |= uint8(1) << uint8(projected.kind)
+		}
 		if g.rows == 1 {
 			first, err := b.copyScalar(projected, work)
 			if err != nil {
@@ -803,6 +849,9 @@ func (b *markBinding) addInnerRow(cols [][]scalar, row int, work *heapWorkBudget
 }
 
 func (b *markBinding) matches(cols [][]scalar, row int, scratch *evalScratch) bool {
+	if scratch.err != nil {
+		return false
+	}
 	hash, addressable := b.hashOuter(cols, row, scratch)
 	group := markEmpty
 	if addressable {
@@ -821,6 +870,10 @@ func (b *markBinding) matches(cols [][]scalar, row int, scratch *evalScratch) bo
 		if probe.kind == kindNull {
 			return false
 		}
+		if err := b.validateValueDomains(b.groups[group].valueKinds, probe, Eq); err != nil {
+			scratch.parkError(err)
+			return false
+		}
 		hash, ok := b.valueHashProbe(group, probe, scratch)
 		return ok && b.hasValueProbe(group, hash, probe, scratch)
 	case correlatedMarkNotIn:
@@ -830,7 +883,14 @@ func (b *markBinding) matches(cols [][]scalar, row int, scratch *evalScratch) bo
 			return true
 		}
 		probe := cols[b.plan.probe][row]
-		if probe.kind == kindNull || b.groups[group].hasNull {
+		if probe.kind == kindNull {
+			return false
+		}
+		if err := b.validateValueDomains(b.groups[group].valueKinds, probe, Eq); err != nil {
+			scratch.parkError(err)
+			return false
+		}
+		if b.groups[group].hasNull {
 			return false
 		}
 		hash, ok := b.valueHashProbe(group, probe, scratch)
@@ -840,6 +900,20 @@ func (b *markBinding) matches(cols [][]scalar, row int, scratch *evalScratch) bo
 			return false
 		}
 		g := &b.groups[group]
+		probe := cols[b.plan.probe][row]
+		// PostgreSQL resolves the comparison operator before executing the
+		// scalar-subquery cardinality check. In this runtime-typed surface that
+		// means every live projected domain must be compatible with a live probe
+		// before 21000 can win. NULL remains neutral, while compatible multi-row
+		// groups still report cardinality before NULL can short-circuit.
+		if probe.kind != kindNull {
+			if err := b.validateValueDomains(
+				g.valueKinds, probe, b.plan.authoredOp,
+			); err != nil {
+				scratch.parkError(err)
+				return false
+			}
+		}
 		// Cardinality is a property of authored rows, not distinct projected
 		// values. It is checked before either operand can short-circuit on NULL,
 		// but only after this outer row actually addressed the group.
@@ -847,12 +921,31 @@ func (b *markBinding) matches(cols [][]scalar, row int, scratch *evalScratch) bo
 			scratch.parkError(correlatedMarkCardinalityError)
 			return false
 		}
-		probe := cols[b.plan.probe][row]
 		if probe.kind == kindNull || g.first.kind == kindNull {
+			return false
+		}
+		if _, err := compareSQLPathScalars(
+			b.plan.valuePos, probe, b.plan.authoredOp, g.first,
+		); err != nil {
+			scratch.parkError(err)
 			return false
 		}
 		return evalCmp(probe, b.plan.op, g.first)
 	}
+}
+
+func (b *markBinding) validateValueDomains(kinds uint8, probe scalar, op Op) error {
+	for kind := kindBool; kind <= kindContainer; kind++ {
+		if kinds&(uint8(1)<<uint8(kind)) == 0 {
+			continue
+		}
+		if _, err := compareSQLPathScalars(
+			b.plan.valuePos, probe, op, scalar{kind: kind},
+		); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (p *plan) validateHeapMarkDependencies(catalog store.DatabaseSnapshot) error {
@@ -895,6 +988,8 @@ func (p *plan) bindMarks(
 		b := &w.marks[p.marks[i].slot]
 		b.reset()
 		b.plan = p.marks[i]
+		b.keyKinds = resize(b.keyKinds, len(b.plan.innerKeys))
+		clear(b.keyKinds)
 		b.ensureSeed()
 		b.scan.cancel = w.cancel
 		if err := b.collectHeap(inner, work); err != nil {
@@ -1023,6 +1118,8 @@ func (p *plan) bindFileMarks(
 		b := &w.marks[p.marks[i].slot]
 		b.reset()
 		b.plan = p.marks[i]
+		b.keyKinds = resize(b.keyKinds, len(b.plan.innerKeys))
+		clear(b.keyKinds)
 		b.ensureSeed()
 		b.scan.cancel = w.cancel
 		if inner != nil {

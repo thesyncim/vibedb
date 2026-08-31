@@ -615,6 +615,9 @@ func (c *conn) prepareContextMode(
 			src, tree.Select, queryParameterTypes,
 		)
 		if err == nil {
+			err = c.proveSQLPathComparisonDomains(ctx, src, tree.Select, s.query)
+		}
+		if err == nil {
 			s.explain = tree.Explain
 			s.analyze = tree.Explain && tree.Analyze
 			// Source requirements are properties of the prepared SELECT, not
@@ -664,9 +667,23 @@ func (c *conn) prepareContextMode(
 			}
 		}
 	} else {
-		s.mutation, err = query.PrepareParsedDMLWithParameterTypes(
-			src, tree, queryParameterTypes,
-		)
+		var domainTree *sqlast.SelectStmt
+		switch tree.Kind {
+		case sqlast.KindInsert:
+			domainTree = tree.Insert.Source
+		case sqlast.KindUpdate:
+			domainTree = tree.Update.Filter
+		case sqlast.KindDelete:
+			domainTree = tree.Delete.Filter
+		}
+		if domainTree != nil {
+			err = c.validateSQLPathComparisonDomains(ctx, src, domainTree)
+		}
+		if err == nil {
+			s.mutation, err = query.PrepareParsedDMLWithParameterTypes(
+				src, tree, queryParameterTypes,
+			)
+		}
 		if err == nil {
 			s.dependencies = dmlExecutablePhysicalDependencies(tree)
 		}

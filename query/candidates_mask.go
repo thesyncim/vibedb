@@ -64,6 +64,9 @@ func snapshotCandidateMasks[S store.IndexSource](p *plan, snapshot S, caps sourc
 	}
 	w.storeMaskUsed = 0
 	w.storeIndexProbes = 0
+	if p.requiresSQLDomainScan() {
+		return nil, false, nil
+	}
 	w.storeIndexes = snapshot.AppendIndexes(w.storeIndexes[:0])
 	masks, bounded, exact, err := candidatesFor(p.where, snapshot, caps, p.valuePaths, w.storeIndexes, w, requireExact)
 	if err != nil {
@@ -144,7 +147,7 @@ func candidatesFor[S store.IndexSource](p *compiledPredicate, snapshot S, caps s
 		// No exact index answers this leaf, so the catalog cannot bound it: it
 		// falls through to a full scan.
 		return nil, false, false, nil
-	case predIn, predInBound:
+	case predIn, predInBound, predSQLInBound:
 		// The index probes one exact value at a time (its variadic values are
 		// a compound key's columns, not alternatives), so a membership costs
 		// one probe per alternative, unioned. That is the same probe count a
@@ -197,7 +200,7 @@ func candidatesFor[S store.IndexSource](p *compiledPredicate, snapshot S, caps s
 			w.keepStoreMasks(acc)
 		}
 		return acc, true, requireExact, nil
-	case predAntiBound:
+	case predAntiBound, predSQLAntiBound:
 		// Existential negation is a two-valued complement, not SQL NOT over a
 		// nullable equality. A heap snapshot can complement an exact positive
 		// membership against its metadata-only live universe; that retains
@@ -210,6 +213,9 @@ func candidatesFor[S store.IndexSource](p *compiledPredicate, snapshot S, caps s
 		}
 		positive := *p
 		positive.kind = predInBound
+		if p.kind == predSQLAntiBound {
+			positive.kind = predSQLInBound
+		}
 		inner, bounded, exact, err := candidatesFor(
 			&positive, snapshot, caps, paths, indexes, w, true,
 		)
@@ -472,7 +478,7 @@ func singleColumnIndex(path string, indexes []store.IndexInfo) (store.IndexInfo,
 // branch, which is what keeps the existing In path exactly as fast as it was
 // before late binding existed.
 func (p *compiledPredicate) membership(w *Workspace) (lits []scalar, needles []vibejson.Index, bindable bool) {
-	if p.kind != predInBound {
+	if p.kind != predInBound && p.kind != predSQLInBound {
 		return p.lits, p.needles, true
 	}
 	if p.slot >= len(w.joins) {
@@ -597,7 +603,7 @@ func (p *compiledPredicate) canBoundWithRanges(
 		}
 		_, ok := singleColumnIndex(p.indexPath(paths), indexes)
 		return ok
-	case predIn, predInBound:
+	case predIn, predInBound, predSQLInBound:
 		return p.membershipBounded(paths, indexes, w)
 	case predContains:
 		return p.containPlan != nil && p.containPlan.canBoundWithRanges(
@@ -666,7 +672,7 @@ func (p *compiledPredicate) canAnswerExactly(paths []compiledPath, indexes []sto
 		}
 		_, ok := singleColumnIndex(p.indexPath(paths), indexes)
 		return ok
-	case predIn, predInBound:
+	case predIn, predInBound, predSQLInBound:
 		return p.membershipBounded(paths, indexes, w)
 	case predContains:
 		return p.containPlan != nil && p.containPlan.canAnswerExactly(paths, indexes, w)
@@ -716,7 +722,7 @@ func (p *compiledPredicate) maxExactProbeColumns(
 			return 0
 		}
 		return 1
-	case predIn, predInBound:
+	case predIn, predInBound, predSQLInBound:
 		lits, _, bindable := p.membership(w)
 		if !bindable || len(lits) == 0 {
 			return 0

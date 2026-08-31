@@ -486,6 +486,12 @@ func (x *sqlViewExpander) expandDefinition(
 	); err != nil {
 		return nil, err
 	}
+	// The definition was parsed against definition.Query, but every nested
+	// statement prepared from the expanded tree receives the outer statement's
+	// source text. Preserve the operator for diagnostics while marking its byte
+	// position unavailable: interpreting a definition-local offset against the
+	// unrelated outer source would publish a confidently wrong pgwire P field.
+	suppressSQLViewRuntimeComparisonPositions(tree)
 	index := len(x.entries)
 	x.entries = append(x.entries, sqlViewExpansionEntry{
 		name: definition.Name, tree: tree, state: 1, height: 1,
@@ -499,6 +505,96 @@ func (x *sqlViewExpander) expandDefinition(
 	x.stack = x.stack[:len(x.stack)-1]
 	x.entries[index].state = 2
 	return &x.entries[index], nil
+}
+
+// suppressSQLViewRuntimeComparisonPositions marks only runtime path-to-path
+// comparison offsets. All other definition positions remain available to the
+// expansion and validation passes that consume them before execution. The
+// negative sentinel survives ordinary AST copies and is recognized by both
+// the scan-predicate and searched-CASE evaluators as "no client position".
+func suppressSQLViewRuntimeComparisonPositions(tree *sqlast.SelectStmt) {
+	if tree == nil {
+		return
+	}
+	if tree.Set != nil {
+		suppressSQLViewSetComparisonPositions(tree.Set.Root)
+		return
+	}
+	if tree.With != nil {
+		for i := range tree.With.CTEs {
+			suppressSQLViewRuntimeComparisonPositions(tree.With.CTEs[i].Query)
+		}
+	}
+	for i := range tree.Columns {
+		suppressSQLViewScalarComparisonPositions(tree.Columns[i].Scalar)
+	}
+	for i := range tree.From {
+		ref := &tree.From[i]
+		suppressSQLViewRuntimeComparisonPositions(ref.Query)
+		if ref.On != nil {
+			suppressSQLViewExprComparisonPositions(ref.On.Expr)
+			// Extracted JOIN keys are a planner sidecar. ON keeps the
+			// authoritative expression position above, while USING has no Expr
+			// at all, so both forms must explicitly lose definition-local key
+			// offsets before later join/correlation lowering derives provenance.
+			ref.On.Pos = -1
+			for k := range ref.On.Keys {
+				ref.On.Keys[k].Pos = -1
+			}
+		}
+	}
+	suppressSQLViewExprComparisonPositions(tree.Where)
+	suppressSQLViewExprComparisonPositions(tree.Having)
+	for i := range tree.OrderBy {
+		suppressSQLViewScalarComparisonPositions(tree.OrderBy[i].Scalar)
+	}
+}
+
+func suppressSQLViewSetComparisonPositions(expression *sqlast.SetExpr) {
+	if expression == nil {
+		return
+	}
+	switch expression.Kind {
+	case sqlast.SetSelectExpr, sqlast.SetTableExpr:
+		suppressSQLViewRuntimeComparisonPositions(expression.Select)
+	case sqlast.SetBinaryExpr:
+		suppressSQLViewSetComparisonPositions(expression.Left)
+		suppressSQLViewSetComparisonPositions(expression.Right)
+	case sqlast.SetGroupExpr:
+		suppressSQLViewSetComparisonPositions(expression.Child)
+	}
+}
+
+func suppressSQLViewExprComparisonPositions(expression *sqlast.Expr) {
+	if expression == nil {
+		return
+	}
+	if (expression.Kind == sqlast.ExprCompare &&
+		(expression.RightPath != nil || expression.Subquery != nil)) ||
+		expression.Kind == sqlast.ExprIn && expression.Subquery != nil {
+		expression.Value.Pos = -1
+	}
+	suppressSQLViewScalarComparisonPositions(expression.ScalarLeft)
+	suppressSQLViewScalarComparisonPositions(expression.ScalarRight)
+	suppressSQLViewRuntimeComparisonPositions(expression.Subquery)
+	for i := range expression.Kids {
+		suppressSQLViewExprComparisonPositions(expression.Kids[i])
+	}
+}
+
+func suppressSQLViewScalarComparisonPositions(expression *sqlast.ScalarExpr) {
+	if expression == nil {
+		return
+	}
+	suppressSQLViewScalarComparisonPositions(expression.Left)
+	suppressSQLViewScalarComparisonPositions(expression.Right)
+	suppressSQLViewScalarComparisonPositions(expression.Else)
+	for i := range expression.Whens {
+		arm := &expression.Whens[i]
+		suppressSQLViewExprComparisonPositions(arm.Predicate)
+		suppressSQLViewScalarComparisonPositions(arm.Match)
+		suppressSQLViewScalarComparisonPositions(arm.Result)
+	}
 }
 
 func sqlViewDepthAdmitted(depth, height int) bool {

@@ -44,6 +44,9 @@ func (p *plan) runDirectFileIndexedCount(
 	if p.where == nil || p.grouped || !p.singleRow {
 		return directFileIndexStats{}, false, nil
 	}
+	if p.requiresSQLDomainScan() {
+		return directFileIndexStats{}, false, nil
+	}
 	for _, column := range p.columns {
 		if column.agg != aggCount || column.value >= 0 {
 			return directFileIndexStats{}, false, nil

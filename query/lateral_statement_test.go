@@ -332,8 +332,8 @@ func TestSQLLateralMidApplyTypeFailurePublishesNothingAndRecovers(t *testing.T) 
 	_, err = statement.RunInto(
 		&exec, FromDatabase(bad.Snapshot(), statement.Collection()), nil,
 	)
-	var valueErr *LateralBindingValueError
-	if !errors.As(err, &valueErr) || exec.Result.RowCount != 0 {
+	var undefined *sqlast.UndefinedOperatorError
+	if !errors.As(err, &undefined) || exec.Result.RowCount != 0 {
 		t.Fatalf("mid-APPLY error = %T %v, rows=%d", err, err, exec.Result.RowCount)
 	}
 	good := makeDB(t, `{"id":"first","k":1}`)
@@ -443,7 +443,6 @@ func TestSQLLateralExactDecimalStringNullAndMissingBindings(t *testing.T) {
 	put("outer_exact",
 		`{"id":"decimal","k":1.0}`,
 		`{"id":"wide","k":9007199254740993}`,
-		`{"id":"escaped","k":"\u0061"}`,
 		`{"id":"null","k":null}`,
 		`{"id":"missing"}`,
 	)
@@ -451,10 +450,11 @@ func TestSQLLateralExactDecimalStringNullAndMissingBindings(t *testing.T) {
 		`{"id":"decimal","k":10e-1}`,
 		`{"id":"wide","k":9007199254740993.0}`,
 		`{"id":"adjacent","k":9007199254740992}`,
-		`{"id":"plain","k":"a"}`,
 		`{"id":"null","k":null}`,
 		`{"id":"missing"}`,
 	)
+	put("outer_exact_string", `{"id":"escaped","k":"\u0061"}`)
+	put("inner_exact_string", `{"id":"plain","k":"a"}`)
 	statement, exec, got := runLateralStatement(t, db, `
 		SELECT o.id, d.id FROM outer_exact o
 		LEFT JOIN LATERAL (
@@ -463,11 +463,22 @@ func TestSQLLateralExactDecimalStringNullAndMissingBindings(t *testing.T) {
 	defer statement.Release()
 	defer exec.Release()
 	want := []string{
-		`"decimal","decimal"`, `"wide","wide"`, `"escaped","plain"`,
-		`"null",null`, `"missing",null`,
+		`"decimal","decimal"`, `"wide","wide"`, `"null",null`, `"missing",null`,
 	}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("exact LATERAL rows = %q, want %q", got, want)
+	}
+
+	stringStatement, stringExec, got := runLateralStatement(t, db, `
+		SELECT o.id, d.id FROM outer_exact_string o
+		LEFT JOIN LATERAL (
+			SELECT i.id FROM inner_exact_string i WHERE i.k = o.k
+		) d ON TRUE`)
+	defer stringStatement.Release()
+	defer stringExec.Release()
+	want = []string{`"escaped","plain"`}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("exact string LATERAL rows = %q, want %q", got, want)
 	}
 }
 

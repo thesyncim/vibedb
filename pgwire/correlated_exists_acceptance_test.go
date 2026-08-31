@@ -421,61 +421,44 @@ func TestPGWireCorrelatedExistsDroppedDependencyAndRefusalRecovery(t *testing.T)
 	})
 }
 
-func TestPGWireCorrelatedExistsContainerKeysUseCanonicalStoredJSONIdentity(t *testing.T) {
+func TestPGWireCorrelatedExistsContainerKeysRejectUndefinedJSONEquality(t *testing.T) {
 	c := connectSQLCatalog(t)
 	for _, statement := range []string{
 		`CREATE TABLE ce_wire_value_outer (id STRING PRIMARY KEY, match_key ANY)`,
 		`CREATE INDEX ce_wire_value_outer_match ON ce_wire_value_outer (match_key)`,
 		`CREATE TABLE ce_wire_value_inner (id STRING PRIMARY KEY, match_key ANY)`,
-		`INSERT INTO ce_wire_value_outer VALUES ` +
-			`('{"id":"a_array","match_key":[1,2]}'),` +
-			`('{"id":"b_object","match_key":{"a":1,"b":2}}'),` +
-			`('{"id":"c_object_order","match_key":{"b":2,"a":1}}'),` +
-			`('{"id":"d_scalar","match_key":"scalar"}'),` +
-			`('{"id":"e_array_order","match_key":[2,1]}'),` +
-			`('{"id":"f_object_value","match_key":{"a":1,"b":3}}'),` +
-			`('{"id":"g_object_member","match_key":{"a":1,"c":2}}'),` +
-			`('{"id":"h_missing"}')`,
-		`INSERT INTO ce_wire_value_inner VALUES ` +
-			`('{"id":"i_scalar","match_key":"scalar"}'),` +
-			`('{"id":"i_array","match_key":[1,2]}'),` +
-			`('{"id":"i_object","match_key":{"a":1,"b":2}}'),` +
-			`('{"id":"i_object_duplicate","match_key":{"a":1,"b":2}}')`,
+		`INSERT INTO ce_wire_value_outer VALUES ('{"id":"outer","match_key":[1,2]}')`,
+		`INSERT INTO ce_wire_value_inner VALUES ('{"id":"inner","match_key":[1,2]}')`,
 	} {
 		requireCorrelatedExistsWireCycle(t, c, c.query(statement), statusIdle)
 	}
 	exists := `SELECT o.id FROM ce_wire_value_outer AS o WHERE EXISTS (` +
 		`SELECT 1 FROM ce_wire_value_inner AS i WHERE i.match_key = o.match_key) ORDER BY o.id`
-	messages := c.query(exists)
-	requireCorrelatedExistsWireCycle(t, c, messages, statusIdle)
-	if got, want := correlatedExistsWireIDs(t, messages),
-		[]string{`"a_array"`, `"b_object"`, `"c_object_order"`, `"d_scalar"`}; !slices.Equal(got, want) {
-		t.Fatalf("simple container EXISTS rows = %q, want %q", got, want)
+	check := func(t *testing.T, messages []backendMessage, source string) {
+		t.Helper()
+		fields := requireCorrelatedExistsWireFailure(
+			t, messages, sqlstateUndefinedFunction, statusIdle,
+		)
+		if fields['M'] != `operator does not exist: json = json` {
+			t.Fatalf("container comparison message = %q", fields['M'])
+		}
+		want := strconv.Itoa(strings.Index(source, "=") + 1)
+		if fields['P'] != want {
+			t.Fatalf("container comparison position = %q, want %q", fields['P'], want)
+		}
+		requireCorrelatedExistsWireSentinel(t, c, statusIdle)
 	}
+	check(t, c.query(exists), exists)
 
-	begin := c.query("BEGIN")
-	requireCorrelatedExistsWireCycle(t, c, begin, statusInTx)
-	messages = extendedSQL(c, exists, nil)
-	requireCorrelatedExistsWireCycle(t, c, messages, statusInTx)
-	if got, want := correlatedExistsWireIDs(t, messages),
-		[]string{`"a_array"`, `"b_object"`, `"c_object_order"`, `"d_scalar"`}; !slices.Equal(got, want) {
-		t.Fatalf("extended container EXISTS rows = %q, want %q", got, want)
-	}
-	rollback := c.query("ROLLBACK")
-	requireCorrelatedExistsWireCycle(t, c, rollback, statusIdle)
+	check(t, extendedSQL(c, exists, nil), exists)
 
 	anti := `SELECT o.id FROM ce_wire_value_outer AS o WHERE NOT EXISTS (` +
 		`SELECT 1 FROM ce_wire_value_inner AS i WHERE i.match_key = o.match_key) ORDER BY o.id`
-	messages = c.query(anti)
-	requireCorrelatedExistsWireCycle(t, c, messages, statusIdle)
-	if got, want := correlatedExistsWireIDs(t, messages),
-		[]string{`"e_array_order"`, `"f_object_value"`, `"g_object_member"`, `"h_missing"`}; !slices.Equal(got, want) {
-		t.Fatalf("container NOT EXISTS rows = %q, want %q", got, want)
-	}
+	check(t, c.query(anti), anti)
 
-	reused := c.query(`SELECT id FROM ce_wire_value_outer WHERE id = 'a_array'`)
+	reused := c.query(`SELECT id FROM ce_wire_value_outer WHERE id = 'outer'`)
 	requireCorrelatedExistsWireCycle(t, c, reused, statusIdle)
-	if got := correlatedExistsWireIDs(t, reused); !slices.Equal(got, []string{`"a_array"`}) {
+	if got := correlatedExistsWireIDs(t, reused); !slices.Equal(got, []string{`"outer"`}) {
 		t.Fatalf("container session reuse rows = %q", got)
 	}
 }

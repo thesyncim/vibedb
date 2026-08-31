@@ -19,8 +19,10 @@ const (
 // addressable only when every component is non-NULL; SQL equality can never
 // correlate a NULL or missing component.
 type correlatedMarkKey struct {
-	outer string
-	inner string
+	outer       string
+	inner       string
+	operatorPos int
+	outerFirst  bool
 }
 
 // correlatedMark is the cold builder form installed only by the SQL
@@ -34,7 +36,9 @@ type correlatedMark struct {
 	where      Predicate
 	hasWhere   bool
 	kind       correlatedMarkKind
-	op         Op // authored scalar comparison; meaningful only for Scalar
+	op         Op // execution comparison; meaningful only for Scalar
+	authoredOp Op // diagnostic spelling before a direct NOT is normalized
+	valuePos   int
 }
 
 // planMark is the immutable compiled address map shared by executions.  Every
@@ -42,13 +46,17 @@ type correlatedMark struct {
 // snapshot values.  Outer columns address the driving plan and inner columns
 // address inner.  probe/value are -1 when their operator does not use them.
 type planMark struct {
-	collection string
-	inner      *plan
-	outer      []int
-	innerKeys  []int
-	probe      int
-	value      int
-	slot       int
-	kind       correlatedMarkKind
-	op         Op
+	collection    string
+	inner         *plan
+	outer         []int
+	innerKeys     []int
+	keyPositions  []int
+	keyOuterFirst []bool
+	probe         int
+	value         int
+	slot          int
+	kind          correlatedMarkKind
+	op            Op
+	authoredOp    Op
+	valuePos      int
 }

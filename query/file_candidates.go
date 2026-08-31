@@ -46,7 +46,7 @@ func (p *plan) fileCandidateMasksBounded(
 	if err := w.checkCanceled(); err != nil {
 		return nil, 0, err
 	}
-	if p.where == nil {
+	if p.where == nil || p.requiresSQLDomainScan() {
 		return nil, 0, nil
 	}
 	w.storeMaskUsed = 0
@@ -83,6 +83,9 @@ func (p *plan) fileExactCandidateMasksBounded(
 ) ([]store.Mask, uint64, uint64, int, bool, error) {
 	if err := w.checkCanceled(); err != nil {
 		return nil, 0, 0, 0, true, err
+	}
+	if p.requiresSQLDomainScan() {
+		return nil, 0, 0, 0, false, nil
 	}
 	index.Reset(snapshot)
 	if p.where == nil {

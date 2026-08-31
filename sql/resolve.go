@@ -690,11 +690,15 @@ func (p *Parser) bindHaving(e *Expr) error {
 			}
 		}
 		return nil
-	case ExprScalarCompare, ExprScalarIsNull:
-		return newFeatureNotSupportedError(
-			p.lx.src, e.Pos,
-			"computed scalar expressions in HAVING are not supported by this execution slice yet",
-		)
+	case ExprScalarCompare, ExprScalarIsNull, ExprScalarTruth:
+		for _, scalar := range []*ScalarExpr{e.ScalarLeft, e.ScalarRight} {
+			if path := firstUngroupedScalarPath(p, scalar); path != nil {
+				return p.errfAt(path.Pos,
+					"HAVING scalar expression reads path %q, which is not a GROUP BY key",
+					path.Spec())
+			}
+		}
+		return nil
 	}
 	if e.Agg != AggNone {
 		column := p.aggregateColumn(e.Agg, e.Path)

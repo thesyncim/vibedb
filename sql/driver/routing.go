@@ -180,12 +180,19 @@ func CompileConstraintProgram(placementColumns []string, where *sqlast.Expr) *Co
 // non-shard-key leaves are ignored: they never narrow a finite domain, so the
 // ordinal stays unknown and routing fails closed.
 func (p *ConstraintProgram) discover(where *sqlast.Expr, placementColumns []string) {
+	if containsRuntimeSQLPathComparison(where) {
+		return
+	}
+	p.discoverResolved(where, placementColumns)
+}
+
+func (p *ConstraintProgram) discoverResolved(where *sqlast.Expr, placementColumns []string) {
 	if where == nil {
 		return
 	}
 	if where.Kind == sqlast.ExprAnd {
 		for _, kid := range where.Kids {
-			p.discover(kid, placementColumns)
+			p.discoverResolved(kid, placementColumns)
 		}
 		return
 	}
@@ -198,7 +205,7 @@ func (p *ConstraintProgram) discover(where *sqlast.Expr, placementColumns []stri
 		if where.Op != sqlast.OpEq {
 			return
 		}
-		if where.Subquery != nil {
+		if where.Subquery != nil || where.RightPath != nil {
 			p.slots[ordinal].constraints = append(
 				p.slots[ordinal].constraints, shardConstraint{unbindable: true})
 			return

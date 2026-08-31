@@ -20,7 +20,7 @@ func (p *plan) runRelationInto(
 	if err := w.checkCanceled(); err != nil {
 		return err
 	}
-	if p.hasLimit && p.limit == 0 {
+	if p.hasLimit && p.limit == 0 && !p.requiresSQLDomainScan() {
 		return prepareResult(dst, p, 0)
 	}
 	if err := w.activeHeapWorkBudget().admitPlanner(
