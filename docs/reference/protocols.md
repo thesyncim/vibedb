@@ -79,7 +79,7 @@ catalog generation.
 | `op` | Current use | Important boundary |
 | --- | --- | --- |
 | empty or `query` | routed read-only SQL | result may combine independent shard observations |
-| `exec` | static, colocated single-shard execution | availability depends on serving mode; not the durable RF3 batch lane |
+| `exec` | one static single-base-owner write; index maintenance may add transaction participants | not a general static batch or the durable RF3 batch lane |
 | `read_batch` | RF3 exact-primary-key whole-document SELECT vector | all-or-nothing result; one observation per group |
 | `issuer_open` | open a durable request issuer lane | authenticated write authority and durable service required |
 | `exec_batch` | sequenced durable RF3 mutation batch | closed identity grammar; no unsequenced fallback |

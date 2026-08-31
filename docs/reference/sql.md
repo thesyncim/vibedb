@@ -163,12 +163,14 @@ change the primary key; one constant document therefore cannot replace several
 distinct keys. DELETE supports the same tail but no alias or USING. Mutation
 ORDER BY requires LIMIT; UPDATE FROM and mutation OFFSET are unsupported.
 
-Computed assignments run in the embedded adapters and in the static
-distributed lane, where maintained global indexes use canonical before/after
-images evaluated by the base shard. The strict RF3 transaction lane and its
-pgwire endpoint still refuse computed assignments; they accept the narrower
-whole-document or direct declared-column updates described in the distributed
-guide.
+Computed assignments run in the embedded adapters and through static gateway
+`exec` for one single-base-owner statement, where independently placed global
+indexes use canonical before/after images evaluated by the base shard and may
+add transaction participants. The static listener does not expose general
+multi-statement or cross-base-shard `exec_batch`. The strict RF3 transaction
+lane and its pgwire endpoint still refuse computed assignments; they accept the
+narrower whole-document or direct declared-column updates described in the
+distributed guide.
 
 RETURNING accepts bounded path/scalar projections but no aggregates,
 parameters, or SELECT tail. Execute a returning mutation through a query API;

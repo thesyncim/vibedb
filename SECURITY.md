@@ -78,10 +78,14 @@ after collecting required evidence.
 
 ## Current security-relevant gaps
 
-At the audited commit, the malformed SQL string `SELECT 1 GARBAGE` is
-misclassified as read-only by the service authorization classifier, and its
-test fails. Do not treat current distributed SQL authorization as production
-qualified. Other known sharp edges are listed in [current status](docs/status.md).
+The parser treats `SELECT 1 GARBAGE` as a valid select-list expression with an
+implicit alias. The authorization test now records that grammar and separately
+proves that an actually unconsumed tail such as `SELECT 1 AS value GARBAGE`
+fails closed. That focused test passes; it is not a production-qualification
+claim. The complete external process gate still does not combine every
+certificate-rotation and confused-deputy fault, and explicit plaintext mode is
+for loopback development only. Other known sharp edges are listed in [current
+status](docs/status.md).
 
 ## Source map
 

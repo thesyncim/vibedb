@@ -229,9 +229,16 @@ committed and what result it produced.
 
 ## Static indexed updates and deletes
 
+> [!IMPORTANT]
+> The checked-in static listener exposes this path only through `exec` for one
+> single-base-owner statement. Independently placed index writes may add
+> transaction participants, but general multi-statement or cross-base-shard
+> static `exec_batch` is not exposed. Public `exec_batch` is reserved for
+> authenticated durable RF3 and never takes an unsequenced fallback.
+
 The static gateway can maintain independently placed global indexes for a
-computed `UPDATE`, or for a `DELETE`, without evaluating an update assignment at the
-coordinator:
+computed `UPDATE`, or for a `DELETE`, without evaluating an update assignment
+at the coordinator:
 
 1. The base shard preflights the complete selected batch and returns canonical
    primary key, before-document, and after-document images without publishing.

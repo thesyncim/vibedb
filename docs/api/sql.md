@@ -99,12 +99,14 @@ UPDATE expressions read the current row. Upsert expressions read both the
 current target row (`users.visits`; bare `visits` is ambiguous) and incoming
 `EXCLUDED` top-level fields. This is implemented behavior, not roadmap syntax.
 
-This guide primarily describes the embedded adapters. The static distributed
-gateway can also maintain global indexes for computed `UPDATE` expressions by
-using canonical before/after images evaluated on the base shard. The strict
-RF3 transaction lane, including its pgwire path, still refuses computed
-assignments; it admits only the narrower documented direct-column and
-whole-document forms.
+This guide primarily describes the embedded adapters. Static gateway `exec`
+can also maintain independently placed global indexes for one single-base-owner
+computed `UPDATE` by using canonical before/after images evaluated on the base
+shard; those index writes may add transaction participants. The static listener
+does not expose general multi-statement or cross-base-shard `exec_batch`, which
+is reserved for authenticated durable RF3. The strict RF3 transaction lane,
+including its pgwire path, still refuses computed assignments; it admits only
+the narrower documented direct-column and whole-document forms.
 
 `ON CONFLICT` always means the table primary key. `DO NOTHING` and `DO UPDATE`
 are supported; explicit conflict targets, named constraints, action WHERE, and
@@ -216,6 +218,9 @@ Ownership rules are strict:
   active transaction.
 - `Prepared.Close` releases parsed and compiled arenas and closes its live
   cursor. It is idempotent.
+- `Session.Tables` returns an owned catalog snapshot sorted by table name.
+  Each table's declared columns are in canonical path order—not DDL order—and
+  its exact indexes remain in creation order.
 - Cursor cells borrow runtime storage until `Cursor.Close`; copy data that must
   survive. `Cursor.Close` releases the snapshot lease and is idempotent.
 - Cursor → prepared → session → database is clearest; Close methods safely cascade, and sessions outlive Database.Close.

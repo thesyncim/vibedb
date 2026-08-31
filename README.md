@@ -125,10 +125,11 @@ go vet ./...
 go test -p=1 -timeout=25m ./...
 ```
 
-At the documented source snapshot, the final command is expected to report the
-known `internal/serviceauthz` failure described in [current status](docs/status.md).
-Treat that exact failure as the recorded baseline, not as a passing suite, and
-investigate any additional failure.
+The documentation audit did not complete a fresh serial root-module run after
+the final `main` merge, so this page does not claim that command is green.
+Focused authorization, storage, SQL, protocol, generator, and integration
+checks are recorded in [current status](docs/status.md). Treat any failure from
+your checkout as a failure to investigate, not as an accepted baseline.
 
 Some qualification lanes require Linux, Docker, Java, `psql`, or explicit
 environment flags. Their docs distinguish normal tests from opt-in evidence.

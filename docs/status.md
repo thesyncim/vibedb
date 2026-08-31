@@ -8,7 +8,7 @@
 > and use only disposable or independently recoverable data.
 
 Runtime behavior for this rewrite was audited from `main` at commit
-`0c9dc636314f5166440bf574bfa3fb2d752f2dba`. The documentation changes that
+`9069cd0e403e2a0450be967e0b2317121dfc7df2`. The documentation changes that
 follow it do not turn that snapshot into a roadmap or guarantee about a later
 commit.
 
@@ -54,7 +54,6 @@ These are source-audit findings, not hypothetical limitations.
 
 | Area | Current defect or sharp edge | Consequence |
 | --- | --- | --- |
-| Authorization | `SELECT 1 GARBAGE` is classified as read-only instead of the intended fail-closed read+write+schema set | `go test ./internal/serviceauthz` fails on untouched `main`; do not treat malformed-SQL classification as qualified |
 | Service metrics | A nonzero-group request can panic when a metrics service was built with `Provider` that is not also `GroupProvider` | Group-serving configurations must supply `GroupProvider` |
 | Distributed transaction journal | Compaction omits durable coordinator recovery-pulse records | Reopen after compaction can reset recovery-pulse state; do not rely on that compaction path for recovery authority |
 | Build grammar identity | The static shard wire gained mutation-image marker `0xe4`, but the build manifest and derived wire grammar ID did not change | Pre- and post-image builds can pass the build preface yet disagree on this request; never mix them or treat the current gate as sufficient proof |
@@ -69,12 +68,18 @@ These defects are reasons the project must not be used for irreplaceable data.
 
 ## Test baseline
 
-At the audited commit, a serial root-module run found the known
-`internal/serviceauthz` failure above and continued into `store/durable`, where
-the command was externally terminated. It therefore did **not** produce a
-complete root-module result, and this page does not present the tree as green.
-Focused core, store, query, SQL, pgwire, Raft, command, benchmark, and hermetic
-client integration suites passed during the audit.
+On an earlier audit base, a serial root-module run reached `store/durable` and
+was externally terminated, so it did **not** produce a complete root-module
+result. The later `main` merge aligned the SQL-authorization assertion with the
+parser grammar; the focused `internal/serviceauthz` suite now passes. A fresh
+complete serial root run was not finished after that final merge, and this page
+does not present the tree as green. Focused core, store, query, SQL, pgwire,
+Raft, command, benchmark, and hermetic client integration suites passed during
+the audit. A separate complete `store/durable` package run exceeded its
+30-minute timeout while
+`TestFileStorePointReplayDoesNotExhaustRetirementCapacity` was active; that
+test passed alone in 51 seconds, but the package run still has no complete
+result.
 
 Opt-in or environment-specific gates were not all run locally:
 
