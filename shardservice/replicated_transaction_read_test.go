@@ -397,14 +397,16 @@ func TestReplicatedServerServesCanonicalTransactionRecoveryRead(t *testing.T) {
 		uint8(distributedtxn.CoordinatorCommitted), distributedtxn.ReplicatedPayloadCoordinator)
 	record.CoordinatorDecision = distributedtxn.CoordinatorCommitted
 	owner := &fakeReplicatedOwner{state: state, transactionResult: raftservice.TransactionReadResult{
-		Applied: 11, Complete: false,
+		Applied: 12, Complete: false,
 		Records: []replicatedstate.TransactionRecoveryRecord{record},
 	}}
 	request := replicatedRecoveryRequests(replicatedWireState(state).Fence,
 		serviceauthz.Authority{Node: rafttransport.NodeID{31}, Generation: 17})[3]
 	response := testReplicatedServer(owner).executeReplicated(context.Background(), request)
-	if response.Kind != ReplicatedTransactionReadResult || response.ReadApplied != 11 ||
+	if response.Kind != ReplicatedTransactionReadResult || response.ReadApplied != 12 ||
 		!validReplicatedResponse(response) ||
+		response.State.Fence != request.Fence || response.State.Applied != 12 ||
+		response.State.Commit != 12 || owner.probeCalls.Load() != 1 ||
 		owner.transactionRequest.Capability != serviceauthz.CapabilityTransactionRecovery ||
 		owner.transactionRequest.Read.Kind != replicatedstate.TransactionRecoveryScanCoordinator ||
 		owner.transactionRequest.Read.ID != request.TransactionRead.ID {
@@ -437,7 +439,7 @@ func TestReplicatedServerTransactionRecoveryTypedRefusals(t *testing.T) {
 			serviceauthz.Authority{Node: rafttransport.NodeID{31}, Generation: 17})[0]
 		response := testReplicatedServer(owner).executeReplicated(context.Background(), request)
 		if response.Kind != test.kind || response.Refusal != test.refusal ||
-			!validReplicatedResponse(response) {
+			!validReplicatedResponse(response) || owner.probeCalls.Load() != 2 {
 			t.Fatalf("error=%v response=%+v", test.err, response)
 		}
 	}

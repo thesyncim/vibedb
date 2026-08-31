@@ -11,10 +11,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/thesyncim/vibedb/internal/executionpin"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftserve"
 	"github.com/thesyncim/vibedb/internal/raftservice"
+	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 )
 
 type fakeReplicatedOwner struct {
@@ -42,6 +45,22 @@ type fakeReplicatedOwner struct {
 	executionPinLease    raftservice.ExecutionPinReadLease
 	executionPinRequest  raftservice.ExecutionPinReadRequest
 	probeCalls           atomic.Uint64
+}
+
+type fakeBatchReadOwner struct {
+	*fakeReplicatedOwner
+	result  raftservice.PointReadBatchResult
+	lease   raftservice.PointReadLease
+	err     error
+	request raftservice.PointReadBatchRequest
+}
+
+func (owner *fakeBatchReadOwner) ReadPointBatch(
+	_ context.Context,
+	request raftservice.PointReadBatchRequest,
+) (raftservice.PointReadBatchResult, raftservice.PointReadLease, error) {
+	owner.request = request
+	return owner.result, owner.lease, owner.err
 }
 
 func (owner *fakeReplicatedOwner) ApplyMembership(
@@ -206,22 +225,80 @@ func testReplicatedServingState() raftservice.ServingState {
 func TestReplicatedServerServesFoundEmptyReadWithoutConflatingMiss(t *testing.T) {
 	state := testReplicatedServingState()
 	owner := &fakeReplicatedOwner{state: state, readResult: raftservice.PointReadResult{
-		Applied: 11, Found: true, Value: []byte{},
+		Applied: 12, Found: true, Value: []byte{},
 	}}
 	server := &ReplicatedServer{owner: owner}
 	request := &ReplicatedRequest{Operation: ReplicatedReadFollower,
 		Fence: replicatedWireState(state).Fence, Relation: 1, Key: []byte("k"),
 		MinimumApplied: 10, MaxValueBytes: 1024}
 	response := server.executeReplicated(context.Background(), request)
-	if response.Kind != ReplicatedReadFound || response.ReadApplied != 11 ||
-		len(response.Value) != 0 || !validReplicatedResponse(response) {
+	if response.Kind != ReplicatedReadFound || response.ReadApplied != 12 ||
+		len(response.Value) != 0 || !validReplicatedResponse(response) ||
+		response.State.Fence != request.Fence || response.State.Applied != 12 ||
+		response.State.Commit != 12 || owner.probeCalls.Load() != 1 {
 		t.Fatalf("response=%+v", response)
 	}
 	owner.readResult.Found = false
 	response = server.executeReplicated(context.Background(), request)
-	if response.Kind != ReplicatedReadMissing || response.ReadApplied != 11 ||
-		!validReplicatedResponse(response) {
+	if response.Kind != ReplicatedReadMissing || response.ReadApplied != 12 ||
+		!validReplicatedResponse(response) || owner.probeCalls.Load() != 2 {
 		t.Fatalf("miss response=%+v", response)
+	}
+}
+
+func TestReplicatedServerSuccessfulBatchReadUsesAcceptedFenceWithoutRefresh(t *testing.T) {
+	state := testReplicatedServingState()
+	packed, err := replicatedstate.AppendPointReadBatch(nil, []replicatedstate.PointRead{{
+		Relation: 1, Key: []byte("k"),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := &fakeBatchReadOwner{
+		fakeReplicatedOwner: &fakeReplicatedOwner{state: state},
+		// count=1, found bitmap bit 0, zero-length value.
+		result: raftservice.PointReadBatchResult{
+			Applied: 12, Data: []byte{1, 0, 0, 0, 1, 0, 0, 0, 0},
+		},
+	}
+	request := &ReplicatedRequest{
+		Operation: ReplicatedReadBatchLeader, Fence: replicatedWireState(state).Fence,
+		BatchRead:      packed,
+		MinimumApplied: 10, MaxValueBytes: 1024,
+	}
+	if !validReplicatedRequest(request) {
+		t.Fatal("batch-read fixture is not a valid wire request")
+	}
+	response := testReplicatedServer(owner).executeReplicated(t.Context(), request)
+	if response.Kind != ReplicatedReadBatchResult || response.ReadApplied != 12 ||
+		response.State.Fence != request.Fence || response.State.Applied != 12 ||
+		response.State.Commit != 12 || owner.probeCalls.Load() != 1 ||
+		!validReplicatedResponse(response) {
+		t.Fatalf("response=%+v probes=%d", response, owner.probeCalls.Load())
+	}
+}
+
+func TestReplicatedServerSuccessfulExecutionPinReadUsesAcceptedFenceWithoutRefresh(t *testing.T) {
+	state := testReplicatedServingState()
+	owner := &fakeReplicatedOwner{state: state,
+		executionPinResult: raftservice.ExecutionPinReadResult{Applied: 12}}
+	request := &ReplicatedRequest{
+		Operation: ReplicatedExecutionPinRead, Fence: replicatedWireState(state).Fence,
+		Authority:  serviceauthz.Authority{Node: rafttransport.NodeID{1}, Generation: 1},
+		Capability: serviceauthz.CapabilityExecutionPin,
+		ExecutionPinRead: ReplicatedExecutionPinReadRequest{
+			Pin: executionpin.PinID{1}, MinimumApplied: 10,
+		},
+	}
+	if !validReplicatedRequest(request) {
+		t.Fatal("execution-pin fixture is not a valid wire request")
+	}
+	response := testReplicatedServer(owner).executeReplicated(t.Context(), request)
+	if response.Kind != ReplicatedExecutionPinReadResult || response.ReadApplied != 12 ||
+		response.State.Fence != request.Fence || response.State.Applied != 12 ||
+		response.State.Commit != 12 || owner.probeCalls.Load() != 1 ||
+		!validReplicatedResponse(response) {
+		t.Fatalf("response=%+v probes=%d", response, owner.probeCalls.Load())
 	}
 }
 
@@ -243,7 +320,7 @@ func TestReplicatedServerPreservesTypedPointReadBounds(t *testing.T) {
 			response := server.executeReplicated(context.Background(), request)
 			if response.Kind != ReplicatedRefusal || response.Refusal != test.refusal ||
 				!response.HasState || response.State.Applied != state.Status.Applied ||
-				!validReplicatedResponse(response) {
+				!validReplicatedResponse(response) || owner.probeCalls.Load() != 2 {
 				t.Fatalf("response=%+v", response)
 			}
 		})

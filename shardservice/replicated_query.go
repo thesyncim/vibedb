@@ -113,11 +113,7 @@ func (server *ReplicatedServer) executeReplicatedQuery(ctx context.Context, requ
 	if encoded.Len() > int(request.MaxValueBytes) {
 		return refuse(ReplicatedRefusalReadBufferBound)
 	}
-	refreshed, err := server.owner.Probe(ctx, request.Fence.Group)
-	if err != nil {
-		return refuse(ReplicatedRefusalUnavailable)
-	}
-	wireState = replicatedWireState(refreshed)
+	wireState = replicatedReadState(wireState, request.Fence, cut.Data().Fence().Applied)
 	response := &ReplicatedResponse{Kind: ReplicatedQueryResult, HasState: true, State: wireState,
 		ReadApplied: cut.Data().Fence().Applied, Value: encoded.Bytes(), readLease: lease}
 	if !validReplicatedResponse(response) {
