@@ -987,7 +987,10 @@ func servePreparedRF3WithExecutionLanes(
 		authorities, err = newRF3NativeAuthorities(transportRegistry, gate, preparedSet.groups, restoreGates, restoreOperations)
 		if err == nil {
 			authorities.adopted = adoptedInventory
-			server, err = shardservice.NewReplicatedServer(peer.Owners(), 64<<20, rf3RequestTimeout)
+			server, err = shardservice.NewReplicatedServer(
+				peer.Owners(), shardservice.DefaultReplicatedInFlightFrameBytes,
+				rf3RequestTimeout,
+			)
 		}
 		if err == nil {
 			err = server.BindAuthorization(gate, nil)

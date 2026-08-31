@@ -8,7 +8,7 @@
 > and use only disposable or independently recoverable data.
 
 Runtime behavior for this rewrite was audited from `main` at commit
-`8c296c9fce9683156cfaac440c0d1066e3351fb0`. The documentation changes that
+`1488914280f61ac7cf4350ce1e183ca52bd28ce9`. The documentation changes that
 follow it do not turn that snapshot into a roadmap or guarantee about a later
 commit.
 
