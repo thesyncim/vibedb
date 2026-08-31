@@ -163,6 +163,54 @@ func TestDurableSQLRequestExecutorReplaysOwnPreparedIntent(t *testing.T) {
 	}
 }
 
+func TestDurableSQLComputedUpdateRetryRecoversRetainedProgramAfterReevaluationError(t *testing.T) {
+	snapshot, planner := replicatedSQLTransactionFixture(t, true)
+	client, data := attachReplicatedSQLIndexedReadClient(
+		t, snapshot, []byte(`{"divisor":2,"id":"message-1","n":10}`),
+	)
+	queries := []Query{{
+		SQL: `UPDATE messages SET n = n / divisor WHERE id = ?`, Class: ClassInteractive,
+		Params: []shardservice.Param{shardservice.StringParam("message-1")},
+	}}
+	tenant := []byte("computed-update-retained-retry")
+	key := requestledger.RequestKey{
+		Scope: requestledger.ScopeAuthenticated, Principal: requestledger.PrincipalID{11},
+		Request:      requestledger.RequestID{12},
+		TenantDigest: requestledger.Digest(sha256.Sum256(tenant)), IssuerEpoch: 7,
+		IssuerLane: requestledger.IssuerLane{13}, IssuerSequence: 1,
+	}
+	ledger, pins := new(typedServiceLedger), new(typedServicePinStop)
+	topology := durableFaultTopology(t, durableFaultParticipants(t))
+	current := topology.Current()
+	current.Generation = 7
+	if err := topology.Publish(*current); err != nil {
+		t.Fatal(err)
+	}
+	service, err := newDurableRequestService(
+		topology, ledger, typedServiceRunnerStop{}, pins,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor, err := NewDurableSQLRequestExecutor(DurableSQLRequestExecutorOptions{
+		Planner: planner, ReplicatedData: data, Requests: service,
+		RecoveryPulseLimit: 3, PlanningLeaseSpan: 64,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = executor.Execute(t.Context(), key, tenant, queries); !errors.Is(err, errTypedServicePin) {
+		t.Fatalf("initial computed admission: %v", err)
+	}
+	client.value = []byte(`{"divisor":0,"id":"message-1","n":5}`)
+	if _, err = executor.Execute(t.Context(), key, tenant, queries); !errors.Is(err, errTypedServicePin) {
+		t.Fatalf("retry did not recover retained computed program: %v", err)
+	}
+	if client.reads != 2 || ledger.applies != 1 || pins.called != 2 {
+		t.Fatalf("reads=%d creates=%d pins=%d", client.reads, ledger.applies, pins.called)
+	}
+}
+
 func TestDurableSQLRequestExecutorAdmitsAtomicFiniteCrossShardDelete(t *testing.T) {
 	_, planner, keys := replicatedSQLSplitTransactionFixture(t)
 	data, err := NewReplicatedExecutor(new(replicatedSQLIndexedReadClient), 3, time.Second)

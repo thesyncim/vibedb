@@ -135,10 +135,11 @@ limits and the caller's `max_result_bytes` may make the effective cap smaller.
 | members in one replicated route | 64 | hard codec/client ceiling; serving route remains 3 | RF3 client, `gateway/replicated_native.go` |
 | RF3 attempts / one attempt timeout | 16 / 5 min | hard maxima; configuration must be positive | RF3 client, `gateway/replicated_native.go` |
 | retained leader hints | 4,096 default; 65,536 hard | cache only; eviction triggers discovery | RF3 client, `gateway/replicated_native.go` |
-| RF3 server connections | 65,536 | absolute hard maximum | RF3 service, `shardservice/replicated_server.go` |
-| RF3 in-flight frame account | 1 GiB | absolute hard maximum | RF3 service, `shardservice/replicated_server.go` |
-| RF3 request timeout | 5 min | absolute hard maximum | RF3 service, `shardservice/replicated_server.go` |
+| RF3 native connections / concurrent TLS handshakes | 64 / 16 in checked-in `serve-rf3`; 65,536 connection hard maximum | handshakes cannot exceed connections | RF3 service, `cmd/vibedb-shard/serve_rf3.go`, `shardservice/replicated_server.go` |
+| RF3 in-flight frame account | 112 MiB checked-in `serve-rf3` default; 1 GiB hard maximum | process-wide across every local RF3 group | RF3 service, `shardservice/replicated_server.go` |
+| RF3 request timeout | 15 s in checked-in `serve-rf3`; 5 min hard maximum | one request | RF3 service, `cmd/vibedb-shard/serve_rf3.go`, `shardservice/replicated_server.go` |
 | one RF3 SQL request / result / each work account / rows | 1 MiB / 4 MiB / 8 MiB / 100,000 | hard per-request bounds | RF3 SQL, `shardservice/replicated_query.go` |
+| one worst-bound RF3 SQL execution reservation | 40 MiB | conservative shared-frame charge; the 112 MiB default admits two plus their request frames and refuses a third | RF3 SQL, `shardservice/replicated_query.go` |
 | replicated command / result | 16 MiB / 16 MiB | hard | replicated apply, `internal/replication/types.go` |
 | user relations per replicated bundle | 59 | hard dense slot count | replicated apply, `internal/replication/types.go` |
 | mutations / key / value in one replicated command | 65,536 / 256 B / 4 MiB | hard | replicated apply, `internal/replication/types.go` |

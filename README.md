@@ -103,19 +103,8 @@ database directory, never an arbitrary live file.
 - A fixed total-memory ceiling: some indexes and off-heap structures are
   data-dependent.
 
-See [stability and known issues](docs/status.md) before evaluating any path.
-
-## Documentation
-
-- [Documentation home](docs/README.md)
-- [Architecture](docs/architecture.md)
-- [Data model](docs/data-model.md)
-- [Transactions](docs/transactions.md)
-- [Durability and recovery](docs/durability.md)
-- [Operations](docs/operations/README.md)
-- [Reference](docs/reference/README.md)
-- [Executable capability matrix](docs/capabilities.md)
-- [Generated distributed feature ledger](docs/distributed-feature-state.md)
+Browse the [documentation map](docs/README.md) for architecture, operations,
+reference material, and contribution paths.
 
 ## Build and test this checkout
 
@@ -125,15 +114,9 @@ go vet ./...
 go test -p=1 -timeout=25m ./...
 ```
 
-The documentation audit did not complete a fresh serial root-module run after
-the final `main` merge, so this page does not claim that command is green.
-Focused authorization, storage, SQL, protocol, generator, and integration
-checks are recorded in [current status](docs/status.md). Treat any failure from
-your checkout as a failure to investigate, not as an accepted baseline.
-
-Some qualification lanes require Linux, Docker, Java, `psql`, or explicit
-environment flags. Their docs distinguish normal tests from opt-in evidence.
-Passing tests on one commit does not create a compatibility or support promise.
+This rewrite does not claim a complete green root-module run. See
+[current status](docs/status.md) for the exact validation record and opt-in
+qualification boundaries; investigate any failure from your checkout.
 
 ## Contributing and security
 

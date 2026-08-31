@@ -46,12 +46,6 @@ func (s *postgresSession) prepareWrite(
 	if parsed.Kind != sqlast.KindInsert && parsed.Kind != sqlast.KindUpdate && parsed.Kind != sqlast.KindDelete || parsed.ReturnsRows() {
 		return nil, sqlast.NewFeatureNotSupportedError(text, 0, "RF3 PostgreSQL supports INSERT, UPDATE and DELETE without RETURNING")
 	}
-	if err := rejectComputedUpdateAssignments(
-		text, parsed,
-		"computed UPDATE SET expressions require coordinator-owned post-images and are not supported for RF3 PostgreSQL writes",
-	); err != nil {
-		return nil, err
-	}
 	if parsed.Kind == sqlast.KindInsert && parsed.Insert.Source != nil {
 		return nil, sqlast.NewFeatureNotSupportedError(text, 0, "RF3 PostgreSQL INSERT requires VALUES")
 	}
@@ -65,7 +59,8 @@ func (s *postgresSession) prepareWrite(
 	parameterTypes = postgresScalarDMLParameterTypes(parameterTypes, documents)
 	var compiled *query.DMLStatement
 	var resolvedParameterTypes []driver.ParamType
-	if len(parameterTypes) != 0 || postgresDMLNeedsParameterTypeAnalysis(parsed) {
+	if len(parameterTypes) != 0 || postgresDMLNeedsParameterTypeAnalysis(parsed) ||
+		hasComputedUpdateAssignments(parsed) {
 		var err error
 		compiled, err = query.PrepareParsedDMLWithParameterTypes(
 			text, parsed, parameterTypes,
@@ -158,8 +153,15 @@ func postgresDMLNeedsParameterTypeAnalysis(parsed *sqlast.Statement) bool {
 		return parsed.Insert != nil &&
 			postgresSelectNeedsParameterTypeAnalysis(parsed.Insert.Source)
 	case sqlast.KindUpdate:
-		return parsed.Update != nil &&
-			postgresSelectNeedsParameterTypeAnalysis(parsed.Update.Filter)
+		if parsed.Update == nil {
+			return false
+		}
+		for index := range parsed.Update.Assignments {
+			if postgresScalarHasParameter(parsed.Update.Assignments[index].Expr) {
+				return true
+			}
+		}
+		return postgresSelectNeedsParameterTypeAnalysis(parsed.Update.Filter)
 	case sqlast.KindDelete:
 		return parsed.Delete != nil &&
 			postgresSelectNeedsParameterTypeAnalysis(parsed.Delete.Filter)

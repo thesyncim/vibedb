@@ -737,6 +737,66 @@ func TestGlobalConditionalDeleteCompareDoesNotConsumeDocumentCapacity(t *testing
 	}
 }
 
+func TestGlobalDigestCompareProvesSameLocatorAndReplacesExactOldLocator(t *testing.T) {
+	fixture := newRelationBundleFixture(t, true)
+	key := []byte{0x91, 1, 'a'}
+	locator := []byte(`["doc-1"]`)
+	seed := fixture.command(t, 1, replication.RelationMutationBatch{
+		Relation: 2,
+		Mutations: []replication.Mutation{{
+			Kind: replication.MutationPutAbsentOrEqual, Key: key, Value: locator,
+		}},
+	})
+	if _, err := fixture.machine.ApplyNormal(normalMeta(3), seed); err != nil ||
+		bundleCompletionResult(t, fixture.machine, seed) != ResultApplied {
+		t.Fatalf("seed global locator: %v", err)
+	}
+
+	digest := sha256.Sum256(locator)
+	prove := fixture.command(t, 2, replication.RelationMutationBatch{
+		Relation: 2,
+		Mutations: []replication.Mutation{{
+			Kind: replication.MutationPutDigestEqual, Key: key, Value: locator,
+			ExpectedValueLength: uint64(len(locator)), ExpectedValueDigest: digest,
+		}},
+	})
+	if _, err := fixture.machine.ApplyNormal(normalMeta(4), prove); err != nil ||
+		bundleCompletionResult(t, fixture.machine, prove) != ResultApplied {
+		t.Fatalf("same-locator digest proof: %v", err)
+	}
+
+	stale := fixture.command(t, 3, replication.RelationMutationBatch{
+		Relation: 2,
+		Mutations: []replication.Mutation{{
+			Kind: replication.MutationPutDigestEqual, Key: key, Value: locator,
+			ExpectedValueLength: uint64(len(locator)),
+			ExpectedValueDigest: sha256.Sum256([]byte("stale")),
+		}},
+	})
+	if _, err := fixture.machine.ApplyNormal(normalMeta(5), stale); err != nil ||
+		bundleCompletionResult(t, fixture.machine, stale) != ResultIndexConflict {
+		t.Fatalf("stale same-locator proof: %v", err)
+	}
+
+	replacement := []byte(`["doc-2"]`)
+	replace := fixture.command(t, 4, replication.RelationMutationBatch{
+		Relation: 2,
+		Mutations: []replication.Mutation{{
+			Kind: replication.MutationPutDigestEqual, Key: key,
+			Value: replacement, ExpectedValueLength: uint64(len(locator)),
+			ExpectedValueDigest: digest,
+		}},
+	})
+	if _, err := fixture.machine.ApplyNormal(normalMeta(6), replace); err != nil ||
+		bundleCompletionResult(t, fixture.machine, replace) != ResultApplied {
+		t.Fatalf("exact different-locator replacement: %v", err)
+	}
+	if value, found, err := fixture.global.Collection.AppendRaw(nil, key); err != nil ||
+		!found || !bytes.Equal(value, replacement) {
+		t.Fatalf("global locator after proofs = %q found=%v err=%v", value, found, err)
+	}
+}
+
 func TestRelationJSONDigestCompareReplaceAndDelete(t *testing.T) {
 	fixture := newRelationBundleFixture(t, false)
 	key := []byte("catalog-head")

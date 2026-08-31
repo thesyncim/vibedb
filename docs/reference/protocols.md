@@ -11,39 +11,24 @@ REST. A listener accepting one protocol must not be probed with another.
 
 ## Protocol map
 
-```mermaid
-flowchart LR
-    APP[Go application] -->|in-process calls| EMB[embedded API]
-    DEV[development client] -->|NDJSON stream| GW[gateway]
-    PG[PostgreSQL v3 client] -->|pgwire| PGA[pgwire adapter]
-    PGA --> GW
-    GW -->|static Q/R SQL| SS[static shard]
-    GW -->|RF3 native binary| RS[RF3 shard]
-    RS <-->|Raft peer binary| PEER[RF3 peers]
-    GW -->|split/control binary| CTL[control services]
-```
+| Boundary | Protocol |
+| --- | --- |
+| application to embedded database | direct Go calls; see the [Native Go API](../api/native.md) |
+| development client to gateway | one JSON object per line |
+| PostgreSQL client to adapter | PostgreSQL v3 framing; adapter behavior, not PostgreSQL compatibility |
+| gateway to static shard | tagged, length-prefixed `Q`/`R` binary frames |
+| gateway or control client to RF3 member | authenticated RF3 native binary frames |
+| RF3 peers and control services | mTLS plus a traffic-specific binary protocol |
 
-| Surface | Framing | Intended boundary | Compatibility |
-| --- | --- | --- | --- |
-| Embedded Go API | none; direct calls | application and embedded database in one process | source-level development API |
-| Gateway development protocol | one JSON object plus newline | development client to gateway | exact-build only |
-| Static shard SQL | tagged, length-prefixed binary | gateway to one statically owned shard | internal, exact-build only |
-| RF3 native | tagged binary frames | authenticated gateway/control client to RF3 member | internal, exact-build only |
-| pgwire | PostgreSQL protocol v3 framing | PostgreSQL client to adapter | protocol adapter, not PostgreSQL compatibility |
-| TLS and control | mTLS stream plus traffic-specific binary protocol | service to service | internal, exact-build only |
-
-## Embedded API is not a wire protocol
-
-For the in-process interface, use the [Native Go API](../api/native.md). This
-page deliberately does not duplicate that API or imply that its types can be
-serialized onto a gateway connection.
+The embedded API has no wire encoding. Every network protocol in this table is
+an exact-build development surface unless its section says otherwise.
 
 ## Placement tuple identity
 
-Cross-shard placement uses tuple codec version 1 and native mapper version 1.
-Both identifiers, field order and type, mapper parameters, and canonical tuple
-bytes belong to placement identity. Changing any of them requires regenerating
-every dependent placement artifact in the same change.
+Cross-shard placement identity includes tuple codec version 1, native mapper
+version 1, field order and types, mapper parameters, and canonical tuple bytes.
+Changing any part requires regenerating every dependent placement artifact in
+the same change.
 
 The scalar set is deliberately closed to raw-byte strings and exact JSON
 numbers. Strings are not normalized or checked for UTF-8. Numerically equal
@@ -51,18 +36,14 @@ spellings such as `5`, `5.0`, `5e0`, and `50e-1` encode identically, as do
 positive and negative zero. Booleans, null, arrays, objects, timestamps, and a
 zero-value `distribution.Scalar` are refused.
 
-Each scalar is self-delimiting: `0x01` identifies a string followed by a
-uvarint byte length and its bytes; `0x02` identifies a canonical exact number.
-`0x00` is reserved. `AppendScalar` leaves its destination unchanged on an
-invalid scalar, while `AppendTuple` may return the already encoded valid prefix
-when a later scalar fails.
-
-The native mapper accepts one through eight fields. A complete tuple is hashed
-with xxHash64 and its high bits choose a virtual bucket in the eight-byte
-keyspace. Bucket width is 8 through 24 bits; the default is 20. A shorter bound
-prefix cannot predict the rest of that hash and maps to the complete keyspace,
-so a tenant-only predicate may scatter. xxHash64 selects placement; canonical
-tuple bytes, not the hash, define equality.
+`0x01` encodes a string with a uvarint byte length; `0x02` encodes a canonical
+exact number; `0x00` is reserved. `AppendScalar` leaves its destination
+unchanged on refusal, while `AppendTuple` may return an encoded valid prefix
+when a later scalar fails. The mapper accepts one through eight fields and uses
+the high bits of xxHash64 to select an 8- to 24-bit virtual bucket (20 by
+default). A bound prefix maps to the full keyspace because it cannot predict
+the remaining hash input. The hash selects placement; canonical tuple bytes
+define equality.
 
 ## Gateway newline-delimited JSON
 
@@ -110,10 +91,9 @@ success. Callers must classify the response, not parse diagnostic text.
 
 ### Durable write identity and unknown outcomes
 
-`exec_batch` requires all of `request_id`, `installation_id`, `issuer_epoch`,
+`exec_batch` requires `request_id`, `installation_id`, `issuer_epoch`,
 `lane_ordinal`, `grant_digest`, and `issuer_sequence`. Legacy issuer fields are
-decode-only and rejected. The gateway has no fallback that silently executes an
-unsequenced batch.
+decode-only and rejected; there is no unsequenced fallback.
 
 ```mermaid
 sequenceDiagram
@@ -133,12 +113,11 @@ sequenceDiagram
     end
 ```
 
-`committed` and `outcome_unknown` are mutually exclusive. A disconnect,
-deadline, cancellation, or TLS rotation after possible admission does not prove
-abort. Retain the same request identity, SQL bytes, parameter kinds and bytes,
-statement order, and grant. Resolve or replay that exact request; never generate
-a fresh ID for an ambiguous mutation. At the lower RF3 layer, retry is stricter
-still: the executor resends the exact original canonical command bytes.
+`committed` and `outcome_unknown` are mutually exclusive. After possible
+admission, a disconnect, deadline, cancellation, or TLS rotation does not prove
+abort. Resolve or replay the same identity, grant, statement order, SQL bytes,
+and parameter kinds and bytes; never replace an ambiguous mutation with a new
+ID. RF3 retries resend the original canonical command bytes.
 
 ## Static shard SQL
 
@@ -193,7 +172,7 @@ with version 1 and request tags `P`, `M`, `T`, `L`, `E`, and `G`; responses use
 | serving discovery | probe, member state, leader hint |
 | consensus mutation | propose exact canonical command |
 | membership | authenticated fixed-width membership transition |
-| data read | leader ReadIndex read or explicit applied-floor follower read |
+| data read | point, batch, and fenced SQL reads |
 | recovery | transaction, request-ledger, execution-pin, and route-gate reads |
 | batches and SQL | leader batch point read and leader fenced SQL query |
 
@@ -210,7 +189,7 @@ route.
 
 ### Read cuts are per group
 
-A linearizable point read is leader-only and waits for a quorum-backed
+Every linearizable RF3 read is leader-only and waits for a quorum-backed
 ReadIndex plus local apply. An `at_least_applied` follower read proves only that
 one exact route reached the supplied floor; it is neither linearizable nor a
 bounded-staleness promise.
@@ -222,30 +201,35 @@ therefore **not a global MVCC snapshot, global timestamp, or transaction cut**.
 One definite stale fence permits at most one catalog refresh and complete
 replay from the original request.
 
-General RF3 SQL is also a leader ReadIndex-fenced request, with narrower
-per-request bounds than static SQL. The optimized `read_batch` lane accepts only
-exact-primary-key, whole-document SELECTs; joins, projections, ranges,
-aggregates, ordering, and limits continue through the general executor.
+General RF3 SQL has narrower per-request bounds than static SQL. The optimized
+`read_batch` lane accepts only exact-primary-key, whole-document SELECTs; joins,
+projections, ranges, aggregates, ordering, and limits use the general executor.
 
 ## PostgreSQL wire adapter
 
-The [`pgwire` API](../api/pgwire.md) implements PostgreSQL protocol v3 framing,
-simple Query, extended Parse/Bind/Describe/Execute/Sync, prepared statements,
-portals, cancellation, selected text/binary formats, SCRAM-SHA-256, and
-SSLRequest TLS negotiation. It is not a PostgreSQL server or catalog clone.
-Direct TLS, SCRAM-SHA-256-PLUS, replication, `COPY`, `LISTEN`/`NOTIFY`, a
-queryable `pg_catalog`, and the full PostgreSQL type/function surface are absent.
+See the [pgwire guide](../api/pgwire.md) for framing, authentication, client
+features, and unsupported PostgreSQL facilities. This reference only separates
+the two deployment boundaries.
 
 | Deployment | Backend and security | SQL/transaction boundary |
 | --- | --- | --- |
 | embedded `pgwire` package | local SQL database; caller must explicitly choose Trust or SCRAM and TLS policy | shares the embedded SQL runtime, including its documented local transaction surface |
 | gateway `-pg-dev-listen` | RF3 distributed backend; literal loopback only; Trust auth; user `local`, database `vibedb`; no TLS on this listener | per-statement quorum reads; durable autocommit `INSERT`/`UPDATE`/`DELETE` without `RETURNING`; no mutation inside explicit transactions |
 
-The gateway adapter rejects repeatable-read and serializable snapshot claims,
-savepoints, `INSERT ... SELECT`, `ON CONFLICT`, computed update forms that need
-coordinator-owned post-images, and unsupported distributed DML shapes. DDL is
-available only when a coordinated callback is configured; it is never executed
-as a replica-local schema change. An unknown commit outcome is propagated.
+For an exact-primary-key autocommit `UPDATE`, the gateway admits supported
+computed declared-column assignments. It reads the old row with a linearizable
+point read, evaluates the expressions once, canonicalizes the postimage, and
+retains that postimage in the durable program with the expected old-value
+length and SHA-256 digest. Apply is an exact old-value compare-and-swap; retry
+may initially replan, but after admission transaction execution and recovery
+use the retained bytes instead of re-evaluating the expressions.
+
+The gateway still fences `RETURNING`, `ON CONFLICT`, nested write targets,
+multi-statement pgwire writes, and mutations inside an explicit transaction.
+It also rejects repeatable-read and serializable snapshot claims, savepoints,
+`INSERT ... SELECT`, and unsupported distributed DML shapes. DDL requires a
+coordinated callback and never runs as a replica-local schema change. Unknown
+commit outcomes are propagated.
 
 ## TLS, build gate, and control protocols
 
@@ -258,14 +242,18 @@ the next layer authorizes an explicit capability.
 After TLS, internal streams exchange a fixed 104-byte build preface. Wire and
 disk grammar IDs are opaque equality identities with no ordering semantics.
 Both peers must have exact grammar IDs and mutually sufficient capability bits.
-This is intended as an exact-build gate, not version negotiation.
+This is exact-declared-grammar admission, not version negotiation or proof that
+the peers came from the same commit.
 
 > [!WARNING]
-> The current static-shard grammar manifest was not advanced when marker `0xe4`
-> was added. Builds before and after that change can therefore advertise the
-> same wire grammar ID even though the older decoder rejects the new marker.
-> Run one exact binary commit across every peer; the current preface is not
-> sufficient proof by itself.
+> The grammar manifest was not advanced for static-shard marker `0xe4` or for
+> commit `e9ac566f`. Across the first boundary, builds advertise the same wire
+> ID although the older decoder rejects the marker. Across the second, builds
+> advertise the same wire and disk IDs although RF3 global-index relations now
+> admit `PutDigestEqual` and stored transactions normalize
+> `ResultInvalidDocument` and `ResultTargetBound` to `ResultIndexConflict`. Run
+> one exact binary commit across every endpoint; the current preface does not
+> prove compatibility across either boundary.
 
 Credential/allowlist rotation atomically publishes a new admission generation
 and closes streams admitted under the retired generation. That revocation is
@@ -296,5 +284,5 @@ commit acknowledgement, or apply acknowledgement.
 | RF3 routing and retry | `gateway/replicated_native.go`, `replicated_data_read.go`, `replicated_data_scatter_read.go`, `replicated_sql_read.go` |
 | pgwire base and gateway adapter | `pgwire/doc.go`, `pgwire/proto.go`, `gateway/pgwire.go`, `gateway/pgwire_write.go` |
 | TLS identity and rotation | `internal/servicetls/`, `internal/rafttransport/identity.go` |
-| exact-build gate | `internal/buildgate/profile.go`, `internal/buildgate/preface.go` |
+| declared-grammar gate | `internal/buildgate/profile.go`, `internal/buildgate/preface.go` |
 | split control | `shardcontrol/protocol.go`, `shardcontrol/service.go` |

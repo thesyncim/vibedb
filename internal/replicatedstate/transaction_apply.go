@@ -1368,6 +1368,13 @@ func (m *Machine) planStoredTransactionMutations(
 		if err != nil {
 			return nil, nil, dataChain, 0, 0, err
 		}
+		if code == ResultInvalidDocument || code == ResultTargetBound {
+			// The replicated transaction control format intentionally has one
+			// deterministic abort vote. Invalid or relation-bounded mutation bytes
+			// are caller-data conflicts, not corrupt transaction state; normalize
+			// them before either fused or split prepare persists its vote.
+			code = ResultIndexConflict
+		}
 		if code != ResultApplied {
 			return nil, nil, dataChain, 0, code, nil
 		}

@@ -17,7 +17,8 @@ See the [PostgreSQL wire adapter](pgwire.md) and [SQL reference](../reference/sq
 
 ## Open a catalog with `database/sql`
 
-The DSN is the catalog path. Import the driver for registration:
+The DSN is the catalog path. This complete program uses a disposable catalog
+through `database/sql` only:
 
 ```go
 package main
@@ -26,51 +27,54 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"log"
+	"os"
+	"path/filepath"
 
-	_ "github.com/thesyncim/vibedb/sql/driver"
+	vibedriver "github.com/thesyncim/vibedb/sql/driver"
 )
+
+func must(err error) {
+	if err != nil {
+		panic(err)
+	}
+}
 
 func main() {
 	ctx := context.Background()
-	db, err := sql.Open("vibedb", "app.vdb")
-	if err != nil {
-		log.Fatal(err)
-	}
+	dir, err := os.MkdirTemp("", "vibedb-sql-*")
+	must(err)
+	defer os.RemoveAll(dir)
+	path := filepath.Join(dir, "app.vdb")
+
+	connector, err := (vibedriver.Driver{}).OpenConnector(path)
+	must(err)
+	db := sql.OpenDB(connector)
 	defer db.Close()
 
 	_, err = db.ExecContext(ctx, `CREATE TABLE counters (
 		id STRING PRIMARY KEY,
 		value INTEGER NOT NULL
 	)`)
-	if err != nil {
-		log.Fatal(err)
-	}
+	must(err)
 
 	_, err = db.ExecContext(ctx,
 		`INSERT INTO counters (id, value) VALUES (?, ?)`, "requests", 1)
-	if err != nil {
-		log.Fatal(err)
-	}
+	must(err)
 
 	_, err = db.ExecContext(ctx,
 		`UPDATE counters SET value = value + 1 WHERE id = ?`, "requests")
-	if err != nil {
-		log.Fatal(err)
-	}
+	must(err)
 
 	var value int64
-	if err := db.QueryRowContext(ctx,
-		`SELECT value FROM counters WHERE id = ?`, "requests").Scan(&value); err != nil {
-		log.Fatal(err)
-	}
+	must(db.QueryRowContext(ctx,
+		`SELECT value FROM counters WHERE id = ?`, "requests").Scan(&value))
 	fmt.Println(value)
 }
 ```
 
 The native placeholder is `?`. Named `database/sql` arguments are rejected.
 The pgwire adapter rewrites PostgreSQL `$1` placeholders before parsing; do not
-use `$1` through this driver.
+use `$1` through this driver. Each native call accepts exactly one statement.
 
 Use `Query` for SELECT and mutations with RETURNING. Use `Exec` for DDL and
 mutations without RETURNING. `LastInsertId` is not available.
@@ -99,14 +103,21 @@ UPDATE expressions read the current row. Upsert expressions read both the
 current target row (`users.visits`; bare `visits` is ambiguous) and incoming
 `EXCLUDED` top-level fields. This is implemented behavior, not roadmap syntax.
 
-This guide primarily describes the embedded adapters. Static gateway `exec`
-can also maintain independently placed global indexes for one single-base-owner
-computed `UPDATE` by using canonical before/after images evaluated on the base
-shard; those index writes may add transaction participants. The static listener
-does not expose general multi-statement or cross-base-shard `exec_batch`, which
-is reserved for authenticated durable RF3. The strict RF3 transaction lane,
-including its pgwire path, still refuses computed assignments; it admits only
-the narrower documented direct-column and whole-document forms.
+The embedded behavior above is broader than the authenticated durable RF3 lane.
+RF3 accepts a declared top-level computed assignment only for an exact-primary-
+key UPDATE without RETURNING, ORDER BY/LIMIT, a nested target, or a primary-key
+move. `ON CONFLICT` remains fenced. For example:
+
+```sql
+UPDATE users SET visits = visits + 1, name = name || '!' WHERE id = ?;
+```
+
+The coordinator linearizably reads the old row and evaluates every right-hand
+side once against that same image. It retains the canonical postimage plus the
+old value's exact length and SHA-256 check in the durable program; global-index
+changes derive from that postimage, and recovery replays it without reevaluation.
+The RF3 pgwire backend is autocommit-only: send each write in its own Query or
+Execute/Sync cycle, not an explicit or multi-statement transaction.
 
 `ON CONFLICT` always means the table primary key. `DO NOTHING` and `DO UPDATE`
 are supported; explicit conflict targets, named constraints, action WHERE, and
@@ -133,30 +144,6 @@ distinction in predicates with `IS MISSING`. Authored comparisons such as
 
 ## Transactions and savepoints
 
-```go
-tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
-if err != nil {
-	return err
-}
-defer tx.Rollback()
-
-if _, err := tx.ExecContext(ctx,
-	`UPDATE counters SET value = value + 1 WHERE id = ?`, "requests"); err != nil {
-	return err
-}
-if _, err := tx.ExecContext(ctx, `SAVEPOINT before_audit`); err != nil {
-	return err
-}
-if _, err := tx.ExecContext(ctx,
-	`INSERT INTO counters (id, value) VALUES (?, ?)`, "audit", 1); err != nil {
-	if _, rollbackErr := tx.ExecContext(ctx,
-		`ROLLBACK TO SAVEPOINT before_audit`); rollbackErr != nil {
-		return rollbackErr
-	}
-}
-return tx.Commit()
-```
-
 | Isolation | Read cut | Commit validation |
 |---|---|---|
 | Read Committed (default) | One coherent cut per statement | Write conflicts |
@@ -169,46 +156,64 @@ transaction. A transaction may hold up to 64 savepoints. Duplicate names
 shadow older savepoints; RELEASE removes the named savepoint and newer ones;
 ROLLBACK TO retains the named savepoint and removes newer ones.
 
+This function can be added to the program above; every statement sees the same
+`counters` table and all resources have one owner:
+
+```go
+func savepointExample(ctx context.Context, db *sql.DB) {
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	must(err)
+	defer tx.Rollback()
+	_, err = tx.ExecContext(ctx, `SAVEPOINT before_audit`)
+	must(err)
+	_, err = tx.ExecContext(ctx,
+		`INSERT INTO counters (id, value) VALUES (?, ?)`, "audit", 1)
+	must(err)
+	_, err = tx.ExecContext(ctx, `ROLLBACK TO SAVEPOINT before_audit`)
+	must(err)
+	must(tx.Commit())
+}
+```
+
+Close or exhaust `Rows` before another operation on the same physical
+connection, especially inside `*sql.Tx`. In the typed runtime, a prepare or
+execution error fails an active transaction; recover with ROLLBACK TO or
+ROLLBACK. COMMIT on a failed transaction rolls it back.
+
 After an unknown commit result, close the `database/sql` pool—or typed session
 then database—reopen the catalog, and reconcile; never blindly retry the write.
 
 ## Typed runtime
 
-Use the typed runtime when connection/session ownership must be explicit:
+Use the typed runtime when the caller needs explicit sessions and typed cells.
+Do not open the same catalog through it while a `database/sql` pool still owns
+the writer lease. This function uses the imports and `must` helper above:
 
 ```go
-database, err := driver.Open("app.vdb")
-if err != nil {
-	return err
-}
-defer database.Close()
-
-session, err := database.NewSession(ctx)
-if err != nil {
-	return err
-}
-defer session.Close()
-
-prepared, err := session.Prepare(ctx,
-	`SELECT id, value FROM counters WHERE id = ?`)
-if err != nil {
-	return err
-}
-defer prepared.Close()
-
-cursor, err := prepared.Query(ctx, []any{"requests"})
-if err != nil {
-	return err
-}
-defer cursor.Close()
-for cursor.Next() {
-	id, _ := cursor.Cell(0).Text()
-	value, _ := cursor.Cell(1).Int64()
-	fmt.Println(id, value)
+func typedRead(ctx context.Context, path string) {
+	database, err := vibedriver.Open(path)
+	must(err)
+	defer database.Close()
+	session, err := database.NewSession(ctx)
+	must(err)
+	defer session.Close()
+	prepared, err := session.Prepare(ctx,
+		`SELECT id, value FROM counters WHERE id = ?`)
+	must(err)
+	defer prepared.Close()
+	cursor, err := prepared.Query(ctx, []any{"requests"})
+	must(err)
+	defer cursor.Close()
+	if !cursor.Next() {
+		panic("counter not found")
+	}
+	value, ok := cursor.Cell(1).Int64()
+	if !ok {
+		panic("counter is not an integer")
+	}
+	fmt.Println(value)
 }
 ```
-
-That example imports `github.com/thesyncim/vibedb/sql/driver`.
 
 Ownership rules are strict:
 
@@ -218,12 +223,12 @@ Ownership rules are strict:
   active transaction.
 - `Prepared.Close` releases parsed and compiled arenas and closes its live
   cursor. It is idempotent.
-- `Session.Tables` returns an owned catalog snapshot sorted by table name.
-  Each table's declared columns are in canonical path order—not DDL order—and
-  its exact indexes remain in creation order.
+- `Session.Tables` returns an owned snapshot: tables are sorted by name,
+  declared columns by canonical path, and exact indexes by creation order.
 - Cursor cells borrow runtime storage until `Cursor.Close`; copy data that must
   survive. `Cursor.Close` releases the snapshot lease and is idempotent.
-- Cursor → prepared → session → database is clearest; Close methods safely cascade, and sessions outlive Database.Close.
+- Cursor → prepared → session → database is clearest; Close methods safely
+  cascade, and sessions outlive `Database.Close`.
 
 `Session.SetResultLimits`, `SetIntermediateLimit`, and `SetMemoryLimit` must be
 configured while idle with no live cursor. Zero selects defaults; `-1` disables
@@ -231,10 +236,12 @@ result/intermediate caps. A positive memory limit must be at least 64 KiB.
 
 ## Values and limits
 
-Both APIs accept nil, bool, finite floats, UTF-8 string/bytes, and `query.Number`; document string/bytes must be valid JSON.
-`database/sql` accepts standard-convertible integers and `vibejson.RawValue` only as an exact number.
-Typed runtime accepts all integer widths, `RawValue` as a valid document or exact-number scalar,
-and `*bool`, `*int64`, `*float64`, `*string`, `*[]byte`, or `*query.Number`.
+`database/sql` accepts nil, bool, converter-supported integers, finite float64,
+UTF-8 string/bytes, `query.Number`, and numeric `vibejson.RawValue`. The typed
+runtime accepts every integer width, finite float32/64, those string/number
+forms, and `*bool`, `*int64`, `*float64`, `*string`, `*[]byte`, or
+`*query.Number`. It also accepts `RawValue` as a valid document. Document
+string/bytes must contain one valid JSON value.
 
 | Boundary | Current limit |
 |---|---:|
@@ -254,20 +261,11 @@ and `*bool`, `*int64`, `*float64`, `*string`, `*[]byte`, or `*query.Number`.
 
 Returned `database/sql` values are nil for SQL NULL, bool for booleans, int64
 for exactly representable integral numbers, and byte slices for other exact
-numbers, strings, and JSON. Do not assume every NUMBER fits `float64`.
-
-## Parser ownership
-
-The zero VibeDB `sql.Parser` is reusable but not concurrent. Its AST borrows
-arena storage until the next parse or release. `Parse` accepts SELECT-family
-queries; `ParseStatement` accepts all supported statements. Convert byte-offset
-parse errors before presenting a character-oriented protocol diagnostic.
+numbers, strings, and JSON. NUMBER uses exact JSON-decimal identity: `1`, `1.0`,
+and `1e0` compare as the same number. Do not round through `float64`.
 
 ## Source map
 
-- Driver registration and argument limits: `sql/driver/driver.go:22-79`, `sql/driver/driver.go:308-419`
-- Typed ownership: `sql/driver/runtime.go:22-65`, `sql/driver/runtime.go:129-242`, `sql/driver/runtime.go:608-980`
-- Transactions/savepoints: `sql/driver/tx.go:89-184`, `sql/driver/tx.go:2138-2486`, `sql/driver/savepoint.go:7-190`
-- Mutations and null/missing: `sql/driver/column_update.go:23-112`, `sql/driver/write.go:2452-2577`, `sql/ast.go:684-691`
-- Mutation-image capture: `sql/driver/mutation_capture.go`, `gateway/writer.go`, `gateway/transaction.go`
-- Parser ownership and limits: `sql/parser.go:19-76`, `sql/parser.go:328-377`, `sql/error.go:9-38`
+- Native/typed adapters and values: `sql/driver/driver.go:22-79`, `sql/driver/driver.go:308-419`, `sql/driver/runtime.go:22-242`
+- Transactions and embedded mutations: `sql/driver/tx.go:89-184`, `sql/driver/savepoint.go:7-190`, `sql/driver/column_update.go:23-112`
+- RF3 postimages and replay: `gateway/replicated_sql_transaction.go:128-565`, `gateway/durable_sql_request_executor.go:103-157`

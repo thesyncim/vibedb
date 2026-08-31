@@ -24,6 +24,8 @@ out below. PostgreSQL syntax not listed here is unsupported.
 | Error position | Zero-based byte offset in parser errors |
 
 `Parse`/`ParseStatement` accept one statement; pgwire splits bounded batches.
+A zero `sql.Parser` is reusable but not concurrent, and its returned AST
+borrows parser-arena storage only until the next parse or release.
 
 Operators:
 
@@ -71,8 +73,7 @@ Type spellings are grouped as follows:
 |---|---|
 | Null | NULL |
 | Boolean | BOOL, BOOLEAN |
-| Exact/general number | NUMBER, DECIMAL, NUMERIC |
-| Number aliases | FLOAT, REAL, DOUBLE |
+| Exact/general number | NUMBER, DECIMAL, NUMERIC, FLOAT, REAL, DOUBLE |
 | Integer | INTEGER, INT, INT2, INT4, INT8, BIGINT, SMALLINT, TINYINT |
 | String | STRING, TEXT, VARCHAR, CLOB |
 | Container | ARRAY, OBJECT |
@@ -107,8 +108,7 @@ identity options. A table with dependent views cannot be dropped until its
 views are removed.
 
 ```sql
-CREATE VIEW active_accounts (id, balance) AS
-SELECT id, balance FROM accounts WHERE active = TRUE;
+CREATE VIEW active_accounts (id, balance) AS SELECT id, balance FROM accounts WHERE active = TRUE;
 DROP VIEW active_accounts RESTRICT;
 ```
 
@@ -138,8 +138,7 @@ Explicit targets, `ON CONSTRAINT`, action WHERE, nested assignments or `EXCLUDED
 paths, and mixed document/column assignments are unsupported. A DO UPDATE batch containing the same canonical key twice fails atomically.
 
 ```sql
-INSERT INTO archive SELECT "$doc" FROM accounts WHERE active = FALSE
-ON CONFLICT DO NOTHING;
+INSERT INTO archive SELECT "$doc" FROM accounts WHERE active = FALSE ON CONFLICT DO NOTHING;
 ```
 
 INSERT…SELECT requires one whole-document output and no target list. VALUES
@@ -153,8 +152,7 @@ UPDATE accounts AS a
 SET balance = a.balance + ?, active = TRUE
 WHERE a.id = ? RETURNING id, balance;
 
-DELETE FROM accounts
-WHERE active = FALSE ORDER BY id LIMIT 100 RETURNING id;
+DELETE FROM accounts WHERE active = FALSE ORDER BY id LIMIT 100 RETURNING id;
 ```
 
 UPDATE supports an alias, row expressions, whole-document replacement, declared
@@ -163,14 +161,15 @@ change the primary key; one constant document therefore cannot replace several
 distinct keys. DELETE supports the same tail but no alias or USING. Mutation
 ORDER BY requires LIMIT; UPDATE FROM and mutation OFFSET are unsupported.
 
-Computed assignments run in the embedded adapters and through static gateway
-`exec` for one single-base-owner statement, where independently placed global
-indexes use canonical before/after images evaluated by the base shard and may
-add transaction participants. The static listener does not expose general
-multi-statement or cross-base-shard `exec_batch`. The strict RF3 transaction
-lane and its pgwire endpoint still refuse computed assignments; they accept the
-narrower whole-document or direct declared-column updates described in the
-distributed guide.
+The durable RF3 gateway is narrower than embedded execution. It accepts whole-
+document or declared top-level UPDATE only with exact-primary-key equality;
+top-level assignments may use supported scalar right-hand sides and are
+simultaneous. RETURNING, ORDER BY/LIMIT, nested targets, primary-key moves, and
+ON CONFLICT are refused. The coordinator linearizably reads the old row,
+evaluates each right-hand side once, and retains the canonical postimage with an
+exact old-length/SHA-256 CAS. Global indexes derive from that postimage. An
+ordinary exact retry may first replan; after admission, transaction execution
+and recovery use the retained program instead of reevaluating expressions.
 
 RETURNING accepts bounded path/scalar projections but no aggregates,
 parameters, or SELECT tail. Execute a returning mutation through a query API;
@@ -251,15 +250,14 @@ Aggregates behave as follows:
 | `COUNT(path)` | Counts present, non-null values |
 | SUM/AVG/MIN/MAX | Consume numeric values, skip null/nonnumeric, null on empty input |
 
-Exact decimal semantics are preserved. Aggregate DISTINCT is unsupported.
+Exact JSON-decimal semantics are preserved: `1`, `1.0`, and `1e0` compare
+equally without a `float64` round trip. Aggregate DISTINCT is unsupported.
 
 ## Predicates and three-valued logic
 
 ```sql
-WHERE active = TRUE
-  AND tier IN ('pro', 'team') AND score BETWEEN 10 AND 20
-  AND profile @> '{"verified":true}' AND name ILIKE 'ada%'
-  AND deleted_at IS MISSING
+WHERE active = TRUE AND tier IN ('pro', 'team') AND score BETWEEN 10 AND 20
+  AND profile @> '{"verified":true}' AND name ILIKE 'ada%' AND deleted_at IS MISSING
 ```
 
 Implemented predicates are comparisons, IS `[NOT]` NULL, IS `[NOT]` MISSING,
@@ -391,19 +389,16 @@ ROLLBACK TO restores and retains the named savepoint and drops newer ones.
 
 ## Unsupported SQL families
 
-Unsupported families include MERGE, REPLACE, COPY, GRANT/REVOKE, COMMENT,
-VACUUM/ANALYZE/REINDEX/CLUSTER, PREPARE/EXECUTE/DEALLOCATE, DECLARE/FETCH/MOVE,
-LISTEN/NOTIFY/UNLISTEN, LOCK, CALL, and DO. PostgreSQL extensions, catalogs,
-procedures, triggers, policies, sequences, materialized views, and replication are outside this dialect.
+Unsupported families include MERGE, REPLACE, COPY, GRANT/REVOKE, COMMENT, VACUUM,
+ANALYZE, REINDEX, CLUSTER, PREPARE/EXECUTE/DEALLOCATE, DECLARE/FETCH/MOVE,
+LISTEN/NOTIFY/UNLISTEN, LOCK, CALL, and DO. PostgreSQL extensions, catalogs, procedures,
+triggers, policies, sequences, materialized views, and replication are outside this dialect.
 
 ## Source map
 
-- Parser contract/tokens/unsupported: `sql/parser.go:19-76`, `sql/parser.go:722-907`, `sql/lexer.go:155-300`, `sql/unsupported.go:5-85`
-- SELECT/group/order/limit: `sql/parser.go:962-1209`, `sql/parser.go:2635-2903`, `sql/resolve.go:635-735`
-- Expressions/predicates: `sql/scalar_parse.go:90-770`, `sql/predicate.go:503-745`, `sql/predicate.go:1103-1255`
-- Joins/derived/LATERAL: `sql/parser.go:2105-2455`, `sql/resolve.go:450-633`
+- Parser and expressions: `sql/parser.go:19-76`, `sql/lexer.go:155-300`, `sql/scalar_parse.go:90-770`, `sql/predicate.go:503-745`
+- SELECT and relations: `sql/parser.go:962-1209`, `sql/parser.go:2105-2455`, `sql/resolve.go:450-735`
 - CTE/set/window: `sql/parse_cte.go:5-135`, `sql/recursive_cte.go:25-220`, `sql/set.go:314-873`, `sql/parser.go:1320-1954`
-- DML: `sql/parse_dml.go:224-674`, `sql/parse_dml.go:847-1512`, `sql/driver/write.go:1095-1504`
-- Static mutation images: `sql/driver/mutation_capture.go`, `shardservice/execute.go`, `gateway/writer.go`
+- DML and RF3 images: `sql/parse_dml.go:224-674`, `sql/driver/write.go:1095-1504`, `gateway/replicated_sql_transaction.go:128-565`
 - DDL/views: `sql/parse_ddl.go:5-566`, `sql/parse_drop.go:31-187`, `sql/parse_view.go:5-118`
 - Runtime transactions: `sql/driver/tx.go:89-258`, `sql/driver/savepoint.go:7-190`

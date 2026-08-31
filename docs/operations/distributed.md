@@ -52,7 +52,6 @@ The boundaries have distinct jobs:
 3. The host gives runnable groups bounded Ready, input, proposal, and logical-tick turns.
 4. One runtime owns one group identity, WAL namespace, SQL apply root, state machine, and node;
    physical and logical incarnations prevent accidental path adoption.
-5. The node persists Ready, releases messages, applies and publishes, then advances.
 
 An accepted proposal is not committed, and a transport write is not proposal acceptance. A log
 entry is not externally complete until deterministic apply and result publication finish.
@@ -60,19 +59,14 @@ entry is not externally complete until deterministic apply and result publicatio
 ## Catalog generations are operation leases
 
 Catalog publication is atomic: a reader sees one whole old or new immutable generation, never
-a mixture. Planning, endpoints, ownership, route versions, and scatter targets share that cut.
+a mixture. Pin that generation, retain it through return, and build every route and command from
+it. After a stale-fence failure, pin a newer generation and rebuild from the original request;
+do not splice newer metadata into the old command.
 
-An operation holds its lease through return. A stale-fence retry pins a newer generation and
-rebuilds from the original input, while earlier leases remain held so drains see old attempts.
-
-This gives two important rules:
-
-- Never splice an endpoint, ownership epoch, or schema relation from a newer catalog into an
-  already encoded command. Forwarding, where explicitly supported, preserves the exact old
-  command bytes and checks a catalog-authorized forwarding window.
-- Treat generation drain as a metadata and execution fence, not as a database snapshot. Two
-  groups read with separate Raft barriers do not become one global point-in-time read merely
-  because their routes came from one catalog generation.
+Forwarding, where explicitly supported, preserves the old command bytes and checks a
+catalog-authorized window. Generation drain is a metadata and execution fence, not a database
+snapshot: groups that read through separate Raft barriers do not gain one global point-in-time
+cut merely because their routes came from one catalog generation.
 
 Publication only moves forward. Exact-predecessor cutovers compare-and-publish; a stale
 controller must re-observe and replan, not publish an unrelated higher generation.
@@ -111,9 +105,10 @@ fail closed when a group-level active transaction intent blocks the requested cu
 ## WAL generations and snapshots
 
 The Raft WAL is bounded, preallocated, encrypted/authenticated, digest-chained, and tied to an
-immutable placement identity. The default profile is a 256 MiB file with 80 MiB maximum records,
-65,536 records, 1,048,576 entries, and 128 MiB live data; configuration may choose lower valid
-bounds. Capacity exhaustion is an admission failure, not permission to overwrite live history.
+immutable placement identity. Its active limits are sealed into the format; a manifest may choose
+smaller values than the constructor defaults. See [defaults and limits](../reference/limits.md)
+for the current ceilings. Capacity exhaustion is an admission failure, not permission to
+overwrite live history.
 
 Startup authenticates the family manifest, header, dual current slots, records, key, recovery
 epoch, and SQL/apply binding before adoption. One torn current slot can be selected around, but
@@ -227,7 +222,7 @@ Transport retry and request retry solve different problems. Re-sending a peer fr
 Raft delivery. Re-submitting the exact client command settles whether the logical operation
 committed and what result it produced.
 
-## Static indexed updates and deletes
+## Indexed updates and deletes
 
 > [!IMPORTANT]
 > The checked-in static listener exposes this path only through `exec` for one
@@ -236,37 +231,38 @@ committed and what result it produced.
 > static `exec_batch` is not exposed. Public `exec_batch` is reserved for
 > authenticated durable RF3 and never takes an unsequenced fallback.
 
-The static gateway can maintain independently placed global indexes for a
-computed `UPDATE`, or for a `DELETE`, without evaluating an update assignment
-at the coordinator:
+The static and RF3 lanes reach the same index relations through different
+replay contracts:
 
-1. The base shard preflights the complete selected batch and returns canonical
-   primary key, before-document, and after-document images without publishing.
-   A delete has a null after image. The capture is row/byte bounded and requires
-   both read and write authority even though its execution mode is read-only.
-2. The gateway validates every image and base route, derives old index deletes
-   and new index puts, and retains sorted primary keys plus SHA-256 before- and
-   after-image digests. It does not durably retain the full postimages.
-3. The base participant is staged as old-key/digest precondition, original SQL,
-   then new-key/digest check. A serializable prepare executes that sequence and
-   rolls it back, proving that the SQL still produces the captured postimages
-   before any participant can commit.
-4. After the coordinator decision, apply executes the staged batch again. Base
-   work remains in authored order; on each final index participant every delete
-   is ordered before every put, including across statements, so an atomic
-   unique-key swap can release old claims first.
+| Lane | Base-row proof | Retry behavior |
+| --- | --- | --- |
+| Static `exec` | The base shard captures canonical key, before-image, and after-image without publishing. Prepare checks the old digest, executes the original SQL, and checks the resulting digest before any participant commits. | Apply executes the staged SQL again. A computed right-hand side is therefore not an exactly-once evaluation contract. |
+| Durable RF3 `exec_batch` | An exact-primary-key update performs one linearizable old-row read, evaluates supported top-level declared-column assignments simultaneously over that row, canonicalizes the postimage, and retains it with the old byte length and SHA-256 digest. | The retained mutation bytes are the recovery program. Apply uses an exact old-value CAS and never re-evaluates the SQL expression. |
 
-All global-index lifecycle states are write-maintained; only `Ready` is
-read-plannable. A computed right-hand side is evaluated once during capture,
-but the SQL is executed again during prepare and apply, so this is not an
-exactly-once evaluation contract.
+An RF3 update of a missing key retains a durable zero-row no-op and does not
+evaluate its assignments.
 
-This path is static-only. Strict RF3 durable transactions accept
-whole-document and direct declared-column updates, but still reject computed
-assignments because the durable RF3 replay program does not retain their
-evaluated postimages. The new static path has local and in-process failure-
-atomicity tests; it has no new external process, crash, or recovery
-qualification gate.
+Both lanes derive global-index changes from canonical images. RF3 removal is
+digest-guarded; a new locator is absent-or-equal. When an index key stays the
+same, one digest-compare replacement proves the exact old locator before
+installing the new one. A stale base row or locator aborts rather than
+publishing a partial base/index state.
+
+This is optimistic materialization, not an automatic recompute loop. An
+ordinary exact retry may first replan, but after ledger admission the retained
+program is authoritative; transaction execution and recovery use those bytes.
+Recomputing from a newer row requires a new logical request identity.
+
+Only `Ready` global indexes are read-plannable, although every lifecycle state
+is write-maintained. RF3 computed updates remain inside the narrow mutation
+surface: exact primary-key equality, top-level declared columns, supported
+scalar expressions, and no primary-key move. `RETURNING`, `ORDER BY`, `LIMIT`,
+nested targets, and `ON CONFLICT` remain fenced; gateway pgwire exposes writes
+only as durable autocommit operations. Local tests cover retained canonical
+postimages, simultaneous evaluation, exact retry, index derivation, and
+same-key locator replacement. The external RF3 chaos workload still uses
+whole-document updates, so it does not qualify computed-update recovery under
+process, leader, or partition faults.
 
 ## Transactions and logical clocks
 
@@ -314,42 +310,33 @@ There is no global MVCC timestamp, global snapshot read, or wall-clock-derived c
 | Snapshot staging interruption | The target is incomplete and non-serving. | Resume the certified artifact transfer; do not expose staged rows. |
 | Stale catalog or ownership fence | Topology changed after planning. | Re-pin a newer catalog generation and rebuild from the original logical request. |
 
-## Hard bounds worth monitoring
+## Bounds worth monitoring
 
-These are admission ceilings, not sizing recommendations. A manifest may configure smaller
-values, and front-end commands may impose tighter limits than the reusable core.
+The current numeric ceilings live in [defaults and limits](../reference/limits.md); do not copy
+them into deployment assumptions. Watch queues, WAL generations, read barriers, retained
+results, ledger cleanup reserve, leadership churn, and catalog drains. These are admission
+accounts, not sizing recommendations or exact RSS limits. Raising one requires complete
+same-build qualification because tighter bounds at another layer still win.
 
-| Resource | Current hard/default boundary |
-| --- | --- |
-| Multi-Raft core | Per host/lane: 4,096 groups, 65,536 queued items, 1 GiB queued bytes; 1–64 power-of-two lanes, with aggregate capacity scaling by lane count. |
-| Group membership | At most 64 roster references in the generic registry; RF3 steady state is three voters. |
-| Raft command/input | 16 MiB proposal command, approximately 17 MiB inbound message, 4 MiB committed Ready batch. |
-| Peer transport | 4,096 peers, 65,536 queued frames, 1 GiB queued bytes; 256-frame coalescing. |
-| WAL defaults | 256 MiB file, 80 MiB record, 65,536 records, 1,048,576 entries, 128 MiB live bytes. |
-| Read barriers | 1,024 pending contexts and 256 KiB aggregate context bytes per node. |
-| Proposal results | 65,536 outstanding identities/attempts/waiters, 64 attempts per identity, 128 MiB retained completions. |
-| Request ledger | 32 KiB inline plan, 512 KiB pages, 1 GiB aggregate plan, 256 targets per physical wave. |
-
-Watch queues, WAL generations, read barriers, retained results, ledger cleanup reserve,
-leadership churn, and catalog drains. Raising a limit requires complete same-build qualification.
+The checked-in `serve-rf3` command uses a 112 MiB process-wide native frame
+account shared by every local RF3 group. From an otherwise empty account, that
+admits two worst-bound 40 MiB SQL execution reservations and their maximum
+request frames while retaining headroom for ordinary native traffic; a third
+worst-bound query is refused before execution. The reservation is conservative,
+not actual allocation, RSS, or a throughput promise, and other in-flight native
+traffic can reduce available concurrency.
 
 ## Current non-guarantees
 
-Do not infer any of the following from the implementation or its tests:
+The earlier sections define the principal non-guarantees. Additional gaps are:
 
-- rolling or mixed-version compatibility, downgrade, or online format migration;
-- a production availability, durability, data-loss, failover-time, or latency SLA;
-- linearizable follower reads or a bounded follower-staleness interval;
-- ordinary Raft `MsgSnap` transfer;
-- receiver or consensus acknowledgement from `Send` or a socket-write counter;
-- automatic or joint-consensus replica replacement;
-- a cluster-wide snapshot, global MVCC timestamp, or unrestricted clock-fault tolerance;
-- online request-ledger range changes—a different range requires a fresh certified group;
-- replicated local `UNIQUE` indexes;
-- durable fulfillment of large completion-digest references by a finished blob store;
-- proof from the deterministic simulator of physical WAL tears, TLS/framing, process behavior,
-  autonomous election timing, or external-network qualification;
-- production PKI provisioning or permission to bypass the exact certificate/trust-domain model.
+- request-ledger ranges cannot change online; a different range needs a fresh certified group;
+- local `UNIQUE` indexes are not supported on replicated relations;
+- large completion-digest references have no finished durable blob-store fulfillment path;
+- deterministic simulation does not prove physical WAL tears, TLS/framing, process behavior,
+  autonomous election timing, or external-network behavior;
+- production PKI provisioning is outside this repository and does not relax the exact
+  certificate and trust-domain model.
 
 Several formats explicitly identify themselves as unreleased and have no legacy decoder.
 Preserve artifacts, but assume only the exact creating build can understand them.

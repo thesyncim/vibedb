@@ -8,7 +8,7 @@
 > and use only disposable or independently recoverable data.
 
 Runtime behavior for this rewrite was audited from `main` at commit
-`9069cd0e403e2a0450be967e0b2317121dfc7df2`. The documentation changes that
+`8c296c9fce9683156cfaac440c0d1066e3351fb0`. The documentation changes that
 follow it do not turn that snapshot into a roadmap or guarantee about a later
 commit.
 
@@ -52,41 +52,32 @@ continue to reject obsolete layouts.
 
 These are source-audit findings, not hypothetical limitations.
 
-| Area | Current defect or sharp edge | Consequence |
+| Evidence | Current defect or sharp edge | Consequence |
 | --- | --- | --- |
-| Service metrics | A nonzero-group request can panic when a metrics service was built with `Provider` that is not also `GroupProvider` | Group-serving configurations must supply `GroupProvider` |
-| Distributed transaction journal | Compaction omits durable coordinator recovery-pulse records | Reopen after compaction can reset recovery-pulse state; do not rely on that compaction path for recovery authority |
-| Build grammar identity | The static shard wire gained mutation-image marker `0xe4`, but the build manifest and derived wire grammar ID did not change | Pre- and post-image builds can pass the build preface yet disagree on this request; never mix them or treat the current gate as sufficient proof |
-| Facade options | `AdvancedOptions.Engine.SkipIndexes` is not defensively cloned | Caller mutation after `Open` can affect later lazy collections |
-| Facade opaque values | A first lazy `Put` and later direct/transactional writes do not apply one consistent JSON rule | Do not enable opaque values through the root facade |
-| Reopened bounds | Transactional writes use database-open defaults rather than a reopened collection's persisted key/document bounds | Do not assume direct and transactional bound parity with custom persisted limits |
-| Collection names | NUL handling differs between memory and durable layers | Treat NUL as unsupported in portable collection names |
-| Benchmark summaries | `mixedsuite` summary rows contain more grouping fields than the header declares | Do not consume its current summary TSV as a stable machine-readable schema |
+| [Service metrics](../internal/servicemetrics/service.go) | A nonzero-group request can panic when a metrics service was built with `Provider` that is not also `GroupProvider` | Group-serving configurations must supply `GroupProvider` |
+| [Distributed transaction compaction](../internal/distributedtxn/journal_compact.go) | Compaction omits durable coordinator recovery-pulse records | Reopen after compaction can reset recovery-pulse state; do not rely on that compaction path for recovery authority |
+| [Shard codec](../shardservice/codec.go) / [replicated apply](../internal/replicatedstate/apply.go) / [transaction apply](../internal/replicatedstate/transaction_apply.go) / [build manifest](../internal/buildgate/manifest/current.txt) | Static capture added mutation-image marker `0xe4`; later RF3 postimage work also widened replicated global-index digest replacement and normalized prepare conflicts. Neither boundary advanced the generated wire or disk grammar IDs | Builds across either boundary can pass the preface yet disagree on requests or durable replay; use one exact commit and do not rely on the preface or in-place replay across these changes |
+| [Facade option cloning](../vibedb.go) | `AdvancedOptions.Engine.SkipIndexes` is not defensively cloned | Caller mutation after `Open` can affect later lazy collections |
+| [Facade validation](../vibedb.go) / [transaction validation](../vibedb_txn.go) | A first lazy `Put` and later direct or transactional writes do not apply one consistent JSON rule | Do not enable opaque values through the root facade |
+| [Facade transaction bounds](../vibedb_txn.go) | Transactional writes use database-open defaults rather than a reopened collection's persisted key/document bounds | Do not assume direct and transactional bound parity with custom persisted limits |
+| [Facade names](../internal/collectionname/collectionname.go) / [memory-store names](../store/store_collection.go) | NUL handling differs between memory and durable layers | Treat NUL as unsupported in portable collection names |
+| [`mixedsuite` summaries](../bench/competitive/cmd/mixedsuite/main.go) | Summary rows contain more grouping fields than the header declares | Do not consume the current summary TSV as a stable machine-readable schema |
 
-Source and test locations are maintained in the relevant API/operations pages.
 These defects are reasons the project must not be used for irreplaceable data.
 
-## Test baseline
+## Validation record
 
-On an earlier audit base, a serial root-module run reached `store/durable` and
-was externally terminated, so it did **not** produce a complete root-module
-result. The later `main` merge aligned the SQL-authorization assertion with the
-parser grammar; the focused `internal/serviceauthz` suite now passes. A fresh
-complete serial root run was not finished after that final merge, and this page
-does not present the tree as green. Focused core, store, query, SQL, pgwire,
-Raft, command, benchmark, and hermetic client integration suites passed during
-the audit. A separate complete `store/durable` package run exceeded its
-30-minute timeout while
-`TestFileStorePointReplayDoesNotExhaustRetirementCapacity` was active; that
-test passed alone in 51 seconds, but the package run still has no complete
-result.
+Validation was incremental across the rewrite and its `main` merges; this is
+the complete claim, not a blanket green-build assertion.
 
-Opt-in or environment-specific gates were not all run locally:
-
-- PostgreSQL's upstream corpus was not run.
-- Stock `psql` and Java/JDBC live gates require explicit local dependencies.
-- Linux-only external fault, `/proc`, direct-I/O, and Kubernetes Kind lanes were
-  not reproduced on this Darwin host.
+| Check | Result | Boundary |
+| --- | --- | --- |
+| `go test -p=1 -timeout=25m ./...` | **Incomplete** | An earlier run reached `store/durable` and was externally terminated; no complete serial root run finished after the final `main` merge |
+| Focused packages and integrations | Passed during the audit | Core, store, query, SQL, pgwire, Raft, commands, benchmarks, hermetic clients, and `internal/serviceauthz` after its parser-aligned assertion |
+| `go test ./store/durable -timeout=30m` | **Timed out** | `TestFileStorePointReplayDoesNotExhaustRetirementCapacity` was active; that test passed alone in 51 seconds, but the package has no complete result |
+| PostgreSQL 18.6 upstream corpus | Not run | The approval set remains empty; see [PostgreSQL compatibility status](#postgresql-compatibility-status) |
+| Live `psql` and Java/JDBC gates | Not run | Require explicit local dependencies and flags |
+| Linux fault, `/proc`, direct-I/O, and Kubernetes Kind lanes | Not run | This audit ran on Darwin |
 
 CI workflow presence does not prove branch protection or a mandatory release
 gate. Raw CI artifacts are evidence for one run, not a benchmark publication or
@@ -109,14 +100,3 @@ No competitive result is published in this repository. Coverage tables show
 that harness shapes exist; qualification receipts validate artifact structure;
 neither establishes a win, cost claim, or scaling result. See
 [performance evidence](performance.md).
-
-## Source map
-
-- `internal/buildgate/profile.go`, `disk.go`, and `rolling_restart_test.go`
-- `internal/serviceauthz/sql.go` and `sql_test.go`
-- `internal/servicemetrics/service.go`
-- `internal/distributedtxn/journal.go` and `journal_compact.go`
-- `vibedb.go` and `vibedb_txn.go`
-- `integration/pgcompat/approved-tests.txt`
-- `bench/competitive/RESULTS.md`
-- `bench/competitive/cmd/mixedsuite/main.go`

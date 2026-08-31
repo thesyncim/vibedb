@@ -66,26 +66,22 @@ database afterward.
 
 ## Require TLS and SCRAM
 
-For a network listener, provide a certificate, require TLS, and derive the
-in-memory verifier used by the SCRAM lookup:
+For a network listener, add `crypto/tls` to the imports above and use this
+constructor. The caller owns and closes the returned server:
 
 ```go
-verifier, err := pgwire.NewVerifier("correct horse battery staple")
-if err != nil {
-	return err
+func secureServer(database *driver.Database, tlsConfig *tls.Config) (*pgwire.Server, error) {
+	verifier, err := pgwire.NewVerifier("correct horse battery staple")
+	if err != nil {
+		return nil, err
+	}
+	return pgwire.NewServer(database, pgwire.Options{
+		Database: "app", TLSConfig: tlsConfig, RequireTLS: true,
+		Auth: pgwire.SCRAM(func(user string) (pgwire.Verifier, bool) {
+			return verifier, user == "app"
+		}),
+	})
 }
-server, err := pgwire.NewServer(database, pgwire.Options{
-	Database:   "app",
-	TLSConfig:  tlsConfig, // certificate or certificate callback required
-	RequireTLS: true,
-	Auth: pgwire.SCRAM(func(user string) (pgwire.Verifier, bool) {
-		return verifier, user == "app"
-	}),
-})
-if err != nil {
-	return err
-}
-defer server.Close()
 ```
 
 The public API does not yet serialize or reload `Verifier`; this example is
@@ -101,8 +97,9 @@ passwords.
 cancel request arrives on its own connection and receives no response, as the
 protocol requires.
 
-`NewServerWithBackend` borrows a custom `Backend`; it receives authenticated `SessionIdentity` and must bind it to execution authority.
-The server closes returned sessions. Autocommit-only writes must each stand alone.
+`NewServerWithBackend` borrows a custom `Backend`. It receives authenticated
+`SessionIdentity` and must bind it to execution authority; the server closes
+returned sessions.
 
 ## Protocol surface
 
@@ -112,7 +109,7 @@ The server closes returned sessions. Autocommit-only writes must each stand alon
 | Simple query | Bounded multi-statement batches; stop at first error |
 | Extended query | Parse, Bind, Describe, Execute, Close, Flush, Sync |
 | Prepared state | Named/unnamed statements and portals, portal suspension |
-| Transactions | BEGIN/START, COMMIT, ROLLBACK, SAVEPOINT, RELEASE, ROLLBACK TO |
+| Embedded transactions | BEGIN/START, COMMIT, ROLLBACK, SAVEPOINT, RELEASE, ROLLBACK TO |
 | Isolation | Read Committed, Repeatable Read, Serializable; READ ONLY/WRITE |
 | Cancellation | BackendKeyData plus out-of-band CancelRequest |
 | Parameters | Text plus selected binary encodings |
@@ -123,6 +120,13 @@ Simple-query placeholders are rejected. Extended-query clients use `$1`
 through `$32767`; repeated and out-of-order references work, and gaps count
 toward the parameter count. Mixing `$n` and `?` is rejected. Rewriting ignores
 quoted strings, identifiers, and comments.
+
+The gateway RF3 backend is a separate, autocommit-only write lane. It accepts
+INSERT VALUES, DELETE, and exact-primary-key UPDATE without RETURNING. A
+declared top-level UPDATE right-hand side may be a supported computed scalar;
+RETURNING, ORDER BY/LIMIT, nested targets, primary-key moves, and ON CONFLICT
+remain fenced. Each write stands alone in one Query or Execute/Sync cycle;
+explicit and multi-statement write transactions are unsupported there.
 
 On the embedded transactional backend, an idle batch of stored SQL is
 preflighted and runs atomically in one implicit transaction. Explicit
@@ -157,8 +161,11 @@ In a failed transaction, only COMMIT, ROLLBACK, and ROLLBACK TO may proceed.
 COMMIT on an aborted transaction rolls it back and reports command tag
 `ROLLBACK`. DDL is still prohibited inside transactions.
 
-Errors carry mapped PostgreSQL SQLSTATEs and character positions. Unknown
-commit outcome is `40003`, outranks cancellation, and requires reconnect/reconcile—not blind retry.
+Errors carry one-based character positions. Common SQLSTATEs are `42601`
+syntax, `0A000` unsupported, `23505` unique violation, `40001` serialization,
+`54000` resource cap, `57014` cancellation, and `08P01` protocol violation.
+Unknown outcome is `40003`; it outranks cancellation and requires reconnect
+and reconciliation, never a blind retry.
 
 ## Parameter types
 
@@ -180,6 +187,10 @@ is rejected; send JSON text `null` to store a JSON null document. Untyped text
 uses JSON-scalar spelling inference, so `21` may bind as a number; declare text
 when text is required. Scalar JSON objects and arrays are rejected in scalar
 positions. Nonfinite floats are rejected.
+
+Text `int2`/`int4`/`int8`/`float4`/`float8`/`numeric` inputs bind as exact JSON
+numbers without PostgreSQL width or range enforcement. Binary integers and
+floats use their protocol widths; binary `numeric` is unsupported.
 
 Input strings must be valid UTF-8 and contain no NUL. Text-format `name` clips
 at 63 bytes; overlength binary `name` is `42622`. Direct `bpchar` preserves
@@ -242,18 +253,17 @@ result, intermediate, or timeout limits; other execution limits still apply.
 ## Explicitly unsupported
 
 Do not expect COPY, replication, LISTEN/NOTIFY, logical decoding, large objects,
-PostgreSQL extensions or functions, materialized views, general catalog queries,
-direct TLS, holdable cursors, or arbitrary ORM startup/discovery traffic.
-Recognized unsupported SQL returns feature-not-supported; unknown frontend
-messages are protocol violations.
+PostgreSQL extensions/functions, materialized views, general catalog queries,
+direct TLS, holdable cursors, or arbitrary ORM discovery. Unsupported SQL maps
+to `0A000`; unknown frontend messages map to `08P01`.
 
 ## Source map
 
 - Contract and compatibility boundary: `pgwire/doc.go:1-39`, `pgwire/server.go:40-51`
 - Server lifecycle/options: `pgwire/server.go:54-155`, `pgwire/server.go:183-400`
-- Startup/TLS/auth: `pgwire/session.go:438-744`, `pgwire/scram.go:18-70`, `pgwire/scram.go:96-528`
+- Startup/TLS/auth: `pgwire/session.go:438-744`, `pgwire/scram.go:18-528`
 - Simple/extended state machines: `pgwire/session.go:831-1102`, `pgwire/extended.go:53-394`
 - Parameters/results/errors: `pgwire/extended.go:810-1491`, `pgwire/rows.go:12-251`, `pgwire/pgerror.go:291-581`
-- Commands and numbered parameters: `pgwire/command.go:192-374`, `pgwire/command.go:954-1670`
-- Discovery and integration gates: `pgwire/catalog_shim.go:12-145`, `integration/pgclient/pgclient_test.go:35-369`
+- Commands/discovery/gates: `pgwire/command.go:192-1670`, `pgwire/catalog_shim.go:12-145`, `integration/pgclient/pgclient_test.go:35-369`
+- Gateway RF3 writes: `gateway/pgwire_write.go:34-92`, `gateway/replicated_sql_transaction.go:128-565`
 - Zero-test compatibility ratchet: `integration/pgcompat/approved-tests.txt:1-3`

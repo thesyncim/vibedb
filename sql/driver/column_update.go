@@ -63,6 +63,35 @@ func materializeColumnAssignments(
 	)
 }
 
+// MaterializePreparedUpdateAssignments evaluates and applies one prepared
+// UPDATE assignment list over document. Every computed right-hand side sees
+// the same pre-update document, and direct assignments are patched only after
+// all computed values have been collected. statement and exec are mutable,
+// single-consumer query state owned by the caller; document and args are
+// borrowed only for this call, while the returned document is owned.
+//
+// This is the pre-storage materialization boundary. It intentionally does not
+// validate a table schema, routing key, or canonical storage representation;
+// distributed coordinators must perform those checks before retaining or
+// publishing the returned bytes.
+func MaterializePreparedUpdateAssignments(
+	statement *query.DMLStatement,
+	exec *query.Exec,
+	document []byte,
+	args []any,
+	maxBytes int,
+) ([]byte, error) {
+	if statement == nil || statement.Tree() == nil ||
+		statement.Tree().Kind != sqlast.KindUpdate ||
+		statement.Tree().Update == nil {
+		return nil, errors.New("vibedb: prepared UPDATE assignments require an UPDATE statement")
+	}
+	return materializeColumnAssignments(
+		statement, exec, document,
+		statement.Tree().Update.Assignments, args, maxBytes,
+	)
+}
+
 // materializeConflictColumnAssignments evaluates the computed half of an
 // INSERT ... ON CONFLICT DO UPDATE assignment list over one immutable pair of
 // row images, then feeds those values through the same byte-preserving patcher

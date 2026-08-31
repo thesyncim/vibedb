@@ -139,9 +139,10 @@ func TestGatewayDurableRF3ExternalProcessRecovery(t *testing.T) {
 	})
 	terminalLossLatency := clientA.loseResponseAfterFirstByte(t, terminalRequest)
 	latencies = append(latencies, terminalLossLatency)
-	fixture.assertPinJournalRetired(t, fixture.gatewayAJournal)
 	// The byte proves the server emitted a response, while these independent
-	// linearizable reads prove the discarded response followed durable apply.
+	// linearizable reads prove the mutation applied despite its deliberately
+	// unknown transport outcome. Replacement recovery below proves the exact
+	// terminal; the ACK replay then retires this gateway's retained journal.
 	proofA := fixture.dialGateway(t, fixture.gatewayANode, fixture.gatewayAAddress)
 	latencies = append(latencies, proofA.assertPoint(t, "orders_a", "terminal-a"))
 	latencies = append(latencies, proofA.assertPoint(t, "orders_b", "terminal-b"))
@@ -859,12 +860,13 @@ func (fixture *durableRF3ExternalFixture) startGateway(
 			{SQL: `INSERT INTO orders_a VALUES (?)`, Params: []serveParam{{Kind: "document", Text: `{"id":"seed-a","kind":"seed","email":"seed-a@example.test","value":1}`}}},
 			{SQL: `INSERT INTO orders_b VALUES (?)`, Params: []serveParam{{Kind: "document", Text: `{"id":"seed-b","kind":"seed","email":"seed-b@example.test","value":2}`}}},
 		}, "batch")
-		response, _ := client.roundTrip(t, request)
+		seedTimeout := gateway.DefaultProfiles()[gateway.ClassBatch].GlobalDeadline + 5*time.Second
+		response, _ := client.roundTripWithin(t, request, seedTimeout)
 		// Seeding is a durable request too. A definite outcome-unknown reply
 		// must be resolved by one bounded retry of the identical issuer key and
 		// command, not treated as proof that the seed was rolled back.
 		if reply := durableRF3ExternalExecResponse(t, response); strings.Contains(reply.Error, gateway.ErrDurableRequestUnresolved.Error()) {
-			response, _ = client.roundTrip(t, request)
+			response, _ = client.roundTripWithin(t, request, seedTimeout)
 		}
 		durableRF3ExternalAssertCommitted(t, response, 2, 2)
 		client.ackTerminal(t, response)
@@ -1286,10 +1288,19 @@ func (client *durableRF3ExternalWireClient) roundTrip(
 	request []byte,
 ) ([]byte, time.Duration) {
 	t.Helper()
-	if client == nil || client.connection == nil || len(request) == 0 {
+	return client.roundTripWithin(t, request, 20*time.Second)
+}
+
+func (client *durableRF3ExternalWireClient) roundTripWithin(
+	t testing.TB,
+	request []byte,
+	timeout time.Duration,
+) ([]byte, time.Duration) {
+	t.Helper()
+	if client == nil || client.connection == nil || len(request) == 0 || timeout <= 0 {
 		t.Fatal("invalid external gateway round trip")
 	}
-	if err := client.connection.SetDeadline(time.Now().Add(20 * time.Second)); err != nil {
+	if err := client.connection.SetDeadline(time.Now().Add(timeout)); err != nil {
 		t.Fatal(err)
 	}
 	wire := append(append([]byte(nil), request...), '\n')

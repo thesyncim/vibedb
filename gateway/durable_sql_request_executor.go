@@ -127,11 +127,12 @@ func (executor *DurableSQLRequestExecutor) Execute(
 		opctx, lease.snapshot, queries, profile, executor.data,
 	)
 	if err != nil || !handled || len(participants) == 0 {
-		if errors.Is(err, ErrReplicatedReadIntentActive) {
-			// An exact retry may encounter its own already-prepared writes.
-			// Recover the authenticated retained recipe instead of requiring
-			// a new row image through that intent. No record means this is
-			// another request's intent and the original refusal still stands.
+		if err != nil {
+			// Planning happens before the fused ledger Create. An exact retry can
+			// therefore observe its own prepared intent or a committed row whose
+			// computed UPDATE now evaluates differently. Recover the authenticated
+			// retained recipe on every lowering failure; no matching record leaves
+			// the original refusal authoritative.
 			result, found, replayErr := executor.Replay(opctx, key)
 			if found {
 				admitted = true

@@ -10,6 +10,7 @@ const markdownWrapWidth = 96
 
 func RenderMarkdown() []byte {
 	var out bytes.Buffer
+	evidenceIDs, evidence := collectEvidence()
 	out.WriteString("# Distributed feature ledger\n\n")
 	out.WriteString("> [!CAUTION]\n")
 	writeWrapped(&out, "> ", "> ", "VibeDB is unreleased development software. Any commit may break APIs, commands, wire protocols, or disk formats. Use documentation and binaries from the exact same commit, and store only disposable or independently recoverable data. A **Yes** below does not mean supported, production-ready, or compatible with another commit. Consult [current status](status.md) for known failing tests and defects.")
@@ -17,42 +18,37 @@ func RenderMarkdown() []byte {
 	out.WriteString("> [!NOTE]\n")
 	writeWrapped(&out, "> ", "> ", "Generated from `internal/featurestate.Distributed`. Change the manifest, not this file.")
 	out.WriteByte('\n')
-	writeWrapped(&out, "", "", "This ledger separates code existence from integration, checked-in development commands, and external fault or performance qualification. It describes only the exact commit that generated it.")
-	out.WriteByte('\n')
-
-	out.WriteString("## State legend\n\n")
-	writeWrapped(&out, "", "", "The state applies independently to every stage. Read the adjacent contract for the exact boundary.")
+	out.WriteString("## How to read this ledger\n\n")
+	writeWrapped(&out, "", "", "Every feature has four independent stages. The adjacent contract is the claim; the label alone is not. This ledger describes only the exact commit that generated it.")
 	out.WriteByte('\n')
 	writeWrapped(&out, "- **Yes** — ", "  ", "The manifest makes the complete stage claim written in its contract and cites evidence.")
 	writeWrapped(&out, "- **Partial** — ", "  ", "Only the subset stated in the contract is present or qualified; the contract names material gaps.")
 	writeWrapped(&out, "- **No** — ", "  ", "The manifest makes no positive claim for that stage; the contract states the current boundary.")
 	out.WriteByte('\n')
-	writeWrapped(&out, "", "", "A qualification **Yes** requires the fault or benchmark evidence stated by that contract. Ordinary correctness tests alone remain **Partial**. A development-command **Yes** means a checked-in command constructs the path; it is not a release claim.")
-	out.WriteByte('\n')
-
-	out.WriteString("## Stage model\n\n")
 	out.WriteString("| Stage | Question answered |\n")
 	out.WriteString("| --- | --- |\n")
 	out.WriteString("| Primitive | Does the underlying code, codec, or protocol exist? |\n")
 	out.WriteString("| Integrated | Does a repository path compose and use it? |\n")
 	out.WriteString("| Development command | Does a checked-in command or CLI construct the path? |\n")
 	out.WriteString("| Qualification | Has the stated contract passed the cited fault or performance gate? |\n\n")
-
-	out.WriteString("## Summary\n\n")
-	out.WriteString("| Feature | Primitive | Integrated | Development command | Qualification |\n")
-	out.WriteString("| --- | --- | --- | --- | --- |\n")
-	for _, feature := range Distributed {
-		fmt.Fprintf(&out, "| %s | **%s** | **%s** | **%s** | **%s** |\n",
-			escape(feature.Name), feature.Primitive.Status.label(),
-			feature.Integrated.Status.label(), feature.Shipped.Status.label(),
-			feature.Qualification.Status.label())
-	}
-	out.WriteString("\n## Contracts\n\n")
-	writeWrapped(&out, "", "", "Expand a feature for its exact stage contracts. Each table lists its source and test evidence once, even when several stages rely on the same reference.")
+	writeWrapped(&out, "", "", "A qualification **Yes** requires the fault or benchmark gate named by its contract; ordinary correctness tests remain **Partial**. A development-command **Yes** means a checked-in command constructs the path, not that the feature is released.")
 	out.WriteByte('\n')
+
+	out.WriteString("## Features\n\n")
 	for _, feature := range Distributed {
-		renderFeature(&out, feature)
+		renderFeature(&out, feature, evidenceIDs)
 	}
+
+	out.WriteString("## Evidence index\n\n")
+	writeWrapped(&out, "", "", "Evidence is deduplicated across features. Links point to source or executable tests in this repository.")
+	out.WriteByte('\n')
+	fmt.Fprintf(&out, "<details>\n<summary>%d unique source and test references</summary>\n\n", len(evidence))
+	for index, reference := range evidence {
+		fmt.Fprintf(&out, "%d. <a id=\"evidence-%d\"></a>[%s](../%s) — `%s`\n",
+			index+1, index+1, escape(reference.Path), escape(reference.Path),
+			escape(reference.Symbol))
+	}
+	out.WriteString("\n</details>\n")
 
 	out.WriteString("\n## Regenerate\n\n")
 	writeWrapped(&out, "1. ", "   ", "Change `internal/featurestate/manifest.go` and cite production code or an executable test.")
@@ -63,64 +59,56 @@ func RenderMarkdown() []byte {
 	return out.Bytes()
 }
 
-func renderFeature(out *bytes.Buffer, feature Feature) {
-	evidenceIDs, evidence := collectFeatureEvidence(feature)
-
-	fmt.Fprintf(out, "<details>\n<summary><strong>%s</strong></summary>\n\n", escape(feature.Name))
-	out.WriteString("| Stage | Exact contract |\n")
-	out.WriteString("| --- | --- |\n")
-	renderStageRow(out, "Primitive", feature.Primitive, evidenceIDs)
-	renderStageRow(out, "Integrated", feature.Integrated, evidenceIDs)
-	renderStageRow(out, "Development command", feature.Shipped, evidenceIDs)
-	renderStageRow(out, "Qualification", feature.Qualification, evidenceIDs)
-	if len(evidence) != 0 {
-		out.WriteString("| Evidence key | ")
-		for index, reference := range evidence {
-			if index != 0 {
-				out.WriteString("<br>")
-			}
-			fmt.Fprintf(out, "**E%d** [%s](../%s) — `%s`", index+1,
-				escape(reference.Path), escape(reference.Path), escape(reference.Symbol))
-		}
-		out.WriteString(" |\n")
-	}
+func renderFeature(out *bytes.Buffer, feature Feature, evidenceIDs map[Reference]int) {
+	fmt.Fprintf(out,
+		"<details>\n<summary><strong>%s</strong> — Primitive:%s · Integrated:%s · Command:%s · Qualification:%s</summary>\n\n",
+		escape(feature.Name), feature.Primitive.Status.label(),
+		feature.Integrated.Status.label(), feature.Shipped.Status.label(),
+		feature.Qualification.Status.label())
+	renderStage(out, "Primitive", feature.Primitive, evidenceIDs)
+	renderStage(out, "Integrated", feature.Integrated, evidenceIDs)
+	renderStage(out, "Development command", feature.Shipped, evidenceIDs)
+	renderStage(out, "Qualification", feature.Qualification, evidenceIDs)
 	out.WriteString("\n</details>\n\n")
 }
 
-func collectFeatureEvidence(feature Feature) (map[Reference]int, []Reference) {
+func collectEvidence() (map[Reference]int, []Reference) {
 	ids := make(map[Reference]int)
 	var ordered []Reference
-	stages := [...]Stage{
-		feature.Primitive,
-		feature.Integrated,
-		feature.Shipped,
-		feature.Qualification,
-	}
-	for _, stage := range stages {
-		for _, reference := range stage.Evidence {
-			if _, exists := ids[reference]; exists {
-				continue
+	for _, feature := range Distributed {
+		stages := [...]Stage{
+			feature.Primitive,
+			feature.Integrated,
+			feature.Shipped,
+			feature.Qualification,
+		}
+		for _, stage := range stages {
+			for _, reference := range stage.Evidence {
+				if _, exists := ids[reference]; exists {
+					continue
+				}
+				ordered = append(ordered, reference)
+				ids[reference] = len(ordered)
 			}
-			ordered = append(ordered, reference)
-			ids[reference] = len(ordered)
 		}
 	}
 	return ids, ordered
 }
 
-func renderStageRow(out *bytes.Buffer, title string, stage Stage, evidenceIDs map[Reference]int) {
-	fmt.Fprintf(out, "| **%s — %s** | %s", title, stage.Status.label(), escape(stage.Contract))
+func renderStage(out *bytes.Buffer, title string, stage Stage, evidenceIDs map[Reference]int) {
+	fmt.Fprintf(out, "**%s — %s**\n\n", title, stage.Status.label())
+	writeWrapped(out, "", "", escape(stage.Contract))
 	if len(stage.Evidence) != 0 {
-		out.WriteString("<br><sub>Evidence: ")
+		out.WriteString("\n_Evidence:_ ")
 		for index, reference := range stage.Evidence {
 			if index != 0 {
 				out.WriteString(", ")
 			}
-			fmt.Fprintf(out, "**E%d**", evidenceIDs[reference])
+			fmt.Fprintf(out, "[E%d](#evidence-%d)", evidenceIDs[reference], evidenceIDs[reference])
 		}
-		out.WriteString("</sub>")
+		out.WriteByte('\n')
 	}
-	out.WriteString(" |\n")
+	out.WriteByte('\n')
 }
 
 func writeWrapped(out *bytes.Buffer, prefix, continuation, value string) {
