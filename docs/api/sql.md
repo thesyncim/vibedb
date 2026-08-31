@@ -268,8 +268,10 @@ expressions, casts, and `CASE` use the ordinary scalar runtime. Nested-path
 targets remain unsupported. An update cannot change the primary key. A single
 whole-document replacement cannot replace several rows that have different
 primary keys. Static distributed writes, including maintained global indexes,
-consume shard-evaluated canonical postimages. The strict RF3 transaction lane
-still refuses computed assignments.
+consume shard-evaluated canonical postimages. Exact-primary-key RF3 updates
+evaluate computed assignments once over a linearizable old-row image, retain
+the canonical postimage in the durable transaction program, and publish it only
+through an exact old-value digest CAS. RF3 `RETURNING` remains unsupported.
 
 `UPDATE` and `DELETE` support `WHERE`, `ORDER BY`, `LIMIT`, and `RETURNING`.
 `UPDATE ... FROM` and `DELETE ... USING` are not supported.

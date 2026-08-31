@@ -10,6 +10,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/store/durable"
 )
 
 func transactionCommandWithFingerprint(
@@ -1038,6 +1039,188 @@ func TestTransactionFusedPrepareConflictLeavesOnlyExactVote(t *testing.T) {
 	competingCompletion, _ := openTransactionCompletion(t, fixture.machine, competing)
 	if competingCompletion.ResultCode != ResultTransactionConflict {
 		t.Fatalf("competing fused prepare result = %d", competingCompletion.ResultCode)
+	}
+}
+
+func TestTransactionPrepareNormalizesMutationRefusalsToExactConflictVote(t *testing.T) {
+	type refusalCase struct {
+		name    string
+		fixture func(testing.TB) relationBundleFixture
+		value   func(relationBundleFixture) []byte
+	}
+	refusals := []refusalCase{
+		{
+			name: "invalid_document",
+			fixture: func(t testing.TB) relationBundleFixture {
+				return newRelationBundleFixture(t, true)
+			},
+			value: func(relationBundleFixture) []byte { return []byte("{") },
+		},
+		{
+			name: "target_bound",
+			fixture: func(t testing.TB) relationBundleFixture {
+				return newRelationBundleFixtureWithCollectionOptions(
+					t, true, false,
+					durable.Options{InlineValueBytes: 64, MaxDocumentBytes: 128},
+					durable.Options{},
+				)
+			},
+			value: func(fixture relationBundleFixture) []byte {
+				value := append(
+					[]byte(`{"email":"`),
+					bytes.Repeat([]byte{'x'}, fixture.base.Limits.MaxDocumentBytes)...,
+				)
+				return append(value, '"', '}')
+			},
+		},
+	}
+	for _, refusal := range refusals {
+		for _, fused := range []bool{true, false} {
+			mode := "split"
+			if fused {
+				mode = "fused"
+			}
+			t.Run(refusal.name+"/"+mode, func(t *testing.T) {
+				fixture := refusal.fixture(t)
+				id := transactionCodecID(247)
+				key := []byte("normalized-" + refusal.name + "-" + mode)
+				batches := []replication.RelationMutationBatch{{
+					Relation: 1,
+					Mutations: []replication.Mutation{{
+						Kind: replication.MutationPutAbsentOrEqual,
+						Key:  key, Value: refusal.value(fixture),
+					}},
+				}}
+				applyWant := func(index uint64, command []byte, want uint32) TransactionCompletionResult {
+					t.Helper()
+					if err := fixture.machine.AdmitCommand(command); err != nil {
+						t.Fatalf("admit transaction at %d: %v", index, err)
+					}
+					if _, err := fixture.machine.ApplyNormal(normalMeta(index), command); err != nil {
+						t.Fatalf("apply transaction at %d: %v", index, err)
+					}
+					completion, result := openTransactionCompletion(t, fixture.machine, command)
+					if completion.ResultCode != want {
+						t.Fatalf("transaction result at %d = %d, want %d", index, completion.ResultCode, want)
+					}
+					return result
+				}
+				assertAbsent := func(stage string) {
+					t.Helper()
+					if value, found, err := fixture.base.Collection.AppendRaw(nil, key); err != nil || found {
+						t.Fatalf("%s published refused value %q found=%v err=%v", stage, value, found, err)
+					}
+				}
+				controlKey, _ := TransactionControlStorageKey(
+					distributedtxn.ReplicatedRoleParticipant, id,
+				)
+				readControl := func(stage string) ([]byte, TransactionControlView) {
+					t.Helper()
+					raw, found, err := fixture.system.Collection.AppendRaw(nil, controlKey[:])
+					if err != nil || !found {
+						t.Fatalf("%s read participant vote: found=%v err=%v", stage, found, err)
+					}
+					control, err := OpenTransactionControl(raw)
+					if err != nil {
+						t.Fatalf("%s open participant vote: %v", stage, err)
+					}
+					return raw, control
+				}
+
+				if fused {
+					prepare := transactionCompletionCommand(
+						t, fixture.binding, fusedParticipantControl(
+							t, fixture, id,
+							distributedtxn.ReplicatedStagePrepareParticipant, 0, batches,
+						), batches,
+					)
+					result := applyWant(3, prepare, ResultIndexConflict)
+					if result.Revision != 3 || result.AffectedRowsValid {
+						t.Fatalf("fused refusal result = %+v", result)
+					}
+					beforeRetry, vote := readControl("fused refusal")
+					if vote.State != uint8(distributedtxn.ParticipantReleased) ||
+						vote.Revision != 3 || vote.PrepareResultCode != ResultIndexConflict ||
+						vote.LastResultCode != ResultIndexConflict || !vote.FusedPath ||
+						vote.ResidentMutationBytes != 0 || vote.ResidentIntentBytes != 0 {
+						t.Fatalf("fused refusal vote = %+v", vote.TransactionControl)
+					}
+					assertAbsent("fused refusal")
+					if fixture.machine.state.ActiveTransactionCount != 0 ||
+						fixture.machine.state.TransactionPayloadRows != 0 ||
+						fixture.machine.state.TransactionIntentRows != 0 {
+						t.Fatalf("fused refusal accounting = %+v", fixture.machine.state)
+					}
+					result = applyWant(4, prepare, ResultIndexConflict)
+					if result.Revision != 3 || result.AffectedRowsValid {
+						t.Fatalf("fused refusal retry = %+v", result)
+					}
+					afterRetry, _ := readControl("fused refusal retry")
+					if !bytes.Equal(beforeRetry, afterRetry) {
+						t.Fatal("fused exact retry rewrote its released conflict vote")
+					}
+					assertAbsent("fused refusal retry")
+					return
+				}
+
+				stage := transactionParticipantStageCommand(t, fixture, id, batches)
+				applyTransactionCommand(t, fixture.machine, 3, stage)
+				assertAbsent("split stage")
+				prepare := transactionParticipantTransitionCommand(
+					t, fixture, id, distributedtxn.ReplicatedPrepareParticipant, 1,
+				)
+				result := applyWant(4, prepare, ResultIndexConflict)
+				if result.Revision != 1 || result.AffectedRowsValid {
+					t.Fatalf("split refusal result = %+v", result)
+				}
+				beforeRetry, vote := readControl("split refusal")
+				if vote.State != uint8(distributedtxn.ParticipantStaged) ||
+					vote.Revision != 1 || vote.PrepareResultCode != ResultIndexConflict ||
+					vote.LastResultCode != ResultIndexConflict || vote.FusedPath ||
+					vote.ResidentMutationBytes == 0 || vote.ResidentIntentBytes == 0 {
+					t.Fatalf("split refusal vote = %+v", vote.TransactionControl)
+				}
+				assertAbsent("split refusal")
+				result = applyWant(5, prepare, ResultIndexConflict)
+				if result.Revision != 1 || result.AffectedRowsValid {
+					t.Fatalf("split refusal retry = %+v", result)
+				}
+				afterRetry, _ := readControl("split refusal retry")
+				if !bytes.Equal(beforeRetry, afterRetry) {
+					t.Fatal("split exact retry rewrote its staged conflict vote")
+				}
+
+				abort := transactionParticipantTransitionCommand(
+					t, fixture, id, distributedtxn.ReplicatedAbortParticipant, 1,
+				)
+				applyTransactionCommand(t, fixture.machine, 6, abort)
+				release := transactionParticipantTransitionCommand(
+					t, fixture, id, distributedtxn.ReplicatedReleaseParticipant, 2,
+				)
+				applyTransactionCommand(t, fixture.machine, 7, release)
+				beforeHistoricalRetry, released := readControl("split cleanup")
+				if released.State != uint8(distributedtxn.ParticipantReleased) ||
+					released.Revision != 3 || released.PrepareResultCode != ResultIndexConflict ||
+					released.ResidentMutationBytes != 0 || released.ResidentIntentBytes != 0 {
+					t.Fatalf("split released vote = %+v", released.TransactionControl)
+				}
+				if fixture.machine.state.ActiveTransactionCount != 0 ||
+					fixture.machine.state.TransactionPayloadRows != 0 ||
+					fixture.machine.state.TransactionIntentRows != 0 {
+					t.Fatalf("split release accounting = %+v", fixture.machine.state)
+				}
+				assertAbsent("split cleanup")
+				result = applyWant(8, prepare, ResultIndexConflict)
+				if result.Revision != 3 || result.AffectedRowsValid {
+					t.Fatalf("split historical retry = %+v", result)
+				}
+				afterHistoricalRetry, _ := readControl("split historical retry")
+				if !bytes.Equal(beforeHistoricalRetry, afterHistoricalRetry) {
+					t.Fatal("split historical retry rewrote its released conflict vote")
+				}
+				assertAbsent("split historical retry")
+			})
+		}
 	}
 }
 

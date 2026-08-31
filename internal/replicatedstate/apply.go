@@ -1927,6 +1927,7 @@ func (m *Machine) planMutations(
 			mutation.Kind != replication.MutationDeleteDigestEqual ||
 			relation.kind == RelationGlobalIndex &&
 				mutation.Kind != replication.MutationPutAbsentOrEqual &&
+				mutation.Kind != replication.MutationPutDigestEqual &&
 				mutation.Kind != replication.MutationDeleteDigestEqual {
 			return nil, 0, ResultInvalidDocument, nil
 		}
@@ -2117,7 +2118,9 @@ func (m *Machine) planMutations(
 					) {
 						continue
 					}
-					return nil, 0, ResultIndexConflict, nil
+					if mutation.condition != mutationPutDigestEqual {
+						return nil, 0, ResultIndexConflict, nil
+					}
 				}
 			}
 		}

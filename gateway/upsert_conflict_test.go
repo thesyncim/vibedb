@@ -142,21 +142,22 @@ func unsupportedPosition(err *sqlast.FeatureNotSupportedError) int {
 	return err.Pos
 }
 
-func TestPostgreSQLRF3PrepareRejectsComputedUpdateBeforeRetention(t *testing.T) {
+func TestPostgreSQLRF3PreparesComputedUpdateAndKeepsReturningFenced(t *testing.T) {
 	const text = `UPDATE messages SET value = value || '-next' WHERE id = ?`
-	wantPosition := strings.Index(text, `||`)
 	executor, _ := newSQLRF3TestExecutor(t)
 	authority := serviceauthz.Authority{Generation: 1}
 	authority.Node[0] = 1
 	dispatches := 0
+	var dispatched Query
 	backend := &PostgreSQLBackend{
 		Executor: executor,
 		Authorize: func(pgwire.SessionIdentity) (serviceauthz.Authority, error) {
 			return authority, nil
 		},
-		Write: func(context.Context, serviceauthz.Authority, Query) (*Result, error) {
+		Write: func(_ context.Context, _ serviceauthz.Authority, query Query) (*Result, error) {
 			dispatches++
-			return nil, nil
+			dispatched = query
+			return &Result{Kind: shardservice.ResponseCompletion, RowsAffected: 1}, nil
 		},
 	}
 	session, err := backend.NewSession(context.Background(), pgwire.SessionIdentity{})
@@ -166,20 +167,29 @@ func TestPostgreSQLRF3PrepareRejectsComputedUpdateBeforeRetention(t *testing.T) 
 	defer session.Close()
 
 	prepared, err := session.Prepare(context.Background(), text)
+	if err != nil || prepared == nil {
+		t.Fatalf("Prepare computed UPDATE = %v, %v", prepared, err)
+	}
+	result, err := prepared.Exec(context.Background(), []any{"message-1"})
+	if err != nil || result.RowsAffected != 1 {
+		t.Fatalf("Exec computed UPDATE = %+v, %v", result, err)
+	}
+	if dispatches != 1 || dispatched.SQL != text || len(dispatched.Params) != 1 ||
+		string(dispatched.Params[0].Bytes) != "message-1" {
+		t.Fatalf("computed dispatches=%d query=%+v", dispatches, dispatched)
+	}
+	if err := prepared.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	returning, err := session.Prepare(
+		context.Background(), text+` RETURNING value`,
+	)
 	var unsupported *sqlast.FeatureNotSupportedError
-	if !errors.As(err, &unsupported) || unsupported.Pos != wantPosition {
-		t.Fatalf(
-			"Prepare error = %T %v, want positioned FeatureNotSupported at %d",
-			err, err, wantPosition,
-		)
+	if !errors.As(err, &unsupported) || returning != nil {
+		t.Fatalf("RETURNING prepare = %v, %T %v", returning, err, err)
 	}
-	if prepared != nil {
-		t.Fatal("RF3 computed UPDATE returned a prepared statement")
-	}
-	if dispatches != 0 {
-		t.Fatalf("write dispatches = %d, want 0", dispatches)
-	}
-	if len(session.(*postgresSession).statements) != 0 {
-		t.Fatal("RF3 session retained a refused computed UPDATE")
+	if dispatches != 1 || len(session.(*postgresSession).statements) != 0 {
+		t.Fatalf("RETURNING dispatches=%d retained=%d", dispatches, len(session.(*postgresSession).statements))
 	}
 }

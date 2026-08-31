@@ -14,6 +14,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/query"
 	"github.com/thesyncim/vibedb/shardservice"
 	sqlast "github.com/thesyncim/vibedb/sql"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
@@ -42,9 +43,11 @@ var (
 )
 
 type replicatedSQLBoundStatement struct {
-	prepared *PreparedPlan
-	bound    *BoundWritePlan
-	profile  ReplicatedTableProfile
+	prepared         *PreparedPlan
+	bound            *BoundWritePlan
+	profile          ReplicatedTableProfile
+	updateExpression *query.DMLStatement
+	updateExec       query.Exec
 }
 
 type replicatedSQLParticipantBuilder struct {
@@ -134,6 +137,18 @@ func (executor *Executor) planReplicatedSQLTransactionWithData(
 		return nil, false, nil
 	}
 	statements := make([]replicatedSQLBoundStatement, len(queries))
+	var expressionCancel query.CancelFlag
+	var stopExpressionCancel func() bool
+	defer func() {
+		if stopExpressionCancel != nil {
+			stopExpressionCancel()
+		}
+		for index := range statements {
+			if statements[index].updateExpression != nil {
+				statements[index].updateExpression.Release()
+			}
+		}
+	}()
 	replicatedCount := 0
 	var encodedFlatBytes uint64
 	for index := range queries {
@@ -166,18 +181,13 @@ func (executor *Executor) planReplicatedSQLTransactionWithData(
 					ErrReplicatedSQLTransactionUnsupported, unsupported,
 				)
 			}
-			if err := rejectComputedUpdateAssignments(
-				queries[index].SQL, &prepared.statement,
-				"computed UPDATE SET expressions require coordinator-owned post-images and are not supported for RF3 writes",
-			); err != nil {
-				return nil, true, err
-			}
 		}
 		bound, err := prepared.BindWrite(args)
 		if err != nil {
 			return nil, false, err
 		}
-		statements[index] = replicatedSQLBoundStatement{prepared: prepared, bound: bound}
+		statements[index].prepared = prepared
+		statements[index].bound = bound
 		if !replicated {
 			continue
 		}
@@ -186,6 +196,31 @@ func (executor *Executor) planReplicatedSQLTransactionWithData(
 			return nil, true, ErrReplicatedSQLTransactionUnsupported
 		}
 		statements[index].profile = tableProfile
+		if hasComputedUpdateAssignments(&prepared.statement) {
+			parameterTypes, typeErr := postgresQueryParameterTypes(
+				queries[index].ParamTypes, prepared.params,
+			)
+			if typeErr != nil {
+				return nil, true, typeErr
+			}
+			expression, expressionErr := query.PrepareParsedDMLWithParameterTypes(
+				queries[index].SQL, &prepared.statement, parameterTypes,
+			)
+			if expressionErr != nil {
+				return nil, true, expressionErr
+			}
+			statements[index].updateExpression = expression
+			if !expression.HasUpdateExpressions() {
+				return nil, true, ErrReplicatedSQLTransactionUnsupported
+			}
+			if expressionErr = expression.ValidateUpdateExpressionBindings(args); expressionErr != nil {
+				return nil, true, expressionErr
+			}
+			if ctx != nil && ctx.Done() != nil && stopExpressionCancel == nil {
+				stopExpressionCancel = context.AfterFunc(ctx, expressionCancel.Cancel)
+			}
+			statements[index].updateExec.Options.Cancel = &expressionCancel
+		}
 		if prepared.statement.Kind == sqlast.KindInsert && len(prepared.statement.Insert.Columns) != 0 {
 			insert := prepared.statement.Insert
 			if uint64(len(insert.Rows)) > profile.MaxTransactionMutations {
@@ -326,14 +361,26 @@ func (executor *Executor) planReplicatedSQLTransactionWithData(
 					// presence before schema validation and never publishes this value.
 					document = []byte("{}")
 					missingPartial = true
+				} else if statement.updateExpression != nil {
+					document, err = sqldriver.MaterializePreparedUpdateAssignments(
+						statement.updateExpression, &statement.updateExec,
+						oldDocument, statement.bound.updateArgs,
+						int(statement.profile.MaxDocumentBytes),
+					)
+					if err == nil {
+						document, err = vibejson.AppendCanonicalize(nil, document)
+					}
 				} else {
 					document, err = sqldriver.ApplyColumnAssignments(
 						oldDocument, statement.bound.updateAssignments,
 						statement.bound.updateArgs, int(statement.profile.MaxDocumentBytes),
 					)
-					if err != nil {
-						return nil, true, err
-					}
+				}
+				if err != nil {
+					return nil, true, err
+				}
+				if len(document) > int(statement.profile.MaxDocumentBytes) {
+					return nil, true, ErrTransactionByteLimit
 				}
 				statement.bound.updateDoc = document
 			}
@@ -701,8 +748,11 @@ func readReplicatedSQLDocument(
 	if err != nil {
 		return nil, false, err
 	}
-	if !result.Found || len(result.Value) == 0 {
+	if !result.Found {
 		return nil, false, nil
+	}
+	if len(result.Value) == 0 {
+		return nil, false, ErrReplicatedRoute
 	}
 	return result.Value, true, nil
 }

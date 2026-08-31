@@ -416,3 +416,41 @@ func TestApplyColumnAssignmentsFailsClosedOnComputedExpression(t *testing.T) {
 		t.Fatalf("legacy assignment returned a postimage on refusal: %s", updated)
 	}
 }
+
+func TestMaterializePreparedUpdateAssignmentsIsSimultaneousAndReusable(t *testing.T) {
+	const source = `UPDATE docs SET n = n + ?, mirror = n, label = ? WHERE id = ?`
+	parsed, err := sqlast.ParseStatement(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	statement, err := query.PrepareParsedDML(source, parsed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer statement.Release()
+	args := []any{int64(1), "changed", "row"}
+	if err := statement.ValidateUpdateExpressionBindings(args); err != nil {
+		t.Fatal(err)
+	}
+	var exec query.Exec
+	for _, test := range []struct {
+		old  string
+		want string
+	}{
+		{
+			old:  `{"id":"row","label":"old","mirror":0,"n":5}`,
+			want: `{"id":"row","label":"changed","mirror":5,"n":6}`,
+		},
+		{
+			old:  `{"id":"row","label":"again","mirror":7,"n":10}`,
+			want: `{"id":"row","label":"changed","mirror":10,"n":11}`,
+		},
+	} {
+		updated, materializeErr := MaterializePreparedUpdateAssignments(
+			statement, &exec, []byte(test.old), args, 1<<20,
+		)
+		if materializeErr != nil || string(updated) != test.want {
+			t.Fatalf("materialized %s = %s, %v; want %s", test.old, updated, materializeErr, test.want)
+		}
+	}
+}

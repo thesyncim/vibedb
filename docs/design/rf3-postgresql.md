@@ -69,12 +69,14 @@ JSON-operator parity.
 
 Keep GoLand's console in **Auto** transaction mode. INSERT supports whole JSON
 documents or flat column/value tuples, including multiple rows. UPDATE can
-replace the whole document or assign scalar literals, placeholders, and `NULL`
-to declared top-level columns. It requires primary-key equality. DELETE requires
+replace the whole document or assign scalar literals, placeholders, `NULL`, and
+supported row-dependent scalar expressions to declared top-level columns. It
+requires primary-key equality; computed assignments are evaluated once over the
+old row and retained as a canonical digest-guarded postimage. DELETE requires
 primary-key equality or a finite IN list. RETURNING, every `ON CONFLICT` action,
-nested or row-dependent UPDATE assignments, and multi-statement write batches
-are not supported. Execute each write independently, with its own Query message
-or Execute/Sync batch. This is not a complete PostgreSQL transactional SQL
+nested UPDATE targets, and multi-statement PostgreSQL write batches are not
+supported. Execute each write independently, with its own Query message or
+Execute/Sync batch. This is not a complete PostgreSQL transactional SQL
 implementation.
 
 RF3 SQL `CREATE UNIQUE INDEX` fails closed with SQLSTATE `0A000` before schema

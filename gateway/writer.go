@@ -316,28 +316,17 @@ func (s *Snapshot) prepareWrite(plan *PreparedPlan, source string) error {
 	return nil
 }
 
-// rejectComputedUpdateAssignments fences write lanes that would otherwise
-// replay a SET list outside the shard-local SQL evaluator. Expr.Pos names the
-// authored right-hand side, so protocol adapters retain an exact 0A000
-// position rather than pointing at the assignment target or statement start.
-func rejectComputedUpdateAssignments(
-	source string,
-	statement *sqlast.Statement,
-	reason string,
-) error {
+func hasComputedUpdateAssignments(statement *sqlast.Statement) bool {
 	if statement == nil || statement.Kind != sqlast.KindUpdate ||
 		statement.Update == nil {
-		return nil
+		return false
 	}
 	for i := range statement.Update.Assignments {
-		expression := statement.Update.Assignments[i].Expr
-		if expression != nil {
-			return sqlast.NewFeatureNotSupportedError(
-				source, expression.Pos, reason,
-			)
+		if statement.Update.Assignments[i].Expr != nil {
+			return true
 		}
 	}
-	return nil
+	return false
 }
 
 func (s *Snapshot) prepareGlobalIndexWrites(
