@@ -252,19 +252,24 @@ WHERE id = ?
 ```
 
 For tables with declared columns, `UPDATE` can instead assign scalar literals,
-placeholders, or `NULL` to one or more top-level columns:
+placeholders, `NULL`, or supported scalar expressions to one or more top-level
+columns:
 
 ```sql
 UPDATE employees
-SET team = ?, score = 7, note = NULL
+SET team = ?, score = score + 1, note = NULL
 WHERE id = ?
 ```
 
 Each matching document is updated independently, and unassigned fields are
-preserved. Nested-path targets and row-dependent assignment expressions such as
-`score = score + 1` are not supported. An update cannot change the primary key.
-A single whole-document replacement cannot replace several rows that have
-different primary keys.
+preserved. Every right-hand side observes the same old row, so mixed assignments
+are simultaneous rather than left-to-right. Arithmetic, concatenation, unary
+expressions, casts, and `CASE` use the ordinary scalar runtime. Nested-path
+targets remain unsupported. An update cannot change the primary key. A single
+whole-document replacement cannot replace several rows that have different
+primary keys. Static distributed writes, including maintained global indexes,
+consume shard-evaluated canonical postimages. The strict RF3 transaction lane
+still refuses computed assignments.
 
 `UPDATE` and `DELETE` support `WHERE`, `ORDER BY`, `LIMIT`, and `RETURNING`.
 `UPDATE ... FROM` and `DELETE ... USING` are not supported.
