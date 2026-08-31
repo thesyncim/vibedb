@@ -163,6 +163,13 @@ change the primary key; one constant document therefore cannot replace several
 distinct keys. DELETE supports the same tail but no alias or USING. Mutation
 ORDER BY requires LIMIT; UPDATE FROM and mutation OFFSET are unsupported.
 
+Computed assignments run in the embedded adapters and in the static
+distributed lane, where maintained global indexes use canonical before/after
+images evaluated by the base shard. The strict RF3 transaction lane and its
+pgwire endpoint still refuse computed assignments; they accept the narrower
+whole-document or direct declared-column updates described in the distributed
+guide.
+
 RETURNING accepts bounded path/scalar projections but no aggregates,
 parameters, or SELECT tail. Execute a returning mutation through a query API;
 its rows are materialized before publication.
@@ -395,5 +402,6 @@ procedures, triggers, policies, sequences, materialized views, and replication a
 - Joins/derived/LATERAL: `sql/parser.go:2105-2455`, `sql/resolve.go:450-633`
 - CTE/set/window: `sql/parse_cte.go:5-135`, `sql/recursive_cte.go:25-220`, `sql/set.go:314-873`, `sql/parser.go:1320-1954`
 - DML: `sql/parse_dml.go:224-674`, `sql/parse_dml.go:847-1512`, `sql/driver/write.go:1095-1504`
+- Static mutation images: `sql/driver/mutation_capture.go`, `shardservice/execute.go`, `gateway/writer.go`
 - DDL/views: `sql/parse_ddl.go:5-566`, `sql/parse_drop.go:31-187`, `sql/parse_view.go:5-118`
 - Runtime transactions: `sql/driver/tx.go:89-258`, `sql/driver/savepoint.go:7-190`

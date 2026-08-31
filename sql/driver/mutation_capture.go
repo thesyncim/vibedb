@@ -11,6 +11,7 @@ import (
 	"github.com/thesyncim/vibedb/query"
 	sqlast "github.com/thesyncim/vibedb/sql"
 	"github.com/thesyncim/vibedb/store/durable"
+	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/x/byteview"
 )
 
@@ -157,6 +158,64 @@ func (p *Prepared) CaptureMutationInto(
 		return p.fail(err)
 	}
 	err = p.statement.captureMutationInto(ctx, args, visit)
+	err = scope.finish(err)
+	if err != nil {
+		return p.fail(err)
+	}
+	return nil
+}
+
+// CaptureMutationImagesInto visits the exact primary key, pre-mutation
+// document, and post-mutation document for every row an UPDATE or DELETE would
+// affect without publishing the mutation. DELETE supplies a nil after image.
+// Selection and post-image construction use the same lowered statement,
+// bindings, schema, routing, primary-key, batch, and unique-index checks as
+// execution. Every row is preflighted before the first visitor call, and each
+// computed UPDATE right-hand side is evaluated exactly once over its immutable
+// old row.
+//
+// The three byte slices borrow capture-owned scratch and are valid only until
+// visit returns. A caller that retains an image must copy it.
+func (p *Prepared) CaptureMutationImagesInto(
+	ctx context.Context,
+	values []any,
+	visit func(key, before, after []byte) error,
+) error {
+	if err := p.usable(); err != nil {
+		return p.fail(err)
+	}
+	if visit == nil {
+		return p.fail(errors.New(
+			"vibedb: mutation image capture requires a visitor",
+		))
+	}
+	if p.statement.mutation == nil ||
+		(p.Kind() != sqlast.KindUpdate && p.Kind() != sqlast.KindDelete) {
+		return p.fail(errors.New(
+			"vibedb: mutation image capture requires UPDATE or DELETE",
+		))
+	}
+	if err := p.session.ready(ctx); err != nil {
+		return p.fail(err)
+	}
+	if p.session.state != SessionIdle || p.session.conn.tx != nil {
+		return p.fail(ErrTransactionActive)
+	}
+	if err := p.statement.checkArgumentCount(len(values)); err != nil {
+		return p.fail(err)
+	}
+	args, err := p.session.conn.runtimeValues(
+		p.statement.paramKinds, values,
+	)
+	if err != nil {
+		return p.fail(err)
+	}
+	scope, err := p.session.conn.beginContextCancellation(ctx)
+	if err != nil {
+		clear(args)
+		return p.fail(err)
+	}
+	err = p.statement.captureMutationImagesInto(ctx, args, visit)
 	err = scope.finish(err)
 	if err != nil {
 		return p.fail(err)
@@ -354,6 +413,307 @@ func (s *stmt) captureMutationInto(
 	return nil
 }
 
+func (s *stmt) captureMutationImagesInto(
+	ctx context.Context,
+	args []any,
+	visit func(key, before, after []byte) error,
+) error {
+	defer clear(args)
+	ctx = withCooperativeCancellation(ctx, s.conn.exec.Options.Cancel)
+	d := s.conn.db
+	if err := lockContext(ctx, &d.mu); err != nil {
+		return err
+	}
+	defer d.mu.Unlock()
+	if d.closed {
+		return sqldriver.ErrBadConn
+	}
+	if err := contextCheckpoint(ctx); err != nil {
+		return err
+	}
+	if err := d.settleCatalogLocked(); err != nil {
+		return err
+	}
+	if err := s.validateViewDependenciesLocked(); err != nil {
+		return err
+	}
+	if err := d.validateViewTableTargetLocked(s.mutation.Tree()); err != nil {
+		return err
+	}
+	t, ok := d.tables[s.mutation.Collection()]
+	if !ok {
+		return fmt.Errorf("%w: %q", ErrTableNotFound, s.mutation.Collection())
+	}
+	limits, err := tableMutationLimits(t)
+	if err != nil {
+		return err
+	}
+
+	var (
+		assignments []sqlast.UpdateAssignment
+		document    []byte
+		keys        []string
+	)
+	switch s.mutation.Kind() {
+	case query.DMLUpdate:
+		assignments = s.mutation.Tree().Update.Assignments
+		if len(assignments) != 0 {
+			if err := validateDeclaredColumnAssignments(
+				s.mutation.Collection(), t.meta, assignments,
+			); err != nil {
+				return err
+			}
+			if err := validateColumnAssignmentBindings(assignments, args); err != nil {
+				return err
+			}
+			if err := s.mutation.ValidateUpdateExpressionBindings(args); err != nil {
+				return err
+			}
+			// A column UPDATE first proves that its predicate addresses one
+			// physical shard. Per-row postimages below then prove that no row
+			// moves out of that shard.
+			if err := s.conn.routeDelete(s.mutation, args); err != nil {
+				return err
+			}
+			keys, err = s.conn.matchingKeysLocked(
+				ctx, s.mutation, args, t, limits, 0,
+			)
+		} else {
+			document, err = operandDocument(
+				s.mutation, s.mutation.Tree().Update.Doc, args,
+			)
+			if err == nil {
+				document, err = canonicalMutationCapturePostimage(
+					document, limits.MaxDocumentBytes,
+				)
+			}
+			if err == nil {
+				err = s.conn.routeUpdate(s.mutation, args, document)
+			}
+			if err == nil {
+				keys, err = s.conn.matchingKeysLocked(
+					ctx, s.mutation, args, t, limits, len(document),
+				)
+			}
+		}
+	case query.DMLDelete:
+		if err = s.conn.routeDelete(s.mutation, args); err == nil {
+			keys, err = s.conn.matchingKeysLocked(
+				ctx, s.mutation, args, t, limits, 0,
+			)
+		}
+	default:
+		return errors.New(
+			"vibedb: internal mutation image capture requires UPDATE or DELETE",
+		)
+	}
+	if err != nil {
+		return err
+	}
+	var wholeDocumentKey string
+	if s.mutation.Kind() == query.DMLUpdate && len(assignments) == 0 {
+		wholeDocumentKey, err = documentKey(
+			document, t.meta.PrimaryKey, t.primary,
+			limits.MaxKeyBytes,
+		)
+		if err != nil {
+			return err
+		}
+		for _, key := range keys {
+			if key != wholeDocumentKey {
+				return fmt.Errorf(
+					"%w: replacement key %q does not match selected key %q",
+					ErrUpdatePrimaryKey, wholeDocumentKey, key,
+				)
+			}
+		}
+	}
+	if len(keys) == 0 {
+		return contextCheckpoint(ctx)
+	}
+	if t.collection == nil {
+		return errors.New(
+			"vibedb: selected mutation capture keys have no materialized collection",
+		)
+	}
+	snapshot, err := t.collection.Snapshot()
+	if err != nil {
+		return err
+	}
+	defer snapshot.Close()
+
+	scratch := s.conn.pointRaw[:0]
+	defer func() { s.conn.pointRaw = scratch[:0] }()
+	postimages := make([]seedDocument, 0, len(keys))
+	if s.mutation.Kind() == query.DMLUpdate {
+		if len(assignments) == 0 {
+			if err := validateDocument(
+				t.schema, document, limits.MaxDocumentBytes,
+				&s.conn.insertTape,
+			); err != nil {
+				return err
+			}
+			for _, key := range keys {
+				if err := contextCheckpoint(ctx); err != nil {
+					return err
+				}
+				var found bool
+				scratch, found, err = snapshot.AppendRaw(
+					scratch[:0], byteview.Bytes(key),
+				)
+				if err != nil {
+					return err
+				}
+				if !found {
+					return ErrTransactionConflict
+				}
+				postimages = append(postimages, seedDocument{
+					key: key, document: document,
+				})
+			}
+		} else {
+			stagedBytes := 0
+			var routeScratch []byte
+			for _, key := range keys {
+				if err := contextCheckpoint(ctx); err != nil {
+					return err
+				}
+				var found bool
+				scratch, found, err = snapshot.AppendRaw(
+					scratch[:0], byteview.Bytes(key),
+				)
+				if err != nil {
+					return err
+				}
+				if !found {
+					return ErrTransactionConflict
+				}
+				replacement, materializeErr := materializeColumnAssignments(
+					s.mutation, &s.conn.exec, scratch, assignments, args,
+					limits.MaxDocumentBytes,
+				)
+				if materializeErr != nil {
+					return materializeErr
+				}
+				replacement, materializeErr = canonicalMutationCapturePostimage(
+					replacement, limits.MaxDocumentBytes,
+				)
+				if materializeErr != nil {
+					return materializeErr
+				}
+				if err := validateDocument(
+					t.schema, replacement, limits.MaxDocumentBytes,
+					&s.conn.insertTape,
+				); err != nil {
+					return err
+				}
+				routeScratch, err = s.conn.routeUpdateInto(
+					s.mutation, args, replacement, routeScratch[:0],
+				)
+				if err != nil {
+					return err
+				}
+				newKey, keyErr := documentKey(
+					replacement, t.meta.PrimaryKey, t.primary,
+					limits.MaxKeyBytes,
+				)
+				if keyErr != nil {
+					return keyErr
+				}
+				if key != newKey {
+					return fmt.Errorf(
+						"%w: replacement key %q does not match selected key %q",
+						ErrUpdatePrimaryKey, newKey, key,
+					)
+				}
+				if len(key) > limits.MaxBatchBytes-stagedBytes ||
+					len(replacement) > limits.MaxBatchBytes-stagedBytes-len(key) {
+					return fmt.Errorf(
+						"vibedb: UPDATE exceeds the %d-byte mutation batch limit for table %q: %w",
+						limits.MaxBatchBytes, s.mutation.Collection(),
+						durable.ErrBatchTooLarge,
+					)
+				}
+				postimages = append(postimages, seedDocument{
+					key: key, document: replacement,
+				})
+				stagedBytes += len(key) + len(replacement)
+			}
+		}
+		if err := validateTableUniquePostimages(
+			ctx, t, postimages, keys,
+		); err != nil {
+			return err
+		}
+	} else {
+		// DELETE has no postimage to stage, but every old row must still be
+		// readable before a callback can observe the first one.
+		for _, key := range keys {
+			if err := contextCheckpoint(ctx); err != nil {
+				return err
+			}
+			var found bool
+			scratch, found, err = snapshot.AppendRaw(
+				scratch[:0], byteview.Bytes(key),
+			)
+			if err != nil {
+				return err
+			}
+			if !found {
+				return ErrTransactionConflict
+			}
+		}
+	}
+
+	if err := contextCheckpoint(ctx); err != nil {
+		return err
+	}
+	for i, key := range keys {
+		if err := contextCheckpoint(ctx); err != nil {
+			return err
+		}
+		var found bool
+		scratch, found, err = snapshot.AppendRaw(
+			scratch[:0], byteview.Bytes(key),
+		)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return ErrTransactionConflict
+		}
+		var after []byte
+		if len(postimages) != 0 {
+			after = postimages[i].document
+		}
+		if err := visit(byteview.Bytes(key), scratch, after); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// canonicalMutationCapturePostimage applies the same externally visible JSON
+// boundary as durable primary mutation. Exact image capture must expose the
+// bytes a successful write would publish, not the pre-storage spelling emitted
+// by a document parameter or column patcher. Every postimage-dependent check is
+// intentionally downstream of this seam.
+func canonicalMutationCapturePostimage(
+	document []byte,
+	maxDocumentBytes int,
+) ([]byte, error) {
+	canonical, err := vibejson.AppendCanonicalize(nil, document)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"vibedb: canonicalize mutation postimage: %w", err,
+		)
+	}
+	if len(canonical) > maxDocumentBytes {
+		return nil, durable.ErrDocumentTooLarge
+	}
+	return canonical, nil
+}
+
 // ValidatePrimaryDocumentDigests compares a bounded, sorted primary-key set
 // with the documents visible in the active serializable transaction. Exact
 // point dependencies are retained through commit, closing the capture-to-apply
@@ -442,8 +802,20 @@ func (s *Session) validatePrimaryDocumentDigests(
 		if err != nil {
 			return s.fail(err)
 		}
-		if !found || sha256.Sum256(scratch) != digests[i] {
+		if !found {
 			return s.fail(ErrDistributedTransactionConflict)
+		}
+		if sha256.Sum256(scratch) != digests[i] {
+			// Whole-document transaction overlays retain the caller's valid JSON
+			// spelling until durable apply canonicalizes it. Captured postimages
+			// already describe those canonical durable bytes, so preserve the
+			// ordinary raw hash fast path and normalize only a mismatch.
+			canonical, canonicalErr := canonicalMutationCapturePostimage(
+				scratch, state.limits.MaxDocumentBytes,
+			)
+			if canonicalErr != nil || sha256.Sum256(canonical) != digests[i] {
+				return s.fail(ErrDistributedTransactionConflict)
+			}
 		}
 	}
 	if installGuard {

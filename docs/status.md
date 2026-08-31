@@ -8,7 +8,7 @@
 > and use only disposable or independently recoverable data.
 
 Runtime behavior for this rewrite was audited from `main` at commit
-`e7b87f44fdbbc0188bbeadd87f77eec78e24b780`. The documentation changes that
+`0c9dc636314f5166440bf574bfa3fb2d752f2dba`. The documentation changes that
 follow it do not turn that snapshot into a roadmap or guarantee about a later
 commit.
 
@@ -57,6 +57,7 @@ These are source-audit findings, not hypothetical limitations.
 | Authorization | `SELECT 1 GARBAGE` is classified as read-only instead of the intended fail-closed read+write+schema set | `go test ./internal/serviceauthz` fails on untouched `main`; do not treat malformed-SQL classification as qualified |
 | Service metrics | A nonzero-group request can panic when a metrics service was built with `Provider` that is not also `GroupProvider` | Group-serving configurations must supply `GroupProvider` |
 | Distributed transaction journal | Compaction omits durable coordinator recovery-pulse records | Reopen after compaction can reset recovery-pulse state; do not rely on that compaction path for recovery authority |
+| Build grammar identity | The static shard wire gained mutation-image marker `0xe4`, but the build manifest and derived wire grammar ID did not change | Pre- and post-image builds can pass the build preface yet disagree on this request; never mix them or treat the current gate as sufficient proof |
 | Facade options | `AdvancedOptions.Engine.SkipIndexes` is not defensively cloned | Caller mutation after `Open` can affect later lazy collections |
 | Facade opaque values | A first lazy `Put` and later direct/transactional writes do not apply one consistent JSON rule | Do not enable opaque values through the root facade |
 | Reopened bounds | Transactional writes use database-open defaults rather than a reopened collection's persisted key/document bounds | Do not assume direct and transactional bound parity with custom persisted limits |

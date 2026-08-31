@@ -99,6 +99,13 @@ UPDATE expressions read the current row. Upsert expressions read both the
 current target row (`users.visits`; bare `visits` is ambiguous) and incoming
 `EXCLUDED` top-level fields. This is implemented behavior, not roadmap syntax.
 
+This guide primarily describes the embedded adapters. The static distributed
+gateway can also maintain global indexes for computed `UPDATE` expressions by
+using canonical before/after images evaluated on the base shard. The strict
+RF3 transaction lane, including its pgwire path, still refuses computed
+assignments; it admits only the narrower documented direct-column and
+whole-document forms.
+
 `ON CONFLICT` always means the table primary key. `DO NOTHING` and `DO UPDATE`
 are supported; explicit conflict targets, named constraints, action WHERE, and
 nested `EXCLUDED` paths are not.
@@ -257,4 +264,5 @@ parse errors before presenting a character-oriented protocol diagnostic.
 - Typed ownership: `sql/driver/runtime.go:22-65`, `sql/driver/runtime.go:129-242`, `sql/driver/runtime.go:608-980`
 - Transactions/savepoints: `sql/driver/tx.go:89-184`, `sql/driver/tx.go:2138-2486`, `sql/driver/savepoint.go:7-190`
 - Mutations and null/missing: `sql/driver/column_update.go:23-112`, `sql/driver/write.go:2452-2577`, `sql/ast.go:684-691`
+- Mutation-image capture: `sql/driver/mutation_capture.go`, `gateway/writer.go`, `gateway/transaction.go`
 - Parser ownership and limits: `sql/parser.go:19-76`, `sql/parser.go:328-377`, `sql/error.go:9-38`

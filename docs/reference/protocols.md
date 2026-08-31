@@ -157,13 +157,30 @@ fences, and specialized transaction/exchange fields are explicit.
 | ownership | one immutable distribution/shard/allocation/routing/epoch identity |
 | concurrency | one goroutine and one single-consumer SQL session per SQL connection |
 | reads | only strong, leader-owner reads; session and stale policies are reserved and refused |
-| writes | require explicit read-write mode; distributed gateways do not select it |
+| writes | require explicit read-write mode; the distributed gateway selects it for admitted mutations |
 | failures | closed typed classes such as not-owner, stale epoch/version, deadline, resource, malformed, read-only, unsupported policy, and outcome-unknown |
 | availability | the endpoint itself creates no Raft election, replication, or failover |
 
 Authentication is an outer listener responsibility. The checked-in command
 requires either the authenticated TLS profile or explicit plaintext loopback
 development mode. Do not expose the codec as an unauthenticated remote service.
+
+### Static mutation capture
+
+Two mutually exclusive optional request markers run `UPDATE`/`DELETE` target
+selection without publishing:
+
+| Marker | Response columns, all JSON OID 114 | Computed `UPDATE` |
+| --- | --- | --- |
+| legacy `0xdc` | `primary_key`, `document` | refused |
+| mutation image `0xe4` | `primary_key`, `before_document`, `after_document` | admitted; DELETE returns SQL NULL for `after_document` |
+
+Both modes carry SQL and typed parameters, execute as read-only, and require
+delegated data-read plus data-write capability. They cannot combine with a
+transaction, read fence, global-index lookup, primary-key read, document scan,
+partial aggregate, row batch, exchange, or repartition request. Result row and
+byte limits cover every returned key and image; excess is a resource-limit
+failure. Returned images are canonical and owned by the response.
 
 ## RF3 native service
 
@@ -241,7 +258,14 @@ the next layer authorizes an explicit capability.
 After TLS, internal streams exchange a fixed 104-byte build preface. Wire and
 disk grammar IDs are opaque equality identities with no ordering semantics.
 Both peers must have exact grammar IDs and mutually sufficient capability bits.
-This is an exact-build gate, not version negotiation.
+This is intended as an exact-build gate, not version negotiation.
+
+> [!WARNING]
+> The current static-shard grammar manifest was not advanced when marker `0xe4`
+> was added. Builds before and after that change can therefore advertise the
+> same wire grammar ID even though the older decoder rejects the new marker.
+> Run one exact binary commit across every peer; the current preface is not
+> sufficient proof by itself.
 
 Credential/allowlist rotation atomically publishes a new admission generation
 and closes streams admitted under the retired generation. That revocation is
@@ -267,6 +291,7 @@ commit acknowledgement, or apply acknowledgement.
 | native JSON grammar and errors | `cmd/vibedb-gateway/data_wire.go`, `data_handler.go`, `data_response.go` |
 | durable request grammar | `cmd/vibedb-gateway/durable_exec_batch_wire.go`, `durable_exec_batch.go`, `exec_batch_ack_wire.go` |
 | static shard framing and admission | `shardservice/codec.go`, `wire.go`, `server.go`, `admit.go` |
+| static mutation-image execution | `sql/driver/mutation_capture.go`, `shardservice/execute.go`, `gateway/executor.go`, `gateway/writer.go` |
 | RF3 native framing and serving | `shardservice/replicated_wire.go`, `replicated_server.go`, `replicated_query.go` |
 | RF3 routing and retry | `gateway/replicated_native.go`, `replicated_data_read.go`, `replicated_data_scatter_read.go`, `replicated_sql_read.go` |
 | pgwire base and gateway adapter | `pgwire/doc.go`, `pgwire/proto.go`, `gateway/pgwire.go`, `gateway/pgwire_write.go` |

@@ -2,7 +2,7 @@
 // their server implementations.
 //
 // [Server] is the static, single-owner SQL endpoint. [ReplicatedServer] serves
-// the shard-native and control grammar over replicated state. Authenticated
+// the shard-native grammar over replicated state. Authenticated
 // serving wrappers add TLS identity and capability checks for remote command
 // paths; raw loopback and test entry points also exist, so neither server type
 // is inherently an authentication boundary. Their request grammars, admission

@@ -227,6 +227,40 @@ Transport retry and request retry solve different problems. Re-sending a peer fr
 Raft delivery. Re-submitting the exact client command settles whether the logical operation
 committed and what result it produced.
 
+## Static indexed updates and deletes
+
+The static gateway can maintain independently placed global indexes for a
+computed `UPDATE`, or for a `DELETE`, without evaluating an update assignment at the
+coordinator:
+
+1. The base shard preflights the complete selected batch and returns canonical
+   primary key, before-document, and after-document images without publishing.
+   A delete has a null after image. The capture is row/byte bounded and requires
+   both read and write authority even though its execution mode is read-only.
+2. The gateway validates every image and base route, derives old index deletes
+   and new index puts, and retains sorted primary keys plus SHA-256 before- and
+   after-image digests. It does not durably retain the full postimages.
+3. The base participant is staged as old-key/digest precondition, original SQL,
+   then new-key/digest check. A serializable prepare executes that sequence and
+   rolls it back, proving that the SQL still produces the captured postimages
+   before any participant can commit.
+4. After the coordinator decision, apply executes the staged batch again. Base
+   work remains in authored order; on each final index participant every delete
+   is ordered before every put, including across statements, so an atomic
+   unique-key swap can release old claims first.
+
+All global-index lifecycle states are write-maintained; only `Ready` is
+read-plannable. A computed right-hand side is evaluated once during capture,
+but the SQL is executed again during prepare and apply, so this is not an
+exactly-once evaluation contract.
+
+This path is static-only. Strict RF3 durable transactions accept
+whole-document and direct declared-column updates, but still reject computed
+assignments because the durable RF3 replay program does not retain their
+evaluated postimages. The new static path has local and in-process failure-
+atomicity tests; it has no new external process, crash, or recovery
+qualification gate.
+
 ## Transactions and logical clocks
 
 > [!WARNING]
@@ -323,4 +357,5 @@ Preserve artifacts, but assume only the exact creating build can understand them
 - Peer transport: [`internal/rafttransport/identity.go`](../../internal/rafttransport/identity.go), [`internal/rafttransport/registry.go`](../../internal/rafttransport/registry.go), [`internal/rafttransport/transport.go`](../../internal/rafttransport/transport.go)
 - Membership: [`internal/membershipgrant/grant.go`](../../internal/membershipgrant/grant.go), [`internal/raftservice/owner.go`](../../internal/raftservice/owner.go)
 - Retry/state: [`internal/raftserve/registry.go`](../../internal/raftserve/registry.go), [`internal/replicatedstate/apply.go`](../../internal/replicatedstate/apply.go), [`internal/requestledger/types.go`](../../internal/requestledger/types.go)
+- Static indexed mutations: [`sql/driver/mutation_capture.go`](../../sql/driver/mutation_capture.go), [`shardservice/execute.go`](../../shardservice/execute.go), [`gateway/writer.go`](../../gateway/writer.go), [`gateway/transaction.go`](../../gateway/transaction.go)
 - Fences/clocks: [`internal/executionpin/transition.go`](../../internal/executionpin/transition.go), [`internal/routegate/machine.go`](../../internal/routegate/machine.go), [`internal/routeforward/resolve.go`](../../internal/routeforward/resolve.go), [`internal/txnclock/clock.go`](../../internal/txnclock/clock.go)
