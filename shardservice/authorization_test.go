@@ -177,8 +177,8 @@ func TestReplicatedRequestLedgerRequiresServiceControlAndDataWriterSubject(t *te
 	)
 	server := &ReplicatedServer{authorization: gate}
 	request := &ReplicatedRequest{
-		Operation: ReplicatedPropose,
-		Authority: serviceauthz.Authority{Node: firstGateway, Generation: 6},
+		Operation:  ReplicatedPropose,
+		Authority:  serviceauthz.Authority{Node: firstGateway, Generation: 6},
 		Capability: serviceauthz.CapabilityRequestLedger,
 	}
 	if !server.authorizeReplicated(firstGateway, request) {
@@ -206,6 +206,7 @@ func TestSealedRequestCapabilityIgnoresCallerExecutionMode(t *testing.T) {
 		{ShardRequest{SQL: `UPDATE docs SET "$doc" = ? WHERE id = ?`, ExecutionMode: ExecutionReadOnly}, serviceauthz.CapabilityDataWrite},
 		{ShardRequest{SQL: "CREATE TABLE docs (id TEXT)", ExecutionMode: ExecutionReadOnly}, serviceauthz.CapabilitySchema},
 		{ShardRequest{SQL: "DELETE FROM docs", MutationCapture: true}, serviceauthz.CapabilityDataRead | serviceauthz.CapabilityDataWrite},
+		{ShardRequest{SQL: "DELETE FROM docs", MutationImageCapture: true}, serviceauthz.CapabilityDataRead | serviceauthz.CapabilityDataWrite},
 		{ShardRequest{Transaction: TransactionRequest{Operation: TransactionLookupCoordinator}, ExecutionMode: ExecutionReadWrite}, serviceauthz.CapabilityDataRead},
 		{ShardRequest{Transaction: TransactionRequest{Operation: TransactionStageCoordinator}, ExecutionMode: ExecutionReadOnly}, serviceauthz.CapabilityDataWrite},
 		{ShardRequest{Exchange: ExchangeRequest{Operation: ExchangePush}, ExecutionMode: ExecutionReadWrite}, serviceauthz.CapabilityDataRead},

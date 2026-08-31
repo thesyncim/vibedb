@@ -555,9 +555,14 @@ type ShardRequest struct {
 	// replace its physical scan source.
 	PrimaryKeyRead PrimaryKeyReadRequest
 	// MutationCapture executes UPDATE/DELETE target selection without mutation
-	// and returns native primary keys plus canonical old documents. It is a
-	// read-only, single-shard precursor to optimistic indexed maintenance.
+	// and returns native primary keys plus canonical old documents. It is the
+	// legacy two-column, read-only precursor to optimistic indexed maintenance.
 	MutationCapture bool
+	// MutationImageCapture materializes UPDATE/DELETE images without mutation
+	// and returns native primary keys, canonical before documents, and exact
+	// after documents (NULL for DELETE). It is mutually exclusive with the
+	// legacy MutationCapture mode.
+	MutationImageCapture bool
 	// DocumentScan selects the bounded raw scan lane. MaxRows and
 	// MaxResultBytes are its mandatory page bounds.
 	DocumentScan DocumentScanRequest
@@ -572,6 +577,10 @@ type ShardRequest struct {
 	// Transaction selects the transaction path. Its zero value is absent and
 	// preserves the ordinary autocommit encoding and execution path.
 	Transaction TransactionRequest
+}
+
+func (r *ShardRequest) mutationCapturePresent() bool {
+	return r != nil && (r.MutationCapture || r.MutationImageCapture)
 }
 
 const (

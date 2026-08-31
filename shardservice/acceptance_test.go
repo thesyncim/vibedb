@@ -362,7 +362,8 @@ func TestAcceptanceNoSerializedPlan(t *testing.T) {
 		"Deadline":      true, "MaxResultBytes": true, "MaxRows": true,
 		"BucketBits": true, "AccessScopes": true, "ReadFenceID": true,
 		"GlobalIndexLookup": true, "PrimaryKeyRead": true,
-		"MutationCapture": true, "DocumentScan": true, "Repartition": true, "PartialAggregate": true,
+		"MutationCapture": true, "MutationImageCapture": true,
+		"DocumentScan": true, "Repartition": true, "PartialAggregate": true,
 		"RowBatch": true, "Exchange": true,
 		"Transaction": true,
 	})

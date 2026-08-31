@@ -185,7 +185,7 @@ func sealedRequestCapability(request *ShardRequest) (serviceauthz.Capability, bo
 			return 0, false
 		}
 	}
-	if request.MutationCapture {
+	if request.mutationCapturePresent() {
 		return serviceauthz.CapabilityDataRead | serviceauthz.CapabilityDataWrite, true
 	}
 	if request.Exchange.present() || request.GlobalIndexLookup.present() || request.DocumentScan.present() {
@@ -322,7 +322,7 @@ func (c *shardConn) handleAdmitted(req *ShardRequest, write func(*ShardResponse)
 		return write(classifyError(err))
 	}
 	if req.Transaction.Operation != TransactionNone {
-		if req.GlobalIndexLookup.present() || req.PrimaryKeyRead.present() || req.MutationCapture || req.DocumentScan.present() {
+		if req.GlobalIndexLookup.present() || req.PrimaryKeyRead.present() || req.mutationCapturePresent() || req.DocumentScan.present() {
 			return write(NewErrorResponse(ErrorMalformedRequest,
 				"shardservice: a transaction command cannot carry an index read envelope"))
 		}
@@ -385,7 +385,7 @@ func (c *shardConn) handleAdmitted(req *ShardRequest, write func(*ShardResponse)
 	if req.GlobalIndexLookup.present() {
 		return write(c.executeGlobalIndexLookup(req))
 	}
-	if req.MutationCapture {
+	if req.mutationCapturePresent() {
 		return write(c.executeMutationCapture(req))
 	}
 	if req.DocumentScan.present() {
@@ -728,7 +728,7 @@ func (c *shardConn) transaction(req *ShardRequest) *ShardResponse {
 	tx := req.Transaction
 	allowAccess := tx.Operation == TransactionAcquireReadFence
 	if req.SQL != "" || len(req.Params) != 0 || req.GlobalIndexLookup.present() ||
-		req.PrimaryKeyRead.present() || req.MutationCapture || req.DocumentScan.present() ||
+		req.PrimaryKeyRead.present() || req.mutationCapturePresent() || req.DocumentScan.present() ||
 		(!allowAccess && len(req.AccessScopes) != 0) ||
 		(!allowAccess && req.BucketBits != 0) {
 		return NewErrorResponse(ErrorMalformedRequest,
@@ -869,7 +869,7 @@ func (c *shardConn) transaction(req *ShardRequest) *ShardResponse {
 func (c *shardConn) executeGlobalIndexLookup(req *ShardRequest) *ShardResponse {
 	lookup := req.GlobalIndexLookup
 	if req.ExecutionMode != ExecutionReadOnly || req.SQL != "" ||
-		len(req.Params) != 0 || req.PrimaryKeyRead.present() || req.MutationCapture ||
+		len(req.Params) != 0 || req.PrimaryKeyRead.present() || req.mutationCapturePresent() ||
 		req.DocumentScan.present() || !lookup.canonical() {
 		return NewErrorResponse(ErrorMalformedRequest,
 			"shardservice: invalid global-index lookup request")
@@ -902,13 +902,14 @@ func (c *shardConn) executeGlobalIndexLookup(req *ShardRequest) *ShardResponse {
 
 var errMutationCaptureLimit = errors.New("shardservice: mutation capture exceeds result bound")
 
-// executeMutationCapture runs the DML runtime's target selector without
-// publishing. Native storage keys and canonical vibejson documents are copied
-// once at the session/wire boundary.
+// executeMutationCapture runs one of the two read-only capture contracts. The
+// legacy marker returns key/before rows; the additive image marker returns
+// key/before/after rows, with a NULL after image for DELETE. Neither publishes.
 func (c *shardConn) executeMutationCapture(req *ShardRequest) *ShardResponse {
 	if req.ExecutionMode != ExecutionReadOnly || req.SQL == "" ||
 		req.GlobalIndexLookup.present() || req.PrimaryKeyRead.present() ||
-		req.DocumentScan.present() || !req.ReadFenceID.IsZero() || !req.MutationCapture {
+		req.DocumentScan.present() || !req.ReadFenceID.IsZero() ||
+		req.MutationCapture == req.MutationImageCapture {
 		return NewErrorResponse(ErrorMalformedRequest,
 			"shardservice: invalid mutation capture request")
 	}
@@ -936,35 +937,78 @@ func (c *shardConn) executeMutationCapture(req *ShardRequest) *ShardResponse {
 	}
 	rows := make([][]Cell, 0, capacity)
 	var retained int64
-	err = prep.CaptureMutationInto(ctx, runtimeArgs(req.Params), func(key, document []byte) error {
-		if maxRows >= 0 && len(rows) >= maxRows {
-			return errMutationCaptureLimit
+	columns := []Column{
+		{Name: "primary_key", TypeOID: pgOIDJSON},
+		{Name: "document", TypeOID: pgOIDJSON},
+	}
+	if req.MutationImageCapture {
+		columns = []Column{
+			{Name: "primary_key", TypeOID: pgOIDJSON},
+			{Name: "before_document", TypeOID: pgOIDJSON},
+			{Name: "after_document", TypeOID: pgOIDJSON},
 		}
-		if maxBytes >= 0 && (int64(len(key)) > maxBytes-retained ||
-			int64(len(document)) > maxBytes-retained-int64(len(key))) {
-			return errMutationCaptureLimit
-		}
-		ownedKey := append([]byte(nil), key...)
-		ownedDocument := append([]byte(nil), document...)
-		rows = append(rows, []Cell{{Bytes: ownedKey}, {Bytes: ownedDocument}})
-		retained += int64(len(key) + len(document))
-		return nil
-	})
+		err = prep.CaptureMutationImagesInto(ctx, runtimeArgs(req.Params), func(key, before, after []byte) error {
+			if maxRows >= 0 && len(rows) >= maxRows {
+				return errMutationCaptureLimit
+			}
+			if maxBytes >= 0 {
+				remaining := maxBytes - retained
+				if int64(len(key)) > remaining {
+					return errMutationCaptureLimit
+				}
+				remaining -= int64(len(key))
+				if int64(len(before)) > remaining {
+					return errMutationCaptureLimit
+				}
+				remaining -= int64(len(before))
+				if int64(len(after)) > remaining {
+					return errMutationCaptureLimit
+				}
+			}
+			afterCell := Cell{Null: true}
+			if after != nil {
+				afterCell = Cell{Bytes: append([]byte(nil), after...)}
+			}
+			rows = append(rows, []Cell{
+				{Bytes: append([]byte(nil), key...)},
+				{Bytes: append([]byte(nil), before...)},
+				afterCell,
+			})
+			retained += int64(len(key))
+			retained += int64(len(before))
+			retained += int64(len(after))
+			return nil
+		})
+	} else {
+		err = prep.CaptureMutationInto(ctx, runtimeArgs(req.Params), func(key, before []byte) error {
+			if maxRows >= 0 && len(rows) >= maxRows {
+				return errMutationCaptureLimit
+			}
+			if maxBytes >= 0 && (int64(len(key)) > maxBytes-retained ||
+				int64(len(before)) > maxBytes-retained-int64(len(key))) {
+				return errMutationCaptureLimit
+			}
+			rows = append(rows, []Cell{
+				{Bytes: append([]byte(nil), key...)},
+				{Bytes: append([]byte(nil), before...)},
+			})
+			retained += int64(len(key))
+			retained += int64(len(before))
+			return nil
+		})
+	}
 	if errors.Is(err, errMutationCaptureLimit) {
 		return NewErrorResponse(ErrorResourceLimit, err.Error())
 	}
 	if err != nil {
 		return classifyError(err)
 	}
-	return RowsResponse([]Column{
-		{Name: "primary_key", TypeOID: pgOIDJSON},
-		{Name: "document", TypeOID: pgOIDJSON},
-	}, rows)
+	return RowsResponse(columns, rows)
 }
 
 func (c *shardConn) executeDocumentScan(req *ShardRequest) *ShardResponse {
 	if req.ExecutionMode != ExecutionReadOnly || req.SQL != "" || len(req.Params) != 0 ||
-		req.GlobalIndexLookup.present() || req.PrimaryKeyRead.present() || req.MutationCapture ||
+		req.GlobalIndexLookup.present() || req.PrimaryKeyRead.present() || req.mutationCapturePresent() ||
 		!req.ReadFenceID.IsZero() || !req.DocumentScan.canonical() ||
 		req.MaxRows == 0 || req.MaxResultBytes == 0 {
 		return NewErrorResponse(ErrorMalformedRequest,
