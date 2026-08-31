@@ -72,14 +72,45 @@ var (
 // wire kind; Unwrap exposes the matching sentinel so a caller matches the
 // failure with errors.Is.
 type ShardError struct {
-	Kind     shardservice.ErrorKind
-	Message  string
-	sentinel error
+	Kind      shardservice.ErrorKind
+	Message   string
+	sentinel  error
+	sqlState  string
+	sqlHint   string
+	sqlPos    int
+	hasSQLPos bool
 }
 
 func (e *ShardError) Error() string { return e.Message }
 
 func (e *ShardError) Unwrap() error { return e.sentinel }
+
+// SQLState exposes an authenticated shard SQL diagnostic to protocol
+// adapters. It is empty for legacy malformed-request errors, which therefore
+// retain their fail-closed XX000 behavior.
+func (e *ShardError) SQLState() string {
+	if e == nil {
+		return ""
+	}
+	return e.sqlState
+}
+
+// SQLHint returns the optional PostgreSQL hint carried by a shard diagnostic.
+func (e *ShardError) SQLHint() string {
+	if e == nil {
+		return ""
+	}
+	return e.sqlHint
+}
+
+// SQLPosition returns the optional zero-based UTF-8 byte position carried by
+// a shard diagnostic. pgwire owns conversion to its one-based character unit.
+func (e *ShardError) SQLPosition() (int, bool) {
+	if e == nil {
+		return 0, false
+	}
+	return e.sqlPos, e.hasSQLPos
+}
 
 // sentinelFor maps a wire error kind onto the sentinel a caller matches: the
 // distribution ownership sentinels for the admission refusals, gateway
@@ -135,7 +166,15 @@ func sentinelFor(kind shardservice.ErrorKind) error {
 
 // shardError builds the typed error for an error-frame response.
 func shardError(resp *shardservice.ShardResponse) *ShardError {
-	return &ShardError{Kind: resp.ErrorKind, Message: resp.ErrorMessage, sentinel: sentinelFor(resp.ErrorKind)}
+	result := &ShardError{Kind: resp.ErrorKind, Message: resp.ErrorMessage, sentinel: sentinelFor(resp.ErrorKind)}
+	if diagnostic, ok := resp.SQLDiagnostic(); ok {
+		result.Message = diagnostic.Message
+		result.sqlState = diagnostic.Code
+		result.sqlHint = diagnostic.Hint
+		result.sqlPos = diagnostic.Position
+		result.hasSQLPos = diagnostic.HasPosition
+	}
+	return result
 }
 
 // DialFunc opens a connection to a shard endpoint's network address. It must
