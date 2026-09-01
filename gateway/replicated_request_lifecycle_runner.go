@@ -328,12 +328,39 @@ func (runner *DurableRequestLifecycleRunner) runAdmittedWave(ctx context.Context
 		if recordErr != nil {
 			return DurableRequestWaveResult{}, errors.Join(recordErr, ErrDurableRequestConflict)
 		}
-		head, err = runner.applyRoutePin(ctx, wave, head, routePin, next,
-			requestledger.OperationRecordRoutePinAcquired)
+		acquiredHead, transitionErr := requestledger.AdvanceHeadRoutePin(
+			head, routePin, next, head.Revision+1,
+		)
+		if transitionErr != nil {
+			return DurableRequestWaveResult{}, errors.Join(transitionErr, ErrDurableRequestConflict)
+		}
+		nextPending, pendingErr := requestledger.NewPendingWaveWithRoutePin(
+			acquiredHead, wave.Build, acquiredHead.Revision+1, next,
+			[]requestledger.StepRef{wave.Step},
+		)
+		if pendingErr != nil {
+			return DurableRequestWaveResult{}, errors.Join(pendingErr, ErrDurableRequestConflict)
+		}
+		result, applyErr := runner.ledger.ApplyCAS(ctx, wave.Home, wave.Key,
+			DurableRequestLifecycleCAS{
+				Operation:        requestledger.OperationRecordRoutePinAcquiredPutPending,
+				ExpectedRevision: head.Revision, Revision: nextPending.Revision,
+				RoutePin: next, Pending: nextPending,
+			})
+		if applyErr != nil {
+			return DurableRequestWaveResult{}, applyErr
+		}
+		if result.Ledger.ResultCode != replicatedstate.ResultApplied {
+			return DurableRequestWaveResult{}, ErrDurableRequestConflict
+		}
+		head, err = requestledger.InstallPendingWave(
+			acquiredHead, nextPending, wave.Build, next,
+		)
 		if err != nil {
-			return DurableRequestWaveResult{}, err
+			return DurableRequestWaveResult{}, errors.Join(err, ErrDurableRequestConflict)
 		}
 		routePin = next
+		pending = nextPending
 	}
 
 	var observation []byte

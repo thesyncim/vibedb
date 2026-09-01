@@ -101,7 +101,7 @@ func (w *preAdvanceDispatchWaves) RunStagedWave(ctx context.Context, _ DurableRe
 }
 
 func TestDurableRequestDistributedRunnerResumesPreAdvanceRoute(t *testing.T) {
-	for _, cut := range []requestledger.Operation{requestledger.OperationRecordRoutePinAcquired, requestledger.OperationPutPending} {
+	for _, cut := range []requestledger.Operation{requestledger.OperationRecordRoutePinAcquiredPutPending} {
 		t.Run(fmt.Sprint(cut), func(t *testing.T) {
 			wave, head, route := lifecycleRunnerFixture(t)
 			events := new(lifecycleRunnerEvents)

@@ -876,7 +876,8 @@ func TestIssuerHighwaterCanonicalAntiResurrection(t *testing.T) {
 		t.Fatal("issuer advance command accessor")
 	}
 	if OperationAdvanceIssuerHighwater != 23 || OperationOpenIssuerLane != 24 ||
-		LastOperation != OperationOpenIssuerLane {
+		OperationRecordRoutePinAcquiredPutPending != 25 ||
+		LastOperation != OperationRecordRoutePinAcquiredPutPending {
 		t.Fatal("issuer highwater operation code changed")
 	}
 	wrongSubject := command
@@ -1111,13 +1112,19 @@ func TestRevisionMatrixAndSemanticsSentinels(t *testing.T) {
 		c.Operation = op
 		if op == OperationCreate || op == OperationBeginPayloadBuild || op == OperationOpenIssuerLane {
 			c.ExpectedRevision, c.Revision = 0, 1
+		} else if op == OperationRecordRoutePinAcquiredPutPending {
+			c.ExpectedRevision, c.Revision = 8, 10
 		} else {
 			c.ExpectedRevision, c.Revision = 8, 9
 		}
 		if err := validateCommandShape(c); err != nil {
 			t.Fatalf("op %d valid: %v", op, err)
 		}
-		for _, pair := range [][2]uint64{{9, 9}, {9, 11}, {10, 9}, {math.MaxUint64, 0}} {
+		invalid := [][2]uint64{{9, 9}, {9, 11}, {10, 9}, {math.MaxUint64, 0}}
+		if op == OperationRecordRoutePinAcquiredPutPending {
+			invalid = [][2]uint64{{9, 9}, {9, 10}, {10, 9}, {math.MaxUint64 - 1, 0}}
+		}
+		for _, pair := range invalid {
 			c.ExpectedRevision, c.Revision = pair[0], pair[1]
 			if err := validateCommandShape(c); err == nil {
 				t.Fatalf("op %d accepted revisions %v", op, pair)

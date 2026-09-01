@@ -1,6 +1,7 @@
 package replicatedstate
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"os"
 	"path/filepath"
@@ -8,6 +9,7 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
+	"github.com/thesyncim/vibedb/internal/routegate"
 	"github.com/thesyncim/vibedb/store/durable"
 )
 
@@ -245,6 +247,315 @@ func requestLedgerCreateCommand(t testing.TB, fixture machineFixture, key reques
 	outer.RequestLedger = inner
 	outer.Fingerprint = sha256.Sum256(inner)
 	return encodeCommand(t, outer), head
+}
+
+func requestLedgerOuterCommand(
+	t testing.TB,
+	fixture machineFixture,
+	sequence uint64,
+	inner []byte,
+) []byte {
+	t.Helper()
+	outer := commandValue(fixture.binding, sequence)
+	outer.Kind = replication.CommandRequestLedger
+	outer.AuthorityClass = replication.CommandAuthorityRequestLedger
+	outer.Batches = nil
+	outer.RequestLedger = inner
+	outer.Fingerprint = sha256.Sum256(inner)
+	return encodeCommand(t, outer)
+}
+
+func requestLedgerAcquireEvidence(
+	t testing.TB,
+	fixture machineFixture,
+	head requestledger.HeadRecord,
+) (requestledger.RoutePinRecord, requestledger.RoutePinRecord) {
+	t.Helper()
+	pin := requestledger.PinID{0x51, 0x52}
+	logical := requestledger.Digest(sha256.Sum256([]byte("fused logical binding")))
+	identityDigest, err := requestledger.DeriveRouteGateIdentity(
+		head.KeyDigest, head.RequestDigest, head.PlanRoot, head.ContinuationDigest,
+		pin, head.NextStepOrdinal,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := routegate.Identity(identityDigest)
+	provisional := requestLedgerRouteGateOuter(t, fixture.binding, 31, routegate.Command{
+		Operation: routegate.OperationAcquireShared, Epoch: 1,
+		Identity: identity, Binding: routegate.Binding{1},
+	})
+	provisionalView, err := replication.OpenCommand(provisional)
+	if err != nil {
+		t.Fatal(err)
+	}
+	physical, ok := replication.RouteGatePhysicalWitness(provisionalView)
+	if !ok {
+		t.Fatal("route-gate physical witness unavailable")
+	}
+	bindingDigest, err := requestledger.DeriveRouteGateBinding(
+		identityDigest, logical, requestledger.Digest(physical), 1,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commandRaw := requestLedgerRouteGateOuter(t, fixture.binding, 31, routegate.Command{
+		Operation: routegate.OperationAcquireShared, Epoch: 1,
+		Identity: identity, Binding: routegate.Binding(bindingDigest),
+	})
+	commandView, err := replication.OpenCommand(commandRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finalPhysical, ok := replication.RouteGatePhysicalWitness(commandView)
+	if !ok || finalPhysical != physical {
+		t.Fatal("route-gate command changed physical witness")
+	}
+	acquiring, err := requestledger.NewRoutePinAcquiring(
+		head, pin, logical, requestledger.Digest(physical), commandRaw,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outcomeRaw, err := routegate.AppendOutcome(nil, routegate.Outcome{
+		Reason: routegate.ReasonAcquired, Mutated: true,
+		Status: routegate.Status{
+			Revision: 1, Epoch: 1, ActivePins: 1, RetainedRecords: 1,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resultDigest := replication.CompletionResultDigest(
+		ResultRouteGate, ResultFormatRouteGate, outcomeRaw,
+	)
+	completionRaw, err := replication.AppendCompletionBytes(nil, replication.CompletionBytes{
+		ClusterID: commandView.ClusterID, ClusterIncarnation: commandView.ClusterIncarnation,
+		TopologyRecoveryEpoch: commandView.TopologyRecoveryEpoch,
+		Distribution:          commandView.Distribution, Shard: commandView.Shard,
+		AllocationGeneration: commandView.AllocationGeneration,
+		ShardIncarnation:     commandView.ShardIncarnation, GroupID: commandView.GroupID,
+		ReplicaSetVersion:      commandView.ReplicaSetVersion,
+		ActivePolicyGeneration: commandView.ActivePolicyGeneration,
+		ProtectionEpoch:        commandView.ProtectionEpoch,
+		RoutingVersion:         commandView.RoutingVersion, RouteGeneration: commandView.RouteGeneration,
+		Tenant: commandView.Tenant, ClientID: commandView.ClientID, ClientEpoch: commandView.ClientEpoch,
+		ClientSequence: commandView.ClientSequence, Fingerprint: commandView.Fingerprint,
+		RetryHome: commandView.RetryHome, AppliedSequence: 11,
+		ResultCode: ResultRouteGate, ResultFormat: ResultFormatRouteGate,
+		Storage: replication.CompletionInline, ResultLength: uint64(len(outcomeRaw)),
+		ResultDigest: resultDigest, InlineResult: outcomeRaw,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	acquired, err := requestledger.RecordVerifiedRoutePinAcquired(
+		acquiring, acquiring.Revision+1, completionRaw,
+	)
+	if err != nil || !requestLedgerRouteCompletionEvidenceAvailable(acquiring, acquired) {
+		t.Fatalf("valid acquire settlement rejected: %v", err)
+	}
+	return acquiring, acquired
+}
+
+func requestLedgerCompletionForCommand(
+	t testing.TB,
+	machine *Machine,
+	command []byte,
+) RequestLedgerCompletionResult {
+	t.Helper()
+	lookup, err := machine.LookupCompletion(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	completion, err := replication.OpenCompletion(lookup.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := OpenRequestLedgerCompletionResult(
+		completion.ResultCode, completion.InlineResult,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
+func TestRequestLedgerFusedAcquirePendingIsAtomicAndReplayExact(t *testing.T) {
+	fixture := newRequestLedgerMachineFixture(t, 64<<20)
+	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	key := requestledger.RequestKey{
+		Scope:        requestledger.ScopeAuthenticated,
+		TenantDigest: requestledger.Digest{0x15}, Principal: requestledger.PrincipalID{0x25},
+		Request: requestledger.RequestID{0x35},
+	}
+	create, initial := requestLedgerCreateCommand(t, fixture, key)
+	if _, err := fixture.machine.ApplyNormal(normalMeta(2), create); err != nil {
+		t.Fatal(err)
+	}
+	home, _ := requestledger.Home(key)
+	acquiring, acquired := requestLedgerAcquireEvidence(t, fixture, initial)
+	intentHead, err := requestledger.AdvanceHeadRoutePin(
+		initial, requestledger.RoutePinRecord{}, acquiring, initial.Revision+1,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intentRaw, _ := requestledger.AppendRoutePin(nil, acquiring)
+	intentInner, err := requestledger.AppendCommand(nil, requestledger.Command{
+		Operation:        requestledger.OperationBeginRoutePinAcquire,
+		ExpectedRevision: initial.Revision, Revision: intentHead.Revision,
+		KeyDigest: initial.KeyDigest, RequestDigest: initial.RequestDigest,
+		PlanRoot: initial.PlanRoot, SubjectDigest: acquiring.RecordDigest,
+		ExpectedRangeIdentity: fixture.machine.options.RequestLedgerRange.Identity,
+		Home:                  home, Payload: intentRaw,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	intentCommand := requestLedgerOuterCommand(t, fixture, 2, intentInner)
+	if _, err = fixture.machine.ApplyNormal(normalMeta(3), intentCommand); err != nil {
+		t.Fatal(err)
+	}
+	storedIntent, err := fixture.machine.RequestLedgerReadInto(RequestLedgerReadRequest{
+		Key: key, ExpectedRangeIdentity: fixture.machine.options.RequestLedgerRange.Identity,
+		Kind: RequestLedgerReadHead, MinimumApplied: 3,
+		MaxBytes: uint32(RequestLedgerReadMaxBytes(RequestLedgerReadHead)),
+	}, make([]byte, 0, RequestLedgerReadMaxBytes(RequestLedgerReadHead)))
+	if err != nil || !storedIntent.Found {
+		t.Fatalf("stored intent head=%+v err=%v", storedIntent, err)
+	}
+	intentHead, err = requestledger.OpenHead(storedIntent.Value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acquiredHead, err := requestledger.AdvanceHeadRoutePin(
+		intentHead, acquiring, acquired, intentHead.Revision+1,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	step := requestledger.StepRef{
+		TargetSource:  requestledger.PayloadSourcePlan,
+		CommandSource: requestledger.PayloadSourcePlan,
+		TargetOffset:  0, TargetLength: 8, CommandOffset: 8, CommandLength: 8,
+		TargetDigest:  requestledger.Digest(sha256.Sum256([]byte("fused target"))),
+		CommandDigest: requestledger.Digest(sha256.Sum256([]byte("fused command"))),
+	}
+	pending, err := requestledger.NewPendingWaveWithRoutePin(
+		acquiredHead, requestledger.PayloadBuildRecord{}, acquiredHead.Revision+1,
+		acquired, []requestledger.StepRef{step},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyFinal, err := requestledger.InstallPendingWave(
+		acquiredHead, pending, requestledger.PayloadBuildRecord{}, acquired,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	compoundRaw, err := requestledger.AppendAcquiredPending(nil, acquired, pending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	subject, err := requestledger.AcquiredPendingDigest(acquired, pending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fusedInner, err := requestledger.AppendCommand(nil, requestledger.Command{
+		Operation:        requestledger.OperationRecordRoutePinAcquiredPutPending,
+		ExpectedRevision: intentHead.Revision, Revision: pending.Revision,
+		KeyDigest: initial.KeyDigest, RequestDigest: initial.RequestDigest,
+		PlanRoot: initial.PlanRoot, SubjectDigest: subject,
+		ExpectedRangeIdentity: fixture.machine.options.RequestLedgerRange.Identity,
+		Home:                  home, Payload: compoundRaw,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fusedCommand := requestLedgerOuterCommand(t, fixture, 3, fusedInner)
+	if _, err = fixture.machine.ApplyNormal(normalMeta(4), fusedCommand); err != nil {
+		t.Fatal(err)
+	}
+	first := requestLedgerCompletionForCommand(t, fixture.machine, fusedCommand)
+	if first.ResultCode != ResultApplied || !first.ExactDuplicate || first.Revision != pending.Revision {
+		t.Fatalf("first fused completion=%+v", first)
+	}
+	usage, err := fixture.machine.RequestLedgerUsage()
+	if err != nil || usage.Rows != 3 {
+		t.Fatalf("usage after fused apply=%+v err=%v", usage, err)
+	}
+	read := RequestLedgerReadRequest{
+		Key: key, ExpectedRangeIdentity: fixture.machine.options.RequestLedgerRange.Identity,
+		Kind: RequestLedgerReadWave, MinimumApplied: 4,
+		MaxBytes: uint32(RequestLedgerReadMaxBytes(RequestLedgerReadWave)),
+	}
+	readResult, err := fixture.machine.RequestLedgerReadInto(
+		read, make([]byte, 0, read.MaxBytes),
+	)
+	if err != nil || !readResult.Found {
+		t.Fatalf("fused wave read=%+v err=%v", readResult, err)
+	}
+	wave, err := OpenRequestLedgerWaveReadValue(readResult.Value)
+	wantHead, _ := requestledger.AppendHead(nil, legacyFinal)
+	wantRoute, _ := requestledger.AppendRoutePin(nil, acquired)
+	wantPending, _ := requestledger.AppendPendingWave(nil, pending)
+	if err != nil || !wave.RouteFound || !wave.PendingFound ||
+		!bytes.Equal(wave.Head, wantHead) || !bytes.Equal(wave.RoutePin, wantRoute) ||
+		!bytes.Equal(wave.Pending, wantPending) {
+		t.Fatalf("fused rows differ from legacy rows: found=%v/%v equal=%v/%v/%v sizes=%d/%d %d/%d %d/%d err=%v",
+			wave.RouteFound, wave.PendingFound, bytes.Equal(wave.Head, wantHead),
+			bytes.Equal(wave.RoutePin, wantRoute), bytes.Equal(wave.Pending, wantPending),
+			len(wave.Head), len(wantHead), len(wave.RoutePin), len(wantRoute),
+			len(wave.Pending), len(wantPending), err)
+	}
+
+	// A replacement gateway reuses the exact inner command with an unrelated
+	// outer retry identity after losing the first response.
+	replayCommand := requestLedgerOuterCommand(t, fixture, 4, fusedInner)
+	if _, err = fixture.machine.ApplyNormal(normalMeta(5), replayCommand); err != nil {
+		t.Fatal(err)
+	}
+	replay := requestLedgerCompletionForCommand(t, fixture.machine, replayCommand)
+	afterReplay, _ := fixture.machine.RequestLedgerUsage()
+	if !replay.ExactDuplicate || replay.ResultCode != ResultApplied ||
+		replay.StateDigest != first.StateDigest || afterReplay != usage {
+		t.Fatalf("replay=%+v usage=%+v want=%+v", replay, afterReplay, usage)
+	}
+
+	// A non-exact retry at a different CAS cut cannot partially rewrite either
+	// nested row or the final head.
+	conflictInner, err := requestledger.AppendCommand(nil, requestledger.Command{
+		Operation:        requestledger.OperationRecordRoutePinAcquiredPutPending,
+		ExpectedRevision: intentHead.Revision + 1, Revision: pending.Revision + 1,
+		KeyDigest: initial.KeyDigest, RequestDigest: initial.RequestDigest,
+		PlanRoot: initial.PlanRoot, SubjectDigest: subject,
+		ExpectedRangeIdentity: fixture.machine.options.RequestLedgerRange.Identity,
+		Home:                  home, Payload: compoundRaw,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conflictCommand := requestLedgerOuterCommand(t, fixture, 5, conflictInner)
+	if _, err = fixture.machine.ApplyNormal(normalMeta(6), conflictCommand); err != nil {
+		t.Fatal(err)
+	}
+	conflict := requestLedgerCompletionForCommand(t, fixture.machine, conflictCommand)
+	afterConflict, _ := fixture.machine.RequestLedgerUsage()
+	read.MinimumApplied = 6
+	afterRead, err := fixture.machine.RequestLedgerReadInto(
+		read, make([]byte, 0, read.MaxBytes),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if conflict.ResultCode != ResultRequestLedgerConflict || conflict.ExactDuplicate ||
+		afterConflict != usage || !bytes.Equal(afterRead.Value, readResult.Value) {
+		t.Fatalf("conflict=%+v usage=%+v want=%+v", conflict, afterConflict, usage)
+	}
 }
 
 func TestRequestLedgerCreateSettlesWithoutSessionAndReopens(t *testing.T) {

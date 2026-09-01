@@ -308,6 +308,71 @@ func TestReplicatedRequestLedgerProposalIdentityPreservesGrammar(t *testing.T) {
 	}
 }
 
+func TestDurableRequestLifecycleCommandFusesAcquiredRouteAndPending(t *testing.T) {
+	head, _, _ := lifecycleHead(t)
+	acquiring, err := requestledger.NewRoutePinAcquiring(
+		head, requestledger.PinID{2}, lifecycleDigest("fused-binding"),
+		lifecycleDigest("fused-physical"), []byte("fused-acquire-command"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intentHead, err := requestledger.AdvanceHeadRoutePin(
+		head, requestledger.RoutePinRecord{}, acquiring, head.Revision+1,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acquired, err := requestledger.RecordVerifiedRoutePinAcquired(
+		acquiring, acquiring.Revision+1, []byte("fused-acquire-completion"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acquiredHead, err := requestledger.AdvanceHeadRoutePin(
+		intentHead, acquiring, acquired, intentHead.Revision+1,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := requestledger.NewPendingWaveWithRoutePin(
+		acquiredHead, requestledger.PayloadBuildRecord{}, acquiredHead.Revision+1,
+		acquired, []requestledger.StepRef{{
+			TargetSource:  requestledger.PayloadSourcePlan,
+			CommandSource: requestledger.PayloadSourcePlan,
+			TargetOffset:  0, TargetLength: 8, CommandOffset: 8, CommandLength: 16,
+			TargetDigest:  lifecycleDigest("fused-target"),
+			CommandDigest: lifecycleDigest("fused-command"),
+		}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command, err := durableRequestLifecycleCommand(head.KeyDigest, DurableRequestLifecycleCAS{
+		Operation:        requestledger.OperationRecordRoutePinAcquiredPutPending,
+		ExpectedRevision: intentHead.Revision, Revision: pending.Revision,
+		RoutePin: acquired, Pending: pending,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	command.ExpectedRangeIdentity = lifecycleDigest("range")
+	command.Home, _ = requestledger.Home(head.Key)
+	raw, err := requestledger.AppendCommand(nil, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, err := requestledger.OpenCommandInto(
+		raw, make([]requestledger.StepRef, requestledger.MaxPendingWaveSteps),
+	)
+	compound, ok := opened.AcquiredPending()
+	if err != nil || !ok || opened.ExpectedRevision != intentHead.Revision ||
+		opened.Revision != pending.Revision || compound.Route().RecordDigest != acquired.RecordDigest ||
+		compound.Pending().Digest() != pending.WaveDigest {
+		t.Fatalf("fused lifecycle command: ok=%v opened=%+v err=%v", ok, opened.Command, err)
+	}
+}
+
 func BenchmarkReplicatedRequestLedgerProposalIdentity(b *testing.B) {
 	command := requestledger.CommandView{Command: requestledger.Command{
 		Operation: requestledger.OperationAdvance, KeyDigest: lifecycleDigest("key"),

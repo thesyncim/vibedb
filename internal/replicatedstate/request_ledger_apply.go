@@ -71,7 +71,8 @@ func (m *Machine) planRequestLedgerCommand(
 	}
 	var stepScratch []requestledger.StepRef
 	ledgerBytes := outer.RequestLedgerBytes()
-	if len(ledgerBytes) > 8 && requestledger.Operation(ledgerBytes[8]) == requestledger.OperationPutPending {
+	if len(ledgerBytes) > 8 && (requestledger.Operation(ledgerBytes[8]) == requestledger.OperationPutPending ||
+		requestledger.Operation(ledgerBytes[8]) == requestledger.OperationRecordRoutePinAcquiredPutPending) {
 		stepScratch = m.requestLedgerSteps[:]
 	}
 	command, err := outer.OpenRequestLedgerInto(stepScratch)
@@ -95,7 +96,8 @@ func (m *Machine) planRequestLedgerCommand(
 		return m.planRequestLedgerIssuerOpen(plan, command, state, snapshot)
 	}
 	storedPendingScratch := m.requestLedgerSteps[:]
-	if command.Operation == requestledger.OperationPutPending {
+	if command.Operation == requestledger.OperationPutPending ||
+		command.Operation == requestledger.OperationRecordRoutePinAcquiredPutPending {
 		storedPendingScratch = nil
 	}
 	rows, err := readRequestLedgerRows(snapshot, command.Home, command.KeyDigest, storedPendingScratch)
@@ -166,6 +168,8 @@ func (m *Machine) planRequestLedgerCommand(
 		return planRequestLedgerSeal(plan, command, rows, snapshot)
 	case requestledger.OperationPutPending:
 		return planRequestLedgerPutPending(plan, command, rows)
+	case requestledger.OperationRecordRoutePinAcquiredPutPending:
+		return planRequestLedgerRecordAcquiredPutPending(plan, command, rows)
 	case requestledger.OperationAdvance:
 		return planRequestLedgerAdvance(plan, command, rows)
 	case requestledger.OperationComplete:
@@ -694,6 +698,83 @@ func planRequestLedgerPutPending(plan requestLedgerCommandPlan, command requestl
 	plan.rows = append(plan.rows, newTransactionPut(key, pendingView.Bytes()))
 	plan.delta.rows++
 	plan.delta.residentBytes += int64(len(key) + len(pendingView.Bytes()))
+	plan.delta.reservedBytes += int64(afterReserved) - int64(beforeReserved)
+	return replaceRequestLedgerHead(plan, rows, next)
+}
+
+func planRequestLedgerRecordAcquiredPutPending(
+	plan requestLedgerCommandPlan,
+	command requestledger.CommandView,
+	rows requestLedgerRows,
+) (requestLedgerCommandPlan, error) {
+	compound, ok := command.AcquiredPending()
+	if !ok {
+		return plan, ErrStateCorrupt
+	}
+	desired := compound.Route()
+	pendingView := compound.Pending()
+	pending := pendingView.Record()
+	if rows.head.Revision == command.Revision && rows.routePinFound && rows.pendingFound &&
+		bytes.Equal(rows.routePinRaw, compound.RouteBytes()) &&
+		bytes.Equal(rows.pendingRaw, compound.PendingBytes()) {
+		return witnessedRequestLedgerApplied(
+			plan, rows.head.Revision, rows.head.Phase, rows.headRaw, true,
+		), nil
+	}
+	if rows.head.Revision != command.ExpectedRevision || rows.head.Phase != requestledger.PhaseSealed ||
+		rows.pendingFound || rows.preparedFound || rows.schemaPinFound || !rows.routePinFound ||
+		rows.routePin.Phase != requestledger.RoutePinAcquiring ||
+		!requestLedgerRouteCompletionEvidenceAvailable(rows.routePin, desired) {
+		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
+	}
+	if pending.PayloadBuildDigest == (requestledger.Digest{}) {
+		if rows.payloadBuildFound {
+			return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
+		}
+	} else if !rows.payloadBuildFound || rows.payloadBuild.Phase != requestledger.PayloadBuildSealed ||
+		rows.payloadBuild.BuildDigest != pending.PayloadBuildDigest ||
+		rows.payloadBuild.KeyDigest != rows.head.KeyDigest ||
+		rows.payloadBuild.RequestDigest != rows.head.RequestDigest ||
+		rows.payloadBuild.PlanRoot != rows.head.PlanRoot ||
+		rows.payloadBuild.PriorContinuationDigest != rows.head.ContinuationDigest ||
+		rows.payloadBuild.WaveOrdinal != rows.head.NextStepOrdinal ||
+		!requestLedgerPendingDynamicBounds(pending, rows.payloadBuild) {
+		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
+	}
+	acquiredHead, err := requestledger.AdvanceHeadRoutePin(
+		rows.head, rows.routePin, desired, command.ExpectedRevision+1,
+	)
+	if err != nil || pending.Revision != command.Revision {
+		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
+	}
+	next, err := requestledger.InstallPendingWave(
+		acquiredHead, pending, rows.payloadBuild, desired,
+	)
+	if err != nil {
+		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
+	}
+	materialized := requestLedgerMaterialized{
+		continuationBytes: len(rows.continuationRaw), routePinBytes: len(rows.routePinRaw),
+	}
+	beforeReserved, ok := requestLedgerReservedBytes(rows.head, materialized)
+	if !ok {
+		return plan, ErrStateCorrupt
+	}
+	materialized.routePinBytes = len(compound.RouteBytes())
+	materialized.pendingBytes = len(compound.PendingBytes())
+	afterReserved, ok := requestLedgerReservedBytes(next, materialized)
+	if !ok {
+		return plan, ErrStateCorrupt
+	}
+	routeKey := requestledger.AppendRoutePinKey(nil, command.Home, command.KeyDigest)
+	pendingKey := requestledger.AppendPendingKey(nil, command.Home, command.KeyDigest)
+	plan.rows = append(plan.rows,
+		newTransactionPut(routeKey, compound.RouteBytes()),
+		newTransactionPut(pendingKey, compound.PendingBytes()),
+	)
+	plan.delta.rows++
+	plan.delta.residentBytes += int64(len(compound.RouteBytes())-len(rows.routePinRaw)) +
+		int64(len(pendingKey)+len(compound.PendingBytes()))
 	plan.delta.reservedBytes += int64(afterReserved) - int64(beforeReserved)
 	return replaceRequestLedgerHead(plan, rows, next)
 }

@@ -50,7 +50,11 @@ func (ledger *lifecycleRunnerLedger) ApplyCAS(
 	cas DurableRequestLifecycleCAS,
 ) (DurableRequestLifecycleCASResult, error) {
 	ledger.events.add(fmt.Sprintf("cas:%d", cas.Operation))
-	if cas.ExpectedRevision != ledger.head.Revision || cas.Revision != ledger.head.Revision+1 {
+	nextRevision := ledger.head.Revision + 1
+	if cas.Operation == requestledger.OperationRecordRoutePinAcquiredPutPending {
+		nextRevision++
+	}
+	if cas.ExpectedRevision != ledger.head.Revision || cas.Revision != nextRevision {
 		return DurableRequestLifecycleCASResult{}, ErrDurableRequestConflict
 	}
 	var err error
@@ -72,6 +76,20 @@ func (ledger *lifecycleRunnerLedger) ApplyCAS(
 			ledger.head, cas.Pending, ledger.build, ledger.route,
 		)
 		ledger.pending = cas.Pending
+	case requestledger.OperationRecordRoutePinAcquiredPutPending:
+		var acquired requestledger.HeadRecord
+		acquired, err = requestledger.AdvanceHeadRoutePin(
+			ledger.head, ledger.route, cas.RoutePin, cas.ExpectedRevision+1,
+		)
+		if err == nil {
+			ledger.head, err = requestledger.InstallPendingWave(
+				acquired, cas.Pending, ledger.build, cas.RoutePin,
+			)
+		}
+		if err == nil {
+			ledger.route = cas.RoutePin
+			ledger.pending = cas.Pending
+		}
 	case requestledger.OperationAdvance:
 		ledger.continuation = cas.Continuation
 		ledger.head, err = requestledger.AdvancePendingWithBuild(
@@ -388,8 +406,7 @@ func TestDurableRequestLifecycleRunnerResumesEveryDurableBoundary(t *testing.T) 
 	}{
 		{"acquire_intent", requestledger.OperationBeginRoutePinAcquire, -1, 0},
 		{"acquire_proposal", requestledger.OperationInvalid, int(replication.CommandRouteGate), routegate.OperationAcquireShared},
-		{"acquire_proof", requestledger.OperationRecordRoutePinAcquired, -1, 0},
-		{"put_pending", requestledger.OperationPutPending, -1, 0},
+		{"acquire_proof_and_pending", requestledger.OperationRecordRoutePinAcquiredPutPending, -1, 0},
 		{"work_proposal", requestledger.OperationInvalid, int(replication.CommandMutationBatch), 0},
 		{"advance", requestledger.OperationAdvance, -1, 0},
 		{"release_intent", requestledger.OperationBeginRoutePinRelease, -1, 0},
@@ -427,6 +444,25 @@ func TestDurableRequestLifecycleRunnerResumesEveryDurableBoundary(t *testing.T) 
 				ledger.pending.Revision != 0 {
 				t.Fatalf("result=%+v head=%+v route=%+v err=%v", result, ledger.head, ledger.route, err)
 			}
+			casCount, compoundCount := 0, 0
+			legacyAcquireCount, legacyPendingCount := 0, 0
+			for _, event := range events.values {
+				switch event {
+				case fmt.Sprintf("cas:%d", requestledger.OperationRecordRoutePinAcquiredPutPending):
+					compoundCount++
+				case fmt.Sprintf("cas:%d", requestledger.OperationRecordRoutePinAcquired):
+					legacyAcquireCount++
+				case fmt.Sprintf("cas:%d", requestledger.OperationPutPending):
+					legacyPendingCount++
+				}
+				if len(event) >= 4 && event[:4] == "cas:" {
+					casCount++
+				}
+			}
+			if casCount != 5 || compoundCount != 1 || legacyAcquireCount != 0 || legacyPendingCount != 0 {
+				t.Fatalf("ledger CAS events=%v; count=%d compound=%d legacy=%d/%d",
+					events.values, casCount, compoundCount, legacyAcquireCount, legacyPendingCount)
+			}
 			for kind, attempts := range proposer.attempts {
 				byCommand := make(map[[sha256.Size]byte][]byte)
 				for _, exact := range attempts {
@@ -444,6 +480,75 @@ func TestDurableRequestLifecycleRunnerResumesEveryDurableBoundary(t *testing.T) 
 				t.Fatalf("route resolutions=%d, want at least acquire/work/release", resolver.calls)
 			}
 		})
+	}
+}
+
+func TestDurableRequestLifecycleRunnerResumesLegacyAcquiredWithoutPending(t *testing.T) {
+	wave, initial, route := lifecycleRunnerFixture(t)
+	events := new(lifecycleRunnerEvents)
+	ledger := &lifecycleRunnerLedger{head: initial, events: events}
+	resolver := &lifecycleRunnerResolver{route: route, events: events}
+	proposer := &lifecycleRunnerProposer{
+		t: t, events: events, faultKind: -1,
+		attempts: make(map[replication.CommandKind][][]byte),
+	}
+	runner, err := newDurableRequestLifecycleRunner(ledger, resolver, proposer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acquire, physical, err := runner.gateSessions.prepareAcquire(t.Context(), route, wave, initial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acquiring, err := requestledger.NewRoutePinAcquiring(
+		initial, wave.PinID, wave.Binding, physical, acquire,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intentHead, err := requestledger.AdvanceHeadRoutePin(
+		initial, requestledger.RoutePinRecord{}, acquiring, initial.Revision+1,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	settled, err := proposer.Propose(t.Context(), route, acquire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acquired, err := requestledger.RecordVerifiedRoutePinAcquired(
+		acquiring, acquiring.Revision+1, settled.Completion,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledger.head, err = requestledger.AdvanceHeadRoutePin(
+		intentHead, acquiring, acquired, intentHead.Revision+1,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledger.route = acquired
+	events.values = nil
+	clear(proposer.attempts)
+
+	result, err := runner.RunWave(t.Context(), wave)
+	if err != nil || result.Revision != initial.Revision+6 ||
+		ledger.route.Phase != requestledger.RoutePinReleased || ledger.pending.Revision != 0 {
+		t.Fatalf("legacy split recovery result=%+v head=%+v route=%+v err=%v",
+			result, ledger.head, ledger.route, err)
+	}
+	putPending, compound := 0, 0
+	for _, event := range events.values {
+		switch event {
+		case fmt.Sprintf("cas:%d", requestledger.OperationPutPending):
+			putPending++
+		case fmt.Sprintf("cas:%d", requestledger.OperationRecordRoutePinAcquiredPutPending):
+			compound++
+		}
+	}
+	if putPending != 1 || compound != 0 {
+		t.Fatalf("legacy recovery events=%v", events.values)
 	}
 }
 

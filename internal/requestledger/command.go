@@ -42,11 +42,12 @@ const (
 	OperationCleanupPlanning
 	OperationAdvanceIssuerHighwater
 	OperationOpenIssuerLane
+	OperationRecordRoutePinAcquiredPutPending
 
 	// LastOperation is the sole inclusive admission bound for the current
 	// request-ledger command grammar. Integrations must not duplicate a numeric
 	// operation ceiling in completion or apply validation.
-	LastOperation = OperationOpenIssuerLane
+	LastOperation = OperationRecordRoutePinAcquiredPutPending
 )
 
 type Command struct {
@@ -128,6 +129,7 @@ type CommandView struct {
 	planningCleanup PlanningCleanupRequest
 	issuerAdvance   IssuerAdvanceRequest
 	issuerOpen      IssuerHighwaterRecord
+	acquiredPending AcquiredPendingView
 }
 
 func (view CommandView) Bytes() []byte { return view.raw[:len(view.raw):len(view.raw)] }
@@ -184,6 +186,9 @@ func (view CommandView) IssuerAdvance() (IssuerAdvanceRequest, bool) {
 }
 func (view CommandView) IssuerOpen() (IssuerHighwaterRecord, bool) {
 	return view.issuerOpen, view.Operation == OperationOpenIssuerLane
+}
+func (view CommandView) AcquiredPending() (AcquiredPendingView, bool) {
+	return view.acquiredPending, view.Operation == OperationRecordRoutePinAcquiredPutPending
 }
 
 func AppendCommand(dst []byte, command Command) ([]byte, error) {
@@ -405,6 +410,26 @@ func OpenCommandInto(raw []byte, stepScratch []StepRef) (CommandView, error) {
 			view.issuerOpen.HighwaterSequence != 0 || view.issuerOpen.AdmittedSequence != 0) {
 			err = ErrCorrupt
 		}
+	case OperationRecordRoutePinAcquiredPutPending:
+		if len(stepScratch) == 0 {
+			_, pendingRaw, route, openErr := validateAcquiredPendingBytes(payload)
+			err = openErr
+			if err == nil && (route.KeyDigest != command.KeyDigest ||
+				route.RequestDigest != command.RequestDigest || route.PlanRoot != command.PlanRoot ||
+				acquiredPendingDigest(route.RecordDigest, readDigest(pendingRaw[160:192])) != command.SubjectDigest) {
+				err = ErrCorrupt
+			}
+		} else {
+			view.acquiredPending, err = OpenAcquiredPendingInto(payload, stepScratch)
+			if err == nil {
+				route, pending := view.acquiredPending.Route(), view.acquiredPending.Pending().Record()
+				if route.KeyDigest != command.KeyDigest || route.RequestDigest != command.RequestDigest ||
+					route.PlanRoot != command.PlanRoot ||
+					acquiredPendingDigest(route.RecordDigest, pending.WaveDigest) != command.SubjectDigest {
+					err = ErrCorrupt
+				}
+			}
+		}
 	default:
 		err = ErrCorrupt
 	}
@@ -432,6 +457,10 @@ func validateCommandShape(command Command) error {
 	if command.Operation == OperationCreate || command.Operation == OperationBeginPayloadBuild ||
 		command.Operation == OperationOpenIssuerLane {
 		if command.ExpectedRevision != 0 || command.Revision != 1 {
+			return ErrRevision
+		}
+	} else if command.Operation == OperationRecordRoutePinAcquiredPutPending {
+		if command.ExpectedRevision >= ^uint64(0)-1 || command.Revision != command.ExpectedRevision+2 {
 			return ErrRevision
 		}
 	} else if !nextRevision(command.ExpectedRevision, command.Revision) {
@@ -467,6 +496,7 @@ func semanticsDigestWithPerturbAndCount(perturb int, xor uint64) (Digest, int) {
 		planningExpiryMagic, planningRestartMagic, planningCleanupMagic, planningExpiryIndexMagic,
 		readyMagic, principalQuotaMagic,
 		issuerHighwaterMagic, issuerSequenceMagic, issuerAdvanceMagic,
+		acquiredPendingMagic,
 	} {
 		_, _ = hash.Write(magic[:])
 	}
@@ -490,6 +520,7 @@ func semanticsDigestWithPerturbAndCount(perturb int, xor uint64) (Digest, int) {
 		IssuerHighwaterKeyBytes, IssuerHighwaterRecordBytes,
 		IssuerSequenceKeyBytes, IssuerSequenceRecordBytes, IssuerAdvanceRequestBytes,
 		IssuerSequenceReservationBytes, IssuerHighwaterResidentBytes,
+		MaxAcquiredPendingRecordBytes, acquiredPendingHeaderBytes,
 		RoutePinReservationBytes, PreparedTerminalReservationBytes,
 		SchemaPinReleaseReservationBytes, ReadyReservationBytes,
 		commandHeaderBytes, headHeaderBytes, pageHeaderBytes, planHeaderBytes,
@@ -523,6 +554,7 @@ func semanticsDigestWithPerturbAndCount(perturb int, xor uint64) (Digest, int) {
 		uint64(OperationRestartPlanning), uint64(OperationCleanupPlanning),
 		uint64(OperationAdvanceIssuerHighwater),
 		uint64(OperationOpenIssuerLane),
+		uint64(OperationRecordRoutePinAcquiredPutPending),
 		uint64(RoutePinAcquiring), uint64(RoutePinAcquired),
 		uint64(RoutePinReleasing), uint64(RoutePinReleased),
 		uint64(SchemaPinReleasing), uint64(SchemaPinReleased),
