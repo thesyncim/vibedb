@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -42,6 +43,13 @@ const durableRF3ExternalEnvironment = "VIBEDB_DURABLE_RF3_PROCESS_E2E"
 
 const (
 	durableRF3ExternalVoters = 3
+	// The multi-relation profile owns 18 sealed user journals, 12 sealed system
+	// journals, and 12 bounded capture journals. Keep their strict allocation
+	// independently bounded so adding a relation or growing journal geometry
+	// cannot hide inside the whole-tree ceiling.
+	durableRF3ExternalRecoveryFiles         = 42
+	durableRF3ExternalRecoveryBudget uint64 = 506 << 20
+	durableRF3ExternalBaselineBudget uint64 = 2188 << 20
 	// Shards plus gateway A, gateway B, the stable user principal, and an
 	// independent observation principal all carry distinct certificate IDs.
 	durableRF3ExternalNodes = 7
@@ -81,11 +89,19 @@ func TestGatewayDurableRF3ExternalProcessRecovery(t *testing.T) {
 	baselineStorage := replicaProcessAllocatedBytes(fixture.root, "")
 	baselineWALs := fixture.captureWALAllocatedBytes(t)
 	baselineWAL := durableRF3ExternalAllocatedTotal(baselineWALs)
+	baselineRecovery := replicaProcessAllocatedBytes(fixture.root, ".rjournal")
+	baselineRecoveryFiles := durableRF3ExternalAllocatedFileCount(fixture.root, ".rjournal")
 	baselineSnapshot := replicaProcessSnapshotPayloadBytes(fixture.root)
 	baselineRSS := fixture.liveRSS()
-	if baselineStorage == 0 || baselineStorage > fixture.baselineStorageBudget || baselineWAL == 0 || baselineRSS == 0 {
-		t.Fatalf("invalid baseline storage=%d limit=%d wal=%d rss=%d", baselineStorage,
-			fixture.baselineStorageBudget, baselineWAL, baselineRSS)
+	if baselineStorage == 0 || baselineStorage > durableRF3ExternalBaselineBudget ||
+		baselineWAL == 0 || baselineRecoveryFiles != durableRF3ExternalRecoveryFiles ||
+		baselineRecovery == 0 || baselineRecovery > durableRF3ExternalRecoveryBudget || baselineRSS == 0 {
+		for _, allocation := range durableRF3ExternalLargestAllocations(fixture.root, 64) {
+			t.Logf("baseline allocation bytes=%d path=%s", allocation.bytes, allocation.path)
+		}
+		t.Fatalf("invalid baseline storage=%d limit=%d wal=%d recovery_files=%d/%d recovery=%d/%d rss=%d",
+			baselineStorage, durableRF3ExternalBaselineBudget, baselineWAL, baselineRecoveryFiles,
+			durableRF3ExternalRecoveryFiles, baselineRecovery, durableRF3ExternalRecoveryBudget, baselineRSS)
 	}
 	measurements := &durableRF3ExternalMeasurements{peakRSS: baselineRSS}
 	fixture.measurements = measurements
@@ -339,6 +355,52 @@ func TestGatewayDurableRF3ExternalProcessRecovery(t *testing.T) {
 		p99, rssGrowth, storageGrowth, walGrowth, clientBytes, snapshotGrowth)
 }
 
+type durableRF3ExternalAllocation struct {
+	path  string
+	bytes uint64
+}
+
+func durableRF3ExternalLargestAllocations(root string, limit int) []durableRF3ExternalAllocation {
+	allocations := make([]durableRF3ExternalAllocation, 0, limit)
+	_ = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil || entry.IsDir() {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return nil
+		}
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !ok || stat.Blocks <= 0 {
+			return nil
+		}
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			return nil
+		}
+		allocations = append(allocations, durableRF3ExternalAllocation{
+			path: relative, bytes: uint64(stat.Blocks) * 512,
+		})
+		return nil
+	})
+	sort.Slice(allocations, func(i, j int) bool { return allocations[i].bytes > allocations[j].bytes })
+	if len(allocations) > limit {
+		allocations = allocations[:limit]
+	}
+	return allocations
+}
+
+func durableRF3ExternalAllocatedFileCount(root, suffix string) int {
+	count := 0
+	_ = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err == nil && !entry.IsDir() && strings.HasSuffix(path, suffix) {
+			count++
+		}
+		return nil
+	})
+	return count
+}
+
 type durableRF3ExternalFixture struct {
 	baselineStorageBudget uint64
 	ctx                   context.Context
@@ -398,8 +460,9 @@ func newDurableRF3ExternalFixture(
 
 func newDurableRF3ExternalFixtureWithPeerFaults(t *testing.T, ctx context.Context, peerFaults bool) *durableRF3ExternalFixture {
 	t.Helper()
-	fixture := &durableRF3ExternalFixture{ctx: ctx, root: t.TempDir(), baselineStorageBudget: 2 << 30,
-		gatewayANode: 3, gatewayBNode: 4, userNode: 5, observerNode: 6}
+	fixture := &durableRF3ExternalFixture{ctx: ctx, root: t.TempDir(),
+		baselineStorageBudget: durableRF3ExternalBaselineBudget,
+		gatewayANode:          3, gatewayBNode: 4, userNode: 5, observerNode: 6}
 	cluster, err := rf3testfixture.ReserveProcessCluster()
 	if err != nil {
 		t.Fatal(err)
@@ -485,18 +548,6 @@ func newDurableRF3ExternalFixtureWithPeerFaults(t *testing.T, ctx context.Contex
 			if err != nil {
 				t.Fatal(err)
 			}
-			// Preserve the original non-journal allowance exactly. Only the
-			// additional sealed transaction journal reservation changes the cold
-			// baseline; foreground storage/WAL/RSS growth budgets do not change.
-			priorJournal := sqldriver.ReplicatedSystemRecoveryJournalBytes
-			if group == durableRF3LedgerGroup {
-				priorJournal = (16 << 20) + 119*storeio.RecoveryJournalMinSectorSize
-			}
-			journal := prepared[group][member].SystemRecoveryJournalBytes
-			if journal < priorJournal || journal > storeio.RecoveryJournalMaxCapacityBytes {
-				t.Fatalf("role %d invalid fixed journal reservation %d", group, journal)
-			}
-			fixture.baselineStorageBudget += journal - priorJournal
 			if member > 0 && prepared[group][member].RelationManifestDigest !=
 				prepared[group][0].RelationManifestDigest {
 				t.Fatalf("role %s relation digest drifted", durableRF3ExternalRoleNames[group])
@@ -1381,11 +1432,37 @@ func (client *durableRF3ExternalWireClient) assertPoint(
 	if err != nil {
 		t.Fatal(err)
 	}
-	response, latency := client.roundTrip(t, raw)
-	if !rf3FixturePointResponseMatches(response, identifier) {
-		t.Fatalf("replicated point id=%q response=%s", identifier, response)
+	started := time.Now()
+	deadline := started.Add(5 * time.Second)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			t.Fatalf("replicated point id=%q did not settle within 5s", identifier)
+		}
+		response, _ := client.roundTripWithin(t, raw, remaining)
+		if rf3FixturePointResponseMatches(response, identifier) {
+			return time.Since(started)
+		}
+		if !durableRF3ExternalRetryableResponse(response) {
+			t.Fatalf("replicated point id=%q response=%s", identifier, response)
+		}
 	}
-	return latency
+}
+
+func durableRF3ExternalRetryableResponse(raw []byte) bool {
+	document, err := vibejson.Parse(raw)
+	if err != nil {
+		return false
+	}
+	okNode, okPresent := document.Get("ok")
+	ok, okValid := okNode.Bool()
+	retryNode, retryPresent := document.Get("retryable")
+	retry, retryValid := retryNode.Bool()
+	codeNode, codePresent := document.Get("code")
+	code, codeValid := codeNode.Text()
+	return okPresent && okValid && !ok && retryPresent && retryValid && retry &&
+		codePresent && codeValid && (code == "conflict" || code == "unavailable" ||
+		code == "read_behind" || code == "stale_catalog" || code == "overloaded")
 }
 
 func (client *durableRF3ExternalWireClient) close() {

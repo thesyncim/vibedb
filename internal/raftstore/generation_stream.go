@@ -11,7 +11,6 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"go.etcd.io/raft/v3"
 	pb "go.etcd.io/raft/v3/raftpb"
-	"google.golang.org/protobuf/proto"
 )
 
 const generationReplayReadBufferBytes = 64 << 10
@@ -791,12 +790,19 @@ func (builder *GenerationBuilder) replaySourceIntoGeneration(
 		previousDigest = record.digest
 		offset = end
 	}
+	if sourceHard != nil && (sourceHard.GetTerm() != builder.current.hard.GetTerm() ||
+		sourceHard.GetVote() != builder.current.hard.GetVote() ||
+		sourceHard.GetCommit() > builder.current.hard.GetCommit()) {
+		return nil, headerState{}, fmt.Errorf(
+			"%w: captured HardState %v does not match replayed HardState %v",
+			ErrGenerationSource, builder.current.hard, sourceHard,
+		)
+	}
 	if scratch == nil || sourceHard == nil ||
 		(builder.parentBinding != ([sha256.Size]byte{})) != sourceGenerationSeen ||
 		offset != builder.current.walEnd ||
 		previousDigest != builder.current.chainDigest ||
 		sourceFirst != builder.current.first || sourceLast != builder.current.last ||
-		!proto.Equal(sourceHard, builder.current.hard) ||
 		!scratch.baseKnown || scratch.baseTerm != checkpointTerm ||
 		scratch.last != builder.current.last ||
 		header.topologyRecoveryEpoch != builder.current.topologyRecoveryEpoch {
@@ -812,6 +818,15 @@ func (builder *GenerationBuilder) replaySourceIntoGeneration(
 		builder.current.currentIncarnation <= lastReady.incarnation {
 		return nil, headerState{}, fmt.Errorf("%w: source incarnation fence",
 			ErrGenerationSource)
+	}
+	// A durable checkpoint can certify the final commit-only notification that
+	// the WAL deliberately left volatile. Fold that publication-backed floor
+	// into the HardState sealed into the replacement generation only after the
+	// captured source current has been proven byte-for-byte above.
+	if sourceHard.GetCommit() < checkpointIndex {
+		sourceHard = cloneHardState(sourceHard)
+		commit := checkpointIndex
+		sourceHard.Commit = &commit
 	}
 	scratch.hard = sourceHard
 	scratch.sourceFirst = sourceFirst

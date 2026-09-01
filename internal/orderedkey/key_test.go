@@ -86,7 +86,7 @@ func TestRejectsMalformedValues(t *testing.T) {
 	strings := [][]byte{
 		[]byte(`"`), []byte(`"\x"`), []byte(`"\ud800"`),
 		[]byte(`"a"b"`),
-		[]byte{'"', 0x01, '"'},
+		{'"', 0x01, '"'},
 	}
 	for _, value := range strings {
 		got, ok := AppendJSONString(dst, value, Ascending)

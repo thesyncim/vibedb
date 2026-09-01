@@ -1179,6 +1179,11 @@ func TestPrepareGenerationRejectsUncertifiedOrInexactSources(t *testing.T) {
 		{name: "future-base", input: testGenerationInput(
 			testGenerationSnapshot(5, 3, "future"),
 		), key: testKey(), want: ErrGenerationSource},
+		{name: "mismatched-publication-commit", input: func() GenerationInput {
+			input := valid
+			input.PublicationCommit = input.Snapshot.GetMetadata().GetIndex() + 1
+			return input
+		}(), key: testKey(), want: ErrGenerationSource},
 		{name: "term-mismatch", input: testGenerationInput(
 			testGenerationSnapshot(3, 3, "wrong-term"),
 		), key: testKey(), want: ErrGenerationSource},

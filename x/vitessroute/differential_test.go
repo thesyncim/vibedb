@@ -53,7 +53,7 @@ type scalarInput struct {
 	u     uint64
 }
 
-func strIn(s string) scalarInput            { return scalarInput{isStr: true, s: s} }
+func strIn(s string) scalarInput              { return scalarInput{isStr: true, s: s} }
 func intIn(spell string, i int64) scalarInput { return scalarInput{spell: spell, i: i} }
 func uintIn(spell string, u uint64) scalarInput {
 	return scalarInput{spell: spell, useU: true, u: u}

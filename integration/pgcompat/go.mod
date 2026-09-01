@@ -1,6 +1,6 @@
 module github.com/thesyncim/vibedb/integration/pgcompat
 
-go 1.26
+go 1.27
 
 require github.com/thesyncim/vibedb v0.0.0
 

@@ -674,7 +674,7 @@ func evidenceCounters(before, after rf3EvidenceCut, reads, writes, retries, logi
 		// FileEnd is a current physical gauge and may fall when a checkpoint
 		// reuses/truncates an unreachable suffix. Encode the detached end state
 		// from zero instead of misrepresenting it as a monotonic delta counter.
-		counter("storage", "file_end_bytes", 0, after.storageFileEnd),
+		counter("storage", "file_end", 0, after.storageFileEnd),
 		counter("storage", "page_reads", before.storagePageReads, after.storagePageReads),
 		counter("storage", "read_bytes", before.storageReadBytes, after.storageReadBytes),
 		counter("workload", "logical_write_bytes", 0, logicalWriteBytes),

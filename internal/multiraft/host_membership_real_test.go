@@ -100,6 +100,13 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 		t.Fatal(err)
 	}
 	cluster.pausePromotion = true
+	// First let the existing quorum commit and publish the promotion while the
+	// learner is partitioned. Once healed, its rejection makes the leader resend
+	// the missing entry with the committed index, so the WAL stores both in one
+	// existing Ready record rather than relying on a deliberately volatile
+	// commit-only notification.
+	cluster.holdPromotionTarget = true
+	cluster.dropPromotionTargetTraffic = true
 	voterConf := &pb.ConfState{Voters: []uint64{1, 2, 3, 4}}
 	cluster.driveUntilWithLeaderTicks(func() bool {
 		for index := 0; index < 3; index++ {
@@ -111,25 +118,40 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 		}
 		return true
 	})
+	heldPublication, err := hosts[3].Publication(group)
+	if err != nil || heldPublication.ReplicaSetVersion != 2 ||
+		heldPublication.ConfState.Equivalent(learnerConf) != nil {
+		t.Fatalf("held learner crossed promotion boundary: %+v, %v", heldPublication, err)
+	}
+	// The existing quorum's publication is the committed transport authority
+	// needed to heal this deliberately partitioned member. Do not overwrite it
+	// with the learner's older local publication while advancing to the crash.
+	if err = registries[3].PublishCommittedAuthority(group, 4, voterConf); err != nil {
+		t.Fatal(err)
+	}
+	cluster.syncAuthority = false
+	cluster.dropPromotionTargetTraffic = false
+	cluster.holdPromotionTarget = false
 	// Committing voters need not carry the new commit index to a learner in the
 	// same append exchange. Cross every protocol-idle boundary with a real tick
-	// on the currently observed leader until member 4 has persisted the commit
-	// and DurablePromotion reconstructs the unapplied entry. The cluster pauses
-	// only from that exact WAL/HardState/publication evidence.
+	// on the currently observed leader until member 4 has persisted the commit.
+	// The cluster pauses on that exact DrivePersisted/status/publication cut;
+	// after the crash, DurablePromotion must reconstruct the unapplied entry
+	// solely from the reopened WAL.
 	cluster.driveUntilWithLeaderTicks(func() bool {
 		if !cluster.promotionPaused {
 			return false
 		}
-		proof, found, proofErr := hosts[3].DurablePromotion(group, target)
 		status, statusErr := hosts[3].Status(group)
 		publication, publicationErr := hosts[3].Publication(group)
-		if proofErr != nil || statusErr != nil || publicationErr != nil {
-			t.Fatal(errors.Join(proofErr, statusErr, publicationErr))
+		if statusErr != nil || publicationErr != nil {
+			t.Fatal(errors.Join(statusErr, publicationErr))
 		}
-		if !found || proof.TargetMember != target || status.Commit < proof.Version ||
-			publication.ReplicaSetVersion >= proof.Version {
-			t.Fatalf("promotion pause lacks durable unapplied witness: proof=%+v found=%t status=%+v publication=%+v",
-				proof, found, status, publication)
+		if status.Commit != 4 || status.Applied != 3 || publication.Applied != 3 ||
+			publication.ReplicaSetVersion != 2 ||
+			publication.ConfState.Equivalent(learnerConf) != nil {
+			t.Fatalf("promotion pause is not the exact persisted-unapplied cut: status=%+v publication=%+v",
+				status, publication)
 		}
 		return true
 	})
@@ -173,6 +195,7 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 		t.Fatal(err)
 	}
 	registries[3], cluster.registries[3] = restartRegistry, restartRegistry
+	cluster.syncAuthority = true
 	cluster.inactive[0], cluster.inactive[3] = true, false
 	cluster.holdTargetUntilVote = true
 	cluster.suppressTargetTicks = true

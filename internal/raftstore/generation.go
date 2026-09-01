@@ -56,6 +56,10 @@ type GenerationInput struct {
 	Snapshot            *pb.Snapshot
 	SnapshotBaseDigest  [sha256.Size]byte
 	RetentionCommitment [sha256.Size]byte
+	// PublicationCommit is the durable state-machine publication certified by
+	// Snapshot and its retention witness. It may raise only this snapshot's
+	// commit floor; activation revalidates the originating apply owner.
+	PublicationCommit uint64
 }
 
 // GenerationInfo is detached fixed-width evidence recovered from one compacted
@@ -156,10 +160,16 @@ func (store *Store) PrepareGeneration(input GenerationInput, key Key) (*Generati
 		return nil, errors.Join(ErrGenerationSource, err)
 	}
 	baseIndex := input.Snapshot.GetMetadata().GetIndex()
+	if input.PublicationCommit != 0 && input.PublicationCommit != baseIndex {
+		return nil, fmt.Errorf("%w: publication commit %d differs from checkpoint %d",
+			ErrGenerationSource, input.PublicationCommit, baseIndex)
+	}
+	durableCommit := max(store.current.hard.GetCommit(), store.image.hard.GetCommit())
+	durableCommit = max(durableCommit, input.PublicationCommit)
 	if baseIndex < store.header.reference.index || baseIndex > store.image.last ||
-		baseIndex > store.current.hard.GetCommit() {
+		baseIndex > durableCommit {
 		return nil, fmt.Errorf("%w: checkpoint index %d outside durable committed range [%d,%d]",
-			ErrGenerationSource, baseIndex, store.header.reference.index, store.current.hard.GetCommit())
+			ErrGenerationSource, baseIndex, store.header.reference.index, durableCommit)
 	}
 	baseTerm, err := termFromImage(store.image, baseIndex)
 	if err != nil || baseTerm != input.Snapshot.GetMetadata().GetTerm() {
@@ -207,7 +217,7 @@ func (store *Store) PrepareGeneration(input GenerationInput, key Key) (*Generati
 		cancel: make(chan struct{}),
 		key:    key, input: GenerationInput{
 			Snapshot: cloneSnapshot(input.Snapshot), SnapshotBaseDigest: input.SnapshotBaseDigest,
-			RetentionCommitment: input.RetentionCommitment,
+			RetentionCommitment: input.RetentionCommitment, PublicationCommit: input.PublicationCommit,
 		},
 	}, nil
 }
@@ -230,6 +240,7 @@ func (builder *GenerationBuilder) BindsInput(input GenerationInput) bool {
 		input.SnapshotBaseDigest == builder.input.SnapshotBaseDigest &&
 		input.RetentionCommitment != ([sha256.Size]byte{}) &&
 		input.RetentionCommitment == builder.input.RetentionCommitment &&
+		input.PublicationCommit == builder.input.PublicationCommit &&
 		proto.Equal(input.Snapshot, builder.input.Snapshot)
 }
 

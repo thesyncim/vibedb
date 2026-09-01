@@ -21,7 +21,8 @@ func writeDurableReadyAt(file *os.File, data []byte, offset int64) (int, error) 
 	if file == nil || len(data) == 0 || offset < 0 {
 		return 0, unix.EINVAL
 	}
-	iovec := unix.Iovec{Base: &data[0], Len: uint64(len(data))}
+	iovec := unix.Iovec{Base: &data[0]}
+	iovec.SetLen(len(data))
 	const longBits = 64
 	low := uintptr(offset)
 	high := uintptr(uint64(offset) >> (longBits - 1) >> 1)

@@ -26,7 +26,7 @@ func TestOrdinaryTransportReconnectsAfterPeerReadEOF(t *testing.T) {
 	fixture := newTransportTestFixture(t)
 	first := &peerEOFConnection{
 		transportTestConnection: newTransportTestConnection(fixture.registry, fixture.remote[0].Node),
-		remoteClosed: make(chan struct{}),
+		remoteClosed:            make(chan struct{}),
 	}
 	second := newTransportTestConnection(fixture.registry, fixture.remote[0].Node)
 	var calls atomic.Int32

@@ -79,6 +79,7 @@ func (p *WALBasePreparation) GenerationInput() (
 		Snapshot:            proto.Clone(p.snapshotBase).(*pb.Snapshot),
 		SnapshotBaseDigest:  p.snapshotBaseDigest,
 		RetentionCommitment: commitment,
+		PublicationCommit:   p.snapshotBase.GetMetadata().GetIndex(),
 	}, nil
 }
 

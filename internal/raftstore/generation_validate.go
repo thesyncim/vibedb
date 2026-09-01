@@ -298,6 +298,13 @@ func (builder *GenerationBuilder) candidateSealMatches(
 	}
 	baseIndex := builder.input.Snapshot.GetMetadata().GetIndex()
 	baseTerm := builder.input.Snapshot.GetMetadata().GetTerm()
+	hardMatches := seal.hard.GetTerm() == builder.current.hard.GetTerm() &&
+		seal.hard.GetVote() == builder.current.hard.GetVote() &&
+		seal.hard.GetCommit() >= baseIndex &&
+		seal.hard.GetCommit() <= builder.current.hard.GetCommit()
+	if builder.loaded {
+		hardMatches = proto.Equal(seal.hard, builder.seal.hard)
+	}
 	return seal.familyID == builder.familyID && seal.generation == builder.generation &&
 		seal.parentBindingDigest == builder.parentBinding &&
 		seal.identityDigest == generationIdentityDigest(builder.header.identity) &&
@@ -315,8 +322,7 @@ func (builder *GenerationBuilder) candidateSealMatches(
 		seal.snapshotBaseDigest == builder.input.SnapshotBaseDigest &&
 		seal.confDigest == generationConfDigest(
 			builder.input.Snapshot.GetMetadata().GetConfState(),
-		) && seal.retentionCommitment == builder.input.RetentionCommitment &&
-		proto.Equal(seal.hard, builder.current.hard) &&
+		) && seal.retentionCommitment == builder.input.RetentionCommitment && hardMatches &&
 		seal.suffixFirst == baseIndex+1 && seal.suffixLast == builder.current.last &&
 		seal.suffixCount == builder.current.last-baseIndex &&
 		seal.sourceFirst == builder.current.first && seal.sourceLast == builder.current.last
