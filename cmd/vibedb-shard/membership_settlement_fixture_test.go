@@ -83,9 +83,12 @@ func rf3MembershipNetworkObserver(observer *replicacontrol.Client, address strin
 		if err != nil {
 			return state, replicacontrol.Observation{}, err
 		}
-		// ReplicaSetVersion is the configuration's log index, not a contiguous
-		// counter. Bind the control observation to the exact native version.
-		request.ExpectedReplicaSetVersion = state.Fence.Command.ReplicaSetVersion
+		// The command endpoint can expose the applied configuration before the
+		// publication read by replica control catches up. Discover that local
+		// publication instead of pinning the read to a transiently newer command
+		// fence; rf3AwaitMembershipSettlement still validates its exact version,
+		// configuration, binding, member, group, and applied cut below.
+		request.ExpectedReplicaSetVersion = 0
 		observed, err := observer.Observe(ctx, node, request)
 		return state, observed, err
 	}
