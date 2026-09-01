@@ -63,7 +63,7 @@ func TestTwoGatewayDurableSQLRF3RecoversUnfinishedWaveWithDefaultPinSpan(t *test
 	// Lose the caller after pin acquisition and durable route intent, before a
 	// terminal result exists. The replacement has a distinct controller and no
 	// copy of the old gateway's journals. No unrelated workload advances leases.
-	gatewayA.client.armLostResponse(requestledger.OperationPutPending)
+	gatewayA.client.armLostResponse(requestledger.OperationRecordRoutePinAcquiredPutPending)
 	_, err = gatewayA.sql.Execute(ctx, key, tenant, queries)
 	if err == nil || !gatewayA.client.callerDisconnected() {
 		gatewayA.client.logRecentSettlements(t)
