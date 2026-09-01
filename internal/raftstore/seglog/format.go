@@ -11,8 +11,10 @@ import (
 )
 
 const (
-	FormatVersion uint16 = 3
-	ManifestName         = "MANIFEST.v3"
+	FormatVersion        uint16 = 3
+	ManifestName                = "MANIFEST.v3"
+	RecordEntry          uint16 = 1
+	RecordTruncateSuffix uint16 = 2
 
 	manifestHeaderBytes  = 80
 	manifestSegmentBytes = 96
@@ -148,7 +150,7 @@ func unmarshalManifest(b []byte) (Manifest, error) {
 	last = 0
 	for range ng {
 		g := GroupMeta{GroupID: binary.LittleEndian.Uint64(b[off : off+8]), TruncateIndex: binary.LittleEndian.Uint64(b[off+8 : off+16]), TruncateTerm: binary.LittleEndian.Uint64(b[off+16 : off+24]), DurableLastIndex: binary.LittleEndian.Uint64(b[off+24 : off+32]), DurableLastTerm: binary.LittleEndian.Uint64(b[off+32 : off+40])}
-		if g.GroupID == 0 || g.GroupID <= last || (g.TruncateIndex == 0) != (g.TruncateTerm == 0) || g.DurableLastIndex == 0 || g.DurableLastTerm == 0 || g.DurableLastIndex < g.TruncateIndex || !allZero(b[off+40:off+manifestGroupBytes]) {
+		if g.GroupID == 0 || g.GroupID <= last || (g.TruncateIndex == 0) != (g.TruncateTerm == 0) || (g.DurableLastIndex == 0) != (g.DurableLastTerm == 0) || g.DurableLastIndex < g.TruncateIndex || !allZero(b[off+40:off+manifestGroupBytes]) {
 			return Manifest{}, fmt.Errorf("%w: group IDs not monotonic", ErrCorrupt)
 		}
 		last = g.GroupID
@@ -191,7 +193,7 @@ func unmarshalSegmentHeader(b []byte) (segmentHeader, error) {
 func recordSize(payload int) uint64 { return uint64(recordHeaderBytes + payload + 4) }
 
 func marshalRecord(r Record, dst []byte) ([]byte, error) {
-	if r.GroupID == 0 || r.Index == 0 || r.Term == 0 || len(r.Payload) > maxRecordBytes {
+	if r.GroupID == 0 || r.Index == 0 || (r.Kind != RecordEntry && r.Kind != RecordTruncateSuffix) || (r.Kind == RecordEntry && r.Term == 0) || (r.Kind == RecordTruncateSuffix && len(r.Payload) != 0) || len(r.Payload) > maxRecordBytes {
 		return nil, ErrBounds
 	}
 	n := int(recordSize(len(r.Payload)))
@@ -229,7 +231,7 @@ func inspectRecord(b []byte) (Record, uint64, error) {
 		return Record{}, n, errors.New("seglog: incomplete record")
 	}
 	r := Record{Kind: binary.LittleEndian.Uint16(b[12:14]), Flags: binary.LittleEndian.Uint16(b[14:16]), GroupID: binary.LittleEndian.Uint64(b[16:24]), Index: binary.LittleEndian.Uint64(b[24:32]), Term: binary.LittleEndian.Uint64(b[32:40]), Payload: b[64 : n-4]}
-	if r.GroupID == 0 || r.Index == 0 || r.Term == 0 || !allZero(b[48:60]) || crc32.Checksum(r.Payload, crcTable) != binary.LittleEndian.Uint32(b[44:48]) || !validCRC(b[:n]) {
+	if r.GroupID == 0 || r.Index == 0 || (r.Kind != RecordEntry && r.Kind != RecordTruncateSuffix) || (r.Kind == RecordEntry && r.Term == 0) || (r.Kind == RecordTruncateSuffix && len(r.Payload) != 0) || !allZero(b[48:60]) || crc32.Checksum(r.Payload, crcTable) != binary.LittleEndian.Uint32(b[44:48]) || !validCRC(b[:n]) {
 		return Record{}, n, fmt.Errorf("%w: record checksum", ErrCorrupt)
 	}
 	return r, n, nil

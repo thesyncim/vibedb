@@ -117,12 +117,43 @@ func (l *Log) Group(group uint64) (GroupIndex, bool) {
 	return GroupIndex{TruncateIndex: g.TruncateIndex, TruncateTerm: g.TruncateTerm, Entries: slices.Clone(g.Entries)}, true
 }
 
+// ReserveGroup moves index allocation to a control-plane boundary. Append
+// never grows the slice: the production adapter must size this from its
+// configured segment/index admission bound and rotate or reserve again before
+// exhaustion.
+func (l *Log) ReserveGroup(group uint64, capacity int) error {
+	if group == 0 || capacity < 0 {
+		return ErrBounds
+	}
+	g := l.index[group]
+	if g == nil {
+		l.index[group] = &GroupIndex{Entries: make([]Location, 0, capacity)}
+		return nil
+	}
+	if capacity < len(g.Entries) {
+		return ErrBounds
+	}
+	if capacity <= cap(g.Entries) {
+		return nil
+	}
+	entries := make([]Location, len(g.Entries), capacity)
+	copy(entries, g.Entries)
+	g.Entries = entries
+	return nil
+}
+
 func (l *Log) Append(r Record) (Location, error) {
 	if l.active == nil {
 		return Location{}, os.ErrClosed
 	}
+	if r.Kind != RecordEntry {
+		return Location{}, fmt.Errorf("%w: Append requires entry record", ErrBounds)
+	}
 	g := l.index[r.GroupID]
-	if r.Index <= l.last[r.GroupID] || g != nil && r.Index <= g.TruncateIndex {
+	if g == nil || len(g.Entries) == cap(g.Entries) {
+		return Location{}, fmt.Errorf("%w: group index reservation", ErrBounds)
+	}
+	if r.Index <= l.last[r.GroupID] || r.Index <= g.TruncateIndex {
 		return Location{}, fmt.Errorf("%w: group index regression", ErrCorrupt)
 	}
 	encoded, err := marshalRecord(r, l.buf)
@@ -140,15 +171,51 @@ func (l *Log) Append(r Record) (Location, error) {
 	}
 	l.activeOffset += uint64(n)
 	loc := Location{SegmentID: l.manifest.ActiveID, Offset: off, Bytes: uint64(len(encoded)), Index: r.Index, Term: r.Term}
-	if g == nil {
-		g = &GroupIndex{}
-		l.index[r.GroupID] = g
-	}
 	g.Entries = append(g.Entries, loc)
 	l.last[r.GroupID] = r.Index
 	l.lastTerm[r.GroupID] = r.Term
 	l.records++
 	return loc, nil
+}
+
+// TruncateSuffix appends an explicit logical record before changing the live
+// index. Recovery permits a group-index regression only through this record,
+// so a torn or missing marker can never make replacement entries appear.
+// The marker's term binds the surviving predecessor (zero when from is one).
+func (l *Log) TruncateSuffix(group, from uint64) error {
+	if l.active == nil {
+		return os.ErrClosed
+	}
+	g := l.index[group]
+	if group == 0 || from == 0 || g == nil || from <= g.TruncateIndex {
+		return ErrBounds
+	}
+	cut := sort.Search(len(g.Entries), func(i int) bool { return g.Entries[i].Index >= from })
+	if cut == len(g.Entries) && from != l.last[group]+1 {
+		return fmt.Errorf("%w: suffix truncation gap", ErrCorrupt)
+	}
+	term := g.TruncateTerm
+	if cut != 0 {
+		term = g.Entries[cut-1].Term
+	}
+	encoded, err := marshalRecord(Record{GroupID: group, Index: from, Term: term, Kind: RecordTruncateSuffix}, l.buf)
+	if err != nil {
+		return err
+	}
+	l.buf = encoded
+	n, err := l.active.WriteAt(encoded, int64(l.activeOffset))
+	if err != nil {
+		return err
+	}
+	if n != len(encoded) {
+		return io.ErrShortWrite
+	}
+	l.activeOffset += uint64(n)
+	l.records++
+	g.Entries = slices.Delete(g.Entries, cut, len(g.Entries))
+	l.last[group] = from - 1
+	l.lastTerm[group] = term
+	return nil
 }
 
 // Sync first makes active bytes durable, then atomically publishes the exact
@@ -231,7 +298,7 @@ func (l *Log) groupMetadata(durableOffset uint64) []GroupMeta {
 		if lastIndex == 0 && g.TruncateIndex != 0 {
 			lastIndex, lastTerm = g.TruncateIndex, g.TruncateTerm
 		}
-		if lastIndex != 0 {
+		if _, seen := l.last[id]; lastIndex != 0 || seen {
 			groups = append(groups, GroupMeta{GroupID: id, TruncateIndex: g.TruncateIndex, TruncateTerm: g.TruncateTerm, DurableLastIndex: lastIndex, DurableLastTerm: lastTerm})
 		}
 	}

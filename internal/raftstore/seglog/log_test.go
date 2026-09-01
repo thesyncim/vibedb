@@ -9,7 +9,12 @@ import (
 
 func appendEntry(t *testing.T, l *Log, group, index, term uint64, payload string) Location {
 	t.Helper()
-	loc, err := l.Append(Record{GroupID: group, Index: index, Term: term, Kind: 1, Payload: []byte(payload)})
+	if _, ok := l.index[group]; !ok {
+		if err := l.ReserveGroup(group, 1024); err != nil {
+			t.Fatal(err)
+		}
+	}
+	loc, err := l.Append(Record{GroupID: group, Index: index, Term: term, Kind: RecordEntry, Payload: []byte(payload)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,6 +56,29 @@ func TestRoundTripRotationAndIndexRebuild(t *testing.T) {
 	}
 }
 
+func TestAppendSteadyStateZeroAlloc(t *testing.T) {
+	l, err := Create(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	if err = l.ReserveGroup(1, 2048); err != nil {
+		t.Fatal(err)
+	}
+	r := Record{GroupID: 1, Index: 1, Term: 1, Kind: RecordEntry, Payload: []byte("small raft entry")}
+	if _, err = l.Append(r); err != nil {
+		t.Fatal(err)
+	}
+	var runErr error
+	allocs := testing.AllocsPerRun(1000, func() { r.Index++; _, runErr = l.Append(r) })
+	if runErr != nil {
+		t.Fatal(runErr)
+	}
+	if allocs != 0 {
+		t.Fatalf("steady-state Append allocations = %v, want 0", allocs)
+	}
+}
+
 func TestLogicalTruncationPersistsAndRebuilds(t *testing.T) {
 	dir := t.TempDir()
 	l, err := Create(dir)
@@ -78,13 +106,91 @@ func TestLogicalTruncationPersistsAndRebuilds(t *testing.T) {
 	if !ok || g.TruncateIndex != 2 || g.TruncateTerm != 2 || len(g.Entries) != 2 || g.Entries[0].Index != 3 {
 		t.Fatalf("rebuilt group = %+v, %v", g, ok)
 	}
-	if _, err = l.Append(Record{GroupID: 7, Index: 2, Term: 2}); !errors.Is(err, ErrCorrupt) {
+	if _, err = l.Append(Record{GroupID: 7, Index: 2, Term: 2, Kind: RecordEntry}); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("append below truncation = %v", err)
 	}
 }
 
+func TestLogicalSuffixTruncationAllowsTermReplacement(t *testing.T) {
+	dir := t.TempDir()
+	l, _ := Create(dir)
+	for i := uint64(1); i <= 4; i++ {
+		appendEntry(t, l, 3, i, 1, "old")
+	}
+	if err := l.Rotate(nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.TruncateSuffix(3, 3); err != nil {
+		t.Fatal(err)
+	}
+	appendEntry(t, l, 3, 3, 2, "new")
+	appendEntry(t, l, 3, 4, 2, "new")
+	if err := l.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	_ = l.Close()
+	l, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	g, _ := l.Group(3)
+	if len(g.Entries) != 4 || g.Entries[2].Index != 3 || g.Entries[2].Term != 2 || g.Entries[3].Term != 2 {
+		t.Fatalf("replacement index = %+v", g)
+	}
+}
+
+func TestUncommittedSuffixTruncationIsDiscarded(t *testing.T) {
+	dir := t.TempDir()
+	l, _ := Create(dir)
+	for i := uint64(1); i <= 3; i++ {
+		appendEntry(t, l, 4, i, 1, "old")
+	}
+	if err := l.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.TruncateSuffix(4, 2); err != nil {
+		t.Fatal(err)
+	}
+	_ = l.Close()
+	l, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	g, _ := l.Group(4)
+	if len(g.Entries) != 3 || g.Entries[2].Index != 3 {
+		t.Fatalf("uncommitted truncate survived: %+v", g)
+	}
+}
+
+func TestSuffixTruncationCanDurablyEmptyGroup(t *testing.T) {
+	dir := t.TempDir()
+	l, _ := Create(dir)
+	appendEntry(t, l, 5, 1, 1, "only")
+	if err := l.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.TruncateSuffix(5, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	_ = l.Close()
+	l, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	g, ok := l.Group(5)
+	if !ok || len(g.Entries) != 0 {
+		t.Fatalf("group = %+v, %v", g, ok)
+	}
+}
+
 func TestActiveUncommittedTailIsDiscardedAtEveryBoundary(t *testing.T) {
-	probe := Record{GroupID: 1, Index: 2, Term: 1, Kind: 1, Payload: []byte("payload")}
+	probe := Record{GroupID: 1, Index: 2, Term: 1, Kind: RecordEntry, Payload: []byte("payload")}
 	encoded, _ := marshalRecord(probe, nil)
 	for cut := 0; cut <= len(encoded); cut++ {
 		t.Run(testName(cut), func(t *testing.T) {
@@ -126,7 +232,7 @@ func TestActiveUncommittedTailIsDiscardedAtEveryBoundary(t *testing.T) {
 }
 
 func TestCommittedTornTailRejectedAtEveryBoundary(t *testing.T) {
-	encoded, _ := marshalRecord(Record{GroupID: 1, Index: 2, Term: 1, Payload: []byte("payload")}, nil)
+	encoded, _ := marshalRecord(Record{GroupID: 1, Index: 2, Term: 1, Kind: RecordEntry, Payload: []byte("payload")}, nil)
 	for cut := 0; cut < len(encoded); cut++ {
 		t.Run(testName(cut), func(t *testing.T) {
 			dir := t.TempDir()

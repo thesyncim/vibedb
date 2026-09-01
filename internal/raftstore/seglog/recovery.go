@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sort"
 )
 
 func (l *Log) reconcileRotation() error {
@@ -89,9 +90,6 @@ func (l *Log) expectedPreviousHash() [32]byte {
 }
 
 func (l *Log) rebuild() error {
-	for _, gm := range l.manifest.Groups {
-		l.index[gm.GroupID] = &GroupIndex{TruncateIndex: gm.TruncateIndex, TruncateTerm: gm.TruncateTerm}
-	}
 	var previousID uint64
 	var previousHash [32]byte
 	for _, want := range l.manifest.Segments {
@@ -145,6 +143,10 @@ func (l *Log) rebuild() error {
 		if l.last[gm.GroupID] != gm.DurableLastIndex || l.lastTerm[gm.GroupID] != gm.DurableLastTerm {
 			return fmt.Errorf("%w: group %d durable index metadata", ErrCorrupt, gm.GroupID)
 		}
+		g := l.index[gm.GroupID]
+		cut := sort.Search(len(g.Entries), func(i int) bool { return g.Entries[i].Index > gm.TruncateIndex })
+		g.Entries = slices.Delete(g.Entries, 0, cut)
+		g.TruncateIndex, g.TruncateTerm = gm.TruncateIndex, gm.TruncateTerm
 	}
 	// The manifest is the anti-invention boundary. Complete-looking records,
 	// partial envelopes, and a footer beyond it are all discarded identically.
@@ -190,18 +192,32 @@ func (l *Log) scanRecords(f *os.File, segmentID, start, end uint64, sealed bool)
 		if err != nil || consumed != n {
 			return 0, fmt.Errorf("segment %d offset %d: %w", segmentID, off, errors.Join(ErrCorrupt, err))
 		}
-		if r.Index <= l.last[r.GroupID] {
-			return 0, fmt.Errorf("%w: group %d record index regression", ErrCorrupt, r.GroupID)
-		}
-		l.last[r.GroupID] = r.Index
-		l.lastTerm[r.GroupID] = r.Term
 		g := l.index[r.GroupID]
 		if g == nil {
 			g = &GroupIndex{}
 			l.index[r.GroupID] = g
 		}
-		if r.Index > g.TruncateIndex {
+		switch r.Kind {
+		case RecordEntry:
+			if r.Index <= l.last[r.GroupID] || r.Index <= g.TruncateIndex {
+				return 0, fmt.Errorf("%w: group %d record index regression", ErrCorrupt, r.GroupID)
+			}
 			g.Entries = append(g.Entries, Location{SegmentID: segmentID, Offset: off, Bytes: n, Index: r.Index, Term: r.Term})
+			l.last[r.GroupID], l.lastTerm[r.GroupID] = r.Index, r.Term
+		case RecordTruncateSuffix:
+			if r.Index <= g.TruncateIndex || r.Index > l.last[r.GroupID]+1 {
+				return 0, fmt.Errorf("%w: group %d suffix truncation", ErrCorrupt, r.GroupID)
+			}
+			cut := sort.Search(len(g.Entries), func(i int) bool { return g.Entries[i].Index >= r.Index })
+			wantTerm := g.TruncateTerm
+			if cut != 0 {
+				wantTerm = g.Entries[cut-1].Term
+			}
+			if r.Term != wantTerm {
+				return 0, fmt.Errorf("%w: group %d suffix predecessor term", ErrCorrupt, r.GroupID)
+			}
+			g.Entries = slices.Delete(g.Entries, cut, len(g.Entries))
+			l.last[r.GroupID], l.lastTerm[r.GroupID] = r.Index-1, r.Term
 		}
 		if !sealed {
 			l.records++
