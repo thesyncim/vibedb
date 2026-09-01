@@ -42,13 +42,16 @@ func TestSeglogEngineDifferentialReadySemantics(t *testing.T) {
 		{NodeIncarnation: incarnation, ReadyID: 2, HardState: hard(3, 3), Entries: []*pb.Entry{entry(3, 3, "B"), entry(4, 3, "C")}},
 		{NodeIncarnation: incarnation, ReadyID: 3, HardState: hard(4, 5), Entries: []*pb.Entry{entry(5, 4, "d")}},
 	}
+	confType, confV2Type := pb.EntryConfChange, pb.EntryConfChangeV2
+	batches[0].Entries[1].Type = &confType
+	batches[0].Entries[2].Type = &confV2Type
 	for _, batch := range batches {
 		if err = store.Persist(batch); err != nil {
 			t.Fatal(err)
 		}
 		entries := make([]seglog.Entry, len(batch.Entries))
 		for i, entry := range batch.Entries {
-			entries[i] = seglog.Entry{Index: entry.GetIndex(), Term: entry.GetTerm(), Data: entry.Data}
+			entries[i] = seglog.Entry{Index: entry.GetIndex(), Term: entry.GetTerm(), Type: entry.GetType(), Data: entry.Data}
 		}
 		hard := seglog.HardState{Term: batch.HardState.GetTerm(), Vote: batch.HardState.GetVote(), Commit: batch.HardState.GetCommit()}
 		replace := uint64(0)
@@ -98,7 +101,7 @@ func TestSeglogEngineDifferentialReadySemantics(t *testing.T) {
 		t.Fatalf("entry lengths differ: engine=%d store=%d", len(state.Entries), len(storeEntries))
 	}
 	for i := range storeEntries {
-		if state.Entries[i].Index != storeEntries[i].GetIndex() || state.Entries[i].Term != storeEntries[i].GetTerm() {
+		if state.Entries[i].Index != storeEntries[i].GetIndex() || state.Entries[i].Term != storeEntries[i].GetTerm() || state.Entries[i].Type != storeEntries[i].GetType() {
 			t.Fatalf("entry %d differs: engine=%+v store=%v", i, state.Entries[i], storeEntries[i])
 		}
 	}

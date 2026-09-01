@@ -2,11 +2,15 @@ package seglog
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"hash/crc32"
 	"os"
 	"path/filepath"
 	"testing"
+
+	pb "go.etcd.io/raft/v3/raftpb"
 )
 
 func waveID(n uint64) WaveID {
@@ -118,7 +122,7 @@ func TestWaveFrameOverheadAndOptionalHardState(t *testing.T) {
 func TestHardStateAndReplacementLegality(t *testing.T) {
 	e := newReservedEngine(t, 1)
 	h := HardState{Term: 2, Vote: 7, Commit: 2}
-	if err := e.PersistWave(Wave{ID: waveID(1), Batches: []ReadyBatch{{GroupID: 1, Entries: []Entry{{1, 1, []byte("1"), 0}, {2, 2, []byte("2"), 0}, {3, 2, []byte("3"), 0}}, Hard: &h}}}); err != nil {
+	if err := e.PersistWave(Wave{ID: waveID(1), Batches: []ReadyBatch{{GroupID: 1, Entries: []Entry{{Index: 1, Term: 1, Data: []byte("1")}, {Index: 2, Term: 2, Data: []byte("2")}, {Index: 3, Term: 2, Data: []byte("3")}}, Hard: &h}}}); err != nil {
 		t.Fatal(err)
 	}
 	tests := []ReadyBatch{
@@ -126,7 +130,7 @@ func TestHardStateAndReplacementLegality(t *testing.T) {
 		{GroupID: 1, Hard: &HardState{Term: 2, Vote: 8, Commit: 2}},
 		{GroupID: 1, Hard: &HardState{Term: 2, Vote: 7, Commit: 1}},
 		{GroupID: 1, Hard: &HardState{Term: 2, Vote: 7, Commit: 4}},
-		{GroupID: 1, ReplaceFrom: 2, Entries: []Entry{{2, 3, []byte("bad"), 0}}},
+		{GroupID: 1, ReplaceFrom: 2, Entries: []Entry{{Index: 2, Term: 3, Data: []byte("bad")}}},
 	}
 	for i, batch := range tests {
 		if err := e.PersistWave(Wave{ID: waveID(uint64(i + 2)), Batches: []ReadyBatch{batch}}); !errors.Is(err, ErrRaftState) {
@@ -134,7 +138,7 @@ func TestHardStateAndReplacementLegality(t *testing.T) {
 		}
 	}
 	next := HardState{Term: 3, Vote: 8, Commit: 3}
-	if err := e.PersistWave(Wave{ID: waveID(20), Batches: []ReadyBatch{{GroupID: 1, ReplaceFrom: 3, Entries: []Entry{{3, 3, []byte("new"), 0}}, Hard: &next}}}); err != nil {
+	if err := e.PersistWave(Wave{ID: waveID(20), Batches: []ReadyBatch{{GroupID: 1, ReplaceFrom: 3, Entries: []Entry{{Index: 3, Term: 3, Data: []byte("new")}}, Hard: &next}}}); err != nil {
 		t.Fatal(err)
 	}
 	state, _ := e.Group(1)
@@ -156,7 +160,7 @@ func TestCheckpointPrefixAndRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := HardState{Term: 1, Vote: 1, Commit: 3}
-	if err = e.PersistWave(Wave{ID: waveID(1), Batches: []ReadyBatch{{GroupID: 4, Entries: []Entry{{1, 1, []byte("1"), 0}, {2, 1, []byte("2"), 0}, {3, 1, []byte("3"), 0}}, Hard: &h}}}); err != nil {
+	if err = e.PersistWave(Wave{ID: waveID(1), Batches: []ReadyBatch{{GroupID: 4, Entries: []Entry{{Index: 1, Term: 1, Data: []byte("1")}, {Index: 2, Term: 1, Data: []byte("2")}, {Index: 3, Term: 1, Data: []byte("3")}}, Hard: &h}}}); err != nil {
 		t.Fatal(err)
 	}
 	cp := Checkpoint{ID: [16]byte{9}, Index: 2, Term: 1}
@@ -190,7 +194,7 @@ func TestActiveWaveTornAtEveryByteBoundary(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := HardState{Term: 1, Vote: 1, Commit: 1}
-	if err = e.PersistWave(Wave{ID: waveID(1), Batches: []ReadyBatch{{GroupID: 1, Entries: []Entry{{1, 1, []byte("payload"), 0}}, Hard: &h}}}); err != nil {
+	if err = e.PersistWave(Wave{ID: waveID(1), Batches: []ReadyBatch{{GroupID: 1, Entries: []Entry{{Index: 1, Term: 1, Data: []byte("payload")}}, Hard: &h}}}); err != nil {
 		t.Fatal(err)
 	}
 	if err = e.Close(); err != nil {
@@ -233,10 +237,10 @@ func TestOutcomeUnknownRecoveryAndWaveIDConflict(t *testing.T) {
 	if err = e.ReserveGroup(1, 32); err != nil {
 		t.Fatal(err)
 	}
-	if err = e.PersistWave(Wave{ID: waveID(1), Batches: []ReadyBatch{{GroupID: 1, Entries: []Entry{{1, 1, []byte("prior"), 0}}}}}); err != nil {
+	if err = e.PersistWave(Wave{ID: waveID(1), Batches: []ReadyBatch{{GroupID: 1, Entries: []Entry{{Index: 1, Term: 1, Data: []byte("prior")}}}}}); err != nil {
 		t.Fatal(err)
 	}
-	w := Wave{ID: waveID(2), Batches: []ReadyBatch{{GroupID: 1, Entries: []Entry{{2, 1, []byte("survives"), 0}}}}}
+	w := Wave{ID: waveID(2), Batches: []ReadyBatch{{GroupID: 1, Entries: []Entry{{Index: 2, Term: 1, Data: []byte("survives")}}}}}
 	injected := errors.New("sync outcome unknown")
 	e.syncData = func(*os.File) error { return injected }
 	if err = e.PersistWave(w); !errors.Is(err, injected) {
@@ -269,7 +273,7 @@ func TestOutcomeUnknownRecoveryAndWaveIDConflict(t *testing.T) {
 	if writes != 0 || syncs != 0 {
 		t.Fatalf("retry writes=%d syncs=%d", writes, syncs)
 	}
-	conflict := Wave{ID: w.ID, Batches: []ReadyBatch{{GroupID: 1, ReplaceFrom: 2, Entries: []Entry{{2, 2, []byte("different"), 0}}}}}
+	conflict := Wave{ID: w.ID, Batches: []ReadyBatch{{GroupID: 1, ReplaceFrom: 2, Entries: []Entry{{Index: 2, Term: 2, Data: []byte("different")}}}}}
 	if err = e.PersistWave(conflict); !errors.Is(err, ErrWaveConflict) {
 		t.Fatalf("conflict=%v", err)
 	}
@@ -426,5 +430,378 @@ func TestPersistWaveSteadyStateZeroAlloc(t *testing.T) {
 	}
 	if allocs != 0 {
 		t.Fatalf("steady PersistWave allocations=%v want=0", allocs)
+	}
+}
+
+func TestEngineRecoversEveryRotationPhase(t *testing.T) {
+	injected := errors.New("rotation crash")
+	for _, phase := range []RotationPhase{RotationSealedSynced, RotationSealedRenamed, RotationNextPublished, RotationManifestPublished} {
+		t.Run(phase.String(), func(t *testing.T) {
+			dir := t.TempDir()
+			e, err := CreateEngine(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = e.Reserve(4096, 64, 16); err != nil {
+				t.Fatal(err)
+			}
+			if err = e.ReserveGroup(1, 16); err != nil {
+				t.Fatal(err)
+			}
+			if err = e.PersistWave(Wave{ID: waveID(1), Batches: []ReadyBatch{{GroupID: 1, Entries: []Entry{{Index: 1, Term: 1, Data: []byte("one")}}}}}); err != nil {
+				t.Fatal(err)
+			}
+			err = e.Rotate(func(got RotationPhase) error {
+				if got == phase {
+					return injected
+				}
+				return nil
+			})
+			if !errors.Is(err, injected) {
+				t.Fatalf("Rotate=%v", err)
+			}
+			_ = e.Close()
+			e, err = OpenEngine(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer e.Close()
+			if e.log.manifest.DurableOffset != segmentHeaderBytes {
+				t.Fatalf("pending marker=%d", e.log.manifest.DurableOffset)
+			}
+			state, ok := e.Group(1)
+			if !ok || len(state.Entries) != 1 || state.Entries[0].Index != 1 {
+				t.Fatalf("state=%+v, %v", state, ok)
+			}
+			if err = e.Reserve(4096, 64, 16); err != nil {
+				t.Fatal(err)
+			}
+			if err = e.ReserveGroup(1, 16); err != nil {
+				t.Fatal(err)
+			}
+			if err = e.PersistWave(Wave{ID: waveID(2), Batches: []ReadyBatch{{GroupID: 1, Entries: []Entry{{Index: 2, Term: 1, Data: []byte("two")}}}}}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func (phase RotationPhase) String() string {
+	switch phase {
+	case RotationSealedSynced:
+		return "sealed-synced"
+	case RotationSealedRenamed:
+		return "sealed-renamed"
+	case RotationNextPublished:
+		return "next-published"
+	case RotationManifestPublished:
+		return "manifest-published"
+	default:
+		return "unknown"
+	}
+}
+
+func TestEnginePendingSealSuffixCuts(t *testing.T) {
+	source := t.TempDir()
+	e, err := CreateEngine(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = e.Reserve(4096, 64, 16); err != nil {
+		t.Fatal(err)
+	}
+	if err = e.ReserveGroup(1, 16); err != nil {
+		t.Fatal(err)
+	}
+	if err = e.PersistWave(Wave{ID: waveID(1), Batches: []ReadyBatch{{GroupID: 1, Entries: []Entry{{Index: 1, Term: 1, Data: []byte("payload")}}}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err = e.log.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	dataBytes := e.log.manifest.DurableOffset
+	indexBytes, err := marshalSegmentIndex(e.log.events, dataBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sum [32]byte
+	copy(sum[:], e.log.activeHash.Sum(nil))
+	footer := marshalSegmentFooter(segmentFooter{ID: 1, Generation: 1, Records: e.log.records, DataBytes: dataBytes, Hash: sum, IndexOffset: dataBytes, IndexBytes: uint64(len(indexBytes)), Events: uint64(len(e.log.events))})
+	suffix := append(indexBytes, footer...)
+	if err = e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := os.ReadFile(filepath.Join(source, ManifestName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	active, err := os.ReadFile(filepath.Join(source, activeName(1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for cut := 0; cut <= len(suffix); cut++ {
+		dir := filepath.Join(t.TempDir(), "cut")
+		if err = os.Mkdir(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err = os.WriteFile(filepath.Join(dir, ManifestName), manifest, 0o640); err != nil {
+			t.Fatal(err)
+		}
+		candidate := append(bytes.Clone(active), suffix[:cut]...)
+		if err = os.WriteFile(filepath.Join(dir, activeName(1)), candidate, 0o640); err != nil {
+			t.Fatal(err)
+		}
+		recovered, openErr := openEngine(dir, func(*os.File) error { return nil })
+		if openErr != nil {
+			t.Fatalf("cut %d/%d: %v", cut, len(suffix), openErr)
+		}
+		state, ok := recovered.Group(1)
+		if !ok || len(state.Entries) != 1 || recovered.log.activeOffset != dataBytes || recovered.log.manifest.DurableOffset != segmentHeaderBytes {
+			t.Fatalf("cut %d state=%+v ok=%v off=%d marker=%d", cut, state, ok, recovered.log.activeOffset, recovered.log.manifest.DurableOffset)
+		}
+		_ = recovered.Close()
+	}
+}
+
+func TestEntryTypesRoundTripAndCompactCost(t *testing.T) {
+	dir := t.TempDir()
+	e, err := CreateEngine(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = e.Reserve(4096, 64, 16); err != nil {
+		t.Fatal(err)
+	}
+	if err = e.ReserveGroup(1, 16); err != nil {
+		t.Fatal(err)
+	}
+	normal := Wave{ID: waveID(1), Batches: []ReadyBatch{{GroupID: 1, Entries: []Entry{{Index: 1, Term: 1, Data: []byte("n")}}}}}
+	normalFrame, _, _, err := e.prepareWave(normal, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conf := Wave{ID: waveID(2), Batches: []ReadyBatch{{GroupID: 1, Entries: []Entry{{Index: 1, Term: 1, Type: pb.EntryConfChange, Data: []byte("n")}}}}}
+	confFrame, _, _, err := e.prepareWave(conf, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(confFrame) != len(normalFrame)+1 {
+		t.Fatalf("config entry overhead=%d want=1", len(confFrame)-len(normalFrame))
+	}
+	entries := []Entry{{Index: 1, Term: 1, Type: pb.EntryNormal, Data: []byte("n")}, {Index: 2, Term: 1, Type: pb.EntryConfChange, Data: []byte("c1")}, {Index: 3, Term: 1, Type: pb.EntryConfChangeV2, Data: []byte("c2")}}
+	if err = e.PersistWave(Wave{ID: waveID(3), Batches: []ReadyBatch{{GroupID: 1, Entries: entries}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err = e.Rotate(nil); err != nil {
+		t.Fatal(err)
+	}
+	if err = e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	e, err = OpenEngine(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	state, _ := e.Group(1)
+	for i, want := range []pb.EntryType{pb.EntryNormal, pb.EntryConfChange, pb.EntryConfChangeV2} {
+		if state.Entries[i].Type != want {
+			t.Fatalf("entry %d type=%v want=%v", i, state.Entries[i].Type, want)
+		}
+	}
+}
+
+func TestEntryTypeMalformedRejected(t *testing.T) {
+	e := newReservedEngine(t, 1)
+	writes := 0
+	e.writeAt = func(*os.File, []byte, int64) (int, error) { writes++; return 0, nil }
+	err := e.PersistWave(Wave{ID: waveID(1), Batches: []ReadyBatch{{GroupID: 1, Entries: []Entry{{Index: 1, Term: 1, Type: pb.EntryType(99)}}}}})
+	if !errors.Is(err, ErrRaftState) || writes != 0 {
+		t.Fatalf("PersistWave=%v writes=%d", err, writes)
+	}
+	valid := Wave{ID: waveID(2), Batches: []ReadyBatch{{GroupID: 1, Entries: []Entry{{Index: 1, Term: 1, Type: pb.EntryConfChange, Data: []byte("x")}}}}}
+	frame, _, _, err := e.prepareWave(valid, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	malformed := bytes.Clone(frame)
+	malformed[78] = 3 // batch-count, group, flags, count, index, term, then type.
+	digest := sha256.Sum256(malformed[72:])
+	copy(malformed[40:72], digest[:])
+	sealWaveHeader(malformed, 1, valid.ID)
+	if _, _, _, err = decodeWaveFrame(malformed, 1); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("decode malformed type=%v", err)
+	}
+}
+
+func TestEngineDeepVerifyMatchesCanonicalSealedIndex(t *testing.T) {
+	dir := t.TempDir()
+	e, err := CreateEngine(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = e.Reserve(4096, 64, 16); err != nil {
+		t.Fatal(err)
+	}
+	if err = e.ReserveGroup(1, 16); err != nil {
+		t.Fatal(err)
+	}
+	if err = e.PersistWave(Wave{ID: waveID(1), Batches: []ReadyBatch{{GroupID: 1, Entries: []Entry{{Index: 1, Term: 1, Data: []byte("payload")}}}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err = e.Rotate(nil); err != nil {
+		t.Fatal(err)
+	}
+	if err = e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	manifestBytes, err := os.ReadFile(filepath.Join(dir, ManifestName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := unmarshalManifest(manifestBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, sealedName(1))
+	_, footer, events, err := readSealedMetadata(path, manifest.LogID, 0, [32]byte{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed := false
+	for i := range events {
+		if _, ok := typeForEventKind(events[i].Kind); ok {
+			events[i].Offset--
+			changed = true
+			break
+		}
+	}
+	if !changed {
+		t.Fatal("missing entry event")
+	}
+	encoded, err := marshalSegmentIndex(events, footer.DataBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uint64(len(encoded)) != footer.IndexBytes {
+		t.Fatalf("index size changed: %d != %d", len(encoded), footer.IndexBytes)
+	}
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.WriteAt(encoded, int64(footer.IndexOffset)); err != nil {
+		t.Fatal(err)
+	}
+	if err = f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	e, err = OpenEngine(dir)
+	if err != nil {
+		t.Fatalf("metadata Open=%v", err)
+	}
+	defer e.Close()
+	if err = e.DeepVerify(); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("DeepVerify=%v", err)
+	}
+}
+
+func TestEngineDeepVerifyChecksFooterFrameCount(t *testing.T) {
+	dir := t.TempDir()
+	e, err := CreateEngine(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = e.Reserve(4096, 64, 16); err != nil {
+		t.Fatal(err)
+	}
+	if err = e.ReserveGroup(1, 16); err != nil {
+		t.Fatal(err)
+	}
+	if err = e.PersistWave(Wave{ID: waveID(1), Batches: []ReadyBatch{{GroupID: 1, Entries: []Entry{{Index: 1, Term: 1}}}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err = e.Rotate(nil); err != nil {
+		t.Fatal(err)
+	}
+	if err = e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := filepath.Join(dir, ManifestName)
+	manifestBytes, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := unmarshalManifest(manifestBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, sealedName(1))
+	_, footer, _, err := readSealedMetadata(path, manifest.LogID, 0, [32]byte{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	footer.Records++
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.WriteAt(marshalSegmentFooter(footer), stat.Size()-segmentFooterBytes); err != nil {
+		t.Fatal(err)
+	}
+	if err = f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	manifest.Segments[0].Records++
+	manifestBytes, err = marshalManifest(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(manifestPath, manifestBytes, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	e, err = OpenEngine(dir)
+	if err != nil {
+		t.Fatalf("metadata Open=%v", err)
+	}
+	defer e.Close()
+	if err = e.DeepVerify(); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("DeepVerify=%v", err)
+	}
+}
+
+func TestWaveVerifierEnforcesCrossFrameSequence(t *testing.T) {
+	e := newReservedEngine(t, 1)
+	if err := e.PersistWave(Wave{ID: waveID(1), Batches: []ReadyBatch{{GroupID: 1, Entries: []Entry{{Index: 1, Term: 1}}}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.PersistWave(Wave{ID: waveID(2), Batches: []ReadyBatch{{GroupID: 1, Entries: []Entry{{Index: 2, Term: 1}}}}}); err != nil {
+		t.Fatal(err)
+	}
+	firstHeader := make([]byte, recordHeaderBytes)
+	if _, err := e.log.active.ReadAt(firstHeader, segmentHeaderBytes); err != nil {
+		t.Fatal(err)
+	}
+	firstBytes, err := inspectWaveHeader(firstHeader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondOffset := int64(segmentHeaderBytes + firstBytes)
+	secondHeader := make([]byte, recordHeaderBytes)
+	if _, err = e.log.active.ReadAt(secondHeader, secondOffset); err != nil {
+		t.Fatal(err)
+	}
+	binary.LittleEndian.PutUint64(secondHeader[8:16], 3)
+	binary.LittleEndian.PutUint32(secondHeader[36:40], crc32.Checksum(secondHeader[:36], crcTable))
+	if _, err = e.log.active.WriteAt(secondHeader, secondOffset); err != nil {
+		t.Fatal(err)
+	}
+	verifier := &Engine{groups: make(map[uint64]*engineGroup), waves: make(map[WaveID][32]byte)}
+	if _, _, err = verifyWaveFrames(e.log.active, e.log.activeOffset, 1, verifier); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("verify=%v", err)
 	}
 }

@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+
+	pb "go.etcd.io/raft/v3/raftpb"
 )
 
 var (
@@ -23,6 +25,7 @@ type WaveID [16]byte
 
 type Entry struct {
 	Index, Term uint64
+	Type        pb.EntryType
 	Data        []byte
 	dataOffset  uint64
 }
@@ -44,7 +47,10 @@ type Wave struct {
 	Batches []ReadyBatch
 }
 
-type EntryLocation struct{ SegmentID, Offset, Bytes, Index, Term uint64 }
+type EntryLocation struct {
+	SegmentID, Offset, Bytes, Index, Term uint64
+	Type                                  pb.EntryType
+}
 type GroupState struct {
 	Hard                        HardState
 	TruncateIndex, TruncateTerm uint64
@@ -205,7 +211,7 @@ func (e *Engine) PersistWave(w Wave) error {
 	e.log.activeOffset += uint64(n)
 	e.log.records++
 	for i := range events {
-		if events[i].Kind == eventWaveEntry {
+		if _, ok := typeForEventKind(events[i].Kind); ok {
 			events[i].Offset += offset
 		}
 	}
@@ -291,6 +297,9 @@ func (e *Engine) prepareWave(w Wave, validateState bool) ([]byte, [32]byte, []se
 		for _, entry := range batch.Entries {
 			e.frameBuf = appendUvarint(e.frameBuf, entry.Index)
 			e.frameBuf = appendUvarint(e.frameBuf, entry.Term)
+			if flags&batchTypes != 0 {
+				e.frameBuf = appendUvarint(e.frameBuf, uint64(entry.Type))
+			}
 			e.frameBuf = appendUvarint(e.frameBuf, uint64(len(entry.Data)))
 			dataOffset := uint64(len(e.frameBuf))
 			e.frameBuf = append(e.frameBuf, entry.Data...)
@@ -298,7 +307,7 @@ func (e *Engine) prepareWave(w Wave, validateState bool) ([]byte, [32]byte, []se
 				return nil, [32]byte{}, nil, ErrBounds
 			}
 			if validateState {
-				e.eventScratch = append(e.eventScratch, segmentEvent{Kind: eventWaveEntry, GroupID: batch.GroupID, Index: entry.Index, Term: entry.Term, Offset: dataOffset, Bytes: uint64(len(entry.Data))})
+				e.eventScratch = append(e.eventScratch, segmentEvent{Kind: eventKindForType(entry.Type), GroupID: batch.GroupID, Index: entry.Index, Term: entry.Term, Offset: dataOffset, Bytes: uint64(len(entry.Data))})
 			}
 		}
 		if validateState && batch.TruncateIndex != 0 {
@@ -350,12 +359,16 @@ func waveSize(w Wave) (int, int, error) {
 			bytes += uvarintBytes(b.Hard.Term) + uvarintBytes(b.Hard.Vote) + uvarintBytes(b.Hard.Commit)
 			events++
 		}
+		hasTypes := batchFlags(b)&batchTypes != 0
 		for j := range b.Entries {
 			entry := &b.Entries[j]
 			if len(entry.Data) > maxRecordBytes || bytes > maxRecordBytes-len(entry.Data) {
 				return 0, 0, ErrBounds
 			}
 			bytes += uvarintBytes(entry.Index) + uvarintBytes(entry.Term) + uvarintBytes(uint64(len(entry.Data))) + len(entry.Data)
+			if hasTypes {
+				bytes += uvarintBytes(uint64(entry.Type))
+			}
 			events++
 		}
 		previousGroup = b.GroupID
@@ -380,6 +393,7 @@ const (
 	batchPrefix     = 1 << 1
 	batchCheckpoint = 1 << 2
 	batchHard       = 1 << 3
+	batchTypes      = 1 << 4
 )
 
 func batchFlags(b *ReadyBatch) byte {
@@ -396,7 +410,41 @@ func batchFlags(b *ReadyBatch) byte {
 	if b.Hard != nil {
 		flags |= batchHard
 	}
+	for i := range b.Entries {
+		if b.Entries[i].Type != pb.EntryNormal {
+			flags |= batchTypes
+			break
+		}
+	}
 	return flags
+}
+
+func validEntryType(kind pb.EntryType) bool {
+	return kind == pb.EntryNormal || kind == pb.EntryConfChange || kind == pb.EntryConfChangeV2
+}
+
+func eventKindForType(kind pb.EntryType) uint16 {
+	switch kind {
+	case pb.EntryConfChange:
+		return eventWaveEntryConf
+	case pb.EntryConfChangeV2:
+		return eventWaveEntryConfV2
+	default:
+		return eventWaveEntry
+	}
+}
+
+func typeForEventKind(kind uint16) (pb.EntryType, bool) {
+	switch kind {
+	case eventWaveEntry:
+		return pb.EntryNormal, true
+	case eventWaveEntryConf:
+		return pb.EntryConfChange, true
+	case eventWaveEntryConfV2:
+		return pb.EntryConfChangeV2, true
+	default:
+		return 0, false
+	}
 }
 
 func validateBatch(g *engineGroup, b *ReadyBatch) (byte, error) {
@@ -416,7 +464,7 @@ func validateBatch(g *engineGroup, b *ReadyBatch) (byte, error) {
 			return 0, ErrRaftState
 		}
 		for i, entry := range b.Entries {
-			if entry.Index != first+uint64(i) || entry.Term == 0 {
+			if entry.Index != first+uint64(i) || entry.Term == 0 || !validEntryType(entry.Type) {
 				return 0, ErrRaftState
 			}
 		}
@@ -542,11 +590,15 @@ func (e *Engine) applyEvent(event segmentEvent, segmentID uint64) error {
 		}
 		cut := sort.Search(len(g.Entries), func(i int) bool { return g.Entries[i].Index >= event.Index })
 		g.Entries = slices.Delete(g.Entries, cut, len(g.Entries))
-	case eventWaveEntry:
+	case eventWaveEntry, eventWaveEntryConf, eventWaveEntryConfV2:
 		if event.Index != durableLast(g)+1 || event.Term == 0 {
 			return ErrRaftState
 		}
-		g.Entries = append(g.Entries, EntryLocation{SegmentID: segmentID, Offset: event.Offset, Bytes: event.Bytes, Index: event.Index, Term: event.Term})
+		entryType, ok := typeForEventKind(event.Kind)
+		if !ok {
+			return ErrCorrupt
+		}
+		g.Entries = append(g.Entries, EntryLocation{SegmentID: segmentID, Offset: event.Offset, Bytes: event.Bytes, Index: event.Index, Term: event.Term, Type: entryType})
 	case eventPrefix:
 		if event.Index < g.TruncateIndex || event.Index > durableLast(g) || termAt(g, nil, event.Index) != event.Term {
 			return ErrRaftState
@@ -634,10 +686,19 @@ func (e *Engine) rebuild() error {
 		return err
 	}
 	end := uint64(stat.Size())
+	sealMarker := e.log.manifest.DurableOffset
+	scanEnd := end
+	pendingSeal := sealMarker > segmentHeaderBytes
+	if pendingSeal {
+		if sealMarker > end {
+			return ErrCorrupt
+		}
+		scanEnd = sealMarker
+	}
 	off := uint64(segmentHeaderBytes)
 	frameHeader := make([]byte, recordHeaderBytes)
-	for off < end {
-		remaining := end - off
+	for off < scanEnd {
+		remaining := scanEnd - off
 		if remaining < recordHeaderBytes {
 			break
 		}
@@ -673,6 +734,9 @@ func (e *Engine) rebuild() error {
 		e.log.records++
 		off += total
 	}
+	if pendingSeal && off != scanEnd {
+		return ErrCorrupt
+	}
 	if off != end {
 		if err = e.log.active.Truncate(int64(off)); err != nil {
 			return err
@@ -683,6 +747,15 @@ func (e *Engine) rebuild() error {
 	// durable startup boundary (also persisting any torn-tail truncation).
 	if err = e.syncData(e.log.active); err != nil {
 		return err
+	}
+	if pendingSeal {
+		next := e.log.manifest
+		next.Generation++
+		next.DurableOffset = segmentHeaderBytes
+		if err = e.log.publish(next); err != nil {
+			return err
+		}
+		e.log.manifest = next
 	}
 	e.log.activeOffset = off
 	e.log.activeHash = sha256.New()
@@ -724,7 +797,7 @@ func decodeWaveFrame(frame []byte, expectedSequence uint64) (WaveID, [32]byte, [
 	}
 	cursor := canonicalCursor{data: frame[72:]}
 	count, err := cursor.uvarint()
-	if err != nil || count == 0 {
+	if err != nil || count == 0 || count > uint64(len(cursor.data)-cursor.off)/3 {
 		return id, digest, nil, ErrCorrupt
 	}
 	batches := make([]ReadyBatch, 0, count)
@@ -739,7 +812,7 @@ func decodeWaveFrame(frame []byte, expectedSequence uint64) (WaveID, [32]byte, [
 			return id, digest, nil, ErrCorrupt
 		}
 		flags, err := cursor.byte()
-		if err != nil || flags & ^byte(batchReplace|batchPrefix|batchCheckpoint|batchHard) != 0 {
+		if err != nil || flags & ^byte(batchReplace|batchPrefix|batchCheckpoint|batchHard|batchTypes) != 0 {
 			return id, digest, nil, ErrCorrupt
 		}
 		batch := ReadyBatch{GroupID: group}
@@ -793,7 +866,11 @@ func decodeWaveFrame(frame []byte, expectedSequence uint64) (WaveID, [32]byte, [
 			batch.Hard = &hard
 		}
 		entryCount, err := cursor.uvarint()
-		if err != nil || entryCount > uint64(len(cursor.data)-cursor.off)/3+1 {
+		minimumEntryBytes := uint64(3)
+		if flags&batchTypes != 0 {
+			minimumEntryBytes++
+		}
+		if err != nil || entryCount > uint64(len(cursor.data)-cursor.off)/minimumEntryBytes {
 			return id, digest, nil, ErrCorrupt
 		}
 		batch.Entries = make([]Entry, 0, entryCount)
@@ -805,6 +882,16 @@ func decodeWaveFrame(frame []byte, expectedSequence uint64) (WaveID, [32]byte, [
 			}
 			entry.Term, err = cursor.uvarint()
 			if err != nil {
+				return id, digest, nil, ErrCorrupt
+			}
+			if flags&batchTypes != 0 {
+				entryType, typeErr := cursor.uvarint()
+				if typeErr != nil || entryType > uint64(pb.EntryConfChangeV2) {
+					return id, digest, nil, ErrCorrupt
+				}
+				entry.Type = pb.EntryType(entryType)
+			}
+			if !validEntryType(entry.Type) {
 				return id, digest, nil, ErrCorrupt
 			}
 			size, readErr := cursor.uvarint()
@@ -844,7 +931,7 @@ func (e *Engine) eventsForDecoded(batches []ReadyBatch, frameOffset, sequence ui
 			events = append(events, segmentEvent{Kind: RecordTruncateSuffix, GroupID: batch.GroupID, Index: batch.ReplaceFrom, Term: predecessorTerm(g, batch.ReplaceFrom)})
 		}
 		for _, entry := range batch.Entries {
-			events = append(events, segmentEvent{Kind: eventWaveEntry, GroupID: batch.GroupID, Index: entry.Index, Term: entry.Term, Offset: frameOffset + entry.dataOffset, Bytes: uint64(len(entry.Data))})
+			events = append(events, segmentEvent{Kind: eventKindForType(entry.Type), GroupID: batch.GroupID, Index: entry.Index, Term: entry.Term, Offset: frameOffset + entry.dataOffset, Bytes: uint64(len(entry.Data))})
 		}
 		if batch.TruncateIndex != 0 {
 			events = append(events, segmentEvent{Kind: eventPrefix, GroupID: batch.GroupID, Index: batch.TruncateIndex, Term: batch.TruncateTerm})
@@ -861,10 +948,14 @@ func (e *Engine) eventsForDecoded(batches []ReadyBatch, frameOffset, sequence ui
 }
 
 func (e *Engine) DeepVerify() error {
+	if err := e.log.usable(); err != nil {
+		return err
+	}
+	verifier := &Engine{groups: make(map[uint64]*engineGroup), waves: make(map[WaveID][32]byte)}
 	previousID, previousHash := e.log.manifest.AnchorID, e.log.manifest.AnchorHash
 	for _, want := range e.log.manifest.Segments {
 		path := filepath.Join(e.log.dir, sealedName(want.ID))
-		got, footer, _, err := readSealedMetadata(path, e.log.manifest.LogID, previousID, previousHash)
+		got, footer, indexed, err := readSealedMetadata(path, e.log.manifest.LogID, previousID, previousHash)
 		if err != nil {
 			return err
 		}
@@ -879,33 +970,13 @@ func (e *Engine) DeepVerify() error {
 		if err == nil && sum != footer.Hash {
 			err = ErrCorrupt
 		}
+		var scanned []segmentEvent
+		var records uint64
 		if err == nil {
-			off := uint64(segmentHeaderBytes)
-			header := make([]byte, recordHeaderBytes)
-			for off < footer.DataBytes {
-				if footer.DataBytes-off < recordHeaderBytes {
-					err = ErrCorrupt
-					break
-				}
-				if _, err = f.ReadAt(header, int64(off)); err != nil {
-					break
-				}
-				total, inspectErr := inspectWaveHeader(header)
-				if inspectErr != nil || total > footer.DataBytes-off {
-					err = ErrCorrupt
-					break
-				}
-				frame := make([]byte, total)
-				copy(frame, header)
-				if _, err = f.ReadAt(frame[recordHeaderBytes:], int64(off+recordHeaderBytes)); err != nil {
-					break
-				}
-				if _, _, _, inspectErr = decodeWaveFrame(frame, binary.LittleEndian.Uint64(header[8:16])); inspectErr != nil {
-					err = inspectErr
-					break
-				}
-				off += total
-			}
+			scanned, records, err = verifyWaveFrames(f, footer.DataBytes, want.ID, verifier)
+		}
+		if err == nil && (records != footer.Records || uint64(len(scanned)) != footer.Events || !slices.Equal(canonicalEventOrder(scanned), indexed)) {
+			err = ErrCorrupt
 		}
 		closeErr := f.Close()
 		if err != nil {
@@ -916,5 +987,64 @@ func (e *Engine) DeepVerify() error {
 		}
 		previousID, previousHash = want.ID, want.Hash
 	}
+	activeEvents, records, err := verifyWaveFrames(e.log.active, e.log.activeOffset, e.log.manifest.ActiveID, verifier)
+	if err != nil {
+		return err
+	}
+	if records != e.log.records || !slices.Equal(canonicalEventOrder(activeEvents), canonicalEventOrder(e.log.events)) || verifier.sequence != e.sequence {
+		return ErrCorrupt
+	}
+	sum, err := hashPrefix(e.log.active, e.log.activeOffset)
+	if err != nil {
+		return err
+	}
+	wantDigest := e.log.activeHash.Sum(nil)
+	if !slices.Equal(sum[:], wantDigest) {
+		return ErrCorrupt
+	}
 	return nil
+}
+
+func verifyWaveFrames(file *os.File, end, segmentID uint64, verifier *Engine) ([]segmentEvent, uint64, error) {
+	off := uint64(segmentHeaderBytes)
+	header := make([]byte, recordHeaderBytes)
+	var events []segmentEvent
+	var records uint64
+	for off < end {
+		if end-off < recordHeaderBytes {
+			return nil, 0, ErrCorrupt
+		}
+		if _, err := file.ReadAt(header, int64(off)); err != nil {
+			return nil, 0, err
+		}
+		total, err := inspectWaveHeader(header)
+		if err != nil || total > end-off {
+			return nil, 0, ErrCorrupt
+		}
+		frame := make([]byte, total)
+		copy(frame, header)
+		if _, err = file.ReadAt(frame[recordHeaderBytes:], int64(off+recordHeaderBytes)); err != nil {
+			return nil, 0, err
+		}
+		id, digest, batches, err := decodeWaveFrame(frame, verifier.sequence+1)
+		if err != nil {
+			return nil, 0, err
+		}
+		decoded, err := verifier.eventsForDecoded(batches, off, verifier.sequence+1, id, digest)
+		if err != nil {
+			return nil, 0, err
+		}
+		for _, event := range decoded {
+			if err = verifier.applyEvent(event, segmentID); err != nil {
+				return nil, 0, err
+			}
+		}
+		events = append(events, decoded...)
+		records++
+		off += total
+	}
+	if off != end {
+		return nil, 0, ErrCorrupt
+	}
+	return events, records, nil
 }

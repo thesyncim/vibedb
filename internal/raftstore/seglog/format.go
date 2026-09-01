@@ -24,6 +24,8 @@ const (
 	eventCheckpoint      uint16 = 6
 	eventWave            uint16 = 7
 	eventWaveEntry       uint16 = 8
+	eventWaveEntryConf   uint16 = 9
+	eventWaveEntryConfV2 uint16 = 10
 
 	manifestHeaderBytes     = 128
 	manifestSegmentBytes    = 112
@@ -347,11 +349,11 @@ func marshalSegmentIndex(events []segmentEvent, dataBytes uint64) ([]byte, error
 		for _, event := range ordered[first:last] {
 			b = append(b, byte(event.Kind))
 			switch event.Kind {
-			case RecordEntry, eventWaveEntry:
+			case RecordEntry, eventWaveEntry, eventWaveEntryConf, eventWaveEntryConfV2:
 				b = appendUvarint(b, event.Index)
 				b = appendUvarint(b, event.Term)
 				minimum := uint64(recordHeaderBytes)
-				if event.Kind == eventWaveEntry {
+				if event.Kind == eventWaveEntry || event.Kind == eventWaveEntryConf || event.Kind == eventWaveEntryConfV2 {
 					minimum = 0
 				}
 				if event.Offset <= previousOffset || event.Bytes < minimum || event.Offset > dataBytes || event.Bytes > dataBytes-event.Offset {
@@ -429,12 +431,12 @@ func unmarshalSegmentIndex(b []byte, dataBytes, eventCount uint64) ([]segmentEve
 		previousOffset := uint64(0)
 		for range count {
 			tag, err := cursor.byte()
-			if err != nil || tag < byte(RecordEntry) || tag > byte(eventWaveEntry) || tag == byte(RecordWave) {
+			if err != nil || tag < byte(RecordEntry) || tag > byte(eventWaveEntryConfV2) || tag == byte(RecordWave) {
 				return nil, fmt.Errorf("%w: event kind", ErrCorrupt)
 			}
 			event := segmentEvent{Kind: uint16(tag), GroupID: group}
 			switch event.Kind {
-			case RecordEntry, eventWaveEntry:
+			case RecordEntry, eventWaveEntry, eventWaveEntryConf, eventWaveEntryConfV2:
 				event.Index, err = cursor.uvarint()
 				if err != nil || event.Index == 0 {
 					return nil, fmt.Errorf("%w: event index", ErrCorrupt)
@@ -450,7 +452,7 @@ func unmarshalSegmentIndex(b []byte, dataBytes, eventCount uint64) ([]segmentEve
 				event.Offset = previousOffset + delta
 				event.Bytes, err = cursor.uvarint()
 				minimum := uint64(recordHeaderBytes)
-				if event.Kind == eventWaveEntry {
+				if event.Kind == eventWaveEntry || event.Kind == eventWaveEntryConf || event.Kind == eventWaveEntryConfV2 {
 					minimum = 0
 				}
 				if err != nil || event.Bytes < minimum || event.Offset < segmentHeaderBytes || event.Offset > dataBytes || event.Bytes > dataBytes-event.Offset {
