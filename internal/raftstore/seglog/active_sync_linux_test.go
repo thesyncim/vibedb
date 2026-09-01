@@ -10,7 +10,7 @@ import (
 // This complements the high-run-count codec/write allocation gate by keeping
 // the real Linux fdatasync syscall in the measured operation.
 func TestPersistWaveRealFdatasyncZeroAlloc(t *testing.T) {
-	e, err := CreateEngine(t.TempDir())
+	e, err := CreateEngineAuthenticated(t.TempDir(), [16]byte{1}, [32]byte{2}, 32<<20)
 	if err != nil {
 		t.Fatal(err)
 	}

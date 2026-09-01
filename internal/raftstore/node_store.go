@@ -2,6 +2,7 @@ package raftstore
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
@@ -21,7 +22,7 @@ import (
 )
 
 const (
-	nodeMetaName        = "NODEMETA.v1"
+	nodeMetaName        = "NODEMETA"
 	nodeLockName        = "LOCK"
 	nodeLogDir          = "log"
 	nodeCheckpointDir   = "checkpoints"
@@ -172,20 +173,19 @@ func CreateNodeStore(dir string, identity Identity, key Key, bootstraps []NodeBo
 		_ = lock.Close()
 		return nil, err
 	}
-	engine, err := seglog.CreateEngine(filepath.Join(dir, nodeLogDir))
+	var logID [16]byte
+	if _, err = rand.Read(logID[:]); err != nil || logID == ([16]byte{}) {
+		_ = lock.Close()
+		return nil, errors.Join(ErrInvalid, err)
+	}
+	cryptoState, err := makeFileCrypto(key, logID)
 	if err != nil {
 		_ = lock.Close()
 		return nil, err
 	}
-	cryptoState, err := makeFileCrypto(key, engine.LogID())
+	authKey := deriveFileSecret(key.Material, logID, "seglog-auth-key")
+	engine, err := seglog.CreateEngineAuthenticated(filepath.Join(dir, nodeLogDir), logID, authKey, uint64(normalized.maxFileBytes))
 	if err != nil {
-		_ = engine.Close()
-		_ = lock.Close()
-		return nil, err
-	}
-	authKey := deriveFileSecret(key.Material, engine.LogID(), "seglog-auth-key")
-	if err = engine.SetAuthenticationKey(authKey); err != nil {
-		_ = engine.Close()
 		_ = lock.Close()
 		return nil, err
 	}
@@ -258,7 +258,7 @@ func OpenNodeStore(dir string, expected Identity, key Key, options NodeStoreOpti
 		return fail(nil, err)
 	}
 	authKey := deriveFileSecret(key.Material, logID, "seglog-auth-key")
-	engine, err := seglog.OpenEngineAuthenticated(filepath.Join(dir, nodeLogDir), authKey)
+	engine, err := seglog.OpenEngineAuthenticated(filepath.Join(dir, nodeLogDir), logID, authKey)
 	if err != nil {
 		return fail(nil, err)
 	}

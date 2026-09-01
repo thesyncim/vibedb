@@ -16,7 +16,7 @@ type pendingRouteBlock struct {
 	entries                   uint32
 }
 
-func readUnpublishedSealed(path string, logID [16]byte, previousID uint64, previousHash, key [32]byte) (SegmentMeta, segmentFooter, error) {
+func readUnpublishedSealed(path string, fileID fileID, capacity uint64, logID [16]byte, previousID uint64, previousHash, key [32]byte) (SegmentMeta, segmentFooter, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return SegmentMeta{}, segmentFooter{}, err
@@ -39,19 +39,19 @@ func readUnpublishedSealed(path string, logID [16]byte, previousID uint64, previ
 	if err != nil {
 		return SegmentMeta{}, segmentFooter{}, err
 	}
-	want := SegmentMeta{ID: header.ID, Generation: header.Generation, Bytes: uint64(stat.Size()), Records: footer.Records, IndexOffset: footer.IndexOffset, IndexBytes: footer.IndexBytes, PreviousHash: header.PreviousHash, Hash: footer.Hash, State: SegmentSealed}
-	if _, _, _, _, err = readSealedSealedMetadata(file, want, logID, previousID, previousHash, key); err != nil {
+	want := SegmentMeta{ID: header.ID, Generation: header.Generation, Bytes: uint64(stat.Size()), Records: footer.Records, IndexOffset: footer.IndexOffset, IndexBytes: footer.IndexBytes, PreviousHash: header.PreviousHash, Hash: footer.Hash, FileID: fileID, State: SegmentSealed}
+	if _, _, _, _, err = readSealedSealedMetadata(file, want, capacity, logID, previousID, previousHash, key); err != nil {
 		return SegmentMeta{}, segmentFooter{}, err
 	}
 	return want, footer, nil
 }
 
-func readSealedSealedMetadata(file *os.File, want SegmentMeta, logID [16]byte, previousID uint64, previousHash, key [32]byte) (segmentFooter, sealedIndexHeader, []sealedGroupRun, uint64, error) {
+func readSealedSealedMetadata(file *os.File, want SegmentMeta, capacity uint64, logID [16]byte, previousID uint64, previousHash, key [32]byte) (segmentFooter, sealedIndexHeader, []sealedGroupRun, uint64, error) {
 	stat, err := file.Stat()
 	if err != nil {
 		return segmentFooter{}, sealedIndexHeader{}, nil, 0, err
 	}
-	if stat.Size() < segmentHeaderBytes+sealedIndexHeaderBytes+segmentFooterBytes || uint64(stat.Size()) != want.Bytes {
+	if stat.Size() < segmentHeaderBytes+sealedIndexHeaderBytes+segmentFooterBytes || uint64(stat.Size()) > capacity || want.Bytes > capacity || uint64(stat.Size()) != want.Bytes {
 		return segmentFooter{}, sealedIndexHeader{}, nil, 0, ErrCorrupt
 	}
 	var headerBytes [segmentHeaderBytes]byte
@@ -59,7 +59,7 @@ func readSealedSealedMetadata(file *os.File, want SegmentMeta, logID [16]byte, p
 		return segmentFooter{}, sealedIndexHeader{}, nil, 0, err
 	}
 	segment, err := unmarshalSegmentHeader(headerBytes[:])
-	if err != nil || segment.ID != want.ID || segment.Generation != want.Generation || segment.LogID != logID || segment.PreviousID != previousID || segment.PreviousHash != previousHash {
+	if err != nil || segment.ID != want.ID || segment.Generation != want.Generation || segment.LogID != logID || segment.FileID != want.FileID || segment.Capacity != capacity || segment.PreviousID != previousID || segment.PreviousHash != previousHash {
 		return segmentFooter{}, sealedIndexHeader{}, nil, 0, ErrCorrupt
 	}
 	var footerBytes [segmentFooterBytes]byte
@@ -67,7 +67,7 @@ func readSealedSealedMetadata(file *os.File, want SegmentMeta, logID [16]byte, p
 		return segmentFooter{}, sealedIndexHeader{}, nil, 0, err
 	}
 	footer, err := unmarshalSegmentFooter(footerBytes[:])
-	if err != nil || footer.ID != segment.ID || footer.Generation != segment.Generation || footer.IndexOffset != footer.DataBytes || footer.IndexBytes != want.IndexBytes || footer.IndexOffset+footer.IndexBytes+segmentFooterBytes != uint64(stat.Size()) || footer.Hash != want.Hash {
+	if err != nil || footer.ID != segment.ID || footer.Generation != segment.Generation || footer.Records != want.Records || footer.IndexOffset != footer.DataBytes || footer.IndexBytes != want.IndexBytes || footer.IndexOffset+footer.IndexBytes+segmentFooterBytes != uint64(stat.Size()) || footer.Hash != want.Hash {
 		return segmentFooter{}, sealedIndexHeader{}, nil, 0, ErrCorrupt
 	}
 	var indexHeaderBytes [sealedIndexHeaderBytes]byte
@@ -90,11 +90,15 @@ func readSealedSealedMetadata(file *os.File, want SegmentMeta, logID [16]byte, p
 	if footer.Auth != segmentSealedMetadataMAC(key, segment, top, footer) {
 		return segmentFooter{}, sealedIndexHeader{}, nil, 0, fmt.Errorf("%w: sealed top authentication", ErrCorrupt)
 	}
-	runs, err := decodeRunDirectory(directory, uint64(indexHeader.Runs))
+	runs, err := decodeSealedDirectory(directory, indexHeader)
 	if err != nil {
 		return segmentFooter{}, sealedIndexHeader{}, nil, 0, err
 	}
 	totalDescriptors := uint64(indexHeader.DescriptorBytes / sealedRouteDescriptorBytes)
+	if footer.Records > indexHeader.LastSequence {
+		return segmentFooter{}, sealedIndexHeader{}, nil, 0, ErrCorrupt
+	}
+	firstSequence := indexHeader.LastSequence - footer.Records + 1
 	for i := range runs {
 		run := &runs[i]
 		baseOrdinal := run.DescriptorOrdinal
@@ -108,6 +112,9 @@ func readSealedSealedMetadata(file *os.File, want SegmentMeta, logID [16]byte, p
 			return segmentFooter{}, sealedIndexHeader{}, nil, 0, ErrCorrupt
 		}
 		if (run.Summary.LastIndex == 0) != (run.Summary.LastTerm == 0) || (run.Summary.TruncateIndex == 0) != (run.Summary.TruncateTerm == 0) {
+			return segmentFooter{}, sealedIndexHeader{}, nil, 0, ErrCorrupt
+		}
+		if run.Summary.LatestWaveID != (WaveID{}) && (footer.Records == 0 || run.Summary.LatestWaveSequence < firstSequence || run.Summary.LatestWaveSequence > indexHeader.LastSequence) {
 			return segmentFooter{}, sealedIndexHeader{}, nil, 0, ErrCorrupt
 		}
 	}
@@ -157,12 +164,32 @@ func (e *Engine) applySealedRun(group *engineGroup, segment SegmentMeta, header 
 		}
 		group.NodeIncarnation, group.ReadyID, group.ReadyDigest, group.ReadyWaveID = summary.NodeIncarnation, summary.ReadyID, summary.ReadyDigest, summary.ReadyWaveID
 	}
+	if summary.LatestWaveID != (WaveID{}) {
+		if summary.LatestWaveSequence > header.LastSequence || summary.LatestWaveDigest == ([32]byte{}) {
+			return ErrCorrupt
+		}
+		if group.latestWaveID == summary.LatestWaveID && (group.latestWaveDigest != summary.LatestWaveDigest || group.latestWaveSequence != summary.LatestWaveSequence) {
+			return ErrCorrupt
+		}
+		if group.latestWaveID != summary.LatestWaveID {
+			e.releaseWaveReference(group.latestWaveID)
+			state := e.waves[summary.LatestWaveID]
+			if state.digest != ([32]byte{}) && (state.digest != summary.LatestWaveDigest || state.sequence != summary.LatestWaveSequence) {
+				return ErrCorrupt
+			}
+			state.digest, state.sequence, state.refs = summary.LatestWaveDigest, summary.LatestWaveSequence, state.refs+1
+			e.waves[summary.LatestWaveID] = state
+		}
+		group.latestWaveID, group.latestWaveDigest, group.latestWaveSequence = summary.LatestWaveID, summary.LatestWaveDigest, summary.LatestWaveSequence
+	} else if group.latestWaveID != (WaveID{}) || group.latestWaveDigest != ([32]byte{}) || group.latestWaveSequence != 0 {
+		return ErrCorrupt
+	}
 	group.lastIndex, group.lastTerm = summary.LastIndex, summary.LastTerm
 	return nil
 }
 
 func verifySealedRuns(file *os.File, segment SegmentMeta, header sealedIndexHeader, runs []sealedGroupRun, verifier *Engine, key [32]byte) error {
-	router, err := newLazyRouteReader(file, key, verifier.log.manifest.LogID, segment.ID, 0, true)
+	router, err := newLazyRouteReader(file, key, verifier.log.state.LogID, segment.ID, 0, true)
 	if err != nil {
 		return err
 	}
@@ -180,7 +207,7 @@ func verifySealedRuns(file *os.File, segment SegmentMeta, header sealedIndexHead
 				return err
 			}
 		}
-		wantSummary := sealedRunSummary{LastIndex: last, LastTerm: lastTerm, Hard: group.Hard, TruncateIndex: group.TruncateIndex, TruncateTerm: group.TruncateTerm, Checkpoint: group.Checkpoint, NodeIncarnation: group.NodeIncarnation, ReadyID: group.ReadyID, ReadyDigest: group.ReadyDigest, ReadyWaveID: group.ReadyWaveID}
+		wantSummary := sealedRunSummary{LastIndex: last, LastTerm: lastTerm, Hard: group.Hard, TruncateIndex: group.TruncateIndex, TruncateTerm: group.TruncateTerm, Checkpoint: group.Checkpoint, NodeIncarnation: group.NodeIncarnation, ReadyID: group.ReadyID, ReadyDigest: group.ReadyDigest, ReadyWaveID: group.ReadyWaveID, LatestWaveID: group.latestWaveID, LatestWaveDigest: group.latestWaveDigest, LatestWaveSequence: group.latestWaveSequence}
 		if run.Summary != wantSummary {
 			return ErrCorrupt
 		}
@@ -247,12 +274,12 @@ func (e *Engine) marshalEngineSealedIndex(dataBytes uint64) ([]byte, int, error)
 					return nil, 0, termErr
 				}
 			}
-			summary = sealedRunSummary{LastIndex: lastIndex, LastTerm: lastTerm, Hard: group.Hard, TruncateIndex: group.TruncateIndex, TruncateTerm: group.TruncateTerm, Checkpoint: group.Checkpoint, NodeIncarnation: group.NodeIncarnation, ReadyID: group.ReadyID, ReadyDigest: group.ReadyDigest, ReadyWaveID: group.ReadyWaveID}
+			summary = sealedRunSummary{LastIndex: lastIndex, LastTerm: lastTerm, Hard: group.Hard, TruncateIndex: group.TruncateIndex, TruncateTerm: group.TruncateTerm, Checkpoint: group.Checkpoint, NodeIncarnation: group.NodeIncarnation, ReadyID: group.ReadyID, ReadyDigest: group.ReadyDigest, ReadyWaveID: group.ReadyWaveID, LatestWaveID: group.latestWaveID, LatestWaveDigest: group.latestWaveDigest, LatestWaveSequence: group.latestWaveSequence}
 		}
 		run := sealedGroupRun{GroupID: groupID, BlockEntries: sealedDefaultBlockEntries, DescriptorOrdinal: descriptorBase, Summary: summary}
-		first := sort.Search(len(group.Entries), func(i int) bool { return group.Entries[i].SegmentID >= e.log.manifest.ActiveID })
+		first := sort.Search(len(group.Entries), func(i int) bool { return group.Entries[i].SegmentID >= e.log.state.ActiveID })
 		for i := first; i < len(group.Entries); i++ {
-			if group.Entries[i].SegmentID != e.log.manifest.ActiveID {
+			if group.Entries[i].SegmentID != e.log.state.ActiveID {
 				return nil, 0, ErrCorrupt
 			}
 		}
@@ -308,7 +335,7 @@ func (e *Engine) marshalEngineSealedIndex(dataBytes uint64) ([]byte, int, error)
 		descriptorBase += uint64(run.DescriptorCount)
 		runs = append(runs, run)
 	}
-	directory, err := appendRunDirectory(nil, runs)
+	directory, retryBytes, retryCount, err := appendSealedDirectory(nil, runs)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -321,7 +348,7 @@ func (e *Engine) marshalEngineSealedIndex(dataBytes uint64) ([]byte, int, error)
 	if total > sealedMaxSegmentBytes || dataBytes+total+segmentFooterBytes > sealedMaxSegmentBytes {
 		return nil, 0, ErrBounds
 	}
-	header := sealedIndexHeader{TotalBytes: uint32(total), Runs: uint32(len(runs)), DirectoryBytes: uint32(len(directory)), DescriptorOffset: uint32(sealedIndexHeaderBytes + len(directory)), DescriptorBytes: uint32(descriptorBytes), RoutePayloadOffset: uint32(uint64(sealedIndexHeaderBytes+len(directory)) + descriptorBytes), RoutePayloadBytes: uint32(routeBytes), DataBytes: uint32(dataBytes), LastSequence: e.sequence}
+	header := sealedIndexHeader{TotalBytes: uint32(total), Runs: uint32(len(runs)), DirectoryBytes: uint32(len(directory)), DescriptorOffset: uint32(sealedIndexHeaderBytes + len(directory)), DescriptorBytes: uint32(descriptorBytes), RoutePayloadOffset: uint32(uint64(sealedIndexHeaderBytes+len(directory)) + descriptorBytes), RoutePayloadBytes: uint32(routeBytes), DataBytes: uint32(dataBytes), LastSequence: e.sequence, RetryBytes: retryBytes, RetryCount: retryCount}
 	headerBytes, err := marshalSealedIndexHeader(header)
 	if err != nil {
 		return nil, 0, err
@@ -334,7 +361,7 @@ func (e *Engine) marshalEngineSealedIndex(dataBytes uint64) ([]byte, int, error)
 		block := &blocks[i]
 		payloadOffset := dataBytes + routeCursor
 		descriptor := routeDescriptor{PayloadOffset: uint32(payloadOffset), PayloadBytes: uint32(len(block.payload)), Entries: block.entries, ExtentOffset: uint32(block.extentOffset), ExtentBytes: uint32(block.extentBytes)}
-		if _, err = marshalRouteDescriptor(index[descriptorCursor:descriptorCursor+sealedRouteDescriptorBytes], descriptor, e.authKey, e.log.manifest.LogID, e.log.manifest.ActiveID, block.groupID, block.ordinal, block.payload); err != nil {
+		if _, err = marshalRouteDescriptor(index[descriptorCursor:descriptorCursor+sealedRouteDescriptorBytes], descriptor, e.authKey, e.log.state.LogID, e.log.state.ActiveID, block.groupID, block.ordinal, block.payload); err != nil {
 			return nil, 0, err
 		}
 		copy(index[routeCursor:], block.payload)
