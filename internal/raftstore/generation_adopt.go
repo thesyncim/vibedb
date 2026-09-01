@@ -2,9 +2,9 @@ package raftstore
 
 import (
 	"errors"
+	"fmt"
 
 	"github.com/thesyncim/vibedb/internal/storeio"
-	"google.golang.org/protobuf/proto"
 )
 
 // AdoptSelectedGeneration replaces only the frozen source's file/recovery
@@ -75,6 +75,15 @@ func (store *Store) AdoptSelectedGeneration() error {
 		return errors.Join(storeio.UnlockWriter(selected.file), selected.file.Close())
 	}
 	seal := selected.generation.seal
+	// A freshly reopened source deliberately forgets commit-only Ready
+	// notifications.  The selected generation may nevertheless carry the exact
+	// checkpoint commit certified by its snapshot/retention witness.  Adoption
+	// remains fenced until CommitGenerationSelection revalidates that SQL owner.
+	durableCommit := max(store.current.hard.GetCommit(), store.image.hard.GetCommit())
+	durableCommit = max(durableCommit, seal.baseIndex)
+	hardCompatible := selected.current.hard.GetTerm() == store.current.hard.GetTerm() &&
+		selected.current.hard.GetVote() == store.current.hard.GetVote() &&
+		selected.current.hard.GetCommit() <= durableCommit
 	if selected.recoveredTornSlot || !selected.activationPending ||
 		seal.sourceHeaderDigest != store.header.headerDigest ||
 		seal.sourceCurrentGeneration != store.current.generation ||
@@ -83,8 +92,18 @@ func (store *Store) AdoptSelectedGeneration() error {
 		seal.sourceReadyID != generationReadyFloor(store.current, store.generation) ||
 		seal.sourceFirst != store.current.first || seal.sourceLast != store.current.last ||
 		selected.current.currentIncarnation != store.current.currentIncarnation ||
-		selected.image.last != store.image.last || !proto.Equal(selected.current.hard, store.current.hard) {
-		return errors.Join(ErrGenerationSource, releaseSelected())
+		selected.image.last != store.image.last || !hardCompatible {
+		return errors.Join(fmt.Errorf(
+			"%w: selected/live cut generation=%d/%d end=%d/%d records=%d/%d incarnation=%d/%d ready=%d/%d bounds=[%d,%d]/[%d,%d] image-last=%d/%d hard=%v/%v",
+			ErrGenerationSource,
+			seal.sourceCurrentGeneration, store.current.generation,
+			seal.sourceWALEnd, store.current.walEnd,
+			seal.sourceRecordSequence, store.current.recordSequence,
+			seal.sourceCurrentIncarnation, store.current.currentIncarnation,
+			seal.sourceReadyID, generationReadyFloor(store.current, store.generation),
+			seal.sourceFirst, seal.sourceLast, store.current.first, store.current.last,
+			selected.image.last, store.image.last, selected.current.hard, store.current.hard,
+		), releaseSelected())
 	}
 	// Re-prove the still-locked source after candidate recovery. No uncertain
 	// namespace or pending mutation is transplanted into the live owner.

@@ -1,6 +1,6 @@
 module github.com/thesyncim/vibedb/integration/pgclient
 
-go 1.26
+go 1.27
 
 require (
 	github.com/jackc/pgx/v5 v5.10.0

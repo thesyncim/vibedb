@@ -524,7 +524,7 @@ func servePreparedRF3WithExecutionLanes(
 	}
 	for index := range preparedSet.groups {
 		item := &preparedSet.groups[index]
-		runtime, adoptErr := raftmember.AdoptPipelinedRuntime(item.wal, item.database, item.apply)
+		runtime, adoptErr := raftmember.AdoptRuntime(item.wal, item.database, item.apply)
 		if adoptErr != nil {
 			remaining := preparedSet.groups[index:]
 			if runtime != nil {
@@ -1515,8 +1515,16 @@ func rejectRF3UnappliedMembership(wal *raftstore.Store, applied uint64) error {
 	if err != nil {
 		return err
 	}
-	if commit < applied || commit == ^uint64(0) {
+	if commit == ^uint64(0) {
 		return fmt.Errorf("%w: durable commit is inconsistent with applied state", errRF3Serving)
+	}
+	// The SQL publication is itself a durable certificate for every applied
+	// entry. The pipelined writer may therefore leave a commit-only HardState
+	// behind that publication; raftmodel raises the recovery commit floor to
+	// applied when it constructs the node. There is no unapplied suffix to
+	// inspect in that case.
+	if commit <= applied {
+		return nil
 	}
 	for next := applied + 1; next <= commit; {
 		entries, err := wal.Entries(next, commit+1, 16<<20)

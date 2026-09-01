@@ -97,6 +97,103 @@ func TestGenerationLiveAdoptionPreservesOwnerReadyAndIncarnation(t *testing.T) {
 	}
 }
 
+func TestGenerationLiveAdoptionCarriesPublicationBackedCommitFloor(t *testing.T) {
+	_, source, _ := createTestStore(t)
+	defer source.Close()
+	incarnation, err := source.BeginIncarnation()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = source.Persist(raftmodel.PersistBatch{
+		NodeIncarnation: incarnation, ReadyID: 1, HardState: hard(2, 1),
+		Entries: []*pb.Entry{entry(2, 2, "durable")}, MustSync: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err = source.Persist(raftmodel.PersistBatch{
+		NodeIncarnation: incarnation, ReadyID: 2, HardState: hard(2, 2),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if source.current.hard.GetCommit() != 1 || source.image.hard.GetCommit() != 2 {
+		t.Fatalf("source commit coordinates current=%d image=%d, want 1/2",
+			source.current.hard.GetCommit(), source.image.hard.GetCommit())
+	}
+	builder, err := source.PrepareGeneration(testGenerationInput(
+		testGenerationSnapshot(2, 2, "publication-backed"),
+	), testKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer builder.Close()
+	candidate, err := builder.Build()
+	if err != nil || candidate.Info.HardCommit != 2 || builder.seal.hard.GetCommit() != 2 {
+		t.Fatalf("candidate commit=%d seal=%d err=%v, want 2",
+			candidate.Info.HardCommit, builder.seal.hard.GetCommit(), err)
+	}
+	if _, err = source.PublishGenerationSelection(builder); err != nil {
+		t.Fatal(err)
+	}
+	if err = source.AdoptSelectedGeneration(); err != nil {
+		t.Fatal(err)
+	}
+	if err = source.CommitGenerationSelection(&testGenerationActivationSettler{}); err != nil {
+		t.Fatal(err)
+	}
+	hardState, _, err := source.InitialState()
+	if err != nil || hardState.GetCommit() != 2 {
+		t.Fatalf("adopted commit=%d err=%v, want 2", hardState.GetCommit(), err)
+	}
+}
+
+func TestPrepareGenerationAcceptsExactPublicationCommitAfterRestart(t *testing.T) {
+	path, source, options := createTestStore(t)
+	incarnation, err := source.BeginIncarnation()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = source.Persist(raftmodel.PersistBatch{
+		NodeIncarnation: incarnation, ReadyID: 1, HardState: hard(2, 1),
+		Entries: []*pb.Entry{entry(2, 2, "durable")}, MustSync: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err = source.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path, testIdentity(), testBootstrap().TopologyRecoveryEpoch, testKey(), options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if _, err = reopened.BeginIncarnation(); err != nil {
+		t.Fatal(err)
+	}
+	input := testGenerationInput(testGenerationSnapshot(2, 2, "publication-backed-restart"))
+	input.PublicationCommit = 2
+	builder, err := reopened.PrepareGeneration(input, testKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer builder.Close()
+	if _, err = builder.Build(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = reopened.PublishGenerationSelection(builder); err != nil {
+		t.Fatal(err)
+	}
+	if err = reopened.AdoptSelectedGeneration(); err != nil {
+		t.Fatal(err)
+	}
+	if err = reopened.CommitGenerationSelection(&testGenerationActivationSettler{}); err != nil {
+		t.Fatal(err)
+	}
+	hardState, _, err := reopened.InitialState()
+	if err != nil || hardState.GetCommit() != 2 {
+		t.Fatalf("adopted publication commit=%d err=%v, want 2", hardState.GetCommit(), err)
+	}
+}
+
 func TestGenerationSourceReadyCursorIsAuthenticated(t *testing.T) {
 	_, source, _, builder := prepareGenerationSource(t)
 	defer source.Close()

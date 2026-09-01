@@ -324,11 +324,20 @@ func decodeServeParams(cursor vibejson.DecodeCursor, scratch *serveRequestDecode
 			case 0:
 				var value []byte
 				cursor, value, fieldErr = decodeServeText(cursor, scratch)
-				if fieldErr != nil || !setServeParamKind(&parameter, value) {
+				if fieldErr != nil {
 					return cursor, errInvalidServeRequest
 				}
+				parameter.wireKind, parameter.Kind = serveParamKindValue(value)
 			case 1:
-				fieldErr = cursor.Bool(&parameter.Bool)
+				var raw vibejson.RawValue
+				raw, fieldErr = cursor.Raw()
+				if fieldErr == nil {
+					var valid bool
+					parameter.Bool, valid = raw.Bool()
+					if !valid && !raw.IsNull() {
+						fieldErr = errInvalidServeRequest
+					}
+				}
 			case 2:
 				cursor, parameter.wireText, fieldErr = decodeServeText(cursor, scratch)
 			}
@@ -400,25 +409,23 @@ func setServeOperation(request *serveRequest, value []byte) bool {
 	return true
 }
 
-func setServeParamKind(parameter *serveParam, value []byte) bool {
+func serveParamKindValue(value []byte) (serveParamKind, string) {
 	// Generic envelope fields have last-value-wins semantics. A duplicate
 	// unknown kind must clear an earlier recognized enum before buildParams.
-	parameter.wireKind = 0
 	switch string(value) {
 	case "null":
-		parameter.wireKind, parameter.Kind = serveParamNull, "null"
+		return serveParamNull, "null"
 	case "bool":
-		parameter.wireKind, parameter.Kind = serveParamBool, "bool"
+		return serveParamBool, "bool"
 	case "number":
-		parameter.wireKind, parameter.Kind = serveParamNumber, "number"
+		return serveParamNumber, "number"
 	case "string":
-		parameter.wireKind, parameter.Kind = serveParamString, "string"
+		return serveParamString, "string"
 	case "document":
-		parameter.wireKind, parameter.Kind = serveParamDocument, "document"
+		return serveParamDocument, "document"
 	default:
-		parameter.Kind = serveBorrowedString(value)
+		return 0, serveBorrowedString(value)
 	}
-	return true
 }
 
 func (scratch *serveRequestDecodeScratch) reserveMetadata(bytes int) bool {

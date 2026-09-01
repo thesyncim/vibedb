@@ -455,11 +455,10 @@ func parseClientFirst(msg string) (clientFirst, error) {
 // would leave the client sending "y" while the server believed it had never
 // offered channel binding, and comparing the two is how the mismatch surfaces.
 func parseClientFinal(msg, expectedNonce, gs2Header string) (proof []byte, withoutProof string, err error) {
-	cut := strings.LastIndex(msg, ",p=")
-	if cut < 0 || cut+3 == len(msg) {
+	withoutProof, encodedProof, ok := strings.CutLast(msg, ",p=")
+	if !ok || encodedProof == "" {
 		return nil, "", malformedSCRAM()
 	}
-	withoutProof = msg[:cut]
 
 	attrs := scramAttributeScanner{text: withoutProof}
 	name, binding, scanErr := attrs.next()
@@ -509,7 +508,7 @@ func parseClientFinal(msg, expectedNonce, gs2Header string) (proof []byte, witho
 		case 'm':
 			return nil, "", unsupportedSCRAMMandatoryExtension()
 		case 'p':
-			// LastIndex above locates the real final proof, so seeing another
+			// CutLast above locates the real final proof, so seeing another
 			// proof here means the client sent it outside its designated slot.
 			return nil, "", malformedSCRAM()
 		default:
@@ -521,7 +520,7 @@ func parseClientFinal(msg, expectedNonce, gs2Header string) (proof []byte, witho
 		}
 	}
 
-	proof, decodeErr := base64.StdEncoding.Strict().DecodeString(msg[cut+3:])
+	proof, decodeErr := base64.StdEncoding.Strict().DecodeString(encodedProof)
 	if decodeErr != nil || len(proof) == 0 {
 		return nil, "", malformedSCRAM()
 	}

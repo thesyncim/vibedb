@@ -106,23 +106,25 @@ func TestThreeRealHostsTransferLeaderThroughAuthenticatedTransportAndContinueApp
 }
 
 type realTransferCluster struct {
-	t                   *testing.T
-	hosts               []*Host
-	registries          []*rafttransport.StaticRegistry
-	memberIndex         map[uint64]int
-	inactive            map[int]bool
-	duplicateTimeoutNow bool
-	timeoutNowSeen      bool
-	duplicateRejected   bool
-	pendingDuplicate    int
-	syncAuthority       bool
-	group               raftmember.GroupKey
-	promotionTarget     uint64
-	pausePromotion      bool
-	promotionPaused     bool
-	promotionVoteSeen   bool
-	holdTargetUntilVote bool
-	suppressTargetTicks bool
+	t                          *testing.T
+	hosts                      []*Host
+	registries                 []*rafttransport.StaticRegistry
+	memberIndex                map[uint64]int
+	inactive                   map[int]bool
+	duplicateTimeoutNow        bool
+	timeoutNowSeen             bool
+	duplicateRejected          bool
+	pendingDuplicate           int
+	syncAuthority              bool
+	group                      raftmember.GroupKey
+	promotionTarget            uint64
+	pausePromotion             bool
+	promotionPaused            bool
+	promotionVoteSeen          bool
+	holdTargetUntilVote        bool
+	holdPromotionTarget        bool
+	dropPromotionTargetTraffic bool
+	suppressTargetTicks        bool
 }
 
 func (cluster *realTransferCluster) driveUntil(done func() bool) {
@@ -190,7 +192,11 @@ func (cluster *realTransferCluster) driveRound(step int) bool {
 			!cluster.promotionVoteSeen {
 			continue
 		}
-		_, consumed, err := host.RunOne()
+		if cluster.holdPromotionTarget &&
+			index == cluster.memberIndex[cluster.promotionTarget] {
+			continue
+		}
+		progress, consumed, err := host.RunOne()
 		if err != nil {
 			if cluster.pendingDuplicate != 0 && index == 1 && strings.Contains(err.Error(), "leader-transfer") {
 				cluster.pendingDuplicate--
@@ -200,6 +206,11 @@ func (cluster *realTransferCluster) driveRound(step int) bool {
 			}
 		}
 		progressed = progressed || consumed
+		// Stop on the exact persisted Ready boundary, before registry
+		// publication, outbound routing, or a later RunOne can apply the entry.
+		if consumed && cluster.pauseAtPersistedPromotion(index, host, progress) {
+			continue
+		}
 		if cluster.syncAuthority && consumed {
 			publication, publishErr := host.Publication(cluster.group)
 			if publishErr != nil {
@@ -221,18 +232,6 @@ func (cluster *realTransferCluster) driveRound(step int) bool {
 						cluster.group, proof); proofErr != nil {
 						cluster.t.Fatal(proofErr)
 					}
-					if cluster.pausePromotion && index == cluster.memberIndex[cluster.promotionTarget] {
-						status, statusErr := host.Status(cluster.group)
-						publication, publicationErr := host.Publication(cluster.group)
-						if statusErr != nil || publicationErr != nil {
-							cluster.t.Fatal(errors.Join(statusErr, publicationErr))
-						}
-						if status.Commit >= proof.Version && publication.ReplicaSetVersion < proof.Version {
-							cluster.pausePromotion = false
-							cluster.promotionPaused = true
-							cluster.inactive[index] = true
-						}
-					}
 				} else if proofErr = cluster.registries[index].ClearDurablePromotion(
 					cluster.group); proofErr != nil {
 					cluster.t.Fatal(proofErr)
@@ -249,6 +248,32 @@ func (cluster *realTransferCluster) driveRound(step int) bool {
 		}
 	}
 	return progressed
+}
+
+func (cluster *realTransferCluster) pauseAtPersistedPromotion(
+	index int,
+	host *Host,
+	progress Progress,
+) bool {
+	cluster.t.Helper()
+	if !cluster.pausePromotion || cluster.promotionTarget == 0 ||
+		index != cluster.memberIndex[cluster.promotionTarget] ||
+		progress.Kind != ProgressReady || progress.ReadyKind != raftmember.DrivePersisted {
+		return false
+	}
+	status, statusErr := host.Status(cluster.group)
+	publication, publicationErr := host.Publication(cluster.group)
+	if statusErr != nil || publicationErr != nil {
+		cluster.t.Fatal(errors.Join(statusErr, publicationErr))
+	}
+	if status.Commit <= status.Applied || status.Commit <= publication.Applied ||
+		status.Commit <= publication.ReplicaSetVersion {
+		return false
+	}
+	cluster.pausePromotion = false
+	cluster.promotionPaused = true
+	cluster.inactive[index] = true
+	return true
 }
 
 // driveUntilWithLeaderTicks advances an exact condition across protocol-idle
@@ -410,6 +435,9 @@ func (cluster *realTransferCluster) diagnostic() string {
 
 func (cluster *realTransferCluster) route(senderIndex int, outbound raftmember.OutboundMessage) {
 	cluster.t.Helper()
+	if cluster.dropPromotionTargetTraffic && outbound.To == cluster.promotionTarget {
+		return
+	}
 	receiverIndex, ok := cluster.memberIndex[outbound.To]
 	if !ok {
 		cluster.t.Fatalf("unknown outbound destination %d", outbound.To)

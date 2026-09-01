@@ -298,11 +298,11 @@ func testTLSConfigs(t *testing.T) (*tls.Config, *tls.Config) {
 	roots := x509.NewCertPool()
 	roots.AddCert(certificate)
 	return &tls.Config{
-			Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}},
-			MinVersion:   tls.VersionTLS12,
-		}, &tls.Config{
-			RootCAs:    roots,
-			ServerName: "localhost",
-			MinVersion: tls.VersionTLS12,
-		}
+		Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}},
+		MinVersion:   tls.VersionTLS12,
+	}, &tls.Config{
+		RootCAs:    roots,
+		ServerName: "localhost",
+		MinVersion: tls.VersionTLS12,
+	}
 }

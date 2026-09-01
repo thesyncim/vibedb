@@ -176,6 +176,13 @@ func runServingSplitController(
 			logf("gateway: split controller advanced %d/%d operation(s), completed %d",
 				pass.Triggered, pass.Discovered, pass.Completed)
 		}
+		// A successful pass durably advances at most one step per operation. Run
+		// the next bounded step immediately while there is proven progress; the
+		// configured interval is the idle/error retry cadence, not an artificial
+		// delay between already-authorized topology actions.
+		if err == nil && pass.Triggered != 0 {
+			continue
+		}
 		select {
 		case <-ctx.Done():
 			return

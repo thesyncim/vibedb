@@ -7,7 +7,6 @@ import (
 	"os"
 
 	pb "go.etcd.io/raft/v3/raftpb"
-	"google.golang.org/protobuf/proto"
 )
 
 // GenerationActivation is detached recovery evidence for one selected but not
@@ -503,7 +502,9 @@ func (store *Store) validateRetiringSourceLocked(state familyState) error {
 	if current.first != seal.sourceFirst || current.last != seal.sourceLast {
 		return fmt.Errorf("%w: retiring source bounds", ErrGenerationSource)
 	}
-	if !proto.Equal(current.hard, seal.hard) {
+	if current.hard.GetTerm() != seal.hard.GetTerm() ||
+		current.hard.GetVote() != seal.hard.GetVote() ||
+		current.hard.GetCommit() > seal.hard.GetCommit() {
 		return fmt.Errorf("%w: retiring source HardState", ErrGenerationSource)
 	}
 	return nil

@@ -56,7 +56,7 @@ func provePinnedNamedFile(
 
 func rawFstatat(directory int, pathNUL string, stat *unix.Stat_t, flags int) error {
 	_, _, errno := unix.Syscall6(
-		unix.SYS_NEWFSTATAT,
+		rawFstatatTrap,
 		uintptr(directory),
 		uintptr(unsafe.Pointer(unsafe.StringData(pathNUL))),
 		uintptr(unsafe.Pointer(stat)),

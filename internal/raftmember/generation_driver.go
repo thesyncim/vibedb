@@ -4,6 +4,7 @@ import (
 	"errors"
 	"sync"
 
+	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
@@ -162,6 +163,9 @@ func (runtime *Runtime) tickWALGeneration() {
 }
 
 func (runtime *Runtime) prepareWALGenerationBuild(driver *walGenerationDriver) error {
+	if !runtime.walGenerationQuiescent() {
+		return nil
+	}
 	_, err := runtime.WALRetentionInput()
 	if err != nil {
 		return err
@@ -239,6 +243,9 @@ func (runtime *Runtime) publishBuiltWALGeneration(
 		return ErrWALUnavailable
 	}
 	closeBuilder := func() error { return result.builder.Close() }
+	if !runtime.walGenerationQuiescent() {
+		return errors.Join(raftstore.ErrGenerationSource, closeBuilder())
+	}
 	checkpoint, err := runtime.WALRetentionInput()
 	if err != nil || checkpoint != result.checkpoint {
 		return errors.Join(err, closeBuilder())
@@ -263,6 +270,16 @@ func (runtime *Runtime) publishBuiltWALGeneration(
 		return errors.Join(adoptErr, closeErr)
 	}
 	return errors.Join(runtime.commitWALGeneration(driver), closeErr)
+}
+
+func (runtime *Runtime) walGenerationQuiescent() bool {
+	if runtime == nil || runtime.node == nil ||
+		runtime.node.Phase() != raftmodel.PhaseIdle ||
+		(runtime.pipelined != nil && !runtime.pipelined.quiescent()) {
+		return false
+	}
+	ready, err := runtime.node.HasReady()
+	return err == nil && !ready
 }
 
 func (runtime *Runtime) commitWALGeneration(driver *walGenerationDriver) error {

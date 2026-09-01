@@ -351,7 +351,7 @@ func (s *ReplicatedChildStage) activate(
 				Limits:     replicatedStateCollectionLimits(identity.SystemLimits),
 			},
 			User: replicatedstate.UserCollection{
-				Name: s.base.UserTable,
+				Name:         s.base.UserTable,
 				LocalIndexes: replicatedApplyLocalIndexes(s.table),
 				Target: replicatedstate.CollectionTarget{
 					Collection:       s.table.collection,

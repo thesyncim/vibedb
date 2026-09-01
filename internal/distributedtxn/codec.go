@@ -194,8 +194,8 @@ type CoordinatorRecord struct {
 	CatalogGeneration uint64
 	// RecoveryDeadline is the legacy field name for the bounded logical pulse
 	// limit. It is never a Unix timestamp and is interpreted only as 1..3.
-	RecoveryDeadline  int64
-	Participants      []ParticipantRef
+	RecoveryDeadline int64
+	Participants     []ParticipantRef
 }
 
 // Coordinator record layout: 48-byte fixed header, packed participant entries,
