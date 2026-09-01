@@ -25,7 +25,7 @@ func (l *Log) reconcileRotation() error {
 	// A missing manifest-selected active is recoverable only when that exact
 	// segment has a complete sealed header/footer/index publication. This is the
 	// rename-before-manifest crash state; payload scrubbing remains explicit.
-	meta, footer, _, err := readSealedMetadata(filepath.Join(l.dir, sealedName(l.manifest.ActiveID)), l.manifest.LogID, l.expectedPreviousID(), l.expectedPreviousHash())
+	meta, footer, _, err := readSealedMetadataAuthenticated(filepath.Join(l.dir, sealedName(l.manifest.ActiveID)), l.manifest.LogID, l.expectedPreviousID(), l.expectedPreviousHash(), l.authKey)
 	if err != nil {
 		return fmt.Errorf("%w: selected active missing: %v", ErrCorrupt, err)
 	}
@@ -97,7 +97,7 @@ func (l *Log) rebuild() error {
 	}
 	previousID, previousHash := l.manifest.AnchorID, l.manifest.AnchorHash
 	for _, want := range l.manifest.Segments {
-		got, _, events, err := readSealedMetadata(filepath.Join(l.dir, sealedName(want.ID)), l.manifest.LogID, previousID, previousHash)
+		got, _, events, err := readSealedMetadataAuthenticated(filepath.Join(l.dir, sealedName(want.ID)), l.manifest.LogID, previousID, previousHash, l.authKey)
 		if err != nil {
 			return err
 		}
@@ -249,6 +249,10 @@ func (l *Log) applyEvent(event segmentEvent, segmentID uint64) error {
 }
 
 func readSealedMetadata(path string, logID [16]byte, previousID uint64, previousHash [32]byte) (SegmentMeta, segmentFooter, []segmentEvent, error) {
+	return readSealedMetadataAuthenticated(path, logID, previousID, previousHash, [32]byte{})
+}
+
+func readSealedMetadataAuthenticated(path string, logID [16]byte, previousID uint64, previousHash, authKey [32]byte) (SegmentMeta, segmentFooter, []segmentEvent, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return SegmentMeta{}, segmentFooter{}, nil, err
@@ -281,12 +285,15 @@ func readSealedMetadata(path string, logID [16]byte, previousID uint64, previous
 		return SegmentMeta{}, segmentFooter{}, nil, err
 	}
 	fileBytes := uint64(st.Size())
-	if footer.ID != h.ID || footer.Generation != h.Generation || footer.PreviousHash != h.PreviousHash || footer.IndexOffset > fileBytes-segmentFooterBytes || footer.IndexBytes != fileBytes-segmentFooterBytes-footer.IndexOffset {
+	if footer.ID != h.ID || footer.Generation != h.Generation || footer.IndexOffset > fileBytes-segmentFooterBytes || footer.IndexBytes != fileBytes-segmentFooterBytes-footer.IndexOffset {
 		return SegmentMeta{}, segmentFooter{}, nil, fmt.Errorf("%w: footer/header identity", ErrCorrupt)
 	}
 	indexBytes := make([]byte, footer.IndexBytes)
 	if _, err = f.ReadAt(indexBytes, int64(footer.IndexOffset)); err != nil {
 		return SegmentMeta{}, segmentFooter{}, nil, err
+	}
+	if authKey != ([32]byte{}) && footer.Auth != segmentMetadataMAC(authKey, h, indexBytes, footer) {
+		return SegmentMeta{}, segmentFooter{}, nil, fmt.Errorf("%w: sealed metadata authentication", ErrCorrupt)
 	}
 	events, err := unmarshalSegmentIndex(indexBytes, footer.DataBytes, footer.Events)
 	if err != nil {
@@ -303,7 +310,7 @@ func (l *Log) DeepVerify() error {
 	previousID, previousHash := l.manifest.AnchorID, l.manifest.AnchorHash
 	for _, want := range l.manifest.Segments {
 		path := filepath.Join(l.dir, sealedName(want.ID))
-		got, footer, indexed, err := readSealedMetadata(path, l.manifest.LogID, previousID, previousHash)
+		got, footer, indexed, err := readSealedMetadataAuthenticated(path, l.manifest.LogID, previousID, previousHash, l.authKey)
 		if err != nil {
 			return err
 		}

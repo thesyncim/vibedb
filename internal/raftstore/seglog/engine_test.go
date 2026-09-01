@@ -805,3 +805,230 @@ func TestWaveVerifierEnforcesCrossFrameSequence(t *testing.T) {
 		t.Fatalf("verify=%v", err)
 	}
 }
+
+func TestReadyIdentityAndSharedBatchBlobRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	e, err := CreateEngine(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = e.Reserve(4096, 64, 16); err != nil {
+		t.Fatal(err)
+	}
+	if err = e.ReserveGroup(7, 16); err != nil {
+		t.Fatal(err)
+	}
+	blob := []byte("ciphertext-and-tag")
+	digest := [16]byte{4}
+	w := Wave{ID: waveID(9), Batches: []ReadyBatch{{GroupID: 7, NodeIncarnation: 3, ReadyID: 1, ReadyDigest: digest, Blob: blob, Entries: []Entry{{Index: 1, Term: 1, DataOffset: 0, DataBytes: 3}, {Index: 2, Term: 1, Type: pb.EntryConfChangeV2, DataOffset: 3, DataBytes: 2}}}}}
+	if err = e.PersistWave(w); err != nil {
+		t.Fatal(err)
+	}
+	if err = e.Rotate(nil); err != nil {
+		t.Fatal(err)
+	}
+	if err = e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	e, err = OpenEngine(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	state, ok := e.Group(7)
+	if !ok || state.NodeIncarnation != 3 || state.ReadyID != 1 || state.ReadyDigest != digest || state.ReadyWaveID != w.ID || len(state.Entries) != 2 {
+		t.Fatalf("state=%+v ok=%v", state, ok)
+	}
+	if state.Entries[0].Offset != state.Entries[1].Offset || state.Entries[0].Bytes != uint64(len(blob)) || state.Entries[1].DataOffset != 3 || state.Entries[1].DataBytes != 2 {
+		t.Fatalf("locations=%+v", state.Entries)
+	}
+	if err = e.ReserveReaders(1); err != nil {
+		t.Fatal(err)
+	}
+	if err = e.PrepareSegment(state.Entries[0].SegmentID); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, len(blob))
+	read, err := e.ReadLocation(state.Entries[1], buf)
+	if err != nil || !bytes.Equal(read, blob) {
+		t.Fatalf("read=%q err=%v", read, err)
+	}
+}
+
+func TestNodeBatchSpaceAccounting(t *testing.T) {
+	measure := func(groups, entriesPerGroup int) (frameBytes, indexBytes int) {
+		t.Helper()
+		e := &Engine{
+			groups:       make(map[uint64]*engineGroup, groups),
+			frameBuf:     make([]byte, 0, 4096),
+			eventScratch: make([]segmentEvent, 0, groups*(entriesPerGroup+2)+1),
+		}
+		wave := Wave{ID: WaveID{1}, Batches: make([]ReadyBatch, groups)}
+		for group := 1; group <= groups; group++ {
+			e.groups[uint64(group)] = &engineGroup{GroupState: GroupState{Checkpoint: Checkpoint{Index: 1, Term: 1}, Hard: HardState{Term: 1, Commit: 1}, Entries: make([]EntryLocation, 0, 64)}}
+			entries := make([]Entry, entriesPerGroup)
+			for i := range entries {
+				entries[i] = Entry{Index: uint64(i + 2), Term: 2, DataOffset: uint64(i), DataBytes: 1}
+			}
+			wave.Batches[group-1] = ReadyBatch{GroupID: uint64(group), NodeIncarnation: 1, ReadyID: 1, ReadyDigest: [16]byte{1}, Hard: &HardState{Term: 2, Vote: 1, Commit: uint64(entriesPerGroup + 1)}, Entries: entries, Blob: make([]byte, entriesPerGroup+16)}
+		}
+		frame, _, events, err := e.prepareWave(wave, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range events {
+			if isBlobEvent(events[i].Kind) {
+				events[i].Offset += segmentHeaderBytes
+			}
+		}
+		index, err := marshalSegmentIndex(events, uint64(segmentHeaderBytes+len(frame)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(frame), len(index)
+	}
+	if frame, index := measure(1, 32); frame != 274 || index != 340 {
+		t.Fatalf("one group frame/index = %d/%d, want 274/340", frame, index)
+	}
+	if frame, index := measure(4, 8); frame != 397 || index != 469 {
+		t.Fatalf("four groups frame/index = %d/%d, want 397/469", frame, index)
+	}
+}
+
+func TestAuthenticatedEngineRejectsRecomputedSealedIndexCRC(t *testing.T) {
+	dir := t.TempDir()
+	e, err := CreateEngine(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := [32]byte{1, 2, 3}
+	if err = e.SetAuthenticationKey(key); err != nil {
+		t.Fatal(err)
+	}
+	if err = e.Reserve(4096, 16, 8); err != nil {
+		t.Fatal(err)
+	}
+	if err = e.ReserveGroup(1, 8); err != nil {
+		t.Fatal(err)
+	}
+	if err = e.PersistWave(Wave{ID: WaveID{1}, Batches: []ReadyBatch{{GroupID: 1, NodeIncarnation: 1, ReadyID: 1, ReadyDigest: [16]byte{1}}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err = e.Rotate(nil); err != nil {
+		t.Fatal(err)
+	}
+	if err = e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	manifestBytes, _ := os.ReadFile(filepath.Join(dir, ManifestName))
+	manifest, err := unmarshalManifest(manifestBytes)
+	if err != nil || len(manifest.Segments) != 1 {
+		t.Fatalf("manifest: %#v, %v", manifest, err)
+	}
+	path := filepath.Join(dir, sealedName(1))
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	index := make([]byte, manifest.Segments[0].IndexBytes)
+	if _, err = f.ReadAt(index, int64(manifest.Segments[0].IndexOffset)); err != nil {
+		t.Fatal(err)
+	}
+	index[45] ^= 1 // Ready digest remains structurally valid.
+	putCRC(index)
+	if _, err = f.WriteAt(index, int64(manifest.Segments[0].IndexOffset)); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+	if opened, openErr := OpenEngineAuthenticated(dir, key); opened != nil || !errors.Is(openErr, ErrCorrupt) {
+		t.Fatalf("authenticated Open = %#v, %v", opened, openErr)
+	}
+}
+
+func TestAuthenticatedEngineRejectsRecomputedActiveSHAAndCRC(t *testing.T) {
+	dir := t.TempDir()
+	e, err := CreateEngine(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := [32]byte{9, 8, 7}
+	if err = e.SetAuthenticationKey(key); err != nil {
+		t.Fatal(err)
+	}
+	_ = e.Reserve(4096, 16, 8)
+	_ = e.ReserveGroup(1, 8)
+	if err = e.PersistWave(Wave{ID: WaveID{1}, Batches: []ReadyBatch{{GroupID: 1, NodeIncarnation: 1, ReadyID: 1, ReadyDigest: [16]byte{1}}}}); err != nil {
+		t.Fatal(err)
+	}
+	activeID := e.log.manifest.ActiveID
+	if err = e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, activeName(activeID))
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame := data[segmentHeaderBytes:]
+	frame[len(frame)-1] ^= 1
+	forged := sha256.Sum256(frame[72:])
+	copy(frame[40:72], forged[:])
+	binary.LittleEndian.PutUint32(frame[32:36], crc32.Checksum(frame[40:], crcTable))
+	binary.LittleEndian.PutUint32(frame[36:40], crc32.Checksum(frame[:36], crcTable))
+	if err = os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if opened, openErr := OpenEngineAuthenticated(dir, key); opened != nil || !errors.Is(openErr, ErrCorrupt) {
+		t.Fatalf("authenticated active Open = %#v, %v", opened, openErr)
+	}
+}
+
+func TestAuthenticatedIncarnationRotateRecovery(t *testing.T) {
+	dir := t.TempDir()
+	e, err := CreateEngine(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := [32]byte{4, 5, 6}
+	if err = e.SetAuthenticationKey(key); err != nil {
+		t.Fatal(err)
+	}
+	_ = e.Reserve(4096, 16, 8)
+	_ = e.ReserveGroup(7, 8)
+	if err = e.PersistWave(Wave{ID: WaveID{1}, Batches: []ReadyBatch{{GroupID: 7, BeginIncarnation: 1}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err = e.Rotate(nil); err != nil {
+		t.Fatal(err)
+	}
+	if err = e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	e, err = OpenEngineAuthenticated(dir, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	state, ok := e.Group(7)
+	if !ok || state.NodeIncarnation != 1 || state.ReadyID != 0 {
+		t.Fatalf("recovered incarnation = %#v, %v", state, ok)
+	}
+}
+
+func TestPreparedLocationReadZeroAlloc(t *testing.T) {
+	e := newReservedEngine(t, 1)
+	data := []byte("prepared-read")
+	if err := e.PersistWave(Wave{ID: waveID(1), Batches: []ReadyBatch{{GroupID: 1, Entries: []Entry{{Index: 1, Term: 1, Data: data}}}}}); err != nil {
+		t.Fatal(err)
+	}
+	state, _ := e.Group(1)
+	buf := make([]byte, len(data))
+	var runErr error
+	allocs := testing.AllocsPerRun(1000, func() { _, runErr = e.ReadLocation(state.Entries[0], buf) })
+	if runErr != nil {
+		t.Fatal(runErr)
+	}
+	if allocs != 0 {
+		t.Fatalf("prepared ReadLocation allocations=%v want=0", allocs)
+	}
+}
