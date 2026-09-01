@@ -15,14 +15,14 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/orderedkey"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
-	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/requestledger"
 	"github.com/thesyncim/vibedb/internal/rf3bench"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
-	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibedb/store/durable"
 	"github.com/thesyncim/vibejson"
 )
@@ -170,12 +170,10 @@ func runRF3Evidence(t *testing.T, config rf3bench.Config) rf3EvidenceRun {
 	clients := make([]rf3EvidenceClient, config.Clients)
 	var minimumApplied uint64
 	for index := range clients {
-		clients[index] = openRF3EvidenceClient(t, ctx, executor, route,
-			cluster.groups[0].bases[leader], uint32(index))
+		clients[index] = openRF3EvidenceClient(t, uint32(index))
 		seed := evidenceValue(uint32(index), clients[index].sequence)
-		result := proposeRF3Evidence(t, ctx, executor, route, cluster.groups[0].bases[leader],
-			&clients[index], seed)
-		minimumApplied = max(minimumApplied, result.Outcome.AppliedIndex)
+		result := proposeRF3Evidence(t, ctx, executor, route, &clients[index], seed)
+		minimumApplied = max(minimumApplied, result.Applied)
 	}
 	waitRF3Applied(t, ctx, cluster.owners[:], nil, cluster.groups[0].key, minimumApplied)
 
@@ -184,9 +182,9 @@ func runRF3Evidence(t *testing.T, config rf3bench.Config) rf3EvidenceRun {
 		if evidenceOperation(config.Workload, config.Seed, ordinal) == rf3bench.OperationRead {
 			readRF3Evidence(t, ctx, executor, route, client.key, minimumApplied, readLimit)
 		} else {
-			result := proposeRF3Evidence(t, ctx, executor, route, cluster.groups[0].bases[leader],
-				client, evidenceValue(uint32(ordinal%uint64(len(clients))), client.sequence))
-			minimumApplied = max(minimumApplied, result.Outcome.AppliedIndex)
+			result := proposeRF3Evidence(t, ctx, executor, route, client,
+				evidenceValue(uint32(ordinal%uint64(len(clients))), client.sequence))
+			minimumApplied = max(minimumApplied, result.Applied)
 		}
 	}
 	waitRF3Applied(t, ctx, cluster.owners[:], nil, cluster.groups[0].key, minimumApplied)
@@ -223,22 +221,15 @@ func runRF3Evidence(t *testing.T, config rf3bench.Config) rf3EvidenceRun {
 					sample.Retries = uint32(result.Retries)
 				} else {
 					value := evidenceValue(clientIndex, client.sequence)
-					command := evidenceCommand(cluster.groups[0].bases[leader], client,
-						[]replication.Mutation{{Kind: replication.MutationPut, Key: client.key, Value: value}})
-					encoded, appendErr := replication.AppendCommand(nil, command)
-					if appendErr != nil {
-						t.Errorf("encode client=%d ordinal=%d: %v", clientIndex, ordinal+1, appendErr)
-						return
-					}
-					result, proposeErr := executor.Propose(ctx, route, encoded)
+					result, proposeErr := directRF3Evidence(ctx, executor, route, client, value)
 					if proposeErr != nil {
 						t.Errorf("write client=%d ordinal=%d: %v", clientIndex, ordinal+1, proposeErr)
 						return
 					}
-					client.sequence++
-					sample.Applied = result.Outcome.AppliedIndex
-					sample.Commit, sample.Checkpoint = result.State.Commit, result.State.CheckpointApplied
-					sample.Retries, sample.PayloadBytes = uint32(result.Retries), uint32(len(encoded))
+					sample.Applied = result.Applied
+					sample.Commit, sample.Checkpoint = result.Commit, result.Checkpoint
+					sample.Retries = uint32(result.Retries)
+					sample.PayloadBytes = uint32(len(client.key) + len(value))
 					atomicMaximum(&maximumApplied, sample.Applied)
 				}
 				sample.LatencyNS = uint64(max(time.Since(started), time.Nanosecond))
@@ -275,12 +266,9 @@ func runRF3Evidence(t *testing.T, config rf3bench.Config) rf3EvidenceRun {
 	return rf3EvidenceRun{report: report, encoded: encoded.Bytes(), readCount: reads, writeCount: writes}
 }
 
-func openRF3EvidenceClient(t *testing.T, ctx context.Context, executor *gateway.ReplicatedExecutor,
-	route gateway.ReplicatedRoute, base sqldriver.ReplicatedShardStoreIdentity,
-	clientIndex uint32,
-) rf3EvidenceClient {
+func openRF3EvidenceClient(t *testing.T, clientIndex uint32) rf3EvidenceClient {
 	t.Helper()
-	var client rf3EvidenceClient
+	client := rf3EvidenceClient{epoch: 1, sequence: 1}
 	client.id[0], client.id[1] = 0xe1, byte(clientIndex+1)
 	keyJSON := strconv.AppendQuote(nil, "rf3-evidence-"+strconv.FormatUint(uint64(clientIndex), 10))
 	var ok bool
@@ -288,58 +276,53 @@ func openRF3EvidenceClient(t *testing.T, ctx context.Context, executor *gateway.
 	if !ok {
 		t.Fatal("encode evidence key")
 	}
-	command := evidenceCommand(base, &client, nil)
-	command.Kind, command.ClientEpoch, command.ClientSequence = replication.CommandSessionOpen, 0, 1
-	command.NextDeadlineUnixNano = 2_000_000_000_000_000_000
-	command.Fingerprint = sha256.Sum256(append([]byte("rf3-evidence-open"), byte(clientIndex)))
-	encoded, err := replication.AppendCommand(nil, command)
-	if err != nil {
-		t.Fatal(err)
-	}
-	result, err := executor.Propose(ctx, route, encoded)
-	if err != nil {
-		t.Fatal(err)
-	}
-	completion, err := replication.OpenCompletion(result.Completion)
-	if err != nil || completion.ResultCode != replicatedstate.ResultSessionOpened || completion.ClientEpoch == 0 {
-		t.Fatalf("open completion=%+v err=%v", completion, err)
-	}
-	client.epoch, client.sequence = completion.ClientEpoch, 2
 	return client
 }
 
-func evidenceCommand(base sqldriver.ReplicatedShardStoreIdentity, client *rf3EvidenceClient,
-	mutations []replication.Mutation,
-) replication.Command {
-	command := rf3Command(base, replication.CommandMutationBatch, client.epoch, client.sequence, mutations)
-	command.ClientID = client.id
-	var identity [25]byte
-	copy(identity[:16], client.id[:])
-	identity[16] = byte(command.Kind)
-	for offset := 0; offset < 8; offset++ {
-		identity[17+offset] = byte(client.sequence >> (8 * offset))
+func proposeRF3Evidence(t *testing.T, ctx context.Context, executor *gateway.ReplicatedExecutor,
+	route gateway.ReplicatedRoute, client *rf3EvidenceClient, value []byte,
+) gateway.ReplicatedDirectMutationResult {
+	t.Helper()
+	result, err := directRF3Evidence(ctx, executor, route, client, value)
+	if err != nil {
+		t.Fatal(err)
 	}
-	command.Fingerprint = sha256.Sum256(identity[:])
-	return command
+	return result
 }
 
-func proposeRF3Evidence(t *testing.T, ctx context.Context, executor *gateway.ReplicatedExecutor,
-	route gateway.ReplicatedRoute, base sqldriver.ReplicatedShardStoreIdentity,
-	client *rf3EvidenceClient, value []byte,
-) gateway.ReplicatedResult {
-	t.Helper()
-	command := evidenceCommand(base, client,
-		[]replication.Mutation{{Kind: replication.MutationPut, Key: client.key, Value: value}})
-	encoded, err := replication.AppendCommand(nil, command)
-	if err != nil {
-		t.Fatal(err)
+func directRF3Evidence(ctx context.Context, executor *gateway.ReplicatedExecutor,
+	route gateway.ReplicatedRoute, client *rf3EvidenceClient, value []byte,
+) (gateway.ReplicatedDirectMutationResult, error) {
+	tenant := []byte("rf3-evidence")
+	var request requestledger.RequestID
+	request[0] = client.id[1]
+	for offset := 0; offset < 8; offset++ {
+		request[8+offset] = byte(client.sequence >> (8 * offset))
 	}
-	result, err := executor.Propose(ctx, route, encoded)
-	if err != nil {
-		t.Fatal(err)
+	var lane requestledger.IssuerLane
+	lane[0] = client.id[1]
+	direct := gateway.ReplicatedDirectMutation{
+		Key: requestledger.RequestKey{
+			Scope: requestledger.ScopeAuthenticated, Principal: requestledger.PrincipalID(client.id),
+			Request: request, TenantDigest: requestledger.Digest(sha256.Sum256(tenant)),
+			IssuerEpoch: client.epoch, IssuerSequence: client.sequence, IssuerLane: lane,
+		},
+		RequestDigest: replication.Digest(sha256.Sum256(value)), Tenant: tenant,
+		Participant: gateway.ReplicatedTransactionParticipant{
+			Route: route, BucketBits: 8,
+			IntentScopes: []distributedtxn.IntentScope{{Start: 0, End: 256}},
+			Batches: []replication.RelationMutationBatch{{
+				Relation: 1, Mutations: []replication.Mutation{{
+					Kind: replication.MutationPut, Key: client.key, Value: value,
+				}},
+			}},
+		},
 	}
-	client.sequence++
-	return result
+	result, err := executor.DirectMutate(ctx, direct)
+	if err == nil {
+		client.sequence++
+	}
+	return result, err
 }
 
 func readRF3Evidence(t *testing.T, ctx context.Context, executor *gateway.ReplicatedExecutor,
@@ -629,12 +612,14 @@ func evidenceMetadata(readLimit uint32) []rf3bench.Metadata {
 		{Key: []byte("go_version"), Value: []byte(runtime.Version())},
 		{Key: []byte("goarch"), Value: []byte(runtime.GOARCH)},
 		{Key: []byte("goos"), Value: []byte(runtime.GOOS)},
+		{Key: []byte("payload_bytes"), Value: []byte("logical-key-value")},
 		{Key: []byte("read_admission"), Value: []byte("owner-bounded-retry-wait-in-latency")},
 		{Key: []byte("read_max_value_bytes"), Value: strconv.AppendUint(nil, uint64(readLimit), 10)},
 		{Key: []byte("read_retry_backoff_cap_ns"), Value: strconv.AppendUint(nil, uint64(rf3EvidenceReadBackoffCap), 10)},
 		{Key: []byte("read_retry_rounds"), Value: strconv.AppendUint(nil, rf3EvidenceReadAttempts, 10)},
 		{Key: []byte("vcs_modified"), Value: []byte(modified)},
 		{Key: []byte("vcs_revision"), Value: []byte(revision)},
+		{Key: []byte("write_path"), Value: []byte("single-participant-one-proposal")},
 	}
 	return metadata
 }

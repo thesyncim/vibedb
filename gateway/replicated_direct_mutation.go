@@ -34,6 +34,8 @@ type ReplicatedDirectMutation struct {
 type ReplicatedDirectMutationResult struct {
 	ID           distributedtxn.ID
 	Applied      uint64
+	Commit       uint64
+	Checkpoint   uint64
 	Committed    bool
 	AffectedRows int64
 	ResultCode   uint32
@@ -66,6 +68,7 @@ func (executor *ReplicatedExecutor) DirectMutate(
 	}
 	result := ReplicatedDirectMutationResult{
 		ID: control.ID, Applied: proposal.Outcome.CompletionAppliedSequence,
+		Commit: proposal.State.Commit, Checkpoint: proposal.State.CheckpointApplied,
 		Committed:  code == replicatedstate.ResultApplied,
 		ResultCode: code, Retries: proposal.Retries,
 		Duplicate: proposal.Outcome.AppliedIndex != proposal.Outcome.CompletionAppliedSequence,
