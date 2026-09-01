@@ -401,7 +401,7 @@ func (runner *DurableRequestLifecycleRunner) runAdmittedWave(ctx context.Context
 	}
 
 	if pending.Revision != 0 {
-		stage = "participant work and continuation"
+		stage = "participant work, continuation, and release intent"
 		route, err = runner.resolvePersistedRoute(ctx, wave, wave.Command)
 		if err != nil {
 			return DurableRequestWaveResult{}, err
@@ -429,11 +429,25 @@ func (runner *DurableRequestLifecycleRunner) runAdmittedWave(ctx context.Context
 		if continuationErr != nil {
 			return DurableRequestWaveResult{}, errors.Join(continuationErr, ErrDurableRequestConflict)
 		}
+		route, err = runner.resolvePersistedRoute(ctx, wave, routePin.Command)
+		if err != nil {
+			return DurableRequestWaveResult{}, err
+		}
+		release, buildErr := runner.gateSessions.prepareRelease(ctx, route, wave, routePin)
+		if buildErr != nil {
+			return DurableRequestWaveResult{}, buildErr
+		}
+		releasing, beginErr := requestledger.BeginRoutePinRelease(
+			routePin, routePin.Revision+1, release,
+		)
+		if beginErr != nil {
+			return DurableRequestWaveResult{}, errors.Join(beginErr, ErrDurableRequestConflict)
+		}
 		result, applyErr := runner.ledger.ApplyCAS(ctx, wave.Home, wave.Key,
 			DurableRequestLifecycleCAS{
-				Operation:        requestledger.OperationAdvance,
-				ExpectedRevision: head.Revision, Revision: continuation.Revision,
-				Continuation: continuation,
+				Operation:        requestledger.OperationAdvanceBeginRoutePinRelease,
+				ExpectedRevision: head.Revision, Revision: head.Revision + 2,
+				Continuation: continuation, RoutePin: releasing,
 			})
 		if applyErr != nil {
 			return DurableRequestWaveResult{}, applyErr
@@ -449,6 +463,13 @@ func (runner *DurableRequestLifecycleRunner) runAdmittedWave(ctx context.Context
 		if err != nil {
 			return DurableRequestWaveResult{}, errors.Join(err, ErrDurableRequestConflict)
 		}
+		head, err = requestledger.AdvanceHeadRoutePin(
+			head, routePin, releasing, head.Revision+1,
+		)
+		if err != nil {
+			return DurableRequestWaveResult{}, errors.Join(err, ErrDurableRequestConflict)
+		}
+		routePin = releasing
 		pending = requestledger.PendingWaveRecord{}
 	}
 

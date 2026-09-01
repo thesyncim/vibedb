@@ -556,6 +556,145 @@ func TestRequestLedgerFusedAcquirePendingIsAtomicAndReplayExact(t *testing.T) {
 		afterConflict != usage || !bytes.Equal(afterRead.Value, readResult.Value) {
 		t.Fatalf("conflict=%+v usage=%+v want=%+v", conflict, afterConflict, usage)
 	}
+
+	// Settle the installed pending wave and publish the exact route-release
+	// intent in one atomic command. The nested rows and final head must be byte
+	// identical to the two legacy transitions.
+	continuation, err := requestledger.NewContinuation(
+		legacyFinal, pending, acquired, legacyFinal.Revision+1, 7,
+		[]byte("fused next cursor"), []byte("fused settled observation"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, acquireCommand, ok := openRequestLedgerRouteGateCommand(acquired.Command)
+	if !ok {
+		t.Fatal("open acquired route-gate command")
+	}
+	releaseCommandRaw := requestLedgerRouteGateOuter(t, fixture.binding, 32, routegate.Command{
+		Operation: routegate.OperationReleaseShared, Epoch: acquireCommand.Epoch,
+		Identity: acquireCommand.Identity, Binding: acquireCommand.Binding,
+	})
+	releasing, err := requestledger.BeginRoutePinRelease(
+		acquired, acquired.Revision+1, releaseCommandRaw,
+	)
+	if err != nil || !requestLedgerRouteCommandEvidenceAvailable(acquired, releasing) {
+		t.Fatalf("release intent evidence: %v", err)
+	}
+	legacyAdvanced, err := requestledger.AdvancePending(legacyFinal, pending, continuation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyReleasedIntent, err := requestledger.AdvanceHeadRoutePin(
+		legacyAdvanced, acquired, releasing, legacyAdvanced.Revision+1,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	advanceReleaseRaw, err := requestledger.AppendAdvanceRelease(nil, continuation, releasing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	advanceReleaseSubject, err := requestledger.AdvanceReleaseDigest(continuation, releasing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	advanceReleaseInner, err := requestledger.AppendCommand(nil, requestledger.Command{
+		Operation:        requestledger.OperationAdvanceBeginRoutePinRelease,
+		ExpectedRevision: legacyFinal.Revision, Revision: legacyReleasedIntent.Revision,
+		KeyDigest: initial.KeyDigest, RequestDigest: initial.RequestDigest,
+		PlanRoot: initial.PlanRoot, SubjectDigest: advanceReleaseSubject,
+		ExpectedRangeIdentity: fixture.machine.options.RequestLedgerRange.Identity,
+		Home:                  home, Payload: advanceReleaseRaw,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	advanceReleaseCommand := requestLedgerOuterCommand(t, fixture, 6, advanceReleaseInner)
+	if _, err = fixture.machine.ApplyNormal(normalMeta(7), advanceReleaseCommand); err != nil {
+		t.Fatal(err)
+	}
+	advanceReleaseCompletion := requestLedgerCompletionForCommand(t, fixture.machine, advanceReleaseCommand)
+	advanceUsage, err := fixture.machine.RequestLedgerUsage()
+	if err != nil || advanceReleaseCompletion.ResultCode != ResultApplied ||
+		!advanceReleaseCompletion.ExactDuplicate ||
+		advanceReleaseCompletion.Revision != legacyReleasedIntent.Revision || advanceUsage.Rows != 3 {
+		t.Fatalf("advance-release completion=%+v usage=%+v err=%v",
+			advanceReleaseCompletion, advanceUsage, err)
+	}
+	read.MinimumApplied = 7
+	advancedRead, err := fixture.machine.RequestLedgerReadInto(
+		read, make([]byte, 0, read.MaxBytes),
+	)
+	if err != nil || !advancedRead.Found {
+		t.Fatalf("advanced wave read=%+v err=%v", advancedRead, err)
+	}
+	advancedWave, err := OpenRequestLedgerWaveReadValue(advancedRead.Value)
+	wantAdvancedHead, _ := requestledger.AppendHead(nil, legacyReleasedIntent)
+	wantReleasing, _ := requestledger.AppendRoutePin(nil, releasing)
+	if err != nil || !advancedWave.RouteFound || advancedWave.PendingFound ||
+		!bytes.Equal(advancedWave.Head, wantAdvancedHead) ||
+		!bytes.Equal(advancedWave.RoutePin, wantReleasing) {
+		t.Fatalf("advance-release rows differ from legacy rows: route=%t pending=%t head=%t route=%t err=%v",
+			advancedWave.RouteFound, advancedWave.PendingFound,
+			bytes.Equal(advancedWave.Head, wantAdvancedHead),
+			bytes.Equal(advancedWave.RoutePin, wantReleasing), err)
+	}
+	continuationRead := RequestLedgerReadRequest{
+		Key: key, ExpectedRangeIdentity: fixture.machine.options.RequestLedgerRange.Identity,
+		Kind: RequestLedgerReadContinuation, MinimumApplied: 7,
+		MaxBytes: uint32(RequestLedgerReadMaxBytes(RequestLedgerReadContinuation)),
+	}
+	storedContinuation, err := fixture.machine.RequestLedgerReadInto(
+		continuationRead, make([]byte, 0, continuationRead.MaxBytes),
+	)
+	wantContinuation, _ := requestledger.AppendContinuation(nil, continuation)
+	if err != nil || !storedContinuation.Found ||
+		!bytes.Equal(storedContinuation.Value, wantContinuation) {
+		t.Fatalf("advance-release continuation found=%t equal=%t err=%v",
+			storedContinuation.Found, bytes.Equal(storedContinuation.Value, wantContinuation), err)
+	}
+
+	advanceReplayCommand := requestLedgerOuterCommand(t, fixture, 7, advanceReleaseInner)
+	if _, err = fixture.machine.ApplyNormal(normalMeta(8), advanceReplayCommand); err != nil {
+		t.Fatal(err)
+	}
+	advanceReplay := requestLedgerCompletionForCommand(t, fixture.machine, advanceReplayCommand)
+	afterAdvanceReplay, _ := fixture.machine.RequestLedgerUsage()
+	if !advanceReplay.ExactDuplicate || advanceReplay.ResultCode != ResultApplied ||
+		advanceReplay.StateDigest != advanceReleaseCompletion.StateDigest ||
+		afterAdvanceReplay != advanceUsage {
+		t.Fatalf("advance replay=%+v usage=%+v want=%+v",
+			advanceReplay, afterAdvanceReplay, advanceUsage)
+	}
+
+	advanceConflictInner, err := requestledger.AppendCommand(nil, requestledger.Command{
+		Operation:        requestledger.OperationAdvanceBeginRoutePinRelease,
+		ExpectedRevision: legacyFinal.Revision + 1, Revision: legacyReleasedIntent.Revision + 1,
+		KeyDigest: initial.KeyDigest, RequestDigest: initial.RequestDigest,
+		PlanRoot: initial.PlanRoot, SubjectDigest: advanceReleaseSubject,
+		ExpectedRangeIdentity: fixture.machine.options.RequestLedgerRange.Identity,
+		Home:                  home, Payload: advanceReleaseRaw,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	advanceConflictCommand := requestLedgerOuterCommand(t, fixture, 8, advanceConflictInner)
+	if _, err = fixture.machine.ApplyNormal(normalMeta(9), advanceConflictCommand); err != nil {
+		t.Fatal(err)
+	}
+	advanceConflict := requestLedgerCompletionForCommand(t, fixture.machine, advanceConflictCommand)
+	afterAdvanceConflict, _ := fixture.machine.RequestLedgerUsage()
+	read.MinimumApplied = 9
+	afterAdvanceRead, err := fixture.machine.RequestLedgerReadInto(
+		read, make([]byte, 0, read.MaxBytes),
+	)
+	if err != nil || advanceConflict.ResultCode != ResultRequestLedgerConflict ||
+		advanceConflict.ExactDuplicate || afterAdvanceConflict != advanceUsage ||
+		!bytes.Equal(afterAdvanceRead.Value, advancedRead.Value) {
+		t.Fatalf("advance conflict=%+v usage=%+v want=%+v err=%v",
+			advanceConflict, afterAdvanceConflict, advanceUsage, err)
+	}
 }
 
 func TestRequestLedgerCreateSettlesWithoutSessionAndReopens(t *testing.T) {

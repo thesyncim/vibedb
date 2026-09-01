@@ -371,6 +371,59 @@ func TestDurableRequestLifecycleCommandFusesAcquiredRouteAndPending(t *testing.T
 		compound.Pending().Digest() != pending.WaveDigest {
 		t.Fatalf("fused lifecycle command: ok=%v opened=%+v err=%v", ok, opened.Command, err)
 	}
+
+	pendingHead, err := requestledger.InstallPendingWave(
+		acquiredHead, pending, requestledger.PayloadBuildRecord{}, acquired,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	continuation, err := requestledger.NewContinuation(
+		pendingHead, pending, acquired, pendingHead.Revision+1, 7,
+		[]byte("fused-cursor"), []byte("fused-observation"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releasing, err := requestledger.BeginRoutePinRelease(
+		acquired, acquired.Revision+1, []byte("fused-release-command"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	advanced, err := requestledger.AdvancePending(pendingHead, pending, continuation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseHead, err := requestledger.AdvanceHeadRoutePin(
+		advanced, acquired, releasing, advanced.Revision+1,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command, err = durableRequestLifecycleCommand(head.KeyDigest, DurableRequestLifecycleCAS{
+		Operation:        requestledger.OperationAdvanceBeginRoutePinRelease,
+		ExpectedRevision: pendingHead.Revision, Revision: releaseHead.Revision,
+		Continuation: continuation, RoutePin: releasing,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	command.ExpectedRangeIdentity = lifecycleDigest("range")
+	command.Home, _ = requestledger.Home(head.Key)
+	raw, err = requestledger.AppendCommand(nil, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, err = requestledger.OpenCommandInto(raw, nil)
+	advanceRelease, ok := opened.AdvanceRelease()
+	if err != nil || !ok || opened.ExpectedRevision != pendingHead.Revision ||
+		opened.Revision != releaseHead.Revision ||
+		advanceRelease.Continuation().ContinuationDigest != continuation.ContinuationDigest ||
+		advanceRelease.Route().RecordDigest != releasing.RecordDigest {
+		t.Fatalf("fused advance-release command: ok=%v opened=%+v err=%v",
+			ok, opened.Command, err)
+	}
 }
 
 func BenchmarkReplicatedRequestLedgerProposalIdentity(b *testing.B) {

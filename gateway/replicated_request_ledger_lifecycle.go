@@ -319,6 +319,12 @@ func durableRequestLifecycleCommand(
 		if err == nil {
 			command.Payload, err = requestledger.AppendAcquiredPending(nil, cas.RoutePin, cas.Pending)
 		}
+	case requestledger.OperationAdvanceBeginRoutePinRelease:
+		command.RequestDigest, command.PlanRoot = cas.Continuation.RequestDigest, cas.Continuation.PlanRoot
+		command.SubjectDigest, err = requestledger.AdvanceReleaseDigest(cas.Continuation, cas.RoutePin)
+		if err == nil {
+			command.Payload, err = requestledger.AppendAdvanceRelease(nil, cas.Continuation, cas.RoutePin)
+		}
 	case requestledger.OperationCleanupPayload:
 		command.RequestDigest, command.PlanRoot = cas.Head.RequestDigest, cas.Head.PlanRoot
 		command.SubjectDigest = cas.PayloadCleanup.BuildDigest

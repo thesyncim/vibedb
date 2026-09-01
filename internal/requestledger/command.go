@@ -43,11 +43,12 @@ const (
 	OperationAdvanceIssuerHighwater
 	OperationOpenIssuerLane
 	OperationRecordRoutePinAcquiredPutPending
+	OperationAdvanceBeginRoutePinRelease
 
 	// LastOperation is the sole inclusive admission bound for the current
 	// request-ledger command grammar. Integrations must not duplicate a numeric
 	// operation ceiling in completion or apply validation.
-	LastOperation = OperationRecordRoutePinAcquiredPutPending
+	LastOperation = OperationAdvanceBeginRoutePinRelease
 )
 
 type Command struct {
@@ -130,6 +131,7 @@ type CommandView struct {
 	issuerAdvance   IssuerAdvanceRequest
 	issuerOpen      IssuerHighwaterRecord
 	acquiredPending AcquiredPendingView
+	advanceRelease  AdvanceReleaseView
 }
 
 func (view CommandView) Bytes() []byte { return view.raw[:len(view.raw):len(view.raw)] }
@@ -189,6 +191,9 @@ func (view CommandView) IssuerOpen() (IssuerHighwaterRecord, bool) {
 }
 func (view CommandView) AcquiredPending() (AcquiredPendingView, bool) {
 	return view.acquiredPending, view.Operation == OperationRecordRoutePinAcquiredPutPending
+}
+func (view CommandView) AdvanceRelease() (AdvanceReleaseView, bool) {
+	return view.advanceRelease, view.Operation == OperationAdvanceBeginRoutePinRelease
 }
 
 func AppendCommand(dst []byte, command Command) ([]byte, error) {
@@ -430,6 +435,17 @@ func OpenCommandInto(raw []byte, stepScratch []StepRef) (CommandView, error) {
 				}
 			}
 		}
+	case OperationAdvanceBeginRoutePinRelease:
+		view.advanceRelease, err = OpenAdvanceRelease(payload)
+		if err == nil {
+			continuation, route := view.advanceRelease.Continuation(), view.advanceRelease.Route()
+			if continuation.KeyDigest != command.KeyDigest ||
+				continuation.RequestDigest != command.RequestDigest ||
+				continuation.PlanRoot != command.PlanRoot ||
+				advanceReleaseDigest(continuation.ContinuationDigest, route.RecordDigest) != command.SubjectDigest {
+				err = ErrCorrupt
+			}
+		}
 	default:
 		err = ErrCorrupt
 	}
@@ -459,7 +475,8 @@ func validateCommandShape(command Command) error {
 		if command.ExpectedRevision != 0 || command.Revision != 1 {
 			return ErrRevision
 		}
-	} else if command.Operation == OperationRecordRoutePinAcquiredPutPending {
+	} else if command.Operation == OperationRecordRoutePinAcquiredPutPending ||
+		command.Operation == OperationAdvanceBeginRoutePinRelease {
 		if command.ExpectedRevision >= ^uint64(0)-1 || command.Revision != command.ExpectedRevision+2 {
 			return ErrRevision
 		}
@@ -496,7 +513,7 @@ func semanticsDigestWithPerturbAndCount(perturb int, xor uint64) (Digest, int) {
 		planningExpiryMagic, planningRestartMagic, planningCleanupMagic, planningExpiryIndexMagic,
 		readyMagic, principalQuotaMagic,
 		issuerHighwaterMagic, issuerSequenceMagic, issuerAdvanceMagic,
-		acquiredPendingMagic,
+		acquiredPendingMagic, advanceReleaseMagic,
 	} {
 		_, _ = hash.Write(magic[:])
 	}
@@ -521,6 +538,7 @@ func semanticsDigestWithPerturbAndCount(perturb int, xor uint64) (Digest, int) {
 		IssuerSequenceKeyBytes, IssuerSequenceRecordBytes, IssuerAdvanceRequestBytes,
 		IssuerSequenceReservationBytes, IssuerHighwaterResidentBytes,
 		MaxAcquiredPendingRecordBytes, acquiredPendingHeaderBytes,
+		MaxAdvanceReleaseRecordBytes, advanceReleaseHeaderBytes,
 		RoutePinReservationBytes, PreparedTerminalReservationBytes,
 		SchemaPinReleaseReservationBytes, ReadyReservationBytes,
 		commandHeaderBytes, headHeaderBytes, pageHeaderBytes, planHeaderBytes,
@@ -555,6 +573,7 @@ func semanticsDigestWithPerturbAndCount(perturb int, xor uint64) (Digest, int) {
 		uint64(OperationAdvanceIssuerHighwater),
 		uint64(OperationOpenIssuerLane),
 		uint64(OperationRecordRoutePinAcquiredPutPending),
+		uint64(OperationAdvanceBeginRoutePinRelease),
 		uint64(RoutePinAcquiring), uint64(RoutePinAcquired),
 		uint64(RoutePinReleasing), uint64(RoutePinReleased),
 		uint64(SchemaPinReleasing), uint64(SchemaPinReleased),

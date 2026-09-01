@@ -51,7 +51,8 @@ func (ledger *lifecycleRunnerLedger) ApplyCAS(
 ) (DurableRequestLifecycleCASResult, error) {
 	ledger.events.add(fmt.Sprintf("cas:%d", cas.Operation))
 	nextRevision := ledger.head.Revision + 1
-	if cas.Operation == requestledger.OperationRecordRoutePinAcquiredPutPending {
+	if cas.Operation == requestledger.OperationRecordRoutePinAcquiredPutPending ||
+		cas.Operation == requestledger.OperationAdvanceBeginRoutePinRelease {
 		nextRevision++
 	}
 	if cas.ExpectedRevision != ledger.head.Revision || cas.Revision != nextRevision {
@@ -96,6 +97,21 @@ func (ledger *lifecycleRunnerLedger) ApplyCAS(
 			ledger.head, ledger.pending, cas.Continuation, ledger.build,
 		)
 		ledger.pending = requestledger.PendingWaveRecord{}
+	case requestledger.OperationAdvanceBeginRoutePinRelease:
+		var advanced requestledger.HeadRecord
+		advanced, err = requestledger.AdvancePendingWithBuild(
+			ledger.head, ledger.pending, cas.Continuation, ledger.build,
+		)
+		if err == nil {
+			ledger.head, err = requestledger.AdvanceHeadRoutePin(
+				advanced, ledger.route, cas.RoutePin, cas.Revision,
+			)
+		}
+		if err == nil {
+			ledger.continuation = cas.Continuation
+			ledger.route = cas.RoutePin
+			ledger.pending = requestledger.PendingWaveRecord{}
+		}
 	default:
 		err = ErrDurableRequestConflict
 	}
@@ -408,8 +424,7 @@ func TestDurableRequestLifecycleRunnerResumesEveryDurableBoundary(t *testing.T) 
 		{"acquire_proposal", requestledger.OperationInvalid, int(replication.CommandRouteGate), routegate.OperationAcquireShared},
 		{"acquire_proof_and_pending", requestledger.OperationRecordRoutePinAcquiredPutPending, -1, 0},
 		{"work_proposal", requestledger.OperationInvalid, int(replication.CommandMutationBatch), 0},
-		{"advance", requestledger.OperationAdvance, -1, 0},
-		{"release_intent", requestledger.OperationBeginRoutePinRelease, -1, 0},
+		{"advance_and_release_intent", requestledger.OperationAdvanceBeginRoutePinRelease, -1, 0},
 		{"release_proposal", requestledger.OperationInvalid, int(replication.CommandRouteGate), routegate.OperationReleaseShared},
 		{"release_proof", requestledger.OperationRecordRoutePinReleased, -1, 0},
 	}
@@ -444,24 +459,33 @@ func TestDurableRequestLifecycleRunnerResumesEveryDurableBoundary(t *testing.T) 
 				ledger.pending.Revision != 0 {
 				t.Fatalf("result=%+v head=%+v route=%+v err=%v", result, ledger.head, ledger.route, err)
 			}
-			casCount, compoundCount := 0, 0
-			legacyAcquireCount, legacyPendingCount := 0, 0
+			casCount, acquiredPendingCount, advanceReleaseCount := 0, 0, 0
+			legacyAcquireCount, legacyPendingCount, legacyAdvanceCount, legacyReleaseCount := 0, 0, 0, 0
 			for _, event := range events.values {
 				switch event {
 				case fmt.Sprintf("cas:%d", requestledger.OperationRecordRoutePinAcquiredPutPending):
-					compoundCount++
+					acquiredPendingCount++
+				case fmt.Sprintf("cas:%d", requestledger.OperationAdvanceBeginRoutePinRelease):
+					advanceReleaseCount++
 				case fmt.Sprintf("cas:%d", requestledger.OperationRecordRoutePinAcquired):
 					legacyAcquireCount++
 				case fmt.Sprintf("cas:%d", requestledger.OperationPutPending):
 					legacyPendingCount++
+				case fmt.Sprintf("cas:%d", requestledger.OperationAdvance):
+					legacyAdvanceCount++
+				case fmt.Sprintf("cas:%d", requestledger.OperationBeginRoutePinRelease):
+					legacyReleaseCount++
 				}
 				if len(event) >= 4 && event[:4] == "cas:" {
 					casCount++
 				}
 			}
-			if casCount != 5 || compoundCount != 1 || legacyAcquireCount != 0 || legacyPendingCount != 0 {
-				t.Fatalf("ledger CAS events=%v; count=%d compound=%d legacy=%d/%d",
-					events.values, casCount, compoundCount, legacyAcquireCount, legacyPendingCount)
+			if casCount != 4 || acquiredPendingCount != 1 || advanceReleaseCount != 1 ||
+				legacyAcquireCount != 0 || legacyPendingCount != 0 ||
+				legacyAdvanceCount != 0 || legacyReleaseCount != 0 {
+				t.Fatalf("ledger CAS events=%v; count=%d compounds=%d/%d legacy=%d/%d/%d/%d",
+					events.values, casCount, acquiredPendingCount, advanceReleaseCount,
+					legacyAcquireCount, legacyPendingCount, legacyAdvanceCount, legacyReleaseCount)
 			}
 			for kind, attempts := range proposer.attempts {
 				byCommand := make(map[[sha256.Size]byte][]byte)

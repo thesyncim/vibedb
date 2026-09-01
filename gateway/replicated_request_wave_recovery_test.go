@@ -181,8 +181,7 @@ func TestDurableRequestStagedWaveResumesAdvancedReleaseWithoutRestaging(t *testi
 		operation requestledger.Operation
 		proposal  bool
 	}{
-		{"advance", requestledger.OperationAdvance, false},
-		{"release-intent", requestledger.OperationBeginRoutePinRelease, false},
+		{"advance-and-release-intent", requestledger.OperationAdvanceBeginRoutePinRelease, false},
 		{"release-proposal", requestledger.OperationInvalid, true},
 		{"release-proof", requestledger.OperationRecordRoutePinReleased, false},
 	} {
@@ -257,7 +256,7 @@ func TestDurableRequestStagedWaveResumesAdvancedReleaseWithoutRestaging(t *testi
 func TestDurableRequestAdvancedPayloadRejectsSubstitutedWitnesses(t *testing.T) {
 	wave, head, route := lifecycleRunnerFixture(t)
 	events := new(lifecycleRunnerEvents)
-	ledger := &advancedWaveLedger{lifecycleRunnerLedger: &lifecycleRunnerLedger{head: head, events: events, fault: requestledger.OperationAdvance},
+	ledger := &advancedWaveLedger{lifecycleRunnerLedger: &lifecycleRunnerLedger{head: head, events: events, fault: requestledger.OperationAdvanceBeginRoutePinRelease},
 		payload: dynamicPayloadLedger{chunks: make(map[uint64]requestledger.PayloadChunkRecord)}}
 	proposer := &lifecycleRunnerProposer{t: t, events: events, faultKind: -1, attempts: make(map[replication.CommandKind][][]byte)}
 	runner, err := newDurableRequestLifecycleRunner(ledger, &lifecycleRunnerResolver{route: route, events: events}, proposer)

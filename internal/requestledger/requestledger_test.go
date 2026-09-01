@@ -877,7 +877,8 @@ func TestIssuerHighwaterCanonicalAntiResurrection(t *testing.T) {
 	}
 	if OperationAdvanceIssuerHighwater != 23 || OperationOpenIssuerLane != 24 ||
 		OperationRecordRoutePinAcquiredPutPending != 25 ||
-		LastOperation != OperationRecordRoutePinAcquiredPutPending {
+		OperationAdvanceBeginRoutePinRelease != 26 ||
+		LastOperation != OperationAdvanceBeginRoutePinRelease {
 		t.Fatal("issuer highwater operation code changed")
 	}
 	wrongSubject := command
@@ -1112,7 +1113,8 @@ func TestRevisionMatrixAndSemanticsSentinels(t *testing.T) {
 		c.Operation = op
 		if op == OperationCreate || op == OperationBeginPayloadBuild || op == OperationOpenIssuerLane {
 			c.ExpectedRevision, c.Revision = 0, 1
-		} else if op == OperationRecordRoutePinAcquiredPutPending {
+		} else if op == OperationRecordRoutePinAcquiredPutPending ||
+			op == OperationAdvanceBeginRoutePinRelease {
 			c.ExpectedRevision, c.Revision = 8, 10
 		} else {
 			c.ExpectedRevision, c.Revision = 8, 9
@@ -1121,7 +1123,8 @@ func TestRevisionMatrixAndSemanticsSentinels(t *testing.T) {
 			t.Fatalf("op %d valid: %v", op, err)
 		}
 		invalid := [][2]uint64{{9, 9}, {9, 11}, {10, 9}, {math.MaxUint64, 0}}
-		if op == OperationRecordRoutePinAcquiredPutPending {
+		if op == OperationRecordRoutePinAcquiredPutPending ||
+			op == OperationAdvanceBeginRoutePinRelease {
 			invalid = [][2]uint64{{9, 9}, {9, 10}, {10, 9}, {math.MaxUint64 - 1, 0}}
 		}
 		for _, pair := range invalid {

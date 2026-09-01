@@ -438,8 +438,8 @@ func TestDurableRequestLogicalContractGolden(t *testing.T) {
 		{"transaction_manifest", program.Contract.TransactionManifestDigest, "51e7388c9e85977a405006ea2d4b44fe374a9f8336f534d63bb2fdfd33082eb3"},
 		// The protocol binds the required persisted command epoch and atomic
 		// terminal pin freeze via KernelSemanticsDigest; terminal binds protocol.
-		{"protocol_program", program.Contract.ProtocolProgramDigest, "547d4e05a9a52b643b64ee25470bfe463c8be1492049549eb0c8dcfe32c319a3"},
-		{"terminal_contract", program.Contract.TerminalContractDigest, "01ea78b9a40a28099fbbaed2a9a86b72ceec769dc42929bf95cec491afa196ab"},
+		{"protocol_program", program.Contract.ProtocolProgramDigest, "6179392b5f300d07674fe5153b35b55f7bf5f4d8babc86f30c84fff574a383ec"},
+		{"terminal_contract", program.Contract.TerminalContractDigest, "9ce7fc23984e901015ece288cd0d731d8dfaade9aff6d82b38571253d9bec36e"},
 		{"retry_home", program.Contract.RetryHomeDerivationDigest, "f8d18eb29f23cf552f4f74ab86fdf1717bcb18c8599c08692941e2dd2163f7a3"},
 		{"plan_build", program.Contract.PlanBuildID, "cd61dffcc1b2288c743473b7fac0ac8fcbdf2bffb64d214ef6a58cf857a24325"},
 	} {
