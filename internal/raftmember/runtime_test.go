@@ -444,8 +444,8 @@ func TestRuntimeBatchesNormalProposalsIntoOneReady(t *testing.T) {
 	if err != nil || lastAfter-lastBefore != uint64(raftmodel.MaxProposalBatchEntries) {
 		t.Fatalf("persisted log range = %d..%d, err=%v", lastBefore, lastAfter, err)
 	}
-	if syncs := fixture.wal.SyncCount() - syncsBefore; syncs != 2 {
-		t.Fatalf("batched Ready sync count = %d, want 2", syncs)
+	if syncs := fixture.wal.SyncCount() - syncsBefore; syncs != 1 {
+		t.Fatalf("batched Ready sync count = %d, want 1", syncs)
 	}
 	recordBytes := remainingBefore - fixture.wal.RemainingBytes()
 	if recordBytes <= 0 || recordBytes > int64(fixture.options.MaxRecordBytes) {
@@ -467,6 +467,48 @@ func TestRuntimeBatchesNormalProposalsIntoOneReady(t *testing.T) {
 		t.Fatalf("proposal across configuration barrier = %v", err)
 	}
 	drainRuntime(t, fixture.runtime, nil)
+}
+
+func TestRuntimeMultiEntryProposalAdmissionIsAllOrNone(t *testing.T) {
+	fixture := newRuntimeFixture(t, 224, nil)
+	drainRuntime(t, fixture.runtime, nil)
+	if err := fixture.runtime.Campaign(); err != nil {
+		t.Fatal(err)
+	}
+	drainRuntime(t, fixture.runtime, nil)
+
+	command := testApplySessionOpen(fixture.base)
+	lastBefore, err := fixture.wal.LastIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = fixture.runtime.ProposeBatch([][]byte{command, nil}); !errors.Is(err, raftmodel.ErrAdmissionBound) {
+		t.Fatalf("malformed ProposeBatch() error = %v", err)
+	}
+	if fixture.runtime.proposalBatchEntries != 0 || fixture.runtime.proposalBatchBytes != 0 {
+		t.Fatalf("refused batch counters = %d/%d", fixture.runtime.proposalBatchEntries, fixture.runtime.proposalBatchBytes)
+	}
+	if last, lastErr := fixture.wal.LastIndex(); lastErr != nil || last != lastBefore {
+		t.Fatalf("refused batch WAL index = %d, %v; want %d", last, lastErr, lastBefore)
+	}
+	if err = fixture.runtime.ProposeBatch([][]byte{command, command}); err != nil {
+		t.Fatalf("valid ProposeBatch() error = %v", err)
+	}
+	if fixture.runtime.proposalBatchEntries != 2 ||
+		fixture.runtime.proposalBatchBytes != int64(2*len(command)) {
+		t.Fatalf("admitted batch counters = %d/%d", fixture.runtime.proposalBatchEntries, fixture.runtime.proposalBatchBytes)
+	}
+	captured, err := fixture.runtime.DriveReady(new(ReadyWorkspace), nil, settleTestApplied)
+	if err != nil || captured.Kind != DriveCaptured {
+		t.Fatalf("DriveReady(capture) = %+v, %v", captured, err)
+	}
+	persisted, err := fixture.runtime.DriveReady(new(ReadyWorkspace), nil, settleTestApplied)
+	if err != nil || persisted.Kind != DrivePersisted || persisted.ReadyID != captured.ReadyID {
+		t.Fatalf("DriveReady(persist) = %+v, %v", persisted, err)
+	}
+	if last, lastErr := fixture.wal.LastIndex(); lastErr != nil || last-lastBefore != 2 {
+		t.Fatalf("multi-entry persisted range = %d..%d, %v", lastBefore, last, lastErr)
+	}
 }
 
 func TestRuntimeProposalBatchByteLimitIsExact(t *testing.T) {

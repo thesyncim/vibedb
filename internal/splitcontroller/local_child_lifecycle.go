@@ -224,7 +224,7 @@ func (l *LocalChildLifecycle) ExecuteAdoptChildRuntime(
 	if l.wal == nil || l.activation.Apply == nil {
 		return ErrTopologyConflict
 	}
-	runtime, err := raftmember.AdoptRuntime(l.wal, l.options.Database, l.activation.Apply)
+	runtime, err := raftmember.AdoptPipelinedRuntime(l.wal, l.options.Database, l.activation.Apply)
 	if err != nil {
 		if runtime != nil {
 			_ = runtime.Close()

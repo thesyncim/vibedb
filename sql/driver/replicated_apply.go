@@ -138,22 +138,25 @@ type ReplicatedApplyCapacityProfile struct {
 // SQL root. Its implementation deliberately does not expose the underlying
 // durable collections, transaction log, or replicated-state Machine.
 type ReplicatedApply struct {
-	owner                *dbConnector
-	database             *database
-	machine              *replicatedstate.Machine
-	table                *table
-	identity             ReplicatedApplyIdentity
-	rangeSplitCapture    *rangesplit.SourceCapture
-	schemaCapture        *schemachange.SourceCapture
-	closed               bool
-	attemptGeneration    uint64
-	attemptActive        bool
-	attemptBatch         bool
-	attemptKeys          replicatedAttemptBinaryKeys
-	walBaseCaptureActive bool
-	walBaseSelectActive  bool
-	walBaseSelectPending bool
-	walBasePending       raftstore.GenerationActivationIdentity
+	owner                   *dbConnector
+	database                *database
+	machine                 *replicatedstate.Machine
+	table                   *table
+	identity                ReplicatedApplyIdentity
+	rangeSplitCapture       *rangesplit.SourceCapture
+	schemaCapture           *schemachange.SourceCapture
+	closed                  bool
+	attemptGeneration       uint64
+	attemptActive           bool
+	attemptBatch            bool
+	attemptKeys             replicatedAttemptBinaryKeys
+	batchCompletionBatches  uint64
+	batchCompletionEntries  uint64
+	batchCompletionComplete uint64
+	walBaseCaptureActive    bool
+	walBaseSelectActive     bool
+	walBaseSelectPending    bool
+	walBasePending          raftstore.GenerationActivationIdentity
 	// exclusiveConnector is set only by a no-copy child-stage handoff. It keeps
 	// SQL sessions fenced until raftmember atomically retires the connector or
 	// the apply claim is explicitly closed.
@@ -173,6 +176,14 @@ type CompletionLookupWorkspace struct {
 	owner   *ReplicatedApply
 }
 
+// ReplicatedApplyBatchCompletionStats reports how often atomic apply produced
+// bounded original results suitable for settlement without a durable lookup.
+type ReplicatedApplyBatchCompletionStats struct {
+	Batches         uint64
+	Entries         uint64
+	CompleteBatches uint64
+}
+
 // replicatedAttemptBinaryKeys is stable storage for the interface value passed
 // into txnclock. Pointing the interface at this claim-owned adapter keeps the
 // synchronous borrowed-key call allocation-free. Keys is cleared immediately
@@ -188,6 +199,7 @@ func (keys *replicatedAttemptBinaryKeys) Key(index int) []byte {
 
 var _ raftmodel.StateMachine = (*ReplicatedApply)(nil)
 var _ raftmodel.NormalBatchStateMachine = (*ReplicatedApply)(nil)
+var _ raftmodel.NormalCompletionBatchStateMachine = (*ReplicatedApply)(nil)
 
 type replicatedApplyMeta struct {
 	Format                           uint16
@@ -1990,6 +2002,76 @@ func (a *ReplicatedApply) ApplyNormalBatch(
 	a.attemptActive = false
 	a.attemptGeneration = 0
 	return applied, publication, err
+}
+
+// ApplyNormalBatchWithCompletions is ApplyNormalBatch with bounded original
+// result capture for the direct settlement lane.
+func (a *ReplicatedApply) ApplyNormalBatchWithCompletions(
+	entries []raftmodel.NormalApply,
+	dataChainWitnesses [][32]byte,
+	completions *raftmodel.NormalApplyBatchCompletions,
+) (int, raftmodel.Publication, error) {
+	if completions == nil {
+		return a.ApplyNormalBatch(entries, dataChainWitnesses)
+	}
+	completions.Reset()
+	clear(dataChainWitnesses[:min(len(entries), len(dataChainWitnesses))])
+	if a == nil || a.database == nil {
+		return 0, raftmodel.Publication{}, ErrReplicatedApplyClosed
+	}
+	a.database.mu.Lock()
+	defer a.database.mu.Unlock()
+	if err := a.checkLocked(); err != nil {
+		return 0, raftmodel.Publication{}, err
+	}
+	if err := a.checkActivationBaseLocked(); err != nil {
+		return 0, raftmodel.Publication{}, err
+	}
+	a.attemptGeneration = a.table.collection.Generation()
+	a.attemptActive = true
+	a.attemptBatch = true
+	applied, publication, err := a.machine.ApplyNormalBatchWithCompletions(
+		entries, dataChainWitnesses, completions,
+	)
+	if err == nil && applied > 0 {
+		a.batchCompletionBatches++
+		captured := 0
+		complete := true
+		for index := 0; index < applied; index++ {
+			if len(entries[index].Data) == 0 {
+				continue
+			}
+			if _, ok := completions.Completion(index); ok {
+				captured++
+			} else {
+				complete = false
+			}
+		}
+		a.batchCompletionEntries += uint64(captured)
+		if complete {
+			a.batchCompletionComplete++
+		}
+	}
+	a.attemptBatch = false
+	a.attemptActive = false
+	a.attemptGeneration = 0
+	return applied, publication, err
+}
+
+// BatchCompletionStats returns a detached fast-settlement counter cut.
+func (a *ReplicatedApply) BatchCompletionStats() ReplicatedApplyBatchCompletionStats {
+	if a == nil || a.database == nil {
+		return ReplicatedApplyBatchCompletionStats{}
+	}
+	a.database.mu.RLock()
+	defer a.database.mu.RUnlock()
+	if a.checkLocked() != nil {
+		return ReplicatedApplyBatchCompletionStats{}
+	}
+	return ReplicatedApplyBatchCompletionStats{
+		Batches: a.batchCompletionBatches, Entries: a.batchCompletionEntries,
+		CompleteBatches: a.batchCompletionComplete,
+	}
 }
 
 // ApplyConfiguration implements raftmodel.StateMachine under the SQL

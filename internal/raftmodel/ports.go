@@ -15,17 +15,21 @@ import (
 // ReadyID. Once bounded canonical admission succeeds or persistence may have
 // begun, reuse of that key with different batch bytes must also be rejected.
 //
-// The pointed-to values are owned by Node and are read-only. Persist must not
-// retain or mutate them. A nil return means that Snapshot, Entries, and
-// HardState have reached stable storage in that order. When MustSync is true,
-// the durability barrier must also be complete before Persist returns.
+// The pointed-to values are owned by Node and are read-only. By default,
+// Persist must not retain or mutate them. TransferOwnership is the asynchronous
+// local-storage fast path: it transfers immutable Entries and HardState to the
+// store on canonical admission, and the caller must never mutate them again.
+// A nil return means that Snapshot, Entries, and HardState have reached stable
+// storage in that order. When MustSync is true, the durability barrier must
+// also be complete before Persist returns.
 type PersistBatch struct {
-	NodeIncarnation uint64
-	ReadyID         uint64
-	HardState       *pb.HardState
-	Entries         []*pb.Entry
-	Snapshot        *pb.Snapshot
-	MustSync        bool
+	NodeIncarnation   uint64
+	ReadyID           uint64
+	HardState         *pb.HardState
+	Entries           []*pb.Entry
+	Snapshot          *pb.Snapshot
+	MustSync          bool
+	TransferOwnership bool
 }
 
 // StableStore is both the recovery view consumed by raft and the atomic,
@@ -78,8 +82,60 @@ type NormalApply struct {
 // across all of its Nodes so the fixed arrays do not scale with group count.
 // It must not be shared by concurrent calls.
 type NormalApplyBatchWorkspace struct {
-	entries   [MaxNormalApplyBatchEntries]NormalApply
-	witnesses [MaxNormalApplyBatchEntries][32]byte
+	entries     [MaxNormalApplyBatchEntries]NormalApply
+	witnesses   [MaxNormalApplyBatchEntries][32]byte
+	completions NormalApplyBatchCompletions
+}
+
+// NormalApplyBatchCompletions is caller-owned bounded scratch for original
+// results produced by a normal batch apply. Results are ephemeral settlement
+// evidence, never a replacement for the durable retry record. The arena is
+// reused by one serialized Ready lane and therefore does not scale with group
+// count.
+type NormalApplyBatchCompletions struct {
+	arena   []byte
+	offsets [MaxNormalApplyBatchEntries]uint32
+	lengths [MaxNormalApplyBatchEntries]uint16
+}
+
+// Reset clears every result while retaining at most the fixed aggregate bound.
+func (completions *NormalApplyBatchCompletions) Reset() {
+	if completions == nil {
+		return
+	}
+	clear(completions.arena)
+	completions.arena = completions.arena[:0]
+	clear(completions.offsets[:])
+	clear(completions.lengths[:])
+}
+
+// Store copies one nonempty original result into bounded caller-owned storage.
+// Each logical entry may publish at most one result.
+func (completions *NormalApplyBatchCompletions) Store(index int, result []byte) error {
+	if completions == nil || index < 0 || index >= MaxNormalApplyBatchEntries ||
+		len(result) == 0 || len(result) > MaxNormalApplyCompletionBytes ||
+		cap(result) > MaxNormalApplyCompletionBytes || completions.lengths[index] != 0 ||
+		len(completions.arena) > MaxNormalApplyBatchEntries*MaxNormalApplyCompletionBytes-len(result) {
+		return fmt.Errorf("raftmodel: invalid normal batch completion")
+	}
+	completions.offsets[index] = uint32(len(completions.arena))
+	completions.lengths[index] = uint16(len(result))
+	completions.arena = append(completions.arena, result...)
+	return nil
+}
+
+// Completion returns one borrowed original result, if the batch apply supplied
+// it. Bytes remain valid only until the pending range is settled.
+func (completions *NormalApplyBatchCompletions) Completion(index int) ([]byte, bool) {
+	if completions == nil || index < 0 || index >= MaxNormalApplyBatchEntries {
+		return nil, false
+	}
+	length := int(completions.lengths[index])
+	offset := int(completions.offsets[index])
+	if length == 0 || offset < 0 || offset > len(completions.arena)-length {
+		return nil, false
+	}
+	return completions.arena[offset : offset+length : offset+length], true
 }
 
 // AppliedNormalBatch identifies one atomically published normal-entry range.
@@ -92,15 +148,39 @@ type AppliedNormalBatch struct {
 	entries     []*pb.Entry
 	publication Publication
 	completion  []byte
+	completions *NormalApplyBatchCompletions
 }
 
 // Completion returns the optional original singleton apply result. Bytes are
 // borrowed with the same lifetime as Entry; absence requests durable lookup.
 func (batch AppliedNormalBatch) Completion(index int) ([]byte, bool) {
-	if index != 0 || len(batch.entries) != 1 || len(batch.completion) == 0 {
-		return nil, false
+	if batch.completions != nil {
+		if completion, ok := batch.completions.Completion(index); ok {
+			return completion, true
+		}
 	}
-	return batch.completion, true
+	if index == 0 && len(batch.entries) == 1 && len(batch.completion) != 0 {
+		return batch.completion, true
+	}
+	return nil, false
+}
+
+// HasCompletionForEveryCommand reports whether settlement can consume this
+// entire range without opening a durable completion snapshot. Empty Raft
+// no-ops have no result and do not prevent the fast path.
+func (batch AppliedNormalBatch) HasCompletionForEveryCommand() bool {
+	for index, entry := range batch.entries {
+		if entry == nil {
+			return false
+		}
+		if len(entry.GetData()) == 0 {
+			continue
+		}
+		if _, ok := batch.Completion(index); !ok {
+			return false
+		}
+	}
+	return len(batch.entries) != 0
 }
 
 // Len returns the exact number of atomically published normal entries.
@@ -220,6 +300,18 @@ type NormalBatchStateMachine interface {
 		publication Publication,
 		err error,
 	)
+}
+
+// NormalCompletionBatchStateMachine optionally carries original bounded
+// results from an atomic batch directly into synchronous settlement. Missing
+// results retain the ordinary durable lookup behavior. On error, or when no
+// prefix is applied, completions must be empty.
+type NormalCompletionBatchStateMachine interface {
+	ApplyNormalBatchWithCompletions(
+		entries []NormalApply,
+		dataChainWitnesses [][32]byte,
+		completions *NormalApplyBatchCompletions,
+	) (applied int, publication Publication, err error)
 }
 
 // validateNormalBatchDataChainWitnesses checks the logical digest walk before

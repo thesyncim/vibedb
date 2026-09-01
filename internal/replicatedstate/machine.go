@@ -57,6 +57,7 @@ type Machine struct {
 	dataChainHash          *dataChainHasher
 	mutationPlan           []finalMutation
 	canonicalMutations     canonicalMutationScratch
+	commandPlanScratch     commandPlanScratch
 	mutationInline         [8]finalMutation
 	bundlePlan             []finalMutation
 	bundleRelations        []plannedRelationChanges
@@ -1835,12 +1836,14 @@ func (m *Machine) validateCompletionResult(completion replication.CompletionView
 func publicationFromState(state State) raftmodel.Publication {
 	return raftmodel.Publication{
 		Applied: state.Applied, DataChainDigest: state.DataChainDigest,
-		ConfState: cloneConfState(state.ConfState), ReplicaSetVersion: state.ReplicaSetVersion,
+		ConfState: state.ConfState, ReplicaSetVersion: state.ReplicaSetVersion,
 	}
 }
 
 func clonePublication(p raftmodel.Publication) raftmodel.Publication {
-	p.ConfState = cloneConfState(p.ConfState)
+	// Publication explicitly exposes StateMachine-owned immutable ConfState.
+	// Copying the value therefore detaches all mutable scalar state without
+	// cloning the same protobuf membership on every normal apply/read cut.
 	return p
 }
 

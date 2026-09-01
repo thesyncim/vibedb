@@ -311,6 +311,18 @@ func (owners *ExecutionOwners) SubmitOwned(ctx context.Context, fence ServingFen
 	}
 	return owner.SubmitOwned(ctx, fence, data)
 }
+func (owners *ExecutionOwners) SubmitOwnedAuthorized(
+	ctx context.Context,
+	fence ServingFence,
+	data []byte,
+	authorize ProposalAuthorization,
+) (Result, error) {
+	owner, err := owners.owner(fence.Group)
+	if err != nil {
+		return Result{}, err
+	}
+	return owner.SubmitOwnedAuthorized(ctx, fence, data, authorize)
+}
 func (owners *ExecutionOwners) ApplyMembership(ctx context.Context, request MembershipRequest) error {
 	owner, err := owners.owner(request.Fence.Group)
 	if err != nil {

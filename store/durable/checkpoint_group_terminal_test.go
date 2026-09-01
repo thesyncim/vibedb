@@ -369,7 +369,6 @@ func checkpointGroupTestStageUncertifiedAtMarkerEpoch(
 
 	write := &WriteBatch{
 		collection: members[0].Collection,
-		position:   make(map[string]int, 1),
 		active:     true,
 	}
 	defer closeDurableWriteBatches([]*WriteBatch{write})

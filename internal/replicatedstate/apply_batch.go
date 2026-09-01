@@ -7,6 +7,7 @@ import (
 	"sync"
 	"unsafe"
 
+	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/store/durable"
@@ -15,6 +16,7 @@ import (
 )
 
 var _ raftmodel.NormalBatchStateMachine = (*Machine)(nil)
+var _ raftmodel.NormalCompletionBatchStateMachine = (*Machine)(nil)
 
 type normalBatchWorkspace struct {
 	system         logicalOverlay
@@ -26,6 +28,8 @@ type normalBatchWorkspace struct {
 	attemptedMarks []logicalOverlayMark
 	plan           commandPlanScratch
 	state          []byte
+	conf           []byte
+	completion     []byte
 	keys           []finalMutation
 }
 
@@ -67,8 +71,18 @@ func (workspace *normalBatchWorkspace) release() uint64 {
 	workspace.attemptedMarks = workspace.attemptedMarks[:0]
 	clear(workspace.state)
 	workspace.state = workspace.state[:0]
+	clear(workspace.conf)
+	workspace.conf = workspace.conf[:0]
+	clear(workspace.completion)
+	workspace.completion = workspace.completion[:0]
 	if cap(workspace.state) > maxNormalBatchRetainedBufferBytes {
 		workspace.state = nil
+	}
+	if cap(workspace.conf) > MaxStateEnvelopeBytes {
+		workspace.conf = nil
+	}
+	if cap(workspace.completion) > raftmodel.MaxNormalApplyCompletionBytes {
+		workspace.completion = nil
 	}
 	if cap(workspace.keys) > maxNormalBatchRetainedOverlayEntries {
 		workspace.keys = nil
@@ -91,6 +105,10 @@ func (workspace *normalBatchWorkspace) retainedBytes() uintptr {
 			uintptr(cap(overlay.undo))*unsafe.Sizeof(logicalOverlayUndo{})
 	}
 	plan := &workspace.plan
+	transactionBytes := cap(plan.transactionControlRecord)
+	for index := range plan.transactionRelationRecord {
+		transactionBytes += cap(plan.transactionRelationRecord[index])
+	}
 	retained := overlayBytes(&workspace.system) + overlayBytes(&workspace.user) +
 		overlayBytes(&workspace.attempted)
 	relationBank := workspace.relationExtra[:cap(workspace.relationExtra)]
@@ -104,8 +122,9 @@ func (workspace *normalBatchWorkspace) retainedBytes() uintptr {
 	return retained +
 		uintptr(cap(plan.sessionRead)+cap(plan.slotRead)+cap(plan.sessionRecord)+
 			cap(plan.slotRecord)+cap(plan.currentValue)+cap(plan.decodeRead)+
-			cap(workspace.state)) +
+			transactionBytes+cap(workspace.state)+cap(workspace.conf)+cap(workspace.completion)) +
 		uintptr(cap(plan.descriptors))*unsafe.Sizeof(mutationValueDescriptor{}) +
+		uintptr(cap(plan.transactionRows))*unsafe.Sizeof(transactionRowMutation{}) +
 		uintptr(cap(workspace.relationMarks)+cap(workspace.attemptedMarks))*
 			unsafe.Sizeof(logicalOverlayMark{}) +
 		uintptr(cap(workspace.keys))*unsafe.Sizeof(finalMutation{})
@@ -146,10 +165,10 @@ func (workspace *normalBatchWorkspace) prepareRelationOverlays(
 	} else {
 		workspace.attemptedMarks = workspace.attemptedMarks[:count]
 	}
-	workspace.user.reset(snapshots.values[0].value)
+	workspace.user.resetPoint(snapshots.values[0])
 	workspace.attempted.reset(nil)
 	for i := range extra {
-		workspace.relationExtra[i].reset(snapshots.values[i+1].value)
+		workspace.relationExtra[i].resetPoint(snapshots.values[i+1])
 		workspace.attemptedExtra[i].reset(nil)
 	}
 	return true
@@ -183,6 +202,19 @@ func (workspace *normalBatchWorkspace) attemptedOverlay(ordinal int) *logicalOve
 	return &workspace.attemptedExtra[ordinal]
 }
 
+func isSingleParticipantBatchCommand(data []byte) bool {
+	command, err := replication.OpenCommand(data)
+	return err == nil && isSingleParticipantCommand(command)
+}
+
+func isSingleParticipantCommand(command replication.CommandView) bool {
+	if command.Kind() != replication.CommandTransaction {
+		return false
+	}
+	control, err := distributedtxn.OpenReplicatedCommand(command.TransactionBytes())
+	return err == nil && control.Operation == distributedtxn.ReplicatedApplySingleParticipant
+}
+
 // ApplyNormalBatch plans a bounded consecutive normal-entry run against one
 // coherent durable cut plus binary-key logical overlays, then publishes the
 // exact accepted prefix through one CheckpointGroup transaction. It is
@@ -194,6 +226,34 @@ func (workspace *normalBatchWorkspace) attemptedOverlay(ordinal int) *logicalOve
 func (m *Machine) ApplyNormalBatch(
 	entries []raftmodel.NormalApply,
 	dataChainWitnesses [][32]byte,
+) (int, raftmodel.Publication, error) {
+	return m.applyNormalBatch(entries, dataChainWitnesses, nil)
+}
+
+// ApplyNormalBatchWithCompletions captures deterministic direct-transaction
+// results in caller-owned bounded storage so synchronous settlement does not
+// need to checkpoint merely to read the state just published.
+func (m *Machine) ApplyNormalBatchWithCompletions(
+	entries []raftmodel.NormalApply,
+	dataChainWitnesses [][32]byte,
+	completions *raftmodel.NormalApplyBatchCompletions,
+) (int, raftmodel.Publication, error) {
+	if completions != nil {
+		completions.Reset()
+	}
+	applied, publication, err := m.applyNormalBatch(entries, dataChainWitnesses, completions)
+	if err != nil || applied == 0 {
+		if completions != nil {
+			completions.Reset()
+		}
+	}
+	return applied, publication, err
+}
+
+func (m *Machine) applyNormalBatch(
+	entries []raftmodel.NormalApply,
+	dataChainWitnesses [][32]byte,
+	completions *raftmodel.NormalApplyBatchCompletions,
 ) (int, raftmodel.Publication, error) {
 	if len(entries) == 0 {
 		return 0, raftmodel.Publication{}, nil
@@ -235,9 +295,21 @@ func (m *Machine) ApplyNormalBatch(
 		return 0, raftmodel.Publication{}, nil
 	}
 
-	systemSnapshot, relationSnapshots, err := m.captureHotBundleApplyCutLocked()
-	if err != nil {
-		return 0, raftmodel.Publication{}, m.fail(err)
+	var systemBase pointSnapshot
+	var relationSnapshots relationPointSnapshots
+	if isSingleParticipantBatchCommand(first.Data) {
+		systemBase.live = m.system.Collection
+		relationSnapshots.count = uint16(len(m.relations))
+		for ordinal := range m.relations {
+			relationSnapshots.values[ordinal].live = m.relations[ordinal].target.Collection
+		}
+	} else {
+		systemSnapshot, snapshots, err := m.captureHotBundleApplyCutLocked()
+		if err != nil {
+			return 0, raftmodel.Publication{}, m.fail(err)
+		}
+		systemBase.value = systemSnapshot
+		relationSnapshots = snapshots
 	}
 	batch := normalBatchWorkspacePool.Get().(*normalBatchWorkspace)
 	defer func() {
@@ -253,7 +325,7 @@ func (m *Machine) ApplyNormalBatch(
 		m.batchTelemetry = telemetry
 		normalBatchWorkspacePool.Put(batch)
 	}()
-	batch.system.reset(systemSnapshot)
+	batch.system.resetPoint(systemBase)
 	if !batch.prepareRelationOverlays(relationSnapshots) {
 		return 0, raftmodel.Publication{}, m.fail(errors.Join(
 			ErrInconsistentSnapshot, m.applyCut.Close(),
@@ -276,6 +348,14 @@ func (m *Machine) ApplyNormalBatch(
 	}
 	stateEnvelopeBytes := len(batch.state)
 	confBytes := proto.Size(m.state.ConfState)
+	batch.conf, stateErr = proto.MarshalOptions{Deterministic: true}.MarshalAppend(
+		batch.conf[:0], m.state.ConfState,
+	)
+	if stateErr != nil || len(batch.conf) != confBytes {
+		return 0, raftmodel.Publication{}, m.fail(errors.Join(
+			ErrStateCorrupt, stateErr, m.applyCut.Close(),
+		))
+	}
 	batch.state = batch.state[:0]
 	working := m.state
 	planned := 0
@@ -316,6 +396,10 @@ func (m *Machine) ApplyNormalBatch(
 		digest := normalEntryDigest(meta, data)
 		next := m.nextBatchState(working, meta, digest)
 		plan := commandPlan{dataChainDigest: working.DataChainDigest}
+		transaction := false
+		var transactionCommand distributedtxn.ReplicatedCommandView
+		var transactionRows []transactionRowMutation
+		var originalCompletion []byte
 		if len(data) != 0 {
 			command, openErr := replication.OpenCommand(data)
 			if openErr != nil {
@@ -326,12 +410,23 @@ func (m *Machine) ApplyNormalBatch(
 				deferredErr = ErrWrongBinding
 				break
 			}
-			if command.Kind() == replication.CommandTransaction ||
-				command.Kind() == replication.CommandRequestLedger ||
+			if command.Kind() == replication.CommandRequestLedger ||
 				command.Kind() == replication.CommandRouteGate ||
 				command.Kind() == replication.CommandExecutionPin ||
 				command.Kind() == replication.CommandSplitCaptureActivate {
 				break
+			}
+			transaction = command.Kind() == replication.CommandTransaction
+			if transaction {
+				control, controlErr := distributedtxn.OpenReplicatedCommand(command.TransactionBytes())
+				if controlErr != nil {
+					deferredErr = controlErr
+					break
+				}
+				if control.Operation != distributedtxn.ReplicatedApplySingleParticipant {
+					break
+				}
+				transactionCommand = control
 			}
 			sessionDigest := sessionAuthorityIdentityKey(command.AuthorityClass, command.Tenant, command.ClientID)
 			seen := false
@@ -346,17 +441,50 @@ func (m *Machine) ApplyNormalBatch(
 			}
 			selectedSessionDigests[selectedSessions] = sessionDigest
 			selectedSessions++
-			plan, deferredErr = m.planBundleCommand(
-				command, meta.Index, working,
-				pointSnapshot{value: systemSnapshot, overlay: &batch.system},
-				planningSnapshots,
-				&batch.plan,
-			)
+			var transactionDelta transactionStateDelta
+			if transaction {
+				transactionPlan, planErr := m.planTransactionCommand(
+					command, meta.Index, working,
+					pointSnapshot{overlay: &batch.system},
+					planningSnapshots, &batch.plan,
+				)
+				plan, transactionRows, transactionDelta =
+					transactionPlan.command, transactionPlan.rows, transactionPlan.delta
+				deferredErr = planErr
+				if deferredErr == nil && completions != nil && len(transactionRows) == 1 &&
+					!transactionRows[0].delete && len(transactionRows[0].value) != 0 {
+					controlView, controlErr := OpenTransactionControl(transactionRows[0].value)
+					if controlErr != nil {
+						deferredErr = controlErr
+					} else {
+						batch.completion, deferredErr = m.appendTransactionCompletion(
+							batch.completion[:0], command, transactionCommand,
+							controlView.TransactionControl, plan.resultCode, true,
+						)
+						originalCompletion = batch.completion
+					}
+				}
+			} else {
+				plan, deferredErr = m.planBundleCommand(
+					command, meta.Index, working,
+					pointSnapshot{overlay: &batch.system},
+					planningSnapshots,
+					&batch.plan,
+				)
+			}
 			if deferredErr != nil {
+				deferredErr = fmt.Errorf("%w: plan normal batch entry %d", deferredErr, meta.Index)
 				break
 			}
 			if deferredErr = applyCommandPlanToState(&next, plan); deferredErr != nil {
+				deferredErr = fmt.Errorf("%w: apply normal batch state at entry %d", deferredErr, meta.Index)
 				break
+			}
+			if transaction {
+				if deferredErr = applyTransactionStateDelta(&next, transactionDelta); deferredErr != nil {
+					deferredErr = fmt.Errorf("%w: apply transaction batch state at entry %d", deferredErr, meta.Index)
+					break
+				}
 			}
 		}
 
@@ -375,6 +503,22 @@ func (m *Machine) ApplyNormalBatch(
 			batch.attemptedMarks[ordinal] = batch.attemptedOverlay(ordinal).mark()
 		}
 		if deferredErr = m.recordBatchPlan(batch, plan); deferredErr != nil {
+			deferredErr = fmt.Errorf("%w: record normal batch entry %d", deferredErr, meta.Index)
+			batch.system.rollback(systemMark)
+			for ordinal := range m.relations {
+				batch.relationOverlay(ordinal).rollback(batch.relationMarks[ordinal])
+				batch.attemptedOverlay(ordinal).rollback(batch.attemptedMarks[ordinal])
+			}
+			break
+		}
+		for rowIndex := range transactionRows {
+			row := &transactionRows[rowIndex]
+			if deferredErr = batch.system.record(row.key, row.value, row.delete); deferredErr != nil {
+				deferredErr = fmt.Errorf("%w: record transaction row at entry %d", deferredErr, meta.Index)
+				break
+			}
+		}
+		if deferredErr != nil {
 			batch.system.rollback(systemMark)
 			for ordinal := range m.relations {
 				batch.relationOverlay(ordinal).rollback(batch.relationMarks[ordinal])
@@ -390,6 +534,16 @@ func (m *Machine) ApplyNormalBatch(
 			}
 			deferredErr = ErrAdmissionBound
 			break
+		}
+		if len(originalCompletion) != 0 {
+			if deferredErr = completions.Store(planned, originalCompletion); deferredErr != nil {
+				batch.system.rollback(systemMark)
+				for ordinal := range m.relations {
+					batch.relationOverlay(ordinal).rollback(batch.relationMarks[ordinal])
+					batch.attemptedOverlay(ordinal).rollback(batch.attemptedMarks[ordinal])
+				}
+				break
+			}
 		}
 		batch.system.commit(systemMark)
 		for ordinal := range m.relations {
@@ -428,7 +582,7 @@ func (m *Machine) ApplyNormalBatch(
 			)
 		}
 		if finalizeErr == nil {
-			batch.state, finalizeErr = AppendState(batch.state[:0], working)
+			batch.state, finalizeErr = appendStateWithConf(batch.state[:0], working, batch.conf)
 		}
 		if finalizeErr == nil && len(batch.state) != stateEnvelopeBytes {
 			finalizeErr = fmt.Errorf(
@@ -444,6 +598,9 @@ func (m *Machine) ApplyNormalBatch(
 	}
 	closeErr := m.applyCut.Close()
 	if finalizeErr != nil || closeErr != nil {
+		if completions != nil {
+			completions.Reset()
+		}
 		clear(dataChainWitnesses[:planned])
 		return 0, raftmodel.Publication{}, m.fail(errors.Join(finalizeErr, closeErr))
 	}
@@ -519,6 +676,9 @@ func (m *Machine) ApplyNormalBatch(
 		observer(AttemptedMutationKeys{changes: batch.keys}, updateErr)
 	}
 	if updateErr != nil {
+		if completions != nil {
+			completions.Reset()
+		}
 		clear(dataChainWitnesses[:planned])
 		return 0, raftmodel.Publication{}, m.fail(updateErr)
 	}

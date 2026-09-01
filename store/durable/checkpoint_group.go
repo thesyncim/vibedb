@@ -214,6 +214,10 @@ type CheckpointGroupStats struct {
 	CertificateSyncs    uint64
 	BarrierSyncs        uint64
 	PhysicalCheckpoints uint64
+	ExplicitCheckpoints uint64
+	PeriodicCheckpoints uint64
+	PressureCheckpoints uint64
+	MarkerCheckpoints   uint64
 }
 
 // CheckpointRetentionWitness is the fixed-width authenticated evidence that
@@ -287,6 +291,7 @@ type CheckpointGroup struct {
 	opts     CheckpointGroupOptions
 	file     *os.File
 	fileInfo os.FileInfo
+	batch    checkpointGroupBatchWorkspace
 
 	sequence            uint64
 	txnBase             uint64
@@ -327,6 +332,109 @@ type CheckpointGroup struct {
 	certificateSyncs    atomic.Uint64
 	barrierSyncs        atomic.Uint64
 	physicalCheckpoints atomic.Uint64
+	explicitCheckpoints atomic.Uint64
+	periodicCheckpoints atomic.Uint64
+	pressureCheckpoints atomic.Uint64
+	markerCheckpoints   atomic.Uint64
+}
+
+// checkpointGroupBatchWorkspace is protected by CheckpointGroup.mu. Fixed
+// group ownership means every update can reuse the same bounded staging
+// handles, dedup maps, and byte arenas; only cold growth allocates. The public
+// DatabaseBatch remains valid solely for the callback, exactly as before.
+type checkpointGroupBatchWorkspace struct {
+	database     DatabaseBatch
+	byName       map[string]*WriteBatch
+	writeBatches []WriteBatch
+	batches      []*WriteBatch
+	dirty        []NamedCollection
+}
+
+func (workspace *checkpointGroupBatchWorkspace) prepare(
+	members []NamedCollection,
+) (*DatabaseBatch, error) {
+	if len(members) == 0 {
+		return nil, nil
+	}
+	for index := range members {
+		member := members[index]
+		if member.Name == "" {
+			return nil, ErrCollectionName
+		}
+		if member.Collection == nil {
+			return nil, fmt.Errorf("%w: nil collection %q", ErrTxnParticipant, member.Name)
+		}
+		if member.BatchDocumentsHint < 0 ||
+			member.BatchDocumentsHint > member.Collection.options.MaxBatchDocuments {
+			return nil, fmt.Errorf(
+				"%w: collection %q batch hint %d exceeds [0,%d]",
+				ErrTxnParticipant, member.Name, member.BatchDocumentsHint,
+				member.Collection.options.MaxBatchDocuments,
+			)
+		}
+		for prior := range index {
+			if members[prior].Name == member.Name {
+				return nil, fmt.Errorf(
+					"%w: duplicate name %q", ErrTxnParticipant, member.Name,
+				)
+			}
+			if members[prior].Collection == member.Collection {
+				return nil, fmt.Errorf(
+					"vibedb: one durable collection cannot be cataloged as both %q and %q",
+					members[prior].Name, member.Name,
+				)
+			}
+		}
+	}
+	if workspace.byName == nil {
+		workspace.byName = make(map[string]*WriteBatch, len(members))
+	} else {
+		clear(workspace.byName)
+	}
+	if cap(workspace.writeBatches) < len(members) {
+		workspace.writeBatches = make([]WriteBatch, len(members))
+	} else {
+		workspace.writeBatches = workspace.writeBatches[:len(members)]
+	}
+	if cap(workspace.batches) < len(members) {
+		workspace.batches = make([]*WriteBatch, len(members))
+	} else {
+		workspace.batches = workspace.batches[:len(members)]
+	}
+	for index, member := range members {
+		write := &workspace.writeBatches[index]
+		write.collection = member.Collection
+		hint := member.BatchDocumentsHint
+		if hint == 0 {
+			hint = member.Collection.options.MaxBatchDocuments
+		}
+		write.ensurePositionCapacity(hint)
+		write.reset()
+		write.active = true
+		workspace.batches[index] = write
+		workspace.byName[member.Name] = write
+	}
+	workspace.database.byName = workspace.byName
+	workspace.database.members = members
+	workspace.database.batches = workspace.batches
+	workspace.dirty = workspace.dirty[:0]
+	return &workspace.database, nil
+}
+
+func (workspace *checkpointGroupBatchWorkspace) release() {
+	for index := range workspace.batches {
+		write := workspace.batches[index]
+		if write != nil {
+			write.active = false
+			write.reset()
+		}
+		workspace.batches[index] = nil
+	}
+	clear(workspace.byName)
+	clear(workspace.dirty)
+	workspace.batches = workspace.batches[:0]
+	workspace.dirty = workspace.dirty[:0]
+	workspace.database = DatabaseBatch{}
 }
 
 // checkpointGroupFaultPoint is a package test seam. Production leaves the hook
@@ -1342,6 +1450,10 @@ func (g *CheckpointGroup) Stats() CheckpointGroupStats {
 		JournalSyncs: journal, MarkerSyncs: marker,
 		CertificateSyncs: certificate, BarrierSyncs: g.barrierSyncs.Load(),
 		PhysicalCheckpoints: g.physicalCheckpoints.Load(),
+		ExplicitCheckpoints: g.explicitCheckpoints.Load(),
+		PeriodicCheckpoints: g.periodicCheckpoints.Load(),
+		PressureCheckpoints: g.pressureCheckpoints.Load(),
+		MarkerCheckpoints:   g.markerCheckpoints.Load(),
 	}
 }
 
@@ -1406,9 +1518,9 @@ func (g *CheckpointGroup) Seed(
 
 	wb := &WriteBatch{
 		collection: owned,
-		position:   make(map[string]int, 1),
 		active:     true,
 	}
+	wb.ensurePositionCapacity(1)
 	defer closeDurableWriteBatches([]*WriteBatch{wb})
 	if err := wb.Put(key, seed.Envelope); err != nil {
 		return err
@@ -1558,10 +1670,15 @@ func (g *CheckpointGroup) updateLocked(
 			ErrCheckpointGroupSequence, g.applied, update.lastApplied,
 		)
 	}
-	ordered, err := validateTxnMembers(members)
+	batch, err := g.batch.prepare(members)
 	if err != nil {
 		return err
 	}
+	if batch == nil {
+		return fmt.Errorf("%w: transition has no durable mutation", ErrCheckpointGroupSequence)
+	}
+	defer g.batch.release()
+	ordered := members
 	for _, member := range ordered {
 		if owned := g.byName[member.Name]; owned == nil || owned != member.Collection {
 			return fmt.Errorf(
@@ -1613,35 +1730,20 @@ func (g *CheckpointGroup) updateLocked(
 	// a terminal checkpoint error after its requested publication is visible.
 	checkpointDue := g.txn-g.certTxn.Load() >= g.opts.CheckpointEvery
 	if checkpointDue {
+		before := g.checkpoints.Load()
 		if err := g.checkpointLocked(); err != nil {
 			return err
 		}
+		if g.checkpoints.Load() != before {
+			g.periodicCheckpoints.Add(1)
+		}
 	}
 
-	batch := &DatabaseBatch{
-		byName:  make(map[string]*WriteBatch, len(ordered)),
-		members: ordered,
-	}
-	batches := make([]*WriteBatch, len(ordered))
-	batch.batches = batches
-	for i, member := range ordered {
-		hint := member.BatchDocumentsHint
-		if hint == 0 {
-			hint = member.Collection.options.MaxBatchDocuments
-		}
-		wb := &WriteBatch{
-			collection: member.Collection,
-			position:   make(map[string]int, hint), active: true,
-		}
-		batches[i] = wb
-		batch.byName[member.Name] = wb
-	}
-	defer closeDurableWriteBatches(batches)
 	if err := fn(batch); err != nil {
 		return err
 	}
 
-	dirty := make([]NamedCollection, 0, len(ordered))
+	dirty := g.batch.dirty[:0]
 	totalDocs := 0
 	var totalBytes int64
 	for _, member := range ordered {
@@ -1653,6 +1755,7 @@ func (g *CheckpointGroup) updateLocked(
 		totalDocs += wb.Len()
 		totalBytes += int64(len(wb.keys) + len(wb.values))
 	}
+	g.batch.dirty = dirty
 	if len(dirty) == 0 {
 		return fmt.Errorf("%w: transition has no durable mutation", ErrCheckpointGroupSequence)
 	}
@@ -1685,8 +1788,12 @@ func (g *CheckpointGroup) updateLocked(
 			if err := g.requireCertificateSequenceBudgetLocked(requiredSequences); err != nil {
 				return err
 			}
+			before := g.checkpoints.Load()
 			if err := g.checkpointLocked(); err != nil {
 				return err
+			}
+			if g.checkpoints.Load() != before {
+				g.markerCheckpoints.Add(1)
 			}
 			if err := g.recycleMarkerLocked(); err != nil {
 				return err
@@ -1726,8 +1833,12 @@ func (g *CheckpointGroup) updateLocked(
 		if err := g.requireCertificateSequenceBudgetLocked(requiredSequences); err != nil {
 			return err
 		}
+		before := g.checkpoints.Load()
 		if err := g.checkpointLocked(); err != nil {
 			return err
+		}
+		if g.checkpoints.Load() != before {
+			g.pressureCheckpoints.Add(1)
 		}
 	}
 	return ErrCheckpointGroupPressure
@@ -2086,7 +2197,12 @@ func (g *CheckpointGroup) Checkpoint() error {
 	if err := g.checkUsableLocked(); err != nil {
 		return err
 	}
-	return g.checkpointLocked()
+	before := g.checkpoints.Load()
+	err := g.checkpointLocked()
+	if err == nil && g.checkpoints.Load() != before {
+		g.explicitCheckpoints.Add(1)
+	}
+	return err
 }
 
 // SealRetentionFloor installs one explicit retained floor in both authenticated

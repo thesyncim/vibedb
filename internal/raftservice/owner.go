@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/thesyncim/vibedb/internal/executionpin"
 	"github.com/thesyncim/vibedb/internal/membershipgrant"
@@ -23,6 +24,22 @@ import (
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	pb "go.etcd.io/raft/v3/raftpb"
+)
+
+const (
+	// One full closed-loop client wave shares a Ready durability boundary. The
+	// owner still progresses prior Ready and peer acknowledgements while the
+	// successor window is assembled.
+	proposalIngressBatchEntries   = raftmodel.MaxProposalBatchEntries
+	proposalIngressCoalesceWindow = 500 * time.Microsecond
+	proposalIngressGraceWindow    = time.Millisecond
+	proposalIngressRecoveryWindow = time.Millisecond
+	proposalIngressRecoveryRounds = 8
+	// A learned closed-loop cohort may transiently dip while one completion is
+	// still being delivered. Give that cohort one unconditional recovery turn
+	// before consulting the live pending count, avoiding a nearly-full Raft/WAL
+	// wave followed by a singleton without imposing a persistent tail delay.
+	proposalIngressGraceRounds = 1
 )
 
 var (
@@ -43,6 +60,9 @@ var (
 	// ErrServingFence reports a request addressed to another local Runtime
 	// incarnation, allocation, or leadership term.
 	ErrServingFence = errors.New("raftservice: stale serving fence")
+	// ErrServingAuthorization reports that a dynamic local serving gate denied
+	// an otherwise current serialized proposal cut.
+	ErrServingAuthorization = errors.New("raftservice: serving authorization denied")
 	// ErrOutcomeUnknown reports cancellation or owner loss after the exact
 	// command entered the serving registry. Retrying the same command bytes is
 	// safe; changing its request identity is not.
@@ -150,6 +170,7 @@ type ownerRequest struct {
 	bytes        int64
 	async        bool
 	delivery     *proposalDelivery
+	authorize    ProposalAuthorization
 	membership   MembershipRequest
 	read         readRequest
 	targetMember uint64
@@ -316,7 +337,17 @@ type ExecutionPinSource interface {
 type Result struct {
 	Outcome    raftserve.Outcome
 	Completion []byte
+	// State is the exact serialized serving cut that admitted the proposal.
+	// Settlement can advance its monotonic applied watermark without a second
+	// owner-lane probe or pairing the result with a later fence generation.
+	State ServingState
 }
+
+// ProposalAuthorization is an allocation-free, non-blocking authority check
+// evaluated by the serialized owner against the same serving cut used for
+// proposal admission. It lets the native server fuse its dynamic serving gate
+// with fence validation instead of issuing a separate preflight Probe.
+type ProposalAuthorization func(ServingState) bool
 
 // PointReadRequest selects one dense relation and exact consistency contract.
 // Linearizable uses a leader ReadIndex barrier. Follower mode serves only when
@@ -645,10 +676,13 @@ type Owner struct {
 	ingressBytes         int64
 	pendingProposalItems int
 	pendingProposalBytes int64
+	pendingProposalGroup map[raftmember.GroupKey]int
 	pendingReadItems     int
 	pendingReadBytes     int64
 	readSequence         uint64
 	pendingReads         map[[16]byte]*readDelivery
+	proposalCohort       map[raftmember.GroupKey]int
+	proposalCohortMisses map[raftmember.GroupKey]uint8
 	started              bool
 	closed               bool
 	failure              error
@@ -684,6 +718,11 @@ type ownerHost interface {
 	RunOne() (multiraft.Progress, bool, error)
 	PopOutbound() (raftmember.OutboundMessage, bool)
 	Close() error
+}
+
+type asyncOwnerHost interface {
+	AsyncNotify() <-chan struct{}
+	WakePipelined()
 }
 
 type MembershipAuthority interface {
@@ -824,18 +863,187 @@ func newOwner(options Options, host ownerHost, allowEmpty bool) (*Owner, error) 
 	return &Owner{
 		registry: options.Registry, host: host, groups: groups, members: members,
 		outbound: options.Outbound, pulse: options.Pulse, limits: limits,
-		authority:    options.MembershipAuthority,
-		metrics:      options.ProgressMetrics,
-		ingress:      make(chan ownerRequest, limits.MaxIngressItems),
-		ready:        make(chan struct{}),
-		done:         make(chan struct{}),
-		pendingReads: make(map[[16]byte]*readDelivery, limits.MaxPendingReadItems),
+		authority:            options.MembershipAuthority,
+		metrics:              options.ProgressMetrics,
+		ingress:              make(chan ownerRequest, limits.MaxIngressItems),
+		ready:                make(chan struct{}),
+		done:                 make(chan struct{}),
+		pendingReads:         make(map[[16]byte]*readDelivery, limits.MaxPendingReadItems),
+		pendingProposalGroup: make(map[raftmember.GroupKey]int, len(groups)),
+		proposalCohort:       make(map[raftmember.GroupKey]int, len(groups)),
 	}, nil
+}
+
+// proposalIngressCollector holds only bounded, already-accounted client
+// requests. It never calls Host itself. The owner continues to drain Ready,
+// send Raft traffic, and adopt peer messages while a successor proposal cohort
+// is assembled, so closed-loop callers do not have to complete the preceding
+// round before its acknowledgements can be processed.
+type proposalIngressCollector struct {
+	requests []ownerRequest
+	group    raftmember.GroupKey
+	bytes    int64
+	target   int
+	known    bool
+	rounds   int
+	observed bool
+	timer    *time.Timer
+	timerC   <-chan time.Time
+}
+
+func newProposalIngressCollector(capacity int) proposalIngressCollector {
+	capacity = min(capacity, proposalIngressBatchEntries)
+	return proposalIngressCollector{requests: make([]ownerRequest, 0, capacity)}
+}
+
+func (collector *proposalIngressCollector) active() bool {
+	return collector != nil && len(collector.requests) != 0
+}
+
+func (collector *proposalIngressCollector) stopTimer() {
+	if collector == nil {
+		return
+	}
+	collector.timerC = nil
+	if collector.timer == nil || collector.timer.Stop() {
+		return
+	}
+	select {
+	case <-collector.timer.C:
+	default:
+	}
+}
+
+func (collector *proposalIngressCollector) resetTimer(window time.Duration) {
+	collector.stopTimer()
+	if collector.timer == nil {
+		collector.timer = time.NewTimer(window)
+	} else {
+		collector.timer.Reset(window)
+	}
+	collector.timerC = collector.timer.C
+}
+
+func (collector *proposalIngressCollector) start(owner *Owner, request ownerRequest) {
+	collector.group = request.group
+	collector.requests = append(collector.requests, request)
+	collector.bytes = int64(len(request.data))
+	collector.target = owner.proposalCohort[request.group]
+	owner.mu.Lock()
+	collector.target = max(collector.target, owner.pendingProposalGroup[request.group])
+	owner.mu.Unlock()
+	collector.target = min(collector.target, cap(collector.requests))
+	collector.known = collector.target > 1
+	if collector.known {
+		if owner.proposalCohort == nil {
+			owner.proposalCohort = make(map[raftmember.GroupKey]int)
+		}
+		owner.proposalCohort[request.group] = max(
+			owner.proposalCohort[request.group], collector.target,
+		)
+	}
+	collector.rounds = 0
+	collector.resetTimer(proposalIngressCoalesceWindow)
+}
+
+func proposalIngressCandidate(request ownerRequest) bool {
+	return request.kind == requestProposal && len(request.data) > 0 &&
+		len(request.data) < int(raftmodel.MaxProposalBatchBytes)
+}
+
+func (collector *proposalIngressCollector) accepts(request ownerRequest) bool {
+	return collector.active() && proposalIngressCandidate(request) &&
+		request.group == collector.group &&
+		len(collector.requests) < cap(collector.requests) &&
+		int64(len(request.data)) <= raftmodel.MaxProposalBatchBytes-collector.bytes
+}
+
+func (collector *proposalIngressCollector) append(request ownerRequest) {
+	collector.requests = append(collector.requests, request)
+	collector.bytes += int64(len(request.data))
+}
+
+func (collector *proposalIngressCollector) full() bool {
+	return collector.active() && (collector.known && len(collector.requests) >= collector.target ||
+		len(collector.requests) == cap(collector.requests) ||
+		collector.bytes == raftmodel.MaxProposalBatchBytes)
+}
+
+func (collector *proposalIngressCollector) expire(owner *Owner) bool {
+	collector.timerC = nil
+	if collector.known && len(collector.requests) < collector.target &&
+		collector.rounds < proposalIngressRecoveryRounds {
+		owner.mu.Lock()
+		pending := owner.pendingProposalGroup[collector.group]
+		owner.mu.Unlock()
+		if collector.rounds < proposalIngressGraceRounds || pending >= collector.target {
+			collector.rounds++
+			window := proposalIngressRecoveryWindow
+			if collector.rounds <= proposalIngressGraceRounds {
+				window = proposalIngressGraceWindow
+			}
+			collector.resetTimer(window)
+			return false
+		}
+	}
+	collector.observe(owner)
+	return true
+}
+
+const proposalCohortDecayMisses = 8
+
+// observe updates the learned closed-loop cohort with hysteresis. A single
+// straggler must not permanently fragment every later wave, while a real
+// client-count reduction converges after a bounded number of partial windows.
+func (collector *proposalIngressCollector) observe(owner *Owner) {
+	if collector == nil || owner == nil || collector.observed || !collector.active() {
+		return
+	}
+	collector.observed = true
+	learned := len(collector.requests)
+	owner.mu.Lock()
+	learned = max(learned, owner.pendingProposalGroup[collector.group])
+	owner.mu.Unlock()
+	learned = min(learned, cap(collector.requests))
+	if owner.proposalCohort == nil {
+		owner.proposalCohort = make(map[raftmember.GroupKey]int)
+	}
+	current := owner.proposalCohort[collector.group]
+	if learned >= current {
+		owner.proposalCohort[collector.group] = learned
+		if owner.proposalCohortMisses != nil {
+			delete(owner.proposalCohortMisses, collector.group)
+		}
+		return
+	}
+	if owner.proposalCohortMisses == nil {
+		owner.proposalCohortMisses = make(map[raftmember.GroupKey]uint8)
+	}
+	misses := owner.proposalCohortMisses[collector.group] + 1
+	if misses < proposalCohortDecayMisses {
+		owner.proposalCohortMisses[collector.group] = misses
+		return
+	}
+	step := max(1, current/4)
+	owner.proposalCohort[collector.group] = max(learned, current-step)
+	delete(owner.proposalCohortMisses, collector.group)
+}
+
+func (collector *proposalIngressCollector) reset() {
+	collector.stopTimer()
+	clear(collector.requests)
+	collector.requests = collector.requests[:0]
+	collector.group = raftmember.GroupKey{}
+	collector.bytes = 0
+	collector.target = 0
+	collector.known = false
+	collector.rounds = 0
+	collector.observed = false
 }
 
 // Run becomes the sole Host owner until ctx is canceled or a terminal lane
 // failure occurs. It may be called exactly once.
-func (owner *Owner) Run(ctx context.Context) error {
+func (owner *Owner) Run(ctx context.Context) (runErr error) {
 	if owner == nil || ctx == nil {
 		return ErrInvalidOwner
 	}
@@ -853,6 +1061,50 @@ func (owner *Owner) Run(ctx context.Context) error {
 
 	var pending raftmember.OutboundMessage
 	readyBlocked := false
+	collector := newProposalIngressCollector(owner.limits.MaxIngressItems)
+	var asyncNotify <-chan struct{}
+	var asyncHost asyncOwnerHost
+	if host, ok := owner.host.(asyncOwnerHost); ok {
+		asyncHost = host
+		asyncNotify = host.AsyncNotify()
+	}
+	handleRequest := func(request ownerRequest) error {
+		err := owner.handle(request)
+		owner.release(request.bytes)
+		if request.async && err != nil {
+			return err
+		}
+		return nil
+	}
+	failCollected := func(cause error) {
+		for _, request := range collector.requests {
+			request.reply <- ownerReply{err: cause}
+			owner.release(request.bytes)
+		}
+		collector.reset()
+	}
+	flushCollected := func() error {
+		collector.stopTimer()
+		collector.observe(owner)
+		for index, request := range collector.requests {
+			if err := handleRequest(request); err != nil {
+				for _, retained := range collector.requests[index+1:] {
+					retained.reply <- ownerReply{err: errors.Join(ErrOwnerClosed, err)}
+					owner.release(retained.bytes)
+				}
+				collector.reset()
+				return err
+			}
+		}
+		collector.reset()
+		return nil
+	}
+	defer func() {
+		if collector.active() {
+			failCollected(errors.Join(ErrOwnerClosed, runErr))
+		}
+		collector.stopTimer()
+	}()
 	for {
 		if pending.Message != nil {
 			if owner.outbound == nil {
@@ -923,12 +1175,48 @@ func (owner *Owner) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return owner.stop(context.Cause(ctx))
+		case <-asyncNotify:
+			readyBlocked = false
+			asyncHost.WakePipelined()
 		case request := <-owner.ingress:
 			readyBlocked = false
-			handleErr := owner.handle(request)
-			owner.release(request.bytes)
-			if request.async && handleErr != nil {
-				return owner.stop(handleErr)
+			proposal := proposalIngressCandidate(request)
+			switch {
+			case !collector.active() && proposal:
+				collector.start(owner, request)
+			case collector.accepts(request):
+				collector.append(request)
+				if collector.full() {
+					if err := flushCollected(); err != nil {
+						return owner.stop(err)
+					}
+				}
+			case collector.active() && request.kind == requestInbound:
+				// The acknowledgement may complete the preceding closed-loop wave.
+				// Admit it immediately and let the next owner turn drive Host while
+				// the successor proposal cohort remains bounded in this collector.
+				if err := handleRequest(request); err != nil {
+					return owner.stop(err)
+				}
+			default:
+				// Local reads, topology changes, another group, and an oversized
+				// singleton are ordering barriers for the collected prefix.
+				if collector.active() {
+					if err := flushCollected(); err != nil {
+						return owner.stop(err)
+					}
+				}
+				if proposal {
+					collector.start(owner, request)
+				} else if err := handleRequest(request); err != nil {
+					return owner.stop(err)
+				}
+			}
+		case <-collector.timerC:
+			if collector.expire(owner) {
+				if err := flushCollected(); err != nil {
+					return owner.stop(err)
+				}
 			}
 		case _, ok := <-owner.pulse:
 			readyBlocked = false
@@ -1012,6 +1300,15 @@ func (owner *Owner) handle(request ownerRequest) error {
 		status, err := owner.host.Status(request.group)
 		if err != nil {
 			reply.err = err
+			break
+		}
+		reply.state = ServingState{
+			Identity: member.identity,
+			Command:  member.command,
+			Status:   status,
+		}
+		if request.authorize != nil && !request.authorize(reply.state) {
+			reply.err = ErrServingAuthorization
 			break
 		}
 		if status.MemberID != member.identity.MemberID || status.LeaderID != member.identity.MemberID ||
@@ -2483,7 +2780,7 @@ func (owner *Owner) Submit(
 	fence ServingFence,
 	command []byte,
 ) (Result, error) {
-	return owner.submit(ctx, fence, command, false)
+	return owner.submit(ctx, fence, command, false, nil)
 }
 
 // SubmitOwned transfers one exact-length, capacity-clamped command allocation
@@ -2496,7 +2793,22 @@ func (owner *Owner) SubmitOwned(
 	fence ServingFence,
 	command []byte,
 ) (Result, error) {
-	return owner.submit(ctx, fence, command, true)
+	return owner.submit(ctx, fence, command, true, nil)
+}
+
+// SubmitOwnedAuthorized fuses dynamic serving authorization with the exact
+// serialized fence/status cut used to admit an owned proposal. The callback
+// must not block or retain State.
+func (owner *Owner) SubmitOwnedAuthorized(
+	ctx context.Context,
+	fence ServingFence,
+	command []byte,
+	authorize ProposalAuthorization,
+) (Result, error) {
+	if authorize == nil {
+		return Result{}, ErrInvalidOwner
+	}
+	return owner.submit(ctx, fence, command, true, authorize)
 }
 
 func (owner *Owner) submit(
@@ -2504,6 +2816,7 @@ func (owner *Owner) submit(
 	fence ServingFence,
 	command []byte,
 	transfer bool,
+	authorize ProposalAuthorization,
 ) (Result, error) {
 	if len(command) == 0 || len(command) > replication.MaxCommandBytes {
 		return Result{}, ErrInvalidOwner
@@ -2517,10 +2830,10 @@ func (owner *Owner) submit(
 	if cause := context.Cause(ctx); cause != nil {
 		return Result{}, cause
 	}
-	if err := owner.reservePendingProposal(int64(len(command))); err != nil {
+	if err := owner.reservePendingProposalForGroup(fence.Group, int64(len(command))); err != nil {
 		return Result{}, err
 	}
-	defer owner.releasePendingProposal(int64(len(command)))
+	defer owner.releasePendingProposalForGroup(fence.Group, int64(len(command)))
 	// Exact-length allocation keeps the ingress byte charge equal to retained
 	// capacity instead of relying on append growth-class rounding.
 	owned := command
@@ -2532,34 +2845,37 @@ func (owner *Owner) submit(
 	reply, err := owner.enqueue(ctx, ownerRequest{
 		kind: requestProposal, group: fence.Group, fence: fence, data: owned,
 		reply: make(chan ownerReply, 1), bytes: int64(cap(owned)),
-		delivery: delivery,
+		delivery: delivery, authorize: authorize,
 	})
 	if err != nil {
+		result := Result{State: reply.state}
 		if errors.Is(err, ErrOutcomeUnknown) {
 			if transfer {
-				return Result{}, err
+				return result, err
 			}
-			return Result{}, &UnknownOutcomeError{
+			return result, &UnknownOutcomeError{
 				Command: append([]byte(nil), owned...), Cause: err,
 			}
 		}
-		return Result{}, err
+		return result, err
 	}
 	waiter := reply.waiter
 	outcome, waitErr := waiter.Wait(ctx)
 	if waitErr != nil {
 		waiter.Cancel()
-		return Result{}, &UnknownOutcomeError{Command: owned[:len(owned):len(owned)], Cause: waitErr}
+		return Result{State: reply.state}, &UnknownOutcomeError{
+			Command: owned[:len(owned):len(owned)], Cause: waitErr,
+		}
 	}
 	completion := make([]byte, 0, outcome.CompletionBytes)
 	completion, taken, takeErr := waiter.TakeCompletionInto(completion)
 	if takeErr != nil {
 		waiter.Cancel()
-		return Result{}, &UnknownOutcomeError{
+		return Result{State: reply.state}, &UnknownOutcomeError{
 			Command: owned[:len(owned):len(owned)], Cause: takeErr,
 		}
 	}
-	result := Result{Outcome: taken, Completion: completion}
+	result := Result{Outcome: taken, Completion: completion, State: reply.state}
 	if outcomeErr := taken.Err(); outcomeErr != nil {
 		return result, outcomeErr
 	}
@@ -2570,6 +2886,10 @@ func (owner *Owner) submit(
 // reservation stays charged across registry admission, Wait, completion take,
 // cancellation, and exact unknown-outcome handoff.
 func (owner *Owner) reservePendingProposal(bytes int64) error {
+	return owner.reservePendingProposalForGroup(raftmember.GroupKey{}, bytes)
+}
+
+func (owner *Owner) reservePendingProposalForGroup(group raftmember.GroupKey, bytes int64) error {
 	if owner == nil || bytes <= 0 || bytes > owner.limits.MaxPendingProposalBytes {
 		return ErrPendingProposalsFull
 	}
@@ -2584,13 +2904,25 @@ func (owner *Owner) reservePendingProposal(bytes int64) error {
 	}
 	owner.pendingProposalItems++
 	owner.pendingProposalBytes += bytes
+	if owner.pendingProposalGroup == nil {
+		owner.pendingProposalGroup = make(map[raftmember.GroupKey]int)
+	}
+	owner.pendingProposalGroup[group]++
 	return nil
 }
 
 func (owner *Owner) releasePendingProposal(bytes int64) {
+	owner.releasePendingProposalForGroup(raftmember.GroupKey{}, bytes)
+}
+
+func (owner *Owner) releasePendingProposalForGroup(group raftmember.GroupKey, bytes int64) {
 	owner.mu.Lock()
 	owner.pendingProposalItems--
 	owner.pendingProposalBytes -= bytes
+	owner.pendingProposalGroup[group]--
+	if owner.pendingProposalGroup[group] == 0 {
+		delete(owner.pendingProposalGroup, group)
+	}
 	owner.mu.Unlock()
 }
 

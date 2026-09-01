@@ -216,6 +216,15 @@ type memberRuntime interface {
 	Close() error
 }
 
+type proposalBatchRuntime interface {
+	ProposeBatch([][]byte) error
+}
+
+type pipelinedRuntime interface {
+	Pipelined() bool
+	SetPipelinedWake(func())
+}
+
 type snapshotBaseRuntime interface {
 	SnapshotBaseCertificate() (replicatedstate.SnapshotBaseCertificate, error)
 }
@@ -452,6 +461,7 @@ type Host struct {
 	readySend   func(raftmember.OutboundMessage) error
 	settle      raftmember.ResultSettlementSink
 	serving     ServingSinks
+	asyncNotify chan struct{}
 	closed      bool
 }
 
@@ -513,6 +523,7 @@ func newHost(
 		limits: limits,
 		groups: make(map[raftmember.GroupKey]*groupState),
 		settle: settle, serving: serving,
+		asyncNotify: make(chan struct{}, 1),
 	}
 	if serving.Settle != nil {
 		host.settle = host.settleOwnedBatch
@@ -600,8 +611,47 @@ func (host *Host) addRuntime(runtime memberRuntime) error {
 	}
 	host.groups[key] = group
 	host.order = append(host.order, group)
+	if pipelined, ok := runtime.(pipelinedRuntime); ok && pipelined.Pipelined() {
+		pipelined.SetPipelinedWake(host.signalAsync)
+	}
 	host.wake(group)
 	return nil
+}
+
+func (host *Host) signalAsync() {
+	if host == nil {
+		return
+	}
+	select {
+	case host.asyncNotify <- struct{}{}:
+	default:
+	}
+}
+
+// AsyncNotify wakes the serialized scheduler when a local append lane finishes.
+// The channel is edge-triggered and coalesced; WakePipelined re-establishes the
+// runnable set from authoritative Runtime ownership.
+func (host *Host) AsyncNotify() <-chan struct{} {
+	if host == nil {
+		return nil
+	}
+	return host.asyncNotify
+}
+
+// WakePipelined makes every live pipelined group runnable after a coalesced
+// append completion signal. Group count is strictly bounded by Host limits.
+func (host *Host) WakePipelined() {
+	if host == nil || host.closed {
+		return
+	}
+	for _, group := range host.order {
+		if group == nil || group.runtime == nil || group.failure != nil || group.retiring {
+			continue
+		}
+		if runtime, ok := group.runtime.(pipelinedRuntime); ok && runtime.Pipelined() {
+			host.wake(group)
+		}
+	}
 }
 
 func (host *Host) lookup(key raftmember.GroupKey) (*groupState, error) {
@@ -1380,6 +1430,40 @@ func (host *Host) runInput(group *groupState) (result Progress, consumed bool, r
 			}
 			group.nextClass = (class + 1) % inputClassCount
 			progress.Kind = ProgressProposal
+			// Real runtimes can place a bounded queue prefix into one local
+			// multi-entry MsgProp. This preserves per-command log/result identity
+			// while producing one AppendEntries message and one durable Ready cut.
+			if batchRuntime, batchCapable := group.runtime.(proposalBatchRuntime); batchCapable {
+				available := group.proposals.items[group.proposals.head:]
+				var commands [raftmodel.MaxProposalBatchEntries][]byte
+				batchEntries := 0
+				batchBytes := int64(0)
+				for batchEntries < len(available) && batchEntries < len(commands) {
+					candidate := available[batchEntries]
+					candidateBytes := int64(len(candidate.data))
+					if !candidate.tracked || candidateBytes > raftmodel.MaxProposalBatchBytes-batchBytes {
+						break
+					}
+					commands[batchEntries] = candidate.data
+					batchEntries++
+					batchBytes += candidateBytes
+				}
+				if batchEntries >= 2 {
+					leaderTerm, leadershipErr := host.preflightTrackedProposal(group)
+					if leadershipErr == nil && batchRuntime.ProposeBatch(commands[:batchEntries]) == nil {
+						for range batchEntries {
+							consumed, _ := group.proposals.pop()
+							host.releaseInput(group, int64(len(consumed.data)))
+							host.finishTrackedProposal(group, consumed, nil)
+						}
+						progress.ProposalCount = batchEntries
+						progress.ProposalBytes = batchBytes
+						group.trackedLeaderTerm = leaderTerm
+						host.refreshTrackedPending(group)
+						return progress, true, nil
+					}
+				}
+			}
 			batchEntries := 0
 			batchBytes := int64(0)
 			trackedChecked := false

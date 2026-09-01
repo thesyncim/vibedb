@@ -19,6 +19,7 @@ import (
 type Node struct {
 	id          uint64
 	incarnation uint64
+	async       bool
 	raw         *raft.RawNode
 	stable      StableStore
 	machine     StateMachine
@@ -40,10 +41,11 @@ type Node struct {
 	readBytes    int
 	readSeq      uint64
 
-	settlementReadyID    uint64
-	settlementStart      int
-	settlementCount      int
-	settlementCompletion []byte
+	settlementReadyID     uint64
+	settlementStart       int
+	settlementCount       int
+	settlementCompletion  []byte
+	settlementCompletions *NormalApplyBatchCompletions
 
 	readyFromInput    bool
 	pendingInputCalls int
@@ -104,6 +106,18 @@ type MemberProgress struct {
 // member boot counter allocated by StableStore; it fences ReadIndex results and
 // Ready retries across restarts.
 func NewNode(id, incarnation uint64, stable StableStore, machine StateMachine) (*Node, error) {
+	return newNode(id, incarnation, stable, machine, false)
+}
+
+// NewPipelinedNode constructs a Node around upstream Raft's ordered
+// MsgStorageAppend/MsgStorageApply protocol. The caller must service each
+// local target reliably and in order and must never call the synchronous Ready
+// lifecycle methods.
+func NewPipelinedNode(id, incarnation uint64, stable StableStore, machine StateMachine) (*Node, error) {
+	return newNode(id, incarnation, stable, machine, true)
+}
+
+func newNode(id, incarnation uint64, stable StableStore, machine StateMachine, async bool) (*Node, error) {
 	if id == raft.None {
 		return nil, errors.New("raftmodel: member ID must be non-zero")
 	}
@@ -211,8 +225,15 @@ func NewNode(id, incarnation uint64, stable StableStore, machine StateMachine) (
 	if err := ValidateConfState(pub.ConfState, last); err != nil {
 		return nil, fmt.Errorf("raftmodel: published ConfState: %w", err)
 	}
-	if pub.Applied < base || pub.Applied > committed {
-		return nil, fmt.Errorf("raftmodel: published index %d outside durable committed range [%d,%d]", pub.Applied, base, committed)
+	if pub.Applied < base || pub.Applied > last {
+		return nil, fmt.Errorf("raftmodel: published index %d outside durable log range [%d,%d]", pub.Applied, base, last)
+	}
+	if pub.Applied > committed {
+		// A successful state-machine publication is itself durable by contract
+		// and could only have been produced from a committed, already-durable log
+		// entry. It is therefore the recovery certificate for a final commit-only
+		// HardState notification that the WAL deliberately did not rewrite.
+		committed = pub.Applied
 	}
 	if pub.Applied == base {
 		if equivalentErr := pub.ConfState.Equivalent(metadata.GetConfState()); equivalentErr != nil {
@@ -227,8 +248,14 @@ func NewNode(id, incarnation uint64, stable StableStore, machine StateMachine) (
 	// It therefore belongs to the durable state-machine publication. Overlay it
 	// on the log store's HardState for RawNode recovery; an older snapshot's
 	// InitialState ConfState is not authoritative after later config entries.
-	recovery := recoveryStorage{StableStore: stable, confState: cloneConfState(pub.ConfState)}
+	recovery := recoveryStorage{
+		StableStore: stable, confState: cloneConfState(pub.ConfState),
+		commitFloor: pub.Applied,
+	}
 	cfg := NewConfig(id, recovery, pub.Applied)
+	if async {
+		cfg = newAsyncConfig(id, recovery, pub.Applied)
+	}
 	raw, err := newRawNodeChecked(&cfg)
 	if err != nil {
 		return nil, fmt.Errorf("raftmodel: construct RawNode: %w", err)
@@ -236,6 +263,7 @@ func NewNode(id, incarnation uint64, stable StableStore, machine StateMachine) (
 	n := &Node{
 		id:          id,
 		incarnation: incarnation,
+		async:       async,
 		raw:         raw,
 		stable:      stable,
 		machine:     machine,
@@ -315,9 +343,10 @@ func (n *Node) CurrentReady() (ReadyProgress, bool) {
 	}, true
 }
 
-// Published returns a defensive copy of the last publication accepted by the
-// driver.
-func (n *Node) Published() Publication { return clonePublication(n.published) }
+// Published returns the last publication accepted by the driver. ConfState is
+// StateMachine-owned immutable data under Publication's ownership contract;
+// callers must not mutate it.
+func (n *Node) Published() Publication { return n.published }
 
 // PublishedApplied returns the fixed-width applied coordinate of the last
 // accepted publication without cloning its variable-sized ConfState. It is for
@@ -596,13 +625,25 @@ func (n *Node) ApplyNextBatch(workspace *NormalApplyBatchWorkspace) (ApplyBatchR
 		if count > 0 {
 			entries := workspace.entries[:count]
 			witnesses := workspace.witnesses[:count]
-			applied, publication, err := batchMachine.ApplyNormalBatch(entries, witnesses)
+			workspace.completions.Reset()
+			var applied int
+			var publication Publication
+			var err error
+			if completionMachine, ok := n.machine.(NormalCompletionBatchStateMachine); ok {
+				applied, publication, err = completionMachine.ApplyNormalBatchWithCompletions(
+					entries, witnesses, &workspace.completions,
+				)
+			} else {
+				applied, publication, err = batchMachine.ApplyNormalBatch(entries, witnesses)
+			}
 			if err != nil {
+				workspace.completions.Reset()
 				clear(entries)
 				clear(witnesses)
 				return ApplyBatchResult{}, n.fail(PhaseEntriesApplied, first.GetIndex(), err)
 			}
 			if applied < 0 || applied > count {
+				workspace.completions.Reset()
 				clear(entries)
 				clear(witnesses)
 				return ApplyBatchResult{}, n.fail(
@@ -611,6 +652,19 @@ func (n *Node) ApplyNextBatch(workspace *NormalApplyBatchWorkspace) (ApplyBatchR
 				)
 			}
 			if applied > 0 {
+				for index := 0; index < count; index++ {
+					completion, present := workspace.completions.Completion(index)
+					if index >= applied && present || present && len(entries[index].Data) == 0 ||
+						present && (len(completion) > MaxNormalApplyCompletionBytes || cap(completion) > MaxNormalApplyCompletionBytes) {
+						workspace.completions.Reset()
+						clear(entries)
+						clear(witnesses)
+						return ApplyBatchResult{}, n.fail(
+							PhaseEntriesApplied, first.GetIndex(),
+							errors.New("invalid normal batch completion bound"),
+						)
+					}
+				}
 				if err := n.acceptNormalBatchPublication(
 					entries, witnesses, applied, publication,
 				); err != nil {
@@ -624,6 +678,7 @@ func (n *Node) ApplyNextBatch(workspace *NormalApplyBatchWorkspace) (ApplyBatchR
 				n.settlementReadyID = n.readyID
 				n.settlementStart = start
 				n.settlementCount = applied
+				n.settlementCompletions = &workspace.completions
 				return ApplyBatchResult{
 					Applied: applied,
 					Normal:  n.pendingAppliedNormalBatch(),
@@ -641,6 +696,7 @@ func (n *Node) ApplyNextBatch(workspace *NormalApplyBatchWorkspace) (ApplyBatchR
 			}
 			clear(entries)
 			clear(witnesses)
+			workspace.completions.Reset()
 			if publication != (Publication{}) {
 				return ApplyBatchResult{}, n.fail(
 					PhaseEntriesApplied, first.GetIndex(),
@@ -714,6 +770,7 @@ func (n *Node) pendingAppliedNormalBatch() AppliedNormalBatch {
 		entries:     n.ready.CommittedEntries[n.settlementStart:end],
 		publication: n.published,
 		completion:  n.settlementCompletion,
+		completions: n.settlementCompletions,
 	}
 }
 
@@ -752,6 +809,7 @@ func (n *Node) SettleAppliedNormalBatch(batch AppliedNormalBatch) error {
 	n.settlementStart = 0
 	n.settlementCount = 0
 	n.settlementCompletion = nil
+	n.settlementCompletions = nil
 	if n.entryPos == len(n.ready.CommittedEntries) {
 		n.phase = PhaseEntriesApplied
 	}
@@ -1079,6 +1137,39 @@ func (n *Node) Propose(data []byte) error {
 	n.observeCommitAdvancement()
 	if err == nil {
 		n.recordProtocolInput(1, int64(len(data)))
+	}
+	return err
+}
+
+// ProposeBatch submits multiple independent normal entries through one local
+// MsgProp. Each payload remains its own Raft log entry and settlement identity,
+// while the leader emits one bounded AppendEntries batch instead of one append
+// message per caller. Every payload is copied before the core can retain it.
+func (n *Node) ProposeBatch(commands [][]byte) error {
+	if len(commands) < 2 || len(commands) > MaxProposalBatchEntries {
+		return fmt.Errorf("%w: proposal batch entries %d exceed bound", ErrAdmissionBound, len(commands))
+	}
+	total := int64(0)
+	entries := make([]*pb.Entry, len(commands))
+	for index, data := range commands {
+		if err := admitProposalBytes(len(data)); err != nil {
+			return err
+		}
+		if int64(len(data)) > MaxProposalBatchBytes-total {
+			return fmt.Errorf("%w: proposal batch bytes exceed %d", ErrAdmissionBound, MaxProposalBatchBytes)
+		}
+		total += int64(len(data))
+		entries[index] = &pb.Entry{Data: append([]byte(nil), data...)}
+	}
+	if err := n.admitProtocolInput("ProposeBatch", len(entries), total); err != nil {
+		return err
+	}
+	err := n.raw.Step(&pb.Message{
+		Type: pb.MsgProp.Enum(), From: new(n.id), Entries: entries,
+	})
+	n.observeCommitAdvancement()
+	if err == nil {
+		n.recordProtocolInput(len(entries), total)
 	}
 	return err
 }
@@ -1501,10 +1592,15 @@ func (n *Node) fail(stage Phase, index uint64, err error) error {
 
 type recoveryStorage struct {
 	StableStore
-	confState *pb.ConfState
+	confState   *pb.ConfState
+	commitFloor uint64
 }
 
 func (s recoveryStorage) InitialState() (*pb.HardState, *pb.ConfState, error) {
 	hardState, _, err := s.StableStore.InitialState()
+	if err == nil && hardState != nil && hardState.GetCommit() < s.commitFloor {
+		commit := s.commitFloor
+		hardState.Commit = &commit
+	}
 	return hardState, cloneConfState(s.confState), err
 }

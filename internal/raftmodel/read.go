@@ -39,6 +39,10 @@ const (
 	// MaxPendingInputCalls independently bounds message/read/control work that
 	// carries no unstable entries but can still grow an uncaptured Ready.
 	MaxPendingInputCalls = MaxInflightMsgs
+	// MaxPipelinedReadyMessages is the fixed scheduling envelope for one
+	// asynchronous Ready: bounded peer traffic, local append/apply work, and
+	// pending read responses. Runtime rings are sized from this protocol limit.
+	MaxPipelinedReadyMessages = 256
 	// MaxPendingInputBytes bounds the Entry/Snapshot payload bytes accumulated
 	// into one uncaptured Ready. Followers do not apply the leader proposal
 	// watermark, so the integration boundary enforces it independently.

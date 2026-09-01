@@ -26,13 +26,24 @@ const (
 // settings. Keeping validation at that boundary avoids duplicating upstream's
 // reserved-ID and configuration rules here.
 func NewConfig(id uint64, storage raft.Storage, applied uint64) raft.Config {
+	return newConfig(id, storage, applied, false)
+}
+
+// newAsyncConfig selects upstream's ordered local-storage message protocol.
+// It is kept private so callers cannot accidentally combine the asynchronous
+// Ready contract with the synchronous Node lifecycle.
+func newAsyncConfig(id uint64, storage raft.Storage, applied uint64) raft.Config {
+	return newConfig(id, storage, applied, true)
+}
+
+func newConfig(id uint64, storage raft.Storage, applied uint64, async bool) raft.Config {
 	return raft.Config{
 		ID:                          id,
 		ElectionTick:                ElectionTick,
 		HeartbeatTick:               HeartbeatTick,
 		Storage:                     storage,
 		Applied:                     applied,
-		AsyncStorageWrites:          false,
+		AsyncStorageWrites:          async,
 		MaxSizePerMsg:               MaxSizePerMsg,
 		MaxCommittedSizePerReady:    MaxCommittedSizePerReady,
 		MaxUncommittedEntriesSize:   MaxUncommittedEntriesSize,

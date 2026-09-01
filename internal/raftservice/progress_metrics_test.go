@@ -26,8 +26,8 @@ func TestProgressMetricsCountsExistingOwnerSeamsExactly(t *testing.T) {
 		ReadOutcomes: make([]raftmodel.ReadOutcome, 2),
 	}, true, nil)
 	metrics.observeProgress(multiraft.Progress{Kind: multiraft.ProgressFault}, true, errors.New("disk"))
-	want := ProgressMetricsSnapshot{ProposalCommands: 3, ProposalBytes: 19,
-		AppliedEntries: 2, ReadyPersisted: 1, SnapshotsFinished: 1,
+	want := ProgressMetricsSnapshot{ProposalBatches: 1, ProposalCommands: 3, ProposalBytes: 19,
+		ApplyBatches: 1, AppliedEntries: 2, ReadyPersisted: 1, SnapshotsFinished: 1,
 		CommitAdvancements: 1, CommittedEntries: 4,
 		ReadCompletions: 2, Faults: 1}
 	if got := metrics.Snapshot(); got != want {

@@ -161,6 +161,7 @@ type fileOps struct {
 	ensureAllocated       func(*os.File, int64) error
 	readAt                func(*os.File, []byte, int64) (int, error)
 	writeAt               func(*os.File, []byte, int64) (int, error)
+	durableWriteAt        func(*os.File, []byte, int64) (int, error)
 	recordBarrier         func(*os.File) error
 	sync                  func(*os.File) error
 	syncDirectory         func(*os.Root) error
@@ -208,13 +209,13 @@ func normalizeOptions(options Options) (normalizedOptions, error) {
 	if result.ops.readAt == nil {
 		result.ops.readAt = func(file *os.File, data []byte, offset int64) (int, error) { return file.ReadAt(data, offset) }
 	}
-	if result.ops.recordBarrier == nil {
+	if result.ops.recordBarrier == nil && result.ops.sync != nil {
 		// Tests which supplied the historical all-phase Sync seam retain that
 		// behavior unless they explicitly distinguish the record barrier.
 		result.ops.recordBarrier = result.ops.sync
-		if result.ops.recordBarrier == nil {
-			result.ops.recordBarrier = syncReadyRecord
-		}
+	}
+	if result.ops.recordBarrier == nil && result.ops.durableWriteAt == nil {
+		result.ops.durableWriteAt = defaultDurableReadyWrite()
 	}
 	if result.ops.sync == nil {
 		result.ops.sync = func(file *os.File) error { return file.Sync() }

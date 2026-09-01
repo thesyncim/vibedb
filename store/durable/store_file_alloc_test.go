@@ -30,6 +30,37 @@ func TestFileStoreWarmedPointMutationAllocations(t *testing.T) {
 	}
 }
 
+func TestWriteBatchWarmedRecordAllocations(t *testing.T) {
+	options, err := testFileStoreOptions().normalized()
+	if err != nil {
+		t.Fatal(err)
+	}
+	collection := &Collection{options: options}
+	batch := &WriteBatch{collection: collection, active: true}
+	batch.ensurePositionCapacity(4)
+	key := []byte("alpha")
+	values := [][]byte{[]byte(`{"n":1}`), []byte(`{"n":2}`)}
+	for index := range values {
+		if err := batch.Put(key, values[index]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	batch.reset()
+	batch.active = true
+	allocations := testing.AllocsPerRun(1_000, func() {
+		batch.reset()
+		batch.active = true
+		for index := range values {
+			if putErr := batch.Put(key, values[index]); putErr != nil {
+				panic(putErr)
+			}
+		}
+	})
+	if allocations != 0 {
+		t.Fatalf("warmed WriteBatch record allocations = %.2f, want 0", allocations)
+	}
+}
+
 func testFileStoreWarmedPointMutationAllocations(
 	t *testing.T,
 	durability DurabilityMode,

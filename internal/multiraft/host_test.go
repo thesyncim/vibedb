@@ -57,6 +57,26 @@ type fakeRuntime struct {
 	schemaQuiesceErrs   []error
 }
 
+type fakeBatchRuntime struct {
+	*fakeRuntime
+	batchCalls int
+	batchErr   error
+}
+
+func (runtime *fakeBatchRuntime) ProposeBatch(commands [][]byte) error {
+	runtime.batchCalls++
+	if runtime.batchErr != nil {
+		return runtime.batchErr
+	}
+	if !runtime.discardProposals {
+		runtime.inputs = append(runtime.inputs, ProgressProposal)
+		for _, command := range commands {
+			runtime.proposals = append(runtime.proposals, append([]byte(nil), command...))
+		}
+	}
+	return nil
+}
+
 func newFakeRuntime(seed byte) *fakeRuntime {
 	key := raftmember.GroupKey{TopologyRecoveryEpoch: uint64(seed) + 1}
 	for index := range key.ClusterID {
@@ -892,6 +912,50 @@ func TestHostProposalBatchPreservesGroupAndInputClassFairness(t *testing.T) {
 	}
 	if host.queueItems != 0 || host.queueBytes != 0 {
 		t.Fatalf("queue accounting after batches = %d/%d", host.queueItems, host.queueBytes)
+	}
+}
+
+func TestHostTrackedProposalBatchUsesOneRuntimeCallAndFallsBackAtomically(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		batchErr  error
+		wantCalls int
+	}{
+		{name: "multi-entry", wantCalls: 1},
+		{name: "fallback", batchErr: raftmodel.ErrAdmissionBound, wantCalls: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var admissions []ProposalAdmission
+			host, err := newTestServingHost(
+				testHostLimits(), settleNoLocalWaiters,
+				func(admission ProposalAdmission) { admissions = append(admissions, admission) },
+				ignoreProposalGroupTermination, retainProposalGroupPending,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			runtime := &fakeBatchRuntime{fakeRuntime: newFakeRuntime(35), batchErr: test.batchErr}
+			if err = host.addRuntime(runtime); err != nil {
+				t.Fatal(err)
+			}
+			for index := 1; index <= 3; index++ {
+				token := ProposalToken{uint64(index), 1, uint64(index), 1}
+				if err = host.EnqueueTrackedProposal(runtime.identity.Group, []byte{byte(index)}, token); err != nil {
+					t.Fatal(err)
+				}
+			}
+			progress, done, runErr := host.RunOne()
+			if runErr != nil || !done || progress.ProposalCount != 3 ||
+				runtime.batchCalls != test.wantCalls || len(runtime.proposals) != 3 || len(admissions) != 3 {
+				t.Fatalf("batch progress=%+v done=%t err=%v calls=%d proposals=%d admissions=%+v",
+					progress, done, runErr, runtime.batchCalls, len(runtime.proposals), admissions)
+			}
+			for _, admission := range admissions {
+				if !admission.Admitted {
+					t.Fatalf("proposal was not admitted: %+v", admission)
+				}
+			}
+		})
 	}
 }
 

@@ -124,6 +124,18 @@ func AppendState(dst []byte, state State) ([]byte, error) {
 	if err != nil {
 		return dst, fmt.Errorf("%w: encode ConfState: %v", ErrStateCorrupt, err)
 	}
+	return appendStateWithConf(dst, state, conf)
+}
+
+// appendStateWithConf is the normal-apply encoder. The Machine has already
+// validated and durably adopted its immutable ConfState at bootstrap or the
+// last configuration entry, so repeating Changer.Restore for every ordinary
+// batch adds no new correctness proof. The caller supplies the deterministic
+// encoding and this function still enforces exact envelope geometry/aliasing.
+func appendStateWithConf(dst []byte, state State, conf []byte) ([]byte, error) {
+	if state.ConfState == nil || len(conf) != proto.Size(state.ConfState) {
+		return dst, ErrStateCorrupt
+	}
 	headerBytes := stateEncodingHeader(state)
 	total, err := stateEncodingSize(state, len(conf))
 	if err != nil {
@@ -344,6 +356,24 @@ func OpenState(src []byte) (State, error) {
 }
 
 func validateState(state State) error {
+	if err := validateStateStructure(state); err != nil {
+		return err
+	}
+	if len(state.ConfState.ProtoReflect().GetUnknown()) != 0 {
+		return fmt.Errorf("%w: unknown ConfState fields", ErrStateCorrupt)
+	}
+	if err := raftmodel.ValidateConfState(state.ConfState, state.Applied); err != nil {
+		return fmt.Errorf("%w: invalid ConfState: %v", ErrStateCorrupt, err)
+	}
+	return validateStateRecord(state)
+}
+
+// validateStateStructure proves every invariant that does not depend on the
+// contents of ConfState. A normal transition can reuse a previously validated,
+// Machine-owned immutable ConfState at a greater applied index; membership
+// validation is monotonic in that index and need not rebuild the Raft progress
+// tracker for every command.
+func validateStateStructure(state State) error {
 	if err := state.Binding.validate(); err != nil {
 		return fmt.Errorf("%w: %v", ErrStateCorrupt, err)
 	}
@@ -374,12 +404,10 @@ func validateState(state State) error {
 	if !validStateFenceCounters(state) {
 		return fmt.Errorf("%w: invalid fence counters", ErrStateCorrupt)
 	}
-	if len(state.ConfState.ProtoReflect().GetUnknown()) != 0 {
-		return fmt.Errorf("%w: unknown ConfState fields", ErrStateCorrupt)
-	}
-	if err := raftmodel.ValidateConfState(state.ConfState, state.Applied); err != nil {
-		return fmt.Errorf("%w: invalid ConfState: %v", ErrStateCorrupt, err)
-	}
+	return nil
+}
+
+func validateStateRecord(state State) error {
 	switch state.LastKind {
 	case RecordStaticSnapshot:
 		if state.LastEntryType != pb.EntryNormal || state.Applied != 1 ||

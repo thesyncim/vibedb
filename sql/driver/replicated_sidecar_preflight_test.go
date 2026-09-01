@@ -51,7 +51,7 @@ func TestReplicatedApplyDurableProfilesPreflightEveryRetryWindow(t *testing.T) {
 			}
 		}
 	}
-	if ReplicatedSystemRecoveryJournalBytes != 655872 || ReplicatedUserRecoveryJournalBytes != 16794624 {
+	if ReplicatedSystemRecoveryJournalBytes != 16777216 || ReplicatedUserRecoveryJournalBytes != 16794624 {
 		t.Fatal("data-only system or user journal changed with ledger ceiling")
 	}
 }

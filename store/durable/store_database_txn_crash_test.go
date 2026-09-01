@@ -295,24 +295,31 @@ func TestDatabaseTxnDecisionTornTail(t *testing.T) {
 		t.Fatalf("decision end %d > file %d", decisionEnd, len(full))
 	}
 	for size := 0; size <= decisionEnd; size++ {
-		img := cloneDatabaseDir(t, baseImg)
-		writeTxnMarkerPrefix(t, img, full, size)
-		// Classify from the marker alone: a prefix that decodes the decision
-		// must reopen committed; every incomplete prefix must abort.
-		committedPrefix := decisionPrefixCommitted(t, img, header.MarkerID, header.Epoch, txnID)
-		db2, err := OpenDatabase(img, DatabaseOptions{Options: txnTestOptions()})
-		if err != nil {
-			if size < regionStart || !committedPrefix {
-				continue
+		func() {
+			img := cloneDatabaseDir(t, baseImg)
+			defer func() {
+				if err := os.RemoveAll(img); err != nil {
+					t.Errorf("prefix %d: remove crash image: %v", size, err)
+				}
+			}()
+			writeTxnMarkerPrefix(t, img, full, size)
+			// Classify from the marker alone: a prefix that decodes the decision
+			// must reopen committed; every incomplete prefix must abort.
+			committedPrefix := decisionPrefixCommitted(t, img, header.MarkerID, header.Epoch, txnID)
+			db2, err := OpenDatabase(img, DatabaseOptions{Options: txnTestOptions()})
+			if err != nil {
+				if size < regionStart || !committedPrefix {
+					return
+				}
+				t.Fatalf("prefix %d: OpenDatabase: %v", size, err)
 			}
-			t.Fatalf("prefix %d: OpenDatabase: %v", size, err)
-		}
-		if committedPrefix {
-			assertCommittedAB(t, db2)
-		} else {
-			assertAbortedNames(t, db2, "a", "b")
-		}
-		_ = db2.Close()
+			if committedPrefix {
+				assertCommittedAB(t, db2)
+			} else {
+				assertAbortedNames(t, db2, "a", "b")
+			}
+			_ = db2.Close()
+		}()
 	}
 
 	// Live torn-append seam: the seam persists a byte prefix and returns

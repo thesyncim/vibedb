@@ -8,6 +8,7 @@ import (
 	"testing"
 	"unsafe"
 
+	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/store/durable"
@@ -401,6 +402,121 @@ func TestApplyNormalBatchOnePhysicalUpdateZeroSyncAndBoundedWarmScratch(t *testi
 		t.Fatalf("warm scratch grew: first=%v second=%v", warm, stable)
 	}
 	t.Logf("8-command pooled workspace retained %d bytes", stable)
+}
+
+func TestApplyNormalBatchSingleParticipantTransactionsShareOnePhysicalUpdate(t *testing.T) {
+	const count = 8
+	fixture := newNormalBatchFixtureWithSystemDocuments(t, count, 8, 2*count+1)
+	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	commands := make([][]byte, count)
+	keys := make([][]byte, count)
+	for index := range count {
+		keys[index] = []byte{0, 'd', byte(index), 0xff}
+		batches := []replication.RelationMutationBatch{{
+			Relation: 1,
+			Mutations: []replication.Mutation{{
+				Kind: replication.MutationPut, Key: keys[index],
+				Value: []byte{'{', '"', 'n', '"', ':', byte('0' + index), '}'},
+			}},
+		}}
+		digest, err := replication.TransactionMutationDigest(batches)
+		if err != nil {
+			t.Fatal(err)
+		}
+		commands[index] = transactionCompletionCommand(t, fixture.binding,
+			distributedtxn.ReplicatedCommand{
+				Role:      distributedtxn.ReplicatedRoleParticipant,
+				Operation: distributedtxn.ReplicatedApplySingleParticipant,
+				ID:        transactionCodecID(byte(80 + index)), ExpectedRevision: 1,
+				PayloadKind: distributedtxn.ReplicatedPayloadParticipantStage,
+				Participant: distributedtxn.ParticipantStage{
+					CoordinatorGroup:            distributedtxn.ID(fixture.binding.GroupID),
+					CoordinatorShardIncarnation: distributedtxn.ID(fixture.binding.ShardIncarnation),
+					CoordinatorAllocation:       fixture.binding.AllocationGeneration,
+					BucketBits:                  8, IntentScopes: []distributedtxn.IntentScope{{Start: 0, End: 256}},
+					MutationDigest: digest,
+				},
+			}, batches,
+		)
+	}
+	if err := fixture.machine.AdmitCommand(commands[0]); err != nil {
+		t.Fatalf("admit first direct transaction: %v", err)
+	}
+	entries := normalBatchEntries(2, commands...)
+	before := fixture.group.Stats()
+	var originals raftmodel.NormalApplyBatchCompletions
+	applied, publication, err := fixture.machine.ApplyNormalBatchWithCompletions(
+		entries, normalBatchWitnesses(entries), &originals,
+	)
+	if err != nil || applied != count || publication.Applied != count+1 {
+		t.Fatalf("direct transaction batch = %d, %+v, %v", applied, publication, err)
+	}
+	after := fixture.group.Stats()
+	if after.TransactionHighWater != before.TransactionHighWater+1 ||
+		after.Updates != before.Updates+1 || after.LargestUpdateSpan != count ||
+		after.JournalSyncs != before.JournalSyncs ||
+		after.MarkerSyncs != before.MarkerSyncs ||
+		after.CertificateSyncs != before.CertificateSyncs ||
+		after.BarrierSyncs != before.BarrierSyncs {
+		t.Fatalf("direct batch was not one zero-sync physical update: before=%+v after=%+v",
+			before, after)
+	}
+	if fixture.machine.state.TransactionControlCount != count ||
+		fixture.machine.state.ActiveTransactionCount != 0 {
+		t.Fatalf("direct batch accounting = %+v", fixture.machine.state)
+	}
+	for index := range commands {
+		raw, found := originals.Completion(index)
+		if !found {
+			t.Fatalf("direct original completion %d is absent", index)
+		}
+		completion, openErr := replication.OpenCompletion(raw)
+		if openErr != nil || completion.ResultCode != ResultApplied ||
+			completion.AppliedSequence != uint64(index+2) {
+			t.Fatalf("direct original completion %d = %+v, %v", index, completion, openErr)
+		}
+	}
+	beforeAdmission := fixture.group.Stats()
+	if err := fixture.machine.AdmitCommand(commands[0]); err != nil {
+		t.Fatalf("admit direct retry against dirty suffix: %v", err)
+	}
+	if afterAdmission := fixture.group.Stats(); afterAdmission != beforeAdmission {
+		t.Fatalf("direct admission forced a dirty-suffix checkpoint: before=%+v after=%+v",
+			beforeAdmission, afterAdmission)
+	}
+	retryEntries := normalBatchEntries(uint64(count+2), commands...)
+	retried, retryPublication, retryErr := fixture.machine.ApplyNormalBatch(
+		retryEntries, normalBatchWitnesses(retryEntries),
+	)
+	if retryErr != nil || retried != count || retryPublication.Applied != 2*count+1 {
+		t.Fatalf("dirty-suffix direct retry batch = %d, %+v, %v",
+			retried, retryPublication, retryErr)
+	}
+	afterRetry := fixture.group.Stats()
+	if afterRetry.TransactionHighWater != before.TransactionHighWater+2 ||
+		afterRetry.Updates != before.Updates+2 ||
+		afterRetry.JournalSyncs != before.JournalSyncs ||
+		afterRetry.MarkerSyncs != before.MarkerSyncs ||
+		afterRetry.CertificateSyncs != before.CertificateSyncs ||
+		afterRetry.BarrierSyncs != before.BarrierSyncs {
+		t.Fatalf("direct retry forced a dirty-suffix checkpoint: before=%+v after=%+v",
+			before, afterRetry)
+	}
+	if err := fixture.group.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	for index := range commands {
+		lookup, lookupErr := fixture.machine.LookupCompletion(commands[index])
+		if lookupErr != nil || lookup.AppliedSequence != uint64(index+2) {
+			t.Fatalf("direct completion %d = %+v, %v", index, lookup, lookupErr)
+		}
+		value, found, readErr := fixture.user.Collection.AppendRaw(nil, keys[index])
+		if readErr != nil || !found || len(value) == 0 {
+			t.Fatalf("direct value %d = %q found=%v err=%v", index, value, found, readErr)
+		}
+	}
 }
 
 func TestApplyNormalBatchFull128CommandWorkspaceIsWarmStable(t *testing.T) {

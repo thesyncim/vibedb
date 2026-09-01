@@ -144,6 +144,7 @@ type AppliedBatchCompletionWorkspace struct {
 	apply  sqldriver.CompletionLookupWorkspace
 	owner  *sqldriver.ReplicatedApply
 	source AppliedBatchSource
+	direct bool
 }
 
 // AppliedBatchSource is the fixed identity of one applied Ready interval.
@@ -257,6 +258,12 @@ func (batch AppliedBatch) BeginCompletionLookup(
 	if workspace == nil || workspace.owner != nil {
 		return replicatedstate.ErrCompletionWorkspaceBusy
 	}
+	if batch.normal.HasCompletionForEveryCommand() {
+		workspace.owner = batch.apply
+		workspace.source = batch.source
+		workspace.direct = true
+		return nil
+	}
 	if err := batch.apply.BeginCompletionLookupBatch(
 		&workspace.apply, batch.FinalPublication(),
 	); err != nil {
@@ -264,6 +271,7 @@ func (batch AppliedBatch) BeginCompletionLookup(
 	}
 	workspace.owner = batch.apply
 	workspace.source = batch.source
+	workspace.direct = false
 	return nil
 }
 
@@ -320,6 +328,10 @@ func (batch AppliedBatch) EndCompletionLookup(
 	}
 	workspace.owner = nil
 	workspace.source = AppliedBatchSource{}
+	if workspace.direct {
+		workspace.direct = false
+		return nil
+	}
 	return batch.apply.EndCompletionLookupBatch(&workspace.apply)
 }
 
@@ -332,6 +344,7 @@ func (workspace *AppliedBatchCompletionWorkspace) Release() error {
 		return replicatedstate.ErrCompletionWorkspaceBusy
 	}
 	workspace.source = AppliedBatchSource{}
+	workspace.direct = false
 	return workspace.apply.Release()
 }
 
@@ -422,6 +435,7 @@ type Runtime struct {
 	identity        RuntimeIdentity
 	walGeneration   *walGenerationDriver
 	schemaWALResume *WALGenerationDriverOptions
+	pipelined       *pipelinedRuntime
 
 	proposalBatchEntries     int
 	proposalBatchBytes       int64
@@ -455,7 +469,18 @@ func AdoptRuntime(
 	database *sqldriver.Database,
 	apply *sqldriver.ReplicatedApply,
 ) (*Runtime, error) {
-	return adoptRuntime(wal, database, apply, 0)
+	return adoptRuntime(wal, database, apply, 0, false)
+}
+
+// AdoptPipelinedRuntime constructs the production commit path backed by
+// upstream Raft's ordered asynchronous append/apply protocol. The Runtime
+// remains single-owner; only WAL I/O executes on its dedicated append lane.
+func AdoptPipelinedRuntime(
+	wal *raftstore.Store,
+	database *sqldriver.Database,
+	apply *sqldriver.ReplicatedApply,
+) (*Runtime, error) {
+	return adoptRuntime(wal, database, apply, 0, true)
 }
 
 // AdoptStagedRuntime adopts one preplanned learner incarnation. The first
@@ -470,7 +495,21 @@ func AdoptStagedRuntime(
 	if expected == 0 {
 		return nil, ErrRuntimeOwnership
 	}
-	return adoptRuntime(wal, database, apply, expected)
+	return adoptRuntime(wal, database, apply, expected, false)
+}
+
+// AdoptPipelinedStagedRuntime is the asynchronous-storage counterpart of
+// AdoptStagedRuntime for a preplanned learner incarnation.
+func AdoptPipelinedStagedRuntime(
+	wal *raftstore.Store,
+	database *sqldriver.Database,
+	apply *sqldriver.ReplicatedApply,
+	expected uint64,
+) (*Runtime, error) {
+	if expected == 0 {
+		return nil, ErrRuntimeOwnership
+	}
+	return adoptRuntime(wal, database, apply, expected, true)
 }
 
 func adoptRuntime(
@@ -478,6 +517,7 @@ func adoptRuntime(
 	database *sqldriver.Database,
 	apply *sqldriver.ReplicatedApply,
 	expected uint64,
+	pipelined bool,
 ) (*Runtime, error) {
 	if wal == nil || database == nil || apply == nil {
 		return nil, ErrRuntimeOwnership
@@ -537,12 +577,22 @@ func adoptRuntime(
 		return runtime.abortAdoption(fmt.Errorf("raftmember: begin incarnation: %w", err))
 	}
 	runtime.identity.NodeIncarnation = incarnation
-	runtime.node, err = raftmodel.NewNode(sealed.MemberID, incarnation, wal, apply)
+	if pipelined {
+		runtime.node, err = raftmodel.NewPipelinedNode(sealed.MemberID, incarnation, wal, apply)
+	} else {
+		runtime.node, err = raftmodel.NewNode(sealed.MemberID, incarnation, wal, apply)
+	}
 	if err != nil {
 		return runtime.abortAdoption(fmt.Errorf("raftmember: construct node: %w", err))
 	}
 	if err = runtime.node.BindMembershipTransitionContext(); err != nil {
 		return runtime.abortAdoption(fmt.Errorf("raftmember: bind membership transition context: %w", err))
+	}
+	if pipelined {
+		runtime.pipelined, err = newPipelinedRuntime(runtime)
+		if err != nil {
+			return runtime.abortAdoption(fmt.Errorf("raftmember: construct append lane: %w", err))
+		}
 	}
 	return runtime, nil
 }
@@ -605,6 +655,9 @@ func (runtime *Runtime) QuiesceSQLGeneration() error {
 		return ErrSchemaGenerationSwap
 	}
 	if runtime.apply != nil {
+		if runtime.pipelined != nil && !runtime.pipelined.quiescent() {
+			return ErrSchemaGenerationSwap
+		}
 		if err := runtime.node.ReplaceStateMachine(runtime.apply); err != nil {
 			return errors.Join(ErrSchemaGenerationSwap, err)
 		}
@@ -752,7 +805,7 @@ func (runtime *Runtime) Propose(data []byte) error {
 		return err
 	}
 	if !continuing {
-		if err := runtime.reserveReadyWithWALMaintenance(); err != nil {
+		if err := runtime.reserveProtocolInput(); err != nil {
 			if deterministicPersistFailure(err) {
 				return runtime.fail(err)
 			}
@@ -767,6 +820,48 @@ func (runtime *Runtime) Propose(data []byte) error {
 	return nil
 }
 
+// ProposeBatch admits independent canonical commands and submits them as one
+// multi-entry Raft proposal message. Admission is all-or-none, so callers may
+// safely fall back to individual proposal handling on any error.
+func (runtime *Runtime) ProposeBatch(commands [][]byte) error {
+	if err := runtime.checkUsable(); err != nil {
+		return err
+	}
+	if len(commands) < 2 || len(commands) > raftmodel.MaxProposalBatchEntries {
+		return raftmodel.ErrAdmissionBound
+	}
+	if err := runtime.requireEmptyInputWindow(); err != nil {
+		return err
+	}
+	total := int64(0)
+	for _, data := range commands {
+		dataBytes := int64(len(data))
+		if len(data) == 0 || dataBytes > raftmodel.MaxProposalBatchBytes-total {
+			return raftmodel.ErrAdmissionBound
+		}
+		total += dataBytes
+		if err := runtime.apply.AdmitCommand(data); err != nil {
+			if errors.Is(err, replicatedstate.ErrApplyPoisoned) ||
+				errors.Is(err, sqldriver.ErrReplicatedApplyClosed) {
+				return runtime.fail(err)
+			}
+			return err
+		}
+	}
+	if err := runtime.reserveProtocolInput(); err != nil {
+		if deterministicPersistFailure(err) {
+			return runtime.fail(err)
+		}
+		return err
+	}
+	if err := runtime.node.ProposeBatch(commands); err != nil {
+		return err
+	}
+	runtime.proposalBatchEntries = len(commands)
+	runtime.proposalBatchBytes = total
+	return nil
+}
+
 // ProposeConfChange admits one topology-authorized configuration change into
 // the existing model-checked Raft path. Runtime does not itself authorize
 // membership or grant serving authority. Nil means only local core admission.
@@ -774,7 +869,7 @@ func (runtime *Runtime) ProposeConfChange(change pb.ConfChangeI) error {
 	if err := runtime.requireEmptyInputWindow(); err != nil {
 		return err
 	}
-	if err := runtime.reserveReadyWithWALMaintenance(); err != nil {
+	if err := runtime.reserveProtocolInput(); err != nil {
 		if deterministicPersistFailure(err) {
 			return runtime.fail(err)
 		}
@@ -827,6 +922,7 @@ func (runtime *Runtime) DurablePromotion(
 	if err != nil {
 		return DurablePromotionProof{}, false, err
 	}
+	commit = max(commit, runtime.node.PublishedApplied())
 	if commit <= applied {
 		runtime.promotionScan = durablePromotionScan{applied: applied,
 			last: last, commit: commit, target: target, valid: true}
@@ -1037,7 +1133,7 @@ func (runtime *Runtime) StepMessage(message *pb.Message) error {
 	if message.GetTo() != runtime.identity.MemberID {
 		return errors.New("raftmember: ordinary message targets another member")
 	}
-	if err := runtime.reserveReadyWithWALMaintenance(); err != nil {
+	if err := runtime.reserveProtocolInput(); err != nil {
 		if deterministicPersistFailure(err) {
 			return runtime.fail(err)
 		}
@@ -1052,7 +1148,7 @@ func (runtime *Runtime) Tick() error {
 	if err := runtime.requireEmptyInputWindow(); err != nil {
 		return err
 	}
-	if err := runtime.reserveReadyWithWALMaintenance(); err != nil {
+	if err := runtime.reserveProtocolInput(); err != nil {
 		if deterministicPersistFailure(err) {
 			return runtime.fail(err)
 		}
@@ -1067,7 +1163,7 @@ func (runtime *Runtime) Campaign() error {
 	if err := runtime.requireEmptyInputWindow(); err != nil {
 		return err
 	}
-	if err := runtime.reserveReadyWithWALMaintenance(); err != nil {
+	if err := runtime.reserveProtocolInput(); err != nil {
 		if deterministicPersistFailure(err) {
 			return runtime.fail(err)
 		}
@@ -1090,6 +1186,9 @@ func (runtime *Runtime) DriveReady(
 ) (DriveResult, error) {
 	if err := runtime.checkUsable(); err != nil {
 		return DriveResult{}, err
+	}
+	if runtime.pipelined != nil {
+		return runtime.drivePipelinedReady(workspace, send, settle)
 	}
 	if _, pending := runtime.pendingAppliedResults(); pending {
 		return runtime.settleAppliedResults(settle)
@@ -1429,6 +1528,10 @@ func (runtime *Runtime) Close() error {
 		return ErrResultSettlementPending
 	}
 	runtime.stopping = true
+	if runtime.pipelined != nil {
+		runtime.pipelined.stopAppendWorker()
+		runtime.pipelined = nil
+	}
 	if runtime.walGeneration != nil {
 		runtime.walGeneration.stopAndWait()
 		clear(runtime.walGeneration.key.Material[:])

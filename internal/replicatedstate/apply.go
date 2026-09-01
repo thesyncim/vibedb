@@ -144,15 +144,19 @@ type relationPointSnapshots struct {
 // overlays before the next call reuses these buffers. Singleton planning passes
 // nil and retains its existing ownership behavior.
 type commandPlanScratch struct {
-	authorityRead   []byte
-	authorityRecord []byte
-	sessionRead     []byte
-	slotRead        []byte
-	decodeRead      []byte
-	sessionRecord   []byte
-	slotRecord      []byte
-	currentValue    []byte
-	descriptors     []mutationValueDescriptor
+	authorityRead             []byte
+	authorityRecord           []byte
+	sessionRead               []byte
+	slotRead                  []byte
+	decodeRead                []byte
+	sessionRecord             []byte
+	slotRecord                []byte
+	currentValue              []byte
+	descriptors               []mutationValueDescriptor
+	transactionPayloads       [replication.MaxRelationsPerBundle]TransactionRelationPayloadView
+	transactionRelationRecord [replication.MaxRelationsPerBundle][]byte
+	transactionControlRecord  []byte
+	transactionRows           []transactionRowMutation
 	// logicalValueReads counts mutation before-value reads in the current
 	// physical batch. It is retained only as bounded qualification telemetry.
 	logicalValueReads uint32
@@ -192,6 +196,16 @@ func (s *commandPlanScratch) release() {
 	clear(s.slotRecord)
 	clear(s.currentValue)
 	clear(s.descriptors)
+	clear(s.transactionPayloads[:])
+	for index := range s.transactionRelationRecord {
+		clear(s.transactionRelationRecord[index])
+		s.transactionRelationRecord[index] = s.transactionRelationRecord[index][:0]
+		if cap(s.transactionRelationRecord[index]) > maxNormalBatchRetainedBufferBytes {
+			s.transactionRelationRecord[index] = nil
+		}
+	}
+	clear(s.transactionControlRecord)
+	clear(s.transactionRows)
 	s.sessionRead = s.sessionRead[:0]
 	s.authorityRead = s.authorityRead[:0]
 	s.authorityRecord = s.authorityRecord[:0]
@@ -200,6 +214,8 @@ func (s *commandPlanScratch) release() {
 	s.sessionRecord = s.sessionRecord[:0]
 	s.slotRecord = s.slotRecord[:0]
 	s.descriptors = s.descriptors[:0]
+	s.transactionControlRecord = s.transactionControlRecord[:0]
+	s.transactionRows = s.transactionRows[:0]
 	if cap(s.sessionRead) > maxNormalBatchRetainedBufferBytes {
 		s.sessionRead = nil
 	}
@@ -228,6 +244,12 @@ func (s *commandPlanScratch) release() {
 	}
 	if cap(s.descriptors) > maxNormalBatchRetainedOverlayEntries {
 		s.descriptors = nil
+	}
+	if cap(s.transactionControlRecord) > maxNormalBatchRetainedBufferBytes {
+		s.transactionControlRecord = nil
+	}
+	if cap(s.transactionRows) > maxNormalBatchRetainedOverlayEntries {
+		s.transactionRows = nil
 	}
 }
 
@@ -444,7 +466,7 @@ func (m *Machine) applyNormal(meta raftmodel.ApplyMeta, data []byte, completion 
 	if command.Kind() == replication.CommandTransaction {
 		transactionPlan, planErr := m.planTransactionCommand(
 			command, meta.Index, m.state,
-			pointSnapshot{value: systemSnapshot}, relationSnapshots,
+			pointSnapshot{value: systemSnapshot}, relationSnapshots, nil,
 		)
 		err = errors.Join(planErr, m.applyCut.Close())
 		if err != nil {
@@ -808,13 +830,29 @@ func (m *Machine) AdmitCommand(data []byte) error {
 	if !m.immutableBindingMatches(command) {
 		return ErrWrongBinding
 	}
-	systemSnapshot, relationSnapshots, err := m.captureHotBundleApplyCutLocked()
-	if err != nil {
-		return m.fail(err)
+	var systemBase pointSnapshot
+	var relationSnapshots relationPointSnapshots
+	if isSingleParticipantCommand(command) {
+		// ReplicatedApply's database read lock excludes the sole apply writer for
+		// the complete admission call. Read the current journal-backed overlays
+		// directly so proposal admission never turns a dirty certified suffix
+		// into an otherwise unnecessary physical checkpoint.
+		systemBase.live = m.system.Collection
+		relationSnapshots.count = uint16(len(m.relations))
+		for ordinal := range m.relations {
+			relationSnapshots.values[ordinal].live = m.relations[ordinal].target.Collection
+		}
+	} else {
+		systemSnapshot, snapshots, err := m.captureHotBundleApplyCutLocked()
+		if err != nil {
+			return m.fail(err)
+		}
+		systemBase.value = systemSnapshot
+		relationSnapshots = snapshots
 	}
 	if command.Kind() == replication.CommandRequestLedger {
 		ledgerPlan, planErr := m.planRequestLedgerCommand(
-			command, m.state, pointSnapshot{value: systemSnapshot},
+			command, m.state, systemBase,
 		)
 		closeErr := m.applyCut.Close()
 		if planErr != nil || closeErr != nil {
@@ -841,7 +879,7 @@ func (m *Machine) AdmitCommand(data []byte) error {
 	if command.Kind() == replication.CommandTransaction {
 		transactionPlan, planErr := m.planTransactionCommand(
 			command, m.state.Applied+1, m.state,
-			pointSnapshot{value: systemSnapshot}, relationSnapshots,
+			systemBase, relationSnapshots, &m.commandPlanScratch,
 		)
 		closeErr := m.applyCut.Close()
 		if planErr != nil || closeErr != nil {
@@ -873,8 +911,8 @@ func (m *Machine) AdmitCommand(data []byte) error {
 	}
 	plan, planErr := m.planBundleCommand(
 		command, m.state.Applied+1, m.state,
-		pointSnapshot{value: systemSnapshot}, relationSnapshots,
-		nil,
+		systemBase, relationSnapshots,
+		&m.commandPlanScratch,
 	)
 	closeErr := m.applyCut.Close()
 	if planErr != nil || closeErr != nil {
@@ -996,7 +1034,10 @@ func (m *Machine) nextState(meta raftmodel.ApplyMeta, kind RecordKind, digest [3
 	return State{
 		Binding: m.binding, Applied: meta.Index, LastTerm: meta.Term,
 		LastKind: kind, LastEntryType: meta.Type, LastEntryDigest: digest,
-		DataChainDigest: m.state.DataChainDigest, ConfState: cloneConfState(m.state.ConfState),
+		// ConfState is Machine-owned immutable data. Normal transitions preserve
+		// membership, so retain its identity instead of reflect-cloning the same
+		// configuration for every admission and apply.
+		DataChainDigest: m.state.DataChainDigest, ConfState: m.state.ConfState,
 		ApplyContractDigest: m.applyContract,
 		ReplicaSetVersion:   m.state.ReplicaSetVersion,
 		BootstrapDigest:     m.bootstrapDigest, SnapshotBaseDigest: m.state.SnapshotBaseDigest,
@@ -2329,6 +2370,7 @@ func (m *Machine) releaseMutationPlan() {
 // also lets hot point reads inline without interface escapes.
 type pointSnapshot struct {
 	value   *durable.Snapshot
+	live    *durable.Collection
 	overlay *logicalOverlay
 }
 
@@ -2336,7 +2378,34 @@ func (s pointSnapshot) appendRaw(dst []byte, key []byte) ([]byte, bool, error) {
 	if s.overlay != nil {
 		return s.overlay.appendRaw(dst, key)
 	}
+	if s.live != nil {
+		return s.live.AppendRaw(dst, key)
+	}
+	if s.value == nil {
+		return dst, false, ErrInconsistentSnapshot
+	}
 	return s.value.AppendRaw(dst, key)
+}
+
+func (s pointSnapshot) rangePrefixRaw(
+	prefix []byte,
+	visit func(key, value []byte) error,
+) error {
+	if s.overlay != nil {
+		return s.overlay.rangePrefixRaw(prefix, visit)
+	}
+	if s.live != nil {
+		return s.live.RangeRawCurrent(func(key, value []byte) error {
+			if bytes.HasPrefix(key, prefix) {
+				return visit(key, value)
+			}
+			return nil
+		})
+	}
+	if s.value == nil {
+		return ErrInconsistentSnapshot
+	}
+	return s.value.RangePrefixRaw(prefix, visit)
 }
 
 func (s pointSnapshot) appendRawForPlan(
@@ -2374,7 +2443,7 @@ func (s pointSnapshot) hasRawPrefix(prefix []byte) (bool, error) {
 	if s.overlay != nil {
 		err = s.overlay.rangePrefixRaw(prefix, visit)
 	} else {
-		err = s.value.RangePrefixRaw(prefix, visit)
+		err = s.rangePrefixRaw(prefix, visit)
 	}
 	if errors.Is(err, errStopSessionPrefix) {
 		return true, nil
@@ -2395,7 +2464,7 @@ func (s pointSnapshot) rangeSessionSlots(
 	if s.overlay != nil {
 		return s.overlay.rangePrefixRaw(prefix[:], visit)
 	}
-	return s.value.RangePrefixRaw(prefix[:], visit)
+	return s.rangePrefixRaw(prefix[:], visit)
 }
 
 func ensureNoAuthoritySessionRows(snapshot pointSnapshot, tenant []byte,
@@ -2877,11 +2946,25 @@ func (m *Machine) checkTransitionCapacityWithCaptureRows(
 	captureBytes int,
 	transactionRows []transactionRowMutation,
 ) error {
-	stateEnvelopeBytes, err := validatedStateSize(next)
+	stateEnvelopeBytes, err := m.validatedTransitionStateSize(next)
 	if err != nil {
 		return err
 	}
 	return m.checkTransitionCapacityWithStateBytes(stateEnvelopeBytes, changes, plan, captureBytes, transactionRows)
+}
+
+func (m *Machine) validatedTransitionStateSize(next State) (int, error) {
+	if !m.initialized || next.ConfState != m.state.ConfState ||
+		next.ReplicaSetVersion != m.state.ReplicaSetVersion {
+		return validatedStateSize(next)
+	}
+	if err := validateStateStructure(next); err != nil {
+		return 0, err
+	}
+	if err := validateStateRecord(next); err != nil {
+		return 0, err
+	}
+	return stateEncodingSize(next, proto.Size(next.ConfState))
 }
 
 // checkTransitionCapacityWithStateBytes consumes only an exact size from

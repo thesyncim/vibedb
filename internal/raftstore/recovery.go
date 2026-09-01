@@ -270,6 +270,109 @@ func recoverRecords(file *os.File, header *headerState, current currentState, op
 	return image, generation, nil
 }
 
+// recoverReadyTail adopts the longest complete authenticated Ready chain after
+// the last current-slot anchor. Persist writes and syncs one record before it
+// can acknowledge that Ready, so every complete chained record is safe to
+// replay. A missing or incomplete final record is an unacknowledged crash cut
+// and terminates the tail. Authenticated records with invalid Raft state remain
+// corruption: they were completely emitted by this writer and must not be
+// silently discarded.
+func recoverReadyTail(
+	file *os.File,
+	header headerState,
+	current currentState,
+	image logImage,
+	options normalizedOptions,
+) (currentState, logImage, error) {
+	if file == nil || current.recordSequence == 0 || current.walEnd < HeaderBytes {
+		return currentState{}, logImage{}, fmt.Errorf("%w: invalid Ready tail anchor", ErrCorrupt)
+	}
+	offset := current.walEnd
+	previousDigest := current.chainDigest
+	minimumReadyID := uint64(1)
+	if current.retryPresent {
+		if current.retry.incarnation != current.currentIncarnation || current.retry.readyID == math.MaxUint64 {
+			return currentState{}, logImage{}, fmt.Errorf("%w: invalid Ready tail retry anchor", ErrCorrupt)
+		}
+		minimumReadyID = current.retry.readyID + 1
+	}
+	for sequence := current.recordSequence + 1; sequence <= options.maxRecords; sequence++ {
+		prefix := make([]byte, recordPrefixBytes)
+		if _, err := file.ReadAt(prefix, offset); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return currentState{}, logImage{}, fmt.Errorf("%w: read Ready tail prefix: %v", ErrCorrupt, err)
+		}
+		if allZero(prefix) {
+			break
+		}
+		envelope, err := inspectRecordPrefix(prefix, header, options)
+		if err != nil {
+			break
+		}
+		if envelope.kind != recordKindReady || envelope.sequence != sequence ||
+			envelope.previous != previousDigest || envelope.incarnation != current.currentIncarnation ||
+			envelope.readyID < minimumReadyID {
+			return currentState{}, logImage{}, fmt.Errorf(
+				"%w: Ready tail identity kind=%d sequence=%d/%d incarnation=%d/%d ready=%d/min-%d",
+				ErrCorrupt, envelope.kind, envelope.sequence, sequence,
+				envelope.incarnation, current.currentIncarnation, envelope.readyID, minimumReadyID,
+			)
+		}
+		end, ok := addInt64(offset, envelope.total)
+		if !ok || end > options.maxFileBytes {
+			break
+		}
+		data := make([]byte, envelope.total)
+		if _, err = file.ReadAt(data, offset); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return currentState{}, logImage{}, fmt.Errorf("%w: read Ready tail record: %v", ErrCorrupt, err)
+		}
+		record, err := unmarshalRecord(data, header, options)
+		if err != nil {
+			// A crash can leave only one incomplete final record because the
+			// writer does not begin its successor until this record's sync has
+			// succeeded. Nonzero bytes at the next framed boundary therefore
+			// prove corruption of an interior acknowledged record.
+			nextPrefix := make([]byte, recordPrefixBytes)
+			if _, nextErr := file.ReadAt(nextPrefix, end); nextErr == nil && !allZero(nextPrefix) {
+				return currentState{}, logImage{}, fmt.Errorf("%w: invalid interior Ready tail record: %v", ErrCorrupt, err)
+			} else if nextErr != nil && !errors.Is(nextErr, io.EOF) {
+				return currentState{}, logImage{}, fmt.Errorf("%w: inspect Ready tail successor: %v", ErrCorrupt, nextErr)
+			}
+			break
+		}
+		payload, err := unmarshalReadyPayload(record.payload, options)
+		if err != nil || bool(record.envelope.flags&1 != 0) != payload.mustSync {
+			return currentState{}, logImage{}, errors.Join(ErrCorrupt, err,
+				errors.New("authenticated Ready tail payload is invalid"))
+		}
+		delta, err := planReadyPayload(&image, payload, options)
+		if err != nil {
+			return currentState{}, logImage{}, fmt.Errorf("%w: apply authenticated Ready tail: %v", ErrCorrupt, err)
+		}
+		commitImageDelta(&image, delta)
+		current.walEnd = end
+		current.recordSequence = sequence
+		current.chainDigest = record.digest
+		current.hard = cloneHardState(delta.hard)
+		current.last = delta.last
+		current.retryPresent = true
+		current.retry = retryKey{incarnation: record.envelope.incarnation, readyID: record.envelope.readyID}
+		current.retryDigest = sha256.Sum256(record.payload)
+		offset = end
+		previousDigest = record.digest
+		if record.envelope.readyID == math.MaxUint64 {
+			return currentState{}, logImage{}, fmt.Errorf("%w: Ready tail identity exhausted", ErrCorrupt)
+		}
+		minimumReadyID = record.envelope.readyID + 1
+	}
+	return current, image, nil
+}
+
 func validateRecoveredGenerationSeal(
 	seal generationSeal,
 	header headerState,

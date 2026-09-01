@@ -57,6 +57,7 @@ type PointReadRequest = raftservice.PointReadRequest
 type PointReadResult = raftservice.PointReadResult
 type PointReadLease = raftservice.PointReadLease
 type ServingState = raftservice.ServingState
+type ProgressMetrics = raftservice.ProgressMetrics
 
 var NewAuthenticatedPeerRuntime = raftservice.NewAuthenticatedPeerRuntime
 var ErrOutcomeUnknown = raftservice.ErrOutcomeUnknown
@@ -155,8 +156,10 @@ type multiGroupRF3Group struct {
 	logicalSchema replication.Digest
 	key           raftmember.GroupKey
 	runtimes      [multiGroupRF3Voters]*raftmember.Runtime
+	wals          [multiGroupRF3Voters]*raftstore.Store
 	bases         [multiGroupRF3Voters]sqldriver.ReplicatedShardStoreIdentity
 	reads         [multiGroupRF3Voters]*sqldriver.ReplicatedApply
+	storageRoots  [multiGroupRF3Voters]string
 }
 
 type multiGroupRF3Trace struct {
@@ -272,6 +275,7 @@ type multiGroupTransactionRF3Cluster struct {
 	groups     [multiGroupRF3MaxGroups]multiGroupRF3Group
 	groupCount int
 	owners     [multiGroupRF3Voters]*Owner
+	progress   [multiGroupRF3Voters]*ProgressMetrics
 	peers      [multiGroupRF3Voters]*AuthenticatedPeerRuntime
 	contexts   [multiGroupRF3Voters]context.Context
 	cancels    [multiGroupRF3Voters]context.CancelFunc
@@ -482,6 +486,17 @@ func newMultiGroupRF3Cluster(
 	t testing.TB,
 	groupCount int,
 ) *multiGroupTransactionRF3Cluster {
+	return newMultiGroupRF3ClusterWithWALOptions(t, groupCount, raftstore.Options{
+		MaxFileBytes: 256 << 20, MaxRecordBytes: raftstore.DefaultMaxRecordBytes,
+		MaxRecords: 4096, MaxEntries: 16384, MaxLiveBytes: raftstore.DefaultMaxLiveBytes,
+	})
+}
+
+func newMultiGroupRF3ClusterWithWALOptions(
+	t testing.TB,
+	groupCount int,
+	walOptions raftstore.Options,
+) *multiGroupTransactionRF3Cluster {
 	t.Helper()
 	if groupCount <= 0 || groupCount > multiGroupRF3MaxGroups {
 		t.Fatalf("RF3 group count %d is outside [1,%d]", groupCount, multiGroupRF3MaxGroups)
@@ -492,9 +507,9 @@ func newMultiGroupRF3Cluster(
 	cluster.network.conns = make(map[*multiGroupRF3Conn]struct{})
 	for group := 0; group < cluster.groupCount; group++ {
 		for member := 0; member < multiGroupRF3Voters; member++ {
-			cluster.groups[group].runtimes[member], cluster.groups[group].bases[member],
-				cluster.groups[group].reads[member] = newMultiGroupRF3Runtime(
-				t, group, uint64(member+1),
+			cluster.groups[group].runtimes[member], cluster.groups[group].wals[member], cluster.groups[group].bases[member],
+				cluster.groups[group].reads[member], cluster.groups[group].storageRoots[member] = newMultiGroupRF3Runtime(
+				t, group, uint64(member+1), walOptions,
 			)
 		}
 		cluster.groups[group].key = cluster.groups[group].runtimes[0].Identity().Group
@@ -587,6 +602,10 @@ func newMultiGroupRF3Cluster(
 			}
 		}
 		localMember := member
+		metrics := new(ProgressMetrics)
+		if err := metrics.ConfigureGroups(identities); err != nil {
+			t.Fatal(err)
+		}
 		peer, err := NewAuthenticatedPeerRuntime(AuthenticatedPeerOptions{
 			Registry: registries[nodes[member]], TLS: peerTLS[member],
 			Dial: func(ctx context.Context, node rafttransport.NodeID) (net.Conn, error) {
@@ -601,7 +620,7 @@ func newMultiGroupRF3Cluster(
 			Owner: Options{
 				Registry: serving, Host: host, Members: identities, CommandFences: fences,
 				ReadSources: reads, TransactionRecoverySources: recovery,
-				Pulse: cluster.pulses[member],
+				Pulse: cluster.pulses[member], ProgressMetrics: metrics,
 				Limits: Limits{MaxIngressItems: 256, MaxIngressBytes: 128 << 20,
 					MaxPendingProposalItems: 128, MaxPendingProposalBytes: 128 << 20,
 					MaxPendingReadItems: 128, MaxPendingReadBytes: 128 << 20,
@@ -629,6 +648,7 @@ func newMultiGroupRF3Cluster(
 		}
 		cluster.peers[member] = peer
 		cluster.owners[member] = peer.Owner()
+		cluster.progress[member] = metrics
 		cluster.contexts[member], cluster.cancels[member] = context.WithCancel(context.Background())
 		cluster.runErrors[member] = make(chan error, 1)
 	}
@@ -942,7 +962,8 @@ func newMultiGroupRF3Runtime(
 	t testing.TB,
 	group int,
 	memberID uint64,
-) (*raftmember.Runtime, sqldriver.ReplicatedShardStoreIdentity, *sqldriver.ReplicatedApply) {
+	walOptions raftstore.Options,
+) (*raftmember.Runtime, *raftstore.Store, sqldriver.ReplicatedShardStoreIdentity, *sqldriver.ReplicatedApply, string) {
 	t.Helper()
 	shards := [...]string{"0000-7fff", "8000-ffff", "request-ledger"}
 	distributions := [...]string{"orders-a", "orders-b", "durable-requests"}
@@ -962,22 +983,21 @@ func newMultiGroupRF3Runtime(
 		key.Material[index] = byte(index + 1 + group)
 	}
 	baseIndex, baseTerm := uint64(1), uint64(1)
+	storageRoot := t.TempDir()
 	wal, err := raftstore.Create(
-		filepath.Join(t.TempDir(), "member.wal"), identity, key,
+		filepath.Join(storageRoot, "member.wal"), identity, key,
 		raftstore.Bootstrap{TopologyRecoveryEpoch: 3, Snapshot: &pb.Snapshot{
 			Data: []byte("rf3-multigroup-bootstrap"),
 			Metadata: &pb.SnapshotMetadata{Index: &baseIndex, Term: &baseTerm,
 				ConfState: &pb.ConfState{Voters: []uint64{1, 2, 3}}},
 		}},
-		raftstore.Options{MaxFileBytes: 256 << 20,
-			MaxRecordBytes: raftstore.DefaultMaxRecordBytes, MaxRecords: 4096,
-			MaxEntries: 16384, MaxLiveBytes: raftstore.DefaultMaxLiveBytes},
+		walOptions,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	database, err := sqldriver.InitializeShardStore(
-		filepath.Join(t.TempDir(), "member.vdb"), sqldriver.ShardStoreBinding{
+		filepath.Join(storageRoot, "member.vdb"), sqldriver.ShardStoreBinding{
 			Distribution:         distribution.DistributionName(identity.Distribution),
 			Shard:                distribution.ShardID(identity.Shard),
 			AllocationGeneration: distribution.ShardAllocationGeneration(identity.AllocationGeneration),
@@ -1050,11 +1070,22 @@ func newMultiGroupRF3Runtime(
 	if _, err := apply.InstallSnapshot(bootstrap); err != nil {
 		t.Fatal(err)
 	}
-	runtime, err := raftmember.AdoptRuntime(wal, database, apply)
+	runtime, err := raftmember.AdoptPipelinedRuntime(wal, database, apply)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return runtime, base, apply
+	// Match the production runtime: a busy shard must be able to replace its
+	// immutable WAL generation under admission pressure instead of failing once
+	// the original preallocation fills. Keep the periodic cadence outside normal
+	// tests; ReserveReady's pressure path still forces a replacement when needed.
+	if err := runtime.ConfigureWALGeneration(raftmember.WALGenerationDriverOptions{
+		IntervalTicks: 12000,
+		Key:           key,
+	}); err != nil {
+		_ = runtime.Close()
+		t.Fatal(err)
+	}
+	return runtime, wal, base, apply, storageRoot
 }
 
 func TestTwoRealRF3GroupsExecuteFusedTwoParticipantTransactionAcrossLeaderIsolation(t *testing.T) {

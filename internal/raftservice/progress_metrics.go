@@ -25,8 +25,10 @@ type ProgressMetrics struct {
 	// perform only bounded local diagnostic work, not remote I/O.
 	ProposalFailure     func(raftmember.GroupKey, ProposalFailureReason)
 	proposalFailureSeen atomic.Uint64
+	proposalBatches     atomic.Uint64
 	proposalCommands    atomic.Uint64
 	proposalBytes       atomic.Uint64
+	applyBatches        atomic.Uint64
 	appliedEntries      atomic.Uint64
 	commitAdvancements  atomic.Uint64
 	committedEntries    atomic.Uint64
@@ -43,10 +45,11 @@ type progressMetricsGroup struct {
 }
 
 type progressMetricsCounters struct {
-	proposalCommands, proposalBytes, appliedEntries atomic.Uint64
-	commitAdvancements, committedEntries            atomic.Uint64
-	readyPersisted, snapshotsFinished               atomic.Uint64
-	readCompletions, faults                         atomic.Uint64
+	proposalBatches, proposalCommands, proposalBytes atomic.Uint64
+	applyBatches, appliedEntries                     atomic.Uint64
+	commitAdvancements, committedEntries             atomic.Uint64
+	readyPersisted, snapshotsFinished                atomic.Uint64
+	readCompletions, faults                          atomic.Uint64
 }
 
 type progressMetricsGroupTable struct {
@@ -57,8 +60,10 @@ type progressMetricsGroupTable struct {
 // ProgressMetricsSnapshot is a detached, consistent-enough counter cut. Every
 // field is cumulative for one process incarnation.
 type ProgressMetricsSnapshot struct {
+	ProposalBatches    uint64
 	ProposalCommands   uint64
 	ProposalBytes      uint64
+	ApplyBatches       uint64
 	AppliedEntries     uint64
 	CommitAdvancements uint64
 	CommittedEntries   uint64
@@ -78,10 +83,12 @@ func (metrics *ProgressMetrics) observeProgress(progress multiraft.Progress, don
 		metrics.observeProposalFailure(progress.Group, err)
 	}
 	if progress.ProposalCount > 0 {
+		metrics.proposalBatches.Add(1)
 		metrics.proposalCommands.Add(uint64(progress.ProposalCount))
 		metrics.proposalBytes.Add(uint64(progress.ProposalBytes))
 	}
 	if progress.AppliedCount > 0 {
+		metrics.applyBatches.Add(1)
 		metrics.appliedEntries.Add(uint64(progress.AppliedCount))
 	}
 	if progress.CommitAdvancements != 0 {
@@ -110,10 +117,12 @@ func (metrics *ProgressMetrics) observeProgress(progress multiraft.Progress, don
 
 func (counters *progressMetricsCounters) observe(progress multiraft.Progress, done bool, err error) {
 	if progress.ProposalCount > 0 {
+		counters.proposalBatches.Add(1)
 		counters.proposalCommands.Add(uint64(progress.ProposalCount))
 		counters.proposalBytes.Add(uint64(progress.ProposalBytes))
 	}
 	if progress.AppliedCount > 0 {
+		counters.applyBatches.Add(1)
 		counters.appliedEntries.Add(uint64(progress.AppliedCount))
 	}
 	if progress.CommitAdvancements != 0 {
@@ -217,7 +226,8 @@ func (metrics *ProgressMetrics) GroupProgressMetrics(group raftmember.GroupKey) 
 	}
 	c := &slot.counters
 	return slot.identity, ProgressMetricsSnapshot{
-		ProposalCommands: c.proposalCommands.Load(), ProposalBytes: c.proposalBytes.Load(),
+		ProposalBatches: c.proposalBatches.Load(), ProposalCommands: c.proposalCommands.Load(),
+		ProposalBytes: c.proposalBytes.Load(), ApplyBatches: c.applyBatches.Load(),
 		AppliedEntries: c.appliedEntries.Load(), ReadyPersisted: c.readyPersisted.Load(),
 		CommitAdvancements: c.commitAdvancements.Load(), CommittedEntries: c.committedEntries.Load(),
 		SnapshotsFinished: c.snapshotsFinished.Load(), ReadCompletions: c.readCompletions.Load(),
@@ -230,8 +240,10 @@ func (metrics *ProgressMetrics) Snapshot() ProgressMetricsSnapshot {
 		return ProgressMetricsSnapshot{}
 	}
 	return ProgressMetricsSnapshot{
+		ProposalBatches:    metrics.proposalBatches.Load(),
 		ProposalCommands:   metrics.proposalCommands.Load(),
 		ProposalBytes:      metrics.proposalBytes.Load(),
+		ApplyBatches:       metrics.applyBatches.Load(),
 		AppliedEntries:     metrics.appliedEntries.Load(),
 		CommitAdvancements: metrics.commitAdvancements.Load(),
 		CommittedEntries:   metrics.committedEntries.Load(),
