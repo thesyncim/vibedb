@@ -234,11 +234,22 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 	// A cold store has no WAL incarnation yet. Its first adoption must mint 1;
 	// later incarnations require an existing durable WAL, not a fixture label.
 	const targetIncarnation = uint64(1)
-	targetAddresses := rf3CommandUnusedAddresses(t, 4)
+	targetReservation, err := rf3testfixture.ReserveLoopbackAddresses(4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer targetReservation.Close()
+	targetAddresses := targetReservation.Addresses
 	targetListeners := rf3ManifestListeners{
 		Peer: targetAddresses[0], Native: targetAddresses[1],
 		Snapshot: targetAddresses[2], Control: targetAddresses[3],
 	}
+	// The cold process binds only control. Keep its future serving addresses
+	// reserved so later fixture proxies cannot recycle them before bootstrap.
+	if err = targetReservation.Listeners[3].Close(); err != nil {
+		t.Fatal(err)
+	}
+	targetReservation.Listeners[3] = nil
 	target := rf3ManifestEnrolledTarget{
 		MemberID: 4, NodeID: targetNode, StoreID: targetStore,
 		NodeIncarnation: targetIncarnation, PeerAddress: targetListeners.Peer,
@@ -439,7 +450,8 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 			policyPath: policyPath, peerAddresses: peerAddresses, nativeAddresses: nativeAddresses,
 			controlAddresses: controlAddresses, snapshotAddresses: snapshotAddresses, targetNode: targetNode, targetStore: targetStore,
 			targetIncarnation: targetIncarnation, targetListeners: targetListeners,
-			clientNode: clientNode, gatewayNode: gatewayNode, clientProfile: clientProfile, authority: authority, grantClient: grantClient,
+			targetReservation: targetReservation,
+			clientNode:        clientNode, gatewayNode: gatewayNode, clientProfile: clientProfile, authority: authority, grantClient: grantClient,
 		})
 		return
 	}
@@ -507,6 +519,9 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 		},
 	)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err = targetReservation.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = bootstrapClient.Execute(t.Context(), targetNode,

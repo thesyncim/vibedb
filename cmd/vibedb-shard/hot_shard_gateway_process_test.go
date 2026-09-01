@@ -83,6 +83,7 @@ type gatewayHotShardLiveFixture struct {
 	targetStore       [16]byte
 	targetIncarnation uint64
 	targetListeners   rf3ManifestListeners
+	targetReservation *rf3testfixture.ReservedAddresses
 	clientProfile     *rafttransport.PeerTLS
 	clientNode        rafttransport.NodeID
 	gatewayNode       rafttransport.NodeID
@@ -179,6 +180,12 @@ func runGatewayHotShardLiveChild(t testing.TB, fixture gatewayHotShardLiveFixtur
 		fixture.targetListeners.Native+"="+fmt.Sprintf("%x", fixture.targetNode))
 	command := exec.Command(gatewayBinary, arguments...)
 	command.Stdout, command.Stderr = diagnostic, diagnostic
+	// Every fixture-owned proxy and gateway address is now fixed. Release the
+	// cold target's future serving listeners before the controller can begin
+	// bootstrap, without leaving them available for an earlier proxy bind.
+	if err = fixture.targetReservation.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if err = command.Start(); err != nil {
 		t.Fatal(err)
 	}
