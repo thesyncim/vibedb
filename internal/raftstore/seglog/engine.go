@@ -24,10 +24,11 @@ const engineWaveGroup = ^uint64(0)
 type WaveID [16]byte
 
 type Entry struct {
-	Index, Term uint64
-	Type        pb.EntryType
-	Data        []byte
-	dataOffset  uint64
+	Index, Term           uint64
+	Type                  pb.EntryType
+	Data                  []byte
+	DataOffset, DataBytes uint64
+	dataOffset            uint64
 }
 type HardState struct{ Term, Vote, Commit uint64 }
 type Checkpoint struct {
@@ -36,11 +37,14 @@ type Checkpoint struct {
 }
 type ReadyBatch struct {
 	GroupID                     uint64
+	NodeIncarnation, ReadyID    uint64
+	ReadyDigest                 [16]byte
 	ReplaceFrom                 uint64
 	Entries                     []Entry
 	Hard                        *HardState
 	TruncateIndex, TruncateTerm uint64
 	Checkpoint                  *Checkpoint
+	Blob                        []byte
 }
 type Wave struct {
 	ID      WaveID
@@ -50,15 +54,30 @@ type Wave struct {
 type EntryLocation struct {
 	SegmentID, Offset, Bytes, Index, Term uint64
 	Type                                  pb.EntryType
+	DataOffset, DataBytes                 uint64
+	BatchID                               WaveID
 }
 type GroupState struct {
 	Hard                        HardState
 	TruncateIndex, TruncateTerm uint64
 	Checkpoint                  Checkpoint
 	Entries                     []EntryLocation
+	NodeIncarnation, ReadyID    uint64
+	ReadyDigest                 [16]byte
+	ReadyWaveID                 WaveID
+}
+
+type GroupSummary struct {
+	LastIndex                uint64
+	NodeIncarnation, ReadyID uint64
+	ReadyDigest              [16]byte
 }
 
 type engineGroup struct{ GroupState }
+type segmentReader struct {
+	id   uint64
+	file *os.File
+}
 
 type Engine struct {
 	log          *Log
@@ -70,6 +89,8 @@ type Engine struct {
 	eventScratch []segmentEvent
 	syncData     func(*os.File) error
 	writeAt      func(*os.File, []byte, int64) (int, error)
+	readers      []segmentReader
+	readerNext   int
 }
 
 func CreateEngine(dir string) (*Engine, error) {
@@ -80,7 +101,102 @@ func CreateEngine(dir string) (*Engine, error) {
 	return &Engine{log: l, groups: make(map[uint64]*engineGroup), waves: make(map[WaveID][32]byte), syncData: syncActiveData, writeAt: func(f *os.File, b []byte, off int64) (int, error) { return f.WriteAt(b, off) }}, nil
 }
 
-func (e *Engine) Close() error { return e.log.Close() }
+func (e *Engine) Close() error {
+	var err error
+	for i := range e.readers {
+		if e.readers[i].file != nil {
+			err = errors.Join(err, e.readers[i].file.Close())
+			e.readers[i] = segmentReader{}
+		}
+	}
+	return errors.Join(err, e.log.Close())
+}
+
+// ReserveReaders fixes the maximum number of retained sealed descriptors.
+// Cache misses are explicit control-plane operations through PrepareSegment.
+func (e *Engine) ReserveReaders(count int) error {
+	if err := e.log.usable(); err != nil {
+		return err
+	}
+	if count < 0 {
+		return ErrBounds
+	}
+	for i := count; i < len(e.readers); i++ {
+		if e.readers[i].file != nil {
+			_ = e.readers[i].file.Close()
+		}
+	}
+	if count != len(e.readers) {
+		e.readers = make([]segmentReader, count)
+		e.readerNext = 0
+	}
+	return nil
+}
+
+func (e *Engine) PrepareSegment(segmentID uint64) error {
+	if err := e.log.usable(); err != nil {
+		return err
+	}
+	if segmentID == e.log.manifest.ActiveID {
+		return nil
+	}
+	for i := range e.readers {
+		if e.readers[i].id == segmentID && e.readers[i].file != nil {
+			return nil
+		}
+	}
+	found := false
+	for _, meta := range e.log.manifest.Segments {
+		if meta.ID == segmentID {
+			found = true
+			break
+		}
+	}
+	if !found || len(e.readers) == 0 {
+		return ErrBounds
+	}
+	f, err := os.Open(filepath.Join(e.log.dir, sealedName(segmentID)))
+	if err != nil {
+		return err
+	}
+	slot := e.readerNext % len(e.readers)
+	e.readerNext++
+	if e.readers[slot].file != nil {
+		_ = e.readers[slot].file.Close()
+	}
+	e.readers[slot] = segmentReader{id: segmentID, file: f}
+	return nil
+}
+
+// ReadLocation reads exactly one entry value without decoding its containing
+// wave. Returned bytes alias dst and remain valid until the caller reuses dst.
+func (e *Engine) ReadLocation(location EntryLocation, dst []byte) ([]byte, error) {
+	if err := e.log.usable(); err != nil {
+		return nil, err
+	}
+	if location.Bytes > uint64(len(dst)) {
+		return nil, ErrBounds
+	}
+	var file *os.File
+	if location.SegmentID == e.log.manifest.ActiveID {
+		file = e.log.active
+	} else {
+		for i := range e.readers {
+			if e.readers[i].id == location.SegmentID {
+				file = e.readers[i].file
+				break
+			}
+		}
+	}
+	if file == nil {
+		return nil, ErrBounds
+	}
+	result := dst[:location.Bytes]
+	if _, err := file.ReadAt(result, int64(location.Offset)); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
 
 // Reserve moves every unbounded allocation off the steady PersistWave path.
 func (e *Engine) Reserve(frameBytes, events, waveIDs int) error {
@@ -147,11 +263,75 @@ func (e *Engine) Group(group uint64) (GroupState, bool) {
 	result.Entries = slices.Clone(result.Entries)
 	return result, true
 }
+
+// Summary returns the mutation admission cursor without cloning entry indexes.
+func (e *Engine) Summary(group uint64) (GroupSummary, bool) {
+	if e == nil || e.log.usable() != nil {
+		return GroupSummary{}, false
+	}
+	g, ok := e.groups[group]
+	if !ok {
+		return GroupSummary{}, false
+	}
+	last := g.Checkpoint.Index
+	if len(g.Entries) != 0 {
+		last = g.Entries[len(g.Entries)-1].Index
+	}
+	return GroupSummary{LastIndex: last, NodeIncarnation: g.NodeIncarnation, ReadyID: g.ReadyID, ReadyDigest: g.ReadyDigest}, true
+}
+
+// GroupIDs returns recovered group IDs in canonical order. The allocation is
+// confined to the Open/control path.
+func (e *Engine) GroupIDs() []uint64 {
+	ids := make([]uint64, 0, len(e.groups))
+	for id := range e.groups {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	return ids
+}
+
+// Lookup returns one immutable location without cloning the group's index.
+// compacted distinguishes a missing historical index from an unavailable one.
+func (e *Engine) Lookup(group, index uint64) (location EntryLocation, term uint64, compacted, ok bool) {
+	if e == nil || e.log.usable() != nil {
+		return EntryLocation{}, 0, false, false
+	}
+	g, exists := e.groups[group]
+	if !exists {
+		return EntryLocation{}, 0, false, false
+	}
+	base := g.Checkpoint.Index
+	if index < base {
+		return EntryLocation{}, 0, true, false
+	}
+	if index == base {
+		return EntryLocation{}, g.Checkpoint.Term, false, true
+	}
+	position := index - base - 1
+	if position >= uint64(len(g.Entries)) {
+		return EntryLocation{}, 0, false, false
+	}
+	location = g.Entries[position]
+	return location, location.Term, false, true
+}
+
 func (e *Engine) Sequence() uint64 {
 	if e == nil || e.log.usable() != nil {
 		return 0
 	}
 	return e.sequence
+}
+
+func (e *Engine) LogID() [16]byte { return e.log.manifest.LogID }
+
+// FatalError reports whether an ambiguous storage mutation poisoned the
+// handle. A nil result means a returned operation error was pre-mutation.
+func (e *Engine) FatalError() error {
+	if e == nil || e.log == nil {
+		return os.ErrClosed
+	}
+	return e.log.usable()
 }
 
 // PersistWave makes a caller-sorted, multi-group Ready wave durable with one
@@ -268,11 +448,22 @@ func (e *Engine) prepareWave(w Wave, validateState bool) ([]byte, [32]byte, []se
 		if batch.Hard != nil {
 			needed++
 		}
+		if flags&batchIdentity != 0 {
+			needed++
+		}
 		if len(e.eventScratch)+needed+1 > cap(e.eventScratch) || validateState && len(group.Entries)-replacementCount(group.Entries, batch.ReplaceFrom)+len(batch.Entries) > cap(group.Entries) {
 			return nil, [32]byte{}, nil, ErrBounds
 		}
 		e.frameBuf = appendUvarint(e.frameBuf, batch.GroupID-previousGroup)
 		e.frameBuf = append(e.frameBuf, flags)
+		if flags&batchIdentity != 0 {
+			e.frameBuf = appendUvarint(e.frameBuf, batch.NodeIncarnation)
+			e.frameBuf = appendUvarint(e.frameBuf, batch.ReadyID)
+			e.frameBuf = append(e.frameBuf, batch.ReadyDigest[:]...)
+			if validateState {
+				e.eventScratch = append(e.eventScratch, segmentEvent{Kind: eventReadyState, GroupID: batch.GroupID, Incarnation: batch.NodeIncarnation, ReadyID: batch.ReadyID, ReadyDigest: batch.ReadyDigest, Reference: w.ID})
+			}
+		}
 		if batch.ReplaceFrom != 0 {
 			e.frameBuf = appendUvarint(e.frameBuf, batch.ReplaceFrom)
 			if validateState {
@@ -300,14 +491,31 @@ func (e *Engine) prepareWave(w Wave, validateState bool) ([]byte, [32]byte, []se
 			if flags&batchTypes != 0 {
 				e.frameBuf = appendUvarint(e.frameBuf, uint64(entry.Type))
 			}
-			e.frameBuf = appendUvarint(e.frameBuf, uint64(len(entry.Data)))
+			if flags&batchBlob != 0 {
+				e.frameBuf = appendUvarint(e.frameBuf, entry.DataOffset)
+				e.frameBuf = appendUvarint(e.frameBuf, entry.DataBytes)
+			} else {
+				e.frameBuf = appendUvarint(e.frameBuf, uint64(len(entry.Data)))
+			}
 			dataOffset := uint64(len(e.frameBuf))
-			e.frameBuf = append(e.frameBuf, entry.Data...)
+			if flags&batchBlob == 0 {
+				e.frameBuf = append(e.frameBuf, entry.Data...)
+			}
 			if len(e.frameBuf) > cap(e.frameBuf) {
 				return nil, [32]byte{}, nil, ErrBounds
 			}
-			if validateState {
+			if validateState && flags&batchBlob == 0 {
 				e.eventScratch = append(e.eventScratch, segmentEvent{Kind: eventKindForType(entry.Type), GroupID: batch.GroupID, Index: entry.Index, Term: entry.Term, Offset: dataOffset, Bytes: uint64(len(entry.Data))})
+			}
+		}
+		if flags&batchBlob != 0 {
+			e.frameBuf = appendUvarint(e.frameBuf, uint64(len(batch.Blob)))
+			blobOffset := uint64(len(e.frameBuf))
+			e.frameBuf = append(e.frameBuf, batch.Blob...)
+			if validateState {
+				for _, entry := range batch.Entries {
+					e.eventScratch = append(e.eventScratch, segmentEvent{Kind: blobEventKind(entry.Type), GroupID: batch.GroupID, Index: entry.Index, Term: entry.Term, Offset: blobOffset, Bytes: uint64(len(batch.Blob)), DataOffset: entry.DataOffset, DataBytes: entry.DataBytes})
+				}
 			}
 		}
 		if validateState && batch.TruncateIndex != 0 {
@@ -359,17 +567,33 @@ func waveSize(w Wave) (int, int, error) {
 			bytes += uvarintBytes(b.Hard.Term) + uvarintBytes(b.Hard.Vote) + uvarintBytes(b.Hard.Commit)
 			events++
 		}
+		if batchFlags(b)&batchIdentity != 0 {
+			bytes += uvarintBytes(b.NodeIncarnation) + uvarintBytes(b.ReadyID) + 16
+			events++
+		}
 		hasTypes := batchFlags(b)&batchTypes != 0
+		hasBlob := len(b.Blob) != 0
 		for j := range b.Entries {
 			entry := &b.Entries[j]
 			if len(entry.Data) > maxRecordBytes || bytes > maxRecordBytes-len(entry.Data) {
 				return 0, 0, ErrBounds
 			}
-			bytes += uvarintBytes(entry.Index) + uvarintBytes(entry.Term) + uvarintBytes(uint64(len(entry.Data))) + len(entry.Data)
+			bytes += uvarintBytes(entry.Index) + uvarintBytes(entry.Term)
+			if hasBlob {
+				bytes += uvarintBytes(entry.DataOffset) + uvarintBytes(entry.DataBytes)
+			} else {
+				bytes += uvarintBytes(uint64(len(entry.Data))) + len(entry.Data)
+			}
 			if hasTypes {
 				bytes += uvarintBytes(uint64(entry.Type))
 			}
 			events++
+		}
+		if hasBlob {
+			if len(b.Blob) > maxRecordBytes || bytes > maxRecordBytes-len(b.Blob) {
+				return 0, 0, ErrBounds
+			}
+			bytes += uvarintBytes(uint64(len(b.Blob))) + len(b.Blob)
 		}
 		previousGroup = b.GroupID
 	}
@@ -394,6 +618,8 @@ const (
 	batchCheckpoint = 1 << 2
 	batchHard       = 1 << 3
 	batchTypes      = 1 << 4
+	batchIdentity   = 1 << 5
+	batchBlob       = 1 << 6
 )
 
 func batchFlags(b *ReadyBatch) byte {
@@ -409,6 +635,12 @@ func batchFlags(b *ReadyBatch) byte {
 	}
 	if b.Hard != nil {
 		flags |= batchHard
+	}
+	if b.NodeIncarnation != 0 || b.ReadyID != 0 || b.ReadyDigest != ([16]byte{}) {
+		flags |= batchIdentity
+	}
+	if len(b.Blob) != 0 {
+		flags |= batchBlob
 	}
 	for i := range b.Entries {
 		if b.Entries[i].Type != pb.EntryNormal {
@@ -442,13 +674,44 @@ func typeForEventKind(kind uint16) (pb.EntryType, bool) {
 		return pb.EntryConfChange, true
 	case eventWaveEntryConfV2:
 		return pb.EntryConfChangeV2, true
+	case eventBlobEntry:
+		return pb.EntryNormal, true
+	case eventBlobEntryConf:
+		return pb.EntryConfChange, true
+	case eventBlobEntryConfV2:
+		return pb.EntryConfChangeV2, true
 	default:
 		return 0, false
 	}
 }
 
+func blobEventKind(kind pb.EntryType) uint16 {
+	switch kind {
+	case pb.EntryConfChange:
+		return eventBlobEntryConf
+	case pb.EntryConfChangeV2:
+		return eventBlobEntryConfV2
+	default:
+		return eventBlobEntry
+	}
+}
+
+func isBlobEvent(kind uint16) bool { return kind >= eventBlobEntry && kind <= eventBlobEntryConfV2 }
+
 func validateBatch(g *engineGroup, b *ReadyBatch) (byte, error) {
 	flags := batchFlags(b)
+	if flags&batchIdentity != 0 {
+		if b.NodeIncarnation == 0 || b.ReadyID == 0 || b.ReadyDigest == ([16]byte{}) {
+			return 0, ErrRaftState
+		}
+		if b.NodeIncarnation == g.NodeIncarnation {
+			if b.ReadyID != g.ReadyID+1 {
+				return 0, ErrRaftState
+			}
+		} else if b.NodeIncarnation <= g.NodeIncarnation || b.ReadyID != 1 {
+			return 0, ErrRaftState
+		}
+	}
 	last := durableLast(g)
 	effectiveCommit := g.Hard.Commit
 	if b.Hard != nil {
@@ -465,6 +728,13 @@ func validateBatch(g *engineGroup, b *ReadyBatch) (byte, error) {
 		}
 		for i, entry := range b.Entries {
 			if entry.Index != first+uint64(i) || entry.Term == 0 || !validEntryType(entry.Type) {
+				return 0, ErrRaftState
+			}
+			if flags&batchBlob != 0 {
+				if len(entry.Data) != 0 || len(b.Blob) < 16 || entry.DataOffset > ^uint64(0)-entry.DataBytes {
+					return 0, ErrRaftState
+				}
+			} else if entry.DataOffset != 0 || entry.DataBytes != 0 {
 				return 0, ErrRaftState
 			}
 		}
@@ -584,13 +854,25 @@ func (e *Engine) applyEvent(event segmentEvent, segmentID uint64) error {
 		e.groups[event.GroupID] = g
 	}
 	switch event.Kind {
+	case eventReadyState:
+		if event.Incarnation == 0 || event.ReadyID == 0 || event.ReadyDigest == ([16]byte{}) {
+			return ErrRaftState
+		}
+		if event.Incarnation == g.NodeIncarnation {
+			if event.ReadyID != g.ReadyID+1 {
+				return ErrRaftState
+			}
+		} else if event.Incarnation <= g.NodeIncarnation || event.ReadyID != 1 {
+			return ErrRaftState
+		}
+		g.NodeIncarnation, g.ReadyID, g.ReadyDigest, g.ReadyWaveID = event.Incarnation, event.ReadyID, event.ReadyDigest, WaveID(event.Reference)
 	case RecordTruncateSuffix:
 		if event.Index == 0 || event.Index <= g.Hard.Commit || event.Index > durableLast(g)+1 || predecessorTerm(g, event.Index) != event.Term {
 			return ErrRaftState
 		}
 		cut := sort.Search(len(g.Entries), func(i int) bool { return g.Entries[i].Index >= event.Index })
 		g.Entries = slices.Delete(g.Entries, cut, len(g.Entries))
-	case eventWaveEntry, eventWaveEntryConf, eventWaveEntryConfV2:
+	case eventWaveEntry, eventWaveEntryConf, eventWaveEntryConfV2, eventBlobEntry, eventBlobEntryConf, eventBlobEntryConfV2:
 		if event.Index != durableLast(g)+1 || event.Term == 0 {
 			return ErrRaftState
 		}
@@ -598,7 +880,7 @@ func (e *Engine) applyEvent(event segmentEvent, segmentID uint64) error {
 		if !ok {
 			return ErrCorrupt
 		}
-		g.Entries = append(g.Entries, EntryLocation{SegmentID: segmentID, Offset: event.Offset, Bytes: event.Bytes, Index: event.Index, Term: event.Term, Type: entryType})
+		g.Entries = append(g.Entries, EntryLocation{SegmentID: segmentID, Offset: event.Offset, Bytes: event.Bytes, Index: event.Index, Term: event.Term, Type: entryType, DataOffset: event.DataOffset, DataBytes: event.DataBytes, BatchID: g.ReadyWaveID})
 	case eventPrefix:
 		if event.Index < g.TruncateIndex || event.Index > durableLast(g) || termAt(g, nil, event.Index) != event.Term {
 			return ErrRaftState
@@ -812,10 +1094,25 @@ func decodeWaveFrame(frame []byte, expectedSequence uint64) (WaveID, [32]byte, [
 			return id, digest, nil, ErrCorrupt
 		}
 		flags, err := cursor.byte()
-		if err != nil || flags & ^byte(batchReplace|batchPrefix|batchCheckpoint|batchHard|batchTypes) != 0 {
+		if err != nil || flags & ^byte(batchReplace|batchPrefix|batchCheckpoint|batchHard|batchTypes|batchIdentity|batchBlob) != 0 {
 			return id, digest, nil, ErrCorrupt
 		}
 		batch := ReadyBatch{GroupID: group}
+		if flags&batchIdentity != 0 {
+			batch.NodeIncarnation, err = cursor.uvarint()
+			if err != nil {
+				return id, digest, nil, ErrCorrupt
+			}
+			batch.ReadyID, err = cursor.uvarint()
+			if err != nil {
+				return id, digest, nil, ErrCorrupt
+			}
+			value, takeErr := cursor.take(16)
+			if takeErr != nil {
+				return id, digest, nil, ErrCorrupt
+			}
+			copy(batch.ReadyDigest[:], value)
+		}
 		if flags&batchReplace != 0 {
 			batch.ReplaceFrom, err = cursor.uvarint()
 			if err != nil || batch.ReplaceFrom == 0 {
@@ -870,6 +1167,9 @@ func decodeWaveFrame(frame []byte, expectedSequence uint64) (WaveID, [32]byte, [
 		if flags&batchTypes != 0 {
 			minimumEntryBytes++
 		}
+		if flags&batchBlob != 0 {
+			minimumEntryBytes++
+		}
 		if err != nil || entryCount > uint64(len(cursor.data)-cursor.off)/minimumEntryBytes {
 			return id, digest, nil, ErrCorrupt
 		}
@@ -894,17 +1194,42 @@ func decodeWaveFrame(frame []byte, expectedSequence uint64) (WaveID, [32]byte, [
 			if !validEntryType(entry.Type) {
 				return id, digest, nil, ErrCorrupt
 			}
+			if flags&batchBlob != 0 {
+				entry.DataOffset, err = cursor.uvarint()
+				if err != nil {
+					return id, digest, nil, ErrCorrupt
+				}
+				entry.DataBytes, err = cursor.uvarint()
+				if err != nil || entry.DataOffset > ^uint64(0)-entry.DataBytes {
+					return id, digest, nil, ErrCorrupt
+				}
+			} else {
+				size, readErr := cursor.uvarint()
+				if readErr != nil || size > uint64(len(cursor.data)-cursor.off) {
+					return id, digest, nil, ErrCorrupt
+				}
+				entry.dataOffset = uint64(72 + cursor.off)
+				data, readErr := cursor.take(int(size))
+				if readErr != nil {
+					return id, digest, nil, ErrCorrupt
+				}
+				entry.Data = data
+			}
+			batch.Entries = append(batch.Entries, entry)
+		}
+		if flags&batchBlob != 0 {
 			size, readErr := cursor.uvarint()
-			if readErr != nil || size > uint64(len(cursor.data)-cursor.off) {
+			if readErr != nil || size < 16 || size > uint64(len(cursor.data)-cursor.off) {
 				return id, digest, nil, ErrCorrupt
 			}
-			entry.dataOffset = uint64(72 + cursor.off)
-			data, readErr := cursor.take(int(size))
+			blobOffset := uint64(72 + cursor.off)
+			batch.Blob, readErr = cursor.take(int(size))
 			if readErr != nil {
-				return id, digest, nil, readErr
+				return id, digest, nil, ErrCorrupt
 			}
-			entry.Data = data
-			batch.Entries = append(batch.Entries, entry)
+			for i := range batch.Entries {
+				batch.Entries[i].dataOffset = blobOffset
+			}
 		}
 		batches = append(batches, batch)
 		previous = group
@@ -927,11 +1252,18 @@ func (e *Engine) eventsForDecoded(batches []ReadyBatch, frameOffset, sequence ui
 		if _, err := validateBatch(g, batch); err != nil {
 			return nil, err
 		}
+		if batch.NodeIncarnation != 0 {
+			events = append(events, segmentEvent{Kind: eventReadyState, GroupID: batch.GroupID, Incarnation: batch.NodeIncarnation, ReadyID: batch.ReadyID, ReadyDigest: batch.ReadyDigest, Reference: id})
+		}
 		if batch.ReplaceFrom != 0 {
 			events = append(events, segmentEvent{Kind: RecordTruncateSuffix, GroupID: batch.GroupID, Index: batch.ReplaceFrom, Term: predecessorTerm(g, batch.ReplaceFrom)})
 		}
 		for _, entry := range batch.Entries {
-			events = append(events, segmentEvent{Kind: eventKindForType(entry.Type), GroupID: batch.GroupID, Index: entry.Index, Term: entry.Term, Offset: frameOffset + entry.dataOffset, Bytes: uint64(len(entry.Data))})
+			kind, bytes := eventKindForType(entry.Type), uint64(len(entry.Data))
+			if len(batch.Blob) != 0 {
+				kind, bytes = blobEventKind(entry.Type), uint64(len(batch.Blob))
+			}
+			events = append(events, segmentEvent{Kind: kind, GroupID: batch.GroupID, Index: entry.Index, Term: entry.Term, Offset: frameOffset + entry.dataOffset, Bytes: bytes, DataOffset: entry.DataOffset, DataBytes: entry.DataBytes})
 		}
 		if batch.TruncateIndex != 0 {
 			events = append(events, segmentEvent{Kind: eventPrefix, GroupID: batch.GroupID, Index: batch.TruncateIndex, Term: batch.TruncateTerm})

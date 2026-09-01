@@ -26,6 +26,10 @@ const (
 	eventWaveEntry       uint16 = 8
 	eventWaveEntryConf   uint16 = 9
 	eventWaveEntryConfV2 uint16 = 10
+	eventReadyState      uint16 = 11
+	eventBlobEntry       uint16 = 12
+	eventBlobEntryConf   uint16 = 13
+	eventBlobEntryConfV2 uint16 = 14
 
 	manifestHeaderBytes     = 128
 	manifestSegmentBytes    = 112
@@ -90,7 +94,10 @@ type segmentEvent struct {
 	Kind                                uint16
 	GroupID, Index, Term, Offset, Bytes uint64
 	Vote, Commit                        uint64
+	Incarnation, ReadyID                uint64
+	DataOffset, DataBytes               uint64
 	Reference                           [16]byte
+	ReadyDigest                         [16]byte
 	Digest                              [32]byte
 }
 
@@ -346,6 +353,7 @@ func marshalSegmentIndex(events []segmentEvent, dataBytes uint64) ([]byte, error
 		b = appendUvarint(b, group-previousGroup)
 		b = appendUvarint(b, uint64(last-first))
 		previousOffset := uint64(0)
+		previousBlobBytes := uint64(0)
 		for _, event := range ordered[first:last] {
 			b = append(b, byte(event.Kind))
 			switch event.Kind {
@@ -362,6 +370,23 @@ func marshalSegmentIndex(events []segmentEvent, dataBytes uint64) ([]byte, error
 				b = appendUvarint(b, event.Offset-previousOffset)
 				b = appendUvarint(b, event.Bytes)
 				previousOffset = event.Offset
+			case eventBlobEntry, eventBlobEntryConf, eventBlobEntryConfV2:
+				b = appendUvarint(b, event.Index)
+				b = appendUvarint(b, event.Term)
+				if event.Offset < previousOffset || event.Offset > dataBytes || event.Bytes < 16 || event.Bytes > dataBytes-event.Offset {
+					return nil, ErrCorrupt
+				}
+				offsetDelta := event.Offset - previousOffset
+				b = appendUvarint(b, offsetDelta)
+				if offsetDelta != 0 {
+					b = appendUvarint(b, event.Bytes)
+					previousBlobBytes = event.Bytes
+				} else if event.Bytes != previousBlobBytes {
+					return nil, ErrCorrupt
+				}
+				b = appendUvarint(b, event.DataOffset)
+				b = appendUvarint(b, event.DataBytes)
+				previousOffset = event.Offset
 			case RecordTruncateSuffix, eventPrefix:
 				b = appendUvarint(b, event.Index)
 				b = appendUvarint(b, event.Term)
@@ -377,6 +402,11 @@ func marshalSegmentIndex(events []segmentEvent, dataBytes uint64) ([]byte, error
 				b = appendUvarint(b, event.Index)
 				b = append(b, event.Reference[:]...)
 				b = append(b, event.Digest[:]...)
+			case eventReadyState:
+				b = appendUvarint(b, event.Incarnation)
+				b = appendUvarint(b, event.ReadyID)
+				b = append(b, event.ReadyDigest[:]...)
+				b = append(b, event.Reference[:]...)
 			default:
 				return nil, ErrCorrupt
 			}
@@ -429,9 +459,10 @@ func unmarshalSegmentIndex(b []byte, dataBytes, eventCount uint64) ([]segmentEve
 			return nil, fmt.Errorf("%w: group event count", ErrCorrupt)
 		}
 		previousOffset := uint64(0)
+		previousBlobBytes := uint64(0)
 		for range count {
 			tag, err := cursor.byte()
-			if err != nil || tag < byte(RecordEntry) || tag > byte(eventWaveEntryConfV2) || tag == byte(RecordWave) {
+			if err != nil || tag < byte(RecordEntry) || tag > byte(eventBlobEntryConfV2) || tag == byte(RecordWave) {
 				return nil, fmt.Errorf("%w: event kind", ErrCorrupt)
 			}
 			event := segmentEvent{Kind: uint16(tag), GroupID: group}
@@ -457,6 +488,38 @@ func unmarshalSegmentIndex(b []byte, dataBytes, eventCount uint64) ([]segmentEve
 				}
 				if err != nil || event.Bytes < minimum || event.Offset < segmentHeaderBytes || event.Offset > dataBytes || event.Bytes > dataBytes-event.Offset {
 					return nil, fmt.Errorf("%w: event geometry", ErrCorrupt)
+				}
+				previousOffset = event.Offset
+			case eventBlobEntry, eventBlobEntryConf, eventBlobEntryConfV2:
+				event.Index, err = cursor.uvarint()
+				if err != nil || event.Index == 0 {
+					return nil, ErrCorrupt
+				}
+				event.Term, err = cursor.uvarint()
+				if err != nil || event.Term == 0 {
+					return nil, ErrCorrupt
+				}
+				delta, readErr := cursor.uvarint()
+				if readErr != nil || previousOffset > ^uint64(0)-delta {
+					return nil, ErrCorrupt
+				}
+				event.Offset = previousOffset + delta
+				if delta != 0 {
+					event.Bytes, err = cursor.uvarint()
+					previousBlobBytes = event.Bytes
+				} else {
+					event.Bytes = previousBlobBytes
+				}
+				if err != nil || event.Bytes < 16 || event.Offset < segmentHeaderBytes || event.Offset > dataBytes || event.Bytes > dataBytes-event.Offset {
+					return nil, ErrCorrupt
+				}
+				event.DataOffset, err = cursor.uvarint()
+				if err != nil {
+					return nil, ErrCorrupt
+				}
+				event.DataBytes, err = cursor.uvarint()
+				if err != nil || event.DataOffset > ^uint64(0)-event.DataBytes {
+					return nil, ErrCorrupt
 				}
 				previousOffset = event.Offset
 			case RecordTruncateSuffix, eventPrefix:
@@ -510,6 +573,31 @@ func unmarshalSegmentIndex(b []byte, dataBytes, eventCount uint64) ([]segmentEve
 					return nil, err
 				}
 				copy(event.Digest[:], digest)
+			case eventReadyState:
+				event.Incarnation, err = cursor.uvarint()
+				if err != nil || event.Incarnation == 0 {
+					return nil, ErrCorrupt
+				}
+				event.ReadyID, err = cursor.uvarint()
+				if err != nil || event.ReadyID == 0 {
+					return nil, ErrCorrupt
+				}
+				digest, takeErr := cursor.take(16)
+				if takeErr != nil {
+					return nil, ErrCorrupt
+				}
+				copy(event.ReadyDigest[:], digest)
+				if event.ReadyDigest == ([16]byte{}) {
+					return nil, ErrCorrupt
+				}
+				waveID, takeErr := cursor.take(16)
+				if takeErr != nil {
+					return nil, ErrCorrupt
+				}
+				copy(event.Reference[:], waveID)
+				if event.Reference == ([16]byte{}) {
+					return nil, ErrCorrupt
+				}
 			}
 			result = append(result, event)
 		}
