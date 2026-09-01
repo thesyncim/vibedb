@@ -30,6 +30,29 @@ func newReservedEngine(t *testing.T, groups ...uint64) *Engine {
 	if err = e.Reserve(1<<20, 4096, 4096); err != nil {
 		t.Fatal(err)
 	}
+	if err = e.ReserveReaders(2); err != nil {
+		t.Fatal(err)
+	}
+	for _, group := range groups {
+		if err = e.ReserveGroup(group, 4096); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return e
+}
+
+func newEngineAt(t *testing.T, dir string, groups ...uint64) *Engine {
+	t.Helper()
+	e, err := CreateEngine(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = e.Reserve(1<<20, 4096, 4096); err != nil {
+		t.Fatal(err)
+	}
+	if err = e.ReserveReaders(2); err != nil {
+		t.Fatal(err)
+	}
 	for _, group := range groups {
 		if err = e.ReserveGroup(group, 4096); err != nil {
 			t.Fatal(err)
@@ -105,8 +128,8 @@ func TestWaveFrameOverheadAndOptionalHardState(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 72 fixed bytes + 1 wave batch-count byte + 3 common batch bytes +
-	// 3 common entry bytes.
-	if got, want := len(frame)-len(entry.Data), 79; got != want {
+	// 3 common entry bytes + 1 canonical empty shared-blob length byte.
+	if got, want := len(frame)-len(entry.Data), 80; got != want {
 		t.Fatalf("single-entry overhead=%d want=%d", got, want)
 	}
 	hard := HardState{Term: 1, Vote: 1, Commit: 1}
@@ -457,13 +480,25 @@ func TestEngineRecoversEveryRotationPhase(t *testing.T) {
 				}
 				return nil
 			})
+			if phase == RotationSealedSynced || phase == RotationSealedRenamed {
+				if err != nil {
+					t.Fatalf("Rotate=%v", err)
+				}
+				err = e.WaitSeal()
+			}
 			if !errors.Is(err, injected) {
 				t.Fatalf("Rotate=%v", err)
 			}
 			_ = e.Close()
-			e, err = OpenEngine(dir)
+			var recoveryIO recoveryIOCounters
+			e, err = openEngineAuthenticatedObserved(dir, func(*os.File) error { return nil }, [32]byte{}, &recoveryIO)
 			if err != nil {
 				t.Fatal(err)
+			}
+			if phase == RotationSealedSynced || phase == RotationSealedRenamed {
+				if recoveryIO.pendingPromotions != 1 || recoveryIO.pendingPayloadBytes != 0 || recoveryIO.pendingSealBytes != 0 {
+					t.Fatalf("fast pending promotion I/O=%+v", recoveryIO)
+				}
 			}
 			defer e.Close()
 			if e.log.manifest.DurableOffset != segmentHeaderBytes {
@@ -520,7 +555,7 @@ func TestEnginePendingSealSuffixCuts(t *testing.T) {
 		t.Fatal(err)
 	}
 	dataBytes := e.log.manifest.DurableOffset
-	indexBytes, err := marshalSegmentIndex(e.log.events, dataBytes)
+	indexBytes, _, err := e.marshalEngineSealedIndex(dataBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -560,6 +595,224 @@ func TestEnginePendingSealSuffixCuts(t *testing.T) {
 			t.Fatalf("cut %d state=%+v ok=%v off=%d marker=%d", cut, state, ok, recovered.log.activeOffset, recovered.log.manifest.DurableOffset)
 		}
 		_ = recovered.Close()
+	}
+}
+
+func TestEnginePendingRotationCrashCutsRecover(t *testing.T) {
+	for _, phase := range []RotationPhase{RotationManifestPublished, RotationSealedSynced, RotationSealedRenamed} {
+		t.Run(phase.String(), func(t *testing.T) {
+			dir := t.TempDir()
+			e := newEngineAt(t, dir, 1)
+			if err := e.PersistWave(Wave{ID: waveID(1), Batches: []ReadyBatch{{GroupID: 1, Entries: []Entry{{Index: 1, Term: 1, Data: []byte("one")}}}}}); err != nil {
+				t.Fatal(err)
+			}
+			injected := errors.New("crash cut")
+			err := e.Rotate(func(got RotationPhase) error {
+				if got == phase {
+					return injected
+				}
+				return nil
+			})
+			if phase == RotationManifestPublished {
+				if !errors.Is(err, injected) {
+					t.Fatalf("rotate error=%v", err)
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if closeErr := e.Close(); !errors.Is(closeErr, injected) {
+					t.Fatalf("close error=%v", closeErr)
+				}
+			}
+			_ = e.Close()
+			e, err = OpenEngine(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer e.Close()
+			location, term, compacted, ok, err := e.LookupExact(1, 1)
+			if err != nil || compacted || !ok || term != 1 || location.Bytes == 0 {
+				t.Fatalf("lookup=%+v term=%d compacted=%v ok=%v err=%v", location, term, compacted, ok, err)
+			}
+		})
+	}
+}
+
+func TestEngineEmptyRotationIsCanonical(t *testing.T) {
+	dir := t.TempDir()
+	e := newEngineAt(t, dir)
+	if err := e.Rotate(nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.WaitSeal(); err != nil {
+		t.Fatal(err)
+	}
+	if e.log.manifest.Segments[0].State != SegmentSealed {
+		t.Fatalf("sealed=%+v", e.log.manifest.Segments[0])
+	}
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	e, err := OpenEngine(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+}
+
+func TestFrozenSegmentSummaryIsStableDuringNewActiveWrites(t *testing.T) {
+	dir := t.TempDir()
+	e := newEngineAt(t, dir, 1)
+	if err := e.PersistWave(Wave{ID: waveID(1), Batches: []ReadyBatch{{GroupID: 1, Entries: []Entry{{Index: 1, Term: 1, Data: []byte("one")}}}}}); err != nil {
+		t.Fatal(err)
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	e.sealBuildHookTest = func() { close(entered); <-release }
+	if err := e.Rotate(nil); err != nil {
+		t.Fatal(err)
+	}
+	<-entered
+	if err := e.PersistWave(Wave{ID: waveID(2), Batches: []ReadyBatch{{GroupID: 1, Entries: []Entry{{Index: 2, Term: 2, Data: []byte("two")}}}}}); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	if err := e.WaitSeal(); err != nil {
+		t.Fatal(err)
+	}
+	e.sealBuildHookTest = nil
+	first, _, _, ok, err := e.LookupExact(1, 1)
+	if err != nil || !ok || first.SegmentID != 1 {
+		t.Fatalf("first=%+v ok=%v err=%v", first, ok, err)
+	}
+	second, _, _, ok, err := e.LookupExact(1, 2)
+	if err != nil || !ok || second.SegmentID != 2 {
+		t.Fatalf("second=%+v ok=%v err=%v", second, ok, err)
+	}
+}
+
+func TestSealerDoesNotOpenHistoricalSegments(t *testing.T) {
+	e := newReservedEngine(t, 1)
+	for index := uint64(1); index <= 4; index++ {
+		if err := e.PersistWave(Wave{ID: waveID(index), Batches: []ReadyBatch{{GroupID: 1, Entries: []Entry{{Index: index, Term: 1, Data: []byte{byte(index)}}}}}}); err != nil {
+			t.Fatal(err)
+		}
+		if index < 4 {
+			if err := e.Rotate(nil); err != nil {
+				t.Fatal(err)
+			}
+			if err := e.WaitSeal(); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	var opened []string
+	e.sealOpenHookTest = func(path string) { opened = append(opened, filepath.Base(path)) }
+	if err := e.Rotate(nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.WaitSeal(); err != nil {
+		t.Fatal(err)
+	}
+	if len(opened) != 1 || opened[0] != activeName(4) {
+		t.Fatalf("sealer opens=%v", opened)
+	}
+}
+
+func TestSegmentSummaryCapacityRejectsBeforeMutation(t *testing.T) {
+	e := newReservedEngine(t, 1, 2)
+	e.activeBuild = &segmentBuildArena{groups: make([]segmentGroupBuild, 0, 1)}
+	if err := e.PersistWave(Wave{ID: waveID(1), Batches: []ReadyBatch{{GroupID: 1, Entries: []Entry{{Index: 1, Term: 1, Data: []byte("one")}}}}}); err != nil {
+		t.Fatal(err)
+	}
+	beforeOffset, beforeSequence, beforeEvents := e.log.activeOffset, e.sequence, len(e.log.events)
+	for retry := 0; retry < 2; retry++ {
+		err := e.PersistWave(Wave{ID: waveID(uint64(2 + retry)), Batches: []ReadyBatch{{GroupID: 2, Entries: []Entry{{Index: 1, Term: 1, Data: []byte("two")}}}}})
+		if !errors.Is(err, ErrBounds) {
+			t.Fatalf("retry %d error=%v", retry, err)
+		}
+		if e.log.activeOffset != beforeOffset || e.sequence != beforeSequence || len(e.log.events) != beforeEvents || e.groups[2].buildSegmentID != 0 {
+			t.Fatalf("retry mutated offset=%d sequence=%d events=%d tag=%d", e.log.activeOffset, e.sequence, len(e.log.events), e.groups[2].buildSegmentID)
+		}
+	}
+}
+
+func TestReserveMovesActiveSegmentSummarySlots(t *testing.T) {
+	e := newReservedEngine(t, 1)
+	if err := e.PersistWave(Wave{ID: waveID(1), Batches: []ReadyBatch{{GroupID: 1, Entries: []Entry{{Index: 1, Term: 7}}}}}); err != nil {
+		t.Fatal(err)
+	}
+	old := e.activeBuild
+	if err := e.Reserve(1<<20, cap(old.groups)+1, 4096); err != nil {
+		t.Fatal(err)
+	}
+	if e.activeBuild == old || len(e.activeBuild.groups) != 1 || e.activeBuild.groups[0].GroupID != 1 {
+		t.Fatalf("rebuilt arena=%+v old=%p new=%p", e.activeBuild.groups, old, e.activeBuild)
+	}
+	if group := e.groups[1]; group.buildSegmentID != e.log.manifest.ActiveID || group.buildSlot != 0 {
+		t.Fatalf("group slot tag=%d slot=%d active=%d", group.buildSegmentID, group.buildSlot, e.log.manifest.ActiveID)
+	}
+	if err := e.Rotate(nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.WaitSeal(); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestControlOnlySummaryAndCumulativeSequenceAcrossRotations(t *testing.T) {
+	dir := t.TempDir()
+	e := newEngineAt(t, dir, 1)
+	if err := e.PersistWave(Wave{ID: waveID(1), Batches: []ReadyBatch{{GroupID: 1, Entries: []Entry{{Index: 1, Term: 1, Data: []byte("one")}}}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Rotate(nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.WaitSeal(); err != nil {
+		t.Fatal(err)
+	}
+	hard := HardState{Term: 1, Vote: 1, Commit: 1}
+	if err := e.PersistWave(Wave{ID: waveID(2), Batches: []ReadyBatch{{GroupID: 1, Hard: &hard}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Rotate(nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.WaitSeal(); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Rotate(nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.WaitSeal(); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	e, err := OpenEngine(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	meta, ok := e.Metadata(1)
+	if !ok || meta.LastIndex != 1 || meta.Hard != hard || e.sequence != 2 {
+		t.Fatalf("meta=%+v ok=%v sequence=%d", meta, ok, e.sequence)
+	}
+	for _, segment := range e.log.manifest.Segments {
+		f, openErr := os.Open(filepath.Join(dir, sealedName(segment.ID)))
+		if openErr != nil {
+			t.Fatal(openErr)
+		}
+		_, header, _, _, readErr := readSealedSealedMetadata(f, segment, e.log.manifest.LogID, segment.ID-1, segment.PreviousHash, e.authKey)
+		_ = f.Close()
+		if readErr != nil || header.LastSequence != min(segment.ID, 2) {
+			t.Fatalf("segment=%d sequence=%d err=%v", segment.ID, header.LastSequence, readErr)
+		}
 	}
 }
 
@@ -664,33 +917,44 @@ func TestEngineDeepVerifyMatchesCanonicalSealedIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := filepath.Join(dir, sealedName(1))
-	_, footer, events, err := readSealedMetadata(path, manifest.LogID, 0, [32]byte{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	changed := false
-	for i := range events {
-		if _, ok := typeForEventKind(events[i].Kind); ok {
-			events[i].Offset--
-			changed = true
-			break
-		}
-	}
-	if !changed {
-		t.Fatal("missing entry event")
-	}
-	encoded, err := marshalSegmentIndex(events, footer.DataBytes)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if uint64(len(encoded)) != footer.IndexBytes {
-		t.Fatalf("index size changed: %d != %d", len(encoded), footer.IndexBytes)
-	}
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = f.WriteAt(encoded, int64(footer.IndexOffset)); err != nil {
+	footer, header, runs, _, err := readSealedSealedMetadata(f, manifest.Segments[0], manifest.LogID, 0, [32]byte{}, [32]byte{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 || runs[0].Inline.ExtentOffset == 0 {
+		t.Fatalf("runs=%#v", runs)
+	}
+	runs[0].Inline.Term++
+	directory, err := appendRunDirectory(nil, runs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(directory) != int(header.DirectoryBytes) {
+		t.Fatalf("directory size changed: %d != %d", len(directory), header.DirectoryBytes)
+	}
+	headerBytes, err := marshalSealedIndexHeader(header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.WriteAt(directory, int64(footer.IndexOffset+sealedIndexHeaderBytes)); err != nil {
+		t.Fatal(err)
+	}
+	var segmentHeaderData [segmentHeaderBytes]byte
+	if _, err = f.ReadAt(segmentHeaderData[:], 0); err != nil {
+		t.Fatal(err)
+	}
+	segmentHeader, err := unmarshalSegmentHeader(segmentHeaderData[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	top := append(headerBytes[:], directory...)
+	footer.Auth = segmentSealedMetadataMAC([32]byte{}, segmentHeader, top, footer)
+	stat, _ := f.Stat()
+	if _, err = f.WriteAt(marshalSegmentFooter(footer), stat.Size()-segmentFooterBytes); err != nil {
 		t.Fatal(err)
 	}
 	if err = f.Close(); err != nil {
@@ -737,11 +1001,6 @@ func TestEngineDeepVerifyChecksFooterFrameCount(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := filepath.Join(dir, sealedName(1))
-	_, footer, _, err := readSealedMetadata(path, manifest.LogID, 0, [32]byte{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	footer.Records++
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -750,6 +1009,36 @@ func TestEngineDeepVerifyChecksFooterFrameCount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	footerBytes := make([]byte, segmentFooterBytes)
+	if _, err = f.ReadAt(footerBytes, stat.Size()-segmentFooterBytes); err != nil {
+		t.Fatal(err)
+	}
+	footer, err := unmarshalSegmentFooter(footerBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	footer.Records++
+	topBytes := make([]byte, sealedIndexHeaderBytes)
+	if _, err = f.ReadAt(topBytes, int64(footer.IndexOffset)); err != nil {
+		t.Fatal(err)
+	}
+	indexHeader, err := unmarshalSealedIndexHeader(topBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	topBytes = make([]byte, sealedIndexHeaderBytes+int(indexHeader.DirectoryBytes))
+	if _, err = f.ReadAt(topBytes, int64(footer.IndexOffset)); err != nil {
+		t.Fatal(err)
+	}
+	segmentBytes := make([]byte, segmentHeaderBytes)
+	if _, err = f.ReadAt(segmentBytes, 0); err != nil {
+		t.Fatal(err)
+	}
+	segment, err := unmarshalSegmentHeader(segmentBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	footer.Auth = segmentSealedMetadataMAC([32]byte{}, segment, topBytes, footer)
 	if _, err = f.WriteAt(marshalSegmentFooter(footer), stat.Size()-segmentFooterBytes); err != nil {
 		t.Fatal(err)
 	}
@@ -765,12 +1054,11 @@ func TestEngineDeepVerifyChecksFooterFrameCount(t *testing.T) {
 		t.Fatal(err)
 	}
 	e, err = OpenEngine(dir)
-	if err != nil {
+	if !errors.Is(err, ErrCorrupt) {
+		if err == nil {
+			_ = e.Close()
+		}
 		t.Fatalf("metadata Open=%v", err)
-	}
-	defer e.Close()
-	if err = e.DeepVerify(); !errors.Is(err, ErrCorrupt) {
-		t.Fatalf("DeepVerify=%v", err)
 	}
 }
 
@@ -818,9 +1106,15 @@ func TestReadyIdentityAndSharedBatchBlobRoundTrip(t *testing.T) {
 	if err = e.ReserveGroup(7, 16); err != nil {
 		t.Fatal(err)
 	}
-	blob := []byte("ciphertext-and-tag")
+	blob := []byte("ciphertext-and-tag!!!")
 	digest := [16]byte{4}
-	w := Wave{ID: waveID(9), Batches: []ReadyBatch{{GroupID: 7, NodeIncarnation: 3, ReadyID: 1, ReadyDigest: digest, Blob: blob, Entries: []Entry{{Index: 1, Term: 1, DataOffset: 0, DataBytes: 3}, {Index: 2, Term: 1, Type: pb.EntryConfChangeV2, DataOffset: 3, DataBytes: 2}}}}}
+	w := Wave{ID: waveID(9), Blob: blob, Batches: []ReadyBatch{{GroupID: 7, NodeIncarnation: 3, ReadyID: 1, ReadyDigest: digest, Entries: []Entry{{Index: 1, Term: 1, ExtentID: 1, ExtentBytes: uint64(len(blob)), DataOffset: 0, DataBytes: 3}, {Index: 2, Term: 1, Type: pb.EntryConfChangeV2, ExtentID: 1, ExtentBytes: uint64(len(blob)), DataOffset: 3, DataBytes: 2}}}}}
+	if err = validateWaveExtents(w.Batches, uint64(len(w.Blob))); err != nil {
+		t.Fatalf("extents: %v", err)
+	}
+	if _, err = validateBatch(e.groups[7], &w.Batches[0]); err != nil {
+		t.Fatalf("batch: %v", err)
+	}
 	if err = e.PersistWave(w); err != nil {
 		t.Fatal(err)
 	}
@@ -855,43 +1149,71 @@ func TestReadyIdentityAndSharedBatchBlobRoundTrip(t *testing.T) {
 	}
 }
 
-func TestNodeBatchSpaceAccounting(t *testing.T) {
-	measure := func(groups, entriesPerGroup int) (frameBytes, indexBytes int) {
+func TestWaveExtentCanonicalGeometry(t *testing.T) {
+	valid := []ReadyBatch{{GroupID: 1, Entries: []Entry{
+		{Index: 1, Term: 1, ExtentID: 1, ExtentOffset: 0, ExtentBytes: 20, DataOffset: 0, DataBytes: 4},
+		{Index: 2, Term: 1, ExtentID: 2, ExtentOffset: 20, ExtentBytes: 18, DataOffset: 0, DataBytes: 2},
+	}}}
+	if err := validateWaveExtents(valid, 38); err != nil {
+		t.Fatal(err)
+	}
+	for name, mutate := range map[string]func(*[]ReadyBatch, *uint64){
+		"first offset":   func(b *[]ReadyBatch, _ *uint64) { (*b)[0].Entries[0].ExtentOffset = 1 },
+		"id skip":        func(b *[]ReadyBatch, _ *uint64) { (*b)[0].Entries[1].ExtentID = 3 },
+		"extent gap":     func(b *[]ReadyBatch, n *uint64) { (*b)[0].Entries[1].ExtentOffset++; *n++ },
+		"data gap":       func(b *[]ReadyBatch, _ *uint64) { (*b)[0].Entries[1].DataOffset = 1 },
+		"trailing bytes": func(_ *[]ReadyBatch, n *uint64) { *n++ },
+	} {
+		t.Run(name, func(t *testing.T) {
+			batches := []ReadyBatch{{GroupID: 1, Entries: append([]Entry(nil), valid[0].Entries...)}}
+			bytes := uint64(38)
+			mutate(&batches, &bytes)
+			if err := validateWaveExtents(batches, bytes); !errors.Is(err, ErrRaftState) {
+				t.Fatalf("error=%v", err)
+			}
+		})
+	}
+}
+
+func TestNodeBatchFrameSpaceAccounting(t *testing.T) {
+	measure := func(groups, entriesPerGroup int) int {
 		t.Helper()
 		e := &Engine{
 			groups:       make(map[uint64]*engineGroup, groups),
 			frameBuf:     make([]byte, 0, 4096),
 			eventScratch: make([]segmentEvent, 0, groups*(entriesPerGroup+2)+1),
 		}
-		wave := Wave{ID: WaveID{1}, Batches: make([]ReadyBatch, groups)}
+		wave := Wave{ID: WaveID{1}, Batches: make([]ReadyBatch, groups), Blob: make([]byte, groups*entriesPerGroup+16)}
 		for group := 1; group <= groups; group++ {
 			e.groups[uint64(group)] = &engineGroup{GroupState: GroupState{Checkpoint: Checkpoint{Index: 1, Term: 1}, Hard: HardState{Term: 1, Commit: 1}, Entries: make([]EntryLocation, 0, 64)}}
 			entries := make([]Entry, entriesPerGroup)
 			for i := range entries {
-				entries[i] = Entry{Index: uint64(i + 2), Term: 2, DataOffset: uint64(i), DataBytes: 1}
+				entries[i] = Entry{Index: uint64(i + 2), Term: 2, ExtentID: 1, ExtentBytes: uint64(len(wave.Blob)), DataOffset: uint64((group-1)*entriesPerGroup + i), DataBytes: 1}
 			}
-			wave.Batches[group-1] = ReadyBatch{GroupID: uint64(group), NodeIncarnation: 1, ReadyID: 1, ReadyDigest: [16]byte{1}, Hard: &HardState{Term: 2, Vote: 1, Commit: uint64(entriesPerGroup + 1)}, Entries: entries, Blob: make([]byte, entriesPerGroup+16)}
+			wave.Batches[group-1] = ReadyBatch{GroupID: uint64(group), NodeIncarnation: 1, ReadyID: 1, ReadyDigest: [16]byte{1}, Hard: &HardState{Term: 2, Vote: 1, Commit: uint64(entriesPerGroup + 1)}, Entries: entries}
 		}
-		frame, _, events, err := e.prepareWave(wave, true)
+		frame, _, _, err := e.prepareWave(wave, false)
 		if err != nil {
 			t.Fatal(err)
 		}
-		for i := range events {
-			if isBlobEvent(events[i].Kind) {
-				events[i].Offset += segmentHeaderBytes
-			}
-		}
-		index, err := marshalSegmentIndex(events, uint64(segmentHeaderBytes+len(frame)))
-		if err != nil {
-			t.Fatal(err)
-		}
-		return len(frame), len(index)
+		return len(frame)
 	}
-	if frame, index := measure(1, 32); frame != 274 || index != 340 {
-		t.Fatalf("one group frame/index = %d/%d, want 274/340", frame, index)
+	if frame := measure(1, 32); frame != 370 {
+		t.Fatalf("one group frame = %d, want 370", frame)
 	}
-	if frame, index := measure(4, 8); frame != 397 || index != 469 {
-		t.Fatalf("four groups frame/index = %d/%d, want 397/469", frame, index)
+	if frame := measure(4, 8); frame != 442 {
+		t.Fatalf("four groups frame = %d, want 442", frame)
+	}
+}
+
+func TestPrepareWaveEncodeOnlyNeedsNoEngineState(t *testing.T) {
+	e := &Engine{frameBuf: make([]byte, 0, 256), eventScratch: make([]segmentEvent, 0, 4)}
+	wave := Wave{ID: waveID(1), Batches: []ReadyBatch{{GroupID: 1, Entries: []Entry{{Index: 1, Term: 1}}}}}
+	if frame, _, _, err := e.prepareWave(wave, false); err != nil || len(frame) == 0 {
+		t.Fatalf("encode-only frame=%d err=%v", len(frame), err)
+	}
+	if _, _, _, err := e.prepareWave(wave, true); !errors.Is(err, ErrBounds) {
+		t.Fatalf("stateful incomplete Engine error=%v", err)
 	}
 }
 
