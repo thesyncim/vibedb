@@ -26,6 +26,129 @@ const (
 	sealedMaxSegmentBytes      = uint64(^uint32(0))
 )
 
+type sealedRetryState struct {
+	ID       WaveID
+	Digest   [32]byte
+	Sequence uint64
+}
+
+// appendSealedDirectory writes each live retry identity once, in first-group
+// reference order. Group summaries carry the canonical one-based ordinal.
+func appendSealedDirectory(dst []byte, runs []sealedGroupRun) ([]byte, uint32, uint32, error) {
+	if uint64(len(runs)) > uint64(^uint32(0)) {
+		return nil, 0, 0, ErrBounds
+	}
+	start := len(dst)
+	ordinals := make(map[WaveID]uint32, len(runs))
+	states := make([]sealedRetryState, 0, len(runs))
+	for i := range runs {
+		s := &runs[i].Summary
+		if s.LatestWaveID == (WaveID{}) {
+			if s.LatestWaveDigest != ([32]byte{}) || s.LatestWaveSequence != 0 || s.RetryOrdinal != 0 {
+				return nil, 0, 0, ErrCorrupt
+			}
+			continue
+		}
+		if s.LatestWaveDigest == ([32]byte{}) || s.LatestWaveSequence == 0 {
+			return nil, 0, 0, ErrCorrupt
+		}
+		ordinal := ordinals[s.LatestWaveID]
+		if ordinal == 0 {
+			if uint64(len(states)) >= uint64(^uint32(0)) {
+				return nil, 0, 0, ErrBounds
+			}
+			ordinal = uint32(len(states) + 1)
+			ordinals[s.LatestWaveID] = ordinal
+			states = append(states, sealedRetryState{ID: s.LatestWaveID, Digest: s.LatestWaveDigest, Sequence: s.LatestWaveSequence})
+		} else {
+			state := states[ordinal-1]
+			if state.Digest != s.LatestWaveDigest || state.Sequence != s.LatestWaveSequence {
+				return nil, 0, 0, ErrCorrupt
+			}
+		}
+		s.RetryOrdinal = ordinal
+	}
+	for i := range states {
+		dst = append(dst, states[i].ID[:]...)
+		dst = append(dst, states[i].Digest[:]...)
+		dst = appendUvarint(dst, states[i].Sequence)
+	}
+	retryBytes := len(dst) - start
+	if uint64(retryBytes) > uint64(^uint32(0)) {
+		return nil, 0, 0, ErrBounds
+	}
+	var err error
+	dst, err = appendRunDirectory(dst, runs)
+	return dst, uint32(retryBytes), uint32(len(states)), err
+}
+
+func decodeSealedDirectory(src []byte, header sealedIndexHeader) ([]sealedGroupRun, error) {
+	if uint64(header.RetryBytes) > uint64(len(src)) || header.DirectoryBytes != uint32(len(src)) {
+		return nil, ErrCorrupt
+	}
+	if uint64(header.RetryCount) > uint64(header.RetryBytes)/49 {
+		return nil, ErrCorrupt
+	}
+	retries := make([]sealedRetryState, 0, header.RetryCount)
+	cursor := canonicalCursor{data: src[:header.RetryBytes]}
+	for range header.RetryCount {
+		id, err := cursor.take(16)
+		if err != nil {
+			return nil, ErrCorrupt
+		}
+		state := sealedRetryState{}
+		copy(state.ID[:], id)
+		digest, err := cursor.take(32)
+		if err != nil {
+			return nil, ErrCorrupt
+		}
+		copy(state.Digest[:], digest)
+		state.Sequence, err = cursor.uvarint()
+		if err != nil || state.ID == (WaveID{}) || state.Digest == ([32]byte{}) || state.Sequence == 0 {
+			return nil, ErrCorrupt
+		}
+		for i := range retries {
+			if retries[i].ID == state.ID {
+				return nil, ErrCorrupt
+			}
+		}
+		retries = append(retries, state)
+	}
+	if !cursor.empty() {
+		return nil, ErrCorrupt
+	}
+	runs, err := decodeRunDirectory(src[header.RetryBytes:], uint64(header.Runs))
+	if err != nil {
+		return nil, err
+	}
+	nextOrdinal := uint32(1)
+	seen := make([]bool, len(retries))
+	for i := range runs {
+		ordinal := runs[i].Summary.RetryOrdinal
+		if ordinal == 0 {
+			continue
+		}
+		if ordinal > uint32(len(retries)) {
+			return nil, ErrCorrupt
+		}
+		if !seen[ordinal-1] {
+			if ordinal != nextOrdinal {
+				return nil, ErrCorrupt
+			}
+			seen[ordinal-1] = true
+			nextOrdinal++
+		}
+		state := retries[ordinal-1]
+		runs[i].Summary.LatestWaveID = state.ID
+		runs[i].Summary.LatestWaveDigest = state.Digest
+		runs[i].Summary.LatestWaveSequence = state.Sequence
+	}
+	if nextOrdinal != uint32(len(retries))+1 {
+		return nil, ErrCorrupt
+	}
+	return runs, nil
+}
+
 var sealedIndexMagic = [8]byte{'V', 'D', 'B', 'S', 'I', 'D', 'X', 0}
 var sealedRouteDomain = []byte{'v', 'i', 'b', 'e', 'd', 'b', '/', 's', 'e', 'g', 'l', 'o', 'g', '/', 's', 'e', 'a', 'l', 'e', 'd', '/', 'r', 'o', 'u', 't', 'e', 0}
 var sealedTopDomain = []byte{'v', 'i', 'b', 'e', 'd', 'b', '/', 's', 'e', 'g', 'l', 'o', 'g', '/', 's', 'e', 'a', 'l', 'e', 'd', '/', 't', 'o', 'p', 0}
@@ -36,17 +159,18 @@ type sealedIndexHeader struct {
 	RoutePayloadOffset, RoutePayloadBytes uint32
 	DataBytes                             uint32
 	LastSequence                          uint64
+	RetryBytes, RetryCount                uint32
 }
 
 func marshalSealedIndexHeader(h sealedIndexHeader) ([sealedIndexHeaderBytes]byte, error) {
 	var b [sealedIndexHeaderBytes]byte
 	total, directory, descriptorOffset, descriptorBytes := uint64(h.TotalBytes), uint64(h.DirectoryBytes), uint64(h.DescriptorOffset), uint64(h.DescriptorBytes)
 	routeOffset, routeBytes := uint64(h.RoutePayloadOffset), uint64(h.RoutePayloadBytes)
-	if total < sealedIndexHeaderBytes || directory > total-sealedIndexHeaderBytes || descriptorOffset != sealedIndexHeaderBytes+directory || descriptorBytes%sealedRouteDescriptorBytes != 0 || routeOffset != descriptorOffset+descriptorBytes || routeOffset > total || routeBytes != total-routeOffset || uint64(h.DataBytes) > sealedMaxSegmentBytes {
+	if total < sealedIndexHeaderBytes || directory > total-sealedIndexHeaderBytes || uint64(h.RetryBytes) > directory || (h.RetryCount == 0) != (h.RetryBytes == 0) || descriptorOffset != sealedIndexHeaderBytes+directory || descriptorBytes%sealedRouteDescriptorBytes != 0 || routeOffset != descriptorOffset+descriptorBytes || routeOffset > total || routeBytes != total-routeOffset || uint64(h.DataBytes) > sealedMaxSegmentBytes {
 		return b, ErrCorrupt
 	}
 	copy(b[:8], sealedIndexMagic[:])
-	binary.LittleEndian.PutUint16(b[8:10], FormatVersion)
+	binary.LittleEndian.PutUint16(b[8:10], canonicalFormatMarker)
 	binary.LittleEndian.PutUint16(b[10:12], sealedIndexHeaderBytes)
 	binary.LittleEndian.PutUint32(b[12:16], h.TotalBytes)
 	binary.LittleEndian.PutUint32(b[16:20], h.Runs)
@@ -57,15 +181,20 @@ func marshalSealedIndexHeader(h sealedIndexHeader) ([sealedIndexHeaderBytes]byte
 	binary.LittleEndian.PutUint32(b[36:40], h.RoutePayloadBytes)
 	binary.LittleEndian.PutUint32(b[40:44], h.DataBytes)
 	binary.LittleEndian.PutUint64(b[44:52], h.LastSequence)
+	binary.LittleEndian.PutUint32(b[52:56], h.RetryBytes)
+	binary.LittleEndian.PutUint32(b[56:60], h.RetryCount)
 	putCRC(b[:])
 	return b, nil
 }
 
 func unmarshalSealedIndexHeader(b []byte) (sealedIndexHeader, error) {
-	if len(b) != sealedIndexHeaderBytes || string(b[:8]) != string(sealedIndexMagic[:]) || binary.LittleEndian.Uint16(b[8:10]) != FormatVersion || binary.LittleEndian.Uint16(b[10:12]) != sealedIndexHeaderBytes || !validCRC(b) || !allZero(b[52:60]) {
+	if len(b) != sealedIndexHeaderBytes || string(b[:8]) != string(sealedIndexMagic[:]) || binary.LittleEndian.Uint16(b[8:10]) != canonicalFormatMarker || binary.LittleEndian.Uint16(b[10:12]) != sealedIndexHeaderBytes || !validCRC(b) {
 		return sealedIndexHeader{}, ErrCorrupt
 	}
-	h := sealedIndexHeader{TotalBytes: binary.LittleEndian.Uint32(b[12:16]), Runs: binary.LittleEndian.Uint32(b[16:20]), DirectoryBytes: binary.LittleEndian.Uint32(b[20:24]), DescriptorOffset: binary.LittleEndian.Uint32(b[24:28]), DescriptorBytes: binary.LittleEndian.Uint32(b[28:32]), RoutePayloadOffset: binary.LittleEndian.Uint32(b[32:36]), RoutePayloadBytes: binary.LittleEndian.Uint32(b[36:40]), DataBytes: binary.LittleEndian.Uint32(b[40:44]), LastSequence: binary.LittleEndian.Uint64(b[44:52])}
+	h := sealedIndexHeader{TotalBytes: binary.LittleEndian.Uint32(b[12:16]), Runs: binary.LittleEndian.Uint32(b[16:20]), DirectoryBytes: binary.LittleEndian.Uint32(b[20:24]), DescriptorOffset: binary.LittleEndian.Uint32(b[24:28]), DescriptorBytes: binary.LittleEndian.Uint32(b[28:32]), RoutePayloadOffset: binary.LittleEndian.Uint32(b[32:36]), RoutePayloadBytes: binary.LittleEndian.Uint32(b[36:40]), DataBytes: binary.LittleEndian.Uint32(b[40:44]), LastSequence: binary.LittleEndian.Uint64(b[44:52]), RetryBytes: binary.LittleEndian.Uint32(b[52:56]), RetryCount: binary.LittleEndian.Uint32(b[56:60])}
+	if h.RetryBytes > h.DirectoryBytes || (h.RetryCount == 0) != (h.RetryBytes == 0) {
+		return sealedIndexHeader{}, ErrCorrupt
+	}
 	if _, err := marshalSealedIndexHeader(h); err != nil {
 		return sealedIndexHeader{}, err
 	}
@@ -108,6 +237,10 @@ type sealedRunSummary struct {
 	NodeIncarnation, ReadyID    uint64
 	ReadyDigest                 [16]byte
 	ReadyWaveID                 WaveID
+	LatestWaveID                WaveID
+	LatestWaveDigest            [32]byte
+	LatestWaveSequence          uint64
+	RetryOrdinal                uint32
 }
 
 type sealedGroupRun struct {
@@ -151,6 +284,7 @@ const (
 	summaryReady
 	runInline
 	summaryTail
+	summaryWave
 )
 
 func appendRunDirectory(dst []byte, runs []sealedGroupRun) ([]byte, error) {
@@ -182,6 +316,9 @@ func appendRunDirectory(dst []byte, runs []sealedGroupRun) ([]byte, error) {
 		}
 		if run.Summary.NodeIncarnation != 0 {
 			flags |= summaryReady
+		}
+		if run.Summary.LatestWaveID != (WaveID{}) {
+			flags |= summaryWave
 		}
 		if inline && !controlOnly {
 			flags |= runInline
@@ -219,6 +356,12 @@ func appendRunDirectory(dst []byte, runs []sealedGroupRun) ([]byte, error) {
 			dst = appendUvarint(dst, run.Summary.ReadyID)
 			dst = append(dst, run.Summary.ReadyDigest[:]...)
 			dst = append(dst, run.Summary.ReadyWaveID[:]...)
+		}
+		if flags&summaryWave != 0 {
+			if run.Summary.RetryOrdinal == 0 {
+				return nil, ErrCorrupt
+			}
+			dst = appendUvarint(dst, uint64(run.Summary.RetryOrdinal))
 		}
 		previousGroup = run.GroupID
 	}
@@ -270,7 +413,7 @@ func decodeRunDirectory(src []byte, count uint64) ([]sealedGroupRun, error) {
 			return nil, ErrCorrupt
 		}
 		flags, err := cursor.byte()
-		if err != nil || flags & ^byte(summaryHard|summaryTruncate|summaryCheckpoint|summaryReady|runInline|summaryTail) != 0 || flags&summaryTail == 0 {
+		if err != nil || flags & ^byte(summaryHard|summaryTruncate|summaryCheckpoint|summaryReady|runInline|summaryTail|summaryWave) != 0 || flags&summaryTail == 0 {
 			return nil, ErrCorrupt
 		}
 		run.Summary.LastIndex, err = cursor.uvarint()
@@ -352,6 +495,14 @@ func decodeRunDirectory(src []byte, count uint64) ([]sealedGroupRun, error) {
 			if err == nil {
 				value, err = cursor.take(16)
 				copy(run.Summary.ReadyWaveID[:], value)
+			}
+		}
+		if err == nil && flags&summaryWave != 0 {
+			ordinal, ordinalErr := cursor.uvarint()
+			if ordinalErr != nil || ordinal == 0 || ordinal > uint64(^uint32(0)) {
+				err = ErrCorrupt
+			} else {
+				run.Summary.RetryOrdinal = uint32(ordinal)
 			}
 		}
 		wantDescriptors := uint64(0)

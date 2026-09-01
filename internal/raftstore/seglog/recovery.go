@@ -3,14 +3,13 @@ package seglog
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 )
 
-// reconcileActive opens the single manifest-selected writable segment. Frozen
-// segments have explicit manifest state and are recovered by Engine.rebuild;
+// reconcileActive opens the single state-selected writable segment. Frozen
+// segments have explicit state state and are recovered by Engine.rebuild;
 // there is no alternate sealed format or rename-state reader.
 func (l *Log) reconcileRotation() error {
-	activePath := filepath.Join(l.dir, activeName(l.manifest.ActiveID))
+	activePath := segmentPath(l.dir, l.state.ActiveFileID)
 	f, err := os.OpenFile(activePath, os.O_RDWR, 0)
 	if err != nil {
 		return fmt.Errorf("%w: selected active: %v", ErrCorrupt, err)
@@ -20,15 +19,15 @@ func (l *Log) reconcileRotation() error {
 }
 
 func (l *Log) expectedPreviousID() uint64 {
-	if n := len(l.manifest.Segments); n != 0 {
-		return l.manifest.Segments[n-1].ID
+	if n := len(l.state.Segments); n != 0 {
+		return l.state.Segments[n-1].ID
 	}
-	return l.manifest.AnchorID
+	return l.state.AnchorID
 }
 
 func (l *Log) expectedPreviousHash() [32]byte {
-	if n := len(l.manifest.Segments); n != 0 {
-		return l.manifest.Segments[n-1].Hash
+	if n := len(l.state.Segments); n != 0 {
+		return l.state.Segments[n-1].Hash
 	}
-	return l.manifest.AnchorHash
+	return l.state.AnchorHash
 }

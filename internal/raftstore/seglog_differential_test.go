@@ -22,7 +22,8 @@ func TestSeglogEngineDifferentialReadySemantics(t *testing.T) {
 		t.Fatal(err)
 	}
 	engineDir := filepath.Join(t.TempDir(), "seglog")
-	engine, err := seglog.CreateEngine(engineDir)
+	logID, authKey := [16]byte{1}, [32]byte{2}
+	engine, err := seglog.CreateEngineAuthenticated(engineDir, logID, authKey, 32<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +79,7 @@ func TestSeglogEngineDifferentialReadySemantics(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	engine, err = seglog.OpenEngine(engineDir)
+	engine, err = seglog.OpenEngineAuthenticated(engineDir, logID, authKey)
 	if err != nil {
 		t.Fatal(err)
 	}

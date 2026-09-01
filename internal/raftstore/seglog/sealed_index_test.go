@@ -62,6 +62,44 @@ func TestSealedIndexHeaderAndTopAuthentication(t *testing.T) {
 	}
 }
 
+func TestSealedRetryTableIsDeduplicatedAndCanonical(t *testing.T) {
+	id, digest := waveID(7), [32]byte{9}
+	runs := []sealedGroupRun{
+		{GroupID: 1, Summary: sealedRunSummary{LatestWaveID: id, LatestWaveDigest: digest, LatestWaveSequence: 11}},
+		{GroupID: 2, Summary: sealedRunSummary{LatestWaveID: id, LatestWaveDigest: digest, LatestWaveSequence: 11}},
+	}
+	directory, retryBytes, retryCount, err := appendSealedDirectory(nil, runs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retryCount != 1 || retryBytes != 49 { // ID + SHA-256 + one-byte sequence.
+		t.Fatalf("retry table bytes=%d count=%d", retryBytes, retryCount)
+	}
+	header := sealedIndexHeader{Runs: 2, DirectoryBytes: uint32(len(directory)), RetryBytes: retryBytes, RetryCount: retryCount}
+	decoded, err := decodeSealedDirectory(directory, header)
+	if err != nil || decoded[0].Summary.LatestWaveID != id || decoded[1].Summary.LatestWaveDigest != digest || decoded[0].Summary.RetryOrdinal != 1 || decoded[1].Summary.RetryOrdinal != 1 {
+		t.Fatalf("decoded=%#v err=%v", decoded, err)
+	}
+	// No table entry may be unreferenced, and first references must introduce
+	// ordinals monotonically (there is one canonical encoding).
+	extraID := waveID(8)
+	extra := append([]byte(nil), directory[:retryBytes]...)
+	extra = append(extra, extraID[:]...)
+	extra = append(extra, digest[:]...)
+	extra = appendUvarint(extra, 12)
+	extra = append(extra, directory[retryBytes:]...)
+	header.DirectoryBytes = uint32(len(extra))
+	header.RetryBytes += 49
+	header.RetryCount++
+	if _, err = decodeSealedDirectory(extra, header); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("unreferenced retry accepted: %v", err)
+	}
+	runs[1].Summary.LatestWaveSequence++
+	if _, _, _, err = appendSealedDirectory(nil, runs); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("same ID with changed state accepted: %v", err)
+	}
+}
+
 func TestSealedRouteDescriptorIndependentAuthentication(t *testing.T) {
 	key := [32]byte{1}
 	logID := [16]byte{2}

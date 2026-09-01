@@ -24,6 +24,33 @@ func nodeSnapshot(group, index, term uint64) *pb.Snapshot {
 	}
 }
 
+func TestNodeStoreUsesOnlyCanonicalNodeMetadataName(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "node")
+	options := NodeStoreOptions{Store: testOptions(), FrameBytes: 1 << 20, Events: 64, WaveIDs: 16, EntriesPerGroup: 16, CachedSegments: 1}
+	store, err := CreateNodeStore(dir, testIdentity(), testKey(), []NodeBootstrap{{GroupID: 10, Snapshot: nodeSnapshot(10, 1, 1)}}, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	canonical := filepath.Join(dir, "NODEMETA")
+	if _, err = os.Stat(canonical); err != nil {
+		t.Fatalf("canonical node metadata: %v", err)
+	}
+	obsolete := filepath.Join(dir, nodeMetaName+".v1")
+	if _, err = os.Stat(obsolete); !os.IsNotExist(err) {
+		t.Fatalf("obsolete node metadata exists: %v", err)
+	}
+	if err = os.Rename(canonical, obsolete); err != nil {
+		t.Fatal(err)
+	}
+	if reopened, openErr := OpenNodeStore(dir, testIdentity(), testKey(), options); openErr == nil {
+		_ = reopened.Close()
+		t.Fatal("Open accepted obsolete node metadata filename")
+	}
+}
+
 func TestNodeStoreRejectsCheckpointCollisionAndNamespaceReplacement(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "node")
 	options := NodeStoreOptions{Store: testOptions(), FrameBytes: 1 << 20, Events: 64, WaveIDs: 16, EntriesPerGroup: 16, CachedSegments: 1}

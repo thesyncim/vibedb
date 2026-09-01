@@ -9,10 +9,10 @@ import (
 	"hash/crc32"
 	"io"
 	"os"
-	"path/filepath"
 	"slices"
 	"sort"
 	"sync"
+	"time"
 
 	pb "go.etcd.io/raft/v3/raftpb"
 )
@@ -98,6 +98,9 @@ type engineGroup struct {
 	buildSlot           int
 	owner               *Engine
 	id                  uint64
+	latestWaveID        WaveID
+	latestWaveDigest    [32]byte
+	latestWaveSequence  uint64
 }
 type segmentReader struct {
 	id     uint64
@@ -106,7 +109,7 @@ type segmentReader struct {
 }
 
 type sealRequest struct {
-	base    Manifest
+	base    metadataState
 	pending SegmentMeta
 	events  []segmentEvent
 	hook    func(RotationPhase) error
@@ -132,7 +135,7 @@ func groupSealSummary(group *engineGroup) sealedRunSummary {
 	} else if lastIndex == group.TruncateIndex {
 		lastTerm = group.TruncateTerm
 	}
-	return sealedRunSummary{LastIndex: lastIndex, LastTerm: lastTerm, Hard: group.Hard, TruncateIndex: group.TruncateIndex, TruncateTerm: group.TruncateTerm, Checkpoint: group.Checkpoint, NodeIncarnation: group.NodeIncarnation, ReadyID: group.ReadyID, ReadyDigest: group.ReadyDigest, ReadyWaveID: group.ReadyWaveID}
+	return sealedRunSummary{LastIndex: lastIndex, LastTerm: lastTerm, Hard: group.Hard, TruncateIndex: group.TruncateIndex, TruncateTerm: group.TruncateTerm, Checkpoint: group.Checkpoint, NodeIncarnation: group.NodeIncarnation, ReadyID: group.ReadyID, ReadyDigest: group.ReadyDigest, ReadyWaveID: group.ReadyWaveID, LatestWaveID: group.latestWaveID, LatestWaveDigest: group.latestWaveDigest, LatestWaveSequence: group.latestWaveSequence}
 }
 
 func (arena *segmentBuildArena) touch(group *engineGroup, segmentID uint64) bool {
@@ -167,14 +170,16 @@ type Engine struct {
 	sealStop            chan struct{}
 	sealerDone          chan struct{}
 	sealPending         bool
+	maintenanceBusy     bool
 	activeBuild         *segmentBuildArena
 	spareBuild          *segmentBuildArena
 	sealBuildHookTest   func()
 	sealOpenHookTest    func(string)
 	log                 *Log
 	groups              map[uint64]*engineGroup
-	waves               map[WaveID][32]byte
+	waves               map[WaveID]waveState
 	waveLimit           int
+	sealHeadroom        uint64
 	sequence            uint64
 	frameBuf            []byte
 	eventScratch        []segmentEvent
@@ -190,18 +195,29 @@ type Engine struct {
 	recoveryIO          *recoveryIOCounters
 }
 
-type recoveryIOCounters struct {
-	pendingPayloadBytes uint64
-	pendingSealBytes    uint64
-	pendingPromotions   uint64
+type waveState struct {
+	digest   [32]byte
+	sequence uint64
+	refs     uint32
 }
 
-func CreateEngine(dir string) (*Engine, error) {
-	l, err := createLog(dir)
+type recoveryIOCounters struct {
+	pendingPayloadBytes                                       uint64
+	activeScanBytes                                           uint64
+	pendingSealBytes                                          uint64
+	pendingPromotions                                         uint64
+	maintenanceReserveAttempts, maintenanceCheckpointAttempts uint64
+}
+
+func CreateEngineAuthenticated(dir string, logID [16]byte, authKey [32]byte, segmentCapacity uint64) (*Engine, error) {
+	if logID == ([16]byte{}) || authKey == ([32]byte{}) || segmentCapacity < segmentHeaderBytes || segmentCapacity >= 1<<32 {
+		return nil, ErrBounds
+	}
+	l, err := createLog(dir, logID, authKey, segmentCapacity)
 	if err != nil {
 		return nil, err
 	}
-	e := &Engine{log: l, groups: make(map[uint64]*engineGroup), waves: make(map[WaveID][32]byte), syncData: syncActiveData, writeAt: func(f *os.File, b []byte, off int64) (int, error) { return f.WriteAt(b, off) }}
+	e := &Engine{log: l, groups: make(map[uint64]*engineGroup), waves: make(map[WaveID]waveState), syncData: syncActiveData, writeAt: func(f *os.File, b []byte, off int64) (int, error) { return f.WriteAt(b, off) }, authMAC: hmac.New(sha256.New, authKey[:]), authKey: authKey}
 	e.startSealer()
 	return e, nil
 }
@@ -213,16 +229,20 @@ func (e *Engine) startSealer() {
 	e.sealerDone = make(chan struct{})
 	go func() {
 		defer close(e.sealerDone)
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
 		for {
 			select {
 			case request := <-e.sealRequests:
-				err := e.finishFrozenSeal(request.base, request.pending, request.events, request.build, request.hook)
+				err := e.finishFrozenSeal(request.base, request.pending, request.events, request.build, request.hook, false)
 				if err != nil {
 					e.writeMu.Lock()
 					e.log.poison(err)
 					e.writeMu.Unlock()
 				}
 				e.sealResults <- err
+			case <-ticker.C:
+				e.runMetadataMaintenance()
 			case <-e.sealStop:
 				return
 			}
@@ -230,22 +250,14 @@ func (e *Engine) startSealer() {
 	}()
 }
 
-func (e *Engine) SetAuthenticationKey(key [32]byte) error {
-	if key == ([32]byte{}) || e.sequence != 0 || len(e.waves) != 0 {
-		return ErrRaftState
-	}
-	e.authMAC = hmac.New(sha256.New, key[:])
-	e.authKey = key
-	e.log.authKey = key
-	return nil
-}
-
 func (e *Engine) waveDigest(payload []byte, sequence uint64, id WaveID) [32]byte {
-	if e.authMAC == nil {
+	// The nil-state path is restricted to the internal encode-only sizing seam;
+	// every creatable/openable Engine installs the keyed MAC and a Log.
+	if e.authMAC == nil || e.log == nil {
 		return sha256.Sum256(payload)
 	}
 	e.authMAC.Reset()
-	copy(e.authContext[:16], e.log.manifest.LogID[:])
+	copy(e.authContext[:16], e.log.state.LogID[:])
 	binary.LittleEndian.PutUint64(e.authContext[16:24], sequence)
 	copy(e.authContext[24:40], id[:])
 	_, _ = e.authMAC.Write(e.authContext[:])
@@ -313,7 +325,7 @@ func (e *Engine) PrepareSegment(segmentID uint64) error {
 	if err := e.log.usable(); err != nil {
 		return err
 	}
-	if segmentID == e.log.manifest.ActiveID {
+	if segmentID == e.log.state.ActiveID {
 		return nil
 	}
 	for i := range e.readers {
@@ -322,7 +334,7 @@ func (e *Engine) PrepareSegment(segmentID uint64) error {
 		}
 	}
 	found := false
-	for _, meta := range e.log.manifest.Segments {
+	for _, meta := range e.log.state.Segments {
 		if meta.ID == segmentID {
 			found = true
 			break
@@ -331,7 +343,11 @@ func (e *Engine) PrepareSegment(segmentID uint64) error {
 	if !found || len(e.readers) == 0 {
 		return ErrBounds
 	}
-	f, err := os.Open(filepath.Join(e.log.dir, sealedName(segmentID)))
+	fileID, ok := e.fileIDForSegment(segmentID)
+	if !ok {
+		return ErrBounds
+	}
+	f, err := os.Open(segmentPath(e.log.dir, fileID))
 	if err != nil {
 		return err
 	}
@@ -340,13 +356,28 @@ func (e *Engine) PrepareSegment(segmentID uint64) error {
 	if e.readers[slot].file != nil {
 		_ = e.readers[slot].file.Close()
 	}
-	routes, err := newLazyRouteReader(f, e.authKey, e.log.manifest.LogID, segmentID, 4, true)
+	routes, err := newLazyRouteReader(f, e.authKey, e.log.state.LogID, segmentID, 4, true)
 	if err != nil {
 		_ = f.Close()
 		return err
 	}
 	e.readers[slot] = segmentReader{id: segmentID, file: f, routes: routes}
 	return nil
+}
+
+func (e *Engine) fileIDForSegment(segmentID uint64) (fileID, bool) {
+	if segmentID <= e.log.state.AnchorID {
+		return fileID{}, false
+	}
+	ordinal := segmentID - e.log.state.AnchorID - 1
+	if ordinal >= uint64(len(e.log.state.Segments)) {
+		return fileID{}, false
+	}
+	meta := e.log.state.Segments[ordinal]
+	if meta.ID != segmentID || meta.FileID == (fileID{}) {
+		return fileID{}, false
+	}
+	return meta.FileID, true
 }
 
 // ReadLocation reads exactly one entry value without decoding its containing
@@ -359,7 +390,7 @@ func (e *Engine) ReadLocation(location EntryLocation, dst []byte) ([]byte, error
 		return nil, ErrBounds
 	}
 	var file *os.File
-	if location.SegmentID == e.log.manifest.ActiveID {
+	if location.SegmentID == e.log.state.ActiveID {
 		file = e.log.active
 	} else {
 		for i := range e.readers {
@@ -384,9 +415,20 @@ func (e *Engine) Reserve(frameBytes, events, waveIDs int) error {
 	if err := e.log.usable(); err != nil {
 		return err
 	}
-	if frameBytes < 72 || events < len(e.eventScratch) || waveIDs < len(e.waves) {
+	if frameBytes < 72 || events < len(e.eventScratch) || events < len(e.log.events) || waveIDs < len(e.waves) {
 		return ErrBounds
 	}
+	// The seal/index bound is charged before accepting any append. Route
+	// descriptors, compact payload, top directory, and footer are conservatively
+	// bounded here; actual seal geometry is checked again before publication.
+	headroom := uint64(sealedIndexHeaderBytes+segmentFooterBytes) + uint64(events)*96 + 4096
+	if headroom < e.sealHeadroom && e.log.activeOffset > segmentHeaderBytes {
+		return ErrBounds
+	}
+	if uint64(frameBytes) > e.log.state.SegmentCapacity-segmentHeaderBytes || headroom >= e.log.state.SegmentCapacity-segmentHeaderBytes || uint64(frameBytes)+headroom > e.log.state.SegmentCapacity-segmentHeaderBytes {
+		return ErrBounds
+	}
+	e.sealHeadroom = headroom
 	if frameBytes > cap(e.frameBuf) {
 		e.frameBuf = make([]byte, 0, frameBytes)
 	}
@@ -406,7 +448,7 @@ func (e *Engine) Reserve(frameBytes, events, waveIDs int) error {
 			if e.log.events[i].GroupID == engineWaveGroup {
 				continue
 			}
-			if group := e.groups[e.log.events[i].GroupID]; group != nil && group.buildSegmentID == e.log.manifest.ActiveID {
+			if group := e.groups[e.log.events[i].GroupID]; group != nil && group.buildSegmentID == e.log.state.ActiveID {
 				group.buildSegmentID = 0
 				group.buildSlot = 0
 			}
@@ -417,8 +459,8 @@ func (e *Engine) Reserve(frameBytes, events, waveIDs int) error {
 				continue
 			}
 			group := e.groups[e.log.events[i].GroupID]
-			if group != nil && group.buildSegmentID != e.log.manifest.ActiveID {
-				if !e.activeBuild.touch(group, e.log.manifest.ActiveID) {
+			if group != nil && group.buildSegmentID != e.log.state.ActiveID {
+				if !e.activeBuild.touch(group, e.log.state.ActiveID) {
 					return ErrBounds
 				}
 			}
@@ -428,9 +470,9 @@ func (e *Engine) Reserve(frameBytes, events, waveIDs int) error {
 		e.spareBuild = &segmentBuildArena{groups: make([]segmentGroupBuild, 0, events)}
 	}
 	if waveIDs > len(e.waves) {
-		replacement := make(map[WaveID][32]byte, waveIDs)
-		for id, digest := range e.waves {
-			replacement[id] = digest
+		replacement := make(map[WaveID]waveState, waveIDs)
+		for id, state := range e.waves {
+			replacement[id] = state
 		}
 		e.waves = replacement
 	}
@@ -596,7 +638,7 @@ func (e *Engine) Sequence() uint64 {
 	return e.sequence
 }
 
-func (e *Engine) LogID() [16]byte { return e.log.manifest.LogID }
+func (e *Engine) LogID() [16]byte { return e.log.state.LogID }
 
 // FatalError reports whether an ambiguous storage mutation poisoned the
 // handle. A nil result means a returned operation error was pre-mutation.
@@ -631,16 +673,17 @@ func (e *Engine) PersistWave(w Wave) error {
 		return ErrBounds
 	}
 	if previous, ok := e.waves[w.ID]; ok {
-		_, digest, _, err := e.prepareWave(w, false)
+		encoded, _, _, err := e.prepareWave(w, false)
 		if err != nil {
 			return e.log.poison(ErrWaveConflict)
 		}
-		if previous == digest {
+		digest := e.waveDigest(encoded[72:], previous.sequence, w.ID)
+		if previous.digest == digest {
 			return nil
 		}
 		return e.log.poison(ErrWaveConflict)
 	}
-	if len(e.waves) >= e.waveLimit {
+	if e.waveLimit == 0 || len(e.waves)-e.reclaimedWaveStates(w.Batches)+1 > e.waveLimit {
 		return ErrBounds
 	}
 	frame, _, events, err := e.prepareWave(w, true)
@@ -648,6 +691,9 @@ func (e *Engine) PersistWave(w Wave) error {
 		return err
 	}
 	if len(e.log.events)+len(events) > cap(e.log.events) {
+		return ErrBounds
+	}
+	if e.sealHeadroom == 0 || e.log.activeOffset > e.log.state.SegmentCapacity-e.sealHeadroom || uint64(len(frame)) > e.log.state.SegmentCapacity-e.sealHeadroom-e.log.activeOffset {
 		return ErrBounds
 	}
 	offset := e.log.activeOffset
@@ -675,11 +721,44 @@ func (e *Engine) PersistWave(w Wave) error {
 	}
 	e.log.events = append(e.log.events, events...)
 	for _, event := range events {
-		if err = e.applyEvent(event, e.log.manifest.ActiveID); err != nil {
+		if err = e.applyEvent(event, e.log.state.ActiveID); err != nil {
 			return e.log.poison(err)
 		}
 	}
 	return nil
+}
+
+func (e *Engine) reclaimedWaveStates(batches []ReadyBatch) int {
+	reclaimed := 0
+	for i := range batches {
+		group := e.groups[batches[i].GroupID]
+		if group == nil || group.latestWaveID == (WaveID{}) {
+			continue
+		}
+		old := group.latestWaveID
+		seen := false
+		refs := uint32(0)
+		for j := 0; j < i; j++ {
+			other := e.groups[batches[j].GroupID]
+			if other != nil && other.latestWaveID == old {
+				seen = true
+				break
+			}
+		}
+		if seen {
+			continue
+		}
+		for j := i; j < len(batches); j++ {
+			other := e.groups[batches[j].GroupID]
+			if other != nil && other.latestWaveID == old {
+				refs++
+			}
+		}
+		if state, ok := e.waves[old]; ok && refs == state.refs {
+			reclaimed++
+		}
+	}
+	return reclaimed
 }
 
 func (e *Engine) prepareWave(w Wave, validateState bool) ([]byte, [32]byte, []segmentEvent, error) {
@@ -698,7 +777,7 @@ func (e *Engine) prepareWave(w Wave, validateState bool) ([]byte, [32]byte, []se
 		missing := 0
 		for i := range w.Batches {
 			group := e.groups[w.Batches[i].GroupID]
-			if group == nil || group.buildSegmentID != e.log.manifest.ActiveID {
+			if group == nil || group.buildSegmentID != e.log.state.ActiveID {
 				missing++
 			}
 		}
@@ -728,7 +807,7 @@ func (e *Engine) prepareWave(w Wave, validateState bool) ([]byte, [32]byte, []se
 				return nil, [32]byte{}, nil, err
 			}
 		}
-		needed := len(batch.Entries)
+		needed := len(batch.Entries) + 1 // generic latest-wave ref for this group
 		if batch.ReplaceFrom != 0 {
 			needed++
 		}
@@ -752,6 +831,9 @@ func (e *Engine) prepareWave(w Wave, validateState bool) ([]byte, [32]byte, []se
 		}
 		e.frameBuf = appendUvarint(e.frameBuf, batch.GroupID-previousGroup)
 		e.frameBuf = append(e.frameBuf, flags)
+		if validateState {
+			e.eventScratch = append(e.eventScratch, segmentEvent{Kind: eventWaveRef, GroupID: batch.GroupID, Index: e.sequence + 1, Reference: w.ID})
+		}
 		if flags&batchIdentity != 0 {
 			e.frameBuf = appendUvarint(e.frameBuf, batch.NodeIncarnation)
 			e.frameBuf = appendUvarint(e.frameBuf, batch.ReadyID)
@@ -851,7 +933,7 @@ func (e *Engine) prepareWave(w Wave, validateState bool) ([]byte, [32]byte, []se
 	}
 	if validateState {
 		for i := range w.Batches {
-			if !e.activeBuild.touch(e.groups[w.Batches[i].GroupID], e.log.manifest.ActiveID) {
+			if !e.activeBuild.touch(e.groups[w.Batches[i].GroupID], e.log.state.ActiveID) {
 				return nil, [32]byte{}, nil, ErrBounds
 			}
 		}
@@ -859,6 +941,11 @@ func (e *Engine) prepareWave(w Wave, validateState bool) ([]byte, [32]byte, []se
 	digest := e.waveDigest(e.frameBuf[72:], e.sequence+1, w.ID)
 	copy(e.frameBuf[40:72], digest[:])
 	if validateState {
+		for i := range e.eventScratch {
+			if e.eventScratch[i].Kind == eventWaveRef {
+				e.eventScratch[i].Digest = digest
+			}
+		}
 		e.eventScratch = append(e.eventScratch, segmentEvent{Kind: eventWave, GroupID: engineWaveGroup, Index: e.sequence + 1, Reference: w.ID, Digest: digest})
 	}
 	return e.frameBuf, digest, e.eventScratch, nil
@@ -870,7 +957,7 @@ func waveSize(w Wave) (int, int, error) {
 	if err := validateWaveExtents(w.Batches, uint64(len(w.Blob))); err != nil {
 		return 0, 0, err
 	}
-	bytes, events := 72+uvarintBytes(uint64(len(w.Batches))), 1
+	bytes, events := 72+uvarintBytes(uint64(len(w.Batches))), 1+len(w.Batches)
 	previousGroup := uint64(0)
 	for i := range w.Batches {
 		b := &w.Batches[i]
@@ -1258,7 +1345,7 @@ func (g *engineGroup) sealedTerm(index uint64) (uint64, bool, error) {
 func sealWaveHeader(frame []byte, sequence uint64, id WaveID) {
 	binary.LittleEndian.PutUint32(frame[0:4], uint32(len(frame)))
 	binary.LittleEndian.PutUint16(frame[4:6], RecordWave)
-	binary.LittleEndian.PutUint16(frame[6:8], FormatVersion)
+	binary.LittleEndian.PutUint16(frame[6:8], canonicalFormatMarker)
 	binary.LittleEndian.PutUint64(frame[8:16], sequence)
 	copy(frame[16:32], id[:])
 	binary.LittleEndian.PutUint32(frame[32:36], crc32.Checksum(frame[40:], crcTable))
@@ -1268,10 +1355,13 @@ func sealWaveHeader(frame []byte, sequence uint64, id WaveID) {
 func (e *Engine) applyEvent(event segmentEvent, segmentID uint64) error {
 	if event.Kind == eventWave {
 		id := WaveID(event.Reference)
-		if previous, ok := e.waves[id]; ok && previous != event.Digest {
+		if previous, ok := e.waves[id]; ok && previous.digest != ([32]byte{}) && previous.digest != event.Digest {
 			return ErrWaveConflict
 		}
-		e.waves[id] = event.Digest
+		if state, ok := e.waves[id]; ok {
+			state.digest, state.sequence = event.Digest, event.Index
+			e.waves[id] = state
+		}
 		if event.Index != e.sequence+1 {
 			return ErrCorrupt
 		}
@@ -1284,6 +1374,21 @@ func (e *Engine) applyEvent(event segmentEvent, segmentID uint64) error {
 		e.groups[event.GroupID] = g
 	}
 	switch event.Kind {
+	case eventWaveRef:
+		id := WaveID(event.Reference)
+		if id == (WaveID{}) || event.Digest == ([32]byte{}) || event.Index != e.sequence+1 {
+			return ErrCorrupt
+		}
+		if g.latestWaveID != id {
+			e.releaseWaveReference(g.latestWaveID)
+			state := e.waves[id]
+			if state.digest != ([32]byte{}) && (state.digest != event.Digest || state.sequence != event.Index) {
+				return ErrWaveConflict
+			}
+			state.digest, state.sequence, state.refs = event.Digest, event.Index, state.refs+1
+			e.waves[id] = state
+		}
+		g.latestWaveID, g.latestWaveDigest, g.latestWaveSequence = id, event.Digest, event.Index
 	case eventIncarnation:
 		if event.Incarnation != g.NodeIncarnation+1 {
 			return ErrRaftState
@@ -1300,7 +1405,8 @@ func (e *Engine) applyEvent(event segmentEvent, segmentID uint64) error {
 		} else if event.Incarnation <= g.NodeIncarnation || event.ReadyID != 1 {
 			return ErrRaftState
 		}
-		g.NodeIncarnation, g.ReadyID, g.ReadyDigest, g.ReadyWaveID = event.Incarnation, event.ReadyID, event.ReadyDigest, WaveID(event.Reference)
+		newWave := WaveID(event.Reference)
+		g.NodeIncarnation, g.ReadyID, g.ReadyDigest, g.ReadyWaveID = event.Incarnation, event.ReadyID, event.ReadyDigest, newWave
 	case RecordTruncateSuffix:
 		predecessor, err := predecessorTerm(g, event.Index)
 		if err != nil {
@@ -1358,10 +1464,23 @@ func (e *Engine) applyEvent(event segmentEvent, segmentID uint64) error {
 	default:
 		return ErrCorrupt
 	}
-	if e.activeBuild != nil && !e.activeBuild.update(g, e.log.manifest.ActiveID) {
+	if e.activeBuild != nil && !e.activeBuild.update(g, e.log.state.ActiveID) {
 		return ErrBounds
 	}
 	return nil
+}
+
+func (e *Engine) releaseWaveReference(id WaveID) {
+	if id == (WaveID{}) {
+		return
+	}
+	state, ok := e.waves[id]
+	if !ok || state.refs <= 1 {
+		delete(e.waves, id)
+		return
+	}
+	state.refs--
+	e.waves[id] = state
 }
 
 func (g *engineGroup) clipSealedSuffix(last uint64) {
@@ -1408,20 +1527,24 @@ func (e *Engine) Rotate(hook func(RotationPhase) error) error {
 			return ErrBounds
 		}
 	}
-	if err := e.log.Sync(); err != nil {
-		return err
-	}
 	l := e.log
+	if e.maintenanceBusy || len(l.state.Segments) == cap(l.state.Segments) || catalogSuffixRecords(l.metadata.slot) >= catalogCheckpointHardRecords || !l.state.Reserves[0].Ready || !l.state.Reserves[1].Ready || l.reserveFiles[0] == nil || l.reserveFiles[1] == nil {
+		return ErrBounds
+	}
 	if cap(l.eventSpare) < cap(l.events) || e.activeBuild == nil || e.spareBuild == nil {
 		return ErrBounds
 	}
-	dataBytes, frozenID, frozenGeneration := l.manifest.DurableOffset, l.manifest.ActiveID, l.manifest.ActiveGeneration
+	if err := e.log.Sync(); err != nil {
+		return err
+	}
+	dataBytes, frozenID, frozenGeneration := l.activeOffset, l.state.ActiveID, l.state.ActiveGeneration
 	var sum [32]byte
 	copy(sum[:], l.activeHash.Sum(l.digestScratch[:0]))
 	nextID, nextGeneration := frozenID+1, frozenGeneration+1
-	nextHeader := segmentHeader{ID: nextID, Generation: nextGeneration, PreviousID: frozenID, PreviousHash: sum, LogID: l.manifest.LogID}
-	nextFile, err := createSegment(l.dir, nextHeader)
-	if err != nil {
+	nextHeader := segmentHeader{ID: nextID, Generation: nextGeneration, PreviousID: frozenID, PreviousHash: sum, LogID: l.state.LogID, FileID: l.state.Reserves[0].FileID, Capacity: l.state.SegmentCapacity}
+	nextFile := l.reserveFiles[0]
+	var err error
+	if err = activateReserve(nextFile, nextHeader); err != nil {
 		return l.poison(err)
 	}
 	if hook != nil {
@@ -1430,12 +1553,15 @@ func (e *Engine) Rotate(hook func(RotationPhase) error) error {
 			return l.poison(err)
 		}
 	}
-	pending := SegmentMeta{ID: frozenID, Generation: frozenGeneration, Bytes: dataBytes, Records: l.records, PreviousHash: l.expectedPreviousHash(), Hash: sum, State: SegmentFrozenPending}
-	next := l.manifest
+	pending := SegmentMeta{ID: frozenID, Generation: frozenGeneration, Bytes: dataBytes, Records: l.records, PreviousHash: l.expectedPreviousHash(), Hash: sum, FileID: l.state.ActiveFileID, State: SegmentFrozenPending}
+	next := l.state
 	next.Generation++
 	next.ActiveID, next.ActiveGeneration = nextID, nextGeneration
+	next.ActiveFileID = next.Reserves[0].FileID
+	next.Reserves[0], next.Reserves[1] = next.Reserves[1], reserveDescriptor{}
 	next.DurableSegmentID, next.DurableOffset = nextID, segmentHeaderBytes
-	next.Segments = append(slices.Clone(next.Segments), pending)
+	next.Segments = next.Segments[:len(next.Segments)+1]
+	next.Segments[len(next.Segments)-1] = pending
 	if err = l.publish(next); err != nil {
 		_ = nextFile.Close()
 		return l.poison(err)
@@ -1446,14 +1572,15 @@ func (e *Engine) Rotate(hook func(RotationPhase) error) error {
 	frozenBuild.lastSequence = e.sequence
 	e.activeBuild, e.spareBuild = e.spareBuild, nil
 	l.events, l.eventSpare = l.eventSpare[:0], nil
-	l.active, l.activeOffset, l.records, l.manifest = nextFile, segmentHeaderBytes, 0, next
+	l.active, l.activeOffset, l.records, l.state = nextFile, segmentHeaderBytes, 0, next
+	l.reserveFiles[0], l.reserveFiles[1] = l.reserveFiles[1], nil
 	l.activeHash = sha256.New()
 	_, _ = l.activeHash.Write(marshalSegmentHeader(nextHeader))
 	if err = old.Close(); err != nil {
 		return l.poison(err)
 	}
 	if hook != nil {
-		if err = hook(RotationManifestPublished); err != nil {
+		if err = hook(RotationPendingMetadataPublished); err != nil {
 			return l.poison(err)
 		}
 	}
@@ -1462,7 +1589,7 @@ func (e *Engine) Rotate(hook func(RotationPhase) error) error {
 	return nil
 }
 
-func (e *Engine) finishFrozenSeal(base Manifest, pending SegmentMeta, events []segmentEvent, build *segmentBuildArena, hook func(RotationPhase) error) (result error) {
+func (e *Engine) finishFrozenSeal(base metadataState, pending SegmentMeta, events []segmentEvent, build *segmentBuildArena, hook func(RotationPhase) error, deferMaintenance bool) (result error) {
 	if build == nil {
 		return ErrBounds
 	}
@@ -1472,14 +1599,14 @@ func (e *Engine) finishFrozenSeal(base Manifest, pending SegmentMeta, events []s
 	if e.sealBuildHookTest != nil {
 		e.sealBuildHookTest()
 	}
-	builderLog := &Log{dir: e.log.dir, manifest: base, authKey: e.authKey, events: events}
-	builderLog.manifest.ActiveID, builderLog.manifest.ActiveGeneration = pending.ID, pending.Generation
+	builderLog := &Log{dir: e.log.dir, state: base, authKey: e.authKey, events: events}
+	builderLog.state.ActiveID, builderLog.state.ActiveGeneration = pending.ID, pending.Generation
 	builder := &Engine{log: builderLog, groups: make(map[uint64]*engineGroup, len(build.groups)), sequence: build.lastSequence, authKey: e.authKey, sealSummaryOverride: make(map[uint64]sealedRunSummary, len(build.groups))}
 	for i := range build.groups {
 		item := build.groups[i]
 		final := item.Final
 		builder.sealSummaryOverride[item.GroupID] = final
-		builder.groups[item.GroupID] = &engineGroup{id: item.GroupID, GroupState: GroupState{Hard: final.Hard, TruncateIndex: final.TruncateIndex, TruncateTerm: final.TruncateTerm, Checkpoint: final.Checkpoint, NodeIncarnation: final.NodeIncarnation, ReadyID: final.ReadyID, ReadyDigest: final.ReadyDigest, ReadyWaveID: final.ReadyWaveID}, lastIndex: final.LastIndex, lastTerm: final.LastTerm}
+		builder.groups[item.GroupID] = &engineGroup{id: item.GroupID, GroupState: GroupState{Hard: final.Hard, TruncateIndex: final.TruncateIndex, TruncateTerm: final.TruncateTerm, Checkpoint: final.Checkpoint, NodeIncarnation: final.NodeIncarnation, ReadyID: final.ReadyID, ReadyDigest: final.ReadyDigest, ReadyWaveID: final.ReadyWaveID}, lastIndex: final.LastIndex, lastTerm: final.LastTerm, latestWaveID: final.LatestWaveID, latestWaveDigest: final.LatestWaveDigest, latestWaveSequence: final.LatestWaveSequence}
 	}
 	for i := range events {
 		event := events[i]
@@ -1506,15 +1633,18 @@ func (e *Engine) finishFrozenSeal(base Manifest, pending SegmentMeta, events []s
 	if err != nil {
 		return err
 	}
+	if pending.Bytes > base.SegmentCapacity || uint64(len(index)) > base.SegmentCapacity-pending.Bytes || segmentFooterBytes > base.SegmentCapacity-pending.Bytes-uint64(len(index)) {
+		return ErrBounds
+	}
 	header, err := unmarshalSealedIndexHeader(index[:sealedIndexHeaderBytes])
 	if err != nil {
 		return err
 	}
-	runs, err := decodeRunDirectory(index[sealedIndexHeaderBytes:topBytes], uint64(header.Runs))
+	runs, err := decodeSealedDirectory(index[sealedIndexHeaderBytes:topBytes], header)
 	if err != nil {
 		return err
 	}
-	pendingPath := filepath.Join(e.log.dir, activeName(pending.ID))
+	pendingPath := segmentPath(e.log.dir, pending.FileID)
 	if e.sealOpenHookTest != nil {
 		e.sealOpenHookTest(pendingPath)
 	}
@@ -1526,7 +1656,7 @@ func (e *Engine) finishFrozenSeal(base Manifest, pending SegmentMeta, events []s
 		_, err = f.WriteAt(index, int64(pending.Bytes))
 	}
 	footer := segmentFooter{ID: pending.ID, Generation: pending.Generation, Records: pending.Records, DataBytes: pending.Bytes, Hash: pending.Hash, IndexOffset: pending.Bytes, IndexBytes: uint64(len(index)), Events: uint64(len(events))}
-	segmentIdentity := segmentHeader{ID: pending.ID, Generation: pending.Generation, PreviousID: pending.ID - 1, PreviousHash: pending.PreviousHash, LogID: base.LogID}
+	segmentIdentity := segmentHeader{ID: pending.ID, Generation: pending.Generation, PreviousID: pending.ID - 1, PreviousHash: pending.PreviousHash, LogID: base.LogID, FileID: pending.FileID, Capacity: base.SegmentCapacity}
 	footer.Auth = segmentSealedMetadataMAC(e.authKey, segmentIdentity, index[:topBytes], footer)
 	footerBytes := marshalSegmentFooter(footer)
 	if err == nil {
@@ -1545,11 +1675,8 @@ func (e *Engine) finishFrozenSeal(base Manifest, pending SegmentMeta, events []s
 	if err != nil {
 		return err
 	}
-	if err = os.Rename(filepath.Join(e.log.dir, activeName(pending.ID)), filepath.Join(e.log.dir, sealedName(pending.ID))); err == nil {
-		err = syncDir(e.log.dir)
-	}
-	if err == nil && hook != nil {
-		err = hook(RotationSealedRenamed)
+	if hook != nil {
+		err = hook(RotationSealFileClosed)
 	}
 	if err != nil {
 		return err
@@ -1558,19 +1685,124 @@ func (e *Engine) finishFrozenSeal(base Manifest, pending SegmentMeta, events []s
 	sealed.State = SegmentSealed
 	sealed.IndexOffset, sealed.IndexBytes = pending.Bytes, uint64(len(index))
 	sealed.Bytes = pending.Bytes + uint64(len(index)) + segmentFooterBytes
+	recordSegment := sealed
+	recordSegment.PreviousHash, recordSegment.FileID = [32]byte{}, fileID{}
+	record := catalogRecord{Kind: catalogSeal, Segment: recordSegment, FileID: sealed.FileID}
+	nextGeneration := e.log.metadata.slot.Generation + 1
+	predictedTail, predictedHash, previewErr := e.log.metadata.previewRecord(record, nextGeneration)
+	if previewErr != nil {
+		return previewErr
+	}
+	var checkpointID fileID
+	var checkpointHash [32]byte
+	var checkpointCandidate catalogCheckpoint
+	if suffix := (predictedTail - max(uint64(metadataCatalogStart), e.log.metadata.slot.CheckpointTail)) / catalogRecordBytes; !deferMaintenance && suffix >= catalogCheckpointSoftRecords {
+		if e.recoveryIO != nil {
+			e.recoveryIO.maintenanceCheckpointAttempts++
+		}
+		checkpointID, err = randomFileID()
+		if err == nil {
+			checkpointCandidate = catalogCheckpoint{ID: checkpointID, LogID: base.LogID, Generation: nextGeneration, Tail: predictedTail, CatalogHash: predictedHash, AnchorID: base.AnchorID, AnchorGeneration: base.AnchorGeneration, AnchorHash: base.AnchorHash, Segments: base.Segments, Final: sealed}
+			checkpointHash, err = catalogCheckpointWriter(e.log.dir, checkpointCandidate, e.authKey)
+		}
+		if err == nil {
+			runway := catalogCheckpointHardRecords * catalogRecordBytes
+			if predictedTail > ^uint64(0)-runway {
+				err = ErrBounds
+			} else {
+				err = preallocateMetadataRunway(e.log.metadata.file, predictedTail+runway)
+			}
+		}
+		// Checkpoint creation is capacity maintenance, not log corruption. The
+		// seal remains publishable through the exact bounded suffix limit; a
+		// later Rotate backpressures before mutation if maintenance stays down.
+		if err != nil {
+			if checkpointHash != ([32]byte{}) {
+				cleanupUnpublishedCheckpoint(e.log.dir, checkpointCandidate, checkpointHash, e.authKey)
+			}
+			checkpointID, checkpointHash = fileID{}, [32]byte{}
+		}
+	}
+	// Reserve preparation is deliberately outside writeMu: physical allocation,
+	// file sync, and directory sync must never stall active appends. Failure is
+	// capacity backpressure for the next Rotate, not corruption of this seal.
+	var reserveFile *os.File
+	var reserve reserveDescriptor
+	var reserveErr error
+	if !deferMaintenance {
+		if e.recoveryIO != nil {
+			e.recoveryIO.maintenanceReserveAttempts++
+		}
+		reserveFile, reserve, reserveErr = prepareReserve(e.log.dir, e.log.state.SegmentCapacity)
+	}
+	var grownSegments []SegmentMeta
+	if !deferMaintenance && len(e.log.state.Segments) == cap(e.log.state.Segments) {
+		capacity := max(256, cap(e.log.state.Segments)*2)
+		grownSegments = make([]SegmentMeta, len(e.log.state.Segments), capacity)
+		copy(grownSegments, e.log.state.Segments)
+	}
 	e.writeMu.Lock()
 	defer e.writeMu.Unlock()
-	manifest := e.log.manifest
-	if len(manifest.Segments) == 0 || manifest.Segments[len(manifest.Segments)-1] != pending {
+	state := e.log.state
+	if grownSegments != nil {
+		state.Segments = grownSegments
+	}
+	if len(state.Segments) == 0 || state.Segments[len(state.Segments)-1] != pending {
+		if reserveFile != nil {
+			cleanupUnpublishedFile(reserveFile, segmentPath(e.log.dir, reserve.FileID), e.log.dir)
+		}
+		if checkpointHash != ([32]byte{}) {
+			cleanupUnpublishedCheckpoint(e.log.dir, checkpointCandidate, checkpointHash, e.authKey)
+		}
 		return ErrCorrupt
 	}
-	manifest.Generation++
-	manifest.Segments = slices.Clone(manifest.Segments)
-	manifest.Segments[len(manifest.Segments)-1] = sealed
-	if err = e.log.publish(manifest); err != nil {
+	nextSlot := e.log.metadata.slot
+	nextSlot.Generation++
+	nextSlot.HasPending = false
+	nextSlot.Pending = pendingDescriptor{}
+	reserveIndex := -1
+	if reserveErr == nil {
+		for i := range nextSlot.Reserves {
+			if !nextSlot.Reserves[i].Ready {
+				nextSlot.Reserves[i], reserveIndex = reserve, i
+				break
+			}
+		}
+	}
+	if checkpointID != (fileID{}) {
+		nextSlot.PreviousCheckpointID = nextSlot.CheckpointID
+		nextSlot.PreviousCheckpointTail = nextSlot.CheckpointTail
+		nextSlot.PreviousCheckpointHash = nextSlot.CheckpointHash
+		nextSlot.CheckpointID = [16]byte(checkpointID)
+		nextSlot.CheckpointTail = predictedTail
+		nextSlot.CheckpointHash = checkpointHash
+	}
+	if err = e.log.metadata.publish(nextSlot, &record); err != nil {
+		if reserveFile != nil {
+			_ = reserveFile.Close()
+		}
 		return err
 	}
-	e.log.manifest = manifest
+	if hook != nil {
+		if err = hook(RotationSealedMetadataPublished); err != nil {
+			if reserveFile != nil {
+				_ = reserveFile.Close()
+			}
+			return err
+		}
+	}
+	state.Generation = nextSlot.Generation
+	state.Segments[len(state.Segments)-1] = sealed
+	if reserveIndex >= 0 {
+		state.Reserves[reserveIndex] = reserve
+		e.log.reserveFiles[reserveIndex] = reserveFile
+	} else if reserveFile != nil {
+		cleanupUnpublishedFile(reserveFile, segmentPath(e.log.dir, reserve.FileID), e.log.dir)
+	}
+	e.log.state = state
+	if deferMaintenance {
+		e.log.metadata.needsHealing = true
+	}
 	for i := range runs {
 		run := runs[i]
 		group := e.groups[run.GroupID]
@@ -1606,43 +1838,171 @@ func (e *Engine) finishFrozenSeal(base Manifest, pending SegmentMeta, events []s
 	return nil
 }
 
-func OpenEngine(dir string) (*Engine, error) {
-	return openEngineAuthenticated(dir, syncActiveData, [32]byte{})
+// runMetadataMaintenance is the serial sealer's autonomous capacity lane.
+// It performs all physical allocation/checkpoint I/O without writeMu and only
+// holds the mutex for the fixed-size authenticated slot publication.
+func (e *Engine) runMetadataMaintenance() {
+	e.writeMu.Lock()
+	if e.maintenanceBusy || e.log == nil || e.log.usable() != nil || e.log.metadata == nil || e.log.metadata.slot.HasPending {
+		e.writeMu.Unlock()
+		return
+	}
+	missing := [2]bool{}
+	needWork := e.log.metadata.needsHealing || catalogSuffixRecords(e.log.metadata.slot) >= catalogCheckpointSoftRecords || len(e.log.state.Segments) == cap(e.log.state.Segments)
+	for i := range missing {
+		missing[i] = !e.log.metadata.slot.Reserves[i].Ready || e.log.reserveFiles[i] == nil
+		needWork = needWork || missing[i]
+	}
+	if !needWork {
+		e.writeMu.Unlock()
+		return
+	}
+	e.maintenanceBusy = true
+	baseSlot := e.log.metadata.slot
+	segments := e.log.state.Segments
+	dir, logID, capacity := e.log.dir, e.log.state.LogID, e.log.state.SegmentCapacity
+	e.writeMu.Unlock()
+	var grownSegments []SegmentMeta
+	if len(segments) == cap(segments) {
+		grownCapacity := max(256, cap(segments)*2)
+		grownSegments = make([]SegmentMeta, len(segments), grownCapacity)
+		copy(grownSegments, segments)
+	}
+
+	var reserveFiles [2]*os.File
+	var reserves [2]reserveDescriptor
+	for i := range missing {
+		if missing[i] {
+			reserveFiles[i], reserves[i], _ = prepareReserve(dir, capacity)
+		}
+	}
+	var checkpointID fileID
+	var checkpointHash [32]byte
+	var checkpointCandidate catalogCheckpoint
+	if e.log.metadata.needsHealing || catalogSuffixRecords(baseSlot) >= catalogCheckpointSoftRecords {
+		checkpointID, _ = randomFileID()
+		if checkpointID != (fileID{}) {
+			checkpointCandidate = catalogCheckpoint{ID: checkpointID, LogID: logID, Generation: baseSlot.Generation, Tail: baseSlot.CatalogTail, CatalogHash: baseSlot.CatalogHash, AnchorID: baseSlot.AnchorID, AnchorGeneration: baseSlot.AnchorGeneration, AnchorHash: baseSlot.AnchorHash, Segments: segments}
+			checkpointHash, _ = catalogCheckpointWriter(dir, checkpointCandidate, e.authKey)
+			if checkpointHash != ([32]byte{}) {
+				runway := catalogCheckpointHardRecords * catalogRecordBytes
+				if baseSlot.CatalogTail > ^uint64(0)-runway || preallocateMetadataRunway(e.log.metadata.file, baseSlot.CatalogTail+runway) != nil {
+					cleanupUnpublishedCheckpoint(dir, checkpointCandidate, checkpointHash, e.authKey)
+					checkpointID, checkpointHash = fileID{}, [32]byte{}
+				}
+			}
+		}
+	}
+
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+	e.maintenanceBusy = false
+	if e.log.metadata.slot.Generation != baseSlot.Generation || e.log.metadata.slot.CatalogTail != baseSlot.CatalogTail {
+		for i := range reserveFiles {
+			if reserveFiles[i] != nil {
+				cleanupUnpublishedFile(reserveFiles[i], segmentPath(dir, reserves[i].FileID), dir)
+			}
+		}
+		if checkpointHash != ([32]byte{}) {
+			cleanupUnpublishedCheckpoint(dir, checkpointCandidate, checkpointHash, e.authKey)
+		}
+		return
+	}
+	next := baseSlot
+	changed := false
+	for i := range reserveFiles {
+		if reserveFiles[i] != nil && missing[i] {
+			next.Reserves[i] = reserves[i]
+			changed = true
+		}
+	}
+	if checkpointID != (fileID{}) {
+		next.PreviousCheckpointID, next.PreviousCheckpointTail, next.PreviousCheckpointHash = next.CheckpointID, next.CheckpointTail, next.CheckpointHash
+		next.CheckpointID, next.CheckpointTail, next.CheckpointHash = [16]byte(checkpointID), next.CatalogTail, checkpointHash
+		changed = true
+	}
+	if !changed {
+		if grownSegments != nil {
+			e.log.state.Segments = grownSegments
+		}
+		return
+	}
+	next.Generation++
+	if err := e.log.metadata.publish(next, nil); err != nil {
+		for i := range reserveFiles {
+			if reserveFiles[i] != nil {
+				_ = reserveFiles[i].Close()
+			}
+		}
+		e.log.poison(err)
+		return
+	}
+	e.log.metadata.needsHealing = false
+	if grownSegments != nil {
+		e.log.state.Segments = grownSegments
+	}
+	e.log.state.Generation = next.Generation
+	for i := range reserveFiles {
+		if reserveFiles[i] != nil && missing[i] {
+			e.log.reserveFiles[i] = reserveFiles[i]
+			e.log.state.Reserves[i] = reserves[i]
+		}
+	}
 }
 
-func openEngine(dir string, startupSync func(*os.File) error) (*Engine, error) {
-	return openEngineAuthenticated(dir, startupSync, [32]byte{})
-}
-
-func OpenEngineAuthenticated(dir string, key [32]byte) (*Engine, error) {
-	if key == ([32]byte{}) {
+func OpenEngineAuthenticated(dir string, logID [16]byte, key [32]byte) (*Engine, error) {
+	if logID == ([16]byte{}) || key == ([32]byte{}) {
 		return nil, ErrRaftState
 	}
-	return openEngineAuthenticated(dir, syncActiveData, key)
+	return openEngineAuthenticated(dir, syncActiveData, logID, key)
 }
 
-func openEngineAuthenticated(dir string, startupSync func(*os.File) error, key [32]byte) (*Engine, error) {
-	return openEngineAuthenticatedObserved(dir, startupSync, key, nil)
+func openEngine(dir string, startupSync func(*os.File) error, logID [16]byte, key [32]byte) (*Engine, error) {
+	return openEngineAuthenticated(dir, startupSync, logID, key)
 }
 
-func openEngineAuthenticatedObserved(dir string, startupSync func(*os.File) error, key [32]byte, recoveryIO *recoveryIOCounters) (*Engine, error) {
-	b, err := os.ReadFile(filepath.Join(dir, ManifestName))
+func openEngineAuthenticated(dir string, startupSync func(*os.File) error, logID [16]byte, key [32]byte) (*Engine, error) {
+	return openEngineAuthenticatedObserved(dir, startupSync, logID, key, nil)
+}
+
+func openEngineAuthenticatedObserved(dir string, startupSync func(*os.File) error, logID [16]byte, key [32]byte, recoveryIO *recoveryIOCounters) (*Engine, error) {
+	if logID == ([16]byte{}) || key == ([32]byte{}) {
+		return nil, ErrRaftState
+	}
+	metadata, segments, err := openMetadataStore(dir, logID, key)
 	if err != nil {
 		return nil, err
 	}
-	manifest, err := unmarshalManifest(b)
-	if err != nil {
-		return nil, err
-	}
-	l := &Log{dir: dir, manifest: manifest, authKey: key}
+	state := stateFromMetadata(metadata.slot, segments)
+	l := &Log{dir: dir, state: state, metadata: metadata, authKey: key}
 	if err = l.reconcileRotation(); err != nil {
+		_ = metadata.Close()
 		return nil, err
 	}
-	e := &Engine{log: l, groups: make(map[uint64]*engineGroup), waves: make(map[WaveID][32]byte), syncData: startupSync, writeAt: func(f *os.File, b []byte, off int64) (int, error) { return f.WriteAt(b, off) }, recoveryIO: recoveryIO}
-	if key != ([32]byte{}) {
-		e.authMAC = hmac.New(sha256.New, key[:])
-		e.authKey = key
+	for i := range state.Reserves {
+		if !state.Reserves[i].Ready {
+			continue
+		}
+		file, openErr := os.OpenFile(segmentPath(dir, state.Reserves[i].FileID), os.O_RDWR, 0)
+		var reconcileErr error
+		if openErr == nil {
+			reconcileErr = reconcileTentativeReserve(file, state.Reserves[i], metadata.slot)
+		}
+		if openErr != nil || reconcileErr != nil {
+			if file != nil {
+				_ = file.Close()
+			}
+			state.Reserves[i] = reserveDescriptor{}
+			l.state.Reserves[i] = reserveDescriptor{}
+			metadata.slot.Reserves[i] = reserveDescriptor{}
+			metadata.needsHealing = true
+			continue
+		}
+		l.reserveFiles[i] = file
 	}
+	e := &Engine{log: l, groups: make(map[uint64]*engineGroup), waves: make(map[WaveID]waveState), syncData: startupSync, writeAt: func(f *os.File, b []byte, off int64) (int, error) { return f.WriteAt(b, off) }, recoveryIO: recoveryIO}
+	e.authMAC = hmac.New(sha256.New, key[:])
+	e.authKey = key
 	if err = e.rebuild(); err != nil {
 		_ = l.Close()
 		return nil, err
@@ -1658,39 +2018,25 @@ func openEngineAuthenticatedObserved(dir string, startupSync func(*os.File) erro
 // partial suffix is not an error here: the bounded pending-data recovery path
 // below truncates it back to want.Bytes and seals it again.
 func (e *Engine) promoteCompletePending(want SegmentMeta, previousID uint64, previousHash [32]byte) (SegmentMeta, segmentFooter, sealedIndexHeader, []sealedGroupRun, bool, error) {
-	activePath := filepath.Join(e.log.dir, activeName(want.ID))
-	sealedPath := filepath.Join(e.log.dir, sealedName(want.ID))
-	path, rename := activePath, true
-	meta, footer, err := readUnpublishedSealed(path, e.log.manifest.LogID, previousID, previousHash, e.authKey)
-	if err != nil {
-		path, rename = sealedPath, false
-		meta, footer, err = readUnpublishedSealed(path, e.log.manifest.LogID, previousID, previousHash, e.authKey)
-	}
+	path := segmentPath(e.log.dir, want.FileID)
+	meta, footer, err := readUnpublishedSealed(path, want.FileID, e.log.state.SegmentCapacity, e.log.state.LogID, previousID, previousHash, e.authKey)
 	if err != nil {
 		return SegmentMeta{}, segmentFooter{}, sealedIndexHeader{}, nil, false, nil
 	}
 	if footer.DataBytes != want.Bytes || footer.Records != want.Records || footer.Hash != want.Hash || meta.ID != want.ID || meta.Generation != want.Generation || meta.PreviousHash != want.PreviousHash {
 		return SegmentMeta{}, segmentFooter{}, sealedIndexHeader{}, nil, false, ErrCorrupt
 	}
-	if rename {
-		if err = os.Rename(activePath, sealedPath); err != nil {
-			return SegmentMeta{}, segmentFooter{}, sealedIndexHeader{}, nil, false, err
-		}
-		if err = syncDir(e.log.dir); err != nil {
-			return SegmentMeta{}, segmentFooter{}, sealedIndexHeader{}, nil, false, err
-		}
-		path = sealedPath
-	}
+	meta.FileID = want.FileID
 	file, err := os.Open(path)
 	if err != nil {
 		return SegmentMeta{}, segmentFooter{}, sealedIndexHeader{}, nil, false, err
 	}
-	footer, header, runs, _, readErr := readSealedSealedMetadata(file, meta, e.log.manifest.LogID, previousID, previousHash, e.authKey)
+	footer, header, runs, _, readErr := readSealedSealedMetadata(file, meta, e.log.state.SegmentCapacity, e.log.state.LogID, previousID, previousHash, e.authKey)
 	closeErr := file.Close()
 	if readErr != nil || closeErr != nil {
 		return SegmentMeta{}, segmentFooter{}, sealedIndexHeader{}, nil, false, errors.Join(readErr, closeErr)
 	}
-	next := e.log.manifest
+	next := e.log.state
 	next.Generation++
 	next.Segments = slices.Clone(next.Segments)
 	found := false
@@ -1707,7 +2053,7 @@ func (e *Engine) promoteCompletePending(want SegmentMeta, previousID uint64, pre
 	if err = e.log.publish(next); err != nil {
 		return SegmentMeta{}, segmentFooter{}, sealedIndexHeader{}, nil, false, err
 	}
-	e.log.manifest = next
+	e.log.state = next
 	if e.recoveryIO != nil {
 		e.recoveryIO.pendingPromotions++
 	}
@@ -1715,8 +2061,8 @@ func (e *Engine) promoteCompletePending(want SegmentMeta, previousID uint64, pre
 }
 
 func (e *Engine) rebuild() error {
-	previousID, previousHash := e.log.manifest.AnchorID, e.log.manifest.AnchorHash
-	for _, want := range e.log.manifest.Segments {
+	previousID, previousHash := e.log.state.AnchorID, e.log.state.AnchorHash
+	for _, want := range e.log.state.Segments {
 		if pendingSegment(want) {
 			sealed, footer, sealedHeader, runs, promoted, promoteErr := e.promoteCompletePending(want, previousID, previousHash)
 			if promoteErr != nil {
@@ -1741,26 +2087,14 @@ func (e *Engine) rebuild() error {
 				previousID, previousHash = sealed.ID, sealed.Hash
 				continue
 			}
-			file, err := os.OpenFile(filepath.Join(e.log.dir, activeName(want.ID)), os.O_RDWR, 0)
-			if errors.Is(err, os.ErrNotExist) {
-				meta, footer, sealedErr := readUnpublishedSealed(filepath.Join(e.log.dir, sealedName(want.ID)), e.log.manifest.LogID, previousID, previousHash, e.authKey)
-				if sealedErr != nil || footer.DataBytes != want.Bytes || footer.Records != want.Records || footer.Hash != want.Hash || meta.ID != want.ID {
-					return errors.Join(ErrCorrupt, sealedErr)
-				}
-				if err = os.Rename(filepath.Join(e.log.dir, sealedName(want.ID)), filepath.Join(e.log.dir, activeName(want.ID))); err == nil {
-					err = syncDir(e.log.dir)
-				}
-				if err == nil {
-					file, err = os.OpenFile(filepath.Join(e.log.dir, activeName(want.ID)), os.O_RDWR, 0)
-				}
-			}
+			file, err := os.OpenFile(segmentPath(e.log.dir, want.FileID), os.O_RDWR, 0)
 			if err != nil {
 				return err
 			}
 			headerBytes := make([]byte, segmentHeaderBytes)
 			_, headerErr := file.ReadAt(headerBytes, 0)
 			header, decodeErr := unmarshalSegmentHeader(headerBytes)
-			if headerErr != nil || decodeErr != nil || header.ID != want.ID || header.Generation != want.Generation || header.PreviousID != previousID || header.PreviousHash != previousHash || header.LogID != e.log.manifest.LogID {
+			if headerErr != nil || decodeErr != nil || header.ID != want.ID || header.Generation != want.Generation || header.PreviousID != previousID || header.PreviousHash != previousHash || header.LogID != e.log.state.LogID || header.FileID != want.FileID || header.Capacity != e.log.state.SegmentCapacity {
 				_ = file.Close()
 				return errors.Join(ErrCorrupt, headerErr, decodeErr)
 			}
@@ -1803,17 +2137,17 @@ func (e *Engine) rebuild() error {
 					build.groups = append(build.groups, segmentGroupBuild{GroupID: groupID, Final: groupSealSummary(group)})
 				}
 			}
-			if err = e.finishFrozenSeal(e.log.manifest, want, events, build, nil); err != nil {
+			if err = e.finishFrozenSeal(e.log.state, want, events, build, nil, true); err != nil {
 				return err
 			}
 			previousID, previousHash = want.ID, want.Hash
 			continue
 		}
-		file, err := os.Open(filepath.Join(e.log.dir, sealedName(want.ID)))
+		file, err := os.Open(segmentPath(e.log.dir, want.FileID))
 		if err != nil {
 			return err
 		}
-		footer, header, runs, _, readErr := readSealedSealedMetadata(file, want, e.log.manifest.LogID, previousID, previousHash, e.authKey)
+		footer, header, runs, _, readErr := readSealedSealedMetadata(file, want, e.log.state.SegmentCapacity, e.log.state.LogID, previousID, previousHash, e.authKey)
 		closeErr := file.Close()
 		if readErr != nil {
 			return readErr
@@ -1838,7 +2172,7 @@ func (e *Engine) rebuild() error {
 		e.sequence = header.LastSequence
 		previousID, previousHash = want.ID, want.Hash
 	}
-	if len(e.log.manifest.Segments) != 0 && len(e.readers) == 0 {
+	if len(e.log.state.Segments) != 0 && len(e.readers) == 0 {
 		e.readers = make([]segmentReader, 1)
 	}
 	headerBytes := make([]byte, segmentHeaderBytes)
@@ -1849,15 +2183,18 @@ func (e *Engine) rebuild() error {
 	if err != nil {
 		return err
 	}
-	if header.ID != e.log.manifest.ActiveID || header.Generation != e.log.manifest.ActiveGeneration || header.PreviousID != previousID || header.PreviousHash != previousHash || header.LogID != e.log.manifest.LogID {
+	if header.ID != e.log.state.ActiveID || header.Generation != e.log.state.ActiveGeneration || header.PreviousID != previousID || header.PreviousHash != previousHash || header.LogID != e.log.state.LogID || header.FileID != e.log.state.ActiveFileID || header.Capacity != e.log.state.SegmentCapacity {
 		return ErrCorrupt
 	}
 	stat, err := e.log.active.Stat()
 	if err != nil {
 		return err
 	}
+	if stat.Size() < segmentHeaderBytes || uint64(stat.Size()) > e.log.state.SegmentCapacity {
+		return ErrCorrupt
+	}
 	end := uint64(stat.Size())
-	sealMarker := e.log.manifest.DurableOffset
+	sealMarker := e.log.state.DurableOffset
 	scanEnd := end
 	pendingSeal := sealMarker > segmentHeaderBytes
 	if pendingSeal {
@@ -1867,6 +2204,8 @@ func (e *Engine) rebuild() error {
 		scanEnd = sealMarker
 	}
 	off := uint64(segmentHeaderBytes)
+	recoveryHash := sha256.New()
+	_, _ = recoveryHash.Write(headerBytes)
 	frameHeader := make([]byte, recordHeaderBytes)
 	for off < scanEnd {
 		remaining := scanEnd - off
@@ -1875,6 +2214,9 @@ func (e *Engine) rebuild() error {
 		}
 		if _, err = e.log.active.ReadAt(frameHeader, int64(off)); err != nil {
 			return err
+		}
+		if e.recoveryIO != nil {
+			e.recoveryIO.activeScanBytes += recordHeaderBytes
 		}
 		total, headerErr := inspectWaveHeader(frameHeader)
 		if headerErr != nil {
@@ -1887,6 +2229,9 @@ func (e *Engine) rebuild() error {
 		copy(frame, frameHeader)
 		if _, err = e.log.active.ReadAt(frame[recordHeaderBytes:], int64(off+recordHeaderBytes)); err != nil {
 			return err
+		}
+		if e.recoveryIO != nil {
+			e.recoveryIO.activeScanBytes += total - recordHeaderBytes
 		}
 		id, digest, batches, parseErr := decodeWaveFrameForEngine(frame, e.sequence+1, e)
 		if parseErr != nil {
@@ -1903,6 +2248,7 @@ func (e *Engine) rebuild() error {
 		}
 		e.log.events = append(e.log.events, events...)
 		e.log.records++
+		_, _ = recoveryHash.Write(frame)
 		off += total
 	}
 	if pendingSeal && off != scanEnd {
@@ -1920,24 +2266,21 @@ func (e *Engine) rebuild() error {
 		return err
 	}
 	if pendingSeal {
-		next := e.log.manifest
+		next := e.log.state
 		next.Generation++
 		next.DurableOffset = segmentHeaderBytes
 		if err = e.log.publish(next); err != nil {
 			return err
 		}
-		e.log.manifest = next
+		e.log.state = next
 	}
 	e.log.activeOffset = off
-	e.log.activeHash = sha256.New()
-	if _, err = io.CopyN(e.log.activeHash, io.NewSectionReader(e.log.active, 0, int64(off)), int64(off)); err != nil {
-		return err
-	}
+	e.log.activeHash = recoveryHash
 	return nil
 }
 
 func inspectWaveHeader(header []byte) (uint64, error) {
-	if len(header) != recordHeaderBytes || binary.LittleEndian.Uint16(header[4:6]) != RecordWave || binary.LittleEndian.Uint16(header[6:8]) != FormatVersion || binary.LittleEndian.Uint32(header[36:40]) != crc32.Checksum(header[:36], crcTable) {
+	if len(header) != recordHeaderBytes || binary.LittleEndian.Uint16(header[4:6]) != RecordWave || binary.LittleEndian.Uint16(header[6:8]) != canonicalFormatMarker || binary.LittleEndian.Uint32(header[36:40]) != crc32.Checksum(header[:36], crcTable) {
 		return 0, ErrCorrupt
 	}
 	total := uint64(binary.LittleEndian.Uint32(header[:4]))
@@ -2175,6 +2518,7 @@ func (e *Engine) eventsForDecoded(batches []ReadyBatch, frameOffset, sequence ui
 		if _, err := validateBatch(g, batch); err != nil {
 			return nil, err
 		}
+		events = append(events, segmentEvent{Kind: eventWaveRef, GroupID: batch.GroupID, Index: sequence, Reference: id, Digest: digest})
 		if batch.NodeIncarnation != 0 {
 			events = append(events, segmentEvent{Kind: eventReadyState, GroupID: batch.GroupID, Incarnation: batch.NodeIncarnation, ReadyID: batch.ReadyID, ReadyDigest: batch.ReadyDigest, Reference: id})
 		}
@@ -2213,18 +2557,18 @@ func (e *Engine) DeepVerify() error {
 	if err := e.log.usable(); err != nil {
 		return err
 	}
-	verifier := &Engine{log: e.log, groups: make(map[uint64]*engineGroup), waves: make(map[WaveID][32]byte), authKey: e.authKey}
+	verifier := &Engine{log: e.log, groups: make(map[uint64]*engineGroup), waves: make(map[WaveID]waveState), authKey: e.authKey}
 	if e.authKey != ([32]byte{}) {
 		verifier.authMAC = hmac.New(sha256.New, e.authKey[:])
 	}
-	previousID, previousHash := e.log.manifest.AnchorID, e.log.manifest.AnchorHash
-	for _, want := range e.log.manifest.Segments {
-		path := filepath.Join(e.log.dir, sealedName(want.ID))
+	previousID, previousHash := e.log.state.AnchorID, e.log.state.AnchorHash
+	for _, want := range e.log.state.Segments {
+		path := segmentPath(e.log.dir, want.FileID)
 		f, err := os.Open(path)
 		if err != nil {
 			return err
 		}
-		footer, header, runs, _, err := readSealedSealedMetadata(f, want, e.log.manifest.LogID, previousID, previousHash, e.authKey)
+		footer, header, runs, _, err := readSealedSealedMetadata(f, want, e.log.state.SegmentCapacity, e.log.state.LogID, previousID, previousHash, e.authKey)
 		if err != nil {
 			_ = f.Close()
 			return err
@@ -2253,7 +2597,7 @@ func (e *Engine) DeepVerify() error {
 		}
 		previousID, previousHash = want.ID, want.Hash
 	}
-	activeEvents, records, err := verifyWaveFrames(e.log.active, e.log.activeOffset, e.log.manifest.ActiveID, verifier)
+	activeEvents, records, err := verifyWaveFrames(e.log.active, e.log.activeOffset, e.log.state.ActiveID, verifier)
 	if err != nil {
 		return err
 	}
