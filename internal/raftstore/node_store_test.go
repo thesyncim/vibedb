@@ -128,6 +128,13 @@ func TestNodeStoreMultiGroupRetryAndReopen(t *testing.T) {
 	if err = store.PersistWave([]NodeReady{changed}); !errors.Is(err, ErrRetryConflict) {
 		t.Fatalf("changed duplicate = %v", err)
 	}
+	if err = store.engine.Rotate(nil); err != nil {
+		t.Fatal(err)
+	}
+	third := NodeReady{GroupID: 20, Batch: raftmodel.PersistBatch{NodeIncarnation: 1, ReadyID: 3, Entries: []*pb.Entry{typedEntry(4, 3, pb.EntryNormal, "after-rotate")}, HardState: hard(3, 4)}}
+	if err = store.PersistWave([]NodeReady{third}); err != nil {
+		t.Fatalf("persist after rotate: %v", err)
+	}
 	if err = store.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -140,12 +147,112 @@ func TestNodeStoreMultiGroupRetryAndReopen(t *testing.T) {
 	if err != nil || len(entries) != 1 || entries[0].GetType() != pb.EntryConfChange || !bytes.Equal(entries[0].GetData(), []byte("conf")) {
 		t.Fatalf("group 10 entries = %#v, %v", entries, err)
 	}
-	entries, err = reopened.Group(20).Entries(2, 4, ^uint64(0))
-	if err != nil || len(entries) != 2 || entries[0].GetType() != pb.EntryConfChangeV2 || !bytes.Equal(entries[1].GetData(), []byte("next")) {
+	entries, err = reopened.Group(20).Entries(2, 5, ^uint64(0))
+	if err != nil || len(entries) != 3 || entries[0].GetType() != pb.EntryConfChangeV2 || !bytes.Equal(entries[1].GetData(), []byte("next")) || !bytes.Equal(entries[2].GetData(), []byte("after-rotate")) {
 		t.Fatalf("group 20 entries = %#v, %v", entries, err)
 	}
-	if hardState, confState, err := reopened.Group(20).InitialState(); err != nil || hardState.GetCommit() != 3 || len(confState.GetVoters()) != 1 {
+	if hardState, confState, err := reopened.Group(20).InitialState(); err != nil || hardState.GetCommit() != 4 || len(confState.GetVoters()) != 1 {
 		t.Fatalf("initial state = %#v %#v, %v", hardState, confState, err)
+	}
+}
+
+func TestNodeStoreSharedBoundedExtentsRotateReopen(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "node")
+	options := NodeStoreOptions{Store: testOptions(), FrameBytes: 1 << 20, Events: 64, WaveIDs: 16, EntriesPerGroup: 16, CachedSegments: 2}
+	store, err := CreateNodeStore(dir, testIdentity(), testKey(), []NodeBootstrap{{GroupID: 10, Snapshot: nodeSnapshot(10, 1, 1)}, {GroupID: 20, Snapshot: nodeSnapshot(20, 1, 1)}}, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.BeginIncarnations([]uint64{10, 20}); err != nil {
+		t.Fatal(err)
+	}
+	a, b, c := string(bytes.Repeat([]byte{'a'}, 10<<10)), string(bytes.Repeat([]byte{'b'}, 10<<10)), string(bytes.Repeat([]byte{'c'}, 20<<10))
+	ready := []NodeReady{
+		{GroupID: 10, Batch: raftmodel.PersistBatch{NodeIncarnation: 1, ReadyID: 1, Entries: []*pb.Entry{typedEntry(2, 2, pb.EntryNormal, a)}, HardState: hard(2, 2)}},
+		{GroupID: 20, Batch: raftmodel.PersistBatch{NodeIncarnation: 1, ReadyID: 1, Entries: []*pb.Entry{typedEntry(2, 2, pb.EntryNormal, b), typedEntry(3, 2, pb.EntryNormal, c)}, HardState: hard(2, 3)}},
+	}
+	if err = store.PersistWave(ready); err != nil {
+		t.Fatal(err)
+	}
+	first, _, _, _, err := store.engine.LookupExact(10, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shared, _, _, _, err := store.engine.LookupExact(20, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, _, _, _, err := store.engine.LookupExact(20, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Offset != shared.Offset || first.ExtentID != shared.ExtentID || second.Offset == first.Offset || second.ExtentID <= first.ExtentID || first.Bytes > nodeDataExtentBytes+uint64(store.crypto.aead.Overhead()) || second.Bytes > nodeDataExtentBytes+uint64(store.crypto.aead.Overhead()) {
+		t.Fatalf("extent geometry first=%+v shared=%+v second=%+v", first, shared, second)
+	}
+	if err = store.engine.Rotate(nil); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = OpenNodeStore(dir, testIdentity(), testKey(), options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	for _, tc := range []struct {
+		group, index uint64
+		want         string
+	}{{10, 2, a}, {20, 2, b}, {20, 3, c}} {
+		entries, readErr := store.Group(tc.group).Entries(tc.index, tc.index+1, ^uint64(0))
+		if readErr != nil || len(entries) != 1 || string(entries[0].GetData()) != tc.want {
+			t.Fatalf("group=%d index=%d entries=%d err=%v", tc.group, tc.index, len(entries), readErr)
+		}
+	}
+	firstIndex, err := store.Group(20).FirstIndex()
+	if err != nil || firstIndex != 2 {
+		t.Fatalf("first index=%d err=%v", firstIndex, err)
+	}
+	lastIndex, err := store.Group(20).LastIndex()
+	if err != nil || lastIndex != 3 {
+		t.Fatalf("last index=%d err=%v", lastIndex, err)
+	}
+}
+
+func TestNodeStoreEmptyAndOversizeExtentPacking(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "node")
+	options := NodeStoreOptions{Store: testOptions(), FrameBytes: 1 << 20, Events: 32, WaveIDs: 16, EntriesPerGroup: 16, CachedSegments: 1}
+	store, err := CreateNodeStore(dir, testIdentity(), testKey(), []NodeBootstrap{{GroupID: 10, Snapshot: nodeSnapshot(10, 1, 1)}, {GroupID: 20, Snapshot: nodeSnapshot(20, 1, 1)}}, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err = store.BeginIncarnations([]uint64{10, 20}); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	store.persistWaveTest = func(wave seglog.Wave) error {
+		calls++
+		if calls == 1 && (len(wave.Blob) != 0 || wave.Batches[0].Entries[0].ExtentBytes != 0) {
+			t.Fatalf("all-empty wave paid an extent: %+v blob=%d", wave.Batches[0].Entries[0], len(wave.Blob))
+		}
+		if calls == 2 {
+			want := 40<<10 + store.crypto.aead.Overhead()
+			if len(wave.Blob) != want || wave.Batches[0].Entries[0].ExtentBytes != uint64(want) || wave.Batches[0].Entries[1].ExtentBytes != uint64(want) || wave.Batches[1].Entries[0].ExtentBytes != 0 {
+				t.Fatalf("oversize/empty packing blob=%d batches=%+v", len(wave.Blob), wave.Batches)
+			}
+		}
+		return store.engine.PersistWave(wave)
+	}
+	if err = store.PersistWave([]NodeReady{{GroupID: 10, Batch: raftmodel.PersistBatch{NodeIncarnation: 1, ReadyID: 1, Entries: []*pb.Entry{typedEntry(2, 2, pb.EntryNormal, "")}, HardState: hard(2, 2)}}}); err != nil {
+		t.Fatal(err)
+	}
+	large := string(bytes.Repeat([]byte{'x'}, 40<<10))
+	if err = store.PersistWave([]NodeReady{
+		{GroupID: 10, Batch: raftmodel.PersistBatch{NodeIncarnation: 1, ReadyID: 2, Entries: []*pb.Entry{typedEntry(3, 2, pb.EntryNormal, large), typedEntry(4, 2, pb.EntryNormal, "")}, HardState: hard(2, 4)}},
+		{GroupID: 20, Batch: raftmodel.PersistBatch{NodeIncarnation: 1, ReadyID: 1, Entries: []*pb.Entry{typedEntry(2, 2, pb.EntryNormal, "")}, HardState: hard(2, 2)}},
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
 

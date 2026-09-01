@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"sync"
 
 	pb "go.etcd.io/raft/v3/raftpb"
 )
@@ -26,11 +27,12 @@ const engineWaveGroup = ^uint64(0)
 type WaveID [16]byte
 
 type Entry struct {
-	Index, Term           uint64
-	Type                  pb.EntryType
-	Data                  []byte
-	DataOffset, DataBytes uint64
-	dataOffset            uint64
+	Index, Term                         uint64
+	Type                                pb.EntryType
+	Data                                []byte
+	ExtentID, ExtentOffset, ExtentBytes uint64
+	DataOffset, DataBytes               uint64
+	dataOffset                          uint64
 }
 type HardState struct{ Term, Vote, Commit uint64 }
 type Checkpoint struct {
@@ -47,11 +49,13 @@ type ReadyBatch struct {
 	Hard                        *HardState
 	TruncateIndex, TruncateTerm uint64
 	Checkpoint                  *Checkpoint
-	Blob                        []byte
 }
 type Wave struct {
 	ID      WaveID
 	Batches []ReadyBatch
+	// Blob is the wave-shared sequence of independently authenticated,
+	// entry-aligned extents. Entry extent offsets are relative to Blob.
+	Blob []byte
 }
 
 type EntryLocation struct {
@@ -59,6 +63,7 @@ type EntryLocation struct {
 	Type                                  pb.EntryType
 	DataOffset, DataBytes                 uint64
 	BatchID                               WaveID
+	ExtentID                              uint64
 }
 type GroupState struct {
 	Hard                        HardState
@@ -76,36 +81,153 @@ type GroupSummary struct {
 	ReadyDigest              [16]byte
 }
 
-type engineGroup struct{ GroupState }
+type GroupMetadata struct {
+	Hard                        HardState
+	TruncateIndex, TruncateTerm uint64
+	Checkpoint                  Checkpoint
+	FirstIndex, LastIndex       uint64
+	NodeIncarnation, ReadyID    uint64
+	ReadyDigest                 [16]byte
+}
+
+type engineGroup struct {
+	GroupState
+	sealed              []sealedRunRef
+	lastIndex, lastTerm uint64
+	buildSegmentID      uint64
+	buildSlot           int
+	owner               *Engine
+	id                  uint64
+}
 type segmentReader struct {
-	id   uint64
-	file *os.File
+	id     uint64
+	file   *os.File
+	routes *LazyRouteReader
+}
+
+type sealRequest struct {
+	base    Manifest
+	pending SegmentMeta
+	events  []segmentEvent
+	hook    func(RotationPhase) error
+	build   *segmentBuildArena
+}
+
+type segmentGroupBuild struct {
+	GroupID uint64
+	Final   sealedRunSummary
+}
+
+type segmentBuildArena struct {
+	groups       []segmentGroupBuild
+	lastSequence uint64
+}
+
+func groupSealSummary(group *engineGroup) sealedRunSummary {
+	lastIndex, lastTerm := durableLast(group), group.lastTerm
+	if len(group.Entries) != 0 {
+		lastTerm = group.Entries[len(group.Entries)-1].Term
+	} else if lastIndex == group.Checkpoint.Index {
+		lastTerm = group.Checkpoint.Term
+	} else if lastIndex == group.TruncateIndex {
+		lastTerm = group.TruncateTerm
+	}
+	return sealedRunSummary{LastIndex: lastIndex, LastTerm: lastTerm, Hard: group.Hard, TruncateIndex: group.TruncateIndex, TruncateTerm: group.TruncateTerm, Checkpoint: group.Checkpoint, NodeIncarnation: group.NodeIncarnation, ReadyID: group.ReadyID, ReadyDigest: group.ReadyDigest, ReadyWaveID: group.ReadyWaveID}
+}
+
+func (arena *segmentBuildArena) touch(group *engineGroup, segmentID uint64) bool {
+	if group.buildSegmentID == segmentID {
+		return group.buildSlot >= 0 && group.buildSlot < len(arena.groups)
+	}
+	if len(arena.groups) == cap(arena.groups) {
+		return false
+	}
+	group.buildSegmentID, group.buildSlot = segmentID, len(arena.groups)
+	arena.groups = append(arena.groups, segmentGroupBuild{GroupID: group.id, Final: groupSealSummary(group)})
+	return true
+}
+
+func (arena *segmentBuildArena) update(group *engineGroup, segmentID uint64) bool {
+	if group.buildSegmentID != segmentID || group.buildSlot < 0 || group.buildSlot >= len(arena.groups) {
+		return false
+	}
+	arena.groups[group.buildSlot].Final = groupSealSummary(group)
+	return true
+}
+
+func (arena *segmentBuildArena) clear() {
+	arena.groups = arena.groups[:0]
+	arena.lastSequence = 0
 }
 
 type Engine struct {
-	log          *Log
-	groups       map[uint64]*engineGroup
-	waves        map[WaveID][32]byte
-	waveLimit    int
-	sequence     uint64
-	frameBuf     []byte
-	eventScratch []segmentEvent
-	syncData     func(*os.File) error
-	writeAt      func(*os.File, []byte, int64) (int, error)
-	readers      []segmentReader
-	readerNext   int
-	authMAC      hash.Hash
-	authKey      [32]byte
-	authContext  [40]byte
-	authSum      [32]byte
+	writeMu             sync.Mutex
+	sealRequests        chan sealRequest
+	sealResults         chan error
+	sealStop            chan struct{}
+	sealerDone          chan struct{}
+	sealPending         bool
+	activeBuild         *segmentBuildArena
+	spareBuild          *segmentBuildArena
+	sealBuildHookTest   func()
+	sealOpenHookTest    func(string)
+	log                 *Log
+	groups              map[uint64]*engineGroup
+	waves               map[WaveID][32]byte
+	waveLimit           int
+	sequence            uint64
+	frameBuf            []byte
+	eventScratch        []segmentEvent
+	syncData            func(*os.File) error
+	writeAt             func(*os.File, []byte, int64) (int, error)
+	readers             []segmentReader
+	readerNext          int
+	authMAC             hash.Hash
+	authKey             [32]byte
+	authContext         [40]byte
+	authSum             [32]byte
+	sealSummaryOverride map[uint64]sealedRunSummary
+	recoveryIO          *recoveryIOCounters
+}
+
+type recoveryIOCounters struct {
+	pendingPayloadBytes uint64
+	pendingSealBytes    uint64
+	pendingPromotions   uint64
 }
 
 func CreateEngine(dir string) (*Engine, error) {
-	l, err := Create(dir)
+	l, err := createLog(dir)
 	if err != nil {
 		return nil, err
 	}
-	return &Engine{log: l, groups: make(map[uint64]*engineGroup), waves: make(map[WaveID][32]byte), syncData: syncActiveData, writeAt: func(f *os.File, b []byte, off int64) (int, error) { return f.WriteAt(b, off) }}, nil
+	e := &Engine{log: l, groups: make(map[uint64]*engineGroup), waves: make(map[WaveID][32]byte), syncData: syncActiveData, writeAt: func(f *os.File, b []byte, off int64) (int, error) { return f.WriteAt(b, off) }}
+	e.startSealer()
+	return e, nil
+}
+
+func (e *Engine) startSealer() {
+	e.sealRequests = make(chan sealRequest, 1)
+	e.sealResults = make(chan error, 1)
+	e.sealStop = make(chan struct{})
+	e.sealerDone = make(chan struct{})
+	go func() {
+		defer close(e.sealerDone)
+		for {
+			select {
+			case request := <-e.sealRequests:
+				err := e.finishFrozenSeal(request.base, request.pending, request.events, request.build, request.hook)
+				if err != nil {
+					e.writeMu.Lock()
+					e.log.poison(err)
+					e.writeMu.Unlock()
+				}
+				e.sealResults <- err
+			case <-e.sealStop:
+				return
+			}
+		}
+	}()
 }
 
 func (e *Engine) SetAuthenticationKey(key [32]byte) error {
@@ -134,6 +256,17 @@ func (e *Engine) waveDigest(payload []byte, sequence uint64, id WaveID) [32]byte
 
 func (e *Engine) Close() error {
 	var err error
+	if e.sealPending {
+		err = <-e.sealResults
+		e.sealPending = false
+	}
+	if e.sealStop != nil {
+		close(e.sealStop)
+		<-e.sealerDone
+		e.sealStop = nil
+	}
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
 	for i := range e.readers {
 		if e.readers[i].file != nil {
 			err = errors.Join(err, e.readers[i].file.Close())
@@ -141,6 +274,18 @@ func (e *Engine) Close() error {
 		}
 	}
 	return errors.Join(err, e.log.Close())
+}
+
+// WaitSeal is a control-plane fence for rotation tests, shutdown, and callers
+// that need the frozen segment published before reclamation. PersistWave does
+// not wait for it.
+func (e *Engine) WaitSeal() error {
+	if !e.sealPending {
+		return nil
+	}
+	err := <-e.sealResults
+	e.sealPending = false
+	return err
 }
 
 // ReserveReaders fixes the maximum number of retained sealed descriptors.
@@ -195,7 +340,12 @@ func (e *Engine) PrepareSegment(segmentID uint64) error {
 	if e.readers[slot].file != nil {
 		_ = e.readers[slot].file.Close()
 	}
-	e.readers[slot] = segmentReader{id: segmentID, file: f}
+	routes, err := newLazyRouteReader(f, e.authKey, e.log.manifest.LogID, segmentID, 4, true)
+	if err != nil {
+		_ = f.Close()
+		return err
+	}
+	e.readers[slot] = segmentReader{id: segmentID, file: f, routes: routes}
 	return nil
 }
 
@@ -248,6 +398,35 @@ func (e *Engine) Reserve(frameBytes, events, waveIDs int) error {
 			return err
 		}
 	}
+	if e.activeBuild == nil || cap(e.activeBuild.groups) < events {
+		// Rebuilding the active arena must also move the per-group slot tags.
+		// A tag points into one concrete arena, so retaining it while replacing
+		// that arena would silently omit the group from the frozen summary.
+		for i := range e.log.events {
+			if e.log.events[i].GroupID == engineWaveGroup {
+				continue
+			}
+			if group := e.groups[e.log.events[i].GroupID]; group != nil && group.buildSegmentID == e.log.manifest.ActiveID {
+				group.buildSegmentID = 0
+				group.buildSlot = 0
+			}
+		}
+		e.activeBuild = &segmentBuildArena{groups: make([]segmentGroupBuild, 0, events)}
+		for i := range e.log.events {
+			if e.log.events[i].GroupID == engineWaveGroup {
+				continue
+			}
+			group := e.groups[e.log.events[i].GroupID]
+			if group != nil && group.buildSegmentID != e.log.manifest.ActiveID {
+				if !e.activeBuild.touch(group, e.log.manifest.ActiveID) {
+					return ErrBounds
+				}
+			}
+		}
+	}
+	if e.spareBuild == nil || cap(e.spareBuild.groups) < events {
+		e.spareBuild = &segmentBuildArena{groups: make([]segmentGroupBuild, 0, events)}
+	}
 	if waveIDs > len(e.waves) {
 		replacement := make(map[WaveID][32]byte, waveIDs)
 		for id, digest := range e.waves {
@@ -268,7 +447,7 @@ func (e *Engine) ReserveGroup(group uint64, entries int) error {
 	}
 	g := e.groups[group]
 	if g == nil {
-		e.groups[group] = &engineGroup{GroupState: GroupState{Entries: make([]EntryLocation, 0, entries)}}
+		e.groups[group] = &engineGroup{GroupState: GroupState{Entries: make([]EntryLocation, 0, entries)}, owner: e, id: group}
 		return nil
 	}
 	if entries < len(g.Entries) {
@@ -291,7 +470,28 @@ func (e *Engine) Group(group uint64) (GroupState, bool) {
 		return GroupState{}, false
 	}
 	result := g.GroupState
-	result.Entries = slices.Clone(result.Entries)
+	sealedEntries := 0
+	for i := range g.sealed {
+		sealedEntries += int(g.sealed[i].Last - g.sealed[i].First + 1)
+	}
+	result.Entries = make([]EntryLocation, 0, sealedEntries+len(g.Entries))
+	for i := range g.sealed {
+		run := g.sealed[i]
+		for index := run.First; index <= run.Last; index++ {
+			location, _, compacted, found := e.Lookup(group, index)
+			if compacted {
+				continue
+			}
+			if !found {
+				return GroupState{}, false
+			}
+			result.Entries = append(result.Entries, location)
+			if index == ^uint64(0) {
+				break
+			}
+		}
+	}
+	result.Entries = append(result.Entries, g.Entries...)
 	return result, true
 }
 
@@ -304,11 +504,20 @@ func (e *Engine) Summary(group uint64) (GroupSummary, bool) {
 	if !ok {
 		return GroupSummary{}, false
 	}
-	last := g.Checkpoint.Index
-	if len(g.Entries) != 0 {
-		last = g.Entries[len(g.Entries)-1].Index
-	}
+	last := durableLast(g)
 	return GroupSummary{LastIndex: last, NodeIncarnation: g.NodeIncarnation, ReadyID: g.ReadyID, ReadyDigest: g.ReadyDigest}, true
+}
+
+func (e *Engine) Metadata(group uint64) (GroupMetadata, bool) {
+	if e == nil || e.log.usable() != nil {
+		return GroupMetadata{}, false
+	}
+	g, ok := e.groups[group]
+	if !ok {
+		return GroupMetadata{}, false
+	}
+	base := max(g.Checkpoint.Index, g.TruncateIndex)
+	return GroupMetadata{Hard: g.Hard, TruncateIndex: g.TruncateIndex, TruncateTerm: g.TruncateTerm, Checkpoint: g.Checkpoint, FirstIndex: base + 1, LastIndex: durableLast(g), NodeIncarnation: g.NodeIncarnation, ReadyID: g.ReadyID, ReadyDigest: g.ReadyDigest}, true
 }
 
 // GroupIDs returns recovered group IDs in canonical order. The allocation is
@@ -325,26 +534,59 @@ func (e *Engine) GroupIDs() []uint64 {
 // Lookup returns one immutable location without cloning the group's index.
 // compacted distinguishes a missing historical index from an unavailable one.
 func (e *Engine) Lookup(group, index uint64) (location EntryLocation, term uint64, compacted, ok bool) {
-	if e == nil || e.log.usable() != nil {
+	location, term, compacted, ok, err := e.LookupExact(group, index)
+	if err != nil {
+		_ = e.log.poison(err)
 		return EntryLocation{}, 0, false, false
+	}
+	return location, term, compacted, ok
+}
+
+func (e *Engine) LookupExact(group, index uint64) (location EntryLocation, term uint64, compacted, ok bool, err error) {
+	if e == nil || e.log.usable() != nil {
+		return EntryLocation{}, 0, false, false, ErrPoisoned
 	}
 	g, exists := e.groups[group]
 	if !exists {
-		return EntryLocation{}, 0, false, false
+		return EntryLocation{}, 0, false, false, nil
 	}
-	base := g.Checkpoint.Index
+	base := max(g.Checkpoint.Index, g.TruncateIndex)
 	if index < base {
-		return EntryLocation{}, 0, true, false
+		return EntryLocation{}, 0, true, false, nil
 	}
 	if index == base {
-		return EntryLocation{}, g.Checkpoint.Term, false, true
+		baseTerm := g.TruncateTerm
+		if g.Checkpoint.Index == base {
+			baseTerm = g.Checkpoint.Term
+		}
+		return EntryLocation{}, baseTerm, false, true, nil
 	}
-	position := index - base - 1
-	if position >= uint64(len(g.Entries)) {
-		return EntryLocation{}, 0, false, false
+	position := sort.Search(len(g.Entries), func(i int) bool { return g.Entries[i].Index >= index })
+	if position < len(g.Entries) && g.Entries[position].Index == index {
+		location = g.Entries[position]
+		return location, location.Term, false, true, nil
 	}
-	location = g.Entries[position]
-	return location, location.Term, false, true
+	for i := len(g.sealed) - 1; i >= 0; i-- {
+		run := g.sealed[i]
+		if index < run.First || index > run.Last {
+			continue
+		}
+		if err := e.PrepareSegment(run.SegmentID); err != nil {
+			return EntryLocation{}, 0, false, false, err
+		}
+		for slot := range e.readers {
+			reader := &e.readers[slot]
+			if reader.id != run.SegmentID || reader.routes == nil {
+				continue
+			}
+			route, err := reader.routes.Point(run, index)
+			if err != nil {
+				return EntryLocation{}, 0, false, false, err
+			}
+			return EntryLocation{SegmentID: run.SegmentID, Offset: route.ExtentOffset, Bytes: route.ExtentBytes, Index: index, Term: route.Term, Type: pb.EntryType(route.Type), DataOffset: route.DataOffset, DataBytes: route.DataBytes, BatchID: route.BatchID, ExtentID: route.ExtentID}, route.Term, false, true, nil
+		}
+	}
+	return EntryLocation{}, 0, false, false, nil
 }
 
 func (e *Engine) Sequence() uint64 {
@@ -380,6 +622,8 @@ func (e *Engine) SetDataSyncForTesting(sync func(*os.File) error) { e.syncData =
 // nonzero WaveIDs and strictly increasing GroupIDs within each wave. Success is
 // the fence before dependent messages or Ready completion may be published.
 func (e *Engine) PersistWave(w Wave) error {
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
 	if err := e.log.usable(); err != nil {
 		return err
 	}
@@ -444,8 +688,23 @@ func (e *Engine) prepareWave(w Wave, validateState bool) ([]byte, [32]byte, []se
 	if err != nil {
 		return nil, [32]byte{}, nil, err
 	}
-	if encodedBytes > cap(e.frameBuf) || eventCount > cap(e.eventScratch) {
+	if validateState && (e.log == nil || e.activeBuild == nil) {
 		return nil, [32]byte{}, nil, ErrBounds
+	}
+	if encodedBytes > cap(e.frameBuf) || eventCount > cap(e.eventScratch) || validateState && eventCount > cap(e.log.events)-len(e.log.events) {
+		return nil, [32]byte{}, nil, ErrBounds
+	}
+	if validateState {
+		missing := 0
+		for i := range w.Batches {
+			group := e.groups[w.Batches[i].GroupID]
+			if group == nil || group.buildSegmentID != e.log.manifest.ActiveID {
+				missing++
+			}
+		}
+		if missing > cap(e.activeBuild.groups)-len(e.activeBuild.groups) {
+			return nil, [32]byte{}, nil, ErrBounds
+		}
 	}
 	e.frameBuf = e.frameBuf[:72]
 	clear(e.frameBuf)
@@ -510,7 +769,11 @@ func (e *Engine) prepareWave(w Wave, validateState bool) ([]byte, [32]byte, []se
 		if batch.ReplaceFrom != 0 {
 			e.frameBuf = appendUvarint(e.frameBuf, batch.ReplaceFrom)
 			if validateState {
-				e.eventScratch = append(e.eventScratch, segmentEvent{Kind: RecordTruncateSuffix, GroupID: batch.GroupID, Index: batch.ReplaceFrom, Term: predecessorTerm(group, batch.ReplaceFrom)})
+				predecessor, termErr := predecessorTerm(group, batch.ReplaceFrom)
+				if termErr != nil {
+					return nil, [32]byte{}, nil, termErr
+				}
+				e.eventScratch = append(e.eventScratch, segmentEvent{Kind: RecordTruncateSuffix, GroupID: batch.GroupID, Index: batch.ReplaceFrom, Term: predecessor})
 			}
 		}
 		if batch.TruncateIndex != 0 {
@@ -529,12 +792,18 @@ func (e *Engine) prepareWave(w Wave, validateState bool) ([]byte, [32]byte, []se
 		}
 		e.frameBuf = appendUvarint(e.frameBuf, uint64(len(batch.Entries)))
 		for _, entry := range batch.Entries {
+			if flags&batchBlob != 0 && (entry.ExtentOffset > uint64(len(w.Blob)) || entry.ExtentBytes > uint64(len(w.Blob))-entry.ExtentOffset) {
+				return nil, [32]byte{}, nil, ErrBounds
+			}
 			e.frameBuf = appendUvarint(e.frameBuf, entry.Index)
 			e.frameBuf = appendUvarint(e.frameBuf, entry.Term)
 			if flags&batchTypes != 0 {
 				e.frameBuf = appendUvarint(e.frameBuf, uint64(entry.Type))
 			}
 			if flags&batchBlob != 0 {
+				e.frameBuf = appendUvarint(e.frameBuf, entry.ExtentID)
+				e.frameBuf = appendUvarint(e.frameBuf, entry.ExtentOffset)
+				e.frameBuf = appendUvarint(e.frameBuf, entry.ExtentBytes)
 				e.frameBuf = appendUvarint(e.frameBuf, entry.DataOffset)
 				e.frameBuf = appendUvarint(e.frameBuf, entry.DataBytes)
 			} else {
@@ -551,14 +820,9 @@ func (e *Engine) prepareWave(w Wave, validateState bool) ([]byte, [32]byte, []se
 				e.eventScratch = append(e.eventScratch, segmentEvent{Kind: eventKindForType(entry.Type), GroupID: batch.GroupID, Index: entry.Index, Term: entry.Term, Offset: dataOffset, Bytes: uint64(len(entry.Data))})
 			}
 		}
-		if flags&batchBlob != 0 {
-			e.frameBuf = appendUvarint(e.frameBuf, uint64(len(batch.Blob)))
-			blobOffset := uint64(len(e.frameBuf))
-			e.frameBuf = append(e.frameBuf, batch.Blob...)
-			if validateState {
-				for _, entry := range batch.Entries {
-					e.eventScratch = append(e.eventScratch, segmentEvent{Kind: blobEventKind(entry.Type), GroupID: batch.GroupID, Index: entry.Index, Term: entry.Term, Offset: blobOffset, Bytes: uint64(len(batch.Blob)), DataOffset: entry.DataOffset, DataBytes: entry.DataBytes})
-				}
+		if validateState && flags&batchBlob != 0 {
+			for _, entry := range batch.Entries {
+				e.eventScratch = append(e.eventScratch, segmentEvent{Kind: blobEventKind(entry.Type), GroupID: batch.GroupID, Index: entry.Index, Term: entry.Term, Offset: entry.ExtentOffset, Bytes: entry.ExtentBytes, DataOffset: entry.DataOffset, DataBytes: entry.DataBytes, ReadyID: entry.ExtentID, Reference: w.ID})
 			}
 		}
 		if validateState && batch.TruncateIndex != 0 {
@@ -572,8 +836,25 @@ func (e *Engine) prepareWave(w Wave, validateState bool) ([]byte, [32]byte, []se
 		}
 		previousGroup = batch.GroupID
 	}
+	e.frameBuf = appendUvarint(e.frameBuf, uint64(len(w.Blob)))
+	blobOffset := uint64(len(e.frameBuf))
+	e.frameBuf = append(e.frameBuf, w.Blob...)
+	if validateState {
+		for i := range e.eventScratch {
+			if isBlobEvent(e.eventScratch[i].Kind) {
+				e.eventScratch[i].Offset += blobOffset
+			}
+		}
+	}
 	if len(e.frameBuf) > maxRecordBytes || len(e.frameBuf) > cap(e.frameBuf) {
 		return nil, [32]byte{}, nil, ErrBounds
+	}
+	if validateState {
+		for i := range w.Batches {
+			if !e.activeBuild.touch(e.groups[w.Batches[i].GroupID], e.log.manifest.ActiveID) {
+				return nil, [32]byte{}, nil, ErrBounds
+			}
+		}
 	}
 	digest := e.waveDigest(e.frameBuf[72:], e.sequence+1, w.ID)
 	copy(e.frameBuf[40:72], digest[:])
@@ -586,6 +867,9 @@ func (e *Engine) prepareWave(w Wave, validateState bool) ([]byte, [32]byte, []se
 // waveSize is deliberately run before the encoder mutates its reusable slices.
 // Insufficient reservations therefore fail without a hidden growth allocation.
 func waveSize(w Wave) (int, int, error) {
+	if err := validateWaveExtents(w.Batches, uint64(len(w.Blob))); err != nil {
+		return 0, 0, err
+	}
 	bytes, events := 72+uvarintBytes(uint64(len(w.Batches))), 1
 	previousGroup := uint64(0)
 	for i := range w.Batches {
@@ -619,7 +903,7 @@ func waveSize(w Wave) (int, int, error) {
 			events++
 		}
 		hasTypes := batchFlags(b)&batchTypes != 0
-		hasBlob := len(b.Blob) != 0
+		hasBlob := batchFlags(b)&batchBlob != 0
 		for j := range b.Entries {
 			entry := &b.Entries[j]
 			if len(entry.Data) > maxRecordBytes || bytes > maxRecordBytes-len(entry.Data) {
@@ -627,7 +911,7 @@ func waveSize(w Wave) (int, int, error) {
 			}
 			bytes += uvarintBytes(entry.Index) + uvarintBytes(entry.Term)
 			if hasBlob {
-				bytes += uvarintBytes(entry.DataOffset) + uvarintBytes(entry.DataBytes)
+				bytes += uvarintBytes(entry.ExtentID) + uvarintBytes(entry.ExtentOffset) + uvarintBytes(entry.ExtentBytes) + uvarintBytes(entry.DataOffset) + uvarintBytes(entry.DataBytes)
 			} else {
 				bytes += uvarintBytes(uint64(len(entry.Data))) + len(entry.Data)
 			}
@@ -636,18 +920,63 @@ func waveSize(w Wave) (int, int, error) {
 			}
 			events++
 		}
-		if hasBlob {
-			if len(b.Blob) > maxRecordBytes || bytes > maxRecordBytes-len(b.Blob) {
-				return 0, 0, ErrBounds
-			}
-			bytes += uvarintBytes(uint64(len(b.Blob))) + len(b.Blob)
-		}
 		previousGroup = b.GroupID
 	}
+	if len(w.Blob) > maxRecordBytes || bytes > maxRecordBytes-len(w.Blob) {
+		return 0, 0, ErrBounds
+	}
+	bytes += uvarintBytes(uint64(len(w.Blob))) + len(w.Blob)
 	if bytes > maxRecordBytes {
 		return 0, 0, ErrBounds
 	}
 	return bytes, events, nil
+}
+
+// validateWaveExtents makes the shared blob a canonical sequence of disjoint
+// authenticated extents. Entries may share an extent, but cannot disagree on
+// its identity/geometry or overlap slices within it.
+func validateWaveExtents(batches []ReadyBatch, blobBytes uint64) error {
+	var previousOffset, previousBytes, previousID, previousDataEnd uint64
+	haveExtent := false
+	for i := range batches {
+		for j := range batches[i].Entries {
+			entry := batches[i].Entries[j]
+			if entry.ExtentBytes == 0 {
+				if entry.ExtentID != 0 || entry.ExtentOffset != 0 || entry.DataOffset != 0 || entry.DataBytes != 0 {
+					return ErrRaftState
+				}
+				continue
+			}
+			if entry.ExtentID == 0 || entry.ExtentBytes < 16 || entry.ExtentOffset > blobBytes || entry.ExtentBytes > blobBytes-entry.ExtentOffset || entry.DataOffset > entry.ExtentBytes-16 || entry.DataBytes > entry.ExtentBytes-16-entry.DataOffset {
+				return ErrRaftState
+			}
+			if haveExtent && entry.ExtentOffset == previousOffset {
+				if entry.ExtentID != previousID || entry.ExtentBytes != previousBytes || entry.DataOffset != previousDataEnd {
+					return ErrRaftState
+				}
+			} else {
+				if !haveExtent {
+					if entry.ExtentOffset != 0 || entry.ExtentID != 1 {
+						return ErrRaftState
+					}
+				} else if previousDataEnd != previousBytes-16 || entry.ExtentOffset != previousOffset+previousBytes || entry.ExtentID != previousID+1 {
+					return ErrRaftState
+				}
+				previousOffset, previousBytes, previousID, previousDataEnd, haveExtent = entry.ExtentOffset, entry.ExtentBytes, entry.ExtentID, 0, true
+				if entry.DataOffset != 0 {
+					return ErrRaftState
+				}
+			}
+			previousDataEnd = entry.DataOffset + entry.DataBytes
+		}
+	}
+	if haveExtent != (blobBytes != 0) {
+		return ErrRaftState
+	}
+	if haveExtent && (previousDataEnd != previousBytes-16 || previousOffset+previousBytes != blobBytes) {
+		return ErrRaftState
+	}
+	return nil
 }
 
 func uvarintBytes(value uint64) int {
@@ -687,13 +1016,13 @@ func batchFlags(b *ReadyBatch) byte {
 	if b.NodeIncarnation != 0 || b.ReadyID != 0 || b.ReadyDigest != ([16]byte{}) {
 		flags |= batchIdentity
 	}
-	if len(b.Blob) != 0 {
-		flags |= batchBlob
-	}
 	if b.BeginIncarnation != 0 {
 		flags |= batchBegin
 	}
 	for i := range b.Entries {
+		if b.Entries[i].ExtentBytes != 0 {
+			flags |= batchBlob
+		}
 		if b.Entries[i].Type != pb.EntryNormal {
 			flags |= batchTypes
 			break
@@ -788,10 +1117,10 @@ func validateBatch(g *engineGroup, b *ReadyBatch) (byte, error) {
 				return 0, ErrRaftState
 			}
 			if flags&batchBlob != 0 {
-				if len(entry.Data) != 0 || len(b.Blob) < 16 || entry.DataOffset > ^uint64(0)-entry.DataBytes {
+				if len(entry.Data) != 0 || entry.ExtentBytes < 16 || entry.ExtentOffset > ^uint64(0)-entry.ExtentBytes || entry.DataOffset > ^uint64(0)-entry.DataBytes || entry.DataOffset+entry.DataBytes > entry.ExtentBytes-16 {
 					return 0, ErrRaftState
 				}
-			} else if entry.DataOffset != 0 || entry.DataBytes != 0 {
+			} else if entry.ExtentOffset != 0 || entry.ExtentBytes != 0 || entry.DataOffset != 0 || entry.DataBytes != 0 {
 				return 0, ErrRaftState
 			}
 		}
@@ -800,7 +1129,11 @@ func validateBatch(g *engineGroup, b *ReadyBatch) (byte, error) {
 		return 0, ErrRaftState
 	}
 	if b.Checkpoint != nil {
-		if b.Checkpoint.ID == ([16]byte{}) || b.Checkpoint.Index == 0 || b.Checkpoint.Term == 0 || b.Checkpoint.Index < g.Checkpoint.Index || b.Checkpoint.Index > effectiveCommit || (b.Checkpoint.Index <= last && termAt(g, b, b.Checkpoint.Index) != b.Checkpoint.Term) {
+		checkpointTerm, err := termAt(g, b, b.Checkpoint.Index)
+		if err != nil {
+			return 0, err
+		}
+		if b.Checkpoint.ID == ([16]byte{}) || b.Checkpoint.Index == 0 || b.Checkpoint.Term == 0 || b.Checkpoint.Index < g.Checkpoint.Index || b.Checkpoint.Index > effectiveCommit || (b.Checkpoint.Index <= last && checkpointTerm != b.Checkpoint.Term) {
 			return 0, ErrRaftState
 		}
 		if b.Checkpoint.Index > last {
@@ -808,7 +1141,11 @@ func validateBatch(g *engineGroup, b *ReadyBatch) (byte, error) {
 		}
 	}
 	if b.TruncateIndex != 0 {
-		if b.TruncateTerm == 0 || b.TruncateIndex < g.TruncateIndex || b.TruncateIndex > last || b.TruncateIndex > effectiveCommit || (b.Checkpoint == nil || b.TruncateIndex != b.Checkpoint.Index) && termAt(g, b, b.TruncateIndex) != b.TruncateTerm {
+		truncateTerm, err := termAt(g, b, b.TruncateIndex)
+		if err != nil {
+			return 0, err
+		}
+		if b.TruncateTerm == 0 || b.TruncateIndex < g.TruncateIndex || b.TruncateIndex > last || b.TruncateIndex > effectiveCommit || (b.Checkpoint == nil || b.TruncateIndex != b.Checkpoint.Index) && truncateTerm != b.TruncateTerm {
 			return 0, ErrRaftState
 		}
 	}
@@ -831,6 +1168,9 @@ func durableLast(g *engineGroup) uint64 {
 	if len(g.Entries) != 0 {
 		return g.Entries[len(g.Entries)-1].Index
 	}
+	if g.lastIndex != 0 {
+		return g.lastIndex
+	}
 	if g.Checkpoint.Index > g.TruncateIndex {
 		return g.Checkpoint.Index
 	}
@@ -843,43 +1183,76 @@ func replacementCount(entries []EntryLocation, from uint64) int {
 	cut := sort.Search(len(entries), func(i int) bool { return entries[i].Index >= from })
 	return len(entries) - cut
 }
-func predecessorTerm(g *engineGroup, from uint64) uint64 {
+func predecessorTerm(g *engineGroup, from uint64) (uint64, error) {
 	if from <= 1 {
-		return 0
+		return 0, nil
 	}
 	for i := len(g.Entries) - 1; i >= 0; i-- {
 		if g.Entries[i].Index == from-1 {
-			return g.Entries[i].Term
+			return g.Entries[i].Term, nil
 		}
 	}
+	if term, ok, err := g.sealedTerm(from - 1); err != nil || ok {
+		return term, err
+	}
 	if g.Checkpoint.Index == from-1 {
-		return g.Checkpoint.Term
+		return g.Checkpoint.Term, nil
 	}
 	if g.TruncateIndex == from-1 {
-		return g.TruncateTerm
+		return g.TruncateTerm, nil
 	}
-	return 0
+	return 0, nil
 }
-func termAt(g *engineGroup, b *ReadyBatch, index uint64) uint64 {
+func termAt(g *engineGroup, b *ReadyBatch, index uint64) (uint64, error) {
 	if b != nil {
 		for _, entry := range b.Entries {
 			if entry.Index == index {
-				return entry.Term
+				return entry.Term, nil
 			}
 		}
 	}
 	for i := len(g.Entries) - 1; i >= 0; i-- {
 		if g.Entries[i].Index == index {
-			return g.Entries[i].Term
+			return g.Entries[i].Term, nil
 		}
 	}
+	if term, ok, err := g.sealedTerm(index); err != nil || ok {
+		return term, err
+	}
 	if g.Checkpoint.Index == index {
-		return g.Checkpoint.Term
+		return g.Checkpoint.Term, nil
 	}
 	if g.TruncateIndex == index {
-		return g.TruncateTerm
+		return g.TruncateTerm, nil
 	}
-	return 0
+	return 0, nil
+}
+
+func (g *engineGroup) sealedTerm(index uint64) (uint64, bool, error) {
+	for i := len(g.sealed) - 1; i >= 0; i-- {
+		run := g.sealed[i]
+		if index < run.First || index > run.Last {
+			continue
+		}
+		if g.owner == nil {
+			return 0, false, ErrBounds
+		}
+		if err := g.owner.PrepareSegment(run.SegmentID); err != nil {
+			return 0, false, err
+		}
+		for slot := range g.owner.readers {
+			reader := &g.owner.readers[slot]
+			if reader.id != run.SegmentID || reader.routes == nil {
+				continue
+			}
+			route, err := reader.routes.Point(run, index)
+			if err != nil {
+				return 0, false, err
+			}
+			return route.Term, true, nil
+		}
+	}
+	return 0, false, nil
 }
 
 func sealWaveHeader(frame []byte, sequence uint64, id WaveID) {
@@ -907,7 +1280,7 @@ func (e *Engine) applyEvent(event segmentEvent, segmentID uint64) error {
 	}
 	g := e.groups[event.GroupID]
 	if g == nil {
-		g = &engineGroup{}
+		g = &engineGroup{owner: e, id: event.GroupID}
 		e.groups[event.GroupID] = g
 	}
 	switch event.Kind {
@@ -929,11 +1302,17 @@ func (e *Engine) applyEvent(event segmentEvent, segmentID uint64) error {
 		}
 		g.NodeIncarnation, g.ReadyID, g.ReadyDigest, g.ReadyWaveID = event.Incarnation, event.ReadyID, event.ReadyDigest, WaveID(event.Reference)
 	case RecordTruncateSuffix:
-		if event.Index == 0 || event.Index <= g.Hard.Commit || event.Index > durableLast(g)+1 || predecessorTerm(g, event.Index) != event.Term {
+		predecessor, err := predecessorTerm(g, event.Index)
+		if err != nil {
+			return err
+		}
+		if event.Index == 0 || event.Index <= g.Hard.Commit || event.Index > durableLast(g)+1 || predecessor != event.Term {
 			return ErrRaftState
 		}
 		cut := sort.Search(len(g.Entries), func(i int) bool { return g.Entries[i].Index >= event.Index })
 		g.Entries = slices.Delete(g.Entries, cut, len(g.Entries))
+		g.clipSealedSuffix(event.Index - 1)
+		g.lastIndex, g.lastTerm = event.Index-1, event.Term
 	case eventWaveEntry, eventWaveEntryConf, eventWaveEntryConfV2, eventBlobEntry, eventBlobEntryConf, eventBlobEntryConfV2:
 		if event.Index != durableLast(g)+1 || event.Term == 0 {
 			return ErrRaftState
@@ -942,22 +1321,35 @@ func (e *Engine) applyEvent(event segmentEvent, segmentID uint64) error {
 		if !ok {
 			return ErrCorrupt
 		}
-		g.Entries = append(g.Entries, EntryLocation{SegmentID: segmentID, Offset: event.Offset, Bytes: event.Bytes, Index: event.Index, Term: event.Term, Type: entryType, DataOffset: event.DataOffset, DataBytes: event.DataBytes, BatchID: g.ReadyWaveID})
+		g.Entries = append(g.Entries, EntryLocation{SegmentID: segmentID, Offset: event.Offset, Bytes: event.Bytes, Index: event.Index, Term: event.Term, Type: entryType, DataOffset: event.DataOffset, DataBytes: event.DataBytes, BatchID: WaveID(event.Reference), ExtentID: event.ReadyID})
+		g.lastIndex, g.lastTerm = event.Index, event.Term
 	case eventPrefix:
-		if event.Index < g.TruncateIndex || event.Index > durableLast(g) || termAt(g, nil, event.Index) != event.Term {
+		term, err := termAt(g, nil, event.Index)
+		if err != nil {
+			return err
+		}
+		if event.Index < g.TruncateIndex || event.Index > durableLast(g) || term != event.Term {
 			return ErrRaftState
 		}
 		cut := sort.Search(len(g.Entries), func(i int) bool { return g.Entries[i].Index > event.Index })
 		g.Entries = slices.Delete(g.Entries, 0, cut)
+		g.clipSealedThrough(event.Index)
 		g.TruncateIndex, g.TruncateTerm = event.Index, event.Term
+		if len(g.Entries) == 0 && g.lastIndex < event.Index {
+			g.lastIndex, g.lastTerm = event.Index, event.Term
+		}
 	case eventCheckpoint:
 		if event.Reference == ([16]byte{}) || event.Index < g.Checkpoint.Index || event.Term == 0 {
 			return ErrRaftState
 		}
 		cut := sort.Search(len(g.Entries), func(i int) bool { return g.Entries[i].Index > event.Index })
 		g.Entries = slices.Delete(g.Entries, 0, cut)
+		g.clipSealedThrough(event.Index)
 		g.TruncateIndex, g.TruncateTerm = event.Index, event.Term
 		g.Checkpoint = Checkpoint{ID: event.Reference, Index: event.Index, Term: event.Term}
+		if len(g.Entries) == 0 && g.lastIndex < event.Index {
+			g.lastIndex, g.lastTerm = event.Index, event.Term
+		}
 	case eventHardState:
 		if event.Term < g.Hard.Term || event.Commit < g.Hard.Commit || event.Commit > durableLast(g) || event.Term == g.Hard.Term && g.Hard.Vote != 0 && event.Vote != g.Hard.Vote {
 			return ErrRaftState
@@ -966,10 +1358,253 @@ func (e *Engine) applyEvent(event segmentEvent, segmentID uint64) error {
 	default:
 		return ErrCorrupt
 	}
+	if e.activeBuild != nil && !e.activeBuild.update(g, e.log.manifest.ActiveID) {
+		return ErrBounds
+	}
 	return nil
 }
 
-func (e *Engine) Rotate(hook func(RotationPhase) error) error { return e.log.Rotate(hook) }
+func (g *engineGroup) clipSealedSuffix(last uint64) {
+	kept := g.sealed[:0]
+	for i := range g.sealed {
+		run := g.sealed[i]
+		if run.First > last {
+			continue
+		}
+		if run.Last > last {
+			run.Last = last
+		}
+		kept = append(kept, run)
+	}
+	g.sealed = kept
+}
+
+func (g *engineGroup) clipSealedThrough(index uint64) {
+	kept := g.sealed[:0]
+	for i := range g.sealed {
+		run := g.sealed[i]
+		if run.Last <= index {
+			continue
+		}
+		if run.First <= index {
+			run.First = index + 1
+		}
+		kept = append(kept, run)
+	}
+	g.sealed = kept
+}
+
+func (e *Engine) Rotate(hook func(RotationPhase) error) error {
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+	if e.sealPending {
+		select {
+		case err := <-e.sealResults:
+			e.sealPending = false
+			if err != nil {
+				return e.log.poison(err)
+			}
+		default:
+			return ErrBounds
+		}
+	}
+	if err := e.log.Sync(); err != nil {
+		return err
+	}
+	l := e.log
+	if cap(l.eventSpare) < cap(l.events) || e.activeBuild == nil || e.spareBuild == nil {
+		return ErrBounds
+	}
+	dataBytes, frozenID, frozenGeneration := l.manifest.DurableOffset, l.manifest.ActiveID, l.manifest.ActiveGeneration
+	var sum [32]byte
+	copy(sum[:], l.activeHash.Sum(l.digestScratch[:0]))
+	nextID, nextGeneration := frozenID+1, frozenGeneration+1
+	nextHeader := segmentHeader{ID: nextID, Generation: nextGeneration, PreviousID: frozenID, PreviousHash: sum, LogID: l.manifest.LogID}
+	nextFile, err := createSegment(l.dir, nextHeader)
+	if err != nil {
+		return l.poison(err)
+	}
+	if hook != nil {
+		if err = hook(RotationNextPublished); err != nil {
+			_ = nextFile.Close()
+			return l.poison(err)
+		}
+	}
+	pending := SegmentMeta{ID: frozenID, Generation: frozenGeneration, Bytes: dataBytes, Records: l.records, PreviousHash: l.expectedPreviousHash(), Hash: sum, State: SegmentFrozenPending}
+	next := l.manifest
+	next.Generation++
+	next.ActiveID, next.ActiveGeneration = nextID, nextGeneration
+	next.DurableSegmentID, next.DurableOffset = nextID, segmentHeaderBytes
+	next.Segments = append(slices.Clone(next.Segments), pending)
+	if err = l.publish(next); err != nil {
+		_ = nextFile.Close()
+		return l.poison(err)
+	}
+	old := l.active
+	frozenEvents := l.events
+	frozenBuild := e.activeBuild
+	frozenBuild.lastSequence = e.sequence
+	e.activeBuild, e.spareBuild = e.spareBuild, nil
+	l.events, l.eventSpare = l.eventSpare[:0], nil
+	l.active, l.activeOffset, l.records, l.manifest = nextFile, segmentHeaderBytes, 0, next
+	l.activeHash = sha256.New()
+	_, _ = l.activeHash.Write(marshalSegmentHeader(nextHeader))
+	if err = old.Close(); err != nil {
+		return l.poison(err)
+	}
+	if hook != nil {
+		if err = hook(RotationManifestPublished); err != nil {
+			return l.poison(err)
+		}
+	}
+	e.sealPending = true
+	e.sealRequests <- sealRequest{base: next, pending: pending, events: frozenEvents, hook: hook, build: frozenBuild}
+	return nil
+}
+
+func (e *Engine) finishFrozenSeal(base Manifest, pending SegmentMeta, events []segmentEvent, build *segmentBuildArena, hook func(RotationPhase) error) (result error) {
+	if build == nil {
+		return ErrBounds
+	}
+	if build.lastSequence < pending.Records {
+		return ErrCorrupt
+	}
+	if e.sealBuildHookTest != nil {
+		e.sealBuildHookTest()
+	}
+	builderLog := &Log{dir: e.log.dir, manifest: base, authKey: e.authKey, events: events}
+	builderLog.manifest.ActiveID, builderLog.manifest.ActiveGeneration = pending.ID, pending.Generation
+	builder := &Engine{log: builderLog, groups: make(map[uint64]*engineGroup, len(build.groups)), sequence: build.lastSequence, authKey: e.authKey, sealSummaryOverride: make(map[uint64]sealedRunSummary, len(build.groups))}
+	for i := range build.groups {
+		item := build.groups[i]
+		final := item.Final
+		builder.sealSummaryOverride[item.GroupID] = final
+		builder.groups[item.GroupID] = &engineGroup{id: item.GroupID, GroupState: GroupState{Hard: final.Hard, TruncateIndex: final.TruncateIndex, TruncateTerm: final.TruncateTerm, Checkpoint: final.Checkpoint, NodeIncarnation: final.NodeIncarnation, ReadyID: final.ReadyID, ReadyDigest: final.ReadyDigest, ReadyWaveID: final.ReadyWaveID}, lastIndex: final.LastIndex, lastTerm: final.LastTerm}
+	}
+	for i := range events {
+		event := events[i]
+		group := builder.groups[event.GroupID]
+		if group == nil {
+			continue
+		}
+		switch event.Kind {
+		case RecordTruncateSuffix:
+			cut := sort.Search(len(group.Entries), func(i int) bool { return group.Entries[i].Index >= event.Index })
+			group.Entries = group.Entries[:cut]
+		case eventPrefix, eventCheckpoint:
+			cut := sort.Search(len(group.Entries), func(i int) bool { return group.Entries[i].Index > event.Index })
+			group.Entries = group.Entries[cut:]
+		case eventWaveEntry, eventWaveEntryConf, eventWaveEntryConfV2, eventBlobEntry, eventBlobEntryConf, eventBlobEntryConfV2:
+			entryType, ok := typeForEventKind(event.Kind)
+			if !ok {
+				return ErrCorrupt
+			}
+			group.Entries = append(group.Entries, EntryLocation{SegmentID: pending.ID, Offset: event.Offset, Bytes: event.Bytes, Index: event.Index, Term: event.Term, Type: entryType, DataOffset: event.DataOffset, DataBytes: event.DataBytes, BatchID: WaveID(event.Reference), ExtentID: event.ReadyID})
+		}
+	}
+	index, topBytes, err := builder.marshalEngineSealedIndex(pending.Bytes)
+	if err != nil {
+		return err
+	}
+	header, err := unmarshalSealedIndexHeader(index[:sealedIndexHeaderBytes])
+	if err != nil {
+		return err
+	}
+	runs, err := decodeRunDirectory(index[sealedIndexHeaderBytes:topBytes], uint64(header.Runs))
+	if err != nil {
+		return err
+	}
+	pendingPath := filepath.Join(e.log.dir, activeName(pending.ID))
+	if e.sealOpenHookTest != nil {
+		e.sealOpenHookTest(pendingPath)
+	}
+	f, err := os.OpenFile(pendingPath, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	if err = f.Truncate(int64(pending.Bytes)); err == nil {
+		_, err = f.WriteAt(index, int64(pending.Bytes))
+	}
+	footer := segmentFooter{ID: pending.ID, Generation: pending.Generation, Records: pending.Records, DataBytes: pending.Bytes, Hash: pending.Hash, IndexOffset: pending.Bytes, IndexBytes: uint64(len(index)), Events: uint64(len(events))}
+	segmentIdentity := segmentHeader{ID: pending.ID, Generation: pending.Generation, PreviousID: pending.ID - 1, PreviousHash: pending.PreviousHash, LogID: base.LogID}
+	footer.Auth = segmentSealedMetadataMAC(e.authKey, segmentIdentity, index[:topBytes], footer)
+	footerBytes := marshalSegmentFooter(footer)
+	if err == nil {
+		if e.recoveryIO != nil {
+			e.recoveryIO.pendingSealBytes += uint64(len(index) + len(footerBytes))
+		}
+		_, err = f.WriteAt(footerBytes, int64(pending.Bytes)+int64(len(index)))
+	}
+	if err == nil {
+		err = f.Sync()
+	}
+	if err == nil && hook != nil {
+		err = hook(RotationSealedSynced)
+	}
+	err = errors.Join(err, f.Close())
+	if err != nil {
+		return err
+	}
+	if err = os.Rename(filepath.Join(e.log.dir, activeName(pending.ID)), filepath.Join(e.log.dir, sealedName(pending.ID))); err == nil {
+		err = syncDir(e.log.dir)
+	}
+	if err == nil && hook != nil {
+		err = hook(RotationSealedRenamed)
+	}
+	if err != nil {
+		return err
+	}
+	sealed := pending
+	sealed.State = SegmentSealed
+	sealed.IndexOffset, sealed.IndexBytes = pending.Bytes, uint64(len(index))
+	sealed.Bytes = pending.Bytes + uint64(len(index)) + segmentFooterBytes
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+	manifest := e.log.manifest
+	if len(manifest.Segments) == 0 || manifest.Segments[len(manifest.Segments)-1] != pending {
+		return ErrCorrupt
+	}
+	manifest.Generation++
+	manifest.Segments = slices.Clone(manifest.Segments)
+	manifest.Segments[len(manifest.Segments)-1] = sealed
+	if err = e.log.publish(manifest); err != nil {
+		return err
+	}
+	e.log.manifest = manifest
+	for i := range runs {
+		run := runs[i]
+		group := e.groups[run.GroupID]
+		if group == nil {
+			continue
+		}
+		first, last := uint64(0), uint64(0)
+		for j := range group.Entries {
+			if group.Entries[j].SegmentID == pending.ID {
+				if first == 0 {
+					first = group.Entries[j].Index
+				}
+				last = group.Entries[j].Index
+			}
+		}
+		if first != 0 {
+			first, last = max(first, run.First), min(last, run.Last)
+			if first <= last {
+				group.sealed = append(group.sealed, sealedRunRef{SegmentID: pending.ID, GroupID: run.GroupID, First: first, Last: last, RouteFirst: run.First, RouteLast: run.Last, DescriptorBase: pending.Bytes + uint64(header.DescriptorOffset) + run.DescriptorOrdinal*sealedRouteDescriptorBytes, DescriptorCount: run.DescriptorCount, BlockEntries: run.BlockEntries, ExtentOffset: run.ExtentOffset, ExtentBytes: run.ExtentBytes, Inline: run.Inline})
+			}
+		}
+		kept := group.Entries[:0]
+		for j := range group.Entries {
+			if group.Entries[j].SegmentID != pending.ID {
+				kept = append(kept, group.Entries[j])
+			}
+		}
+		group.Entries = kept
+	}
+	e.log.eventSpare = events[:0]
+	build.clear()
+	e.spareBuild = build
+	return nil
+}
 
 func OpenEngine(dir string) (*Engine, error) {
 	return openEngineAuthenticated(dir, syncActiveData, [32]byte{})
@@ -987,6 +1622,10 @@ func OpenEngineAuthenticated(dir string, key [32]byte) (*Engine, error) {
 }
 
 func openEngineAuthenticated(dir string, startupSync func(*os.File) error, key [32]byte) (*Engine, error) {
+	return openEngineAuthenticatedObserved(dir, startupSync, key, nil)
+}
+
+func openEngineAuthenticatedObserved(dir string, startupSync func(*os.File) error, key [32]byte, recoveryIO *recoveryIOCounters) (*Engine, error) {
 	b, err := os.ReadFile(filepath.Join(dir, ManifestName))
 	if err != nil {
 		return nil, err
@@ -995,11 +1634,11 @@ func openEngineAuthenticated(dir string, startupSync func(*os.File) error, key [
 	if err != nil {
 		return nil, err
 	}
-	l := &Log{dir: dir, manifest: manifest, index: make(map[uint64]*GroupIndex), last: make(map[uint64]uint64), lastTerm: make(map[uint64]uint64), buf: make([]byte, 0, 4096), authKey: key}
+	l := &Log{dir: dir, manifest: manifest, authKey: key}
 	if err = l.reconcileRotation(); err != nil {
 		return nil, err
 	}
-	e := &Engine{log: l, groups: make(map[uint64]*engineGroup), waves: make(map[WaveID][32]byte), syncData: startupSync, writeAt: func(f *os.File, b []byte, off int64) (int, error) { return f.WriteAt(b, off) }}
+	e := &Engine{log: l, groups: make(map[uint64]*engineGroup), waves: make(map[WaveID][32]byte), syncData: startupSync, writeAt: func(f *os.File, b []byte, off int64) (int, error) { return f.WriteAt(b, off) }, recoveryIO: recoveryIO}
 	if key != ([32]byte{}) {
 		e.authMAC = hmac.New(sha256.New, key[:])
 		e.authKey = key
@@ -1009,25 +1648,198 @@ func openEngineAuthenticated(dir string, startupSync func(*os.File) error, key [
 		return nil, err
 	}
 	e.waveLimit = len(e.waves)
+	e.startSealer()
 	return e, nil
+}
+
+// promoteCompletePending recognizes a fully synced seal suffix left on either
+// side of the active-to-sealed rename. It publishes that already-authenticated
+// result without truncating, rescanning frames, or rebuilding the index. A
+// partial suffix is not an error here: the bounded pending-data recovery path
+// below truncates it back to want.Bytes and seals it again.
+func (e *Engine) promoteCompletePending(want SegmentMeta, previousID uint64, previousHash [32]byte) (SegmentMeta, segmentFooter, sealedIndexHeader, []sealedGroupRun, bool, error) {
+	activePath := filepath.Join(e.log.dir, activeName(want.ID))
+	sealedPath := filepath.Join(e.log.dir, sealedName(want.ID))
+	path, rename := activePath, true
+	meta, footer, err := readUnpublishedSealed(path, e.log.manifest.LogID, previousID, previousHash, e.authKey)
+	if err != nil {
+		path, rename = sealedPath, false
+		meta, footer, err = readUnpublishedSealed(path, e.log.manifest.LogID, previousID, previousHash, e.authKey)
+	}
+	if err != nil {
+		return SegmentMeta{}, segmentFooter{}, sealedIndexHeader{}, nil, false, nil
+	}
+	if footer.DataBytes != want.Bytes || footer.Records != want.Records || footer.Hash != want.Hash || meta.ID != want.ID || meta.Generation != want.Generation || meta.PreviousHash != want.PreviousHash {
+		return SegmentMeta{}, segmentFooter{}, sealedIndexHeader{}, nil, false, ErrCorrupt
+	}
+	if rename {
+		if err = os.Rename(activePath, sealedPath); err != nil {
+			return SegmentMeta{}, segmentFooter{}, sealedIndexHeader{}, nil, false, err
+		}
+		if err = syncDir(e.log.dir); err != nil {
+			return SegmentMeta{}, segmentFooter{}, sealedIndexHeader{}, nil, false, err
+		}
+		path = sealedPath
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return SegmentMeta{}, segmentFooter{}, sealedIndexHeader{}, nil, false, err
+	}
+	footer, header, runs, _, readErr := readSealedSealedMetadata(file, meta, e.log.manifest.LogID, previousID, previousHash, e.authKey)
+	closeErr := file.Close()
+	if readErr != nil || closeErr != nil {
+		return SegmentMeta{}, segmentFooter{}, sealedIndexHeader{}, nil, false, errors.Join(readErr, closeErr)
+	}
+	next := e.log.manifest
+	next.Generation++
+	next.Segments = slices.Clone(next.Segments)
+	found := false
+	for i := range next.Segments {
+		if next.Segments[i] == want {
+			next.Segments[i] = meta
+			found = true
+			break
+		}
+	}
+	if !found {
+		return SegmentMeta{}, segmentFooter{}, sealedIndexHeader{}, nil, false, ErrCorrupt
+	}
+	if err = e.log.publish(next); err != nil {
+		return SegmentMeta{}, segmentFooter{}, sealedIndexHeader{}, nil, false, err
+	}
+	e.log.manifest = next
+	if e.recoveryIO != nil {
+		e.recoveryIO.pendingPromotions++
+	}
+	return meta, footer, header, runs, true, nil
 }
 
 func (e *Engine) rebuild() error {
 	previousID, previousHash := e.log.manifest.AnchorID, e.log.manifest.AnchorHash
 	for _, want := range e.log.manifest.Segments {
-		got, _, events, err := readSealedMetadataAuthenticated(filepath.Join(e.log.dir, sealedName(want.ID)), e.log.manifest.LogID, previousID, previousHash, e.authKey)
+		if pendingSegment(want) {
+			sealed, footer, sealedHeader, runs, promoted, promoteErr := e.promoteCompletePending(want, previousID, previousHash)
+			if promoteErr != nil {
+				return promoteErr
+			}
+			if promoted {
+				if sealedHeader.LastSequence != e.sequence+footer.Records {
+					return ErrCorrupt
+				}
+				for i := range runs {
+					run := runs[i]
+					group := e.groups[run.GroupID]
+					if group == nil {
+						group = &engineGroup{owner: e, id: run.GroupID}
+						e.groups[run.GroupID] = group
+					}
+					if applyErr := e.applySealedRun(group, sealed, sealedHeader, run); applyErr != nil {
+						return applyErr
+					}
+				}
+				e.sequence = sealedHeader.LastSequence
+				previousID, previousHash = sealed.ID, sealed.Hash
+				continue
+			}
+			file, err := os.OpenFile(filepath.Join(e.log.dir, activeName(want.ID)), os.O_RDWR, 0)
+			if errors.Is(err, os.ErrNotExist) {
+				meta, footer, sealedErr := readUnpublishedSealed(filepath.Join(e.log.dir, sealedName(want.ID)), e.log.manifest.LogID, previousID, previousHash, e.authKey)
+				if sealedErr != nil || footer.DataBytes != want.Bytes || footer.Records != want.Records || footer.Hash != want.Hash || meta.ID != want.ID {
+					return errors.Join(ErrCorrupt, sealedErr)
+				}
+				if err = os.Rename(filepath.Join(e.log.dir, sealedName(want.ID)), filepath.Join(e.log.dir, activeName(want.ID))); err == nil {
+					err = syncDir(e.log.dir)
+				}
+				if err == nil {
+					file, err = os.OpenFile(filepath.Join(e.log.dir, activeName(want.ID)), os.O_RDWR, 0)
+				}
+			}
+			if err != nil {
+				return err
+			}
+			headerBytes := make([]byte, segmentHeaderBytes)
+			_, headerErr := file.ReadAt(headerBytes, 0)
+			header, decodeErr := unmarshalSegmentHeader(headerBytes)
+			if headerErr != nil || decodeErr != nil || header.ID != want.ID || header.Generation != want.Generation || header.PreviousID != previousID || header.PreviousHash != previousHash || header.LogID != e.log.manifest.LogID {
+				_ = file.Close()
+				return errors.Join(ErrCorrupt, headerErr, decodeErr)
+			}
+			st, statErr := file.Stat()
+			if statErr != nil || uint64(st.Size()) < want.Bytes {
+				_ = file.Close()
+				return errors.Join(ErrCorrupt, statErr)
+			}
+			if uint64(st.Size()) != want.Bytes {
+				if err = file.Truncate(int64(want.Bytes)); err != nil {
+					_ = file.Close()
+					return err
+				}
+			}
+			if e.recoveryIO != nil {
+				e.recoveryIO.pendingPayloadBytes += want.Bytes
+			}
+			sum, hashErr := hashPrefix(file, want.Bytes)
+			if hashErr != nil || sum != want.Hash {
+				_ = file.Close()
+				return errors.Join(ErrCorrupt, hashErr)
+			}
+			events, records, scanErr := verifyWaveFrames(file, want.Bytes, want.ID, e)
+			closeErr := file.Close()
+			if scanErr != nil || closeErr != nil || records != want.Records {
+				return errors.Join(ErrCorrupt, scanErr, closeErr)
+			}
+			seen := make(map[uint64]struct{})
+			build := &segmentBuildArena{groups: make([]segmentGroupBuild, 0, len(events)), lastSequence: e.sequence}
+			for i := range events {
+				groupID := events[i].GroupID
+				if groupID == engineWaveGroup {
+					continue
+				}
+				if _, ok := seen[groupID]; ok {
+					continue
+				}
+				seen[groupID] = struct{}{}
+				if group := e.groups[groupID]; group != nil {
+					build.groups = append(build.groups, segmentGroupBuild{GroupID: groupID, Final: groupSealSummary(group)})
+				}
+			}
+			if err = e.finishFrozenSeal(e.log.manifest, want, events, build, nil); err != nil {
+				return err
+			}
+			previousID, previousHash = want.ID, want.Hash
+			continue
+		}
+		file, err := os.Open(filepath.Join(e.log.dir, sealedName(want.ID)))
 		if err != nil {
 			return err
 		}
-		if got != want {
+		footer, header, runs, _, readErr := readSealedSealedMetadata(file, want, e.log.manifest.LogID, previousID, previousHash, e.authKey)
+		closeErr := file.Close()
+		if readErr != nil {
+			return readErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		if header.LastSequence != e.sequence+footer.Records {
 			return ErrCorrupt
 		}
-		for _, event := range events {
-			if err = e.applyEvent(event, want.ID); err != nil {
+		for i := range runs {
+			run := runs[i]
+			group := e.groups[run.GroupID]
+			if group == nil {
+				group = &engineGroup{owner: e, id: run.GroupID}
+				e.groups[run.GroupID] = group
+			}
+			if err = e.applySealedRun(group, want, header, run); err != nil {
 				return err
 			}
 		}
+		e.sequence = header.LastSequence
 		previousID, previousHash = want.ID, want.Hash
+	}
+	if len(e.log.manifest.Segments) != 0 && len(e.readers) == 0 {
+		e.readers = make([]segmentReader, 1)
 	}
 	headerBytes := make([]byte, segmentHeaderBytes)
 	if _, err := e.log.active.ReadAt(headerBytes, 0); err != nil {
@@ -1285,12 +2097,24 @@ func decodeWaveFrameForEngine(frame []byte, expectedSequence uint64, engine *Eng
 				return id, digest, nil, ErrCorrupt
 			}
 			if flags&batchBlob != 0 {
+				entry.ExtentID, err = cursor.uvarint()
+				if err != nil {
+					return id, digest, nil, ErrCorrupt
+				}
+				entry.ExtentOffset, err = cursor.uvarint()
+				if err != nil {
+					return id, digest, nil, ErrCorrupt
+				}
+				entry.ExtentBytes, err = cursor.uvarint()
+				if err != nil || entry.ExtentBytes < 16 || entry.ExtentOffset > ^uint64(0)-entry.ExtentBytes {
+					return id, digest, nil, ErrCorrupt
+				}
 				entry.DataOffset, err = cursor.uvarint()
 				if err != nil {
 					return id, digest, nil, ErrCorrupt
 				}
 				entry.DataBytes, err = cursor.uvarint()
-				if err != nil || entry.DataOffset > ^uint64(0)-entry.DataBytes {
+				if err != nil || entry.DataOffset > ^uint64(0)-entry.DataBytes || entry.DataOffset+entry.DataBytes > entry.ExtentBytes-16 {
 					return id, digest, nil, ErrCorrupt
 				}
 			} else {
@@ -1307,22 +2131,31 @@ func decodeWaveFrameForEngine(frame []byte, expectedSequence uint64, engine *Eng
 			}
 			batch.Entries = append(batch.Entries, entry)
 		}
-		if flags&batchBlob != 0 {
-			size, readErr := cursor.uvarint()
-			if readErr != nil || size < 16 || size > uint64(len(cursor.data)-cursor.off) {
-				return id, digest, nil, ErrCorrupt
-			}
-			blobOffset := uint64(72 + cursor.off)
-			batch.Blob, readErr = cursor.take(int(size))
-			if readErr != nil {
-				return id, digest, nil, ErrCorrupt
-			}
-			for i := range batch.Entries {
-				batch.Entries[i].dataOffset = blobOffset
-			}
-		}
 		batches = append(batches, batch)
 		previous = group
+	}
+	blobSize, err := cursor.uvarint()
+	if err != nil || blobSize > uint64(len(cursor.data)-cursor.off) {
+		return id, digest, nil, ErrCorrupt
+	}
+	blobOffset := uint64(72 + cursor.off)
+	if _, err = cursor.take(int(blobSize)); err != nil {
+		return id, digest, nil, ErrCorrupt
+	}
+	for i := range batches {
+		for j := range batches[i].Entries {
+			entry := &batches[i].Entries[j]
+			if entry.ExtentBytes == 0 {
+				continue
+			}
+			if entry.ExtentOffset > blobSize || entry.ExtentBytes > blobSize-entry.ExtentOffset {
+				return id, digest, nil, ErrCorrupt
+			}
+			entry.dataOffset = blobOffset + entry.ExtentOffset
+		}
+	}
+	if err = validateWaveExtents(batches, blobSize); err != nil {
+		return id, digest, nil, ErrCorrupt
 	}
 	if !cursor.empty() {
 		return id, digest, nil, ErrCorrupt
@@ -1336,7 +2169,7 @@ func (e *Engine) eventsForDecoded(batches []ReadyBatch, frameOffset, sequence ui
 		batch := &batches[i]
 		g := e.groups[batch.GroupID]
 		if g == nil {
-			g = &engineGroup{}
+			g = &engineGroup{owner: e, id: batch.GroupID}
 			e.groups[batch.GroupID] = g
 		}
 		if _, err := validateBatch(g, batch); err != nil {
@@ -1349,14 +2182,18 @@ func (e *Engine) eventsForDecoded(batches []ReadyBatch, frameOffset, sequence ui
 			events = append(events, segmentEvent{Kind: eventIncarnation, GroupID: batch.GroupID, Incarnation: batch.BeginIncarnation})
 		}
 		if batch.ReplaceFrom != 0 {
-			events = append(events, segmentEvent{Kind: RecordTruncateSuffix, GroupID: batch.GroupID, Index: batch.ReplaceFrom, Term: predecessorTerm(g, batch.ReplaceFrom)})
+			predecessor, termErr := predecessorTerm(g, batch.ReplaceFrom)
+			if termErr != nil {
+				return nil, termErr
+			}
+			events = append(events, segmentEvent{Kind: RecordTruncateSuffix, GroupID: batch.GroupID, Index: batch.ReplaceFrom, Term: predecessor})
 		}
 		for _, entry := range batch.Entries {
 			kind, bytes := eventKindForType(entry.Type), uint64(len(entry.Data))
-			if len(batch.Blob) != 0 {
-				kind, bytes = blobEventKind(entry.Type), uint64(len(batch.Blob))
+			if entry.ExtentBytes != 0 {
+				kind, bytes = blobEventKind(entry.Type), entry.ExtentBytes
 			}
-			events = append(events, segmentEvent{Kind: kind, GroupID: batch.GroupID, Index: entry.Index, Term: entry.Term, Offset: frameOffset + entry.dataOffset, Bytes: bytes, DataOffset: entry.DataOffset, DataBytes: entry.DataBytes})
+			events = append(events, segmentEvent{Kind: kind, GroupID: batch.GroupID, Index: entry.Index, Term: entry.Term, Offset: frameOffset + entry.dataOffset, Bytes: bytes, DataOffset: entry.DataOffset, DataBytes: entry.DataBytes, ReadyID: entry.ExtentID, Reference: id})
 		}
 		if batch.TruncateIndex != 0 {
 			events = append(events, segmentEvent{Kind: eventPrefix, GroupID: batch.GroupID, Index: batch.TruncateIndex, Term: batch.TruncateTerm})
@@ -1383,15 +2220,13 @@ func (e *Engine) DeepVerify() error {
 	previousID, previousHash := e.log.manifest.AnchorID, e.log.manifest.AnchorHash
 	for _, want := range e.log.manifest.Segments {
 		path := filepath.Join(e.log.dir, sealedName(want.ID))
-		got, footer, indexed, err := readSealedMetadataAuthenticated(path, e.log.manifest.LogID, previousID, previousHash, e.authKey)
+		f, err := os.Open(path)
 		if err != nil {
 			return err
 		}
-		if got != want {
-			return ErrCorrupt
-		}
-		f, err := os.Open(path)
+		footer, header, runs, _, err := readSealedSealedMetadata(f, want, e.log.manifest.LogID, previousID, previousHash, e.authKey)
 		if err != nil {
+			_ = f.Close()
 			return err
 		}
 		sum, err := hashPrefix(f, footer.DataBytes)
@@ -1403,8 +2238,11 @@ func (e *Engine) DeepVerify() error {
 		if err == nil {
 			scanned, records, err = verifyWaveFrames(f, footer.DataBytes, want.ID, verifier)
 		}
-		if err == nil && (records != footer.Records || uint64(len(scanned)) != footer.Events || !slices.Equal(canonicalEventOrder(scanned), indexed)) {
+		if err == nil && (records != footer.Records || uint64(len(scanned)) != footer.Events || verifier.sequence != header.LastSequence) {
 			err = ErrCorrupt
+		}
+		if err == nil {
+			err = verifySealedRuns(f, want, header, runs, verifier, e.authKey)
 		}
 		closeErr := f.Close()
 		if err != nil {

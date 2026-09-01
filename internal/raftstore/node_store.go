@@ -51,6 +51,10 @@ type GroupIncarnation struct {
 	GroupID, Incarnation uint64
 }
 
+const nodeDataExtentBytes = 32 << 10
+
+type pageEntryRef struct{ batch, entry uint32 }
+
 type CheckpointPhase uint8
 
 const (
@@ -62,35 +66,36 @@ const (
 )
 
 type NodeStore struct {
-	mu                                   sync.Mutex
-	dir                                  string
-	identity                             Identity
-	key                                  Key
-	options                              normalizedOptions
-	engine                               *seglog.Engine
-	lock                                 *os.File
-	pinnedDir, metaFile                  *os.File
-	metaSize                             int64
-	dirPathNUL, metaNameNUL              string
-	crypto                               fileCrypto
-	cryptoWork                           objectCryptoWorkspace
-	groupAAD                             [40]byte
-	groupNonce                           [12]byte
-	plainArena, cipherArena, digestArena []byte
-	readPlain                            []byte
-	cachedBatch                          seglog.WaveID
-	cachedGroup                          uint64
-	cacheValid                           bool
-	waveBatches                          [MaxPersistGroupBatches]seglog.ReadyBatch
-	waveEntries                          [MaxPersistGroupBatches][]seglog.Entry
-	waveHard                             [MaxPersistGroupBatches]seglog.HardState
-	waveCheckpoint                       [MaxPersistGroupBatches]seglog.Checkpoint
-	persistWaveTest                      func(seglog.Wave) error
-	namespaceProofTest                   func() error
-	checkpointHookTest                   func(CheckpointPhase) error
-	checkpointLeaveTempTest              bool
-	closed                               bool
-	poisoned                             error
+	mu                                        sync.Mutex
+	dir                                       string
+	identity                                  Identity
+	key                                       Key
+	options                                   normalizedOptions
+	engine                                    *seglog.Engine
+	lock                                      *os.File
+	pinnedDir, metaFile                       *os.File
+	metaSize                                  int64
+	dirPathNUL, metaNameNUL                   string
+	crypto                                    fileCrypto
+	cryptoWork                                objectCryptoWorkspace
+	groupAAD                                  [40]byte
+	groupNonce                                [12]byte
+	plainArena, cipherArena, digestArena      []byte
+	readPlain                                 []byte
+	cachedBatch                               seglog.WaveID
+	cachedSegment, cachedOffset, cachedExtent uint64
+	cacheValid                                bool
+	waveBatches                               [MaxPersistGroupBatches]seglog.ReadyBatch
+	waveEntries                               [MaxPersistGroupBatches][]seglog.Entry
+	waveHard                                  [MaxPersistGroupBatches]seglog.HardState
+	waveCheckpoint                            [MaxPersistGroupBatches]seglog.Checkpoint
+	pageRefs                                  []pageEntryRef
+	persistWaveTest                           func(seglog.Wave) error
+	namespaceProofTest                        func() error
+	checkpointHookTest                        func(CheckpointPhase) error
+	checkpointLeaveTempTest                   bool
+	closed                                    bool
+	poisoned                                  error
 }
 
 type GroupView struct {
@@ -193,7 +198,7 @@ func CreateNodeStore(dir string, identity Identity, key Key, bootstraps []NodeBo
 		_ = store.Close()
 		return nil, err
 	}
-	firstState, _ := engine.Group(bootstraps[0].GroupID)
+	firstState, _ := engine.Metadata(bootstraps[0].GroupID)
 	firstSnapshot, err := marshalSnapshot(bootstraps[0].Snapshot)
 	if err != nil {
 		_ = store.Close()
@@ -276,6 +281,7 @@ func OpenNodeStore(dir string, expected Identity, key Key, options NodeStoreOpti
 		store.cipherArena = make([]byte, 0, options.FrameBytes)
 		store.digestArena = make([]byte, 0, options.FrameBytes)
 		store.readPlain = make([]byte, 0, options.FrameBytes)
+		store.pageRefs = make([]pageEntryRef, 0, options.Events)
 		for i := range store.waveEntries {
 			store.waveEntries[i] = make([]seglog.Entry, 0, MaxReadyEntries)
 		}
@@ -341,6 +347,7 @@ func (s *NodeStore) reserve(options NodeStoreOptions, bootstraps []NodeBootstrap
 	s.cipherArena = make([]byte, 0, options.FrameBytes)
 	s.digestArena = make([]byte, 0, options.FrameBytes)
 	s.readPlain = make([]byte, 0, options.FrameBytes)
+	s.pageRefs = make([]pageEntryRef, 0, options.Events)
 	for i := range s.waveEntries {
 		s.waveEntries[i] = make([]seglog.Entry, 0, MaxReadyEntries)
 	}
@@ -566,16 +573,17 @@ func (s *NodeStore) PersistWave(ready []NodeReady) error {
 		}
 	}
 	id := nodeWaveID(ready)
-	totalPlain := 0
+	totalPlain, totalEntries := 0, 0
 	for _, item := range ready {
 		for _, entry := range item.Batch.Entries {
 			if entry == nil || totalPlain > math.MaxInt-len(entry.GetData()) {
 				return ErrBounds
 			}
 			totalPlain += len(entry.GetData())
+			totalEntries++
 		}
 	}
-	if totalPlain > cap(s.plainArena) || totalPlain+len(ready)*s.crypto.aead.Overhead() > cap(s.cipherArena) {
+	if totalPlain > cap(s.plainArena) || totalEntries > cap(s.pageRefs) || totalEntries > (cap(s.cipherArena)-totalPlain)/s.crypto.aead.Overhead() {
 		return ErrBounds
 	}
 	s.plainArena = s.plainArena[:totalPlain]
@@ -613,26 +621,15 @@ func (s *NodeStore) PersistWave(ready []NodeReady) error {
 			duplicateCount++
 			continue
 		}
-		nonceInput := &s.groupAAD
-		logID := s.engine.LogID()
-		copy(nonceInput[:16], logID[:])
-		copy(nonceInput[16:32], id[:])
-		binary.LittleEndian.PutUint64(nonceInput[32:40], item.GroupID)
-		nonceDigest := sha256.Sum256(nonceInput[:])
-		s.groupNonce = s.cryptoWork.deriveObjectNonce("node-group", item.GroupID, nonceDigest)
-		dataStart := plainOffset
 		entries := s.waveEntries[mappedCount][:0]
 		for _, entry := range batch.Entries {
 			data := entry.GetData()
 			copy(s.plainArena[plainOffset:], data)
-			entries = append(entries, seglog.Entry{Index: entry.GetIndex(), Term: entry.GetTerm(), Type: entry.GetType(), DataOffset: uint64(plainOffset - dataStart), DataBytes: uint64(len(data))})
+			entries = append(entries, seglog.Entry{Index: entry.GetIndex(), Term: entry.GetTerm(), Type: entry.GetType(), DataOffset: uint64(plainOffset), DataBytes: uint64(len(data))})
 			plainOffset += len(data)
 		}
 		s.waveEntries[mappedCount] = entries
-		cipherStart := len(s.cipherArena)
-		s.cipherArena = s.crypto.aead.Seal(s.cipherArena, s.groupNonce[:], s.plainArena[dataStart:plainOffset], nonceInput[:])
-		ciphertext := s.cipherArena[cipherStart:]
-		mapped := seglog.ReadyBatch{GroupID: item.GroupID, NodeIncarnation: batch.NodeIncarnation, ReadyID: batch.ReadyID, ReadyDigest: retryDigest, Entries: entries, Blob: ciphertext}
+		mapped := seglog.ReadyBatch{GroupID: item.GroupID, NodeIncarnation: batch.NodeIncarnation, ReadyID: batch.ReadyID, ReadyDigest: retryDigest, Entries: entries}
 		if len(entries) > 0 && entries[0].Index <= state.LastIndex {
 			mapped.ReplaceFrom = entries[0].Index
 		}
@@ -659,7 +656,11 @@ func (s *NodeStore) PersistWave(ready []NodeReady) error {
 	if duplicateCount == len(ready) {
 		return nil
 	}
-	wave := seglog.Wave{ID: id, Batches: s.waveBatches[:mappedCount]}
+	s.plainArena = s.plainArena[:plainOffset]
+	if err := s.packWaveExtents(id, mappedCount); err != nil {
+		return err
+	}
+	wave := seglog.Wave{ID: id, Batches: s.waveBatches[:mappedCount], Blob: s.cipherArena}
 	var persistErr error
 	if s.persistWaveTest != nil {
 		persistErr = s.persistWaveTest(wave)
@@ -678,6 +679,73 @@ func (s *NodeStore) PersistWave(ready []NodeReady) error {
 		return errors.Join(ErrPersistenceUnknown, err)
 	}
 	s.cacheValid = false
+	return nil
+}
+
+// packWaveExtents packs caller-sorted group data into entry-aligned shared
+// pages. The tag is paid once per page, including pages shared by tiny groups;
+// an entry larger than the target receives one dedicated extent.
+func (s *NodeStore) packWaveExtents(id seglog.WaveID, batches int) error {
+	s.pageRefs = s.pageRefs[:0]
+	if len(s.plainArena) == 0 {
+		s.cipherArena = s.cipherArena[:0]
+		return nil
+	}
+	for bi := 0; bi < batches; bi++ {
+		hasData := false
+		for ei := range s.waveBatches[bi].Entries {
+			hasData = hasData || s.waveBatches[bi].Entries[ei].DataBytes != 0
+		}
+		if !hasData {
+			for ei := range s.waveBatches[bi].Entries {
+				s.waveBatches[bi].Entries[ei].DataOffset = 0
+			}
+			continue
+		}
+		for ei := range s.waveBatches[bi].Entries {
+			s.pageRefs = append(s.pageRefs, pageEntryRef{batch: uint32(bi), entry: uint32(ei)})
+		}
+	}
+	s.cipherArena = s.cipherArena[:0]
+	for first, extentID := 0, uint64(1); first < len(s.pageRefs); extentID++ {
+		firstEntry := &s.waveBatches[s.pageRefs[first].batch].Entries[s.pageRefs[first].entry]
+		if firstEntry.DataOffset > uint64(len(s.plainArena)) || firstEntry.DataBytes > uint64(len(s.plainArena))-firstEntry.DataOffset {
+			return ErrBounds
+		}
+		plainStart, plainEnd := firstEntry.DataOffset, firstEntry.DataOffset+firstEntry.DataBytes
+		last := first + 1
+		for last < len(s.pageRefs) {
+			entry := &s.waveBatches[s.pageRefs[last].batch].Entries[s.pageRefs[last].entry]
+			if entry.DataOffset < plainEnd || entry.DataOffset > uint64(len(s.plainArena)) || entry.DataBytes > uint64(len(s.plainArena))-entry.DataOffset {
+				return ErrBounds
+			}
+			end := entry.DataOffset + entry.DataBytes
+			if entry.DataBytes != 0 && plainEnd > plainStart && end > plainStart+nodeDataExtentBytes {
+				break
+			}
+			plainEnd = end
+			last++
+		}
+		if plainEnd > uint64(len(s.plainArena)) || plainStart > plainEnd {
+			return ErrBounds
+		}
+		extentOffset := uint64(len(s.cipherArena))
+		aad := &s.groupAAD
+		logID := s.engine.LogID()
+		copy(aad[:16], logID[:])
+		copy(aad[16:32], id[:])
+		binary.LittleEndian.PutUint64(aad[32:40], extentID)
+		nonceDigest := sha256.Sum256(aad[:])
+		s.groupNonce = s.cryptoWork.deriveObjectNonce("node-page", extentID, nonceDigest)
+		s.cipherArena = s.crypto.aead.Seal(s.cipherArena, s.groupNonce[:], s.plainArena[plainStart:plainEnd], aad[:])
+		extentBytes := uint64(len(s.cipherArena)) - extentOffset
+		for i := first; i < last; i++ {
+			entry := &s.waveBatches[s.pageRefs[i].batch].Entries[s.pageRefs[i].entry]
+			entry.DataOffset -= plainStart
+			entry.ExtentID, entry.ExtentOffset, entry.ExtentBytes = extentID, extentOffset, extentBytes
+		}
+		first = last
+	}
 	return nil
 }
 
@@ -827,7 +895,10 @@ func (v *GroupView) Term(index uint64) (uint64, error) {
 	if err := v.store.usable(); err != nil {
 		return 0, err
 	}
-	_, term, compacted, ok := v.store.engine.Lookup(v.group, index)
+	_, term, compacted, ok, lookupErr := v.store.engine.LookupExact(v.group, index)
+	if lookupErr != nil {
+		return 0, lookupErr
+	}
 	if compacted {
 		return 0, raft.ErrCompacted
 	}
@@ -842,11 +913,11 @@ func (v *GroupView) FirstIndex() (uint64, error) {
 	if err := v.store.usable(); err != nil {
 		return 0, err
 	}
-	state, ok := v.store.engine.Group(v.group)
+	state, ok := v.store.engine.Metadata(v.group)
 	if !ok {
 		return 0, raft.ErrUnavailable
 	}
-	return state.Checkpoint.Index + 1, nil
+	return state.FirstIndex, nil
 }
 
 // ReadEntryInto authenticates and decrypts exactly the containing group batch.
@@ -857,12 +928,18 @@ func (v *GroupView) ReadEntryInto(index uint64, ciphertext, plaintext []byte) (B
 	if err := v.store.usable(); err != nil {
 		return BorrowedEntry{}, err
 	}
-	loc, _, compacted, ok := v.store.engine.Lookup(v.group, index)
+	loc, _, compacted, ok, lookupErr := v.store.engine.LookupExact(v.group, index)
+	if lookupErr != nil {
+		return BorrowedEntry{}, lookupErr
+	}
 	if compacted {
 		return BorrowedEntry{}, raft.ErrCompacted
 	}
 	if !ok {
 		return BorrowedEntry{}, raft.ErrUnavailable
+	}
+	if loc.Bytes == 0 {
+		return BorrowedEntry{Index: loc.Index, Term: loc.Term, Type: loc.Type, Data: plaintext[:0]}, nil
 	}
 	if loc.Bytes < uint64(v.store.crypto.aead.Overhead()) || uint64(len(ciphertext)) < loc.Bytes || cap(plaintext) < int(loc.Bytes)-v.store.crypto.aead.Overhead() {
 		return BorrowedEntry{}, ErrBounds
@@ -878,9 +955,9 @@ func (v *GroupView) ReadEntryInto(index uint64, ciphertext, plaintext []byte) (B
 	logID := v.store.engine.LogID()
 	copy(aad[:16], logID[:])
 	copy(aad[16:32], loc.BatchID[:])
-	binary.LittleEndian.PutUint64(aad[32:40], v.group)
+	binary.LittleEndian.PutUint64(aad[32:40], loc.ExtentID)
 	nonceDigest := sha256.Sum256(aad[:])
-	v.store.groupNonce = v.store.cryptoWork.deriveObjectNonce("node-group", v.group, nonceDigest)
+	v.store.groupNonce = v.store.cryptoWork.deriveObjectNonce("node-page", loc.ExtentID, nonceDigest)
 	plain, err := v.store.crypto.aead.Open(plaintext[:0], v.store.groupNonce[:], ciphertext, aad[:])
 	if err != nil || loc.DataOffset > uint64(len(plain)) || loc.DataBytes > uint64(len(plain))-loc.DataOffset {
 		return BorrowedEntry{}, ErrCorrupt
@@ -893,14 +970,11 @@ func (v *GroupView) LastIndex() (uint64, error) {
 	if err := v.store.usable(); err != nil {
 		return 0, err
 	}
-	state, ok := v.store.engine.Group(v.group)
+	state, ok := v.store.engine.Metadata(v.group)
 	if !ok {
 		return 0, raft.ErrUnavailable
 	}
-	if len(state.Entries) == 0 {
-		return state.Checkpoint.Index, nil
-	}
-	return state.Entries[len(state.Entries)-1].Index, nil
+	return state.LastIndex, nil
 }
 func (v *GroupView) InitialState() (*pb.HardState, *pb.ConfState, error) {
 	v.store.mu.Lock()
@@ -908,7 +982,7 @@ func (v *GroupView) InitialState() (*pb.HardState, *pb.ConfState, error) {
 	if err := v.store.usable(); err != nil {
 		return nil, nil, err
 	}
-	state, ok := v.store.engine.Group(v.group)
+	state, ok := v.store.engine.Metadata(v.group)
 	if !ok {
 		return nil, nil, raft.ErrUnavailable
 	}
@@ -925,7 +999,7 @@ func (v *GroupView) Snapshot() (*pb.Snapshot, error) {
 	if err := v.store.usable(); err != nil {
 		return nil, err
 	}
-	state, ok := v.store.engine.Group(v.group)
+	state, ok := v.store.engine.Metadata(v.group)
 	if !ok {
 		return nil, raft.ErrUnavailable
 	}
@@ -937,21 +1011,30 @@ func (v *GroupView) Entries(lo, hi, maxSize uint64) ([]*pb.Entry, error) {
 	if err := v.store.usable(); err != nil {
 		return nil, err
 	}
-	state, ok := v.store.engine.Group(v.group)
+	state, ok := v.store.engine.Metadata(v.group)
 	if !ok {
 		return nil, raft.ErrUnavailable
 	}
-	first := state.Checkpoint.Index + 1
+	first := state.FirstIndex
 	if lo < first {
 		return nil, raft.ErrCompacted
 	}
-	if hi < lo || hi > first+uint64(len(state.Entries)) {
+	if hi < lo || hi > state.LastIndex+1 {
 		return nil, raft.ErrUnavailable
 	}
 	result := make([]*pb.Entry, 0, hi-lo)
 	var size uint64
 	for index := lo; index < hi; index++ {
-		loc := state.Entries[index-first]
+		loc, _, compacted, found, lookupErr := v.store.engine.LookupExact(v.group, index)
+		if lookupErr != nil {
+			return nil, lookupErr
+		}
+		if compacted {
+			return nil, raft.ErrCompacted
+		}
+		if !found {
+			return nil, raft.ErrUnavailable
+		}
 		entry, err := v.store.readEntry(v.group, loc)
 		if err != nil {
 			return nil, err
@@ -967,7 +1050,11 @@ func (v *GroupView) Entries(lo, hi, maxSize uint64) ([]*pb.Entry, error) {
 }
 
 func (s *NodeStore) readEntry(group uint64, loc seglog.EntryLocation) (*pb.Entry, error) {
-	if !s.cacheValid || s.cachedGroup != group || s.cachedBatch != loc.BatchID {
+	if loc.Bytes == 0 {
+		index, term, entryType := loc.Index, loc.Term, loc.Type
+		return &pb.Entry{Index: &index, Term: &term, Type: &entryType}, nil
+	}
+	if !s.cacheValid || s.cachedSegment != loc.SegmentID || s.cachedOffset != loc.Offset || s.cachedBatch != loc.BatchID || s.cachedExtent != loc.ExtentID {
 		if err := s.engine.PrepareSegment(loc.SegmentID); err != nil {
 			return nil, err
 		}
@@ -982,15 +1069,15 @@ func (s *NodeStore) readEntry(group uint64, loc seglog.EntryLocation) (*pb.Entry
 		logID := s.engine.LogID()
 		copy(aad[:16], logID[:])
 		copy(aad[16:32], loc.BatchID[:])
-		binary.LittleEndian.PutUint64(aad[32:40], group)
+		binary.LittleEndian.PutUint64(aad[32:40], loc.ExtentID)
 		nonceDigest := sha256.Sum256(aad[:])
-		s.groupNonce = s.cryptoWork.deriveObjectNonce("node-group", group, nonceDigest)
+		s.groupNonce = s.cryptoWork.deriveObjectNonce("node-page", loc.ExtentID, nonceDigest)
 		s.readPlain, err = s.crypto.aead.Open(s.readPlain[:0], s.groupNonce[:], ciphertext, aad[:])
 		if err != nil {
 			s.cacheValid = false
 			return nil, ErrCorrupt
 		}
-		s.cachedGroup, s.cachedBatch, s.cacheValid = group, loc.BatchID, true
+		s.cachedSegment, s.cachedOffset, s.cachedBatch, s.cachedExtent, s.cacheValid = loc.SegmentID, loc.Offset, loc.BatchID, loc.ExtentID, true
 	}
 	if loc.DataOffset > uint64(len(s.readPlain)) || loc.DataBytes > uint64(len(s.readPlain))-loc.DataOffset {
 		return nil, ErrCorrupt
