@@ -18,6 +18,12 @@ const (
 	ManifestName                = "MANIFEST.v3"
 	RecordEntry          uint16 = 1
 	RecordTruncateSuffix uint16 = 2
+	RecordWave           uint16 = 3
+	eventHardState       uint16 = 4
+	eventPrefix          uint16 = 5
+	eventCheckpoint      uint16 = 6
+	eventWave            uint16 = 7
+	eventWaveEntry       uint16 = 8
 
 	manifestHeaderBytes     = 128
 	manifestSegmentBytes    = 112
@@ -81,6 +87,9 @@ type segmentFooter struct {
 type segmentEvent struct {
 	Kind                                uint16
 	GroupID, Index, Term, Offset, Bytes uint64
+	Vote, Commit                        uint64
+	Reference                           [16]byte
+	Digest                              [32]byte
 }
 
 type Record struct {
@@ -312,7 +321,7 @@ func unmarshalSegmentFooter(b []byte) (segmentFooter, error) {
 	f.IndexOffset = binary.LittleEndian.Uint64(b[112:120])
 	f.IndexBytes = binary.LittleEndian.Uint64(b[120:128])
 	f.Events = binary.LittleEndian.Uint64(b[128:136])
-	if f.ID == 0 || f.Generation == 0 || f.DataBytes < segmentHeaderBytes || f.IndexOffset != f.DataBytes || f.IndexBytes < segmentIndexHeaderBytes+4 || f.IndexBytes > maxSegmentIndexBytes || f.Events != f.Records || !allZero(b[136:segmentFooterBytes-4]) {
+	if f.ID == 0 || f.Generation == 0 || f.DataBytes < segmentHeaderBytes || f.IndexOffset != f.DataBytes || f.IndexBytes < segmentIndexHeaderBytes+4 || f.IndexBytes > maxSegmentIndexBytes || !allZero(b[136:segmentFooterBytes-4]) {
 		return segmentFooter{}, fmt.Errorf("%w: footer state", ErrCorrupt)
 	}
 	return f, nil
@@ -336,19 +345,38 @@ func marshalSegmentIndex(events []segmentEvent, dataBytes uint64) ([]byte, error
 		b = appendUvarint(b, uint64(last-first))
 		previousOffset := uint64(0)
 		for _, event := range ordered[first:last] {
-			if event.Kind != RecordEntry && event.Kind != RecordTruncateSuffix {
-				return nil, ErrCorrupt
-			}
 			b = append(b, byte(event.Kind))
-			b = appendUvarint(b, event.Index)
-			b = appendUvarint(b, event.Term)
-			if event.Kind == RecordEntry {
-				if event.Offset <= previousOffset || event.Bytes < recordHeaderBytes || event.Offset > dataBytes || event.Bytes > dataBytes-event.Offset {
+			switch event.Kind {
+			case RecordEntry, eventWaveEntry:
+				b = appendUvarint(b, event.Index)
+				b = appendUvarint(b, event.Term)
+				minimum := uint64(recordHeaderBytes)
+				if event.Kind == eventWaveEntry {
+					minimum = 0
+				}
+				if event.Offset <= previousOffset || event.Bytes < minimum || event.Offset > dataBytes || event.Bytes > dataBytes-event.Offset {
 					return nil, ErrCorrupt
 				}
 				b = appendUvarint(b, event.Offset-previousOffset)
 				b = appendUvarint(b, event.Bytes)
 				previousOffset = event.Offset
+			case RecordTruncateSuffix, eventPrefix:
+				b = appendUvarint(b, event.Index)
+				b = appendUvarint(b, event.Term)
+			case eventHardState:
+				b = appendUvarint(b, event.Term)
+				b = appendUvarint(b, event.Vote)
+				b = appendUvarint(b, event.Commit)
+			case eventCheckpoint:
+				b = appendUvarint(b, event.Index)
+				b = appendUvarint(b, event.Term)
+				b = append(b, event.Reference[:]...)
+			case eventWave:
+				b = appendUvarint(b, event.Index)
+				b = append(b, event.Reference[:]...)
+				b = append(b, event.Digest[:]...)
+			default:
+				return nil, ErrCorrupt
 			}
 		}
 		groups++
@@ -401,29 +429,85 @@ func unmarshalSegmentIndex(b []byte, dataBytes, eventCount uint64) ([]segmentEve
 		previousOffset := uint64(0)
 		for range count {
 			tag, err := cursor.byte()
-			if err != nil || (tag != byte(RecordEntry) && tag != byte(RecordTruncateSuffix)) {
+			if err != nil || tag < byte(RecordEntry) || tag > byte(eventWaveEntry) || tag == byte(RecordWave) {
 				return nil, fmt.Errorf("%w: event kind", ErrCorrupt)
 			}
-			index, err := cursor.uvarint()
-			if err != nil || index == 0 {
-				return nil, fmt.Errorf("%w: event index", ErrCorrupt)
-			}
-			term, err := cursor.uvarint()
-			if err != nil || (tag == byte(RecordEntry) && term == 0) {
-				return nil, fmt.Errorf("%w: event term", ErrCorrupt)
-			}
-			event := segmentEvent{Kind: uint16(tag), GroupID: group, Index: index, Term: term}
-			if event.Kind == RecordEntry {
+			event := segmentEvent{Kind: uint16(tag), GroupID: group}
+			switch event.Kind {
+			case RecordEntry, eventWaveEntry:
+				event.Index, err = cursor.uvarint()
+				if err != nil || event.Index == 0 {
+					return nil, fmt.Errorf("%w: event index", ErrCorrupt)
+				}
+				event.Term, err = cursor.uvarint()
+				if err != nil || event.Term == 0 {
+					return nil, fmt.Errorf("%w: event term", ErrCorrupt)
+				}
 				delta, err := cursor.uvarint()
 				if err != nil || delta == 0 || previousOffset > ^uint64(0)-delta {
 					return nil, fmt.Errorf("%w: event offset", ErrCorrupt)
 				}
 				event.Offset = previousOffset + delta
 				event.Bytes, err = cursor.uvarint()
-				if err != nil || event.Bytes < recordHeaderBytes || event.Offset < segmentHeaderBytes || event.Offset > dataBytes || event.Bytes > dataBytes-event.Offset {
+				minimum := uint64(recordHeaderBytes)
+				if event.Kind == eventWaveEntry {
+					minimum = 0
+				}
+				if err != nil || event.Bytes < minimum || event.Offset < segmentHeaderBytes || event.Offset > dataBytes || event.Bytes > dataBytes-event.Offset {
 					return nil, fmt.Errorf("%w: event geometry", ErrCorrupt)
 				}
 				previousOffset = event.Offset
+			case RecordTruncateSuffix, eventPrefix:
+				event.Index, err = cursor.uvarint()
+				if err != nil || event.Index == 0 {
+					return nil, fmt.Errorf("%w: event index", ErrCorrupt)
+				}
+				event.Term, err = cursor.uvarint()
+				if err != nil {
+					return nil, fmt.Errorf("%w: event term", ErrCorrupt)
+				}
+			case eventHardState:
+				event.Term, err = cursor.uvarint()
+				if err != nil {
+					return nil, ErrCorrupt
+				}
+				event.Vote, err = cursor.uvarint()
+				if err != nil {
+					return nil, ErrCorrupt
+				}
+				event.Commit, err = cursor.uvarint()
+				if err != nil {
+					return nil, ErrCorrupt
+				}
+			case eventCheckpoint:
+				event.Index, err = cursor.uvarint()
+				if err != nil || event.Index == 0 {
+					return nil, ErrCorrupt
+				}
+				event.Term, err = cursor.uvarint()
+				if err != nil || event.Term == 0 {
+					return nil, ErrCorrupt
+				}
+				reference, err := cursor.take(16)
+				if err != nil {
+					return nil, err
+				}
+				copy(event.Reference[:], reference)
+			case eventWave:
+				event.Index, err = cursor.uvarint()
+				if err != nil || event.Index == 0 {
+					return nil, ErrCorrupt
+				}
+				reference, err := cursor.take(16)
+				if err != nil {
+					return nil, err
+				}
+				copy(event.Reference[:], reference)
+				digest, err := cursor.take(32)
+				if err != nil {
+					return nil, err
+				}
+				copy(event.Digest[:], digest)
 			}
 			result = append(result, event)
 		}
@@ -453,6 +537,14 @@ func (c *canonicalCursor) byte() (byte, error) {
 	v := c.data[c.off]
 	c.off++
 	return v, nil
+}
+func (c *canonicalCursor) take(n int) ([]byte, error) {
+	if n < 0 || n > len(c.data)-c.off {
+		return nil, io.ErrUnexpectedEOF
+	}
+	result := c.data[c.off : c.off+n]
+	c.off += n
+	return result, nil
 }
 func (c *canonicalCursor) uvarint() (uint64, error) {
 	if c.off >= len(c.data) {

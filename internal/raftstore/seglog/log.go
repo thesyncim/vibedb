@@ -393,9 +393,6 @@ func (l *Log) Rotate(hook func(RotationPhase) error) error {
 	if n := len(l.manifest.Segments); n != 0 {
 		previous = l.manifest.Segments[n-1].Hash
 	}
-	if l.records != uint64(len(l.events)) {
-		return l.poison(fmt.Errorf("%w: active event count", ErrCorrupt))
-	}
 	indexBytes, encodeErr := marshalSegmentIndex(l.events, dataBytes)
 	if encodeErr != nil {
 		return l.poison(encodeErr)
