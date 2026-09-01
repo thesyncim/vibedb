@@ -110,23 +110,23 @@ func replicatedTransactionEncoderFixture(t testing.TB) (ReplicatedRoute, distrib
 		t.Fatal(err)
 	}
 	return ReplicatedRoute{
-		Distribution: distribution.DistributionName("docs"), Shard: distribution.ShardID("-80"),
-		Group: raftmember.GroupKey{
-			ClusterID: [16]byte{1}, ClusterIncarnation: [16]byte{2},
-			TopologyRecoveryEpoch: 1, ShardIncarnation: [16]byte{3}, GroupID: [16]byte{4},
-		},
-		AllocationGeneration: 1,
-		Command: raftservice.CommandFence{
-			ReplicaSetVersion: 1, ActivePolicyGeneration: 1, ProtectionEpoch: 1,
-			OwnershipEpoch: 1, SchemaGeneration: 1, RelationManifestDigest: [32]byte{1},
-			RoutingVersion: 1, RouteGeneration: 1,
-		},
-	}, distributedtxn.ReplicatedCommand{
-		Role:      distributedtxn.ReplicatedRoleCoordinator,
-		Operation: distributedtxn.ReplicatedStageCoordinator,
-		ID:        id, PayloadKind: distributedtxn.ReplicatedPayloadCoordinator, Payload: payload,
-		ControllerEpoch: 1, ExecutionPinDigest: distributedtxn.Digest{1},
-	}
+			Distribution: distribution.DistributionName("docs"), Shard: distribution.ShardID("-80"),
+			Group: raftmember.GroupKey{
+				ClusterID: [16]byte{1}, ClusterIncarnation: [16]byte{2},
+				TopologyRecoveryEpoch: 1, ShardIncarnation: [16]byte{3}, GroupID: [16]byte{4},
+			},
+			AllocationGeneration: 1,
+			Command: raftservice.CommandFence{
+				ReplicaSetVersion: 1, ActivePolicyGeneration: 1, ProtectionEpoch: 1,
+				OwnershipEpoch: 1, SchemaGeneration: 1, RelationManifestDigest: [32]byte{1},
+				RoutingVersion: 1, RouteGeneration: 1,
+			},
+		}, distributedtxn.ReplicatedCommand{
+			Role:      distributedtxn.ReplicatedRoleCoordinator,
+			Operation: distributedtxn.ReplicatedStageCoordinator,
+			ID:        id, PayloadKind: distributedtxn.ReplicatedPayloadCoordinator, Payload: payload,
+			ControllerEpoch: 1, ExecutionPinDigest: distributedtxn.Digest{1},
+		}
 }
 
 func TestReplicatedTransactionCommandEncoderPreservesPrefixAndBoundsScratch(t *testing.T) {
