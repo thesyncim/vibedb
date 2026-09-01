@@ -47,6 +47,20 @@ type NodeReady struct {
 	Batch   raftmodel.PersistBatch
 }
 
+type GroupIncarnation struct {
+	GroupID, Incarnation uint64
+}
+
+type CheckpointPhase uint8
+
+const (
+	CheckpointTempWritten CheckpointPhase = iota + 1
+	CheckpointFileSynced
+	CheckpointRenamed
+	CheckpointDirectorySynced
+	CheckpointBeforeLogReference
+)
+
 type NodeStore struct {
 	mu                                   sync.Mutex
 	dir                                  string
@@ -73,6 +87,8 @@ type NodeStore struct {
 	waveCheckpoint                       [MaxPersistGroupBatches]seglog.Checkpoint
 	persistWaveTest                      func(seglog.Wave) error
 	namespaceProofTest                   func() error
+	checkpointHookTest                   func(CheckpointPhase) error
+	checkpointLeaveTempTest              bool
 	closed                               bool
 	poisoned                             error
 }
@@ -135,12 +151,6 @@ func CreateNodeStore(dir string, identity Identity, key Key, bootstraps []NodeBo
 	if err = os.Mkdir(dir, 0o700); err != nil {
 		return nil, err
 	}
-	cleanup := true
-	defer func() {
-		if cleanup {
-			_ = os.RemoveAll(dir)
-		}
-	}()
 	lock, err := os.OpenFile(filepath.Join(dir, nodeLockName), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, err
@@ -164,6 +174,12 @@ func CreateNodeStore(dir string, identity Identity, key Key, bootstraps []NodeBo
 	}
 	cryptoState, err := makeFileCrypto(key, engine.LogID())
 	if err != nil {
+		_ = engine.Close()
+		_ = lock.Close()
+		return nil, err
+	}
+	authKey := deriveFileSecret(key.Material, engine.LogID(), "seglog-auth-key")
+	if err = engine.SetAuthenticationKey(authKey); err != nil {
 		_ = engine.Close()
 		_ = lock.Close()
 		return nil, err
@@ -192,7 +208,6 @@ func CreateNodeStore(dir string, identity Identity, key Key, bootstraps []NodeBo
 		_ = store.Close()
 		return nil, err
 	}
-	cleanup = false
 	return store, nil
 }
 
@@ -233,16 +248,17 @@ func OpenNodeStore(dir string, expected Identity, key Key, options NodeStoreOpti
 	if err != nil {
 		return fail(nil, err)
 	}
-	engine, err := seglog.OpenEngine(filepath.Join(dir, nodeLogDir))
+	cryptoState, err := makeFileCrypto(key, logID)
+	if err != nil {
+		return fail(nil, err)
+	}
+	authKey := deriveFileSecret(key.Material, logID, "seglog-auth-key")
+	engine, err := seglog.OpenEngineAuthenticated(filepath.Join(dir, nodeLogDir), authKey)
 	if err != nil {
 		return fail(nil, err)
 	}
 	if engine.LogID() != logID {
 		return fail(engine, ErrIdentityMismatch)
-	}
-	cryptoState, err := makeFileCrypto(key, logID)
-	if err != nil {
-		return fail(engine, err)
 	}
 	store := &NodeStore{dir: dir, identity: identity, key: key, options: normalized, engine: engine, lock: lock, crypto: cryptoState, cryptoWork: newObjectCryptoWorkspace(cryptoState.dataKey, cryptoState.nonceKey)}
 	if err = engine.Reserve(options.FrameBytes, options.Events, options.WaveIDs); err == nil {
@@ -449,13 +465,39 @@ func (s *NodeStore) publishCheckpoint(group uint64, snapshot *pb.Snapshot) (segl
 	} else if !errors.Is(statErr, os.ErrNotExist) {
 		return seglog.Checkpoint{}, statErr
 	}
+	if orphan, readErr := os.ReadFile(tmp); readErr == nil {
+		if len(orphan) == len(header)+len(ciphertext) && bytes.Equal(orphan[:len(header)], header) && bytes.Equal(orphan[len(header):], ciphertext) {
+			orphanFile, openErr := os.OpenFile(tmp, os.O_RDWR, 0)
+			if openErr != nil {
+				return seglog.Checkpoint{}, openErr
+			}
+			if syncErr := errors.Join(orphanFile.Sync(), orphanFile.Close()); syncErr != nil {
+				return seglog.Checkpoint{}, syncErr
+			}
+			if renameErr := os.Rename(tmp, final); renameErr != nil {
+				return seglog.Checkpoint{}, renameErr
+			}
+			if syncErr := syncNodeDirectory(filepath.Join(s.dir, nodeCheckpointDir)); syncErr != nil {
+				return seglog.Checkpoint{}, syncErr
+			}
+			return seglog.Checkpoint{ID: id, Index: index, Term: term}, nil
+		}
+		if removeErr := os.Remove(tmp); removeErr != nil {
+			return seglog.Checkpoint{}, removeErr
+		}
+		if syncErr := syncNodeDirectory(filepath.Join(s.dir, nodeCheckpointDir)); syncErr != nil {
+			return seglog.Checkpoint{}, syncErr
+		}
+	} else if !errors.Is(readErr, os.ErrNotExist) {
+		return seglog.Checkpoint{}, readErr
+	}
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return seglog.Checkpoint{}, err
 	}
 	ok := false
 	defer func() {
-		if !ok {
+		if !ok && !s.checkpointLeaveTempTest {
 			_ = f.Close()
 			_ = os.Remove(tmp)
 		}
@@ -463,8 +505,14 @@ func (s *NodeStore) publishCheckpoint(group uint64, snapshot *pb.Snapshot) (segl
 	if _, err = f.Write(header); err == nil {
 		_, err = f.Write(ciphertext)
 	}
+	if err == nil && s.checkpointHookTest != nil {
+		err = s.checkpointHookTest(CheckpointTempWritten)
+	}
 	if err == nil {
 		err = f.Sync()
+	}
+	if err == nil && s.checkpointHookTest != nil {
+		err = s.checkpointHookTest(CheckpointFileSynced)
 	}
 	if err == nil {
 		err = f.Close()
@@ -472,15 +520,28 @@ func (s *NodeStore) publishCheckpoint(group uint64, snapshot *pb.Snapshot) (segl
 	if err == nil {
 		err = os.Rename(tmp, final)
 	}
+	if err == nil && s.checkpointHookTest != nil {
+		err = s.checkpointHookTest(CheckpointRenamed)
+	}
 	if err == nil {
-		d, _ := os.Open(filepath.Join(s.dir, nodeCheckpointDir))
-		err = errors.Join(d.Sync(), d.Close())
+		err = syncNodeDirectory(filepath.Join(s.dir, nodeCheckpointDir))
+	}
+	if err == nil && s.checkpointHookTest != nil {
+		err = s.checkpointHookTest(CheckpointDirectorySynced)
 	}
 	if err != nil {
 		return seglog.Checkpoint{}, err
 	}
 	ok = true
 	return seglog.Checkpoint{ID: id, Index: index, Term: term}, nil
+}
+
+func syncNodeDirectory(path string) error {
+	directory, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	return errors.Join(directory.Sync(), directory.Close())
 }
 
 func (s *NodeStore) PersistWave(ready []NodeReady) error {
@@ -523,7 +584,7 @@ func (s *NodeStore) PersistWave(ready []NodeReady) error {
 	for _, item := range ready {
 		batch := item.Batch
 		state, ok := s.engine.Summary(item.GroupID)
-		if !ok {
+		if !ok || batch.NodeIncarnation == 0 || batch.NodeIncarnation != state.NodeIncarnation {
 			return ErrInvalid
 		}
 		s.digestArena = s.digestArena[:0]
@@ -586,7 +647,11 @@ func (s *NodeStore) PersistWave(ready []NodeReady) error {
 			}
 			s.waveCheckpoint[mappedCount] = cp
 			mapped.Checkpoint = &s.waveCheckpoint[mappedCount]
-			mapped.TruncateIndex, mapped.TruncateTerm = cp.Index, cp.Term
+			if s.checkpointHookTest != nil {
+				if err = s.checkpointHookTest(CheckpointBeforeLogReference); err != nil {
+					return err
+				}
+			}
 		}
 		s.waveBatches[mappedCount] = mapped
 		mappedCount++
@@ -613,6 +678,94 @@ func (s *NodeStore) PersistWave(ready []NodeReady) error {
 		return errors.Join(ErrPersistenceUnknown, err)
 	}
 	s.cacheValid = false
+	return nil
+}
+
+// BeginIncarnations durably allocates the exact next incarnation for each
+// caller-sorted group in one control wave and one durability barrier.
+func (s *NodeStore) BeginIncarnations(groups []uint64) ([]GroupIncarnation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.usable(); err != nil {
+		return nil, err
+	}
+	if len(groups) == 0 || len(groups) > MaxPersistGroupBatches {
+		return nil, ErrInvalid
+	}
+	requests := make([]GroupIncarnation, len(groups))
+	for i, group := range groups {
+		if group == 0 || i > 0 && groups[i-1] >= group {
+			return nil, ErrInvalid
+		}
+		state, ok := s.engine.Summary(group)
+		if !ok || state.NodeIncarnation == math.MaxUint64 {
+			return nil, ErrInvalid
+		}
+		requests[i] = GroupIncarnation{GroupID: group, Incarnation: state.NodeIncarnation + 1}
+	}
+	if err := s.persistIncarnationsLocked(requests); err != nil {
+		return requests, err
+	}
+	return requests, nil
+}
+
+// PersistIncarnations is the exact retry form for an allocation whose sync
+// outcome was unknown. A request already durable with ReadyID zero is omitted.
+func (s *NodeStore) PersistIncarnations(requests []GroupIncarnation) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.usable(); err != nil {
+		return err
+	}
+	return s.persistIncarnationsLocked(requests)
+}
+
+func (s *NodeStore) persistIncarnationsLocked(requests []GroupIncarnation) error {
+	if len(requests) == 0 || len(requests) > MaxPersistGroupBatches {
+		return ErrInvalid
+	}
+	if err := s.proveNamespace(); err != nil {
+		s.poisoned = err
+		return err
+	}
+	mapped := 0
+	var canonical [MaxPersistGroupBatches * 16]byte
+	for i, request := range requests {
+		if request.GroupID == 0 || request.Incarnation == 0 || i > 0 && requests[i-1].GroupID >= request.GroupID {
+			return ErrInvalid
+		}
+		state, ok := s.engine.Summary(request.GroupID)
+		if !ok {
+			return ErrInvalid
+		}
+		if request.Incarnation == state.NodeIncarnation && state.ReadyID == 0 {
+			continue
+		}
+		if request.Incarnation != state.NodeIncarnation+1 {
+			return ErrInvalid
+		}
+		binary.LittleEndian.PutUint64(canonical[mapped*16:mapped*16+8], request.GroupID)
+		binary.LittleEndian.PutUint64(canonical[mapped*16+8:mapped*16+16], request.Incarnation)
+		s.waveBatches[mapped] = seglog.ReadyBatch{GroupID: request.GroupID, BeginIncarnation: request.Incarnation}
+		mapped++
+	}
+	if mapped == 0 {
+		return nil
+	}
+	digest := sha256.Sum256(canonical[:mapped*16])
+	var id seglog.WaveID
+	copy(id[:], digest[:16])
+	if err := s.engine.PersistWave(seglog.Wave{ID: id, Batches: s.waveBatches[:mapped]}); err != nil {
+		if fatal := s.engine.FatalError(); fatal != nil {
+			s.poisoned = fatal
+			return errors.Join(ErrPersistenceUnknown, err, fatal)
+		}
+		return errors.Join(ErrInvalid, err)
+	}
+	if err := s.proveNamespace(); err != nil {
+		s.poisoned = err
+		return errors.Join(ErrPersistenceUnknown, err)
+	}
 	return nil
 }
 

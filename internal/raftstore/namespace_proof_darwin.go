@@ -5,6 +5,8 @@ package raftstore
 import (
 	"fmt"
 	"os"
+	"runtime"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
@@ -15,16 +17,14 @@ func provePinnedNamedFile(
 	file *os.File,
 	expectedSize int64,
 ) error {
-	if pinnedDirectory == nil || file == nil || len(parentPathNUL) < 2 || len(baseNUL) < 2 {
+	if pinnedDirectory == nil || file == nil || !validNULTerminatedPath(parentPathNUL) || !validNULTerminatedPath(baseNUL) {
 		return ErrNamespaceChanged
 	}
-	parentPath := parentPathNUL[:len(parentPathNUL)-1]
-	base := baseNUL[:len(baseNUL)-1]
 	var pinnedDirectoryStat, pinnedEntry, fileStat unix.Stat_t
 	if err := unix.Fstat(int(pinnedDirectory.Fd()), &pinnedDirectoryStat); err != nil {
 		return fmt.Errorf("%w: stat pinned parent: %v", ErrNamespaceChanged, err)
 	}
-	if err := unix.Fstatat(int(pinnedDirectory.Fd()), base, &pinnedEntry, unix.AT_SYMLINK_NOFOLLOW); err != nil ||
+	if err := rawFstatat(int(pinnedDirectory.Fd()), baseNUL, &pinnedEntry, unix.AT_SYMLINK_NOFOLLOW); err != nil ||
 		pinnedEntry.Mode&unix.S_IFMT != unix.S_IFREG {
 		return fmt.Errorf("%w: stat pinned WAL leaf: %v", ErrNamespaceChanged, err)
 	}
@@ -32,7 +32,7 @@ func provePinnedNamedFile(
 		!sameUnixFile(&fileStat, &pinnedEntry) || fileStat.Size != expectedSize {
 		return fmt.Errorf("%w: WAL descriptor no longer names leaf/capacity", ErrNamespaceChanged)
 	}
-	liveFD, err := unix.Open(parentPath, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	liveFD, err := rawOpenDirectory(parentPathNUL)
 	if err != nil {
 		return fmt.Errorf("%w: reopen live parent: %v", ErrNamespaceChanged, err)
 	}
@@ -42,12 +42,33 @@ func provePinnedNamedFile(
 		!sameUnixFile(&pinnedDirectoryStat, &liveDirectory) {
 		return fmt.Errorf("%w: live parent path was rebound", ErrNamespaceChanged)
 	}
-	if err := unix.Fstatat(liveFD, base, &liveEntry, unix.AT_SYMLINK_NOFOLLOW); err != nil ||
+	if err := rawFstatat(liveFD, baseNUL, &liveEntry, unix.AT_SYMLINK_NOFOLLOW); err != nil ||
 		liveEntry.Mode&unix.S_IFMT != unix.S_IFREG || !sameUnixFile(&fileStat, &liveEntry) {
 		return fmt.Errorf("%w: live WAL leaf was replaced", ErrNamespaceChanged)
 	}
 	return nil
 }
+
+func rawFstatat(directory int, pathNUL string, stat *unix.Stat_t, flags int) error {
+	_, _, errno := unix.Syscall6(unix.SYS_FSTATAT64, uintptr(directory), uintptr(unsafe.Pointer(unsafe.StringData(pathNUL))), uintptr(unsafe.Pointer(stat)), uintptr(flags), 0, 0)
+	runtime.KeepAlive(pathNUL)
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+func rawOpenDirectory(pathNUL string) (int, error) {
+	directory := unix.AT_FDCWD
+	fd, _, errno := unix.Syscall6(unix.SYS_OPENAT, uintptr(directory), uintptr(unsafe.Pointer(unsafe.StringData(pathNUL))), uintptr(unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC), 0, 0, 0)
+	runtime.KeepAlive(pathNUL)
+	if errno != 0 {
+		return -1, errno
+	}
+	return int(fd), nil
+}
+
+func validNULTerminatedPath(path string) bool { return len(path) > 1 && path[len(path)-1] == 0 }
 
 func sameUnixFile(left, right *unix.Stat_t) bool {
 	return left != nil && right != nil &&

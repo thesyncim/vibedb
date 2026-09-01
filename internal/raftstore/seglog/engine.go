@@ -1,9 +1,11 @@
 package seglog
 
 import (
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"hash"
 	"hash/crc32"
 	"io"
 	"os"
@@ -37,6 +39,7 @@ type Checkpoint struct {
 }
 type ReadyBatch struct {
 	GroupID                     uint64
+	BeginIncarnation            uint64
 	NodeIncarnation, ReadyID    uint64
 	ReadyDigest                 [16]byte
 	ReplaceFrom                 uint64
@@ -91,6 +94,10 @@ type Engine struct {
 	writeAt      func(*os.File, []byte, int64) (int, error)
 	readers      []segmentReader
 	readerNext   int
+	authMAC      hash.Hash
+	authKey      [32]byte
+	authContext  [40]byte
+	authSum      [32]byte
 }
 
 func CreateEngine(dir string) (*Engine, error) {
@@ -99,6 +106,30 @@ func CreateEngine(dir string) (*Engine, error) {
 		return nil, err
 	}
 	return &Engine{log: l, groups: make(map[uint64]*engineGroup), waves: make(map[WaveID][32]byte), syncData: syncActiveData, writeAt: func(f *os.File, b []byte, off int64) (int, error) { return f.WriteAt(b, off) }}, nil
+}
+
+func (e *Engine) SetAuthenticationKey(key [32]byte) error {
+	if key == ([32]byte{}) || e.sequence != 0 || len(e.waves) != 0 {
+		return ErrRaftState
+	}
+	e.authMAC = hmac.New(sha256.New, key[:])
+	e.authKey = key
+	e.log.authKey = key
+	return nil
+}
+
+func (e *Engine) waveDigest(payload []byte, sequence uint64, id WaveID) [32]byte {
+	if e.authMAC == nil {
+		return sha256.Sum256(payload)
+	}
+	e.authMAC.Reset()
+	copy(e.authContext[:16], e.log.manifest.LogID[:])
+	binary.LittleEndian.PutUint64(e.authContext[16:24], sequence)
+	copy(e.authContext[24:40], id[:])
+	_, _ = e.authMAC.Write(e.authContext[:])
+	_, _ = e.authMAC.Write(payload)
+	_ = e.authMAC.Sum(e.authSum[:0])
+	return e.authSum
 }
 
 func (e *Engine) Close() error {
@@ -334,6 +365,9 @@ func (e *Engine) FatalError() error {
 	return e.log.usable()
 }
 
+// SetDataSyncForTesting installs a deterministic durability fault seam.
+func (e *Engine) SetDataSyncForTesting(sync func(*os.File) error) { e.syncData = sync }
+
 // PersistWave makes a caller-sorted, multi-group Ready wave durable with one
 // append and one data-sync. The frame is the acknowledgement boundary: its
 // checksum and canonical payload digest cover every batch, so recovery applies
@@ -451,6 +485,9 @@ func (e *Engine) prepareWave(w Wave, validateState bool) ([]byte, [32]byte, []se
 		if flags&batchIdentity != 0 {
 			needed++
 		}
+		if flags&batchBegin != 0 {
+			needed++
+		}
 		if len(e.eventScratch)+needed+1 > cap(e.eventScratch) || validateState && len(group.Entries)-replacementCount(group.Entries, batch.ReplaceFrom)+len(batch.Entries) > cap(group.Entries) {
 			return nil, [32]byte{}, nil, ErrBounds
 		}
@@ -462,6 +499,12 @@ func (e *Engine) prepareWave(w Wave, validateState bool) ([]byte, [32]byte, []se
 			e.frameBuf = append(e.frameBuf, batch.ReadyDigest[:]...)
 			if validateState {
 				e.eventScratch = append(e.eventScratch, segmentEvent{Kind: eventReadyState, GroupID: batch.GroupID, Incarnation: batch.NodeIncarnation, ReadyID: batch.ReadyID, ReadyDigest: batch.ReadyDigest, Reference: w.ID})
+			}
+		}
+		if flags&batchBegin != 0 {
+			e.frameBuf = appendUvarint(e.frameBuf, batch.BeginIncarnation)
+			if validateState {
+				e.eventScratch = append(e.eventScratch, segmentEvent{Kind: eventIncarnation, GroupID: batch.GroupID, Incarnation: batch.BeginIncarnation})
 			}
 		}
 		if batch.ReplaceFrom != 0 {
@@ -532,7 +575,7 @@ func (e *Engine) prepareWave(w Wave, validateState bool) ([]byte, [32]byte, []se
 	if len(e.frameBuf) > maxRecordBytes || len(e.frameBuf) > cap(e.frameBuf) {
 		return nil, [32]byte{}, nil, ErrBounds
 	}
-	digest := sha256.Sum256(e.frameBuf[72:])
+	digest := e.waveDigest(e.frameBuf[72:], e.sequence+1, w.ID)
 	copy(e.frameBuf[40:72], digest[:])
 	if validateState {
 		e.eventScratch = append(e.eventScratch, segmentEvent{Kind: eventWave, GroupID: engineWaveGroup, Index: e.sequence + 1, Reference: w.ID, Digest: digest})
@@ -569,6 +612,10 @@ func waveSize(w Wave) (int, int, error) {
 		}
 		if batchFlags(b)&batchIdentity != 0 {
 			bytes += uvarintBytes(b.NodeIncarnation) + uvarintBytes(b.ReadyID) + 16
+			events++
+		}
+		if batchFlags(b)&batchBegin != 0 {
+			bytes += uvarintBytes(b.BeginIncarnation)
 			events++
 		}
 		hasTypes := batchFlags(b)&batchTypes != 0
@@ -620,6 +667,7 @@ const (
 	batchTypes      = 1 << 4
 	batchIdentity   = 1 << 5
 	batchBlob       = 1 << 6
+	batchBegin      = 1 << 7
 )
 
 func batchFlags(b *ReadyBatch) byte {
@@ -641,6 +689,9 @@ func batchFlags(b *ReadyBatch) byte {
 	}
 	if len(b.Blob) != 0 {
 		flags |= batchBlob
+	}
+	if b.BeginIncarnation != 0 {
+		flags |= batchBegin
 	}
 	for i := range b.Entries {
 		if b.Entries[i].Type != pb.EntryNormal {
@@ -700,6 +751,12 @@ func isBlobEvent(kind uint16) bool { return kind >= eventBlobEntry && kind <= ev
 
 func validateBatch(g *engineGroup, b *ReadyBatch) (byte, error) {
 	flags := batchFlags(b)
+	if flags&batchBegin != 0 {
+		if b.BeginIncarnation != g.NodeIncarnation+1 || flags != batchBegin || len(b.Entries) != 0 || b.Hard != nil || b.Checkpoint != nil || b.ReplaceFrom != 0 || b.TruncateIndex != 0 {
+			return 0, ErrRaftState
+		}
+		return flags, nil
+	}
 	if flags&batchIdentity != 0 {
 		if b.NodeIncarnation == 0 || b.ReadyID == 0 || b.ReadyDigest == ([16]byte{}) {
 			return 0, ErrRaftState
@@ -854,6 +911,11 @@ func (e *Engine) applyEvent(event segmentEvent, segmentID uint64) error {
 		e.groups[event.GroupID] = g
 	}
 	switch event.Kind {
+	case eventIncarnation:
+		if event.Incarnation != g.NodeIncarnation+1 {
+			return ErrRaftState
+		}
+		g.NodeIncarnation, g.ReadyID, g.ReadyDigest, g.ReadyWaveID = event.Incarnation, 0, [16]byte{}, WaveID{}
 	case eventReadyState:
 		if event.Incarnation == 0 || event.ReadyID == 0 || event.ReadyDigest == ([16]byte{}) {
 			return ErrRaftState
@@ -910,10 +972,21 @@ func (e *Engine) applyEvent(event segmentEvent, segmentID uint64) error {
 func (e *Engine) Rotate(hook func(RotationPhase) error) error { return e.log.Rotate(hook) }
 
 func OpenEngine(dir string) (*Engine, error) {
-	return openEngine(dir, syncActiveData)
+	return openEngineAuthenticated(dir, syncActiveData, [32]byte{})
 }
 
 func openEngine(dir string, startupSync func(*os.File) error) (*Engine, error) {
+	return openEngineAuthenticated(dir, startupSync, [32]byte{})
+}
+
+func OpenEngineAuthenticated(dir string, key [32]byte) (*Engine, error) {
+	if key == ([32]byte{}) {
+		return nil, ErrRaftState
+	}
+	return openEngineAuthenticated(dir, syncActiveData, key)
+}
+
+func openEngineAuthenticated(dir string, startupSync func(*os.File) error, key [32]byte) (*Engine, error) {
 	b, err := os.ReadFile(filepath.Join(dir, ManifestName))
 	if err != nil {
 		return nil, err
@@ -922,11 +995,15 @@ func openEngine(dir string, startupSync func(*os.File) error) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
-	l := &Log{dir: dir, manifest: manifest, index: make(map[uint64]*GroupIndex), last: make(map[uint64]uint64), lastTerm: make(map[uint64]uint64), buf: make([]byte, 0, 4096)}
+	l := &Log{dir: dir, manifest: manifest, index: make(map[uint64]*GroupIndex), last: make(map[uint64]uint64), lastTerm: make(map[uint64]uint64), buf: make([]byte, 0, 4096), authKey: key}
 	if err = l.reconcileRotation(); err != nil {
 		return nil, err
 	}
 	e := &Engine{log: l, groups: make(map[uint64]*engineGroup), waves: make(map[WaveID][32]byte), syncData: startupSync, writeAt: func(f *os.File, b []byte, off int64) (int, error) { return f.WriteAt(b, off) }}
+	if key != ([32]byte{}) {
+		e.authMAC = hmac.New(sha256.New, key[:])
+		e.authKey = key
+	}
 	if err = e.rebuild(); err != nil {
 		_ = l.Close()
 		return nil, err
@@ -938,7 +1015,7 @@ func openEngine(dir string, startupSync func(*os.File) error) (*Engine, error) {
 func (e *Engine) rebuild() error {
 	previousID, previousHash := e.log.manifest.AnchorID, e.log.manifest.AnchorHash
 	for _, want := range e.log.manifest.Segments {
-		got, _, events, err := readSealedMetadata(filepath.Join(e.log.dir, sealedName(want.ID)), e.log.manifest.LogID, previousID, previousHash)
+		got, _, events, err := readSealedMetadataAuthenticated(filepath.Join(e.log.dir, sealedName(want.ID)), e.log.manifest.LogID, previousID, previousHash, e.authKey)
 		if err != nil {
 			return err
 		}
@@ -999,7 +1076,7 @@ func (e *Engine) rebuild() error {
 		if _, err = e.log.active.ReadAt(frame[recordHeaderBytes:], int64(off+recordHeaderBytes)); err != nil {
 			return err
 		}
-		id, digest, batches, parseErr := decodeWaveFrame(frame, e.sequence+1)
+		id, digest, batches, parseErr := decodeWaveFrameForEngine(frame, e.sequence+1, e)
 		if parseErr != nil {
 			return parseErr
 		}
@@ -1059,6 +1136,10 @@ func inspectWaveHeader(header []byte) (uint64, error) {
 }
 
 func decodeWaveFrame(frame []byte, expectedSequence uint64) (WaveID, [32]byte, []ReadyBatch, error) {
+	return decodeWaveFrameForEngine(frame, expectedSequence, nil)
+}
+
+func decodeWaveFrameForEngine(frame []byte, expectedSequence uint64, engine *Engine) (WaveID, [32]byte, []ReadyBatch, error) {
 	if len(frame) < 72 {
 		return WaveID{}, [32]byte{}, nil, ErrCorrupt
 	}
@@ -1074,6 +1155,9 @@ func decodeWaveFrame(frame []byte, expectedSequence uint64) (WaveID, [32]byte, [
 	var stored [32]byte
 	copy(stored[:], frame[40:72])
 	digest := sha256.Sum256(frame[72:])
+	if engine != nil {
+		digest = engine.waveDigest(frame[72:], expectedSequence, id)
+	}
 	if stored != digest {
 		return id, digest, nil, ErrCorrupt
 	}
@@ -1094,7 +1178,7 @@ func decodeWaveFrame(frame []byte, expectedSequence uint64) (WaveID, [32]byte, [
 			return id, digest, nil, ErrCorrupt
 		}
 		flags, err := cursor.byte()
-		if err != nil || flags & ^byte(batchReplace|batchPrefix|batchCheckpoint|batchHard|batchTypes|batchIdentity|batchBlob) != 0 {
+		if err != nil || flags & ^byte(batchReplace|batchPrefix|batchCheckpoint|batchHard|batchTypes|batchIdentity|batchBlob|batchBegin) != 0 {
 			return id, digest, nil, ErrCorrupt
 		}
 		batch := ReadyBatch{GroupID: group}
@@ -1112,6 +1196,12 @@ func decodeWaveFrame(frame []byte, expectedSequence uint64) (WaveID, [32]byte, [
 				return id, digest, nil, ErrCorrupt
 			}
 			copy(batch.ReadyDigest[:], value)
+		}
+		if flags&batchBegin != 0 {
+			batch.BeginIncarnation, err = cursor.uvarint()
+			if err != nil || batch.BeginIncarnation == 0 {
+				return id, digest, nil, ErrCorrupt
+			}
 		}
 		if flags&batchReplace != 0 {
 			batch.ReplaceFrom, err = cursor.uvarint()
@@ -1255,6 +1345,9 @@ func (e *Engine) eventsForDecoded(batches []ReadyBatch, frameOffset, sequence ui
 		if batch.NodeIncarnation != 0 {
 			events = append(events, segmentEvent{Kind: eventReadyState, GroupID: batch.GroupID, Incarnation: batch.NodeIncarnation, ReadyID: batch.ReadyID, ReadyDigest: batch.ReadyDigest, Reference: id})
 		}
+		if batch.BeginIncarnation != 0 {
+			events = append(events, segmentEvent{Kind: eventIncarnation, GroupID: batch.GroupID, Incarnation: batch.BeginIncarnation})
+		}
 		if batch.ReplaceFrom != 0 {
 			events = append(events, segmentEvent{Kind: RecordTruncateSuffix, GroupID: batch.GroupID, Index: batch.ReplaceFrom, Term: predecessorTerm(g, batch.ReplaceFrom)})
 		}
@@ -1283,11 +1376,14 @@ func (e *Engine) DeepVerify() error {
 	if err := e.log.usable(); err != nil {
 		return err
 	}
-	verifier := &Engine{groups: make(map[uint64]*engineGroup), waves: make(map[WaveID][32]byte)}
+	verifier := &Engine{log: e.log, groups: make(map[uint64]*engineGroup), waves: make(map[WaveID][32]byte), authKey: e.authKey}
+	if e.authKey != ([32]byte{}) {
+		verifier.authMAC = hmac.New(sha256.New, e.authKey[:])
+	}
 	previousID, previousHash := e.log.manifest.AnchorID, e.log.manifest.AnchorHash
 	for _, want := range e.log.manifest.Segments {
 		path := filepath.Join(e.log.dir, sealedName(want.ID))
-		got, footer, indexed, err := readSealedMetadata(path, e.log.manifest.LogID, previousID, previousHash)
+		got, footer, indexed, err := readSealedMetadataAuthenticated(path, e.log.manifest.LogID, previousID, previousHash, e.authKey)
 		if err != nil {
 			return err
 		}
@@ -1358,7 +1454,7 @@ func verifyWaveFrames(file *os.File, end, segmentID uint64, verifier *Engine) ([
 		if _, err = file.ReadAt(frame[recordHeaderBytes:], int64(off+recordHeaderBytes)); err != nil {
 			return nil, 0, err
 		}
-		id, digest, batches, err := decodeWaveFrame(frame, verifier.sequence+1)
+		id, digest, batches, err := decodeWaveFrameForEngine(frame, verifier.sequence+1, verifier)
 		if err != nil {
 			return nil, 0, err
 		}

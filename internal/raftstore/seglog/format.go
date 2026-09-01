@@ -4,6 +4,8 @@
 package seglog
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -30,6 +32,7 @@ const (
 	eventBlobEntry       uint16 = 12
 	eventBlobEntryConf   uint16 = 13
 	eventBlobEntryConfV2 uint16 = 14
+	eventIncarnation     uint16 = 15
 
 	manifestHeaderBytes     = 128
 	manifestSegmentBytes    = 112
@@ -86,7 +89,7 @@ type segmentHeader struct {
 
 type segmentFooter struct {
 	ID, Generation, Records, DataBytes uint64
-	PreviousHash, Hash                 [32]byte
+	Auth, Hash                         [32]byte
 	IndexOffset, IndexBytes, Events    uint64
 }
 
@@ -311,7 +314,7 @@ func marshalSegmentFooter(f segmentFooter) []byte {
 	binary.LittleEndian.PutUint64(b[24:32], f.Generation)
 	binary.LittleEndian.PutUint64(b[32:40], f.Records)
 	binary.LittleEndian.PutUint64(b[40:48], f.DataBytes)
-	copy(b[48:80], f.PreviousHash[:])
+	copy(b[48:80], f.Auth[:])
 	copy(b[80:112], f.Hash[:])
 	binary.LittleEndian.PutUint64(b[112:120], f.IndexOffset)
 	binary.LittleEndian.PutUint64(b[120:128], f.IndexBytes)
@@ -325,7 +328,7 @@ func unmarshalSegmentFooter(b []byte) (segmentFooter, error) {
 		return segmentFooter{}, fmt.Errorf("%w: segment footer", ErrCorrupt)
 	}
 	f := segmentFooter{ID: binary.LittleEndian.Uint64(b[16:24]), Generation: binary.LittleEndian.Uint64(b[24:32]), Records: binary.LittleEndian.Uint64(b[32:40]), DataBytes: binary.LittleEndian.Uint64(b[40:48])}
-	copy(f.PreviousHash[:], b[48:80])
+	copy(f.Auth[:], b[48:80])
 	copy(f.Hash[:], b[80:112])
 	f.IndexOffset = binary.LittleEndian.Uint64(b[112:120])
 	f.IndexBytes = binary.LittleEndian.Uint64(b[120:128])
@@ -334,6 +337,23 @@ func unmarshalSegmentFooter(b []byte) (segmentFooter, error) {
 		return segmentFooter{}, fmt.Errorf("%w: footer state", ErrCorrupt)
 	}
 	return f, nil
+}
+
+func segmentMetadataMAC(key [32]byte, header segmentHeader, index []byte, footer segmentFooter) [32]byte {
+	if key == ([32]byte{}) {
+		return [32]byte{}
+	}
+	footer.Auth = [32]byte{}
+	encoded := marshalSegmentFooter(footer)
+	mac := hmac.New(sha256.New, key[:])
+	_, _ = mac.Write([]byte("vibedb/seglog-v3/sealed-metadata\x00"))
+	encodedHeader := marshalSegmentHeader(header)
+	_, _ = mac.Write(encodedHeader)
+	_, _ = mac.Write(index)
+	_, _ = mac.Write(encoded)
+	var result [32]byte
+	copy(result[:], mac.Sum(nil))
+	return result
 }
 
 func marshalSegmentIndex(events []segmentEvent, dataBytes uint64) ([]byte, error) {
@@ -407,6 +427,8 @@ func marshalSegmentIndex(events []segmentEvent, dataBytes uint64) ([]byte, error
 				b = appendUvarint(b, event.ReadyID)
 				b = append(b, event.ReadyDigest[:]...)
 				b = append(b, event.Reference[:]...)
+			case eventIncarnation:
+				b = appendUvarint(b, event.Incarnation)
 			default:
 				return nil, ErrCorrupt
 			}
@@ -462,7 +484,7 @@ func unmarshalSegmentIndex(b []byte, dataBytes, eventCount uint64) ([]segmentEve
 		previousBlobBytes := uint64(0)
 		for range count {
 			tag, err := cursor.byte()
-			if err != nil || tag < byte(RecordEntry) || tag > byte(eventBlobEntryConfV2) || tag == byte(RecordWave) {
+			if err != nil || tag < byte(RecordEntry) || tag > byte(eventIncarnation) || tag == byte(RecordWave) {
 				return nil, fmt.Errorf("%w: event kind", ErrCorrupt)
 			}
 			event := segmentEvent{Kind: uint16(tag), GroupID: group}
@@ -595,7 +617,9 @@ func unmarshalSegmentIndex(b []byte, dataBytes, eventCount uint64) ([]segmentEve
 					return nil, ErrCorrupt
 				}
 				copy(event.Reference[:], waveID)
-				if event.Reference == ([16]byte{}) {
+			case eventIncarnation:
+				event.Incarnation, err = cursor.uvarint()
+				if err != nil || event.Incarnation == 0 {
 					return nil, ErrCorrupt
 				}
 			}

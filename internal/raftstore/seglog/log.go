@@ -48,6 +48,7 @@ type Log struct {
 	events        []segmentEvent
 	poisoned      error
 	publishHook   func(Manifest) error
+	authKey       [32]byte
 }
 
 func activeName(id uint64) string { return fmt.Sprintf("%020d.active", id) }
@@ -402,7 +403,9 @@ func (l *Log) Rotate(hook func(RotationPhase) error) error {
 	} else if n != len(indexBytes) {
 		return l.poison(io.ErrShortWrite)
 	}
-	ftr := segmentFooter{ID: l.manifest.ActiveID, Generation: l.manifest.ActiveGeneration, Records: l.records, DataBytes: dataBytes, PreviousHash: previous, Hash: sum, IndexOffset: dataBytes, IndexBytes: uint64(len(indexBytes)), Events: uint64(len(l.events))}
+	ftr := segmentFooter{ID: l.manifest.ActiveID, Generation: l.manifest.ActiveGeneration, Records: l.records, DataBytes: dataBytes, Hash: sum, IndexOffset: dataBytes, IndexBytes: uint64(len(indexBytes)), Events: uint64(len(l.events))}
+	header := segmentHeader{ID: l.manifest.ActiveID, Generation: l.manifest.ActiveGeneration, PreviousID: l.expectedPreviousID(), PreviousHash: previous, LogID: l.manifest.LogID}
+	ftr.Auth = segmentMetadataMAC(l.authKey, header, indexBytes, ftr)
 	footerBytes := marshalSegmentFooter(ftr)
 	if n, writeErr := l.active.WriteAt(footerBytes, int64(dataBytes)+int64(len(indexBytes))); writeErr != nil {
 		return l.poison(writeErr)

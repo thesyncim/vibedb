@@ -11,6 +11,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftstore/seglog"
 	pb "go.etcd.io/raft/v3/raftpb"
+	"google.golang.org/protobuf/proto"
 )
 
 func nodeSnapshot(group, index, term uint64) *pb.Snapshot {
@@ -29,6 +30,9 @@ func TestNodeStoreRejectsCheckpointCollisionAndNamespaceReplacement(t *testing.T
 	snapshot := nodeSnapshot(10, 1, 1)
 	store, err := CreateNodeStore(dir, testIdentity(), testKey(), []NodeBootstrap{{GroupID: 10, Snapshot: snapshot}}, options)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.BeginIncarnations([]uint64{10}); err != nil {
 		t.Fatal(err)
 	}
 	state, _ := store.engine.Group(10)
@@ -84,6 +88,9 @@ func TestNodeStoreMultiGroupRetryAndReopen(t *testing.T) {
 		{GroupID: 20, Snapshot: nodeSnapshot(20, 1, 1)},
 	}, options)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.BeginIncarnations([]uint64{10, 20}); err != nil {
 		t.Fatal(err)
 	}
 	persistCalls := 0
@@ -149,6 +156,9 @@ func TestNodeStorePreparedReadAndTermZeroAlloc(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err = store.BeginIncarnations([]uint64{10}); err != nil {
+		t.Fatal(err)
+	}
 	defer store.Close()
 	batch := raftmodel.PersistBatch{NodeIncarnation: 1, ReadyID: 1, Entries: []*pb.Entry{typedEntry(2, 2, pb.EntryNormal, "value")}, HardState: hard(2, 2)}
 	if err = store.Group(10).Persist(batch); err != nil {
@@ -185,20 +195,143 @@ func TestNodeStorePreparedPersistZeroAlloc(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err = store.BeginIncarnations([]uint64{10}); err != nil {
+		t.Fatal(err)
+	}
 	defer store.Close()
-	index, term, entryType := uint64(2), uint64(2), pb.EntryNormal
-	vote, commit := uint64(1), uint64(2)
+	index, term, entryType := uint64(1), uint64(2), pb.EntryNormal
+	vote, commit := uint64(1), uint64(1)
 	entry := &pb.Entry{Index: &index, Term: &term, Type: &entryType, Data: []byte("x")}
 	hardState := &pb.HardState{Term: &term, Vote: &vote, Commit: &commit}
-	batch := raftmodel.PersistBatch{NodeIncarnation: 1, ReadyID: 1, Entries: []*pb.Entry{entry}, HardState: hardState}
+	batch := raftmodel.PersistBatch{NodeIncarnation: 1, Entries: []*pb.Entry{entry}, HardState: hardState}
 	view := store.Group(10)
-	store.persistWaveTest = func(seglog.Wave) error { return nil }
-	store.namespaceProofTest = func() error { return nil }
+	readyID := uint64(0)
 	if got := testing.AllocsPerRun(10, func() {
+		readyID++
+		index++
+		commit = index
+		batch.ReadyID = readyID
 		if persistErr := view.Persist(batch); persistErr != nil {
 			panic(persistErr)
 		}
 	}); got != 0 {
 		t.Fatalf("prepared Persist allocs/run = %v", got)
+	}
+}
+
+func TestNodeStoreIncarnationWaveRecoveryAndFence(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "node")
+	options := NodeStoreOptions{Store: testOptions(), FrameBytes: 1 << 20, Events: 64, WaveIDs: 32, EntriesPerGroup: 16, CachedSegments: 1}
+	store, err := CreateNodeStore(dir, testIdentity(), testKey(), []NodeBootstrap{{GroupID: 10, Snapshot: nodeSnapshot(10, 1, 1)}, {GroupID: 20, Snapshot: nodeSnapshot(20, 1, 1)}}, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	allocated, err := store.BeginIncarnations([]uint64{10, 20})
+	if err != nil || len(allocated) != 2 || allocated[0].Incarnation != 1 || allocated[1].Incarnation != 1 {
+		t.Fatalf("allocate = %#v, %v", allocated, err)
+	}
+	if err = store.PersistIncarnations(allocated); err != nil {
+		t.Fatalf("exact allocation retry: %v", err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = OpenNodeStore(dir, testIdentity(), testKey(), options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err = store.Group(10).Persist(raftmodel.PersistBatch{NodeIncarnation: 2, ReadyID: 1}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("unallocated incarnation = %v", err)
+	}
+	if err = store.Group(10).Persist(raftmodel.PersistBatch{NodeIncarnation: 1, ReadyID: 1}); err != nil {
+		t.Fatalf("first Ready in allocated incarnation: %v", err)
+	}
+	if _, err = store.BeginIncarnations([]uint64{10}); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.Group(10).Persist(raftmodel.PersistBatch{NodeIncarnation: 1, ReadyID: 2}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("stale incarnation = %v", err)
+	}
+	if err = store.Group(10).Persist(raftmodel.PersistBatch{NodeIncarnation: 2, ReadyID: 1}); err != nil {
+		t.Fatalf("new incarnation Ready 1: %v", err)
+	}
+}
+
+func TestNodeStoreCheckpointPublicationCrashPhases(t *testing.T) {
+	for _, phase := range []CheckpointPhase{CheckpointTempWritten, CheckpointFileSynced, CheckpointRenamed, CheckpointDirectorySynced, CheckpointBeforeLogReference} {
+		t.Run(fmt.Sprint(phase), func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "node")
+			options := NodeStoreOptions{Store: testOptions(), FrameBytes: 1 << 20, Events: 64, WaveIDs: 16, EntriesPerGroup: 16, CachedSegments: 1}
+			store, err := CreateNodeStore(dir, testIdentity(), testKey(), []NodeBootstrap{{GroupID: 10, Snapshot: nodeSnapshot(10, 1, 1)}}, options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = store.BeginIncarnations([]uint64{10}); err != nil {
+				t.Fatal(err)
+			}
+			injected := errors.New("checkpoint crash")
+			store.checkpointHookTest = func(got CheckpointPhase) error {
+				if got == phase {
+					return injected
+				}
+				return nil
+			}
+			store.checkpointLeaveTempTest = phase == CheckpointTempWritten || phase == CheckpointFileSynced
+			snapshot := nodeSnapshot(10, 2, 2)
+			snapshot.Data = []byte("exact snapshot bytes")
+			snapshot.Metadata.ConfState = &pb.ConfState{Voters: []uint64{1, 2}, Learners: []uint64{3}}
+			batch := raftmodel.PersistBatch{NodeIncarnation: 1, ReadyID: 1, Snapshot: snapshot, HardState: hard(2, 2)}
+			if err = store.Group(10).Persist(batch); !errors.Is(err, injected) {
+				t.Fatalf("phase error = %v", err)
+			}
+			_ = store.Close()
+			store, err = OpenNodeStore(dir, testIdentity(), testKey(), options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			state, _ := store.engine.Group(10)
+			if state.Checkpoint.Index != 1 {
+				t.Fatalf("failed publication referenced checkpoint %d", state.Checkpoint.Index)
+			}
+			if err = store.Group(10).Persist(batch); err != nil {
+				t.Fatalf("safe retry: %v", err)
+			}
+			got, err := store.Group(10).Snapshot()
+			if err != nil || !proto.Equal(got, snapshot) {
+				t.Fatalf("snapshot roundtrip = %#v, %v", got, err)
+			}
+			_ = store.Close()
+		})
+	}
+}
+
+func TestNodeStoreCheckpointUnknownLogSyncRecoversReference(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "node")
+	options := NodeStoreOptions{Store: testOptions(), FrameBytes: 1 << 20, Events: 64, WaveIDs: 16, EntriesPerGroup: 16, CachedSegments: 1}
+	store, err := CreateNodeStore(dir, testIdentity(), testKey(), []NodeBootstrap{{GroupID: 10, Snapshot: nodeSnapshot(10, 1, 1)}}, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.BeginIncarnations([]uint64{10}); err != nil {
+		t.Fatal(err)
+	}
+	injected := errors.New("unknown data sync")
+	store.engine.SetDataSyncForTesting(func(*os.File) error { return injected })
+	snapshot := nodeSnapshot(10, 2, 2)
+	snapshot.Data = []byte("durable-before-reference")
+	batch := raftmodel.PersistBatch{NodeIncarnation: 1, ReadyID: 1, Snapshot: snapshot, HardState: hard(2, 2)}
+	if err = store.Group(10).Persist(batch); !errors.Is(err, ErrPersistenceUnknown) || !errors.Is(err, injected) {
+		t.Fatalf("unknown sync = %v", err)
+	}
+	_ = store.Close()
+	store, err = OpenNodeStore(dir, testIdentity(), testKey(), options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	got, err := store.Group(10).Snapshot()
+	if err != nil || !proto.Equal(got, snapshot) {
+		t.Fatalf("recovered checkpoint = %#v, %v", got, err)
 	}
 }
