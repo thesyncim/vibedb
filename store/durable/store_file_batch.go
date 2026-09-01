@@ -2,6 +2,7 @@ package durable
 
 import (
 	"errors"
+	"unsafe"
 )
 
 // ErrBatchTooLarge reports a batch whose mutations do not fit the reservation
@@ -108,8 +109,9 @@ func (b *WriteBatch) Delete(key []byte) error {
 
 func (b *WriteBatch) record(key []byte, src []byte, remove bool) error {
 	b.canonical = false
-	// m[string(b)] is the compiler's non-allocating map-read pattern: the string
-	// conversion is used only as the index expression and never escapes.
+	if b.position == nil {
+		b.ensurePositionCapacity(b.collection.options.MaxBatchDocuments)
+	}
 	if at, exists := b.position[string(key)]; exists {
 		old := b.entries[at]
 		nextBytes := len(b.keys) + len(b.values) - old.valueLength
@@ -134,9 +136,12 @@ func (b *WriteBatch) record(key []byte, src []byte, remove bool) error {
 	b.keys = append(b.keys, key...)
 	b.values = append(b.values, src...)
 	b.entries = append(b.entries, entry)
-	// The map key is the arena's copy, so it neither retains the caller's
-	// string nor allocates a second one.
-	b.position[string(b.key(entry))] = len(b.entries) - 1
+	ownedKey := b.key(entry)
+	// The map key borrows the batch-owned immutable key arena. reset clears the
+	// map before the arena can be reused, so no key outlives or observes a later
+	// batch. This avoids the allocating []byte-to-string copy on insertion while
+	// retaining Go's optimized map lookup for caller-owned keys.
+	b.position[unsafe.String(unsafe.SliceData(ownedKey), len(ownedKey))] = len(b.entries) - 1
 	return nil
 }
 
@@ -150,6 +155,9 @@ func (b *WriteBatch) appendRecovery(key, src []byte, remove bool) error {
 	if b == nil || !b.active {
 		return ErrBatchClosed
 	}
+	if b.position == nil {
+		b.ensurePositionCapacity(b.collection.options.MaxBatchDocuments)
+	}
 	if _, exists := b.position[string(key)]; exists {
 		return errors.New("vibedb: duplicate key in recovery batch")
 	}
@@ -160,10 +168,19 @@ func (b *WriteBatch) appendRecovery(key, src []byte, remove bool) error {
 	b.keys = append(b.keys, key...)
 	b.values = append(b.values, src...)
 	b.entries = append(b.entries, entry)
-	b.position[string(b.key(entry))] = len(b.entries) - 1
+	ownedKey := b.key(entry)
+	b.position[unsafe.String(unsafe.SliceData(ownedKey), len(ownedKey))] = len(b.entries) - 1
 	b.canonical = false
 	b.recovery = true
 	return nil
+}
+
+func (b *WriteBatch) ensurePositionCapacity(maxDocuments int) {
+	if b.position == nil {
+		b.position = make(map[string]int, maxDocuments)
+	} else {
+		clear(b.position)
+	}
 }
 
 // replaceValue compacts a superseded value in place and repairs later offsets.
@@ -229,8 +246,8 @@ func (c *Collection) fileWriteBatch() *WriteBatch {
 	if c.batch == nil {
 		c.batch = &WriteBatch{
 			collection: c,
-			position:   make(map[string]int, c.options.MaxBatchDocuments),
 		}
+		c.batch.ensurePositionCapacity(c.options.MaxBatchDocuments)
 	}
 	batch := c.batch
 	batch.reset()

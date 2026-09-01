@@ -487,7 +487,10 @@ func TestTransactionRecoveryOwnerRequiresExactDedicatedCapability(t *testing.T) 
 		ID:   distributedtxn.ID{1}, MinimumApplied: 1, MaxRows: 1,
 		MaxBytes: replicatedstate.TransactionRecoverySummaryBytes,
 	}}
-	owner := &Owner{}
+	owner := &Owner{
+		proposalCohort:       make(map[raftmember.GroupKey]int),
+		pendingProposalGroup: make(map[raftmember.GroupKey]int),
+	}
 	for _, capability := range []serviceauthz.Capability{
 		serviceauthz.CapabilityDataRead,
 		serviceauthz.CapabilityDataWrite,
@@ -756,4 +759,45 @@ func TestOwnerPendingProposalBudgetIsIndependentAndReclaimable(t *testing.T) {
 	if err := owner.reservePendingProposal(1); !errors.Is(err, ErrOwnerClosed) {
 		t.Fatalf("closed reserve = %v", err)
 	}
+}
+
+func TestProposalIngressCollectorBuildsFixedBoundedPipelineWindows(t *testing.T) {
+	group := peerServerTestGroup()
+	request := func(sequence byte) ownerRequest {
+		return ownerRequest{
+			kind: requestProposal, group: group, data: []byte{sequence},
+			reply: make(chan ownerReply, 1), bytes: 1,
+		}
+	}
+	owner := &Owner{
+		proposalCohort:       make(map[raftmember.GroupKey]int),
+		pendingProposalGroup: make(map[raftmember.GroupKey]int),
+	}
+	collector := newProposalIngressCollector(4)
+	collector.start(owner, request(1))
+	if !collector.active() || collector.bytes != 1 || collector.known || collector.full() {
+		t.Fatalf("initial collector=%+v", collector)
+	}
+	for sequence := byte(2); sequence <= 4; sequence++ {
+		next := request(sequence)
+		if !collector.accepts(next) {
+			t.Fatalf("collector refused same-group request %d", sequence)
+		}
+		collector.append(next)
+	}
+	if !collector.full() || len(collector.requests) != 4 || collector.bytes != 4 {
+		t.Fatalf("full collector=%+v", collector)
+	}
+	other := request(6)
+	other.group.GroupID[0] ^= 0xff
+	if collector.accepts(other) {
+		t.Fatal("collector accepted a cross-group proposal")
+	}
+	collector.reset()
+
+	collector.start(owner, request(7))
+	if !collector.expire(owner) || owner.proposalCohort[group] != 1 {
+		t.Fatalf("partial window did not expire: %+v", collector)
+	}
+	collector.reset()
 }

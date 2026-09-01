@@ -686,6 +686,13 @@ func (registry *StaticRegistry) PublishCommittedAuthority(
 	if slot == nil {
 		return ErrGroupNotFound
 	}
+	current := slot.view.Load()
+	if version == current.version {
+		if confMatchesRoles(conf, current.roles) {
+			return nil
+		}
+		return ErrReplicaSet
+	}
 	roles, err := registry.rolesFromConf(group, conf)
 	if err != nil {
 		return err
@@ -718,6 +725,29 @@ func (registry *StaticRegistry) PublishCommittedAuthority(
 			return nil
 		}
 	}
+}
+
+func confMatchesRoles(conf *pb.ConfState, roles map[uint64]MemberRole) bool {
+	if conf == nil || len(conf.GetVotersOutgoing()) != 0 ||
+		len(conf.GetLearnersNext()) != 0 || conf.GetAutoLeave() ||
+		len(conf.GetVoters())+len(conf.GetLearners()) != len(roles) {
+		return false
+	}
+	var previous uint64
+	for index, member := range conf.GetVoters() {
+		if (index != 0 && member <= previous) || roles[member] != MemberVoter {
+			return false
+		}
+		previous = member
+	}
+	previous = 0
+	for index, member := range conf.GetLearners() {
+		if (index != 0 && member <= previous) || roles[member] != MemberLearner {
+			return false
+		}
+		previous = member
+	}
+	return true
 }
 
 // PublishDurablePromotion installs a narrow election witness only after the

@@ -18,7 +18,7 @@ import (
 	pb "go.etcd.io/raft/v3/raftpb"
 )
 
-const codecVersion uint16 = 1
+const codecVersion uint16 = 2
 
 type decoder struct {
 	data   []byte
@@ -96,7 +96,23 @@ type objectCryptoWorkspace struct {
 	objectKeyMAC hash.Hash
 	authMAC      hash.Hash
 	sequence     [8]byte
+	domain       [32]byte
+	digest       [sha256.Size]byte
 	sum          [sha256.Size]byte
+}
+
+var (
+	objectKeyPrefix   = []byte("vibedb/raft-wal/object/")
+	objectTagPrefix   = []byte("tag/")
+	objectNoncePrefix = []byte("object/")
+)
+
+func (workspace *objectCryptoWorkspace) writeDomain(mac hash.Hash, domain string) {
+	if len(domain) > len(workspace.domain) {
+		panic("raftstore: object crypto domain exceeds workspace")
+	}
+	copy(workspace.domain[:], domain)
+	_, _ = mac.Write(workspace.domain[:len(domain)])
 }
 
 func newObjectCryptoWorkspace(
@@ -116,11 +132,12 @@ func (workspace *objectCryptoWorkspace) deriveObjectKey(
 ) [sha256.Size]byte {
 	mac := workspace.objectKeyMAC
 	mac.Reset()
-	_, _ = mac.Write([]byte("vibedb/raft-wal/object/"))
-	_, _ = mac.Write([]byte(domain))
+	_, _ = mac.Write(objectKeyPrefix)
+	workspace.writeDomain(mac, domain)
 	binary.LittleEndian.PutUint64(workspace.sequence[:], sequence)
 	_, _ = mac.Write(workspace.sequence[:])
-	_, _ = mac.Write(digest[:])
+	workspace.digest = digest
+	_, _ = mac.Write(workspace.digest[:])
 	_ = mac.Sum(workspace.sum[:0])
 	return workspace.sum
 }
@@ -132,8 +149,8 @@ func (workspace *objectCryptoWorkspace) makeObjectTag(
 ) [sha256.Size]byte {
 	mac := workspace.authMAC
 	mac.Reset()
-	_, _ = mac.Write([]byte("tag/"))
-	_, _ = mac.Write([]byte(domain))
+	_, _ = mac.Write(objectTagPrefix)
+	workspace.writeDomain(mac, domain)
 	binary.LittleEndian.PutUint64(workspace.sequence[:], sequence)
 	_, _ = mac.Write(workspace.sequence[:])
 	_, _ = mac.Write(context)
@@ -149,11 +166,12 @@ func (workspace *objectCryptoWorkspace) deriveObjectNonce(
 ) [12]byte {
 	mac := workspace.authMAC
 	mac.Reset()
-	_, _ = mac.Write([]byte("object/"))
-	_, _ = mac.Write([]byte(domain))
+	_, _ = mac.Write(objectNoncePrefix)
+	workspace.writeDomain(mac, domain)
 	binary.LittleEndian.PutUint64(workspace.sequence[:], sequence)
 	_, _ = mac.Write(workspace.sequence[:])
-	_, _ = mac.Write(digest[:])
+	workspace.digest = digest
+	_, _ = mac.Write(workspace.digest[:])
 	_ = mac.Sum(workspace.sum[:0])
 	var result [12]byte
 	copy(result[:], workspace.sum[:])

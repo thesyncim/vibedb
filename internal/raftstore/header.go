@@ -36,6 +36,7 @@ type headerState struct {
 	headerNonce           [12]byte
 	dataKey               [32]byte
 	nonceKey              [32]byte
+	recordAEAD            cipher.AEAD
 	headerDigest          [32]byte
 	reference             snapshotReference
 	bounds                formatBounds
@@ -142,7 +143,8 @@ func marshalStaticHeader(identity Identity, key Key, bootstrap Bootstrap, option
 	ownedIdentity.Shard = strings.Clone(identity.Shard)
 	state := headerState{
 		identity: ownedIdentity, keyID: strings.Clone(key.ID), wrapped: slices.Clone(key.Wrapped), fileID: fileID,
-		headerNonce: nonce, dataKey: fileCrypto.dataKey, nonceKey: fileCrypto.nonceKey, headerDigest: sha256.Sum256(header), reference: reference,
+		headerNonce: nonce, dataKey: fileCrypto.dataKey, nonceKey: fileCrypto.nonceKey,
+		recordAEAD: fileCrypto.aead, headerDigest: sha256.Sum256(header), reference: reference,
 		bounds:                boundsFromOptions(options),
 		topologyRecoveryEpoch: bootstrap.TopologyRecoveryEpoch,
 		snapshot:              cloneSnapshot(bootstrap.Snapshot), snapshotBytes: snapshotBytes,
@@ -219,7 +221,8 @@ func unmarshalStaticHeader(header []byte, expected Identity, key Key, options no
 	}
 	state := headerState{
 		identity: identity, keyID: keyID, wrapped: wrapped, fileID: fileID, headerNonce: nonce,
-		dataKey: fileCrypto.dataKey, nonceKey: fileCrypto.nonceKey, headerDigest: sha256.Sum256(header), reference: reference, bounds: bounds,
+		dataKey: fileCrypto.dataKey, nonceKey: fileCrypto.nonceKey, recordAEAD: fileCrypto.aead,
+		headerDigest: sha256.Sum256(header), reference: reference, bounds: bounds,
 	}
 	return state, aead, nil
 }

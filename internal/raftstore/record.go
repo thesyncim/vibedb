@@ -2,7 +2,6 @@ package raftstore
 
 import (
 	"bytes"
-	"crypto/cipher"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
@@ -62,6 +61,24 @@ type recordDecodeWorkspace struct {
 	tagContext [recordTagContextBytes]byte
 }
 
+type recordEncodeWorkspace struct {
+	aad        []byte
+	crypto     objectCryptoWorkspace
+	tagContext [recordTagContextBytes]byte
+}
+
+func (workspace *recordEncodeWorkspace) aadBuffer(header headerState, capacity int) []byte {
+	if workspace.crypto.authMAC == nil {
+		workspace.crypto = newObjectCryptoWorkspace(header.dataKey, header.nonceKey)
+	}
+	if cap(workspace.aad) < capacity {
+		workspace.aad = make([]byte, 0, capacity)
+	} else {
+		workspace.aad = workspace.aad[:0]
+	}
+	return workspace.aad
+}
+
 func newRecordDecodeWorkspace(header headerState) recordDecodeWorkspace {
 	return recordDecodeWorkspace{
 		crypto: newObjectCryptoWorkspace(header.dataKey, header.nonceKey),
@@ -72,9 +89,32 @@ type readyPayload struct {
 	hard     *pb.HardState
 	entries  []*pb.Entry
 	mustSync bool
+	owned    bool
 }
 
 func marshalRecord(kind uint8, flags uint8, sequence, incarnation, readyID uint64, previous [32]byte, payload []byte, header headerState, options normalizedOptions) ([]byte, [32]byte, [12]byte, error) {
+	return marshalRecordInto(nil, nil, kind, flags, sequence, incarnation, readyID, previous, payload, header, options)
+}
+
+func readyRecordSize(payloadBytes, keyIDBytes int) (int, bool) {
+	if payloadBytes <= 0 || keyIDBytes < 0 ||
+		payloadBytes > math.MaxInt-recordPrefixBytes-recordChecksumBytes-16-keyIDBytes {
+		return 0, false
+	}
+	return alignRecordLength(recordPrefixBytes + keyIDBytes + payloadBytes + 16 + recordChecksumBytes), true
+}
+
+func marshalRecordInto(
+	destination []byte,
+	workspace *recordEncodeWorkspace,
+	kind uint8,
+	flags uint8,
+	sequence, incarnation, readyID uint64,
+	previous [32]byte,
+	payload []byte,
+	header headerState,
+	options normalizedOptions,
+) ([]byte, [32]byte, [12]byte, error) {
 	if (kind != recordKindBootstrap && kind != recordKindReady &&
 		kind != recordKindRetainedEntries && kind != recordKindGenerationSeal) ||
 		sequence == 0 || len(payload) == 0 {
@@ -97,12 +137,32 @@ func marshalRecord(kind uint8, flags uint8, sequence, incarnation, readyID uint6
 		return nil, [32]byte{}, [12]byte{}, fmt.Errorf("%w: record length %d", ErrBounds, total)
 	}
 	envelope := recordEnvelope{kind: kind, flags: flags, total: total, plainLength: len(payload), cipherLength: cipherLength, sequence: sequence, incarnation: incarnation, readyID: readyID, previous: previous, fileID: header.fileID}
-	objectTag := makeObjectTag(header.nonceKey, "wal-record", sequence, recordTagContext(envelope), payload)
-	aead, err := makeObjectAEAD(header.dataKey, "wal-record", sequence, objectTag)
-	if err != nil {
-		return nil, [32]byte{}, [12]byte{}, err
+	var objectTag [32]byte
+	if workspace == nil {
+		objectTag = makeObjectTag(header.nonceKey, "wal-record", sequence, recordTagContext(envelope), payload)
+	} else {
+		if workspace.crypto.authMAC == nil {
+			workspace.crypto = newObjectCryptoWorkspace(header.dataKey, header.nonceKey)
+		}
+		objectTag = workspace.crypto.makeObjectTag(
+			"wal-record", sequence, putRecordTagContext(&workspace.tagContext, envelope), payload,
+		)
 	}
-	result := make([]byte, total)
+	aead := header.recordAEAD
+	if aead == nil {
+		var err error
+		aead, err = makeObjectAEAD(header.dataKey, "wal-record", sequence, objectTag)
+		if err != nil {
+			return nil, [32]byte{}, [12]byte{}, err
+		}
+	}
+	var result []byte
+	if cap(destination) < total {
+		result = make([]byte, total)
+	} else {
+		result = destination[:total]
+		clear(result)
+	}
 	copy(result[0:8], recordMagic[:])
 	binary.LittleEndian.PutUint16(result[8:10], codecVersion)
 	result[10] = kind
@@ -116,19 +176,32 @@ func marshalRecord(kind uint8, flags uint8, sequence, incarnation, readyID uint6
 	binary.LittleEndian.PutUint64(result[40:48], incarnation)
 	binary.LittleEndian.PutUint64(result[48:56], readyID)
 	copy(result[56:88], previous[:])
-	nonce := deriveObjectNonce(header.nonceKey, "wal-record", sequence, objectTag)
+	var nonce [12]byte
+	if workspace == nil {
+		nonce = deriveObjectNonce(header.nonceKey, "wal-record", sequence, objectTag)
+	} else {
+		nonce = workspace.crypto.deriveObjectNonce("wal-record", sequence, objectTag)
+	}
 	copy(result[88:100], nonce[:])
 	copy(result[100:132], objectTag[:])
 	copy(result[132:148], header.fileID[:])
 	copy(result[recordPrefixBytes:], header.keyID)
 	aadEnd := recordPrefixBytes + len(header.keyID)
 	padding := result[aadEnd+cipherLength : len(result)-recordChecksumBytes]
-	aad := make([]byte, 0, aadEnd+len(header.headerDigest)+len(padding))
+	aadCapacity := aadEnd + len(header.headerDigest) + len(padding)
+	var aad []byte
+	if workspace == nil {
+		aad = make([]byte, 0, aadCapacity)
+	} else {
+		aad = workspace.aadBuffer(header, aadCapacity)
+	}
 	aad = append(aad, result[:aadEnd]...)
 	aad = append(aad, header.headerDigest[:]...)
 	aad = append(aad, padding...)
-	ciphertext := aead.Seal(nil, nonce[:], payload, aad)
-	copy(result[aadEnd:], ciphertext)
+	ciphertext := aead.Seal(result[aadEnd:aadEnd], nonce[:], payload, aad)
+	if len(ciphertext) != cipherLength {
+		return nil, [32]byte{}, [12]byte{}, fmt.Errorf("%w: record ciphertext length", ErrBounds)
+	}
 	sealRecordChecksum(result)
 	digest := sha256.Sum256(result)
 	return result, digest, nonce, nil
@@ -253,20 +326,15 @@ func unmarshalInspectedRecord(
 	if workspace != nil {
 		workspace.aad = aad
 	}
-	var aead cipher.AEAD
-	var err error
-	if workspace != nil && workspace.crypto.objectKeyMAC != nil {
-		derived := workspace.crypto.deriveObjectKey(
-			"wal-record", envelope.sequence, envelope.payloadDigest,
-		)
-		aead, err = makeObjectAEADFromKey(derived)
-	} else {
+	aead := header.recordAEAD
+	if aead == nil {
+		var err error
 		aead, err = makeObjectAEAD(
 			header.dataKey, "wal-record", envelope.sequence, envelope.payloadDigest,
 		)
-	}
-	if err != nil {
-		return decodedRecord{}, err
+		if err != nil {
+			return decodedRecord{}, err
+		}
 	}
 	var destination []byte
 	if workspace != nil {
@@ -304,19 +372,36 @@ func unmarshalInspectedRecord(
 }
 
 func marshalReadyPayload(batch raftmodel.PersistBatch) ([]byte, error) {
+	return marshalReadyPayloadInto(nil, batch)
+}
+
+func readyPayloadSize(batch raftmodel.PersistBatch) (int, error) {
+	capacity := 40
+	for _, entry := range batch.Entries {
+		if entry == nil || uint64(len(entry.GetData())) > math.MaxUint32 || capacity > math.MaxInt-32-len(entry.GetData()) {
+			return 0, fmt.Errorf("%w: Ready entry geometry", ErrBounds)
+		}
+		capacity += 32 + len(entry.GetData())
+	}
+	return capacity, nil
+}
+
+func marshalReadyPayloadInto(destination []byte, batch raftmodel.PersistBatch) ([]byte, error) {
 	flags := uint16(0)
 	if batch.MustSync {
 		flags = 1
 	}
 	hardPresent := !isEmptyHardState(batch.HardState)
-	capacity := 40
-	for _, entry := range batch.Entries {
-		if entry == nil || uint64(len(entry.GetData())) > math.MaxUint32 || capacity > math.MaxInt-32-len(entry.GetData()) {
-			return nil, fmt.Errorf("%w: Ready entry geometry", ErrBounds)
-		}
-		capacity += 32 + len(entry.GetData())
+	capacity, err := readyPayloadSize(batch)
+	if err != nil {
+		return nil, err
 	}
-	result := make([]byte, 0, capacity)
+	var result []byte
+	if cap(destination) < capacity {
+		result = make([]byte, 0, capacity)
+	} else {
+		result = destination[:0]
+	}
 	result = appendUint16(result, codecVersion)
 	result = appendUint16(result, flags)
 	result = appendUint32(result, uint32(len(batch.Entries)))
@@ -325,7 +410,7 @@ func marshalReadyPayload(batch raftmodel.PersistBatch) ([]byte, error) {
 	} else {
 		result = append(result, 0)
 	}
-	result = append(result, make([]byte, 7)...)
+	result = append(result, 0, 0, 0, 0, 0, 0, 0)
 	result = appendUint64(result, batch.HardState.GetTerm())
 	result = appendUint64(result, batch.HardState.GetVote())
 	result = appendUint64(result, batch.HardState.GetCommit())

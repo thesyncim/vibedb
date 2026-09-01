@@ -206,7 +206,7 @@ func InstallPublishedLearner(plan LearnerInstallPlan) (raftmember.RuntimeIdentit
 	if err = learnerInstallFault(learnerInstallAfterWAL); err != nil {
 		return raftmember.RuntimeIdentity{}, err
 	}
-	runtime, err := raftmember.AdoptStagedRuntime(
+	runtime, err := raftmember.AdoptPipelinedStagedRuntime(
 		wal, plan.Database, activation.Apply, plan.Descriptor.TargetIncarnation,
 	)
 	if err != nil {

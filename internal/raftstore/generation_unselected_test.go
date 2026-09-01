@@ -72,6 +72,10 @@ func openUnselectedGenerationForTest(
 	if err != nil {
 		return cleanup(err)
 	}
+	current, image, err = recoverReadyTail(file, header, current, image, normalized)
+	if err != nil {
+		return cleanup(err)
+	}
 	if !generation.present || header.topologyRecoveryEpoch != expectedTopologyRecoveryEpoch {
 		return cleanup(ErrGenerationCandidate)
 	}

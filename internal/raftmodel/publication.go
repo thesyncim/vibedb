@@ -22,7 +22,10 @@ func (n *Node) acceptNormalPublication(meta ApplyMeta, noop bool, returned Publi
 	if noop && returned.DataChainDigest != previous.DataChainDigest {
 		return errors.New("no-op entry changed data-chain digest")
 	}
-	n.published = clonePublication(returned)
+	// Publication.ConfState is state-machine-owned immutable data. Normal
+	// entries cannot replace it, so retain the borrowed identity instead of
+	// reflect-cloning the same membership on every apply batch.
+	n.published = returned
 	return nil
 }
 
@@ -53,7 +56,7 @@ func (n *Node) acceptNormalBatchPublication(
 			return fmt.Errorf("normal-batch unselected witness %d is nonzero", index)
 		}
 	}
-	n.published = clonePublication(returned)
+	n.published = returned
 	return nil
 }
 
@@ -74,7 +77,7 @@ func (n *Node) acceptConfigurationPublication(meta ApplyMeta, state *pb.ConfStat
 	if returned.DataChainDigest != previous.DataChainDigest {
 		return errors.New("configuration entry changed data-chain digest")
 	}
-	n.published = clonePublication(returned)
+	n.published = returned
 	return nil
 }
 
@@ -95,7 +98,7 @@ func (n *Node) acceptSnapshotPublication(index uint64, state *pb.ConfState, retu
 	if returned.ReplicaSetVersion > index {
 		return errors.New("snapshot ReplicaSetVersion exceeds snapshot index")
 	}
-	n.published = clonePublication(returned)
+	n.published = returned
 	return nil
 }
 

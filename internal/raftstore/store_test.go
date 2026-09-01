@@ -15,6 +15,13 @@ import (
 	pb "go.etcd.io/raft/v3/raftpb"
 )
 
+func testRecordBarrier(store *Store) func(*os.File) error {
+	if store != nil && store.options.ops.recordBarrier != nil {
+		return store.options.ops.recordBarrier
+	}
+	return syncReadyRecord
+}
+
 func testIdentity() Identity {
 	identity := Identity{
 		Distribution: "orders", Shard: "0000-7fff", AllocationGeneration: 7, MemberID: 1,
@@ -174,8 +181,9 @@ func TestCreatePersistOpenAndDetachedStorage(t *testing.T) {
 	if err != nil || len(entries) != 2 || string(entries[0].GetData()) != "a" || string(entries[1].GetData()) != "replacement" {
 		t.Fatalf("Entries = %v, %v", entries, err)
 	}
-	entries[0].Data[0] = 'X'
-	entries[0].Index = uint64Pointer(99)
+	if cap(entries) != len(entries) {
+		t.Fatalf("borrowed Entries capacity = %d, want %d", cap(entries), len(entries))
+	}
 	state.Term = uint64Pointer(99)
 	conf.Voters[0] = 99
 	snapshot, err := reopened.Snapshot()
@@ -413,13 +421,16 @@ func TestNilDefaultEntryTypeExactRetryAndOverlap(t *testing.T) {
 	}
 }
 
-func TestCommitImageDeltaClearsTruncatedTailPointers(t *testing.T) {
+func TestCommitImageDeltaPublishesConflictingSuffixCopyOnWrite(t *testing.T) {
 	image := logImage{entries: []*pb.Entry{entry(2, 2, "a"), entry(3, 2, "b"), entry(4, 2, "c")}, first: 2, last: 4, hard: hard(2, 2), baseTerm: 1}
 	old := image.entries
 	delta := imageDelta{replace: true, prefixLength: 1, entries: []*pb.Entry{entry(3, 3, "B")}, last: 3, hard: hard(3, 2)}
 	commitImageDelta(&image, delta)
-	if old[2] != nil {
-		t.Fatal("truncated tail pointer retained in backing array")
+	if len(image.entries) != 2 || string(image.entries[1].GetData()) != "B" {
+		t.Fatalf("published entries = %v", image.entries)
+	}
+	if len(old) != 3 || string(old[1].GetData()) != "b" || string(old[2].GetData()) != "c" {
+		t.Fatalf("borrowed old entries changed = %v", old)
 	}
 }
 

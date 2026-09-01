@@ -59,6 +59,34 @@ func TestReadyCannotSendOrAcceptInputBeforePersistence(t *testing.T) {
 	}
 }
 
+func TestDurablePublicationRecoversFinalCommitOnlyHardState(t *testing.T) {
+	_, stable, machine := newTestNode(t, 1, []uint64{1})
+	term := uint64(2)
+	index := uint64(2)
+	if err := stable.MemoryStorage.Append([]*pb.Entry{{
+		Term: &term, Index: &index, Data: []byte("already-applied"),
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	commit := uint64(1)
+	if err := stable.MemoryStorage.SetHardState(&pb.HardState{
+		Term: &term, Commit: &commit,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	machine.pub.Applied = index
+	machine.pub.DataChainDigest = sha256.Sum256([]byte("already-applied"))
+	node, err := NewNode(1, 2, stable, machine)
+	if err != nil {
+		t.Fatalf("recover with applied commit certificate: %v", err)
+	}
+	status := node.Status()
+	if status.GetCommit() != index || status.Applied != index {
+		t.Fatalf("recovered status commit/applied = %d/%d, want %d/%d",
+			status.GetCommit(), status.Applied, index, index)
+	}
+}
+
 func TestPendingReadyInputIsBoundedBeforeCapture(t *testing.T) {
 	node, _, _ := newTestNode(t, 1, []uint64{1, 2})
 	term := uint64(2)
@@ -183,6 +211,29 @@ func TestNormalProposalsShareOneBoundedUncapturedReady(t *testing.T) {
 			len(node.ready.Entries),
 			node.ready.Entries[0].GetData(), node.ready.Entries[1].GetData(),
 		)
+	}
+}
+
+func TestMultiEntryProposalIsOneCoreInputWithIndependentEntries(t *testing.T) {
+	node, _, _ := newTestNode(t, 1, []uint64{1})
+	driveCampaign(t, node)
+
+	first := []byte("first")
+	second := []byte("second")
+	if err := node.ProposeBatch([][]byte{first, second}); err != nil {
+		t.Fatalf("ProposeBatch() error = %v", err)
+	}
+	first[0] = 'X'
+	second[0] = 'Y'
+	if node.pendingInputCalls != 1 || node.pendingInputUnits != 2 {
+		t.Fatalf("batch input accounting = %d calls/%d units", node.pendingInputCalls, node.pendingInputUnits)
+	}
+	if captured, err := node.CaptureReady(); err != nil || !captured {
+		t.Fatalf("CaptureReady() = %v, %v", captured, err)
+	}
+	if len(node.ready.Entries) != 2 || string(node.ready.Entries[0].GetData()) != "first" ||
+		string(node.ready.Entries[1].GetData()) != "second" {
+		t.Fatalf("multi-entry Ready = %+v", node.ready.Entries)
 	}
 }
 

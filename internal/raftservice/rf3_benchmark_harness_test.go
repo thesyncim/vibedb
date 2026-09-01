@@ -18,6 +18,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/orderedkey"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
+	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
@@ -55,9 +56,28 @@ type rf3EvidenceCut struct {
 	storageReadBytes     uint64
 	storagePageReads     uint64
 	storageBatches       uint64
+	storageAllocated     uint64
+	storageApparent      uint64
+	storageFiles         uint64
 	checkpointUpdates    uint64
 	checkpointSyncs      uint64
+	checkpointCount      uint64
+	checkpointExplicit   uint64
+	checkpointPeriodic   uint64
+	checkpointPressure   uint64
+	checkpointMarker     uint64
 	checkpointAppliedSum uint64
+	proposalCommands     uint64
+	proposalBatches      uint64
+	readyPersisted       uint64
+	walEntries           uint64
+	walLiveBytes         uint64
+	walSyncs             uint64
+	appliedEntries       uint64
+	applyBatches         uint64
+	completionBatches    uint64
+	completionEntries    uint64
+	completionComplete   uint64
 }
 
 type rf3EvidenceRun struct {
@@ -145,7 +165,11 @@ func TestRF3EvidenceMatrix(t *testing.T) {
 
 func runRF3Evidence(t *testing.T, config rf3bench.Config) rf3EvidenceRun {
 	t.Helper()
-	cluster := newMultiGroupTransactionRF3Cluster(t)
+	// Evidence uses the production WAL geometry. The small shared RF3 fixture
+	// intentionally reaches generation pressure after 12k entries and is useful
+	// for rollover tests, but it turns a sustained throughput run into a
+	// compaction benchmark at an artificial boundary.
+	cluster := newMultiGroupRF3ClusterWithWALOptions(t, multiGroupRF3Groups, raftstore.Options{})
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	ctx, err := serviceauthz.WithAuthority(ctx, serviceauthz.Authority{
@@ -530,7 +554,27 @@ func evidenceOperation(workload rf3bench.Workload, seed, ordinal uint64) rf3benc
 func captureRF3EvidenceCut(t *testing.T, cluster *multiGroupTransactionRF3Cluster) rf3EvidenceCut {
 	t.Helper()
 	var cut rf3EvidenceCut
+	storage, err := rf3bench.MeasureFootprint(cluster.groups[0].storageRoots[:]...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cut.storageAllocated = storage.AllocatedBytes
+	cut.storageApparent = storage.ApparentBytes
+	cut.storageFiles = storage.Files
 	for local := 0; local < multiGroupRF3Voters; local++ {
+		_, progress, found := cluster.progress[local].GroupProgressMetrics(cluster.groups[0].key)
+		if !found {
+			t.Fatal("RF3 progress metrics omitted benchmark group")
+		}
+		cut.proposalCommands += progress.ProposalCommands
+		cut.proposalBatches += progress.ProposalBatches
+		cut.readyPersisted += progress.ReadyPersisted
+		cut.appliedEntries += progress.AppliedEntries
+		cut.applyBatches += progress.ApplyBatches
+		wal := cluster.groups[0].wals[local].Metrics()
+		cut.walEntries += wal.Entries
+		cut.walLiveBytes += wal.LiveBytes
+		cut.walSyncs += wal.Syncs
 		inbound := cluster.peers[local].InboundStats()
 		cut.inboundAccepted += inbound.Accepted
 		cut.inboundRejected += inbound.Rejected
@@ -574,6 +618,15 @@ func captureRF3EvidenceCut(t *testing.T, cluster *multiGroupTransactionRF3Cluste
 		cut.checkpointSyncs += durability.JournalSyncs + durability.CertificateSyncs +
 			durability.MarkerSyncs
 		cut.checkpointAppliedSum += durability.CheckpointAppliedIndex
+		cut.checkpointCount += durability.Checkpoints
+		cut.checkpointExplicit += durability.ExplicitCheckpoints
+		cut.checkpointPeriodic += durability.PeriodicCheckpoints
+		cut.checkpointPressure += durability.PressureCheckpoints
+		cut.checkpointMarker += durability.MarkerCheckpoints
+		completion := cluster.groups[0].reads[local].BatchCompletionStats()
+		cut.completionBatches += completion.Batches
+		cut.completionEntries += completion.Entries
+		cut.completionComplete += completion.CompleteBatches
 	}
 	return cut
 }
@@ -591,12 +644,37 @@ func evidenceCounters(before, after rf3EvidenceCut, reads, writes, retries, logi
 		counter("network", "inbound_rejected", before.inboundRejected, after.inboundRejected),
 		counter("network", "sent_bytes", before.transportSentBytes, after.transportSentBytes),
 		counter("network", "sent_frames", before.transportSentFrames, after.transportSentFrames),
+		counter("raft", "applied_entries", before.appliedEntries, after.appliedEntries),
+		counter("raft", "apply_batches", before.applyBatches, after.applyBatches),
 		counter("raft", "checkpoint_applied_sum", before.checkpointAppliedSum, after.checkpointAppliedSum),
+		counter("raft", "checkpoint_count", before.checkpointCount, after.checkpointCount),
+		counter("raft", "checkpoint_explicit", before.checkpointExplicit, after.checkpointExplicit),
+		counter("raft", "checkpoint_marker", before.checkpointMarker, after.checkpointMarker),
+		counter("raft", "checkpoint_periodic", before.checkpointPeriodic, after.checkpointPeriodic),
+		counter("raft", "checkpoint_pressure", before.checkpointPressure, after.checkpointPressure),
 		counter("raft", "checkpoint_syncs", before.checkpointSyncs, after.checkpointSyncs),
 		counter("raft", "checkpoint_updates", before.checkpointUpdates, after.checkpointUpdates),
+		counter("raft", "completion_batches", before.completionBatches, after.completionBatches),
+		counter("raft", "completion_complete_batches", before.completionComplete, after.completionComplete),
+		counter("raft", "completion_entries", before.completionEntries, after.completionEntries),
+		counter("raft", "proposal_batches", before.proposalBatches, after.proposalBatches),
+		counter("raft", "proposal_commands", before.proposalCommands, after.proposalCommands),
+		counter("raft", "ready_persisted", before.readyPersisted, after.readyPersisted),
+		counter("raft", "wal_entries", before.walEntries, after.walEntries),
+		counter("raft", "wal_live_bytes", before.walLiveBytes, after.walLiveBytes),
+		counter("raft", "wal_syncs", before.walSyncs, after.walSyncs),
+		counter("storage", "allocated_bytes_after", 0, after.storageAllocated),
+		counter("storage", "allocated_bytes_before", 0, before.storageAllocated),
+		counter("storage", "apparent_bytes_after", 0, after.storageApparent),
+		counter("storage", "apparent_bytes_before", 0, before.storageApparent),
 		counter("storage", "committed_batches", before.storageBatches, after.storageBatches),
 		counter("storage", "device_bytes", before.storageDeviceBytes, after.storageDeviceBytes),
-		counter("storage", "file_end", before.storageFileEnd, after.storageFileEnd),
+		counter("storage", "file_count_after", 0, after.storageFiles),
+		counter("storage", "file_count_before", 0, before.storageFiles),
+		// FileEnd is a current physical gauge and may fall when a checkpoint
+		// reuses/truncates an unreachable suffix. Encode the detached end state
+		// from zero instead of misrepresenting it as a monotonic delta counter.
+		counter("storage", "file_end_bytes", 0, after.storageFileEnd),
 		counter("storage", "page_reads", before.storagePageReads, after.storagePageReads),
 		counter("storage", "read_bytes", before.storageReadBytes, after.storageReadBytes),
 		counter("workload", "logical_write_bytes", 0, logicalWriteBytes),

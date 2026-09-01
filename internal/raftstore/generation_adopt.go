@@ -95,6 +95,10 @@ func (store *Store) AdoptSelectedGeneration() error {
 	store.path, store.base = selected.path, selected.base
 	store.file, store.fileInfo, store.locked = selected.file, selected.fileInfo, true
 	store.header, store.current, store.image, store.generation = selected.header, selected.current, selected.image, selected.generation
+	// The record workspace owns keyed HMAC state for exactly one WAL header.
+	// Generation adoption replaces the file keys, so retaining the old
+	// workspace would derive nonces and tags under the retired generation.
+	store.recordEncode = recordEncodeWorkspace{}
 	store.syncCount++ // candidate allocation restoration Sync
 	// The family lease and candidate lease cover the complete transition;
 	// release the old inode only after the stable Store points at the candidate.

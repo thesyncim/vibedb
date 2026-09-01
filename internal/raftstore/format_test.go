@@ -343,7 +343,7 @@ func TestFormatByteGolden(t *testing.T) {
 	}
 	got := []string{digestHex(static), digestHex(record), digestHex(slot)}
 	// Filled from the deterministic encoder; changing any byte is a format change.
-	want := []string{"6da76bf5c626fa6257d06e77fdb39966615a9144cb6e727b0e41e41c42fa54a4", "8b8d44c0d9550f54d34e6eeea2143851ab49fbab11f7eb26f2dfa774fb33268a", "9bb18b22dba438e690363b29747caf208be727aebe064aaabd044cdce58ab5db"}
+	want := []string{"8ea70ff1044428d10888243a2ecc48b15599fdc98661046641183a83ee7f18f4", "bfc4f386a60d7bd1b226448897afb3a764f672d111c3e5dbcd9f189c2e272a76", "d8759c5b741b65d41aa5cac714fc0b3322ca4a03debe985830672a828ac26fba"}
 	for index := range want {
 		if got[index] != want[index] {
 			t.Fatalf("golden %d = %s", index, got[index])

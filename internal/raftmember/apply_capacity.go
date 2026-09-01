@@ -73,7 +73,7 @@ func validateLiveApplyCapacity(
 		)
 	}
 	return validateImmutableBaseApplyCapacity(
-		profile, applyProfile, hardState.GetCommit(), lastIndex,
+		profile, applyProfile, max(hardState.GetCommit(), applyProfile.Applied), lastIndex,
 	)
 }
 

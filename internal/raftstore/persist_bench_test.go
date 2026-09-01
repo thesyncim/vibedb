@@ -42,7 +42,7 @@ func BenchmarkPersistReadyDurability(b *testing.B) {
 
 			originalRead := store.options.ops.readAt
 			originalWrite := store.options.ops.writeAt
-			originalBarrier := store.options.ops.recordBarrier
+			originalBarrier := testRecordBarrier(store)
 			originalSync := store.options.ops.sync
 			var reads, writes, recordBarriers, finalSyncs, proofs uint64
 			store.options.ops.observeNamespaceProof = func() { proofs++ }

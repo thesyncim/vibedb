@@ -55,6 +55,26 @@ type fakeBatchReadOwner struct {
 	request raftservice.PointReadBatchRequest
 }
 
+type fakeAuthorizedReplicatedOwner struct {
+	*fakeReplicatedOwner
+	authorizedCalls atomic.Uint64
+}
+
+func (owner *fakeAuthorizedReplicatedOwner) SubmitOwnedAuthorized(
+	_ context.Context,
+	_ raftservice.ServingFence,
+	_ []byte,
+	authorize raftservice.ProposalAuthorization,
+) (raftservice.Result, error) {
+	owner.authorizedCalls.Add(1)
+	result := owner.result
+	result.State = owner.state
+	if !authorize(owner.state) {
+		return result, raftservice.ErrServingAuthorization
+	}
+	return result, owner.err
+}
+
 func (owner *fakeBatchReadOwner) ReadPointBatch(
 	_ context.Context,
 	request raftservice.PointReadBatchRequest,
@@ -484,6 +504,48 @@ func TestReplicatedServerRoundTripCompletionAndNotLeader(t *testing.T) {
 				t.Fatal("replicated server connection leaked")
 			}
 		})
+	}
+}
+
+func TestReplicatedServerFusesProposalProbeAndDynamicServingAuthorization(t *testing.T) {
+	fence := testReplicatedFence()
+	command := testReplicatedCommand(t, fence)
+	completion := testReplicatedCompletion(t, fence, 8)
+	state := testReplicatedServingState()
+	state.Status.Commit = 8
+	state.Status.Applied = 8
+	state.Status.CheckpointApplied = 7
+	base := &fakeReplicatedOwner{state: state, result: raftservice.Result{
+		Outcome: raftserve.Outcome{Code: raftserve.OutcomeCompletion, AppliedIndex: 9,
+			CompletionAppliedSequence: 8, CompletionBytes: len(completion)},
+		Completion: completion,
+	}}
+	owner := &fakeAuthorizedReplicatedOwner{fakeReplicatedOwner: base}
+	server := testReplicatedServer(owner)
+	allowed := true
+	var authorityCalls atomic.Uint64
+	if err := server.BindServingAuthority(func(candidate raftservice.ServingState) bool {
+		authorityCalls.Add(1)
+		return allowed && candidate == state
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request := &ReplicatedRequest{Operation: ReplicatedPropose, Fence: fence, Command: command}
+	response := server.executeReplicated(context.Background(), request)
+	if response.Kind != ReplicatedCompletion || response.State.Applied != 9 ||
+		response.State.Commit != 9 || response.State.CheckpointApplied != 7 ||
+		!validReplicatedResponse(response) || owner.probeCalls.Load() != 0 ||
+		owner.authorizedCalls.Load() != 1 || authorityCalls.Load() != 1 {
+		t.Fatalf("fused response=%+v probes=%d submissions=%d authority=%d",
+			response, owner.probeCalls.Load(), owner.authorizedCalls.Load(), authorityCalls.Load())
+	}
+
+	allowed = false
+	response = server.executeReplicated(context.Background(), request)
+	if response.Kind != ReplicatedRefusal || response.Refusal != ReplicatedRefusalUnavailable ||
+		!response.HasState || owner.authorizedCalls.Load() != 2 || authorityCalls.Load() != 2 {
+		t.Fatalf("revoked fused response=%+v submissions=%d authority=%d",
+			response, owner.authorizedCalls.Load(), authorityCalls.Load())
 	}
 }
 

@@ -140,7 +140,7 @@ func TestRuntimeReplaysCommittedWALSuffixFromCheckpointCertificate(t *testing.T)
 						lastBefore, persistedLast, len(suffixCommands),
 					)
 				}
-				if syncs := fixture.wal.SyncCount() - syncsBefore; syncs != 2 {
+				if syncs := fixture.wal.SyncCount() - syncsBefore; syncs != 1 {
 					t.Fatalf("entry-bearing suffix WAL syncs = %d, want 2", syncs)
 				}
 			}

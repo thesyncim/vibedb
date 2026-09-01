@@ -39,10 +39,16 @@ func (m *Machine) planTransactionCommand(
 	state State,
 	systemSnapshot pointSnapshot,
 	relationSnapshots relationPointSnapshots,
+	scratch *commandPlanScratch,
 ) (transactionCommandPlan, error) {
 	plan := transactionCommandPlan{command: commandPlan{
 		command: command, dataChainDigest: state.DataChainDigest,
 	}}
+	if scratch != nil {
+		clear(scratch.transactionRows)
+		scratch.transactionRows = scratch.transactionRows[:0]
+		plan.rows = scratch.transactionRows[:0]
+	}
 	if command.Kind() != replication.CommandTransaction {
 		return transactionCommandPlan{}, ErrStateCorrupt
 	}
@@ -170,7 +176,7 @@ func (m *Machine) planTransactionCommand(
 	case distributedtxn.ReplicatedApplySingleParticipant:
 		return m.planSingleParticipantApply(
 			plan, command, control, applied, commandDigest, storageKey,
-			systemSnapshot, relationSnapshots, existing.TransactionControl, found,
+			systemSnapshot, relationSnapshots, existing.TransactionControl, found, scratch,
 		)
 	case distributedtxn.ReplicatedAbortReleaseParticipant:
 		if control.ExpectedRevision == 0 {
@@ -1007,37 +1013,55 @@ func (m *Machine) planSingleParticipantApply(
 	relationSnapshots relationPointSnapshots,
 	existing TransactionControl,
 	found bool,
+	scratch *commandPlanScratch,
 ) (transactionCommandPlan, error) {
 	controlBytes, err := TransactionControlResidentBytes(len(control.Participant.IntentScopes))
 	if err != nil {
-		return transactionCommandPlan{}, err
+		return transactionCommandPlan{}, fmt.Errorf("%w: size direct control", err)
 	}
-	var payloadArena [replication.MaxRelationsPerBundle]TransactionRelationPayloadView
-	payloads := payloadArena[:0]
+	var payloads []TransactionRelationPayloadView
+	if scratch == nil {
+		payloads = make([]TransactionRelationPayloadView, 0, replication.MaxRelationsPerBundle)
+	} else {
+		clear(scratch.transactionPayloads[:])
+		payloads = scratch.transactionPayloads[:0]
+	}
 	blocked := false
 	relations := command.RelationBatches()
+	relationOrdinal := 0
 	for relations.Next() {
+		if relationOrdinal >= replication.MaxRelationsPerBundle {
+			return transactionCommandPlan{}, ErrAdmissionBound
+		}
 		batch := relations.Batch()
 		if blockedNow, blockErr := transactionBatchBlocked(snapshot, batch); blockErr != nil {
-			return transactionCommandPlan{}, blockErr
+			return transactionCommandPlan{}, fmt.Errorf("%w: check direct intent", blockErr)
 		} else if blockedNow {
 			blocked = true
 		}
-		row, appendErr := AppendTransactionRelationPayload(nil, control.ID, batch)
+		var destination []byte
+		if scratch != nil {
+			destination = scratch.transactionRelationRecord[relationOrdinal][:0]
+		}
+		row, appendErr := AppendTransactionRelationPayload(destination, control.ID, batch)
 		if appendErr != nil {
-			return transactionCommandPlan{}, appendErr
+			return transactionCommandPlan{}, fmt.Errorf("%w: encode direct relation", appendErr)
+		}
+		if scratch != nil {
+			scratch.transactionRelationRecord[relationOrdinal] = row
 		}
 		payload, openErr := OpenTransactionRelationPayload(row)
 		if openErr != nil {
-			return transactionCommandPlan{}, openErr
+			return transactionCommandPlan{}, fmt.Errorf("%w: reopen direct relation", openErr)
 		}
 		payloads = append(payloads, payload)
+		relationOrdinal++
 	}
 	resultCode := uint32(ResultIndexConflict)
 	var affectedRows int64
 	if !blocked {
 		changes, spans, digest, rows, code, planErr := m.planStoredTransactionMutations(
-			command, payloads, plan.command.dataChainDigest, relationSnapshots,
+			command, payloads, plan.command.dataChainDigest, relationSnapshots, scratch,
 		)
 		if planErr != nil {
 			return transactionCommandPlan{}, planErr
@@ -1073,11 +1097,21 @@ func (m *Machine) planSingleParticipantApply(
 		LastOperation: control.Operation, LastExpectedRevision: control.ExpectedRevision,
 		LastCommandDigest: commandDigest, LastResultCode: resultCode, LastAppliedIndex: applied,
 	}
-	encoded, err := AppendTransactionControl(nil, durableControl)
+	var controlDestination []byte
+	if scratch != nil {
+		controlDestination = scratch.transactionControlRecord[:0]
+	}
+	encoded, err := AppendTransactionControl(controlDestination, durableControl)
 	if err != nil {
-		return transactionCommandPlan{}, err
+		return transactionCommandPlan{}, fmt.Errorf("%w: encode direct result", err)
+	}
+	if scratch != nil {
+		scratch.transactionControlRecord = encoded
 	}
 	plan.rows = append(plan.rows, newTransactionPut(controlKey[:], encoded))
+	if scratch != nil {
+		scratch.transactionRows = plan.rows
+	}
 	plan.delta = transactionStateDelta{residentByte: int64(controlBytes)}
 	if found {
 		plan.delta.residentByte -= int64(existing.ResidentControlBytes)
@@ -1179,7 +1213,7 @@ func (m *Machine) planParticipantStageWithVote(
 	var finishPlan commandPlan
 	if prepare {
 		changes, spans, digest, _, code, err := m.planStoredTransactionMutations(
-			command, payloads, plan.command.dataChainDigest, relationSnapshots,
+			command, payloads, plan.command.dataChainDigest, relationSnapshots, nil,
 		)
 		if err != nil {
 			return transactionCommandPlan{}, err
@@ -1314,7 +1348,7 @@ func (m *Machine) planParticipantTransition(
 			return transactionCommandPlan{}, err
 		}
 		changes, spans, digest, affectedRows, code, err := m.planStoredTransactionMutations(
-			command, batches, plan.command.dataChainDigest, relationSnapshots,
+			command, batches, plan.command.dataChainDigest, relationSnapshots, nil,
 		)
 		if err != nil {
 			return transactionCommandPlan{}, err
@@ -1340,7 +1374,7 @@ func (m *Machine) planParticipantTransition(
 			return transactionCommandPlan{}, err
 		}
 		_, _, _, _, code, err := m.planStoredTransactionMutations(
-			command, batches, plan.command.dataChainDigest, relationSnapshots,
+			command, batches, plan.command.dataChainDigest, relationSnapshots, nil,
 		)
 		if err != nil {
 			return transactionCommandPlan{}, err
@@ -1456,7 +1490,11 @@ func (m *Machine) planStoredTransactionMutations(
 	rows []TransactionRelationPayloadView,
 	dataChain [sha256.Size]byte,
 	snapshots relationPointSnapshots,
+	scratch *commandPlanScratch,
 ) ([]finalMutation, []plannedRelationChanges, [sha256.Size]byte, int64, uint32, error) {
+	if scratch != nil {
+		scratch.begin()
+	}
 	m.canonicalMutations.begin(command, rows)
 	if snapshots.count != uint16(len(m.relations)) {
 		return nil, nil, dataChain, 0, 0, ErrInconsistentSnapshot
@@ -1473,10 +1511,12 @@ func (m *Machine) planStoredTransactionMutations(
 			return nil, nil, dataChain, 0, ResultUnknownRelation, nil
 		}
 		changes, batchAffectedRows, code, err := m.planMutations(
-			&m.relations[ordinal], batch, snapshots.values[ordinal], nil, false,
+			&m.relations[ordinal], batch, snapshots.values[ordinal], scratch, false,
 		)
 		if err != nil {
-			return nil, nil, dataChain, 0, 0, err
+			return nil, nil, dataChain, 0, 0, fmt.Errorf(
+				"%w: plan transaction relation %d", err, batch.Relation,
+			)
 		}
 		if code == ResultInvalidDocument || code == ResultTargetBound {
 			// The replicated transaction control format intentionally has one
@@ -1502,9 +1542,13 @@ func (m *Machine) planStoredTransactionMutations(
 		m.bundleRelations = append(m.bundleRelations, plannedRelationChanges{
 			ordinal: uint16(ordinal), start: uint32(start), end: uint32(len(m.bundlePlan)),
 		})
+		var descriptors []mutationValueDescriptor
+		if scratch != nil {
+			descriptors = scratch.descriptors
+		}
 		dataChain, err = dataChainTransitionDigest(
 			m.dataChainHash, dataChain, m.relations[ordinal].contract,
-			m.bundlePlan[start:], nil,
+			m.bundlePlan[start:], descriptors,
 		)
 		if err != nil {
 			return nil, nil, dataChain, 0, 0, err

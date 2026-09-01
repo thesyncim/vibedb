@@ -25,16 +25,19 @@ import (
 type Store struct {
 	mu sync.RWMutex
 
-	path          string
-	logicalPath   string
-	parentPath    string
-	base          string
-	logicalBase   string
-	root          *os.Root
-	directoryInfo os.FileInfo
-	file          *os.File
-	fileInfo      os.FileInfo
-	locked        bool
+	path           string
+	logicalPath    string
+	parentPath     string
+	base           string
+	logicalBase    string
+	root           *os.Root
+	directoryInfo  os.FileInfo
+	file           *os.File
+	fileInfo       os.FileInfo
+	proofDirectory *os.File
+	proofParentNUL string
+	proofBaseNUL   string
+	locked         bool
 
 	options    normalizedOptions
 	header     headerState
@@ -55,6 +58,12 @@ type Store struct {
 	attemptedReady       retryKey
 	attemptedReadyDigest [32]byte
 	pending              *pendingMutation
+	pendingState         pendingMutation
+	groupEntriesScratch  []*pb.Entry
+	unsynced             bool
+	recordEncode         recordEncodeWorkspace
+	recordArena          []byte
+	payloadArena         []byte
 }
 
 // Metrics is a detached fixed-width view of live WAL retention and durable
@@ -87,7 +96,12 @@ type pendingKind uint8
 const (
 	pendingBegin pendingKind = iota + 1
 	pendingPersist
+	pendingPersistGroup
 )
+
+// MaxPersistGroupBatches bounds one append-lane durability group. The caller
+// may submit fewer; the fixed bound keeps retry state independent of load.
+const MaxPersistGroupBatches = 16
 
 type pendingMutation struct {
 	kind             pendingKind
@@ -98,6 +112,15 @@ type pendingMutation struct {
 	currentOffset    int64
 	next             currentState
 	delta            imageDelta
+	groupCount       int
+	groupKeys        [MaxPersistGroupBatches]retryKey
+	groupDigests     [MaxPersistGroupBatches][32]byte
+	groupDeltas      [MaxPersistGroupBatches]imageDelta
+	groupRecords     [MaxPersistGroupBatches][]byte
+	groupPublish     [MaxPersistGroupBatches]bool
+	groupRecordBytes []byte
+	groupRecordStart int64
+	mustSync         bool
 }
 
 var _ raftmodel.StableStore = (*Store)(nil)
@@ -392,6 +415,10 @@ func resumeCreatedSource(
 		return cleanup(err)
 	}
 	image, generation, err := recoverRecords(file, &header, current, options)
+	if err != nil {
+		return cleanup(err)
+	}
+	current, image, err = recoverReadyTail(file, header, current, image, options)
 	if err != nil {
 		return cleanup(err)
 	}
@@ -866,6 +893,11 @@ func openFamilySelectedStore(root *os.Root, parentPath string, directoryInfo os.
 		cleanup()
 		return nil, err
 	}
+	current, image, err = recoverReadyTail(file, header, current, image, normalized)
+	if err != nil {
+		cleanup()
+		return nil, err
+	}
 	if header.topologyRecoveryEpoch != expectedTopologyRecoveryEpoch {
 		cleanup()
 		return nil, fmt.Errorf("%w: expected topology recovery epoch %d, sealed %d", ErrIdentityMismatch, expectedTopologyRecoveryEpoch, header.topologyRecoveryEpoch)
@@ -1004,6 +1036,27 @@ func writeExactAt(operations fileOps, file *os.File, data []byte, offset int64) 
 		return io.ErrShortWrite
 	}
 	return nil
+}
+
+func writeDurableExactAt(operations fileOps, file *os.File, data []byte, offset int64) error {
+	if operations.durableWriteAt == nil {
+		return ErrInvalid
+	}
+	written, err := operations.durableWriteAt(file, data, offset)
+	if err != nil {
+		return err
+	}
+	if written != len(data) {
+		return io.ErrShortWrite
+	}
+	return nil
+}
+
+func recordDurabilityBarrier(operations fileOps, file *os.File) error {
+	if operations.recordBarrier != nil {
+		return operations.recordBarrier(file)
+	}
+	return syncReadyRecord(file)
 }
 
 func (store *Store) checkBaseLocked() error {
@@ -1146,10 +1199,24 @@ func (store *Store) CapacityProfile() (CapacityProfile, error) {
 // available Ready work; empty Ready batches remain zero-write/zero-sync even
 // when full (they still perform read-only namespace fencing).
 func (store *Store) ReserveReady() error {
+	_, err := store.ReserveReadyCount(1)
+	return err
+}
+
+// ReserveReadyCount returns a conservative number of future worst-case Ready
+// records that fit the current immutable generation, up to limit. It performs
+// no mutation. A pipelined owner uses the returned count as local admission
+// credits so it does not contend on Store.mu with every in-flight fdatasync.
+// Consuming each credit at most once preserves every physical, logical-entry,
+// live-byte, and record-count bound even when actual Ready records are smaller.
+func (store *Store) ReserveReadyCount(limit int) (int, error) {
+	if limit <= 0 {
+		return 0, ErrInvalid
+	}
 	store.mu.RLock()
 	defer store.mu.RUnlock()
 	if err := store.checkLocked(); err != nil {
-		return err
+		return 0, err
 	}
 	requiredLiveBytes := int64(MinimumReadyLiveBytes)
 	if store.options.maxLiveBytes < requiredLiveBytes {
@@ -1159,13 +1226,21 @@ func (store *Store) ReserveReady() error {
 	if store.options.maxEntries < requiredEntries {
 		requiredEntries = store.options.maxEntries
 	}
-	if store.current.recordSequence >= store.options.maxRecords ||
-		store.options.maxFileBytes-store.current.walEnd < int64(store.options.maxRecordBytes) ||
-		store.image.liveBytes > store.options.maxLiveBytes-requiredLiveBytes ||
-		uint64(len(store.image.entries)) > store.options.maxEntries-requiredEntries {
-		return ErrFull
+	availableRecords := store.options.maxRecords - store.current.recordSequence
+	availableBytes := uint64(0)
+	if remaining := store.options.maxFileBytes - store.current.walEnd; remaining > 0 {
+		availableBytes = uint64(remaining) / uint64(store.options.maxRecordBytes)
 	}
-	return nil
+	availableLive := uint64(0)
+	if store.image.liveBytes >= 0 && store.image.liveBytes <= store.options.maxLiveBytes {
+		availableLive = uint64(store.options.maxLiveBytes-store.image.liveBytes) / uint64(requiredLiveBytes)
+	}
+	availableEntries := (store.options.maxEntries - uint64(len(store.image.entries))) / requiredEntries
+	count := min(uint64(limit), availableRecords, availableBytes, availableLive, availableEntries)
+	if count == 0 {
+		return 0, ErrFull
+	}
+	return int(count), nil
 }
 
 // RemainingBytes reports the unused portion of the fixed physical allocation.
@@ -1178,8 +1253,199 @@ func (store *Store) RemainingBytes() int64 {
 	return store.options.maxFileBytes - store.current.walEnd
 }
 
-// Persist implements raftmodel.StableStore. Every nonempty accepted batch has
-// both its aligned WAL record and selecting current slot synced before return.
+// PersistGroup appends an ordered bounded sequence of Ready records and crosses
+// one shared durability barrier. Recovery may retain any complete prefix after
+// an unacknowledged crash, which is safe Raft stable storage; responses are
+// released only after the whole submitted group reaches the barrier. An
+// outcome-unknown error pins the exact group for byte-identical retry.
+func (store *Store) PersistGroup(batches []raftmodel.PersistBatch) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if err := store.checkBaseLocked(); err != nil {
+		return err
+	}
+	if len(batches) == 0 || len(batches) > MaxPersistGroupBatches {
+		return persistenceError("validate Ready group size", false, ErrInvalid)
+	}
+	if !store.begun || store.observedReadyID == math.MaxUint64 {
+		return persistenceError("validate Ready group owner", false, ErrInvalid)
+	}
+
+	working := logImage{
+		hard: store.image.hard, first: store.image.first,
+		last: store.image.last, baseTerm: store.image.baseTerm,
+		liveBytes: store.image.liveBytes,
+	}
+	working.entries = append(store.groupEntriesScratch[:0], store.image.entries...)
+	defer func() {
+		clear(working.entries)
+		store.groupEntriesScratch = working.entries[:0]
+	}()
+
+	var keys [MaxPersistGroupBatches]retryKey
+	var digests [MaxPersistGroupBatches][32]byte
+	var deltas [MaxPersistGroupBatches]imageDelta
+	var payloads [MaxPersistGroupBatches][]byte
+	var empty [MaxPersistGroupBatches]bool
+	var volatileCommit [MaxPersistGroupBatches]bool
+	totalPayloadBytes := 0
+	for _, batch := range batches {
+		if isEmptyHardState(batch.HardState) && len(batch.Entries) == 0 {
+			continue
+		}
+		payloadBytes, err := readyPayloadSize(batch)
+		if err != nil || totalPayloadBytes > math.MaxInt-payloadBytes {
+			return persistenceError("reserve Ready group payload", false, errors.Join(ErrBounds, err))
+		}
+		totalPayloadBytes += payloadBytes
+	}
+	if cap(store.payloadArena) < totalPayloadBytes {
+		store.payloadArena = make([]byte, totalPayloadBytes)
+	} else {
+		store.payloadArena = store.payloadArena[:totalPayloadBytes]
+	}
+	payloadOffset := 0
+	expected := store.observedReadyID
+	for index, batch := range batches {
+		if batch.NodeIncarnation == 0 || batch.NodeIncarnation != store.current.currentIncarnation ||
+			batch.ReadyID == 0 || expected == math.MaxUint64 || batch.ReadyID != expected+1 {
+			return persistenceError("validate Ready group order", false, ErrInvalid)
+		}
+		expected = batch.ReadyID
+		keys[index] = retryKey{incarnation: batch.NodeIncarnation, readyID: batch.ReadyID}
+		var err error
+		empty[index], payloads[index], digests[index], deltas[index], err =
+			store.prepareBatchAgainstImageLocked(batch, &working, store.payloadArena[payloadOffset:payloadOffset])
+		if err != nil {
+			return persistenceError("validate Ready group", false, err)
+		}
+		if !empty[index] {
+			payloadOffset += len(payloads[index])
+			volatileCommit[index] = isVolatileCommitOnly(&working, batch, deltas[index])
+			commitImageDelta(&working, deltas[index])
+		}
+	}
+
+	if store.pending != nil {
+		if store.pending.kind != pendingPersistGroup || store.pending.groupCount != len(batches) {
+			return ErrPersistenceUnknown
+		}
+		for index := range batches {
+			if store.pending.groupKeys[index] != keys[index] ||
+				store.pending.groupDigests[index] != digests[index] {
+				return persistenceError("validate pending Ready group retry", false, ErrRetryConflict)
+			}
+		}
+		return store.settlePendingLocked()
+	}
+
+	nonempty := 0
+	for index := range batches {
+		if empty[index] || volatileCommit[index] {
+			continue
+		}
+		nonempty++
+		if len(payloads[index]) > store.options.maxRecordBytes {
+			return persistenceError("reserve Ready group", false, ErrBounds)
+		}
+	}
+	if nonempty == 0 {
+		published := false
+		for index := range batches {
+			if volatileCommit[index] {
+				commitImageDelta(&store.image, deltas[index])
+				published = true
+			}
+		}
+		if !published {
+			if err := store.proveCurrentNamespace(); err != nil {
+				store.poisonNamespace(err, false)
+				return persistenceError("prove WAL for empty Ready group", false, err)
+			}
+		}
+		store.observedReadyID = keys[len(batches)-1].readyID
+		store.observedReadyDigest = digests[len(batches)-1]
+		return nil
+	}
+	if uint64(nonempty) > store.options.maxRecords-store.current.recordSequence {
+		return persistenceError("reserve Ready group", false, ErrFull)
+	}
+	pending := &store.pendingState
+	*pending = pendingMutation{
+		kind: pendingPersistGroup, key: keys[len(batches)-1],
+		semanticDigest: digests[len(batches)-1], groupCount: len(batches),
+	}
+	pending.next = store.current
+	totalRecordBytes := 0
+	for index := range batches {
+		if empty[index] || volatileCommit[index] {
+			continue
+		}
+		recordBytes, ok := readyRecordSize(len(payloads[index]), len(store.header.keyID))
+		if !ok || recordBytes > store.options.maxRecordBytes || totalRecordBytes > math.MaxInt-recordBytes {
+			return persistenceError("reserve Ready group record", false, ErrBounds)
+		}
+		totalRecordBytes += recordBytes
+	}
+	if cap(store.recordArena) < totalRecordBytes {
+		store.recordArena = make([]byte, totalRecordBytes)
+	} else {
+		store.recordArena = store.recordArena[:totalRecordBytes]
+	}
+	recordOffset := 0
+	groupRecordStart := pending.next.walEnd
+	for index, batch := range batches {
+		pending.mustSync = pending.mustSync || batch.MustSync
+		pending.groupKeys[index] = keys[index]
+		pending.groupDigests[index] = digests[index]
+		pending.groupDeltas[index] = deltas[index]
+		pending.groupPublish[index] = !empty[index]
+		if empty[index] || volatileCommit[index] {
+			continue
+		}
+		if pending.next.recordSequence == math.MaxUint64 {
+			return persistenceError("advance Ready group sequence", false, ErrBounds)
+		}
+		sequence := pending.next.recordSequence + 1
+		flags := uint8(0)
+		if batch.MustSync {
+			flags = 1
+		}
+		record, recordDigest, _, err := marshalRecordInto(
+			store.recordArena[recordOffset:recordOffset], &store.recordEncode,
+			recordKindReady, flags, sequence, batch.NodeIncarnation, batch.ReadyID,
+			pending.next.chainDigest, payloads[index], store.header, store.options,
+		)
+		if err != nil {
+			return persistenceError("encode Ready group record", false, err)
+		}
+		end, ok := addInt64(pending.next.walEnd, len(record))
+		if !ok || end > store.options.maxFileBytes {
+			return persistenceError("reserve Ready group record", false, ErrFull)
+		}
+		pending.groupRecords[index] = record
+		recordOffset += len(record)
+		pending.next.walEnd = end
+		pending.next.recordSequence = sequence
+		pending.next.chainDigest = recordDigest
+		pending.next.hard = deltas[index].hard
+		pending.next.last = deltas[index].last
+		pending.next.retryPresent = true
+		pending.next.retry = keys[index]
+		pending.next.retryDigest = digests[index]
+	}
+	pending.groupRecordBytes = store.recordArena[:recordOffset]
+	pending.groupRecordStart = groupRecordStart
+	store.pending = pending
+	return store.settlePendingLocked()
+}
+
+// Persist implements raftmodel.StableStore. Every nonempty accepted batch is
+// one authenticated, chained append followed by one durability barrier. Cold
+// recovery scans the bounded valid Ready tail beyond the last current-slot
+// anchor. Current slots are incarnation/generation anchors, not per-Ready
+// selectors; removing their second sync is safe because an incomplete final
+// record was never acknowledged and is ignored as a torn tail.
 func (store *Store) Persist(batch raftmodel.PersistBatch) error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
@@ -1235,6 +1501,14 @@ func (store *Store) Persist(batch raftmodel.PersistBatch) error {
 		store.observedReadyDigest = semanticDigest
 		return nil
 	}
+	if isVolatileCommitOnly(&store.image, batch, delta) {
+		commitImageDelta(&store.image, delta)
+		store.observedReadyID = batch.ReadyID
+		store.observedReadyDigest = semanticDigest
+		store.attemptedReady = retryKey{}
+		store.attemptedReadyDigest = [32]byte{}
+		return nil
+	}
 	if store.attemptedReady == (retryKey{}) {
 		store.attemptedReady = key
 		store.attemptedReadyDigest = semanticDigest
@@ -1250,7 +1524,9 @@ func (store *Store) Persist(batch raftmodel.PersistBatch) error {
 	if batch.MustSync {
 		flags = 1
 	}
-	record, recordDigest, _, err := marshalRecord(recordKindReady, flags, sequence, batch.NodeIncarnation, batch.ReadyID, store.current.chainDigest, payloadBytes, store.header, store.options)
+	record, recordDigest, _, err := marshalRecordInto(store.recordArena[:0], &store.recordEncode,
+		recordKindReady, flags, sequence, batch.NodeIncarnation, batch.ReadyID,
+		store.current.chainDigest, payloadBytes, store.header, store.options)
 	if err != nil {
 		return persistenceError("encode Ready record", false, err)
 	}
@@ -1258,36 +1534,25 @@ func (store *Store) Persist(batch raftmodel.PersistBatch) error {
 	if !ok || end > store.options.maxFileBytes {
 		return persistenceError("reserve Ready record", false, ErrFull)
 	}
-	if err := store.proveCurrentNamespace(); err != nil {
-		store.poisonNamespace(err, false)
-		return persistenceError("prove WAL before record", false, err)
-	}
 	if err := writeExactAt(store.options.ops, store.file, record, store.current.walEnd); err != nil {
 		return persistenceError("write Ready record", false, err)
 	}
-	if err := store.options.ops.recordBarrier(store.file); err != nil {
-		return persistenceError("order Ready record", false, err)
-	}
-	store.syncCount++
 	next := store.current
-	next.activeSlot = 1 - store.current.activeSlot
-	next.generation++
 	next.walEnd = end
 	next.recordSequence = sequence
 	next.chainDigest = recordDigest
-	next.hard = cloneHardState(delta.hard)
+	next.hard = delta.hard
 	next.last = delta.last
 	next.retryPresent = true
 	next.retry = retryKey{incarnation: batch.NodeIncarnation, readyID: batch.ReadyID}
 	next.retryDigest = semanticDigest
-	data, _, err := marshalCurrentSlot(next, next.activeSlot, store.header)
-	if err != nil {
-		return persistenceError("encode current slot", false, err)
+	store.recordArena = record
+	pending := &store.pendingState
+	*pending = pendingMutation{
+		kind: pendingPersist, key: key, semanticDigest: semanticDigest,
+		next: next, delta: delta, mustSync: batch.MustSync,
 	}
-	store.pending = &pendingMutation{
-		kind: pendingPersist, key: retryKey{incarnation: batch.NodeIncarnation, readyID: batch.ReadyID}, semanticDigest: semanticDigest,
-		currentBytes: data, currentOffset: int64(StaticHeaderBytes + next.activeSlot*CurrentSlotBytes), next: next, delta: delta,
-	}
+	store.pending = pending
 	return store.settlePendingLocked()
 }
 
@@ -1295,6 +1560,77 @@ func (store *Store) settlePendingLocked() error {
 	pending := store.pending
 	if pending == nil {
 		return ErrInvalid
+	}
+	if pending.kind == pendingPersistGroup {
+		fused := pending.mustSync && !store.unsynced &&
+			store.options.ops.recordBarrier == nil && store.options.ops.durableWriteAt != nil
+		if fused {
+			if err := writeDurableExactAt(
+				store.options.ops, store.file,
+				pending.groupRecordBytes, pending.groupRecordStart,
+			); err != nil {
+				return persistenceError("write durable Ready group", true, err)
+			}
+			store.syncCount++
+			store.unsynced = false
+		} else {
+			if err := writeExactAt(
+				store.options.ops, store.file,
+				pending.groupRecordBytes, pending.groupRecordStart,
+			); err != nil {
+				return persistenceError("write Ready group", true, err)
+			}
+		}
+		if pending.mustSync {
+			if !fused {
+				if err := recordDurabilityBarrier(store.options.ops, store.file); err != nil {
+					return persistenceError("sync Ready group", true, err)
+				}
+				store.syncCount++
+			}
+			store.unsynced = false
+		} else {
+			store.unsynced = true
+		}
+		if err := store.proveCurrentNamespace(); err != nil {
+			store.poisonNamespace(err, true)
+			return persistenceError("prove WAL after Ready group sync", true, err)
+		}
+		store.current = pending.next
+		for index := 0; index < pending.groupCount; index++ {
+			if pending.groupPublish[index] {
+				commitImageDelta(&store.image, pending.groupDeltas[index])
+			}
+		}
+		store.observedReadyID = pending.key.readyID
+		store.observedReadyDigest = pending.semanticDigest
+		store.attemptedReady = retryKey{}
+		store.attemptedReadyDigest = [32]byte{}
+		store.pending = nil
+		return nil
+	}
+	if pending.kind == pendingPersist {
+		if pending.mustSync {
+			if err := recordDurabilityBarrier(store.options.ops, store.file); err != nil {
+				return persistenceError("sync Ready record", true, err)
+			}
+			store.syncCount++
+			store.unsynced = false
+		} else {
+			store.unsynced = true
+		}
+		if err := store.proveCurrentNamespace(); err != nil {
+			store.poisonNamespace(err, true)
+			return persistenceError("prove WAL after Ready sync", true, err)
+		}
+		store.current = pending.next
+		commitImageDelta(&store.image, pending.delta)
+		store.observedReadyID = pending.key.readyID
+		store.observedReadyDigest = pending.semanticDigest
+		store.attemptedReady = retryKey{}
+		store.attemptedReadyDigest = [32]byte{}
+		store.pending = nil
+		return nil
 	}
 	if err := store.proveCurrentNamespace(); err != nil {
 		unknown := pending.currentAttempted
@@ -1324,6 +1660,7 @@ func (store *Store) settlePendingLocked() error {
 		return persistenceError("sync current slot", true, err)
 	}
 	store.syncCount++
+	store.unsynced = false
 	if err := store.proveCurrentNamespace(); err != nil {
 		store.poisonNamespace(err, true)
 		return persistenceError("prove WAL after current slot", true, err)
@@ -1348,6 +1685,32 @@ func (store *Store) settlePendingLocked() error {
 }
 
 func (store *Store) prepareBatchLocked(batch raftmodel.PersistBatch) (bool, []byte, [32]byte, imageDelta, error) {
+	empty, encoded, digest, delta, err := store.prepareBatchAgainstImageLocked(batch, &store.image, store.payloadArena[:0])
+	if err == nil && !empty {
+		store.payloadArena = encoded
+	}
+	return empty, encoded, digest, delta, err
+}
+
+// isVolatileCommitOnly identifies the commit-index notification that follows
+// already-durable log replication. It changes neither term nor vote, carries
+// no log bytes, and requires no barrier. The state machine's durable
+// publication certifies the final such notification across restart; the next
+// ordinary WAL record also folds it into persisted HardState.
+func isVolatileCommitOnly(image *logImage, batch raftmodel.PersistBatch, delta imageDelta) bool {
+	return image != nil && image.hard != nil && !batch.MustSync &&
+		len(batch.Entries) == 0 && canonicalEmptySnapshot(batch.Snapshot) &&
+		!isEmptyHardState(batch.HardState) && delta.hard != nil &&
+		delta.hard.GetTerm() == image.hard.GetTerm() &&
+		delta.hard.GetVote() == image.hard.GetVote() &&
+		delta.hard.GetCommit() >= image.hard.GetCommit()
+}
+
+func (store *Store) prepareBatchAgainstImageLocked(
+	batch raftmodel.PersistBatch,
+	image *logImage,
+	destination []byte,
+) (bool, []byte, [32]byte, imageDelta, error) {
 	if !canonicalEmptySnapshot(batch.Snapshot) {
 		return false, nil, [32]byte{}, imageDelta{}, ErrUnsupportedSnapshot
 	}
@@ -1361,12 +1724,15 @@ func (store *Store) prepareBatchLocked(batch raftmodel.PersistBatch) (bool, []by
 	if empty {
 		return true, nil, emptyReadyDigest(batch.MustSync), imageDelta{}, nil
 	}
-	payload := readyPayload{hard: batch.HardState, entries: batch.Entries, mustSync: batch.MustSync}
-	delta, err := planReadyPayload(&store.image, payload, store.options)
+	payload := readyPayload{
+		hard: batch.HardState, entries: batch.Entries,
+		mustSync: batch.MustSync, owned: batch.TransferOwnership,
+	}
+	delta, err := planReadyPayload(image, payload, store.options)
 	if err != nil {
 		return false, nil, [32]byte{}, imageDelta{}, err
 	}
-	encoded, err := marshalReadyPayload(batch)
+	encoded, err := marshalReadyPayloadInto(destination, batch)
 	if err != nil {
 		return false, nil, [32]byte{}, imageDelta{}, err
 	}
@@ -1395,7 +1761,27 @@ func (store *Store) proveCurrentNamespace() error {
 	if store.options.ops.observeNamespaceProof != nil {
 		store.options.ops.observeNamespaceProof()
 	}
-	return proveNamedFile(store.root, store.parentPath, store.directoryInfo, store.base, store.file, store.options.maxFileBytes)
+	if store.proofDirectory == nil {
+		directory, err := store.root.Open(".")
+		if err != nil {
+			return fmt.Errorf("%w: pin WAL parent descriptor: %v", ErrNamespaceChanged, err)
+		}
+		store.proofDirectory = directory
+	}
+	if !cachedNULPathMatches(store.proofParentNUL, store.parentPath) {
+		store.proofParentNUL = store.parentPath + "\x00"
+	}
+	if !cachedNULPathMatches(store.proofBaseNUL, store.base) {
+		store.proofBaseNUL = store.base + "\x00"
+	}
+	return provePinnedNamedFile(
+		store.proofDirectory, store.proofParentNUL, store.proofBaseNUL,
+		store.file, store.options.maxFileBytes,
+	)
+}
+
+func cachedNULPathMatches(cached, path string) bool {
+	return len(cached) == len(path)+1 && cached[len(path)] == 0 && cached[:len(path)] == path
 }
 
 // InitialState implements raft.Storage.
@@ -1416,10 +1802,14 @@ func (store *Store) DurableCommit() (uint64, error) {
 	if err := store.checkLocked(); err != nil {
 		return 0, err
 	}
-	return store.image.hard.GetCommit(), nil
+	return store.current.hard.GetCommit(), nil
 }
 
-// Entries implements raft.Storage and returns detached entry objects.
+// Entries implements raft.Storage and returns an immutable borrowed pointer
+// slice, matching raft.MemoryStorage. Entry objects and their Data must not be
+// mutated. A full-slice expression prevents append from modifying the
+// Store-owned pointer vector; conflicting suffix publication uses copy-on-write
+// so a reader may safely retain the returned slice.
 func (store *Store) Entries(lo, hi, maxSize uint64) ([]*pb.Entry, error) {
 	store.mu.RLock()
 	defer store.mu.RUnlock()
@@ -1447,7 +1837,7 @@ func (store *Store) Entries(lo, hi, maxSize uint64) ([]*pb.Entry, error) {
 		size += next
 		limit++
 	}
-	return cloneEntries(selected[:limit]), nil
+	return selected[:limit:limit], nil
 }
 
 // Term implements raft.Storage.
@@ -1583,6 +1973,17 @@ func (store *Store) Close() error {
 	if store.closed {
 		return nil
 	}
+	var flushErr error
+	if store.file != nil && store.unsynced && store.pending == nil && store.poisoned == nil {
+		if err := store.proveCurrentNamespace(); err != nil {
+			flushErr = persistenceError("prove WAL before close sync", false, err)
+		} else if err := recordDurabilityBarrier(store.options.ops, store.file); err != nil {
+			flushErr = persistenceError("sync Ready tail on close", true, err)
+		} else {
+			store.syncCount++
+			store.unsynced = false
+		}
+	}
 	store.closed = true
 	var unlockErr error
 	if store.locked {
@@ -1594,6 +1995,11 @@ func (store *Store) Close() error {
 		closeErr = store.file.Close()
 		store.file = nil
 	}
+	var proofDirectoryErr error
+	if store.proofDirectory != nil {
+		proofDirectoryErr = store.proofDirectory.Close()
+		store.proofDirectory = nil
+	}
 	familyErr := store.family.close()
 	store.family = nil
 	var rootErr error
@@ -1601,5 +2007,5 @@ func (store *Store) Close() error {
 		rootErr = store.root.Close()
 		store.root = nil
 	}
-	return errors.Join(unlockErr, closeErr, familyErr, rootErr)
+	return errors.Join(flushErr, unlockErr, closeErr, proofDirectoryErr, familyErr, rootErr)
 }

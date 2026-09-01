@@ -467,6 +467,14 @@ func (store *Store) validateRetiringSourceLocked(state familyState) error {
 	if err != nil || recoveredTorn {
 		return errors.Join(ErrGenerationSource, err)
 	}
+	image, _, err := recoverRecords(file, &header, current, store.options)
+	if err != nil {
+		return errors.Join(ErrGenerationSource, err)
+	}
+	current, _, err = recoverReadyTail(file, header, current, image, store.options)
+	if err != nil {
+		return errors.Join(ErrGenerationSource, err)
+	}
 	if current.generation != seal.sourceCurrentGeneration {
 		return fmt.Errorf("%w: retiring source current generation", ErrGenerationSource)
 	}

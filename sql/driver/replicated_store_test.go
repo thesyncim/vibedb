@@ -68,7 +68,7 @@ func TestReplicatedBatchCeilingFitsConditionalJournal(t *testing.T) {
 		systemLimits.MaxBatchBytes+storeio.RecoveryConditionalHeaderSize,
 	)
 	if systemRequired > int(ReplicatedSystemRecoveryJournalBytes) ||
-		ReplicatedSystemRecoveryJournalBytes != 655872 {
+		ReplicatedSystemRecoveryJournalBytes != 16<<20 {
 		t.Fatalf(
 			"system conditional record = %d, system profile = %d",
 			systemRequired, ReplicatedSystemRecoveryJournalBytes,
@@ -210,7 +210,7 @@ func TestReplicatedSidecarProfilesStrictCurrentGrammar(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const wantApply = `{"system_recovery_journal_bytes":655872}`
+	const wantApply = `{"system_recovery_journal_bytes":16777216}`
 	if string(applyRaw) != wantApply {
 		t.Fatalf("apply sidecar JSON = %s, want %s", applyRaw, wantApply)
 	}
@@ -220,8 +220,8 @@ func TestReplicatedSidecarProfilesStrictCurrentGrammar(t *testing.T) {
 	}
 	applyCases := map[string]string{
 		"missing":    `{}`,
-		"unknown":    `{"unknown":1,"system_recovery_journal_bytes":655872}`,
-		"duplicate":  `{"system_recovery_journal_bytes":655872,"system_recovery_journal_bytes":655872}`,
+		"unknown":    `{"unknown":1,"system_recovery_journal_bytes":16777216}`,
+		"duplicate":  `{"system_recovery_journal_bytes":16777216,"system_recovery_journal_bytes":16777216}`,
 		"wrong":      `{"system_recovery_journal_bytes":197120}`,
 		"null":       `null`,
 		"non_object": `[]`,

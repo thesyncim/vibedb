@@ -732,9 +732,9 @@ func UpdateCollections(
 		}
 		wb := &WriteBatch{
 			collection: member.Collection,
-			position:   make(map[string]int, initialDocuments),
 			active:     true,
 		}
+		wb.ensurePositionCapacity(initialDocuments)
 		batches[i] = wb
 		batch.byName[member.Name] = wb
 	}

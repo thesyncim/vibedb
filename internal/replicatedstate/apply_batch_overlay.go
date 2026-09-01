@@ -39,6 +39,7 @@ var logicalOverlayHashSeed = maphash.MakeSeed()
 // can omit a sequence of logical writes whose net image equals that base.
 type logicalOverlay struct {
 	base    *durable.Snapshot
+	live    *durable.Collection
 	slots   []uint32
 	entries []logicalOverlayEntry
 	arena   []byte
@@ -85,6 +86,17 @@ func overlayKeyHash(key []byte) uint64 {
 
 func (o *logicalOverlay) reset(base *durable.Snapshot) {
 	o.base = base
+	o.live = nil
+	o.resetContents()
+}
+
+func (o *logicalOverlay) resetPoint(base pointSnapshot) {
+	o.base = base.value
+	o.live = base.live
+	o.resetContents()
+}
+
+func (o *logicalOverlay) resetContents() {
 	clear(o.slots)
 	clear(o.entries)
 	clear(o.arena)
@@ -353,11 +365,14 @@ func (o *logicalOverlay) appendRawTracked(
 		}
 		return append(dst, o.value(entry)...), true, nil
 	}
-	if o.base == nil {
+	if o.base == nil && o.live == nil {
 		return dst, false, nil
 	}
 	if physicalBaseReads != nil {
 		*physicalBaseReads++
+	}
+	if o.live != nil {
+		return o.live.AppendRaw(dst, key)
 	}
 	return o.base.AppendRaw(dst, key)
 }
@@ -390,8 +405,8 @@ func (o *logicalOverlay) rangePrefixRaw(
 		}
 		return visit(o.key(entry), o.value(entry))
 	}
-	if o.base != nil {
-		err := o.base.RangePrefixRaw(prefix, func(key, value []byte) error {
+	if o.base != nil || o.live != nil {
+		err := pointSnapshot{value: o.base, live: o.live}.rangePrefixRaw(prefix, func(key, value []byte) error {
 			for next < len(ordered) {
 				entry := &o.entries[ordered[next]]
 				comparison := bytes.Compare(o.key(entry), key)

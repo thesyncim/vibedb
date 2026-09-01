@@ -20,10 +20,13 @@ const (
 	// 2,048 current two-participant decisions so recycle is pressure handling,
 	// not a per-apply steady-state fence.
 	ReplicatedTransactionMarkerBytes uint64 = 1 << 20
-	// ReplicatedSystemRecoveryJournalBytes is the sealed conservative region
-	// retained by the current profile. It covers the maximum hidden
-	// state/session/slot conditional record with margin.
-	ReplicatedSystemRecoveryJournalBytes uint64 = 655872
+	// ReplicatedSystemRecoveryJournalBytes is the exact sealed decision suffix
+	// retained by the hidden state collection. A one-record geometry turns
+	// journal recycling into steady-state checkpoint work even for tiny direct
+	// writes. One ordinary 16 MiB segment holds many small group commits while
+	// still covering the maximum legal hidden-state batch; the independently
+	// bounded checkpoint cadence remains the durability/retention fence.
+	ReplicatedSystemRecoveryJournalBytes uint64 = 16 << 20
 )
 
 // ReplicatedShardStoreSidecarProfile freezes the exact sealed sidecars owned

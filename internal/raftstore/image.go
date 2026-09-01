@@ -66,7 +66,7 @@ func planReadyPayload(image *logImage, payload readyPayload, options normalizedO
 		previousTerm = entry.GetTerm()
 		batchBytes += int64(len(entry.GetData()))
 	}
-	delta := imageDelta{hard: cloneHardState(image.hard), last: image.last, liveBytes: image.liveBytes}
+	delta := imageDelta{hard: image.hard, last: image.last, liveBytes: image.liveBytes}
 	if len(payload.entries) != 0 {
 		start := payload.entries[0].GetIndex()
 		if start < image.first || start > image.last+1 {
@@ -105,7 +105,11 @@ func planReadyPayload(image *logImage, payload readyPayload, options normalizedO
 		if delta.liveBytes < 0 || delta.liveBytes > options.maxLiveBytes {
 			return imageDelta{}, fmt.Errorf("%w: live log bytes %d", ErrBounds, delta.liveBytes)
 		}
-		delta.entries = cloneEntries(payload.entries)
+		if payload.owned {
+			delta.entries = payload.entries
+		} else {
+			delta.entries = cloneEntries(payload.entries)
+		}
 		delta.last = payload.entries[len(payload.entries)-1].GetIndex()
 	}
 	if !isEmptyHardState(payload.hard) {
@@ -116,7 +120,11 @@ func planReadyPayload(image *logImage, payload readyPayload, options normalizedO
 			(candidate.GetTerm() == 0 && candidate.GetVote() != 0) || (candidate.GetVote() != 0 && raft.IsLocalMsgTarget(candidate.GetVote())) {
 			return imageDelta{}, fmt.Errorf("%w: HardState regression or impossible commit", ErrInvalid)
 		}
-		delta.hard = cloneHardState(candidate)
+		if payload.owned {
+			delta.hard = candidate
+		} else {
+			delta.hard = cloneHardState(candidate)
+		}
 	}
 	lastTerm := image.baseTerm
 	switch {
@@ -135,10 +143,16 @@ func planReadyPayload(image *logImage, payload readyPayload, options normalizedO
 
 func commitImageDelta(image *logImage, delta imageDelta) {
 	if delta.replace {
-		old := image.entries
-		image.entries = append(image.entries[:delta.prefixLength], delta.entries...)
-		if len(image.entries) < len(old) {
-			clear(old[len(image.entries):])
+		if delta.prefixLength < len(image.entries) {
+			// Entries exposes immutable borrowed slices to Raft. A conflicting
+			// suffix replacement therefore publishes a new pointer vector instead
+			// of mutating any position a concurrent reader may still hold. Ordinary
+			// sequential append may reuse capacity beyond the old visible length.
+			next := make([]*pb.Entry, delta.prefixLength, delta.prefixLength+len(delta.entries))
+			copy(next, image.entries[:delta.prefixLength])
+			image.entries = append(next, delta.entries...)
+		} else {
+			image.entries = append(image.entries, delta.entries...)
 		}
 		image.last = delta.last
 		image.liveBytes = delta.liveBytes
@@ -147,6 +161,7 @@ func commitImageDelta(image *logImage, delta imageDelta) {
 }
 
 func applyReadyPayload(image *logImage, payload readyPayload, options normalizedOptions) error {
+	payload.owned = true
 	delta, err := planReadyPayload(image, payload, options)
 	if err != nil {
 		return err

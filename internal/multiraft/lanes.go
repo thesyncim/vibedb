@@ -239,6 +239,32 @@ func (lane *ExecutionLane) RunOne() (Progress, bool, error) {
 	}
 	return lane.set.RunOne(lane.index)
 }
+
+// AsyncNotify exposes this lane's append-completion edge to its sole Owner.
+// Each ExecutionLane wraps exactly one Host, so forwarding the Host channel
+// preserves the same coalesced SPSC wakeup used by a standalone Host.
+func (lane *ExecutionLane) AsyncNotify() <-chan struct{} {
+	if lane == nil || lane.set == nil || lane.index < 0 || lane.index >= len(lane.set.lanes) {
+		return nil
+	}
+	return lane.set.lanes[lane.index].host.AsyncNotify()
+}
+
+// WakePipelined rebuilds this lane's runnable set after an append worker edge.
+// The Owner is the serialized caller, but retain the lane lock so the wrapper
+// has the same synchronization contract as every other ExecutionLane method.
+func (lane *ExecutionLane) WakePipelined() {
+	if lane == nil || lane.set == nil || lane.index < 0 || lane.index >= len(lane.set.lanes) {
+		return
+	}
+	entry := &lane.set.lanes[lane.index]
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	if lane.set.state.Load() == executionLanesOpen {
+		entry.host.WakePipelined()
+	}
+}
+
 func (lane *ExecutionLane) PopOutbound() (raftmember.OutboundMessage, bool) {
 	if lane == nil || lane.set == nil {
 		return raftmember.OutboundMessage{}, false

@@ -84,8 +84,9 @@ func settleNodeBatch(t *testing.T, node *Node, batch AppliedNormalBatch) {
 }
 
 func TestNodeBatchWorkspaceIsCallerOwnedDensity(t *testing.T) {
-	wantWorkspace := uintptr(MaxNormalApplyBatchEntries) *
-		(unsafe.Sizeof(NormalApply{}) + unsafe.Sizeof([32]byte{}))
+	wantWorkspace := uintptr(MaxNormalApplyBatchEntries)*
+		(unsafe.Sizeof(NormalApply{})+unsafe.Sizeof([32]byte{})) +
+		unsafe.Sizeof(NormalApplyBatchCompletions{})
 	workspaceBytes := unsafe.Sizeof(NormalApplyBatchWorkspace{})
 	nodeBytes := unsafe.Sizeof(Node{})
 	if workspaceBytes != wantWorkspace || nodeBytes >= workspaceBytes {

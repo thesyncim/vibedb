@@ -204,6 +204,9 @@ func TestInteriorRecordCorruptionFailsClosed(t *testing.T) {
 	if err := store.Persist(raftmodel.PersistBatch{NodeIncarnation: incarnation, ReadyID: 1, HardState: hard(2, 2), Entries: []*pb.Entry{entry(2, 2, "x")}}); err != nil {
 		t.Fatal(err)
 	}
+	if err := store.Persist(raftmodel.PersistBatch{NodeIncarnation: incarnation, ReadyID: 2, HardState: hard(3, 3), Entries: []*pb.Entry{entry(3, 3, "y")}}); err != nil {
+		t.Fatal(err)
+	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -302,7 +305,7 @@ func TestBootstrapSnapshotPresenceRoundTripsExactly(t *testing.T) {
 	}
 }
 
-func TestOpenCrashCutsSelectOnlyAuthenticatedCurrentImage(t *testing.T) {
+func TestOpenCrashCutsRecoverAuthenticatedReadyTailIndependentlyOfCurrentSlot(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "crash-cuts.wal")
 	options := testOptions()
 	options.ops.sync = func(*os.File) error { return nil }
@@ -354,7 +357,7 @@ func TestOpenCrashCutsSelectOnlyAuthenticatedCurrentImage(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	assertOldImage := func(prefix int) {
+	assertTailImage := func(prefix int) {
 		t.Helper()
 		file, openErr := os.OpenFile(path, os.O_RDWR, 0)
 		if openErr != nil {
@@ -379,14 +382,14 @@ func TestOpenCrashCutsSelectOnlyAuthenticatedCurrentImage(t *testing.T) {
 		if closeErr := reopened.Close(); closeErr != nil {
 			t.Fatal(closeErr)
 		}
-		if lastErr != nil || stateErr != nil || last != 1 || state.GetTerm() != 1 || state.GetCommit() != 1 ||
+		if lastErr != nil || stateErr != nil || last != 2 || state.GetTerm() != 2 || state.GetCommit() != 2 ||
 			currentIncarnation != incarnation {
-			t.Fatalf("cut %d exposed new image: last=%d state=%v lastErr=%v stateErr=%v", prefix, last, state, lastErr, stateErr)
+			t.Fatalf("cut %d omitted authenticated tail: last=%d state=%v lastErr=%v stateErr=%v", prefix, last, state, lastErr, stateErr)
 		}
 	}
-	assertOldImage(0) // A fully synced orphan record is not selected.
+	assertTailImage(0) // The synced record is the selector-free durable fact.
 	for prefix := 1; prefix < CurrentSlotBytes; prefix++ {
-		assertOldImage(prefix)
+		assertTailImage(prefix)
 	}
 
 	file, err := os.OpenFile(path, os.O_RDWR, 0)

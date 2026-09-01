@@ -31,6 +31,15 @@ type replicatedOwner interface {
 	ReadRouteGate(context.Context, raftservice.RouteGateReadRequest) (raftservice.RouteGateReadResult, raftservice.RouteGateReadLease, error)
 }
 
+type replicatedAuthorizedOwner interface {
+	SubmitOwnedAuthorized(
+		context.Context,
+		raftservice.ServingFence,
+		[]byte,
+		raftservice.ProposalAuthorization,
+	) (raftservice.Result, error)
+}
+
 func replicatedRequestDigest(command []byte) [sha256.Size]byte {
 	return sha256.Sum256(command)
 }
@@ -448,24 +457,31 @@ func (server *ReplicatedServer) executeReplicatedAuthenticated(
 	request *ReplicatedRequest,
 	authenticated bool,
 ) *ReplicatedResponse {
-	state, stateErr := server.owner.Probe(ctx, request.Fence.Group)
-	wireState := replicatedWireState(state)
-	if stateErr != nil {
-		return &ReplicatedResponse{
-			Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalUnavailable,
+	authorizedOwner, fusedProposal := server.owner.(replicatedAuthorizedOwner)
+	fusedProposal = fusedProposal && request.Operation == ReplicatedPropose
+	var state raftservice.ServingState
+	var wireState ReplicatedMemberState
+	if !fusedProposal {
+		var stateErr error
+		state, stateErr = server.owner.Probe(ctx, request.Fence.Group)
+		wireState = replicatedWireState(state)
+		if stateErr != nil {
+			return &ReplicatedResponse{
+				Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalUnavailable,
+			}
 		}
-	}
-	if server.serving != nil && !server.serving(state) &&
-		(!authenticated || server.transition == nil || !server.transition(state, request)) {
-		return &ReplicatedResponse{
-			Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalUnavailable,
-			HasState: true, State: wireState,
+		if server.serving != nil && !server.serving(state) &&
+			(!authenticated || server.transition == nil || !server.transition(state, request)) {
+			return &ReplicatedResponse{
+				Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalUnavailable,
+				HasState: true, State: wireState,
+			}
 		}
-	}
-	if request.Fence.AllocationGeneration != state.Identity.AllocationGeneration {
-		return &ReplicatedResponse{
-			Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalStaleFence,
-			HasState: true, State: wireState,
+		if request.Fence.AllocationGeneration != state.Identity.AllocationGeneration {
+			return &ReplicatedResponse{
+				Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalStaleFence,
+				HasState: true, State: wireState,
+			}
 		}
 	}
 	if request.Operation == ReplicatedProbe {
@@ -861,13 +877,28 @@ func (server *ReplicatedServer) executeReplicatedAuthenticated(
 	// admission. A settled result therefore authenticates the request fence
 	// even if an unrelated owner-lane transition followed the initial probe.
 	proposalState.Fence = request.Fence
-	result, err := server.owner.SubmitOwned(ctx, raftservice.ServingFence{
+	servingFence := raftservice.ServingFence{
 		Group:                request.Fence.Group,
 		AllocationGeneration: request.Fence.AllocationGeneration,
 		Command:              request.Fence.Command,
 		MemberID:             request.Fence.MemberID, StoreID: request.Fence.StoreID,
 		NodeIncarnation: request.Fence.NodeIncarnation, Term: request.Fence.Term,
-	}, request.Command)
+	}
+	var result raftservice.Result
+	var err error
+	if fusedProposal {
+		result, err = authorizedOwner.SubmitOwnedAuthorized(
+			ctx, servingFence, request.Command,
+			func(candidate raftservice.ServingState) bool {
+				return server.serving == nil || server.serving(candidate) ||
+					(authenticated && server.transition != nil && server.transition(candidate, request))
+			},
+		)
+		proposalState = replicatedWireState(result.State)
+		proposalState.Fence = request.Fence
+	} else {
+		result, err = server.owner.SubmitOwned(ctx, servingFence, request.Command)
+	}
 	if err == nil {
 		// Settlement is a stronger witness than a second status probe: the
 		// exact command has already been observed in a published applied batch.
@@ -906,6 +937,11 @@ func (server *ReplicatedServer) executeReplicatedAuthenticated(
 	case errors.Is(err, raftservice.ErrServingFence):
 		return &ReplicatedResponse{
 			Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalStaleFence,
+			HasState: true, State: wireState,
+		}
+	case errors.Is(err, raftservice.ErrServingAuthorization):
+		return &ReplicatedResponse{
+			Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalUnavailable,
 			HasState: true, State: wireState,
 		}
 	case result.Outcome.Code == raftserve.OutcomeProposalAbandoned ||
