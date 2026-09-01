@@ -2,6 +2,7 @@ package seglog
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -22,9 +23,9 @@ func (l *Log) reconcileRotation() error {
 		return err
 	}
 	// A missing manifest-selected active is recoverable only when that exact
-	// segment is a fully valid sealed file. This is the rename-before-manifest
-	// crash state; no other absent-active state is guessed.
-	meta, footer, err := verifySealed(filepath.Join(l.dir, sealedName(l.manifest.ActiveID)), l.manifest.LogID, l.expectedPreviousID(), l.expectedPreviousHash())
+	// segment has a complete sealed header/footer/index publication. This is the
+	// rename-before-manifest crash state; payload scrubbing remains explicit.
+	meta, footer, _, err := readSealedMetadata(filepath.Join(l.dir, sealedName(l.manifest.ActiveID)), l.manifest.LogID, l.expectedPreviousID(), l.expectedPreviousHash())
 	if err != nil {
 		return fmt.Errorf("%w: selected active missing: %v", ErrCorrupt, err)
 	}
@@ -80,41 +81,33 @@ func (l *Log) expectedPreviousID() uint64 {
 	if n := len(l.manifest.Segments); n != 0 {
 		return l.manifest.Segments[n-1].ID
 	}
-	return 0
+	return l.manifest.AnchorID
 }
 func (l *Log) expectedPreviousHash() [32]byte {
 	if n := len(l.manifest.Segments); n != 0 {
 		return l.manifest.Segments[n-1].Hash
 	}
-	return [32]byte{}
+	return l.manifest.AnchorHash
 }
 
 func (l *Log) rebuild() error {
-	var previousID uint64
-	var previousHash [32]byte
+	for _, gm := range l.manifest.Groups {
+		l.index[gm.GroupID] = &GroupIndex{TruncateIndex: gm.TruncateIndex, TruncateTerm: gm.TruncateTerm}
+		l.last[gm.GroupID], l.lastTerm[gm.GroupID] = gm.TruncateIndex, gm.TruncateTerm
+	}
+	previousID, previousHash := l.manifest.AnchorID, l.manifest.AnchorHash
 	for _, want := range l.manifest.Segments {
-		got, _, err := verifySealed(filepath.Join(l.dir, sealedName(want.ID)), l.manifest.LogID, previousID, previousHash)
+		got, _, events, err := readSealedMetadata(filepath.Join(l.dir, sealedName(want.ID)), l.manifest.LogID, previousID, previousHash)
 		if err != nil {
 			return err
 		}
 		if got != want {
 			return fmt.Errorf("%w: sealed segment %d differs from manifest", ErrCorrupt, want.ID)
 		}
-		f, err := os.Open(filepath.Join(l.dir, sealedName(want.ID)))
-		if err != nil {
-			return err
-		}
-		var count uint64
-		count, err = l.scanRecords(f, want.ID, segmentHeaderBytes, want.Bytes-segmentFooterBytes, true)
-		closeErr := f.Close()
-		if err != nil {
-			return err
-		}
-		if count != want.Records {
-			return fmt.Errorf("%w: sealed segment %d record count", ErrCorrupt, want.ID)
-		}
-		if closeErr != nil {
-			return closeErr
+		for _, event := range events {
+			if err = l.applyEvent(event, want.ID); err != nil {
+				return err
+			}
 		}
 		previousID, previousHash = want.ID, want.Hash
 	}
@@ -133,7 +126,7 @@ func (l *Log) rebuild() error {
 	if uint64(st.Size()) < l.manifest.DurableOffset {
 		return fmt.Errorf("%w: active shorter than durable offset", ErrCorrupt)
 	}
-	if _, err = l.scanRecords(l.active, h.ID, segmentHeaderBytes, l.manifest.DurableOffset, false); err != nil {
+	if _, err = l.scanRecords(l.active, h.ID, segmentHeaderBytes, l.manifest.DurableOffset, true); err != nil {
 		return err
 	}
 	if len(l.last) != len(l.manifest.Groups) {
@@ -159,10 +152,14 @@ func (l *Log) rebuild() error {
 		}
 	}
 	l.activeOffset = l.manifest.DurableOffset
+	l.activeHash = sha256.New()
+	if _, err = io.CopyN(l.activeHash, io.NewSectionReader(l.active, 0, int64(l.activeOffset)), int64(l.activeOffset)); err != nil {
+		return err
+	}
 	return nil
 }
 
-func (l *Log) scanRecords(f *os.File, segmentID, start, end uint64, sealed bool) (uint64, error) {
+func (l *Log) scanRecords(f *os.File, segmentID, start, end uint64, active bool) (uint64, error) {
 	off := start
 	var count uint64
 	header := make([]byte, recordHeaderBytes)
@@ -174,8 +171,8 @@ func (l *Log) scanRecords(f *os.File, segmentID, start, end uint64, sealed bool)
 		if _, err := f.ReadAt(header, int64(off)); err != nil {
 			return 0, fmt.Errorf("%w: read record header: %v", ErrCorrupt, err)
 		}
-		n := uint64(binaryUint32(header[8:12]))
-		if n < recordHeaderBytes+4 || n > maxRecordBytes+recordHeaderBytes+4 || n > end-off {
+		n := uint64(binaryUint32(header[0:4]))
+		if n < recordHeaderBytes || n > maxRecordBytes+recordHeaderBytes || n > end-off {
 			return 0, fmt.Errorf("%w: committed partial record", ErrCorrupt)
 		}
 		if uint64(cap(recordBuf)) < n {
@@ -192,34 +189,15 @@ func (l *Log) scanRecords(f *os.File, segmentID, start, end uint64, sealed bool)
 		if err != nil || consumed != n {
 			return 0, fmt.Errorf("segment %d offset %d: %w", segmentID, off, errors.Join(ErrCorrupt, err))
 		}
-		g := l.index[r.GroupID]
-		if g == nil {
-			g = &GroupIndex{}
-			l.index[r.GroupID] = g
+		event := segmentEvent{Kind: r.Kind, GroupID: r.GroupID, Index: r.Index, Term: r.Term}
+		if r.Kind == RecordEntry {
+			event.Offset, event.Bytes = off, n
 		}
-		switch r.Kind {
-		case RecordEntry:
-			if r.Index <= l.last[r.GroupID] || r.Index <= g.TruncateIndex {
-				return 0, fmt.Errorf("%w: group %d record index regression", ErrCorrupt, r.GroupID)
-			}
-			g.Entries = append(g.Entries, Location{SegmentID: segmentID, Offset: off, Bytes: n, Index: r.Index, Term: r.Term})
-			l.last[r.GroupID], l.lastTerm[r.GroupID] = r.Index, r.Term
-		case RecordTruncateSuffix:
-			if r.Index <= g.TruncateIndex || r.Index > l.last[r.GroupID]+1 {
-				return 0, fmt.Errorf("%w: group %d suffix truncation", ErrCorrupt, r.GroupID)
-			}
-			cut := sort.Search(len(g.Entries), func(i int) bool { return g.Entries[i].Index >= r.Index })
-			wantTerm := g.TruncateTerm
-			if cut != 0 {
-				wantTerm = g.Entries[cut-1].Term
-			}
-			if r.Term != wantTerm {
-				return 0, fmt.Errorf("%w: group %d suffix predecessor term", ErrCorrupt, r.GroupID)
-			}
-			g.Entries = slices.Delete(g.Entries, cut, len(g.Entries))
-			l.last[r.GroupID], l.lastTerm[r.GroupID] = r.Index-1, r.Term
+		if err = l.applyEvent(event, segmentID); err != nil {
+			return 0, err
 		}
-		if !sealed {
+		if active {
+			l.events = append(l.events, event)
 			l.records++
 		}
 		off += n
@@ -231,49 +209,174 @@ func (l *Log) scanRecords(f *os.File, segmentID, start, end uint64, sealed bool)
 	return count, nil
 }
 
-func verifySealed(path string, logID [16]byte, previousID uint64, previousHash [32]byte) (SegmentMeta, segmentFooter, error) {
+func (l *Log) applyEvent(event segmentEvent, segmentID uint64) error {
+	g := l.index[event.GroupID]
+	if g == nil {
+		g = &GroupIndex{}
+		l.index[event.GroupID] = g
+	}
+	switch event.Kind {
+	case RecordEntry:
+		if event.Index <= g.TruncateIndex {
+			return nil
+		}
+		if event.Index <= l.last[event.GroupID] {
+			return fmt.Errorf("%w: group %d record index regression", ErrCorrupt, event.GroupID)
+		}
+		g.Entries = append(g.Entries, Location{SegmentID: segmentID, Offset: event.Offset, Bytes: event.Bytes, Index: event.Index, Term: event.Term})
+		l.last[event.GroupID], l.lastTerm[event.GroupID] = event.Index, event.Term
+	case RecordTruncateSuffix:
+		if event.Index <= g.TruncateIndex {
+			return nil
+		}
+		if event.Index > l.last[event.GroupID]+1 {
+			return fmt.Errorf("%w: group %d suffix truncation", ErrCorrupt, event.GroupID)
+		}
+		cut := sort.Search(len(g.Entries), func(i int) bool { return g.Entries[i].Index >= event.Index })
+		wantTerm := g.TruncateTerm
+		if cut != 0 {
+			wantTerm = g.Entries[cut-1].Term
+		}
+		if event.Term != wantTerm {
+			return fmt.Errorf("%w: group %d suffix predecessor term", ErrCorrupt, event.GroupID)
+		}
+		g.Entries = slices.Delete(g.Entries, cut, len(g.Entries))
+		l.last[event.GroupID], l.lastTerm[event.GroupID] = event.Index-1, event.Term
+	default:
+		return fmt.Errorf("%w: unknown segment event", ErrCorrupt)
+	}
+	return nil
+}
+
+func readSealedMetadata(path string, logID [16]byte, previousID uint64, previousHash [32]byte) (SegmentMeta, segmentFooter, []segmentEvent, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return SegmentMeta{}, segmentFooter{}, err
+		return SegmentMeta{}, segmentFooter{}, nil, err
 	}
 	defer f.Close()
 	st, err := f.Stat()
 	if err != nil {
-		return SegmentMeta{}, segmentFooter{}, err
+		return SegmentMeta{}, segmentFooter{}, nil, err
 	}
-	if st.Size() < segmentHeaderBytes+segmentFooterBytes {
-		return SegmentMeta{}, segmentFooter{}, fmt.Errorf("%w: short sealed segment", ErrCorrupt)
+	if st.Size() < segmentHeaderBytes+segmentIndexHeaderBytes+4+segmentFooterBytes {
+		return SegmentMeta{}, segmentFooter{}, nil, fmt.Errorf("%w: short sealed segment", ErrCorrupt)
 	}
 	hb := make([]byte, segmentHeaderBytes)
 	if _, err = f.ReadAt(hb, 0); err != nil {
-		return SegmentMeta{}, segmentFooter{}, err
+		return SegmentMeta{}, segmentFooter{}, nil, err
 	}
 	h, err := unmarshalSegmentHeader(hb)
 	if err != nil {
-		return SegmentMeta{}, segmentFooter{}, err
+		return SegmentMeta{}, segmentFooter{}, nil, err
 	}
 	if h.LogID != logID || h.PreviousID != previousID || h.PreviousHash != previousHash {
-		return SegmentMeta{}, segmentFooter{}, fmt.Errorf("%w: segment chain mismatch", ErrCorrupt)
+		return SegmentMeta{}, segmentFooter{}, nil, fmt.Errorf("%w: segment chain mismatch", ErrCorrupt)
 	}
 	fb := make([]byte, segmentFooterBytes)
 	if _, err = f.ReadAt(fb, st.Size()-segmentFooterBytes); err != nil {
-		return SegmentMeta{}, segmentFooter{}, err
+		return SegmentMeta{}, segmentFooter{}, nil, err
 	}
 	footer, err := unmarshalSegmentFooter(fb)
 	if err != nil {
-		return SegmentMeta{}, segmentFooter{}, err
+		return SegmentMeta{}, segmentFooter{}, nil, err
 	}
-	if footer.ID != h.ID || footer.Generation != h.Generation || footer.PreviousHash != h.PreviousHash || footer.DataBytes+segmentFooterBytes != uint64(st.Size()) {
-		return SegmentMeta{}, segmentFooter{}, fmt.Errorf("%w: footer/header identity", ErrCorrupt)
+	fileBytes := uint64(st.Size())
+	if footer.ID != h.ID || footer.Generation != h.Generation || footer.PreviousHash != h.PreviousHash || footer.IndexOffset > fileBytes-segmentFooterBytes || footer.IndexBytes != fileBytes-segmentFooterBytes-footer.IndexOffset {
+		return SegmentMeta{}, segmentFooter{}, nil, fmt.Errorf("%w: footer/header identity", ErrCorrupt)
 	}
-	sum, err := hashPrefix(f, footer.DataBytes)
+	indexBytes := make([]byte, footer.IndexBytes)
+	if _, err = f.ReadAt(indexBytes, int64(footer.IndexOffset)); err != nil {
+		return SegmentMeta{}, segmentFooter{}, nil, err
+	}
+	events, err := unmarshalSegmentIndex(indexBytes, footer.DataBytes, footer.Events)
 	if err != nil {
-		return SegmentMeta{}, segmentFooter{}, err
+		return SegmentMeta{}, segmentFooter{}, nil, err
 	}
-	if !bytes.Equal(sum[:], footer.Hash[:]) {
-		return SegmentMeta{}, segmentFooter{}, fmt.Errorf("%w: sealed segment hash", ErrCorrupt)
+	meta := SegmentMeta{ID: h.ID, Generation: h.Generation, Bytes: uint64(st.Size()), Records: footer.Records, IndexOffset: footer.IndexOffset, IndexBytes: footer.IndexBytes, PreviousHash: h.PreviousHash, Hash: footer.Hash}
+	return meta, footer, events, nil
+}
+
+// DeepVerify is the explicit bit-rot scrub path. Normal Open intentionally
+// reads only sealed headers, footers, and compact event indexes; this method
+// hashes and decodes every retained sealed payload byte.
+func (l *Log) DeepVerify() error {
+	previousID, previousHash := l.manifest.AnchorID, l.manifest.AnchorHash
+	for _, want := range l.manifest.Segments {
+		path := filepath.Join(l.dir, sealedName(want.ID))
+		got, footer, indexed, err := readSealedMetadata(path, l.manifest.LogID, previousID, previousHash)
+		if err != nil {
+			return err
+		}
+		if got != want {
+			return fmt.Errorf("%w: sealed segment metadata", ErrCorrupt)
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		sum, hashErr := hashPrefix(f, footer.DataBytes)
+		var scanned []segmentEvent
+		if hashErr == nil {
+			scanned, hashErr = readRecordEvents(f, footer.DataBytes)
+		}
+		closeErr := f.Close()
+		if hashErr != nil {
+			return hashErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		if !bytes.Equal(sum[:], footer.Hash[:]) {
+			return fmt.Errorf("%w: sealed segment hash", ErrCorrupt)
+		}
+		if !slices.Equal(canonicalEventOrder(scanned), indexed) {
+			return fmt.Errorf("%w: sealed index differs from records", ErrCorrupt)
+		}
+		previousID, previousHash = want.ID, want.Hash
 	}
-	return SegmentMeta{ID: h.ID, Generation: h.Generation, Bytes: uint64(st.Size()), Records: footer.Records, PreviousHash: h.PreviousHash, Hash: sum}, footer, nil
+	return nil
+}
+
+func readRecordEvents(f *os.File, end uint64) ([]segmentEvent, error) {
+	off := uint64(segmentHeaderBytes)
+	result := make([]segmentEvent, 0)
+	header := make([]byte, recordHeaderBytes)
+	var recordBuf []byte
+	for off < end {
+		if end-off < recordHeaderBytes {
+			return nil, fmt.Errorf("%w: partial record header", ErrCorrupt)
+		}
+		if _, err := f.ReadAt(header, int64(off)); err != nil {
+			return nil, err
+		}
+		n := uint64(binaryUint32(header[0:4]))
+		if n < recordHeaderBytes || n > maxRecordBytes+recordHeaderBytes || n > end-off {
+			return nil, fmt.Errorf("%w: record geometry", ErrCorrupt)
+		}
+		if uint64(cap(recordBuf)) < n {
+			recordBuf = make([]byte, n)
+		} else {
+			recordBuf = recordBuf[:n]
+		}
+		copy(recordBuf, header)
+		if _, err := f.ReadAt(recordBuf[recordHeaderBytes:], int64(off+recordHeaderBytes)); err != nil {
+			return nil, err
+		}
+		r, consumed, err := inspectRecord(recordBuf)
+		if err != nil || consumed != n {
+			return nil, errors.Join(ErrCorrupt, err)
+		}
+		event := segmentEvent{Kind: r.Kind, GroupID: r.GroupID, Index: r.Index, Term: r.Term}
+		if r.Kind == RecordEntry {
+			event.Offset, event.Bytes = off, n
+		}
+		result = append(result, event)
+		off += n
+	}
+	if off != end {
+		return nil, fmt.Errorf("%w: record boundary", ErrCorrupt)
+	}
+	return result, nil
 }
 
 func binaryUint32(b []byte) uint32 {

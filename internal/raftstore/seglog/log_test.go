@@ -1,14 +1,22 @@
 package seglog
 
 import (
+	"bytes"
+	"encoding/binary"
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
 func appendEntry(t *testing.T, l *Log, group, index, term uint64, payload string) Location {
 	t.Helper()
+	if cap(l.events) == 0 {
+		if err := l.ReserveEvents(4096); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if _, ok := l.index[group]; !ok {
 		if err := l.ReserveGroup(group, 1024); err != nil {
 			t.Fatal(err)
@@ -45,6 +53,9 @@ func TestRoundTripRotationAndIndexRebuild(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer l.Close()
+	if err = l.DeepVerify(); err != nil {
+		t.Fatal(err)
+	}
 	if got := l.Manifest(); got.Generation != 4 || got.ActiveID != 2 || len(got.Segments) != 1 || len(got.Groups) != 2 || got.Groups[0].DurableLastIndex != 2 {
 		t.Fatalf("manifest = %+v", got)
 	}
@@ -56,6 +67,95 @@ func TestRoundTripRotationAndIndexRebuild(t *testing.T) {
 	}
 }
 
+func TestCompactFormatOverheadAndCanonicalIndex(t *testing.T) {
+	if recordHeaderBytes != 40 || recordSize(0) != 40 {
+		t.Fatalf("record overhead = %d/%d", recordHeaderBytes, recordSize(0))
+	}
+	sequential := make([]segmentEvent, 100)
+	off := uint64(segmentHeaderBytes)
+	for i := range sequential {
+		sequential[i] = segmentEvent{Kind: RecordEntry, GroupID: 1, Index: uint64(i + 1), Term: 1, Offset: off, Bytes: 48}
+		off += 48
+	}
+	encoded, err := marshalSegmentIndex(sequential, off)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bodyBytes := len(encoded) - segmentIndexHeaderBytes - 4
+	if bodyBytes > 6*len(sequential) {
+		t.Fatalf("sequential compact index = %.2f bytes/event", float64(bodyBytes)/100)
+	}
+	decoded, err := unmarshalSegmentIndex(encoded, off, 100)
+	if err != nil || !slices.Equal(decoded, sequential) {
+		t.Fatalf("decode = %v, equal=%v", err, slices.Equal(decoded, sequential))
+	}
+	interleaved := make([]segmentEvent, 0, 400)
+	off = segmentHeaderBytes
+	for i := uint64(1); i <= 100; i++ {
+		for group := uint64(1); group <= 4; group++ {
+			interleaved = append(interleaved, segmentEvent{Kind: RecordEntry, GroupID: group, Index: i, Term: 1, Offset: off, Bytes: 48})
+			off += 48
+		}
+	}
+	encoded, err = marshalSegmentIndex(interleaved, off)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bodyBytes = len(encoded) - segmentIndexHeaderBytes - 4
+	if bodyBytes > 7*len(interleaved) {
+		t.Fatalf("interleaved compact index = %.2f bytes/event", float64(bodyBytes)/400)
+	}
+}
+
+func TestCompactIndexRejectsMalformedCanonicalVarints(t *testing.T) {
+	events := []segmentEvent{{Kind: RecordEntry, GroupID: 1, Index: 1, Term: 1, Offset: segmentHeaderBytes, Bytes: recordHeaderBytes}}
+	encoded, _ := marshalSegmentIndex(events, segmentHeaderBytes+recordHeaderBytes)
+	noncanonical := append(slices.Clone(encoded[:41]), append([]byte{0}, encoded[41:]...)...)
+	noncanonical[40] = 0x81
+	binary.LittleEndian.PutUint32(noncanonical[12:16], uint32(len(noncanonical)))
+	putCRC(noncanonical)
+	overflow := append(slices.Clone(encoded[:segmentIndexHeaderBytes]), bytes.Repeat([]byte{0xff}, 10)...)
+	overflow = append(overflow, 0, 0, 0, 0)
+	binary.LittleEndian.PutUint32(overflow[12:16], uint32(len(overflow)))
+	putCRC(overflow)
+	trailing := append(slices.Clone(encoded[:len(encoded)-4]), 0)
+	trailing = append(trailing, 0, 0, 0, 0)
+	binary.LittleEndian.PutUint32(trailing[12:16], uint32(len(trailing)))
+	putCRC(trailing)
+	for name, malformed := range map[string][]byte{"noncanonical": noncanonical, "overflow": overflow, "trailing": trailing} {
+		if _, err := unmarshalSegmentIndex(malformed, segmentHeaderBytes+recordHeaderBytes, 1); !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("%s = %v", name, err)
+		}
+	}
+}
+
+func TestRotateUsesIncrementalHashWithoutReadingActive(t *testing.T) {
+	dir := t.TempDir()
+	l, _ := Create(dir)
+	appendEntry(t, l, 1, 1, 1, "one")
+	appendEntry(t, l, 1, 2, 1, "two")
+	if err := l.active.Close(); err != nil {
+		t.Fatal(err)
+	}
+	writeOnly, err := os.OpenFile(filepath.Join(dir, activeName(1)), os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.active = writeOnly
+	if err = l.Rotate(nil); err != nil {
+		t.Fatalf("rotation attempted an active read or failed publication: %v", err)
+	}
+	_ = l.Close()
+	l, err = Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	if len(l.Manifest().Segments) != 1 {
+		t.Fatal("segment was not sealed")
+	}
+}
+
 func TestAppendSteadyStateZeroAlloc(t *testing.T) {
 	l, err := Create(t.TempDir())
 	if err != nil {
@@ -63,6 +163,9 @@ func TestAppendSteadyStateZeroAlloc(t *testing.T) {
 	}
 	defer l.Close()
 	if err = l.ReserveGroup(1, 2048); err != nil {
+		t.Fatal(err)
+	}
+	if err = l.ReserveEvents(2048); err != nil {
 		t.Fatal(err)
 	}
 	r := Record{GroupID: 1, Index: 1, Term: 1, Kind: RecordEntry, Payload: []byte("small raft entry")}
@@ -264,8 +367,8 @@ func TestCorruptionChecks(t *testing.T) {
 	}{
 		{"manifest", func(t *testing.T, dir string, _ Manifest) { flipByte(t, filepath.Join(dir, ManifestName), 20) }},
 		{"sealed-header", func(t *testing.T, dir string, _ Manifest) { flipByte(t, filepath.Join(dir, sealedName(1)), 30) }},
-		{"sealed-record", func(t *testing.T, dir string, _ Manifest) {
-			flipByte(t, filepath.Join(dir, sealedName(1)), segmentHeaderBytes+64)
+		{"sealed-index", func(t *testing.T, dir string, m Manifest) {
+			flipByte(t, filepath.Join(dir, sealedName(1)), int64(m.Segments[0].IndexOffset)+segmentIndexHeaderBytes)
 		}},
 		{"sealed-footer", func(t *testing.T, dir string, m Manifest) {
 			flipByte(t, filepath.Join(dir, sealedName(1)), int64(m.Segments[0].Bytes)-10)
@@ -292,6 +395,64 @@ func TestCorruptionChecks(t *testing.T) {
 				t.Fatalf("open = %v", err)
 			}
 		})
+	}
+}
+
+func TestOpenSkipsSealedPayloadAndDeepVerifyDetectsDamage(t *testing.T) {
+	dir := t.TempDir()
+	l, _ := Create(dir)
+	loc := appendEntry(t, l, 1, 1, 1, "sealed payload")
+	if err := l.Rotate(nil); err != nil {
+		t.Fatal(err)
+	}
+	_ = l.Close()
+	flipByte(t, filepath.Join(dir, sealedName(1)), int64(loc.Offset+recordHeaderBytes))
+	l, err := Open(dir)
+	if err != nil {
+		t.Fatalf("metadata-only Open read or validated sealed payload: %v", err)
+	}
+	defer l.Close()
+	g, _ := l.Group(1)
+	if len(g.Entries) != 1 || g.Entries[0] != loc {
+		t.Fatalf("metadata index = %+v", g)
+	}
+	if err = l.DeepVerify(); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("DeepVerify = %v", err)
+	}
+}
+
+func TestSealedIndexSemanticMismatchRejected(t *testing.T) {
+	dir := t.TempDir()
+	l, _ := Create(dir)
+	appendEntry(t, l, 1, 1, 1, "payload")
+	if err := l.Rotate(nil); err != nil {
+		t.Fatal(err)
+	}
+	m := l.Manifest()
+	_ = l.Close()
+	meta := m.Segments[0]
+	path := filepath.Join(dir, sealedName(1))
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	index := make([]byte, meta.IndexBytes)
+	if _, err = f.ReadAt(index, int64(meta.IndexOffset)); err != nil {
+		t.Fatal(err)
+	}
+	// group delta, count, kind, and index are one byte each here; alter the
+	// canonical term while retaining a valid index CRC.
+	index[segmentIndexHeaderBytes+4] = 2
+	putCRC(index)
+	if _, err = f.WriteAt(index, int64(meta.IndexOffset)); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+	if opened, err := Open(dir); !errors.Is(err, ErrCorrupt) {
+		if opened != nil {
+			_ = opened.Close()
+		}
+		t.Fatalf("open = %v", err)
 	}
 }
 
@@ -395,18 +556,117 @@ func TestLogIdentityRejectsSegmentGraft(t *testing.T) {
 
 func TestManifestRejectsNonMonotonicMetadata(t *testing.T) {
 	m := Manifest{Generation: 1, ActiveID: 3, ActiveGeneration: 3, DurableSegmentID: 3, DurableOffset: segmentHeaderBytes, Segments: []SegmentMeta{{ID: 2}, {ID: 1}}}
-	b, err := marshalManifest(m)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err = unmarshalManifest(b); !errors.Is(err, ErrCorrupt) {
-		t.Fatalf("unmarshal = %v", err)
+	if _, err := marshalManifest(m); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("marshal segments = %v", err)
 	}
 	m.Segments = nil
 	m.Groups = []GroupMeta{{GroupID: 2}, {GroupID: 1}}
-	b, _ = marshalManifest(m)
-	if _, err = unmarshalManifest(b); !errors.Is(err, ErrCorrupt) {
-		t.Fatalf("groups = %v", err)
+	if _, err := marshalManifest(m); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("marshal groups = %v", err)
+	}
+}
+
+func TestRetainedChainAnchorAllowsPrefixReclamation(t *testing.T) {
+	dir := t.TempDir()
+	l, _ := Create(dir)
+	appendEntry(t, l, 1, 1, 1, "reclaim")
+	if err := l.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.SetTruncate(1, 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Rotate(nil); err != nil {
+		t.Fatal(err)
+	}
+	appendEntry(t, l, 1, 2, 2, "retain")
+	if err := l.Rotate(nil); err != nil {
+		t.Fatal(err)
+	}
+	m := l.Manifest()
+	_ = l.Close()
+	anchor := m.Segments[0]
+	m.Generation++
+	m.AnchorID, m.AnchorGeneration, m.AnchorHash = anchor.ID, anchor.Generation, anchor.Hash
+	m.Segments = slices.Clone(m.Segments[1:])
+	if err := publishManifest(dir, m); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(dir, sealedName(anchor.ID))); err != nil {
+		t.Fatal(err)
+	}
+	l, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	g, _ := l.Group(1)
+	if len(g.Entries) != 1 || g.Entries[0].Index != 2 || l.Manifest().AnchorID != 1 {
+		t.Fatalf("anchored rebuild = %+v manifest=%+v", g, l.Manifest())
+	}
+}
+
+func TestRetainedChainAnchorAllowsNoSealedSegments(t *testing.T) {
+	dir := t.TempDir()
+	l, _ := Create(dir)
+	appendEntry(t, l, 1, 1, 1, "reclaim")
+	if err := l.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.SetTruncate(1, 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Rotate(nil); err != nil {
+		t.Fatal(err)
+	}
+	m := l.Manifest()
+	_ = l.Close()
+	anchor := m.Segments[0]
+	m.Generation++
+	m.AnchorID, m.AnchorGeneration, m.AnchorHash = anchor.ID, anchor.Generation, anchor.Hash
+	m.Segments = nil
+	if err := publishManifest(dir, m); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(dir, sealedName(anchor.ID))); err != nil {
+		t.Fatal(err)
+	}
+	l, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	g, ok := l.Group(1)
+	if !ok || len(g.Entries) != 0 || g.TruncateIndex != 1 {
+		t.Fatalf("empty retained rebuild = %+v, %v", g, ok)
+	}
+}
+
+func TestRetainedChainAnchorMismatchRejected(t *testing.T) {
+	dir := t.TempDir()
+	l, _ := Create(dir)
+	appendEntry(t, l, 1, 1, 1, "one")
+	if err := l.Rotate(nil); err != nil {
+		t.Fatal(err)
+	}
+	m := l.Manifest()
+	_ = l.Close()
+	anchor := m.Segments[0]
+	m.Generation++
+	m.AnchorID, m.AnchorGeneration, m.AnchorHash = anchor.ID, anchor.Generation, anchor.Hash
+	m.AnchorHash[0] ^= 1
+	m.Segments = nil
+	if err := publishManifest(dir, m); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(dir, sealedName(anchor.ID))); err != nil {
+		t.Fatal(err)
+	}
+	if opened, err := Open(dir); !errors.Is(err, ErrCorrupt) {
+		if opened != nil {
+			_ = opened.Close()
+		}
+		t.Fatalf("open = %v", err)
 	}
 }
 
@@ -426,6 +686,7 @@ func TestRotationCrashPublicationPhases(t *testing.T) {
 			if !errors.Is(err, injected) {
 				t.Fatalf("rotate = %v", err)
 			}
+			assertPoisoned(t, l)
 			_ = l.Close()
 			l, err = Open(dir)
 			if err != nil {
@@ -444,6 +705,45 @@ func TestRotationCrashPublicationPhases(t *testing.T) {
 				t.Fatalf("manifest = %+v", l.Manifest())
 			}
 		})
+	}
+}
+
+func TestManifestPublicationErrorsPoisonHandle(t *testing.T) {
+	for _, operation := range []string{"sync", "truncate"} {
+		t.Run(operation, func(t *testing.T) {
+			l, _ := Create(t.TempDir())
+			appendEntry(t, l, 1, 1, 1, "entry")
+			if operation == "truncate" {
+				if err := l.Sync(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			injected := errors.New("publish failed after ambiguous mutation")
+			l.publishHook = func(Manifest) error { return injected }
+			var err error
+			if operation == "sync" {
+				err = l.Sync()
+			} else {
+				err = l.SetTruncate(1, 1, 1)
+			}
+			if !errors.Is(err, injected) || !errors.Is(err, ErrPoisoned) {
+				t.Fatalf("operation = %v", err)
+			}
+			assertPoisoned(t, l)
+			_ = l.Close()
+		})
+	}
+}
+
+func assertPoisoned(t *testing.T, l *Log) {
+	t.Helper()
+	if _, err := l.Append(Record{GroupID: 1, Index: 2, Term: 1, Kind: RecordEntry}); !errors.Is(err, ErrPoisoned) {
+		t.Fatalf("Append after fault = %v", err)
+	}
+	for name, call := range map[string]func() error{"Sync": l.Sync, "SetTruncate": func() error { return l.SetTruncate(1, 1, 1) }, "Rotate": func() error { return l.Rotate(nil) }, "TruncateSuffix": func() error { return l.TruncateSuffix(1, 1) }} {
+		if err := call(); !errors.Is(err, ErrPoisoned) {
+			t.Fatalf("%s after fault = %v", name, err)
+		}
 	}
 }
 
