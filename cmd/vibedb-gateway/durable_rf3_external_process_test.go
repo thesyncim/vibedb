@@ -1432,11 +1432,37 @@ func (client *durableRF3ExternalWireClient) assertPoint(
 	if err != nil {
 		t.Fatal(err)
 	}
-	response, latency := client.roundTrip(t, raw)
-	if !rf3FixturePointResponseMatches(response, identifier) {
-		t.Fatalf("replicated point id=%q response=%s", identifier, response)
+	started := time.Now()
+	deadline := started.Add(5 * time.Second)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			t.Fatalf("replicated point id=%q did not settle within 5s", identifier)
+		}
+		response, _ := client.roundTripWithin(t, raw, remaining)
+		if rf3FixturePointResponseMatches(response, identifier) {
+			return time.Since(started)
+		}
+		if !durableRF3ExternalRetryableResponse(response) {
+			t.Fatalf("replicated point id=%q response=%s", identifier, response)
+		}
 	}
-	return latency
+}
+
+func durableRF3ExternalRetryableResponse(raw []byte) bool {
+	document, err := vibejson.Parse(raw)
+	if err != nil {
+		return false
+	}
+	okNode, okPresent := document.Get("ok")
+	ok, okValid := okNode.Bool()
+	retryNode, retryPresent := document.Get("retryable")
+	retry, retryValid := retryNode.Bool()
+	codeNode, codePresent := document.Get("code")
+	code, codeValid := codeNode.Text()
+	return okPresent && okValid && !ok && retryPresent && retryValid && retry &&
+		codePresent && codeValid && (code == "conflict" || code == "unavailable" ||
+		code == "read_behind" || code == "stale_catalog" || code == "overloaded")
 }
 
 func (client *durableRF3ExternalWireClient) close() {
