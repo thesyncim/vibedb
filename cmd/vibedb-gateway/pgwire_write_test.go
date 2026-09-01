@@ -27,6 +27,7 @@ type postgresWriteServiceStub struct {
 	identity                    durableExecBatchIdentity
 	queries                     []gateway.Query
 	unknown, ackUnknown, refuse bool
+	direct                      bool
 }
 
 type postgresLeaderChangeStub struct{ postgresWriteServiceStub }
@@ -336,9 +337,43 @@ func (s *postgresWriteServiceStub) OpenIssuer(_ context.Context, _ serviceauthz.
 	return gateway.ReplicatedIssuerLaneGrant{Installation: open.Installation, Epoch: open.Epoch, LaneOrdinal: open.LaneOrdinal, GrantDigest: replication.Digest{9}}, nil
 }
 func (s *postgresWriteServiceStub) result() durableExecBatchExecuteResult {
+	if s.direct {
+		return durableExecBatchExecuteResult{
+			Result: &gateway.Result{Kind: shardservice.ResponseCompletion, RowsAffected: 2},
+			Direct: true,
+		}
+	}
 	return durableExecBatchExecuteResult{Result: &gateway.Result{Kind: shardservice.ResponseCompletion, RowsAffected: 2}, Ack: durableExecBatchAckWireRequest{
 		Identity: durableExecBatchAckIdentity{RequestID: s.identity.RequestID, Reference: s.identity.Reference, IssuerSequence: s.identity.IssuerSequence, RequestDigest: replication.Digest{3}}, TerminalRevision: 1, ResultDigest: replication.Digest{4}, AckToken: requestledger.AckToken{5},
 	}}
+}
+
+func TestPostgreSQLDirectWriteAdvancesOutboxWithoutAckRoundTrip(t *testing.T) {
+	authority := serviceauthz.Authority{Generation: 1}
+	authority.Node[0] = 5
+	path := filepath.Join(t.TempDir(), "writes")
+	s := &postgresWriteServiceStub{direct: true}
+	w, err := openPostgresDurableWriter(path, authority, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := w.Write(t.Context(), authority, gateway.Query{SQL: "DELETE FROM documents WHERE id=?"})
+	if err != nil || result.RowsAffected != 2 || s.writes != 1 || s.replays != 0 || s.acks != 0 ||
+		w.record.Sequence != 2 || w.record.Query != nil || w.record.Ack != nil ||
+		w.record.Version != postgresWriteJournalVersionUntyped {
+		t.Fatalf("direct write result=%+v err=%v service=%+v record=%+v", result, err, s, w.record)
+	}
+	if err = w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	w, err = openPostgresDurableWriter(path, authority, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if w.record.Sequence != 2 || w.record.Query != nil || w.record.Ack != nil {
+		t.Fatalf("reopened direct outbox=%+v", w.record)
+	}
 }
 func (s *postgresWriteServiceStub) ExecBatch(_ context.Context, _ serviceauthz.Authority, id durableExecBatchIdentity, q []gateway.Query) (durableExecBatchExecuteResult, error) {
 	s.writes++

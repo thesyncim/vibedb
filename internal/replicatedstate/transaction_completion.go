@@ -77,6 +77,7 @@ func OpenTransactionCompletionResult(
 		result.AffectedRowsValid &&
 			result.Operation != distributedtxn.ReplicatedApplyParticipant &&
 			result.Operation != distributedtxn.ReplicatedApplyReleaseParticipant &&
+			result.Operation != distributedtxn.ReplicatedApplySingleParticipant &&
 			result.Operation != distributedtxn.ReplicatedRetireCoordinator ||
 		!result.AffectedRowsValid && result.AffectedRows != 0 ||
 		result.RevisionValid != (result.Revision != 0) {
@@ -99,7 +100,8 @@ func OpenTransactionCompletionResult(
 		return TransactionCompletionResult{}, ErrCompletionCorrupt
 	}
 	apply := result.Operation == distributedtxn.ReplicatedApplyParticipant ||
-		result.Operation == distributedtxn.ReplicatedApplyReleaseParticipant
+		result.Operation == distributedtxn.ReplicatedApplyReleaseParticipant ||
+		result.Operation == distributedtxn.ReplicatedApplySingleParticipant
 	if resultCode == ResultApplied &&
 		(apply && !result.AffectedRowsValid ||
 			!apply && result.Operation != distributedtxn.ReplicatedRetireCoordinator &&
@@ -118,7 +120,8 @@ func transactionOperationCanRejectPrepare(
 ) bool {
 	if role == distributedtxn.ReplicatedRoleParticipant {
 		return operation == distributedtxn.ReplicatedPrepareParticipant ||
-			operation == distributedtxn.ReplicatedStagePrepareParticipant
+			operation == distributedtxn.ReplicatedStagePrepareParticipant ||
+			operation == distributedtxn.ReplicatedApplySingleParticipant
 	}
 	return role == distributedtxn.ReplicatedRoleCoordinator &&
 		(operation == distributedtxn.ReplicatedBeginPrepareCoordinator ||
@@ -235,6 +238,7 @@ func transactionCompletionDisposition(
 		command.Operation == distributedtxn.ReplicatedStagePrepareParticipant ||
 		command.Operation == distributedtxn.ReplicatedBeginPrepareCoordinator ||
 		command.Operation == distributedtxn.ReplicatedBeginPrepareManifestCoordinator ||
+		command.Operation == distributedtxn.ReplicatedApplySingleParticipant ||
 		command.Operation == distributedtxn.ReplicatedApplyReleaseParticipant ||
 		command.Operation == distributedtxn.ReplicatedAbortReleaseParticipant) {
 		return transactionRetryConflict, ResultTransactionConflict, nil
@@ -302,6 +306,14 @@ func transactionHistoricalRetryExact(
 	case distributedtxn.ReplicatedStagePrepareParticipant:
 		return control.FusedPath && transactionParticipantStageRetryExact(command, control) &&
 			control.PrepareCommandDigest == commandDigest &&
+			(control.PrepareResultCode == ResultApplied ||
+				control.PrepareResultCode == ResultIndexConflict ||
+				control.PrepareResultCode == ResultWrongShard), control.PrepareResultCode, nil
+	case distributedtxn.ReplicatedApplySingleParticipant:
+		return control.FusedPath && transactionParticipantStageRetryExact(command, control) &&
+			control.PrepareCommandDigest == commandDigest &&
+			distributedtxn.ParticipantState(control.State) == distributedtxn.ParticipantReleased &&
+			control.Revision == command.ExpectedRevision &&
 			(control.PrepareResultCode == ResultApplied ||
 				control.PrepareResultCode == ResultIndexConflict ||
 				control.PrepareResultCode == ResultWrongShard), control.PrepareResultCode, nil
@@ -578,7 +590,8 @@ func (m *Machine) appendTransactionCompletion(
 	}
 	binary.LittleEndian.PutUint64(result[8:16], control.Revision)
 	apply := transaction.Operation == distributedtxn.ReplicatedApplyParticipant ||
-		transaction.Operation == distributedtxn.ReplicatedApplyReleaseParticipant
+		transaction.Operation == distributedtxn.ReplicatedApplyReleaseParticipant ||
+		transaction.Operation == distributedtxn.ReplicatedApplySingleParticipant
 	retire := transaction.Operation == distributedtxn.ReplicatedRetireCoordinator
 	if exact && resultCode == ResultApplied && (apply || retire) {
 		if apply && (!control.AffectedRowsValid || control.AffectedRows < 0) ||

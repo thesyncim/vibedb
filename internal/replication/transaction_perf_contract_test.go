@@ -464,8 +464,31 @@ func buildReplicatedTransactionPerformanceSchedule(
 		return transactionPerformanceSchedule{}
 	}
 	if participants == 1 {
-		command := testMultiRelationCommand()
+		command := testFusedParticipantStageCommand(t)
+		controlView, err := distributedtxn.OpenReplicatedCommand(command.Transaction)
+		if err != nil {
+			t.Fatal(err)
+		}
+		control := controlView.Command()
+		control.Operation = distributedtxn.ReplicatedApplySingleParticipant
+		control.ExpectedRevision = 1
+		control.Participant.ParticipantOrdinal = 0
+		command.Transaction = encodeTransactionControl(t, control)
+		command.ClientSequence, err = TransactionClientSequence(command.Transaction)
+		if err != nil {
+			t.Fatal(err)
+		}
 		encoded := encodeCommand(t, command)
+		opened, err := OpenCommand(encoded)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, operation, ok := opened.TransactionIdentity()
+		if !ok || operation != distributedtxn.ReplicatedApplySingleParticipant ||
+			opened.ClientSequence != 1 || opened.RelationCount() == 0 {
+			t.Fatalf("single-participant schedule operation=%d sequence=%d relations=%d",
+				operation, opened.ClientSequence, opened.RelationCount())
+		}
 		return transactionPerformanceSchedule{
 			critical: 1, total: 1, barriers: 1, maxCommandBytes: len(encoded),
 		}

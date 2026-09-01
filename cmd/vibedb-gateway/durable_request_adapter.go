@@ -89,17 +89,27 @@ func (service *replicatedDurableRequestService) ExecBatch(
 }
 
 func (service *replicatedDurableRequestService) ReplayBatch(ctx context.Context, authority serviceauthz.Authority, identity durableExecBatchIdentity, queries []gateway.Query) (durableExecBatchExecuteResult, bool, error) {
-	recovery, ok := service.sql.(interface {
-		ReplayRequest(context.Context, requestledger.RequestKey, []gateway.Query) (gateway.DurableSQLRequestResult, bool, error)
-	})
-	if !ok {
-		return durableExecBatchExecuteResult{}, false, errInvalidDurableRequestAdapter
-	}
 	key, err := service.issuers.ValidateRequest(ctx, authority, identity.Reference, requestledger.RequestID(identity.RequestID), identity.IssuerSequence)
 	if err != nil {
 		return durableExecBatchExecuteResult{}, false, err
 	}
-	result, found, err := recovery.ReplayRequest(ctx, key, queries)
+	var result gateway.DurableSQLRequestResult
+	var found bool
+	if direct, ok := service.sql.(interface {
+		ReplayRequestWithTenant(context.Context, requestledger.RequestKey, []byte, []gateway.Query) (gateway.DurableSQLRequestResult, bool, error)
+	}); ok {
+		tenant, tenantErr := authenticatedIssuerTenantFor(authority)
+		if tenantErr != nil {
+			return durableExecBatchExecuteResult{}, false, tenantErr
+		}
+		result, found, err = direct.ReplayRequestWithTenant(ctx, key, tenant[:], queries)
+	} else if recovery, ok := service.sql.(interface {
+		ReplayRequest(context.Context, requestledger.RequestKey, []gateway.Query) (gateway.DurableSQLRequestResult, bool, error)
+	}); ok {
+		result, found, err = recovery.ReplayRequest(ctx, key, queries)
+	} else {
+		return durableExecBatchExecuteResult{}, false, errInvalidDurableRequestAdapter
+	}
 	if !found || err != nil && !errors.Is(err, gateway.ErrDurableSQLAborted) {
 		return durableExecBatchExecuteResult{}, found, err
 	}
@@ -108,8 +118,17 @@ func (service *replicatedDurableRequestService) ReplayBatch(ctx context.Context,
 }
 
 func durableAdapterResult(identity durableExecBatchIdentity, key requestledger.RequestKey, result gateway.DurableSQLRequestResult, outcomeErr error) (durableExecBatchExecuteResult, error) {
-	if result.Result == nil || result.Key.RequestKey != key || result.Key.Digest == (replication.Digest{}) ||
-		result.TerminalRevision == 0 || result.ResultDigest == (replication.Digest{}) ||
+	if result.Result == nil || result.Key.RequestKey != key || result.Key.Digest == (replication.Digest{}) {
+		return durableExecBatchExecuteResult{}, errInvalidDurableRequestAdapter
+	}
+	if result.Direct {
+		if result.TerminalRevision != 0 || result.ResultDigest != (replication.Digest{}) ||
+			result.AckToken != (gateway.DurableRequestAckToken{}) {
+			return durableExecBatchExecuteResult{}, errInvalidDurableRequestAdapter
+		}
+		return durableExecBatchExecuteResult{Result: result.Result, Direct: true}, outcomeErr
+	}
+	if result.TerminalRevision == 0 || result.ResultDigest == (replication.Digest{}) ||
 		result.AckToken == (gateway.DurableRequestAckToken{}) {
 		return durableExecBatchExecuteResult{}, errInvalidDurableRequestAdapter
 	}

@@ -1048,7 +1048,8 @@ func transactionOperationCarriesRelationBatches(
 	case distributedtxn.ReplicatedStageParticipant,
 		distributedtxn.ReplicatedBeginPrepareCoordinator,
 		distributedtxn.ReplicatedBeginPrepareManifestCoordinator,
-		distributedtxn.ReplicatedStagePrepareParticipant:
+		distributedtxn.ReplicatedStagePrepareParticipant,
+		distributedtxn.ReplicatedApplySingleParticipant:
 		return true
 	default:
 		return false
@@ -1343,6 +1344,11 @@ func transactionClientSequence(control transactionControlMetadata) (uint64, erro
 		distributedtxn.ReplicatedBeginPrepareManifestCoordinator,
 		distributedtxn.ReplicatedStagePrepareParticipant:
 		return 1, nil
+	case distributedtxn.ReplicatedApplySingleParticipant:
+		if control.expectedRevision == 0 {
+			return 0, semantic("direct participant issuer sequence")
+		}
+		return control.expectedRevision, nil
 	case distributedtxn.ReplicatedStageManifestSegment,
 		distributedtxn.ReplicatedAppendManifestSegments:
 		// Page zero follows the atomic coordinator begin at sequence two.

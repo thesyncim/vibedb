@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/thesyncim/vibedb/gateway"
@@ -116,5 +117,30 @@ func TestReplicatedDurableRequestAdapterCarriesExactStructuredIdentity(t *testin
 	if acknowledged.Applied != 13 || acknowledged.CollectionRounds != 2 ||
 		acknowledged.durableExecBatchAckWireRequest != executed.Ack {
 		t.Fatalf("ACK settlement drifted: %+v", acknowledged)
+	}
+}
+
+func TestDurableRequestAdapterAcceptsOnlyCapabilityFreeDirectResult(t *testing.T) {
+	key := requestledger.RequestKey{
+		Scope: requestledger.ScopeAuthenticated, Principal: requestledger.PrincipalID{1},
+		Request: requestledger.RequestID{2}, TenantDigest: requestledger.Digest{3},
+		IssuerEpoch: 4, IssuerSequence: 5, IssuerLane: requestledger.IssuerLane{6},
+	}
+	ledgerKey, err := gateway.NewDurableRequestLedgerKey(key, replication.Digest{7})
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := durableExecBatchIdentity{RequestID: replication.ID128(key.Request), IssuerSequence: 5}
+	direct := gateway.DurableSQLRequestResult{
+		Key: ledgerKey, Result: &gateway.Result{TransactionID: replication.ID128{8}}, Direct: true,
+	}
+	result, err := durableAdapterResult(identity, key, direct, nil)
+	if err != nil || !result.Direct || result.Result != direct.Result ||
+		result.Ack != (durableExecBatchAckWireRequest{}) {
+		t.Fatalf("direct adapter result=%+v err=%v", result, err)
+	}
+	direct.TerminalRevision = 1
+	if _, err = durableAdapterResult(identity, key, direct, nil); !errors.Is(err, errInvalidDurableRequestAdapter) {
+		t.Fatalf("direct terminal capability accepted: %v", err)
 	}
 }

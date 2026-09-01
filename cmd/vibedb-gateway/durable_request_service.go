@@ -30,6 +30,7 @@ type durableExecBatchIdentity struct {
 type durableExecBatchExecuteResult struct {
 	Result *gateway.Result
 	Ack    durableExecBatchAckWireRequest
+	Direct bool
 }
 
 func validDurableExecBatchIdentity(identity durableExecBatchIdentity) bool {

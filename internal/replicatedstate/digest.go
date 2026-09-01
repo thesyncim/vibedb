@@ -29,7 +29,8 @@ const deterministicApplySemantics = "vibejson-strict;last-mutation-per-key-wins;
 	"data-shard-raft-ordered-route-gate;shared-data-authority;exclusive-topology-authority;" +
 	"fixed-route-gate-command-outcome;epoch-fenced-release-tombstones;" +
 	"absolute-session-lease;lease-deadline-cas;sequenced-session-revoke;" +
-	"stable-logical-command-digest;data-chain-value-descriptor-sha256"
+	"stable-logical-command-digest;data-chain-value-descriptor-sha256;" +
+	"single-participant-issuer-lane-terminal-retry-witness"
 
 // deterministicRelationApplySemantics freezes the relation and conditional
 // mutation behavior shared by compact singleton and multi-relation commands.

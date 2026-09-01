@@ -93,28 +93,37 @@ func (m *Machine) planTransactionCommand(
 		plan.command.conflict = true
 		return plan, nil
 	}
+	direct := control.Operation == distributedtxn.ReplicatedApplySingleParticipant
 	creation := control.Operation == distributedtxn.ReplicatedStageCoordinator ||
 		control.Operation == distributedtxn.ReplicatedStageManifestCoordinator ||
 		control.Operation == distributedtxn.ReplicatedStageParticipant ||
 		control.Operation == distributedtxn.ReplicatedStagePrepareParticipant ||
 		control.Operation == distributedtxn.ReplicatedAbortReleaseParticipant &&
 			control.ExpectedRevision == 0
-	if creation != !found {
+	if direct && found && (!existing.FusedPath ||
+		existing.LastOperation != distributedtxn.ReplicatedApplySingleParticipant ||
+		distributedtxn.ParticipantState(existing.State) != distributedtxn.ParticipantReleased ||
+		control.ExpectedRevision <= existing.Revision) {
 		plan.command.resultCode = ResultTransactionConflict
 		plan.command.conflict = true
 		return plan, nil
 	}
-	if !creation && (existing.ID != control.ID || existing.Role != control.Role ||
+	if !direct && creation != !found {
+		plan.command.resultCode = ResultTransactionConflict
+		plan.command.conflict = true
+		return plan, nil
+	}
+	if !direct && !creation && (existing.ID != control.ID || existing.Role != control.Role ||
 		existing.Revision != control.ExpectedRevision) {
 		plan.command.resultCode = ResultTransactionConflict
 		plan.command.conflict = true
 		return plan, nil
 	}
-	if !creation && operationHasExclusiveTransactionPath(control.Operation) &&
+	if !direct && !creation && operationHasExclusiveTransactionPath(control.Operation) &&
 		existing.FusedPath != operationUsesFusedTransactionPath(control.Operation) {
 		return transactionConflict(plan), nil
 	}
-	if state.TransactionControlCount >= MaxRetainedTransactions && creation {
+	if state.TransactionControlCount >= MaxRetainedTransactions && !found && (creation || direct) {
 		plan.command.refusal = ErrAdmissionBound
 		return plan, nil
 	}
@@ -157,6 +166,11 @@ func (m *Machine) planTransactionCommand(
 		return m.planParticipantStagePrepared(
 			plan, command, control, applied, commandDigest, storageKey,
 			systemSnapshot, relationSnapshots,
+		)
+	case distributedtxn.ReplicatedApplySingleParticipant:
+		return m.planSingleParticipantApply(
+			plan, command, control, applied, commandDigest, storageKey,
+			systemSnapshot, relationSnapshots, existing.TransactionControl, found,
 		)
 	case distributedtxn.ReplicatedAbortReleaseParticipant:
 		if control.ExpectedRevision == 0 {
@@ -976,6 +990,102 @@ func (m *Machine) planParticipantStagePrepared(
 		plan, command, control, applied, commandDigest, controlKey,
 		snapshot, relationSnapshots, true,
 	)
+}
+
+// planSingleParticipantApply is the one-consensus-round transaction kernel.
+// The command identity, user mutations, deterministic result, and compact
+// retry witness become durable in one state-machine transaction. Unlike the
+// distributed lane it never installs intents or retained mutation payloads.
+func (m *Machine) planSingleParticipantApply(
+	plan transactionCommandPlan,
+	command replication.CommandView,
+	control distributedtxn.ReplicatedCommand,
+	applied uint64,
+	commandDigest replication.Digest,
+	controlKey [transactionControlStorageKeyBytes]byte,
+	snapshot pointSnapshot,
+	relationSnapshots relationPointSnapshots,
+	existing TransactionControl,
+	found bool,
+) (transactionCommandPlan, error) {
+	controlBytes, err := TransactionControlResidentBytes(len(control.Participant.IntentScopes))
+	if err != nil {
+		return transactionCommandPlan{}, err
+	}
+	var payloadArena [replication.MaxRelationsPerBundle]TransactionRelationPayloadView
+	payloads := payloadArena[:0]
+	blocked := false
+	relations := command.RelationBatches()
+	for relations.Next() {
+		batch := relations.Batch()
+		if blockedNow, blockErr := transactionBatchBlocked(snapshot, batch); blockErr != nil {
+			return transactionCommandPlan{}, blockErr
+		} else if blockedNow {
+			blocked = true
+		}
+		row, appendErr := AppendTransactionRelationPayload(nil, control.ID, batch)
+		if appendErr != nil {
+			return transactionCommandPlan{}, appendErr
+		}
+		payload, openErr := OpenTransactionRelationPayload(row)
+		if openErr != nil {
+			return transactionCommandPlan{}, openErr
+		}
+		payloads = append(payloads, payload)
+	}
+	resultCode := uint32(ResultIndexConflict)
+	var affectedRows int64
+	if !blocked {
+		changes, spans, digest, rows, code, planErr := m.planStoredTransactionMutations(
+			command, payloads, plan.command.dataChainDigest, relationSnapshots,
+		)
+		if planErr != nil {
+			return transactionCommandPlan{}, planErr
+		}
+		if code != ResultApplied && code != ResultIndexConflict && code != ResultWrongShard {
+			return transactionCommandPlan{}, fmt.Errorf(
+				"%w: direct participant result %d", ErrTransactionStateCorrupt, code,
+			)
+		}
+		resultCode = code
+		if code == ResultApplied {
+			plan.command.changes = changes
+			plan.command.relations = spans
+			plan.command.dataChainDigest = digest
+			affectedRows = rows
+		}
+	}
+	durableControl := TransactionControl{
+		ID: control.ID, Role: control.Role,
+		State: uint8(distributedtxn.ParticipantReleased), Revision: control.ExpectedRevision,
+		ControllerEpoch: control.ControllerEpoch, ExecutionPinDigest: control.ExecutionPinDigest,
+		PayloadKind: control.PayloadKind, PayloadDigest: control.Participant.MutationDigest,
+		PayloadBytes: transactionCanonicalRelationBytes(command),
+		PayloadCount: uint64(command.MutationCount()), PayloadRelationCount: uint16(command.RelationCount()),
+		CoordinatorGroup:            replication.ID128(control.Participant.CoordinatorGroup),
+		CoordinatorShardIncarnation: replication.ID128(control.Participant.CoordinatorShardIncarnation),
+		CoordinatorAllocation:       control.Participant.CoordinatorAllocation,
+		MutationDigest:              control.Participant.MutationDigest,
+		BucketBits:                  control.Participant.BucketBits, IntentScopes: control.Participant.IntentScopes,
+		AffectedRows: affectedRows, AffectedRowsValid: resultCode == ResultApplied,
+		PrepareResultCode: resultCode, PrepareCommandDigest: commandDigest,
+		FusedPath: true, ResidentControlBytes: controlBytes,
+		LastOperation: control.Operation, LastExpectedRevision: control.ExpectedRevision,
+		LastCommandDigest: commandDigest, LastResultCode: resultCode, LastAppliedIndex: applied,
+	}
+	encoded, err := AppendTransactionControl(nil, durableControl)
+	if err != nil {
+		return transactionCommandPlan{}, err
+	}
+	plan.rows = append(plan.rows, newTransactionPut(controlKey[:], encoded))
+	plan.delta = transactionStateDelta{residentByte: int64(controlBytes)}
+	if found {
+		plan.delta.residentByte -= int64(existing.ResidentControlBytes)
+	} else {
+		plan.delta.controls = 1
+	}
+	plan.command.resultCode = resultCode
+	return plan, nil
 }
 
 func (m *Machine) planParticipantStageWithVote(

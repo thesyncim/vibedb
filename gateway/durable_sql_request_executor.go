@@ -28,6 +28,9 @@ type DurableSQLRequestExecutorOptions struct {
 	Requests           *DurableRequestService
 	RecoveryPulseLimit uint8
 	PlanningLeaseSpan  uint64
+	// SingleParticipantFastPath selects the terminal one-proposal lane for a
+	// replay-stable one-statement, one-relation, one-group mutation.
+	SingleParticipantFastPath bool
 }
 
 // DurableSQLRequestExecutor is the production composition boundary from one
@@ -39,6 +42,7 @@ type DurableSQLRequestExecutor struct {
 	requests          *DurableRequestService
 	recoveryPulses    uint8
 	planningLeaseSpan uint64
+	singleFast        bool
 }
 
 type DurableSQLRequestResult struct {
@@ -47,6 +51,9 @@ type DurableSQLRequestResult struct {
 	TerminalRevision uint64
 	ResultDigest     replication.Digest
 	AckToken         DurableRequestAckToken
+	// Direct is terminal in the participant group itself and therefore has no
+	// request-ledger ACK capability or terminal-ledger revision.
+	Direct bool
 }
 
 func NewDurableRequestLedgerKey(
@@ -74,6 +81,7 @@ func NewDurableSQLRequestExecutor(
 	return &DurableSQLRequestExecutor{
 		planner: options.Planner, data: options.ReplicatedData, requests: options.Requests,
 		recoveryPulses: options.RecoveryPulseLimit, planningLeaseSpan: options.PlanningLeaseSpan,
+		singleFast: options.SingleParticipantFastPath,
 	}, nil
 }
 
@@ -142,6 +150,25 @@ func (executor *DurableSQLRequestExecutor) Execute(
 		}
 		return DurableSQLRequestResult{}, fmt.Errorf("gateway: durable SQL lowering: %w", errors.Join(err, ErrDurableSQLRequest))
 	}
+	if executor.singleFast && key.IssuerSequence != 0 &&
+		directSQLMutationEligible(queries, participants) {
+		admitted = true
+		direct, directErr := executor.executeDirect(
+			opctx, key, tenant, lease.generation, participants[0],
+		)
+		if direct.Result != nil && !direct.duplicate {
+			executor.observeMutationPressure(lease.snapshot, participants)
+		}
+		if directErr != nil {
+			if errors.Is(directErr, ErrReplicatedTransactionConflict) {
+				return direct.DurableSQLRequestResult, fmt.Errorf(
+					"gateway: direct SQL execution: %w", ErrDurableSQLAborted,
+				)
+			}
+			return DurableSQLRequestResult{}, fmt.Errorf("gateway: direct SQL execution: %w", directErr)
+		}
+		return direct.DurableSQLRequestResult, nil
+	}
 	program, err := BuildDurableRequestLogicalProgram(DurableRequestLogicalProgramBuild{
 		Home: home, Key: key, Tenant: tenant, CatalogGeneration: lease.generation,
 		RecoveryDeadline:        int64(executor.recoveryPulses),
@@ -182,6 +209,63 @@ func (executor *DurableSQLRequestExecutor) Execute(
 	return executor.result(key, outcome)
 }
 
+type directSQLRequestResult struct {
+	DurableSQLRequestResult
+	duplicate bool
+}
+
+func (executor *DurableSQLRequestExecutor) executeDirect(
+	ctx context.Context,
+	key DurableRequestLedgerKey,
+	tenant []byte,
+	catalogGeneration uint64,
+	participant ReplicatedTransactionParticipant,
+) (directSQLRequestResult, error) {
+	direct, err := executor.data.DirectMutate(ctx, ReplicatedDirectMutation{
+		Key: key.RequestKey, RequestDigest: key.Digest, Tenant: tenant, Participant: participant,
+	})
+	if direct.ID == (distributedtxn.ID{}) {
+		return directSQLRequestResult{}, err
+	}
+	result := directSQLRequestResult{
+		DurableSQLRequestResult: DurableSQLRequestResult{
+			Key: key, Direct: true,
+			Result: &Result{
+				Kind: shardservice.ResponseCompletion, RowsAffected: direct.AffectedRows,
+				TransactionID: replication.ID128(direct.ID), RouteKind: distribution.RouteTargeted,
+				Generation: catalogGeneration, ShardsFanned: 1, Retries: direct.Retries,
+			},
+		},
+		duplicate: direct.Duplicate,
+	}
+	if executor.planner != nil {
+		executor.planner.metrics.observeRoute(distribution.RouteTargeted, 1, ScatterNone)
+	}
+	return result, err
+}
+
+func directSQLMutationEligible(
+	queries []Query,
+	participants []ReplicatedTransactionParticipant,
+) bool {
+	if len(queries) != 1 || len(participants) != 1 || len(participants[0].Batches) != 1 {
+		return false
+	}
+	mutations := participants[0].Batches[0].Mutations
+	if len(mutations) == 0 {
+		return false
+	}
+	for index := range mutations {
+		switch mutations[index].Kind {
+		case replication.MutationPut, replication.MutationPutAbsentOrEqual,
+			replication.MutationDelete, replication.MutationPutAbsent:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // ReplayRequest resolves retained caller bytes before any new planning. A
 // committed INSERT may now conflict with its own row; replay must not replan it.
 func (executor *DurableSQLRequestExecutor) ReplayRequest(ctx context.Context, requestKey requestledger.RequestKey, queries []Query) (DurableSQLRequestResult, bool, error) {
@@ -196,6 +280,63 @@ func (executor *DurableSQLRequestExecutor) ReplayRequest(ctx context.Context, re
 		return DurableSQLRequestResult{}, false, err
 	}
 	return executor.Replay(ctx, key)
+}
+
+// ReplayRequestWithTenant reconstructs the terminal one-group command after a
+// gateway or client-outbox restart. The direct command is a pure function of
+// the authenticated request identity, caller digest, route, and replay-stable
+// canonical mutation, so no gateway-local session state is required.
+func (executor *DurableSQLRequestExecutor) ReplayRequestWithTenant(
+	ctx context.Context,
+	requestKey requestledger.RequestKey,
+	tenant []byte,
+	queries []Query,
+) (DurableSQLRequestResult, bool, error) {
+	if executor == nil || ctx == nil || !executor.singleFast || !requestKey.Valid() ||
+		len(tenant) == 0 || requestledger.Digest(sha256.Sum256(tenant)) != requestKey.TenantDigest {
+		return executor.ReplayRequest(ctx, requestKey, queries)
+	}
+	if err := validateDurableSQLReplayAdmission(queries); err != nil {
+		return DurableSQLRequestResult{}, false, err
+	}
+	key, err := NewDurableRequestLedgerKey(requestKey, replicatedSQLTransactionRequestDigest(queries))
+	if err != nil {
+		return DurableSQLRequestResult{}, false, err
+	}
+	profile, err := executor.profile(queries)
+	if err != nil {
+		return DurableSQLRequestResult{}, false, err
+	}
+	if err = validateQueryBatchAdmission(queries, profile); err != nil {
+		return DurableSQLRequestResult{}, false, err
+	}
+	opctx, cancel := context.WithTimeout(ctx, profile.GlobalDeadline)
+	defer cancel()
+	lease := executor.planner.catalog.pinCurrent()
+	if lease.snapshot == nil || lease.generation == 0 {
+		return DurableSQLRequestResult{}, false, ErrNoCatalog
+	}
+	defer lease.release()
+	participants, handled, planErr := executor.planner.planReplicatedSQLTransactionWithData(
+		opctx, lease.snapshot, queries, profile, executor.data,
+	)
+	if planErr != nil || !handled || key.IssuerSequence == 0 ||
+		!directSQLMutationEligible(queries, participants) {
+		return executor.Replay(opctx, key)
+	}
+	direct, directErr := executor.executeDirect(
+		opctx, key, tenant, lease.generation, participants[0],
+	)
+	if direct.Result == nil || direct.Result.TransactionID == (replication.ID128{}) {
+		return DurableSQLRequestResult{}, true, directErr
+	}
+	if !direct.duplicate {
+		executor.observeMutationPressure(lease.snapshot, participants)
+	}
+	if errors.Is(directErr, ErrReplicatedTransactionConflict) {
+		return direct.DurableSQLRequestResult, true, ErrDurableSQLAborted
+	}
+	return direct.DurableSQLRequestResult, true, directErr
 }
 
 // observeMutationPressure samples one logical write per routed participant.

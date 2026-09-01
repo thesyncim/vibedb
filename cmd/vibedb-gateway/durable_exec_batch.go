@@ -81,16 +81,19 @@ func executeDurableExecBatch(
 	if err != nil {
 		return &serveResponse{Error: err.Error()}
 	}
-	if result.Result == nil || !validDurableExecBatchAckRequest(&result.Ack) {
+	if result.Result == nil || !result.Direct && !validDurableExecBatchAckRequest(&result.Ack) ||
+		result.Direct && result.Ack != (durableExecBatchAckWireRequest{}) {
 		return &serveResponse{Error: errDurableExecBatchUnavailable.Error()}
 	}
 	response := encodeResult(result.Result)
 	if !response.Committed || response.TransactionID == (replication.ID128{}) ||
-		result.Ack.Identity.RequestID != identity.RequestID ||
-		result.Ack.Identity.Reference != identity.Reference ||
-		result.Ack.Identity.IssuerSequence != identity.IssuerSequence {
+		!result.Direct && (result.Ack.Identity.RequestID != identity.RequestID ||
+			result.Ack.Identity.Reference != identity.Reference ||
+			result.Ack.Identity.IssuerSequence != identity.IssuerSequence) {
 		return &serveResponse{Error: errDurableExecBatchUnavailable.Error()}
 	}
-	response.DurableAck = &result.Ack
+	if !result.Direct {
+		response.DurableAck = &result.Ack
+	}
 	return response
 }

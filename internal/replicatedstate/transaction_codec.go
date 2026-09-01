@@ -1083,6 +1083,7 @@ func operationHasExclusiveTransactionPath(operation distributedtxn.ReplicatedOpe
 		distributedtxn.ReplicatedBeginPrepareManifestCoordinator,
 		distributedtxn.ReplicatedAppendManifestSegments,
 		distributedtxn.ReplicatedStagePrepareParticipant,
+		distributedtxn.ReplicatedApplySingleParticipant,
 		distributedtxn.ReplicatedApplyReleaseParticipant,
 		distributedtxn.ReplicatedAbortReleaseParticipant:
 		return true
@@ -1097,6 +1098,7 @@ func operationUsesFusedTransactionPath(operation distributedtxn.ReplicatedOperat
 		distributedtxn.ReplicatedBeginPrepareManifestCoordinator,
 		distributedtxn.ReplicatedAppendManifestSegments,
 		distributedtxn.ReplicatedStagePrepareParticipant,
+		distributedtxn.ReplicatedApplySingleParticipant,
 		distributedtxn.ReplicatedApplyReleaseParticipant,
 		distributedtxn.ReplicatedAbortReleaseParticipant:
 		return true
@@ -1291,6 +1293,7 @@ func transactionOperationRole(
 		return role == distributedtxn.ReplicatedRoleCoordinator
 	case distributedtxn.ReplicatedStageParticipant,
 		distributedtxn.ReplicatedStagePrepareParticipant,
+		distributedtxn.ReplicatedApplySingleParticipant,
 		distributedtxn.ReplicatedPrepareParticipant,
 		distributedtxn.ReplicatedApplyParticipant,
 		distributedtxn.ReplicatedApplyReleaseParticipant,
@@ -1340,6 +1343,7 @@ func transactionStateOperationCompatible(
 	case distributedtxn.ParticipantReleased:
 		return operation == distributedtxn.ReplicatedReleaseParticipant ||
 			operation == distributedtxn.ReplicatedApplyReleaseParticipant ||
+			operation == distributedtxn.ReplicatedApplySingleParticipant ||
 			operation == distributedtxn.ReplicatedAbortReleaseParticipant
 	default:
 		return false

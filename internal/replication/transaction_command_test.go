@@ -497,6 +497,18 @@ func TestFusedTransactionClientSequencesAreCanonicalAndNonAliasing(t *testing.T)
 			t.Fatalf("operation %d sequence=%d err=%v", operation, sequence, sequenceErr)
 		}
 	}
+	direct := distributedtxn.ReplicatedCommand{
+		Role:      distributedtxn.ReplicatedRoleParticipant,
+		Operation: distributedtxn.ReplicatedApplySingleParticipant,
+		ID:        id, ExpectedRevision: 9,
+		PayloadKind: distributedtxn.ReplicatedPayloadParticipantStage,
+		Participant: fusedView.Participant,
+	}
+	directBytes := encodeTransactionControl(t, direct)
+	directSequence, err := TransactionClientSequence(directBytes)
+	if err != nil || directSequence != 9 {
+		t.Fatalf("direct issuer sequence=%d err=%v", directSequence, err)
+	}
 	fence := distributedtxn.ReplicatedCommand{
 		Role:      distributedtxn.ReplicatedRoleParticipant,
 		Operation: distributedtxn.ReplicatedAbortReleaseParticipant,

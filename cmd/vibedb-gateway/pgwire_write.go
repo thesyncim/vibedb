@@ -313,8 +313,22 @@ func (w *postgresDurableWriter) resolve(ctx context.Context, fresh bool) (*gatew
 		}
 		return nil, err
 	}
-	if result.Result == nil || !validDurableExecBatchAckRequest(&result.Ack) {
+	if result.Result == nil || !result.Direct && !validDurableExecBatchAckRequest(&result.Ack) ||
+		result.Direct && result.Ack != (durableExecBatchAckWireRequest{}) {
 		return nil, errInvalidDurableRequestAdapter
+	}
+	if result.Direct {
+		if w.record.Sequence == ^uint64(0) {
+			return nil, errInvalidDurableRequestAdapter
+		}
+		w.record.Sequence++
+		w.record.Identity = durableExecBatchIdentity{}
+		w.record.Query = nil
+		w.record.Version = postgresWriteJournalVersionUntyped
+		if saveErr := w.save(); saveErr != nil {
+			return nil, saveErr
+		}
+		return result.Result, err
 	}
 	ack := postgresStoredAck(result.Ack)
 	w.record.Ack = &ack

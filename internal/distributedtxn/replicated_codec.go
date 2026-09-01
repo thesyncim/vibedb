@@ -75,6 +75,9 @@ const (
 	ReplicatedStagePrepareParticipant
 	ReplicatedApplyReleaseParticipant
 	ReplicatedAbortReleaseParticipant
+	// ReplicatedApplySingleParticipant is the terminal one-proposal lane for a
+	// request whose complete mutation set belongs to one Raft group.
+	ReplicatedApplySingleParticipant
 	// ReplicatedPulseCoordinator advances the bounded logical recovery lease.
 	// It never changes the transaction revision or decision; a later abort is
 	// authorized only after the durable pulse reaches the coordinator record's
@@ -851,7 +854,7 @@ func replicatedCommandShapeWithinBound(command ReplicatedCommand) bool {
 	case ReplicatedAppendManifestSegments:
 		return scopeBytes == 0 && len(command.Payload) <= MaxManifestSegmentSequenceBytes
 	case ReplicatedBeginPrepareCoordinator, ReplicatedStagePrepareParticipant,
-		ReplicatedStageParticipant:
+		ReplicatedApplySingleParticipant, ReplicatedStageParticipant:
 		return scopeBytes <= MaxIntentScopes*8
 	default:
 		return scopeBytes == 0
@@ -918,6 +921,11 @@ func replicatedOperationShape(operation ReplicatedOperation) (
 		return ReplicatedRoleCoordinator, ReplicatedPayloadManifestSegments, false, true
 	case ReplicatedStagePrepareParticipant:
 		return ReplicatedRoleParticipant, ReplicatedPayloadParticipantStage, true, true
+	case ReplicatedApplySingleParticipant:
+		// Direct apply uses ExpectedRevision as the issuer-lane sequence. The
+		// participant keeps one advancing terminal witness per lane instead of
+		// retaining one transaction record per request.
+		return ReplicatedRoleParticipant, ReplicatedPayloadParticipantStage, false, true
 	case ReplicatedApplyReleaseParticipant, ReplicatedAbortReleaseParticipant:
 		return ReplicatedRoleParticipant, ReplicatedPayloadNone, false, true
 	default:
@@ -931,7 +939,8 @@ func replicatedCommandCarriesParticipant(
 ) bool {
 	switch operation {
 	case ReplicatedStageParticipant, ReplicatedBeginPrepareCoordinator,
-		ReplicatedBeginPrepareManifestCoordinator, ReplicatedStagePrepareParticipant:
+		ReplicatedBeginPrepareManifestCoordinator, ReplicatedStagePrepareParticipant,
+		ReplicatedApplySingleParticipant:
 		return true
 	case ReplicatedAbortReleaseParticipant:
 		return expectedRevision == 0

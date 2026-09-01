@@ -127,6 +127,40 @@ func TestStructuredExecBatchBindsExactAuthorityAndReturnsAckHandle(t *testing.T)
 	}
 }
 
+func TestStructuredExecBatchDirectCompletionHasNoAckRoundTrip(t *testing.T) {
+	request := serveRequest{
+		Op: "exec_batch", RequestID: "01000000000000000000000000000000",
+		InstallationID: "02000000000000000000000000000000", IssuerEpoch: 7,
+		LaneOrdinal: 2, GrantDigest: strings.Repeat("03", 32), IssuerSequence: 9,
+		Statements: []serveStatement{{SQL: `DELETE FROM docs WHERE id = 1`}},
+	}
+	transactionID := replication.ID128{8}
+	stub := &durableRequestServiceStub{result: durableExecBatchExecuteResult{
+		Result: &gateway.Result{
+			Kind: shardservice.ResponseCompletion, RouteKind: distribution.RouteTargeted,
+			Generation: 3, ShardsFanned: 1, TransactionID: transactionID, RowsAffected: 1,
+		},
+		Direct: true,
+	}}
+	authority := serviceauthz.Authority{Node: [16]byte{9}, Generation: 4}
+	response := executeDurableExecBatch(t.Context(), stub, authority, request)
+	if response.Error != "" || response.DurableAck != nil || !response.Committed ||
+		response.RowsAffected != 1 || response.TransactionID != transactionID {
+		t.Fatalf("direct response=%+v", response)
+	}
+	var output bytes.Buffer
+	if err := writeServeResponse(vibejson.NewWriter(&output), response); err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{
+		`"request_digest"`, `"terminal_revision"`, `"result_digest"`, `"ack_token"`,
+	} {
+		if strings.Contains(output.String(), forbidden) {
+			t.Fatalf("direct response %q contains %q", output.String(), forbidden)
+		}
+	}
+}
+
 func TestStructuredExecBatchWireRejectsIdentityAmbiguityAndSpoofing(t *testing.T) {
 	valid := `{"op":"exec_batch","request_id":"01000000000000000000000000000000","installation_id":"02000000000000000000000000000000","issuer_epoch":7,"lane_ordinal":2,"grant_digest":"` + strings.Repeat("03", 32) + `","issuer_sequence":9,"class":"batch","statements":[{"sql":"DELETE FROM docs WHERE id = 1"}]}`
 	if err := validateDurableExecBatchEnvelope([]byte(valid)); err != nil {

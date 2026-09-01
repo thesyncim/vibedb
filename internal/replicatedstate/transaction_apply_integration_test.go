@@ -364,7 +364,8 @@ func fusedParticipantControl(
 		Role: distributedtxn.ReplicatedRoleParticipant, Operation: operation,
 		ID: id, ExpectedRevision: expected, PayloadKind: distributedtxn.ReplicatedPayloadNone,
 	}
-	if operation == distributedtxn.ReplicatedStagePrepareParticipant {
+	if operation == distributedtxn.ReplicatedStagePrepareParticipant ||
+		operation == distributedtxn.ReplicatedApplySingleParticipant {
 		digest, err := replication.TransactionMutationDigest(batches)
 		if err != nil {
 			t.Fatal(err)
@@ -380,6 +381,136 @@ func fusedParticipantControl(
 		}
 	}
 	return control
+}
+
+func TestTransactionSingleParticipantAppliesAndRetainsExactResultInOneEntry(t *testing.T) {
+	fixture := newRelationBundleFixture(t, true)
+	id := transactionCodecID(240)
+	documentKey := []byte("direct-document")
+	document := []byte(`{"email":"direct@example.com","n":1}`)
+	globalKey := []byte{0x91, 0x02, 'd'}
+	globalValue := []byte(`["direct-document"]`)
+	batches := []replication.RelationMutationBatch{
+		{Relation: 1, Mutations: []replication.Mutation{{
+			Kind: replication.MutationPutAbsentOrEqual, Key: documentKey, Value: document,
+		}}},
+		{Relation: 2, Mutations: []replication.Mutation{{
+			Kind: replication.MutationPutAbsentOrEqual, Key: globalKey, Value: globalValue,
+		}}},
+	}
+	control := fusedParticipantControl(
+		t, fixture, id, distributedtxn.ReplicatedApplySingleParticipant, 9, batches,
+	)
+	command := transactionCompletionCommand(t, fixture.binding, control, batches)
+	result := applyTransactionCommand(t, fixture.machine, 3, command)
+	if result.Revision != 9 || !result.AffectedRowsValid || result.AffectedRows != 1 {
+		t.Fatalf("direct result = %+v", result)
+	}
+	controlKey, _ := TransactionControlStorageKey(distributedtxn.ReplicatedRoleParticipant, id)
+	raw, found, err := fixture.system.Collection.AppendRaw(nil, controlKey[:])
+	if err != nil || !found {
+		t.Fatalf("read direct control: found=%v err=%v", found, err)
+	}
+	retained, err := OpenTransactionControl(raw)
+	if err != nil || retained.State != uint8(distributedtxn.ParticipantReleased) ||
+		retained.Revision != 9 || retained.ResidentMutationBytes != 0 ||
+		retained.ResidentIntentBytes != 0 || retained.ResidentControlBytes == 0 ||
+		retained.PrepareResultCode != ResultApplied || !retained.AffectedRowsValid ||
+		retained.AffectedRows != 1 || !retained.FusedPath {
+		t.Fatalf("direct retained control = %+v err=%v", retained.TransactionControl, err)
+	}
+	if fixture.machine.state.TransactionControlCount != 1 ||
+		fixture.machine.state.ActiveTransactionCount != 0 ||
+		fixture.machine.state.TransactionPayloadRows != 0 ||
+		fixture.machine.state.TransactionIntentRows != 0 {
+		t.Fatalf("direct accounting = %+v", fixture.machine.state)
+	}
+	for _, check := range []struct {
+		collection interface {
+			AppendRaw([]byte, []byte) ([]byte, bool, error)
+		}
+		key, value []byte
+	}{
+		{fixture.base.Collection, documentKey, document},
+		{fixture.global.Collection, globalKey, globalValue},
+	} {
+		got, ok, readErr := check.collection.AppendRaw(nil, check.key)
+		if readErr != nil || !ok || !bytes.Equal(got, check.value) {
+			t.Fatalf("direct committed %q = %q found=%v err=%v", check.key, got, ok, readErr)
+		}
+	}
+
+	// A response-lost retry is another Raft entry, but it returns the original
+	// result and performs no second data or retained-control mutation.
+	retry := applyTransactionCommand(t, fixture.machine, 4, command)
+	if retry != result || fixture.machine.state.TransactionControlCount != 1 {
+		t.Fatalf("direct retry result=%+v original=%+v state=%+v", retry, result, fixture.machine.state)
+	}
+	rawAfter, found, err := fixture.system.Collection.AppendRaw(nil, controlKey[:])
+	if err != nil || !found || !bytes.Equal(rawAfter, raw) {
+		t.Fatalf("direct retry changed witness: found=%v equal=%v err=%v", found, bytes.Equal(rawAfter, raw), err)
+	}
+
+	competingBatches := []replication.RelationMutationBatch{
+		{Relation: 1, Mutations: []replication.Mutation{{
+			Kind: replication.MutationPutAbsentOrEqual, Key: documentKey,
+			Value: []byte(`{"email":"other@example.com"}`),
+		}}},
+		{Relation: 2, Mutations: []replication.Mutation{{
+			Kind: replication.MutationPutAbsentOrEqual, Key: globalKey, Value: globalValue,
+		}}},
+	}
+	competing := transactionCompletionCommand(t, fixture.binding, fusedParticipantControl(
+		t, fixture, id, distributedtxn.ReplicatedApplySingleParticipant, 9, competingBatches,
+	), competingBatches)
+	if err := fixture.machine.AdmitCommand(competing); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.machine.ApplyNormal(normalMeta(5), competing); err != nil {
+		t.Fatal(err)
+	}
+	completion, competingResult := openTransactionCompletion(t, fixture.machine, competing)
+	if completion.ResultCode != ResultTransactionConflict || competingResult.AffectedRowsValid {
+		t.Fatalf("competing direct result code=%d result=%+v", completion.ResultCode, competingResult)
+	}
+
+	// The next issuer sequence for the same lane replaces the terminal witness
+	// in place. Retained transaction state is therefore bounded by active issuer
+	// lanes per shard, not by total requests.
+	nextKey := []byte("direct-document-next")
+	nextValue := []byte(`{"email":"next@example.com","n":2}`)
+	nextBatches := []replication.RelationMutationBatch{{
+		Relation: 1, Mutations: []replication.Mutation{{
+			Kind: replication.MutationPutAbsentOrEqual, Key: nextKey, Value: nextValue,
+		}},
+	}}
+	nextControl := fusedParticipantControl(
+		t, fixture, id, distributedtxn.ReplicatedApplySingleParticipant, 10, nextBatches,
+	)
+	next := transactionCompletionCommand(t, fixture.binding, nextControl, nextBatches)
+	nextResult := applyTransactionCommand(t, fixture.machine, 6, next)
+	if nextResult.Revision != 10 || !nextResult.AffectedRowsValid ||
+		nextResult.AffectedRows != 1 || fixture.machine.state.TransactionControlCount != 1 {
+		t.Fatalf("advanced direct result=%+v state=%+v", nextResult, fixture.machine.state)
+	}
+	raw, found, err = fixture.system.Collection.AppendRaw(nil, controlKey[:])
+	advanced, openErr := OpenTransactionControl(raw)
+	if err != nil || openErr != nil || !found || advanced.Revision != 10 ||
+		advanced.LastExpectedRevision != 10 || advanced.LastAppliedIndex != 6 {
+		t.Fatalf("advanced direct witness=%+v found=%v read=%v open=%v",
+			advanced.TransactionControl, found, err, openErr)
+	}
+	if err = fixture.machine.AdmitCommand(command); err != nil {
+		t.Fatalf("admit stale direct retry: %v", err)
+	}
+	if _, err = fixture.machine.ApplyNormal(normalMeta(7), command); err != nil {
+		t.Fatalf("apply stale direct retry: %v", err)
+	}
+	lookup, staleResult := openTransactionCompletion(t, fixture.machine, command)
+	if lookup.ResultCode != ResultTransactionConflict || staleResult.AffectedRowsValid ||
+		fixture.machine.state.TransactionControlCount != 1 {
+		t.Fatalf("stale direct lookup code=%d result=%+v", lookup.ResultCode, staleResult)
+	}
 }
 
 func TestTransactionFusedPrepareApplyReleaseIsOneAtomicFinish(t *testing.T) {

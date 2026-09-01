@@ -483,7 +483,8 @@ func TestFusedReplicatedOperationsUseFreshCanonicalCodes(t *testing.T) {
 		ReplicatedAppendManifestSegments <= ReplicatedReleaseParticipant ||
 		ReplicatedStagePrepareParticipant <= ReplicatedReleaseParticipant ||
 		ReplicatedApplyReleaseParticipant <= ReplicatedReleaseParticipant ||
-		ReplicatedAbortReleaseParticipant <= ReplicatedReleaseParticipant {
+		ReplicatedAbortReleaseParticipant <= ReplicatedReleaseParticipant ||
+		ReplicatedApplySingleParticipant <= ReplicatedReleaseParticipant {
 		t.Fatal("fused operation aliases an old split operation")
 	}
 	participant := ReplicatedCommand{
@@ -514,6 +515,18 @@ func TestFusedReplicatedOperationsUseFreshCanonicalCodes(t *testing.T) {
 		if _, err := AppendReplicatedCommand(nil, command); err != nil {
 			t.Fatalf("operation %d: %v", operation, err)
 		}
+	}
+	direct := ReplicatedCommand{
+		Role: ReplicatedRoleParticipant, Operation: ReplicatedApplySingleParticipant,
+		ID: testID(), ExpectedRevision: 9,
+		PayloadKind: ReplicatedPayloadParticipantStage,
+		Participant: fusedParticipantStage(
+			ReplicatedApplySingleParticipant, 0, digest("direct-participant"),
+		),
+	}
+	direct = fencedReplicatedTestCommand(direct)
+	if _, err := AppendReplicatedCommand(nil, direct); err != nil {
+		t.Fatalf("direct operation: %v", err)
 	}
 	old := participant
 	old.Operation = ReplicatedStageParticipant
