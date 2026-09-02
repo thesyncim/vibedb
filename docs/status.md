@@ -54,10 +54,7 @@ These are source-audit findings, not hypothetical limitations.
 
 | Evidence | Current defect or sharp edge | Consequence |
 | --- | --- | --- |
-| [Shard codec](../shardservice/codec.go) / [replicated apply](../internal/replicatedstate/apply.go) / [transaction apply](../internal/replicatedstate/transaction_apply.go) / [build manifest](../internal/buildgate/manifest/current.txt) | Static capture added mutation-image marker `0xe4`; later RF3 postimage work also widened replicated global-index digest replacement and normalized prepare conflicts. Neither boundary advanced the generated wire or disk grammar IDs | Builds across either boundary can pass the preface yet disagree on requests or durable replay; use one exact commit and do not rely on the preface or in-place replay across these changes |
 | [Facade validation](../vibedb.go) / [transaction validation](../vibedb_txn.go) | A first lazy `Put` and later direct or transactional writes do not apply one consistent JSON rule | Do not enable opaque values through the root facade |
-| [Facade transaction bounds](../vibedb_txn.go) | Transactional writes use database-open defaults rather than a reopened collection's persisted key/document bounds | Do not assume direct and transactional bound parity with custom persisted limits |
-| [Facade names](../internal/collectionname/collectionname.go) / [memory-store names](../store/store_collection.go) | NUL handling differs between memory and durable layers | Treat NUL as unsupported in portable collection names |
 | [`mixedsuite` summaries](../bench/competitive/cmd/mixedsuite/main.go) | Summary rows contain more grouping fields than the header declares | Do not consume the current summary TSV as a stable machine-readable schema |
 
 These defects are reasons the project must not be used for irreplaceable data.

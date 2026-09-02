@@ -32,6 +32,20 @@ var buildgateBeforeSQLParameterTypes = Profile{
 	},
 }
 
+// buildgateBeforeMutationImagesAndPostimages freezes the grammar identities
+// that accidentally remained current after mutation-image marker 0xe4 and the
+// replicated postimage/prepare-conflict semantics were introduced.
+var buildgateBeforeMutationImagesAndPostimages = Profile{
+	WireGrammar: GrammarID{0x71, 0x13, 0xcc, 0xdb, 0xf9, 0xc2, 0xa3, 0xcd, 0xac, 0x3d, 0x57, 0x96, 0xb9, 0x64, 0x21, 0xdf},
+	DiskGrammar: GrammarID{0xde, 0xce, 0x27, 0xa5, 0x8f, 0xe9, 0xf3, 0x8d, 0xb5, 0x14, 0xd1, 0x41, 0xba, 0x23, 0x6e, 0x34},
+	Provided: CapabilitySet{
+		1<<CapabilityRaftTransport | 1<<CapabilityGatewayShardTransport,
+	},
+	Required: CapabilitySet{
+		1<<CapabilityRaftTransport | 1<<CapabilityGatewayShardTransport,
+	},
+}
+
 func TestGeneratedManifestMatchesCurrentLedgerSemantics(t *testing.T) {
 	semantics := requestledger.SemanticsDigest()
 	if [32]byte(semantics) != generatedRequestLedgerSemantics {
@@ -97,6 +111,25 @@ func TestBuildBeforeSQLParameterTypesIsIncompatibleBeforeWireOrDiskAdmission(t *
 	}
 	if _, err := gate.AuthorizeDiskAdoption(legacyDisk); !errors.Is(err, ErrDiskGrammar) {
 		t.Fatalf("pre-parameter-metadata/current disk compatibility = %v, want ErrDiskGrammar", err)
+	}
+}
+
+func TestBuildBeforeMutationImagesAndPostimagesIsIncompatibleBeforeAdmission(t *testing.T) {
+	current := CurrentProfile()
+	legacy := buildgateBeforeMutationImagesAndPostimages
+	if current.WireGrammar == legacy.WireGrammar || current.DiskGrammar == legacy.DiskGrammar {
+		t.Fatal("current manifest retained the pre-mutation-image/postimage grammar identity")
+	}
+	if _, err := CheckCompatibility(current, legacy); !errors.Is(err, ErrWireGrammar) {
+		t.Fatalf("legacy/current peer compatibility = %v, want ErrWireGrammar", err)
+	}
+	gate, err := NewCurrentDiskGate(current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyDisk := DiskIdentity{Grammar: legacy.DiskGrammar, Required: legacy.Required}
+	if _, err := gate.AuthorizeDiskAdoption(legacyDisk); !errors.Is(err, ErrDiskGrammar) {
+		t.Fatalf("legacy/current disk compatibility = %v, want ErrDiskGrammar", err)
 	}
 }
 

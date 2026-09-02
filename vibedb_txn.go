@@ -184,6 +184,8 @@ type txCollectionState struct {
 
 	maxDocs  int
 	maxBytes int
+	maxKey   int
+	maxDoc   int
 
 	overlaySource query.FileOverlaySource
 
@@ -447,11 +449,14 @@ func (t *Tx) captureCut() error {
 
 func (t *Tx) newCollectionState(name string) *txCollectionState {
 	maxDocs, maxBytes := t.db.batchBounds(name)
+	maxKey, maxDoc := t.db.documentBounds(name)
 	state := &txCollectionState{
 		name:     name,
 		pending:  make(map[string]*txMutation),
 		maxDocs:  maxDocs,
 		maxBytes: maxBytes,
+		maxKey:   maxKey,
+		maxDoc:   maxDoc,
 	}
 	state.overlaySource = query.NewFileOverlaySource(state)
 	return state
@@ -747,12 +752,8 @@ func (c *TxCollection) Put(key string, document []byte) (created bool, err error
 	if err := c.keyError(key); err != nil {
 		return false, err
 	}
-	maxKey, maxDoc := c.tx.db.documentBounds()
-	if len(document) == 0 || len(document) > maxDoc {
+	if len(document) == 0 || len(document) > c.state.maxDoc {
 		return false, ErrDocumentTooLarge
-	}
-	if len(key) > maxKey {
-		return false, ErrKeyTooLarge
 	}
 	if err := validateDocument(c.tx.db.engine.Collection, document); err != nil {
 		return false, err
@@ -930,8 +931,7 @@ func (c *TxCollection) ready() error {
 }
 
 func (c *TxCollection) keyError(key string) error {
-	maxKey, _ := c.tx.db.documentBounds()
-	if len(key) == 0 || len(key) > maxKey {
+	if len(key) == 0 || len(key) > c.state.maxKey {
 		return ErrKeyTooLarge
 	}
 	return nil
@@ -1200,9 +1200,14 @@ func (s *txCollectionState) LenDelta() int64 {
 	return delta
 }
 
-func (d *Database) documentBounds() (maxKey, maxDoc int) {
+func (d *Database) documentBounds(name string) (maxKey, maxDoc int) {
 	if d == nil {
 		return defaultMaxKeyBytes, defaultMaxDocumentBytes
+	}
+	if d.disk != nil {
+		if collection, ok := d.disk.Collection(name); ok && collection != nil {
+			return collection.MaxKeyBytes(), collection.MaxDocumentBytes()
+		}
 	}
 	return d.maxKeyBytes, d.maxDocumentBytes
 }

@@ -25,7 +25,7 @@ func TestPortableCollectionNameRoundTrip(t *testing.T) {
 
 func TestCollectionNameRejectsNonCanonicalOrUnrepresentableInput(t *testing.T) {
 	for _, name := range []string{
-		"", string([]byte{0xff}), strings.Repeat("x", MaxNameBytes+1),
+		"", "nul\x00name", string([]byte{0xff}), strings.Repeat("x", MaxNameBytes+1),
 	} {
 		if _, ok := Encode(name); ok {
 			t.Fatalf("Encode(%q) succeeded", name)

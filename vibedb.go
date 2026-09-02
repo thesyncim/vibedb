@@ -30,8 +30,8 @@ var (
 	// ErrInvalidOptions reports incompatible facade options. The underlying
 	// store's validation error is wrapped when a resource bound is invalid.
 	ErrInvalidOptions = errors.New("vibedb: invalid options")
-	// ErrInvalidCollectionName reports an empty, invalid UTF-8, or longer than
-	// MaxCollectionNameBytes logical name.
+	// ErrInvalidCollectionName reports an empty, NUL-bearing, invalid UTF-8, or
+	// longer than MaxCollectionNameBytes logical name.
 	ErrInvalidCollectionName = errors.New("vibedb: invalid collection name")
 	// ErrManagedCollection reports an attempt to close a collection whose
 	// lifecycle belongs to its Database. Close the database instead.

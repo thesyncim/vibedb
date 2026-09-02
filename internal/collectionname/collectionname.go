@@ -23,11 +23,13 @@ const (
 )
 
 // Valid reports whether name has one canonical reversible file encoding.
+// NUL is excluded so memory and durable catalogs share one logical namespace.
 // Names are application strings rather than path fragments, so separators,
 // reserved device spellings, trailing dots/spaces, and distinct Unicode forms
 // are all legal and remain distinct after encoding.
 func Valid(name string) bool {
-	return name != "" && len(name) <= MaxNameBytes && utf8.ValidString(name)
+	return name != "" && len(name) <= MaxNameBytes && utf8.ValidString(name) &&
+		!strings.ContainsRune(name, 0)
 }
 
 // Encode returns name's portable primary filename.

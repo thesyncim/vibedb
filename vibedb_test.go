@@ -418,6 +418,26 @@ func TestZeroOptionReopenUsesPersistedAdmissionBounds(t *testing.T) {
 		if _, err := collection.Put(tooLongKey, []byte(`null`)); !errors.Is(err, vibedb.ErrKeyTooLarge) {
 			t.Fatalf("zero-option reopened Put beyond persisted key bound: %v", err)
 		}
+		tx, err := reopened.Begin()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = tx.Collection("docs").Put(longKey, largeDocument); err != nil {
+			t.Fatalf("transactional Put within persisted bounds: %v", err)
+		}
+		if err = tx.Commit(); err != nil {
+			t.Fatalf("transactional Commit within persisted bounds: %v", err)
+		}
+		tx, err = reopened.Begin()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = tx.Collection("docs").Put(tooLongKey, []byte(`null`)); !errors.Is(err, vibedb.ErrKeyTooLarge) {
+			t.Fatalf("transactional Put beyond persisted key bound: %v", err)
+		}
+		if err = tx.Rollback(); err != nil {
+			t.Fatal(err)
+		}
 		got, found, err := collection.Get(longKey)
 		if err != nil || !found || !slices.Equal(got, largeDocument) {
 			t.Fatalf("zero-option reopened Get = (%d bytes,%v,%v)", len(got), found, err)
@@ -1169,9 +1189,14 @@ func TestInvalidCollectionNameIsDeferredToOperation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	invalid := db.Collection(strings.Repeat("x", vibedb.MaxCollectionNameBytes+1))
-	if _, err := invalid.Put("k", []byte(`{}`)); !errors.Is(err, vibedb.ErrInvalidCollectionName) {
-		t.Fatalf("Put error = %v", err)
+	for _, name := range []string{
+		strings.Repeat("x", vibedb.MaxCollectionNameBytes+1),
+		"nul\x00name",
+	} {
+		invalid := db.Collection(name)
+		if _, err := invalid.Put("k", []byte(`{}`)); !errors.Is(err, vibedb.ErrInvalidCollectionName) {
+			t.Fatalf("Put collection %q error = %v", name, err)
+		}
 	}
 }
 
