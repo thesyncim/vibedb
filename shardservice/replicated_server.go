@@ -459,9 +459,17 @@ func (server *ReplicatedServer) executeReplicatedAuthenticated(
 ) *ReplicatedResponse {
 	authorizedOwner, fusedProposal := server.owner.(replicatedAuthorizedOwner)
 	fusedProposal = fusedProposal && request.Operation == ReplicatedPropose
+	fusedRead := replicatedReadOperation(request.Operation)
+	var readAuthorize raftservice.ProposalAuthorization
+	if fusedRead {
+		readAuthorize = func(candidate raftservice.ServingState) bool {
+			return server.serving == nil || server.serving(candidate) ||
+				(authenticated && server.transition != nil && server.transition(candidate, request))
+		}
+	}
 	var state raftservice.ServingState
 	var wireState ReplicatedMemberState
-	if !fusedProposal {
+	if !fusedProposal && !fusedRead {
 		var stateErr error
 		state, stateErr = server.owner.Probe(ctx, request.Fence.Group)
 		wireState = replicatedWireState(state)
@@ -549,13 +557,14 @@ func (server *ReplicatedServer) executeReplicatedAuthenticated(
 				Term: request.Fence.Term,
 			},
 			Packed: request.BatchRead, MinimumApplied: request.MinimumApplied,
-			MaxResultBytes: int(request.MaxValueBytes),
+			MaxResultBytes: int(request.MaxValueBytes), Authorize: readAuthorize,
 		})
 		if readErr != nil && readLease != nil {
 			readLease.Release()
 			readLease = nil
 		}
 		if readErr == nil {
+			wireState = replicatedWireState(result.State)
 			wireState = replicatedReadState(wireState, request.Fence, result.Applied)
 			response := &ReplicatedResponse{Kind: ReplicatedReadBatchResult,
 				HasState: true, State: wireState, ReadApplied: result.Applied,
@@ -579,6 +588,9 @@ func (server *ReplicatedServer) executeReplicatedAuthenticated(
 		case errors.Is(readErr, raftservice.ErrServingFence):
 			return &ReplicatedResponse{Kind: ReplicatedRefusal,
 				Refusal: ReplicatedRefusalStaleFence, HasState: true, State: wireState}
+		case errors.Is(readErr, raftservice.ErrServingAuthorization):
+			return &ReplicatedResponse{Kind: ReplicatedRefusal,
+				Refusal: ReplicatedRefusalUnavailable, HasState: true, State: wireState}
 		case errors.Is(readErr, replicatedstate.ErrReadBehind):
 			return &ReplicatedResponse{Kind: ReplicatedRefusal,
 				Refusal: ReplicatedRefusalReadBehind, HasState: true, State: wireState}
@@ -607,13 +619,14 @@ func (server *ReplicatedServer) executeReplicatedAuthenticated(
 			},
 			Relation: request.Relation, Key: request.Key,
 			MinimumApplied: request.MinimumApplied, MaxValueBytes: int(request.MaxValueBytes),
-			Linearizable: request.Operation == ReplicatedReadLeader,
+			Linearizable: request.Operation == ReplicatedReadLeader, Authorize: readAuthorize,
 		})
 		if readErr != nil && readLease != nil {
 			readLease.Release()
 			readLease = nil
 		}
 		if readErr == nil {
+			wireState = replicatedWireState(result.State)
 			wireState = replicatedReadState(wireState, request.Fence, result.Applied)
 			kind := ReplicatedReadMissing
 			if result.Found {
@@ -639,6 +652,9 @@ func (server *ReplicatedServer) executeReplicatedAuthenticated(
 			return &ReplicatedResponse{Kind: ReplicatedNotLeader, HasState: true, State: wireState}
 		case errors.Is(readErr, raftservice.ErrServingFence):
 			return &ReplicatedResponse{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalStaleFence,
+				HasState: true, State: wireState}
+		case errors.Is(readErr, raftservice.ErrServingAuthorization):
+			return &ReplicatedResponse{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalUnavailable,
 				HasState: true, State: wireState}
 		case errors.Is(readErr, replicatedstate.ErrReadBehind):
 			return &ReplicatedResponse{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalReadBehind,
@@ -671,13 +687,14 @@ func (server *ReplicatedServer) executeReplicatedAuthenticated(
 				StoreID: request.Fence.StoreID, NodeIncarnation: request.Fence.NodeIncarnation,
 				Term: request.Fence.Term,
 			},
-			Capability: request.Capability, Read: read,
+			Capability: request.Capability, Read: read, Authorize: readAuthorize,
 		})
 		if readErr != nil && readLease != nil {
 			readLease.Release()
 			readLease = nil
 		}
 		if readErr == nil {
+			wireState = replicatedWireState(result.State)
 			wireState = replicatedReadState(wireState, request.Fence, result.Applied)
 			value, encodeErr := AppendReplicatedTransactionReadValue(nil,
 				ReplicatedTransactionReadValue{
@@ -711,6 +728,9 @@ func (server *ReplicatedServer) executeReplicatedAuthenticated(
 		case errors.Is(readErr, raftservice.ErrServingFence):
 			return &ReplicatedResponse{Kind: ReplicatedRefusal,
 				Refusal: ReplicatedRefusalStaleFence, HasState: true, State: wireState}
+		case errors.Is(readErr, raftservice.ErrServingAuthorization):
+			return &ReplicatedResponse{Kind: ReplicatedRefusal,
+				Refusal: ReplicatedRefusalUnavailable, HasState: true, State: wireState}
 		case errors.Is(readErr, replicatedstate.ErrReadBehind):
 			return &ReplicatedResponse{Kind: ReplicatedRefusal,
 				Refusal: ReplicatedRefusalReadBehind, HasState: true, State: wireState}
@@ -747,13 +767,14 @@ func (server *ReplicatedServer) executeReplicatedAuthenticated(
 					StoreID: request.Fence.StoreID, NodeIncarnation: request.Fence.NodeIncarnation,
 					Term: request.Fence.Term,
 				},
-				Capability: request.Capability, Read: read,
+				Capability: request.Capability, Read: read, Authorize: readAuthorize,
 			})
 		if readErr != nil && readLease != nil {
 			readLease.Release()
 			readLease = nil
 		}
 		if readErr == nil {
+			wireState = replicatedWireState(result.State)
 			wireState = replicatedReadState(wireState, request.Fence, result.Applied)
 			value, encodeErr := AppendReplicatedRequestLedgerReadValue(nil,
 				ReplicatedRequestLedgerReadValue{
@@ -784,6 +805,9 @@ func (server *ReplicatedServer) executeReplicatedAuthenticated(
 		case errors.Is(readErr, raftservice.ErrServingFence):
 			return &ReplicatedResponse{Kind: ReplicatedRefusal,
 				Refusal: ReplicatedRefusalStaleFence, HasState: true, State: wireState}
+		case errors.Is(readErr, raftservice.ErrServingAuthorization):
+			return &ReplicatedResponse{Kind: ReplicatedRefusal,
+				Refusal: ReplicatedRefusalUnavailable, HasState: true, State: wireState}
 		case errors.Is(readErr, replicatedstate.ErrReadBehind):
 			return &ReplicatedResponse{Kind: ReplicatedRefusal,
 				Refusal: ReplicatedRefusalReadBehind, HasState: true, State: wireState}
@@ -806,7 +830,7 @@ func (server *ReplicatedServer) executeReplicatedAuthenticated(
 		}
 	}
 	if request.Operation == ReplicatedRouteGateRead {
-		return server.readRouteGate(ctx, request, wireState)
+		return server.readRouteGate(ctx, request, wireState, readAuthorize)
 	}
 	if request.Operation == ReplicatedExecutionPinRead {
 		wireRead := request.ExecutionPinRead
@@ -819,13 +843,14 @@ func (server *ReplicatedServer) executeReplicatedAuthenticated(
 					Term: request.Fence.Term,
 				},
 				Capability: request.Capability, Pin: wireRead.Pin,
-				MinimumApplied: wireRead.MinimumApplied,
+				MinimumApplied: wireRead.MinimumApplied, Authorize: readAuthorize,
 			})
 		if readErr != nil && readLease != nil {
 			readLease.Release()
 			readLease = nil
 		}
 		if readErr == nil {
+			wireState = replicatedWireState(result.State)
 			wireState = replicatedReadState(wireState, request.Fence, result.Applied)
 			value, encodeErr := AppendReplicatedExecutionPinReadValue(nil,
 				ReplicatedExecutionPinReadValue{Found: result.Found, Record: result.Record})
@@ -853,6 +878,9 @@ func (server *ReplicatedServer) executeReplicatedAuthenticated(
 		case errors.Is(readErr, raftservice.ErrServingFence):
 			return &ReplicatedResponse{Kind: ReplicatedRefusal,
 				Refusal: ReplicatedRefusalStaleFence, HasState: true, State: wireState}
+		case errors.Is(readErr, raftservice.ErrServingAuthorization):
+			return &ReplicatedResponse{Kind: ReplicatedRefusal,
+				Refusal: ReplicatedRefusalUnavailable, HasState: true, State: wireState}
 		case errors.Is(readErr, replicatedstate.ErrReadBehind):
 			return &ReplicatedResponse{Kind: ReplicatedRefusal,
 				Refusal: ReplicatedRefusalReadBehind, HasState: true, State: wireState}
@@ -1005,6 +1033,17 @@ func (server *ReplicatedServer) executeReplicatedAuthenticated(
 			Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalUnavailable,
 			HasState: true, State: wireState,
 		}
+	}
+}
+
+func replicatedReadOperation(operation ReplicatedOperation) bool {
+	switch operation {
+	case ReplicatedReadLeader, ReplicatedReadFollower, ReplicatedReadBatchLeader,
+		ReplicatedTransactionRead, ReplicatedRequestLedgerRead,
+		ReplicatedExecutionPinRead, ReplicatedRouteGateRead:
+		return true
+	default:
+		return false
 	}
 }
 

@@ -301,6 +301,21 @@ func TestOwnerReadOutcomeSettlesExactFixedContextAndCancellationCleansUp(t *test
 	}
 }
 
+func TestReadIngressLaneDoesNotClassifyControlAsRead(t *testing.T) {
+	for _, kind := range []requestKind{requestReadLinear, requestReadFollower, requestReadTransaction,
+		requestReadRequestLedger, requestReadExecutionPin, requestReadRouteGate} {
+		if !readIngressCandidate(ownerRequest{kind: kind}) {
+			t.Fatalf("read kind %d was not classified", kind)
+		}
+	}
+	for _, kind := range []requestKind{requestProposal, requestInbound, requestStatus, requestMembership,
+		requestSchemaTransition, requestReplicaRetirement} {
+		if readIngressCandidate(ownerRequest{kind: kind}) {
+			t.Fatalf("control kind %d entered read lane", kind)
+		}
+	}
+}
+
 type ownerTestReadSource struct {
 	result      replicatedstate.PointReadResult
 	batchResult replicatedstate.PointReadBatchResult

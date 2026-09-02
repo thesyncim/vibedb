@@ -138,7 +138,7 @@ func TestReplicatedServerServesRequestLedgerThroughDedicatedOwnerRead(t *testing
 	response := testReplicatedServer(owner).executeReplicated(t.Context(), request)
 	if response.Kind != ReplicatedRequestLedgerReadResult || response.ReadApplied != 12 ||
 		response.State.Fence != request.Fence || response.State.Applied != 12 ||
-		response.State.Commit != 12 || owner.probeCalls.Load() != 1 ||
+		response.State.Commit != 12 || owner.probeCalls.Load() != 0 ||
 		!validReplicatedResponse(response) {
 		t.Fatalf("response = %+v", response)
 	}

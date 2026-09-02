@@ -80,7 +80,12 @@ func (owner *fakeBatchReadOwner) ReadPointBatch(
 	request raftservice.PointReadBatchRequest,
 ) (raftservice.PointReadBatchResult, raftservice.PointReadLease, error) {
 	owner.request = request
-	return owner.result, owner.lease, owner.err
+	result := owner.result
+	result.State = owner.state
+	if request.Authorize != nil && !request.Authorize(owner.state) {
+		return result, owner.lease, raftservice.ErrServingAuthorization
+	}
+	return result, owner.lease, owner.err
 }
 
 func (owner *fakeReplicatedOwner) ApplyMembership(
@@ -116,6 +121,41 @@ func TestReplicatedServerLiveServingAuthorityGatesEveryRequest(t *testing.T) {
 	active = false
 	if response := server.executeReplicated(t.Context(), request); response.Kind != ReplicatedRefusal || response.Refusal != ReplicatedRefusalUnavailable {
 		t.Fatalf("revoked response = %+v", response)
+	}
+}
+
+func TestReplicatedServerFusesReadProbeAndDynamicServingAuthorization(t *testing.T) {
+	state := testReplicatedServingState()
+	owner := &fakeReplicatedOwner{state: state, readResult: raftservice.PointReadResult{
+		Applied: state.Status.Applied, Found: true, Value: []byte("value"),
+	}}
+	server := testReplicatedServer(owner)
+	allowed := true
+	var authorityCalls atomic.Uint64
+	if err := server.BindServingAuthority(func(candidate raftservice.ServingState) bool {
+		authorityCalls.Add(1)
+		return allowed && candidate == state
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request := &ReplicatedRequest{
+		Operation: ReplicatedReadLeader, Fence: replicatedWireState(state).Fence,
+		Relation: 1, Key: []byte("key"), MinimumApplied: state.Status.Applied,
+		MaxValueBytes: 1024,
+	}
+	response := server.executeReplicated(t.Context(), request)
+	if response.Kind != ReplicatedReadFound || !validReplicatedResponse(response) ||
+		owner.probeCalls.Load() != 0 || authorityCalls.Load() != 1 {
+		t.Fatalf("allowed response=%+v probes=%d authority=%d",
+			response, owner.probeCalls.Load(), authorityCalls.Load())
+	}
+
+	allowed = false
+	response = server.executeReplicated(t.Context(), request)
+	if response.Kind != ReplicatedRefusal || response.Refusal != ReplicatedRefusalUnavailable ||
+		!response.HasState || owner.probeCalls.Load() != 1 || authorityCalls.Load() != 2 {
+		t.Fatalf("revoked response=%+v probes=%d authority=%d",
+			response, owner.probeCalls.Load(), authorityCalls.Load())
 	}
 }
 
@@ -182,8 +222,8 @@ func (owner *fakeReplicatedOwner) SubmitOwned(
 }
 
 func (owner *fakeReplicatedOwner) ReadPoint(
-	context.Context,
-	raftservice.PointReadRequest,
+	_ context.Context,
+	request raftservice.PointReadRequest,
 ) (raftservice.PointReadResult, raftservice.PointReadLease, error) {
 	if owner.readCalled != nil {
 		select {
@@ -192,7 +232,12 @@ func (owner *fakeReplicatedOwner) ReadPoint(
 			close(owner.readCalled)
 		}
 	}
-	return owner.readResult, owner.readLease, owner.readErr
+	result := owner.readResult
+	result.State = owner.state
+	if request.Authorize != nil && !request.Authorize(owner.state) {
+		return result, owner.readLease, raftservice.ErrServingAuthorization
+	}
+	return result, owner.readLease, owner.readErr
 }
 
 func (owner *fakeReplicatedOwner) ReadTransaction(
@@ -207,7 +252,12 @@ func (owner *fakeReplicatedOwner) ReadTransaction(
 			close(owner.transactionCalled)
 		}
 	}
-	return owner.transactionResult, owner.transactionLease, owner.transactionErr
+	result := owner.transactionResult
+	result.State = owner.state
+	if request.Authorize != nil && !request.Authorize(owner.state) {
+		return result, owner.transactionLease, raftservice.ErrServingAuthorization
+	}
+	return result, owner.transactionLease, owner.transactionErr
 }
 
 func (owner *fakeReplicatedOwner) ReadRequestLedger(
@@ -215,7 +265,12 @@ func (owner *fakeReplicatedOwner) ReadRequestLedger(
 	request raftservice.RequestLedgerReadRequest,
 ) (raftservice.RequestLedgerReadResult, raftservice.RequestLedgerReadLease, error) {
 	owner.requestLedgerRequest = request
-	return owner.requestLedgerResult, owner.requestLedgerLease, owner.requestLedgerErr
+	result := owner.requestLedgerResult
+	result.State = owner.state
+	if request.Authorize != nil && !request.Authorize(owner.state) {
+		return result, owner.requestLedgerLease, raftservice.ErrServingAuthorization
+	}
+	return result, owner.requestLedgerLease, owner.requestLedgerErr
 }
 
 func (owner *fakeReplicatedOwner) ReadExecutionPin(
@@ -223,7 +278,12 @@ func (owner *fakeReplicatedOwner) ReadExecutionPin(
 	request raftservice.ExecutionPinReadRequest,
 ) (raftservice.ExecutionPinReadResult, raftservice.ExecutionPinReadLease, error) {
 	owner.executionPinRequest = request
-	return owner.executionPinResult, owner.executionPinLease, owner.executionPinErr
+	result := owner.executionPinResult
+	result.State = owner.state
+	if request.Authorize != nil && !request.Authorize(owner.state) {
+		return result, owner.executionPinLease, raftservice.ErrServingAuthorization
+	}
+	return result, owner.executionPinLease, owner.executionPinErr
 }
 
 type testPointReadLease struct{ released atomic.Bool }
@@ -255,13 +315,13 @@ func TestReplicatedServerServesFoundEmptyReadWithoutConflatingMiss(t *testing.T)
 	if response.Kind != ReplicatedReadFound || response.ReadApplied != 12 ||
 		len(response.Value) != 0 || !validReplicatedResponse(response) ||
 		response.State.Fence != request.Fence || response.State.Applied != 12 ||
-		response.State.Commit != 12 || owner.probeCalls.Load() != 1 {
+		response.State.Commit != 12 || owner.probeCalls.Load() != 0 {
 		t.Fatalf("response=%+v", response)
 	}
 	owner.readResult.Found = false
 	response = server.executeReplicated(context.Background(), request)
 	if response.Kind != ReplicatedReadMissing || response.ReadApplied != 12 ||
-		!validReplicatedResponse(response) || owner.probeCalls.Load() != 2 {
+		!validReplicatedResponse(response) || owner.probeCalls.Load() != 0 {
 		t.Fatalf("miss response=%+v", response)
 	}
 }
@@ -292,7 +352,7 @@ func TestReplicatedServerSuccessfulBatchReadUsesAcceptedFenceWithoutRefresh(t *t
 	response := testReplicatedServer(owner).executeReplicated(t.Context(), request)
 	if response.Kind != ReplicatedReadBatchResult || response.ReadApplied != 12 ||
 		response.State.Fence != request.Fence || response.State.Applied != 12 ||
-		response.State.Commit != 12 || owner.probeCalls.Load() != 1 ||
+		response.State.Commit != 12 || owner.probeCalls.Load() != 0 ||
 		!validReplicatedResponse(response) {
 		t.Fatalf("response=%+v probes=%d", response, owner.probeCalls.Load())
 	}
@@ -316,7 +376,7 @@ func TestReplicatedServerSuccessfulExecutionPinReadUsesAcceptedFenceWithoutRefre
 	response := testReplicatedServer(owner).executeReplicated(t.Context(), request)
 	if response.Kind != ReplicatedExecutionPinReadResult || response.ReadApplied != 12 ||
 		response.State.Fence != request.Fence || response.State.Applied != 12 ||
-		response.State.Commit != 12 || owner.probeCalls.Load() != 1 ||
+		response.State.Commit != 12 || owner.probeCalls.Load() != 0 ||
 		!validReplicatedResponse(response) {
 		t.Fatalf("response=%+v probes=%d", response, owner.probeCalls.Load())
 	}
@@ -340,7 +400,7 @@ func TestReplicatedServerPreservesTypedPointReadBounds(t *testing.T) {
 			response := server.executeReplicated(context.Background(), request)
 			if response.Kind != ReplicatedRefusal || response.Refusal != test.refusal ||
 				!response.HasState || response.State.Applied != state.Status.Applied ||
-				!validReplicatedResponse(response) || owner.probeCalls.Load() != 2 {
+				!validReplicatedResponse(response) || owner.probeCalls.Load() != 1 {
 				t.Fatalf("response=%+v", response)
 			}
 		})

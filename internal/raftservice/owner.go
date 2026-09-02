@@ -214,6 +214,7 @@ type readRequest struct {
 	fence          ServingFence
 	minimumApplied uint64
 	delivery       *readDelivery
+	authorize      ProposalAuthorization
 }
 
 type readAuthorization struct {
@@ -224,11 +225,13 @@ type readAuthorization struct {
 	routeGate      RouteGateSource
 	minimumApplied uint64
 	generation     *ownerGeneration
+	state          ServingState
 }
 
 type readDelivery struct {
 	state          atomic.Uint32
 	reply          chan ownerReply
+	serving        ServingState
 	source         ReadSource
 	recovery       TransactionRecoverySource
 	requestLedger  RequestLedgerSource
@@ -359,6 +362,7 @@ type PointReadRequest struct {
 	MinimumApplied uint64
 	MaxValueBytes  int
 	Linearizable   bool
+	Authorize      ProposalAuthorization
 }
 
 // PointReadResult owns Value. Found=true with an empty Value is distinct from
@@ -367,6 +371,7 @@ type PointReadResult struct {
 	Applied uint64
 	Found   bool
 	Value   []byte
+	State   ServingState
 }
 
 // PointReadBatchRequest selects one leader ReadIndex for a packed positional
@@ -377,11 +382,13 @@ type PointReadBatchRequest struct {
 	Packed         []byte
 	MinimumApplied uint64
 	MaxResultBytes int
+	Authorize      ProposalAuthorization
 }
 
 type PointReadBatchResult struct {
 	Applied uint64
 	Data    []byte
+	State   ServingState
 }
 
 // PointReadLease holds the conservative response-memory reservation until the
@@ -429,6 +436,7 @@ type TransactionReadRequest struct {
 	Fence      ServingFence
 	Capability serviceauthz.Capability
 	Read       replicatedstate.TransactionRecoveryReadRequest
+	Authorize  ProposalAuthorization
 }
 
 // TransactionReadResult owns Records and every record payload. Applied is the
@@ -437,6 +445,7 @@ type TransactionReadResult struct {
 	Applied  uint64
 	Complete bool
 	Records  []replicatedstate.TransactionRecoveryRecord
+	State    ServingState
 }
 
 // TransactionReadLease holds the conservative response and scratch-memory
@@ -452,6 +461,7 @@ type RequestLedgerReadRequest struct {
 	Fence      ServingFence
 	Capability serviceauthz.Capability
 	Read       replicatedstate.RequestLedgerReadRequest
+	Authorize  ProposalAuthorization
 }
 
 type RequestLedgerReadResult struct {
@@ -459,6 +469,7 @@ type RequestLedgerReadResult struct {
 	Found             bool
 	AuthoritativeKind replicatedstate.RequestLedgerReadKind
 	Value             []byte
+	State             ServingState
 }
 
 type RequestLedgerReadLease interface {
@@ -470,12 +481,14 @@ type ExecutionPinReadRequest struct {
 	Capability     serviceauthz.Capability
 	Pin            executionpin.PinID
 	MinimumApplied uint64
+	Authorize      ProposalAuthorization
 }
 
 type ExecutionPinReadResult struct {
 	Applied uint64
 	Found   bool
 	Record  executionpin.Record
+	State   ServingState
 }
 
 type ExecutionPinReadLease interface {
@@ -951,6 +964,16 @@ func proposalIngressCandidate(request ownerRequest) bool {
 		len(request.data) < int(raftmodel.MaxProposalBatchBytes)
 }
 
+func readIngressCandidate(request ownerRequest) bool {
+	switch request.kind {
+	case requestReadLinear, requestReadFollower, requestReadTransaction,
+		requestReadRequestLedger, requestReadExecutionPin, requestReadRouteGate:
+		return true
+	default:
+		return false
+	}
+}
+
 func (collector *proposalIngressCollector) accepts(request ownerRequest) bool {
 	return collector.active() && proposalIngressCandidate(request) &&
 		request.group == collector.group &&
@@ -1191,10 +1214,12 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 						return owner.stop(err)
 					}
 				}
-			case collector.active() && request.kind == requestInbound:
-				// The acknowledgement may complete the preceding closed-loop wave.
-				// Admit it immediately and let the next owner turn drive Host while
-				// the successor proposal cohort remains bounded in this collector.
+			case collector.active() && (request.kind == requestInbound || readIngressCandidate(request)):
+				// Peer progress and reads are independent lanes. A read cannot require
+				// an overlapping, not-yet-admitted proposal to precede it; a proposal
+				// completed before the read began is already covered by ReadIndex and
+				// the applied-publication barrier. Preserve the successor write cohort
+				// instead of fragmenting it into singleton durability waves.
 				if err := handleRequest(request); err != nil {
 					return owner.stop(err)
 				}
@@ -1476,6 +1501,11 @@ func (owner *Owner) handle(request ownerRequest) error {
 			reply.err = &NotLeaderError{Status: status}
 			break
 		}
+		serving := ServingState{Identity: member.identity, Command: member.command, Status: status}
+		if request.read.authorize != nil && !request.read.authorize(serving) {
+			reply.err = ErrServingAuthorization
+			break
+		}
 		if request.kind == requestReadFollower {
 			if status.Applied < request.read.minimumApplied {
 				reply.err = replicatedstate.ErrReadBehind
@@ -1486,20 +1516,12 @@ func (owner *Owner) handle(request ownerRequest) error {
 				break
 			}
 			reply.read = readAuthorization{source: member.read,
-				minimumApplied: request.read.minimumApplied, generation: member.generation}
+				minimumApplied: request.read.minimumApplied, generation: member.generation,
+				state: serving}
 			break
 		}
 		if status.LeaderID != member.identity.MemberID {
 			reply.err = &NotLeaderError{Status: status}
-			break
-		}
-		context, contextErr := owner.nextReadContext(member.identity.NodeIncarnation)
-		if contextErr != nil {
-			reply.err = contextErr
-			break
-		}
-		if err := owner.host.ReadIndex(request.group, context[:]); err != nil {
-			reply.err = err
 			break
 		}
 		request.read.delivery.source = member.read
@@ -1509,6 +1531,16 @@ func (owner *Owner) handle(request ownerRequest) error {
 		request.read.delivery.routeGate, _ = member.recovery.(RouteGateSource)
 		request.read.delivery.minimumApplied = request.read.minimumApplied
 		request.read.delivery.generation = member.generation
+		request.read.delivery.serving = serving
+		context, contextErr := owner.nextReadContext(member.identity.NodeIncarnation)
+		if contextErr != nil {
+			reply.err = contextErr
+			break
+		}
+		if err := owner.host.ReadIndex(request.group, context[:]); err != nil {
+			reply.err = err
+			break
+		}
 		owner.pendingReads[context] = request.read.delivery
 		// The reply is settled only by the matching quorum barrier.
 		return nil
@@ -1855,6 +1887,7 @@ func (owner *Owner) finishReadOutcomes(outcomes []raftmodel.ReadOutcome) {
 			reply.read.generation = delivery.generation
 			reply.read.executionPin = delivery.executionPin
 			reply.read.routeGate = delivery.routeGate
+			reply.read.state = delivery.serving
 		}
 		owner.settleReadDelivery(delivery, reply)
 	}
@@ -2309,7 +2342,7 @@ func (owner *Owner) ReadPoint(
 			kind: kind, group: request.Fence.Group, reply: delivery.reply,
 			bytes: int64(cap(key)), read: readRequest{
 				fence: request.Fence, minimumApplied: request.MinimumApplied,
-				delivery: delivery,
+				delivery: delivery, authorize: request.Authorize,
 			},
 		}
 		reply, err = owner.enqueueRead(ctx, ownerRequest, delivery)
@@ -2318,6 +2351,7 @@ func (owner *Owner) ReadPoint(
 			kind: kind, group: request.Fence.Group, reply: make(chan ownerReply, 1),
 			bytes: int64(cap(key)), read: readRequest{
 				fence: request.Fence, minimumApplied: request.MinimumApplied,
+				authorize: request.Authorize,
 			},
 		})
 	}
@@ -2337,7 +2371,7 @@ func (owner *Owner) ReadPoint(
 		return PointReadResult{}, nil, ErrServingFence
 	}
 	releaseReservation = false
-	return PointReadResult{Applied: value.Fence.Applied, Found: value.Found, Value: value.Value},
+	return PointReadResult{Applied: value.Fence.Applied, Found: value.Found, Value: value.Value, State: reply.read.state},
 		&pointReadLease{owner: owner, bytes: responseCharge}, nil
 }
 
@@ -2373,7 +2407,7 @@ func (owner *Owner) ReadPointBatch(
 		kind: requestReadLinear, group: request.Fence.Group, reply: delivery.reply,
 		bytes: int64(cap(owned)), read: readRequest{
 			fence: request.Fence, minimumApplied: request.MinimumApplied,
-			delivery: delivery,
+			delivery: delivery, authorize: request.Authorize,
 		},
 	}, delivery)
 	if err != nil {
@@ -2399,7 +2433,7 @@ func (owner *Owner) ReadPointBatch(
 		return PointReadBatchResult{}, nil, ErrServingFence
 	}
 	releaseReservation = false
-	return PointReadBatchResult{Applied: value.Fence.Applied, Data: value.Data},
+	return PointReadBatchResult{Applied: value.Fence.Applied, Data: value.Data, State: reply.read.state},
 		&pointReadLease{owner: owner, bytes: responseCharge}, nil
 }
 
@@ -2435,7 +2469,7 @@ func (owner *Owner) ReadTransaction(
 		kind: requestReadTransaction, group: request.Fence.Group, reply: delivery.reply,
 		read: readRequest{
 			fence: request.Fence, minimumApplied: request.Read.MinimumApplied,
-			delivery: delivery,
+			delivery: delivery, authorize: request.Authorize,
 		},
 	}, delivery)
 	if err != nil {
@@ -2469,6 +2503,7 @@ func (owner *Owner) ReadTransaction(
 	releaseReservation = false
 	return TransactionReadResult{
 		Applied: value.Fence.Applied, Complete: value.Complete, Records: value.Records,
+		State: reply.read.state,
 	}, &pointReadLease{owner: owner, bytes: responseCharge}, nil
 }
 
@@ -2507,7 +2542,7 @@ func (owner *Owner) ReadRequestLedger(
 		kind: requestReadRequestLedger, group: request.Fence.Group, reply: delivery.reply,
 		read: readRequest{
 			fence: request.Fence, minimumApplied: request.Read.MinimumApplied,
-			delivery: delivery,
+			delivery: delivery, authorize: request.Authorize,
 		},
 	}, delivery)
 	if err != nil {
@@ -2528,7 +2563,7 @@ func (owner *Owner) ReadRequestLedger(
 	releaseReservation = false
 	return RequestLedgerReadResult{
 		Applied: value.Fence.Applied, Found: value.Found,
-		AuthoritativeKind: value.AuthoritativeKind, Value: value.Value,
+		AuthoritativeKind: value.AuthoritativeKind, Value: value.Value, State: reply.read.state,
 	}, &pointReadLease{owner: owner, bytes: responseCharge}, nil
 }
 
@@ -2564,6 +2599,7 @@ func (owner *Owner) ReadExecutionPin(
 		kind: requestReadExecutionPin, group: request.Fence.Group, reply: delivery.reply,
 		read: readRequest{
 			fence: request.Fence, minimumApplied: request.MinimumApplied, delivery: delivery,
+			authorize: request.Authorize,
 		},
 	}, delivery)
 	if err != nil {
@@ -2581,7 +2617,7 @@ func (owner *Owner) ReadExecutionPin(
 	}
 	releaseReservation = false
 	return ExecutionPinReadResult{
-		Applied: value.Fence.Applied, Found: value.Found, Record: value.Record,
+		Applied: value.Fence.Applied, Found: value.Found, Record: value.Record, State: reply.read.state,
 	}, &pointReadLease{owner: owner, bytes: responseCharge}, nil
 }
 
