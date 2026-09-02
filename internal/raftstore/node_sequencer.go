@@ -28,6 +28,7 @@ const (
 	submissionBeginIncarnations
 	submissionPersistIncarnations
 	submissionRegisterGroup
+	submissionDescriptorCatalog
 )
 
 // Submission is caller-owned storage for one immutable group Ready and its
@@ -41,6 +42,7 @@ type Submission struct {
 	groups       [MaxPersistGroupBatches]uint64
 	incarnations [MaxPersistGroupBatches]GroupIncarnation
 	descriptor   GroupDescriptor
+	catalog      descriptorCatalogCandidate
 	state        atomic.Uint32
 	ticket       atomic.Uint64
 	err          error
@@ -67,14 +69,14 @@ func (s *Submission) Prepare(ready NodeReady) error {
 	if state := s.state.Load(); state == submissionQueued || state == submissionWaiting {
 		return ErrSubmissionPending
 	}
-	s.Ready, s.err, s.kind, s.count = ready, nil, submissionReady, 0
+	s.Ready, s.err, s.kind, s.count, s.catalog = ready, nil, submissionReady, 0, descriptorCatalogCandidate{}
 	s.ticket.Store(0)
 	s.state.Store(submissionIdle)
 	return nil
 }
 
 func (s *Submission) invalidatePrepare() {
-	s.Ready, s.err, s.kind, s.count = NodeReady{}, nil, 0, 0
+	s.Ready, s.err, s.kind, s.count, s.catalog = NodeReady{}, nil, 0, 0, descriptorCatalogCandidate{}
 	s.ticket.Store(0)
 	s.state.Store(submissionUnprepared)
 }
@@ -90,7 +92,7 @@ func (s *Submission) prepareControl(kind submissionKind, count int) error {
 		s.invalidatePrepare()
 		return ErrInvalid
 	}
-	s.Ready, s.err, s.kind, s.count = NodeReady{}, nil, kind, uint8(count)
+	s.Ready, s.err, s.kind, s.count, s.catalog = NodeReady{}, nil, kind, uint8(count), descriptorCatalogCandidate{}
 	s.ticket.Store(0)
 	s.state.Store(submissionIdle)
 	return nil
@@ -148,6 +150,18 @@ func (s *Submission) PrepareRegisterGroup(descriptor GroupDescriptor) error {
 		return ErrInvalid
 	}
 	s.descriptor = descriptor
+	return nil
+}
+
+func (s *Submission) prepareDescriptorCatalog(candidate descriptorCatalogCandidate) error {
+	if err := s.prepareControl(submissionDescriptorCatalog, 1); err != nil {
+		return err
+	}
+	if candidate.id == ([16]byte{}) || candidate.through == 0 {
+		s.invalidatePrepare()
+		return ErrInvalid
+	}
+	s.catalog = candidate
 	return nil
 }
 
@@ -392,6 +406,8 @@ func (q *NodeSubmissionSequencer) runWave(items *[MaxPersistGroupBatches]*Submis
 				s.descriptor = d
 			}
 			return registerErr
+		case submissionDescriptorCatalog:
+			return q.store.publishDescriptorCatalogReferenceLocked(s.catalog, true)
 		default:
 			return ErrInvalid
 		}

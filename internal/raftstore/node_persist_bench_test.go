@@ -2,12 +2,62 @@ package raftstore
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	pb "go.etcd.io/raft/v3/raftpb"
 )
+
+func BenchmarkNodeStoreOpenDescriptorCatalog256Groups(b *testing.B) {
+	dir := filepath.Join(b.TempDir(), "node")
+	options := NodeStoreOptions{Store: testOptions(), FrameBytes: 1 << 20, Events: 4096, WaveIDs: 1024, EntriesPerGroup: 64, CachedSegments: 2, Groups: 512}
+	store, err := CreateNodeStore(dir, testNodeIdentity(), testKey(), []NodeBootstrap{{Descriptor: testGroupDescriptor(1), Snapshot: nodeSnapshot(1, 1, 1)}}, options)
+	if err != nil {
+		b.Fatal(err)
+	}
+	store.SetDataSyncForTesting(func(*os.File) error { return nil })
+	for group := uint64(2); group <= 256; group++ {
+		if _, err = store.RegisterGroup(testGroupDescriptor(group)); err != nil {
+			b.Fatal(err)
+		}
+		if group%32 == 0 {
+			if err = store.engine.Rotate(nil); err != nil {
+				b.Fatal(err)
+			}
+			if err = store.engine.WaitSeal(); err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+	if err = store.CheckpointDescriptorCatalog(); err != nil {
+		b.Fatal(err)
+	}
+	if err = store.engine.Rotate(nil); err != nil {
+		b.Fatal(err)
+	}
+	if err = store.engine.WaitSeal(); err != nil {
+		b.Fatal(err)
+	}
+	if err = store.ReclaimDeadNodeLogPrefix(); err != nil {
+		b.Fatal(err)
+	}
+	if err = store.Close(); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		store, err = OpenNodeStore(dir, testNodeIdentity(), testKey(), options)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if err = store.Close(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
 
 // BenchmarkNodeStorePersistDurability measures the canonical node-wide log
 // with its real platform durability primitive. Setup, incarnation allocation,
