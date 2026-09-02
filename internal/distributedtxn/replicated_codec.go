@@ -34,6 +34,13 @@ const (
 	MaxReplicatedCommandBytes = replicatedCommandHeaderBytes +
 		MaxIntentScopes*8 + ReplicatedManifestCoordinatorRecordBytes +
 		MaxManifestSegmentSequenceBytes + replicatedCommandChecksumBytes
+	// MaxSingleParticipantControlBytes is the exact maximum control body for
+	// the one-proposal single-group apply lane: fixed header, the complete
+	// bounded scope set, no copied mutation payload, and the checksum. Callers
+	// can reserve this small buffer once instead of provisioning the manifest
+	// coordinator's nearly-1-MiB command bound.
+	MaxSingleParticipantControlBytes = replicatedCommandHeaderBytes +
+		MaxIntentScopes*8 + replicatedCommandChecksumBytes
 	// MaxRecoveryPulses bounds both replicated work and journal retention for
 	// one abandoned coordinator. The shipped protocol uses this exact limit.
 	MaxRecoveryPulses = uint8(3)

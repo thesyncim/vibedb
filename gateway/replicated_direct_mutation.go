@@ -10,11 +10,12 @@ import (
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
+	"github.com/thesyncim/vibejson/x/byteview"
 )
 
-var directMutationIdentityDomain = []byte("vibedb/direct-mutation/request\x00")
-var directMutationAuthorityDomain = []byte("vibedb/direct-mutation/authority\x00")
-var directMutationFingerprintDomain = []byte("vibedb/direct-mutation/fingerprint\x00")
+const directMutationIdentityDomain = "vibedb/direct-mutation/request\x00"
+const directMutationAuthorityDomain = "vibedb/direct-mutation/authority\x00"
+const directMutationFingerprintDomain = "vibedb/direct-mutation/fingerprint\x00"
 
 // ReplicatedDirectMutation is the single-group write contract. The caller has
 // already routed and lowered its complete logical operation to canonical native
@@ -41,6 +42,14 @@ type ReplicatedDirectMutationResult struct {
 	ResultCode   uint32
 	Retries      int
 	Duplicate    bool
+}
+
+// directMutationEncodeWorkspace owns every bounded temporary needed to build
+// one direct command. It is deliberately caller-owned and not concurrency-safe:
+// request lanes reserve one workspace before entering the hot path.
+type directMutationEncodeWorkspace struct {
+	control  [distributedtxn.MaxSingleParticipantControlBytes]byte
+	digester replication.TransactionMutationDigester
 }
 
 // DirectMutate applies and deduplicates one complete single-group mutation in
@@ -91,6 +100,17 @@ func appendReplicatedDirectMutationCommand(
 	dst []byte,
 	request ReplicatedDirectMutation,
 ) ([]byte, distributedtxn.ReplicatedCommand, error) {
+	return appendReplicatedDirectMutationCommandPrepared(dst, nil, request)
+}
+
+// appendReplicatedDirectMutationCommandPrepared encodes one direct mutation
+// using caller-owned output and fixed control storage. A warmed workspace and
+// enough capacity in dst make the successful path allocation-free.
+func appendReplicatedDirectMutationCommandPrepared(
+	dst []byte,
+	workspace *directMutationEncodeWorkspace,
+	request ReplicatedDirectMutation,
+) ([]byte, distributedtxn.ReplicatedCommand, error) {
 	participant := request.Participant
 	if !request.Key.Valid() || request.Key.IssuerEpoch == 0 ||
 		request.Key.IssuerSequence == 0 || request.Key.IssuerLane == (requestledger.IssuerLane{}) ||
@@ -110,7 +130,12 @@ func appendReplicatedDirectMutationCommand(
 	if err != nil {
 		return dst, distributedtxn.ReplicatedCommand{}, errors.Join(err, ErrReplicatedTransaction)
 	}
-	mutationDigest, err := replication.TransactionMutationDigest(participant.Batches)
+	var mutationDigest distributedtxn.Digest
+	if workspace == nil {
+		mutationDigest, err = replication.TransactionMutationDigest(participant.Batches)
+	} else {
+		mutationDigest, err = workspace.digester.Digest(participant.Batches)
+	}
 	if err != nil {
 		return dst, distributedtxn.ReplicatedCommand{}, errors.Join(err, ErrReplicatedTransaction)
 	}
@@ -130,18 +155,18 @@ func appendReplicatedDirectMutationCommand(
 			MutationDigest: mutationDigest,
 		},
 	}
-	controlBytes, err := distributedtxn.AppendReplicatedCommand(nil, control)
+	var controlDst []byte
+	if workspace != nil {
+		controlDst = workspace.control[:0]
+	}
+	controlBytes, err := distributedtxn.AppendReplicatedCommand(controlDst, control)
 	if err != nil {
 		return dst, distributedtxn.ReplicatedCommand{}, fmt.Errorf("gateway: encode direct control: %w", errors.Join(err, ErrReplicatedTransaction))
-	}
-	sequence, err := replication.TransactionClientSequence(controlBytes)
-	if err != nil {
-		return dst, distributedtxn.ReplicatedCommand{}, errors.Join(err, ErrReplicatedTransaction)
 	}
 	outer := replicatedTransactionCommandHeader(
 		participant.Route, request.Tenant,
 		durableRequestRetryHome(replication.Digest(keyDigest), id),
-		replication.ID128(id), uint64(control.Role), sequence,
+		replication.ID128(id), uint64(control.Role), request.Key.IssuerSequence,
 	)
 	outer.Kind = replication.CommandTransaction
 	outer.AuthorityClass = replication.CommandAuthorityMembershipStableData
@@ -156,24 +181,22 @@ func appendReplicatedDirectMutationCommand(
 }
 
 func directMutationTransactionID(key requestledger.Digest) distributedtxn.ID {
-	hash := sha256.New()
-	_, _ = hash.Write(directMutationIdentityDomain)
-	_, _ = hash.Write(key[:])
-	sum := hash.Sum(nil)
+	var framed [len(directMutationIdentityDomain) + sha256.Size]byte
+	at := copy(framed[:], directMutationIdentityDomain)
+	copy(framed[at:], key[:])
+	sum := sha256.Sum256(framed[:])
 	var id distributedtxn.ID
-	copy(id[:], sum)
+	copy(id[:], sum[:])
 	return id
 }
 
 func directMutationAuthorityDigest(
 	lane requestledger.Digest,
 ) distributedtxn.Digest {
-	hash := sha256.New()
-	_, _ = hash.Write(directMutationAuthorityDomain)
-	_, _ = hash.Write(lane[:])
-	var digest distributedtxn.Digest
-	hash.Sum(digest[:0])
-	return digest
+	var framed [len(directMutationAuthorityDomain) + sha256.Size]byte
+	at := copy(framed[:], directMutationAuthorityDomain)
+	copy(framed[at:], lane[:])
+	return distributedtxn.Digest(sha256.Sum256(framed[:]))
 }
 
 func directMutationFingerprint(
@@ -182,7 +205,7 @@ func directMutationFingerprint(
 	control []byte,
 ) replication.Digest {
 	hash := sha256.New()
-	_, _ = hash.Write(directMutationFingerprintDomain)
+	_, _ = hash.Write(byteview.Bytes(directMutationFingerprintDomain))
 	_, _ = hash.Write(key[:])
 	_, _ = hash.Write(request[:])
 	_, _ = hash.Write(control)
