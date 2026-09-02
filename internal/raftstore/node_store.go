@@ -90,6 +90,7 @@ type NodeStore struct {
 	nextLogKey                                uint64
 	key                                       Key
 	options                                   normalizedOptions
+	bounds                                    nodeStoreBounds
 	engine                                    *seglog.Engine
 	lock                                      *os.File
 	pinnedDir, metaFile                       *os.File
@@ -163,11 +164,23 @@ func defaultNodeOptions(options NodeStoreOptions) (NodeStoreOptions, normalizedO
 	if options.Groups == 0 {
 		options.Groups = 4096
 	}
-	if options.FrameBytes < 72 || options.Events < 1 || options.WaveIDs < 1 || options.EntriesPerGroup < 1 || options.EntriesPerGroup > MaxReadyEntries ||
-		options.CachedSegments < 0 || options.Groups < 1 || uint64(options.Groups) > math.MaxUint32 {
+	if options.FrameBytes < 72 || uint64(options.FrameBytes) > AbsoluteMaxRecordBytes ||
+		options.Events < 1 || uint64(options.Events) > AbsoluteMaxEntries ||
+		options.WaveIDs < 1 || uint64(options.WaveIDs) > AbsoluteMaxRecords ||
+		options.EntriesPerGroup < 1 || options.EntriesPerGroup > MaxReadyEntries ||
+		options.CachedSegments < 0 || uint64(options.CachedSegments) > math.MaxUint32 ||
+		options.Groups < 1 || uint64(options.Groups) > math.MaxUint32 {
 		return options, normalizedOptions{}, ErrBounds
 	}
 	return options, normalized, nil
+}
+
+func nodeBoundsFromOptions(options NodeStoreOptions, normalized normalizedOptions) nodeStoreBounds {
+	return nodeStoreBounds{
+		store: boundsFromOptions(normalized), frameBytes: uint64(options.FrameBytes), events: uint64(options.Events),
+		waveIDs: uint64(options.WaveIDs), entriesPerGroup: uint64(options.EntriesPerGroup),
+		cachedSegments: uint64(options.CachedSegments), groups: uint64(options.Groups),
+	}
 }
 
 func CreateNodeStore(dir string, identity NodeIdentity, key Key, bootstraps []NodeBootstrap, options NodeStoreOptions) (*NodeStore, error) {
@@ -224,7 +237,8 @@ func CreateNodeStore(dir string, identity NodeIdentity, key Key, bootstraps []No
 	copy(storedDescriptors, descriptors)
 	storedOrder := make([]uint32, len(order), options.Groups)
 	copy(storedOrder, order)
-	store := &NodeStore{dir: dir, identity: identity, descriptors: storedDescriptors, descriptorOrder: storedOrder, nextLogKey: uint64(len(descriptors)) + 1, key: key, options: normalized, engine: engine, lock: lock, crypto: cryptoState, cryptoWork: newObjectCryptoWorkspace(cryptoState.dataKey, cryptoState.nonceKey)}
+	bounds := nodeBoundsFromOptions(options, normalized)
+	store := &NodeStore{dir: dir, identity: identity, descriptors: storedDescriptors, descriptorOrder: storedOrder, nextLogKey: uint64(len(descriptors)) + 1, key: key, options: normalized, bounds: bounds, engine: engine, lock: lock, crypto: cryptoState, cryptoWork: newObjectCryptoWorkspace(cryptoState.dataKey, cryptoState.nonceKey)}
 	if err = store.reserve(options, bootstraps); err != nil {
 		_ = store.Close()
 		return nil, err
@@ -233,7 +247,7 @@ func CreateNodeStore(dir string, identity NodeIdentity, key Key, bootstraps []No
 		_ = store.Close()
 		return nil, err
 	}
-	if err = writeNodeMeta(dir, identity, key, engine.LogID(), boundsFromOptions(normalized), cryptoState); err != nil {
+	if err = writeNodeMeta(dir, identity, key, engine.LogID(), bounds, cryptoState); err != nil {
 		_ = store.Close()
 		return nil, err
 	}
@@ -277,7 +291,8 @@ func OpenNodeStore(dir string, expected NodeIdentity, key Key, options NodeStore
 	if err != nil {
 		return fail(nil, err)
 	}
-	identity, logID, err := openNodeMeta(meta, expected, key, normalized)
+	bounds := nodeBoundsFromOptions(options, normalized)
+	identity, logID, err := openNodeMeta(meta, expected, key, bounds)
 	if err != nil {
 		return fail(nil, err)
 	}
@@ -293,7 +308,7 @@ func OpenNodeStore(dir string, expected NodeIdentity, key Key, options NodeStore
 	if engine.LogID() != logID {
 		return fail(engine, ErrIdentityMismatch)
 	}
-	store := &NodeStore{dir: dir, identity: identity, key: key, options: normalized, engine: engine, lock: lock, crypto: cryptoState, cryptoWork: newObjectCryptoWorkspace(cryptoState.dataKey, cryptoState.nonceKey)}
+	store := &NodeStore{dir: dir, identity: identity, key: key, options: normalized, bounds: bounds, engine: engine, lock: lock, crypto: cryptoState, cryptoWork: newObjectCryptoWorkspace(cryptoState.dataKey, cryptoState.nonceKey)}
 	if err = engine.Reserve(options.FrameBytes, options.Events, options.WaveIDs); err == nil {
 		err = engine.ReserveReaders(options.CachedSegments)
 	}
@@ -344,7 +359,7 @@ func OpenNodeStore(dir string, expected NodeIdentity, key Key, options NodeStore
 	return store, nil
 }
 
-func openNodeMeta(data []byte, expected NodeIdentity, key Key, options normalizedOptions) (NodeIdentity, [16]byte, error) {
+func openNodeMeta(data []byte, expected NodeIdentity, key Key, bounds nodeStoreBounds) (NodeIdentity, [16]byte, error) {
 	var zero [16]byte
 	if len(data) < nodeMetaHeaderBytes+16 || !bytes.Equal(data[:8], nodeMetaMagic[:]) ||
 		binary.LittleEndian.Uint16(data[8:10]) != 1 || !allZero(data[14:16]) || !allZero(data[44:48]) {
@@ -371,11 +386,11 @@ func openNodeMeta(data []byte, expected NodeIdentity, key Key, options normalize
 	if err != nil {
 		return NodeIdentity{}, zero, ErrCorrupt
 	}
-	identity, bounds, err := unmarshalNodeIdentity(plain)
+	identity, storedBounds, err := unmarshalNodeIdentity(plain)
 	if err != nil {
 		return NodeIdentity{}, zero, err
 	}
-	if identity != expected || bounds != boundsFromOptions(options) {
+	if identity != expected || storedBounds != bounds {
 		return NodeIdentity{}, zero, ErrIdentityMismatch
 	}
 	return identity, logID, nil
@@ -1122,6 +1137,38 @@ func (v *GroupView) NodeIncarnation() (uint64, error) {
 	return state.NodeIncarnation, nil
 }
 
+// NodeIdentity returns the immutable physical-node identity authenticated by
+// this group view's owning node log.
+func (v *GroupView) NodeIdentity() (NodeIdentity, error) {
+	v.store.mu.Lock()
+	defer v.store.mu.Unlock()
+	if err := v.store.usable(); err != nil {
+		return NodeIdentity{}, err
+	}
+	if _, ok := v.store.descriptorForLogKey(v.group); !ok {
+		return NodeIdentity{}, ErrInvalid
+	}
+	return v.store.identity, nil
+}
+
+// CapacityProfile returns the authenticated immutable checkpoint base and the
+// exact per-group entry-index capacity sealed into NODEMETA.
+func (v *GroupView) CapacityProfile() (CapacityProfile, error) {
+	v.store.mu.Lock()
+	defer v.store.mu.Unlock()
+	if err := v.store.usable(); err != nil {
+		return CapacityProfile{}, err
+	}
+	state, ok := v.store.engine.Metadata(v.group)
+	if !ok || state.Checkpoint.Index == 0 {
+		return CapacityProfile{}, ErrCorrupt
+	}
+	return CapacityProfile{
+		Format: CapacityFormatImmutableBase, LogBaseIndex: state.Checkpoint.Index,
+		MaxEntries: v.store.bounds.entriesPerGroup,
+	}, nil
+}
+
 func (s *NodeStore) rebuildDescriptors(limit int) error {
 	metadata, ok := s.engine.Metadata(nodeDescriptorGroup)
 	if !ok || metadata.LastIndex == 0 || metadata.LastIndex > uint64(limit) || metadata.Hard.Term != 1 || metadata.Hard.Vote != 0 || metadata.Hard.Commit != metadata.LastIndex {
@@ -1472,7 +1519,7 @@ func (s *NodeStore) loadCheckpoint(group uint64, cp seglog.Checkpoint) (*pb.Snap
 	return unmarshalSnapshot(plain, descriptor.MemberID)
 }
 
-func writeNodeMeta(dir string, identity NodeIdentity, key Key, logID [16]byte, bounds formatBounds, cryptoState fileCrypto) error {
+func writeNodeMeta(dir string, identity NodeIdentity, key Key, logID [16]byte, bounds nodeStoreBounds, cryptoState fileCrypto) error {
 	plain, err := marshalNodeIdentity(identity, bounds)
 	if err != nil {
 		return err

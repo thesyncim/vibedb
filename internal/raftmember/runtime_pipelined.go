@@ -172,13 +172,21 @@ func (q *pipelinedAppendRing) push(work pipelinedAppendWork) bool {
 	return true
 }
 
-func (q *pipelinedAppendRing) pop() (pipelinedAppendWork, bool) {
+func (q *pipelinedAppendRing) front() (pipelinedAppendWork, bool) {
 	head := q.head.value.Load()
 	if head == q.tail.value.Load() {
 		return pipelinedAppendWork{}, false
 	}
+	return q.items[head%uint64(len(q.items))], true
+}
+
+func (q *pipelinedAppendRing) pop() (pipelinedAppendWork, bool) {
+	head := q.head.value.Load()
+	work, ok := q.front()
+	if !ok {
+		return pipelinedAppendWork{}, false
+	}
 	position := head % uint64(len(q.items))
-	work := q.items[position]
 	q.items[position] = pipelinedAppendWork{}
 	q.head.value.Store(head + 1)
 	return work, true
@@ -262,21 +270,31 @@ type pipelinedRuntime struct {
 	appendCommit       uint64
 	durableTerm        uint64
 	durableVote        uint64
+	nodeSubmission     bool
+	nodeWork           pipelinedAppendWork
 }
 
 func newPipelinedRuntime(runtime *Runtime) (*pipelinedRuntime, error) {
-	hard, _, err := runtime.wal.InitialState()
+	if runtime == nil || runtime.stableStore() == nil {
+		return nil, ErrRuntimeOwnership
+	}
+	hard, _, err := runtime.stableStore().InitialState()
 	if err != nil {
 		return nil, err
 	}
 	commit := max(hard.GetCommit(), runtime.node.PublishedApplied())
 	p := &pipelinedRuntime{
-		runtime: runtime, workerWake: make(chan struct{}, 1),
-		resultSpace: make(chan struct{}, 1), stop: make(chan struct{}), done: make(chan struct{}),
+		runtime:    runtime,
 		appendTerm: hard.GetTerm(), appendVote: hard.GetVote(), appendCommit: commit,
 		durableTerm: hard.GetTerm(), durableVote: hard.GetVote(),
 	}
-	go p.runAppendWorker()
+	if runtime.nodePersistence == nil {
+		p.workerWake = make(chan struct{}, 1)
+		p.resultSpace = make(chan struct{}, 1)
+		p.stop = make(chan struct{})
+		p.done = make(chan struct{})
+		go p.runAppendWorker()
+	}
 	return p, nil
 }
 
@@ -359,6 +377,14 @@ func (p *pipelinedRuntime) stopAppendWorker() {
 	if p == nil {
 		return
 	}
+	if p.runtime.nodePersistence != nil {
+		if p.nodeSubmission {
+			_, _ = p.runtime.nodePersistence.Wait()
+			p.nodeSubmission = false
+			p.nodeWork = pipelinedAppendWork{}
+		}
+		return
+	}
 	p.stopOnce.Do(func() { close(p.stop) })
 	<-p.done
 }
@@ -368,6 +394,10 @@ func (p *pipelinedRuntime) stopAppendWorker() {
 // ownership setup; the worker loads the immutable callback atomically.
 func (runtime *Runtime) SetPipelinedWake(wake func()) {
 	if runtime == nil || runtime.pipelined == nil {
+		return
+	}
+	if runtime.nodePersistence != nil {
+		runtime.nodePersistence.sequencer.SetWake(wake)
 		return
 	}
 	if wake == nil {
@@ -397,6 +427,9 @@ func (runtime *Runtime) reservePipelinedReady() error {
 	if p.appendOutstanding >= pipelinedAppendCapacity ||
 		p.applyQueue.remaining() == 0 || p.directQueue.remaining() < raftmodel.MaxPipelinedReadyMessages {
 		return raftstore.ErrFull
+	}
+	if runtime.nodePersistence != nil {
+		return nil
 	}
 	if p.admission != 0 {
 		p.admission--
@@ -456,22 +489,82 @@ func (p *pipelinedRuntime) enqueueAppend(message *pb.Message) error {
 		return p.runtime.fail(errors.New("raftmember: pipelined append ring overflow"))
 	}
 	p.appendOutstanding++
+	if p.runtime.nodePersistence == nil {
+		signalPipelinedEdge(p.workerWake)
+		return nil
+	}
+	return p.submitNextNodeAppend()
+}
+
+func (p *pipelinedRuntime) submitNodeWork(work pipelinedAppendWork) error {
+	if p.nodeSubmission || p.runtime.nodePersistence == nil {
+		return nil
+	}
+	if _, err := p.runtime.nodePersistence.Submit(work.batch); err != nil {
+		return err
+	}
+	p.nodeWork = work
+	p.nodeSubmission = true
+	return nil
+}
+
+func (p *pipelinedRuntime) submitNextNodeAppend() error {
+	if p.runtime.nodePersistence == nil || p.nodeSubmission || p.appendRetry {
+		return nil
+	}
+	work, ok := p.appendWork.front()
+	if !ok {
+		return nil
+	}
+	if err := p.submitNodeWork(work); err != nil {
+		if errors.Is(err, raftstore.ErrSubmissionBackpressure) {
+			return nil
+		}
+		return p.runtime.fail(err)
+	}
+	if _, ok = p.appendWork.pop(); !ok {
+		return p.runtime.fail(errors.New("raftmember: node append queue lost submitted work"))
+	}
+	return nil
+}
+
+func (p *pipelinedRuntime) requestAppendRetry() error {
+	if p.runtime.nodePersistence != nil {
+		if p.nodeSubmission || p.nodeWork.message == nil {
+			return p.runtime.fail(errors.New("raftmember: invalid node append retry state"))
+		}
+		if err := p.submitNodeWork(p.nodeWork); err != nil {
+			return err
+		}
+		p.appendRetry = false
+		return nil
+	}
+	p.appendRetry = false
+	p.retryRequest.Store(true)
 	signalPipelinedEdge(p.workerWake)
 	return nil
 }
 
-func (p *pipelinedRuntime) requestAppendRetry() {
-	p.appendRetry = false
-	p.retryRequest.Store(true)
-	signalPipelinedEdge(p.workerWake)
-}
-
 func (p *pipelinedRuntime) consumeAppendResult() (DriveResult, bool, error) {
-	result, ok := p.appendDone.pop()
-	if !ok {
-		return DriveResult{}, false, nil
+	var result pipelinedAppendResult
+	if p.runtime.nodePersistence != nil {
+		if !p.nodeSubmission {
+			return DriveResult{}, false, nil
+		}
+		_, done, err := p.runtime.nodePersistence.Poll()
+		if !done {
+			return DriveResult{}, false, nil
+		}
+		result.works[0], result.count, result.err = p.nodeWork, 1, err
+		p.nodeSubmission = false
+	} else {
+		var ok bool
+		result, ok = p.appendDone.pop()
+		if !ok {
+			return DriveResult{}, false, nil
+		}
+		signalPipelinedEdge(p.resultSpace)
 	}
-	signalPipelinedEdge(p.resultSpace)
 	if result.count == 0 || int(result.count) > p.appendOutstanding {
 		return DriveResult{}, true, p.runtime.fail(errors.New("raftmember: invalid pipelined append completion"))
 	}
@@ -483,7 +576,7 @@ func (p *pipelinedRuntime) consumeAppendResult() (DriveResult, bool, error) {
 		}
 	}
 	if result.err != nil {
-		if deterministicPersistFailure(result.err) {
+		if deterministicPersistFailure(result.err) || p.runtime.nodePersistence != nil && errors.Is(result.err, raftstore.ErrPersistenceUnknown) {
 			return DriveResult{}, true, p.runtime.fail(result.err)
 		}
 		p.appendRetry = true
@@ -512,6 +605,12 @@ func (p *pipelinedRuntime) consumeAppendResult() (DriveResult, bool, error) {
 	p.appendOutstanding -= int(result.count)
 	p.appendProcessedID = lastReadyID
 	p.appendRetryReadyID = 0
+	if p.runtime.nodePersistence != nil {
+		p.nodeWork = pipelinedAppendWork{}
+		if err := p.submitNextNodeAppend(); err != nil {
+			return DriveResult{}, true, err
+		}
+	}
 	return DriveResult{Kind: DrivePersisted, ReadyID: lastReadyID}, true, nil
 }
 
@@ -593,8 +692,13 @@ func (runtime *Runtime) drivePipelinedReady(
 
 	if p.appendRetry {
 		readyID := p.appendRetryReadyID
-		p.requestAppendRetry()
+		if err := p.requestAppendRetry(); err != nil {
+			return DriveResult{}, err
+		}
 		return DriveResult{Kind: DriveCaptured, ReadyID: readyID}, nil
+	}
+	if err := p.submitNextNodeAppend(); err != nil {
+		return DriveResult{}, err
 	}
 	if result, consumed, err := p.consumeAppendResult(); consumed {
 		return result, err
@@ -682,7 +786,9 @@ driveDirect:
 		return DriveResult{}, runtime.fail(err)
 	}
 	if !captured {
-		p.admission++
+		if runtime.nodePersistence == nil {
+			p.admission++
+		}
 		return DriveResult{}, nil
 	}
 	appendCount := 0
@@ -721,7 +827,7 @@ driveDirect:
 			}
 		}
 	}
-	if appendCount == 0 {
+	if appendCount == 0 && runtime.nodePersistence == nil {
 		p.admission++
 	}
 	runtime.proposalBatchEntries = 0

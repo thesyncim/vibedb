@@ -60,6 +60,36 @@ func BindingFromWAL(
 	return bindingFromIdentity(identity, wal.TopologyRecoveryEpoch(), authority), nil
 }
 
+// BindingFromNodeGroup derives the complete SQL binding from one authenticated
+// group descriptor in the node-wide log. It performs no mutation and never
+// invents an incarnation or SQL identity.
+func BindingFromNodeGroup(
+	group *raftstore.GroupView,
+	authority sqldriver.ReplicatedAuthorityProfile,
+) (sqldriver.ReplicatedShardStoreBinding, error) {
+	if group == nil {
+		return sqldriver.ReplicatedShardStoreBinding{}, ErrWALUnavailable
+	}
+	if _, _, err := group.InitialState(); err != nil {
+		return sqldriver.ReplicatedShardStoreBinding{}, fmt.Errorf(
+			"%w: inspect node group stable state: %w", ErrWALUnavailable, err,
+		)
+	}
+	descriptor, err := group.Descriptor()
+	if err != nil {
+		return sqldriver.ReplicatedShardStoreBinding{}, fmt.Errorf(
+			"%w: inspect node group descriptor: %w", ErrWALUnavailable, err,
+		)
+	}
+	node, err := group.NodeIdentity()
+	if err != nil {
+		return sqldriver.ReplicatedShardStoreBinding{}, fmt.Errorf(
+			"%w: inspect node identity: %w", ErrWALUnavailable, err,
+		)
+	}
+	return bindingFromIdentity(descriptor.Identity(node), descriptor.TopologyRecoveryEpoch, authority), nil
+}
+
 // BindingForNewWAL derives the exact SQL binding for an intended immutable WAL
 // identity before that WAL exists. This breaks the staged-child bootstrap
 // cycle: SQL can receive and certify its final image first, then the WAL can be
@@ -123,6 +153,24 @@ func BindPreparedSQL(
 	userTable string,
 ) (sqldriver.ReplicatedShardStoreIdentity, error) {
 	binding, err := BindingFromWAL(wal, authority)
+	if err != nil {
+		return sqldriver.ReplicatedShardStoreIdentity{}, err
+	}
+	if database == nil {
+		return sqldriver.ReplicatedShardStoreIdentity{}, ErrInvalidDatabase
+	}
+	return database.BindReplicatedShardStore(binding, userTable)
+}
+
+// BindPreparedNodeSQL publishes the exact replicated SQL identity for one
+// authenticated group in a node-wide log.
+func BindPreparedNodeSQL(
+	group *raftstore.GroupView,
+	database *sqldriver.Database,
+	authority sqldriver.ReplicatedAuthorityProfile,
+	userTable string,
+) (sqldriver.ReplicatedShardStoreIdentity, error) {
+	binding, err := BindingFromNodeGroup(group, authority)
 	if err != nil {
 		return sqldriver.ReplicatedShardStoreIdentity{}, err
 	}

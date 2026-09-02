@@ -429,6 +429,7 @@ func (result DriveResult) Progressed() bool { return result.Kind != DriveIdle }
 // admission. It does not certify leadership, commit, apply, or a client result.
 type Runtime struct {
 	wal             *raftstore.Store
+	stable          raftmodel.StableStore
 	database        *sqldriver.Database
 	apply           *sqldriver.ReplicatedApply
 	node            *raftmodel.Node
@@ -436,6 +437,7 @@ type Runtime struct {
 	walGeneration   *walGenerationDriver
 	schemaWALResume *WALGenerationDriverOptions
 	pipelined       *pipelinedRuntime
+	nodePersistence *NodeRuntimePersistence
 
 	proposalBatchEntries     int
 	proposalBatchBytes       int64
@@ -512,6 +514,105 @@ func AdoptPipelinedStagedRuntime(
 	return adoptRuntime(wal, database, apply, expected, true)
 }
 
+// AdoptNodeRuntime constructs one pipelined member on the node-wide log. The
+// caller must durably allocate the group's node incarnation and bind
+// persistence before adoption. The Runtime owns database and apply after the
+// SQL ownership claim, but the node store and its device sequencer remain
+// node-level resources owned by the caller.
+func AdoptNodeRuntime(
+	persistence *NodeRuntimePersistence,
+	database *sqldriver.Database,
+	apply *sqldriver.ReplicatedApply,
+) (*Runtime, error) {
+	if persistence == nil || persistence.stable == nil || persistence.sequencer == nil ||
+		database == nil || apply == nil || persistence.incarnation == 0 {
+		return nil, ErrRuntimeOwnership
+	}
+	group := persistence.stable
+	if err := ValidateNodeApplyCapacity(group, apply); err != nil {
+		return nil, err
+	}
+	profile, err := apply.CapacityQualificationProfile()
+	if err != nil {
+		return nil, err
+	}
+	identity, err := runtimeIdentityFromNodeGroup(group, profile)
+	if err != nil {
+		return nil, err
+	}
+	descriptor, err := group.Descriptor()
+	if err != nil || descriptor.LogKey != persistence.group || descriptor.MemberID != identity.MemberID {
+		return nil, ErrNodePersistenceBinding
+	}
+	incarnation, err := group.NodeIncarnation()
+	if err != nil || incarnation != persistence.incarnation {
+		return nil, ErrNodePersistenceBinding
+	}
+	if err = apply.ClaimRuntimeOwnership(database); err != nil {
+		return nil, fmt.Errorf("%w: claim SQL apply ownership: %w", ErrRuntimeOwnership, err)
+	}
+	runtime := &Runtime{
+		stable: group, database: database, apply: apply, nodePersistence: persistence,
+		identity: identity,
+	}
+	runtime.node, err = raftmodel.NewPipelinedNode(identity.MemberID, incarnation, group, apply)
+	if err != nil {
+		return runtime.abortAdoption(fmt.Errorf("raftmember: construct node: %w", err))
+	}
+	if err = runtime.node.BindMembershipTransitionContext(); err != nil {
+		return runtime.abortAdoption(fmt.Errorf("raftmember: bind membership transition context: %w", err))
+	}
+	runtime.pipelined, err = newPipelinedRuntime(runtime)
+	if err != nil {
+		return runtime.abortAdoption(fmt.Errorf("raftmember: construct node append lane: %w", err))
+	}
+	return runtime, nil
+}
+
+// RuntimeIdentityFromNodeGroup returns the exact portable member identity that
+// a bound apply claim may adopt from the node-wide log.
+func RuntimeIdentityFromNodeGroup(
+	group *raftstore.GroupView,
+	apply *sqldriver.ReplicatedApply,
+) (RuntimeIdentity, error) {
+	if apply == nil {
+		return RuntimeIdentity{}, sqldriver.ErrReplicatedApplyClosed
+	}
+	profile, err := apply.CapacityQualificationProfile()
+	if err != nil {
+		return RuntimeIdentity{}, err
+	}
+	return runtimeIdentityFromNodeGroup(group, profile)
+}
+
+func runtimeIdentityFromNodeGroup(
+	group *raftstore.GroupView,
+	profile sqldriver.ReplicatedApplyCapacityProfile,
+) (RuntimeIdentity, error) {
+	binding, err := BindingFromNodeGroup(group, profile.Binding.Authority)
+	if err != nil {
+		return RuntimeIdentity{}, err
+	}
+	if binding != profile.Binding {
+		return RuntimeIdentity{}, ErrBindingMismatch
+	}
+	incarnation, err := group.NodeIncarnation()
+	if err != nil || incarnation == 0 {
+		return RuntimeIdentity{}, errors.Join(ErrRuntimeOwnership, err)
+	}
+	return RuntimeIdentity{
+		Group: GroupKey{
+			ClusterID: binding.ClusterID, ClusterIncarnation: binding.ClusterIncarnation,
+			TopologyRecoveryEpoch: binding.TopologyRecoveryEpoch,
+			ShardIncarnation:      binding.ShardIncarnation, GroupID: binding.GroupID,
+		},
+		Distribution: strings.Clone(binding.Distribution), Shard: strings.Clone(binding.Shard),
+		AllocationGeneration: binding.AllocationGeneration, MemberID: binding.MemberID,
+		StoreID: binding.StoreID, NodeIncarnation: incarnation,
+		RelationManifestDigest: profile.RelationManifestDigest,
+	}, nil
+}
+
 func adoptRuntime(
 	wal *raftstore.Store,
 	database *sqldriver.Database,
@@ -549,7 +650,7 @@ func adoptRuntime(
 
 	sealed := wal.Identity()
 	runtime := &Runtime{
-		wal: wal, database: database, apply: apply,
+		wal: wal, stable: wal, database: database, apply: apply,
 		identity: RuntimeIdentity{
 			Group: GroupKey{
 				ClusterID: sealed.ClusterID, ClusterIncarnation: sealed.ClusterIncarnation,
@@ -630,9 +731,19 @@ func (runtime *Runtime) Failure() error {
 	return nil
 }
 
+func (runtime *Runtime) stableStore() raftmodel.StableStore {
+	if runtime == nil {
+		return nil
+	}
+	if runtime.stable != nil {
+		return runtime.stable
+	}
+	return runtime.wal
+}
+
 func (runtime *Runtime) checkUsable() error {
 	if runtime == nil || runtime.closed || runtime.stopping || runtime.node == nil ||
-		runtime.wal == nil || runtime.apply == nil || runtime.database == nil {
+		runtime.stableStore() == nil || runtime.apply == nil || runtime.database == nil {
 		return ErrRuntimeClosed
 	}
 	if runtime.failure != nil {
@@ -914,14 +1025,16 @@ func (runtime *Runtime) DurablePromotion(
 		return DurablePromotionProof{}, false, errors.New("raftmember: invalid promotion target")
 	}
 	applied := runtime.node.PublishedApplied()
-	last, err := runtime.wal.LastIndex()
+	stable := runtime.stableStore()
+	last, err := stable.LastIndex()
 	if err != nil {
 		return DurablePromotionProof{}, false, err
 	}
-	commit, err := runtime.wal.DurableCommit()
+	hard, _, err := stable.InitialState()
 	if err != nil {
 		return DurablePromotionProof{}, false, err
 	}
+	commit := hard.GetCommit()
 	commit = max(commit, runtime.node.PublishedApplied())
 	if commit <= applied {
 		runtime.promotionScan = durablePromotionScan{applied: applied,
@@ -938,7 +1051,7 @@ func (runtime *Runtime) DurablePromotion(
 		first = lastCommitted - raftmodel.MaxMessageEntries + 1
 	}
 	for index := lastCommitted; index >= first; index-- {
-		entries, readErr := runtime.wal.Entries(index, index+1, raftmodel.MaxInboundMessageBytes)
+		entries, readErr := stable.Entries(index, index+1, raftmodel.MaxInboundMessageBytes)
 		if readErr != nil {
 			return DurablePromotionProof{}, false, readErr
 		}
@@ -1041,7 +1154,7 @@ func (runtime *Runtime) SnapshotBaseCertificate() (replicatedstate.SnapshotBaseC
 	if err := runtime.checkNoPendingSettlement(); err != nil {
 		return replicatedstate.SnapshotBaseCertificate{}, err
 	}
-	snapshot, err := runtime.wal.Snapshot()
+	snapshot, err := runtime.stableStore().Snapshot()
 	if err != nil {
 		return replicatedstate.SnapshotBaseCertificate{}, err
 	}
@@ -1562,6 +1675,8 @@ func (runtime *Runtime) Close() error {
 		}
 		runtime.wal = nil
 	}
+	runtime.stable = nil
+	runtime.nodePersistence = nil
 	runtime.closed = true
 	return nil
 }
