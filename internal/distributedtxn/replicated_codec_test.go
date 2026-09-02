@@ -851,6 +851,13 @@ func TestFusedReplicatedCommandExactMaximum(t *testing.T) {
 	if MaxReplicatedCommandBytes != want {
 		t.Fatalf("max replicated command=%d want=%d", MaxReplicatedCommandBytes, want)
 	}
+	const singleParticipantWant = 2220
+	if MaxSingleParticipantControlBytes != singleParticipantWant {
+		t.Fatalf(
+			"max single-participant control=%d want=%d",
+			MaxSingleParticipantControlBytes, singleParticipantWant,
+		)
+	}
 }
 
 func TestReplicatedRetirementSummaryCanonicalFixedAndAllocationFree(t *testing.T) {

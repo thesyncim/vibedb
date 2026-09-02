@@ -264,11 +264,11 @@ func durableRequestRetryHome(
 	key replication.Digest,
 	transaction distributedtxn.ID,
 ) replication.RetryHome {
-	hash := sha256.New()
-	_, _ = hash.Write(byteview.Bytes(durableRequestRetryHomeDomain))
-	_, _ = hash.Write(key[:])
-	_, _ = hash.Write(transaction[:])
-	sum := hash.Sum(nil)
+	var framed [len(durableRequestRetryHomeDomain) + sha256.Size + len(distributedtxn.ID{})]byte
+	at := copy(framed[:], durableRequestRetryHomeDomain)
+	at += copy(framed[at:], key[:])
+	copy(framed[at:], transaction[:])
+	sum := sha256.Sum256(framed[:])
 	var home replication.RetryHome
 	copy(home[:], sum[:len(home)])
 	return home
