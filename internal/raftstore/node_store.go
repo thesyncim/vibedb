@@ -35,13 +35,25 @@ var nodeMetaMagic = [8]byte{'V', 'D', 'B', 'N', 'O', 'D', 'E', 0}
 type NodeStoreOptions struct {
 	Store                                                        Options
 	FrameBytes, Events, WaveIDs, EntriesPerGroup, CachedSegments int
+	Groups                                                       int
+}
+
+type NodeIdentity struct {
+	ClusterID, ClusterIncarnation, NodeID [16]byte
+}
+
+// GroupDescriptor contains only placement/member coordinates that vary by
+// Raft group. LogKey is an immutable, monotonically allocated local identity.
+type GroupDescriptor struct {
+	LogKey, TopologyRecoveryEpoch, AllocationGeneration, MemberID uint64
+	GroupID, ShardIncarnation, StoreID                            [16]byte
+	Distribution, Shard                                           string
 }
 
 type NodeBootstrap struct {
-	GroupID         uint64
-	NodeIncarnation uint64
-	Snapshot        *pb.Snapshot
-	HardState       *pb.HardState
+	Descriptor GroupDescriptor
+	Snapshot   *pb.Snapshot
+	HardState  *pb.HardState
 }
 
 type NodeReady struct {
@@ -70,7 +82,10 @@ const (
 type NodeStore struct {
 	mu                                        sync.Mutex
 	dir                                       string
-	identity                                  Identity
+	identity                                  NodeIdentity
+	descriptors                               []GroupDescriptor
+	descriptorOrder                           []uint32
+	nextLogKey                                uint64
 	key                                       Key
 	options                                   normalizedOptions
 	engine                                    *seglog.Engine
@@ -141,24 +156,28 @@ func defaultNodeOptions(options NodeStoreOptions) (NodeStoreOptions, normalizedO
 	if options.CachedSegments == 0 {
 		options.CachedSegments = 8
 	}
+	if options.Groups == 0 {
+		options.Groups = 4096
+	}
 	if options.FrameBytes < 72 || options.Events < 1 || options.WaveIDs < 1 || options.EntriesPerGroup < 1 || options.CachedSegments < 0 {
 		return options, normalizedOptions{}, ErrBounds
 	}
 	return options, normalized, nil
 }
 
-func CreateNodeStore(dir string, identity Identity, key Key, bootstraps []NodeBootstrap, options NodeStoreOptions) (*NodeStore, error) {
+func CreateNodeStore(dir string, identity NodeIdentity, key Key, bootstraps []NodeBootstrap, options NodeStoreOptions) (*NodeStore, error) {
 	options, normalized, err := defaultNodeOptions(options)
 	if err != nil {
 		return nil, err
 	}
-	if err = validateIdentity(identity); err != nil {
+	if err = validateNodeIdentity(identity); err != nil {
 		return nil, err
 	}
 	if err = validateKey(key, false); err != nil {
 		return nil, err
 	}
-	if len(bootstraps) == 0 {
+	bootstraps, descriptors, order, err := canonicalInitialDescriptors(bootstraps)
+	if err != nil || len(bootstraps) >= MaxPersistGroupBatches || len(bootstraps) > options.Groups {
 		return nil, ErrInvalid
 	}
 	if err = os.Mkdir(dir, 0o700); err != nil {
@@ -196,7 +215,11 @@ func CreateNodeStore(dir string, identity Identity, key Key, bootstraps []NodeBo
 		_ = lock.Close()
 		return nil, err
 	}
-	store := &NodeStore{dir: dir, identity: identity, key: key, options: normalized, engine: engine, lock: lock, crypto: cryptoState, cryptoWork: newObjectCryptoWorkspace(cryptoState.dataKey, cryptoState.nonceKey)}
+	storedDescriptors := make([]GroupDescriptor, len(descriptors), options.Groups)
+	copy(storedDescriptors, descriptors)
+	storedOrder := make([]uint32, len(order), options.Groups)
+	copy(storedOrder, order)
+	store := &NodeStore{dir: dir, identity: identity, descriptors: storedDescriptors, descriptorOrder: storedOrder, nextLogKey: uint64(len(descriptors)) + 1, key: key, options: normalized, engine: engine, lock: lock, crypto: cryptoState, cryptoWork: newObjectCryptoWorkspace(cryptoState.dataKey, cryptoState.nonceKey)}
 	if err = store.reserve(options, bootstraps); err != nil {
 		_ = store.Close()
 		return nil, err
@@ -205,14 +228,7 @@ func CreateNodeStore(dir string, identity Identity, key Key, bootstraps []NodeBo
 		_ = store.Close()
 		return nil, err
 	}
-	firstState, _ := engine.Metadata(bootstraps[0].GroupID)
-	firstSnapshot, err := marshalSnapshot(bootstraps[0].Snapshot)
-	if err != nil {
-		_ = store.Close()
-		return nil, err
-	}
-	ref := snapshotReference{id: firstState.Checkpoint.ID, digest: sha256.Sum256(firstSnapshot), size: uint64(len(firstSnapshot)), index: firstState.Checkpoint.Index, term: firstState.Checkpoint.Term}
-	if err = writeNodeMeta(dir, identity, key, engine.LogID(), ref, boundsFromOptions(normalized), cryptoState); err != nil {
+	if err = writeNodeMeta(dir, identity, key, engine.LogID(), boundsFromOptions(normalized), cryptoState); err != nil {
 		_ = store.Close()
 		return nil, err
 	}
@@ -225,12 +241,12 @@ func CreateNodeStore(dir string, identity Identity, key Key, bootstraps []NodeBo
 
 // OpenNodeStore authenticates node metadata before exposing recovered group
 // state. Engine Open performs its startup durability sync before this returns.
-func OpenNodeStore(dir string, expected Identity, key Key, options NodeStoreOptions) (*NodeStore, error) {
+func OpenNodeStore(dir string, expected NodeIdentity, key Key, options NodeStoreOptions) (*NodeStore, error) {
 	options, normalized, err := defaultNodeOptions(options)
 	if err != nil {
 		return nil, err
 	}
-	if err = validateIdentity(expected); err != nil {
+	if err = validateNodeIdentity(expected); err != nil {
 		return nil, err
 	}
 	if err = validateKey(key, false); err != nil {
@@ -277,7 +293,14 @@ func OpenNodeStore(dir string, expected Identity, key Key, options NodeStoreOpti
 		err = engine.ReserveReaders(options.CachedSegments)
 	}
 	if err == nil {
+		if err = engine.ReserveGroup(nodeDescriptorGroup, options.Groups); err != nil {
+		}
+	}
+	if err == nil {
 		for _, group := range engine.GroupIDs() {
+			if group == nodeDescriptorGroup {
+				continue
+			}
 			if err = engine.ReserveGroup(group, options.EntriesPerGroup); err != nil {
 				break
 			}
@@ -292,7 +315,22 @@ func OpenNodeStore(dir string, expected Identity, key Key, options NodeStoreOpti
 		for i := range store.waveEntries {
 			store.waveEntries[i] = make([]seglog.Entry, 0, MaxReadyEntries)
 		}
-		err = store.bindNamespace()
+		if err = store.rebuildDescriptors(options.Groups); err == nil {
+			ids := engine.GroupIDs()
+			if len(ids) != len(store.descriptors)+1 || ids[len(ids)-1] != nodeDescriptorGroup {
+				err = ErrCorrupt
+			} else {
+				for i := range store.descriptors {
+					if ids[i] != uint64(i+1) {
+						err = ErrCorrupt
+						break
+					}
+				}
+			}
+			if err == nil {
+				err = store.bindNamespace()
+			}
+		}
 	}
 	if err != nil {
 		_ = store.Close()
@@ -301,39 +339,39 @@ func OpenNodeStore(dir string, expected Identity, key Key, options NodeStoreOpti
 	return store, nil
 }
 
-func openNodeMeta(data []byte, expected Identity, key Key, options normalizedOptions) (Identity, [16]byte, error) {
+func openNodeMeta(data []byte, expected NodeIdentity, key Key, options normalizedOptions) (NodeIdentity, [16]byte, error) {
 	var zero [16]byte
 	if len(data) < nodeMetaHeaderBytes+16 || !bytes.Equal(data[:8], nodeMetaMagic[:]) ||
 		binary.LittleEndian.Uint16(data[8:10]) != 1 || !allZero(data[14:16]) || !allZero(data[44:48]) {
-		return Identity{}, zero, ErrCorrupt
+		return NodeIdentity{}, zero, ErrCorrupt
 	}
 	keyIDBytes := int(binary.LittleEndian.Uint16(data[10:12]))
 	wrappedBytes := int(binary.LittleEndian.Uint16(data[12:14]))
 	headerBytes := nodeMetaHeaderBytes + keyIDBytes + wrappedBytes
 	if headerBytes > len(data)-16 || !bytes.Equal(data[nodeMetaHeaderBytes:nodeMetaHeaderBytes+keyIDBytes], []byte(key.ID)) ||
 		!bytes.Equal(data[nodeMetaHeaderBytes+keyIDBytes:headerBytes], key.Wrapped) {
-		return Identity{}, zero, ErrIdentityMismatch
+		return NodeIdentity{}, zero, ErrIdentityMismatch
 	}
 	var logID [16]byte
 	copy(logID[:], data[16:32])
 	cryptoState, err := makeFileCrypto(key, logID)
 	if err != nil {
-		return Identity{}, zero, err
+		return NodeIdentity{}, zero, err
 	}
 	nonce := deriveNonce(cryptoState.nonceKey, "node-meta", 0)
 	if !bytes.Equal(data[32:44], nonce[:]) {
-		return Identity{}, zero, ErrCorrupt
+		return NodeIdentity{}, zero, ErrCorrupt
 	}
 	plain, err := cryptoState.aead.Open(nil, nonce[:], data[headerBytes:], data[:headerBytes])
 	if err != nil {
-		return Identity{}, zero, ErrCorrupt
+		return NodeIdentity{}, zero, ErrCorrupt
 	}
-	identity, _, bounds, err := unmarshalIdentity(plain)
+	identity, bounds, err := unmarshalNodeIdentity(plain)
 	if err != nil {
-		return Identity{}, zero, err
+		return NodeIdentity{}, zero, err
 	}
 	if identity != expected || bounds != boundsFromOptions(options) {
-		return Identity{}, zero, ErrIdentityMismatch
+		return NodeIdentity{}, zero, ErrIdentityMismatch
 	}
 	return identity, logID, nil
 }
@@ -346,9 +384,12 @@ func (s *NodeStore) reserve(options NodeStoreOptions, bootstraps []NodeBootstrap
 		return err
 	}
 	for _, b := range bootstraps {
-		if err := s.engine.ReserveGroup(b.GroupID, options.EntriesPerGroup); err != nil {
+		if err := s.engine.ReserveGroup(b.Descriptor.LogKey, options.EntriesPerGroup); err != nil {
 			return err
 		}
+	}
+	if err := s.engine.ReserveGroup(nodeDescriptorGroup, options.Groups); err != nil {
+		return err
 	}
 	s.plainArena = make([]byte, 0, options.FrameBytes)
 	s.cipherArena = make([]byte, 0, options.FrameBytes)
@@ -362,12 +403,15 @@ func (s *NodeStore) reserve(options NodeStoreOptions, bootstraps []NodeBootstrap
 }
 
 func (s *NodeStore) bootstrap(bootstraps []NodeBootstrap) error {
-	if !slices.IsSortedFunc(bootstraps, func(a, b NodeBootstrap) int { return intCompare(a.GroupID, b.GroupID) }) {
+	if !slices.IsSortedFunc(bootstraps, func(a, b NodeBootstrap) int { return intCompare(a.Descriptor.LogKey, b.Descriptor.LogKey) }) {
 		return ErrInvalid
 	}
-	batches := make([]seglog.ReadyBatch, len(bootstraps))
+	batches := make([]seglog.ReadyBatch, len(bootstraps)+1)
 	for i, b := range bootstraps {
-		checkpoint, err := s.publishCheckpoint(b.GroupID, b.Snapshot)
+		if err := validateSnapshotBase(b.Snapshot, b.Descriptor.MemberID); err != nil {
+			return err
+		}
+		checkpoint, err := s.publishCheckpoint(b.Descriptor.LogKey, b.Snapshot)
 		if err != nil {
 			return err
 		}
@@ -377,10 +421,26 @@ func (s *NodeStore) bootstrap(bootstraps []NodeBootstrap) error {
 			h.Term = uint64Pointer(checkpoint.Term)
 			h.Commit = uint64Pointer(checkpoint.Index)
 		}
-		batches[i] = seglog.ReadyBatch{GroupID: b.GroupID, Checkpoint: &checkpoint, Hard: &seglog.HardState{Term: h.GetTerm(), Vote: h.GetVote(), Commit: h.GetCommit()}}
+		batches[i] = seglog.ReadyBatch{GroupID: b.Descriptor.LogKey, Checkpoint: &checkpoint, Hard: &seglog.HardState{Term: h.GetTerm(), Vote: h.GetVote(), Commit: h.GetCommit()}}
 	}
+	s.plainArena = s.plainArena[:0]
+	descriptorEntries := make([]seglog.Entry, 0, len(bootstraps))
+	for i := range bootstraps {
+		start := len(s.plainArena)
+		var err error
+		s.plainArena, err = appendGroupDescriptor(s.plainArena, bootstraps[i].Descriptor)
+		if err != nil {
+			return err
+		}
+		descriptorEntries = append(descriptorEntries, seglog.Entry{Index: uint64(i + 1), Term: 1, DataOffset: uint64(start), DataBytes: uint64(len(s.plainArena) - start)})
+	}
+	batches[len(bootstraps)] = seglog.ReadyBatch{GroupID: nodeDescriptorGroup, Entries: descriptorEntries}
 	id := bootstrapWaveID(batches)
-	return s.engine.PersistWave(seglog.Wave{ID: id, Batches: batches})
+	copy(s.waveBatches[:], batches)
+	if err := s.packWaveExtents(id, len(batches)); err != nil {
+		return err
+	}
+	return s.engine.PersistWave(seglog.Wave{ID: id, Batches: s.waveBatches[:len(batches)], Blob: s.cipherArena})
 }
 
 func (s *NodeStore) bindNamespace() error {
@@ -427,7 +487,12 @@ func bootstrapWaveID(batches []seglog.ReadyBatch) seglog.WaveID {
 	for i := range batches {
 		binary.LittleEndian.PutUint64(word[:], batches[i].GroupID)
 		_, _ = h.Write(word[:])
-		_, _ = h.Write(batches[i].Checkpoint.ID[:])
+		if batches[i].Checkpoint != nil {
+			_, _ = h.Write(batches[i].Checkpoint.ID[:])
+		} else {
+			binary.LittleEndian.PutUint64(word[:], uint64(len(batches[i].Entries)))
+			_, _ = h.Write(word[:])
+		}
 	}
 	var id seglog.WaveID
 	copy(id[:], h.Sum(nil))
@@ -585,7 +650,8 @@ func (s *NodeStore) persistWave(ready []NodeReady, sequenced bool) error {
 		return ErrInvalid
 	}
 	for i := range ready {
-		if ready[i].GroupID == 0 || i > 0 && ready[i-1].GroupID >= ready[i].GroupID {
+		_, registered := s.descriptorForLogKey(ready[i].GroupID)
+		if !registered || i > 0 && ready[i-1].GroupID >= ready[i].GroupID {
 			return ErrInvalid
 		}
 	}
@@ -781,20 +847,43 @@ func (s *NodeStore) BeginIncarnations(groups []uint64) ([]GroupIncarnation, erro
 		return nil, ErrInvalid
 	}
 	requests := make([]GroupIncarnation, len(groups))
+	if err := s.beginIncarnationsLocked(groups, requests); err != nil {
+		return requests, err
+	}
+	return requests, nil
+}
+
+func (s *NodeStore) beginIncarnationsSequenced(groups []uint64, requests []GroupIncarnation) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.usable(); err != nil {
+		return err
+	}
+	if s.sequencer == nil {
+		return ErrInvalid
+	}
+	return s.beginIncarnationsLocked(groups, requests)
+}
+
+func (s *NodeStore) beginIncarnationsLocked(groups []uint64, requests []GroupIncarnation) error {
+	if len(groups) == 0 || len(groups) > MaxPersistGroupBatches || len(requests) != len(groups) {
+		return ErrInvalid
+	}
 	for i, group := range groups {
-		if group == 0 || i > 0 && groups[i-1] >= group {
-			return nil, ErrInvalid
+		_, registered := s.descriptorForLogKey(group)
+		if !registered || i > 0 && groups[i-1] >= group {
+			return ErrInvalid
 		}
 		state, ok := s.engine.Summary(group)
 		if !ok || state.NodeIncarnation == math.MaxUint64 {
-			return nil, ErrInvalid
+			return ErrInvalid
 		}
 		requests[i] = GroupIncarnation{GroupID: group, Incarnation: state.NodeIncarnation + 1}
 	}
 	if err := s.persistIncarnationsLocked(requests); err != nil {
-		return requests, err
+		return err
 	}
-	return requests, nil
+	return nil
 }
 
 // PersistIncarnations is the exact retry form for an allocation whose sync
@@ -811,6 +900,18 @@ func (s *NodeStore) PersistIncarnations(requests []GroupIncarnation) error {
 	return s.persistIncarnationsLocked(requests)
 }
 
+func (s *NodeStore) persistIncarnationsSequenced(requests []GroupIncarnation) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.usable(); err != nil {
+		return err
+	}
+	if s.sequencer == nil {
+		return ErrInvalid
+	}
+	return s.persistIncarnationsLocked(requests)
+}
+
 func (s *NodeStore) persistIncarnationsLocked(requests []GroupIncarnation) error {
 	if len(requests) == 0 || len(requests) > MaxPersistGroupBatches {
 		return ErrInvalid
@@ -822,7 +923,8 @@ func (s *NodeStore) persistIncarnationsLocked(requests []GroupIncarnation) error
 	mapped := 0
 	var canonical [MaxPersistGroupBatches * 16]byte
 	for i, request := range requests {
-		if request.GroupID == 0 || request.Incarnation == 0 || i > 0 && requests[i-1].GroupID >= request.GroupID {
+		_, registered := s.descriptorForLogKey(request.GroupID)
+		if !registered || request.Incarnation == 0 || i > 0 && requests[i-1].GroupID >= request.GroupID {
 			return ErrInvalid
 		}
 		state, ok := s.engine.Summary(request.GroupID)
@@ -860,6 +962,91 @@ func (s *NodeStore) persistIncarnationsLocked(requests []GroupIncarnation) error
 	return nil
 }
 
+// RegisterGroup atomically publishes an exact portable group descriptor and
+// begins incarnation one in the same authenticated log frame and data sync.
+// It is disabled once the node sequencer owns submission ordering.
+func (s *NodeStore) RegisterGroup(descriptor GroupDescriptor) (GroupIncarnation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.usable(); err != nil {
+		return GroupIncarnation{}, err
+	}
+	if s.sequencer != nil {
+		return GroupIncarnation{}, ErrSequencerActive
+	}
+	return s.registerGroupLocked(descriptor)
+}
+
+func (s *NodeStore) registerGroupSequenced(descriptor GroupDescriptor) (GroupIncarnation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.usable(); err != nil {
+		return GroupIncarnation{}, err
+	}
+	if s.sequencer == nil {
+		return GroupIncarnation{}, ErrInvalid
+	}
+	return s.registerGroupLocked(descriptor)
+}
+
+func (s *NodeStore) registerGroupLocked(descriptor GroupDescriptor) (GroupIncarnation, error) {
+	if descriptor.LogKey != 0 || validateGroupDescriptor(descriptor, true) != nil || len(s.descriptors) == cap(s.descriptors) || s.nextLogKey == 0 || s.nextLogKey >= nodeDescriptorGroup {
+		return GroupIncarnation{}, ErrBounds
+	}
+	position, found := slices.BinarySearchFunc(s.descriptorOrder, descriptor.GroupID, func(index uint32, target [16]byte) int {
+		return bytes.Compare(s.descriptors[index].GroupID[:], target[:])
+	})
+	if found {
+		existing := s.descriptors[s.descriptorOrder[position]]
+		request := descriptor
+		request.LogKey = existing.LogKey
+		if existing != request {
+			return GroupIncarnation{}, ErrIdentityMismatch
+		}
+		state, ok := s.engine.Summary(existing.LogKey)
+		if !ok || state.NodeIncarnation == 0 {
+			return GroupIncarnation{}, ErrCorrupt
+		}
+		return GroupIncarnation{GroupID: existing.LogKey, Incarnation: state.NodeIncarnation}, nil
+	}
+	descriptor.LogKey = s.nextLogKey
+	if err := s.engine.ReserveGroup(descriptor.LogKey, cap(s.waveEntries[0])); err != nil {
+		return GroupIncarnation{}, err
+	}
+	s.plainArena = s.plainArena[:0]
+	var err error
+	s.plainArena, err = appendGroupDescriptor(s.plainArena, descriptor)
+	if err != nil {
+		return GroupIncarnation{}, err
+	}
+	s.waveEntries[0] = append(s.waveEntries[0][:0], seglog.Entry{Index: descriptor.LogKey, Term: 1, DataOffset: 0, DataBytes: uint64(len(s.plainArena))})
+	s.waveBatches[0] = seglog.ReadyBatch{GroupID: descriptor.LogKey, BeginIncarnation: 1}
+	s.waveBatches[1] = seglog.ReadyBatch{GroupID: nodeDescriptorGroup, Entries: s.waveEntries[0]}
+	digest := sha256.Sum256(s.plainArena)
+	var waveID seglog.WaveID
+	copy(waveID[:], digest[:16])
+	if err = s.packWaveExtents(waveID, 2); err != nil {
+		return GroupIncarnation{}, err
+	}
+	if err = s.engine.PersistWave(seglog.Wave{ID: waveID, Batches: s.waveBatches[:2], Blob: s.cipherArena}); err != nil {
+		if fatal := s.engine.FatalError(); fatal != nil {
+			s.poisoned = fatal
+			return GroupIncarnation{}, errors.Join(ErrPersistenceUnknown, err, fatal)
+		}
+		return GroupIncarnation{}, err
+	}
+	if err = s.proveNamespace(); err != nil {
+		s.poisoned = err
+		return GroupIncarnation{}, errors.Join(ErrPersistenceUnknown, err)
+	}
+	s.descriptors = append(s.descriptors, descriptor)
+	s.descriptorOrder = append(s.descriptorOrder, 0)
+	copy(s.descriptorOrder[position+1:], s.descriptorOrder[position:len(s.descriptorOrder)-1])
+	s.descriptorOrder[position] = uint32(len(s.descriptors) - 1)
+	s.nextLogKey++
+	return GroupIncarnation{GroupID: descriptor.LogKey, Incarnation: 1}, nil
+}
+
 func nodeWaveID(ready []NodeReady) seglog.WaveID {
 	var canonical [MaxPersistGroupBatches * 24]byte
 	for i, item := range ready {
@@ -875,6 +1062,91 @@ func nodeWaveID(ready []NodeReady) seglog.WaveID {
 }
 
 func (s *NodeStore) Group(group uint64) *GroupView { return &GroupView{store: s, group: group} }
+
+func (s *NodeStore) NodeIdentity() NodeIdentity { return s.identity }
+
+func (s *NodeStore) SetDataSyncForTesting(sync func(*os.File) error) {
+	s.engine.SetDataSyncForTesting(sync)
+}
+
+func (s *NodeStore) descriptorForLogKey(group uint64) (GroupDescriptor, bool) {
+	if group == 0 || group >= s.nextLogKey || group > uint64(len(s.descriptors)) {
+		return GroupDescriptor{}, false
+	}
+	d := s.descriptors[group-1]
+	return d, d.LogKey == group
+}
+
+func (s *NodeStore) GroupByID(groupID [16]byte) (*GroupView, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	position, found := slices.BinarySearchFunc(s.descriptorOrder, groupID, func(index uint32, target [16]byte) int {
+		return bytes.Compare(s.descriptors[index].GroupID[:], target[:])
+	})
+	if !found {
+		return nil, false
+	}
+	return &GroupView{store: s, group: s.descriptors[s.descriptorOrder[position]].LogKey}, true
+}
+
+func (v *GroupView) Descriptor() (GroupDescriptor, error) {
+	v.store.mu.Lock()
+	defer v.store.mu.Unlock()
+	if err := v.store.usable(); err != nil {
+		return GroupDescriptor{}, err
+	}
+	d, ok := v.store.descriptorForLogKey(v.group)
+	if !ok {
+		return GroupDescriptor{}, ErrInvalid
+	}
+	return d, nil
+}
+
+func (v *GroupView) NodeIncarnation() (uint64, error) {
+	v.store.mu.Lock()
+	defer v.store.mu.Unlock()
+	if err := v.store.usable(); err != nil {
+		return 0, err
+	}
+	state, ok := v.store.engine.Summary(v.group)
+	if !ok || state.NodeIncarnation == 0 {
+		return 0, ErrInvalid
+	}
+	return state.NodeIncarnation, nil
+}
+
+func (s *NodeStore) rebuildDescriptors(limit int) error {
+	metadata, ok := s.engine.Metadata(nodeDescriptorGroup)
+	if !ok || metadata.FirstIndex != 1 || metadata.LastIndex == 0 || metadata.LastIndex > uint64(limit) {
+		return ErrCorrupt
+	}
+	descriptors := make([]GroupDescriptor, 0, limit)
+	order := make([]uint32, 0, limit)
+	for index := uint64(1); index <= metadata.LastIndex; index++ {
+		location, _, compacted, found, err := s.engine.LookupExact(nodeDescriptorGroup, index)
+		if err != nil || compacted || !found {
+			return ErrCorrupt
+		}
+		entry, err := s.readEntry(nodeDescriptorGroup, location)
+		if err != nil {
+			return err
+		}
+		descriptor, err := decodeGroupDescriptor(entry.GetData())
+		if err != nil || descriptor.LogKey != index {
+			return ErrCorrupt
+		}
+		descriptors = append(descriptors, descriptor)
+		order = append(order, uint32(index-1))
+	}
+	slices.SortFunc(order, func(a, b uint32) int { return bytes.Compare(descriptors[a].GroupID[:], descriptors[b].GroupID[:]) })
+	for i := 1; i < len(order); i++ {
+		if bytes.Compare(descriptors[order[i-1]].GroupID[:], descriptors[order[i]].GroupID[:]) >= 0 {
+			return ErrCorrupt
+		}
+	}
+	s.descriptors, s.descriptorOrder, s.nextLogKey = descriptors, order, uint64(len(descriptors))+1
+	return nil
+}
 func (v *GroupView) Persist(batch raftmodel.PersistBatch) error {
 	return v.store.PersistWave([]NodeReady{{GroupID: v.group, Batch: batch}})
 }
@@ -1129,6 +1401,10 @@ func (s *NodeStore) readEntry(group uint64, loc seglog.EntryLocation) (*pb.Entry
 }
 
 func (s *NodeStore) loadCheckpoint(group uint64, cp seglog.Checkpoint) (*pb.Snapshot, error) {
+	descriptor, ok := s.descriptorForLogKey(group)
+	if !ok {
+		return nil, ErrCorrupt
+	}
 	data, err := os.ReadFile(filepath.Join(s.dir, nodeCheckpointDir, fmt.Sprintf("%x.chk", cp.ID)))
 	if err != nil {
 		return nil, err
@@ -1165,11 +1441,11 @@ func (s *NodeStore) loadCheckpoint(group uint64, cp seglog.Checkpoint) (*pb.Snap
 	if err != nil || sha256.Sum256(plain) != digest {
 		return nil, ErrCorrupt
 	}
-	return unmarshalSnapshot(plain, s.identity.MemberID)
+	return unmarshalSnapshot(plain, descriptor.MemberID)
 }
 
-func writeNodeMeta(dir string, identity Identity, key Key, logID [16]byte, reference snapshotReference, bounds formatBounds, cryptoState fileCrypto) error {
-	plain, err := marshalIdentity(identity, reference, bounds)
+func writeNodeMeta(dir string, identity NodeIdentity, key Key, logID [16]byte, bounds formatBounds, cryptoState fileCrypto) error {
+	plain, err := marshalNodeIdentity(identity, bounds)
 	if err != nil {
 		return err
 	}
