@@ -90,3 +90,114 @@ func TestNodeRuntimePersistenceSharesOneSequencerWithoutGroupWorkers(t *testing.
 		t.Fatal(err)
 	}
 }
+
+func TestAdoptNodeRuntimeDrivesWorkerFreeDurableReady(t *testing.T) {
+	legacy := testWALIdentity(17)
+	var nodeID [16]byte
+	copy(nodeID[:], []byte("runtime-node-017"))
+	node := raftstore.NodeIdentity{ClusterID: legacy.ClusterID, ClusterIncarnation: legacy.ClusterIncarnation, NodeID: nodeID}
+	descriptor := raftstore.GroupDescriptor{
+		TopologyRecoveryEpoch: testTopologyRecoveryEpoch,
+		AllocationGeneration:  legacy.AllocationGeneration,
+		MemberID:              legacy.MemberID,
+		GroupID:               legacy.GroupID,
+		ShardIncarnation:      legacy.ShardIncarnation,
+		StoreID:               legacy.StoreID,
+		Distribution:          legacy.Distribution,
+		Shard:                 legacy.Shard,
+	}
+	index, term := uint64(1), uint64(1)
+	bootstrap := &pb.Snapshot{
+		Data: []byte("raftmember-static-bootstrap"),
+		Metadata: &pb.SnapshotMetadata{
+			Index: &index, Term: &term,
+			ConfState: &pb.ConfState{Voters: []uint64{legacy.MemberID}},
+		},
+	}
+	options := raftstore.NodeStoreOptions{
+		Store: testWALOptions(), FrameBytes: 1 << 20, Events: 256,
+		WaveIDs: 64, EntriesPerGroup: 64, CachedSegments: 1, Groups: 8,
+	}
+	store, err := raftstore.CreateNodeStore(
+		filepath.Join(t.TempDir(), "node"), node, testWALKey(),
+		[]raftstore.NodeBootstrap{{Descriptor: descriptor, Snapshot: bootstrap}}, options,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err = store.BeginIncarnations([]uint64{1}); err != nil {
+		t.Fatal(err)
+	}
+	group := store.Group(1)
+	_, database, _ := prepareSQLRoot(t, legacy, "node-runtime")
+	authority := testAuthorityProfile()
+	base, err := BindPreparedNodeSQL(group, database, authority, "docs")
+	skipIfStrictAllocationUnsupported(t, "bind node runtime SQL", err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	apply, _, err := OpenPreparedNodeApply(group, database, authority, base, testApplyOptions())
+	skipIfStrictAllocationUnsupported(t, "open node runtime apply", err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = apply.InstallSnapshot(bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	identity, err := RuntimeIdentityFromNodeGroup(group, apply)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sequencer, err := raftstore.NewNodeSubmissionSequencer(store, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persistence, err := BindNodeRuntimePersistence(store, sequencer, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := AdoptNodeRuntime(persistence, database, apply)
+	if err != nil {
+		if runtime != nil {
+			_ = runtime.Close()
+		}
+		t.Fatal(err)
+	}
+	if runtime.wal != nil || runtime.stable != group || runtime.pipelined == nil ||
+		runtime.pipelined.workerWake != nil || runtime.pipelined.done != nil {
+		t.Fatalf("node Runtime retained a per-group WAL worker: wal=%p worker=%v done=%v", runtime.wal, runtime.pipelined.workerWake, runtime.pipelined.done)
+	}
+	if err = runtime.Campaign(); err != nil {
+		t.Fatal(err)
+	}
+	var workspace ReadyWorkspace
+	for step := 0; step < 1000; step++ {
+		result, driveErr := runtime.DriveReady(&workspace, func(OutboundMessage) error { return nil }, settleTestApplied)
+		if driveErr != nil {
+			t.Fatalf("DriveReady step %d: %v", step, driveErr)
+		}
+		if runtime.pipelined.nodeSubmission {
+			if _, waitErr := persistence.Wait(); waitErr != nil {
+				t.Fatalf("node persistence step %d: %v", step, waitErr)
+			}
+			continue
+		}
+		if !result.Progressed() {
+			break
+		}
+		if step == 999 {
+			t.Fatal("node Runtime Ready drain did not converge")
+		}
+	}
+	status, err := runtime.Status()
+	if err != nil || status.Term == 0 {
+		t.Fatalf("status=%+v err=%v", status, err)
+	}
+	if err = runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = group.LastIndex(); err != nil {
+		t.Fatalf("Runtime closed shared node store: %v", err)
+	}
+}

@@ -37,6 +37,55 @@ func OpenPreparedApply(
 	return database.OpenReplicatedApply(expectedSQL, bootstrap, options)
 }
 
+// OpenPreparedNodeApply acquires trusted apply against one authenticated group
+// in the node-wide log without constructing a Runtime or minting an
+// incarnation.
+func OpenPreparedNodeApply(
+	group *raftstore.GroupView,
+	database *sqldriver.Database,
+	authority sqldriver.ReplicatedAuthorityProfile,
+	expectedSQL sqldriver.ReplicatedShardStoreIdentity,
+	options sqldriver.ReplicatedApplyOptions,
+) (*sqldriver.ReplicatedApply, sqldriver.ReplicatedApplyIdentity, error) {
+	binding, bootstrap, err := nodeApplyPrerequisites(group, authority)
+	if err != nil {
+		return nil, sqldriver.ReplicatedApplyIdentity{}, err
+	}
+	if database == nil {
+		return nil, sqldriver.ReplicatedApplyIdentity{}, ErrInvalidDatabase
+	}
+	if expectedSQL.Binding != binding {
+		return nil, sqldriver.ReplicatedApplyIdentity{}, ErrBindingMismatch
+	}
+	if _, err := database.RequireReplicatedShardStore(expectedSQL); err != nil {
+		return nil, sqldriver.ReplicatedApplyIdentity{}, err
+	}
+	return database.OpenReplicatedApply(expectedSQL, bootstrap, options)
+}
+
+func nodeApplyPrerequisites(
+	group *raftstore.GroupView,
+	authority sqldriver.ReplicatedAuthorityProfile,
+) (sqldriver.ReplicatedShardStoreBinding, *pb.Snapshot, error) {
+	binding, err := BindingFromNodeGroup(group, authority)
+	if err != nil {
+		return sqldriver.ReplicatedShardStoreBinding{}, nil, err
+	}
+	base, err := group.Snapshot()
+	if err != nil {
+		return sqldriver.ReplicatedShardStoreBinding{}, nil, fmt.Errorf(
+			"%w: read node group checkpoint: %w", ErrWALUnavailable, err,
+		)
+	}
+	bootstrap, err := replicatedstate.StaticBootstrapForSnapshot(base)
+	if err != nil {
+		return sqldriver.ReplicatedShardStoreBinding{}, nil, fmt.Errorf(
+			"%w: recover static bootstrap from node group checkpoint: %w", ErrWALUnavailable, err,
+		)
+	}
+	return binding, bootstrap, nil
+}
+
 // OpenBoundSQLWithApply performs exact base+apply identity comparison before
 // SQL namespace and transaction recovery, then acquires the opaque claim using
 // the WAL's exact static bootstrap.

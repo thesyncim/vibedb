@@ -231,6 +231,7 @@ type NodeSubmissionSequencer struct {
 	stopOnce   sync.Once
 	drainOnce  sync.Once
 	fatal      atomic.Pointer[sequencerFailure]
+	ownerWake  atomic.Pointer[nodeSequencerWake]
 
 	persist func([]NodeReady) error
 
@@ -240,6 +241,7 @@ type NodeSubmissionSequencer struct {
 }
 
 type sequencerFailure struct{ err error }
+type nodeSequencerWake struct{ fn func() }
 
 func NewNodeSubmissionSequencer(store *NodeStore, capacity int) (*NodeSubmissionSequencer, error) {
 	if store == nil || capacity < 2 || capacity&(capacity-1) != 0 || capacity > 1<<20 {
@@ -273,6 +275,25 @@ func NewNodeSubmissionSequencer(store *NodeStore, capacity int) (*NodeSubmission
 // portable group identity into its dense local log key.
 func (q *NodeSubmissionSequencer) Owns(store *NodeStore) bool {
 	return q != nil && store != nil && q.store == store
+}
+
+// SetWake installs the one device-scheduler notification for this sequencer.
+// It is deliberately node-wide rather than per group: one callback drains all
+// Runtime completions made visible by a durability wave.
+func (q *NodeSubmissionSequencer) SetWake(wake func()) {
+	if q == nil || wake == nil {
+		if q != nil {
+			q.ownerWake.Store(nil)
+		}
+		return
+	}
+	q.ownerWake.Store(&nodeSequencerWake{fn: wake})
+}
+
+func (q *NodeSubmissionSequencer) notifyOwner() {
+	if wake := q.ownerWake.Load(); wake != nil && wake.fn != nil {
+		wake.fn()
+	}
 }
 
 func (q *NodeSubmissionSequencer) signal() {
@@ -469,6 +490,7 @@ func (q *NodeSubmissionSequencer) run() {
 			q.complete(items[i], completionErr)
 			items[i] = nil
 		}
+		q.notifyOwner()
 		if fatal {
 			failure := &sequencerFailure{err: completionErr}
 			q.fatal.CompareAndSwap(nil, failure)
@@ -478,6 +500,7 @@ func (q *NodeSubmissionSequencer) run() {
 			}
 			<-q.drained
 			q.failAccepted(completionErr)
+			q.notifyOwner()
 			return
 		}
 	}

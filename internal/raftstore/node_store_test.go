@@ -66,6 +66,47 @@ func TestNodeStoreUsesOnlyCanonicalNodeMetadataName(t *testing.T) {
 	}
 }
 
+func TestNodeStoreAuthenticatesCompleteCapacityGeometry(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "node")
+	options := NodeStoreOptions{Store: testOptions(), FrameBytes: 1 << 20, Events: 64, WaveIDs: 16, EntriesPerGroup: 16, CachedSegments: 1, Groups: 8}
+	store, err := CreateNodeStore(dir, testNodeIdentity(), testKey(), []NodeBootstrap{{Descriptor: testGroupDescriptor(10), Snapshot: nodeSnapshot(10, 1, 1)}}, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name   string
+		mutate func(*NodeStoreOptions)
+	}{
+		{"frame-bytes", func(o *NodeStoreOptions) { o.FrameBytes++ }},
+		{"events", func(o *NodeStoreOptions) { o.Events++ }},
+		{"wave-ids", func(o *NodeStoreOptions) { o.WaveIDs++ }},
+		{"entries-per-group", func(o *NodeStoreOptions) { o.EntriesPerGroup++ }},
+		{"cached-segments", func(o *NodeStoreOptions) { o.CachedSegments++ }},
+		{"groups", func(o *NodeStoreOptions) { o.Groups++ }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			changed := options
+			test.mutate(&changed)
+			reopened, openErr := OpenNodeStore(dir, testNodeIdentity(), testKey(), changed)
+			if reopened != nil {
+				_ = reopened.Close()
+			}
+			if !errors.Is(openErr, ErrIdentityMismatch) {
+				t.Fatalf("OpenNodeStore mismatch = %v", openErr)
+			}
+		})
+	}
+	reopened, err := OpenNodeStore(dir, testNodeIdentity(), testKey(), options)
+	if err != nil {
+		t.Fatalf("exact reopen: %v", err)
+	}
+	_ = reopened.Close()
+}
+
 func TestNodeStoreDescriptorEnrollmentIsAtomicMonotonicAndReopens(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "node")
 	options := NodeStoreOptions{Store: testOptions(), FrameBytes: 1 << 20, Events: 128, WaveIDs: 32, EntriesPerGroup: 32, CachedSegments: 1, Groups: 8}

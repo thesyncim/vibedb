@@ -16,6 +16,7 @@ var ErrNodePersistenceBinding = errors.New("raftmember: node persistence group b
 // order. Apply/outbound processing must wait for Wait/Poll completion.
 type NodeRuntimePersistence struct {
 	sequencer   *raftstore.NodeSubmissionSequencer
+	stable      *raftstore.GroupView
 	cell        raftstore.Submission
 	group       uint64
 	incarnation uint64
@@ -41,7 +42,7 @@ func BindNodeRuntimePersistence(store *raftstore.NodeStore, sequencer *raftstore
 	if err != nil || incarnation != identity.NodeIncarnation {
 		return nil, ErrNodePersistenceBinding
 	}
-	adapter := &NodeRuntimePersistence{sequencer: sequencer, group: descriptor.LogKey, incarnation: incarnation}
+	adapter := &NodeRuntimePersistence{sequencer: sequencer, stable: view, group: descriptor.LogKey, incarnation: incarnation}
 	if err = adapter.cell.Initialize(); err != nil {
 		return nil, err
 	}

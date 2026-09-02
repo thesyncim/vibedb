@@ -26,6 +26,46 @@ func ValidateImmutableBaseApplyCapacity(
 	return validateLiveApplyCapacity(wal, apply, false)
 }
 
+// ValidateNodeApplyCapacity proves the same bounded apply contract against one
+// group in the authenticated node-wide log.
+func ValidateNodeApplyCapacity(
+	group *raftstore.GroupView,
+	apply *sqldriver.ReplicatedApply,
+) error {
+	if group == nil {
+		return ErrWALUnavailable
+	}
+	profile, err := group.CapacityProfile()
+	if err != nil {
+		return fmt.Errorf("%w: inspect node group capacity profile: %w", ErrWALUnavailable, err)
+	}
+	if apply == nil {
+		return sqldriver.ErrReplicatedApplyClosed
+	}
+	applyProfile, err := apply.CapacityQualificationProfile()
+	if err != nil {
+		return err
+	}
+	liveBinding, err := BindingFromNodeGroup(group, applyProfile.Binding.Authority)
+	if err != nil {
+		return err
+	}
+	if liveBinding != applyProfile.Binding {
+		return fmt.Errorf("%w: replicated apply claim belongs to another node group binding", ErrBindingMismatch)
+	}
+	hard, _, err := group.InitialState()
+	if err != nil {
+		return fmt.Errorf("%w: inspect node group hard state: %w", ErrWALUnavailable, err)
+	}
+	last, err := group.LastIndex()
+	if err != nil {
+		return fmt.Errorf("%w: inspect node group last index: %w", ErrWALUnavailable, err)
+	}
+	return validateImmutableBaseApplyCapacity(
+		profile, applyProfile, max(hard.GetCommit(), applyProfile.Applied), last,
+	)
+}
+
 func validateLiveApplyCapacity(
 	wal *raftstore.Store,
 	apply *sqldriver.ReplicatedApply,

@@ -12,7 +12,16 @@ import (
 const (
 	nodeDescriptorGroup = ^uint64(0) - 1
 	nodeDescriptorFixed = 88
+	nodeIdentityBytes   = 152
 )
+
+// nodeStoreBounds is the complete immutable memory and disk geometry of a
+// node log. Every value which sizes a fixed hot-path arena or an engine index
+// is authenticated in NODEMETA and must match exactly on reopen.
+type nodeStoreBounds struct {
+	store                                                                formatBounds
+	frameBytes, events, waveIDs, entriesPerGroup, cachedSegments, groups uint64
+}
 
 func validateNodeIdentity(identity NodeIdentity) error {
 	if identity.ClusterID == ([16]byte{}) || identity.ClusterIncarnation == ([16]byte{}) || identity.NodeID == ([16]byte{}) {
@@ -21,37 +30,65 @@ func validateNodeIdentity(identity NodeIdentity) error {
 	return nil
 }
 
-func marshalNodeIdentity(identity NodeIdentity, bounds formatBounds) ([]byte, error) {
-	if validateNodeIdentity(identity) != nil {
+func marshalNodeIdentity(identity NodeIdentity, bounds nodeStoreBounds) ([]byte, error) {
+	if validateNodeIdentity(identity) != nil || !validNodeStoreBounds(bounds) {
 		return nil, ErrInvalid
 	}
-	b := make([]byte, 104)
+	b := make([]byte, nodeIdentityBytes)
 	binary.LittleEndian.PutUint16(b[0:2], 1)
 	copy(b[8:24], identity.ClusterID[:])
 	copy(b[24:40], identity.ClusterIncarnation[:])
 	copy(b[40:56], identity.NodeID[:])
-	binary.LittleEndian.PutUint64(b[56:64], bounds.fileBytes)
-	binary.LittleEndian.PutUint32(b[64:68], bounds.recordBytes)
-	binary.LittleEndian.PutUint64(b[72:80], bounds.records)
-	binary.LittleEndian.PutUint64(b[80:88], bounds.entries)
-	binary.LittleEndian.PutUint64(b[88:96], bounds.liveBytes)
-	binary.LittleEndian.PutUint32(b[96:100], crc32.Checksum(b[:96], crcTable))
+	binary.LittleEndian.PutUint64(b[56:64], bounds.store.fileBytes)
+	binary.LittleEndian.PutUint32(b[64:68], bounds.store.recordBytes)
+	binary.LittleEndian.PutUint64(b[72:80], bounds.store.records)
+	binary.LittleEndian.PutUint64(b[80:88], bounds.store.entries)
+	binary.LittleEndian.PutUint64(b[88:96], bounds.store.liveBytes)
+	binary.LittleEndian.PutUint64(b[96:104], bounds.frameBytes)
+	binary.LittleEndian.PutUint64(b[104:112], bounds.events)
+	binary.LittleEndian.PutUint64(b[112:120], bounds.waveIDs)
+	binary.LittleEndian.PutUint64(b[120:128], bounds.entriesPerGroup)
+	binary.LittleEndian.PutUint64(b[128:136], bounds.cachedSegments)
+	binary.LittleEndian.PutUint64(b[136:144], bounds.groups)
+	binary.LittleEndian.PutUint32(b[144:148], crc32.Checksum(b[:144], crcTable))
 	return b, nil
 }
 
-func unmarshalNodeIdentity(b []byte) (NodeIdentity, formatBounds, error) {
-	if len(b) != 104 || binary.LittleEndian.Uint16(b[0:2]) != 1 || !allZero(b[2:8]) || !allZero(b[68:72]) || !allZero(b[100:104]) || binary.LittleEndian.Uint32(b[96:100]) != crc32.Checksum(b[:96], crcTable) {
-		return NodeIdentity{}, formatBounds{}, ErrCorrupt
+func unmarshalNodeIdentity(b []byte) (NodeIdentity, nodeStoreBounds, error) {
+	if len(b) != nodeIdentityBytes || binary.LittleEndian.Uint16(b[0:2]) != 1 || !allZero(b[2:8]) || !allZero(b[68:72]) || !allZero(b[148:152]) || binary.LittleEndian.Uint32(b[144:148]) != crc32.Checksum(b[:144], crcTable) {
+		return NodeIdentity{}, nodeStoreBounds{}, ErrCorrupt
 	}
 	var identity NodeIdentity
 	copy(identity.ClusterID[:], b[8:24])
 	copy(identity.ClusterIncarnation[:], b[24:40])
 	copy(identity.NodeID[:], b[40:56])
-	bounds := formatBounds{fileBytes: binary.LittleEndian.Uint64(b[56:64]), recordBytes: binary.LittleEndian.Uint32(b[64:68]), records: binary.LittleEndian.Uint64(b[72:80]), entries: binary.LittleEndian.Uint64(b[80:88]), liveBytes: binary.LittleEndian.Uint64(b[88:96])}
-	if validateNodeIdentity(identity) != nil || bounds.fileBytes < HeaderBytes || bounds.fileBytes > uint64(AbsoluteMaxFileBytes) || bounds.recordBytes == 0 || bounds.recordBytes > AbsoluteMaxRecordBytes || bounds.records == 0 || bounds.records > AbsoluteMaxRecords || bounds.entries == 0 || bounds.entries > AbsoluteMaxEntries || bounds.liveBytes == 0 || bounds.liveBytes > uint64(AbsoluteMaxLiveBytes) {
-		return NodeIdentity{}, formatBounds{}, ErrCorrupt
+	bounds := nodeStoreBounds{
+		store: formatBounds{
+			fileBytes: binary.LittleEndian.Uint64(b[56:64]), recordBytes: binary.LittleEndian.Uint32(b[64:68]),
+			records: binary.LittleEndian.Uint64(b[72:80]), entries: binary.LittleEndian.Uint64(b[80:88]), liveBytes: binary.LittleEndian.Uint64(b[88:96]),
+		},
+		frameBytes: binary.LittleEndian.Uint64(b[96:104]), events: binary.LittleEndian.Uint64(b[104:112]),
+		waveIDs: binary.LittleEndian.Uint64(b[112:120]), entriesPerGroup: binary.LittleEndian.Uint64(b[120:128]),
+		cachedSegments: binary.LittleEndian.Uint64(b[128:136]), groups: binary.LittleEndian.Uint64(b[136:144]),
+	}
+	if validateNodeIdentity(identity) != nil || !validNodeStoreBounds(bounds) {
+		return NodeIdentity{}, nodeStoreBounds{}, ErrCorrupt
 	}
 	return identity, bounds, nil
+}
+
+func validNodeStoreBounds(bounds nodeStoreBounds) bool {
+	store := bounds.store
+	return store.fileBytes >= HeaderBytes && store.fileBytes <= uint64(AbsoluteMaxFileBytes) &&
+		store.recordBytes > 0 && store.recordBytes <= AbsoluteMaxRecordBytes &&
+		store.records > 0 && store.records <= AbsoluteMaxRecords &&
+		store.entries > 0 && store.entries <= AbsoluteMaxEntries &&
+		store.liveBytes > 0 && store.liveBytes <= uint64(AbsoluteMaxLiveBytes) &&
+		bounds.frameBytes >= 72 && bounds.frameBytes <= AbsoluteMaxRecordBytes &&
+		bounds.events > 0 && bounds.events <= AbsoluteMaxEntries &&
+		bounds.waveIDs > 0 && bounds.waveIDs <= AbsoluteMaxRecords &&
+		bounds.entriesPerGroup > 0 && bounds.entriesPerGroup <= MaxReadyEntries &&
+		bounds.cachedSegments <= math.MaxUint32 && bounds.groups > 0 && bounds.groups <= math.MaxUint32
 }
 
 func validateGroupDescriptor(descriptor GroupDescriptor, allowZeroKey bool) error {
