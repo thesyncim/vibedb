@@ -29,7 +29,8 @@ const (
 	eventIncarnation      uint16 = 15
 	eventWaveRef          uint16 = 16
 
-	segmentHeaderBytes   = 128
+	segmentIdentityBytes = 128
+	segmentHeaderBytes   = segmentIdentityBytes + reserveHeaderBytes
 	recordHeaderBytes    = 40
 	segmentFooterBytes   = 160
 	maxSegmentIndexBytes = 64 << 20
@@ -116,10 +117,10 @@ func pendingSegment(s SegmentMeta) bool {
 }
 
 func marshalSegmentHeader(h segmentHeader) []byte {
-	b := make([]byte, segmentHeaderBytes)
+	b := make([]byte, segmentIdentityBytes)
 	copy(b, headerMagic[:])
 	binary.LittleEndian.PutUint16(b[8:10], canonicalFormatMarker)
-	binary.LittleEndian.PutUint16(b[10:12], segmentHeaderBytes)
+	binary.LittleEndian.PutUint16(b[10:12], segmentIdentityBytes)
 	binary.LittleEndian.PutUint64(b[16:24], h.ID)
 	binary.LittleEndian.PutUint64(b[24:32], h.Generation)
 	binary.LittleEndian.PutUint64(b[32:40], h.PreviousID)
@@ -132,7 +133,11 @@ func marshalSegmentHeader(h segmentHeader) []byte {
 }
 
 func unmarshalSegmentHeader(b []byte) (segmentHeader, error) {
-	if len(b) != segmentHeaderBytes || !validCRC(b) || string(b[:8]) != string(headerMagic[:]) || binary.LittleEndian.Uint16(b[8:10]) != canonicalFormatMarker || binary.LittleEndian.Uint16(b[10:12]) != segmentHeaderBytes {
+	if len(b) < segmentIdentityBytes {
+		return segmentHeader{}, fmt.Errorf("%w: segment header", ErrCorrupt)
+	}
+	b = b[:segmentIdentityBytes]
+	if !validCRC(b) || string(b[:8]) != string(headerMagic[:]) || binary.LittleEndian.Uint16(b[8:10]) != canonicalFormatMarker || binary.LittleEndian.Uint16(b[10:12]) != segmentIdentityBytes {
 		return segmentHeader{}, fmt.Errorf("%w: segment header", ErrCorrupt)
 	}
 	h := segmentHeader{ID: binary.LittleEndian.Uint64(b[16:24]), Generation: binary.LittleEndian.Uint64(b[24:32]), PreviousID: binary.LittleEndian.Uint64(b[32:40])}
@@ -140,7 +145,7 @@ func unmarshalSegmentHeader(b []byte) (segmentHeader, error) {
 	copy(h.LogID[:], b[72:88])
 	copy(h.FileID[:], b[88:104])
 	h.Capacity = binary.LittleEndian.Uint64(b[104:112])
-	if h.ID == 0 || h.Generation == 0 || (h.ID == 1) != (h.PreviousID == 0) || h.PreviousID+1 != h.ID || h.LogID == ([16]byte{}) || h.FileID == (fileID{}) || h.Capacity < segmentHeaderBytes || h.Capacity >= 1<<32 || !allZero(b[112:segmentHeaderBytes-4]) {
+	if h.ID == 0 || h.Generation == 0 || (h.ID == 1) != (h.PreviousID == 0) || h.PreviousID+1 != h.ID || h.LogID == ([16]byte{}) || h.FileID == (fileID{}) || h.Capacity < segmentHeaderBytes || h.Capacity >= 1<<32 || !allZero(b[112:segmentIdentityBytes-4]) {
 		return segmentHeader{}, fmt.Errorf("%w: segment header identity", ErrCorrupt)
 	}
 	return h, nil

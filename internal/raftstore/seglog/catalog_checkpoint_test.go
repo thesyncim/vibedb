@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"syscall"
 	"testing"
 )
@@ -100,6 +101,78 @@ func TestCatalogCheckpointWriterRejectsImpossibleState(t *testing.T) {
 	}
 }
 
+func TestCatalogCheckpointStreamsBaseSummariesRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	checkpoint := validCatalogCheckpoint(fileID{14})
+	checkpoint.BaseSequence = 91
+	groups := []checkpointGroupSummary{
+		{GroupID: 3, Summary: sealedRunSummary{LastIndex: 8, LastTerm: 2, Hard: HardState{Term: 2, Commit: 8}, TruncateIndex: 4, TruncateTerm: 1}},
+		{GroupID: 100, Summary: sealedRunSummary{LastIndex: 12, LastTerm: 3, Checkpoint: Checkpoint{ID: [16]byte{7}, Index: 10, Term: 2}, TruncateIndex: 10, TruncateTerm: 2}},
+	}
+	checkpoint.GroupIDs = []uint64{3, 100}
+	checkpoint.GroupSummaries = map[uint64]sealedRunSummary{3: groups[0].Summary, 100: groups[1].Summary}
+	digest, err := writeCatalogCheckpoint(dir, checkpoint, testAuthKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	slot := metadataSlot{Generation: checkpoint.Generation, LogID: checkpoint.LogID, CatalogTail: checkpoint.Tail, CatalogHash: checkpoint.CatalogHash, CheckpointID: [16]byte(checkpoint.ID), CheckpointTail: checkpoint.Tail, CheckpointHash: digest, AnchorID: checkpoint.AnchorID, AnchorGeneration: checkpoint.AnchorGeneration, AnchorHash: checkpoint.AnchorHash}
+	segments, base, _, _, _, err := readCatalogCheckpoint(dir, slot, testAuthKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(segments) != 1 || base.Sequence != checkpoint.BaseSequence || !reflect.DeepEqual(base.Groups, groups) {
+		t.Fatalf("segments=%d base=%+v", len(segments), base)
+	}
+}
+
+func TestCatalogCheckpointRewritesPartialDeterministicTemp(t *testing.T) {
+	for _, cut := range []int{1, catalogCheckpointHeaderBytes - 1, catalogCheckpointHeaderBytes + catalogCheckpointEntryBytes/2, catalogCheckpointHeaderBytes + catalogCheckpointEntryBytes + catalogCheckpointTrailerBytes - 1} {
+		t.Run(string(rune(cut)), func(t *testing.T) {
+			dir := t.TempDir()
+			checkpoint := validCatalogCheckpoint(fileID{0x31, byte(cut)})
+			tmp := filepath.Join(dir, "."+checkpointFileName(checkpoint.ID)+".tmp")
+			if err := os.WriteFile(tmp, make([]byte, cut), 0o640); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := writeCatalogCheckpoint(dir, checkpoint, testAuthKey); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(filepath.Join(dir, checkpointFileName(checkpoint.ID))); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(tmp); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("partial temp remains: %v", err)
+			}
+		})
+	}
+}
+
+func TestCatalogCheckpointTempRecoveryRejectsNamespaceSubstitution(t *testing.T) {
+	dir := t.TempDir()
+	checkpoint := validCatalogCheckpoint(fileID{0x41})
+	tmp := filepath.Join(dir, "."+checkpointFileName(checkpoint.ID)+".tmp")
+	backup := tmp + ".validated"
+	if err := os.WriteFile(tmp, []byte{1}, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	checkpointBeforeTempCleanup = func(path string) {
+		checkpointBeforeTempCleanup = nil
+		if err := os.Rename(path, backup); err != nil {
+			t.Fatalf("rename partial temp: %v", err)
+		}
+		if err := os.WriteFile(path, []byte("substitute"), 0o640); err != nil {
+			t.Fatalf("install substitute: %v", err)
+		}
+	}
+	t.Cleanup(func() { checkpointBeforeTempCleanup = nil })
+	if _, err := writeCatalogCheckpoint(dir, checkpoint, testAuthKey); !errors.Is(err, os.ErrExist) {
+		t.Fatalf("checkpoint temp substitution accepted: %v", err)
+	}
+	if got, err := os.ReadFile(tmp); err != nil || string(got) != "substitute" {
+		t.Fatalf("substitute removed or changed: %q %v", got, err)
+	}
+}
+
 func TestRepeatedCheckpointENOSPCLeavesDirectoryBounded(t *testing.T) {
 	dir := t.TempDir()
 	saved := checkpointWriteFullAt
@@ -155,15 +228,42 @@ func TestNilCheckpointHookDoesNotSuppressOrdinaryFailureCleanup(t *testing.T) {
 	}
 }
 
-func TestCatalogCheckpointRejectsDuplicateSealedFileOwnership(t *testing.T) {
-	id := fileID{8}
-	firstHash, secondHash := [32]byte{1}, [32]byte{2}
-	segments := []SegmentMeta{
-		{ID: 1, Generation: 1, Bytes: segmentHeaderBytes + sealedIndexHeaderBytes + segmentFooterBytes, IndexOffset: segmentHeaderBytes, IndexBytes: sealedIndexHeaderBytes, Hash: firstHash, FileID: id, State: SegmentSealed},
-		{ID: 2, Generation: 2, Bytes: segmentHeaderBytes + sealedIndexHeaderBytes + segmentFooterBytes, IndexOffset: segmentHeaderBytes, IndexBytes: sealedIndexHeaderBytes, PreviousHash: firstHash, Hash: secondHash, FileID: id, State: SegmentSealed},
+func TestOpenRejectsDuplicateCheckpointFileIDAtExactSegmentIdentity(t *testing.T) {
+	dir := t.TempDir()
+	engine := newEngineAt(t, dir, 1)
+	for index := uint64(1); index <= 2; index++ {
+		wave := Wave{ID: waveID(index), Batches: []ReadyBatch{{GroupID: 1, Entries: []Entry{{Index: index, Term: 1}}}}}
+		if err := engine.PersistWave(wave); err != nil {
+			t.Fatal(err)
+		}
+		if err := engine.Rotate(nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := engine.WaitSeal(); err != nil {
+			t.Fatal(err)
+		}
 	}
-	_, err := writeCatalogCheckpoint(t.TempDir(), catalogCheckpoint{ID: fileID{9}, LogID: testLogID, Generation: 2, Tail: metadataCatalogStart + 2*catalogRecordBytes, CatalogHash: [32]byte{3}, Segments: segments}, testAuthKey)
-	if !errors.Is(err, ErrCorrupt) {
-		t.Fatalf("duplicate sealed FileID=%v", err)
+	segments := append([]SegmentMeta(nil), engine.log.state.Segments...)
+	if len(segments) != 2 {
+		t.Fatalf("segments=%d", len(segments))
+	}
+	segments[1].FileID = segments[0].FileID
+	id := fileID{9, 9}
+	digest, err := writeCatalogCheckpoint(dir, catalogCheckpoint{ID: id, LogID: testLogID, Generation: engine.log.metadata.slot.Generation, Tail: engine.log.metadata.slot.CatalogTail, CatalogHash: engine.log.metadata.slot.CatalogHash, Segments: segments}, testAuthKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := engine.log.metadata.slot
+	next.Generation++
+	next.CheckpointID, next.CheckpointTail, next.CheckpointHash = [16]byte(id), next.CatalogTail, digest
+	if err = engine.log.metadata.publish(next, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err = engine.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if reopened, openErr := openTestEngine(dir); openErr == nil {
+		_ = reopened.Close()
+		t.Fatal("duplicate checkpoint FileID survived exact segment-header verification")
 	}
 }

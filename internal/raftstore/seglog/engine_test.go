@@ -9,7 +9,9 @@ import (
 	"hash/crc32"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
+	"syscall"
 	"testing"
 
 	pb "go.etcd.io/raft/v3/raftpb"
@@ -421,6 +423,58 @@ func TestWaveRetryStateStaysBoundedAcrossWritesAndRotations(t *testing.T) {
 	}
 }
 
+func TestCheckpointBaseSummaryMatchesFullSealedReplay(t *testing.T) {
+	dir := t.TempDir()
+	engine := newEngineAt(t, dir, 1)
+	hard1 := HardState{Term: 1, Vote: 1, Commit: 1}
+	if err := engine.PersistWave(Wave{ID: waveID(1), Batches: []ReadyBatch{{GroupID: 1, NodeIncarnation: 1, ReadyID: 1, ReadyDigest: [16]byte{1}, Entries: []Entry{{Index: 1, Term: 1}, {Index: 2, Term: 1}}, Hard: &hard1}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.Rotate(nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.WaitSeal(); err != nil {
+		t.Fatal(err)
+	}
+	hard2 := HardState{Term: 2, Vote: 1, Commit: 3}
+	if err := engine.PersistWave(Wave{ID: waveID(2), Batches: []ReadyBatch{{GroupID: 1, NodeIncarnation: 1, ReadyID: 2, ReadyDigest: [16]byte{2}, ReplaceFrom: 2, Entries: []Entry{{Index: 2, Term: 2}, {Index: 3, Term: 2}}, Hard: &hard2}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.Rotate(nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.WaitSeal(); err != nil {
+		t.Fatal(err)
+	}
+	want, ok := engine.Group(1)
+	if !ok {
+		t.Fatal("group missing before checkpoint")
+	}
+	id := fileID{0xee, 1}
+	digest, err := writeCatalogCheckpoint(dir, catalogCheckpoint{ID: id, LogID: testLogID, Generation: engine.log.metadata.slot.Generation, Tail: engine.log.metadata.slot.CatalogTail, CatalogHash: engine.log.metadata.slot.CatalogHash, Segments: engine.log.state.Segments, BaseSequence: engine.sealedSequence, GroupIDs: engine.sealedSummaryOrder, GroupSummaries: engine.sealedSummaries}, testAuthKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := engine.log.metadata.slot
+	next.Generation++
+	next.CheckpointID, next.CheckpointTail, next.CheckpointHash = [16]byte(id), next.CatalogTail, digest
+	if err = engine.log.metadata.publish(next, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err = engine.Close(); err != nil {
+		t.Fatal(err)
+	}
+	engine, err = openTestEngine(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+	got, ok := engine.Group(1)
+	if !ok || !reflect.DeepEqual(got, want) {
+		t.Fatalf("base replay mismatch\n got=%+v\nwant=%+v", got, want)
+	}
+}
+
 func TestSharedWaveRefSurvivesOneGroupAdvanceAfterReopen(t *testing.T) {
 	dir := t.TempDir()
 	e := newEngineAt(t, dir, 1, 2)
@@ -492,6 +546,84 @@ func TestCatalogHardSuffixBackpressuresBeforeRotationMutation(t *testing.T) {
 	}
 	if e.log.state.Generation != before.Generation || e.log.state.ActiveID != before.ActiveID || e.log.activeOffset != beforeOffset || e.sealPending {
 		t.Fatalf("hard-bound refusal mutated state: before=%+v/%d after=%+v/%d", before, beforeOffset, e.log.state, e.log.activeOffset)
+	}
+}
+
+func TestMetadataCheckpointWriterFailureRetriesWithoutPoison(t *testing.T) {
+	oldSoft, oldWriter := catalogCheckpointSoftRecords, catalogCheckpointWriter
+	catalogCheckpointSoftRecords = 1
+	t.Cleanup(func() { catalogCheckpointSoftRecords, catalogCheckpointWriter = oldSoft, oldWriter })
+	e := newReservedEngine(t, 1)
+	defer e.Close()
+	if err := e.PersistWave(Wave{ID: waveID(1), Batches: []ReadyBatch{{GroupID: 1, Entries: []Entry{{Index: 1, Term: 1}}}}}); err != nil {
+		t.Fatal(err)
+	}
+	injected := syscall.EIO
+	catalogCheckpointWriter = func(string, catalogCheckpoint, [32]byte) ([32]byte, error) { return [32]byte{}, injected }
+	if err := e.Rotate(nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.WaitSeal(); err != nil {
+		t.Fatal(err)
+	}
+	e.runMetadataMaintenance()
+	if err := e.log.usable(); err != nil {
+		t.Fatalf("ordinary checkpoint I/O poisoned engine: %v", err)
+	}
+	if catalogSuffixRecords(e.log.metadata.slot) == 0 {
+		t.Fatal("failed checkpoint unexpectedly published")
+	}
+	catalogCheckpointWriter = oldWriter
+	e.runMetadataMaintenance()
+	if err := e.log.usable(); err != nil || catalogSuffixRecords(e.log.metadata.slot) != 0 {
+		t.Fatalf("checkpoint maintenance did not recover: suffix=%d err=%v", catalogSuffixRecords(e.log.metadata.slot), err)
+	}
+}
+
+func TestMetadataCheckpointSnapshotConcurrentWithReclaimFenceUpdate(t *testing.T) {
+	oldWriter := catalogCheckpointWriter
+	t.Cleanup(func() { catalogCheckpointWriter = oldWriter })
+	e, _, _ := newReclaimableEngine(t, t.TempDir())
+	defer e.Close()
+	if err := e.PersistWave(Wave{ID: waveID(20), Batches: []ReadyBatch{{GroupID: 1, Entries: []Entry{{Index: 3, Term: 1}}}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Rotate(nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.WaitSeal(); err != nil {
+		t.Fatal(err)
+	}
+	e.writeMu.Lock()
+	e.log.metadata.needsHealing = true
+	e.writeMu.Unlock()
+	entered := make(chan struct{})
+	start := make(chan struct{})
+	catalogCheckpointWriter = func(dir string, checkpoint catalogCheckpoint, key [32]byte) ([32]byte, error) {
+		close(entered)
+		<-start
+		return oldWriter(dir, checkpoint, key)
+	}
+	maintenanceDone := make(chan struct{})
+	go func() {
+		e.runMetadataMaintenance()
+		close(maintenanceDone)
+	}()
+	<-entered
+	persistDone := make(chan error, 1)
+	checkpoint := Checkpoint{ID: [16]byte{0x44}, Index: 3, Term: 1}
+	hard := HardState{Term: 1, Vote: 1, Commit: 3}
+	go func() {
+		<-start
+		persistDone <- e.PersistWave(Wave{ID: waveID(21), Batches: []ReadyBatch{{GroupID: 1, Checkpoint: &checkpoint, Hard: &hard}}})
+	}()
+	close(start)
+	if err := <-persistDone; err != nil {
+		t.Fatal(err)
+	}
+	<-maintenanceDone
+	if err := e.log.usable(); err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -49,19 +49,19 @@ func createLog(dir string, logID [16]byte, authKey [32]byte, segmentCapacity uin
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
-	f, activeReserve, err := prepareReserve(dir, segmentCapacity)
+	f, activeReserve, err := prepareReserve(dir, segmentCapacity, logID, authKey)
 	if err != nil {
 		return nil, err
 	}
 	h := segmentHeader{ID: 1, Generation: 1, LogID: logID, FileID: activeReserve.FileID, Capacity: activeReserve.Capacity}
-	if err = activateReserve(f, h); err != nil {
+	if err = activateReserve(f, h, authKey); err != nil {
 		_ = f.Close()
 		return nil, err
 	}
 	var reserves [2]reserveDescriptor
 	var reserveFiles [2]*os.File
 	for i := range reserves {
-		reserveFiles[i], reserves[i], err = prepareReserve(dir, activeReserve.Capacity)
+		reserveFiles[i], reserves[i], err = prepareReserve(dir, activeReserve.Capacity, logID, authKey)
 		if err != nil {
 			_ = f.Close()
 			for j := 0; j < i; j++ {
@@ -83,7 +83,8 @@ func createLog(dir string, logID [16]byte, authKey [32]byte, segmentCapacity uin
 	}
 	m := stateFromMetadata(slot, nil)
 	activeHash := sha256.New()
-	_, _ = activeHash.Write(marshalSegmentHeader(h))
+	prefix := marshalSegmentPrefix(h, authKey)
+	_, _ = activeHash.Write(prefix[:])
 	return &Log{dir: dir, active: f, activeOffset: segmentHeaderBytes, activeHash: activeHash, state: m, metadata: metadata, reserveFiles: reserveFiles, authKey: authKey}, nil
 }
 
@@ -177,9 +178,10 @@ func (l *Log) Sync() error {
 
 // replenishReserve runs only on the serial background sealer. The file is
 // physically allocated and durable before its ownership appears in a slot.
-func activateReserve(file *os.File, header segmentHeader) error {
-	if stat, err := file.Stat(); err != nil || stat.Size() != 0 {
-		return errors.Join(ErrCorrupt, err)
+func activateReserve(file *os.File, header segmentHeader, key [32]byte) error {
+	descriptor := reserveDescriptor{FileID: header.FileID, Capacity: header.Capacity, Ready: true}
+	if err := verifyPhysicalReserve(file, descriptor, header.LogID, key); err != nil {
+		return err
 	}
 	bytes := marshalSegmentHeader(header)
 	if err := writeFullAt(file, bytes, 0); err != nil {
