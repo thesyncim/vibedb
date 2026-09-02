@@ -107,8 +107,11 @@ func (service *Service) Serve(ctx context.Context, connection rafttransport.Peer
 		}
 	} else {
 		provider, ok := service.options.Provider.(GroupProvider)
+		if !ok {
+			return ErrMetrics
+		}
 		identity, metrics, found := provider.GroupProgressMetrics(group)
-		if !ok || !found || identity.Group != group || identity.MemberID == 0 {
+		if !found || identity.Group != group || identity.MemberID == 0 {
 			return ErrMetrics
 		}
 		snapshot.Member, snapshot.Metrics = identity.MemberID, metrics

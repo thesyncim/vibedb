@@ -83,6 +83,11 @@ func (j *Journal) compactedBytesLocked() (uint64, bool) {
 				}
 			}
 		}
+		for range record.status.RecoveryPulse {
+			if !add(0) {
+				return total, false
+			}
+		}
 		if record.status.CoordinatorState == CoordinatorCommitted ||
 			record.status.CoordinatorState == CoordinatorAborted {
 			payload := 0
@@ -271,6 +276,11 @@ func (j *Journal) writeCompactedLocked(file *os.File) (uint64, error) {
 				if err := write(journalManifestSegment, 0, uint64(index)+1, id, page); err != nil {
 					return 0, err
 				}
+			}
+		}
+		for pulse := uint8(1); pulse <= record.status.RecoveryPulse; pulse++ {
+			if err := write(journalCoordinatorPulse, pulse, 1, id, nil); err != nil {
+				return 0, err
 			}
 		}
 		switch state {

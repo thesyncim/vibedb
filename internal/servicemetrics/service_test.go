@@ -2,6 +2,7 @@ package servicemetrics
 
 import (
 	"context"
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -16,6 +17,14 @@ type testProvider struct {
 	group    raftmember.GroupKey
 	member   uint64
 	stages   StageMetricsSnapshot
+}
+
+type aggregateOnlyProvider struct {
+	snapshot raftservice.ProgressMetricsSnapshot
+}
+
+func (provider aggregateOnlyProvider) ProgressMetrics() raftservice.ProgressMetricsSnapshot {
+	return provider.snapshot
 }
 
 func (provider testProvider) StageMetrics() StageMetricsSnapshot { return provider.stages }
@@ -125,6 +134,29 @@ func TestAuthenticatedMetricsServiceReturnsOnlyExactLocalGroup(t *testing.T) {
 	}
 	if err = <-done; err == nil {
 		t.Fatal("server accepted unknown group")
+	}
+}
+
+func TestMetricsServiceRejectsGroupRequestWhenProviderHasNoGroupSupport(t *testing.T) {
+	identity := rafttransport.PeerIdentity{Node: rafttransport.NodeID{1}}
+	service, err := NewService(ServiceOptions{Provider: aggregateOnlyProvider{},
+		Authorize:    func(peer rafttransport.PeerIdentity) bool { return peer == identity },
+		ReadDeadline: func() time.Time { return time.Now().Add(time.Second) }, WriteDeadline: func() time.Time { return time.Now().Add(time.Second) }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	group := raftmember.GroupKey{ClusterID: [16]byte{1}, ClusterIncarnation: [16]byte{2},
+		TopologyRecoveryEpoch: 3, ShardIncarnation: [16]byte{4}, GroupID: [16]byte{5}}
+	server, client := net.Pipe()
+	done := make(chan error, 1)
+	go func() { done <- service.Serve(t.Context(), &testConnection{Conn: server, peer: identity}) }()
+	if _, err = (Client{Open: func(context.Context) (rafttransport.PeerConnection, error) {
+		return &testConnection{Conn: client}, nil
+	}}).ReadGroup(t.Context(), group); err == nil {
+		t.Fatal("group request succeeded without a GroupProvider")
+	}
+	if err = <-done; !errors.Is(err, ErrMetrics) {
+		t.Fatalf("server error = %v, want ErrMetrics", err)
 	}
 }
 

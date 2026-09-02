@@ -961,6 +961,26 @@ func TestConfiguredFileModeAppliesToLazyCollectionCreation(t *testing.T) {
 	}
 }
 
+func TestOpenDefensivelyClonesSkipIndexesForLazyCollections(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "skip-index-options.vdb")
+	skipIndexes := []string{"/score"}
+	db, err := vibedb.Open(path, vibedb.WithAdvancedOptions(vibedb.AdvancedOptions{
+		Durability: vibedb.Buffered,
+		Engine:     durable.Options{SkipIndexes: skipIndexes},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// Open owns a frozen copy of caller configuration. Mutating the source
+	// before the first lazy collection is materialized must not alter it.
+	skipIndexes[0] = "not-an-rfc6901-pointer"
+	if _, err = db.Collection("scores").Put("one", []byte(`{"score":1}`)); err != nil {
+		t.Fatalf("lazy Put observed caller mutation: %v", err)
+	}
+}
+
 func TestInvalidLazyMutationsDoNotCreateCollectionFiles(t *testing.T) {
 	t.Run("bounds and JSON", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "invalid-put.vdb")

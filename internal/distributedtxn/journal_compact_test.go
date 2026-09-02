@@ -219,3 +219,50 @@ func TestJournalCompactPreservesActiveManifestContinuation(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestJournalCompactPreservesCoordinatorRecoveryPulse(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "transactions.vtj")
+	id := journalID(241)
+	j, err := OpenJournal(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = j.StageCoordinator(journalCoordinator(t, id)); err != nil {
+		t.Fatal(err)
+	}
+	for pulse := uint8(1); pulse <= 2; pulse++ {
+		if _, err = j.PulseCoordinator(id, 1, pulse); err != nil {
+			t.Fatalf("pulse %d: %v", pulse, err)
+		}
+	}
+	wantUsage := j.Usage()
+	if opportunity := j.CompactionOpportunity(); opportunity.CompactedBytes == 0 {
+		t.Fatalf("compaction opportunity = %+v", opportunity)
+	}
+	if err = j.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	if got := j.Usage(); got != wantUsage {
+		t.Fatalf("compacted usage = %+v, want %+v", got, wantUsage)
+	}
+	if err = j.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	j, err = OpenJournal(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer j.Close()
+	status, found := j.CoordinatorStatus(id)
+	if !found || status.Revision != 1 || status.CoordinatorState != CoordinatorStaging ||
+		status.RecoveryPulse != 2 {
+		t.Fatalf("reopened status = %+v, found=%v", status, found)
+	}
+	if got := j.Usage(); got != wantUsage {
+		t.Fatalf("reopened usage = %+v, want %+v", got, wantUsage)
+	}
+	if status, err = j.PulseCoordinator(id, 1, 3); err != nil || status.RecoveryPulse != 3 {
+		t.Fatalf("continued pulse = %+v, %v", status, err)
+	}
+}

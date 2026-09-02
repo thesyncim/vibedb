@@ -220,6 +220,7 @@ func normalizeOptions(options AdvancedOptions, target openTarget) (normalizedOpt
 
 func cloneEngineOptions(options durable.Options) durable.Options {
 	options.Indexes = slices.Clone(options.Indexes)
+	options.SkipIndexes = slices.Clone(options.SkipIndexes)
 	for i := range options.Indexes {
 		options.Indexes[i].Name = strings.Clone(options.Indexes[i].Name)
 		options.Indexes[i].Paths = slices.Clone(options.Indexes[i].Paths)
