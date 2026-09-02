@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+	"sync/atomic"
 
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftstore/seglog"
@@ -95,6 +96,12 @@ type NodeStore struct {
 	namespaceProofTest                        func() error
 	checkpointHookTest                        func(CheckpointPhase) error
 	checkpointLeaveTempTest                   bool
+	sequencer                                 *NodeSubmissionSequencer
+	closing                                   bool
+	closeDone                                 chan struct{}
+	closeErr                                  error
+	closeInit                                 sync.Once
+	closingFlag                               atomic.Bool
 	closed                                    bool
 	poisoned                                  error
 }
@@ -551,11 +558,21 @@ func syncNodeDirectory(path string) error {
 	return errors.Join(directory.Sync(), directory.Close())
 }
 
-func (s *NodeStore) PersistWave(ready []NodeReady) error {
+func (s *NodeStore) PersistWave(ready []NodeReady) error { return s.persistWave(ready, false) }
+
+func (s *NodeStore) persistSequencedWave(ready []NodeReady) error { return s.persistWave(ready, true) }
+
+func (s *NodeStore) persistWave(ready []NodeReady, sequenced bool) error {
+	if !sequenced && s.closingFlag.Load() {
+		return ErrClosed
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
+	if s.closed || s.closing && !sequenced {
 		return ErrClosed
+	}
+	if !sequenced && s.sequencer != nil {
+		return ErrSequencerActive
 	}
 	if s.poisoned != nil {
 		return errors.Join(ErrPersistenceUnknown, s.poisoned)
@@ -757,6 +774,9 @@ func (s *NodeStore) BeginIncarnations(groups []uint64) ([]GroupIncarnation, erro
 	if err := s.usable(); err != nil {
 		return nil, err
 	}
+	if s.sequencer != nil {
+		return nil, ErrSequencerActive
+	}
 	if len(groups) == 0 || len(groups) > MaxPersistGroupBatches {
 		return nil, ErrInvalid
 	}
@@ -784,6 +804,9 @@ func (s *NodeStore) PersistIncarnations(requests []GroupIncarnation) error {
 	defer s.mu.Unlock()
 	if err := s.usable(); err != nil {
 		return err
+	}
+	if s.sequencer != nil {
+		return ErrSequencerActive
 	}
 	return s.persistIncarnationsLocked(requests)
 }
@@ -857,7 +880,7 @@ func (v *GroupView) Persist(batch raftmodel.PersistBatch) error {
 }
 
 func (s *NodeStore) usable() error {
-	if s.closed {
+	if s.closed || s.closing {
 		return ErrClosed
 	}
 	if s.poisoned != nil {
@@ -867,15 +890,31 @@ func (s *NodeStore) usable() error {
 }
 
 func (s *NodeStore) Close() error {
+	s.closeInit.Do(func() { s.closeDone = make(chan struct{}) })
+	done := s.closeDone
+	if !s.closingFlag.CompareAndSwap(false, true) {
+		<-done
+		return s.closeErr
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		close(done)
+		return s.closeErr
+	}
+	s.closing = true
+	sequencer := s.sequencer
+	s.mu.Unlock()
+	var err error
+	if sequencer != nil {
+		err = sequencer.Close()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
-		return nil
-	}
 	s.closed = true
-	var err error
+	s.closing = false
 	if s.engine != nil {
-		err = s.engine.Close()
+		err = errors.Join(err, s.engine.Close())
 	}
 	if s.metaFile != nil {
 		err = errors.Join(err, s.metaFile.Close())
@@ -886,6 +925,8 @@ func (s *NodeStore) Close() error {
 	if s.lock != nil {
 		err = errors.Join(err, storeio.UnlockWriter(s.lock), s.lock.Close())
 	}
+	s.closeErr = err
+	close(done)
 	return err
 }
 
