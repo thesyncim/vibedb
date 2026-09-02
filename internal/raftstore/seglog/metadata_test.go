@@ -158,7 +158,7 @@ func TestCatalogCheckpointBoundsOpenToSuffix(t *testing.T) {
 	}
 	alias := store.slot
 	alias.Active.FileID = segments[0].FileID
-	if _, _, aliasErr := readCatalogBounded(dir, store.file, alias, testAuthKey); !errors.Is(aliasErr, ErrCorrupt) {
+	if _, _, _, aliasErr := readCatalogBounded(dir, store.file, alias, testAuthKey); !errors.Is(aliasErr, ErrCorrupt) {
 		t.Fatalf("sealed/active FileID alias accepted: %v", aliasErr)
 	}
 	secondCheckpointID := fileID{0xc2}
@@ -205,26 +205,250 @@ func TestCatalogCheckpointBoundsOpenToSuffix(t *testing.T) {
 	if len(got) != 20 || got[19].ID != 20 || catalogSuffixRecords(opened.slot) != 4 || !opened.needsHealing || opened.slot.CheckpointID != [16]byte(firstCheckpointID) || opened.slot.PreviousCheckpointID != ([16]byte{}) {
 		t.Fatalf("segments=%d suffix=%d", len(got), catalogSuffixRecords(opened.slot))
 	}
+	// The physical bank was recoverable only through its previous checkpoint at
+	// record 16. Ring overwrite admission must use that verified floor, not the
+	// corrupt current checkpoint's record-20 cursor retained in the raw slot.
+	oldRing := catalogRingRecords
+	catalogRingRecords = 4
+	t.Cleanup(func() { catalogRingRecords = oldRing })
+	hash := sha256.Sum256([]byte{21})
+	segment := SegmentMeta{ID: 21, Generation: 21, Bytes: segmentHeaderBytes + sealedIndexHeaderBytes + segmentFooterBytes, Records: 1, IndexOffset: segmentHeaderBytes, IndexBytes: sealedIndexHeaderBytes, Hash: hash, State: SegmentSealed}
+	next := opened.slot
+	next.Generation++
+	next.Active = activeDescriptor{FileID: activeFile, ID: 22, Generation: 22, PreviousID: 21, PreviousHash: hash, Capacity: 1 << 20}
+	if publishErr := opened.publish(next, &catalogRecord{Kind: catalogSeal, Segment: segment, FileID: fileID{22}}); !errors.Is(publishErr, ErrBounds) {
+		t.Fatalf("fallback-dependent ring overwrite = %v", publishErr)
+	}
 }
 
-func TestMetadataRunwayRejectsNoopSecondReplenishment(t *testing.T) {
+func TestOpenMarksNonchosenPreviousCheckpointBankForHealing(t *testing.T) {
 	dir := t.TempDir()
 	initial := metadataSlot{Generation: 1, LogID: testLogID, CatalogTail: metadataCatalogStart, Active: activeDescriptor{FileID: fileID{1}, ID: 1, Generation: 1, Capacity: 1 << 20}}
 	store, err := createMetadataStore(dir, initial, testAuthKey)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	segmentHash := sha256.Sum256([]byte("healing segment"))
+	segment := SegmentMeta{ID: 1, Generation: 1, Bytes: segmentHeaderBytes + sealedIndexHeaderBytes + segmentFooterBytes, Records: 1, IndexOffset: segmentHeaderBytes, IndexBytes: sealedIndexHeaderBytes, Hash: segmentHash, FileID: fileID{9}, State: SegmentSealed}
+	next := store.slot
+	next.Generation++
+	next.Active = activeDescriptor{FileID: fileID{1}, ID: 2, Generation: 2, PreviousID: 1, PreviousHash: segmentHash, Capacity: 1 << 20}
+	if err = store.publish(next, &catalogRecord{Kind: catalogSeal, Segment: SegmentMeta{ID: segment.ID, Generation: segment.Generation, Bytes: segment.Bytes, Records: segment.Records, IndexOffset: segment.IndexOffset, IndexBytes: segment.IndexBytes, Hash: segment.Hash, State: SegmentSealed}, FileID: segment.FileID}); err != nil {
+		t.Fatal(err)
+	}
+	initial = store.slot
+	ids := [3]fileID{{0xa1}, {0xb2}, {0xc3}}
+	var hashes [3][32]byte
+	for i := range ids {
+		hashes[i], err = writeCatalogCheckpoint(dir, catalogCheckpoint{ID: ids[i], LogID: testLogID, Generation: initial.Generation, Tail: initial.CatalogTail, CatalogHash: initial.CatalogHash, Segments: []SegmentMeta{segment}}, testAuthKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	low := initial
+	low.Generation = 10
+	low.CheckpointID, low.CheckpointTail, low.CheckpointHash = [16]byte(ids[1]), initial.CatalogTail, hashes[1]
+	low.PreviousCheckpointID, low.PreviousCheckpointTail, low.PreviousCheckpointHash = [16]byte(ids[0]), initial.CatalogTail, hashes[0]
+	high := initial
+	high.Generation = 11
+	high.CheckpointID, high.CheckpointTail, high.CheckpointHash = [16]byte(ids[2]), initial.CatalogTail, hashes[2]
+	var raw [metadataSlotBytes]byte
+	if err = marshalMetadataSlot(raw[:], low, testAuthKey); err == nil {
+		err = writeFullAt(store.file, raw[:], metadataSlot0Offset)
+	}
+	if err == nil {
+		err = marshalMetadataSlot(raw[:], high, testAuthKey)
+	}
+	if err == nil {
+		err = writeFullAt(store.file, raw[:], metadataSlot1Offset)
+	}
+	if err == nil {
+		err = store.file.Sync()
+	}
+	if closeErr := store.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentLow := filepath.Join(dir, checkpointFileName(ids[1]))
+	file, err := os.OpenFile(currentLow, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = file.WriteAt([]byte{0xff}, 20); err == nil {
+		err = file.Sync()
+	}
+	if closeErr := file.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, _, err := openMetadataStore(dir, testLogID, testAuthKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opened.slotIndex != 1 || opened.slot.Generation != high.Generation || !opened.needsHealing || opened.bankRecoveryFloor[0] != initial.CatalogTail {
+		t.Fatalf("chosen=%d generation=%d healing=%v floors=%v", opened.slotIndex, opened.slot.Generation, opened.needsHealing, opened.bankRecoveryFloor)
+	}
+	repair := opened.slot
+	repair.Generation++
+	if err = opened.publish(repair, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, fallback, err := readCatalogBounded(dir, opened.file, opened.bankSlots[0], testAuthKey); err != nil || fallback {
+		t.Fatalf("repaired bank still fallback-dependent: fallback=%v err=%v", fallback, err)
+	}
+	if opened.needsHealing {
+		t.Fatal("nonchosen fallback bank remained degraded after rewrite")
+	}
+	if err = opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	low = initial
+	low.Generation = 20
+	low.CheckpointID, low.CheckpointTail, low.CheckpointHash = [16]byte(ids[2]), initial.CatalogTail, hashes[2]
+	high = initial
+	high.Generation = 21
+	high.CheckpointID, high.CheckpointTail, high.CheckpointHash = [16]byte(ids[1]), initial.CatalogTail, hashes[1]
+	high.PreviousCheckpointID, high.PreviousCheckpointTail, high.PreviousCheckpointHash = [16]byte(ids[0]), initial.CatalogTail, hashes[0]
+	meta, err := os.OpenFile(filepath.Join(dir, metadataName), os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = marshalMetadataSlot(raw[:], low, testAuthKey); err == nil {
+		err = writeFullAt(meta, raw[:], metadataSlot0Offset)
+	}
+	if err == nil {
+		err = marshalMetadataSlot(raw[:], high, testAuthKey)
+	}
+	if err == nil {
+		err = writeFullAt(meta, raw[:], metadataSlot1Offset)
+	}
+	if err == nil {
+		err = meta.Sync()
+	}
+	if closeErr := meta.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, _, err = openMetadataStore(dir, testLogID, testAuthKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	if opened.slotIndex != 1 || !opened.needsHealing || opened.slot.CheckpointID != [16]byte(ids[0]) {
+		t.Fatalf("chosen fallback not normalized: index=%d healing=%v slot=%+v", opened.slotIndex, opened.needsHealing, opened.slot)
+	}
+	firstRepair := opened.slot
+	firstRepair.Generation++
+	if err = opened.publish(firstRepair, nil); err != nil {
+		t.Fatal(err)
+	}
+	if !opened.needsHealing {
+		t.Fatal("one opposite-bank publish falsely healed chosen fallback bank")
+	}
+	secondRepair := opened.slot
+	secondRepair.Generation++
+	if err = opened.publish(secondRepair, nil); err != nil {
+		t.Fatal(err)
+	}
+	if opened.needsHealing || !opened.bankHealthy[0] || !opened.bankHealthy[1] {
+		t.Fatalf("two-bank healing incomplete: healing=%v healthy=%v", opened.needsHealing, opened.bankHealthy)
+	}
+}
+
+func TestMetadataRingRejectsNoopPhysicalAllocation(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "meta-ring-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if err = file.Truncate(metadataCatalogStart); err != nil {
+		t.Fatal(err)
+	}
 	old := metadataPhysicalFile
 	metadataPhysicalFile = func(*os.File, uint64) error { return nil }
 	defer func() { metadataPhysicalFile = old }()
-	softTail := uint64(metadataCatalogStart) + catalogCheckpointSoftRecords*catalogRecordBytes
-	if err = store.file.Truncate(int64(softTail)); err != nil {
+	if err = preallocateMetadataRing(file); !errors.Is(err, ErrBounds) {
+		t.Fatalf("no-op ring allocation = %v", err)
+	}
+}
+
+func TestMetadataRingRequiresBothRecoverableBanksBeforeOverwrite(t *testing.T) {
+	oldRing := catalogRingRecords
+	catalogRingRecords = 4
+	t.Cleanup(func() { catalogRingRecords = oldRing })
+	dir := t.TempDir()
+	activeFile := fileID{1}
+	initial := metadataSlot{Generation: 1, LogID: testLogID, CatalogTail: metadataCatalogStart, Active: activeDescriptor{FileID: activeFile, ID: 1, Generation: 1, Capacity: 1 << 20}}
+	store, err := createMetadataStore(dir, initial, testAuthKey)
+	if err != nil {
 		t.Fatal(err)
 	}
-	through := softTail + catalogCheckpointHardRecords*catalogRecordBytes
-	if err = preallocateMetadataRunway(store.file, through); !errors.Is(err, ErrBounds) {
-		t.Fatalf("no-op second runway = %v", err)
+	defer store.Close()
+	segments := make([]SegmentMeta, 0, 5)
+	previousHash := [32]byte{}
+	publishSegment := func(id uint64) error {
+		hash := sha256.Sum256([]byte{byte(id)})
+		segment := SegmentMeta{ID: id, Generation: id, Bytes: segmentHeaderBytes + sealedIndexHeaderBytes + segmentFooterBytes, Records: 1, IndexOffset: segmentHeaderBytes, IndexBytes: sealedIndexHeaderBytes, PreviousHash: previousHash, Hash: hash, FileID: fileID{byte(id + 1)}, State: SegmentSealed}
+		recordSegment := segment
+		recordSegment.PreviousHash, recordSegment.FileID = [32]byte{}, fileID{}
+		next := store.slot
+		next.Generation++
+		next.Active = activeDescriptor{FileID: activeFile, ID: id + 1, Generation: id + 1, PreviousID: id, PreviousHash: hash, Capacity: 1 << 20}
+		if publishErr := store.publish(next, &catalogRecord{Kind: catalogSeal, Segment: recordSegment, FileID: segment.FileID}); publishErr != nil {
+			return publishErr
+		}
+		segments = append(segments, segment)
+		previousHash = hash
+		return nil
+	}
+	for id := uint64(1); id <= 4; id++ {
+		if err = publishSegment(id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// An unreadable physical bank is never permission to overwrite its ring
+	// dependency; the first checkpoint cut below explicitly repairs that bank.
+	store.bankUsable[1] = false
+	before := store.slot
+	if err = publishSegment(5); !errors.Is(err, ErrBounds) {
+		t.Fatalf("unsafe overwrite = %v", err)
+	}
+	if store.slot != before || len(segments) != 4 {
+		t.Fatal("unsafe overwrite mutated state")
+	}
+	for bank := byte(0); bank < 2; bank++ {
+		checkpointID := fileID{0xd0 + bank}
+		digest, writeErr := writeCatalogCheckpoint(dir, catalogCheckpoint{ID: checkpointID, LogID: testLogID, Generation: store.slot.Generation, Tail: store.slot.CatalogTail, CatalogHash: store.slot.CatalogHash, Segments: segments}, testAuthKey)
+		if writeErr != nil {
+			t.Fatal(writeErr)
+		}
+		next := store.slot
+		next.Generation++
+		next.PreviousCheckpointID, next.PreviousCheckpointTail, next.PreviousCheckpointHash = [16]byte{}, 0, [32]byte{}
+		next.CheckpointID, next.CheckpointTail, next.CheckpointHash = [16]byte(checkpointID), next.CatalogTail, digest
+		if err = store.publish(next, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err = publishSegment(5); err != nil {
+		t.Fatalf("safe overwrite = %v", err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	opened, got, err := openMetadataStore(dir, testLogID, testAuthKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	if len(got) != 5 || got[4].ID != 5 {
+		t.Fatalf("recovered segments=%v", got)
 	}
 }
 

@@ -12,17 +12,38 @@ import (
 // cannot share a 4 KiB page with the fallback slot. The catalog begins after a
 // second alignment gap so future direct-I/O metadata writers retain alignment.
 const (
-	metadataSlotBytes    = 4096
-	metadataSlot0Offset  = 0
-	metadataSlot1Offset  = metadataSlotBytes
-	metadataCatalogStart = 16 << 10
-	catalogRecordBytes   = 192
+	metadataSlotBytes      = 4096
+	metadataSlot0Offset    = 0
+	metadataSlot1Offset    = metadataSlotBytes
+	metadataCatalogStart   = 16 << 10
+	catalogRecordBytes     = 192
+	metadataCatalogRecords = 8192
+	metadataCatalogBytes   = metadataCatalogRecords * catalogRecordBytes
+	metadataCatalogEnd     = metadataCatalogStart + metadataCatalogBytes
 
-	metadataSlotMACOffset = metadataSlotBytes - 36
-	metadataSlotCRCOffset = metadataSlotBytes - 4
-	catalogMACOffset      = catalogRecordBytes - 36
-	catalogCRCOffset      = catalogRecordBytes - 4
+	metadataSlotMACOffset    = metadataSlotBytes - 36
+	metadataSlotCRCOffset    = metadataSlotBytes - 4
+	catalogMACOffset         = catalogRecordBytes - 36
+	catalogCRCOffset         = catalogRecordBytes - 4
+	maxRetiredSegments       = 32
+	retiredDescriptorBytes   = 104
+	retiredDescriptorsOffset = 504
+	retiredCheckpointOffset  = 3868
+	maxRetiredCheckpoints    = 4
 )
+
+// Tests may reduce the logical ring while retaining the production physical
+// allocation. It is control-plane state and never read on append hot paths.
+var catalogRingRecords = uint64(metadataCatalogRecords)
+
+func catalogPhysicalOffset(cursor uint64) (int64, error) {
+	if cursor < metadataCatalogStart || (cursor-metadataCatalogStart)%catalogRecordBytes != 0 || catalogRingRecords == 0 || catalogRingRecords > metadataCatalogRecords {
+		return 0, ErrCorrupt
+	}
+	record := (cursor - metadataCatalogStart) / catalogRecordBytes
+	offset := uint64(metadataCatalogStart) + record%catalogRingRecords*catalogRecordBytes
+	return int64(offset), nil
+}
 
 var (
 	metadataMagic = [8]byte{'V', 'D', 'B', 'S', 'M', 'E', 'T', 'A'}
@@ -58,6 +79,27 @@ type reserveDescriptor struct {
 	Ready    bool
 }
 
+type reclaimPhase uint8
+
+const (
+	reclaimNone reclaimPhase = iota
+	reclaimPrepared
+	reclaimDurable
+)
+
+type retiredDescriptor struct {
+	ID, Generation uint64
+	FileID         fileID
+	Bytes          uint64
+	PreviousHash   [32]byte
+	Hash           [32]byte
+}
+
+type retiredCheckpointDescriptor struct {
+	ID   fileID
+	Hash [32]byte
+}
+
 type metadataSlot struct {
 	Generation                 uint64
 	LogID                      [16]byte
@@ -75,6 +117,12 @@ type metadataSlot struct {
 	Pending                    pendingDescriptor
 	HasPending                 bool
 	Reserves                   [2]reserveDescriptor
+	ReclaimPhase               reclaimPhase
+	RetiredCount               uint8
+	RetiredReserveMask         uint32
+	Retired                    [maxRetiredSegments]retiredDescriptor
+	RetiredCheckpointCount     uint8
+	RetiredCheckpoints         [maxRetiredCheckpoints]retiredCheckpointDescriptor
 }
 
 type catalogRecord struct {
@@ -94,7 +142,10 @@ type catalogRecord struct {
 //	264..376 optional pending descriptor
 //	376..440 two 32-byte reserve descriptors
 //	440..496 previous checkpoint descriptor
-//	496..4060 canonical zero padding
+//	496..504 reclaim phase/count/recycled-reserve mask
+//	504..3832 thirty-two 104-byte retired segment descriptors
+//	3832..3868 retired-checkpoint count and canonical zero padding
+//	3868..4060 four 48-byte retired checkpoint ID/hash descriptors
 //	4060..4092 HMAC-SHA256; 4092..4096 CRC32C
 func marshalMetadataSlot(dst []byte, slot metadataSlot, key [32]byte) error {
 	if len(dst) != metadataSlotBytes || key == ([32]byte{}) || validateMetadataSlot(slot) != nil {
@@ -126,6 +177,18 @@ func marshalMetadataSlot(dst []byte, slot metadataSlot, key [32]byte) error {
 	copy(dst[440:456], slot.PreviousCheckpointID[:])
 	binary.LittleEndian.PutUint64(dst[456:464], slot.PreviousCheckpointTail)
 	copy(dst[464:496], slot.PreviousCheckpointHash[:])
+	dst[496] = byte(slot.ReclaimPhase)
+	dst[497] = slot.RetiredCount
+	binary.LittleEndian.PutUint32(dst[498:502], slot.RetiredReserveMask)
+	for i := 0; i < int(slot.RetiredCount); i++ {
+		putRetiredDescriptor(dst[retiredDescriptorsOffset+i*retiredDescriptorBytes:retiredDescriptorsOffset+(i+1)*retiredDescriptorBytes], slot.Retired[i])
+	}
+	dst[3832] = slot.RetiredCheckpointCount
+	for i := 0; i < int(slot.RetiredCheckpointCount); i++ {
+		start := retiredCheckpointOffset + i*48
+		copy(dst[start:start+16], slot.RetiredCheckpoints[i].ID[:])
+		copy(dst[start+16:start+48], slot.RetiredCheckpoints[i].Hash[:])
+	}
 	mac := hmac.New(sha256.New, key[:])
 	_, _ = mac.Write(dst[:metadataSlotMACOffset])
 	copy(dst[metadataSlotMACOffset:metadataSlotCRCOffset], mac.Sum(nil))
@@ -139,7 +202,9 @@ func unmarshalMetadataSlot(src []byte, key [32]byte) (metadataSlot, error) {
 	}
 	mac := hmac.New(sha256.New, key[:])
 	_, _ = mac.Write(src[:metadataSlotMACOffset])
-	if !hmac.Equal(src[metadataSlotMACOffset:metadataSlotCRCOffset], mac.Sum(nil)) || !allZero(src[496:metadataSlotMACOffset]) {
+	retiredCount := src[497]
+	retiredCheckpointCount := src[3832]
+	if retiredCount > maxRetiredSegments || retiredCheckpointCount > maxRetiredCheckpoints || !hmac.Equal(src[metadataSlotMACOffset:metadataSlotCRCOffset], mac.Sum(nil)) || !allZero(src[502:retiredDescriptorsOffset]) || !allZero(src[retiredDescriptorsOffset+int(retiredCount)*retiredDescriptorBytes:3832]) || !allZero(src[3833:retiredCheckpointOffset]) || !allZero(src[retiredCheckpointOffset+int(retiredCheckpointCount)*48:metadataSlotMACOffset]) {
 		return metadataSlot{}, ErrCorrupt
 	}
 	flags := binary.LittleEndian.Uint32(src[12:16])
@@ -155,6 +220,17 @@ func unmarshalMetadataSlot(src []byte, key [32]byte) (metadataSlot, error) {
 	copy(slot.PreviousCheckpointID[:], src[440:456])
 	slot.PreviousCheckpointTail = binary.LittleEndian.Uint64(src[456:464])
 	copy(slot.PreviousCheckpointHash[:], src[464:496])
+	slot.ReclaimPhase, slot.RetiredCount = reclaimPhase(src[496]), retiredCount
+	slot.RetiredReserveMask = binary.LittleEndian.Uint32(src[498:502])
+	for i := 0; i < int(slot.RetiredCount); i++ {
+		slot.Retired[i] = getRetiredDescriptor(src[retiredDescriptorsOffset+i*retiredDescriptorBytes : retiredDescriptorsOffset+(i+1)*retiredDescriptorBytes])
+	}
+	slot.RetiredCheckpointCount = retiredCheckpointCount
+	for i := 0; i < int(retiredCheckpointCount); i++ {
+		start := retiredCheckpointOffset + i*48
+		copy(slot.RetiredCheckpoints[i].ID[:], src[start:start+16])
+		copy(slot.RetiredCheckpoints[i].Hash[:], src[start+16:start+48])
+	}
 	slot.Active = getActiveDescriptor(src[184:264])
 	slot.Pending = getPendingDescriptor(src[264:376])
 	if !validReserveDescriptorBytes(src[376:408]) || !validReserveDescriptorBytes(src[408:440]) {
@@ -180,7 +256,7 @@ func validateMetadataSlot(slot metadataSlot) error {
 		return ErrCorrupt
 	}
 	previousCheckpoint := slot.PreviousCheckpointID != ([16]byte{}) || slot.PreviousCheckpointTail != 0 || slot.PreviousCheckpointHash != ([32]byte{})
-	if previousCheckpoint && (slot.PreviousCheckpointID == ([16]byte{}) || slot.PreviousCheckpointHash == ([32]byte{}) || slot.PreviousCheckpointTail < metadataCatalogStart || slot.PreviousCheckpointTail >= slot.CheckpointTail || (slot.PreviousCheckpointTail-metadataCatalogStart)%catalogRecordBytes != 0) {
+	if previousCheckpoint && (slot.PreviousCheckpointID == ([16]byte{}) || slot.PreviousCheckpointID == slot.CheckpointID || slot.PreviousCheckpointHash == ([32]byte{}) || slot.PreviousCheckpointTail < metadataCatalogStart || slot.PreviousCheckpointTail > slot.CheckpointTail || (slot.PreviousCheckpointTail-metadataCatalogStart)%catalogRecordBytes != 0) {
 		return ErrCorrupt
 	}
 	if previousCheckpoint && !checkpoint {
@@ -222,7 +298,72 @@ func validateMetadataSlot(slot metadataSlot) error {
 	if slot.Reserves[0].Ready && slot.Reserves[1].Ready && slot.Reserves[0].FileID == slot.Reserves[1].FileID {
 		return ErrCorrupt
 	}
+	if slot.ReclaimPhase > reclaimDurable || (slot.ReclaimPhase == reclaimNone) != (slot.RetiredCount == 0) || slot.RetiredCount > maxRetiredSegments || slot.RetiredReserveMask>>slot.RetiredCount != 0 || slot.ReclaimPhase != reclaimDurable && slot.RetiredReserveMask != 0 {
+		return ErrCorrupt
+	}
+	for i := 0; i < int(slot.RetiredCount); i++ {
+		retired := slot.Retired[i]
+		if retired.ID == 0 || retired.Generation == 0 || retired.FileID == (fileID{}) || retired.Bytes < segmentHeaderBytes+sealedIndexHeaderBytes+segmentFooterBytes || retired.Bytes > slot.Active.Capacity || retired.Hash == ([32]byte{}) || (retired.ID == 1) != (retired.PreviousHash == ([32]byte{})) || i != 0 && (retired.ID != slot.Retired[i-1].ID+1 || retired.Generation != slot.Retired[i-1].Generation+1 || retired.PreviousHash != slot.Retired[i-1].Hash) {
+			return ErrCorrupt
+		}
+		if retired.FileID == slot.Active.FileID || slot.HasPending && retired.FileID == slot.Pending.FileID {
+			return ErrCorrupt
+		}
+		matchedReserve := false
+		for j := range slot.Reserves {
+			if slot.Reserves[j].Ready && retired.FileID == slot.Reserves[j].FileID {
+				matchedReserve = true
+			}
+		}
+		if matchedReserve != (slot.RetiredReserveMask&(uint32(1)<<i) != 0) {
+			return ErrCorrupt
+		}
+		for j := 0; j < i; j++ {
+			if retired.FileID == slot.Retired[j].FileID {
+				return ErrCorrupt
+			}
+		}
+	}
+	if slot.RetiredCount != 0 {
+		last := slot.Retired[slot.RetiredCount-1]
+		if last.ID != slot.AnchorID || last.Generation != slot.AnchorGeneration || last.Hash != slot.AnchorHash {
+			return ErrCorrupt
+		}
+	}
+	if slot.RetiredCheckpointCount > maxRetiredCheckpoints {
+		return ErrCorrupt
+	}
+	for i := 0; i < int(slot.RetiredCheckpointCount); i++ {
+		retired := slot.RetiredCheckpoints[i]
+		if retired.ID == (fileID{}) || retired.Hash == ([32]byte{}) || retired.ID == fileID(slot.CheckpointID) || retired.ID == fileID(slot.PreviousCheckpointID) {
+			return ErrCorrupt
+		}
+		for j := 0; j < i; j++ {
+			if retired.ID == slot.RetiredCheckpoints[j].ID {
+				return ErrCorrupt
+			}
+		}
+	}
 	return nil
+}
+
+func putRetiredDescriptor(dst []byte, d retiredDescriptor) {
+	binary.LittleEndian.PutUint64(dst[0:8], d.ID)
+	binary.LittleEndian.PutUint64(dst[8:16], d.Generation)
+	copy(dst[16:32], d.FileID[:])
+	binary.LittleEndian.PutUint64(dst[32:40], d.Bytes)
+	copy(dst[40:72], d.PreviousHash[:])
+	copy(dst[72:104], d.Hash[:])
+}
+
+func getRetiredDescriptor(src []byte) (d retiredDescriptor) {
+	d.ID = binary.LittleEndian.Uint64(src[0:8])
+	d.Generation = binary.LittleEndian.Uint64(src[8:16])
+	copy(d.FileID[:], src[16:32])
+	d.Bytes = binary.LittleEndian.Uint64(src[32:40])
+	copy(d.PreviousHash[:], src[40:72])
+	copy(d.Hash[:], src[72:104])
+	return d
 }
 
 func putActiveDescriptor(dst []byte, d activeDescriptor) {

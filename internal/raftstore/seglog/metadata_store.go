@@ -10,23 +10,25 @@ import (
 const metadataName = "META"
 
 type metadataStore struct {
-	dir          string
-	file         *os.File
-	key          [32]byte
-	slot         metadataSlot
-	slotIndex    uint8
-	slotBuffer   [metadataSlotBytes]byte
-	recordBuf    [catalogRecordBytes]byte
-	needsHealing bool
+	dir               string
+	file              *os.File
+	key               [32]byte
+	slot              metadataSlot
+	slotIndex         uint8
+	slotBuffer        [metadataSlotBytes]byte
+	recordBuf         [catalogRecordBytes]byte
+	needsHealing      bool
+	bankSlots         [2]metadataSlot
+	bankUsable        [2]bool
+	bankHealthy       [2]bool
+	bankRecoveryFloor [2]uint64
+	base              checkpointBase
 }
 
 var metadataPhysicalFile = metadataAllocateThrough
 
-func preallocateMetadataRunway(file *os.File, through uint64) error {
-	if through >= 1<<32 {
-		return ErrBounds
-	}
-	if err := metadataPhysicalFile(file, through); err != nil {
+func preallocateMetadataRing(file *os.File) error {
+	if err := metadataPhysicalFile(file, metadataCatalogEnd); err != nil {
 		return err
 	}
 	stat, err := file.Stat()
@@ -35,13 +37,10 @@ func preallocateMetadataRunway(file *os.File, through uint64) error {
 	}
 	allocated, ok := allocatedFileBytes(stat)
 	// META has one intentional sparse alignment hole between slot 1 and the
-	// catalog. Apart from that bounded hole, physical blocks must cover the
-	// requested absolute runway; this detects a no-op second replenishment.
-	// Creation verifies before the two slots are written, so the portable
-	// allowance includes the whole fixed 16 KiB prefix. Subsequent checks still
-	// detect a missing runway because this allowance never grows.
+	// catalog. Apart from that bounded hole, physical blocks cover the entire
+	// fixed circular catalog for the lifetime of the store.
 	const boundedHole = metadataCatalogStart
-	if !ok || allocated > ^uint64(0)-boundedHole || allocated+boundedHole < through {
+	if !ok || allocated > ^uint64(0)-boundedHole || allocated+boundedHole < metadataCatalogEnd {
 		return ErrBounds
 	}
 	return nil
@@ -84,7 +83,7 @@ func createMetadataStore(dir string, initial metadataSlot, key [32]byte) (*metad
 	if err != nil {
 		return nil, err
 	}
-	store := &metadataStore{dir: dir, file: file, key: key, slot: initial}
+	store := &metadataStore{dir: dir, file: file, key: key, slot: initial, bankSlots: [2]metadataSlot{initial, initial}, bankUsable: [2]bool{true, true}, bankHealthy: [2]bool{true, true}, bankRecoveryFloor: [2]uint64{metadataCatalogStart, metadataCatalogStart}}
 	clean := true
 	defer func() {
 		if clean {
@@ -95,7 +94,7 @@ func createMetadataStore(dir string, initial metadataSlot, key [32]byte) (*metad
 	if err = file.Truncate(metadataCatalogStart); err != nil {
 		return nil, err
 	}
-	if err = preallocateMetadataRunway(file, metadataCatalogStart+catalogCheckpointHardRecords*catalogRecordBytes); err != nil {
+	if err = preallocateMetadataRing(file); err != nil {
 		return nil, err
 	}
 	if err = marshalMetadataSlot(store.slotBuffer[:], initial, key); err != nil {
@@ -130,14 +129,16 @@ func openMetadataStore(dir string, logID [16]byte, key [32]byte) (*metadataStore
 	var valid [2]bool
 	var usedPrevious [2]bool
 	var candidates [2][]SegmentMeta
+	var bases [2]checkpointBase
 	for i, off := range []int64{metadataSlot0Offset, metadataSlot1Offset} {
 		if readFullAt(file, store.slotBuffer[:], off) != nil {
 			continue
 		}
 		slot, decodeErr := unmarshalMetadataSlot(store.slotBuffer[:], key)
 		if decodeErr == nil && slot.LogID == logID {
-			if segments, fallback, chainErr := readCatalogBounded(dir, file, slot, key); chainErr == nil {
+			if segments, base, fallback, chainErr := readCatalogBounded(dir, file, slot, key); chainErr == nil {
 				slots[i], candidates[i], valid[i] = slot, segments, true
+				bases[i] = base
 				usedPrevious[i] = fallback
 			}
 		}
@@ -154,6 +155,23 @@ func openMetadataStore(dir string, logID [16]byte, key [32]byte) (*metadataStore
 		return nil, nil, ErrCorrupt
 	}
 	store.slot, store.slotIndex = slots[chosen], uint8(chosen)
+	store.base = bases[chosen]
+	store.bankSlots, store.bankUsable = slots, valid
+	for i := range valid {
+		store.bankHealthy[i] = valid[i] && !usedPrevious[i]
+	}
+	for i := range valid {
+		if !valid[i] {
+			continue
+		}
+		store.bankRecoveryFloor[i] = metadataCatalogStart
+		if usedPrevious[i] {
+			store.bankRecoveryFloor[i] = slots[i].PreviousCheckpointTail
+		} else if slots[i].CheckpointID != ([16]byte{}) {
+			store.bankRecoveryFloor[i] = slots[i].CheckpointTail
+		}
+	}
+	store.needsHealing = !store.bankHealthy[0] || !store.bankHealthy[1]
 	if usedPrevious[chosen] {
 		store.slot.CheckpointID, store.slot.CheckpointTail, store.slot.CheckpointHash = store.slot.PreviousCheckpointID, store.slot.PreviousCheckpointTail, store.slot.PreviousCheckpointHash
 		store.slot.PreviousCheckpointID, store.slot.PreviousCheckpointTail, store.slot.PreviousCheckpointHash = [16]byte{}, 0, [32]byte{}
@@ -162,26 +180,26 @@ func openMetadataStore(dir string, logID [16]byte, key [32]byte) (*metadataStore
 	return store, candidates[chosen], nil
 }
 
-func readCatalogBounded(dir string, file *os.File, slot metadataSlot, key [32]byte) ([]SegmentMeta, bool, error) {
+func readCatalogBounded(dir string, file *os.File, slot metadataSlot, key [32]byte) ([]SegmentMeta, checkpointBase, bool, error) {
 	if slot.CatalogTail < metadataCatalogStart || (slot.CatalogTail-metadataCatalogStart)%catalogRecordBytes != 0 {
-		return nil, false, ErrCorrupt
+		return nil, checkpointBase{}, false, ErrCorrupt
 	}
-	segments, tail, digest, lastRecordGeneration, err := readCatalogCheckpoint(dir, slot, key)
+	segments, base, tail, digest, lastRecordGeneration, err := readCatalogCheckpoint(dir, slot, key)
 	usedPrevious := false
 	if err != nil && slot.PreviousCheckpointID != ([16]byte{}) {
 		fallback := slot
 		fallback.CheckpointID = slot.PreviousCheckpointID
 		fallback.CheckpointTail = slot.PreviousCheckpointTail
 		fallback.CheckpointHash = slot.PreviousCheckpointHash
-		segments, tail, digest, lastRecordGeneration, err = readCatalogCheckpoint(dir, fallback, key)
+		segments, base, tail, digest, lastRecordGeneration, err = readCatalogCheckpoint(dir, fallback, key)
 		usedPrevious = err == nil
 	}
 	if err != nil {
-		return nil, false, err
+		return nil, checkpointBase{}, false, err
 	}
 	count := (slot.CatalogTail - tail) / catalogRecordBytes
 	if count > catalogCheckpointHardRecords {
-		return nil, false, ErrBounds
+		return nil, checkpointBase{}, false, ErrBounds
 	}
 	if cap(segments)-len(segments) < int(count) {
 		grown := make([]SegmentMeta, len(segments), len(segments)+int(count))
@@ -195,12 +213,16 @@ func readCatalogBounded(dir string, file *os.File, slot metadataSlot, key [32]by
 	}
 	var raw [catalogRecordBytes]byte
 	for tail < slot.CatalogTail {
-		if err := readFullAt(file, raw[:], int64(tail)); err != nil {
-			return nil, false, err
+		offset, offsetErr := catalogPhysicalOffset(tail)
+		if offsetErr != nil {
+			return nil, checkpointBase{}, false, offsetErr
+		}
+		if err := readFullAt(file, raw[:], offset); err != nil {
+			return nil, checkpointBase{}, false, err
 		}
 		record, recordHash, err := unmarshalCatalogRecord(raw[:], key)
 		if err != nil || record.PreviousTail != tail || record.PreviousHash != digest || record.Generation <= lastRecordGeneration || record.Generation > slot.Generation {
-			return nil, false, ErrCorrupt
+			return nil, checkpointBase{}, false, ErrCorrupt
 		}
 		switch record.Kind {
 		case catalogSeal:
@@ -208,52 +230,63 @@ func readCatalogBounded(dir string, file *os.File, slot metadataSlot, key [32]by
 			segment.PreviousHash = lastHash
 			segment.FileID = record.FileID
 			if segment.ID != lastID+1 || segment.Generation != lastGeneration+1 {
-				return nil, false, ErrCorrupt
+				return nil, checkpointBase{}, false, ErrCorrupt
 			}
 			segments = append(segments, segment)
 			lastID, lastGeneration, lastHash = segment.ID, segment.Generation, segment.Hash
 		case catalogAnchor:
-			if record.AnchorID < lastID || record.AnchorGeneration < lastGeneration {
-				return nil, false, ErrCorrupt
+			if record.AnchorID <= slot.AnchorID || record.AnchorGeneration <= slot.AnchorGeneration || len(segments) == 0 {
+				return nil, checkpointBase{}, false, ErrCorrupt
 			}
 			cut := 0
 			for cut < len(segments) && segments[cut].ID <= record.AnchorID {
 				cut++
 			}
+			if cut == 0 {
+				return nil, checkpointBase{}, false, ErrCorrupt
+			}
+			removed := segments[cut-1]
+			if removed.ID != record.AnchorID || removed.Generation != record.AnchorGeneration || removed.Hash != record.AnchorHash {
+				return nil, checkpointBase{}, false, ErrCorrupt
+			}
 			segments = append(segments[:0], segments[cut:]...)
 			lastID, lastGeneration, lastHash = record.AnchorID, record.AnchorGeneration, record.AnchorHash
+			if len(segments) != 0 {
+				last := segments[len(segments)-1]
+				lastID, lastGeneration, lastHash = last.ID, last.Generation, last.Hash
+			}
 		}
 		tail += catalogRecordBytes
 		digest = recordHash
 		lastRecordGeneration = record.Generation
 	}
 	if digest != slot.CatalogHash {
-		return nil, false, ErrCorrupt
+		return nil, checkpointBase{}, false, ErrCorrupt
 	}
 	if slot.HasPending {
 		if slot.Pending.ID != lastID+1 || slot.Pending.Generation != lastGeneration+1 || slot.Pending.PreviousHash != lastHash || slot.Active.PreviousID != slot.Pending.ID || slot.Active.PreviousHash != slot.Pending.Hash {
-			return nil, false, ErrCorrupt
+			return nil, checkpointBase{}, false, ErrCorrupt
 		}
 	} else if slot.Active.PreviousID != lastID || slot.Active.Generation != lastGeneration+1 || slot.Active.PreviousHash != lastHash {
-		return nil, false, ErrCorrupt
+		return nil, checkpointBase{}, false, ErrCorrupt
 	}
-	owned := make(map[fileID]struct{}, len(segments)+4)
-	for i := range segments {
-		if _, duplicate := owned[segments[i].FileID]; duplicate {
-			return nil, false, ErrCorrupt
-		}
-		owned[segments[i].FileID] = struct{}{}
-	}
-	for _, id := range []fileID{slot.Active.FileID, slot.Pending.FileID, slot.Reserves[0].FileID, slot.Reserves[1].FileID} {
+	owners := []fileID{slot.Active.FileID, slot.Pending.FileID, slot.Reserves[0].FileID, slot.Reserves[1].FileID}
+	for ownerIndex, id := range owners {
 		if id == (fileID{}) {
 			continue
 		}
-		if _, duplicate := owned[id]; duplicate {
-			return nil, false, ErrCorrupt
+		for i := range segments {
+			if segments[i].FileID == id {
+				return nil, checkpointBase{}, false, ErrCorrupt
+			}
 		}
-		owned[id] = struct{}{}
+		for i := 0; i < ownerIndex; i++ {
+			if owners[i] == id {
+				return nil, checkpointBase{}, false, ErrCorrupt
+			}
+		}
 	}
-	return segments, usedPrevious, nil
+	return segments, base, usedPrevious, nil
 }
 
 func catalogSuffixRecords(slot metadataSlot) uint64 {
@@ -284,6 +317,23 @@ func (store *metadataStore) publish(next metadataSlot, record *catalogRecord) er
 		return ErrCorrupt
 	}
 	if record != nil {
+		ringBytes := catalogRingRecords * catalogRecordBytes
+		if catalogRingRecords == 0 || catalogRingRecords > metadataCatalogRecords || ringBytes/catalogRecordBytes != catalogRingRecords {
+			return ErrBounds
+		}
+		if store.slot.CatalogTail >= metadataCatalogStart+ringBytes {
+			overwrite := store.slot.CatalogTail - ringBytes
+			for i := range store.bankUsable {
+				if !store.bankUsable[i] {
+					return ErrBounds
+				}
+				bank := store.bankSlots[i]
+				floor := store.bankRecoveryFloor[i]
+				if overwrite >= floor && overwrite < bank.CatalogTail {
+					return ErrBounds
+				}
+			}
+		}
 		record.Generation = next.Generation
 		record.PreviousTail = store.slot.CatalogTail
 		record.PreviousHash = store.slot.CatalogHash
@@ -291,7 +341,11 @@ func (store *metadataStore) publish(next metadataSlot, record *catalogRecord) er
 		if err != nil {
 			return err
 		}
-		if err = writeFullAt(store.file, store.recordBuf[:], int64(store.slot.CatalogTail)); err != nil {
+		offset, offsetErr := catalogPhysicalOffset(store.slot.CatalogTail)
+		if offsetErr != nil {
+			return offsetErr
+		}
+		if err = writeFullAt(store.file, store.recordBuf[:], offset); err != nil {
 			return err
 		}
 		next.CatalogTail = store.slot.CatalogTail + catalogRecordBytes
@@ -314,6 +368,13 @@ func (store *metadataStore) publish(next metadataSlot, record *catalogRecord) er
 		return err
 	}
 	store.slot, store.slotIndex = next, nextIndex
+	store.bankSlots[nextIndex], store.bankUsable[nextIndex] = next, true
+	store.bankHealthy[nextIndex] = true
+	store.needsHealing = !store.bankHealthy[0] || !store.bankHealthy[1]
+	store.bankRecoveryFloor[nextIndex] = metadataCatalogStart
+	if next.CheckpointID != ([16]byte{}) {
+		store.bankRecoveryFloor[nextIndex] = next.CheckpointTail
+	}
 	return nil
 }
 

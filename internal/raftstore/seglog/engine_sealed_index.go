@@ -1,6 +1,7 @@
 package seglog
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -22,6 +23,10 @@ func readUnpublishedSealed(path string, fileID fileID, capacity uint64, logID [1
 		return SegmentMeta{}, segmentFooter{}, err
 	}
 	defer file.Close()
+	return readUnpublishedSealedFile(file, fileID, capacity, logID, previousID, previousHash, key)
+}
+
+func readUnpublishedSealedFile(file *os.File, fileID fileID, capacity uint64, logID [16]byte, previousID uint64, previousHash, key [32]byte) (SegmentMeta, segmentFooter, error) {
 	stat, err := file.Stat()
 	if err != nil || stat.Size() < segmentHeaderBytes+sealedIndexHeaderBytes+segmentFooterBytes {
 		return SegmentMeta{}, segmentFooter{}, ErrCorrupt
@@ -32,8 +37,9 @@ func readUnpublishedSealed(path string, fileID fileID, capacity uint64, logID [1
 		return SegmentMeta{}, segmentFooter{}, ErrCorrupt
 	}
 	header, err := unmarshalSegmentHeader(headerBytes[:])
-	if err != nil {
-		return SegmentMeta{}, segmentFooter{}, err
+	descriptor := reserveDescriptor{FileID: fileID, Capacity: capacity, Ready: true}
+	if err != nil || !validReserveCertificate(headerBytes[segmentIdentityBytes:], descriptor, logID, key) {
+		return SegmentMeta{}, segmentFooter{}, errors.Join(ErrCorrupt, err)
 	}
 	footer, err := unmarshalSegmentFooter(footerBytes[:])
 	if err != nil {
@@ -59,7 +65,8 @@ func readSealedSealedMetadata(file *os.File, want SegmentMeta, capacity uint64, 
 		return segmentFooter{}, sealedIndexHeader{}, nil, 0, err
 	}
 	segment, err := unmarshalSegmentHeader(headerBytes[:])
-	if err != nil || segment.ID != want.ID || segment.Generation != want.Generation || segment.LogID != logID || segment.FileID != want.FileID || segment.Capacity != capacity || segment.PreviousID != previousID || segment.PreviousHash != previousHash {
+	descriptor := reserveDescriptor{FileID: want.FileID, Capacity: capacity, Ready: true}
+	if err != nil || !validReserveCertificate(headerBytes[segmentIdentityBytes:], descriptor, logID, key) || segment.ID != want.ID || segment.Generation != want.Generation || segment.LogID != logID || segment.FileID != want.FileID || segment.Capacity != capacity || segment.PreviousID != previousID || segment.PreviousHash != previousHash {
 		return segmentFooter{}, sealedIndexHeader{}, nil, 0, ErrCorrupt
 	}
 	var footerBytes [segmentFooterBytes]byte
@@ -133,18 +140,15 @@ func readFullAt(file *os.File, dst []byte, offset int64) error {
 }
 
 func (e *Engine) applySealedRun(group *engineGroup, segment SegmentMeta, header sealedIndexHeader, run sealedGroupRun) error {
+	previousApplySequence := e.applySequence
+	e.applySequence = header.LastSequence
+	defer func() { e.applySequence = previousApplySequence }()
 	summary := run.Summary
 	if summary.LastIndex < group.Hard.Commit || (summary.LastIndex == 0) != (summary.LastTerm == 0) || summary.Hard.Term < group.Hard.Term || summary.Hard.Commit < group.Hard.Commit || summary.Hard.Commit > summary.LastIndex || summary.Hard.Term == group.Hard.Term && group.Hard.Vote != 0 && summary.Hard.Vote != group.Hard.Vote || summary.TruncateIndex < group.TruncateIndex || summary.Checkpoint.Index < group.Checkpoint.Index {
 		return ErrCorrupt
 	}
-	group.clipSealedSuffix(summary.LastIndex)
-	if run.First != 0 {
-		if run.Last != summary.LastIndex || run.First > run.Last || run.DescriptorOrdinal > uint64(header.DescriptorBytes/sealedRouteDescriptorBytes) || uint64(run.DescriptorCount) > uint64(header.DescriptorBytes/sealedRouteDescriptorBytes)-run.DescriptorOrdinal {
-			return ErrCorrupt
-		}
-		group.clipSealedSuffix(run.First - 1)
-		descriptorBase := segment.IndexOffset + uint64(header.DescriptorOffset) + run.DescriptorOrdinal*sealedRouteDescriptorBytes
-		group.sealed = append(group.sealed, sealedRunRef{SegmentID: segment.ID, GroupID: run.GroupID, First: run.First, Last: run.Last, RouteFirst: run.First, RouteLast: run.Last, DescriptorBase: descriptorBase, DescriptorCount: run.DescriptorCount, BlockEntries: run.BlockEntries, ExtentOffset: run.ExtentOffset, ExtentBytes: run.ExtentBytes, Inline: run.Inline})
+	if err := e.applySealedRoute(group, segment, header, run); err != nil {
+		return err
 	}
 	if summary.TruncateIndex != 0 {
 		group.clipSealedThrough(summary.TruncateIndex)
@@ -185,6 +189,23 @@ func (e *Engine) applySealedRun(group *engineGroup, segment SegmentMeta, header 
 		return ErrCorrupt
 	}
 	group.lastIndex, group.lastTerm = summary.LastIndex, summary.LastTerm
+	if segment.ID != 0 {
+		e.recordSealedSummary(run.GroupID, summary, header.LastSequence)
+	}
+	return nil
+}
+
+func (e *Engine) applySealedRoute(group *engineGroup, segment SegmentMeta, header sealedIndexHeader, run sealedGroupRun) error {
+	summary := run.Summary
+	group.clipSealedSuffix(summary.LastIndex)
+	if run.First != 0 {
+		if run.Last != summary.LastIndex || run.First > run.Last || run.DescriptorOrdinal > uint64(header.DescriptorBytes/sealedRouteDescriptorBytes) || uint64(run.DescriptorCount) > uint64(header.DescriptorBytes/sealedRouteDescriptorBytes)-run.DescriptorOrdinal {
+			return ErrCorrupt
+		}
+		group.clipSealedSuffix(run.First - 1)
+		descriptorBase := segment.IndexOffset + uint64(header.DescriptorOffset) + run.DescriptorOrdinal*sealedRouteDescriptorBytes
+		group.addSealedRun(sealedRunRef{SegmentID: segment.ID, GroupID: run.GroupID, First: run.First, Last: run.Last, RouteFirst: run.First, RouteLast: run.Last, DescriptorBase: descriptorBase, DescriptorCount: run.DescriptorCount, BlockEntries: run.BlockEntries, ExtentOffset: run.ExtentOffset, ExtentBytes: run.ExtentBytes, Inline: run.Inline})
+	}
 	return nil
 }
 
