@@ -19,11 +19,13 @@ type RouteGateReadRequest struct {
 	Fence          ServingFence
 	Capability     serviceauthz.Capability
 	MinimumApplied uint64
+	Authorize      ProposalAuthorization
 }
 
 type RouteGateReadResult struct {
 	Applied uint64
 	Status  routegate.Status
+	State   ServingState
 }
 
 type RouteGateReadLease interface{ Release() }
@@ -66,6 +68,7 @@ func (owner *Owner) ReadRouteGate(
 		kind: requestReadRouteGate, group: request.Fence.Group, reply: delivery.reply,
 		read: readRequest{
 			fence: request.Fence, minimumApplied: request.MinimumApplied, delivery: delivery,
+			authorize: request.Authorize,
 		},
 	}, delivery)
 	if err != nil {
@@ -82,6 +85,6 @@ func (owner *Owner) ReadRouteGate(
 	}
 	releaseReservation = false
 	return RouteGateReadResult{
-		Applied: value.Fence.Applied, Status: value.Status,
+		Applied: value.Fence.Applied, Status: value.Status, State: reply.read.state,
 	}, &pointReadLease{owner: owner, bytes: responseCharge}, nil
 }

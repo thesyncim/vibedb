@@ -9,7 +9,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 )
 
-func (server *ReplicatedServer) readRouteGate(ctx context.Context, request *ReplicatedRequest, wireState ReplicatedMemberState) *ReplicatedResponse {
+func (server *ReplicatedServer) readRouteGate(ctx context.Context, request *ReplicatedRequest, wireState ReplicatedMemberState, authorize raftservice.ProposalAuthorization) *ReplicatedResponse {
 	result, readLease, readErr := server.owner.ReadRouteGate(ctx,
 		raftservice.RouteGateReadRequest{
 			Fence: raftservice.ServingFence{
@@ -20,12 +20,14 @@ func (server *ReplicatedServer) readRouteGate(ctx context.Context, request *Repl
 			},
 			Capability:     request.Capability,
 			MinimumApplied: request.MinimumApplied,
+			Authorize:      authorize,
 		})
 	if readErr != nil && readLease != nil {
 		readLease.Release()
 		readLease = nil
 	}
 	if readErr == nil {
+		wireState = replicatedWireState(result.State)
 		wireState = replicatedReadState(wireState, request.Fence, result.Applied)
 		value, encodeErr := AppendReplicatedRouteGateReadValue(nil,
 			result.Status)
@@ -53,6 +55,9 @@ func (server *ReplicatedServer) readRouteGate(ctx context.Context, request *Repl
 	case errors.Is(readErr, raftservice.ErrServingFence):
 		return &ReplicatedResponse{Kind: ReplicatedRefusal,
 			Refusal: ReplicatedRefusalStaleFence, HasState: true, State: wireState}
+	case errors.Is(readErr, raftservice.ErrServingAuthorization):
+		return &ReplicatedResponse{Kind: ReplicatedRefusal,
+			Refusal: ReplicatedRefusalUnavailable, HasState: true, State: wireState}
 	case errors.Is(readErr, replicatedstate.ErrReadBehind):
 		return &ReplicatedResponse{Kind: ReplicatedRefusal,
 			Refusal: ReplicatedRefusalReadBehind, HasState: true, State: wireState}

@@ -27,7 +27,12 @@ type routeGateOwner struct {
 
 func (o *routeGateOwner) ReadRouteGate(_ context.Context, request raftservice.RouteGateReadRequest) (raftservice.RouteGateReadResult, raftservice.RouteGateReadLease, error) {
 	o.request = request
-	return o.result, o.lease, o.err
+	result := o.result
+	result.State = o.state
+	if request.Authorize != nil && !request.Authorize(o.state) {
+		return result, o.lease, raftservice.ErrServingAuthorization
+	}
+	return result, o.lease, o.err
 }
 func routeGateRequest() *ReplicatedRequest {
 	return &ReplicatedRequest{Operation: ReplicatedRouteGateRead,
@@ -144,7 +149,7 @@ func TestReplicatedRouteGateReadAuthorizationAndOwnerFences(t *testing.T) {
 	if response.Kind != ReplicatedRouteGateReadResult || !validReplicatedResponse(response) ||
 		response.ReadApplied != 12 || response.State.Fence != request.Fence ||
 		response.State.Applied != 12 || response.State.Commit != 12 ||
-		owner.probeCalls.Load() != 1 || owner.request.Fence.Term != request.Fence.Term ||
+		owner.probeCalls.Load() != 0 || owner.request.Fence.Term != request.Fence.Term ||
 		owner.request.MinimumApplied != 7 ||
 		owner.request.Capability != serviceauthz.CapabilityDataWrite || lease.released.Load() {
 		t.Fatalf("response %+v request %+v", response, owner.request)
@@ -170,7 +175,7 @@ func TestReplicatedRouteGateReadAuthorizationAndOwnerFences(t *testing.T) {
 		owner.probeCalls.Store(0)
 		response = server.executeReplicated(t.Context(), request)
 		if response.Kind != tt.kind || response.Refusal != tt.refusal ||
-			!owner.lease.(*testPointReadLease).released.Load() || owner.probeCalls.Load() != 2 {
+			!owner.lease.(*testPointReadLease).released.Load() || owner.probeCalls.Load() != 1 {
 			t.Fatalf("error %v response %+v", tt.err, response)
 		}
 	}
