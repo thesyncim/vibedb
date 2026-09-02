@@ -81,6 +81,8 @@ const (
 
 type NodeStore struct {
 	mu                                        sync.Mutex
+	catalogMu                                 sync.Mutex
+	maintenance                               sync.WaitGroup
 	dir                                       string
 	identity                                  NodeIdentity
 	descriptors                               []GroupDescriptor
@@ -111,6 +113,8 @@ type NodeStore struct {
 	namespaceProofTest                        func() error
 	checkpointHookTest                        func(CheckpointPhase) error
 	checkpointLeaveTempTest                   bool
+	descriptorCheckpointHookTest              func(DescriptorCheckpointPhase) error
+	descriptorCheckpointLeaveTempTest         bool
 	sequencer                                 *NodeSubmissionSequencer
 	closing                                   bool
 	closeDone                                 chan struct{}
@@ -159,7 +163,8 @@ func defaultNodeOptions(options NodeStoreOptions) (NodeStoreOptions, normalizedO
 	if options.Groups == 0 {
 		options.Groups = 4096
 	}
-	if options.FrameBytes < 72 || options.Events < 1 || options.WaveIDs < 1 || options.EntriesPerGroup < 1 || options.CachedSegments < 0 {
+	if options.FrameBytes < 72 || options.Events < 1 || options.WaveIDs < 1 || options.EntriesPerGroup < 1 || options.EntriesPerGroup > MaxReadyEntries ||
+		options.CachedSegments < 0 || options.Groups < 1 || uint64(options.Groups) > math.MaxUint32 {
 		return options, normalizedOptions{}, ErrBounds
 	}
 	return options, normalized, nil
@@ -313,7 +318,7 @@ func OpenNodeStore(dir string, expected NodeIdentity, key Key, options NodeStore
 		store.readPlain = make([]byte, 0, options.FrameBytes)
 		store.pageRefs = make([]pageEntryRef, 0, options.Events)
 		for i := range store.waveEntries {
-			store.waveEntries[i] = make([]seglog.Entry, 0, MaxReadyEntries)
+			store.waveEntries[i] = make([]seglog.Entry, 0, options.EntriesPerGroup)
 		}
 		if err = store.rebuildDescriptors(options.Groups); err == nil {
 			ids := engine.GroupIDs()
@@ -397,7 +402,7 @@ func (s *NodeStore) reserve(options NodeStoreOptions, bootstraps []NodeBootstrap
 	s.readPlain = make([]byte, 0, options.FrameBytes)
 	s.pageRefs = make([]pageEntryRef, 0, options.Events)
 	for i := range s.waveEntries {
-		s.waveEntries[i] = make([]seglog.Entry, 0, MaxReadyEntries)
+		s.waveEntries[i] = make([]seglog.Entry, 0, options.EntriesPerGroup)
 	}
 	return nil
 }
@@ -434,7 +439,8 @@ func (s *NodeStore) bootstrap(bootstraps []NodeBootstrap) error {
 		}
 		descriptorEntries = append(descriptorEntries, seglog.Entry{Index: uint64(i + 1), Term: 1, DataOffset: uint64(start), DataBytes: uint64(len(s.plainArena) - start)})
 	}
-	batches[len(bootstraps)] = seglog.ReadyBatch{GroupID: nodeDescriptorGroup, Entries: descriptorEntries}
+	descriptorHard := seglog.HardState{Term: 1, Commit: uint64(len(descriptorEntries))}
+	batches[len(bootstraps)] = seglog.ReadyBatch{GroupID: nodeDescriptorGroup, Entries: descriptorEntries, Hard: &descriptorHard}
 	id := bootstrapWaveID(batches)
 	copy(s.waveBatches[:], batches)
 	if err := s.packWaveExtents(id, len(batches)); err != nil {
@@ -1021,7 +1027,8 @@ func (s *NodeStore) registerGroupLocked(descriptor GroupDescriptor) (GroupIncarn
 	}
 	s.waveEntries[0] = append(s.waveEntries[0][:0], seglog.Entry{Index: descriptor.LogKey, Term: 1, DataOffset: 0, DataBytes: uint64(len(s.plainArena))})
 	s.waveBatches[0] = seglog.ReadyBatch{GroupID: descriptor.LogKey, BeginIncarnation: 1}
-	s.waveBatches[1] = seglog.ReadyBatch{GroupID: nodeDescriptorGroup, Entries: s.waveEntries[0]}
+	s.waveHard[1] = seglog.HardState{Term: 1, Commit: descriptor.LogKey}
+	s.waveBatches[1] = seglog.ReadyBatch{GroupID: nodeDescriptorGroup, Entries: s.waveEntries[0], Hard: &s.waveHard[1]}
 	digest := sha256.Sum256(s.plainArena)
 	var waveID seglog.WaveID
 	copy(waveID[:], digest[:16])
@@ -1117,12 +1124,29 @@ func (v *GroupView) NodeIncarnation() (uint64, error) {
 
 func (s *NodeStore) rebuildDescriptors(limit int) error {
 	metadata, ok := s.engine.Metadata(nodeDescriptorGroup)
-	if !ok || metadata.FirstIndex != 1 || metadata.LastIndex == 0 || metadata.LastIndex > uint64(limit) {
+	if !ok || metadata.LastIndex == 0 || metadata.LastIndex > uint64(limit) || metadata.Hard.Term != 1 || metadata.Hard.Vote != 0 || metadata.Hard.Commit != metadata.LastIndex {
 		return ErrCorrupt
 	}
 	descriptors := make([]GroupDescriptor, 0, limit)
 	order := make([]uint32, 0, limit)
-	for index := uint64(1); index <= metadata.LastIndex; index++ {
+	first := uint64(1)
+	if metadata.Checkpoint != (seglog.Checkpoint{}) {
+		if metadata.Checkpoint.Index != metadata.TruncateIndex || metadata.Checkpoint.Term != 1 || metadata.TruncateTerm != 1 || metadata.FirstIndex != metadata.Checkpoint.Index+1 {
+			return ErrCorrupt
+		}
+		var err error
+		descriptors, err = s.readDescriptorCatalog(metadata.Checkpoint, limit)
+		if err != nil {
+			return err
+		}
+		for index := range descriptors {
+			order = append(order, uint32(index))
+		}
+		first = metadata.Checkpoint.Index + 1
+	} else if metadata.FirstIndex != 1 || metadata.TruncateIndex != 0 {
+		return ErrCorrupt
+	}
+	for index := first; index <= metadata.LastIndex; index++ {
 		location, _, compacted, found, err := s.engine.LookupExact(nodeDescriptorGroup, index)
 		if err != nil || compacted || !found {
 			return ErrCorrupt
@@ -1135,8 +1159,11 @@ func (s *NodeStore) rebuildDescriptors(limit int) error {
 		if err != nil || descriptor.LogKey != index {
 			return ErrCorrupt
 		}
+		if descriptor.LogKey != uint64(len(descriptors))+1 {
+			return ErrCorrupt
+		}
 		descriptors = append(descriptors, descriptor)
-		order = append(order, uint32(index-1))
+		order = append(order, uint32(len(descriptors)-1))
 	}
 	slices.SortFunc(order, func(a, b uint32) int { return bytes.Compare(descriptors[a].GroupID[:], descriptors[b].GroupID[:]) })
 	for i := 1; i < len(order); i++ {
@@ -1181,6 +1208,7 @@ func (s *NodeStore) Close() error {
 	if sequencer != nil {
 		err = sequencer.Close()
 	}
+	s.maintenance.Wait()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.closed = true
