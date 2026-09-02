@@ -44,6 +44,9 @@ func TestNodeSubmissionSequencerBoundsAndCacheLineLayout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !q.Owns(store) || q.Owns(&NodeStore{}) {
+		t.Fatal("sequencer accepted the wrong NodeStore owner")
+	}
 	if _, err = NewNodeSubmissionSequencer(store, 8); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("second node-path sequencer=%v", err)
 	}
@@ -70,6 +73,42 @@ func TestNodeSubmissionSequencerBoundsAndCacheLineLayout(t *testing.T) {
 	closing.closingFlag.Store(true)
 	if _, err = NewNodeSubmissionSequencer(closing, 8); !errors.Is(err, ErrClosed) {
 		t.Fatalf("sequencer registered after close linearization: %v", err)
+	}
+}
+
+func TestNodeSubmissionSequencerRejectsUnpreparedAndFailedPrepare(t *testing.T) {
+	var persisted atomic.Int32
+	q := newTestSequencer(t, 8, func([]NodeReady) error {
+		persisted.Add(1)
+		return nil
+	})
+	var cell Submission
+	if err := cell.Initialize(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.TrySubmit(&cell); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("unprepared submission=%v", err)
+	}
+	if err := cell.Prepare(NodeReady{GroupID: 1, Batch: raftmodel.PersistBatch{NodeIncarnation: 1, ReadyID: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.TrySubmit(&cell); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cell.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if err := cell.PrepareBeginIncarnations([]uint64{0}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("invalid prepare=%v", err)
+	}
+	if _, done, _ := cell.Poll(); done {
+		t.Fatal("failed prepare exposed stale completion")
+	}
+	if _, err := q.TrySubmit(&cell); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("failed prepare submission=%v", err)
+	}
+	if got := persisted.Load(); got != 1 {
+		t.Fatalf("persisted=%d want=1", got)
 	}
 }
 
@@ -168,9 +207,9 @@ func TestNodeSubmissionSequencerFusesRealNodeStoreEngineCalls(t *testing.T) {
 	bootstraps := make([]NodeBootstrap, 8)
 	for i := range bootstraps {
 		group := uint64(i + 1)
-		bootstraps[i] = NodeBootstrap{GroupID: group, Snapshot: nodeSnapshot(group, 1, 1)}
+		bootstraps[i] = NodeBootstrap{Descriptor: testGroupDescriptor(group), Snapshot: nodeSnapshot(group, 1, 1)}
 	}
-	store, err := CreateNodeStore(dir, testIdentity(), testKey(), bootstraps, options)
+	store, err := CreateNodeStore(dir, testNodeIdentity(), testKey(), bootstraps, options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,10 +269,136 @@ func TestNodeSubmissionSequencerFusesRealNodeStoreEngineCalls(t *testing.T) {
 	}
 }
 
+func TestNodeSubmissionSequencerOrdersIncarnationControlAsWaveBoundary(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "node")
+	options := NodeStoreOptions{Store: testOptions(), FrameBytes: 1 << 20, Events: 128, WaveIDs: 32, EntriesPerGroup: 32, CachedSegments: 1}
+	store, err := CreateNodeStore(dir, testNodeIdentity(), testKey(), []NodeBootstrap{
+		{Descriptor: testGroupDescriptor(1), Snapshot: nodeSnapshot(1, 1, 1)},
+		{Descriptor: testGroupDescriptor(2), Snapshot: nodeSnapshot(2, 1, 1)},
+	}, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var syncs atomic.Int32
+	store.engine.SetDataSyncForTesting(func(file *os.File) error {
+		syncs.Add(1)
+		return file.Sync()
+	})
+	q, err := NewNodeSubmissionSequencer(store, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	control := new(Submission)
+	if err = control.Initialize(); err != nil {
+		t.Fatal(err)
+	}
+	if err = control.PrepareBeginIncarnations([]uint64{1, 2}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = q.TrySubmit(control); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = control.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	incarnations := control.Incarnations()
+	if len(incarnations) != 2 || incarnations[0] != (GroupIncarnation{GroupID: 1, Incarnation: 1}) ||
+		incarnations[1] != (GroupIncarnation{GroupID: 2, Incarnation: 1}) {
+		t.Fatalf("incarnations=%v", incarnations)
+	}
+	if err = control.PreparePersistIncarnations(incarnations); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = q.TrySubmit(control); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = control.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if got := syncs.Load(); got != 1 {
+		t.Fatalf("idempotent control retry performed sync: %d", got)
+	}
+	ready := preparedSubmission(t, 1, 1)
+	ready.Ready.Batch.Entries = []*pb.Entry{typedEntry(2, 2, pb.EntryNormal, "x")}
+	ready.Ready.Batch.HardState = hard(2, 2)
+	if _, err = q.TrySubmit(ready); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = ready.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if got := syncs.Load(); got != 2 {
+		t.Fatalf("control+Ready durability syncs=%d want 2", got)
+	}
+}
+
+func TestNodeSubmissionSequencerRegistersExactGroupInTicketStream(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "node")
+	options := NodeStoreOptions{Store: testOptions(), FrameBytes: 1 << 20, Events: 128, WaveIDs: 32, EntriesPerGroup: 32, CachedSegments: 1, Groups: 8}
+	store, err := CreateNodeStore(dir, testNodeIdentity(), testKey(), []NodeBootstrap{{Descriptor: testGroupDescriptor(20), Snapshot: nodeSnapshot(1, 1, 1)}}, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sequencer, err := NewNodeSubmissionSequencer(store, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var registration Submission
+	if err = registration.Initialize(); err != nil {
+		t.Fatal(err)
+	}
+	descriptor := testGroupDescriptor(10)
+	if err = registration.PrepareRegisterGroup(descriptor); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = sequencer.TrySubmit(&registration); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = registration.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	got, incarnation, ok := registration.RegisteredGroup()
+	if !ok || got.LogKey != 2 || got.GroupID != descriptor.GroupID || incarnation != (GroupIncarnation{GroupID: 2, Incarnation: 1}) {
+		t.Fatalf("registered=%+v incarnation=%+v ok=%v", got, incarnation, ok)
+	}
+	if _, err = store.RegisterGroup(testGroupDescriptor(30)); !errors.Is(err, ErrSequencerActive) {
+		t.Fatalf("direct registration fence=%v", err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSubmissionControlPrepareZeroAlloc(t *testing.T) {
+	cell := new(Submission)
+	if err := cell.Initialize(); err != nil {
+		t.Fatal(err)
+	}
+	groups := []uint64{1, 2, 3, 4}
+	requests := []GroupIncarnation{{1, 1}, {2, 1}, {3, 1}, {4, 1}}
+	descriptor := testGroupDescriptor(9)
+	allocs := testing.AllocsPerRun(1000, func() {
+		if err := cell.PrepareBeginIncarnations(groups); err != nil {
+			panic(err)
+		}
+		if err := cell.PreparePersistIncarnations(requests); err != nil {
+			panic(err)
+		}
+		if err := cell.PrepareRegisterGroup(descriptor); err != nil {
+			panic(err)
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("control prepare allocations=%f", allocs)
+	}
+}
+
 func TestNodeStoreCloseDrainsSequencerAndRejectsDirectCalls(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "node")
 	options := NodeStoreOptions{Store: testOptions(), FrameBytes: 1 << 20, Events: 64, WaveIDs: 16, EntriesPerGroup: 16, CachedSegments: 1}
-	store, err := CreateNodeStore(dir, testIdentity(), testKey(), []NodeBootstrap{{GroupID: 1, Snapshot: nodeSnapshot(1, 1, 1)}}, options)
+	store, err := CreateNodeStore(dir, testNodeIdentity(), testKey(), []NodeBootstrap{{Descriptor: testGroupDescriptor(1), Snapshot: nodeSnapshot(1, 1, 1)}}, options)
 	if err != nil {
 		t.Fatal(err)
 	}

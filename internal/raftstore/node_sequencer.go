@@ -14,10 +14,20 @@ var (
 )
 
 const (
-	submissionIdle uint32 = iota
+	submissionUnprepared uint32 = iota
+	submissionIdle
 	submissionQueued
 	submissionWaiting
 	submissionComplete
+)
+
+type submissionKind uint8
+
+const (
+	submissionReady submissionKind = iota + 1
+	submissionBeginIncarnations
+	submissionPersistIncarnations
+	submissionRegisterGroup
 )
 
 // Submission is caller-owned storage for one immutable group Ready and its
@@ -25,11 +35,16 @@ const (
 // values reachable through it remain immutable from successful TrySubmit until
 // Poll or Wait reports completion.
 type Submission struct {
-	Ready  NodeReady
-	state  atomic.Uint32
-	ticket atomic.Uint64
-	err    error
-	done   chan struct{}
+	Ready        NodeReady
+	kind         submissionKind
+	count        uint8
+	groups       [MaxPersistGroupBatches]uint64
+	incarnations [MaxPersistGroupBatches]GroupIncarnation
+	descriptor   GroupDescriptor
+	state        atomic.Uint32
+	ticket       atomic.Uint64
+	err          error
+	done         chan struct{}
 }
 
 // Initialize allocates the cold-path wait edge. The Submission itself remains
@@ -52,10 +67,95 @@ func (s *Submission) Prepare(ready NodeReady) error {
 	if state := s.state.Load(); state == submissionQueued || state == submissionWaiting {
 		return ErrSubmissionPending
 	}
-	s.Ready, s.err = ready, nil
+	s.Ready, s.err, s.kind, s.count = ready, nil, submissionReady, 0
 	s.ticket.Store(0)
 	s.state.Store(submissionIdle)
 	return nil
+}
+
+func (s *Submission) invalidatePrepare() {
+	s.Ready, s.err, s.kind, s.count = NodeReady{}, nil, 0, 0
+	s.ticket.Store(0)
+	s.state.Store(submissionUnprepared)
+}
+
+func (s *Submission) prepareControl(kind submissionKind, count int) error {
+	if s == nil || s.done == nil {
+		return ErrInvalid
+	}
+	if state := s.state.Load(); state == submissionQueued || state == submissionWaiting {
+		return ErrSubmissionPending
+	}
+	if count < 1 || count > MaxPersistGroupBatches {
+		s.invalidatePrepare()
+		return ErrInvalid
+	}
+	s.Ready, s.err, s.kind, s.count = NodeReady{}, nil, kind, uint8(count)
+	s.ticket.Store(0)
+	s.state.Store(submissionIdle)
+	return nil
+}
+
+// PrepareBeginIncarnations copies caller-sorted dense log keys into fixed
+// caller-owned Submission storage. Results are available through Incarnations
+// after completion and remain valid until the next Prepare call.
+func (s *Submission) PrepareBeginIncarnations(groups []uint64) error {
+	if err := s.prepareControl(submissionBeginIncarnations, len(groups)); err != nil {
+		return err
+	}
+	for i, group := range groups {
+		if group == 0 || i > 0 && groups[i-1] >= group {
+			s.invalidatePrepare()
+			return ErrInvalid
+		}
+		s.groups[i] = group
+	}
+	return nil
+}
+
+// PreparePersistIncarnations copies an exact unknown-outcome retry into fixed
+// caller-owned storage. The control operation is ordered in the same ticket
+// stream as Ready persistence and forms a durability-wave boundary.
+func (s *Submission) PreparePersistIncarnations(requests []GroupIncarnation) error {
+	if err := s.prepareControl(submissionPersistIncarnations, len(requests)); err != nil {
+		return err
+	}
+	for i, request := range requests {
+		if request.GroupID == 0 || request.Incarnation == 0 || i > 0 && requests[i-1].GroupID >= request.GroupID {
+			s.invalidatePrepare()
+			return ErrInvalid
+		}
+		s.incarnations[i] = request
+	}
+	return nil
+}
+
+func (s *Submission) Incarnations() []GroupIncarnation {
+	if s == nil || s.kind != submissionBeginIncarnations || s.state.Load() != submissionComplete {
+		return nil
+	}
+	return s.incarnations[:s.count]
+}
+
+// PrepareRegisterGroup keeps the caller's immutable strings borrowed until
+// completion; the fixed descriptor value itself is copied into the cell.
+func (s *Submission) PrepareRegisterGroup(descriptor GroupDescriptor) error {
+	if err := s.prepareControl(submissionRegisterGroup, 1); err != nil {
+		return err
+	}
+	if descriptor.LogKey != 0 || validateGroupDescriptor(descriptor, true) != nil {
+		s.invalidatePrepare()
+		return ErrInvalid
+	}
+	s.descriptor = descriptor
+	return nil
+}
+
+func (s *Submission) RegisteredGroup() (GroupDescriptor, GroupIncarnation, bool) {
+	if s == nil || s.kind != submissionRegisterGroup || s.state.Load() != submissionComplete || s.err != nil {
+		return GroupDescriptor{}, GroupIncarnation{}, false
+	}
+	return s.descriptor, s.incarnations[0], true
 }
 
 func (s *Submission) Poll() (ticket uint64, done bool, err error) {
@@ -154,6 +254,13 @@ func NewNodeSubmissionSequencer(store *NodeStore, capacity int) (*NodeSubmission
 	return q, nil
 }
 
+// Owns reports whether this sequencer is the sole submission owner installed
+// on store. Adapters must prove this exact pointer binding before translating a
+// portable group identity into its dense local log key.
+func (q *NodeSubmissionSequencer) Owns(store *NodeStore) bool {
+	return q != nil && store != nil && q.store == store
+}
+
 func (q *NodeSubmissionSequencer) signal() {
 	select {
 	case q.wake <- struct{}{}:
@@ -176,6 +283,13 @@ func (q *NodeSubmissionSequencer) TrySubmit(submission *Submission) (uint64, err
 	}
 	if q.closed.Load() {
 		return 0, ErrClosed
+	}
+	state := submission.state.Load()
+	if state != submissionIdle {
+		if state == submissionQueued || state == submissionWaiting {
+			return 0, ErrSubmissionPending
+		}
+		return 0, ErrInvalid
 	}
 	if !submission.state.CompareAndSwap(submissionIdle, submissionQueued) {
 		return 0, ErrSubmissionPending
@@ -260,6 +374,28 @@ func (q *NodeSubmissionSequencer) runWave(items *[MaxPersistGroupBatches]*Submis
 			err = ErrSubmissionPanic
 		}
 	}()
+	if count == 1 && items[0].kind != submissionReady {
+		s := items[0]
+		switch s.kind {
+		case submissionBeginIncarnations:
+			return q.store.beginIncarnationsSequenced(s.groups[:s.count], s.incarnations[:s.count])
+		case submissionPersistIncarnations:
+			return q.store.persistIncarnationsSequenced(s.incarnations[:s.count])
+		case submissionRegisterGroup:
+			incarnation, registerErr := q.store.registerGroupSequenced(s.descriptor)
+			if registerErr == nil {
+				s.incarnations[0] = incarnation
+				d, ok := q.store.descriptorForLogKey(incarnation.GroupID)
+				if !ok {
+					return ErrCorrupt
+				}
+				s.descriptor = d
+			}
+			return registerErr
+		default:
+			return ErrInvalid
+		}
+	}
 	for i := 0; i < count; i++ {
 		value := items[i].Ready
 		at := i
@@ -293,7 +429,8 @@ func (q *NodeSubmissionSequencer) run() {
 		count := 0
 		for count < len(items) {
 			s, ok := q.peek()
-			if !ok || submissionGroupSeen(&items, count, s.Ready.GroupID) {
+			if !ok || count > 0 && (items[0].kind != submissionReady || s.kind != submissionReady) ||
+				s.kind == submissionReady && submissionGroupSeen(&items, count, s.Ready.GroupID) {
 				break
 			}
 			items[count] = q.pop()
