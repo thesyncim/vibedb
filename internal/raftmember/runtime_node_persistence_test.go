@@ -4,8 +4,10 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	gort "runtime"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftstore"
@@ -168,6 +170,18 @@ func TestAdoptNodeRuntimeDrivesWorkerFreeDurableReady(t *testing.T) {
 		runtime.pipelined.workerWake != nil || runtime.pipelined.done != nil {
 		t.Fatalf("node Runtime retained a per-group WAL worker: wal=%p worker=%v done=%v", runtime.wal, runtime.pipelined.workerWake, runtime.pipelined.done)
 	}
+	coordinator, err := NewNodeCheckpointCoordinator(sequencer, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer coordinator.Close()
+	if duplicate, duplicateErr := NewNodeCheckpointCoordinator(sequencer, 8); duplicate != nil ||
+		!errors.Is(duplicateErr, raftstore.ErrMaintenanceActive) {
+		t.Fatalf("duplicate node maintenance lane = %p, %v", duplicate, duplicateErr)
+	}
+	if err = runtime.ConfigureNodeCheckpointing(coordinator, NodeCheckpointOptions{IntervalTicks: 1}); err != nil {
+		t.Fatal(err)
+	}
 	if err = runtime.Campaign(); err != nil {
 		t.Fatal(err)
 	}
@@ -194,7 +208,50 @@ func TestAdoptNodeRuntimeDrivesWorkerFreeDurableReady(t *testing.T) {
 	if err != nil || status.Term == 0 {
 		t.Fatalf("status=%+v err=%v", status, err)
 	}
+	wantCheckpoint := apply.Applied()
+	if wantCheckpoint <= 1 {
+		t.Fatalf("campaign did not advance applied index: %d", wantCheckpoint)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if err = runtime.Tick(); err != nil {
+			t.Fatal(err)
+		}
+		for step := 0; step < 1000; step++ {
+			result, driveErr := runtime.DriveReady(&workspace, func(OutboundMessage) error { return nil }, settleTestApplied)
+			if driveErr != nil {
+				t.Fatal(driveErr)
+			}
+			if runtime.pipelined.nodeSubmission {
+				if _, waitErr := persistence.Wait(); waitErr != nil {
+					t.Fatal(waitErr)
+				}
+				continue
+			}
+			if !result.Progressed() {
+				break
+			}
+		}
+		recoveryBase, snapshotErr := group.Snapshot()
+		if snapshotErr != nil {
+			t.Fatal(snapshotErr)
+		}
+		if recoveryBase.GetMetadata().GetIndex() >= wantCheckpoint {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("node checkpoint stayed at %d, want >= %d", recoveryBase.GetMetadata().GetIndex(), wantCheckpoint)
+		}
+		gort.Gosched()
+	}
+	first, err := group.FirstIndex()
+	if err != nil || first < wantCheckpoint+1 {
+		t.Fatalf("checkpoint did not truncate applied prefix: first=%d err=%v", first, err)
+	}
 	if err = runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err = coordinator.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = group.LastIndex(); err != nil {

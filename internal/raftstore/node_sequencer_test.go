@@ -16,7 +16,9 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftstore/seglog"
+	"go.etcd.io/raft/v3"
 	pb "go.etcd.io/raft/v3/raftpb"
+	"google.golang.org/protobuf/proto"
 )
 
 func newTestSequencer(t *testing.T, capacity int, persist func([]NodeReady) error) *NodeSubmissionSequencer {
@@ -112,6 +114,33 @@ func TestNodeSubmissionSequencerRejectsUnpreparedAndFailedPrepare(t *testing.T) 
 	}
 	if got := persisted.Load(); got != 1 {
 		t.Fatalf("persisted=%d want=1", got)
+	}
+}
+
+func TestNodeSubmissionSequencerWakeFanoutDoesNotOverwriteOwners(t *testing.T) {
+	q := newTestSequencer(t, 8, func([]NodeReady) error { return nil })
+	first, second := preparedSubmission(t, 1, 1), preparedSubmission(t, 2, 1)
+	var firstWake, replacementWake, secondWake atomic.Int32
+	q.SetWakeFor(first, func() { firstWake.Add(1) })
+	q.SetWakeFor(second, func() { secondWake.Add(1) })
+	q.notifyOwner()
+	if firstWake.Load() != 1 || secondWake.Load() != 1 {
+		t.Fatalf("initial wake fanout=%d/%d want 1/1", firstWake.Load(), secondWake.Load())
+	}
+	q.SetWakeFor(first, func() { replacementWake.Add(1) })
+	q.notifyOwner()
+	if firstWake.Load() != 1 || replacementWake.Load() != 1 || secondWake.Load() != 2 {
+		t.Fatalf("replaced wake fanout=%d/%d/%d want 1/1/2",
+			firstWake.Load(), replacementWake.Load(), secondWake.Load())
+	}
+	q.SetWakeFor(first, nil)
+	q.notifyOwner()
+	if replacementWake.Load() != 1 || secondWake.Load() != 3 {
+		t.Fatalf("unregistered wake fanout=%d/%d want 1/3", replacementWake.Load(), secondWake.Load())
+	}
+	q.SetWakeFor(second, nil)
+	if q.ownerWakes.Load() != nil {
+		t.Fatal("last wake unregister retained a callback snapshot")
 	}
 }
 
@@ -421,6 +450,136 @@ func TestNodeSubmissionSequencerOrdersIncarnationControlAsWaveBoundary(t *testin
 	}
 	if got := syncs.Load(); got != 2 {
 		t.Fatalf("control+Ready durability syncs=%d want 2", got)
+	}
+}
+
+func TestNodeSubmissionSequencerPublishesCheckpointAndReclaimsPrefix(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "node")
+	options := NodeStoreOptions{MaxWaveBytes: 1 << 20, MaxSegmentEvents: 128, RecentWaves: 32, MaxEntriesPerGroup: 32, ReaderSlots: 1}
+	store, err := CreateNodeStore(dir, testNodeIdentity(), testKey(), []NodeBootstrap{{Descriptor: testGroupDescriptor(1), Snapshot: nodeSnapshot(1, 1, 1)}}, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	incarnations, err := store.BeginIncarnations([]uint64{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sequencer, err := NewNodeSubmissionSequencer(store, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready := preparedSubmission(t, 1, incarnations[0].Incarnation)
+	ready.Ready.Batch.Entries = []*pb.Entry{typedEntry(2, 2, pb.EntryNormal, "committed")}
+	ready.Ready.Batch.HardState = hard(2, 2)
+	if _, err = sequencer.TrySubmit(ready); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = ready.Wait(); err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot := nodeSnapshot(1, 2, 2)
+	snapshot.Data = []byte("application-checkpoint")
+	checkpoint := new(Submission)
+	if err = checkpoint.Initialize(); err != nil {
+		t.Fatal(err)
+	}
+	if err = checkpoint.PrepareCheckpoint(1, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = sequencer.TrySubmit(checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = checkpoint.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if first, firstErr := store.Group(1).FirstIndex(); firstErr != nil || first != 3 {
+		t.Fatalf("first index = %d, %v", first, firstErr)
+	}
+	if _, termErr := store.Group(1).Term(1); !errors.Is(termErr, raft.ErrCompacted) {
+		t.Fatalf("old prefix term = %v", termErr)
+	}
+	if term, termErr := store.Group(1).Term(2); termErr != nil || term != 2 {
+		t.Fatalf("checkpoint term = %d, %v", term, termErr)
+	}
+	if got, snapshotErr := store.Group(1).Snapshot(); snapshotErr != nil || !proto.Equal(got, snapshot) {
+		t.Fatalf("checkpoint = %#v, %v", got, snapshotErr)
+	}
+
+	// Exact retries are no-ops, while different state at the same applied index
+	// is rejected instead of silently replacing the recovery base.
+	if err = checkpoint.PrepareCheckpoint(1, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = sequencer.TrySubmit(checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = checkpoint.Wait(); err != nil {
+		t.Fatalf("exact checkpoint retry: %v", err)
+	}
+	conflict := proto.Clone(snapshot).(*pb.Snapshot)
+	conflict.Data = []byte("different-state")
+	if err = checkpoint.PrepareCheckpoint(1, conflict); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = sequencer.TrySubmit(checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = checkpoint.Wait(); !errors.Is(err, ErrRetryConflict) {
+		t.Fatalf("same-index conflict = %v", err)
+	}
+	if err = sequencer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = OpenNodeStore(dir, testNodeIdentity(), testKey(), options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if first, firstErr := store.Group(1).FirstIndex(); firstErr != nil || first != 3 {
+		t.Fatalf("recovered first index = %d, %v", first, firstErr)
+	}
+	if got, snapshotErr := store.Group(1).Snapshot(); snapshotErr != nil || !proto.Equal(got, snapshot) {
+		t.Fatalf("recovered checkpoint = %#v, %v", got, snapshotErr)
+	}
+}
+
+func TestNodeSubmissionCheckpointRejectsUncommittedOrWrongTerm(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "node")
+	options := NodeStoreOptions{MaxWaveBytes: 1 << 20, MaxSegmentEvents: 128, RecentWaves: 32, MaxEntriesPerGroup: 32, ReaderSlots: 1}
+	store, err := CreateNodeStore(dir, testNodeIdentity(), testKey(), []NodeBootstrap{{Descriptor: testGroupDescriptor(1), Snapshot: nodeSnapshot(1, 1, 1)}}, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	sequencer, err := NewNodeSubmissionSequencer(store, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sequencer.Close()
+	cell := new(Submission)
+	if err = cell.Initialize(); err != nil {
+		t.Fatal(err)
+	}
+	for name, snapshot := range map[string]*pb.Snapshot{
+		"uncommitted": nodeSnapshot(1, 2, 2),
+		"wrong-term":  nodeSnapshot(1, 1, 2),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if prepareErr := cell.PrepareCheckpoint(1, snapshot); prepareErr != nil {
+				t.Fatal(prepareErr)
+			}
+			if _, submitErr := sequencer.TrySubmit(cell); submitErr != nil {
+				t.Fatal(submitErr)
+			}
+			if _, waitErr := cell.Wait(); !errors.Is(waitErr, ErrInvalid) && !errors.Is(waitErr, ErrRetryConflict) {
+				t.Fatalf("invalid checkpoint = %v", waitErr)
+			}
+		})
 	}
 }
 

@@ -5,6 +5,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	pb "go.etcd.io/raft/v3/raftpb"
 )
 
 var (
@@ -12,6 +14,7 @@ var (
 	ErrSubmissionPending      = errors.New("raftstore: submission is already pending")
 	ErrSubmissionPanic        = errors.New("raftstore: node submission worker panicked")
 	ErrSequencerActive        = errors.New("raftstore: direct persistence disabled while node sequencer is active")
+	ErrMaintenanceActive      = errors.New("raftstore: node maintenance lane already has an owner")
 )
 
 const (
@@ -30,6 +33,7 @@ const (
 	submissionPersistIncarnations
 	submissionRegisterGroup
 	submissionDescriptorCatalog
+	submissionCheckpoint
 )
 
 // Submission is caller-owned storage for one immutable group Ready and its
@@ -44,6 +48,7 @@ type Submission struct {
 	incarnations [MaxPersistGroupBatches]GroupIncarnation
 	descriptor   GroupDescriptor
 	catalog      descriptorCatalogCandidate
+	snapshot     *pb.Snapshot
 	state        atomic.Uint32
 	ticket       atomic.Uint64
 	err          error
@@ -70,14 +75,14 @@ func (s *Submission) Prepare(ready NodeReady) error {
 	if state := s.state.Load(); state == submissionQueued || state == submissionWaiting {
 		return ErrSubmissionPending
 	}
-	s.Ready, s.err, s.kind, s.count, s.catalog = ready, nil, submissionReady, 0, descriptorCatalogCandidate{}
+	s.Ready, s.err, s.kind, s.count, s.catalog, s.snapshot = ready, nil, submissionReady, 0, descriptorCatalogCandidate{}, nil
 	s.ticket.Store(0)
 	s.state.Store(submissionIdle)
 	return nil
 }
 
 func (s *Submission) invalidatePrepare() {
-	s.Ready, s.err, s.kind, s.count, s.catalog = NodeReady{}, nil, 0, 0, descriptorCatalogCandidate{}
+	s.Ready, s.err, s.kind, s.count, s.catalog, s.snapshot = NodeReady{}, nil, 0, 0, descriptorCatalogCandidate{}, nil
 	s.ticket.Store(0)
 	s.state.Store(submissionUnprepared)
 }
@@ -93,7 +98,7 @@ func (s *Submission) prepareControl(kind submissionKind, count int) error {
 		s.invalidatePrepare()
 		return ErrInvalid
 	}
-	s.Ready, s.err, s.kind, s.count, s.catalog = NodeReady{}, nil, kind, uint8(count), descriptorCatalogCandidate{}
+	s.Ready, s.err, s.kind, s.count, s.catalog, s.snapshot = NodeReady{}, nil, kind, uint8(count), descriptorCatalogCandidate{}, nil
 	s.ticket.Store(0)
 	s.state.Store(submissionIdle)
 	return nil
@@ -166,6 +171,23 @@ func (s *Submission) prepareDescriptorCatalog(candidate descriptorCatalogCandida
 	return nil
 }
 
+// PrepareCheckpoint borrows one immutable application snapshot until the
+// submission completes. The checkpoint is ordered with Ready persistence and
+// forms a durability-wave boundary, so its logical prefix truncation cannot
+// overtake an earlier append or be overtaken by a later one.
+func (s *Submission) PrepareCheckpoint(group uint64, snapshot *pb.Snapshot) error {
+	if err := s.prepareControl(submissionCheckpoint, 1); err != nil {
+		return err
+	}
+	if group == 0 || snapshot == nil || snapshot.GetMetadata() == nil || snapshot.GetMetadata().GetConfState() == nil ||
+		snapshot.GetMetadata().GetIndex() == 0 || snapshot.GetMetadata().GetTerm() == 0 {
+		s.invalidatePrepare()
+		return ErrInvalid
+	}
+	s.groups[0], s.snapshot = group, snapshot
+	return nil
+}
+
 func (s *Submission) RegisteredGroup() (GroupDescriptor, GroupIncarnation, bool) {
 	if s == nil || s.kind != submissionRegisterGroup || s.state.Load() != submissionComplete || s.err != nil {
 		return GroupDescriptor{}, GroupIncarnation{}, false
@@ -224,15 +246,17 @@ type NodeSubmissionSequencer struct {
 	head submissionRingIndex
 	tail submissionRingIndex
 
-	wake       chan struct{}
-	drained    chan struct{}
-	done       chan struct{}
-	closed     atomic.Bool
-	submitters atomic.Int64
-	stopOnce   sync.Once
-	drainOnce  sync.Once
-	fatal      atomic.Pointer[sequencerFailure]
-	ownerWake  atomic.Pointer[nodeSequencerWake]
+	wake             chan struct{}
+	drained          chan struct{}
+	done             chan struct{}
+	closed           atomic.Bool
+	submitters       atomic.Int64
+	stopOnce         sync.Once
+	drainOnce        sync.Once
+	fatal            atomic.Pointer[sequencerFailure]
+	wakeMu           sync.Mutex
+	ownerWakes       atomic.Pointer[nodeSequencerWakeSet]
+	maintenanceOwner atomic.Bool
 
 	persist func([]NodeReady) error
 
@@ -242,7 +266,11 @@ type NodeSubmissionSequencer struct {
 }
 
 type sequencerFailure struct{ err error }
-type nodeSequencerWake struct{ fn func() }
+type nodeSequencerWake struct {
+	owner *Submission
+	fn    func()
+}
+type nodeSequencerWakeSet struct{ entries []nodeSequencerWake }
 
 // nodeWaveAdmission is a conservative, allocation-free upper bound for the
 // fixed arenas touched by one Ready after it joins a node durability wave.
@@ -363,22 +391,83 @@ func (q *NodeSubmissionSequencer) Owns(store *NodeStore) bool {
 	return q != nil && store != nil && q.store == store
 }
 
-// SetWake installs the one device-scheduler notification for this sequencer.
-// It is deliberately node-wide rather than per group: one callback drains all
-// Runtime completions made visible by a durability wave.
-func (q *NodeSubmissionSequencer) SetWake(wake func()) {
-	if q == nil || wake == nil {
-		if q != nil {
-			q.ownerWake.Store(nil)
-		}
+// ClaimMaintenanceLane reserves the single bounded background producer which
+// may prepare checkpoint work for this device sequencer.
+func (q *NodeSubmissionSequencer) ClaimMaintenanceLane() error {
+	if q == nil || q.closed.Load() {
+		return ErrClosed
+	}
+	if !q.maintenanceOwner.CompareAndSwap(false, true) {
+		return ErrMaintenanceActive
+	}
+	return nil
+}
+
+// ReleaseMaintenanceLane releases a previously claimed producer after all of
+// its accepted work has completed.
+func (q *NodeSubmissionSequencer) ReleaseMaintenanceLane() {
+	if q != nil {
+		q.maintenanceOwner.Store(false)
+	}
+}
+
+// SetWakeFor registers the execution owner of one caller-reserved submission
+// cell. Registration is cold-path and publishes one immutable callback vector;
+// durability completion only performs an atomic load and bounded iteration.
+// Passing nil removes owner without disturbing any other execution lane.
+func (q *NodeSubmissionSequencer) SetWakeFor(owner *Submission, wake func()) {
+	if q == nil || owner == nil {
 		return
 	}
-	q.ownerWake.Store(&nodeSequencerWake{fn: wake})
+	q.wakeMu.Lock()
+	defer q.wakeMu.Unlock()
+	current := q.ownerWakes.Load()
+	count := 0
+	if current != nil {
+		count = len(current.entries)
+	}
+	position := count
+	if current != nil {
+		for index := range current.entries {
+			if current.entries[index].owner == owner {
+				position = index
+				break
+			}
+		}
+	}
+	if wake == nil && position == count {
+		return
+	}
+	nextCount := count
+	if wake == nil {
+		nextCount--
+	} else if position == count {
+		nextCount++
+	}
+	if nextCount == 0 {
+		q.ownerWakes.Store(nil)
+		return
+	}
+	next := &nodeSequencerWakeSet{entries: make([]nodeSequencerWake, nextCount)}
+	if wake == nil {
+		copy(next.entries, current.entries[:position])
+		copy(next.entries[position:], current.entries[position+1:])
+	} else {
+		if current != nil {
+			copy(next.entries, current.entries)
+		}
+		next.entries[position] = nodeSequencerWake{owner: owner, fn: wake}
+	}
+	q.ownerWakes.Store(next)
 }
 
 func (q *NodeSubmissionSequencer) notifyOwner() {
-	if wake := q.ownerWake.Load(); wake != nil && wake.fn != nil {
-		wake.fn()
+	if wakes := q.ownerWakes.Load(); wakes != nil {
+		for index := range wakes.entries {
+			if wakes.entries[index].fn != nil {
+				wakes.entries[index].fn()
+			}
+		}
 	}
 }
 
@@ -520,6 +609,8 @@ func (q *NodeSubmissionSequencer) runWave(items *[MaxPersistGroupBatches]*Submis
 			return registerErr
 		case submissionDescriptorCatalog:
 			return q.store.publishDescriptorCatalogReferenceLocked(s.catalog, true)
+		case submissionCheckpoint:
+			return q.store.publishGroupCheckpointSequenced(s.groups[0], s.snapshot)
 		default:
 			return ErrInvalid
 		}

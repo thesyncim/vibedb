@@ -397,7 +397,8 @@ func (runtime *Runtime) SetPipelinedWake(wake func()) {
 		return
 	}
 	if runtime.nodePersistence != nil {
-		runtime.nodePersistence.sequencer.SetWake(wake)
+		runtime.nodePersistence.sequencer.SetWakeFor(&runtime.nodePersistence.cell, wake)
+		runtime.nodePersistence.sequencer.SetWakeFor(&runtime.nodePersistence.checkpoint, wake)
 		return
 	}
 	if wake == nil {

@@ -6,6 +6,7 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftstore"
+	pb "go.etcd.io/raft/v3/raftpb"
 )
 
 var ErrNodePersistenceBinding = errors.New("raftmember: node persistence group binding mismatch")
@@ -18,6 +19,7 @@ type NodeRuntimePersistence struct {
 	sequencer   *raftstore.NodeSubmissionSequencer
 	stable      *raftstore.GroupView
 	cell        raftstore.Submission
+	checkpoint  raftstore.Submission
 	group       uint64
 	incarnation uint64
 }
@@ -44,6 +46,9 @@ func BindNodeRuntimePersistence(store *raftstore.NodeStore, sequencer *raftstore
 	}
 	adapter := &NodeRuntimePersistence{sequencer: sequencer, stable: view, group: descriptor.LogKey, incarnation: incarnation}
 	if err = adapter.cell.Initialize(); err != nil {
+		return nil, err
+	}
+	if err = adapter.checkpoint.Initialize(); err != nil {
 		return nil, err
 	}
 	return adapter, nil
@@ -74,4 +79,28 @@ func (p *NodeRuntimePersistence) Wait() (uint64, error) {
 		return 0, ErrRuntimeClosed
 	}
 	return p.cell.Wait()
+}
+
+func (p *NodeRuntimePersistence) submitCheckpoint(snapshot *pb.Snapshot) (uint64, error) {
+	if p == nil || p.sequencer == nil {
+		return 0, ErrRuntimeClosed
+	}
+	if err := p.checkpoint.PrepareCheckpoint(p.group, snapshot); err != nil {
+		return 0, err
+	}
+	return p.sequencer.TrySubmit(&p.checkpoint)
+}
+
+func (p *NodeRuntimePersistence) pollCheckpoint() (uint64, bool, error) {
+	if p == nil {
+		return 0, false, ErrRuntimeClosed
+	}
+	return p.checkpoint.Poll()
+}
+
+func (p *NodeRuntimePersistence) waitCheckpoint() (uint64, error) {
+	if p == nil {
+		return 0, ErrRuntimeClosed
+	}
+	return p.checkpoint.Wait()
 }
