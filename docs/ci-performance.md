@@ -1,175 +1,124 @@
 # CI performance
 
-This change starts at `a069351bbd190c925fa81f8205c0b66ffce24911` (main,
-2026-09-03). Optimize the existing Go workflow before considering a Bazel
-migration. The first measurable opportunity is scheduling and cache freshness.
+The target is at least a 5x reduction from the historical passing CI run of
+27m40s: **5m32s end to end**. The changes use native Go caches and GitHub Actions
+scheduling. No Bazel migration or additional runner service is required.
 
-## Baseline evidence
+## Measurements
 
-The most recent passing baseline found before these increments was
-[33570912428](https://github.com/thesyncim/vibedb/actions/runs/33570912428),
-at `77cb367d0d9e36f85dedbf95754b39ea0bcd6a70` (2026-09-01): **27m40s** from
-workflow creation through completion. Its x86 test job took 27m37s, including
-483 s of cross-compilation, 757 s of ordinary tests, and 213 s of storage race
-tests. A 5x improvement against this historical run requires <=332 seconds
-end to end. Source changes since that revision make this a historical baseline,
-not a controlled same-revision benchmark.
+| Run | Result | End to end | Initial queue | Runner-minutes |
+| --- | --- | ---: | ---: | ---: |
+| [Historical baseline](https://github.com/thesyncim/vibedb/actions/runs/33570912428) | pass | 27m40s | 3s | 50.8 |
+| [First wide, cold split](https://github.com/thesyncim/vibedb/actions/runs/33804436030) | fail | 8m41s | 1m18s | 80.9 |
+| [Staged main run](https://github.com/thesyncim/vibedb/actions/runs/33808353104) | fail | 6m00s | 1m37s | 36.4 |
+| [Clean warm measurement](https://github.com/thesyncim/vibedb/actions/runs/33808998083) | pass | 4m07s | 3s | 32.7 |
 
-GitHub Actions runs [33801464065](https://github.com/thesyncim/vibedb/actions/runs/33801464065)
-and [33730074031](https://github.com/thesyncim/vibedb/actions/runs/33730074031)
-show these step durations:
+**The clean warm run passed all 27 jobs in 4m07s end to end: 6.72x faster
+than the 27m40s historical passing baseline.** Initial queueing was 3 seconds
+in both runs. Runner usage fell from 50.8 to 32.7 minutes, approximately 36%.
+The measured warm run exceeds the 5x target without reducing coverage or
+relaxing qualification limits. Earlier hot-shard failures remain documented
+below; one passing run is not a claim that those intermittent failures cannot
+recur.
 
-| Step | Recent run | Earlier run |
-| --- | ---: | ---: |
-| x86 build and vet | 66 s | 61 s |
-| x86 four cross-compilation targets, sequential | 516 s | 459 s |
-| ARM serial package tests | 696 s | 722 s |
-| Distributed serving race suite | 326 s | 534 s |
-| Kubernetes topology qualification | 255 s | 321 s |
+The baseline was `77cb367d0d9e36f85dedbf95754b39ea0bcd6a70`, on 2026-09-01.
+The clean measurement uses `40ace7cdaf7c8d1f88039053f9eb97199d93fd10`, on
+2026-09-03, including concurrent backend fixes and additional SIMD validation.
+This is a historical comparison, not a controlled same-source A/B experiment.
+Warm-cache results do not guarantee the same latency after cache eviction, a
+Go toolchain change, or a long GitHub runner queue.
 
-Both runs failed on ARM and cancelled the x86 matrix member before its ordinary
-tests finished. The later qualification/race steps in that member did not run.
-These are partial baselines, **not complete passing-suite durations**. Their
-existing test failures are outside this workflow change.
+The failed staged run took 4m23s from first job start to last finish; its queue
+wait made the end-to-end time 6m. It used 28% fewer runner-minutes than the
+historical baseline. Its only substantive failure was the hot-shard latency
+gate: 7.51s foreground p99 against a 5s bound. Earlier runs also exposed
+intermittent hot-shard request deadlines. No timeout, latency bound, or retry
+policy was relaxed to obtain a faster result. Failed and cancelled runs are
+not evidence of a completed passing-suite speedup.
 
-In the recent ARM log, reported package times total about 607 s: durable storage
-249 s, SQL/store/driver/pgwire 153 s, gateway/shard commands 112 s, and the remaining
-packages about 93 s. These sums exclude compilation and runner overhead. The
-largest shard is about 2.4 times shorter than the serial package-time sum; that
-is a scheduling estimate, not a measured speedup.
+## What changed
 
-The x86 jobs all restored the same approximately 64 MB `setup-go` cache, keyed
-by Go version and `go.sum`. Their post steps said the primary key was already
-present and did not save updated build outputs.
+- Build caches previously shared an immutable dependency-only key. All x86
+  jobs restored the same roughly 64 MiB snapshot and then declined to save
+  newly compiled source. The new build keys include exact Go version, host
+  OS/architecture, lane, and revision, with a lane-prefix restore from earlier
+  revisions. Go validates individual cached entries. Module downloads use a
+  separate shared key covering all `go.sum` files.
+- Completed compilation is saved after test failures and cancellation too.
+  Superseded revisions therefore do not discard all compilation work. Failed
+  test results are not reusable Go test results.
+- Four cross-compilation targets run in two lanes, covering the same root and
+  PostgreSQL client modules. They no longer precede native tests. Both native
+  architectures retain full build/vet checks.
+- Native testing has five disjoint test shards on each architecture: durable,
+  durable pressure, SQL, process, and core. Package discovery uses
+  `go list ./...`; new packages default to core. Every runner retains `-p=1`
+  and the 25-minute package timeout to avoid overlapping large mmap arenas.
+- `TestFilePrimaryChurnQualification` and
+  `TestFilePrimaryLargerThanCacheQualification` consumed 113.82s and 53.57s in
+  the measured x86 package. They have their own runner. The ordinary durable
+  shard uses the complementary exact-name exclusion; neither test, corpus,
+  assertion, nor repetition count was changed.
+- The new `GOEXPERIMENT=simd` planner/query/gateway tests run independently on
+  both architectures, retaining their command and `-count=1`. Previously they
+  delayed core tests by 124s on x86 and 99s on ARM.
+- Sixteen work jobs are initially runnable, leaving room for the other four
+  RF3 workflows triggered by main pushes. Once the SQL pair finishes,
+  contracts/restore/LATERAL, recovery/client, storage-race, and distributed-race
+  lanes start. This scheduling dependency does not suppress them after a SQL
+  failure. The first 30-job experiment left nine jobs waiting for runner slots.
+- Short qualification groups share runners. Independent groups explicitly
+  continue after an earlier group's failure. Overall job/check failure is
+  preserved. Qualification commands, environment switches, repeat counts,
+  evidence validation, and artifact names are retained.
+- Matrix failures do not cancel sibling coverage. Existing required check
+  names remain as fail-closed aggregators, including the native test,
+  distributed-race, restore-activation, and LATERAL checks. Skipped or failed
+  required dependencies cannot produce a successful aggregate.
+- New pushes cancel superseded runs on main and PRs. An older in-flight main
+  revision may therefore have no complete evidence artifact; the latest
+  revision still runs all checks. Manual dispatch supports a fixed-revision
+  measurement while other main updates continue.
 
-## Changes
+## Validation
 
-- Four cross-compilation targets run in two independent compiler lanes, covering
-  the same root and PostgreSQL client modules. They no longer delay native tests.
-- Native tests use five disjoint test shards on each of the existing architectures.
-  `go list ./...` discovers the complete package set; new packages default to the
-  core shard. The two measured pressure qualifications have their own runner;
-  the ordinary durable shard uses the complementary exact-name exclusion.
-  Each runner retains `-p=1` and the 25-minute package timeout.
-- Slow Linux process qualifications and both storage-race lanes run independently.
-  Short recovery/client checks share a runner; distributed race packages use two
-  balanced lanes. Build/vet runs in the core shard on each architecture. This
-  originally limited initial fan-out to 20 jobs; the first 30-job experiment
-  left nine jobs queued while only about 20 ran. Restore activation shares the contract runner
-  and retains its prior required check name through an aggregator. LATERAL
-  shares that runner too, retaining its required check name. Hot-shard and
-  transport qualifications share one runner.
-- Modules have a shared dependency cache. Build/test cache snapshots have separate
-  toolchain, host architecture, and lane keys, with a revision suffix and a prefix
-  restore from an earlier revision. Go validates each restored cache entry.
-  Explicit saves run after test failures and cancellation too, so completed
-  compilation survives a failing suite or a superseding main commit. Go cache
-  entries are individually validated; cancellation does not make a failed test
-  result reusable. Failed test results are not reusable Go test results.
-- Superseded runs are cancelled on main and PRs so the newest revision does not
-  queue behind obsolete work. This intentionally stops collecting evidence for
-  an in-flight older main revision; every check still runs for the latest one.
-- Matrix failures do not cancel siblings. Existing `test (ubuntu-latest)`,
-  `test (ubuntu-24.04-arm)`, and `race (distributed serving)` check names are
-  retained as aggregators. The test aggregators both require every split test
-  lane to succeed, including cross-compilation and process evidence. Failure,
-  cancellation, and skipped dependencies cannot make these checks pass.
-- Qualification commands, environment switches, repeat counts, evidence
-  validation, and artifact names remain unchanged. No suite moves off pull
-  requests. Unit logs are uploaded for subsequent package timing analysis.
+Local validation includes actionlint v1.7.7 **with ShellCheck**, six selector
+checks, and shell syntax validation. The base package partition was compared
+with real `go list ./...`: all 83 packages exactly once. The extra pressure lane
+shares only the durable package through complementary filters. The checks cover
+new packages, invalid arguments, discovery failure, empty shards, serial
+execution, failure propagation, and pressure-filter disjointness.
 
-## Validation and measurement
+Workflow comparisons verified that moved test/evidence commands, environments,
+artifact settings, and repeat counts remained unchanged. The concurrent feature
+merge also required refreshing the generated `UNSAFE.md` inventory for
+`planner/statistics_groups.go`, whose unsafe use is `unsafe.Sizeof`; the audit
+suite passed after regeneration.
 
-Local validation: pinned actionlint v1.7.7; shell syntax; selector tests for
-complete/disjoint coverage, new packages, invalid arguments, discovery failure,
-empty shards, serial invocation and test failure propagation. The selector's
-base partition was compared with real `go list ./...`: all 83 packages exactly
-once. The added pressure lane shares the durable package using complementary
-filters, whose disjointness is checked by the selector tests.
-The original and revised workflow steps were compared for unchanged evidence
-commands, environment, artifact paths, repeat counts, and timeouts.
+## Repeating the measurement
 
-The first split workflow is running on GitHub; completed comparisons will be
-recorded here once available. A macOS run cannot validate the
-Linux filesystem qualifications or ARM runner performance. Compare the first
-cold-cache run and at least two subsequent source revisions, separating queue
-time, cache restore/save, compilation, and package execution. Compare the same
-successful checks before claiming an end-to-end gain. Use the uploaded
-`unit-timings-*` logs and the run's job/step timestamps.
-
-Parallel runners duplicate some compilation and use more concurrent job slots; more
-revision caches consume storage and can cause eviction. Observe queue time,
-runner minutes, and cache hit rates as well as latency. Account concurrency
-limits can absorb much of the scheduling gain. Cold caches and substantial
-shared-package changes will be slower than warm leaf changes.
-
-## Bazel and the 10x target
-
-Go already caches builds and successful cacheable tests. Bazel's remote cache
-can be useful, but it requires build targets and declared inputs; process tests
-that invoke Go, use real filesystems, sockets, subprocesses, and external tools
-need additional integration. It does not remove the runtime of fresh fault,
-crash, or throughput qualifications. Those currently force repeat execution.
-
-A 10x end-to-end gain is not supported by these measurements. The unchanged
-Kubernetes lane alone took 4.25–5.35 minutes, and the durable package took about
-4.15 minutes before build/setup overhead. After measuring this split, profile
-those remaining critical paths. Further options include splitting expensive
-tests within the durable package, caching the Kubernetes image build, or faster
-runners. Treat each as a separate measured experiment; changing which suites
-run on a PR would change the coverage policy and is not part of this change.
-
-References:
-[setup-go caching](https://github.com/actions/setup-go/blob/main/docs/advanced-usage.md#caching),
-[Go build and test caching](https://pkg.go.dev/cmd/go#hdr-Build_and_test_caching),
-[Bazel remote caching](https://bazel.build/remote/caching).
-
-To report a run without counting later metadata edits as execution time:
+Wait for other CI runs to finish to measure an uncontended warm run:
 
 ```sh
+gh workflow run ci.yml --ref main
+gh run list --workflow ci.yml --event workflow_dispatch --limit 1
 gh run view RUN_ID --json createdAt,updatedAt,status,conclusion,jobs | \
   python3 scripts/ci/summarize-run.py --baseline-seconds 1660
 ```
 
-The report separates initial queue time and identifies failed/incomplete runs;
-an elapsed-time ratio for a failed run is not a passing-suite speedup.
+Use job/step timestamps for wall time; cached Go test output can replay prior
+results. The report separates initial queue time and flags unsuccessful runs.
+Unit JSON logs are uploaded as `unit-timings-*` for package/test analysis.
+Compare runner-minutes and cache hit rates as well as elapsed time. The newest
+snapshots across observed lane keys occupied about 4.6 GiB during rollout;
+revision history and old lanes add storage and are subject to cache eviction.
 
-### Measurements during rollout
+Go already supplies build and successful-test caching. Bazel remote caching
+would require additional build targets and declared inputs, and cannot remove
+the execution time of fresh crash/fault qualifications. Further performance
+work should follow the measured critical path, currently including Kubernetes
+qualification, rather than assuming a build-system migration provides 5x.
 
-The first wide, cold-cache run
-[33804436030](https://github.com/thesyncim/vibedb/actions/runs/33804436030)
-finished in 521 seconds, including 78 seconds of initial queue time and 443
-seconds from first job start to last finish. It used 80.9 runner-minutes. Its
-core shards failed the already-observed allocation tests, and hot-shard
-qualification timed out. The latter passed on the next run and in an isolated
-Linux reproduction; no test retries or relaxed deadlines were added.
-
-The first compact run
-[33805250803](https://github.com/thesyncim/vibedb/actions/runs/33805250803)
-exposed a ShellCheck error in the race package-list expansion. That was fixed
-with a quoted Bash array, and local validation now includes ShellCheck. Its
-x86 durable log reported 286.89 seconds across 724 top-level tests;
-`TestFilePrimaryChurnQualification` consumed 113.82 seconds and
-`TestFilePrimaryLargerThanCacheQualification` 53.57 seconds. These two tests now
-run separately from the remaining durable tests, without changing either test.
-
-The first compact run completed in 367 seconds (7 seconds initial queue),
-4.52x shorter elapsed time than the historical baseline, using 61.3
-runner-minutes. This was still a failed run and is not passing-suite proof.
-
-### SIMD and staged scheduling
-
-A concurrent feature merge added `GOEXPERIMENT=simd` planner/query/gateway
-tests before the core tests on both architectures. In manual run
-[33807400032](https://github.com/thesyncim/vibedb/actions/runs/33807400032),
-that step took 124 seconds on x86 and 99 seconds on ARM before ordinary core
-testing could begin. It now has independent architecture lanes, with the same
-command, repeat count, timeout, and experiment setting.
-
-SQL shards have their own job ID and anchor the second scheduling wave.
-Contracts/restore/LATERAL, recovery/client checks, storage race, and distributed
-race lanes start after the SQL pair finishes. They explicitly still run after
-a SQL failure. Sixteen work jobs are initially runnable, leaving four slots
-for the other RF3 workflows triggered by main pushes. No test moves off a PR
-or loses its required aggregate gate. The two native SQL shards plus eight
-other native shards retain the same package/test partition.
+References: [Go caching](https://pkg.go.dev/cmd/go#hdr-Build_and_test_caching),
+[setup-go caching](https://github.com/actions/setup-go/blob/main/docs/advanced-usage.md#caching),
+[Bazel remote caching](https://bazel.build/remote/caching).
