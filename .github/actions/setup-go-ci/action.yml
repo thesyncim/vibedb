@@ -1,0 +1,45 @@
+name: Set up Go with lane caches
+description: Share modules and refresh each lane's build cache as source changes.
+inputs:
+  scope:
+    description: Stable lane name, including matrix targets or shards.
+    required: true
+outputs:
+  cache-key:
+    description: Build cache key to save, including the current revision.
+    value: ${{ steps.build-cache.outputs.cache-primary-key }}
+  cache-hit:
+    description: Whether this exact revision was restored.
+    value: ${{ steps.build-cache.outputs.cache-hit }}
+  cache-path:
+    description: Go build cache directory.
+    value: ${{ steps.paths.outputs.build }}
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-go@v6
+      id: toolchain
+      with:
+        go-version: '1.27'
+        cache: false
+    - id: paths
+      shell: bash
+      run: |
+        echo "build=$(go env GOCACHE)" >> "$GITHUB_OUTPUT"
+        echo "modules=$(go env GOMODCACHE)" >> "$GITHUB_OUTPUT"
+    - uses: actions/cache@v4
+      with:
+        path: ${{ steps.paths.outputs.modules }}
+        key: go-mod-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.go-version }}-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          go-mod-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.go-version }}-
+    # setup-go's default go.sum key is immutable: the first successful job
+    # wins, and later source builds never refresh it. Isolate lane writers and
+    # restore the preceding revision; Go validates individual cache entries.
+    - uses: actions/cache/restore@v4
+      id: build-cache
+      with:
+        path: ${{ steps.paths.outputs.build }}
+        key: go-build-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.go-version }}-${{ inputs.scope }}-${{ github.sha }}
+        restore-keys: |
+          go-build-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.go-version }}-${{ inputs.scope }}-

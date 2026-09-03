@@ -14,9 +14,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
+      - uses: ./.github/actions/setup-go-ci
+        id: go
         with:
-          go-version: '1.27'
+          scope: repository-contracts
       - name: Validate workflow syntax
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
       - name: Reject stale generated contracts
@@ -43,15 +44,22 @@ jobs:
           go run ./cmd/vibedb-operator render -image "vibedb:${GITHUB_SHA}" -namespace vibedb-test -shard-node-ids "${ids}" > "${second}"
           cmp "${first}" "${second}"
           go run ./cmd/vibedb-operator validate -manifest "${first}"
+      - name: Save Go build cache
+        if: ${{ !cancelled() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.go.outputs.cache-path }}
+          key: ${{ steps.go.outputs.cache-key }}
   kubernetes-rf3:
     name: Kubernetes RF3 serving and restart qualification
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
+      - uses: ./.github/actions/setup-go-ci
+        id: go
         with:
-          go-version: '1.27'
+          scope: kubernetes-rf3
       - name: Install pinned Kind
         run: go install sigs.k8s.io/kind@v0.32.0
       - name: Qualify three-worker RF3 topology
@@ -66,15 +74,22 @@ jobs:
           path: ${{ runner.temp }}/vibedb-kube-rf3-evidence
           if-no-files-found: error
           retention-days: 30
+      - name: Save Go build cache
+        if: ${{ !cancelled() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.go.outputs.cache-path }}
+          key: ${{ steps.go.outputs.cache-key }}
   restore-activation:
     name: Fresh RF3 restore activation crash qualification
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
+      - uses: ./.github/actions/setup-go-ci
+        id: go
         with:
-          go-version: '1.27'
+          scope: restore-activation
       - name: Run every external activation publication cut
         shell: bash
         env:
@@ -123,6 +138,12 @@ jobs:
           path: ${{ runner.temp }}/restore-activation
           if-no-files-found: error
           retention-days: 30
+      - name: Save Go build cache
+        if: ${{ !cancelled() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.go.outputs.cache-path }}
+          key: ${{ steps.go.outputs.cache-key }}
   test:
     name: test (${{ matrix.runner }})
     strategy:
@@ -131,9 +152,10 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
+      - uses: ./.github/actions/setup-go-ci
+        id: go
         with:
-          go-version: '1.27'
+          scope: test
       - name: Build and vet
         run: go build ./... && go vet ./...
       - name: Cross-compile 32-bit packages and tests
@@ -439,25 +461,39 @@ jobs:
         # Qualification tests build multi-hundred-MiB corpora and are geometry/
         # throughput gates; under -race on ARM they alone can exhaust the budget.
         run: go test -race -timeout=25m -skip 'Qualification' -run 'Primary|BufferedInplace|Committer|PageCache|WriteTransaction' ./internal/storeio/ ./store/durable/
+      - name: Save Go build cache
+        if: ${{ !cancelled() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.go.outputs.cache-path }}
+          key: ${{ steps.go.outputs.cache-key }}
   lateral-race:
     name: race (LATERAL cross-layer)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
+      - uses: ./.github/actions/setup-go-ci
+        id: go
         with:
-          go-version: '1.27'
+          scope: lateral-race
       - name: Focused LATERAL race tests
         run: go test -race -p=1 -count=1 -timeout=10m -run 'Lateral' ./query ./sql/driver ./pgwire
+      - name: Save Go build cache
+        if: ${{ !cancelled() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.go.outputs.cache-path }}
+          key: ${{ steps.go.outputs.cache-key }}
   distributed-race:
     name: race (distributed serving)
     runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
+      - uses: ./.github/actions/setup-go-ci
+        id: go
         with:
-          go-version: '1.27'
+          scope: distributed-race
       - name: Distributed serving race tests
         # External qualification corpora have dedicated no-skip Linux jobs in
         # the test matrix. This lane instruments the serving, quorum, durable
@@ -470,3 +506,9 @@ jobs:
           ./internal/raftservice
           ./internal/replicatedstate
           ./internal/snapshottransfer
+      - name: Save Go build cache
+        if: ${{ !cancelled() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.go.outputs.cache-path }}
+          key: ${{ steps.go.outputs.cache-key }}
