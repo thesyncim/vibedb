@@ -33,3 +33,23 @@ func OpenBoundSQLWithApplyForSchemaSourceTransition(
 			return sqldriver.OpenReplicatedShardStoreWithSchemaSourceTransition(path, base, apply, command, options...)
 		}, opening...)
 }
+
+// OpenBoundNodeSQLWithApplyForSchemaSourceTransition opens the authenticated
+// retiring source on the node log. Segmented node logs have no foreground WAL
+// generation activation; the caller separately proves the exact committed
+// transition entry from this GroupView before requesting catalog settlement.
+func OpenBoundNodeSQLWithApplyForSchemaSourceTransition(
+	path string, group *raftstore.GroupView,
+	authority sqldriver.ReplicatedAuthorityProfile,
+	expectedSQL sqldriver.ReplicatedShardStoreIdentity,
+	expectedApply sqldriver.ReplicatedApplyIdentity,
+	command []byte,
+	opening ...sqldriver.ReplicatedOpenOptions,
+) (*sqldriver.Database, *sqldriver.ReplicatedApply, error) {
+	return openBoundNodeSQLWithApply(
+		path, group, authority, expectedSQL, expectedApply,
+		func(path string, base sqldriver.ReplicatedShardStoreIdentity, apply sqldriver.ReplicatedApplyIdentity, options ...sqldriver.ReplicatedOpenOptions) (*sqldriver.Database, error) {
+			return sqldriver.OpenReplicatedShardStoreWithSchemaSourceTransition(path, base, apply, command, options...)
+		}, opening...,
+	)
+}

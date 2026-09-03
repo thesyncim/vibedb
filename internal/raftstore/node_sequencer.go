@@ -244,6 +244,91 @@ type NodeSubmissionSequencer struct {
 type sequencerFailure struct{ err error }
 type nodeSequencerWake struct{ fn func() }
 
+// nodeWaveAdmission is a conservative, allocation-free upper bound for the
+// fixed arenas touched by one Ready after it joins a node durability wave.
+// frameBytes deliberately charges the wave header once per Ready. That small
+// overcharge makes costs additive, so the consumer can stop before the next
+// ticket without encoding, locking the store, or later rejecting an already
+// accepted Ready merely because unrelated groups happened to arrive together.
+type nodeWaveAdmission struct {
+	frameBytes int
+	events     int
+}
+
+func addAdmissionInt(value *int, delta int) bool {
+	if delta < 0 || *value > int(^uint(0)>>1)-delta {
+		return false
+	}
+	*value += delta
+	return true
+}
+
+func (s *NodeStore) readyWaveAdmission(ready NodeReady) (nodeWaveAdmission, error) {
+	// A zero-value store is used by scheduler-only tests and injected transports.
+	// Real node stores always authenticate nonzero bounds in NODEMETA.
+	if s == nil || s.bounds.maxWaveBytes == 0 {
+		return nodeWaveAdmission{}, nil
+	}
+	batch := ready.Batch
+	if ready.GroupID == 0 || batch.NodeIncarnation == 0 || batch.ReadyID == 0 ||
+		uint64(len(batch.Entries)) > s.bounds.maxEntriesPerGroup {
+		return nodeWaveAdmission{}, ErrBounds
+	}
+	plainBytes, nonemptyEntries := 0, 0
+	for _, entry := range batch.Entries {
+		if entry == nil || !addAdmissionInt(&plainBytes, len(entry.GetData())) {
+			return nodeWaveAdmission{}, ErrBounds
+		}
+		if len(entry.GetData()) != 0 {
+			nonemptyEntries++
+		}
+	}
+	readyBytes, err := readyPayloadSize(batch)
+	if err != nil {
+		return nodeWaveAdmission{}, err
+	}
+	if !canonicalEmptySnapshot(batch.Snapshot) {
+		snapshotBytes, snapshotErr := snapshotPayloadSize(batch.Snapshot)
+		if snapshotErr != nil || !addAdmissionInt(&readyBytes, snapshotBytes) {
+			if snapshotErr != nil {
+				return nodeWaveAdmission{}, snapshotErr
+			}
+			return nodeWaveAdmission{}, ErrBounds
+		}
+	}
+	if uint64(readyBytes) > s.bounds.maxWaveBytes {
+		return nodeWaveAdmission{}, ErrBounds
+	}
+
+	// 92 covers the fixed wave header and both count varints. 169 covers the
+	// worst batch descriptor (identity, replacement, checkpoint, HardState and
+	// counts). Each entry then has at most eight uint64 varints in blob form.
+	// AEAD contributes one 16-byte tag per nonempty entry in the worst packing.
+	frameBytes := 92 + 169
+	if len(batch.Entries) > (int(^uint(0)>>1)-frameBytes)/80 ||
+		!addAdmissionInt(&frameBytes, len(batch.Entries)*80) ||
+		!addAdmissionInt(&frameBytes, plainBytes) ||
+		nonemptyEntries > (int(^uint(0)>>1)-frameBytes)/16 ||
+		!addAdmissionInt(&frameBytes, nonemptyEntries*16) {
+		return nodeWaveAdmission{}, ErrBounds
+	}
+	events := 6
+	if !addAdmissionInt(&events, len(batch.Entries)) ||
+		uint64(frameBytes) > s.bounds.maxWaveBytes ||
+		uint64(events) > s.bounds.maxSegmentEvents {
+		return nodeWaveAdmission{}, ErrBounds
+	}
+	return nodeWaveAdmission{frameBytes: frameBytes, events: events}, nil
+}
+
+func (s *NodeStore) waveAdmissionsFit(current, next nodeWaveAdmission) bool {
+	if s == nil || s.bounds.maxWaveBytes == 0 {
+		return true
+	}
+	return next.frameBytes <= int(s.bounds.maxWaveBytes)-current.frameBytes &&
+		next.events <= int(s.bounds.maxSegmentEvents)-current.events
+}
+
 func NewNodeSubmissionSequencer(store *NodeStore, capacity int) (*NodeSubmissionSequencer, error) {
 	if store == nil || capacity < 2 || capacity&(capacity-1) != 0 || capacity > 1<<20 {
 		return nil, ErrBounds
@@ -326,6 +411,11 @@ func (q *NodeSubmissionSequencer) TrySubmit(submission *Submission) (uint64, err
 			return 0, ErrSubmissionPending
 		}
 		return 0, ErrInvalid
+	}
+	if submission.kind == submissionReady {
+		if _, err := q.store.readyWaveAdmission(submission.Ready); err != nil {
+			return 0, err
+		}
 	}
 	if !submission.state.CompareAndSwap(submissionIdle, submissionQueued) {
 		return 0, ErrSubmissionPending
@@ -478,11 +568,29 @@ func (q *NodeSubmissionSequencer) run() {
 	var ready [MaxPersistGroupBatches]NodeReady
 	for {
 		count := 0
+		var admission nodeWaveAdmission
 		for count < len(items) {
 			s, ok := q.peek()
 			if !ok || count > 0 && (items[0].kind != submissionReady || s.kind != submissionReady) ||
 				s.kind == submissionReady && submissionGroupSeen(&items, count, s.Ready.GroupID) {
 				break
+			}
+			if s.kind == submissionReady {
+				next, admissionErr := q.store.readyWaveAdmission(s.Ready)
+				if admissionErr != nil {
+					// TrySubmit performs the same immutable geometry check before
+					// publishing a ticket. Reaching this branch means caller-owned
+					// Ready memory changed after acceptance: fail this wave rather
+					// than letting it contaminate a later durability decision.
+					items[count] = q.pop()
+					count++
+					break
+				}
+				if count > 0 && !q.store.waveAdmissionsFit(admission, next) {
+					break
+				}
+				admission.frameBytes += next.frameBytes
+				admission.events += next.events
 			}
 			items[count] = q.pop()
 			count++
