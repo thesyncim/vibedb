@@ -1,0 +1,17 @@
+{
+  "source_revision": "9c45728c775d41d25e2c9daaad0a9e3571c86be0",
+  "exit_codes": {
+    "cockroachdb": 0,
+    "vibedb": 1
+  },
+  "timings_used_in_report": false,
+  "vibedb": {
+    "verified_trials": 8,
+    "error": "update_existing warmup: ERROR: PostgreSQL write outcome unknown for request db47be0cd2e611f47957c9044fb2705f; server retains the request for automatic recovery; do not resubmit the write without verifying its outcome; reconnecting does not resolve or cancel it (SQLSTATE 40003)"
+  },
+  "cockroachdb": {
+    "verified_trials": 10,
+    "error": null
+  },
+  "shutdown_notes": "Forced post-measurement shutdown: cockroach\n"
+}

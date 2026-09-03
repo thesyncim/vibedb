@@ -1,0 +1,100 @@
+{
+  "vibedb": {
+    "source_revision": "1ce8a3ff6b3466ee17b4e4fc84f86fa2eba2444d",
+    "source_status": "",
+    "go_version": "go version go1.27.0 darwin/arm64",
+    "architecture": "arm64",
+    "crdb_image": "cockroachdb/cockroach:v26.3.1@sha256:204f131510c78393adb02345f289a8dbb32e1491e26cc92b6c7751f3b97be3c5",
+    "limits": {
+      "shared_cpus": 12,
+      "shared_memory_bytes": 25769803776
+    },
+    "options": {
+      "output": "/private/tmp/vibedb-crdb-sql-1ce8a3ff",
+      "rows": 8192,
+      "operations": 20000,
+      "scans": 2000,
+      "warmup": 1000,
+      "repetitions": 3,
+      "clients": "1,8",
+      "order": "vibedb-first"
+    },
+    "binary_sha256": {
+      "vibedb": "feb4be63d78b0a1d3c4c66b4e23b6b9127d29a0956a74058003d6af3684472bb",
+      "rf3-sqlbench": "0da02ffa59bea069b6a1949f8adc6440c2acc57619cbd7bfd136fb55655aa7d7",
+      "cockroach": "7923d5eca1fc275abebd64863fa5e5c51be3504fd57f37c5b8c4f8579bd54c3e",
+      "vibedb-gateway": "fed37e31e4356b46841be746ae0ea3cf98ac80c3c8b4ec4bb653a1129e9edc11",
+      "vibedb-shard": "a7410285e3969decd03917072ef65f30b9c507c2459139291b6cdce2c2c89756"
+    },
+    "method": "single Linux container; shared disk volume; engines run sequentially; SQL loopback trust/plaintext; inter-node TLS; no durability settings disabled",
+    "docker": {
+      "Architecture": "aarch64",
+      "NCPU": 16,
+      "MemTotal": 50425147392,
+      "KernelVersion": "7.0.12-linuxkit",
+      "OperatingSystem": "Docker Desktop"
+    },
+    "raw_sha256": "b936dd947f5413022d4f93ac3c4247c2be14c87eb9b430b717c5f80c3db43cf0",
+    "measurement_started_utc": "2026-09-03T21:38:36Z",
+    "runner_exit_codes": {
+      "vibedb": 1
+    },
+    "runtime_image": {
+      "Id": "sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b",
+      "RepoDigests": [
+        "golang@sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b"
+      ],
+      "Architecture": "arm64",
+      "Os": "linux"
+    }
+  },
+  "cockroachdb": {
+    "source_revision": "410bf5979dfdc313aa0f34482439224d45f02f4e",
+    "source_status": "",
+    "go_version": "go version go1.27.0 darwin/arm64",
+    "architecture": "arm64",
+    "crdb_image": "cockroachdb/cockroach:v26.3.1@sha256:204f131510c78393adb02345f289a8dbb32e1491e26cc92b6c7751f3b97be3c5",
+    "limits": {
+      "shared_cpus": 12,
+      "shared_memory_bytes": 25769803776
+    },
+    "options": {
+      "output": "/private/tmp/vibedb-crdb-sql-final",
+      "rows": 8192,
+      "operations": 20000,
+      "scans": 2000,
+      "warmup": 1000,
+      "repetitions": 3,
+      "clients": "1,8",
+      "order": "crdb-first"
+    },
+    "binary_sha256": {
+      "vibedb": "b5a5ddf742735cbfaf627a69b1f01a62f94046f9561acdd28813d3f59e659b23",
+      "rf3-sqlbench": "c7675ab00e39f2455769a50ce6b1ef885a1f0c272d76abf7ee296a83c19a9bfd",
+      "cockroach": "7923d5eca1fc275abebd64863fa5e5c51be3504fd57f37c5b8c4f8579bd54c3e",
+      "vibedb-gateway": "9f23b3f4fac071160114227442dca9b2532c83d2c1be0f8ba6f3acbfdac04e9c",
+      "vibedb-shard": "a2bcd464fc622a3f2ee319f3f5bb6dc74ea8489144e9fb9d2fec683ebabccc74"
+    },
+    "method": "single Linux container; shared disk volume; engines run sequentially; SQL loopback trust/plaintext; inter-node TLS; no durability settings disabled",
+    "docker": {
+      "Architecture": "aarch64",
+      "NCPU": 16,
+      "MemTotal": 50425147392,
+      "KernelVersion": "7.0.12-linuxkit",
+      "OperatingSystem": "Docker Desktop"
+    },
+    "raw_sha256": "605fbc40c96670da157e1772f6981ba6553b74d81dfd06adc92afdbd3b2372ba",
+    "measurement_started_utc": "2026-09-03T21:41:44Z",
+    "runner_exit_codes": {
+      "cockroachdb": 0
+    },
+    "runtime_image": {
+      "Id": "sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b",
+      "RepoDigests": [
+        "golang@sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b"
+      ],
+      "Architecture": "arm64",
+      "Os": "linux"
+    }
+  }
+}

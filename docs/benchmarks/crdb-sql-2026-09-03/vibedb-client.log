@@ -1,0 +1,25 @@
+vibedb point_hit c=1 rep=1 3191.2 ops/s p99=0.584ms errors=0 verified=true
+vibedb point_hit c=1 rep=2 3198.0 ops/s p99=0.578ms errors=0 verified=true
+vibedb point_hit c=1 rep=3 3186.6 ops/s p99=0.577ms errors=0 verified=true
+vibedb point_hit c=8 rep=1 9441.0 ops/s p99=2.321ms errors=0 verified=true
+vibedb point_hit c=8 rep=2 9517.5 ops/s p99=2.380ms errors=0 verified=true
+vibedb point_hit c=8 rep=3 9471.6 ops/s p99=2.409ms errors=0 verified=true
+vibedb point_miss c=1 rep=1 3293.5 ops/s p99=0.568ms errors=0 verified=true
+vibedb point_miss c=1 rep=2 3308.0 ops/s p99=0.565ms errors=0 verified=true
+vibedb point_miss c=1 rep=3 3272.6 ops/s p99=0.569ms errors=0 verified=true
+vibedb point_miss c=8 rep=1 9848.5 ops/s p99=2.260ms errors=0 verified=true
+vibedb point_miss c=8 rep=2 9781.7 ops/s p99=2.246ms errors=0 verified=true
+vibedb point_miss c=8 rep=3 9756.9 ops/s p99=2.232ms errors=0 verified=true
+vibedb range_64 c=1 rep=1 485.2 ops/s p99=3.792ms errors=0 verified=true
+vibedb range_64 c=1 rep=2 482.7 ops/s p99=3.858ms errors=0 verified=true
+vibedb range_64 c=1 rep=3 481.2 ops/s p99=3.830ms errors=0 verified=true
+vibedb range_64 c=8 rep=1 1006.7 ops/s p99=21.503ms errors=0 verified=true
+vibedb range_64 c=8 rep=2 1005.4 ops/s p99=23.346ms errors=0 verified=true
+vibedb range_64 c=8 rep=3 1011.1 ops/s p99=22.621ms errors=0 verified=true
+vibedb group_16 c=1 rep=1 262.9 ops/s p99=4.790ms errors=0 verified=true
+vibedb group_16 c=1 rep=2 264.6 ops/s p99=4.776ms errors=0 verified=true
+vibedb group_16 c=1 rep=3 264.4 ops/s p99=4.850ms errors=0 verified=true
+vibedb group_16 c=8 rep=1 520.1 ops/s p99=39.098ms errors=0 verified=true
+vibedb group_16 c=8 rep=2 518.5 ops/s p99=38.336ms errors=0 verified=true
+vibedb group_16 c=8 rep=3 516.0 ops/s p99=37.989ms errors=0 verified=true
+benchmark failed: update_existing warmup: ERROR: PostgreSQL write outcome unknown for request dcfd2790854593d7d67254fcfd161636; server retains the request for automatic recovery; do not resubmit the write without verifying its outcome; reconnecting does not resolve or cancel it (SQLSTATE 40003)

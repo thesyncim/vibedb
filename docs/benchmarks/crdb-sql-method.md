@@ -11,7 +11,9 @@ Go 1.27, Docker, and Python 3 are required. The runner builds VibeDB with
 hashes and the source revision/status, and runs each engine sequentially. Use
 `--order crdb-first` to reverse engine order. Never compile or run unrelated
 benchmarks during the measurement window. Nonzero exit codes and failed trials
-are evidence, not results to discard. The runner continues to the second engine
+are evidence, not results to discard. After measurements, the runner bounds
+shutdown and records any forced termination; it does not claim a restart or
+power-loss durability test. The runner continues to the second engine
 after a workload failure. Output files are never overwritten; the benchmark
 creates a new table and does not drop existing tables.
 
@@ -36,7 +38,8 @@ are not claimed equivalent. Neither engine has disabled fsync or replication.
 The shared client creates the same table with a text primary key, an integer
 bucket, an integer score, and the same repeated, compressible 256-byte ASCII
 text payload in every row. There are 8,192 initial
-rows and no secondary indexes. Each table has one initial data partition/range.
+rows and no secondary indexes. VibeDB's table occupies one data group. CockroachDB retains its default range
+boundaries; its setup verifies all voting replica counts equal three.
 CockroachDB gets an explicit `ANALYZE` after loading. VibeDB currently has no
 shipped distributed ANALYZE command; it uses the available optimizer metadata.
 This schema does not establish anything about secondary-index update locality,
