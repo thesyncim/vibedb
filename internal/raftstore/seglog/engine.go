@@ -2610,6 +2610,9 @@ func (e *Engine) rebuild() error {
 			return err
 		}
 	}
+	if err = restoreActiveAllocation(e.log.active, e.log.state.SegmentCapacity, int64(off)); err != nil {
+		return err
+	}
 	// A process crash can leave a checksum-valid frame only in the page cache.
 	// Before recovered state becomes observable, make the accepted prefix a
 	// durable startup boundary (also persisting any torn-tail truncation).

@@ -65,9 +65,9 @@ func prepareReserve(dir string, capacity uint64, logID [16]byte, key [32]byte) (
 		certificate := marshalReserveCertificate(logID, descriptor, key)
 		err = writeFullAt(file, certificate[:], segmentIdentityBytes)
 	}
-	if err == nil {
-		err = file.Truncate(segmentHeaderBytes)
-	}
+	// Writing the lifecycle certificate establishes exactly segmentHeaderBytes
+	// of logical EOF. Do not truncate, even to that same size: Linux releases
+	// KEEP_SIZE preallocation beyond EOF on ftruncate.
 	if err == nil {
 		err = verifyPhysicalReserve(file, descriptor, logID, key)
 	}
@@ -150,6 +150,22 @@ func verifyPhysicalAllocation(file *os.File, capacity uint64, wantSize int64) er
 		return fmt.Errorf("%w: reserve short physical allocation %d/%d", ErrBounds, allocated, capacity)
 	}
 	return nil
+}
+
+// restoreActiveAllocation runs only during cold recovery, after replay has
+// authenticated the retained prefix. A torn-tail truncation can release the
+// KEEP_SIZE reservation, including if a previous restart crashed between the
+// truncation and reallocation. Restore and prove headroom before startup sync
+// and before exposing the writer; ENOSPC remains an explicit startup failure.
+func restoreActiveAllocation(file *os.File, capacity uint64, wantSize int64) error {
+	err := verifyPhysicalAllocation(file, capacity, wantSize)
+	if err == nil || !errors.Is(err, ErrBounds) {
+		return err
+	}
+	if err := reservePhysicalFile(file, capacity); err != nil {
+		return err
+	}
+	return verifyPhysicalAllocation(file, capacity, wantSize)
 }
 
 func marshalReserveCertificate(logID [16]byte, descriptor reserveDescriptor, key [32]byte) (out [reserveHeaderBytes]byte) {

@@ -208,6 +208,13 @@ and registration are cold operations and may allocate and block the submission
 lane; these changes do not establish end-to-end zero allocation, throughput,
 or a competitive space result.
 
+Linux reserves retain physical allocation beyond their logical EOF. Writing
+the reserve certificate establishes that EOF without a redundant truncate,
+which would release the reserved extents. Cold recovery restores and verifies
+active-segment headroom after a torn-tail truncation, before the startup sync
+and before exposing a writer. If space cannot be reserved, open fails rather
+than allowing a later foreground append to discover the shortage.
+
 ## Platform and failure limits
 
 “Power-safe” means the strongest implemented platform barrier; Darwin uses the
