@@ -64,6 +64,9 @@ present and did not save updated build outputs.
   restore from an earlier revision. Go validates each restored cache entry.
   Explicit saves run after test failures too, so successful compilation survives
   a failing suite. Failed test results are not reusable Go test results.
+- Superseded runs are cancelled on main and PRs so the newest revision does not
+  queue behind obsolete work. This intentionally stops collecting evidence for
+  an in-flight older main revision; every check still runs for the latest one.
 - Matrix failures do not cancel siblings. Existing `test (ubuntu-latest)`,
   `test (ubuntu-24.04-arm)`, and `race (distributed serving)` check names are
   retained as aggregators. The test aggregators both require every split test
@@ -78,7 +81,9 @@ present and did not save updated build outputs.
 Local validation: pinned actionlint v1.7.7; shell syntax; selector tests for
 complete/disjoint coverage, new packages, invalid arguments, discovery failure,
 empty shards, serial invocation and test failure propagation. The selector's
-union was also compared with real `go list ./...`: all 83 packages exactly once.
+base partition was compared with real `go list ./...`: all 83 packages exactly
+once. The added pressure lane shares the durable package using complementary
+filters, whose disjointness is checked by the selector tests.
 The original and revised workflow steps were compared for unchanged evidence
 commands, environment, artifact paths, repeat counts, and timeouts.
 
@@ -145,3 +150,7 @@ x86 durable log reported 286.89 seconds across 724 top-level tests;
 `TestFilePrimaryChurnQualification` consumed 113.82 seconds and
 `TestFilePrimaryLargerThanCacheQualification` 53.57 seconds. These two tests now
 run separately from the remaining durable tests, without changing either test.
+
+The first compact run completed in 367 seconds (7 seconds initial queue),
+4.52x shorter elapsed time than the historical baseline, using 61.3
+runner-minutes. This was still a failed run and is not passing-suite proof.
