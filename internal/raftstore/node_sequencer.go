@@ -159,6 +159,22 @@ func (s *Submission) PrepareRegisterGroup(descriptor GroupDescriptor) error {
 	return nil
 }
 
+// PrepareRegisterGroupWithSnapshot borrows an immutable bootstrap snapshot
+// until completion. This cold control operation fences the descriptor, initial
+// term/commit and incarnation together; it must not be used for an existing
+// group's normal checkpoint maintenance.
+func (s *Submission) PrepareRegisterGroupWithSnapshot(descriptor GroupDescriptor, snapshot *pb.Snapshot) error {
+	if err := s.PrepareRegisterGroup(descriptor); err != nil {
+		return err
+	}
+	if err := validateSnapshotBase(snapshot, descriptor.MemberID); err != nil {
+		s.invalidatePrepare()
+		return err
+	}
+	s.snapshot = snapshot
+	return nil
+}
+
 func (s *Submission) prepareDescriptorCatalog(candidate descriptorCatalogCandidate) error {
 	if err := s.prepareControl(submissionDescriptorCatalog, 1); err != nil {
 		return err
@@ -597,7 +613,7 @@ func (q *NodeSubmissionSequencer) runWave(items *[MaxPersistGroupBatches]*Submis
 		case submissionPersistIncarnations:
 			return q.store.persistIncarnationsSequenced(s.incarnations[:s.count])
 		case submissionRegisterGroup:
-			incarnation, registerErr := q.store.registerGroupSequenced(s.descriptor)
+			incarnation, registerErr := q.store.registerGroupSequenced(s.descriptor, s.snapshot)
 			if registerErr == nil {
 				s.incarnations[0] = incarnation
 				d, ok := q.store.descriptorForLogKey(incarnation.GroupID)

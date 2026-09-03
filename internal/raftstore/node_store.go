@@ -1123,10 +1123,31 @@ func (s *NodeStore) RegisterGroup(descriptor GroupDescriptor) (GroupIncarnation,
 	if s.sequencer != nil {
 		return GroupIncarnation{}, ErrSequencerActive
 	}
-	return s.registerGroupLocked(descriptor)
+	return s.registerGroupLocked(descriptor, nil)
 }
 
-func (s *NodeStore) registerGroupSequenced(descriptor GroupDescriptor) (GroupIncarnation, error) {
+// RegisterGroupWithSnapshot provisions a group with an immutable application
+// checkpoint. The descriptor, initial term/commit and incarnation become
+// authoritative together in one node-log wave, after the checkpoint is durable.
+// This is a cold path; while a sequencer owns the store, use a Submission.
+// An exact retry is accepted while this checkpoint is still the group's base;
+// a conflicting or superseded base never silently resets existing Raft state.
+func (s *NodeStore) RegisterGroupWithSnapshot(descriptor GroupDescriptor, snapshot *pb.Snapshot) (GroupIncarnation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.usable(); err != nil {
+		return GroupIncarnation{}, err
+	}
+	if s.sequencer != nil {
+		return GroupIncarnation{}, ErrSequencerActive
+	}
+	if snapshot == nil {
+		return GroupIncarnation{}, ErrInvalid
+	}
+	return s.registerGroupLocked(descriptor, snapshot)
+}
+
+func (s *NodeStore) registerGroupSequenced(descriptor GroupDescriptor, snapshot *pb.Snapshot) (GroupIncarnation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.usable(); err != nil {
@@ -1135,12 +1156,17 @@ func (s *NodeStore) registerGroupSequenced(descriptor GroupDescriptor) (GroupInc
 	if s.sequencer == nil {
 		return GroupIncarnation{}, ErrInvalid
 	}
-	return s.registerGroupLocked(descriptor)
+	return s.registerGroupLocked(descriptor, snapshot)
 }
 
-func (s *NodeStore) registerGroupLocked(descriptor GroupDescriptor) (GroupIncarnation, error) {
-	if descriptor.LogKey != 0 || validateGroupDescriptor(descriptor, true) != nil || len(s.descriptors) == cap(s.descriptors) || s.nextLogKey == 0 || s.nextLogKey >= nodeDescriptorGroup {
+func (s *NodeStore) registerGroupLocked(descriptor GroupDescriptor, snapshot *pb.Snapshot) (GroupIncarnation, error) {
+	if descriptor.LogKey != 0 || validateGroupDescriptor(descriptor, true) != nil {
 		return GroupIncarnation{}, ErrBounds
+	}
+	if snapshot != nil {
+		if err := validateSnapshotBase(snapshot, descriptor.MemberID); err != nil {
+			return GroupIncarnation{}, err
+		}
 	}
 	position, found := slices.BinarySearchFunc(s.descriptorOrder, descriptor.GroupID, func(index uint32, target [16]byte) int {
 		return bytes.Compare(s.descriptors[index].GroupID[:], target[:])
@@ -1156,9 +1182,52 @@ func (s *NodeStore) registerGroupLocked(descriptor GroupDescriptor) (GroupIncarn
 		if !ok || state.NodeIncarnation == 0 {
 			return GroupIncarnation{}, ErrCorrupt
 		}
+		if snapshot != nil {
+			metadata, ok := s.engine.Metadata(existing.LogKey)
+			if !ok {
+				return GroupIncarnation{}, ErrCorrupt
+			}
+			if metadata.Checkpoint.Index != snapshot.GetMetadata().GetIndex() ||
+				metadata.Checkpoint.Term != snapshot.GetMetadata().GetTerm() {
+				return GroupIncarnation{}, ErrRetryConflict
+			}
+			retained, err := s.loadCheckpoint(existing.LogKey, metadata.Checkpoint)
+			if err != nil {
+				return GroupIncarnation{}, err
+			}
+			// Compare the canonical wire payload, not protobuf pointer presence.
+			want, err := marshalSnapshot(snapshot)
+			if err != nil {
+				return GroupIncarnation{}, err
+			}
+			got, err := marshalSnapshot(retained)
+			if err != nil {
+				return GroupIncarnation{}, err
+			}
+			if !bytes.Equal(got, want) {
+				return GroupIncarnation{}, ErrRetryConflict
+			}
+		}
 		return GroupIncarnation{GroupID: existing.LogKey, Incarnation: state.NodeIncarnation}, nil
 	}
+	// Capacity limits apply to new groups, not exact unknown-outcome retries.
+	if len(s.descriptors) == cap(s.descriptors) || s.nextLogKey == 0 || s.nextLogKey >= nodeDescriptorGroup {
+		return GroupIncarnation{}, ErrBounds
+	}
 	descriptor.LogKey = s.nextLogKey
+	var checkpoint seglog.Checkpoint
+	if snapshot != nil {
+		var err error
+		checkpoint, err = s.publishCheckpoint(descriptor.LogKey, snapshot)
+		if err != nil {
+			return GroupIncarnation{}, err
+		}
+		if s.checkpointHookTest != nil {
+			if err = s.checkpointHookTest(CheckpointBeforeLogReference); err != nil {
+				return GroupIncarnation{}, err
+			}
+		}
+	}
 	if err := s.engine.ReserveGroup(descriptor.LogKey, int(s.bounds.maxEntriesPerGroup)); err != nil {
 		return GroupIncarnation{}, err
 	}
@@ -1170,9 +1239,20 @@ func (s *NodeStore) registerGroupLocked(descriptor GroupDescriptor) (GroupIncarn
 	}
 	s.waveEntryArena[0] = seglog.Entry{Index: descriptor.LogKey, Term: 1, DataOffset: 0, DataBytes: uint64(len(s.plainArena))}
 	s.waveBatches[0] = seglog.ReadyBatch{GroupID: descriptor.LogKey, BeginIncarnation: 1}
+	if snapshot != nil {
+		s.waveCheckpoint[0] = checkpoint
+		s.waveHard[0] = seglog.HardState{Term: checkpoint.Term, Commit: checkpoint.Index}
+		s.waveBatches[0].Checkpoint, s.waveBatches[0].Hard = &s.waveCheckpoint[0], &s.waveHard[0]
+	}
 	s.waveHard[1] = seglog.HardState{Term: 1, Commit: descriptor.LogKey}
 	s.waveBatches[1] = seglog.ReadyBatch{GroupID: nodeDescriptorGroup, Entries: s.waveEntryArena[:1:1], Hard: &s.waveHard[1]}
 	digest := sha256.Sum256(s.plainArena)
+	if snapshot != nil {
+		var identity [48]byte
+		copy(identity[:32], digest[:])
+		copy(identity[32:], checkpoint.ID[:])
+		digest = sha256.Sum256(identity[:])
+	}
 	var waveID seglog.WaveID
 	copy(waveID[:], digest[:16])
 	if err = s.packWaveExtents(waveID, 2); err != nil {

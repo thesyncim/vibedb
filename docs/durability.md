@@ -182,6 +182,32 @@ The durable package currently exports no dedicated retirement-capacity
 sentinel. Do not document one. Active snapshots can also make collection close,
 database close, and collection drop retryable.
 
+## Shared Raft-log group bootstrap
+
+The internal `NodeStore` can register a new group from an application snapshot.
+It makes the checkpoint file and its directory durable first, then publishes
+the group descriptor, checkpoint reference, initial term/commit, and first
+incarnation together in one node-log durability wave. A checkpoint file without
+that reference does not create a group during recovery.
+
+Checkpoint objects are named by group and content, because their authenticated
+encryption binds both. Equal snapshots in separate groups are valid. A retry
+after interrupted file publication re-establishes the file/directory durability
+barrier before referencing the object. An uncertain log-sync result requires
+close and reopen; recovery decides whether the complete bootstrap exists.
+
+An exact registration retry remains valid at the configured group limit while
+the same checkpoint is retained. A changed descriptor or checkpoint fails
+closed. Existing groups cannot combine an incarnation fence with new entries,
+votes, or a replacement snapshot; the combined bootstrap is restricted to a
+group with no prior Raft state.
+
+This is an internal integration primitive, not a completed command cutover.
+The `serve-rf3` command still constructs per-group WAL storage. Snapshot creation
+and registration are cold operations and may allocate and block the submission
+lane; these changes do not establish end-to-end zero allocation, throughput,
+or a competitive space result.
+
 ## Platform and failure limits
 
 “Power-safe” means the strongest implemented platform barrier; Darwin uses the
@@ -214,3 +240,6 @@ The public API defines no safe live raw-file backup procedure.
 - Multi-collection protocol: `store/durable/store_database_txn.go`
 - Recovery crash tests: `store/durable/store_file_journal_crash_test.go`
 - Buffered crash tests: `store/durable/store_file_buffered_test.go`
+- Shared-log bootstrap: `internal/raftstore/node_store.go`, `internal/raftstore/node_sequencer.go`
+- Bootstrap crash/retry tests: `internal/raftstore/node_group_bootstrap_test.go`
+- Incarnation and replay verification: `internal/raftstore/seglog/bootstrap_test.go`, `internal/raftstore/seglog/engine_test.go`

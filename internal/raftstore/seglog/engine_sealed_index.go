@@ -229,8 +229,13 @@ func verifySealedRuns(file *os.File, segment SegmentMeta, header sealedIndexHead
 			}
 		}
 		wantSummary := sealedRunSummary{LastIndex: last, LastTerm: lastTerm, Hard: group.Hard, TruncateIndex: group.TruncateIndex, TruncateTerm: group.TruncateTerm, Checkpoint: group.Checkpoint, NodeIncarnation: group.NodeIncarnation, ReadyID: group.ReadyID, ReadyDigest: group.ReadyDigest, ReadyWaveID: group.ReadyWaveID, LatestWaveID: group.latestWaveID, LatestWaveDigest: group.latestWaveDigest, LatestWaveSequence: group.latestWaveSequence}
-		if run.Summary != wantSummary {
-			return ErrCorrupt
+		// RetryOrdinal is a dictionary coordinate, not replayed group state.
+		// decodeSealedDirectory already validated the reference; compare its
+		// resolved wave identity/digest/sequence with the actual log frames.
+		gotSummary := run.Summary
+		gotSummary.RetryOrdinal = 0
+		if gotSummary != wantSummary {
+			return fmt.Errorf("%w: group %d sealed summary", ErrCorrupt, run.GroupID)
 		}
 		first := sort.Search(len(group.Entries), func(j int) bool { return group.Entries[j].SegmentID >= segment.ID })
 		active := group.Entries[first:]

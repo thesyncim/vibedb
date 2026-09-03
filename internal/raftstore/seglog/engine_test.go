@@ -1499,6 +1499,16 @@ func TestEngineDeepVerifyMatchesCanonicalSealedIndex(t *testing.T) {
 	if err = e.Close(); err != nil {
 		t.Fatal(err)
 	}
+	e, err = openTestEngine(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = e.DeepVerify(); err != nil {
+		t.Fatalf("valid sealed index: %v", err)
+	}
+	if err = e.Close(); err != nil {
+		t.Fatal(err)
+	}
 	state := readTestMetadata(t, dir, testLogID, testAuthKey)
 	path := segmentPath(dir, state.Segments[0].FileID)
 	f, err := os.OpenFile(path, os.O_RDWR, 0)

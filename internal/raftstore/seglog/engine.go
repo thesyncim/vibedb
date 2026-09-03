@@ -1371,10 +1371,21 @@ func isBlobEvent(kind uint16) bool { return kind >= eventBlobEntry && kind <= ev
 func validateBatch(g *engineGroup, b *ReadyBatch) (byte, error) {
 	flags := batchFlags(b)
 	if flags&batchBegin != 0 {
-		if b.BeginIncarnation != g.NodeIncarnation+1 || flags != batchBegin || len(b.Entries) != 0 || b.Hard != nil || b.Checkpoint != nil || b.ReplaceFrom != 0 || b.TruncateIndex != 0 {
+		if b.BeginIncarnation != g.NodeIncarnation+1 || len(b.Entries) != 0 || b.ReplaceFrom != 0 || b.TruncateIndex != 0 || b.TruncateTerm != 0 {
 			return 0, ErrRaftState
 		}
-		return flags, nil
+		if flags == batchBegin {
+			return flags, nil
+		}
+		// Only a virgin group may combine its first incarnation fence with a
+		// checkpoint and initial HardState. Existing groups still require a
+		// standalone fence: no append, vote change or reset can hitch a ride.
+		if flags != batchBegin|batchCheckpoint|batchHard || g.NodeIncarnation != 0 ||
+			g.Hard != (HardState{}) || durableLast(g) != 0 || g.Checkpoint != (Checkpoint{}) ||
+			g.TruncateIndex != 0 || g.ReadyID != 0 ||
+			b.Hard.Vote != 0 || b.Hard.Term < b.Checkpoint.Term || b.Hard.Commit != b.Checkpoint.Index {
+			return 0, ErrRaftState
+		}
 	}
 	if flags&batchIdentity != 0 {
 		if b.NodeIncarnation == 0 || b.ReadyID == 0 || b.ReadyDigest == ([16]byte{}) {
@@ -2874,10 +2885,14 @@ func (e *Engine) eventsForDecoded(batches []ReadyBatch, frameOffset, sequence ui
 		}
 		for _, entry := range batch.Entries {
 			kind, bytes := eventKindForType(entry.Type), uint64(len(entry.Data))
+			var reference [16]byte
 			if entry.ExtentBytes != 0 {
 				kind, bytes = blobEventKind(entry.Type), entry.ExtentBytes
+				reference = id
 			}
-			events = append(events, segmentEvent{Kind: kind, GroupID: batch.GroupID, Index: entry.Index, Term: entry.Term, Offset: frameOffset + entry.dataOffset, Bytes: bytes, DataOffset: entry.DataOffset, DataBytes: entry.DataBytes, ReadyID: entry.ExtentID, Reference: id})
+			// Match prepareWave: only authenticated blob extents carry a
+			// BatchID in their entry route. Inline payloads have no extent AAD.
+			events = append(events, segmentEvent{Kind: kind, GroupID: batch.GroupID, Index: entry.Index, Term: entry.Term, Offset: frameOffset + entry.dataOffset, Bytes: bytes, DataOffset: entry.DataOffset, DataBytes: entry.DataBytes, ReadyID: entry.ExtentID, Reference: reference})
 		}
 		if batch.TruncateIndex != 0 {
 			events = append(events, segmentEvent{Kind: eventPrefix, GroupID: batch.GroupID, Index: batch.TruncateIndex, Term: batch.TruncateTerm})
@@ -2921,12 +2936,18 @@ func (e *Engine) DeepVerify() error {
 		var records uint64
 		if err == nil {
 			scanned, records, err = verifyWaveFrames(f, footer.DataBytes, want.ID, verifier)
+			if err != nil {
+				err = fmt.Errorf("%w: segment %d frame verification", err, want.ID)
+			}
 		}
 		if err == nil && (records != footer.Records || uint64(len(scanned)) != footer.Events || verifier.sequence != header.LastSequence) {
-			err = ErrCorrupt
+			err = fmt.Errorf("%w: segment %d frame/event/sequence counts", ErrCorrupt, want.ID)
 		}
 		if err == nil {
 			err = verifySealedRuns(f, want, header, runs, verifier, e.authKey)
+			if err != nil {
+				err = fmt.Errorf("%w: segment %d route verification", err, want.ID)
+			}
 		}
 		closeErr := f.Close()
 		if err != nil {
