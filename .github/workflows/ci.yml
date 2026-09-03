@@ -103,7 +103,7 @@ jobs:
         if: ${{ !cancelled() && steps.go.outcome == 'success' }}
         run: go test -race -p=1 -count=1 -timeout=10m -run 'Lateral' ./query ./sql/driver ./pgwire
       - name: Save Go build cache
-        if: ${{ !cancelled() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
+        if: ${{ always() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
         with:
           path: ${{ steps.go.outputs.cache-path }}
@@ -133,7 +133,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
       - name: Save Go build cache
-        if: ${{ !cancelled() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
+        if: ${{ always() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
         with:
           path: ${{ steps.go.outputs.cache-path }}
@@ -166,7 +166,7 @@ jobs:
             (cd integration/pgclient && go test -run '^$' -exec=true ./...)
           done
       - name: Save Go build cache
-        if: ${{ !cancelled() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
+        if: ${{ always() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
         with:
           path: ${{ steps.go.outputs.cache-path }}
@@ -206,7 +206,7 @@ jobs:
           path: ${{ runner.temp }}/unit-tests.txt
           retention-days: 7
       - name: Save Go build cache
-        if: ${{ !cancelled() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
+        if: ${{ always() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
         with:
           path: ${{ steps.go.outputs.cache-path }}
@@ -407,7 +407,7 @@ jobs:
           VIBEDB_TEST_PSQL: "1"
         run: go test -count=1 -timeout=5m -run '^TestPSQLClient18$' -v .
       - name: Save Go build cache
-        if: ${{ !cancelled() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
+        if: ${{ always() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
         with:
           path: ${{ steps.go.outputs.cache-path }}
@@ -508,7 +508,7 @@ jobs:
           go test ./internal/raftservice -run '^TestRF3AllThreeVoterQuorumCutsFailClosedOrCommit$' -count=1 -v
           go test ./internal/multiraft -run '^$' -bench '^BenchmarkExecutionLanes(Scaling|SixtyFourGroups|HotShardIsolation)$' -benchtime=1000x -count=1
       - name: Save Go build cache
-        if: ${{ !cancelled() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
+        if: ${{ always() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
         with:
           path: ${{ steps.go.outputs.cache-path }}
@@ -531,7 +531,7 @@ jobs:
         # throughput gates; under -race on ARM they alone can exhaust the budget.
         run: go test -race -timeout=25m -skip 'Qualification' -run 'Primary|BufferedInplace|Committer|PageCache|WriteTransaction' ./internal/storeio/ ./store/durable/
       - name: Save Go build cache
-        if: ${{ !cancelled() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
+        if: ${{ always() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
         with:
           path: ${{ steps.go.outputs.cache-path }}
@@ -589,7 +589,7 @@ jobs:
           read -r -a test_targets <<< "$PACKAGES"
           go test -race -p=1 -count=1 -timeout=30m "${test_targets[@]}"
       - name: Save Go build cache
-        if: ${{ !cancelled() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
+        if: ${{ always() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
         with:
           path: ${{ steps.go.outputs.cache-path }}

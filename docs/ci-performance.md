@@ -62,8 +62,10 @@ present and did not save updated build outputs.
 - Modules have a shared dependency cache. Build/test cache snapshots have separate
   toolchain, host architecture, and lane keys, with a revision suffix and a prefix
   restore from an earlier revision. Go validates each restored cache entry.
-  Explicit saves run after test failures too, so successful compilation survives
-  a failing suite. Failed test results are not reusable Go test results.
+  Explicit saves run after test failures and cancellation too, so completed
+  compilation survives a failing suite or a superseding main commit. Go cache
+  entries are individually validated; cancellation does not make a failed test
+  result reusable. Failed test results are not reusable Go test results.
 - Superseded runs are cancelled on main and PRs so the newest revision does not
   queue behind obsolete work. This intentionally stops collecting evidence for
   an in-flight older main revision; every check still runs for the latest one.
