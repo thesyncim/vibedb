@@ -429,7 +429,7 @@ func (result DriveResult) Progressed() bool { return result.Kind != DriveIdle }
 // admission. It does not certify leadership, commit, apply, or a client result.
 type Runtime struct {
 	wal             *raftstore.Store
-	stable          raftmodel.StableStore
+	stable          runtimeStableStore
 	database        *sqldriver.Database
 	apply           *sqldriver.ReplicatedApply
 	node            *raftmodel.Node
@@ -447,6 +447,11 @@ type Runtime struct {
 	stopping                 bool
 	closed                   bool
 	schemaGenerationQuiesced bool
+}
+
+type runtimeStableStore interface {
+	raftmodel.StableStore
+	LogBounds() (last, commit uint64, err error)
 }
 
 type durablePromotionScan struct {
@@ -732,7 +737,7 @@ func (runtime *Runtime) Failure() error {
 	return nil
 }
 
-func (runtime *Runtime) stableStore() raftmodel.StableStore {
+func (runtime *Runtime) stableStore() runtimeStableStore {
 	if runtime == nil {
 		return nil
 	}
@@ -1027,15 +1032,10 @@ func (runtime *Runtime) DurablePromotion(
 	}
 	applied := runtime.node.PublishedApplied()
 	stable := runtime.stableStore()
-	last, err := stable.LastIndex()
+	last, commit, err := stable.LogBounds()
 	if err != nil {
 		return DurablePromotionProof{}, false, err
 	}
-	hard, _, err := stable.InitialState()
-	if err != nil {
-		return DurablePromotionProof{}, false, err
-	}
-	commit := hard.GetCommit()
 	commit = max(commit, runtime.node.PublishedApplied())
 	if commit <= applied {
 		runtime.promotionScan = durablePromotionScan{applied: applied,

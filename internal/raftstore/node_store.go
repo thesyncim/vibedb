@@ -1586,6 +1586,23 @@ func (v *GroupView) LastIndex() (uint64, error) {
 	}
 	return state.LastIndex, nil
 }
+
+// LogBounds returns the same Raft-visible coordinates as LastIndex and
+// InitialState under one lock. It neither opens the checkpoint object nor
+// constructs protobuf state, so repeated control probes allocate nothing.
+func (v *GroupView) LogBounds() (last, commit uint64, err error) {
+	v.store.mu.Lock()
+	defer v.store.mu.Unlock()
+	if err := v.store.usable(); err != nil {
+		return 0, 0, err
+	}
+	state, ok := v.store.engine.Metadata(v.group)
+	if !ok {
+		return 0, 0, raft.ErrUnavailable
+	}
+	return state.LastIndex, state.Hard.Commit, nil
+}
+
 func (v *GroupView) InitialState() (*pb.HardState, *pb.ConfState, error) {
 	v.store.mu.Lock()
 	defer v.store.mu.Unlock()

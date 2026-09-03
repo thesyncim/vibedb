@@ -1805,6 +1805,18 @@ func (store *Store) DurableCommit() (uint64, error) {
 	return store.current.hard.GetCommit(), nil
 }
 
+// LogBounds returns the Raft-visible last index and commit under one lock,
+// without cloning protobuf state. Like InitialState, commit includes live
+// commit-only knowledge; use DurableCommit for the persisted commit floor.
+func (store *Store) LogBounds() (last, commit uint64, err error) {
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	if err := store.checkLocked(); err != nil {
+		return 0, 0, err
+	}
+	return store.image.last, store.image.hard.GetCommit(), nil
+}
+
 // Entries implements raft.Storage and returns an immutable borrowed pointer
 // slice, matching raft.MemoryStorage. Entry objects and their Data must not be
 // mutated. A full-slice expression prevents append from modifying the

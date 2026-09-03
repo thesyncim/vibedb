@@ -32,7 +32,7 @@ modules, dependencies, Cgo, and the Git directory. It is an import inventory,
 not a proof that all transitive code is memory-safe.
 
 <!-- unsafe-file-list:start -->
-The root module contains 74 non-test Go files that import `unsafe`:
+The root module contains 75 non-test Go files that import `unsafe`:
 
 ```text
 autosplit/recorder.go
@@ -68,6 +68,7 @@ internal/storeio/unified_canonical_form.go
 planner/memo.go
 planner/optimizer.go
 planner/statistics.go
+planner/statistics_groups.go
 query/apply_cache.go
 query/apply_kernel.go
 query/compiler.go
