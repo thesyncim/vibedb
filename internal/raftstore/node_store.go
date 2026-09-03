@@ -111,13 +111,14 @@ type NodeStore struct {
 	cryptoWork                                objectCryptoWorkspace
 	groupAAD                                  [40]byte
 	groupNonce                                [12]byte
-	plainArena, cipherArena, digestArena      []byte
+	plainArena, cipherArena                   []byte
 	readPlain                                 []byte
+	readyDigest                               readyDigestWorkspace
 	cachedBatch                               seglog.WaveID
 	cachedSegment, cachedOffset, cachedExtent uint64
 	cacheValid                                bool
 	waveBatches                               [MaxPersistGroupBatches]seglog.ReadyBatch
-	waveEntries                               [MaxPersistGroupBatches][]seglog.Entry
+	waveEntryArena                            []seglog.Entry
 	waveHard                                  [MaxPersistGroupBatches]seglog.HardState
 	waveCheckpoint                            [MaxPersistGroupBatches]seglog.Checkpoint
 	pageRefs                                  []pageEntryRef
@@ -179,6 +180,7 @@ func defaultNodeOptions(options NodeStoreOptions) (NodeStoreOptions, error) {
 		options.MaxSegmentEvents < 1 || uint64(options.MaxSegmentEvents) > AbsoluteMaxEntries ||
 		options.RecentWaves < 1 || uint64(options.RecentWaves) > AbsoluteMaxRecords ||
 		options.MaxEntriesPerGroup < 1 || options.MaxEntriesPerGroup > MaxReadyEntries ||
+		options.MaxEntriesPerGroup > options.MaxSegmentEvents ||
 		options.ReaderSlots < 0 || uint64(options.ReaderSlots) > math.MaxUint32 ||
 		options.MaxGroups < 1 || uint64(options.MaxGroups) > math.MaxUint32 {
 		return options, ErrBounds
@@ -321,7 +323,8 @@ func OpenNodeStore(dir string, expected NodeIdentity, key Key, options NodeStore
 		return fail(engine, ErrIdentityMismatch)
 	}
 	store := &NodeStore{dir: dir, identity: identity, key: key, bounds: bounds, engine: engine, lock: lock, crypto: cryptoState, cryptoWork: newObjectCryptoWorkspace(cryptoState.dataKey, cryptoState.nonceKey)}
-	if err = engine.Reserve(options.MaxWaveBytes, options.MaxSegmentEvents, options.RecentWaves); err == nil {
+	store.plainArena = make([]byte, 0, options.MaxWaveBytes)
+	if err = engine.ReserveWithFrameArena(store.plainArena, options.MaxSegmentEvents, options.RecentWaves); err == nil {
 		err = engine.ReserveReaders(options.ReaderSlots)
 	}
 	if err == nil {
@@ -339,14 +342,10 @@ func OpenNodeStore(dir string, expected NodeIdentity, key Key, options NodeStore
 		}
 	}
 	if err == nil {
-		store.plainArena = make([]byte, 0, options.MaxWaveBytes)
 		store.cipherArena = make([]byte, 0, options.MaxWaveBytes)
-		store.digestArena = make([]byte, 0, options.MaxWaveBytes)
-		store.readPlain = make([]byte, 0, options.MaxWaveBytes)
+		store.readyDigest = newReadyDigestWorkspace()
 		store.pageRefs = make([]pageEntryRef, 0, options.MaxSegmentEvents)
-		for i := range store.waveEntries {
-			store.waveEntries[i] = make([]seglog.Entry, 0, options.MaxEntriesPerGroup)
-		}
+		store.waveEntryArena = make([]seglog.Entry, options.MaxSegmentEvents)
 		if err = store.rebuildDescriptors(options.MaxGroups); err == nil {
 			ids := engine.GroupIDs()
 			if len(ids) != len(store.descriptors)+1 || ids[len(ids)-1] != nodeDescriptorGroup {
@@ -409,7 +408,8 @@ func openNodeMeta(data []byte, expected NodeIdentity, key Key, bounds nodeStoreB
 }
 
 func (s *NodeStore) reserve(options NodeStoreOptions, bootstraps []NodeBootstrap) error {
-	if err := s.engine.Reserve(options.MaxWaveBytes, options.MaxSegmentEvents, options.RecentWaves); err != nil {
+	s.plainArena = make([]byte, 0, options.MaxWaveBytes)
+	if err := s.engine.ReserveWithFrameArena(s.plainArena, options.MaxSegmentEvents, options.RecentWaves); err != nil {
 		return err
 	}
 	if err := s.engine.ReserveReaders(options.ReaderSlots); err != nil {
@@ -423,14 +423,10 @@ func (s *NodeStore) reserve(options NodeStoreOptions, bootstraps []NodeBootstrap
 	if err := s.engine.ReserveGroup(nodeDescriptorGroup, options.MaxGroups); err != nil {
 		return err
 	}
-	s.plainArena = make([]byte, 0, options.MaxWaveBytes)
 	s.cipherArena = make([]byte, 0, options.MaxWaveBytes)
-	s.digestArena = make([]byte, 0, options.MaxWaveBytes)
-	s.readPlain = make([]byte, 0, options.MaxWaveBytes)
+	s.readyDigest = newReadyDigestWorkspace()
 	s.pageRefs = make([]pageEntryRef, 0, options.MaxSegmentEvents)
-	for i := range s.waveEntries {
-		s.waveEntries[i] = make([]seglog.Entry, 0, options.MaxEntriesPerGroup)
-	}
+	s.waveEntryArena = make([]seglog.Entry, options.MaxSegmentEvents)
 	return nil
 }
 
@@ -807,32 +803,25 @@ func (s *NodeStore) persistWave(ready []NodeReady, sequenced bool) error {
 	}
 	s.plainArena = s.plainArena[:totalPlain]
 	s.cipherArena = s.cipherArena[:0]
-	plainOffset, mappedCount, duplicateCount := 0, 0, 0
+	plainOffset, entryOffset, mappedCount, duplicateCount := 0, 0, 0, 0
 	for _, item := range ready {
 		batch := item.Batch
 		state, ok := s.engine.Summary(item.GroupID)
 		if !ok || batch.NodeIncarnation == 0 || batch.NodeIncarnation != state.NodeIncarnation {
 			return ErrInvalid
 		}
-		s.digestArena = s.digestArena[:0]
-		encoded, err := marshalReadyPayloadInto(s.digestArena, batch)
-		if err != nil {
-			return err
-		}
-		s.digestArena = encoded
+		var snapshotBytes []byte
 		if !canonicalEmptySnapshot(batch.Snapshot) {
-			snapshotBytes, snapshotErr := marshalSnapshot(batch.Snapshot)
+			var snapshotErr error
+			snapshotBytes, snapshotErr = marshalSnapshot(batch.Snapshot)
 			if snapshotErr != nil {
 				return snapshotErr
 			}
-			if len(s.digestArena)+len(snapshotBytes) > cap(s.digestArena) {
-				return ErrBounds
-			}
-			s.digestArena = append(s.digestArena, snapshotBytes...)
 		}
-		digest := sha256.Sum256(s.digestArena)
-		var retryDigest [16]byte
-		copy(retryDigest[:], digest[:16])
+		retryDigest, err := s.readyDigest.digest(batch, snapshotBytes)
+		if err != nil {
+			return err
+		}
 		if batch.NodeIncarnation == state.NodeIncarnation && batch.ReadyID == state.ReadyID {
 			if retryDigest != state.ReadyDigest {
 				return ErrRetryConflict
@@ -840,14 +829,17 @@ func (s *NodeStore) persistWave(ready []NodeReady, sequenced bool) error {
 			duplicateCount++
 			continue
 		}
-		entries := s.waveEntries[mappedCount][:0]
+		if len(batch.Entries) > len(s.waveEntryArena)-entryOffset {
+			return ErrBounds
+		}
+		entries := s.waveEntryArena[entryOffset : entryOffset : entryOffset+len(batch.Entries)]
 		for _, entry := range batch.Entries {
 			data := entry.GetData()
 			copy(s.plainArena[plainOffset:], data)
 			entries = append(entries, seglog.Entry{Index: entry.GetIndex(), Term: entry.GetTerm(), Type: entry.GetType(), DataOffset: uint64(plainOffset), DataBytes: uint64(len(data))})
 			plainOffset += len(data)
 		}
-		s.waveEntries[mappedCount] = entries
+		entryOffset += len(entries)
 		mapped := seglog.ReadyBatch{GroupID: item.GroupID, NodeIncarnation: batch.NodeIncarnation, ReadyID: batch.ReadyID, ReadyDigest: retryDigest, Entries: entries}
 		if len(entries) > 0 && entries[0].Index <= state.LastIndex {
 			mapped.ReplaceFrom = entries[0].Index
@@ -1149,7 +1141,7 @@ func (s *NodeStore) registerGroupLocked(descriptor GroupDescriptor) (GroupIncarn
 		return GroupIncarnation{GroupID: existing.LogKey, Incarnation: state.NodeIncarnation}, nil
 	}
 	descriptor.LogKey = s.nextLogKey
-	if err := s.engine.ReserveGroup(descriptor.LogKey, cap(s.waveEntries[0])); err != nil {
+	if err := s.engine.ReserveGroup(descriptor.LogKey, int(s.bounds.maxEntriesPerGroup)); err != nil {
 		return GroupIncarnation{}, err
 	}
 	s.plainArena = s.plainArena[:0]
@@ -1158,10 +1150,10 @@ func (s *NodeStore) registerGroupLocked(descriptor GroupDescriptor) (GroupIncarn
 	if err != nil {
 		return GroupIncarnation{}, err
 	}
-	s.waveEntries[0] = append(s.waveEntries[0][:0], seglog.Entry{Index: descriptor.LogKey, Term: 1, DataOffset: 0, DataBytes: uint64(len(s.plainArena))})
+	s.waveEntryArena[0] = seglog.Entry{Index: descriptor.LogKey, Term: 1, DataOffset: 0, DataBytes: uint64(len(s.plainArena))}
 	s.waveBatches[0] = seglog.ReadyBatch{GroupID: descriptor.LogKey, BeginIncarnation: 1}
 	s.waveHard[1] = seglog.HardState{Term: 1, Commit: descriptor.LogKey}
-	s.waveBatches[1] = seglog.ReadyBatch{GroupID: nodeDescriptorGroup, Entries: s.waveEntries[0], Hard: &s.waveHard[1]}
+	s.waveBatches[1] = seglog.ReadyBatch{GroupID: nodeDescriptorGroup, Entries: s.waveEntryArena[:1:1], Hard: &s.waveHard[1]}
 	digest := sha256.Sum256(s.plainArena)
 	var waveID seglog.WaveID
 	copy(waveID[:], digest[:16])
@@ -1566,6 +1558,17 @@ func (s *NodeStore) readEntry(group uint64, loc seglog.EntryLocation) (*pb.Entry
 		}
 		if loc.Bytes > uint64(cap(s.cipherArena)) {
 			return nil, ErrBounds
+		}
+		overhead := uint64(s.crypto.aead.Overhead())
+		if loc.Bytes < overhead {
+			return nil, ErrCorrupt
+		}
+		plainBytes := loc.Bytes - overhead
+		if plainBytes > uint64(cap(s.readPlain)) {
+			if plainBytes > uint64(math.MaxInt) {
+				return nil, ErrBounds
+			}
+			s.readPlain = make([]byte, 0, int(plainBytes))
 		}
 		ciphertext, err := s.engine.ReadLocation(loc, s.cipherArena[:loc.Bytes])
 		if err != nil {

@@ -12,7 +12,7 @@ import (
 
 func BenchmarkNodeStoreOpenDescriptorCatalog256Groups(b *testing.B) {
 	dir := filepath.Join(b.TempDir(), "node")
-	options := NodeStoreOptions{MaxWaveBytes: 1 << 20, MaxSegmentEvents: 4096, RecentWaves: 1024, MaxEntriesPerGroup: 64, ReaderSlots: 2, MaxGroups: 512}
+	options := NodeStoreOptions{MaxWaveBytes: 1 << 20, MaxSegmentEvents: 4096, RecentWaves: 1024, MaxEntriesPerGroup: DefaultNodeMaxEntriesPerGroup, ReaderSlots: 2, MaxGroups: 512}
 	store, err := CreateNodeStore(dir, testNodeIdentity(), testKey(), []NodeBootstrap{{Descriptor: testGroupDescriptor(1), Snapshot: nodeSnapshot(1, 1, 1)}}, options)
 	if err != nil {
 		b.Fatal(err)
@@ -50,6 +50,28 @@ func BenchmarkNodeStoreOpenDescriptorCatalog256Groups(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		store, err = OpenNodeStore(dir, testNodeIdentity(), testKey(), options)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if err = store.Close(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkNodeStoreOpenDefaultGeometry(b *testing.B) {
+	dir := filepath.Join(b.TempDir(), "node")
+	store, err := CreateNodeStore(dir, testNodeIdentity(), testKey(), []NodeBootstrap{{Descriptor: testGroupDescriptor(1), Snapshot: nodeSnapshot(1, 1, 1)}}, NodeStoreOptions{})
+	if err != nil {
+		b.Fatal(err)
+	}
+	if err = store.Close(); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		store, err = OpenNodeStore(dir, testNodeIdentity(), testKey(), NodeStoreOptions{})
 		if err != nil {
 			b.Fatal(err)
 		}
