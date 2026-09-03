@@ -287,7 +287,7 @@ func TestNodeStoreRejectsCheckpointCollisionAndNamespaceReplacement(t *testing.T
 		t.Fatal(err)
 	}
 	state, _ := store.engine.Group(1)
-	checkpointPath := filepath.Join(dir, nodeCheckpointDir, fmt.Sprintf("%x.chk", state.Checkpoint.ID))
+	checkpointPath := filepath.Join(dir, nodeCheckpointDir, nodeCheckpointName(1, state.Checkpoint.ID))
 	original, err := os.ReadFile(checkpointPath)
 	if err != nil {
 		t.Fatal(err)

@@ -540,6 +540,12 @@ func checkpointWaveID(group uint64, checkpoint seglog.Checkpoint) seglog.WaveID 
 	return id
 }
 
+// Checkpoint ciphertext authenticates the group as well as the content. Equal
+// application snapshots in different groups must not share a physical object.
+func nodeCheckpointName(group uint64, id [16]byte) string {
+	return fmt.Sprintf("%016x-%x.chk", group, id)
+}
+
 func (s *NodeStore) publishCheckpoint(group uint64, snapshot *pb.Snapshot) (seglog.Checkpoint, error) {
 	if snapshot == nil || snapshot.GetMetadata() == nil || snapshot.GetMetadata().GetConfState() == nil {
 		return seglog.Checkpoint{}, ErrInvalid
@@ -570,14 +576,26 @@ func (s *NodeStore) publishCheckpoint(group uint64, snapshot *pb.Snapshot) (segl
 	copy(header[40:72], digest[:])
 	copy(header[72:84], nonce[:])
 	binary.LittleEndian.PutUint32(header[84:88], uint32(len(ciphertext)))
-	name := fmt.Sprintf("%x.chk", id)
+	name := nodeCheckpointName(group, id)
 	tmp := filepath.Join(s.dir, nodeCheckpointDir, "."+name+".tmp")
 	final := filepath.Join(s.dir, nodeCheckpointDir, name)
 	if _, statErr := os.Stat(final); statErr == nil {
-		existing, loadErr := s.loadCheckpoint(group, seglog.Checkpoint{ID: id, Index: index, Term: term})
+		existing, loadErr := s.loadCheckpointForMember(group, 0, seglog.Checkpoint{ID: id, Index: index, Term: term})
 		if loadErr == nil {
 			existingPlain, marshalErr := marshalSnapshot(existing)
 			if marshalErr == nil && sha256.Sum256(existingPlain) == digest && bytes.Equal(existingPlain, plain) {
+				// An earlier attempt may have returned after rename but before
+				// directory sync. Existence is not proof of durable publication.
+				file, openErr := os.OpenFile(final, os.O_RDWR, 0)
+				if openErr != nil {
+					return seglog.Checkpoint{}, openErr
+				}
+				if syncErr := errors.Join(file.Sync(), file.Close()); syncErr != nil {
+					return seglog.Checkpoint{}, syncErr
+				}
+				if syncErr := syncNodeDirectory(filepath.Join(s.dir, nodeCheckpointDir)); syncErr != nil {
+					return seglog.Checkpoint{}, syncErr
+				}
 				return seglog.Checkpoint{ID: id, Index: index, Term: term}, nil
 			}
 		}
@@ -1601,7 +1619,13 @@ func (s *NodeStore) loadCheckpoint(group uint64, cp seglog.Checkpoint) (*pb.Snap
 	if !ok {
 		return nil, ErrCorrupt
 	}
-	data, err := os.ReadFile(filepath.Join(s.dir, nodeCheckpointDir, fmt.Sprintf("%x.chk", cp.ID)))
+	return s.loadCheckpointForMember(group, descriptor.MemberID, cp)
+}
+
+// A newly registering group is not in the authoritative descriptor index yet.
+// Verify its staged checkpoint without publishing a descriptor prematurely.
+func (s *NodeStore) loadCheckpointForMember(group, memberID uint64, cp seglog.Checkpoint) (*pb.Snapshot, error) {
+	data, err := os.ReadFile(filepath.Join(s.dir, nodeCheckpointDir, nodeCheckpointName(group, cp.ID)))
 	if err != nil {
 		return nil, err
 	}
@@ -1637,7 +1661,7 @@ func (s *NodeStore) loadCheckpoint(group uint64, cp seglog.Checkpoint) (*pb.Snap
 	if err != nil || sha256.Sum256(plain) != digest {
 		return nil, ErrCorrupt
 	}
-	return unmarshalSnapshot(plain, descriptor.MemberID)
+	return unmarshalSnapshot(plain, memberID)
 }
 
 func writeNodeMeta(dir string, identity NodeIdentity, key Key, logID [16]byte, bounds nodeStoreBounds, cryptoState fileCrypto) error {
