@@ -2,6 +2,7 @@ package raftstore
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -573,6 +574,45 @@ func TestNodeStorePreparedPersistZeroAlloc(t *testing.T) {
 		}
 	}); got != 0 {
 		t.Fatalf("prepared Persist allocs/run = %v", got)
+	}
+}
+
+func TestReadyDigestWorkspaceMatchesCanonicalEncodingAndAllocatesZero(t *testing.T) {
+	index, term, entryType := uint64(7), uint64(3), pb.EntryConfChangeV2
+	vote, commit := uint64(2), uint64(6)
+	entry := &pb.Entry{Index: &index, Term: &term, Type: &entryType, Data: []byte("payload")}
+	batch := raftmodel.PersistBatch{
+		NodeIncarnation: 9,
+		ReadyID:         11,
+		MustSync:        true,
+		Entries:         []*pb.Entry{entry},
+		HardState:       &pb.HardState{Term: &term, Vote: &vote, Commit: &commit},
+	}
+	snapshot := []byte("snapshot")
+	encoded, err := marshalReadyPayload(batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical := append(encoded, snapshot...)
+	wantSum := sha256.Sum256(canonical)
+	var want [16]byte
+	copy(want[:], wantSum[:16])
+
+	workspace := newReadyDigestWorkspace()
+	got, err := workspace.digest(batch, snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("digest = %x, want %x", got, want)
+	}
+	if allocations := testing.AllocsPerRun(1000, func() {
+		got, err = workspace.digest(batch, snapshot)
+		if err != nil || got != want {
+			panic("digest failed")
+		}
+	}); allocations != 0 {
+		t.Fatalf("ready digest allocations/run = %v", allocations)
 	}
 }
 

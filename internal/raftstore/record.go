@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash"
 	"hash/crc32"
 	"math"
 
@@ -65,6 +66,59 @@ type recordEncodeWorkspace struct {
 	aad        []byte
 	crypto     objectCryptoWorkspace
 	tagContext [recordTagContextBytes]byte
+}
+
+// readyDigestWorkspace hashes the canonical Ready encoding without first
+// materializing another MaxWaveBytes-sized copy. The node store serializes
+// persistence under its mutex, so one workspace covers every Raft group on
+// the device and allocates only when the store is opened.
+type readyDigestWorkspace struct {
+	hash   hash.Hash
+	header [40]byte
+	entry  [32]byte
+	sum    [sha256.Size]byte
+}
+
+func newReadyDigestWorkspace() readyDigestWorkspace {
+	return readyDigestWorkspace{hash: sha256.New()}
+}
+
+func (workspace *readyDigestWorkspace) digest(batch raftmodel.PersistBatch, snapshot []byte) ([16]byte, error) {
+	var result [16]byte
+	if workspace.hash == nil {
+		workspace.hash = sha256.New()
+	}
+	if _, err := readyPayloadSize(batch); err != nil {
+		return result, err
+	}
+
+	workspace.hash.Reset()
+	clear(workspace.header[:])
+	binary.LittleEndian.PutUint16(workspace.header[0:2], codecVersion)
+	if batch.MustSync {
+		binary.LittleEndian.PutUint16(workspace.header[2:4], 1)
+	}
+	binary.LittleEndian.PutUint32(workspace.header[4:8], uint32(len(batch.Entries)))
+	if !isEmptyHardState(batch.HardState) {
+		workspace.header[8] = 1
+	}
+	binary.LittleEndian.PutUint64(workspace.header[16:24], batch.HardState.GetTerm())
+	binary.LittleEndian.PutUint64(workspace.header[24:32], batch.HardState.GetVote())
+	binary.LittleEndian.PutUint64(workspace.header[32:40], batch.HardState.GetCommit())
+	_, _ = workspace.hash.Write(workspace.header[:])
+	for _, entry := range batch.Entries {
+		clear(workspace.entry[:])
+		binary.LittleEndian.PutUint32(workspace.entry[0:4], uint32(entry.GetType()))
+		binary.LittleEndian.PutUint64(workspace.entry[8:16], entry.GetTerm())
+		binary.LittleEndian.PutUint64(workspace.entry[16:24], entry.GetIndex())
+		binary.LittleEndian.PutUint32(workspace.entry[24:28], uint32(len(entry.GetData())))
+		_, _ = workspace.hash.Write(workspace.entry[:])
+		_, _ = workspace.hash.Write(entry.GetData())
+	}
+	_, _ = workspace.hash.Write(snapshot)
+	sum := workspace.hash.Sum(workspace.sum[:0])
+	copy(result[:], sum[:len(result)])
+	return result, nil
 }
 
 func (workspace *recordEncodeWorkspace) aadBuffer(header headerState, capacity int) []byte {

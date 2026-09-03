@@ -94,6 +94,7 @@ type GroupMetadata struct {
 
 type engineGroup struct {
 	GroupState
+	entryLimit          int
 	sealed              []sealedRunRef
 	lastIndex, lastTerm uint64
 	buildSegmentID      uint64
@@ -202,6 +203,9 @@ type Engine struct {
 	sealedSummaryOrder  []uint64
 	sealedSequence      uint64
 	applySequence       uint64
+	entryArenas         [2][]EntryLocation
+	entryArenaActive    uint8
+	entryArenaReady     bool
 }
 
 type waveState struct {
@@ -434,6 +438,21 @@ func (e *Engine) ReadLocation(location EntryLocation, dst []byte) ([]byte, error
 
 // Reserve moves every unbounded allocation off the steady PersistWave path.
 func (e *Engine) Reserve(frameBytes, events, waveIDs int) error {
+	return e.reserve(frameBytes, events, waveIDs, nil)
+}
+
+// ReserveWithFrameArena installs caller-owned frame scratch. This is intended
+// for fused storage stacks that can reuse plaintext after encryption instead
+// of retaining a third maximum-wave buffer solely for log framing. The caller
+// must keep the arena alive and must not use it concurrently with PersistWave.
+func (e *Engine) ReserveWithFrameArena(frame []byte, events, waveIDs int) error {
+	if cap(frame) < 72 {
+		return ErrBounds
+	}
+	return e.reserve(cap(frame), events, waveIDs, frame[:0])
+}
+
+func (e *Engine) reserve(frameBytes, events, waveIDs int, frame []byte) error {
 	if err := e.log.usable(); err != nil {
 		return err
 	}
@@ -451,7 +470,9 @@ func (e *Engine) Reserve(frameBytes, events, waveIDs int) error {
 		return ErrBounds
 	}
 	e.sealHeadroom = headroom
-	if frameBytes > cap(e.frameBuf) {
+	if frame != nil {
+		e.frameBuf = frame
+	} else if frameBytes > cap(e.frameBuf) {
 		e.frameBuf = make([]byte, 0, frameBytes)
 	}
 	if events > cap(e.eventScratch) {
@@ -460,6 +481,16 @@ func (e *Engine) Reserve(frameBytes, events, waveIDs int) error {
 	if events > cap(e.log.events) {
 		if err := e.log.ReserveEvents(events); err != nil {
 			return err
+		}
+	}
+	if events > len(e.entryArenas[0]) {
+		first := make([]EntryLocation, events)
+		second := make([]EntryLocation, events)
+		e.entryArenas = [2][]EntryLocation{first, second}
+		e.entryArenaActive = 0
+		e.entryArenaReady = false
+		if !e.repackEntryArena(Wave{}) {
+			return ErrBounds
 		}
 	}
 	if e.activeBuild == nil || cap(e.activeBuild.groups) < events {
@@ -503,6 +534,8 @@ func (e *Engine) Reserve(frameBytes, events, waveIDs int) error {
 }
 
 func (e *Engine) ReserveGroup(group uint64, entries int) error {
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
 	if err := e.log.usable(); err != nil {
 		return err
 	}
@@ -511,18 +544,115 @@ func (e *Engine) ReserveGroup(group uint64, entries int) error {
 	}
 	g := e.groups[group]
 	if g == nil {
-		e.groups[group] = &engineGroup{GroupState: GroupState{Entries: make([]EntryLocation, 0, entries)}, owner: e, id: group}
+		e.groups[group] = &engineGroup{entryLimit: entries, owner: e, id: group}
 		return nil
 	}
 	if entries < len(g.Entries) {
 		return ErrBounds
 	}
-	if entries > cap(g.Entries) {
-		grown := make([]EntryLocation, len(g.Entries), entries)
-		copy(grown, g.Entries)
-		g.Entries = grown
-	}
+	g.entryLimit = entries
 	return nil
+}
+
+func waveGroupEntryNeed(group *engineGroup, wave Wave) (int, bool) {
+	if group == nil {
+		return 0, false
+	}
+	for index := range wave.Batches {
+		batch := &wave.Batches[index]
+		if batch.GroupID != group.id {
+			continue
+		}
+		return len(group.Entries) - replacementCount(group.Entries, batch.ReplaceFrom) + len(batch.Entries), true
+	}
+	return len(group.Entries), false
+}
+
+func entryArenaCapacity(needed, limit int) int {
+	if needed <= 0 {
+		return 0
+	}
+	capacity := 1
+	for capacity < needed && capacity <= limit/2 {
+		capacity *= 2
+	}
+	if capacity < needed || capacity > limit {
+		return needed
+	}
+	return capacity
+}
+
+// repackEntryArena moves every active-segment location between two fixed
+// node-wide arenas. The arenas are bounded by the segment event reservation;
+// no group receives its worst-case slice until it actually becomes hot.
+func (e *Engine) repackEntryArena(wave Wave) bool {
+	if len(e.entryArenas[0]) == 0 || len(e.entryArenas[1]) != len(e.entryArenas[0]) {
+		return false
+	}
+	total := 0
+	for _, group := range e.groups {
+		needed, targeted := waveGroupEntryNeed(group, wave)
+		if targeted && (group.entryLimit == 0 || needed > group.entryLimit) {
+			return false
+		}
+		capacity := len(group.Entries)
+		if e.entryArenaReady {
+			capacity = cap(group.Entries)
+		}
+		if targeted && capacity < needed {
+			capacity = entryArenaCapacity(needed, group.entryLimit)
+		}
+		if capacity > len(e.entryArenas[0])-total {
+			total = len(e.entryArenas[0]) + 1
+			break
+		}
+		total += capacity
+	}
+	compact := total > len(e.entryArenas[0])
+	if compact {
+		total = 0
+		for _, group := range e.groups {
+			needed, targeted := waveGroupEntryNeed(group, wave)
+			capacity := len(group.Entries)
+			if targeted && capacity < needed {
+				capacity = entryArenaCapacity(needed, group.entryLimit)
+			}
+			if capacity > len(e.entryArenas[0])-total {
+				return false
+			}
+			total += capacity
+		}
+	}
+	target := e.entryArenaActive ^ 1
+	arena, cursor := e.entryArenas[target], 0
+	for _, group := range e.groups {
+		needed, targeted := waveGroupEntryNeed(group, wave)
+		capacity := len(group.Entries)
+		if e.entryArenaReady && !compact {
+			capacity = cap(group.Entries)
+		}
+		if targeted && capacity < needed {
+			capacity = entryArenaCapacity(needed, group.entryLimit)
+		}
+		copy(arena[cursor:cursor+len(group.Entries)], group.Entries)
+		group.Entries = arena[cursor : cursor+len(group.Entries) : cursor+capacity]
+		cursor += capacity
+	}
+	e.entryArenaActive, e.entryArenaReady = target, true
+	return true
+}
+
+func (e *Engine) ensureWaveEntryCapacity(wave Wave) bool {
+	allFit := true
+	for index := range wave.Batches {
+		group := e.groups[wave.Batches[index].GroupID]
+		needed, _ := waveGroupEntryNeed(group, wave)
+		if group == nil || group.entryLimit == 0 || needed > group.entryLimit {
+			return false
+		}
+		allFit = allFit && needed <= cap(group.Entries)
+	}
+	return allFit || e.repackEntryArena(wave)
 }
 
 func (e *Engine) Group(group uint64) (GroupState, bool) {
@@ -712,7 +842,8 @@ func (e *Engine) PersistWave(w Wave) error {
 	if err != nil {
 		return err
 	}
-	if !e.waveFitsActive(w, len(frame), len(events)) {
+	entriesFit := e.ensureWaveEntryCapacity(w)
+	if !entriesFit || !e.waveFitsActive(w, len(frame), len(events)) {
 		if e.log.activeOffset == segmentHeaderBytes {
 			if e.sealPending {
 				return ErrBackpressure
@@ -722,7 +853,7 @@ func (e *Engine) PersistWave(w Wave) error {
 		if err = e.rotateLocked(nil); err != nil {
 			return err
 		}
-		if !e.waveFitsActive(w, len(frame), len(events)) {
+		if !e.ensureWaveEntryCapacity(w) || !e.waveFitsActive(w, len(frame), len(events)) {
 			// Frozen locations remain in the group indexes until the asynchronous
 			// seal publishes its compact routes. The device sequencer waits on the
 			// seal and retries the exact WaveID; no accepted Ready is discarded.
@@ -887,7 +1018,7 @@ func (e *Engine) prepareWave(w Wave, validateState bool) ([]byte, [32]byte, []se
 		if flags&batchBegin != 0 {
 			needed++
 		}
-		if len(e.eventScratch)+needed+1 > cap(e.eventScratch) || validateState && len(batch.Entries) > cap(group.Entries) {
+		if len(e.eventScratch)+needed+1 > cap(e.eventScratch) || validateState && len(batch.Entries) > group.entryLimit {
 			return nil, [32]byte{}, nil, ErrBounds
 		}
 		e.frameBuf = appendUvarint(e.frameBuf, batch.GroupID-previousGroup)

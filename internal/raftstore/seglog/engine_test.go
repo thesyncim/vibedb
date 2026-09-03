@@ -113,6 +113,90 @@ func newReservedEngine(t *testing.T, groups ...uint64) *Engine {
 	return e
 }
 
+func TestEntryIndexesUseNodeWideActiveSegmentArenas(t *testing.T) {
+	e, err := createTestEngine(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	frame := make([]byte, 0, 1<<20)
+	if err = e.ReserveWithFrameArena(frame, 256, 64); err != nil {
+		t.Fatal(err)
+	}
+	if &e.frameBuf[:1][0] != &frame[:1][0] {
+		t.Fatal("engine did not retain caller-owned frame arena")
+	}
+	for group := uint64(1); group <= 32; group++ {
+		if err = e.ReserveGroup(group, 16); err != nil {
+			t.Fatal(err)
+		}
+		if capacity := cap(e.groups[group].Entries); capacity != 0 {
+			t.Fatalf("cold group %d reserved %d entry locations", group, capacity)
+		}
+	}
+	if len(e.entryArenas[0]) != 256 || len(e.entryArenas[1]) != 256 {
+		t.Fatalf("node entry arenas = %d/%d", len(e.entryArenas[0]), len(e.entryArenas[1]))
+	}
+	e.SetDataSyncForTesting(func(*os.File) error { return nil })
+	batches := make([]ReadyBatch, 32)
+	for index := range batches {
+		batches[index] = ReadyBatch{GroupID: uint64(index + 1), Entries: []Entry{{Index: 1, Term: 1}}}
+	}
+	if err = e.PersistWave(Wave{ID: waveID(1), Batches: batches}); err != nil {
+		t.Fatal(err)
+	}
+	totalCapacity := 0
+	for group := uint64(1); group <= 32; group++ {
+		if len(e.groups[group].Entries) != 1 {
+			t.Fatalf("group %d entries=%d", group, len(e.groups[group].Entries))
+		}
+		totalCapacity += cap(e.groups[group].Entries)
+	}
+	if totalCapacity != 32 {
+		t.Fatalf("active index capacity=%d want one slot per active group", totalCapacity)
+	}
+}
+
+func TestEntryArenaPressureRotatesInsteadOfAllocating(t *testing.T) {
+	e, err := createTestEngine(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	if err = e.Reserve(1<<20, 128, 32); err != nil {
+		t.Fatal(err)
+	}
+	if err = e.ReserveReaders(1); err != nil {
+		t.Fatal(err)
+	}
+	if err = e.ReserveGroup(1, 4); err != nil {
+		t.Fatal(err)
+	}
+	e.SetDataSyncForTesting(func(*os.File) error { return nil })
+	for index := uint64(1); index <= 5; index++ {
+		wave := Wave{ID: waveID(index), Batches: []ReadyBatch{{GroupID: 1, Entries: []Entry{{Index: index, Term: 1}}}}}
+		err = e.PersistWave(wave)
+		if index == 5 {
+			if !errors.Is(err, ErrBackpressure) {
+				t.Fatalf("fifth active entry = %v, want rotation backpressure", err)
+			}
+			if err = e.WaitSeal(); err != nil {
+				t.Fatal(err)
+			}
+			err = e.PersistWave(wave)
+		}
+		if err != nil {
+			t.Fatalf("persist %d: %v", index, err)
+		}
+	}
+	if got := len(e.groups[1].Entries); got != 1 {
+		t.Fatalf("new active segment entries=%d want 1", got)
+	}
+	if _, term, compacted, found := e.Lookup(1, 1); compacted || !found || term != 1 {
+		t.Fatalf("sealed lookup term=%d compacted=%t found=%t", term, compacted, found)
+	}
+}
+
 func newEngineAt(t *testing.T, dir string, groups ...uint64) *Engine {
 	t.Helper()
 	e, err := createTestEngine(dir)
