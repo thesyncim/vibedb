@@ -13,6 +13,8 @@ concurrency:
   cancel-in-progress: true
 jobs:
   repository-contracts:
+    needs: [sql-tests]
+    if: ${{ !cancelled() }}
     name: repository contracts
     runs-on: ubuntu-latest
     steps:
@@ -177,7 +179,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: [ubuntu-latest, ubuntu-24.04-arm]
-        shard: [durable, durable-pressure, sql, process, core]
+        shard: [durable, durable-pressure, process, core]
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
@@ -188,11 +190,6 @@ jobs:
       - name: Build and vet
         if: matrix.shard == 'core'
         run: go build ./... && go vet ./...
-      - name: Go 1.27 SIMD planner and query paths
-        if: matrix.shard == 'core'
-        env:
-          GOEXPERIMENT: simd
-        run: go test -count=1 -timeout=10m ./planner ./query ./gateway
       - name: Tests
         shell: bash
         run: scripts/ci/test-shard.sh "$TEST_SHARD" | tee "${RUNNER_TEMP}/unit-tests.txt"
@@ -211,7 +208,64 @@ jobs:
         with:
           path: ${{ steps.go.outputs.cache-path }}
           key: ${{ steps.go.outputs.cache-key }}
+  sql-tests:
+    name: unit (${{ matrix.runner }}, ${{ matrix.shard }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+        shard: [sql]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-go-ci
+        id: go
+        with:
+          scope: unit-${{ matrix.shard }}
+      - name: Tests
+        shell: bash
+        run: scripts/ci/test-shard.sh "$TEST_SHARD" | tee "${RUNNER_TEMP}/unit-tests.txt"
+        env:
+          TEST_SHARD: ${{ matrix.shard }}
+      - name: Upload package timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-timings-${{ matrix.runner }}-${{ matrix.shard }}
+          path: ${{ runner.temp }}/unit-tests.txt
+          retention-days: 7
+      - name: Save Go build cache
+        if: ${{ always() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.go.outputs.cache-path }}
+          key: ${{ steps.go.outputs.cache-key }}
+  simd-tests:
+    name: SIMD planner and query (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-go-ci
+        id: go
+        with:
+          scope: simd
+      - name: Go 1.27 SIMD planner and query paths
+        env:
+          GOEXPERIMENT: simd
+        run: go test -count=1 -timeout=10m ./planner ./query ./gateway
+      - name: Save Go build cache
+        if: ${{ always() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.go.outputs.cache-path }}
+          key: ${{ steps.go.outputs.cache-key }}
   durable-sql-rf3:
+    needs: [sql-tests]
+    if: ${{ !cancelled() }}
     name: Recovery, replica replacement and PostgreSQL clients
     runs-on: ubuntu-latest
     steps:
@@ -514,6 +568,8 @@ jobs:
           path: ${{ steps.go.outputs.cache-path }}
           key: ${{ steps.go.outputs.cache-key }}
   storage-race:
+    needs: [sql-tests]
+    if: ${{ !cancelled() }}
     name: race storage (${{ matrix.runner }})
     strategy:
       fail-fast: false
@@ -539,7 +595,7 @@ jobs:
   test:
     name: test (${{ matrix.runner }})
     if: always()
-    needs: [cross-compile, unit-tests, durable-sql-rf3, hot-shard-mutation, storage-race]
+    needs: [cross-compile, unit-tests, sql-tests, simd-tests, durable-sql-rf3, hot-shard-mutation, storage-race]
     strategy:
       fail-fast: false
       matrix:
@@ -561,6 +617,8 @@ jobs:
           RESULT: ${{ needs.repository-contracts.result }}
         run: test "$RESULT" = success
   distributed-race-packages:
+    needs: [sql-tests]
+    if: ${{ !cancelled() }}
     name: race distributed (${{ matrix.name }})
     strategy:
       fail-fast: false

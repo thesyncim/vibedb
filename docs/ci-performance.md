@@ -54,8 +54,8 @@ present and did not save updated build outputs.
 - Slow Linux process qualifications and both storage-race lanes run independently.
   Short recovery/client checks share a runner; distributed race packages use two
   balanced lanes. Build/vet runs in the core shard on each architecture. This
-  limits initial fan-out to 20 jobs; the first 30-job experiment left nine jobs
-  queued while only about 20 ran. Restore activation shares the contract runner
+  originally limited initial fan-out to 20 jobs; the first 30-job experiment
+  left nine jobs queued while only about 20 ran. Restore activation shares the contract runner
   and retains its prior required check name through an aggregator. LATERAL
   shares that runner too, retaining its required check name. Hot-shard and
   transport qualifications share one runner.
@@ -156,3 +156,20 @@ run separately from the remaining durable tests, without changing either test.
 The first compact run completed in 367 seconds (7 seconds initial queue),
 4.52x shorter elapsed time than the historical baseline, using 61.3
 runner-minutes. This was still a failed run and is not passing-suite proof.
+
+### SIMD and staged scheduling
+
+A concurrent feature merge added `GOEXPERIMENT=simd` planner/query/gateway
+tests before the core tests on both architectures. In manual run
+[33807400032](https://github.com/thesyncim/vibedb/actions/runs/33807400032),
+that step took 124 seconds on x86 and 99 seconds on ARM before ordinary core
+testing could begin. It now has independent architecture lanes, with the same
+command, repeat count, timeout, and experiment setting.
+
+SQL shards have their own job ID and anchor the second scheduling wave.
+Contracts/restore/LATERAL, recovery/client checks, storage race, and distributed
+race lanes start after the SQL pair finishes. They explicitly still run after
+a SQL failure. Sixteen work jobs are initially runnable, leaving four slots
+for the other RF3 workflows triggered by main pushes. No test moves off a PR
+or loses its required aggregate gate. The two native SQL shards plus eight
+other native shards retain the same package/test partition.
