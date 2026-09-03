@@ -72,7 +72,7 @@ func (server *ReplicatedServer) executeReplicatedQuery(ctx context.Context, requ
 		return refuse(ReplicatedRefusalUnavailable)
 	}
 	charge := replicatedSQLReservationBytes(request.MaxValueBytes)
-	if !server.frames.reserve(charge) {
+	if !server.frames.reserveSQL(ctx, charge) {
 		return refuse(ReplicatedRefusalAdmissionBound)
 	}
 	lease := &replicatedSQLLease{budget: &server.frames, bytes: charge}
@@ -175,4 +175,48 @@ func executeFencedSQL(ctx context.Context, source interface {
 	}
 	columns := responseColumns(prepared)
 	return RowsResponse(columns, collectRows(&cursor, len(columns)))
+}
+
+// reserveSQL applies bounded backpressure before taking a ReadIndex cut. Waiting
+// requests retain only their already charged wire frames, never SQL workspaces
+// or snapshots. Sixteen maximum SQL request frames fit the default native-frame
+// headroom. Other native operations retain nonblocking admission.
+func (budget *replicatedFrameByteBudget) reserveSQL(ctx context.Context, bytes int64) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	if budget.reserve(bytes) {
+		return true
+	}
+	if budget == nil || bytes <= 0 || bytes > budget.limit {
+		return false
+	}
+	budget.waitMu.Lock()
+	if budget.waiters.Load() >= 16 {
+		budget.waitMu.Unlock()
+		return false
+	}
+	budget.waiters.Add(1)
+	defer budget.waiters.Add(-1)
+	for {
+		if ctx.Err() != nil {
+			budget.waitMu.Unlock()
+			return false
+		}
+		if budget.reserve(bytes) {
+			budget.waitMu.Unlock()
+			return true
+		}
+		if budget.changed == nil {
+			budget.changed = make(chan struct{})
+		}
+		changed := budget.changed
+		budget.waitMu.Unlock()
+		select {
+		case <-ctx.Done():
+			return false
+		case <-changed:
+		}
+		budget.waitMu.Lock()
+	}
 }

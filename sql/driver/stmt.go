@@ -442,6 +442,19 @@ func (s *stmt) queryRowsCandidates(
 			if !candidateRead && errors.Is(err, errPointMaterializationTooLarge) {
 				source, err = s.conn.tx.querySource(s.query.Collection())
 			}
+		} else if s.transactionPrimaryRangeEligible(state) {
+			bounds, eligible, empty, bindErr := s.conn.bindPrimaryRangeProgram(s.primaryRange, args, state.limits.MaxKeyBytes)
+			switch {
+			case bindErr != nil:
+				err = bindErr
+			case empty:
+				source = query.FromSnapshot(store.Snapshot{})
+			case !eligible:
+				source, err = s.conn.tx.querySource(s.query.Collection())
+			default:
+				s.conn.fileRange.Bind(bounds.lower, bounds.upper, bounds.lowerExclusive)
+				source = query.FromFileRange(state.snapshot, &s.conn.fileRange)
+			}
 		} else {
 			source, err = s.conn.tx.querySource(s.query.Collection())
 		}
@@ -759,7 +772,7 @@ func (s *stmt) explainOptions(ctx context.Context) (query.ExplainOptions, error)
 			options.Indexes = state.snapshot.AppendIndexes(options.Indexes)
 		}
 		options.PrimaryPoint = s.pointCandidate && s.pointPath == state.primaryKey
-		options.PrimaryRange = s.primaryRange != nil && s.primaryRange.path == state.primaryKey
+		options.PrimaryRange = s.transactionPrimaryRangeEligible(state)
 		return options, contextCheckpoint(ctx)
 	}
 	if err := rlockContext(ctx, &s.conn.db.mu); err != nil {
@@ -1149,4 +1162,14 @@ func (t *tx) execSavepointStatement(tree *sqlast.Statement) error {
 	default:
 		return fmt.Errorf("vibedb: unsupported savepoint statement %s", tree.Kind)
 	}
+}
+
+// A native range may borrow the transaction snapshot only when no staged
+// writes need overlay visibility and no split ownership filter is required.
+// Serializable admission remains unchanged; this is only a physical source
+// choice after the existing transaction checks.
+func (s *stmt) transactionPrimaryRangeEligible(state *txTable) bool {
+	return state != nil && state.snapshot != nil && len(state.pending) == 0 &&
+		(state.readCut == nil || state.readCut.FullOwnership()) &&
+		s.primaryRange != nil && s.primaryRange.path == state.primaryKey
 }

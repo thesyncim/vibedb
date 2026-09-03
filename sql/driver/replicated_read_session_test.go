@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
@@ -48,6 +49,8 @@ func TestReplicatedReadSessionUsesBorrowedImmutableCut(t *testing.T) {
 	for _, test := range []struct{ sql, want string }{
 		{`SELECT value FROM docs ORDER BY value DESC LIMIT 1`, "10"},
 		{`SELECT COUNT(*) FROM docs`, "1"},
+		{`SELECT value FROM docs WHERE id >= 'a' AND id < 'b' ORDER BY id LIMIT 64`, "10"},
+		{`SELECT COUNT(*) FROM docs WHERE id >= 'b'`, "0"},
 		{`SELECT SUM(value) FROM docs`, "10"},
 		{`SELECT a.value FROM docs a JOIN docs b ON a.id = b.id`, "10"},
 	} {
@@ -61,6 +64,9 @@ func TestReplicatedReadSessionUsesBorrowedImmutableCut(t *testing.T) {
 			defer cur.Close()
 			if err := p.QueryInto(ctx, nil, &cur); err != nil {
 				t.Fatal(err)
+			}
+			if strings.Contains(test.sql, "id >=") && !reader.conn.exec.Stats.PrimaryRangeBounded {
+				t.Fatal("RF3 range scanned the full snapshot")
 			}
 			if !cur.Next() {
 				t.Fatal("no row")

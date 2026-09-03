@@ -180,7 +180,9 @@ func TestReplicatedServerRunsTwoMaximumSQLAdmissionsConcurrently(t *testing.T) {
 	if got := server.Stats().InFlightFrameBytes; got != 2*replicatedSQLMaximumReservationBytes {
 		t.Fatalf("overlapping SQL reservation = %d, want %d", got, 2*replicatedSQLMaximumReservationBytes)
 	}
-	third := server.executeReplicated(ctx, request)
+	blocked, cancelBlocked := context.WithTimeout(ctx, 10*time.Millisecond)
+	defer cancelBlocked()
+	third := server.executeReplicated(blocked, request)
 	if third.Kind != ReplicatedRefusal || third.Refusal != ReplicatedRefusalAdmissionBound {
 		t.Fatalf("third overlapping query = %+v, want admission refusal", third)
 	}
@@ -226,5 +228,60 @@ func BenchmarkReplicatedSQLAdmissionWaves(b *testing.B) {
 			}
 			b.ReportMetric(float64(test.width), "queries/wave")
 		})
+	}
+}
+
+func TestSQLBackpressureWakesOnReleaseAndRespectsBound(t *testing.T) {
+	budget := &replicatedFrameByteBudget{limit: 10}
+	if !budget.reserve(10) {
+		t.Fatal("initial reservation")
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	admitted := make(chan bool, 16)
+	for range 16 {
+		go func() { admitted <- budget.reserveSQL(ctx, 10) }()
+	}
+	deadline := time.After(time.Second)
+	for budget.waiters.Load() != 16 {
+		select {
+		case <-deadline:
+			t.Fatal("waiters not registered")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	if budget.reserveSQL(t.Context(), 10) {
+		t.Fatal("unbounded waiting queue")
+	}
+	if budget.used.Load() != 10 {
+		t.Fatal("waiting allocated a workspace")
+	}
+	budget.release(10)
+	select {
+	case ok := <-admitted:
+		if !ok {
+			t.Fatal("released capacity not admitted")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("lost wakeup")
+	}
+	if budget.used.Load() != 10 {
+		t.Fatal("reservation bound exceeded")
+	}
+	cancel()
+	for range 15 {
+		select {
+		case ok := <-admitted:
+			if ok {
+				t.Fatal("cancelled waiter acquired")
+			}
+		case <-time.After(time.Second):
+			t.Fatal("cancellation stuck")
+		}
+	}
+	budget.release(10)
+	if budget.used.Load() != 0 || budget.waiters.Load() != 0 {
+		t.Fatal("reservation or waiter leaked")
 	}
 }

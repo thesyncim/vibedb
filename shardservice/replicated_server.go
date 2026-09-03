@@ -132,8 +132,11 @@ const (
 )
 
 type replicatedFrameByteBudget struct {
-	limit int64
-	used  atomic.Int64
+	limit   int64
+	used    atomic.Int64
+	waiters atomic.Int32
+	waitMu  sync.Mutex
+	changed chan struct{}
 }
 
 func (budget *replicatedFrameByteBudget) reserve(bytes int64) bool {
@@ -156,6 +159,14 @@ func (budget *replicatedFrameByteBudget) release(bytes int64) {
 		return
 	}
 	budget.used.Add(-bytes)
+	if budget.waiters.Load() != 0 {
+		budget.waitMu.Lock()
+		if budget.changed != nil {
+			close(budget.changed)
+			budget.changed = nil
+		}
+		budget.waitMu.Unlock()
+	}
 }
 
 const (

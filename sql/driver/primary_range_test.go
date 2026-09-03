@@ -150,3 +150,38 @@ func TestPrimaryRangePredicatesSeekDurableOrderedGraph(t *testing.T) {
 		}
 	}
 }
+
+func TestTransactionPrimaryRangeKeepsOverlayVisibility(t *testing.T) {
+	db := openTestDB(t)
+	if _, err := db.Exec(`CREATE TABLE docs (id STRING PRIMARY KEY, n INTEGER)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO docs (id,n) VALUES ('a',1),('c',3)`); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	check := func(want int) {
+		t.Helper()
+		var got int
+		if err := tx.QueryRow(`SELECT SUM(n) FROM docs WHERE id >= 'b'`).Scan(&got); err != nil || got != want {
+			t.Fatalf("sum=%d want=%d err=%v", got, want, err)
+		}
+	}
+	check(3)
+	if _, err := tx.Exec(`INSERT INTO docs (id,n) VALUES ('b',2)`); err != nil {
+		t.Fatal(err)
+	}
+	check(5)
+	if _, err := tx.Exec(`UPDATE docs SET n=30 WHERE id='c'`); err != nil {
+		t.Fatal(err)
+	}
+	check(32)
+	if _, err := tx.Exec(`DELETE FROM docs WHERE id='b'`); err != nil {
+		t.Fatal(err)
+	}
+	check(30)
+}
