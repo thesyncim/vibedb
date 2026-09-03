@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"hash/crc32"
 	"slices"
-	"unsafe"
 
 	"github.com/cespare/xxhash/v2"
 )
@@ -261,7 +260,7 @@ func UnmarshalPartitionAnalysis(data []byte) (*PartitionAnalysis, error) {
 		}
 	}
 	count := d.count(opts.SampleRows, 16+4*len(paths))
-	if uint64(count) != min(rows, uint64(opts.SampleRows)) || !d.alloc(uint64(count)*(uint64(unsafe.Sizeof(analyzedSampleRow{}))+uint64(len(paths))*16)) {
+	if uint64(count) != min(rows, uint64(opts.SampleRows)) || !d.alloc(uint64(count)*(128+uint64(len(paths))*16)) {
 		return invalid()
 	}
 	a.sample = make([]analyzedSampleRow, count)

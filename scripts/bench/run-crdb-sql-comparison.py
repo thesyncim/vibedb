@@ -85,13 +85,25 @@ def main():
         def stop(processes):
             for process in processes:
                 inside("pkill", "-TERM", "-x", process, check=False)
-            deadline = time.monotonic() + 90
+            deadline = time.monotonic() + 20
             while time.monotonic() < deadline:
                 rows = output(["docker", "exec", name, "ps", "-eo", "comm=,stat="]).splitlines()
                 if not any(row.split()[0] in processes and not row.split()[1].startswith("Z") for row in rows):
                     return
                 time.sleep(.5)
-            raise RuntimeError("database did not shut down before next engine")
+            # Measurements and full verification have finished. Draining all
+            # CRDB voters at once can leave the last node awaiting its peers.
+            # Stop only this runner's processes, record it, and ensure none can
+            # consume resources in the next engine's measurement window.
+            shell("printf '%s\\n' 'Forced post-measurement shutdown: " + ",".join(processes) + "' >> /evidence/shutdown-notes.txt")
+            for process in processes:
+                inside("pkill", "-KILL", "-x", process, check=False)
+            for _ in range(20):
+                rows = output(["docker", "exec", name, "ps", "-eo", "comm=,stat="]).splitlines()
+                if not any(row.split()[0] in processes and not row.split()[1].startswith("Z") for row in rows):
+                    return
+                time.sleep(.5)
+            raise RuntimeError("database process survived shutdown")
 
         shell("mkdir -p /evidence /data/certs")
         shell("uname -a > /evidence/platform.txt; stat -f -c %T /data >> /evidence/platform.txt; cat /sys/fs/cgroup/cpu.max /sys/fs/cgroup/memory.max >> /evidence/platform.txt")
