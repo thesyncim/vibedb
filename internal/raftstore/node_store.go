@@ -28,14 +28,26 @@ const (
 	nodeLogDir          = "log"
 	nodeCheckpointDir   = "checkpoints"
 	nodeMetaHeaderBytes = 48
+
+	DefaultNodeSegmentBytes       = 32 << 20
+	DefaultNodeMaxWaveBytes       = 20 << 20
+	DefaultNodeMaxSegmentEvents   = 32 << 10
+	DefaultNodeRecentWaves        = 4 << 10
+	DefaultNodeMaxEntriesPerGroup = raftmodel.MaxMessageEntries
+	DefaultNodeReaderSlots        = 4
+	DefaultNodeMaxGroups          = 4 << 10
 )
 
 var nodeMetaMagic = [8]byte{'V', 'D', 'B', 'N', 'O', 'D', 'E', 0}
 
+// NodeStoreOptions is the complete immutable node-log geometry. Zero values
+// select the exported defaults. SegmentBytes controls only one physical log
+// segment; it is deliberately independent from maximum wave, index, cache,
+// and group capacities so reserve space cannot silently scale with a legacy
+// per-group WAL bound.
 type NodeStoreOptions struct {
-	Store                                                        Options
-	FrameBytes, Events, WaveIDs, EntriesPerGroup, CachedSegments int
-	Groups                                                       int
+	SegmentBytes, MaxWaveBytes, MaxSegmentEvents, RecentWaves int
+	MaxEntriesPerGroup, ReaderSlots, MaxGroups                int
 }
 
 type NodeIdentity struct {
@@ -89,7 +101,6 @@ type NodeStore struct {
 	descriptorOrder                           []uint32
 	nextLogKey                                uint64
 	key                                       Key
-	options                                   normalizedOptions
 	bounds                                    nodeStoreBounds
 	engine                                    *seglog.Engine
 	lock                                      *os.File
@@ -141,50 +152,51 @@ type BorrowedEntry struct {
 	Data        []byte
 }
 
-func defaultNodeOptions(options NodeStoreOptions) (NodeStoreOptions, normalizedOptions, error) {
-	normalized, err := normalizeOptions(options.Store)
-	if err != nil {
-		return options, normalizedOptions{}, err
+func defaultNodeOptions(options NodeStoreOptions) (NodeStoreOptions, error) {
+	if options.SegmentBytes == 0 {
+		options.SegmentBytes = DefaultNodeSegmentBytes
 	}
-	if options.FrameBytes == 0 {
-		options.FrameBytes = normalized.maxRecordBytes
+	if options.MaxWaveBytes == 0 {
+		options.MaxWaveBytes = DefaultNodeMaxWaveBytes
 	}
-	if options.Events == 0 {
-		options.Events = int(normalized.maxEntries)
+	if options.MaxSegmentEvents == 0 {
+		options.MaxSegmentEvents = DefaultNodeMaxSegmentEvents
 	}
-	if options.WaveIDs == 0 {
-		options.WaveIDs = int(normalized.maxRecords)
+	if options.RecentWaves == 0 {
+		options.RecentWaves = DefaultNodeRecentWaves
 	}
-	if options.EntriesPerGroup == 0 {
-		options.EntriesPerGroup = int(normalized.maxEntries)
+	if options.MaxEntriesPerGroup == 0 {
+		options.MaxEntriesPerGroup = DefaultNodeMaxEntriesPerGroup
 	}
-	if options.CachedSegments == 0 {
-		options.CachedSegments = 8
+	if options.ReaderSlots == 0 {
+		options.ReaderSlots = DefaultNodeReaderSlots
 	}
-	if options.Groups == 0 {
-		options.Groups = 4096
+	if options.MaxGroups == 0 {
+		options.MaxGroups = DefaultNodeMaxGroups
 	}
-	if options.FrameBytes < 72 || uint64(options.FrameBytes) > AbsoluteMaxRecordBytes ||
-		options.Events < 1 || uint64(options.Events) > AbsoluteMaxEntries ||
-		options.WaveIDs < 1 || uint64(options.WaveIDs) > AbsoluteMaxRecords ||
-		options.EntriesPerGroup < 1 || options.EntriesPerGroup > MaxReadyEntries ||
-		options.CachedSegments < 0 || uint64(options.CachedSegments) > math.MaxUint32 ||
-		options.Groups < 1 || uint64(options.Groups) > math.MaxUint32 {
-		return options, normalizedOptions{}, ErrBounds
+	if options.SegmentBytes < 1<<20 || uint64(options.SegmentBytes) >= 1<<32 ||
+		options.MaxWaveBytes < 72 || options.MaxWaveBytes > seglog.MaximumWaveBytes ||
+		options.MaxSegmentEvents < 1 || uint64(options.MaxSegmentEvents) > AbsoluteMaxEntries ||
+		options.RecentWaves < 1 || uint64(options.RecentWaves) > AbsoluteMaxRecords ||
+		options.MaxEntriesPerGroup < 1 || options.MaxEntriesPerGroup > MaxReadyEntries ||
+		options.ReaderSlots < 0 || uint64(options.ReaderSlots) > math.MaxUint32 ||
+		options.MaxGroups < 1 || uint64(options.MaxGroups) > math.MaxUint32 {
+		return options, ErrBounds
 	}
-	return options, normalized, nil
+	return options, nil
 }
 
-func nodeBoundsFromOptions(options NodeStoreOptions, normalized normalizedOptions) nodeStoreBounds {
+func nodeBoundsFromOptions(options NodeStoreOptions) nodeStoreBounds {
 	return nodeStoreBounds{
-		store: boundsFromOptions(normalized), frameBytes: uint64(options.FrameBytes), events: uint64(options.Events),
-		waveIDs: uint64(options.WaveIDs), entriesPerGroup: uint64(options.EntriesPerGroup),
-		cachedSegments: uint64(options.CachedSegments), groups: uint64(options.Groups),
+		segmentBytes: uint64(options.SegmentBytes), maxWaveBytes: uint64(options.MaxWaveBytes),
+		maxSegmentEvents: uint64(options.MaxSegmentEvents), recentWaves: uint64(options.RecentWaves),
+		maxEntriesPerGroup: uint64(options.MaxEntriesPerGroup), readerSlots: uint64(options.ReaderSlots),
+		maxGroups: uint64(options.MaxGroups),
 	}
 }
 
 func CreateNodeStore(dir string, identity NodeIdentity, key Key, bootstraps []NodeBootstrap, options NodeStoreOptions) (*NodeStore, error) {
-	options, normalized, err := defaultNodeOptions(options)
+	options, err := defaultNodeOptions(options)
 	if err != nil {
 		return nil, err
 	}
@@ -195,7 +207,7 @@ func CreateNodeStore(dir string, identity NodeIdentity, key Key, bootstraps []No
 		return nil, err
 	}
 	bootstraps, descriptors, order, err := canonicalInitialDescriptors(bootstraps)
-	if err != nil || len(bootstraps) >= MaxPersistGroupBatches || len(bootstraps) > options.Groups {
+	if err != nil || len(bootstraps) >= MaxPersistGroupBatches || len(bootstraps) > options.MaxGroups {
 		return nil, ErrInvalid
 	}
 	if err = os.Mkdir(dir, 0o700); err != nil {
@@ -228,17 +240,17 @@ func CreateNodeStore(dir string, identity NodeIdentity, key Key, bootstraps []No
 		return nil, err
 	}
 	authKey := deriveFileSecret(key.Material, logID, "seglog-auth-key")
-	engine, err := seglog.CreateEngineAuthenticated(filepath.Join(dir, nodeLogDir), logID, authKey, uint64(normalized.maxFileBytes))
+	engine, err := seglog.CreateEngineAuthenticated(filepath.Join(dir, nodeLogDir), logID, authKey, uint64(options.SegmentBytes))
 	if err != nil {
 		_ = lock.Close()
 		return nil, err
 	}
-	storedDescriptors := make([]GroupDescriptor, len(descriptors), options.Groups)
+	storedDescriptors := make([]GroupDescriptor, len(descriptors), options.MaxGroups)
 	copy(storedDescriptors, descriptors)
-	storedOrder := make([]uint32, len(order), options.Groups)
+	storedOrder := make([]uint32, len(order), options.MaxGroups)
 	copy(storedOrder, order)
-	bounds := nodeBoundsFromOptions(options, normalized)
-	store := &NodeStore{dir: dir, identity: identity, descriptors: storedDescriptors, descriptorOrder: storedOrder, nextLogKey: uint64(len(descriptors)) + 1, key: key, options: normalized, bounds: bounds, engine: engine, lock: lock, crypto: cryptoState, cryptoWork: newObjectCryptoWorkspace(cryptoState.dataKey, cryptoState.nonceKey)}
+	bounds := nodeBoundsFromOptions(options)
+	store := &NodeStore{dir: dir, identity: identity, descriptors: storedDescriptors, descriptorOrder: storedOrder, nextLogKey: uint64(len(descriptors)) + 1, key: key, bounds: bounds, engine: engine, lock: lock, crypto: cryptoState, cryptoWork: newObjectCryptoWorkspace(cryptoState.dataKey, cryptoState.nonceKey)}
 	if err = store.reserve(options, bootstraps); err != nil {
 		_ = store.Close()
 		return nil, err
@@ -261,7 +273,7 @@ func CreateNodeStore(dir string, identity NodeIdentity, key Key, bootstraps []No
 // OpenNodeStore authenticates node metadata before exposing recovered group
 // state. Engine Open performs its startup durability sync before this returns.
 func OpenNodeStore(dir string, expected NodeIdentity, key Key, options NodeStoreOptions) (*NodeStore, error) {
-	options, normalized, err := defaultNodeOptions(options)
+	options, err := defaultNodeOptions(options)
 	if err != nil {
 		return nil, err
 	}
@@ -291,7 +303,7 @@ func OpenNodeStore(dir string, expected NodeIdentity, key Key, options NodeStore
 	if err != nil {
 		return fail(nil, err)
 	}
-	bounds := nodeBoundsFromOptions(options, normalized)
+	bounds := nodeBoundsFromOptions(options)
 	identity, logID, err := openNodeMeta(meta, expected, key, bounds)
 	if err != nil {
 		return fail(nil, err)
@@ -308,12 +320,12 @@ func OpenNodeStore(dir string, expected NodeIdentity, key Key, options NodeStore
 	if engine.LogID() != logID {
 		return fail(engine, ErrIdentityMismatch)
 	}
-	store := &NodeStore{dir: dir, identity: identity, key: key, options: normalized, bounds: bounds, engine: engine, lock: lock, crypto: cryptoState, cryptoWork: newObjectCryptoWorkspace(cryptoState.dataKey, cryptoState.nonceKey)}
-	if err = engine.Reserve(options.FrameBytes, options.Events, options.WaveIDs); err == nil {
-		err = engine.ReserveReaders(options.CachedSegments)
+	store := &NodeStore{dir: dir, identity: identity, key: key, bounds: bounds, engine: engine, lock: lock, crypto: cryptoState, cryptoWork: newObjectCryptoWorkspace(cryptoState.dataKey, cryptoState.nonceKey)}
+	if err = engine.Reserve(options.MaxWaveBytes, options.MaxSegmentEvents, options.RecentWaves); err == nil {
+		err = engine.ReserveReaders(options.ReaderSlots)
 	}
 	if err == nil {
-		if err = engine.ReserveGroup(nodeDescriptorGroup, options.Groups); err != nil {
+		if err = engine.ReserveGroup(nodeDescriptorGroup, options.MaxGroups); err != nil {
 		}
 	}
 	if err == nil {
@@ -321,21 +333,21 @@ func OpenNodeStore(dir string, expected NodeIdentity, key Key, options NodeStore
 			if group == nodeDescriptorGroup {
 				continue
 			}
-			if err = engine.ReserveGroup(group, options.EntriesPerGroup); err != nil {
+			if err = engine.ReserveGroup(group, options.MaxEntriesPerGroup); err != nil {
 				break
 			}
 		}
 	}
 	if err == nil {
-		store.plainArena = make([]byte, 0, options.FrameBytes)
-		store.cipherArena = make([]byte, 0, options.FrameBytes)
-		store.digestArena = make([]byte, 0, options.FrameBytes)
-		store.readPlain = make([]byte, 0, options.FrameBytes)
-		store.pageRefs = make([]pageEntryRef, 0, options.Events)
+		store.plainArena = make([]byte, 0, options.MaxWaveBytes)
+		store.cipherArena = make([]byte, 0, options.MaxWaveBytes)
+		store.digestArena = make([]byte, 0, options.MaxWaveBytes)
+		store.readPlain = make([]byte, 0, options.MaxWaveBytes)
+		store.pageRefs = make([]pageEntryRef, 0, options.MaxSegmentEvents)
 		for i := range store.waveEntries {
-			store.waveEntries[i] = make([]seglog.Entry, 0, options.EntriesPerGroup)
+			store.waveEntries[i] = make([]seglog.Entry, 0, options.MaxEntriesPerGroup)
 		}
-		if err = store.rebuildDescriptors(options.Groups); err == nil {
+		if err = store.rebuildDescriptors(options.MaxGroups); err == nil {
 			ids := engine.GroupIDs()
 			if len(ids) != len(store.descriptors)+1 || ids[len(ids)-1] != nodeDescriptorGroup {
 				err = ErrCorrupt
@@ -397,27 +409,27 @@ func openNodeMeta(data []byte, expected NodeIdentity, key Key, bounds nodeStoreB
 }
 
 func (s *NodeStore) reserve(options NodeStoreOptions, bootstraps []NodeBootstrap) error {
-	if err := s.engine.Reserve(options.FrameBytes, options.Events, options.WaveIDs); err != nil {
+	if err := s.engine.Reserve(options.MaxWaveBytes, options.MaxSegmentEvents, options.RecentWaves); err != nil {
 		return err
 	}
-	if err := s.engine.ReserveReaders(options.CachedSegments); err != nil {
+	if err := s.engine.ReserveReaders(options.ReaderSlots); err != nil {
 		return err
 	}
 	for _, b := range bootstraps {
-		if err := s.engine.ReserveGroup(b.Descriptor.LogKey, options.EntriesPerGroup); err != nil {
+		if err := s.engine.ReserveGroup(b.Descriptor.LogKey, options.MaxEntriesPerGroup); err != nil {
 			return err
 		}
 	}
-	if err := s.engine.ReserveGroup(nodeDescriptorGroup, options.Groups); err != nil {
+	if err := s.engine.ReserveGroup(nodeDescriptorGroup, options.MaxGroups); err != nil {
 		return err
 	}
-	s.plainArena = make([]byte, 0, options.FrameBytes)
-	s.cipherArena = make([]byte, 0, options.FrameBytes)
-	s.digestArena = make([]byte, 0, options.FrameBytes)
-	s.readPlain = make([]byte, 0, options.FrameBytes)
-	s.pageRefs = make([]pageEntryRef, 0, options.Events)
+	s.plainArena = make([]byte, 0, options.MaxWaveBytes)
+	s.cipherArena = make([]byte, 0, options.MaxWaveBytes)
+	s.digestArena = make([]byte, 0, options.MaxWaveBytes)
+	s.readPlain = make([]byte, 0, options.MaxWaveBytes)
+	s.pageRefs = make([]pageEntryRef, 0, options.MaxSegmentEvents)
 	for i := range s.waveEntries {
-		s.waveEntries[i] = make([]seglog.Entry, 0, options.EntriesPerGroup)
+		s.waveEntries[i] = make([]seglog.Entry, 0, options.MaxEntriesPerGroup)
 	}
 	return nil
 }
@@ -775,6 +787,9 @@ func (s *NodeStore) persistWave(ready []NodeReady, sequenced bool) error {
 		if fatal := s.engine.FatalError(); fatal != nil {
 			s.poisoned = fatal
 			return errors.Join(ErrPersistenceUnknown, persistErr, fatal)
+		}
+		if errors.Is(persistErr, seglog.ErrBackpressure) {
+			return errors.Join(ErrDurabilityBackpressure, persistErr)
 		}
 		return errors.Join(ErrInvalid, persistErr)
 	}
@@ -1165,7 +1180,7 @@ func (v *GroupView) CapacityProfile() (CapacityProfile, error) {
 	}
 	return CapacityProfile{
 		Format: CapacityFormatImmutableBase, LogBaseIndex: state.Checkpoint.Index,
-		MaxEntries: v.store.bounds.entriesPerGroup,
+		MaxEntries: v.store.bounds.maxEntriesPerGroup,
 	}, nil
 }
 
