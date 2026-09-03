@@ -137,6 +137,9 @@ func TestEntryIndexesUseNodeWideActiveSegmentArenas(t *testing.T) {
 	if len(e.entryArenas[0]) != 256 || len(e.entryArenas[1]) != 256 {
 		t.Fatalf("node entry arenas = %d/%d", len(e.entryArenas[0]), len(e.entryArenas[1]))
 	}
+	if cap(e.activeBuild.groups) != 32 || cap(e.spareBuild.groups) != 32 {
+		t.Fatalf("seal builders reserve groups=%d/%d want 32/32", cap(e.activeBuild.groups), cap(e.spareBuild.groups))
+	}
 	e.SetDataSyncForTesting(func(*os.File) error { return nil })
 	batches := make([]ReadyBatch, 32)
 	for index := range batches {
@@ -1325,16 +1328,16 @@ func TestSegmentSummaryCapacityRejectsBeforeMutation(t *testing.T) {
 	}
 }
 
-func TestReserveMovesActiveSegmentSummarySlots(t *testing.T) {
+func TestReserveGroupMovesActiveSegmentSummarySlots(t *testing.T) {
 	e := newReservedEngine(t, 1)
 	if err := e.PersistWave(Wave{ID: waveID(1), Batches: []ReadyBatch{{GroupID: 1, Entries: []Entry{{Index: 1, Term: 7}}}}}); err != nil {
 		t.Fatal(err)
 	}
 	old := e.activeBuild
-	if err := e.Reserve(1<<20, cap(old.groups)+1, 4096); err != nil {
+	if err := e.ReserveGroup(2, 4096); err != nil {
 		t.Fatal(err)
 	}
-	if e.activeBuild == old || len(e.activeBuild.groups) != 1 || e.activeBuild.groups[0].GroupID != 1 {
+	if e.activeBuild == old || cap(e.activeBuild.groups) != 2 || len(e.activeBuild.groups) != 1 || e.activeBuild.groups[0].GroupID != 1 {
 		t.Fatalf("rebuilt arena=%+v old=%p new=%p", e.activeBuild.groups, old, e.activeBuild)
 	}
 	if group := e.groups[1]; group.buildSegmentID != e.log.state.ActiveID || group.buildSlot != 0 {

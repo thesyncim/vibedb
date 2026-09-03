@@ -493,7 +493,29 @@ func (e *Engine) reserve(frameBytes, events, waveIDs int, frame []byte) error {
 			return ErrBounds
 		}
 	}
-	if e.activeBuild == nil || cap(e.activeBuild.groups) < events {
+	if err := e.reserveBuildGroups(min(len(e.groups), events)); err != nil {
+		return err
+	}
+	if waveIDs > len(e.waves) {
+		replacement := make(map[WaveID]waveState, waveIDs)
+		for id, state := range e.waves {
+			replacement[id] = state
+		}
+		e.waves = replacement
+	}
+	e.waveLimit = waveIDs
+	return nil
+}
+
+// reserveBuildGroups sizes seal summaries by registered groups, not segment
+// events. Each group occupies at most one summary slot in a segment regardless
+// of how many entries or metadata events it appends.
+func (e *Engine) reserveBuildGroups(groups int) error {
+	if groups < 0 || e.log == nil || groups > cap(e.log.events) {
+		return ErrBounds
+	}
+	capacity := entryArenaCapacity(groups, cap(e.log.events))
+	if e.activeBuild == nil || cap(e.activeBuild.groups) < groups {
 		// Rebuilding the active arena must also move the per-group slot tags.
 		// A tag points into one concrete arena, so retaining it while replacing
 		// that arena would silently omit the group from the frozen summary.
@@ -506,7 +528,7 @@ func (e *Engine) reserve(frameBytes, events, waveIDs int, frame []byte) error {
 				group.buildSlot = 0
 			}
 		}
-		e.activeBuild = &segmentBuildArena{groups: make([]segmentGroupBuild, 0, events)}
+		e.activeBuild = &segmentBuildArena{groups: make([]segmentGroupBuild, 0, capacity)}
 		for i := range e.log.events {
 			if e.log.events[i].GroupID == engineWaveGroup {
 				continue
@@ -519,17 +541,9 @@ func (e *Engine) reserve(frameBytes, events, waveIDs int, frame []byte) error {
 			}
 		}
 	}
-	if e.spareBuild == nil || cap(e.spareBuild.groups) < events {
-		e.spareBuild = &segmentBuildArena{groups: make([]segmentGroupBuild, 0, events)}
+	if e.spareBuild == nil || cap(e.spareBuild.groups) < groups {
+		e.spareBuild = &segmentBuildArena{groups: make([]segmentGroupBuild, 0, capacity)}
 	}
-	if waveIDs > len(e.waves) {
-		replacement := make(map[WaveID]waveState, waveIDs)
-		for id, state := range e.waves {
-			replacement[id] = state
-		}
-		e.waves = replacement
-	}
-	e.waveLimit = waveIDs
 	return nil
 }
 
@@ -544,6 +558,10 @@ func (e *Engine) ReserveGroup(group uint64, entries int) error {
 	}
 	g := e.groups[group]
 	if g == nil {
+		buildGroups := min(len(e.groups)+1, cap(e.log.events))
+		if err := e.reserveBuildGroups(buildGroups); err != nil {
+			return err
+		}
 		e.groups[group] = &engineGroup{entryLimit: entries, owner: e, id: group}
 		return nil
 	}
