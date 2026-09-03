@@ -46,15 +46,19 @@ present and did not save updated build outputs.
 
 - Four cross-compilation targets run in two independent compiler lanes, covering
   the same root and PostgreSQL client modules. They no longer delay native tests.
-- Native tests use four disjoint shards on each of the existing architectures.
+- Native tests use five disjoint test shards on each of the existing architectures.
   `go list ./...` discovers the complete package set; new packages default to the
-  core shard. Each runner retains `-p=1` and the 25-minute package timeout.
+  core shard. The two measured pressure qualifications have their own runner;
+  the ordinary durable shard uses the complementary exact-name exclusion.
+  Each runner retains `-p=1` and the 25-minute package timeout.
 - Slow Linux process qualifications and both storage-race lanes run independently.
   Short recovery/client checks share a runner; distributed race packages use two
   balanced lanes. Build/vet runs in the core shard on each architecture. This
   limits initial fan-out to 20 jobs; the first 30-job experiment left nine jobs
   queued while only about 20 ran. Restore activation shares the contract runner
-  and retains its prior required check name through an aggregator.
+  and retains its prior required check name through an aggregator. LATERAL
+  shares that runner too, retaining its required check name. Hot-shard and
+  transport qualifications share one runner.
 - Modules have a shared dependency cache. Build/test cache snapshots have separate
   toolchain, host architecture, and lane keys, with a revision suffix and a prefix
   restore from an earlier revision. Go validates each restored cache entry.
@@ -122,3 +126,22 @@ gh run view RUN_ID --json createdAt,updatedAt,status,conclusion,jobs | \
 
 The report separates initial queue time and identifies failed/incomplete runs;
 an elapsed-time ratio for a failed run is not a passing-suite speedup.
+
+### Measurements during rollout
+
+The first wide, cold-cache run
+[33804436030](https://github.com/thesyncim/vibedb/actions/runs/33804436030)
+finished in 521 seconds, including 78 seconds of initial queue time and 443
+seconds from first job start to last finish. It used 80.9 runner-minutes. Its
+core shards failed the already-observed allocation tests, and hot-shard
+qualification timed out. The latter passed on the next run and in an isolated
+Linux reproduction; no test retries or relaxed deadlines were added.
+
+The first compact run
+[33805250803](https://github.com/thesyncim/vibedb/actions/runs/33805250803)
+exposed a ShellCheck error in the race package-list expansion. That was fixed
+with a quoted Bash array, and local validation now includes ShellCheck. Its
+x86 durable log reported 286.89 seconds across 724 top-level tests;
+`TestFilePrimaryChurnQualification` consumed 113.82 seconds and
+`TestFilePrimaryLargerThanCacheQualification` 53.57 seconds. These two tests now
+run separately from the remaining durable tests, without changing either test.

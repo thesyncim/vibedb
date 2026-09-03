@@ -2,6 +2,7 @@
 import collections
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import tempfile
@@ -47,6 +48,23 @@ sys.exit(99)
             self.assertEqual(result.returncode, 0, result.stderr)
             selected.extend(result.stdout.splitlines())
         self.assertEqual(collections.Counter(selected), collections.Counter(PACKAGES))
+
+    def test_pressure_filters_are_complementary(self):
+        regular = json.loads(self.run_shard("durable").stdout.splitlines()[-1])
+        pressure = json.loads(self.run_shard("durable-pressure").stdout.splitlines()[-1])
+        self.assertEqual(regular[-1], PREFIX + "/store/durable")
+        self.assertEqual(pressure[-1], regular[-1])
+        skip = regular[regular.index("-skip") + 1]
+        run = pressure[pressure.index("-run") + 1]
+        self.assertEqual(skip, run)
+        for test in ("TestFilePrimaryChurnQualification",
+                     "TestFilePrimaryLargerThanCacheQualification",
+                     "TestNewDurableBehavior", "ExampleStore", "FuzzRecovery",
+                     "TestFilePrimaryChurnQualificationExtra"):
+            pressure_selected = re.search(run, test) is not None
+            regular_selected = re.search(skip, test) is None
+            self.assertNotEqual(pressure_selected, regular_selected)
+        self.assertIsNone(re.search(run, "TestFilePrimaryChurnQualificationExtra"))
 
     def test_invalid_arguments_fail(self):
         for args in ((), ("typo",), ("core", "typo"), ("core", "--list", "extra")):

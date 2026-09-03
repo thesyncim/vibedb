@@ -95,6 +95,8 @@ jobs:
           path: ${{ runner.temp }}/restore-activation
           if-no-files-found: error
           retention-days: 30
+      - name: Focused LATERAL race tests
+        run: go test -race -p=1 -count=1 -timeout=10m -run 'Lateral' ./query ./sql/driver ./pgwire
       - name: Save Go build cache
         if: ${{ !cancelled() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
@@ -170,7 +172,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: [ubuntu-latest, ubuntu-24.04-arm]
-        shard: [durable, sql, process, core]
+        shard: [durable, durable-pressure, sql, process, core]
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
@@ -397,7 +399,7 @@ jobs:
           path: ${{ steps.go.outputs.cache-path }}
           key: ${{ steps.go.outputs.cache-key }}
   hot-shard-mutation:
-    name: Write-driven hot-shard qualification
+    name: Hot-shard and transport qualification
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -467,21 +469,6 @@ jobs:
           path: ${{ runner.temp }}/hot-shard-mutation
           if-no-files-found: error
           retention-days: 30
-      - name: Save Go build cache
-        if: ${{ !cancelled() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@v4
-        with:
-          path: ${{ steps.go.outputs.cache-path }}
-          key: ${{ steps.go.outputs.cache-key }}
-  transport-qualification:
-    name: RF3 and authenticated transport qualification
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: ./.github/actions/setup-go-ci
-        id: go
-        with:
-          scope: transport-qualification
       - name: RF3 external-process fault evidence
         run: |
           rf3_evidence_path="${RUNNER_TEMP}/rf3-chaos.tsv"
@@ -535,7 +522,7 @@ jobs:
   test:
     name: test (${{ matrix.runner }})
     if: always()
-    needs: [cross-compile, unit-tests, durable-sql-rf3, hot-shard-mutation, transport-qualification, storage-race]
+    needs: [cross-compile, unit-tests, durable-sql-rf3, hot-shard-mutation, storage-race]
     strategy:
       fail-fast: false
       matrix:
@@ -548,21 +535,14 @@ jobs:
         run: jq -e 'all(.[]; .result == "success")' <<< "$RESULTS"
   lateral-race:
     name: race (LATERAL cross-layer)
+    if: always()
+    needs: [repository-contracts]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: ./.github/actions/setup-go-ci
-        id: go
-        with:
-          scope: lateral-race
-      - name: Focused LATERAL race tests
-        run: go test -race -p=1 -count=1 -timeout=10m -run 'Lateral' ./query ./sql/driver ./pgwire
-      - name: Save Go build cache
-        if: ${{ !cancelled() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@v4
-        with:
-          path: ${{ steps.go.outputs.cache-path }}
-          key: ${{ steps.go.outputs.cache-key }}
+      - name: Require contracts, restore and LATERAL tests to pass
+        env:
+          RESULT: ${{ needs.repository-contracts.result }}
+        run: test "$RESULT" = success
   distributed-race-packages:
     name: race distributed (${{ matrix.name }})
     strategy:
