@@ -532,6 +532,18 @@ func bootstrapWaveID(batches []seglog.ReadyBatch) seglog.WaveID {
 	return id
 }
 
+func checkpointWaveID(group uint64, checkpoint seglog.Checkpoint) seglog.WaveID {
+	var canonical [48]byte
+	copy(canonical[:16], []byte("node-checkpoint\x00"))
+	binary.LittleEndian.PutUint64(canonical[16:24], group)
+	copy(canonical[24:40], checkpoint.ID[:])
+	binary.LittleEndian.PutUint64(canonical[40:48], checkpoint.Index)
+	digest := sha256.Sum256(canonical[:])
+	var id seglog.WaveID
+	copy(id[:], digest[:])
+	return id
+}
+
 func (s *NodeStore) publishCheckpoint(group uint64, snapshot *pb.Snapshot) (seglog.Checkpoint, error) {
 	if snapshot == nil || snapshot.GetMetadata() == nil || snapshot.GetMetadata().GetConfState() == nil {
 		return seglog.Checkpoint{}, ErrInvalid
@@ -654,6 +666,97 @@ func syncNodeDirectory(path string) error {
 		return err
 	}
 	return errors.Join(directory.Sync(), directory.Close())
+}
+
+// publishGroupCheckpointSequenced durably publishes an application checkpoint
+// and then references it from the shared log. It is called only by the device
+// sequencer, which makes the logical prefix truncation an ordered control wave.
+func (s *NodeStore) publishGroupCheckpointSequenced(group uint64, snapshot *pb.Snapshot) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.poisoned != nil {
+		if s.poisoned != nil {
+			return errors.Join(ErrPersistenceUnknown, s.poisoned)
+		}
+		return ErrClosed
+	}
+	if err := s.proveNamespace(); err != nil {
+		s.poisoned = err
+		return errors.Join(ErrPersistenceUnknown, err)
+	}
+	descriptor, registered := s.descriptorForLogKey(group)
+	if !registered || validateSnapshotBase(snapshot, descriptor.MemberID) != nil {
+		return ErrInvalid
+	}
+	metadata, ok := s.engine.Metadata(group)
+	if !ok {
+		return ErrInvalid
+	}
+	index, term := snapshot.GetMetadata().GetIndex(), snapshot.GetMetadata().GetTerm()
+	if index < metadata.Checkpoint.Index || index > metadata.Hard.Commit {
+		return ErrInvalid
+	}
+	if index == metadata.Checkpoint.Index {
+		if term != metadata.Checkpoint.Term {
+			return ErrRetryConflict
+		}
+		current, err := s.loadCheckpoint(group, metadata.Checkpoint)
+		if err != nil {
+			return err
+		}
+		currentBytes, err := marshalSnapshot(current)
+		if err != nil {
+			return err
+		}
+		candidateBytes, err := marshalSnapshot(snapshot)
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(currentBytes, candidateBytes) {
+			return ErrRetryConflict
+		}
+		return nil
+	}
+	_, storedTerm, compacted, found, err := s.engine.LookupExact(group, index)
+	if err != nil {
+		return err
+	}
+	if compacted || !found || storedTerm != term {
+		return ErrInvalid
+	}
+	checkpoint, err := s.publishCheckpoint(group, snapshot)
+	if err != nil {
+		return err
+	}
+	s.waveCheckpoint[0] = checkpoint
+	s.waveBatches[0] = seglog.ReadyBatch{GroupID: group, Checkpoint: &s.waveCheckpoint[0]}
+	if s.checkpointHookTest != nil {
+		if err = s.checkpointHookTest(CheckpointBeforeLogReference); err != nil {
+			return err
+		}
+	}
+	wave := seglog.Wave{ID: checkpointWaveID(group, checkpoint), Batches: s.waveBatches[:1]}
+	if s.persistWaveTest != nil {
+		err = s.persistWaveTest(wave)
+	} else {
+		err = s.engine.PersistWave(wave)
+	}
+	if err != nil {
+		if fatal := s.engine.FatalError(); fatal != nil {
+			s.poisoned = fatal
+			return errors.Join(ErrPersistenceUnknown, err, fatal)
+		}
+		if errors.Is(err, seglog.ErrBackpressure) {
+			return errors.Join(ErrDurabilityBackpressure, err)
+		}
+		return errors.Join(ErrInvalid, err)
+	}
+	if err = s.proveNamespace(); err != nil {
+		s.poisoned = err
+		return errors.Join(ErrPersistenceUnknown, err)
+	}
+	s.cacheValid = false
+	return nil
 }
 
 func (s *NodeStore) PersistWave(ready []NodeReady) error { return s.persistWave(ready, false) }

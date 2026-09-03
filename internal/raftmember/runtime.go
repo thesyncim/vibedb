@@ -435,6 +435,7 @@ type Runtime struct {
 	node            *raftmodel.Node
 	identity        RuntimeIdentity
 	walGeneration   *walGenerationDriver
+	nodeCheckpoint  *nodeCheckpointDriver
 	schemaWALResume *WALGenerationDriverOptions
 	pipelined       *pipelinedRuntime
 	nodePersistence *NodeRuntimePersistence
@@ -1267,6 +1268,9 @@ func (runtime *Runtime) Tick() error {
 		}
 		return err
 	}
+	if err := runtime.driveNodeCheckpoint(true); err != nil {
+		return runtime.fail(err)
+	}
 	runtime.tickWALGeneration()
 	return runtime.node.Tick()
 }
@@ -1299,6 +1303,9 @@ func (runtime *Runtime) DriveReady(
 ) (DriveResult, error) {
 	if err := runtime.checkUsable(); err != nil {
 		return DriveResult{}, err
+	}
+	if err := runtime.driveNodeCheckpoint(false); err != nil {
+		return DriveResult{}, runtime.fail(err)
 	}
 	if runtime.pipelined != nil {
 		return runtime.drivePipelinedReady(workspace, send, settle)
@@ -1641,12 +1648,20 @@ func (runtime *Runtime) Close() error {
 		return ErrResultSettlementPending
 	}
 	runtime.stopping = true
+	var checkpointErr error
 	if runtime.pipelined != nil {
 		runtime.pipelined.stopAppendWorker()
 		if runtime.nodePersistence != nil {
 			runtime.nodePersistence.sequencer.SetWakeFor(&runtime.nodePersistence.cell, nil)
 		}
 		runtime.pipelined = nil
+	}
+	if runtime.nodeCheckpoint != nil {
+		checkpointErr = runtime.nodeCheckpoint.stopAndWait(runtime.nodePersistence)
+		if runtime.nodePersistence != nil {
+			runtime.nodePersistence.sequencer.SetWakeFor(&runtime.nodePersistence.checkpoint, nil)
+		}
+		runtime.nodeCheckpoint = nil
 	}
 	if runtime.walGeneration != nil {
 		runtime.walGeneration.stopAndWait()
@@ -1662,24 +1677,24 @@ func (runtime *Runtime) Close() error {
 	runtime.node = nil
 	if runtime.apply != nil {
 		if err := runtime.apply.Close(); err != nil {
-			return err
+			return errors.Join(checkpointErr, err)
 		}
 		runtime.apply = nil
 	}
 	if runtime.database != nil {
 		if err := runtime.database.Close(); err != nil {
-			return err
+			return errors.Join(checkpointErr, err)
 		}
 		runtime.database = nil
 	}
 	if runtime.wal != nil {
 		if err := runtime.wal.Close(); err != nil {
-			return err
+			return errors.Join(checkpointErr, err)
 		}
 		runtime.wal = nil
 	}
 	runtime.stable = nil
 	runtime.nodePersistence = nil
 	runtime.closed = true
-	return nil
+	return checkpointErr
 }
