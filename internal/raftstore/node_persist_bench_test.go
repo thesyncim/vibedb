@@ -12,7 +12,7 @@ import (
 
 func BenchmarkNodeStoreOpenDescriptorCatalog256Groups(b *testing.B) {
 	dir := filepath.Join(b.TempDir(), "node")
-	options := NodeStoreOptions{Store: testOptions(), FrameBytes: 1 << 20, Events: 4096, WaveIDs: 1024, EntriesPerGroup: 64, CachedSegments: 2, Groups: 512}
+	options := NodeStoreOptions{MaxWaveBytes: 1 << 20, MaxSegmentEvents: 4096, RecentWaves: 1024, MaxEntriesPerGroup: 64, ReaderSlots: 2, MaxGroups: 512}
 	store, err := CreateNodeStore(dir, testNodeIdentity(), testKey(), []NodeBootstrap{{Descriptor: testGroupDescriptor(1), Snapshot: nodeSnapshot(1, 1, 1)}}, options)
 	if err != nil {
 		b.Fatal(err)
@@ -68,13 +68,12 @@ func BenchmarkNodeStorePersistDurability(b *testing.B) {
 		b.Run(fmt.Sprintf("groups=%d", groups), func(b *testing.B) {
 			b.StopTimer()
 			options := NodeStoreOptions{
-				Store:           testOptions(),
-				FrameBytes:      1 << 20,
-				Events:          128 << 10,
-				WaveIDs:         32 << 10,
-				EntriesPerGroup: 32 << 10,
-				CachedSegments:  1,
-				Groups:          64,
+				MaxWaveBytes:       1 << 20,
+				MaxSegmentEvents:   128 << 10,
+				RecentWaves:        32 << 10,
+				MaxEntriesPerGroup: raftmodel.MaxMessageEntries,
+				ReaderSlots:        1,
+				MaxGroups:          64,
 			}
 			bootstraps := make([]NodeBootstrap, groups)
 			groupKeys := make([]uint64, groups)

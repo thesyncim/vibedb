@@ -646,7 +646,7 @@ func TestReserveCannotShrinkActiveSealBudget(t *testing.T) {
 	}
 }
 
-func TestSealEOFNeverExceedsReservedCapacity(t *testing.T) {
+func TestAutomaticRotationNeverExceedsReservedCapacity(t *testing.T) {
 	dir := t.TempDir()
 	const capacity = 256 << 10
 	e, err := CreateEngineAuthenticated(dir, testLogID, testAuthKey, capacity)
@@ -661,33 +661,43 @@ func TestSealEOFNeverExceedsReservedCapacity(t *testing.T) {
 		t.Fatal(err)
 	}
 	payload := bytes.Repeat([]byte{7}, 8<<10)
-	var accepted uint64
 	for i := uint64(1); i <= 128; i++ {
-		err = e.PersistWave(Wave{ID: waveID(i), Batches: []ReadyBatch{{GroupID: 1, Entries: []Entry{{Index: i, Term: 1, Data: payload}}}}})
-		if errors.Is(err, ErrBounds) {
-			break
+		wave := Wave{ID: waveID(i), Batches: []ReadyBatch{{GroupID: 1, Entries: []Entry{{Index: i, Term: 1, Data: payload}}}}}
+		for {
+			err = e.PersistWave(wave)
+			if !errors.Is(err, ErrBackpressure) {
+				break
+			}
+			if err = e.WaitSeal(); err != nil {
+				t.Fatal(err)
+			}
 		}
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("wave %d: %v", i, err)
 		}
-		accepted = i
 	}
-	if accepted == 0 || err == nil {
-		t.Fatalf("accepted=%d terminal=%v", accepted, err)
+	if err = e.Rotate(nil); errors.Is(err, ErrBackpressure) {
+		if err = e.WaitSeal(); err == nil {
+			err = e.Rotate(nil)
+		}
 	}
-	if err = e.Rotate(nil); err != nil {
+	if err != nil {
 		t.Fatal(err)
 	}
 	if err = e.WaitSeal(); err != nil {
 		t.Fatal(err)
 	}
-	segment := e.log.state.Segments[0]
-	stat, err := os.Stat(segmentPath(dir, segment.FileID))
-	if err != nil {
-		t.Fatal(err)
+	if len(e.log.state.Segments) < 2 {
+		t.Fatalf("automatic rotations=%d, want at least 2", len(e.log.state.Segments))
 	}
-	if stat.Size() > capacity {
-		t.Fatalf("sealed EOF=%d capacity=%d", stat.Size(), capacity)
+	for _, segment := range e.log.state.Segments {
+		stat, statErr := os.Stat(segmentPath(dir, segment.FileID))
+		if statErr != nil {
+			t.Fatal(statErr)
+		}
+		if stat.Size() > capacity {
+			t.Fatalf("segment %d EOF=%d capacity=%d", segment.ID, stat.Size(), capacity)
+		}
 	}
 }
 
@@ -1216,12 +1226,12 @@ func TestSealerDoesNotOpenHistoricalSegments(t *testing.T) {
 func TestSegmentSummaryCapacityRejectsBeforeMutation(t *testing.T) {
 	e := newReservedEngine(t, 1, 2)
 	e.activeBuild = &segmentBuildArena{groups: make([]segmentGroupBuild, 0, 1)}
-	if err := e.PersistWave(Wave{ID: waveID(1), Batches: []ReadyBatch{{GroupID: 1, Entries: []Entry{{Index: 1, Term: 1, Data: []byte("one")}}}}}); err != nil {
-		t.Fatal(err)
-	}
 	beforeOffset, beforeSequence, beforeEvents := e.log.activeOffset, e.sequence, len(e.log.events)
 	for retry := 0; retry < 2; retry++ {
-		err := e.PersistWave(Wave{ID: waveID(uint64(2 + retry)), Batches: []ReadyBatch{{GroupID: 2, Entries: []Entry{{Index: 1, Term: 1, Data: []byte("two")}}}}})
+		err := e.PersistWave(Wave{ID: waveID(uint64(1 + retry)), Batches: []ReadyBatch{
+			{GroupID: 1, Entries: []Entry{{Index: 1, Term: 1, Data: []byte("one")}}},
+			{GroupID: 2, Entries: []Entry{{Index: 1, Term: 1, Data: []byte("two")}}},
+		}})
 		if !errors.Is(err, ErrBounds) {
 			t.Fatalf("retry %d error=%v", retry, err)
 		}

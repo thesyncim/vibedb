@@ -203,7 +203,7 @@ func TestNodeSubmissionSequencerMPSCConcurrentTickets(t *testing.T) {
 
 func TestNodeSubmissionSequencerFusesRealNodeStoreEngineCalls(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "node")
-	options := NodeStoreOptions{Store: testOptions(), FrameBytes: 1 << 20, Events: 256, WaveIDs: 64, EntriesPerGroup: 64, CachedSegments: 1}
+	options := NodeStoreOptions{MaxWaveBytes: 1 << 20, MaxSegmentEvents: 256, RecentWaves: 64, MaxEntriesPerGroup: 64, ReaderSlots: 1}
 	bootstraps := make([]NodeBootstrap, 8)
 	for i := range bootstraps {
 		group := uint64(i + 1)
@@ -271,7 +271,7 @@ func TestNodeSubmissionSequencerFusesRealNodeStoreEngineCalls(t *testing.T) {
 
 func TestNodeSubmissionSequencerOrdersIncarnationControlAsWaveBoundary(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "node")
-	options := NodeStoreOptions{Store: testOptions(), FrameBytes: 1 << 20, Events: 128, WaveIDs: 32, EntriesPerGroup: 32, CachedSegments: 1}
+	options := NodeStoreOptions{MaxWaveBytes: 1 << 20, MaxSegmentEvents: 128, RecentWaves: 32, MaxEntriesPerGroup: 32, ReaderSlots: 1}
 	store, err := CreateNodeStore(dir, testNodeIdentity(), testKey(), []NodeBootstrap{
 		{Descriptor: testGroupDescriptor(1), Snapshot: nodeSnapshot(1, 1, 1)},
 		{Descriptor: testGroupDescriptor(2), Snapshot: nodeSnapshot(2, 1, 1)},
@@ -336,7 +336,7 @@ func TestNodeSubmissionSequencerOrdersIncarnationControlAsWaveBoundary(t *testin
 
 func TestNodeSubmissionSequencerRegistersExactGroupInTicketStream(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "node")
-	options := NodeStoreOptions{Store: testOptions(), FrameBytes: 1 << 20, Events: 128, WaveIDs: 32, EntriesPerGroup: 32, CachedSegments: 1, Groups: 8}
+	options := NodeStoreOptions{MaxWaveBytes: 1 << 20, MaxSegmentEvents: 128, RecentWaves: 32, MaxEntriesPerGroup: 32, ReaderSlots: 1, MaxGroups: 8}
 	store, err := CreateNodeStore(dir, testNodeIdentity(), testKey(), []NodeBootstrap{{Descriptor: testGroupDescriptor(20), Snapshot: nodeSnapshot(1, 1, 1)}}, options)
 	if err != nil {
 		t.Fatal(err)
@@ -397,7 +397,7 @@ func TestSubmissionControlPrepareZeroAlloc(t *testing.T) {
 
 func TestNodeStoreCloseDrainsSequencerAndRejectsDirectCalls(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "node")
-	options := NodeStoreOptions{Store: testOptions(), FrameBytes: 1 << 20, Events: 64, WaveIDs: 16, EntriesPerGroup: 16, CachedSegments: 1}
+	options := NodeStoreOptions{MaxWaveBytes: 1 << 20, MaxSegmentEvents: 64, RecentWaves: 16, MaxEntriesPerGroup: 16, ReaderSlots: 1}
 	store, err := CreateNodeStore(dir, testNodeIdentity(), testKey(), []NodeBootstrap{{Descriptor: testGroupDescriptor(1), Snapshot: nodeSnapshot(1, 1, 1)}}, options)
 	if err != nil {
 		t.Fatal(err)

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 var (
@@ -442,7 +443,20 @@ func (q *NodeSubmissionSequencer) runWave(items *[MaxPersistGroupBatches]*Submis
 		}
 		ready[at] = value
 	}
-	err = q.persist(ready[:count])
+	for {
+		err = q.persist(ready[:count])
+		if !errors.Is(err, ErrDurabilityBackpressure) {
+			break
+		}
+		if waitErr := q.store.engine.WaitSeal(); waitErr != nil {
+			err = errors.Join(ErrPersistenceUnknown, err, waitErr)
+			break
+		}
+		// Backpressure without a pending seal means the background metadata
+		// lane is replenishing reserves or checkpointing the catalog. Yield the
+		// device sequencer so that maintenance can publish its fixed-size slot.
+		time.Sleep(50 * time.Microsecond)
+	}
 	clear(ready[:count])
 	return err
 }

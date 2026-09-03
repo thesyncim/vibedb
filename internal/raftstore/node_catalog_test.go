@@ -11,7 +11,7 @@ import (
 )
 
 func descriptorCatalogTestOptions(groups int) NodeStoreOptions {
-	return NodeStoreOptions{Store: testOptions(), FrameBytes: 1 << 20, Events: 512, WaveIDs: 128, EntriesPerGroup: 64, CachedSegments: 2, Groups: groups}
+	return NodeStoreOptions{MaxWaveBytes: 1 << 20, MaxSegmentEvents: 512, RecentWaves: 128, MaxEntriesPerGroup: 64, ReaderSlots: 2, MaxGroups: groups}
 }
 
 func createDescriptorCatalogTestStore(t *testing.T, groups int) (string, *NodeStore, NodeStoreOptions) {

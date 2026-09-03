@@ -41,7 +41,7 @@ func testGroupDescriptor(key uint64) GroupDescriptor {
 
 func TestNodeStoreUsesOnlyCanonicalNodeMetadataName(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "node")
-	options := NodeStoreOptions{Store: testOptions(), FrameBytes: 1 << 20, Events: 64, WaveIDs: 16, EntriesPerGroup: 16, CachedSegments: 1}
+	options := NodeStoreOptions{MaxWaveBytes: 1 << 20, MaxSegmentEvents: 64, RecentWaves: 16, MaxEntriesPerGroup: 16, ReaderSlots: 1}
 	store, err := CreateNodeStore(dir, testNodeIdentity(), testKey(), []NodeBootstrap{{Descriptor: testGroupDescriptor(10), Snapshot: nodeSnapshot(10, 1, 1)}}, options)
 	if err != nil {
 		t.Fatal(err)
@@ -68,7 +68,7 @@ func TestNodeStoreUsesOnlyCanonicalNodeMetadataName(t *testing.T) {
 
 func TestNodeStoreAuthenticatesCompleteCapacityGeometry(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "node")
-	options := NodeStoreOptions{Store: testOptions(), FrameBytes: 1 << 20, Events: 64, WaveIDs: 16, EntriesPerGroup: 16, CachedSegments: 1, Groups: 8}
+	options := NodeStoreOptions{SegmentBytes: DefaultNodeSegmentBytes, MaxWaveBytes: 1 << 20, MaxSegmentEvents: 64, RecentWaves: 16, MaxEntriesPerGroup: 16, ReaderSlots: 1, MaxGroups: 8}
 	store, err := CreateNodeStore(dir, testNodeIdentity(), testKey(), []NodeBootstrap{{Descriptor: testGroupDescriptor(10), Snapshot: nodeSnapshot(10, 1, 1)}}, options)
 	if err != nil {
 		t.Fatal(err)
@@ -80,12 +80,13 @@ func TestNodeStoreAuthenticatesCompleteCapacityGeometry(t *testing.T) {
 		name   string
 		mutate func(*NodeStoreOptions)
 	}{
-		{"frame-bytes", func(o *NodeStoreOptions) { o.FrameBytes++ }},
-		{"events", func(o *NodeStoreOptions) { o.Events++ }},
-		{"wave-ids", func(o *NodeStoreOptions) { o.WaveIDs++ }},
-		{"entries-per-group", func(o *NodeStoreOptions) { o.EntriesPerGroup++ }},
-		{"cached-segments", func(o *NodeStoreOptions) { o.CachedSegments++ }},
-		{"groups", func(o *NodeStoreOptions) { o.Groups++ }},
+		{"segment-bytes", func(o *NodeStoreOptions) { o.SegmentBytes++ }},
+		{"max-wave-bytes", func(o *NodeStoreOptions) { o.MaxWaveBytes++ }},
+		{"max-segment-events", func(o *NodeStoreOptions) { o.MaxSegmentEvents++ }},
+		{"recent-waves", func(o *NodeStoreOptions) { o.RecentWaves++ }},
+		{"max-entries-per-group", func(o *NodeStoreOptions) { o.MaxEntriesPerGroup++ }},
+		{"reader-slots", func(o *NodeStoreOptions) { o.ReaderSlots++ }},
+		{"max-groups", func(o *NodeStoreOptions) { o.MaxGroups++ }},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -107,9 +108,113 @@ func TestNodeStoreAuthenticatesCompleteCapacityGeometry(t *testing.T) {
 	_ = reopened.Close()
 }
 
+func TestDefaultNodeGeometryIsUsableAndSpaceBounded(t *testing.T) {
+	options, err := defaultNodeOptions(NodeStoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if options.SegmentBytes != DefaultNodeSegmentBytes || options.MaxWaveBytes != DefaultNodeMaxWaveBytes ||
+		options.MaxSegmentEvents != DefaultNodeMaxSegmentEvents || options.RecentWaves != DefaultNodeRecentWaves ||
+		options.MaxEntriesPerGroup != DefaultNodeMaxEntriesPerGroup || options.ReaderSlots != DefaultNodeReaderSlots ||
+		options.MaxGroups != DefaultNodeMaxGroups {
+		t.Fatalf("default node geometry=%+v", options)
+	}
+	if options.SegmentBytes*3 != 96<<20 {
+		t.Fatalf("active plus two reserves=%d, want %d", options.SegmentBytes*3, 96<<20)
+	}
+	dir := filepath.Join(t.TempDir(), "node")
+	store, err := CreateNodeStore(dir, testNodeIdentity(), testKey(), []NodeBootstrap{{Descriptor: testGroupDescriptor(10), Snapshot: nodeSnapshot(10, 1, 1)}}, NodeStoreOptions{})
+	if err != nil {
+		t.Fatalf("zero-value create: %v", err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = OpenNodeStore(dir, testNodeIdentity(), testKey(), NodeStoreOptions{})
+	if err != nil {
+		t.Fatalf("zero-value reopen: %v", err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNodeSequencerAutomaticallyRotatesAndReopens(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "node")
+	options := NodeStoreOptions{
+		SegmentBytes: 1 << 20, MaxWaveBytes: 64 << 10, MaxSegmentEvents: 128,
+		RecentWaves: 64, MaxEntriesPerGroup: 16, ReaderSlots: 2, MaxGroups: 8,
+	}
+	store, err := CreateNodeStore(dir, testNodeIdentity(), testKey(), []NodeBootstrap{{Descriptor: testGroupDescriptor(10), Snapshot: nodeSnapshot(10, 1, 1)}}, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	incarnations, err := store.BeginIncarnations([]uint64{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sequencer, err := NewNodeSubmissionSequencer(store, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var submission Submission
+	if err = submission.Initialize(); err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte{'r'}, 48<<10)
+	for readyID := uint64(1); readyID <= 40; readyID++ {
+		index := readyID + 1
+		entry := typedEntry(index, 2, pb.EntryNormal, string(payload))
+		batch := raftmodel.PersistBatch{NodeIncarnation: incarnations[0].Incarnation, ReadyID: readyID, Entries: []*pb.Entry{entry}, HardState: hard(2, index)}
+		if err = submission.Prepare(NodeReady{GroupID: 1, Batch: batch}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = sequencer.TrySubmit(&submission); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = submission.Wait(); err != nil {
+			t.Fatalf("Ready %d: %v", readyID, err)
+		}
+	}
+	logFiles, err := os.ReadDir(filepath.Join(dir, nodeLogDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	segmentFiles := 0
+	for _, file := range logFiles {
+		if len(file.Name()) >= len("segment-") && file.Name()[:len("segment-")] == "segment-" {
+			segmentFiles++
+		}
+	}
+	if segmentFiles < 5 {
+		t.Fatalf("segment files=%d, want active, two reserves, and at least two sealed", segmentFiles)
+	}
+	if err = sequencer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenNodeStore(dir, testNodeIdentity(), testKey(), options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	entries, err := reopened.Group(1).Entries(2, 42, ^uint64(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 40 {
+		t.Fatalf("reopened entries=%d, want 40", len(entries))
+	}
+	if entries[0].GetIndex() != 2 || entries[39].GetIndex() != 41 || !bytes.Equal(entries[39].GetData(), payload) {
+		t.Fatalf("reopened first/last=%d/%d", entries[0].GetIndex(), entries[39].GetIndex())
+	}
+}
+
 func TestNodeStoreDescriptorEnrollmentIsAtomicMonotonicAndReopens(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "node")
-	options := NodeStoreOptions{Store: testOptions(), FrameBytes: 1 << 20, Events: 128, WaveIDs: 32, EntriesPerGroup: 32, CachedSegments: 1, Groups: 8}
+	options := NodeStoreOptions{MaxWaveBytes: 1 << 20, MaxSegmentEvents: 128, RecentWaves: 32, MaxEntriesPerGroup: 32, ReaderSlots: 1, MaxGroups: 8}
 	initial := testGroupDescriptor(20)
 	store, err := CreateNodeStore(dir, testNodeIdentity(), testKey(), []NodeBootstrap{{Descriptor: initial, Snapshot: nodeSnapshot(1, 1, 1)}}, options)
 	if err != nil {
@@ -171,7 +276,7 @@ func TestNodeStoreDescriptorEnrollmentIsAtomicMonotonicAndReopens(t *testing.T) 
 
 func TestNodeStoreRejectsCheckpointCollisionAndNamespaceReplacement(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "node")
-	options := NodeStoreOptions{Store: testOptions(), FrameBytes: 1 << 20, Events: 64, WaveIDs: 16, EntriesPerGroup: 16, CachedSegments: 1}
+	options := NodeStoreOptions{MaxWaveBytes: 1 << 20, MaxSegmentEvents: 64, RecentWaves: 16, MaxEntriesPerGroup: 16, ReaderSlots: 1}
 	snapshot := nodeSnapshot(10, 1, 1)
 	store, err := CreateNodeStore(dir, testNodeIdentity(), testKey(), []NodeBootstrap{{Descriptor: testGroupDescriptor(10), Snapshot: snapshot}}, options)
 	if err != nil {
@@ -227,7 +332,7 @@ func typedEntry(index, term uint64, kind pb.EntryType, data string) *pb.Entry {
 
 func TestNodeStoreMultiGroupRetryAndReopen(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "node")
-	options := NodeStoreOptions{Store: testOptions(), FrameBytes: 1 << 20, Events: 256, WaveIDs: 64, EntriesPerGroup: 64, CachedSegments: 2}
+	options := NodeStoreOptions{MaxWaveBytes: 1 << 20, MaxSegmentEvents: 256, RecentWaves: 64, MaxEntriesPerGroup: 64, ReaderSlots: 2}
 	store, err := CreateNodeStore(dir, testNodeIdentity(), testKey(), []NodeBootstrap{
 		{Descriptor: testGroupDescriptor(10), Snapshot: nodeSnapshot(10, 1, 1)},
 		{Descriptor: testGroupDescriptor(20), Snapshot: nodeSnapshot(20, 1, 1)},
@@ -303,7 +408,7 @@ func TestNodeStoreMultiGroupRetryAndReopen(t *testing.T) {
 
 func TestNodeStoreSharedBoundedExtentsRotateReopen(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "node")
-	options := NodeStoreOptions{Store: testOptions(), FrameBytes: 1 << 20, Events: 64, WaveIDs: 16, EntriesPerGroup: 16, CachedSegments: 2}
+	options := NodeStoreOptions{MaxWaveBytes: 1 << 20, MaxSegmentEvents: 64, RecentWaves: 16, MaxEntriesPerGroup: 16, ReaderSlots: 2}
 	store, err := CreateNodeStore(dir, testNodeIdentity(), testKey(), []NodeBootstrap{{Descriptor: testGroupDescriptor(10), Snapshot: nodeSnapshot(10, 1, 1)}, {Descriptor: testGroupDescriptor(20), Snapshot: nodeSnapshot(20, 1, 1)}}, options)
 	if err != nil {
 		t.Fatal(err)
@@ -366,7 +471,7 @@ func TestNodeStoreSharedBoundedExtentsRotateReopen(t *testing.T) {
 
 func TestNodeStoreEmptyAndOversizeExtentPacking(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "node")
-	options := NodeStoreOptions{Store: testOptions(), FrameBytes: 1 << 20, Events: 32, WaveIDs: 16, EntriesPerGroup: 16, CachedSegments: 1}
+	options := NodeStoreOptions{MaxWaveBytes: 1 << 20, MaxSegmentEvents: 32, RecentWaves: 16, MaxEntriesPerGroup: 16, ReaderSlots: 1}
 	store, err := CreateNodeStore(dir, testNodeIdentity(), testKey(), []NodeBootstrap{{Descriptor: testGroupDescriptor(10), Snapshot: nodeSnapshot(10, 1, 1)}, {Descriptor: testGroupDescriptor(20), Snapshot: nodeSnapshot(20, 1, 1)}}, options)
 	if err != nil {
 		t.Fatal(err)
@@ -403,7 +508,7 @@ func TestNodeStoreEmptyAndOversizeExtentPacking(t *testing.T) {
 
 func TestNodeStorePreparedReadAndTermZeroAlloc(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "node")
-	options := NodeStoreOptions{Store: testOptions(), FrameBytes: 1 << 20, Events: 64, WaveIDs: 16, EntriesPerGroup: 16, CachedSegments: 1}
+	options := NodeStoreOptions{MaxWaveBytes: 1 << 20, MaxSegmentEvents: 64, RecentWaves: 16, MaxEntriesPerGroup: 16, ReaderSlots: 1}
 	store, err := CreateNodeStore(dir, testNodeIdentity(), testKey(), []NodeBootstrap{{Descriptor: testGroupDescriptor(10), Snapshot: nodeSnapshot(10, 1, 1)}}, options)
 	if err != nil {
 		t.Fatal(err)
@@ -417,8 +522,8 @@ func TestNodeStorePreparedReadAndTermZeroAlloc(t *testing.T) {
 		t.Fatal(err)
 	}
 	view := store.Group(1)
-	ciphertext := make([]byte, options.FrameBytes)
-	plaintext := make([]byte, options.FrameBytes)
+	ciphertext := make([]byte, options.MaxWaveBytes)
+	plaintext := make([]byte, options.MaxWaveBytes)
 	if _, err = view.ReadEntryInto(2, ciphertext, plaintext); err != nil {
 		t.Fatal(err)
 	}
@@ -442,7 +547,7 @@ func TestNodeStorePreparedReadAndTermZeroAlloc(t *testing.T) {
 
 func TestNodeStorePreparedPersistZeroAlloc(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "node")
-	options := NodeStoreOptions{Store: testOptions(), FrameBytes: 1 << 20, Events: 128, WaveIDs: 64, EntriesPerGroup: 64, CachedSegments: 1}
+	options := NodeStoreOptions{MaxWaveBytes: 1 << 20, MaxSegmentEvents: 128, RecentWaves: 64, MaxEntriesPerGroup: 64, ReaderSlots: 1}
 	store, err := CreateNodeStore(dir, testNodeIdentity(), testKey(), []NodeBootstrap{{Descriptor: testGroupDescriptor(10), Snapshot: nodeSnapshot(10, 1, 1)}}, options)
 	if err != nil {
 		t.Fatal(err)
@@ -473,7 +578,7 @@ func TestNodeStorePreparedPersistZeroAlloc(t *testing.T) {
 
 func TestNodeStoreIncarnationWaveRecoveryAndFence(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "node")
-	options := NodeStoreOptions{Store: testOptions(), FrameBytes: 1 << 20, Events: 64, WaveIDs: 32, EntriesPerGroup: 16, CachedSegments: 1}
+	options := NodeStoreOptions{MaxWaveBytes: 1 << 20, MaxSegmentEvents: 64, RecentWaves: 32, MaxEntriesPerGroup: 16, ReaderSlots: 1}
 	store, err := CreateNodeStore(dir, testNodeIdentity(), testKey(), []NodeBootstrap{{Descriptor: testGroupDescriptor(10), Snapshot: nodeSnapshot(10, 1, 1)}, {Descriptor: testGroupDescriptor(20), Snapshot: nodeSnapshot(20, 1, 1)}}, options)
 	if err != nil {
 		t.Fatal(err)
@@ -514,7 +619,7 @@ func TestNodeStoreCheckpointPublicationCrashPhases(t *testing.T) {
 	for _, phase := range []CheckpointPhase{CheckpointTempWritten, CheckpointFileSynced, CheckpointRenamed, CheckpointDirectorySynced, CheckpointBeforeLogReference} {
 		t.Run(fmt.Sprint(phase), func(t *testing.T) {
 			dir := filepath.Join(t.TempDir(), "node")
-			options := NodeStoreOptions{Store: testOptions(), FrameBytes: 1 << 20, Events: 64, WaveIDs: 16, EntriesPerGroup: 16, CachedSegments: 1}
+			options := NodeStoreOptions{MaxWaveBytes: 1 << 20, MaxSegmentEvents: 64, RecentWaves: 16, MaxEntriesPerGroup: 16, ReaderSlots: 1}
 			store, err := CreateNodeStore(dir, testNodeIdentity(), testKey(), []NodeBootstrap{{Descriptor: testGroupDescriptor(10), Snapshot: nodeSnapshot(10, 1, 1)}}, options)
 			if err != nil {
 				t.Fatal(err)
@@ -560,7 +665,7 @@ func TestNodeStoreCheckpointPublicationCrashPhases(t *testing.T) {
 
 func TestNodeStoreCheckpointUnknownLogSyncRecoversReference(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "node")
-	options := NodeStoreOptions{Store: testOptions(), FrameBytes: 1 << 20, Events: 64, WaveIDs: 16, EntriesPerGroup: 16, CachedSegments: 1}
+	options := NodeStoreOptions{MaxWaveBytes: 1 << 20, MaxSegmentEvents: 64, RecentWaves: 16, MaxEntriesPerGroup: 16, ReaderSlots: 1}
 	store, err := CreateNodeStore(dir, testNodeIdentity(), testKey(), []NodeBootstrap{{Descriptor: testGroupDescriptor(10), Snapshot: nodeSnapshot(10, 1, 1)}}, options)
 	if err != nil {
 		t.Fatal(err)

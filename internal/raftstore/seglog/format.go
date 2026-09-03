@@ -35,6 +35,10 @@ const (
 	segmentFooterBytes   = 160
 	maxSegmentIndexBytes = 64 << 20
 	maxRecordBytes       = 64 << 20
+	// MaximumWaveBytes is the exact encoded-frame ceiling accepted by the
+	// canonical node log. Node admission geometry is sealed independently of
+	// segment capacity and must never advertise a larger wave.
+	MaximumWaveBytes = maxRecordBytes
 )
 
 var _ [40 - recordHeaderBytes]byte

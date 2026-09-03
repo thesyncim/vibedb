@@ -21,6 +21,7 @@ import (
 var (
 	ErrWaveConflict = errors.New("seglog: wave ID reused with different payload")
 	ErrRaftState    = errors.New("seglog: illegal Raft durable state")
+	ErrBackpressure = fmt.Errorf("%w: durability capacity maintenance pending", ErrBounds)
 )
 
 const engineWaveGroup = ^uint64(0)
@@ -304,11 +305,20 @@ func (e *Engine) Close() error {
 // that need the frozen segment published before reclamation. PersistWave does
 // not wait for it.
 func (e *Engine) WaitSeal() error {
+	e.writeMu.Lock()
 	if !e.sealPending {
-		return nil
+		err := e.log.usable()
+		e.writeMu.Unlock()
+		return err
 	}
+	e.writeMu.Unlock()
 	err := <-e.sealResults
+	e.writeMu.Lock()
 	e.sealPending = false
+	if err == nil {
+		err = e.log.usable()
+	}
+	e.writeMu.Unlock()
 	return err
 }
 
@@ -702,11 +712,27 @@ func (e *Engine) PersistWave(w Wave) error {
 	if err != nil {
 		return err
 	}
-	if len(e.log.events)+len(events) > cap(e.log.events) {
-		return ErrBounds
+	if !e.waveFitsActive(w, len(frame), len(events)) {
+		if e.log.activeOffset == segmentHeaderBytes {
+			if e.sealPending {
+				return ErrBackpressure
+			}
+			return ErrBounds
+		}
+		if err = e.rotateLocked(nil); err != nil {
+			return err
+		}
+		if !e.waveFitsActive(w, len(frame), len(events)) {
+			// Frozen locations remain in the group indexes until the asynchronous
+			// seal publishes its compact routes. The device sequencer waits on the
+			// seal and retries the exact WaveID; no accepted Ready is discarded.
+			return ErrBackpressure
+		}
 	}
-	if e.sealHeadroom == 0 || e.log.activeOffset > e.log.state.SegmentCapacity-e.sealHeadroom || uint64(len(frame)) > e.log.state.SegmentCapacity-e.sealHeadroom-e.log.activeOffset {
-		return ErrBounds
+	for i := range w.Batches {
+		if !e.activeBuild.touch(e.groups[w.Batches[i].GroupID], e.log.state.ActiveID) {
+			return ErrBounds
+		}
 	}
 	offset := e.log.activeOffset
 	sequence := e.sequence + 1
@@ -740,6 +766,27 @@ func (e *Engine) PersistWave(w Wave) error {
 	}
 	e.applySequence = 0
 	return nil
+}
+
+func (e *Engine) waveFitsActive(w Wave, frameBytes, events int) bool {
+	if e.sealHeadroom == 0 || frameBytes < 0 || events < 0 ||
+		len(e.log.events)+events > cap(e.log.events) ||
+		e.log.activeOffset > e.log.state.SegmentCapacity-e.sealHeadroom ||
+		uint64(frameBytes) > e.log.state.SegmentCapacity-e.sealHeadroom-e.log.activeOffset {
+		return false
+	}
+	missingBuildGroups := 0
+	for i := range w.Batches {
+		batch := &w.Batches[i]
+		group := e.groups[batch.GroupID]
+		if group == nil || len(group.Entries)-replacementCount(group.Entries, batch.ReplaceFrom)+len(batch.Entries) > cap(group.Entries) {
+			return false
+		}
+		if group.buildSegmentID != e.log.state.ActiveID {
+			missingBuildGroups++
+		}
+	}
+	return e.activeBuild != nil && missingBuildGroups <= cap(e.activeBuild.groups)-len(e.activeBuild.groups)
 }
 
 func (e *Engine) reclaimedWaveStates(batches []ReadyBatch) int {
@@ -784,7 +831,7 @@ func (e *Engine) prepareWave(w Wave, validateState bool) ([]byte, [32]byte, []se
 	if validateState && (e.log == nil || e.activeBuild == nil) {
 		return nil, [32]byte{}, nil, ErrBounds
 	}
-	if encodedBytes > cap(e.frameBuf) || eventCount > cap(e.eventScratch) || validateState && eventCount > cap(e.log.events)-len(e.log.events) {
+	if encodedBytes > cap(e.frameBuf) || eventCount > cap(e.eventScratch) || validateState && eventCount > cap(e.log.events) {
 		return nil, [32]byte{}, nil, ErrBounds
 	}
 	if validateState {
@@ -795,7 +842,7 @@ func (e *Engine) prepareWave(w Wave, validateState bool) ([]byte, [32]byte, []se
 				missing++
 			}
 		}
-		if missing > cap(e.activeBuild.groups)-len(e.activeBuild.groups) {
+		if missing > cap(e.activeBuild.groups) {
 			return nil, [32]byte{}, nil, ErrBounds
 		}
 	}
@@ -840,7 +887,7 @@ func (e *Engine) prepareWave(w Wave, validateState bool) ([]byte, [32]byte, []se
 		if flags&batchBegin != 0 {
 			needed++
 		}
-		if len(e.eventScratch)+needed+1 > cap(e.eventScratch) || validateState && len(group.Entries)-replacementCount(group.Entries, batch.ReplaceFrom)+len(batch.Entries) > cap(group.Entries) {
+		if len(e.eventScratch)+needed+1 > cap(e.eventScratch) || validateState && len(batch.Entries) > cap(group.Entries) {
 			return nil, [32]byte{}, nil, ErrBounds
 		}
 		e.frameBuf = appendUvarint(e.frameBuf, batch.GroupID-previousGroup)
@@ -944,13 +991,6 @@ func (e *Engine) prepareWave(w Wave, validateState bool) ([]byte, [32]byte, []se
 	}
 	if len(e.frameBuf) > maxRecordBytes || len(e.frameBuf) > cap(e.frameBuf) {
 		return nil, [32]byte{}, nil, ErrBounds
-	}
-	if validateState {
-		for i := range w.Batches {
-			if !e.activeBuild.touch(e.groups[w.Batches[i].GroupID], e.log.state.ActiveID) {
-				return nil, [32]byte{}, nil, ErrBounds
-			}
-		}
 	}
 	digest := e.waveDigest(e.frameBuf[72:], e.sequence+1, w.ID)
 	copy(e.frameBuf[40:72], digest[:])
@@ -1588,6 +1628,10 @@ func (e *Engine) recordSealedSummary(groupID uint64, summary sealedRunSummary, s
 func (e *Engine) Rotate(hook func(RotationPhase) error) error {
 	e.writeMu.Lock()
 	defer e.writeMu.Unlock()
+	return e.rotateLocked(hook)
+}
+
+func (e *Engine) rotateLocked(hook func(RotationPhase) error) error {
 	if e.sealPending {
 		select {
 		case err := <-e.sealResults:
@@ -1596,12 +1640,12 @@ func (e *Engine) Rotate(hook func(RotationPhase) error) error {
 				return e.log.poison(err)
 			}
 		default:
-			return ErrBounds
+			return ErrBackpressure
 		}
 	}
 	l := e.log
 	if e.maintenanceBusy || l.metadata.needsHealing || l.metadata.slot.ReclaimPhase != reclaimNone || l.metadata.slot.RetiredCheckpointCount != 0 || len(l.state.Segments) == cap(l.state.Segments) || catalogSuffixRecords(l.metadata.slot) >= catalogCheckpointHardRecords || !l.state.Reserves[0].Ready || !l.state.Reserves[1].Ready || l.reserveFiles[0] == nil || l.reserveFiles[1] == nil {
-		return ErrBounds
+		return ErrBackpressure
 	}
 	if cap(l.eventSpare) < cap(l.events) || e.activeBuild == nil || e.spareBuild == nil {
 		return ErrBounds

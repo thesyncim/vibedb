@@ -31,7 +31,7 @@ func TestNodeRuntimePersistenceSharesOneSequencerWithoutGroupWorkers(t *testing.
 		boots[i] = raftstore.NodeBootstrap{Descriptor: descriptors[i], Snapshot: &pb.Snapshot{Metadata: &pb.SnapshotMetadata{Index: &index, Term: &term, ConfState: &pb.ConfState{Voters: []uint64{member}}}}}
 		identities[i] = RuntimeIdentity{Group: GroupKey{ClusterID: base.ClusterID, ClusterIncarnation: base.ClusterIncarnation, TopologyRecoveryEpoch: 7, ShardIncarnation: identity.ShardIncarnation, GroupID: identity.GroupID}, Distribution: identity.Distribution, Shard: identity.Shard, AllocationGeneration: identity.AllocationGeneration, MemberID: member, StoreID: identity.StoreID, NodeIncarnation: 1}
 	}
-	options := raftstore.NodeStoreOptions{Store: testWALOptions(), FrameBytes: 1 << 20, Events: 256, WaveIDs: 64, EntriesPerGroup: 64, CachedSegments: 1, Groups: 8}
+	options := raftstore.NodeStoreOptions{MaxWaveBytes: 1 << 20, MaxSegmentEvents: 256, RecentWaves: 64, MaxEntriesPerGroup: 64, ReaderSlots: 1, MaxGroups: 8}
 	store, err := raftstore.CreateNodeStore(filepath.Join(t.TempDir(), "node"), node, testWALKey(), boots, options)
 	if err != nil {
 		t.Fatal(err)
@@ -115,8 +115,8 @@ func TestAdoptNodeRuntimeDrivesWorkerFreeDurableReady(t *testing.T) {
 		},
 	}
 	options := raftstore.NodeStoreOptions{
-		Store: testWALOptions(), FrameBytes: 1 << 20, Events: 256,
-		WaveIDs: 64, EntriesPerGroup: 64, CachedSegments: 1, Groups: 8,
+		MaxWaveBytes: 1 << 20, MaxSegmentEvents: 256,
+		RecentWaves: 64, MaxEntriesPerGroup: 64, ReaderSlots: 1, MaxGroups: 8,
 	}
 	store, err := raftstore.CreateNodeStore(
 		filepath.Join(t.TempDir(), "node"), node, testWALKey(),
