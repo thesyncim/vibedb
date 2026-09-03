@@ -130,14 +130,14 @@ func TestAdoptNodeRuntimeDrivesWorkerFreeDurableReady(t *testing.T) {
 		t.Fatal(err)
 	}
 	group := store.Group(1)
-	_, database, _ := prepareSQLRoot(t, legacy, "node-runtime")
+	path, database, _ := prepareSQLRoot(t, legacy, "node-runtime")
 	authority := testAuthorityProfile()
 	base, err := BindPreparedNodeSQL(group, database, authority, "docs")
 	skipIfStrictAllocationUnsupported(t, "bind node runtime SQL", err)
 	if err != nil {
 		t.Fatal(err)
 	}
-	apply, _, err := OpenPreparedNodeApply(group, database, authority, base, testApplyOptions())
+	apply, applyIdentity, err := OpenPreparedNodeApply(group, database, authority, base, testApplyOptions())
 	skipIfStrictAllocationUnsupported(t, "open node runtime apply", err)
 	if err != nil {
 		t.Fatal(err)
@@ -199,5 +199,14 @@ func TestAdoptNodeRuntimeDrivesWorkerFreeDurableReady(t *testing.T) {
 	}
 	if _, err = group.LastIndex(); err != nil {
 		t.Fatalf("Runtime closed shared node store: %v", err)
+	}
+	reopenedDatabase, reopenedApply, err := OpenBoundNodeSQLWithApply(
+		path, group, authority, base, applyIdentity,
+	)
+	if err != nil {
+		t.Fatalf("OpenBoundNodeSQLWithApply: %v", err)
+	}
+	if err = errors.Join(reopenedApply.Close(), reopenedDatabase.Close()); err != nil {
+		t.Fatalf("close node-log restart handles: %v", err)
 	}
 }

@@ -336,12 +336,12 @@ func readFresh(reader io.Reader, destination []byte) error {
 }
 
 func marshalSnapshot(snapshot *pb.Snapshot) ([]byte, error) {
-	if err := validateSnapshotBase(snapshot, 0); err != nil {
+	capacity, err := snapshotPayloadSize(snapshot)
+	if err != nil {
 		return nil, err
 	}
 	metadata := snapshot.GetMetadata()
 	conf := metadata.GetConfState()
-	capacity := 40 + 8*(len(conf.GetVoters())+len(conf.GetLearners())) + len(snapshot.GetData())
 	result := make([]byte, 0, capacity)
 	result = appendUint16(result, codecVersion)
 	flags := uint16(0)
@@ -365,6 +365,21 @@ func marshalSnapshot(snapshot *pb.Snapshot) ([]byte, error) {
 	}
 	result = append(result, snapshot.GetData()...)
 	return result, nil
+}
+
+// snapshotPayloadSize validates and sizes the private snapshot codec without
+// allocating. The node sequencer uses it to reject an individually impossible
+// Ready before publishing a submission ticket.
+func snapshotPayloadSize(snapshot *pb.Snapshot) (int, error) {
+	if err := validateSnapshotBase(snapshot, 0); err != nil {
+		return 0, err
+	}
+	conf := snapshot.GetMetadata().GetConfState()
+	members := len(conf.GetVoters()) + len(conf.GetLearners())
+	if members > (math.MaxInt-40-len(snapshot.GetData()))/8 {
+		return 0, ErrBounds
+	}
+	return 40 + 8*members + len(snapshot.GetData()), nil
 }
 
 func unmarshalSnapshot(data []byte, memberID uint64) (*pb.Snapshot, error) {

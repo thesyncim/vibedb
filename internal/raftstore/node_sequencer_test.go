@@ -21,7 +21,10 @@ import (
 
 func newTestSequencer(t *testing.T, capacity int, persist func([]NodeReady) error) *NodeSubmissionSequencer {
 	t.Helper()
-	q, err := NewNodeSubmissionSequencer(&NodeStore{}, capacity)
+	q, err := NewNodeSubmissionSequencer(&NodeStore{bounds: nodeStoreBounds{
+		maxWaveBytes: DefaultNodeMaxWaveBytes, maxSegmentEvents: DefaultNodeMaxSegmentEvents,
+		maxEntriesPerGroup: DefaultNodeMaxEntriesPerGroup,
+	}}, capacity)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,6 +168,93 @@ func TestNodeSubmissionSequencerFusesFIFOAndCompletesInTicketOrder(t *testing.T)
 	defer sizesMu.Unlock()
 	if len(sizes) != 5 || sizes[0] != 1 || sizes[1] != MaxPersistGroupBatches || sizes[2] != MaxPersistGroupBatches || sizes[3] != MaxPersistGroupBatches || sizes[4] != 15 {
 		t.Fatalf("fused wave sizes=%v", sizes)
+	}
+}
+
+func TestNodeSubmissionSequencerSplitsWaveBeforeArenaCapacity(t *testing.T) {
+	store := &NodeStore{bounds: nodeStoreBounds{
+		maxWaveBytes: 1024, maxSegmentEvents: 64, maxEntriesPerGroup: 8,
+	}}
+	q, err := NewNodeSubmissionSequencer(store, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = q.Close() })
+	entered, release := make(chan struct{}), make(chan struct{})
+	var calls atomic.Int32
+	var sizesMu sync.Mutex
+	var sizes []int
+	q.persist = func(ready []NodeReady) error {
+		if calls.Add(1) == 1 {
+			close(entered)
+			<-release
+		}
+		sizesMu.Lock()
+		sizes = append(sizes, len(ready))
+		sizesMu.Unlock()
+		return nil
+	}
+
+	first := preparedSubmission(t, 1, 1)
+	if _, err = q.TrySubmit(first); err != nil {
+		t.Fatal(err)
+	}
+	<-entered
+	queued := []*Submission{preparedSubmission(t, 2, 1), preparedSubmission(t, 3, 1)}
+	for _, item := range queued {
+		item.Ready.Batch.Entries = []*pb.Entry{typedEntry(2, 2, pb.EntryNormal, string(make([]byte, 500)))}
+		if _, err = q.TrySubmit(item); err != nil {
+			t.Fatal(err)
+		}
+	}
+	close(release)
+	for _, item := range append([]*Submission{first}, queued...) {
+		if _, err = item.Wait(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sizesMu.Lock()
+	defer sizesMu.Unlock()
+	if fmt.Sprint(sizes) != "[1 1 1]" {
+		t.Fatalf("capacity-aware durability waves=%v want [1 1 1]", sizes)
+	}
+}
+
+func TestNodeSubmissionSequencerRejectsImpossibleReadyBeforeTicket(t *testing.T) {
+	store := &NodeStore{bounds: nodeStoreBounds{
+		maxWaveBytes: 1024, maxSegmentEvents: 7, maxEntriesPerGroup: 8,
+	}}
+	q, err := NewNodeSubmissionSequencer(store, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = q.Close() })
+	var calls atomic.Int32
+	q.persist = func([]NodeReady) error {
+		calls.Add(1)
+		return nil
+	}
+
+	tooLarge := preparedSubmission(t, 1, 1)
+	tooLarge.Ready.Batch.Entries = []*pb.Entry{
+		typedEntry(2, 2, pb.EntryNormal, string(make([]byte, 800))),
+	}
+	if ticket, submitErr := q.TrySubmit(tooLarge); ticket != 0 || !errors.Is(submitErr, ErrBounds) {
+		t.Fatalf("oversize submit ticket=%d err=%v", ticket, submitErr)
+	}
+	if tooLarge.state.Load() != submissionIdle {
+		t.Fatalf("oversize submission state=%d want idle", tooLarge.state.Load())
+	}
+
+	tooManyEvents := preparedSubmission(t, 1, 1)
+	tooManyEvents.Ready.Batch.Entries = []*pb.Entry{
+		typedEntry(2, 2, pb.EntryNormal, "a"), typedEntry(3, 2, pb.EntryNormal, "b"),
+	}
+	if ticket, submitErr := q.TrySubmit(tooManyEvents); ticket != 0 || !errors.Is(submitErr, ErrBounds) {
+		t.Fatalf("event-heavy submit ticket=%d err=%v", ticket, submitErr)
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("impossible Ready reached persistence %d times", calls.Load())
 	}
 }
 
@@ -837,7 +927,10 @@ func BenchmarkNodeSubmissionSequencer(b *testing.B) {
 	for _, producers := range []int{1, 8, 64} {
 		b.Run(fmt.Sprintf("producers=%d", producers), func(b *testing.B) {
 			b.StopTimer()
-			q, err := NewNodeSubmissionSequencer(&NodeStore{}, 1024)
+			q, err := NewNodeSubmissionSequencer(&NodeStore{bounds: nodeStoreBounds{
+				maxWaveBytes: DefaultNodeMaxWaveBytes, maxSegmentEvents: DefaultNodeMaxSegmentEvents,
+				maxEntriesPerGroup: DefaultNodeMaxEntriesPerGroup,
+			}}, 1024)
 			if err != nil {
 				b.Fatal(err)
 			}

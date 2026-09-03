@@ -100,6 +100,73 @@ func OpenBoundSQLWithApply(
 	return openBoundSQLWithApply(path, wal, authority, expectedSQL, expectedApply, sqldriver.OpenReplicatedShardStoreWithApply, opening...)
 }
 
+// OpenBoundNodeSQLWithApply performs the ordinary exact restart of a SQL/apply
+// pair whose Raft durability authority is one authenticated node-log group.
+func OpenBoundNodeSQLWithApply(
+	path string,
+	group *raftstore.GroupView,
+	authority sqldriver.ReplicatedAuthorityProfile,
+	expectedSQL sqldriver.ReplicatedShardStoreIdentity,
+	expectedApply sqldriver.ReplicatedApplyIdentity,
+	opening ...sqldriver.ReplicatedOpenOptions,
+) (*sqldriver.Database, *sqldriver.ReplicatedApply, error) {
+	return openBoundNodeSQLWithApply(
+		path, group, authority, expectedSQL, expectedApply,
+		sqldriver.OpenReplicatedShardStoreWithApply, opening...,
+	)
+}
+
+func openBoundNodeSQLWithApply(
+	path string,
+	group *raftstore.GroupView,
+	authority sqldriver.ReplicatedAuthorityProfile,
+	expectedSQL sqldriver.ReplicatedShardStoreIdentity,
+	expectedApply sqldriver.ReplicatedApplyIdentity,
+	open func(string, sqldriver.ReplicatedShardStoreIdentity, sqldriver.ReplicatedApplyIdentity, ...sqldriver.ReplicatedOpenOptions) (*sqldriver.Database, error),
+	opening ...sqldriver.ReplicatedOpenOptions,
+) (*sqldriver.Database, *sqldriver.ReplicatedApply, error) {
+	binding, bootstrap, err := nodeApplyPrerequisites(group, authority)
+	if err != nil {
+		return nil, nil, err
+	}
+	if expectedSQL.Binding != binding {
+		return nil, nil, ErrBindingMismatch
+	}
+	database, err := open(path, expectedSQL, expectedApply, opening...)
+	if err != nil {
+		return nil, nil, err
+	}
+	claim, actual, err := database.OpenReplicatedApply(
+		expectedSQL, bootstrap, replicatedApplyOptions(expectedApply),
+	)
+	if err != nil || actual != expectedApply {
+		if claim != nil {
+			_ = claim.Close()
+		}
+		closeErr := database.Close()
+		if closeErr != nil && errors.Is(err, sqldriver.ErrSchemaSourceNotCommitted) {
+			err = fmt.Errorf("%w: schema source cleanup: %v", ErrRuntimeOwnership, err)
+		}
+		if err == nil {
+			err = sqldriver.ErrReplicatedApplyMismatch
+		}
+		return nil, nil, errors.Join(err, closeErr)
+	}
+	return database, claim, nil
+}
+
+func replicatedApplyOptions(expected sqldriver.ReplicatedApplyIdentity) sqldriver.ReplicatedApplyOptions {
+	return sqldriver.ReplicatedApplyOptions{
+		MaxSessions: expected.MaxSessions, RetryWindow: expected.RetryWindow,
+		TxnLimits: expected.TxnLimits, Placement: expected.Placement,
+		RequestLedgerCapacityBytes:       expected.RequestLedgerCapacityBytes,
+		RequestLedgerCleanupReserveBytes: expected.RequestLedgerCleanupReserveBytes,
+		RequestLedgerRangeStart:          expected.RequestLedgerRangeStart,
+		RequestLedgerRangeEnd:            expected.RequestLedgerRangeEnd,
+		RequestLedgerRangeIdentity:       expected.RequestLedgerRangeIdentity,
+	}
+}
+
 func openBoundSQLWithApply(
 	path string,
 	wal *raftstore.Store,
@@ -123,15 +190,7 @@ func openBoundSQLWithApply(
 		return nil, nil, err
 	}
 	claim, actual, err := database.OpenReplicatedApply(
-		expectedSQL, bootstrap, sqldriver.ReplicatedApplyOptions{
-			MaxSessions: expectedApply.MaxSessions, RetryWindow: expectedApply.RetryWindow,
-			TxnLimits: expectedApply.TxnLimits, Placement: expectedApply.Placement,
-			RequestLedgerCapacityBytes:       expectedApply.RequestLedgerCapacityBytes,
-			RequestLedgerCleanupReserveBytes: expectedApply.RequestLedgerCleanupReserveBytes,
-			RequestLedgerRangeStart:          expectedApply.RequestLedgerRangeStart,
-			RequestLedgerRangeEnd:            expectedApply.RequestLedgerRangeEnd,
-			RequestLedgerRangeIdentity:       expectedApply.RequestLedgerRangeIdentity,
-		},
+		expectedSQL, bootstrap, replicatedApplyOptions(expectedApply),
 	)
 	if err != nil || actual != expectedApply {
 		if claim != nil {
@@ -164,6 +223,43 @@ func OpenBoundSQLWithApplyForSettlement(
 	options sqldriver.ReplicatedApplyOptions,
 ) (*sqldriver.Database, *sqldriver.ReplicatedApply, sqldriver.ReplicatedApplyIdentity, error) {
 	binding, bootstrap, err := applyPrerequisites(wal, authority)
+	if err != nil {
+		return nil, nil, sqldriver.ReplicatedApplyIdentity{}, err
+	}
+	if expectedSQL.Binding != binding {
+		return nil, nil, sqldriver.ReplicatedApplyIdentity{}, ErrBindingMismatch
+	}
+	database, identity, err := sqldriver.OpenReplicatedShardStoreWithApplyForSettlement(
+		path, expectedSQL, options,
+	)
+	if err != nil {
+		return nil, nil, sqldriver.ReplicatedApplyIdentity{}, err
+	}
+	claim, actual, err := database.OpenReplicatedApply(expectedSQL, bootstrap, options)
+	if err != nil || actual != identity {
+		if claim != nil {
+			_ = claim.Close()
+		}
+		closeErr := database.Close()
+		if err == nil {
+			err = sqldriver.ErrReplicatedApplyMismatch
+		}
+		return nil, nil, sqldriver.ReplicatedApplyIdentity{}, errors.Join(err, closeErr)
+	}
+	return database, claim, identity, nil
+}
+
+// OpenBoundNodeSQLWithApplyForSettlement resolves the same post-catalog crash
+// window as OpenBoundSQLWithApplyForSettlement without constructing a legacy
+// per-group WAL owner.
+func OpenBoundNodeSQLWithApplyForSettlement(
+	path string,
+	group *raftstore.GroupView,
+	authority sqldriver.ReplicatedAuthorityProfile,
+	expectedSQL sqldriver.ReplicatedShardStoreIdentity,
+	options sqldriver.ReplicatedApplyOptions,
+) (*sqldriver.Database, *sqldriver.ReplicatedApply, sqldriver.ReplicatedApplyIdentity, error) {
+	binding, bootstrap, err := nodeApplyPrerequisites(group, authority)
 	if err != nil {
 		return nil, nil, sqldriver.ReplicatedApplyIdentity{}, err
 	}
