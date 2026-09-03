@@ -252,6 +252,7 @@ func CreateNodeStore(dir string, identity NodeIdentity, key Key, bootstraps []No
 	storedOrder := make([]uint32, len(order), options.MaxGroups)
 	copy(storedOrder, order)
 	bounds := nodeBoundsFromOptions(options)
+	key.Wrapped = bytes.Clone(key.Wrapped)
 	store := &NodeStore{dir: dir, identity: identity, descriptors: storedDescriptors, descriptorOrder: storedOrder, nextLogKey: uint64(len(descriptors)) + 1, key: key, bounds: bounds, engine: engine, lock: lock, crypto: cryptoState, cryptoWork: newObjectCryptoWorkspace(cryptoState.dataKey, cryptoState.nonceKey)}
 	if err = store.reserve(options, bootstraps); err != nil {
 		_ = store.Close()
@@ -310,6 +311,12 @@ func OpenNodeStore(dir string, expected NodeIdentity, key Key, options NodeStore
 	if err != nil {
 		return fail(nil, err)
 	}
+	// openNodeMeta authenticated the entire header and validated these bounds.
+	// Retain a detached copy even when the caller supplied expected metadata:
+	// command startup may clear its temporary key after handing off ownership.
+	wrappedStart := nodeMetaHeaderBytes + len(key.ID)
+	wrappedEnd := wrappedStart + int(binary.LittleEndian.Uint16(meta[12:14]))
+	key.Wrapped = bytes.Clone(meta[wrappedStart:wrappedEnd])
 	cryptoState, err := makeFileCrypto(key, logID)
 	if err != nil {
 		return fail(nil, err)
@@ -380,7 +387,7 @@ func openNodeMeta(data []byte, expected NodeIdentity, key Key, bounds nodeStoreB
 	wrappedBytes := int(binary.LittleEndian.Uint16(data[12:14]))
 	headerBytes := nodeMetaHeaderBytes + keyIDBytes + wrappedBytes
 	if headerBytes > len(data)-16 || !bytes.Equal(data[nodeMetaHeaderBytes:nodeMetaHeaderBytes+keyIDBytes], []byte(key.ID)) ||
-		!bytes.Equal(data[nodeMetaHeaderBytes+keyIDBytes:headerBytes], key.Wrapped) {
+		(key.Wrapped != nil && !bytes.Equal(data[nodeMetaHeaderBytes+keyIDBytes:headerBytes], key.Wrapped)) {
 		return NodeIdentity{}, zero, ErrIdentityMismatch
 	}
 	var logID [16]byte
