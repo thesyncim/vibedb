@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash/maphash"
 	"slices"
+	"strings"
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
@@ -341,6 +342,9 @@ func (s *Snapshot) prepareGlobalIndexWrites(
 	for ordinal := 0; ordinal < indexes.Len(); ordinal++ {
 		metadata, _ := indexes.At(ordinal)
 		if !metadata.Global() {
+			continue
+		}
+		if !updateMayChangeGlobalIndex(&plan.statement, metadata) {
 			continue
 		}
 		program, err := s.compileGlobalIndex(plan.table, metadata.Name, false)
@@ -678,9 +682,20 @@ func (p *PreparedPlan) bindGlobalIndexCapture(
 			expectation.postimageDigest = sha256.Sum256(replacement)
 		}
 		expected = append(expected, expectation)
+		oldIndex, err := oldWorkspace.indexDocument(row[1].Bytes)
+		if err != nil {
+			return err
+		}
+		var newIndex vibejson.Index
+		if bound.kind == sqlast.KindUpdate {
+			newIndex, err = newWorkspace.indexDocument(replacement)
+			if err != nil {
+				return err
+			}
+		}
 		for indexOrdinal := range p.writeGlobalIndexes {
 			prepared := &p.writeGlobalIndexes[indexOrdinal]
-			oldRoute, err := prepared.program.RouteDocument(row[1].Bytes, &oldWorkspace)
+			oldRoute, err := prepared.program.routeIndexedDocument(oldIndex, len(row[1].Bytes), &oldWorkspace)
 			if err != nil {
 				return fmt.Errorf("global index %s captured row %d: %w",
 					prepared.program.metadata.Name, rowOrdinal, err)
@@ -696,7 +711,7 @@ func (p *PreparedPlan) bindGlobalIndexCapture(
 				)
 				continue
 			}
-			newRoute, err := prepared.program.RouteDocument(replacement, &newWorkspace)
+			newRoute, err := prepared.program.routeIndexedDocument(newIndex, len(replacement), &newWorkspace)
 			if err != nil {
 				return fmt.Errorf("global index %s replacement row %d: %w",
 					prepared.program.metadata.Name, rowOrdinal, err)
@@ -989,4 +1004,40 @@ func writeDocShardKeyWorkspace(
 		}
 	}
 	return key, entries, nil
+}
+
+// updateMayChangeGlobalIndex proves maintenance unnecessary only from the SET
+// targets, never from selectivity estimates. A top-level assignment can alter
+// every descendant pointer. Locator paths include the primary and shard keys.
+func updateMayChangeGlobalIndex(stmt *sqlast.Statement, metadata IndexMetadata) bool {
+	if stmt == nil || stmt.Kind != sqlast.KindUpdate || stmt.Update == nil || len(stmt.Update.Assignments) == 0 {
+		return true
+	}
+	overlaps := func(path string) bool {
+		if path == "" || path[0] != '/' {
+			return true
+		}
+		root := path[1:]
+		if end := strings.IndexByte(root, '/'); end >= 0 {
+			root = root[:end]
+		}
+		root = strings.ReplaceAll(strings.ReplaceAll(root, "~1", "/"), "~0", "~")
+		for _, assignment := range stmt.Update.Assignments {
+			if assignment.Column == root {
+				return true
+			}
+		}
+		return false
+	}
+	for _, path := range metadata.Paths[:metadata.PathCount] {
+		if overlaps(path) {
+			return true
+		}
+	}
+	for _, path := range metadata.LocatorPaths[:metadata.LocatorCount] {
+		if overlaps(path) {
+			return true
+		}
+	}
+	return false
 }

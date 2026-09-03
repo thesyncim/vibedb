@@ -1615,11 +1615,12 @@ func TestE2EPlannerSelectedWorkerRepartitionAggregation(t *testing.T) {
 		Rows:       Estimate{Value: 1_000_000, Lower: 800_000, Upper: 1_000_000, Confidence: .9},
 		RowBytes:   Estimate{Value: 128, Lower: 96, Upper: 128, Confidence: .9},
 		Partitions: partitions,
+		Groups:     []GroupStatistics{{Paths: []string{"/n"}, Distinct: Estimate{Value: 100_000, Lower: 100_000, Upper: 100_000, Confidence: 1}}},
 	}})
 	profiles := DefaultProfiles()
 	batch := profiles[ClassBatch]
-	// Centralized grouped state is estimated at 128 MiB; four worker-local
-	// reducers are estimated below this hard 40 MiB per-query objective.
+	// 100,000 groups exceed the 40 MiB coordinator state cap after accounting
+	// for actual accumulator overhead. Four reducers fit individually.
 	batch.MaxAggregateBytes = 40 << 20
 	profiles[ClassBatch] = batch
 	executor := NewExecutor(c.client, NewCatalogHolder(snapshot), Options{Profiles: profiles})

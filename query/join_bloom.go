@@ -44,8 +44,9 @@ import (
 // joinBloomBlock is one 32-byte block: eight 32-bit words, each carrying
 // exactly one of the filter's eight bits per key. Confining a key's whole
 // signature to one block is the point of the design — a classic Bloom filter's
-// k probes are k independent cache misses, while this is one, and testing the
-// block is eight loads and eight ANDs over a single cache line.
+// k probes are k independent cache misses, while this stays within one block.
+// Insertion uses one AVX2 vector or two NEON vectors in Go SIMD builds.
+// Probes fuse bit generation with a scalar early exit: most fail in word one.
 //
 // Provenance: ALGO-BLOOM-BLOCKED-001.
 type joinBloomBlock [8]uint32
@@ -162,35 +163,12 @@ func joinBloomBlocks(keys int) int {
 	return 1 << uint(bits.Len(uint(blocks-1)))
 }
 
-// signature derives a key's block index and its eight in-block bits.
-//
-// The block comes from the high half of the hash and the bits from the low
-// half, which is what the reference layout does so that a collision in one is
-// independent of a collision in the other. That reason was tested here and did
-// not hold up: deriving both from the low half measures an identical
-// false-positive rate (TestJoinBloomFalsePositiveRate, 0.0001 either way),
-// because maphash already avalanches and the odd-salt multiplication
-// decorrelates the in-block bits from the index by itself. The split is kept
-// anyway — it costs one shift, and it is the property the published
-// false-positive arithmetic assumes — but it is kept on the strength of the
-// reference rather than of a measurement, and a reader should not go looking
-// for the win it does not have.
-func (b *joinBloom) signature(hash uint64) (int, joinBloomBlock) {
-	var word joinBloomBlock
-	low := uint32(hash)
-	for i := range word {
-		word[i] = uint32(1) << ((low * joinBloomSalt[i]) >> 27)
-	}
-	return int(uint32(hash>>32) & b.mask), word
-}
-
+// The high hash half selects a block; the low half derives its eight bits.
+// Splitting the hash preserves the blocked-filter reference layout.
 // insert records one inner join key.
 func (b *joinBloom) insert(hash uint64) {
-	index, word := b.signature(hash)
-	block := &b.blocks[index]
-	for i := range word {
-		block[i] |= word[i]
-	}
+	block := &b.blocks[uint32(hash>>32)&b.mask]
+	joinBloomInsertBlock(block, uint32(hash))
 	b.inserted++
 }
 
@@ -200,13 +178,10 @@ func (b *joinBloom) insert(hash uint64) {
 // The filter itself is read-only here — several filter-phase workers test the
 // same blocks concurrently — so the tallies go to the caller's own scratch.
 func (b *joinBloom) admits(hash uint64, pr *joinProbe) bool {
-	index, word := b.signature(hash)
-	block := &b.blocks[index]
+	block := &b.blocks[uint32(hash>>32)&b.mask]
 	pr.tested++
-	for i := range word {
-		if block[i]&word[i] == 0 {
-			return false
-		}
+	if !joinBloomTestBlock(block, uint32(hash)) {
+		return false
 	}
 	pr.admitted++
 	return true
@@ -224,4 +199,21 @@ func (b *joinBloom) admits(hash uint64, pr *joinProbe) bool {
 // overturn.
 func hashJoinKey(key string) uint64 {
 	return maphash.String(joinBloomSeed, key)
+}
+
+func joinBloomInsertScalar(block *joinBloomBlock, low uint32) {
+	for i := range block {
+		block[i] |= uint32(1) << ((low * joinBloomSalt[i]) >> 27)
+	}
+}
+
+// Early exits beat evaluating all eight lanes for the selective joins this
+// filter targets. Keep this loop inlineable even when SIMD inserts are enabled.
+func joinBloomTestBlock(block *joinBloomBlock, low uint32) bool {
+	for i := range block {
+		if block[i]&(uint32(1)<<((low*joinBloomSalt[i])>>27)) == 0 {
+			return false
+		}
+	}
+	return true
 }

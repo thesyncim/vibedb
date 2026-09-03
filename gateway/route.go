@@ -46,6 +46,7 @@ type plan struct {
 	groupKeys    []int
 	aggHeaders   []string
 	repartition  bool
+	groupLocal   bool
 	physical     *queryplanner.Plan
 	planning     queryplanner.OptimizerStatistics
 }
@@ -146,6 +147,7 @@ func (e *Executor) routeContext(ctx context.Context, snap *Snapshot, q *Query, b
 		groupKeys:    bound.groupKeys,
 		aggHeaders:   bound.aggHeaders,
 		repartition:  physicalPlanContains(physical, queryplanner.OpRepartition),
+		groupLocal:   bound.groupLocal,
 		physical:     physical,
 		planning:     planning,
 	}, nil

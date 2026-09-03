@@ -27,14 +27,16 @@ type TableStatistics struct {
 	RowBytes   Estimate              `json:"row_bytes"`
 	Columns    []ColumnStatistics    `json:"columns,omitempty"`
 	Partitions []PartitionStatistics `json:"partitions,omitempty"`
+	Groups     []GroupStatistics     `json:"groups,omitempty"`
 }
 
 // PartitionStatistics is an optional topology-pinned row estimate for one
 // physical partition/shard. A distributed cost model can sum selected
 // partitions without assuming table rows are uniformly distributed.
 type PartitionStatistics struct {
-	Partition string   `json:"partition"`
-	Rows      Estimate `json:"rows"`
+	Partition string            `json:"partition"`
+	Rows      Estimate          `json:"rows"`
+	Groups    []GroupStatistics `json:"groups,omitempty"`
 }
 
 // ColumnStatistics contains the selectivity facts with the highest practical
@@ -170,13 +172,18 @@ type compactPartitionStatistic struct {
 // pinned to the same generation as routing metadata without putting mutable
 // feedback in the query path.
 type StatisticsCatalog struct {
-	generation uint64
-	tables     []compactTableStatistic
-	columns    []compactColumnStatistic
-	common     []compactValueFrequency
-	histogram  []compactHistogramBucket
-	partitions []compactPartitionStatistic
-	arena      string
+	generation  uint64
+	tables      []compactTableStatistic
+	columns     []compactColumnStatistic
+	common      []compactValueFrequency
+	histogram   []compactHistogramBucket
+	partitions  []compactPartitionStatistic
+	arena       string
+	groups      []compactGroupStatistic
+	groupPaths  []statisticStringRef
+	tuples      []compactTupleFrequency
+	tupleValues []statisticStringRef
+	groupArena  string
 }
 
 // NewStatisticsCatalog validates and compacts one generation. A nil descriptor
@@ -324,6 +331,9 @@ func NewStatisticsCatalog(generation uint64, descriptors []TableStatistics) (*St
 		catalog.tables = append(catalog.tables, tableEntry)
 	}
 	catalog.arena = arena.String()
+	if err := catalog.buildGroups(ordered); err != nil {
+		return nil, err
+	}
 	return catalog, nil
 }
 
@@ -1092,6 +1102,7 @@ func (c *StatisticsCatalog) Descriptors() []TableStatistics {
 		descriptor.Table = strings.Clone(c.string(table.name))
 		descriptor.Rows = table.rows.public()
 		descriptor.RowBytes = table.rowBytes.public()
+		descriptor.Groups = c.groupDescriptors(uint32(tableIndex), "")
 		partitionStart := partitionCursor
 		for partitionCursor < len(c.partitions) && c.partitions[partitionCursor].table == table.name {
 			partitionCursor++
@@ -1101,6 +1112,7 @@ func (c *StatisticsCatalog) Descriptors() []TableStatistics {
 			partition := c.partitions[i]
 			descriptor.Partitions[i-partitionStart] = PartitionStatistics{
 				Partition: strings.Clone(c.string(partition.partition)), Rows: partition.rows.public(),
+				Groups: c.groupDescriptors(uint32(tableIndex), c.string(partition.partition)),
 			}
 		}
 		descriptor.Columns = make([]ColumnStatistics, table.columnCount)
@@ -1142,7 +1154,7 @@ func (c *StatisticsCatalog) RetainedBytes() uint64 {
 		uint64(cap(c.common))*uint64(unsafe.Sizeof(compactValueFrequency{})) +
 		uint64(cap(c.histogram))*uint64(unsafe.Sizeof(compactHistogramBucket{})) +
 		uint64(cap(c.partitions))*uint64(unsafe.Sizeof(compactPartitionStatistic{})) +
-		uint64(len(c.arena))
+		uint64(len(c.arena)) + c.groupRetainedBytes()
 }
 
 // TableStatistic is an immutable allocation-free view into one catalog.

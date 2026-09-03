@@ -16,19 +16,23 @@ import (
 // gateway currently has one remote fragment, but the representation naturally
 // extends to separately costed join/aggregate fragments and exchanges.
 type distributedPrivate struct {
-	targets     int
-	shards      int
-	scanRows    float64
-	scanBytes   float64
-	outputRows  float64
-	rowBytes    float64
-	order       []OrderKey
-	aggregates  []bootstrap.AggKind
-	groupKeys   []int
-	limit       int
-	offset      int
-	hasLimit    bool
-	indexLookup bool
+	targets         int
+	shards          int
+	scanRows        float64
+	scanBytes       float64
+	outputRows      float64
+	finalRows       float64
+	reducerGroups   float64
+	profile         Profile
+	rowBytes        float64
+	order           []OrderKey
+	aggregates      []bootstrap.AggKind
+	groupKeys       []int
+	limit           int
+	offset          int
+	hasLimit        bool
+	indexLookup     bool
+	disableExchange bool
 }
 
 type distributedCostModel struct {
@@ -55,7 +59,15 @@ func (m *distributedCostModel) ChildPropertyAlternatives(
 			Distribution: queryplanner.Distribution{Kind: queryplanner.DistributionAny},
 		}}}
 		metadata, ok := m.private[expr.Private]
-		if ok && !metadata.indexLookup && len(metadata.groupKeys) != 0 && metadata.targets > 1 {
+		if ok && len(metadata.groupKeys) != 0 {
+			centralMemory := aggregateStateMemory(metadata, metadata.finalRows)
+			if centralMemory > float64(metadata.profile.withDefaults().MaxAggregateBytes) {
+				alternatives = nil
+			}
+		}
+		if ok && !metadata.indexLookup && !metadata.disableExchange && len(metadata.groupKeys) != 0 && metadata.targets > 1 &&
+			aggregateStateMemory(metadata, metadata.reducerGroups) <= float64(metadata.profile.withDefaults().MaxWorkerAggregateBytes) &&
+			groupedExchangeFeasible(metadata) {
 			alternatives = append(alternatives, []queryplanner.PhysicalProperties{{
 				Distribution: queryplanner.Distribution{
 					Kind: queryplanner.DistributionHash, Keys: plannerGroupKeys(metadata.groupKeys),
@@ -90,7 +102,7 @@ func (m *distributedCostModel) Provided(
 		}
 		return queryplanner.PhysicalProperties{
 			Distribution: distributionProperty,
-			Ordering:     plannerOrdering(metadata.order),
+			Ordering:     distributedAccessOrdering(metadata),
 		}, nil
 	case queryplanner.OpFinalAggregate:
 		if len(children) == 1 && children[0].Provided.Distribution.Kind == queryplanner.DistributionHash {
@@ -133,23 +145,23 @@ func (m *distributedCostModel) LocalCost(
 			Memory:  min(metadata.scanBytes, 1<<20),
 		}, nil
 	case queryplanner.OpFinalAggregate:
-		rows := max(1, float64(metadata.targets))
-		if len(metadata.groupKeys) != 0 {
-			rows = max(1, metadata.outputRows)
-		}
+		rows := metadata.outputRows
 		width := max(16, metadata.rowBytes)
-		partitions := 1.0
 		network := boundedProduct(rows, width)
+		groups, criticalRows := metadata.finalRows, rows
 		if len(children) == 1 && children[0].Provided.Distribution.Kind == queryplanner.DistributionHash {
-			partitions = max(1, float64(children[0].Provided.Distribution.Partitions))
+			groups = metadata.reducerGroups
+			// Each source emits a group at most once. Even a hot group can
+			// contribute only targets partials to a reducer after local combining.
+			criticalRows = min(rows, boundedProduct(groups, float64(metadata.targets)))
 			network = 0
 		}
-		memory := boundedProduct(rows, width) / partitions
+		memory := aggregateStateMemory(metadata, groups)
 		if len(metadata.groupKeys) == 0 {
 			memory = boundedProduct(width, float64(len(metadata.aggregates)))
 		}
 		return queryplanner.Cost{
-			CPU:     boundedProduct(rows/partitions, float64(len(metadata.aggregates))),
+			CPU:     boundedProduct(criticalRows, float64(len(metadata.aggregates))),
 			Network: network, Memory: memory,
 		}, nil
 	default:
@@ -206,40 +218,17 @@ func (m *distributedCostModel) Enforcers(
 			Provided: queryplanner.PhysicalProperties{
 				Distribution: required.Distribution,
 			},
-			Cost: queryplanner.Cost{CPU: rows, Network: boundedProduct(rows, width), Memory: width},
+			Cost: queryplanner.Cost{CPU: rows, Network: boundedProduct(rows, width), Memory: m.gatherMemory(rows, width)},
 		}
 		if len(required.Ordering) == 0 {
 			return []queryplanner.EnforcerChain{{gather}}, nil
 		}
-		sort := queryplanner.Enforcer{
-			Op: queryplanner.OpSort,
-			Provided: queryplanner.PhysicalProperties{
-				Distribution: required.Distribution, Ordering: required.Ordering,
-			},
-			Cost: queryplanner.Cost{
-				CPU: boundedProduct(rows, math.Log2(max(2, rows))), Memory: boundedProduct(rows, width),
-			},
-		}
+		sort := m.sortEnforcer(rows, width, required)
 		return []queryplanner.EnforcerChain{{gather, sort}}, nil
 	}
 	if provided.Distribution.Kind == queryplanner.DistributionSingleton &&
 		!orderingPrefix(provided.Ordering, required.Ordering) {
-		op := queryplanner.OpSort
-		cpuRows, memoryRows := rows, rows
-		if metadata, ok := m.private[1]; ok && len(metadata.groupKeys) != 0 && metadata.hasLimit {
-			op = queryplanner.OpTopK
-			memoryRows = min(rows, float64(metadata.limit+metadata.offset))
-			cpuRows = max(2, memoryRows)
-		}
-		return []queryplanner.EnforcerChain{{{
-			Op: op,
-			Provided: queryplanner.PhysicalProperties{
-				Distribution: provided.Distribution, Ordering: required.Ordering,
-			},
-			Cost: queryplanner.Cost{
-				CPU: boundedProduct(rows, math.Log2(cpuRows)), Memory: boundedProduct(memoryRows, width),
-			},
-		}}}, nil
+		return []queryplanner.EnforcerChain{{m.sortEnforcer(rows, width, required)}}, nil
 	}
 	return nil, nil
 }
@@ -328,7 +317,7 @@ func optimizeDistributedAccessPlan(
 		outputRows = min(outputRows, scanRows)
 	}
 	metadata := distributedPrivate{
-		targets: len(route.Targets), shards: bound.manifest.ShardCount(),
+		targets: len(route.Targets), shards: bound.manifest.ShardCount(), profile: profile,
 		scanRows: scanRows, scanBytes: scanBytes, outputRows: outputRows, rowBytes: rowBytes,
 		order: bound.order, aggregates: bound.aggregates, groupKeys: bound.groupKeys,
 		limit:       bound.limit,
@@ -346,6 +335,17 @@ func optimizeDistributedAccessPlan(
 		}
 		metadata.rowBytes = max(metadata.rowBytes, float64(len(bound.aggregates))*16)
 	}
+	metadata.finalRows = metadata.outputRows
+	if len(bound.groupKeys) != 0 {
+		metadata.outputRows, metadata.finalRows, _, _ = distributedGroupEstimates(snap, bound, route, outputRows)
+		metadata.reducerGroups = hashPartitionGroupUpper(metadata.finalRows, max(1, metadata.targets))
+		for _, target := range route.Targets {
+			if _, ok := snap.replicatedShardAt(route.Distribution, target.Shard); ok {
+				metadata.disableExchange = true
+				break
+			}
+		}
+	}
 	memo := queryplanner.NewMemo(queryplanner.Limits{})
 	remoteLogical := queryplanner.LogicalProperties{
 		Rows:     queryplanner.ExactEstimate(metadata.outputRows),
@@ -361,8 +361,8 @@ func optimizeDistributedAccessPlan(
 		return nil, queryplanner.OptimizerStatistics{}, err
 	}
 	root := remoteGroup
-	if len(bound.aggregates) != 0 && len(route.Targets) > 1 {
-		finalRows := metadata.outputRows
+	if len(bound.aggregates) != 0 && len(route.Targets) > 1 && !bound.groupLocal {
+		finalRows := metadata.finalRows
 		if len(bound.groupKeys) == 0 {
 			finalRows = 1
 		}
@@ -415,7 +415,7 @@ func optimizeDistributedAccessPlan(
 	optimizer := queryplanner.Optimizer{
 		Memo: memo, Rules: rules,
 		Model:     &distributedCostModel{private: map[queryplanner.PrivateID]distributedPrivate{privateID: metadata}},
-		Objective: queryplanner.Objective{MaxMemory: float64(profile.MaxAggregateBytes)},
+		Objective: queryplanner.Objective{MaxMemory: float64(profile.withDefaults().MaxAggregateBytes)},
 	}
 	plan, err := optimizer.Optimize(ctx, root, required)
 	return plan, optimizer.Statistics(), err
@@ -472,18 +472,25 @@ func distributedEstimates(
 	}
 	var inlineSelectivities [8]float64
 	selectivities := inlineSelectivities[:0]
-	if len(bound.constraints) > len(inlineSelectivities) {
-		selectivities = make([]float64, 0, len(bound.constraints))
+	domains, paths := bound.constraints, placement.Columns
+	if len(bound.statConstraints) != 0 {
+		domains, paths = bound.statConstraints, bound.statPaths
+	}
+	if len(domains) > len(inlineSelectivities) {
+		selectivities = make([]float64, 0, len(domains))
+	}
+	if joint, ok := boundJointSelectivity(drivingStatistics, paths, domains); ok {
+		return scanRows, scanBytes, boundedProduct(min(drivingRows, boundedProduct(drivingTableRows, joint.Upper)), joinExpansion), rowBytes
 	}
 	var scalarScratch [256]byte
-	for ordinal, domain := range bound.constraints {
+	for ordinal, domain := range domains {
 		if domain.Kind == distribution.DomainEmpty {
 			return scanRows, scanBytes, 0, rowBytes
 		}
-		if domain.Kind != distribution.DomainFinite || ordinal >= len(placement.Columns) {
+		if domain.Kind != distribution.DomainFinite || ordinal >= len(paths) {
 			continue
 		}
-		column, exists := drivingStatistics.Column(placement.Columns[ordinal])
+		column, exists := drivingStatistics.Column(paths[ordinal])
 		if !exists {
 			continue
 		}

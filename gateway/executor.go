@@ -1011,9 +1011,15 @@ func (e *Executor) fanoutGroupedBatches(
 	opctx, cancel := context.WithTimeout(ctx, p.GlobalDeadline)
 	defer cancel()
 
-	merger, err := newGroupedAggregateMerger(pl.aggregates, pl.groupKeys, p.MaxAggregateBytes)
-	if err != nil {
-		return nil, err
+	var merger *groupedAggregateMerger
+	var err error
+	var disjointRows [][]shardservice.Cell
+	var disjointBytes uint64
+	if !pl.groupLocal {
+		merger, err = newGroupedAggregateMerger(pl.aggregates, pl.groupKeys, p.MaxAggregateBytes)
+		if err != nil {
+			return nil, err
+		}
 	}
 	streams := make([]groupedShardStream, len(pl.calls))
 	for i := range streams {
@@ -1121,11 +1127,30 @@ func (e *Executor) fanoutGroupedBatches(
 					goto finished
 				}
 				for row := range batch.Rows {
+					if pl.groupLocal {
+						if len(batch.Rows[row]) != len(pl.aggregates) {
+							fail(ErrMergeSchema)
+							goto finished
+						}
+						charge := uint64(48 + len(batch.Rows[row])*32)
+						for _, cell := range batch.Rows[row] {
+							charge += uint64(len(cell.Bytes))
+						}
+						if disjointBytes > p.MaxAggregateBytes || charge > p.MaxAggregateBytes-disjointBytes {
+							fail(ErrResultLimit)
+							goto finished
+						}
+						disjointBytes += charge
+						continue
+					}
 					if addErr := merger.add(batch.Rows[row]); addErr != nil {
 						fail(fmt.Errorf("%w: shard %d row %d: %v",
 							ErrMergeAggregate, shard, shardRows+row, addErr))
 						goto finished
 					}
+				}
+				if pl.groupLocal {
+					disjointRows = appendGroupedBatch(disjointRows, batch.Rows)
 				}
 				shardRows += len(batch.Rows)
 			case <-opctx.Done():
@@ -1136,10 +1161,14 @@ func (e *Executor) fanoutGroupedBatches(
 	}
 
 finished:
+	operationErr := opctx.Err()
 	cancel()
 	wg.Wait()
 	if err := readError(); err != nil {
 		return nil, err
+	}
+	if operationErr != nil {
+		return nil, operationErr
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -1147,9 +1176,12 @@ finished:
 	if len(columns) != len(pl.aggregates) {
 		return nil, ErrMergeSchema
 	}
-	rows, err := merger.finish()
-	if err != nil {
-		return nil, err
+	rows := disjointRows
+	if merger != nil {
+		rows, err = merger.finish()
+		if err != nil {
+			return nil, err
+		}
 	}
 	rows, err = finalizeGroupedRowsWindow(
 		rows, pl.order, pl.offset, pl.limit, pl.hasLimit, p.MaxAggregateBytes,
@@ -1220,4 +1252,29 @@ func responseBytes(resp *shardservice.ShardResponse) uint64 {
 		}
 	}
 	return n
+}
+
+// Shard-local groups need ownership, not a second hash table. Batch arenas
+// preserve contiguous cells and payload while avoiding two allocations per row.
+func appendGroupedBatch(dst [][]shardservice.Cell, rows [][]shardservice.Cell) [][]shardservice.Cell {
+	cells, bytes := 0, 0
+	for _, row := range rows {
+		cells += len(row)
+		for _, cell := range row {
+			bytes += len(cell.Bytes)
+		}
+	}
+	cellArena := make([]shardservice.Cell, cells)
+	payload := make([]byte, 0, bytes)
+	for _, row := range rows {
+		out := cellArena[:len(row):len(row)]
+		cellArena = cellArena[len(row):]
+		for i, cell := range row {
+			start := len(payload)
+			payload = append(payload, cell.Bytes...)
+			out[i] = shardservice.Cell{Null: cell.Null, Bytes: payload[start:len(payload):len(payload)]}
+		}
+		dst = append(dst, out)
+	}
+	return dst
 }

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"hash/maphash"
+	"math"
+	"slices"
 	"strings"
 	"sync/atomic"
 
@@ -54,23 +56,27 @@ type PreparedPlan struct {
 	parser    sqlast.Parser
 	statement sqlast.Statement
 
-	generation   uint64
-	table        string
-	tables       []string
-	distribution distribution.DistributionName
-	spec         distribution.DistributionSpec
-	manifest     *distribution.Manifest
-	constraints  *sqldriver.ConstraintProgram
-	order        []OrderKey
-	limit        *sqlast.Operand
-	offset       *sqlast.Operand
-	aggregates   []sqlast.AggKind
-	groupKeys    []int
-	aggHeaders   []string
-	params       int
-	alwaysReason string
-	emptyReason  string
-	multiReason  string
+	generation      uint64
+	table           string
+	tables          []string
+	distribution    distribution.DistributionName
+	spec            distribution.DistributionSpec
+	manifest        *distribution.Manifest
+	constraints     *sqldriver.ConstraintProgram
+	statConstraints *sqldriver.ConstraintProgram
+	statPaths       []string
+	groupPaths      []string
+	groupLocal      bool
+	order           []OrderKey
+	limit           *sqlast.Operand
+	offset          *sqlast.Operand
+	aggregates      []sqlast.AggKind
+	groupKeys       []int
+	aggHeaders      []string
+	params          int
+	alwaysReason    string
+	emptyReason     string
+	multiReason     string
 
 	// writeKeyPointers holds one compiled shard-key pointer per ordinal for a
 	// whole-document insert or a whole-document UPDATE; it is nil for every
@@ -105,20 +111,24 @@ type boundGlobalIndexRead struct {
 // instructions stay private so callers cannot mutate a cached plan's shared
 // ORDER BY metadata.
 type BoundPlan struct {
-	generation   uint64
-	table        string
-	tables       []string
-	distribution distribution.DistributionName
-	constraints  distribution.BoundConstraints
-	order        []OrderKey
-	limit        int
-	offset       int
-	hasLimit     bool
-	aggregates   []sqlast.AggKind
-	groupKeys    []int
-	aggHeaders   []string
-	globalIndex  *boundGlobalIndexRead
-	globalEmpty  bool
+	generation      uint64
+	table           string
+	tables          []string
+	distribution    distribution.DistributionName
+	constraints     distribution.BoundConstraints
+	statConstraints distribution.BoundConstraints
+	statPaths       []string
+	groupPaths      []string
+	groupLocal      bool
+	order           []OrderKey
+	limit           int
+	offset          int
+	hasLimit        bool
+	aggregates      []sqlast.AggKind
+	groupKeys       []int
+	aggHeaders      []string
+	globalIndex     *boundGlobalIndexRead
+	globalEmpty     bool
 
 	spec         distribution.DistributionSpec
 	manifest     *distribution.Manifest
@@ -258,6 +268,32 @@ func (s *Snapshot) Prepare(ctx context.Context, sqlText string) (*PreparedPlan, 
 	plan.manifest = manifest
 	plan.params = plan.statement.Params()
 	plan.constraints = sqldriver.CompileConstraintProgram(placement.Columns, selectStmt.Where)
+	if stats, ok := s.Statistics(plan.table); ok {
+		plan.statPaths = appendStatisticsPredicatePaths(nil, stats.AppendColumnPaths(nil), selectStmt.Where)
+		if len(plan.statPaths) != 0 {
+			plan.statConstraints = sqldriver.CompileConstraintProgram(plan.statPaths, selectStmt.Where)
+		}
+	}
+	// Group statistics are valid only for base-table keys, before any join
+	// can change their domain or introduce NULL-extended values.
+	if len(selectStmt.From) == 1 {
+		for _, path := range selectStmt.GroupBy {
+			if path == nil || path.Source != 0 || path.MergedUsing != 0 {
+				plan.groupPaths = nil
+				break
+			}
+			plan.groupPaths = append(plan.groupPaths, string(path.AppendPointer(nil)))
+		}
+	}
+	if len(plan.groupPaths) != 0 {
+		plan.groupLocal = true
+		for _, path := range placement.Columns {
+			if !slices.Contains(plan.groupPaths, path) {
+				plan.groupLocal = false
+				break
+			}
+		}
+	}
 	if err := s.prepareGlobalIndexReads(plan, selectStmt.Where); err != nil {
 		return nil, err
 	}
@@ -346,6 +382,13 @@ func (p *PreparedPlan) Bind(args []any) (*BoundPlan, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrPlanParameters, err)
 	}
+	var statConstraints distribution.BoundConstraints
+	if p.statConstraints != nil {
+		statConstraints, err = p.statConstraints.Bind(args)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %w", ErrPlanParameters, err)
+		}
+	}
 	limit, err := bindPlanLimit(p.limit, args)
 	if err != nil {
 		return nil, err
@@ -364,7 +407,8 @@ func (p *PreparedPlan) Bind(args []any) (*BoundPlan, error) {
 	}
 	return &BoundPlan{
 		generation: p.generation, table: p.table,
-		tables:       p.tables,
+		tables:          p.tables,
+		statConstraints: statConstraints, statPaths: p.statPaths, groupPaths: p.groupPaths, groupLocal: p.groupLocal,
 		distribution: p.distribution, constraints: constraints,
 		order: p.order, limit: limit, offset: offset, hasLimit: p.limit != nil,
 		aggregates: p.aggregates, groupKeys: p.groupKeys,
@@ -434,39 +478,36 @@ func (s *Snapshot) prepareGlobalIndexReads(
 func (p *PreparedPlan) bindGlobalIndexRead(
 	args []any,
 ) (*boundGlobalIndexRead, bool, error) {
-	for pass := 0; pass < 2; pass++ {
-		for i := range p.readGlobalIndexes {
-			candidate := &p.readGlobalIndexes[i]
-			unique := candidate.program.metadata.Flags&IndexUnique != 0
-			if (pass == 0) != unique {
-				continue
+	var best *boundGlobalIndexRead
+	bestCost := math.MaxFloat64
+	for i := range p.readGlobalIndexes {
+		candidate := &p.readGlobalIndexes[i]
+		constraints, err := candidate.constraints.Bind(args)
+		if err != nil {
+			return nil, false, fmt.Errorf("%w: %w", ErrPlanParameters, err)
+		}
+		if len(constraints) == 0 || len(constraints) > 4 {
+			continue
+		}
+		complete := true
+		for _, domain := range constraints {
+			if domain.Kind == distribution.DomainEmpty {
+				return nil, true, nil
 			}
-			constraints, err := candidate.constraints.Bind(args)
-			if err != nil {
-				return nil, false, fmt.Errorf("%w: %w", ErrPlanParameters, err)
-			}
-			if len(constraints) == 0 || len(constraints) > 4 {
-				continue
-			}
-			complete := true
-			for ordinal := range constraints {
-				domain := constraints[ordinal]
-				if domain.Kind == distribution.DomainEmpty {
-					return nil, true, nil
-				}
-				if domain.Kind != distribution.DomainFinite || len(domain.Values) == 0 {
-					complete = false
-					break
-				}
-			}
-			if complete {
-				return &boundGlobalIndexRead{
-					program: candidate.program, constraints: constraints,
-				}, false, nil
+			if domain.Kind != distribution.DomainFinite || len(domain.Values) == 0 {
+				complete = false
 			}
 		}
+		if !complete {
+			continue
+		}
+		cost := globalIndexAccessCost(candidate.program, constraints)
+		if best == nil || cost < bestCost {
+			best = &boundGlobalIndexRead{program: candidate.program, constraints: constraints}
+			bestCost = cost
+		}
 	}
-	return nil, false, nil
+	return best, false, nil
 }
 
 // ValidateRoute refuses a cross-shard route whose result semantics the current
