@@ -44,6 +44,55 @@ func TestNodeStoreIdenticalSnapshotsAreIsolatedByGroup(t *testing.T) {
 	}
 }
 
+// Initial CreateNodeStore groups have not minted a runtime incarnation. They
+// are just as valid registration retries as groups registered after creation.
+func TestNodeStoreRegistrationRetryOfInitialGroup(t *testing.T) {
+	store, dir, options := registrationTestStore(t)
+	descriptor, snapshot := testGroupDescriptor(1), nodeSnapshot(1, 1, 1)
+	for _, reopen := range []bool{false, true} {
+		if reopen {
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			var err error
+			store, err = OpenNodeStore(dir, testNodeIdentity(), testKey(), options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+		}
+		syncs := 0
+		store.SetDataSyncForTesting(func(file *os.File) error {
+			syncs++
+			return file.Sync()
+		})
+		for _, withSnapshot := range []bool{false, true} {
+			var got GroupIncarnation
+			var err error
+			if withSnapshot {
+				got, err = store.RegisterGroupWithSnapshot(descriptor, snapshot)
+			} else {
+				got, err = store.RegisterGroup(descriptor)
+			}
+			if err != nil || got != (GroupIncarnation{GroupID: 1}) || syncs != 0 {
+				t.Fatalf("reopen=%t snapshot=%t retry=%+v syncs=%d err=%v", reopen, withSnapshot, got, syncs, err)
+			}
+		}
+		conflict := proto.Clone(snapshot).(*pb.Snapshot)
+		conflict.Data = append(conflict.Data, 'x')
+		if _, err := store.RegisterGroupWithSnapshot(descriptor, conflict); !errors.Is(err, ErrRetryConflict) {
+			t.Fatalf("different initial checkpoint accepted: %v", err)
+		}
+		if err := store.engine.DeepVerify(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	incarnations, err := store.BeginIncarnations([]uint64{1})
+	if err != nil || len(incarnations) != 1 || incarnations[0].Incarnation != 1 {
+		t.Fatalf("retry consumed the first runtime incarnation: %+v: %v", incarnations, err)
+	}
+}
+
 func registrationTestStore(t *testing.T) (*NodeStore, string, NodeStoreOptions) {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), "node")

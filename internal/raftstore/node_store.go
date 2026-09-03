@@ -1113,6 +1113,8 @@ func (s *NodeStore) persistIncarnationsLocked(requests []GroupIncarnation) error
 
 // RegisterGroup atomically publishes an exact portable group descriptor and
 // begins incarnation one in the same authenticated log frame and data sync.
+// An existing descriptor returns its current incarnation without a write;
+// initial CreateNodeStore groups return zero until their first runtime starts.
 // It is disabled once the node sequencer owns submission ordering.
 func (s *NodeStore) RegisterGroup(descriptor GroupDescriptor) (GroupIncarnation, error) {
 	s.mu.Lock()
@@ -1132,6 +1134,8 @@ func (s *NodeStore) RegisterGroup(descriptor GroupDescriptor) (GroupIncarnation,
 // This is a cold path; while a sequencer owns the store, use a Submission.
 // An exact retry is accepted while this checkpoint is still the group's base;
 // a conflicting or superseded base never silently resets existing Raft state.
+// A retry preserves the current incarnation, including zero for initial groups
+// that have never started a runtime.
 func (s *NodeStore) RegisterGroupWithSnapshot(descriptor GroupDescriptor, snapshot *pb.Snapshot) (GroupIncarnation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1179,7 +1183,10 @@ func (s *NodeStore) registerGroupLocked(descriptor GroupDescriptor, snapshot *pb
 			return GroupIncarnation{}, ErrIdentityMismatch
 		}
 		state, ok := s.engine.Summary(existing.LogKey)
-		if !ok || state.NodeIncarnation == 0 {
+		// CreateNodeStore installs initial groups before their first runtime
+		// incarnation. Zero is valid here: an exact retry must return the
+		// retained fence, not reject or silently mint a new one.
+		if !ok {
 			return GroupIncarnation{}, ErrCorrupt
 		}
 		if snapshot != nil {
