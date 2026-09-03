@@ -166,7 +166,14 @@ func TestAdoptNodeRuntimeDrivesWorkerFreeDurableReady(t *testing.T) {
 		}
 		t.Fatal(err)
 	}
-	if runtime.wal != nil || runtime.stable != group || runtime.pipelined == nil ||
+	defer runtime.Close()
+	if runtime.pipelined == nil {
+		t.Fatal("node Runtime has no ordered append lane")
+	}
+	// Group() and GroupByID() return distinct views of the same log group.
+	// Runtime must use the view owned by its bound persistence adapter, not
+	// the independently acquired view used to prepare SQL above.
+	if runtime.wal != nil || runtime.stable != persistence.stable || runtime.nodePersistence != persistence ||
 		runtime.pipelined.workerWake != nil || runtime.pipelined.done != nil {
 		t.Fatalf("node Runtime retained a per-group WAL worker: wal=%p worker=%v done=%v", runtime.wal, runtime.pipelined.workerWake, runtime.pipelined.done)
 	}
