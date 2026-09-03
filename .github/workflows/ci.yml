@@ -50,6 +50,7 @@ jobs:
           cmp "${first}" "${second}"
           go run ./cmd/vibedb-operator validate -manifest "${first}"
       - name: Run every external activation publication cut
+        if: ${{ !cancelled() && steps.go.outcome == 'success' }}
         shell: bash
         env:
           VIBEDB_RESTORE_ACTIVATION_E2E: "1"
@@ -73,6 +74,7 @@ jobs:
           fi
           grep -F 'restore_activation_evidence cuts=6' "${evidence}/go-test.jsonl" >/dev/null
       - name: Build three authority-free SQL roots per restored group
+        if: ${{ !cancelled() && steps.go.outcome == 'success' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -98,6 +100,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
       - name: Focused LATERAL race tests
+        if: ${{ !cancelled() && steps.go.outcome == 'success' }}
         run: go test -race -p=1 -count=1 -timeout=10m -run 'Lateral' ./query ./sql/driver ./pgwire
       - name: Save Go build cache
         if: ${{ !cancelled() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
@@ -287,6 +290,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
       - name: Prepare replica-replacement qualification
+        if: ${{ !cancelled() && steps.go.outcome == 'success' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -313,6 +317,7 @@ jobs:
           printf 'VIBEDB_REPLICA_REPLACEMENT_E2E=1 VIBEDB_REPLICA_REPLACEMENT_EVIDENCE=%s go test -json -count=3 -timeout=8m -run %s ./cmd/vibedb-gateway\n' \
             "${evidence}/runs" "^${test_name}$" > "${evidence}/command.txt"
       - name: Automatic replica-replacement process qualification
+        if: ${{ !cancelled() && steps.go.outcome == 'success' }}
         shell: bash
         env:
           VIBEDB_REPLICA_REPLACEMENT_E2E: "1"
@@ -392,9 +397,11 @@ jobs:
           if-no-files-found: error
           retention-days: 30
       - name: PostgreSQL client integration
+        if: ${{ !cancelled() && steps.go.outcome == 'success' }}
         working-directory: integration/pgclient
         run: go test -timeout=2m ./...
       - name: PostgreSQL psql 18.4 integration
+        if: ${{ !cancelled() && steps.go.outcome == 'success' }}
         working-directory: integration/pgclient
         env:
           VIBEDB_TEST_PSQL: "1"
@@ -477,6 +484,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
       - name: RF3 external-process fault evidence
+        if: ${{ !cancelled() && steps.go.outcome == 'success' }}
         run: |
           rf3_evidence_path="${RUNNER_TEMP}/rf3-chaos.tsv"
           go run ./bench/rf3chaos -output "${rf3_evidence_path}" -runs 1 -timeout 5m
@@ -485,6 +493,7 @@ jobs:
           grep -F $'summary\tpassed\t1\tfailed\t0' "${rf3_evidence_path}"
           sed -n '1,50p' "${rf3_evidence_path}"
       - name: Authenticated transport fault and throughput evidence
+        if: ${{ !cancelled() && steps.go.outcome == 'success' }}
         run: |
           go test ./gateway -run '^TestAuthorizedClientTLSNetworkChaosAndThroughputGate$' -count=1 -v
           go test ./gateway -run '^TestAuthenticated(GatewayShardHotAuthorizationAllocationFree|ShardBoundaryRotationAndConfusedDeputyFault)$' -count=1 -v
@@ -492,6 +501,7 @@ jobs:
           go test ./gateway -run '^$' -bench '^BenchmarkAuthorizedClientTLSRequest$' -benchtime=2000x -count=1
           go test ./gateway -run '^$' -bench '^BenchmarkAuthenticatedGatewayShardStream$' -benchtime=2000x -count=1
       - name: RF3 exhaustive quorum and multi-group scaling evidence
+        if: ${{ !cancelled() && steps.go.outcome == 'success' }}
         env:
           VIBEDB_RF3_QUORUM_QUALIFICATION: "1"
         run: |
