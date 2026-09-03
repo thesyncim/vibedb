@@ -144,9 +144,45 @@ jobs:
         with:
           path: ${{ steps.go.outputs.cache-path }}
           key: ${{ steps.go.outputs.cache-key }}
-  test:
-    name: test (${{ matrix.runner }})
+  cross-compile:
+    name: cross-compile (${{ matrix.goos }}/${{ matrix.goarch }})
     strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: '386'
+          - goos: windows
+            goarch: '386'
+          - goos: windows
+            goarch: amd64
+          - goos: windows
+            goarch: arm64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-go-ci
+        id: go
+        with:
+          scope: cross-${{ matrix.goos }}-${{ matrix.goarch }}
+      - name: Compile packages and tests in both modules
+        env:
+          CGO_ENABLED: '0'
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          go test -run '^$' -exec=true ./...
+          (cd integration/pgclient && go test -run '^$' -exec=true ./...)
+      - name: Save Go build cache
+        if: ${{ !cancelled() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.go.outputs.cache-path }}
+          key: ${{ steps.go.outputs.cache-key }}
+  native-test:
+    name: native test (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
       matrix:
         runner: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
@@ -158,24 +194,6 @@ jobs:
           scope: test
       - name: Build and vet
         run: go build ./... && go vet ./...
-      - name: Cross-compile 32-bit packages and tests
-        if: matrix.runner == 'ubuntu-latest'
-        env:
-          CGO_ENABLED: 0
-        run: |
-          GOOS=linux GOARCH=386 go test -run '^$' -exec=true ./...
-          GOOS=windows GOARCH=386 go test -run '^$' -exec=true ./...
-          (cd integration/pgclient && GOOS=linux GOARCH=386 go test -run '^$' -exec=true ./...)
-          (cd integration/pgclient && GOOS=windows GOARCH=386 go test -run '^$' -exec=true ./...)
-      - name: Cross-compile Windows 64-bit packages and tests
-        if: matrix.runner == 'ubuntu-latest'
-        env:
-          CGO_ENABLED: 0
-        run: |
-          GOOS=windows GOARCH=amd64 go test -run '^$' -exec=true ./...
-          GOOS=windows GOARCH=arm64 go test -run '^$' -exec=true ./...
-          (cd integration/pgclient && GOOS=windows GOARCH=amd64 go test -run '^$' -exec=true ./...)
-          (cd integration/pgclient && GOOS=windows GOARCH=arm64 go test -run '^$' -exec=true ./...)
       - name: Tests
         # Durable-backed package tests reserve large mmap arenas. Serializing
         # package binaries keeps the aggregate virtual-memory reservation
@@ -512,3 +530,17 @@ jobs:
         with:
           path: ${{ steps.go.outputs.cache-path }}
           key: ${{ steps.go.outputs.cache-key }}
+  test:
+    name: test (${{ matrix.runner }})
+    if: always()
+    needs: [cross-compile, native-test]
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require native and cross-compilation lanes to pass
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: jq -e 'all(.[]; .result == "success")' <<< "$RESULTS"
