@@ -3,6 +3,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 permissions:
   contents: read
 concurrency:
@@ -587,7 +588,9 @@ jobs:
         # multi-process resource gates under race overhead.
         env:
           PACKAGES: ${{ matrix.packages }}
-        run: go test -race -p=1 -count=1 -timeout=30m $PACKAGES
+        run: |
+          read -r -a test_targets <<< "$PACKAGES"
+          go test -race -p=1 -count=1 -timeout=30m "${test_targets[@]}"
       - name: Save Go build cache
         if: ${{ !cancelled() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
