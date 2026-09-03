@@ -34,7 +34,8 @@ SQL memory allowance; VibeDB uses its shipped bounded working sets. The shared
 are not claimed equivalent. Neither engine has disabled fsync or replication.
 
 The shared client creates the same table with a text primary key, an integer
-bucket, an integer score, and a 256-byte text payload. There are 8,192 initial
+bucket, an integer score, and the same repeated, compressible 256-byte ASCII
+text payload in every row. There are 8,192 initial
 rows and no secondary indexes. Each table has one initial data partition/range.
 CockroachDB gets an explicit `ANALYZE` after loading. VibeDB currently has no
 shipped distributed ANALYZE command; it uses the available optimizer metadata.

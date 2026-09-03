@@ -114,7 +114,8 @@ def main():
             else:
                 shell("for n in 0 1 2; do /bench/cockroach start --certs-dir=/data/certs --accept-sql-without-tls --store=/data/crdb-$n --listen-addr=127.0.0.1:$((26257+n)) --http-addr=127.0.0.1:$((8080+n)) --join=127.0.0.1:26257,127.0.0.1:26258,127.0.0.1:26259 --cache=512MiB --max-sql-memory=512MiB > /evidence/crdb-$n.log 2>&1 & done")
                 inside("/bench/cockroach", "init", "--certs-dir=/data/certs", "--host=127.0.0.1:26257")
-                inside("/bench/cockroach", "sql", "--certs-dir=/data/certs", "--host=127.0.0.1:26257", "-e", "SET CLUSTER SETTING server.host_based_authentication.configuration = 'host all all 127.0.0.1/32 trust'; CREATE USER bench; GRANT admin TO bench")
+                for statement in ["SET CLUSTER SETTING server.host_based_authentication.configuration = 'host all all 127.0.0.1/32 trust'", "CREATE USER bench", "GRANT admin TO bench"]:
+                    inside("/bench/cockroach", "sql", "--certs-dir=/data/certs", "--host=127.0.0.1:26257", "-e", statement)
                 time.sleep(2)  # allow authentication setting to propagate before clients connect
                 url = "postgresql://bench@127.0.0.1:26257/defaultdb?sslmode=disable"
                 processes = ["cockroach"]

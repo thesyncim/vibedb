@@ -36,6 +36,13 @@ proof that a row or shard can be omitted.
   memo still uses the coordinator budget as its overall memory ceiling, so
   raising the worker cap above that ceiling does not widen plan admission.
 
+RF3 SQL now waits in a bounded admission queue before acquiring a ReadIndex cut
+when execution reservations are full. The existing 112 MiB shared budget is
+unchanged; at most 16 SQL requests wait with only their charged request frames.
+Cancellation releases waiting slots. Eligible transaction snapshots also use
+compiled primary-key range bounds; staged-write overlays and filtered split
+ownership retain their required source paths.
+
 ## Go 1.27 and SIMD
 
 Go 1.27 is the minimum version already declared by this repository. Build with
@@ -68,8 +75,14 @@ full sketches reject hashes above their threshold before binary search. Duplicat
 or bounds are refused. Cardinality intervals are approximate statistical
 intervals; their confidence labels are not deterministic bounds on execution.
 Hash collisions are probabilistic. Collection is an explicit maintenance API;
-it is not an automatic scheduler or a new SQL ANALYZE command, and the synopsis
-has no network serialization protocol in this change.
+it is not an automatic scheduler or a new SQL ANALYZE command.
+
+`PartitionAnalysis.MarshalBinary` and `UnmarshalPartitionAnalysis` now preserve
+unionable sketches and priority samples in a versioned, checksummed format.
+Decoding bounds both wire size and expanded retained state, including repeated
+group-path references. `MatchesDefinition` fences shard, generation, schema,
+and collection bounds. RPC dispatch, collection scheduling, and atomic catalog
+publication of a complete remote scan still need integration.
 
 The resulting `TableStatistics` descriptors can be supplied to the existing
 catalog publication APIs. `Groups` adds joint NDV and tuple most-common-value
