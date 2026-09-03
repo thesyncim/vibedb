@@ -1,0 +1,75 @@
+"""Exercise the CI selector without compiling or running the database suites."""
+import collections
+import json
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+import unittest
+
+SCRIPT = Path(__file__).with_name("test-shard.sh").resolve()
+PREFIX = "github.com/thesyncim/vibedb"
+PACKAGES = [PREFIX + suffix for suffix in (
+    "", "/store/durable", "/query", "/store", "/sql/driver", "/pgwire",
+    "/cmd/vibedb-gateway", "/cmd/vibedb-shard", "/internal/raftservice",
+    "/new-package", "/store/durable/new-package",
+)]
+
+
+class TestShard(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        directory = Path(self.temp.name)
+        fake_go = directory / "go"
+        fake_go.write_text('''#!/usr/bin/env python3
+import json, os, sys
+if sys.argv[1:] == ["list", "./..."]:
+    print(os.environ["TEST_PACKAGES"])
+    sys.exit(int(os.environ.get("LIST_STATUS", "0")))
+if sys.argv[1] == "test":
+    print(json.dumps(sys.argv[1:]))
+    sys.exit(int(os.environ.get("TEST_STATUS", "0")))
+sys.exit(99)
+''')
+        fake_go.chmod(0o755)
+        self.env = dict(os.environ, PATH=str(directory) + os.pathsep + os.environ["PATH"],
+                        TEST_PACKAGES="\n".join(PACKAGES))
+
+    def run_shard(self, *args):
+        return subprocess.run(["bash", str(SCRIPT), *args], env=self.env,
+                              text=True, capture_output=True)
+
+    def test_disjoint_and_complete_including_new_packages(self):
+        selected = []
+        for shard in ("durable", "sql", "process", "core"):
+            result = self.run_shard(shard, "--list")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            selected.extend(result.stdout.splitlines())
+        self.assertEqual(collections.Counter(selected), collections.Counter(PACKAGES))
+
+    def test_invalid_arguments_fail(self):
+        for args in ((), ("typo",), ("core", "typo"), ("core", "--list", "extra")):
+            self.assertNotEqual(self.run_shard(*args).returncode, 0)
+
+    def test_partial_failed_discovery_cannot_run_tests(self):
+        self.env["LIST_STATUS"] = "7"
+        result = self.run_shard("core")
+        self.assertEqual(result.returncode, 7)
+        self.assertEqual(result.stdout, "")
+
+    def test_empty_shard_fails(self):
+        self.env["TEST_PACKAGES"] = PREFIX + "/query"
+        self.assertNotEqual(self.run_shard("durable").returncode, 0)
+
+    def test_serial_execution_and_failure_propagation(self):
+        self.env["TEST_STATUS"] = "9"
+        result = self.run_shard("process")
+        self.assertEqual(result.returncode, 9)
+        args = json.loads(result.stdout.splitlines()[-1])
+        self.assertEqual(args, ["test", "-p=1", "-timeout=25m",
+                                PREFIX + "/cmd/vibedb-gateway", PREFIX + "/cmd/vibedb-shard"])
+
+
+if __name__ == "__main__":
+    unittest.main()

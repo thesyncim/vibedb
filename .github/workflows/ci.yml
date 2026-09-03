@@ -20,6 +20,8 @@ jobs:
           scope: repository-contracts
       - name: Validate workflow syntax
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
+      - name: Validate test shard selection
+        run: python3 -m unittest discover -s scripts/ci -p '*_test.py'
       - name: Reject stale generated contracts
         shell: bash
         run: |
@@ -144,6 +146,27 @@ jobs:
         with:
           path: ${{ steps.go.outputs.cache-path }}
           key: ${{ steps.go.outputs.cache-key }}
+  build:
+    name: build and vet (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-go-ci
+        id: go
+        with:
+          scope: build
+      - name: Build and vet
+        run: go build ./... && go vet ./...
+      - name: Save Go build cache
+        if: ${{ !cancelled() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.go.outputs.cache-path }}
+          key: ${{ steps.go.outputs.cache-key }}
   cross-compile:
     name: cross-compile (${{ matrix.goos }}/${{ matrix.goarch }})
     strategy:
@@ -179,28 +202,48 @@ jobs:
         with:
           path: ${{ steps.go.outputs.cache-path }}
           key: ${{ steps.go.outputs.cache-key }}
-  native-test:
-    name: native test (${{ matrix.runner }})
+  unit-tests:
+    name: unit (${{ matrix.runner }}, ${{ matrix.shard }})
     strategy:
       fail-fast: false
       matrix:
         runner: [ubuntu-latest, ubuntu-24.04-arm]
+        shard: [durable, sql, process, core]
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-go-ci
         id: go
         with:
-          scope: test
-      - name: Build and vet
-        run: go build ./... && go vet ./...
+          scope: unit-${{ matrix.shard }}
       - name: Tests
-        # Durable-backed package tests reserve large mmap arenas. Serializing
-        # package binaries keeps the aggregate virtual-memory reservation
-        # deterministic without reducing test coverage or per-package timeouts.
-        run: go test -p=1 -timeout=25m ./...
+        shell: bash
+        run: scripts/ci/test-shard.sh "$TEST_SHARD" | tee "${RUNNER_TEMP}/unit-tests.txt"
+        env:
+          TEST_SHARD: ${{ matrix.shard }}
+      - name: Upload package timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-timings-${{ matrix.runner }}-${{ matrix.shard }}
+          path: ${{ runner.temp }}/unit-tests.txt
+          retention-days: 7
+      - name: Save Go build cache
+        if: ${{ !cancelled() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.go.outputs.cache-path }}
+          key: ${{ steps.go.outputs.cache-key }}
+  durable-sql-rf3:
+    name: Durable SQL RF3 recovery
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-go-ci
+        id: go
+        with:
+          scope: durable-sql-rf3
       - name: Prepare durable SQL RF3 recovery qualification
-        if: matrix.runner == 'ubuntu-latest'
         shell: bash
         run: |
           set -euo pipefail
@@ -229,7 +272,6 @@ jobs:
           printf 'TMPDIR=%s VIBEDB_DURABLE_SQL_RF3_E2E=1 go test -json -count=3 -timeout=8m -run %s ./internal/raftservice\n' \
             "${test_root}" "^${test_name}$" > "${evidence}/command.txt"
       - name: Durable SQL RF3 terminal and ACK recovery qualification
-        if: matrix.runner == 'ubuntu-latest'
         shell: bash
         env:
           TMPDIR: ${{ runner.temp }}/durable-sql-rf3-tmp
@@ -241,7 +283,7 @@ jobs:
             ./internal/raftservice \
             | tee "${RUNNER_TEMP}/durable-sql-rf3/go-test.jsonl"
       - name: Validate durable SQL RF3 recovery evidence
-        if: always() && matrix.runner == 'ubuntu-latest'
+        if: always()
         shell: bash
         run: |
           set -euo pipefail
@@ -263,15 +305,29 @@ jobs:
             "$(cat "${evidence}/revision.txt")" > "${summary}"
           test "$(stat -c %s "${summary}")" -le 65536
       - name: Upload durable SQL RF3 recovery evidence
-        if: always() && matrix.runner == 'ubuntu-latest'
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: durable-sql-rf3-${{ github.sha }}
           path: ${{ runner.temp }}/durable-sql-rf3
           if-no-files-found: error
           retention-days: 30
+      - name: Save Go build cache
+        if: ${{ !cancelled() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.go.outputs.cache-path }}
+          key: ${{ steps.go.outputs.cache-key }}
+  replica-replacement:
+    name: Automatic replica replacement
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-go-ci
+        id: go
+        with:
+          scope: replica-replacement
       - name: Prepare replica-replacement qualification
-        if: matrix.runner == 'ubuntu-latest'
         shell: bash
         run: |
           set -euo pipefail
@@ -298,7 +354,6 @@ jobs:
           printf 'VIBEDB_REPLICA_REPLACEMENT_E2E=1 VIBEDB_REPLICA_REPLACEMENT_EVIDENCE=%s go test -json -count=3 -timeout=8m -run %s ./cmd/vibedb-gateway\n' \
             "${evidence}/runs" "^${test_name}$" > "${evidence}/command.txt"
       - name: Automatic replica-replacement process qualification
-        if: matrix.runner == 'ubuntu-latest'
         shell: bash
         env:
           VIBEDB_REPLICA_REPLACEMENT_E2E: "1"
@@ -310,7 +365,7 @@ jobs:
             ./cmd/vibedb-gateway \
             | tee "${RUNNER_TEMP}/replica-replacement/go-test.jsonl"
       - name: Validate replica-replacement evidence
-        if: always() && matrix.runner == 'ubuntu-latest'
+        if: always()
         shell: bash
         run: |
           set -euo pipefail
@@ -370,15 +425,29 @@ jobs:
           EOF
           test "$(stat -c %s "${summary}")" -le 65536
       - name: Upload replica-replacement evidence
-        if: always() && matrix.runner == 'ubuntu-latest'
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: replica-replacement-${{ github.sha }}
           path: ${{ runner.temp }}/replica-replacement
           if-no-files-found: error
           retention-days: 30
+      - name: Save Go build cache
+        if: ${{ !cancelled() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.go.outputs.cache-path }}
+          key: ${{ steps.go.outputs.cache-key }}
+  hot-shard-mutation:
+    name: Write-driven hot-shard qualification
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-go-ci
+        id: go
+        with:
+          scope: hot-shard-mutation
       - name: Prepare write-driven hot-shard qualification
-        if: matrix.runner == 'ubuntu-latest'
         shell: bash
         run: |
           set -euo pipefail
@@ -392,7 +461,6 @@ jobs:
           go test -list "^${test_name}$" ./cmd/vibedb-gateway > "${evidence}/test-list.txt"
           grep -Fqx "${test_name}" "${evidence}/test-list.txt"
       - name: Write-driven hot-shard process qualification
-        if: matrix.runner == 'ubuntu-latest'
         shell: bash
         env:
           VIBEDB_HOT_SHARD_MUTATION_E2E: "1"
@@ -403,7 +471,7 @@ jobs:
             ./cmd/vibedb-gateway \
             | tee "${RUNNER_TEMP}/hot-shard-mutation/go-test.jsonl"
       - name: Validate write-driven hot-shard evidence
-        if: always() && matrix.runner == 'ubuntu-latest'
+        if: always()
         shell: bash
         run: |
           set -euo pipefail
@@ -434,15 +502,29 @@ jobs:
                 contains("snapshot_network_growth=")))' \
             "${result}" >/dev/null
       - name: Upload write-driven hot-shard evidence
-        if: always() && matrix.runner == 'ubuntu-latest'
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: hot-shard-mutation-${{ github.sha }}
           path: ${{ runner.temp }}/hot-shard-mutation
           if-no-files-found: error
           retention-days: 30
+      - name: Save Go build cache
+        if: ${{ !cancelled() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.go.outputs.cache-path }}
+          key: ${{ steps.go.outputs.cache-key }}
+  transport-qualification:
+    name: RF3 and authenticated transport qualification
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-go-ci
+        id: go
+        with:
+          scope: transport-qualification
       - name: RF3 external-process fault evidence
-        if: matrix.runner == 'ubuntu-latest'
         run: |
           rf3_evidence_path="${RUNNER_TEMP}/rf3-chaos.tsv"
           go run ./bench/rf3chaos -output "${rf3_evidence_path}" -runs 1 -timeout 5m
@@ -451,7 +533,6 @@ jobs:
           grep -F $'summary\tpassed\t1\tfailed\t0' "${rf3_evidence_path}"
           sed -n '1,50p' "${rf3_evidence_path}"
       - name: Authenticated transport fault and throughput evidence
-        if: matrix.runner == 'ubuntu-latest'
         run: |
           go test ./gateway -run '^TestAuthorizedClientTLSNetworkChaosAndThroughputGate$' -count=1 -v
           go test ./gateway -run '^TestAuthenticated(GatewayShardHotAuthorizationAllocationFree|ShardBoundaryRotationAndConfusedDeputyFault)$' -count=1 -v
@@ -459,22 +540,53 @@ jobs:
           go test ./gateway -run '^$' -bench '^BenchmarkAuthorizedClientTLSRequest$' -benchtime=2000x -count=1
           go test ./gateway -run '^$' -bench '^BenchmarkAuthenticatedGatewayShardStream$' -benchtime=2000x -count=1
       - name: RF3 exhaustive quorum and multi-group scaling evidence
-        if: matrix.runner == 'ubuntu-latest'
         env:
           VIBEDB_RF3_QUORUM_QUALIFICATION: "1"
         run: |
           go test ./internal/raftservice -run '^TestRF3AllThreeVoterQuorumCutsFailClosedOrCommit$' -count=1 -v
           go test ./internal/multiraft -run '^$' -bench '^BenchmarkExecutionLanes(Scaling|SixtyFourGroups|HotShardIsolation)$' -benchtime=1000x -count=1
+      - name: Save Go build cache
+        if: ${{ !cancelled() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.go.outputs.cache-path }}
+          key: ${{ steps.go.outputs.cache-key }}
+  postgresql-client:
+    name: PostgreSQL client integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-go-ci
+        id: go
+        with:
+          scope: postgresql-client
       - name: PostgreSQL client integration
-        if: matrix.runner == 'ubuntu-latest'
         working-directory: integration/pgclient
         run: go test -timeout=2m ./...
       - name: PostgreSQL psql 18.4 integration
-        if: matrix.runner == 'ubuntu-latest'
         working-directory: integration/pgclient
         env:
           VIBEDB_TEST_PSQL: "1"
         run: go test -count=1 -timeout=5m -run '^TestPSQLClient18$' -v .
+      - name: Save Go build cache
+        if: ${{ !cancelled() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.go.outputs.cache-path }}
+          key: ${{ steps.go.outputs.cache-key }}
+  storage-race:
+    name: race storage (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-go-ci
+        id: go
+        with:
+          scope: storage-race
       - name: Race, storage suites
         # Qualification tests build multi-hundred-MiB corpora and are geometry/
         # throughput gates; under -race on ARM they alone can exhaust the budget.
@@ -485,6 +597,20 @@ jobs:
         with:
           path: ${{ steps.go.outputs.cache-path }}
           key: ${{ steps.go.outputs.cache-key }}
+  test:
+    name: test (${{ matrix.runner }})
+    if: always()
+    needs: [build, cross-compile, unit-tests, durable-sql-rf3, replica-replacement, hot-shard-mutation, transport-qualification, postgresql-client, storage-race]
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every test lane to pass
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: jq -e 'all(.[]; .result == "success")' <<< "$RESULTS"
   lateral-race:
     name: race (LATERAL cross-layer)
     runs-on: ubuntu-latest
@@ -502,8 +628,12 @@ jobs:
         with:
           path: ${{ steps.go.outputs.cache-path }}
           key: ${{ steps.go.outputs.cache-key }}
-  distributed-race:
-    name: race (distributed serving)
+  distributed-race-packages:
+    name: race distributed (${{ matrix.package }})
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [gateway, internal/multiraft, internal/raftservice, internal/replicatedstate, internal/snapshottransfer]
     runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:
@@ -511,7 +641,7 @@ jobs:
       - uses: ./.github/actions/setup-go-ci
         id: go
         with:
-          scope: distributed-race
+          scope: race-${{ matrix.package }}
       - name: Distributed serving race tests
         # External qualification corpora have dedicated no-skip Linux jobs in
         # the test matrix. This lane instruments the serving, quorum, durable
@@ -519,28 +649,20 @@ jobs:
         # multi-process resource gates under race overhead.
         run: >-
           go test -race -p=1 -count=1 -timeout=30m
-          ./gateway
-          ./internal/multiraft
-          ./internal/raftservice
-          ./internal/replicatedstate
-          ./internal/snapshottransfer
+          ./${{ matrix.package }}
       - name: Save Go build cache
         if: ${{ !cancelled() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
         with:
           path: ${{ steps.go.outputs.cache-path }}
           key: ${{ steps.go.outputs.cache-key }}
-  test:
-    name: test (${{ matrix.runner }})
+  distributed-race:
+    name: race (distributed serving)
     if: always()
-    needs: [cross-compile, native-test]
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    needs: [distributed-race-packages]
     runs-on: ubuntu-latest
     steps:
-      - name: Require native and cross-compilation lanes to pass
+      - name: Require every distributed race package to pass
         env:
-          RESULTS: ${{ toJSON(needs) }}
-        run: jq -e 'all(.[]; .result == "success")' <<< "$RESULTS"
+          RESULT: ${{ needs.distributed-race-packages.result }}
+        run: test "$RESULT" = success
