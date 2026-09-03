@@ -44,13 +44,17 @@ present and did not save updated build outputs.
 
 ## Changes
 
-- Four cross-compilation targets run independently, covering the same root and
-  PostgreSQL client modules. They no longer delay native tests.
+- Four cross-compilation targets run in two independent compiler lanes, covering
+  the same root and PostgreSQL client modules. They no longer delay native tests.
 - Native tests use four disjoint shards on each of the existing architectures.
   `go list ./...` discovers the complete package set; new packages default to the
   core shard. Each runner retains `-p=1` and the 25-minute package timeout.
-- Linux process qualifications, client integration, and both storage-race lanes
-  run independently. Distributed race packages also run independently.
+- Slow Linux process qualifications and both storage-race lanes run independently.
+  Short recovery/client checks share a runner; distributed race packages use two
+  balanced lanes. Build/vet runs in the core shard on each architecture. This
+  limits initial fan-out to 20 jobs; the first 30-job experiment left nine jobs
+  queued while only about 20 ran. Restore activation shares the contract runner
+  and retains its prior required check name through an aggregator.
 - Modules have a shared dependency cache. Build/test cache snapshots have separate
   toolchain, host architecture, and lane keys, with a revision suffix and a prefix
   restore from an earlier revision. Go validates each restored cache entry.
@@ -74,14 +78,15 @@ union was also compared with real `go list ./...`: all 83 packages exactly once.
 The original and revised workflow steps were compared for unchanged evidence
 commands, environment, artifact paths, repeat counts, and timeouts.
 
-The revised workflow has not run on GitHub yet. A macOS run cannot validate the
+The first split workflow is running on GitHub; completed comparisons will be
+recorded here once available. A macOS run cannot validate the
 Linux filesystem qualifications or ARM runner performance. Compare the first
 cold-cache run and at least two subsequent source revisions, separating queue
 time, cache restore/save, compilation, and package execution. Compare the same
 successful checks before claiming an end-to-end gain. Use the uploaded
 `unit-timings-*` logs and the run's job/step timestamps.
 
-More runners duplicate some compilation and use more concurrent job slots; more
+Parallel runners duplicate some compilation and use more concurrent job slots; more
 revision caches consume storage and can cause eviction. Observe queue time,
 runner minutes, and cache hit rates as well as latency. Account concurrency
 limits can absorb much of the scheduling gain. Cold caches and substantial
@@ -107,3 +112,13 @@ References:
 [setup-go caching](https://github.com/actions/setup-go/blob/main/docs/advanced-usage.md#caching),
 [Go build and test caching](https://pkg.go.dev/cmd/go#hdr-Build_and_test_caching),
 [Bazel remote caching](https://bazel.build/remote/caching).
+
+To report a run without counting later metadata edits as execution time:
+
+```sh
+gh run view RUN_ID --json createdAt,updatedAt,status,conclusion,jobs | \
+  python3 scripts/ci/summarize-run.py --baseline-seconds 1660
+```
+
+The report separates initial queue time and identifies failed/incomplete runs;
+an elapsed-time ratio for a failed run is not a passing-suite speedup.

@@ -37,4 +37,4 @@ if [[ ${2:-} == --list ]]; then
   exit 0
 fi
 printf 'Test shard %s: %s packages\n' "$shard" "${#selected[@]}"
-exec go test -p=1 -timeout=25m "${selected[@]}"
+exec go test -json -p=1 -timeout=25m "${selected[@]}"

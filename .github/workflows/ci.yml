@@ -46,52 +46,6 @@ jobs:
           go run ./cmd/vibedb-operator render -image "vibedb:${GITHUB_SHA}" -namespace vibedb-test -shard-node-ids "${ids}" > "${second}"
           cmp "${first}" "${second}"
           go run ./cmd/vibedb-operator validate -manifest "${first}"
-      - name: Save Go build cache
-        if: ${{ !cancelled() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@v4
-        with:
-          path: ${{ steps.go.outputs.cache-path }}
-          key: ${{ steps.go.outputs.cache-key }}
-  kubernetes-rf3:
-    name: Kubernetes RF3 serving and restart qualification
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v6
-      - uses: ./.github/actions/setup-go-ci
-        id: go
-        with:
-          scope: kubernetes-rf3
-      - name: Install pinned Kind
-        run: go install sigs.k8s.io/kind@v0.32.0
-      - name: Qualify three-worker RF3 topology
-        env:
-          VIBEDB_KUBE_EVIDENCE_DIR: ${{ runner.temp }}/vibedb-kube-rf3-evidence
-        run: deploy/kubernetes/qualify-kind.sh
-      - name: Upload Kubernetes RF3 evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: kubernetes-rf3-${{ github.sha }}
-          path: ${{ runner.temp }}/vibedb-kube-rf3-evidence
-          if-no-files-found: error
-          retention-days: 30
-      - name: Save Go build cache
-        if: ${{ !cancelled() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@v4
-        with:
-          path: ${{ steps.go.outputs.cache-path }}
-          key: ${{ steps.go.outputs.cache-key }}
-  restore-activation:
-    name: Fresh RF3 restore activation crash qualification
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v6
-      - uses: ./.github/actions/setup-go-ci
-        id: go
-        with:
-          scope: restore-activation
       - name: Run every external activation publication cut
         shell: bash
         env:
@@ -146,21 +100,30 @@ jobs:
         with:
           path: ${{ steps.go.outputs.cache-path }}
           key: ${{ steps.go.outputs.cache-key }}
-  build:
-    name: build and vet (${{ matrix.runner }})
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [ubuntu-latest, ubuntu-24.04-arm]
-    runs-on: ${{ matrix.runner }}
+  kubernetes-rf3:
+    name: Kubernetes RF3 serving and restart qualification
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-go-ci
         id: go
         with:
-          scope: build
-      - name: Build and vet
-        run: go build ./... && go vet ./...
+          scope: kubernetes-rf3
+      - name: Install pinned Kind
+        run: go install sigs.k8s.io/kind@v0.32.0
+      - name: Qualify three-worker RF3 topology
+        env:
+          VIBEDB_KUBE_EVIDENCE_DIR: ${{ runner.temp }}/vibedb-kube-rf3-evidence
+        run: deploy/kubernetes/qualify-kind.sh
+      - name: Upload Kubernetes RF3 evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kubernetes-rf3-${{ github.sha }}
+          path: ${{ runner.temp }}/vibedb-kube-rf3-evidence
+          if-no-files-found: error
+          retention-days: 30
       - name: Save Go build cache
         if: ${{ !cancelled() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
@@ -168,34 +131,32 @@ jobs:
           path: ${{ steps.go.outputs.cache-path }}
           key: ${{ steps.go.outputs.cache-key }}
   cross-compile:
-    name: cross-compile (${{ matrix.goos }}/${{ matrix.goarch }})
+    name: cross-compile (${{ matrix.name }})
     strategy:
       fail-fast: false
       matrix:
         include:
-          - goos: linux
-            goarch: '386'
-          - goos: windows
-            goarch: '386'
-          - goos: windows
-            goarch: amd64
-          - goos: windows
-            goarch: arm64
+          - name: 32-bit
+            targets: linux/386 windows/386
+          - name: windows-64-bit
+            targets: windows/amd64 windows/arm64
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-go-ci
         id: go
         with:
-          scope: cross-${{ matrix.goos }}-${{ matrix.goarch }}
+          scope: cross-${{ matrix.name }}
       - name: Compile packages and tests in both modules
         env:
           CGO_ENABLED: '0'
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
+          TARGETS: ${{ matrix.targets }}
         run: |
-          go test -run '^$' -exec=true ./...
-          (cd integration/pgclient && go test -run '^$' -exec=true ./...)
+          for target in $TARGETS; do
+            export GOOS="${target%/*}" GOARCH="${target#*/}"
+            go test -run '^$' -exec=true ./...
+            (cd integration/pgclient && go test -run '^$' -exec=true ./...)
+          done
       - name: Save Go build cache
         if: ${{ !cancelled() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
@@ -216,6 +177,9 @@ jobs:
         id: go
         with:
           scope: unit-${{ matrix.shard }}
+      - name: Build and vet
+        if: matrix.shard == 'core'
+        run: go build ./... && go vet ./...
       - name: Tests
         shell: bash
         run: scripts/ci/test-shard.sh "$TEST_SHARD" | tee "${RUNNER_TEMP}/unit-tests.txt"
@@ -235,7 +199,7 @@ jobs:
           path: ${{ steps.go.outputs.cache-path }}
           key: ${{ steps.go.outputs.cache-key }}
   durable-sql-rf3:
-    name: Durable SQL RF3 recovery
+    name: Recovery, replica replacement and PostgreSQL clients
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -312,21 +276,6 @@ jobs:
           path: ${{ runner.temp }}/durable-sql-rf3
           if-no-files-found: error
           retention-days: 30
-      - name: Save Go build cache
-        if: ${{ !cancelled() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@v4
-        with:
-          path: ${{ steps.go.outputs.cache-path }}
-          key: ${{ steps.go.outputs.cache-key }}
-  replica-replacement:
-    name: Automatic replica replacement
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: ./.github/actions/setup-go-ci
-        id: go
-        with:
-          scope: replica-replacement
       - name: Prepare replica-replacement qualification
         shell: bash
         run: |
@@ -432,6 +381,14 @@ jobs:
           path: ${{ runner.temp }}/replica-replacement
           if-no-files-found: error
           retention-days: 30
+      - name: PostgreSQL client integration
+        working-directory: integration/pgclient
+        run: go test -timeout=2m ./...
+      - name: PostgreSQL psql 18.4 integration
+        working-directory: integration/pgclient
+        env:
+          VIBEDB_TEST_PSQL: "1"
+        run: go test -count=1 -timeout=5m -run '^TestPSQLClient18$' -v .
       - name: Save Go build cache
         if: ${{ !cancelled() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
@@ -551,29 +508,6 @@ jobs:
         with:
           path: ${{ steps.go.outputs.cache-path }}
           key: ${{ steps.go.outputs.cache-key }}
-  postgresql-client:
-    name: PostgreSQL client integration
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: ./.github/actions/setup-go-ci
-        id: go
-        with:
-          scope: postgresql-client
-      - name: PostgreSQL client integration
-        working-directory: integration/pgclient
-        run: go test -timeout=2m ./...
-      - name: PostgreSQL psql 18.4 integration
-        working-directory: integration/pgclient
-        env:
-          VIBEDB_TEST_PSQL: "1"
-        run: go test -count=1 -timeout=5m -run '^TestPSQLClient18$' -v .
-      - name: Save Go build cache
-        if: ${{ !cancelled() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@v4
-        with:
-          path: ${{ steps.go.outputs.cache-path }}
-          key: ${{ steps.go.outputs.cache-key }}
   storage-race:
     name: race storage (${{ matrix.runner }})
     strategy:
@@ -600,7 +534,7 @@ jobs:
   test:
     name: test (${{ matrix.runner }})
     if: always()
-    needs: [build, cross-compile, unit-tests, durable-sql-rf3, replica-replacement, hot-shard-mutation, transport-qualification, postgresql-client, storage-race]
+    needs: [cross-compile, unit-tests, durable-sql-rf3, hot-shard-mutation, transport-qualification, storage-race]
     strategy:
       fail-fast: false
       matrix:
@@ -629,11 +563,15 @@ jobs:
           path: ${{ steps.go.outputs.cache-path }}
           key: ${{ steps.go.outputs.cache-key }}
   distributed-race-packages:
-    name: race distributed (${{ matrix.package }})
+    name: race distributed (${{ matrix.name }})
     strategy:
       fail-fast: false
       matrix:
-        package: [gateway, internal/multiraft, internal/raftservice, internal/replicatedstate, internal/snapshottransfer]
+        include:
+          - name: gateway-snapshot
+            packages: ./gateway ./internal/multiraft ./internal/snapshottransfer
+          - name: raft-state
+            packages: ./internal/raftservice ./internal/replicatedstate
     runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:
@@ -641,15 +579,15 @@ jobs:
       - uses: ./.github/actions/setup-go-ci
         id: go
         with:
-          scope: race-${{ matrix.package }}
+          scope: race-${{ matrix.name }}
       - name: Distributed serving race tests
         # External qualification corpora have dedicated no-skip Linux jobs in
         # the test matrix. This lane instruments the serving, quorum, durable
         # ledger, and snapshot concurrency paths without duplicating those
         # multi-process resource gates under race overhead.
-        run: >-
-          go test -race -p=1 -count=1 -timeout=30m
-          ./${{ matrix.package }}
+        env:
+          PACKAGES: ${{ matrix.packages }}
+        run: go test -race -p=1 -count=1 -timeout=30m $PACKAGES
       - name: Save Go build cache
         if: ${{ !cancelled() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
@@ -665,4 +603,14 @@ jobs:
       - name: Require every distributed race package to pass
         env:
           RESULT: ${{ needs.distributed-race-packages.result }}
+        run: test "$RESULT" = success
+  restore-activation:
+    name: Fresh RF3 restore activation crash qualification
+    if: always()
+    needs: [repository-contracts]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require repository contracts and restore activation to pass
+        env:
+          RESULT: ${{ needs.repository-contracts.result }}
         run: test "$RESULT" = success

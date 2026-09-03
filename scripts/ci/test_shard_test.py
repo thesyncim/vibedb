@@ -67,7 +67,7 @@ sys.exit(99)
         result = self.run_shard("process")
         self.assertEqual(result.returncode, 9)
         args = json.loads(result.stdout.splitlines()[-1])
-        self.assertEqual(args, ["test", "-p=1", "-timeout=25m",
+        self.assertEqual(args, ["test", "-json", "-p=1", "-timeout=25m",
                                 PREFIX + "/cmd/vibedb-gateway", PREFIX + "/cmd/vibedb-shard"])
 
 
