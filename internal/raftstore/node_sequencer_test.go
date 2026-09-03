@@ -115,6 +115,33 @@ func TestNodeSubmissionSequencerRejectsUnpreparedAndFailedPrepare(t *testing.T) 
 	}
 }
 
+func TestNodeSubmissionSequencerWakeFanoutDoesNotOverwriteOwners(t *testing.T) {
+	q := newTestSequencer(t, 8, func([]NodeReady) error { return nil })
+	first, second := preparedSubmission(t, 1, 1), preparedSubmission(t, 2, 1)
+	var firstWake, replacementWake, secondWake atomic.Int32
+	q.SetWakeFor(first, func() { firstWake.Add(1) })
+	q.SetWakeFor(second, func() { secondWake.Add(1) })
+	q.notifyOwner()
+	if firstWake.Load() != 1 || secondWake.Load() != 1 {
+		t.Fatalf("initial wake fanout=%d/%d want 1/1", firstWake.Load(), secondWake.Load())
+	}
+	q.SetWakeFor(first, func() { replacementWake.Add(1) })
+	q.notifyOwner()
+	if firstWake.Load() != 1 || replacementWake.Load() != 1 || secondWake.Load() != 2 {
+		t.Fatalf("replaced wake fanout=%d/%d/%d want 1/1/2",
+			firstWake.Load(), replacementWake.Load(), secondWake.Load())
+	}
+	q.SetWakeFor(first, nil)
+	q.notifyOwner()
+	if replacementWake.Load() != 1 || secondWake.Load() != 3 {
+		t.Fatalf("unregistered wake fanout=%d/%d want 1/3", replacementWake.Load(), secondWake.Load())
+	}
+	q.SetWakeFor(second, nil)
+	if q.ownerWakes.Load() != nil {
+		t.Fatal("last wake unregister retained a callback snapshot")
+	}
+}
+
 func preparedSubmission(t *testing.T, group, readyID uint64) *Submission {
 	t.Helper()
 	s := new(Submission)

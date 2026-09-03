@@ -1643,6 +1643,9 @@ func (runtime *Runtime) Close() error {
 	runtime.stopping = true
 	if runtime.pipelined != nil {
 		runtime.pipelined.stopAppendWorker()
+		if runtime.nodePersistence != nil {
+			runtime.nodePersistence.sequencer.SetWakeFor(&runtime.nodePersistence.cell, nil)
+		}
 		runtime.pipelined = nil
 	}
 	if runtime.walGeneration != nil {

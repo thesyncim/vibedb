@@ -232,7 +232,8 @@ type NodeSubmissionSequencer struct {
 	stopOnce   sync.Once
 	drainOnce  sync.Once
 	fatal      atomic.Pointer[sequencerFailure]
-	ownerWake  atomic.Pointer[nodeSequencerWake]
+	wakeMu     sync.Mutex
+	ownerWakes atomic.Pointer[nodeSequencerWakeSet]
 
 	persist func([]NodeReady) error
 
@@ -242,7 +243,11 @@ type NodeSubmissionSequencer struct {
 }
 
 type sequencerFailure struct{ err error }
-type nodeSequencerWake struct{ fn func() }
+type nodeSequencerWake struct {
+	owner *Submission
+	fn    func()
+}
+type nodeSequencerWakeSet struct{ entries []nodeSequencerWake }
 
 // nodeWaveAdmission is a conservative, allocation-free upper bound for the
 // fixed arenas touched by one Ready after it joins a node durability wave.
@@ -363,22 +368,63 @@ func (q *NodeSubmissionSequencer) Owns(store *NodeStore) bool {
 	return q != nil && store != nil && q.store == store
 }
 
-// SetWake installs the one device-scheduler notification for this sequencer.
-// It is deliberately node-wide rather than per group: one callback drains all
-// Runtime completions made visible by a durability wave.
-func (q *NodeSubmissionSequencer) SetWake(wake func()) {
-	if q == nil || wake == nil {
-		if q != nil {
-			q.ownerWake.Store(nil)
-		}
+// SetWakeFor registers the execution owner of one caller-reserved submission
+// cell. Registration is cold-path and publishes one immutable callback vector;
+// durability completion only performs an atomic load and bounded iteration.
+// Passing nil removes owner without disturbing any other execution lane.
+func (q *NodeSubmissionSequencer) SetWakeFor(owner *Submission, wake func()) {
+	if q == nil || owner == nil {
 		return
 	}
-	q.ownerWake.Store(&nodeSequencerWake{fn: wake})
+	q.wakeMu.Lock()
+	defer q.wakeMu.Unlock()
+	current := q.ownerWakes.Load()
+	count := 0
+	if current != nil {
+		count = len(current.entries)
+	}
+	position := count
+	if current != nil {
+		for index := range current.entries {
+			if current.entries[index].owner == owner {
+				position = index
+				break
+			}
+		}
+	}
+	if wake == nil && position == count {
+		return
+	}
+	nextCount := count
+	if wake == nil {
+		nextCount--
+	} else if position == count {
+		nextCount++
+	}
+	if nextCount == 0 {
+		q.ownerWakes.Store(nil)
+		return
+	}
+	next := &nodeSequencerWakeSet{entries: make([]nodeSequencerWake, nextCount)}
+	if wake == nil {
+		copy(next.entries, current.entries[:position])
+		copy(next.entries[position:], current.entries[position+1:])
+	} else {
+		if current != nil {
+			copy(next.entries, current.entries)
+		}
+		next.entries[position] = nodeSequencerWake{owner: owner, fn: wake}
+	}
+	q.ownerWakes.Store(next)
 }
 
 func (q *NodeSubmissionSequencer) notifyOwner() {
-	if wake := q.ownerWake.Load(); wake != nil && wake.fn != nil {
-		wake.fn()
+	if wakes := q.ownerWakes.Load(); wakes != nil {
+		for index := range wakes.entries {
+			if wakes.entries[index].fn != nil {
+				wakes.entries[index].fn()
+			}
+		}
 	}
 }
 
