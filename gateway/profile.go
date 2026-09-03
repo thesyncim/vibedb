@@ -62,6 +62,10 @@ type Profile struct {
 	MaxAggregateRows  uint64
 	MaxAggregateBytes uint64
 
+	// MaxWorkerAggregateBytes caps grouped state on each reducer worker. It is
+	// independent of the coordinator output cap; zero inherits MaxAggregateBytes.
+	MaxWorkerAggregateBytes uint64
+
 	// PerShardRows and PerShardBytes are pushed to each shard as its MaxRows and
 	// MaxResultBytes, bounding the work one shard performs.
 	PerShardRows  uint64
@@ -105,6 +109,9 @@ func (p Profile) withDefaults() Profile {
 	}
 	if p.MaxAggregateBytes == 0 {
 		p.MaxAggregateBytes = defaultMaxAggregateBytes
+	}
+	if p.MaxWorkerAggregateBytes == 0 {
+		p.MaxWorkerAggregateBytes = p.MaxAggregateBytes
 	}
 	if p.PerShardRows == 0 {
 		p.PerShardRows = defaultPerShardRows

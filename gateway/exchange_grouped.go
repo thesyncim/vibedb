@@ -59,7 +59,7 @@ func makeGroupedExchangeLimits(profile Profile, partitions int, columns int) (gr
 	output.Producers = 1
 	return groupedExchangeLimits{
 		blockRows: uint32(rows), blockBytes: blockBytes,
-		producerMemory: producerMemory, reducerMemory: perPartitionBytes,
+		producerMemory: producerMemory, reducerMemory: profile.withDefaults().MaxWorkerAggregateBytes,
 		input: input, output: output,
 	}, nil
 }

@@ -4,6 +4,8 @@ import queryplanner "github.com/thesyncim/vibedb/planner"
 
 // Re-export the cold statistics vocabulary at the gateway catalog boundary so
 // topology publishers do not need to translate identical records.
+type GroupStatistics = queryplanner.GroupStatistics
+type TupleFrequency = queryplanner.TupleFrequency
 type TableStatistics = queryplanner.TableStatistics
 type PartitionStatistics = queryplanner.PartitionStatistics
 type ColumnStatistics = queryplanner.ColumnStatistics

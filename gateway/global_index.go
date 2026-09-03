@@ -215,9 +215,19 @@ func (p GlobalIndexProgram) RouteDocument(
 	if p.snapshot == nil || workspace == nil {
 		return GlobalIndexRoute{}, ErrGlobalIndexDocument
 	}
+	index, err := workspace.indexDocument(document)
+	if err != nil {
+		return GlobalIndexRoute{}, err
+	}
+	return p.routeIndexedDocument(index, len(document), workspace)
+}
+
+// indexDocument is deliberately explicit rather than a pointer-identity cache:
+// callers may reuse and mutate a byte buffer between documents.
+func (workspace *GlobalIndexWorkspace) indexDocument(document []byte) (vibejson.Index, error) {
 	needed, err := vibejson.RequiredIndexEntries(document)
 	if err != nil {
-		return GlobalIndexRoute{}, fmt.Errorf("%w: invalid JSON: %v", ErrGlobalIndexDocument, err)
+		return vibejson.Index{}, fmt.Errorf("%w: invalid JSON: %v", ErrGlobalIndexDocument, err)
 	}
 	if cap(workspace.entries) < needed {
 		workspace.entries = make([]vibejson.IndexEntry, needed)
@@ -226,12 +236,17 @@ func (p GlobalIndexProgram) RouteDocument(
 	}
 	index, err := vibejson.BuildIndex(document, workspace.entries)
 	if err != nil {
-		return GlobalIndexRoute{}, fmt.Errorf("%w: invalid JSON: %v", ErrGlobalIndexDocument, err)
+		return vibejson.Index{}, fmt.Errorf("%w: invalid JSON: %v", ErrGlobalIndexDocument, err)
 	}
-	if len(document) > int(^uint(0)>>1)/2 {
+	return index, nil
+}
+
+func (p GlobalIndexProgram) routeIndexedDocument(index vibejson.Index, documentBytes int, workspace *GlobalIndexWorkspace) (GlobalIndexRoute, error) {
+	var err error
+	if documentBytes > int(^uint(0)>>1)/2 {
 		return GlobalIndexRoute{}, fmt.Errorf("%w: document is too large", ErrGlobalIndexDocument)
 	}
-	decodedCapacity := len(document) * 2
+	decodedCapacity := documentBytes * 2
 	if cap(workspace.decoded) < decodedCapacity {
 		workspace.decoded = make([]byte, 0, decodedCapacity)
 	} else {

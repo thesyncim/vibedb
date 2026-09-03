@@ -65,7 +65,7 @@ func TestExplainDistributedPhysicalPlanWithoutDispatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !strings.HasPrefix(groupedTopK.PhysicalPlan, "top-k") ||
-		!strings.Contains(groupedTopK.PhysicalPlan, "final-aggregate") {
+		strings.Contains(groupedTopK.PhysicalPlan, "final-aggregate") {
 		t.Fatalf("grouped top-k physical plan:\n%s", groupedTopK.PhysicalPlan)
 	}
 }

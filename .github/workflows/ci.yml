@@ -183,6 +183,11 @@ jobs:
       - name: Build and vet
         if: matrix.shard == 'core'
         run: go build ./... && go vet ./...
+      - name: Go 1.27 SIMD planner and query paths
+        if: matrix.shard == 'core'
+        env:
+          GOEXPERIMENT: simd
+        run: go test -count=1 -timeout=10m ./planner ./query ./gateway
       - name: Tests
         shell: bash
         run: scripts/ci/test-shard.sh "$TEST_SHARD" | tee "${RUNNER_TEMP}/unit-tests.txt"
