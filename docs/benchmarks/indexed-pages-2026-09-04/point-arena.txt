@@ -1,0 +1,8 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/store
+cpu: Apple M4 Max
+BenchmarkSegmentPointArena/default-16         	  277030	      1292 ns/op	   16432 B/op	       3 allocs/op
+BenchmarkSegmentPointArena/reserved-16        	 2250392	       160.3 ns/op	     432 B/op	       3 allocs/op
+PASS
+ok  	github.com/thesyncim/vibedb/store	0.902s

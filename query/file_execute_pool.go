@@ -299,7 +299,7 @@ func (pool *filePool) work(at int) {
 		part := p.makeFilePartial(
 			batch, w, docs, slots,
 			arenas.begin(batch.seq, pool.dropped.Load()),
-			job.budget,
+			job.budget, filePartialDetached,
 		)
 		if part.err != nil {
 			pool.stopped.Store(true)

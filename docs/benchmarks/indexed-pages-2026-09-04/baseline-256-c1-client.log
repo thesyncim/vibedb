@@ -1,0 +1,3 @@
+vibedb range_256 c=1 rep=1 0.2 ops/s p99=14462.963ms errors=0 verified=true
+vibedb range_256 c=1 rep=2 0.3 ops/s p99=3843.929ms errors=0 verified=true
+vibedb range_256 c=1 rep=3 0.3 ops/s p99=3326.210ms errors=0 verified=true

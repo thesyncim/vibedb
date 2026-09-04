@@ -1,0 +1,21 @@
+{
+  "baseline_revision": "c0675b8af96e",
+  "go_version": "1.27",
+  "GOOS": "linux",
+  "GOARCH": "arm64",
+  "CGO_ENABLED": "0",
+  "GOEXPERIMENT": "simd",
+  "image": "golang:1.27-bookworm",
+  "image_id": "sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b",
+  "cpu_limit": 12,
+  "memory_bytes": 25769803776,
+  "binary_sha256": {
+    "baseline/vibedb": "7649a32948ef82a6a510cab92650794914437935d92863138f46a0e60892ba84",
+    "baseline/vibedb-gateway": "18d186cfee13c77e5a399a0bf62930f84ffd30b62da1281dc4d535c3f09a397b",
+    "baseline/vibedb-shard": "53ab0d0e2bad83364da92a909a3beffbc1bd0072037663486f8230251978c085",
+    "after/vibedb": "7b0f8548df9f4f82678f31bb981b6ae33da623f42dc6da3c5afb2adfd47b4847",
+    "after/vibedb-gateway": "6c690840950cea60e2ef34446e813af8b67b2be92edd9da35f824f9755550796",
+    "after/vibedb-shard": "665cf96688d4c150f854baab6d605381b26363c64ca7274c83fdd43792437fb1",
+    "rf3-sqlbench-v3": "91749167418edde105ec8af659f0a3e88c752e596ed7cdf134300bbede6e1e14"
+  }
+}
