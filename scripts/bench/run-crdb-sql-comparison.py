@@ -143,6 +143,10 @@ def main():
                     "-output", f"/evidence/{engine}.json", stdout=log, stderr=subprocess.STDOUT, check=False)
                 failures[engine] = completed.returncode
             shell(f"du -sk /data/* > /evidence/{engine}-storage.txt")
+            # Untimed detail separates fixed journals/logs from data-dependent
+            # growth; do not mistake the small fixture's total for amplification.
+            storage_roots = "/data/vibe" if engine == "vibedb" else "/data/crdb-0 /data/crdb-1 /data/crdb-2"
+            shell(f"du -ak {storage_roots} > /evidence/{engine}-storage-detail.txt")
             stop(processes)
             print(f"{engine}: exit={completed.returncode}; raw log: {dest / (engine + '-client.log')}", flush=True)
     finally:
