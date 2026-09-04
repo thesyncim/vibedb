@@ -73,6 +73,93 @@ func rawTopLevelScalarMatch(
 	}
 }
 
+// rawTopLevelPathName recognizes a path whose value can be recovered while
+// walking one top-level object. Dotted single-field paths already retain their
+// decoded name. A one-token JSON pointer is equally cheap when it contains no
+// escape: the bytes after the slash are the decoded member name verbatim.
+func rawTopLevelPathName(path compiledPath) (string, bool) {
+	if path.join != joinPathOuter {
+		return "", false
+	}
+	if path.single {
+		return path.name, true
+	}
+	pointer := path.pointer.String()
+	if len(pointer) < 2 || pointer[0] != '/' {
+		return "", false
+	}
+	for i := 1; i < len(pointer); i++ {
+		if pointer[i] == '/' || pointer[i] == '~' {
+			return "", false
+		}
+	}
+	return pointer[1:], true
+}
+
+// rawTopLevelScalars extracts one row of simple top-level paths from a
+// validated JSON object without building a structural tape. dst has one
+// column per path and already contains a slot for row. Duplicate object keys
+// retain the last value, matching Node.Get. An escaped key or a non-object
+// root declines the lane because either can change JSON Pointer semantics.
+func rawTopLevelScalars(
+	src []byte,
+	paths []compiledPath,
+	dst [][]vibejson.RawValue,
+	row int,
+) bool {
+	i := rawSkipSpace(src, 0)
+	if i >= len(src) || src[i] != '{' {
+		return false
+	}
+	i++
+	for {
+		i = rawSkipSpace(src, i)
+		if i >= len(src) {
+			return false
+		}
+		if src[i] == '}' {
+			return true
+		}
+		if src[i] != '"' {
+			return false
+		}
+		keyStart := i
+		keyEnd, escaped, ok := rawScanString(src, i)
+		if !ok || escaped {
+			return false
+		}
+		i = rawSkipSpace(src, keyEnd)
+		if i >= len(src) || src[i] != ':' {
+			return false
+		}
+		i = rawSkipSpace(src, i+1)
+		valueStart := i
+		valueEnd, ok := rawSkipValue(src, i)
+		if !ok {
+			return false
+		}
+		key := src[keyStart+1 : keyEnd-1]
+		for col, path := range paths {
+			name, supported := rawTopLevelPathName(path)
+			if supported && rawEqualString(key, name) {
+				dst[col][row] = vibejson.RawValue{Src: src[valueStart:valueEnd]}
+			}
+		}
+		i = rawSkipSpace(src, valueEnd)
+		if i >= len(src) {
+			return false
+		}
+		switch src[i] {
+		case ',':
+			i++
+		case '}':
+			return true
+		default:
+			return false
+		}
+	}
+}
+
 func rawEqualString(value []byte, want string) bool {
 	if len(value) != len(want) {
 		return false

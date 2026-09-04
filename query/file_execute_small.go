@@ -2,6 +2,8 @@ package query
 
 import (
 	"errors"
+	"fmt"
+	"slices"
 
 	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibedb/store/durable"
@@ -87,6 +89,61 @@ func (p *plan) runFileSmall(e *Exec, snapshot *durable.Snapshot, span *FileRange
 	return true, err
 }
 
+// runValidatedRawInto executes one storage-validated point document without
+// rebuilding it into a Segment. The same raw-row evaluator used by small
+// durable ranges keeps the complete predicate authoritative; its Segment
+// fallback covers complex paths and uncommon JSON roots.
+func (p *plan) runValidatedRawInto(e *Exec, raw []byte) error {
+	if e.file.small == nil {
+		e.file.small = &fileSmallScan{}
+		e.file.small.row = e.file.small.appendRow
+	}
+	if p.grouped || p.hasAggregate {
+		docs := &e.file.small.docs
+		docs.Reset()
+		if _, err := docs.Append(raw); err != nil {
+			return err
+		}
+		e.Stats = ExecStats{}
+		return p.runInto(&e.Result, docs, &e.Workspace, e.Options.Workers)
+	}
+	s := e.file.small
+	s.p, s.e, s.stats, s.opts, s.ordered, s.payload = p, e, ExecStats{}, normalizedFileOptions{}, false, 0
+	s.work.heapWorkParent = &e.Workspace.heapWorkBudget
+	s.work.heapWorkTextReserved = 0
+	s.work.cancel = e.Options.Cancel
+	s.work.eval.setWork(&e.Workspace.heapWorkBudget)
+	s.work.eval.bindTo(nil)
+	s.work.eval.bindMarks(nil)
+	s.work.eval.bindCorrelations(e.Workspace.correlations)
+	s.batch = takeFileBatch(s.slots[:], 0, 0)
+	defer func() {
+		s.slots[0].batch = s.batch
+		clear(s.arena.heads)
+		e.Stats = s.stats
+		s.p, s.e = nil, nil
+		s.work.heapWorkParent = nil
+		s.work.eval.setWork(nil)
+		s.work.eval.bindCorrelations(nil)
+		s.work.cancel = nil
+	}()
+	if err := prepareResult(&e.Result, p, 0); err != nil {
+		return err
+	}
+	s.batch.data = raw
+	s.batch.ends = append(s.batch.ends, len(raw))
+	s.batch.bytes = int64(len(raw))
+	s.stats = ExecStats{
+		Workers: 1, RowsTotal: 1, RowsScanned: 1, CandidateRows: 1,
+		PeakBatchRows: 1, PeakBatchBytes: s.batch.bytes,
+	}
+	err := s.flush()
+	if err == nil {
+		err = s.work.checkCanceled()
+	}
+	return err
+}
+
 func (s *fileSmallScan) appendRow(_, value []byte) error {
 	if err := s.work.checkCanceled(); err != nil {
 		return err
@@ -162,4 +219,161 @@ func (s *fileSmallScan) flush() error {
 	s.batch.base += uint64(len(s.batch.ends))
 	s.batch.data, s.batch.ends, s.batch.bytes = s.batch.data[:0], s.batch.ends[:0], 0
 	return nil
+}
+
+// makeFileRawRowsPartial runs the synchronous small-page lane directly over
+// validated JSON bytes when every referenced path is one top-level member. It
+// preserves the complete compiled predicate; only the temporary Segment and
+// its structural tape are omitted. Unsupported roots and escaped object keys
+// decline before any result row is published, so the ordinary path remains
+// authoritative for the full JSON Pointer surface.
+func (p *plan) makeFileRawRowsPartial(
+	batch fileBatch,
+	w *Workspace,
+	slot *fileSlot,
+	arena *fileArena,
+	mode filePartialMode,
+) (filePartial, bool) {
+	part := filePartial{seq: batch.seq}
+	if len(p.valuePaths) == 0 {
+		return part, false
+	}
+	for _, path := range p.valuePaths {
+		if _, ok := rawTopLevelPathName(path); !ok {
+			return part, false
+		}
+	}
+
+	rows := len(batch.ends)
+	w.raws = resize(w.raws, len(p.valuePaths))
+	for col := range p.valuePaths {
+		raws := resize(w.raws[col], rows)
+		clear(raws)
+		w.raws[col] = raws
+	}
+	start := 0
+	for row, end := range batch.ends {
+		if err := cancellationCheckpoint(w.cancel, row); err != nil {
+			part.err = err
+			return part, true
+		}
+		if !rawTopLevelScalars(batch.data[start:end], p.valuePaths, w.raws, row) {
+			return filePartial{}, false
+		}
+		start = end
+	}
+
+	ctx := &w.ctx
+	ctx.s, ctx.rows = nil, rows
+	ctx.values = resize(ctx.values, len(p.valuePaths))
+	classify := func(cols []int, text *[]byte) error {
+		need := 0
+		for _, col := range cols {
+			escaped, err := escapedTextBytesCancelable(w.raws[col], w.cancel)
+			if err != nil {
+				return err
+			}
+			need += escaped
+		}
+		return ctx.classifyColumns(cols, text, need, w)
+	}
+	w.text, w.lateText = w.text[:0], w.lateText[:0]
+	if err := classify(p.filterCols, &w.text); err != nil {
+		part.err = err
+		return part, true
+	}
+	if err := classify(p.lateCols, &w.lateText); err != nil {
+		part.err = err
+		return part, true
+	}
+	selected, err := p.selectRows(ctx, nil, false, w)
+	if err != nil {
+		part.err = err
+		return part, true
+	}
+	if err := w.eval.firstError(); err != nil {
+		part.err = err
+		return part, true
+	}
+	return p.makeFileRowsPartial(part, selected, ctx, batch, slot, arena, mode, w), true
+}
+
+func (p *plan) makeFileRowsPartial(
+	part filePartial,
+	selected []int,
+	ctx *execCtx,
+	batch fileBatch,
+	slot *fileSlot,
+	arena *fileArena,
+	mode filePartialMode,
+	w *Workspace,
+) filePartial {
+	if len(p.order) != 0 && mode != filePartialOrdered {
+		if err := w.checkCanceled(); err != nil {
+			part.err = err
+			return part
+		}
+		slices.SortStableFunc(selected, func(a, b int) int { return p.compareRows(ctx, a, b) })
+		if err := w.checkCanceled(); err != nil {
+			part.err = err
+			return part
+		}
+	}
+	if p.hasLimit && len(selected) > p.limit {
+		selected = selected[:p.limit]
+	}
+	// Reserve the whole batch's scalar-header slab before handing out the
+	// first row. Growing it a row at a time leaves every superseded array live
+	// through the rows already pointing into it.
+	order := p.order
+	if mode != filePartialDetached {
+		order = nil
+	}
+	headsPerRow := len(p.columns) + len(order)
+	if headsPerRow != 0 && len(selected) > int(^uint(0)>>1)/headsPerRow {
+		part.err = fmt.Errorf("query: durable result scalar arena overflows int")
+		return part
+	}
+	if err := arena.reserveHeads(len(selected) * headsPerRow); err != nil {
+		part.err = err
+		return part
+	}
+	prev := slot.rows
+	rows := prev[:0]
+	for at, row := range selected {
+		if err := cancellationCheckpoint(w.cancel, at); err != nil {
+			part.err = err
+			return part
+		}
+		r := fileRow{ordinal: batch.base + uint64(row)}
+		var used int64
+		var arenaErr error
+		if mode != filePartialDetached {
+			r.values, arenaErr = arena.takeHeads(len(p.columns))
+			if arenaErr != nil {
+				part.err = arenaErr
+				return part
+			}
+			for col := range p.columns {
+				r.values[col] = scalar{}
+				if p.columns[col].value >= 0 {
+					r.values[col] = ctx.values[p.columns[col].value][row]
+				}
+				used += scalarBytes(r.values[col])
+			}
+		} else {
+			r.values, used, arenaErr = ownScalars(arena, ctx, row, p.columns, order, nil)
+		}
+		if arenaErr != nil {
+			part.err = arenaErr
+			return part
+		}
+		r.order = r.values[len(p.columns):len(r.values):len(r.values)]
+		r.values = r.values[:len(p.columns):len(p.columns)]
+		part.bytes += fileRowStructBytes + used
+		rows = append(rows, r)
+	}
+	clearTail(prev, len(rows))
+	slot.rows, part.rows = rows, rows
+	return part
 }

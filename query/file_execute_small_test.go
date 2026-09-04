@@ -153,6 +153,81 @@ func TestFileSmallIndexedPages(t *testing.T) {
 	}
 }
 
+func TestValidatedRawPointMatchesSegment(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		q    *Query
+	}{
+		{
+			name: "projection and residual",
+			raw:  `{"id":"first","score":7,"active":true,"id":"last"}`,
+			q: Select(Path("/id"), Path("/score")).
+				Where(And(Cmp("/id", Eq, "last"), Cmp("/active", Eq, true))),
+		},
+		{
+			name: "escaped unrelated key falls back",
+			raw:  `{"id":"a","we\\u0069rd":1,"score":9}`,
+			q:    Select(Path("/id"), Path("/score")).Where(Cmp("/id", Eq, "a")),
+		},
+		{
+			name: "nested pointer falls back",
+			raw:  `{"id":"a","nested":{"score":11}}`,
+			q:    Select(Path("/id"), Path("/nested/score")),
+		},
+		{
+			name: "array root preserves pointer semantics",
+			raw:  `["a",13]`,
+			q:    Select(Path("/0"), Path("/1")),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var docs store.Segment
+			if _, err := docs.Append([]byte(test.raw)); err != nil {
+				t.Fatal(err)
+			}
+			want, err := test.q.Run(FromSegment(&docs))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var source ValidatedRawSource
+			source.Bind([]byte(test.raw))
+			var exec Exec
+			defer exec.Release()
+			if err := test.q.RunInto(&exec, FromValidatedRaw(&source)); err != nil {
+				t.Fatal(err)
+			}
+			if got := resultKey(exec.Result); got != resultKey(want) {
+				t.Fatalf("got %s want %s", got, resultKey(want))
+			}
+		})
+	}
+
+	raw := []byte(`{"id":"a","score":7,"active":true}`)
+	q := Select(Path("/id"), Path("/score")).Where(Cmp("/active", Eq, true))
+	var source ValidatedRawSource
+	source.Bind(raw)
+	var exec Exec
+	defer exec.Release()
+	if err := q.RunInto(&exec, FromValidatedRaw(&source)); err != nil {
+		t.Fatal(err)
+	}
+	want := resultKey(exec.Result)
+	allocs := testing.AllocsPerRun(200, func() {
+		if err := q.RunInto(&exec, FromValidatedRaw(&source)); err != nil {
+			panic(err)
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("warm validated raw allocations %g", allocs)
+	}
+	clear(raw)
+	if got := resultKey(exec.Result); got != want {
+		t.Fatalf("result retained borrowed bytes: got %s want %s", got, want)
+	}
+}
+
 func TestPrimaryOrderedLimitSurvivesSpills(t *testing.T) {
 	file, err := os.CreateTemp(t.TempDir(), "spill-limit")
 	if err != nil {

@@ -1438,6 +1438,13 @@ func (p *plan) makeFilePartial(
 		}
 	}
 	slot := &slots[batch.seq%uint64(len(slots))]
+	if mode != filePartialDetached {
+		if fast, handled := p.makeFileRawRowsPartial(
+			batch, w, slot, arena, mode,
+		); handled {
+			return fast
+		}
+	}
 	// The batch Segment carries no postings, and that is a decision, not an
 	// omission. Postings are an inverted index over a Segment's top-level keys
 	// and scalars; building one costs a hash and a bucket append per member of
@@ -1589,87 +1596,7 @@ func (p *plan) makeFilePartial(
 		slot.accs, part.accs = accs, accs
 		part.bytes = int64(len(accs)) * aggAccStructBytes
 	default:
-		if len(p.order) != 0 && mode != filePartialOrdered {
-			if err := w.checkCanceled(); err != nil {
-				part.err = err
-				return part
-			}
-			slices.SortStableFunc(selected, func(a, b int) int { return p.compareRows(ctx, a, b) })
-			if err := w.checkCanceled(); err != nil {
-				part.err = err
-				return part
-			}
-		}
-		if p.hasLimit && len(selected) > p.limit {
-			selected = selected[:p.limit]
-		}
-		// Reserve the whole batch's scalar-header slab before handing out the
-		// first row. Growing it a row at a time leaves every superseded array
-		// live through the rows already pointing into it; one exact batch
-		// reservation removes those transient generations and makes both the
-		// allocation and retained-memory cost proportional to the slab kept.
-		order := p.order
-		if mode != filePartialDetached {
-			order = nil
-		}
-		headsPerRow := len(p.columns) + len(order)
-		if headsPerRow != 0 &&
-			len(selected) > int(^uint(0)>>1)/headsPerRow {
-			part.err = fmt.Errorf("query: durable result scalar arena overflows int")
-			return part
-		}
-		if err := arena.reserveHeads(len(selected) * headsPerRow); err != nil {
-			part.err = err
-			return part
-		}
-		prev := slot.rows
-		rows := prev[:0]
-		for at, row := range selected {
-			if err := cancellationCheckpoint(w.cancel, at); err != nil {
-				part.err = err
-				return part
-			}
-			r := fileRow{ordinal: batch.base + uint64(row)}
-			// The projected and ordering scalars share one header span split in
-			// two, and every byte they detach is packed into one span of the
-			// worker's arena, so a row of c columns ordered by k keys costs two
-			// reservations instead of the 2+2(c+k) allocations that a slice per
-			// role plus a clone per field used to cost — and, since the arena
-			// outlives the execution, no allocation at all once it is warm.
-			var used int64
-			var arenaErr error
-			if mode != filePartialDetached {
-				// The synchronous consumer copies cells into Result before the
-				// batch workspace is reused. Only scalar headers are needed;
-				// detaching bytes here would copy every projected value twice.
-				r.values, arenaErr = arena.takeHeads(len(p.columns))
-				if arenaErr != nil {
-					part.err = arenaErr
-					return part
-				}
-				for col := range p.columns {
-					r.values[col] = scalar{}
-					if p.columns[col].value >= 0 {
-						r.values[col] = ctx.values[p.columns[col].value][row]
-					}
-					used += scalarBytes(r.values[col])
-				}
-			} else {
-				r.values, used, arenaErr = ownScalars(arena, ctx, row, p.columns, order, nil)
-			}
-			if arenaErr != nil {
-				part.err = arenaErr
-				return part
-			}
-			r.order = r.values[len(p.columns):len(r.values):len(r.values)]
-			r.values = r.values[:len(p.columns):len(p.columns)]
-			part.bytes += fileRowStructBytes + used
-			rows = append(rows, r)
-		}
-		// Same reason as the grouped branch: a stale row header still owns the
-		// bytes it detached from a batch two rings ago.
-		clearTail(prev, len(rows))
-		slot.rows, part.rows = rows, rows
+		return p.makeFileRowsPartial(part, selected, ctx, batch, slot, arena, mode, w)
 	}
 	for i := range part.groups {
 		detachAggregateExtremes(part.groups[i].accs, p.columns)

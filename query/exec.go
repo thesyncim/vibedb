@@ -18,6 +18,7 @@ type sourceKind uint8
 const (
 	sourceInvalid sourceKind = iota
 	sourceSegment
+	sourceValidatedRaw
 	sourceHeapSnapshot
 	sourceFileSnapshot
 	sourceFileRange
@@ -44,8 +45,9 @@ const (
 // escaping.
 type Source struct {
 	kind sourceKind
-	// payload is a *store.Segment for sourceSegment, a *FileRangeSource for
-	// sourceFileRange, and a *FileOverlaySource for sourceFileOverlay and
+	// payload is a *store.Segment for sourceSegment, a *ValidatedRawSource for
+	// sourceValidatedRaw, a *FileRangeSource for sourceFileRange, and a
+	// *FileOverlaySource for sourceFileOverlay and
 	// sourceSnapshotOverlay. Those variants are
 	// disjoint, so one GC-visible pointer keeps Source the same size it had
 	// before overlay support; adding an interface field here made every
@@ -57,6 +59,25 @@ type Source struct {
 	catalog store.DatabaseSnapshot
 	files   durable.DatabaseSnapshot
 	name    string
+}
+
+// ValidatedRawSource holds one validated JSON document for synchronous point
+// execution. The bytes are borrowed until RunInto returns.
+type ValidatedRawSource struct {
+	value []byte
+}
+
+// Bind replaces the borrowed validated document.
+func (s *ValidatedRawSource) Bind(value []byte) {
+	if s != nil {
+		s.value = value
+	}
+}
+
+// FromValidatedRaw names one JSON document already validated by its storage
+// reader. source must remain alive and unchanged until execution returns.
+func FromValidatedRaw(source *ValidatedRawSource) Source {
+	return Source{kind: sourceValidatedRaw, payload: unsafe.Pointer(source)}
 }
 
 func (s Source) subquerySource(outer, collection string) (Source, error) {
@@ -499,7 +520,7 @@ func (q *Query) runInto(e *Exec, src Source, correlations []scalar) (err error) 
 	}
 	e.Workspace.heapWorkParent = nil
 	switch src.kind {
-	case sourceSegment, sourceHeapSnapshot, sourceSnapshotOverlay, sourceDatabase, sourceRelationSpool:
+	case sourceSegment, sourceValidatedRaw, sourceHeapSnapshot, sourceSnapshotOverlay, sourceDatabase, sourceRelationSpool:
 		memoryBytes, limitErr := normalizeHeapMemoryBytes(e.Options)
 		if limitErr != nil {
 			return limitErr
@@ -523,6 +544,15 @@ func (q *Query) runInto(e *Exec, src Source, correlations []scalar) (err error) 
 		}
 		e.Stats = ExecStats{}
 		return p.runInto(&e.Result, docs, &e.Workspace, e.Options.Workers)
+	case sourceValidatedRaw:
+		raw := (*ValidatedRawSource)(src.payload)
+		if raw == nil || len(raw.value) == 0 {
+			return fmt.Errorf("query: FromValidatedRaw was given an empty source")
+		}
+		if err := rejectJoins(p, "FromValidatedRaw"); err != nil {
+			return err
+		}
+		return p.runValidatedRawInto(e, raw.value)
 	case sourceRelationSpool:
 		spool := (*relationSpool)(src.payload)
 		if spool == nil {

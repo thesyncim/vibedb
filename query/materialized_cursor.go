@@ -32,5 +32,8 @@ func NewResultCursor(result *Result) (Cursor, error) {
 			return Cursor{}, errors.New("query: materialized row arity mismatch")
 		}
 	}
-	return (&Statement{outputs: len(result.Columns)}).cursor(result), nil
+	// Distributed merge has already applied every relational clause. A nil
+	// statement marks this simpler cursor shape and avoids allocating a
+	// one-field Statement for every wire response.
+	return Cursor{res: result, cur: -1, left: -1}, nil
 }

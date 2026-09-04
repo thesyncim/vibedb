@@ -266,6 +266,7 @@ type conn struct {
 	exec           query.Exec
 	args           []any
 	pointDocs      store.Segment
+	pointSource    query.ValidatedRawSource
 	pointRaw       []byte
 	pointKeyRaw    []byte
 	pointKeyEnds   []int
