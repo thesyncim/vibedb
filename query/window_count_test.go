@@ -56,3 +56,24 @@ func TestWindowCountFrameDifferential(t *testing.T) {
 		}
 	}
 }
+
+func TestWindowOrderedInputAndLateInversion(t *testing.T) {
+	for _, keys := range [][]string{
+		{`1`, `1.0`, `2`, `3`, `null`}, // Already ordered, with stable exact-number peers.
+		{`1`, `1.0`, `2`, `null`, `3`}, // Last pair inverted; must still sort.
+		{`3`, `2`, `1`, `1.0`, `null`}, // Ordered only under DESC NULLS LAST.
+	} {
+		data := make([][]string, len(keys))
+		for row, key := range keys {
+			data[row] = []string{key, fmt.Sprint(row)}
+		}
+		input := buildSetTestSpool(t, data)
+		for _, descending := range []bool{false, true} {
+			plan := windowPlan{order: []windowOrderKey{{column: 0, descending: descending, nulls: windowNullsLast}}, functions: []windowFunctionSpec{
+				{kind: windowRowNumber, column: -1}, {kind: windowRank, column: -1},
+				{kind: windowLag, column: 1, offset: 1},
+			}}
+			assertSetRows(t, runWindowTest(t, &input, &plan), referenceWindowIntegerRows(t, &input, &plan))
+		}
+	}
+}

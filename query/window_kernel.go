@@ -836,7 +836,24 @@ func (e *windowExecutor) sortRows(
 		e.order[row] = row
 	}
 	rows := len(e.order)
-	if rows < 2 {
+	if rows < 2 || len(plan.partition) == 0 && len(plan.order) == 0 {
+		return cancellationError(cancel)
+	}
+	// Ordered input (including a single peer group) already has the stable
+	// permutation. Stop at the first inversion so unordered input pays only
+	// for its initial ordered run before entering the merge sort.
+	ordered := true
+	for row := 1; row < rows; row++ {
+		comparison, err := compareWindowRows(input, plan, row-1, row, cancel)
+		if err != nil {
+			return err
+		}
+		if comparison > 0 {
+			ordered = false
+			break
+		}
+	}
+	if ordered {
 		return cancellationError(cancel)
 	}
 	src, dst := e.order, e.sortScratch
