@@ -1648,3 +1648,45 @@ func TestSingleParticipantPointReadDoesNotForceCheckpoint(t *testing.T) {
 		}
 	}
 }
+
+func TestSingleParticipantReservedSequenceFencesLateCommands(t *testing.T) {
+	fixture := newRelationBundleFixture(t, true)
+	id := transactionCodecID(243)
+	key := []byte("reserved-sequence")
+	makeCommand := func(sequence uint64, value string) []byte {
+		batches := []replication.RelationMutationBatch{{Relation: 1, Mutations: []replication.Mutation{{Kind: replication.MutationPut, Key: key, Value: []byte(value)}}}}
+		control := fusedParticipantControl(t, fixture, id, distributedtxn.ReplicatedApplySingleParticipant, sequence, batches)
+		return transactionCompletionCommand(t, fixture.binding, control, batches)
+	}
+	old := makeCommand(1, `{"n":1}`)
+	applyTransactionCommand(t, fixture.machine, 3, old)
+	// A restarted gateway skips the whole previous reservation, not just the
+	// last observed result. The data protocol must accept the gap directly.
+	fresh := makeCommand(65537, `{"n":2}`)
+	result := applyTransactionCommand(t, fixture.machine, 4, fresh)
+	retry := applyTransactionCommand(t, fixture.machine, 5, fresh)
+	if result != retry || result.Revision != 65537 || !result.AffectedRowsValid || result.AffectedRows != 1 {
+		t.Fatalf("fresh=%+v retry=%+v", result, retry)
+	}
+	// An old committed retry and an old never-applied proposal can both arrive
+	// after restart. Neither may overwrite the later reservation's value.
+	for i, command := range [][]byte{old, makeCommand(2, `{"n":999}`)} {
+		if err := fixture.machine.AdmitCommand(command); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.machine.ApplyNormal(normalMeta(uint64(6+i)), command); err != nil {
+			t.Fatal(err)
+		}
+		completion, late := openTransactionCompletion(t, fixture.machine, command)
+		if completion.ResultCode != ResultTransactionConflict || late.AffectedRowsValid {
+			t.Fatalf("late=%+v completion=%+v", late, completion)
+		}
+	}
+	value, found, err := fixture.base.Collection.AppendRaw(nil, key)
+	if err != nil || !found || string(value) != `{"n":2}` {
+		t.Fatalf("value=%s found=%v err=%v", value, found, err)
+	}
+	if fixture.machine.state.TransactionControlCount != 1 {
+		t.Fatal("unbounded retained witnesses")
+	}
+}

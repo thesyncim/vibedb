@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime/trace"
 	"strings"
 	"sync"
 
@@ -16,8 +17,8 @@ import (
 	sqlast "github.com/thesyncim/vibedb/sql"
 )
 
-// Independent tables must not share an outcome-unknown outbox. Keep ordering
-// within a table and retain the legacy journal under its original identity.
+// Independent tables must not share an outcome-unknown coordinated outbox.
+// Keep legacy recovery identities and allow bounded concurrent direct writes.
 // The local endpoint has the same fixed 64-table bound as its data processes.
 const maxPostgresTableWriters = 64
 
@@ -30,6 +31,11 @@ type postgresTableWriters struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
 	workers   sync.WaitGroup
+	active    sync.WaitGroup
+	gates     map[string]*postgresTableGate
+	direct    *postgresDirectPool
+	closeDone chan struct{}
+	closeErr  error
 	closed    bool
 }
 
@@ -61,7 +67,7 @@ func openPostgresTableWriters(path string, authority serviceauthz.Authority, ser
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	w := &postgresTableWriters{path: path + ".tables", authority: authority, service: service,
-		writers: make(map[string]*postgresDurableWriter), ctx: ctx, cancel: cancel}
+		writers: make(map[string]*postgresDurableWriter), gates: make(map[string]*postgresTableGate), closeDone: make(chan struct{}), ctx: ctx, cancel: cancel}
 	fail := func(err error) (*postgresTableWriters, error) { _ = w.Close(); return nil, err }
 	// Before multi-table support the only writable table was documents. A
 	// retained pending command is stronger evidence and must never be rerouted.
@@ -136,6 +142,12 @@ func openPostgresTableWriters(path string, authority serviceauthz.Authority, ser
 		}
 		w.writers[table] = lane
 	}
+	if _, ok := service.(postgresPreparedDirectService); ok {
+		w.direct, err = openPostgresDirectPool(path+".direct", authority, service)
+		if err != nil {
+			return fail(err)
+		}
+	}
 	for _, lane := range w.writers {
 		w.start(lane)
 	}
@@ -148,6 +160,8 @@ func (w *postgresTableWriters) start(lane *postgresDurableWriter) {
 }
 
 func (w *postgresTableWriters) Write(ctx context.Context, authority serviceauthz.Authority, q gateway.Query) (*gateway.Result, error) {
+	region := trace.StartRegion(ctx, "pg.write")
+	defer region.End()
 	if authority != w.authority {
 		return nil, gateway.ErrReplicatedUnauthorized
 	}
@@ -172,10 +186,44 @@ func (w *postgresTableWriters) Write(ctx context.Context, authority serviceauthz
 			w.start(lane)
 		}
 	}
+	if err != nil {
+		w.mu.Unlock()
+		return nil, err
+	}
+	gate := w.gates[table]
+	if gate == nil {
+		gate = &postgresTableGate{}
+		w.gates[table] = gate
+	}
+	w.active.Add(1)
 	w.mu.Unlock()
+	defer w.active.Done()
+	ctx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(w.ctx, cancel)
+	defer func() { stop(); cancel() }()
+	if w.direct != nil {
+		release, err := gate.acquire(ctx, false)
+		if err != nil {
+			return nil, err
+		}
+		// Old journals retain their original crash-recovery contract. Resolve any
+		// predecessor before new direct work, without saving an empty outbox.
+		err = lane.drainPrevious(ctx)
+		if err != nil {
+			release()
+			return nil, err
+		}
+		result, handled, err := w.direct.Write(ctx, q)
+		release()
+		if handled {
+			return result, err
+		}
+	}
+	release, err := gate.acquire(ctx, true)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 	return lane.Write(ctx, authority, q)
 }
 
@@ -189,16 +237,41 @@ func (w *postgresTableWriters) Run(ctx context.Context) {
 
 func (w *postgresTableWriters) Close() error {
 	w.mu.Lock()
-	defer w.mu.Unlock()
 	if w.closed {
-		return nil
+		w.mu.Unlock()
+		<-w.closeDone
+		return w.closeErr
 	}
 	w.closed = true
 	w.cancel()
+	w.mu.Unlock()
+	w.active.Wait()
 	w.workers.Wait()
 	var err error
+	if w.direct != nil {
+		err = w.direct.Close()
+	}
 	for _, lane := range w.writers {
 		err = errors.Join(err, lane.Close())
 	}
+	w.closeErr = err
+	close(w.closeDone)
 	return err
+}
+
+func (w *postgresDurableWriter) drainPrevious(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-w.gate:
+	}
+	defer func() { w.gate <- struct{}{} }()
+	if w.poison != nil {
+		return w.poison
+	}
+	previous := w.record.Identity.RequestID
+	if _, err := w.resolveLeaderChanges(ctx, false); err != nil && !errors.Is(err, gateway.ErrDurableSQLAborted) || w.record.Query != nil {
+		return w.outcomeError(previous, err, true)
+	}
+	return nil
 }

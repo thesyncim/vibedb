@@ -11,8 +11,10 @@ import (
 )
 
 // DurableSQLDirectPlan is a client-owned durable recipe, not a server cache.
-// The caller must fsync it with the request identity before ExecutePreparedDirect.
-// Recovery must retain these exact mutation bytes, including preimage guards;
+// Durable outbox clients must fsync it with the identity before execution.
+// PG autocommit clients may instead durably reserve never-reused sequences and
+// report ambiguous outcomes after a crash. Any retry of an identity must retain
+// these exact mutation bytes, including preimage guards;
 // evaluating a computed assignment again would change the command identity.
 type DurableSQLDirectPlan struct {
 	Key               requestledger.RequestKey
