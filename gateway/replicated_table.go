@@ -242,6 +242,30 @@ func (snapshot *Snapshot) ResolveReplicatedTableKey(
 	scalarScratch []byte,
 	replicaScratch []ReplicatedEndpoint,
 ) (ResolvedReplicatedTableKey, bool) {
+	return snapshot.resolveReplicatedTableKey(table, orderedKey, scalarScratch, replicaScratch, true)
+}
+
+// resolveReplicatedTableKeyWithoutRouteID skips the SHA256 route digest.
+// Batch readers use it for non-leading points whose route authority is
+// compared directly against the leading point's authority; the digest is a
+// pure function of that authority, so equality without hashing rejects
+// exactly the same mismatches (and one strict superset: a hash collision).
+func (snapshot *Snapshot) resolveReplicatedTableKeyWithoutRouteID(
+	table []byte,
+	orderedKey []byte,
+	scalarScratch []byte,
+	replicaScratch []ReplicatedEndpoint,
+) (ResolvedReplicatedTableKey, bool) {
+	return snapshot.resolveReplicatedTableKey(table, orderedKey, scalarScratch, replicaScratch, false)
+}
+
+func (snapshot *Snapshot) resolveReplicatedTableKey(
+	table []byte,
+	orderedKey []byte,
+	scalarScratch []byte,
+	replicaScratch []ReplicatedEndpoint,
+	wantRouteID bool,
+) (ResolvedReplicatedTableKey, bool) {
 	entry, ok := snapshot.replicatedTableAtBytes(table)
 	if !ok {
 		return ResolvedReplicatedTableKey{}, false
@@ -309,9 +333,13 @@ func (snapshot *Snapshot) ResolveReplicatedTableKey(
 		route.LogicalSchemaDigest != profile.LogicalSchemaDigest {
 		return ResolvedReplicatedTableKey{}, false
 	}
-	return ResolvedReplicatedTableKey{
-		Profile: profile, Route: route, RouteID: replicatedRouteID(route), Point: point,
-	}, true
+	resolved := ResolvedReplicatedTableKey{
+		Profile: profile, Route: route, Point: point,
+	}
+	if wantRouteID {
+		resolved.RouteID = replicatedRouteID(route)
+	}
+	return resolved, true
 }
 
 func replicatedRouteID(route ReplicatedRoute) replication.Digest {

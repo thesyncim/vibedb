@@ -702,3 +702,64 @@ func TestReplicatedDataReaderHoldsResponseReservationUntilRelease(t *testing.T) 
 	}
 	result.Release()
 }
+
+func TestReplicatedBatchLiteResolveMatchesFullResolve(t *testing.T) {
+	client := &publicPointReadClient{wantRelation: 1, wantMaxValue: 4 << 20, wantMinimum: 10}
+	reader, _, key, full := testReplicatedDataReader(t, client)
+	lease := reader.catalog.pinCurrent()
+	if lease.snapshot == nil {
+		t.Fatal("no catalog snapshot")
+	}
+	defer lease.release()
+	var replicas [ServingReplicaCount]ReplicatedEndpoint
+	var scalar [replication.MaxMutationKeyBytes + 16]byte
+	lite, ok := lease.snapshot.resolveReplicatedTableKeyWithoutRouteID(
+		[]byte("messages"), key, scalar[:0], replicas[:0],
+	)
+	if !ok {
+		t.Fatal("lite resolve failed for a resolvable key")
+	}
+	if lite.RouteID != (replication.Digest{}) {
+		t.Fatal("lite resolve must not compute a route digest")
+	}
+	if replicatedRouteAuthority(lite.Route) != replicatedRouteAuthority(full.Route) {
+		t.Fatal("lite resolve authority differs from full resolve")
+	}
+	if lite.Profile != full.Profile || lite.Point != full.Point {
+		t.Fatal("lite resolve profile/point differs from full resolve")
+	}
+	// The authority comparison must discriminate every coordinate it
+	// claims to cover: flipping any one of them has to break equality,
+	// and the digest has to agree.
+	flip := func(route ReplicatedRoute) []ReplicatedRoute {
+		out := make([]ReplicatedRoute, 0, 8)
+		next := route
+		next.AllocationGeneration++
+		out = append(out, next)
+		next = route
+		next.Command.OwnershipEpoch++
+		out = append(out, next)
+		next = route
+		next.Command.SchemaGeneration++
+		out = append(out, next)
+		next = route
+		next.Command.RouteGeneration++
+		out = append(out, next)
+		next = route
+		next.Command.RoutingVersion++
+		out = append(out, next)
+		next = route
+		next.Group.GroupID[0]++
+		out = append(out, next)
+		return out
+	}
+	want := replicatedRouteAuthority(full.Route)
+	for index, tampered := range flip(full.Route) {
+		if replicatedRouteAuthority(tampered) == want {
+			t.Fatalf("authority comparison blind to coordinate %d", index)
+		}
+		if replicatedRouteAuthorityDigest(tampered) == replicatedRouteAuthorityDigest(full.Route) {
+			t.Fatalf("route digest blind to coordinate %d", index)
+		}
+	}
+}

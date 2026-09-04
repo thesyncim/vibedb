@@ -361,6 +361,7 @@ func (reader *ReplicatedDataReader) readBatchPinned(
 
 	var route ReplicatedRoute
 	var routeID replication.Digest
+	var routeAuthority replication.RouteAuthority
 	maximum := uint64(request.MaxResultBytes)
 	if maximum > reader.maxReadBytes {
 		return ReplicatedTableBatchReadResult{}, lease.generation, ErrReplicatedReadAdmission
@@ -377,11 +378,12 @@ func (reader *ReplicatedDataReader) readBatchPinned(
 	}
 	points := make([]ReplicatedBatchPointRead, len(request.Points))
 	// Only the first point's route leaves this loop (it addresses the RPC);
-	// later points keep nothing but their RouteID digest, captured before the
-	// next iteration overwrites the workspace. They therefore share one
-	// scratch pair instead of escaping a replica table and decode slab per
-	// point. The shared pair is never retained: resolved routes alias it, and
-	// only index zero's route is kept.
+	// later points keep nothing: each is gated on a direct authority
+	// comparison before the next iteration overwrites the workspace. They
+	// therefore share one scratch pair instead of escaping a replica table
+	// and decode slab per point, and skip the SHA256 route digest entirely.
+	// The shared pair is never retained: resolved routes alias it, and only
+	// index zero's route is kept.
 	var firstReplicas [ServingReplicaCount]ReplicatedEndpoint
 	var firstScalar [replication.MaxMutationKeyBytes + 16]byte
 	var routeReplicas [ServingReplicaCount]ReplicatedEndpoint
@@ -391,16 +393,33 @@ func (reader *ReplicatedDataReader) readBatchPinned(
 		if index == 0 {
 			replicaScratch, scalarScratch = firstReplicas[:0], firstScalar[:0]
 		}
-		resolved, ok := lease.snapshot.ResolveReplicatedTableKey(
+		// Only the leading point pays for the SHA256 route digest (it binds
+		// the result position). Later points resolve without it and gate on a
+		// direct authority comparison, which rejects exactly the same route
+		// mismatches without re-hashing identical authority bytes per point.
+		if index == 0 {
+			resolved, ok := lease.snapshot.ResolveReplicatedTableKey(
+				request.Points[index].Table, request.Points[index].Key,
+				scalarScratch, replicaScratch,
+			)
+			if !ok {
+				return ReplicatedTableBatchReadResult{}, lease.generation, ErrReplicatedTableRoute
+			}
+			route, routeID = resolved.Route, resolved.RouteID
+			routeAuthority = replicatedRouteAuthority(route)
+			points[index] = ReplicatedBatchPointRead{
+				Relation: resolved.Profile.Relation, Key: request.Points[index].Key,
+			}
+			if pressurePoints != nil {
+				pressurePoints[index] = resolved.Point
+			}
+			continue
+		}
+		resolved, ok := lease.snapshot.resolveReplicatedTableKeyWithoutRouteID(
 			request.Points[index].Table, request.Points[index].Key,
 			scalarScratch, replicaScratch,
 		)
-		if !ok {
-			return ReplicatedTableBatchReadResult{}, lease.generation, ErrReplicatedTableRoute
-		}
-		if index == 0 {
-			route, routeID = resolved.Route, resolved.RouteID
-		} else if resolved.RouteID != routeID {
+		if !ok || replicatedRouteAuthority(resolved.Route) != routeAuthority {
 			return ReplicatedTableBatchReadResult{}, lease.generation, ErrReplicatedTableRoute
 		}
 		points[index] = ReplicatedBatchPointRead{

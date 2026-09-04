@@ -155,7 +155,14 @@ func replicatedTransactionRouteAuthorityWitness(route ReplicatedRoute, stableMem
 }
 
 func replicatedRouteAuthorityDigest(route ReplicatedRoute) replication.Digest {
-	return replication.RouteAuthorityDigest(replication.RouteAuthority{
+	return replication.RouteAuthorityDigest(replicatedRouteAuthority(route))
+}
+
+// replicatedRouteAuthority copies the exact authority coordinates covered by
+// the route digest. The struct is value-comparable, so batch readers can gate
+// same-route points with == instead of re-hashing identical bytes per point.
+func replicatedRouteAuthority(route ReplicatedRoute) replication.RouteAuthority {
+	return replication.RouteAuthority{
 		ClusterID:              route.Group.ClusterID,
 		ClusterIncarnation:     route.Group.ClusterIncarnation,
 		TopologyRecoveryEpoch:  route.Group.TopologyRecoveryEpoch,
@@ -170,5 +177,5 @@ func replicatedRouteAuthorityDigest(route ReplicatedRoute) replication.Digest {
 		RelationManifestDigest: replication.Digest(route.Command.RelationManifestDigest),
 		RoutingVersion:         route.Command.RoutingVersion,
 		RouteGeneration:        route.Command.RouteGeneration,
-	})
+	}
 }
