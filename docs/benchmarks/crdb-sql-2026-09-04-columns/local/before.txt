@@ -1,0 +1,23 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/query
+cpu: Apple M4 Max
+BenchmarkFileColumnScan/filter/workers=1-16         	      64	   5584217 ns/op	       0 B/op	       0 allocs/op
+BenchmarkFileColumnScan/filter/workers=1-16         	      63	   5613925 ns/op	       0 B/op	       0 allocs/op
+BenchmarkFileColumnScan/filter/workers=1-16         	      61	   5668975 ns/op	       0 B/op	       0 allocs/op
+BenchmarkFileColumnScan/group/workers=1-16          	      58	   5993960 ns/op	       0 B/op	       0 allocs/op
+BenchmarkFileColumnScan/group/workers=1-16          	      60	   6117079 ns/op	       0 B/op	       0 allocs/op
+BenchmarkFileColumnScan/group/workers=1-16          	      58	   6009930 ns/op	       0 B/op	       0 allocs/op
+BenchmarkFileColumnScan/project/workers=1-16        	      60	   6115466 ns/op	       0 B/op	       0 allocs/op
+BenchmarkFileColumnScan/project/workers=1-16        	      57	   6020542 ns/op	       0 B/op	       0 allocs/op
+BenchmarkFileColumnScan/project/workers=1-16        	      58	   6098454 ns/op	       1 B/op	       0 allocs/op
+BenchmarkFileColumnScan/filter/workers=4-16         	      63	   5717540 ns/op	  139071 B/op	       1 allocs/op
+BenchmarkFileColumnScan/filter/workers=4-16         	      62	   5782266 ns/op	  141313 B/op	       1 allocs/op
+BenchmarkFileColumnScan/filter/workers=4-16         	      55	   6483631 ns/op	   76352 B/op	       0 allocs/op
+BenchmarkFileColumnScan/group/workers=4-16          	      52	   6534942 ns/op	       2 B/op	       0 allocs/op
+BenchmarkFileColumnScan/group/workers=4-16          	      60	   6072901 ns/op	       0 B/op	       0 allocs/op
+BenchmarkFileColumnScan/group/workers=4-16          	      60	   6014562 ns/op	  127760 B/op	       4 allocs/op
+BenchmarkFileColumnScan/project/workers=4-16        	      60	   6123794 ns/op	  183666 B/op	       2 allocs/op
+BenchmarkFileColumnScan/project/workers=4-16        	      61	   6070319 ns/op	       0 B/op	       0 allocs/op
+BenchmarkFileColumnScan/project/workers=4-16        	      60	   6944130 ns/op	  148715 B/op	       2 allocs/op
+PASS

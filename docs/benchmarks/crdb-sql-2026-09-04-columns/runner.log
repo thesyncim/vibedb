@@ -1,0 +1,18 @@
+docker.io/cockroachdb/cockroach@sha256:204f131510c78393adb02345f289a8dbb32e1491e26cc92b6c7751f3b97be3c5: Pulling from cockroachdb/cockroach
+Digest: sha256:204f131510c78393adb02345f289a8dbb32e1491e26cc92b6c7751f3b97be3c5
+Status: Image is up to date for cockroachdb/cockroach@sha256:204f131510c78393adb02345f289a8dbb32e1491e26cc92b6c7751f3b97be3c5
+docker.io/cockroachdb/cockroach:v26.3.1@sha256:204f131510c78393adb02345f289a8dbb32e1491e26cc92b6c7751f3b97be3c5
+029792ef8f284f718512b47a81b3e92568ae46b7e07f4aa6af4e94ec84421b8d
+vibedb-crdb-sql-bd59fe139f42-binary
+vibedb-crdb-sql-bd59fe139f42-data
+101b249f23da3e521da73048a1c1aaebe320585006e99d8616e02b961a746a8f
+vibedb: exit=0; raw log: /private/tmp/vibedb-crdb-sql-columns/vibedb-client.log
+E260904 11:46:09.281607 69 2@rpc/peer.go:697  [rnode=?,raddr=127.0.0.1:26257,class=system,rpc] 1  failed connection attempt (last connected 0s ago): grpc: connection error: desc = "transport: error while dialing: dial tcp 127.0.0.1:26257: connect: connection refused" [code 14/Unavailable]
+warning: node not ready to perform cluster initialization: failed to connect to the node: initial connection heartbeat failed: grpc: connection error: desc = "transport: error while dialing: dial tcp 127.0.0.1:26257: connect: connection refused" [code 14/Unavailable] (retrying)
+Cluster successfully initialized
+SET CLUSTER SETTING
+CREATE ROLE
+GRANT ROLE
+cockroachdb: exit=0; raw log: /private/tmp/vibedb-crdb-sql-columns/cockroachdb-client.log
+vibedb-crdb-sql-bd59fe139f42
+vibedb-crdb-sql-bd59fe139f42-data
