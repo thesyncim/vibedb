@@ -1,0 +1,31 @@
+Date: 2026-09-04
+Original worktree: /private/tmp/vibedb-fused-rf3-node
+Frozen base source: /private/tmp/vibedb-catalog-miss-fixed-6402842c
+Isolated tested copy: /private/tmp/vibedb-diagnostics-sol-review-20260904
+Only the four reviewed diagnostics paths were overlaid onto the frozen base. The unreviewed storage and gateway WIP in the original worktree was not used by either test run.
+
+Docker image: golang:1.27-bookworm, --pull=never
+Image ID: sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b
+Image platform: linux/arm64
+Network: disabled with --network=none
+Source: /private/tmp/vibedb-diagnostics-sol-review-20260904 mounted read-only at /workspace
+Module cache: /Users/thesyncim/go/pkg/mod mounted read-only at /gomodcache
+Dedicated new volume: vibedb-fused-diagnostics-sol-20260904-review mounted at /fixture-tmp
+Go build cache: /fixture-tmp/go-build
+Real stores: fresh testing.TempDir directories under TMPDIR=/fixture-tmp, on the Docker volume rather than the macOS source bind mount
+Other environment: GOMODCACHE=/gomodcache, GOTOOLCHAIN=local, GOEXPERIMENT=simd, VIBEDB_RF3_QUORUM_QUALIFICATION=1
+
+Source preparation:
+cp -R /private/tmp/vibedb-catalog-miss-fixed-6402842c /private/tmp/vibedb-diagnostics-sol-review-20260904
+cd /private/tmp/vibedb-fused-rf3-node
+cp cmd/vibedb-shard/rf3_diagnostics.go cmd/vibedb-shard/rf3_diagnostics_resource_test.go cmd/vibedb-shard/rf3_diagnostics_resource_linux_test.go cmd/vibedb-shard/serve_rf3.go /private/tmp/vibedb-diagnostics-sol-review-20260904/cmd/vibedb-shard/
+docker volume create vibedb-fused-diagnostics-sol-20260904-review
+
+Normal run (exit 0; package PASS 0.851s):
+docker run --rm --pull=never --network=none --name vibedb-fused-diagnostics-sol-normal --mount type=bind,src=/private/tmp/vibedb-diagnostics-sol-review-20260904,dst=/workspace,readonly --mount type=bind,src=/Users/thesyncim/go/pkg/mod,dst=/gomodcache,readonly --mount type=volume,src=vibedb-fused-diagnostics-sol-20260904-review,dst=/fixture-tmp --workdir /workspace -e GOMODCACHE=/gomodcache -e GOCACHE=/fixture-tmp/go-build -e TMPDIR=/fixture-tmp -e GOTOOLCHAIN=local -e GOEXPERIMENT=simd -e VIBEDB_RF3_QUORUM_QUALIFICATION=1 golang:1.27-bookworm go test ./cmd/vibedb-shard -run 'TestRF3Diagnostic|TestRunServeNodeRequiresPreparedGatewayManifest' -count=1 -v -timeout=180s > /private/tmp/fused-diagnostics-sol-linux-normal.log 2>&1
+
+Race run (exit 0; package PASS 2.799s):
+docker run --rm --pull=never --network=none --name vibedb-fused-diagnostics-sol-race --mount type=bind,src=/private/tmp/vibedb-diagnostics-sol-review-20260904,dst=/workspace,readonly --mount type=bind,src=/Users/thesyncim/go/pkg/mod,dst=/gomodcache,readonly --mount type=volume,src=vibedb-fused-diagnostics-sol-20260904-review,dst=/fixture-tmp --workdir /workspace -e GOMODCACHE=/gomodcache -e GOCACHE=/fixture-tmp/go-build -e TMPDIR=/fixture-tmp -e GOTOOLCHAIN=local -e GOEXPERIMENT=simd -e VIBEDB_RF3_QUORUM_QUALIFICATION=1 golang:1.27-bookworm go test -race ./cmd/vibedb-shard -run 'TestRF3Diagnostic|TestRunServeNodeRequiresPreparedGatewayManifest' -count=1 -v -timeout=180s > /private/tmp/fused-diagnostics-sol-linux-race.log 2>&1
+
+Both verbose logs contain named PASS for TestRF3DiagnosticRealCollectionSamplingPreservesPendingOverlay and TestRF3DiagnosticRealApplyCurrentSchemaAndDynamicCoverage, with no SKIP, FAIL or data race. Source overlay equality was verified byte-for-byte after both runs. Source and log SHA256 values are in /private/tmp/fused-diagnostics-sol-sha256.txt.
+Both test containers exited 0 and were removed by --rm. No benchmark was run. No test/build process remains active for this review.

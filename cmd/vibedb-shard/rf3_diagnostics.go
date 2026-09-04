@@ -12,6 +12,8 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/shardservice"
+	sqldriver "github.com/thesyncim/vibedb/sql/driver"
+	"github.com/thesyncim/vibedb/store/durable"
 )
 
 // rf3DiagnosticSnapshot is a fixed, bounded process-local evidence record.
@@ -65,6 +67,251 @@ type rf3DiagnosticSnapshot struct {
 	RemoteConnections       int    `json:"remote_connections"`
 	RemoteIdle              int    `json:"remote_idle"`
 	RemoteWaiters           int    `json:"remote_waiters"`
+
+	// Resource counters sum the currently open collection generations. Schema
+	// replacement or group retirement can reset them within one process, so
+	// interval comparisons require an unchanged serving inventory/generation.
+	ResourceStatsAvailable                bool                                  `json:"resource_stats_available"`
+	ResourceStatsCoveredGroups            uint64                                `json:"resource_stats_covered_groups"`
+	ResourceStatsFailures                 uint64                                `json:"resource_stats_failures"`
+	PrimaryOverlayFolds                   uint64                                `json:"primary_overlay_folds"`
+	PrimaryOverlayMaterializationAttempts uint64                                `json:"primary_overlay_materialization_attempts"`
+	PrimaryOverlayMaterializations        uint64                                `json:"primary_overlay_materializations"`
+	PrimaryOverlayMaterializationFailures uint64                                `json:"primary_overlay_materialization_failures"`
+	PrimaryOverlayFoldNSCount             uint64                                `json:"primary_overlay_fold_ns_count"`
+	PrimaryOverlayFoldNSSum               uint64                                `json:"primary_overlay_fold_ns_sum"`
+	PrimaryOverlayFoldNSMax               uint64                                `json:"primary_overlay_fold_ns_max"`
+	PrimaryOverlayFoldNSBuckets           [durable.StatsHistogramBuckets]uint64 `json:"primary_overlay_fold_ns_buckets"`
+	PrimaryOverlayPressureFolds           uint64                                `json:"primary_overlay_pressure_folds"`
+	PrimaryOverlaySnapshotFolds           uint64                                `json:"primary_overlay_snapshot_folds"`
+	PrimaryOverlayBarrierFolds            uint64                                `json:"primary_overlay_barrier_folds"`
+	PrimaryOverlayCheckpointFolds         uint64                                `json:"primary_overlay_checkpoint_folds"`
+	PrimaryOverlayArenaBytes              uint64                                `json:"primary_overlay_arena_bytes"`
+	PrimaryOverlayRetainedRecords         uint64                                `json:"primary_overlay_retained_records"`
+	PrimaryOverlayDirtyBuckets            uint64                                `json:"primary_overlay_dirty_buckets"`
+	PrimaryOverlayReservedFoldBytes       uint64                                `json:"primary_overlay_reserved_fold_bytes"`
+}
+
+type rf3DiagnosticApply interface {
+	ResourceStats() (sqldriver.ReplicatedApplyResourceStats, error)
+}
+
+type rf3DiagnosticResourceTotals struct {
+	available                             bool
+	covered, failures                     uint64
+	groups                                map[raftmember.GroupKey]rf3DiagnosticApply
+	expected                              map[raftmember.GroupKey]struct{}
+	overflow                              bool
+	primaryOverlayFolds                   uint64
+	primaryOverlayMaterializationAttempts uint64
+	primaryOverlayMaterializations        uint64
+	primaryOverlayMaterializationFailures uint64
+	primaryOverlayFoldNS                  durable.StatsHistogram
+	primaryOverlayPressureFolds           uint64
+	primaryOverlaySnapshotFolds           uint64
+	primaryOverlayBarrierFolds            uint64
+	primaryOverlayCheckpointFolds         uint64
+	primaryOverlayArenaBytes              uint64
+	primaryOverlayRetainedRecords         uint64
+	primaryOverlayDirtyBuckets            uint64
+	primaryOverlayReservedFoldBytes       uint64
+}
+
+func addRF3DiagnosticResourceGroup(expected map[raftmember.GroupKey]struct{}, group raftmember.GroupKey) {
+	if group != (raftmember.GroupKey{}) {
+		expected[group] = struct{}{}
+	}
+}
+
+func addRF3DiagnosticResourceProvider(
+	providers map[raftmember.GroupKey]rf3DiagnosticApply,
+	group raftmember.GroupKey,
+	apply rf3DiagnosticApply,
+) {
+	if group != (raftmember.GroupKey{}) && apply != nil {
+		if prior, present := providers[group]; !present || prior == nil {
+			providers[group] = apply
+		}
+	}
+}
+
+func setRF3DiagnosticResourceProvider(
+	providers map[raftmember.GroupKey]rf3DiagnosticApply,
+	group raftmember.GroupKey,
+	apply rf3DiagnosticApply,
+) {
+	if group != (raftmember.GroupKey{}) {
+		providers[group] = apply
+	}
+}
+
+func (totals *rf3DiagnosticResourceTotals) addUint64(target *uint64, value uint64) {
+	if ^uint64(0)-*target < value {
+		*target = ^uint64(0)
+		totals.overflow = true
+		return
+	}
+	*target += value
+}
+
+func (totals *rf3DiagnosticResourceTotals) failure() {
+	totals.addUint64(&totals.failures, 1)
+}
+
+func (totals *rf3DiagnosticResourceTotals) add(stats durable.Stats) {
+	totals.addUint64(&totals.primaryOverlayFolds, stats.PrimaryOverlayFolds)
+	totals.addUint64(&totals.primaryOverlayMaterializationAttempts, stats.PrimaryOverlayMaterializationAttempts)
+	totals.addUint64(&totals.primaryOverlayMaterializations, stats.PrimaryOverlayMaterializations)
+	totals.addUint64(&totals.primaryOverlayMaterializationFailures, stats.PrimaryOverlayMaterializationFailures)
+	totals.addUint64(&totals.primaryOverlayFoldNS.Count, stats.PrimaryOverlayFoldNS.Count)
+	totals.addUint64(&totals.primaryOverlayFoldNS.Sum, stats.PrimaryOverlayFoldNS.Sum)
+	if stats.PrimaryOverlayFoldNS.Max > totals.primaryOverlayFoldNS.Max {
+		totals.primaryOverlayFoldNS.Max = stats.PrimaryOverlayFoldNS.Max
+	}
+	for index := range totals.primaryOverlayFoldNS.Buckets {
+		totals.addUint64(&totals.primaryOverlayFoldNS.Buckets[index], stats.PrimaryOverlayFoldNS.Buckets[index])
+	}
+	totals.addUint64(&totals.primaryOverlayPressureFolds, stats.PrimaryOverlayPressureFolds)
+	totals.addUint64(&totals.primaryOverlaySnapshotFolds, stats.PrimaryOverlaySnapshotFolds)
+	totals.addUint64(&totals.primaryOverlayBarrierFolds, stats.PrimaryOverlayBarrierFolds)
+	totals.addUint64(&totals.primaryOverlayCheckpointFolds, stats.PrimaryOverlayCheckpointFolds)
+	totals.addUint64(&totals.primaryOverlayArenaBytes, stats.PrimaryOverlayArenaBytes)
+	totals.addUint64(&totals.primaryOverlayRetainedRecords, stats.PrimaryOverlayRetainedRecords)
+	totals.addUint64(&totals.primaryOverlayDirtyBuckets, stats.PrimaryOverlayDirtyBuckets)
+	totals.addUint64(&totals.primaryOverlayReservedFoldBytes, stats.PrimaryOverlayReservedFoldBytes)
+}
+
+func aggregateRF3DiagnosticResources(
+	expected map[raftmember.GroupKey]struct{},
+	providers map[raftmember.GroupKey]rf3DiagnosticApply,
+	inventoryUnavailable bool,
+) rf3DiagnosticResourceTotals {
+	totals := rf3DiagnosticResourceTotals{expected: expected, groups: providers}
+	if inventoryUnavailable {
+		totals.failure()
+	}
+	for group := range expected {
+		apply, present := providers[group]
+		if !present || apply == nil {
+			totals.failure()
+			continue
+		}
+		resources, err := apply.ResourceStats()
+		if err != nil || resources.RelationCount == 0 ||
+			resources.RelationCount > uint16(len(resources.Relations)) {
+			totals.failure()
+			continue
+		}
+		totals.addUint64(&totals.covered, 1)
+		totals.add(resources.System)
+		totals.add(resources.Capture)
+		for relation := uint16(0); relation < resources.RelationCount; relation++ {
+			totals.add(resources.Relations[relation])
+		}
+	}
+	if totals.overflow {
+		totals.failure()
+	}
+	totals.available = len(expected) != 0 && totals.covered == uint64(len(expected)) &&
+		totals.failures == 0 && !totals.overflow
+	return totals
+}
+
+type rf3DiagnosticInventorySnapshot struct {
+	nativeGroups map[raftmember.GroupKey]struct{}
+	providers    map[raftmember.GroupKey]rf3DiagnosticApply
+	usable       bool
+}
+
+func snapshotRF3DiagnosticInventory(inventory *rf3AdoptedGroupInventory) rf3DiagnosticInventorySnapshot {
+	if inventory == nil {
+		return rf3DiagnosticInventorySnapshot{usable: true}
+	}
+	inventory.mu.Lock()
+	defer inventory.mu.Unlock()
+	snapshot := rf3DiagnosticInventorySnapshot{
+		nativeGroups: make(map[raftmember.GroupKey]struct{}),
+		providers:    make(map[raftmember.GroupKey]rf3DiagnosticApply),
+		usable:       inventory.root != nil && !inventory.failed,
+	}
+	if native := inventory.nativeChildren.Load(); native != nil {
+		for group := range *native {
+			if group != (raftmember.GroupKey{}) {
+				snapshot.nativeGroups[group] = struct{}{}
+			}
+		}
+	}
+	if snapshot.usable {
+		for group, runtime := range inventory.runtimes {
+			if runtime.apply != nil {
+				addRF3DiagnosticResourceProvider(snapshot.providers, group, runtime.apply)
+			}
+		}
+	}
+	return snapshot
+}
+
+func snapshotRF3DiagnosticSchemaProviders(schemas *rf3SchemaActivator) map[raftmember.GroupKey]rf3DiagnosticApply {
+	providers := make(map[raftmember.GroupKey]rf3DiagnosticApply)
+	if schemas == nil {
+		return providers
+	}
+	type schemaState struct {
+		group raftmember.GroupKey
+		state *rf3SchemaGeneration
+	}
+	schemas.mu.RLock()
+	states := make([]schemaState, 0, len(schemas.groups))
+	for group, state := range schemas.groups {
+		states = append(states, schemaState{group: group, state: state})
+	}
+	schemas.mu.RUnlock()
+	for _, entry := range states {
+		var apply rf3DiagnosticApply
+		if entry.state != nil {
+			entry.state.mu.Lock()
+			apply = entry.state.apply
+			entry.state.mu.Unlock()
+		}
+		// A mapped generation with no current apply must mask a prepared
+		// predecessor rather than accidentally reporting that closed handle.
+		setRF3DiagnosticResourceProvider(providers, entry.group, apply)
+	}
+	return providers
+}
+
+func collectRF3DiagnosticResources(
+	manifest rf3Manifest,
+	prepared []preparedRF3Group,
+	inventory *rf3AdoptedGroupInventory,
+	schemas *rf3SchemaActivator,
+) rf3DiagnosticResourceTotals {
+	bundles := manifest.groupBundles()
+	expected := make(map[raftmember.GroupKey]struct{}, len(bundles)+len(prepared))
+	providers := make(map[raftmember.GroupKey]rf3DiagnosticApply, len(bundles)+len(prepared))
+	for _, bundle := range bundles {
+		addRF3DiagnosticResourceGroup(expected, bundle.Route.Group)
+	}
+	for index := range prepared {
+		group := groupFromBinding(prepared[index].base.Binding)
+		if group == (raftmember.GroupKey{}) {
+			group = prepared[index].manifest.Route.Group
+		}
+		if prepared[index].apply != nil {
+			addRF3DiagnosticResourceProvider(providers, group, prepared[index].apply)
+		}
+	}
+	inventorySnapshot := snapshotRF3DiagnosticInventory(inventory)
+	for group := range inventorySnapshot.nativeGroups {
+		addRF3DiagnosticResourceGroup(expected, group)
+	}
+	for group, apply := range inventorySnapshot.providers {
+		addRF3DiagnosticResourceProvider(providers, group, apply)
+	}
+	for group, apply := range snapshotRF3DiagnosticSchemaProviders(schemas) {
+		setRF3DiagnosticResourceProvider(providers, group, apply)
+	}
+	return aggregateRF3DiagnosticResources(expected, providers, inventory != nil && !inventorySnapshot.usable)
 }
 
 // emitRF3DiagnosticSnapshot writes one machine-readable line with a stable
@@ -82,24 +329,51 @@ func emitRF3DiagnosticSnapshot(
 	serial *atomic.Uint64,
 	inventory *rf3AdoptedGroupInventory,
 ) {
+	emitRF3DiagnosticSnapshotWithResources(manifest, profile, nodeOwner, server, embedded, serial, inventory, nil, nil)
+}
+
+func emitRF3DiagnosticSnapshotWithResources(
+	manifest rf3Manifest,
+	profile *rafttransport.PeerTLS,
+	nodeOwner *rf3NodeOwner,
+	server *shardservice.ReplicatedServer,
+	embedded *rf3EmbeddedGateway,
+	serial *atomic.Uint64,
+	inventory *rf3AdoptedGroupInventory,
+	prepared []preparedRF3Group,
+	schemas *rf3SchemaActivator,
+) {
 	snapshot := rf3DiagnosticSnapshot{
 		UTC: time.Now().UTC().Format(time.RFC3339Nano), Event: "snapshot", PID: os.Getpid(),
 		Groups: len(manifest.groupBundles()), ReadyWaveHistogram: make([]uint64, raftstore.MaxPersistGroupBatches+1),
 	}
-	if inventory != nil {
-		// The authority snapshot includes both freshly appended prepared
-		// groups and adopted split children. Count their union with the manifest.
-		groups := make(map[raftmember.GroupKey]struct{}, snapshot.Groups)
-		for _, bundle := range manifest.groupBundles() {
-			groups[bundle.Route.Group] = struct{}{}
-		}
-		if native := inventory.nativeChildren.Load(); native != nil {
-			for group := range *native {
-				groups[group] = struct{}{}
-			}
-		}
-		snapshot.Groups = len(groups)
+	resources := collectRF3DiagnosticResources(manifest, prepared, inventory, schemas)
+	// Production manifests always carry nonzero group identities. Preserve the
+	// old declared count for in-memory legacy fixtures that intentionally omit
+	// those identities; such a record remains unavailable below.
+	snapshot.Groups = len(resources.expected)
+	if snapshot.Groups == 0 {
+		snapshot.Groups = len(manifest.groupBundles())
 	}
+	snapshot.ResourceStatsAvailable = resources.available
+	snapshot.ResourceStatsCoveredGroups = resources.covered
+	snapshot.ResourceStatsFailures = resources.failures
+	snapshot.PrimaryOverlayFolds = resources.primaryOverlayFolds
+	snapshot.PrimaryOverlayMaterializationAttempts = resources.primaryOverlayMaterializationAttempts
+	snapshot.PrimaryOverlayMaterializations = resources.primaryOverlayMaterializations
+	snapshot.PrimaryOverlayMaterializationFailures = resources.primaryOverlayMaterializationFailures
+	snapshot.PrimaryOverlayFoldNSCount = resources.primaryOverlayFoldNS.Count
+	snapshot.PrimaryOverlayFoldNSSum = resources.primaryOverlayFoldNS.Sum
+	snapshot.PrimaryOverlayFoldNSMax = resources.primaryOverlayFoldNS.Max
+	snapshot.PrimaryOverlayFoldNSBuckets = resources.primaryOverlayFoldNS.Buckets
+	snapshot.PrimaryOverlayPressureFolds = resources.primaryOverlayPressureFolds
+	snapshot.PrimaryOverlaySnapshotFolds = resources.primaryOverlaySnapshotFolds
+	snapshot.PrimaryOverlayBarrierFolds = resources.primaryOverlayBarrierFolds
+	snapshot.PrimaryOverlayCheckpointFolds = resources.primaryOverlayCheckpointFolds
+	snapshot.PrimaryOverlayArenaBytes = resources.primaryOverlayArenaBytes
+	snapshot.PrimaryOverlayRetainedRecords = resources.primaryOverlayRetainedRecords
+	snapshot.PrimaryOverlayDirtyBuckets = resources.primaryOverlayDirtyBuckets
+	snapshot.PrimaryOverlayReservedFoldBytes = resources.primaryOverlayReservedFoldBytes
 	if serial != nil {
 		snapshot.Serial = serial.Add(1)
 	}

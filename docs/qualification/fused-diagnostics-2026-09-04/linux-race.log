@@ -1,0 +1,66 @@
+=== RUN   TestRF3DiagnosticRealApplyCurrentSchemaAndDynamicCoverage
+--- PASS: TestRF3DiagnosticRealApplyCurrentSchemaAndDynamicCoverage (1.64s)
+=== RUN   TestRF3DiagnosticResourceAggregationIncludesAllParticipants
+--- PASS: TestRF3DiagnosticResourceAggregationIncludesAllParticipants (0.01s)
+=== RUN   TestRF3DiagnosticResourceGroupDedupKeepsOneProvider
+--- PASS: TestRF3DiagnosticResourceGroupDedupKeepsOneProvider (0.00s)
+=== RUN   TestRF3DiagnosticCurrentGenerationMasksPreparedProvider
+--- PASS: TestRF3DiagnosticCurrentGenerationMasksPreparedProvider (0.00s)
+=== RUN   TestRF3DiagnosticResourceFailuresAreUnavailable
+--- PASS: TestRF3DiagnosticResourceFailuresAreUnavailable (0.00s)
+=== RUN   TestRF3DiagnosticResourceLiveUnionOmitsRetiredPreparedGroups
+--- PASS: TestRF3DiagnosticResourceLiveUnionOmitsRetiredPreparedGroups (0.00s)
+=== RUN   TestRF3DiagnosticInventorySnapshotFailsClosed
+--- PASS: TestRF3DiagnosticInventorySnapshotFailsClosed (0.00s)
+=== RUN   TestRF3DiagnosticResourceOverflowFailsClosed
+--- PASS: TestRF3DiagnosticResourceOverflowFailsClosed (0.00s)
+=== RUN   TestRF3DiagnosticResourceErrorIdentity
+--- PASS: TestRF3DiagnosticResourceErrorIdentity (0.00s)
+=== RUN   TestRF3DiagnosticRealCollectionSamplingPreservesPendingOverlay
+--- PASS: TestRF3DiagnosticRealCollectionSamplingPreservesPendingOverlay (0.07s)
+=== RUN   TestRunServeNodeRequiresPreparedGatewayManifest
+=== RUN   TestRunServeNodeRequiresPreparedGatewayManifest/single_group_manifest
+error RF3 node manifest: serve-node requires grouped node_log and explicit gateway configuration
+=== RUN   TestRunServeNodeRequiresPreparedGatewayManifest/unknown_flag
+flag provided but not defined: -unknown
+Usage of serve-node:
+  -execution-lanes int
+    	power-of-two Raft execution lanes shared by node groups (default 8)
+  -manifest string
+    	canonical prepared physical-node manifest
+  -reload-prepared-groups
+    	allow SIGHUP to append durably prepared groups from the same manifest
+usage:
+  vibedb-shard init -store <path> -distribution <name> -shard <id> -allocation-generation <n>
+  vibedb-shard serve -store <path> -listen <addr> -distribution <name> -shard <id> -allocation-generation <n> -epoch <n> -routing-version <n>
+  vibedb-shard serve-rf3 -manifest <path>
+  vibedb-shard serve-node -manifest <path>
+  vibedb-shard prepare-rf3 -manifest <path>
+  vibedb-shard prepare-node-rf3 -manifest <path>
+  vibedb-shard prepare-node-group-rf3 -manifest <path>
+  vibedb-shard bootstrap-rf3 -manifest <path>
+  vibedb-shard adopt-restored-rf3 -manifest <path>
+=== RUN   TestRunServeNodeRequiresPreparedGatewayManifest/missing_manifest
+usage:
+  vibedb-shard init -store <path> -distribution <name> -shard <id> -allocation-generation <n>
+  vibedb-shard serve -store <path> -listen <addr> -distribution <name> -shard <id> -allocation-generation <n> -epoch <n> -routing-version <n>
+  vibedb-shard serve-rf3 -manifest <path>
+  vibedb-shard serve-node -manifest <path>
+  vibedb-shard prepare-rf3 -manifest <path>
+  vibedb-shard prepare-node-rf3 -manifest <path>
+  vibedb-shard prepare-node-group-rf3 -manifest <path>
+  vibedb-shard bootstrap-rf3 -manifest <path>
+  vibedb-shard adopt-restored-rf3 -manifest <path>
+--- PASS: TestRunServeNodeRequiresPreparedGatewayManifest (0.00s)
+    --- PASS: TestRunServeNodeRequiresPreparedGatewayManifest/single_group_manifest (0.00s)
+    --- PASS: TestRunServeNodeRequiresPreparedGatewayManifest/unknown_flag (0.00s)
+    --- PASS: TestRunServeNodeRequiresPreparedGatewayManifest/missing_manifest (0.00s)
+=== RUN   TestRF3DiagnosticSnapshotWritesDurableNodeRootRecord
+VIBEDB_RF3_DIAGNOSTIC {"utc":"2026-09-04T18:02:47.433989751Z","event":"snapshot","serial":1,"pid":7138,"node_id":"","groups":2,"ready_waves":0,"ready_durable_waves":0,"observed_append_barriers":0,"multi_group_waves":0,"ready_wave_group_histogram":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"ready_queue_depth":0,"ready_queue_capacity":0,"active_submitters":0,"failed_waves":0,"checkpoint_queue_submissions":0,"checkpoint_queue_rejected":0,"checkpoint_queue_wait_ns":0,"checkpoint_service_ns":0,"native_available":false,"native_accepted":0,"native_rejected":0,"native_failed":0,"native_active":0,"native_semantic_dispatches":0,"native_inflight_frame_bytes":0,"gateway_available":false,"gateway_local_calls":0,"gateway_remote_calls":0,"gateway_semantic_sql_calls":0,"gateway_legacy_calls":0,"gateway_sql_request_encodings":0,"gateway_sql_request_encoded_bytes":0,"remote_dials":0,"remote_reuses":0,"remote_poisoned":0,"remote_rejected":0,"remote_handshake_failures":0,"remote_connections":0,"remote_idle":0,"remote_waiters":0,"resource_stats_available":false,"resource_stats_covered_groups":0,"resource_stats_failures":0,"primary_overlay_folds":0,"primary_overlay_materialization_attempts":0,"primary_overlay_materializations":0,"primary_overlay_materialization_failures":0,"primary_overlay_fold_ns_count":0,"primary_overlay_fold_ns_sum":0,"primary_overlay_fold_ns_max":0,"primary_overlay_fold_ns_buckets":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"primary_overlay_pressure_folds":0,"primary_overlay_snapshot_folds":0,"primary_overlay_barrier_folds":0,"primary_overlay_checkpoint_folds":0,"primary_overlay_arena_bytes":0,"primary_overlay_retained_records":0,"primary_overlay_dirty_buckets":0,"primary_overlay_reserved_fold_bytes":0}
+VIBEDB_RF3_DIAGNOSTIC {"utc":"2026-09-04T18:02:47.436156876Z","event":"snapshot","serial":2,"pid":7138,"node_id":"","groups":2,"ready_waves":0,"ready_durable_waves":0,"observed_append_barriers":0,"multi_group_waves":0,"ready_wave_group_histogram":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"ready_queue_depth":0,"ready_queue_capacity":0,"active_submitters":0,"failed_waves":0,"checkpoint_queue_submissions":0,"checkpoint_queue_rejected":0,"checkpoint_queue_wait_ns":0,"checkpoint_service_ns":0,"native_available":false,"native_accepted":0,"native_rejected":0,"native_failed":0,"native_active":0,"native_semantic_dispatches":0,"native_inflight_frame_bytes":0,"gateway_available":false,"gateway_local_calls":0,"gateway_remote_calls":0,"gateway_semantic_sql_calls":0,"gateway_legacy_calls":0,"gateway_sql_request_encodings":0,"gateway_sql_request_encoded_bytes":0,"remote_dials":0,"remote_reuses":0,"remote_poisoned":0,"remote_rejected":0,"remote_handshake_failures":0,"remote_connections":0,"remote_idle":0,"remote_waiters":0,"resource_stats_available":false,"resource_stats_covered_groups":0,"resource_stats_failures":0,"primary_overlay_folds":0,"primary_overlay_materialization_attempts":0,"primary_overlay_materializations":0,"primary_overlay_materialization_failures":0,"primary_overlay_fold_ns_count":0,"primary_overlay_fold_ns_sum":0,"primary_overlay_fold_ns_max":0,"primary_overlay_fold_ns_buckets":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"primary_overlay_pressure_folds":0,"primary_overlay_snapshot_folds":0,"primary_overlay_barrier_folds":0,"primary_overlay_checkpoint_folds":0,"primary_overlay_arena_bytes":0,"primary_overlay_retained_records":0,"primary_overlay_dirty_buckets":0,"primary_overlay_reserved_fold_bytes":0}
+--- PASS: TestRF3DiagnosticSnapshotWritesDurableNodeRootRecord (0.01s)
+=== RUN   TestRF3DiagnosticGroupsCountLiveAuthorityUnion
+VIBEDB_RF3_DIAGNOSTIC {"utc":"2026-09-04T18:02:47.442086626Z","event":"snapshot","serial":1,"pid":7138,"node_id":"","groups":2,"ready_waves":0,"ready_durable_waves":0,"observed_append_barriers":0,"multi_group_waves":0,"ready_wave_group_histogram":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"ready_queue_depth":0,"ready_queue_capacity":0,"active_submitters":0,"failed_waves":0,"checkpoint_queue_submissions":0,"checkpoint_queue_rejected":0,"checkpoint_queue_wait_ns":0,"checkpoint_service_ns":0,"native_available":false,"native_accepted":0,"native_rejected":0,"native_failed":0,"native_active":0,"native_semantic_dispatches":0,"native_inflight_frame_bytes":0,"gateway_available":false,"gateway_local_calls":0,"gateway_remote_calls":0,"gateway_semantic_sql_calls":0,"gateway_legacy_calls":0,"gateway_sql_request_encodings":0,"gateway_sql_request_encoded_bytes":0,"remote_dials":0,"remote_reuses":0,"remote_poisoned":0,"remote_rejected":0,"remote_handshake_failures":0,"remote_connections":0,"remote_idle":0,"remote_waiters":0,"resource_stats_available":false,"resource_stats_covered_groups":0,"resource_stats_failures":3,"primary_overlay_folds":0,"primary_overlay_materialization_attempts":0,"primary_overlay_materializations":0,"primary_overlay_materialization_failures":0,"primary_overlay_fold_ns_count":0,"primary_overlay_fold_ns_sum":0,"primary_overlay_fold_ns_max":0,"primary_overlay_fold_ns_buckets":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"primary_overlay_pressure_folds":0,"primary_overlay_snapshot_folds":0,"primary_overlay_barrier_folds":0,"primary_overlay_checkpoint_folds":0,"primary_overlay_arena_bytes":0,"primary_overlay_retained_records":0,"primary_overlay_dirty_buckets":0,"primary_overlay_reserved_fold_bytes":0}
+--- PASS: TestRF3DiagnosticGroupsCountLiveAuthorityUnion (0.01s)
+PASS
+ok  	github.com/thesyncim/vibedb/cmd/vibedb-shard	2.799s
