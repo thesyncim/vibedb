@@ -23,6 +23,7 @@ concurrency:
 
 env:
   GOEXPERIMENT: simd
+  GOAMD64: v1
   PACKED_SIMD_BENCHTIME: 250ms
   PACKED_SIMD_REPETITIONS: '5'
 
@@ -58,7 +59,7 @@ jobs:
           metadata="${evidence}/metadata"
           binaries="${RUNNER_TEMP}/packed-simd-binaries"
           base_worktree="${RUNNER_TEMP}/packed-simd-base"
-          mkdir -m 700 -p "${metadata}" "${binaries}"
+          mkdir -p "${metadata}" "${binaries}"
           test ! -e "${base_worktree}"
 
           base_selector="${PULL_REQUEST_BASE_SHA:-}"
@@ -156,19 +157,54 @@ jobs:
 
       - name: Run focused SIMD parity and query integration checks
         working-directory: ${{ github.workspace }}
+        env:
+          VIBEDB_TEST_REQUIRE_AVX2: ${{ matrix.runner == 'ubuntu-latest' && '1' || '' }}
         run: |
           set -euo pipefail
           evidence="${RUNNER_TEMP}/packed-simd"
           {
-            printf 'go test -count=1 -timeout=5m ./internal/storeio -run %q\n' \
+            printf 'VIBEDB_TEST_REQUIRE_AVX2=%q go test -v -count=1 -timeout=5m ./internal/storeio -run %q\n' \
+              "${VIBEDB_TEST_REQUIRE_AVX2}" \
               'Test(CountCompact|CompactPacked|CompactStream|CompactPrimaryStripe)'
             printf 'go test -count=1 -timeout=5m ./query -run %q\n' \
               '^TestFilePackedEqualityCount(Wide)?$'
+            printf 'VIBEDB_TEST_REQUIRE_AVX2=%q go test -v -race -gcflags=all=-d=checkptr=2 -count=1 -timeout=5m ./internal/storeio -run %q\n' \
+              "${VIBEDB_TEST_REQUIRE_AVX2}" \
+              '^(TestCountCompactPackedEqual|TestCompactPacked)'
           } > "${evidence}/focused-test-commands.txt"
-          go test -count=1 -timeout=5m ./internal/storeio \
-            -run 'Test(CountCompact|CompactPacked|CompactStream|CompactPrimaryStripe)'
+          go test -v -count=1 -timeout=5m ./internal/storeio \
+            -run 'Test(CountCompact|CompactPacked|CompactStream|CompactPrimaryStripe)' \
+            2>&1 | tee "${evidence}/focused-storeio-tests.txt"
           go test -count=1 -timeout=5m ./query \
             -run '^TestFilePackedEqualityCount(Wide)?$'
+          go test -v -race -gcflags=all=-d=checkptr=2 -count=1 -timeout=5m ./internal/storeio \
+            -run '^(TestCountCompactPackedEqual|TestCompactPacked)' \
+            2>&1 | tee "${evidence}/packed-race-checkptr-tests.txt"
+
+      - name: SIMD packed-count fallback with AVX2 disabled (AMD64)
+        if: matrix.runner == 'ubuntu-latest'
+        shell: bash
+        env:
+          GOAMD64: v1
+          GOEXPERIMENT: simd
+          GODEBUG: cpu.avx2=off
+        run: |
+          set -euo pipefail
+          evidence="${RUNNER_TEMP}/packed-simd/avx2-disabled"
+          mkdir -p "${evidence}"
+          test "$(go env GOARCH)" = amd64
+          test "$(go env GOAMD64)" = v1
+          {
+            printf 'revision=%s\n' "$(git rev-parse HEAD)"
+            go version
+            go env -json GOARCH GOAMD64 GOEXPERIMENT
+            printf 'GODEBUG=%s\n' "${GODEBUG}"
+          } > "${evidence}/environment.txt"
+          tests='Test(CountCompact|CompactPacked)|^TestFilePackedEqualityCount(Wide)?$'
+          printf 'GOAMD64=v1 GOEXPERIMENT=simd GODEBUG=cpu.avx2=off go test -v -count=1 -timeout=5m ./internal/storeio ./query -run %q\n' \
+            "${tests}" > "${evidence}/commands.txt"
+          go test -v -count=1 -timeout=5m ./internal/storeio ./query \
+            -run "${tests}" 2>&1 | tee "${evidence}/tests.txt"
 
       - name: Collect alternating native raw benchmarks
         working-directory: ${{ github.workspace }}
