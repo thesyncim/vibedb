@@ -27,9 +27,8 @@ type compactPrimaryScanShape struct {
 }
 
 type compactPrimaryScanStream struct {
-	// Low 16 bits are the first bound; high 16 bits are 1<<width. Zero means
-	// the stream has no prepared dictionary plan.
-	dictionary uint32
+	dictionaryFirst uint16
+	dictionaryCount uint16
 }
 
 type compactStreamSequentialState struct {
@@ -127,8 +126,8 @@ func (d *CompactPrimaryScanDecoder) prepare(
 				stream.dictCount+1 <= len(d.dictionary)-dictionaryCount &&
 				fragmentBytes <= len(d.fragments)-fragmentCount {
 				plan := &d.streamPlan[streamCount+hole]
-				plan.dictionary = uint32(dictionaryCount) |
-					uint32(uint16(1)<<stream.width)<<16
+				plan.dictionaryFirst = uint16(dictionaryCount)
+				plan.dictionaryCount = uint16(stream.dictCount)
 				d.dictionary[dictionaryCount] = uint16(fragmentCount)
 				dictionaryStart := 0
 				for id := 0; id < stream.dictCount; id++ {
@@ -237,7 +236,7 @@ func (d *CompactPrimaryScanDecoder) appendValue(
 		stream := &d.streamView[streamAt]
 		var ok bool
 		plan := d.streamPlan[streamAt]
-		if plan.dictionary != 0 {
+		if plan.dictionaryCount != 0 {
 			dst, ok = d.appendDictionaryFragment(dst, streamAt, ordinal)
 		} else {
 			dst = append(dst, meta.static[previous:end]...)
@@ -275,8 +274,7 @@ func (d *CompactPrimaryScanDecoder) appendDictionaryFragment(
 	// the stream grammar and fragment geometry checks for every value made those
 	// already-proven branches a material fraction of scan time.
 	plan := d.streamPlan[streamAt]
-	first := int(uint16(plan.dictionary))
-	dictionaryMask := uint16(plan.dictionary >> 16)
+	first := int(plan.dictionaryFirst)
 	width := int(v.width)
 	reservoir := uint64(s.value)
 	available := s.bit
@@ -286,7 +284,10 @@ func (d *CompactPrimaryScanDecoder) appendDictionaryFragment(
 		cursor++
 		available += 8
 	}
-	id := int(reservoir & uint64(dictionaryMask-1))
+	id := 0
+	if width != 0 {
+		id = int(reservoir & (uint64(1)<<uint(width) - 1))
+	}
 	start, end := compactPrimaryDictionarySpan(&d.dictionary, first+id)
 	reservoir >>= uint(width)
 	available -= width
