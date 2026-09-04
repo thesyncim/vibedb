@@ -1394,15 +1394,15 @@ func TestCompactPrimaryScanDecoderDictionaryPlanBounds(t *testing.T) {
 			{"shape metadata", unsafe.Sizeof(compactPrimaryScanShape{}), 96},
 			{"stream view", unsafe.Sizeof(compactStreamView{}), 104},
 			{"stream plan", unsafe.Sizeof(compactPrimaryScanStream{}), 4},
-			{"scan decoder", size, 40_912},
+			{"scan decoder", size, 38_864},
 		} {
 			if pin.got != pin.want {
 				t.Fatalf("64-bit %s bytes=%d, want %d", pin.name, pin.got, pin.want)
 			}
 		}
 	}
-	if size > 40<<10 {
-		t.Fatalf("scan decoder bytes=%d exceed bounded 40 KiB footprint", size)
+	if size > 38<<10 {
+		t.Fatalf("scan decoder bytes=%d exceed bounded 38 KiB footprint", size)
 	}
 	for _, high := range []bool{false, true} {
 		rows := 4096
@@ -1563,12 +1563,7 @@ func TestCompactPrimaryScanDictionaryReservoirAllWidths(t *testing.T) {
 				fragmentDecoder := CompactPrimaryScanDecoder{}
 				if fragmentSupported {
 					fragmentDecoder.streamView[0] = stream
-					dictionaryFirst := uint16(0)
-					if stream.dictCount <= 256 {
-						dictionaryFirst = 1 << compactPrimaryScanDictionarySlotShift
-					}
 					fragmentDecoder.streamPlan[0] = compactPrimaryScanStream{
-						dictionaryFirst: dictionaryFirst,
 						dictionaryCount: uint16(stream.dictCount),
 					}
 					copy(fragmentDecoder.dictionary[:], bounds)
@@ -1787,7 +1782,7 @@ func TestCompactPrimaryScanDictionaryReservoirReprepareSameSlot(t *testing.T) {
 			t.Fatalf("initial dictionary row=%d", row)
 		}
 	}
-	if decoder.streams[0].width != 1 {
+	if decoder.streams[0].next != 2 {
 		t.Fatalf("initial dictionary state=%+v", decoder.streams[0])
 	}
 
