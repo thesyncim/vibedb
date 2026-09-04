@@ -1,0 +1,16 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/pgwire
+cpu: Apple M4 Max
+BenchmarkUnnamedParseFrontend/cold-16         	 3616606	       331.9 ns/op	     600 B/op	       7 allocs/op
+BenchmarkUnnamedParseFrontend/cold-16         	 3549726	       338.9 ns/op	     600 B/op	       7 allocs/op
+BenchmarkUnnamedParseFrontend/cold-16         	 3613657	       332.2 ns/op	     600 B/op	       7 allocs/op
+BenchmarkUnnamedParseFrontend/cold-16         	 3608804	       332.3 ns/op	     600 B/op	       7 allocs/op
+BenchmarkUnnamedParseFrontend/cold-16         	 3589074	       331.9 ns/op	     600 B/op	       7 allocs/op
+BenchmarkUnnamedParseFrontend/exact-reuse-16  	146317590	         8.223 ns/op	       0 B/op	       0 allocs/op
+BenchmarkUnnamedParseFrontend/exact-reuse-16  	144029317	         8.303 ns/op	       0 B/op	       0 allocs/op
+BenchmarkUnnamedParseFrontend/exact-reuse-16  	144676260	         8.294 ns/op	       0 B/op	       0 allocs/op
+BenchmarkUnnamedParseFrontend/exact-reuse-16  	144921738	         8.262 ns/op	       0 B/op	       0 allocs/op
+BenchmarkUnnamedParseFrontend/exact-reuse-16  	145236170	         8.224 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/thesyncim/vibedb/pgwire	12.388s

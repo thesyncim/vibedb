@@ -14,11 +14,35 @@ import (
 
 var (
 	_ pgwire.BackendSessionParameterPreparer     = (*postgresSession)(nil)
+	_ pgwire.BackendStatementParseReuser         = (*postgresStatement)(nil)
 	_ pgwire.BackendStatementParamTyper          = (*postgresStatement)(nil)
 	_ pgwire.BackendStatementParamTypePositioner = (*postgresStatement)(nil)
 	_ pgwire.BackendStatementParamTyper          = (*postgresWriteStatement)(nil)
 	_ pgwire.BackendStatementParamTypePositioner = (*postgresWriteStatement)(nil)
 )
+
+func TestPostgreSQLStatementParseReuseFollowsCatalogGeneration(t *testing.T) {
+	session, _ := newTypedPostgreSQLSession(t)
+	statement, err := session.Prepare(
+		t.Context(), "SELECT id FROM messages WHERE id = ? ORDER BY id LIMIT 32",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := statement.(*postgresStatement)
+	if !p.ReusableForParse() {
+		t.Fatal("current distributed statement declined exact Parse reuse")
+	}
+	p.session.state = sqldriver.SessionFailedTransaction
+	if p.ReusableForParse() {
+		t.Fatal("statement in a failed transaction allowed Parse reuse")
+	}
+	p.session.state = sqldriver.SessionIdle
+	p.catalogGeneration++
+	if p.ReusableForParse() {
+		t.Fatal("statement from a stale catalog generation allowed Parse reuse")
+	}
+}
 
 func newTypedPostgreSQLSession(t testing.TB) (pgwire.BackendSession, *sqlRF3TestTransport) {
 	t.Helper()
