@@ -426,6 +426,9 @@ func countCompactPacked7BetweenNEON(
 	if count <= 0 || upper <= lower {
 		return 0
 	}
+	if lower > 127 || upper > 128 {
+		return countCompactPacked7BetweenScalar(data, count, lower, upper)
+	}
 	if count < 32 {
 		return countCompactPacked7BetweenScalar(data, count, lower, upper)
 	}
@@ -464,6 +467,9 @@ func countCompactPacked10BetweenNEON(
 ) (matched int) {
 	if count <= 0 || upper <= lower {
 		return 0
+	}
+	if lower > 1023 || upper > 1024 {
+		return countCompactPacked10BetweenScalar(data, count, lower, upper)
 	}
 	if count < 32 {
 		return countCompactPacked10BetweenScalar(data, count, lower, upper)
@@ -517,6 +523,9 @@ func countCompactPacked8BetweenNEON(
 	if count <= 0 || upper <= lower {
 		return 0
 	}
+	if lower > 255 || upper > 255 {
+		return countCompactPacked8BetweenScalar(data, count, lower, upper)
+	}
 	if count < 32 {
 		return countCompactPacked8BetweenScalar(data, count, lower, upper)
 	}
@@ -564,6 +573,9 @@ func countCompactPacked16BetweenNEON(
 ) (matched int) {
 	if count <= 0 || upper <= lower {
 		return 0
+	}
+	if lower > 65535 || upper > 65535 {
+		return countCompactPacked16BetweenScalar(data, count, lower, upper)
 	}
 	if count < 32 {
 		return countCompactPacked16BetweenScalar(data, count, lower, upper)

@@ -215,6 +215,9 @@ func (p *plan) scalarCountIntegerIntervalPath() (
 			return compiledPath{}, 0, 0, false, false
 		}
 		candidate := p.valuePaths[kid.col]
+		if !candidate.single {
+			return compiledPath{}, 0, 0, false, false
+		}
 		if !pathSet {
 			path, pathSet = candidate, true
 		} else if path.indexPath() != candidate.indexPath() || path.join != candidate.join {
