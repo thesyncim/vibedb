@@ -1566,3 +1566,67 @@ func TestTransactionParticipantPrepareWinsAbortFenceRace(t *testing.T) {
 		t.Fatalf("prepare winner control=%+v err=%v", control.TransactionControl, err)
 	}
 }
+
+func TestSingleParticipantConditionalUpdateIsAtomicAndReplayStable(t *testing.T) {
+	fixture := newRelationBundleFixture(t, true)
+	id := transactionCodecID(241)
+	key := []byte("conditional-update")
+	before := []byte(`{"id":"conditional-update","n":41}`)
+	after := []byte(`{"id":"conditional-update","n":42}`)
+	makeCommand := func(sequence uint64, mutation replication.Mutation) []byte {
+		batches := []replication.RelationMutationBatch{{Relation: 1, Mutations: []replication.Mutation{mutation}}}
+		control := fusedParticipantControl(t, fixture, id, distributedtxn.ReplicatedApplySingleParticipant, sequence, batches)
+		return transactionCompletionCommand(t, fixture.binding, control, batches)
+	}
+	seed := makeCommand(1, replication.Mutation{Kind: replication.MutationPut, Key: key, Value: before})
+	applyTransactionCommand(t, fixture.machine, 3, seed)
+	mutation := replication.Mutation{Kind: replication.MutationPutDigestEqual, Key: key, Value: after, ExpectedValueLength: uint64(len(before)), ExpectedValueDigest: replication.Digest(sha256.Sum256(before))}
+	update := makeCommand(2, mutation)
+	first := applyTransactionCommand(t, fixture.machine, 4, update)
+	retry := applyTransactionCommand(t, fixture.machine, 5, update)
+	if first != retry || !first.AffectedRowsValid || first.AffectedRows != 1 {
+		t.Fatalf("retry=%+v first=%+v", retry, first)
+	}
+	// A new request using the stale preimage must not overwrite the committed row.
+	stale := makeCommand(3, mutation)
+	if err := fixture.machine.AdmitCommand(stale); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.machine.ApplyNormal(normalMeta(6), stale); err != nil {
+		t.Fatal(err)
+	}
+	completion, result := openTransactionCompletion(t, fixture.machine, stale)
+	if completion.ResultCode != ResultIndexConflict || result.AffectedRowsValid {
+		t.Fatalf("stale guard=%d %+v", completion.ResultCode, result)
+	}
+	value, found, err := fixture.base.Collection.AppendRaw(nil, key)
+	if err != nil || !found || !bytes.Equal(value, after) {
+		t.Fatalf("conditional update value=%s found=%v err=%v", value, found, err)
+	}
+}
+
+// A point read after every commit used to materialize a detached physical
+// snapshot, defeating the checkpoint group's deferred durability schedule.
+func TestSingleParticipantPointReadDoesNotForceCheckpoint(t *testing.T) {
+	fixture := newRelationBundleFixture(t, true)
+	id := transactionCodecID(242)
+	key := []byte("live-point")
+	for sequence := uint64(1); sequence <= 32; sequence++ {
+		value := []byte(fmt.Sprintf(`{"id":"live-point","n":%d}`, sequence))
+		batches := []replication.RelationMutationBatch{{Relation: 1, Mutations: []replication.Mutation{{Kind: replication.MutationPut, Key: key, Value: value}}}}
+		control := fusedParticipantControl(t, fixture, id, distributedtxn.ReplicatedApplySingleParticipant, sequence, batches)
+		command := transactionCompletionCommand(t, fixture.binding, control, batches)
+		publication, err := fixture.machine.ApplyNormal(normalMeta(sequence+2), command)
+		if err != nil {
+			t.Fatal(err)
+		}
+		before := fixture.group.Stats()
+		result, err := fixture.machine.PointReadInto(1, key, publication.Applied, fixture.base.Limits.MaxDocumentBytes, nil)
+		if err != nil || !result.Found || !bytes.Equal(result.Value, value) || result.Fence.Applied != publication.Applied {
+			t.Fatalf("sequence %d: read=%+v err=%v", sequence, result, err)
+		}
+		if after := fixture.group.Stats(); after != before {
+			t.Fatalf("point read performed storage work: before=%+v after=%+v", before, after)
+		}
+	}
+}

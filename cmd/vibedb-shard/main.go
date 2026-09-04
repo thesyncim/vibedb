@@ -48,6 +48,7 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibedb/internal/processprofile"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/servicetls"
@@ -56,7 +57,19 @@ import (
 )
 
 func main() {
-	os.Exit(run(os.Args))
+	os.Exit(runProfiled(os.Args))
+}
+
+func runProfiled(args []string) int {
+	if len(args) > 1 && args[1] == "serve-rf3" {
+		stop, err := processprofile.StartFromEnv("shard")
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 2
+		}
+		defer stop()
+	}
+	return run(args)
 }
 
 func run(args []string) int {

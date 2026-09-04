@@ -31,10 +31,23 @@ import (
 	"sort"
 
 	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/processprofile"
 )
 
 func main() {
-	os.Exit(run(os.Args))
+	os.Exit(runProfiled(os.Args))
+}
+
+func runProfiled(args []string) int {
+	if len(args) > 1 && args[1] == "serve" {
+		stop, err := processprofile.StartFromEnv("gateway")
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 2
+		}
+		defer stop()
+	}
+	return run(args)
 }
 
 func run(args []string) int {

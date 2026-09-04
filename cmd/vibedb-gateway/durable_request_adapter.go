@@ -68,8 +68,15 @@ func (service *replicatedDurableRequestService) ExecBatch(
 	identity durableExecBatchIdentity,
 	queries []gateway.Query,
 ) (durableExecBatchExecuteResult, error) {
+	return service.ExecBatchMode(ctx, authority, identity, queries, gateway.DurableSQLCoordinated)
+}
+
+func (service *replicatedDurableRequestService) ExecBatchMode(
+	ctx context.Context, authority serviceauthz.Authority, identity durableExecBatchIdentity,
+	queries []gateway.Query, mode gateway.DurableSQLExecutionMode,
+) (durableExecBatchExecuteResult, error) {
 	if service == nil || service.issuers == nil || service.sql == nil || ctx == nil ||
-		!authority.Valid() || !validDurableExecBatchIdentity(identity) || len(queries) == 0 {
+		!authority.Valid() || mode > gateway.DurableSQLCoordinated || !validDurableExecBatchIdentity(identity) || len(queries) == 0 {
 		return durableExecBatchExecuteResult{}, errInvalidDurableRequestAdapter
 	}
 	key, err := service.issuers.ValidateRequest(ctx, authority, identity.Reference,
@@ -81,7 +88,16 @@ func (service *replicatedDurableRequestService) ExecBatch(
 	if err != nil {
 		return durableExecBatchExecuteResult{}, err
 	}
-	result, err := service.sql.Execute(ctx, key, tenant[:], queries)
+	var result gateway.DurableSQLRequestResult
+	if sql, ok := service.sql.(interface {
+		ExecuteMode(context.Context, requestledger.RequestKey, []byte, []gateway.Query, gateway.DurableSQLExecutionMode) (gateway.DurableSQLRequestResult, error)
+	}); ok {
+		result, err = sql.ExecuteMode(ctx, key, tenant[:], queries, mode)
+	} else if mode == gateway.DurableSQLCoordinated {
+		result, err = service.sql.Execute(ctx, key, tenant[:], queries)
+	} else {
+		return durableExecBatchExecuteResult{}, errInvalidDurableRequestAdapter
+	}
 	if err != nil && !errors.Is(err, gateway.ErrDurableSQLAborted) {
 		return durableExecBatchExecuteResult{}, err
 	}
@@ -89,6 +105,14 @@ func (service *replicatedDurableRequestService) ExecBatch(
 }
 
 func (service *replicatedDurableRequestService) ReplayBatch(ctx context.Context, authority serviceauthz.Authority, identity durableExecBatchIdentity, queries []gateway.Query) (durableExecBatchExecuteResult, bool, error) {
+	return service.ReplayBatchMode(ctx, authority, identity, queries, gateway.DurableSQLLegacyAuto)
+}
+
+func (service *replicatedDurableRequestService) ReplayBatchMode(ctx context.Context, authority serviceauthz.Authority, identity durableExecBatchIdentity, queries []gateway.Query, mode gateway.DurableSQLExecutionMode) (durableExecBatchExecuteResult, bool, error) {
+	if service == nil || service.issuers == nil || service.sql == nil || ctx == nil ||
+		!authority.Valid() || !validDurableExecBatchIdentity(identity) || mode > gateway.DurableSQLCoordinated {
+		return durableExecBatchExecuteResult{}, false, errInvalidDurableRequestAdapter
+	}
 	key, err := service.issuers.ValidateRequest(ctx, authority, identity.Reference, requestledger.RequestID(identity.RequestID), identity.IssuerSequence)
 	if err != nil {
 		return durableExecBatchExecuteResult{}, false, err
@@ -97,7 +121,7 @@ func (service *replicatedDurableRequestService) ReplayBatch(ctx context.Context,
 	var found bool
 	if direct, ok := service.sql.(interface {
 		ReplayRequestWithTenant(context.Context, requestledger.RequestKey, []byte, []gateway.Query) (gateway.DurableSQLRequestResult, bool, error)
-	}); ok {
+	}); ok && mode != gateway.DurableSQLCoordinated {
 		tenant, tenantErr := authenticatedIssuerTenantFor(authority)
 		if tenantErr != nil {
 			return durableExecBatchExecuteResult{}, false, tenantErr
@@ -183,3 +207,49 @@ func (service *replicatedDurableRequestService) AckExecBatch(
 }
 
 var _ durableRequestService = (*replicatedDurableRequestService)(nil)
+
+func (service *replicatedDurableRequestService) PrepareDirectBatch(ctx context.Context, authority serviceauthz.Authority, identity durableExecBatchIdentity, queries []gateway.Query) (*gateway.DurableSQLDirectPlan, error) {
+	if service == nil || service.issuers == nil || ctx == nil || !authority.Valid() || !validDurableExecBatchIdentity(identity) {
+		return nil, errInvalidDurableRequestAdapter
+	}
+	sql, ok := service.sql.(interface {
+		PrepareDirect(context.Context, requestledger.RequestKey, []byte, []gateway.Query) (*gateway.DurableSQLDirectPlan, error)
+	})
+	if !ok {
+		return nil, errors.Join(gateway.ErrDurableSQLNotAdmitted, gateway.ErrDurableSQLDirectIneligible)
+	}
+	key, err := service.issuers.ValidateRequest(ctx, authority, identity.Reference, requestledger.RequestID(identity.RequestID), identity.IssuerSequence)
+	if err != nil {
+		return nil, err
+	}
+	tenant, err := authenticatedIssuerTenantFor(authority)
+	if err != nil {
+		return nil, err
+	}
+	return sql.PrepareDirect(ctx, key, tenant[:], queries)
+}
+
+func (service *replicatedDurableRequestService) ExecutePreparedDirectBatch(ctx context.Context, authority serviceauthz.Authority, identity durableExecBatchIdentity, queries []gateway.Query, plan *gateway.DurableSQLDirectPlan) (durableExecBatchExecuteResult, error) {
+	if service == nil || service.issuers == nil || ctx == nil || !authority.Valid() || !validDurableExecBatchIdentity(identity) {
+		return durableExecBatchExecuteResult{}, errInvalidDurableRequestAdapter
+	}
+	sql, ok := service.sql.(interface {
+		ExecutePreparedDirect(context.Context, requestledger.RequestKey, []byte, []gateway.Query, *gateway.DurableSQLDirectPlan) (gateway.DurableSQLRequestResult, error)
+	})
+	if !ok {
+		return durableExecBatchExecuteResult{}, errInvalidDurableRequestAdapter
+	}
+	key, err := service.issuers.ValidateRequest(ctx, authority, identity.Reference, requestledger.RequestID(identity.RequestID), identity.IssuerSequence)
+	if err != nil {
+		return durableExecBatchExecuteResult{}, err
+	}
+	tenant, err := authenticatedIssuerTenantFor(authority)
+	if err != nil {
+		return durableExecBatchExecuteResult{}, err
+	}
+	result, err := sql.ExecutePreparedDirect(ctx, key, tenant[:], queries, plan)
+	if err != nil && !errors.Is(err, gateway.ErrDurableSQLAborted) {
+		return durableExecBatchExecuteResult{}, err
+	}
+	return durableAdapterResult(identity, key, result, err)
+}

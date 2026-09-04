@@ -22,14 +22,29 @@ var ErrDurableSQLRequest = errors.New("gateway: durable RF3 SQL request is unava
 var ErrDurableSQLNotAdmitted = errors.New("gateway: SQL request was not admitted by this invocation")
 var ErrDurableSQLAborted = errors.New("gateway: durable SQL transaction aborted")
 
+// DurableSQLExecutionMode fixes the consensus protocol for one durable issuer
+// lane. Direct and coordinated lanes require independent sequence counters.
+type DurableSQLExecutionMode uint8
+
+const (
+	// DurableSQLLegacyAuto is only for recovery of pre-mode durable outboxes.
+	DurableSQLLegacyAuto DurableSQLExecutionMode = iota
+	DurableSQLDirectOnly
+	DurableSQLCoordinated
+)
+
+// ErrDurableSQLDirectIneligible accompanies ErrDurableSQLNotAdmitted when a
+// direct-only request cannot be lowered without entering the request ledger.
+var ErrDurableSQLDirectIneligible = errors.New("gateway: SQL request requires coordinated execution")
+
 type DurableSQLRequestExecutorOptions struct {
 	Planner            *Executor
 	ReplicatedData     *ReplicatedExecutor
 	Requests           *DurableRequestService
 	RecoveryPulseLimit uint8
 	PlanningLeaseSpan  uint64
-	// SingleParticipantFastPath selects the terminal one-proposal lane for a
-	// replay-stable one-statement, one-relation, one-group mutation.
+	// SingleParticipantFastPath enables explicit direct execution and prepared
+	// recipes. Execute itself always uses the coordinated issuer domain.
 	SingleParticipantFastPath bool
 }
 
@@ -90,6 +105,18 @@ func (executor *DurableSQLRequestExecutor) Execute(
 	requestKey requestledger.RequestKey,
 	tenant []byte,
 	queries []Query,
+) (DurableSQLRequestResult, error) {
+	// An unqualified issuer may mix SQL shapes. Keep all its sequences in the
+	// ledger; direct callers must explicitly own an independent issuer lane.
+	return executor.ExecuteMode(ctx, requestKey, tenant, queries, DurableSQLCoordinated)
+}
+
+// ExecuteMode never silently switches a direct-only request into the ledger.
+// Persist mode with the caller's identity before its first invocation. An
+// unknown outcome must be recovered in that original mode.
+func (executor *DurableSQLRequestExecutor) ExecuteMode(
+	ctx context.Context, requestKey requestledger.RequestKey, tenant []byte,
+	queries []Query, mode DurableSQLExecutionMode,
 ) (result DurableSQLRequestResult, err error) {
 	admitted := false
 	defer func() {
@@ -98,7 +125,7 @@ func (executor *DurableSQLRequestExecutor) Execute(
 		}
 	}()
 	if executor == nil || ctx == nil || executor.planner == nil || executor.data == nil ||
-		executor.requests == nil || !requestKey.Valid() || len(tenant) == 0 || len(queries) == 0 ||
+		executor.requests == nil || mode > DurableSQLCoordinated || !requestKey.Valid() || len(tenant) == 0 || len(queries) == 0 ||
 		requestledger.Digest(sha256.Sum256(tenant)) != requestKey.TenantDigest {
 		return DurableSQLRequestResult{}, ErrDurableSQLRequest
 	}
@@ -150,7 +177,7 @@ func (executor *DurableSQLRequestExecutor) Execute(
 		}
 		return DurableSQLRequestResult{}, fmt.Errorf("gateway: durable SQL lowering: %w", errors.Join(err, ErrDurableSQLRequest))
 	}
-	if executor.singleFast && key.IssuerSequence != 0 &&
+	if mode != DurableSQLCoordinated && executor.singleFast && key.IssuerSequence != 0 &&
 		directSQLMutationEligible(queries, participants) {
 		admitted = true
 		direct, directErr := executor.executeDirect(
@@ -168,6 +195,9 @@ func (executor *DurableSQLRequestExecutor) Execute(
 			return DurableSQLRequestResult{}, fmt.Errorf("gateway: direct SQL execution: %w", directErr)
 		}
 		return direct.DurableSQLRequestResult, nil
+	}
+	if mode == DurableSQLDirectOnly {
+		return DurableSQLRequestResult{}, ErrDurableSQLDirectIneligible
 	}
 	program, err := BuildDurableRequestLogicalProgram(DurableRequestLogicalProgramBuild{
 		Home: home, Key: key, Tenant: tenant, CatalogGeneration: lease.generation,

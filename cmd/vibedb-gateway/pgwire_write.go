@@ -10,10 +10,12 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime/trace"
 	"time"
 
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/requestledger"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/shardservice"
@@ -40,10 +42,31 @@ type postgresDurableService interface {
 	ReplayBatch(context.Context, serviceauthz.Authority, durableExecBatchIdentity, []gateway.Query) (durableExecBatchExecuteResult, bool, error)
 }
 
+// Production writers persist two issuer domains in one serialized outbox.
+// One outbox preserves table ordering across execution protocols.
+type postgresModeDurableService interface {
+	ExecBatchMode(context.Context, serviceauthz.Authority, durableExecBatchIdentity, []gateway.Query, gateway.DurableSQLExecutionMode) (durableExecBatchExecuteResult, error)
+	ReplayBatchMode(context.Context, serviceauthz.Authority, durableExecBatchIdentity, []gateway.Query, gateway.DurableSQLExecutionMode) (durableExecBatchExecuteResult, bool, error)
+}
+
+type postgresPreparedDirectService interface {
+	PrepareDirectBatch(context.Context, serviceauthz.Authority, durableExecBatchIdentity, []gateway.Query) (*gateway.DurableSQLDirectPlan, error)
+	ExecutePreparedDirectBatch(context.Context, serviceauthz.Authority, durableExecBatchIdentity, []gateway.Query, *gateway.DurableSQLDirectPlan) (durableExecBatchExecuteResult, error)
+}
+
+type postgresCoordinatedIssuer struct {
+	Installation replication.ID128
+	Sequence     uint64
+	Reference    gateway.ReplicatedIssuerReference
+}
+
 // Alias without the public wire decoder: the private checksummed journal stores
 // the complete typed ACK, not the public protocol's flattened JSON envelope.
 type postgresStoredAck durableExecBatchAckWireRequest
 type postgresWriteRecord struct {
+	DirectPlan   *gateway.DurableSQLDirectPlan   `json:",omitempty"`
+	Mode         gateway.DurableSQLExecutionMode `json:",omitempty"`
+	Coordinated  *postgresCoordinatedIssuer      `json:",omitempty"`
 	Version      uint32
 	Table        string `json:",omitempty"`
 	Authority    serviceauthz.Authority
@@ -149,6 +172,12 @@ func openPostgresDurableWriter(path string, authority serviceauthz.Authority, se
 		if !validPostgresWriteJournalVersion(&w.record) || w.record.Authority != authority || w.record.Installation == (replication.ID128{}) || w.record.Sequence == 0 {
 			return fail(errInvalidDurableRequestAdapter)
 		}
+		if _, modeAware := service.(postgresModeDurableService); w.record.Mode != gateway.DurableSQLLegacyAuto && !modeAware {
+			return fail(errInvalidDurableRequestAdapter)
+		}
+		if _, prepared := service.(postgresPreparedDirectService); w.record.DirectPlan != nil && !prepared {
+			return fail(errInvalidDurableRequestAdapter)
+		}
 		if len(table) == 1 && w.record.Table != table[0] {
 			return fail(errInvalidDurableRequestAdapter)
 		}
@@ -156,13 +185,17 @@ func openPostgresDurableWriter(path string, authority serviceauthz.Authority, se
 			return fail(errInvalidDurableRequestAdapter)
 		}
 		if w.record.Query != nil {
-			if !validDurableExecBatchIdentity(w.record.Identity) || w.record.Identity.Reference.Installation != w.record.Installation || w.record.Identity.IssuerSequence != w.record.Sequence {
+			if !validDurableExecBatchIdentity(w.record.Identity) || !w.pendingIssuerMatches() {
 				return fail(errInvalidDurableRequestAdapter)
 			}
 		} else if w.record.Ack != nil {
 			return fail(errInvalidDurableRequestAdapter)
 		}
-		if w.record.Ack != nil && !validDurableExecBatchAckRequest((*durableExecBatchAckWireRequest)(w.record.Ack)) {
+		if w.record.Ack != nil && (!validDurableExecBatchAckRequest((*durableExecBatchAckWireRequest)(w.record.Ack)) ||
+			w.record.Ack.Identity.RequestID != w.record.Identity.RequestID ||
+			w.record.Ack.Identity.Reference != w.record.Identity.Reference ||
+			w.record.Ack.Identity.IssuerSequence != w.record.Identity.IssuerSequence ||
+			w.record.Mode == gateway.DurableSQLDirectOnly) {
 			return fail(errInvalidDurableRequestAdapter)
 		}
 		return w, nil
@@ -184,6 +217,8 @@ func openPostgresDurableWriter(path string, authority serviceauthz.Authority, se
 }
 
 func (w *postgresDurableWriter) save() (err error) {
+	region := trace.StartRegion(context.Background(), "pg.outbox.save")
+	defer region.End()
 	defer func() {
 		if err != nil {
 			w.poison = err
@@ -192,6 +227,11 @@ func (w *postgresDurableWriter) save() (err error) {
 	if w.poison != nil {
 		return w.poison
 	}
+	version, versionErr := postgresWriteRecordVersion(&w.record)
+	if versionErr != nil {
+		return versionErr
+	}
+	w.record.Version = version
 	raw, err := vibejson.Marshal(&w.record)
 	if err != nil {
 		return err
@@ -261,12 +301,19 @@ func (w *postgresDurableWriter) finishAck(ctx context.Context) error {
 	if _, err := w.service.AckExecBatch(ctx, w.record.Authority, durableExecBatchAckWireRequest(*w.record.Ack)); err != nil {
 		return err
 	}
-	if w.record.Sequence == ^uint64(0) {
+	sequence := &w.record.Sequence
+	if w.record.Mode == gateway.DurableSQLCoordinated {
+		if w.record.Coordinated == nil {
+			return errInvalidDurableRequestAdapter
+		}
+		sequence = &w.record.Coordinated.Sequence
+	}
+	if *sequence == ^uint64(0) {
 		return errInvalidDurableRequestAdapter
 	}
-	w.record.Sequence++
+	(*sequence)++
 	w.record.Identity = durableExecBatchIdentity{}
-	w.record.Query, w.record.Ack = nil, nil
+	w.record.Query, w.record.Ack, w.record.DirectPlan = nil, nil, nil
 	w.record.Version = postgresWriteJournalVersionUntyped
 	return w.save()
 }
@@ -289,20 +336,38 @@ func (w *postgresDurableWriter) resolve(ctx context.Context, fresh bool) (*gatew
 	var result durableExecBatchExecuteResult
 	var err error
 	found := false
-	if !fresh {
-		result, found, err = w.service.ReplayBatch(ctx, w.record.Authority, w.record.Identity, queries)
+	if w.record.DirectPlan != nil {
+		service, ok := w.service.(postgresPreparedDirectService)
+		if !ok {
+			return nil, errInvalidDurableRequestAdapter
+		}
+		region := trace.StartRegion(ctx, "pg.direct.execute")
+		result, err = service.ExecutePreparedDirectBatch(ctx, w.record.Authority, w.record.Identity, queries, w.record.DirectPlan)
+		region.End()
+		found = true
+	} else if !fresh {
+		if service, ok := w.service.(postgresModeDurableService); ok {
+			result, found, err = service.ReplayBatchMode(ctx, w.record.Authority, w.record.Identity, queries, w.record.Mode)
+		} else {
+			result, found, err = w.service.ReplayBatch(ctx, w.record.Authority, w.record.Identity, queries)
+		}
 		if err != nil && !errors.Is(err, gateway.ErrDurableSQLAborted) {
 			return nil, err
 		}
 	}
 	if !found {
-		result, err = w.service.ExecBatch(ctx, w.record.Authority, w.record.Identity, queries)
+		if service, ok := w.service.(postgresModeDurableService); ok {
+			result, err = service.ExecBatchMode(ctx, w.record.Authority, w.record.Identity, queries, w.record.Mode)
+		} else {
+			result, err = w.service.ExecBatch(ctx, w.record.Authority, w.record.Identity, queries)
+		}
 	}
 	if err != nil && !errors.Is(err, gateway.ErrDurableSQLAborted) {
 		if fresh && errors.Is(err, gateway.ErrDurableSQLNotAdmitted) {
 			// This invocation had no earlier unknown attempt. Reuse the sequence
 			// but never the failed command's nonce for the next independent write.
 			w.record.Query = nil
+			w.record.DirectPlan = nil
 			w.record.Identity = durableExecBatchIdentity{}
 			w.record.Version = postgresWriteJournalVersionUntyped
 			if saveErr := w.save(); saveErr != nil {
@@ -313,7 +378,9 @@ func (w *postgresDurableWriter) resolve(ctx context.Context, fresh bool) (*gatew
 		}
 		return nil, err
 	}
-	if result.Result == nil || !result.Direct && !validDurableExecBatchAckRequest(&result.Ack) ||
+	if w.record.Mode == gateway.DurableSQLCoordinated && result.Direct ||
+		w.record.Mode == gateway.DurableSQLDirectOnly && !result.Direct ||
+		result.Result == nil || !result.Direct && !validDurableExecBatchAckRequest(&result.Ack) ||
 		result.Direct && result.Ack != (durableExecBatchAckWireRequest{}) {
 		return nil, errInvalidDurableRequestAdapter
 	}
@@ -324,6 +391,7 @@ func (w *postgresDurableWriter) resolve(ctx context.Context, fresh bool) (*gatew
 		w.record.Sequence++
 		w.record.Identity = durableExecBatchIdentity{}
 		w.record.Query = nil
+		w.record.DirectPlan = nil
 		w.record.Version = postgresWriteJournalVersionUntyped
 		if saveErr := w.save(); saveErr != nil {
 			return nil, saveErr
@@ -360,6 +428,8 @@ func (w *postgresDurableWriter) resolveLeaderChanges(ctx context.Context, fresh 
 }
 
 func (w *postgresDurableWriter) Write(ctx context.Context, authority serviceauthz.Authority, q gateway.Query) (*gateway.Result, error) {
+	region := trace.StartRegion(ctx, "pg.write")
+	defer region.End()
 	if authority != w.record.Authority {
 		return nil, gateway.ErrReplicatedUnauthorized
 	}
@@ -379,14 +449,43 @@ func (w *postgresDurableWriter) Write(ctx context.Context, authority serviceauth
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if w.record.Reference.GrantDigest == (replication.Digest{}) {
-		grant, err := w.service.OpenIssuer(ctx, authority, gateway.ReplicatedIssuerOpen{Installation: w.record.Installation, Epoch: 1})
+	mode := gateway.DurableSQLLegacyAuto
+	if _, ok := w.service.(postgresModeDurableService); ok {
+		mode = gateway.DurableSQLDirectOnly
+	}
+	result, err := w.writeFresh(ctx, authority, q, mode)
+	if mode == gateway.DurableSQLDirectOnly && errors.Is(err, gateway.ErrDurableSQLDirectIneligible) &&
+		errors.Is(err, gateway.ErrDurableSQLNotAdmitted) && w.record.Query == nil && w.poison == nil {
+		return w.writeFresh(ctx, authority, q, gateway.DurableSQLCoordinated)
+	}
+	return result, err
+}
+
+func (w *postgresDurableWriter) writeFresh(ctx context.Context, authority serviceauthz.Authority, q gateway.Query, mode gateway.DurableSQLExecutionMode) (*gateway.Result, error) {
+	installation, reference, sequence := &w.record.Installation, &w.record.Reference, &w.record.Sequence
+	if mode == gateway.DurableSQLCoordinated {
+		if w.record.Coordinated == nil {
+			lane := &postgresCoordinatedIssuer{Sequence: 1}
+			if _, err := rand.Read(lane.Installation[:]); err != nil {
+				return nil, err
+			}
+			w.record.Coordinated = lane
+			// Persist installation before opening its replicated grant, so an
+			// uncertain grant response cannot create a new installation on restart.
+			if err := w.save(); err != nil {
+				return nil, err
+			}
+		}
+		installation, reference, sequence = &w.record.Coordinated.Installation, &w.record.Coordinated.Reference, &w.record.Coordinated.Sequence
+	}
+	if reference.GrantDigest == (replication.Digest{}) {
+		grant, err := w.service.OpenIssuer(ctx, authority, gateway.ReplicatedIssuerOpen{Installation: *installation, Epoch: 1})
 		if err != nil {
 			return nil, err
 		}
-		w.record.Reference = gateway.ReplicatedIssuerReference{Installation: grant.Installation, Epoch: grant.Epoch, LaneOrdinal: grant.LaneOrdinal, GrantDigest: grant.GrantDigest}
+		*reference = gateway.ReplicatedIssuerReference{Installation: grant.Installation, Epoch: grant.Epoch, LaneOrdinal: grant.LaneOrdinal, GrantDigest: grant.GrantDigest}
 	}
-	identity := durableExecBatchIdentity{Reference: w.record.Reference, IssuerSequence: w.record.Sequence}
+	identity := durableExecBatchIdentity{Reference: *reference, IssuerSequence: *sequence}
 	if _, err := rand.Read(identity.RequestID[:]); err != nil {
 		return nil, err
 	}
@@ -409,7 +508,23 @@ func (w *postgresDurableWriter) Write(ctx context.Context, authority serviceauth
 	if err != nil {
 		return nil, err
 	}
+	var directPlan *gateway.DurableSQLDirectPlan
+	if service, ok := w.service.(postgresPreparedDirectService); ok && mode == gateway.DurableSQLDirectOnly {
+		// No mutation has been proposed. Keep preparation outside the outbox
+		// publication so an interrupted read cannot leave a half-prepared write.
+		region := trace.StartRegion(ctx, "pg.direct.prepare")
+		directPlan, err = service.PrepareDirectBatch(ctx, authority, identity, []gateway.Query{owned})
+		region.End()
+		if err != nil {
+			return nil, errors.Join(gateway.ErrDurableSQLNotAdmitted, err)
+		}
+		if directPlan == nil {
+			return nil, errInvalidDurableRequestAdapter
+		}
+	}
 	w.record.Version = version
+	w.record.Mode = mode
+	w.record.DirectPlan = directPlan
 	w.record.Query, w.record.Identity = &owned, identity
 	if err = w.save(); err != nil {
 		return nil, w.outcomeError(identity.RequestID, err, false)
@@ -454,11 +569,56 @@ func postgresWriteJournalVersion(query *gateway.Query) (uint32, error) {
 	return postgresWriteJournalVersionTyped, nil
 }
 
+// Versions 3/4 fence two-domain recovery from older binaries. The query
+// encoding is unchanged from versions 1/2, respectively. Versions 5/6 also
+// retain an exact prepared direct recipe, which must never be replanned.
+func postgresWriteRecordVersion(record *postgresWriteRecord) (uint32, error) {
+	if record == nil || record.Mode > gateway.DurableSQLCoordinated {
+		return 0, errInvalidDurableRequestAdapter
+	}
+	if lane := record.Coordinated; lane != nil {
+		if lane.Installation == (replication.ID128{}) || lane.Installation == record.Installation || lane.Sequence == 0 {
+			return 0, errInvalidDurableRequestAdapter
+		}
+		if ref := lane.Reference; ref.GrantDigest != (replication.Digest{}) &&
+			(ref.Installation != lane.Installation || ref.Epoch != 1 || ref.LaneOrdinal != 0) {
+			return 0, errInvalidDurableRequestAdapter
+		}
+	}
+	if record.Mode == gateway.DurableSQLCoordinated && record.Coordinated == nil {
+		return 0, errInvalidDurableRequestAdapter
+	}
+	version, err := postgresWriteJournalVersion(record.Query)
+	if record.DirectPlan != nil {
+		if record.Mode != gateway.DurableSQLDirectOnly || record.Query == nil || record.Ack != nil ||
+			record.DirectPlan.Key.Request != requestledger.RequestID(record.Identity.RequestID) ||
+			record.DirectPlan.Key.IssuerSequence != record.Identity.IssuerSequence {
+			return 0, errInvalidDurableRequestAdapter
+		}
+		version += 4
+	} else if record.Mode != gateway.DurableSQLLegacyAuto || record.Coordinated != nil {
+		version += 2
+	}
+	return version, err
+}
+
+func (w *postgresDurableWriter) pendingIssuerMatches() bool {
+	installation, reference, sequence := w.record.Installation, w.record.Reference, w.record.Sequence
+	if w.record.Mode == gateway.DurableSQLCoordinated {
+		if w.record.Coordinated == nil {
+			return false
+		}
+		installation, reference, sequence = w.record.Coordinated.Installation, w.record.Coordinated.Reference, w.record.Coordinated.Sequence
+	}
+	return w.record.Identity.Reference.Installation == installation &&
+		w.record.Identity.Reference == reference && w.record.Identity.IssuerSequence == sequence
+}
+
 func validPostgresWriteJournalVersion(record *postgresWriteRecord) bool {
 	if record == nil {
 		return false
 	}
-	version, err := postgresWriteJournalVersion(record.Query)
+	version, err := postgresWriteRecordVersion(record)
 	if err != nil {
 		return false
 	}

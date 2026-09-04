@@ -1,73 +1,92 @@
-# Separate durable SQL execution lanes (proposal; not implemented)
+# Durable SQL write domains and prepared single-participant updates
 
-The PostgreSQL RF3 outbox increments one issuer sequence after every terminal
-write. Direct single-participant writes retain their result in the data group;
-coordinated writes admit their sequence in the request ledger. Ledger admission
-requires exactly the previous admitted sequence plus one. Consequently 128 direct
-inserts followed by a computed update attempt ledger sequence 129 while the
-ledger expects 1. The benchmark exposes this as an outcome-unknown update.
+Implemented after explicit approval on 2026-09-04 to change the write protocol.
+The earlier automatic-review block is superseded by that approval. This change
+fixes a correctness defect exposed by the CockroachDB comparison and removes
+unnecessary coordination for exact primary-key updates. It is not evidence of
+performance or feature parity with CockroachDB.
 
-Automatic approval review rejected implementation of this protocol change on
-2026-09-04 because changes to durable journals, issuer lanes, replay and consensus
-sequencing could cause duplicate or unrecoverable writes. No write-protocol code
-was changed. This document makes the proposed change and its validation reviewable.
+## Independent request identities
 
-## Proposed behavior
+Direct writes retain results in the data group. Coordinated writes admit their
+sequence in the request ledger, whose contiguous sequence rule is unchanged.
+Using one issuer for both meant direct inserts consumed sequence numbers the
+ledger never saw: the next coordinated update could not be admitted.
 
-Keep one serialized, fsynced outbox per table, with two independently granted
-issuer identities and two sequence counters. One identity only executes direct
-single-participant commands; the other only executes coordinated ledger requests.
-The mode and full identity must be durable before execution. The executor must
-support strict modes: direct-only cannot fall back to the ledger, and coordinated
-cannot take the direct path even if a later plan becomes eligible.
+The PostgreSQL endpoint keeps one serialized, fsynced outbox per table with two
+independently granted issuer identities and counters. Direct-only execution
+cannot fall through to ledger admission; coordinated execution cannot use the
+direct path. Only a known refusal before admission permits switching domains.
+An uncertain result retains the original identity, mode and command for recovery.
+The coordinated installation is persisted before obtaining its grant. Terminal
+cleanup advances only the corresponding domain's counter.
 
-A fresh request first tries direct-only admission. Only a confirmed refusal before
-any proposal or ledger admission allows the outbox to clear that attempt durably
-and create a coordinated attempt under its independent identity. No timeout,
-lost reply, leader change, storage error or uncertain admission permits switching
-identity or mode. Recovery always uses the mode and identity retained on disk.
+Native `DurableSQLRequestExecutor.Execute` now always uses the coordinated
+protocol. Callers choosing `ExecuteMode` must use separate issuers for direct and
+coordinated commands. `LegacyAuto` exists for legacy outbox recovery; it is not a
+safe policy for new mixed-protocol issuers.
 
-| Statement | Direct issuer sequence | Coordinated issuer sequence |
-| --- | ---: | ---: |
-| First direct insert | 1 | unused |
-| Second direct insert | 2 | unused |
-| Computed update | unchanged | 1 |
-| Another direct insert | 3 | unchanged |
-| Second computed update | unchanged | 2 |
+## Exact durable mutation recipes
+
+The PostgreSQL writer prepares eligible direct commands before outbox publication.
+Preparation validates SQL and, for a computed update, reads the preimage through
+the existing linearizable point-read protocol. It cannot propose a mutation.
+The writer then fsyncs the exact mutation recipe together with the SQL, complete
+request identity and mode before executing it.
+
+Recovery executes that same recipe without evaluating the SQL again. For an
+update, the replicated command checks the original preimage digest atomically
+with replacing the row. A conflicting write produces a terminal abort; an exact
+retry returns the retained original result. A lost response cannot turn `n=n+1`
+into a second increment.
+
+The added UPDATE path requires one exact primary-key equality, one participant,
+one relation and one physical mutation. Existing lowering rejects primary-key
+movement, subqueries, ORDER BY, LIMIT and RETURNING. These limits matter: the
+single digest guard covers the complete read set. General scans and multi-key
+updates need additional read/absence/phantom guards and remain in the coordinated
+protocol. Existing replay-stable direct insert/delete eligibility is retained.
+Prepared plans are an internal trusted-client recipe, not a new public wire API.
 
 ## Compatibility and failure handling
 
-Use a new journal version so older binaries reject records whose two-lane
-semantics they cannot understand. Continue decoding legacy journal bytes exactly.
-Recover any legacy pending request under its original identity before admitting
-new work. An already retained outcome-unknown request must never be erased or
-renumbered to make a benchmark pass. Existing legacy sequence-gap requests may
-require a separate recovery protocol; this proposal does not claim to repair them.
+Journal versions 1/2 retain their legacy encoding and recovery policy. Versions
+3/4 persist explicit execution domains; versions 5/6 additionally persist an exact
+prepared recipe. Odd versions are untyped and even versions preserve parameter
+types. Older binaries reject unsupported versions. Do not downgrade while a new
+outbox exists without an explicit migration.
 
-The second issuer grant must be persisted with its first request. Restarts must
-not regenerate it. ACK advancement changes only the coordinated counter; direct
-terminal advancement changes only the direct counter. An unexpected result mode
-is an error, never permission to acknowledge a different protocol.
+Open validates mode, version, issuer/grant/counter relationships and retained ACK
+identity. Journal failures poison the writer. A pending legacy request is never
+cleared or renumbered to recover availability. Existing legacy sequence-gap
+requests and native callers with mixed-protocol history need a separate recovery
+procedure; this change does not claim to repair those records automatically.
+PostgreSQL reconnects carry no application idempotency key and are not exactly-once
+application retries.
 
-Native callers also need an explicit mode contract and documented independent
-issuers. Retaining automatic mode for compatibility would not fix existing native
-callers that mix direct and coordinated operations on one issuer.
+## Applied point reads
 
-## Required validation before merge
+A point read holds the state machine publication lock while checking the hidden
+transaction intent and reading the selected relation's current primary router.
+The machine exclusively owns mutations to these collections, so both reads belong
+to one completed applied state. The existing minimum applied index, ownership,
+intent and response-size checks remain. Detached scans still acquire snapshots.
 
-- Real three-voter insert/update/insert/update via PostgreSQL, checking all rows.
-- Alternation across restart, including a retained direct result and ledger ACK.
-- Lost replies after direct application and after ledger admission: original
-  nonce, mode and sequence retained, each update applied once.
-- Proven pre-admission refusal: safe transition to a different issuer only after
-  the old outbox attempt is durably removed.
-- Journal write/fsync failures at each transition, corrupt or mismatched grants,
-  invalid mode/version, overflow, and old-binary version fencing.
-- Catalog/routing changes between planning and retry cannot switch protocols.
-- Concurrent table requests retain ordering; unrelated tables keep progressing.
-- Full RF3 SQL comparison includes update failures and costs; no weakened fsync,
-  replication, isolation, result validation or retry accounting.
+The old point path captured all collection snapshots and could force a physical
+checkpoint after every update. Live point reads include acknowledged overlay
+mutations without forcing that checkpoint. Quorum/read-index checks, fsync and
+replicated durability publication are unchanged.
 
-This is a correctness prerequisite for the performance target, not evidence that
-VibeDB is twice as fast as CockroachDB. A separate profile and optimization cycle
-is needed once computed updates run correctly.
+## Validation and remaining limits
+
+Tests cover independent sequence domains across restart, lost replies in both
+modes, retained ACKs, refusal cleanup failure, identity/version fences, exact
+recipe publication before execution, replay without a new preimage, stale-preimage
+abort, retained terminal replay, and point reads that leave checkpoint counters
+unchanged after every commit. The gateway suites and focused race checks exercise
+these paths; the comparative harness verifies every row after each workload.
+
+Fault-injection and unit restart coverage do not establish complete CockroachDB
+guarantee parity. Broader process-kill, partition and multi-region histories are
+still required. The per-table outbox still serializes independent writes. The
+2x CockroachDB target remains unmet.

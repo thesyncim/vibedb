@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"testing"
 	"time"
 
@@ -129,7 +130,7 @@ func TestDurableSQLSingleParticipantFastPathSkipsLedgerAndReplaysExactly(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, err := executor.Execute(ctx, requestKey, tenant, queries)
+	first, err := executor.ExecuteMode(ctx, requestKey, tenant, queries, DurableSQLDirectOnly)
 	if err != nil || !first.Direct || first.Result == nil || first.Result.RowsAffected != 1 ||
 		first.TerminalRevision != 0 || first.ResultDigest != (replication.Digest{}) ||
 		first.AckToken != (DurableRequestAckToken{}) || ledger.applies != 0 ||
@@ -145,4 +146,21 @@ func TestDurableSQLSingleParticipantFastPathSkipsLedgerAndReplaysExactly(t *test
 		t.Fatalf("direct SQL replay=%+v found=%v pins=%d proposals=%d err=%v",
 			replayed, found, pins.called, client.proposals, err)
 	}
+	// A batch cannot consume the direct issuer's sequence in the ledger.
+	batch := append([]Query(nil), queries...)
+	batch = append(batch, Query{SQL: `INSERT INTO messages VALUES (?)`, Class: ClassInteractive,
+		Params: []shardservice.Param{shardservice.DocumentParam(`{"id":"message-2","n":2}`)}})
+	_, err = executor.ExecuteMode(ctx, requestKey, tenant, batch, DurableSQLDirectOnly)
+	if !errors.Is(err, ErrDurableSQLNotAdmitted) || !errors.Is(err, ErrDurableSQLDirectIneligible) || ledger.applies != 0 || client.proposals != 2 {
+		t.Fatalf("direct-only fell into ledger: err=%v ledger=%d proposals=%d", err, ledger.applies, client.proposals)
+	}
+	// Even a direct-eligible insert must use the ledger when no independent
+	// direct lane was selected. This fixture intentionally stops at pinning.
+	requestKey.IssuerSequence = 1
+	requestKey.Request[0]++
+	_, err = executor.Execute(ctx, requestKey, tenant, queries)
+	if err == nil || ledger.applies != 1 || client.proposals != 2 {
+		t.Fatalf("unqualified write bypassed ledger: err=%v ledger=%d proposals=%d", err, ledger.applies, client.proposals)
+	}
+
 }

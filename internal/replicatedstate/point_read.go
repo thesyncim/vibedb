@@ -5,7 +5,6 @@ import (
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/replication"
-	"github.com/thesyncim/vibedb/store/durable"
 )
 
 var (
@@ -26,9 +25,11 @@ type PointReadResult struct {
 	Value []byte
 }
 
-// PointReadInto captures every dense relation and the hidden state collection
-// at one database-snapshot generation, then resolves one relation/key. The
-// minimum is an applied-index contract, never a wall-clock staleness claim.
+// PointReadInto reads the hidden intent and selected row under the machine
+// publication lock. Every collection is exclusively mutated by this machine,
+// so both live reads belong to the same completed applied state. No detached
+// snapshot escapes and no physical checkpoint is needed to materialize one.
+// The minimum is an applied-index contract, never a wall-clock staleness claim.
 func (m *Machine) PointReadInto(
 	relation replication.RelationID,
 	key []byte,
@@ -59,32 +60,24 @@ func (m *Machine) PointReadInto(
 	if m.publication.Applied < minimumApplied {
 		return PointReadResult{}, ErrReadBehind
 	}
-	if err := durable.SnapshotCollectionsInto(&m.applyCut, m.members); err != nil {
-		return PointReadResult{}, m.fail(err)
-	}
-	snapshot, ok := m.applyCut.CollectionHandle(selected.target.Collection)
-	if !ok || snapshot == nil {
-		return PointReadResult{}, m.fail(errors.Join(ErrInconsistentSnapshot, m.applyCut.Close()))
-	}
-	systemSnapshot, ok := m.applyCut.CollectionHandle(m.system.Collection)
-	if !ok || systemSnapshot == nil {
-		return PointReadResult{}, m.fail(errors.Join(ErrInconsistentSnapshot, m.applyCut.Close()))
-	}
+	// Apply and activation hold m.mu until the entire bundle is published. The
+	// live primary router includes acknowledged overlay mutations even when
+	// the rooted physical graph still belongs to an older checkpoint.
 	_, blocked, intentErr := lookupTransactionIntentOwner(
-		pointSnapshot{value: systemSnapshot}, relation, key,
+		pointSnapshot{live: m.system.Collection}, relation, key,
 	)
 	if intentErr != nil {
-		return PointReadResult{}, m.fail(errors.Join(intentErr, m.applyCut.Close()))
+		return PointReadResult{}, m.fail(intentErr)
 	}
 	if blocked {
-		return PointReadResult{}, errors.Join(ErrTransactionIntentActive, m.applyCut.Close())
+		return PointReadResult{}, ErrTransactionIntentActive
 	}
-	value, found, err := snapshot.AppendRaw(dst[:0], key)
+	value, found, err := selected.target.Collection.AppendRaw(dst[:0], key)
 	if err != nil {
-		return PointReadResult{}, m.fail(errors.Join(err, m.applyCut.Close()))
+		return PointReadResult{}, m.fail(err)
 	}
 	if len(value) > maxValueBytes {
-		return PointReadResult{}, errors.Join(ErrReadBufferBound, m.applyCut.Close())
+		return PointReadResult{}, ErrReadBufferBound
 	}
 	result := PointReadResult{
 		Fence: SnapshotFence{
@@ -96,9 +89,6 @@ func (m *Machine) PointReadInto(
 			SnapshotBaseDigest: m.state.SnapshotBaseDigest,
 		},
 		Found: found, Value: value,
-	}
-	if err := m.applyCut.Close(); err != nil {
-		return PointReadResult{}, m.fail(err)
 	}
 	return result, nil
 }
