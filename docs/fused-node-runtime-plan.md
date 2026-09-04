@@ -274,7 +274,20 @@ comparison: after/before geomeans 0.884x / 0.852x, with inconsistent write resul
 Reverse-order locality differs; first-order local-read slow bursts are unresolved.
 All 120 trials validate, and all regressions are retained. Revert `d6374d33`
 removes the experiment. The separately reviewed guarded-preimage change at
-`7b8efb88` is not included in those timings and must be measured independently.
+`7b8efb88` is not included in those timings.
+
+Its [independent guarded-update comparison](benchmarks/fused-guarded-update-2026-09-04/README.md)
+measures C8 update throughput at 1.946x / 1.997x baseline, p99 at 0.489x / 0.461x,
+and cluster append barriers/update about 49% lower in both orders. These writes
+remain 0.633x / 0.645x CockroachDB. Overall after/before geomeans are 1.791x /
+0.890x, and after/CockroachDB is 0.577x / 0.495x. C1 gains are unstable, unchanged
+reads have slow bursts, the first baseline records a term transition, and reverse
+order locality differs. All 120 trials validate with SIMD Linux/ARM64 binaries
+and matched resources, but the reverse order fails five throughput and seven p99
+guardrails. No stable overall gain or promotion qualification is established.
+The reviewed guarded path remains on the redesign branch. Next resolve baseline
+stalls and C1 proposal/durability costs, together with the outstanding process
+correctness gate; do not infer further structural benefits from these short runs.
 
 The real Linux physical3/physical6 process test remains a failing gate.
 Both layouts create three tables and validate topology and identities.
