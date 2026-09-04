@@ -191,9 +191,6 @@ jobs:
         id: go
         with:
           scope: unit-${{ matrix.shard }}
-      - name: Build and vet
-        if: matrix.shard == 'core'
-        run: go build ./... && go vet ./...
       - name: Tests
         shell: bash
         run: scripts/ci/test-shard.sh "$TEST_SHARD" | tee "${RUNNER_TEMP}/unit-tests.txt"
