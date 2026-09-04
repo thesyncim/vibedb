@@ -191,7 +191,7 @@ func newStoreBuilderChunk(options Options, shapes []*ShapeRecord, sourceCapacity
 		chunk.Docs.docs = make([]vibejson.Index, 0, options.ChunkDocuments)
 	}
 	for _, rec := range shapes {
-		chunk.Docs.shapes.seedRecord(rec)
+		chunk.Docs.ensureShapeCache().seedRecord(rec)
 	}
 	return chunk
 }
@@ -307,7 +307,7 @@ func (b *Builder) flush() {
 // document's physical storage class, so a successful transition moves its
 // ordinal from the classic remainder to the compiled shape.
 func compactStoreBuilderShapes(docs *Segment) {
-	if docs == nil || len(docs.shapes.shapes) == 0 || len(docs.tapeRefs) == 0 {
+	if docs == nil || docs.shapes == nil || len(docs.shapes.shapes) == 0 || len(docs.tapeRefs) == 0 {
 		return
 	}
 	allCompact := true

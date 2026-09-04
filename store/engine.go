@@ -265,10 +265,16 @@ func initChunkSegment(
 	// exact minima prevent one page-local shape from pinning bulk-sized field,
 	// table, record, and spelling slabs. The compiler and read representation
 	// stay identical, so this policy change has no query-path branch.
-	docs.shapes.arenaMinRecords = 1
-	docs.shapes.arenaMinFields = 1
-	docs.shapes.arenaMinSlots = 1
-	docs.shapes.arenaMinBytes = 1
+	// The cache exists only while ShapeTapes ingest can resolve against it:
+	// reads use each row's Rec pointer, and sealIngest releases the cache, so
+	// a non-shape chunk carries no 248-byte idle cache in its Chunk struct.
+	if options.ShapeTapes {
+		docs.shapes = &ShapeCache{}
+		docs.shapes.arenaMinRecords = 1
+		docs.shapes.arenaMinFields = 1
+		docs.shapes.arenaMinSlots = 1
+		docs.shapes.arenaMinBytes = 1
+	}
 }
 
 // prepareStoreSegment reserves the dense per-chunk tables and seeds its shape

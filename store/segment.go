@@ -121,16 +121,18 @@ type Segment struct {
 	// and holds each document's dedup header; narrow is the slab of 8-byte
 	// value entries for narrow-width documents, addressed by each ref's
 	// offset (it relocates freely as it grows: no pointer into it ever
-	// leaves a call); shapes is the internal cache the ingest conformance
-	// gate resolves against; widened caches the classic tapes Doc has
-	// re-materialized, under widenMu so concurrent reads stay safe once
-	// appending stops. wideValueTapes is the width test seam: it forces
-	// 16-byte value entries for narrow-eligible documents so the
+	// leaves a call); shapes is the ingest conformance cache, allocated on
+	// first use and released by sealIngest — reads resolve through each
+	// ref's Rec pointer and mappedShapes, never through this cache, so a
+	// published chunk carries no ingest tables; widened caches the classic
+	// tapes Doc has re-materialized, under widenMu so concurrent reads stay
+	// safe once appending stops. wideValueTapes is the width test seam: it
+	// forces 16-byte value entries for narrow-eligible documents so the
 	// differential tests can hold the two widths against each other on
 	// identical documents; nothing outside tests sets it.
 	tapeRefs       []ShapeTapeRef
 	narrow         []ShapeNarrowValue
-	shapes         ShapeCache
+	shapes         *ShapeCache
 	widened        map[int][]vibejson.IndexEntry
 	widenMu        sync.Mutex
 	wideValueTapes bool
@@ -457,9 +459,27 @@ func (s *Segment) committedEntries() int {
 // shape compaction removed entirely, or for template capacity a rebuild
 // reserved and did not spend — and this set indexes nothing further. An arena
 // with committed entries backs live tapes and must outlive the seal.
+// ensureShapeCache returns the ingest conformance cache, allocating a
+// bulk-policy cache on first use. Collection chunks arrive with an
+// exact-minima cache from initChunkSegment when ShapeTapes is enabled;
+// raw scratch Segments grow one here on their first conforming document.
+// Reads never touch the cache — Doc widens through each ref's Rec pointer —
+// so sealIngest releases it and no read path pays this branch.
+func (s *Segment) ensureShapeCache() *ShapeCache {
+	if s.shapes == nil {
+		s.shapes = &ShapeCache{}
+	}
+	return s.shapes
+}
+
 func (s *Segment) sealIngest() {
 	s.scratch = nil
 	s.valueSeen = nil
+	// The conformance cache compiled shapes for the ingest this seal closes.
+	// Rebuilds re-seed from the surviving rows' Rec pointers and reads never
+	// consult the cache, so retaining its table and arenas would pin
+	// page-local compilation memory for the chunk's whole published lifetime.
+	s.shapes = nil
 	// The arena free lists go unconditionally. They exist only to serve a later
 	// fill, and a sealed chunk takes no further document; the retired list in
 	// particular would otherwise keep a slice header per superseded generation
