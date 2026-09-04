@@ -263,18 +263,18 @@ type Database struct {
 	// collection. This preserves lazy-collection correctness without allowing
 	// unrelated key churn to overflow another collection's exact history.
 	//
-	// The clock is sharded so disjoint collections share nothing but atomic
-	// counters: txnRevision is one global atomic sequencer (one fetch-add per
-	// published commit, so a multi-collection publication still carries a
+	// The clock is sharded: txnRevision is one global atomic sequencer (one
+	// successful CAS per published commit, so a multi-collection publication carries a
 	// single revision); the live-transaction directory is striped across
 	// txnActive shards (one shard lock per Begin/Finish instead of one global
 	// lock); conflict histories live in txnHistories (lock-free lookup, with
 	// per-collection observation already serialized by that collection's
 	// txnFence on both the validation and publication sides). Validation
-	// therefore takes no clock locks at all. clockMu remains for the rare
-	// paths only: history-capacity overflow, revision exhaustion, and the
-	// saturation latch.
-	clockMu            sync.Mutex
+	// therefore takes no clock locks. clockMu protects reclamation: registration,
+	// unregistration, and existing-history recording take it shared; history
+	// creation, overflow, and quiescence take it exclusively. Disjoint operations
+	// remain concurrent while a reset cannot erase an overlapping record.
+	clockMu            sync.RWMutex
 	txnRevision        atomic.Uint64
 	txnRevisionStopped atomic.Bool
 	txnActive          [txnActiveShardCount]txnActiveShard
@@ -286,9 +286,12 @@ type Database struct {
 	txnHistories       sync.Map // string → *txnclock.ExternalHistory
 	txnHistoriesCount  atomic.Int64
 
-	// Deterministic in-package concurrency seams. Production leaves both nil.
-	testAfterTxValidation     func()
-	testDirectMutationBlocked func(*Collection)
+	// Deterministic in-package concurrency seams. Production leaves them nil.
+	testAfterTxValidation        func()
+	testDirectMutationBlocked    func(*Collection)
+	testBeforeClockQuiesce       func()
+	testAfterTxHistoryGuards     func()
+	testAfterTxnRevisionAssigned func(uint64)
 
 	// updateDepth tracks Update/View closure nesting per goroutine. Concurrent
 	// closures on distinct goroutines are allowed; re-entering Update on the

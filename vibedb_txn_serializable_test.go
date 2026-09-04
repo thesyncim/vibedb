@@ -537,12 +537,12 @@ func TestNativeSerializableFinishScrubsEscapedState(t *testing.T) {
 func TestNativeSerializableCoordinatorHolderSaturationIsPermanent(t *testing.T) {
 	db := openSerializableMemoryDB(t)
 	defer db.Close()
-	// Force saturation the way striped registration observes it: the latch
-	// set with the count at maximum. A saturated coordinator arms without
-	// registering, so the directory must neither grow nor drain.
+	// Exercise the transition itself, rather than starting with a prelatched
+	// coordinator. The existing holder bucket remains live at revision zero;
+	// the next Begin must saturate immediately and never wrap or grow it.
 	db.clockMu.Lock()
-	db.txnClockSaturated.Store(true)
-	db.txnActiveCount.Store(maxTxnActiveCount)
+	db.txnActive[0].revs = map[uint64]uint64{0: maxTxnActiveCount - 1}
+	db.txnActiveCount.Store(maxTxnActiveCount - 1)
 	db.clockMu.Unlock()
 
 	tx, err := db.Begin()
@@ -572,7 +572,7 @@ func TestNativeSerializableCoordinatorHolderSaturationIsPermanent(t *testing.T) 
 			t.Fatal(err)
 		}
 	}
-	if entries := db.txnActiveEntriesForTest(); entries != 0 {
+	if entries := db.txnActiveEntriesForTest(); entries != 1 {
 		t.Fatalf("saturated directory grew: entries=%d", entries)
 	}
 	if _, err := db.Collection("c").Put("k", []byte(`{"n":1}`)); err != nil {
