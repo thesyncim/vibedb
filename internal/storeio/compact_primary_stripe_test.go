@@ -1099,6 +1099,7 @@ func TestCompactPrimaryScanFixedPackedSequentialParityAllWidths(t *testing.T) {
 		for width := range test.maxWidth + 1 {
 			t.Run(fmt.Sprintf("%s/width=%d", test.name, width), func(t *testing.T) {
 				view := compactPrimaryFixedPackedScanView(t, test.kind, width, rows)
+				checkCompactSequentialSeeks(t, view)
 				var state compactStreamSequentialState
 				want := make([]byte, 0, 32)
 				got := make([]byte, 0, 32)

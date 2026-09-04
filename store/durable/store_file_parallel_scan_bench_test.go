@@ -10,10 +10,21 @@ import (
 // immutable, so all workers read the same generation. All returned bytes are
 // consumed; the reported throughput is corpus bytes / whole-operation time.
 func BenchmarkUnifiedPartitionedScanAllBytes(b *testing.B) {
-	const rows = 100_000
-	keys, documents := unifiedCompetitiveCorpus(rows, false)
+	benchmarkUnifiedPartitionedScanAllBytes(b, 100_000, false)
+}
+
+func BenchmarkUnifiedPartitionedScanAllBytesMillion(b *testing.B) {
+	benchmarkUnifiedPartitionedScanAllBytes(b, 1_000_000, false)
+}
+
+func BenchmarkUnifiedPartitionedScanAllBytesHighCardinality(b *testing.B) {
+	benchmarkUnifiedPartitionedScanAllBytes(b, 100_000, true)
+}
+
+func benchmarkUnifiedPartitionedScanAllBytes(b *testing.B, rows int, high bool) {
+	keys, documents := unifiedCompetitiveCorpus(rows, high)
 	collection := unifiedBenchStore(b, keys, documents, unifiedBenchOptions())
-	for _, workers := range []int{1, 2, 4, 8} {
+	for _, workers := range []int{1, 2, 4, 8, 12, 16} {
 		b.Run(fmt.Sprintf("workers=%d", workers), func(b *testing.B) {
 			type worker struct {
 				snapshot              *Snapshot

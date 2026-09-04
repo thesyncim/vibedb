@@ -134,8 +134,8 @@ func (d *CompactPrimaryScanDecoder) prepare(
 // appendKey reconstructs the ordered key stream without restarting its front
 // decoder from the beginning of the 64-row block for every row. A bounded
 // private prefix copy keeps the next key independent from callback mutations.
-// Non-front streams and non-sequential callers retain the admitted random-rank
-// decoder.
+// Bounded starts prime the nearest restart once; numeric keys use the scalar
+// sequential decoder. Other representations retain admitted random-rank decoding.
 func (d *CompactPrimaryScanDecoder) appendKey(
 	dst []byte,
 	v *CompactPrimaryStripeView,
@@ -151,9 +151,26 @@ func (d *CompactPrimaryScanDecoder) appendKey(
 		d.prepared = false
 	}
 	d.prepare(v, bucket)
-	out, ok := d.keyState.appendFrontKey(
-		dst, &d.key, row, d.keyPrior[:d.keyState.previousLen],
-	)
+	var out []byte
+	var ok bool
+	if d.key.kind == compactStreamFront {
+		if row >= 0 && row < d.key.count && row != d.keyState.next {
+			d.keyState = compactStreamSequentialState{next: row / compactStreamRestart * compactStreamRestart}
+			for d.keyState.next < row {
+				prior, valid := d.keyState.appendFrontKey(d.keyPrior[:0], &d.key,
+					d.keyState.next, d.keyPrior[:d.keyState.previousLen])
+				if !valid || len(prior) > len(d.keyPrior) {
+					return dst, false
+				}
+			}
+		}
+		out, ok = d.keyState.appendFrontKey(dst, &d.key, row, d.keyPrior[:d.keyState.previousLen])
+	} else {
+		if row != d.keyState.next {
+			d.keyState.seek(&d.key, row)
+		}
+		out, ok = d.keyState.appendValue(dst, &d.key, row)
+	}
 	if !ok || len(out) > len(d.keyPrior) {
 		return dst, false
 	}
@@ -197,6 +214,9 @@ func (d *CompactPrimaryScanDecoder) appendValue(
 		streamAt := int(meta.first) + hole
 		stream := &d.streamView[streamAt]
 		state := &d.streams[streamAt]
+		if ordinal != state.next {
+			state.seek(stream, ordinal)
+		}
 		var ok bool
 		plan := d.streamPlan[streamAt]
 		if plan.dictionaryCount != 0 {
@@ -363,7 +383,7 @@ func (s *compactStreamSequentialState) appendValue(
 			s.lengthBit = s.cursor * 8
 			s.bit = (s.cursor + lengthBytes) * 8
 		}
-		if s.next == 0 {
+		if s.alphabetEnd == 0 {
 			s.alphabetEnd = int(binary.LittleEndian.Uint16(v.dictDir))
 			s.prefixEnd = s.alphabetEnd
 			if v.dictCount == 3 {
@@ -402,16 +422,39 @@ func (s *compactStreamSequentialState) appendValue(
 		}
 		width := int(v.width)
 		mask := uint64(1<<v.width) - 1
-		byteAt := s.bit >> 3
-		shift := s.bit & 7
+		char := 0
+		bit := s.bit
+		// Eight symbols occupy at most 48 bits. One bounded load replaces
+		// eight byte-reservoir refills; a scalar tail handles the page edge.
+		for char+8 <= middleLen && bit/8+8 <= len(v.data) {
+			packed := binary.LittleEndian.Uint64(v.data[bit/8:]) >> uint(bit&7)
+			a := int(packed & mask)
+			b := int(packed >> uint(width) & mask)
+			c := int(packed >> uint(2*width) & mask)
+			d := int(packed >> uint(3*width) & mask)
+			e := int(packed >> uint(4*width) & mask)
+			f := int(packed >> uint(5*width) & mask)
+			g := int(packed >> uint(6*width) & mask)
+			h := int(packed >> uint(7*width) & mask)
+			if max(a, b, c, d, e, f, g, h) >= len(alphabet) {
+				return dst[:start], false
+			}
+			out := dst[middle+char : middle+char+8]
+			out[0], out[1], out[2], out[3] = alphabet[a], alphabet[b], alphabet[c], alphabet[d]
+			out[4], out[5], out[6], out[7] = alphabet[e], alphabet[f], alphabet[g], alphabet[h]
+			char += 8
+			bit += 8 * width
+		}
+		byteAt := bit >> 3
+		shift := bit & 7
 		var packed uint64
 		available := 0
-		if shift != 0 {
+		if char < middleLen && shift != 0 {
 			packed = uint64(v.data[byteAt]) >> shift
 			available = 8 - shift
 			byteAt++
 		}
-		for char := range middleLen {
+		for ; char < middleLen; char++ {
 			for available < width {
 				packed |= uint64(v.data[byteAt]) << available
 				available += 8
