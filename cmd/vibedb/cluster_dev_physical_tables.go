@@ -15,7 +15,9 @@ import (
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftservice"
+	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/query"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibejson"
 )
@@ -76,15 +78,24 @@ func ensureDevPhysicalTables(root, binary string, cluster *devClusterManifest, s
 		return err
 	}
 	for _, table := range inventory.Tables {
-		members, group, err := prepareDevPhysicalTable(root, binary, *cluster, table)
-		if err != nil {
-			return err
-		}
-		provision, err := buildDevPhysicalTableProvision(table, members, group)
-		if err != nil {
-			return err
-		}
 		path := filepath.Join(root, table.artifactStem()+"-catalog.vibejson")
+		_, fragmentErr := readDevFile(path, 4<<20)
+		if fragmentErr != nil && !errors.Is(fragmentErr, os.ErrNotExist) {
+			return fragmentErr
+		}
+		// The immutable fragment is published only after all three stores pass
+		// cold validation. A completed table may already have live writers or a
+		// newer schema generation; validate its original proof without reopening
+		// or freezing those live SQL/apply identities.
+		completed := fragmentErr == nil
+		members, group, err := prepareDevPhysicalTable(root, binary, *cluster, table, completed)
+		if err != nil {
+			return err
+		}
+		provision, err := buildDevPhysicalTableProvision(table, members, group, completed)
+		if err != nil {
+			return err
+		}
 		// The bytes include the complete endpoint/store/route/schema witness.
 		// A stale or substituted fragment must not be accepted on recovery.
 		if err := writeDevFileOnce(path, provision); err != nil {
@@ -229,7 +240,7 @@ func plannedDevPhysicalMembers(cluster devClusterManifest, table devTableProvisi
 	return members, nil
 }
 
-func prepareDevPhysicalTable(root, binary string, cluster devClusterManifest, table devTableProvision) ([]devClusterMember, raftmember.GroupKey, error) {
+func prepareDevPhysicalTable(root, binary string, cluster devClusterManifest, table devTableProvision, completed bool) ([]devClusterMember, raftmember.GroupKey, error) {
 	members, err := plannedDevPhysicalMembers(cluster, table)
 	if err != nil {
 		return nil, raftmember.GroupKey{}, err
@@ -263,10 +274,18 @@ func prepareDevPhysicalTable(root, binary string, cluster devClusterManifest, ta
 			return nil, raftmember.GroupKey{}, err
 		}
 		path := filepath.Join(root, fmt.Sprintf("prepare-%s-member-%d.vibejson", table.artifactStem(), index+1))
-		if err := writeDevFileOnce(path, raw); err != nil {
+		if completed {
+			retained, err := readDevFile(path, 1<<20)
+			if err != nil || !bytes.Equal(retained, raw) {
+				return nil, raftmember.GroupKey{}, errors.Join(errDevCluster, err)
+			}
+		} else if err := writeDevFileOnce(path, raw); err != nil {
 			return nil, raftmember.GroupKey{}, err
 		}
 		if _, err := os.Stat(filepath.Join(member.GroupRoot, "serve-rf3.vibejson")); errors.Is(err, os.ErrNotExist) {
+			if completed {
+				return nil, raftmember.GroupKey{}, errors.Join(errDevCluster, err)
+			}
 			if err := runDevCommand(binary, "prepare-node-group-rf3", "-manifest", path); err != nil {
 				return nil, raftmember.GroupKey{}, err
 			}
@@ -274,14 +293,14 @@ func prepareDevPhysicalTable(root, binary string, cluster devClusterManifest, ta
 			return nil, raftmember.GroupKey{}, err
 		}
 	}
-	members, group, err := devPhysicalTableMembers(cluster, table)
+	members, group, err := devPhysicalTableMembersAt(cluster, table, !completed)
 	if err != nil {
 		return nil, group, err
 	}
 	// Every SQL root is durable before any live manifest advertises the new
 	// group. A retry can find any prefix of these manifest publications.
 	for _, member := range members {
-		if err := appendDevPhysicalNodeGroup(member); err != nil {
+		if err := reconcileDevPhysicalNodeGroup(member, !completed); err != nil {
 			return nil, group, err
 		}
 	}
@@ -289,6 +308,10 @@ func prepareDevPhysicalTable(root, binary string, cluster devClusterManifest, ta
 }
 
 func devPhysicalTableMembers(cluster devClusterManifest, table devTableProvision) ([]devClusterMember, raftmember.GroupKey, error) {
+	return devPhysicalTableMembersAt(cluster, table, true)
+}
+
+func devPhysicalTableMembersAt(cluster devClusterManifest, table devTableProvision, initialSchema bool) ([]devClusterMember, raftmember.GroupKey, error) {
 	members, err := plannedDevPhysicalMembers(cluster, table)
 	group := mustDevGroup(cluster.Members)
 	if err != nil || group == (raftmember.GroupKey{}) {
@@ -319,17 +342,36 @@ func devPhysicalTableMembers(cluster devClusterManifest, table devTableProvision
 			binding.MemberID != member.Member || binding.StoreID != storeID || identity.UserTable != table.Table || identity.UserPrimaryKey != table.PrimaryKey {
 			return nil, group, errors.Join(errDevCluster, err)
 		}
-		if err := sqldriver.ValidateReplicatedChildSchema(identity, table.CreateTable, nil, nil); err != nil {
-			return nil, group, err
+		if initialSchema {
+			if err := sqldriver.ValidateReplicatedChildSchema(identity, table.CreateTable, nil, nil); err != nil {
+				return nil, group, err
+			}
+		} else {
+			// An evolving apply identity must still exist and obey its strict
+			// retained grammar. Its live generation is owned by serve-node.
+			raw, err := readDevFile(filepath.Join(member.GroupRoot, "apply-identity.vibejson"), 1<<20)
+			if err != nil {
+				return nil, group, err
+			}
+			var apply sqldriver.ReplicatedApplyIdentity
+			if err := apply.UnmarshalJSON(raw); err != nil {
+				return nil, group, err
+			}
 		}
 	}
 	return members, group, nil
 }
 
-func buildDevPhysicalTableProvision(table devTableProvision, members []devClusterMember, group raftmember.GroupKey) ([]byte, error) {
+func buildDevPhysicalTableProvision(table devTableProvision, members []devClusterMember, group raftmember.GroupKey, completed bool) ([]byte, error) {
 	endpoints := make(map[distribution.EndpointID]string)
 	name := distribution.DistributionName(table.Distribution)
-	route, err := inspectDevPreparedRoute(endpoints, table.artifactStem(), name, "all", table.Table, table.PrimaryKey, group, replication.Digest{}, true, members)
+	var route devPreparedRoute
+	var err error
+	if completed {
+		route, err = plannedDevPhysicalTableRoute(endpoints, table, members, group)
+	} else {
+		route, err = inspectDevPreparedRoute(endpoints, table.artifactStem(), name, "all", table.Table, table.PrimaryKey, group, replication.Digest{}, true, members)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -351,7 +393,72 @@ func buildDevPhysicalTableProvision(table devTableProvision, members []devCluste
 	return gateway.AppendReplicatedTableProvision(nil, addition)
 }
 
-func appendDevPhysicalNodeGroup(member devClusterMember) error {
+// A completed fragment preserves the initial schema proof even after an
+// authorized ALTER changes the live catalog. The pure driver schema builders
+// share the cold store's exact digest grammar without acquiring writer locks.
+func plannedDevPhysicalTableRoute(endpoints map[distribution.EndpointID]string, table devTableProvision, members []devClusterMember, group raftmember.GroupKey) (devPreparedRoute, error) {
+	statement, err := query.PrepareDML(table.CreateTable)
+	if err != nil {
+		return devPreparedRoute{}, err
+	}
+	defer statement.Release()
+	definition, err := statement.LowerTable()
+	if err != nil {
+		return devPreparedRoute{}, err
+	}
+	result := devPreparedRoute{
+		leaders: make([]distribution.EndpointID, len(members)), replicas: make([]gateway.ReplicatedReplicaDescriptor, len(members)),
+		schemaGeneration: 1,
+	}
+	placement := sqldriver.ReplicatedPlacementProfile{
+		Format: sqldriver.ReplicatedPlacementProfileFormat, ShardKey: table.PrimaryKey,
+		TupleVersion: distribution.CurrentTupleVersion, MapperVersion: distribution.NativeMapperVersion,
+		Range: distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
+	}
+	schema := sqldriver.InitialReplicatedRelationSchema{Table: table.Table, PrimaryKey: table.PrimaryKey, Schema: definition.Schema}
+	for index, member := range members {
+		node, nodeErr := decodeDev16(member.Node)
+		store, storeErr := decodeDev16(member.Store)
+		if nodeErr != nil || storeErr != nil {
+			return devPreparedRoute{}, errDevCluster
+		}
+		binding := sqldriver.ReplicatedShardStoreBinding{
+			ClusterID: group.ClusterID, ClusterIncarnation: group.ClusterIncarnation, TopologyRecoveryEpoch: group.TopologyRecoveryEpoch,
+			Distribution: table.Distribution, Shard: "all", AllocationGeneration: 1,
+			ShardIncarnation: group.ShardIncarnation, GroupID: group.GroupID, MemberID: member.Member, StoreID: store,
+			Authority: sqldriver.ReplicatedAuthorityProfile{ActivePolicyGeneration: 1, ProtectionEpoch: 1, OwnershipEpoch: 1, SchemaGeneration: 1, RoutingVersion: 1, RouteGeneration: 1},
+		}
+		digest, limits, err := sqldriver.InitialReplicatedRelationManifest(binding, placement, schema)
+		if err != nil {
+			return devPreparedRoute{}, err
+		}
+		logical, err := sqldriver.InitialReplicatedLogicalSchemaDigest(binding, placement, schema)
+		if err != nil {
+			return devPreparedRoute{}, err
+		}
+		profile := gateway.ReplicatedTableProfile{
+			Table: table.Table, Relation: 1, PrimaryKey: table.PrimaryKey, SchemaGeneration: 1,
+			LogicalSchemaDigest: logical, MaxKeyBytes: uint16(limits.MaxKeyBytes), MaxDocumentBytes: uint32(limits.MaxDocumentBytes),
+		}
+		if index == 0 {
+			result.digest, result.table = digest, profile
+		} else if result.digest != digest || result.table != profile {
+			return devPreparedRoute{}, errDevCluster
+		}
+		prefix := fmt.Sprintf("%s-member-%d", table.artifactStem(), index+1)
+		result.leaders[index] = distribution.EndpointID(prefix)
+		result.replicas[index] = gateway.ReplicatedReplicaDescriptor{
+			Member: member.Member, Node: rafttransport.NodeID(node), StoreID: store, NodeIncarnation: 1,
+			Endpoint: result.leaders[index], NativeEndpoint: distribution.EndpointID(prefix + "-native"), ControlEndpoint: distribution.EndpointID(prefix + "-control"),
+		}
+		endpoints[result.leaders[index]] = member.Peer
+		endpoints[result.replicas[index].NativeEndpoint] = member.Native
+		endpoints[result.replicas[index].ControlEndpoint] = member.Control
+	}
+	return result, nil
+}
+
+func reconcileDevPhysicalNodeGroup(member devClusterMember, appendMissing bool) error {
 	groupRaw, err := readDevFile(filepath.Join(member.GroupRoot, "serve-rf3.vibejson"), 4<<20)
 	if err != nil {
 		return err
@@ -395,7 +502,7 @@ func appendDevPhysicalNodeGroup(member devClusterMember) error {
 			return nil
 		}
 	}
-	if ordinal != len(groups) || len(groups) >= devPhysicalMaxGroups {
+	if !appendMissing || ordinal != len(groups) || len(groups) >= devPhysicalMaxGroups {
 		return errDevCluster
 	}
 	if err := retainDevPhysicalManifest(member.ServeManifest, nodeRaw); err != nil {

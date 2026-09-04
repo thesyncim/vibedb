@@ -310,6 +310,77 @@ func TestDevPhysicalRealPreparationRecoversExactPlans(t *testing.T) {
 			if err != nil || !bytes.Equal(planned, after) {
 				t.Fatalf("restart replaced the planned identities: %v", err)
 			}
+			alpha := inventory.Tables[0]
+			alphaMembers, alphaGroup, err := devPhysicalTableMembers(cluster, alpha)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Hold the exact SQL writer locks a live serve-node owns. The next
+			// CREATE must validate alpha's completed proof without reopening it.
+			for _, member := range alphaMembers {
+				lock, err := os.OpenFile(filepath.Join(member.GroupRoot, "member.vdb.lock"), os.O_RDWR, 0o600)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := storeio.LockWriter(lock); err != nil {
+					lock.Close()
+					t.Fatal(err)
+				}
+				t.Cleanup(func() {
+					storeio.UnlockWriter(lock)
+					lock.Close()
+				})
+			}
+			if _, err := buildDevPhysicalTableProvision(alpha, alphaMembers, alphaGroup, false); !errors.Is(err, storeio.ErrWriterLocked) {
+				t.Fatalf("cold validation did not observe the live writer lock: %v", err)
+			}
+			foreignIdentity, err := os.ReadFile(filepath.Join(alpha.GroupRoots[1], "sql-identity.vibejson"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, mismatch := range []struct {
+				name, path string
+				replace    func([]byte) []byte
+			}{
+				{"fragment_schema", filepath.Join(root, alpha.artifactStem()+"-catalog.vibejson"), func(raw []byte) []byte {
+					return bytes.ReplaceAll(raw, []byte("value TEXT"), []byte("value INTEGER"))
+				}},
+				{"preparation", filepath.Join(root, "prepare-"+alpha.artifactStem()+"-member-1.vibejson"), func(raw []byte) []byte {
+					return bytes.ReplaceAll(raw, []byte(alpha.Stores[0]), []byte(alpha.Stores[1]))
+				}},
+				{"store_binding", filepath.Join(alpha.GroupRoots[0], "sql-identity.vibejson"), func([]byte) []byte {
+					return foreignIdentity
+				}},
+				{"apply_identity", filepath.Join(alpha.GroupRoots[0], "apply-identity.vibejson"), func([]byte) []byte {
+					return []byte("{}")
+				}},
+			} {
+				t.Run(mismatch.name, func(t *testing.T) {
+					original, err := os.ReadFile(mismatch.path)
+					if err != nil {
+						t.Fatal(err)
+					}
+					changed := mismatch.replace(original)
+					if bytes.Equal(changed, original) {
+						t.Fatal("mismatch did not change the retained proof")
+					}
+					if err := os.WriteFile(mismatch.path, changed, 0o600); err != nil {
+						t.Fatal(err)
+					}
+					t.Cleanup(func() {
+						if err := os.WriteFile(mismatch.path, original, 0o600); err != nil {
+							t.Fatal(err)
+						}
+					})
+					if err := ensureDevTables(root, binary, &cluster, ""); err == nil {
+						t.Fatal("accepted a substituted completed preparation witness")
+					}
+					retained, err := os.ReadFile(mismatch.path)
+					if err != nil || !bytes.Equal(retained, changed) {
+						t.Fatalf("repaired a mismatched completed witness: %v", err)
+					}
+				})
+			}
 			for _, name := range []string{"recover_beta", "recover_gamma"} {
 				if err := os.WriteFile(schema, []byte("CREATE TABLE "+name+" (value TEXT, PRIMARY KEY (id))"), 0o600); err != nil {
 					t.Fatal(err)
