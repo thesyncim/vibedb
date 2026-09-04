@@ -175,6 +175,7 @@ type Runtime struct {
 	cancel context.CancelFunc
 
 	serveOnce    sync.Once
+	ready        chan struct{}
 	serveDone    chan struct{}
 	serveErr     error
 	serveMu      sync.Mutex
@@ -209,7 +210,7 @@ func Open(parent context.Context, config Config) (*Runtime, error) {
 	}
 	runtimeCtx, cancel := context.WithCancel(parent)
 	runtime := &Runtime{config: config, ctx: runtimeCtx, cancel: cancel,
-		serveDone: make(chan struct{}), drainDone: make(chan struct{})}
+		ready: make(chan struct{}), serveDone: make(chan struct{}), drainDone: make(chan struct{})}
 	if runtime.config.Logf == nil {
 		runtime.config.Logf = func(format string, args ...any) {
 			fmt.Fprintf(os.Stderr, format+"\n", args...)
@@ -450,6 +451,17 @@ func (runtime *Runtime) Listener() net.Listener {
 		return nil
 	}
 	return runtime.listener
+}
+
+// Ready closes after every configured optional service and PostgreSQL writer
+// and listener has started successfully. Open only binds the public listener;
+// supervisors must select Ready alongside Serve completion and cancellation
+// before advertising the frontend. Failed startup never signals readiness.
+func (runtime *Runtime) Ready() <-chan struct{} {
+	if runtime == nil {
+		return nil
+	}
+	return runtime.ready
 }
 
 // Serve starts public and optional PostgreSQL admission and waits until the

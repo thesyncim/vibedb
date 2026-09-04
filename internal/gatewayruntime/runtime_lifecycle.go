@@ -65,6 +65,10 @@ func (runtime *Runtime) runServe() {
 		runtime.pg = pg
 	}
 
+	if runtime.ctx.Err() != nil {
+		return
+	}
+	close(runtime.ready)
 	logf("vibedb-gateway serving catalog generation %d on %s",
 		runtime.holder.Current().Generation(), runtime.listener.Addr())
 	var err error
