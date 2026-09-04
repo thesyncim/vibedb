@@ -376,7 +376,7 @@ func parseWorkloads(raw string) ([]string, error) {
 	}
 	allowed := map[string]struct{}{
 		"point_hit": {}, "point_miss": {}, "range_64": {}, "group_16": {},
-		"update_existing": {}, "mixed_read_update": {},
+		"update_existing": {}, "mixed_read_update": {}, "update_uniform": {}, "mixed_uniform": {},
 	}
 	workloads := make([]string, 0, len(strings.Split(raw, ",")))
 	seen := make(map[string]struct{}, len(allowed))
@@ -485,11 +485,25 @@ func readKeyFor(rows, rep, ordinal int) int {
 	return int(mixOrdinal(uint64(ordinal)+uint64(rep)*0xa0761d6478bd642f+0xe7037ed1a0b428db) % uint64(rows))
 }
 
+// uniformKeyFor selects a key from the stripe owned by client. Every client
+// gets the keys whose ids have id%clients == client, including when rows is
+// not divisible by clients. The stream is independent of the operation and
+// table/group streams so mixed traffic remains approximately half reads and
+// half updates at every placement.
+func uniformKeyFor(rows, clients, client, rep, ordinal int) int {
+	stripeLength := (rows-1-client)/clients + 1
+	value := mixOrdinal(uint64(ordinal) + uint64(rep)*0x8cb92baa5d7e1b43 + 0x4f1bbcdc676f3e2d)
+	return client + clients*int(value%uint64(stripeLength))
+}
+
 func operationFor(workload string, ordinal int) string {
-	if workload == "mixed_read_update" {
+	if workload == "mixed_read_update" || workload == "mixed_uniform" {
 		if mixedRead(ordinal) {
 			return "point_hit"
 		}
+		return "update_existing"
+	}
+	if workload == "update_uniform" {
 		return "update_existing"
 	}
 	return workload
@@ -632,6 +646,10 @@ func trial(ctx context.Context, c config, workload string, clients, rep, count i
 			id = client
 			sql = "UPDATE " + table + " SET score=score+1 WHERE id=$1"
 			params = [][]byte{[]byte(key(id))}
+		case "update_uniform":
+			id = uniformKeyFor(c.rows, clients, client, rep, ordinal)
+			sql = "UPDATE " + table + " SET score=score+1 WHERE id=$1"
+			params = [][]byte{[]byte(key(id))}
 		case "mixed_read_update":
 			if mixedRead(ordinal) {
 				// Read keys and per-client update keys are disjoint. This keeps the
@@ -642,6 +660,15 @@ func trial(ctx context.Context, c config, workload string, clients, rep, count i
 				params = [][]byte{[]byte(key(id))}
 			} else {
 				id = client
+				sql = "UPDATE " + table + " SET score=score+1 WHERE id=$1"
+				params = [][]byte{[]byte(key(id))}
+			}
+		case "mixed_uniform":
+			id = uniformKeyFor(c.rows, clients, client, rep, ordinal)
+			if mixedRead(ordinal) {
+				sql = "SELECT id,bucket,score,payload FROM " + table + " WHERE id=$1"
+				params = [][]byte{[]byte(key(id))}
+			} else {
 				sql = "UPDATE " + table + " SET score=score+1 WHERE id=$1"
 				params = [][]byte{[]byte(key(id))}
 			}
@@ -695,6 +722,11 @@ func trial(ctx context.Context, c config, workload string, clients, rep, count i
 				return fmt.Errorf("update affected %d", res.CommandTag.RowsAffected())
 			}
 			scores[group][id]++
+		case "update_uniform":
+			if res.CommandTag.RowsAffected() != 1 {
+				return fmt.Errorf("uniform update affected %d", res.CommandTag.RowsAffected())
+			}
+			scores[group][id]++
 		case "mixed_read_update":
 			if mixedRead(ordinal) {
 				if len(res.Rows) != 1 || len(res.Rows[0]) != 4 {
@@ -707,6 +739,21 @@ func trial(ctx context.Context, c config, workload string, clients, rep, count i
 			} else {
 				if res.CommandTag.RowsAffected() != 1 {
 					return fmt.Errorf("mixed update affected %d", res.CommandTag.RowsAffected())
+				}
+				scores[group][id]++
+			}
+		case "mixed_uniform":
+			if mixedRead(ordinal) {
+				if len(res.Rows) != 1 || len(res.Rows[0]) != 4 {
+					return fmt.Errorf("uniform mixed read result shape")
+				}
+				row := res.Rows[0]
+				if textCell(c, row[0]) != key(id) || string(row[1]) != strconv.Itoa(id%16) || string(row[2]) != strconv.Itoa(scores[group][id]) || textCell(c, row[3]) != payload {
+					return fmt.Errorf("uniform mixed read mismatch")
+				}
+			} else {
+				if res.CommandTag.RowsAffected() != 1 {
+					return fmt.Errorf("uniform mixed update affected %d", res.CommandTag.RowsAffected())
 				}
 				scores[group][id]++
 			}

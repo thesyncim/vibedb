@@ -99,6 +99,18 @@ def diagnostic_report(directory):
     return value
 
 
+def uniform_report(workload):
+    value = report(new=True)
+    value.update(schema_version=2, status="complete", started_utc="2026-09-04T00:00:00Z")
+    value.pop("verification_error")
+    value["config"]["Workloads"] = [workload]
+    trial = value["results"][0]
+    trial["workload"] = workload
+    for ordinal, sample in enumerate(trial["samples"]):
+        sample["operation"] = MODULE.operation_for(workload, ordinal)
+    return value
+
+
 class SummarizeCRDBSQLTest(unittest.TestCase):
     def test_diagnostic_brackets_verify_exact_archives_and_integer_deltas(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -136,6 +148,66 @@ class SummarizeCRDBSQLTest(unittest.TestCase):
             path = write_report(directory, report(new=True))
             _, samples = MODULE.load(path, "vibedb")
             self.assertEqual(samples, 2)
+
+    def test_uniform_workloads_validate_actual_operation_labels(self):
+        for workload in ("update_uniform", "mixed_uniform"):
+            with self.subTest(workload=workload), tempfile.TemporaryDirectory() as directory:
+                value = uniform_report(workload)
+                _, samples = MODULE.load(write_report(directory, value), "vibedb")
+                self.assertEqual(samples, 2)
+
+    def test_uniform_workloads_reject_incorrect_operation_mix(self):
+        for workload in ("update_uniform", "mixed_uniform"):
+            with self.subTest(workload=workload), tempfile.TemporaryDirectory() as directory:
+                value = uniform_report(workload)
+                trial = value["results"][0]
+                for ordinal, sample in enumerate(trial["samples"]):
+                    expected = MODULE.operation_for(workload, ordinal)
+                    sample["operation"] = "point_hit" if expected == "update_existing" else "update_existing"
+                with self.assertRaisesRegex(ValueError, "operation identity"):
+                    MODULE.load(write_report(directory, value), "vibedb")
+
+    def test_uniform_workloads_cannot_use_legacy_schema_to_omit_operation_labels(self):
+        for workload in ("update_uniform", "mixed_uniform"):
+            for schema in (None, 1):
+                with self.subTest(workload=workload, schema=schema), tempfile.TemporaryDirectory() as directory:
+                    value = uniform_report(workload)
+                    if schema is None:
+                        value.pop("schema_version")
+                    else:
+                        value["schema_version"] = schema
+                    for sample in value["results"][0]["samples"]:
+                        sample.pop("operation")
+                    with self.assertRaisesRegex(ValueError, "uniform workloads require report schema 2"):
+                        MODULE.load(write_report(directory, value), "vibedb")
+
+    def test_uniform_workloads_reject_wrong_sample_count_assignment_and_repetition(self):
+        for workload in ("update_uniform", "mixed_uniform"):
+            for change in ("sample_count", "client", "repetition", "missing_operation"):
+                with self.subTest(workload=workload, change=change), tempfile.TemporaryDirectory() as directory:
+                    value = uniform_report(workload)
+                    trial = value["results"][0]
+                    if change == "sample_count":
+                        trial["samples"].pop()
+                    elif change == "client":
+                        trial["samples"][1]["client"] = 1
+                    elif change == "repetition":
+                        trial["repetition"] = 2
+                    else:
+                        trial["samples"][0].pop("operation")
+                    with self.assertRaises(ValueError):
+                        MODULE.load(write_report(directory, value), "vibedb")
+
+    def test_uniform_trial_must_exercise_every_configured_client(self):
+        for workload in ("update_uniform", "mixed_uniform"):
+            with self.subTest(workload=workload), tempfile.TemporaryDirectory() as directory:
+                value = uniform_report(workload)
+                value["config"]["Clients"] = "8"
+                trial = value["results"][0]
+                trial["clients"] = 8
+                trial["samples"][1].update(client=1, endpoint=1)
+                with self.assertRaisesRegex(ValueError, "operation count/engine mismatch"):
+                    MODULE.load(write_report(directory, value), "vibedb")
 
     def assert_invalid_new_report(self, mutate):
         with tempfile.TemporaryDirectory() as directory:

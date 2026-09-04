@@ -172,8 +172,15 @@ class FusedNodeRunnerTest(unittest.TestCase):
     def test_workload_alias_is_canonicalized(self):
         self.assertEqual(MODULE.parse_workloads("mixed", "workloads"),
                          ["mixed_read_update"])
+        self.assertEqual(MODULE.parse_workloads("update_uniform,mixed_uniform", "workloads"),
+                         ["update_uniform", "mixed_uniform"])
         with self.assertRaises(MODULE.RunnerError):
             MODULE.parse_workloads("point_hit,point_hit", "workloads")
+
+    def test_uniform_workloads_are_explicit_and_leave_default_matrix_unchanged(self):
+        self.assertIn("update_uniform", MODULE.ALLOWED_WORKLOADS)
+        self.assertIn("mixed_uniform", MODULE.ALLOWED_WORKLOADS)
+        self.assertEqual(MODULE.cell_matrix(Arguments())[0]["workloads"], MODULE.DEFAULT_WORKLOADS)
 
     def test_output_directory_refuses_reuse(self):
         with tempfile.TemporaryDirectory() as parent:

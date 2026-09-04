@@ -1,13 +1,22 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgproto3"
 )
 
 func TestInvalidEndpointDoesNotLeakCredentials(t *testing.T) {
@@ -105,6 +114,387 @@ func TestStreamsDoNotPartitionGroupsOrKeysByClient(t *testing.T) {
 	}
 }
 
+func TestUniformKeyForUsesDisjointStripesAndDatasetBounds(t *testing.T) {
+	for _, tc := range []struct {
+		rows, clients int
+	}{{64, 1}, {64, 3}, {65, 8}, {127, 15}, {8192, 8}} {
+		owners := make(map[int]int)
+		for client := 0; client < tc.clients; client++ {
+			stripeLength := (tc.rows-1-client)/tc.clients + 1
+			if stripeLength < 1 {
+				t.Fatalf("rows=%d clients=%d client=%d has empty stripe", tc.rows, tc.clients, client)
+			}
+			max := client + tc.clients*(stripeLength-1)
+			if max >= tc.rows {
+				t.Fatalf("rows=%d clients=%d client=%d stripe reaches row %d", tc.rows, tc.clients, client, max)
+			}
+			for rep := 1; rep <= 3; rep++ {
+				for ordinal := 0; ordinal < 2000; ordinal++ {
+					id := uniformKeyFor(tc.rows, tc.clients, client, rep, ordinal)
+					if id < 0 || id >= tc.rows {
+						t.Fatalf("rows=%d clients=%d client=%d produced out-of-bounds id %d", tc.rows, tc.clients, client, id)
+					}
+					if id%tc.clients != client {
+						t.Fatalf("rows=%d clients=%d client=%d produced id %d owned by %d", tc.rows, tc.clients, client, id, id%tc.clients)
+					}
+					if previous, ok := owners[id]; ok && previous != client {
+						t.Fatalf("id %d selected by clients %d and %d", id, previous, client)
+					}
+					owners[id] = client
+				}
+			}
+		}
+	}
+}
+
+func TestUniformKeyForDeterministicallySpreadsAcrossWideStripes(t *testing.T) {
+	const rows, clients, rep = 4096, 8, 7
+	stripeLength := (rows-1)/clients + 1
+	for client := 0; client < clients; client++ {
+		first, second := make([]int, 256), make([]int, 256)
+		seen := make(map[int]struct{})
+		for operation := 0; operation < 10000; operation++ {
+			ordinal := client + operation*clients
+			id := uniformKeyFor(rows, clients, client, rep, ordinal)
+			seen[id] = struct{}{}
+			if operation < len(first) {
+				first[operation] = id
+			}
+		}
+		for operation := 0; operation < len(second); operation++ {
+			second[operation] = uniformKeyFor(rows, clients, client, rep, client+operation*clients)
+		}
+		if len(seen) != stripeLength {
+			t.Fatalf("client %d selected only %d of %d stripe keys", client, len(seen), stripeLength)
+		}
+		for ordinal := range first {
+			if first[ordinal] != second[ordinal] {
+				t.Fatalf("client %d key stream changed at ordinal %d", client, ordinal)
+			}
+		}
+	}
+}
+
+func TestMixedUniformOracleSeesOnlyOwnPriorWrites(t *testing.T) {
+	const rows, clients, groups, rep = 127, 8, 3, 5
+	c := config{groupDistribution: "uniform"}
+	scores := make([][]int, groups)
+	updates := make([][]int, groups)
+	for group := 0; group < groups; group++ {
+		scores[group], updates[group] = make([]int, rows), make([]int, rows)
+		for id := 0; id < rows; id++ {
+			scores[group][id] = id % 100
+		}
+	}
+	reads, writes, readsAfterWrites := 0, 0, 0
+	for client := 0; client < clients; client++ {
+		for ordinal := client; ordinal < 12000; ordinal += clients {
+			group := groupFor(c, groups, ordinal)
+			id := uniformKeyFor(rows, clients, client, rep, ordinal)
+			if id%clients != client {
+				t.Fatalf("client %d selected id %d", client, id)
+			}
+			if mixedRead(ordinal) {
+				reads++
+				if updates[group][id] > 0 {
+					readsAfterWrites++
+				}
+				if scores[group][id] != id%100+updates[group][id] {
+					t.Fatalf("group %d id %d oracle score = %d, want %d", group, id, scores[group][id], id%100+updates[group][id])
+				}
+			} else {
+				writes++
+				scores[group][id]++
+				updates[group][id]++
+			}
+		}
+	}
+	if reads == 0 || writes == 0 || readsAfterWrites == 0 {
+		t.Fatalf("mixed_uniform reads=%d writes=%d reads-after-writes=%d", reads, writes, readsAfterWrites)
+	}
+}
+
+func TestUniformWorkloadOperationLabels(t *testing.T) {
+	if got := operationFor("update_uniform", 0); got != "update_existing" {
+		t.Fatalf("update_uniform operation = %q", got)
+	}
+	reads, writes := 0, 0
+	for ordinal := 0; ordinal < 4000; ordinal++ {
+		want := "update_existing"
+		if mixedRead(ordinal) {
+			want = "point_hit"
+			reads++
+		} else {
+			writes++
+		}
+		if got := operationFor("mixed_uniform", ordinal); got != want {
+			t.Fatalf("mixed_uniform ordinal %d operation = %q, want %q", ordinal, got, want)
+		}
+	}
+	if reads == 0 || writes == 0 {
+		t.Fatalf("mixed_uniform reads=%d writes=%d", reads, writes)
+	}
+}
+
+// Exercise trial's real warmup, statement selection, response checking and
+// score updates over the extended protocol. The server maintains independent
+// rows, so failing to advance the warmup oracle or accepting a stale read
+// cannot be hidden by a test that increments both expected counters together.
+func TestUniformTrialWarmupPriorReadsAndFullVerification(t *testing.T) {
+	const rows, clients, count, warmup = 67, 3, 259, 83
+	tables := []string{"wide_a", "wide_b"}
+	for _, engine := range []string{"vibedb", "cockroachdb"} {
+		for _, workload := range []string{"update_uniform", "mixed_uniform"} {
+			t.Run(engine+"/"+workload, func(t *testing.T) {
+				c := config{engine: engine, rows: rows, warmup: warmup, groupDistribution: "uniform"}
+				scores, stored := make([][]int, len(tables)), make([][]int, len(tables))
+				for group := range tables {
+					scores[group], stored[group] = make([]int, rows), make([]int, rows)
+					for id := range rows {
+						scores[group][id], stored[group][id] = id%100, id%100
+					}
+				}
+				var mu sync.Mutex
+				seen := make(map[int]bool)
+				readsAfterWrites := 0
+				calls := make([]int, clients*2)
+				endpoint := uniformTrialServer(t, func(connection int, sql string, params [][]byte) ([][][]byte, string, error) {
+					mu.Lock()
+					defer mu.Unlock()
+					cell := func(value string) []byte {
+						if engine == "vibedb" {
+							encoded, _ := json.Marshal(value)
+							return encoded
+						}
+						return []byte(value)
+					}
+					row := func(group, id int) [][]byte {
+						return [][]byte{cell(key(id)), []byte(strconv.Itoa(id % 16)), []byte(strconv.Itoa(stored[group][id])), cell(payload)}
+					}
+					if connection >= len(calls) {
+						for group, table := range tables {
+							if sql == "SELECT COUNT(*) FROM "+table {
+								return [][][]byte{{[]byte(strconv.Itoa(rows))}}, "SELECT 1", nil
+							}
+							if sql == "SELECT id,bucket,score,payload FROM "+table+" WHERE id >= $1 ORDER BY id LIMIT 512" && len(params) == 1 && string(params[0]) == key(0) {
+								result := make([][][]byte, rows)
+								for id := range rows {
+									result[id] = row(group, id)
+								}
+								return result, "SELECT " + strconv.Itoa(rows), nil
+							}
+						}
+						return nil, "", fmt.Errorf("unexpected verification query %q", sql)
+					}
+					client, rep := connection%clients, []int{2, 5}[connection/clients]
+					call := calls[connection]
+					warmups := (warmup-1-client)/clients + 1
+					ordinal := client + call*clients
+					if call >= warmups {
+						ordinal = client + (call-warmups)*clients
+					}
+					group := groupFor(c, len(tables), ordinal)
+					id := uniformKeyFor(rows, clients, client, rep, ordinal)
+					read := workload == "mixed_uniform" && mixedRead(ordinal)
+					wantSQL := "UPDATE " + tables[group] + " SET score=score+1 WHERE id=$1"
+					if read {
+						wantSQL = "SELECT id,bucket,score,payload FROM " + tables[group] + " WHERE id=$1"
+					}
+					if sql != wantSQL || len(params) != 1 || string(params[0]) != key(id) || id%clients != client {
+						return nil, "", fmt.Errorf("connection %d ordinal %d statement/key mismatch: %q %q", connection, ordinal, sql, params)
+					}
+					calls[connection]++
+					seen[id] = true
+					if read {
+						if stored[group][id] > id%100 {
+							readsAfterWrites++
+						}
+						return [][][]byte{row(group, id)}, "SELECT 1", nil
+					}
+					stored[group][id]++
+					return nil, "UPDATE 1", nil
+				})
+				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+				defer cancel()
+				for _, rep := range []int{2, 5} {
+					out, err := trial(ctx, c, workload, clients, rep, count, tables, scores, []string{endpoint})
+					if err != nil || out.Errors != 0 || out.Repetition != rep || len(out.Samples) != count {
+						t.Fatalf("trial repetition %d: errors=%d err=%v samples=%v", rep, out.Errors, err, out.Samples)
+					}
+					for ordinal, sample := range out.Samples {
+						if sample.Ordinal != ordinal || sample.Client != ordinal%clients || sample.Operation != operationFor(workload, ordinal) {
+							t.Fatalf("sample identity: %+v", sample)
+						}
+					}
+					mu.Lock()
+					for group := range tables {
+						for id := range rows {
+							if scores[group][id] != stored[group][id] {
+								t.Errorf("repetition %d group %d key %d oracle=%d stored=%d", rep, group, id, scores[group][id], stored[group][id])
+							}
+						}
+					}
+					mu.Unlock()
+				}
+				mu.Lock()
+				for connection, got := range calls {
+					client := connection % clients
+					if want := (warmup-1-client)/clients + 1 + (count-1-client)/clients + 1; got != want {
+						t.Errorf("connection %d operations=%d want=%d", connection, got, want)
+					}
+				}
+				if len(seen) != rows || workload == "mixed_uniform" && readsAfterWrites == 0 {
+					t.Errorf("key coverage=%d/%d reads-after-writes=%d", len(seen), rows, readsAfterWrites)
+				}
+				mu.Unlock()
+				admin, err := pgconn.Connect(ctx, endpoint)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer admin.Close(context.Background())
+				if err := verify(ctx, admin, c, tables, scores); err != nil {
+					t.Fatal(err)
+				}
+				mu.Lock()
+				stored[1][rows-1]++ // A mismatched tail row must fail full-table verification.
+				mu.Unlock()
+				if err := verify(ctx, admin, c, tables, scores); err == nil {
+					t.Fatal("full-table verification accepted a mismatched tail score")
+				}
+			})
+		}
+	}
+}
+
+func uniformTrialServer(t *testing.T, execute func(int, string, [][]byte) ([][][]byte, string, error)) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var workers sync.WaitGroup
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		for connection := 0; ; connection++ {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			workers.Add(1)
+			go func(connection int) {
+				defer workers.Done()
+				defer conn.Close()
+				_ = conn.SetDeadline(time.Now().Add(20 * time.Second))
+				backend := pgproto3.NewBackend(conn, conn)
+				if _, err := backend.ReceiveStartupMessage(); err != nil {
+					t.Error(err)
+					return
+				}
+				backend.Send(&pgproto3.AuthenticationOk{})
+				backend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+				if err := backend.Flush(); err != nil {
+					t.Error(err)
+					return
+				}
+				var sql string
+				var params [][]byte
+				for {
+					message, err := backend.Receive()
+					if err != nil {
+						if !errors.Is(err, io.EOF) {
+							t.Error(err)
+						}
+						return
+					}
+					switch message := message.(type) {
+					case *pgproto3.Parse:
+						sql = message.Query
+						backend.Send(&pgproto3.ParseComplete{})
+					case *pgproto3.Bind:
+						params = make([][]byte, len(message.Parameters))
+						for i, parameter := range message.Parameters {
+							params[i] = append([]byte(nil), parameter...)
+						}
+						backend.Send(&pgproto3.BindComplete{})
+					case *pgproto3.Describe:
+						if strings.HasPrefix(sql, "SELECT ") {
+							names := []string{"id", "bucket", "score", "payload"}
+							if strings.HasPrefix(sql, "SELECT COUNT(") {
+								names = []string{"count"}
+							}
+							fields := make([]pgproto3.FieldDescription, len(names))
+							for i, name := range names {
+								fields[i] = pgproto3.FieldDescription{Name: []byte(name), DataTypeOID: 25, DataTypeSize: -1, TypeModifier: -1}
+							}
+							backend.Send(&pgproto3.RowDescription{Fields: fields})
+						} else {
+							backend.Send(&pgproto3.NoData{})
+						}
+					case *pgproto3.Execute:
+						rows, tag, err := execute(connection, sql, params)
+						if err != nil {
+							backend.Send(&pgproto3.ErrorResponse{Severity: "ERROR", Code: "XX000", Message: err.Error()})
+						} else {
+							for _, row := range rows {
+								backend.Send(&pgproto3.DataRow{Values: row})
+							}
+							backend.Send(&pgproto3.CommandComplete{CommandTag: []byte(tag)})
+						}
+					case *pgproto3.Sync:
+						backend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+						if err := backend.Flush(); err != nil {
+							t.Error(err)
+							return
+						}
+					case *pgproto3.Terminate:
+						return
+					default:
+						t.Errorf("unexpected extended-protocol message %T", message)
+						return
+					}
+				}
+			}(connection)
+		}
+	}()
+	t.Cleanup(func() {
+		_ = listener.Close()
+		workers.Wait()
+	})
+	return "postgresql://bench@" + listener.Addr().String() + "/bench?sslmode=disable"
+}
+
+func TestMixedUniformWarmupRejectsEveryIncorrectReadField(t *testing.T) {
+	for _, field := range []int{0, 1, 2, 3} {
+		t.Run(strconv.Itoa(field), func(t *testing.T) {
+			c := config{engine: "cockroachdb", rows: 64, warmup: 32, groupDistribution: "uniform"}
+			scores, stored := make([]int, c.rows), make([]int, c.rows)
+			for id := range scores {
+				scores[id], stored[id] = id%100, id%100
+			}
+			endpoint := uniformTrialServer(t, func(_ int, sql string, params [][]byte) ([][][]byte, string, error) {
+				id, err := strconv.Atoi(strings.TrimPrefix(string(params[0]), "key-"))
+				if err != nil || id < 0 || id >= len(stored) {
+					return nil, "", fmt.Errorf("unexpected key %q", params)
+				}
+				if strings.HasPrefix(sql, "UPDATE ") {
+					stored[id]++
+					return nil, "UPDATE 1", nil
+				}
+				row := [][]byte{[]byte(key(id)), []byte(strconv.Itoa(id % 16)), []byte(strconv.Itoa(stored[id])), []byte(payload)}
+				row[field] = []byte("incorrect")
+				return [][][]byte{row}, "SELECT 1", nil
+			})
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			out, err := trial(ctx, c, "mixed_uniform", 1, 1, 8, []string{defaultTable}, [][]int{scores}, []string{endpoint})
+			if err == nil || !strings.Contains(err.Error(), "mixed_uniform warmup: uniform mixed read mismatch") || out.MeasurementStartedUTC != "" {
+				t.Fatalf("incorrect read field %d did not fail warmup: err=%v", field, err)
+			}
+		})
+	}
+}
+
 func TestParseTables(t *testing.T) {
 	got, err := parseTables("rf3_sql_bench,orders_01")
 	if err != nil {
@@ -132,6 +522,19 @@ func TestParseWorkloads(t *testing.T) {
 		if _, err := parseWorkloads(input); err == nil {
 			t.Fatalf("parseWorkloads(%q) accepted invalid input", input)
 		}
+	}
+}
+
+func TestParseWorkloadsAcceptsExplicitUniformNames(t *testing.T) {
+	got, err := parseWorkloads("update_uniform,mixed_uniform")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(got, ",") != "update_uniform,mixed_uniform" {
+		t.Fatalf("workloads = %v", got)
+	}
+	if _, err := parseWorkloads("update_uniform,update_uniform"); err == nil {
+		t.Fatal("duplicate update_uniform workload accepted")
 	}
 }
 

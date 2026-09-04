@@ -17,7 +17,9 @@ from statistics import median
 WORKLOADS = ("point_hit", "point_miss", "range_64", "group_16", "update_existing")
 DEFAULT_TABLES = ("rf3_sql_bench",)
 MIXED_WORKLOAD = "mixed_read_update"
-ALL_WORKLOADS = WORKLOADS + (MIXED_WORKLOAD,)
+UNIFORM_UPDATE_WORKLOAD = "update_uniform"
+UNIFORM_MIXED_WORKLOAD = "mixed_uniform"
+ALL_WORKLOADS = WORKLOADS + (MIXED_WORKLOAD, UNIFORM_UPDATE_WORKLOAD, UNIFORM_MIXED_WORKLOAD)
 UINT64_MASK = (1 << 64) - 1
 DIAGNOSTIC_COUNTERS = (
     "ready_waves", "ready_durable_waves", "observed_append_barriers", "multi_group_waves", "failed_waves",
@@ -100,6 +102,15 @@ def group_for(config, groups, ordinal):
     require(config.get("GroupDistribution", "uniform") == "uniform",
             "unknown group distribution")
     return value % groups
+
+
+def operation_for(workload, ordinal):
+    """Match rf3-sqlbench's actual SQL operation label for one sample."""
+    if workload in (MIXED_WORKLOAD, UNIFORM_MIXED_WORKLOAD):
+        return "point_hit" if mix_ordinal(ordinal + 0xD1B54A32D192ED03) & 1 == 0 else "update_existing"
+    if workload == UNIFORM_UPDATE_WORKLOAD:
+        return "update_existing"
+    return workload
 
 
 def comparable_config(config):
@@ -222,6 +233,10 @@ def load(path, engine):
                 f"invalid {field}")
     tables = tables_for(config)
     workloads = workloads_for(config)
+    # These workloads were introduced after schema 2. Legacy compatibility
+    # must not let their operation and routing metadata become optional.
+    if any(workload in (UNIFORM_UPDATE_WORKLOAD, UNIFORM_MIXED_WORKLOAD) for workload in workloads):
+        require(schema_version == 2, "uniform workloads require report schema 2")
     require(isinstance(config.get("Clients"), str) and config["Clients"], "invalid clients")
     try:
         clients = [int(n) for n in config["Clients"].split(",")]
@@ -268,7 +283,8 @@ def load(path, engine):
         count = trial.get("operations")
         require(is_integer(count) and count > 0, "invalid trial operation count")
         expected_count = config["ScanOperations"] if trial["workload"] in ("range_64", "group_16") else config["Operations"]
-        require(trial["engine"] == engine and count == expected_count and count > 0,
+        require(trial["engine"] == engine and count == expected_count and
+                (schema_version == 1 or count >= trial["clients"]),
                 "trial operation count/engine mismatch")
         samples = trial["samples"]
         require(len(samples) == count, "sample count mismatch")
@@ -305,10 +321,8 @@ def load(path, engine):
             if "error" in sample:
                 require(isinstance(sample["error"], str), "invalid sample error")
             if schema_version == 2 or "operation" in sample:
-                operation = trial["workload"]
-                if operation == MIXED_WORKLOAD:
-                    operation = "point_hit" if mix_ordinal(ordinal + 0xD1B54A32D192ED03) & 1 == 0 else "update_existing"
-                require(sample.get("operation") == operation, "sample operation identity mismatch")
+                require(sample.get("operation") == operation_for(trial["workload"], ordinal),
+                        "sample operation identity mismatch")
         errors = sum(bool(s.get("error")) for s in samples)
         require(is_integer(trial.get("errors")) and errors == trial["errors"],
                 "error count mismatch")

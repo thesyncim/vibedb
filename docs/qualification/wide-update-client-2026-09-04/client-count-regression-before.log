@@ -1,0 +1,21 @@
+
+======================================================================
+FAIL: test_uniform_trial_must_exercise_every_configured_client (test_summarize_crdb_sql.SummarizeCRDBSQLTest) (workload='update_uniform')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/private/tmp/vibedb-fused-rf3-node/scripts/bench/test_summarize_crdb_sql.py", line 210, in test_uniform_trial_must_exercise_every_configured_client
+    MODULE.load(write_report(directory, value), "vibedb")
+AssertionError: ValueError not raised
+
+======================================================================
+FAIL: test_uniform_trial_must_exercise_every_configured_client (test_summarize_crdb_sql.SummarizeCRDBSQLTest) (workload='mixed_uniform')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/private/tmp/vibedb-fused-rf3-node/scripts/bench/test_summarize_crdb_sql.py", line 210, in test_uniform_trial_must_exercise_every_configured_client
+    MODULE.load(write_report(directory, value), "vibedb")
+AssertionError: ValueError not raised
+
+----------------------------------------------------------------------
+Ran 1 test in 0.097s
+
+FAILED (failures=2)

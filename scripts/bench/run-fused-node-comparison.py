@@ -38,7 +38,7 @@ DEFAULT_WORKLOADS = "point_hit,point_miss,range_64,group_16,update_existing"
 DEFAULT_PAYLOAD_BYTES = 256
 ALLOWED_WORKLOADS = {
     "point_hit", "point_miss", "range_64", "group_16", "update_existing",
-    "mixed_read_update",
+    "mixed_read_update", "update_uniform", "mixed_uniform",
 }
 COMMAND_LOG = None
 
