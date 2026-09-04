@@ -1,0 +1,40 @@
+=== RUN   TestCompactPackedBenchmarkWidths
+=== RUN   TestCompactPackedBenchmarkWidths/dictionary8
+=== RUN   TestCompactPackedBenchmarkWidths/FOR16
+--- PASS: TestCompactPackedBenchmarkWidths (0.00s)
+    --- PASS: TestCompactPackedBenchmarkWidths/dictionary8 (0.00s)
+    --- PASS: TestCompactPackedBenchmarkWidths/FOR16 (0.00s)
+=== RUN   TestCompactPackedBenchmarkStripeWidths
+--- PASS: TestCompactPackedBenchmarkStripeWidths (0.01s)
+=== RUN   TestCountCompactPackedEqualDispatchAVX2
+    compact_stream_codec_packed_equal_dispatch_amd64_test.go:15: AVX2=false GODEBUG="cpu.avx2=off"
+--- PASS: TestCountCompactPackedEqualDispatchAVX2 (0.00s)
+=== RUN   TestCountCompactPackedEqualAVX2DirectParity
+    compact_stream_codec_packed_equal_dispatch_amd64_test.go:47: AVX2 is unavailable or disabled
+--- SKIP: TestCountCompactPackedEqualAVX2DirectParity (0.00s)
+=== RUN   TestCompactPackedEqualWidth7Through16Parity
+--- PASS: TestCompactPackedEqualWidth7Through16Parity (4.65s)
+=== RUN   TestCompactPackedEqualFirstRowsExerciseEveryLane
+--- PASS: TestCompactPackedEqualFirstRowsExerciseEveryLane (0.00s)
+=== RUN   TestCountCompactPackedEqualDispatch
+--- PASS: TestCountCompactPackedEqualDispatch (0.00s)
+=== RUN   TestCountCompactPackedEqualZeroAlloc
+--- PASS: TestCountCompactPackedEqualZeroAlloc (0.02s)
+=== RUN   TestCountCompactPackedEqualMatchesRandomAccess
+--- PASS: TestCountCompactPackedEqualMatchesRandomAccess (0.01s)
+PASS
+ok  	github.com/thesyncim/vibedb/internal/storeio	4.699s
+=== RUN   TestFilePackedEqualityCount
+=== RUN   TestFilePackedEqualityCount/label/dictionary7
+=== RUN   TestFilePackedEqualityCount/n/FOR10
+--- PASS: TestFilePackedEqualityCount (0.04s)
+    --- PASS: TestFilePackedEqualityCount/label/dictionary7 (0.00s)
+    --- PASS: TestFilePackedEqualityCount/n/FOR10 (0.00s)
+=== RUN   TestFilePackedEqualityCountWide
+=== RUN   TestFilePackedEqualityCountWide/label/dictionary8
+=== RUN   TestFilePackedEqualityCountWide/n/FOR16
+--- PASS: TestFilePackedEqualityCountWide (0.05s)
+    --- PASS: TestFilePackedEqualityCountWide/label/dictionary8 (0.00s)
+    --- PASS: TestFilePackedEqualityCountWide/n/FOR16 (0.00s)
+PASS
+ok  	github.com/thesyncim/vibedb/query	0.108s

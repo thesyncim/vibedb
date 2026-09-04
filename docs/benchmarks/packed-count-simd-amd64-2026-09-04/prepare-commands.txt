@@ -1,0 +1,9 @@
+git rev-parse --verify HEAD^{commit}
+git rev-parse --verify 953981b69afd18b1b6adc558b586fc183531a8bb^{commit}
+git worktree add --detach /home/runner/work/_temp/packed-simd-base 953981b69afd18b1b6adc558b586fc183531a8bb
+cp /home/runner/work/vibedb/vibedb/internal/storeio/compact_stream_codec_packed_equal_bench_test.go /home/runner/work/_temp/packed-simd-base/internal/storeio/compact_stream_codec_packed_equal_bench_test.go
+cp /home/runner/work/vibedb/vibedb/query/file_packed_count_bench_test.go /home/runner/work/_temp/packed-simd-base/query/file_packed_count_bench_test.go
+go test -run \^\$ -c -o /home/runner/work/_temp/packed-simd-binaries/base-storeio.test ./internal/storeio
+go test -run \^\$ -c -o /home/runner/work/_temp/packed-simd-binaries/base-query.test ./query
+go test -run \^\$ -c -o /home/runner/work/_temp/packed-simd-binaries/head-storeio.test ./internal/storeio
+go test -run \^\$ -c -o /home/runner/work/_temp/packed-simd-binaries/head-query.test ./query
