@@ -271,9 +271,9 @@ jobs:
           GOAMD64: v1
           VIBEDB_TEST_REQUIRE_AVX2: ${{ matrix.runner == 'ubuntu-latest' && '1' || '' }}
         run: |
-          GOEXPERIMENT=simd go test -v -count=1 -timeout=5m ./internal/storeio -run 'Test(CountCompact|CompactPacked|CompactStream|CompactPrimaryStripe)'
-          GOEXPERIMENT=nosimd go test -count=1 -timeout=5m ./internal/storeio -run 'Test(CountCompact|CompactPacked|CompactStream|CompactPrimaryStripe)'
-          GOEXPERIMENT=nosimd go test -count=1 -timeout=5m ./query -run '^TestFilePackedEqualityCount(Wide)?$'
+          GOEXPERIMENT=simd go test -v -count=1 -timeout=5m ./internal/storeio -run 'Test(CountCompact|CompactPacked|CompactIntegerOrdered|CompactStream|CompactPrimaryStripe)'
+          GOEXPERIMENT=nosimd go test -count=1 -timeout=5m ./internal/storeio -run 'Test(CountCompact|CompactPacked|CompactIntegerOrdered|CompactStream|CompactPrimaryStripe)'
+          GOEXPERIMENT=nosimd go test -count=1 -timeout=5m ./query -run '^TestFilePacked(Equality|Ordered)Count.*$'
       - name: SIMD packed-count fallback with AVX2 disabled (AMD64)
         if: matrix.runner == 'ubuntu-latest'
         shell: bash
@@ -293,7 +293,7 @@ jobs:
             go env -json GOARCH GOAMD64 GOEXPERIMENT
             printf 'GODEBUG=%s\n' "${GODEBUG}"
           } > "${evidence}/environment.txt"
-          tests='Test(CountCompact|CompactPacked)|^TestFilePackedEqualityCount(Wide)?$'
+          tests='Test(CountCompact|CompactPacked|CompactIntegerOrdered)|^TestFilePacked(Equality|Ordered)Count.*$'
           printf 'GOAMD64=v1 GOEXPERIMENT=simd GODEBUG=cpu.avx2=off go test -v -count=1 -timeout=5m ./internal/storeio ./query -run %q\n' \
             "${tests}" > "${evidence}/commands.txt"
           go test -v -count=1 -timeout=5m ./internal/storeio ./query \
