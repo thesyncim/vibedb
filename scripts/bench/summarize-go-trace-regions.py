@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize pg.* regions from Go 1.27 `go tool trace -d=parsed` output.
+"""Summarize pg.* and sql.* regions from Go 1.27 `go tool trace -d=parsed` output.
 
 Only matched regions contribute. Report unmatched edges because flight-recorder
 retention can truncate a region. Nested regions must not be added to parents.
@@ -15,7 +15,7 @@ from statistics import mean, median
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("parsed_trace")
 args = parser.parse_args()
-pattern = re.compile(r' G=(\d+) Region(Begin|End) Time=(\d+) Task=\d+ Type="(pg\.[^"]+)"')
+pattern = re.compile(r' G=(\d+) Region(Begin|End) Time=(\d+) Task=\d+ Type="((?:pg|sql)\.[^"]+)"')
 pending = defaultdict(list)
 durations = defaultdict(list)
 unmatched_end = defaultdict(int)
