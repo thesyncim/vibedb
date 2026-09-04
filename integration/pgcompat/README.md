@@ -48,7 +48,7 @@ See PostgreSQL's [regression-test documentation](https://www.postgresql.org/docs
 
 ## Requirements
 
-- Bash, Git, Go 1.26, and standard Unix text tools
+- Bash, Git, Go 1.27, and standard Unix text tools
 - network access for the first corpus clone
 - either Docker for the pinned client image or a local `psql`
 - GNU `timeout`, `gtimeout`, or Perl for per-script deadlines

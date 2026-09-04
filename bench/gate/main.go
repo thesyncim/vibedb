@@ -151,6 +151,7 @@ func run(baseFlag string, keep bool) (bool, error) {
 		return false, err
 	}
 
+	fmt.Fprintf(os.Stderr, "bench-gate: GOEXPERIMENT=%s\n", benchExperiment())
 	fmt.Fprintf(os.Stderr, "bench-gate: head = working tree at %s\n", root)
 	fmt.Fprintf(os.Stderr, "bench-gate: base = %s (%s)\n", baseSHA, baseDesc)
 
@@ -243,6 +244,14 @@ func benchPattern(names []string) string {
 	return "^(" + strings.Join(names, "|") + ")$"
 }
 
+// benchExperiment selects the same backend for baseline and candidate builds.
+func benchExperiment() string {
+	if experiment := os.Getenv("GOEXPERIMENT"); experiment != "" {
+		return experiment
+	}
+	return "simd"
+}
+
 // goTestBench runs one benchmark group and returns its stdout. It fixes
 // -run '^$' (no tests), -count=1 (no result caching), and -benchmem (so B/op
 // and allocs/op are always present).
@@ -256,7 +265,7 @@ func goTestBench(dir, pkg, pattern, benchtime string) (string, error) {
 		pkg,
 	)
 	cmd.Dir = dir
-	cmd.Env = os.Environ()
+	cmd.Env = append(os.Environ(), "GOEXPERIMENT="+benchExperiment())
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("%w\n%s", err, out)

@@ -21,6 +21,9 @@ concurrency:
   group: postgresql-compatibility-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  GOEXPERIMENT: simd
+
 jobs:
   upstream-regression:
     name: PostgreSQL 18.6 regression corpus

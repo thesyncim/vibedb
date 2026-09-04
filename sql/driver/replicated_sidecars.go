@@ -257,9 +257,9 @@ func (profile *replicatedShardStoreSidecarVibe) UnmarshalVibeJSON(
 		}
 		switch index {
 		case 0:
-			err = c.Uint64(&decoded.UserRecoveryJournalBytes)
+			err = c.Uint(&decoded.UserRecoveryJournalBytes)
 		case 1:
-			err = c.Uint64(&decoded.TransactionMarkerBytes)
+			err = c.Uint(&decoded.TransactionMarkerBytes)
 		}
 		if err != nil {
 			return c, err

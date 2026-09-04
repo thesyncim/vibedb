@@ -79,9 +79,25 @@ only after its recovery record is power-safe. A collection may use a primary
 file and a recovery-journal sidecar; copy or back up the complete closed
 database directory, never an arbitrary live file.
 
+Repository builds, tests, and focused benchmarks default to SIMD:
+
+```sh
+make build
+make test
+make bench
+```
+
+Use `make test GOEXPERIMENT=nosimd` for the portable parity check. CI,
+standalone test/benchmark scripts, and deployment builds select SIMD by
+default too. For an embedding application or a raw Go command, pass
+`GOEXPERIMENT=simd`; a dependency cannot enable this compiler experiment
+through `go.mod`. Go 1.27 SIMD kernels support arm64 and supported amd64 CPUs,
+with runtime CPU fallback on amd64.
+
 ## What is implemented
 
 - Canonical JSON documents in named, lazily materialized collections.
+- Retained JSON indexes for document placement; see the [paired placement measurements](docs/benchmarks/vibejson-placement-2026-09-04/README.md).
 - Exact scalar and compound indexes.
 - Immutable snapshots, typed queries, and bounded execution workspaces.
 - Serializable native transactions and multi-table SQL transactions.

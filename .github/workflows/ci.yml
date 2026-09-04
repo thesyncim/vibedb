@@ -11,6 +11,9 @@ concurrency:
   # Intermediate main commits already replace one another in the pending
   # slot. Prioritize the newest revision instead of waiting on stale work.
   cancel-in-progress: true
+env:
+  GOEXPERIMENT: simd
+
 jobs:
   repository-contracts:
     needs: [sql-tests]
@@ -256,7 +259,17 @@ jobs:
       - name: Go 1.27 SIMD planner and query paths
         env:
           GOEXPERIMENT: simd
-        run: go test -count=1 -timeout=10m ./planner ./query ./gateway
+        run: go test -count=1 -timeout=10m ./planner ./query ./gateway ./distribution ./internal/rangesplit
+      - name: SIMD catalog and replicated JSON
+        env:
+          GOEXPERIMENT: simd
+        run: >-
+          go test -short -count=1 -timeout=5m ./sql/driver
+          -run 'Test(Catalog|SQLCatalog|Replicated.*(JSON|Json|Catalog|Grammar|Scalar|Placement|Version))'
+      - name: Portable JSON and placement parity
+        env:
+          GOEXPERIMENT: nosimd
+        run: go test -short -count=1 -timeout=5m ./distribution ./internal/rangesplit ./sql/driver
       - name: Save Go build cache
         if: ${{ always() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4

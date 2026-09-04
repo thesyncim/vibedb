@@ -1,0 +1,70 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/internal/rangesplit
+cpu: Apple M4 Max
+BenchmarkPartitionRowsOnePass   	 1253774	       241.5 ns/op	 124.24 MB/s	       0 B/op	       0 allocs/op
+BenchmarkTranslateTailEntryMove 	  172333	      1652 ns/op	  36.32 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/internal/rangesplit
+cpu: Apple M4 Max
+BenchmarkPartitionRowsOnePass   	 1241461	       241.7 ns/op	 124.13 MB/s	       0 B/op	       0 allocs/op
+BenchmarkTranslateTailEntryMove 	  170478	      1652 ns/op	  36.32 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/internal/rangesplit
+cpu: Apple M4 Max
+BenchmarkPartitionRowsOnePass   	 1251054	       239.2 ns/op	 125.44 MB/s	       0 B/op	       0 allocs/op
+BenchmarkTranslateTailEntryMove 	  172038	      1648 ns/op	  36.42 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/internal/rangesplit
+cpu: Apple M4 Max
+BenchmarkPartitionRowsOnePass   	 1264272	       238.2 ns/op	 125.97 MB/s	       0 B/op	       0 allocs/op
+BenchmarkTranslateTailEntryMove 	  172502	      1646 ns/op	  36.44 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/internal/rangesplit
+cpu: Apple M4 Max
+BenchmarkPartitionRowsOnePass   	 1251068	       238.8 ns/op	 125.61 MB/s	       0 B/op	       0 allocs/op
+BenchmarkTranslateTailEntryMove 	  170587	      1648 ns/op	  36.40 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/internal/rangesplit
+cpu: Apple M4 Max
+BenchmarkPartitionRowsOnePass   	 1253860	       239.6 ns/op	 125.20 MB/s	       0 B/op	       0 allocs/op
+BenchmarkTranslateTailEntryMove 	  170316	      1646 ns/op	  36.46 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/internal/rangesplit
+cpu: Apple M4 Max
+BenchmarkPartitionRowsOnePass   	 1246773	       239.4 ns/op	 125.34 MB/s	       0 B/op	       0 allocs/op
+BenchmarkTranslateTailEntryMove 	  173078	      1653 ns/op	  36.30 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/internal/rangesplit
+cpu: Apple M4 Max
+BenchmarkPartitionRowsOnePass   	 1249339	       239.3 ns/op	 125.39 MB/s	       0 B/op	       0 allocs/op
+BenchmarkTranslateTailEntryMove 	  171816	      1653 ns/op	  36.29 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/internal/rangesplit
+cpu: Apple M4 Max
+BenchmarkPartitionRowsOnePass   	 1277784	       241.4 ns/op	 124.28 MB/s	       0 B/op	       0 allocs/op
+BenchmarkTranslateTailEntryMove 	  170937	      1654 ns/op	  36.27 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/internal/rangesplit
+cpu: Apple M4 Max
+BenchmarkPartitionRowsOnePass   	 1244913	       239.5 ns/op	 125.26 MB/s	       0 B/op	       0 allocs/op
+BenchmarkTranslateTailEntryMove 	  171014	      1654 ns/op	  36.27 MB/s	       0 B/op	       0 allocs/op
+PASS

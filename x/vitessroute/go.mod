@@ -5,7 +5,7 @@ go 1.27
 require (
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/thesyncim/vibedb v0.0.0
-	github.com/thesyncim/vibejson v0.0.0-20260730224651-50a62f7753df
+	github.com/thesyncim/vibejson v0.1.0
 	vitess.io/vitess v0.24.2
 )
 
