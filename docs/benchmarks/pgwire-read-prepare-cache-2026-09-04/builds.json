@@ -1,0 +1,14 @@
+{
+  "baseline_commit": "033a02392acd808c44d8a6086d632aac9d30cb90",
+  "baseline": {
+    "vibedb": "04b7954c8d39b68a3ba9fe67ee248a384794ff2cb185f8d5d51b1ff7b81cf479",
+    "vibedb-gateway": "1bb1968c9167eaa6fca4488b7d0c9610a5c07ef05801d498df422c891a0f6e55",
+    "vibedb-shard": "47d02d0b47cc6a9c3ebd46c64f238523290046c3a9c8047b8337c9183e31a6bc"
+  },
+  "candidate": {
+    "vibedb": "12635b118bb9fc05de433bfcbc5063c6761d0853d1b2b868e62b7d6d5738c969",
+    "vibedb-gateway": "39977325e8e93dc3b31e3952b65cdd369244d0eddeced27b8803435e05cf19d2",
+    "vibedb-shard": "55bf2c4b0b677f7d964cb02b7ced5f17ed256775c2479763e58a161de9852fea"
+  },
+  "toolchain": "go1.27.1 linux/arm64 GOEXPERIMENT=simd"
+}
