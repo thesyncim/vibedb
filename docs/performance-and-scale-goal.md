@@ -45,10 +45,10 @@ large fixed allocations and are insufficient for a space-efficiency claim.
 User clarification: pursue a substantially better architecture, with breaking
 changes allowed; competitor implementations are evidence, not the design target.
 
-1. Connect serving to asynchronous persistence, then shared node storage and
-   batching across ranges. The current startup/reload path adopts synchronous
-   runtimes despite existing pipelined and node-log primitives. Validate recovery
-   and dynamically added groups as part of the serving path.
+1. Connect serving to shared node storage and batching across ranges.
+   Asynchronous startup/reload is now integrated and passed the Linux shipped
+   crash/partition harness; node-log ownership is still not wired into the
+   command path. Validate recovery and dynamically added groups as part of it.
 2. Redesign committed/versioned read visibility so transactions need not block
    unrelated readers across a group. Retain serializable conflict validation.
 3. Reduce fixed per-range allocation and duplicate log/data amplification, with
@@ -60,5 +60,11 @@ changes allowed; competitor implementations are evidence, not the design target.
 The [adaptive read-admission comparison](benchmarks/crdb-sql-2026-09-04-reads/README.md)
 validated 120,000 more samples. C8 point hits: 10,200.5 ops/s; grouped scans:
 1,242.6. All workloads still trail CRDB. The regressed precursor is retained.
+
+The [asynchronous serving comparison](benchmarks/crdb-sql-2026-09-04-pipelined/README.md)
+validated another 120,000 samples: C8 updates 2,416.1 ops/s versus CRDB 4,149.6.
+Grouped-scan variance/regression is retained, not hidden. Diagnostic storage
+accounting found about 3 GiB reserved across twelve per-member WALs. See the
+[structural redesign target](storage-runtime-redesign.md).
 
 Status: **active; no acceptance gate is complete**.
