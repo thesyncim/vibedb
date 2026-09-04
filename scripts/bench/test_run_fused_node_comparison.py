@@ -1,3 +1,4 @@
+from contextlib import ExitStack
 import importlib.util
 import json
 from pathlib import Path
@@ -58,7 +59,7 @@ class FusedNodeRunnerTest(unittest.TestCase):
             with self.assertRaises(MODULE.RunnerError):
                 MODULE.resource_limits(quota, "24g")
 
-    def test_full_control_sequence_builds_once_before_both_orderings(self):
+    def run_mocked_control_sequence(self, include_crdb):
         events = []
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -79,25 +80,64 @@ class FusedNodeRunnerTest(unittest.TestCase):
                 self.assertTrue(schema.is_dir())
                 return {"status": "completed", "client_exit_code": 0, "errors": []}
             source = {"revision": "client", "status": "", "dirty": False, "patch": b"", "patch_sha256": "unused"}
-            with patch.object(MODULE, "docker_architecture", return_value="amd64"), \
-                    patch.object(MODULE, "docker_json", return_value={}), \
-                    patch.object(MODULE, "git_info", side_effect=lambda _: dict(source)), \
-                    patch.object(MODULE, "text_output", side_effect=[MODULE.PARENT_DEFAULT_REF, "candidate"]), \
-                    patch.object(MODULE, "prepare_worktrees", side_effect=prepare), \
-                    patch.object(MODULE, "build_all", side_effect=build), \
-                    patch.object(MODULE, "ensure_image", return_value={"Id": "sha256:runtime"}), \
-                    patch.object(MODULE, "run"), patch.object(MODULE, "cleanup_worktrees"), \
-                    patch.object(MODULE, "run_engine", side_effect=engine):
-                code = MODULE.main([str(destination), "--repo", str(root), "--client-source", str(root),
-                                    "--candidate-ref", "candidate", "--no-include-crdb"])
-            self.assertEqual(code, 0)
-            self.assertEqual(events, ["build", ("parent-first", "parent"), ("parent-first", "candidate"),
-                                      ("candidate-first", "candidate"), ("candidate-first", "parent")])
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(MODULE, "docker_architecture", return_value="amd64"))
+                stack.enter_context(patch.object(MODULE, "docker_json", return_value={}))
+                stack.enter_context(patch.object(MODULE, "git_info", side_effect=lambda _: dict(source)))
+                stack.enter_context(patch.object(MODULE, "text_output",
+                                                 side_effect=[MODULE.PARENT_DEFAULT_REF, "candidate"]))
+                stack.enter_context(patch.object(MODULE, "prepare_worktrees", side_effect=prepare))
+                stack.enter_context(patch.object(MODULE, "build_all", side_effect=build))
+                stack.enter_context(patch.object(MODULE, "ensure_image", return_value={"Id": "sha256:runtime"}))
+                stack.enter_context(patch.object(MODULE, "run"))
+                stack.enter_context(patch.object(MODULE, "cleanup_worktrees"))
+                stack.enter_context(patch.object(MODULE, "run_engine", side_effect=engine))
+                if include_crdb:
+                    stack.enter_context(patch.object(MODULE, "extract_crdb_binary", return_value=None))
+                invocation = [str(destination), "--repo", str(root), "--client-source", str(root),
+                              "--candidate-ref", "candidate"]
+                if not include_crdb:
+                    invocation.append("--no-include-crdb")
+                code = MODULE.main(invocation)
             manifest = json.loads((destination / "manifest.json").read_text())
-            self.assertEqual(len(manifest["planned_runs"]), len(manifest["runs"]))
-            self.assertEqual(manifest["promotion_gate"]["required_geomean_ratio"], 1.25)
-            self.assertEqual(manifest["promotion_gate"]["max_cell_throughput_regression"], .05)
-            self.assertEqual(manifest["promotion_gate"]["max_cell_p99_regression"], .10)
+            return code, events, manifest
+
+    def test_full_control_sequence_builds_once_before_both_orderings(self):
+        code, events, manifest = self.run_mocked_control_sequence(False)
+        self.assertEqual(code, 0)
+        self.assertEqual(events, ["build", ("parent-first", "parent"), ("parent-first", "candidate"),
+                                  ("candidate-first", "candidate"), ("candidate-first", "parent")])
+        self.assertEqual(manifest["engine_sequences"], {
+            "parent-first": ["parent", "candidate"],
+            "candidate-first": ["candidate", "parent"],
+        })
+        self.assertEqual(
+            [(run["order"], run["engine"]) for run in manifest["planned_runs"]],
+            [("parent-first", "parent"), ("parent-first", "candidate"),
+             ("candidate-first", "candidate"), ("candidate-first", "parent")],
+        )
+        self.assertEqual(len(manifest["planned_runs"]), len(manifest["runs"]))
+        self.assertEqual(manifest["promotion_gate"]["required_geomean_ratio"], 1.25)
+        self.assertEqual(manifest["promotion_gate"]["max_cell_throughput_regression"], .05)
+        self.assertEqual(manifest["promotion_gate"]["max_cell_p99_regression"], .10)
+        MODULE.COMMAND_LOG = None
+
+    def test_included_crdb_reverses_the_complete_engine_sequence(self):
+        code, events, manifest = self.run_mocked_control_sequence(True)
+        self.assertEqual(code, 0)
+        self.assertEqual(events, ["build", ("parent-first", "parent"), ("parent-first", "candidate"),
+                                  ("parent-first", "crdb"), ("candidate-first", "crdb"),
+                                  ("candidate-first", "candidate"), ("candidate-first", "parent")])
+        self.assertEqual(manifest["engine_sequences"], {
+            "parent-first": ["parent", "candidate", "crdb"],
+            "candidate-first": ["crdb", "candidate", "parent"],
+        })
+        self.assertEqual(
+            [(run["order"], run["engine"]) for run in manifest["planned_runs"]],
+            [("parent-first", "parent"), ("parent-first", "candidate"), ("parent-first", "crdb"),
+             ("candidate-first", "crdb"), ("candidate-first", "candidate"), ("candidate-first", "parent")],
+        )
+        self.assertEqual(len(manifest["planned_runs"]), len(manifest["runs"]))
         MODULE.COMMAND_LOG = None
 
     def test_all_matrix_contains_baseline_and_both_node_distributions(self):

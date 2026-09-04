@@ -46,10 +46,12 @@ python3 scripts/bench/run-fused-node-comparison.py /absolute/new/evidence \
   --vibedb-sql-ports 5432 --order both
 ```
 
-`--order both` runs parent then candidate, and candidate then parent, using fresh
-fixtures. CockroachDB follows the two VibeDB engines unless `--no-include-crdb`
-is requested. This balances parent/candidate order; CockroachDB's relative order
-is not balanced by this tranche runner. The baseline uses one SQL entrypoint
+`--order both` runs fresh fixtures in two exact engine sequences. With CRDB
+included, `parent-first` is `[parent, candidate, crdb]` and `candidate-first`
+is `[crdb, candidate, parent]`; without CRDB, the sequences are
+`[parent, candidate]` and `[candidate, parent]`. The labels describe the
+relative parent/candidate order, while the manifest records each exact sequence
+and the planned runs use that same sequence. The baseline uses one SQL entrypoint
 for every engine. Defaults are primary-key hit, primary-key miss, ordered 64-row
 range, 16-group aggregate and existing-row update; C1/C8; 8,192 rows; 20,000
 point/update operations; 2,000 range/group operations; 1,000 serial warmups before

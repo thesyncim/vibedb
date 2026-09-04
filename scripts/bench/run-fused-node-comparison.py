@@ -193,6 +193,17 @@ def parse_workloads(raw, name):
     return canonical
 
 
+def engines_for_order(order, include_crdb):
+    """Return the exact engine sequence for one recorded parent/candidate order."""
+    if order == "parent-first":
+        sequence = ["parent", "candidate"]
+        return sequence + (["crdb"] if include_crdb else [])
+    if order == "candidate-first":
+        sequence = ["candidate", "parent"]
+        return (["crdb"] if include_crdb else []) + sequence
+    raise RunnerError(f"unsupported engine order {order!r}")
+
+
 def table_names(count, prefix):
     if not valid_identifier(prefix):
         raise RunnerError(f"invalid table prefix {prefix!r}")
@@ -1126,6 +1137,7 @@ def main(argv=None):
             "credentials_in_evidence": False,
         },
         "orders": [],
+        "engine_sequences": {},
         "runs": [],
     }
     try:
@@ -1139,10 +1151,12 @@ def main(argv=None):
                   ["candidate-first"] if args.order == "candidate-first" else
                   ["parent-first", "candidate-first"])
         manifest["orders"] = orders
+        engine_sequences = {order: engines_for_order(order, args.include_crdb)
+                            for order in orders}
+        manifest["engine_sequences"] = engine_sequences
         manifest["planned_runs"] = [{"cell": cell["id"], "order": order, "engine": engine}
                                     for order in orders for cell in cells
-                                    for engine in ((["parent", "candidate"] if order == "parent-first" else ["candidate", "parent"]) +
-                                                   (["crdb"] if args.include_crdb else []))]
+                                    for engine in engine_sequences[order]]
         manifest["control_sha256"] = {}
         controls = destination / "controls"
         controls.mkdir(mode=0o700)
@@ -1189,11 +1203,8 @@ def main(argv=None):
                 manifest["binary_sha256"] = binary_hashes(bins)
                 write_json(destination / "manifest.json", manifest)
                 for order in orders:
-                    engine_order = ["parent", "candidate"] if order == "parent-first" else ["candidate", "parent"]
-                    if args.include_crdb:
-                        engine_order.append("crdb")
                     for cell in cells:
-                        for engine in engine_order:
+                        for engine in engine_sequences[order]:
                             run_dir = destination / cell["id"] / order / engine
                             schema = schema_files(run_dir, cell["tables"])
                             result = run_engine(args, cell, engine, order, bins, run_dir, schema, arch)
