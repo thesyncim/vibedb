@@ -263,7 +263,11 @@ type Database struct {
 	// before capturing its cut, then retains independently bounded histories per
 	// collection. This preserves lazy-collection correctness without allowing
 	// unrelated key churn to overflow another collection's exact history.
-	clockMu            sync.Mutex
+	// clockMu guards the serializable conflict clock. Validation
+	// (validateDependencies) only reads histories and takes it shared, so
+	// conflict checks on disjoint collections run in parallel; Begin/Finish
+	// publication takes it exclusively.
+	clockMu            sync.RWMutex
 	txnRevision        uint64
 	txnRevisionStopped bool
 	txnActive          map[uint64]txnActiveRevision
