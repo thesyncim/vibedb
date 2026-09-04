@@ -1804,6 +1804,7 @@ func TestCompactPrimaryScanDictionaryReservoirReprepareSameSlot(t *testing.T) {
 	}
 	got, ok := decoder.appendDictionaryFragment(nil, 0, 0)
 	want, wantOK := decoder.streamView[0].appendValue([]byte(`{"value":`)[:9], 0)
+	want = append(want, '}')
 	if !ok || !wantOK || !bytes.Equal(got, want) {
 		t.Fatalf("dictionary after reprepare=%q,%v want=%q,%v", got, ok, want, wantOK)
 	}
