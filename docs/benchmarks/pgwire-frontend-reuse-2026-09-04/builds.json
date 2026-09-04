@@ -1,0 +1,35 @@
+{
+  "toolchain": "go1.27.1 linux/arm64",
+  "goexperiment": "simd",
+  "primary_latest_main": {
+    "baseline_commit": "d9828e9b",
+    "candidate_source_commit": "91bcc8e7",
+    "baseline": {
+      "vibedb": "408386964dc7ad0f23f42f236e70b067e18bce6c505cd6d6abf7e56def9122b8",
+      "vibedb-gateway": "bef983cacd90c191648c0805ab87bed724eaea362d892528f022a0e22f50dad3",
+      "vibedb-shard": "150f6feca3a411156374fc501eeedeab404608544e1aac62dce39cc06b2456b4"
+    },
+    "candidate": {
+      "vibedb": "6875c4783a80595c9c392444df3c08429f224bef609c8895f05836871f49e293",
+      "vibedb-gateway": "72182e844c903cac5f98d2528087a65bdcadb825464d19667c7fbbe3e6243586",
+      "vibedb-shard": "90b078a44c8656e0d66f4d5c500b96236e41ad77812f8958247cba5c19c2d144"
+    }
+  },
+  "earlier_pair": {
+    "baseline_commit": "6cb255c0",
+    "baseline": {
+      "vibedb": "1bd7f2302e8b20139579af917440ad0129860e4bbfb96c949aa78bff8d348451",
+      "vibedb-gateway": "b927296c132dd540740b86c0b69fc3f17eea2116cfb102087b77df935d22f2d3",
+      "vibedb-shard": "a6b783520564d7520d4db92e0afe40aa39473aa1e155ed11e7ee548619f63dfc"
+    },
+    "candidate": {
+      "vibedb": "ccc454b77e2fdc81824ac0c84767254e9006eb14c024c7ff304a33b69cc2342e",
+      "vibedb-gateway": "69d01bd49337cd5631296c27ac881402e7fbbbd306ac402f6b8a020acd071021",
+      "vibedb-shard": "392468822109ecc8b9b6f0364e9fe812454d21b74c18ee5fa773029d89767d8b"
+    }
+  },
+  "harness": {
+    "rf3-sqlbench": "91749167418edde105ec8af659f0a3e88c752e596ed7cdf134300bbede6e1e14",
+    "seed-resume": "da435844887576d6825d16debdc5bd051a988abcd09893444c525bcf61d189f0"
+  }
+}
