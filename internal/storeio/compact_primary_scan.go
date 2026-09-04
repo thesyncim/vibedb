@@ -12,12 +12,13 @@ const (
 	// Dictionary boundaries are decoded once per leaf into one shared bounded
 	// pool. A stream that would overflow the pool simply keeps the admitted
 	// random-rank decoder; other streams in the leaf still specialize.
-	compactPrimaryScanDictionaryBounds = 512
+	compactPrimaryScanDictionaryBounds = 1024
 	// Dictionary fragments combine the static bytes preceding a hole with each
 	// dictionary spelling. Adjacent low-cardinality dictionaries may share one
 	// Cartesian fragment table. Keep a bounded power-of-two pool and let unusual
 	// leaves fall back per stream.
-	compactPrimaryScanDictionaryFragmentBytes = 8 << 10
+	compactPrimaryScanDictionaryFragmentBytes = 16 << 10
+	compactPrimaryScanDictionaryPairLimit     = 64
 	compactPrimaryScanDictionaryPair          = uint16(1 << 15)
 	compactPrimaryScanDictionaryCountMask     = compactPrimaryScanDictionaryPair - 1
 )
@@ -130,6 +131,51 @@ func (d *CompactPrimaryScanDecoder) prepare(
 				prefixStart = meta.ends[hole-1]
 			}
 			prefixEnd := meta.ends[hole]
+			if stream.kind == compactStreamDictionary && stream.dictCount > 0 &&
+				hole+1 < entry.template.holes {
+				next := &d.streamView[streamAt+1]
+				pairCount := stream.dictCount * next.dictCount
+				pairEnd := meta.ends[hole+1]
+				fragmentBytes := int(pairEnd-prefixStart)*pairCount +
+					len(stream.dictData)*next.dictCount +
+					len(next.dictData)*stream.dictCount
+				if next.kind == compactStreamDictionary && next.dictCount > 0 &&
+					pairCount <= compactPrimaryScanDictionaryPairLimit &&
+					pairCount+1 <= len(d.dictionary)-dictionaryCount &&
+					fragmentBytes <= len(d.fragments)-fragmentCount {
+					plan := &d.streamPlan[streamAt]
+					plan.dictionaryFirst = uint16(dictionaryCount)
+					plan.dictionaryCount = compactPrimaryScanDictionaryPair | uint16(pairCount)
+					d.dictionary[dictionaryCount] = uint16(fragmentCount)
+					firstStart := 0
+					for firstID := 0; firstID < stream.dictCount; firstID++ {
+						firstEnd := int(binary.LittleEndian.Uint16(stream.dictDir[firstID*2:]))
+						secondStart := 0
+						for secondID := 0; secondID < next.dictCount; secondID++ {
+							secondEnd := int(binary.LittleEndian.Uint16(next.dictDir[secondID*2:]))
+							fragmentCount += copy(
+								d.fragments[fragmentCount:], meta.static[prefixStart:prefixEnd],
+							)
+							fragmentCount += copy(
+								d.fragments[fragmentCount:], stream.dictData[firstStart:firstEnd],
+							)
+							fragmentCount += copy(
+								d.fragments[fragmentCount:], meta.static[prefixEnd:pairEnd],
+							)
+							fragmentCount += copy(
+								d.fragments[fragmentCount:], next.dictData[secondStart:secondEnd],
+							)
+							d.dictionary[dictionaryCount+firstID*next.dictCount+secondID+1] =
+								uint16(fragmentCount)
+							secondStart = secondEnd
+						}
+						firstStart = firstEnd
+					}
+					dictionaryCount += pairCount + 1
+					hole++
+					continue
+				}
+			}
 			prefixBytes := int(prefixEnd - prefixStart)
 			fragmentBytes := prefixBytes*stream.dictCount + len(stream.dictData)
 			if stream.kind == compactStreamDictionary &&
@@ -153,14 +199,6 @@ func (d *CompactPrimaryScanDecoder) prepare(
 					dictionaryStart = dictionaryEnd
 				}
 				dictionaryCount += stream.dictCount + 1
-			}
-		}
-		for hole := 0; hole+1 < entry.template.holes; hole++ {
-			first := &d.streamPlan[streamCount+hole]
-			second := &d.streamPlan[streamCount+hole+1]
-			if first.dictionaryCount != 0 && second.dictionaryCount != 0 {
-				first.dictionaryCount |= compactPrimaryScanDictionaryPair
-				hole++
 			}
 		}
 		streamCount += entry.template.holes
@@ -317,27 +355,21 @@ func (d *CompactPrimaryScanDecoder) appendDictionaryPairFragment(
 		s.next++
 		ids[lane] = id
 	}
-	firstPlan := d.streamPlan[streamAt]
-	secondPlan := d.streamPlan[streamAt+1]
-	firstCount := int(firstPlan.dictionaryCount & compactPrimaryScanDictionaryCountMask)
-	secondCount := int(secondPlan.dictionaryCount)
-	if firstCount != d.streamView[streamAt].dictCount ||
-		secondCount != d.streamView[streamAt+1].dictCount {
+	plan := d.streamPlan[streamAt]
+	count := int(plan.dictionaryCount & compactPrimaryScanDictionaryCountMask)
+	secondCount := d.streamView[streamAt+1].dictCount
+	fragment := ids[0]*secondCount + ids[1]
+	first := int(plan.dictionaryFirst)
+	last := first + count + 1
+	if count != d.streamView[streamAt].dictCount*secondCount ||
+		last > len(d.dictionary) || fragment >= count {
 		return dst, false
 	}
-	first := int(firstPlan.dictionaryFirst) + ids[0]
-	second := int(secondPlan.dictionaryFirst) + ids[1]
-	if first+1 >= len(d.dictionary) || second+1 >= len(d.dictionary) {
+	start, end := int(d.dictionary[first+fragment]), int(d.dictionary[first+fragment+1])
+	if end < start || end > len(d.fragments) {
 		return dst, false
 	}
-	firstStart, firstEnd := int(d.dictionary[first]), int(d.dictionary[first+1])
-	secondStart, secondEnd := int(d.dictionary[second]), int(d.dictionary[second+1])
-	if firstEnd < firstStart || secondEnd < secondStart ||
-		firstEnd > len(d.fragments) || secondEnd > len(d.fragments) {
-		return dst, false
-	}
-	dst = append(dst, d.fragments[firstStart:firstEnd]...)
-	return append(dst, d.fragments[secondStart:secondEnd]...), true
+	return append(dst, d.fragments[start:end]...), true
 }
 
 func (d *CompactPrimaryScanDecoder) appendDictionaryFragment(

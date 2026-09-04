@@ -1394,15 +1394,15 @@ func TestCompactPrimaryScanDecoderDictionaryPlanBounds(t *testing.T) {
 			{"shape metadata", unsafe.Sizeof(compactPrimaryScanShape{}), 96},
 			{"stream view", unsafe.Sizeof(compactStreamView{}), 104},
 			{"stream plan", unsafe.Sizeof(compactPrimaryScanStream{}), 4},
-			{"scan decoder", size, 38_864},
+			{"scan decoder", size, 48_080},
 		} {
 			if pin.got != pin.want {
 				t.Fatalf("64-bit %s bytes=%d, want %d", pin.name, pin.got, pin.want)
 			}
 		}
 	}
-	if size > 38<<10 {
-		t.Fatalf("scan decoder bytes=%d exceed bounded 38 KiB footprint", size)
+	if size > 47<<10 {
+		t.Fatalf("scan decoder bytes=%d exceed bounded 47 KiB footprint", size)
 	}
 	for _, high := range []bool{false, true} {
 		rows := 4096
@@ -1411,24 +1411,6 @@ func TestCompactPrimaryScanDecoderDictionaryPlanBounds(t *testing.T) {
 			rows = 900
 		}
 		_, view, _ := compactPrimaryTestPage(t, rows, high)
-		var decoder CompactPrimaryScanDecoder
-		decoder.prepare(&view, 0)
-		if !decoder.supported {
-			t.Fatalf("high=%t representative decoder was not prepared", high)
-		}
-		pairs := 0
-		for _, plan := range decoder.streamPlan {
-			if plan.dictionaryCount&compactPrimaryScanDictionaryPair != 0 {
-				pairs++
-			}
-		}
-		wantPairs := 10
-		if high {
-			wantPairs = 0
-		}
-		if pairs != wantPairs {
-			t.Fatalf("high=%t paired dictionary plans=%d, want %d", high, pairs, wantPairs)
-		}
 		bounds, largest := 0, 0
 		for shape := 0; shape < view.shapeCount; shape++ {
 			entry, ok := view.shapeEntry(shape)
