@@ -14,8 +14,9 @@ const (
 	// random-rank decoder; other streams in the leaf still specialize.
 	compactPrimaryScanDictionaryBounds = 1024
 	// Dictionary fragments combine the static bytes preceding a hole with each
-	// dictionary spelling. The common 4K-row shape set needs 6,717 bytes; keep a
-	// bounded power-of-two pool and let unusual leaves fall back per stream.
+	// dictionary spelling. Adjacent low-cardinality dictionaries may share one
+	// Cartesian fragment table. Keep a bounded power-of-two pool and let unusual
+	// leaves fall back per stream.
 	compactPrimaryScanDictionaryFragmentBytes = 16 << 10
 	compactPrimaryScanDictionaryPairLimit     = 64
 	compactPrimaryScanDictionaryPair          = uint16(1 << 15)
@@ -316,8 +317,6 @@ func (d *CompactPrimaryScanDecoder) appendDictionaryPairFragment(
 	streamAt int,
 	row int,
 ) ([]byte, bool) {
-	firstState := d.streams[streamAt]
-	secondState := d.streams[streamAt+1]
 	ids := [2]int{}
 	for lane := 0; lane < 2; lane++ {
 		v := &d.streamView[streamAt+lane]
@@ -327,8 +326,6 @@ func (d *CompactPrimaryScanDecoder) appendDictionaryPairFragment(
 		}
 		if v.kind != compactStreamDictionary || row < 0 || row >= v.count ||
 			row != s.next || v.dictCount <= 0 || v.width > 16 {
-			d.streams[streamAt] = firstState
-			d.streams[streamAt+1] = secondState
 			return dst, false
 		}
 		width := int(v.width)
@@ -337,8 +334,6 @@ func (d *CompactPrimaryScanDecoder) appendDictionaryPairFragment(
 		cursor := s.cursor
 		for available < width {
 			if cursor >= len(v.data) {
-				d.streams[streamAt] = firstState
-				d.streams[streamAt+1] = secondState
 				return dst, false
 			}
 			reservoir |= uint64(v.data[cursor]) << uint(available)
@@ -350,8 +345,6 @@ func (d *CompactPrimaryScanDecoder) appendDictionaryPairFragment(
 			id = int(reservoir & (uint64(1)<<uint(width) - 1))
 		}
 		if id < 0 || id >= v.dictCount {
-			d.streams[streamAt] = firstState
-			d.streams[streamAt+1] = secondState
 			return dst, false
 		}
 		reservoir >>= uint(width)
@@ -370,14 +363,10 @@ func (d *CompactPrimaryScanDecoder) appendDictionaryPairFragment(
 	last := first + count + 1
 	if count != d.streamView[streamAt].dictCount*secondCount ||
 		last > len(d.dictionary) || fragment >= count {
-		d.streams[streamAt] = firstState
-		d.streams[streamAt+1] = secondState
 		return dst, false
 	}
 	start, end := int(d.dictionary[first+fragment]), int(d.dictionary[first+fragment+1])
 	if end < start || end > len(d.fragments) {
-		d.streams[streamAt] = firstState
-		d.streams[streamAt+1] = secondState
 		return dst, false
 	}
 	return append(dst, d.fragments[start:end]...), true
