@@ -1,0 +1,8 @@
+Base (current main de6c448dc75838fbfa1b9ec63875ca8b0769190a):
+GOTOOLCHAIN=go1.27.0 GOEXPERIMENT=simd go test -count=5 -run '^$' -bench '^BenchmarkFilePackedIntegerInterval(Count|CountWide)$' -benchtime=200ms -benchmem ./query
+
+Candidate (39093608066794b932f9b1b93281e4ff129b894b):
+GOTOOLCHAIN=go1.27.0 GOEXPERIMENT=simd VIBEDB_EXPECT_INTERVAL=1 go test -count=5 -run '^$' -bench '^BenchmarkFilePackedIntegerInterval(Count|CountWide)$' -benchtime=200ms -benchmem ./query
+
+Candidate portable fallback:
+GOTOOLCHAIN=go1.27.0 GOEXPERIMENT=nosimd VIBEDB_EXPECT_INTERVAL=1 go test -count=5 -run '^$' -bench '^BenchmarkFilePackedIntegerInterval(Count|CountWide)$' -benchtime=200ms -benchmem ./query
