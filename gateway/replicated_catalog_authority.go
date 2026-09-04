@@ -920,7 +920,28 @@ func (authority *ReplicatedCatalogAuthority) Publish(
 	if err = authority.observePublishedCatalog(next); err != nil {
 		return err
 	}
-	return authority.holder.PublishAfter(expectedGeneration, next)
+	return authority.publishCommittedCatalogAfter(expectedGeneration, next)
+}
+
+func (authority *ReplicatedCatalogAuthority) publishCommittedCatalogAfter(
+	expectedGeneration uint64, next *Snapshot,
+) error {
+	err := authority.holder.PublishAfter(expectedGeneration, next)
+	if err == nil || !errors.Is(err, ErrCatalogGenerationMismatch) {
+		return err
+	}
+	current := authority.holder.Current()
+	if current == nil || next == nil || current.Generation() != next.Generation() {
+		return err
+	}
+	equal, compareErr := equalCatalogSnapshots(current, next)
+	if compareErr != nil {
+		return errors.Join(err, compareErr)
+	}
+	if equal {
+		return nil
+	}
+	return err
 }
 
 // RetryPending resends only the session-owned byte-identical command after an
@@ -992,7 +1013,7 @@ func (authority *ReplicatedCatalogAuthority) RetryPending(ctx context.Context) e
 				expected, published, grant,
 			)
 		} else {
-			err = authority.holder.PublishAfter(expected, published)
+			err = authority.publishCommittedCatalogAfter(expected, published)
 		}
 		return err
 	}
