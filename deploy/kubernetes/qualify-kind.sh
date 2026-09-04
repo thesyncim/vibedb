@@ -30,6 +30,26 @@ start_port_forward() {
   port_forward_pid=$!
 }
 
+wait_for_rollouts() {
+  local phase=$1
+  local failed=0
+  local index role
+  local -a roles=(catalog ledger data gateway)
+  local -a pids=()
+  for role in "${roles[@]}"; do
+    kubectl rollout status -n "${namespace}" "statefulset/vibedb-${role}" --timeout=10m \
+      2>&1 | tee "${evidence_dir}/${phase}-${role}.log" &
+    pids+=("$!")
+  done
+  for index in "${!pids[@]}"; do
+    if ! wait "${pids[index]}"; then
+      printf '%s rollout failed for %s\n' "${phase}" "${roles[index]}" >&2
+      failed=1
+    fi
+  done
+  return "${failed}"
+}
+
 collect_failure_evidence() {
     # Preserve bounded pod/init diagnostics before deleting this test cluster.
     timeout --kill-after=1s 10s kubectl --request-timeout=5s get pods -n "${namespace}" -o wide \
@@ -117,9 +137,7 @@ kubectl apply --dry-run=client --validate=false -f "${topology_yaml}" >/dev/null
 kubectl create namespace "${namespace}"
 kubectl apply -f "${bootstrap_yaml}"
 kubectl apply -f "${topology_yaml}"
-for role in catalog ledger data gateway; do
-  kubectl rollout status -n "${namespace}" "statefulset/vibedb-${role}" --timeout=10m
-done
+wait_for_rollouts initial
 kubectl exec -n "${namespace}" vibedb-gateway-0 -- \
   vibedb-kube-qualify dns -namespace "${namespace}" -timeout 60s \
   | tee "${evidence_dir}/dns.vibejson"
@@ -144,12 +162,13 @@ start_port_forward
   -samples 128 -max-p99 1s -max-latency 5s \
   | tee "${evidence_dir}/before-restart.vibejson"
 
-# Exercise every ordinal, including whichever member currently leads, while
-# StatefulSet readiness keeps each RF3 group from voluntarily losing quorum.
+# Exercise every ordinal, including whichever member currently leads. Each
+# StatefulSet still replaces its own pods in order and waits for readiness;
+# independent RF3 roles can make progress at the same time.
 for role in catalog ledger data gateway; do
   kubectl rollout restart -n "${namespace}" "statefulset/vibedb-${role}"
-  kubectl rollout status -n "${namespace}" "statefulset/vibedb-${role}" --timeout=10m
 done
+wait_for_rollouts restart
 start_port_forward
 
 "${work_dir}/vibedb-kube-qualify" verify \
