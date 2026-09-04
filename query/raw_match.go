@@ -78,22 +78,10 @@ func rawTopLevelScalarMatch(
 // decoded name. A one-token JSON pointer is equally cheap when it contains no
 // escape: the bytes after the slash are the decoded member name verbatim.
 func rawTopLevelPathName(path compiledPath) (string, bool) {
-	if path.join != joinPathOuter {
+	if path.join != joinPathOuter || !path.topLevel {
 		return "", false
 	}
-	if path.single {
-		return path.name, true
-	}
-	pointer := path.pointer.String()
-	if len(pointer) < 2 || pointer[0] != '/' {
-		return "", false
-	}
-	for i := 1; i < len(pointer); i++ {
-		if pointer[i] == '/' || pointer[i] == '~' {
-			return "", false
-		}
-	}
-	return pointer[1:], true
+	return path.name, true
 }
 
 // rawTopLevelScalars extracts one row of simple top-level paths from a
@@ -139,10 +127,32 @@ func rawTopLevelScalars(
 			return false
 		}
 		key := src[keyStart+1 : keyEnd-1]
-		for col, path := range paths {
-			name, supported := rawTopLevelPathName(path)
-			if supported && rawEqualString(key, name) {
-				dst[col][row] = vibejson.RawValue{Src: src[valueStart:valueEnd]}
+		value := vibejson.RawValue{Src: src[valueStart:valueEnd]}
+		switch len(paths) {
+		case 1:
+			if rawEqualString(key, paths[0].name) {
+				dst[0][row] = value
+			}
+		case 2:
+			if rawEqualString(key, paths[0].name) {
+				dst[0][row] = value
+			} else if rawEqualString(key, paths[1].name) {
+				dst[1][row] = value
+			}
+		case 3:
+			if rawEqualString(key, paths[0].name) {
+				dst[0][row] = value
+			} else if rawEqualString(key, paths[1].name) {
+				dst[1][row] = value
+			} else if rawEqualString(key, paths[2].name) {
+				dst[2][row] = value
+			}
+		default:
+			for col := range paths {
+				if rawEqualString(key, paths[col].name) {
+					dst[col][row] = value
+					break
+				}
 			}
 		}
 		i = rawSkipSpace(src, valueEnd)

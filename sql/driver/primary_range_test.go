@@ -38,14 +38,43 @@ func TestPrimaryRangeBindingReusesByteArena(t *testing.T) {
 	}
 }
 
+func TestPrimaryRangePredicateCoverage(t *testing.T) {
+	connection := directTestConn(t).(*conn)
+	directExec(t, connection, `CREATE TABLE docs (id STRING PRIMARY KEY, kind STRING)`, nil)
+	for _, test := range []struct {
+		sql  string
+		want bool
+	}{
+		{`SELECT id FROM docs WHERE id >= ? ORDER BY id LIMIT 32`, true},
+		{`SELECT id FROM docs WHERE id > ? AND id <= ? ORDER BY id LIMIT 32`, true},
+		{`SELECT id FROM docs WHERE id >= ? AND kind = 'keep' ORDER BY id LIMIT 32`, false},
+	} {
+		statement, err := connection.Prepare(test.sql)
+		if err != nil {
+			t.Fatal(err)
+		}
+		prepared := statement.(*stmt)
+		if prepared.primaryRange == nil || prepared.primaryRange.coversPredicate != test.want {
+			t.Errorf("coverage for %q = %+v, want %t", test.sql, prepared.primaryRange, test.want)
+		}
+		if err := statement.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestPrimaryRangePredicatesSeekDurableOrderedGraph(t *testing.T) {
 	db := openTestDB(t)
 	if _, err := db.Exec(`CREATE TABLE docs (id STRING PRIMARY KEY, kind STRING)`); err != nil {
 		t.Fatal(err)
 	}
 	for _, id := range []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"} {
+		kind := "keep"
+		if id == "e" {
+			kind = "drop"
+		}
 		if _, err := db.Exec(
-			`INSERT INTO docs (id, kind) VALUES (?, ?)`, id, "keep",
+			`INSERT INTO docs (id, kind) VALUES (?, ?)`, id, kind,
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -62,7 +91,7 @@ func TestPrimaryRangePredicatesSeekDurableOrderedGraph(t *testing.T) {
 		{
 			name: "between under conjunction",
 			sql:  `SELECT id FROM docs WHERE kind = 'keep' AND id BETWEEN ? AND ? ORDER BY id`,
-			args: []any{"d", "f"}, want: []string{"d", "e", "f"},
+			args: []any{"d", "f"}, want: []string{"d", "f"},
 		},
 		{
 			name: "exclusive",
@@ -140,11 +169,11 @@ func TestPrimaryRangePredicatesSeekDurableOrderedGraph(t *testing.T) {
 	for _, want := range []string{
 		`"actual_access_path":"primary-key-range"`,
 		`"rows_total":10`,
-		`"rows_scanned":3`,
+		`"rows_scanned":2`,
 		`"primary_range_bounded":true`,
 		`"index_bounded":true`,
 		`"index_lookups":1`,
-		`"candidate_rows":3`,
+		`"candidate_rows":2`,
 	} {
 		if !strings.Contains(plan, want) {
 			t.Errorf("EXPLAIN ANALYZE missing %s: %s", want, plan)

@@ -28,7 +28,9 @@ type fileSmallScan struct {
 	stats   ExecStats
 	opts    normalizedFileOptions
 	batch   fileBatch
+	cells   []Cell
 	ordered bool
+	covered bool
 	payload int64
 }
 
@@ -38,7 +40,8 @@ func (p *plan) runFileSmall(e *Exec, snapshot *durable.Snapshot, span *FileRange
 		e.file.small.row = e.file.small.appendRow
 	}
 	s := e.file.small
-	s.p, s.e, s.stats, s.opts, s.ordered, s.payload = p, e, *stats, opts, ordered, 0
+	s.p, s.e, s.stats, s.opts, s.ordered, s.covered, s.payload = p, e, *stats, opts, ordered,
+		ordered && span != nil && span.predicatePath != "" && span.predicatePath == span.orderedPath, 0
 	s.work.heapWorkParent = &e.Workspace.heapWorkBudget
 	s.work.heapWorkTextReserved = 0
 	s.work.cancel = e.Options.Cancel
@@ -50,6 +53,7 @@ func (p *plan) runFileSmall(e *Exec, snapshot *durable.Snapshot, span *FileRange
 	defer func() {
 		s.slots[0].batch = s.batch
 		clear(s.arena.heads) // borrowed batch values must not retain old arenas
+		clear(s.cells)
 		*stats = s.stats
 		s.p, s.e = nil, nil
 		s.work.heapWorkParent = nil
@@ -108,7 +112,7 @@ func (p *plan) runValidatedRawInto(e *Exec, raw []byte) error {
 		return p.runInto(&e.Result, docs, &e.Workspace, e.Options.Workers)
 	}
 	s := e.file.small
-	s.p, s.e, s.stats, s.opts, s.ordered, s.payload = p, e, ExecStats{}, normalizedFileOptions{}, false, 0
+	s.p, s.e, s.stats, s.opts, s.ordered, s.covered, s.payload = p, e, ExecStats{}, normalizedFileOptions{}, false, false, 0
 	s.work.heapWorkParent = &e.Workspace.heapWorkBudget
 	s.work.heapWorkTextReserved = 0
 	s.work.cancel = e.Options.Cancel
@@ -174,9 +178,27 @@ func (s *fileSmallScan) flush() error {
 	}
 	clear(s.arena.heads)
 	s.arena.rewind()
+	if s.ordered {
+		bytes, handled, stopped, err := s.p.appendFileRawOrderedResult(
+			&s.e.Result, s.batch, &s.work, s.covered, &s.payload, &s.cells,
+		)
+		if handled {
+			s.stats.Batches++
+			s.stats.BufferedBytes = max(s.stats.BufferedBytes, bytes)
+			s.batch.base += uint64(len(s.batch.ends))
+			s.batch.data, s.batch.ends, s.batch.bytes = s.batch.data[:0], s.batch.ends[:0], 0
+			if stopped && err == nil {
+				return errFileExecutionStopped
+			}
+			return err
+		}
+	}
 	mode := filePartialBorrowed
 	if s.ordered {
 		mode = filePartialOrdered
+		if s.covered {
+			mode = filePartialOrderedCovered
+		}
 	}
 	part := s.p.makeFilePartial(s.batch, &s.work, &s.docs, s.slots[:], &s.arena, &s.e.Workspace.aggregateBudget, mode)
 	s.stats.Batches++
@@ -221,6 +243,159 @@ func (s *fileSmallScan) flush() error {
 	return nil
 }
 
+// appendFileRawOrderedResult materializes a validated primary-order batch
+// straight from classified columns into the retained Result. All documents are
+// parsed before the first cell is published, so a complex JSON shape can still
+// decline to the structural executor without exposing partial output. This
+// removes the intermediate fileRow header arena and its second scalar walk from
+// the latency-sensitive 32/64/256-row path.
+func (p *plan) appendFileRawOrderedResult(
+	result *Result,
+	batch fileBatch,
+	w *Workspace,
+	predicateCovered bool,
+	payload *int64,
+	cells *[]Cell,
+) (retained int64, handled, stopped bool, err error) {
+	if predicateCovered {
+		return p.appendFileRawCoveredResult(result, batch, w, payload, cells)
+	}
+	ctx, selected, complete, err := p.prepareFileRawRows(batch, w, predicateCovered)
+	if !complete {
+		return 0, false, false, nil
+	}
+	if err != nil {
+		return 0, true, false, err
+	}
+	for at, row := range selected {
+		if err := cancellationCheckpoint(w.cancel, at); err != nil {
+			return retained, true, false, err
+		}
+		rowPayload := int64(0)
+		rowRetained := int64(fileRowStructBytes)
+		for col := range p.columns {
+			value := scalar{}
+			if p.columns[col].value >= 0 {
+				value = ctx.values[p.columns[col].value][row]
+			}
+			add := resultCellPayloadBytes(cellFromScalar(value))
+			if add < 0 || rowPayload > int64(^uint64(0)>>1)-add {
+				return retained, true, false,
+					result.resultByteBudgetError(result.RowCount+1, int64(^uint64(0)>>1))
+			}
+			rowPayload += add
+			rowRetained = saturatedBytes(rowRetained, scalarBytes(value))
+		}
+		nextPayload := saturatedBytes(*payload, rowPayload)
+		required, err := result.checkResultBudget(
+			len(p.columns), result.RowCount+1, nextPayload,
+		)
+		if err != nil {
+			return retained, true, false, err
+		}
+		result.resultBytesUsed = required
+		for col := range p.columns {
+			value := scalar{}
+			if p.columns[col].value >= 0 {
+				value = ctx.values[p.columns[col].value][row]
+			}
+			cell := result.ownFileCell(cellFromScalar(value))
+			result.Columns[col].Cells = append(result.Columns[col].Cells, cell)
+		}
+		*payload = nextPayload
+		retained = saturatedBytes(retained, rowRetained)
+		result.RowCount++
+		if result.RowCount == p.limit {
+			return retained, true, true, nil
+		}
+	}
+	return retained, true, false, nil
+}
+
+// appendFileRawCoveredResult projects a batch whose native primary bounds
+// already prove the complete predicate. It classifies only the values returned
+// to the client and immediately copies each cell into Result ownership, instead
+// of building full scalar columns for a predicate that will not run.
+func (p *plan) appendFileRawCoveredResult(
+	result *Result,
+	batch fileBatch,
+	w *Workspace,
+	payload *int64,
+	cells *[]Cell,
+) (retained int64, handled, stopped bool, err error) {
+	_, complete, err := p.extractFileRawColumns(batch, w)
+	if !complete {
+		return 0, false, false, nil
+	}
+	if err != nil {
+		return 0, true, false, err
+	}
+	textNeed := 0
+	for _, column := range p.columns {
+		if column.value < 0 {
+			continue
+		}
+		need, err := escapedTextBytesCancelable(w.raws[column.value], w.cancel)
+		if err != nil {
+			return 0, true, false, err
+		}
+		textNeed += need
+	}
+	if err := w.admitDecodedText(textNeed); err != nil {
+		return 0, true, false, err
+	}
+	w.text = w.text[:0]
+	if cap(w.text) < textNeed {
+		w.text = make([]byte, 0, growCap(cap(w.text), textNeed))
+	}
+	rowCells := resize((*cells)[:0], len(p.columns))
+	*cells = rowCells
+	defer clear(rowCells)
+	for row := range batch.ends {
+		if err := cancellationCheckpoint(w.cancel, row); err != nil {
+			return retained, true, false, err
+		}
+		rowPayload := int64(0)
+		for col, column := range p.columns {
+			value := scalar{kind: kindNull}
+			if column.value >= 0 {
+				value = classifyRawInto(w.raws[column.value][row], &w.text)
+			}
+			cell := cellFromScalar(value)
+			add := resultCellPayloadBytes(cell)
+			if add < 0 || rowPayload > int64(^uint64(0)>>1)-add {
+				return retained, true, false,
+					result.resultByteBudgetError(result.RowCount+1, int64(^uint64(0)>>1))
+			}
+			rowPayload += add
+			rowCells[col] = cell
+		}
+		nextPayload := saturatedBytes(*payload, rowPayload)
+		required, err := result.checkResultBudget(
+			len(p.columns), result.RowCount+1, nextPayload,
+		)
+		if err != nil {
+			return retained, true, false, err
+		}
+		result.resultBytesUsed = required
+		for col, cell := range rowCells {
+			result.Columns[col].Cells = append(
+				result.Columns[col].Cells, result.ownFileCell(cell),
+			)
+		}
+		*payload = nextPayload
+		retained = saturatedBytes(
+			retained,
+			int64(fileRowStructBytes+len(p.columns)*scalarStructBytes)+rowPayload,
+		)
+		result.RowCount++
+		if result.RowCount == p.limit {
+			return retained, true, true, nil
+		}
+	}
+	return retained, true, false, nil
+}
+
 // makeFileRawRowsPartial runs the synchronous small-page lane directly over
 // validated JSON bytes when every referenced path is one top-level member. It
 // preserves the complete compiled predicate; only the temporary Segment and
@@ -235,36 +410,33 @@ func (p *plan) makeFileRawRowsPartial(
 	mode filePartialMode,
 ) (filePartial, bool) {
 	part := filePartial{seq: batch.seq}
-	if len(p.valuePaths) == 0 {
+	ctx, selected, complete, err := p.prepareFileRawRows(
+		batch, w, mode == filePartialOrderedCovered,
+	)
+	if !complete {
 		return part, false
 	}
-	for _, path := range p.valuePaths {
-		if _, ok := rawTopLevelPathName(path); !ok {
-			return part, false
-		}
+	if err != nil {
+		part.err = err
+		return part, true
 	}
+	return p.makeFileRowsPartial(part, selected, ctx, batch, slot, arena, mode, w), true
+}
 
+// prepareFileRawRows extracts and classifies a synchronous validated batch.
+// It performs all fallible shape checks before a caller publishes any cells,
+// which lets the ordered result lane materialize directly without losing the
+// ordinary Segment fallback for uncommon JSON shapes.
+func (p *plan) prepareFileRawRows(
+	batch fileBatch,
+	w *Workspace,
+	predicateCovered bool,
+) (*execCtx, []int, bool, error) {
+	ctx, complete, err := p.extractFileRawColumns(batch, w)
+	if !complete || err != nil {
+		return nil, nil, complete, err
+	}
 	rows := len(batch.ends)
-	w.raws = resize(w.raws, len(p.valuePaths))
-	for col := range p.valuePaths {
-		raws := resize(w.raws[col], rows)
-		clear(raws)
-		w.raws[col] = raws
-	}
-	start := 0
-	for row, end := range batch.ends {
-		if err := cancellationCheckpoint(w.cancel, row); err != nil {
-			part.err = err
-			return part, true
-		}
-		if !rawTopLevelScalars(batch.data[start:end], p.valuePaths, w.raws, row) {
-			return filePartial{}, false
-		}
-		start = end
-	}
-
-	ctx := &w.ctx
-	ctx.s, ctx.rows = nil, rows
 	ctx.values = resize(ctx.values, len(p.valuePaths))
 	classify := func(cols []int, text *[]byte) error {
 		need := 0
@@ -279,23 +451,64 @@ func (p *plan) makeFileRawRowsPartial(
 	}
 	w.text, w.lateText = w.text[:0], w.lateText[:0]
 	if err := classify(p.filterCols, &w.text); err != nil {
-		part.err = err
-		return part, true
+		return nil, nil, true, err
 	}
 	if err := classify(p.lateCols, &w.lateText); err != nil {
-		part.err = err
-		return part, true
+		return nil, nil, true, err
 	}
-	selected, err := p.selectRows(ctx, nil, false, w)
-	if err != nil {
-		part.err = err
-		return part, true
+	var selected []int
+	if predicateCovered {
+		selected = w.selected[:0]
+		for row := range rows {
+			selected = append(selected, row)
+		}
+		w.selected = selected
+	} else {
+		selected, err = p.selectRows(ctx, nil, false, w)
+		if err != nil {
+			return nil, nil, true, err
+		}
 	}
 	if err := w.eval.firstError(); err != nil {
-		part.err = err
-		return part, true
+		return nil, nil, true, err
 	}
-	return p.makeFileRowsPartial(part, selected, ctx, batch, slot, arena, mode, w), true
+	return ctx, selected, true, nil
+}
+
+func (p *plan) extractFileRawColumns(
+	batch fileBatch,
+	w *Workspace,
+) (*execCtx, bool, error) {
+	if len(p.valuePaths) == 0 {
+		return nil, false, nil
+	}
+	for _, path := range p.valuePaths {
+		if _, ok := rawTopLevelPathName(path); !ok {
+			return nil, false, nil
+		}
+	}
+
+	rows := len(batch.ends)
+	w.raws = resize(w.raws, len(p.valuePaths))
+	for col := range p.valuePaths {
+		raws := resize(w.raws[col], rows)
+		clear(raws)
+		w.raws[col] = raws
+	}
+	start := 0
+	for row, end := range batch.ends {
+		if err := cancellationCheckpoint(w.cancel, row); err != nil {
+			return nil, true, err
+		}
+		if !rawTopLevelScalars(batch.data[start:end], p.valuePaths, w.raws, row) {
+			return nil, false, nil
+		}
+		start = end
+	}
+
+	ctx := &w.ctx
+	ctx.s, ctx.rows = nil, rows
+	return ctx, true, nil
 }
 
 func (p *plan) makeFileRowsPartial(
@@ -308,7 +521,7 @@ func (p *plan) makeFileRowsPartial(
 	mode filePartialMode,
 	w *Workspace,
 ) filePartial {
-	if len(p.order) != 0 && mode != filePartialOrdered {
+	if len(p.order) != 0 && mode != filePartialOrdered && mode != filePartialOrderedCovered {
 		if err := w.checkCanceled(); err != nil {
 			part.err = err
 			return part

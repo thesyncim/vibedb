@@ -454,6 +454,9 @@ func (s *stmt) queryRowsCandidates(
 			default:
 				s.conn.fileRange.Bind(bounds.lower, bounds.upper, bounds.lowerExclusive)
 				s.conn.fileRange.BindPrimaryOrder(s.primaryRange.path)
+				if s.primaryRange.coversPredicate {
+					s.conn.fileRange.BindPrimaryPredicate(s.primaryRange.path)
+				}
 				source = query.FromFileRange(state.snapshot, &s.conn.fileRange)
 			}
 		} else {
@@ -603,6 +606,9 @@ func (s *stmt) queryRowsCandidates(
 						bounds.lower, bounds.upper, bounds.lowerExclusive,
 					)
 					s.conn.fileRange.BindPrimaryOrder(s.primaryRange.path)
+					if s.primaryRange.coversPredicate {
+						s.conn.fileRange.BindPrimaryPredicate(s.primaryRange.path)
+					}
 					source = query.FromFileRange(snapshot, &s.conn.fileRange)
 				}
 			}

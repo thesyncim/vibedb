@@ -32,8 +32,8 @@ const (
 
 // A Source is the collection a compiled query runs over. Construct one with
 // exactly one of [FromSegment], [FromSnapshot], [FromFile], [FromFileRange],
-// [FromFileOverlay], [FromSnapshotOverlay], [FromDatabase], or
-// [FromFileDatabase]; the zero Source names nothing and every execution
+// [FromValidatedRaw], [FromFileOverlay], [FromSnapshotOverlay], [FromDatabase],
+// or [FromFileDatabase]; the zero Source names nothing and every execution
 // rejects it.
 //
 // Source is a concrete discriminated struct rather than an interface. A
@@ -165,6 +165,7 @@ func FromFile(s *durable.Snapshot) Source {
 // their existing size and allocation behavior.
 type FileRangeSource struct {
 	orderedPath    string
+	predicatePath  string
 	lower          []byte
 	upper          []byte
 	lowerExclusive bool
@@ -182,6 +183,7 @@ func (s *FileRangeSource) Bind(lower, upper []byte, lowerExclusive bool) {
 	if s != nil {
 		s.lower, s.upper, s.lowerExclusive = lower, upper, lowerExclusive
 		s.orderedPath = ""
+		s.predicatePath = ""
 	}
 }
 
@@ -195,10 +197,22 @@ func (s *FileRangeSource) BindPrimaryOrder(path string) {
 	}
 }
 
+// BindPrimaryPredicate certifies that the complete compiled predicate is the
+// conjunction represented by this source's native bounds on path. The query
+// executor may therefore omit a redundant row-by-row predicate evaluation.
+// Callers must own both that predicate proof and the primary-key schema
+// invariant; Bind clears the certificate before every reuse.
+func (s *FileRangeSource) BindPrimaryPredicate(path string) {
+	if s != nil {
+		s.predicatePath = path
+	}
+}
+
 // FromFileRange names a page-backed snapshot restricted to one native ordered-
 // primary span. The complete compiled predicate remains authoritative after the
-// seek, so this changes physical work only. rangeSource must remain alive and
-// unchanged until execution returns.
+// seek unless the caller also supplies [FileRangeSource.BindPrimaryPredicate]'s
+// explicit coverage certificate. rangeSource must remain alive and unchanged
+// until execution returns.
 func FromFileRange(s *durable.Snapshot, rangeSource *FileRangeSource) Source {
 	return Source{
 		kind: sourceFileRange, file: s, payload: unsafe.Pointer(rangeSource),

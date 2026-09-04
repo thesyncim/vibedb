@@ -1407,9 +1407,10 @@ type fileGroup struct {
 type filePartialMode uint8
 
 const (
-	filePartialDetached filePartialMode = iota // worker rows outlive the batch
-	filePartialBorrowed                        // synchronous consumer owns cells before reuse
-	filePartialOrdered                         // synchronous consumer, certified primary order
+	filePartialDetached       filePartialMode = iota // worker rows outlive the batch
+	filePartialBorrowed                              // synchronous consumer owns cells before reuse
+	filePartialOrdered                               // synchronous consumer, certified primary order
+	filePartialOrderedCovered                        // ordered and native bounds cover the predicate
 )
 
 // makeFilePartial reduces one batch of raw documents. Workers detach rows
@@ -1510,10 +1511,22 @@ func (p *plan) makeFilePartial(
 		part.err = err
 		return part
 	}
-	selected, err := p.selectRows(ctx, nil, false, w)
-	if err != nil {
-		part.err = err
-		return part
+	var (
+		selected []int
+		err      error
+	)
+	if mode == filePartialOrderedCovered {
+		selected = w.selected[:0]
+		for row := range ctx.rows {
+			selected = append(selected, row)
+		}
+		w.selected = selected
+	} else {
+		selected, err = p.selectRows(ctx, nil, false, w)
+		if err != nil {
+			part.err = err
+			return part
+		}
 	}
 	if err := w.eval.firstError(); err != nil {
 		part.err = err

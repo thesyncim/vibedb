@@ -68,6 +68,9 @@ func TestFileSmallIndexedPages(t *testing.T) {
 				}
 				span := NewFileRangeSource([]byte("00500"), []byte("04000"), true)
 				span.BindPrimaryOrder("/id")
+				if !residual {
+					span.BindPrimaryPredicate("/id")
+				}
 				// Multiple batches, including a final partially filled page.
 				e.Options = ExecOptions{BatchRows: 11, BatchBytes: 512}
 				for range 3 {

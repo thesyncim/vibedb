@@ -1,0 +1,15 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/query
+cpu: Apple M4 Max
+BenchmarkFileIndexedPage/Primary/rows=32-16         	  277528	     12892 ns/op	        32.00 scanned/op	       0 B/op	       0 allocs/op
+BenchmarkFileIndexedPage/Primary/rows=32-16         	  281178	     12692 ns/op	        32.00 scanned/op	       0 B/op	       0 allocs/op
+BenchmarkFileIndexedPage/Primary/rows=32-16         	  285687	     12897 ns/op	        32.00 scanned/op	       0 B/op	       0 allocs/op
+BenchmarkFileIndexedPage/Primary/rows=64-16         	  158415	     23051 ns/op	        64.00 scanned/op	       0 B/op	       0 allocs/op
+BenchmarkFileIndexedPage/Primary/rows=64-16         	  160065	     23003 ns/op	        64.00 scanned/op	       0 B/op	       0 allocs/op
+BenchmarkFileIndexedPage/Primary/rows=64-16         	  156432	     23026 ns/op	        64.00 scanned/op	       0 B/op	       0 allocs/op
+BenchmarkFileIndexedPage/Primary/rows=256-16        	   42573	     84182 ns/op	       256.0 scanned/op	       0 B/op	       0 allocs/op
+BenchmarkFileIndexedPage/Primary/rows=256-16        	   42274	     85700 ns/op	       256.0 scanned/op	       0 B/op	       0 allocs/op
+BenchmarkFileIndexedPage/Primary/rows=256-16        	   42804	     84227 ns/op	       256.0 scanned/op	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/thesyncim/vibedb/query	37.847s
