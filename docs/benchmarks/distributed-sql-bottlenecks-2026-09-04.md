@@ -74,6 +74,32 @@ checkpoint regression test now covers both point reads and exact completion
 lookups after every write. This is why isolated call-site improvements cannot
 substitute for a sustained end-to-end measurement.
 
+## Profile of the combined fix
+
+A second diagnostic run on clean `dc48cd2e` used the same 1,024-row profile
+configuration. [Raw gateway/data-leader traces, CPU profiles and manifest](crdb-sql-2026-09-04-writes/profile/README.md)
+are retained with a reproducible region summary. All 2,128 write regions matched.
+
+| Region | Mean milliseconds |
+|---|---:|
+| Prepare exact direct mutation | 0.523 |
+| Execute replicated direct mutation | 3.650 |
+| Gateway outbox save, each of normally two saves | 0.891 |
+
+The preparation region no longer pays the repeated physical snapshot checkpoint.
+The two gateway saves total approximately 1.782 ms per write. Gateway fsync waits
+accounted for 3.528 seconds of accumulated time in this run. The data leader
+recorded 1.41 seconds of accumulated Raft-log `fdatasync` wait and 0.97 seconds of
+other fsync wait across the full diagnostic workload. These are aggregate
+cross-goroutine observations, not additive per-update phase measurements.
+The 3.650 ms execution region still includes replication, durable apply,
+scheduling and response transport; it is not a pure Raft-network measurement.
+
+The [uninstrumented comparison](crdb-sql-2026-09-04-writes/README.md) separately
+validated all 120,000 samples. Median update throughput was 164.1 versus 853.1
+ops/s at one client and 162.8 versus 4,107.8 at eight clients (VibeDB versus
+CockroachDB). Serial gateway outbox ownership remains a decisive throughput limit.
+
 ## Remaining measured or code-supported targets
 
 - The per-table outbox still serializes independent writes. Bounded concurrent

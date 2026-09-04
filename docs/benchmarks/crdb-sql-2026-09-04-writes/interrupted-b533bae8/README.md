@@ -1,0 +1,1 @@
+This attempt was interrupted after its first verified VibeDB update repetition exposed another checkpoint call site. VibeDB exited 143 and did not finalize its raw JSON. Its logs are retained as diagnostic evidence only; it is not a complete comparative result. No throughput ratio is computed from this attempt.

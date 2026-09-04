@@ -1,0 +1,6 @@
+4	/data/ca.key
+24	/data/certs
+1484204	/data/crdb-0
+1412152	/data/crdb-1
+1338668	/data/crdb-2
+3584956	/data/vibe
