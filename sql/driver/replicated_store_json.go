@@ -417,17 +417,17 @@ func decodeReplicatedAuthorityVibe(
 		var decodeErr error
 		switch index {
 		case 0:
-			decodeErr = c.Uint64(&decoded.ActivePolicyGeneration)
+			decodeErr = c.Uint(&decoded.ActivePolicyGeneration)
 		case 1:
-			decodeErr = c.Uint64(&decoded.ProtectionEpoch)
+			decodeErr = c.Uint(&decoded.ProtectionEpoch)
 		case 2:
-			decodeErr = c.Uint64(&decoded.OwnershipEpoch)
+			decodeErr = c.Uint(&decoded.OwnershipEpoch)
 		case 3:
-			decodeErr = c.Uint64(&decoded.SchemaGeneration)
+			decodeErr = c.Uint(&decoded.SchemaGeneration)
 		case 4:
-			decodeErr = c.Uint64(&decoded.RoutingVersion)
+			decodeErr = c.Uint(&decoded.RoutingVersion)
 		case 5:
-			decodeErr = c.Uint64(&decoded.RouteGeneration)
+			decodeErr = c.Uint(&decoded.RouteGeneration)
 		}
 		if decodeErr != nil {
 			return decodeErr
@@ -477,13 +477,13 @@ func decodeReplicatedBindingVibe(
 				"vibedb: replicated cluster_incarnation must be 128-bit lowercase hexadecimal",
 				"vibedb: replicated cluster_incarnation")
 		case 2:
-			err = c.Uint64(&decoded.TopologyRecoveryEpoch)
+			err = c.Uint(&decoded.TopologyRecoveryEpoch)
 		case 3:
 			err = c.String(&decoded.Distribution)
 		case 4:
 			err = c.String(&decoded.Shard)
 		case 5:
-			err = c.Uint64(&decoded.AllocationGeneration)
+			err = c.Uint(&decoded.AllocationGeneration)
 		case 6:
 			err = decodeReplicatedLowerHex(c, decoded.ShardIncarnation[:],
 				"vibedb: replicated shard_incarnation must be 128-bit lowercase hexadecimal",
@@ -493,7 +493,7 @@ func decodeReplicatedBindingVibe(
 				"vibedb: replicated group_id must be 128-bit lowercase hexadecimal",
 				"vibedb: replicated group_id")
 		case 8:
-			err = c.Uint64(&decoded.MemberID)
+			err = c.Uint(&decoded.MemberID)
 		case 9:
 			err = decodeReplicatedLowerHex(c, decoded.StoreID[:],
 				"vibedb: replicated store_id must be 128-bit lowercase hexadecimal",
@@ -562,10 +562,10 @@ func decodeReplicatedRelationVibe(
 		}
 		switch index {
 		case 0:
-			err = c.Uint16(&decoded.Relation)
+			err = c.Uint(&decoded.Relation)
 		case 1:
 			var kind uint8
-			err = c.Uint8(&kind)
+			err = c.Uint(&kind)
 			decoded.Kind = ReplicatedShardRelationKind(kind)
 		case 2:
 			err = c.String(&decoded.Table)
@@ -584,29 +584,29 @@ func decodeReplicatedRelationVibe(
 				"vibedb: replicated local_index_digest must be lowercase SHA-256 hexadecimal",
 				"vibedb: replicated local_index_digest")
 		case 6:
-			err = c.Uint64(&decoded.IndexID)
+			err = c.Uint(&decoded.IndexID)
 		case 7:
-			err = c.Uint64(&decoded.Incarnation)
+			err = c.Uint(&decoded.Incarnation)
 		case 8:
-			err = c.Uint8(&decoded.LocatorCount)
+			err = c.Uint(&decoded.LocatorCount)
 		case 9:
 			err = c.Bool(&decoded.Unique)
 		case 10:
 			var encoding uint8
-			err = c.Uint8(&encoding)
+			err = c.Uint(&encoding)
 			decoded.KeyEncoding = ReplicatedRelationKeyEncoding(encoding)
 		case 11:
-			err = c.Uint8(&decoded.KeyArity)
+			err = c.Uint(&decoded.KeyArity)
 		case 12:
 			var version uint32
-			err = c.Uint32(&version)
+			err = c.Uint(&version)
 			decoded.TupleVersion = distribution.TupleVersion(version)
 		case 13:
 			var version uint32
-			err = c.Uint32(&version)
+			err = c.Uint(&version)
 			decoded.MapperVersion = distribution.MapperVersion(version)
 		case 14:
-			err = c.Uint8(&decoded.BucketBits)
+			err = c.Uint(&decoded.BucketBits)
 		case 15:
 			err = decodeReplicatedLowerHex(c, decoded.SchemaDigest[:],
 				"vibedb: replicated schema_digest must be lowercase SHA-256 hexadecimal",
@@ -688,7 +688,7 @@ func decodeReplicatedStoreIdentityVibe(
 				err = decodeReplicatedShardSidecarsVibe(c, &decoded.Sidecars)
 			}
 		case 8:
-			err = c.Uint64(&decoded.RelationSchemaGeneration)
+			err = c.Uint(&decoded.RelationSchemaGeneration)
 		case 9:
 			err = decodeReplicatedLowerHex(c, decoded.RelationManifestDigest[:],
 				"vibedb: replicated relation_manifest_digest must be lowercase SHA-256 hexadecimal",

@@ -82,6 +82,7 @@ database directory, never an arbitrary live file.
 ## What is implemented
 
 - Canonical JSON documents in named, lazily materialized collections.
+- Retained JSON indexes for document placement; see the [paired placement measurements](docs/benchmarks/vibejson-placement-2026-09-04/README.md).
 - Exact scalar and compound indexes.
 - Immutable snapshots, typed queries, and bounded execution workspaces.
 - Serializable native transactions and multi-table SQL transactions.

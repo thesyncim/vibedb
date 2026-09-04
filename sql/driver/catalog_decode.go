@@ -113,7 +113,7 @@ func decodeShardStoreIdentityVibe(c *vibejson.DecodeCursor, dst *ShardStoreIdent
 			decoded.Shard = distribution.ShardID(strings.Clone(value))
 		case 2:
 			var value uint64
-			err = c.Uint64(&value)
+			err = c.Uint(&value)
 			decoded.AllocationGeneration = distribution.ShardAllocationGeneration(value)
 		case 3:
 			err = decodeReplicatedLowerHex(c, decoded.LogID[:], "vibedb: shard store log id must contain exactly 128 bits of lowercase hexadecimal", "vibedb: shard store log id")
@@ -173,11 +173,11 @@ func decodeShardStoreFenceVibe(c *vibejson.DecodeCursor, dst *ShardStoreFence) e
 		}
 		if index == 0 {
 			var value uint64
-			err = c.Uint64(&value)
+			err = c.Uint(&value)
 			decoded.OwnershipEpoch = distribution.OwnershipEpoch(value)
 		} else {
 			var value uint64
-			err = c.Uint64(&value)
+			err = c.Uint(&value)
 			decoded.RoutingVersion = distribution.RoutingVersion(value)
 		}
 		if err != nil {
@@ -482,7 +482,7 @@ func decodeCatalogFile(c *vibejson.DecodeCursor, dst *catalogFile) error {
 				return errors.New("vibedb: SQL catalog version must not be null")
 			}
 			var value int64
-			err = c.Int64(&value)
+			err = c.Int(&value)
 			if err == nil && (value < 0 || int64(int(value)) != value) {
 				err = errors.New("vibedb: SQL catalog version is out of range")
 			}
@@ -650,7 +650,7 @@ func decodeTableMetaVibe(c *vibejson.DecodeCursor, dst *tableMeta) error {
 		case 4:
 			err = c.Bool(&decoded.Materialized)
 		case 5:
-			err = c.Uint64(&decoded.SealedRecoveryJournalBytes)
+			err = c.Uint(&decoded.SealedRecoveryJournalBytes)
 		}
 		if err != nil {
 			return err
@@ -729,7 +729,7 @@ func decodeSchemaMetaVibe(c *vibejson.DecodeCursor, dst *schemaMeta) error {
 			return err
 		}
 		if index == 0 {
-			err = c.Uint16(&decoded.Root)
+			err = c.Uint(&decoded.Root)
 		} else {
 			err = decodeSchemaFieldsVibe(c, &decoded.Fields)
 		}
@@ -792,7 +792,7 @@ func decodeSchemaFieldVibe(c *vibejson.DecodeCursor, dst *schemaFieldMeta) error
 		case 0:
 			err = decodeBoundedCatalogString(c, &decoded.Path, maxCatalogBytes, "schema field path")
 		case 1:
-			err = c.Uint16(&decoded.Types)
+			err = c.Uint(&decoded.Types)
 		case 2:
 			err = c.Bool(&decoded.Required)
 		}

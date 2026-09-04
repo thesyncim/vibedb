@@ -1,0 +1,60 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/distribution
+cpu: Apple M4 Max
+BenchmarkDocumentPointProgram 	  712941	       422.7 ns/op	 177.42 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/distribution
+cpu: Apple M4 Max
+BenchmarkDocumentPointProgram 	  704804	       421.1 ns/op	 178.11 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/distribution
+cpu: Apple M4 Max
+BenchmarkDocumentPointProgram 	  692367	       427.6 ns/op	 175.38 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/distribution
+cpu: Apple M4 Max
+BenchmarkDocumentPointProgram 	  720576	       417.6 ns/op	 179.58 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/distribution
+cpu: Apple M4 Max
+BenchmarkDocumentPointProgram 	  715022	       421.5 ns/op	 177.92 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/distribution
+cpu: Apple M4 Max
+BenchmarkDocumentPointProgram 	  714256	       418.4 ns/op	 179.26 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/distribution
+cpu: Apple M4 Max
+BenchmarkDocumentPointProgram 	  711208	       421.1 ns/op	 178.11 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/distribution
+cpu: Apple M4 Max
+BenchmarkDocumentPointProgram 	  714476	       421.7 ns/op	 177.86 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/distribution
+cpu: Apple M4 Max
+BenchmarkDocumentPointProgram 	  710408	       416.6 ns/op	 180.01 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/distribution
+cpu: Apple M4 Max
+BenchmarkDocumentPointProgram 	  721941	       417.5 ns/op	 179.64 MB/s	       0 B/op	       0 allocs/op
+PASS
