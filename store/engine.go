@@ -511,6 +511,26 @@ func copyStoreShapeTape(dst *Segment, index vibejson.Index) (vibejson.Index, Sha
 	return vibejson.Index{Src: index.Src, Entries: values}, ref, true
 }
 
+// chunkKeysCap sizes a rebuilt chunk's key directory to its highest
+// addressable slot instead of the chunk capacity. Slots address by position,
+// so sparse chunks (the common small-collection case) stop paying a full
+// capacity directory per rebuild. The bound covers every slot any reader can
+// observe: live slots (point lookups resolve through the key directory to
+// live slots; scans, indexes, and the compiled-key fast path all iterate or
+// verify the live mask first) plus removed slots being cleared and an
+// insert's replacement slot. Readers never address beyond it.
+func chunkKeysCap(old *Chunk, live uint64, replaceSlot int) int {
+	var oldLive uint64
+	if old != nil {
+		oldLive = old.Live
+	}
+	n := bits.Len64(live | oldLive)
+	if replaceSlot+1 > n {
+		n = replaceSlot + 1
+	}
+	return n
+}
+
 // buildStoreChunk is the single bounded rebuild primitive used by inserts,
 // replacements, deletes, index backfill, and index reclaim.
 // live is the exact post-edit slot mask. replaceSlot selects one slot whose
@@ -531,7 +551,7 @@ func buildStoreChunk(
 		return nil, nil
 	}
 	chunk := &Chunk{
-		keys: make([]string, options.ChunkDocuments),
+		keys: make([]string, chunkKeysCap(old, live, replaceSlot)),
 	}
 	prepareStoreSegment(&chunk.Docs, options, postings, old, live, replaceSlot, len(src))
 	if old != nil {
@@ -592,7 +612,7 @@ func buildStoreChunkSchema(
 		return nil, nil
 	}
 	chunk := &Chunk{
-		keys: make([]string, options.ChunkDocuments),
+		keys: make([]string, chunkKeysCap(old, live, replaceSlot)),
 	}
 	prepareStoreSegment(
 		&chunk.Docs, options, postings, old, live, replaceSlot, len(src),
