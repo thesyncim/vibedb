@@ -251,9 +251,13 @@ type Database struct {
 	handlesMu sync.Mutex
 	handles   map[string]*Collection
 
-	// commitMu serializes Commit validation and publication across every
-	// transaction on this handle. Begin does not take it; think-time overlaps.
-	commitMu sync.Mutex
+	// commitMu serializes Commit validation and publication. Multi-collection
+	// transactions take it exclusively; single-collection transactions whose
+	// reads are confined to their dirty collection take it shared, so commits
+	// on disjoint collections proceed in parallel. Same-collection commits
+	// still serialize on that collection's txnFence. Begin does not take it;
+	// think-time overlaps.
+	commitMu sync.RWMutex
 
 	// The native serializable lane samples one database-global logical revision
 	// before capturing its cut, then retains independently bounded histories per

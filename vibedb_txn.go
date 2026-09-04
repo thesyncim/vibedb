@@ -259,8 +259,23 @@ func (t *Tx) Commit() error {
 	// blocked by generation leases during validation/publication.
 	t.releaseCuts()
 
-	db.commitMu.Lock()
-	defer db.commitMu.Unlock()
+	// Choose the commit lock mode before locking. A transaction confined to a
+	// single collection (its only participant is its only dirty collection)
+	// cannot create a cross-collection read-write cycle with another confined
+	// transaction on a different collection, so shared mode is sufficient;
+	// same-collection peers still serialize on that collection's txnFence.
+	// Anything wider (cross-collection reads, multi-collection writes) takes
+	// the exclusive mode to preserve serializable validation.
+	preParticipants := t.participantStates()
+	sharedCommit := len(dirty) == 1 && len(preParticipants) == 1 &&
+		preParticipants[0].name == dirty[0].name
+	if sharedCommit {
+		db.commitMu.RLock()
+		defer db.commitMu.RUnlock()
+	} else {
+		db.commitMu.Lock()
+		defer db.commitMu.Unlock()
+	}
 	// dirty is name-sorted, so every transaction takes collection fences in one
 	// stable order. Keep them through conflict validation, materialization,
 	// publication, and conflict-clock recording. A direct Put/Delete on a dirty
@@ -769,8 +784,12 @@ func (c *TxCollection) Put(key string, document []byte) (created bool, err error
 		c.state.canonical = nil
 		return false, err
 	}
-	c.state.canonical = canonical
-	owned := append([]byte(nil), canonical...)
+	// Transfer scratch ownership to the staged mutation instead of copying:
+	// the canonical buffer is already an owned exact-size rendering, so the
+	// extra alloc+memcpy per Put is pure overhead. The next Put allocates a
+	// fresh scratch, matching the previous per-Put allocation count.
+	c.state.canonical = nil
+	owned := canonical
 	baseExisted, err := c.baseExisted(key)
 	if err != nil {
 		c.state.canonical = nil
