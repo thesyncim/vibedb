@@ -470,9 +470,9 @@ func (p *postgresStatement) QueryInto(ctx context.Context, args []any, rows *pgw
 	profile.PerShardRows = min(profile.PerShardRows, profile.MaxAggregateRows)
 	profile.MaxAggregateBytes = min(profile.MaxAggregateBytes, uint64(s.bytes))
 	profile.PerShardBytes = min(profile.PerShardBytes, profile.MaxAggregateBytes)
-	result, err := s.backend.Executor.queryWithProfile(ctx, Query{
+	result, err := s.backend.Executor.queryPreparedWithProfile(ctx, Query{
 		SQL: p.compiled.SQL(), Params: params, ParamTypes: p.paramTypes, Class: ClassBatch,
-	}, profile)
+	}, profile, p.compiled.NumParams())
 	if err != nil {
 		return err
 	}

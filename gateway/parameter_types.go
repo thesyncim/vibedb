@@ -91,6 +91,24 @@ func validateTypedQueries(ctx context.Context, queries []Query) error {
 	return nil
 }
 
+// validatePreparedQueryParameters checks the mutable execution inputs for a
+// statement whose SQL and parameter domains were already semantically prepared
+// by the pgwire session. The retained compiled statement supplies the trusted
+// arity; transport values and type metadata remain untrusted on every bind.
+func validatePreparedQueryParameters(candidate *Query, preparedParams int) error {
+	if candidate == nil || preparedParams < 0 || len(candidate.Params) != preparedParams {
+		actual := 0
+		if candidate != nil {
+			actual = len(candidate.Params)
+		}
+		return fmt.Errorf(
+			"%w: prepared statement has %d parameters, request has %d",
+			ErrPlanParameters, preparedParams, actual,
+		)
+	}
+	return validateSQLParameterTypes(candidate.Params, candidate.ParamTypes)
+}
+
 // validateSQLParameterTypes validates only the bounded transport metadata. It
 // deliberately does not parse SQL, so callers can use it during physical
 // admission before attacker-controlled text reaches the parser.
