@@ -1102,7 +1102,7 @@ func compactDaysBeforeYear(year int) int {
 	return year*365 + (year+3)/4 - (year+99)/100 + (year+399)/400
 }
 
-func appendCompactDate(dst []byte, ordinal int32) []byte {
+func appendCompactDateArithmetic(dst []byte, ordinal int32) []byte {
 	// Shift the ordinal's 0000-01-01 origin to a March-based 400-year era.
 	// March makes leap day the final day of a year, allowing direct division
 	// instead of a year search and month loop. The negative-era branch covers
