@@ -131,6 +131,18 @@ func (client testHealthRoundClient) Observe(
 			ReplicaSetVersion: request.ExpectedReplicaSetVersion}}, nil
 }
 
+func (client testHealthRoundClient) ObserveHealth(
+	_ context.Context, _ rafttransport.NodeID, request replicacontrol.Request,
+) (replicacontrol.HealthObservation, error) {
+	if err := client.failed[request.TargetMember]; err != nil {
+		return replicacontrol.HealthObservation{}, err
+	}
+	status := client.status[request.TargetMember]
+	return replicacontrol.HealthObservation{Request: request, MemberID: status.MemberID,
+		LeaderID: status.LeaderID, Term: status.Term, Commit: status.Commit,
+		Applied: status.Applied, ReplicaSetVersion: request.ExpectedReplicaSetVersion}, nil
+}
+
 func TestReplicaHealthRevisionRejectsPartitionWithoutLeader(t *testing.T) {
 	snapshot, _ := testReplicatedHealthSnapshot(t)
 	client := testHealthRoundClient{

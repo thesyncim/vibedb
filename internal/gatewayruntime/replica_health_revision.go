@@ -18,7 +18,7 @@ import (
 // cluster size.
 type gatewayReplicaHealthRevisionController struct {
 	catalog      gatewayReplicaCatalogReader
-	observations gatewayReplicaObservationClient
+	observations gatewayReplicaHealthObservationClient
 	authority    gateway.ReplicaHealthRevisionAuthority
 }
 
@@ -32,7 +32,7 @@ type gatewayReplicaHealthRevisionPass struct {
 
 func newGatewayReplicaHealthRevisionController(
 	catalog gatewayReplicaCatalogReader,
-	observations gatewayReplicaObservationClient,
+	observations gatewayReplicaHealthObservationClient,
 	authority gateway.ReplicaHealthRevisionAuthority,
 ) (*gatewayReplicaHealthRevisionController, error) {
 	if catalog == nil || observations == nil || authority == nil {
@@ -108,7 +108,7 @@ func (controller *gatewayReplicaHealthRevisionController) RunPass(
 type gatewayHealthCut struct {
 	member      uint64
 	endpoint    gateway.ReplicatedReplicaDescriptor
-	observation replicacontrol.Observation
+	observation replicacontrol.HealthObservation
 	err         error
 }
 
@@ -135,8 +135,9 @@ func (controller *gatewayReplicaHealthRevisionController) observeGroup(
 				Operation: operation, Step: step, Group: descriptor.Group,
 				TargetMember:              endpoint.Member,
 				ExpectedReplicaSetVersion: descriptor.Command.ReplicaSetVersion,
+				HealthOnly:                true,
 			}
-			observation, err := controller.observations.Observe(ctx, endpoint.Node, request)
+			observation, err := controller.observations.ObserveHealth(ctx, endpoint.Node, request)
 			results <- gatewayHealthCut{member: endpoint.Member, endpoint: endpoint,
 				observation: observation, err: err}
 		}()
@@ -192,25 +193,25 @@ func (controller *gatewayReplicaHealthRevisionController) observeGroup(
 }
 
 func validHealthCut(cut gatewayHealthCut, rsv uint64) bool {
-	status := cut.observation.Status
-	return cut.member != 0 && cut.endpoint.Member == cut.member && status.MemberID == cut.member &&
-		status.LeaderID != 0 && status.Term != 0 && status.Commit != 0 &&
-		cut.observation.Publication.ReplicaSetVersion == rsv &&
-		status.Applied == cut.observation.Publication.Applied && status.Applied <= status.Commit
+	observation := cut.observation
+	return cut.member != 0 && cut.endpoint.Member == cut.member &&
+		observation.MemberID == cut.member && observation.LeaderID != 0 &&
+		observation.Term != 0 && observation.Commit != 0 && observation.Applied != 0 &&
+		observation.ReplicaSetVersion == rsv && observation.Applied <= observation.Commit
 }
 
 func quorumHealthAgreement(cuts []gatewayHealthCut) (gatewayHealthAgreement, []gatewayHealthCut, bool) {
 	for _, candidate := range cuts {
-		status := candidate.observation.Status
-		agreement := gatewayHealthAgreement{leader: status.LeaderID, term: status.Term,
-			commit: status.Commit, rsv: candidate.observation.Publication.ReplicaSetVersion}
+		observation := candidate.observation
+		agreement := gatewayHealthAgreement{leader: observation.LeaderID, term: observation.Term,
+			commit: observation.Commit, rsv: observation.ReplicaSetVersion}
 		reporters := make([]gatewayHealthCut, 0, gateway.ServingReplicaCount)
 		leaderAnswered := false
 		for _, cut := range cuts {
-			other := cut.observation.Status
+			other := cut.observation
 			if other.LeaderID == agreement.leader && other.Term == agreement.term &&
 				other.Commit == agreement.commit &&
-				cut.observation.Publication.ReplicaSetVersion == agreement.rsv {
+				other.ReplicaSetVersion == agreement.rsv {
 				reporters = append(reporters, cut)
 				leaderAnswered = leaderAnswered || (cut.member == agreement.leader && other.MemberID == other.LeaderID)
 			}

@@ -615,6 +615,10 @@ type gatewayReplicaObservationClient interface {
 	Observe(context.Context, rafttransport.NodeID, replicacontrol.Request) (replicacontrol.Observation, error)
 }
 
+type gatewayReplicaHealthObservationClient interface {
+	ObserveHealth(context.Context, rafttransport.NodeID, replicacontrol.Request) (replicacontrol.HealthObservation, error)
+}
+
 type gatewayReplicaActionClient interface {
 	Execute(context.Context, rafttransport.NodeID, replicaaction.Request) error
 }

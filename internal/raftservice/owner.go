@@ -23,6 +23,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
+	"go.etcd.io/raft/v3"
 	pb "go.etcd.io/raft/v3/raftpb"
 )
 
@@ -135,6 +136,7 @@ const (
 	requestReadExecutionPin
 	requestReadRouteGate
 	requestReplicaObservation
+	requestReplicaHealthObservation
 	requestOwnershipTransition
 	requestSchemaTransition
 	requestReplicaRetirement
@@ -191,6 +193,7 @@ type ownerReply struct {
 	err         error
 	read        readAuthorization
 	observation ReplicaObservation
+	health      ReplicaHealthObservation
 	committed   bool
 }
 
@@ -208,6 +211,17 @@ type ReplicaObservation struct {
 	ProgressFound  bool
 	State          replicatedstate.State
 	SnapshotBase   *replicatedstate.SnapshotBaseCertificate
+}
+
+// ReplicaHealthObservation is the bounded liveness cut used by controllers
+// that only need the current Raft progress identity. It deliberately carries
+// no durable state or snapshot witness; those remain exclusive to
+// ReplicaObservation and its certified movement, backup, and learner
+// consumers.
+type ReplicaHealthObservation struct {
+	Identity    raftmember.RuntimeIdentity
+	Status      raftmember.RuntimeStatus
+	Publication raftmodel.Publication
 }
 
 type readRequest struct {
@@ -1442,6 +1456,39 @@ func (owner *Owner) handle(request ownerRequest) error {
 		}
 		if reply.err == nil {
 			reply.err = owner.syncCommandFenceFromState(request.group, reply.observation)
+		}
+	case requestReplicaHealthObservation:
+		if request.group == (raftmember.GroupKey{}) || request.targetMember == 0 {
+			reply.err = ErrInvalidOwner
+			break
+		}
+		member, found := owner.members[request.group]
+		if !found {
+			reply.err = multiraft.ErrGroupNotFound
+			break
+		}
+		if member.identity.MemberID != request.targetMember {
+			reply.err = ErrServingFence
+			break
+		}
+		reply.health.Identity = member.identity
+		reply.health.Status, reply.err = owner.host.Status(request.group)
+		if reply.err == nil {
+			reply.health.Publication, reply.err = owner.host.Publication(request.group)
+		}
+		if reply.err == nil {
+			fence, fenceErr := owner.host.SnapshotAuthorizationFence(request.group)
+			reply.err = fenceErr
+			if fenceErr == nil && !validReplicaHealthObservation(
+				request.group, member.identity, reply.health.Status, reply.health.Publication, fence,
+			) {
+				reply.err = ErrServingFence
+			}
+			if reply.err == nil {
+				reply.err = owner.syncCommandFenceFromSnapshot(
+					request.group, reply.health.Publication, fence,
+				)
+			}
 		}
 	case requestOwnershipTransition:
 		reply.err = owner.applyOwnershipTransition(request.fence, request.data)
@@ -3249,6 +3296,44 @@ func (owner *Owner) ObserveReplica(
 		reply: make(chan ownerReply, 1),
 	})
 	return reply.observation, err
+}
+
+// ObserveReplicaHealth collects the detached Raft liveness fields and durable
+// publication fence in one serialized Host turn. It never acquires a full
+// state or snapshot artifact cut.
+func (owner *Owner) ObserveReplicaHealth(
+	ctx context.Context,
+	group raftmember.GroupKey,
+	targetMember uint64,
+) (ReplicaHealthObservation, error) {
+	if ctx == nil || group == (raftmember.GroupKey{}) || targetMember == 0 {
+		return ReplicaHealthObservation{}, ErrInvalidOwner
+	}
+	reply, err := owner.enqueue(ctx, ownerRequest{
+		kind: requestReplicaHealthObservation, group: group, targetMember: targetMember,
+		reply: make(chan ownerReply, 1),
+	})
+	return reply.health, err
+}
+
+func validReplicaHealthObservation(
+	group raftmember.GroupKey,
+	identity raftmember.RuntimeIdentity,
+	status raftmember.RuntimeStatus,
+	publication raftmodel.Publication,
+	fence replicatedstate.SnapshotFence,
+) bool {
+	return identity.Group == group && identity.MemberID != 0 &&
+		status.MemberID == identity.MemberID && status.MemberID != 0 &&
+		status.LeaderID != 0 && status.Term != 0 && status.Commit != 0 &&
+		status.Applied != 0 && status.Applied <= status.Commit &&
+		status.RaftState <= raft.StatePreCandidate &&
+		publication.Applied != 0 && publication.ConfState != nil &&
+		publication.Applied == status.Applied &&
+		publication.Applied == fence.Applied &&
+		publication.ReplicaSetVersion != 0 &&
+		publication.ReplicaSetVersion == fence.ReplicaSetVersion &&
+		publication.DataChainDigest == fence.DataChainDigest
 }
 
 func stateMatchesReplicaGroup(state replicatedstate.State, group raftmember.GroupKey) bool {

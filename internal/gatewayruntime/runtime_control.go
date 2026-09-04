@@ -161,8 +161,12 @@ func (runtime *Runtime) openReplicaControl() error {
 		return fmt.Errorf("open replica health controller: %w", err)
 	}
 	runtime.healthController = healthController
+	healthObservations, ok := controls.HealthObservations.(gatewayReplicaHealthObservationClient)
+	if !ok {
+		return fmt.Errorf("%w: health-only replica observations unsupported", errGatewayReplicaHealth)
+	}
 	healthRevisions, err := newGatewayReplicaHealthRevisionController(
-		runtime.authority, controls.HealthObservations, runtime.authority,
+		runtime.authority, healthObservations, runtime.authority,
 	)
 	if err != nil {
 		return fmt.Errorf("open replica health revisions: %w", err)

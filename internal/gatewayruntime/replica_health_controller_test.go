@@ -382,6 +382,17 @@ func (testAuthenticatedHealthClient) Observe(
 			ConfState: &pb.ConfState{Voters: []uint64{1, 2, 3}}}}, nil
 }
 
+func (testAuthenticatedHealthClient) ObserveHealth(
+	_ context.Context, _ rafttransport.NodeID, request replicacontrol.Request,
+) (replicacontrol.HealthObservation, error) {
+	if request.TargetMember == 1 {
+		return replicacontrol.HealthObservation{}, errors.New("failed member unavailable")
+	}
+	return replicacontrol.HealthObservation{Request: request, MemberID: request.TargetMember,
+		LeaderID: 2, Term: 4, Commit: 30, Applied: 30,
+		ReplicaSetVersion: request.ExpectedReplicaSetVersion}, nil
+}
+
 func TestAuthenticatedHealthObserverRequiresCurrentQuorumAndLeader(t *testing.T) {
 	snapshot, certificate := testReplicatedHealthSnapshot(t)
 	observer := gatewayAuthenticatedHealthObserver{client: testAuthenticatedHealthClient{}}

@@ -1,13 +1,16 @@
 package raftservice
 
 import (
+	"context"
 	"errors"
 	"testing"
 
 	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibedb/internal/multiraft"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	"go.etcd.io/raft/v3"
 	"go.etcd.io/raft/v3/raftpb"
 )
 
@@ -46,6 +49,131 @@ func (host *retirementHost) SnapshotAuthorizationFence(raftmember.GroupKey) (rep
 
 func (host *retirementHost) Status(raftmember.GroupKey) (raftmember.RuntimeStatus, error) {
 	return host.status, nil
+}
+
+type healthProbeHost struct {
+	ownerHost
+	publication       raftmodel.Publication
+	status            raftmember.RuntimeStatus
+	fence             replicatedstate.SnapshotFence
+	authorizationCall int
+	snapshotCalls     int
+	authorizationErr  error
+}
+
+func (host *healthProbeHost) Publication(raftmember.GroupKey) (raftmodel.Publication, error) {
+	return host.publication, nil
+}
+
+func (host *healthProbeHost) Status(raftmember.GroupKey) (raftmember.RuntimeStatus, error) {
+	return host.status, nil
+}
+
+func (host *healthProbeHost) SnapshotAuthorizationFence(raftmember.GroupKey) (replicatedstate.SnapshotFence, error) {
+	host.authorizationCall++
+	return host.fence, host.authorizationErr
+}
+
+func (host *healthProbeHost) SnapshotState(raftmember.GroupKey) (replicatedstate.State, error) {
+	host.snapshotCalls++
+	return replicatedstate.State{}, errors.New("health observation acquired a full snapshot")
+}
+
+func newHealthProbeOwner() (*Owner, *healthProbeHost, raftmember.GroupKey) {
+	group := peerServerTestGroup()
+	digest := [32]byte{4}
+	binding := replicatedstate.Binding{ClusterID: group.ClusterID,
+		ClusterIncarnation: group.ClusterIncarnation, TopologyRecoveryEpoch: group.TopologyRecoveryEpoch,
+		ShardIncarnation: group.ShardIncarnation, GroupID: group.GroupID,
+		AllocationGeneration: 3, ActivePolicyGeneration: 5, ProtectionEpoch: 6,
+		OwnershipEpoch: 8, SchemaGeneration: 9, RoutingVersion: 10, RouteGeneration: 11}
+	host := &healthProbeHost{
+		publication: raftmodel.Publication{Applied: 19, DataChainDigest: digest,
+			ConfState: &raftpb.ConfState{Voters: []uint64{2, 3, 4}}, ReplicaSetVersion: 7},
+		status: raftmember.RuntimeStatus{MemberID: 2, LeaderID: 2, Term: 12,
+			Commit: 19, Applied: 19, RaftState: raft.StateLeader},
+		fence: replicatedstate.SnapshotFence{Binding: binding, RelationManifestDigest: digest,
+			Applied: 19, DataChainDigest: digest, ReplicaSetVersion: 7},
+	}
+	member := ownerMember{identity: raftmember.RuntimeIdentity{Group: group,
+		AllocationGeneration: 3, MemberID: 2, StoreID: [16]byte{3}, NodeIncarnation: 4,
+		RelationManifestDigest: digest}, command: CommandFence{ReplicaSetVersion: 6,
+		ActivePolicyGeneration: 5, ProtectionEpoch: 6, OwnershipEpoch: 8,
+		SchemaGeneration: 9, RoutingVersion: 10, RouteGeneration: 11,
+		RelationManifestDigest: digest}}
+	owner := &Owner{host: host, members: map[raftmember.GroupKey]ownerMember{group: member}}
+	return owner, host, group
+}
+
+func TestReplicaHealthObservationUsesOnlyAuthorizationFence(t *testing.T) {
+	owner, host, group := newHealthProbeOwner()
+	member := owner.members[group]
+	reply := make(chan ownerReply, 1)
+	request := ownerRequest{kind: requestReplicaHealthObservation, group: group,
+		targetMember: 2, reply: reply}
+	if err := owner.handle(request); err != nil {
+		t.Fatalf("health handle err=%v", err)
+	}
+	got := (<-reply).health
+	if got.Identity != member.identity || got.Status != host.status ||
+		got.Publication.Applied != host.publication.Applied ||
+		got.Publication.ReplicaSetVersion != host.publication.ReplicaSetVersion {
+		t.Fatalf("health observation=%+v", got)
+	}
+	if host.authorizationCall != 1 || host.snapshotCalls != 0 {
+		t.Fatalf("authorization=%d snapshot=%d", host.authorizationCall, host.snapshotCalls)
+	}
+	if owner.members[group].command.ReplicaSetVersion != 7 {
+		t.Fatalf("command fence=%+v", owner.members[group].command)
+	}
+	if err := owner.handle(ownerRequest{kind: requestReplicaHealthObservation, group: group,
+		targetMember: 3, reply: reply}); !errors.Is(err, ErrServingFence) {
+		t.Fatalf("wrong target err=%v", err)
+	}
+	if _, err := owner.ObserveReplicaHealth(context.Background(), raftmember.GroupKey{}, 2); !errors.Is(err, ErrInvalidOwner) {
+		t.Fatalf("empty group err=%v", err)
+	}
+}
+
+func TestReplicaHealthObservationPreservesRejectionFences(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*healthProbeHost, *ownerRequest)
+		want   error
+	}{
+		{"wrong target", func(_ *healthProbeHost, request *ownerRequest) { request.targetMember++ }, ErrServingFence},
+		{"wrong group", func(_ *healthProbeHost, request *ownerRequest) { request.group.GroupID[0]++ }, multiraft.ErrGroupNotFound},
+		{"pending settlement", func(host *healthProbeHost, _ *ownerRequest) {
+			host.authorizationErr = raftmember.ErrResultSettlementPending
+		}, raftmember.ErrResultSettlementPending},
+		{"pending schema", func(host *healthProbeHost, _ *ownerRequest) {
+			host.authorizationErr = replicatedstate.ErrSchemaTransitionPending
+		}, replicatedstate.ErrSchemaTransitionPending},
+		{"fence group", func(host *healthProbeHost, _ *ownerRequest) { host.fence.Binding.GroupID[0]++ }, ErrServingFence},
+		{"fence allocation", func(host *healthProbeHost, _ *ownerRequest) { host.fence.Binding.AllocationGeneration++ }, ErrServingFence},
+		{"fence version", func(host *healthProbeHost, _ *ownerRequest) { host.fence.ReplicaSetVersion++ }, ErrServingFence},
+		{"publication applied", func(host *healthProbeHost, _ *ownerRequest) { host.publication.Applied-- }, ErrServingFence},
+		{"fence applied", func(host *healthProbeHost, _ *ownerRequest) { host.fence.Applied-- }, ErrServingFence},
+		{"fence digest", func(host *healthProbeHost, _ *ownerRequest) { host.fence.DataChainDigest[0]++ }, ErrServingFence},
+		{"fence manifest", func(host *healthProbeHost, _ *ownerRequest) { host.fence.RelationManifestDigest[0]++ }, ErrServingFence},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			owner, host, group := newHealthProbeOwner()
+			before := owner.members[group].command
+			replies := make(chan ownerReply, 1)
+			request := ownerRequest{kind: requestReplicaHealthObservation, group: group, targetMember: 2, reply: replies}
+			test.mutate(host, &request)
+			if err := owner.handle(request); !errors.Is(err, test.want) {
+				t.Fatalf("handle=%v want=%v", err, test.want)
+			}
+			if reply := <-replies; !errors.Is(reply.err, test.want) {
+				t.Fatalf("reply=%v want=%v", reply.err, test.want)
+			}
+			if host.snapshotCalls != 0 || owner.members[group].command != before {
+				t.Fatalf("rejected health cut acquired a snapshot or changed the command fence: snapshots=%d", host.snapshotCalls)
+			}
+		})
+	}
 }
 
 func (host *retirementHost) Remove(raftmember.GroupKey) error {
