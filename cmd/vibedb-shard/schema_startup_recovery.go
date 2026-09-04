@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/thesyncim/vibedb/internal/raftmember"
-	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/schemainstall"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"go.etcd.io/raft/v3"
@@ -17,10 +15,13 @@ import (
 // before a host, socket handler or result registry can use the old source.
 // A source recovery handle is never adopted into Raft: after its exact final
 // command is proved and the catalog CAS settles, only the target is opened.
-func openRF3RetainedApply(path string, wal *raftstore.Store,
+func openRF3RetainedApply(path string, wal rf3RecoveryLog,
 	base sqldriver.ReplicatedShardStoreIdentity, applyID sqldriver.ReplicatedApplyIdentity,
 	opening ...sqldriver.ReplicatedOpenOptions,
 ) (sqldriver.ReplicatedShardStoreIdentity, sqldriver.ReplicatedApplyIdentity, *sqldriver.Database, *sqldriver.ReplicatedApply, error) {
+	if err := validateRF3RecoveryLog(wal); err != nil {
+		return base, applyID, nil, nil, err
+	}
 	targetSelected := false
 	_, published, err := sqldriver.ObservePublishedReplicatedSchemaTransition(path)
 	if err != nil {
@@ -95,7 +96,7 @@ func openRF3RetainedApply(path string, wal *raftstore.Store,
 					sourceOpening[0].SchemaCommittedTransition = string(entries[0].GetData())
 				}
 			}
-			database, source, err := raftmember.OpenBoundSQLWithApplyForSchemaSourceTransition(path, wal, base.Binding.Authority, base, applyID, transition.Bytes(), sourceOpening...)
+			database, source, err := openRF3SchemaSourceLog(path, wal, base, applyID, transition.Bytes(), sourceOpening...)
 			if err != nil && !errors.Is(err, sqldriver.ErrSchemaSourceNotCommitted) {
 				return base, applyID, nil, nil, fmt.Errorf("open retained schema source transition: %w", err)
 			}
@@ -121,7 +122,7 @@ func openRF3RetainedApply(path string, wal *raftstore.Store,
 			return base, applyID, nil, nil, err
 		}
 	}
-	database, apply, err := raftmember.OpenBoundSQLWithApplyRecoveringGeneration(path, wal, base.Binding.Authority, base, applyID, opening...)
+	database, apply, err := openRF3SelectedLog(path, wal, base, applyID, opening...)
 	if err != nil {
 		err = fmt.Errorf("open selected schema generation %d: %w", base.Binding.Authority.SchemaGeneration, err)
 	}
@@ -129,7 +130,7 @@ func openRF3RetainedApply(path string, wal *raftstore.Store,
 }
 
 func rf3SchemaTargetRecoveryOpening(
-	path string, wal *raftstore.Store, opening []sqldriver.ReplicatedOpenOptions,
+	path string, wal rf3RecoveryLog, opening []sqldriver.ReplicatedOpenOptions,
 ) ([]sqldriver.ReplicatedOpenOptions, error) {
 	transition, found, err := sqldriver.ObservePersistedReplicatedSchemaTransition(path)
 	if err != nil {

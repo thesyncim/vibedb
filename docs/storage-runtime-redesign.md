@@ -20,6 +20,15 @@ legacy WALs. Completing the design means wiring preparation, startup, hot group
 addition, checkpoint reclamation, schema recovery and shutdown through one
 node owner. Adding another unused abstraction is insufficient.
 
+The command's schema/startup recovery now accepts authenticated node-log group
+views as well as range files. Linux disk-backed tests reopen a shared log with
+two SQL groups and verify foreign-group rejection, uncommitted schema preparation,
+committed publication, and an applied SQL checkpoint ahead of its commit-only
+HardState. Each schema case repeats the physical-log restart and checks the
+neighboring group. This qualifies recovery integration only: normal startup and
+preparation still require the node-owner composition before space or throughput
+benefits can be measured.
+
 Use a new node manifest and fresh preparation format. Do not spend this
 unreleased redesign building a legacy data migration framework. Preserve exact
 cluster/group/store identity checks, durable incarnation allocation and retained
