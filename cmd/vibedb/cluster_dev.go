@@ -1764,26 +1764,54 @@ func (d *devDiagnostics) String() string {
 	return tail.String()
 }
 
-func reserveDevPorts(count int) ([]string, error) {
-	listeners := make([]net.Listener, count)
-	addresses := make([]string, count)
-	for i := range listeners {
-		l, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			for _, open := range listeners {
-				if open != nil {
-					open.Close()
-				}
-			}
-			return nil, err
-		}
-		listeners[i] = l
-		addresses[i] = l.Addr().String()
+func reserveDevPorts(count int, pgAddresses ...string) ([]string, error) {
+	return reserveDevPortsUsing(count, pgAddresses, net.Listen)
+}
+
+func reserveDevPortsUsing(count int, pgAddresses []string, listen func(string, string) (net.Listener, error)) (addresses []string, err error) {
+	if count < 0 {
+		return nil, errDevCluster
 	}
-	for _, l := range listeners {
-		if err := l.Close(); err != nil {
-			return nil, err
+	seen := make(map[string]bool, len(pgAddresses))
+	for _, address := range pgAddresses {
+		if address == "" {
+			continue
 		}
+		if !validDevPGAddress(address) || seen[address] {
+			return nil, fmt.Errorf("%w: PostgreSQL endpoints must be distinct literal loopback addresses", errDevCluster)
+		}
+		seen[address] = true
+	}
+	listeners := make([]net.Listener, 0, count+len(seen))
+	defer func() {
+		for index := len(listeners) - 1; index >= 0; index-- {
+			err = errors.Join(err, listeners[index].Close())
+		}
+		if err != nil {
+			addresses = nil
+		}
+	}()
+	// Hold the requested PG bindings while the kernel assigns every internal
+	// ephemeral port. Binding the actual addresses also handles address-family
+	// aliases according to the same socket rules used by the child processes.
+	for _, address := range pgAddresses {
+		if address == "" {
+			continue
+		}
+		listener, listenErr := listen("tcp", address)
+		if listenErr != nil {
+			return nil, fmt.Errorf("reserve PostgreSQL listener %q: %w", address, listenErr)
+		}
+		listeners = append(listeners, listener)
+	}
+	addresses = make([]string, count)
+	for index := range addresses {
+		listener, listenErr := listen("tcp", "127.0.0.1:0")
+		if listenErr != nil {
+			return nil, listenErr
+		}
+		listeners = append(listeners, listener)
+		addresses[index] = listener.Addr().String()
 	}
 	return addresses, nil
 }

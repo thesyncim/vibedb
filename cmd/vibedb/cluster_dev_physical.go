@@ -102,6 +102,19 @@ func initializeDevPhysicalCluster(options devClusterOptions, manifestPath string
 	if pgEnabled && len(filepath.Join(options.root, "node-1", "pg-ddl.sock")) >= len(syscall.RawSockaddrUnix{}.Path) {
 		return devClusterManifest{}, fmt.Errorf("%w: cluster root is too long for the PostgreSQL DDL Unix socket", errDevCluster)
 	}
+	// Each process owns four shard listeners, one embedded frontend listener,
+	// and a separate gateway-control listener. Reserve requested PG bindings
+	// before assigning those ports, and fail before writing durable identities
+	// when a caller's requested endpoint is unavailable.
+	physical := options.physicalNodes
+	pgAddresses := options.pgListens
+	if len(pgAddresses) == 0 && options.pgListen != "" {
+		pgAddresses = []string{options.pgListen}
+	}
+	ports, err := reserveDevPorts(1+physical*6, pgAddresses...)
+	if err != nil {
+		return devClusterManifest{}, err
+	}
 	if err := os.MkdirAll(options.root, 0o700); err != nil {
 		return devClusterManifest{}, err
 	}
@@ -122,7 +135,6 @@ func initializeDevPhysicalCluster(options devClusterOptions, manifestPath string
 		}
 	}
 
-	physical := options.physicalNodes
 	storageNodes := make([]rafttransport.NodeID, physical)
 	gatewayNodes := make([]rafttransport.NodeID, physical)
 	for i := 0; i < physical; i++ {
@@ -179,15 +191,6 @@ func initializeDevPhysicalCluster(options devClusterOptions, manifestPath string
 	}
 	clear(keyMaterial)
 
-	// Each process owns four shard listeners, one embedded frontend listener,
-	// and (for the designated controller) a separate gateway-control listener.
-	// The gateway-control socket cannot alias the shard control socket: both
-	// services are live in the same process but use different TLS principals.
-	portCount := 1 + physical*6
-	ports, err := reserveDevPorts(portCount)
-	if err != nil {
-		return devClusterManifest{}, err
-	}
 	frontend := make([]string, physical)
 	for i := range frontend {
 		frontend[i] = ports[1+i*6+5]
