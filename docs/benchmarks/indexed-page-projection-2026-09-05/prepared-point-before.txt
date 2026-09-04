@@ -2,10 +2,10 @@ goos: darwin
 goarch: arm64
 pkg: github.com/thesyncim/vibedb/gateway
 cpu: Apple M4 Max
-BenchmarkTmpPostgreSQLRF3PreparedPointQuery-16    	  541173	      6644 ns/op	   14958 B/op	     109 allocs/op
-BenchmarkTmpPostgreSQLRF3PreparedPointQuery-16    	  515566	      6505 ns/op	   14958 B/op	     109 allocs/op
-BenchmarkTmpPostgreSQLRF3PreparedPointQuery-16    	  530713	      6456 ns/op	   14957 B/op	     109 allocs/op
-BenchmarkTmpPostgreSQLRF3PreparedPointQuery-16    	  601802	      6219 ns/op	   14958 B/op	     109 allocs/op
-BenchmarkTmpPostgreSQLRF3PreparedPointQuery-16    	  541948	      6588 ns/op	   14958 B/op	     109 allocs/op
+BenchmarkTmpPostgreSQLRF3PreparedPointQuery-16    	  511502	      6024 ns/op	   14958 B/op	     109 allocs/op
+BenchmarkTmpPostgreSQLRF3PreparedPointQuery-16    	  602989	      5897 ns/op	   14957 B/op	     109 allocs/op
+BenchmarkTmpPostgreSQLRF3PreparedPointQuery-16    	  619407	      5865 ns/op	   14956 B/op	     109 allocs/op
+BenchmarkTmpPostgreSQLRF3PreparedPointQuery-16    	  613640	      5926 ns/op	   14957 B/op	     109 allocs/op
+BenchmarkTmpPostgreSQLRF3PreparedPointQuery-16    	  616170	      5887 ns/op	   14957 B/op	     109 allocs/op
 PASS
-ok  	github.com/thesyncim/vibedb/gateway	18.240s
+ok  	github.com/thesyncim/vibedb/gateway	18.069s

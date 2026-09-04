@@ -30,9 +30,9 @@ front-end, routing, and merge cost with transport responses held constant. Five
 
 | Prepared point path | ns/op | Bytes/op | Allocations/op |
 |---|---:|---:|---:|
-| Main | 6,505 | 14,958 | 109 |
-| Candidate | 4,329 | 10,153 | 78 |
-| Change | -33.5% | -32.1% | -28.4% |
+| Main | 5,897 | 14,957 | 109 |
+| Candidate | 4,301 | 10,152 | 78 |
+| Change | -27.1% | -32.1% | -28.4% |
 
 Raw output is in `prepared-point-before.txt` and
 `prepared-point-after.txt`.
@@ -47,30 +47,30 @@ data processes plus the gateway. Each independently generated fixture has
 500,000 deterministic 256-byte-payload rows, which is 1,953 times the largest
 returned page.
 
-The candidate ran before the confirmation baseline. Every build ran 6,000 point
-operations or 3,000 range operations per trial, 500 warmups, five repetitions,
+The latest-main baseline ran before the candidate on a separate fresh cluster.
+Every build ran 6,000 point operations or 3,000 range operations per trial, 500 warmups, five repetitions,
 and 1 or 8 closed-loop clients. Every operation checked its returned values and
 order. The harness also verified the complete table before and after each
 50-trial matrix. All 100 trials completed with zero errors.
 
 | Query | Clients | Main ops/s | Candidate ops/s | Throughput | Main p50 us | Candidate p50 us | p50 latency |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| point hit | 1 | 3,847.7 | 3,923.5 | +2.0% | 244.9 | 238.5 | -2.6% |
-| point hit | 8 | 19,237.1 | 19,378.8 | +0.7% | 390.1 | 384.3 | -1.5% |
-| point miss | 1 | 3,953.9 | 4,046.0 | +2.3% | 236.4 | 229.9 | -2.7% |
-| point miss | 8 | 20,588.1 | 20,849.1 | +1.3% | 368.7 | 364.8 | -1.1% |
-| range 32 | 1 | 3,308.3 | 3,425.0 | +3.5% | 285.7 | 274.3 | -4.0% |
-| range 32 | 8 | 15,874.3 | 16,959.8 | +6.8% | 466.7 | 439.2 | -5.9% |
-| range 64 | 1 | 2,890.6 | 3,019.4 | +4.5% | 327.0 | 311.1 | -4.9% |
-| range 64 | 8 | 13,591.5 | 14,617.0 | +7.5% | 542.8 | 509.9 | -6.1% |
-| range 256 | 1 | 1,793.4 | 1,886.0 | +5.2% | 531.1 | 508.8 | -4.2% |
-| range 256 | 8 | 7,340.0 | 8,498.8 | +15.8% | 990.8 | 865.2 | -12.7% |
+| point hit | 1 | 3,959.2 | 4,079.5 | +3.0% | 236.6 | 228.7 | -3.3% |
+| point hit | 8 | 20,441.9 | 20,797.6 | +1.7% | 368.8 | 364.3 | -1.2% |
+| point miss | 1 | 4,052.3 | 4,099.5 | +1.2% | 229.4 | 227.2 | -0.9% |
+| point miss | 8 | 21,478.4 | 21,990.9 | +2.4% | 356.0 | 348.0 | -2.3% |
+| range 32 | 1 | 3,376.0 | 3,540.2 | +4.9% | 276.6 | 265.7 | -3.9% |
+| range 32 | 8 | 16,595.2 | 17,996.0 | +8.4% | 449.7 | 418.7 | -6.9% |
+| range 64 | 1 | 3,000.9 | 3,148.3 | +4.9% | 314.8 | 299.5 | -4.9% |
+| range 64 | 8 | 14,013.7 | 15,428.0 | +10.1% | 524.4 | 485.8 | -7.4% |
+| range 256 | 1 | 1,853.2 | 1,985.5 | +7.1% | 511.0 | 479.9 | -6.1% |
+| range 256 | 8 | 7,796.5 | 8,959.6 | +14.9% | 935.7 | 826.7 | -11.6% |
 
-Public point throughput improves 0.7-2.3% and median latency improves 1.1-2.7%;
+Public point throughput improves 1.2-3.0% and median latency improves 0.9-3.3%;
 network and quorum work dominate this one-row wall-clock result. The fixed
 planning and materialization savings become clearer with wider pages. The
 largest public gain is the 256-row range at eight clients: throughput rises
-15.8% and median latency falls 12.7%. The isolated prepared gateway benchmark
+14.9% and median latency falls 11.6%. The isolated prepared gateway benchmark
 shows the larger CPU/allocation reduction before network and quorum latency.
 
 The original target was a 1,000,000-row distributed fixture. A single-shard RF3

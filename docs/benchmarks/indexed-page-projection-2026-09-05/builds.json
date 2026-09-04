@@ -1,17 +1,18 @@
 {
-  "baseline_commit": "816b8d9d3aa710215258c876a2f070056fc73a4be",
-  "candidate_code_commit": "e257671374c28c2d258ef6e69c6db147bca3ec67",
+  "baseline_commit": "0951f0da7e61027807a06dbdc2a304fcb8e5e2ce",
+  "candidate_code_commit": "88b85843c0fd6c8d81c5699a327059b01a15cff7",
   "baseline": {
-    "vibedb": "688cbbfd215c2ed7192729ee798a9b38953bac45cfd677133be0ef838e4b5264",
-    "vibedb-gateway": "297cb59c8eafdd4e55750d6f71803f51d57abe5afadc8051c65dd80014ce2fa5",
-    "vibedb-shard": "9d7e3649406c803f303e0213c5ed7160e99a4c2b4747d21335d049ff36e0722c"
+    "vibedb": "8aa30d97fdf2c11abbdf096b63d29e1e3538f012b0693df7f8ac4af35fa2af25",
+    "vibedb-gateway": "adbc69b83b3336b4df0aa38f2237d3baad006f998a02807ebfbbd6e627ae1690",
+    "vibedb-shard": "85a72f1a344864614b62c931c10070dcc9cfb4fb0967f0df977a50e4f6a7d008"
   },
   "candidate": {
-    "vibedb": "572955068b42f615f1396e632258aa10c1c89c4d8261082915db3e861d55ec29",
-    "vibedb-gateway": "f7a731dd3a8f0e281a43e0fa95cbdeb4d5311586c141c3469695ab04ec06a7cc",
-    "vibedb-shard": "5bb74e71609f4f4c0d829ec577f63041de5d34c066abb419a589de187134b38b"
+    "vibedb": "6048c778aa9b8b2b35e1a9b099fa1ab478322d4e0f4d5cd0e028a77e5f4a86f9",
+    "vibedb-gateway": "f4b64bb9559aad2f13b362a187e6b8831d8bcc1566ddcc4127097497e64217a8",
+    "vibedb-shard": "9a4aab2e04bfe9fa32ee9e22699216288f4b380a39b6ed389edc850e2bc68019"
   },
   "local_toolchain": "go1.27.0 darwin/arm64",
-  "distributed_toolchain": "go1.27.1 linux/arm64",
-  "distributed_process_limit": "GOMAXPROCS=2"
+  "distributed_toolchain": "go1.27.0 linux/arm64 (cross-compiled on darwin/arm64)",
+  "distributed_process_limit": "GOMAXPROCS=2",
+  "rf3_sqlbench": "5f4170b261bd4ab4b4486c24d0b44383e0064c13695bd09a2868644c0ea1a979"
 }
