@@ -153,7 +153,7 @@ type fileWorkspace struct {
 	// value a partial keeps is detached first), so a worker can reuse its own
 	// across consecutive batches and keep its column, text, selection, and
 	// shape-cache storage warm for the whole execution.
-	workers []Workspace
+	workers []fileWorkerWorkspace
 	// segments is one scan Segment per worker goroutine, indexed like workers
 	// and reset rather than rebuilt between batches. It is a slice of pointers
 	// because a Segment carries a mutex, so a slice of values could not be grown
@@ -1323,12 +1323,13 @@ type fileGroup struct {
 // next batch's bytes rather than fault.
 func (p *plan) makeFilePartial(
 	batch fileBatch,
-	w *Workspace,
+	worker *fileWorkerWorkspace,
 	docs *store.Segment,
 	slots []fileSlot,
 	arena *fileArena,
 	budget *aggregateBudget,
 ) filePartial {
+	w := &worker.Workspace
 	part := filePartial{seq: batch.seq}
 	if err := w.checkCanceled(); err != nil {
 		part.err = err
@@ -1342,63 +1343,69 @@ func (p *plan) makeFilePartial(
 		}
 	}
 	slot := &slots[batch.seq%uint64(len(slots))]
-	// The batch Segment carries no postings, and that is a decision, not an
-	// omission. Postings are an inverted index over a Segment's top-level keys
-	// and scalars; building one costs a hash and a bucket append per member of
-	// every document, and this Segment is probed exactly once and then dropped,
-	// so the build can never amortize. The filtered-count benchmark covers the
-	// most favorable pruning case and still makes the temporary index slower
-	// and allocation-heavy; exact results live in docs/performance.md. Real
-	// pushdown happens before the scan, against the snapshot's persistent
-	// indexes (fileCandidateMasks); once a batch is in hand the compiled
-	// predicate's single pass over at most BatchRows rows is already cheaper
-	// than indexing them. Candidate selection and the full scan return the same
-	// rows by construction, so this changes cost only.
-	docs.Reset()
-	start := 0
-	for row, end := range batch.ends {
-		if err := cancellationCheckpoint(w.cancel, row); err != nil {
-			part.err = err
-			return part
-		}
-		document := batch.data[start:end]
-		if _, err := docs.Append(document); err != nil {
-			part.err = err
-			return part
-		}
-		start = end
-	}
 	w.text = w.text[:0]
+	w.lateText = w.lateText[:0]
 	w.groupKey = w.groupKey[:0]
 	ctx := &w.ctx
-	ctx.s, ctx.rows = docs, docs.Len()
-	if path, lit, ok := p.scalarCountPath(); ok {
-		w.raws = resize(w.raws, 1)
-		raws := w.ctx.cache.AppendField(w.raws[0][:0], docs, path.name)
-		w.raws[0] = raws
-		w.text = w.text[:0]
-		count := 0
-		for row, raw := range raws {
+	if handled, err := worker.extractFileColumns(p, batch); err != nil {
+		part.err = err
+		return part
+	} else if !handled {
+		// The batch Segment carries no postings, and that is a decision, not an
+		// omission. Postings are an inverted index over a Segment's top-level keys
+		// and scalars; building one costs a hash and a bucket append per member of
+		// every document, and this Segment is probed exactly once and then dropped,
+		// so the build can never amortize. The filtered-count benchmark covers the
+		// most favorable pruning case and still makes the temporary index slower
+		// and allocation-heavy; exact results live in docs/performance.md. Real
+		// pushdown happens before the scan, against the snapshot's persistent
+		// indexes (fileCandidateMasks); once a batch is in hand the compiled
+		// predicate's single pass over at most BatchRows rows is already cheaper
+		// than indexing them. Candidate selection and the full scan return the same
+		// rows by construction, so this changes cost only.
+		docs.Reset()
+		start := 0
+		for row, end := range batch.ends {
 			if err := cancellationCheckpoint(w.cancel, row); err != nil {
 				part.err = err
 				return part
 			}
-			if rawEqualsScalar(raw, lit, &w.text) {
-				count++
+			document := batch.data[start:end]
+			if _, err := docs.Append(document); err != nil {
+				part.err = err
+				return part
 			}
+			start = end
 		}
-		accs := resize(slot.accs, len(p.columns))
-		resetAggs(accs)
-		for i := range accs {
-			accs[i].count = count
+		ctx.s, ctx.rows = docs, docs.Len()
+		if path, lit, ok := p.scalarCountPath(); ok {
+			w.raws = resize(w.raws, 1)
+			raws := w.ctx.cache.AppendField(w.raws[0][:0], docs, path.name)
+			w.raws[0] = raws
+			w.text = w.text[:0]
+			count := 0
+			for row, raw := range raws {
+				if err := cancellationCheckpoint(w.cancel, row); err != nil {
+					part.err = err
+					return part
+				}
+				if rawEqualsScalar(raw, lit, &w.text) {
+					count++
+				}
+			}
+			accs := resize(slot.accs, len(p.columns))
+			resetAggs(accs)
+			for i := range accs {
+				accs[i].count = count
+			}
+			slot.accs, part.accs = accs, accs
+			part.bytes = int64(len(accs)) * aggAccStructBytes
+			return part
 		}
-		slot.accs, part.accs = accs, accs
-		part.bytes = int64(len(accs)) * aggAccStructBytes
-		return part
-	}
-	if err := ctx.extract(p, nil, w); err != nil {
-		part.err = err
-		return part
+		if err := ctx.extract(p, nil, w); err != nil {
+			part.err = err
+			return part
+		}
 	}
 	if err := w.checkCanceled(); err != nil {
 		part.err = err

@@ -110,7 +110,7 @@ type fileJob struct {
 	skip      *durable.DataSkippingFilter
 	overflow  *[]byte
 	slots     []fileSlot
-	spaces    []Workspace
+	spaces    []fileWorkerWorkspace
 	segments  []*store.Segment
 	arenas    []fileArenaSet
 	opts      normalizedFileOptions
@@ -269,6 +269,12 @@ func (pool *filePool) work(at int) {
 	job := &pool.job
 	p, slots := job.p, job.slots
 	w := &job.spaces[at]
+	defer func() {
+		// Directory names borrow the compiled plan; parked workers retain only
+		// the directory's capacity after this execution finishes or cancels.
+		clear(w.columns)
+		w.columns = w.columns[:0]
+	}()
 	// The worker's scan Segment is minted on the execution that first needs
 	// this worker number and reset by every batch after, so a warm Exec
 	// allocates none at all.

@@ -576,7 +576,10 @@ func assertCanceledExecClean(t *testing.T, exec *Exec) {
 		)
 	}
 	for i := range exec.file.workers {
-		assertWorkspaceBorrowedViewsCleared(t, &exec.file.workers[i])
+		assertWorkspaceBorrowedViewsCleared(t, &exec.file.workers[i].Workspace)
+		if len(exec.file.workers[i].columns) != 0 {
+			t.Fatalf("canceled durable worker %d retained its column directory", i)
+		}
 		if len(exec.file.workers[i].eval.binds) != 0 {
 			t.Fatalf("canceled durable worker %d retained join bindings", i)
 		}

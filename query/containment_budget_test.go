@@ -130,6 +130,11 @@ func TestHeapContainmentBudgetPropagatesAcrossSources(t *testing.T) {
 // own admission account without adding a second validation pass to every
 // ordinary row.
 func TestDurablePunctuationDenseContainmentIsBounded(t *testing.T) {
+	t.Run("direct columns", func(t *testing.T) { testDurablePunctuationDenseContainment(t, false) })
+	t.Run("nested path fallback", func(t *testing.T) { testDurablePunctuationDenseContainment(t, true) })
+}
+
+func testDurablePunctuationDenseContainment(t *testing.T, nestedPath bool) {
 	file, err := os.CreateTemp(t.TempDir(), "containment-budget-*")
 	if err != nil {
 		t.Fatal(err)
@@ -144,6 +149,9 @@ func TestDurablePunctuationDenseContainmentIsBounded(t *testing.T) {
 	defer collection.Close()
 
 	document := []byte(`{"id":1,"hay":` + denseContainmentArray(5_000) + `}`)
+	if nestedPath {
+		document = []byte(`{"id":1,"nested":{"hay":` + denseContainmentArray(5_000) + `}}`)
+	}
 	if _, err := collection.Put([]byte("row"), document); err != nil {
 		t.Fatal(err)
 	}
@@ -154,6 +162,9 @@ func TestDurablePunctuationDenseContainmentIsBounded(t *testing.T) {
 	defer snapshot.Close()
 
 	query := Select(Count()).Where(Contains("hay", "0"))
+	if nestedPath {
+		query = Select(Count()).Where(Contains("nested.hay", "0"))
+	}
 	exec := Exec{Options: ExecOptions{
 		Workers:     1,
 		BatchRows:   1,
@@ -167,8 +178,12 @@ func TestDurablePunctuationDenseContainmentIsBounded(t *testing.T) {
 	if len(exec.file.segments) != 1 || exec.file.segments[0] == nil {
 		t.Fatal("durable worker did not reach its scratch Segment")
 	}
-	if got := exec.file.segments[0].Len(); got != 1 {
-		t.Fatalf("durable scratch Segment contains %d documents, want 1", got)
+	wantDocuments := 0
+	if nestedPath {
+		wantDocuments = 1
+	}
+	if got := exec.file.segments[0].Len(); got != wantDocuments {
+		t.Fatalf("durable scratch Segment contains %d documents, want %d", got, wantDocuments)
 	}
 	tape := cap(exec.file.workers[0].eval.entries)
 	if tape == 0 || tape >= 5_000 {
