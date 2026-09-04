@@ -247,7 +247,9 @@ type Database struct {
 	disk      *durable.Database
 	heap      store.Database
 
-	handlesMu sync.Mutex
+	// handlesMu guards the catalog handle map. Lookup hits take it shared;
+	// only handle creation and teardown take it exclusively.
+	handlesMu sync.RWMutex
 	handles   map[string]*Collection
 
 	// commitMu serializes Commit validation and publication. Multi-collection
@@ -353,6 +355,18 @@ func (d *Database) Collection(name string) *Collection {
 	if !validCollectionName(name) {
 		return &Collection{name: name, initialErr: ErrInvalidCollectionName}
 	}
+	// Fast path: existing handles resolve shared, so concurrent
+	// transactions on disjoint collections never serialize here.
+	d.handlesMu.RLock()
+	collection := d.handles[name]
+	closed := d.closed.Load()
+	d.handlesMu.RUnlock()
+	if closed {
+		return &Collection{name: name, initialErr: ErrClosed}
+	}
+	if collection != nil {
+		return collection
+	}
 	d.handlesMu.Lock()
 	defer d.handlesMu.Unlock()
 	if d.closed.Load() {
@@ -361,7 +375,7 @@ func (d *Database) Collection(name string) *Collection {
 	if collection := d.handles[name]; collection != nil {
 		return collection
 	}
-	collection := &Collection{name: strings.Clone(name), owner: d}
+	collection = &Collection{name: strings.Clone(name), owner: d}
 	d.handles[collection.name] = collection
 	return collection
 }

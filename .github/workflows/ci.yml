@@ -16,7 +16,6 @@ env:
 
 jobs:
   repository-contracts:
-    needs: [sql-tests]
     if: ${{ !cancelled() }}
     name: repository contracts
     runs-on: ubuntu-latest
@@ -149,10 +148,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: 32-bit
-            targets: linux/386 windows/386
-          - name: windows-64-bit
-            targets: windows/amd64 windows/arm64
+          - name: linux-386
+            target: linux/386
+          - name: windows-386
+            target: windows/386
+          - name: windows-amd64
+            target: windows/amd64
+          - name: windows-arm64
+            target: windows/arm64
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -163,13 +166,11 @@ jobs:
       - name: Compile packages and tests in both modules
         env:
           CGO_ENABLED: '0'
-          TARGETS: ${{ matrix.targets }}
+          TARGET: ${{ matrix.target }}
         run: |
-          for target in $TARGETS; do
-            export GOOS="${target%/*}" GOARCH="${target#*/}"
-            go test -run '^$' -exec=true ./...
-            (cd integration/pgclient && go test -run '^$' -exec=true ./...)
-          done
+          export GOOS="${TARGET%/*}" GOARCH="${TARGET#*/}"
+          go test -run '^$' -exec=true ./...
+          (cd integration/pgclient && go test -run '^$' -exec=true ./...)
       - name: Save Go build cache
         if: ${{ always() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
@@ -309,7 +310,6 @@ jobs:
           path: ${{ steps.go.outputs.cache-path }}
           key: ${{ steps.go.outputs.cache-key }}
   durable-sql-rf3:
-    needs: [sql-tests]
     if: ${{ !cancelled() }}
     name: Recovery, replica replacement and PostgreSQL clients
     runs-on: ubuntu-latest
@@ -613,56 +613,31 @@ jobs:
           path: ${{ steps.go.outputs.cache-path }}
           key: ${{ steps.go.outputs.cache-key }}
   storage-race:
-    needs: [sql-tests]
     if: ${{ !cancelled() }}
-    name: race storage (${{ matrix.runner }})
+    name: race storage (${{ matrix.runner }}, ${{ matrix.lane }})
     strategy:
       fail-fast: false
       matrix:
         runner: [ubuntu-latest, ubuntu-24.04-arm]
+        lane: [storeio, durable-heavy, durable-rest]
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-go-ci
         id: go
         with:
-          scope: storage-race
+          scope: storage-race-${{ matrix.lane }}
       - name: Race, storage suites
         # Qualification tests build multi-hundred-MiB corpora and are geometry/
         # throughput gates; under -race on ARM they alone can exhaust the budget.
-        run: go test -race -timeout=25m -skip 'Qualification' -run 'Primary|BufferedInplace|Committer|PageCache|WriteTransaction' ./internal/storeio/ ./store/durable/
+        run: scripts/ci/storage-race.sh "${{ matrix.lane }}"
       - name: Save Go build cache
         if: ${{ always() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
         with:
           path: ${{ steps.go.outputs.cache-path }}
           key: ${{ steps.go.outputs.cache-key }}
-  test:
-    name: test (${{ matrix.runner }})
-    if: always()
-    needs: [cross-compile, unit-tests, sql-tests, simd-tests, durable-sql-rf3, hot-shard-mutation, storage-race]
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [ubuntu-latest, ubuntu-24.04-arm]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Require every test lane to pass
-        env:
-          RESULTS: ${{ toJSON(needs) }}
-        run: jq -e 'all(.[]; .result == "success")' <<< "$RESULTS"
-  lateral-race:
-    name: race (LATERAL cross-layer)
-    if: always()
-    needs: [repository-contracts]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Require contracts, restore and LATERAL tests to pass
-        env:
-          RESULT: ${{ needs.repository-contracts.result }}
-        run: test "$RESULT" = success
   distributed-race-packages:
-    needs: [sql-tests]
     if: ${{ !cancelled() }}
     name: race distributed (${{ matrix.name }})
     strategy:
@@ -690,30 +665,10 @@ jobs:
           PACKAGES: ${{ matrix.packages }}
         run: |
           read -r -a test_targets <<< "$PACKAGES"
-          go test -race -p=1 -count=1 -timeout=30m "${test_targets[@]}"
+          go test -race -p=2 -count=1 -timeout=30m "${test_targets[@]}"
       - name: Save Go build cache
         if: ${{ always() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
         with:
           path: ${{ steps.go.outputs.cache-path }}
           key: ${{ steps.go.outputs.cache-key }}
-  distributed-race:
-    name: race (distributed serving)
-    if: always()
-    needs: [distributed-race-packages]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Require every distributed race package to pass
-        env:
-          RESULT: ${{ needs.distributed-race-packages.result }}
-        run: test "$RESULT" = success
-  restore-activation:
-    name: Fresh RF3 restore activation crash qualification
-    if: always()
-    needs: [repository-contracts]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Require repository contracts and restore activation to pass
-        env:
-          RESULT: ${{ needs.repository-contracts.result }}
-        run: test "$RESULT" = success

@@ -1,0 +1,4 @@
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY vibedb vibedb-shard vibedb-gateway vibedb-operator vibedb-kube-qualify /usr/local/bin/
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/vibedb"]

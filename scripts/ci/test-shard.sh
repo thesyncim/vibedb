@@ -3,8 +3,9 @@ set -euo pipefail
 
 export GOEXPERIMENT=${GOEXPERIMENT:-simd}
 
-# Keep mmap-heavy package binaries serial within a runner. Parallelism is
-# provided by isolated Actions runners, not competing arenas on one machine.
+# Keep mmap-heavy durable package binaries serial. The remaining shards use
+# two package workers: measured SQL and process packages otherwise leave half
+# of the runner idle, while core's many packages serialize avoidably.
 shard=${1:?usage: test-shard.sh durable|durable-churn|durable-large-cache|sql|process|core [--list]}
 case "$shard" in
   durable|durable-churn|durable-large-cache|sql|process|core) ;;
@@ -46,7 +47,11 @@ printf 'Test shard %s: %s packages\n' "$shard" "${#selected[@]}"
 # The two pressure qualifications consumed 167s of 287s in the measured
 # package. Complementary anchored filters retain every test and subtest.
 pressure_tests='^(TestFilePrimaryChurnQualification|TestFilePrimaryLargerThanCacheQualification)$'
-test_args=(-json -p=1 -timeout=25m)
+package_parallelism=1
+case "$shard" in
+  sql|process|core) package_parallelism=2 ;;
+esac
+test_args=(-json "-p=${package_parallelism}" -timeout=25m)
 case "$shard" in
   durable) test_args+=(-skip "$pressure_tests") ;;
   durable-churn) test_args+=(-run '^TestFilePrimaryChurnQualification$') ;;
