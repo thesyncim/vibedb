@@ -1,0 +1,61 @@
+{
+  "source_revision": "b5d84523dfbf50f5ff9b820a2dc2a6b83e3f4be4",
+  "source_status": "",
+  "go_version": "go version go1.27.0 darwin/arm64",
+  "architecture": "arm64",
+  "crdb_image": "cockroachdb/cockroach:v26.3.1@sha256:204f131510c78393adb02345f289a8dbb32e1491e26cc92b6c7751f3b97be3c5",
+  "limits": {
+    "shared_cpus": 12,
+    "shared_memory_bytes": 25769803776
+  },
+  "options": {
+    "output": "/private/tmp/vibedb-crdb-sql-ordered-limit-b5d84523",
+    "rows": 8192,
+    "operations": 20000,
+    "scans": 2000,
+    "warmup": 1000,
+    "repetitions": 3,
+    "clients": "1,8",
+    "order": "vibedb-first"
+  },
+  "binary_sha256": {
+    "vibedb": "afe312af690149055daa3c55d5abcf5a37e1a70857d1cf6181571a99145a5a49",
+    "rf3-sqlbench": "392909e0447dec401bc75b583e0cc08eed1f1bdad0c71f6636e85f1833799dd9",
+    "cockroach": "7923d5eca1fc275abebd64863fa5e5c51be3504fd57f37c5b8c4f8579bd54c3e",
+    "vibedb-gateway": "83edbafa6a6b02423ad4a241740b45cf07ac748db7f4549f835fd53faae4473f",
+    "vibedb-shard": "c7923c3de02326047294577b0f6adf8eba673978b91fc15853a87a0d81ecb2a8"
+  },
+  "method": "single Linux container; shared disk volume; engines run sequentially; SQL loopback trust/plaintext; inter-node TLS; no durability settings disabled",
+  "docker": {
+    "Architecture": "aarch64",
+    "NCPU": 16,
+    "MemTotal": 50425147392,
+    "KernelVersion": "7.0.12-linuxkit",
+    "OperatingSystem": "Docker Desktop"
+  },
+  "runtime_image": {
+    "Id": "sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b",
+    "RepoDigests": [
+      "golang@sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b"
+    ],
+    "Architecture": "arm64",
+    "Os": "linux"
+  },
+  "runner_exit_codes": {
+    "vibedb": 1,
+    "cockroachdb": 0
+  },
+  "evidence": {
+    "vibedb": {
+      "raw_sha256": "be2f6ca8d19ca4ac33cf6ecaa12d1ba9b5c4443c6534b851ede8ebc0da9999d1",
+      "started_utc": "2026-09-04T06:43:48Z",
+      "version": "PostgreSQL 16.0 (vibedb pgwire)"
+    },
+    "cockroachdb": {
+      "raw_sha256": "2ee26122a2facf1718b9c63862a6c3501ced0438369ce3cb8b19462ef9f4b973",
+      "started_utc": "2026-09-04T06:45:56Z",
+      "version": "CockroachDB CCL v26.3.1 (aarch64-unknown-linux-gnu, built 2026/08/24 17:37:27, go1.26.6)"
+    }
+  },
+  "shutdown_notes": "Forced post-measurement shutdown: cockroach\n"
+}
