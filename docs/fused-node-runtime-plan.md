@@ -259,6 +259,15 @@ samples validate, but this remains a shortened single-host diagnostic and
 does not pass the tranche or full objective. Runtime health warnings remain
 in the retained logs even though health publication is active in every arm.
 
+Main `ea866504` (window-count and sorting optimizations) was then merged at
+`0383eb86` and passed the focused query tests and independent review. A fresh
+[SIMD write profile](benchmarks/fused-health-2026-09-04/write-profile-0383eb86/README.md)
+verifies 16,000 updates with zero errors. Compressed leaf reconstruction takes
+12.6–25.8% of each node's sampled CPU; proposal/apply and node-log durability
+waits remain substantial. These instrumented timings are not a new speedup
+claim. The next investigations are private guarded preimage reads and compact
+column patching during batch application.
+
 The real Linux physical3/physical6 process test remains a failing gate.
 Both layouts create three tables and validate topology and identities.
 Physical3 acknowledges 18 writes and passes the owner PG content oracle,
