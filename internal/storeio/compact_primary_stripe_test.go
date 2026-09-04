@@ -1591,6 +1591,10 @@ func TestCompactPrimaryScanDictionaryReservoirAllWidths(t *testing.T) {
 				dirty := make([]byte, 32)
 				for row, id := range ids {
 					seenOffset[row*width&7] = true
+					directID, directOK := compactPrimaryScanDictionaryID(&stream, row)
+					if !directOK || directID != id {
+						t.Fatalf("direct row=%d offset=%d id=%d,%v want=%d", row, row*width&7, directID, directOK, id)
+					}
 					for at := range dirty {
 						dirty[at] = 0xcc
 					}
