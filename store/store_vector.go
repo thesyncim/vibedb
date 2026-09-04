@@ -1,18 +1,24 @@
 package store
 
-// Persistent 32-way radix vector for immutable document chunks. Updating one
-// chunk path-copies O(log32(chunks)) fixed nodes; appending grows the root by
+// Persistent 16-way radix vector for immutable document chunks. Updating one
+// chunk path-copies O(log16(chunks)) fixed nodes; appending grows the root by
 // one level only when its address space is full. There is no corpus-wide chunk
 // pointer slice to copy and no relocation or compaction event.
+//
+// The fanout is 16 rather than 32 so one node is 256 bytes (a single 32-slot
+// node would be 512): every commit path-copies the nodes above its chunk, so
+// the narrower node halves per-commit vector garbage for the depth-0 case
+// that covers collections up to 16 chunks, and halves it at every level
+// above. Depth still grows geometrically, so the address space is unchanged.
 
 type storeChunkNode struct {
-	children [32]*storeChunkNode
-	leaves   [32]*Chunk
+	children [16]*storeChunkNode
+	leaves   [16]*Chunk
 }
 
 type storeChunkVector struct {
 	root  *storeChunkNode
-	depth uint8 // zero means root.leaves; Each higher level consumes five bits
+	depth uint8 // zero means root.leaves; Each higher level consumes four bits
 	Count uint32
 }
 
@@ -22,12 +28,12 @@ func (v storeChunkVector) Get(id uint32) *Chunk {
 	}
 	node := v.root
 	for level := v.depth; level > 0; level-- {
-		node = node.children[(id>>(uint(level)*5))&31]
+		node = node.children[(id>>(uint(level)*4))&15]
 		if node == nil {
 			return nil
 		}
 	}
-	return node.leaves[id&31]
+	return node.leaves[id&15]
 }
 
 func (v storeChunkVector) set(id uint32, chunk *Chunk) storeChunkVector {
@@ -44,19 +50,19 @@ func storeChunkSet(node *storeChunkNode, level uint8, id uint32, chunk *Chunk) *
 		out = *node
 	}
 	if level == 0 {
-		out.leaves[id&31] = chunk
+		out.leaves[id&15] = chunk
 		return &out
 	}
-	i := (id >> (uint(level) * 5)) & 31
+	i := (id >> (uint(level) * 4)) & 15
 	out.children[i] = storeChunkSet(out.children[i], level-1, id, chunk)
 	return &out
 }
 
 func (v storeChunkVector) append(chunk *Chunk) (storeChunkVector, uint32) {
 	id := v.Count
-	capacity := uint64(32) << (uint(v.depth) * 5)
+	capacity := uint64(16) << (uint(v.depth) * 4)
 	if uint64(v.Count) == capacity {
-		v.root = &storeChunkNode{children: [32]*storeChunkNode{v.root}}
+		v.root = &storeChunkNode{children: [16]*storeChunkNode{v.root}}
 		v.depth++
 	}
 	v.Count++
@@ -69,9 +75,9 @@ func (v storeChunkVector) append(chunk *Chunk) (storeChunkVector, uint32) {
 // the vector, ordinary collection updates use the persistent append/set methods.
 func (v *storeChunkVector) appendTransient(chunk *Chunk) uint32 {
 	id := v.Count
-	capacity := uint64(32) << (uint(v.depth) * 5)
+	capacity := uint64(16) << (uint(v.depth) * 4)
 	if uint64(v.Count) == capacity {
-		v.root = &storeChunkNode{children: [32]*storeChunkNode{v.root}}
+		v.root = &storeChunkNode{children: [16]*storeChunkNode{v.root}}
 		v.depth++
 	}
 	v.Count++
@@ -84,10 +90,10 @@ func storeChunkSetTransient(node **storeChunkNode, level uint8, id uint32, chunk
 		*node = &storeChunkNode{}
 	}
 	if level == 0 {
-		(*node).leaves[id&31] = chunk
+		(*node).leaves[id&15] = chunk
 		return
 	}
-	i := (id >> (uint(level) * 5)) & 31
+	i := (id >> (uint(level) * 4)) & 15
 	storeChunkSetTransient(&(*node).children[i], level-1, id, chunk)
 }
 
@@ -131,7 +137,7 @@ func storeChunkNext(node *storeChunkNode, level uint8, prefix, count, from uint6
 		return 0, nil, false
 	}
 
-	shift := uint(level) * 5
+	shift := uint(level) * 4
 	start := 0
 	if from > prefix {
 		start = int((from - prefix) >> shift)
@@ -171,7 +177,7 @@ func storeChunkEach(node *storeChunkNode, level uint8, prefix, count uint32, fn 
 		}
 		return true
 	}
-	shift := uint(level) * 5
+	shift := uint(level) * 4
 	for i, child := range node.children {
 		if child == nil {
 			continue
