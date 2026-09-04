@@ -32,6 +32,9 @@ if sys.argv[1:] == ["list", "./..."]:
 if sys.argv[1] == "test":
     print(json.dumps(sys.argv[1:]))
     sys.exit(int(os.environ.get("TEST_STATUS", "0")))
+if sys.argv[1] == "vet":
+    print(json.dumps(sys.argv[1:]))
+    sys.exit(int(os.environ.get("VET_STATUS", "0")))
 sys.exit(99)
 ''')
         fake_go.chmod(0o755)
@@ -94,6 +97,19 @@ sys.exit(99)
         self.assertEqual(args, ["test", "-json", "-p=2", "-timeout=25m",
                                 PREFIX + "/cmd/vibedb-gateway", PREFIX + "/cmd/vibedb-shard",
                                 PREFIX + "/internal/gatewayruntime"])
+
+    def test_core_runs_tests_then_full_vet(self):
+        result = self.run_shard("core")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        commands = [json.loads(line) for line in result.stdout.splitlines()
+                    if line.startswith("[")]
+        self.assertEqual(commands[-1], ["vet", "./..."])
+        core_test = commands[0]
+        self.assertEqual(core_test[0], "test")
+        self.assertEqual(core_test[1:4], ["-json", "-p=4", "-timeout=25m"])
+
+        self.env["VET_STATUS"] = "8"
+        self.assertEqual(self.run_shard("core").returncode, 8)
 
 
 if __name__ == "__main__":
