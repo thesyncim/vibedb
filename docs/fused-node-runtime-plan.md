@@ -302,3 +302,15 @@ table placement in its pinned catalog during PG verification. The latter
 failure does not record which frontend returned it. Crash/restart is not
 reached. Keep this regression visible; neither recovery qualification nor
 complete frontend visibility is established.
+
+Main `f4644b8e` (PR #133, bounded scans and packed string/date rendering) was
+merged at `38e5ff72`. Independent source review found no blocking issue in
+seek priming, half-open bounds, overflow re-entry or immutable snapshot use.
+Focused `internal/storeio` tests passed on Darwin ARM64 with Go 1.27 and
+`GOEXPERIMENT=simd`. The new alphabet SIMD kernel is explicitly Darwin-only;
+Linux ARM64 selects its scalar fallback. The bounded cursor, seek and date
+changes also apply on Linux. This upstream change is absent from every SQL
+comparison reported above and receives no performance credit from those runs.
+The durable bounded-scan binary-prefix, overflow and held-snapshot regression
+also passed with SIMD enabled from a frozen archive of `38e5ff72`, excluding
+the active row-overlay experiment.
