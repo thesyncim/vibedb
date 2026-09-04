@@ -13,6 +13,10 @@ const (
 	// pool. A stream that would overflow the pool simply keeps the admitted
 	// random-rank decoder; other streams in the leaf still specialize.
 	compactPrimaryScanDictionaryBounds = 512
+	// Dictionary fragments combine the static bytes preceding a hole with each
+	// dictionary spelling. The common 4K-row shape set needs 6,717 bytes; keep a
+	// bounded power-of-two pool and let unusual leaves fall back per stream.
+	compactPrimaryScanDictionaryFragmentBytes = 8 << 10
 )
 
 type compactPrimaryScanShape struct {
@@ -57,6 +61,7 @@ type CompactPrimaryScanDecoder struct {
 	streamPlan [compactPrimaryScanStreams]compactPrimaryScanStream
 	streams    [compactPrimaryScanStreams]compactStreamSequentialState
 	dictionary [compactPrimaryScanDictionaryBounds]uint16
+	fragments  [compactPrimaryScanDictionaryFragmentBytes]byte
 	key        compactStreamView
 	keyState   compactStreamSequentialState
 	keyPrior   [CommonPrimaryLeafMaxKeyBytes]byte
@@ -85,6 +90,7 @@ func (d *CompactPrimaryScanDecoder) prepare(
 	clear(d.streamPlan[:])
 	streamCount := 0
 	dictionaryCount := 0
+	fragmentCount := 0
 	for shape := 0; shape < v.shapeCount; shape++ {
 		entry, ok := v.shapeEntry(shape)
 		if !ok || entry.template.holes > compactPrimaryScanHoles ||
@@ -108,16 +114,32 @@ func (d *CompactPrimaryScanDecoder) prepare(
 				return
 			}
 			d.streamView[streamCount+hole] = stream
+			prefixStart := uint32(0)
+			if hole != 0 {
+				prefixStart = meta.ends[hole-1]
+			}
+			prefixEnd := meta.ends[hole]
+			prefixBytes := int(prefixEnd - prefixStart)
+			fragmentBytes := prefixBytes*stream.dictCount + len(stream.dictData)
 			if stream.kind == compactStreamDictionary &&
 				stream.dictCount > 0 &&
-				stream.dictCount+1 <= len(d.dictionary)-dictionaryCount {
+				stream.dictCount+1 <= len(d.dictionary)-dictionaryCount &&
+				fragmentBytes <= len(d.fragments)-fragmentCount {
 				plan := &d.streamPlan[streamCount+hole]
 				plan.dictionaryFirst = uint16(dictionaryCount)
 				plan.dictionaryCount = uint16(stream.dictCount)
-				d.dictionary[dictionaryCount] = 0
+				d.dictionary[dictionaryCount] = uint16(fragmentCount)
+				dictionaryStart := 0
 				for id := 0; id < stream.dictCount; id++ {
-					d.dictionary[dictionaryCount+id+1] =
-						binary.LittleEndian.Uint16(stream.dictDir[id*2:])
+					dictionaryEnd := int(binary.LittleEndian.Uint16(stream.dictDir[id*2:]))
+					fragmentCount += copy(
+						d.fragments[fragmentCount:], meta.static[prefixStart:prefixEnd],
+					)
+					fragmentCount += copy(
+						d.fragments[fragmentCount:], stream.dictData[dictionaryStart:dictionaryEnd],
+					)
+					d.dictionary[dictionaryCount+id+1] = uint16(fragmentCount)
+					dictionaryStart = dictionaryEnd
 				}
 				dictionaryCount += stream.dictCount + 1
 			}
@@ -210,31 +232,80 @@ func (d *CompactPrimaryScanDecoder) appendValue(
 	previous := uint32(0)
 	for hole := 0; hole < int(meta.holes); hole++ {
 		end := meta.ends[hole]
-		dst = append(dst, meta.static[previous:end]...)
-		previous = end
 		streamAt := int(meta.first) + hole
 		stream := &d.streamView[streamAt]
-		state := &d.streams[streamAt]
-		if ordinal != state.next {
-			state.seek(stream, ordinal)
-		}
 		var ok bool
 		plan := d.streamPlan[streamAt]
 		if plan.dictionaryCount != 0 {
-			first := int(plan.dictionaryFirst)
-			last := first + int(plan.dictionaryCount) + 1
-			dst, ok = state.appendDictionary(
-				dst, stream, ordinal, d.dictionary[first:last],
-			)
+			dst, ok = d.appendDictionaryFragment(dst, streamAt, ordinal)
 		} else {
+			dst = append(dst, meta.static[previous:end]...)
+			state := &d.streams[streamAt]
+			if ordinal != state.next {
+				state.seek(stream, ordinal)
+			}
 			dst, ok = state.appendValue(dst, stream, ordinal)
 		}
+		previous = end
 		if !ok {
 			return dst[:start], false
 		}
 	}
 	end := meta.ends[meta.holes]
 	return append(dst, meta.static[previous:end]...), true
+}
+
+func (d *CompactPrimaryScanDecoder) appendDictionaryFragment(
+	dst []byte,
+	streamAt int,
+	row int,
+) ([]byte, bool) {
+	v := &d.streamView[streamAt]
+	s := &d.streams[streamAt]
+	if row != s.next {
+		s.seek(v, row)
+	}
+	plan := d.streamPlan[streamAt]
+	first := int(plan.dictionaryFirst)
+	last := first + int(plan.dictionaryCount) + 1
+	bounds := d.dictionary[first:last]
+	if v.kind != compactStreamDictionary || row < 0 || row >= v.count ||
+		row != s.next || len(bounds) != v.dictCount+1 {
+		return dst, false
+	}
+	width := int(v.width)
+	if v.dictCount <= 0 || width > 16 {
+		return dst, false
+	}
+	reservoir := uint64(s.value)
+	available := s.bit
+	cursor := s.cursor
+	for available < width {
+		if cursor >= len(v.data) {
+			return dst, false
+		}
+		reservoir |= uint64(v.data[cursor]) << uint(available)
+		cursor++
+		available += 8
+	}
+	id := 0
+	if width != 0 {
+		id = int(reservoir & (uint64(1)<<uint(width) - 1))
+	}
+	if id < 0 || id >= v.dictCount {
+		return dst, false
+	}
+	start, end := int(bounds[id]), int(bounds[id+1])
+	if end < start || end > len(d.fragments) {
+		return dst, false
+	}
+	reservoir >>= uint(width)
+	available -= width
+	s.value = int64(reservoir)
+	s.bit = available
+	s.cursor = cursor
+	s.next++
+	return append(dst, d.fragments[start:end]...), true
 }
 
 func (s *compactStreamSequentialState) appendDictionary(

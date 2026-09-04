@@ -1,0 +1,16 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/gateway
+cpu: Apple M4 Max
+BenchmarkPgwireTypedValidation/semantic_reprepare-16         	  241558	      5544 ns/op	   12784 B/op	      54 allocs/op
+BenchmarkPgwireTypedValidation/semantic_reprepare-16         	  174342	      5972 ns/op	   12784 B/op	      54 allocs/op
+BenchmarkPgwireTypedValidation/semantic_reprepare-16         	  213596	      5889 ns/op	   12784 B/op	      54 allocs/op
+BenchmarkPgwireTypedValidation/semantic_reprepare-16         	  207850	      5567 ns/op	   12784 B/op	      54 allocs/op
+BenchmarkPgwireTypedValidation/semantic_reprepare-16         	  235755	      5521 ns/op	   12784 B/op	      54 allocs/op
+BenchmarkPgwireTypedValidation/retained_statement-16         	137923458	         8.626 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPgwireTypedValidation/retained_statement-16         	142035948	         8.435 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPgwireTypedValidation/retained_statement-16         	140993876	         8.486 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPgwireTypedValidation/retained_statement-16         	142667894	         8.400 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPgwireTypedValidation/retained_statement-16         	135634299	         8.856 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/thesyncim/vibedb/gateway	12.682s
