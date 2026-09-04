@@ -148,10 +148,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: 32-bit
-            targets: linux/386 windows/386
-          - name: windows-64-bit
-            targets: windows/amd64 windows/arm64
+          - name: linux-386
+            target: linux/386
+          - name: windows-386
+            target: windows/386
+          - name: windows-amd64
+            target: windows/amd64
+          - name: windows-arm64
+            target: windows/arm64
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -162,13 +166,11 @@ jobs:
       - name: Compile packages and tests in both modules
         env:
           CGO_ENABLED: '0'
-          TARGETS: ${{ matrix.targets }}
+          TARGET: ${{ matrix.target }}
         run: |
-          for target in $TARGETS; do
-            export GOOS="${target%/*}" GOARCH="${target#*/}"
-            go test -run '^$' -exec=true ./...
-            (cd integration/pgclient && go test -run '^$' -exec=true ./...)
-          done
+          export GOOS="${TARGET%/*}" GOARCH="${TARGET#*/}"
+          go test -run '^$' -exec=true ./...
+          (cd integration/pgclient && go test -run '^$' -exec=true ./...)
       - name: Save Go build cache
         if: ${{ always() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
