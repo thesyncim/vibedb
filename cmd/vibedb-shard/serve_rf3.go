@@ -524,7 +524,7 @@ func servePreparedRF3WithExecutionLanes(
 	}
 	for index := range preparedSet.groups {
 		item := &preparedSet.groups[index]
-		runtime, adoptErr := raftmember.AdoptRuntime(item.wal, item.database, item.apply)
+		runtime, adoptErr := raftmember.AdoptPipelinedRuntime(item.wal, item.database, item.apply)
 		if adoptErr != nil {
 			remaining := preparedSet.groups[index:]
 			if runtime != nil {

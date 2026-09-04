@@ -176,7 +176,7 @@ func reloadPreparedRF3Groups(ctx context.Context, current *rf3Manifest, profile 
 		if item.restoreOperation != ([32]byte{}) {
 			return item.close(errInvalidRF3Manifest)
 		}
-		runtime, err := raftmember.AdoptRuntime(item.wal, item.database, item.apply)
+		runtime, err := raftmember.AdoptPipelinedRuntime(item.wal, item.database, item.apply)
 		if err != nil {
 			return err
 		}
