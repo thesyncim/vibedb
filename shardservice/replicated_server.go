@@ -124,8 +124,8 @@ const (
 	defaultReplicatedNativeFrameHeadroom = int64(32 << 20)
 	// DefaultReplicatedInFlightFrameBytes admits two maximum 40 MiB fenced SQL
 	// reservations plus both maximum 1 MiB SQL request bodies. The remaining
-	// nearly 30 MiB preserves room for ordinary native traffic, while the bound
-	// remains below the 120 MiB needed by a third SQL reservation. It is a
+	// nearly 30 MiB leaves room for ordinary native traffic. SQL execution has
+	// a separate 80 MiB quota so small workspaces cannot consume this headroom. It is a
 	// process-wide bound shared by every RF3 group hosted by one shard process.
 	DefaultReplicatedInFlightFrameBytes = defaultReplicatedSQLConcurrency*replicatedSQLMaximumReservationBytes +
 		defaultReplicatedNativeFrameHeadroom
@@ -136,6 +136,7 @@ type replicatedFrameByteBudget struct {
 	used    atomic.Int64
 	waiters atomic.Int32
 	waitMu  sync.Mutex
+	sqlUsed int64 // protected by waitMu; subset of used
 	changed chan struct{}
 }
 

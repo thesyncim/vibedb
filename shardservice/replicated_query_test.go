@@ -3,7 +3,9 @@ package shardservice
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,6 +13,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
+	"github.com/thesyncim/vibedb/query"
 )
 
 type blockingReplicatedSQLAdmissionOwner struct {
@@ -94,7 +97,7 @@ func TestDefaultReplicatedFrameBudgetAdmitsTwoWorstBoundSQLQueries(t *testing.T)
 	requestBytes := int64(frame.Len() - 5)
 	budget := replicatedFrameByteBudget{limit: DefaultReplicatedInFlightFrameBytes}
 	for query := range 2 {
-		if !budget.reserve(requestBytes) || !budget.reserve(replicatedSQLMaximumReservationBytes) {
+		if !budget.reserve(requestBytes) || !budget.reserveSQL(t.Context(), replicatedSQLMaximumReservationBytes) {
 			t.Fatalf("maximum query %d was not admitted: used=%d limit=%d", query, budget.used.Load(), budget.limit)
 		}
 	}
@@ -111,12 +114,14 @@ func TestDefaultReplicatedFrameBudgetAdmitsTwoWorstBoundSQLQueries(t *testing.T)
 	if !budget.reserve(requestBytes) {
 		t.Fatal("third maximum request body could not reach typed SQL admission")
 	}
-	if budget.reserve(replicatedSQLMaximumReservationBytes) {
+	ctx, cancel := context.WithTimeout(t.Context(), time.Millisecond)
+	defer cancel()
+	if budget.reserveSQL(ctx, replicatedSQLMaximumReservationBytes) {
 		t.Fatal("third maximum SQL execution escaped the two-query bound")
 	}
 	budget.release(requestBytes)
 	for range 2 {
-		budget.release(replicatedSQLMaximumReservationBytes)
+		budget.releaseSQL(replicatedSQLMaximumReservationBytes)
 		budget.release(requestBytes)
 	}
 	if got := budget.used.Load(); got != 0 {
@@ -124,13 +129,13 @@ func TestDefaultReplicatedFrameBudgetAdmitsTwoWorstBoundSQLQueries(t *testing.T)
 	}
 }
 
-func TestReplicatedServerRunsTwoMaximumSQLAdmissionsConcurrently(t *testing.T) {
+func TestReplicatedServerSmallSQLAdmissionsOverlapWithoutMaximumReservation(t *testing.T) {
 	state := testReplicatedServingState()
 	state.Identity.Distribution, state.Identity.Shard = "data", "all"
 	base := &fakeReplicatedOwner{state: state}
 	owner := &blockingReplicatedSQLAdmissionOwner{
 		fakeReplicatedOwner: base,
-		entered:             make(chan struct{}, 3),
+		entered:             make(chan struct{}, 9),
 		release:             make(chan struct{}),
 	}
 	server, err := NewReplicatedServer(
@@ -166,20 +171,27 @@ func TestReplicatedServerRunsTwoMaximumSQLAdmissionsConcurrently(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	responses := make(chan *ReplicatedResponse, 2)
-	for range 2 {
+	responses := make(chan *ReplicatedResponse, 8)
+	for range 8 {
 		go func() { responses <- server.executeReplicated(ctx, request) }()
 	}
-	for query := range 2 {
+	for query := range 8 {
 		select {
 		case <-owner.entered:
 		case <-time.After(time.Second):
 			t.Fatalf("maximum query %d did not overlap at the ReadIndex boundary", query)
 		}
 	}
-	if got := server.Stats().InFlightFrameBytes; got != 2*replicatedSQLMaximumReservationBytes {
-		t.Fatalf("overlapping SQL reservation = %d, want %d", got, 2*replicatedSQLMaximumReservationBytes)
+	if got := server.Stats().InFlightFrameBytes; got != 8*replicatedSQLTiers[0].reservationBytes() {
+		t.Fatalf("small-query reservation = %d", got)
 	}
+	// Fill the remaining process allowance to exercise cancellation while the
+	// eight original queries hold their small reservations.
+	rest := server.frames.limit - server.frames.used.Load()
+	if !server.frames.reserve(rest) {
+		t.Fatal("reserve remaining budget")
+	}
+	defer server.frames.release(rest)
 	blocked, cancelBlocked := context.WithTimeout(ctx, 10*time.Millisecond)
 	defer cancelBlocked()
 	third := server.executeReplicated(blocked, request)
@@ -193,7 +205,7 @@ func TestReplicatedServerRunsTwoMaximumSQLAdmissionsConcurrently(t *testing.T) {
 	}
 
 	close(owner.release)
-	for query := range 2 {
+	for query := range 8 {
 		select {
 		case response := <-responses:
 			if response.Kind != ReplicatedRefusal || response.Refusal != ReplicatedRefusalUnavailable {
@@ -203,8 +215,8 @@ func TestReplicatedServerRunsTwoMaximumSQLAdmissionsConcurrently(t *testing.T) {
 			t.Fatalf("released query %d did not finish", query)
 		}
 	}
-	if got := server.Stats().InFlightFrameBytes; got != 0 {
-		t.Fatalf("completed SQL reservations retained %d bytes", got)
+	if got := server.Stats().InFlightFrameBytes; got != rest {
+		t.Fatalf("completed SQL reservations retained %d extra bytes", got-rest)
 	}
 }
 
@@ -280,8 +292,94 @@ func TestSQLBackpressureWakesOnReleaseAndRespectsBound(t *testing.T) {
 			t.Fatal("cancellation stuck")
 		}
 	}
-	budget.release(10)
+	budget.releaseSQL(10)
 	if budget.used.Load() != 0 || budget.waiters.Load() != 0 {
 		t.Fatal("reservation or waiter leaked")
+	}
+}
+
+func TestSQLExecutionQuotaPreservesNativeCapacity(t *testing.T) {
+	budget := &replicatedFrameByteBudget{limit: DefaultReplicatedInFlightFrameBytes}
+	charge := replicatedSQLTiers[0].reservationBytes()
+	count := int(budget.sqlLimit() / charge)
+	for range count {
+		if !budget.reserveSQL(t.Context(), charge) {
+			t.Fatal("small reservation refused")
+		}
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), time.Millisecond)
+	defer cancel()
+	if budget.reserveSQL(ctx, charge) {
+		t.Fatal("SQL crossed execution quota")
+	}
+	if !budget.reserve(replication.MaxCommandBytes) {
+		t.Fatal("SQL starved native command")
+	}
+	budget.release(replication.MaxCommandBytes)
+	for range count {
+		(&replicatedSQLLease{budget: budget, bytes: charge}).Release()
+	}
+	if budget.used.Load() != 0 || budget.sqlUsed != 0 {
+		t.Fatal("accounting leaked")
+	}
+	// An impossible reservation refuses immediately even without a deadline.
+	if budget.reserveSQL(t.Context(), budget.sqlLimit()+1) {
+		t.Fatal("oversized reservation admitted")
+	}
+}
+
+func TestReplicatedSQLResponseSizeMatchesCodec(t *testing.T) {
+	responses := []*ShardResponse{
+		{Kind: ResponseRows},
+		{Kind: ResponseRows, Columns: []Column{{Name: "answer", TypeOID: 23}}, Rows: [][]Cell{{{Bytes: []byte("42")}}, {{Null: true}}, {{Bytes: []byte{}}}}},
+		{Kind: ResponseRows, Columns: []Column{{Name: strings.Repeat("column", 12000)}}, Rows: [][]Cell{{{Bytes: []byte(strings.Repeat("x", 70000))}}}},
+		NewErrorResponse(ErrorMalformedRequest, "invalid query"),
+		NewErrorResponse(ErrorMalformedRequest, strings.Repeat("error", 14000)),
+	}
+	for i, response := range responses {
+		var encoded bytes.Buffer
+		if err := EncodeResponse(&encoded, response); err != nil {
+			t.Fatal(err)
+		}
+		for _, limit := range []int{-1, 0, encoded.Len() - 1, encoded.Len(), encoded.Len() + 1} {
+			if got, want := replicatedSQLResponseFits(response, limit), limit >= encoded.Len(); got != want {
+				t.Fatalf("response %d size %d limit %d fits=%v want=%v", i, encoded.Len(), limit, got, want)
+			}
+		}
+	}
+	if replicatedSQLResponseFits(nil, 100) || replicatedSQLResponseFits(&ShardResponse{Kind: ResponseRows, Rows: [][]Cell{{{Null: true}}}}, 100) {
+		t.Fatal("invalid shape accepted")
+	}
+}
+
+func TestReplicatedSQLTierEscalationClassifiesOnlyGrowableLimits(t *testing.T) {
+	small := replicatedSQLTiers[0]
+	bytesErr := &query.ResultBudgetError{Rows: 1, RowLimit: 10, Bytes: 100000, ByteLimit: int64(small.resultBytes)}
+	for _, test := range []struct {
+		name    string
+		err     error
+		maximum int
+		grow    bool
+	}{
+		{"bytes", bytesErr, MaxReplicatedSQLResultBytes, true},
+		{"wrapped bytes", fmt.Errorf("wrapped: %w", bytesErr), MaxReplicatedSQLResultBytes, true},
+		{"caller bytes", bytesErr, small.resultBytes, false},
+		{"caller rows", &query.ResultBudgetError{Rows: 11, RowLimit: 10}, MaxReplicatedSQLResultBytes, false},
+		{"untyped result", query.ErrResultBudget, MaxReplicatedSQLResultBytes, false},
+		{"workspace", query.ErrWorkBudget, MaxReplicatedSQLResultBytes, true},
+		{"intermediate", query.ErrIntermediateBudget, MaxReplicatedSQLResultBytes, true},
+		{"aggregate", query.ErrAggregateBudget, MaxReplicatedSQLResultBytes, true},
+		{"join", query.ErrJoinPairBudget, MaxReplicatedSQLResultBytes, true},
+		{"cancel", context.Canceled, MaxReplicatedSQLResultBytes, false},
+		{"syntax", fmt.Errorf("syntax error"), MaxReplicatedSQLResultBytes, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := small.canGrow(test.err, test.maximum); got != test.grow {
+				t.Fatalf("grow=%v want=%v", got, test.grow)
+			}
+			if replicatedSQLTiers[len(replicatedSQLTiers)-1].canGrow(test.err, MaxReplicatedSQLResultBytes) {
+				t.Fatal("final tier grows")
+			}
+		})
 	}
 }
