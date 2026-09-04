@@ -1,0 +1,194 @@
+VibeDB development cluster ready: 127.0.0.1:44763
+development DDL preparing table="rf3_sql_bench"
+development DDL prepared table="rf3_sql_bench"; loading three members
+development child 1 (vibedb-shard), last 65536 bytes:
+raft2026/09/04 09:05:31 INFO: 1 switched to configuration voters=(1 2 3)
+raft2026/09/04 09:05:31 INFO: 1 became follower at term 1
+raft2026/09/04 09:05:31 INFO: newRaft 1 [peers: [1,2,3], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+vibedb-shard RF3 ready distribution="catalog" shard="controlplane" member=1 replica-set=1 peer=127.0.0.1:44113 native=127.0.0.1:43993 snapshot=127.0.0.1:39987 control=127.0.0.1:38099
+raft2026/09/04 09:05:31 INFO: 1 [logterm: 1, index: 1, vote: 0] cast MsgPreVote for 2 [logterm: 1, index: 1] at term 1
+raft2026/09/04 09:05:31 INFO: 1 [term: 1] received a MsgVote message with higher term from 2 [term: 2]
+raft2026/09/04 09:05:31 INFO: 1 became follower at term 2
+raft2026/09/04 09:05:31 INFO: 1 [logterm: 1, index: 1, vote: 0] cast MsgVote for 2 [logterm: 1, index: 1] at term 2
+
+development child 2 (vibedb-shard), last 65536 bytes:
+raft2026/09/04 09:05:31 INFO: 2 switched to configuration voters=(1 2 3)
+raft2026/09/04 09:05:31 INFO: 2 became follower at term 1
+raft2026/09/04 09:05:31 INFO: newRaft 2 [peers: [1,2,3], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+vibedb-shard RF3 ready distribution="catalog" shard="controlplane" member=2 replica-set=1 peer=127.0.0.1:36455 native=127.0.0.1:34327 snapshot=127.0.0.1:37629 control=127.0.0.1:40437
+raft2026/09/04 09:05:31 INFO: 2 is starting a new election at term 1
+raft2026/09/04 09:05:31 INFO: 2 became pre-candidate at term 1
+raft2026/09/04 09:05:31 INFO: 2 [logterm: 1, index: 1] sent MsgPreVote request to 1 at term 1
+raft2026/09/04 09:05:31 INFO: 2 [logterm: 1, index: 1] sent MsgPreVote request to 3 at term 1
+raft2026/09/04 09:05:31 INFO: 2 received MsgPreVoteResp from 2 at term 1
+raft2026/09/04 09:05:31 INFO: 2 has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/04 09:05:31 INFO: 2 received MsgPreVoteResp from 3 at term 1
+raft2026/09/04 09:05:31 INFO: 2 has received 2 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/04 09:05:31 INFO: 2 became candidate at term 2
+raft2026/09/04 09:05:31 INFO: 2 [logterm: 1, index: 1] sent MsgVote request to 1 at term 2
+raft2026/09/04 09:05:31 INFO: 2 [logterm: 1, index: 1] sent MsgVote request to 3 at term 2
+raft2026/09/04 09:05:31 INFO: 2 received MsgVoteResp from 2 at term 2
+raft2026/09/04 09:05:31 INFO: 2 has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/09/04 09:05:31 INFO: 2 received MsgVoteResp from 3 at term 2
+raft2026/09/04 09:05:31 INFO: 2 has received 2 MsgVoteResp votes and 0 vote rejections
+raft2026/09/04 09:05:31 INFO: 2 became leader at term 2
+
+development child 3 (vibedb-shard), last 65536 bytes:
+raft2026/09/04 09:05:31 INFO: 3 switched to configuration voters=(1 2 3)
+raft2026/09/04 09:05:31 INFO: 3 became follower at term 1
+raft2026/09/04 09:05:31 INFO: newRaft 3 [peers: [1,2,3], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+vibedb-shard RF3 ready distribution="catalog" shard="controlplane" member=3 replica-set=1 peer=127.0.0.1:34493 native=127.0.0.1:34697 snapshot=127.0.0.1:34157 control=127.0.0.1:41265
+raft2026/09/04 09:05:31 INFO: 3 [logterm: 1, index: 1, vote: 0] cast MsgPreVote for 2 [logterm: 1, index: 1] at term 1
+raft2026/09/04 09:05:31 INFO: 3 [term: 1] received a MsgVote message with higher term from 2 [term: 2]
+raft2026/09/04 09:05:31 INFO: 3 became follower at term 2
+raft2026/09/04 09:05:31 INFO: 3 [logterm: 1, index: 1, vote: 0] cast MsgVote for 2 [logterm: 1, index: 1] at term 2
+
+development child 4 (vibedb-shard), last 65536 bytes:
+raft2026/09/04 09:05:31 INFO: 1 switched to configuration voters=(1 2 3)
+raft2026/09/04 09:05:31 INFO: 1 became follower at term 1
+raft2026/09/04 09:05:31 INFO: newRaft 1 [peers: [1,2,3], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+vibedb-shard RF3 ready distribution="request-ledger" shard="all" member=1 replica-set=1 peer=127.0.0.1:34667 native=127.0.0.1:43571 snapshot=127.0.0.1:32809 control=127.0.0.1:34673
+raft2026/09/04 09:05:31 INFO: 1 [logterm: 1, index: 1, vote: 0] cast MsgPreVote for 3 [logterm: 1, index: 1] at term 1
+raft2026/09/04 09:05:31 INFO: 1 [logterm: 1, index: 1, vote: 0] cast MsgPreVote for 2 [logterm: 1, index: 1] at term 1
+raft2026/09/04 09:05:31 INFO: 1 [term: 1] received a MsgVote message with higher term from 2 [term: 2]
+raft2026/09/04 09:05:31 INFO: 1 became follower at term 2
+raft2026/09/04 09:05:31 INFO: 1 [logterm: 1, index: 1, vote: 0] cast MsgVote for 2 [logterm: 1, index: 1] at term 2
+raft2026/09/04 09:05:31 INFO: 1 [logterm: 1, index: 1, vote: 2] rejected MsgVote from 3 [logterm: 1, index: 1] at term 2
+
+development child 5 (vibedb-shard), last 65536 bytes:
+raft2026/09/04 09:05:31 INFO: 2 switched to configuration voters=(1 2 3)
+raft2026/09/04 09:05:31 INFO: 2 became follower at term 1
+raft2026/09/04 09:05:31 INFO: newRaft 2 [peers: [1,2,3], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+vibedb-shard RF3 ready distribution="request-ledger" shard="all" member=2 replica-set=1 peer=127.0.0.1:46361 native=127.0.0.1:35925 snapshot=127.0.0.1:41861 control=127.0.0.1:45853
+raft2026/09/04 09:05:31 INFO: 2 is starting a new election at term 1
+raft2026/09/04 09:05:31 INFO: 2 became pre-candidate at term 1
+raft2026/09/04 09:05:31 INFO: 2 [logterm: 1, index: 1] sent MsgPreVote request to 1 at term 1
+raft2026/09/04 09:05:31 INFO: 2 [logterm: 1, index: 1] sent MsgPreVote request to 3 at term 1
+raft2026/09/04 09:05:31 INFO: 2 received MsgPreVoteResp from 2 at term 1
+raft2026/09/04 09:05:31 INFO: 2 has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/04 09:05:31 INFO: 2 [logterm: 1, index: 1, vote: 0] cast MsgPreVote for 3 [logterm: 1, index: 1] at term 1
+raft2026/09/04 09:05:31 INFO: 2 received MsgPreVoteResp from 3 at term 1
+raft2026/09/04 09:05:31 INFO: 2 has received 2 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/04 09:05:31 INFO: 2 became candidate at term 2
+raft2026/09/04 09:05:31 INFO: 2 [logterm: 1, index: 1] sent MsgVote request to 1 at term 2
+raft2026/09/04 09:05:31 INFO: 2 [logterm: 1, index: 1] sent MsgVote request to 3 at term 2
+raft2026/09/04 09:05:31 INFO: 2 received MsgVoteResp from 2 at term 2
+raft2026/09/04 09:05:31 INFO: 2 has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/09/04 09:05:31 INFO: 2 [logterm: 1, index: 1, vote: 2] rejected MsgVote from 3 [logterm: 1, index: 1] at term 2
+raft2026/09/04 09:05:31 INFO: 2 received MsgVoteResp rejection from 3 at term 2
+raft2026/09/04 09:05:31 INFO: 2 has received 1 MsgVoteResp votes and 1 vote rejections
+raft2026/09/04 09:05:31 INFO: 2 received MsgVoteResp from 1 at term 2
+raft2026/09/04 09:05:31 INFO: 2 has received 2 MsgVoteResp votes and 1 vote rejections
+raft2026/09/04 09:05:31 INFO: 2 became leader at term 2
+
+development child 6 (vibedb-shard), last 65536 bytes:
+raft2026/09/04 09:05:31 INFO: 3 switched to configuration voters=(1 2 3)
+raft2026/09/04 09:05:31 INFO: 3 became follower at term 1
+raft2026/09/04 09:05:31 INFO: newRaft 3 [peers: [1,2,3], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+vibedb-shard RF3 ready distribution="request-ledger" shard="all" member=3 replica-set=1 peer=127.0.0.1:41525 native=127.0.0.1:33369 snapshot=127.0.0.1:41489 control=127.0.0.1:33509
+raft2026/09/04 09:05:31 INFO: 3 is starting a new election at term 1
+raft2026/09/04 09:05:31 INFO: 3 became pre-candidate at term 1
+raft2026/09/04 09:05:31 INFO: 3 [logterm: 1, index: 1] sent MsgPreVote request to 1 at term 1
+raft2026/09/04 09:05:31 INFO: 3 [logterm: 1, index: 1] sent MsgPreVote request to 2 at term 1
+raft2026/09/04 09:05:31 INFO: 3 received MsgPreVoteResp from 3 at term 1
+raft2026/09/04 09:05:31 INFO: 3 has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/04 09:05:31 INFO: 3 [logterm: 1, index: 1, vote: 0] cast MsgPreVote for 2 [logterm: 1, index: 1] at term 1
+raft2026/09/04 09:05:31 INFO: 3 received MsgPreVoteResp from 2 at term 1
+raft2026/09/04 09:05:31 INFO: 3 has received 2 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/04 09:05:31 INFO: 3 became candidate at term 2
+raft2026/09/04 09:05:31 INFO: 3 [logterm: 1, index: 1] sent MsgVote request to 1 at term 2
+raft2026/09/04 09:05:31 INFO: 3 [logterm: 1, index: 1] sent MsgVote request to 2 at term 2
+raft2026/09/04 09:05:31 INFO: 3 received MsgVoteResp from 3 at term 2
+raft2026/09/04 09:05:31 INFO: 3 has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/09/04 09:05:31 INFO: 3 [logterm: 1, index: 1, vote: 3] rejected MsgVote from 2 [logterm: 1, index: 1] at term 2
+raft2026/09/04 09:05:31 INFO: 3 received MsgVoteResp rejection from 2 at term 2
+raft2026/09/04 09:05:31 INFO: 3 has received 1 MsgVoteResp votes and 1 vote rejections
+raft2026/09/04 09:05:31 INFO: 3 received MsgVoteResp rejection from 1 at term 2
+raft2026/09/04 09:05:31 INFO: 3 has received 1 MsgVoteResp votes and 2 vote rejections
+raft2026/09/04 09:05:31 INFO: 3 became follower at term 2
+
+development child 7 (vibedb-shard), last 65536 bytes:
+raft2026/09/04 09:05:31 INFO: 1 switched to configuration voters=(1 2 3)
+raft2026/09/04 09:05:31 INFO: 1 became follower at term 1
+raft2026/09/04 09:05:31 INFO: newRaft 1 [peers: [1,2,3], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+vibedb-shard RF3 ready distribution="data" shard="all" member=1 replica-set=1 peer=127.0.0.1:41919 native=127.0.0.1:35595 snapshot=127.0.0.1:45931 control=127.0.0.1:44153
+raft2026/09/04 09:05:31 INFO: 1 [logterm: 1, index: 1, vote: 0] cast MsgPreVote for 3 [logterm: 1, index: 1] at term 1
+raft2026/09/04 09:05:31 INFO: 1 [term: 1] received a MsgVote message with higher term from 3 [term: 2]
+raft2026/09/04 09:05:31 INFO: 1 became follower at term 2
+raft2026/09/04 09:05:31 INFO: 1 [logterm: 1, index: 1, vote: 0] cast MsgVote for 3 [logterm: 1, index: 1] at term 2
+raft2026/09/04 09:05:32 INFO: 1 switched to configuration voters=(1 2 3)
+raft2026/09/04 09:05:32 INFO: 1 became follower at term 1
+raft2026/09/04 09:05:32 INFO: newRaft 1 [peers: [1,2,3], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+RF3 prepared group loaded table="rf3_sql_bench" group=9b68fc38aede816b1d946e71fe241859 member=1
+raft2026/09/04 09:05:33 INFO: 1 [logterm: 1, index: 1, vote: 0] cast MsgPreVote for 3 [logterm: 1, index: 1] at term 1
+raft2026/09/04 09:05:33 INFO: 1 [term: 1] received a MsgVote message with higher term from 3 [term: 2]
+raft2026/09/04 09:05:33 INFO: 1 became follower at term 2
+raft2026/09/04 09:05:33 INFO: 1 [logterm: 1, index: 1, vote: 0] cast MsgVote for 3 [logterm: 1, index: 1] at term 2
+
+development child 8 (vibedb-shard), last 65536 bytes:
+raft2026/09/04 09:05:31 INFO: 2 switched to configuration voters=(1 2 3)
+raft2026/09/04 09:05:31 INFO: 2 became follower at term 1
+raft2026/09/04 09:05:31 INFO: newRaft 2 [peers: [1,2,3], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+vibedb-shard RF3 ready distribution="data" shard="all" member=2 replica-set=1 peer=127.0.0.1:39849 native=127.0.0.1:35429 snapshot=127.0.0.1:35421 control=127.0.0.1:45579
+raft2026/09/04 09:05:31 INFO: 2 [logterm: 1, index: 1, vote: 0] cast MsgPreVote for 3 [logterm: 1, index: 1] at term 1
+raft2026/09/04 09:05:31 INFO: 2 [term: 1] received a MsgVote message with higher term from 3 [term: 2]
+raft2026/09/04 09:05:31 INFO: 2 became follower at term 2
+raft2026/09/04 09:05:31 INFO: 2 [logterm: 1, index: 1, vote: 0] cast MsgVote for 3 [logterm: 1, index: 1] at term 2
+raft2026/09/04 09:05:32 INFO: 2 switched to configuration voters=(1 2 3)
+raft2026/09/04 09:05:32 INFO: 2 became follower at term 1
+raft2026/09/04 09:05:32 INFO: newRaft 2 [peers: [1,2,3], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+RF3 prepared group loaded table="rf3_sql_bench" group=9b68fc38aede816b1d946e71fe241859 member=2
+raft2026/09/04 09:05:33 INFO: 2 [logterm: 1, index: 1, vote: 0] cast MsgPreVote for 3 [logterm: 1, index: 1] at term 1
+raft2026/09/04 09:05:33 INFO: 2 [term: 1] received a MsgVote message with higher term from 3 [term: 2]
+raft2026/09/04 09:05:33 INFO: 2 became follower at term 2
+raft2026/09/04 09:05:33 INFO: 2 [logterm: 1, index: 1, vote: 0] cast MsgVote for 3 [logterm: 1, index: 1] at term 2
+
+development child 9 (vibedb-shard), last 65536 bytes:
+raft2026/09/04 09:05:31 INFO: 3 switched to configuration voters=(1 2 3)
+raft2026/09/04 09:05:31 INFO: 3 became follower at term 1
+raft2026/09/04 09:05:31 INFO: newRaft 3 [peers: [1,2,3], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+vibedb-shard RF3 ready distribution="data" shard="all" member=3 replica-set=1 peer=127.0.0.1:35867 native=127.0.0.1:34759 snapshot=127.0.0.1:35801 control=127.0.0.1:38015
+raft2026/09/04 09:05:31 INFO: 3 is starting a new election at term 1
+raft2026/09/04 09:05:31 INFO: 3 became pre-candidate at term 1
+raft2026/09/04 09:05:31 INFO: 3 [logterm: 1, index: 1] sent MsgPreVote request to 1 at term 1
+raft2026/09/04 09:05:31 INFO: 3 [logterm: 1, index: 1] sent MsgPreVote request to 2 at term 1
+raft2026/09/04 09:05:31 INFO: 3 received MsgPreVoteResp from 3 at term 1
+raft2026/09/04 09:05:31 INFO: 3 has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/04 09:05:31 INFO: 3 received MsgPreVoteResp from 1 at term 1
+raft2026/09/04 09:05:31 INFO: 3 has received 2 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/04 09:05:31 INFO: 3 became candidate at term 2
+raft2026/09/04 09:05:31 INFO: 3 [logterm: 1, index: 1] sent MsgVote request to 1 at term 2
+raft2026/09/04 09:05:31 INFO: 3 [logterm: 1, index: 1] sent MsgVote request to 2 at term 2
+raft2026/09/04 09:05:31 INFO: 3 received MsgVoteResp from 3 at term 2
+raft2026/09/04 09:05:31 INFO: 3 has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/09/04 09:05:31 INFO: 3 received MsgVoteResp from 1 at term 2
+raft2026/09/04 09:05:31 INFO: 3 has received 2 MsgVoteResp votes and 0 vote rejections
+raft2026/09/04 09:05:31 INFO: 3 became leader at term 2
+raft2026/09/04 09:05:32 INFO: 3 switched to configuration voters=(1 2 3)
+raft2026/09/04 09:05:32 INFO: 3 became follower at term 1
+raft2026/09/04 09:05:32 INFO: newRaft 3 [peers: [1,2,3], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+RF3 prepared group loaded table="rf3_sql_bench" group=9b68fc38aede816b1d946e71fe241859 member=3
+raft2026/09/04 09:05:33 INFO: 3 is starting a new election at term 1
+raft2026/09/04 09:05:33 INFO: 3 became pre-candidate at term 1
+raft2026/09/04 09:05:33 INFO: 3 [logterm: 1, index: 1] sent MsgPreVote request to 1 at term 1
+raft2026/09/04 09:05:33 INFO: 3 [logterm: 1, index: 1] sent MsgPreVote request to 2 at term 1
+raft2026/09/04 09:05:33 INFO: 3 received MsgPreVoteResp from 3 at term 1
+raft2026/09/04 09:05:33 INFO: 3 has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/04 09:05:33 INFO: 3 received MsgPreVoteResp from 1 at term 1
+raft2026/09/04 09:05:33 INFO: 3 has received 2 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/04 09:05:33 INFO: 3 became candidate at term 2
+raft2026/09/04 09:05:33 INFO: 3 [logterm: 1, index: 1] sent MsgVote request to 1 at term 2
+raft2026/09/04 09:05:33 INFO: 3 [logterm: 1, index: 1] sent MsgVote request to 2 at term 2
+raft2026/09/04 09:05:33 INFO: 3 received MsgVoteResp from 3 at term 2
+raft2026/09/04 09:05:33 INFO: 3 has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/09/04 09:05:33 INFO: 3 received MsgVoteResp from 2 at term 2
+raft2026/09/04 09:05:33 INFO: 3 has received 2 MsgVoteResp votes and 0 vote rejections
+raft2026/09/04 09:05:33 INFO: 3 became leader at term 2
+
+development child 10 (vibedb-gateway), last 65536 bytes:
+gateway: local PostgreSQL RF3 endpoint 127.0.0.1:5432 (user local, database vibedb; durable auto-commit writes)
+vibedb-gateway serving catalog generation 1 on 127.0.0.1:44763
+gateway: replica health revision controller published 9/3 revision(s)
+gateway: replica health revision controller published 12/4 revision(s)
+gateway: replica health revision controller: vibedb-gateway: invalid replica health controller configuration
+

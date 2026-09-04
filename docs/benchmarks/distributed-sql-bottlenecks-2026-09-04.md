@@ -135,3 +135,25 @@ must be measured against the extra quorum and failure constraints here.
 
 The 2x CockroachDB target is not established. These changes also do not establish
 full SQL feature, isolation, failover or multi-region guarantee parity.
+
+## Concurrent autocommit follow-up
+
+The [complete follow-up comparison](crdb-sql-2026-09-04-concurrent/README.md)
+validates all 120,000 samples at clean `3e9d2306`. VibeDB updates reached
+390.5 ops/s at C1 and 2,029.3 at C8; CRDB reached 909.4 and 3,966.8. The former
+serialized-outbox ceiling is removed, but the 2x CRDB target remains unmet.
+
+Bounded issuer slots durably reserve sequence blocks before accepting commands,
+and retain exact live recipes until their outcome is known. They preserve the
+replicated durability boundary and explicitly report crash-interrupted PG
+statements as ambiguous. Read-only preparation retries admission pressure with
+bounded backoff. Lone Raft proposals no longer wait for the fixed batching timer.
+
+The new diagnostic profile has only three initialization outbox saves, alongside
+2,128 writes. Mean preparation is 0.598 ms; execution is 2.567 ms; the parent write
+region is 3.355 ms. Execution remains the largest measured phase. That includes
+replication, durable apply, scheduler waits and transport; it does not prove that
+storage alone or Raft alone accounts for the remaining gap. The new report
+retains the raw profile, syscall-delay summaries, failed precursor and exact
+benchmark data. Native session completion scans use lazy snapshots after the
+full suite exposed incompatibilities with point-only completion lookup.

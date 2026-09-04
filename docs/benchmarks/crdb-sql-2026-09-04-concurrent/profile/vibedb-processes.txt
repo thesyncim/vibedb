@@ -1,0 +1,15 @@
+    PID COMMAND         COMMAND
+      1 sleep           sleep infinity
+    116 vibedb          /bench/vibedb cluster dev --root /data/vibe --replicas 3 --pg-listen 127.0.0.1:5432 --diagnostics-on-exit
+    253 vibedb-shard    /bench/vibedb-shard serve-rf3 -manifest /data/vibe/catalog-member-1/serve-rf3.vibejson
+    254 vibedb-shard    /bench/vibedb-shard serve-rf3 -manifest /data/vibe/catalog-member-2/serve-rf3.vibejson
+    255 vibedb-shard    /bench/vibedb-shard serve-rf3 -manifest /data/vibe/catalog-member-3/serve-rf3.vibejson
+    256 vibedb-shard    /bench/vibedb-shard serve-rf3 -manifest /data/vibe/ledger-member-1/serve-rf3.vibejson
+    257 vibedb-shard    /bench/vibedb-shard serve-rf3 -manifest /data/vibe/ledger-member-2/serve-rf3.vibejson
+    258 vibedb-shard    /bench/vibedb-shard serve-rf3 -manifest /data/vibe/ledger-member-3/serve-rf3.vibejson
+    270 vibedb-shard    /bench/vibedb-shard serve-rf3 -manifest /data/vibe/data-member-1/serve-multigroup.vibejson -reload-prepared-groups
+    282 vibedb-shard    /bench/vibedb-shard serve-rf3 -manifest /data/vibe/data-member-2/serve-multigroup.vibejson -reload-prepared-groups
+    294 vibedb-shard    /bench/vibedb-shard serve-rf3 -manifest /data/vibe/data-member-3/serve-multigroup.vibejson -reload-prepared-groups
+    389 vibedb-gateway  /bench/vibedb-gateway serve -catalog /data/vibe/catalog.vibejson -catalog-route-seed /data/vibe/catalog.vibejson.route-seed -catalog-bootstrap-if-missing -catalog-relation 1 -catalog-session-journal /data/vibe/gateway-session -catalog-client-id e232f4e5d7e6abff0a1fb16ce1ff31cd -catalog-retry-home e232f4e5d7e6abff -durable-ack-key /data/vibe/durable-ack-key -listen 127.0.0.1:44763 -tls-certificate /data/vibe/node-10-cert.pem -tls-key /data/vibe/node-10-key.pem -tls-roots /data/vibe/roots.pem -tls-identity-oid 1.3.6.1.4.1.32473.1.1 -authorization-policy /data/vibe/authorization-policy.vibejson -hot-shard-capacity /data/vibe/hot-shard-capacity.vibejson -replica-control-manifest /data/vibe/replica-control.vibejson -shard-peer 127.0.0.1:43993=57bd42445e738c9ad71d26da738a9b43 -shard-peer 127.0.0.1:34327=80b14b325e28074b08e40dbe567858dc -shard-peer 127.0.0.1:34697=d08813ccd2a1f63bfd11157734220687 -shard-peer 127.0.0.1:43571=2a7820bcd33851039fc2b816b90744d1 -shard-peer 127.0.0.1:35925=bb5be9ca45bf8eb6ffb67face49c097f -shard-peer 127.0.0.1:33369=61b251c4ec3b085bf6dd749f3220b86d -shard-peer 127.0.0.1:35595=b5e63c64f63e46f1f5020f25e126a458 -shard-peer 127.0.0.1:35429=0d02df8b0f23f1f4fafe3dc4e11e4693 -shard-peer 127.0.0.1:34759=6ecf2c9d1fab267d45097111c33f591f -pg-dev-listen 127.0.0.1:5432 -pg-dev-ddl-socket /tmp/vibedb-ddl-2153434942/control.sock
+    431 sh              sh -c ps -eo pid,comm,args > /evidence/vibedb-processes.txt
+    437 ps              ps -eo pid,comm,args
