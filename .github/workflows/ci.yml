@@ -105,7 +105,7 @@ jobs:
           retention-days: 30
       - name: Focused LATERAL race tests
         if: ${{ !cancelled() && steps.go.outcome == 'success' }}
-        run: go test -race -p=1 -count=1 -timeout=10m -run 'Lateral' ./query ./sql/driver ./pgwire
+        run: go test -race -p=3 -count=1 -timeout=10m -run 'Lateral' ./query ./sql/driver ./pgwire
       - name: Save Go build cache
         if: ${{ always() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
