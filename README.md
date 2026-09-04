@@ -79,6 +79,11 @@ only after its recovery record is power-safe. A collection may use a primary
 file and a recovery-journal sidecar; copy or back up the complete closed
 database directory, never an arbitrary live file.
 
+For Go 1.27 applications, build with `GOEXPERIMENT=simd` to enable VibeJSON
+SIMD kernels on arm64 and supported amd64 CPUs. This flag must be set when
+building the application; a dependency cannot enable it through `go.mod`.
+The local-cluster instructions and Kubernetes image enable it explicitly.
+
 ## What is implemented
 
 - Canonical JSON documents in named, lazily materialized collections.

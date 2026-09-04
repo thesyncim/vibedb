@@ -11,7 +11,7 @@
 performance, cost, storage, or scaling number. A green test, a generated coverage
 cell, or a CI artifact is not a result.
 
-This is a separate Go 1.26 module so competitor dependencies do not enter VibeDB's
+This is a separate Go 1.27 module so competitor dependencies do not enter VibeDB's
 root module. The current adapters use VibeDB from this checkout, Badger v4.9.5,
 bbolt v1.5.0, Pebble v1.1.5, and modernc SQLite v1.54.0. `go.mod` is authoritative.
 

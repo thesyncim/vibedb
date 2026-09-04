@@ -1,8 +1,8 @@
 // Derived from Vitess (github.com/vitessio/vitess,
 // go/vt/vtgate/vindexes/xxhash.go), Apache License 2.0. The differential harness
 // pins upstream v0.24.2; this xxhash keyspace-id algorithm is byte-identical
-// across v0.22.0..v0.24.2 (v0.22.0 itself does not compile under this repo's Go
-// 1.26 toolchain). See LICENSE-VITESS and docs/provenance.md
+// across v0.22.0..v0.24.2 (v0.22.0 itself stopped compiling with Go 1.26).
+// See LICENSE-VITESS and docs/provenance.md
 // (ALGO-VITESS-XXHASH-001).
 
 package vitessroute

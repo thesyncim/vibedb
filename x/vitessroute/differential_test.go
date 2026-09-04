@@ -4,8 +4,8 @@
 // module's go.mod) ONLY from _test.go files. No shipped adapter .go file imports
 // Vitess; the root module carries no Vitess dependency. The design names v0.22.0
 // as the reference release; the harness pins v0.24.2, whose xxhash/multicol/cfc
-// vindex code is byte-identical to v0.22.0 (v0.22.0 cannot compile under this
-// repo's Go 1.26 toolchain — the swissmap GOEXPERIMENT was removed). Each test
+// vindex code is byte-identical to v0.22.0 (v0.22.0 stopped compiling with
+// Go 1.26 when the swissmap GOEXPERIMENT was removed). Each test
 // computes the UPSTREAM destination by driving the genuine
 // go/vt/vtgate/vindexes Vindex (via CreateVindex + Map/Hash over sqltypes
 // values) and the ADAPTER destination via the shipped Stage 1 code, then

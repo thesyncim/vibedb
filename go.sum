@@ -10,10 +10,8 @@ github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZb
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu7U=
 github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
-github.com/thesyncim/vibejson v0.0.0-20260730224651-50a62f7753df h1:uKhFWMwhHIwIsqKb6nF8Bu36NOKBjVSvne7EYf59kSg=
-github.com/thesyncim/vibejson v0.0.0-20260730224651-50a62f7753df/go.mod h1:kvdNOZKpEtFo+trGM4UTz7pgy21ZKEgVx/n0WrcjlbQ=
-github.com/thesyncim/vibejson v0.0.0-20260904124246-ba74e524519b h1:S7VYzRIlH0WV5pod+3M3l+rvLDQtxwshUMlSEWfDEos=
-github.com/thesyncim/vibejson v0.0.0-20260904124246-ba74e524519b/go.mod h1:G4TBr+6QraiYUM7Uk/yGu+G37rCM3lvqemndeNWQO6o=
+github.com/thesyncim/vibejson v0.1.0 h1:Hk6Zp2RyiNuTBk7UiJ1I67ZJEpqIIiIE6J5gCUsAVc8=
+github.com/thesyncim/vibejson v0.1.0/go.mod h1:G4TBr+6QraiYUM7Uk/yGu+G37rCM3lvqemndeNWQO6o=
 go.etcd.io/raft/v3 v3.7.0 h1:BGzlwx07bLv8PW6OU5HObuz1y4hlPZUXA07pM1mPUh4=
 go.etcd.io/raft/v3 v3.7.0/go.mod h1:6gX6T2X907DjnjsFLODnTxba77stjs84W9gTTI0GUNA=
 golang.org/x/sys v0.47.0 h1:o7XGOvZQCADBQQ4Y7VNq2dRWQR7JmOUW8Kxx4ZsNgWs=

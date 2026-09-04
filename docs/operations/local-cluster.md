@@ -10,7 +10,7 @@ This page starts the smallest useful distributed VibeDB environment: three repli
 
 ## Prerequisites
 
-- Go 1.26, as declared by `go.mod`
+- Go 1.27, as declared by `go.mod`
 - a local checkout of this repository
 - `psql` if you want to run the SQL examples
 - a free loopback TCP port; this page uses `127.0.0.1:7432`
@@ -23,10 +23,14 @@ The launcher resolves `vibedb-shard` and `vibedb-gateway` beside its own executa
 
 ```bash
 mkdir -p ./bin
-go build -o ./bin/vibedb ./cmd/vibedb
-go build -o ./bin/vibedb-shard ./cmd/vibedb-shard
-go build -o ./bin/vibedb-gateway ./cmd/vibedb-gateway
+GOEXPERIMENT=simd go build -o ./bin/vibedb ./cmd/vibedb
+GOEXPERIMENT=simd go build -o ./bin/vibedb-shard ./cmd/vibedb-shard
+GOEXPERIMENT=simd go build -o ./bin/vibedb-gateway ./cmd/vibedb-gateway
 ```
+
+These Go 1.27 builds enable the JSON SIMD kernels on arm64 and supported amd64
+CPUs. The amd64 build keeps runtime CPU fallback. Use `GOEXPERIMENT=nosimd`
+for a portable build of all three processes.
 
 ## Start RF3 with PostgreSQL
 
