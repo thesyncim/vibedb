@@ -18,9 +18,9 @@ Darwin arm64, Go 1.27. The result remains allocation-free after warmup.
 
 | Returned rows | Main ns/op | Candidate ns/op | Latency |
 |---:|---:|---:|---:|
-| 32 | 16,358 | 12,892 | -21.2% |
-| 64 | 29,882 | 23,026 | -22.9% |
-| 256 | 110,052 | 84,227 | -23.5% |
+| 32 | 15,890 | 12,584 | -20.8% |
+| 64 | 29,406 | 22,663 | -22.9% |
+| 256 | 111,537 | 83,276 | -25.3% |
 
 Raw output is in `page-before.txt` and `page-after.txt`.
 
