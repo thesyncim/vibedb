@@ -251,19 +251,19 @@ func (d *CompactPrimaryScanDecoder) appendValue(
 		stream := &d.streamView[streamAt]
 		var ok bool
 		plan := d.streamPlan[streamAt]
-		if plan.dictionaryCount == 0 {
+		if plan.dictionaryCount&compactPrimaryScanDictionaryPair != 0 {
+			dst, ok = d.appendDictionaryPairFragment(dst, streamAt, ordinal)
+			hole++
+			end = meta.ends[hole]
+		} else if plan.dictionaryCount != 0 {
+			dst, ok = d.appendDictionaryFragment(dst, streamAt, ordinal)
+		} else {
 			dst = append(dst, meta.static[previous:end]...)
 			state := &d.streams[streamAt]
 			if ordinal != state.next {
 				state.seek(stream, ordinal)
 			}
 			dst, ok = state.appendValue(dst, stream, ordinal)
-		} else if plan.dictionaryCount&compactPrimaryScanDictionaryPair != 0 {
-			dst, ok = d.appendDictionaryPairFragment(dst, streamAt, ordinal)
-			hole++
-			end = meta.ends[hole]
-		} else {
-			dst, ok = d.appendDictionaryFragment(dst, streamAt, ordinal)
 		}
 		previous = end
 		if !ok {
@@ -279,10 +279,43 @@ func (d *CompactPrimaryScanDecoder) appendDictionaryPairFragment(
 	streamAt int,
 	row int,
 ) ([]byte, bool) {
-	firstID, firstOK := compactPrimaryScanDictionaryID(&d.streamView[streamAt], row)
-	secondID, secondOK := compactPrimaryScanDictionaryID(&d.streamView[streamAt+1], row)
-	if !firstOK || !secondOK {
-		return dst, false
+	ids := [2]int{}
+	for lane := 0; lane < 2; lane++ {
+		v := &d.streamView[streamAt+lane]
+		s := &d.streams[streamAt+lane]
+		if row != s.next {
+			s.seek(v, row)
+		}
+		if v.kind != compactStreamDictionary || row < 0 || row >= v.count ||
+			row != s.next || v.dictCount <= 0 || v.width > 16 {
+			return dst, false
+		}
+		width := int(v.width)
+		reservoir := uint64(s.value)
+		available := s.bit
+		cursor := s.cursor
+		for available < width {
+			if cursor >= len(v.data) {
+				return dst, false
+			}
+			reservoir |= uint64(v.data[cursor]) << uint(available)
+			cursor++
+			available += 8
+		}
+		id := 0
+		if width != 0 {
+			id = int(reservoir & (uint64(1)<<uint(width) - 1))
+		}
+		if id < 0 || id >= v.dictCount {
+			return dst, false
+		}
+		reservoir >>= uint(width)
+		available -= width
+		s.value = int64(reservoir)
+		s.bit = available
+		s.cursor = cursor
+		s.next++
+		ids[lane] = id
 	}
 	firstPlan := d.streamPlan[streamAt]
 	secondPlan := d.streamPlan[streamAt+1]
@@ -292,8 +325,8 @@ func (d *CompactPrimaryScanDecoder) appendDictionaryPairFragment(
 		secondCount != d.streamView[streamAt+1].dictCount {
 		return dst, false
 	}
-	first := int(firstPlan.dictionaryFirst) + firstID
-	second := int(secondPlan.dictionaryFirst) + secondID
+	first := int(firstPlan.dictionaryFirst) + ids[0]
+	second := int(secondPlan.dictionaryFirst) + ids[1]
 	if first+1 >= len(d.dictionary) || second+1 >= len(d.dictionary) {
 		return dst, false
 	}
@@ -305,37 +338,6 @@ func (d *CompactPrimaryScanDecoder) appendDictionaryPairFragment(
 	}
 	dst = append(dst, d.fragments[firstStart:firstEnd]...)
 	return append(dst, d.fragments[secondStart:secondEnd]...), true
-}
-
-func compactPrimaryScanDictionaryID(v *compactStreamView, row int) (int, bool) {
-	if v.kind != compactStreamDictionary || row < 0 || row >= v.count ||
-		v.dictCount <= 0 || v.width > 16 {
-		return 0, false
-	}
-	width := int(v.width)
-	if width == 0 {
-		return 0, true
-	}
-	bit := row * width
-	at := bit >> 3
-	shift := bit & 7
-	needed := (shift + width + 7) >> 3
-	if at < 0 || needed > len(v.data)-at {
-		return 0, false
-	}
-	var packed uint32
-	switch needed {
-	case 1:
-		packed = uint32(v.data[at])
-	case 2:
-		packed = uint32(binary.LittleEndian.Uint16(v.data[at:]))
-	default:
-		packed = uint32(v.data[at]) |
-			uint32(v.data[at+1])<<8 |
-			uint32(v.data[at+2])<<16
-	}
-	id := int(packed>>uint(shift)) & (1<<uint(width) - 1)
-	return id, id < v.dictCount
 }
 
 func (d *CompactPrimaryScanDecoder) appendDictionaryFragment(
