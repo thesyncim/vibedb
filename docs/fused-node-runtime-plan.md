@@ -5,6 +5,19 @@ with Luna max, then independently review and fix with Sol max. Base is main
 `fff5d6892e27db30f919c3ff7081b291cf71e4a1`; the inconclusive query experiment
 `d1756055` and its evidence `97200d59` stay on their separate branch.
 
+At the user's subsequent request, main `0128e794` was merged cleanly at
+`22bd378b` before any tranche measurement. It adds lazy collection transaction
+cuts, shared conflict-clock validation, parallel disjoint collection commits
+and zero-copy transaction puts. Both parent and candidate retain these upstream
+changes; the corrected comparison baseline is recorded below.
+Sol max review then reproduced and fixed fractured read-only cuts, missing
+validation for no-write transactions, and permanent handles created by rejected
+collection names. Five regression tests fail on `0128e794` and pass with the
+fix; the full root race suite passes. The reviewed fix is on main at
+`37a171521459199b8cea9fe5f3ad50ce0b325597`, which is the final parent baseline
+for this tranche. The active branch includes it at merge `f3281140`.
+The registered promotion thresholds below are unchanged.
+
 The full objective remains at least 2× CockroachDB on a representative matched
 read/write matrix with comparable durability/consistency, substantially better
 space efficiency, horizontal scalability and nonblocking schema evolution.
