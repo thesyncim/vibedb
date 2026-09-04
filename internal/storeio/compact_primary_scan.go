@@ -435,6 +435,7 @@ func (s *compactStreamSequentialState) appendValue(
 		return s.appendAlphabet(dst, v, row)
 	}
 	prefix := 0
+	arithmeticPrefix := false
 	switch v.kind {
 	case compactStreamFOR:
 		if row < 0 || row >= v.count || row != s.next {
@@ -503,19 +504,26 @@ func (s *compactStreamSequentialState) appendValue(
 	case compactStreamDelta:
 	case compactStreamDeltaPack:
 	case compactStreamPrefixInt:
-		if len(v.data) < 2 || v.data[0]&2 != 0 {
+		if len(v.data) < 2 {
 			return v.appendValue(dst, row)
 		}
 		prefix = 2
+		arithmeticPrefix = v.data[0]&2 != 0
 	default:
 		return v.appendValue(dst, row)
 	}
 	if row < 0 || row >= v.count || row != s.next {
 		return v.appendValue(dst, row)
 	}
-	packedDelta := v.kind == compactStreamDeltaPack ||
-		v.kind == compactStreamPrefixInt && v.data[0]&4 != 0
-	if packedDelta {
+	if arithmeticPrefix {
+		if len(v.data) != 18 {
+			return v.appendValue(dst, row)
+		}
+		first := int64(binary.LittleEndian.Uint64(v.data[2:]))
+		delta := int64(binary.LittleEndian.Uint64(v.data[10:]))
+		s.value = first + int64(row)*delta
+	} else if v.kind == compactStreamDeltaPack ||
+		v.kind == compactStreamPrefixInt && v.data[0]&4 != 0 {
 		if row%compactStreamRestart == 0 {
 			block := row / compactStreamRestart
 			s.cursor = int(binary.LittleEndian.Uint32(v.data[prefix+block*4:]))
