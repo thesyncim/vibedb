@@ -144,9 +144,13 @@ type fileWorkspace struct {
 	// Execs. The path and needle copies let an Exec reused with freshly
 	// compiled equivalent queries retain the warmed filter without pinning any
 	// one query plan.
-	tokenFilter       *durable.EqFilter
-	tokenFilterPath   string
-	tokenFilterNeedle []byte
+	tokenFilter         *durable.EqFilter
+	tokenFilterPath     string
+	tokenFilterNeedle   []byte
+	orderedFilter       *durable.IntegerOrderFilter
+	orderedFilterPath   string
+	orderedFilterOp     durable.IntegerOrder
+	orderedFilterNeedle int64
 
 	// workers is one scan Workspace per worker goroutine, indexed by worker
 	// number. Indexing by worker rather than by batch is deliberate: nothing a
@@ -227,6 +231,10 @@ func (w *fileWorkspace) release() {
 	w.tokenFilter = nil
 	w.tokenFilterPath = ""
 	w.tokenFilterNeedle = nil
+	w.orderedFilter = nil
+	w.orderedFilterPath = ""
+	w.orderedFilterOp = 0
+	w.orderedFilterNeedle = 0
 	w.workers = nil
 	w.segments = nil
 	w.arenas = nil
@@ -253,6 +261,24 @@ func (w *fileWorkspace) tokenEqFilterFor(path string, needle []byte) (*durable.E
 	w.tokenFilter = filter
 	w.tokenFilterPath = strings.Clone(path)
 	w.tokenFilterNeedle = append(w.tokenFilterNeedle[:0], needle...)
+	return filter, nil
+}
+
+func (w *fileWorkspace) tokenIntegerOrderFilterFor(
+	path string, needle int64, op durable.IntegerOrder,
+) (*durable.IntegerOrderFilter, error) {
+	if w.orderedFilter != nil && w.orderedFilterPath == path &&
+		w.orderedFilterNeedle == needle && w.orderedFilterOp == op {
+		return w.orderedFilter, nil
+	}
+	filter, err := durable.NewIntegerOrderFilter(path, needle, op)
+	if err != nil {
+		return nil, err
+	}
+	w.orderedFilter = filter
+	w.orderedFilterPath = strings.Clone(path)
+	w.orderedFilterNeedle = needle
+	w.orderedFilterOp = op
 	return filter, nil
 }
 
@@ -589,6 +615,19 @@ func (p *plan) runFileInto(
 	coveringColumns, handled, directErr := p.runDirectFileAggregate(snapshot, e)
 	if handled {
 		stats.CoveringColumns = coveringColumns
+		e.Stats = stats
+		if directErr == nil {
+			directErr = e.Workspace.checkCanceled()
+		}
+		return directErr
+	}
+	orderedFilter, handled, directErr := p.runDirectFileTokenIntegerOrderCount(snapshot, e)
+	if handled {
+		// The strict FOR lane is a serial full scan with no row fallback.
+		stats.Workers = 1
+		stats.RowsScanned = orderedFilter.scanned
+		stats.TokenFilterRows = orderedFilter.token
+		stats.TokenFilterFallbackRows = orderedFilter.fallback
 		e.Stats = stats
 		if directErr == nil {
 			directErr = e.Workspace.checkCanceled()

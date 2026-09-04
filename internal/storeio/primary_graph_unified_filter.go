@@ -49,6 +49,33 @@ type UnifiedEqFilter struct {
 	holes         [unifiedMaxTemplates]int16
 }
 
+// UnifiedIntegerOrderFilter is the strict storage-native predicate for one
+// signed integer ordering over compact FOR streams. Unlike UnifiedEqFilter it
+// never renders a row: if any present target stream in the snapshot cannot
+// answer exactly, the cursor declines the complete scan and the query layer
+// uses its generic executor.
+type UnifiedIntegerOrderFilter struct {
+	resolver UnifiedHoleResolver
+	needle   int64
+	op       UnifiedIntegerOrder
+}
+
+// NewUnifiedIntegerOrderFilter builds an exact ordered integer filter over a
+// unified field path. The caller proves the query literal is an int64 before
+// constructing this filter; the storage layer still validates the operation.
+func NewUnifiedIntegerOrderFilter(
+	path []byte, needle int64, op UnifiedIntegerOrder,
+) (*UnifiedIntegerOrderFilter, error) {
+	if !validUnifiedIntegerOrder(op) {
+		return nil, fmt.Errorf("%w: unified integer order", ErrInvalidWrite)
+	}
+	f := &UnifiedIntegerOrderFilter{needle: needle, op: op}
+	if err := f.resolver.SetPath(path); err != nil {
+		return nil, err
+	}
+	return f, nil
+}
+
 // NewUnifiedEqFilter builds a filter for path (the UnifiedHoleResolver
 // syntax) and needle, which must be the JSON spelling of one comparand value;
 // it is canonicalized here so callers may pass any valid spelling.
@@ -355,6 +382,40 @@ func (c *PrimaryGraphCursor) FilterCountEq(
 		}
 		if c.done {
 			return nil, PageRef{}, nil
+		}
+	}
+}
+
+// FilterCountIntegerOrdered scans every compact leaf with an all-or-nothing
+// FOR ordering counter. A false result means no count is authoritative: the
+// caller must discard progress and execute the original predicate generically.
+func (c *PrimaryGraphCursor) FilterCountIntegerOrdered(
+	f *UnifiedIntegerOrderFilter, progress *UnifiedFilterProgress,
+) (supported bool, err error) {
+	if c == nil || f == nil || progress == nil {
+		return false, nil
+	}
+	if c.done {
+		return true, nil
+	}
+	for {
+		if c.row == 0 {
+			matched, ok := c.leaf.CountResolvedIntegerOrdered(
+				&f.resolver, f.needle, f.op,
+			)
+			if !ok {
+				return false, nil
+			}
+			progress.Scanned += c.leaf.Len()
+			progress.Matched += matched
+			c.row = c.leaf.Len()
+		}
+		if err := c.advanceLeaf(); err != nil {
+			c.Close()
+			return false, err
+		}
+		if c.done {
+			return true, nil
 		}
 	}
 }

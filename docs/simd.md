@@ -1,9 +1,10 @@
-# SIMD in compressed equality counts
+# SIMD in compressed equality and ordered counts
 
-Development implementation: Go 1.27 SIMD can evaluate equality directly over
-packed column values. A durable unindexed `COUNT(*) WHERE field = value` can
-count matching dictionary IDs or integer offsets without reconstructing each
-JSON document. The storage format and exact comparison rules stay unchanged.
+Development implementation: Go 1.27 SIMD can evaluate equality and integer
+ordering directly over packed column values. A durable unindexed
+`COUNT(*) WHERE field = value` or integer ordering predicate can count packed
+values without reconstructing each JSON document. The storage format and
+exact comparison rules stay unchanged.
 
 The packed counter set covers 7-, 8-, 10-, and 16-bit values. The measured
 fixtures use 7- and 8-bit dictionary IDs, representing dictionaries of up to
@@ -13,6 +14,16 @@ cover the 7-bit dictionary and 10-bit integer fixtures; the wide fixtures add
 the 8-bit dictionary and 16-bit integer cases while using the same exact scalar
 comparison rules. Other compact stream kinds can use these widths when their
 encoding is valid.
+
+The ordered lane supports ungrouped durable `COUNT(*)` with one integer
+literal and `<`, `<=`, `>`, or `>=`. It reports a storage result only when
+every present resolved token stream is FOR encoded and can answer the exact
+integer ordering without an unsafe overflow or container case. If any leaf
+declines, the storage scan discards partial progress and the executor runs the
+generic path for the whole operation. The codec uses one exact scalar
+less-than counter and derives the other operators with overflow-safe threshold
+and complement math; the same bounded width-specific counters serve the Go
+1.27 ARM64 and AMD64 SIMD dispatches.
 
 The 7- and 10-bit paths gather overlapping byte pairs, unpack independent
 values, compare those values with the needle, and accumulate the matches.
@@ -61,6 +72,9 @@ exact base and candidate revisions, SIMD-focused checks, and raw benchmark
 artifacts for those native comparisons. The [AMD64 packed-count measurements](benchmarks/packed-count-simd-amd64-2026-09-04/README.md)
 report the initial AVX2 counter and durable query qualification on a Go 1.27.1
 AMD64 runner, with exact revision pairs and an unchanged ARM64 control.
+The [ordered packed-count measurements](benchmarks/packed-order-simd-2026-09-04/README.md)
+record local FOR10 and FOR16 `<`, `<=`, `>`, and `>=` durable COUNT evidence,
+including the nosimd control and raw samples.
 Portable parity remains in the regular CI job.
 
 Each width follows the same evidence requirement: demonstrate that a real
@@ -75,7 +89,9 @@ architecture, fixtures, and exact revision pairs.
 - `internal/storeio/compact_stream_codec_simd_amd64.go`: guarded AVX2 loads, width-specific unpacking, and bounded reductions.
 - `internal/storeio/compact_stream_codec_dispatch_scalar.go`: portable dispatch.
 - `internal/storeio/compact_primary_stripe.go`: compressed stripe count operations.
-- `internal/storeio/primary_graph_unified_filter.go`: durable equality count integration.
+- `internal/storeio/primary_graph_unified_filter.go`: durable packed equality and ordered count integration.
+- `query/file_packed_order_bench_test.go`: durable ordered COUNT fixtures and benchmarks.
+- `internal/storeio/compact_stream_codec_packed_order_test.go`: ordered packed-counter oracle and dispatch tests.
 - `internal/storeio/compact_stream_codec_test.go`: all-width and exact-number oracles.
 - `.github/workflows/packed-simd.yml`: paired native base/candidate evidence lane.
 - `.github/workflows/ci.yml`: SIMD and portable parity on ARM64 and AMD64.

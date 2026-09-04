@@ -13,8 +13,12 @@ func TestCountCompactPackedEqualDispatchScalar(t *testing.T) {
 		compactPackedEqualDispatchName(countCompactPacked8EqualImpl),
 		compactPackedEqualDispatchName(countCompactPacked10EqualImpl),
 		compactPackedEqualDispatchName(countCompactPacked16EqualImpl),
+		compactPackedEqualDispatchName(countCompactPacked7LessImpl),
+		compactPackedEqualDispatchName(countCompactPacked8LessImpl),
+		compactPackedEqualDispatchName(countCompactPacked10LessImpl),
+		compactPackedEqualDispatchName(countCompactPacked16LessImpl),
 	} {
-		if !strings.HasSuffix(name, "EqualScalar") {
+		if !strings.HasSuffix(name, "EqualScalar") && !strings.HasSuffix(name, "LessScalar") {
 			t.Fatalf("portable dispatch=%q, want scalar", name)
 		}
 	}

@@ -34,6 +34,22 @@ const (
 	compactDictionaryScanPreferred = 128
 )
 
+// UnifiedIntegerOrder names the four exact signed-integer predicates accepted
+// by the storage-native ordered COUNT lane. It is intentionally shared with
+// durable and kept separate from query's parser operators.
+type UnifiedIntegerOrder uint8
+
+const (
+	UnifiedIntegerLess UnifiedIntegerOrder = iota
+	UnifiedIntegerLessEqual
+	UnifiedIntegerGreater
+	UnifiedIntegerGreaterEqual
+)
+
+func validUnifiedIntegerOrder(op UnifiedIntegerOrder) bool {
+	return op <= UnifiedIntegerGreaterEqual
+}
+
 type compactStreamEncoding struct {
 	kind  uint8
 	width uint8
@@ -1800,6 +1816,93 @@ func (v compactStreamView) countIntegerEqual(needle int64) (matched int, support
 	}
 }
 
+func (v compactStreamView) validIntegerFORData() bool {
+	if v.kind != compactStreamFOR || v.count < 0 || v.width > 64 || len(v.data) < 8 {
+		return false
+	}
+	packedBytes := (uint64(v.count)*uint64(v.width) + 7) / 8
+	return packedBytes == uint64(len(v.data)-8)
+}
+
+// countIntegerLess scans one exact FOR stream for values below an exclusive
+// signed threshold. For widths below 64 the signed ordering lets us compare
+// packed unsigned deltas directly; a threshold outside the representable
+// range becomes an all-zero or all-one result without touching the data. A
+// full-width or structurally valid wrapping FOR stream reconstructs each
+// signed value in the scalar bounded reader.
+func (v compactStreamView) countIntegerLess(needle int64) (matched int, supported bool) {
+	if !v.validIntegerFORData() {
+		return 0, false
+	}
+	base := int64(binary.LittleEndian.Uint64(v.data))
+	// Writer-produced FOR streams choose the signed minimum as base, so a
+	// sub-64-bit span cannot wrap. The admitted binary grammar does not depend
+	// on writer provenance, though: reconstruct a structurally valid wrapped
+	// span exactly instead of applying the ordinary unsigned-delta shortcut.
+	limit := uint64(0)
+	if v.width < 64 {
+		limit = uint64(1) << v.width
+	}
+	wrapped := v.width > 0 && v.width < 64 &&
+		base > int64(1<<63-1)-int64(limit-1)
+	if v.width == 64 || wrapped {
+		for row := 0; row < v.count; row++ {
+			delta := compactReadBits(v.data[8:], row*int(v.width), int(v.width))
+			value := int64(uint64(base) + delta)
+			if value < needle {
+				matched++
+			}
+		}
+		return matched, true
+	}
+	if needle <= base {
+		return 0, true
+	}
+	delta := uint64(needle) - uint64(base)
+	if delta >= limit {
+		return v.count, true
+	}
+	return countCompactPackedLess(v.data[8:], v.count, int(v.width), delta), true
+}
+
+// countIntegerOrdered derives every ordered predicate from the one exclusive
+// less-than scan. The boundary checks avoid overflowing MinInt64/MaxInt64 and
+// complements are taken only after a complete exact scan.
+func (v compactStreamView) countIntegerOrdered(
+	needle int64, op UnifiedIntegerOrder,
+) (matched int, supported bool) {
+	if !validUnifiedIntegerOrder(op) {
+		return 0, false
+	}
+	const maxInt64Value = int64(1<<63 - 1)
+	switch op {
+	case UnifiedIntegerLess:
+		return v.countIntegerLess(needle)
+	case UnifiedIntegerLessEqual:
+		if needle == maxInt64Value {
+			if !v.validIntegerFORData() {
+				return 0, false
+			}
+			return v.count, true
+		}
+		return v.countIntegerLess(needle + 1)
+	case UnifiedIntegerGreater:
+		if needle == maxInt64Value {
+			if !v.validIntegerFORData() {
+				return 0, false
+			}
+			return 0, true
+		}
+		matched, supported = v.countIntegerLess(needle + 1)
+		return v.count - matched, supported
+	case UnifiedIntegerGreaterEqual:
+		matched, supported = v.countIntegerLess(needle)
+		return v.count - matched, supported
+	default:
+		return 0, false
+	}
+}
+
 // countSpellingEqual scans one complete scalar stream for an exact canonical
 // JSON spelling. scratch is retained by the caller for front-coded values so
 // repeated scans remain allocation-free.
@@ -2185,6 +2288,62 @@ func countCompactPackedEqual(
 	return matched
 }
 
+// countCompactPackedLess counts packed unsigned lanes below an exclusive
+// threshold. The caller handles thresholds outside the lane's representable
+// range, so the SIMD entry points only need to compare ordinary lane values.
+// Keeping this operation separate from equality lets ordered FOR predicates
+// derive all four SQL operators from one exact threshold scan.
+func countCompactPackedLess(
+	data []byte,
+	count, width int,
+	threshold uint64,
+) (matched int) {
+	if count <= 0 || width < 0 || width > 64 || threshold == 0 {
+		return 0
+	}
+	if width == 0 {
+		return count
+	}
+	if width < 64 && threshold >= uint64(1)<<uint(width) {
+		return count
+	}
+	switch width {
+	case 7:
+		return countCompactPacked7LessImpl(data, count, threshold)
+	case 8:
+		return countCompactPacked8LessImpl(data, count, threshold)
+	case 10:
+		return countCompactPacked10LessImpl(data, count, threshold)
+	case 16:
+		return countCompactPacked16LessImpl(data, count, threshold)
+	}
+	if width > 56 {
+		for row := 0; row < count; row++ {
+			if compactReadBits(data, row*width, width) < threshold {
+				matched++
+			}
+		}
+		return matched
+	}
+	mask := uint64(1)<<uint(width) - 1
+	var reservoir uint64
+	available := 0
+	cursor := 0
+	for range count {
+		for available < width {
+			reservoir |= uint64(data[cursor]) << uint(available)
+			cursor++
+			available += 8
+		}
+		if reservoir&mask < threshold {
+			matched++
+		}
+		reservoir >>= uint(width)
+		available -= width
+	}
+	return matched
+}
+
 // Byte-aligned widths can compare values directly without a bit reservoir.
 // Keep the full uint64 needle so out-of-range values scan without matching.
 func countCompactPacked8EqualScalar(data []byte, count int, want uint64) (matched int) {
@@ -2200,6 +2359,32 @@ func countCompactPacked16EqualScalar(data []byte, count int, want uint64) (match
 	for row := 0; row < count; row++ {
 		value := binary.LittleEndian.Uint16(data[row*2:])
 		if uint64(value) == want {
+			matched++
+		}
+	}
+	return matched
+}
+
+func countCompactPacked8LessScalar(
+	data []byte,
+	count int,
+	threshold uint64,
+) (matched int) {
+	for row := 0; row < count; row++ {
+		if uint64(data[row]) < threshold {
+			matched++
+		}
+	}
+	return matched
+}
+
+func countCompactPacked16LessScalar(
+	data []byte,
+	count int,
+	threshold uint64,
+) (matched int) {
+	for row := 0; row < count; row++ {
+		if uint64(binary.LittleEndian.Uint16(data[row*2:])) < threshold {
 			matched++
 		}
 	}
@@ -2253,6 +2438,56 @@ func countCompactPacked7EqualScalar(data []byte, count int, want uint64) (matche
 	return matched
 }
 
+// countCompactPacked7LessScalar consumes eight 7-bit lanes per seven-byte
+// group. It is also the short-input and portable oracle for the SIMD lane.
+func countCompactPacked7LessScalar(
+	data []byte,
+	count int,
+	threshold uint64,
+) (matched int) {
+	row := 0
+	cursor := 0
+	for ; row+8 <= count; row, cursor = row+8, cursor+7 {
+		packed := uint64(data[cursor]) |
+			uint64(data[cursor+1])<<8 |
+			uint64(data[cursor+2])<<16 |
+			uint64(data[cursor+3])<<24 |
+			uint64(data[cursor+4])<<32 |
+			uint64(data[cursor+5])<<40 |
+			uint64(data[cursor+6])<<48
+		if packed&0x7f < threshold {
+			matched++
+		}
+		if packed>>7&0x7f < threshold {
+			matched++
+		}
+		if packed>>14&0x7f < threshold {
+			matched++
+		}
+		if packed>>21&0x7f < threshold {
+			matched++
+		}
+		if packed>>28&0x7f < threshold {
+			matched++
+		}
+		if packed>>35&0x7f < threshold {
+			matched++
+		}
+		if packed>>42&0x7f < threshold {
+			matched++
+		}
+		if packed>>49&0x7f < threshold {
+			matched++
+		}
+	}
+	for ; row < count; row++ {
+		if compactReadBits(data, row*7, 7) < threshold {
+			matched++
+		}
+	}
+	return matched
+}
+
 // Four 10-bit values occupy exactly five bytes. This is the ordinary packed
 // width for integer ranges and dictionaries with 513-1024 distinct values.
 func countCompactPacked10EqualScalar(data []byte, count int, want uint64) (matched int) {
@@ -2279,6 +2514,43 @@ func countCompactPacked10EqualScalar(data []byte, count int, want uint64) (match
 	}
 	for ; row < count; row++ {
 		if compactReadBits(data, row*10, 10) == want {
+			matched++
+		}
+	}
+	return matched
+}
+
+// countCompactPacked10LessScalar consumes four 10-bit lanes per five-byte
+// group. It deliberately keeps threshold as uint64 so direct tests can prove
+// that an out-of-range threshold does not truncate into a false match.
+func countCompactPacked10LessScalar(
+	data []byte,
+	count int,
+	threshold uint64,
+) (matched int) {
+	row := 0
+	cursor := 0
+	for ; row+4 <= count; row, cursor = row+4, cursor+5 {
+		packed := uint64(data[cursor]) |
+			uint64(data[cursor+1])<<8 |
+			uint64(data[cursor+2])<<16 |
+			uint64(data[cursor+3])<<24 |
+			uint64(data[cursor+4])<<32
+		if packed&0x3ff < threshold {
+			matched++
+		}
+		if packed>>10&0x3ff < threshold {
+			matched++
+		}
+		if packed>>20&0x3ff < threshold {
+			matched++
+		}
+		if packed>>30&0x3ff < threshold {
+			matched++
+		}
+	}
+	for ; row < count; row++ {
+		if compactReadBits(data, row*10, 10) < threshold {
 			matched++
 		}
 	}

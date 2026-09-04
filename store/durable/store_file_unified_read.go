@@ -19,6 +19,36 @@ type EqFilter struct {
 	inner *storeio.UnifiedEqFilter
 }
 
+// IntegerOrder is the durable API spelling of the exact signed integer
+// ordering accepted by Snapshot.FilterIntegerOrderCount.
+type IntegerOrder = storeio.UnifiedIntegerOrder
+
+const (
+	IntegerLess         = storeio.UnifiedIntegerLess
+	IntegerLessEqual    = storeio.UnifiedIntegerLessEqual
+	IntegerGreater      = storeio.UnifiedIntegerGreater
+	IntegerGreaterEqual = storeio.UnifiedIntegerGreaterEqual
+)
+
+// IntegerOrderFilter is reusable state for one strict FOR ordered COUNT.
+// Unsupported leaves decline the whole scan so callers can use the generic
+// executor without exposing a partial result.
+type IntegerOrderFilter struct {
+	inner *storeio.UnifiedIntegerOrderFilter
+}
+
+// NewIntegerOrderFilter builds an exact integer ordering over a unified field
+// path. The query layer is responsible for restricting its literal to int64.
+func NewIntegerOrderFilter(
+	path string, needle int64, op IntegerOrder,
+) (*IntegerOrderFilter, error) {
+	inner, err := storeio.NewUnifiedIntegerOrderFilter([]byte(path), needle, op)
+	if err != nil {
+		return nil, err
+	}
+	return &IntegerOrderFilter{inner: inner}, nil
+}
+
 // NewEqFilter builds an equality filter over a "/a/b" field path and the
 // JSON spelling of one comparand value (canonicalized internally).
 func NewEqFilter(path string, needleJSON []byte) (*EqFilter, error) {
@@ -47,6 +77,15 @@ type FilterEqResult struct {
 	Matched  int
 	Fallback int
 	Scanned  int
+}
+
+// FilterIntegerOrderResult reports a strict ordered scan. Supported is false
+// when any present target stream cannot answer exactly from compact FOR data;
+// Matched and Scanned are then deliberately zero and must be discarded.
+type FilterIntegerOrderResult struct {
+	Matched   int
+	Scanned   int
+	Supported bool
 }
 
 // FilterEqCount scans every live document and counts those whose value at the
@@ -116,6 +155,53 @@ func (s *Snapshot) FilterEqCount(f *EqFilter) (FilterEqResult, error) {
 		if matched {
 			progress.Matched++
 		}
+	}
+}
+
+// FilterIntegerOrderCount scans a snapshot using the strict FOR ordering lane.
+// It never renders or falls back per row: unsupported compact leaves decline
+// atomically, allowing the query executor to run the original predicate.
+func (s *Snapshot) FilterIntegerOrderCount(
+	f *IntegerOrderFilter,
+) (FilterIntegerOrderResult, error) {
+	if s == nil || s.collection == nil || s.state == nil {
+		return FilterIntegerOrderResult{}, ErrClosed
+	}
+	if f == nil || f.inner == nil {
+		return FilterIntegerOrderResult{}, fmt.Errorf("vibedb: nil unified integer filter")
+	}
+	state := s.state
+	catalogBounds := storeio.GlobalTabletCatalogBounds{
+		StoreID:                state.root.StoreID,
+		SelectedRootGeneration: state.root.Generation,
+		FileEnd:                state.fileEnd,
+		NextLogicalID:          state.root.NextLogicalID,
+	}
+	leafBounds := storeio.CommonPrimaryLeafBounds{
+		FileEnd:           state.fileEnd,
+		NextLogicalID:     state.root.NextLogicalID,
+		AllocationQuantum: state.root.PageSize,
+	}
+	var cursor storeio.PrimaryGraphCursor
+	if err := storeio.InitPrimaryGraphCursor(
+		&cursor, s.collection.cache, state.root.PrimaryRoot,
+		catalogBounds, leafBounds, nil, nil,
+	); err != nil {
+		return FilterIntegerOrderResult{}, err
+	}
+	defer cursor.Close()
+	var progress storeio.UnifiedFilterProgress
+	for {
+		supported, err := cursor.FilterCountIntegerOrdered(f.inner, &progress)
+		if err != nil {
+			return FilterIntegerOrderResult{}, err
+		}
+		if !supported {
+			return FilterIntegerOrderResult{}, nil
+		}
+		return FilterIntegerOrderResult{
+			Matched: progress.Matched, Scanned: progress.Scanned, Supported: true,
+		}, nil
 	}
 }
 
