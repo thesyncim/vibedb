@@ -430,7 +430,11 @@ func newReplicatedCatalogGateway(
 		}
 		return nil, nil, nil, nil, nil, err
 	}
-	_, err = authority.Read(ctx)
+	if !bootstrapIfMissing && !routeSeedExists {
+		_, err = waitReplicatedCatalogBootstrap(ctx, authority, attempts, attemptTimeout)
+	} else {
+		_, err = authority.Read(ctx)
+	}
 	if err != nil && (!bootstrapIfMissing ||
 		!errors.Is(err, gateway.ErrReplicatedCatalogMissing)) {
 		if replicatedPool != nil {
