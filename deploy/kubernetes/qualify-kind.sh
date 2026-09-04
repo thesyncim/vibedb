@@ -12,6 +12,7 @@ image=vibedb:kube-qualification
 root_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 evidence_dir=${VIBEDB_KUBE_EVIDENCE_DIR:-"${RUNNER_TEMP:-/tmp}/vibedb-kube-rf3-evidence"}
 work_dir=$(mktemp -d "${RUNNER_TEMP:-/tmp}/vibedb-kube-rf3.XXXXXXXX")
+image_context="${work_dir}/image"
 state_dir="${work_dir}/bootstrap-authority"
 bootstrap_yaml="${work_dir}/bootstrap.yaml"
 topology_yaml="${work_dir}/topology.yaml"
@@ -114,21 +115,40 @@ go env -json GOEXPERIMENT GOAMD64 GOARCH > "${evidence_dir}/go-backend.txt"
 kind version > "${evidence_dir}/kind-version.txt"
 kubectl version --client=true > "${evidence_dir}/kubectl-version.txt"
 
-go build -o "${work_dir}/vibedb-operator" "${root_dir}/cmd/vibedb-operator"
-go build -o "${work_dir}/vibedb-kube-qualify" "${root_dir}/cmd/vibedb-kube-qualify"
+mkdir -p "${image_context}"
+CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' \
+  -o "${image_context}/vibedb-operator" "${root_dir}/cmd/vibedb-operator"
 mkdir -m 0700 "${state_dir}"
-"${work_dir}/vibedb-operator" bootstrap \
+"${image_context}/vibedb-operator" bootstrap \
   -namespace "${namespace}" -state-dir "${state_dir}" \
   > "${bootstrap_yaml}" 2> "${bootstrap_metadata}"
-"${work_dir}/vibedb-operator" render -namespace "${namespace}" -image "${image}" \
+"${image_context}/vibedb-operator" render -namespace "${namespace}" -image "${image}" \
   -bootstrap-state-dir "${state_dir}" > "${topology_yaml}"
-"${work_dir}/vibedb-operator" validate -manifest "${topology_yaml}"
-docker build --build-arg "GOEXPERIMENT=${GOEXPERIMENT}" --file "${root_dir}/deploy/kubernetes/Dockerfile" --tag "${image}" "${root_dir}"
+"${image_context}/vibedb-operator" validate -manifest "${topology_yaml}"
 # From this point cleanup owns this newly created test cluster, including a
 # partially failed create. The earlier existence check never grants ownership.
 cluster_created=true
 kind create cluster --name "${cluster_name}" \
-  --config "${root_dir}/deploy/kubernetes/kind-3-worker.yaml" --wait 120s
+  --config "${root_dir}/deploy/kubernetes/kind-3-worker.yaml" --wait 120s &
+cluster_create_pid=$!
+image_status=0
+if ! CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o "${image_context}/" \
+    "${root_dir}/cmd/vibedb" \
+    "${root_dir}/cmd/vibedb-shard" \
+    "${root_dir}/cmd/vibedb-gateway" \
+    "${root_dir}/cmd/vibedb-kube-qualify" || \
+  ! docker build --file "${root_dir}/deploy/kubernetes/Dockerfile.prebuilt" \
+    --tag "${image}" "${image_context}"; then
+  image_status=1
+fi
+cluster_status=0
+if ! wait "${cluster_create_pid}"; then
+  cluster_status=1
+fi
+if [[ "${image_status}" -ne 0 || "${cluster_status}" -ne 0 ]]; then
+  echo "Kubernetes image or Kind cluster creation failed" >&2
+  exit 1
+fi
 kind load docker-image --name "${cluster_name}" "${image}"
 
 # Even client dry-run performs resource discovery against an API server.
@@ -154,7 +174,7 @@ done
 chmod 0600 "${work_dir}/client-key.pem"
 start_port_forward
 
-"${work_dir}/vibedb-kube-qualify" write \
+"${image_context}/vibedb-kube-qualify" write \
   -certificate "${work_dir}/client-cert.pem" -key "${work_dir}/client-key.pem" \
   -roots "${work_dir}/cluster-roots.pem" \
   -bootstrap-state "${state_dir}/bootstrap-state.vibejson" \
@@ -171,7 +191,7 @@ done
 wait_for_rollouts restart
 start_port_forward
 
-"${work_dir}/vibedb-kube-qualify" verify \
+"${image_context}/vibedb-kube-qualify" verify \
   -certificate "${work_dir}/client-cert.pem" -key "${work_dir}/client-key.pem" \
   -roots "${work_dir}/cluster-roots.pem" \
   -bootstrap-state "${state_dir}/bootstrap-state.vibejson" \
