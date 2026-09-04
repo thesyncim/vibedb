@@ -165,16 +165,38 @@ func (server *ReplicatedServer) DispatchReplicated(ctx context.Context, call Rep
 	owned := cloneReplicatedCall(call)
 	server.semanticDispatch.Add(1)
 	response := server.executeReplicatedAuthenticatedCall(requestCtx, &owned.Request, true, owned.SQL)
-	if response == nil || !validReplicatedResponse(response) {
+	reply, replyErr := semanticReplyFromExecutedResponse(response)
+	if replyErr != nil {
 		if response != nil && response.readLease != nil {
 			response.readLease.Release()
 		}
-		return nil, ErrReplicatedWire
+		return nil, replyErr
 	}
-	reply := &ReplicatedReply{Response: *response, SQL: response.sqlResult}
 	retained = true
 	return &replicatedReplyLease{reply: reply, readLease: response.readLease,
 		frameBudget: &server.frames, frameBytes: charge}, nil
+}
+
+func semanticReplyFromExecutedResponse(response *ReplicatedResponse) (*ReplicatedReply, error) {
+	if response == nil || !validReplicatedResponse(response) {
+		return nil, ErrReplicatedWire
+	}
+	reply := &ReplicatedReply{Response: *response, SQL: response.sqlResult}
+	if response.Kind != ReplicatedQueryResult || reply.SQL != nil {
+		return reply, nil
+	}
+	// The shared query executor emits the bounded SQL response frame directly.
+	// Remote calls decode that frame at the gateway boundary; do the same for an
+	// in-process semantic call while its read lease still owns the frame, then
+	// restore the transport-neutral typed reply shape.
+	result, err := DecodeReplicatedSQLResponse(response.Value)
+	if err != nil || result.Kind != ResponseRows && result.Kind != ResponseError {
+		return nil, ErrReplicatedWire
+	}
+	reply.Response.Value = nil
+	reply.Response.sqlResult = result
+	reply.SQL = result
+	return reply, nil
 }
 
 // ValidateReplicatedReply validates the common semantic result grammar used by

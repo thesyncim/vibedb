@@ -592,6 +592,44 @@ func TestSemanticResultEncodingAndDetachmentCopiesBorrowedStrings(t *testing.T) 
 	}
 }
 
+func TestSemanticDispatchDecodesDirectSQLFrame(t *testing.T) {
+	result := &ShardResponse{
+		Kind:    ResponseRows,
+		Columns: []Column{{Name: "value"}},
+		Rows:    [][]Cell{{{Bytes: []byte(`42`)}}},
+	}
+	var frame bytes.Buffer
+	if err := EncodeResponse(&frame, result); err != nil {
+		t.Fatal(err)
+	}
+	response := &ReplicatedResponse{
+		Kind:        ReplicatedQueryResult,
+		HasState:    true,
+		State:       replicatedWireState(testReplicatedServingState()),
+		ReadApplied: 1,
+		Value:       frame.Bytes(),
+	}
+	reply, err := semanticReplyFromExecutedResponse(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reply.Response.Value) != 0 || reply.SQL == nil ||
+		len(reply.SQL.Rows) != 1 || len(reply.SQL.Rows[0]) != 1 ||
+		string(reply.SQL.Rows[0][0].Bytes) != "42" {
+		t.Fatalf("decoded semantic reply = %+v", reply)
+	}
+	if err := ValidateReplicatedReply(reply); err != nil {
+		t.Fatal(err)
+	}
+
+	bad := *response
+	bad.Value = append([]byte(nil), response.Value...)
+	bad.Value[len(bad.Value)-1] ^= 0xff
+	if _, err := semanticReplyFromExecutedResponse(&bad); !errors.Is(err, ErrReplicatedWire) {
+		t.Fatalf("corrupt direct frame error = %v", err)
+	}
+}
+
 func TestSemanticDispatchChecksCredentialExpiryOnEveryCall(t *testing.T) {
 	fixture := bindSemanticServer(t, &fakeReplicatedOwner{state: testReplicatedServingState()}, time.Second)
 	now := shardTLSNow
