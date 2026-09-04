@@ -204,7 +204,10 @@ jobs:
                 contains("ack_failover=") and
                 contains("gateway_replacement_recovery=") and
                 contains("max_voter_failover=") and
+                contains("foreground_objective=5s") and
+                contains("foreground_grace=100ms") and
                 contains("p99=") and
+                contains("foreground_max=") and
                 contains("rss_growth=") and
                 contains("storage_growth=") and
                 contains("wal_growth=") and

@@ -43,6 +43,13 @@ const durableRF3ExternalEnvironment = "VIBEDB_DURABLE_RF3_PROCESS_E2E"
 
 const (
 	durableRF3ExternalVoters = 3
+	// The foreground objective is a service bound. The grace covers scheduler
+	// and wall-clock measurement skew at that boundary without relaxing the
+	// response, durability, or retryability checks.
+	durableRF3ExternalForegroundObjective  = 5 * time.Second
+	durableRF3ExternalForegroundGrace      = 100 * time.Millisecond
+	durableRF3ExternalRetryBackoff         = 10 * time.Millisecond
+	durableRF3ExternalRetryDiagnosticBytes = 4 << 10
 	// The multi-relation profile owns 18 sealed user journals, 12 sealed system
 	// journals, and 12 bounded capture journals. Keep their strict allocation
 	// independently bounded so adding a relation or growing journal geometry
@@ -314,8 +321,12 @@ func TestGatewayDurableRF3ExternalProcessRecovery(t *testing.T) {
 
 	slices.Sort(latencies)
 	p99 := latencies[(len(latencies)*99+99)/100-1]
-	if p99 > 5*time.Second {
-		t.Fatalf("external durable RF3 foreground p99=%s exceeds 5s", p99)
+	foregroundMax := latencies[len(latencies)-1]
+	foregroundLimit := durableRF3ExternalForegroundObjective + durableRF3ExternalForegroundGrace
+	if foregroundMax > foregroundLimit {
+		t.Fatalf("external durable RF3 foreground max=%s exceeds objective=%s grace=%s limit=%s",
+			foregroundMax, durableRF3ExternalForegroundObjective,
+			durableRF3ExternalForegroundGrace, foregroundLimit)
 	}
 	finalStorage := replicaProcessAllocatedBytes(fixture.root, "")
 	finalWALs := fixture.captureWALAllocatedBytes(t)
@@ -350,9 +361,10 @@ func TestGatewayDurableRF3ExternalProcessRecovery(t *testing.T) {
 	// The public wire counter is exact for every test-owned gateway request and
 	// response. No shipped external Raft byte counter exists, so the gate names
 	// that boundary honestly and separately proves zero snapshot payload growth.
-	t.Logf("durable external RF3: roles=4 shard_processes=3 gateway_replacement=true gateway_principals_distinct=true route_seeds_distinct=true mtls=true shard_sigstop=true shard_sigkill=true all_shards_restarted=true terminal_response_lost=true ack_response_lost=true exact_terminal_replay=true exact_ack_replay=true acknowledged_replay_refused=true no_acknowledged_loss=true partition_failover=%s terminal_failover=%s ack_failover=%s gateway_replacement_recovery=%s max_voter_failover=%s p99=%s rss_growth=%d storage_growth=%d wal_growth=%d public_client_wire_bytes=%d snapshot_payload_bytes=%d ack_gc_complete=true pin_journals_retired=true",
+	t.Logf("durable external RF3: roles=4 shard_processes=3 gateway_replacement=true gateway_principals_distinct=true route_seeds_distinct=true mtls=true shard_sigstop=true shard_sigkill=true all_shards_restarted=true terminal_response_lost=true ack_response_lost=true exact_terminal_replay=true exact_ack_replay=true acknowledged_replay_refused=true no_acknowledged_loss=true partition_failover=%s terminal_failover=%s ack_failover=%s gateway_replacement_recovery=%s max_voter_failover=%s foreground_objective=%s foreground_grace=%s p99=%s foreground_max=%s rss_growth=%d storage_growth=%d wal_growth=%d public_client_wire_bytes=%d snapshot_payload_bytes=%d ack_gc_complete=true pin_journals_retired=true",
 		partitionFailover, terminalFailover, ackFailover, gatewayReplacement, maxVoterFailover,
-		p99, rssGrowth, storageGrowth, walGrowth, clientBytes, snapshotGrowth)
+		durableRF3ExternalForegroundObjective, durableRF3ExternalForegroundGrace,
+		p99, foregroundMax, rssGrowth, storageGrowth, walGrowth, clientBytes, snapshotGrowth)
 }
 
 type durableRF3ExternalAllocation struct {
@@ -1433,18 +1445,48 @@ func (client *durableRF3ExternalWireClient) assertPoint(
 		t.Fatal(err)
 	}
 	started := time.Now()
-	deadline := started.Add(5 * time.Second)
+	limit := durableRF3ExternalForegroundObjective + durableRF3ExternalForegroundGrace
+	deadline := started.Add(limit)
+	attempts := 0
+	var lastRetryable []byte
 	for {
+		if cause := context.Cause(t.Context()); cause != nil {
+			t.Fatalf("replicated point id=%q canceled after %d attempts: %v; last_retryable=%s",
+				identifier, attempts, cause, lastRetryable)
+		}
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			t.Fatalf("replicated point id=%q did not settle within 5s", identifier)
+			t.Fatalf("replicated point id=%q did not settle within objective=%s grace=%s limit=%s attempts=%d last_retryable=%s",
+				identifier, durableRF3ExternalForegroundObjective, durableRF3ExternalForegroundGrace,
+				limit, attempts, lastRetryable)
 		}
+		attempts++
 		response, _ := client.roundTripWithin(t, raw, remaining)
 		if rf3FixturePointResponseMatches(response, identifier) {
 			return time.Since(started)
 		}
 		if !durableRF3ExternalRetryableResponse(response) {
 			t.Fatalf("replicated point id=%q response=%s", identifier, response)
+		}
+		diagnostic := response[:min(len(response), durableRF3ExternalRetryDiagnosticBytes)]
+		lastRetryable = append(lastRetryable[:0], diagnostic...)
+		remaining = time.Until(deadline)
+		if remaining <= 0 {
+			continue
+		}
+		backoff := min(durableRF3ExternalRetryBackoff, remaining)
+		timer := time.NewTimer(backoff)
+		select {
+		case <-t.Context().Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			t.Fatalf("replicated point id=%q canceled after %d attempts: %v; last_retryable=%s",
+				identifier, attempts, context.Cause(t.Context()), lastRetryable)
+		case <-timer.C:
 		}
 	}
 }

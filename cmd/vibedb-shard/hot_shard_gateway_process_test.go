@@ -291,6 +291,10 @@ func runGatewayHotShardLiveChild(t testing.TB, fixture gatewayHotShardLiveFixtur
 	}
 	links[0].heal()
 
+	// Admission and final publication are distinct bounded phases. The forced
+	// partition above deliberately consumes time after admission, so reusing
+	// its deadline would shorten the controller's final convergence budget.
+	deadline = time.Now().Add(30 * time.Second)
 	var final *gateway.Snapshot
 	for time.Now().Before(deadline) {
 		restartQuiescedGateway()
