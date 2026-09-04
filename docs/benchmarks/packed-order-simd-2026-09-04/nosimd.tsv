@@ -1,0 +1,17 @@
+benchmark	candidate_nosimd_median_ns	candidate_simd_median_ns	nosimd_over_simd	candidate_nosimd_range_ns	candidate_simd_range_ns
+BenchmarkFilePackedOrderedCount/half/ge	7092	3099	2.29x	7016-7269	3075-3632
+BenchmarkFilePackedOrderedCount/half/gt	7096	3100	2.29x	7070-7280	3084-3827
+BenchmarkFilePackedOrderedCount/half/le	7118	3116	2.28x	7034-7266	3084-4162
+BenchmarkFilePackedOrderedCount/half/lt	7097	3103	2.29x	7048-7242	3092-3694
+BenchmarkFilePackedOrderedCount/sparse/ge	7134	3118	2.29x	7088-7211	3069-3759
+BenchmarkFilePackedOrderedCount/sparse/gt	7212	3109	2.32x	7053-7290	3083-3305
+BenchmarkFilePackedOrderedCount/sparse/le	7262	3096	2.35x	7010-7338	3076-3402
+BenchmarkFilePackedOrderedCount/sparse/lt	7234	3212	2.25x	7103-7312	3075-3337
+BenchmarkFilePackedOrderedCountWide/half/ge	11450	3619	3.16x	11297-11510	3470-13566
+BenchmarkFilePackedOrderedCountWide/half/gt	11356	3491	3.25x	11263-11530	3476-13189
+BenchmarkFilePackedOrderedCountWide/half/le	11454	3618	3.17x	11267-11630	3483-7619
+BenchmarkFilePackedOrderedCountWide/half/lt	11417	3606	3.17x	11327-11594	3473-3994
+BenchmarkFilePackedOrderedCountWide/sparse/ge	7078	3087	2.29x	6944-7124	2954-3124
+BenchmarkFilePackedOrderedCountWide/sparse/gt	6909	3074	2.25x	6793-6973	2954-3360
+BenchmarkFilePackedOrderedCountWide/sparse/le	6944	2963	2.34x	6830-7032	2942-5929
+BenchmarkFilePackedOrderedCountWide/sparse/lt	7050	3075	2.29x	6795-7057	2984-3159

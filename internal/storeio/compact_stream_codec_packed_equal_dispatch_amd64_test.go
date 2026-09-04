@@ -28,16 +28,57 @@ func TestCountCompactPackedEqualDispatchAVX2(t *testing.T) {
 		compactPackedEqualDispatchName(countCompactPacked8EqualImpl),
 		compactPackedEqualDispatchName(countCompactPacked10EqualImpl),
 		compactPackedEqualDispatchName(countCompactPacked16EqualImpl),
+		compactPackedEqualDispatchName(countCompactPacked7LessImpl),
+		compactPackedEqualDispatchName(countCompactPacked8LessImpl),
+		compactPackedEqualDispatchName(countCompactPacked10LessImpl),
+		compactPackedEqualDispatchName(countCompactPacked16LessImpl),
 	} {
 		if name == "" {
 			t.Fatal("missing amd64 packed dispatch function name")
 		}
 		if wantAVX2 {
-			if !strings.HasSuffix(name, "EqualAVX2") {
-				t.Fatalf("AVX2 dispatch=%q, want EqualAVX2", name)
+			if !strings.HasSuffix(name, "EqualAVX2") && !strings.HasSuffix(name, "LessAVX2") {
+				t.Fatalf("AVX2 dispatch=%q, want packed AVX2", name)
 			}
-		} else if !strings.HasSuffix(name, "EqualScalar") {
-			t.Fatalf("AVX2-disabled dispatch=%q, want EqualScalar", name)
+		} else if !strings.HasSuffix(name, "EqualScalar") && !strings.HasSuffix(name, "LessScalar") {
+			t.Fatalf("AVX2-disabled dispatch=%q, want packed scalar", name)
+		}
+	}
+}
+
+func TestCountCompactPackedLessAVX2DirectParity(t *testing.T) {
+	if !archsimd.X86.AVX2() {
+		t.Skip("AVX2 is unavailable or disabled")
+	}
+	candidates := []struct {
+		width int
+		fn    func([]byte, int, uint64) int
+	}{
+		{width: 7, fn: countCompactPacked7LessAVX2},
+		{width: 8, fn: countCompactPacked8LessAVX2},
+		{width: 10, fn: countCompactPacked10LessAVX2},
+		{width: 16, fn: countCompactPacked16LessAVX2},
+	}
+	for _, candidate := range candidates {
+		mask := uint64(1)<<uint(candidate.width) - 1
+		for _, count := range []int{32, 64, 65, 4095, 4096, 4097} {
+			packed := compactPackedEqualPatternData(
+				count, candidate.width, compactPackedPatternRandom,
+			)
+			for _, offset := range []int{0, 17, 31} {
+				backing := make([]byte, offset+len(packed)+16)
+				for at := range backing {
+					backing[at] = 0xa5
+				}
+				copy(backing[offset:], packed)
+				input := backing[offset : offset+len(packed) : offset+len(packed)]
+				for _, threshold := range []uint64{0, 1, mask / 3, mask, mask + 1, ^uint64(0)} {
+					expected := compactPackedLessExpected(input, count, candidate.width, threshold)
+					if got := candidate.fn(input, count, threshold); got != expected {
+						t.Fatalf("width=%d count=%d offset=%d threshold=%d got=%d expected=%d", candidate.width, count, offset, threshold, got, expected)
+					}
+				}
+			}
 		}
 	}
 }

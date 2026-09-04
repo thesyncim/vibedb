@@ -9,6 +9,10 @@ var (
 	countCompactPacked8EqualImpl  = countCompactPacked8EqualNEON
 	countCompactPacked10EqualImpl = countCompactPacked10EqualNEON
 	countCompactPacked16EqualImpl = countCompactPacked16EqualNEON
+	countCompactPacked7LessImpl   = countCompactPacked7LessNEON
+	countCompactPacked8LessImpl   = countCompactPacked8LessNEON
+	countCompactPacked10LessImpl  = countCompactPacked10LessNEON
+	countCompactPacked16LessImpl  = countCompactPacked16LessNEON
 )
 
 // The lookup indices interleave the two bytes needed by each little-endian
@@ -224,6 +228,183 @@ func countCompactPacked16EqualNEON(data []byte, count int, want uint64) (matched
 		if row < chunkEnd {
 			tail := chunkEnd - row
 			matched += countCompactPacked16EqualScalar(remaining, tail, want)
+			remaining = remaining[tail*2:]
+			row = chunkEnd
+		}
+	}
+	return matched
+}
+
+// The ordered kernels share the equality extraction and reduction schedules;
+// only the lane predicate changes. Thresholds are bounded by the packed width
+// by countCompactPackedLess before dispatch, while these guards keep the
+// architecture entry points safe for direct differential tests as well.
+func countCompactPacked7LessNEON(data []byte, count int, threshold uint64) (matched int) {
+	if count <= 0 || threshold == 0 {
+		return 0
+	}
+	if threshold > 127 {
+		return count
+	}
+	if count < 32 {
+		return countCompactPacked7LessScalar(data, count, threshold)
+	}
+	indices0 := archsimd.LoadUint8x16Array(&compactPacked7NEONIndices0)
+	indices1 := archsimd.LoadUint8x16Array(&compactPacked7NEONIndices1)
+	shifts := archsimd.LoadInt16x8Array(&compactPacked7NEONShifts)
+	mask := archsimd.BroadcastUint16x8(127)
+	needle := archsimd.BroadcastUint16x8(uint16(threshold))
+	var sums0, sums1 archsimd.Uint16x8
+	row := 0
+	remaining := data
+	for ; row+16 <= count && len(remaining) >= 16; row += 16 {
+		loaded := archsimd.LoadUint8x16Array((*[16]uint8)(remaining))
+		lanes0 := loaded.LookupOrZero(indices0).ReshapeToUint16s().Shift(shifts)
+		lanes1 := loaded.LookupOrZero(indices1).ReshapeToUint16s().Shift(shifts)
+		sums0 = sums0.Sub(lanes0.And(mask).Less(needle).ToInt16x8().ToBits())
+		sums1 = sums1.Sub(lanes1.And(mask).Less(needle).ToInt16x8().ToBits())
+		remaining = remaining[14:]
+		if row&4095 == 4080 {
+			matched += int(sums0.ReduceSum()) + int(sums1.ReduceSum())
+			sums0, sums1 = archsimd.Uint16x8{}, archsimd.Uint16x8{}
+		}
+	}
+	matched += int(sums0.ReduceSum()) + int(sums1.ReduceSum())
+	if row < count {
+		matched += countCompactPacked7LessScalar(remaining, count-row, threshold)
+	}
+	return matched
+}
+
+func countCompactPacked10LessNEON(data []byte, count int, threshold uint64) (matched int) {
+	if count <= 0 || threshold == 0 {
+		return 0
+	}
+	if threshold > 1023 {
+		return count
+	}
+	if count < 32 {
+		return countCompactPacked10LessScalar(data, count, threshold)
+	}
+	indices := archsimd.LoadUint8x16Array(&compactPacked10NEONIndices)
+	indicesOffset6 := archsimd.LoadUint8x16Array(&compactPacked10NEONIndicesOffset6)
+	shifts := archsimd.LoadInt16x8Array(&compactPacked10NEONShifts)
+	mask := archsimd.BroadcastUint16x8(1023)
+	needle := archsimd.BroadcastUint16x8(uint16(threshold))
+	var sums0, sums1, sums2, sums3 archsimd.Uint16x8
+	row := 0
+	remaining := data
+	for row < count {
+		chunkEnd := count
+		if remainingRows := 4096; chunkEnd-row > remainingRows {
+			chunkEnd = row + remainingRows
+		}
+		vectorEnd := row + (chunkEnd-row)/32*32
+		for ; row < vectorEnd && len(remaining) >= 40; row += 32 {
+			loaded0 := archsimd.LoadUint8x16Array((*[16]uint8)(remaining))
+			loaded1 := archsimd.LoadUint8x16Array((*[16]uint8)(remaining[10:]))
+			loaded2 := archsimd.LoadUint8x16Array((*[16]uint8)(remaining[20:]))
+			loaded3 := archsimd.LoadUint8x16Array((*[16]uint8)(remaining[24:]))
+			lanes0 := loaded0.LookupOrZero(indices).ReshapeToUint16s().Shift(shifts)
+			lanes1 := loaded1.LookupOrZero(indices).ReshapeToUint16s().Shift(shifts)
+			lanes2 := loaded2.LookupOrZero(indices).ReshapeToUint16s().Shift(shifts)
+			lanes3 := loaded3.LookupOrZero(indicesOffset6).ReshapeToUint16s().Shift(shifts)
+			sums0 = sums0.Sub(lanes0.And(mask).Less(needle).ToInt16x8().ToBits())
+			sums1 = sums1.Sub(lanes1.And(mask).Less(needle).ToInt16x8().ToBits())
+			sums2 = sums2.Sub(lanes2.And(mask).Less(needle).ToInt16x8().ToBits())
+			sums3 = sums3.Sub(lanes3.And(mask).Less(needle).ToInt16x8().ToBits())
+			remaining = remaining[40:]
+		}
+		matched += int(sums0.ReduceSum()) + int(sums1.ReduceSum()) +
+			int(sums2.ReduceSum()) + int(sums3.ReduceSum())
+		sums0, sums1, sums2, sums3 = archsimd.Uint16x8{}, archsimd.Uint16x8{}, archsimd.Uint16x8{}, archsimd.Uint16x8{}
+		if row < chunkEnd {
+			tail := chunkEnd - row
+			matched += countCompactPacked10LessScalar(remaining, tail, threshold)
+			remaining = remaining[(tail*10+7)/8:]
+			row = chunkEnd
+		}
+	}
+	return matched
+}
+
+func countCompactPacked8LessNEON(data []byte, count int, threshold uint64) (matched int) {
+	if count <= 0 || threshold == 0 {
+		return 0
+	}
+	if threshold > 255 {
+		return count
+	}
+	if count < 32 {
+		return countCompactPacked8LessScalar(data, count, threshold)
+	}
+	needle := archsimd.BroadcastUint8x16(uint8(threshold))
+	row := 0
+	remaining := data
+	for row < count {
+		chunkEnd := count
+		if chunkEnd-row > 512 {
+			chunkEnd = row + 512
+		}
+		vectorEnd := row + (chunkEnd-row)/64*64
+		var sums0, sums1, sums2, sums3 archsimd.Uint8x16
+		for ; row < vectorEnd && len(remaining) >= 64; row += 64 {
+			loaded0 := archsimd.LoadUint8x16Array((*[16]uint8)(remaining))
+			loaded1 := archsimd.LoadUint8x16Array((*[16]uint8)(remaining[16:]))
+			loaded2 := archsimd.LoadUint8x16Array((*[16]uint8)(remaining[32:]))
+			loaded3 := archsimd.LoadUint8x16Array((*[16]uint8)(remaining[48:]))
+			sums0 = sums0.Sub(loaded0.Less(needle).ToInt8x16().ToBits())
+			sums1 = sums1.Sub(loaded1.Less(needle).ToInt8x16().ToBits())
+			sums2 = sums2.Sub(loaded2.Less(needle).ToInt8x16().ToBits())
+			sums3 = sums3.Sub(loaded3.Less(needle).ToInt8x16().ToBits())
+			remaining = remaining[64:]
+		}
+		for ; row+16 <= chunkEnd && len(remaining) >= 16; row += 16 {
+			loaded := archsimd.LoadUint8x16Array((*[16]uint8)(remaining))
+			sums0 = sums0.Sub(loaded.Less(needle).ToInt8x16().ToBits())
+			remaining = remaining[16:]
+		}
+		matched += int(sums0.ReduceSum()) + int(sums1.ReduceSum()) +
+			int(sums2.ReduceSum()) + int(sums3.ReduceSum())
+		if row < chunkEnd {
+			tail := chunkEnd - row
+			matched += countCompactPacked8LessScalar(remaining, tail, threshold)
+			remaining = remaining[tail:]
+			row = chunkEnd
+		}
+	}
+	return matched
+}
+
+func countCompactPacked16LessNEON(data []byte, count int, threshold uint64) (matched int) {
+	if count <= 0 || threshold == 0 {
+		return 0
+	}
+	if threshold > 65535 {
+		return count
+	}
+	if count < 32 {
+		return countCompactPacked16LessScalar(data, count, threshold)
+	}
+	needle := archsimd.BroadcastUint16x8(uint16(threshold))
+	row := 0
+	remaining := data
+	for row < count {
+		chunkEnd := count
+		if chunkEnd-row > 4096 {
+			chunkEnd = row + 4096
+		}
+		vectorEnd := row + (chunkEnd-row)/8*8
+		var sums archsimd.Uint16x8
+		for ; row < vectorEnd && len(remaining) >= 16; row += 8 {
+			loaded := archsimd.LoadUint8x16Array((*[16]uint8)(remaining)).ReshapeToUint16s()
+			sums = sums.Sub(loaded.Less(needle).ToInt16x8().ToBits())
+			remaining = remaining[16:]
+		}
+		matched += int(sums.ReduceSum())
+		if row < chunkEnd {
+			tail := chunkEnd - row
+			matched += countCompactPacked16LessScalar(remaining, tail, threshold)
 			remaining = remaining[tail*2:]
 			row = chunkEnd
 		}

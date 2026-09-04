@@ -169,6 +169,24 @@ func (p *plan) scalarCountEqualityPath() (compiledPath, scalar, bool) {
 	return p.valuePaths[p.where.col], p.where.lit, true
 }
 
+// scalarCountIntegerOrderPath recognizes the strict ordered COUNT shape. The
+// storage lane only accepts an actual int64 literal: decimal and floating
+// literals retain the generic executor's exact-number semantics.
+func (p *plan) scalarCountIntegerOrderPath() (compiledPath, scalar, Op, bool) {
+	if p.where == nil || p.where.kind != predCmp ||
+		!orderedRangeOp(p.where.op) || p.grouped || !p.singleRow ||
+		p.where.col < 0 || p.where.col >= len(p.valuePaths) ||
+		p.where.lit.kind != kindNumber || !p.where.lit.isInt {
+		return compiledPath{}, scalar{}, 0, false
+	}
+	for _, col := range p.columns {
+		if col.agg != aggCount || col.value >= 0 {
+			return compiledPath{}, scalar{}, 0, false
+		}
+	}
+	return p.valuePaths[p.where.col], p.where.lit, p.where.op, true
+}
+
 func (p *plan) scalarCountPath() (compiledPath, scalar, bool) {
 	path, lit, ok := p.scalarCountEqualityPath()
 	if !ok || !path.single {

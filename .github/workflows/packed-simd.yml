@@ -4,7 +4,14 @@ on:
   pull_request:
     paths:
       - 'internal/storeio/compact_stream_codec*'
+      - 'internal/storeio/compact_primary_stripe.go'
+      - 'internal/storeio/primary_graph_unified_filter.go'
+      - 'store/durable/store_file_unified_read.go'
+      - 'query/file_execute.go'
+      - 'query/file_execute_cover.go'
+      - 'query/raw_match.go'
       - 'query/file_packed_count_bench_test.go'
+      - 'query/file_packed_order_bench_test.go'
       - '.github/workflows/packed-simd.yml'
       - 'scripts/bench/run-packed-simd.sh'
   workflow_dispatch:
@@ -124,6 +131,9 @@ jobs:
             printf 'cp %q %q\n' \
               "${GITHUB_WORKSPACE}/query/file_packed_count_bench_test.go" \
               "${base_worktree}/query/file_packed_count_bench_test.go"
+            printf 'cp %q %q\n' \
+              "${GITHUB_WORKSPACE}/query/file_packed_order_bench_test.go" \
+              "${base_worktree}/query/file_packed_order_bench_test.go"
             printf 'go test -run %q -c -o %q ./internal/storeio\n' '^$' "${binaries}/base-storeio.test"
             printf 'go test -run %q -c -o %q ./query\n' '^$' "${binaries}/base-query.test"
             printf 'go test -run %q -c -o %q ./internal/storeio\n' '^$' "${binaries}/head-storeio.test"
@@ -134,6 +144,7 @@ jobs:
           trap 'git worktree remove --force "${base_worktree}" >/dev/null 2>&1 || true' EXIT
           test -f "${GITHUB_WORKSPACE}/internal/storeio/compact_stream_codec_packed_equal_bench_test.go"
           test -f "${GITHUB_WORKSPACE}/query/file_packed_count_bench_test.go"
+          test -f "${GITHUB_WORKSPACE}/query/file_packed_order_bench_test.go"
           mkdir -p "${base_worktree}/internal/storeio" "${base_worktree}/query"
           cp -- "${GITHUB_WORKSPACE}/internal/storeio/compact_stream_codec_packed_equal_bench_test.go" \
             "${base_worktree}/internal/storeio/compact_stream_codec_packed_equal_bench_test.go"
@@ -143,6 +154,10 @@ jobs:
             "${base_worktree}/internal/storeio/compact_stream_codec_packed_equal_bench_test.go"
           cmp -- "${GITHUB_WORKSPACE}/query/file_packed_count_bench_test.go" \
             "${base_worktree}/query/file_packed_count_bench_test.go"
+          cp -- "${GITHUB_WORKSPACE}/query/file_packed_order_bench_test.go" \
+            "${base_worktree}/query/file_packed_order_bench_test.go"
+          cmp -- "${GITHUB_WORKSPACE}/query/file_packed_order_bench_test.go" \
+            "${base_worktree}/query/file_packed_order_bench_test.go"
           git -C "${base_worktree}" status --short > "${metadata}/base-worktree-status.txt"
 
           cd "${GITHUB_WORKSPACE}"
@@ -165,20 +180,21 @@ jobs:
           {
             printf 'VIBEDB_TEST_REQUIRE_AVX2=%q go test -v -count=1 -timeout=5m ./internal/storeio -run %q\n' \
               "${VIBEDB_TEST_REQUIRE_AVX2}" \
-              'Test(CountCompact|CompactPacked|CompactStream|CompactPrimaryStripe)'
+              'Test(CountCompact|CompactPacked|CompactIntegerOrdered|CompactStream|CompactPrimaryStripe)'
             printf 'go test -count=1 -timeout=5m ./query -run %q\n' \
-              '^TestFilePackedEqualityCount(Wide)?$'
+              '^TestFilePacked(Equality|Ordered)Count.*$'
             printf 'VIBEDB_TEST_REQUIRE_AVX2=%q go test -v -race -gcflags=all=-d=checkptr=2 -count=1 -timeout=5m ./internal/storeio -run %q\n' \
               "${VIBEDB_TEST_REQUIRE_AVX2}" \
-              '^(TestCountCompactPackedEqual|TestCompactPacked)'
+              '^(TestCountCompactPacked(Equal|Less)|TestCompactPacked|TestCompactIntegerOrdered)'
           } > "${evidence}/focused-test-commands.txt"
           go test -v -count=1 -timeout=5m ./internal/storeio \
-            -run 'Test(CountCompact|CompactPacked|CompactStream|CompactPrimaryStripe)' \
+            -run 'Test(CountCompact|CompactPacked|CompactIntegerOrdered|CompactStream|CompactPrimaryStripe)' \
             2>&1 | tee "${evidence}/focused-storeio-tests.txt"
           go test -count=1 -timeout=5m ./query \
-            -run '^TestFilePackedEqualityCount(Wide)?$'
+            -run '^TestFilePacked(Equality|Ordered)Count.*$' \
+            2>&1 | tee "${evidence}/focused-query-tests.txt"
           go test -v -race -gcflags=all=-d=checkptr=2 -count=1 -timeout=5m ./internal/storeio \
-            -run '^(TestCountCompactPackedEqual|TestCompactPacked)' \
+            -run '^(TestCountCompactPacked(Equal|Less)|TestCompactPacked|TestCompactIntegerOrdered)' \
             2>&1 | tee "${evidence}/packed-race-checkptr-tests.txt"
 
       - name: SIMD packed-count fallback with AVX2 disabled (AMD64)
@@ -200,7 +216,7 @@ jobs:
             go env -json GOARCH GOAMD64 GOEXPERIMENT
             printf 'GODEBUG=%s\n' "${GODEBUG}"
           } > "${evidence}/environment.txt"
-          tests='Test(CountCompact|CompactPacked)|^TestFilePackedEqualityCount(Wide)?$'
+          tests='Test(CountCompact|CompactPacked|CompactIntegerOrdered)|^TestFilePacked(Equality|Ordered)Count.*$'
           printf 'GOAMD64=v1 GOEXPERIMENT=simd GODEBUG=cpu.avx2=off go test -v -count=1 -timeout=5m ./internal/storeio ./query -run %q\n' \
             "${tests}" > "${evidence}/commands.txt"
           go test -v -count=1 -timeout=5m ./internal/storeio ./query \

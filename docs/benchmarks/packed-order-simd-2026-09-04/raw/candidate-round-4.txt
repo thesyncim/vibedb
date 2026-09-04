@@ -1,0 +1,21 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/query
+cpu: Apple M4 Max
+BenchmarkFilePackedOrderedCount/sparse/lt         	   91405	      3212 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedOrderedCount/sparse/le         	   97119	      3093 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedOrderedCount/sparse/gt         	   97386	      3095 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedOrderedCount/sparse/ge         	   92371	      3226 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedOrderedCount/half/lt           	   93548	      3223 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedOrderedCount/half/le           	   96892	      3116 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedOrderedCount/half/gt           	   91927	      3237 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedOrderedCount/half/ge           	   92566	      3235 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedOrderedCountWide/sparse/lt     	  101329	      2984 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedOrderedCountWide/sparse/le     	  101430	      2963 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedOrderedCountWide/sparse/gt     	   99849	      2970 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedOrderedCountWide/sparse/ge     	  102399	      2972 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedOrderedCountWide/half/lt       	   85294	      3506 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedOrderedCountWide/half/le       	   84949	      3483 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedOrderedCountWide/half/gt       	   86648	      3491 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedOrderedCountWide/half/ge       	   86415	      3495 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+PASS

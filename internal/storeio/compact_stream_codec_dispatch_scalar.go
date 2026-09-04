@@ -12,4 +12,8 @@ var (
 	countCompactPacked8EqualImpl  = countCompactPacked8EqualScalar
 	countCompactPacked10EqualImpl = countCompactPacked10EqualScalar
 	countCompactPacked16EqualImpl = countCompactPacked16EqualScalar
+	countCompactPacked7LessImpl   = countCompactPacked7LessScalar
+	countCompactPacked8LessImpl   = countCompactPacked8LessScalar
+	countCompactPacked10LessImpl  = countCompactPacked10LessScalar
+	countCompactPacked16LessImpl  = countCompactPacked16LessScalar
 )
