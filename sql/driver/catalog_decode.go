@@ -112,9 +112,7 @@ func decodeShardStoreIdentityVibe(c *vibejson.DecodeCursor, dst *ShardStoreIdent
 			err = c.String(&value)
 			decoded.Shard = distribution.ShardID(strings.Clone(value))
 		case 2:
-			var value uint64
-			err = c.Uint(&value)
-			decoded.AllocationGeneration = distribution.ShardAllocationGeneration(value)
+			err = c.Uint(&decoded.AllocationGeneration)
 		case 3:
 			err = decodeReplicatedLowerHex(c, decoded.LogID[:], "vibedb: shard store log id must contain exactly 128 bits of lowercase hexadecimal", "vibedb: shard store log id")
 		}
@@ -172,13 +170,9 @@ func decodeShardStoreFenceVibe(c *vibejson.DecodeCursor, dst *ShardStoreFence) e
 			return err
 		}
 		if index == 0 {
-			var value uint64
-			err = c.Uint(&value)
-			decoded.OwnershipEpoch = distribution.OwnershipEpoch(value)
+			err = c.Uint(&decoded.OwnershipEpoch)
 		} else {
-			var value uint64
-			err = c.Uint(&value)
-			decoded.RoutingVersion = distribution.RoutingVersion(value)
+			err = c.Uint(&decoded.RoutingVersion)
 		}
 		if err != nil {
 			return err
