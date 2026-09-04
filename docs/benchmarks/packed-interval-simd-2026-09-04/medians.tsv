@@ -1,9 +1,9 @@
 benchmark	base_ns	candidate_ns	nosimd_ns	base_speedup	simd_speedup
-BenchmarkFilePackedIntegerIntervalCount/empty	2227635	2431	2436	916.3x	1.00x
-BenchmarkFilePackedIntegerIntervalCount/sparse	2231832	3392	8194	658.0x	2.42x
-BenchmarkFilePackedIntegerIntervalCount/half	2361290	3098	6998	762.2x	2.26x
-BenchmarkFilePackedIntegerIntervalCount/full	2379847	2439	2440	975.7x	1.00x
-BenchmarkFilePackedIntegerIntervalCountWide/empty	2177342	2478	2480	878.7x	1.00x
-BenchmarkFilePackedIntegerIntervalCountWide/sparse	2175732	3535	11287	615.5x	3.19x
-BenchmarkFilePackedIntegerIntervalCountWide/half	2173688	3541	11345	613.9x	3.20x
-BenchmarkFilePackedIntegerIntervalCountWide/full	2315316	2489	2492	930.2x	1.00x
+BenchmarkFilePackedIntegerIntervalCount/empty	2227635	2410	2572	924.3x	1.07x
+BenchmarkFilePackedIntegerIntervalCount/sparse	2231832	3350	9239	666.2x	2.76x
+BenchmarkFilePackedIntegerIntervalCount/half	2361290	3073	6970	768.4x	2.27x
+BenchmarkFilePackedIntegerIntervalCount/full	2379847	2431	2464	979.0x	1.01x
+BenchmarkFilePackedIntegerIntervalCountWide/empty	2177342	2456	2455	886.5x	1.00x
+BenchmarkFilePackedIntegerIntervalCountWide/sparse	2175732	3476	11296	625.9x	3.25x
+BenchmarkFilePackedIntegerIntervalCountWide/half	2173688	3465	11258	627.3x	3.25x
+BenchmarkFilePackedIntegerIntervalCountWide/full	2315316	2406	2481	962.3x	1.03x
