@@ -1,0 +1,38 @@
+{
+  "pg.direct.execute": {
+    "count": 2304,
+    "total_ms": 4135.9542980000015,
+    "mean_ms": 1.795119052951389,
+    "p50_ms": 1.47744,
+    "p95_ms": 2.590336,
+    "unmatched_begin": 0,
+    "unmatched_end": 0
+  },
+  "pg.direct.prepare": {
+    "count": 2304,
+    "total_ms": 1010.685466000001,
+    "mean_ms": 0.4386655668402778,
+    "p50_ms": 0.248512,
+    "p95_ms": 0.50272,
+    "unmatched_begin": 0,
+    "unmatched_end": 0
+  },
+  "pg.outbox.save": {
+    "count": 3,
+    "total_ms": 5.510272,
+    "mean_ms": 1.8367573333333334,
+    "p50_ms": 1.218176,
+    "p95_ms": 3.851968,
+    "unmatched_begin": 0,
+    "unmatched_end": 0
+  },
+  "pg.write": {
+    "count": 2304,
+    "total_ms": 5459.800926000012,
+    "mean_ms": 2.3697052630208333,
+    "p50_ms": 1.7985275,
+    "p95_ms": 4.060032,
+    "unmatched_begin": 0,
+    "unmatched_end": 0
+  }
+}

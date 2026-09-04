@@ -28,7 +28,10 @@ capacity contract permits valid history spanning multiple segment entry limits.
 See [registration qualification](qualification/node-registration-2026-09-04/README.md).
 
 Node-log split/replica movement, interrupted admission at process-crash boundaries,
-sustained reclamation and acknowledged-write fault campaigns remain. The first
+sustained reclamation and simultaneous multi-group fault histories remain. The
+[shipped node-log fault campaign](qualification/node-fault-2026-09-04/README.md)
+now passes acknowledged-write, lost-reply, partition and restart checks for one
+RF3 group across three processes. The first
 [matched node-log comparison](benchmarks/crdb-sql-2026-09-04-node/README.md) validates
 120,000 samples but still trails CRDB on every workload. Fixture allocation falls
 to about 1.34 GiB; sustained amplification is unqualified. C8 grouped-scan relative

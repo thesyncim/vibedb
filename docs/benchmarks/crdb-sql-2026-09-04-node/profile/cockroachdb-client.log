@@ -1,0 +1,10 @@
+cockroachdb point_hit c=1 rep=1 6718.6 ops/s p99=0.265ms errors=0 verified=true
+cockroachdb point_hit c=8 rep=1 34614.4 ops/s p99=0.450ms errors=0 verified=true
+cockroachdb point_miss c=1 rep=1 6948.2 ops/s p99=0.274ms errors=0 verified=true
+cockroachdb point_miss c=8 rep=1 42230.6 ops/s p99=0.286ms errors=0 verified=true
+cockroachdb range_64 c=1 rep=1 4778.4 ops/s p99=0.285ms errors=0 verified=true
+cockroachdb range_64 c=8 rep=1 30486.8 ops/s p99=0.487ms errors=0 verified=true
+cockroachdb group_16 c=1 rep=1 623.0 ops/s p99=3.231ms errors=0 verified=true
+cockroachdb group_16 c=8 rep=1 3199.3 ops/s p99=5.128ms errors=0 verified=true
+cockroachdb update_existing c=1 rep=1 1252.0 ops/s p99=1.108ms errors=0 verified=true
+cockroachdb update_existing c=8 rep=1 5991.4 ops/s p99=2.035ms errors=0 verified=true

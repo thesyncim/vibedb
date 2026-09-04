@@ -1,0 +1,42 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/internal/storeio
+cpu: Apple M4 Max
+BenchmarkCompactCommonPrefix/bytes=12/prefix=0-16         	84584001	         1.242 ns/op	 805.08 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCompactCommonPrefix/bytes=12/prefix=0-16         	93939566	         1.218 ns/op	 821.14 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCompactCommonPrefix/bytes=12/prefix=0-16         	100000000	         1.215 ns/op	 822.89 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCompactCommonPrefix/bytes=12/prefix=6-16         	78772461	         1.608 ns/op	4353.02 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCompactCommonPrefix/bytes=12/prefix=6-16         	76518411	         1.568 ns/op	4464.70 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCompactCommonPrefix/bytes=12/prefix=6-16         	79099113	         1.552 ns/op	4510.09 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCompactCommonPrefix/bytes=12/prefix=12-16        	40303389	         3.139 ns/op	4141.33 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCompactCommonPrefix/bytes=12/prefix=12-16        	36308623	         3.248 ns/op	4002.83 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCompactCommonPrefix/bytes=12/prefix=12-16        	37859869	         3.063 ns/op	4244.86 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCompactCommonPrefix/bytes=32/prefix=0-16         	100000000	         1.219 ns/op	 820.36 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCompactCommonPrefix/bytes=32/prefix=0-16         	100000000	         1.210 ns/op	 826.65 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCompactCommonPrefix/bytes=32/prefix=0-16         	98374120	         1.222 ns/op	 818.25 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCompactCommonPrefix/bytes=32/prefix=16-16        	46272481	         2.640 ns/op	6438.98 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCompactCommonPrefix/bytes=32/prefix=16-16        	45425860	         2.697 ns/op	6303.60 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCompactCommonPrefix/bytes=32/prefix=16-16        	45825576	         2.656 ns/op	6401.70 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCompactCommonPrefix/bytes=32/prefix=32-16        	34381490	         3.549 ns/op	9298.65 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCompactCommonPrefix/bytes=32/prefix=32-16        	33230263	         3.543 ns/op	9314.74 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCompactCommonPrefix/bytes=32/prefix=32-16        	37530786	         3.516 ns/op	9386.84 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCompactCommonPrefix/bytes=256/prefix=0-16        	100000000	         1.227 ns/op	 814.70 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCompactCommonPrefix/bytes=256/prefix=0-16        	98846786	         1.218 ns/op	 821.08 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCompactCommonPrefix/bytes=256/prefix=0-16        	92634262	         1.217 ns/op	 821.37 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCompactCommonPrefix/bytes=256/prefix=128-16      	10794116	        11.29 ns/op	11429.01 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCompactCommonPrefix/bytes=256/prefix=128-16      	10882215	        11.13 ns/op	11585.26 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCompactCommonPrefix/bytes=256/prefix=128-16      	10318179	        11.17 ns/op	11545.49 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCompactCommonPrefix/bytes=256/prefix=256-16      	 5404532	        20.76 ns/op	12379.21 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCompactCommonPrefix/bytes=256/prefix=256-16      	 5862296	        20.18 ns/op	12738.40 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCompactCommonPrefix/bytes=256/prefix=256-16      	 5981917	        20.13 ns/op	12766.85 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCompactCommonPrefix/bytes=4096/prefix=0-16       	97310420	         1.212 ns/op	 825.04 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCompactCommonPrefix/bytes=4096/prefix=0-16       	100000000	         1.234 ns/op	 810.51 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCompactCommonPrefix/bytes=4096/prefix=0-16       	99543757	         1.225 ns/op	 816.35 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCompactCommonPrefix/bytes=4096/prefix=2048-16    	  686384	       172.3 ns/op	11894.45 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCompactCommonPrefix/bytes=4096/prefix=2048-16    	  719082	       172.4 ns/op	11887.15 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCompactCommonPrefix/bytes=4096/prefix=2048-16    	  709813	       172.4 ns/op	11887.09 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCompactCommonPrefix/bytes=4096/prefix=4096-16    	  382602	       321.2 ns/op	12754.54 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCompactCommonPrefix/bytes=4096/prefix=4096-16    	  377649	       335.3 ns/op	12219.30 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCompactCommonPrefix/bytes=4096/prefix=4096-16    	  373249	       323.3 ns/op	12670.55 MB/s	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/thesyncim/vibedb/internal/storeio	4.984s

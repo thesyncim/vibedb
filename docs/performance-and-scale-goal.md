@@ -51,7 +51,8 @@ changes allowed; competitor implementations are evidence, not the design target.
    append/checkpoint ownership and pass initial multi-group restart tests.
    Live group registration and opt-in benchmark integration are now implemented;
    end-to-end SQL and a matched comparison now pass verification. Qualify node-log
-   faults and fix the remaining performance gap next. See
+   faults under concurrent multi-group load and fix the remaining performance gap
+   next. The single-group shipped node-log fault campaign now passes. See
    [registration scope](qualification/node-registration-2026-09-04/README.md).
 2. Redesign committed/versioned read visibility so transactions need not block
    unrelated readers across a group. Retain serializable conflict validation.

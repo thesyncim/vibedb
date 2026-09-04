@@ -1,0 +1,49 @@
+File: vibedb-shard
+Build ID: c61efc678e01811c4ce6aef83b8032c8c97509e3
+Type: cpu
+Time: 2026-09-04 12:54:39 CEST
+Duration: 8.73s, Total samples = 5.79s (66.33%)
+Showing nodes accounting for 3.46s, 59.76% of 5.79s total
+Dropped 563 nodes (cum <= 0.03s)
+Showing top 40 nodes out of 390
+      flat  flat%   sum%        cum   cum%
+     0.67s 11.57% 11.57%      0.67s 11.57%  internal/runtime/syscall/linux.Syscall6
+     0.35s  6.04% 17.62%      0.35s  6.04%  runtime.futex
+     0.30s  5.18% 22.80%      0.30s  5.18%  runtime.memmove
+     0.20s  3.45% 26.25%      0.56s  9.67%  github.com/thesyncim/vibejson.buildIndexOptions
+     0.16s  2.76% 29.02%      0.17s  2.94%  github.com/thesyncim/vibedb/query.parseDecimal
+     0.14s  2.42% 31.43%      0.14s  2.42%  runtime.nanotime
+     0.08s  1.38% 32.82%      0.41s  7.08%  github.com/thesyncim/vibedb/internal/storeio.(*CompactPrimaryScanDecoder).appendValue
+     0.08s  1.38% 34.20%      0.80s 13.82%  github.com/thesyncim/vibedb/internal/storeio.(*PrimaryGraphCursor).visitCurrentLeafInlineUntil
+     0.08s  1.38% 35.58%      0.60s 10.36%  github.com/thesyncim/vibedb/store.(*Segment).buildDoc
+     0.08s  1.38% 36.96%      0.09s  1.55%  github.com/thesyncim/vibejson.scanNumberFastTagged
+     0.07s  1.21% 38.17%      0.23s  3.97%  github.com/thesyncim/vibedb/internal/storeio.(*compactStreamSequentialState).appendValue
+     0.07s  1.21% 39.38%      0.11s  1.90%  github.com/thesyncim/vibedb/query.classifyRawInto
+     0.06s  1.04% 40.41%      0.06s  1.04%  github.com/thesyncim/vibedb/internal/storeio.compactCommonPrefix (inline)
+     0.06s  1.04% 41.45%      0.35s  6.04%  github.com/thesyncim/vibejson.(*TapeBuilder).WalkFast
+     0.06s  1.04% 42.49%      0.06s  1.04%  internal/runtime/maps.memHashAES
+     0.06s  1.04% 43.52%      0.06s  1.04%  runtime.memclrNoHeapPointers
+     0.06s  1.04% 44.56%      0.06s  1.04%  runtime.usleep
+     0.05s  0.86% 45.42%      0.12s  2.07%  github.com/thesyncim/vibedb/internal/storeio.(*commonPrimaryLeafPlacer).place
+     0.05s  0.86% 46.29%      0.25s  4.32%  github.com/thesyncim/vibedb/internal/storeio.compactStreamView.appendValue
+     0.05s  0.86% 47.15%      0.05s  0.86%  github.com/thesyncim/vibedb/internal/storeio.compactStreamView.prefixInteger
+     0.05s  0.86% 48.01%      0.15s  2.59%  github.com/thesyncim/vibejson.(*TapeBuilder).stringFast
+     0.05s  0.86% 48.88%      0.05s  0.86%  runtime.typePointers.next
+     0.04s  0.69% 49.57%      0.04s  0.69%  github.com/thesyncim/vibedb/internal/storeio.(*CompactPrimaryStripeView).OverflowRef
+     0.04s  0.69% 50.26%      1.62s 27.98%  github.com/thesyncim/vibedb/query.(*plan).makeFilePartial
+     0.04s  0.69% 50.95%      0.78s 13.47%  github.com/thesyncim/vibedb/store.(*Segment).Append
+     0.04s  0.69% 51.64%      0.04s  0.69%  github.com/thesyncim/vibedb/store.(*Segment).DocAt
+     0.04s  0.69% 52.33%      0.04s  0.69%  github.com/thesyncim/vibedb/store.tapeSuffixClaimsKey
+     0.04s  0.69% 53.02%      0.04s  0.69%  github.com/thesyncim/vibejson.nextSignificantFast (inline)
+     0.04s  0.69% 53.71%      0.04s  0.69%  internal/strconv.formatBase10
+     0.04s  0.69% 54.40%      0.04s  0.69%  runtime.memequal
+     0.04s  0.69% 55.09%      0.04s  0.69%  runtime.readvarint
+     0.03s  0.52% 55.61%      1.05s 18.13%  github.com/thesyncim/vibedb/internal/raftservice.(*Owner).Run
+     0.03s  0.52% 56.13%      0.06s  1.04%  github.com/thesyncim/vibedb/internal/storeio.(*CompactPrimaryStripeView).RenderRecordsWithScratch
+     0.03s  0.52% 56.65%      0.03s  0.52%  github.com/thesyncim/vibedb/internal/storeio.(*compactStreamView).dictionaryEntry (inline)
+     0.03s  0.52% 57.17%      0.04s  0.69%  github.com/thesyncim/vibedb/internal/storeio.KeyHashBytes
+     0.03s  0.52% 57.69%      0.03s  0.52%  github.com/thesyncim/vibedb/internal/storeio.appendCanonicalUint6
+     0.03s  0.52% 58.20%      0.04s  0.69%  github.com/thesyncim/vibedb/query.(*aggregateLease).reserve
+     0.03s  0.52% 58.72%      0.04s  0.69%  github.com/thesyncim/vibedb/query.ownScalars
+     0.03s  0.52% 59.24%      0.06s  1.04%  github.com/thesyncim/vibedb/query.reserveFileBatchRow
+     0.03s  0.52% 59.76%      0.05s  0.86%  github.com/thesyncim/vibedb/store.(*Segment).commitDoc

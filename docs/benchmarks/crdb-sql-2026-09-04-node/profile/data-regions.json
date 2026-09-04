@@ -1,0 +1,38 @@
+{
+  "sql.read.admission": {
+    "count": 5822,
+    "total_ms": 1.5764750000000536,
+    "mean_ms": 0.000270778941944349,
+    "p50_ms": 0.000256,
+    "p95_ms": 0.000448,
+    "unmatched_begin": 0,
+    "unmatched_end": 0
+  },
+  "sql.read.encode": {
+    "count": 5819,
+    "total_ms": 13.734271000000035,
+    "mean_ms": 0.002360245918542705,
+    "p50_ms": 0.000704,
+    "p95_ms": 0.003904,
+    "unmatched_begin": 0,
+    "unmatched_end": 0
+  },
+  "sql.read.execute": {
+    "count": 5822,
+    "total_ms": 2766.0686069999997,
+    "mean_ms": 0.47510625334936446,
+    "p50_ms": 0.023552,
+    "p95_ms": 3.507392,
+    "unmatched_begin": 0,
+    "unmatched_end": 0
+  },
+  "sql.read.quorum": {
+    "count": 5822,
+    "total_ms": 886.1775720000002,
+    "mean_ms": 0.15221188114050155,
+    "p50_ms": 0.1302725,
+    "p95_ms": 0.259904,
+    "unmatched_begin": 0,
+    "unmatched_end": 0
+  }
+}

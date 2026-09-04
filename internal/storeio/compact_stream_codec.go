@@ -952,8 +952,45 @@ func (s *compactStreamScratch) encodePrefixInt(
 }
 
 func compactCommonPrefix(a, b []byte) int {
+	if len(a) == 0 || len(b) == 0 || a[0] != b[0] {
+		return 0
+	}
+	return compactCommonPrefixEqualHead(a, b)
+}
+
+// Keep the immediate mismatch case in the small, inlinable caller.
+func compactCommonPrefixEqualHead(a, b []byte) int {
 	n := min(len(a), len(b))
 	i := 0
+	// Canonical scalar strings often share long payloads. Compare whole words
+	// without reading beyond either slice; little-endian bit order identifies
+	// the first different byte on every architecture, including unaligned data.
+	for n-i >= 32 {
+		x0 := binary.LittleEndian.Uint64(a[i:]) ^ binary.LittleEndian.Uint64(b[i:])
+		x1 := binary.LittleEndian.Uint64(a[i+8:]) ^ binary.LittleEndian.Uint64(b[i+8:])
+		x2 := binary.LittleEndian.Uint64(a[i+16:]) ^ binary.LittleEndian.Uint64(b[i+16:])
+		x3 := binary.LittleEndian.Uint64(a[i+24:]) ^ binary.LittleEndian.Uint64(b[i+24:])
+		if x0|x1|x2|x3 != 0 {
+			switch {
+			case x0 != 0:
+				return i + bits.TrailingZeros64(x0)/8
+			case x1 != 0:
+				return i + 8 + bits.TrailingZeros64(x1)/8
+			case x2 != 0:
+				return i + 16 + bits.TrailingZeros64(x2)/8
+			default:
+				return i + 24 + bits.TrailingZeros64(x3)/8
+			}
+		}
+		i += 32
+	}
+	for n-i >= 8 {
+		different := binary.LittleEndian.Uint64(a[i:]) ^ binary.LittleEndian.Uint64(b[i:])
+		if different != 0 {
+			return i + bits.TrailingZeros64(different)/8
+		}
+		i += 8
+	}
 	for i < n && a[i] == b[i] {
 		i++
 	}

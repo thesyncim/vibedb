@@ -1,0 +1,46 @@
+Main binary filename not available.
+Type: delay
+Showing nodes accounting for 19.45s, 99.55% of 19.54s total
+Dropped 695 nodes (cum <= 0.10s)
+Showing top 40 nodes out of 50
+      flat  flat%   sum%        cum   cum%
+     8.73s 44.68% 44.68%      8.73s 44.68%  runtime.(*profBuf).read
+     8.73s 44.67% 89.35%      8.73s 44.67%  os/signal.signal_recv
+     0.96s  4.90% 94.25%      0.96s  4.90%  golang.org/x/sys/unix.Fdatasync
+     0.66s  3.37% 97.61%      0.66s  3.37%  syscall.Fsync
+     0.24s  1.21% 98.82%      0.24s  1.21%  syscall.write
+     0.14s  0.73% 99.55%      0.14s  0.73%  syscall.read
+         0     0% 99.55%      0.14s  0.72%  crypto/tls.(*Conn).Read
+         0     0% 99.55%      0.23s  1.19%  crypto/tls.(*Conn).Write
+         0     0% 99.55%      0.14s  0.72%  crypto/tls.(*Conn).readFromUntil
+         0     0% 99.55%      0.14s  0.72%  crypto/tls.(*Conn).readRecord
+         0     0% 99.55%      0.14s  0.72%  crypto/tls.(*Conn).readRecordOrCCS
+         0     0% 99.55%      0.23s  1.19%  crypto/tls.(*Conn).write
+         0     0% 99.55%      0.23s  1.19%  crypto/tls.(*Conn).writeRecordLocked
+         0     0% 99.55%      0.16s  0.81%  github.com/thesyncim/vibedb/internal/raftservice.(*ExecutionOwners).Run.func1
+         0     0% 99.55%      0.16s  0.81%  github.com/thesyncim/vibedb/internal/raftservice.(*Owner).Run
+         0     0% 99.55%      0.99s  5.07%  github.com/thesyncim/vibedb/internal/raftstore.(*NodeStore).persistSequencedWave
+         0     0% 99.55%      0.99s  5.07%  github.com/thesyncim/vibedb/internal/raftstore.(*NodeStore).persistWave
+         0     0% 99.55%      0.99s  5.07%  github.com/thesyncim/vibedb/internal/raftstore.(*NodeSubmissionSequencer).run
+         0     0% 99.55%      0.99s  5.07%  github.com/thesyncim/vibedb/internal/raftstore.(*NodeSubmissionSequencer).runWave
+         0     0% 99.55%      0.97s  4.94%  github.com/thesyncim/vibedb/internal/raftstore/seglog.(*Engine).PersistWave
+         0     0% 99.55%      0.96s  4.90%  github.com/thesyncim/vibedb/internal/raftstore/seglog.syncActiveData
+         0     0% 99.55%      0.16s   0.8%  github.com/thesyncim/vibedb/internal/rafttransport.(*OrdinaryTransport).Run.func2
+         0     0% 99.55%      0.16s   0.8%  github.com/thesyncim/vibedb/internal/rafttransport.(*OrdinaryTransport).runPeer
+         0     0% 99.55%      0.16s   0.8%  github.com/thesyncim/vibedb/internal/rafttransport.writeFull
+         0     0% 99.55%      0.50s  2.57%  github.com/thesyncim/vibedb/internal/storeio.(*Committer).run
+         0     0% 99.55%      0.50s  2.57%  github.com/thesyncim/vibedb/internal/storeio.(*portableDevice).Commit
+         0     0% 99.55%      0.41s  2.10%  github.com/thesyncim/vibedb/internal/storeio.dataBarrier
+         0     0% 99.55%      0.60s  3.06%  github.com/thesyncim/vibedb/internal/storeio.dataSync
+         0     0% 99.55%      0.16s  0.84%  github.com/thesyncim/vibedb/shardservice.(*ReplicatedServer).ServeAuthenticated.func3
+         0     0% 99.55%      0.16s  0.84%  github.com/thesyncim/vibedb/shardservice.(*ReplicatedServer).serveReplicatedConn
+         0     0% 99.55%      0.16s  0.84%  github.com/thesyncim/vibedb/shardservice.(*ReplicatedServer).serveReplicatedRequestAuthorized
+         0     0% 99.55%      0.12s   0.6%  github.com/thesyncim/vibedb/store/durable.(*CheckpointGroup).checkpointLocked
+         0     0% 99.55%      0.66s  3.37%  internal/poll.(*FD).Fsync
+         0     0% 99.55%      0.66s  3.37%  internal/poll.(*FD).Fsync.func1
+         0     0% 99.55%      0.14s  0.73%  internal/poll.(*FD).Read
+         0     0% 99.55%      0.24s  1.21%  internal/poll.(*FD).Write
+         0     0% 99.55%      0.66s  3.38%  internal/poll.ignoringEINTR
+         0     0% 99.55%      0.38s  1.94%  internal/poll.ignoringEINTRIO
+         0     0% 99.55%      0.14s  0.72%  io.ReadAtLeast
+         0     0% 99.55%      0.14s  0.72%  io.ReadFull

@@ -55,13 +55,23 @@ import (
 // timing hooks; the exact internal cuts remain covered by deterministic owner,
 // registry, WAL, and apply tests.
 func TestServeRF3ShippedFaultHarness(t *testing.T) {
+	runRF3ShippedFaultHarness(t, false)
+}
+
+// The same process-level adversarial history must hold on the node log.
+// Preparation uses the shipped fresh-node format, with no per-group WAL.
+func TestServeRF3ShippedNodeFaultHarness(t *testing.T) {
+	runRF3ShippedFaultHarness(t, true)
+}
+
+func runRF3ShippedFaultHarness(t *testing.T, nodeLog bool) {
 	if os.Getenv(rf3CommandHelperEnvironment) != "" {
 		return
 	}
 	if runtime.GOOS != "linux" {
 		t.Skip("external RF3 qualification requires Linux /proc RSS and strict physical WAL controls")
 	}
-	fixture := newRF3FaultFixture(t)
+	fixture := newRF3FaultFixtureWithStorage(t, 4096, nodeLog)
 	defer fixture.close(t)
 	fixture.startAll(t)
 	qualification := rf3bench.Qualification{
@@ -316,7 +326,7 @@ func TestServeRF3ShippedFaultHarness(t *testing.T) {
 		t.Fatalf("acknowledged result survived as a replayable completion: %+v", acknowledged)
 	}
 
-	allocated := rf3FaultWALAllocatedBytes(t, fixture.walPaths)
+	allocated := fixture.allocatedLogBytes(t)
 	allocatedDelta := max(int64(0), allocated-fixture.walAllocatedBaseline)
 	if uint64(allocatedDelta) > rf3bench.WALGrowthBoundBytes {
 		t.Fatalf("small RF3 fault run allocated %d additional WAL bytes, want <= %d",
@@ -539,6 +549,7 @@ type rf3FaultFixture struct {
 	authority            sqldriver.ReplicatedAuthorityProfile
 	manifestPaths        [rf3CommandMembers]string
 	walPaths             [rf3CommandMembers]string
+	nodeLog              bool
 	children             [rf3CommandMembers]*rf3CommandChild
 	listeners            [rf3CommandMembers][4]*net.TCPListener
 	walAllocatedBaseline int64
@@ -552,7 +563,12 @@ func newRF3FaultFixture(t testing.TB) *rf3FaultFixture {
 
 func newRF3FaultFixtureWithWALRecords(t testing.TB, maxRecords uint64) *rf3FaultFixture {
 	t.Helper()
-	fixture := &rf3FaultFixture{root: t.TempDir(), group: rf3CommandGroup(), nodes: rf3CommandNodes(), authority: rf3CommandAuthority()}
+	return newRF3FaultFixtureWithStorage(t, maxRecords, false)
+}
+
+func newRF3FaultFixtureWithStorage(t testing.TB, maxRecords uint64, nodeLog bool) *rf3FaultFixture {
+	t.Helper()
+	fixture := &rf3FaultFixture{nodeLog: nodeLog, root: t.TempDir(), group: rf3CommandGroup(), nodes: rf3CommandNodes(), authority: rf3CommandAuthority()}
 	for member := 0; member < rf3CommandMembers; member++ {
 		for lane := 0; lane < 4; lane++ {
 			listener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1")})
@@ -595,6 +611,10 @@ func newRF3FaultFixtureWithWALRecords(t testing.TB, maxRecords uint64) *rf3Fault
 		MaxRecords: maxRecords, MaxEntries: 16384, MaxLiveBytes: raftstore.DefaultMaxLiveBytes}
 	for member := 0; member < rf3CommandMembers; member++ {
 		memberRoot := filepath.Join(fixture.root, fmt.Sprintf("member-%d", member+1))
+		if nodeLog {
+			prepareRF3FaultNodeMember(t, fixture, member, memberRoot, policyPath, keyMaterial, walOptions)
+			continue
+		}
 		if err = os.MkdirAll(memberRoot, 0o700); err != nil {
 			t.Fatal(err)
 		}
@@ -651,7 +671,7 @@ func newRF3FaultFixtureWithWALRecords(t testing.TB, maxRecords uint64) *rf3Fault
 			t.Fatal(err)
 		}
 	}
-	fixture.walAllocatedBaseline = rf3FaultWALAllocatedBytes(t, fixture.walPaths)
+	fixture.walAllocatedBaseline = fixture.allocatedLogBytes(t)
 	if fixture.walAllocatedBaseline <= 0 {
 		t.Fatal("RF3 WAL allocation baseline has no physical blocks")
 	}
