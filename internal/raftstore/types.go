@@ -100,11 +100,15 @@ const (
 	// it never rewrites the active file in place.
 	CapacityFormatImmutableBase CapacityFormat = 1
 	CapacityFormatStatic                       = CapacityFormatImmutableBase
+	// CapacityFormatSegmentedNode retains history across immutable segments.
+	// MaxEntries bounds one group's active-segment index and incoming batch,
+	// not the distance between the checkpoint and the retained last index.
+	CapacityFormatSegmentedNode CapacityFormat = 2
 )
 
 // CapacityProfile is a detached view of the immutable log-capacity facts
-// needed by higher-level admission proofs. MaxEntries is sealed into the WAL's
-// authenticated static header. LogBaseIndex is the authenticated durable
+// needed by higher-level admission proofs. MaxEntries is sealed into the log's
+// authenticated geometry; its meaning depends on Format. LogBaseIndex is the authenticated durable
 // snapshot index selected by this handle. Format is a capability contract, not
 // a serving or capacity reservation.
 //

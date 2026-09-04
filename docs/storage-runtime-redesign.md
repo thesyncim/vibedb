@@ -20,11 +20,16 @@ checkpoint worker are shared. Linux tests cover 17 prepared groups, two-group
 SQL recovery/swap, and three serving instances electing leaders before and after
 restart. See [scope and raw qualification](qualification/node-serving-2026-09-04/README.md).
 
-Fresh hot-group registration, node-log split/replica movement, interrupted
-admission, sustained reclamation and acknowledged-write fault campaigns remain.
-Reload can adopt a group already present in the node log; it does not yet
-register a newly prepared group. Existing dev/benchmark preparation still uses
-per-range logs, so no new space or throughput gain has been measured.
+Fresh hot-group registration now authenticates a prepared SQL root and static
+bootstrap before durably registering its descriptor through the live sequencer.
+Retries preserve newer log history and incarnation state. `cluster dev --node-log`
+and the comparison runner’s `--node-log` select this fresh path. The segmented
+capacity contract permits valid history spanning multiple segment entry limits.
+See [registration qualification](qualification/node-registration-2026-09-04/README.md).
+
+Node-log split/replica movement, interrupted admission at process-crash boundaries,
+sustained reclamation and acknowledged-write fault campaigns remain. No new space
+or throughput gain has yet been measured through the benchmark integration.
 
 Continue the new node manifest and fresh preparation format. Do not spend this
 unreleased redesign building a legacy data migration framework. Preserve exact

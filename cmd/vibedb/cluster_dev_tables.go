@@ -22,7 +22,8 @@ import (
 )
 
 // The inventory is persisted before materialization so a restart reuses the
-// exact allocated identities. Groups share processes, not WALs or SQL roots.
+// exact allocated identities. Node-log groups share durability ownership;
+// every group retains an independent SQL root.
 type devTableInventory struct {
 	Tables []devTableProvision `json:"tables"`
 }
@@ -153,7 +154,7 @@ func ensureDevTables(root, shardBinary string, cluster *devClusterManifest, sche
 			if err != nil {
 				return err
 			}
-			path := filepath.Join(root, fmt.Sprintf("data-member-%d", i+1), "serve-multigroup.vibejson")
+			path := filepath.Join(filepath.Dir(cluster.DataMembers[i].ServeManifest), "serve-multigroup.vibejson")
 			if err := replaceDevFile(path, raw); err != nil {
 				return err
 			}
@@ -242,7 +243,7 @@ func ensureDevTables(root, shardBinary string, cluster *devClusterManifest, sche
 		if err != nil {
 			return err
 		}
-		path := filepath.Join(root, fmt.Sprintf("data-member-%d", i+1), "serve-multigroup.vibejson")
+		path := filepath.Join(filepath.Dir(cluster.DataMembers[i].ServeManifest), "serve-multigroup.vibejson")
 		if err := retainDevGroupInventoryManifest(filepath.Dir(path), paths); err != nil {
 			return err
 		}
@@ -398,7 +399,11 @@ func prepareDevTable(root, binary string, cluster devClusterManifest, table devT
 		}
 		member.Store, member.ServeManifest = table.Stores[i], filepath.Join(prepare.Root, "serve-rf3.vibejson")
 		if _, err := os.Stat(member.ServeManifest); errors.Is(err, os.ErrNotExist) {
-			if err := runDevCommand(binary, "prepare-rf3", "-manifest", path); err != nil {
+			command := "prepare-rf3"
+			if cluster.NodeLog {
+				command = "prepare-node-group-rf3"
+			}
+			if err := runDevCommand(binary, command, "-manifest", path); err != nil {
 				return nil, group, err
 			}
 		} else if err != nil {
@@ -471,6 +476,9 @@ func composeDevGroupManifest(paths []string) ([]byte, error) {
 			}
 			process = source
 		} else {
+			if len(source["node_log"]) != 0 && !bytes.Equal(process["node_log"], source["node_log"]) {
+				return nil, fmt.Errorf("%w: group changes shared node log", errDevCluster)
+			}
 			for _, key := range []string{"listeners", "tls", "authorization_policy"} {
 				if !bytes.Equal(process[key], source[key]) {
 					return nil, fmt.Errorf("%w: group changes shared %s", errDevCluster, key)
@@ -483,7 +491,11 @@ func composeDevGroupManifest(paths []string) ([]byte, error) {
 		return nil, err
 	}
 	process["groups"] = raw
-	return orderedDevManifestObject(process, []string{"listeners", "tls", "authorization_policy", "replica_control", "split_control", "groups"})
+	order := []string{"listeners", "tls", "authorization_policy", "replica_control", "split_control", "groups"}
+	if len(process["node_log"]) != 0 {
+		order = append([]string{"node_log"}, order...)
+	}
+	return orderedDevManifestObject(process, order)
 }
 
 func orderedDevManifestObject(fields map[string]json.RawMessage, order []string) ([]byte, error) {

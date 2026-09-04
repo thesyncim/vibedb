@@ -84,6 +84,8 @@ func run(args []string) int {
 		return runServe(args[2:])
 	case "serve-rf3":
 		return runServeRF3(args[2:])
+	case "prepare-node-group-rf3":
+		return runPrepareNodeGroupRF3(args[2:])
 	case "prepare-node-rf3":
 		return runPrepareNodeRF3(args[2:])
 	case "prepare-rf3":
@@ -119,6 +121,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  vibedb-shard serve-rf3 -manifest <path>")
 	fmt.Fprintln(os.Stderr, "  vibedb-shard prepare-rf3 -manifest <path>")
 	fmt.Fprintln(os.Stderr, "  vibedb-shard prepare-node-rf3 -manifest <path>")
+	fmt.Fprintln(os.Stderr, "  vibedb-shard prepare-node-group-rf3 -manifest <path>")
 	fmt.Fprintln(os.Stderr, "  vibedb-shard bootstrap-rf3 -manifest <path>")
 	fmt.Fprintln(os.Stderr, "  vibedb-shard adopt-restored-rf3 -manifest <path>")
 }

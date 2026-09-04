@@ -262,7 +262,7 @@ func prepareRF3GroupSetOnNode(manifest rf3Manifest, profile *rafttransport.PeerT
 		var nodeLog *raftstore.GroupView
 		var log rf3RecoveryLog
 		if nodeOwner != nil {
-			nodeLog, err = nodeOwner.group(base.Binding)
+			nodeLog, err = nodeOwner.ensurePreparedGroup(single, base, applyIdentity, opening)
 			log = nodeLog
 		} else {
 			key, err = loadRF3WALKey(bundle.WAL.KeyID, bundle.WAL.KeyMaterialPath)

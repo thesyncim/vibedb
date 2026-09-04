@@ -74,6 +74,7 @@ type devClusterManifest struct {
 	dataServeManifests  []string
 	Format              uint16             `json:"format"`
 	Nodes               uint8              `json:"nodes"`
+	NodeLog             bool               `json:"node_log,omitempty"`
 	ClientEndpoint      string             `json:"client_endpoint"`
 	CatalogPath         string             `json:"catalog_path"`
 	GatewayCertificate  string             `json:"gateway_certificate"`
@@ -308,12 +309,14 @@ type devPrincipal struct {
 type devClusterOptions struct {
 	root, shardBinary, gatewayBinary string
 	replicas                         int
+	nodeLog                          bool
 }
 
 func runClusterDev(args []string) int {
 	fs := flag.NewFlagSet("cluster dev", flag.ContinueOnError)
 	root := fs.String("root", "", "absolute durable cluster directory")
 	replicas := fs.Int("replicas", devClusterRF3, "Raft replicas: 1 for dev-only/no-HA or 3 for RF3")
+	nodeLog := fs.Bool("node-log", false, "use shared node logs for a fresh RF3 cluster")
 	nodes := fs.Int("nodes", 0, "deprecated alias for --replicas")
 	shardBinary := fs.String("shard-binary", "", "vibedb-shard executable; defaults beside vibedb or PATH")
 	gatewayBinary := fs.String("gateway-binary", "", "vibedb-gateway executable; defaults beside vibedb or PATH")
@@ -337,7 +340,7 @@ func runClusterDev(args []string) int {
 		}
 		*replicas = *nodes
 	}
-	if *replicas != devClusterRF1 && *replicas != devClusterRF3 {
+	if *replicas != devClusterRF1 && *replicas != devClusterRF3 || *nodeLog && *replicas != devClusterRF3 {
 		usage()
 		return 2
 	}
@@ -372,7 +375,7 @@ func runClusterDev(args []string) int {
 			return 1
 		}
 	}
-	manifest, err := ensureDevCluster(devClusterOptions{root: abs, replicas: *replicas, shardBinary: shard, gatewayBinary: gw})
+	manifest, err := ensureDevCluster(devClusterOptions{root: abs, replicas: *replicas, shardBinary: shard, gatewayBinary: gw, nodeLog: *nodeLog})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cluster dev: %v\n", err)
 		return 1
@@ -428,7 +431,7 @@ func ensureDevCluster(options devClusterOptions) (devClusterManifest, error) {
 		}
 		canonical, e := vibejson.Marshal(&m)
 		if e != nil || !bytes.Equal(raw, canonical) || !validDevManifest(m, options.root) ||
-			m.Nodes != uint8(options.replicas) {
+			m.Nodes != uint8(options.replicas) || m.NodeLog != options.nodeLog {
 			return m, errDevCluster
 		}
 		return m, completeDevCluster(options, m)
@@ -511,7 +514,7 @@ func initializeDevCluster(options devClusterOptions, manifestPath string) (devCl
 		return devClusterManifest{}, err
 	}
 	clear(keyMaterial)
-	m := devClusterManifest{Format: devClusterFormat, Nodes: uint8(options.replicas), ClientEndpoint: ports[0], CatalogPath: filepath.Join(options.root, "catalog.vibejson"), GatewayCertificate: credentials[gatewayIndex][0], GatewayKey: credentials[gatewayIndex][1], Roots: roots, AuthorizationPolicy: policyPath, HotShardCapacity: filepath.Join(options.root, "hot-shard-capacity.vibejson"), ReplicaControl: filepath.Join(options.root, "replica-control.vibejson"), DurableAckKey: durableAckKeyPath, GatewayNode: hex.EncodeToString(nodes[gatewayIndex][:]), GatewayControl: ports[1+options.replicas*12], Members: make([]devClusterMember, options.replicas), LedgerMembers: make([]devClusterMember, options.replicas), DataMembers: make([]devClusterMember, options.replicas)}
+	m := devClusterManifest{Format: devClusterFormat, Nodes: uint8(options.replicas), NodeLog: options.nodeLog, ClientEndpoint: ports[0], CatalogPath: filepath.Join(options.root, "catalog.vibejson"), GatewayCertificate: credentials[gatewayIndex][0], GatewayKey: credentials[gatewayIndex][1], Roots: roots, AuthorizationPolicy: policyPath, HotShardCapacity: filepath.Join(options.root, "hot-shard-capacity.vibejson"), ReplicaControl: filepath.Join(options.root, "replica-control.vibejson"), DurableAckKey: durableAckKeyPath, GatewayNode: hex.EncodeToString(nodes[gatewayIndex][:]), GatewayControl: ports[1+options.replicas*12], Members: make([]devClusterMember, options.replicas), LedgerMembers: make([]devClusterMember, options.replicas), DataMembers: make([]devClusterMember, options.replicas)}
 	m.ClientCertificate, m.ClientKey = credentials[clientIndex][0], credentials[clientIndex][1]
 	m.ClientNode = hex.EncodeToString(nodes[clientIndex][:])
 	catalogPrepareMembers := make([]devPrepareMember, options.replicas)
@@ -551,6 +554,9 @@ func initializeDevCluster(options devClusterOptions, manifestPath string) (devCl
 		for i := 0; i < options.replicas; i++ {
 			base := 1 + roleIndex*options.replicas*4 + i*4
 			memberRoot := filepath.Join(options.root, fmt.Sprintf("%s-member-%d", role.name, i+1))
+			if options.nodeLog {
+				memberRoot = filepath.Join(memberRoot, "group-0")
+			}
 			identityIndex := roleIndex*options.replicas + i
 			prep := devPrepareManifest{Root: memberRoot, Distribution: role.distribution, Shard: role.shard, ClusterID: hex.EncodeToString(clusterID[:]), ClusterIncarnation: hex.EncodeToString(clusterIncarnation[:]), TopologyRecoveryEpoch: 1, AllocationGeneration: 1, ShardIncarnation: hex.EncodeToString(role.shardIncarnation[:]), GroupID: hex.EncodeToString(role.groupID[:]), MemberID: uint64(i + 1), StoreID: hex.EncodeToString(stores[identityIndex][:]), Table: role.table, CreateTable: role.createTable, Authority: authority, WAL: devPrepareWAL{KeyID: "dev-cluster-key", KeyMaterialPath: keySource, WrappedKey: "local-development-only", MaxFileBytes: raftstore.DefaultMaxFileBytes, MaxRecordBytes: raftstore.DefaultMaxRecordBytes, MaxRecords: raftstore.DefaultMaxRecords, MaxEntries: raftstore.DefaultMaxEntries, MaxLiveBytes: raftstore.DefaultMaxLiveBytes}, Apply: apply, Listeners: devPrepareListeners{Peer: ports[base], Native: ports[base+1], Snapshot: ports[base+2], Control: ports[base+3]}, TLS: devPrepareTLS{Certificate: credentials[identityIndex][0], Key: credentials[identityIndex][1], Roots: roots, IdentityOID: devClusterOID}, AuthorizationPolicy: policyPath, SplitControl: splitControl, DevelopmentOnly: options.replicas == devClusterRF1, Members: role.prepareMembers}
 			prepPath := filepath.Join(options.root, fmt.Sprintf("prepare-%s-member-%d.vibejson", role.name, i+1))
@@ -632,7 +638,11 @@ func completeDevCluster(options devClusterOptions, manifest devClusterManifest) 
 				return err
 			}
 			preparePath := filepath.Join(options.root, fmt.Sprintf("prepare-%s-member-%d.vibejson", role.name, index+1))
-			if err := runDevCommand(options.shardBinary, "prepare-rf3", "-manifest", preparePath); err != nil {
+			if manifest.NodeLog {
+				if err := prepareDevNode(options.shardBinary, preparePath); err != nil {
+					return err
+				}
+			} else if err := runDevCommand(options.shardBinary, "prepare-rf3", "-manifest", preparePath); err != nil {
 				return err
 			}
 		}
@@ -1766,7 +1776,7 @@ func devReplicaSplitSourceForCluster(cluster devClusterManifest) (devReplicaSpli
 }
 
 func validDevManifest(m devClusterManifest, root string) bool {
-	if m.Format != devClusterFormat || m.Nodes != devClusterRF1 && m.Nodes != devClusterRF3 ||
+	if m.Format != devClusterFormat || m.Nodes != devClusterRF1 && m.Nodes != devClusterRF3 || m.NodeLog && m.Nodes != devClusterRF3 ||
 		len(m.Members) != int(m.Nodes) || len(m.LedgerMembers) != int(m.Nodes) ||
 		len(m.DataMembers) != int(m.Nodes) ||
 		!validDevLoopbackAddress(m.ClientEndpoint) || !validDevLoopbackAddress(m.GatewayControl) {

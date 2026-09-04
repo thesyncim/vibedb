@@ -29,6 +29,7 @@ def output(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--node-log", action="store_true", help="use fresh VibeDB shared-node log preparation and live group registration")
     parser.add_argument("--profile", action="store_true", help="instrument VibeDB with local CPU/trace profiles; diagnostic timings only")
     parser.add_argument("--rows", type=int, default=8192)
     parser.add_argument("--operations", type=int, default=20000)
@@ -116,7 +117,8 @@ def main():
                 if args.profile:
                     shell("mkdir -p /evidence/profiles")
                 profile_env = "VIBEDB_PROFILE_DIRECTORY=/evidence/profiles VIBEDB_PROFILE_DURATION=60s " if args.profile else ""
-                shell(profile_env + "/bench/vibedb cluster dev --root /data/vibe --replicas 3 --pg-listen 127.0.0.1:5432 --diagnostics-on-exit > /evidence/vibedb.log 2>&1 &")
+                node_log_flag = " --node-log" if args.node_log else ""
+                shell(profile_env + "/bench/vibedb cluster dev --root /data/vibe --replicas 3" + node_log_flag + " --pg-listen 127.0.0.1:5432 --diagnostics-on-exit > /evidence/vibedb.log 2>&1 &")
                 deadline = time.monotonic() + 90
                 while True:
                     log = output(["docker", "exec", name, "cat", "/evidence/vibedb.log"])

@@ -49,8 +49,9 @@ changes allowed; competitor implementations are evidence, not the design target.
    Asynchronous startup/reload is now integrated and passed the Linux shipped
    crash/partition harness. Explicit node-log preparation and serving now share
    append/checkpoint ownership and pass initial multi-group restart tests.
-   Complete live group registration, node-log fault qualification and benchmark
-   integration; see [qualification scope](qualification/node-serving-2026-09-04/README.md).
+   Live group registration and opt-in benchmark integration are now implemented;
+   qualify end-to-end SQL, node-log faults and measured performance next. See
+   [registration scope](qualification/node-registration-2026-09-04/README.md).
 2. Redesign committed/versioned read visibility so transactions need not block
    unrelated readers across a group. Retain serializable conflict validation.
 3. Reduce fixed per-range allocation and duplicate log/data amplification, with

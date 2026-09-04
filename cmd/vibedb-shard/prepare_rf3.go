@@ -121,6 +121,7 @@ type prepareRF3Member struct {
 }
 
 type persistedRF3Manifest struct {
+	NodeLog             *rf3NodeLogManifest        `json:"node_log,omitempty"`
 	WAL                 persistedRF3WAL            `json:"wal"`
 	SQL                 persistedRF3SQL            `json:"sql"`
 	Route               persistedRF3GroupRoute     `json:"route"`
@@ -277,13 +278,17 @@ func loadPrepareRF3Manifest(path string) (prepareRF3Manifest, error) {
 }
 
 func provisionRF3Member(input prepareRF3Manifest) error {
-	return provisionRF3MemberInto(input, input.Root, nil)
+	return provisionRF3MemberInto(input, input.Root, nil, false)
 }
 
 // destination may be a private node-preparation directory. All published
 // metadata uses input.Root, so one atomic node-root rename publishes every
 // group and the shared log together without rewriting SQL identities.
-func provisionRF3MemberInto(input prepareRF3Manifest, destination string, nodeGroup *raftstore.GroupView) (resultErr error) {
+func provisionRF3MemberInto(input prepareRF3Manifest, destination string, nodeGroup *raftstore.GroupView, pendingNode bool) (resultErr error) {
+	nodeMode := nodeGroup != nil || pendingNode
+	if nodeGroup != nil && pendingNode {
+		return errPrepareRF3
+	}
 	identity, authority, nodes, options, apply, keyMaterial, err := validatePrepareRF3(input)
 	if err != nil {
 		return err
@@ -300,10 +305,7 @@ func provisionRF3MemberInto(input prepareRF3Manifest, destination string, nodeGr
 		return errors.Join(errPrepareRF3, err)
 	}
 	if _, statErr := os.Lstat(final); statErr == nil {
-		if nodeGroup != nil {
-			return errPrepareRF3
-		}
-		return verifyPreparedRF3Member(final, manifestRaw)
+		return verifyPreparedRF3MemberMode(final, manifestRaw, nodeMode)
 	} else if !errors.Is(statErr, os.ErrNotExist) {
 		return errors.Join(errPrepareRF3, statErr)
 	}
@@ -351,12 +353,13 @@ func provisionRF3MemberInto(input prepareRF3Manifest, destination string, nodeGr
 	for index := range input.Members {
 		voters[index] = input.Members[index].MemberID
 	}
+	bootstrap := &pb.Snapshot{Data: []byte("vibedb-rf3-bootstrap"), Metadata: &pb.SnapshotMetadata{Index: &index, Term: &term, ConfState: &pb.ConfState{Voters: voters}}}
 	var wal *raftstore.Store
 	var log rf3RecoveryLog
-	if nodeGroup == nil {
-		wal, err = raftstore.Create(walPath, identity, key, raftstore.Bootstrap{TopologyRecoveryEpoch: input.TopologyRecoveryEpoch, Snapshot: &pb.Snapshot{Data: []byte("vibedb-rf3-bootstrap"), Metadata: &pb.SnapshotMetadata{Index: &index, Term: &term, ConfState: &pb.ConfState{Voters: voters}}}}, options)
+	if !nodeMode {
+		wal, err = raftstore.Create(walPath, identity, key, raftstore.Bootstrap{TopologyRecoveryEpoch: input.TopologyRecoveryEpoch, Snapshot: bootstrap}, options)
 		log = wal
-	} else {
+	} else if nodeGroup != nil {
 		var actual, expected sqldriver.ReplicatedShardStoreBinding
 		actual, err = raftmember.BindingFromNodeGroup(nodeGroup, authority)
 		if err == nil {
@@ -406,6 +409,10 @@ func provisionRF3MemberInto(input prepareRF3Manifest, destination string, nodeGr
 	var binding sqldriver.ReplicatedShardStoreBinding
 	if nodeGroup != nil {
 		binding, err = raftmember.BindingFromNodeGroup(nodeGroup, authority)
+	} else if pendingNode {
+		// This is preparation authority only. The running node must authenticate
+		// this SQL root and commit its descriptor/bootstrap before runtime adoption.
+		binding, err = raftmember.BindingForNewWAL(identity, input.TopologyRecoveryEpoch, authority)
 	} else {
 		binding, err = raftmember.BindingFromWAL(wal, authority)
 	}
@@ -426,13 +433,18 @@ func provisionRF3MemberInto(input prepareRF3Manifest, destination string, nodeGr
 	var applyIdentity sqldriver.ReplicatedApplyIdentity
 	if nodeGroup != nil {
 		applyHandle, applyIdentity, err = raftmember.OpenPreparedNodeApply(nodeGroup, database, authority, baseIdentity, apply)
+	} else if pendingNode {
+		applyHandle, applyIdentity, err = database.OpenReplicatedApply(baseIdentity, bootstrap, apply)
 	} else {
 		applyHandle, applyIdentity, err = raftmember.OpenPreparedApply(wal, database, authority, baseIdentity, apply)
 	}
 	if err != nil {
 		return closeBase(err)
 	}
-	snapshot, err := log.Snapshot()
+	snapshot := bootstrap
+	if log != nil {
+		snapshot, err = log.Snapshot()
+	}
 	if err == nil {
 		_, err = applyHandle.InstallSnapshot(snapshot)
 	}
@@ -450,6 +462,15 @@ func provisionRF3MemberInto(input prepareRF3Manifest, destination string, nodeGr
 	if err != nil {
 		return err
 	}
+	if nodeMode {
+		bootstrapRaw, err := proto.MarshalOptions{Deterministic: true}.Marshal(snapshot)
+		if err != nil {
+			return err
+		}
+		if err := writePrepareRF3File(filepath.Join(stage, "node-bootstrap.pb"), bootstrapRaw, 0o600); err != nil {
+			return err
+		}
+	}
 	if err := writePrepareRF3File(filepath.Join(stage, "sql-identity.vibejson"), baseRaw, 0o600); err != nil {
 		return err
 	}
@@ -466,8 +487,11 @@ func provisionRF3MemberInto(input prepareRF3Manifest, destination string, nodeGr
 		return err
 	}
 	if err := os.Rename(stage, final); err != nil {
-		if nodeGroup != nil {
-			return err
+		if nodeMode {
+			if verifyErr := verifyPreparedRF3MemberMode(final, manifestRaw, true); verifyErr != nil {
+				return errors.Join(err, verifyErr)
+			}
+			return syncPrepareRF3Directory(parent)
 		}
 		// Another identical preparer may have won publication after our initial
 		// existence check. Accept only a byte-identical, completely retained
@@ -482,6 +506,10 @@ func provisionRF3MemberInto(input prepareRF3Manifest, destination string, nodeGr
 }
 
 func verifyPreparedRF3Member(root string, manifestRaw []byte) error {
+	return verifyPreparedRF3MemberMode(root, manifestRaw, false)
+}
+
+func verifyPreparedRF3MemberMode(root string, manifestRaw []byte, nodeMode bool) error {
 	info, err := os.Lstat(root)
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return errors.Join(errPrepareRF3, err)
@@ -490,8 +518,15 @@ func verifyPreparedRF3Member(root string, manifestRaw []byte) error {
 	if err != nil || !bytes.Equal(retained, manifestRaw) {
 		return errors.Join(errPrepareRF3, err)
 	}
-	for _, name := range [...]string{
-		"member.wal", "member.vdb", "sql-identity.vibejson", "apply-identity.vibejson",
+	logArtifact := "member.wal"
+	if nodeMode {
+		logArtifact = "node-bootstrap.pb"
+		if _, err := os.Lstat(filepath.Join(root, "member.wal")); !errors.Is(err, os.ErrNotExist) {
+			return errors.Join(errPrepareRF3, err)
+		}
+	}
+	for _, name := range []string{
+		logArtifact, "member.vdb", "sql-identity.vibejson", "apply-identity.vibejson",
 		"wal-key", "split-control.journal", filepath.Join("split-children", "static-bootstrap.pb"),
 	} {
 		artifact, statErr := os.Lstat(filepath.Join(root, name))

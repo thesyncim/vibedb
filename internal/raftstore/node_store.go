@@ -1386,7 +1386,7 @@ func (v *GroupView) CapacityProfile() (CapacityProfile, error) {
 		return CapacityProfile{}, ErrCorrupt
 	}
 	return CapacityProfile{
-		Format: CapacityFormatImmutableBase, LogBaseIndex: state.Checkpoint.Index,
+		Format: CapacityFormatSegmentedNode, LogBaseIndex: state.Checkpoint.Index,
 		MaxEntries: v.store.bounds.maxEntriesPerGroup,
 	}, nil
 }

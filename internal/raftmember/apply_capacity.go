@@ -27,7 +27,8 @@ func ValidateImmutableBaseApplyCapacity(
 }
 
 // ValidateNodeApplyCapacity proves the same bounded apply contract against one
-// group in the authenticated node-wide log.
+// group in the authenticated node-wide log. Its per-segment index bound does
+// not cap total history retained across segments.
 func ValidateNodeApplyCapacity(
 	group *raftstore.GroupView,
 	apply *sqldriver.ReplicatedApply,
@@ -61,7 +62,7 @@ func ValidateNodeApplyCapacity(
 	if err != nil {
 		return fmt.Errorf("%w: inspect node group last index: %w", ErrWALUnavailable, err)
 	}
-	return validateImmutableBaseApplyCapacity(
+	return validateApplyCapacity(
 		profile, applyProfile, max(hard.GetCommit(), applyProfile.Applied), last,
 	)
 }
@@ -123,7 +124,14 @@ func validateImmutableBaseApplyCapacity(
 	commit uint64,
 	last uint64,
 ) error {
-	if profile.Format != raftstore.CapacityFormatImmutableBase || profile.LogBaseIndex == 0 {
+	if profile.Format != raftstore.CapacityFormatImmutableBase {
+		return ErrApplyCapacity
+	}
+	return validateApplyCapacity(profile, apply, commit, last)
+}
+
+func validateApplyCapacity(profile raftstore.CapacityProfile, apply sqldriver.ReplicatedApplyCapacityProfile, commit, last uint64) error {
+	if (profile.Format != raftstore.CapacityFormatImmutableBase && profile.Format != raftstore.CapacityFormatSegmentedNode) || profile.LogBaseIndex == 0 {
 		return fmt.Errorf(
 			"%w: unsupported immutable-base profile format=%d base=%d",
 			ErrApplyCapacity, profile.Format, profile.LogBaseIndex,
@@ -169,7 +177,7 @@ func validateImmutableBaseApplyCapacity(
 	if maxLast < base {
 		maxLast = ^uint64(0)
 	}
-	if last > maxLast {
+	if profile.Format == raftstore.CapacityFormatImmutableBase && last > maxLast {
 		return fmt.Errorf(
 			"%w: WAL last=%d exceeds sealed range [%d,%d]",
 			ErrApplyCapacity, last, base, maxLast,

@@ -4,11 +4,13 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -162,6 +164,8 @@ func TestServeRF3NodeLogThreeServersRestart(t *testing.T) {
 		}
 	}
 	var manifests [3]rf3Manifest
+	var inputs [3]prepareRF3NodeManifest
+	var reloads [3]chan os.Signal
 	var profiles []*rafttransport.PeerTLS
 	var nativeAddresses [3]string
 	for i := range 3 {
@@ -183,6 +187,7 @@ func TestServeRF3NodeLogThreeServersRestart(t *testing.T) {
 				member.Members[k].PeerAddress = addresses[k][0]
 			}
 		}
+		inputs[i] = input
 		if err := provisionRF3Node(input); err != nil {
 			t.Fatal(err)
 		}
@@ -213,8 +218,12 @@ func TestServeRF3NodeLogThreeServersRestart(t *testing.T) {
 				}
 			}
 			listeners := reservations[i]
+			reloads[i] = make(chan os.Signal, 1)
+			serving := manifests[i]
+			serving.reloadPath = filepath.Join(inputs[i].Root, "serve-rf3.vibejson")
+			serving.reloadSignals = reloads[i]
 			go func() {
-				done <- servePreparedRF3WithListen(ctx, manifests[i], func(network, address string) (net.Listener, error) {
+				done <- servePreparedRF3WithListen(ctx, serving, func(network, address string) (net.Listener, error) {
 					listener := listeners[address]
 					if network != "tcp" || listener == nil {
 						return nil, errors.New("unexpected node listener")
@@ -247,8 +256,86 @@ func TestServeRF3NodeLogThreeServersRestart(t *testing.T) {
 		for _, bundle := range manifests[0].Groups {
 			waitRF3CommandLeader(t, nativeAddresses, nodes, profiles, bundle.Route.Group, bundle.Route.AllocationGeneration, template.Groups[0].Authority.ActivePolicyGeneration)
 		}
+		if restart == 0 {
+			// Preparation runs while each process owns its node log. Then the exact
+			// normal reload path authenticates SQL and commits the new descriptor.
+			for i := range 3 {
+				manifests[i] = appendRF3LiveNodeTestGroup(t, inputs[i], manifests[i])
+				reloads[i] <- syscall.SIGHUP
+			}
+			for _, bundle := range manifests[0].Groups {
+				waitRF3CommandLeader(t, nativeAddresses, nodes, profiles, bundle.Route.Group, bundle.Route.AllocationGeneration, template.Groups[0].Authority.ActivePolicyGeneration)
+			}
+		}
 		stop()
 	}
+}
+
+func appendRF3LiveNodeTestGroup(t *testing.T, input prepareRF3NodeManifest, current rf3Manifest) rf3Manifest {
+	t.Helper()
+	member := input.Groups[0]
+	member.Root = filepath.Join(input.Root, "group-2")
+	member.Shard = "2"
+	id := rf3CommandStoreIdentity(member.MemberID)
+	id.GroupID[15] += 2
+	id.StoreID[15] += 2
+	member.GroupID, member.StoreID = idString(id.GroupID[:]), idString(id.StoreID[:])
+	raw, err := vibejson.Marshal(&member)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(input.Root, "prepare-group-2.vibejson")
+	if err := os.WriteFile(path, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if code := runPrepareNodeGroupRF3([]string{"-manifest", path}); code != 0 {
+		t.Fatalf("pending group preparation returned %d", code)
+	}
+	if _, err := os.Lstat(filepath.Join(member.Root, "member.wal")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("pending group has WAL: %v", err)
+	}
+	raw, err = os.ReadFile(filepath.Join(member.Root, "serve-rf3.vibejson"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var group persistedRF3Manifest
+	if err := vibejson.Unmarshal(raw, &group); err != nil {
+		t.Fatal(err)
+	}
+	path = filepath.Join(input.Root, "serve-rf3.vibejson")
+	old, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var next persistedRF3NodeRuntime
+	if err := vibejson.Unmarshal(old, &next); err != nil {
+		t.Fatal(err)
+	}
+	next.Groups = append(next.Groups, persistedRF3NodeGroup{WAL: group.WAL, SQL: group.SQL, Route: group.Route, ChildRegistry: group.SplitControl.ChildRegistry, Members: group.Members})
+	// The adopted-child inventory authenticates the exact predecessor manifest.
+	directory := filepath.Join(current.ReplicaControl.SourceDataRoot, "prepared-manifests")
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writePrepareRF3File(filepath.Join(directory, fmt.Sprintf("%x.vibejson", sha256.Sum256(old))), old, 0600); err != nil {
+		t.Fatal(err)
+	}
+	raw, err = vibejson.Marshal(&next)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staged := path + ".next"
+	if err := writePrepareRF3File(staged, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(staged, path); err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := loadRF3Manifest(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return parsed
 }
 
 func TestPrepareRF3NodeCrossesInitialWaveBound(t *testing.T) {

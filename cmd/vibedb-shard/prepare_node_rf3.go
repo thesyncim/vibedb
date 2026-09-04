@@ -180,7 +180,29 @@ func provisionRF3Node(input prepareRF3NodeManifest) (resultErr error) {
 		if !found {
 			return raftstore.ErrInvalid
 		}
-		if err := provisionRF3MemberInto(group, filepath.Join(stage, fmt.Sprintf("group-%d", i)), view); err != nil {
+		if err := provisionRF3MemberInto(group, filepath.Join(stage, fmt.Sprintf("group-%d", i)), view, false); err != nil {
+			return err
+		}
+		// Each immutable member reference also names its physical node log. The
+		// supervisor can compose additional groups without inventing log settings.
+		reference := manifests[i]
+		reference.NodeLog = &runtime.NodeLog
+		referenceRaw, err := vibejson.Marshal(&reference)
+		if err != nil {
+			return err
+		}
+		if _, err := parseRF3Manifest(referenceRaw); err != nil {
+			return err
+		}
+		groupStage := filepath.Join(stage, fmt.Sprintf("group-%d", i))
+		nextPath := filepath.Join(groupStage, "serve-rf3.node")
+		if err := writePrepareRF3File(nextPath, referenceRaw, 0600); err != nil {
+			return err
+		}
+		if err := os.Rename(nextPath, filepath.Join(groupStage, "serve-rf3.vibejson")); err != nil {
+			return err
+		}
+		if err := syncPrepareRF3Directory(groupStage); err != nil {
 			return err
 		}
 	}
