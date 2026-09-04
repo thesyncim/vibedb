@@ -50,6 +50,17 @@ func validUnifiedIntegerOrder(op UnifiedIntegerOrder) bool {
 	return op <= UnifiedIntegerGreaterEqual
 }
 
+// UnifiedIntegerInterval is the normalized form of two ordered integer
+// comparisons. Lower is inclusive; Upper is exclusive when UpperUnbounded is
+// false. An unbounded upper endpoint represents values through MaxInt64.
+// Keeping the normalized form in the storage layer avoids doing endpoint
+// arithmetic while a compact stream is being scanned.
+type UnifiedIntegerInterval struct {
+	Lower          int64
+	Upper          int64
+	UpperUnbounded bool
+}
+
 type compactStreamEncoding struct {
 	kind  uint8
 	width uint8
@@ -1903,6 +1914,61 @@ func (v compactStreamView) countIntegerOrdered(
 	}
 }
 
+// countIntegerInterval scans one exact FOR stream for the normalized signed
+// interval [interval.Lower, interval.Upper). The packed lane is decoded once
+// and both bounds are intersected by countCompactPackedBetween. Full-width or
+// wrapping FOR streams use exact wrapped reconstruction because their
+// unsigned deltas do not preserve signed ordering.
+func (v compactStreamView) countIntegerInterval(
+	interval UnifiedIntegerInterval,
+) (matched int, supported bool) {
+	if !v.validIntegerFORData() {
+		return 0, false
+	}
+	if !interval.UpperUnbounded && interval.Upper <= interval.Lower {
+		return 0, true
+	}
+	base := int64(binary.LittleEndian.Uint64(v.data))
+	limit := uint64(0)
+	if v.width < 64 {
+		limit = uint64(1) << v.width
+	}
+	wrapped := v.width > 0 && v.width < 64 &&
+		base > int64(1<<63-1)-int64(limit-1)
+	if v.width == 64 || wrapped {
+		for row := 0; row < v.count; row++ {
+			delta := compactReadBits(v.data[8:], row*int(v.width), int(v.width))
+			value := int64(uint64(base) + delta)
+			if value >= interval.Lower &&
+				(interval.UpperUnbounded || value < interval.Upper) {
+				matched++
+			}
+		}
+		return matched, true
+	}
+
+	lower := uint64(0)
+	if interval.Lower > base {
+		lower = uint64(interval.Lower) - uint64(base)
+	}
+	if lower >= limit {
+		return 0, true
+	}
+	upper := limit
+	if !interval.UpperUnbounded && interval.Upper > base {
+		upper = uint64(interval.Upper) - uint64(base)
+		if upper > limit {
+			upper = limit
+		}
+	} else if !interval.UpperUnbounded {
+		return 0, true
+	}
+	if upper <= lower {
+		return 0, true
+	}
+	return countCompactPackedBetween(v.data[8:], v.count, int(v.width), lower, upper), true
+}
+
 // countSpellingEqual scans one complete scalar stream for an exact canonical
 // JSON spelling. scratch is retained by the caller for front-coded values so
 // repeated scans remain allocation-free.
@@ -2344,6 +2410,85 @@ func countCompactPackedLess(
 	return matched
 }
 
+// countCompactPackedBetween counts packed unsigned lanes in the half-open
+// interval [lower, upper). The caller has already normalized the signed FOR
+// bounds and established that both endpoints fit the lane domain. Empty and
+// whole-domain intervals are answered without touching the data; one-sided
+// intervals reuse the existing SIMD less-than counter, while finite intervals
+// dispatch to a fused counter that decodes each packed lane once.
+func countCompactPackedBetween(
+	data []byte,
+	count, width int,
+	lower, upper uint64,
+) (matched int) {
+	if count <= 0 || width < 0 || width > 64 || upper <= lower {
+		return 0
+	}
+	if width == 0 {
+		if lower == 0 && upper > 0 {
+			return count
+		}
+		return 0
+	}
+	if width < 64 {
+		limit := uint64(1) << uint(width)
+		if lower >= limit {
+			return 0
+		}
+		if upper > limit {
+			upper = limit
+		}
+		if upper <= lower {
+			return 0
+		}
+		if lower == 0 {
+			return countCompactPackedLess(data, count, width, upper)
+		}
+		if upper == limit {
+			return count - countCompactPackedLess(data, count, width, lower)
+		}
+	}
+	if width == 64 {
+		// Full-width intervals are not used by the strict packed FOR lane, but
+		// retain an exact bounded fallback for direct codec callers.
+		for row := 0; row < count; row++ {
+			value := compactReadBits(data, row*width, width)
+			if value >= lower && value < upper {
+				matched++
+			}
+		}
+		return matched
+	}
+	switch width {
+	case 7:
+		return countCompactPacked7BetweenImpl(data, count, lower, upper)
+	case 8:
+		return countCompactPacked8BetweenImpl(data, count, lower, upper)
+	case 10:
+		return countCompactPacked10BetweenImpl(data, count, lower, upper)
+	case 16:
+		return countCompactPacked16BetweenImpl(data, count, lower, upper)
+	}
+	mask := uint64(1)<<uint(width) - 1
+	var reservoir uint64
+	available := 0
+	cursor := 0
+	for range count {
+		for available < width {
+			reservoir |= uint64(data[cursor]) << uint(available)
+			cursor++
+			available += 8
+		}
+		value := reservoir & mask
+		if value >= lower && value < upper {
+			matched++
+		}
+		reservoir >>= uint(width)
+		available -= width
+	}
+	return matched
+}
+
 // Byte-aligned widths can compare values directly without a bit reservoir.
 // Keep the full uint64 needle so out-of-range values scan without matching.
 func countCompactPacked8EqualScalar(data []byte, count int, want uint64) (matched int) {
@@ -2385,6 +2530,34 @@ func countCompactPacked16LessScalar(
 ) (matched int) {
 	for row := 0; row < count; row++ {
 		if uint64(binary.LittleEndian.Uint16(data[row*2:])) < threshold {
+			matched++
+		}
+	}
+	return matched
+}
+
+func countCompactPacked8BetweenScalar(
+	data []byte,
+	count int,
+	lower, upper uint64,
+) (matched int) {
+	for row := 0; row < count; row++ {
+		value := uint64(data[row])
+		if value >= lower && value < upper {
+			matched++
+		}
+	}
+	return matched
+}
+
+func countCompactPacked16BetweenScalar(
+	data []byte,
+	count int,
+	lower, upper uint64,
+) (matched int) {
+	for row := 0; row < count; row++ {
+		value := uint64(binary.LittleEndian.Uint16(data[row*2:]))
+		if value >= lower && value < upper {
 			matched++
 		}
 	}
@@ -2488,6 +2661,57 @@ func countCompactPacked7LessScalar(
 	return matched
 }
 
+// countCompactPacked7BetweenScalar consumes eight 7-bit lanes per seven-byte
+// group and applies both bounds while each packed word is decoded once.
+func countCompactPacked7BetweenScalar(
+	data []byte,
+	count int,
+	lower, upper uint64,
+) (matched int) {
+	row := 0
+	cursor := 0
+	for ; row+8 <= count; row, cursor = row+8, cursor+7 {
+		packed := uint64(data[cursor]) |
+			uint64(data[cursor+1])<<8 |
+			uint64(data[cursor+2])<<16 |
+			uint64(data[cursor+3])<<24 |
+			uint64(data[cursor+4])<<32 |
+			uint64(data[cursor+5])<<40 |
+			uint64(data[cursor+6])<<48
+		if value := packed & 0x7f; value >= lower && value < upper {
+			matched++
+		}
+		if value := packed >> 7 & 0x7f; value >= lower && value < upper {
+			matched++
+		}
+		if value := packed >> 14 & 0x7f; value >= lower && value < upper {
+			matched++
+		}
+		if value := packed >> 21 & 0x7f; value >= lower && value < upper {
+			matched++
+		}
+		if value := packed >> 28 & 0x7f; value >= lower && value < upper {
+			matched++
+		}
+		if value := packed >> 35 & 0x7f; value >= lower && value < upper {
+			matched++
+		}
+		if value := packed >> 42 & 0x7f; value >= lower && value < upper {
+			matched++
+		}
+		if value := packed >> 49 & 0x7f; value >= lower && value < upper {
+			matched++
+		}
+	}
+	for ; row < count; row++ {
+		value := compactReadBits(data, row*7, 7)
+		if value >= lower && value < upper {
+			matched++
+		}
+	}
+	return matched
+}
+
 // Four 10-bit values occupy exactly five bytes. This is the ordinary packed
 // width for integer ranges and dictionaries with 513-1024 distinct values.
 func countCompactPacked10EqualScalar(data []byte, count int, want uint64) (matched int) {
@@ -2551,6 +2775,43 @@ func countCompactPacked10LessScalar(
 	}
 	for ; row < count; row++ {
 		if compactReadBits(data, row*10, 10) < threshold {
+			matched++
+		}
+	}
+	return matched
+}
+
+// countCompactPacked10BetweenScalar consumes four 10-bit lanes per five-byte
+// group and applies both bounds to the decoded lanes.
+func countCompactPacked10BetweenScalar(
+	data []byte,
+	count int,
+	lower, upper uint64,
+) (matched int) {
+	row := 0
+	cursor := 0
+	for ; row+4 <= count; row, cursor = row+4, cursor+5 {
+		packed := uint64(data[cursor]) |
+			uint64(data[cursor+1])<<8 |
+			uint64(data[cursor+2])<<16 |
+			uint64(data[cursor+3])<<24 |
+			uint64(data[cursor+4])<<32
+		if value := packed & 0x3ff; value >= lower && value < upper {
+			matched++
+		}
+		if value := packed >> 10 & 0x3ff; value >= lower && value < upper {
+			matched++
+		}
+		if value := packed >> 20 & 0x3ff; value >= lower && value < upper {
+			matched++
+		}
+		if value := packed >> 30 & 0x3ff; value >= lower && value < upper {
+			matched++
+		}
+	}
+	for ; row < count; row++ {
+		value := compactReadBits(data, row*10, 10)
+		if value >= lower && value < upper {
 			matched++
 		}
 	}

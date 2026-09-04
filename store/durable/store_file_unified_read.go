@@ -23,6 +23,11 @@ type EqFilter struct {
 // ordering accepted by Snapshot.FilterIntegerOrderCount.
 type IntegerOrder = storeio.UnifiedIntegerOrder
 
+// IntegerInterval is the normalized half-open signed interval consumed by
+// Snapshot.FilterIntegerIntervalCount. Lower is inclusive and Upper is
+// exclusive unless UpperUnbounded is true.
+type IntegerInterval = storeio.UnifiedIntegerInterval
+
 const (
 	IntegerLess         = storeio.UnifiedIntegerLess
 	IntegerLessEqual    = storeio.UnifiedIntegerLessEqual
@@ -37,6 +42,13 @@ type IntegerOrderFilter struct {
 	inner *storeio.UnifiedIntegerOrderFilter
 }
 
+// IntegerIntervalFilter is reusable state for one strict FOR interval COUNT.
+// Unsupported leaves decline the whole scan so callers can use the generic
+// executor without exposing a partial result.
+type IntegerIntervalFilter struct {
+	inner *storeio.UnifiedIntegerIntervalFilter
+}
+
 // NewIntegerOrderFilter builds an exact integer ordering over a unified field
 // path. The query layer is responsible for restricting its literal to int64.
 func NewIntegerOrderFilter(
@@ -47,6 +59,19 @@ func NewIntegerOrderFilter(
 		return nil, err
 	}
 	return &IntegerOrderFilter{inner: inner}, nil
+}
+
+// NewIntegerIntervalFilter builds an exact normalized signed interval over a
+// unified field path. The query layer performs endpoint normalization before
+// calling this constructor.
+func NewIntegerIntervalFilter(
+	path string, interval IntegerInterval,
+) (*IntegerIntervalFilter, error) {
+	inner, err := storeio.NewUnifiedIntegerIntervalFilter([]byte(path), interval)
+	if err != nil {
+		return nil, err
+	}
+	return &IntegerIntervalFilter{inner: inner}, nil
 }
 
 // NewEqFilter builds an equality filter over a "/a/b" field path and the
@@ -83,6 +108,15 @@ type FilterEqResult struct {
 // when any present target stream cannot answer exactly from compact FOR data;
 // Matched and Scanned are then deliberately zero and must be discarded.
 type FilterIntegerOrderResult struct {
+	Matched   int
+	Scanned   int
+	Supported bool
+}
+
+// FilterIntegerIntervalResult reports one strict interval scan. Supported is
+// false when any present target stream cannot answer exactly from compact FOR
+// data; Matched and Scanned are then deliberately zero and must be discarded.
+type FilterIntegerIntervalResult struct {
 	Matched   int
 	Scanned   int
 	Supported bool
@@ -200,6 +234,54 @@ func (s *Snapshot) FilterIntegerOrderCount(
 			return FilterIntegerOrderResult{}, nil
 		}
 		return FilterIntegerOrderResult{
+			Matched: progress.Matched, Scanned: progress.Scanned, Supported: true,
+		}, nil
+	}
+}
+
+// FilterIntegerIntervalCount scans a snapshot using the strict FOR interval
+// lane. It never renders or falls back per row: unsupported compact leaves
+// decline atomically, allowing the query executor to run the original
+// predicate.
+func (s *Snapshot) FilterIntegerIntervalCount(
+	f *IntegerIntervalFilter,
+) (FilterIntegerIntervalResult, error) {
+	if s == nil || s.collection == nil || s.state == nil {
+		return FilterIntegerIntervalResult{}, ErrClosed
+	}
+	if f == nil || f.inner == nil {
+		return FilterIntegerIntervalResult{}, fmt.Errorf("vibedb: nil unified integer interval filter")
+	}
+	state := s.state
+	catalogBounds := storeio.GlobalTabletCatalogBounds{
+		StoreID:                state.root.StoreID,
+		SelectedRootGeneration: state.root.Generation,
+		FileEnd:                state.fileEnd,
+		NextLogicalID:          state.root.NextLogicalID,
+	}
+	leafBounds := storeio.CommonPrimaryLeafBounds{
+		FileEnd:           state.fileEnd,
+		NextLogicalID:     state.root.NextLogicalID,
+		AllocationQuantum: state.root.PageSize,
+	}
+	var cursor storeio.PrimaryGraphCursor
+	if err := storeio.InitPrimaryGraphCursor(
+		&cursor, s.collection.cache, state.root.PrimaryRoot,
+		catalogBounds, leafBounds, nil, nil,
+	); err != nil {
+		return FilterIntegerIntervalResult{}, err
+	}
+	defer cursor.Close()
+	var progress storeio.UnifiedFilterProgress
+	for {
+		supported, err := cursor.FilterCountIntegerInterval(f.inner, &progress)
+		if err != nil {
+			return FilterIntegerIntervalResult{}, err
+		}
+		if !supported {
+			return FilterIntegerIntervalResult{}, nil
+		}
+		return FilterIntegerIntervalResult{
 			Matched: progress.Matched, Scanned: progress.Scanned, Supported: true,
 		}, nil
 	}

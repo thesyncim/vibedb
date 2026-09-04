@@ -251,6 +251,74 @@ func (p *plan) runDirectFileTokenIntegerOrderCount(
 	return stats, true, nil
 }
 
+// runDirectFileTokenIntegerIntervalCount answers the narrow unindexed
+// COUNT(*) shape formed by two ordered int64 comparisons on one path. The
+// recognizer has already proved that the comparisons are the complete WHERE
+// predicate; the durable lane then admits the snapshot only when every
+// resolved target stream is exact FOR.
+func (p *plan) runDirectFileTokenIntegerIntervalCount(
+	snapshot *durable.Snapshot,
+	e *Exec,
+) (directFileTokenStats, bool, error) {
+	if err := e.Workspace.checkCanceled(); err != nil {
+		return directFileTokenStats{}, true, err
+	}
+	path, lower, upper, upperUnbounded, ok := p.scalarCountIntegerIntervalPath()
+	if !ok || e.Options.Cancel != nil {
+		return directFileTokenStats{}, false, nil
+	}
+	storagePath := path.indexPath()
+	if storagePath == "" || storagePath == "/" {
+		// UnifiedHoleResolver addresses named fields below the document root. A
+		// root comparison retains the generic path program.
+		return directFileTokenStats{}, false, nil
+	}
+	if p.hasLimit && p.limit == 0 {
+		return directFileTokenStats{}, true, prepareResult(&e.Result, p, 0)
+	}
+	if snapshot.Len() > uint64(^uint(0)>>1) {
+		return directFileTokenStats{}, true, store.ErrTooLarge
+	}
+	interval := durable.IntegerInterval{
+		Lower: lower, Upper: upper, UpperUnbounded: upperUnbounded,
+	}
+	filter, err := e.file.tokenIntegerIntervalFilterFor(storagePath, interval)
+	if err != nil {
+		return directFileTokenStats{}, true, err
+	}
+	filtered, err := snapshot.FilterIntegerIntervalCount(filter)
+	if err != nil {
+		return directFileTokenStats{}, true, err
+	}
+	if !filtered.Supported {
+		return directFileTokenStats{}, false, nil
+	}
+	if filtered.Scanned != int(snapshot.Len()) ||
+		filtered.Matched < 0 || filtered.Matched > filtered.Scanned {
+		return directFileTokenStats{}, true, fmt.Errorf(
+			"query: durable integer interval filter returned invalid progress: scanned=%d matched=%d rows=%d",
+			filtered.Scanned, filtered.Matched, snapshot.Len(),
+		)
+	}
+	stats := directFileTokenStats{
+		scanned: uint64(filtered.Scanned), token: uint64(filtered.Scanned),
+	}
+	e.file.accs = resize(e.file.accs, len(p.columns))
+	resetAggs(e.file.accs)
+	for i := range e.file.accs {
+		e.file.accs[i].count = filtered.Matched
+	}
+	if err := prepareResult(&e.Result, p, 1); err != nil {
+		return stats, true, err
+	}
+	if err := p.fillAggregateCells(
+		&e.Result, 0, e.file.accs, nil, &e.Workspace,
+	); err != nil {
+		return stats, true, err
+	}
+	return stats, true, nil
+}
+
 // runDirectFileTokenScalarCount answers the common unindexed
 // COUNT(*) WHERE field = scalar shape by scanning durable leaf tokens in
 // storage order. This is not candidate pruning: FilterEqCount visits every
