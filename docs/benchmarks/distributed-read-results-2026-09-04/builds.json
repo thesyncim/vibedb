@@ -1,0 +1,22 @@
+{
+  "baseline_revision": "b3acdfd75d9c76b7beccdad92f5299a1c46ebae7",
+  "GOOS": "linux",
+  "GOARCH": "arm64",
+  "CGO_ENABLED": "0",
+  "GOEXPERIMENT": "simd",
+  "GOMAXPROCS_per_server": 2,
+  "container_cpus": 12,
+  "container_memory_gib": 24,
+  "binary_sha256": {
+    "baseline/vibedb": "30f615ae336e448044cf01c946ae175e5389d5ce76d309548a68e1013caaf02e",
+    "baseline/vibedb-gateway": "a368b0e3e940d785fe7dab20388088709b2b773e903c16921d00ba21e75b1787",
+    "baseline/vibedb-shard": "259fb191849dbc65be0db3ffa55734f4aae9ea0b0fe422c75c3801e1894b6428",
+    "after/vibedb": "e4b4159461017b4de456e8976684749cd3a65913e51058751fa6d115f3983f95",
+    "after/vibedb-gateway": "7b58b87382f65822e748ca16b6b79cdd1a812c065ed7169370787df3587c2c8a",
+    "after/vibedb-shard": "7f5514214ce1d153c4b8f663b9600be8ca0caa272100c74488bab03c68f405e0"
+  },
+  "baseline_build_revision": "ac1d91e3ef1d99bda0d1f4ea124295bdaef49ab5",
+  "baseline_and_merged_tree": "5d113ccc4a3a3473bac5264d122f35f2111d819d",
+  "fixture_rows": 500000,
+  "fixture_volume": "vibedb-index-next-01a06d48-data"
+}
