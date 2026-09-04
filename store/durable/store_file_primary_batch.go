@@ -921,13 +921,6 @@ func (c *Collection) buildPrimaryBatchLeaf(
 	if !ok {
 		return nil, storeio.ErrCommonPrimaryLeafCorrupt
 	}
-	if patched, patchErr := c.tryPrimaryBatchCompactReplacement(
-		&stripe, leaf, baseGen,
-	); patchErr != nil {
-		return nil, patchErr
-	} else if patched {
-		return nil, nil
-	}
 	baseRows, err := stripe.RenderRecordsWithScratch(c.primaryLeafMutationScratch)
 	if err != nil {
 		return nil, err
@@ -1003,73 +996,6 @@ func (c *Collection) buildPrimaryBatchLeaf(
 	c.batchPrimaryLeafArena = append(c.batchPrimaryLeafArena, image...)
 	leaf.imageLength = len(c.batchPrimaryLeafArena) - leaf.imageOffset
 	return nil, nil
-}
-
-// tryPrimaryBatchCompactReplacement attempts the narrow existing-row compact
-// patch before decoding and re-placing a complete leaf. Every mutation must be
-// a present inline row in an otherwise inline leaf, and the patcher remains the
-// final authority for shape, hole, summary, and extent admission. A decline is
-// deliberately silent so the caller can use the complete merge/placement path.
-func (c *Collection) tryPrimaryBatchCompactReplacement(
-	stripe *storeio.CompactPrimaryStripeView,
-	leaf *primaryBatchLeaf,
-	baseGen uint64,
-) (bool, error) {
-	if c.options.OpaqueValues || stripe == nil ||
-		stripe.Len() < 1 || stripe.Len() > storeio.CommonPrimaryLeafWideSlots ||
-		stripe.HasOverflowRows() || c.primaryUnifiedBuilder == nil {
-		return false, nil
-	}
-	count := leaf.mutationEnd - leaf.mutationAt
-	if count < 1 || count > cap(c.primaryUnifiedReplacementScratch) {
-		return false, nil
-	}
-	replacements := c.primaryUnifiedReplacementScratch[:0]
-	defer clear(replacements[:count])
-	for mutationAt := leaf.mutationAt; mutationAt < leaf.mutationEnd; mutationAt++ {
-		mutation := &c.batchPrimaryMutations[mutationAt]
-		if mutation.remove || mutation.stored.IsOverflow() ||
-			len(mutation.stored.Inline) == 0 {
-			return false, nil
-		}
-		rank, found := stripe.FindKey(mutation.key)
-		if !found || stripe.IsOverflow(rank) {
-			return false, nil
-		}
-		slot, slotOK := stripe.PostingSlot(rank)
-		if !slotOK {
-			return false, nil
-		}
-		replacements = append(replacements, storeio.CommonPrimaryUnifiedReplacement{
-			Key: mutation.key, Value: mutation.stored.Inline, Slot: slot,
-		})
-	}
-	image, patched, patchErr := stripe.PatchCompactPrimaryStripeReplacements(
-		c.primaryLeafScratch, baseGen+1, replacements, c.primaryUnifiedBuilder,
-	)
-	c.primaryCompactColumnPatchAttempts.Add(1)
-	if patchErr != nil {
-		return false, patchErr
-	}
-	if !patched {
-		return false, nil
-	}
-	c.primaryCompactColumnPatches.Add(1)
-	for mutationAt := leaf.mutationAt; mutationAt < leaf.mutationEnd; mutationAt++ {
-		mutation := &c.batchPrimaryMutations[mutationAt]
-		mutation.found = true
-		mutation.oldSlot = replacements[mutationAt-leaf.mutationAt].Slot
-	}
-	leaf.initialLen = stripe.Len()
-	leaf.finalLen = stripe.Len()
-	leaf.docDelta = 0
-	leaf.applied = count
-	leaf.frameGen = baseGen + 1
-	leaf.skip = false
-	leaf.imageOffset = len(c.batchPrimaryLeafArena)
-	c.batchPrimaryLeafArena = append(c.batchPrimaryLeafArena, image...)
-	leaf.imageLength = len(c.batchPrimaryLeafArena) - leaf.imageOffset
-	return true, nil
 }
 
 // mergePrimaryBatchLeafRows computes one leaf's final logical row set. Both
