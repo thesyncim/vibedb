@@ -16,7 +16,6 @@ env:
 
 jobs:
   repository-contracts:
-    needs: [sql-tests]
     if: ${{ !cancelled() }}
     name: repository contracts
     runs-on: ubuntu-latest
@@ -309,7 +308,6 @@ jobs:
           path: ${{ steps.go.outputs.cache-path }}
           key: ${{ steps.go.outputs.cache-key }}
   durable-sql-rf3:
-    needs: [sql-tests]
     if: ${{ !cancelled() }}
     name: Recovery, replica replacement and PostgreSQL clients
     runs-on: ubuntu-latest
@@ -613,7 +611,6 @@ jobs:
           path: ${{ steps.go.outputs.cache-path }}
           key: ${{ steps.go.outputs.cache-key }}
   storage-race:
-    needs: [sql-tests]
     if: ${{ !cancelled() }}
     name: race storage (${{ matrix.runner }})
     strategy:
@@ -638,7 +635,6 @@ jobs:
           path: ${{ steps.go.outputs.cache-path }}
           key: ${{ steps.go.outputs.cache-key }}
   distributed-race-packages:
-    needs: [sql-tests]
     if: ${{ !cancelled() }}
     name: race distributed (${{ matrix.name }})
     strategy:
