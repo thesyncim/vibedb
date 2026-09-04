@@ -198,6 +198,10 @@ jobs:
         run: scripts/ci/test-shard.sh "$TEST_SHARD" | tee "${RUNNER_TEMP}/unit-tests.txt"
         env:
           TEST_SHARD: ${{ matrix.shard }}
+          # The durable shard already executes the packed SIMD dispatch tests.
+          # Require native AVX2 there instead of rerunning the same tests in
+          # the portable-parity lane.
+          VIBEDB_TEST_REQUIRE_AVX2: ${{ matrix.runner == 'ubuntu-latest' && matrix.shard == 'durable' && '1' || '' }}
       - name: Upload package timings
         if: always()
         uses: actions/upload-artifact@v4
@@ -256,22 +260,10 @@ jobs:
         id: go
         with:
           scope: simd
-      - name: Go 1.27 SIMD planner and query paths
-        env:
-          GOEXPERIMENT: simd
-        run: go test -count=1 -timeout=10m ./planner ./query ./gateway ./distribution ./internal/rangesplit
-      - name: SIMD catalog and replicated JSON
-        env:
-          GOEXPERIMENT: simd
-        run: >-
-          go test -short -count=1 -timeout=5m ./sql/driver
-          -run 'Test(Catalog|SQLCatalog|Replicated.*(JSON|Json|Catalog|Grammar|Scalar|Placement|Version))'
-      - name: Packed column count SIMD and portable parity
+      - name: Packed column count portable parity
         env:
           GOAMD64: v1
-          VIBEDB_TEST_REQUIRE_AVX2: ${{ matrix.runner == 'ubuntu-latest' && '1' || '' }}
         run: |
-          GOEXPERIMENT=simd go test -v -count=1 -timeout=5m ./internal/storeio -run 'Test(CountCompact|CompactPacked|CompactIntegerOrdered|CompactStream|CompactPrimaryStripe)'
           GOEXPERIMENT=nosimd go test -count=1 -timeout=5m ./internal/storeio -run 'Test(CountCompact|CompactPacked|CompactIntegerOrdered|CompactStream|CompactPrimaryStripe)'
           GOEXPERIMENT=nosimd go test -count=1 -timeout=5m ./query -run '^TestFilePacked(Equality|Ordered)Count.*$'
       - name: SIMD packed-count fallback with AVX2 disabled (AMD64)

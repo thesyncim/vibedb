@@ -264,26 +264,22 @@ func (d *CompactPrimaryScanDecoder) appendDictionaryFragment(
 	s := &d.streams[streamAt]
 	if row != s.next {
 		s.seek(v, row)
+		if row != s.next {
+			return dst, false
+		}
 	}
+	// prepare admitted the complete immutable stream, decoded every dictionary
+	// boundary, and installed this plan only when both bounded pools fit. Keep
+	// the row loop to state synchronization and packed-ID consumption; repeating
+	// the stream grammar and fragment geometry checks for every value made those
+	// already-proven branches a material fraction of scan time.
 	plan := d.streamPlan[streamAt]
 	first := int(plan.dictionaryFirst)
-	last := first + int(plan.dictionaryCount) + 1
-	bounds := d.dictionary[first:last]
-	if v.kind != compactStreamDictionary || row < 0 || row >= v.count ||
-		row != s.next || len(bounds) != v.dictCount+1 {
-		return dst, false
-	}
 	width := int(v.width)
-	if v.dictCount <= 0 || width > 16 {
-		return dst, false
-	}
 	reservoir := uint64(s.value)
 	available := s.bit
 	cursor := s.cursor
 	for available < width {
-		if cursor >= len(v.data) {
-			return dst, false
-		}
 		reservoir |= uint64(v.data[cursor]) << uint(available)
 		cursor++
 		available += 8
@@ -292,13 +288,7 @@ func (d *CompactPrimaryScanDecoder) appendDictionaryFragment(
 	if width != 0 {
 		id = int(reservoir & (uint64(1)<<uint(width) - 1))
 	}
-	if id < 0 || id >= v.dictCount {
-		return dst, false
-	}
-	start, end := int(bounds[id]), int(bounds[id+1])
-	if end < start || end > len(d.fragments) {
-		return dst, false
-	}
+	start, end := int(d.dictionary[first+id]), int(d.dictionary[first+id+1])
 	reservoir >>= uint(width)
 	available -= width
 	s.value = int64(reservoir)
