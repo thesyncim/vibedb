@@ -30,6 +30,7 @@ const (
 var errInvalidRF3Manifest = errors.New("vibedb-shard: invalid RF3 manifest")
 
 type rf3Manifest struct {
+	NodeLog             *rf3NodeLogManifest
 	reloadPath          string
 	reloadSignals       <-chan os.Signal
 	Digest              [sha256.Size]byte
@@ -71,7 +72,7 @@ func (manifest rf3Manifest) groupBundles() []rf3ManifestGroup {
 func (manifest rf3Manifest) withGroup(group rf3ManifestGroup) rf3Manifest {
 	split := manifest.SplitControl
 	split.ChildRegistry = group.ChildRegistry
-	return rf3Manifest{Digest: manifest.Digest, WAL: group.WAL, SQL: group.SQL, Listeners: manifest.Listeners,
+	return rf3Manifest{NodeLog: manifest.NodeLog, Digest: manifest.Digest, WAL: group.WAL, SQL: group.SQL, Listeners: manifest.Listeners,
 		TLS: manifest.TLS, AuthorizationPolicy: manifest.AuthorizationPolicy,
 		ReplicaControl: manifest.ReplicaControl,
 		SplitControl:   split, Route: group.Route,
@@ -234,6 +235,16 @@ func parseRF3Manifest(data []byte) (rf3Manifest, error) {
 	key, node, present := fields.Next()
 	if !present {
 		return rf3Manifest{}, errInvalidRF3Manifest
+	}
+	if bytes.Equal(key.Raw().Bytes(), []byte(`"node_log"`)) {
+		manifest.NodeLog, err = parseRF3NodeLogManifest(node)
+		if err != nil {
+			return rf3Manifest{}, err
+		}
+		key, node, present = fields.Next()
+		if !present {
+			return rf3Manifest{}, errInvalidRF3Manifest
+		}
 	}
 	if bytes.Equal(key.Raw().Bytes(), []byte(`"listeners"`)) {
 		if manifest.Listeners, err = parseRF3ManifestListeners(node); err != nil {

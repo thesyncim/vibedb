@@ -4,6 +4,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
+	pb "go.etcd.io/raft/v3/raftpb"
 )
 
 // Recovery uses an authenticated group log, independent of whether the physical
@@ -12,6 +13,7 @@ import (
 type rf3RecoveryLog interface {
 	rf3SchemaWALReader
 	LastIndex() (uint64, error)
+	Snapshot() (*pb.Snapshot, error)
 }
 
 func validateRF3RecoveryLog(log rf3RecoveryLog) error {
@@ -58,5 +60,20 @@ func openRF3SchemaSourceLog(path string, log rf3RecoveryLog,
 		return raftmember.OpenBoundNodeSQLWithApplyForSchemaSourceTransition(path, value, base.Binding.Authority, base, apply, command, opening...)
 	default:
 		return nil, nil, raftmember.ErrWALUnavailable
+	}
+}
+
+func rf3DurableLogCommit(log rf3RecoveryLog) (uint64, error) {
+	switch value := log.(type) {
+	case *raftstore.Store:
+		return value.DurableCommit()
+	case *raftstore.GroupView:
+		hard, _, err := value.InitialState()
+		if err != nil {
+			return 0, err
+		}
+		return hard.GetCommit(), nil
+	default:
+		return 0, raftmember.ErrWALUnavailable
 	}
 }

@@ -13,23 +13,20 @@ physical node/store. Raft groups retain independent ordering and identities, but
 a bounded batch of ready groups shares one durable append barrier. A slow group
 must not occupy the execution lane while its disk operation is pending.
 
-Current implementation: startup and reload now use AdoptPipelinedRuntime.
-NodeStore, NodeSubmissionSequencer, AdoptNodeRuntime and NodeCheckpointCoordinator
-exist and have internal tests; the shipped command path still opens separate
-legacy WALs. Completing the design means wiring preparation, startup, hot group
-addition, checkpoint reclamation, schema recovery and shutdown through one
-node owner. Adding another unused abstraction is insufficient.
+Current implementation: `prepare-node-rf3` and an explicit `node_log` serving
+manifest connect fresh multi-group preparation, startup, schema log access,
+runtime adoption and shutdown to one node owner. The append sequencer and
+checkpoint worker are shared. Linux tests cover 17 prepared groups, two-group
+SQL recovery/swap, and three serving instances electing leaders before and after
+restart. See [scope and raw qualification](qualification/node-serving-2026-09-04/README.md).
 
-The command's schema/startup recovery now accepts authenticated node-log group
-views as well as range files. Linux disk-backed tests reopen a shared log with
-two SQL groups and verify foreign-group rejection, uncommitted schema preparation,
-committed publication, and an applied SQL checkpoint ahead of its commit-only
-HardState. Each schema case repeats the physical-log restart and checks the
-neighboring group. This qualifies recovery integration only: normal startup and
-preparation still require the node-owner composition before space or throughput
-benefits can be measured.
+Fresh hot-group registration, node-log split/replica movement, interrupted
+admission, sustained reclamation and acknowledged-write fault campaigns remain.
+Reload can adopt a group already present in the node log; it does not yet
+register a newly prepared group. Existing dev/benchmark preparation still uses
+per-range logs, so no new space or throughput gain has been measured.
 
-Use a new node manifest and fresh preparation format. Do not spend this
+Continue the new node manifest and fresh preparation format. Do not spend this
 unreleased redesign building a legacy data migration framework. Preserve exact
 cluster/group/store identity checks, durable incarnation allocation and retained
 checkpoint authority in the new format. Recovery must reconstruct acknowledged

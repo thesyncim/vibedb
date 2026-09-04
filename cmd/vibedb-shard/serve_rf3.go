@@ -144,6 +144,8 @@ type preparedRF3Group struct {
 	applyIdentity      sqldriver.ReplicatedApplyIdentity
 	key                raftstore.Key
 	wal                *raftstore.Store
+	nodeLog            *raftstore.GroupView
+	nodeOwner          *rf3NodeOwner
 	database           *sqldriver.Database
 	apply              *sqldriver.ReplicatedApply
 	publication        raftmodel.Publication
@@ -175,7 +177,14 @@ func closePreparedRF3Groups(groups []preparedRF3Group, cause error) error {
 }
 
 func prepareRF3GroupSet(manifest rf3Manifest, profile *rafttransport.PeerTLS, opening sqldriver.ReplicatedOpenOptions, inventory ...*rf3AdoptedGroupInventory) (preparedRF3Set, error) {
+	return prepareRF3GroupSetOnNode(manifest, profile, opening, nil, inventory...)
+}
+
+func prepareRF3GroupSetOnNode(manifest rf3Manifest, profile *rafttransport.PeerTLS, opening sqldriver.ReplicatedOpenOptions, nodeOwner *rf3NodeOwner, inventory ...*rf3AdoptedGroupInventory) (preparedRF3Set, error) {
 	var result preparedRF3Set
+	if (manifest.NodeLog != nil) != (nodeOwner != nil) {
+		return result, errInvalidRF3Manifest
+	}
 	bundles := manifest.groupBundles()
 	initialCount := len(bundles)
 	var recovered []rf3AdoptedGroupRecovery
@@ -248,16 +257,25 @@ func prepareRF3GroupSet(manifest rf3Manifest, profile *rafttransport.PeerTLS, op
 		if profile.LocalIdentity().TrustDomain != want {
 			return result, closePreparedRF3Groups(result.groups, fmt.Errorf("%w: group %d trust domain differs from retained identity", errRF3Serving, index))
 		}
-		key, err := loadRF3WALKey(bundle.WAL.KeyID, bundle.WAL.KeyMaterialPath)
-		if err != nil {
-			return result, closePreparedRF3Groups(result.groups, err)
+		var key raftstore.Key
+		var wal *raftstore.Store
+		var nodeLog *raftstore.GroupView
+		var log rf3RecoveryLog
+		if nodeOwner != nil {
+			nodeLog, err = nodeOwner.group(base.Binding)
+			log = nodeLog
+		} else {
+			key, err = loadRF3WALKey(bundle.WAL.KeyID, bundle.WAL.KeyMaterialPath)
+			if err == nil {
+				wal, err = raftstore.Open(bundle.WAL.Path, walIdentityFromBinding(base.Binding), base.Binding.TopologyRecoveryEpoch, key, bundle.WAL.Options)
+			}
+			log = wal
 		}
-		wal, err := raftstore.Open(bundle.WAL.Path, walIdentityFromBinding(base.Binding), base.Binding.TopologyRecoveryEpoch, key, bundle.WAL.Options)
 		if err != nil {
 			clear(key.Material[:])
-			return result, closePreparedRF3Groups(result.groups, fmt.Errorf("open RF3 WAL group %d: %w", index, err))
+			return result, closePreparedRF3Groups(result.groups, fmt.Errorf("open RF3 log group %d: %w", index, err))
 		}
-		base, applyIdentity, database, apply, err := openRF3RetainedApply(bundle.SQL.Path, wal, base, applyIdentity, opening)
+		base, applyIdentity, database, apply, err := openRF3RetainedApply(bundle.SQL.Path, log, base, applyIdentity, opening)
 		if err != nil {
 			clear(key.Material[:])
 			return result, closePreparedRF3Groups(result.groups,
@@ -271,19 +289,19 @@ func prepareRF3GroupSet(manifest rf3Manifest, profile *rafttransport.PeerTLS, op
 		if err != nil {
 			return result, closePreparedRF3Groups(append(result.groups, preparedRF3Group{
 				manifest: single, base: base, applyIdentity: applyIdentity, key: key,
-				wal: wal, database: database, apply: apply}), err)
+				wal: wal, nodeLog: nodeLog, nodeOwner: nodeOwner, database: database, apply: apply}), err)
 		}
-		item := preparedRF3Group{manifest: single, base: base, applyIdentity: applyIdentity, key: key, wal: wal, database: database, apply: apply, publication: apply.Published(), splitRuntimeDigest: runtimeDigest}
+		item := preparedRF3Group{manifest: single, base: base, applyIdentity: applyIdentity, key: key, wal: wal, nodeLog: nodeLog, nodeOwner: nodeOwner, database: database, apply: apply, publication: apply.Published(), splitRuntimeDigest: runtimeDigest}
 		if !rf3SplitChildTemplateMatchesRetained(single.SplitControl.ChildRegistry, base, applyIdentity) ||
 			!rf3SplitChildSchemaMatchesRetained(single.SplitControl.ChildRegistry, base) {
 			return result, closePreparedRF3Groups(append(result.groups, item),
 				fmt.Errorf("%w: group %d split child template differs from activated schema", errRF3Serving, index))
 		}
-		item.restoreOperation, err = validateRestoredRF3Bootstrap(wal, bundle.SQL.Path, base.Binding.MemberID)
+		item.restoreOperation, err = validateRestoredRF3Bootstrap(log, bundle.SQL.Path, base.Binding.MemberID)
 		if err != nil {
 			return result, closePreparedRF3Groups(append(result.groups, item), err)
 		}
-		if err = rejectRF3UnappliedMembership(wal, item.publication.Applied); err != nil {
+		if err = rejectRF3UnappliedMembership(log, item.publication.Applied); err != nil {
 			return result, closePreparedRF3Groups(append(result.groups, item), err)
 		}
 		roster, _, _, native, err := buildRF3Roster(single, group, base.Binding.MemberID, item.publication)
@@ -436,7 +454,12 @@ func servePreparedRF3WithExecutionLanes(
 		return err
 	}
 	defer func() { resultErr = errors.Join(resultErr, adoptedInventory.Close()) }()
-	preparedSet, err := prepareRF3GroupSet(manifest, profile, opening, adoptedInventory)
+	nodeOwner, err := openRF3NodeOwner(manifest, profile)
+	if err != nil {
+		return err
+	}
+	defer func() { resultErr = errors.Join(resultErr, nodeOwner.Close()) }()
+	preparedSet, err := prepareRF3GroupSetOnNode(manifest, profile, opening, nodeOwner, adoptedInventory)
 	if err != nil {
 		return err
 	}
@@ -524,7 +547,7 @@ func servePreparedRF3WithExecutionLanes(
 	}
 	for index := range preparedSet.groups {
 		item := &preparedSet.groups[index]
-		runtime, adoptErr := raftmember.AdoptPipelinedRuntime(item.wal, item.database, item.apply)
+		runtime, adoptErr := item.adoptRuntime()
 		if adoptErr != nil {
 			remaining := preparedSet.groups[index:]
 			if runtime != nil {
@@ -534,13 +557,6 @@ func servePreparedRF3WithExecutionLanes(
 			return errors.Join(closeAdopted(adoptErr), closePreparedRF3Groups(remaining, nil))
 		}
 		runtimes = append(runtimes, runtime)
-		if adoptErr = runtime.ConfigureWALGeneration(raftmember.WALGenerationDriverOptions{
-			IntervalTicks: rf3WALGenerationIntervalTicks, Key: item.key,
-			OnError: func(err error) { fmt.Fprintf(os.Stderr, "vibedb-shard RF3 WAL generation deferred: %v\n", err) },
-		}); adoptErr != nil {
-			return errors.Join(closeAdopted(adoptErr), closePreparedRF3Groups(preparedSet.groups[index+1:], nil))
-		}
-		clear(item.key.Material[:])
 		runtimePublication, publicationErr := runtime.Publication()
 		if publicationErr != nil || runtimePublication.ReplicaSetVersion != item.publication.ReplicaSetVersion || !proto.Equal(runtimePublication.ConfState, item.publication.ConfState) {
 			return errors.Join(closeAdopted(errors.Join(fmt.Errorf("%w: group %d publication changed during adoption", errRF3Serving, index), publicationErr)), closePreparedRF3Groups(preparedSet.groups[index+1:], nil))
@@ -1086,7 +1102,7 @@ func servePreparedRF3WithExecutionLanes(
 	for {
 		select {
 		case <-manifest.reloadSignals:
-			if err := reloadPreparedRF3Groups(parent, &manifest, profile, peer, adoptedInventory, schemaActivator); err != nil {
+			if err := reloadPreparedRF3Groups(parent, &manifest, profile, peer, adoptedInventory, schemaActivator, nodeOwner); err != nil {
 				fmt.Fprintf(os.Stderr, "RF3 prepared group reload refused: %v\n", err)
 			}
 			continue
@@ -1233,7 +1249,7 @@ func rf3PreparingMarkerReadError(sqlPath string) error {
 	return err
 }
 
-func validateRestoredRF3Bootstrap(wal *raftstore.Store, sqlPath string, member uint64) ([32]byte, error) {
+func validateRestoredRF3Bootstrap(wal rf3RecoveryLog, sqlPath string, member uint64) ([32]byte, error) {
 	base, err := wal.Snapshot()
 	if err != nil {
 		return [32]byte{}, err
@@ -1510,8 +1526,8 @@ func walIdentityFromBinding(binding sqldriver.ReplicatedShardStoreBinding) rafts
 // rejectRF3UnappliedMembership closes the fixed-roster restart gap. Normal
 // committed entries may replay after adoption, but a committed configuration
 // entry would advance the state machine beyond the immutable transport roster.
-func rejectRF3UnappliedMembership(wal *raftstore.Store, applied uint64) error {
-	commit, err := wal.DurableCommit()
+func rejectRF3UnappliedMembership(wal rf3RecoveryLog, applied uint64) error {
+	commit, err := rf3DurableLogCommit(wal)
 	if err != nil {
 		return err
 	}

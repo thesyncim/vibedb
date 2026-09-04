@@ -14,7 +14,6 @@ import (
 	"github.com/thesyncim/vibedb/internal/multiraft"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftservice"
-	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/schemainstall"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
@@ -40,7 +39,7 @@ type rf3SchemaGeneration struct {
 	mu       sync.Mutex
 	identity raftmember.RuntimeIdentity
 	path     string
-	wal      *raftstore.Store
+	wal      rf3RecoveryLog
 	base     sqldriver.ReplicatedShardStoreIdentity
 	applyID  sqldriver.ReplicatedApplyIdentity
 	apply    *sqldriver.ReplicatedApply
@@ -89,7 +88,7 @@ func newRF3SchemaActivator(
 	for i := range groups {
 		item := &groups[i]
 		group := groupFromBinding(item.base.Binding)
-		if group == (raftmember.GroupKey{}) || item.wal == nil || item.apply == nil ||
+		if group == (raftmember.GroupKey{}) || validateRF3RecoveryLog(item.recoveryLog()) != nil || item.apply == nil ||
 			item.manifest.SQL.Path == "" {
 			return nil, errRF3Serving
 		}
@@ -100,7 +99,7 @@ func newRF3SchemaActivator(
 			return nil, errRF3Serving
 		}
 		result.groups[group] = &rf3SchemaGeneration{identity: identities[i], path: item.manifest.SQL.Path,
-			wal: item.wal, base: item.base.Clone(), applyID: item.applyIdentity,
+			wal: item.recoveryLog(), base: item.base.Clone(), applyID: item.applyIdentity,
 			apply: item.apply}
 	}
 	return result, nil

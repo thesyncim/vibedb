@@ -767,7 +767,7 @@ func (runtime *Runtime) checkUsable() error {
 // owned by Runtime for an exact target-generation install.
 func (runtime *Runtime) QuiesceSQLGeneration() error {
 	if runtime == nil || runtime.closed || runtime.stopping || runtime.failure != nil ||
-		runtime.node == nil || runtime.wal == nil || runtime.database == nil ||
+		runtime.node == nil || runtime.stableStore() == nil || runtime.database == nil ||
 		runtime.schemaGenerationQuiesced {
 		return ErrSchemaGenerationSwap
 	}
@@ -788,6 +788,12 @@ func (runtime *Runtime) QuiesceSQLGeneration() error {
 			clear(driver.key.Material[:])
 			clear(driver.key.Wrapped)
 			runtime.walGeneration = nil
+		}
+		// A node checkpoint can still retain the old apply handle after Raft
+		// becomes idle. Drain that group's capture/submission before closing SQL;
+		// the shared coordinator stays alive for every other group and the target.
+		if err := runtime.nodeCheckpoint.stopAndWait(runtime.nodePersistence); err != nil {
+			return errors.Join(ErrSchemaGenerationSwap, err)
 		}
 		if err := runtime.apply.Close(); err != nil {
 			return errors.Join(ErrSchemaGenerationSwap, err)
@@ -820,7 +826,7 @@ func (runtime *Runtime) InstallSQLGeneration(
 	expectedApply sqldriver.ReplicatedApplyIdentity,
 ) error {
 	if runtime == nil || runtime.closed || runtime.stopping || runtime.failure != nil ||
-		!runtime.schemaGenerationQuiesced || runtime.node == nil || runtime.wal == nil ||
+		!runtime.schemaGenerationQuiesced || runtime.node == nil || runtime.stableStore() == nil ||
 		runtime.apply != nil || runtime.database != nil || database == nil || apply == nil {
 		return ErrSchemaGenerationSwap
 	}

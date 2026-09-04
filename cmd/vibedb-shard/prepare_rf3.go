@@ -276,14 +276,21 @@ func loadPrepareRF3Manifest(path string) (prepareRF3Manifest, error) {
 	return result, nil
 }
 
-func provisionRF3Member(input prepareRF3Manifest) (resultErr error) {
+func provisionRF3Member(input prepareRF3Manifest) error {
+	return provisionRF3MemberInto(input, input.Root, nil)
+}
+
+// destination may be a private node-preparation directory. All published
+// metadata uses input.Root, so one atomic node-root rename publishes every
+// group and the shared log together without rewriting SQL identities.
+func provisionRF3MemberInto(input prepareRF3Manifest, destination string, nodeGroup *raftstore.GroupView) (resultErr error) {
 	identity, authority, nodes, options, apply, keyMaterial, err := validatePrepareRF3(input)
 	if err != nil {
 		return err
 	}
 	defer clear(keyMaterial)
-	final := input.Root
-	paths := map[string]string{"wal": filepath.Join(final, "member.wal"), "sql": filepath.Join(final, "member.vdb"), "identity": filepath.Join(final, "sql-identity.vibejson"), "apply": filepath.Join(final, "apply-identity.vibejson"), "key": filepath.Join(final, "wal-key")}
+	final := destination
+	paths := preparedRF3MemberPaths(input.Root)
 	manifest := buildPreparedRF3Manifest(input, nodes, paths)
 	manifestRaw, err := vibejson.Marshal(&manifest)
 	if err != nil {
@@ -293,11 +300,14 @@ func provisionRF3Member(input prepareRF3Manifest) (resultErr error) {
 		return errors.Join(errPrepareRF3, err)
 	}
 	if _, statErr := os.Lstat(final); statErr == nil {
+		if nodeGroup != nil {
+			return errPrepareRF3
+		}
 		return verifyPreparedRF3Member(final, manifestRaw)
 	} else if !errors.Is(statErr, os.ErrNotExist) {
 		return errors.Join(errPrepareRF3, statErr)
 	}
-	parent, base := filepath.Dir(input.Root), filepath.Base(input.Root)
+	parent, base := filepath.Dir(final), filepath.Base(final)
 	stage, err := os.MkdirTemp(parent, "."+base+".prepare-")
 	if err != nil {
 		return err
@@ -341,7 +351,22 @@ func provisionRF3Member(input prepareRF3Manifest) (resultErr error) {
 	for index := range input.Members {
 		voters[index] = input.Members[index].MemberID
 	}
-	wal, err := raftstore.Create(walPath, identity, key, raftstore.Bootstrap{TopologyRecoveryEpoch: input.TopologyRecoveryEpoch, Snapshot: &pb.Snapshot{Data: []byte("vibedb-rf3-bootstrap"), Metadata: &pb.SnapshotMetadata{Index: &index, Term: &term, ConfState: &pb.ConfState{Voters: voters}}}}, options)
+	var wal *raftstore.Store
+	var log rf3RecoveryLog
+	if nodeGroup == nil {
+		wal, err = raftstore.Create(walPath, identity, key, raftstore.Bootstrap{TopologyRecoveryEpoch: input.TopologyRecoveryEpoch, Snapshot: &pb.Snapshot{Data: []byte("vibedb-rf3-bootstrap"), Metadata: &pb.SnapshotMetadata{Index: &index, Term: &term, ConfState: &pb.ConfState{Voters: voters}}}}, options)
+		log = wal
+	} else {
+		var actual, expected sqldriver.ReplicatedShardStoreBinding
+		actual, err = raftmember.BindingFromNodeGroup(nodeGroup, authority)
+		if err == nil {
+			expected, err = raftmember.BindingForNewWAL(identity, input.TopologyRecoveryEpoch, authority)
+		}
+		if err == nil && actual != expected {
+			err = raftmember.ErrBindingMismatch
+		}
+		log = nodeGroup
+	}
 	clear(key.Material[:])
 	clear(key.Wrapped)
 	if err != nil {
@@ -378,12 +403,16 @@ func provisionRF3Member(input prepareRF3Manifest) (resultErr error) {
 		return closeBase(err)
 	}
 	var baseIdentity sqldriver.ReplicatedShardStoreIdentity
-	if len(input.GlobalIndexes) == 0 {
-		baseIdentity, err = raftmember.BindPreparedSQL(wal, database, authority, input.Table)
+	var binding sqldriver.ReplicatedShardStoreBinding
+	if nodeGroup != nil {
+		binding, err = raftmember.BindingFromNodeGroup(nodeGroup, authority)
 	} else {
-		var binding sqldriver.ReplicatedShardStoreBinding
 		binding, err = raftmember.BindingFromWAL(wal, authority)
-		if err == nil {
+	}
+	if err == nil {
+		if len(input.GlobalIndexes) == 0 {
+			baseIdentity, err = database.BindReplicatedShardStore(binding, input.Table)
+		} else {
 			baseIdentity, err = database.BindReplicatedShardStoreBundle(binding, input.Table, input.GlobalIndexes)
 		}
 	}
@@ -393,11 +422,17 @@ func provisionRF3Member(input prepareRF3Manifest) (resultErr error) {
 	if err = sqldriver.ValidateReplicatedChildSchema(baseIdentity, input.CreateTable, input.SchemaStatements, input.GlobalIndexes); err != nil {
 		return closeBase(err)
 	}
-	applyHandle, applyIdentity, err := raftmember.OpenPreparedApply(wal, database, authority, baseIdentity, apply)
+	var applyHandle *sqldriver.ReplicatedApply
+	var applyIdentity sqldriver.ReplicatedApplyIdentity
+	if nodeGroup != nil {
+		applyHandle, applyIdentity, err = raftmember.OpenPreparedNodeApply(nodeGroup, database, authority, baseIdentity, apply)
+	} else {
+		applyHandle, applyIdentity, err = raftmember.OpenPreparedApply(wal, database, authority, baseIdentity, apply)
+	}
 	if err != nil {
 		return closeBase(err)
 	}
-	snapshot, err := wal.Snapshot()
+	snapshot, err := log.Snapshot()
 	if err == nil {
 		_, err = applyHandle.InstallSnapshot(snapshot)
 	}
@@ -431,6 +466,9 @@ func provisionRF3Member(input prepareRF3Manifest) (resultErr error) {
 		return err
 	}
 	if err := os.Rename(stage, final); err != nil {
+		if nodeGroup != nil {
+			return err
+		}
 		// Another identical preparer may have won publication after our initial
 		// existence check. Accept only a byte-identical, completely retained
 		// member and sync the parent ourselves before reporting success.
@@ -833,4 +871,8 @@ func syncPrepareRF3Directory(path string) error {
 		return err
 	}
 	return errors.Join(directory.Sync(), directory.Close())
+}
+
+func preparedRF3MemberPaths(root string) map[string]string {
+	return map[string]string{"wal": filepath.Join(root, "member.wal"), "sql": filepath.Join(root, "member.vdb"), "identity": filepath.Join(root, "sql-identity.vibejson"), "apply": filepath.Join(root, "apply-identity.vibejson"), "key": filepath.Join(root, "wal-key")}
 }

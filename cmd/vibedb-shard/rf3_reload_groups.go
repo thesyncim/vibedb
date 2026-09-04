@@ -90,9 +90,19 @@ func validateRF3GroupTransition(current, next rf3Manifest) error {
 }
 
 func reloadPreparedRF3Groups(ctx context.Context, current *rf3Manifest, profile *rafttransport.PeerTLS,
-	peer *raftservice.AuthenticatedExecutionPeerRuntime, inventory *rf3AdoptedGroupInventory, schemas *rf3SchemaActivator,
+	peer *raftservice.AuthenticatedExecutionPeerRuntime, inventory *rf3AdoptedGroupInventory, schemas *rf3SchemaActivator, nodeOwners ...*rf3NodeOwner,
 ) error {
 	if current == nil || current.reloadPath == "" || inventory == nil || schemas == nil {
+		return errInvalidRF3Manifest
+	}
+	var nodeOwner *rf3NodeOwner
+	if len(nodeOwners) > 1 {
+		return errInvalidRF3Manifest
+	}
+	if len(nodeOwners) == 1 {
+		nodeOwner = nodeOwners[0]
+	}
+	if (current.NodeLog != nil) != (nodeOwner != nil) {
 		return errInvalidRF3Manifest
 	}
 	next, err := loadRF3Manifest(current.reloadPath)
@@ -166,9 +176,9 @@ func reloadPreparedRF3Groups(ctx context.Context, current *rf3Manifest, profile 
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		set, err := prepareRF3GroupSet(next.withGroup(bundle), profile, sqldriver.ReplicatedOpenOptions{
+		set, err := prepareRF3GroupSetOnNode(next.withGroup(bundle), profile, sqldriver.ReplicatedOpenOptions{
 			WriterLockContext: ctx, WriterLockDeadline: time.Now().Add(rf3StartupWriterLockWait),
-		})
+		}, nodeOwner)
 		if err != nil {
 			return err
 		}
@@ -176,16 +186,13 @@ func reloadPreparedRF3Groups(ctx context.Context, current *rf3Manifest, profile 
 		if item.restoreOperation != ([32]byte{}) {
 			return item.close(errInvalidRF3Manifest)
 		}
-		runtime, err := raftmember.AdoptPipelinedRuntime(item.wal, item.database, item.apply)
+		runtime, err := item.adoptRuntime()
 		if err != nil {
-			return err
+			if runtime != nil {
+				return errors.Join(err, runtime.Close())
+			}
+			return item.close(err)
 		}
-		if err := runtime.ConfigureWALGeneration(raftmember.WALGenerationDriverOptions{
-			IntervalTicks: rf3WALGenerationIntervalTicks, Key: item.key,
-		}); err != nil {
-			return errors.Join(err, runtime.Close())
-		}
-		clear(item.key.Material[:])
 		identity := runtime.Identity()
 		command := commandFenceFromPublication(item.base.Binding.Authority, identity, item.publication.ReplicaSetVersion)
 		inventory.mu.Lock()
@@ -206,7 +213,7 @@ func reloadPreparedRF3Groups(ctx context.Context, current *rf3Manifest, profile 
 		inventory.mu.Unlock()
 		schemas.mu.Lock()
 		schemas.groups[identity.Group] = &rf3SchemaGeneration{identity: identity, path: item.manifest.SQL.Path,
-			wal: item.wal, base: item.base.Clone(), applyID: item.applyIdentity, apply: item.apply}
+			wal: item.recoveryLog(), base: item.base.Clone(), applyID: item.applyIdentity, apply: item.apply}
 		schemas.mu.Unlock()
 		current.Groups = append(current.groupBundles(), bundle)
 		fmt.Fprintf(os.Stderr, "RF3 prepared group loaded table=%q group=%x member=%d\n", item.base.UserTable, identity.Group.GroupID, identity.MemberID)

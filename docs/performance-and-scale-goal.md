@@ -47,8 +47,10 @@ changes allowed; competitor implementations are evidence, not the design target.
 
 1. Connect serving to shared node storage and batching across ranges.
    Asynchronous startup/reload is now integrated and passed the Linux shipped
-   crash/partition harness; node-log ownership is still not wired into the
-   command path. Validate recovery and dynamically added groups as part of it.
+   crash/partition harness. Explicit node-log preparation and serving now share
+   append/checkpoint ownership and pass initial multi-group restart tests.
+   Complete live group registration, node-log fault qualification and benchmark
+   integration; see [qualification scope](qualification/node-serving-2026-09-04/README.md).
 2. Redesign committed/versioned read visibility so transactions need not block
    unrelated readers across a group. Retain serializable conflict validation.
 3. Reduce fixed per-range allocation and duplicate log/data amplification, with
