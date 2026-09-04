@@ -1,0 +1,66 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/internal/storeio
+cpu: Apple M4 Max
+BenchmarkCompactStreamPackedEquality7         	  850418	       318.2 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEquality7         	  933162	       321.9 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEquality7         	  925104	       319.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEquality7         	  939591	       318.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEquality7         	  907566	       322.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEquality7         	  917793	       318.9 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEquality7         	  943197	       321.2 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEquality7         	  917383	       319.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEquality7         	  950770	       326.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEquality7         	  929739	       321.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamSpellingEquality7       	  558788	       537.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamSpellingEquality7       	  554161	       541.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamSpellingEquality7       	  581582	       538.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamSpellingEquality7       	  557137	       535.2 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamSpellingEquality7       	  549508	       544.9 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamSpellingEquality7       	  570296	       538.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamSpellingEquality7       	  573175	       543.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamSpellingEquality7       	  544020	       538.8 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamSpellingEquality7       	  556521	       535.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamSpellingEquality7       	  572732	       549.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEquality10        	  463030	       653.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEquality10        	  454682	       657.9 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEquality10        	  455088	       655.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEquality10        	  457545	       655.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEquality10        	  451333	       657.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEquality10        	  455612	       654.9 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEquality10        	  457072	       654.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEquality10        	  452790	       658.2 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEquality10        	  462175	       659.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEquality10        	  458379	       655.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamIntegerEquality10       	  453354	       659.5 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamIntegerEquality10       	  449948	       656.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamIntegerEquality10       	  452850	       658.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamIntegerEquality10       	  460083	       657.5 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamIntegerEquality10       	  450974	       663.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamIntegerEquality10       	  450886	       660.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamIntegerEquality10       	  450918	       662.5 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamIntegerEquality10       	  462870	       663.9 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamIntegerEquality10       	  459048	       664.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamIntegerEquality10       	  458738	       661.5 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactPrimaryStripePackedEquality7  	  486459	       613.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactPrimaryStripePackedEquality7  	  494817	       617.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactPrimaryStripePackedEquality7  	  484639	       612.9 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactPrimaryStripePackedEquality7  	  471435	       615.2 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactPrimaryStripePackedEquality7  	  489732	       614.1 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactPrimaryStripePackedEquality7  	  471225	       622.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactPrimaryStripePackedEquality7  	  480102	       615.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactPrimaryStripePackedEquality7  	  492974	       618.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactPrimaryStripePackedEquality7  	  479223	       613.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactPrimaryStripePackedEquality7  	  486052	       610.9 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactPrimaryStripePackedEquality10 	  380277	       777.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactPrimaryStripePackedEquality10 	  383774	       782.5 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactPrimaryStripePackedEquality10 	  396864	       772.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactPrimaryStripePackedEquality10 	  385594	       775.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactPrimaryStripePackedEquality10 	  379370	       778.1 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactPrimaryStripePackedEquality10 	  386394	       775.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactPrimaryStripePackedEquality10 	  391437	       778.2 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactPrimaryStripePackedEquality10 	  384711	       782.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactPrimaryStripePackedEquality10 	  389560	       777.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactPrimaryStripePackedEquality10 	  385657	       782.8 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/thesyncim/vibedb/internal/storeio	19.088s

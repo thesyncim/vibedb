@@ -2187,10 +2187,10 @@ func countCompactPackedEqual(
 		return 0
 	}
 	if width == 7 {
-		return countCompactPacked7Equal(data, count, want)
+		return countCompactPacked7EqualImpl(data, count, want)
 	}
 	if width == 10 {
-		return countCompactPacked10Equal(data, count, want)
+		return countCompactPacked10EqualImpl(data, count, want)
 	}
 	if width > 56 {
 		for row := 0; row < count; row++ {
@@ -2222,7 +2222,7 @@ func countCompactPackedEqual(
 // Eight 7-bit ids occupy exactly seven bytes. This width is common for
 // low-cardinality columns with 65-128 values, and consuming complete groups
 // avoids the generic reservoir's refill branch on almost every row.
-func countCompactPacked7Equal(data []byte, count int, want uint64) (matched int) {
+func countCompactPacked7EqualScalar(data []byte, count int, want uint64) (matched int) {
 	row := 0
 	cursor := 0
 	for ; row+8 <= count; row, cursor = row+8, cursor+7 {
@@ -2268,7 +2268,7 @@ func countCompactPacked7Equal(data []byte, count int, want uint64) (matched int)
 
 // Four 10-bit values occupy exactly five bytes. This is the ordinary packed
 // width for integer ranges and dictionaries with 513-1024 distinct values.
-func countCompactPacked10Equal(data []byte, count int, want uint64) (matched int) {
+func countCompactPacked10EqualScalar(data []byte, count int, want uint64) (matched int) {
 	row := 0
 	cursor := 0
 	for ; row+4 <= count; row, cursor = row+4, cursor+5 {

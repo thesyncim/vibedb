@@ -1889,14 +1889,23 @@ func compactPrimaryCompetitiveScanFixtures(t testing.TB) []compactPrimaryScanFix
 func BenchmarkCompactPrimaryStripeCountryScan(b *testing.B) {
 	fixtures := compactPrimaryCompetitiveScanFixtures(b)
 	needle := []byte(`"PT"`)
+	var resolver UnifiedHoleResolver
+	if err := resolver.SetPath([]byte("/country")); err != nil {
+		b.Fatal(err)
+	}
+	scratch := make([]byte, 0, 32)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
 		matched := 0
 		for i := range fixtures {
-			count, ok := fixtures[i].view.CountDictionaryHoleEqual(fixtures[i].holes, needle)
+			var count int
+			var ok bool
+			count, scratch, ok = fixtures[i].view.CountResolvedSpellingEqual(
+				&resolver, needle, scratch,
+			)
 			if !ok {
-				b.Fatal("compact dictionary scan")
+				b.Fatal("compact country spelling scan")
 			}
 			matched += count
 		}
