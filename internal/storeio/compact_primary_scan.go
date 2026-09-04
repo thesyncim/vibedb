@@ -188,17 +188,25 @@ func (d *CompactPrimaryScanDecoder) appendKey(
 			}
 		}
 		out, ok = d.keyState.appendFrontKey(dst, &d.key, row, d.keyPrior[:d.keyState.previousLen])
+		if !ok || len(out) > len(d.keyPrior) {
+			return dst, false
+		}
+		copy(d.keyPrior[:], out)
+		return out, true
+	} else if d.key.kind == compactStreamAlphabet {
+		if row != d.keyState.next {
+			d.keyState.seek(&d.key, row)
+		}
+		if row == d.keyState.next && row >= 0 && row < d.key.count {
+			return d.keyState.appendAlphabet(dst, &d.key, row, true)
+		}
+		return d.key.appendValue(dst, row)
 	} else {
 		if row != d.keyState.next {
 			d.keyState.seek(&d.key, row)
 		}
-		out, ok = d.keyState.appendValue(dst, &d.key, row)
+		return d.keyState.appendValue(dst, &d.key, row)
 	}
-	if !ok || len(out) > len(d.keyPrior) {
-		return dst, false
-	}
-	copy(d.keyPrior[:], out)
-	return out, true
 }
 
 func (d *CompactPrimaryScanDecoder) appendValue(
@@ -244,7 +252,11 @@ func (d *CompactPrimaryScanDecoder) appendValue(
 			if ordinal != state.next {
 				state.seek(stream, ordinal)
 			}
-			dst, ok = state.appendValue(dst, stream, ordinal)
+			if stream.kind == compactStreamAlphabet && ordinal == state.next {
+				dst, ok = state.appendAlphabet(dst, stream, ordinal, true)
+			} else {
+				dst, ok = state.appendValue(dst, stream, ordinal)
+			}
 		}
 		previous = end
 		if !ok {
@@ -423,7 +435,7 @@ func (s *compactStreamSequentialState) appendValue(
 		if row < 0 || row >= v.count || row != s.next {
 			return v.appendValue(dst, row)
 		}
-		return s.appendAlphabet(dst, v, row)
+		return s.appendAlphabet(dst, v, row, false)
 	}
 	prefix := 0
 	switch v.kind {
@@ -582,7 +594,7 @@ func compactSpreadAlphabet5(packed uint64) uint64 {
 // Both callers check kind, row bounds, and synchronization before entering.
 // Keeping this renderer independent of random-decode fallback avoids a recursive
 // call graph that would force caller-owned scan state onto the heap.
-func (s *compactStreamSequentialState) appendAlphabet(dst []byte, v *compactStreamView, row int) ([]byte, bool) {
+func (s *compactStreamSequentialState) appendAlphabet(dst []byte, v *compactStreamView, row int, admitted bool) ([]byte, bool) {
 	if row%compactStreamRestart == 0 {
 		block := row / compactStreamRestart
 		s.cursor = int(binary.LittleEndian.Uint32(v.data[block*4:]))
@@ -651,7 +663,7 @@ func (s *compactStreamSequentialState) appendAlphabet(dst []byte, v *compactStre
 	mask := uint64(1<<v.width) - 1
 	char := 0
 	bit := s.bit
-	if middleLen >= 32 && s.alphabetBase != 0 {
+	if admitted && middleLen >= 32 && s.alphabetBase != 0 {
 		var ok bool
 		char, ok = compactScanAlphabetSIMD(dst[middle:middle+middleLen], v.data, bit, width, len(alphabet), byte(s.alphabetBase-1))
 		if !ok {

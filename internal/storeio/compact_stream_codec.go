@@ -1620,7 +1620,7 @@ func (v compactStreamView) appendAlphabetValue(dst []byte, row int) ([]byte, boo
 	if state.next != row {
 		return dst, false
 	}
-	return state.appendAlphabet(dst, &v, row)
+	return state.appendAlphabet(dst, &v, row, false)
 }
 
 func (v compactStreamView) prefixInteger(row int) (int64, bool) {

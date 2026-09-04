@@ -30,6 +30,15 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
+      - name: Qualify packed scan kernels
+        run: |
+          set -euo pipefail
+          go test ./internal/storeio \
+            -run 'TestCompactAlphabetAVX2|TestCompactPrimaryScanDecoderMatchesRandomAccess|TestCompactPrimaryScanAlphabetBatchRejectsInvalidSymbols' \
+            -count=1
+          GODEBUG=cpu.avx2=off go test ./internal/storeio \
+            -run 'TestCompactAlphabetAVX2|TestCompactPrimaryScanDecoderMatchesRandomAccess' \
+            -count=1
       - name: Build both revisions before timing
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
