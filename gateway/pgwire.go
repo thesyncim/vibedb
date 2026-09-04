@@ -443,6 +443,15 @@ func (p *postgresStatement) ParamTypeTargetDefault(i int) bool {
 	return p != nil && p.compiled != nil &&
 		p.compiled.ParameterTypeTargetDefault(i)
 }
+func (p *postgresStatement) ReusableForParse() bool {
+	if p == nil || p.session == nil || p.compiled == nil || p.local ||
+		p.session.state == driver.SessionClosed ||
+		p.session.state == driver.SessionFailedTransaction {
+		return false
+	}
+	snapshot := p.session.backend.Executor.catalog.Current()
+	return snapshot != nil && snapshot.Generation() == p.catalogGeneration
+}
 func (p *postgresStatement) Columns() []string { return p.compiled.Columns() }
 func (p *postgresStatement) AppendSchema(dst []query.OutputColumn) []query.OutputColumn {
 	return p.compiled.AppendSchema(dst)

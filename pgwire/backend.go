@@ -88,6 +88,16 @@ type BackendStatement interface {
 	Close() error
 }
 
+// BackendStatementParseReuser is the optional contract for reusing a live
+// backend statement when PostgreSQL replaces the unnamed statement with the
+// exact same SQL and declared parameter types. Implementations must return
+// false when external state that participates in Prepare, such as a catalog
+// generation, has changed. Backends that do not implement this interface keep
+// the ordinary close-and-prepare behavior.
+type BackendStatementParseReuser interface {
+	ReusableForParse() bool
+}
+
 // BackendStatementParamTyper is the optional analyzed SQL-input contract of a
 // prepared statement. Keeping it separate from BackendStatement preserves
 // compatibility for external backends whose schemaless parameters are all
