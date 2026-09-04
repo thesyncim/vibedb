@@ -237,6 +237,27 @@ func appendCanonicalUint6(dst []byte, v uint64) []byte {
 	}
 }
 
+// appendFixedUint8 renders a known sub-100M value with all eight digits,
+// including leading zeroes. Arithmetic prefix keys use this fixed width and
+// otherwise paid to render a minimal integer before shifting it for padding.
+func appendFixedUint8(dst []byte, v uint32) []byte {
+	pair := func(value uint32) (byte, byte) {
+		at := value * 2
+		return canonicalDecimalPairs[at], canonicalDecimalPairs[at+1]
+	}
+	hi := v / 10_000
+	lo := v - hi*10_000
+	a := hi / 100
+	b := hi - a*100
+	c := lo / 100
+	d := lo - c*100
+	a0, a1 := pair(a)
+	b0, b1 := pair(b)
+	c0, c1 := pair(c)
+	d0, d1 := pair(d)
+	return append(dst, a0, a1, b0, b1, c0, c1, d0, d1)
+}
+
 // AppendZigzagVarint appends the canonical-integer token payload: zigzag
 // mapping (small magnitudes of either sign become small unsigned values)
 // followed by base-128 varint, little-endian groups, high bit as
