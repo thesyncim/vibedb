@@ -112,7 +112,7 @@ type ChildReplicaTarget struct {
 
 	// The remaining fields are the replica-local prepared runtime authority.
 	// WAL member/store identity, physical roots, SQL storage/log identity, and
-	// the apply participant are deliberately distinct on every RF3 member.
+	// the apply target are deliberately distinct on every RF3 member.
 	WAL               raftstore.Identity
 	WALPath           string
 	SQLPath           string

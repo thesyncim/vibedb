@@ -188,6 +188,9 @@ func (d *CompactPrimaryScanDecoder) appendKey(
 			}
 		}
 		out, ok = d.keyState.appendFrontKey(dst, &d.key, row, d.keyPrior[:d.keyState.previousLen])
+	} else if d.key.kind == compactStreamPrefixInt &&
+		len(d.key.data) == 18 && d.key.data[0]&2 != 0 {
+		out, ok = d.keyState.appendArithmeticPrefixKey(dst, &d.key, row)
 	} else {
 		if row != d.keyState.next {
 			d.keyState.seek(&d.key, row)
@@ -199,6 +202,51 @@ func (d *CompactPrimaryScanDecoder) appendKey(
 	}
 	copy(d.keyPrior[:], out)
 	return out, true
+}
+
+func (s *compactStreamSequentialState) appendArithmeticPrefixKey(
+	dst []byte,
+	v *compactStreamView,
+	row int,
+) ([]byte, bool) {
+	if row < 0 || row >= v.count || row != s.next {
+		return v.appendValue(dst, row)
+	}
+	first := int64(binary.LittleEndian.Uint64(v.data[2:]))
+	delta := int64(binary.LittleEndian.Uint64(v.data[10:]))
+	value := first + int64(row)*delta
+	if value < 0 {
+		return dst, false
+	}
+	s.value = value
+	s.next++
+	prefixValue, _ := v.dictionaryEntry(0)
+	suffixValue, _ := v.dictionaryEntry(1)
+	dst = append(dst, prefixValue...)
+	digits := len(dst)
+	if value < 1_000_000 {
+		dst = appendCanonicalUint6(dst, uint64(value))
+	} else {
+		dst = strconv.AppendUint(dst, uint64(value), 10)
+	}
+	if v.data[0]&1 != 0 {
+		width := int(v.data[1])
+		n := len(dst) - digits
+		if n > width {
+			return dst, false
+		}
+		if n < width {
+			gap := width - n
+			for range gap {
+				dst = append(dst, 0)
+			}
+			copy(dst[digits+gap:], dst[digits:digits+n])
+			for at := digits; at < digits+gap; at++ {
+				dst[at] = '0'
+			}
+		}
+	}
+	return append(dst, suffixValue...), true
 }
 
 func (d *CompactPrimaryScanDecoder) appendValue(
@@ -295,6 +343,15 @@ func (d *CompactPrimaryScanDecoder) appendDictionaryFragment(
 	s.bit = available
 	s.cursor = cursor
 	s.next++
+	fragmentLen := end - start
+	// The admitted corpus is dominated by 15-byte fragments. A fixed copy
+	// lowers to one unaligned vector load/store instead of runtime.memmove.
+	if fragmentLen <= 16 && cap(dst)-len(dst) >= 16 {
+		at := len(dst)
+		dst = dst[:at+16]
+		*(*[16]byte)(dst[at:]) = *(*[16]byte)(d.fragments[start:])
+		return dst[:at+fragmentLen], true
+	}
 	return append(dst, d.fragments[start:end]...), true
 }
 

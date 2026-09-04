@@ -51,7 +51,7 @@ func replicatedRecoveryRequests(
 		{Operation: ReplicatedTransactionRead, Authority: authority,
 			Capability: serviceauthz.CapabilityTransactionRecovery, Fence: fence,
 			TransactionRead: ReplicatedTransactionReadRequest{
-				Kind: ReplicatedTransactionLookupParticipant, ID: id,
+				Kind: ReplicatedTransactionLookupTarget, ID: id,
 				MinimumApplied: 8, MaxRows: 1,
 				MaxBytes: replicatedstate.TransactionRecoverySummaryBytes,
 			}},
@@ -198,13 +198,13 @@ func TestReplicatedTransactionRecoveryValueCanonicalRoundTrip(t *testing.T) {
 
 func TestReplicatedTransactionRecoveryCancellationWitnessRoundTripAndMalformed(t *testing.T) {
 	id := testTransactionID(214)
-	record := replicatedRecoveryTestRecord(id, distributedtxn.ReplicatedRoleParticipant,
-		uint8(distributedtxn.ParticipantReleased), distributedtxn.ReplicatedPayloadParticipantStage)
+	record := replicatedRecoveryTestRecord(id, distributedtxn.ReplicatedRoleTarget,
+		uint8(distributedtxn.TargetReleased), distributedtxn.ReplicatedPayloadTargetStage)
 	record.PayloadCount = 0
 	record.CancellationWitness = true
-	record.ParticipantOrdinal = 4096
+	record.TargetOrdinal = 4096
 	encoded, err := AppendReplicatedTransactionReadValue(nil, ReplicatedTransactionReadValue{
-		Kind: ReplicatedTransactionLookupParticipant, Complete: true,
+		Kind: ReplicatedTransactionLookupTarget, Complete: true,
 		Records: []replicatedstate.TransactionRecoveryRecord{record},
 	})
 	if err != nil {
@@ -218,7 +218,7 @@ func TestReplicatedTransactionRecoveryCancellationWitnessRoundTripAndMalformed(t
 	opened, err := OpenReplicatedTransactionReadValueInto(encoded, arena[:0])
 	if err != nil || len(opened.Records) != 1 ||
 		!opened.Records[0].CancellationWitness ||
-		opened.Records[0].ParticipantOrdinal != 4096 ||
+		opened.Records[0].TargetOrdinal != 4096 ||
 		opened.Records[0].PayloadCount != 0 || opened.Records[0].AffectedRowsValid ||
 		opened.Records[0].AffectedRows != 0 {
 		t.Fatalf("opened cancellation=%+v err=%v", opened, err)
@@ -319,7 +319,7 @@ func TestReplicatedTransactionRecoveryValueRejectsMalformedEnvelopeAndScan(t *te
 		},
 		"payload-length": func(raw []byte) { binary.BigEndian.PutUint32(raw[6:10], 1) },
 		"role": func(raw []byte) {
-			raw[replicatedTransactionReadValueHeaderBytes+16] = byte(distributedtxn.ReplicatedRoleParticipant)
+			raw[replicatedTransactionReadValueHeaderBytes+16] = byte(distributedtxn.ReplicatedRoleTarget)
 		},
 		"duplicate": func(raw []byte) {
 			firstStart := replicatedTransactionReadValueHeaderBytes

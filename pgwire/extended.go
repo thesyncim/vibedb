@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -180,6 +181,10 @@ func (s *session) handleParse() error {
 				"this connection already holds %d prepared statements", maxStatements))
 		}
 	}
+	if old != nil && s.reuseUnnamedParse(old, m) {
+		s.w.parseComplete()
+		return nil
+	}
 	charge := preparedInputCharge(m.name, m.query, len(m.paramOIDs))
 	retained := s.statementBytes + charge
 	if old != nil {
@@ -239,6 +244,32 @@ func (s *session) handleParse() error {
 	s.statementBytes = retained
 	s.w.parseComplete()
 	return nil
+}
+
+// reuseUnnamedParse keeps the still-live runtime when a client repeats the
+// exact unnamed Parse contract. The old statement is available here because
+// replacement is transactional: handleParse does not close it until a new
+// prepare succeeds. Reusing it avoids protocol classification, parameter
+// rewriting, semantic compilation, and RowDescription construction.
+func (s *session) reuseUnnamedParse(old *prepared, m *frontendMessage) bool {
+	if old == nil || m == nil || m.name != "" || old.name != "" ||
+		old.runtime == nil || old.sql != m.query ||
+		!slices.Equal(old.paramOIDs, m.paramOIDs) {
+		return false
+	}
+	if s.cancelCheck != nil && s.cancelCheck() != nil {
+		return false
+	}
+	reuser, ok := old.runtime.(BackendStatementParseReuser)
+	if !ok || !reuser.ReusableForParse() {
+		return false
+	}
+	// Parse replacement destroys every portal derived from the prior unnamed
+	// statement even though its immutable plan can stay live.
+	s.closePortalsOf(old)
+	s.statementBindBytes -= old.bindBytes
+	old.bindBytes = 0
+	return true
 }
 
 const (

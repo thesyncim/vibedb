@@ -76,7 +76,7 @@ func TestClusterMultiShardSameShardInsertAccepted(t *testing.T) {
 
 // TestClusterMultiShardCrossShardInsertRejectedBeforeExecution proves a multi-row
 // insert whose rows route to different shards is refused with ErrCrossShardWrite
-// and that no row is written: the preflight completes before any participant, so
+// and that no row is written: the preflight completes before any target, so
 // the batch never partially dispatches.
 func TestClusterMultiShardCrossShardInsertRejectedBeforeExecution(t *testing.T) {
 	db, _, diff := openTwoShardDocs(t)

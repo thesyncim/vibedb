@@ -45,16 +45,16 @@ func TestDurableSQLGatewaySharedTypedLedgerRecoversLostTerminalAndAck(t *testing
 		head: terminalLedger.head, terminal: terminal.Terminal,
 		faultAck: true, faultGC: true,
 	}
-	participants := durableFaultParticipants(t)
+	targets := durableFaultTargets(t)
 	serviceA, err := newDurableRequestService(
-		durableFaultTopology(t, participants), shared,
+		durableFaultTopology(t, targets), shared,
 		typedServiceRunnerStop{}, new(typedServicePinStop),
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	serviceB, err := newDurableRequestService(
-		durableFaultTopology(t, participants), shared,
+		durableFaultTopology(t, targets), shared,
 		typedServiceRunnerStop{}, new(typedServicePinStop),
 	)
 	if err != nil {

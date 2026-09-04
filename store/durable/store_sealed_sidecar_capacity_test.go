@@ -130,7 +130,7 @@ func TestSealedTxnLogRetainsDischargedWindowUntilPressureRecycle(t *testing.T) {
 	}
 	var storeID, journalID [16]byte
 	storeID[0], journalID[0] = 1, 2
-	if _, err := log.marker.AppendDecision(1, []storeio.TxnParticipant{{
+	if _, err := log.marker.AppendDecision(1, []storeio.TxnCollectionRef{{
 		StoreID: storeID, JournalID: journalID, PreparedGeneration: 2,
 	}}); err != nil {
 		t.Fatal(err)

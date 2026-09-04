@@ -79,10 +79,10 @@ func transactionCodecControl(t testing.TB) TransactionControl {
 		t.Fatal(err)
 	}
 	return TransactionControl{
-		ID: transactionCodecID(1), Role: distributedtxn.ReplicatedRoleParticipant,
-		State: uint8(distributedtxn.ParticipantPrepared), Revision: 2,
+		ID: transactionCodecID(1), Role: distributedtxn.ReplicatedRoleTarget,
+		State: uint8(distributedtxn.TargetPrepared), Revision: 2,
 		ControllerEpoch: 7, ExecutionPinDigest: transactionCodecDigest(19),
-		PayloadKind:   distributedtxn.ReplicatedPayloadParticipantStage,
+		PayloadKind:   distributedtxn.ReplicatedPayloadTargetStage,
 		PayloadDigest: transactionCodecDigest(20), PayloadBytes: 4096, PayloadCount: 1,
 		PayloadRelationCount:        1,
 		CoordinatorGroup:            transactionCodecReplicationID(30),
@@ -91,7 +91,7 @@ func transactionCodecControl(t testing.TB) TransactionControl {
 		MutationDigest:              transactionCodecDigest(70), BucketBits: 8, IntentScopes: scopes,
 		ResidentControlBytes: controlBytes, ResidentMutationBytes: mutationBytes,
 		ResidentIntentBytes:  intentBytes,
-		LastOperation:        distributedtxn.ReplicatedPrepareParticipant,
+		LastOperation:        distributedtxn.ReplicatedPrepareTarget,
 		LastExpectedRevision: 1, LastCommandDigest: transactionCodecCommandDigest(110),
 		LastResultCode: 1, LastAppliedIndex: 91,
 	}
@@ -113,10 +113,10 @@ func transactionCodecCoordinatorPayload(t testing.TB) (distributedtxn.ID, []byte
 	payload, err := distributedtxn.AppendCoordinator(nil, distributedtxn.CoordinatorRecord{
 		ID: id, State: distributedtxn.CoordinatorStaging, Revision: 1,
 		CatalogGeneration: 7, RecoveryDeadline: 99,
-		Participants: []distributedtxn.ParticipantRef{{
+		Targets: []distributedtxn.TransactionTargetRef{{
 			Distribution: []byte("dist"), Shard: []byte("shard-a"),
 			RoutingVersion: 9, AllocationGeneration: 10, OwnershipEpoch: 11,
-			MutationDigest: transactionCodecDigest(13), State: distributedtxn.ParticipantStaged,
+			MutationDigest: transactionCodecDigest(13), State: distributedtxn.TargetStaged,
 		}},
 	})
 	if err != nil {
@@ -140,10 +140,10 @@ func transactionCodecManifestSegment(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := builder.Append(distributedtxn.ParticipantRef{
+	if err := builder.Append(distributedtxn.TransactionTargetRef{
 		Distribution: []byte("dist"), Shard: []byte("shard-b"),
 		RoutingVersion: 12, AllocationGeneration: 13, OwnershipEpoch: 14,
-		MutationDigest: transactionCodecDigest(15), State: distributedtxn.ParticipantStaged,
+		MutationDigest: transactionCodecDigest(15), State: distributedtxn.TargetStaged,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -156,9 +156,9 @@ func transactionCodecManifestSegment(
 
 func TestTransactionSystemStorageKeysAreExactAndOrdered(t *testing.T) {
 	id := transactionCodecID(1)
-	control, err := TransactionControlStorageKey(distributedtxn.ReplicatedRoleParticipant, id)
+	control, err := TransactionControlStorageKey(distributedtxn.ReplicatedRoleTarget, id)
 	if err != nil || len(control) != transactionControlStorageKeyBytes ||
-		control[0] != transactionControlPrefix || control[1] != byte(distributedtxn.ReplicatedRoleParticipant) ||
+		control[0] != transactionControlPrefix || control[1] != byte(distributedtxn.ReplicatedRoleTarget) ||
 		!bytes.Equal(control[2:], id[:]) {
 		t.Fatalf("control key=%x err=%v", control, err)
 	}
@@ -233,13 +233,13 @@ func TestTransactionControlRoundTripRetryWitnessAndTombstone(t *testing.T) {
 	}
 
 	tombstone := control
-	tombstone.State = uint8(distributedtxn.ParticipantReleased)
+	tombstone.State = uint8(distributedtxn.TargetReleased)
 	tombstone.Revision = 4
 	tombstone.ResidentMutationBytes = 0
 	tombstone.ResidentIntentBytes = 0
 	tombstone.AffectedRowsValid = true
 	tombstone.AffectedRows = 7
-	tombstone.LastOperation = distributedtxn.ReplicatedReleaseParticipant
+	tombstone.LastOperation = distributedtxn.ReplicatedReleaseTarget
 	tombstone.LastExpectedRevision = 3
 	tombstone.LastCommandDigest = transactionCodecCommandDigest(120)
 	tombstone.LastAppliedIndex = 101
@@ -259,7 +259,7 @@ func TestTransactionControlRoundTripRetryWitnessAndTombstone(t *testing.T) {
 func TestTransactionControlFusedPathBitIsDurableAndOperationBound(t *testing.T) {
 	fused := transactionCodecControl(t)
 	fused.FusedPath = true
-	fused.LastOperation = distributedtxn.ReplicatedStagePrepareParticipant
+	fused.LastOperation = distributedtxn.ReplicatedStagePrepareTarget
 	fused.LastExpectedRevision = 0
 	fused.PrepareResultCode = ResultApplied
 	fused.PrepareCommandDigest = fused.LastCommandDigest
@@ -269,12 +269,12 @@ func TestTransactionControlFusedPathBitIsDurableAndOperationBound(t *testing.T) 
 	}
 	opened, err := OpenTransactionControl(encoded)
 	if err != nil || !opened.FusedPath ||
-		opened.LastOperation != distributedtxn.ReplicatedStagePrepareParticipant {
+		opened.LastOperation != distributedtxn.ReplicatedStagePrepareTarget {
 		t.Fatalf("fused control = %+v err=%v", opened.TransactionControl, err)
 	}
 
 	legacyOperation := fused
-	legacyOperation.LastOperation = distributedtxn.ReplicatedPrepareParticipant
+	legacyOperation.LastOperation = distributedtxn.ReplicatedPrepareTarget
 	if _, err := AppendTransactionControl(nil, legacyOperation); err == nil {
 		t.Fatal("fused control accepted a legacy prepare witness")
 	}
@@ -313,18 +313,18 @@ func TestTransactionControlCancellationWitnessIsExplicitCompactAndOrdinalBound(t
 	controlBytes, _ := TransactionControlResidentBytes(0)
 	mutationDigest := transactionCodecDigest(91)
 	control := TransactionControl{
-		ID: transactionCodecID(92), Role: distributedtxn.ReplicatedRoleParticipant,
-		State: uint8(distributedtxn.ParticipantReleased), Revision: 1,
-		PayloadKind:                 distributedtxn.ReplicatedPayloadParticipantStage,
+		ID: transactionCodecID(92), Role: distributedtxn.ReplicatedRoleTarget,
+		State: uint8(distributedtxn.TargetReleased), Revision: 1,
+		PayloadKind:                 distributedtxn.ReplicatedPayloadTargetStage,
 		PayloadDigest:               mutationDigest,
 		CoordinatorGroup:            transactionCodecReplicationID(93),
 		CoordinatorShardIncarnation: transactionCodecReplicationID(94),
 		CoordinatorAllocation:       95,
 		MutationDigest:              mutationDigest,
-		ParticipantOrdinal:          4096,
+		TargetOrdinal:               4096,
 		FusedPath:                   true, CancellationWitness: true,
 		ResidentControlBytes: controlBytes,
-		LastOperation:        distributedtxn.ReplicatedAbortReleaseParticipant,
+		LastOperation:        distributedtxn.ReplicatedAbortReleaseTarget,
 		LastExpectedRevision: 0,
 		LastCommandDigest:    transactionCodecCommandDigest(96),
 		LastResultCode:       ResultApplied,
@@ -339,7 +339,7 @@ func TestTransactionControlCancellationWitnessIsExplicitCompactAndOrdinalBound(t
 		t.Fatalf("cancellation witness bytes=%d", len(encoded))
 	}
 	opened, err := OpenTransactionControl(encoded)
-	if err != nil || !opened.CancellationWitness || opened.ParticipantOrdinal != 4096 ||
+	if err != nil || !opened.CancellationWitness || opened.TargetOrdinal != 4096 ||
 		opened.PrepareResultCode != 0 || opened.PayloadBytes != 0 || opened.PayloadCount != 0 {
 		t.Fatalf("cancellation witness=%+v err=%v", opened.TransactionControl, err)
 	}
@@ -357,14 +357,14 @@ func TestTransactionControlCancellationWitnessIsExplicitCompactAndOrdinalBound(t
 	}
 	indexConflict := control
 	indexConflict.CancellationWitness = false
-	indexConflict.ParticipantOrdinal = 0
+	indexConflict.TargetOrdinal = 0
 	indexConflict.Revision = 3
 	indexConflict.PayloadBytes = 1
 	indexConflict.PayloadCount = 1
 	indexConflict.PayloadRelationCount = 1
 	indexConflict.PrepareResultCode = ResultIndexConflict
 	indexConflict.PrepareCommandDigest = transactionCodecCommandDigest(98)
-	indexConflict.LastOperation = distributedtxn.ReplicatedStagePrepareParticipant
+	indexConflict.LastOperation = distributedtxn.ReplicatedStagePrepareTarget
 	indexConflict.LastCommandDigest = indexConflict.PrepareCommandDigest
 	indexConflict.LastResultCode = ResultIndexConflict
 	if _, err := AppendTransactionControl(nil, indexConflict); err != nil {
@@ -391,7 +391,7 @@ func TestTransactionManifestControlRoundTripIncrementalSealWitness(t *testing.T)
 		State: uint8(distributedtxn.CoordinatorStaging), Revision: 2,
 		PayloadKind:   distributedtxn.ReplicatedPayloadManifestCoordinator,
 		PayloadDigest: transactionCodecDigest(31),
-		PayloadBytes:  descriptor.EncodedBytes, PayloadCount: descriptor.ParticipantCount,
+		PayloadBytes:  descriptor.EncodedBytes, PayloadCount: descriptor.TargetCount,
 		CoordinatorGroup:            transactionCodecReplicationID(32),
 		CoordinatorShardIncarnation: transactionCodecReplicationID(48),
 		CoordinatorAllocation:       64,
@@ -405,7 +405,7 @@ func TestTransactionManifestControlRoundTripIncrementalSealWitness(t *testing.T)
 		LastResultCode:              1,
 		LastAppliedIndex:            12,
 		ManifestNextPage:            segment.Index + 1,
-		ManifestNextParticipant:     segment.FirstParticipant + uint64(segment.ParticipantCount),
+		ManifestNextTarget:          segment.FirstTarget + uint64(segment.TargetCount),
 		ManifestEncodedBytes:        uint64(len(segment.Raw)),
 		ManifestChainDigest: advanceTransactionManifestChain(
 			distributedtxn.Digest{}, segment.Index, segment.Digest,
@@ -413,7 +413,7 @@ func TestTransactionManifestControlRoundTripIncrementalSealWitness(t *testing.T)
 	}
 	if got := finishTransactionManifestRoot(
 		control.ManifestChainDigest,
-		control.ManifestNextParticipant,
+		control.ManifestNextTarget,
 		control.ManifestEncodedBytes,
 		control.ManifestNextPage,
 	); got != descriptor.Root {
@@ -426,7 +426,7 @@ func TestTransactionManifestControlRoundTripIncrementalSealWitness(t *testing.T)
 	}
 	view, err := OpenTransactionControlInto(encoded, nil)
 	if err != nil || view.ManifestNextPage != control.ManifestNextPage ||
-		view.ManifestNextParticipant != control.ManifestNextParticipant ||
+		view.ManifestNextTarget != control.ManifestNextTarget ||
 		view.ManifestEncodedBytes != control.ManifestEncodedBytes ||
 		view.ManifestChainDigest != control.ManifestChainDigest {
 		t.Fatalf("manifest control=%+v err=%v", view.TransactionControl, err)
@@ -442,7 +442,7 @@ func TestTransactionManifestControlRoundTripIncrementalSealWitness(t *testing.T)
 			candidate.ManifestNextPage = uint32(candidate.PayloadCount + 1)
 		},
 		"participant beyond descriptor": func(candidate *TransactionControl) {
-			candidate.ManifestNextParticipant = candidate.PayloadCount + 1
+			candidate.ManifestNextTarget = candidate.PayloadCount + 1
 		},
 		"bytes beyond descriptor": func(candidate *TransactionControl) {
 			candidate.ManifestEncodedBytes = candidate.PayloadBytes + 1
@@ -459,7 +459,7 @@ func TestTransactionManifestControlRoundTripIncrementalSealWitness(t *testing.T)
 
 	inline := transactionCodecControl(t)
 	inline.ManifestNextPage = 1
-	inline.ManifestNextParticipant = 1
+	inline.ManifestNextTarget = 1
 	inline.ManifestEncodedBytes = 1
 	inline.ManifestChainDigest = transactionCodecDigest(130)
 	if _, err := AppendTransactionControl(nil, inline); err == nil {
@@ -475,7 +475,7 @@ func TestTransactionCoordinatorDecisionSurvivesRetiredTombstone(t *testing.T) {
 		State: uint8(distributedtxn.CoordinatorRetired), Revision: 3,
 		PayloadKind:   distributedtxn.ReplicatedPayloadManifestCoordinator,
 		PayloadDigest: transactionCodecDigest(34), PayloadBytes: descriptor.EncodedBytes,
-		PayloadCount:                descriptor.ParticipantCount,
+		PayloadCount:                descriptor.TargetCount,
 		CoordinatorGroup:            transactionCodecReplicationID(35),
 		CoordinatorShardIncarnation: transactionCodecReplicationID(51),
 		CoordinatorAllocation:       67,
@@ -490,7 +490,7 @@ func TestTransactionCoordinatorDecisionSurvivesRetiredTombstone(t *testing.T) {
 		LastResultCode:              1,
 		LastAppliedIndex:            101,
 		ManifestNextPage:            segment.Index + 1,
-		ManifestNextParticipant:     descriptor.ParticipantCount,
+		ManifestNextTarget:          descriptor.TargetCount,
 		ManifestEncodedBytes:        descriptor.EncodedBytes,
 		ManifestChainDigest: advanceTransactionManifestChain(
 			distributedtxn.Digest{}, segment.Index, segment.Digest,
@@ -590,12 +590,12 @@ func TestTransactionManifestPageRoundTripScratchAndRetryIdentity(t *testing.T) {
 	if uint64(len(encoded)+transactionManifestKeyBytes) != resident {
 		t.Fatalf("page resident=%d want=%d", len(encoded)+transactionManifestKeyBytes, resident)
 	}
-	participants := make([]distributedtxn.ParticipantRef, distributedtxn.MaxManifestPageParticipants)
-	identities := make([]byte, distributedtxn.MaxManifestPageParticipants*distributedtxn.MaxShardIdentityBytes*2)
-	view, err := OpenTransactionManifestPageInto(encoded, participants, identities)
+	targets := make([]distributedtxn.TransactionTargetRef, distributedtxn.MaxManifestPageTargets)
+	identities := make([]byte, distributedtxn.MaxManifestPageTargets*distributedtxn.MaxShardIdentityBytes*2)
+	view, err := OpenTransactionManifestPageInto(encoded, targets, identities)
 	if err != nil || view.ID != id || view.Index != segment.Index ||
-		view.FirstParticipant != segment.FirstParticipant ||
-		view.ParticipantCount != segment.ParticipantCount || view.Digest != segment.Digest ||
+		view.FirstTarget != segment.FirstTarget ||
+		view.TargetCount != segment.TargetCount || view.Digest != segment.Digest ||
 		!bytes.Equal(view.Raw, segment.Raw) || cap(view.Raw) != len(view.Raw) {
 		t.Fatalf("manifest page=%+v err=%v", view, err)
 	}
@@ -605,8 +605,8 @@ func TestTransactionManifestPageRoundTripScratchAndRetryIdentity(t *testing.T) {
 		t.Fatalf("manifest key=%x want=%x err=%v", key, wantKey, err)
 	}
 	reencoded, err := AppendTransactionManifestPage(nil, id, distributedtxn.ManifestSegment{
-		Index: segment.Index, FirstParticipant: segment.FirstParticipant,
-		ParticipantCount: segment.ParticipantCount, Digest: segment.Digest, Raw: view.Raw,
+		Index: segment.Index, FirstTarget: segment.FirstTarget,
+		TargetCount: segment.TargetCount, Digest: segment.Digest, Raw: view.Raw,
 	})
 	if err != nil || !bytes.Equal(reencoded, encoded) {
 		t.Fatalf("manifest reencode equal=%t err=%v", bytes.Equal(reencoded, encoded), err)
@@ -708,8 +708,8 @@ func TestTransactionSystemRowsRejectCorruptionReservedAndExhaustion(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	participants := make([]distributedtxn.ParticipantRef, distributedtxn.MaxManifestPageParticipants)
-	identities := make([]byte, distributedtxn.MaxManifestPageParticipants*distributedtxn.MaxShardIdentityBytes*2)
+	targets := make([]distributedtxn.TransactionTargetRef, distributedtxn.MaxManifestPageTargets)
+	identities := make([]byte, distributedtxn.MaxManifestPageTargets*distributedtxn.MaxShardIdentityBytes*2)
 	for _, test := range []struct {
 		name     string
 		row      []byte
@@ -723,7 +723,7 @@ func TestTransactionSystemRowsRejectCorruptionReservedAndExhaustion(t *testing.T
 		}},
 		{"payload", payloadRow, 72, func(raw []byte) error { _, err := OpenTransactionCoordinatorPayload(raw); return err }},
 		{"manifest", manifest, 88, func(raw []byte) error {
-			_, err := OpenTransactionManifestPageInto(raw, participants, identities)
+			_, err := OpenTransactionManifestPageInto(raw, targets, identities)
 			return err
 		}},
 		{"mutation", mutation, 120, func(raw []byte) error { _, err := OpenTransactionNativeMutation(raw); return err }},
@@ -785,8 +785,8 @@ func TestTransactionSystemRowsWarmPathsAllocateNothing(t *testing.T) {
 		t.Fatal(err)
 	}
 	pageScratch := make([]byte, 0, len(pageEncoded))
-	participants := make([]distributedtxn.ParticipantRef, distributedtxn.MaxManifestPageParticipants)
-	identities := make([]byte, distributedtxn.MaxManifestPageParticipants*distributedtxn.MaxShardIdentityBytes*2)
+	targets := make([]distributedtxn.TransactionTargetRef, distributedtxn.MaxManifestPageTargets)
+	identities := make([]byte, distributedtxn.MaxManifestPageTargets*distributedtxn.MaxShardIdentityBytes*2)
 
 	mutation := transactionCodecMutation()
 	mutationEncoded, err := AppendTransactionNativeMutation(nil, id, 1, 0, mutation)
@@ -831,7 +831,7 @@ func TestTransactionSystemRowsWarmPathsAllocateNothing(t *testing.T) {
 		if err != nil {
 			panic(err)
 		}
-		transactionCodecPageSink, err = OpenTransactionManifestPageInto(pageEncoded, participants, identities)
+		transactionCodecPageSink, err = OpenTransactionManifestPageInto(pageEncoded, targets, identities)
 		if err != nil {
 			panic(err)
 		}
@@ -894,15 +894,15 @@ func FuzzTransactionSystemRowsCanonical(f *testing.F) {
 			}
 			rebuilt, err = AppendTransactionCoordinatorPayload(nil, view.ID, view.Kind, view.Payload)
 		case 2:
-			participants := make([]distributedtxn.ParticipantRef, distributedtxn.MaxManifestPageParticipants)
-			identities := make([]byte, distributedtxn.MaxManifestPageParticipants*distributedtxn.MaxShardIdentityBytes*2)
-			view, openErr := OpenTransactionManifestPageInto(row, participants, identities)
+			targets := make([]distributedtxn.TransactionTargetRef, distributedtxn.MaxManifestPageTargets)
+			identities := make([]byte, distributedtxn.MaxManifestPageTargets*distributedtxn.MaxShardIdentityBytes*2)
+			view, openErr := OpenTransactionManifestPageInto(row, targets, identities)
 			if openErr != nil {
 				return
 			}
 			rebuilt, err = AppendTransactionManifestPage(nil, view.ID, distributedtxn.ManifestSegment{
-				Index: view.Index, FirstParticipant: view.FirstParticipant,
-				ParticipantCount: view.ParticipantCount, Digest: view.Digest, Raw: view.Raw,
+				Index: view.Index, FirstTarget: view.FirstTarget,
+				TargetCount: view.TargetCount, Digest: view.Digest, Raw: view.Raw,
 			})
 		case 3:
 			view, openErr := OpenTransactionNativeMutation(row)

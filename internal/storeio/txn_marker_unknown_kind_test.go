@@ -8,11 +8,11 @@ import (
 )
 
 func TestOpenTxnMarkerRejectsAuthenticatedUnknownKinds(t *testing.T) {
-	participants := testTxnParticipants(2)
-	decision := wireEdgeTxnDecisionWithSequence(t, 1, 1, participants)
+	targets := testTxnCollectionRefs(2)
+	decision := wireEdgeTxnDecisionWithSequence(t, 1, 1, targets)
 	binary.LittleEndian.PutUint16(decision[4:6], 0x7fff)
 	wireEdgeSealTxnMarkerRecord(
-		decision, TxnMarkerRecordPrefixSize+len(participants)*TxnParticipantSize,
+		decision, TxnMarkerRecordPrefixSize+len(targets)*TxnCollectionRefSize,
 	)
 
 	retirementSize, ok := checkedTxnRetirementPaddedSize()
@@ -21,7 +21,7 @@ func TestOpenTxnMarkerRejectsAuthenticatedUnknownKinds(t *testing.T) {
 	}
 	retirement := make([]byte, retirementSize)
 	if _, err := encodeTxnRetirementRecord(
-		retirement, 1, participants[0].StoreID,
+		retirement, 1, targets[0].StoreID,
 	); err != nil {
 		t.Fatalf("encodeTxnRetirementRecord: %v", err)
 	}
@@ -67,14 +67,14 @@ func TestOpenTxnMarkerRejectsAuthenticatedUnknownKinds(t *testing.T) {
 }
 
 func TestTxnMarkerAuthenticatedKnownKindLayoutMismatchIsHard(t *testing.T) {
-	participants := testTxnParticipants(2)
-	decisionAsRetirement := wireEdgeTxnDecisionWithSequence(t, 1, 1, participants)
+	targets := testTxnCollectionRefs(2)
+	decisionAsRetirement := wireEdgeTxnDecisionWithSequence(t, 1, 1, targets)
 	binary.LittleEndian.PutUint16(
 		decisionAsRetirement[4:6], TxnMarkerRecordKindRetirement,
 	)
 	wireEdgeSealTxnMarkerRecord(
 		decisionAsRetirement,
-		TxnMarkerRecordPrefixSize+len(participants)*TxnParticipantSize,
+		TxnMarkerRecordPrefixSize+len(targets)*TxnCollectionRefSize,
 	)
 
 	retirementSize, ok := checkedTxnRetirementPaddedSize()
@@ -83,7 +83,7 @@ func TestTxnMarkerAuthenticatedKnownKindLayoutMismatchIsHard(t *testing.T) {
 	}
 	retirementAsDecision := make([]byte, retirementSize)
 	if _, err := encodeTxnRetirementRecord(
-		retirementAsDecision, 1, participants[0].StoreID,
+		retirementAsDecision, 1, targets[0].StoreID,
 	); err != nil {
 		t.Fatalf("encodeTxnRetirementRecord: %v", err)
 	}
@@ -108,8 +108,8 @@ func TestTxnMarkerAuthenticatedKnownKindLayoutMismatchIsHard(t *testing.T) {
 }
 
 func TestTxnMarkerOversizedAuthenticatedDecisionLayoutCannotTruncate(t *testing.T) {
-	const participantCount = TxnMarkerMaxParticipants + 1
-	bodyEnd := TxnMarkerRecordPrefixSize + participantCount*TxnParticipantSize
+	const targetCount = TxnMarkerMaxCollections + 1
+	bodyEnd := TxnMarkerRecordPrefixSize + targetCount*TxnCollectionRefSize
 	record := make([]byte, bodyEnd+TxnMarkerRecordTrailerSize)
 	binary.LittleEndian.PutUint32(record[0:4], txnMarkerRecordMagic)
 	// A retirement kind over a decision-shaped authenticated body exercises the
@@ -118,7 +118,7 @@ func TestTxnMarkerOversizedAuthenticatedDecisionLayoutCannotTruncate(t *testing.
 	binary.LittleEndian.PutUint16(record[4:6], TxnMarkerRecordKindRetirement)
 	binary.LittleEndian.PutUint64(record[8:16], 1)
 	binary.LittleEndian.PutUint64(record[16:24], 1)
-	binary.LittleEndian.PutUint32(record[24:28], participantCount)
+	binary.LittleEndian.PutUint32(record[24:28], targetCount)
 	wireEdgeSealTxnMarkerRecord(record, bodyEnd)
 	if _, _, err := decodeTxnMarkerRecord(
 		record, 1,

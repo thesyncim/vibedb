@@ -99,12 +99,12 @@ func (j *Journal) compactedBytesLocked() (uint64, bool) {
 			}
 		}
 	}
-	for _, record := range j.participants {
+	for _, record := range j.targets {
 		if record == nil || !add(len(record.stage)) {
 			return total, false
 		}
-		if record.status.ParticipantState == ParticipantAborted ||
-			record.status.ParticipantState == ParticipantReleased {
+		if record.status.TargetState == TargetAborted ||
+			record.status.TargetState == TargetReleased {
 			continue
 		}
 		transitions := int(record.status.Revision) - 1
@@ -120,7 +120,7 @@ func (j *Journal) compactedBytesLocked() (uint64, bool) {
 // Compact rewrites the journal's current authoritative state into one
 // canonical generation and atomically installs it at the original path.
 //
-// Active coordinator manifests and participant mutation stages remain intact:
+// Active coordinator manifests and target mutation stages remain intact:
 // recovery still needs them. Retired coordinator manifests and superseded
 // transition entries do not. Terminal records retain their byte-exact stage in
 // one compact entry, preserving delayed retry and lookup semantics without an
@@ -214,17 +214,17 @@ func (j *Journal) writeCompactedLocked(file *os.File) (uint64, error) {
 		coordinatorIDs = append(coordinatorIDs, id)
 	}
 	slices.SortFunc(coordinatorIDs, compareJournalID)
-	participantIDs := make([]ID, 0, len(j.participants))
-	for id := range j.participants {
-		participantIDs = append(participantIDs, id)
+	targetIDs := make([]ID, 0, len(j.targets))
+	for id := range j.targets {
+		targetIDs = append(targetIDs, id)
 	}
-	slices.SortFunc(participantIDs, compareJournalID)
+	slices.SortFunc(targetIDs, compareJournalID)
 
 	var retained uint64
 	write := func(kind journalEntryKind, state byte, revision uint64, id ID, payload []byte) error {
 		entryBytes := journalEncodedEntryBytes(len(payload))
 		if retained > MaxRetainedJournalBytes || entryBytes > MaxRetainedJournalBytes-retained ||
-			uint64(len(payload)) > MaxParticipantRecordBytes {
+			uint64(len(payload)) > MaxTargetRecordBytes {
 			return ErrTooLarge
 		}
 		entry := make([]byte, int(entryBytes))
@@ -305,14 +305,14 @@ func (j *Journal) writeCompactedLocked(file *os.File) (uint64, error) {
 		}
 	}
 
-	for _, id := range participantIDs {
-		record := j.participants[id]
+	for _, id := range targetIDs {
+		record := j.targets[id]
 		if record == nil {
 			return 0, ErrCorrupt
 		}
-		state := record.status.ParticipantState
-		if state == ParticipantAborted || state == ParticipantReleased {
-			if err := write(journalCompactedParticipant, byte(state), record.status.Revision, id, record.stage); err != nil {
+		state := record.status.TargetState
+		if state == TargetAborted || state == TargetReleased {
+			if err := write(journalCompactedTarget, byte(state), record.status.Revision, id, record.stage); err != nil {
 				return 0, err
 			}
 			continue
@@ -320,16 +320,16 @@ func (j *Journal) writeCompactedLocked(file *os.File) (uint64, error) {
 		if len(record.stage) == 0 || record.status.Revision != uint64(state) {
 			return 0, ErrCorrupt
 		}
-		if err := write(journalParticipantStage, byte(ParticipantStaged), 1, id, record.stage); err != nil {
+		if err := write(journalTargetStage, byte(TargetStaged), 1, id, record.stage); err != nil {
 			return 0, err
 		}
-		if state >= ParticipantPrepared {
-			if err := write(journalParticipantTransition, byte(ParticipantPrepared), 2, id, nil); err != nil {
+		if state >= TargetPrepared {
+			if err := write(journalTargetTransition, byte(TargetPrepared), 2, id, nil); err != nil {
 				return 0, err
 			}
 		}
-		if state == ParticipantApplied {
-			if err := write(journalParticipantTransition, byte(ParticipantApplied), 3, id, nil); err != nil {
+		if state == TargetApplied {
+			if err := write(journalTargetTransition, byte(TargetApplied), 3, id, nil); err != nil {
 				return 0, err
 			}
 		}

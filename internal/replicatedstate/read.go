@@ -799,7 +799,7 @@ func (m *Machine) appendSessionCompletion(
 }
 
 // ReadSnapshot pins every dense relation, hidden state, and reserved
-// transition-capture participant at one publication cut.
+// transition-capture target at one publication cut.
 type ReadSnapshot struct {
 	cut              durable.DatabaseSnapshot
 	publication      raftmodel.Publication
@@ -957,7 +957,7 @@ func (s *ReadSnapshot) Close() error {
 }
 
 // Snapshot captures every dense relation, hidden system state, and the
-// private transition-capture participant under the Machine publication lock.
+// private transition-capture target under the Machine publication lock.
 // names may be empty or contain exactly the sole user name; system and capture
 // are automatic, and capture remains inaccessible through ReadSnapshot.Collection.
 func (m *Machine) Snapshot(names ...string) (*ReadSnapshot, error) {

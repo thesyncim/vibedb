@@ -91,7 +91,7 @@ type ReplicatedTransactionReadKind uint8
 
 const (
 	ReplicatedTransactionLookupCoordinator ReplicatedTransactionReadKind = iota + 1
-	ReplicatedTransactionLookupParticipant
+	ReplicatedTransactionLookupTarget
 	ReplicatedTransactionReadManifestPage
 	ReplicatedTransactionScanCoordinators
 )

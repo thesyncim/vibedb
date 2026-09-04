@@ -26,10 +26,10 @@ func TestJournalCompactReclaimsRetiredManifestAndReopensExact(t *testing.T) {
 	if _, err = j.StageManifestCoordinator(coordinatorRaw); err != nil {
 		t.Fatal(err)
 	}
-	participants := make([]ParticipantRef, MaxManifestPageParticipants)
-	identities := make([]byte, MaxManifestPageParticipants*MaxShardIdentityBytes*2)
+	targets := make([]TransactionTargetRef, MaxManifestPageTargets)
+	identities := make([]byte, MaxManifestPageTargets*MaxShardIdentityBytes*2)
 	for _, page := range pages {
-		if _, err = j.StageManifestSegment(coordinatorID, page, participants, identities); err != nil {
+		if _, err = j.StageManifestSegment(coordinatorID, page, targets, identities); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -41,20 +41,20 @@ func TestJournalCompactReclaimsRetiredManifestAndReopensExact(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	participantID := journalID(191)
-	participantRaw := journalParticipant(t, participantID, bytes.Repeat([]byte("m"), 8<<10))
-	if _, err = j.StageParticipant(participantRaw); err != nil {
+	targetID := journalID(191)
+	targetRaw := journalTarget(t, targetID, bytes.Repeat([]byte("m"), 8<<10))
+	if _, err = j.StageTarget(targetRaw); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = j.TransitionParticipant(participantID, 1, ParticipantAborted); err != nil {
+	if _, err = j.TransitionTarget(targetID, 1, TargetAborted); err != nil {
 		t.Fatal(err)
 	}
-	released, err := j.TransitionParticipant(participantID, 2, ParticipantReleased)
+	released, err := j.TransitionTarget(targetID, 2, TargetReleased)
 	if err != nil {
 		t.Fatal(err)
 	}
 	fenceID := journalID(211)
-	fenced, err := j.AbortParticipant(fenceID, 1)
+	fenced, err := j.AbortTarget(fenceID, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,16 +92,16 @@ func TestJournalCompactReclaimsRetiredManifestAndReopensExact(t *testing.T) {
 	if got, err := j.StageManifestCoordinator(coordinatorRaw); err != nil || got != retired {
 		t.Fatalf("retired coordinator retry = %+v, %v", got, err)
 	}
-	if got, err := j.StageParticipant(participantRaw); err != nil || got != released {
+	if got, err := j.StageTarget(targetRaw); err != nil || got != released {
 		t.Fatalf("released participant retry = %+v, %v", got, err)
 	}
-	if got, err := j.ParticipantStage(participantID); err != nil || !bytes.Equal(got, participantRaw) {
+	if got, err := j.TransactionTargetStage(targetID); err != nil || !bytes.Equal(got, targetRaw) {
 		t.Fatalf("terminal participant stage len=%d err=%v", len(got), err)
 	}
-	if got, err := j.ParticipantStage(fenceID); err != nil || got != nil {
+	if got, err := j.TransactionTargetStage(fenceID); err != nil || got != nil {
 		t.Fatalf("fence stage = %x, %v", got, err)
 	}
-	if _, err = j.ManifestPage(coordinatorID, 0, participants, identities); !errors.Is(err, ErrJournalNotFound) {
+	if _, err = j.ManifestPage(coordinatorID, 0, targets, identities); !errors.Is(err, ErrJournalNotFound) {
 		t.Fatalf("retired manifest page = %v", err)
 	}
 	firstSize := after.Size()
@@ -130,13 +130,13 @@ func TestJournalCompactReclaimsRetiredManifestAndReopensExact(t *testing.T) {
 	if got, ok := j.CoordinatorStatus(coordinatorID); !ok || got != retired {
 		t.Fatalf("reopened coordinator = %+v,%v", got, ok)
 	}
-	if got, ok := j.ParticipantStatus(participantID); !ok || got != released {
+	if got, ok := j.TargetStatus(targetID); !ok || got != released {
 		t.Fatalf("reopened participant = %+v,%v", got, ok)
 	}
-	if got, ok := j.ParticipantStatus(fenceID); !ok || got != fenced {
+	if got, ok := j.TargetStatus(fenceID); !ok || got != fenced {
 		t.Fatalf("reopened fence = %+v,%v", got, ok)
 	}
-	if got, err := j.ParticipantStage(participantID); err != nil || !bytes.Equal(got, participantRaw) {
+	if got, err := j.TransactionTargetStage(targetID); err != nil || !bytes.Equal(got, targetRaw) {
 		t.Fatalf("reopened participant stage len=%d err=%v", len(got), err)
 	}
 	if got, err := j.ManifestCoordinator(coordinatorID); err != nil || got.Manifest != descriptor {
@@ -155,8 +155,8 @@ func TestJournalCompactPreservesActiveManifestContinuation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	participants := make([]ParticipantRef, MaxManifestPageParticipants)
-	identities := make([]byte, MaxManifestPageParticipants*MaxShardIdentityBytes*2)
+	targets := make([]TransactionTargetRef, MaxManifestPageTargets)
+	identities := make([]byte, MaxManifestPageTargets*MaxShardIdentityBytes*2)
 	j, err := OpenJournal(path)
 	if err != nil {
 		t.Fatal(err)
@@ -164,7 +164,7 @@ func TestJournalCompactPreservesActiveManifestContinuation(t *testing.T) {
 	if _, err = j.StageManifestCoordinator(raw); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = j.StageManifestSegment(id, pages[0], participants, identities); err != nil {
+	if _, err = j.StageManifestSegment(id, pages[0], targets, identities); err != nil {
 		t.Fatal(err)
 	}
 	if err = j.Compact(); err != nil {
@@ -179,7 +179,7 @@ func TestJournalCompactPreservesActiveManifestContinuation(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, page := range pages[1:] {
-		if _, err = j.StageManifestSegment(id, page, participants, identities); err != nil {
+		if _, err = j.StageManifestSegment(id, page, targets, identities); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -207,11 +207,11 @@ func TestJournalCompactPreservesActiveManifestContinuation(t *testing.T) {
 		t.Fatal(err)
 	}
 	for index := uint32(0); index < descriptor.SegmentCount; index++ {
-		page, pageErr := j.ManifestPage(id, index, participants, identities)
+		page, pageErr := j.ManifestPage(id, index, targets, identities)
 		if pageErr != nil {
 			t.Fatal(pageErr)
 		}
-		if _, pageErr = reader.OpenNext(page.Segment.Raw, participants, identities); pageErr != nil {
+		if _, pageErr = reader.OpenNext(page.Segment.Raw, targets, identities); pageErr != nil {
 			t.Fatal(pageErr)
 		}
 	}

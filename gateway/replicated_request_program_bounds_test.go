@@ -20,7 +20,7 @@ func TestDurableRequestProgramExactContinuationAndTerminalBounds(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			build := durableRequestProgramBuildFixture(t)
-			build.Participants = durableFaultParticipantsN(t, 1)
+			build.Targets = durableFaultTargetsN(t, 1)
 			program, err := BuildDurableRequestLogicalProgram(build)
 			if err != nil {
 				t.Fatal(err)
@@ -47,7 +47,7 @@ func TestDurableRequestProgramExactContinuationAndTerminalBounds(t *testing.T) {
 			}
 			progress := durableDistributedProgress{execution: DurableRequestTypedExecutionContext{
 				Recipe: DurableRequestRecipe{Identity: program.Identity, CatalogGeneration: build.CatalogGeneration,
-					ParticipantCount: program.Contract.ParticipantCount, Contract: program.Contract},
+					TargetCount: program.Contract.TargetCount, Contract: program.Contract},
 			}, state: durableDistributedState{branch: branch}}
 			result, err := progress.result()
 			if err != nil || len(result) != durableRequestResultHeaderBytes {

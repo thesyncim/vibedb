@@ -36,15 +36,15 @@ func TestTransactionStageFitsShippedSystemProfile(t *testing.T) {
 		})
 	}
 	id := transactionCodecID(221)
-	control := fusedParticipantControl(t, fixture, id,
-		distributedtxn.ReplicatedStagePrepareParticipant, 0, batches)
+	control := fusedTargetControl(t, fixture, id,
+		distributedtxn.ReplicatedStagePrepareTarget, 0, batches)
 	command := transactionCompletionCommand(t, fixture.binding, control, batches)
 	applyTransactionCommand(t, fixture.machine, 3, command)
 	if fixture.machine.state.TransactionIntentRows != 24 || fixture.machine.state.TransactionPayloadRows != 2 {
 		t.Fatalf("stage did not retain the full multi-relation image: %+v", fixture.machine.state)
 	}
 	finish := transactionCompletionCommand(t, fixture.binding,
-		fusedParticipantControl(t, fixture, id, distributedtxn.ReplicatedApplyReleaseParticipant, 2, nil), nil)
+		fusedTargetControl(t, fixture, id, distributedtxn.ReplicatedApplyReleaseTarget, 2, nil), nil)
 	applyTransactionCommand(t, fixture.machine, 4, finish)
 	if fixture.machine.state.TransactionIntentRows != 0 || fixture.machine.state.TransactionPayloadRows != 0 ||
 		fixture.base.Collection.Len() != 12 || fixture.global.Collection.Len() != 12 {
@@ -80,7 +80,7 @@ func TestTransactionPrepareReservesAtomicFinishCapacity(t *testing.T) {
 		})
 	}
 	id := transactionCodecID(222)
-	control := fusedParticipantControl(t, fixture, id, distributedtxn.ReplicatedStagePrepareParticipant, 0, batches)
+	control := fusedTargetControl(t, fixture, id, distributedtxn.ReplicatedStagePrepareTarget, 0, batches)
 	command := transactionCompletionCommand(t, fixture.binding, control, batches)
 	fixture.machine.options.TxnLimits.MaxDocuments = finishDocuments - 1
 	if err := fixture.machine.AdmitCommand(command); !errors.Is(err, ErrAdmissionBound) {
@@ -95,7 +95,7 @@ func TestTransactionPrepareReservesAtomicFinishCapacity(t *testing.T) {
 	}
 	applyTransactionCommand(t, fixture.machine, 3, command)
 	finish := transactionCompletionCommand(t, fixture.binding,
-		fusedParticipantControl(t, fixture, id, distributedtxn.ReplicatedApplyReleaseParticipant, 2, nil), nil)
+		fusedTargetControl(t, fixture, id, distributedtxn.ReplicatedApplyReleaseTarget, 2, nil), nil)
 	applyTransactionCommand(t, fixture.machine, 4, finish)
 	if fixture.machine.state.TransactionIntentRows != 0 || fixture.machine.state.TransactionPayloadRows != 0 ||
 		fixture.base.Collection.Len() != 32 || fixture.global.Collection.Len() != 32 {

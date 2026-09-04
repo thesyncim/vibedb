@@ -1075,7 +1075,7 @@ func TestReadCommittedUnrelatedCatalogChangeDoesNotInvalidateStatement(t *testin
 	}
 }
 
-func TestReadCommittedDirtyParticipantSurvivesUnrelatedDDL(t *testing.T) {
+func TestReadCommittedDirtyTargetSurvivesUnrelatedDDL(t *testing.T) {
 	db := openTestDB(t)
 	if _, err := db.Exec(`CREATE TABLE docs (id STRING PRIMARY KEY)`); err != nil {
 		t.Fatal(err)

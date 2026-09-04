@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-func manifestParticipant(index uint64) ParticipantRef {
+func manifestTarget(index uint64) TransactionTargetRef {
 	var shard [16]byte
 	const hex = "0123456789abcdef"
 	for i := range shard {
@@ -20,11 +20,11 @@ func manifestParticipant(index uint64) ParticipantRef {
 	for i := 8; i < len(digest); i++ {
 		digest[i] = byte(i)
 	}
-	return ParticipantRef{
+	return TransactionTargetRef{
 		Distribution: []byte("docs"), Shard: shard[:], RoutingVersion: 7,
 		AllocationGeneration: 11, OwnershipEpoch: 13,
 		AuthorityWitness: AuthorityWitness(digest[:16]),
-		MutationDigest:   digest, State: ParticipantStaged,
+		MutationDigest:   digest, State: TargetStaged,
 	}
 }
 
@@ -40,7 +40,7 @@ func buildManifest(t testing.TB, count uint64) (ManifestDescriptor, [][]byte) {
 		t.Fatal(err)
 	}
 	for i := uint64(0); i < count; i++ {
-		if err := builder.Append(manifestParticipant(i)); err != nil {
+		if err := builder.Append(manifestTarget(i)); err != nil {
 			t.Fatalf("Append %d: %v", i, err)
 		}
 	}
@@ -51,27 +51,27 @@ func buildManifest(t testing.TB, count uint64) (ManifestDescriptor, [][]byte) {
 	return descriptor, pages
 }
 
-func TestManifestRoundTripCanonicalAndMoreThan64Participants(t *testing.T) {
+func TestManifestRoundTripCanonicalAndMoreThan64Targets(t *testing.T) {
 	descriptor, pages := buildManifest(t, 4097)
-	if descriptor.ParticipantCount != 4097 || descriptor.SegmentCount <= 1 {
+	if descriptor.TargetCount != 4097 || descriptor.SegmentCount <= 1 {
 		t.Fatalf("descriptor = %+v", descriptor)
 	}
 	reader, err := NewManifestReader(descriptor)
 	if err != nil {
 		t.Fatal(err)
 	}
-	participantArena := make([]ParticipantRef, MaxManifestPageParticipants)
-	identityArena := make([]byte, MaxManifestPageParticipants*MaxShardIdentityBytes*2)
+	targetArena := make([]TransactionTargetRef, MaxManifestPageTargets)
+	identityArena := make([]byte, MaxManifestPageTargets*MaxShardIdentityBytes*2)
 	var seen uint64
 	for pageIndex, raw := range pages {
-		page, err := reader.OpenNext(raw, participantArena, identityArena)
+		page, err := reader.OpenNext(raw, targetArena, identityArena)
 		if err != nil {
 			t.Fatalf("page %d len=%d count=%d: %v", pageIndex, len(raw), binary.LittleEndian.Uint32(raw[12:16]), err)
 		}
-		for i := range page.Participants {
-			want := manifestParticipant(seen)
-			got := page.Participants[i]
-			if compareParticipantIdentity(got, want) != 0 || !equalParticipantRef(got, want) {
+		for i := range page.Targets {
+			want := manifestTarget(seen)
+			got := page.Targets[i]
+			if compareTargetIdentity(got, want) != 0 || !equalTargetRef(got, want) {
 				t.Fatalf("participant %d differs", seen)
 			}
 			seen++
@@ -80,7 +80,7 @@ func TestManifestRoundTripCanonicalAndMoreThan64Participants(t *testing.T) {
 	if err := reader.Seal(); err != nil {
 		t.Fatal(err)
 	}
-	if seen != descriptor.ParticipantCount {
+	if seen != descriptor.TargetCount {
 		t.Fatalf("decoded %d participants", seen)
 	}
 
@@ -96,12 +96,12 @@ func TestManifestRoundTripCanonicalAndMoreThan64Participants(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, raw := range pages {
-		page, err := OpenManifestSegment(raw, participantArena, identityArena)
+		page, err := OpenManifestSegment(raw, targetArena, identityArena)
 		if err != nil {
 			t.Fatal(err)
 		}
-		for i := range page.Participants {
-			if err := rebuilder.Append(page.Participants[i]); err != nil {
+		for i := range page.Targets {
+			if err := rebuilder.Append(page.Targets[i]); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -130,7 +130,7 @@ func TestManifestDeduplicatesExactAdjacentIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	first := manifestParticipant(1)
+	first := manifestTarget(1)
 	if err := builder.Append(first); err != nil {
 		t.Fatal(err)
 	}
@@ -153,10 +153,10 @@ func TestManifestRejectsReorderedInputAndResourceByteOverflow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := builder.Append(manifestParticipant(2)); err != nil {
+	if err := builder.Append(manifestTarget(2)); err != nil {
 		t.Fatal(err)
 	}
-	if err := builder.Append(manifestParticipant(1)); !errors.Is(err, ErrCorrupt) {
+	if err := builder.Append(manifestTarget(1)); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("reordered input = %v", err)
 	}
 
@@ -165,14 +165,14 @@ func TestManifestRejectsReorderedInputAndResourceByteOverflow(t *testing.T) {
 		t.Fatal(err)
 	}
 	builder.totalBytes = MaxManifestBytes
-	if err := builder.Append(manifestParticipant(1)); !errors.Is(err, ErrTooLarge) {
+	if err := builder.Append(manifestTarget(1)); !errors.Is(err, ErrTooLarge) {
 		t.Fatalf("byte overflow = %v", err)
 	}
 }
 
 func TestManifestDescriptorRejectsImpossiblePageGeometry(t *testing.T) {
 	descriptor := ManifestDescriptor{
-		ParticipantCount: 1, EncodedBytes: 1, SegmentCount: 1, Root: Digest{1},
+		TargetCount: 1, EncodedBytes: 1, SegmentCount: 1, Root: Digest{1},
 	}
 	if _, err := NewManifestReader(descriptor); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("NewManifestReader impossible descriptor = %v", err)
@@ -185,7 +185,7 @@ func TestManifestDescriptorRejectsImpossiblePageGeometry(t *testing.T) {
 	}
 
 	descriptor.EncodedBytes = ManifestSegmentBytes
-	descriptor.ParticipantCount = uint64(MaxManifestPageParticipants + 1)
+	descriptor.TargetCount = uint64(MaxManifestPageTargets + 1)
 	if descriptor.valid() {
 		t.Fatal("one-page descriptor admitted more participants than a page can encode")
 	}
@@ -193,11 +193,11 @@ func TestManifestDescriptorRejectsImpossiblePageGeometry(t *testing.T) {
 
 func TestManifestRejectsReorderedSparseTruncatedAndOversizedPages(t *testing.T) {
 	descriptor, pages := buildManifest(t, 4097)
-	participants := make([]ParticipantRef, MaxManifestPageParticipants)
-	identities := make([]byte, MaxManifestPageParticipants*MaxShardIdentityBytes*2)
+	targets := make([]TransactionTargetRef, MaxManifestPageTargets)
+	identities := make([]byte, MaxManifestPageTargets*MaxShardIdentityBytes*2)
 
 	reader, _ := NewManifestReader(descriptor)
-	if _, err := reader.OpenNext(pages[1], participants, identities); !errors.Is(err, ErrCorrupt) {
+	if _, err := reader.OpenNext(pages[1], targets, identities); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("reordered first page = %v", err)
 	}
 
@@ -205,35 +205,35 @@ func TestManifestRejectsReorderedSparseTruncatedAndOversizedPages(t *testing.T) 
 	binary.LittleEndian.PutUint32(sparse[8:12], 3)
 	binary.LittleEndian.PutUint32(sparse[len(sparse)-4:], crc32Checksum(sparse[:len(sparse)-4]))
 	reader, _ = NewManifestReader(descriptor)
-	if _, err := reader.OpenNext(sparse, participants, identities); !errors.Is(err, ErrCorrupt) {
+	if _, err := reader.OpenNext(sparse, targets, identities); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("sparse page = %v", err)
 	}
 
 	truncated := pages[0][:len(pages[0])-1]
-	if _, err := OpenManifestSegment(truncated, participants, identities); !errors.Is(err, ErrCorrupt) {
+	if _, err := OpenManifestSegment(truncated, targets, identities); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("truncated page = %v", err)
 	}
 
 	oversized := make([]byte, ManifestSegmentBytes+1)
 	copy(oversized, pages[0])
-	if _, err := OpenManifestSegment(oversized, participants, identities); !errors.Is(err, ErrCorrupt) {
+	if _, err := OpenManifestSegment(oversized, targets, identities); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("oversized page = %v", err)
 	}
 }
 
-func TestManifestOneHundredThousandParticipantsUsesPagedScratch(t *testing.T) {
+func TestManifestOneHundredThousandTargetsUsesPagedScratch(t *testing.T) {
 	descriptor, pages := buildManifest(t, 100_000)
-	if descriptor.ParticipantCount != 100_000 || descriptor.EncodedBytes > MaxManifestBytes {
+	if descriptor.TargetCount != 100_000 || descriptor.EncodedBytes > MaxManifestBytes {
 		t.Fatalf("descriptor = %+v", descriptor)
 	}
 	reader, err := NewManifestReader(descriptor)
 	if err != nil {
 		t.Fatal(err)
 	}
-	participants := make([]ParticipantRef, MaxManifestPageParticipants)
-	identities := make([]byte, MaxManifestPageParticipants*MaxShardIdentityBytes*2)
+	targets := make([]TransactionTargetRef, MaxManifestPageTargets)
+	identities := make([]byte, MaxManifestPageTargets*MaxShardIdentityBytes*2)
 	for _, page := range pages {
-		if _, err := reader.OpenNext(page, participants, identities); err != nil {
+		if _, err := reader.OpenNext(page, targets, identities); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -268,7 +268,7 @@ func TestManifestSealIsIdempotentAndFinal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := builder.Append(manifestParticipant(1)); err != nil {
+	if err := builder.Append(manifestTarget(1)); err != nil {
 		t.Fatal(err)
 	}
 	first, err := builder.Seal()
@@ -279,22 +279,22 @@ func TestManifestSealIsIdempotentAndFinal(t *testing.T) {
 	if err != nil || second != first {
 		t.Fatalf("second seal = %+v, %v", second, err)
 	}
-	if err := builder.Append(manifestParticipant(2)); !errors.Is(err, ErrInvalidState) {
+	if err := builder.Append(manifestTarget(2)); !errors.Is(err, ErrInvalidState) {
 		t.Fatalf("append after seal = %v", err)
 	}
 }
 
 func BenchmarkManifestCodecPage(b *testing.B) {
-	participants := make([]ParticipantRef, 700)
-	for i := range participants {
-		participants[i] = manifestParticipant(uint64(i))
+	targets := make([]TransactionTargetRef, 700)
+	for i := range targets {
+		targets[i] = manifestTarget(uint64(i))
 	}
 	pageArena := make([]byte, ManifestSegmentBytes)
-	participantArena := make([]ParticipantRef, MaxManifestPageParticipants)
-	identityArena := make([]byte, MaxManifestPageParticipants*MaxShardIdentityBytes*2)
+	targetArena := make([]TransactionTargetRef, MaxManifestPageTargets)
+	identityArena := make([]byte, MaxManifestPageTargets*MaxShardIdentityBytes*2)
 	var builder ManifestBuilder
 	emit := func(segment ManifestSegment) error {
-		_, openErr := OpenManifestSegment(segment.Raw, participantArena, identityArena)
+		_, openErr := OpenManifestSegment(segment.Raw, targetArena, identityArena)
 		return openErr
 	}
 	b.ReportAllocs()
@@ -303,8 +303,8 @@ func BenchmarkManifestCodecPage(b *testing.B) {
 		if err := builder.Reset(pageArena, emit); err != nil {
 			b.Fatal(err)
 		}
-		for i := range participants {
-			if err := builder.Append(participants[i]); err != nil {
+		for i := range targets {
+			if err := builder.Append(targets[i]); err != nil {
 				b.Fatal(err)
 			}
 		}

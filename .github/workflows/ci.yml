@@ -635,15 +635,7 @@ jobs:
           key: ${{ steps.go.outputs.cache-key }}
   distributed-race-packages:
     if: ${{ !cancelled() }}
-    name: race distributed (${{ matrix.name }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: gateway-snapshot
-            packages: ./gateway ./internal/multiraft ./internal/snapshottransfer
-          - name: raft-state
-            packages: ./internal/raftservice ./internal/replicatedstate
+    name: race distributed
     runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:
@@ -651,17 +643,16 @@ jobs:
       - uses: ./.github/actions/setup-go-ci
         id: go
         with:
-          scope: race-${{ matrix.name }}
+          scope: race-distributed
       - name: Distributed serving race tests
         # External qualification corpora have dedicated no-skip Linux jobs in
         # the test matrix. This lane instruments the serving, quorum, durable
         # ledger, and snapshot concurrency paths without duplicating those
         # multi-process resource gates under race overhead.
-        env:
-          PACKAGES: ${{ matrix.packages }}
-        run: |
-          read -r -a test_targets <<< "$PACKAGES"
-          go test -race -p=2 -count=1 -timeout=30m "${test_targets[@]}"
+        run: >-
+          go test -race -p=4 -count=1 -timeout=30m
+          ./gateway ./internal/multiraft ./internal/snapshottransfer
+          ./internal/raftservice ./internal/replicatedstate
       - name: Save Go build cache
         if: ${{ always() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4

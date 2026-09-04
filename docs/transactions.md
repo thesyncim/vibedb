@@ -9,6 +9,11 @@ Use root `vibedb` for serializable application transactions over named
 collections. `store` and `store/durable` are lower-level engine primitives with
 different lifecycle and commit contracts.
 
+The code calls each independently addressed atomic resource a **transaction
+target**. Traditional atomic-commit literature calls the same role a
+participant. An embedded target is a dirty collection; an RF3 target is one
+exact distribution, shard, and route incarnation with its grouped mutations.
+
 ## Choose an API
 
 | Need | API | Contract |

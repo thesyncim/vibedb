@@ -32,7 +32,7 @@ const (
 	// retired manifest pages. Data admission reserves the exact worst-case
 	// decision/retirement bytes for every active record, so reaching the ceiling
 	// cannot strand admitted work. This is a byte bound, never a transaction or
-	// participant-count bound.
+	// target-count bound.
 	MaxRetainedJournalBytes = uint64(8 << 30)
 
 	// MaxActiveManifestBytes bounds exact resident segmented-page bytes across
@@ -45,15 +45,15 @@ type journalEntryKind uint8
 
 const (
 	journalCoordinatorStage journalEntryKind = iota + 1
-	journalParticipantStage
+	journalTargetStage
 	journalCoordinatorTransition
-	journalParticipantTransition
-	journalParticipantFence
+	journalTargetTransition
+	journalTargetFence
 	journalManifestSegment
 	journalManifestCoordinatorStage
 	journalManifestCoordinatorSeal
 	journalCompactedCoordinator
-	journalCompactedParticipant
+	journalCompactedTarget
 	journalCoordinatorPulse
 )
 
@@ -62,7 +62,7 @@ type RecordRole uint8
 const (
 	RoleInvalid RecordRole = iota
 	RoleCoordinator
-	RoleParticipant
+	RoleTarget
 )
 
 // Status is the allocation-free result of a journal lookup or transition.
@@ -72,7 +72,7 @@ type Status struct {
 	ID               ID
 	Revision         uint64
 	CoordinatorState CoordinatorState
-	ParticipantState ParticipantState
+	TargetState      TargetState
 	MutationDigest   Digest
 	RecoveryPulse    uint8
 }
@@ -88,7 +88,7 @@ type journalRecord struct {
 
 type journalManifest struct {
 	segments            [][]byte
-	participantCount    uint64
+	targetCount         uint64
 	encodedBytes        uint64
 	chain               Digest
 	lastDistribution    [MaxShardIdentityBytes]byte
@@ -111,7 +111,7 @@ type Journal struct {
 	mu             sync.RWMutex
 	file           *os.File
 	coordinators   map[ID]*journalRecord
-	participants   map[ID]*journalRecord
+	targets        map[ID]*journalRecord
 	manifests      map[ID]*journalManifest
 	retainedBytes  uint64
 	manifestBytes  uint64
@@ -166,14 +166,14 @@ func coordinatorStatusControlReserve(status Status, manifest bool) uint64 {
 	return reserve - used
 }
 
-func participantControlReserve(state ParticipantState) uint64 {
+func targetControlReserve(state TargetState) uint64 {
 	const transition = uint64(journalEntryHeaderBytes + 4)
 	switch state {
-	case ParticipantStaged:
+	case TargetStaged:
 		return transition * 3
-	case ParticipantPrepared:
+	case TargetPrepared:
 		return transition * 2
-	case ParticipantApplied:
+	case TargetApplied:
 		return transition
 	default:
 		return 0
@@ -214,8 +214,8 @@ func (j *Journal) rebuildControlReserveLocked() error {
 			return ErrTooLarge
 		}
 	}
-	for _, record := range j.participants {
-		if !add(participantControlReserve(record.status.ParticipantState)) {
+	for _, record := range j.targets {
+		if !add(targetControlReserve(record.status.TargetState)) {
 			return ErrTooLarge
 		}
 	}
@@ -254,7 +254,7 @@ func OpenJournal(path string) (*Journal, error) {
 	}
 	j := &Journal{
 		file: file, coordinators: make(map[ID]*journalRecord),
-		participants: make(map[ID]*journalRecord), manifests: make(map[ID]*journalManifest),
+		targets: make(map[ID]*journalRecord), manifests: make(map[ID]*journalManifest),
 		barrierChanged: make(chan struct{}), path: path,
 	}
 	if err := j.recover(); err != nil {
@@ -282,7 +282,7 @@ func (j *Journal) recover() error {
 	}
 	var offset int64
 	var header [journalEntryHeaderBytes]byte
-	var participantScratch []ParticipantRef
+	var targetScratch []TransactionTargetRef
 	var identityScratch []byte
 	for offset < size {
 		remaining := size - offset
@@ -297,7 +297,7 @@ func (j *Journal) recover() error {
 		}
 		payloadBytes := int64(binary.LittleEndian.Uint32(header[8:12]))
 		entryBytes := int64(journalEntryHeaderBytes) + payloadBytes + 4
-		if payloadBytes < 0 || payloadBytes > MaxParticipantRecordBytes {
+		if payloadBytes < 0 || payloadBytes > MaxTargetRecordBytes {
 			return ErrTooLarge
 		}
 		if entryBytes > remaining {
@@ -314,11 +314,11 @@ func (j *Journal) recover() error {
 			}
 			return ErrCorrupt
 		}
-		if journalEntryKind(entry[4]) == journalManifestSegment && participantScratch == nil {
-			participantScratch = make([]ParticipantRef, MaxManifestPageParticipants)
-			identityScratch = make([]byte, MaxManifestPageParticipants*MaxShardIdentityBytes*2)
+		if journalEntryKind(entry[4]) == journalManifestSegment && targetScratch == nil {
+			targetScratch = make([]TransactionTargetRef, MaxManifestPageTargets)
+			identityScratch = make([]byte, MaxManifestPageTargets*MaxShardIdentityBytes*2)
 		}
-		if err := j.replayEntry(entry, participantScratch, identityScratch); err != nil {
+		if err := j.replayEntry(entry, targetScratch, identityScratch); err != nil {
 			return err
 		}
 		offset += entryBytes
@@ -348,8 +348,7 @@ func (j *Journal) truncateTornTail(offset int64) error {
 
 func (j *Journal) replayEntry(
 	entry []byte,
-	participantScratch []ParticipantRef,
-	identityScratch []byte,
+	targetScratch []TransactionTargetRef, identityScratch []byte,
 ) error {
 	kind := journalEntryKind(entry[4])
 	state := entry[5]
@@ -364,33 +363,33 @@ func (j *Journal) replayEntry(
 			return ErrCorrupt
 		}
 		return j.replayCoordinatorStage(payload, record)
-	case journalParticipantStage:
+	case journalTargetStage:
 		var scopes [MaxIntentScopes]IntentScope
-		record, err := OpenParticipantInto(payload, scopes[:])
+		record, err := OpenTargetInto(payload, scopes[:])
 		if err != nil || record.ID != id || record.Revision != revision || byte(record.State) != state {
 			return ErrCorrupt
 		}
-		return j.replayParticipantStage(payload, record)
+		return j.replayTargetStage(payload, record)
 	case journalCoordinatorTransition:
 		if len(payload) != 0 {
 			return ErrCorrupt
 		}
 		return j.replayCoordinatorTransition(id, revision, CoordinatorState(state))
-	case journalParticipantTransition:
+	case journalTargetTransition:
 		if len(payload) != 0 {
 			return ErrCorrupt
 		}
-		return j.replayParticipantTransition(id, revision, ParticipantState(state))
-	case journalParticipantFence:
-		if len(payload) != 0 || ParticipantState(state) != ParticipantAborted || revision != 2 {
+		return j.replayTargetTransition(id, revision, TargetState(state))
+	case journalTargetFence:
+		if len(payload) != 0 || TargetState(state) != TargetAborted || revision != 2 {
 			return ErrCorrupt
 		}
-		return j.replayParticipantFence(id)
+		return j.replayTargetFence(id)
 	case journalManifestSegment:
 		if state != 0 || revision == 0 {
 			return ErrCorrupt
 		}
-		page, err := OpenManifestSegment(payload, participantScratch, identityScratch)
+		page, err := OpenManifestSegment(payload, targetScratch, identityScratch)
 		if err != nil || uint64(page.Segment.Index)+1 != revision {
 			return ErrCorrupt
 		}
@@ -412,8 +411,8 @@ func (j *Journal) replayEntry(
 		return j.replayManifestCoordinatorSeal(id, revision, CoordinatorState(state), descriptor)
 	case journalCompactedCoordinator:
 		return j.replayCompactedCoordinator(id, revision, CoordinatorState(state), payload)
-	case journalCompactedParticipant:
-		return j.replayCompactedParticipant(id, revision, ParticipantState(state), payload)
+	case journalCompactedTarget:
+		return j.replayCompactedTarget(id, revision, TargetState(state), payload)
 	case journalCoordinatorPulse:
 		if len(payload) != 0 {
 			return ErrCorrupt
@@ -436,7 +435,7 @@ func (j *Journal) replayCoordinatorPulse(id ID, revision uint64, pulse uint8) er
 }
 
 // replayCompactedCoordinator restores a retired coordinator without replaying
-// its (potentially very large) segmented participant manifest. The immutable
+// its (potentially very large) segmented target manifest. The immutable
 // stage remains byte-exact so late lookup and retry behavior is unchanged.
 func (j *Journal) replayCompactedCoordinator(
 	id ID,
@@ -448,7 +447,7 @@ func (j *Journal) replayCompactedCoordinator(
 		return ErrCorrupt
 	}
 	if len(raw) >= 4 && equal4(raw[:4], coordinatorMagic) {
-		var scratch [MaxInlineParticipants]ParticipantRef
+		var scratch [MaxInlineTargets]TransactionTargetRef
 		record, err := OpenCoordinatorInto(raw, scratch[:])
 		if err != nil || record.ID != id || record.Revision != 1 ||
 			record.State != CoordinatorStaging {
@@ -470,50 +469,50 @@ func (j *Journal) replayCompactedCoordinator(
 	return nil
 }
 
-// replayCompactedParticipant restores a terminal participant in one entry.
+// replayCompactedTarget restores a terminal target in one entry.
 // Keeping its original stage bytes preserves exact retry and read behavior;
 // only superseded state-transition entries are removed.
-func (j *Journal) replayCompactedParticipant(
+func (j *Journal) replayCompactedTarget(
 	id ID,
 	revision uint64,
-	state ParticipantState,
+	state TargetState,
 	raw []byte,
 ) error {
-	if id.IsZero() || j.participants[id] != nil ||
-		(state != ParticipantAborted && state != ParticipantReleased) {
+	if id.IsZero() || j.targets[id] != nil ||
+		(state != TargetAborted && state != TargetReleased) {
 		return ErrCorrupt
 	}
 	if len(raw) == 0 {
-		if state != ParticipantAborted || revision != 2 {
+		if state != TargetAborted || revision != 2 {
 			return ErrCorrupt
 		}
-		j.participants[id] = &journalRecord{status: Status{
-			Role: RoleParticipant, ID: id, Revision: revision, ParticipantState: state,
+		j.targets[id] = &journalRecord{status: Status{
+			Role: RoleTarget, ID: id, Revision: revision, TargetState: state,
 		}}
 		return nil
 	}
 	var scopes [MaxIntentScopes]IntentScope
-	record, err := OpenParticipantInto(raw, scopes[:])
+	record, err := OpenTargetInto(raw, scopes[:])
 	if err != nil || record.ID != id || record.Revision != 1 ||
-		record.State != ParticipantStaged ||
-		(state == ParticipantAborted && (revision < 2 || revision > 3)) ||
-		(state == ParticipantReleased && (revision < 3 || revision > 4)) {
+		record.State != TargetStaged ||
+		(state == TargetAborted && (revision < 2 || revision > 3)) ||
+		(state == TargetReleased && (revision < 3 || revision > 4)) {
 		return ErrCorrupt
 	}
-	j.participants[id] = &journalRecord{status: Status{
-		Role: RoleParticipant, ID: id, Revision: revision,
-		ParticipantState: state, MutationDigest: record.MutationDigest,
+	j.targets[id] = &journalRecord{status: Status{
+		Role: RoleTarget, ID: id, Revision: revision,
+		TargetState: state, MutationDigest: record.MutationDigest,
 	}, stage: bytes.Clone(raw), bucketBits: record.BucketBits,
 		scopes: append([]IntentScope(nil), record.IntentScopes...)}
 	return nil
 }
 
-func (j *Journal) replayParticipantFence(id ID) error {
-	if id.IsZero() || j.participants[id] != nil {
+func (j *Journal) replayTargetFence(id ID) error {
+	if id.IsZero() || j.targets[id] != nil {
 		return ErrCorrupt
 	}
-	j.participants[id] = &journalRecord{status: Status{
-		Role: RoleParticipant, ID: id, Revision: 2, ParticipantState: ParticipantAborted,
+	j.targets[id] = &journalRecord{status: Status{
+		Role: RoleTarget, ID: id, Revision: 2, TargetState: TargetAborted,
 	}}
 	return nil
 }
@@ -559,7 +558,7 @@ func (j *Journal) replayManifestSegment(id ID, raw []byte, page ManifestPage) er
 		return nil
 	}
 	if index != segmentCount ||
-		page.Segment.FirstParticipant != manifest.participantCount ||
+		page.Segment.FirstTarget != manifest.targetCount ||
 		!manifestPageWithinDescriptor(manifest, page, len(raw), coordinator.manifest) {
 		return ErrCorrupt
 	}
@@ -567,21 +566,21 @@ func (j *Journal) replayManifestSegment(id ID, raw []byte, page ManifestPage) er
 		uint64(len(raw)) > MaxActiveManifestBytes-j.manifestBytes {
 		return ErrTooLarge
 	}
-	first := &page.Participants[0]
-	if manifest.participantCount != 0 && compareIdentityBytes(
+	first := &page.Targets[0]
+	if manifest.targetCount != 0 && compareIdentityBytes(
 		manifest.lastDistribution[:manifest.lastDistributionLen],
 		manifest.lastShard[:manifest.lastShardLen],
 		first.Distribution, first.Shard,
 	) >= 0 {
 		return ErrCorrupt
 	}
-	last := &page.Participants[len(page.Participants)-1]
+	last := &page.Targets[len(page.Targets)-1]
 	copy(manifest.lastDistribution[:], last.Distribution)
 	copy(manifest.lastShard[:], last.Shard)
 	manifest.lastDistributionLen = uint8(len(last.Distribution))
 	manifest.lastShardLen = uint8(len(last.Shard))
 	manifest.chain = appendManifestChain(manifest.chain, page.Segment.Index, page.Segment.Digest)
-	manifest.participantCount += uint64(page.Segment.ParticipantCount)
+	manifest.targetCount += uint64(page.Segment.TargetCount)
 	manifest.encodedBytes += uint64(len(raw))
 	manifest.segments = append(manifest.segments, bytes.Clone(raw))
 	j.manifestBytes += uint64(len(raw))
@@ -635,32 +634,32 @@ func (j *Journal) replayManifestCoordinatorSeal(
 
 func (j *Journal) manifestDescriptor(id ID) ManifestDescriptor {
 	manifest := j.manifests[id]
-	if manifest == nil || manifest.participantCount == 0 || len(manifest.segments) == 0 ||
+	if manifest == nil || manifest.targetCount == 0 || len(manifest.segments) == 0 ||
 		uint64(len(manifest.segments)) > uint64(^uint32(0)) {
 		return ManifestDescriptor{}
 	}
 	descriptor := ManifestDescriptor{
-		ParticipantCount: manifest.participantCount,
-		EncodedBytes:     manifest.encodedBytes,
-		SegmentCount:     uint32(len(manifest.segments)),
+		TargetCount:  manifest.targetCount,
+		EncodedBytes: manifest.encodedBytes,
+		SegmentCount: uint32(len(manifest.segments)),
 	}
 	descriptor.Root = finishManifestRoot(manifest.chain, descriptor)
 	return descriptor
 }
 
-func (j *Journal) replayParticipantStage(raw []byte, record ParticipantRecord) error {
-	if record.State != ParticipantStaged {
+func (j *Journal) replayTargetStage(raw []byte, record TargetRecord) error {
+	if record.State != TargetStaged {
 		return ErrCorrupt
 	}
-	if prior := j.participants[record.ID]; prior != nil {
+	if prior := j.targets[record.ID]; prior != nil {
 		if !bytes.Equal(prior.stage, raw) {
 			return ErrJournalConflict
 		}
 		return nil
 	}
-	j.participants[record.ID] = &journalRecord{
-		status: Status{Role: RoleParticipant, ID: record.ID, Revision: record.Revision,
-			ParticipantState: record.State, MutationDigest: record.MutationDigest},
+	j.targets[record.ID] = &journalRecord{
+		status: Status{Role: RoleTarget, ID: record.ID, Revision: record.Revision,
+			TargetState: record.State, MutationDigest: record.MutationDigest},
 		stage: bytes.Clone(raw), bucketBits: record.BucketBits,
 		scopes: append([]IntentScope(nil), record.IntentScopes...),
 	}
@@ -698,15 +697,15 @@ func (j *Journal) releaseManifestLocked(id ID) {
 	delete(j.manifests, id)
 }
 
-func (j *Journal) replayParticipantTransition(id ID, revision uint64, next ParticipantState) error {
-	record := j.participants[id]
+func (j *Journal) replayTargetTransition(id ID, revision uint64, next TargetState) error {
+	record := j.targets[id]
 	if record == nil || revision != record.status.Revision+1 ||
-		!record.status.ParticipantState.CanTransitionTo(next) {
+		!record.status.TargetState.CanTransitionTo(next) {
 		return ErrCorrupt
 	}
 	record.status.Revision = revision
-	record.status.ParticipantState = next
-	if next == ParticipantAborted || next == ParticipantReleased {
+	record.status.TargetState = next
+	if next == TargetAborted || next == TargetReleased {
 		j.removeBarrierLocked(id)
 	}
 	return nil
@@ -735,7 +734,7 @@ func (j *Journal) removeBarrierLocked(id ID) {
 	if j.barriers <= 0 {
 		return
 	}
-	record := j.participants[id]
+	record := j.targets[id]
 	if record != nil && len(record.scopes) == 0 {
 		if j.globalBarriers > 0 {
 			j.globalBarriers--
@@ -771,7 +770,7 @@ func (j *Journal) writeEntryLocked(kind journalEntryKind, state byte, revision u
 	entryBytes := uint64(journalEntryHeaderBytes) + payloadBytes + 4
 	if j.retainedBytes > MaxRetainedJournalBytes ||
 		entryBytes > MaxRetainedJournalBytes-j.retainedBytes ||
-		entryBytes > uint64(^uint(0)>>1) || payloadBytes > MaxParticipantRecordBytes {
+		entryBytes > uint64(^uint(0)>>1) || payloadBytes > MaxTargetRecordBytes {
 		return ErrTooLarge
 	}
 	entry := make([]byte, int(entryBytes))
@@ -798,7 +797,7 @@ func (j *Journal) writeEntryLocked(kind journalEntryKind, state byte, revision u
 }
 
 func (j *Journal) StageCoordinator(raw []byte) (Status, error) {
-	var arena [MaxInlineParticipants]ParticipantRef
+	var arena [MaxInlineTargets]TransactionTargetRef
 	record, err := OpenCoordinatorInto(raw, arena[:])
 	if err != nil || record.State != CoordinatorStaging {
 		return Status{}, errors.Join(ErrCorrupt, err)
@@ -827,18 +826,17 @@ func (j *Journal) StageCoordinator(raw []byte) (Status, error) {
 }
 
 // StageManifestSegment durably appends one canonical manifest page. Pages must
-// arrive in order; retries of the exact page are idempotent. participants and
+// arrive in order; retries of the exact page are idempotent. targets and
 // identities are caller scratch and may be reused immediately after return.
 func (j *Journal) StageManifestSegment(
 	id ID,
 	raw []byte,
-	participants []ParticipantRef,
-	identities []byte,
+	targets []TransactionTargetRef, identities []byte,
 ) (ManifestSegment, error) {
 	if id.IsZero() {
 		return ManifestSegment{}, ErrCorrupt
 	}
-	page, err := OpenManifestSegment(raw, participants, identities)
+	page, err := OpenManifestSegment(raw, targets, identities)
 	if err != nil {
 		return ManifestSegment{}, err
 	}
@@ -862,7 +860,7 @@ func (j *Journal) StageManifestSegment(
 		}
 		return ManifestSegment{}, ErrJournalConflict
 	}
-	if index != segmentCount || page.Segment.FirstParticipant != manifest.participantCount ||
+	if index != segmentCount || page.Segment.FirstTarget != manifest.targetCount ||
 		!manifestPageWithinDescriptor(manifest, page, len(raw), coordinator.manifest) {
 		return ManifestSegment{}, ErrJournalConflict
 	}
@@ -873,8 +871,8 @@ func (j *Journal) StageManifestSegment(
 		uint64(len(raw)) > MaxActiveManifestBytes-j.manifestBytes {
 		return ManifestSegment{}, ErrTooLarge
 	}
-	first := &page.Participants[0]
-	if manifest.participantCount != 0 && compareIdentityBytes(
+	first := &page.Targets[0]
+	if manifest.targetCount != 0 && compareIdentityBytes(
 		manifest.lastDistribution[:manifest.lastDistributionLen],
 		manifest.lastShard[:manifest.lastShardLen],
 		first.Distribution, first.Shard,
@@ -886,13 +884,13 @@ func (j *Journal) StageManifestSegment(
 	); err != nil {
 		return ManifestSegment{}, err
 	}
-	last := &page.Participants[len(page.Participants)-1]
+	last := &page.Targets[len(page.Targets)-1]
 	copy(manifest.lastDistribution[:], last.Distribution)
 	copy(manifest.lastShard[:], last.Shard)
 	manifest.lastDistributionLen = uint8(len(last.Distribution))
 	manifest.lastShardLen = uint8(len(last.Shard))
 	manifest.chain = appendManifestChain(manifest.chain, page.Segment.Index, page.Segment.Digest)
-	manifest.participantCount += uint64(page.Segment.ParticipantCount)
+	manifest.targetCount += uint64(page.Segment.TargetCount)
 	manifest.encodedBytes += uint64(len(raw))
 	manifest.segments = append(manifest.segments, bytes.Clone(raw))
 	j.manifestBytes += uint64(len(raw))
@@ -909,22 +907,22 @@ func manifestPageWithinDescriptor(
 		page.Segment.Index >= descriptor.SegmentCount {
 		return false
 	}
-	nextParticipants := manifest.participantCount + uint64(page.Segment.ParticipantCount)
+	nextTargets := manifest.targetCount + uint64(page.Segment.TargetCount)
 	nextBytes := manifest.encodedBytes + uint64(rawBytes)
 	nextSegments64 := uint64(len(manifest.segments)) + 1
-	if nextParticipants > descriptor.ParticipantCount || nextBytes > descriptor.EncodedBytes ||
+	if nextTargets > descriptor.TargetCount || nextBytes > descriptor.EncodedBytes ||
 		nextSegments64 > uint64(descriptor.SegmentCount) {
 		return false
 	}
 	nextSegments := uint32(nextSegments64)
 	if nextSegments == descriptor.SegmentCount {
-		if nextParticipants != descriptor.ParticipantCount || nextBytes != descriptor.EncodedBytes {
+		if nextTargets != descriptor.TargetCount || nextBytes != descriptor.EncodedBytes {
 			return false
 		}
 		candidate := ManifestDescriptor{
-			ParticipantCount: nextParticipants,
-			EncodedBytes:     nextBytes,
-			SegmentCount:     nextSegments,
+			TargetCount:  nextTargets,
+			EncodedBytes: nextBytes,
+			SegmentCount: nextSegments,
 		}
 		candidate.Root = finishManifestRoot(
 			appendManifestChain(manifest.chain, page.Segment.Index, page.Segment.Digest),
@@ -932,7 +930,7 @@ func manifestPageWithinDescriptor(
 		)
 		return candidate == descriptor
 	}
-	return nextParticipants < descriptor.ParticipantCount && nextBytes < descriptor.EncodedBytes
+	return nextTargets < descriptor.TargetCount && nextBytes < descriptor.EncodedBytes
 }
 
 // StageManifestCoordinator durably begins a segmented coordinator with its
@@ -1017,15 +1015,15 @@ func (j *Journal) SealManifestCoordinator(
 	return record.status, nil
 }
 
-func (j *Journal) StageParticipant(raw []byte) (Status, error) {
+func (j *Journal) StageTarget(raw []byte) (Status, error) {
 	var scopes [MaxIntentScopes]IntentScope
-	record, err := OpenParticipantInto(raw, scopes[:])
-	if err != nil || record.State != ParticipantStaged {
+	record, err := OpenTargetInto(raw, scopes[:])
+	if err != nil || record.State != TargetStaged {
 		return Status{}, errors.Join(ErrCorrupt, err)
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	if prior := j.participants[record.ID]; prior != nil {
+	if prior := j.targets[record.ID]; prior != nil {
 		if bytes.Equal(prior.stage, raw) {
 			return prior.status, nil
 		}
@@ -1036,16 +1034,16 @@ func (j *Journal) StageParticipant(raw []byte) (Status, error) {
 	if j.scopeConflictLocked(record.BucketBits, record.IntentScopes) {
 		return Status{}, ErrJournalBusy
 	}
-	reserve := participantControlReserve(record.State)
+	reserve := targetControlReserve(record.State)
 	if !j.admitsDataLocked(len(raw), reserve) {
 		return Status{}, ErrTooLarge
 	}
-	if err := j.writeEntryLocked(journalParticipantStage, byte(record.State), record.Revision, record.ID, raw); err != nil {
+	if err := j.writeEntryLocked(journalTargetStage, byte(record.State), record.Revision, record.ID, raw); err != nil {
 		return Status{}, err
 	}
-	status := Status{Role: RoleParticipant, ID: record.ID, Revision: record.Revision,
-		ParticipantState: record.State, MutationDigest: record.MutationDigest}
-	j.participants[record.ID] = &journalRecord{
+	status := Status{Role: RoleTarget, ID: record.ID, Revision: record.Revision,
+		TargetState: record.State, MutationDigest: record.MutationDigest}
+	j.targets[record.ID] = &journalRecord{
 		status: status, stage: bytes.Clone(raw),
 		bucketBits: record.BucketBits, scopes: append([]IntentScope(nil), record.IntentScopes...),
 	}
@@ -1057,7 +1055,7 @@ func (j *Journal) StageParticipant(raw []byte) (Status, error) {
 func (j *Journal) Status(id ID) (Status, bool) {
 	j.mu.RLock()
 	defer j.mu.RUnlock()
-	record := j.participants[id]
+	record := j.targets[id]
 	if record == nil {
 		record = j.coordinators[id]
 	}
@@ -1082,7 +1080,7 @@ func (j *Journal) Usage() JournalUsage {
 }
 
 // CoordinatorStatus returns only the coordinator role for id. A coordinator
-// shard may also be a data participant for the same transaction, so protocol
+// shard may also be a data target for the same transaction, so protocol
 // callers must not use the compatibility Status lookup when the role matters.
 func (j *Journal) CoordinatorStatus(id ID) (Status, bool) {
 	j.mu.RLock()
@@ -1094,12 +1092,12 @@ func (j *Journal) CoordinatorStatus(id ID) (Status, bool) {
 	return record.status, true
 }
 
-// ParticipantStatus returns only the participant role for id. Coordinator and
-// participant records have independent revisions and may coexist on one shard.
-func (j *Journal) ParticipantStatus(id ID) (Status, bool) {
+// TargetStatus returns only the target role for id. Coordinator and
+// target records have independent revisions and may coexist on one shard.
+func (j *Journal) TargetStatus(id ID) (Status, bool) {
 	j.mu.RLock()
 	defer j.mu.RUnlock()
-	record := j.participants[id]
+	record := j.targets[id]
 	if record == nil {
 		return Status{}, false
 	}
@@ -1196,83 +1194,83 @@ func coordinatorRecoveryPulseLimit(stage []byte, manifest bool) (uint8, error) {
 	return uint8(deadline), nil
 }
 
-func (j *Journal) TransitionParticipant(id ID, expected uint64, next ParticipantState) (Status, error) {
+func (j *Journal) TransitionTarget(id ID, expected uint64, next TargetState) (Status, error) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	record := j.participants[id]
+	record := j.targets[id]
 	if record == nil {
 		return Status{}, ErrJournalNotFound
 	}
-	if record.status.Revision == expected+1 && record.status.ParticipantState == next {
+	if record.status.Revision == expected+1 && record.status.TargetState == next {
 		return record.status, nil
 	}
-	if record.status.Revision != expected || !record.status.ParticipantState.CanTransitionTo(next) {
+	if record.status.Revision != expected || !record.status.TargetState.CanTransitionTo(next) {
 		return Status{}, ErrJournalConflict
 	}
-	if err := j.writeEntryLocked(journalParticipantTransition, byte(next), expected+1, id, nil); err != nil {
+	if err := j.writeEntryLocked(journalTargetTransition, byte(next), expected+1, id, nil); err != nil {
 		return Status{}, err
 	}
 	j.replaceControlReserveLocked(
-		participantControlReserve(record.status.ParticipantState),
-		participantControlReserve(next),
+		targetControlReserve(record.status.TargetState),
+		targetControlReserve(next),
 	)
 	record.status.Revision++
-	record.status.ParticipantState = next
-	if next == ParticipantAborted || next == ParticipantReleased {
+	record.status.TargetState = next
+	if next == TargetAborted || next == TargetReleased {
 		j.removeBarrierLocked(id)
 	}
 	return record.status, nil
 }
 
-// AbortParticipant aborts an existing staged/prepared participant or durably
+// AbortTarget aborts an existing staged/prepared target or durably
 // installs an ABORTED tombstone for a missing initial revision. The tombstone
-// fences a delayed StageParticipant after recovery has chosen abort.
-func (j *Journal) AbortParticipant(id ID, expected uint64) (Status, error) {
+// fences a delayed StageTarget after recovery has chosen abort.
+func (j *Journal) AbortTarget(id ID, expected uint64) (Status, error) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	record := j.participants[id]
+	record := j.targets[id]
 	if record == nil {
 		if id.IsZero() || expected != 1 {
 			return Status{}, ErrJournalNotFound
 		}
 		if err := j.writeEntryLocked(
-			journalParticipantFence, byte(ParticipantAborted), expected+1, id, nil,
+			journalTargetFence, byte(TargetAborted), expected+1, id, nil,
 		); err != nil {
 			return Status{}, err
 		}
 		status := Status{
-			Role: RoleParticipant, ID: id, Revision: expected + 1,
-			ParticipantState: ParticipantAborted,
+			Role: RoleTarget, ID: id, Revision: expected + 1,
+			TargetState: TargetAborted,
 		}
-		j.participants[id] = &journalRecord{status: status}
+		j.targets[id] = &journalRecord{status: status}
 		return status, nil
 	}
-	if record.status.Revision == expected+1 && record.status.ParticipantState == ParticipantAborted {
+	if record.status.Revision == expected+1 && record.status.TargetState == TargetAborted {
 		return record.status, nil
 	}
 	if record.status.Revision != expected ||
-		!record.status.ParticipantState.CanTransitionTo(ParticipantAborted) {
+		!record.status.TargetState.CanTransitionTo(TargetAborted) {
 		return Status{}, ErrJournalConflict
 	}
 	if err := j.writeEntryLocked(
-		journalParticipantTransition, byte(ParticipantAborted), expected+1, id, nil,
+		journalTargetTransition, byte(TargetAborted), expected+1, id, nil,
 	); err != nil {
 		return Status{}, err
 	}
 	j.replaceControlReserveLocked(
-		participantControlReserve(record.status.ParticipantState),
-		participantControlReserve(ParticipantAborted),
+		targetControlReserve(record.status.TargetState),
+		targetControlReserve(TargetAborted),
 	)
 	record.status.Revision++
-	record.status.ParticipantState = ParticipantAborted
+	record.status.TargetState = TargetAborted
 	j.removeBarrierLocked(id)
 	return record.status, nil
 }
 
-// WaitNoParticipantBarrier waits only for active participant scopes that
+// WaitNoTargetBarrier waits only for active target scopes that
 // intersect access. An absent access scope is the fail-safe whole-shard form.
 // Transaction commands bypass this gate so recovery can always make progress.
-func (j *Journal) WaitNoParticipantBarrier(
+func (j *Journal) WaitNoTargetBarrier(
 	ctx context.Context,
 	bucketBits uint8,
 	access []IntentScope,
@@ -1297,10 +1295,10 @@ func (j *Journal) WaitNoParticipantBarrier(
 	}
 }
 
-// ParticipantBarrierConflict is the non-blocking form used while assembling a
+// TargetBarrierConflict is the non-blocking form used while assembling a
 // distributed read cut. A caller must first hold its shard-local read gate so a
-// participant cannot appear between this check and fence publication.
-func (j *Journal) ParticipantBarrierConflict(
+// target cannot appear between this check and fence publication.
+func (j *Journal) TargetBarrierConflict(
 	bucketBits uint8,
 	access []IntentScope,
 ) (bool, error) {
@@ -1330,23 +1328,23 @@ func (j *Journal) scopeConflictLocked(bucketBits uint8, access []IntentScope) bo
 	return false
 }
 
-// Participant returns a decoded immutable view of the stage payload. Its byte
+// Target returns a decoded immutable view of the stage payload. Its byte
 // slices remain valid until Journal.Close and must not be modified.
-func (j *Journal) Participant(id ID) (ParticipantRecord, error) {
+func (j *Journal) Target(id ID) (TargetRecord, error) {
 	j.mu.RLock()
 	defer j.mu.RUnlock()
-	record := j.participants[id]
+	record := j.targets[id]
 	if record == nil {
-		return ParticipantRecord{}, ErrJournalNotFound
+		return TargetRecord{}, ErrJournalNotFound
 	}
-	return OpenParticipant(record.stage)
+	return OpenTarget(record.stage)
 }
 
-// ParticipantStage returns the immutable checksummed participant stage bytes.
-func (j *Journal) ParticipantStage(id ID) ([]byte, error) {
+// TransactionTargetStage returns the immutable checksummed target stage bytes.
+func (j *Journal) TransactionTargetStage(id ID) ([]byte, error) {
 	j.mu.RLock()
 	defer j.mu.RUnlock()
-	record := j.participants[id]
+	record := j.targets[id]
 	if record == nil {
 		return nil, ErrJournalNotFound
 	}
@@ -1357,7 +1355,7 @@ func (j *Journal) ParticipantStage(id ID) ([]byte, error) {
 }
 
 // Coordinator returns a decoded immutable view of the coordinator stage
-// payload. Participant slices alias journal-owned storage and remain valid
+// payload. Target slices alias journal-owned storage and remain valid
 // until Close.
 func (j *Journal) Coordinator(id ID) (CoordinatorRecord, error) {
 	j.mu.RLock()
@@ -1385,8 +1383,7 @@ func (j *Journal) ManifestCoordinator(id ID) (ManifestCoordinatorRecord, error) 
 func (j *Journal) ManifestPage(
 	id ID,
 	index uint32,
-	participants []ParticipantRef,
-	identities []byte,
+	targets []TransactionTargetRef, identities []byte,
 ) (ManifestPage, error) {
 	j.mu.RLock()
 	defer j.mu.RUnlock()
@@ -1396,7 +1393,7 @@ func (j *Journal) ManifestPage(
 		uint64(index) >= uint64(len(manifest.segments)) {
 		return ManifestPage{}, ErrJournalNotFound
 	}
-	return OpenManifestSegment(manifest.segments[int(index)], participants, identities)
+	return OpenManifestSegment(manifest.segments[int(index)], targets, identities)
 }
 
 // CoordinatorStage returns the immutable checksummed stage bytes for id. The

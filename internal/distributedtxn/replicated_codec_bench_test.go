@@ -46,9 +46,9 @@ func BenchmarkValidateFusedManifestCoordinator(b *testing.B) {
 		Operation: ReplicatedBeginPrepareManifestCoordinator,
 		ID:        testID(), PayloadKind: ReplicatedPayloadManifestCoordinator,
 		Payload: appendManifestPages(coordinator, pages[:MaxManifestSegmentsPerCommand]),
-		Participant: fusedParticipantStage(
+		Target: fusedTargetStage(
 			ReplicatedBeginPrepareManifestCoordinator, ordinal,
-			manifestParticipant(uint64(ordinal)).MutationDigest,
+			manifestTarget(uint64(ordinal)).MutationDigest,
 		),
 	})
 	if err != nil {

@@ -144,7 +144,7 @@ func (c *txnFaultController) PrepareSyncs() int {
 	return c.prepareSyncs
 }
 
-// ProgramJournal sets a journal fault plan on one participant.
+// ProgramJournal sets a journal fault plan on one target.
 func (c *txnFaultController) ProgramJournal(name string, plan storeio.JournalFaultPlan) {
 	c.t.Helper()
 	fj := c.Journal(name)

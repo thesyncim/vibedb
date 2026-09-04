@@ -11,10 +11,10 @@ import (
 )
 
 var (
-	// ErrTransactionParticipantMissing reports that a durable decision names a
-	// participant whose collection file or journal is missing or mismatched,
-	// and no participant-retired record covers that StoreID.
-	ErrTransactionParticipantMissing = errors.New(
+	// ErrTransactionCollectionMissing reports that a durable decision names a
+	// target whose collection file or journal is missing or mismatched,
+	// and no target-retired record covers that StoreID.
+	ErrTransactionCollectionMissing = errors.New(
 		"vibedb: a committed database transaction names a missing collection",
 	)
 	// ErrTransactionLogMissing reports that collection journals hold uncovered
@@ -25,7 +25,7 @@ var (
 		"vibedb: collection journals hold conditional transaction records but the database's decision log is missing",
 	)
 	// ErrTransactionLogRecoveryRequired reports that txn.vtm already exists and
-	// may name participants outside the caller's current set. Existing decision
+	// may name targets outside the caller's current set. Existing decision
 	// logs may be opened only by a complete-catalog recovery operation.
 	ErrTransactionLogRecoveryRequired = errors.New(
 		"vibedb: existing transaction decision log requires complete catalog recovery",
@@ -153,7 +153,7 @@ func OpenCollectionsWithTransactions(
 		if previous, duplicate := seenStores[collection.storeID]; duplicate {
 			return abort(collections[:i+1], fmt.Errorf(
 				"%w: requests %d and %d have duplicate StoreID %x",
-				ErrTxnParticipant, previous, i, collection.storeID,
+				ErrTxnCollection, previous, i, collection.storeID,
 			))
 		}
 		seenStores[collection.storeID] = i
@@ -182,12 +182,12 @@ func validateTransactionCollectionRequests(
 		file := requests[i].File
 		if file == nil {
 			return fmt.Errorf(
-				"%w: nil collection file at request %d", ErrTxnParticipant, i,
+				"%w: nil collection file at request %d", ErrTxnCollection, i,
 			)
 		}
 		if _, duplicate := seenPointers[file]; duplicate {
 			return fmt.Errorf(
-				"%w: duplicate collection file at request %d", ErrTxnParticipant, i,
+				"%w: duplicate collection file at request %d", ErrTxnCollection, i,
 			)
 		}
 		seenPointers[file] = struct{}{}
@@ -197,14 +197,14 @@ func validateTransactionCollectionRequests(
 		}
 		if !info.Mode().IsRegular() {
 			return fmt.Errorf(
-				"%w: request %d is not a regular file", ErrTxnParticipant, i,
+				"%w: request %d is not a regular file", ErrTxnCollection, i,
 			)
 		}
 		for previous := 0; previous < i; previous++ {
 			if os.SameFile(info, infos[previous]) {
 				return fmt.Errorf(
 					"%w: requests %d and %d name the same physical file",
-					ErrTxnParticipant, previous, i,
+					ErrTxnCollection, previous, i,
 				)
 			}
 		}
@@ -226,7 +226,7 @@ func validateTransactionCollectionRequests(
 
 // preflightAndReplayDatabaseTxnRecovery separates catalog recovery into a
 // read-only validation phase and a mutating replay phase. No member journal is
-// applied or recycled until every collection and every marker participant has
+// applied or recycled until every collection and every marker target has
 // been validated against the complete opened catalog.
 func preflightAndReplayDatabaseTxnRecovery(
 	recovery *databaseTxnRecovery,
@@ -236,7 +236,7 @@ func preflightAndReplayDatabaseTxnRecovery(
 		return nil
 	}
 	if recovery.decisions != nil {
-		if err := validateTxnDecisionParticipants(
+		if err := validateTxnDecisionCollections(
 			recovery.decisions, collections,
 		); err != nil {
 			return err
@@ -256,7 +256,7 @@ func preflightAndReplayDatabaseTxnRecovery(
 				epoch = observedEpoch
 			}
 		} else {
-			resolve = participantBindingResolver(
+			resolve = targetBindingResolver(
 				recovery.decisions, c.storeID, c.journalID,
 			)
 			epoch = recovery.decisions.Epoch()
@@ -280,7 +280,7 @@ func preflightAndReplayDatabaseTxnRecovery(
 				epoch = observedEpoch
 			}
 		} else {
-			resolve = participantBindingResolver(
+			resolve = targetBindingResolver(
 				recovery.decisions, c.storeID, c.journalID,
 			)
 			epoch = recovery.decisions.Epoch()
@@ -423,7 +423,7 @@ func loadDatabaseTxnRecoveryFromLog(
 	return recovery, nil
 }
 
-// reconcileDatabaseTxnAfterOpens validates participant presence, clears
+// reconcileDatabaseTxnAfterOpens validates target presence, clears
 // discharge accounting, and applies L4 log-removal when legal. collections is
 // every successfully opened catalog member.
 func reconcileDatabaseTxnAfterOpens(
@@ -440,7 +440,7 @@ func reconcileDatabaseTxnAfterOpens(
 	if recovery.absent || recovery.decisions == nil {
 		return nil
 	}
-	if err := validateTxnDecisionParticipants(
+	if err := validateTxnDecisionCollections(
 		recovery.decisions, collections,
 	); err != nil {
 		return err
@@ -502,7 +502,7 @@ func reconcileDatabaseTxnAfterOpens(
 	return nil
 }
 
-func validateTxnDecisionParticipants(
+func validateTxnDecisionCollections(
 	decisions *storeio.TxnDecisions, collections []*Collection,
 ) error {
 	if decisions == nil {
@@ -527,9 +527,8 @@ func validateTxnDecisionParticipants(
 	epoch := decisions.Epoch()
 	var validationErr error
 	decisions.RangeDecisions(func(
-		txnID uint64, participants []storeio.TxnParticipant,
-	) bool {
-		for _, p := range participants {
+		txnID uint64, targets []storeio.TxnCollectionRef) bool {
+		for _, p := range targets {
 			if decisions.Retired(p.StoreID) {
 				continue
 			}
@@ -537,14 +536,14 @@ func validateTxnDecisionParticipants(
 			if !exists {
 				validationErr = fmt.Errorf(
 					"%w: store %x",
-					ErrTransactionParticipantMissing, p.StoreID,
+					ErrTransactionCollectionMissing, p.StoreID,
 				)
 				return false
 			}
 			if c.journalID != p.JournalID {
 				validationErr = fmt.Errorf(
 					"%w: journal identity mismatch for store %x",
-					ErrTransactionParticipantMissing, p.StoreID,
+					ErrTransactionCollectionMissing, p.StoreID,
 				)
 				return false
 			}
@@ -563,7 +562,7 @@ func validateTxnDecisionParticipants(
 			if _, exists := preparesByStore[p.StoreID][prepare]; !exists {
 				validationErr = fmt.Errorf(
 					"%w: store %x journal %x has neither a recycled base covering generation %d nor exact transaction %d prepare at that generation",
-					ErrTransactionParticipantMissing, p.StoreID, p.JournalID,
+					ErrTransactionCollectionMissing, p.StoreID, p.JournalID,
 					p.PreparedGeneration, txnID,
 				)
 				return false
@@ -620,9 +619,8 @@ func txnDecisionsDischarged(
 	}
 	discharged := true
 	decisions.RangeDecisions(func(
-		_ uint64, participants []storeio.TxnParticipant,
-	) bool {
-		for _, p := range participants {
+		_ uint64, targets []storeio.TxnCollectionRef) bool {
+		for _, p := range targets {
 			if decisions.Retired(p.StoreID) {
 				continue
 			}
@@ -667,9 +665,8 @@ func txnDecisionsNameStore(
 	}
 	found := false
 	decisions.RangeDecisions(func(
-		_ uint64, participants []storeio.TxnParticipant,
-	) bool {
-		for _, p := range participants {
+		_ uint64, targets []storeio.TxnCollectionRef) bool {
+		for _, p := range targets {
 			if p.StoreID == storeID {
 				found = true
 				return false
@@ -681,7 +678,7 @@ func txnDecisionsNameStore(
 }
 
 // retireCollectionBeforeDrop folds past live conditionals and appends a
-// participant-retired record when the drop barrier requires it. The caller
+// target-retired record when the drop barrier requires it. The caller
 // holds the catalog write lock; the collection is still open.
 func (d *Database) retireCollectionBeforeDrop(entry *databaseEntry) error {
 	log := lookupDatabaseTxnLog(d)
@@ -710,7 +707,7 @@ func (d *Database) retireCollectionBeforeDrop(entry *databaseEntry) error {
 	var foldErr error
 	if holdsErr == nil && holds {
 		foldErr = c.checkpointPastConditionalsLocked(
-			participantBindingResolver(decisions, c.storeID, c.journalID),
+			targetBindingResolver(decisions, c.storeID, c.journalID),
 			decisions.Epoch(),
 		)
 	}
@@ -800,7 +797,7 @@ func rescanTxnLogMarker(l *TxnLog) (*storeio.TxnDecisions, error) {
 	return decisions, nil
 }
 
-func participantBindingResolver(
+func targetBindingResolver(
 	decisions *storeio.TxnDecisions, storeID, journalID [16]byte,
 ) recoveryJournalDecisionResolver {
 	return func(
@@ -808,19 +805,19 @@ func participantBindingResolver(
 	) (bool, error) {
 		if decisions == nil || markerID != decisions.MarkerID() ||
 			epoch != decisions.Epoch() {
-			return false, ErrTransactionParticipantBinding
+			return false, ErrTransactionCollectionBinding
 		}
-		participants, ok := decisions.Lookup(markerID, epoch, txnID)
+		targets, ok := decisions.Lookup(markerID, epoch, txnID)
 		if !ok {
 			return false, nil
 		}
-		for _, p := range participants {
+		for _, p := range targets {
 			if p.StoreID == storeID && p.JournalID == journalID &&
 				p.PreparedGeneration == preparedGeneration {
 				return true, nil
 			}
 		}
-		return false, ErrTransactionParticipantBinding
+		return false, ErrTransactionCollectionBinding
 	}
 }
 

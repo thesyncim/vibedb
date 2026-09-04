@@ -44,7 +44,7 @@ go test -v -count=1 -timeout=1m -run='^TestRegisteredWriterSIGKILLRelease$' ./in
 
 run_gate utc_tls ./internal/rafttransport TestPeerTLSIndependentUTCStepMatrix 2m
 run_gate logical_pulse ./gateway TestRecoveryManifestMissingPageRequiresLogicalPulsesAcrossRestart 2m
-run_gate transaction_recovery ./internal/raftservice TestTwoRealRF3GroupsExecuteFusedTwoParticipantTransactionAcrossLeaderIsolation 3m
+run_gate transaction_recovery ./internal/raftservice TestTwoRealRF3GroupsExecuteFusedTwoTargetTransactionAcrossLeaderIsolation 3m
 run_gate foreground_suspend ./internal/raftservice TestRF3NativeServingThreeProcessRecoveryEvidence 4m
 
 qualification="${evidence_dir}/shipped-rf3-qualification.tsv"

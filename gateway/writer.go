@@ -66,7 +66,7 @@ var ErrWriteShardKeyMove = errors.New("gateway: update replacement document woul
 var ErrExecRequiresMutation = errors.New("gateway: Exec requires a mutating statement")
 
 // ErrGlobalIndexMaintenanceUnsupported reports an indexed mutation whose old
-// and new rows cannot yet be proven before participant staging. Refusing it is
+// and new rows cannot yet be proven before target staging. Refusing it is
 // a correctness fence: a READY global index is never allowed to drift behind
 // its base table.
 var ErrGlobalIndexMaintenanceUnsupported = errors.New("gateway: global index maintenance for this mutation shape is unsupported")

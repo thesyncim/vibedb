@@ -147,7 +147,7 @@ func NewHeadWithRequestDigest(key RequestKey, requestDigest Digest, plan []byte)
 }
 
 // NewHeadWithContract binds terminal settlement to the exact catalog,
-// participant, and result-shape contract selected before any outbound step.
+// target, and result-shape contract selected before any outbound step.
 func NewHeadWithContract(
 	key RequestKey,
 	requestDigest Digest,

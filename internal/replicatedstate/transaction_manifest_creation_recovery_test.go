@@ -24,11 +24,11 @@ func TestTransactionManifestCreationRecoveryAfterNonfusedAppend(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for index := 0; len(pages) == 0 && index <= distributedtxn.MaxManifestPageParticipants; index++ {
-		if err := builder.Append(distributedtxn.ParticipantRef{
+	for index := 0; len(pages) == 0 && index <= distributedtxn.MaxManifestPageTargets; index++ {
+		if err := builder.Append(distributedtxn.TransactionTargetRef{
 			Distribution: []byte("dist"), Shard: []byte(fmt.Sprintf("shard-%08d", index)),
 			RoutingVersion: 1, AllocationGeneration: 1, OwnershipEpoch: 1,
-			MutationDigest: transactionCodecDigest(15), State: distributedtxn.ParticipantStaged,
+			MutationDigest: transactionCodecDigest(15), State: distributedtxn.TargetStaged,
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -143,12 +143,12 @@ func assertManifestCreationCorruptionRejected(
 	})
 	t.Run("canonical-first-page-substitution", func(t *testing.T) {
 		page, err := distributedtxn.OpenManifestSegment(pages[0],
-			make([]distributedtxn.ParticipantRef, distributedtxn.MaxManifestPageParticipants),
-			make([]byte, distributedtxn.MaxManifestPageParticipants*distributedtxn.MaxShardIdentityBytes*2))
+			make([]distributedtxn.TransactionTargetRef, distributedtxn.MaxManifestPageTargets),
+			make([]byte, distributedtxn.MaxManifestPageTargets*distributedtxn.MaxShardIdentityBytes*2))
 		if err != nil {
 			t.Fatal(err)
 		}
-		page.Participants[0].MutationDigest[0] ^= 0x80
+		page.Targets[0].MutationDigest[0] ^= 0x80
 		var encoded []byte
 		builder, err := distributedtxn.NewManifestBuilder(make([]byte, distributedtxn.ManifestSegmentBytes),
 			func(segment distributedtxn.ManifestSegment) error {
@@ -159,8 +159,8 @@ func assertManifestCreationCorruptionRejected(
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, participant := range page.Participants {
-			if err := builder.Append(participant); err != nil {
+		for _, target := range page.Targets {
+			if err := builder.Append(target); err != nil {
 				t.Fatal(err)
 			}
 		}

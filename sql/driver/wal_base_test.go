@@ -190,7 +190,7 @@ func TestReplicatedApplyCaptureWALBaseSealsOneScanWithoutArtifact(t *testing.T) 
 	if group == nil || !group.Owns(members) {
 		t.Fatal("WAL-base capture checkpoint membership mismatch")
 	}
-	participants := uint64(len(members))
+	targets := uint64(len(members))
 	beforeStats := group.Stats()
 	beforeFiles := walBaseDataFiles(t, database)
 	beforeCut, err := claim.SnapshotArtifactCut()
@@ -253,10 +253,10 @@ func TestReplicatedApplyCaptureWALBaseSealsOneScanWithoutArtifact(t *testing.T) 
 
 	afterStats := group.Stats()
 	if afterStats.CheckpointAppliedIndex != 1 ||
-		afterStats.CertificateSyncs-beforeStats.CertificateSyncs != participants ||
+		afterStats.CertificateSyncs-beforeStats.CertificateSyncs != targets ||
 		afterStats.Checkpoints-beforeStats.Checkpoints != 1 ||
-		afterStats.BarrierSyncs-beforeStats.BarrierSyncs != participants+1 ||
-		afterStats.PhysicalCheckpoints-beforeStats.PhysicalCheckpoints != participants {
+		afterStats.BarrierSyncs-beforeStats.BarrierSyncs != targets+1 ||
+		afterStats.PhysicalCheckpoints-beforeStats.PhysicalCheckpoints != targets {
 		t.Fatalf("capture seal stats: before=%+v after=%+v", beforeStats, afterStats)
 	}
 	if afterFiles := walBaseDataFiles(t, database); !slices.Equal(afterFiles, beforeFiles) {

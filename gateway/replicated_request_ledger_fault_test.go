@@ -943,7 +943,7 @@ type durableFaultRunner struct {
 	data  *durableRunnerData
 }
 
-type durableParticipantProofRunner struct {
+type durableTargetProofRunner struct {
 	data *durableRunnerData
 }
 
@@ -976,20 +976,20 @@ func (runner *durableFaultRunner) Run(
 	recipe DurableRequestRecipe,
 	journal DurableRequestStepJournal,
 ) (DurableRequestTerminal, error) {
-	if runner == nil || journal == nil || recipe.ParticipantStream == nil ||
-		recipe.ParticipantCount == 0 {
+	if runner == nil || journal == nil || recipe.TargetStream == nil ||
+		recipe.TargetCount == 0 {
 		return DurableRequestTerminal{}, ErrDurableRequest
 	}
-	var participants uint64
-	for recipe.ParticipantStream.Next() {
-		_ = recipe.ParticipantStream.Current()
-		participants++
+	var targets uint64
+	for recipe.TargetStream.Next() {
+		_ = recipe.TargetStream.Current()
+		targets++
 	}
-	if err := recipe.ParticipantStream.Err(); err != nil {
+	if err := recipe.TargetStream.Err(); err != nil {
 		return DurableRequestTerminal{}, err
 	}
-	if !recipe.ParticipantStream.Complete() ||
-		participants != recipe.ParticipantCount || participants > math.MaxInt64 {
+	if !recipe.TargetStream.Complete() ||
+		targets != recipe.TargetCount || targets > math.MaxInt64 {
 		return DurableRequestTerminal{}, ErrDurableRequestConflict
 	}
 	next, err := openDurableRunnerProgress(recipe.Progress, len(runner.steps))
@@ -1034,10 +1034,10 @@ func (runner *durableFaultRunner) Run(
 		}
 	}
 	result, err := AppendDurableRequestResult(nil, DurableRequestResult{
-		Committed: true, AffectedRows: int64(participants),
+		Committed: true, AffectedRows: int64(targets),
 		Transaction:       [16]byte(recipe.Identity.ID),
 		CatalogGeneration: recipe.Identity.CatalogGeneration,
-		ShardsFanned:      participants, TransitionTag: recipe.Contract.CommitTransitionTag,
+		ShardsFanned:      targets, TransitionTag: recipe.Contract.CommitTransitionTag,
 		TerminalStateDigest:     recipe.Contract.CommitTerminalStateDigest,
 		TerminalContractDigest:  recipe.Contract.TerminalContractDigest,
 		RetirementWitnessDigest: recipe.Contract.RetirementWitnessDigest,
@@ -1049,41 +1049,41 @@ func (runner *durableFaultRunner) Run(
 	return DurableRequestTerminal{Result: result}, nil
 }
 
-func durableParticipantProofStep(
-	participant DurableRequestLogicalParticipant,
+func durableTargetProofStep(
+	logical DurableRequestLogicalTarget,
 	ordinal uint64,
 ) (target, command []byte) {
-	target = append(target, participant.Group.GroupID[:]...)
-	command = append(command, participant.Group.ShardIncarnation[:]...)
+	target = append(target, logical.Group.GroupID[:]...)
+	command = append(command, logical.Group.ShardIncarnation[:]...)
 	var encodedOrdinal [8]byte
 	binary.LittleEndian.PutUint64(encodedOrdinal[:], ordinal)
 	command = append(command, encodedOrdinal[:]...)
 	return target, command
 }
 
-func (runner *durableParticipantProofRunner) Run(
+func (runner *durableTargetProofRunner) Run(
 	ctx context.Context,
 	recipe DurableRequestRecipe,
 	journal DurableRequestStepJournal,
 ) (DurableRequestTerminal, error) {
 	if runner == nil || runner.data == nil || journal == nil ||
-		recipe.ParticipantStream == nil || recipe.ParticipantCount == 0 ||
-		recipe.ParticipantCount > math.MaxInt64 {
+		recipe.TargetStream == nil || recipe.TargetCount == 0 ||
+		recipe.TargetCount > math.MaxInt64 {
 		return DurableRequestTerminal{}, ErrDurableRequest
 	}
-	next, err := openDurableRunnerProgress(recipe.Progress, int(recipe.ParticipantCount))
+	next, err := openDurableRunnerProgress(recipe.Progress, int(recipe.TargetCount))
 	if err != nil {
 		return DurableRequestTerminal{}, err
 	}
 	pending := len(recipe.Pending.Command) != 0
 	var ordinal uint64
-	for recipe.ParticipantStream.Next() {
-		participant := recipe.ParticipantStream.Current()
+	for recipe.TargetStream.Next() {
+		logical := recipe.TargetStream.Current()
 		if ordinal < uint64(next) {
 			ordinal++
 			continue
 		}
-		target, command := durableParticipantProofStep(participant, ordinal)
+		target, command := durableTargetProofStep(logical, ordinal)
 		if pending {
 			if ordinal != uint64(next) ||
 				!bytes.Equal(recipe.Pending.Target, target) ||
@@ -1112,11 +1112,11 @@ func (runner *durableParticipantProofRunner) Run(
 		next++
 		ordinal++
 	}
-	if err := recipe.ParticipantStream.Err(); err != nil {
+	if err := recipe.TargetStream.Err(); err != nil {
 		return DurableRequestTerminal{}, err
 	}
-	if !recipe.ParticipantStream.Complete() || pending ||
-		ordinal != recipe.ParticipantCount || uint64(next) != ordinal {
+	if !recipe.TargetStream.Complete() || pending ||
+		ordinal != recipe.TargetCount || uint64(next) != ordinal {
 		return DurableRequestTerminal{}, ErrDurableRequestConflict
 	}
 	result, err := AppendDurableRequestResult(nil, DurableRequestResult{
@@ -1140,24 +1140,24 @@ func (runner durableStaticTerminalRunner) Run(
 	recipe DurableRequestRecipe,
 	journal DurableRequestStepJournal,
 ) (DurableRequestTerminal, error) {
-	if journal == nil || recipe.ParticipantStream == nil {
+	if journal == nil || recipe.TargetStream == nil {
 		return DurableRequestTerminal{}, ErrDurableRequest
 	}
 	var count uint64
-	for recipe.ParticipantStream.Next() {
-		_ = recipe.ParticipantStream.Current()
+	for recipe.TargetStream.Next() {
+		_ = recipe.TargetStream.Current()
 		count++
 	}
-	if err := recipe.ParticipantStream.Err(); err != nil {
+	if err := recipe.TargetStream.Err(); err != nil {
 		return DurableRequestTerminal{}, err
 	}
-	if !recipe.ParticipantStream.Complete() || count != recipe.ParticipantCount {
+	if !recipe.TargetStream.Complete() || count != recipe.TargetCount {
 		return DurableRequestTerminal{}, ErrDurableRequestConflict
 	}
 	return cloneDurableFaultTerminal(runner.terminal), nil
 }
 
-func durableFaultParticipants(t *testing.T) []ReplicatedTransactionParticipant {
+func durableFaultTargets(t *testing.T) []ReplicatedTransactionTarget {
 	t.Helper()
 	snapshot, executor := replicatedSQLTransactionFixture(t, true)
 	queries := []Query{
@@ -1168,38 +1168,38 @@ func durableFaultParticipants(t *testing.T) []ReplicatedTransactionParticipant {
 			shardservice.StringParam("log-fault"),
 		}},
 	}
-	participants, handled, err := executor.planReplicatedSQLTransaction(
+	targets, handled, err := executor.planReplicatedSQLTransaction(
 		t.Context(), snapshot, queries, executor.profileFor(ClassInteractive),
 	)
-	if err != nil || !handled || len(participants) != 2 {
-		t.Fatalf("fault participants handled=%v count=%d err=%v", handled, len(participants), err)
+	if err != nil || !handled || len(targets) != 2 {
+		t.Fatalf("fault participants handled=%v count=%d err=%v", handled, len(targets), err)
 	}
-	return participants
+	return targets
 }
 
-func durableFaultParticipantsN(
+func durableFaultTargetsN(
 	t *testing.T,
 	count int,
-) []ReplicatedTransactionParticipant {
+) []ReplicatedTransactionTarget {
 	t.Helper()
-	base := durableFaultParticipants(t)[0]
-	participants := make([]ReplicatedTransactionParticipant, count)
-	for index := range participants {
-		participant := base
-		participant.Route = cloneDurableRequestRoute(base.Route)
-		participant.Route.Distribution = distribution.DistributionName(
+	base := durableFaultTargets(t)[0]
+	targets := make([]ReplicatedTransactionTarget, count)
+	for index := range targets {
+		target := base
+		target.Route = cloneDurableRequestRoute(base.Route)
+		target.Route.Distribution = distribution.DistributionName(
 			"fault-distribution-" + strconv.Itoa(index),
 		)
-		participant.Route.Shard = distribution.ShardID("fault-shard-" + strconv.Itoa(index))
-		participant.Route.Group.GroupID = [16]byte{}
-		participant.Route.Group.ShardIncarnation = [16]byte{}
-		binary.LittleEndian.PutUint64(participant.Route.Group.GroupID[:8], uint64(index)+1)
+		target.Route.Shard = distribution.ShardID("fault-shard-" + strconv.Itoa(index))
+		target.Route.Group.GroupID = [16]byte{}
+		target.Route.Group.ShardIncarnation = [16]byte{}
+		binary.LittleEndian.PutUint64(target.Route.Group.GroupID[:8], uint64(index)+1)
 		binary.LittleEndian.PutUint64(
-			participant.Route.Group.ShardIncarnation[:8], uint64(index)+1,
+			target.Route.Group.ShardIncarnation[:8], uint64(index)+1,
 		)
-		participants[index] = participant
+		targets[index] = target
 	}
-	return participants
+	return targets
 }
 
 func durableFaultSteps() []durableRunnerStep {
@@ -1214,7 +1214,7 @@ func durableFaultSteps() []durableRunnerStep {
 
 func durableFaultTopology(
 	t *testing.T,
-	participants []ReplicatedTransactionParticipant,
+	targets []ReplicatedTransactionTarget,
 ) *DurableRequestLedgerTopologyHolder {
 	t.Helper()
 	holder, err := NewDurableRequestLedgerTopologyHolder(DurableRequestLedgerTopology{
@@ -1222,11 +1222,11 @@ func durableFaultTopology(
 		Ranges: []DurableRequestLedgerRange{
 			{
 				End:      requestledger.LedgerHome{0x80},
-				Identity: replication.Digest{1}, Route: participants[0].Route,
+				Identity: replication.Digest{1}, Route: targets[0].Route,
 			},
 			{
 				Start:    requestledger.LedgerHome{0x80},
-				Identity: replication.Digest{2}, Route: participants[1].Route,
+				Identity: replication.Digest{2}, Route: targets[1].Route,
 			},
 		},
 	})
@@ -1252,16 +1252,16 @@ func newDurableFaultExecutor(
 	return executor
 }
 
-func durableFaultRequest(t *testing.T, participants []ReplicatedTransactionParticipant) DurableRequest {
+func durableFaultRequest(t *testing.T, targets []ReplicatedTransactionTarget) DurableRequest {
 	t.Helper()
 	return durableFaultRequestWith(
-		t, participants, replication.ID128{0x51}, replication.Digest{0x61}, 7,
+		t, targets, replication.ID128{0x51}, replication.Digest{0x61}, 7,
 	)
 }
 
 func durableFaultRequestWith(
 	t *testing.T,
-	participants []ReplicatedTransactionParticipant,
+	targets []ReplicatedTransactionTarget,
 	requestID replication.ID128,
 	requestDigest replication.Digest,
 	catalogGeneration uint64,
@@ -1281,33 +1281,33 @@ func durableFaultRequestWith(
 	if err != nil {
 		t.Fatal(err)
 	}
-	logical := make([]DurableRequestLogicalParticipant, len(participants))
-	for index := range participants {
-		participant := &participants[index]
+	logical := make([]DurableRequestLogicalTarget, len(targets))
+	for index := range targets {
+		target := &targets[index]
 		rangeDigest := sha256.Sum256([]byte(
-			"range/" + string(participant.Route.Distribution) + "/" + string(participant.Route.Shard),
+			"range/" + string(target.Route.Distribution) + "/" + string(target.Route.Shard),
 		))
 		lineageDigest := sha256.Sum256([]byte(
-			"lineage/" + string(participant.Route.Distribution) + "/" + string(participant.Route.Shard),
+			"lineage/" + string(target.Route.Distribution) + "/" + string(target.Route.Shard),
 		))
 		forwardingDigest := sha256.Sum256([]byte(
-			"forward/" + string(participant.Route.Distribution) + "/" + string(participant.Route.Shard),
+			"forward/" + string(target.Route.Distribution) + "/" + string(target.Route.Shard),
 		))
-		logical[index] = DurableRequestLogicalParticipant{
-			Distribution:           participant.Route.Distribution,
-			Shard:                  participant.Route.Shard,
+		logical[index] = DurableRequestLogicalTarget{
+			Distribution:           target.Route.Distribution,
+			Shard:                  target.Route.Shard,
 			RangeIdentity:          replication.Digest(rangeDigest),
-			Group:                  participant.Route.Group,
-			SchemaGeneration:       participant.Route.Command.SchemaGeneration,
-			RelationManifestDigest: participant.Route.Command.RelationManifestDigest,
+			Group:                  target.Route.Group,
+			SchemaGeneration:       target.Route.Command.SchemaGeneration,
+			RelationManifestDigest: target.Route.Command.RelationManifestDigest,
 			LineageDigest:          replication.Digest(lineageDigest),
 			ForwardingRuleDigest:   replication.Digest(forwardingDigest),
-			BucketBits:             participant.BucketBits,
-			IntentScopes:           participant.IntentScopes,
-			Batches:                participant.Batches,
+			BucketBits:             target.BucketBits,
+			IntentScopes:           target.IntentScopes,
+			Batches:                target.Batches,
 		}
 	}
-	slices.SortFunc(logical, compareDurableRequestLogicalParticipant)
+	slices.SortFunc(logical, compareDurableRequestLogicalTarget)
 	program, err := SealDurableRequestLogicalProgram(DurableRequestLogicalProgram{
 		Identity: ReplicatedTransactionIdentity{
 			CatalogGeneration: catalogGeneration, RecoveryDeadline: 1 << 60,
@@ -1333,7 +1333,7 @@ func durableFaultRequestWith(
 			PlanningLeaseGeneration:      1,
 		},
 		Tenant: tenant, KeyDigest: replication.Digest(keyDigest), RequestID: requestID,
-		RequestDigest: requestDigest, Participants: logical,
+		RequestDigest: requestDigest, Targets: logical,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1342,12 +1342,12 @@ func durableFaultRequestWith(
 }
 
 func TestDurableRequestExecutorRequiresExactStructuredIssuerKey(t *testing.T) {
-	participants := durableFaultParticipants(t)
-	topology := durableFaultTopology(t, participants)
+	targets := durableFaultTargets(t)
+	topology := durableFaultTopology(t, targets)
 	executor := newDurableFaultExecutor(t, topology, newDurableFaultMemoryLedger(),
 		&durableFaultRunner{steps: durableFaultSteps(), rule: new(durableRunnerFaultRule),
 			data: newDurableRunnerData()})
-	request := durableFaultRequest(t, participants)
+	request := durableFaultRequest(t, targets)
 
 	for name, mutate := range map[string]func(*DurableRequestLedgerKey){
 		"epoch":    func(key *DurableRequestLedgerKey) { key.IssuerEpoch = 0 },
@@ -1408,8 +1408,8 @@ func TestDurableRequestReplacementRecoversEveryReplicatedBoundary(t *testing.T) 
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
-			participants := durableFaultParticipants(t)
-			topology := durableFaultTopology(t, participants)
+			targets := durableFaultTargets(t)
+			topology := durableFaultTopology(t, targets)
 			base := newDurableFaultMemoryLedger()
 			ledgerRule := new(durableFaultRule)
 			ledger := &durableFaultLedger{base: base, rule: ledgerRule}
@@ -1424,7 +1424,7 @@ func TestDurableRequestReplacementRecoversEveryReplicatedBoundary(t *testing.T) 
 			first := newDurableFaultExecutor(t, topology, ledger, &durableFaultRunner{
 				steps: steps, rule: runnerRule, data: data,
 			})
-			request := durableFaultRequest(t, participants)
+			request := durableFaultRequest(t, targets)
 			ctx, cancel := context.WithTimeout(
 				t.Context(), 10*time.Second,
 			)
@@ -1516,8 +1516,8 @@ func TestDurableRequestReplacementRecoversEveryReplicatedBoundary(t *testing.T) 
 }
 
 func TestDurableRequestAckResponseLossLeavesCompactPermanentTombstone(t *testing.T) {
-	participants := durableFaultParticipants(t)
-	topology := durableFaultTopology(t, participants)
+	targets := durableFaultTargets(t)
+	topology := durableFaultTopology(t, targets)
 	base := newDurableFaultMemoryLedger()
 	ledgerRule := new(durableFaultRule)
 	ledger := &durableFaultLedger{base: base, rule: ledgerRule}
@@ -1525,7 +1525,7 @@ func TestDurableRequestAckResponseLossLeavesCompactPermanentTombstone(t *testing
 	data := newDurableRunnerData()
 	runner := &durableFaultRunner{steps: durableFaultSteps(), rule: runnerRule, data: data}
 	executor := newDurableFaultExecutor(t, topology, ledger, runner)
-	request := durableFaultRequest(t, participants)
+	request := durableFaultRequest(t, targets)
 	ctx := t.Context()
 	outcome, err := executor.Execute(ctx, request)
 	if err != nil || !outcome.Committed || outcome.Acknowledged {
@@ -1538,11 +1538,11 @@ func TestDurableRequestAckResponseLossLeavesCompactPermanentTombstone(t *testing
 	changedDigest := request.Program.RequestDigest
 	changedDigest[0] ^= 0xff
 	forgedDigest := durableFaultRequestWith(
-		t, participants, request.Program.RequestID, changedDigest,
+		t, targets, request.Program.RequestID, changedDigest,
 		request.Program.Identity.CatalogGeneration,
 	)
 	forgedPlan := durableFaultRequestWith(
-		t, participants, request.Program.RequestID, request.Program.RequestDigest,
+		t, targets, request.Program.RequestID, request.Program.RequestDigest,
 		request.Program.Identity.CatalogGeneration+1,
 	)
 	for name, candidate := range map[string]DurableRequest{
@@ -1632,17 +1632,17 @@ func TestDurableRequestAckResponseLossLeavesCompactPermanentTombstone(t *testing
 }
 
 func TestDurableRequestTerminalServesAbortAndRejectsForgedSemantics(t *testing.T) {
-	participants := durableFaultParticipants(t)
-	topology := durableFaultTopology(t, participants)
+	targets := durableFaultTargets(t)
+	topology := durableFaultTopology(t, targets)
 	ctx := t.Context()
 	abortRequest := durableFaultRequestWith(
-		t, participants, replication.ID128{0x76}, replication.Digest{0x77}, 7,
+		t, targets, replication.ID128{0x76}, replication.Digest{0x77}, 7,
 	)
 	abortRaw, err := AppendDurableRequestResult(nil, DurableRequestResult{
 		Committed:               false,
 		Transaction:             [16]byte(abortRequest.Program.Identity.ID),
 		CatalogGeneration:       abortRequest.Program.Identity.CatalogGeneration,
-		ShardsFanned:            uint64(len(abortRequest.Program.Participants)),
+		ShardsFanned:            uint64(len(abortRequest.Program.Targets)),
 		TransitionTag:           abortRequest.Program.Contract.AbortTransitionTag,
 		TerminalStateDigest:     abortRequest.Program.Contract.AbortTerminalStateDigest,
 		TerminalContractDigest:  abortRequest.Program.Contract.TerminalContractDigest,
@@ -1672,14 +1672,14 @@ func TestDurableRequestTerminalServesAbortAndRejectsForgedSemantics(t *testing.T
 	}
 
 	forgedRequest := durableFaultRequestWith(
-		t, participants, replication.ID128{0x78}, replication.Digest{0x79}, 7,
+		t, targets, replication.ID128{0x78}, replication.Digest{0x79}, 7,
 	)
 	validCommit, err := AppendDurableRequestResult(nil, DurableRequestResult{
 		Committed:               true,
 		AffectedRows:            2,
 		Transaction:             [16]byte(forgedRequest.Program.Identity.ID),
 		CatalogGeneration:       forgedRequest.Program.Identity.CatalogGeneration,
-		ShardsFanned:            uint64(len(forgedRequest.Program.Participants)),
+		ShardsFanned:            uint64(len(forgedRequest.Program.Targets)),
 		TransitionTag:           forgedRequest.Program.Contract.CommitTransitionTag,
 		TerminalStateDigest:     forgedRequest.Program.Contract.CommitTerminalStateDigest,
 		TerminalContractDigest:  forgedRequest.Program.Contract.TerminalContractDigest,
@@ -1700,7 +1700,7 @@ func TestDurableRequestTerminalServesAbortAndRejectsForgedSemantics(t *testing.T
 		Committed:               false,
 		Transaction:             [16]byte(forgedRequest.Program.Identity.ID),
 		CatalogGeneration:       forgedRequest.Program.Identity.CatalogGeneration,
-		ShardsFanned:            uint64(len(forgedRequest.Program.Participants)),
+		ShardsFanned:            uint64(len(forgedRequest.Program.Targets)),
 		TransitionTag:           forgedRequest.Program.Contract.AbortTransitionTag,
 		TerminalStateDigest:     forgedRequest.Program.Contract.AbortTerminalStateDigest,
 		TerminalContractDigest:  forgedRequest.Program.Contract.TerminalContractDigest,
@@ -1716,7 +1716,7 @@ func TestDurableRequestTerminalServesAbortAndRejectsForgedSemantics(t *testing.T
 		AffectedRows:            2,
 		Transaction:             [16]byte(forgedRequest.Program.Identity.ID),
 		CatalogGeneration:       forgedRequest.Program.Identity.CatalogGeneration + 1,
-		ShardsFanned:            uint64(len(forgedRequest.Program.Participants)),
+		ShardsFanned:            uint64(len(forgedRequest.Program.Targets)),
 		TransitionTag:           forgedRequest.Program.Contract.CommitTransitionTag,
 		TerminalStateDigest:     forgedRequest.Program.Contract.CommitTerminalStateDigest,
 		TerminalContractDigest:  forgedRequest.Program.Contract.TerminalContractDigest,
@@ -1730,7 +1730,7 @@ func TestDurableRequestTerminalServesAbortAndRejectsForgedSemantics(t *testing.T
 		AffectedRows:            2,
 		Transaction:             [16]byte(forgedRequest.Program.Identity.ID),
 		CatalogGeneration:       forgedRequest.Program.Identity.CatalogGeneration,
-		ShardsFanned:            uint64(len(forgedRequest.Program.Participants)) + 1,
+		ShardsFanned:            uint64(len(forgedRequest.Program.Targets)) + 1,
 		TransitionTag:           forgedRequest.Program.Contract.CommitTransitionTag,
 		TerminalStateDigest:     forgedRequest.Program.Contract.CommitTerminalStateDigest,
 		TerminalContractDigest:  forgedRequest.Program.Contract.TerminalContractDigest,
@@ -1777,8 +1777,8 @@ func TestDurableRequestTerminalServesAbortAndRejectsForgedSemantics(t *testing.T
 }
 
 func TestDurableRequestStatelessCapacityFloodDoesNotConsumeRecoveryAuthority(t *testing.T) {
-	participants := durableFaultParticipants(t)
-	topology := durableFaultTopology(t, participants)
+	targets := durableFaultTargets(t)
+	topology := durableFaultTopology(t, targets)
 	base := newDurableFaultMemoryLedger()
 	ledger := &durableCapacityLedger{
 		durableFaultLedger: &durableFaultLedger{base: base, rule: new(durableFaultRule)},
@@ -1796,7 +1796,7 @@ func TestDurableRequestStatelessCapacityFloodDoesNotConsumeRecoveryAuthority(t *
 		requestID := replication.ID128{}
 		binary.LittleEndian.PutUint64(requestID[:8], uint64(index+1))
 		request := durableFaultRequestWith(
-			t, participants, requestID,
+			t, targets, requestID,
 			replication.Digest{0x91, byte(index), byte(index >> 8)}, 7,
 		)
 		outcome, err := executor.Execute(ctx, request)
@@ -1869,8 +1869,8 @@ func TestDurableRequestStageUsesAppliedCompletionFastPath(t *testing.T) {
 		{name: "response_lost", responseLost: true, wantLookups: 1, wantStageErr: true},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
-			participants := durableFaultParticipants(t)
-			topology := durableFaultTopology(t, participants)
+			targets := durableFaultTargets(t)
+			topology := durableFaultTopology(t, targets)
 			base := newDurableFaultMemoryLedger()
 			rule := new(durableFaultRule)
 			ledger := &durableFaultLedger{base: base, rule: rule}
@@ -1879,7 +1879,7 @@ func TestDurableRequestStageUsesAppliedCompletionFastPath(t *testing.T) {
 				data: newDurableRunnerData(),
 			})
 			request := durableFaultRequestWith(
-				t, participants, replication.ID128{0x72}, replication.Digest{0x73}, 7,
+				t, targets, replication.ID128{0x72}, replication.Digest{0x73}, 7,
 			)
 			ctx := t.Context()
 			key := request.Key
@@ -1940,8 +1940,8 @@ func TestDurableRequestRefreshesSameHomeAtEveryLifecycleCut(t *testing.T) {
 		{name: "ack", operation: durableFaultAcknowledge, wantCalls: 2, ack: true},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
-			participants := durableFaultParticipants(t)
-			topology := durableFaultTopology(t, participants)
+			targets := durableFaultTargets(t)
+			topology := durableFaultTopology(t, targets)
 			current := topology.Current()
 			nextRanges := make([]DurableRequestLedgerRange, len(current.Ranges))
 			for index := range current.Ranges {
@@ -1966,7 +1966,7 @@ func TestDurableRequestRefreshesSameHomeAtEveryLifecycleCut(t *testing.T) {
 				steps: durableFaultSteps(), rule: new(durableRunnerFaultRule), data: data,
 			})
 			request := durableFaultRequestWith(
-				t, participants, replication.ID128{0x74, byte(testCase.operation)},
+				t, targets, replication.ID128{0x74, byte(testCase.operation)},
 				replication.Digest{0x75, byte(testCase.operation)}, 7,
 			)
 			ctx := t.Context()
@@ -1992,11 +1992,11 @@ func TestDurableRequestRefreshesSameHomeAtEveryLifecycleCut(t *testing.T) {
 	}
 }
 
-func TestDurableRequestPagedRecipeHasNoParticipantCliff(t *testing.T) {
+func TestDurableRequestPagedRecipeHasNoTargetCliff(t *testing.T) {
 	for _, count := range []int{64, 65, 4097} {
 		t.Run(strconv.Itoa(count), func(t *testing.T) {
-			participants := durableFaultParticipantsN(t, count)
-			topology := durableFaultTopology(t, participants)
+			targets := durableFaultTargetsN(t, count)
+			topology := durableFaultTopology(t, targets)
 			base := newDurableFaultMemoryLedger()
 			ledger := &durableFaultLedger{base: base, rule: new(durableFaultRule)}
 			data := newDurableRunnerData()
@@ -2004,7 +2004,7 @@ func TestDurableRequestPagedRecipeHasNoParticipantCliff(t *testing.T) {
 				steps: durableFaultSteps(), rule: new(durableRunnerFaultRule), data: data,
 			})
 			request := durableFaultRequestWith(
-				t, participants, replication.ID128{byte(count), byte(count >> 8)},
+				t, targets, replication.ID128{byte(count), byte(count >> 8)},
 				replication.Digest{byte(count), byte(count >> 8), 0x7d}, 7,
 			)
 			ctx := t.Context()
@@ -2044,18 +2044,18 @@ func TestDurableRequestPagedRecipeHasNoParticipantCliff(t *testing.T) {
 	}
 }
 
-func TestDurableRequestWideStreamDispatchesEveryParticipant(t *testing.T) {
+func TestDurableRequestWideStreamDispatchesEveryTarget(t *testing.T) {
 	const count = 8193
-	participants := durableFaultParticipantsN(t, count)
-	topology := durableFaultTopology(t, participants)
+	targets := durableFaultTargetsN(t, count)
+	topology := durableFaultTopology(t, targets)
 	base := newDurableFaultMemoryLedger()
 	ledger := &durableFaultLedger{base: base, rule: new(durableFaultRule)}
 	data := newDurableRunnerData()
 	executor := newDurableFaultExecutor(
-		t, topology, ledger, &durableParticipantProofRunner{data: data},
+		t, topology, ledger, &durableTargetProofRunner{data: data},
 	)
 	request := durableFaultRequestWith(
-		t, participants, replication.ID128{0x79, 0x20}, replication.Digest{0x7a, 0x20}, 7,
+		t, targets, replication.ID128{0x79, 0x20}, replication.Digest{0x7a, 0x20}, 7,
 	)
 	ctx := t.Context()
 	outcome, err := executor.Execute(ctx, request)
@@ -2075,11 +2075,11 @@ func TestDurableRequestWideStreamDispatchesEveryParticipant(t *testing.T) {
 }
 
 func TestDurableRequestPagedBuildResumesAtEveryDurableCut(t *testing.T) {
-	participants := durableFaultParticipantsN(t, 4097)
+	targets := durableFaultTargetsN(t, 4097)
 	request := durableFaultRequestWith(
-		t, participants, replication.ID128{0x7a}, replication.Digest{0x7b}, 7,
+		t, targets, replication.ID128{0x7a}, replication.Digest{0x7b}, 7,
 	)
-	topology := durableFaultTopology(t, participants)
+	topology := durableFaultTopology(t, targets)
 	ctx := t.Context()
 	key := request.Key
 	point, err := durableRequestLedgerHome(key)
@@ -2160,7 +2160,7 @@ func TestDurableRequestPagedBuildResumesAtEveryDurableCut(t *testing.T) {
 				steps: durableFaultSteps(), rule: new(durableRunnerFaultRule), data: data,
 			})
 			outcome, err := replacement.Execute(ctx, request)
-			if err != nil || !outcome.Committed || outcome.ShardsFanned != len(participants) {
+			if err != nil || !outcome.Committed || outcome.ShardsFanned != len(targets) {
 				t.Fatalf("replacement outcome=%+v err=%v", outcome, err)
 			}
 			entry, err = base.Lookup(ctx, home, key)
@@ -2173,13 +2173,13 @@ func TestDurableRequestPagedBuildResumesAtEveryDurableCut(t *testing.T) {
 }
 
 func TestDurableRequestConcurrentGatewaysConvergeOnOneOutcome(t *testing.T) {
-	participants := durableFaultParticipants(t)
-	topology := durableFaultTopology(t, participants)
+	targets := durableFaultTargets(t)
+	topology := durableFaultTopology(t, targets)
 	base := newDurableFaultMemoryLedger()
 	ledger := &durableFaultLedger{base: base, rule: new(durableFaultRule)}
 	data := newDurableRunnerData()
 	steps := durableFaultSteps()
-	request := durableFaultRequest(t, participants)
+	request := durableFaultRequest(t, targets)
 	ctx := t.Context()
 	type result struct {
 		outcome DurableRequestOutcome
@@ -2226,11 +2226,11 @@ func TestDurableRequestLostResponseConvergesWhenAnotherGatewayAdvancesAhead(t *t
 		{name: "advance", operation: durableFaultAdvance},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
-			participants := durableFaultParticipants(t)
+			targets := durableFaultTargets(t)
 			if testCase.wideRecipe {
-				participants = durableFaultParticipantsN(t, 4097)
+				targets = durableFaultTargetsN(t, 4097)
 			}
-			topology := durableFaultTopology(t, participants)
+			topology := durableFaultTopology(t, targets)
 			base := newDurableFaultMemoryLedger()
 			normal := &durableFaultLedger{base: base, rule: new(durableFaultRule)}
 			ahead := &durableAheadLedger{
@@ -2251,7 +2251,7 @@ func TestDurableRequestLostResponseConvergesWhenAnotherGatewayAdvancesAhead(t *t
 				steps: steps, rule: new(durableRunnerFaultRule), data: data,
 			})
 			request := durableFaultRequestWith(
-				t, participants, replication.ID128{0x7c, byte(testCase.operation)},
+				t, targets, replication.ID128{0x7c, byte(testCase.operation)},
 				replication.Digest{0x7d, byte(testCase.operation)}, 7,
 			)
 			ctx, cancel := context.WithTimeout(
@@ -2281,7 +2281,7 @@ func TestDurableRequestLostResponseConvergesWhenAnotherGatewayAdvancesAhead(t *t
 				t.Fatal(ctx.Err())
 			}
 			if secondErr != nil || !secondOutcome.Committed ||
-				secondOutcome.ShardsFanned != len(participants) {
+				secondOutcome.ShardsFanned != len(targets) {
 				t.Fatalf("ahead gateway outcome=%+v err=%v", secondOutcome, secondErr)
 			}
 			if firstValue.err != nil || !firstValue.outcome.Committed ||
@@ -2307,8 +2307,8 @@ func TestDurableRequestLostResponseConvergesWhenAnotherGatewayAdvancesAhead(t *t
 }
 
 func TestDurableRequestRoutesIndependentIdentitiesToTwoLedgerHomes(t *testing.T) {
-	participants := durableFaultParticipants(t)
-	topology := durableFaultTopology(t, participants)
+	targets := durableFaultTargets(t)
+	topology := durableFaultTopology(t, targets)
 	base := newDurableFaultMemoryLedger()
 	ledger := &durableFaultLedger{base: base, rule: new(durableFaultRule)}
 	data := newDurableRunnerData()
@@ -2321,7 +2321,7 @@ func TestDurableRequestRoutesIndependentIdentitiesToTwoLedgerHomes(t *testing.T)
 		requestID := replication.ID128{}
 		binary.LittleEndian.PutUint64(requestID[:8], value)
 		request := durableFaultRequestWith(
-			t, participants, requestID,
+			t, targets, requestID,
 			replication.Digest{byte(value), byte(value >> 8), 0x39}, 7,
 		)
 		point, err := durableRequestLedgerHome(request.Key)
@@ -2355,8 +2355,8 @@ func TestDurableRequestRoutesIndependentIdentitiesToTwoLedgerHomes(t *testing.T)
 }
 
 func TestDurableRequestLedgerHomeUsesCanonicalHalfOpenDigestRanges(t *testing.T) {
-	participants := durableFaultParticipants(t)
-	holder := durableFaultTopology(t, participants)
+	targets := durableFaultTargets(t)
+	holder := durableFaultTopology(t, targets)
 	topology := holder.Current()
 	boundaryMinusOne := requestledger.LedgerHome{0x7f}
 	for index := 1; index < len(boundaryMinusOne); index++ {
@@ -2390,8 +2390,8 @@ func TestDurableRequestLedgerHomeUsesCanonicalHalfOpenDigestRanges(t *testing.T)
 }
 
 func TestDurableRequestLedgerTopologyDoesNotExposeMutableRoutes(t *testing.T) {
-	participants := durableFaultParticipants(t)
-	holder := durableFaultTopology(t, participants)
+	targets := durableFaultTargets(t)
+	holder := durableFaultTopology(t, targets)
 	current := holder.Current()
 	wantIdentity := current.Ranges[0].Identity
 	wantAddress := current.Ranges[0].Route.Replicas[0].Address
@@ -2422,8 +2422,8 @@ func TestDurableRequestLedgerTopologyDoesNotExposeMutableRoutes(t *testing.T) {
 }
 
 func TestDurableRequestLedgerTopologyRejectsUnprovedRehome(t *testing.T) {
-	participants := durableFaultParticipants(t)
-	holder := durableFaultTopology(t, participants)
+	targets := durableFaultTargets(t)
+	holder := durableFaultTopology(t, targets)
 	current := holder.Current()
 	ranges := make([]DurableRequestLedgerRange, len(current.Ranges))
 	for index := range current.Ranges {
@@ -2458,7 +2458,7 @@ func TestDurableRequestLedgerTopologyRejectsUnprovedRehome(t *testing.T) {
 
 	added := []DurableRequestLedgerRange{
 		{End: requestledger.LedgerHome{0x40}, Identity: ranges[0].Identity, Route: ranges[0].Route},
-		{Start: requestledger.LedgerHome{0x40}, End: ranges[0].End, Identity: replication.Digest{3}, Route: participants[0].Route},
+		{Start: requestledger.LedgerHome{0x40}, End: ranges[0].End, Identity: replication.Digest{3}, Route: targets[0].Route},
 		ranges[1],
 	}
 	if err := holder.Publish(DurableRequestLedgerTopology{
@@ -2481,10 +2481,10 @@ func TestDurableRequestLedgerTopologyRejectsUnprovedRehome(t *testing.T) {
 }
 
 func TestDurableRequestLedgerTopologyConcurrentPublishNeverRegresses(t *testing.T) {
-	participants := durableFaultParticipants(t)
+	targets := durableFaultTargets(t)
 	const publishers = 64
 	for attempt := 0; attempt < 32; attempt++ {
-		holder := durableFaultTopology(t, participants)
+		holder := durableFaultTopology(t, targets)
 		start := make(chan struct{})
 		var wait sync.WaitGroup
 		wait.Add(publishers)

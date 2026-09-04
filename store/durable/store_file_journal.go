@@ -146,9 +146,9 @@ var ErrTransactionMarkerEpochMismatch = errors.New(
 	"vibedb: conditional journal record epoch disagrees with the decision log",
 )
 
-// ErrTransactionParticipantBinding reports a committed decision whose marker
-// or participant tuple does not exactly bind the conditional record recovered.
-var ErrTransactionParticipantBinding = errors.New(
+// ErrTransactionCollectionBinding reports a committed decision whose marker
+// or target tuple does not exactly bind the conditional record recovered.
+var ErrTransactionCollectionBinding = errors.New(
 	"vibedb: transaction decision participant binding mismatch",
 )
 
@@ -592,7 +592,7 @@ func recoveryJournalDeltaReplayStart(
 // recoveryJournalDecisionResolver answers whether a kind-4 conditional batch
 // should apply. Database recovery constructs it per collection, closing over that
 // collection's (StoreID, JournalID) so a decision commits the record only when
-// its participant list names them. A nil resolver is standalone open.
+// its target list names them. A nil resolver is standalone open.
 type recoveryJournalDecisionResolver func(
 	markerID [16]byte, epoch, txnID, preparedGeneration uint64,
 ) (committed bool, err error)
@@ -622,7 +622,7 @@ var recoveryJournalReplayResolverHook func(*Collection) (
 //
 // Standalone opens pass a nil resolver: any retained kind-4 fails closed with
 // ErrCollectionInDoubt. Database opens call
-// replayRecoveryJournalResolvedLocked with a participant-binding resolver.
+// replayRecoveryJournalResolvedLocked with a target-binding resolver.
 func (c *Collection) replayRecoveryJournalLocked(rootGeneration uint64) error {
 	if hook := recoveryJournalReplayResolverHook; hook != nil {
 		resolve, epoch := hook(c)

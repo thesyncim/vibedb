@@ -194,7 +194,7 @@ func TestVerifyDatabaseTornDecision(t *testing.T) {
 	// Torn append writes a prefix and reports the short write. The checksummed
 	// record is incomplete, so inspection retains that residue as the distinct
 	// torn-decision diagnostic.
-	if _, err := marker.AppendDecision(99, []storeio.TxnParticipant{
+	if _, err := marker.AppendDecision(99, []storeio.TxnCollectionRef{
 		{StoreID: aStore, JournalID: aJournal, PreparedGeneration: 2},
 		{StoreID: bStore, JournalID: bJournal, PreparedGeneration: 2},
 	}); !errors.Is(err, io.ErrShortWrite) {
@@ -219,9 +219,9 @@ func TestVerifyDatabaseTornDecision(t *testing.T) {
 	}
 }
 
-// TestVerifyDatabaseMissingParticipant deletes a named participant file under
-// a live decision and expects missing_participant.
-func TestVerifyDatabaseMissingParticipant(t *testing.T) {
+// TestVerifyDatabaseMissingTarget deletes a named target file under
+// a live decision and expects missing_target.
+func TestVerifyDatabaseMissingTarget(t *testing.T) {
 	db, dir := openVerifyTestDB(t, "a", "b")
 	mustUpdateAB(t, db)
 	if err := db.Close(); err != nil {
@@ -405,7 +405,7 @@ func TestVerifyDatabaseDistinctDiagnostics(t *testing.T) {
 			Phase: storeio.TxnMarkerFaultTornAppend, AppendIndex: 0,
 		})
 		aStore, aJournal, _ := readStoreJournalIDs(t, collectionPath(t, dir, "a"))
-		if _, err := marker.AppendDecision(99, []storeio.TxnParticipant{{
+		if _, err := marker.AppendDecision(99, []storeio.TxnCollectionRef{{
 			StoreID: aStore, JournalID: aJournal, PreparedGeneration: 2,
 		}}); !errors.Is(err, io.ErrShortWrite) {
 			t.Fatalf("torn AppendDecision = %v, want io.ErrShortWrite", err)

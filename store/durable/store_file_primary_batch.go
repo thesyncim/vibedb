@@ -197,7 +197,7 @@ func (c *Collection) stagePrimaryBatchLocked(
 	return c.stagePrimaryBatchForJournalLocked(batch, false)
 }
 
-// stagePrimaryBatchConditionalLocked stages a multi-collection participant
+// stagePrimaryBatchConditionalLocked stages a multi-collection target
 // after reserving room for its larger kind-4 conditional journal record. The
 // ordinary buffered single-collection lane keeps its compact kind-3 journal
 // policy and physical-checkpoint fallback.
@@ -1203,7 +1203,7 @@ func (c *Collection) publishPrimaryBatch(
 }
 
 // publishPrimaryBatchGateHeld is the gate-held body of publishPrimaryBatch.
-// Multi-collection commit acquires every participant's snapshotGate write side
+// Multi-collection commit acquires every target's snapshotGate write side
 // in process-global order before calling this per member; single-collection
 // Update acquires the gate itself via publishPrimaryBatch. The writer must
 // already be held. Infallible by construction — see publishPrimaryBatch.

@@ -12,13 +12,13 @@ func FuzzManifestSegmentCanonicalUniqueness(f *testing.F) {
 	f.Add([]byte("not-a-manifest-segment"))
 
 	f.Fuzz(func(t *testing.T, raw []byte) {
-		participants := make([]ParticipantRef, MaxManifestPageParticipants)
-		identities := make([]byte, MaxManifestPageParticipants*MaxShardIdentityBytes*2)
-		page, err := OpenManifestSegment(raw, participants, identities)
+		targets := make([]TransactionTargetRef, MaxManifestPageTargets)
+		identities := make([]byte, MaxManifestPageTargets*MaxShardIdentityBytes*2)
+		page, err := OpenManifestSegment(raw, targets, identities)
 		if err != nil {
 			return
 		}
-		if page.Segment.Index != 0 || page.Segment.FirstParticipant != 0 {
+		if page.Segment.Index != 0 || page.Segment.FirstTarget != 0 {
 			return
 		}
 		arena := make([]byte, ManifestSegmentBytes)
@@ -30,8 +30,8 @@ func FuzzManifestSegmentCanonicalUniqueness(f *testing.F) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		for i := range page.Participants {
-			if err := builder.Append(page.Participants[i]); err != nil {
+		for i := range page.Targets {
+			if err := builder.Append(page.Targets[i]); err != nil {
 				t.Fatalf("accepted segment did not rebuild: %v", err)
 			}
 		}

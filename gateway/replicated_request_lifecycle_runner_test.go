@@ -173,9 +173,9 @@ type lifecycleRunnerResolver struct {
 	events *lifecycleRunnerEvents
 }
 
-func (resolver *lifecycleRunnerResolver) ResolveDurableRequestParticipant(
+func (resolver *lifecycleRunnerResolver) ResolveDurableRequestTarget(
 	_ context.Context,
-	_ DurableRequestLogicalParticipant,
+	_ DurableRequestLogicalTarget,
 ) (ReplicatedRoute, error) {
 	resolver.calls++
 	resolver.events.add("resolve")
@@ -310,7 +310,7 @@ func lifecycleRunnerFixture(t testing.TB) (
 ) {
 	t.Helper()
 	route, _, _ := testReplicatedRouteCommand(t)
-	physical := ReplicatedTransactionParticipant{
+	physical := ReplicatedTransactionTarget{
 		Route: route, BucketBits: 8,
 		Batches: []replication.RelationMutationBatch{{
 			Relation: 1,
@@ -381,7 +381,7 @@ func lifecycleRunnerFixture(t testing.TB) (
 	if err != nil {
 		t.Fatal(err)
 	}
-	logical := DurableRequestLogicalParticipant{
+	logical := DurableRequestLogicalTarget{
 		Distribution: physical.Route.Distribution, Shard: physical.Route.Shard,
 		RangeIdentity: replication.Digest(lifecycleDigest("range")), Group: physical.Route.Group,
 		SchemaGeneration:       physical.Route.Command.SchemaGeneration,
@@ -400,7 +400,7 @@ func lifecycleRunnerFixture(t testing.TB) (
 		Home: DurableRequestLedgerHome{
 			Identity: replication.Digest(lifecycleDigest("home")), Point: homePoint, route: physical.Route,
 		},
-		Key: key, Participant: logical,
+		Key: key, LogicalTarget: logical,
 		Identity: ReplicatedTransactionIdentity{
 			ID: [16]byte{7}, RetryHome: retry, CatalogGeneration: 7,
 			RecoveryDeadline: 1, CoordinatorOrdinal: 0,

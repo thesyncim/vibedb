@@ -832,7 +832,7 @@ func (m *Machine) AdmitCommand(data []byte) error {
 	}
 	var systemBase pointSnapshot
 	var relationSnapshots relationPointSnapshots
-	if isSingleParticipantCommand(command) {
+	if isSingleTargetCommand(command) {
 		// ReplicatedApply's database read lock excludes the sole apply writer for
 		// the complete admission call. Read the current journal-backed overlays
 		// directly so proposal admission never turns a dirty certified suffix

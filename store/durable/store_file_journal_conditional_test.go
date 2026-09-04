@@ -352,9 +352,9 @@ func TestConditionalReplayCoveredStillResolved(t *testing.T) {
 	}
 }
 
-// TestConditionalReplayParticipantBindingSkips proves a resolver that commits
+// TestConditionalReplayTargetBindingSkips proves a resolver that commits
 // the triple but (per its closure) does not name this collection skips apply.
-func TestConditionalReplayParticipantBindingSkips(t *testing.T) {
+func TestConditionalReplayTargetBindingSkips(t *testing.T) {
 	coll, file, path := openCatalogOwnedSyncCollection(t)
 	before := primaryStoreContent(t, coll)
 	markerID := conditionalMarkerID(6)

@@ -110,7 +110,7 @@ func directMutationAllocationFixture(tb testing.TB) ReplicatedDirectMutation {
 			IssuerEpoch: 7, IssuerSequence: 1, IssuerLane: requestledger.IssuerLane{0x32},
 		},
 		RequestDigest: replication.Digest{0x41}, Tenant: tenant,
-		Participant: ReplicatedTransactionParticipant{
+		Target: ReplicatedTransactionTarget{
 			Route: route, BucketBits: 8,
 			IntentScopes: []distributedtxn.IntentScope{{Start: 0, End: 256}},
 			Batches: []replication.RelationMutationBatch{{

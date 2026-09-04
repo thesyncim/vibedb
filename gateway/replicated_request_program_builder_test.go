@@ -15,7 +15,7 @@ func TestBuildDurableRequestLogicalProgramReservesOneLiveWave(t *testing.T) {
 	for _, count := range []int{1, 2, 65, 512} {
 		t.Run(fmt.Sprintf("participants_%d", count), func(t *testing.T) {
 			build := durableRequestProgramBuildFixture(t)
-			build.Participants = durableFaultParticipantsN(t, count)
+			build.Targets = durableFaultTargetsN(t, count)
 			program, err := BuildDurableRequestLogicalProgram(build)
 			if err != nil {
 				t.Fatal(err)
@@ -64,9 +64,9 @@ func TestBuildDurableRequestLogicalProgramReservesOneLiveWave(t *testing.T) {
 
 func durableRequestProgramBuildFixture(t *testing.T) DurableRequestLogicalProgramBuild {
 	t.Helper()
-	participants := durableFaultParticipants(t)
-	request := durableFaultRequest(t, participants)
-	topology := durableFaultTopology(t, participants)
+	targets := durableFaultTargets(t)
+	request := durableFaultRequest(t, targets)
+	topology := durableFaultTopology(t, targets)
 	point, err := requestledger.Home(request.Key.RequestKey)
 	if err != nil {
 		t.Fatal(err)
@@ -79,7 +79,7 @@ func durableRequestProgramBuildFixture(t *testing.T) DurableRequestLogicalProgra
 		Home: home, Key: request.Key, Tenant: slices.Clone(request.Program.Tenant),
 		CatalogGeneration: request.Program.Identity.CatalogGeneration,
 		RecoveryDeadline:  3, PlanningLeaseSpan: 100,
-		PlanningLeaseGeneration: 1, PinEpoch: 1, Participants: participants,
+		PlanningLeaseGeneration: 1, PinEpoch: 1, Targets: targets,
 	}
 }
 
@@ -109,8 +109,8 @@ func TestBuildDurableRequestLogicalProgramDerivesCompleteAggregateContract(t *te
 		CatalogGeneration:         program.Identity.CatalogGeneration,
 		SchemaManifestDigest:      executionpin.Digest(contract.SchemaManifestDigest),
 		TransactionManifestDigest: executionpin.Digest(contract.TransactionManifestDigest),
-		ParticipantAuthorityRoot:  executionpin.Digest(contract.LineageForwardingDigest),
-		ParticipantCount:          contract.ParticipantCount,
+		TargetAuthorityRoot:       executionpin.Digest(contract.LineageForwardingDigest),
+		TargetCount:               contract.TargetCount,
 		ExecutionContractDigest:   executionpin.Digest(contract.ProtocolProgramDigest),
 		LedgerHomeGroup:           executionpin.ID(build.Home.borrowedRoute().Group.GroupID),
 	}
@@ -126,24 +126,24 @@ func TestBuildDurableRequestLogicalProgramIsOrderIndependentAndOwnsMutationBytes
 	if err != nil {
 		t.Fatal(err)
 	}
-	slices.Reverse(build.Participants)
+	slices.Reverse(build.Targets)
 	second, err := BuildDurableRequestLogicalProgram(build)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if first.Contract != second.Contract || first.Identity != second.Identity ||
-		len(first.Participants) != len(second.Participants) {
+		len(first.Targets) != len(second.Targets) {
 		t.Fatal("caller participant order changed the sealed aggregate")
 	}
-	for index := range first.Participants {
-		if compareDurableRequestLogicalParticipant(first.Participants[index], second.Participants[index]) != 0 ||
-			first.Participants[index].MutationDigest != second.Participants[index].MutationDigest {
+	for index := range first.Targets {
+		if compareDurableRequestLogicalTarget(first.Targets[index], second.Targets[index]) != 0 ||
+			first.Targets[index].MutationDigest != second.Targets[index].MutationDigest {
 			t.Fatalf("participant %d changed under input reorder", index)
 		}
 	}
-	before := first.Participants[0].Batches[0].Mutations[0].Key[0]
-	build.Participants[0].Batches[0].Mutations[0].Key[0]++
-	if first.Participants[0].Batches[0].Mutations[0].Key[0] != before {
+	before := first.Targets[0].Batches[0].Mutations[0].Key[0]
+	build.Targets[0].Batches[0].Mutations[0].Key[0]++
+	if first.Targets[0].Batches[0].Mutations[0].Key[0] != before {
 		t.Fatal("sealed recipe borrowed caller mutation storage")
 	}
 }

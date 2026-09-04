@@ -716,8 +716,8 @@ func TestReplicatedProposalResponseBoundCarriesTransactionCompletion(t *testing.
 	}
 
 	var result [24]byte
-	result[0] = byte(distributedtxn.ReplicatedRoleParticipant)
-	result[1] = byte(distributedtxn.ReplicatedPrepareParticipant)
+	result[0] = byte(distributedtxn.ReplicatedRoleTarget)
+	result[1] = byte(distributedtxn.ReplicatedPrepareTarget)
 	result[2] = 2
 	binary.LittleEndian.PutUint64(result[8:16], 2)
 	if _, err := replicatedstate.OpenTransactionCompletionResult(
@@ -739,7 +739,7 @@ func TestReplicatedProposalResponseBoundCarriesTransactionCompletion(t *testing.
 		RoutingVersion:         fence.Command.RoutingVersion,
 		RouteGeneration:        fence.Command.RouteGeneration,
 		Tenant:                 []byte("tenant"), ClientID: replication.ID128{1},
-		ClientEpoch:    uint64(distributedtxn.ReplicatedRoleParticipant),
+		ClientEpoch:    uint64(distributedtxn.ReplicatedRoleTarget),
 		ClientSequence: 2, Fingerprint: replication.Digest{1},
 		AppliedSequence: 9,
 		ResultCode:      replicatedstate.ResultApplied,
@@ -1167,7 +1167,7 @@ func testReplicatedExecutionPinCommand(t testing.TB, fence ReplicatedFence, clas
 		RequestKeyDigest: digest(1), RequestDigest: digest(2),
 		CatalogGeneration:    3,
 		SchemaManifestDigest: digest(5), TransactionManifestDigest: digest(6),
-		ParticipantAuthorityRoot: digest(7), ParticipantCount: 8,
+		TargetAuthorityRoot: digest(7), TargetCount: 8,
 		ExecutionContractDigest: digest(9), LedgerHomeGroup: id(10),
 	}
 	pin, err := executionpin.DerivePinID(binding)

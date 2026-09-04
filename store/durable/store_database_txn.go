@@ -26,7 +26,7 @@ import (
 const txnMarkerFilename = "txn.vtm"
 
 var (
-	// ErrDatabaseTransactionUnsupportedLane reports that a participant's
+	// ErrDatabaseTransactionUnsupportedLane reports that a target's
 	// durability lane cannot join a multi-collection commit. Supported lanes
 	// are sync-journal and buffered-journal; buffered-volatile, async-COW, and
 	// chain-fence are refused with nothing staged.
@@ -34,7 +34,7 @@ var (
 		"vibedb: a database transaction requires a journal-backed lane (sync-journal or buffered-journal)",
 	)
 	// ErrTxnTooLarge reports that a multi-collection commit exceeds a
-	// cross-participant bound (collections, documents, bytes, or decision
+	// cross-target bound (collections, documents, bytes, or decision
 	// record capacity). Nothing was staged.
 	ErrTxnTooLarge = errors.New(
 		"vibedb: database transaction exceeds a bounded limit",
@@ -45,9 +45,9 @@ var (
 	ErrTxnLimitsRequired = errors.New(
 		"vibedb: database transaction requires explicit non-zero TxnLimits",
 	)
-	// ErrTxnParticipant reports a nil participant, an unnamed collection, a
+	// ErrTxnCollection reports a nil target, an unnamed collection, a
 	// duplicate name, or a DatabaseBatch.Collection name outside the member set.
-	ErrTxnParticipant = errors.New(
+	ErrTxnCollection = errors.New(
 		"vibedb: invalid database transaction participant",
 	)
 	// ErrTxnLogPoisoned reports that a prior decision-sync failure poisoned the
@@ -91,7 +91,7 @@ type TxnLog struct {
 	path string
 	root *os.Root
 	// rootInfo is the physical directory identity captured from root. It lets
-	// lazy mint reject mismatched participants before creating txn.vtm.
+	// lazy mint reject mismatched targets before creating txn.vtm.
 	rootInfo os.FileInfo
 	opts     TxnLogOptions
 
@@ -100,7 +100,7 @@ type TxnLog struct {
 	// nextTxnID is monotonic within the current epoch, seeded from the open
 	// scan's MaxTxnID (or 1 for a fresh mint).
 	nextTxnID uint64
-	// undischarged counts decisions whose participant journals may still hold
+	// undischarged counts decisions whose target journals may still hold
 	// matching kind-4 records. Recycle is legal only when this is zero and no
 	// registered journal holds a current-epoch conditional.
 	undischarged int
@@ -139,7 +139,7 @@ func (l *TxnLog) checkpointGroupMutationFenced() bool {
 // NewTxnLog constructs an unminted decision-log owner for a fresh catalog.
 // Any pre-existing txn.vtm is refused: only OpenCollectionsWithTransactions
 // may reopen a marker because decision-log recycle requires the complete live
-// participant catalog. The mint fence runs at the head of the first K ≥ 2
+// target catalog. The mint fence runs at the head of the first K ≥ 2
 // commit.
 func NewTxnLog(dir string, options TxnLogOptions) (*TxnLog, error) {
 	log, err := newTxnLogDirectory(dir, options)
@@ -395,7 +395,7 @@ func (l *TxnLog) ValidateCollections(members []NamedCollection) error {
 		return nil
 	}
 	if l == nil {
-		return fmt.Errorf("%w: nil transaction log", ErrTxnParticipant)
+		return fmt.Errorf("%w: nil transaction log", ErrTxnCollection)
 	}
 	l.commitMu.Lock()
 	defer l.commitMu.Unlock()
@@ -443,7 +443,7 @@ func (l *TxnLog) validateCollectionsLocked(ordered []NamedCollection) error {
 	for _, collection := range collections {
 		name := nameOf[collection]
 		if collection.closed {
-			return fmt.Errorf("%w: closed collection %q", ErrTxnParticipant, name)
+			return fmt.Errorf("%w: closed collection %q", ErrTxnCollection, name)
 		}
 		if failure := collection.PersistenceError(); failure != nil {
 			return fmt.Errorf("vibedb: collection %q persistence: %w", name, failure)
@@ -452,7 +452,7 @@ func (l *TxnLog) validateCollectionsLocked(ordered []NamedCollection) error {
 			return fmt.Errorf("%w: %s", ErrDatabaseTransactionUnsupportedLane, name)
 		}
 		if collection.file == nil {
-			return fmt.Errorf("%w: closed collection %q", ErrTxnParticipant, name)
+			return fmt.Errorf("%w: closed collection %q", ErrTxnCollection, name)
 		}
 		var matches bool
 		var matchErr error
@@ -475,7 +475,7 @@ func (l *TxnLog) validateCollectionsLocked(ordered []NamedCollection) error {
 }
 
 // registerCollection records c as catalog-scoped under this log so a later
-// decision-sync failure poisons it alongside commit participants.
+// decision-sync failure poisons it alongside commit targets.
 func (l *TxnLog) registerCollection(c *Collection) {
 	if l == nil || c == nil {
 		return
@@ -505,7 +505,7 @@ func (l *TxnLog) registerCollectionUnlessCheckpointGroup(c *Collection) error {
 // with a decision append.
 func (l *TxnLog) AdoptCollection(c *Collection) error {
 	if l == nil || c == nil {
-		return fmt.Errorf("%w: nil collection", ErrTxnParticipant)
+		return fmt.Errorf("%w: nil collection", ErrTxnCollection)
 	}
 	l.commitMu.Lock()
 	defer l.commitMu.Unlock()
@@ -518,11 +518,11 @@ func (l *TxnLog) AdoptCollection(c *Collection) error {
 	c.writer.Lock()
 	defer c.writer.Unlock()
 	if c.closed || c.file == nil || !databaseTxnLaneSupported(c) {
-		return fmt.Errorf("%w: collection is not transaction-capable", ErrTxnParticipant)
+		return fmt.Errorf("%w: collection is not transaction-capable", ErrTxnCollection)
 	}
 	if !c.journalEnabled() || c.journal.Cursor() != 0 {
 		return fmt.Errorf(
-			"%w: adopted collection journal is not empty", ErrTxnParticipant,
+			"%w: adopted collection journal is not empty", ErrTxnCollection,
 		)
 	}
 	matches, err := storeio.FileMatchesDirectory(l.rootInfo, c.file)
@@ -553,7 +553,7 @@ func (l *TxnLog) registerCollectionLocked(c *Collection) {
 
 // DetachCollection removes one live collection from this log's catalog scope.
 // If the current marker contains decisions, detach first folds every registered
-// participant past its current-epoch conditionals and recycles the marker to an
+// target past its current-epoch conditionals and recycles the marker to an
 // empty epoch. It then checkpoints the target's remaining ordinary journal
 // window so the exact handle can be passed back to [TxnLog.AdoptCollection] if
 // the caller's catalog mutation definitely did not publish.
@@ -565,7 +565,7 @@ func (l *TxnLog) registerCollectionLocked(c *Collection) {
 // because a commit automatically registers every supplied member.
 func (l *TxnLog) DetachCollection(c *Collection) error {
 	if l == nil || c == nil {
-		return fmt.Errorf("%w: nil collection", ErrTxnParticipant)
+		return fmt.Errorf("%w: nil collection", ErrTxnCollection)
 	}
 	l.commitMu.Lock()
 	defer l.commitMu.Unlock()
@@ -602,7 +602,7 @@ func (l *TxnLog) DetachCollection(c *Collection) error {
 	var checkpointErr error
 	if c.closed || c.file == nil || !databaseTxnLaneSupported(c) {
 		checkpointErr = fmt.Errorf(
-			"%w: collection is not transaction-capable", ErrTxnParticipant,
+			"%w: collection is not transaction-capable", ErrTxnCollection,
 		)
 	} else if c.journalEnabled() && c.journal.Cursor() != 0 {
 		checkpointErr = c.checkpointPastConditionalsLocked(nil, 0)
@@ -664,29 +664,29 @@ type DatabaseBatch struct {
 // Collection returns the member WriteBatch for name.
 func (b *DatabaseBatch) Collection(name string) (*WriteBatch, error) {
 	if b == nil {
-		return nil, ErrTxnParticipant
+		return nil, ErrTxnCollection
 	}
 	batch, ok := b.byName[name]
 	if !ok || batch == nil {
-		return nil, fmt.Errorf("%w: %q", ErrTxnParticipant, name)
+		return nil, fmt.Errorf("%w: %q", ErrTxnCollection, name)
 	}
 	return batch, nil
 }
 
 // CollectionHandle returns the member WriteBatch for an exact pre-opened
-// handle. It performs no string construction or conversion. The participant
+// handle. It performs no string construction or conversion. The target
 // count is transaction-bounded, so a compact linear probe avoids allocating a
 // second map on every commit.
 func (b *DatabaseBatch) CollectionHandle(collection *Collection) (*WriteBatch, error) {
 	if b == nil || collection == nil || len(b.members) != len(b.batches) {
-		return nil, ErrTxnParticipant
+		return nil, ErrTxnCollection
 	}
 	for i := range b.members {
 		if b.members[i].Collection == collection && b.batches[i] != nil {
 			return b.batches[i], nil
 		}
 	}
-	return nil, ErrTxnParticipant
+	return nil, ErrTxnCollection
 }
 
 // UpdateCollections stages per-collection mutations via fn, then commits the
@@ -706,7 +706,7 @@ func UpdateCollections(
 		return errors.New("vibedb: UpdateCollections requires a function")
 	}
 	if log == nil {
-		return fmt.Errorf("%w: nil transaction log", ErrTxnParticipant)
+		return fmt.Errorf("%w: nil transaction log", ErrTxnCollection)
 	}
 	log.commitMu.Lock()
 	groupOwned := log.checkpointGroup != nil || log.checkpointGroupRetired
@@ -776,8 +776,8 @@ func checkTxnLimits(limits TxnLimits, collections, documents int, bytes int64) e
 		return ErrTxnLimitsRequired
 	}
 	maxCollections := limits.MaxCollections
-	if maxCollections > storeio.TxnMarkerMaxParticipants {
-		maxCollections = storeio.TxnMarkerMaxParticipants
+	if maxCollections > storeio.TxnMarkerMaxCollections {
+		maxCollections = storeio.TxnMarkerMaxCollections
 	}
 	if collections > maxCollections {
 		return fmt.Errorf(
@@ -797,10 +797,10 @@ func checkTxnLimits(limits TxnLimits, collections, documents int, bytes int64) e
 			ErrTxnTooLarge, bytes, limits.MaxBytes,
 		)
 	}
-	if collections > storeio.TxnMarkerMaxParticipants {
+	if collections > storeio.TxnMarkerMaxCollections {
 		return fmt.Errorf(
 			"%w: decision participant capacity %d",
-			ErrTxnTooLarge, storeio.TxnMarkerMaxParticipants,
+			ErrTxnTooLarge, storeio.TxnMarkerMaxCollections,
 		)
 	}
 	return nil
@@ -822,20 +822,20 @@ func validateTxnMembers(members []NamedCollection) ([]NamedCollection, error) {
 		}
 		if _, dup := seenName[member.Name]; dup {
 			return nil, fmt.Errorf(
-				"%w: duplicate name %q", ErrTxnParticipant, member.Name,
+				"%w: duplicate name %q", ErrTxnCollection, member.Name,
 			)
 		}
 		seenName[member.Name] = struct{}{}
 		if member.Collection == nil {
 			return nil, fmt.Errorf(
-				"%w: nil collection %q", ErrTxnParticipant, member.Name,
+				"%w: nil collection %q", ErrTxnCollection, member.Name,
 			)
 		}
 		if member.BatchDocumentsHint < 0 ||
 			member.BatchDocumentsHint > member.Collection.options.MaxBatchDocuments {
 			return nil, fmt.Errorf(
 				"%w: collection %q batch hint %d exceeds [0,%d]",
-				ErrTxnParticipant, member.Name, member.BatchDocumentsHint,
+				ErrTxnCollection, member.Name, member.BatchDocumentsHint,
 				member.Collection.options.MaxBatchDocuments,
 			)
 		}
@@ -994,7 +994,7 @@ func (l *TxnLog) commitMulti(
 			// reach commitMulti with a dirty Len()>0 that stages empty, but
 			// refuse closed rather than preparing a hollow record.
 			return fmt.Errorf(
-				"%w: staged empty batch for %q", ErrTxnParticipant, nameOf[c],
+				"%w: staged empty batch for %q", ErrTxnCollection, nameOf[c],
 			)
 		}
 		staged[i] = st
@@ -1009,14 +1009,14 @@ func (l *TxnLog) commitMulti(
 	header := l.marker.Header()
 	txnID := l.nextTxnID
 	l.nextTxnID++
-	participants := make([]storeio.TxnParticipant, len(order))
+	targets := make([]storeio.TxnCollectionRef, len(order))
 	for i, c := range order {
 		if prepErr := c.preparePrimaryBatchConditionalLocked(
 			&staged[i], header.MarkerID, header.Epoch, txnID, false,
 		); prepErr != nil {
 			return prepErr
 		}
-		participants[i] = storeio.TxnParticipant{
+		targets[i] = storeio.TxnCollectionRef{
 			StoreID:            c.storeID,
 			JournalID:          c.journalID,
 			PreparedGeneration: staged[i].generation,
@@ -1047,7 +1047,7 @@ func (l *TxnLog) commitMulti(
 		}
 	}
 
-	if _, appendErr := l.marker.AppendDecision(txnID, participants); appendErr != nil {
+	if _, appendErr := l.marker.AppendDecision(txnID, targets); appendErr != nil {
 		if errors.Is(appendErr, storeio.ErrTxnMarkerFull) {
 			return fmt.Errorf("%w: decision log full", ErrTxnTooLarge)
 		}
@@ -1099,7 +1099,7 @@ func (l *TxnLog) verifyRootDirectoryLocked() error {
 	defer l.regMu.Unlock()
 	for _, collection := range l.collections {
 		if collection == nil || collection.file == nil {
-			return fmt.Errorf("%w: nil registered collection", ErrTxnParticipant)
+			return fmt.Errorf("%w: nil registered collection", ErrTxnCollection)
 		}
 		matches, err := storeio.FileMatchesDirectory(l.rootInfo, collection.file)
 		if err != nil {
@@ -1132,7 +1132,7 @@ func (l *TxnLog) verifyMarkerDirectoryLocked() error {
 	defer l.regMu.Unlock()
 	for _, collection := range l.collections {
 		if collection == nil || collection.file == nil {
-			return fmt.Errorf("%w: nil registered collection", ErrTxnParticipant)
+			return fmt.Errorf("%w: nil registered collection", ErrTxnCollection)
 		}
 		matches, err := l.marker.MatchesFileDirectory(collection.file)
 		if err != nil {
@@ -1180,8 +1180,8 @@ func (l *TxnLog) ensureMintedLocked() error {
 	return nil
 }
 
-func (l *TxnLog) ensureDecisionRoomLocked(participantCount int) error {
-	padded, ok := txnDecisionRecordBytes(participantCount)
+func (l *TxnLog) ensureDecisionRoomLocked(targetCount int) error {
+	padded, ok := txnDecisionRecordBytes(targetCount)
 	if !ok {
 		return fmt.Errorf(
 			"%w: decision participant capacity", ErrTxnTooLarge,
@@ -1209,8 +1209,8 @@ func (l *TxnLog) ensureDecisionRoomLocked(participantCount int) error {
 	)
 }
 
-func txnDecisionRecordBytes(participantCount int) (int, bool) {
-	return storeio.TxnDecisionRecordPaddedSize(participantCount)
+func txnDecisionRecordBytes(targetCount int) (int, bool) {
+	return storeio.TxnDecisionRecordPaddedSize(targetCount)
 }
 
 func (l *TxnLog) foldLaggardsAndRecycleLocked() error {
@@ -1225,7 +1225,7 @@ func (l *TxnLog) foldLaggardsAndRecycleLocked() error {
 		var foldErr error
 		if holdsErr == nil && holds {
 			foldErr = c.checkpointPastConditionalsLocked(
-				participantBindingResolver(decisions, c.storeID, c.journalID),
+				targetBindingResolver(decisions, c.storeID, c.journalID),
 				decisions.Epoch(),
 			)
 		}

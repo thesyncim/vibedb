@@ -17,9 +17,9 @@ const (
 	// only needs caller scratch for one page, regardless of transaction width.
 	ManifestSegmentBytes = 64 << 10
 
-	// MaxManifestBytes is a resource-byte admission bound, not a participant
+	// MaxManifestBytes is a resource-byte admission bound, not a target
 	// count bound. Capacity is derived solely from exact encoded bytes and can
-	// be raised independently without changing the participant grammar.
+	// be raised independently without changing the target grammar.
 	MaxManifestBytes = 64 << 20
 
 	manifestSegmentHeaderBytes     = 32
@@ -27,9 +27,9 @@ const (
 	manifestCoordinatorHeaderBytes = 112
 	manifestDescriptorBytes        = 56
 
-	// MaxManifestPageParticipants is a page-scratch sizing convenience, not a
-	// transaction participant limit.
-	MaxManifestPageParticipants = (ManifestSegmentBytes - manifestSegmentHeaderBytes - 4) / manifestEntryFixedBytes
+	// MaxManifestPageTargets is a page-scratch sizing convenience, not a
+	// transaction target limit.
+	MaxManifestPageTargets = (ManifestSegmentBytes - manifestSegmentHeaderBytes - 4) / manifestEntryFixedBytes
 )
 
 var (
@@ -39,29 +39,29 @@ var (
 	manifestRootDomain       = [8]byte{'V', 'T', 'M', 'R', 'O', 'T', '1', 0}
 )
 
-// ManifestDescriptor binds the complete ordered participant set without
+// ManifestDescriptor binds the complete ordered target set without
 // retaining it in one resident slice. Root commits to every segment digest,
-// its position, total encoded bytes, and total unique participant count.
+// its position, total encoded bytes, and total unique target count.
 type ManifestDescriptor struct {
-	ParticipantCount uint64
-	EncodedBytes     uint64
-	SegmentCount     uint32
-	Root             Digest
+	TargetCount  uint64
+	EncodedBytes uint64
+	SegmentCount uint32
+	Root         Digest
 }
 
 func (d ManifestDescriptor) valid() bool {
-	if d.ParticipantCount == 0 || d.SegmentCount == 0 ||
-		uint64(d.SegmentCount) > d.ParticipantCount || d.Root == (Digest{}) {
+	if d.TargetCount == 0 || d.SegmentCount == 0 ||
+		uint64(d.SegmentCount) > d.TargetCount || d.Root == (Digest{}) {
 		return false
 	}
 	segments := uint64(d.SegmentCount)
-	if d.ParticipantCount > segments*uint64(MaxManifestPageParticipants) {
+	if d.TargetCount > segments*uint64(MaxManifestPageTargets) {
 		return false
 	}
 	// Every page has a header and checksum. Its first identity needs at least
 	// one distribution and shard byte; every later distinct identity needs at
 	// least one suffix byte in addition to the fixed entry.
-	minimumBytes := d.ParticipantCount*(manifestEntryFixedBytes+1) +
+	minimumBytes := d.TargetCount*(manifestEntryFixedBytes+1) +
 		segments*(manifestSegmentHeaderBytes+4+1)
 	return d.EncodedBytes >= minimumBytes && d.EncodedBytes <= MaxManifestBytes &&
 		d.EncodedBytes <= segments*ManifestSegmentBytes
@@ -69,21 +69,21 @@ func (d ManifestDescriptor) valid() bool {
 
 // ManifestSegment describes one borrowed encoded page.
 type ManifestSegment struct {
-	Index            uint32
-	FirstParticipant uint64
-	ParticipantCount uint32
-	Digest           Digest
-	Raw              []byte
+	Index       uint32
+	FirstTarget uint64
+	TargetCount uint32
+	Digest      Digest
+	Raw         []byte
 }
 
-// ManifestPage is the decoded view of one page. The ParticipantRef slice and
+// ManifestPage is the decoded view of one page. The TransactionTargetRef slice and
 // reconstructed prefix-compressed identities are caller-owned.
 type ManifestPage struct {
-	Segment      ManifestSegment
-	Participants []ParticipantRef
+	Segment ManifestSegment
+	Targets []TransactionTargetRef
 }
 
-// ManifestBuilder incrementally encodes a pre-sorted participant stream. It
+// ManifestBuilder incrementally encodes a pre-sorted target stream. It
 // retains only one 64 KiB page and the preceding identity. Exact adjacent
 // duplicates are folded; conflicting duplicates and reordering fail closed.
 type ManifestBuilder struct {
@@ -102,7 +102,7 @@ type ManifestBuilder struct {
 	priorShard        [MaxShardIdentityBytes]byte
 	priorDistLen      uint8
 	priorShardLen     uint8
-	prior             ParticipantRef
+	prior             TransactionTargetRef
 	havePrior         bool
 	sealed            bool
 	descriptor        ManifestDescriptor
@@ -146,82 +146,82 @@ func (b *ManifestBuilder) beginPage() {
 	b.priorShardLen = 0
 }
 
-// Append adds one participant in strict (distribution, shard) order.
-func (b *ManifestBuilder) Append(participant ParticipantRef) error {
+// Append adds one target in strict (distribution, shard) order.
+func (b *ManifestBuilder) Append(target TransactionTargetRef) error {
 	if b.sealed {
 		return ErrInvalidState
 	}
 	if b.failed != nil {
 		return b.failed
 	}
-	if err := validateManifestParticipant(participant); err != nil {
+	if err := validateManifestTarget(target); err != nil {
 		b.failed = err
 		return err
 	}
 	if b.havePrior {
-		order := compareParticipantIdentity(b.prior, participant)
+		order := compareTargetIdentity(b.prior, target)
 		if order > 0 {
 			b.failed = ErrCorrupt
 			return b.failed
 		}
 		if order == 0 {
-			if equalParticipantRef(b.prior, participant) {
+			if equalTargetRef(b.prior, target) {
 				return nil
 			}
 			b.failed = ErrCorrupt
 			return b.failed
 		}
 	}
-	entryBytes := manifestEntryFixedBytes + len(participant.Distribution) + len(participant.Shard)
+	entryBytes := manifestEntryFixedBytes + len(target.Distribution) + len(target.Shard)
 	if b.pageCount != 0 {
-		entryBytes -= commonPrefix(b.priorDistribution[:b.priorDistLen], participant.Distribution)
-		entryBytes -= commonPrefix(b.priorShard[:b.priorShardLen], participant.Shard)
+		entryBytes -= commonPrefix(b.priorDistribution[:b.priorDistLen], target.Distribution)
+		entryBytes -= commonPrefix(b.priorShard[:b.priorShardLen], target.Shard)
 	}
 	if len(b.scratch)+entryBytes+4 > ManifestSegmentBytes {
 		if err := b.flush(); err != nil {
 			b.failed = err
 			return err
 		}
-		entryBytes = manifestEntryFixedBytes + len(participant.Distribution) + len(participant.Shard)
+		entryBytes = manifestEntryFixedBytes + len(target.Distribution) + len(target.Shard)
 	}
 	if uint64(entryBytes)+b.totalBytes > MaxManifestBytes {
 		b.failed = ErrTooLarge
 		return b.failed
 	}
-	b.appendEntry(participant, entryBytes)
-	b.prior = participant
-	b.prior.Distribution = b.priorDistribution[:len(participant.Distribution)]
-	b.prior.Shard = b.priorShard[:len(participant.Shard)]
-	copy(b.priorDistribution[:], participant.Distribution)
-	copy(b.priorShard[:], participant.Shard)
-	b.priorDistLen = uint8(len(participant.Distribution))
-	b.priorShardLen = uint8(len(participant.Shard))
+	b.appendEntry(target, entryBytes)
+	b.prior = target
+	b.prior.Distribution = b.priorDistribution[:len(target.Distribution)]
+	b.prior.Shard = b.priorShard[:len(target.Shard)]
+	copy(b.priorDistribution[:], target.Distribution)
+	copy(b.priorShard[:], target.Shard)
+	b.priorDistLen = uint8(len(target.Distribution))
+	b.priorShardLen = uint8(len(target.Shard))
 	b.havePrior = true
 	b.pageCount++
 	b.totalCount++
 	return nil
 }
 
-func (b *ManifestBuilder) appendEntry(participant ParticipantRef, entryBytes int) {
+func (b *ManifestBuilder) appendEntry(target TransactionTargetRef, entryBytes int) {
 	distPrefix, shardPrefix := 0, 0
 	if b.pageCount != 0 {
-		distPrefix = commonPrefix(b.priorDistribution[:b.priorDistLen], participant.Distribution)
-		shardPrefix = commonPrefix(b.priorShard[:b.priorShardLen], participant.Shard)
+		distPrefix = commonPrefix(b.priorDistribution[:b.priorDistLen], target.Distribution)
+		shardPrefix = commonPrefix(b.priorShard[:b.priorShardLen], target.Shard)
 	}
-	distSuffix := participant.Distribution[distPrefix:]
-	shardSuffix := participant.Shard[shardPrefix:]
+	distSuffix := target.Distribution[distPrefix:]
+	shardSuffix := target.Shard[shardPrefix:]
 	start := len(b.scratch)
 	b.scratch = b.scratch[:start+entryBytes]
 	out := b.scratch[start:]
 	out[0], out[1] = byte(distPrefix), byte(len(distSuffix))
 	out[2], out[3] = byte(shardPrefix), byte(len(shardSuffix))
-	out[4] = byte(participant.State)
+	out[4] = byte(target.State)
 	out[5], out[6], out[7] = 0, 0, 0
-	binary.LittleEndian.PutUint64(out[8:16], participant.RoutingVersion)
-	binary.LittleEndian.PutUint64(out[16:24], participant.AllocationGeneration)
-	binary.LittleEndian.PutUint64(out[24:32], participant.OwnershipEpoch)
-	copy(out[32:64], participant.MutationDigest[:])
-	copy(out[64:80], participant.AuthorityWitness[:])
+	binary.LittleEndian.PutUint64(out[8:16], target.RoutingVersion)
+	binary.LittleEndian.PutUint64(out[16:24], target.AllocationGeneration)
+	binary.LittleEndian.PutUint64(out[24:32], target.OwnershipEpoch)
+	copy(out[32:64], target.MutationDigest[:])
+	copy(out[64:80], target.AuthorityWitness[:])
 	cursor := manifestEntryFixedBytes
 	copy(out[cursor:], distSuffix)
 	cursor += len(distSuffix)
@@ -246,8 +246,8 @@ func (b *ManifestBuilder) flush() error {
 	binary.LittleEndian.PutUint32(b.scratch[total-4:], crc32.Checksum(b.scratch[:total-4], castagnoli))
 	digest := sha256.Sum256(b.scratch)
 	segment := ManifestSegment{
-		Index: b.segmentIndex, FirstParticipant: b.first,
-		ParticipantCount: b.pageCount, Digest: digest, Raw: b.scratch,
+		Index: b.segmentIndex, FirstTarget: b.first,
+		TargetCount: b.pageCount, Digest: digest, Raw: b.scratch,
 	}
 	if err := b.emit(segment); err != nil {
 		return err
@@ -277,7 +277,7 @@ func (b *ManifestBuilder) Seal() (ManifestDescriptor, error) {
 		return ManifestDescriptor{}, err
 	}
 	descriptor := ManifestDescriptor{
-		ParticipantCount: b.totalCount, EncodedBytes: b.totalBytes,
+		TargetCount: b.totalCount, EncodedBytes: b.totalBytes,
 		SegmentCount: b.segmentCount,
 	}
 	descriptor.Root = finishManifestRoot(b.chain, descriptor)
@@ -287,7 +287,7 @@ func (b *ManifestBuilder) Seal() (ManifestDescriptor, error) {
 }
 
 // ManifestReader verifies a sequence page by page. It retains only root-chain
-// state and the final participant identity; callers provide each page arena.
+// state and the final target identity; callers provide each page arena.
 type ManifestReader struct {
 	want         ManifestDescriptor
 	nextSegment  uint32
@@ -312,13 +312,12 @@ func NewManifestReader(descriptor ManifestDescriptor) (*ManifestReader, error) {
 // OpenNext validates and decodes the next canonical page into caller scratch.
 func (r *ManifestReader) OpenNext(
 	raw []byte,
-	participants []ParticipantRef,
-	identities []byte,
+	targets []TransactionTargetRef, identities []byte,
 ) (ManifestPage, error) {
 	if r.failed != nil {
 		return ManifestPage{}, r.failed
 	}
-	page, err := openManifestSegment(raw, participants, identities)
+	page, err := openManifestSegment(raw, targets, identities)
 	if err != nil {
 		if err == ErrTooLarge {
 			return ManifestPage{}, err
@@ -327,7 +326,7 @@ func (r *ManifestReader) OpenNext(
 		return ManifestPage{}, r.failed
 	}
 	if page.Segment.Index != r.nextSegment ||
-		page.Segment.FirstParticipant != r.nextFirst {
+		page.Segment.FirstTarget != r.nextFirst {
 		r.failed = ErrCorrupt
 		return ManifestPage{}, r.failed
 	}
@@ -337,19 +336,19 @@ func (r *ManifestReader) OpenNext(
 	}
 	if r.haveLast && compareIdentityBytes(
 		r.lastDist[:r.lastDistLen], r.lastShard[:r.lastShardLen],
-		page.Participants[0].Distribution, page.Participants[0].Shard,
+		page.Targets[0].Distribution, page.Targets[0].Shard,
 	) >= 0 {
 		r.failed = ErrCorrupt
 		return ManifestPage{}, r.failed
 	}
-	last := &page.Participants[len(page.Participants)-1]
+	last := &page.Targets[len(page.Targets)-1]
 	copy(r.lastDist[:], last.Distribution)
 	copy(r.lastShard[:], last.Shard)
 	r.lastDistLen, r.lastShardLen = uint8(len(last.Distribution)), uint8(len(last.Shard))
 	r.haveLast = true
 	r.chain = appendManifestChain(r.chain, page.Segment.Index, page.Segment.Digest)
 	r.nextSegment++
-	r.nextFirst += uint64(page.Segment.ParticipantCount)
+	r.nextFirst += uint64(page.Segment.TargetCount)
 	r.encodedBytes += uint64(len(raw))
 	return page, nil
 }
@@ -360,7 +359,7 @@ func (r *ManifestReader) Seal() error {
 		return r.failed
 	}
 	got := ManifestDescriptor{
-		ParticipantCount: r.nextFirst, EncodedBytes: r.encodedBytes,
+		TargetCount: r.nextFirst, EncodedBytes: r.encodedBytes,
 		SegmentCount: r.nextSegment,
 	}
 	got.Root = finishManifestRoot(r.chain, got)
@@ -374,16 +373,14 @@ func (r *ManifestReader) Seal() error {
 // verification require ManifestReader.
 func OpenManifestSegment(
 	raw []byte,
-	participants []ParticipantRef,
-	identities []byte,
+	targets []TransactionTargetRef, identities []byte,
 ) (ManifestPage, error) {
-	return openManifestSegment(raw, participants, identities)
+	return openManifestSegment(raw, targets, identities)
 }
 
 func openManifestSegment(
 	raw []byte,
-	scratch []ParticipantRef,
-	identities []byte,
+	scratch []TransactionTargetRef, identities []byte,
 ) (ManifestPage, error) {
 	if len(raw) < manifestSegmentHeaderBytes+manifestEntryFixedBytes+4 ||
 		len(raw) > ManifestSegmentBytes || !equal4(raw[:4], manifestSegmentMagic) ||
@@ -396,17 +393,17 @@ func openManifestSegment(
 	first := binary.LittleEndian.Uint64(raw[16:24])
 	payloadBytes := binary.LittleEndian.Uint32(raw[24:28])
 	if binary.LittleEndian.Uint32(raw[28:32]) != 0 || count == 0 ||
-		uint64(count) > uint64(MaxManifestPageParticipants) ||
+		uint64(count) > uint64(MaxManifestPageTargets) ||
 		uint64(payloadBytes)+manifestSegmentHeaderBytes+4 != uint64(len(raw)) ||
 		uint64(count) > uint64(cap(scratch)) {
 		return ManifestPage{}, ErrCorrupt
 	}
-	participants := scratch[:count]
-	clear(participants)
+	targets := scratch[:count]
+	clear(targets)
 	cursor, end := manifestSegmentHeaderBytes, len(raw)-4
 	identityCursor := 0
-	var prior ParticipantRef
-	for i := range participants {
+	var prior TransactionTargetRef
+	for i := range targets {
 		if end-cursor < manifestEntryFixedBytes {
 			return ManifestPage{}, ErrCorrupt
 		}
@@ -422,8 +419,8 @@ func openManifestSegment(
 			return ManifestPage{}, ErrCorrupt
 		}
 		cursor += manifestEntryFixedBytes
-		p := &participants[i]
-		p.State = ParticipantState(entry[4])
+		p := &targets[i]
+		p.State = TargetState(entry[4])
 		p.RoutingVersion = binary.LittleEndian.Uint64(entry[8:16])
 		p.AllocationGeneration = binary.LittleEndian.Uint64(entry[16:24])
 		p.OwnershipEpoch = binary.LittleEndian.Uint64(entry[24:32])
@@ -445,8 +442,8 @@ func openManifestSegment(
 		identityCursor += distLen + shardLen
 		cursor += distSuffix + shardSuffix
 		if !utf8.Valid(p.Distribution) || !utf8.Valid(p.Shard) ||
-			validateManifestParticipant(*p) != nil ||
-			(i != 0 && (compareParticipantIdentity(prior, *p) >= 0 ||
+			validateManifestTarget(*p) != nil ||
+			(i != 0 && (compareTargetIdentity(prior, *p) >= 0 ||
 				distPrefix != commonPrefix(prior.Distribution, p.Distribution) ||
 				shardPrefix != commonPrefix(prior.Shard, p.Shard))) {
 			return ManifestPage{}, ErrCorrupt
@@ -458,9 +455,9 @@ func openManifestSegment(
 	}
 	digest := sha256.Sum256(raw)
 	return ManifestPage{
-		Segment: ManifestSegment{Index: index, FirstParticipant: first,
-			ParticipantCount: count, Digest: digest, Raw: raw},
-		Participants: participants,
+		Segment: ManifestSegment{Index: index, FirstTarget: first,
+			TargetCount: count, Digest: digest, Raw: raw},
+		Targets: targets,
 	}, nil
 }
 
@@ -529,7 +526,7 @@ func appendManifestDescriptor(dst []byte, descriptor ManifestDescriptor) ([]byte
 }
 
 func appendManifestDescriptorTo(out []byte, descriptor ManifestDescriptor) {
-	binary.LittleEndian.PutUint64(out[0:8], descriptor.ParticipantCount)
+	binary.LittleEndian.PutUint64(out[0:8], descriptor.TargetCount)
 	binary.LittleEndian.PutUint64(out[8:16], descriptor.EncodedBytes)
 	binary.LittleEndian.PutUint32(out[16:20], descriptor.SegmentCount)
 	copy(out[24:56], descriptor.Root[:])
@@ -540,14 +537,14 @@ func openManifestDescriptor(src []byte) ManifestDescriptor {
 	if len(src) < manifestDescriptorBytes || binary.LittleEndian.Uint32(src[20:24]) != 0 {
 		return descriptor
 	}
-	descriptor.ParticipantCount = binary.LittleEndian.Uint64(src[0:8])
+	descriptor.TargetCount = binary.LittleEndian.Uint64(src[0:8])
 	descriptor.EncodedBytes = binary.LittleEndian.Uint64(src[8:16])
 	descriptor.SegmentCount = binary.LittleEndian.Uint32(src[16:20])
 	copy(descriptor.Root[:], src[24:56])
 	return descriptor
 }
 
-func validateManifestParticipant(p ParticipantRef) error {
+func validateManifestTarget(p TransactionTargetRef) error {
 	if len(p.Distribution) == 0 || len(p.Distribution) > MaxShardIdentityBytes ||
 		!utf8.Valid(p.Distribution) || len(p.Shard) == 0 || len(p.Shard) > MaxShardIdentityBytes ||
 		!utf8.Valid(p.Shard) || p.RoutingVersion == 0 || p.AllocationGeneration == 0 ||
@@ -557,7 +554,7 @@ func validateManifestParticipant(p ParticipantRef) error {
 	return nil
 }
 
-func compareParticipantIdentity(a, b ParticipantRef) int {
+func compareTargetIdentity(a, b TransactionTargetRef) int {
 	return compareIdentityBytes(a.Distribution, a.Shard, b.Distribution, b.Shard)
 }
 
@@ -568,8 +565,8 @@ func compareIdentityBytes(aDist, aShard, bDist, bShard []byte) int {
 	return compareBytes(aShard, bShard)
 }
 
-func equalParticipantRef(a, b ParticipantRef) bool {
-	return compareParticipantIdentity(a, b) == 0 &&
+func equalTargetRef(a, b TransactionTargetRef) bool {
+	return compareTargetIdentity(a, b) == 0 &&
 		a.RoutingVersion == b.RoutingVersion &&
 		a.AllocationGeneration == b.AllocationGeneration &&
 		a.OwnershipEpoch == b.OwnershipEpoch &&
@@ -603,7 +600,7 @@ func finishManifestRoot(chain Digest, descriptor ManifestDescriptor) Digest {
 	var encoded [8 + 32 + 8 + 8 + 4]byte
 	copy(encoded[:8], manifestRootDomain[:])
 	copy(encoded[8:40], chain[:])
-	binary.LittleEndian.PutUint64(encoded[40:48], descriptor.ParticipantCount)
+	binary.LittleEndian.PutUint64(encoded[40:48], descriptor.TargetCount)
 	binary.LittleEndian.PutUint64(encoded[48:56], descriptor.EncodedBytes)
 	binary.LittleEndian.PutUint32(encoded[56:60], descriptor.SegmentCount)
 	return sha256.Sum256(encoded[:])

@@ -25,11 +25,11 @@ type ReplicatedDirectMutation struct {
 	Key           requestledger.RequestKey
 	RequestDigest replication.Digest
 	Tenant        []byte
-	Participant   ReplicatedTransactionParticipant
+	Target        ReplicatedTransactionTarget
 }
 
 // ReplicatedDirectMutationResult is the exact retained terminal result from the
-// participant group. One successful invocation consumes one Raft proposal; an
+// target group. One successful invocation consumes one Raft proposal; an
 // exact retry of the lane's latest request returns the original Applied index
 // and affected-row count.
 type ReplicatedDirectMutationResult struct {
@@ -48,7 +48,7 @@ type ReplicatedDirectMutationResult struct {
 // one direct command. It is deliberately caller-owned and not concurrency-safe:
 // request lanes reserve one workspace before entering the hot path.
 type directMutationEncodeWorkspace struct {
-	control  [distributedtxn.MaxSingleParticipantControlBytes]byte
+	control  [distributedtxn.MaxSingleTargetControlBytes]byte
 	digester replication.TransactionMutationDigester
 }
 
@@ -63,7 +63,7 @@ func (executor *ReplicatedExecutor) DirectMutate(
 	if err != nil {
 		return ReplicatedDirectMutationResult{}, err
 	}
-	proposal, err := executor.Propose(ctx, request.Participant.Route, command)
+	proposal, err := executor.Propose(ctx, request.Target.Route, command)
 	if err != nil {
 		return ReplicatedDirectMutationResult{}, err
 	}
@@ -111,15 +111,15 @@ func appendReplicatedDirectMutationCommandPrepared(
 	workspace *directMutationEncodeWorkspace,
 	request ReplicatedDirectMutation,
 ) ([]byte, distributedtxn.ReplicatedCommand, error) {
-	participant := request.Participant
+	target := request.Target
 	if !request.Key.Valid() || request.Key.IssuerEpoch == 0 ||
 		request.Key.IssuerSequence == 0 || request.Key.IssuerLane == (requestledger.IssuerLane{}) ||
 		request.RequestDigest == (replication.Digest{}) ||
 		len(request.Tenant) == 0 || len(request.Tenant) > replication.MaxIdentityBytes ||
 		requestledger.Digest(sha256.Sum256(request.Tenant)) != request.Key.TenantDigest ||
-		!validReplicatedRoute(participant.Route) ||
-		!distributedtxn.ValidateIntentScopes(participant.IntentScopes, participant.BucketBits) ||
-		len(participant.Batches) == 0 {
+		!validReplicatedRoute(target.Route) ||
+		!distributedtxn.ValidateIntentScopes(target.IntentScopes, target.BucketBits) ||
+		len(target.Batches) == 0 {
 		return dst, distributedtxn.ReplicatedCommand{}, ErrReplicatedTransaction
 	}
 	keyDigest, err := requestledger.KeyDigest(request.Key)
@@ -132,26 +132,26 @@ func appendReplicatedDirectMutationCommandPrepared(
 	}
 	var mutationDigest distributedtxn.Digest
 	if workspace == nil {
-		mutationDigest, err = replication.TransactionMutationDigest(participant.Batches)
+		mutationDigest, err = replication.TransactionMutationDigest(target.Batches)
 	} else {
-		mutationDigest, err = workspace.digester.Digest(participant.Batches)
+		mutationDigest, err = workspace.digester.Digest(target.Batches)
 	}
 	if err != nil {
 		return dst, distributedtxn.ReplicatedCommand{}, errors.Join(err, ErrReplicatedTransaction)
 	}
 	id := directMutationTransactionID(requestledger.Digest(laneHome))
 	control := distributedtxn.ReplicatedCommand{
-		Role:      distributedtxn.ReplicatedRoleParticipant,
-		Operation: distributedtxn.ReplicatedApplySingleParticipant,
+		Role:      distributedtxn.ReplicatedRoleTarget,
+		Operation: distributedtxn.ReplicatedApplySingleTarget,
 		ID:        id, ExpectedRevision: request.Key.IssuerSequence,
-		PayloadKind:        distributedtxn.ReplicatedPayloadParticipantStage,
+		PayloadKind:        distributedtxn.ReplicatedPayloadTargetStage,
 		ControllerEpoch:    request.Key.IssuerEpoch,
 		ExecutionPinDigest: directMutationAuthorityDigest(requestledger.Digest(laneHome)),
-		Participant: distributedtxn.ParticipantStage{
-			CoordinatorGroup:            distributedtxn.ID(participant.Route.Group.GroupID),
-			CoordinatorShardIncarnation: distributedtxn.ID(participant.Route.Group.ShardIncarnation),
-			CoordinatorAllocation:       participant.Route.AllocationGeneration,
-			BucketBits:                  participant.BucketBits, IntentScopes: participant.IntentScopes,
+		Target: distributedtxn.TransactionTargetStage{
+			CoordinatorGroup:            distributedtxn.ID(target.Route.Group.GroupID),
+			CoordinatorShardIncarnation: distributedtxn.ID(target.Route.Group.ShardIncarnation),
+			CoordinatorAllocation:       target.Route.AllocationGeneration,
+			BucketBits:                  target.BucketBits, IntentScopes: target.IntentScopes,
 			MutationDigest: mutationDigest,
 		},
 	}
@@ -164,14 +164,14 @@ func appendReplicatedDirectMutationCommandPrepared(
 		return dst, distributedtxn.ReplicatedCommand{}, fmt.Errorf("gateway: encode direct control: %w", errors.Join(err, ErrReplicatedTransaction))
 	}
 	outer := replicatedTransactionCommandHeader(
-		participant.Route, request.Tenant,
+		target.Route, request.Tenant,
 		durableRequestRetryHome(replication.Digest(keyDigest), id),
 		replication.ID128(id), uint64(control.Role), request.Key.IssuerSequence,
 	)
 	outer.Kind = replication.CommandTransaction
 	outer.AuthorityClass = replication.CommandAuthorityMembershipStableData
 	outer.Transaction = controlBytes
-	outer.Batches = participant.Batches
+	outer.Batches = target.Batches
 	outer.Fingerprint = directMutationFingerprint(keyDigest, request.RequestDigest, controlBytes)
 	dst, err = replication.AppendCommand(dst, outer)
 	if err != nil {

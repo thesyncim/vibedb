@@ -286,10 +286,9 @@ func verifyDatabaseTxn(dir string) (txnVerifyReport, error) {
 	markerID := decisions.MarkerID()
 	epoch := decisions.Epoch()
 	decisions.RangeDecisions(func(
-		txnID uint64, participants []storeio.TxnParticipant,
-	) bool {
+		txnID uint64, targets []storeio.TxnCollectionRef) bool {
 		report.Decisions++
-		for _, p := range participants {
+		for _, p := range targets {
 			if decisions.Retired(p.StoreID) {
 				continue
 			}
@@ -351,7 +350,7 @@ func verifyDatabaseTxn(dir string) (txnVerifyReport, error) {
 			})
 			continue
 		}
-		participants, ok := decisions.Lookup(markerID, epoch, cond.TxnID)
+		targets, ok := decisions.Lookup(markerID, epoch, cond.TxnID)
 		if !ok {
 			report.Findings = append(report.Findings, txnVerifyFinding{
 				Kind:    "in_doubt",
@@ -364,7 +363,7 @@ func verifyDatabaseTxn(dir string) (txnVerifyReport, error) {
 			continue
 		}
 		bound := false
-		for _, p := range participants {
+		for _, p := range targets {
 			if p.StoreID == cond.StoreID && p.JournalID == cond.JournalID {
 				bound = true
 				break

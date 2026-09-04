@@ -18,34 +18,34 @@ const (
 	distributedTransactionStateFile = "distributed-transaction-state.vjc"
 	distributedTransactionMember    = "\x00distributed-transaction-state"
 
-	// The participant apply record belongs to the repository's single
+	// The target apply record belongs to the repository's single
 	// unreleased format-0 image. The codec byte selects its sole current
 	// grammar; it is a corruption sentinel, not a released format version.
-	distributedParticipantStateCodecSentinel = uint8(0)
-	distributedParticipantStateHeaderBytes   = 8
-	distributedParticipantStateMaxBytes      = distributedParticipantStateHeaderBytes +
+	distributedTargetStateCodecSentinel = uint8(0)
+	distributedTargetStateHeaderBytes   = 8
+	distributedTargetStateMaxBytes      = distributedTargetStateHeaderBytes +
 		binary.MaxVarintLen64 + 9 // uint64 revision plus MaxInt64 rows: 8+10+9 = 27.
 	distributedTransactionStateKeyBytes   = len(distributedtxn.ID{})
 	distributedTransactionStateBatchBytes = distributedTransactionStateKeyBytes +
-		distributedParticipantStateMaxBytes
+		distributedTargetStateMaxBytes
 )
 
 var (
 	ErrDistributedTransactionConflict = errors.New("vibedb: distributed transaction state conflicts with durable state")
 	errDistributedAlreadyApplied      = errors.New("vibedb: distributed participant was already applied")
-	distributedParticipantStateMagic  = [4]byte{'V', 'D', 'P', 'A'}
+	distributedTargetStateMagic       = [4]byte{'V', 'D', 'P', 'A'}
 )
 
-type distributedParticipantCommit struct {
+type distributedTargetCommit struct {
 	id           distributedtxn.ID
 	revision     uint64
 	rowsAffected int64
 	document     []byte
-	documentBuf  [distributedParticipantStateMaxBytes]byte
+	documentBuf  [distributedTargetStateMaxBytes]byte
 }
 
-func (t *tx) checkDistributedParticipantLocked() error {
-	commit := t.distributedParticipant
+func (t *tx) checkDistributedTargetLocked() error {
+	commit := t.distributedTarget
 	if commit == nil {
 		return nil
 	}
@@ -53,7 +53,7 @@ func (t *tx) checkDistributedParticipantLocked() error {
 	if collection == nil {
 		return errors.New("vibedb: distributed transaction state collection is not open")
 	}
-	var rawBuf [distributedParticipantStateMaxBytes]byte
+	var rawBuf [distributedTargetStateMaxBytes]byte
 	raw, found, err := collection.AppendRaw(rawBuf[:0], commit.id[:])
 	if err != nil {
 		return err
@@ -61,7 +61,7 @@ func (t *tx) checkDistributedParticipantLocked() error {
 	if !found {
 		return nil
 	}
-	revision, rowsAffected, err := openDistributedParticipantState(raw)
+	revision, rowsAffected, err := openDistributedTargetState(raw)
 	if err != nil || revision != commit.revision {
 		return ErrDistributedTransactionConflict
 	}
@@ -74,8 +74,8 @@ func distributedTransactionStateOptions() durable.Options {
 		Durability:        durable.DurabilitySync,
 		OpaqueValues:      true,
 		MaxKeyBytes:       distributedTransactionStateKeyBytes,
-		InlineValueBytes:  distributedParticipantStateMaxBytes,
-		MaxDocumentBytes:  distributedParticipantStateMaxBytes,
+		InlineValueBytes:  distributedTargetStateMaxBytes,
+		MaxDocumentBytes:  distributedTargetStateMaxBytes,
 		MaxBatchDocuments: 1,
 		MaxBatchBytes:     distributedTransactionStateBatchBytes,
 	}
@@ -86,7 +86,7 @@ func validateDistributedTransactionStateCollection(collection *durable.Collectio
 		collection.HasSchema() || collection.HasIndexes() ||
 		!collection.HasSynchronousDurability() || !collection.SupportsUpdate() ||
 		collection.MaxKeyBytes() != distributedTransactionStateKeyBytes ||
-		collection.MaxDocumentBytes() != distributedParticipantStateMaxBytes ||
+		collection.MaxDocumentBytes() != distributedTargetStateMaxBytes ||
 		collection.MaxBatchDocuments() != 1 ||
 		collection.MaxBatchBytes() != distributedTransactionStateBatchBytes {
 		return errors.New("vibedb: distributed transaction state collection profile mismatch")
@@ -142,36 +142,36 @@ func (d *database) ensureDistributedTransactionStateLocked() error {
 	return nil
 }
 
-func appendDistributedParticipantState(dst []byte, revision uint64, rowsAffected int64) []byte {
-	dst = append(dst, distributedParticipantStateMagic[:]...)
+func appendDistributedTargetState(dst []byte, revision uint64, rowsAffected int64) []byte {
+	dst = append(dst, distributedTargetStateMagic[:]...)
 	dst = append(dst,
-		distributedParticipantStateCodecSentinel,
-		byte(distributedtxn.ParticipantApplied),
+		distributedTargetStateCodecSentinel,
+		byte(distributedtxn.TargetApplied),
 		0, 0,
 	)
 	dst = binary.AppendUvarint(dst, revision)
 	return binary.AppendUvarint(dst, uint64(rowsAffected))
 }
 
-func openDistributedParticipantState(src []byte) (revision uint64, rowsAffected int64, err error) {
-	if len(src) < distributedParticipantStateHeaderBytes+2 ||
-		len(src) > distributedParticipantStateMaxBytes ||
-		src[0] != distributedParticipantStateMagic[0] ||
-		src[1] != distributedParticipantStateMagic[1] ||
-		src[2] != distributedParticipantStateMagic[2] ||
-		src[3] != distributedParticipantStateMagic[3] ||
-		src[4] != distributedParticipantStateCodecSentinel ||
-		src[5] != byte(distributedtxn.ParticipantApplied) ||
+func openDistributedTargetState(src []byte) (revision uint64, rowsAffected int64, err error) {
+	if len(src) < distributedTargetStateHeaderBytes+2 ||
+		len(src) > distributedTargetStateMaxBytes ||
+		src[0] != distributedTargetStateMagic[0] ||
+		src[1] != distributedTargetStateMagic[1] ||
+		src[2] != distributedTargetStateMagic[2] ||
+		src[3] != distributedTargetStateMagic[3] ||
+		src[4] != distributedTargetStateCodecSentinel ||
+		src[5] != byte(distributedtxn.TargetApplied) ||
 		src[6] != 0 || src[7] != 0 {
 		return 0, 0, ErrDistributedTransactionConflict
 	}
-	revision, n := binary.Uvarint(src[distributedParticipantStateHeaderBytes:])
-	if n <= 0 || revision == 0 || n != distributedParticipantUvarintBytes(revision) {
+	revision, n := binary.Uvarint(src[distributedTargetStateHeaderBytes:])
+	if n <= 0 || revision == 0 || n != distributedTargetUvarintBytes(revision) {
 		return 0, 0, ErrDistributedTransactionConflict
 	}
-	position := distributedParticipantStateHeaderBytes + n
+	position := distributedTargetStateHeaderBytes + n
 	rows, n := binary.Uvarint(src[position:])
-	if n <= 0 || rows > math.MaxInt64 || n != distributedParticipantUvarintBytes(rows) {
+	if n <= 0 || rows > math.MaxInt64 || n != distributedTargetUvarintBytes(rows) {
 		return 0, 0, ErrDistributedTransactionConflict
 	}
 	if position+n != len(src) {
@@ -180,14 +180,14 @@ func openDistributedParticipantState(src []byte) (revision uint64, rowsAffected 
 	return revision, int64(rows), nil
 }
 
-func distributedParticipantUvarintBytes(value uint64) int {
+func distributedTargetUvarintBytes(value uint64) int {
 	return max(1, (bits.Len64(value)+6)/7)
 }
 
 // OpenDistributedTransactionJournal opens the shard-local transaction journal
 // next to this catalog's owned table storage. ShardStoreServingClaim provides
 // the single live writer exclusion; the journal remains separate from SQL data
-// until participant apply joins both through the catalog transaction log.
+// until target apply joins both through the catalog transaction log.
 func (d *Database) OpenDistributedTransactionJournal() (*distributedtxn.Journal, error) {
 	if d == nil || d.connector == nil {
 		return nil, ErrDatabaseClosed
@@ -218,10 +218,10 @@ func (d *Database) OpenDistributedTransactionJournal() (*distributedtxn.Journal,
 	return journal, nil
 }
 
-// DistributedParticipantStatus reads the SQL-atomic participant state by raw
+// DistributedTargetStatus reads the SQL-atomic target state by raw
 // transaction ID. Warm inline reads decode through bounded stack scratch and
 // do not allocate a payload copy.
-func (d *Database) DistributedParticipantStatus(id distributedtxn.ID) (revision uint64, rowsAffected int64, found bool, err error) {
+func (d *Database) DistributedTargetStatus(id distributedtxn.ID) (revision uint64, rowsAffected int64, found bool, err error) {
 	if d == nil || d.connector == nil {
 		return 0, 0, false, ErrDatabaseClosed
 	}
@@ -237,19 +237,19 @@ func (d *Database) DistributedParticipantStatus(id distributedtxn.ID) (revision 
 	if core.closed || core.distributedTxnCollection == nil {
 		return 0, 0, false, ErrDatabaseClosed
 	}
-	var rawBuf [distributedParticipantStateMaxBytes]byte
+	var rawBuf [distributedTargetStateMaxBytes]byte
 	raw, found, err := core.distributedTxnCollection.AppendRaw(rawBuf[:0], id[:])
 	if err != nil || !found {
 		return 0, 0, found, err
 	}
-	revision, rowsAffected, err = openDistributedParticipantState(raw)
+	revision, rowsAffected, err = openDistributedTargetState(raw)
 	return revision, rowsAffected, true, err
 }
 
-// CommitDistributedParticipant publishes the active SQL transaction and its
-// APPLIED participant state in one database transaction. An exact retry returns
+// CommitDistributedTarget publishes the active SQL transaction and its
+// APPLIED target state in one database transaction. An exact retry returns
 // the retained affected-row count without republishing the user mutation.
-func (s *Session) CommitDistributedParticipant(
+func (s *Session) CommitDistributedTarget(
 	ctx context.Context,
 	id distributedtxn.ID,
 	expectedRevision uint64,
@@ -271,14 +271,14 @@ func (s *Session) CommitDistributedParticipant(
 		s.state = SessionFailedTransaction
 		return 0, err
 	}
-	commit := &distributedParticipantCommit{
+	commit := &distributedTargetCommit{
 		id: id, revision: expectedRevision + 1, rowsAffected: rowsAffected,
 	}
-	commit.document = appendDistributedParticipantState(
+	commit.document = appendDistributedTargetState(
 		commit.documentBuf[:0], commit.revision, rowsAffected,
 	)
 	tx := s.conn.tx
-	tx.distributedParticipant = commit
+	tx.distributedTarget = commit
 	err := tx.Commit()
 	s.state = SessionIdle
 	if errors.Is(err, errDistributedAlreadyApplied) {

@@ -23,7 +23,7 @@ import (
 type DurableRequestWave struct {
 	Home              DurableRequestLedgerHome
 	Key               requestledger.RequestKey
-	Participant       DurableRequestLogicalParticipant
+	LogicalTarget     DurableRequestLogicalTarget
 	Identity          ReplicatedTransactionIdentity
 	Tenant            []byte
 	PinID             requestledger.PinID
@@ -73,9 +73,9 @@ type durableRequestWaveStager interface {
 	Stage(context.Context, DurableRequestLedgerHome, requestledger.RequestKey, uint64, []byte, []byte, uint64) (DurableRequestDynamicPayload, error)
 }
 
-// DurableRequestLifecycleRunner drives one participant at a time. Width is
+// DurableRequestLifecycleRunner drives one target at a time. Width is
 // therefore bounded by bytes and the persisted uint64 wave ordinal, not by an
-// aggregate participant slice or a policy participant cap.
+// aggregate target slice or a policy target cap.
 type DurableRequestLifecycleRunner struct {
 	ledger       DurableRequestLedger
 	resolver     DurableRequestRouteResolver
@@ -136,7 +136,7 @@ func newDurableRequestLifecycleRunner(
 }
 
 // RunWave executes the complete durable lifetime of exactly one logical
-// participant wave:
+// target wave:
 //
 //	route intent -> route proposal -> route proof -> pending work -> work
 //	settlement -> continuation -> release intent -> release proposal -> proof
@@ -167,7 +167,7 @@ func (runner *DurableRequestLifecycleRunner) RunWave(
 
 // RunStagedWave admits one invocation before its payload staging writes. The
 // admission is not a reusable token: every return/restart requires a new fence.
-// No service authority is forwarded to staging or participant proposals.
+// No service authority is forwarded to staging or target proposals.
 func (runner *DurableRequestLifecycleRunner) RunStagedWave(ctx context.Context, wave DurableRequestWave) (_ DurableRequestWaveResult, failure error) {
 	stage := "validate"
 	defer func() {
@@ -647,11 +647,11 @@ func (runner *DurableRequestLifecycleRunner) resolveWave(
 	ctx context.Context,
 	wave DurableRequestWave,
 ) (ReplicatedRoute, error) {
-	route, err := runner.resolver.ResolveDurableRequestParticipant(ctx, wave.Participant)
+	route, err := runner.resolver.ResolveDurableRequestTarget(ctx, wave.LogicalTarget)
 	if err != nil {
 		return ReplicatedRoute{}, err
 	}
-	if !durableRequestRouteMatchesParticipant(route, wave.Participant) ||
+	if !durableRequestRouteMatchesTarget(route, wave.LogicalTarget) ||
 		!commandMatchesRoute(wave.Command, route) {
 		return ReplicatedRoute{}, ErrDurableRequestConflict
 	}
@@ -663,28 +663,28 @@ func (runner *DurableRequestLifecycleRunner) resolvePersistedRoute(
 	wave DurableRequestWave,
 	exact []byte,
 ) (ReplicatedRoute, error) {
-	route, err := runner.resolver.ResolveDurableRequestParticipant(ctx, wave.Participant)
+	route, err := runner.resolver.ResolveDurableRequestTarget(ctx, wave.LogicalTarget)
 	if err != nil {
 		return ReplicatedRoute{}, err
 	}
-	if !durableRequestRouteMatchesParticipant(route, wave.Participant) ||
+	if !durableRequestRouteMatchesTarget(route, wave.LogicalTarget) ||
 		!commandMatchesRoute(exact, route) {
 		return ReplicatedRoute{}, ErrDurableRequestConflict
 	}
 	return route, nil
 }
 
-func durableRequestRouteMatchesParticipant(
+func durableRequestRouteMatchesTarget(
 	route ReplicatedRoute,
-	participant DurableRequestLogicalParticipant,
+	target DurableRequestLogicalTarget,
 ) bool {
-	return validReplicatedRoute(route) && route.Distribution == participant.Distribution &&
-		route.Shard == participant.Shard && route.Group == participant.Group &&
-		route.RangeIdentity == participant.RangeIdentity &&
-		route.LineageDigest == participant.LineageDigest &&
-		route.ForwardingRuleDigest == participant.ForwardingRuleDigest &&
-		route.Command.SchemaGeneration == participant.SchemaGeneration &&
-		route.Command.RelationManifestDigest == participant.RelationManifestDigest
+	return validReplicatedRoute(route) && route.Distribution == target.Distribution &&
+		route.Shard == target.Shard && route.Group == target.Group &&
+		route.RangeIdentity == target.RangeIdentity &&
+		route.LineageDigest == target.LineageDigest &&
+		route.ForwardingRuleDigest == target.ForwardingRuleDigest &&
+		route.Command.SchemaGeneration == target.SchemaGeneration &&
+		route.Command.RelationManifestDigest == target.RelationManifestDigest
 }
 
 func (runner *DurableRequestLifecycleRunner) fenceWaveSideEffect(

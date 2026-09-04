@@ -330,7 +330,7 @@ func openTxnDBWithAB(t *testing.T) (*Database, *Collection, *Collection) {
 }
 
 // TestDatabaseTxnReconcileCommittedRollForward covers W3/W4 shapes at the
-// integration level: decision durable with zero/one/all participants already
+// integration level: decision durable with zero/one/all targets already
 // published; reopen recovers all-committed content.
 func TestDatabaseTxnReconcileCommittedRollForward(t *testing.T) {
 	for _, tc := range []struct {
@@ -362,11 +362,11 @@ func TestDatabaseTxnReconcileCommittedRollForward(t *testing.T) {
 			const txnID = uint64(1)
 			genA := prepareMaybePublish(t, a, header.MarkerID, header.Epoch, txnID, "k", `{"n":1}`, tc.publishA)
 			genB := prepareMaybePublish(t, b, header.MarkerID, header.Epoch, txnID, "k", `{"n":1}`, tc.publishB)
-			participants := []storeio.TxnParticipant{
+			targets := []storeio.TxnCollectionRef{
 				{StoreID: a.storeID, JournalID: a.journalID, PreparedGeneration: genA},
 				{StoreID: b.storeID, JournalID: b.journalID, PreparedGeneration: genB},
 			}
-			if _, err := marker.AppendDecision(txnID, participants); err != nil {
+			if _, err := marker.AppendDecision(txnID, targets); err != nil {
 				t.Fatal(err)
 			}
 			if err := marker.Sync(); err != nil {
@@ -382,7 +382,7 @@ func TestDatabaseTxnReconcileCommittedRollForward(t *testing.T) {
 }
 
 // prepareMaybePublish prepares a kind-4 record. When publish is true it also
-// publishes and checkpoints past the conditional (W4: this participant's root
+// publishes and checkpoints past the conditional (W4: this target's root
 // already covers the decision); otherwise it unwinds memory and leaves the
 // durable prepare in the journal (W3).
 func prepareMaybePublish(
@@ -463,9 +463,9 @@ func TestDatabaseTxnReconcilePresumedAbort(t *testing.T) {
 	}
 }
 
-// TestDatabaseTxnParticipantMissingFailClosed deletes one participant under a
+// TestDatabaseTxnCollectionRefMissingFailClosed deletes one target under a
 // live decision and proves OpenDatabase fails; a retirement record opens clean.
-func TestDatabaseTxnParticipantMissingFailClosed(t *testing.T) {
+func TestDatabaseTxnTargetMissingFailClosed(t *testing.T) {
 	db, _, b := openTxnDBWithAB(t)
 	mustTxnUpdate2(t, db, "k", `{"n":1}`, "k", `{"n":1}`)
 	storeB := b.storeID
@@ -482,7 +482,7 @@ func TestDatabaseTxnParticipantMissingFailClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err := OpenDatabase(img, DatabaseOptions{Options: txnTestOptions()})
-	if !errors.Is(err, ErrTransactionParticipantMissing) {
+	if !errors.Is(err, ErrTransactionCollectionMissing) {
 		t.Fatalf("OpenDatabase err=%v want ErrTransactionParticipantMissing", err)
 	}
 
@@ -784,7 +784,7 @@ func TestDatabaseTxnLogRemovalIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err := OpenDatabase(img, DatabaseOptions{Options: txnTestOptions()})
-	if !errors.Is(err, ErrTransactionParticipantMissing) {
+	if !errors.Is(err, ErrTransactionCollectionMissing) {
 		t.Fatalf("OpenDatabase err=%v want ErrTransactionParticipantMissing", err)
 	}
 	if _, err := os.Stat(filepath.Join(img, txnMarkerFilename)); err != nil {

@@ -243,7 +243,7 @@ func (s *ReplicatedChildStage) ApplyTailBatch(
 	return s.stage.ApplyTailBatch(batch, persist)
 }
 
-// Activate publishes or reuses the hidden apply participant, initializes its
+// Activate publishes or reuses the hidden apply target, initializes its
 // state row against the sealed child image, and atomically transfers this
 // exclusive claim to normal ReplicatedApply. The returned snapshot base still
 // must initialize the destination raftstore before serving.

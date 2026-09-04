@@ -104,13 +104,13 @@ const (
 //
 // Cross-collection atomicity rides a sibling sidecar, not a shared primary
 // file. Database.Update (and the caller-owned UpdateCollections primitive)
-// prepares one conditional journal record per dirty participant, then appends
+// prepares one conditional journal record per dirty target, then appends
 // and syncs a single decision record in txn.vtm — that sync is the sole
 // atomic commit point — before publishing under every snapshotGate held at
 // once. Read cuts never observe a torn multi-collection commit. Standalone
-// [Open] of a participant that still holds an uncovered conditional fails
+// [Open] of a target that still holds an uncovered conditional fails
 // closed; open the database directory instead. The one-file layout's cost
-// remains: N open descriptors and N writer locks, and a K-participant commit
+// remains: N open descriptors and N writer locks, and a K-target commit
 // performs K+1 fsyncs.
 //
 // A Database owns the files it opened and closes them in Close. OpenDatabase
@@ -178,9 +178,9 @@ type DatabaseOptions struct {
 // document or posting leaf is scanned. A directory holding K collections
 // costs K bounded recoveries and K open descriptors. When txn.vtm is present,
 // OpenDatabase loads the decision log first, opens every collection with a
-// participant-binding resolver (so committed conditionals roll forward and
+// target-binding resolver (so committed conditionals roll forward and
 // undecided ones are presumed abort and consumed), then reconciles
-// participant presence and log-removal legality. Collection opens complete
+// target presence and log-removal legality. Collection opens complete
 // before the attached TxnLog accepts its first commit.
 //
 // Relative dir values are resolved once at entry, so a later process-wide
@@ -538,7 +538,7 @@ func (d *Database) Collection(name string) (*Collection, bool) {
 //
 // When the collection still holds conditional journal records or an
 // undischarged decision names its StoreID, DropCollection first folds the
-// journal past those records and appends a participant-retired record to
+// journal past those records and appends a target-retired record to
 // txn.vtm, then performs today's ordered primary→journal deletion. A crash
 // around that barrier leaves a consistent reopen image either way.
 //
@@ -800,7 +800,7 @@ func validateOrphanRecoveryJournals(
 		if holds && (decisions == nil || !decisions.Retired(header.StoreID)) {
 			return fmt.Errorf(
 				"%w: orphan journal %q for store %x retains a conditional prepare without participant retirement",
-				ErrTransactionParticipantMissing, base, header.StoreID,
+				ErrTransactionCollectionMissing, base, header.StoreID,
 			)
 		}
 	}

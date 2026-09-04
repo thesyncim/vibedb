@@ -154,7 +154,7 @@ func TestTransactionStateScaffoldCoordinatorDecisionIsMonotoneCAS(t *testing.T) 
 	}
 }
 
-func TestTransactionStateScaffoldParticipantApplyIsAtomicAndIdempotent(t *testing.T) {
+func TestTransactionStateScaffoldTargetApplyIsAtomicAndIdempotent(t *testing.T) {
 	scaffold := newTransactionStateScaffold(t)
 	documentKey := []byte("doc-1")
 	document := []byte(`{"email":"a","n":1}`)
@@ -236,14 +236,14 @@ func TestTransactionStateScaffoldSnapshotAndReopenRetainRecords(t *testing.T) {
 	scaffold := newTransactionStateScaffold(t)
 	coordinatorKey := []byte("txn/coordinator/0000000000000002")
 	coordinator := []byte(`{"revision":2,"state":"committed"}`)
-	participantKey := []byte("txn/participant/0000000000000002")
-	participant := []byte(`{"revision":2,"state":"prepared"}`)
+	targetKey := []byte("txn/participant/0000000000000002")
+	target := []byte(`{"revision":2,"state":"prepared"}`)
 
 	command := scaffold.command(t, replication.RelationMutationBatch{
 		Relation: 1,
 		Mutations: []replication.Mutation{
 			{Kind: replication.MutationPutAbsentOrEqual, Key: coordinatorKey, Value: coordinator},
-			{Kind: replication.MutationPutAbsentOrEqual, Key: participantKey, Value: participant},
+			{Kind: replication.MutationPutAbsentOrEqual, Key: targetKey, Value: target},
 		},
 	})
 	if result := scaffold.apply(t, command); result != ResultApplied {
@@ -296,7 +296,7 @@ func TestTransactionStateScaffoldSnapshotAndReopenRetainRecords(t *testing.T) {
 		want []byte
 	}{
 		{key: coordinatorKey, want: coordinator},
-		{key: participantKey, want: participant},
+		{key: targetKey, want: target},
 	} {
 		result, readErr := reopened.PointReadInto(
 			1, check.key, publication.Applied,

@@ -20,7 +20,7 @@ const (
 	durableRequestMaxPlanPageCount = (requestledger.MaxPlanBytes + requestledger.MaxPlanPageBytes - 1) /
 		requestledger.MaxPlanPageBytes
 	durableRequestReaderMaxLiveBytes = requestledger.MaxPlanPageBytes +
-		durableRequestMaxParticipantFrameBytes +
+		durableRequestMaxTargetFrameBytes +
 		durableRequestMaxPlanPageCount*len(requestledger.Digest{}) +
 		replication.MaxIdentityBytes +
 		distributedtxn.MaxIntentScopes*int(unsafe.Sizeof(distributedtxn.IntentScope{})) +
@@ -40,7 +40,7 @@ func (function durableRequestPlanPageSourceFunc) Get(ordinal uint32) ([]byte, er
 
 // durableRequestRecipeStreamReader authenticates the complete immutable page
 // chain and performs one bounded semantic validation pass before it exposes the
-// first participant. Every lazy reload rechecks that page's authenticated chain
+// first target. Every lazy reload rechecks that page's authenticated chain
 // witness, preventing source substitution after validation.
 type durableRequestRecipeStreamReader struct {
 	descriptor DurableRequestPlanDescriptor
@@ -52,7 +52,7 @@ type durableRequestRecipeStreamReader struct {
 	CatalogGeneration uint64
 	Identity          ReplicatedTransactionIdentity
 	Contract          DurableRequestExecutionContract
-	ParticipantCount  uint64
+	TargetCount       uint64
 	Tenant            []byte
 	KeyDigest         replication.Digest
 	RequestID         replication.ID128
@@ -63,7 +63,7 @@ type durableRequestRecipeStreamReader struct {
 	scopes    []distributedtxn.IntentScope
 	batches   []replication.RelationMutationBatch
 	mutations []replication.Mutation
-	current   DurableRequestLogicalParticipant
+	current   DurableRequestLogicalTarget
 	err       error
 	done      bool
 }
@@ -120,7 +120,7 @@ func (reader *durableRequestRecipeStreamReader) resetAndReadHeader() error {
 	}
 	reader.cursor = cursor
 	reader.ordinal, reader.err, reader.done = 0, nil, false
-	reader.current = DurableRequestLogicalParticipant{}
+	reader.current = DurableRequestLogicalTarget{}
 	var headers [durableRequestPlanHeaderBytes + durableRequestLogicalRecipeHeaderBytes]byte
 	if err := reader.cursor.readFull(headers[:]); err != nil {
 		return err
@@ -136,7 +136,7 @@ func (reader *durableRequestRecipeStreamReader) resetAndReadHeader() error {
 		!allZeroDurableRequest(recipe[26:32]) || !allZeroDurableRequest(recipe[76:80]) {
 		return ErrDurableRequestConflict
 	}
-	reader.ParticipantCount = binary.LittleEndian.Uint64(recipe[16:24])
+	reader.TargetCount = binary.LittleEndian.Uint64(recipe[16:24])
 	tenantBytes := int(binary.LittleEndian.Uint16(recipe[24:26]))
 	copy(reader.Identity.ID[:], recipe[32:48])
 	copy(reader.Identity.RetryHome[:], recipe[48:56])
@@ -178,7 +178,7 @@ func (reader *durableRequestRecipeStreamReader) resetAndReadHeader() error {
 	contract.AbortTransitionTag = binary.LittleEndian.Uint32(recipe[offset : offset+4])
 	offset += 4
 	values := []*uint64{
-		&contract.ParticipantCount, &contract.CommitFinalWaveCount,
+		&contract.TargetCount, &contract.CommitFinalWaveCount,
 		&contract.AbortFinalWaveCount, &contract.MaxPendingWaveBytes,
 		&contract.MaxContinuationBytes, &contract.MaxTerminalBytes,
 		&contract.MaxActivePayloadBytes, &contract.MaxActivePayloadChunks,
@@ -201,10 +201,10 @@ func (reader *durableRequestRecipeStreamReader) resetAndReadHeader() error {
 	reader.CatalogGeneration = reader.Identity.CatalogGeneration
 	recipeBytes := binary.LittleEndian.Uint64(plan[16:24])
 	frameBudget := recipeBytes - durableRequestLogicalRecipeHeaderBytes - durableRequestRecipeTrailerBytes
-	if reader.ParticipantCount == 0 || tenantBytes <= 0 || tenantBytes > replication.MaxIdentityBytes ||
-		uint64(reader.Identity.CoordinatorOrdinal) >= reader.ParticipantCount ||
+	if reader.TargetCount == 0 || tenantBytes <= 0 || tenantBytes > replication.MaxIdentityBytes ||
+		uint64(reader.Identity.CoordinatorOrdinal) >= reader.TargetCount ||
 		uint64(tenantBytes) > frameBudget ||
-		reader.ParticipantCount > (frameBudget-uint64(tenantBytes))/durableRequestLogicalParticipantHeaderBytes ||
+		reader.TargetCount > (frameBudget-uint64(tenantBytes))/durableRequestLogicalTargetHeaderBytes ||
 		!validDurableRequestStreamFixedContract(*reader) {
 		return ErrDurableRequestConflict
 	}
@@ -220,7 +220,7 @@ func (reader *durableRequestRecipeStreamReader) resetAndReadHeader() error {
 }
 
 // Reset authenticates and reopens the same sealed plan from its first
-// participant. Page reloads retain the original page-chain witnesses, so a
+// target. Page reloads retain the original page-chain witnesses, so a
 // mutable source cannot substitute bytes between protocol passes.
 func (reader *durableRequestRecipeStreamReader) Reset() error {
 	if reader == nil {
@@ -229,7 +229,7 @@ func (reader *durableRequestRecipeStreamReader) Reset() error {
 	return reader.resetAndReadHeader()
 }
 
-var _ DurableRequestReplayableParticipantStream = (*durableRequestRecipeStreamReader)(nil)
+var _ DurableRequestReplayableTargetStream = (*durableRequestRecipeStreamReader)(nil)
 
 func validDurableRequestStreamFixedContract(reader durableRequestRecipeStreamReader) bool {
 	identity, contract := reader.Identity, reader.Contract
@@ -242,7 +242,7 @@ func validDurableRequestStreamFixedContract(reader durableRequestRecipeStreamRea
 		reader.RequestDigest == (replication.Digest{}) ||
 		contract.CatalogGeneration != identity.CatalogGeneration ||
 		contract.KeyDigest != reader.KeyDigest || contract.RequestDigest != reader.RequestDigest ||
-		contract.ParticipantCount != reader.ParticipantCount ||
+		contract.TargetCount != reader.TargetCount ||
 		contract.KernelSemanticsDigest != replication.Digest(requestledger.SemanticsDigest()) ||
 		contract.PinID != durableRequestPinID(reader.KeyDigest, reader.RequestDigest) ||
 		contract.PinEpoch == 0 ||
@@ -487,7 +487,7 @@ func (reader *durableRequestRecipeStreamReader) Next() bool {
 	if reader == nil || reader.err != nil || reader.done {
 		return false
 	}
-	if reader.ordinal == reader.ParticipantCount {
+	if reader.ordinal == reader.TargetCount {
 		var trailers [durableRequestRecipeTrailerBytes + durableRequestPlanTrailerBytes]byte
 		if reader.err = reader.cursor.readFull(trailers[:]); reader.err == nil &&
 			reader.cursor.absolute != reader.descriptor.TotalBytes {
@@ -496,15 +496,15 @@ func (reader *durableRequestRecipeStreamReader) Next() bool {
 		reader.done = true
 		return false
 	}
-	var header [durableRequestLogicalParticipantHeaderBytes]byte
+	var header [durableRequestLogicalTargetHeaderBytes]byte
 	if reader.err = reader.cursor.readFull(header[:]); reader.err != nil {
 		return false
 	}
 	frameBytes := int(binary.LittleEndian.Uint32(header[:4]))
-	if frameBytes < durableRequestLogicalParticipantHeaderBytes ||
-		frameBytes > durableRequestMaxParticipantFrameBytes ||
+	if frameBytes < durableRequestLogicalTargetHeaderBytes ||
+		frameBytes > durableRequestMaxTargetFrameBytes ||
 		reader.cursor.absolute > reader.descriptor.TotalBytes ||
-		uint64(frameBytes-durableRequestLogicalParticipantHeaderBytes) >
+		uint64(frameBytes-durableRequestLogicalTargetHeaderBytes) >
 			reader.descriptor.TotalBytes-reader.cursor.absolute {
 		reader.err = ErrDurableRequestConflict
 		return false
@@ -514,12 +514,12 @@ func (reader *durableRequestRecipeStreamReader) Next() bool {
 	} else {
 		reader.frame = reader.frame[:frameBytes]
 	}
-	copy(reader.frame[:durableRequestLogicalParticipantHeaderBytes], header[:])
-	reader.err = reader.cursor.readFull(reader.frame[durableRequestLogicalParticipantHeaderBytes:])
+	copy(reader.frame[:durableRequestLogicalTargetHeaderBytes], header[:])
+	reader.err = reader.cursor.readFull(reader.frame[durableRequestLogicalTargetHeaderBytes:])
 	if reader.err != nil {
 		return false
 	}
-	reader.current, reader.err = reader.openParticipant(reader.frame)
+	reader.current, reader.err = reader.openTarget(reader.frame)
 	if reader.err != nil {
 		return false
 	}
@@ -527,9 +527,9 @@ func (reader *durableRequestRecipeStreamReader) Next() bool {
 	return true
 }
 
-func (reader *durableRequestRecipeStreamReader) Current() DurableRequestLogicalParticipant {
+func (reader *durableRequestRecipeStreamReader) Current() DurableRequestLogicalTarget {
 	if reader == nil || reader.err != nil || reader.ordinal == 0 {
-		return DurableRequestLogicalParticipant{}
+		return DurableRequestLogicalTarget{}
 	}
 	return reader.current
 }
@@ -543,7 +543,7 @@ func (reader *durableRequestRecipeStreamReader) Err() error {
 
 func (reader *durableRequestRecipeStreamReader) Complete() bool {
 	return reader != nil && reader.err == nil && reader.done &&
-		reader.ordinal == reader.ParticipantCount && reader.cursor.absolute == reader.descriptor.TotalBytes
+		reader.ordinal == reader.TargetCount && reader.cursor.absolute == reader.descriptor.TotalBytes
 }
 
 func (reader *durableRequestRecipeStreamReader) BufferedBytes() int {
@@ -557,12 +557,12 @@ func (reader *durableRequestRecipeStreamReader) BufferedBytes() int {
 		cap(reader.mutations)*int(unsafe.Sizeof(replication.Mutation{}))
 }
 
-func (reader *durableRequestRecipeStreamReader) openParticipant(
+func (reader *durableRequestRecipeStreamReader) openTarget(
 	frame []byte,
-) (DurableRequestLogicalParticipant, error) {
-	if len(frame) < durableRequestLogicalParticipantHeaderBytes ||
+) (DurableRequestLogicalTarget, error) {
+	if len(frame) < durableRequestLogicalTargetHeaderBytes ||
 		int(binary.LittleEndian.Uint32(frame[:4])) != len(frame) {
-		return DurableRequestLogicalParticipant{}, ErrDurableRequestConflict
+		return DurableRequestLogicalTarget{}, ErrDurableRequestConflict
 	}
 	distributionBytes := int(binary.LittleEndian.Uint16(frame[4:6]))
 	shardBytes := int(binary.LittleEndian.Uint16(frame[6:8]))
@@ -581,24 +581,24 @@ func (reader *durableRequestRecipeStreamReader) openParticipant(
 		layout.Bytes <= 0 || layout.Bytes > replication.MaxCommandBytes ||
 		layout.RelationCount == 0 || layout.MutationCount == 0 ||
 		layout.MutationCount > replication.MaxMutations {
-		return DurableRequestLogicalParticipant{}, ErrDurableRequestConflict
+		return DurableRequestLogicalTarget{}, ErrDurableRequestConflict
 	}
-	cursor := durableRequestLogicalParticipantHeaderBytes
+	cursor := durableRequestLogicalTargetHeaderBytes
 	if distributionBytes > len(frame)-cursor {
-		return DurableRequestLogicalParticipant{}, ErrDurableRequestConflict
+		return DurableRequestLogicalTarget{}, ErrDurableRequestConflict
 	}
 	distributionEnd := cursor + distributionBytes
 	distributionRaw := frame[cursor:distributionEnd:distributionEnd]
 	cursor = distributionEnd
 	if shardBytes > len(frame)-cursor {
-		return DurableRequestLogicalParticipant{}, ErrDurableRequestConflict
+		return DurableRequestLogicalTarget{}, ErrDurableRequestConflict
 	}
 	shardEnd := cursor + shardBytes
 	shardRaw := frame[cursor:shardEnd:shardEnd]
 	cursor = shardEnd
 	if scopeCount > (len(frame)-cursor-layout.Bytes)/8 ||
 		layout.Bytes > len(frame)-cursor-scopeCount*8 {
-		return DurableRequestLogicalParticipant{}, ErrDurableRequestConflict
+		return DurableRequestLogicalTarget{}, ErrDurableRequestConflict
 	}
 	if cap(reader.scopes) < scopeCount {
 		reader.scopes = make([]distributedtxn.IntentScope, scopeCount)
@@ -613,12 +613,12 @@ func (reader *durableRequestRecipeStreamReader) openParticipant(
 		cursor += 8
 	}
 	if cursor+layout.Bytes != len(frame) {
-		return DurableRequestLogicalParticipant{}, ErrDurableRequestConflict
+		return DurableRequestLogicalTarget{}, ErrDurableRequestConflict
 	}
 	mutationRaw := frame[cursor : cursor+layout.Bytes : cursor+layout.Bytes]
 	view, err := replication.OpenTransactionMutationBytes(mutationRaw, layout)
 	if err != nil {
-		return DurableRequestLogicalParticipant{}, errors.Join(err, ErrDurableRequestConflict)
+		return DurableRequestLogicalTarget{}, errors.Join(err, ErrDurableRequestConflict)
 	}
 	if cap(reader.mutations) < int(layout.MutationCount) {
 		reader.mutations = make([]replication.Mutation, 0, int(layout.MutationCount))
@@ -648,28 +648,28 @@ func (reader *durableRequestRecipeStreamReader) openParticipant(
 			Mutations: reader.mutations[start:len(reader.mutations):len(reader.mutations)],
 		})
 	}
-	participant := DurableRequestLogicalParticipant{
+	target := DurableRequestLogicalTarget{
 		Distribution:     distribution.DistributionName(byteview.String(distributionRaw)),
 		Shard:            distribution.ShardID(byteview.String(shardRaw)),
 		Group:            openDurableRequestGroup(frame[64:136]),
 		SchemaGeneration: binary.LittleEndian.Uint64(frame[136:144]),
 		BucketBits:       bucketBits, IntentScopes: reader.scopes, Batches: reader.batches,
 	}
-	copy(participant.RangeIdentity[:], frame[32:64])
-	copy(participant.RelationManifestDigest[:], frame[144:176])
-	copy(participant.LineageDigest[:], frame[176:208])
-	copy(participant.ForwardingRuleDigest[:], frame[208:240])
-	copy(participant.MutationDigest[:], frame[240:272])
-	if !validDurableRequestLogicalGroup(participant.Group) || participant.SchemaGeneration == 0 ||
-		participant.RangeIdentity == (replication.Digest{}) ||
-		participant.RelationManifestDigest == (replication.Digest{}) ||
-		participant.LineageDigest == (replication.Digest{}) ||
-		participant.ForwardingRuleDigest == (replication.Digest{}) ||
-		!distributedtxn.ValidateIntentScopes(participant.IntentScopes, participant.BucketBits) ||
-		view.Digest() != participant.MutationDigest {
-		return DurableRequestLogicalParticipant{}, ErrDurableRequestConflict
+	copy(target.RangeIdentity[:], frame[32:64])
+	copy(target.RelationManifestDigest[:], frame[144:176])
+	copy(target.LineageDigest[:], frame[176:208])
+	copy(target.ForwardingRuleDigest[:], frame[208:240])
+	copy(target.MutationDigest[:], frame[240:272])
+	if !validDurableRequestLogicalGroup(target.Group) || target.SchemaGeneration == 0 ||
+		target.RangeIdentity == (replication.Digest{}) ||
+		target.RelationManifestDigest == (replication.Digest{}) ||
+		target.LineageDigest == (replication.Digest{}) ||
+		target.ForwardingRuleDigest == (replication.Digest{}) ||
+		!distributedtxn.ValidateIntentScopes(target.IntentScopes, target.BucketBits) ||
+		view.Digest() != target.MutationDigest {
+		return DurableRequestLogicalTarget{}, ErrDurableRequestConflict
 	}
-	return participant, nil
+	return target, nil
 }
 
 type durableRequestStreamContractValidator struct {
@@ -699,9 +699,9 @@ func newDurableRequestStreamContractValidator(
 	_, _ = validator.manifest.Write(reader.KeyDigest[:])
 	_, _ = validator.manifest.Write(reader.RequestDigest[:])
 	_, _ = validator.schema.Write(byteview.Bytes(durableRequestSchemaDomain))
-	writeDurableRequestU64(validator.schema, &validator.scratch, reader.ParticipantCount)
+	writeDurableRequestU64(validator.schema, &validator.scratch, reader.TargetCount)
 	_, _ = validator.lineage.Write(byteview.Bytes(durableRequestLineageDomain))
-	writeDurableRequestU64(validator.lineage, &validator.scratch, reader.ParticipantCount)
+	writeDurableRequestU64(validator.lineage, &validator.scratch, reader.TargetCount)
 	_, _ = validator.coordinator.Write(byteview.Bytes(durableRequestCoordinatorDomain))
 	writeDurableRequestU64(validator.coordinator, &validator.scratch, uint64(reader.Identity.CoordinatorOrdinal))
 	return validator
@@ -709,10 +709,10 @@ func newDurableRequestStreamContractValidator(
 
 func (validator *durableRequestStreamContractValidator) observe(
 	ordinal uint64,
-	participant *DurableRequestLogicalParticipant,
+	target *DurableRequestLogicalTarget,
 ) error {
-	distributionRaw := byteview.Bytes(string(participant.Distribution))
-	shardRaw := byteview.Bytes(string(participant.Shard))
+	distributionRaw := byteview.Bytes(string(target.Distribution))
+	shardRaw := byteview.Bytes(string(target.Shard))
 	if validator.hasPrevious {
 		order := bytes.Compare(
 			validator.previousDistribution[:validator.previousDistributionBytes], distributionRaw,
@@ -721,7 +721,7 @@ func (validator *durableRequestStreamContractValidator) observe(
 			order = bytes.Compare(validator.previousShard[:validator.previousShardBytes], shardRaw)
 		}
 		if order == 0 {
-			order = bytes.Compare(validator.previousRange[:], participant.RangeIdentity[:])
+			order = bytes.Compare(validator.previousRange[:], target.RangeIdentity[:])
 		}
 		if order >= 0 {
 			return ErrDurableRequestConflict
@@ -729,16 +729,16 @@ func (validator *durableRequestStreamContractValidator) observe(
 	}
 	validator.previousDistributionBytes = copy(validator.previousDistribution[:], distributionRaw)
 	validator.previousShardBytes = copy(validator.previousShard[:], shardRaw)
-	validator.previousRange = participant.RangeIdentity
+	validator.previousRange = target.RangeIdentity
 	validator.hasPrevious = true
-	writeDurableRequestParticipantIdentity(validator.manifest, &validator.scratch, participant)
-	writeDurableRequestU64(validator.schema, &validator.scratch, participant.SchemaGeneration)
-	_, _ = validator.schema.Write(participant.RelationManifestDigest[:])
-	_, _ = validator.lineage.Write(participant.RangeIdentity[:])
-	_, _ = validator.lineage.Write(participant.LineageDigest[:])
-	_, _ = validator.lineage.Write(participant.ForwardingRuleDigest[:])
+	writeDurableRequestTargetIdentity(validator.manifest, &validator.scratch, target)
+	writeDurableRequestU64(validator.schema, &validator.scratch, target.SchemaGeneration)
+	_, _ = validator.schema.Write(target.RelationManifestDigest[:])
+	_, _ = validator.lineage.Write(target.RangeIdentity[:])
+	_, _ = validator.lineage.Write(target.LineageDigest[:])
+	_, _ = validator.lineage.Write(target.ForwardingRuleDigest[:])
 	if ordinal == uint64(validator.coordinatorOrdinal) {
-		writeDurableRequestParticipantIdentity(validator.coordinator, &validator.scratch, participant)
+		writeDurableRequestTargetIdentity(validator.coordinator, &validator.scratch, target)
 	}
 	return nil
 }

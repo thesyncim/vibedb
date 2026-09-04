@@ -13,7 +13,7 @@ import (
 	pb "go.etcd.io/raft/v3/raftpb"
 )
 
-// A learner changes physical replication, not the sealed SQL participant.
+// A learner changes physical replication, not the sealed SQL target.
 // Foreground admission must work both before and after the gate command has
 // been durably prepared. No catalog publication or command rewrite is allowed
 // to hide the membership/catalog interval exercised by the process CI failure.

@@ -36,9 +36,9 @@ func TestTransactionImageReopenAccountingIntentOwnershipAndTopologyFence(t *test
 	mutationBytes, _ := TransactionRelationPayloadResidentBytes(len(relationBatch.MutationBytes()))
 	intentBytes, _ := TransactionIntentResidentBytes(len(mutation.Key))
 	control := TransactionControl{
-		ID: id, Role: distributedtxn.ReplicatedRoleParticipant,
-		State: uint8(distributedtxn.ParticipantPrepared), Revision: 2,
-		PayloadKind:   distributedtxn.ReplicatedPayloadParticipantStage,
+		ID: id, Role: distributedtxn.ReplicatedRoleTarget,
+		State: uint8(distributedtxn.TargetPrepared), Revision: 2,
+		PayloadKind:   distributedtxn.ReplicatedPayloadTargetStage,
 		PayloadDigest: transactionCodecDigest(20), PayloadBytes: 4096, PayloadCount: 1,
 		PayloadRelationCount:        1,
 		CoordinatorGroup:            transactionCodecReplicationID(30),
@@ -47,7 +47,7 @@ func TestTransactionImageReopenAccountingIntentOwnershipAndTopologyFence(t *test
 		BucketBits: 8, IntentScopes: []distributedtxn.IntentScope{{Start: 1, End: 3}},
 		ResidentControlBytes: controlBytes, ResidentMutationBytes: mutationBytes,
 		ResidentIntentBytes:  intentBytes,
-		LastOperation:        distributedtxn.ReplicatedPrepareParticipant,
+		LastOperation:        distributedtxn.ReplicatedPrepareTarget,
 		LastExpectedRevision: 1, LastCommandDigest: transactionCodecCommandDigest(110),
 		LastResultCode: ResultApplied, LastAppliedIndex: 2,
 	}
@@ -149,19 +149,19 @@ func TestFusedCoordinatorZeroVoteCannotReopenOrCommit(t *testing.T) {
 		State: uint8(distributedtxn.CoordinatorStaging), Revision: 1,
 		PayloadKind:   distributedtxn.ReplicatedPayloadCoordinator,
 		PayloadDigest: payloadDigest, PayloadBytes: uint64(len(payload)), PayloadCount: 1,
-		CoordinatorGroup:              fixture.binding.GroupID,
-		CoordinatorShardIncarnation:   fixture.binding.ShardIncarnation,
-		CoordinatorAllocation:         fixture.binding.AllocationGeneration,
-		MutationDigest:                payloadDigest,
-		CoordinatorParticipantOrdinal: 0,
-		PrepareResultCode:             ResultApplied,
-		FusedPath:                     true,
-		ResidentControlBytes:          controlBytes,
-		ResidentPayloadBytes:          payloadBytes,
-		LastOperation:                 distributedtxn.ReplicatedBeginPrepareCoordinator,
-		LastCommandDigest:             transactionCodecCommandDigest(111),
-		LastResultCode:                ResultApplied,
-		LastAppliedIndex:              2,
+		CoordinatorGroup:            fixture.binding.GroupID,
+		CoordinatorShardIncarnation: fixture.binding.ShardIncarnation,
+		CoordinatorAllocation:       fixture.binding.AllocationGeneration,
+		MutationDigest:              payloadDigest,
+		CoordinatorTargetOrdinal:    0,
+		PrepareResultCode:           ResultApplied,
+		FusedPath:                   true,
+		ResidentControlBytes:        controlBytes,
+		ResidentPayloadBytes:        payloadBytes,
+		LastOperation:               distributedtxn.ReplicatedBeginPrepareCoordinator,
+		LastCommandDigest:           transactionCodecCommandDigest(111),
+		LastResultCode:              ResultApplied,
+		LastAppliedIndex:            2,
 	}
 	controlValue, err := AppendTransactionControl(nil, fencedTransactionTestControl(control))
 	if err != nil {
@@ -221,7 +221,7 @@ func TestFusedCoordinatorZeroVoteCannotReopenOrCommit(t *testing.T) {
 	}
 }
 
-func TestParticipantAbortFenceReopensAndSettlesExactRetry(t *testing.T) {
+func TestTargetAbortFenceReopensAndSettlesExactRetry(t *testing.T) {
 	fixture := newMachineFixture(t)
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatal(err)
@@ -229,16 +229,16 @@ func TestParticipantAbortFenceReopensAndSettlesExactRetry(t *testing.T) {
 	id := transactionCodecID(247)
 	mutationDigest := distributedtxn.Digest(sha256.Sum256([]byte("abort-fence-mutation")))
 	commandControl := distributedtxn.ReplicatedCommand{
-		Role:        distributedtxn.ReplicatedRoleParticipant,
-		Operation:   distributedtxn.ReplicatedAbortReleaseParticipant,
+		Role:        distributedtxn.ReplicatedRoleTarget,
+		Operation:   distributedtxn.ReplicatedAbortReleaseTarget,
 		ID:          id,
-		PayloadKind: distributedtxn.ReplicatedPayloadParticipantStage,
-		Participant: distributedtxn.ParticipantStage{
+		PayloadKind: distributedtxn.ReplicatedPayloadTargetStage,
+		Target: distributedtxn.TransactionTargetStage{
 			CoordinatorGroup:            distributedtxn.ID(fixture.binding.GroupID),
 			CoordinatorShardIncarnation: distributedtxn.ID(fixture.binding.ShardIncarnation),
 			CoordinatorAllocation:       fixture.binding.AllocationGeneration,
 			MutationDigest:              mutationDigest,
-			ParticipantOrdinal:          4096,
+			TargetOrdinal:               4096,
 		},
 	}
 	command := transactionCompletionCommand(t, fixture.binding, commandControl, nil)
@@ -248,18 +248,18 @@ func TestParticipantAbortFenceReopensAndSettlesExactRetry(t *testing.T) {
 	}
 	controlBytes, _ := TransactionControlResidentBytes(0)
 	control := TransactionControl{
-		ID: id, Role: distributedtxn.ReplicatedRoleParticipant,
-		State: uint8(distributedtxn.ParticipantReleased), Revision: 1,
-		PayloadKind:                 distributedtxn.ReplicatedPayloadParticipantStage,
+		ID: id, Role: distributedtxn.ReplicatedRoleTarget,
+		State: uint8(distributedtxn.TargetReleased), Revision: 1,
+		PayloadKind:                 distributedtxn.ReplicatedPayloadTargetStage,
 		PayloadDigest:               mutationDigest,
 		CoordinatorGroup:            fixture.binding.GroupID,
 		CoordinatorShardIncarnation: fixture.binding.ShardIncarnation,
 		CoordinatorAllocation:       fixture.binding.AllocationGeneration,
 		MutationDigest:              mutationDigest,
-		ParticipantOrdinal:          4096,
+		TargetOrdinal:               4096,
 		FusedPath:                   true, CancellationWitness: true,
 		ResidentControlBytes: controlBytes,
-		LastOperation:        distributedtxn.ReplicatedAbortReleaseParticipant,
+		LastOperation:        distributedtxn.ReplicatedAbortReleaseTarget,
 		LastExpectedRevision: 0,
 		LastCommandDigest:    LogicalCommandDigest(openedCommand),
 		LastResultCode:       ResultApplied,
@@ -307,12 +307,12 @@ func TestParticipantAbortFenceReopensAndSettlesExactRetry(t *testing.T) {
 	}
 	records := make([]TransactionRecoveryRecord, 0, 1)
 	recovery, err := reopened.TransactionRecoveryReadInto(TransactionRecoveryReadRequest{
-		Kind: TransactionRecoveryLookupParticipant, ID: id, MinimumApplied: 2,
+		Kind: TransactionRecoveryLookupTarget, ID: id, MinimumApplied: 2,
 		MaxRows: 1, MaxBytes: TransactionRecoverySummaryBytes,
 	}, records, nil)
 	if err != nil || len(recovery.Records) != 1 ||
 		!recovery.Records[0].CancellationWitness ||
-		recovery.Records[0].ParticipantOrdinal != 4096 ||
+		recovery.Records[0].TargetOrdinal != 4096 ||
 		recovery.Records[0].PayloadCount != 0 {
 		t.Fatalf("reopened abort fence recovery=%+v err=%v", recovery, err)
 	}

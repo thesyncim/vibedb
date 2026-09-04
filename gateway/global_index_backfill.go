@@ -16,7 +16,7 @@ var (
 	ErrIndexBackfillTask      = errors.New("gateway: global index backfill task is stale or malformed")
 )
 
-// Keep one base check plus every PUT comfortably below the participant batch's
+// Keep one base check plus every PUT comfortably below the target batch's
 // statement-count envelope, leaving room for future per-page metadata.
 const maxGlobalIndexBackfillPageRows = 2048
 
@@ -313,7 +313,7 @@ func (e *Executor) commitBackfillGroup(
 		},
 	}
 	primaryPath := []byte(program.metadata.LocatorPaths[program.primary])
-	participants, err := appendTransactionStatement(nil, baseCall, shardservice.MutationStatement{
+	targets, err := appendTransactionStatement(nil, baseCall, shardservice.MutationStatement{
 		Kind:     shardservice.MutationPrimaryCheck,
 		Relation: program.metadata.Table, PrimaryPath: primaryPath,
 		ExpectedKeys: group.keys, ExpectedDigests: group.digests,
@@ -335,8 +335,8 @@ func (e *Executor) commitBackfillGroup(
 	for i := range group.entries {
 		entry := &group.entries[i]
 		indexCall.req.AccessScopes = []distributedtxn.IntentScope{entry.scope}
-		participants, err = appendTransactionStatement(
-			participants, indexCall, shardservice.MutationStatement{
+		targets, err = appendTransactionStatement(
+			targets, indexCall, shardservice.MutationStatement{
 				Kind:     shardservice.MutationGlobalIndexPut,
 				Relation: program.metadata.Relation,
 				IndexID:  program.metadata.IndexID, Incarnation: program.metadata.Incarnation,
@@ -350,7 +350,7 @@ func (e *Executor) commitBackfillGroup(
 			return err
 		}
 	}
-	sortTransactionParticipants(participants)
-	_, err = e.executeTransaction(ctx, snapshot, participants, profile)
+	sortTransactionTargets(targets)
+	_, err = e.executeTransaction(ctx, snapshot, targets, profile)
 	return err
 }

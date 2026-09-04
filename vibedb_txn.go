@@ -282,8 +282,8 @@ func (t *Tx) Commit() error {
 	}
 
 	dirty := t.dirtyStates()
-	participants := t.participantStates()
-	if len(participants) == 0 {
+	targets := t.targetStates()
+	if len(targets) == 0 {
 		t.finish(nil)
 		return nil
 	}
@@ -299,8 +299,8 @@ func (t *Tx) Commit() error {
 	// same-collection peers still serialize on that collection's txnFence.
 	// Anything wider (cross-collection reads, multi-collection writes) takes
 	// the exclusive mode to preserve serializable validation.
-	sharedCommit := len(dirty) == 1 && len(participants) == 1 &&
-		participants[0].name == dirty[0].name
+	sharedCommit := len(dirty) == 1 && len(targets) == 1 &&
+		targets[0].name == dirty[0].name
 	if sharedCommit {
 		db.commitMu.RLock()
 		defer db.commitMu.RUnlock()
@@ -313,8 +313,8 @@ func (t *Tx) Commit() error {
 	// publication, and conflict-clock recording. A direct Put/Delete on a dirty
 	// collection therefore linearizes wholly before validation or after COMMIT;
 	// writes to unrelated collections remain independent.
-	lockedCollections := make([]*Collection, 0, len(participants))
-	for _, state := range participants {
+	lockedCollections := make([]*Collection, 0, len(targets))
+	for _, state := range targets {
 		// The handle is cached at ensure time: every participant state
 		// carries the catalog handle it resolved through.
 		collection := state.coll
@@ -339,7 +339,7 @@ func (t *Tx) Commit() error {
 		)
 	}
 
-	if err := t.validateDependencies(participants); err != nil {
+	if err := t.validateDependencies(targets); err != nil {
 		t.finish(nil)
 		return err
 	}
@@ -721,7 +721,7 @@ func (t *Tx) dirtyStates() []*txCollectionState {
 	return dirty
 }
 
-func (t *Tx) participantStates() []*txCollectionState {
+func (t *Tx) targetStates() []*txCollectionState {
 	states := make([]*txCollectionState, 0, len(t.colls))
 	if s := t.solo; s != nil && (s.hasPublishableWrites() || s.coarseRead || len(s.readOrder) != 0) {
 		states = append(states, s)
@@ -892,7 +892,7 @@ func fillDurableBatch(batch *durable.WriteBatch, state *txCollectionState) error
 }
 
 func (t *Tx) commitMemory(dirty []*txCollectionState) error {
-	participants := make([]*store.Collection, 0, len(dirty))
+	targets := make([]*store.Collection, 0, len(dirty))
 	for _, state := range dirty {
 		memory, _, err := state.coll.backend(false)
 		if err != nil {
@@ -901,11 +901,11 @@ func (t *Tx) commitMemory(dirty []*txCollectionState) error {
 		if memory == nil {
 			return fmt.Errorf("%w: collection %q missing at commit", ErrTxConflict, state.name)
 		}
-		participants = append(participants, memory)
+		targets = append(targets, memory)
 	}
 	// Iterate the dirty slice directly: each write batch is independent, so
 	// the name-keyed re-index map was pure per-commit overhead.
-	return store.UpdateCollections(participants, func(batch *store.DatabaseBatch) error {
+	return store.UpdateCollections(targets, func(batch *store.DatabaseBatch) error {
 		for _, state := range dirty {
 			wb, err := batch.Collection(state.name)
 			if err != nil {

@@ -14,7 +14,7 @@ import (
 	"github.com/thesyncim/vibejson/x/byteview"
 )
 
-// MutationKind identifies one participant-batch entry. The zero value remains
+// MutationKind identifies one target-batch entry. The zero value remains
 // ordinary SQL so existing constructors and the routed SQL lane stay compact.
 // Typed entries use the formerly invalid zero SQL-length sentinel inside the
 // same batch format; there is no parallel or named protocol generation.
@@ -33,11 +33,11 @@ func (k MutationKind) valid() bool {
 }
 
 // MutationStatement is one non-row-returning mutation inside a shard-local
-// participant batch. Ordinary SQL remains text because the local parser is its
+// target batch. Ordinary SQL remains text because the local parser is its
 // plan authority. Global-index entries are byte-native: Relation is cold
 // identity, EntryKey is the canonical tuple key, and Value is the bounded JSON
 // locator array produced with vibejson. All decoded payloads borrow the durable
-// participant record.
+// target record.
 type MutationStatement struct {
 	Kind       MutationKind
 	SQL        string
@@ -61,9 +61,9 @@ type MutationStatement struct {
 }
 
 const (
-	// MaxMutationStatements is the canonical per-participant statement bound.
+	// MaxMutationStatements is the canonical per-target statement bound.
 	// Gateways use the same authority during planning so they reject excess
-	// before retaining it or attempting participant encoding.
+	// before retaining it or attempting target encoding.
 	MaxMutationStatements      = 4096
 	maxMutationRelationBytes   = 1<<16 - 1
 	mutationBatchHeader        = 8
@@ -78,8 +78,8 @@ var (
 )
 
 // AppendMutationBatch appends a deterministic compact batch. Ownership and
-// execution limits live once in the participant/apply envelopes, so they are
-// not repeated for every statement. The participant record's checksum and
+// execution limits live once in the target/apply envelopes, so they are
+// not repeated for every statement. The target record's checksum and
 // SHA-256 digest protect these bytes durably and end to end.
 func AppendMutationBatch(dst []byte, statements []MutationStatement) ([]byte, error) {
 	if len(statements) == 0 || len(statements) > MaxMutationStatements {
@@ -261,7 +261,7 @@ func AppendMutationBatch(dst []byte, statements []MutationStatement) ([]byte, er
 
 // MutationBatch is a zero-copy cursor over a validated batch. Next allocates
 // only the statement's small parameter descriptor slice; SQL and parameter
-// bytes alias the retained participant record.
+// bytes alias the retained target record.
 type MutationBatch struct {
 	body      []byte
 	remaining uint32

@@ -52,7 +52,7 @@ func (client *directSQLProposalClient) DoReplicated(
 		return nil, err
 	}
 	control, err := distributedtxn.OpenReplicatedCommand(view.TransactionBytes())
-	if err != nil || control.Operation != distributedtxn.ReplicatedApplySingleParticipant {
+	if err != nil || control.Operation != distributedtxn.ReplicatedApplySingleTarget {
 		client.t.Fatalf("direct SQL command operation=%d err=%v", control.Operation, err)
 	}
 	client.proposals++
@@ -62,8 +62,8 @@ func (client *directSQLProposalClient) DoReplicated(
 		client.exact = bytes.Clone(request.Command)
 		client.originalApply = client.applied
 		var result [24]byte
-		result[0] = byte(distributedtxn.ReplicatedRoleParticipant)
-		result[1] = byte(distributedtxn.ReplicatedApplySingleParticipant)
+		result[0] = byte(distributedtxn.ReplicatedRoleTarget)
+		result[1] = byte(distributedtxn.ReplicatedApplySingleTarget)
 		result[2] = 3 // control revision and affected rows are present.
 		binary.LittleEndian.PutUint64(result[8:16], control.ExpectedRevision)
 		binary.LittleEndian.PutUint64(result[16:24], 1)
@@ -83,7 +83,7 @@ func (client *directSQLProposalClient) DoReplicated(
 	}, nil
 }
 
-func TestDurableSQLSingleParticipantFastPathSkipsLedgerAndReplaysExactly(t *testing.T) {
+func TestDurableSQLSingleTargetFastPathSkipsLedgerAndReplaysExactly(t *testing.T) {
 	snapshot, planner := replicatedSQLTransactionFixture(t, true)
 	var replicas [ServingReplicaCount]ReplicatedEndpoint
 	route, ok := snapshot.ResolveReplicatedRoute("data", "all", replicas[:0])
@@ -97,7 +97,7 @@ func TestDurableSQLSingleParticipantFastPathSkipsLedgerAndReplaysExactly(t *test
 	}
 	ledger := new(typedServiceLedger)
 	pins := new(typedServicePinStop)
-	topology := durableFaultTopology(t, durableFaultParticipants(t))
+	topology := durableFaultTopology(t, durableFaultTargets(t))
 	current := topology.Current()
 	current.Generation = snapshot.Generation()
 	if err = topology.Publish(*current); err != nil {
@@ -109,7 +109,7 @@ func TestDurableSQLSingleParticipantFastPathSkipsLedgerAndReplaysExactly(t *test
 	}
 	executor, err := NewDurableSQLRequestExecutor(DurableSQLRequestExecutorOptions{
 		Planner: planner, ReplicatedData: data, Requests: service,
-		RecoveryPulseLimit: 3, PlanningLeaseSpan: 64, SingleParticipantFastPath: true,
+		RecoveryPulseLimit: 3, PlanningLeaseSpan: 64, SingleTargetFastPath: true,
 	})
 	if err != nil {
 		t.Fatal(err)

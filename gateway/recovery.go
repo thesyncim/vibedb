@@ -26,7 +26,7 @@ var (
 type RecoveryResult struct {
 	ID           distributedtxn.ID
 	State        distributedtxn.CoordinatorState
-	Participants int
+	Targets      int
 	RowsAffected int64
 }
 
@@ -36,7 +36,7 @@ type recoveryCoordinator struct {
 }
 
 // RecoverTransaction locates id's coordinator in the pinned catalog and
-// redrives its monotone state machine. A missing participant may force abort
+// redrives its monotone state machine. A missing target may force abort
 // only after the coordinator's bounded replicated pulse lease and before a
 // commit decision.
 func (e *Executor) RecoverTransaction(ctx context.Context, id distributedtxn.ID) (RecoveryResult, error) {
@@ -190,17 +190,17 @@ func (e *Executor) recoverInlineCoordinator(
 	profile Profile,
 ) (RecoveryResult, error) {
 	reply := coordinator.response.Transaction
-	var arena [distributedtxn.MaxInlineParticipants]distributedtxn.ParticipantRef
+	var arena [distributedtxn.MaxInlineTargets]distributedtxn.TransactionTargetRef
 	record, err := distributedtxn.OpenCoordinatorInto(reply.Record, arena[:])
 	if err != nil || record.ID != reply.ID {
 		return RecoveryResult{}, errors.Join(ErrTransactionConflict, err)
 	}
-	participants, err := resolveRecoveryParticipants(snapshot, record.Participants, profile)
+	targets, err := resolveRecoveryTargets(snapshot, record.Targets, profile)
 	if err != nil {
 		return RecoveryResult{}, err
 	}
-	result := RecoveryResult{ID: record.ID, State: reply.CoordinatorState, Participants: len(participants)}
-	participantReplies, missing, err := e.readRecoveryParticipants(ctx, record, participants, profile)
+	result := RecoveryResult{ID: record.ID, State: reply.CoordinatorState, Targets: len(targets)}
+	targetReplies, missing, err := e.readRecoveryTargets(ctx, record, targets, profile)
 	if err != nil {
 		return RecoveryResult{}, err
 	}
@@ -215,33 +215,33 @@ func (e *Executor) recoverInlineCoordinator(
 			if pulseErr != nil || !ready {
 				return result, errors.Join(pulseErr, ErrRecoveryNotReady)
 			}
-			if err := e.abortTransaction(ctx, record.ID, &participants[0], participants, profile); err != nil {
+			if err := e.abortTransaction(ctx, record.ID, &targets[0], targets, profile); err != nil {
 				return result, transactionAbortFailure(record.ID, nil, err)
 			}
 			return e.retireRecoveredCoordinator(ctx, coordinator, record.ID, 2, result, profile)
 		}
-		for i := range participantReplies {
-			state := participantReplies[i].Transaction.ParticipantState
-			if state == distributedtxn.ParticipantAborted {
-				if err := e.abortTransaction(ctx, record.ID, &participants[0], participants, profile); err != nil {
+		for i := range targetReplies {
+			state := targetReplies[i].Transaction.TargetState
+			if state == distributedtxn.TargetAborted {
+				if err := e.abortTransaction(ctx, record.ID, &targets[0], targets, profile); err != nil {
 					return result, transactionAbortFailure(record.ID, nil, err)
 				}
 				return e.retireRecoveredCoordinator(ctx, coordinator, record.ID, 2, result, profile)
 			}
-			if state != distributedtxn.ParticipantStaged && state != distributedtxn.ParticipantPrepared {
+			if state != distributedtxn.TargetStaged && state != distributedtxn.TargetPrepared {
 				return result, ErrTransactionConflict
 			}
 		}
-		if _, err := e.participantPhase(
-			ctx, record.ID, participants, profile, shardservice.TransactionPrepareParticipant, 1,
+		if _, err := e.targetPhase(
+			ctx, record.ID, targets, profile, shardservice.TransactionPrepareTarget, 1,
 		); err != nil {
-			abortErr := e.abortTransaction(ctx, record.ID, &participants[0], participants, profile)
+			abortErr := e.abortTransaction(ctx, record.ID, &targets[0], targets, profile)
 			if abortErr != nil {
 				return result, transactionAbortFailure(record.ID, err, abortErr)
 			}
 			return result, err
 		}
-		if err := e.commitCoordinator(ctx, record.ID, &participants[0], profile); err != nil {
+		if err := e.commitCoordinator(ctx, record.ID, &targets[0], profile); err != nil {
 			if errors.Is(err, ErrCommitOutcomeUnknown) {
 				return result, &TransactionOutcomeUnknownError{ID: record.ID, Cause: err}
 			}
@@ -253,7 +253,7 @@ func (e *Executor) recoverInlineCoordinator(
 			return result, ErrTransactionConflict
 		}
 	case distributedtxn.CoordinatorAborted:
-		if err := e.abortTransaction(ctx, record.ID, &participants[0], participants, profile); err != nil {
+		if err := e.abortTransaction(ctx, record.ID, &targets[0], targets, profile); err != nil {
 			return result, transactionAbortFailure(record.ID, nil, err)
 		}
 		return e.retireRecoveredCoordinator(ctx, coordinator, record.ID, reply.Revision, result, profile)
@@ -263,8 +263,8 @@ func (e *Executor) recoverInlineCoordinator(
 		return result, ErrTransactionConflict
 	}
 
-	responses, err := e.participantPhase(
-		ctx, record.ID, participants, profile, shardservice.TransactionApplyParticipant, 2,
+	responses, err := e.targetPhase(
+		ctx, record.ID, targets, profile, shardservice.TransactionApplyTarget, 2,
 	)
 	if err != nil {
 		return result, &CommittedTransactionError{ID: record.ID, Cause: err}
@@ -275,8 +275,8 @@ func (e *Executor) recoverInlineCoordinator(
 		}
 		result.RowsAffected += responses[i].RowsAffected
 	}
-	if _, err := e.participantPhase(
-		ctx, record.ID, participants, profile, shardservice.TransactionReleaseParticipant, 3,
+	if _, err := e.targetPhase(
+		ctx, record.ID, targets, profile, shardservice.TransactionReleaseTarget, 3,
 	); err != nil {
 		return result, &CommittedTransactionError{ID: record.ID, Cause: err}
 	}
@@ -284,9 +284,9 @@ func (e *Executor) recoverInlineCoordinator(
 }
 
 type manifestRecoveryArena struct {
-	refs          [distributedtxn.MaxManifestPageParticipants]distributedtxn.ParticipantRef
-	identities    [distributedtxn.MaxManifestPageParticipants * distributedtxn.MaxShardIdentityBytes * 2]byte
-	participants  [distributedtxn.MaxManifestPageParticipants]transactionParticipant
+	refs          [distributedtxn.MaxManifestPageTargets]distributedtxn.TransactionTargetRef
+	identities    [distributedtxn.MaxManifestPageTargets * distributedtxn.MaxShardIdentityBytes * 2]byte
+	targets       [distributedtxn.MaxManifestPageTargets]transactionTarget
 	windowResults []manifestRecoveryWindowResult
 }
 
@@ -310,14 +310,13 @@ type manifestRecoverySummary struct {
 }
 
 type manifestRecoveryPageFunc func(
-	refs []distributedtxn.ParticipantRef,
-	participants []transactionParticipant,
+	refs []distributedtxn.TransactionTargetRef, targets []transactionTarget,
 ) error
 
 func newManifestRecoveryArena(profile Profile) *manifestRecoveryArena {
 	width := max(1, profile.MaxConcurrency)
-	if width > distributedtxn.MaxManifestPageParticipants {
-		width = distributedtxn.MaxManifestPageParticipants
+	if width > distributedtxn.MaxManifestPageTargets {
+		width = distributedtxn.MaxManifestPageTargets
 	}
 	return &manifestRecoveryArena{windowResults: make([]manifestRecoveryWindowResult, width)}
 }
@@ -335,7 +334,7 @@ func (e *Executor) recoverManifestCoordinator(
 	}
 	result := RecoveryResult{
 		ID: record.ID, State: reply.CoordinatorState,
-		Participants: manifestParticipantCount(record.Manifest),
+		Targets: manifestTargetCount(record.Manifest),
 	}
 	if reply.CoordinatorState == distributedtxn.CoordinatorRetired {
 		return result, nil
@@ -345,16 +344,16 @@ func (e *Executor) recoverManifestCoordinator(
 	if err != nil {
 		return RecoveryResult{}, err
 	}
-	var coordinatorParticipant transactionParticipant
+	var coordinatorTarget transactionTarget
 	// Prove the complete ordered root before contacting any participant. A
 	// gateway may crash after the descriptor and page zero are durable; that
 	// recoverable staging prefix must not fan out thousands of guaranteed-miss
 	// participant reads or issue a write from an unsealed page stream.
 	err = e.walkRecoveryManifest(
 		ctx, routes, coordinator, record.ID, record.Manifest, profile, arena,
-		func(_ []distributedtxn.ParticipantRef, participants []transactionParticipant) error {
-			if coordinatorParticipant.call.req == nil {
-				coordinatorParticipant = participants[0]
+		func(_ []distributedtxn.TransactionTargetRef, targets []transactionTarget) error {
+			if coordinatorTarget.call.req == nil {
+				coordinatorTarget = targets[0]
 			}
 			return nil
 		},
@@ -389,15 +388,15 @@ func (e *Executor) recoverManifestCoordinator(
 		}
 		return RecoveryResult{}, err
 	}
-	if coordinatorParticipant.call.req == nil {
+	if coordinatorTarget.call.req == nil {
 		return RecoveryResult{}, ErrTransactionConflict
 	}
 	readSummary := manifestRecoverySummary{}
 	err = e.walkRecoveryManifest(
 		ctx, routes, coordinator, record.ID, record.Manifest, profile, arena,
-		func(refs []distributedtxn.ParticipantRef, participants []transactionParticipant) error {
+		func(refs []distributedtxn.TransactionTargetRef, targets []transactionTarget) error {
 			summary, phaseErr := e.readRecoveryManifestWindow(
-				ctx, record.ID, reply.CoordinatorState, refs, participants,
+				ctx, record.ID, reply.CoordinatorState, refs, targets,
 				profile, arena.windowResults,
 			)
 			readSummary.missing += summary.missing
@@ -422,7 +421,7 @@ func (e *Executor) recoverManifestCoordinator(
 				}
 			}
 			if err := e.abortRecoveryManifest(
-				ctx, routes, coordinator, record, profile, arena, &coordinatorParticipant,
+				ctx, routes, coordinator, record, profile, arena, &coordinatorTarget,
 			); err != nil {
 				return result, transactionAbortFailure(record.ID, nil, err)
 			}
@@ -430,17 +429,17 @@ func (e *Executor) recoverManifestCoordinator(
 		}
 		if _, err := e.runRecoveryManifestPhase(
 			ctx, routes, coordinator, record, profile, arena,
-			shardservice.TransactionPrepareParticipant, 1,
+			shardservice.TransactionPrepareTarget, 1,
 		); err != nil {
 			abortErr := e.abortRecoveryManifest(
-				ctx, routes, coordinator, record, profile, arena, &coordinatorParticipant,
+				ctx, routes, coordinator, record, profile, arena, &coordinatorTarget,
 			)
 			if abortErr != nil {
 				return result, transactionAbortFailure(record.ID, err, abortErr)
 			}
 			return result, err
 		}
-		if err := e.commitCoordinator(ctx, record.ID, &coordinatorParticipant, profile); err != nil {
+		if err := e.commitCoordinator(ctx, record.ID, &coordinatorTarget, profile); err != nil {
 			if errors.Is(err, ErrCommitOutcomeUnknown) {
 				return result, &TransactionOutcomeUnknownError{ID: record.ID, Cause: err}
 			}
@@ -453,7 +452,7 @@ func (e *Executor) recoverManifestCoordinator(
 		}
 	case distributedtxn.CoordinatorAborted:
 		if err := e.abortRecoveryManifest(
-			ctx, routes, coordinator, record, profile, arena, &coordinatorParticipant,
+			ctx, routes, coordinator, record, profile, arena, &coordinatorTarget,
 		); err != nil {
 			return result, transactionAbortFailure(record.ID, nil, err)
 		}
@@ -468,7 +467,7 @@ func (e *Executor) recoverManifestCoordinator(
 
 	apply, err := e.runRecoveryManifestPhase(
 		ctx, routes, coordinator, record, profile, arena,
-		shardservice.TransactionApplyParticipant, 2,
+		shardservice.TransactionApplyTarget, 2,
 	)
 	if err != nil {
 		return result, &CommittedTransactionError{ID: record.ID, Cause: err}
@@ -476,7 +475,7 @@ func (e *Executor) recoverManifestCoordinator(
 	result.RowsAffected = apply.rowsAffected
 	if _, err := e.runRecoveryManifestPhase(
 		ctx, routes, coordinator, record, profile, arena,
-		shardservice.TransactionReleaseParticipant, 3,
+		shardservice.TransactionReleaseTarget, 3,
 	); err != nil {
 		return result, &CommittedTransactionError{ID: record.ID, Cause: err}
 	}
@@ -518,11 +517,11 @@ func (e *Executor) advanceRecoveryPulse(
 	return response.Transaction.RecoveryPulse >= limit, nil
 }
 
-func manifestParticipantCount(descriptor distributedtxn.ManifestDescriptor) int {
-	if descriptor.ParticipantCount > uint64(math.MaxInt) {
+func manifestTargetCount(descriptor distributedtxn.ManifestDescriptor) int {
+	if descriptor.TargetCount > uint64(math.MaxInt) {
 		return math.MaxInt
 	}
-	return int(descriptor.ParticipantCount)
+	return int(descriptor.TargetCount)
 }
 
 func buildRecoveryRouteIndex(
@@ -570,12 +569,11 @@ func buildRecoveryRouteIndex(
 	return routes, nil
 }
 
-func resolveRecoveryParticipantsFromIndex(
+func resolveRecoveryTargetsFromIndex(
 	routes recoveryRouteIndex,
-	refs []distributedtxn.ParticipantRef,
-	participants []transactionParticipant,
+	refs []distributedtxn.TransactionTargetRef, targets []transactionTarget,
 ) error {
-	if len(refs) != len(participants) {
+	if len(refs) != len(targets) {
 		return ErrTransactionConflict
 	}
 	for index := range refs {
@@ -590,7 +588,7 @@ func resolveRecoveryParticipantsFromIndex(
 			uint64(call.req.OwnershipEpoch) != ref.OwnershipEpoch {
 			return ErrTransactionConflict
 		}
-		participants[index].call = call
+		targets[index].call = call
 	}
 	return nil
 }
@@ -632,15 +630,15 @@ func (e *Executor) walkRecoveryManifest(
 		if err != nil || page.Segment.Index != index {
 			return errors.Join(ErrTransactionConflict, err)
 		}
-		participants := arena.participants[:len(page.Participants)]
-		clear(participants)
-		if err := resolveRecoveryParticipantsFromIndex(
-			routes, page.Participants, participants,
+		targets := arena.targets[:len(page.Targets)]
+		clear(targets)
+		if err := resolveRecoveryTargetsFromIndex(
+			routes, page.Targets, targets,
 		); err != nil {
 			return err
 		}
 		if visit != nil {
-			if err := visit(page.Participants, participants); err != nil {
+			if err := visit(page.Targets, targets); err != nil {
 				return err
 			}
 		}
@@ -655,20 +653,19 @@ func (e *Executor) readRecoveryManifestWindow(
 	ctx context.Context,
 	id distributedtxn.ID,
 	coordinatorState distributedtxn.CoordinatorState,
-	refs []distributedtxn.ParticipantRef,
-	participants []transactionParticipant,
+	refs []distributedtxn.TransactionTargetRef, targets []transactionTarget,
 	profile Profile,
 	window []manifestRecoveryWindowResult,
 ) (manifestRecoverySummary, error) {
 	var summary manifestRecoverySummary
 	err := e.forEachRecoveryManifestWindow(
-		ctx, participants, window,
-		func(participant *transactionParticipant) (*shardservice.ShardResponse, error) {
+		ctx, targets, window,
+		func(target *transactionTarget) (*shardservice.ShardResponse, error) {
 			request := transactionRequest(
-				participant.call.req, profile, shardservice.TransactionReadParticipant,
+				target.call.req, profile, shardservice.TransactionReadTarget,
 				id, 0, nil,
 			)
-			return e.transactionRoundTrip(ctx, participant.call.address, request, profile)
+			return e.transactionRoundTrip(ctx, target.call.address, request, profile)
 		},
 		func(index int, response *shardservice.ShardResponse, err error) error {
 			if errors.Is(err, ErrTransactionNotFound) {
@@ -678,20 +675,20 @@ func (e *Executor) readRecoveryManifestWindow(
 			if err != nil {
 				return err
 			}
-			if response == nil || response.Transaction.Role != shardservice.TransactionRoleParticipant ||
+			if response == nil || response.Transaction.Role != shardservice.TransactionRoleTarget ||
 				response.Transaction.ID != id {
 				return ErrTransactionConflict
 			}
-			if response.Transaction.ParticipantState == distributedtxn.ParticipantAborted &&
+			if response.Transaction.TargetState == distributedtxn.TargetAborted &&
 				len(response.Transaction.Record) == 0 {
 				summary.aborted = true
 				return nil
 			}
-			if response.Transaction.RecordKind != shardservice.TransactionRecordParticipant {
+			if response.Transaction.RecordKind != shardservice.TransactionRecordTarget {
 				return ErrTransactionConflict
 			}
 			slot := index % len(window)
-			record, openErr := distributedtxn.OpenParticipantInto(
+			record, openErr := distributedtxn.OpenTargetInto(
 				response.Transaction.Record, window[slot].scopes[:],
 			)
 			ref := &refs[index]
@@ -702,13 +699,13 @@ func (e *Executor) readRecoveryManifestWindow(
 				record.OwnershipEpoch != ref.OwnershipEpoch {
 				return errors.Join(ErrTransactionConflict, openErr)
 			}
-			if response.Transaction.ParticipantState == distributedtxn.ParticipantAborted {
+			if response.Transaction.TargetState == distributedtxn.TargetAborted {
 				summary.aborted = true
 				return nil
 			}
 			if coordinatorState == distributedtxn.CoordinatorStaging &&
-				response.Transaction.ParticipantState != distributedtxn.ParticipantStaged &&
-				response.Transaction.ParticipantState != distributedtxn.ParticipantPrepared {
+				response.Transaction.TargetState != distributedtxn.TargetStaged &&
+				response.Transaction.TargetState != distributedtxn.TargetPrepared {
 				return ErrTransactionConflict
 			}
 			return nil
@@ -730,9 +727,9 @@ func (e *Executor) runRecoveryManifestPhase(
 	var summary manifestRecoverySummary
 	err := e.walkRecoveryManifest(
 		ctx, routes, coordinator, record.ID, record.Manifest, profile, arena,
-		func(_ []distributedtxn.ParticipantRef, participants []transactionParticipant) error {
+		func(_ []distributedtxn.TransactionTargetRef, targets []transactionTarget) error {
 			page, err := e.runRecoveryManifestWindow(
-				ctx, record.ID, participants, profile, arena.windowResults, operation, revision,
+				ctx, record.ID, targets, profile, arena.windowResults, operation, revision,
 			)
 			if page.rowsAffected < 0 || page.rowsAffected > math.MaxInt64-summary.rowsAffected {
 				return ErrTransactionConflict
@@ -747,7 +744,7 @@ func (e *Executor) runRecoveryManifestPhase(
 func (e *Executor) runRecoveryManifestWindow(
 	ctx context.Context,
 	id distributedtxn.ID,
-	participants []transactionParticipant,
+	targets []transactionTarget,
 	profile Profile,
 	window []manifestRecoveryWindowResult,
 	operation shardservice.TransactionOperation,
@@ -755,12 +752,12 @@ func (e *Executor) runRecoveryManifestWindow(
 ) (manifestRecoverySummary, error) {
 	var summary manifestRecoverySummary
 	err := e.forEachRecoveryManifestWindow(
-		ctx, participants, window,
-		func(participant *transactionParticipant) (*shardservice.ShardResponse, error) {
+		ctx, targets, window,
+		func(target *transactionTarget) (*shardservice.ShardResponse, error) {
 			request := transactionRequest(
-				participant.call.req, profile, operation, id, revision, nil,
+				target.call.req, profile, operation, id, revision, nil,
 			)
-			return e.transactionRoundTrip(ctx, participant.call.address, request, profile)
+			return e.transactionRoundTrip(ctx, target.call.address, request, profile)
 		},
 		func(_ int, response *shardservice.ShardResponse, err error) error {
 			if err != nil {
@@ -769,7 +766,7 @@ func (e *Executor) runRecoveryManifestWindow(
 			if response == nil {
 				return ErrTransactionConflict
 			}
-			if operation == shardservice.TransactionApplyParticipant {
+			if operation == shardservice.TransactionApplyTarget {
 				if response.RowsAffected < 0 ||
 					response.RowsAffected > math.MaxInt64-summary.rowsAffected {
 					return ErrTransactionConflict
@@ -784,22 +781,22 @@ func (e *Executor) runRecoveryManifestWindow(
 
 func (e *Executor) forEachRecoveryManifestWindow(
 	ctx context.Context,
-	participants []transactionParticipant,
+	targets []transactionTarget,
 	window []manifestRecoveryWindowResult,
-	dispatch func(*transactionParticipant) (*shardservice.ShardResponse, error),
+	dispatch func(*transactionTarget) (*shardservice.ShardResponse, error),
 	consume func(int, *shardservice.ShardResponse, error) error,
 ) error {
 	if len(window) == 0 {
 		return ErrTransactionConflict
 	}
-	for base := 0; base < len(participants); base += len(window) {
-		count := min(len(window), len(participants)-base)
+	for base := 0; base < len(targets); base += len(window) {
+		count := min(len(window), len(targets)-base)
 		results := window[:count]
 		clear(results)
 		var wait sync.WaitGroup
 		for slot := range results {
 			wait.Go(func() {
-				results[slot].response, results[slot].err = dispatch(&participants[base+slot])
+				results[slot].response, results[slot].err = dispatch(&targets[base+slot])
 			})
 		}
 		wait.Wait()
@@ -822,23 +819,23 @@ func (e *Executor) abortRecoveryManifest(
 	record distributedtxn.ManifestCoordinatorRecord,
 	profile Profile,
 	arena *manifestRecoveryArena,
-	coordinatorParticipant *transactionParticipant,
+	coordinatorTarget *transactionTarget,
 ) error {
 	// The coordinator decision is the sole commit/abort authority. Never mutate
 	// a participant until abort has durably won or an idempotent lookup proves it
 	// already won; a concurrent committed winner must retain all participant
 	// state for committed recovery.
-	if err := e.abortCoordinator(ctx, record.ID, coordinatorParticipant, profile); err != nil {
+	if err := e.abortCoordinator(ctx, record.ID, coordinatorTarget, profile); err != nil {
 		return err
 	}
 	var firstErr error
 	walkErr := e.walkRecoveryManifest(
 		ctx, routes, coordinator, record.ID, record.Manifest, profile, arena,
-		func(_ []distributedtxn.ParticipantRef, participants []transactionParticipant) error {
+		func(_ []distributedtxn.TransactionTargetRef, targets []transactionTarget) error {
 			err := e.forEachRecoveryManifestWindow(
-				ctx, participants, arena.windowResults,
-				func(participant *transactionParticipant) (*shardservice.ShardResponse, error) {
-					return nil, e.abortRecoveryManifestParticipant(ctx, record.ID, participant, profile)
+				ctx, targets, arena.windowResults,
+				func(target *transactionTarget) (*shardservice.ShardResponse, error) {
+					return nil, e.abortRecoveryManifestTarget(ctx, record.ID, target, profile)
 				},
 				func(_ int, _ *shardservice.ShardResponse, err error) error {
 					if err != nil && firstErr == nil {
@@ -865,53 +862,52 @@ func (e *Executor) abortIncompleteRecoveryManifest(
 	id distributedtxn.ID,
 	profile Profile,
 ) error {
-	participant := transactionParticipant{call: coordinator.call}
-	return e.abortCoordinator(ctx, id, &participant, profile)
+	target := transactionTarget{call: coordinator.call}
+	return e.abortCoordinator(ctx, id, &target, profile)
 }
 
-func (e *Executor) abortRecoveryManifestParticipant(
+func (e *Executor) abortRecoveryManifestTarget(
 	ctx context.Context,
 	id distributedtxn.ID,
-	participant *transactionParticipant,
+	target *transactionTarget,
 	profile Profile,
 ) error {
 	lookup := transactionRequest(
-		participant.call.req, profile,
-		shardservice.TransactionLookupParticipant, id, 0, nil,
+		target.call.req, profile,
+		shardservice.TransactionLookupTarget, id, 0, nil,
 	)
-	response, err := e.transactionRoundTrip(ctx, participant.call.address, lookup, profile)
+	response, err := e.transactionRoundTrip(ctx, target.call.address, lookup, profile)
 	if errors.Is(err, ErrTransactionNotFound) {
 		abort := transactionRequest(
-			participant.call.req, profile,
-			shardservice.TransactionAbortParticipant, id, 1, nil,
+			target.call.req, profile,
+			shardservice.TransactionAbortTarget, id, 1, nil,
 		)
-		_, err = e.transactionRoundTrip(ctx, participant.call.address, abort, profile)
+		_, err = e.transactionRoundTrip(ctx, target.call.address, abort, profile)
 		return err
 	}
 	if err != nil {
 		return err
 	}
-	state := response.Transaction.ParticipantState
-	if state == distributedtxn.ParticipantAborted || state == distributedtxn.ParticipantReleased {
+	state := response.Transaction.TargetState
+	if state == distributedtxn.TargetAborted || state == distributedtxn.TargetReleased {
 		return nil
 	}
-	if state != distributedtxn.ParticipantStaged && state != distributedtxn.ParticipantPrepared {
+	if state != distributedtxn.TargetStaged && state != distributedtxn.TargetPrepared {
 		return ErrTransactionConflict
 	}
 	abort := transactionRequest(
-		participant.call.req, profile,
-		shardservice.TransactionAbortParticipant, id, response.Transaction.Revision, nil,
+		target.call.req, profile,
+		shardservice.TransactionAbortTarget, id, response.Transaction.Revision, nil,
 	)
-	_, err = e.transactionRoundTrip(ctx, participant.call.address, abort, profile)
+	_, err = e.transactionRoundTrip(ctx, target.call.address, abort, profile)
 	return err
 }
 
-func resolveRecoveryParticipants(
+func resolveRecoveryTargets(
 	snapshot *Snapshot,
-	refs []distributedtxn.ParticipantRef,
-	profile Profile,
-) ([]transactionParticipant, error) {
-	participants := make([]transactionParticipant, len(refs))
+	refs []distributedtxn.TransactionTargetRef, profile Profile,
+) ([]transactionTarget, error) {
+	targets := make([]transactionTarget, len(refs))
 	for i := range refs {
 		ref := &refs[i]
 		var matched *distribution.Manifest
@@ -946,7 +942,7 @@ func resolveRecoveryParticipants(
 				Deadline: profile.PerShardDeadline, MaxRows: profile.PerShardRows,
 				MaxResultBytes: profile.PerShardBytes,
 			}
-			participants[i].call = shardCall{address: address, req: request}
+			targets[i].call = shardCall{address: address, req: request}
 			found = true
 			break
 		}
@@ -954,23 +950,23 @@ func resolveRecoveryParticipants(
 			return nil, ErrTransactionConflict
 		}
 	}
-	return participants, nil
+	return targets, nil
 }
 
-func (e *Executor) readRecoveryParticipants(
+func (e *Executor) readRecoveryTargets(
 	ctx context.Context,
 	coordinator distributedtxn.CoordinatorRecord,
-	participants []transactionParticipant,
+	targets []transactionTarget,
 	profile Profile,
 ) ([]*shardservice.ShardResponse, int, error) {
-	responses := make([]*shardservice.ShardResponse, len(participants))
+	responses := make([]*shardservice.ShardResponse, len(targets))
 	missing := 0
-	for i := range participants {
+	for i := range targets {
 		request := transactionRequest(
-			participants[i].call.req, profile, shardservice.TransactionReadParticipant,
+			targets[i].call.req, profile, shardservice.TransactionReadTarget,
 			coordinator.ID, 0, nil,
 		)
-		response, err := e.transactionRoundTrip(ctx, participants[i].call.address, request, profile)
+		response, err := e.transactionRoundTrip(ctx, targets[i].call.address, request, profile)
 		if errors.Is(err, ErrTransactionNotFound) {
 			missing++
 			continue
@@ -978,17 +974,17 @@ func (e *Executor) readRecoveryParticipants(
 		if err != nil {
 			return nil, 0, err
 		}
-		if response.Transaction.ParticipantState == distributedtxn.ParticipantAborted &&
+		if response.Transaction.TargetState == distributedtxn.TargetAborted &&
 			len(response.Transaction.Record) == 0 {
 			responses[i] = response
 			continue
 		}
-		record, err := distributedtxn.OpenParticipant(response.Transaction.Record)
+		record, err := distributedtxn.OpenTarget(response.Transaction.Record)
 		if err != nil || record.ID != coordinator.ID ||
-			record.MutationDigest != coordinator.Participants[i].MutationDigest ||
-			record.RoutingVersion != coordinator.Participants[i].RoutingVersion ||
-			record.AllocationGeneration != coordinator.Participants[i].AllocationGeneration ||
-			record.OwnershipEpoch != coordinator.Participants[i].OwnershipEpoch {
+			record.MutationDigest != coordinator.Targets[i].MutationDigest ||
+			record.RoutingVersion != coordinator.Targets[i].RoutingVersion ||
+			record.AllocationGeneration != coordinator.Targets[i].AllocationGeneration ||
+			record.OwnershipEpoch != coordinator.Targets[i].OwnershipEpoch {
 			return nil, 0, errors.Join(ErrTransactionConflict, err)
 		}
 		responses[i] = response
