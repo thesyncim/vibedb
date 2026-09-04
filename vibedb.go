@@ -15,7 +15,6 @@ import (
 	"sync/atomic"
 
 	"github.com/thesyncim/vibedb/internal/collectionname"
-	"github.com/thesyncim/vibedb/internal/txnclock"
 	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibedb/store/durable"
 	"github.com/thesyncim/vibejson"
@@ -263,20 +262,29 @@ type Database struct {
 	// before capturing its cut, then retains independently bounded histories per
 	// collection. This preserves lazy-collection correctness without allowing
 	// unrelated key churn to overflow another collection's exact history.
-	// clockMu guards the serializable conflict clock. Validation
-	// (validateDependencies) only reads histories and takes it shared, so
-	// conflict checks on disjoint collections run in parallel; Begin/Finish
-	// publication takes it exclusively.
-	clockMu            sync.RWMutex
-	txnRevision        uint64
-	txnRevisionStopped bool
-	txnActive          map[uint64]txnActiveRevision
-	txnActiveOldest    uint64
-	txnActiveNewest    uint64
-	txnActiveLinked    bool
+	//
+	// The clock is sharded so disjoint collections share nothing but atomic
+	// counters: txnRevision is one global atomic sequencer (one fetch-add per
+	// published commit, so a multi-collection publication still carries a
+	// single revision); the live-transaction directory is striped across
+	// txnActive shards (one shard lock per Begin/Finish instead of one global
+	// lock); conflict histories live in txnHistories (lock-free lookup, with
+	// per-collection observation already serialized by that collection's
+	// txnFence on both the validation and publication sides). Validation
+	// therefore takes no clock locks at all. clockMu remains for the rare
+	// paths only: history-capacity overflow, revision exhaustion, and the
+	// saturation latch.
+	clockMu            sync.Mutex
+	txnRevision        atomic.Uint64
+	txnRevisionStopped atomic.Bool
+	txnActive          [txnActiveShardCount]txnActiveShard
 	txnActiveCount     atomic.Uint64
-	txnHistoryFloor    uint64
-	txnHistories       map[string]*txnclock.ExternalHistory
+	txnClockSaturated  atomic.Bool
+	txnArmTick         atomic.Uint64
+	txnOldestHint      atomic.Uint64
+	txnHistoryFloor    atomic.Uint64
+	txnHistories       sync.Map // string → *txnclock.ExternalHistory
+	txnHistoriesCount  atomic.Int64
 
 	// Deterministic in-package concurrency seams. Production leaves both nil.
 	testAfterTxValidation     func()

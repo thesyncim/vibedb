@@ -11,6 +11,28 @@ import (
 	"github.com/thesyncim/vibedb/internal/txnclock"
 )
 
+// txnHistoryForTest loads one collection's conflict history. It mirrors the
+// lock-free lookup validation performs: a missing entry means no conflicting
+// publication, never an error.
+func txnHistoryForTest(db *Database, name string) *txnclock.ExternalHistory {
+	if v, ok := db.txnHistories.Load(name); ok {
+		return v.(*txnclock.ExternalHistory)
+	}
+	return nil
+}
+
+// txnHistoriesLenForTest counts live conflict histories across the map.
+// Production never needs a global total; tests use it to assert relation-cap
+// cleanup without depending on map internals.
+func txnHistoriesLenForTest(db *Database) int {
+	n := 0
+	db.txnHistories.Range(func(_, _ any) bool {
+		n++
+		return true
+	})
+	return n
+}
+
 func TestNativeSerializableWriteSkew(t *testing.T) {
 	db := openSerializableMemoryDB(t)
 	defer db.Close()
@@ -404,7 +426,7 @@ func TestNativeSerializableUnrelatedHistoryOverflowDoesNotConflict(t *testing.T)
 			t.Fatal(err)
 		}
 	}
-	if history := db.txnHistories["b"]; history == nil || history.Floor == 0 {
+	if history := txnHistoryForTest(db, "b"); history == nil || history.Floor == 0 {
 		t.Fatal("unrelated collection did not independently overflow")
 	}
 	if err := tx.Commit(); err != nil {
@@ -451,15 +473,15 @@ func TestNativeSerializableHistoryRelationCapAndCleanup(t *testing.T) {
 	for i := 0; i <= maxSerializableHistoryCollections; i++ {
 		db.recordClockKey(fmt.Sprintf("relation_%04d", i), "k")
 	}
-	if db.txnHistoryFloor == 0 || len(db.txnHistories) != 0 {
-		t.Fatalf("relation overflow floor=%d histories=%d", db.txnHistoryFloor, len(db.txnHistories))
+	if db.txnHistoryFloor.Load() == 0 || txnHistoriesLenForTest(db) != 0 {
+		t.Fatalf("relation overflow floor=%d histories=%d", db.txnHistoryFloor.Load(), txnHistoriesLenForTest(db))
 	}
 	if err := tx.Commit(); !errors.Is(err, ErrTxConflict) {
 		t.Fatalf("relation-overflow commit = %v, want conflict", err)
 	}
-	if db.txnActiveCount.Load() != 0 || db.txnHistoryFloor != 0 || db.txnHistories != nil {
+	if db.txnActiveCount.Load() != 0 || db.txnHistoryFloor.Load() != 0 || txnHistoriesLenForTest(db) != 0 {
 		t.Fatalf("last finish retained active=%d floor=%d histories=%d",
-			db.txnActiveCount.Load(), db.txnHistoryFloor, len(db.txnHistories))
+			db.txnActiveCount.Load(), db.txnHistoryFloor.Load(), txnHistoriesLenForTest(db))
 	}
 }
 
@@ -478,8 +500,8 @@ func TestNativeSerializableMultiCollectionPublicationUsesOneRevision(t *testing.
 		t.Fatal(err)
 	}
 	db.clockMu.Lock()
-	a := db.txnHistories["a"]
-	b := db.txnHistories["b"]
+	a := txnHistoryForTest(db, "a")
+	b := txnHistoryForTest(db, "b")
 	if a == nil || b == nil || a.LastWrite == 0 || a.LastWrite != b.LastWrite {
 		db.clockMu.Unlock()
 		t.Fatalf("publication revisions a=%v b=%v", a, b)
@@ -515,37 +537,33 @@ func TestNativeSerializableFinishScrubsEscapedState(t *testing.T) {
 func TestNativeSerializableCoordinatorHolderSaturationIsPermanent(t *testing.T) {
 	db := openSerializableMemoryDB(t)
 	defer db.Close()
+	// Force saturation the way striped registration observes it: the latch
+	// set with the count at maximum. A saturated coordinator arms without
+	// registering, so the directory must neither grow nor drain.
 	db.clockMu.Lock()
-	db.txnActive = map[uint64]txnActiveRevision{
-		0: {count: maxTxnActiveCount - 1},
-	}
-	db.txnActiveOldest = 0
-	db.txnActiveNewest = 0
-	db.txnActiveLinked = true
-	db.txnActiveCount.Store(maxTxnActiveCount - 1)
+	db.txnClockSaturated.Store(true)
+	db.txnActiveCount.Store(maxTxnActiveCount)
 	db.clockMu.Unlock()
 
 	tx, err := db.Begin()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if db.txnActive[0].count != maxTxnActiveCount ||
+	if !db.txnClockSaturated.Load() ||
 		db.txnActiveCount.Load() != maxTxnActiveCount {
-		t.Fatalf("begin did not saturate bucket=%d active=%d",
-			db.txnActive[0].count, db.txnActiveCount.Load())
+		t.Fatalf("begin did not saturate saturated=%v active=%d",
+			db.txnClockSaturated.Load(), db.txnActiveCount.Load())
 	}
 	if err := tx.Rollback(); err != nil {
 		t.Fatal(err)
 	}
-	if db.txnActive[0].count != maxTxnActiveCount ||
+	if !db.txnClockSaturated.Load() ||
 		db.txnActiveCount.Load() != maxTxnActiveCount {
-		t.Fatalf("finish decremented saturated bucket=%d active=%d",
-			db.txnActive[0].count, db.txnActiveCount.Load())
+		t.Fatalf("finish decremented saturated saturated=%v active=%d",
+			db.txnClockSaturated.Load(), db.txnActiveCount.Load())
 	}
 	for i := 0; i < 1024; i++ {
-		db.clockMu.Lock()
-		db.txnRevision++
-		db.clockMu.Unlock()
+		db.txnRevision.Add(1)
 		transient, err := db.Begin()
 		if err != nil {
 			t.Fatal(err)
@@ -554,14 +572,13 @@ func TestNativeSerializableCoordinatorHolderSaturationIsPermanent(t *testing.T) 
 			t.Fatal(err)
 		}
 	}
-	if len(db.txnActive) != 1 || db.txnActiveOldest != 0 || db.txnActiveNewest != 0 {
-		t.Fatalf("saturated directory grew: entries=%d oldest=%d newest=%d",
-			len(db.txnActive), db.txnActiveOldest, db.txnActiveNewest)
+	if entries := db.txnActiveEntriesForTest(); entries != 0 {
+		t.Fatalf("saturated directory grew: entries=%d", entries)
 	}
 	if _, err := db.Collection("c").Put("k", []byte(`{"n":1}`)); err != nil {
 		t.Fatal(err)
 	}
-	if history := db.txnHistories["c"]; history == nil || history.LastWrite == 0 {
+	if history := txnHistoryForTest(db, "c"); history == nil || history.LastWrite == 0 {
 		t.Fatal("saturated coordinator allowed publication history to disarm")
 	}
 }
@@ -574,9 +591,7 @@ func TestNativeSerializableActiveRevisionDirectoryTurnover(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 1; i <= 4096; i++ {
-		db.clockMu.Lock()
-		db.txnRevision = uint64(i)
-		db.clockMu.Unlock()
+		db.txnRevision.Store(uint64(i))
 		transient, err := db.Begin()
 		if err != nil {
 			t.Fatal(err)
@@ -584,10 +599,8 @@ func TestNativeSerializableActiveRevisionDirectoryTurnover(t *testing.T) {
 		if err := transient.Rollback(); err != nil {
 			t.Fatal(err)
 		}
-		db.clockMu.Lock()
-		entries := len(db.txnActive)
-		gotOldest := db.oldestActiveLocked()
-		db.clockMu.Unlock()
+		entries := db.txnActiveEntriesForTest()
+		gotOldest := db.txnOldestScannedForTest()
 		if entries != 1 || gotOldest != oldest.beginRev {
 			t.Fatalf("turnover %d: entries=%d oldest=%d want %d",
 				i, entries, gotOldest, oldest.beginRev)
@@ -596,9 +609,9 @@ func TestNativeSerializableActiveRevisionDirectoryTurnover(t *testing.T) {
 	if err := oldest.Rollback(); err != nil {
 		t.Fatal(err)
 	}
-	if db.txnActiveCount.Load() != 0 || db.txnActive != nil || db.txnActiveLinked {
-		t.Fatalf("quiescence retained count=%d entries=%d linked=%v",
-			db.txnActiveCount.Load(), len(db.txnActive), db.txnActiveLinked)
+	if db.txnActiveCount.Load() != 0 || db.txnActiveEntriesForTest() != 0 {
+		t.Fatalf("quiescence retained count=%d entries=%d",
+			db.txnActiveCount.Load(), db.txnActiveEntriesForTest())
 	}
 }
 
@@ -607,9 +620,7 @@ func TestNativeSerializableActiveRevisionDirectoryUnlinksOutOfOrder(t *testing.T
 	defer db.Close()
 	transactions := make([]*Tx, 256)
 	for i := range transactions {
-		db.clockMu.Lock()
-		db.txnRevision = uint64(i)
-		db.clockMu.Unlock()
+		db.txnRevision.Store(uint64(i))
 		tx, err := db.Begin()
 		if err != nil {
 			t.Fatal(err)
@@ -621,18 +632,18 @@ func TestNativeSerializableActiveRevisionDirectoryUnlinksOutOfOrder(t *testing.T
 			t.Fatal(err)
 		}
 	}
-	if len(db.txnActive) != len(transactions)/2 || db.oldestActiveLocked() != 0 {
+	if db.txnActiveEntriesForTest() != len(transactions)/2 || db.txnOldestScannedForTest() != 0 {
 		t.Fatalf("out-of-order directory entries=%d oldest=%d",
-			len(db.txnActive), db.oldestActiveLocked())
+			db.txnActiveEntriesForTest(), db.txnOldestScannedForTest())
 	}
 	for i := 0; i < len(transactions); i += 2 {
 		if err := transactions[i].Rollback(); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if db.txnActiveCount.Load() != 0 || db.txnActive != nil || db.txnActiveLinked {
-		t.Fatalf("out-of-order cleanup count=%d entries=%d linked=%v",
-			db.txnActiveCount.Load(), len(db.txnActive), db.txnActiveLinked)
+	if db.txnActiveCount.Load() != 0 || db.txnActiveEntriesForTest() != 0 {
+		t.Fatalf("out-of-order cleanup count=%d entries=%d",
+			db.txnActiveCount.Load(), db.txnActiveEntriesForTest())
 	}
 }
 
@@ -643,9 +654,7 @@ func BenchmarkNativeSerializableActiveRevisionTurnover(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		db.clockMu.Lock()
-		db.txnRevision++
-		db.clockMu.Unlock()
+		db.txnRevision.Add(1)
 		transient := &Tx{}
 		db.armClockForBegin(transient)
 		db.finishClock(transient, nil)
@@ -658,7 +667,7 @@ func TestNativeSerializableCoordinatorRevisionExhaustionIsPermanent(t *testing.T
 	db := openSerializableMemoryDB(t)
 	defer db.Close()
 	db.clockMu.Lock()
-	db.txnRevision = maxTxnRevision - 1
+	db.txnRevision.Store(maxTxnRevision - 1)
 	db.clockMu.Unlock()
 
 	beforeMax, err := db.Begin()
@@ -668,9 +677,9 @@ func TestNativeSerializableCoordinatorRevisionExhaustionIsPermanent(t *testing.T
 	if _, err := db.Collection("c").Put("at-max", []byte(`{"n":1}`)); err != nil {
 		t.Fatal(err)
 	}
-	if db.txnRevision != maxTxnRevision || db.txnRevisionStopped {
+	if db.txnRevision.Load() != maxTxnRevision || db.txnRevisionStopped.Load() {
 		t.Fatalf("first maximum publication revision=%d stopped=%v",
-			db.txnRevision, db.txnRevisionStopped)
+			db.txnRevision.Load(), db.txnRevisionStopped.Load())
 	}
 	atMax, err := db.Begin()
 	if err != nil {
@@ -682,7 +691,7 @@ func TestNativeSerializableCoordinatorRevisionExhaustionIsPermanent(t *testing.T
 	if _, err := db.Collection("c").Put("stop", []byte(`{"n":2}`)); err != nil {
 		t.Fatal(err)
 	}
-	if !db.txnRevisionStopped {
+	if !db.txnRevisionStopped.Load() {
 		t.Fatal("publication with an active maximum begin did not stop coordinator")
 	}
 	_ = atMax.Rollback()
@@ -701,7 +710,7 @@ func TestNativeSerializableCoordinatorRevisionExhaustionIsPermanent(t *testing.T
 	if err := after.Commit(); !errors.Is(err, ErrTxConflict) {
 		t.Fatalf("commit after stopped quiescence = %v, want conflict", err)
 	}
-	if !db.txnRevisionStopped {
+	if !db.txnRevisionStopped.Load() {
 		t.Fatal("quiescence reopened stopped coordinator")
 	}
 }
