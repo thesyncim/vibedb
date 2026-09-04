@@ -3,9 +3,8 @@ set -euo pipefail
 
 export GOEXPERIMENT=${GOEXPERIMENT:-simd}
 
-# Keep mmap-heavy durable package binaries serial. The remaining shards use
-# two package workers: measured SQL and process packages otherwise leave half
-# of the runner idle, while core's many packages serialize avoidably.
+# Keep mmap-heavy durable package binaries serial. Process has two packages;
+# SQL and core use all four package workers available on hosted runners.
 shard=${1:?usage: test-shard.sh durable|durable-churn|durable-large-cache|sql|process|core [--list]}
 case "$shard" in
   durable|durable-churn|durable-large-cache|sql|process|core) ;;
@@ -49,7 +48,8 @@ printf 'Test shard %s: %s packages\n' "$shard" "${#selected[@]}"
 pressure_tests='^(TestFilePrimaryChurnQualification|TestFilePrimaryLargerThanCacheQualification)$'
 package_parallelism=1
 case "$shard" in
-  sql|process|core) package_parallelism=2 ;;
+  process) package_parallelism=2 ;;
+  sql|core) package_parallelism=4 ;;
 esac
 test_args=(-json "-p=${package_parallelism}" -timeout=25m)
 case "$shard" in
@@ -57,4 +57,25 @@ case "$shard" in
   durable-churn) test_args+=(-run '^TestFilePrimaryChurnQualification$') ;;
   durable-large-cache) test_args+=(-run '^TestFilePrimaryLargerThanCacheQualification$') ;;
 esac
-exec go test "${test_args[@]}" "${selected[@]}"
+if [[ "$shard" != core ]]; then
+  exec go test "${test_args[@]}" "${selected[@]}"
+fi
+
+# Keep the repository-wide analyzer coverage, but do not put it serially in
+# front of core tests. Both commands report their own failure after the other
+# has completed so neither gate masks the other.
+work=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/vibedb-unit-core.XXXXXX")
+trap 'rm -rf "$work"' EXIT
+go vet ./... >"$work/vet.log" 2>&1 &
+vet_pid=$!
+set +e
+go test "${test_args[@]}" "${selected[@]}"
+test_status=$?
+wait "$vet_pid"
+vet_status=$?
+set -e
+cat "$work/vet.log"
+if (( test_status != 0 )); then
+  exit "$test_status"
+fi
+exit "$vet_status"
