@@ -1,0 +1,17 @@
+benchmark	baseline_median_ns	candidate_median_ns	speedup	candidate_change	baseline_range_ns	candidate_range_ns
+BenchmarkFilePackedOrderedCount/half/ge	2732348	3099	881.69x	-99.89%	2700795-2984018	3075-3632
+BenchmarkFilePackedOrderedCount/half/gt	2733729	3100	881.85x	-99.89%	2704363-3456367	3084-3827
+BenchmarkFilePackedOrderedCount/half/le	2727898	3116	875.45x	-99.89%	2721295-3209697	3084-4162
+BenchmarkFilePackedOrderedCount/half/lt	2720288	3103	876.66x	-99.89%	2713065-2870381	3092-3694
+BenchmarkFilePackedOrderedCount/sparse/ge	2739015	3118	878.45x	-99.89%	2737171-2789932	3069-3759
+BenchmarkFilePackedOrderedCount/sparse/gt	2736733	3109	880.26x	-99.89%	2722493-2803317	3083-3305
+BenchmarkFilePackedOrderedCount/sparse/le	2713644	3096	876.50x	-99.89%	2673880-2985852	3076-3402
+BenchmarkFilePackedOrderedCount/sparse/lt	2701658	3212	841.11x	-99.88%	2689062-3186807	3075-3337
+BenchmarkFilePackedOrderedCountWide/half/ge	2640055	3619	729.50x	-99.86%	2622958-2864957	3470-13566
+BenchmarkFilePackedOrderedCountWide/half/gt	2629877	3491	753.33x	-99.87%	2618917-2884579	3476-13189
+BenchmarkFilePackedOrderedCountWide/half/le	2628277	3618	726.44x	-99.86%	2604584-2872373	3483-7619
+BenchmarkFilePackedOrderedCountWide/half/lt	2641702	3606	732.59x	-99.86%	2617071-2891502	3473-3994
+BenchmarkFilePackedOrderedCountWide/sparse/ge	2651278	3087	858.85x	-99.88%	2638692-2902190	2954-3124
+BenchmarkFilePackedOrderedCountWide/sparse/gt	2655671	3074	863.91x	-99.88%	2631728-2874600	2954-3360
+BenchmarkFilePackedOrderedCountWide/sparse/le	2610025	2963	880.87x	-99.89%	2598306-2849493	2942-5929
+BenchmarkFilePackedOrderedCountWide/sparse/lt	2607346	3075	847.92x	-99.88%	2582417-2872322	2984-3159
