@@ -1,0 +1,8 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/shardservice
+cpu: Apple M4 Max
+BenchmarkDecodeRowDelivery/single_frame-16         	    3254	    174632 ns/op	1266.80 MB/s	  819668 B/op	   12296 allocs/op
+BenchmarkDecodeRowDelivery/row_batch-16            	    5582	    107372 ns/op	2060.40 MB/s	  590289 B/op	       9 allocs/op
+PASS
+ok  	github.com/thesyncim/vibedb/shardservice	1.759s

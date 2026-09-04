@@ -1,0 +1,29 @@
+File: vibedb-shard
+Build ID: dfb1282762fb7e262d7206760f2870641bcb6acc
+Type: cpu
+Time: 2026-09-04 19:59:16 CEST
+Duration: 68.64s, Total samples = 17.78s (25.90%)
+Showing nodes accounting for 3.04s, 17.10% of 17.78s total
+Dropped 1035 nodes (cum <= 0.09s)
+Showing top 20 nodes out of 370
+      flat  flat%   sum%        cum   cum%
+         0     0%     0%      7.32s 41.17%  github.com/thesyncim/vibedb/shardservice.(*ReplicatedServer).ServeAuthenticated.func3
+     0.01s 0.056% 0.056%      7.31s 41.11%  github.com/thesyncim/vibedb/shardservice.(*ReplicatedServer).serveReplicatedConn
+     0.04s  0.22%  0.28%      7.30s 41.06%  github.com/thesyncim/vibedb/shardservice.(*ReplicatedServer).serveReplicatedRequestAuthorized
+         0     0%  0.28%      5.80s 32.62%  github.com/thesyncim/vibedb/shardservice.(*ReplicatedServer).executeReplicatedAuthenticated
+     0.01s 0.056%  0.34%      5.34s 30.03%  github.com/thesyncim/vibedb/shardservice.(*ReplicatedServer).executeReplicatedQuery
+     0.04s  0.22%  0.56%      5.13s 28.85%  github.com/thesyncim/vibedb/shardservice.(*ReplicatedServer).executeReplicatedQueryTier
+         0     0%  0.56%      4.34s 24.41%  github.com/thesyncim/vibedb/shardservice.executeFencedSQLBudget
+         0     0%  0.56%      2.86s 16.09%  github.com/thesyncim/vibedb/sql/driver.(*Prepared).QueryInto (inline)
+     0.01s 0.056%  0.62%      2.86s 16.09%  github.com/thesyncim/vibedb/sql/driver.(*Prepared).queryInto
+     2.85s 16.03% 16.65%      2.85s 16.03%  internal/runtime/syscall/linux.Syscall6
+     0.02s  0.11% 16.76%      2.79s 15.69%  syscall.Syscall
+         0     0% 16.76%      2.78s 15.64%  internal/poll.ignoringEINTRIO (inline)
+     0.02s  0.11% 16.87%      2.75s 15.47%  github.com/thesyncim/vibedb/store/durable.(*Snapshot).rangePrimaryGraphBuffer
+         0     0% 16.87%      2.63s 14.79%  github.com/thesyncim/vibedb/sql/driver.(*stmt).queryRowsCandidates
+     0.04s  0.22% 17.10%      2.46s 13.84%  runtime.systemstack
+         0     0% 17.10%      2.46s 13.84%  syscall.RawSyscall6
+         0     0% 17.10%      2.43s 13.67%  github.com/thesyncim/vibedb/internal/storeio.(*PrimaryGraphCursor).VisitInlineDecoded
+         0     0% 17.10%      2.43s 13.67%  github.com/thesyncim/vibedb/internal/storeio.(*PrimaryGraphCursor).visitAllInline
+         0     0% 17.10%      2.41s 13.55%  github.com/thesyncim/vibedb/query.(*Statement).RunInto
+         0     0% 17.10%      2.40s 13.50%  github.com/thesyncim/vibedb/query.(*Statement).runDirectInto

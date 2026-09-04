@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
-	"slices"
 )
 
 const primaryGraphCatalogDepth = 3
@@ -469,41 +468,6 @@ func (c *PrimaryGraphCursor) NextLeaf() error {
 	return nil
 }
 
-// nextRawBorrowed yields the next compact row through cursor-owned scratch.
-func (c *PrimaryGraphCursor) nextRawBorrowed() (
-	key, raw []byte, overflow, ok bool,
-) {
-	if c.row >= c.leaf.Len() {
-		return nil, nil, false, false
-	}
-	if ref, isOverflow := c.leaf.OverflowRef(c.row); isOverflow {
-		var keyScratch [CommonPrimaryLeafMaxKeyBytes]byte
-		key, ok = c.leaf.AppendKey(keyScratch[:0], c.row)
-		if !ok {
-			return nil, nil, false, false
-		}
-		c.spliceScratch = slices.Grow(c.spliceScratch[:0], PageRefSize)[:PageRefSize]
-		encodePageRef(c.spliceScratch, ref)
-		c.row++
-		return key, c.spliceScratch, true, true
-	}
-	c.spliceScratch, ok = c.leaf.AppendKey(c.spliceScratch[:0], c.row)
-	if !ok {
-		return nil, nil, false, false
-	}
-	keyEnd := len(c.spliceScratch)
-	shape := c.leaf.rowShape(c.row)
-	ordinal := c.sequentialShapeOrdinal(c.row, shape)
-	c.spliceScratch, ok = c.leaf.appendValueOrdinal(
-		c.spliceScratch, c.row, shape, ordinal,
-	)
-	if !ok {
-		return nil, nil, false, false
-	}
-	c.row++
-	return c.spliceScratch[:keyEnd], c.spliceScratch[keyEnd:], false, true
-}
-
 // VisitInline is the scan hot path for inline primary graphs. It keeps the
 // sequential rank decoder inside the leaf loop instead of paying a
 // row-at-a-time cursor call. When an overflow row is encountered the drain stops
@@ -528,23 +492,58 @@ func (c *PrimaryGraphCursor) VisitInlineDecoded(
 	if len(c.upper) == 0 && len(c.prefix) == 0 {
 		return c.visitAllInline(decoder, fn)
 	}
+	// Prefix scans are the half-open range [prefix, successor(prefix)).
+	// Derive the upper fence once per drain; an all-0xff prefix has no upper
+	// fence. Valid stored keys are bounded, so an oversized prefix is empty.
+	upper := c.upper
+	var prefixUpper [CommonPrimaryLeafMaxKeyBytes]byte
+	if len(c.prefix) != 0 {
+		if len(c.prefix) > len(prefixUpper) {
+			c.Close()
+			return nil, PageRef{}, nil
+		}
+		n := copy(prefixUpper[:], c.prefix)
+		for n > 0 && prefixUpper[n-1] == 0xff {
+			n--
+		}
+		if n > 0 {
+			prefixUpper[n-1]++
+			if len(upper) == 0 || bytes.Compare(prefixUpper[:n], upper) < 0 {
+				upper = prefixUpper[:n]
+			}
+		}
+	}
 	for {
-		for {
-			key, raw, overflow, ok := c.nextRawBorrowed()
-			if !ok {
-				break
-			}
-			if len(c.upper) != 0 && bytes.Compare(key, c.upper) >= 0 ||
-				len(c.prefix) != 0 && !bytes.HasPrefix(key, c.prefix) {
-				c.Close()
-				return nil, PageRef{}, nil
-			}
-			if overflow {
-				return key, decodePageRef(raw), nil
-			}
-			if err := fn(key, raw); err != nil {
+		limit := c.leaf.Len()
+		if len(upper) != 0 {
+			var err error
+			limit, err = c.upperRankFromCurrent(upper)
+			if err != nil {
 				return nil, PageRef{}, err
 			}
+		}
+		// Resolve the fence once per leaf and drain through the same sequential
+		// decoder as a full scan. The previous per-row path restarted scalar
+		// decoding for every bounded/prefix result, preventing range partitioning
+		// from using the full scan's throughput.
+		if limit <= c.row && limit < c.leaf.Len() {
+			c.Close()
+			return nil, PageRef{}, nil
+		}
+		// Short spans cannot amortize preparing every scalar stream in a leaf.
+		// Use the bounded random-rank decoder for a restart block's worth of
+		// rows, preserving the same values without the sequential setup cost.
+		spanDecoder := decoder
+		if limit-c.row <= compactStreamRestart {
+			spanDecoder = nil
+		}
+		key, ref, err := c.visitCurrentLeafInlineUntil(spanDecoder, limit, fn)
+		if err != nil || key != nil {
+			return key, ref, err
+		}
+		if limit < c.leaf.Len() {
+			c.Close()
+			return nil, PageRef{}, nil
 		}
 		if err := c.advanceLeaf(); err != nil {
 			c.Close()
@@ -554,6 +553,46 @@ func (c *PrimaryGraphCursor) VisitInlineDecoded(
 			return nil, PageRef{}, nil
 		}
 	}
+}
+
+// upperRankFromCurrent brackets the upper fence from the current row before
+// binary searching. A lookup-sized range should not search the entire leaf;
+// a long range still needs only logarithmically many key decodes.
+func (c *PrimaryGraphCursor) upperRankFromCurrent(upper []byte) (int, error) {
+	rows := c.leaf.Len()
+	if c.row >= rows {
+		return rows, nil
+	}
+	var scratch [CommonPrimaryLeafMaxKeyBytes]byte
+	lo, hi := c.row, rows
+	for step := 1; ; step = min(step*2, rows-c.row) {
+		probe := c.row + step - 1
+		key, ok := c.leaf.AppendKey(scratch[:0], probe)
+		if !ok {
+			return 0, ErrCommonPrimaryLeafCorrupt
+		}
+		if bytes.Compare(key, upper) >= 0 {
+			hi = probe
+			break
+		}
+		lo = probe + 1
+		if lo == rows {
+			return rows, nil
+		}
+	}
+	for lo < hi {
+		mid := lo + (hi-lo)/2
+		key, ok := c.leaf.AppendKey(scratch[:0], mid)
+		if !ok {
+			return 0, ErrCommonPrimaryLeafCorrupt
+		}
+		if bytes.Compare(key, upper) >= 0 {
+			hi = mid
+		} else {
+			lo = mid + 1
+		}
+	}
+	return lo, nil
 }
 
 func (c *PrimaryGraphCursor) visitAllInline(

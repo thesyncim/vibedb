@@ -1,0 +1,25 @@
+=== RUN   TestCompactPackedBenchmarkWidths
+=== RUN   TestCompactPackedBenchmarkWidths/dictionary8
+=== RUN   TestCompactPackedBenchmarkWidths/FOR16
+--- PASS: TestCompactPackedBenchmarkWidths (0.03s)
+    --- PASS: TestCompactPackedBenchmarkWidths/dictionary8 (0.01s)
+    --- PASS: TestCompactPackedBenchmarkWidths/FOR16 (0.01s)
+=== RUN   TestCompactPackedBenchmarkStripeWidths
+--- PASS: TestCompactPackedBenchmarkStripeWidths (0.09s)
+=== RUN   TestCountCompactPackedEqualDispatchAVX2
+    compact_stream_codec_packed_equal_dispatch_amd64_test.go:15: AVX2=true GODEBUG=""
+--- PASS: TestCountCompactPackedEqualDispatchAVX2 (0.00s)
+=== RUN   TestCountCompactPackedEqualAVX2DirectParity
+--- PASS: TestCountCompactPackedEqualAVX2DirectParity (0.06s)
+=== RUN   TestCompactPackedEqualWidth7Through16Parity
+--- PASS: TestCompactPackedEqualWidth7Through16Parity (24.21s)
+=== RUN   TestCompactPackedEqualFirstRowsExerciseEveryLane
+--- PASS: TestCompactPackedEqualFirstRowsExerciseEveryLane (0.00s)
+=== RUN   TestCountCompactPackedEqualDispatch
+--- PASS: TestCountCompactPackedEqualDispatch (0.00s)
+=== RUN   TestCountCompactPackedEqualZeroAlloc
+--- PASS: TestCountCompactPackedEqualZeroAlloc (0.00s)
+=== RUN   TestCountCompactPackedEqualMatchesRandomAccess
+--- PASS: TestCountCompactPackedEqualMatchesRandomAccess (0.04s)
+PASS
+ok  	github.com/thesyncim/vibedb/internal/storeio	25.448s

@@ -94,6 +94,9 @@ default too. For an embedding application or a raw Go command, pass
 through `go.mod`. Go 1.27 SIMD kernels support arm64 and supported amd64 CPUs,
 with runtime CPU fallback on amd64.
 
+See [SIMD in compressed equality counts](docs/simd.md) for the packed-column
+query path and its scalar fallback.
+
 ## What is implemented
 
 - Canonical JSON documents in named, lazily materialized collections.

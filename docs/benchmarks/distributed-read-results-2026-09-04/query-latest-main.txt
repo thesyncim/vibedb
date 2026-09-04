@@ -1,0 +1,1 @@
+ok  	github.com/thesyncim/vibedb/query	0.681s

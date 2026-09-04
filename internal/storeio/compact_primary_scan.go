@@ -13,6 +13,10 @@ const (
 	// pool. A stream that would overflow the pool simply keeps the admitted
 	// random-rank decoder; other streams in the leaf still specialize.
 	compactPrimaryScanDictionaryBounds = 512
+	// Dictionary fragments combine the static bytes preceding a hole with each
+	// dictionary spelling. The common 4K-row shape set needs 6,717 bytes; keep a
+	// bounded power-of-two pool and let unusual leaves fall back per stream.
+	compactPrimaryScanDictionaryFragmentBytes = 8 << 10
 )
 
 type compactPrimaryScanShape struct {
@@ -28,15 +32,16 @@ type compactPrimaryScanStream struct {
 }
 
 type compactStreamSequentialState struct {
-	next        int
-	cursor      int
-	bit         int
-	lengthBit   int
-	value       int64
-	width       int
-	alphabetEnd int
-	prefixEnd   int
-	previousLen int
+	next         int
+	cursor       int
+	bit          int
+	lengthBit    int
+	value        int64
+	width        int
+	alphabetEnd  int
+	prefixEnd    int
+	previousLen  int32
+	alphabetBase uint16 // Base+1 for a contiguous alphabet; zero keeps scalar lookup.
 }
 
 // CompactPrimaryScanDecoder retains bounded sequential scalar state for one
@@ -56,6 +61,7 @@ type CompactPrimaryScanDecoder struct {
 	streamPlan [compactPrimaryScanStreams]compactPrimaryScanStream
 	streams    [compactPrimaryScanStreams]compactStreamSequentialState
 	dictionary [compactPrimaryScanDictionaryBounds]uint16
+	fragments  [compactPrimaryScanDictionaryFragmentBytes]byte
 	key        compactStreamView
 	keyState   compactStreamSequentialState
 	keyPrior   [CommonPrimaryLeafMaxKeyBytes]byte
@@ -84,6 +90,7 @@ func (d *CompactPrimaryScanDecoder) prepare(
 	clear(d.streamPlan[:])
 	streamCount := 0
 	dictionaryCount := 0
+	fragmentCount := 0
 	for shape := 0; shape < v.shapeCount; shape++ {
 		entry, ok := v.shapeEntry(shape)
 		if !ok || entry.template.holes > compactPrimaryScanHoles ||
@@ -107,16 +114,32 @@ func (d *CompactPrimaryScanDecoder) prepare(
 				return
 			}
 			d.streamView[streamCount+hole] = stream
+			prefixStart := uint32(0)
+			if hole != 0 {
+				prefixStart = meta.ends[hole-1]
+			}
+			prefixEnd := meta.ends[hole]
+			prefixBytes := int(prefixEnd - prefixStart)
+			fragmentBytes := prefixBytes*stream.dictCount + len(stream.dictData)
 			if stream.kind == compactStreamDictionary &&
 				stream.dictCount > 0 &&
-				stream.dictCount+1 <= len(d.dictionary)-dictionaryCount {
+				stream.dictCount+1 <= len(d.dictionary)-dictionaryCount &&
+				fragmentBytes <= len(d.fragments)-fragmentCount {
 				plan := &d.streamPlan[streamCount+hole]
 				plan.dictionaryFirst = uint16(dictionaryCount)
 				plan.dictionaryCount = uint16(stream.dictCount)
-				d.dictionary[dictionaryCount] = 0
+				d.dictionary[dictionaryCount] = uint16(fragmentCount)
+				dictionaryStart := 0
 				for id := 0; id < stream.dictCount; id++ {
-					d.dictionary[dictionaryCount+id+1] =
-						binary.LittleEndian.Uint16(stream.dictDir[id*2:])
+					dictionaryEnd := int(binary.LittleEndian.Uint16(stream.dictDir[id*2:]))
+					fragmentCount += copy(
+						d.fragments[fragmentCount:], meta.static[prefixStart:prefixEnd],
+					)
+					fragmentCount += copy(
+						d.fragments[fragmentCount:], stream.dictData[dictionaryStart:dictionaryEnd],
+					)
+					d.dictionary[dictionaryCount+id+1] = uint16(fragmentCount)
+					dictionaryStart = dictionaryEnd
 				}
 				dictionaryCount += stream.dictCount + 1
 			}
@@ -134,8 +157,8 @@ func (d *CompactPrimaryScanDecoder) prepare(
 // appendKey reconstructs the ordered key stream without restarting its front
 // decoder from the beginning of the 64-row block for every row. A bounded
 // private prefix copy keeps the next key independent from callback mutations.
-// Non-front streams and non-sequential callers retain the admitted random-rank
-// decoder.
+// Bounded starts prime the nearest restart once; numeric keys use the scalar
+// sequential decoder. Other representations retain admitted random-rank decoding.
 func (d *CompactPrimaryScanDecoder) appendKey(
 	dst []byte,
 	v *CompactPrimaryStripeView,
@@ -151,9 +174,26 @@ func (d *CompactPrimaryScanDecoder) appendKey(
 		d.prepared = false
 	}
 	d.prepare(v, bucket)
-	out, ok := d.keyState.appendFrontKey(
-		dst, &d.key, row, d.keyPrior[:d.keyState.previousLen],
-	)
+	var out []byte
+	var ok bool
+	if d.key.kind == compactStreamFront {
+		if row >= 0 && row < d.key.count && row != d.keyState.next {
+			d.keyState = compactStreamSequentialState{next: row / compactStreamRestart * compactStreamRestart}
+			for d.keyState.next < row {
+				prior, valid := d.keyState.appendFrontKey(d.keyPrior[:0], &d.key,
+					d.keyState.next, d.keyPrior[:d.keyState.previousLen])
+				if !valid || len(prior) > len(d.keyPrior) {
+					return dst, false
+				}
+			}
+		}
+		out, ok = d.keyState.appendFrontKey(dst, &d.key, row, d.keyPrior[:d.keyState.previousLen])
+	} else {
+		if row != d.keyState.next {
+			d.keyState.seek(&d.key, row)
+		}
+		out, ok = d.keyState.appendValue(dst, &d.key, row)
+	}
 	if !ok || len(out) > len(d.keyPrior) {
 		return dst, false
 	}
@@ -192,28 +232,80 @@ func (d *CompactPrimaryScanDecoder) appendValue(
 	previous := uint32(0)
 	for hole := 0; hole < int(meta.holes); hole++ {
 		end := meta.ends[hole]
-		dst = append(dst, meta.static[previous:end]...)
-		previous = end
 		streamAt := int(meta.first) + hole
 		stream := &d.streamView[streamAt]
-		state := &d.streams[streamAt]
 		var ok bool
 		plan := d.streamPlan[streamAt]
 		if plan.dictionaryCount != 0 {
-			first := int(plan.dictionaryFirst)
-			last := first + int(plan.dictionaryCount) + 1
-			dst, ok = state.appendDictionary(
-				dst, stream, ordinal, d.dictionary[first:last],
-			)
+			dst, ok = d.appendDictionaryFragment(dst, streamAt, ordinal)
 		} else {
+			dst = append(dst, meta.static[previous:end]...)
+			state := &d.streams[streamAt]
+			if ordinal != state.next {
+				state.seek(stream, ordinal)
+			}
 			dst, ok = state.appendValue(dst, stream, ordinal)
 		}
+		previous = end
 		if !ok {
 			return dst[:start], false
 		}
 	}
 	end := meta.ends[meta.holes]
 	return append(dst, meta.static[previous:end]...), true
+}
+
+func (d *CompactPrimaryScanDecoder) appendDictionaryFragment(
+	dst []byte,
+	streamAt int,
+	row int,
+) ([]byte, bool) {
+	v := &d.streamView[streamAt]
+	s := &d.streams[streamAt]
+	if row != s.next {
+		s.seek(v, row)
+	}
+	plan := d.streamPlan[streamAt]
+	first := int(plan.dictionaryFirst)
+	last := first + int(plan.dictionaryCount) + 1
+	bounds := d.dictionary[first:last]
+	if v.kind != compactStreamDictionary || row < 0 || row >= v.count ||
+		row != s.next || len(bounds) != v.dictCount+1 {
+		return dst, false
+	}
+	width := int(v.width)
+	if v.dictCount <= 0 || width > 16 {
+		return dst, false
+	}
+	reservoir := uint64(s.value)
+	available := s.bit
+	cursor := s.cursor
+	for available < width {
+		if cursor >= len(v.data) {
+			return dst, false
+		}
+		reservoir |= uint64(v.data[cursor]) << uint(available)
+		cursor++
+		available += 8
+	}
+	id := 0
+	if width != 0 {
+		id = int(reservoir & (uint64(1)<<uint(width) - 1))
+	}
+	if id < 0 || id >= v.dictCount {
+		return dst, false
+	}
+	start, end := int(bounds[id]), int(bounds[id+1])
+	if end < start || end > len(d.fragments) {
+		return dst, false
+	}
+	reservoir >>= uint(width)
+	available -= width
+	s.value = int64(reservoir)
+	s.bit = available
+	s.cursor = cursor
+	s.next++
+	return append(dst, d.fragments[start:end]...), true
 }
 
 func (s *compactStreamSequentialState) appendDictionary(
@@ -327,7 +419,7 @@ func (s *compactStreamSequentialState) appendFrontKey(
 		dst = append(dst, v.data[s.cursor:s.cursor+suffix]...)
 		s.cursor += suffix
 	}
-	s.previousLen = len(dst) - start
+	s.previousLen = int32(len(dst) - start)
 	s.next++
 	return dst, true
 }
@@ -341,93 +433,7 @@ func (s *compactStreamSequentialState) appendValue(
 		if row < 0 || row >= v.count || row != s.next {
 			return v.appendValue(dst, row)
 		}
-		if row%compactStreamRestart == 0 {
-			block := row / compactStreamRestart
-			s.cursor = int(binary.LittleEndian.Uint32(v.data[block*4:]))
-			base, n, ok := readCompactUvarint(v.data[s.cursor:])
-			if !ok {
-				return dst, false
-			}
-			s.value = int64(base)
-			s.cursor += n
-			if s.cursor >= len(v.data) {
-				return dst, false
-			}
-			s.width = int(v.data[s.cursor])
-			s.cursor++
-			rows := min(compactStreamRestart, v.count-block*compactStreamRestart)
-			lengthBytes := (rows*s.width + 7) / 8
-			if lengthBytes > len(v.data)-s.cursor {
-				return dst, false
-			}
-			s.lengthBit = s.cursor * 8
-			s.bit = (s.cursor + lengthBytes) * 8
-		}
-		if s.next == 0 {
-			s.alphabetEnd = int(binary.LittleEndian.Uint16(v.dictDir))
-			s.prefixEnd = s.alphabetEnd
-			if v.dictCount == 3 {
-				s.prefixEnd = int(binary.LittleEndian.Uint16(v.dictDir[2:]))
-			}
-		}
-		alphabet := v.dictData[:s.alphabetEnd]
-		prefix := v.dictData[s.alphabetEnd:s.prefixEnd]
-		suffix := v.dictData[s.prefixEnd:]
-		length := uint64(s.value) + compactReadBits(v.data, s.lengthBit, s.width)
-		s.lengthBit += s.width
-		if length > CommonPrimaryLeafMaxExtentBytes {
-			return dst, false
-		}
-		endBit := s.bit + int(length)*int(v.width)
-		if endBit > len(v.data)*8 {
-			return dst, false
-		}
-		start := len(dst)
-		dst = append(dst, prefix...)
-		middle := len(dst)
-		middleLen := int(length)
-		// The decoder overwrites every middle byte, so a warm scan can extend
-		// its retained buffer without paying to clear the same bytes first.
-		if middleLen <= cap(dst)-len(dst) {
-			dst = dst[:len(dst)+middleLen]
-		} else {
-			dst = append(dst, make([]byte, middleLen)...)
-		}
-		if v.width == 0 {
-			for char := range middleLen {
-				dst[middle+char] = alphabet[0]
-			}
-			s.next++
-			return append(dst, suffix...), true
-		}
-		width := int(v.width)
-		mask := uint64(1<<v.width) - 1
-		byteAt := s.bit >> 3
-		shift := s.bit & 7
-		var packed uint64
-		available := 0
-		if shift != 0 {
-			packed = uint64(v.data[byteAt]) >> shift
-			available = 8 - shift
-			byteAt++
-		}
-		for char := range middleLen {
-			for available < width {
-				packed |= uint64(v.data[byteAt]) << available
-				available += 8
-				byteAt++
-			}
-			code := int(packed & mask)
-			if code >= len(alphabet) {
-				return dst[:start], false
-			}
-			dst[middle+char] = alphabet[code]
-			packed >>= width
-			available -= width
-		}
-		s.bit = endBit
-		s.next++
-		return append(dst, suffix...), true
+		return s.appendAlphabet(dst, v, row)
 	}
 	prefix := 0
 	switch v.kind {
@@ -572,4 +578,179 @@ func (s *compactStreamSequentialState) appendValue(
 		}
 	}
 	return append(dst, suffixValue...), true
+}
+
+// compactSpreadAlphabet5 expands eight packed five-bit codes into byte lanes.
+// Mask before shifting: the source and destination groups overlap.
+func compactSpreadAlphabet5(packed uint64) uint64 {
+	x := packed&0xfffff | ((packed>>20)&0xfffff)<<32
+	x = x&0x000003ff000003ff | (x&0x000ffc00000ffc00)<<6
+	return x&0x001f001f001f001f | (x&0x03e003e003e003e0)<<3
+}
+
+// appendAlphabet renders an admitted alphabet at the state's current ordinal.
+// Both callers check kind, row bounds, and synchronization before entering.
+// Keeping this renderer independent of random-decode fallback avoids a recursive
+// call graph that would force caller-owned scan state onto the heap.
+func (s *compactStreamSequentialState) appendAlphabet(dst []byte, v *compactStreamView, row int) ([]byte, bool) {
+	if row%compactStreamRestart == 0 {
+		block := row / compactStreamRestart
+		s.cursor = int(binary.LittleEndian.Uint32(v.data[block*4:]))
+		base, n, ok := readCompactUvarint(v.data[s.cursor:])
+		if !ok {
+			return dst, false
+		}
+		s.value = int64(base)
+		s.cursor += n
+		if s.cursor >= len(v.data) {
+			return dst, false
+		}
+		s.width = int(v.data[s.cursor])
+		s.cursor++
+		rows := min(compactStreamRestart, v.count-block*compactStreamRestart)
+		lengthBytes := (rows*s.width + 7) / 8
+		if lengthBytes > len(v.data)-s.cursor {
+			return dst, false
+		}
+		s.lengthBit = s.cursor * 8
+		s.bit = (s.cursor + lengthBytes) * 8
+	}
+	if s.alphabetEnd == 0 {
+		s.alphabetEnd = int(binary.LittleEndian.Uint16(v.dictDir))
+		s.prefixEnd = s.alphabetEnd
+		if v.dictCount == 3 {
+			s.prefixEnd = int(binary.LittleEndian.Uint16(v.dictDir[2:]))
+		}
+		// Admission requires strictly increasing symbols. Equal endpoint span
+		// and cardinality therefore prove every symbol is contiguous.
+		if int(v.dictData[s.alphabetEnd-1])-int(v.dictData[0]) == s.alphabetEnd-1 {
+			s.alphabetBase = uint16(v.dictData[0]) + 1
+		}
+	}
+	alphabet := v.dictData[:s.alphabetEnd]
+	prefix := v.dictData[s.alphabetEnd:s.prefixEnd]
+	suffix := v.dictData[s.prefixEnd:]
+	length := uint64(s.value) + compactReadBits(v.data, s.lengthBit, s.width)
+	s.lengthBit += s.width
+	if length > CommonPrimaryLeafMaxExtentBytes {
+		return dst, false
+	}
+	endBit := s.bit + int(length)*int(v.width)
+	if endBit > len(v.data)*8 {
+		return dst, false
+	}
+	start := len(dst)
+	dst = append(dst, prefix...)
+	middle := len(dst)
+	middleLen := int(length)
+	// The decoder overwrites every middle byte, so a warm scan can extend
+	// its retained buffer without paying to clear the same bytes first.
+	if middleLen <= cap(dst)-len(dst) {
+		dst = dst[:len(dst)+middleLen]
+	} else {
+		dst = append(dst, make([]byte, middleLen)...)
+	}
+	if v.width == 0 {
+		for char := range middleLen {
+			dst[middle+char] = alphabet[0]
+		}
+		s.next++
+		return append(dst, suffix...), true
+	}
+	width := int(v.width)
+	mask := uint64(1<<v.width) - 1
+	char := 0
+	bit := s.bit
+	if middleLen >= 32 && s.alphabetBase != 0 {
+		var ok bool
+		char, ok = compactScanAlphabetSIMD(dst[middle:middle+middleLen], v.data, bit, width, len(alphabet), byte(s.alphabetBase-1))
+		if !ok {
+			return dst[:start], false
+		}
+		bit += char * width
+	}
+	// Eight symbols occupy at most 48 bits. One bounded load replaces
+	// eight byte-reservoir refills; a scalar tail handles the page edge.
+	for char+8 <= middleLen && bit/8+8 <= len(v.data) {
+		packed := binary.LittleEndian.Uint64(v.data[bit/8:]) >> uint(bit&7)
+		if width == 5 && s.alphabetBase != 0 {
+			codes := compactSpreadAlphabet5(packed)
+			if (codes+uint64(128-len(alphabet))*0x0101010101010101)&0x8080808080808080 != 0 {
+				return dst[:start], false
+			}
+			binary.LittleEndian.PutUint64(dst[middle+char:], codes+uint64(s.alphabetBase-1)*0x0101010101010101)
+			char += 8
+			bit += 40
+			continue
+		}
+		a := int(packed & mask)
+		b := int(packed >> uint(width) & mask)
+		c := int(packed >> uint(2*width) & mask)
+		d := int(packed >> uint(3*width) & mask)
+		e := int(packed >> uint(4*width) & mask)
+		f := int(packed >> uint(5*width) & mask)
+		g := int(packed >> uint(6*width) & mask)
+		h := int(packed >> uint(7*width) & mask)
+		if max(a, b, c, d, e, f, g, h) >= len(alphabet) {
+			return dst[:start], false
+		}
+		out := dst[middle+char : middle+char+8]
+		out[0], out[1], out[2], out[3] = alphabet[a], alphabet[b], alphabet[c], alphabet[d]
+		out[4], out[5], out[6], out[7] = alphabet[e], alphabet[f], alphabet[g], alphabet[h]
+		char += 8
+		bit += 8 * width
+	}
+	byteAt := bit >> 3
+	shift := bit & 7
+	if char < middleLen && byteAt+8 <= len(v.data) {
+		packed := binary.LittleEndian.Uint64(v.data[byteAt:]) >> uint(shift)
+		tail := dst[middle+char : middle+middleLen]
+		if width == 5 && s.alphabetBase != 0 {
+			codes := compactSpreadAlphabet5(packed & (uint64(1)<<uint(len(tail)*5) - 1))
+			if (codes+uint64(128-len(alphabet))*0x0101010101010101)&0x8080808080808080 != 0 {
+				return dst[:start], false
+			}
+			var rendered [8]byte
+			binary.LittleEndian.PutUint64(rendered[:], codes+uint64(s.alphabetBase-1)*0x0101010101010101)
+			copy(tail, rendered[:len(tail)])
+			s.bit = endBit
+			s.next++
+			return append(dst, suffix...), true
+		}
+		for i := range tail {
+			code := int(packed & mask)
+			if code >= len(alphabet) {
+				return dst[:start], false
+			}
+			tail[i] = alphabet[code]
+			packed >>= uint(width)
+		}
+		s.bit = endBit
+		s.next++
+		return append(dst, suffix...), true
+	}
+	var packed uint64
+	available := 0
+	if char < middleLen && shift != 0 {
+		packed = uint64(v.data[byteAt]) >> shift
+		available = 8 - shift
+		byteAt++
+	}
+	for ; char < middleLen; char++ {
+		for available < width {
+			packed |= uint64(v.data[byteAt]) << available
+			available += 8
+			byteAt++
+		}
+		code := int(packed & mask)
+		if code >= len(alphabet) {
+			return dst[:start], false
+		}
+		dst[middle+char] = alphabet[code]
+		packed >>= width
+		available -= width
+	}
+	s.bit = endBit
+	s.next++
+	return append(dst, suffix...), true
 }

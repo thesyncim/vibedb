@@ -1,0 +1,8 @@
+revision=3bc2fcc1d34ff270797a64966bb5d7a48123ca17
+go version go1.27.1 linux/amd64
+{
+	"GOAMD64": "v1",
+	"GOARCH": "amd64",
+	"GOEXPERIMENT": "simd"
+}
+GODEBUG=cpu.avx2=off

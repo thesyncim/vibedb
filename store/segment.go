@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"slices"
 	"sync"
 	"unsafe"
 
@@ -271,6 +272,30 @@ func (s *Segment) Doc(i int) vibejson.Index {
 		return s.widenShapeTape(i, r)
 	}
 	return s.DocAt(i)
+}
+
+// Reserve makes room for additional document headers, source bytes, and index
+// entries. It is a capacity hint, not a limit; Append still grows as needed.
+// Small transient query inputs can reserve their known size instead of buying
+// the default bulk-ingest arenas. Existing document views remain valid, and
+// Reset retains the reserved capacity. Negative counts and published or
+// borrowed segments panic, as with Reset.
+func (s *Segment) Reserve(documents, sourceBytes, indexEntries int) {
+	if documents < 0 || sourceBytes < 0 || indexEntries < 0 {
+		panic("vibedb: negative Segment.Reserve capacity")
+	}
+	if s.source != nil || s.mappedDocs != nil || s.arenaMinSrc != 0 || s.arenaMinEntries != 0 || s.dropEmptySpill || s.singleAppend {
+		panic("vibedb: Segment.Reserve on a published or borrowed segment")
+	}
+	s.docs = slices.Grow(s.docs, documents)
+	if sourceBytes > cap(s.srcChunk)-len(s.srcChunk) {
+		s.srcPool.retire(s.srcChunk)
+		s.srcChunk = s.srcPool.take(sourceBytes, cap(s.srcChunk), 1, segmentMaxSrcChunk)
+	}
+	if indexEntries > cap(s.entryChunk)-len(s.entryChunk) {
+		s.entryPool.retire(s.entryChunk)
+		s.entryChunk = s.entryPool.take(indexEntries, cap(s.entryChunk), 1, segmentMaxEntryChunk)
+	}
 }
 
 // Append copies src into the segment, validates and indexes the copy, and returns

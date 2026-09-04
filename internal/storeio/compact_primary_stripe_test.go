@@ -1099,6 +1099,7 @@ func TestCompactPrimaryScanFixedPackedSequentialParityAllWidths(t *testing.T) {
 		for width := range test.maxWidth + 1 {
 			t.Run(fmt.Sprintf("%s/width=%d", test.name, width), func(t *testing.T) {
 				view := compactPrimaryFixedPackedScanView(t, test.kind, width, rows)
+				checkCompactSequentialSeeks(t, view)
 				var state compactStreamSequentialState
 				want := make([]byte, 0, 32)
 				got := make([]byte, 0, 32)
@@ -1393,15 +1394,15 @@ func TestCompactPrimaryScanDecoderDictionaryPlanBounds(t *testing.T) {
 			{"shape metadata", unsafe.Sizeof(compactPrimaryScanShape{}), 96},
 			{"stream view", unsafe.Sizeof(compactStreamView{}), 104},
 			{"stream plan", unsafe.Sizeof(compactPrimaryScanStream{}), 4},
-			{"scan decoder", size, 30_672},
+			{"scan decoder", size, 38_864},
 		} {
 			if pin.got != pin.want {
 				t.Fatalf("64-bit %s bytes=%d, want %d", pin.name, pin.got, pin.want)
 			}
 		}
 	}
-	if size > 31<<10 {
-		t.Fatalf("scan decoder bytes=%d exceed bounded 31 KiB footprint", size)
+	if size > 38<<10 {
+		t.Fatalf("scan decoder bytes=%d exceed bounded 38 KiB footprint", size)
 	}
 	for _, high := range []bool{false, true} {
 		rows := 4096
@@ -1557,6 +1558,17 @@ func TestCompactPrimaryScanDictionaryReservoirAllWidths(t *testing.T) {
 					t.Fatalf("fixture width=%d want=%d", got, width)
 				}
 				var state compactStreamSequentialState
+				fragmentSupported := len(bounds) <= compactPrimaryScanDictionaryBounds &&
+					len(stream.dictData) <= compactPrimaryScanDictionaryFragmentBytes
+				fragmentDecoder := CompactPrimaryScanDecoder{}
+				if fragmentSupported {
+					fragmentDecoder.streamView[0] = stream
+					fragmentDecoder.streamPlan[0] = compactPrimaryScanStream{
+						dictionaryCount: uint16(stream.dictCount),
+					}
+					copy(fragmentDecoder.dictionary[:], bounds)
+					copy(fragmentDecoder.fragments[:], stream.dictData)
+				}
 				var seenOffset [8]bool
 				dirty := make([]byte, 32)
 				for row, id := range ids {
@@ -1571,6 +1583,18 @@ func TestCompactPrimaryScanDictionaryReservoirAllWidths(t *testing.T) {
 						t.Fatalf(
 							"row=%d offset=%d got=%x,%v want=%x,%v id=%d",
 							row, row*width&7, got, ok, want, wantOK, id,
+						)
+					}
+					fragment, fragmentOK := dirty[:0], true
+					if fragmentSupported {
+						fragment, fragmentOK = fragmentDecoder.appendDictionaryFragment(
+							dirty[:0], 0, row,
+						)
+					}
+					if fragmentSupported && (!fragmentOK || !bytes.Equal(fragment, want)) {
+						t.Fatalf(
+							"fragment row=%d offset=%d got=%x,%v want=%x",
+							row, row*width&7, fragment, fragmentOK, want,
 						)
 					}
 				}
@@ -1753,12 +1777,8 @@ func TestCompactPrimaryScanDictionaryReservoirReprepareSameSlot(t *testing.T) {
 	if !decoder.supported || plan.dictionaryCount == 0 {
 		t.Fatal("initial dictionary stream was not planned")
 	}
-	first := int(plan.dictionaryFirst)
-	last := first + int(plan.dictionaryCount) + 1
 	for row := 0; row < 2; row++ {
-		if _, ok := decoder.streams[0].appendDictionary(
-			nil, &decoder.streamView[0], row, decoder.dictionary[first:last],
-		); !ok {
+		if _, ok := decoder.appendDictionaryFragment(nil, 0, row); !ok {
 			t.Fatalf("initial dictionary row=%d", row)
 		}
 	}
@@ -1782,12 +1802,8 @@ func TestCompactPrimaryScanDictionaryReservoirReprepareSameSlot(t *testing.T) {
 		decoder.streams[0] != (compactStreamSequentialState{}) {
 		t.Fatalf("dictionary reprepare plan=%+v state=%+v", plan, decoder.streams[0])
 	}
-	first = int(plan.dictionaryFirst)
-	last = first + int(plan.dictionaryCount) + 1
-	got, ok := decoder.streams[0].appendDictionary(
-		nil, &decoder.streamView[0], 0, decoder.dictionary[first:last],
-	)
-	want, wantOK := decoder.streamView[0].appendValue(nil, 0)
+	got, ok := decoder.appendDictionaryFragment(nil, 0, 0)
+	want, wantOK := decoder.streamView[0].appendValue([]byte(`{"value":`)[:9], 0)
 	if !ok || !wantOK || !bytes.Equal(got, want) {
 		t.Fatalf("dictionary after reprepare=%q,%v want=%q,%v", got, ok, want, wantOK)
 	}
@@ -1889,14 +1905,23 @@ func compactPrimaryCompetitiveScanFixtures(t testing.TB) []compactPrimaryScanFix
 func BenchmarkCompactPrimaryStripeCountryScan(b *testing.B) {
 	fixtures := compactPrimaryCompetitiveScanFixtures(b)
 	needle := []byte(`"PT"`)
+	var resolver UnifiedHoleResolver
+	if err := resolver.SetPath([]byte("/country")); err != nil {
+		b.Fatal(err)
+	}
+	scratch := make([]byte, 0, 32)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
 		matched := 0
 		for i := range fixtures {
-			count, ok := fixtures[i].view.CountDictionaryHoleEqual(fixtures[i].holes, needle)
+			var count int
+			var ok bool
+			count, scratch, ok = fixtures[i].view.CountResolvedSpellingEqual(
+				&resolver, needle, scratch,
+			)
 			if !ok {
-				b.Fatal("compact dictionary scan")
+				b.Fatal("compact country spelling scan")
 			}
 			matched += count
 		}

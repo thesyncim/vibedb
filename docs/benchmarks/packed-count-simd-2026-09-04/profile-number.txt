@@ -1,0 +1,23 @@
+File: vibedb-packed-query.test
+Type: cpu
+Time: 2026-09-04 18:06:19 CEST
+Duration: 2.52s, Total samples = 2.22s (87.93%)
+Active filters:
+   focus=countCompactPacked10EqualNEON
+Showing nodes accounting for 1.11s, 50.00% of 2.22s total
+      flat  flat%   sum%        cum   cum%
+         0     0%     0%      1.11s 50.00%  github.com/thesyncim/vibedb/internal/storeio.(*CompactPrimaryStripeView).CountResolvedNumberEqual
+         0     0%     0%      1.11s 50.00%  github.com/thesyncim/vibedb/internal/storeio.(*PrimaryGraphCursor).FilterCountEq
+         0     0%     0%      1.11s 50.00%  github.com/thesyncim/vibedb/internal/storeio.compactStreamView.countIntegerEqual
+         0     0%     0%      1.11s 50.00%  github.com/thesyncim/vibedb/internal/storeio.compactStreamView.countNumberEqual
+     1.10s 49.55% 49.55%      1.11s 50.00%  github.com/thesyncim/vibedb/internal/storeio.countCompactPacked10EqualNEON
+         0     0% 49.55%      1.11s 50.00%  github.com/thesyncim/vibedb/internal/storeio.countCompactPackedEqual
+         0     0% 49.55%      1.11s 50.00%  github.com/thesyncim/vibedb/query.(*Query).RunInto (inline)
+         0     0% 49.55%      1.11s 50.00%  github.com/thesyncim/vibedb/query.(*Query).runInto
+         0     0% 49.55%      1.11s 50.00%  github.com/thesyncim/vibedb/query.(*plan).runDirectFileTokenScalarCount
+         0     0% 49.55%      1.11s 50.00%  github.com/thesyncim/vibedb/query.(*plan).runFileInto
+         0     0% 49.55%      1.11s 50.00%  github.com/thesyncim/vibedb/query.BenchmarkFilePackedEqualityCount.func1
+         0     0% 49.55%      1.11s 50.00%  github.com/thesyncim/vibedb/store/durable.(*Snapshot).FilterEqCount
+         0     0% 49.55%      1.11s 50.00%  testing.(*B).run1.func1
+         0     0% 49.55%      1.11s 50.00%  testing.(*B).runN
+     0.01s  0.45% 50.00%      0.01s  0.45%  simd/archsimd.Uint16x8.ReduceSum (inline)

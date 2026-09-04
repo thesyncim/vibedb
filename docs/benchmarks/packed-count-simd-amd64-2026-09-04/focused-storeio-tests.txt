@@ -1,0 +1,155 @@
+=== RUN   TestCompactPrimaryStripeRoundTrip
+--- PASS: TestCompactPrimaryStripeRoundTrip (0.01s)
+=== RUN   TestCompactPrimaryStripeScalarSummary
+--- PASS: TestCompactPrimaryStripeScalarSummary (0.00s)
+=== RUN   TestCompactPrimaryStripeSummaryDeclinesUnboundedValues
+=== RUN   TestCompactPrimaryStripeSummaryDeclinesUnboundedValues/missing-is-null
+=== RUN   TestCompactPrimaryStripeSummaryDeclinesUnboundedValues/container
+=== RUN   TestCompactPrimaryStripeSummaryDeclinesUnboundedValues/oversized
+=== RUN   TestCompactPrimaryStripeSummaryDeclinesUnboundedValues/overflow
+--- PASS: TestCompactPrimaryStripeSummaryDeclinesUnboundedValues (0.00s)
+    --- PASS: TestCompactPrimaryStripeSummaryDeclinesUnboundedValues/missing-is-null (0.00s)
+    --- PASS: TestCompactPrimaryStripeSummaryDeclinesUnboundedValues/container (0.00s)
+    --- PASS: TestCompactPrimaryStripeSummaryDeclinesUnboundedValues/oversized (0.00s)
+    --- PASS: TestCompactPrimaryStripeSummaryDeclinesUnboundedValues/overflow (0.00s)
+=== RUN   TestCompactPrimaryStripeOverflowRoundTrip
+--- PASS: TestCompactPrimaryStripeOverflowRoundTrip (0.00s)
+=== RUN   TestCompactPrimaryStripeHighCardinalityRoundTrip
+--- PASS: TestCompactPrimaryStripeHighCardinalityRoundTrip (0.00s)
+=== RUN   TestCompactPrimaryStripeDeterministic
+--- PASS: TestCompactPrimaryStripeDeterministic (0.02s)
+=== RUN   TestCompactPrimaryStripeScalarReplacementMatchesFullPlanner
+--- PASS: TestCompactPrimaryStripeScalarReplacementMatchesFullPlanner (0.00s)
+=== RUN   TestCompactPrimaryStripeScalarCertificateDamageDeclines
+=== RUN   TestCompactPrimaryStripeScalarCertificateDamageDeclines/hole
+=== RUN   TestCompactPrimaryStripeScalarCertificateDamageDeclines/canonical-offset
+=== RUN   TestCompactPrimaryStripeScalarCertificateDamageDeclines/old-length
+=== RUN   TestCompactPrimaryStripeScalarCertificateDamageDeclines/new-length
+--- PASS: TestCompactPrimaryStripeScalarCertificateDamageDeclines (0.00s)
+    --- PASS: TestCompactPrimaryStripeScalarCertificateDamageDeclines/hole (0.00s)
+    --- PASS: TestCompactPrimaryStripeScalarCertificateDamageDeclines/canonical-offset (0.00s)
+    --- PASS: TestCompactPrimaryStripeScalarCertificateDamageDeclines/old-length (0.00s)
+    --- PASS: TestCompactPrimaryStripeScalarCertificateDamageDeclines/new-length (0.00s)
+=== RUN   TestCompactPrimaryStripeMultiShapeReplacementsMatchFullPlanner
+--- PASS: TestCompactPrimaryStripeMultiShapeReplacementsMatchFullPlanner (0.00s)
+=== RUN   TestCompactPrimaryStripeReplacementPatchAllocatesZeroWhenWarm
+--- PASS: TestCompactPrimaryStripeReplacementPatchAllocatesZeroWhenWarm (0.01s)
+=== RUN   TestCompactPrimaryStripeNetZeroMultiShapeDeltaMatchesFullPlanner
+--- PASS: TestCompactPrimaryStripeNetZeroMultiShapeDeltaMatchesFullPlanner (0.00s)
+=== RUN   TestCompactPrimaryStripeMultiColumnReplacementsMatchFullPlanner
+--- PASS: TestCompactPrimaryStripeMultiColumnReplacementsMatchFullPlanner (0.00s)
+=== RUN   TestCompactPrimaryStripeDenseReplacementBatchMatchesFullPlanner
+--- PASS: TestCompactPrimaryStripeDenseReplacementBatchMatchesFullPlanner (0.01s)
+=== RUN   TestCompactPrimaryStripePatchRejectsDuplicateKey
+--- PASS: TestCompactPrimaryStripePatchRejectsDuplicateKey (0.00s)
+=== RUN   TestCompactPrimaryStripePatchClipsLargerBackingBuffer
+--- PASS: TestCompactPrimaryStripePatchClipsLargerBackingBuffer (0.00s)
+=== RUN   TestCompactPrimaryStripeCorruptionRejected
+--- PASS: TestCompactPrimaryStripeCorruptionRejected (0.01s)
+=== RUN   TestCompactPrimaryStripeWarmPointAllocations
+--- PASS: TestCompactPrimaryStripeWarmPointAllocations (0.01s)
+=== RUN   TestCompactPackedBenchmarkWidths
+=== RUN   TestCompactPackedBenchmarkWidths/dictionary8
+=== RUN   TestCompactPackedBenchmarkWidths/FOR16
+--- PASS: TestCompactPackedBenchmarkWidths (0.00s)
+    --- PASS: TestCompactPackedBenchmarkWidths/dictionary8 (0.00s)
+    --- PASS: TestCompactPackedBenchmarkWidths/FOR16 (0.00s)
+=== RUN   TestCompactPackedBenchmarkStripeWidths
+--- PASS: TestCompactPackedBenchmarkStripeWidths (0.01s)
+=== RUN   TestCountCompactPackedEqualDispatchAVX2
+    compact_stream_codec_packed_equal_dispatch_amd64_test.go:15: AVX2=true GODEBUG=""
+--- PASS: TestCountCompactPackedEqualDispatchAVX2 (0.00s)
+=== RUN   TestCountCompactPackedEqualAVX2DirectParity
+--- PASS: TestCountCompactPackedEqualAVX2DirectParity (0.01s)
+=== RUN   TestCompactPackedEqualWidth7Through16Parity
+--- PASS: TestCompactPackedEqualWidth7Through16Parity (4.16s)
+=== RUN   TestCompactPackedEqualFirstRowsExerciseEveryLane
+--- PASS: TestCompactPackedEqualFirstRowsExerciseEveryLane (0.00s)
+=== RUN   TestCountCompactPackedEqualDispatch
+--- PASS: TestCountCompactPackedEqualDispatch (0.00s)
+=== RUN   TestCountCompactPackedEqualZeroAlloc
+--- PASS: TestCountCompactPackedEqualZeroAlloc (0.00s)
+=== RUN   TestCompactStreamCodecRoundTrip
+=== RUN   TestCompactStreamCodecRoundTrip/dictionary
+=== RUN   TestCompactStreamCodecRoundTrip/front
+=== RUN   TestCompactStreamCodecRoundTrip/alphabet
+=== RUN   TestCompactStreamCodecRoundTrip/FOR
+=== RUN   TestCompactStreamCodecRoundTrip/delta
+=== RUN   TestCompactStreamCodecRoundTrip/packed-delta
+=== RUN   TestCompactStreamCodecRoundTrip/date
+=== RUN   TestCompactStreamCodecRoundTrip/prefix-int
+--- PASS: TestCompactStreamCodecRoundTrip (0.00s)
+    --- PASS: TestCompactStreamCodecRoundTrip/dictionary (0.00s)
+    --- PASS: TestCompactStreamCodecRoundTrip/front (0.00s)
+    --- PASS: TestCompactStreamCodecRoundTrip/alphabet (0.00s)
+    --- PASS: TestCompactStreamCodecRoundTrip/FOR (0.00s)
+    --- PASS: TestCompactStreamCodecRoundTrip/delta (0.00s)
+    --- PASS: TestCompactStreamCodecRoundTrip/packed-delta (0.00s)
+    --- PASS: TestCompactStreamCodecRoundTrip/date (0.00s)
+    --- PASS: TestCompactStreamCodecRoundTrip/prefix-int (0.00s)
+=== RUN   TestCompactStreamAdaptiveSelectionAndCount
+--- PASS: TestCompactStreamAdaptiveSelectionAndCount (0.02s)
+=== RUN   TestCountCompactPackedEqualMatchesRandomAccess
+--- PASS: TestCountCompactPackedEqualMatchesRandomAccess (0.01s)
+=== RUN   TestCompactStreamIntegerCountMatchesValues
+--- PASS: TestCompactStreamIntegerCountMatchesValues (0.00s)
+=== RUN   TestCompactStreamNumberCountExactDecimalSemantics
+--- PASS: TestCompactStreamNumberCountExactDecimalSemantics (0.00s)
+=== RUN   TestCompactStreamPackedPrefixIntRoundTrip
+--- PASS: TestCompactStreamPackedPrefixIntRoundTrip (0.00s)
+=== RUN   TestCompactStreamAdaptiveAlphabetSelection
+--- PASS: TestCompactStreamAdaptiveAlphabetSelection (0.00s)
+=== RUN   TestCompactStreamRejectsCorruptFraming
+--- PASS: TestCompactStreamRejectsCorruptFraming (0.00s)
+=== RUN   TestCompactStreamPointDecodeWarmAllocations
+--- PASS: TestCompactStreamPointDecodeWarmAllocations (0.00s)
+=== RUN   TestCompactStreamPlannerEstimateExact
+=== RUN   TestCompactStreamPlannerEstimateExact/unique-sequential-keys
+=== RUN   TestCompactStreamPlannerEstimateExact/low-cardinality
+=== RUN   TestCompactStreamPlannerEstimateExact/single-value
+=== RUN   TestCompactStreamPlannerEstimateExact/two-values
+=== RUN   TestCompactStreamPlannerEstimateExact/empty-strings
+--- PASS: TestCompactStreamPlannerEstimateExact (0.00s)
+    --- PASS: TestCompactStreamPlannerEstimateExact/unique-sequential-keys (0.00s)
+    --- PASS: TestCompactStreamPlannerEstimateExact/low-cardinality (0.00s)
+    --- PASS: TestCompactStreamPlannerEstimateExact/single-value (0.00s)
+    --- PASS: TestCompactStreamPlannerEstimateExact/two-values (0.00s)
+    --- PASS: TestCompactStreamPlannerEstimateExact/empty-strings (0.00s)
+=== RUN   TestCompactStreamPrototypeCompetitiveGate
+    compact_stream_prototype_test.go:792: high=false stripes=25 encoded=1007278 bytes 10.07 B/doc
+    compact_stream_prototype_test.go:793: high=false production physical=905216 bytes 9.05 B/doc
+    compact_stream_prototype_test.go:794: high=false fixed=0.01 keys=1.01 shapes=0.25 templates=0.13 dict=3.87 front=0.00 FOR=1.27 delta=1.01 date=1.51 prefix-int=1.02 B/doc
+    compact_stream_prototype_test.go:803: high=false production streams: keys=0.01 dict=3.94 front=0.00 alphabet=0.02 FOR=1.27 delta=0.00 packed-delta=0.85 date=1.51 prefix-int=0.86 B/doc
+    compact_stream_prototype_test.go:815: high=false hole[0]=0.14 B/doc values=100000
+    compact_stream_prototype_test.go:815: high=false hole[1]=1.26 B/doc values=100000
+    compact_stream_prototype_test.go:815: high=false hole[2]=1.01 B/doc values=100000
+    compact_stream_prototype_test.go:815: high=false hole[3]=1.02 B/doc values=100000
+    compact_stream_prototype_test.go:815: high=false hole[4]=0.46 B/doc values=100000
+    compact_stream_prototype_test.go:815: high=false hole[5]=1.51 B/doc values=100000
+    compact_stream_prototype_test.go:815: high=false hole[6]=0.43 B/doc values=100000
+    compact_stream_prototype_test.go:815: high=false hole[7]=0.28 B/doc values=100000
+    compact_stream_prototype_test.go:815: high=false hole[8]=1.27 B/doc values=100000
+    compact_stream_prototype_test.go:815: high=false hole[9]=0.43 B/doc values=100000
+    compact_stream_prototype_test.go:815: high=false hole[10]=0.43 B/doc values=100000
+    compact_stream_prototype_test.go:815: high=false hole[11]=0.29 B/doc values=66724
+    compact_stream_prototype_test.go:815: high=false hole[12]=0.14 B/doc values=33479
+    compact_stream_prototype_test.go:792: high=true stripes=25 encoded=11368530 bytes 113.69 B/doc
+    compact_stream_prototype_test.go:793: high=true production physical=6701056 bytes 67.01 B/doc
+    compact_stream_prototype_test.go:794: high=true fixed=0.01 keys=1.01 shapes=0.25 templates=0.13 dict=1.40 front=106.08 FOR=1.27 delta=1.01 date=1.51 prefix-int=1.02 B/doc
+    compact_stream_prototype_test.go:803: high=true production streams: keys=0.01 dict=1.45 front=0.00 alphabet=60.23 FOR=1.27 delta=0.00 packed-delta=0.85 date=1.51 prefix-int=0.86 B/doc
+    compact_stream_prototype_test.go:815: high=true hole[0]=0.14 B/doc values=100000
+    compact_stream_prototype_test.go:815: high=true hole[1]=1.26 B/doc values=100000
+    compact_stream_prototype_test.go:815: high=true hole[2]=1.01 B/doc values=100000
+    compact_stream_prototype_test.go:815: high=true hole[3]=1.02 B/doc values=100000
+    compact_stream_prototype_test.go:815: high=true hole[4]=66.52 B/doc values=100000
+    compact_stream_prototype_test.go:815: high=true hole[5]=1.51 B/doc values=100000
+    compact_stream_prototype_test.go:815: high=true hole[6]=11.85 B/doc values=100000
+    compact_stream_prototype_test.go:815: high=true hole[7]=7.29 B/doc values=100000
+    compact_stream_prototype_test.go:815: high=true hole[8]=1.27 B/doc values=100000
+    compact_stream_prototype_test.go:815: high=true hole[9]=6.80 B/doc values=100000
+    compact_stream_prototype_test.go:815: high=true hole[10]=6.80 B/doc values=100000
+    compact_stream_prototype_test.go:815: high=true hole[11]=4.54 B/doc values=66724
+    compact_stream_prototype_test.go:815: high=true hole[12]=2.28 B/doc values=33479
+--- PASS: TestCompactStreamPrototypeCompetitiveGate (2.19s)
+PASS
+ok  	github.com/thesyncim/vibedb/internal/storeio	6.495s

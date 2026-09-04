@@ -1,0 +1,83 @@
+File: vibedb-next-head-query.test
+Type: cpu
+Time: 2026-09-04 18:56:20 CEST
+Duration: 2.57s, Total samples = 2.15s (83.54%)
+Showing nodes accounting for 1.90s, 88.37% of 2.15s total
+Dropped 38 nodes (cum <= 0.01s)
+      flat  flat%   sum%        cum   cum%
+     0.26s 12.09% 12.09%      0.26s 12.09%  runtime.memequal
+     0.24s 11.16% 23.26%      0.50s 23.26%  bytes.Equal (inline)
+     0.18s  8.37% 31.63%      0.19s  8.84%  github.com/thesyncim/vibedb/internal/storeio.(*compactStreamView).dictionaryEntry (inline)
+     0.09s  4.19% 35.81%      0.11s  5.12%  github.com/thesyncim/vibedb/internal/storeio.countCompactPacked8EqualNEON
+     0.09s  4.19% 40.00%      0.12s  5.58%  github.com/thesyncim/vibedb/internal/storeio.openCompactPrimaryStripePayload
+     0.07s  3.26% 43.26%      0.16s  7.44%  github.com/thesyncim/vibedb/internal/storeio.compactStreamView.appendValue
+     0.06s  2.79% 46.05%      0.11s  5.12%  github.com/thesyncim/vibedb/internal/storeio.AdmittedGlobalTabletCatalogAnchor
+     0.05s  2.33% 48.37%      0.17s  7.91%  github.com/thesyncim/vibedb/internal/storeio.AdmittedCachedCompactPrimaryStripe
+     0.04s  1.86% 50.23%      0.15s  6.98%  github.com/thesyncim/vibedb/internal/storeio.(*PrimaryGraphCursor).admittedCatalog
+     0.04s  1.86% 52.09%      0.14s  6.51%  github.com/thesyncim/vibedb/internal/storeio.(*PrimaryGraphCursor).openCatalog
+     0.04s  1.86% 53.95%      0.44s 20.47%  github.com/thesyncim/vibedb/internal/storeio.(*PrimaryGraphCursor).openLeaf
+     0.04s  1.86% 55.81%      0.13s  6.05%  github.com/thesyncim/vibedb/internal/storeio.(*UnifiedHoleResolver).resolveTemplate
+     0.04s  1.86% 57.67%      0.05s  2.33%  github.com/thesyncim/vibedb/internal/storeio.AdmittedGlobalTabletCatalogNode
+     0.04s  1.86% 59.53%      0.84s 39.07%  github.com/thesyncim/vibedb/internal/storeio.compactStreamView.countDictionaryEqual
+     0.04s  1.86% 61.40%      0.04s  1.86%  runtime.madvise
+     0.04s  1.86% 63.26%      0.04s  1.86%  runtime.memmove
+     0.03s  1.40% 64.65%      0.03s  1.40%  github.com/thesyncim/vibedb/internal/storeio.(*PageCache).release
+     0.03s  1.40% 66.05%      0.06s  2.79%  github.com/thesyncim/vibedb/internal/storeio.(*PageCache).tryPinFrameReady
+     0.03s  1.40% 67.44%      0.09s  4.19%  github.com/thesyncim/vibedb/internal/storeio.(*PageCache).tryPinReady
+     0.03s  1.40% 68.84%      0.03s  1.40%  github.com/thesyncim/vibedb/internal/storeio.globalTabletCatalogSegmentedRootView.segmentedView (inline)
+     0.03s  1.40% 70.23%      0.03s  1.40%  github.com/thesyncim/vibejson.(*TapeBuilder).stringFast
+     0.03s  1.40% 71.63%      0.08s  3.72%  github.com/thesyncim/vibejson.buildIndexOptions
+     0.03s  1.40% 73.02%      0.06s  2.79%  internal/strconv.AppendUint
+     0.02s  0.93% 73.95%      0.02s  0.93%  encoding/binary.littleEndian.Uint16 (inline)
+     0.02s  0.93% 74.88%      0.12s  5.58%  github.com/thesyncim/vibedb/internal/storeio.(*PrimaryGraphCursor).nextTablet
+     0.02s  0.93% 75.81%      0.02s  0.93%  github.com/thesyncim/vibedb/internal/storeio.(*PrimaryGraphCursor).releaseTablet
+     0.02s  0.93% 76.74%      0.04s  1.86%  github.com/thesyncim/vibedb/internal/storeio.(*globalTabletCatalogSegmentedRootView).anchorRef
+     0.02s  0.93% 77.67%      0.02s  0.93%  github.com/thesyncim/vibedb/internal/storeio.openCompactStream
+     0.02s  0.93% 78.60%         2s 93.02%  github.com/thesyncim/vibedb/query.(*plan).runDirectFileTokenScalarCount
+     0.02s  0.93% 79.53%      0.02s  0.93%  internal/sync.(*Mutex).Unlock (inline)
+     0.02s  0.93% 80.47%      0.03s  1.40%  runtime.(*timers).check
+     0.02s  0.93% 81.40%      0.02s  0.93%  simd/archsimd.Uint8x16.ReduceSum (inline)
+     0.01s  0.47% 81.86%      0.99s 46.05%  github.com/thesyncim/vibedb/internal/storeio.(*CompactPrimaryStripeView).CountResolvedSpellingEqual
+     0.01s  0.47% 82.33%      0.17s  7.91%  github.com/thesyncim/vibedb/internal/storeio.(*CompactPrimaryStripeView).FirstRankFrom
+     0.01s  0.47% 82.79%      0.12s  5.58%  github.com/thesyncim/vibedb/internal/storeio.(*PageCache).load
+     0.01s  0.47% 83.26%      0.04s  1.86%  github.com/thesyncim/vibedb/internal/storeio.(*PageLease).Release
+     0.01s  0.47% 83.72%      1.32s 61.40%  github.com/thesyncim/vibedb/internal/storeio.(*PrimaryGraphCursor).FilterCountEq
+     0.01s  0.47% 84.19%      0.43s 20.00%  github.com/thesyncim/vibedb/internal/storeio.(*PrimaryGraphCursor).openAnchor
+     0.01s  0.47% 84.65%      0.09s  4.19%  github.com/thesyncim/vibedb/internal/storeio.(*UnifiedHoleResolver).buildIndex
+     0.01s  0.47% 85.12%      0.02s  0.93%  github.com/thesyncim/vibedb/internal/storeio.(*segmentedTabletRouterAnchorView).fenceAtChecked
+     0.01s  0.47% 85.58%      0.04s  1.86%  github.com/thesyncim/vibedb/internal/storeio.(*segmentedTabletRouterAnchorView).upperBound
+     0.01s  0.47% 86.05%      0.02s  0.93%  github.com/thesyncim/vibedb/internal/storeio.AdmittedGlobalTabletCatalogTabletRoot
+     0.01s  0.47% 86.51%      0.65s 30.23%  github.com/thesyncim/vibedb/internal/storeio.InitPrimaryGraphCursor
+     0.01s  0.47% 86.98%      0.85s 39.53%  github.com/thesyncim/vibedb/internal/storeio.compactStreamView.countSpellingEqual
+     0.01s  0.47% 87.44%      2.03s 94.42%  github.com/thesyncim/vibedb/query.(*plan).runFileInto
+     0.01s  0.47% 87.91%      0.05s  2.33%  github.com/thesyncim/vibejson.(*TapeBuilder).WalkFast
+     0.01s  0.47% 88.37%      0.04s  1.86%  runtime.findRunnable
+         0     0% 88.37%      0.04s  1.86%  github.com/thesyncim/vibedb/internal/storeio.(*GlobalTabletCatalogAnchorView).LowerBound
+         0     0% 88.37%      0.02s  0.93%  github.com/thesyncim/vibedb/internal/storeio.(*GlobalTabletCatalogTabletRootView).RouteAnchor
+         0     0% 88.37%      0.12s  5.58%  github.com/thesyncim/vibedb/internal/storeio.(*PageCache).Acquire (inline)
+         0     0% 88.37%      0.32s 14.88%  github.com/thesyncim/vibedb/internal/storeio.(*PrimaryGraphCursor).advanceLeaf
+         0     0% 88.37%      0.50s 23.26%  github.com/thesyncim/vibedb/internal/storeio.(*PrimaryGraphCursor).openTablet
+         0     0% 88.37%      0.13s  6.05%  github.com/thesyncim/vibedb/internal/storeio.(*UnifiedHoleResolver).resolveCompactTemplate (inline)
+         0     0% 88.37%      0.02s  0.93%  github.com/thesyncim/vibedb/internal/storeio.(*segmentedTabletRouterAnchorView).fenceAt (inline)
+         0     0% 88.37%      0.11s  5.12%  github.com/thesyncim/vibedb/internal/storeio.countCompactPackedEqual
+         0     0% 88.37%      0.02s  0.93%  github.com/thesyncim/vibedb/internal/storeio.segmentedTabletRouterValidateAnchorRef
+         0     0% 88.37%      2.05s 95.35%  github.com/thesyncim/vibedb/query.(*Query).RunInto (inline)
+         0     0% 88.37%      2.05s 95.35%  github.com/thesyncim/vibedb/query.(*Query).runInto
+         0     0% 88.37%      2.05s 95.35%  github.com/thesyncim/vibedb/query.BenchmarkFilePackedEqualityCountWide.func1
+         0     0% 88.37%      1.97s 91.63%  github.com/thesyncim/vibedb/store/durable.(*Snapshot).FilterEqCount
+         0     0% 88.37%      0.05s  2.33%  github.com/thesyncim/vibejson.(*TapeBuilder).parseFast
+         0     0% 88.37%      0.08s  3.72%  github.com/thesyncim/vibejson.BuildIndex (inline)
+         0     0% 88.37%      0.04s  1.86%  runtime.(*mheap).alloc.func1
+         0     0% 88.37%      0.04s  1.86%  runtime.(*mheap).allocSpan
+         0     0% 88.37%      0.06s  2.79%  runtime.gopreempt_m (inline)
+         0     0% 88.37%      0.06s  2.79%  runtime.goschedImpl
+         0     0% 88.37%      0.05s  2.33%  runtime.morestack
+         0     0% 88.37%      0.06s  2.79%  runtime.newstack
+         0     0% 88.37%      0.05s  2.33%  runtime.schedule
+         0     0% 88.37%      0.04s  1.86%  runtime.sysUsed (inline)
+         0     0% 88.37%      0.04s  1.86%  runtime.sysUsedOS (inline)
+         0     0% 88.37%      0.04s  1.86%  runtime.systemstack
+         0     0% 88.37%      0.06s  2.79%  strconv.AppendUint (inline)
+         0     0% 88.37%      0.02s  0.93%  sync.(*Mutex).Unlock (inline)
+         0     0% 88.37%      2.06s 95.81%  testing.(*B).run1.func1
+         0     0% 88.37%      2.06s 95.81%  testing.(*B).runN

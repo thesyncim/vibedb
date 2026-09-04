@@ -1102,7 +1102,7 @@ func compactDaysBeforeYear(year int) int {
 	return year*365 + (year+3)/4 - (year+99)/100 + (year+399)/400
 }
 
-func appendCompactDate(dst []byte, ordinal int32) []byte {
+func appendCompactDateArithmetic(dst []byte, ordinal int32) []byte {
 	// Shift the ordinal's 0000-01-01 origin to a March-based 400-year era.
 	// March makes leap day the final day of a year, allowing direct division
 	// instead of a year search and month loop. The negative-era branch covers
@@ -1609,58 +1609,18 @@ func (v compactStreamView) appendAlphabetValue(dst []byte, row int) ([]byte, boo
 	if v.kind != compactStreamAlphabet || row < 0 || row >= v.count {
 		return dst, false
 	}
-	alphabet, prefix, suffix, ok := v.alphabetParts()
-	if !ok {
+	if _, _, _, ok := v.alphabetParts(); !ok {
 		return dst, false
 	}
-	block := row / compactStreamRestart
-	cursor := int(binary.LittleEndian.Uint32(v.data[block*4:]))
-	base, n, valid := readCompactUvarint(v.data[cursor:])
-	if !valid {
+	// Prime only the lengths preceding this row, then share the bounded
+	// word/SIMD renderer with scans. A failed seek leaves the sentinel intact;
+	// never re-enter random decoding through the sequential fallback.
+	state := compactStreamSequentialState{next: -1}
+	state.seek(&v, row)
+	if state.next != row {
 		return dst, false
 	}
-	cursor += n
-	if cursor >= len(v.data) {
-		return dst, false
-	}
-	lengthWidth := int(v.data[cursor])
-	cursor++
-	rows := min(compactStreamRestart, v.count-block*compactStreamRestart)
-	lengthBytes := (rows*lengthWidth + 7) / 8
-	packedStart := cursor + lengthBytes
-	if packedStart > len(v.data) {
-		return dst, false
-	}
-	startChar, length := 0, 0
-	for at := 0; at < rows; at++ {
-		decodedLength := int(base + compactReadBits(
-			v.data[cursor:packedStart], at*lengthWidth, lengthWidth,
-		))
-		if at < row%compactStreamRestart {
-			startChar += decodedLength
-		} else if at == row%compactStreamRestart {
-			length = decodedLength
-		}
-	}
-	packedBytes := ((startChar+length)*int(v.width) + 7) / 8
-	if packedBytes > len(v.data)-packedStart {
-		return dst, false
-	}
-	start := len(dst)
-	dst = append(dst, prefix...)
-	middle := len(dst)
-	dst = append(dst, make([]byte, length)...)
-	for char := 0; char < length; char++ {
-		code := int(compactReadBits(
-			v.data[packedStart:packedStart+packedBytes],
-			(startChar+char)*int(v.width), int(v.width),
-		))
-		if code >= len(alphabet) {
-			return dst[:start], false
-		}
-		dst[middle+char] = alphabet[code]
-	}
-	return append(dst, suffix...), true
+	return state.appendAlphabet(dst, &v, row)
 }
 
 func (v compactStreamView) prefixInteger(row int) (int64, bool) {
@@ -2187,10 +2147,16 @@ func countCompactPackedEqual(
 		return 0
 	}
 	if width == 7 {
-		return countCompactPacked7Equal(data, count, want)
+		return countCompactPacked7EqualImpl(data, count, want)
+	}
+	if width == 8 {
+		return countCompactPacked8EqualImpl(data, count, want)
 	}
 	if width == 10 {
-		return countCompactPacked10Equal(data, count, want)
+		return countCompactPacked10EqualImpl(data, count, want)
+	}
+	if width == 16 {
+		return countCompactPacked16EqualImpl(data, count, want)
 	}
 	if width > 56 {
 		for row := 0; row < count; row++ {
@@ -2219,10 +2185,31 @@ func countCompactPackedEqual(
 	return matched
 }
 
+// Byte-aligned widths can compare values directly without a bit reservoir.
+// Keep the full uint64 needle so out-of-range values scan without matching.
+func countCompactPacked8EqualScalar(data []byte, count int, want uint64) (matched int) {
+	for row := 0; row < count; row++ {
+		if uint64(data[row]) == want {
+			matched++
+		}
+	}
+	return matched
+}
+
+func countCompactPacked16EqualScalar(data []byte, count int, want uint64) (matched int) {
+	for row := 0; row < count; row++ {
+		value := binary.LittleEndian.Uint16(data[row*2:])
+		if uint64(value) == want {
+			matched++
+		}
+	}
+	return matched
+}
+
 // Eight 7-bit ids occupy exactly seven bytes. This width is common for
 // low-cardinality columns with 65-128 values, and consuming complete groups
 // avoids the generic reservoir's refill branch on almost every row.
-func countCompactPacked7Equal(data []byte, count int, want uint64) (matched int) {
+func countCompactPacked7EqualScalar(data []byte, count int, want uint64) (matched int) {
 	row := 0
 	cursor := 0
 	for ; row+8 <= count; row, cursor = row+8, cursor+7 {
@@ -2268,7 +2255,7 @@ func countCompactPacked7Equal(data []byte, count int, want uint64) (matched int)
 
 // Four 10-bit values occupy exactly five bytes. This is the ordinary packed
 // width for integer ranges and dictionaries with 513-1024 distinct values.
-func countCompactPacked10Equal(data []byte, count int, want uint64) (matched int) {
+func countCompactPacked10EqualScalar(data []byte, count int, want uint64) (matched int) {
 	row := 0
 	cursor := 0
 	for ; row+4 <= count; row, cursor = row+4, cursor+5 {

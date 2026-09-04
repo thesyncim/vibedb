@@ -1,0 +1,3 @@
+ok  	github.com/thesyncim/vibedb/store	1.385s
+ok  	github.com/thesyncim/vibedb/query	2.458s
+ok  	github.com/thesyncim/vibedb/sql/driver	1.927s

@@ -1,0 +1,9 @@
+goos: linux
+goarch: amd64
+pkg: github.com/thesyncim/vibedb/query
+cpu: AMD EPYC 9V74 80-Core Processor                
+BenchmarkFilePackedEqualityCount/label/dictionary7         	   36501	      8181 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedEqualityCount/n/FOR10                   	   46174	      6506 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedEqualityCountWide/label/dictionary8     	   30768	      9683 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedEqualityCountWide/n/FOR16               	   48808	      6115 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+PASS

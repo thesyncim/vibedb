@@ -1,0 +1,5 @@
+--- FAIL: TestPrimaryOrderedLimitSurvivesSpills (0.74s)
+    file_execute_small_regression_test.go:199: limit lost across spills: rows=512 stats={Workers:1 RowsTotal:4096 RowsScanned:4096 Batches:128 PeakBatchRows:32 PeakBatchBytes:9056 BufferedBytes:18944 SpillRuns:132 SpilledBytes:4749244 PrimaryRangeBounded:true IndexBounded:false IndexLookups:0 IndexPostingPages:0 IndexCertificateRows:0 IndexRecheckRows:0 CandidateRows:4096 CandidateChunks:0 CoveringColumns:0 DataSkippedRows:0 DataSkippedStripes:0 TokenFilterRows:0 TokenFilterFallbackRows:0 JoinMemberships:0 JoinLookups:0 JoinKeys:0 JoinProbes:0 JoinFilters:0 JoinFilterKeys:0 JoinFilterRejected:0 JoinBuilds:0 JoinBuildRows:0 JoinPairs:0}
+FAIL
+FAIL	github.com/thesyncim/vibedb/query	1.122s
+FAIL

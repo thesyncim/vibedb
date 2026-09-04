@@ -1,0 +1,1 @@
+GOAMD64=v1 GOEXPERIMENT=simd GODEBUG=cpu.avx2=off go test -v -count=1 -timeout=5m ./internal/storeio ./query -run Test\(CountCompact\|CompactPacked\)\|\^TestFilePackedEqualityCount\(Wide\)\?\$

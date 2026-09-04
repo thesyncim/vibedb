@@ -1,0 +1,76 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/internal/storeio
+cpu: Apple M4 Max
+BenchmarkCompactStreamPackedEqualityThresholds/width7-count0         	110205812	         0.9915 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width7-count0         	121130296	         0.9850 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width7-count0         	121052958	         1.003 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width7-count0         	120647071	         0.9910 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width7-count0         	121368940	         0.9936 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width7-count1         	30564487	         3.886 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width7-count1         	30741972	         3.901 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width7-count1         	31205644	         3.927 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width7-count1         	32827245	         3.871 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width7-count1         	31592805	         3.884 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width7-count8         	32735456	         3.727 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width7-count8         	32296777	         3.743 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width7-count8         	32142145	         3.726 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width7-count8         	32782039	         3.802 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width7-count8         	31169170	         3.774 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width7-count16        	21620810	         5.336 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width7-count16        	22561513	         5.194 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width7-count16        	23148705	         5.263 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width7-count16        	22750431	         5.116 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width7-count16        	22781386	         5.879 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width7-count31        	 5938228	        19.80 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width7-count31        	 6240099	        19.96 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width7-count31        	 6130659	        20.18 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width7-count31        	 6246406	        20.29 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width7-count31        	 6013341	        19.89 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width7-count32        	17062723	         7.048 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width7-count32        	18095000	         7.012 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width7-count32        	17273642	         6.989 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width7-count32        	18153739	         7.101 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width7-count32        	16536612	         7.086 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width7-count64        	13986285	         8.591 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width7-count64        	13897466	         8.599 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width7-count64        	13880454	         8.615 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width7-count64        	13887080	         8.524 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width7-count64        	14750318	         8.502 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width10-count0        	100000000	         1.012 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width10-count0        	121217222	         0.9984 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width10-count0        	121158068	         0.9916 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width10-count0        	121188607	         0.9943 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width10-count0        	121304324	         0.9933 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width10-count1        	24714668	         4.479 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width10-count1        	26157564	         4.699 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width10-count1        	23823505	         4.464 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width10-count1        	21409455	         4.742 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width10-count1        	21892983	         5.018 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width10-count8        	27172632	         4.481 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width10-count8        	26858404	         4.451 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width10-count8        	27073270	         4.448 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width10-count8        	26947113	         4.454 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width10-count8        	27324475	         4.439 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width10-count16       	17249329	         6.126 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width10-count16       	20099239	         5.933 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width10-count16       	19855494	         5.941 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width10-count16       	20188988	         5.951 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width10-count16       	20154656	         6.266 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width10-count31       	 8167755	        14.02 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width10-count31       	 8323072	        14.61 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width10-count31       	 8496727	        14.02 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width10-count31       	 8625723	        13.81 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width10-count31       	 8471485	        13.98 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width10-count32       	16997166	         7.231 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width10-count32       	17821671	         7.284 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width10-count32       	17622006	         7.133 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width10-count32       	16402219	         7.208 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width10-count32       	16905374	         7.193 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width10-count64       	12560293	         9.600 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width10-count64       	12565444	         9.519 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width10-count64       	12608683	         9.577 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width10-count64       	12584937	         9.524 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEqualityThresholds/width10-count64       	12559746	         9.550 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/thesyncim/vibedb/internal/storeio	10.183s

@@ -266,6 +266,46 @@ jobs:
         run: >-
           go test -short -count=1 -timeout=5m ./sql/driver
           -run 'Test(Catalog|SQLCatalog|Replicated.*(JSON|Json|Catalog|Grammar|Scalar|Placement|Version))'
+      - name: Packed column count SIMD and portable parity
+        env:
+          GOAMD64: v1
+          VIBEDB_TEST_REQUIRE_AVX2: ${{ matrix.runner == 'ubuntu-latest' && '1' || '' }}
+        run: |
+          GOEXPERIMENT=simd go test -v -count=1 -timeout=5m ./internal/storeio -run 'Test(CountCompact|CompactPacked|CompactStream|CompactPrimaryStripe)'
+          GOEXPERIMENT=nosimd go test -count=1 -timeout=5m ./internal/storeio -run 'Test(CountCompact|CompactPacked|CompactStream|CompactPrimaryStripe)'
+          GOEXPERIMENT=nosimd go test -count=1 -timeout=5m ./query -run '^TestFilePackedEqualityCount(Wide)?$'
+      - name: SIMD packed-count fallback with AVX2 disabled (AMD64)
+        if: matrix.runner == 'ubuntu-latest'
+        shell: bash
+        env:
+          GOAMD64: v1
+          GOEXPERIMENT: simd
+          GODEBUG: cpu.avx2=off
+        run: |
+          set -euo pipefail
+          evidence="${RUNNER_TEMP}/simd-avx2-disabled"
+          mkdir -p "${evidence}"
+          test "$(go env GOARCH)" = amd64
+          test "$(go env GOAMD64)" = v1
+          {
+            printf 'revision=%s\n' "$(git rev-parse HEAD)"
+            go version
+            go env -json GOARCH GOAMD64 GOEXPERIMENT
+            printf 'GODEBUG=%s\n' "${GODEBUG}"
+          } > "${evidence}/environment.txt"
+          tests='Test(CountCompact|CompactPacked)|^TestFilePackedEqualityCount(Wide)?$'
+          printf 'GOAMD64=v1 GOEXPERIMENT=simd GODEBUG=cpu.avx2=off go test -v -count=1 -timeout=5m ./internal/storeio ./query -run %q\n' \
+            "${tests}" > "${evidence}/commands.txt"
+          go test -v -count=1 -timeout=5m ./internal/storeio ./query \
+            -run "${tests}" 2>&1 | tee "${evidence}/tests.txt"
+      - name: Upload AVX2-disabled fallback evidence
+        if: ${{ always() && matrix.runner == 'ubuntu-latest' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: simd-avx2-disabled-${{ github.run_id }}
+          path: ${{ runner.temp }}/simd-avx2-disabled
+          if-no-files-found: warn
+          retention-days: 7
       - name: Portable JSON and placement parity
         env:
           GOEXPERIMENT: nosimd

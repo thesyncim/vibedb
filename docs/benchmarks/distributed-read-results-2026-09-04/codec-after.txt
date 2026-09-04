@@ -1,0 +1,16 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/shardservice
+cpu: Apple M4 Max
+BenchmarkSQLReadCursorEncoding/rows=1/direct=false-16         	 3008644	       217.7 ns/op	     560 B/op	       8 allocs/op
+BenchmarkSQLReadCursorEncoding/rows=1/direct=true-16          	 9921878	        57.71 ns/op	      64 B/op	       1 allocs/op
+BenchmarkSQLReadCursorEncoding/rows=32/direct=false-16        	  241844	      3254 ns/op	    7312 B/op	     107 allocs/op
+BenchmarkSQLReadCursorEncoding/rows=32/direct=true-16         	  593390	      1052 ns/op	     896 B/op	       1 allocs/op
+BenchmarkSQLReadCursorEncoding/rows=64/direct=false-16        	  107431	      5370 ns/op	   16656 B/op	     206 allocs/op
+BenchmarkSQLReadCursorEncoding/rows=64/direct=true-16         	  285651	      2630 ns/op	    1792 B/op	       1 allocs/op
+BenchmarkSQLReadCursorEncoding/rows=256/direct=false-16       	   27813	     21068 ns/op	   70288 B/op	     788 allocs/op
+BenchmarkSQLReadCursorEncoding/rows=256/direct=true-16        	   72504	      8277 ns/op	    6784 B/op	       1 allocs/op
+BenchmarkDecodeRowDelivery/single_frame-16                    	    5503	    113022 ns/op	1957.36 MB/s	  590289 B/op	       9 allocs/op
+BenchmarkDecodeRowDelivery/row_batch-16                       	    5625	    109349 ns/op	2023.16 MB/s	  590288 B/op	       9 allocs/op
+PASS
+ok  	github.com/thesyncim/vibedb/shardservice	7.381s

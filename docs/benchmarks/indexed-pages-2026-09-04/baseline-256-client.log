@@ -1,0 +1,5 @@
+vibedb range_256 c=1 rep=1 0.4 ops/s p99=3021.959ms errors=0 verified=true
+vibedb range_256 c=1 rep=2 0.3 ops/s p99=8151.422ms errors=0 verified=true
+vibedb range_256 c=1 rep=3 0.3 ops/s p99=4293.730ms errors=0 verified=true
+vibedb range_256 c=8 rep=1 0.0 ops/s p99=30001.125ms errors=8 verified=false
+benchmark failed: operation errors; trial is not a valid throughput result
