@@ -50,7 +50,8 @@ changes allowed; competitor implementations are evidence, not the design target.
    crash/partition harness. Explicit node-log preparation and serving now share
    append/checkpoint ownership and pass initial multi-group restart tests.
    Live group registration and opt-in benchmark integration are now implemented;
-   qualify end-to-end SQL, node-log faults and measured performance next. See
+   end-to-end SQL and a matched comparison now pass verification. Qualify node-log
+   faults and fix the remaining performance gap next. See
    [registration scope](qualification/node-registration-2026-09-04/README.md).
 2. Redesign committed/versioned read visibility so transactions need not block
    unrelated readers across a group. Retain serializable conflict validation.
@@ -69,5 +70,12 @@ validated another 120,000 samples: C8 updates 2,416.1 ops/s versus CRDB 4,149.6.
 Grouped-scan variance/regression is retained, not hidden. Diagnostic storage
 accounting found about 3 GiB reserved across twelve per-member WALs. See the
 [structural redesign target](storage-runtime-redesign.md).
+
+The [shared-node comparison](benchmarks/crdb-sql-2026-09-04-node/README.md) validates
+another 120,000 samples. VibeDB remains at 0.331–0.578× CRDB; C8 grouped scans
+improve relative to CRDB, while C8 updates regress. Fixture allocation is about
+1.34 GiB compared with the earlier 3.42 GiB diagnostic accounting, primarily by
+removing per-group WAL reservations. This does not prove sustained amplification
+or any performance-goal gate. The cold smoke-write regression is retained.
 
 Status: **active; no acceptance gate is complete**.

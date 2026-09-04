@@ -28,8 +28,11 @@ capacity contract permits valid history spanning multiple segment entry limits.
 See [registration qualification](qualification/node-registration-2026-09-04/README.md).
 
 Node-log split/replica movement, interrupted admission at process-crash boundaries,
-sustained reclamation and acknowledged-write fault campaigns remain. No new space
-or throughput gain has yet been measured through the benchmark integration.
+sustained reclamation and acknowledged-write fault campaigns remain. The first
+[matched node-log comparison](benchmarks/crdb-sql-2026-09-04-node/README.md) validates
+120,000 samples but still trails CRDB on every workload. Fixture allocation falls
+to about 1.34 GiB; sustained amplification is unqualified. C8 grouped-scan relative
+throughput improves while C8 update relative throughput regresses.
 
 Continue the new node manifest and fresh preparation format. Do not spend this
 unreleased redesign building a legacy data migration framework. Preserve exact

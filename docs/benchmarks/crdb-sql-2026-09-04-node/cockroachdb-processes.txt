@@ -1,0 +1,8 @@
+    PID COMMAND         COMMAND
+      1 sleep           sleep infinity
+    108 vibedb          [vibedb] <defunct>
+    541 cockroach       /bench/cockroach start --certs-dir=/data/certs --accept-sql-without-tls --store=/data/crdb-0 --listen-addr=127.0.0.1:26257 --http-addr=127.0.0.1:8080 --join=127.0.0.1:26257,127.0.0.1:26258,127.0.0.1:26259 --cache=512MiB --max-sql-memory=512MiB
+    542 cockroach       /bench/cockroach start --certs-dir=/data/certs --accept-sql-without-tls --store=/data/crdb-1 --listen-addr=127.0.0.1:26258 --http-addr=127.0.0.1:8081 --join=127.0.0.1:26257,127.0.0.1:26258,127.0.0.1:26259 --cache=512MiB --max-sql-memory=512MiB
+    543 cockroach       /bench/cockroach start --certs-dir=/data/certs --accept-sql-without-tls --store=/data/crdb-2 --listen-addr=127.0.0.1:26259 --http-addr=127.0.0.1:8082 --join=127.0.0.1:26257,127.0.0.1:26258,127.0.0.1:26259 --cache=512MiB --max-sql-memory=512MiB
+    714 sh              sh -c ps -eo pid,comm,args > /evidence/cockroachdb-processes.txt
+    720 ps              ps -eo pid,comm,args

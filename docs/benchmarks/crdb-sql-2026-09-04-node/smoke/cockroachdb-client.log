@@ -1,0 +1,5 @@
+cockroachdb point_hit c=1 rep=1 4849.8 ops/s p99=0.439ms errors=0 verified=true
+cockroachdb point_miss c=1 rep=1 5495.1 ops/s p99=0.244ms errors=0 verified=true
+cockroachdb range_64 c=1 rep=1 3762.1 ops/s p99=0.367ms errors=0 verified=true
+cockroachdb group_16 c=1 rep=1 2649.4 ops/s p99=0.806ms errors=0 verified=true
+cockroachdb update_existing c=1 rep=1 732.3 ops/s p99=2.531ms errors=0 verified=true

@@ -7,8 +7,9 @@ registration through the shared append sequencer. Existing descriptors must
 match the binding; retry never resets a newer log or incarnation.
 
 `cluster dev --node-log` prepares fresh nodes and uses this path for newly created
-tables. The CRDB comparison runner accepts the same flag. This commit has not yet
-completed the end-to-end benchmark smoke run; no performance gain is claimed.
+tables. The CRDB comparison runner accepts the same flag. The subsequent [end-to-end comparison](../../benchmarks/crdb-sql-2026-09-04-node/README.md)
+retains both the smoke result and the full matched matrix; all results verify,
+but every measured workload remains slower than CRDB.
 
 ## Checks
 

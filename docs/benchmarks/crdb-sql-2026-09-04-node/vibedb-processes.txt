@@ -1,0 +1,15 @@
+    PID COMMAND         COMMAND
+      1 sleep           sleep infinity
+    108 vibedb          /bench/vibedb cluster dev --root /data/vibe --replicas 3 --node-log --pg-listen 127.0.0.1:5432 --diagnostics-on-exit
+    239 vibedb-shard    /bench/vibedb-shard serve-rf3 -manifest /data/vibe/catalog-member-1/group-0/serve-rf3.vibejson
+    240 vibedb-shard    /bench/vibedb-shard serve-rf3 -manifest /data/vibe/catalog-member-2/group-0/serve-rf3.vibejson
+    241 vibedb-shard    /bench/vibedb-shard serve-rf3 -manifest /data/vibe/catalog-member-3/group-0/serve-rf3.vibejson
+    242 vibedb-shard    /bench/vibedb-shard serve-rf3 -manifest /data/vibe/ledger-member-1/group-0/serve-rf3.vibejson
+    243 vibedb-shard    /bench/vibedb-shard serve-rf3 -manifest /data/vibe/ledger-member-2/group-0/serve-rf3.vibejson
+    246 vibedb-shard    /bench/vibedb-shard serve-rf3 -manifest /data/vibe/ledger-member-3/group-0/serve-rf3.vibejson
+    257 vibedb-shard    /bench/vibedb-shard serve-rf3 -manifest /data/vibe/data-member-1/group-0/serve-multigroup.vibejson -reload-prepared-groups
+    261 vibedb-shard    /bench/vibedb-shard serve-rf3 -manifest /data/vibe/data-member-2/group-0/serve-multigroup.vibejson -reload-prepared-groups
+    265 vibedb-shard    /bench/vibedb-shard serve-rf3 -manifest /data/vibe/data-member-3/group-0/serve-multigroup.vibejson -reload-prepared-groups
+    360 vibedb-gateway  /bench/vibedb-gateway serve -catalog /data/vibe/catalog.vibejson -catalog-route-seed /data/vibe/catalog.vibejson.route-seed -catalog-bootstrap-if-missing -catalog-relation 1 -catalog-session-journal /data/vibe/gateway-session -catalog-client-id da6fef99f434175cd99fc5e93e6913c6 -catalog-retry-home da6fef99f434175c -durable-ack-key /data/vibe/durable-ack-key -listen 127.0.0.1:43981 -tls-certificate /data/vibe/node-10-cert.pem -tls-key /data/vibe/node-10-key.pem -tls-roots /data/vibe/roots.pem -tls-identity-oid 1.3.6.1.4.1.32473.1.1 -authorization-policy /data/vibe/authorization-policy.vibejson -hot-shard-capacity /data/vibe/hot-shard-capacity.vibejson -replica-control-manifest /data/vibe/replica-control.vibejson -shard-peer 127.0.0.1:40629=19e81808d64e8d1973ba4a8a1bf566ac -shard-peer 127.0.0.1:38753=c29229f0fe0dd5a93fcfae3e97d91280 -shard-peer 127.0.0.1:46243=47f7e7360eade887425c97070d522bb6 -shard-peer 127.0.0.1:37021=543bb0e5b41d40a2165c1248ca662f93 -shard-peer 127.0.0.1:35149=1839acb6b051ec5d36362b915c5dc82b -shard-peer 127.0.0.1:36903=d3a1e3eb170d93b803330311cfb59a73 -shard-peer 127.0.0.1:39633=f30a628b5e4a1643bbaf8460f28a65ec -shard-peer 127.0.0.1:36977=c1747ef33a4d390997d568dea5b1cd46 -shard-peer 127.0.0.1:38727=c7866e64111dce3318b63e6c94ac058c -pg-dev-listen 127.0.0.1:5432 -pg-dev-ddl-socket /tmp/vibedb-ddl-1211418326/control.sock
+    392 sh              sh -c ps -eo pid,comm,args > /evidence/vibedb-processes.txt
+    398 ps              ps -eo pid,comm,args
