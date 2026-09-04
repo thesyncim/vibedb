@@ -366,9 +366,9 @@ jobs:
           test "$(( $(stat -c %b "${preflight}") * $(stat -c %B "${preflight}") ))" -ge 1048576
           rm -f "${preflight}"
           test_name='TestGatewayAutomaticReplicaReplacementProcesses'
-          go test -list "^${test_name}$" ./cmd/vibedb-gateway > "${evidence}/test-list.txt"
+          go test -list "^${test_name}$" ./internal/gatewayruntime > "${evidence}/test-list.txt"
           grep -Fqx "${test_name}" "${evidence}/test-list.txt"
-          printf 'VIBEDB_REPLICA_REPLACEMENT_E2E=1 VIBEDB_REPLICA_REPLACEMENT_EVIDENCE=%s go test -json -count=3 -timeout=8m -run %s ./cmd/vibedb-gateway\n' \
+          printf 'VIBEDB_REPLICA_REPLACEMENT_E2E=1 VIBEDB_REPLICA_REPLACEMENT_EVIDENCE=%s go test -json -count=3 -timeout=8m -run %s ./internal/gatewayruntime\n' \
             "${evidence}/runs" "^${test_name}$" > "${evidence}/command.txt"
       - name: Automatic replica-replacement process qualification
         if: ${{ !cancelled() && steps.go.outcome == 'success' }}
@@ -380,7 +380,7 @@ jobs:
           set -euo pipefail
           go test -json -count=3 -timeout=8m \
             -run '^TestGatewayAutomaticReplicaReplacementProcesses$' \
-            ./cmd/vibedb-gateway \
+            ./internal/gatewayruntime \
             | tee "${RUNNER_TEMP}/replica-replacement/go-test.jsonl"
       - name: Validate replica-replacement evidence
         if: always()
@@ -486,7 +486,7 @@ jobs:
           go env GOOS GOARCH GOVERSION GOTOOLCHAIN > "${evidence}/go-env.txt"
           uname -a > "${evidence}/uname.txt"
           test_name='TestGatewayHotShardMutationProcesses'
-          go test -list "^${test_name}$" ./cmd/vibedb-gateway > "${evidence}/test-list.txt"
+          go test -list "^${test_name}$" ./internal/gatewayruntime > "${evidence}/test-list.txt"
           grep -Fqx "${test_name}" "${evidence}/test-list.txt"
       - name: Write-driven hot-shard process qualification
         shell: bash
@@ -496,7 +496,7 @@ jobs:
           set -euo pipefail
           go test -json -count=1 -timeout=6m \
             -run '^TestGatewayHotShardMutationProcesses$' \
-            ./cmd/vibedb-gateway \
+            ./internal/gatewayruntime \
             | tee "${RUNNER_TEMP}/hot-shard-mutation/go-test.jsonl"
       - name: Validate write-driven hot-shard evidence
         if: always()

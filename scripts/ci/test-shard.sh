@@ -25,7 +25,7 @@ while IFS= read -r package; do
   case "${package#github.com/thesyncim/vibedb}" in
     /store/durable) owner=durable ;;
     /query|/store|/sql/*|/pgwire) owner=sql ;;
-    /cmd/vibedb-gateway|/cmd/vibedb-shard) owner=process ;;
+    /cmd/vibedb-gateway|/cmd/vibedb-shard|/internal/gatewayruntime) owner=process ;;
     *) owner=core ;;
   esac
   if [[ "$owner" == "$package_shard" ]]; then

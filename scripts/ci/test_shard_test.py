@@ -12,7 +12,8 @@ SCRIPT = Path(__file__).with_name("test-shard.sh").resolve()
 PREFIX = "github.com/thesyncim/vibedb"
 PACKAGES = [PREFIX + suffix for suffix in (
     "", "/store/durable", "/query", "/store", "/sql/driver", "/pgwire",
-    "/cmd/vibedb-gateway", "/cmd/vibedb-shard", "/internal/raftservice",
+    "/cmd/vibedb-gateway", "/cmd/vibedb-shard", "/internal/gatewayruntime",
+    "/internal/raftservice",
     "/new-package", "/store/durable/new-package",
 )]
 
@@ -86,7 +87,8 @@ sys.exit(99)
         self.assertEqual(result.returncode, 9)
         args = json.loads(result.stdout.splitlines()[-1])
         self.assertEqual(args, ["test", "-json", "-p=1", "-timeout=25m",
-                                PREFIX + "/cmd/vibedb-gateway", PREFIX + "/cmd/vibedb-shard"])
+                                PREFIX + "/cmd/vibedb-gateway", PREFIX + "/cmd/vibedb-shard",
+                                PREFIX + "/internal/gatewayruntime"])
 
 
 if __name__ == "__main__":

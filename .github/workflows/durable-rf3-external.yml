@@ -45,9 +45,9 @@ jobs:
           test "$(( $(stat -c %b "${preflight}") * $(stat -c %B "${preflight}") ))" -ge 1048576
           rm -f "${preflight}"
           test_name='TestGatewayReadBatchRF3ExternalProcessChaos'
-          go test -list "^${test_name}$" ./cmd/vibedb-gateway > "${evidence}/test-list.txt"
+          go test -list "^${test_name}$" ./internal/gatewayruntime > "${evidence}/test-list.txt"
           grep -Fqx "${test_name}" "${evidence}/test-list.txt"
-          printf 'TMPDIR=%s VIBEDB_READ_BATCH_RF3_PROCESS_E2E=1 go test -json -count=3 -timeout=18m -run %s ./cmd/vibedb-gateway\n' \
+          printf 'TMPDIR=%s VIBEDB_READ_BATCH_RF3_PROCESS_E2E=1 go test -json -count=3 -timeout=18m -run %s ./internal/gatewayruntime\n' \
             "${test_root}" "^${test_name}$" > "${evidence}/command.txt"
       - name: Run external RF3 read-batch chaos
         shell: bash
@@ -58,7 +58,7 @@ jobs:
           set -euo pipefail
           go test -json -count=3 -timeout=18m \
             -run '^TestGatewayReadBatchRF3ExternalProcessChaos$' \
-            ./cmd/vibedb-gateway \
+            ./internal/gatewayruntime \
             | tee "${RUNNER_TEMP}/read-batch-rf3-external/go-test.jsonl"
       - name: Validate exact read-batch evidence
         if: always()
@@ -145,9 +145,9 @@ jobs:
           test "$(( $(stat -c %b "${preflight}") * $(stat -c %B "${preflight}") ))" -ge 1048576
           rm -f "${preflight}"
           test_name='TestGatewayDurableRF3ExternalProcessRecovery'
-          go test -list "^${test_name}$" ./cmd/vibedb-gateway > "${evidence}/test-list.txt"
+          go test -list "^${test_name}$" ./internal/gatewayruntime > "${evidence}/test-list.txt"
           grep -Fqx "${test_name}" "${evidence}/test-list.txt"
-          printf 'TMPDIR=%s VIBEDB_DURABLE_RF3_PROCESS_E2E=1 go test -json -count=3 -timeout=18m -run %s ./cmd/vibedb-gateway\n' \
+          printf 'TMPDIR=%s VIBEDB_DURABLE_RF3_PROCESS_E2E=1 go test -json -count=3 -timeout=18m -run %s ./internal/gatewayruntime\n' \
             "${test_root}" "^${test_name}$" > "${evidence}/command.txt"
       - name: Run external RF3 terminal and ACK recovery
         shell: bash
@@ -158,7 +158,7 @@ jobs:
           set -euo pipefail
           go test -json -count=3 -timeout=18m \
             -run '^TestGatewayDurableRF3ExternalProcessRecovery$' \
-            ./cmd/vibedb-gateway \
+            ./internal/gatewayruntime \
             | tee "${RUNNER_TEMP}/durable-rf3-external/go-test.jsonl"
       - name: Validate exact no-skip evidence
         if: always()
