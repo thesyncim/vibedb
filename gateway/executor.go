@@ -196,14 +196,43 @@ func (e *Executor) Query(ctx context.Context, q Query) (*Result, error) {
 }
 
 func (e *Executor) queryWithProfile(ctx context.Context, q Query, profile Profile) (*Result, error) {
+	return e.queryWithProfileValidation(ctx, q, profile, -1)
+}
+
+// queryPreparedWithProfile is the pgwire read path. postgresStatement already
+// performed the full typed semantic prepare and retains that compiled statement,
+// so execution only needs to validate the bound transport values and arity.
+// Keeping this entry point private prevents general Executor callers from
+// bypassing validateTypedQuery.
+func (e *Executor) queryPreparedWithProfile(
+	ctx context.Context,
+	q Query,
+	profile Profile,
+	preparedParams int,
+) (*Result, error) {
+	return e.queryWithProfileValidation(ctx, q, profile, preparedParams)
+}
+
+func (e *Executor) queryWithProfileValidation(
+	ctx context.Context,
+	q Query,
+	profile Profile,
+	preparedParams int,
+) (*Result, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if err := validateTypedQuery(ctx, &q); err != nil {
-		return nil, err
+	if preparedParams >= 0 {
+		if err := validatePreparedQueryParameters(&q, preparedParams); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := validateTypedQuery(ctx, &q); err != nil {
+			return nil, err
+		}
 	}
 	opctx, cancel := context.WithTimeout(ctx, profile.GlobalDeadline)
 	defer cancel()

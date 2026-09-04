@@ -140,6 +140,35 @@ func TestValidateSQLParameterTypesRejectsNonCanonicalMetadata(t *testing.T) {
 	}
 }
 
+func TestPreparedQueryParameterValidationUsesRetainedArity(t *testing.T) {
+	valid := Query{
+		SQL:        "this text was already prepared and is not parsed here",
+		Params:     []shardservice.Param{shardservice.NullParam()},
+		ParamTypes: []sqldriver.ParamType{sqldriver.ParamTypeText},
+	}
+	if err := validatePreparedQueryParameters(&valid, 1); err != nil {
+		t.Fatalf("prepared parameters = %v", err)
+	}
+
+	wrongArity := valid
+	wrongArity.Params = nil
+	if err := validatePreparedQueryParameters(&wrongArity, 1); !errors.Is(err, ErrPlanParameters) {
+		t.Fatalf("wrong arity error = %v, want ErrPlanParameters", err)
+	}
+
+	invalidPayload := valid
+	invalidPayload.Params = []shardservice.Param{{Kind: shardservice.ParamKind(255)}}
+	if err := validatePreparedQueryParameters(&invalidPayload, 1); !errors.Is(err, ErrPlanParameters) {
+		t.Fatalf("invalid payload error = %v, want ErrPlanParameters", err)
+	}
+
+	invalidTypes := valid
+	invalidTypes.ParamTypes = []sqldriver.ParamType{sqldriver.ParamTypeInvalid}
+	if err := validatePreparedQueryParameters(&invalidTypes, 1); !errors.Is(err, ErrPlanParameters) {
+		t.Fatalf("invalid type error = %v, want ErrPlanParameters", err)
+	}
+}
+
 func TestExecBatchAdmitsEveryItemBeforeCatalogOrSemanticPreparation(t *testing.T) {
 	executor := NewExecutor(nil, nil, Options{})
 	queries := []Query{
