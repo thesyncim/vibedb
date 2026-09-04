@@ -222,9 +222,9 @@ const txnActiveShardCount = 64
 
 // txnActiveShard is one stripe of the live-transaction directory: a revision
 // bucket map owned by its own mutex. Stripes are independent; cross-stripe
-// consistency is never required because every consumer tolerates a stale
-// oldest bound (pruning retains more) and counts stay exact through atomic
-// add/subtract pairing.
+// scans retain a conservative oldest bound because registration samples its
+// revision while holding the stripe lock. The database clock gate excludes
+// quiescent cleanup, and the global holder count uses saturating CAS updates.
 type txnActiveShard struct {
 	mu   sync.Mutex
 	revs map[uint64]uint64
@@ -432,6 +432,7 @@ func (t *Tx) scrubStates() {
 		}
 		state.heapSnap = store.Snapshot{}
 		state.hasHeap = false
+		state.coll = nil
 		state.pending = nil
 		state.order = nil
 		state.overlaySource = query.FileOverlaySource{}
@@ -695,17 +696,16 @@ func (t *Tx) validateState(state *txCollectionState) error {
 
 func (t *Tx) validateDependencies(states []*txCollectionState) error {
 	db := t.db
-	// Lock-free read pass over beginRev-anchored histories: lookups resolve
-	// through the histories map without taking any clock lock, so disjoint
-	// collections validate fully in parallel. This is sound because the
-	// caller holds every participant collection's txnFence, and every history
-	// mutation also holds that collection's fence while a capacity overflow
-	// can only drop histories it replaces with a conservative floor (a missed
-	// floor trip over-approximates nothing: it only concerns collections this
-	// transaction never touched).
-	if db.txnRevisionStopped.Load() ||
-		(db.txnHistoryFloor.Load() != 0 && t.beginRev < db.txnHistoryFloor.Load()) {
+	// Participant fences exclude changes to the loaded histories. An unrelated
+	// collection can still overflow and remove them, so check the conservative
+	// floor both before and after all lookups. A reset after the final check
+	// cannot invalidate already-checked dependencies while their fences remain
+	// held; a reset during the pass must remain visible to this active revision.
+	if db.txnClockConflict(t.beginRev) {
 		return fmt.Errorf("%w: bounded database history", ErrTxConflict)
+	}
+	if hook := db.testAfterTxHistoryGuards; hook != nil {
+		hook()
 	}
 	for _, state := range states {
 		var history *txnclock.ExternalHistory
@@ -732,7 +732,16 @@ func (t *Tx) validateDependencies(states []*txCollectionState) error {
 			}
 		}
 	}
+	if db.txnClockConflict(t.beginRev) {
+		return fmt.Errorf("%w: bounded database history", ErrTxConflict)
+	}
 	return nil
+}
+
+func (d *Database) txnClockConflict(begin uint64) bool {
+	floor := d.txnHistoryFloor.Load()
+	return d.txnRevisionStopped.Load() || d.txnClockSaturated.Load() ||
+		(floor != 0 && begin < floor)
 }
 
 func (t *Tx) commitSingleDurable(state *txCollectionState) error {
@@ -1379,35 +1388,59 @@ func (d *Database) batchBounds(name string) (maxDocs, maxBytes int) {
 }
 
 func (d *Database) armClockForBegin(tx *Tx) {
-	tx.beginRev = d.txnRevision.Load()
 	tx.clockArmed = true
-	// A saturated coordinator arms without registering: the directory is
-	// frozen by design (see txnClockSaturated) and the saturated count keeps
-	// every finish on the recording path.
-	if d.txnClockSaturated.Load() {
+	d.clockMu.RLock()
+	defer d.clockMu.RUnlock()
+	if d.txnClockSaturated.Load() || d.txnActiveCount.Load() == maxTxnActiveCount {
+		d.txnClockSaturated.Store(true)
+		tx.beginRev = d.txnRevision.Load()
 		return
-	}
-	if d.txnActiveCount.Load() >= maxTxnActiveCount {
-		d.clockMu.Lock()
-		if d.txnActiveCount.Load() >= maxTxnActiveCount && !d.txnClockSaturated.Load() {
-			d.txnClockSaturated.Store(true)
-		}
-		d.clockMu.Unlock()
-		if d.txnClockSaturated.Load() {
-			return
-		}
 	}
 	shard := d.txnArmTick.Add(1) & (txnActiveShardCount - 1)
 	s := &d.txnActive[shard]
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Sampling inside the stripe prevents an oldest scan from passing this
+	// registration and publishing a newer pruning bound before it is visible.
+	tx.beginRev = d.txnRevision.Load()
+	if !d.addTxnHolder() {
+		return
+	}
 	if s.revs == nil {
 		s.revs = make(map[uint64]uint64)
 	}
 	s.revs[tx.beginRev]++
-	s.mu.Unlock()
-	d.txnActiveCount.Add(1)
 	tx.clockShard = shard
 	tx.clockInserted = true
+}
+
+func (d *Database) addTxnHolder() bool {
+	for {
+		active := d.txnActiveCount.Load()
+		if active == maxTxnActiveCount {
+			d.txnClockSaturated.Store(true)
+			return false
+		}
+		if d.txnActiveCount.CompareAndSwap(active, active+1) {
+			if active+1 == maxTxnActiveCount {
+				d.txnClockSaturated.Store(true)
+				return false
+			}
+			return true
+		}
+	}
+}
+
+func (d *Database) removeTxnHolder() {
+	for {
+		active := d.txnActiveCount.Load()
+		if active == 0 || active == maxTxnActiveCount {
+			return
+		}
+		if d.txnActiveCount.CompareAndSwap(active, active-1) {
+			return
+		}
+	}
 }
 
 func (d *Database) finishClock(tx *Tx, published map[string][]string) {
@@ -1427,6 +1460,7 @@ func (d *Database) finishClock(tx *Tx, published map[string][]string) {
 	tx.clockArmed = false
 	if tx.clockInserted {
 		tx.clockInserted = false
+		d.clockMu.RLock()
 		s := &d.txnActive[tx.clockShard]
 		s.mu.Lock()
 		if n := s.revs[tx.beginRev]; n <= 1 {
@@ -1434,22 +1468,26 @@ func (d *Database) finishClock(tx *Tx, published map[string][]string) {
 		} else {
 			s.revs[tx.beginRev] = n - 1
 		}
+		d.removeTxnHolder()
 		s.mu.Unlock()
-		d.txnActiveCount.Add(^uint64(0))
 		// Only the oldest holder can advance the oldest bound, so only it
 		// pays for a rescan. A stale-low hint merely retains more history
 		// (bounded by HistoryKeys/Floor), never less.
-		if tx.beginRev <= d.txnOldestHint.Load() {
+		if !d.txnClockSaturated.Load() && tx.beginRev <= d.txnOldestHint.Load() {
 			d.refreshOldestHint()
 		}
+		d.clockMu.RUnlock()
 	}
 	if d.txnActiveCount.Load() == 0 {
 		d.quiesceClock()
 		return
 	}
-	if floor := d.txnHistoryFloor.Load(); floor != 0 && d.txnOldestHint.Load() >= floor {
+	if d.txnClockSaturated.Load() {
+		return
+	}
+	if floor := d.txnHistoryFloor.Load(); floor != 0 && d.oldestTxnHistoryRevision() >= floor {
 		d.clockMu.Lock()
-		if f := d.txnHistoryFloor.Load(); f != 0 && d.txnOldestHint.Load() >= f {
+		if f := d.txnHistoryFloor.Load(); f != 0 && d.oldestTxnHistoryRevision() >= f {
 			d.txnHistoryFloor.Store(0)
 		}
 		d.clockMu.Unlock()
@@ -1457,10 +1495,10 @@ func (d *Database) finishClock(tx *Tx, published map[string][]string) {
 }
 
 // refreshOldestHint recomputes the oldest live begin revision by scanning the
-// directory stripes. Stripes are locked one at a time and never nested, so a
-// scan cannot deadlock against arm/finish. A scan that races a finish may
-// report a revision whose holder just left; the hint is valid as a lower
-// bound in every case (pruning with it retains more, never less).
+// directory stripes while the caller holds clockMu shared. Registrations
+// sample their revision inside the stripe lock, so anything a scan misses
+// cannot precede its initial revision sample. A concurrent finish can only
+// leave a stale-low bound, which retains extra history. Stripes never nest.
 func (d *Database) refreshOldestHint() {
 	min := d.txnRevision.Load()
 	for i := range d.txnActive {
@@ -1477,10 +1515,18 @@ func (d *Database) refreshOldestHint() {
 }
 
 // quiesceClock resets clock state when the last active transaction finishes.
-// It runs only at exact zero, so no recorder or validator is in flight: any
-// transaction that could observe or mutate histories is itself active and
-// would keep the count above zero.
+// The exclusive gate excludes registration and history recording; the count
+// must be checked again after acquiring it because a new Begin can race the
+// last finisher's original zero observation.
 func (d *Database) quiesceClock() {
+	if hook := d.testBeforeClockQuiesce; hook != nil {
+		hook()
+	}
+	d.clockMu.Lock()
+	defer d.clockMu.Unlock()
+	if d.txnActiveCount.Load() != 0 {
+		return
+	}
 	d.clearHistories()
 	d.txnHistoryFloor.Store(0)
 	d.txnOldestHint.Store(d.txnRevision.Load())
@@ -1494,6 +1540,16 @@ func (d *Database) clearHistories() {
 	d.txnHistoriesCount.Store(0)
 }
 
+func (d *Database) oldestTxnHistoryRevision() uint64 {
+	// Saturated holders are intentionally absent from the exact directory.
+	// Freeze the effective pruning bound at zero even if a scan that began
+	// before saturation finishes afterward. Validation also fails closed.
+	if d.txnClockSaturated.Load() {
+		return 0
+	}
+	return d.txnOldestHint.Load()
+}
+
 func (d *Database) recordClockKey(name, key string) {
 	if d.txnActiveCount.Load() == 0 {
 		return
@@ -1502,26 +1558,55 @@ func (d *Database) recordClockKey(name, key string) {
 	if !ok {
 		return
 	}
-	// The caller holds this collection's txnFence (direct writes linearize
-	// through it), so no validator can observe this collection's history
-	// concurrently: same-collection access stays exclusive without any clock
-	// lock. The fence is also what makes the recheck below sound — a commit
-	// that needed this record cannot slip between the count gate and the
-	// history mutation without taking this same fence.
+	if hook := d.testAfterTxnRevisionAssigned; hook != nil {
+		hook(revision)
+	}
+	// A shared hold keeps an existing history attached until its record lands.
+	// Only a missing history needs exclusive creation/overflow admission.
+	d.clockMu.RLock()
+	if d.txnActiveCount.Load() == 0 {
+		d.clockMu.RUnlock()
+		return
+	}
+	if value, exists := d.txnHistories.Load(name); exists {
+		value.(*txnclock.ExternalHistory).RecordAt(revision, d.oldestTxnHistoryRevision(), []string{key})
+		d.clockMu.RUnlock()
+		return
+	}
+	d.clockMu.RUnlock()
+	d.clockMu.Lock()
+	defer d.clockMu.Unlock()
 	if d.txnActiveCount.Load() == 0 {
 		return
 	}
-	history := d.historyForRecord(name, revision)
+	history := d.historyForRecordLocked(name)
 	if history == nil {
 		return
 	}
-	history.RecordAt(revision, d.txnOldestHint.Load(), []string{key})
+	history.RecordAt(revision, d.oldestTxnHistoryRevision(), []string{key})
 }
 
 func (d *Database) recordPublished(published map[string][]string) {
 	revision, ok := d.nextTxnRevision()
 	if !ok {
 		return
+	}
+	d.clockMu.RLock()
+	missing := false
+	for name, keys := range published {
+		if len(keys) != 0 {
+			if _, exists := d.txnHistories.Load(name); !exists {
+				missing = true
+				break
+			}
+		}
+	}
+	if missing {
+		d.clockMu.RUnlock()
+		d.clockMu.Lock()
+		defer d.clockMu.Unlock()
+	} else {
+		defer d.clockMu.RUnlock()
 	}
 	// Resolve every history before recording any: on capacity overflow the
 	// whole publication is dropped (floor set, histories cleared) exactly
@@ -1536,7 +1621,7 @@ func (d *Database) recordPublished(published map[string][]string) {
 		if len(keys) == 0 {
 			continue
 		}
-		history := d.historyForRecord(name, revision)
+		history := d.historyForRecordLocked(name)
 		if history == nil {
 			return
 		}
@@ -1544,98 +1629,66 @@ func (d *Database) recordPublished(published map[string][]string) {
 	}
 	// The caller holds every dirty collection's fence, so each record lands
 	// while concurrent validators of that collection are excluded.
-	oldest := d.txnOldestHint.Load()
+	oldest := d.oldestTxnHistoryRevision()
 	for _, p := range pending {
 		p.history.RecordUniqueAt(revision, oldest, p.keys)
 	}
 }
 
-// historyForRecord returns the named collection's conflict history, creating
+// historyForRecordLocked returns the named collection's conflict history, creating
 // it subject to the relation cap. A nil return means the publication must be
 // dropped: capacity overflow set the history floor and cleared every history,
 // so validators conservatively conflict instead of trusting a partial record.
 //
-// Creation races are benign: duplicate creates converge on one stored entry
-// (the loser uses the winner's), and a transient over-count past the cap only
-// trips an early, equally conservative overflow.
-func (d *Database) historyForRecord(name string, revision uint64) *txnclock.ExternalHistory {
+// The caller holds clockMu exclusively when any history is missing, or shared
+// when every history already exists. Creation and all directory resets are
+// exclusive, so a loaded history cannot be detached before recording ends.
+func (d *Database) historyForRecordLocked(name string) *txnclock.ExternalHistory {
 	if v, ok := d.txnHistories.Load(name); ok {
 		return v.(*txnclock.ExternalHistory)
 	}
-	d.clockMu.Lock()
-	defer d.clockMu.Unlock()
-	if v, ok := d.txnHistories.Load(name); ok {
-		return v.(*txnclock.ExternalHistory)
-	}
-	if floor := d.txnHistoryFloor.Load(); floor != 0 && d.txnOldestHint.Load() >= floor {
+	if floor := d.txnHistoryFloor.Load(); floor != 0 && d.oldestTxnHistoryRevision() >= floor {
 		d.txnHistoryFloor.Store(0)
 	}
 	if d.txnHistoriesCount.Load()+1 > maxSerializableHistoryCollections {
-		d.txnHistoryFloor.Store(revision)
+		// Reservations can arrive out of order. The floor must cover every
+		// revision being discarded, not just this recorder's older revision.
+		floor := d.txnRevision.Load()
+		if previous := d.txnHistoryFloor.Load(); previous > floor {
+			floor = previous
+		}
+		d.txnHistoryFloor.Store(floor)
 		d.clearHistories()
 		return nil
 	}
 	history := &txnclock.ExternalHistory{}
-	actual, loaded := d.txnHistories.LoadOrStore(name, history)
-	if loaded {
-		return actual.(*txnclock.ExternalHistory)
-	}
+	d.txnHistories.Store(name, history)
 	d.txnHistoriesCount.Add(1)
 	return history
 }
 
 // nextTxnRevision assigns the revision a publication records under: one
-// fetch-add per published commit, so a multi-collection publication still
+// successful CAS per published commit, so a multi-collection publication
 // carries a single revision across every collection (see
 // TestNativeSerializableMultiCollectionPublicationUsesOneRevision). The
 // stopped and at-maximum checks preserve the fail-closed exhaustion
 // semantics: once stopped, every validation conflicts and nothing records.
 func (d *Database) nextTxnRevision() (uint64, bool) {
-	if d.txnRevisionStopped.Load() {
-		return d.txnRevision.Load(), false
-	}
-	rev := d.txnRevision.Add(1)
-	if rev == 0 {
-		// Incremented past the maximum: a previous publication already
-		// consumed maxTxnRevision, so the coordinator stops fail-closed
-		// instead of reusing revision zero. Only reachable at the 2^64
-		// boundary (the exhaustion test drives it deliberately); every
-		// later validation conflicts while stopped.
-		d.clockMu.Lock()
-		d.txnRevisionStopped.Store(true)
-		d.clearHistories()
-		d.clockMu.Unlock()
-		return 0, false
-	}
-	if rev == maxTxnRevision {
-		d.clockMu.Lock()
-		activeAtMax := d.activeRevisionPresent(maxTxnRevision)
-		if d.txnActiveCount.Load() == maxTxnActiveCount || activeAtMax {
+	for {
+		if d.txnRevisionStopped.Load() {
+			return d.txnRevision.Load(), false
+		}
+		revision := d.txnRevision.Load()
+		if revision == maxTxnRevision {
+			// Never publish a wrapped value, even temporarily: another
+			// allocator or Begin could otherwise reuse it before the latch.
 			d.txnRevisionStopped.Store(true)
-			d.clearHistories()
-			d.clockMu.Unlock()
 			return maxTxnRevision, false
 		}
-		d.clockMu.Unlock()
-		return rev, true
-	}
-	return rev, true
-}
-
-// activeRevisionPresent reports whether any stripe still holds a live holder
-// of revision. It is called only on the revision-exhaustion path, where
-// exactness matters more than speed.
-func (d *Database) activeRevisionPresent(revision uint64) bool {
-	for i := range d.txnActive {
-		s := &d.txnActive[i]
-		s.mu.Lock()
-		n := s.revs[revision]
-		s.mu.Unlock()
-		if n != 0 {
-			return true
+		if d.txnRevision.CompareAndSwap(revision, revision+1) {
+			return revision + 1, true
 		}
 	}
-	return false
 }
 
 // txnActiveEntriesForTest totals live directory buckets across stripes.
