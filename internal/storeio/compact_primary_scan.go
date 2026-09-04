@@ -549,7 +549,11 @@ func (s *compactStreamSequentialState) appendValue(
 	suffixValue, _ := v.dictionaryEntry(1)
 	dst = append(dst, prefixValue...)
 	digits := len(dst)
-	dst = strconv.AppendUint(dst, uint64(s.value), 10)
+	if s.value < 1_000_000 {
+		dst = appendCanonicalUint6(dst, uint64(s.value))
+	} else {
+		dst = strconv.AppendUint(dst, uint64(s.value), 10)
+	}
 	if v.data[0]&1 != 0 {
 		width := int(v.data[1])
 		n := len(dst) - digits
