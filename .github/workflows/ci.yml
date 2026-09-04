@@ -665,7 +665,7 @@ jobs:
           PACKAGES: ${{ matrix.packages }}
         run: |
           read -r -a test_targets <<< "$PACKAGES"
-          go test -race -p=1 -count=1 -timeout=30m "${test_targets[@]}"
+          go test -race -p=2 -count=1 -timeout=30m "${test_targets[@]}"
       - name: Save Go build cache
         if: ${{ always() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
