@@ -89,7 +89,7 @@ func (c *sqlRF3TestTransport) DoReplicated(ctx context.Context, endpoint Replica
 	return &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedQueryResult, HasState: true, State: state, ReadApplied: 20, Value: encoded.Bytes()}, nil
 }
 
-func newSQLRF3TestExecutor(t *testing.T) (*Executor, *sqlRF3TestTransport) {
+func newSQLRF3TestExecutor(t testing.TB) (*Executor, *sqlRF3TestTransport) {
 	t.Helper()
 	config, endpoints, descriptor, profile := testReplicatedTableInput(t)
 	boundary := distribution.KeyspacePoint{0x80}
