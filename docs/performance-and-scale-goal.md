@@ -79,4 +79,10 @@ improve relative to CRDB, while C8 updates regress. Fixture allocation is about
 removing per-group WAL reservations. This does not prove sustained amplification
 or any performance-goal gate. The cold smoke-write regression is retained.
 
+The [prefix-kernel comparison](benchmarks/crdb-sql-2026-09-04-prefix/README.md)
+validates another 120,000 samples: update medians improve modestly, but C8 p99
+worsens and the third update trial drops to 1,862.3 ops/s. All ratios remain
+0.330–0.595× CRDB. Preserve the current durability barriers; profile sustained
+write rotation/checkpoint costs and remove repeated scan materialization next.
+
 Status: **active; no acceptance gate is complete**.

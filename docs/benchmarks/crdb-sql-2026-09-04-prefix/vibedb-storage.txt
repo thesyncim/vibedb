@@ -1,0 +1,3 @@
+4	/data/ca.key
+24	/data/certs
+1399428	/data/vibe

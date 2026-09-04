@@ -24,3 +24,7 @@ The result must be checked at the SQL workload level before attributing a gain.
 Tests cover lengths 0–257, all eight alignments, every mismatch position with
 both high and low differing bits, and both unequal-length orientations. Existing
 compact-codec and primary-leaf format/mutation tests also pass (3.159 seconds).
+
+The [full SQL comparison](../crdb-sql-2026-09-04-prefix/README.md) verifies all
+results and shows a modest update-median gain, with worse C8 latency tails.
+It does not establish a universal database performance improvement.
