@@ -105,7 +105,7 @@ func (runtime *Runtime) openDDL() error {
 	if config.PGDDLSocket == "" {
 		return nil
 	}
-	run := newGatewayDevDDL(config.PGDDLSocket, runtime.authority, runtime.schemaDDL)
+	run := newGatewayDevDDL(config.PGDDLSocket, runtime.authority, runtime.schemaDDL, config.Logf)
 	// Check the original actor at the common local/forwarded DDL boundary.
 	// Schema recovery itself keeps its persisted owner principal unchanged.
 	runtime.pgDDL = func(ctx context.Context, actor serviceauthz.Authority, text string) error {

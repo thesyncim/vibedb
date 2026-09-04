@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	sqlast "github.com/thesyncim/vibedb/sql"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
@@ -20,6 +21,7 @@ import (
 
 func newGatewayDevDDL(socket string, authority *gateway.ReplicatedCatalogAuthority,
 	schema *gatewaySchemaDDLRuntime,
+	loggers ...func(string, ...any),
 ) func(context.Context, serviceauthz.Authority, string) error {
 	var mu sync.Mutex
 	transport := &http.Transport{DisableKeepAlives: true, DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -117,14 +119,15 @@ func newGatewayDevDDL(socket string, authority *gateway.ReplicatedCatalogAuthori
 		}
 		return registerGatewayDevTable(ctx, func(ctx context.Context) error {
 			return authority.RegisterProvisionedTable(ctx, addition)
-		})
+		}, loggers...)
 	}
 }
 
 // Both online CREATE and restart wait for an authenticated serving fence.
 // Retry only election/read-index transients, within the caller's deadline;
 // malformed schemas and deterministic refusals must never become busy loops.
-func registerGatewayDevTable(ctx context.Context, register func(context.Context) error) error {
+func registerGatewayDevTable(ctx context.Context, register func(context.Context) error, loggers ...func(string, ...any)) error {
+	reported := false
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -133,7 +136,23 @@ func registerGatewayDevTable(ctx context.Context, register func(context.Context)
 		if err == nil {
 			return nil
 		}
-		if !errors.Is(err, gateway.ErrReplicatedLeader) && !errors.Is(err, gateway.ErrReplicatedReadBehind) {
+		retryable := gateway.IsReplicatedReadRetryable(err)
+		if !reported && len(loggers) == 1 && loggers[0] != nil {
+			// Report bounded categories once. Do not emit SQL, manifest bytes,
+			// identities, endpoints, or the possibly large joined error text.
+			var refusal *gateway.ReplicatedRefusalError
+			code := -1
+			if errors.As(err, &refusal) && refusal != nil {
+				code = int(refusal.Code)
+			}
+			loggers[0]("gateway: table registration pending retryable=%t refusal=%d leader=%t read_behind=%t invalid_route=%t stale_fence=%t unauthorized=%t buffer_bound=%t catalog_pending=%t",
+				retryable, code, errors.Is(err, gateway.ErrReplicatedLeader), errors.Is(err, gateway.ErrReplicatedReadBehind),
+				errors.Is(err, gateway.ErrReplicatedRoute), errors.Is(err, raftservice.ErrServingFence),
+				errors.Is(err, gateway.ErrReplicatedUnauthorized), errors.Is(err, gateway.ErrReplicatedReadBufferBound),
+				errors.Is(err, gateway.ErrReplicatedCatalogPending))
+			reported = true
+		}
+		if !retryable {
 			return err
 		}
 		timer := time.NewTimer(100 * time.Millisecond)

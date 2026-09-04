@@ -165,7 +165,7 @@ func (runtime *Runtime) open() error {
 			registerCtx, cancel := context.WithTimeout(runtime.ctx, time.Minute)
 			registerErr = registerGatewayDevTable(registerCtx, func(ctx context.Context) error {
 				return runtime.authority.RegisterProvisionedTable(ctx, addition)
-			})
+			}, runtime.config.Logf)
 			cancel()
 		}
 		if registerErr != nil {

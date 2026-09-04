@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/raftservice"
+	"github.com/thesyncim/vibedb/shardservice"
 )
 
 func TestGatewayDevTableRegistrationWaitsForServingFence(t *testing.T) {
@@ -33,6 +36,24 @@ func TestGatewayDevTableRegistrationDoesNotRetryRefusal(t *testing.T) {
 	})
 	if !errors.Is(err, gateway.ErrInvalidCatalog) || calls != 1 {
 		t.Fatalf("registration calls=%d err=%v", calls, err)
+	}
+}
+
+func TestGatewayDevTableRegistrationDoesNotHideJoinedRefusalOrUnknown(t *testing.T) {
+	for _, terminal := range []error{gateway.ErrReplicatedRoute, gateway.ErrReplicatedUnauthorized,
+		raftservice.ErrServingFence, gateway.ErrReplicatedReadBufferBound,
+		gateway.ErrReplicatedCatalogPending, raftservice.ErrOutcomeUnknown,
+		&gateway.ReplicatedRefusalError{Code: shardservice.ReplicatedRefusalRequestLedgerReadMalformed},
+	} {
+		ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+		failure := errors.Join(gateway.ErrReplicatedLeader, terminal)
+		calls, diagnostics := 0, 0
+		err := registerGatewayDevTable(ctx, func(context.Context) error { calls++; return failure },
+			func(string, ...any) { diagnostics++ })
+		cancel()
+		if err != failure || calls != 1 || diagnostics != 1 {
+			t.Fatalf("registration hid or retried failure: err=%v calls=%d diagnostics=%d", err, calls, diagnostics)
+		}
 	}
 }
 
