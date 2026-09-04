@@ -49,10 +49,14 @@ type Submission struct {
 	descriptor   GroupDescriptor
 	catalog      descriptorCatalogCandidate
 	snapshot     *pb.Snapshot
-	state        atomic.Uint32
-	ticket       atomic.Uint64
-	err          error
-	done         chan struct{}
+	// queuedAt is published before the ring sequence. Its monotonic component
+	// makes queue delay immune to UTC wall-clock steps. It is diagnostic only;
+	// no ordering or durability decision depends on it.
+	queuedAt time.Time
+	state    atomic.Uint32
+	ticket   atomic.Uint64
+	err      error
+	done     chan struct{}
 }
 
 // Initialize allocates the cold-path wait edge. The Submission itself remains
@@ -254,6 +258,207 @@ type submissionRingSlot struct {
 	_        [48]byte
 }
 
+// NodeSubmissionSequencerStats is a detached, fixed-size diagnostics snapshot
+// for one node submission lane. Counters are read from atomics, while queue,
+// ownership and closed fields are current atomic or immutable gauges, so
+// callers may collect the snapshot while producers and the worker are active.
+// The ReadyWaveGroupHistogram index is the number of groups actually appended
+// in an observed Ready frame, excluding idempotent retries; index zero is
+// unused. Snapshot fields are sampled independently, so counter relationships
+// need only hold after the relevant work has completed. QueueDepth is a bounded
+// estimate of reserved tickets that have not been dequeued, excluding service.
+//
+// ReadyWavesSucceeded counts accepted Ready waves whose persistence call
+// returned nil, including an exact idempotent retry which did not append.
+// ReadyPersistAttempts/Successes/Failures count individual persistence calls,
+// including backpressure retries and panics. Wave counters count the complete
+// operation across those attempts. Wave duration includes retry waits; persist
+// duration excludes waits between calls. Queue wait excludes wave service.
+// ReadyDurableWaves and ReadyWaveGroupHistogram count only waves for which the
+// underlying engine sequence advanced. ObservedAppendBarriers therefore
+// reports successful append barriers rather than treating coalesced
+// submissions as syncs. It excludes rotation and sealer metadata syncs, which
+// do not advance the append sequence. A failed call may still contribute to
+// these append counters if the engine advanced before the caller observed the
+// error. Conversely, a poisoned engine suppresses its witness, so some
+// post-sync failures contribute no append count. These are lower-bound
+// observations, not total device sync counts or unknown-outcome resolution.
+type NodeSubmissionSequencerStats struct {
+	SubmissionAttempts            uint64
+	AcceptedSubmissions           uint64
+	RejectedSubmissions           uint64
+	BackpressureSubmissions       uint64
+	ReadySubmissions              uint64
+	ControlSubmissions            uint64
+	ReadyQueueWaitNanos           uint64
+	ControlQueueWaitNanos         uint64
+	ReadyWavesAttempted           uint64
+	ReadyPersistAttempts          uint64
+	ReadyWavesSucceeded           uint64
+	ReadyWavesFailed              uint64
+	ReadyPersistSuccesses         uint64
+	ReadyPersistFailures          uint64
+	ReadyDurableWaves             uint64
+	FailedWaves                   uint64
+	ControlWavesAttempted         uint64
+	ControlPersistAttempts        uint64
+	ControlWavesSucceeded         uint64
+	ControlWavesFailed            uint64
+	ControlPersistSuccesses       uint64
+	ControlPersistFailures        uint64
+	ObservedAppendBarriers        uint64
+	ReadyObservedAppendBarriers   uint64
+	ControlObservedAppendBarriers uint64
+	ReadyPersistDurationNanos     uint64
+	ControlPersistDurationNanos   uint64
+	ReadyWaveDurationNanos        uint64
+	ControlWaveDurationNanos      uint64
+	ReadyWaveGroupHistogram       [MaxPersistGroupBatches + 1]uint64
+	MultiGroupWaves               uint64
+	QueueDepth                    uint64
+	QueueCapacity                 uint64
+	ActiveSubmitters              int64
+	MaintenanceLaneClaimed        bool
+	Closed                        bool
+	CheckpointQueueSubmissions    uint64
+	CheckpointQueueRejected       uint64
+	CheckpointQueueWaitNanos      uint64
+	CheckpointServiceNanos        uint64
+}
+
+// nodeSequencerCounters is kept separate from the public snapshot so no
+// atomic values are copied. It also keeps the hot producer and worker paths
+// allocation-free while Stats loads a detached value.
+type nodeSequencerCounters struct {
+	submissionAttempts            atomic.Uint64
+	acceptedSubmissions           atomic.Uint64
+	rejectedSubmissions           atomic.Uint64
+	backpressureSubmissions       atomic.Uint64
+	readySubmissions              atomic.Uint64
+	controlSubmissions            atomic.Uint64
+	readyQueueWaitNanos           atomic.Uint64
+	controlQueueWaitNanos         atomic.Uint64
+	readyWavesAttempted           atomic.Uint64
+	readyPersistAttempts          atomic.Uint64
+	readyWavesSucceeded           atomic.Uint64
+	readyWavesFailed              atomic.Uint64
+	readyPersistSuccesses         atomic.Uint64
+	readyPersistFailures          atomic.Uint64
+	readyDurableWaves             atomic.Uint64
+	failedWaves                   atomic.Uint64
+	controlWavesAttempted         atomic.Uint64
+	controlPersistAttempts        atomic.Uint64
+	controlWavesSucceeded         atomic.Uint64
+	controlWavesFailed            atomic.Uint64
+	controlPersistSuccesses       atomic.Uint64
+	controlPersistFailures        atomic.Uint64
+	observedAppendBarriers        atomic.Uint64
+	readyObservedAppendBarriers   atomic.Uint64
+	controlObservedAppendBarriers atomic.Uint64
+	readyPersistDurationNanos     atomic.Uint64
+	controlPersistDurationNanos   atomic.Uint64
+	readyWaveDurationNanos        atomic.Uint64
+	controlWaveDurationNanos      atomic.Uint64
+	readyWaveGroupHistogram       [MaxPersistGroupBatches + 1]atomic.Uint64
+	multiGroupWaves               atomic.Uint64
+	checkpointQueueSubmissions    atomic.Uint64
+	checkpointQueueRejected       atomic.Uint64
+	checkpointQueueWaitNanos      atomic.Uint64
+	checkpointServiceNanos        atomic.Uint64
+}
+
+// Stats returns a detached diagnostics snapshot without acquiring the node
+// store or sequencer locks. It is safe to call concurrently with submission,
+// persistence, checkpoint observation, and Close.
+func (q *NodeSubmissionSequencer) Stats() NodeSubmissionSequencerStats {
+	if q == nil {
+		return NodeSubmissionSequencerStats{}
+	}
+	c := &q.stats
+	var result NodeSubmissionSequencerStats
+	result.SubmissionAttempts = c.submissionAttempts.Load()
+	result.AcceptedSubmissions = c.acceptedSubmissions.Load()
+	result.RejectedSubmissions = c.rejectedSubmissions.Load()
+	result.BackpressureSubmissions = c.backpressureSubmissions.Load()
+	result.ReadySubmissions = c.readySubmissions.Load()
+	result.ControlSubmissions = c.controlSubmissions.Load()
+	result.ReadyQueueWaitNanos = c.readyQueueWaitNanos.Load()
+	result.ControlQueueWaitNanos = c.controlQueueWaitNanos.Load()
+	result.ReadyWavesAttempted = c.readyWavesAttempted.Load()
+	result.ReadyPersistAttempts = c.readyPersistAttempts.Load()
+	result.ReadyWavesSucceeded = c.readyWavesSucceeded.Load()
+	result.ReadyWavesFailed = c.readyWavesFailed.Load()
+	result.ReadyPersistSuccesses = c.readyPersistSuccesses.Load()
+	result.ReadyPersistFailures = c.readyPersistFailures.Load()
+	result.ReadyDurableWaves = c.readyDurableWaves.Load()
+	result.FailedWaves = c.failedWaves.Load()
+	result.ControlWavesAttempted = c.controlWavesAttempted.Load()
+	result.ControlPersistAttempts = c.controlPersistAttempts.Load()
+	result.ControlWavesSucceeded = c.controlWavesSucceeded.Load()
+	result.ControlWavesFailed = c.controlWavesFailed.Load()
+	result.ControlPersistSuccesses = c.controlPersistSuccesses.Load()
+	result.ControlPersistFailures = c.controlPersistFailures.Load()
+	result.ObservedAppendBarriers = c.observedAppendBarriers.Load()
+	result.ReadyObservedAppendBarriers = c.readyObservedAppendBarriers.Load()
+	result.ControlObservedAppendBarriers = c.controlObservedAppendBarriers.Load()
+	result.ReadyPersistDurationNanos = c.readyPersistDurationNanos.Load()
+	result.ControlPersistDurationNanos = c.controlPersistDurationNanos.Load()
+	result.ReadyWaveDurationNanos = c.readyWaveDurationNanos.Load()
+	result.ControlWaveDurationNanos = c.controlWaveDurationNanos.Load()
+	for i := range result.ReadyWaveGroupHistogram {
+		result.ReadyWaveGroupHistogram[i] = c.readyWaveGroupHistogram[i].Load()
+	}
+	result.MultiGroupWaves = c.multiGroupWaves.Load()
+	result.QueueCapacity = uint64(len(q.ring))
+	// Read head first: tail-first sampling can subtract a newer head from an
+	// older tail and underflow. Concurrent progress can still overestimate
+	// depth, so bound the estimate by the fixed ring capacity.
+	head := q.head.value.Load()
+	result.QueueDepth = min(q.tail.value.Load()-head, result.QueueCapacity)
+	result.ActiveSubmitters = q.submitters.Load()
+	result.MaintenanceLaneClaimed = q.maintenanceOwner.Load()
+	result.Closed = q.closed.Load()
+	result.CheckpointQueueSubmissions = c.checkpointQueueSubmissions.Load()
+	result.CheckpointQueueRejected = c.checkpointQueueRejected.Load()
+	result.CheckpointQueueWaitNanos = c.checkpointQueueWaitNanos.Load()
+	result.CheckpointServiceNanos = c.checkpointServiceNanos.Load()
+	return result
+}
+
+// ObserveCheckpointQueueSubmission records one accepted checkpoint capture
+// task. It is called by the node-wide checkpoint coordinator after its bounded
+// channel accepts the task.
+func (q *NodeSubmissionSequencer) ObserveCheckpointQueueSubmission() {
+	if q != nil {
+		q.stats.checkpointQueueSubmissions.Add(1)
+	}
+}
+
+// ObserveCheckpointQueueRejected records a checkpoint capture task rejected
+// by the bounded coordinator queue.
+func (q *NodeSubmissionSequencer) ObserveCheckpointQueueRejected() {
+	if q != nil {
+		q.stats.checkpointQueueRejected.Add(1)
+	}
+}
+
+// ObserveCheckpointQueueWait records time spent waiting in the checkpoint
+// coordinator queue. Nonpositive durations are ignored so a wall-clock step
+// cannot turn diagnostics into a huge unsigned value.
+func (q *NodeSubmissionSequencer) ObserveCheckpointQueueWait(wait time.Duration) {
+	if q != nil && wait > 0 {
+		q.stats.checkpointQueueWaitNanos.Add(uint64(wait))
+	}
+}
+
+// ObserveCheckpointService records time spent capturing one application
+// checkpoint after it leaves the bounded queue.
+func (q *NodeSubmissionSequencer) ObserveCheckpointService(duration time.Duration) {
+	if q != nil && duration > 0 {
+		q.stats.checkpointServiceNanos.Add(uint64(duration))
+	}
+}
+
 type NodeSubmissionSequencer struct {
 	store *NodeStore
 	ring  []submissionRingSlot
@@ -273,6 +478,7 @@ type NodeSubmissionSequencer struct {
 	wakeMu           sync.Mutex
 	ownerWakes       atomic.Pointer[nodeSequencerWakeSet]
 	maintenanceOwner atomic.Bool
+	stats            nodeSequencerCounters
 
 	persist func([]NodeReady) error
 
@@ -494,9 +700,111 @@ func (q *NodeSubmissionSequencer) signal() {
 	}
 }
 
+func sequencerDurationNanos(duration time.Duration) uint64 {
+	if duration <= 0 {
+		return 0
+	}
+	return uint64(duration)
+}
+
+// engineAppendWitness is intentionally sampled only by the single sequencer
+// worker. The engine samples sequence and actual appended group count under
+// its write mutex, including synchronization with background sealer failures.
+// Injected persistence functions which do not call the engine provide no
+// append witness.
+func (q *NodeSubmissionSequencer) engineAppendWitness() (sequence uint64, groups int) {
+	if q == nil || q.store == nil || q.store.engine == nil {
+		return 0, 0
+	}
+	return q.store.engine.AppendWitness()
+}
+
+func (q *NodeSubmissionSequencer) observeEngineSequence(before, after uint64, ready bool) uint64 {
+	if after < before {
+		return 0
+	}
+	delta := after - before
+	if delta == 0 {
+		return 0
+	}
+	q.stats.observedAppendBarriers.Add(delta)
+	if ready {
+		q.stats.readyObservedAppendBarriers.Add(delta)
+	} else {
+		q.stats.controlObservedAppendBarriers.Add(delta)
+	}
+	return delta
+}
+
+func (q *NodeSubmissionSequencer) observeReadyPersist(ready []NodeReady) (err error) {
+	q.stats.readyPersistAttempts.Add(1)
+	started := time.Now()
+	// A panic bypasses the named return assignment. Count that attempt as a
+	// failure while leaving the existing runWave recovery policy unchanged.
+	err = ErrSubmissionPanic
+	defer func() {
+		q.stats.readyPersistDurationNanos.Add(sequencerDurationNanos(time.Since(started)))
+		if err == nil {
+			q.stats.readyPersistSuccesses.Add(1)
+		} else {
+			q.stats.readyPersistFailures.Add(1)
+		}
+	}()
+	return q.persist(ready)
+}
+
+func (q *NodeSubmissionSequencer) observeControlPersist(s *Submission) (err error) {
+	q.stats.controlPersistAttempts.Add(1)
+	started := time.Now()
+	err = ErrSubmissionPanic
+	defer func() {
+		q.stats.controlPersistDurationNanos.Add(sequencerDurationNanos(time.Since(started)))
+		if err == nil {
+			q.stats.controlPersistSuccesses.Add(1)
+		} else {
+			q.stats.controlPersistFailures.Add(1)
+		}
+	}()
+	switch s.kind {
+	case submissionBeginIncarnations:
+		return q.store.beginIncarnationsSequenced(s.groups[:s.count], s.incarnations[:s.count])
+	case submissionPersistIncarnations:
+		return q.store.persistIncarnationsSequenced(s.incarnations[:s.count])
+	case submissionRegisterGroup:
+		incarnation, registerErr := q.store.registerGroupSequenced(s.descriptor, s.snapshot)
+		if registerErr == nil {
+			s.incarnations[0] = incarnation
+			d, ok := q.store.descriptorForLogKey(incarnation.GroupID)
+			if !ok {
+				return ErrCorrupt
+			}
+			s.descriptor = d
+		}
+		return registerErr
+	case submissionDescriptorCatalog:
+		return q.store.publishDescriptorCatalogReferenceLocked(s.catalog, true)
+	case submissionCheckpoint:
+		return q.store.publishGroupCheckpointSequenced(s.groups[0], s.snapshot)
+	default:
+		return ErrInvalid
+	}
+}
+
+func (q *NodeSubmissionSequencer) rejectSubmission(err error) (uint64, error) {
+	q.stats.rejectedSubmissions.Add(1)
+	if errors.Is(err, ErrSubmissionBackpressure) {
+		q.stats.backpressureSubmissions.Add(1)
+	}
+	return 0, err
+}
+
 func (q *NodeSubmissionSequencer) TrySubmit(submission *Submission) (uint64, error) {
-	if q == nil || submission == nil || submission.done == nil {
+	if q == nil {
 		return 0, ErrInvalid
+	}
+	q.stats.submissionAttempts.Add(1)
+	if submission == nil || submission.done == nil {
+		return q.rejectSubmission(ErrInvalid)
 	}
 	q.submitters.Add(1)
 	defer func() {
@@ -505,25 +813,25 @@ func (q *NodeSubmissionSequencer) TrySubmit(submission *Submission) (uint64, err
 		}
 	}()
 	if fatal := q.fatal.Load(); fatal != nil {
-		return 0, errors.Join(ErrPersistenceUnknown, fatal.err)
+		return q.rejectSubmission(errors.Join(ErrPersistenceUnknown, fatal.err))
 	}
 	if q.closed.Load() {
-		return 0, ErrClosed
+		return q.rejectSubmission(ErrClosed)
 	}
 	state := submission.state.Load()
 	if state != submissionIdle {
 		if state == submissionQueued || state == submissionWaiting {
-			return 0, ErrSubmissionPending
+			return q.rejectSubmission(ErrSubmissionPending)
 		}
-		return 0, ErrInvalid
+		return q.rejectSubmission(ErrInvalid)
 	}
 	if submission.kind == submissionReady {
 		if _, err := q.store.readyWaveAdmission(submission.Ready); err != nil {
-			return 0, err
+			return q.rejectSubmission(err)
 		}
 	}
 	if !submission.state.CompareAndSwap(submissionIdle, submissionQueued) {
-		return 0, ErrSubmissionPending
+		return q.rejectSubmission(ErrSubmissionPending)
 	}
 	if q.submitHookTest != nil {
 		q.submitHookTest()
@@ -534,7 +842,7 @@ func (q *NodeSubmissionSequencer) TrySubmit(submission *Submission) (uint64, err
 		// most capacity outstanding tickets, it remains correct across wrap.
 		if position-q.head.value.Load() >= uint64(len(q.ring)) {
 			submission.state.Store(submissionIdle)
-			return 0, ErrSubmissionBackpressure
+			return q.rejectSubmission(ErrSubmissionBackpressure)
 		}
 		if q.tail.value.CompareAndSwap(position, position+1) {
 			ticket := position + 1
@@ -543,14 +851,23 @@ func (q *NodeSubmissionSequencer) TrySubmit(submission *Submission) (uint64, err
 				q.claimedHookTest()
 			}
 			slot.value = submission
+			submission.queuedAt = time.Now()
 			submission.ticket.Store(ticket)
+			q.stats.acceptedSubmissions.Add(1)
+			if submission.kind == submissionReady {
+				q.stats.readySubmissions.Add(1)
+			} else {
+				q.stats.controlSubmissions.Add(1)
+			}
+			// Publication lets the consumer complete this cell and its caller
+			// immediately prepare it again. Never read the cell after this edge.
 			slot.sequence.Store(ticket)
 			q.signal()
 			return ticket, nil
 		}
 	}
 	submission.state.Store(submissionIdle)
-	return 0, ErrSubmissionBackpressure
+	return q.rejectSubmission(ErrSubmissionBackpressure)
 }
 
 func (q *NodeSubmissionSequencer) peek() (*Submission, bool) {
@@ -606,30 +923,7 @@ func (q *NodeSubmissionSequencer) runWave(items *[MaxPersistGroupBatches]*Submis
 		}
 	}()
 	if count == 1 && items[0].kind != submissionReady {
-		s := items[0]
-		switch s.kind {
-		case submissionBeginIncarnations:
-			return q.store.beginIncarnationsSequenced(s.groups[:s.count], s.incarnations[:s.count])
-		case submissionPersistIncarnations:
-			return q.store.persistIncarnationsSequenced(s.incarnations[:s.count])
-		case submissionRegisterGroup:
-			incarnation, registerErr := q.store.registerGroupSequenced(s.descriptor, s.snapshot)
-			if registerErr == nil {
-				s.incarnations[0] = incarnation
-				d, ok := q.store.descriptorForLogKey(incarnation.GroupID)
-				if !ok {
-					return ErrCorrupt
-				}
-				s.descriptor = d
-			}
-			return registerErr
-		case submissionDescriptorCatalog:
-			return q.store.publishDescriptorCatalogReferenceLocked(s.catalog, true)
-		case submissionCheckpoint:
-			return q.store.publishGroupCheckpointSequenced(s.groups[0], s.snapshot)
-		default:
-			return ErrInvalid
-		}
+		return q.observeControlPersist(items[0])
 	}
 	for i := 0; i < count; i++ {
 		value := items[i].Ready
@@ -641,7 +935,7 @@ func (q *NodeSubmissionSequencer) runWave(items *[MaxPersistGroupBatches]*Submis
 		ready[at] = value
 	}
 	for {
-		err = q.persist(ready[:count])
+		err = q.observeReadyPersist(ready[:count])
 		if !errors.Is(err, ErrDurabilityBackpressure) {
 			break
 		}
@@ -656,6 +950,59 @@ func (q *NodeSubmissionSequencer) runWave(items *[MaxPersistGroupBatches]*Submis
 	}
 	clear(ready[:count])
 	return err
+}
+
+func (q *NodeSubmissionSequencer) observeSubmissionQueueWait(items *[MaxPersistGroupBatches]*Submission, count int) {
+	now := time.Now()
+	for i := 0; i < count; i++ {
+		queuedAt := items[i].queuedAt
+		if queuedAt.IsZero() {
+			continue
+		}
+		wait := now.Sub(queuedAt)
+		if wait <= 0 {
+			continue
+		}
+		if items[i].kind == submissionReady {
+			q.stats.readyQueueWaitNanos.Add(uint64(wait))
+		} else {
+			q.stats.controlQueueWaitNanos.Add(uint64(wait))
+		}
+	}
+}
+
+func (q *NodeSubmissionSequencer) observeWaveResult(items *[MaxPersistGroupBatches]*Submission, count int, err error, engineDelta uint64, appendedGroups int) {
+	if count == 0 {
+		return
+	}
+	ready := items[0].kind == submissionReady
+	if ready {
+		if err == nil {
+			q.stats.readyWavesSucceeded.Add(1)
+		} else {
+			q.stats.readyWavesFailed.Add(1)
+			q.stats.failedWaves.Add(1)
+		}
+		if engineDelta != 0 {
+			q.stats.readyDurableWaves.Add(engineDelta)
+			// A production Ready wave appends at most one frame. If a test
+			// persistence adapter appends more, the final witness cannot tell
+			// us the earlier frames' group counts, so do not invent them.
+			if engineDelta == 1 && appendedGroups > 0 && appendedGroups <= MaxPersistGroupBatches {
+				q.stats.readyWaveGroupHistogram[appendedGroups].Add(1)
+				if appendedGroups > 1 {
+					q.stats.multiGroupWaves.Add(1)
+				}
+			}
+		}
+		return
+	}
+	if err == nil {
+		q.stats.controlWavesSucceeded.Add(1)
+	} else {
+		q.stats.controlWavesFailed.Add(1)
+		q.stats.failedWaves.Add(1)
+	}
 }
 
 func (q *NodeSubmissionSequencer) failAccepted(err error) {
@@ -709,7 +1056,25 @@ func (q *NodeSubmissionSequencer) run() {
 			<-q.wake
 			continue
 		}
+		q.observeSubmissionQueueWait(&items, count)
+		readyWave := items[0].kind == submissionReady
+		if readyWave {
+			q.stats.readyWavesAttempted.Add(1)
+		} else {
+			q.stats.controlWavesAttempted.Add(1)
+		}
+		started := time.Now()
+		engineBefore, _ := q.engineAppendWitness()
 		err := q.runWave(&items, &ready, count)
+		engineAfter, appendedGroups := q.engineAppendWitness()
+		engineDelta := q.observeEngineSequence(engineBefore, engineAfter, readyWave)
+		waveDuration := sequencerDurationNanos(time.Since(started))
+		if readyWave {
+			q.stats.readyWaveDurationNanos.Add(waveDuration)
+		} else {
+			q.stats.controlWaveDurationNanos.Add(waveDuration)
+		}
+		q.observeWaveResult(&items, count, err, engineDelta, appendedGroups)
 		fatal := errors.Is(err, ErrPersistenceUnknown) || errors.Is(err, ErrSubmissionPanic)
 		completionErr := err
 		if fatal {

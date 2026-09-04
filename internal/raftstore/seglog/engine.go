@@ -185,6 +185,7 @@ type Engine struct {
 	waveLimit           int
 	sealHeadroom        uint64
 	sequence            uint64
+	lastAppendGroups    int
 	frameBuf            []byte
 	eventScratch        []segmentEvent
 	syncData            func(*os.File) error
@@ -802,10 +803,29 @@ func (e *Engine) LookupExact(group, index uint64) (location EntryLocation, term 
 }
 
 func (e *Engine) Sequence() uint64 {
-	if e == nil || e.log.usable() != nil {
-		return 0
+	sequence, _ := e.AppendWitness()
+	return sequence
+}
+
+// AppendWitness returns the append sequence and the group count in its last
+// successfully applied frame. It is safe to sample during persistence and
+// background sealing. The group count is zero for a recovered sequence until
+// this handle appends a new frame; an exact retry leaves both values unchanged.
+//
+// These values witness completed PersistWave data-sync fences, not every
+// device sync. Rotation, checkpoint and sealer syncs are excluded. An unusable
+// handle returns zero values, so a post-sync failure can hide an append rather
+// than provide evidence of its durability.
+func (e *Engine) AppendWitness() (sequence uint64, groups int) {
+	if e == nil {
+		return 0, 0
 	}
-	return e.sequence
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+	if e.log == nil || e.log.usable() != nil {
+		return 0, 0
+	}
+	return e.sequence, e.lastAppendGroups
 }
 
 func (e *Engine) LogID() [16]byte { return e.log.state.LogID }
@@ -914,6 +934,7 @@ func (e *Engine) PersistWave(w Wave) error {
 		}
 	}
 	e.applySequence = 0
+	e.lastAppendGroups = len(w.Batches)
 	return nil
 }
 
