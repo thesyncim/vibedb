@@ -80,6 +80,14 @@ CI workflow presence does not prove branch protection or a mandatory release
 gate. Raw CI artifacts are evidence for one run, not a benchmark publication or
 support claim.
 
+A focused SIMD check on 2026-09-04 found that
+`GOEXPERIMENT=simd go test -race -gcflags=all=-d=checkptr=2 ./internal/storeio -run '^TestCompactStreamAdaptiveAlphabetSelection$' -count=1`
+fails its alphabet point allocation assertion (`1` allocation, expected `0`)
+on clean commit `ea8665045570df3b7d3a3f9aee4d8d9bc4dba0ae` as well as the
+packed-counter SIMD change. The ordinary compact-codec tests pass; this is a
+limitation of the combined instrumented validation, not a passing full-suite
+claim.
+
 ## PostgreSQL compatibility status
 
 The pgwire adapter supports selected PostgreSQL v3 protocol behavior and client
