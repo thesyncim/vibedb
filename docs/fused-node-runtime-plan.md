@@ -245,6 +245,20 @@ Its observed gateway locality differed between orders. Writes showed no
 reproducible gain. The 1,024-row, one-table run does not qualify this tranche.
 Main `fc7548a7` was merged after measurement and is excluded from those results.
 
+The subsequent [isolated health-observation comparison](benchmarks/fused-health-2026-09-04/README.md)
+includes that main revision in both fused arms. Before `494cf2aa` and after
+`2184dca3` share the same catalog-publication race fix; only the health path
+differs. All VibeDB and shared-client binaries prove Go 1.27 with
+`GOEXPERIMENT=simd`, Linux/ARM64, and clean recorded revisions. CockroachDB runs
+on the same Linux/ARM64 Docker kernel and matched aggregate resource limits.
+After/before throughput geomeans are 1.068x and 1.136x; after/CockroachDB is
+0.607x and 0.450x. C1 update gains are 16–23%; C8 gains are 11–89%, with substantial
+order variation. Both arms are local for the first order and remote for the
+second. Two first-order p99 cells regress beyond 10%. All 120 trials / 153,600
+samples validate, but this remains a shortened single-host diagnostic and
+does not pass the tranche or full objective. Runtime health warnings remain
+in the retained logs even though health publication is active in every arm.
+
 The real Linux physical3/physical6 process test remains a failing gate.
 Both layouts create three tables and validate topology and identities.
 Physical3 acknowledges 18 writes and passes the owner PG content oracle,

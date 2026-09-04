@@ -1,0 +1,603 @@
+{
+  "schema": "vibedb.fused-health-comparison/1",
+  "status": "complete",
+  "started_utc": "2026-09-04T15:35:34.115214+00:00",
+  "finished_utc": "2026-09-04T15:39:19.278293+00:00",
+  "refs": {
+    "before": "494cf2aaf9f97779ca855833875024834f64a0d5",
+    "after": "2184dca377127f0a5a5de76d061ab410bc49470d"
+  },
+  "source": {
+    "before": {
+      "revision": "494cf2aaf9f97779ca855833875024834f64a0d5",
+      "status": "",
+      "dirty": false,
+      "patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "after": {
+      "revision": "2184dca377127f0a5a5de76d061ab410bc49470d",
+      "status": "",
+      "dirty": false,
+      "patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "client": {
+      "revision": "27b89cd661b944f6c4738a8d240ffc0ffc649483",
+      "status": "",
+      "dirty": false,
+      "patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  },
+  "orders": {
+    "before-first": [
+      "before",
+      "after",
+      "crdb"
+    ],
+    "after-first": [
+      "crdb",
+      "after",
+      "before"
+    ]
+  },
+  "limits": {
+    "NanoCpus": 12000000000,
+    "Memory": 25769803776,
+    "MemorySwap": 25769803776
+  },
+  "topology": "three physical serving processes, RF3, one SQL endpoint, single Docker host",
+  "diagnostics": "identical signal-acknowledged snapshots on both VibeDB arms",
+  "profiling": false,
+  "docker_architecture": "arm64",
+  "vibedb_build_environment": {
+    "GOOS": "linux",
+    "GOARCH": "arm64",
+    "CGO_ENABLED": "0",
+    "GOEXPERIMENT": "simd",
+    "note": "go_version identifies the cross-compiler host; benchmark executables run in Linux"
+  },
+  "go_version": "go version go1.27.0 darwin/arm64",
+  "build_binary_sha256": {
+    "candidate-vibedb": "e2fb849857a3a36ad2d649d449ea3133e41fa0b8dcebb58f8bd23584bc06d545",
+    "candidate-vibedb-gateway": "f551d3d6870c349b6f062e1fba87ed083e698b73647b1ad013f465a8934e2331",
+    "candidate-vibedb-shard": "609016aabeaa427ad8139db22f0987ebeb2749c23d8af41c8a1e2e4bdbb95252",
+    "cockroach": "7923d5eca1fc275abebd64863fa5e5c51be3504fd57f37c5b8c4f8579bd54c3e",
+    "parent-vibedb": "9fbfc5b1e6c565c9cc2e618eb1044a872512b96c87830da7870982adda59f0b6",
+    "parent-vibedb-gateway": "53863d768007ab5b2d129edf058e7ed44febb559377b1f9ef922ae4896476eea",
+    "parent-vibedb-shard": "f25ef1f9c64fa6bb0a062e4fd4ea79bbc4ed7720c74ed5718d812cd4a6782333",
+    "rf3-sqlbench": "9b70628460529c7af78be7b2249a603b6fda730444d2b852502ae4e45b1fcf2b"
+  },
+  "fixture_binary_sha256": {
+    "before": {
+      "candidate-vibedb": "9fbfc5b1e6c565c9cc2e618eb1044a872512b96c87830da7870982adda59f0b6",
+      "candidate-vibedb-gateway": "53863d768007ab5b2d129edf058e7ed44febb559377b1f9ef922ae4896476eea",
+      "candidate-vibedb-shard": "f25ef1f9c64fa6bb0a062e4fd4ea79bbc4ed7720c74ed5718d812cd4a6782333",
+      "rf3-sqlbench": "9b70628460529c7af78be7b2249a603b6fda730444d2b852502ae4e45b1fcf2b"
+    },
+    "after": {
+      "candidate-vibedb": "e2fb849857a3a36ad2d649d449ea3133e41fa0b8dcebb58f8bd23584bc06d545",
+      "candidate-vibedb-gateway": "f551d3d6870c349b6f062e1fba87ed083e698b73647b1ad013f465a8934e2331",
+      "candidate-vibedb-shard": "609016aabeaa427ad8139db22f0987ebeb2749c23d8af41c8a1e2e4bdbb95252",
+      "rf3-sqlbench": "9b70628460529c7af78be7b2249a603b6fda730444d2b852502ae4e45b1fcf2b"
+    },
+    "crdb": {
+      "candidate-vibedb": "e2fb849857a3a36ad2d649d449ea3133e41fa0b8dcebb58f8bd23584bc06d545",
+      "candidate-vibedb-gateway": "f551d3d6870c349b6f062e1fba87ed083e698b73647b1ad013f465a8934e2331",
+      "candidate-vibedb-shard": "609016aabeaa427ad8139db22f0987ebeb2749c23d8af41c8a1e2e4bdbb95252",
+      "cockroach": "7923d5eca1fc275abebd64863fa5e5c51be3504fd57f37c5b8c4f8579bd54c3e",
+      "parent-vibedb": "9fbfc5b1e6c565c9cc2e618eb1044a872512b96c87830da7870982adda59f0b6",
+      "parent-vibedb-gateway": "53863d768007ab5b2d129edf058e7ed44febb559377b1f9ef922ae4896476eea",
+      "parent-vibedb-shard": "f25ef1f9c64fa6bb0a062e4fd4ea79bbc4ed7720c74ed5718d812cd4a6782333",
+      "rf3-sqlbench": "9b70628460529c7af78be7b2249a603b6fda730444d2b852502ae4e45b1fcf2b"
+    }
+  },
+  "vibedb_build_metadata": {
+    "candidate-vibedb": "/private/tmp/vibedb-health-short-2184dca3/bin/candidate-vibedb: go1.27.0-X:simd\n\tpath\tgithub.com/thesyncim/vibedb/cmd/vibedb\n\tmod\tgithub.com/thesyncim/vibedb\tv0.0.0-20260904153423-2184dca37712\t\n\tdep\tgithub.com/cespare/xxhash/v2\tv2.3.0\th1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=\n\tdep\tgithub.com/thesyncim/vibejson\tv0.1.0\th1:Hk6Zp2RyiNuTBk7UiJ1I67ZJEpqIIiIE6J5gCUsAVc8=\n\tdep\tgo.etcd.io/raft/v3\tv3.7.0\th1:BGzlwx07bLv8PW6OU5HObuz1y4hlPZUXA07pM1mPUh4=\n\tdep\tgolang.org/x/sys\tv0.47.0\th1:o7XGOvZQCADBQQ4Y7VNq2dRWQR7JmOUW8Kxx4ZsNgWs=\n\tdep\tgoogle.golang.org/protobuf\tv1.36.11\th1:fV6ZwhNocDyBLK0dj+fg8ektcVegBBuEolpbTQyBNVE=\n\tbuild\t-buildmode=exe\n\tbuild\t-compiler=gc\n\tbuild\t-trimpath=true\n\tbuild\tCGO_ENABLED=0\n\tbuild\tGOARCH=arm64\n\tbuild\tGOEXPERIMENT=simd\n\tbuild\tGOOS=linux\n\tbuild\tGOARM64=v8.0\n\tbuild\tvcs=git\n\tbuild\tvcs.revision=2184dca377127f0a5a5de76d061ab410bc49470d\n\tbuild\tvcs.time=2026-09-04T15:34:23Z\n\tbuild\tvcs.modified=false",
+    "candidate-vibedb-gateway": "/private/tmp/vibedb-health-short-2184dca3/bin/candidate-vibedb-gateway: go1.27.0-X:simd\n\tpath\tgithub.com/thesyncim/vibedb/cmd/vibedb-gateway\n\tmod\tgithub.com/thesyncim/vibedb\tv0.0.0-20260904153423-2184dca37712\t\n\tdep\tgithub.com/cespare/xxhash/v2\tv2.3.0\th1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=\n\tdep\tgithub.com/thesyncim/vibejson\tv0.1.0\th1:Hk6Zp2RyiNuTBk7UiJ1I67ZJEpqIIiIE6J5gCUsAVc8=\n\tdep\tgo.etcd.io/raft/v3\tv3.7.0\th1:BGzlwx07bLv8PW6OU5HObuz1y4hlPZUXA07pM1mPUh4=\n\tdep\tgolang.org/x/sys\tv0.47.0\th1:o7XGOvZQCADBQQ4Y7VNq2dRWQR7JmOUW8Kxx4ZsNgWs=\n\tdep\tgoogle.golang.org/protobuf\tv1.36.11\th1:fV6ZwhNocDyBLK0dj+fg8ektcVegBBuEolpbTQyBNVE=\n\tbuild\t-buildmode=exe\n\tbuild\t-compiler=gc\n\tbuild\t-trimpath=true\n\tbuild\tCGO_ENABLED=0\n\tbuild\tGOARCH=arm64\n\tbuild\tGOEXPERIMENT=simd\n\tbuild\tGOOS=linux\n\tbuild\tGOARM64=v8.0\n\tbuild\tvcs=git\n\tbuild\tvcs.revision=2184dca377127f0a5a5de76d061ab410bc49470d\n\tbuild\tvcs.time=2026-09-04T15:34:23Z\n\tbuild\tvcs.modified=false",
+    "candidate-vibedb-shard": "/private/tmp/vibedb-health-short-2184dca3/bin/candidate-vibedb-shard: go1.27.0-X:simd\n\tpath\tgithub.com/thesyncim/vibedb/cmd/vibedb-shard\n\tmod\tgithub.com/thesyncim/vibedb\tv0.0.0-20260904153423-2184dca37712\t\n\tdep\tgithub.com/cespare/xxhash/v2\tv2.3.0\th1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=\n\tdep\tgithub.com/thesyncim/vibejson\tv0.1.0\th1:Hk6Zp2RyiNuTBk7UiJ1I67ZJEpqIIiIE6J5gCUsAVc8=\n\tdep\tgo.etcd.io/raft/v3\tv3.7.0\th1:BGzlwx07bLv8PW6OU5HObuz1y4hlPZUXA07pM1mPUh4=\n\tdep\tgolang.org/x/sys\tv0.47.0\th1:o7XGOvZQCADBQQ4Y7VNq2dRWQR7JmOUW8Kxx4ZsNgWs=\n\tdep\tgoogle.golang.org/protobuf\tv1.36.11\th1:fV6ZwhNocDyBLK0dj+fg8ektcVegBBuEolpbTQyBNVE=\n\tbuild\t-buildmode=exe\n\tbuild\t-compiler=gc\n\tbuild\t-trimpath=true\n\tbuild\tCGO_ENABLED=0\n\tbuild\tGOARCH=arm64\n\tbuild\tGOEXPERIMENT=simd\n\tbuild\tGOOS=linux\n\tbuild\tGOARM64=v8.0\n\tbuild\tvcs=git\n\tbuild\tvcs.revision=2184dca377127f0a5a5de76d061ab410bc49470d\n\tbuild\tvcs.time=2026-09-04T15:34:23Z\n\tbuild\tvcs.modified=false",
+    "parent-vibedb": "/private/tmp/vibedb-health-short-2184dca3/bin/parent-vibedb: go1.27.0-X:simd\n\tpath\tgithub.com/thesyncim/vibedb/cmd/vibedb\n\tmod\tgithub.com/thesyncim/vibedb\tv0.0.0-20260904153452-494cf2aaf9f9\t\n\tdep\tgithub.com/cespare/xxhash/v2\tv2.3.0\th1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=\n\tdep\tgithub.com/thesyncim/vibejson\tv0.1.0\th1:Hk6Zp2RyiNuTBk7UiJ1I67ZJEpqIIiIE6J5gCUsAVc8=\n\tdep\tgo.etcd.io/raft/v3\tv3.7.0\th1:BGzlwx07bLv8PW6OU5HObuz1y4hlPZUXA07pM1mPUh4=\n\tdep\tgolang.org/x/sys\tv0.47.0\th1:o7XGOvZQCADBQQ4Y7VNq2dRWQR7JmOUW8Kxx4ZsNgWs=\n\tdep\tgoogle.golang.org/protobuf\tv1.36.11\th1:fV6ZwhNocDyBLK0dj+fg8ektcVegBBuEolpbTQyBNVE=\n\tbuild\t-buildmode=exe\n\tbuild\t-compiler=gc\n\tbuild\t-trimpath=true\n\tbuild\tCGO_ENABLED=0\n\tbuild\tGOARCH=arm64\n\tbuild\tGOEXPERIMENT=simd\n\tbuild\tGOOS=linux\n\tbuild\tGOARM64=v8.0\n\tbuild\tvcs=git\n\tbuild\tvcs.revision=494cf2aaf9f97779ca855833875024834f64a0d5\n\tbuild\tvcs.time=2026-09-04T15:34:52Z\n\tbuild\tvcs.modified=false",
+    "parent-vibedb-gateway": "/private/tmp/vibedb-health-short-2184dca3/bin/parent-vibedb-gateway: go1.27.0-X:simd\n\tpath\tgithub.com/thesyncim/vibedb/cmd/vibedb-gateway\n\tmod\tgithub.com/thesyncim/vibedb\tv0.0.0-20260904153452-494cf2aaf9f9\t\n\tdep\tgithub.com/cespare/xxhash/v2\tv2.3.0\th1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=\n\tdep\tgithub.com/thesyncim/vibejson\tv0.1.0\th1:Hk6Zp2RyiNuTBk7UiJ1I67ZJEpqIIiIE6J5gCUsAVc8=\n\tdep\tgo.etcd.io/raft/v3\tv3.7.0\th1:BGzlwx07bLv8PW6OU5HObuz1y4hlPZUXA07pM1mPUh4=\n\tdep\tgolang.org/x/sys\tv0.47.0\th1:o7XGOvZQCADBQQ4Y7VNq2dRWQR7JmOUW8Kxx4ZsNgWs=\n\tdep\tgoogle.golang.org/protobuf\tv1.36.11\th1:fV6ZwhNocDyBLK0dj+fg8ektcVegBBuEolpbTQyBNVE=\n\tbuild\t-buildmode=exe\n\tbuild\t-compiler=gc\n\tbuild\t-trimpath=true\n\tbuild\tCGO_ENABLED=0\n\tbuild\tGOARCH=arm64\n\tbuild\tGOEXPERIMENT=simd\n\tbuild\tGOOS=linux\n\tbuild\tGOARM64=v8.0\n\tbuild\tvcs=git\n\tbuild\tvcs.revision=494cf2aaf9f97779ca855833875024834f64a0d5\n\tbuild\tvcs.time=2026-09-04T15:34:52Z\n\tbuild\tvcs.modified=false",
+    "parent-vibedb-shard": "/private/tmp/vibedb-health-short-2184dca3/bin/parent-vibedb-shard: go1.27.0-X:simd\n\tpath\tgithub.com/thesyncim/vibedb/cmd/vibedb-shard\n\tmod\tgithub.com/thesyncim/vibedb\tv0.0.0-20260904153452-494cf2aaf9f9\t\n\tdep\tgithub.com/cespare/xxhash/v2\tv2.3.0\th1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=\n\tdep\tgithub.com/thesyncim/vibejson\tv0.1.0\th1:Hk6Zp2RyiNuTBk7UiJ1I67ZJEpqIIiIE6J5gCUsAVc8=\n\tdep\tgo.etcd.io/raft/v3\tv3.7.0\th1:BGzlwx07bLv8PW6OU5HObuz1y4hlPZUXA07pM1mPUh4=\n\tdep\tgolang.org/x/sys\tv0.47.0\th1:o7XGOvZQCADBQQ4Y7VNq2dRWQR7JmOUW8Kxx4ZsNgWs=\n\tdep\tgoogle.golang.org/protobuf\tv1.36.11\th1:fV6ZwhNocDyBLK0dj+fg8ektcVegBBuEolpbTQyBNVE=\n\tbuild\t-buildmode=exe\n\tbuild\t-compiler=gc\n\tbuild\t-trimpath=true\n\tbuild\tCGO_ENABLED=0\n\tbuild\tGOARCH=arm64\n\tbuild\tGOEXPERIMENT=simd\n\tbuild\tGOOS=linux\n\tbuild\tGOARM64=v8.0\n\tbuild\tvcs=git\n\tbuild\tvcs.revision=494cf2aaf9f97779ca855833875024834f64a0d5\n\tbuild\tvcs.time=2026-09-04T15:34:52Z\n\tbuild\tvcs.modified=false",
+    "rf3-sqlbench": "/private/tmp/vibedb-health-short-2184dca3/bin/rf3-sqlbench: go1.27.0-X:simd\n\tpath\tgithub.com/thesyncim/vibedb/integration/pgclient/cmd/rf3-sqlbench\n\tmod\tgithub.com/thesyncim/vibedb/integration/pgclient\tv0.0.0-20260904142759-27b89cd661b9\t\n\tdep\tgithub.com/jackc/pgpassfile\tv1.0.0\th1:/6Hmqy13Ss2zCq62VdNG8tM1wchn8zjSGOBJ6icpsIM=\n\tdep\tgithub.com/jackc/pgservicefile\tv0.0.0-20240606120523-5a60cdf6a761\th1:iCEnooe7UlwOQYpKFhBabPMi4aNAfoODPEFNiAnClxo=\n\tdep\tgithub.com/jackc/pgx/v5\tv5.10.0\th1:VhSvgU2jSli8o3AqIEOTJr7rZwAEUVo4E4XhR94Zfr0=\n\tdep\tgolang.org/x/text\tv0.29.0\th1:1neNs90w9YzJ9BocxfsQNHKuAT4pkghyXc4nhZ6sJvk=\n\tbuild\t-buildmode=exe\n\tbuild\t-compiler=gc\n\tbuild\t-trimpath=true\n\tbuild\tCGO_ENABLED=0\n\tbuild\tGOARCH=arm64\n\tbuild\tGOEXPERIMENT=simd\n\tbuild\tGOOS=linux\n\tbuild\tGOARM64=v8.0\n\tbuild\tvcs=git\n\tbuild\tvcs.revision=27b89cd661b944f6c4738a8d240ffc0ffc649483\n\tbuild\tvcs.time=2026-09-04T14:27:59Z\n\tbuild\tvcs.modified=false"
+  },
+  "executable_formats": "/private/tmp/vibedb-health-short-2184dca3/bin/parent-vibedb-shard:    ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, Go BuildID=1PimsXGd3ddlxeU8JjoL/jjzD_IvYxF-VodM8q4Bs/t0Wmyxl1FstWqss8Hnwc/WC1RdQgvV8xMUZMBkZjJ, BuildID[sha1]=2318044051ad14ab68475cef1de85baba2bfc737, with debug_info, not stripped\n/private/tmp/vibedb-health-short-2184dca3/bin/candidate-vibedb-shard: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, Go BuildID=zdgssXQ2L6-iVFxx2FeM/KM0XuSbtZC1MmllEcK-5/NZcyvFDDYFFuMc_ohin0/ZZy7XGAW2CacrF_YOBzb, BuildID[sha1]=8fc3c7bdfeb81251e73ad3d57e5de3ab232a5cc1, with debug_info, not stripped\n/private/tmp/vibedb-health-short-2184dca3/bin/cockroach:              ELF 64-bit LSB executable, ARM aarch64, version 1 (GNU/Linux), dynamically linked, interpreter /lib/ld-linux-aarch64.so.1, for GNU/Linux 3.10.108, Go BuildID=redacted, BuildID[sha1]=498919aff001d8366249403a2544fba2d833084f, with debug_info, not stripped\n/private/tmp/vibedb-health-short-2184dca3/bin/rf3-sqlbench:           ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, Go BuildID=Q1KTqaQcj7GEu_WzV0qs/CkSVr7xREJtN0L7b_TpJ/77grPgJ7kjGzONXJ7Wd7/-yibGutKxbBrr7NHfEjt, BuildID[sha1]=33d44dee97eb711d227eed921a953cb8a0497c06, with debug_info, not stripped",
+  "before_after_patch_sha256": "185b10e9bbf101717e3221bfc0fa0fc84efa0e7bbddec39acef33f07ef022348",
+  "control_sha256": {
+    "run-fused-node-comparison.py": "c163e48b156baf41929e3f6a036776ca792feed8afc98d1db3a2befd43c4198c",
+    "run-fused-health-comparison.py": "8bd97e835940f62859f43b13b17cb908c259c6187ee0380f69a47f24c587b0e5",
+    "summarize-crdb-sql.py": "9f1f3622bb1c3904a211e8a848e9c6a30d7edc79cd6ef65fa517741260ac4fb2"
+  },
+  "host": {
+    "Architecture": "aarch64",
+    "KernelVersion": "7.0.12-linuxkit",
+    "OperatingSystem": "Docker Desktop",
+    "NCPU": 16,
+    "MemTotal": 50425147392
+  },
+  "images": {
+    "runtime": {
+      "Id": "sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b",
+      "RepoDigests": [
+        "golang@sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b"
+      ],
+      "Os": "linux",
+      "Architecture": "arm64"
+    },
+    "crdb": {
+      "Id": "sha256:204f131510c78393adb02345f289a8dbb32e1491e26cc92b6c7751f3b97be3c5",
+      "RepoDigests": [
+        "cockroachdb/cockroach@sha256:204f131510c78393adb02345f289a8dbb32e1491e26cc92b6c7751f3b97be3c5"
+      ],
+      "Os": "linux",
+      "Architecture": "arm64"
+    }
+  },
+  "runs": [
+    {
+      "arm": "before",
+      "revision": "494cf2aaf9f97779ca855833875024834f64a0d5",
+      "order": "before-first",
+      "status": "completed",
+      "client_exit_code": 0,
+      "errors": [],
+      "cell": {
+        "id": "baseline-c1-c8",
+        "kind": "baseline",
+        "physical_nodes": 3,
+        "tables": [
+          "rf3_sql_bench"
+        ],
+        "workloads": "point_hit,point_miss,range_64,group_16,update_existing",
+        "group_distribution": "uniform",
+        "clients": "1,8",
+        "groups": 1,
+        "endpoint_mode": "single"
+      },
+      "observed_limits": {
+        "NanoCpus": 12000000000,
+        "Memory": 25769803776,
+        "MemorySwap": 25769803776
+      },
+      "process_counts": {
+        "vibedb": 1,
+        "vibedb_shard": 3,
+        "vibedb_gateway": 0,
+        "cockroach": 0
+      },
+      "validation": {
+        "samples_checked": 25600,
+        "complete": true
+      },
+      "routing": {
+        "endpoint_mode": "ordinary_loopback_round_robin_per_client",
+        "endpoint_count": 1,
+        "endpoint_labels": [
+          "127.0.0.1:5432"
+        ],
+        "client_endpoint_identity": "sample.endpoint == sample.client % endpoint_count",
+        "client_endpoint_labels": {
+          "1": [
+            "127.0.0.1:5432"
+          ],
+          "8": [
+            "127.0.0.1:5432",
+            "127.0.0.1:5432",
+            "127.0.0.1:5432",
+            "127.0.0.1:5432",
+            "127.0.0.1:5432",
+            "127.0.0.1:5432",
+            "127.0.0.1:5432",
+            "127.0.0.1:5432"
+          ]
+        },
+        "leader_placement": "retained in published manifests/range inventory when available"
+      },
+      "forced_shutdown": false,
+      "server_exit_codes": [
+        0
+      ],
+      "setup": {
+        "client_binary": "/bench/rf3-sqlbench",
+        "phase": "setup",
+        "tables": [
+          "rf3_sql_bench"
+        ],
+        "timed": false,
+        "parent_live_ddl_enrollment": false,
+        "started_utc": "2026-09-04T15:35:57.272987Z",
+        "exit_code": 0,
+        "elapsed_ns": 1574471458
+      }
+    },
+    {
+      "arm": "after",
+      "revision": "2184dca377127f0a5a5de76d061ab410bc49470d",
+      "order": "before-first",
+      "status": "completed",
+      "client_exit_code": 0,
+      "errors": [],
+      "cell": {
+        "id": "baseline-c1-c8",
+        "kind": "baseline",
+        "physical_nodes": 3,
+        "tables": [
+          "rf3_sql_bench"
+        ],
+        "workloads": "point_hit,point_miss,range_64,group_16,update_existing",
+        "group_distribution": "uniform",
+        "clients": "1,8",
+        "groups": 1,
+        "endpoint_mode": "single"
+      },
+      "observed_limits": {
+        "NanoCpus": 12000000000,
+        "Memory": 25769803776,
+        "MemorySwap": 25769803776
+      },
+      "process_counts": {
+        "vibedb": 1,
+        "vibedb_shard": 3,
+        "vibedb_gateway": 0,
+        "cockroach": 0
+      },
+      "validation": {
+        "samples_checked": 25600,
+        "complete": true
+      },
+      "routing": {
+        "endpoint_mode": "ordinary_loopback_round_robin_per_client",
+        "endpoint_count": 1,
+        "endpoint_labels": [
+          "127.0.0.1:5432"
+        ],
+        "client_endpoint_identity": "sample.endpoint == sample.client % endpoint_count",
+        "client_endpoint_labels": {
+          "1": [
+            "127.0.0.1:5432"
+          ],
+          "8": [
+            "127.0.0.1:5432",
+            "127.0.0.1:5432",
+            "127.0.0.1:5432",
+            "127.0.0.1:5432",
+            "127.0.0.1:5432",
+            "127.0.0.1:5432",
+            "127.0.0.1:5432",
+            "127.0.0.1:5432"
+          ]
+        },
+        "leader_placement": "retained in published manifests/range inventory when available"
+      },
+      "forced_shutdown": false,
+      "server_exit_codes": [
+        0
+      ],
+      "setup": {
+        "client_binary": "/bench/rf3-sqlbench",
+        "phase": "setup",
+        "tables": [
+          "rf3_sql_bench"
+        ],
+        "timed": false,
+        "parent_live_ddl_enrollment": false,
+        "started_utc": "2026-09-04T15:36:30.473034Z",
+        "exit_code": 0,
+        "elapsed_ns": 1533165917
+      }
+    },
+    {
+      "arm": "crdb",
+      "revision": "cockroachdb/cockroach:v26.3.1@sha256:204f131510c78393adb02345f289a8dbb32e1491e26cc92b6c7751f3b97be3c5",
+      "order": "before-first",
+      "status": "completed",
+      "client_exit_code": 0,
+      "errors": [],
+      "cell": {
+        "id": "baseline-c1-c8",
+        "kind": "baseline",
+        "physical_nodes": 3,
+        "tables": [
+          "rf3_sql_bench"
+        ],
+        "workloads": "point_hit,point_miss,range_64,group_16,update_existing",
+        "group_distribution": "uniform",
+        "clients": "1,8",
+        "groups": 1,
+        "endpoint_mode": "single"
+      },
+      "observed_limits": {
+        "NanoCpus": 12000000000,
+        "Memory": 25769803776,
+        "MemorySwap": 25769803776
+      },
+      "process_counts": {
+        "vibedb": 0,
+        "vibedb_shard": 0,
+        "vibedb_gateway": 0,
+        "cockroach": 3
+      },
+      "validation": {
+        "samples_checked": 25600,
+        "complete": true
+      },
+      "routing": {
+        "endpoint_mode": "ordinary_loopback_round_robin_per_client",
+        "endpoint_count": 1,
+        "endpoint_labels": [
+          "127.0.0.1:26257"
+        ],
+        "client_endpoint_identity": "sample.endpoint == sample.client % endpoint_count",
+        "client_endpoint_labels": {
+          "1": [
+            "127.0.0.1:26257"
+          ],
+          "8": [
+            "127.0.0.1:26257",
+            "127.0.0.1:26257",
+            "127.0.0.1:26257",
+            "127.0.0.1:26257",
+            "127.0.0.1:26257",
+            "127.0.0.1:26257",
+            "127.0.0.1:26257",
+            "127.0.0.1:26257"
+          ]
+        },
+        "leader_placement": "retained in published manifests/range inventory when available"
+      },
+      "forced_shutdown": true,
+      "server_exit_codes": [
+        0,
+        0,
+        137
+      ],
+      "setup": {
+        "client_binary": "/bench/rf3-sqlbench",
+        "phase": "setup",
+        "tables": [
+          "rf3_sql_bench"
+        ],
+        "timed": false,
+        "parent_live_ddl_enrollment": false,
+        "started_utc": "2026-09-04T15:37:03.802895Z",
+        "exit_code": 0,
+        "elapsed_ns": 6697881708
+      }
+    },
+    {
+      "arm": "crdb",
+      "revision": "cockroachdb/cockroach:v26.3.1@sha256:204f131510c78393adb02345f289a8dbb32e1491e26cc92b6c7751f3b97be3c5",
+      "order": "after-first",
+      "status": "completed",
+      "client_exit_code": 0,
+      "errors": [],
+      "cell": {
+        "id": "baseline-c1-c8",
+        "kind": "baseline",
+        "physical_nodes": 3,
+        "tables": [
+          "rf3_sql_bench"
+        ],
+        "workloads": "point_hit,point_miss,range_64,group_16,update_existing",
+        "group_distribution": "uniform",
+        "clients": "1,8",
+        "groups": 1,
+        "endpoint_mode": "single"
+      },
+      "observed_limits": {
+        "NanoCpus": 12000000000,
+        "Memory": 25769803776,
+        "MemorySwap": 25769803776
+      },
+      "process_counts": {
+        "vibedb": 0,
+        "vibedb_shard": 0,
+        "vibedb_gateway": 0,
+        "cockroach": 3
+      },
+      "validation": {
+        "samples_checked": 25600,
+        "complete": true
+      },
+      "routing": {
+        "endpoint_mode": "ordinary_loopback_round_robin_per_client",
+        "endpoint_count": 1,
+        "endpoint_labels": [
+          "127.0.0.1:26257"
+        ],
+        "client_endpoint_identity": "sample.endpoint == sample.client % endpoint_count",
+        "client_endpoint_labels": {
+          "1": [
+            "127.0.0.1:26257"
+          ],
+          "8": [
+            "127.0.0.1:26257",
+            "127.0.0.1:26257",
+            "127.0.0.1:26257",
+            "127.0.0.1:26257",
+            "127.0.0.1:26257",
+            "127.0.0.1:26257",
+            "127.0.0.1:26257",
+            "127.0.0.1:26257"
+          ]
+        },
+        "leader_placement": "retained in published manifests/range inventory when available"
+      },
+      "forced_shutdown": true,
+      "server_exit_codes": [
+        137,
+        0,
+        0
+      ],
+      "setup": {
+        "client_binary": "/bench/rf3-sqlbench",
+        "phase": "setup",
+        "tables": [
+          "rf3_sql_bench"
+        ],
+        "timed": false,
+        "parent_live_ddl_enrollment": false,
+        "started_utc": "2026-09-04T15:37:51.023792Z",
+        "exit_code": 0,
+        "elapsed_ns": 1098820291
+      }
+    },
+    {
+      "arm": "after",
+      "revision": "2184dca377127f0a5a5de76d061ab410bc49470d",
+      "order": "after-first",
+      "status": "completed",
+      "client_exit_code": 0,
+      "errors": [],
+      "cell": {
+        "id": "baseline-c1-c8",
+        "kind": "baseline",
+        "physical_nodes": 3,
+        "tables": [
+          "rf3_sql_bench"
+        ],
+        "workloads": "point_hit,point_miss,range_64,group_16,update_existing",
+        "group_distribution": "uniform",
+        "clients": "1,8",
+        "groups": 1,
+        "endpoint_mode": "single"
+      },
+      "observed_limits": {
+        "NanoCpus": 12000000000,
+        "Memory": 25769803776,
+        "MemorySwap": 25769803776
+      },
+      "process_counts": {
+        "vibedb": 1,
+        "vibedb_shard": 3,
+        "vibedb_gateway": 0,
+        "cockroach": 0
+      },
+      "validation": {
+        "samples_checked": 25600,
+        "complete": true
+      },
+      "routing": {
+        "endpoint_mode": "ordinary_loopback_round_robin_per_client",
+        "endpoint_count": 1,
+        "endpoint_labels": [
+          "127.0.0.1:5432"
+        ],
+        "client_endpoint_identity": "sample.endpoint == sample.client % endpoint_count",
+        "client_endpoint_labels": {
+          "1": [
+            "127.0.0.1:5432"
+          ],
+          "8": [
+            "127.0.0.1:5432",
+            "127.0.0.1:5432",
+            "127.0.0.1:5432",
+            "127.0.0.1:5432",
+            "127.0.0.1:5432",
+            "127.0.0.1:5432",
+            "127.0.0.1:5432",
+            "127.0.0.1:5432"
+          ]
+        },
+        "leader_placement": "retained in published manifests/range inventory when available"
+      },
+      "forced_shutdown": false,
+      "server_exit_codes": [
+        0
+      ],
+      "setup": {
+        "client_binary": "/bench/rf3-sqlbench",
+        "phase": "setup",
+        "tables": [
+          "rf3_sql_bench"
+        ],
+        "timed": false,
+        "parent_live_ddl_enrollment": false,
+        "started_utc": "2026-09-04T15:38:27.011505Z",
+        "exit_code": 0,
+        "elapsed_ns": 1362137459
+      }
+    },
+    {
+      "arm": "before",
+      "revision": "494cf2aaf9f97779ca855833875024834f64a0d5",
+      "order": "after-first",
+      "status": "completed",
+      "client_exit_code": 0,
+      "errors": [],
+      "cell": {
+        "id": "baseline-c1-c8",
+        "kind": "baseline",
+        "physical_nodes": 3,
+        "tables": [
+          "rf3_sql_bench"
+        ],
+        "workloads": "point_hit,point_miss,range_64,group_16,update_existing",
+        "group_distribution": "uniform",
+        "clients": "1,8",
+        "groups": 1,
+        "endpoint_mode": "single"
+      },
+      "observed_limits": {
+        "NanoCpus": 12000000000,
+        "Memory": 25769803776,
+        "MemorySwap": 25769803776
+      },
+      "process_counts": {
+        "vibedb": 1,
+        "vibedb_shard": 3,
+        "vibedb_gateway": 0,
+        "cockroach": 0
+      },
+      "validation": {
+        "samples_checked": 25600,
+        "complete": true
+      },
+      "routing": {
+        "endpoint_mode": "ordinary_loopback_round_robin_per_client",
+        "endpoint_count": 1,
+        "endpoint_labels": [
+          "127.0.0.1:5432"
+        ],
+        "client_endpoint_identity": "sample.endpoint == sample.client % endpoint_count",
+        "client_endpoint_labels": {
+          "1": [
+            "127.0.0.1:5432"
+          ],
+          "8": [
+            "127.0.0.1:5432",
+            "127.0.0.1:5432",
+            "127.0.0.1:5432",
+            "127.0.0.1:5432",
+            "127.0.0.1:5432",
+            "127.0.0.1:5432",
+            "127.0.0.1:5432",
+            "127.0.0.1:5432"
+          ]
+        },
+        "leader_placement": "retained in published manifests/range inventory when available"
+      },
+      "forced_shutdown": false,
+      "server_exit_codes": [
+        0
+      ],
+      "setup": {
+        "client_binary": "/bench/rf3-sqlbench",
+        "phase": "setup",
+        "tables": [
+          "rf3_sql_bench"
+        ],
+        "timed": false,
+        "parent_live_ddl_enrollment": false,
+        "started_utc": "2026-09-04T15:38:53.602834Z",
+        "exit_code": 0,
+        "elapsed_ns": 1467354292
+      }
+    }
+  ],
+  "prior_failed_attempt": {
+    "directory": "/private/tmp/vibedb-health-short-6aca5f18",
+    "before": "b6e41fe7b444cf9706d6a4a3d54d8f0fbfa5b66a",
+    "after": "6aca5f185d605d7a8bb3520bc504f2530d0f3969",
+    "result": "Baseline completed; candidate untimed CREATE failed after durable publication and concurrent local catalog read. No candidate timing or CRDB trial exists; excluded from comparison.",
+    "fix_shared_by_both_arms": "2184dca3 / 494cf2aa contain identical catalog acknowledgement fix."
+  }
+}
