@@ -55,17 +55,18 @@ func compactPackedEqualExpected(data []byte, count, width int, want uint64) int 
 	return matched
 }
 
-func TestCompactPackedEqualWidth7And10Parity(t *testing.T) {
+func TestCompactPackedEqualWidth7Through16Parity(t *testing.T) {
 	counts := make([]int, 0, 120)
 	for count := 0; count <= 80; count++ {
 		counts = append(counts, count)
 	}
 	counts = append(counts,
 		255, 256, 257,
+		511, 512, 513,
 		65535, 65536,
 	)
-	// The vector's lookahead leaves a scalar tail at the flush boundary;
-	// sweep both sides so each packed width tests its first actual flush.
+	// Sweep the 4096-row reduction boundary and nearby tails. Width7 needs
+	// lookahead before its first flush; widths 10 and 16 consume exact blocks.
 	for count := 4094; count <= 4112; count++ {
 		counts = append(counts, count)
 	}
@@ -75,7 +76,7 @@ func TestCompactPackedEqualWidth7And10Parity(t *testing.T) {
 		compactPackedPatternAlternating,
 		compactPackedPatternRandom,
 	}
-	for _, width := range []int{7, 10} {
+	for _, width := range []int{7, 8, 10, 16} {
 		mask := uint64(1)<<uint(width) - 1
 		wants := []uint64{0, 1, mask, mask / 3, mask + 1, ^uint64(0)}
 		for _, count := range counts {
@@ -91,10 +92,15 @@ func TestCompactPackedEqualWidth7And10Parity(t *testing.T) {
 					for _, want := range wants {
 						expected := compactPackedEqualExpected(input, count, width, want)
 						gotScalar := 0
-						if width == 7 {
+						switch width {
+						case 7:
 							gotScalar = countCompactPacked7EqualScalar(input, count, want)
-						} else {
+						case 8:
+							gotScalar = countCompactPacked8EqualScalar(input, count, want)
+						case 10:
 							gotScalar = countCompactPacked10EqualScalar(input, count, want)
+						case 16:
+							gotScalar = countCompactPacked16EqualScalar(input, count, want)
 						}
 						got := countCompactPackedEqual(input, count, width, want)
 						if gotScalar != expected || got != expected {
@@ -126,21 +132,22 @@ func TestCompactPackedEqualWidth7And10Parity(t *testing.T) {
 
 func TestCompactPackedEqualFirstRowsExerciseEveryLane(t *testing.T) {
 	const count = 4096
-	for _, width := range []int{7, 10} {
+	for _, width := range []int{7, 8, 10, 16} {
 		mask := uint64(1)<<uint(width) - 1
 		data := make([]byte, (count*width+7)/8)
-		background := mask / 3
+		const background = uint64(0)
 		for row := 0; row < count; row++ {
 			value := background
-			if row < 32 {
+			if row < 64 {
 				value = uint64(row*37+1) & mask
 			}
 			compactPutBits(data, row*width, width, value)
 		}
-		for row := 0; row < 32; row++ {
+		for row := 0; row < 64; row++ {
 			want := compactReadBits(data, row*width, width)
-			// These first 32 values are distinct and exclude background, so
-			// each lane must contribute exactly once without an oracle scan.
+			// These first 64 values are distinct and exclude background. This
+			// covers all four width8 accumulators, with exactly one match per
+			// lane and no oracle scan.
 			if got := countCompactPackedEqual(data, count, width, want); got != 1 {
 				t.Fatalf("width=%d first-row=%d got=%d expected=1", width, row, got)
 			}
@@ -162,22 +169,32 @@ func compactPackedEqualDispatchName(fn func([]byte, int, uint64) int) string {
 
 func TestCountCompactPackedEqualDispatch(t *testing.T) {
 	name7 := compactPackedEqualDispatchName(countCompactPacked7EqualImpl)
+	name8 := compactPackedEqualDispatchName(countCompactPacked8EqualImpl)
 	name10 := compactPackedEqualDispatchName(countCompactPacked10EqualImpl)
-	if name7 == "" || name10 == "" {
-		t.Fatalf("missing packed dispatch function names: width7=%q width10=%q", name7, name10)
+	name16 := compactPackedEqualDispatchName(countCompactPacked16EqualImpl)
+	if name7 == "" || name8 == "" || name10 == "" || name16 == "" {
+		t.Fatalf("missing packed dispatch function names: width7=%q width8=%q width10=%q width16=%q", name7, name8, name10, name16)
 	}
 	if !strings.HasSuffix(name7, "countCompactPacked7EqualScalar") &&
 		!strings.HasSuffix(name7, "countCompactPacked7EqualNEON") {
 		t.Fatalf("unexpected width7 dispatch=%q", name7)
 	}
+	if !strings.HasSuffix(name8, "countCompactPacked8EqualScalar") &&
+		!strings.HasSuffix(name8, "countCompactPacked8EqualNEON") {
+		t.Fatalf("unexpected width8 dispatch=%q", name8)
+	}
 	if !strings.HasSuffix(name10, "countCompactPacked10EqualScalar") &&
 		!strings.HasSuffix(name10, "countCompactPacked10EqualNEON") {
 		t.Fatalf("unexpected width10 dispatch=%q", name10)
 	}
+	if !strings.HasSuffix(name16, "countCompactPacked16EqualScalar") &&
+		!strings.HasSuffix(name16, "countCompactPacked16EqualNEON") {
+		t.Fatalf("unexpected width16 dispatch=%q", name16)
+	}
 }
 
 func TestCountCompactPackedEqualZeroAlloc(t *testing.T) {
-	for _, width := range []int{7, 10} {
+	for _, width := range []int{7, 8, 10, 16} {
 		count := 4096
 		data := compactPackedEqualPatternData(count, width, compactPackedPatternRandom)
 		want := uint64(1) << uint(width-1)

@@ -10,7 +10,9 @@ import (
 func TestCountCompactPackedEqualDispatchScalar(t *testing.T) {
 	for _, name := range []string{
 		compactPackedEqualDispatchName(countCompactPacked7EqualImpl),
+		compactPackedEqualDispatchName(countCompactPacked8EqualImpl),
 		compactPackedEqualDispatchName(countCompactPacked10EqualImpl),
+		compactPackedEqualDispatchName(countCompactPacked16EqualImpl),
 	} {
 		if !strings.HasSuffix(name, "EqualScalar") {
 			t.Fatalf("portable dispatch=%q, want scalar", name)

@@ -270,7 +270,7 @@ jobs:
         run: |
           GOEXPERIMENT=simd go test -count=1 -timeout=5m ./internal/storeio -run 'Test(CountCompact|CompactPacked|CompactStream|CompactPrimaryStripe)'
           GOEXPERIMENT=nosimd go test -count=1 -timeout=5m ./internal/storeio -run 'Test(CountCompact|CompactPacked|CompactStream|CompactPrimaryStripe)'
-          GOEXPERIMENT=nosimd go test -count=1 -timeout=5m ./query -run '^TestFilePackedEqualityCount$'
+          GOEXPERIMENT=nosimd go test -count=1 -timeout=5m ./query -run '^TestFilePackedEqualityCount(Wide)?$'
       - name: Portable JSON and placement parity
         env:
           GOEXPERIMENT: nosimd
