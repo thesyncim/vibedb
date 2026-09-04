@@ -52,20 +52,36 @@ func (executor *DurableSQLRequestExecutor) PrepareDirect(ctx context.Context, ke
 	}
 	opctx, cancel := context.WithTimeout(ctx, profile.GlobalDeadline)
 	defer cancel()
-	lease := executor.planner.catalog.pinCurrent()
-	defer lease.release()
-	if lease.snapshot == nil || lease.generation == 0 {
-		return nil, ErrNoCatalog
-	}
-	participants, handled, err := executor.planner.planReplicatedSQLTransactionWithDataMode(
-		opctx, lease.snapshot, queries, profile, executor.data,
-		replicatedSQLCommittedLeaderPreimage,
-	)
-	if errors.Is(err, errPreparedDirectFallback) {
-		participants, handled, err = executor.planner.planReplicatedSQLTransactionWithData(
+	var lease catalogLease
+	var participants []ReplicatedTransactionParticipant
+	var handled bool
+	refreshedMiss := false
+	for {
+		lease = executor.planner.catalog.pinCurrent()
+		if lease.snapshot == nil || lease.generation == 0 {
+			lease.release()
+			return nil, ErrNoCatalog
+		}
+		participants, handled, err = executor.planner.planReplicatedSQLTransactionWithDataMode(
 			opctx, lease.snapshot, queries, profile, executor.data,
+			replicatedSQLCommittedLeaderPreimage,
 		)
+		if errors.Is(err, errPreparedDirectFallback) {
+			participants, handled, err = executor.planner.planReplicatedSQLTransactionWithData(
+				opctx, lease.snapshot, queries, profile, executor.data,
+			)
+		}
+		if !errors.Is(err, ErrTableNotPlaced) || refreshedMiss {
+			break
+		}
+		refreshedMiss = true
+		staleGeneration := lease.generation
+		lease.release()
+		if refreshErr := executor.planner.refreshAfterCatalogMiss(opctx, staleGeneration); refreshErr != nil {
+			return nil, preserveCatalogMiss(err, refreshErr)
+		}
 	}
+	defer lease.release()
 	if err != nil {
 		return nil, err
 	}

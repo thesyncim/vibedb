@@ -722,7 +722,7 @@ func fusedVerifyPGExact(
 	if lastErr == nil {
 		lastErr = context.Cause(verifyCtx)
 	}
-	t.Fatalf("exact PostgreSQL oracle did not settle: %v", lastErr)
+	t.Fatalf("exact PostgreSQL oracle at %s did not settle: %v", address, lastErr)
 }
 
 func fusedVerifyPGPass(ctx context.Context, connection net.Conn, acked map[string][]fusedAckedRow) (bool, error) {
