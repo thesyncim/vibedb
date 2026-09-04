@@ -362,146 +362,7 @@ func (s *compactStreamSequentialState) appendValue(
 		if row < 0 || row >= v.count || row != s.next {
 			return v.appendValue(dst, row)
 		}
-		if row%compactStreamRestart == 0 {
-			block := row / compactStreamRestart
-			s.cursor = int(binary.LittleEndian.Uint32(v.data[block*4:]))
-			base, n, ok := readCompactUvarint(v.data[s.cursor:])
-			if !ok {
-				return dst, false
-			}
-			s.value = int64(base)
-			s.cursor += n
-			if s.cursor >= len(v.data) {
-				return dst, false
-			}
-			s.width = int(v.data[s.cursor])
-			s.cursor++
-			rows := min(compactStreamRestart, v.count-block*compactStreamRestart)
-			lengthBytes := (rows*s.width + 7) / 8
-			if lengthBytes > len(v.data)-s.cursor {
-				return dst, false
-			}
-			s.lengthBit = s.cursor * 8
-			s.bit = (s.cursor + lengthBytes) * 8
-		}
-		if s.alphabetEnd == 0 {
-			s.alphabetEnd = int(binary.LittleEndian.Uint16(v.dictDir))
-			s.prefixEnd = s.alphabetEnd
-			if v.dictCount == 3 {
-				s.prefixEnd = int(binary.LittleEndian.Uint16(v.dictDir[2:]))
-			}
-			s.alphabetBase = uint16(v.dictData[0]) + 1
-			for i, char := range v.dictData[:s.alphabetEnd] {
-				if int(char) != int(s.alphabetBase)-1+i {
-					s.alphabetBase = 0
-					break
-				}
-			}
-		}
-		alphabet := v.dictData[:s.alphabetEnd]
-		prefix := v.dictData[s.alphabetEnd:s.prefixEnd]
-		suffix := v.dictData[s.prefixEnd:]
-		length := uint64(s.value) + compactReadBits(v.data, s.lengthBit, s.width)
-		s.lengthBit += s.width
-		if length > CommonPrimaryLeafMaxExtentBytes {
-			return dst, false
-		}
-		endBit := s.bit + int(length)*int(v.width)
-		if endBit > len(v.data)*8 {
-			return dst, false
-		}
-		start := len(dst)
-		dst = append(dst, prefix...)
-		middle := len(dst)
-		middleLen := int(length)
-		// The decoder overwrites every middle byte, so a warm scan can extend
-		// its retained buffer without paying to clear the same bytes first.
-		if middleLen <= cap(dst)-len(dst) {
-			dst = dst[:len(dst)+middleLen]
-		} else {
-			dst = append(dst, make([]byte, middleLen)...)
-		}
-		if v.width == 0 {
-			for char := range middleLen {
-				dst[middle+char] = alphabet[0]
-			}
-			s.next++
-			return append(dst, suffix...), true
-		}
-		width := int(v.width)
-		mask := uint64(1<<v.width) - 1
-		char := 0
-		bit := s.bit
-		if middleLen >= 32 && s.alphabetBase != 0 {
-			var ok bool
-			char, ok = compactScanAlphabetSIMD(dst[middle:middle+middleLen], v.data, bit, width, len(alphabet), byte(s.alphabetBase-1))
-			if !ok {
-				return dst[:start], false
-			}
-			bit += char * width
-		}
-		// Eight symbols occupy at most 48 bits. One bounded load replaces
-		// eight byte-reservoir refills; a scalar tail handles the page edge.
-		for char+8 <= middleLen && bit/8+8 <= len(v.data) {
-			packed := binary.LittleEndian.Uint64(v.data[bit/8:]) >> uint(bit&7)
-			a := int(packed & mask)
-			b := int(packed >> uint(width) & mask)
-			c := int(packed >> uint(2*width) & mask)
-			d := int(packed >> uint(3*width) & mask)
-			e := int(packed >> uint(4*width) & mask)
-			f := int(packed >> uint(5*width) & mask)
-			g := int(packed >> uint(6*width) & mask)
-			h := int(packed >> uint(7*width) & mask)
-			if max(a, b, c, d, e, f, g, h) >= len(alphabet) {
-				return dst[:start], false
-			}
-			out := dst[middle+char : middle+char+8]
-			out[0], out[1], out[2], out[3] = alphabet[a], alphabet[b], alphabet[c], alphabet[d]
-			out[4], out[5], out[6], out[7] = alphabet[e], alphabet[f], alphabet[g], alphabet[h]
-			char += 8
-			bit += 8 * width
-		}
-		byteAt := bit >> 3
-		shift := bit & 7
-		if char < middleLen && byteAt+8 <= len(v.data) {
-			packed := binary.LittleEndian.Uint64(v.data[byteAt:]) >> uint(shift)
-			tail := dst[middle+char : middle+middleLen]
-			for i := range tail {
-				code := int(packed & mask)
-				if code >= len(alphabet) {
-					return dst[:start], false
-				}
-				tail[i] = alphabet[code]
-				packed >>= uint(width)
-			}
-			s.bit = endBit
-			s.next++
-			return append(dst, suffix...), true
-		}
-		var packed uint64
-		available := 0
-		if char < middleLen && shift != 0 {
-			packed = uint64(v.data[byteAt]) >> shift
-			available = 8 - shift
-			byteAt++
-		}
-		for ; char < middleLen; char++ {
-			for available < width {
-				packed |= uint64(v.data[byteAt]) << available
-				available += 8
-				byteAt++
-			}
-			code := int(packed & mask)
-			if code >= len(alphabet) {
-				return dst[:start], false
-			}
-			dst[middle+char] = alphabet[code]
-			packed >>= width
-			available -= width
-		}
-		s.bit = endBit
-		s.next++
-		return append(dst, suffix...), true
+		return s.appendAlphabet(dst, v, row)
 	}
 	prefix := 0
 	switch v.kind {
@@ -646,4 +507,179 @@ func (s *compactStreamSequentialState) appendValue(
 		}
 	}
 	return append(dst, suffixValue...), true
+}
+
+// compactSpreadAlphabet5 expands eight packed five-bit codes into byte lanes.
+// Mask before shifting: the source and destination groups overlap.
+func compactSpreadAlphabet5(packed uint64) uint64 {
+	x := packed&0xfffff | ((packed>>20)&0xfffff)<<32
+	x = x&0x000003ff000003ff | (x&0x000ffc00000ffc00)<<6
+	return x&0x001f001f001f001f | (x&0x03e003e003e003e0)<<3
+}
+
+// appendAlphabet renders an admitted alphabet at the state's current ordinal.
+// Both callers check kind, row bounds, and synchronization before entering.
+// Keeping this renderer independent of random-decode fallback avoids a recursive
+// call graph that would force caller-owned scan state onto the heap.
+func (s *compactStreamSequentialState) appendAlphabet(dst []byte, v *compactStreamView, row int) ([]byte, bool) {
+	if row%compactStreamRestart == 0 {
+		block := row / compactStreamRestart
+		s.cursor = int(binary.LittleEndian.Uint32(v.data[block*4:]))
+		base, n, ok := readCompactUvarint(v.data[s.cursor:])
+		if !ok {
+			return dst, false
+		}
+		s.value = int64(base)
+		s.cursor += n
+		if s.cursor >= len(v.data) {
+			return dst, false
+		}
+		s.width = int(v.data[s.cursor])
+		s.cursor++
+		rows := min(compactStreamRestart, v.count-block*compactStreamRestart)
+		lengthBytes := (rows*s.width + 7) / 8
+		if lengthBytes > len(v.data)-s.cursor {
+			return dst, false
+		}
+		s.lengthBit = s.cursor * 8
+		s.bit = (s.cursor + lengthBytes) * 8
+	}
+	if s.alphabetEnd == 0 {
+		s.alphabetEnd = int(binary.LittleEndian.Uint16(v.dictDir))
+		s.prefixEnd = s.alphabetEnd
+		if v.dictCount == 3 {
+			s.prefixEnd = int(binary.LittleEndian.Uint16(v.dictDir[2:]))
+		}
+		// Admission requires strictly increasing symbols. Equal endpoint span
+		// and cardinality therefore prove every symbol is contiguous.
+		if int(v.dictData[s.alphabetEnd-1])-int(v.dictData[0]) == s.alphabetEnd-1 {
+			s.alphabetBase = uint16(v.dictData[0]) + 1
+		}
+	}
+	alphabet := v.dictData[:s.alphabetEnd]
+	prefix := v.dictData[s.alphabetEnd:s.prefixEnd]
+	suffix := v.dictData[s.prefixEnd:]
+	length := uint64(s.value) + compactReadBits(v.data, s.lengthBit, s.width)
+	s.lengthBit += s.width
+	if length > CommonPrimaryLeafMaxExtentBytes {
+		return dst, false
+	}
+	endBit := s.bit + int(length)*int(v.width)
+	if endBit > len(v.data)*8 {
+		return dst, false
+	}
+	start := len(dst)
+	dst = append(dst, prefix...)
+	middle := len(dst)
+	middleLen := int(length)
+	// The decoder overwrites every middle byte, so a warm scan can extend
+	// its retained buffer without paying to clear the same bytes first.
+	if middleLen <= cap(dst)-len(dst) {
+		dst = dst[:len(dst)+middleLen]
+	} else {
+		dst = append(dst, make([]byte, middleLen)...)
+	}
+	if v.width == 0 {
+		for char := range middleLen {
+			dst[middle+char] = alphabet[0]
+		}
+		s.next++
+		return append(dst, suffix...), true
+	}
+	width := int(v.width)
+	mask := uint64(1<<v.width) - 1
+	char := 0
+	bit := s.bit
+	if middleLen >= 32 && s.alphabetBase != 0 {
+		var ok bool
+		char, ok = compactScanAlphabetSIMD(dst[middle:middle+middleLen], v.data, bit, width, len(alphabet), byte(s.alphabetBase-1))
+		if !ok {
+			return dst[:start], false
+		}
+		bit += char * width
+	}
+	// Eight symbols occupy at most 48 bits. One bounded load replaces
+	// eight byte-reservoir refills; a scalar tail handles the page edge.
+	for char+8 <= middleLen && bit/8+8 <= len(v.data) {
+		packed := binary.LittleEndian.Uint64(v.data[bit/8:]) >> uint(bit&7)
+		if width == 5 && s.alphabetBase != 0 {
+			codes := compactSpreadAlphabet5(packed)
+			if (codes+uint64(128-len(alphabet))*0x0101010101010101)&0x8080808080808080 != 0 {
+				return dst[:start], false
+			}
+			binary.LittleEndian.PutUint64(dst[middle+char:], codes+uint64(s.alphabetBase-1)*0x0101010101010101)
+			char += 8
+			bit += 40
+			continue
+		}
+		a := int(packed & mask)
+		b := int(packed >> uint(width) & mask)
+		c := int(packed >> uint(2*width) & mask)
+		d := int(packed >> uint(3*width) & mask)
+		e := int(packed >> uint(4*width) & mask)
+		f := int(packed >> uint(5*width) & mask)
+		g := int(packed >> uint(6*width) & mask)
+		h := int(packed >> uint(7*width) & mask)
+		if max(a, b, c, d, e, f, g, h) >= len(alphabet) {
+			return dst[:start], false
+		}
+		out := dst[middle+char : middle+char+8]
+		out[0], out[1], out[2], out[3] = alphabet[a], alphabet[b], alphabet[c], alphabet[d]
+		out[4], out[5], out[6], out[7] = alphabet[e], alphabet[f], alphabet[g], alphabet[h]
+		char += 8
+		bit += 8 * width
+	}
+	byteAt := bit >> 3
+	shift := bit & 7
+	if char < middleLen && byteAt+8 <= len(v.data) {
+		packed := binary.LittleEndian.Uint64(v.data[byteAt:]) >> uint(shift)
+		tail := dst[middle+char : middle+middleLen]
+		if width == 5 && s.alphabetBase != 0 {
+			codes := compactSpreadAlphabet5(packed & (uint64(1)<<uint(len(tail)*5) - 1))
+			if (codes+uint64(128-len(alphabet))*0x0101010101010101)&0x8080808080808080 != 0 {
+				return dst[:start], false
+			}
+			var rendered [8]byte
+			binary.LittleEndian.PutUint64(rendered[:], codes+uint64(s.alphabetBase-1)*0x0101010101010101)
+			copy(tail, rendered[:len(tail)])
+			s.bit = endBit
+			s.next++
+			return append(dst, suffix...), true
+		}
+		for i := range tail {
+			code := int(packed & mask)
+			if code >= len(alphabet) {
+				return dst[:start], false
+			}
+			tail[i] = alphabet[code]
+			packed >>= uint(width)
+		}
+		s.bit = endBit
+		s.next++
+		return append(dst, suffix...), true
+	}
+	var packed uint64
+	available := 0
+	if char < middleLen && shift != 0 {
+		packed = uint64(v.data[byteAt]) >> shift
+		available = 8 - shift
+		byteAt++
+	}
+	for ; char < middleLen; char++ {
+		for available < width {
+			packed |= uint64(v.data[byteAt]) << available
+			available += 8
+			byteAt++
+		}
+		code := int(packed & mask)
+		if code >= len(alphabet) {
+			return dst[:start], false
+		}
+		dst[middle+char] = alphabet[code]
+		packed >>= width
+		available -= width
+	}
+	s.bit = endBit
+	s.next++
+	return append(dst, suffix...), true
 }
