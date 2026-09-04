@@ -14,7 +14,7 @@ const (
 	// random-rank decoder; other streams in the leaf still specialize.
 	compactPrimaryScanDictionaryBounds = 512
 	// Dictionary fragments combine the static bytes preceding a hole with each
-	// dictionary spelling. The common 4K-row shape set stays below 7 KiB; keep a
+	// dictionary spelling. The common 4K-row shape set needs 6,717 bytes; keep a
 	// bounded power-of-two pool and let unusual leaves fall back per stream.
 	compactPrimaryScanDictionaryFragmentBytes = 8 << 10
 )
@@ -120,12 +120,7 @@ func (d *CompactPrimaryScanDecoder) prepare(
 			}
 			prefixEnd := meta.ends[hole]
 			prefixBytes := int(prefixEnd - prefixStart)
-			suffixStart, suffixEnd := prefixEnd, prefixEnd
-			if hole == entry.template.holes-1 {
-				suffixEnd = meta.ends[entry.template.holes]
-			}
-			suffixBytes := int(suffixEnd - suffixStart)
-			fragmentBytes := (prefixBytes+suffixBytes)*stream.dictCount + len(stream.dictData)
+			fragmentBytes := prefixBytes*stream.dictCount + len(stream.dictData)
 			if stream.kind == compactStreamDictionary &&
 				stream.dictCount > 0 &&
 				stream.dictCount+1 <= len(d.dictionary)-dictionaryCount &&
@@ -142,9 +137,6 @@ func (d *CompactPrimaryScanDecoder) prepare(
 					)
 					fragmentCount += copy(
 						d.fragments[fragmentCount:], stream.dictData[dictionaryStart:dictionaryEnd],
-					)
-					fragmentCount += copy(
-						d.fragments[fragmentCount:], meta.static[suffixStart:suffixEnd],
 					)
 					d.dictionary[dictionaryCount+id+1] = uint16(fragmentCount)
 					dictionaryStart = dictionaryEnd
@@ -246,9 +238,6 @@ func (d *CompactPrimaryScanDecoder) appendValue(
 		plan := d.streamPlan[streamAt]
 		if plan.dictionaryCount != 0 {
 			dst, ok = d.appendDictionaryFragment(dst, streamAt, ordinal)
-			if hole == int(meta.holes)-1 {
-				end = meta.ends[meta.holes]
-			}
 		} else {
 			dst = append(dst, meta.static[previous:end]...)
 			state := &d.streams[streamAt]
