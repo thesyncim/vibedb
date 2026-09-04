@@ -299,12 +299,12 @@ func UpdateCollections(participants []*Collection, fn func(*DatabaseBatch) error
 		return nil
 	}
 
-	for _, collection := range ordered {
-		collection.mu.Lock()
+	for i := range batches {
+		batches[i].collection.mu.Lock()
 	}
 	defer func() {
-		for i := len(ordered) - 1; i >= 0; i-- {
-			ordered[i].mu.Unlock()
+		for i := len(batches) - 1; i >= 0; i-- {
+			batches[i].collection.mu.Unlock()
 		}
 	}()
 
