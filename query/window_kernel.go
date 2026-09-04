@@ -2338,7 +2338,25 @@ func (e *windowExecutor) walkCount(
 	cancel *CancelFlag,
 ) error {
 	rows := partitionEnd - partitionStart
-	lo, hi, count := 0, 0, 0
+	// Sorting has finished and e.order owns the permutation. Reuse the
+	// admitted sort scratch for inclusive prefix counts, rebuilding it for
+	// each function/partition and on both output passes. Exclusions then cost
+	// O(1) per row even when the entire partition is one peer group.
+	var counts []int
+	if function.column >= 0 || function.hasFilter {
+		counts = e.sortScratch[:rows]
+		count := 0
+		for position := range counts {
+			if err := cancellationCheckpoint(cancel, position); err != nil {
+				return err
+			}
+			row := e.order[partitionStart+position]
+			if _, include := windowAggregateValue(input, function, row); include {
+				count++ // At most rows, which already fits in int.
+			}
+			counts[position] = count
+		}
+	}
 	group := 0
 	for position := 0; position < rows; position++ {
 		if err := cancellationCheckpoint(cancel, position); err != nil {
@@ -2350,40 +2368,12 @@ func (e *windowExecutor) walkCount(
 		if err != nil {
 			return err
 		}
-		wantLo, wantHi := selection.lo, selection.hi
-		for hi < wantHi {
-			if err := cancellationCheckpoint(cancel, hi); err != nil {
-				return err
-			}
-			row := e.order[partitionStart+hi]
-			if _, include := windowAggregateValue(input, function, row); include {
-				if count == math.MaxInt {
-					return errWindowSize
-				}
-				count++
-			}
-			hi++
-		}
-		for lo < wantLo {
-			if err := cancellationCheckpoint(cancel, lo); err != nil {
-				return err
-			}
-			row := e.order[partitionStart+lo]
-			if _, include := windowAggregateValue(input, function, row); include {
-				count--
-			}
-			lo++
-		}
-		selectedCount := count
-		for at := selection.skipLo; at < selection.skipHi; at++ {
-			if err := cancellationCheckpoint(cancel, at); err != nil {
-				return err
-			}
-			if selection.excluded(at) {
-				row := e.order[partitionStart+at]
-				if _, include := windowAggregateValue(input, function, row); include {
-					selectedCount--
-				}
+		selectedCount := selection.count()
+		if counts != nil {
+			selectedCount = windowPrefixCount(counts, selection.lo, selection.hi) -
+				windowPrefixCount(counts, selection.skipLo, selection.skipHi)
+			if selection.keep >= selection.skipLo && selection.keep < selection.skipHi {
+				selectedCount += windowPrefixCount(counts, selection.keep, selection.keep+1)
 			}
 		}
 		if err := writer.put(
@@ -2393,6 +2383,18 @@ func (e *windowExecutor) walkCount(
 		}
 	}
 	return cancellationError(cancel)
+}
+
+// windowPrefixCount counts eligible rows in the half-open interval [lo, hi).
+func windowPrefixCount(counts []int, lo, hi int) int {
+	if lo == hi {
+		return 0
+	}
+	count := counts[hi-1]
+	if lo > 0 {
+		count -= counts[lo-1]
+	}
+	return count
 }
 
 func (e *windowExecutor) walkExact(
