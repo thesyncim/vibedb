@@ -42,14 +42,23 @@ large fixed allocations and are insufficient for a space-efficiency claim.
 
 ## Current engineering priorities
 
-1. Replace maximum-size SQL workspace reservation for every read with bounded,
-   growing reservations. Preserve result/error behavior, total deadlines,
-   ReadIndex fences and release-before-wait discipline.
-2. Profile remaining replicated write execution, remove avoidable work and batch
-   durable operations without changing acknowledgment guarantees.
-3. Extend honest tests and measurements to data growth/reclamation, multiple
-   active ranges, mixed and contested transactions, and schema changes under load.
-4. Use those results to select storage, replication, execution and schema
-   redesigns. Maintain raw failed runs alongside successful reruns.
+User clarification: pursue a substantially better architecture, with breaking
+changes allowed; competitor implementations are evidence, not the design target.
+
+1. Connect serving to asynchronous persistence, then shared node storage and
+   batching across ranges. The current startup/reload path adopts synchronous
+   runtimes despite existing pipelined and node-log primitives. Validate recovery
+   and dynamically added groups as part of the serving path.
+2. Redesign committed/versioned read visibility so transactions need not block
+   unrelated readers across a group. Retain serializable conflict validation.
+3. Reduce fixed per-range allocation and duplicate log/data amplification, with
+   compact versioned storage and measured reclamation under sustained writes.
+4. Publish immutable schema generations while reads/writes retain older views;
+   prove staging, backfill, cutover and recovery under load.
+5. Measure mixed, skewed and multi-range workloads across node counts.
+
+The [adaptive read-admission comparison](benchmarks/crdb-sql-2026-09-04-reads/README.md)
+validated 120,000 more samples. C8 point hits: 10,200.5 ops/s; grouped scans:
+1,242.6. All workloads still trail CRDB. The regressed precursor is retained.
 
 Status: **active; no acceptance gate is complete**.
