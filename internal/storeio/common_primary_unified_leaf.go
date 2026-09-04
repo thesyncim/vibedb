@@ -326,6 +326,16 @@ func (b *UnifiedPrimaryLeafBuilder) canonicalSpanIndex(
 	return canonical, true, nil
 }
 
+// CanonicalSpanIndex certifies one already-normalized inline value using the
+// builder's bounded tape/workspace. Durable batch admission uses this wrapper
+// while the collection writer is held so the compact stripe verifier can reuse
+// the same scalar-hole certificate as the concurrent replacement lane.
+func (b *UnifiedPrimaryLeafBuilder) CanonicalSpanIndex(
+	src []byte,
+) (CanonicalSpanIndex, bool, error) {
+	return b.canonicalSpanIndex(src)
+}
+
 // appendHoleSpans extracts the ordered scalar-leaf spans of one canonical
 // document from its tape. A hole is a non-key tape leaf with Next == 1, which
 // places holes at scalar leaves of arbitrary depth and makes empty containers
