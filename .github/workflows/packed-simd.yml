@@ -1,0 +1,198 @@
+name: packed-simd
+
+on:
+  pull_request:
+    paths:
+      - 'internal/storeio/compact_stream_codec*'
+      - 'query/file_packed_count_bench_test.go'
+      - '.github/workflows/packed-simd.yml'
+      - 'scripts/bench/run-packed-simd.sh'
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: Exact commit, branch, or tag to use as the SIMD benchmark base
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: packed-simd-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOEXPERIMENT: simd
+  PACKED_SIMD_BENCHTIME: 250ms
+  PACKED_SIMD_REPETITIONS: '5'
+
+jobs:
+  packed-simd:
+    name: packed SIMD native (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup-go-ci
+        id: go
+        with:
+          scope: packed-simd
+
+      - name: Resolve revisions, capture provenance, and compile both sides
+        shell: bash
+        env:
+          PULL_REQUEST_BASE_SHA: '${{ github.event.pull_request.base.sha }}'
+          WORKFLOW_BASE_REF: '${{ inputs.base_ref }}'
+          PULL_REQUEST_HEAD_SHA: '${{ github.event.pull_request.head.sha }}'
+        run: |
+          set -euo pipefail
+
+          evidence="${RUNNER_TEMP}/packed-simd"
+          metadata="${evidence}/metadata"
+          binaries="${RUNNER_TEMP}/packed-simd-binaries"
+          base_worktree="${RUNNER_TEMP}/packed-simd-base"
+          mkdir -p "${metadata}" "${binaries}"
+          test ! -e "${base_worktree}"
+
+          base_selector="${PULL_REQUEST_BASE_SHA:-}"
+          if [[ -z "${base_selector}" ]]; then
+            base_selector="${WORKFLOW_BASE_REF:-}"
+          fi
+          if [[ -z "${base_selector}" ]]; then
+            echo 'a pull-request base SHA or workflow_dispatch base_ref is required' >&2
+            exit 1
+          fi
+
+          head_sha=$(git rev-parse --verify 'HEAD^{commit}')
+          base_sha=$(git rev-parse --verify "${base_selector}^{commit}")
+          printf '%s\n' "${head_sha}" > "${metadata}/head-sha.txt"
+          printf '%s\n' "${base_sha}" > "${metadata}/base-sha.txt"
+          printf '%s\n' "${base_selector}" > "${metadata}/base-selector.txt"
+          printf '%s\n' "${PULL_REQUEST_HEAD_SHA:-}" > "${metadata}/pull-request-head-sha.txt"
+
+          git status --short --branch > "${metadata}/head-status.txt"
+          if [[ -s "${metadata}/head-status.txt" && $(git status --porcelain=v1 --untracked-files=all) != '' ]]; then
+            printf '%s\n' dirty > "${metadata}/head-dirty-state.txt"
+          else
+            printf '%s\n' clean > "${metadata}/head-dirty-state.txt"
+          fi
+          git -C "${GITHUB_WORKSPACE}" rev-parse --show-toplevel > "${metadata}/workspace.txt"
+
+          {
+            printf 'event_name=%s\n' "${GITHUB_EVENT_NAME:-}"
+            printf 'ref=%s\n' "${GITHUB_REF:-}"
+            printf 'sha=%s\n' "${GITHUB_SHA:-}"
+            printf 'runner_name=%s\n' "${RUNNER_NAME:-}"
+            printf 'runner_os=%s\n' "${RUNNER_OS:-}"
+            printf 'runner_arch=%s\n' "${RUNNER_ARCH:-}"
+            printf 'goexperiment=%s\n' "${GOEXPERIMENT:-}"
+          } > "${metadata}/runner-and-env.txt"
+          go version > "${metadata}/go-version.txt"
+          {
+            for variable in GOEXPERIMENT GOOS GOARCH GOVERSION GOTOOLCHAIN GOAMD64 GOARM64 CGO_ENABLED; do
+              printf '%s=' "${variable}"
+              go env "${variable}"
+            done
+          } > "${metadata}/go-env.txt"
+          uname -a > "${metadata}/uname.txt"
+          free -h > "${metadata}/memory.txt"
+          df -T -B1 "${evidence}" > "${metadata}/filesystem.txt"
+          if command -v lscpu >/dev/null 2>&1; then
+            lscpu > "${metadata}/lscpu.txt"
+            awk '/Architecture|CPU\(s\)|Model name|Flags|Features/ { print }' \
+              "${metadata}/lscpu.txt" > "${metadata}/cpu-features.txt"
+          else
+            cat /proc/cpuinfo > "${metadata}/lscpu.txt"
+            cp "${metadata}/lscpu.txt" "${metadata}/cpu-features.txt"
+          fi
+
+          {
+            printf 'git rev-parse --verify HEAD^{commit}\n'
+            printf 'git rev-parse --verify %q^{commit}\n' "${base_selector}"
+            printf 'git worktree add --detach %q %q\n' "${base_worktree}" "${base_sha}"
+            printf 'cp %q %q\n' \
+              "${GITHUB_WORKSPACE}/internal/storeio/compact_stream_codec_packed_equal_bench_test.go" \
+              "${base_worktree}/internal/storeio/compact_stream_codec_packed_equal_bench_test.go"
+            printf 'cp %q %q\n' \
+              "${GITHUB_WORKSPACE}/query/file_packed_count_bench_test.go" \
+              "${base_worktree}/query/file_packed_count_bench_test.go"
+            printf 'go test -run %q -c -o %q ./internal/storeio\n' '^$' "${binaries}/base-storeio.test"
+            printf 'go test -run %q -c -o %q ./query\n' '^$' "${binaries}/base-query.test"
+            printf 'go test -run %q -c -o %q ./internal/storeio\n' '^$' "${binaries}/head-storeio.test"
+            printf 'go test -run %q -c -o %q ./query\n' '^$' "${binaries}/head-query.test"
+          } > "${evidence}/prepare-commands.txt"
+
+          git worktree add --detach "${base_worktree}" "${base_sha}"
+          trap 'git worktree remove --force "${base_worktree}" >/dev/null 2>&1 || true' EXIT
+          test -f "${GITHUB_WORKSPACE}/internal/storeio/compact_stream_codec_packed_equal_bench_test.go"
+          test -f "${GITHUB_WORKSPACE}/query/file_packed_count_bench_test.go"
+          mkdir -p "${base_worktree}/internal/storeio" "${base_worktree}/query"
+          cp -- "${GITHUB_WORKSPACE}/internal/storeio/compact_stream_codec_packed_equal_bench_test.go" \
+            "${base_worktree}/internal/storeio/compact_stream_codec_packed_equal_bench_test.go"
+          cp -- "${GITHUB_WORKSPACE}/query/file_packed_count_bench_test.go" \
+            "${base_worktree}/query/file_packed_count_bench_test.go"
+          cmp -- "${GITHUB_WORKSPACE}/internal/storeio/compact_stream_codec_packed_equal_bench_test.go" \
+            "${base_worktree}/internal/storeio/compact_stream_codec_packed_equal_bench_test.go"
+          cmp -- "${GITHUB_WORKSPACE}/query/file_packed_count_bench_test.go" \
+            "${base_worktree}/query/file_packed_count_bench_test.go"
+          git -C "${base_worktree}" status --short > "${metadata}/base-worktree-status.txt"
+
+          cd "${GITHUB_WORKSPACE}"
+          go test -run '^$' -c -o "${binaries}/head-storeio.test" ./internal/storeio
+          go test -run '^$' -c -o "${binaries}/head-query.test" ./query
+          cd "${base_worktree}"
+          go test -run '^$' -c -o "${binaries}/base-storeio.test" ./internal/storeio
+          go test -run '^$' -c -o "${binaries}/base-query.test" ./query
+          for binary in "${binaries}"/*.test; do
+            test -x "${binary}"
+          done
+
+      - name: Run focused SIMD parity and query integration checks
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          evidence="${RUNNER_TEMP}/packed-simd"
+          {
+            printf 'go test -count=1 -timeout=5m ./internal/storeio -run %q\n' \
+              'Test(CountCompact|CompactPacked|CompactStream|CompactPrimaryStripe)'
+            printf 'go test -count=1 -timeout=5m ./query -run %q\n' \
+              '^TestFilePackedEqualityCount(Wide)?$'
+          } > "${evidence}/focused-test-commands.txt"
+          go test -count=1 -timeout=5m ./internal/storeio \
+            -run 'Test(CountCompact|CompactPacked|CompactStream|CompactPrimaryStripe)'
+          go test -count=1 -timeout=5m ./query \
+            -run '^TestFilePackedEqualityCount(Wide)?$'
+
+      - name: Collect alternating native raw benchmarks
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          bash scripts/bench/run-packed-simd.sh \
+            "${RUNNER_TEMP}/packed-simd" \
+            "${RUNNER_TEMP}/packed-simd-binaries/base-storeio.test" \
+            "${RUNNER_TEMP}/packed-simd-binaries/head-storeio.test" \
+            "${RUNNER_TEMP}/packed-simd-binaries/base-query.test" \
+            "${RUNNER_TEMP}/packed-simd-binaries/head-query.test"
+
+      - name: Upload packed SIMD raw evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: packed-simd-${{ matrix.runner }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/packed-simd
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Save Go build cache
+        if: ${{ always() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.go.outputs.cache-path }}
+          key: ${{ steps.go.outputs.cache-key }}

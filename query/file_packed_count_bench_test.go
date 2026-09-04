@@ -27,6 +27,19 @@ func filePackedCountNumber(row int) int {
 	return ((row * 73) & 1023) - 512
 }
 
+// The wide fixture has an independent 256-value dictionary lane and a signed
+// 16-bit FOR lane. Keep it separate from filePackedCountSnapshot so the
+// established dictionary7/FOR10 benchmark remains unchanged for checkpoint
+// comparisons.
+func filePackedCountWideLabel(row int) string {
+	id := uint64((row * 73) & 255)
+	return fmt.Sprintf("c%016x", (id+1)*filePackedCountLabelSalt)
+}
+
+func filePackedCountWideNumber(row int) int64 {
+	return int64(((row * 32749) & 65535) - 32768)
+}
+
 // filePackedCountSnapshot builds the immutable compact-primary fixture used
 // by the durable query benchmark and test. CreateFromPrimary leaves the
 // snapshot with compact stripes and no mutable overlay or declared index.
@@ -66,6 +79,42 @@ func filePackedCountSnapshot(tb testing.TB, rows int) *durable.Snapshot {
 	return snapshot
 }
 
+func filePackedCountWideSnapshot(tb testing.TB, rows int) *durable.Snapshot {
+	tb.Helper()
+	file, err := os.CreateTemp(tb.TempDir(), "query-file-packed-count-wide-*")
+	if err != nil {
+		tb.Fatal(err)
+	}
+	tb.Cleanup(func() { _ = file.Close() })
+
+	source := &store.Collection{}
+	for row := range rows {
+		doc := fmt.Appendf(nil,
+			`{"label":"%s","n":%d}`,
+			filePackedCountWideLabel(row),
+			filePackedCountWideNumber(row),
+		)
+		if _, err := source.Put(fmt.Sprintf("row-%07d", row), doc); err != nil {
+			tb.Fatalf("source row %d: %v", row, err)
+		}
+	}
+	options := durable.Options{Collection: store.Options{ChunkDocuments: 64}}
+	if _, err := durable.CreateFromPrimary(source, file, options); err != nil {
+		tb.Fatalf("CreateFromPrimary wide: %v", err)
+	}
+	collection, err := durable.Open(file, options)
+	if err != nil {
+		tb.Fatalf("Open wide: %v", err)
+	}
+	tb.Cleanup(func() { _ = collection.Close() })
+	snapshot, err := collection.Snapshot()
+	if err != nil {
+		tb.Fatalf("Snapshot wide: %v", err)
+	}
+	tb.Cleanup(func() { _ = snapshot.Close() })
+	return snapshot
+}
+
 type filePackedCountCase struct {
 	name  string
 	query *Query
@@ -83,6 +132,33 @@ func filePackedCountCases(rows int) []filePackedCountCase {
 			name:  "n/FOR10",
 			query: Select(Count()).Where(Cmp("n", Eq, int64(17))),
 			want:  int64(rows / 1024),
+		},
+	}
+}
+
+func filePackedCountWideCases(rows int) []filePackedCountCase {
+	const needleRow = 17
+	labelID := (needleRow * 73) & 255
+	numberNeedle := filePackedCountWideNumber(needleRow)
+	labelWant, numberWant := 0, 0
+	for row := range rows {
+		if (row*73)&255 == labelID {
+			labelWant++
+		}
+		if filePackedCountWideNumber(row) == numberNeedle {
+			numberWant++
+		}
+	}
+	return []filePackedCountCase{
+		{
+			name:  "label/dictionary8",
+			query: Select(Count()).Where(Cmp("label", Eq, filePackedCountWideLabel(needleRow))),
+			want:  int64(labelWant),
+		},
+		{
+			name:  "n/FOR16",
+			query: Select(Count()).Where(Cmp("n", Eq, numberNeedle)),
+			want:  int64(numberWant),
 		},
 	}
 }
@@ -130,6 +206,25 @@ func TestFilePackedEqualityCount(t *testing.T) {
 	}
 }
 
+// TestFilePackedEqualityCountWide exercises the same durable no-index COUNT
+// path as the benchmark with dictionary8 and signed FOR16 data. Expected
+// counts are generated from the actual partial-period corpus rather than a
+// rows/period shortcut.
+func TestFilePackedEqualityCountWide(t *testing.T) {
+	const rows = filePackedCountTestRows
+	snapshot := filePackedCountWideSnapshot(t, rows)
+	e := Exec{Options: ExecOptions{Workers: 1}}
+	defer e.Release()
+	for _, tc := range filePackedCountWideCases(rows) {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.query.RunInto(&e, FromFile(snapshot)); err != nil {
+				t.Fatal(err)
+			}
+			assertFilePackedCount(t, &e, rows, tc.want)
+		})
+	}
+}
+
 // BenchmarkFilePackedEqualityCount measures the actual durable query path,
 // including primary graph traversal, template resolution, and packed equality
 // counting. Setup and one warm RunInto are outside the timed loop; the Exec
@@ -139,6 +234,33 @@ func BenchmarkFilePackedEqualityCount(b *testing.B) {
 	const rows = filePackedCountBenchRows
 	snapshot := filePackedCountSnapshot(b, rows)
 	for _, tc := range filePackedCountCases(rows) {
+		b.Run(tc.name, func(b *testing.B) {
+			e := Exec{Options: ExecOptions{Workers: 1}}
+			defer e.Release()
+			source := FromFile(snapshot)
+			if err := tc.query.RunInto(&e, source); err != nil {
+				b.Fatal(err)
+			}
+			assertFilePackedCount(b, &e, rows, tc.want)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				if err := tc.query.RunInto(&e, source); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.StopTimer()
+			assertFilePackedCount(b, &e, rows, tc.want)
+			b.ReportMetric(float64(rows), "rows")
+			b.ReportMetric(float64(e.Result.RowCount), "result-rows")
+		})
+	}
+}
+
+func BenchmarkFilePackedEqualityCountWide(b *testing.B) {
+	const rows = filePackedCountBenchRows
+	snapshot := filePackedCountWideSnapshot(b, rows)
+	for _, tc := range filePackedCountWideCases(rows) {
 		b.Run(tc.name, func(b *testing.B) {
 			e := Exec{Options: ExecOptions{Workers: 1}}
 			defer e.Release()
