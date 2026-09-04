@@ -93,6 +93,7 @@ func TestCompactStreamCodecRoundTrip(t *testing.T) {
 				t.Fatalf("kind=%d want=%d", encoded.kind, test.kind)
 			}
 			view := compactCodecRoundTrip(t, encoded, test.values)
+			checkCompactSequentialSeeks(t, view)
 			needle := test.values[len(test.values)/2]
 			want := 0
 			for _, value := range test.values {
@@ -133,6 +134,7 @@ func TestCompactStreamAdaptiveSelectionAndCount(t *testing.T) {
 		t.Fatal("deferred dictionary bytes differ from eager encoding")
 	}
 	view := compactCodecRoundTrip(t, encoded, values)
+	checkCompactSequentialSeeks(t, view)
 	matched, supported := view.countDictionaryEqual([]byte(`"PT"`))
 	if !supported || matched != want {
 		t.Fatalf("count=%d supported=%v want=%d", matched, supported, want)
@@ -214,6 +216,7 @@ func TestCompactAlphabetPacksAcrossValuesWithinRestartBlock(t *testing.T) {
 
 	encoded := scratch.finishAlphabet(2, values, plan)
 	view := compactCodecRoundTrip(t, encoded, values)
+	checkCompactSequentialSeeks(t, view)
 	for _, row := range []int{0, compactStreamRestart - 1, compactStreamRestart} {
 		got, valid := view.appendValue(nil, row)
 		if !valid || !bytes.Equal(got, values[row]) {
@@ -260,6 +263,7 @@ func TestCompactAlphabetSequentialZeroWidthMiddle(t *testing.T) {
 		t.Fatalf("kind=%d width=%d dictionaries=%d", encoded.kind, encoded.width, len(encoded.dict))
 	}
 	view := compactCodecRoundTrip(t, encoded, values)
+	checkCompactSequentialSeeks(t, view)
 	var state compactStreamSequentialState
 	for row := range values {
 		got, valid := state.appendValue(nil, &view, row)
@@ -279,7 +283,7 @@ func TestCompactAlphabetSequentialReservoirWidthsRestartsAndAllocations(t *testi
 			values[0][symbol] = byte('A' + symbol)
 		}
 		for row := 1; row < len(values); row++ {
-			length := 1 + row*7%17
+			length := 1 + row*7%81
 			values[row] = make([]byte, length)
 			for char := range length {
 				values[row][char] = byte('A' + (row*5+char*3)%cardinality)
@@ -296,7 +300,8 @@ func TestCompactAlphabetSequentialReservoirWidthsRestartsAndAllocations(t *testi
 			)
 		}
 		view := compactCodecRoundTrip(t, encoded, values)
-		backing := make([]byte, cardinality+17)
+		checkCompactSequentialSeeks(t, view)
+		backing := make([]byte, cardinality+81)
 		decode := func(checkRandom bool) {
 			var state compactStreamSequentialState
 			for row, want := range values {
@@ -406,6 +411,7 @@ func TestCompactStreamNumberCountExactDecimalSemantics(t *testing.T) {
 		}(),
 	} {
 		view := compactCodecRoundTrip(t, encoded, values)
+		checkCompactSequentialSeeks(t, view)
 		for _, test := range []struct {
 			needle      string
 			needleInt   int64
@@ -439,6 +445,7 @@ func TestCompactStreamPackedPrefixIntRoundTrip(t *testing.T) {
 		t.Fatalf("codec kind=%d flags=%02x, want packed prefix-int", encoded.kind, encoded.data[0])
 	}
 	view := compactCodecRoundTrip(t, encoded, values)
+	checkCompactSequentialSeeks(t, view)
 	needle := values[997]
 	want := 0
 	for _, value := range values {
@@ -473,6 +480,7 @@ func TestCompactStreamAdaptiveAlphabetSelection(t *testing.T) {
 		t.Fatalf("alphabet affixes=%q, want shared quotes", encoded.dict[1:])
 	}
 	view := compactCodecRoundTrip(t, encoded, values)
+	checkCompactSequentialSeeks(t, view)
 	buf := make([]byte, 0, 80)
 	allocs := testing.AllocsPerRun(1000, func() {
 		out, ok := view.appendValue(buf[:0], 731)
