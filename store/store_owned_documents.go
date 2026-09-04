@@ -177,7 +177,7 @@ func (b *Builder) compactDocuments(state *State) error {
 		docs.scratch = nil
 		docs.tapeRefs = nil
 		docs.narrow = nil
-		docs.shapes = ShapeCache{}
+		docs.shapes = nil
 		docs.widened = nil
 		docs.source = data
 		docs.mappedDocs = owned

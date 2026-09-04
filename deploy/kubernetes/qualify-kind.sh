@@ -12,6 +12,7 @@ image=vibedb:kube-qualification
 root_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 evidence_dir=${VIBEDB_KUBE_EVIDENCE_DIR:-"${RUNNER_TEMP:-/tmp}/vibedb-kube-rf3-evidence"}
 work_dir=$(mktemp -d "${RUNNER_TEMP:-/tmp}/vibedb-kube-rf3.XXXXXXXX")
+image_context="${work_dir}/image"
 state_dir="${work_dir}/bootstrap-authority"
 bootstrap_yaml="${work_dir}/bootstrap.yaml"
 topology_yaml="${work_dir}/topology.yaml"
@@ -28,6 +29,26 @@ start_port_forward() {
   kubectl port-forward -n "${namespace}" service/vibedb-gateway 17400:7400 \
     >> "${evidence_dir}/port-forward.log" 2>&1 &
   port_forward_pid=$!
+}
+
+wait_for_rollouts() {
+  local phase=$1
+  local failed=0
+  local index role
+  local -a roles=(catalog ledger data gateway)
+  local -a pids=()
+  for role in "${roles[@]}"; do
+    kubectl rollout status -n "${namespace}" "statefulset/vibedb-${role}" --timeout=10m \
+      2>&1 | tee "${evidence_dir}/${phase}-${role}.log" &
+    pids+=("$!")
+  done
+  for index in "${!pids[@]}"; do
+    if ! wait "${pids[index]}"; then
+      printf '%s rollout failed for %s\n' "${phase}" "${roles[index]}" >&2
+      failed=1
+    fi
+  done
+  return "${failed}"
 }
 
 collect_failure_evidence() {
@@ -94,21 +115,40 @@ go env -json GOEXPERIMENT GOAMD64 GOARCH > "${evidence_dir}/go-backend.txt"
 kind version > "${evidence_dir}/kind-version.txt"
 kubectl version --client=true > "${evidence_dir}/kubectl-version.txt"
 
-go build -o "${work_dir}/vibedb-operator" "${root_dir}/cmd/vibedb-operator"
-go build -o "${work_dir}/vibedb-kube-qualify" "${root_dir}/cmd/vibedb-kube-qualify"
+mkdir -p "${image_context}"
+CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' \
+  -o "${image_context}/vibedb-operator" "${root_dir}/cmd/vibedb-operator"
 mkdir -m 0700 "${state_dir}"
-"${work_dir}/vibedb-operator" bootstrap \
+"${image_context}/vibedb-operator" bootstrap \
   -namespace "${namespace}" -state-dir "${state_dir}" \
   > "${bootstrap_yaml}" 2> "${bootstrap_metadata}"
-"${work_dir}/vibedb-operator" render -namespace "${namespace}" -image "${image}" \
+"${image_context}/vibedb-operator" render -namespace "${namespace}" -image "${image}" \
   -bootstrap-state-dir "${state_dir}" > "${topology_yaml}"
-"${work_dir}/vibedb-operator" validate -manifest "${topology_yaml}"
-docker build --build-arg "GOEXPERIMENT=${GOEXPERIMENT}" --file "${root_dir}/deploy/kubernetes/Dockerfile" --tag "${image}" "${root_dir}"
+"${image_context}/vibedb-operator" validate -manifest "${topology_yaml}"
 # From this point cleanup owns this newly created test cluster, including a
 # partially failed create. The earlier existence check never grants ownership.
 cluster_created=true
 kind create cluster --name "${cluster_name}" \
-  --config "${root_dir}/deploy/kubernetes/kind-3-worker.yaml" --wait 120s
+  --config "${root_dir}/deploy/kubernetes/kind-3-worker.yaml" --wait 120s &
+cluster_create_pid=$!
+image_status=0
+if ! CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o "${image_context}/" \
+    "${root_dir}/cmd/vibedb" \
+    "${root_dir}/cmd/vibedb-shard" \
+    "${root_dir}/cmd/vibedb-gateway" \
+    "${root_dir}/cmd/vibedb-kube-qualify" || \
+  ! docker build --file "${root_dir}/deploy/kubernetes/Dockerfile.prebuilt" \
+    --tag "${image}" "${image_context}"; then
+  image_status=1
+fi
+cluster_status=0
+if ! wait "${cluster_create_pid}"; then
+  cluster_status=1
+fi
+if [[ "${image_status}" -ne 0 || "${cluster_status}" -ne 0 ]]; then
+  echo "Kubernetes image or Kind cluster creation failed" >&2
+  exit 1
+fi
 kind load docker-image --name "${cluster_name}" "${image}"
 
 # Even client dry-run performs resource discovery against an API server.
@@ -117,9 +157,7 @@ kubectl apply --dry-run=client --validate=false -f "${topology_yaml}" >/dev/null
 kubectl create namespace "${namespace}"
 kubectl apply -f "${bootstrap_yaml}"
 kubectl apply -f "${topology_yaml}"
-for role in catalog ledger data gateway; do
-  kubectl rollout status -n "${namespace}" "statefulset/vibedb-${role}" --timeout=10m
-done
+wait_for_rollouts initial
 kubectl exec -n "${namespace}" vibedb-gateway-0 -- \
   vibedb-kube-qualify dns -namespace "${namespace}" -timeout 60s \
   | tee "${evidence_dir}/dns.vibejson"
@@ -136,7 +174,7 @@ done
 chmod 0600 "${work_dir}/client-key.pem"
 start_port_forward
 
-"${work_dir}/vibedb-kube-qualify" write \
+"${image_context}/vibedb-kube-qualify" write \
   -certificate "${work_dir}/client-cert.pem" -key "${work_dir}/client-key.pem" \
   -roots "${work_dir}/cluster-roots.pem" \
   -bootstrap-state "${state_dir}/bootstrap-state.vibejson" \
@@ -144,15 +182,16 @@ start_port_forward
   -samples 128 -max-p99 1s -max-latency 5s \
   | tee "${evidence_dir}/before-restart.vibejson"
 
-# Exercise every ordinal, including whichever member currently leads, while
-# StatefulSet readiness keeps each RF3 group from voluntarily losing quorum.
+# Exercise every ordinal, including whichever member currently leads. Each
+# StatefulSet still replaces its own pods in order and waits for readiness;
+# independent RF3 roles can make progress at the same time.
 for role in catalog ledger data gateway; do
   kubectl rollout restart -n "${namespace}" "statefulset/vibedb-${role}"
-  kubectl rollout status -n "${namespace}" "statefulset/vibedb-${role}" --timeout=10m
 done
+wait_for_rollouts restart
 start_port_forward
 
-"${work_dir}/vibedb-kube-qualify" verify \
+"${image_context}/vibedb-kube-qualify" verify \
   -certificate "${work_dir}/client-cert.pem" -key "${work_dir}/client-key.pem" \
   -roots "${work_dir}/cluster-roots.pem" \
   -bootstrap-state "${state_dir}/bootstrap-state.vibejson" \

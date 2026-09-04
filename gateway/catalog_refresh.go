@@ -119,14 +119,15 @@ func (e *Executor) refreshAfterCatalogMiss(
 	return e.catalog.refreshAfter(ctx, staleGeneration, e.refresh)
 }
 
-// validateCatalogPrepare checks a statement against one immutable generation.
+// validateCatalogPrepare checks a statement against one immutable generation
+// and returns that generation on success.
 // A missing table is the sole preparation error eligible for one authenticated
 // refresh and a complete re-prepare; all other planner errors return
 // immediately. The short operation deadline also bounds PG protocol callers,
 // whose backend prepare context is deliberately background-scoped.
-func (e *Executor) validateCatalogPrepare(ctx context.Context, sqlText string) error {
+func (e *Executor) validateCatalogPrepare(ctx context.Context, sqlText string) (uint64, error) {
 	if e == nil || e.catalog == nil {
-		return ErrNoCatalog
+		return 0, ErrNoCatalog
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -136,25 +137,31 @@ func (e *Executor) validateCatalogPrepare(ctx context.Context, sqlText string) e
 	// missing-table error pays the bounded refresh setup below.
 	snapshot := e.catalog.Current()
 	if snapshot == nil {
-		return ErrNoCatalog
+		return 0, ErrNoCatalog
 	}
 	_, err := snapshot.Prepare(ctx, sqlText)
-	if err == nil || !errors.Is(err, ErrTableNotPlaced) {
-		return err
+	if err == nil {
+		return snapshot.Generation(), nil
+	}
+	if !errors.Is(err, ErrTableNotPlaced) {
+		return 0, err
 	}
 	staleGeneration := snapshot.Generation()
 	profile := e.profileFor(ClassInteractive)
 	opctx, cancel := context.WithTimeout(ctx, profile.GlobalDeadline)
 	defer cancel()
 	if refreshErr := e.refreshAfterCatalogMiss(opctx, staleGeneration); refreshErr != nil {
-		return preserveCatalogMiss(err, refreshErr)
+		return 0, preserveCatalogMiss(err, refreshErr)
 	}
 	snapshot = e.catalog.Current()
 	if snapshot == nil {
-		return err
+		return 0, err
 	}
 	_, retryErr := snapshot.Prepare(opctx, sqlText)
-	return retryErr
+	if retryErr != nil {
+		return 0, retryErr
+	}
+	return snapshot.Generation(), nil
 }
 
 // preserveCatalogMiss returns the original planner/route diagnostic when a

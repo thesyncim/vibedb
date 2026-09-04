@@ -283,8 +283,12 @@ func TestLegacySQLJoinLayoutAndWarmAllocationGates(t *testing.T) {
 		if got := unsafe.Sizeof(planJoin{}); got != 104 {
 			t.Fatalf("planJoin size = %d, want unchanged 104", got)
 		}
-		if got := unsafe.Sizeof(joinBinding{}); got != 3760 {
-			t.Fatalf("joinBinding size = %d, want unchanged 3760", got)
+		// 3760 before store.Segment shed its 248-byte ingest shape cache
+		// (perf/commit-garbage): joinBinding.file.docs is a batch Segment,
+		// so the binding shrinks with it. Layout of query-owned fields is
+		// unchanged — lits offset below still pins that.
+		if got := unsafe.Sizeof(joinBinding{}); got != 3520 {
+			t.Fatalf("joinBinding size = %d, want unchanged 3520", got)
 		}
 		if got := unsafe.Offsetof(joinBinding{}.lits); got != 8 {
 			t.Fatalf("joinBinding.lits offset = %d, want unchanged 8", got)
@@ -305,8 +309,13 @@ func TestLegacySQLJoinLayoutAndWarmAllocationGates(t *testing.T) {
 		if got := unsafe.Sizeof(planJoin{}); got != 56 {
 			t.Fatalf("planJoin size = %d, want unchanged 56", got)
 		}
-		if got := unsafe.Sizeof(joinBinding{}); got != 2064 {
-			t.Fatalf("joinBinding size = %d, want unchanged 2064", got)
+		// 2064 before store.Segment shed its ingest shape cache: a 192-byte
+		// cache becomes a 4-byte pointer on 32-bit, derived analytically
+		// (no 32-bit runner here; the 64-bit pin above is measured and CI
+		// covers 386). All fields after docs are 4-aligned slices and ints
+		// on 32-bit, so the tail only shifts by the delta, never repacks.
+		if got := unsafe.Sizeof(joinBinding{}); got != 1876 {
+			t.Fatalf("joinBinding size = %d, want unchanged 1876", got)
 		}
 		if got := unsafe.Offsetof(joinBinding{}.lits); got != 4 {
 			t.Fatalf("joinBinding.lits offset = %d, want unchanged 4", got)

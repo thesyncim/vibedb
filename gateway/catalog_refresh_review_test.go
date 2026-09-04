@@ -319,6 +319,11 @@ func TestCatalogRefreshReviewPostgresPrepareRefreshesOnlyMissingTables(t *testin
 				if err != nil {
 					t.Fatal(err)
 				}
+				if read, ok := statement.(*postgresStatement); ok &&
+					read.catalogGeneration != fixture.snapshot.Generation() {
+					t.Fatalf("read cache generation=%d, want validated generation=%d",
+						read.catalogGeneration, fixture.snapshot.Generation())
+				}
 				statement.Close()
 			}
 			if refreshes != 1 || executor.catalog.Current().Generation() != 5 {
@@ -344,7 +349,7 @@ func TestCatalogRefreshReviewPrepareAndExplainBoundColdRefresh(t *testing.T) {
 		if explain {
 			_, err = executor.Explain(context.Background(), Query{SQL: `SELECT id FROM absent`, Class: ClassInteractive})
 		} else {
-			err = executor.validateCatalogPrepare(context.Background(), `SELECT id FROM absent`)
+			_, err = executor.validateCatalogPrepare(context.Background(), `SELECT id FROM absent`)
 		}
 		if !errors.Is(err, ErrTableNotPlaced) || !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("explain=%t lost deadline or missing-table refusal: %v", explain, err)

@@ -71,6 +71,26 @@ jobs:
               -test.benchtime=300ms -test.count=5 \
               | tee -a "$RUNNER_TEMP/packed-read-results/$revision.txt"
           done
+      - name: Profile single-worker full-byte scans
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          set -euo pipefail
+          for revision in base head; do
+            "$RUNNER_TEMP/packed-read-$revision.test" \
+              -test.run '^$' \
+              -test.bench '^BenchmarkUnifiedPartitionedScanAllBytes$/workers=1$' \
+              -test.benchtime=5s -test.count=1 \
+              -test.cpuprofile="$RUNNER_TEMP/packed-read-results/$revision.cpu" \
+              > "$RUNNER_TEMP/packed-read-results/$revision-profile-run.txt"
+            go tool pprof -top -nodecount=100 \
+              "$RUNNER_TEMP/packed-read-$revision.test" \
+              "$RUNNER_TEMP/packed-read-results/$revision.cpu" \
+              > "$RUNNER_TEMP/packed-read-results/$revision-profile-top.txt"
+            go tool pprof -top -cum -nodecount=100 \
+              "$RUNNER_TEMP/packed-read-$revision.test" \
+              "$RUNNER_TEMP/packed-read-results/$revision.cpu" \
+              > "$RUNNER_TEMP/packed-read-results/$revision-profile-cum.txt"
+          done
       - uses: actions/upload-artifact@v6
         if: always()
         with:

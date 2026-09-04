@@ -10,7 +10,7 @@ permissions:
 
 concurrency:
   group: wal-retention-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: true
 
 env:
   GOEXPERIMENT: simd

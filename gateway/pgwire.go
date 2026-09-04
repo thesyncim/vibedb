@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"sync"
 
@@ -13,6 +14,11 @@ import (
 	"github.com/thesyncim/vibedb/shardservice"
 	sqlast "github.com/thesyncim/vibedb/sql"
 	driver "github.com/thesyncim/vibedb/sql/driver"
+)
+
+const (
+	maxPostgresReadCacheSQLBytes   = 4 << 10
+	maxPostgresReadCacheParameters = 256
 )
 
 // PostgreSQLBackend exposes distributed reads and optional durable autocommit
@@ -49,8 +55,21 @@ type postgresSession struct {
 	bytes        int64
 	intermediate int64
 	statements   map[pgwire.BackendStatement]struct{}
+	readCache    postgresReadCache
 	cancelMu     sync.Mutex
 	cancel       context.CancelFunc
+}
+
+// postgresReadCache owns one recently closed distributed SELECT. PostgreSQL's
+// extended unnamed protocol closes that backend statement before parsing the
+// next one, so a single exact entry covers the steady state without retaining
+// an unbounded SQL-keyed map per connection.
+type postgresReadCache struct {
+	text              string
+	parameterTypes    []driver.ParamType
+	compiled          *query.Statement
+	resultParamTypes  []driver.ParamType
+	catalogGeneration uint64
 }
 
 func (s *postgresSession) State() driver.SessionState { return s.state }
@@ -123,11 +142,64 @@ func (s *postgresSession) RollbackTo(ctx context.Context, name string) error {
 }
 func (s *postgresSession) Close() error {
 	s.Cancel()
+	s.state = driver.SessionClosed
 	for statement := range s.statements {
 		_ = statement.Close()
 	}
-	s.state = driver.SessionClosed
+	s.releaseReadCache()
 	return nil
+}
+
+func (s *postgresSession) releaseReadCache() {
+	if s.readCache.compiled != nil {
+		s.readCache.compiled.Release()
+	}
+	s.readCache = postgresReadCache{}
+}
+
+func (s *postgresSession) takeCachedRead(
+	text string,
+	parameterTypes []driver.ParamType,
+) *postgresStatement {
+	cache := &s.readCache
+	if cache.compiled == nil || cache.text != text ||
+		!slices.Equal(cache.parameterTypes, parameterTypes) {
+		return nil
+	}
+	snapshot := s.backend.Executor.catalog.Current()
+	if snapshot == nil || snapshot.Generation() != cache.catalogGeneration {
+		return nil
+	}
+	statement := &postgresStatement{
+		session: s, compiled: cache.compiled,
+		paramTypes:          cache.resultParamTypes,
+		cacheParameterTypes: cache.parameterTypes,
+		catalogGeneration:   cache.catalogGeneration,
+	}
+	*cache = postgresReadCache{}
+	s.statements[statement] = struct{}{}
+	return statement
+}
+
+func (s *postgresSession) retainRead(statement *postgresStatement) bool {
+	if s == nil || s.state == driver.SessionClosed || statement == nil ||
+		statement.compiled == nil || statement.local ||
+		len(statement.compiled.SQL()) > maxPostgresReadCacheSQLBytes ||
+		statement.compiled.NumParams() > maxPostgresReadCacheParameters {
+		return false
+	}
+	s.releaseReadCache()
+	s.readCache = postgresReadCache{
+		text:              statement.compiled.SQL(),
+		parameterTypes:    statement.cacheParameterTypes,
+		compiled:          statement.compiled,
+		resultParamTypes:  statement.paramTypes,
+		catalogGeneration: statement.catalogGeneration,
+	}
+	statement.compiled = nil
+	statement.paramTypes = nil
+	statement.cacheParameterTypes = nil
+	return true
 }
 func (s *postgresSession) Tables(ctx context.Context) ([]driver.TableInfo, error) {
 	if err := ctx.Err(); err != nil {
@@ -189,6 +261,9 @@ func (s *postgresSession) prepare(
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if cached := s.takeCachedRead(text, parameterTypes); cached != nil {
+		return cached, nil
+	}
 	var parser sqlast.Parser
 	var parsed sqlast.Statement
 	err := parser.ParseStatement(&parsed, text)
@@ -215,19 +290,26 @@ func (s *postgresSession) prepare(
 		return nil, err
 	}
 	local := len(tree.From) == 0
+	var catalogGeneration uint64
 	if !local {
 		// Snapshot.Prepare is the catalog-pinned physical routing compiler. It
 		// parses placement, constraints, ordering, and aggregate shape but never
 		// performs scalar/common-type analysis; compiled above is therefore the
 		// sole semantic prepare and already consumed the declared type hints.
-		if err := s.backend.Executor.validateCatalogPrepare(ctx, text); err != nil {
+		catalogGeneration, err = s.backend.Executor.validateCatalogPrepare(ctx, text)
+		if err != nil {
 			compiled.Release()
 			return nil, err
 		}
 	}
 	statement := &postgresStatement{
 		session: s, compiled: compiled, local: local,
-		paramTypes: postgresSelectParameterTypes(compiled),
+		paramTypes:        postgresSelectParameterTypes(compiled),
+		catalogGeneration: catalogGeneration,
+	}
+	if !local && len(text) <= maxPostgresReadCacheSQLBytes &&
+		len(parameterTypes) <= maxPostgresReadCacheParameters {
+		statement.cacheParameterTypes = slices.Clone(parameterTypes)
 	}
 	s.statements[statement] = struct{}{}
 	return statement, nil
@@ -325,6 +407,11 @@ type postgresStatement struct {
 	// execution forwards a present vector so the shard's independent prepare
 	// observes the same analyzed input domains as this gateway prepare.
 	paramTypes []driver.ParamType
+	// cacheParameterTypes is the exact input-hint vector for an eligible
+	// distributed SELECT. It moves with compiled into the session's one-entry
+	// cache and is reused without allocating on an exact hit.
+	cacheParameterTypes []driver.ParamType
+	catalogGeneration   uint64
 }
 
 func (p *postgresStatement) Kind() sqlast.Kind { return sqlast.KindSelect }
@@ -361,11 +448,12 @@ func (p *postgresStatement) AppendSchema(dst []query.OutputColumn) []query.Outpu
 	return p.compiled.AppendSchema(dst)
 }
 func (p *postgresStatement) Close() error {
-	if p.compiled != nil {
+	if p.compiled != nil && !p.session.retainRead(p) {
 		p.compiled.Release()
 		p.compiled = nil
 	}
 	p.paramTypes = nil
+	p.cacheParameterTypes = nil
 	delete(p.session.statements, p)
 	return nil
 }

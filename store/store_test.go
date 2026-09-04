@@ -278,8 +278,16 @@ func TestStoreMutationReusesOnlyLiveImmutableStorage(t *testing.T) {
 				i, len(ref.Rec.Fields), cap(ref.Rec.Fields), len(ref.Rec.table), cap(ref.Rec.table))
 		}
 	}
-	if got := len(beforeChunk.Docs.shapes.shapes); got != 1 {
-		t.Fatalf("compiled shapes = %d, want 1", got)
+	// The ingest cache is released at seal; dedup is proven through the
+	// rows instead: eight documents over one layout share one record.
+	seen := make(map[*ShapeRecord]struct{})
+	for i := range beforeSources {
+		if rec := beforeChunk.Docs.ShapeTapeRefAt(int(beforeChunk.Ord[i])).Rec; rec != nil {
+			seen[rec] = struct{}{}
+		}
+	}
+	if len(seen) != 1 {
+		t.Fatalf("distinct shape records = %d, want 1", len(seen))
 	}
 
 	replacement := []byte(`{"id":3,"group":9,"active":false,"name":"new"}`)
@@ -317,15 +325,31 @@ func TestStoreMutationReusesOnlyLiveImmutableStorage(t *testing.T) {
 	for i := range 3 {
 		_, _ = churn.Put(fmt.Sprintf("k%d", i), []byte(fmt.Sprintf(`{"a":%d,"x":true}`, i)))
 	}
-	oldRec := churn.state.Load().Chunks.Get(0).Docs.shapes.shapes[0]
+	oldRec := churn.state.Load().Chunks.Get(0).Docs.ShapeTapeRefAt(0).Rec
+	if oldRec == nil {
+		t.Fatal("layout A row carries no shape record")
+	}
 	for i := range 3 {
 		if _, err := churn.Put(fmt.Sprintf("k%d", i), []byte(fmt.Sprintf(`{"b":%d,"y":false}`, i))); err != nil {
 			t.Fatal(err)
 		}
 	}
-	currentShapes := churn.state.Load().Chunks.Get(0).Docs.shapes.shapes
-	if len(currentShapes) != 1 || currentShapes[0] == oldRec {
-		t.Fatalf("live shape cache retained obsolete records: %p old=%p", currentShapes[0], oldRec)
+	// The ingest cache is released at seal, so the no-history invariant is
+	// proven through the live rows: exactly one layout B record, never A's.
+	afterChurn := churn.state.Load().Chunks.Get(0)
+	current := make(map[*ShapeRecord]struct{})
+	for i := 0; i < afterChurn.Docs.Len(); i++ {
+		if rec := afterChurn.Docs.ShapeTapeRefAt(i).Rec; rec != nil {
+			current[rec] = struct{}{}
+		}
+	}
+	if len(current) != 1 {
+		t.Fatalf("live rows reference %d distinct shape records, want 1", len(current))
+	}
+	for rec := range current {
+		if rec == oldRec {
+			t.Fatalf("live rows still reference obsolete layout A record %p", oldRec)
+		}
 	}
 }
 
