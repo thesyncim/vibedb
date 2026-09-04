@@ -39,6 +39,9 @@ on:
 permissions:
   contents: read
 
+env:
+  GOEXPERIMENT: simd
+
 concurrency:
   group: fused-node-rf3-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}

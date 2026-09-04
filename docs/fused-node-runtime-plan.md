@@ -234,3 +234,22 @@ a performance claim merely because RPC/process counts fell.
 Versioned visibility, interactive serializable transactions, nonblocking schema
 publication, balancing and safe lease/fencing remain subsequent structural
 work under the same full goal.
+
+## Current measured checkpoint (2026-09-04)
+
+The first shortened comparison is retained in
+[the independent audit](benchmarks/fused-node-short-2026-09-04/audit-summary.md).
+Candidate `27b89cd6` achieved 1.081x and 1.244x the `82ea6abf` parent
+throughput geomean in the two orders, and 0.418x and 0.534x CockroachDB.
+Its observed gateway locality differed between orders. Writes showed no
+reproducible gain. The 1,024-row, one-table run does not qualify this tranche.
+Main `fc7548a7` was merged after measurement and is excluded from those results.
+
+The real Linux physical3/physical6 process test remains a failing gate.
+Both layouts create three tables and validate topology and identities.
+Physical3 acknowledges 18 writes and passes the owner PG content oracle,
+then native frontend2 returns an internal error. Physical6 reports missing
+table placement in its pinned catalog during PG verification. The latter
+failure does not record which frontend returned it. Crash/restart is not
+reached. Keep this regression visible; neither recovery qualification nor
+complete frontend visibility is established.
