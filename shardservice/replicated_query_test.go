@@ -3,9 +3,11 @@ package shardservice
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -381,5 +383,46 @@ func TestReplicatedSQLTierEscalationClassifiesOnlyGrowableLimits(t *testing.T) {
 				t.Fatal("final tier grows")
 			}
 		})
+	}
+}
+
+func TestReplicatedSQLBudgetHintsBoundedAndConservative(t *testing.T) {
+	var hints replicatedSQLBudgetHints
+	key := sha256.Sum256([]byte("SELECT bucket, COUNT(*) FROM docs GROUP BY bucket"))
+	if hints.lookup(key) != 0 {
+		t.Fatal("cold query skipped smallest tier")
+	}
+	hints.record(key, 2)
+	hints.record(key, 1)
+	if hints.lookup(key) != 2 {
+		t.Fatal("smaller concurrent result reduced proven allowance")
+	}
+	collision := key
+	collision[1] ^= 1
+	if hints.lookup(collision) != 0 {
+		t.Fatal("colliding query inherited allowance")
+	}
+	hints.record(collision, 3)
+	if hints.lookup(key) != 0 || hints.lookup(collision) != 3 {
+		t.Fatal("collision did not replace fixed slot")
+	}
+	hints.record(collision, 1000)
+	if hints.lookup(collision) != 3 {
+		t.Fatal("invalid tier retained")
+	}
+	var workers sync.WaitGroup
+	for i := range 32 {
+		workers.Go(func() {
+			for range 100 {
+				hints.record(key, 1+i%3)
+				if tier := hints.lookup(key); tier < 0 || tier >= len(replicatedSQLTiers) {
+					t.Errorf("invalid concurrent tier %d", tier)
+				}
+			}
+		})
+	}
+	workers.Wait()
+	if hints.lookup(key) != 3 {
+		t.Fatal("concurrent promotions lost largest allowance")
 	}
 }

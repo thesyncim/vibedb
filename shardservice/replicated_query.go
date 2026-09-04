@@ -3,7 +3,10 @@ package shardservice
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
+	"runtime/trace"
+	"sync"
 
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftservice"
@@ -82,15 +85,54 @@ func (server *ReplicatedServer) executeReplicatedQuery(ctx context.Context, requ
 	if inner.MaxResultBytes > 0 && inner.MaxResultBytes < uint64(maximum) {
 		maximum = int(inner.MaxResultBytes)
 	}
-	for tier := range replicatedSQLTiers {
+	key := sha256.Sum256([]byte(inner.SQL))
+	for tier := server.sqlHints.lookup(key); tier < len(replicatedSQLTiers); tier++ {
 		budget := replicatedSQLTiers[tier]
 		budget.resultBytes = min(budget.resultBytes, int(request.MaxValueBytes))
 		response, grow := server.executeReplicatedQueryTier(ctx, request, state, inner, owner, budget, maximum)
 		if !grow {
+			if response.Kind == ReplicatedQueryResult {
+				server.sqlHints.record(key, tier)
+			}
 			return response
 		}
 	}
 	return refuse(ReplicatedRefusalReadBufferBound)
+}
+
+// Hints affect only the initial reservation, never plans, rows, authorization,
+// deadlines or result limits. Different parameters/schema generations may need
+// more memory and still escalate normally. Fixed direct-mapped storage bounds
+// retention; collisions only discard an optimization. No SQL text is retained.
+// Repeated large scans avoid executing their smaller failed tiers each time.
+type replicatedSQLBudgetHints struct {
+	mu      sync.Mutex
+	entries [256]struct {
+		key  [sha256.Size]byte
+		tier uint8
+	}
+}
+
+func (hints *replicatedSQLBudgetHints) lookup(key [sha256.Size]byte) int {
+	hints.mu.Lock()
+	entry := hints.entries[key[0]]
+	hints.mu.Unlock()
+	if entry.key == key {
+		return int(entry.tier)
+	}
+	return 0
+}
+
+func (hints *replicatedSQLBudgetHints) record(key [sha256.Size]byte, tier int) {
+	if tier <= 0 || tier >= len(replicatedSQLTiers) {
+		return
+	}
+	hints.mu.Lock()
+	entry := &hints.entries[key[0]]
+	if entry.key != key || tier > int(entry.tier) {
+		entry.key, entry.tier = key, uint8(tier)
+	}
+	hints.mu.Unlock()
 }
 
 type replicatedSQLBudget struct {
@@ -132,7 +174,10 @@ func (server *ReplicatedServer) executeReplicatedQueryTier(ctx context.Context, 
 		return &ReplicatedResponse{Kind: ReplicatedRefusal, Refusal: code, HasState: true, State: wireState}, false
 	}
 	charge := budget.reservationBytes()
-	if !server.frames.reserveSQL(ctx, charge) {
+	admission := trace.StartRegion(ctx, "sql.read.admission")
+	admitted := server.frames.reserveSQL(ctx, charge)
+	admission.End()
+	if !admitted {
 		return refuse(ReplicatedRefusalAdmissionBound)
 	}
 	lease := &replicatedSQLLease{budget: &server.frames, bytes: charge}
@@ -143,7 +188,9 @@ func (server *ReplicatedServer) executeReplicatedQueryTier(ctx context.Context, 
 		}
 	}()
 	var cut raftservice.LinearizableDataReadCut
+	quorum := trace.StartRegion(ctx, "sql.read.quorum")
 	err := owner.ReadLinearizableDataInto(ctx, raftservice.LinearizableDataReadRequest{Fence: state.Fence(), Capability: request.Capability}, &cut)
+	quorum.End()
 	if err != nil {
 		switch {
 		case errors.Is(err, raftmodel.ErrNotLeader), errors.Is(err, raftmodel.ErrReadLeadershipLost):
@@ -163,7 +210,9 @@ func (server *ReplicatedServer) executeReplicatedQueryTier(ctx context.Context, 
 	if !ok {
 		return refuse(ReplicatedRefusalUnavailable)
 	}
+	execution := trace.StartRegion(ctx, "sql.read.execute")
 	result, err := executeFencedSQLBudget(ctx, source, cut.Data(), inner, budget)
+	execution.End()
 	if err != nil {
 		if ctx.Err() == nil && budget.canGrow(err, maximum) {
 			return nil, true
@@ -179,7 +228,10 @@ func (server *ReplicatedServer) executeReplicatedQueryTier(ctx context.Context, 
 		return refuse(ReplicatedRefusalReadBufferBound)
 	}
 	var encoded bytes.Buffer
-	if err := EncodeResponse(&encoded, result); err != nil {
+	encoding := trace.StartRegion(ctx, "sql.read.encode")
+	encodeErr := EncodeResponse(&encoded, result)
+	encoding.End()
+	if encodeErr != nil {
 		return refuse(ReplicatedRefusalUnavailable)
 	}
 	if encoded.Len() > budget.resultBytes {

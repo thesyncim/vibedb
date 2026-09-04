@@ -52,6 +52,7 @@ type ReplicatedServer struct {
 	state          atomic.Uint32
 	requestTimeout time.Duration
 	frames         replicatedFrameByteBudget
+	sqlHints       replicatedSQLBudgetHints
 	authorization  *serviceauthz.Gate
 	audit          serviceauthz.AuditSink
 	serving        func(raftservice.ServingState) bool
