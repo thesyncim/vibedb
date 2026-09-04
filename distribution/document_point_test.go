@@ -2,7 +2,10 @@ package distribution
 
 import (
 	"errors"
+	"strings"
 	"testing"
+
+	"github.com/thesyncim/vibejson"
 )
 
 func TestDocumentPointProgramMatchesNativeTuple(t *testing.T) {
@@ -137,6 +140,51 @@ func TestDocumentPointProgramReleasesBorrowedScalarsOnEveryExit(t *testing.T) {
 		t.Fatalf("late scalar error=%v", err)
 	}
 	assertReleased("late error")
+}
+
+func TestDocumentPointProgramReusesIndexAndValidatesGrowth(t *testing.T) {
+	program, err := CompileDocumentPointProgram([]string{"/tenant", "/region"}, DefaultVirtualBucketBits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := program.mapper.PointFor([]Scalar{NewString("acme"), NewString("eu-west")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var workspace DocumentPointWorkspace
+	for _, source := range []string{
+		`{"tenant":"acme","region":"eu-west"}`,
+		`{"tenant":"old","region":"eu\u002dwest","payload":[1,{"nested":true}],"tenant":"acme"}`,
+		`{"tenant":"acme","region":"eu-west"}`,
+	} {
+		got, err := program.Point([]byte(source), &workspace)
+		if err != nil || got != want {
+			t.Fatalf("Point(%s) = %x, %v; want %x", source, got, err, want)
+		}
+	}
+	retained := &workspace.entries[0]
+	// BuildIndex consumes capacity, so reuse must also work with zero length.
+	workspace.entries = workspace.entries[:0]
+	if _, err := program.Point([]byte(`{"tenant":"acme","region":"eu-west"}`), &workspace); err != nil {
+		t.Fatal(err)
+	}
+	if &workspace.entries[:cap(workspace.entries)][0] != retained {
+		t.Fatal("warm call replaced sufficient index storage")
+	}
+	for _, source := range []string{
+		`{"tenant":"acme","region":"eu-west"} garbage`,
+		`{"tenant":"acme","region":"eu-west","payload":[` + strings.Repeat("0,", 100) + `]}`,
+		`{"tenant":"acme","region":"eu-west","payload":` + strings.Repeat("[", vibejson.DefaultMaxDepth+1) + `0` + strings.Repeat("]", vibejson.DefaultMaxDepth+1) + `}`,
+	} {
+		for _, cold := range []bool{false, true} {
+			if cold {
+				workspace = DocumentPointWorkspace{}
+			}
+			if _, err := program.Point([]byte(source), &workspace); !errors.Is(err, ErrDocumentPoint) {
+				t.Fatalf("Point invalid input (cold=%v) error = %v", cold, err)
+			}
+		}
+	}
 }
 
 func BenchmarkDocumentPointProgram(b *testing.B) {

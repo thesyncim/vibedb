@@ -99,16 +99,17 @@ func (p *DocumentPointProgram) Point(
 	if p == nil || p.mapper == nil || workspace == nil || len(p.pointers) == 0 {
 		return KeyspacePoint{}, fmt.Errorf("%w: nil program or workspace", ErrDocumentPoint)
 	}
-	needed, err := vibejson.RequiredIndexEntries(document)
-	if err != nil {
-		return KeyspacePoint{}, fmt.Errorf("%w: invalid JSON: %v", ErrDocumentPoint, err)
-	}
-	if cap(workspace.entries) < needed {
-		workspace.entries = make([]vibejson.IndexEntry, needed)
-	} else {
-		workspace.entries = workspace.entries[:needed]
-	}
 	index, err := vibejson.BuildIndex(document, workspace.entries)
+	if errors.Is(err, jsondoc.ErrIndexFull) {
+		// Count only when retained storage cannot hold the document. Building
+		// the index already validates it, so warm calls need just one scan.
+		needed, countErr := vibejson.RequiredIndexEntries(document)
+		if countErr != nil {
+			return KeyspacePoint{}, fmt.Errorf("%w: invalid JSON: %v", ErrDocumentPoint, countErr)
+		}
+		workspace.entries = make([]vibejson.IndexEntry, needed)
+		index, err = vibejson.BuildIndex(document, workspace.entries)
+	}
 	if err != nil {
 		return KeyspacePoint{}, fmt.Errorf("%w: invalid JSON: %v", ErrDocumentPoint, err)
 	}
@@ -128,10 +129,9 @@ func (p *DocumentPointProgram) Point(
 				"%w: column %d is missing", ErrDocumentPoint, ordinal,
 			)
 		}
-		value := node.Raw()
-		switch value.Kind() {
+		switch node.Kind() {
 		case jsondoc.String:
-			if text, ok := value.StringBytes(); ok {
+			if text, ok := node.StringBytes(); ok {
 				scalars[ordinal] = NewString(byteview.String(text))
 				continue
 			}
@@ -140,15 +140,15 @@ func (p *DocumentPointProgram) Point(
 			}
 			start := len(workspace.text)
 			var ok bool
-			workspace.text, ok, err = value.AppendText(workspace.text)
-			if err != nil || !ok {
+			workspace.text, ok = node.AppendText(workspace.text)
+			if !ok {
 				return KeyspacePoint{}, fmt.Errorf(
 					"%w: column %d has an invalid string", ErrDocumentPoint, ordinal,
 				)
 			}
 			scalars[ordinal] = NewString(byteview.String(workspace.text[start:]))
 		case jsondoc.Number:
-			number, ok := value.NumberBytes()
+			number, ok := node.NumberBytes()
 			if !ok {
 				return KeyspacePoint{}, fmt.Errorf(
 					"%w: column %d has an invalid number", ErrDocumentPoint, ordinal,
