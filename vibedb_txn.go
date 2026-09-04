@@ -198,7 +198,10 @@ type txCollectionState struct {
 
 	overlaySource query.FileOverlaySource
 
-	readSet     map[string]struct{}
+	// readSet maps each exactly-read key to its owned copy. Staging reuses
+	// the owned copy instead of owning the key a second time, so a key
+	// staged after being read costs one clone rather than two.
+	readSet     map[string]string
 	readOrder   []string
 	coarseRead  bool
 	readTracked bool
@@ -382,10 +385,20 @@ func (t *Tx) Commit() error {
 	return nil
 }
 
-func (t *Tx) publicationKeys(dirty []*txCollectionState) map[string][]string {
-	published := make(map[string][]string, len(dirty))
+// txPublishedKeys is one collection's contribution to a commit's conflict
+// history: the keys whose publication concurrent validators must observe.
+// A slice replaces the old name-keyed map because publication recording
+// assigns one global revision to the whole commit and never looks anything
+// up by name; the map was pure per-commit overhead.
+type txPublishedKeys struct {
+	name string
+	keys []string
+}
+
+func (t *Tx) publicationKeys(dirty []*txCollectionState) []txPublishedKeys {
+	var published []txPublishedKeys
 	for _, state := range dirty {
-		keys := make([]string, 0, len(state.order))
+		var keys []string
 		for _, key := range state.order {
 			entry := state.pending[key]
 			if !entry.existed && entry.remove {
@@ -394,7 +407,7 @@ func (t *Tx) publicationKeys(dirty []*txCollectionState) map[string][]string {
 			keys = append(keys, key)
 		}
 		if len(keys) > 0 {
-			published[state.name] = keys
+			published = append(published, txPublishedKeys{name: state.name, keys: keys})
 		}
 	}
 	return published
@@ -410,7 +423,7 @@ func (t *Tx) Rollback() error {
 	return nil
 }
 
-func (t *Tx) finish(published map[string][]string) {
+func (t *Tx) finish(published []txPublishedKeys) {
 	if t.done {
 		return
 	}
@@ -509,6 +522,41 @@ func (t *Tx) captureCut() error {
 func (t *Tx) newCollectionState(name string) *txCollectionState {
 	maxDocs, maxBytes := t.db.batchBounds(name)
 	maxKey, maxDoc := t.db.documentBounds(name)
+	return newTxCollectionState(name, maxDocs, maxBytes, maxKey, maxDoc)
+}
+
+// newCollectionStateResolved builds the state for a read-write touch from an
+// already-resolved backend, deriving admission limits from the held pointers
+// instead of repeating catalog lookups. The values match batchBounds and
+// documentBounds exactly: the memory profile reports constants and facade
+// defaults regardless of existence; a resolved durable collection reports its
+// persisted limits; an absent collection falls back to facade and engine
+// defaults. (A collection dropped concurrently between resolution and use may
+// observe either source; both directions fail safe because the engines
+// re-enforce their own limits at publish.)
+func (t *Tx) newCollectionStateResolved(name string, memory *store.Collection, disk *durable.Collection) *txCollectionState {
+	maxDocs, maxBytes := defaultFacadeMaxBatchDocuments, defaultFacadeMaxBatchBytes
+	maxKey, maxDoc := defaultMaxKeyBytes, defaultMaxDocumentBytes
+	if db := t.db; db != nil {
+		maxKey, maxDoc = db.maxKeyBytes, db.maxDocumentBytes
+		if db.profile != Memory {
+			if disk != nil {
+				maxKey, maxDoc = disk.MaxKeyBytes(), disk.MaxDocumentBytes()
+				maxDocs, maxBytes = disk.MaxBatchDocuments(), disk.MaxBatchBytes()
+			} else {
+				if db.engine.MaxBatchDocuments > 0 {
+					maxDocs = db.engine.MaxBatchDocuments
+				}
+				if db.engine.MaxBatchBytes > 0 {
+					maxBytes = db.engine.MaxBatchBytes
+				}
+			}
+		}
+	}
+	return newTxCollectionState(name, maxDocs, maxBytes, maxKey, maxDoc)
+}
+
+func newTxCollectionState(name string, maxDocs, maxBytes, maxKey, maxDoc int) *txCollectionState {
 	state := &txCollectionState{
 		name:     name,
 		pending:  make(map[string]*txMutation),
@@ -531,10 +579,11 @@ func (t *Tx) ensureCollection(name string) (*txCollectionState, error) {
 		var exists bool
 		if !t.readOnly {
 			db := t.db
-			// Close resets the memory catalog under handlesMu.
-			db.handlesMu.Lock()
+			// Close resets the memory catalog under handlesMu's write
+			// leg, so the shared leg still excludes teardown here.
+			db.handlesMu.RLock()
 			if db.closed.Load() {
-				db.handlesMu.Unlock()
+				db.handlesMu.RUnlock()
 				return nil, ErrClosed
 			}
 			if db.profile == Memory {
@@ -542,17 +591,18 @@ func (t *Tx) ensureCollection(name string) (*txCollectionState, error) {
 			} else {
 				_, exists = db.disk.Collection(name)
 			}
-			db.handlesMu.Unlock()
+			db.handlesMu.RUnlock()
 		}
 		if !exists {
 			return nil, fmt.Errorf("%w: dynamic collections", ErrTxTooLarge)
 		}
 	}
-	state := t.newCollectionState(name)
-	state.absent = true
 	if t.readOnly {
 		// Every collection present at BeginReadOnly already has a state. A
 		// name outside that cut remains absent even if it was created later.
+		// Limits resolve through the catalog exactly as at Begin.
+		state := t.newCollectionState(name)
+		state.absent = true
 		if t.dynamicStates >= maxSerializableReadCollections {
 			return nil, fmt.Errorf("%w: dynamic collections", ErrTxTooLarge)
 		}
@@ -570,6 +620,8 @@ func (t *Tx) ensureCollection(name string) (*txCollectionState, error) {
 	if err != nil {
 		return nil, err
 	}
+	state := t.newCollectionStateResolved(name, memory, disk)
+	state.absent = true
 	state.coll = coll
 	if memory == nil && disk == nil {
 		if t.dynamicStates >= maxSerializableReadCollections {
@@ -793,7 +845,6 @@ func fillDurableBatch(batch *durable.WriteBatch, state *txCollectionState) error
 
 func (t *Tx) commitMemory(dirty []*txCollectionState) error {
 	participants := make([]*store.Collection, 0, len(dirty))
-	byName := make(map[string]*txCollectionState, len(dirty))
 	for _, state := range dirty {
 		memory, _, err := state.coll.backend(false)
 		if err != nil {
@@ -803,11 +854,12 @@ func (t *Tx) commitMemory(dirty []*txCollectionState) error {
 			return fmt.Errorf("%w: collection %q missing at commit", ErrTxConflict, state.name)
 		}
 		participants = append(participants, memory)
-		byName[state.name] = state
 	}
+	// Iterate the dirty slice directly: each write batch is independent, so
+	// the name-keyed re-index map was pure per-commit overhead.
 	return store.UpdateCollections(participants, func(batch *store.DatabaseBatch) error {
-		for name, state := range byName {
-			wb, err := batch.Collection(name)
+		for _, state := range dirty {
+			wb, err := batch.Collection(state.name)
 			if err != nil {
 				return err
 			}
@@ -1123,10 +1175,10 @@ func (t *Tx) trackPointRead(state *txCollectionState, key string) error {
 		return t.trackCollectionRead(state)
 	}
 	if state.readSet == nil {
-		state.readSet = make(map[string]struct{})
+		state.readSet = make(map[string]string)
 	}
 	owned := state.ownKey(key)
-	state.readSet[owned] = struct{}{}
+	state.readSet[owned] = owned
 	state.readOrder = append(state.readOrder, owned)
 	t.readKeys++
 	t.readBytes += bytes
@@ -1212,7 +1264,15 @@ func (t *Tx) stage(
 	}
 
 	if !present {
-		key = state.ownKey(key)
+		// Prefer the read tracker's owned copy: Put and Delete admit the
+		// read dependency before staging, so the key is usually already
+		// owned and a second clone is pure waste. A coarse (escalated)
+		// collection has no read set and owns here instead.
+		if owned, ok := state.readSet[key]; ok {
+			key = owned
+		} else {
+			key = state.ownKey(key)
+		}
 		entry = &txMutation{existed: existed}
 		state.pending[key] = entry
 		state.order = append(state.order, key)
@@ -1443,7 +1503,7 @@ func (d *Database) removeTxnHolder() {
 	}
 }
 
-func (d *Database) finishClock(tx *Tx, published map[string][]string) {
+func (d *Database) finishClock(tx *Tx, published []txPublishedKeys) {
 	// This transaction is one active holder. If it is the only holder, a future
 	// Begin necessarily captures its already-published storage state and no
 	// logical history needs to be materialized.
@@ -1586,16 +1646,16 @@ func (d *Database) recordClockKey(name, key string) {
 	history.RecordAt(revision, d.oldestTxnHistoryRevision(), []string{key})
 }
 
-func (d *Database) recordPublished(published map[string][]string) {
+func (d *Database) recordPublished(published []txPublishedKeys) {
 	revision, ok := d.nextTxnRevision()
 	if !ok {
 		return
 	}
 	d.clockMu.RLock()
 	missing := false
-	for name, keys := range published {
-		if len(keys) != 0 {
-			if _, exists := d.txnHistories.Load(name); !exists {
+	for i := range published {
+		if len(published[i].keys) != 0 {
+			if _, exists := d.txnHistories.Load(published[i].name); !exists {
 				missing = true
 				break
 			}
@@ -1609,23 +1669,23 @@ func (d *Database) recordPublished(published map[string][]string) {
 		defer d.clockMu.RUnlock()
 	}
 	// Resolve every history before recording any: on capacity overflow the
-	// whole publication is dropped (floor set, histories cleared) exactly
-	// like the single-lock design, so a partial record can never strand a
-	// validator with half a publication's dependencies.
+	// whole publication is dropped (floor set, histories cleared), so a
+	// partial record can never strand a validator with half a publication's
+	// dependencies.
 	type pendingRecord struct {
 		history *txnclock.ExternalHistory
 		keys    []string
 	}
 	pending := make([]pendingRecord, 0, len(published))
-	for name, keys := range published {
-		if len(keys) == 0 {
+	for i := range published {
+		if len(published[i].keys) == 0 {
 			continue
 		}
-		history := d.historyForRecordLocked(name)
+		history := d.historyForRecordLocked(published[i].name)
 		if history == nil {
 			return
 		}
-		pending = append(pending, pendingRecord{history: history, keys: keys})
+		pending = append(pending, pendingRecord{history: history, keys: published[i].keys})
 	}
 	// The caller holds every dirty collection's fence, so each record lands
 	// while concurrent validators of that collection are excluded.
