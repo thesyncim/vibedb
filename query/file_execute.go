@@ -130,6 +130,7 @@ type ExecOptions struct {
 // inside each batch, which meant no amount of Exec reuse could ever warm the
 // scan — every BatchRows documents re-grew all of it from empty.
 type fileWorkspace struct {
+	small          *fileSmallScan
 	index          durable.IndexSession
 	skipFilter     durable.DataSkippingFilter
 	skipPredicates [16]durable.DataSkippingPredicate
@@ -213,6 +214,10 @@ func (w *fileWorkspace) release() {
 	// The parked goroutines are retired before the fields are dropped, because
 	// dropping them is what makes the pool unreachable.
 	w.stopPool()
+	if w.small != nil {
+		w.small.work.Release()
+	}
+	w.small = nil
 	w.index.Release()
 	w.skipFilter = durable.DataSkippingFilter{}
 	clear(w.skipPredicates[:])
@@ -745,6 +750,12 @@ func (p *plan) runFileSnapshotBatched(
 			stats.CandidateChunks++
 		}
 	}
+	if overlay == nil && !p.grouped && !p.hasAggregate && len(p.joins) == 0 && len(p.marks) == 0 && !p.requiresSQLDomainScan() &&
+		(orderedLimit && p.limit <= fileSmallMaxRows || rangeSource == nil && candidateMasks != nil && stats.CandidateRows <= fileSmallMaxRows) {
+		if handled, runErr := p.runFileSmall(e, snapshot, rangeSource, candidateMasks, n, &stats, orderedLimit); handled {
+			return e.Result, stats, runErr
+		}
+	}
 	spills := newSpillManager(
 		n.spillDir, e.file.spillFiles, p.columns, len(p.groupCols),
 		&e.Workspace.aggregateBudget, n.spillBytes, e.Options.Cancel,
@@ -838,6 +849,7 @@ func (p *plan) runFileSnapshotBatched(
 
 	var firstErr error
 	limitReached := false
+	orderedRows := 0 // survives spills that empty the in-memory frontier
 	rows := e.file.rows[:0]
 	var rowBytes int64
 	var resultRows int
@@ -975,10 +987,11 @@ func (p *plan) runFileSnapshotBatched(
 				}
 			}
 			if orderedLimit {
-				part.rows = part.rows[:min(len(part.rows), p.limit-len(rows))]
+				part.rows = part.rows[:min(len(part.rows), p.limit-orderedRows)]
+				orderedRows += len(part.rows)
 			}
 			rows = append(rows, part.rows...)
-			if orderedLimit && len(rows) == p.limit {
+			if orderedLimit && orderedRows == p.limit {
 				limitReached = true
 				cancel()
 			}
@@ -1307,20 +1320,18 @@ type fileGroup struct {
 	bytes   int64
 }
 
-// makeFilePartial reduces one batch of raw documents to a partial result. w is
-// the calling worker's retained scan workspace, docs its retained scan Segment,
-// and slots the in-flight batch ring; everything the partial hands to the
-// consumer either comes from the ring slot this batch owns or is freshly
-// allocated because the consumer keeps it past the slot's next reuse.
-//
-// Resetting docs rather than replacing it is safe for the same reason reusing w
-// is: the partial this call returns holds nothing that points into the Segment.
-// Projected and grouped values are copied into their own arena by ownScalars, a
-// group key is cloned into a string, and an aggregate is a number, so by the
-// time the worker takes its next batch the consumer's view of this one is
-// already detached. See Segment.Reset for the contract that makes the
-// distinction load-bearing: after the reset a retained Index would report the
-// next batch's bytes rather than fault.
+type filePartialMode uint8
+
+const (
+	filePartialDetached filePartialMode = iota // worker rows outlive the batch
+	filePartialBorrowed                        // synchronous consumer owns cells before reuse
+	filePartialOrdered                         // synchronous consumer, certified primary order
+)
+
+// makeFilePartial reduces one batch of raw documents. Workers detach rows
+// into an arena because the batch can be reused before the consumer finishes.
+// Synchronous small scans borrow scalar bytes until immediate materialization;
+// certified primary order also avoids sorting and copying ordering columns.
 func (p *plan) makeFilePartial(
 	batch fileBatch,
 	w *Workspace,
@@ -1328,6 +1339,7 @@ func (p *plan) makeFilePartial(
 	slots []fileSlot,
 	arena *fileArena,
 	budget *aggregateBudget,
+	mode filePartialMode,
 ) filePartial {
 	part := filePartial{seq: batch.seq}
 	if err := w.checkCanceled(); err != nil {
@@ -1355,6 +1367,9 @@ func (p *plan) makeFilePartial(
 	// than indexing them. Candidate selection and the full scan return the same
 	// rows by construction, so this changes cost only.
 	docs.Reset()
+	if mode != filePartialDetached {
+		docs.Reserve(len(batch.ends), len(batch.data), len(batch.ends)*16)
+	}
 	start := 0
 	for row, end := range batch.ends {
 		if err := cancellationCheckpoint(w.cancel, row); err != nil {
@@ -1490,7 +1505,7 @@ func (p *plan) makeFilePartial(
 		slot.accs, part.accs = accs, accs
 		part.bytes = int64(len(accs)) * aggAccStructBytes
 	default:
-		if len(p.order) != 0 {
+		if len(p.order) != 0 && mode != filePartialOrdered {
 			if err := w.checkCanceled(); err != nil {
 				part.err = err
 				return part
@@ -1509,7 +1524,11 @@ func (p *plan) makeFilePartial(
 		// live through the rows already pointing into it; one exact batch
 		// reservation removes those transient generations and makes both the
 		// allocation and retained-memory cost proportional to the slab kept.
-		headsPerRow := len(p.columns) + len(p.order)
+		order := p.order
+		if mode != filePartialDetached {
+			order = nil
+		}
+		headsPerRow := len(p.columns) + len(order)
 		if headsPerRow != 0 &&
 			len(selected) > int(^uint(0)>>1)/headsPerRow {
 			part.err = fmt.Errorf("query: durable result scalar arena overflows int")
@@ -1535,9 +1554,25 @@ func (p *plan) makeFilePartial(
 			// outlives the execution, no allocation at all once it is warm.
 			var used int64
 			var arenaErr error
-			r.values, used, arenaErr = ownScalars(
-				arena, ctx, row, p.columns, p.order, nil,
-			)
+			if mode != filePartialDetached {
+				// The synchronous consumer copies cells into Result before the
+				// batch workspace is reused. Only scalar headers are needed;
+				// detaching bytes here would copy every projected value twice.
+				r.values, arenaErr = arena.takeHeads(len(p.columns))
+				if arenaErr != nil {
+					part.err = arenaErr
+					return part
+				}
+				for col := range p.columns {
+					r.values[col] = scalar{}
+					if p.columns[col].value >= 0 {
+						r.values[col] = ctx.values[p.columns[col].value][row]
+					}
+					used += scalarBytes(r.values[col])
+				}
+			} else {
+				r.values, used, arenaErr = ownScalars(arena, ctx, row, p.columns, order, nil)
+			}
 			if arenaErr != nil {
 				part.err = arenaErr
 				return part

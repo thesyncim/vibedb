@@ -562,3 +562,72 @@ func TestSegmentBulkSpillKeepsGrowthArena(t *testing.T) {
 	}
 	checkSegmentDifferential(t, &s, []string{string(src), `{"small":1}`}, "bulkSpill")
 }
+
+func TestSegmentReserveRetainsViewsAndReset(t *testing.T) {
+	var s Segment
+	first := []byte(`{"id":1,"text":"before"}`)
+	s.Reserve(1, len(first), 16)
+	if cap(s.srcChunk) >= segmentMinSrcChunk || cap(s.entryChunk) >= segmentMinEntryChunk {
+		t.Fatal("small reserve bought bulk arenas")
+	}
+	if _, err := s.Append(first); err != nil {
+		t.Fatal(err)
+	}
+	saved := s.Doc(0)
+	text, ok := saved.Root().Get("text")
+	if !ok {
+		t.Fatal("missing text")
+	}
+	s.Reserve(32, 1<<15, 1024)
+	for range 32 {
+		if _, err := s.Append([]byte(`{"id":2,"text":"after"}`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if string(saved.Src) != string(first) || string(s.Doc(0).Src) != string(first) {
+		t.Fatal("reserve moved or overwrote a live document")
+	}
+	if text.Raw().String() != `"before"` {
+		t.Fatal("reserve overwrote a retained index node")
+	}
+	s.Reset()
+	s.Reserve(1, len(first), 16)
+	if _, err := s.Append(first); err != nil {
+		t.Fatal(err)
+	}
+	allocs := testing.AllocsPerRun(100, func() {
+		s.Reset()
+		s.Reserve(1, len(first), 16)
+		if _, err := s.Append(first); err != nil {
+			panic(err)
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("allocs %g", allocs)
+	}
+}
+
+func BenchmarkSegmentPointArena(b *testing.B) {
+	raw := []byte(`{"id":"key-00000017","bucket":1,"score":17,"payload":"abcdefghijklmnopqrstuvwxyz012345abcdefghijklmnopqrstuvwxyz012345"}`)
+	for _, reserve := range []bool{false, true} {
+		name := "default"
+		if reserve {
+			name = "reserved"
+		}
+		b.Run(name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				var s Segment
+				if reserve {
+					s.Reserve(1, len(raw), 16)
+				}
+				if _, err := s.Append(raw); err != nil {
+					b.Fatal(err)
+				}
+				if s.Len() != 1 {
+					b.Fatal("missing point")
+				}
+			}
+		})
+	}
+}

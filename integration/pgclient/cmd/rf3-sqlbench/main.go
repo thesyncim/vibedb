@@ -18,9 +18,12 @@ import (
 )
 
 type config struct {
+	seedBatch                                    int
+	verifyEveryTrial                             bool
 	engine, url, output, phase                   string
 	rows, operations, scans, warmup, repetitions int
 	clients                                      string
+	workloads                                    string
 }
 type sample struct {
 	Client  int    `json:"client"`
@@ -51,6 +54,9 @@ type report struct {
 	VerificationError string       `json:"verification_error,omitempty"`
 }
 type configRecord struct {
+	SeedBatch                                                           int
+	Workloads                                                           string
+	VerifyEveryTrial                                                    bool
 	Engine                                                              string
 	Rows, PayloadBytes, Operations, ScanOperations, Warmup, Repetitions int
 	Clients                                                             string
@@ -72,6 +78,9 @@ func main() {
 	flag.IntVar(&c.warmup, "warmup", 100, "unmeasured operations before each trial")
 	flag.IntVar(&c.repetitions, "repetitions", 3, "repetitions per workload and concurrency")
 	flag.StringVar(&c.clients, "clients", "1,8", "closed-loop concurrency list (maximum 15)")
+	flag.StringVar(&c.workloads, "workloads", "point_hit,point_miss,range_64,group_16,update_existing", "comma-separated workloads; ranges support 32,64,256")
+	flag.BoolVar(&c.verifyEveryTrial, "verify-every-trial", true, "verify the complete table after every trial; false verifies before and after the full run (each operation is always checked)")
+	flag.IntVar(&c.seedBatch, "seed-batch", 64, "rows per untimed INSERT (1..1024; subject to engine admission limits)")
 	flag.Parse()
 	if err := run(c); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -79,8 +88,18 @@ func main() {
 	}
 }
 func run(c config) error {
+	if c.seedBatch < 1 || c.seedBatch > 1024 {
+		return fmt.Errorf("invalid seed batch")
+	}
 	if (c.engine != "vibedb" && c.engine != "cockroachdb") || c.url == "" || c.rows < 64 || c.rows > 1000000 || c.operations < 1 || c.operations > 1000000 || c.scans < 1 || c.scans > 100000 || c.warmup < 0 || c.warmup > 100000 || c.repetitions < 1 || c.repetitions > 20 || (c.phase != "all" && c.phase != "setup" && c.phase != "run") {
 		return fmt.Errorf("invalid benchmark configuration")
+	}
+	for _, workload := range strings.Split(c.workloads, ",") {
+		switch workload {
+		case "point_hit", "point_miss", "range_32", "range_64", "range_256", "group_16", "update_existing":
+		default:
+			return fmt.Errorf("invalid workload %q", workload)
+		}
 	}
 	var concurrencies []int
 	for _, s := range strings.Split(c.clients, ",") {
@@ -97,7 +116,7 @@ func run(c config) error {
 		return err
 	}
 	defer admin.Close(context.Background())
-	r := report{Config: configRecord{c.engine, c.rows, len(payload), c.operations, c.scans, c.warmup, c.repetitions, c.clients, "extended unnamed parse/bind/execute; text parameters/results; one autocommit statement per operation"}, Started: time.Now().UTC().Format(time.RFC3339)}
+	r := report{Config: configRecord{SeedBatch: c.seedBatch, Engine: c.engine, Rows: c.rows, PayloadBytes: len(payload), Operations: c.operations, ScanOperations: c.scans, Warmup: c.warmup, Repetitions: c.repetitions, Clients: c.clients, Protocol: "extended unnamed parse/bind/execute; text parameters/results; one autocommit statement per operation", Workloads: c.workloads, VerifyEveryTrial: c.verifyEveryTrial}, Started: time.Now().UTC().Format(time.RFC3339)}
 	v := admin.ExecParams(ctx, "SELECT version()", nil, nil, nil, nil).Read()
 	if v.Err != nil {
 		return v.Err
@@ -127,11 +146,11 @@ func run(c config) error {
 	}
 	// No planner tuning or stats commands in the timed region. CockroachDB's
 	// normal cost-based optimizer and VibeDB's normal gateway are both enabled.
-	for _, workload := range []string{"point_hit", "point_miss", "range_64", "group_16", "update_existing"} {
+	for _, workload := range strings.Split(c.workloads, ",") {
 		for _, n := range concurrencies {
 			for rep := 1; rep <= c.repetitions; rep++ {
 				count := c.operations
-				if workload == "range_64" || workload == "group_16" {
+				if strings.HasPrefix(workload, "range_") || workload == "group_16" {
 					count = c.scans
 				}
 				out, e := trial(ctx, c, workload, n, rep, count, scores)
@@ -139,7 +158,10 @@ func run(c config) error {
 					r.VerificationError = e.Error()
 					break
 				}
-				verifyErr := verify(ctx, admin, c, scores)
+				var verifyErr error
+				if c.verifyEveryTrial {
+					verifyErr = verify(ctx, admin, c, scores)
+				}
 				out.Verified = verifyErr == nil && out.Errors == 0
 				r.Results = append(r.Results, out)
 				fmt.Fprintf(os.Stderr, "%s %s c=%d rep=%d %.1f ops/s p99=%.3fms errors=%d verified=%v\n", c.engine, workload, n, rep, out.Throughput, float64(out.P99)/1e6, out.Errors, out.Verified)
@@ -161,6 +183,14 @@ func run(c config) error {
 			break
 		}
 	}
+	if !c.verifyEveryTrial && r.VerificationError == "" {
+		if err := verify(ctx, admin, c, scores); err != nil {
+			r.VerificationError = err.Error()
+			for i := range r.Results {
+				r.Results[i].Verified = false
+			}
+		}
+	}
 	if err = json.NewEncoder(f).Encode(r); err != nil {
 		return err
 	}
@@ -177,10 +207,13 @@ func setup(ctx context.Context, conn *pgconn.PgConn, c config) error {
 	if e := conn.ExecParams(ctx, ddl, nil, nil, nil, nil).Read().Err; e != nil {
 		return e
 	}
-	for first := 0; first < c.rows; first += 64 {
+	for first := 0; first < c.rows; first += c.seedBatch {
+		if first%65536 == 0 {
+			fmt.Fprintf(os.Stderr, "seeding %d/%d rows\n", first, c.rows)
+		}
 		var sql strings.Builder
 		sql.WriteString("INSERT INTO " + table + " (id,bucket,score,payload) VALUES ")
-		for i := first; i < min(first+64, c.rows); i++ {
+		for i := first; i < min(first+c.seedBatch, c.rows); i++ {
 			if i != first {
 				sql.WriteByte(',')
 			}
@@ -190,7 +223,7 @@ func setup(ctx context.Context, conn *pgconn.PgConn, c config) error {
 		if res.Err != nil {
 			return fmt.Errorf("seed %d: %w", first, res.Err)
 		}
-		if res.CommandTag.RowsAffected() != int64(min(64, c.rows-first)) {
+		if res.CommandTag.RowsAffected() != int64(min(c.seedBatch, c.rows-first)) {
 			return fmt.Errorf("seed affected rows")
 		}
 	}
@@ -255,6 +288,10 @@ func verify(ctx context.Context, conn *pgconn.PgConn, c config, scores []int) er
 	return nil
 }
 func trial(ctx context.Context, c config, workload string, clients, rep, count int, scores []int) (result, error) {
+	rangeRows := 64
+	if strings.HasPrefix(workload, "range_") {
+		rangeRows, _ = strconv.Atoi(strings.TrimPrefix(workload, "range_"))
+	}
 	out := result{Engine: c.engine, Workload: workload, Clients: clients, Repetition: rep, Operations: count, Samples: make([]sample, count)}
 	connections := make([]*pgconn.PgConn, clients)
 	defer func() {
@@ -284,9 +321,9 @@ func trial(ctx context.Context, c config, workload string, clients, rep, count i
 		case "point_miss":
 			sql = "SELECT id,bucket,score,payload FROM " + table + " WHERE id=$1"
 			params = [][]byte{[]byte(key(c.rows + id))}
-		case "range_64":
-			id = (id / 64) * 64
-			sql = "SELECT id,score FROM " + table + " WHERE id >= $1 ORDER BY id LIMIT 64"
+		case "range_32", "range_64", "range_256":
+			id = (id / rangeRows) * rangeRows
+			sql = "SELECT id,score FROM " + table + " WHERE id >= $1 ORDER BY id LIMIT " + strconv.Itoa(rangeRows)
 			params = [][]byte{[]byte(key(id))}
 		case "group_16":
 			sql = "SELECT bucket,COUNT(*),SUM(score) FROM " + table + " GROUP BY bucket ORDER BY bucket"
@@ -316,8 +353,8 @@ func trial(ctx context.Context, c config, workload string, clients, rep, count i
 			if len(res.Rows) != 0 {
 				return fmt.Errorf("miss returned rows")
 			}
-		case "range_64":
-			if len(res.Rows) != min(64, c.rows-id) {
+		case "range_32", "range_64", "range_256":
+			if len(res.Rows) != min(rangeRows, c.rows-id) {
 				return fmt.Errorf("range count")
 			}
 			for j, row := range res.Rows {
