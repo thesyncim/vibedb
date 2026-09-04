@@ -1,7 +1,6 @@
 package shardservice
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
@@ -52,6 +51,16 @@ func (l *replicatedSQLLease) Release() {
 }
 
 func (server *ReplicatedServer) executeReplicatedQuery(ctx context.Context, request *ReplicatedRequest, state raftservice.ServingState) *ReplicatedResponse {
+	return server.executeReplicatedQueryCall(ctx, request, state, nil, nil)
+}
+
+func (server *ReplicatedServer) executeReplicatedQueryCall(
+	ctx context.Context,
+	request *ReplicatedRequest,
+	state raftservice.ServingState,
+	semantic *ShardRequest,
+	authorize raftservice.ProposalAuthorization,
+) *ReplicatedResponse {
 	wireState := replicatedWireState(state)
 	refuse := func(code ReplicatedRefusalCode) *ReplicatedResponse {
 		return &ReplicatedResponse{Kind: ReplicatedRefusal, Refusal: code, HasState: true, State: wireState}
@@ -59,9 +68,17 @@ func (server *ReplicatedServer) executeReplicatedQuery(ctx context.Context, requ
 	if request.Fence != wireState.Fence {
 		return refuse(ReplicatedRefusalStaleFence)
 	}
-	reader := bytes.NewReader(request.Query)
-	inner, err := DecodeRequest(reader)
-	if err != nil || reader.Len() != 0 || inner.Authority != request.Authority ||
+	inner := semantic
+	var err error
+	if inner == nil {
+		inner, err = DecodeReplicatedSQLRequest(request.Query)
+		if err != nil {
+			return refuse(ReplicatedRefusalStaleFence)
+		}
+	} else if err = ValidateRequest(inner); err != nil {
+		return refuse(ReplicatedRefusalStaleFence)
+	}
+	if inner.Authority != request.Authority ||
 		string(inner.Distribution) != state.Identity.Distribution || string(inner.Shard) != state.Identity.Shard ||
 		uint64(inner.AllocationGeneration) != request.Fence.AllocationGeneration ||
 		uint64(inner.RoutingVersion) != request.Fence.Command.RoutingVersion ||
@@ -89,7 +106,7 @@ func (server *ReplicatedServer) executeReplicatedQuery(ctx context.Context, requ
 	for tier := server.sqlHints.lookup(key); tier < len(replicatedSQLTiers); tier++ {
 		budget := replicatedSQLTiers[tier]
 		budget.resultBytes = min(budget.resultBytes, int(request.MaxValueBytes))
-		response, grow := server.executeReplicatedQueryTier(ctx, request, state, inner, owner, budget, maximum)
+		response, grow := server.executeReplicatedQueryTierCall(ctx, request, state, inner, owner, budget, maximum, authorize)
 		if !grow {
 			if response.Kind == ReplicatedQueryResult {
 				server.sqlHints.record(key, tier)
@@ -169,6 +186,12 @@ type replicatedSQLReadOwner interface {
 
 func (server *ReplicatedServer) executeReplicatedQueryTier(ctx context.Context, request *ReplicatedRequest, state raftservice.ServingState,
 	inner *ShardRequest, owner replicatedSQLReadOwner, budget replicatedSQLBudget, maximum int) (*ReplicatedResponse, bool) {
+	return server.executeReplicatedQueryTierCall(ctx, request, state, inner, owner, budget, maximum, nil)
+}
+
+func (server *ReplicatedServer) executeReplicatedQueryTierCall(ctx context.Context, request *ReplicatedRequest, state raftservice.ServingState,
+	inner *ShardRequest, owner replicatedSQLReadOwner, budget replicatedSQLBudget, maximum int,
+	authorize raftservice.ProposalAuthorization) (*ReplicatedResponse, bool) {
 	wireState := replicatedWireState(state)
 	refuse := func(code ReplicatedRefusalCode) (*ReplicatedResponse, bool) {
 		return &ReplicatedResponse{Kind: ReplicatedRefusal, Refusal: code, HasState: true, State: wireState}, false
@@ -189,7 +212,7 @@ func (server *ReplicatedServer) executeReplicatedQueryTier(ctx context.Context, 
 	}()
 	var cut raftservice.LinearizableDataReadCut
 	quorum := trace.StartRegion(ctx, "sql.read.quorum")
-	err := owner.ReadLinearizableDataInto(ctx, raftservice.LinearizableDataReadRequest{Fence: state.Fence(), Capability: request.Capability}, &cut)
+	err := owner.ReadLinearizableDataInto(ctx, raftservice.LinearizableDataReadRequest{Fence: state.Fence(), Capability: request.Capability, Authorize: authorize}, &cut)
 	quorum.End()
 	if err != nil {
 		switch {
@@ -197,6 +220,8 @@ func (server *ReplicatedServer) executeReplicatedQueryTier(ctx context.Context, 
 			return &ReplicatedResponse{Kind: ReplicatedNotLeader, HasState: true, State: wireState}, false
 		case errors.Is(err, raftservice.ErrServingFence):
 			return refuse(ReplicatedRefusalStaleFence)
+		case errors.Is(err, raftservice.ErrServingAuthorization):
+			return refuse(ReplicatedRefusalUnavailable)
 		case errors.Is(err, replicatedstate.ErrTransactionIntentActive):
 			return refuse(ReplicatedRefusalReadIntentActive)
 		default:
@@ -227,18 +252,9 @@ func (server *ReplicatedServer) executeReplicatedQueryTier(ctx context.Context, 
 		}
 		return refuse(ReplicatedRefusalReadBufferBound)
 	}
-	var encoded bytes.Buffer
-	encoding := trace.StartRegion(ctx, "sql.read.encode")
-	encodeErr := EncodeResponse(&encoded, result)
-	encoding.End()
-	if encodeErr != nil {
-		return refuse(ReplicatedRefusalUnavailable)
-	}
-	if encoded.Len() > budget.resultBytes {
-		return refuse(ReplicatedRefusalReadBufferBound)
-	}
 	wireState = replicatedReadState(wireState, request.Fence, cut.Data().Fence().Applied)
-	response := &ReplicatedResponse{Kind: ReplicatedQueryResult, HasState: true, State: wireState, ReadApplied: cut.Data().Fence().Applied, Value: encoded.Bytes(), readLease: lease}
+	response := &ReplicatedResponse{Kind: ReplicatedQueryResult, HasState: true, State: wireState,
+		ReadApplied: cut.Data().Fence().Applied, readLease: lease, sqlResult: result}
 	if !validReplicatedResponse(response) {
 		return refuse(ReplicatedRefusalUnavailable)
 	}
@@ -249,7 +265,10 @@ func (server *ReplicatedServer) executeReplicatedQueryTier(ctx context.Context, 
 // These are the two response shapes executeFencedSQLBudget can produce.
 // Charge the full frame grammar without allocating or overflowing on lengths.
 func replicatedSQLResponseFits(response *ShardResponse, limit int) bool {
-	if response == nil || response.HasReadPosition || response.DocumentScan.Present || response.Exchange.present() || response.Transaction.Role != TransactionRoleNone {
+	if response == nil || response.HasReadPosition || !response.ReadPosition.IsZero() ||
+		!response.DocumentScan.canonical() || response.DocumentScan.Present || !response.Exchange.canonical() || response.Exchange.present() ||
+		validateTransactionReply(response.Transaction) != nil || response.Transaction.Role != TransactionRoleNone ||
+		response.RowBatch != (RowBatchReply{}) || response.RowsAffected != 0 {
 		return false
 	}
 	remaining := limit
@@ -266,6 +285,9 @@ func replicatedSQLResponseFits(response *ShardResponse, limit int) bool {
 	}
 	switch response.Kind {
 	case ResponseRows:
+		if len(response.Columns) > maxColumns || len(response.Rows) > maxRows || response.ErrorKind != 0 || response.ErrorMessage != "" {
+			return false
+		}
 		if !take(8) {
 			return false
 		} // column and row counts
@@ -279,6 +301,9 @@ func replicatedSQLResponseFits(response *ShardResponse, limit int) bool {
 				return false
 			}
 			for _, cell := range row {
+				if cell.Null && len(cell.Bytes) != 0 {
+					return false
+				}
 				if !take(1) {
 					return false
 				}
@@ -289,10 +314,16 @@ func replicatedSQLResponseFits(response *ShardResponse, limit int) bool {
 		}
 		return true
 	case ResponseError:
-		return take(5) && take(len(response.ErrorMessage))
+		return response.ErrorKind.valid() && len(response.Columns) == 0 && len(response.Rows) == 0 &&
+			take(5) && take(len(response.ErrorMessage))
 	default:
 		return false
 	}
+}
+
+func replicatedSemanticSQLResultValid(response *ShardResponse) bool {
+	return (response != nil && (response.Kind == ResponseRows || response.Kind == ResponseError)) &&
+		replicatedSQLResponseFits(response, MaxReplicatedSQLResultBytes)
 }
 
 func executeFencedSQLBudget(ctx context.Context, source interface {

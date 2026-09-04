@@ -20,6 +20,9 @@ type LinearizableDataReadRequest struct {
 	Fence      ServingFence
 	Capability serviceauthz.Capability
 	Relations  []replication.RelationID
+	// Authorize runs on the serialized owner cut immediately before the read
+	// is admitted, matching point reads and proposal admission.
+	Authorize ProposalAuthorization
 }
 
 // LinearizableDataReadCut pins both the storage cut and the serving generation.
@@ -87,7 +90,7 @@ func (owner *Owner) ReadLinearizableDataInto(
 	delivery := &readDelivery{reply: make(chan ownerReply, 1)}
 	reply, err := owner.enqueueRead(ctx, ownerRequest{
 		kind: requestReadLinear, group: request.Fence.Group, reply: delivery.reply,
-		read: readRequest{fence: request.Fence, delivery: delivery},
+		read: readRequest{fence: request.Fence, delivery: delivery, authorize: request.Authorize},
 	}, delivery)
 	if err != nil {
 		return err
