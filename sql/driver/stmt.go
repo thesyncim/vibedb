@@ -977,6 +977,12 @@ func (c *conn) pointCollectionSource(
 				c.pointDocs.Reset()
 				return query.Source{}, err
 			}
+			// Reserve only on cold materialization. A flat point document
+			// usually needs fewer than 16 entries; wider shapes retain the
+			// ordinary spill/growth path after this capacity hint.
+			if c.pointDocs.Len() == 0 {
+				c.pointDocs.Reserve(1, len(document), 16)
+			}
 			if _, err := c.pointDocs.Append(document); err != nil {
 				c.pointRaw = document
 				return query.Source{}, err
@@ -1019,6 +1025,12 @@ func (c *conn) pointTransactionSource(
 				c.pointRaw = document
 				c.pointDocs.Reset()
 				return query.Source{}, err
+			}
+			// Reserve only on cold materialization. A flat point document
+			// usually needs fewer than 16 entries; wider shapes retain the
+			// ordinary spill/growth path after this capacity hint.
+			if c.pointDocs.Len() == 0 {
+				c.pointDocs.Reserve(1, len(document), 16)
 			}
 			if _, err := c.pointDocs.Append(document); err != nil {
 				c.pointRaw = document

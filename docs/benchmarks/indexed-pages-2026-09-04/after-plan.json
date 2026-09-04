@@ -1,0 +1,64 @@
+{
+  "version": 1,
+  "plan": {
+    "node": "scan",
+    "collection": "rf3_sql_bench",
+    "access_path": "primary-key-range-or-scan",
+    "scope": "source-aware",
+    "filter_columns": [
+      "id"
+    ],
+    "late_columns": [
+      "score"
+    ],
+    "output": [
+      "id",
+      "score"
+    ],
+    "where": "comparison",
+    "predicate": {
+      "kind": "comparison",
+      "path": "id",
+      "operator": ">="
+    },
+    "order_by": [
+      "id ASC"
+    ],
+    "limit": 256,
+    "analyze": {
+      "elapsed_ns": 280042,
+      "rows": 256,
+      "actual_access_path": "primary-key-range",
+      "workers": 1,
+      "rows_total": 500000,
+      "rows_scanned": 256,
+      "batches": 2,
+      "peak_batch_rows": 210,
+      "peak_batch_bytes": 65578,
+      "buffered_bytes": 52060,
+      "spill_runs": 0,
+      "spilled_bytes": 0,
+      "primary_range_bounded": true,
+      "index_bounded": false,
+      "index_lookups": 0,
+      "index_posting_pages": 0,
+      "index_certificate_rows": 0,
+      "index_recheck_rows": 0,
+      "candidate_rows": 256,
+      "candidate_chunks": 0,
+      "covering_columns": 0,
+      "token_filter_rows": 0,
+      "token_filter_fallback_rows": 0,
+      "join_memberships": 0,
+      "join_lookups": 0,
+      "join_keys": 0,
+      "join_probes": 0,
+      "join_filters": 0,
+      "join_filter_keys": 0,
+      "join_filter_rejected": 0,
+      "join_builds": 0,
+      "join_build_rows": 0,
+      "join_pairs": 0
+    }
+  }
+}
