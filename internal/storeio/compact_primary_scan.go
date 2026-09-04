@@ -12,7 +12,11 @@ const (
 	// Dictionary boundaries are decoded once per leaf into one shared bounded
 	// pool. A stream that would overflow the pool simply keeps the admitted
 	// random-rank decoder; other streams in the leaf still specialize.
-	compactPrimaryScanDictionaryBounds = 512
+	compactPrimaryScanDictionaryBounds    = 512
+	compactPrimaryScanDictionaryIDStreams = 32
+	compactPrimaryScanDictionaryIDBlock   = compactStreamRestart
+	compactPrimaryScanDictionaryFirstMask = compactPrimaryScanDictionaryBounds - 1
+	compactPrimaryScanDictionarySlotShift = 9 // log2(compactPrimaryScanDictionaryBounds)
 	// Dictionary fragments combine the static bytes preceding a hole with each
 	// dictionary spelling. The common 4K-row shape set needs 6,717 bytes; keep a
 	// bounded power-of-two pool and let unusual leaves fall back per stream.
@@ -51,20 +55,21 @@ type compactStreamSequentialState struct {
 // bounded random-rank decoding. The on-disk representation and point-read
 // restart bound are unchanged.
 type CompactPrimaryScanDecoder struct {
-	bucket     BucketID
-	generation uint64
-	lastRow    int
-	prepared   bool
-	supported  bool
-	shapes     [compactPrimaryScanShapes]compactPrimaryScanShape
-	streamView [compactPrimaryScanStreams]compactStreamView
-	streamPlan [compactPrimaryScanStreams]compactPrimaryScanStream
-	streams    [compactPrimaryScanStreams]compactStreamSequentialState
-	dictionary [compactPrimaryScanDictionaryBounds]uint16
-	fragments  [compactPrimaryScanDictionaryFragmentBytes]byte
-	key        compactStreamView
-	keyState   compactStreamSequentialState
-	keyPrior   [CommonPrimaryLeafMaxKeyBytes]byte
+	bucket        BucketID
+	generation    uint64
+	lastRow       int
+	prepared      bool
+	supported     bool
+	shapes        [compactPrimaryScanShapes]compactPrimaryScanShape
+	streamView    [compactPrimaryScanStreams]compactStreamView
+	streamPlan    [compactPrimaryScanStreams]compactPrimaryScanStream
+	streams       [compactPrimaryScanStreams]compactStreamSequentialState
+	dictionary    [compactPrimaryScanDictionaryBounds]uint16
+	dictionaryIDs [compactPrimaryScanDictionaryIDStreams * compactPrimaryScanDictionaryIDBlock]byte
+	fragments     [compactPrimaryScanDictionaryFragmentBytes]byte
+	key           compactStreamView
+	keyState      compactStreamSequentialState
+	keyPrior      [CommonPrimaryLeafMaxKeyBytes]byte
 }
 
 func (d *CompactPrimaryScanDecoder) prepare(
@@ -90,6 +95,7 @@ func (d *CompactPrimaryScanDecoder) prepare(
 	clear(d.streamPlan[:])
 	streamCount := 0
 	dictionaryCount := 0
+	dictionaryIDStreams := 0
 	fragmentCount := 0
 	for shape := 0; shape < v.shapeCount; shape++ {
 		entry, ok := v.shapeEntry(shape)
@@ -127,6 +133,10 @@ func (d *CompactPrimaryScanDecoder) prepare(
 				fragmentBytes <= len(d.fragments)-fragmentCount {
 				plan := &d.streamPlan[streamCount+hole]
 				plan.dictionaryFirst = uint16(dictionaryCount)
+				if stream.dictCount <= 256 && dictionaryIDStreams < compactPrimaryScanDictionaryIDStreams {
+					plan.dictionaryFirst |= uint16(dictionaryIDStreams+1) << compactPrimaryScanDictionarySlotShift
+					dictionaryIDStreams++
+				}
 				plan.dictionaryCount = uint16(stream.dictCount)
 				d.dictionary[dictionaryCount] = uint16(fragmentCount)
 				dictionaryStart := 0
@@ -262,6 +272,45 @@ func (d *CompactPrimaryScanDecoder) appendDictionaryFragment(
 ) ([]byte, bool) {
 	v := &d.streamView[streamAt]
 	s := &d.streams[streamAt]
+	plan := d.streamPlan[streamAt]
+	packedFirst := int(plan.dictionaryFirst)
+	first := packedFirst & compactPrimaryScanDictionaryFirstMask
+	if slot := packedFirst>>compactPrimaryScanDictionarySlotShift - 1; slot >= 0 {
+		if row < 0 || row >= v.count {
+			return dst, false
+		}
+		block := row &^ (compactPrimaryScanDictionaryIDBlock - 1)
+		if s.width != block+1 {
+			width := int(v.width)
+			cursor := block * width / 8
+			reservoir, available := uint64(0), 0
+			ids := d.dictionaryIDs[slot*compactPrimaryScanDictionaryIDBlock : (slot+1)*compactPrimaryScanDictionaryIDBlock]
+			for offset := 0; offset < min(compactPrimaryScanDictionaryIDBlock, v.count-block); offset++ {
+				for available < width {
+					if cursor >= len(v.data) {
+						return dst, false
+					}
+					reservoir |= uint64(v.data[cursor]) << uint(available)
+					cursor++
+					available += 8
+				}
+				id := 0
+				if width != 0 {
+					id = int(reservoir & (uint64(1)<<uint(width) - 1))
+				}
+				if id < 0 || id >= v.dictCount {
+					return dst, false
+				}
+				ids[offset] = byte(id)
+				reservoir >>= uint(width)
+				available -= width
+			}
+			s.width = block + 1
+		}
+		id := int(d.dictionaryIDs[slot*compactPrimaryScanDictionaryIDBlock+row-block])
+		start, end := int(d.dictionary[first+id]), int(d.dictionary[first+id+1])
+		return append(dst, d.fragments[start:end]...), true
+	}
 	if row != s.next {
 		s.seek(v, row)
 		if row != s.next {
@@ -273,8 +322,6 @@ func (d *CompactPrimaryScanDecoder) appendDictionaryFragment(
 	// the row loop to state synchronization and packed-ID consumption; repeating
 	// the stream grammar and fragment geometry checks for every value made those
 	// already-proven branches a material fraction of scan time.
-	plan := d.streamPlan[streamAt]
-	first := int(plan.dictionaryFirst)
 	width := int(v.width)
 	reservoir := uint64(s.value)
 	available := s.bit
