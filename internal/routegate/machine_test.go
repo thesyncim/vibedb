@@ -157,7 +157,7 @@ func TestNewEpochDrainWaitsForActiveOldEpochPin(t *testing.T) {
 	requireReason(t, machine.Apply(testCommand(OperationReleaseExclusive, 2, 99)), ReasonDrainReleased, true)
 }
 
-func TestCapacityIsShardStateBoundNotRequestParticipantField(t *testing.T) {
+func TestCapacityIsShardStateBoundNotRequestTargetField(t *testing.T) {
 	machine := mustMachine(t, 1, 2)
 	requireReason(t, machine.Apply(testCommand(OperationAcquireShared, 1, 1)), ReasonAcquired, true)
 	requireReason(t, machine.Apply(testCommand(OperationAcquireShared, 1, 2)), ReasonAcquired, true)
@@ -169,13 +169,13 @@ func TestCapacityIsShardStateBoundNotRequestParticipantField(t *testing.T) {
 }
 
 func TestCommandsStreamBeyondSmallBatchWidths(t *testing.T) {
-	const participants = 4096
-	machine := mustMachine(t, 1, participants)
-	for ordinal := uint64(1); ordinal <= participants; ordinal++ {
+	const targets = 4096
+	machine := mustMachine(t, 1, targets)
+	for ordinal := uint64(1); ordinal <= targets; ordinal++ {
 		requireReason(t, machine.Apply(testCommand(OperationAcquireShared, 1, ordinal)), ReasonAcquired, true)
 	}
-	if machine.Status().ActivePins != participants {
-		t.Fatalf("active pins = %d, want %d", machine.Status().ActivePins, participants)
+	if machine.Status().ActivePins != targets {
+		t.Fatalf("active pins = %d, want %d", machine.Status().ActivePins, targets)
 	}
 }
 

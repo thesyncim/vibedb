@@ -24,8 +24,8 @@ func replicatedTransactionRecoveryRead(
 	switch request.Kind {
 	case ReplicatedTransactionLookupCoordinator:
 		kind = replicatedstate.TransactionRecoveryLookupCoordinator
-	case ReplicatedTransactionLookupParticipant:
-		kind = replicatedstate.TransactionRecoveryLookupParticipant
+	case ReplicatedTransactionLookupTarget:
+		kind = replicatedstate.TransactionRecoveryLookupTarget
 	case ReplicatedTransactionReadManifestPage:
 		kind = replicatedstate.TransactionRecoveryReadManifestPage
 	case ReplicatedTransactionScanCoordinators:
@@ -210,7 +210,7 @@ func appendReplicatedTransactionRecoveryRecord(
 	binary.BigEndian.PutUint64(dst[67:75], record.CoordinatorAllocation)
 	copy(dst[75:107], record.MutationDigest[:])
 	if record.CancellationWitness {
-		binary.BigEndian.PutUint64(dst[107:115], uint64(record.ParticipantOrdinal))
+		binary.BigEndian.PutUint64(dst[107:115], uint64(record.TargetOrdinal))
 	} else {
 		binary.BigEndian.PutUint64(dst[107:115], uint64(record.AffectedRows))
 	}
@@ -242,7 +242,7 @@ func openReplicatedTransactionRecoveryRecord(
 	record.AffectedRowsValid = src[115]&1 != 0
 	record.CancellationWitness = src[115]&(1<<1) != 0
 	if record.CancellationWitness {
-		record.ParticipantOrdinal = uint32(binary.BigEndian.Uint64(src[107:115]))
+		record.TargetOrdinal = uint32(binary.BigEndian.Uint64(src[107:115]))
 	} else {
 		record.AffectedRows = int64(binary.BigEndian.Uint64(src[107:115]))
 	}
@@ -289,7 +289,7 @@ func validReplicatedTransactionReadShape(
 	count int,
 ) bool {
 	point := kind == ReplicatedTransactionLookupCoordinator ||
-		kind == ReplicatedTransactionLookupParticipant ||
+		kind == ReplicatedTransactionLookupTarget ||
 		kind == ReplicatedTransactionReadManifestPage
 	return point && complete && count <= 1 ||
 		kind == ReplicatedTransactionScanCoordinators &&
@@ -309,15 +309,15 @@ func validReplicatedTransactionRecoveryRecord(
 		return false
 	}
 	wantRole := distributedtxn.ReplicatedRoleCoordinator
-	if kind == ReplicatedTransactionLookupParticipant {
-		wantRole = distributedtxn.ReplicatedRoleParticipant
+	if kind == ReplicatedTransactionLookupTarget {
+		wantRole = distributedtxn.ReplicatedRoleTarget
 	}
 	if record.Role != wantRole {
 		return false
 	}
 	if wantRole == distributedtxn.ReplicatedRoleCoordinator {
 		state := distributedtxn.CoordinatorState(record.State)
-		if record.PayloadCount == 0 || record.CancellationWitness || record.ParticipantOrdinal != 0 ||
+		if record.PayloadCount == 0 || record.CancellationWitness || record.TargetOrdinal != 0 ||
 			!state.CanTransitionTo(state) || !validReplicatedCoordinatorAffectedRows(state, record) ||
 			(record.PayloadKind != distributedtxn.ReplicatedPayloadCoordinator &&
 				record.PayloadKind != distributedtxn.ReplicatedPayloadManifestCoordinator) ||
@@ -328,19 +328,19 @@ func validReplicatedTransactionRecoveryRecord(
 		if record.RecoveryPulse != 0 {
 			return false
 		}
-		state := distributedtxn.ParticipantState(record.State)
+		state := distributedtxn.TargetState(record.State)
 		if record.CancellationWitness {
-			if state != distributedtxn.ParticipantReleased || record.Revision != 1 ||
+			if state != distributedtxn.TargetReleased || record.Revision != 1 ||
 				record.PayloadCount != 0 || record.AffectedRowsValid || record.AffectedRows != 0 {
 				return false
 			}
-		} else if record.PayloadCount == 0 || record.ParticipantOrdinal != 0 {
+		} else if record.PayloadCount == 0 || record.TargetOrdinal != 0 {
 			return false
 		}
 		if !state.CanTransitionTo(state) ||
-			record.PayloadKind != distributedtxn.ReplicatedPayloadParticipantStage ||
+			record.PayloadKind != distributedtxn.ReplicatedPayloadTargetStage ||
 			record.CoordinatorDecision != distributedtxn.CoordinatorInvalid ||
-			!validReplicatedParticipantAffectedRows(state, record) {
+			!validReplicatedTargetAffectedRows(state, record) {
 			return false
 		}
 	}
@@ -350,7 +350,7 @@ func validReplicatedTransactionRecoveryRecord(
 	switch kind {
 	case ReplicatedTransactionLookupCoordinator:
 		return validReplicatedCoordinatorRecoveryPayload(record, payload)
-	case ReplicatedTransactionLookupParticipant,
+	case ReplicatedTransactionLookupTarget,
 		ReplicatedTransactionScanCoordinators:
 		return len(payload) == 0
 	case ReplicatedTransactionReadManifestPage:
@@ -359,8 +359,8 @@ func validReplicatedTransactionRecoveryRecord(
 		}
 		meta, err := inspectTransactionManifestSegment(payload)
 		return err == nil && meta.index == record.ManifestPage &&
-			meta.firstParticipant <= record.PayloadCount &&
-			uint64(meta.participantCount) <= record.PayloadCount-meta.firstParticipant
+			meta.firstTarget <= record.PayloadCount &&
+			uint64(meta.targetCount) <= record.PayloadCount-meta.firstTarget
 	default:
 		return false
 	}
@@ -399,14 +399,14 @@ func validReplicatedCoordinatorDecision(
 	}
 }
 
-func validReplicatedParticipantAffectedRows(
-	state distributedtxn.ParticipantState,
+func validReplicatedTargetAffectedRows(
+	state distributedtxn.TargetState,
 	record replicatedstate.TransactionRecoveryRecord,
 ) bool {
 	switch state {
-	case distributedtxn.ParticipantApplied:
+	case distributedtxn.TargetApplied:
 		return record.AffectedRowsValid
-	case distributedtxn.ParticipantReleased:
+	case distributedtxn.TargetReleased:
 		return record.AffectedRowsValid || record.AffectedRows == 0
 	default:
 		return !record.AffectedRowsValid && record.AffectedRows == 0
@@ -425,14 +425,14 @@ func validReplicatedCoordinatorRecoveryPayload(
 	}
 	switch record.PayloadKind {
 	case distributedtxn.ReplicatedPayloadCoordinator:
-		var scratch [distributedtxn.MaxInlineParticipants]distributedtxn.ParticipantRef
+		var scratch [distributedtxn.MaxInlineTargets]distributedtxn.TransactionTargetRef
 		opened, err := distributedtxn.OpenCoordinatorInto(payload, scratch[:])
 		return err == nil && opened.ID == record.ID &&
-			uint64(len(opened.Participants)) == record.PayloadCount
+			uint64(len(opened.Targets)) == record.PayloadCount
 	case distributedtxn.ReplicatedPayloadManifestCoordinator:
 		opened, err := distributedtxn.OpenManifestCoordinator(payload)
 		return err == nil && opened.ID == record.ID &&
-			opened.Manifest.ParticipantCount == record.PayloadCount
+			opened.Manifest.TargetCount == record.PayloadCount
 	default:
 		return false
 	}

@@ -534,11 +534,11 @@ func validateTransactionRequest(tx *TransactionRequest, cacheDecodedMeta bool) e
 		}
 		var err error
 		if tx.Operation == TransactionStageCoordinator {
-			var participants [distributedtxn.MaxInlineParticipants]distributedtxn.ParticipantRef
-			_, err = distributedtxn.OpenCoordinatorInto(tx.Record, participants[:])
+			var targets [distributedtxn.MaxInlineTargets]distributedtxn.TransactionTargetRef
+			_, err = distributedtxn.OpenCoordinatorInto(tx.Record, targets[:])
 		} else {
 			var scopes [distributedtxn.MaxIntentScopes]distributedtxn.IntentScope
-			_, err = distributedtxn.OpenParticipantInto(tx.Record, scopes[:])
+			_, err = distributedtxn.OpenTargetInto(tx.Record, scopes[:])
 		}
 		if err != nil {
 			return errors.Join(errBadTransaction, err)
@@ -593,7 +593,7 @@ func validateTransactionRequest(tx *TransactionRequest, cacheDecodedMeta bool) e
 		return errBadTransaction
 	}
 	lookup := tx.Operation == TransactionLookupCoordinator ||
-		tx.Operation == TransactionLookupParticipant || tx.Operation == TransactionReadParticipant
+		tx.Operation == TransactionLookupTarget || tx.Operation == TransactionReadTarget
 	if (lookup && tx.Revision != 0) || (!lookup && tx.Revision == 0) {
 		return errBadTransaction
 	}
@@ -605,7 +605,7 @@ func validateTransactionReply(tx TransactionReply) error {
 		if !tx.ID.IsZero() || tx.Revision != 0 ||
 			tx.RecoveryPulse != 0 ||
 			tx.CoordinatorState != distributedtxn.CoordinatorInvalid ||
-			tx.ParticipantState != distributedtxn.ParticipantInvalid ||
+			tx.TargetState != distributedtxn.TargetInvalid ||
 			tx.RecordKind != TransactionRecordNone || tx.SegmentIndex != 0 || len(tx.Record) != 0 {
 			return errBadTransaction
 		}
@@ -618,7 +618,7 @@ func validateTransactionReply(tx TransactionReply) error {
 	case TransactionRoleCoordinator:
 		if tx.CoordinatorState < distributedtxn.CoordinatorStaging ||
 			tx.CoordinatorState > distributedtxn.CoordinatorRetired ||
-			tx.ParticipantState != distributedtxn.ParticipantInvalid {
+			tx.TargetState != distributedtxn.TargetInvalid {
 			return errBadTransaction
 		}
 		switch tx.RecordKind {
@@ -630,8 +630,8 @@ func validateTransactionReply(tx TransactionReply) error {
 			if tx.SegmentIndex != 0 || len(tx.Record) == 0 {
 				return errBadTransaction
 			}
-			var participants [distributedtxn.MaxInlineParticipants]distributedtxn.ParticipantRef
-			record, err := distributedtxn.OpenCoordinatorInto(tx.Record, participants[:])
+			var targets [distributedtxn.MaxInlineTargets]distributedtxn.TransactionTargetRef
+			record, err := distributedtxn.OpenCoordinatorInto(tx.Record, targets[:])
 			if err != nil || record.ID != tx.ID {
 				return errors.Join(errBadTransaction, err)
 			}
@@ -654,9 +654,9 @@ func validateTransactionReply(tx TransactionReply) error {
 		default:
 			return errBadTransaction
 		}
-	case TransactionRoleParticipant:
-		if tx.RecoveryPulse != 0 || tx.ParticipantState < distributedtxn.ParticipantStaged ||
-			tx.ParticipantState > distributedtxn.ParticipantReleased ||
+	case TransactionRoleTarget:
+		if tx.RecoveryPulse != 0 || tx.TargetState < distributedtxn.TargetStaged ||
+			tx.TargetState > distributedtxn.TargetReleased ||
 			tx.CoordinatorState != distributedtxn.CoordinatorInvalid {
 			return errBadTransaction
 		}
@@ -668,12 +668,12 @@ func validateTransactionReply(tx TransactionReply) error {
 			if len(tx.Record) != 0 {
 				return errBadTransaction
 			}
-		case TransactionRecordParticipant:
+		case TransactionRecordTarget:
 			if len(tx.Record) == 0 {
 				return errBadTransaction
 			}
 			var scopes [distributedtxn.MaxIntentScopes]distributedtxn.IntentScope
-			record, err := distributedtxn.OpenParticipantInto(tx.Record, scopes[:])
+			record, err := distributedtxn.OpenTargetInto(tx.Record, scopes[:])
 			if err != nil || record.ID != tx.ID {
 				return errors.Join(errBadTransaction, err)
 			}
@@ -688,13 +688,13 @@ func validateTransactionReply(tx TransactionReply) error {
 
 // openTransactionManifestSegment bounds all decoder scratch to one manifest
 // page. The segmented lane is cold recovery/control traffic; it never sizes an
-// allocation from an unauthenticated aggregate participant count.
+// allocation from an unauthenticated aggregate target count.
 type transactionManifestScratch struct {
-	participants [distributedtxn.MaxManifestPageParticipants]distributedtxn.ParticipantRef
+	targets [distributedtxn.MaxManifestPageTargets]distributedtxn.TransactionTargetRef
 	// Prefix compression can reconstruct two full 255-byte identities per
-	// participant from one 64 KiB page. This exact one-page maximum is a scratch
+	// target from one 64 KiB page. This exact one-page maximum is a scratch
 	// bound, never an aggregate transaction allocation.
-	identities [distributedtxn.MaxManifestPageParticipants * distributedtxn.MaxShardIdentityBytes * 2]byte
+	identities [distributedtxn.MaxManifestPageTargets * distributedtxn.MaxShardIdentityBytes * 2]byte
 }
 
 var transactionManifestScratchPool = sync.Pool{New: func() any {
@@ -714,7 +714,7 @@ func releaseTransactionManifestScratch(scratch *transactionManifestScratch) {
 func inspectTransactionManifestSegment(raw []byte) (transactionManifestSegmentMeta, error) {
 	scratch := borrowTransactionManifestScratch()
 	defer releaseTransactionManifestScratch(scratch)
-	page, err := distributedtxn.OpenManifestSegment(raw, scratch.participants[:], scratch.identities[:])
+	page, err := distributedtxn.OpenManifestSegment(raw, scratch.targets[:], scratch.identities[:])
 	if err != nil {
 		return transactionManifestSegmentMeta{}, err
 	}
@@ -731,7 +731,7 @@ func inspectTransactionManifestFirstSegment(
 	}
 	scratch := borrowTransactionManifestScratch()
 	defer releaseTransactionManifestScratch(scratch)
-	page, err := reader.OpenNext(raw, scratch.participants[:], scratch.identities[:])
+	page, err := reader.OpenNext(raw, scratch.targets[:], scratch.identities[:])
 	if err != nil {
 		return transactionManifestSegmentMeta{}, err
 	}
@@ -748,12 +748,12 @@ func inspectTransactionManifestFirstSegment(
 }
 
 func transactionManifestMeta(page distributedtxn.ManifestPage) transactionManifestSegmentMeta {
-	first := page.Participants[0]
+	first := page.Targets[0]
 	meta := transactionManifestSegmentMeta{
 		valid: true, index: page.Segment.Index,
-		firstParticipant: page.Segment.FirstParticipant,
-		participantCount: page.Segment.ParticipantCount,
-		distributionLen:  uint8(len(first.Distribution)), shardLen: uint8(len(first.Shard)),
+		firstTarget:     page.Segment.FirstTarget,
+		targetCount:     page.Segment.TargetCount,
+		distributionLen: uint8(len(first.Distribution)), shardLen: uint8(len(first.Shard)),
 		routingVersion: first.RoutingVersion, allocation: first.AllocationGeneration,
 		ownershipEpoch: first.OwnershipEpoch,
 	}
@@ -767,16 +767,16 @@ func manifestFirstPageWithinDescriptor(
 	rawBytes int,
 	descriptor distributedtxn.ManifestDescriptor,
 ) bool {
-	if !meta.valid || meta.index != 0 || meta.firstParticipant != 0 || rawBytes <= 0 ||
-		descriptor.SegmentCount == 0 || uint64(meta.participantCount) > descriptor.ParticipantCount ||
+	if !meta.valid || meta.index != 0 || meta.firstTarget != 0 || rawBytes <= 0 ||
+		descriptor.SegmentCount == 0 || uint64(meta.targetCount) > descriptor.TargetCount ||
 		uint64(rawBytes) > descriptor.EncodedBytes {
 		return false
 	}
 	if descriptor.SegmentCount == 1 {
-		return uint64(meta.participantCount) == descriptor.ParticipantCount &&
+		return uint64(meta.targetCount) == descriptor.TargetCount &&
 			uint64(rawBytes) == descriptor.EncodedBytes
 	}
-	return uint64(meta.participantCount) < descriptor.ParticipantCount &&
+	return uint64(meta.targetCount) < descriptor.TargetCount &&
 		uint64(rawBytes) < descriptor.EncodedBytes
 }
 
@@ -1512,7 +1512,7 @@ func encodeTransactionReply(e *encbuf, tx TransactionReply) {
 	if tx.Role == TransactionRoleCoordinator {
 		e.u8(uint8(tx.CoordinatorState))
 	} else {
-		e.u8(uint8(tx.ParticipantState))
+		e.u8(uint8(tx.TargetState))
 	}
 	e.u8(uint8(tx.RecordKind))
 	e.u32(tx.SegmentIndex)
@@ -1530,8 +1530,8 @@ func decodeTransactionReply(d *deccur) (TransactionReply, error) {
 	state := d.u8()
 	if tx.Role == TransactionRoleCoordinator {
 		tx.CoordinatorState = distributedtxn.CoordinatorState(state)
-	} else if tx.Role == TransactionRoleParticipant {
-		tx.ParticipantState = distributedtxn.ParticipantState(state)
+	} else if tx.Role == TransactionRoleTarget {
+		tx.TargetState = distributedtxn.TargetState(state)
 	}
 	tx.RecordKind = TransactionRecordKind(d.u8())
 	tx.SegmentIndex = d.u32()

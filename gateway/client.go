@@ -54,7 +54,7 @@ var (
 	// ErrTransactionConflict reports a non-idempotent transaction retry or an
 	// invalid durable state transition.
 	ErrTransactionConflict = errors.New("gateway: distributed transaction state conflicts with durable state")
-	// ErrTransactionNotFound reports a missing coordinator or participant role.
+	// ErrTransactionNotFound reports a missing coordinator or target role.
 	ErrTransactionNotFound = errors.New("gateway: distributed transaction record was not found")
 	// ErrReadFenceBusy asks a coherent fan-out reader to drop a partial cut and
 	// retry after an intersecting write has crossed admission.

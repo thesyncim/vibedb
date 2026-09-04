@@ -72,9 +72,9 @@ type Profile struct {
 	PerShardBytes uint64
 
 	// MaxTransactionMutations and MaxTransactionBytes independently bound one
-	// atomic write before any participant is staged. Bytes count the exact
-	// canonical mutation batches retained across participants; mutations count
-	// their statements. MaxConcurrency remains the in-flight participant bound.
+	// atomic write before any target is staged. Bytes count the exact
+	// canonical mutation batches retained across targets; mutations count
+	// their statements. MaxConcurrency remains the in-flight target bound.
 	MaxTransactionMutations uint64
 	MaxTransactionBytes     uint64
 

@@ -27,7 +27,7 @@ func testBinding() Binding {
 		RequestKeyDigest: testDigest(1), RequestDigest: testDigest(2),
 		CatalogGeneration:    3,
 		SchemaManifestDigest: testDigest(5), TransactionManifestDigest: testDigest(6),
-		ParticipantAuthorityRoot: testDigest(7), ParticipantCount: 8,
+		TargetAuthorityRoot: testDigest(7), TargetCount: 8,
 		ExecutionContractDigest: testDigest(9), LedgerHomeGroup: testID(10),
 	}
 }
@@ -108,8 +108,8 @@ func TestPinIDBindsEveryLogicalFieldButNotControllerLease(t *testing.T) {
 		func(value *Binding) { value.CatalogGeneration++ },
 		func(value *Binding) { value.SchemaManifestDigest[0]++ },
 		func(value *Binding) { value.TransactionManifestDigest[0]++ },
-		func(value *Binding) { value.ParticipantAuthorityRoot[0]++ },
-		func(value *Binding) { value.ParticipantCount++ },
+		func(value *Binding) { value.TargetAuthorityRoot[0]++ },
+		func(value *Binding) { value.TargetCount++ },
 		func(value *Binding) { value.ExecutionContractDigest[0]++ },
 		func(value *Binding) { value.LedgerHomeGroup[0]++ },
 	}

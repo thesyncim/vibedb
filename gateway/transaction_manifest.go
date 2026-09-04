@@ -41,7 +41,7 @@ func stageTransactionCoordinator(
 	}
 
 	scratch := make([]byte, distributedtxn.ManifestSegmentBytes)
-	descriptor, err := buildTransactionManifest(record.Participants, scratch, func(distributedtxn.ManifestSegment) error {
+	descriptor, err := buildTransactionManifest(record.Targets, scratch, func(distributedtxn.ManifestSegment) error {
 		return nil
 	})
 	if err != nil {
@@ -57,7 +57,7 @@ func stageTransactionCoordinator(
 		return 0, err
 	}
 	begun := false
-	_, err = buildTransactionManifest(record.Participants, scratch, func(segment distributedtxn.ManifestSegment) error {
+	_, err = buildTransactionManifest(record.Targets, scratch, func(segment distributedtxn.ManifestSegment) error {
 		if !begun {
 			begun = true
 			return stager.stageManifestCoordinator(manifest, segment.Raw)
@@ -71,16 +71,15 @@ func stageTransactionCoordinator(
 }
 
 func buildTransactionManifest(
-	participants []distributedtxn.ParticipantRef,
-	scratch []byte,
+	targets []distributedtxn.TransactionTargetRef, scratch []byte,
 	emit func(distributedtxn.ManifestSegment) error,
 ) (distributedtxn.ManifestDescriptor, error) {
 	builder, err := distributedtxn.NewManifestBuilder(scratch, emit)
 	if err != nil {
 		return distributedtxn.ManifestDescriptor{}, err
 	}
-	for i := range participants {
-		if err := builder.Append(participants[i]); err != nil {
+	for i := range targets {
+		if err := builder.Append(targets[i]); err != nil {
 			return distributedtxn.ManifestDescriptor{}, err
 		}
 	}
@@ -92,7 +91,7 @@ func buildTransactionManifest(
 type gatewayCoordinatorStager struct {
 	executor    *Executor
 	ctx         context.Context
-	coordinator *transactionParticipant
+	coordinator *transactionTarget
 	profile     Profile
 }
 

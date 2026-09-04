@@ -22,7 +22,7 @@ func transactionOrchestratorResult(
 	var result [24]byte
 	result[0], result[1], result[2] = byte(role), byte(operation), 2
 	binary.LittleEndian.PutUint64(result[8:16], revision)
-	if (operation == distributedtxn.ReplicatedApplyReleaseParticipant ||
+	if (operation == distributedtxn.ReplicatedApplyReleaseTarget ||
 		operation == distributedtxn.ReplicatedRetireCoordinator) && affected >= 0 {
 		result[2] |= 1
 		binary.LittleEndian.PutUint64(result[16:24], uint64(affected))
@@ -63,28 +63,28 @@ func appendTransactionOrchestratorCompletion(
 }
 
 func TestReplicatedTransactionCommandEncoderIsCanonical(t *testing.T) {
-	participant := durableFaultParticipants(t)[0]
+	target := durableFaultTargets(t)[0]
 	control := distributedtxn.ReplicatedCommand{
-		Role:      distributedtxn.ReplicatedRoleParticipant,
-		Operation: distributedtxn.ReplicatedStagePrepareParticipant,
-		ID:        distributedtxn.ID{1}, PayloadKind: distributedtxn.ReplicatedPayloadParticipantStage,
+		Role:      distributedtxn.ReplicatedRoleTarget,
+		Operation: distributedtxn.ReplicatedStagePrepareTarget,
+		ID:        distributedtxn.ID{1}, PayloadKind: distributedtxn.ReplicatedPayloadTargetStage,
 		ControllerEpoch: 7, ExecutionPinDigest: distributedtxn.Digest{8},
-		Participant: distributedtxn.ParticipantStage{
-			CoordinatorGroup: distributedtxn.ID(participant.Route.Group.GroupID),
+		Target: distributedtxn.TransactionTargetStage{
+			CoordinatorGroup: distributedtxn.ID(target.Route.Group.GroupID),
 			CoordinatorShardIncarnation: distributedtxn.ID(
-				participant.Route.Group.ShardIncarnation,
+				target.Route.Group.ShardIncarnation,
 			),
-			CoordinatorAllocation: participant.Route.AllocationGeneration,
-			BucketBits:            participant.BucketBits, IntentScopes: participant.IntentScopes,
-			ParticipantOrdinal: 0, MutationDigest: transactionMutationDigest(participant.Batches),
+			CoordinatorAllocation: target.Route.AllocationGeneration,
+			BucketBits:            target.BucketBits, IntentScopes: target.IntentScopes,
+			TargetOrdinal: 0, MutationDigest: transactionMutationDigest(target.Batches),
 		},
 	}
 	encoder := replicatedTransactionCommandEncoder{tenant: []byte("tenant")}
-	first, err := encoder.appendExact(nil, replication.RetryHome{2}, participant.Route, control, participant.Batches)
+	first, err := encoder.appendExact(nil, replication.RetryHome{2}, target.Route, control, target.Batches)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := encoder.appendExact(nil, replication.RetryHome{2}, participant.Route, control, participant.Batches)
+	second, err := encoder.appendExact(nil, replication.RetryHome{2}, target.Route, control, target.Batches)
 	if err != nil || string(first) != string(second) {
 		t.Fatalf("canonical command drift: %v", err)
 	}
@@ -99,34 +99,34 @@ func replicatedTransactionEncoderFixture(t testing.TB) (ReplicatedRoute, distrib
 	payload, err := distributedtxn.AppendCoordinator(nil, distributedtxn.CoordinatorRecord{
 		ID: id, State: distributedtxn.CoordinatorStaging, Revision: 1,
 		CatalogGeneration: 1, RecoveryDeadline: 1,
-		Participants: []distributedtxn.ParticipantRef{{
+		Targets: []distributedtxn.TransactionTargetRef{{
 			Distribution: []byte("docs"), Shard: []byte("-80"), RoutingVersion: 1,
 			AllocationGeneration: 1, OwnershipEpoch: 1,
 			AuthorityWitness: distributedtxn.AuthorityWitness{1},
-			MutationDigest:   distributedtxn.Digest{1}, State: distributedtxn.ParticipantStaged,
+			MutationDigest:   distributedtxn.Digest{1}, State: distributedtxn.TargetStaged,
 		}},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return ReplicatedRoute{
-			Distribution: distribution.DistributionName("docs"), Shard: distribution.ShardID("-80"),
-			Group: raftmember.GroupKey{
-				ClusterID: [16]byte{1}, ClusterIncarnation: [16]byte{2},
-				TopologyRecoveryEpoch: 1, ShardIncarnation: [16]byte{3}, GroupID: [16]byte{4},
-			},
-			AllocationGeneration: 1,
-			Command: raftservice.CommandFence{
-				ReplicaSetVersion: 1, ActivePolicyGeneration: 1, ProtectionEpoch: 1,
-				OwnershipEpoch: 1, SchemaGeneration: 1, RelationManifestDigest: [32]byte{1},
-				RoutingVersion: 1, RouteGeneration: 1,
-			},
-		}, distributedtxn.ReplicatedCommand{
-			Role:      distributedtxn.ReplicatedRoleCoordinator,
-			Operation: distributedtxn.ReplicatedStageCoordinator,
-			ID:        id, PayloadKind: distributedtxn.ReplicatedPayloadCoordinator, Payload: payload,
-			ControllerEpoch: 1, ExecutionPinDigest: distributedtxn.Digest{1},
-		}
+		Distribution: distribution.DistributionName("docs"), Shard: distribution.ShardID("-80"),
+		Group: raftmember.GroupKey{
+			ClusterID: [16]byte{1}, ClusterIncarnation: [16]byte{2},
+			TopologyRecoveryEpoch: 1, ShardIncarnation: [16]byte{3}, GroupID: [16]byte{4},
+		},
+		AllocationGeneration: 1,
+		Command: raftservice.CommandFence{
+			ReplicaSetVersion: 1, ActivePolicyGeneration: 1, ProtectionEpoch: 1,
+			OwnershipEpoch: 1, SchemaGeneration: 1, RelationManifestDigest: [32]byte{1},
+			RoutingVersion: 1, RouteGeneration: 1,
+		},
+	}, distributedtxn.ReplicatedCommand{
+		Role:      distributedtxn.ReplicatedRoleCoordinator,
+		Operation: distributedtxn.ReplicatedStageCoordinator,
+		ID:        id, PayloadKind: distributedtxn.ReplicatedPayloadCoordinator, Payload: payload,
+		ControllerEpoch: 1, ExecutionPinDigest: distributedtxn.Digest{1},
+	}
 }
 
 func TestReplicatedTransactionCommandEncoderPreservesPrefixAndBoundsScratch(t *testing.T) {

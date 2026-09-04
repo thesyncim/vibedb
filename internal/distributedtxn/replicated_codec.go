@@ -16,7 +16,7 @@ const (
 	// MaxManifestSegmentsPerCommand VTM1 pages follows it immediately.
 	ReplicatedManifestCoordinatorRecordBytes = manifestCoordinatorHeaderBytes + 4
 	// MaxManifestSegmentsPerCommand is a byte-packing bound, not a transaction
-	// participant bound. Fifteen worst-case 64 KiB pages keep the manifest page
+	// target bound. Fifteen worst-case 64 KiB pages keep the manifest page
 	// pack below 1 MiB. The outer proposal's native relation mutations are not
 	// manifest bytes and may legitimately raise the complete proposal above it.
 	MaxManifestSegmentsPerCommand   = 15
@@ -34,12 +34,12 @@ const (
 	MaxReplicatedCommandBytes = replicatedCommandHeaderBytes +
 		MaxIntentScopes*8 + ReplicatedManifestCoordinatorRecordBytes +
 		MaxManifestSegmentSequenceBytes + replicatedCommandChecksumBytes
-	// MaxSingleParticipantControlBytes is the exact maximum control body for
+	// MaxSingleTargetControlBytes is the exact maximum control body for
 	// the one-proposal single-group apply lane: fixed header, the complete
 	// bounded scope set, no copied mutation payload, and the checksum. Callers
 	// can reserve this small buffer once instead of provisioning the manifest
 	// coordinator's nearly-1-MiB command bound.
-	MaxSingleParticipantControlBytes = replicatedCommandHeaderBytes +
+	MaxSingleTargetControlBytes = replicatedCommandHeaderBytes +
 		MaxIntentScopes*8 + replicatedCommandChecksumBytes
 	// MaxRecoveryPulses bounds both replicated work and journal retention for
 	// one abandoned coordinator. The shipped protocol uses this exact limit.
@@ -54,7 +54,7 @@ type ReplicatedRole uint8
 const (
 	ReplicatedRoleInvalid ReplicatedRole = iota
 	ReplicatedRoleCoordinator
-	ReplicatedRoleParticipant
+	ReplicatedRoleTarget
 )
 
 // ReplicatedOperation is one deterministic transaction state transition.
@@ -68,23 +68,23 @@ const (
 	ReplicatedCommitCoordinator
 	ReplicatedAbortCoordinator
 	ReplicatedRetireCoordinator
-	ReplicatedStageParticipant
-	ReplicatedPrepareParticipant
-	ReplicatedApplyParticipant
-	ReplicatedAbortParticipant
-	ReplicatedReleaseParticipant
+	ReplicatedStageTarget
+	ReplicatedPrepareTarget
+	ReplicatedApplyTarget
+	ReplicatedAbortTarget
+	ReplicatedReleaseTarget
 	// Fused success-path operations use fresh codes. Existing split operations
 	// remain readable only while the unreleased legacy gateway is switched as one
 	// unit; no old command can acquire stronger fused semantics by aliasing a code.
 	ReplicatedBeginPrepareCoordinator
 	ReplicatedBeginPrepareManifestCoordinator
 	ReplicatedAppendManifestSegments
-	ReplicatedStagePrepareParticipant
-	ReplicatedApplyReleaseParticipant
-	ReplicatedAbortReleaseParticipant
-	// ReplicatedApplySingleParticipant is the terminal one-proposal lane for a
+	ReplicatedStagePrepareTarget
+	ReplicatedApplyReleaseTarget
+	ReplicatedAbortReleaseTarget
+	// ReplicatedApplySingleTarget is the terminal one-proposal lane for a
 	// request whose complete mutation set belongs to one Raft group.
-	ReplicatedApplySingleParticipant
+	ReplicatedApplySingleTarget
 	// ReplicatedPulseCoordinator advances the bounded logical recovery lease.
 	// It never changes the transaction revision or decision; a later abort is
 	// authorized only after the durable pulse reaches the coordinator record's
@@ -93,7 +93,7 @@ const (
 )
 
 // ReplicatedPayloadKind binds the control body to one existing canonical
-// durable record grammar. ParticipantStage is the compact exception: native
+// durable record grammar. TransactionTargetStage is the compact exception: native
 // relation mutations remain in the outer replication command.
 type ReplicatedPayloadKind uint8
 
@@ -102,7 +102,7 @@ const (
 	ReplicatedPayloadCoordinator
 	ReplicatedPayloadManifestCoordinator
 	ReplicatedPayloadManifestSegment
-	ReplicatedPayloadParticipantStage
+	ReplicatedPayloadTargetStage
 	ReplicatedPayloadManifestSegments
 	ReplicatedPayloadRetirement
 )
@@ -115,19 +115,19 @@ type ReplicatedRetirementSummary struct {
 	AffectedRowsValid bool
 }
 
-// ParticipantStage is the compact durable intent metadata paired with native
+// TransactionTargetStage is the compact durable intent metadata paired with native
 // relation batches in the outer replication command. MutationDigest binds
 // those exact canonical relation bytes; the outer decoder recomputes it.
-type ParticipantStage struct {
+type TransactionTargetStage struct {
 	CoordinatorGroup            ID
 	CoordinatorShardIncarnation ID
 	CoordinatorAllocation       uint64
 	BucketBits                  uint8
 	IntentScopes                []IntentScope
 	MutationDigest              Digest
-	// ParticipantOrdinal is the participant's exact position in the canonical
+	// TargetOrdinal is the target's exact position in the canonical
 	// coordinator manifest. Zero is a valid ordinal.
-	ParticipantOrdinal uint32
+	TargetOrdinal uint32
 }
 
 // ReplicatedCommand is the construction form of one self-delimiting
@@ -141,20 +141,20 @@ type ReplicatedCommand struct {
 	ExpectedRevision uint64
 	PayloadKind      ReplicatedPayloadKind
 	Payload          []byte
-	Participant      ParticipantStage
+	Target           TransactionTargetStage
 	// RecoveryPulse is populated only by ReplicatedPulseCoordinator and is the
 	// exact next durable pulse value. It occupies a previously reserved header
 	// byte, so the bounded command size is unchanged.
 	RecoveryPulse uint8
 	// ControllerEpoch is the monotonic logical execution-pin lease epoch. Every
 	// transaction transition carries it together with the immutable aggregate
-	// pin digest so participant apply can reject a stale controller locally.
+	// pin digest so target apply can reject a stale controller locally.
 	ControllerEpoch    uint64
 	ExecutionPinDigest Digest
 }
 
 // ReplicatedCommandView is checksum- and semantics-validated. Payload aliases
-// the input; participant scopes occupy caller scratch in Open...Into.
+// the input; target scopes occupy caller scratch in Open...Into.
 type ReplicatedCommandView struct {
 	ReplicatedCommand
 	raw []byte
@@ -165,7 +165,7 @@ type ReplicatedCommandView struct {
 func (v ReplicatedCommandView) Bytes() []byte { return v.raw[:len(v.raw):len(v.raw)] }
 
 // Command returns a construction form. Payload remains a borrowed,
-// capacity-clamped alias; participant scopes use the decoder scratch.
+// capacity-clamped alias; target scopes use the decoder scratch.
 func (v ReplicatedCommandView) Command() ReplicatedCommand { return v.ReplicatedCommand }
 
 // AppendReplicatedRetirementSummary appends the sole fixed retirement-summary
@@ -206,22 +206,22 @@ func OpenReplicatedRetirementSummary(raw []byte) (ReplicatedRetirementSummary, e
 // of canonical VTM1 pages. Its byte slice and every iterator page are capacity
 // clamped aliases of the input.
 type ManifestSegmentSequence struct {
-	raw              []byte
-	count            uint8
-	firstIndex       uint32
-	firstParticipant uint64
-	participantCount uint64
-	chain            Digest
+	raw         []byte
+	count       uint8
+	firstIndex  uint32
+	firstTarget uint64
+	targetCount uint64
+	chain       Digest
 }
 
 func (s ManifestSegmentSequence) Bytes() []byte {
 	return s.raw[:len(s.raw):len(s.raw)]
 }
-func (s ManifestSegmentSequence) Count() int               { return int(s.count) }
-func (s ManifestSegmentSequence) FirstIndex() uint32       { return s.firstIndex }
-func (s ManifestSegmentSequence) FirstParticipant() uint64 { return s.firstParticipant }
-func (s ManifestSegmentSequence) ParticipantCount() uint64 { return s.participantCount }
-func (s ManifestSegmentSequence) EncodedBytes() uint64     { return uint64(len(s.raw)) }
+func (s ManifestSegmentSequence) Count() int           { return int(s.count) }
+func (s ManifestSegmentSequence) FirstIndex() uint32   { return s.firstIndex }
+func (s ManifestSegmentSequence) FirstTarget() uint64  { return s.firstTarget }
+func (s ManifestSegmentSequence) TargetCount() uint64  { return s.targetCount }
+func (s ManifestSegmentSequence) EncodedBytes() uint64 { return uint64(len(s.raw)) }
 
 // ManifestSegmentIterator walks an already validated sequence without
 // revalidating or allocating.
@@ -244,10 +244,10 @@ func (i *ManifestSegmentIterator) Next() bool {
 	total := manifestSegmentHeaderBytes + int(binary.LittleEndian.Uint32(raw[24:28])) + 4
 	page := raw[:total:total]
 	i.current = ManifestSegment{
-		Index:            binary.LittleEndian.Uint32(page[8:12]),
-		FirstParticipant: binary.LittleEndian.Uint64(page[16:24]),
-		ParticipantCount: binary.LittleEndian.Uint32(page[12:16]),
-		Digest:           sha256.Sum256(page), Raw: page,
+		Index:       binary.LittleEndian.Uint32(page[8:12]),
+		FirstTarget: binary.LittleEndian.Uint64(page[16:24]),
+		TargetCount: binary.LittleEndian.Uint32(page[12:16]),
+		Digest:      sha256.Sum256(page), Raw: page,
 	}
 	i.cursor += total
 	return true
@@ -256,7 +256,7 @@ func (i *ManifestSegmentIterator) Next() bool {
 func (i *ManifestSegmentIterator) Segment() ManifestSegment { return i.current }
 
 // OpenManifestSegmentSequence validates one direct sequence of one through
-// fifteen self-delimiting VTM1 pages. Page ordinals, participant ordinals, and
+// fifteen self-delimiting VTM1 pages. Page ordinals, target ordinals, and
 // identities are strictly increasing across page boundaries.
 func OpenManifestSegmentSequence(raw []byte) (ManifestSegmentSequence, error) {
 	if len(raw) == 0 || len(raw) > MaxManifestSegmentSequenceBytes {
@@ -268,7 +268,7 @@ func OpenManifestSegmentSequence(raw []byte) (ManifestSegmentSequence, error) {
 	sequence := ManifestSegmentSequence{raw: raw[:len(raw):len(raw)]}
 	cursor := 0
 	var nextIndex uint32
-	var nextParticipant uint64
+	var nextTarget uint64
 	var prior manifestSegmentSummary
 	for cursor < len(raw) {
 		if sequence.count == MaxManifestSegmentsPerCommand ||
@@ -287,8 +287,8 @@ func OpenManifestSegmentSequence(raw []byte) (ManifestSegmentSequence, error) {
 		}
 		if sequence.count == 0 {
 			sequence.firstIndex = summary.index
-			sequence.firstParticipant = summary.firstParticipant
-			nextIndex, nextParticipant = summary.index, summary.firstParticipant
+			sequence.firstTarget = summary.firstTarget
+			nextIndex, nextTarget = summary.index, summary.firstTarget
 		} else if compareIdentityBytes(
 			prior.lastDistribution[:prior.lastDistributionLength],
 			prior.lastShard[:prior.lastShardLength],
@@ -298,13 +298,13 @@ func OpenManifestSegmentSequence(raw []byte) (ManifestSegmentSequence, error) {
 			return ManifestSegmentSequence{}, ErrCorrupt
 		}
 		if summary.index != nextIndex || summary.index == ^uint32(0) ||
-			summary.firstParticipant != nextParticipant ||
-			uint64(summary.participantCount) > ^uint64(0)-nextParticipant {
+			summary.firstTarget != nextTarget ||
+			uint64(summary.targetCount) > ^uint64(0)-nextTarget {
 			return ManifestSegmentSequence{}, ErrCorrupt
 		}
 		nextIndex++
-		nextParticipant += uint64(summary.participantCount)
-		sequence.participantCount += uint64(summary.participantCount)
+		nextTarget += uint64(summary.targetCount)
+		sequence.targetCount += uint64(summary.targetCount)
 		sequence.chain = appendManifestChain(sequence.chain, summary.index, summary.digest)
 		sequence.count++
 		prior = summary
@@ -317,7 +317,7 @@ func OpenManifestSegmentSequence(raw []byte) (ManifestSegmentSequence, error) {
 }
 
 // ManifestSegmentSequenceFollows validates previous as one complete canonical
-// VTM1 page and requires its final participant identity to sort strictly before
+// VTM1 page and requires its final target identity to sort strictly before
 // the first identity in next. The already-opened sequence remains borrowed and
 // is inspected without decoding an identity arena or allocating.
 func ManifestSegmentSequenceFollows(previous []byte, next ManifestSegmentSequence) error {
@@ -361,53 +361,52 @@ func OpenReplicatedManifestStart(payload []byte) (
 		return nil, ManifestSegmentSequence{}, ErrCorrupt
 	}
 	segments, openErr = OpenManifestSegmentSequence(segmentBytes)
-	if openErr != nil || segments.FirstIndex() != 0 || segments.FirstParticipant() != 0 {
+	if openErr != nil || segments.FirstIndex() != 0 || segments.FirstTarget() != 0 {
 		return nil, ManifestSegmentSequence{}, ErrCorrupt
 	}
 	descriptor := record.Manifest
-	if segments.ParticipantCount() > descriptor.ParticipantCount ||
+	if segments.TargetCount() > descriptor.TargetCount ||
 		segments.EncodedBytes() > descriptor.EncodedBytes {
 		return nil, ManifestSegmentSequence{}, ErrCorrupt
 	}
 	if uint32(segments.Count()) == descriptor.SegmentCount {
 		got := ManifestDescriptor{
-			ParticipantCount: segments.ParticipantCount(),
-			EncodedBytes:     segments.EncodedBytes(), SegmentCount: uint32(segments.Count()),
+			TargetCount:  segments.TargetCount(),
+			EncodedBytes: segments.EncodedBytes(), SegmentCount: uint32(segments.Count()),
 		}
 		got.Root = finishManifestRoot(segments.chain, got)
 		if got != descriptor {
 			return nil, ManifestSegmentSequence{}, ErrCorrupt
 		}
-	} else if segments.ParticipantCount() >= descriptor.ParticipantCount ||
+	} else if segments.TargetCount() >= descriptor.TargetCount ||
 		segments.EncodedBytes() >= descriptor.EncodedBytes {
 		return nil, ManifestSegmentSequence{}, ErrCorrupt
 	}
 	return coordinator, segments, nil
 }
 
-// ReplicatedCoordinatorBindsParticipant validates an inline or segmented
-// coordinator creation payload and exact-matches one participant ordinal
+// ReplicatedCoordinatorBindsTarget validates an inline or segmented
+// coordinator creation payload and exact-matches one target ordinal
 // without allocating. For a segmented coordinator, present is false when the
 // requested ordinal is valid for the descriptor but lies after the initial
 // packed pages and must be checked when its durable page arrives.
-func ReplicatedCoordinatorBindsParticipant(
+func ReplicatedCoordinatorBindsTarget(
 	payload []byte,
 	ordinal uint64,
-	want ParticipantRef,
-) (present bool, matches bool, err error) {
+	want TransactionTargetRef) (present bool, matches bool, err error) {
 	if len(payload) < 4 {
 		return false, false, ErrCorrupt
 	}
 	if equal4(payload[:4], coordinatorMagic) {
-		var scratch [MaxInlineParticipants]ParticipantRef
+		var scratch [MaxInlineTargets]TransactionTargetRef
 		record, openErr := OpenCoordinatorInto(payload, scratch[:])
 		if openErr != nil || !canonicalCoordinatorBytes(payload) {
 			return false, false, ErrCorrupt
 		}
-		if ordinal >= uint64(len(record.Participants)) {
+		if ordinal >= uint64(len(record.Targets)) {
 			return false, false, ErrCorrupt
 		}
-		return true, equalParticipantRef(record.Participants[ordinal], want), nil
+		return true, equalTargetRef(record.Targets[ordinal], want), nil
 	}
 	if !equal4(payload[:4], manifestCoordinatorMagic) {
 		return false, false, ErrCorrupt
@@ -417,17 +416,17 @@ func ReplicatedCoordinatorBindsParticipant(
 		return false, false, openErr
 	}
 	record, openErr := OpenManifestCoordinator(coordinator)
-	if openErr != nil || ordinal >= record.Manifest.ParticipantCount {
+	if openErr != nil || ordinal >= record.Manifest.TargetCount {
 		return false, false, ErrCorrupt
 	}
 	iterator := segments.Iterator()
 	for iterator.Next() {
 		page := iterator.Segment()
-		if ordinal < page.FirstParticipant ||
-			ordinal >= page.FirstParticipant+uint64(page.ParticipantCount) {
+		if ordinal < page.FirstTarget ||
+			ordinal >= page.FirstTarget+uint64(page.TargetCount) {
 			continue
 		}
-		return ManifestSegmentMatchesParticipant(page.Raw, ordinal, want)
+		return ManifestSegmentMatchesTarget(page.Raw, ordinal, want)
 	}
 	return false, false, nil
 }
@@ -461,20 +460,20 @@ func AppendReplicatedCommand(dst []byte, command ReplicatedCommand) ([]byte, err
 	binary.LittleEndian.PutUint32(out[16:20], uint32(len(command.Payload)))
 	binary.LittleEndian.PutUint64(out[24:32], command.ExpectedRevision)
 	copy(out[32:48], command.ID[:])
-	copy(out[48:64], command.Participant.CoordinatorGroup[:])
-	copy(out[64:80], command.Participant.CoordinatorShardIncarnation[:])
-	binary.LittleEndian.PutUint64(out[80:88], command.Participant.CoordinatorAllocation)
-	copy(out[88:120], command.Participant.MutationDigest[:])
-	out[120] = command.Participant.BucketBits
+	copy(out[48:64], command.Target.CoordinatorGroup[:])
+	copy(out[64:80], command.Target.CoordinatorShardIncarnation[:])
+	binary.LittleEndian.PutUint64(out[80:88], command.Target.CoordinatorAllocation)
+	copy(out[88:120], command.Target.MutationDigest[:])
+	out[120] = command.Target.BucketBits
 	out[121] = command.RecoveryPulse
-	binary.LittleEndian.PutUint16(out[122:124], uint16(len(command.Participant.IntentScopes)))
-	binary.LittleEndian.PutUint32(out[124:128], command.Participant.ParticipantOrdinal)
+	binary.LittleEndian.PutUint16(out[122:124], uint16(len(command.Target.IntentScopes)))
+	binary.LittleEndian.PutUint32(out[124:128], command.Target.TargetOrdinal)
 	binary.LittleEndian.PutUint64(out[128:136], command.ControllerEpoch)
 	copy(out[136:168], command.ExecutionPinDigest[:])
 	cursor := replicatedCommandHeaderBytes
-	for i := range command.Participant.IntentScopes {
-		binary.LittleEndian.PutUint32(out[cursor:cursor+4], command.Participant.IntentScopes[i].Start)
-		binary.LittleEndian.PutUint32(out[cursor+4:cursor+8], command.Participant.IntentScopes[i].End)
+	for i := range command.Target.IntentScopes {
+		binary.LittleEndian.PutUint32(out[cursor:cursor+4], command.Target.IntentScopes[i].Start)
+		binary.LittleEndian.PutUint32(out[cursor+4:cursor+8], command.Target.IntentScopes[i].End)
 		cursor += 8
 	}
 	copy(out[cursor:], command.Payload)
@@ -494,7 +493,7 @@ func ReplicatedCommandSize(command ReplicatedCommand) (int, error) {
 }
 
 func replicatedCommandEncodedSize(command ReplicatedCommand) int {
-	return replicatedCommandHeaderBytes + len(command.Participant.IntentScopes)*8 +
+	return replicatedCommandHeaderBytes + len(command.Target.IntentScopes)*8 +
 		len(command.Payload) + replicatedCommandChecksumBytes
 }
 
@@ -512,7 +511,7 @@ func replicatedPayloadOverlapsAppendRegion(dst []byte, total int, payload []byte
 }
 
 // OpenReplicatedCommand returns a borrowed command view. It allocates only the
-// compact participant scope slice, and only for participant staging.
+// compact target scope slice, and only for target staging.
 func OpenReplicatedCommand(src []byte) (ReplicatedCommandView, error) {
 	if len(src) < replicatedCommandHeaderBytes+replicatedCommandChecksumBytes {
 		return ReplicatedCommandView{}, ErrCorrupt
@@ -525,7 +524,7 @@ func OpenReplicatedCommand(src []byte) (ReplicatedCommandView, error) {
 }
 
 // ValidateReplicatedCommand validates one complete canonical transaction
-// control body without retaining a view or materializing participant scopes.
+// control body without retaining a view or materializing target scopes.
 // Replication admission uses this before retaining the immutable raw control
 // bytes, keeping the hot path allocation-free.
 func ValidateReplicatedCommand(src []byte) error {
@@ -559,9 +558,9 @@ func ValidateReplicatedCommand(src []byte) error {
 	var id ID
 	copy(id[:], src[32:48])
 	wantRole, wantPayload, creation, ok := replicatedOperationShape(operation)
-	abortFence := operation == ReplicatedAbortReleaseParticipant && expectedRevision == 0
+	abortFence := operation == ReplicatedAbortReleaseTarget && expectedRevision == 0
 	if abortFence {
-		wantPayload, creation = ReplicatedPayloadParticipantStage, true
+		wantPayload, creation = ReplicatedPayloadTargetStage, true
 	}
 	if id.IsZero() || controllerEpoch == 0 || executionPinDigest == (Digest{}) ||
 		!ok || role != wantRole || payloadKind != wantPayload ||
@@ -575,7 +574,7 @@ func ValidateReplicatedCommand(src []byte) error {
 	scopeEnd := replicatedCommandHeaderBytes + int(scopeCount)*8
 	payloadEnd := scopeEnd + int(payloadLength)
 	payload := src[scopeEnd:payloadEnd:payloadEnd]
-	if replicatedCommandCarriesParticipant(operation, expectedRevision) {
+	if replicatedCommandCarriesTarget(operation, expectedRevision) {
 		var coordinatorGroup, coordinatorShardIncarnation ID
 		var mutationDigest Digest
 		copy(coordinatorGroup[:], src[48:64])
@@ -588,7 +587,7 @@ func ValidateReplicatedCommand(src []byte) error {
 			) {
 			return ErrCorrupt
 		}
-		if operation == ReplicatedStageParticipant &&
+		if operation == ReplicatedStageTarget &&
 			binary.LittleEndian.Uint32(src[124:128]) != 0 {
 			return ErrCorrupt
 		}
@@ -608,7 +607,7 @@ func ValidateReplicatedCommand(src []byte) error {
 }
 
 // OpenReplicatedCommandInto decodes with caller-owned scope storage. A
-// sufficiently sized slice makes participant-stage decode allocation-free.
+// sufficiently sized slice makes target-stage decode allocation-free.
 func OpenReplicatedCommandInto(src []byte, scopes []IntentScope) (ReplicatedCommandView, error) {
 	if len(src) < replicatedCommandHeaderBytes+replicatedCommandChecksumBytes ||
 		len(src) > MaxReplicatedCommandBytes || !equal4(src[:4], replicatedCommandMagic) ||
@@ -635,20 +634,20 @@ func OpenReplicatedCommandInto(src []byte, scopes []IntentScope) (ReplicatedComm
 	view.PayloadKind = ReplicatedPayloadKind(src[7])
 	view.ExpectedRevision = binary.LittleEndian.Uint64(src[24:32])
 	copy(view.ID[:], src[32:48])
-	copy(view.Participant.CoordinatorGroup[:], src[48:64])
-	copy(view.Participant.CoordinatorShardIncarnation[:], src[64:80])
-	view.Participant.CoordinatorAllocation = binary.LittleEndian.Uint64(src[80:88])
-	copy(view.Participant.MutationDigest[:], src[88:120])
-	view.Participant.BucketBits = src[120]
+	copy(view.Target.CoordinatorGroup[:], src[48:64])
+	copy(view.Target.CoordinatorShardIncarnation[:], src[64:80])
+	view.Target.CoordinatorAllocation = binary.LittleEndian.Uint64(src[80:88])
+	copy(view.Target.MutationDigest[:], src[88:120])
+	view.Target.BucketBits = src[120]
 	view.RecoveryPulse = src[121]
-	view.Participant.ParticipantOrdinal = binary.LittleEndian.Uint32(src[124:128])
+	view.Target.TargetOrdinal = binary.LittleEndian.Uint32(src[124:128])
 	view.ControllerEpoch = binary.LittleEndian.Uint64(src[128:136])
 	copy(view.ExecutionPinDigest[:], src[136:168])
 	cursor := replicatedCommandHeaderBytes
 	if scopeCount != 0 {
-		view.Participant.IntentScopes = scopes[:scopeCount]
-		for i := range view.Participant.IntentScopes {
-			view.Participant.IntentScopes[i] = IntentScope{
+		view.Target.IntentScopes = scopes[:scopeCount]
+		for i := range view.Target.IntentScopes {
+			view.Target.IntentScopes[i] = IntentScope{
 				Start: binary.LittleEndian.Uint32(src[cursor : cursor+4]),
 				End:   binary.LittleEndian.Uint32(src[cursor+4 : cursor+8]),
 			}
@@ -672,10 +671,10 @@ func validateReplicatedCommand(command ReplicatedCommand) error {
 		return ErrCorrupt
 	}
 	wantRole, wantPayload, creation, ok := replicatedOperationShape(command.Operation)
-	abortFence := command.Operation == ReplicatedAbortReleaseParticipant &&
+	abortFence := command.Operation == ReplicatedAbortReleaseTarget &&
 		command.ExpectedRevision == 0
 	if abortFence {
-		wantPayload, creation = ReplicatedPayloadParticipantStage, true
+		wantPayload, creation = ReplicatedPayloadTargetStage, true
 	}
 	if !ok || command.Role != wantRole || command.PayloadKind != wantPayload ||
 		(creation && command.ExpectedRevision != 0) || (!creation && command.ExpectedRevision == 0) {
@@ -685,32 +684,32 @@ func validateReplicatedCommand(command ReplicatedCommand) error {
 		command.RecoveryPulse > MaxRecoveryPulses {
 		return ErrCorrupt
 	}
-	carriesParticipant := replicatedCommandCarriesParticipant(
+	carriesTarget := replicatedCommandCarriesTarget(
 		command.Operation, command.ExpectedRevision,
 	)
-	if !carriesParticipant && !participantStageZero(command.Participant) {
+	if !carriesTarget && !targetStageZero(command.Target) {
 		return ErrCorrupt
 	}
-	if carriesParticipant {
-		if command.Participant.CoordinatorGroup.IsZero() ||
-			command.Participant.CoordinatorShardIncarnation.IsZero() ||
-			command.Participant.CoordinatorAllocation == 0 ||
-			command.Participant.MutationDigest == (Digest{}) ||
-			!ValidateIntentScopes(command.Participant.IntentScopes, command.Participant.BucketBits) {
+	if carriesTarget {
+		if command.Target.CoordinatorGroup.IsZero() ||
+			command.Target.CoordinatorShardIncarnation.IsZero() ||
+			command.Target.CoordinatorAllocation == 0 ||
+			command.Target.MutationDigest == (Digest{}) ||
+			!ValidateIntentScopes(command.Target.IntentScopes, command.Target.BucketBits) {
 			return ErrCorrupt
 		}
-		if command.Operation == ReplicatedStageParticipant &&
-			command.Participant.ParticipantOrdinal != 0 {
+		if command.Operation == ReplicatedStageTarget &&
+			command.Target.TargetOrdinal != 0 {
 			return ErrCorrupt
 		}
-		if abortFence && (command.Participant.BucketBits != 0 ||
-			len(command.Participant.IntentScopes) != 0) {
+		if abortFence && (command.Target.BucketBits != 0 ||
+			len(command.Target.IntentScopes) != 0) {
 			return ErrCorrupt
 		}
 	}
 	if err := validateReplicatedPayload(
 		command.Operation, wantPayload, command.ID, command.Payload,
-		command.Participant.ParticipantOrdinal, command.Participant.MutationDigest,
+		command.Target.TargetOrdinal, command.Target.MutationDigest,
 	); err != nil {
 		return err
 	}
@@ -726,7 +725,7 @@ func validateReplicatedPayload(
 	kind ReplicatedPayloadKind,
 	id ID,
 	payload []byte,
-	participantOrdinal uint32,
+	targetOrdinal uint32,
 	mutationDigest Digest,
 ) error {
 	switch kind {
@@ -736,7 +735,7 @@ func validateReplicatedPayload(
 		}
 	case ReplicatedPayloadCoordinator:
 		if err := validateReplicatedCoordinatorPayload(
-			operation, id, payload, participantOrdinal, mutationDigest,
+			operation, id, payload, targetOrdinal, mutationDigest,
 		); err != nil {
 			return err
 		}
@@ -765,19 +764,19 @@ func validateReplicatedPayload(
 			if operation != ReplicatedBeginPrepareManifestCoordinator || segments.Count() != want {
 				return ErrCorrupt
 			}
-			ordinal := uint64(participantOrdinal)
-			if ordinal >= record.Manifest.ParticipantCount {
+			ordinal := uint64(targetOrdinal)
+			if ordinal >= record.Manifest.TargetCount {
 				return ErrCorrupt
 			}
 			iterator := segments.Iterator()
 			for iterator.Next() {
 				page := iterator.Segment()
-				if ordinal < page.FirstParticipant ||
-					ordinal >= page.FirstParticipant+uint64(page.ParticipantCount) {
+				if ordinal < page.FirstTarget ||
+					ordinal >= page.FirstTarget+uint64(page.TargetCount) {
 					continue
 				}
-				matched, matchErr := manifestSegmentMatchesParticipantFields(
-					page.Raw, ordinal, ParticipantRef{MutationDigest: mutationDigest}, false,
+				matched, matchErr := manifestSegmentMatchesTargetFields(
+					page.Raw, ordinal, TransactionTargetRef{MutationDigest: mutationDigest}, false,
 				)
 				if matchErr != nil || !matched {
 					return ErrCorrupt
@@ -803,13 +802,13 @@ func validateReplicatedPayload(
 			return err
 		}
 		if operation != ReplicatedAppendManifestSegments || segments.FirstIndex() == 0 ||
-			segments.FirstParticipant() == 0 {
+			segments.FirstTarget() == 0 {
 			return ErrCorrupt
 		}
 		if err = segments.ValidateAuthorityWitnesses(); err != nil {
 			return err
 		}
-	case ReplicatedPayloadParticipantStage:
+	case ReplicatedPayloadTargetStage:
 		if len(payload) != 0 {
 			return ErrCorrupt
 		}
@@ -830,22 +829,22 @@ func validateReplicatedCoordinatorPayload(
 	operation ReplicatedOperation,
 	id ID,
 	payload []byte,
-	participantOrdinal uint32,
+	targetOrdinal uint32,
 	mutationDigest Digest,
 ) error {
 	if len(payload) > MaxCoordinatorRecordBytes {
 		return ErrTooLarge
 	}
-	var participantScratch [MaxInlineParticipants]ParticipantRef
-	record, err := OpenCoordinatorInto(payload, participantScratch[:])
+	var targetScratch [MaxInlineTargets]TransactionTargetRef
+	record, err := OpenCoordinatorInto(payload, targetScratch[:])
 	if err != nil || !canonicalCoordinatorBytes(payload) || record.ID != id ||
 		record.State != CoordinatorStaging || record.Revision != 1 {
 		return ErrCorrupt
 	}
 	if operation == ReplicatedBeginPrepareCoordinator {
-		ordinal := uint64(participantOrdinal)
-		if ordinal >= uint64(len(record.Participants)) ||
-			record.Participants[ordinal].MutationDigest != mutationDigest {
+		ordinal := uint64(targetOrdinal)
+		if ordinal >= uint64(len(record.Targets)) ||
+			record.Targets[ordinal].MutationDigest != mutationDigest {
 			return ErrCorrupt
 		}
 	}
@@ -853,15 +852,15 @@ func validateReplicatedCoordinatorPayload(
 }
 
 func replicatedCommandShapeWithinBound(command ReplicatedCommand) bool {
-	scopeBytes := len(command.Participant.IntentScopes) * 8
+	scopeBytes := len(command.Target.IntentScopes) * 8
 	switch command.Operation {
 	case ReplicatedBeginPrepareManifestCoordinator:
 		return len(command.Payload) <= ReplicatedManifestCoordinatorRecordBytes+
 			MaxManifestSegmentSequenceBytes && scopeBytes <= MaxIntentScopes*8
 	case ReplicatedAppendManifestSegments:
 		return scopeBytes == 0 && len(command.Payload) <= MaxManifestSegmentSequenceBytes
-	case ReplicatedBeginPrepareCoordinator, ReplicatedStagePrepareParticipant,
-		ReplicatedApplySingleParticipant, ReplicatedStageParticipant:
+	case ReplicatedBeginPrepareCoordinator, ReplicatedStagePrepareTarget,
+		ReplicatedApplySingleTarget, ReplicatedStageTarget:
 		return scopeBytes <= MaxIntentScopes*8
 	default:
 		return scopeBytes == 0
@@ -915,52 +914,52 @@ func replicatedOperationShape(operation ReplicatedOperation) (
 		return ReplicatedRoleCoordinator, ReplicatedPayloadNone, false, true
 	case ReplicatedRetireCoordinator:
 		return ReplicatedRoleCoordinator, ReplicatedPayloadRetirement, false, true
-	case ReplicatedStageParticipant:
-		return ReplicatedRoleParticipant, ReplicatedPayloadParticipantStage, true, true
-	case ReplicatedPrepareParticipant, ReplicatedApplyParticipant,
-		ReplicatedAbortParticipant, ReplicatedReleaseParticipant:
-		return ReplicatedRoleParticipant, ReplicatedPayloadNone, false, true
+	case ReplicatedStageTarget:
+		return ReplicatedRoleTarget, ReplicatedPayloadTargetStage, true, true
+	case ReplicatedPrepareTarget, ReplicatedApplyTarget,
+		ReplicatedAbortTarget, ReplicatedReleaseTarget:
+		return ReplicatedRoleTarget, ReplicatedPayloadNone, false, true
 	case ReplicatedBeginPrepareCoordinator:
 		return ReplicatedRoleCoordinator, ReplicatedPayloadCoordinator, true, true
 	case ReplicatedBeginPrepareManifestCoordinator:
 		return ReplicatedRoleCoordinator, ReplicatedPayloadManifestCoordinator, true, true
 	case ReplicatedAppendManifestSegments:
 		return ReplicatedRoleCoordinator, ReplicatedPayloadManifestSegments, false, true
-	case ReplicatedStagePrepareParticipant:
-		return ReplicatedRoleParticipant, ReplicatedPayloadParticipantStage, true, true
-	case ReplicatedApplySingleParticipant:
+	case ReplicatedStagePrepareTarget:
+		return ReplicatedRoleTarget, ReplicatedPayloadTargetStage, true, true
+	case ReplicatedApplySingleTarget:
 		// Direct apply uses ExpectedRevision as the issuer-lane sequence. The
 		// participant keeps one advancing terminal witness per lane instead of
 		// retaining one transaction record per request.
-		return ReplicatedRoleParticipant, ReplicatedPayloadParticipantStage, false, true
-	case ReplicatedApplyReleaseParticipant, ReplicatedAbortReleaseParticipant:
-		return ReplicatedRoleParticipant, ReplicatedPayloadNone, false, true
+		return ReplicatedRoleTarget, ReplicatedPayloadTargetStage, false, true
+	case ReplicatedApplyReleaseTarget, ReplicatedAbortReleaseTarget:
+		return ReplicatedRoleTarget, ReplicatedPayloadNone, false, true
 	default:
 		return ReplicatedRoleInvalid, ReplicatedPayloadNone, false, false
 	}
 }
 
-func replicatedCommandCarriesParticipant(
+func replicatedCommandCarriesTarget(
 	operation ReplicatedOperation,
 	expectedRevision uint64,
 ) bool {
 	switch operation {
-	case ReplicatedStageParticipant, ReplicatedBeginPrepareCoordinator,
-		ReplicatedBeginPrepareManifestCoordinator, ReplicatedStagePrepareParticipant,
-		ReplicatedApplySingleParticipant:
+	case ReplicatedStageTarget, ReplicatedBeginPrepareCoordinator,
+		ReplicatedBeginPrepareManifestCoordinator, ReplicatedStagePrepareTarget,
+		ReplicatedApplySingleTarget:
 		return true
-	case ReplicatedAbortReleaseParticipant:
+	case ReplicatedAbortReleaseTarget:
 		return expectedRevision == 0
 	default:
 		return false
 	}
 }
 
-func participantStageZero(stage ParticipantStage) bool {
+func targetStageZero(stage TransactionTargetStage) bool {
 	return stage.CoordinatorGroup.IsZero() && stage.CoordinatorShardIncarnation.IsZero() &&
 		stage.CoordinatorAllocation == 0 && stage.BucketBits == 0 &&
 		len(stage.IntentScopes) == 0 && stage.MutationDigest == (Digest{}) &&
-		stage.ParticipantOrdinal == 0
+		stage.TargetOrdinal == 0
 }
 
 func canonicalCoordinatorBytes(raw []byte) bool {
@@ -982,10 +981,10 @@ func canonicalCoordinatorBytes(raw []byte) bool {
 }
 
 type manifestSegmentSummary struct {
-	index            uint32
-	firstParticipant uint64
-	participantCount uint32
-	digest           Digest
+	index       uint32
+	firstTarget uint64
+	targetCount uint32
+	digest      Digest
 
 	firstDistribution       [MaxShardIdentityBytes]byte
 	firstShard              [MaxShardIdentityBytes]byte
@@ -997,9 +996,9 @@ type manifestSegmentSummary struct {
 	lastShardLength         int
 }
 
-type manifestParticipantMatch struct {
+type manifestTargetMatch struct {
 	ordinal uint64
-	want    ParticipantRef
+	want    TransactionTargetRef
 	exact   bool
 	found   bool
 	matched bool
@@ -1014,28 +1013,26 @@ func openCanonicalManifestSegment(raw []byte) (manifestSegmentSummary, bool) {
 	return inspectCanonicalManifestSegment(raw, nil)
 }
 
-// ManifestSegmentMatchesParticipant validates a complete VTM1 page and exact-
-// matches one absolute participant ordinal without a decoded-page arena.
+// ManifestSegmentMatchesTarget validates a complete VTM1 page and exact-
+// matches one absolute target ordinal without a decoded-page arena.
 // present distinguishes an ordinal outside the page from a mismatch.
-func ManifestSegmentMatchesParticipant(
+func ManifestSegmentMatchesTarget(
 	raw []byte,
 	ordinal uint64,
-	want ParticipantRef,
-) (present bool, matches bool, err error) {
-	match := manifestParticipantMatch{ordinal: ordinal, want: want, exact: true}
+	want TransactionTargetRef) (present bool, matches bool, err error) {
+	match := manifestTargetMatch{ordinal: ordinal, want: want, exact: true}
 	if _, ok := inspectCanonicalManifestSegment(raw, &match); !ok {
 		return false, false, ErrCorrupt
 	}
 	return match.found, match.matched, nil
 }
 
-func manifestSegmentMatchesParticipantFields(
+func manifestSegmentMatchesTargetFields(
 	raw []byte,
 	ordinal uint64,
-	want ParticipantRef,
-	exact bool,
+	want TransactionTargetRef, exact bool,
 ) (bool, error) {
-	match := manifestParticipantMatch{ordinal: ordinal, want: want, exact: exact}
+	match := manifestTargetMatch{ordinal: ordinal, want: want, exact: exact}
 	if _, ok := inspectCanonicalManifestSegment(raw, &match); !ok {
 		return false, ErrCorrupt
 	}
@@ -1044,7 +1041,7 @@ func manifestSegmentMatchesParticipantFields(
 
 func inspectCanonicalManifestSegment(
 	raw []byte,
-	match *manifestParticipantMatch,
+	match *manifestTargetMatch,
 ) (manifestSegmentSummary, bool) {
 	var summary manifestSegmentSummary
 	if len(raw) < manifestSegmentHeaderBytes+manifestEntryFixedBytes+4 ||
@@ -1054,12 +1051,12 @@ func inspectCanonicalManifestSegment(
 		return manifestSegmentSummary{}, false
 	}
 	summary.index = binary.LittleEndian.Uint32(raw[8:12])
-	summary.firstParticipant = binary.LittleEndian.Uint64(raw[16:24])
+	summary.firstTarget = binary.LittleEndian.Uint64(raw[16:24])
 	count := int(binary.LittleEndian.Uint32(raw[12:16]))
-	summary.participantCount = uint32(count)
+	summary.targetCount = uint32(count)
 	payloadBytes := int(binary.LittleEndian.Uint32(raw[24:28]))
-	if count <= 0 || count > MaxManifestPageParticipants ||
-		uint64(count) > ^uint64(0)-summary.firstParticipant ||
+	if count <= 0 || count > MaxManifestPageTargets ||
+		uint64(count) > ^uint64(0)-summary.firstTarget ||
 		binary.LittleEndian.Uint32(raw[28:32]) != 0 ||
 		manifestSegmentHeaderBytes+payloadBytes+4 != len(raw) {
 		return manifestSegmentSummary{}, false
@@ -1082,7 +1079,7 @@ func inspectCanonicalManifestSegment(
 			distributionLength == 0 || distributionLength > MaxShardIdentityBytes ||
 			shardLength == 0 || shardLength > MaxShardIdentityBytes ||
 			end-cursor-manifestEntryFixedBytes < distributionSuffix+shardSuffix ||
-			!ParticipantState(entry[4]).valid() ||
+			!TargetState(entry[4]).valid() ||
 			binary.LittleEndian.Uint64(entry[8:16]) == 0 ||
 			binary.LittleEndian.Uint64(entry[16:24]) == 0 ||
 			binary.LittleEndian.Uint64(entry[24:32]) == 0 {
@@ -1120,12 +1117,12 @@ func inspectCanonicalManifestSegment(
 			summary.firstDistributionLength = distributionLength
 			summary.firstShardLength = shardLength
 		}
-		absoluteOrdinal := summary.firstParticipant + uint64(i)
+		absoluteOrdinal := summary.firstTarget + uint64(i)
 		if match != nil && absoluteOrdinal == match.ordinal {
 			match.found = true
-			current := ParticipantRef{
+			current := TransactionTargetRef{
 				Distribution: currentDistribution, Shard: currentShard,
-				State:                ParticipantState(entry[4]),
+				State:                TargetState(entry[4]),
 				RoutingVersion:       binary.LittleEndian.Uint64(entry[8:16]),
 				AllocationGeneration: binary.LittleEndian.Uint64(entry[16:24]),
 				OwnershipEpoch:       binary.LittleEndian.Uint64(entry[24:32]),
@@ -1133,7 +1130,7 @@ func inspectCanonicalManifestSegment(
 				MutationDigest:       mutationDigest,
 			}
 			if match.exact {
-				match.matched = equalParticipantRef(current, match.want)
+				match.matched = equalTargetRef(current, match.want)
 			} else {
 				match.matched = current.MutationDigest == match.want.MutationDigest
 			}

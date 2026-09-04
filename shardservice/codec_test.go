@@ -42,10 +42,10 @@ func testExchangeKey(seed byte) exchange.Key {
 	return exchange.Key{Operation: id, Stage: 2, Partition: 3, Attempt: 4}
 }
 
-func testParticipantRecord(t *testing.T) []byte {
+func testTargetRecord(t *testing.T) []byte {
 	t.Helper()
-	record, err := distributedtxn.AppendParticipant(nil, distributedtxn.ParticipantRecord{
-		ID: testTransactionID(1), State: distributedtxn.ParticipantStaged,
+	record, err := distributedtxn.AppendTarget(nil, distributedtxn.TargetRecord{
+		ID: testTransactionID(1), State: distributedtxn.TargetStaged,
 		Revision: 1, RoutingVersion: 7, AllocationGeneration: 5,
 		OwnershipEpoch: 3, CoordinatorDistribution: []byte("docs"), CoordinatorShard: []byte("-40"),
 		CoordinatorAllocation: 5, CoordinatorRoutingVersion: 7, CoordinatorOwnershipEpoch: 3,
@@ -233,8 +233,8 @@ func TestRequestRoundTrip(t *testing.T) {
 				AllocationGeneration: 5, RoutingVersion: 7, OwnershipEpoch: 3,
 				ExecutionMode: ExecutionReadWrite,
 				Transaction: TransactionRequest{
-					Operation: TransactionStageParticipant,
-					Record:    testParticipantRecord(t),
+					Operation: TransactionStageTarget,
+					Record:    testTargetRecord(t),
 				},
 			},
 		},
@@ -245,7 +245,7 @@ func TestRequestRoundTrip(t *testing.T) {
 				AllocationGeneration: 5, RoutingVersion: 7, OwnershipEpoch: 3,
 				ExecutionMode: ExecutionReadWrite,
 				Transaction: TransactionRequest{
-					Operation: TransactionApplyParticipant,
+					Operation: TransactionApplyTarget,
 					ID:        testTransactionID(1), Revision: 1,
 				},
 			},
@@ -619,8 +619,8 @@ func TestResponseRoundTrip(t *testing.T) {
 			resp: &ShardResponse{
 				Kind: ResponseCompletion, RowsAffected: 3,
 				Transaction: TransactionReply{
-					Role: TransactionRoleParticipant, ID: testTransactionID(1), Revision: 2,
-					ParticipantState: distributedtxn.ParticipantApplied,
+					Role: TransactionRoleTarget, ID: testTransactionID(1), Revision: 2,
+					TargetState: distributedtxn.TargetApplied,
 				},
 			},
 		},
@@ -663,15 +663,15 @@ func TestResponseRoundTrip(t *testing.T) {
 func TestTransactionStageRecordRemainsBorrowed(t *testing.T) {
 	req := &ShardRequest{
 		Transaction: TransactionRequest{
-			Operation: TransactionStageParticipant,
-			Record:    testParticipantRecord(t),
+			Operation: TransactionStageTarget,
+			Record:    testTargetRecord(t),
 		},
 	}
 	decoded, err := DecodeRequest(bytes.NewReader(encodeRequest(t, req)))
 	if err != nil {
 		t.Fatalf("DecodeRequest: %v", err)
 	}
-	record, err := distributedtxn.OpenParticipant(decoded.Transaction.Record)
+	record, err := distributedtxn.OpenTarget(decoded.Transaction.Record)
 	if err != nil {
 		t.Fatalf("OpenParticipant: %v", err)
 	}

@@ -301,8 +301,8 @@ func TestFusedTransactionPersistsExactWrongShardVoteForUnprovableRelation(t *tes
 		}},
 	}}
 	id := transactionCodecID(247)
-	control := fusedParticipantControl(
-		t, fixture, id, distributedtxn.ReplicatedStagePrepareParticipant, 0, batches,
+	control := fusedTargetControl(
+		t, fixture, id, distributedtxn.ReplicatedStagePrepareTarget, 0, batches,
 	)
 	command := transactionCompletionCommand(t, fixture.binding, control, batches)
 	if _, err := fixture.machine.ApplyNormal(normalMeta(3), command); err != nil {
@@ -314,14 +314,14 @@ func TestFusedTransactionPersistsExactWrongShardVoteForUnprovableRelation(t *tes
 		t.Fatalf("wrong-shard completion=%+v result=%+v", completion, result)
 	}
 	controlKey, _ := TransactionControlStorageKey(
-		distributedtxn.ReplicatedRoleParticipant, id,
+		distributedtxn.ReplicatedRoleTarget, id,
 	)
 	raw, found, err := fixture.system.Collection.AppendRaw(nil, controlKey[:])
 	if err != nil || !found {
 		t.Fatalf("wrong-shard vote found=%v err=%v", found, err)
 	}
 	vote, err := OpenTransactionControl(raw)
-	if err != nil || vote.State != uint8(distributedtxn.ParticipantReleased) ||
+	if err != nil || vote.State != uint8(distributedtxn.TargetReleased) ||
 		vote.PrepareResultCode != ResultWrongShard || vote.LastResultCode != ResultWrongShard ||
 		vote.ResidentMutationBytes != 0 || vote.ResidentIntentBytes != 0 {
 		t.Fatalf("wrong-shard vote=%+v err=%v", vote.TransactionControl, err)

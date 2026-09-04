@@ -708,8 +708,8 @@ func TestSnapshotArtifactValidatesExactTransactionRows(t *testing.T) {
 			}
 		})
 	}
-	if cap(scratch.participants) != distributedtxn.MaxManifestPageParticipants ||
-		cap(scratch.identities) != distributedtxn.MaxManifestPageParticipants*distributedtxn.MaxShardIdentityBytes*2 {
+	if cap(scratch.targets) != distributedtxn.MaxManifestPageTargets ||
+		cap(scratch.identities) != distributedtxn.MaxManifestPageTargets*distributedtxn.MaxShardIdentityBytes*2 {
 		t.Fatal("manifest scratch was not retained at the fixed max-page bound")
 	}
 	largeSystemValue := make([]byte, replication.MaxMutationValueBytes+1)

@@ -332,7 +332,7 @@ func directRF3Evidence(ctx context.Context, executor *gateway.ReplicatedExecutor
 			IssuerEpoch: client.epoch, IssuerSequence: client.sequence, IssuerLane: lane,
 		},
 		RequestDigest: replication.Digest(sha256.Sum256(value)), Tenant: tenant,
-		Participant: gateway.ReplicatedTransactionParticipant{
+		Target: gateway.ReplicatedTransactionTarget{
 			Route: route, BucketBits: 8,
 			IntentScopes: []distributedtxn.IntentScope{{Start: 0, End: 256}},
 			Batches: []replication.RelationMutationBatch{{

@@ -810,13 +810,13 @@ type scannedTransactionControl struct {
 	intentRows       uint64
 	payloadSeen      bool
 
-	manifestDescriptor      distributedtxn.ManifestDescriptor
-	manifestDescriptorSeen  bool
-	manifestNextPage        uint32
-	manifestNextParticipant uint64
-	manifestEncodedBytes    uint64
-	manifestChain           distributedtxn.Digest
-	manifestCreation        *scannedManifestCreation
+	manifestDescriptor     distributedtxn.ManifestDescriptor
+	manifestDescriptorSeen bool
+	manifestNextPage       uint32
+	manifestNextTarget     uint64
+	manifestEncodedBytes   uint64
+	manifestChain          distributedtxn.Digest
+	manifestCreation       *scannedManifestCreation
 
 	mutationRows uint64
 	mutationKeys map[transactionIntentIdentity]scannedMutationKey
@@ -879,7 +879,7 @@ func scanSessionSystemSnapshot(
 	var historicalSeen map[[18]byte]uint64
 	var unfencedSlots uint64
 	var transactionScopeScratch []distributedtxn.IntentScope
-	var manifestParticipantScratch []distributedtxn.ParticipantRef
+	var manifestTargetScratch []distributedtxn.TransactionTargetRef
 	var manifestIdentityScratch []byte
 	var manifestCreationControl *scannedTransactionControl
 	var manifestCreationHash hash.Hash
@@ -1212,18 +1212,18 @@ func scanSessionSystemSnapshot(
 			summary.payloadRows++
 			summary.residentPayload += uint64(len(key) + len(value))
 			if view.Kind == distributedtxn.ReplicatedPayloadCoordinator {
-				var participantScratch [distributedtxn.MaxInlineParticipants]distributedtxn.ParticipantRef
-				record, recordErr := distributedtxn.OpenCoordinatorInto(view.Payload, participantScratch[:])
+				var targetScratch [distributedtxn.MaxInlineTargets]distributedtxn.TransactionTargetRef
+				record, recordErr := distributedtxn.OpenCoordinatorInto(view.Payload, targetScratch[:])
 				if recordErr != nil || view.Digest != summary.control.PayloadDigest ||
 					uint64(len(view.Payload)) != summary.control.PayloadBytes ||
-					uint64(len(record.Participants)) != summary.control.PayloadCount {
+					uint64(len(record.Targets)) != summary.control.PayloadCount {
 					return errors.Join(recordErr, ErrTransactionStateCorrupt)
 				}
 			} else {
 				record, recordErr := distributedtxn.OpenManifestCoordinator(view.Payload)
 				if recordErr != nil || len(view.Payload) != distributedtxn.ReplicatedManifestCoordinatorRecordBytes ||
 					record.Manifest.EncodedBytes != summary.control.PayloadBytes ||
-					record.Manifest.ParticipantCount != summary.control.PayloadCount {
+					record.Manifest.TargetCount != summary.control.PayloadCount {
 					return errors.Join(recordErr, ErrTransactionStateCorrupt)
 				}
 				summary.manifestDescriptor = record.Manifest
@@ -1241,14 +1241,14 @@ func scanSessionSystemSnapshot(
 			if !statePresent {
 				return ErrTransactionStateCorrupt
 			}
-			if manifestParticipantScratch == nil {
-				manifestParticipantScratch = make([]distributedtxn.ParticipantRef,
-					distributedtxn.MaxManifestPageParticipants)
+			if manifestTargetScratch == nil {
+				manifestTargetScratch = make([]distributedtxn.TransactionTargetRef,
+					distributedtxn.MaxManifestPageTargets)
 				manifestIdentityScratch = make([]byte,
-					distributedtxn.MaxManifestPageParticipants*distributedtxn.MaxShardIdentityBytes*2)
+					distributedtxn.MaxManifestPageTargets*distributedtxn.MaxShardIdentityBytes*2)
 			}
 			view, openErr := OpenTransactionManifestPageInto(
-				value, manifestParticipantScratch, manifestIdentityScratch,
+				value, manifestTargetScratch, manifestIdentityScratch,
 			)
 			want, keyErr := view.StorageKey()
 			summary := transactionControls[scannedTransactionKey{
@@ -1258,7 +1258,7 @@ func scanSessionSystemSnapshot(
 				summary.control.PayloadKind != distributedtxn.ReplicatedPayloadManifestCoordinator ||
 				summary.manifestCreation == nil ||
 				view.Index != summary.manifestNextPage ||
-				view.FirstParticipant != summary.manifestNextParticipant {
+				view.FirstTarget != summary.manifestNextTarget {
 				return errors.Join(openErr, keyErr, ErrTransactionStateCorrupt)
 			}
 			// Stage starts with exactly one page; fused begin/prepare starts with
@@ -1299,7 +1299,7 @@ func scanSessionSystemSnapshot(
 				}
 			}
 			summary.manifestNextPage++
-			summary.manifestNextParticipant += uint64(view.ParticipantCount)
+			summary.manifestNextTarget += uint64(view.TargetCount)
 			if summary.manifestEncodedBytes > math.MaxUint64-uint64(len(view.Raw)) {
 				return ErrTransactionStateCorrupt
 			}
@@ -1319,7 +1319,7 @@ func scanSessionSystemSnapshot(
 			view, openErr := OpenTransactionRelationPayload(value)
 			want, keyErr := view.StorageKey()
 			summary := transactionControls[scannedTransactionKey{
-				role: distributedtxn.ReplicatedRoleParticipant, id: view.ID,
+				role: distributedtxn.ReplicatedRoleTarget, id: view.ID,
 			}]
 			if openErr != nil || keyErr != nil || !bytes.Equal(key, want[:]) || summary == nil {
 				return errors.Join(openErr, keyErr, ErrTransactionStateCorrupt)
@@ -1394,7 +1394,7 @@ func scanSessionSystemSnapshot(
 			view, openErr := OpenTransactionIntent(value)
 			want, keyErr := view.StorageKey()
 			summary := transactionControls[scannedTransactionKey{
-				role: distributedtxn.ReplicatedRoleParticipant, id: view.ID,
+				role: distributedtxn.ReplicatedRoleTarget, id: view.ID,
 			}]
 			identity := transactionIntentIdentity{relation: view.Relation, digest: view.KeyHash}
 			mutationKey, mutationFound := scannedMutationKey{}, false
@@ -1635,9 +1635,9 @@ func scanSessionSystemSnapshot(
 			if control.PayloadKind == distributedtxn.ReplicatedPayloadManifestCoordinator {
 				if !summary.manifestDescriptorSeen || summary.manifestCreation == nil ||
 					!summary.manifestCreation.authenticated || summary.manifestNextPage == 0 ||
-					summary.manifestNextParticipant == 0 || summary.manifestEncodedBytes == 0 ||
+					summary.manifestNextTarget == 0 || summary.manifestEncodedBytes == 0 ||
 					summary.manifestNextPage != control.ManifestNextPage ||
-					summary.manifestNextParticipant != control.ManifestNextParticipant ||
+					summary.manifestNextTarget != control.ManifestNextTarget ||
 					summary.manifestEncodedBytes != control.ManifestEncodedBytes ||
 					summary.manifestChain != control.ManifestChainDigest {
 					return State{}, false, 0, 0, 0, nil,
@@ -1645,10 +1645,10 @@ func scanSessionSystemSnapshot(
 				}
 				descriptor := summary.manifestDescriptor
 				complete := summary.manifestNextPage == descriptor.SegmentCount &&
-					summary.manifestNextParticipant == descriptor.ParticipantCount &&
+					summary.manifestNextTarget == descriptor.TargetCount &&
 					summary.manifestEncodedBytes == descriptor.EncodedBytes
 				if complete && finishTransactionManifestRoot(
-					summary.manifestChain, descriptor.ParticipantCount,
+					summary.manifestChain, descriptor.TargetCount,
 					descriptor.EncodedBytes, descriptor.SegmentCount,
 				) != descriptor.Root {
 					return State{}, false, 0, 0, 0, nil,
@@ -1687,7 +1687,7 @@ func transactionControlActive(control TransactionControl) bool {
 	if control.Role == distributedtxn.ReplicatedRoleCoordinator {
 		return distributedtxn.CoordinatorState(control.State) != distributedtxn.CoordinatorRetired
 	}
-	return distributedtxn.ParticipantState(control.State) != distributedtxn.ParticipantReleased
+	return distributedtxn.TargetState(control.State) != distributedtxn.TargetReleased
 }
 
 func addTransactionResidentBytes(total *uint64, keyBytes, valueBytes int) error {

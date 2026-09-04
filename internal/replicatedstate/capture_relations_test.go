@@ -234,8 +234,8 @@ func TestRelationCaptureTransactionPublication(t *testing.T) {
 				{Relation: 2, Mutations: []replication.Mutation{{Kind: replication.MutationPutAbsentOrEqual, Key: []byte{0x91, 0x02, 'e'}, Value: []byte(`["employee"]`)}}},
 			}
 			id := transactionCodecID(241)
-			prepare := transactionCompletionCommand(t, f.binding, fusedParticipantControl(
-				t, f, id, distributedtxn.ReplicatedStagePrepareParticipant, 0, batches,
+			prepare := transactionCompletionCommand(t, f.binding, fusedTargetControl(
+				t, f, id, distributedtxn.ReplicatedStagePrepareTarget, 0, batches,
 			), batches)
 			applyTransactionCommand(t, f.machine, 3, prepare)
 			if got := readRelationCapture(t, f.capture.Collection, 3); len(got) != 0 {
@@ -250,11 +250,11 @@ func TestRelationCaptureTransactionPublication(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			operation := distributedtxn.ReplicatedAbortReleaseParticipant
+			operation := distributedtxn.ReplicatedAbortReleaseTarget
 			if commit {
-				operation = distributedtxn.ReplicatedApplyReleaseParticipant
+				operation = distributedtxn.ReplicatedApplyReleaseTarget
 			}
-			finish := transactionCompletionCommand(t, f.binding, fusedParticipantControl(
+			finish := transactionCompletionCommand(t, f.binding, fusedTargetControl(
 				t, f, id, operation, 2, nil,
 			), nil)
 			applyTransactionCommand(t, f.machine, 4, finish)

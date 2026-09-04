@@ -15,13 +15,13 @@ import (
 )
 
 const (
-	durableRequestPlanHeaderBytes               = 24
-	durableRequestPlanTrailerBytes              = 4
-	durableRequestRecipeTrailerBytes            = 4
-	durableRequestLogicalRecipeHeaderBytes      = 952
-	durableRequestLogicalParticipantHeaderBytes = 272
-	maxDurableRequestScopeWave                  = distributedtxn.MaxIntentScopes
-	durableRequestMaxParticipantFrameBytes      = durableRequestLogicalParticipantHeaderBytes +
+	durableRequestPlanHeaderBytes          = 24
+	durableRequestPlanTrailerBytes         = 4
+	durableRequestRecipeTrailerBytes       = 4
+	durableRequestLogicalRecipeHeaderBytes = 952
+	durableRequestLogicalTargetHeaderBytes = 272
+	maxDurableRequestScopeWave             = distributedtxn.MaxIntentScopes
+	durableRequestMaxTargetFrameBytes      = durableRequestLogicalTargetHeaderBytes +
 		2*replication.MaxIdentityBytes + distributedtxn.MaxIntentScopes*8 +
 		replication.MaxCommandBytes
 )
@@ -65,7 +65,7 @@ func (function durableRequestPlanPageSinkFunc) Put(ordinal uint32, page []byte) 
 }
 
 // measureDurableRequestPlan computes exact canonical bytes and the authenticated
-// page root while retaining only one page and one participant mutation payload.
+// page root while retaining only one page and one target mutation payload.
 func measureDurableRequestPlan(
 	key DurableRequestLedgerKey,
 	program DurableRequestLogicalProgram,
@@ -190,17 +190,17 @@ func measureDurableRequestRecipeBytes(program DurableRequestLogicalProgram) (uin
 func measureValidatedDurableRequestRecipeBytes(program DurableRequestLogicalProgram) (uint64, int, error) {
 	total := uint64(durableRequestLogicalRecipeHeaderBytes + len(program.Tenant) + durableRequestRecipeTrailerBytes)
 	maxMutationBytes := 0
-	for index := range program.Participants {
-		participant := &program.Participants[index]
-		layout, err := replication.MeasureTransactionMutationBytes(participant.Batches)
+	for index := range program.Targets {
+		target := &program.Targets[index]
+		layout, err := replication.MeasureTransactionMutationBytes(target.Batches)
 		if err != nil || layout.Bytes <= 0 || layout.Bytes > replication.MaxCommandBytes ||
 			layout.RelationCount == 0 || layout.MutationCount == 0 {
 			return 0, 0, errors.Join(err, ErrDurableRequest)
 		}
-		frameBytes := uint64(durableRequestLogicalParticipantHeaderBytes) +
-			uint64(len(participant.Distribution)) + uint64(len(participant.Shard)) +
-			uint64(len(participant.IntentScopes))*8 + uint64(layout.Bytes)
-		if frameBytes > durableRequestMaxParticipantFrameBytes || frameBytes > math.MaxUint32 ||
+		frameBytes := uint64(durableRequestLogicalTargetHeaderBytes) +
+			uint64(len(target.Distribution)) + uint64(len(target.Shard)) +
+			uint64(len(target.IntentScopes))*8 + uint64(layout.Bytes)
+		if frameBytes > durableRequestMaxTargetFrameBytes || frameBytes > math.MaxUint32 ||
 			frameBytes > MaxDurableRequestRecipeBytes || total > MaxDurableRequestRecipeBytes-frameBytes {
 			return 0, 0, ErrDurableRequestBound
 		}
@@ -295,35 +295,35 @@ func encodeDurableRequestPlan(
 		return err
 	}
 	mutationScratch := make([]byte, 0, measurement.maxMutationBytes)
-	var participantHeader [durableRequestLogicalParticipantHeaderBytes]byte
+	var targetHeader [durableRequestLogicalTargetHeaderBytes]byte
 	var scope [8]byte
-	for index := range program.Participants {
-		participant := &program.Participants[index]
-		encoded, layout, err := replication.AppendTransactionMutationBytes(mutationScratch[:0], participant.Batches)
+	for index := range program.Targets {
+		target := &program.Targets[index]
+		encoded, layout, err := replication.AppendTransactionMutationBytes(mutationScratch[:0], target.Batches)
 		if err != nil || len(encoded) > measurement.maxMutationBytes {
 			return errors.Join(err, ErrDurableRequestConflict)
 		}
 		mutationScratch = encoded[:0:cap(encoded)]
-		frameBytes := durableRequestLogicalParticipantHeaderBytes + len(participant.Distribution) +
-			len(participant.Shard) + len(participant.IntentScopes)*8 + len(encoded)
-		if frameBytes > durableRequestMaxParticipantFrameBytes || uint64(frameBytes) > uint64(math.MaxUint32) {
+		frameBytes := durableRequestLogicalTargetHeaderBytes + len(target.Distribution) +
+			len(target.Shard) + len(target.IntentScopes)*8 + len(encoded)
+		if frameBytes > durableRequestMaxTargetFrameBytes || uint64(frameBytes) > uint64(math.MaxUint32) {
 			return ErrDurableRequestBound
 		}
-		appendDurableRequestLogicalParticipantHeader(participantHeader[:], frameBytes, layout, *participant)
-		if err := observeDurableRequestRecipePart(&recipeCRC, &framer, &writer, participantHeader[:]); err != nil {
+		appendDurableRequestLogicalTargetHeader(targetHeader[:], frameBytes, layout, *target)
+		if err := observeDurableRequestRecipePart(&recipeCRC, &framer, &writer, targetHeader[:]); err != nil {
 			return err
 		}
-		distributionBytes := byteview.Bytes(string(participant.Distribution))
+		distributionBytes := byteview.Bytes(string(target.Distribution))
 		if err := observeDurableRequestRecipePart(&recipeCRC, &framer, &writer, distributionBytes); err != nil {
 			return err
 		}
-		shardBytes := byteview.Bytes(string(participant.Shard))
+		shardBytes := byteview.Bytes(string(target.Shard))
 		if err := observeDurableRequestRecipePart(&recipeCRC, &framer, &writer, shardBytes); err != nil {
 			return err
 		}
-		for scopeIndex := range participant.IntentScopes {
-			binary.LittleEndian.PutUint32(scope[:4], participant.IntentScopes[scopeIndex].Start)
-			binary.LittleEndian.PutUint32(scope[4:8], participant.IntentScopes[scopeIndex].End)
+		for scopeIndex := range target.IntentScopes {
+			binary.LittleEndian.PutUint32(scope[:4], target.IntentScopes[scopeIndex].Start)
+			binary.LittleEndian.PutUint32(scope[4:8], target.IntentScopes[scopeIndex].End)
 			if err := observeDurableRequestRecipePart(&recipeCRC, &framer, &writer, scope[:]); err != nil {
 				return err
 			}
@@ -367,7 +367,7 @@ func appendDurableRequestLogicalHeader(raw []byte, recipeBytes uint64, program D
 	clear(raw)
 	copy(raw[:8], durableRequestLogicalRecipeMagic[:])
 	binary.LittleEndian.PutUint64(raw[8:16], recipeBytes)
-	binary.LittleEndian.PutUint64(raw[16:24], uint64(len(program.Participants)))
+	binary.LittleEndian.PutUint64(raw[16:24], uint64(len(program.Targets)))
 	binary.LittleEndian.PutUint16(raw[24:26], uint16(len(program.Tenant)))
 	copy(raw[32:48], program.Identity.ID[:])
 	copy(raw[48:56], program.Identity.RetryHome[:])
@@ -407,7 +407,7 @@ func appendDurableRequestLogicalHeader(raw []byte, recipeBytes uint64, program D
 	binary.LittleEndian.PutUint32(raw[offset:offset+4], contract.AbortTransitionTag)
 	offset += 4
 	for _, value := range [...]uint64{
-		contract.ParticipantCount, contract.CommitFinalWaveCount,
+		contract.TargetCount, contract.CommitFinalWaveCount,
 		contract.AbortFinalWaveCount, contract.MaxPendingWaveBytes,
 		contract.MaxContinuationBytes, contract.MaxTerminalBytes,
 		contract.MaxActivePayloadBytes, contract.MaxActivePayloadChunks,
@@ -428,29 +428,29 @@ func appendDurableRequestLogicalHeader(raw []byte, recipeBytes uint64, program D
 	copy(raw[offset:offset+32], program.RequestDigest[:])
 }
 
-func appendDurableRequestLogicalParticipantHeader(
+func appendDurableRequestLogicalTargetHeader(
 	raw []byte,
 	frameBytes int,
 	layout replication.TransactionMutationBytesLayout,
-	participant DurableRequestLogicalParticipant,
+	target DurableRequestLogicalTarget,
 ) {
 	clear(raw)
 	binary.LittleEndian.PutUint32(raw[:4], uint32(frameBytes))
-	binary.LittleEndian.PutUint16(raw[4:6], uint16(len(participant.Distribution)))
-	binary.LittleEndian.PutUint16(raw[6:8], uint16(len(participant.Shard)))
-	binary.LittleEndian.PutUint16(raw[8:10], uint16(len(participant.IntentScopes)))
+	binary.LittleEndian.PutUint16(raw[4:6], uint16(len(target.Distribution)))
+	binary.LittleEndian.PutUint16(raw[6:8], uint16(len(target.Shard)))
+	binary.LittleEndian.PutUint16(raw[8:10], uint16(len(target.IntentScopes)))
 	binary.LittleEndian.PutUint16(raw[10:12], layout.RelationCount)
 	binary.LittleEndian.PutUint32(raw[12:16], layout.MutationCount)
 	binary.LittleEndian.PutUint32(raw[16:20], uint32(layout.Bytes))
-	raw[20] = participant.BucketBits
+	raw[20] = target.BucketBits
 	binary.LittleEndian.PutUint16(raw[24:26], uint16(layout.InlineRelationID))
-	copy(raw[32:64], participant.RangeIdentity[:])
-	appendDurableRequestGroup(raw[64:136], participant.Group)
-	binary.LittleEndian.PutUint64(raw[136:144], participant.SchemaGeneration)
-	copy(raw[144:176], participant.RelationManifestDigest[:])
-	copy(raw[176:208], participant.LineageDigest[:])
-	copy(raw[208:240], participant.ForwardingRuleDigest[:])
-	copy(raw[240:272], participant.MutationDigest[:])
+	copy(raw[32:64], target.RangeIdentity[:])
+	appendDurableRequestGroup(raw[64:136], target.Group)
+	binary.LittleEndian.PutUint64(raw[136:144], target.SchemaGeneration)
+	copy(raw[144:176], target.RelationManifestDigest[:])
+	copy(raw[176:208], target.LineageDigest[:])
+	copy(raw[208:240], target.ForwardingRuleDigest[:])
+	copy(raw[240:272], target.MutationDigest[:])
 }
 
 type durableRequestRootCollector struct {

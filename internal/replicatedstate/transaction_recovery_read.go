@@ -16,7 +16,7 @@ type TransactionRecoveryReadKind uint8
 
 const (
 	TransactionRecoveryLookupCoordinator TransactionRecoveryReadKind = iota + 1
-	TransactionRecoveryLookupParticipant
+	TransactionRecoveryLookupTarget
 	TransactionRecoveryReadManifestPage
 	TransactionRecoveryScanCoordinator
 )
@@ -59,7 +59,7 @@ type TransactionRecoveryReadRequest struct {
 // TransactionRecoveryRecord is detached fixed recovery metadata plus an
 // optional borrowed canonical payload in the caller's arena. State is decoded
 // according to Role. Payload is VTC1/VTCM for an active coordinator, VTM1 for
-// a manifest-page read, and empty for participant and scan summaries.
+// a manifest-page read, and empty for target and scan summaries.
 type TransactionRecoveryRecord struct {
 	ID       distributedtxn.ID
 	Role     distributedtxn.ReplicatedRole
@@ -76,11 +76,11 @@ type TransactionRecoveryRecord struct {
 
 	AffectedRows      int64
 	AffectedRowsValid bool
-	// CancellationWitness and ParticipantOrdinal expose the exact compact
+	// CancellationWitness and TargetOrdinal expose the exact compact
 	// abort fence. The ordinal is meaningful only when CancellationWitness is
-	// true; ordinary participant summaries retain affected-row semantics.
+	// true; ordinary target summaries retain affected-row semantics.
 	CancellationWitness bool
-	ParticipantOrdinal  uint32
+	TargetOrdinal       uint32
 	CoordinatorDecision distributedtxn.CoordinatorState
 	ManifestPage        uint32
 	RecoveryPulse       uint8
@@ -110,7 +110,7 @@ func ValidateTransactionRecoveryReadRequest(request TransactionRecoveryReadReque
 			request.MaxBytes > TransactionRecoverySummaryBytes+distributedtxn.MaxCoordinatorRecordBytes {
 			return ErrTransactionRecoveryRead
 		}
-	case TransactionRecoveryLookupParticipant:
+	case TransactionRecoveryLookupTarget:
 		if request.ID.IsZero() || request.ManifestPage != 0 || request.MaxRows != 1 ||
 			request.MaxBytes != TransactionRecoverySummaryBytes {
 			return ErrTransactionRecoveryRead
@@ -190,8 +190,8 @@ func (m *Machine) TransactionRecoveryReadInto(
 		result.Records, resultErr = lookupTransactionRecoveryCoordinator(
 			snapshot, request, records, payload, controlRead[:], controlScopes[:],
 		)
-	case TransactionRecoveryLookupParticipant:
-		result.Records, resultErr = lookupTransactionRecoveryParticipant(
+	case TransactionRecoveryLookupTarget:
+		result.Records, resultErr = lookupTransactionRecoveryTarget(
 			snapshot, request, records, controlRead[:], controlScopes[:],
 		)
 	case TransactionRecoveryReadManifestPage:
@@ -257,7 +257,7 @@ func lookupTransactionRecoveryCoordinator(
 	return append(records, record), nil
 }
 
-func lookupTransactionRecoveryParticipant(
+func lookupTransactionRecoveryTarget(
 	snapshot *durable.Snapshot,
 	request TransactionRecoveryReadRequest,
 	records []TransactionRecoveryRecord,
@@ -265,7 +265,7 @@ func lookupTransactionRecoveryParticipant(
 	controlScopes []distributedtxn.IntentScope,
 ) ([]TransactionRecoveryRecord, error) {
 	control, found, err := transactionRecoveryControlAt(
-		snapshot, distributedtxn.ReplicatedRoleParticipant, request.ID,
+		snapshot, distributedtxn.ReplicatedRoleTarget, request.ID,
 		controlRead, controlScopes,
 	)
 	if err != nil || !found {
@@ -358,7 +358,7 @@ func scanTransactionRecoveryCoordinators(
 		lowerBytes = lower[:]
 		lowerExclusive = true
 	}
-	upper := [2]byte{transactionControlPrefix, byte(distributedtxn.ReplicatedRoleParticipant)}
+	upper := [2]byte{transactionControlPrefix, byte(distributedtxn.ReplicatedRoleTarget)}
 	complete := true
 	used := uint32(0)
 	_, err := snapshot.RangeBoundsRawBuffer(
@@ -454,11 +454,11 @@ func transactionRecoveryCoordinatorPayload(
 		view.Digest != control.PayloadDigest || uint64(len(view.Payload)) != control.PayloadBytes {
 		return nil, errors.Join(err, ErrTransactionStateCorrupt)
 	}
-	var participants [distributedtxn.MaxInlineParticipants]distributedtxn.ParticipantRef
-	record, err := distributedtxn.OpenCoordinatorInto(view.Payload, participants[:])
+	var targets [distributedtxn.MaxInlineTargets]distributedtxn.TransactionTargetRef
+	record, err := distributedtxn.OpenCoordinatorInto(view.Payload, targets[:])
 	resident, residentErr := TransactionCoordinatorPayloadResidentBytes(len(view.Payload))
 	if err != nil || residentErr != nil || record.ID != control.ID ||
-		uint64(len(record.Participants)) != control.PayloadCount ||
+		uint64(len(record.Targets)) != control.PayloadCount ||
 		resident != control.ResidentPayloadBytes ||
 		distributedtxn.Digest(sha256.Sum256(view.Payload)) != control.PayloadDigest {
 		return nil, errors.Join(err, residentErr, ErrTransactionStateCorrupt)
@@ -484,7 +484,7 @@ func transactionRecoveryManifestCoordinator(
 	record, err := distributedtxn.OpenManifestCoordinator(view.Payload)
 	resident, residentErr := TransactionCoordinatorPayloadResidentBytes(len(view.Payload))
 	if err != nil || residentErr != nil || record.ID != control.ID ||
-		record.Manifest.ParticipantCount != control.PayloadCount ||
+		record.Manifest.TargetCount != control.PayloadCount ||
 		record.Manifest.EncodedBytes != control.PayloadBytes ||
 		resident != control.ResidentPayloadBytes {
 		return nil, distributedtxn.ManifestDescriptor{}, errors.Join(
@@ -520,22 +520,22 @@ func transactionRecoveryManifestProgress(
 	descriptor distributedtxn.ManifestDescriptor,
 ) error {
 	if control.ManifestNextPage == 0 || control.ManifestNextPage > descriptor.SegmentCount ||
-		control.ManifestNextParticipant > descriptor.ParticipantCount ||
+		control.ManifestNextTarget > descriptor.TargetCount ||
 		control.ManifestEncodedBytes > descriptor.EncodedBytes {
 		return ErrTransactionStateCorrupt
 	}
 	pageComplete := control.ManifestNextPage == descriptor.SegmentCount
-	participantComplete := control.ManifestNextParticipant == descriptor.ParticipantCount
+	targetComplete := control.ManifestNextTarget == descriptor.TargetCount
 	bytesComplete := control.ManifestEncodedBytes == descriptor.EncodedBytes
-	complete := pageComplete && participantComplete && bytesComplete
-	if (pageComplete || participantComplete || bytesComplete) != complete {
+	complete := pageComplete && targetComplete && bytesComplete
+	if (pageComplete || targetComplete || bytesComplete) != complete {
 		return ErrTransactionStateCorrupt
 	}
 	if complete &&
-		control.ManifestNextParticipant == descriptor.ParticipantCount &&
+		control.ManifestNextTarget == descriptor.TargetCount &&
 		control.ManifestEncodedBytes == descriptor.EncodedBytes &&
 		finishTransactionManifestRoot(
-			control.ManifestChainDigest, control.ManifestNextParticipant,
+			control.ManifestChainDigest, control.ManifestNextTarget,
 			control.ManifestEncodedBytes, control.ManifestNextPage,
 		) != descriptor.Root {
 		return ErrTransactionStateCorrupt
@@ -556,7 +556,7 @@ func transactionRecoveryRecord(control TransactionControl) TransactionRecoveryRe
 		MutationDigest:              control.MutationDigest,
 		AffectedRows:                control.AffectedRows, AffectedRowsValid: control.AffectedRowsValid,
 		CancellationWitness: control.CancellationWitness,
-		ParticipantOrdinal:  control.ParticipantOrdinal,
+		TargetOrdinal:       control.TargetOrdinal,
 		CoordinatorDecision: control.CoordinatorDecision,
 		RecoveryPulse:       control.RecoveryPulse,
 	}

@@ -11,7 +11,7 @@ var errInvalidServeRequest = errors.New("gateway: invalid serving request")
 
 const maxServeWireParams = 1 << 16
 
-// Metadata admission is a request-memory budget, not a shard/participant or
+// Metadata admission is a request-memory budget, not a shard/target or
 // statement-count limit. Charge conservatively for slice growth and the
 // temporary parameter decode slice as well as the retained per-request slices.
 const maxServeDecodeMetadataBytes = 8 << 20

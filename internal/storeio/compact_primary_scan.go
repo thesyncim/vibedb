@@ -295,6 +295,15 @@ func (d *CompactPrimaryScanDecoder) appendDictionaryFragment(
 	s.bit = available
 	s.cursor = cursor
 	s.next++
+	fragmentLen := end - start
+	// The admitted corpus is dominated by 15-byte fragments. A fixed copy
+	// lowers to one unaligned vector load/store instead of runtime.memmove.
+	if fragmentLen <= 16 && cap(dst)-len(dst) >= 16 {
+		at := len(dst)
+		dst = dst[:at+16]
+		*(*[16]byte)(dst[at:]) = *(*[16]byte)(d.fragments[start:])
+		return dst[:at+fragmentLen], true
+	}
 	return append(dst, d.fragments[start:end]...), true
 }
 

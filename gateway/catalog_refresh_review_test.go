@@ -156,8 +156,8 @@ func TestCatalogRefreshReviewCanceledWaiterKeepsOwnerAlive(t *testing.T) {
 func TestCatalogRefreshReviewFailureReplaysExactRetainedRequest(t *testing.T) {
 	for _, refreshErr := range []error{ErrStaleGeneration, ErrReplicatedUnauthorized} {
 		t.Run(refreshErr.Error(), func(t *testing.T) {
-			participants := durableFaultParticipants(t)
-			base := durableFaultRequest(t, participants)
+			targets := durableFaultTargets(t)
+			base := durableFaultRequest(t, targets)
 			queries := []Query{{SQL: `INSERT INTO absent VALUES (?)`, Class: ClassInteractive,
 				Params: []shardservice.Param{shardservice.DocumentParam(`{"id":"retained"}`)}}}
 			key, err := NewDurableRequestLedgerKey(base.Key.RequestKey, replicatedSQLTransactionRequestDigest(queries))
@@ -167,7 +167,7 @@ func TestCatalogRefreshReviewFailureReplaysExactRetainedRequest(t *testing.T) {
 			resultRaw, err := AppendDurableRequestResult(nil, DurableRequestResult{
 				Committed: true, AffectedRows: 2, Transaction: base.Program.Identity.ID,
 				CatalogGeneration:       base.Program.Identity.CatalogGeneration,
-				ShardsFanned:            uint64(len(base.Program.Participants)),
+				ShardsFanned:            uint64(len(base.Program.Targets)),
 				TransitionTag:           base.Program.Contract.CommitTransitionTag,
 				TerminalStateDigest:     base.Program.Contract.CommitTerminalStateDigest,
 				TerminalContractDigest:  base.Program.Contract.TerminalContractDigest,
@@ -192,7 +192,7 @@ func TestCatalogRefreshReviewFailureReplaysExactRetainedRequest(t *testing.T) {
 				t.Fatal(err)
 			}
 			pins := new(typedServicePinStop)
-			service, err := newDurableRequestService(durableFaultTopology(t, participants), ledger, typedServiceRunnerStop{}, pins)
+			service, err := newDurableRequestService(durableFaultTopology(t, targets), ledger, typedServiceRunnerStop{}, pins)
 			if err != nil {
 				t.Fatal(err)
 			}

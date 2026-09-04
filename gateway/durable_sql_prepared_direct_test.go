@@ -30,7 +30,7 @@ func TestDurableSQLPreparedUpdateReplaysPersistedMutation(t *testing.T) {
 	if err != nil || reader.reads != 1 {
 		t.Fatalf("prepare reads=%d err=%v", reader.reads, err)
 	}
-	mutation := plan.Participant.Batches[0].Mutations[0]
+	mutation := plan.Target.Batches[0].Mutations[0]
 	if mutation.Kind != replication.MutationPutDigestEqual || string(mutation.Value) != `{"id":"message-1","n":42}` || mutation.ExpectedValueDigest != replication.Digest(sha256.Sum256(old)) {
 		t.Fatalf("mutation=%+v", mutation)
 	}
@@ -43,7 +43,7 @@ func TestDurableSQLPreparedUpdateReplaysPersistedMutation(t *testing.T) {
 		t.Fatal(err)
 	}
 	command := func(p *DurableSQLDirectPlan) []byte {
-		encoded, _, err := appendReplicatedDirectMutationCommand(nil, ReplicatedDirectMutation{Key: p.Key, RequestDigest: p.RequestDigest, Tenant: tenant, Participant: p.Participant})
+		encoded, _, err := appendReplicatedDirectMutationCommand(nil, ReplicatedDirectMutation{Key: p.Key, RequestDigest: p.RequestDigest, Tenant: tenant, Target: p.Target})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -53,7 +53,7 @@ func TestDurableSQLPreparedUpdateReplaysPersistedMutation(t *testing.T) {
 		t.Fatal("journal round trip changed native command")
 	}
 	reader.value = []byte(`{"id":"message-1","n":99}`)
-	proposer := &directSQLProposalClient{t: t, route: plan.Participant.Route, applied: 1}
+	proposer := &directSQLProposalClient{t: t, route: plan.Target.Route, applied: 1}
 	executor.data, err = NewReplicatedExecutor(proposer, 3, time.Second)
 	if err != nil {
 		t.Fatal(err)
@@ -75,8 +75,8 @@ func TestDurableSQLPreparedUpdateReplaysPersistedMutation(t *testing.T) {
 
 func TestDurableSQLPreparedUpdateRequiresExactPreimageGuard(t *testing.T) {
 	query := []Query{{SQL: `UPDATE messages SET n=n+1 WHERE id='missing'`}}
-	participants := []ReplicatedTransactionParticipant{{Batches: []replication.RelationMutationBatch{{Relation: 1, Mutations: []replication.Mutation{{Kind: replication.MutationPutPresent, Key: []byte("missing"), Value: []byte(`{}`)}}}}}}
-	if preparedDirectEligible(query, participants) {
+	targets := []ReplicatedTransactionTarget{{Batches: []replication.RelationMutationBatch{{Relation: 1, Mutations: []replication.Mutation{{Kind: replication.MutationPutPresent, Key: []byte("missing"), Value: []byte(`{}`)}}}}}}
+	if preparedDirectEligible(query, targets) {
 		t.Fatal("a missing-row placeholder is not a guarded update")
 	}
 	snapshot, planner := replicatedSQLTransactionFixture(t, true)

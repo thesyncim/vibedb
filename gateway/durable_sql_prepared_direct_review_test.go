@@ -94,7 +94,7 @@ func TestPreparedDirectReviewStaleEvaluationErrorFallsBackToFreshRow(t *testing.
 			if len(operations) != 2 || operations[0] != shardservice.ReplicatedReadFollower || operations[1] != shardservice.ReplicatedReadLeader {
 				t.Fatalf("fallback operations=%v", operations)
 			}
-			mutation := plan.Participant.Batches[0].Mutations[0]
+			mutation := plan.Target.Batches[0].Mutations[0]
 			if mutation.Kind != replication.MutationPutDigestEqual || mutation.ExpectedValueLength != uint64(len(test.fresh)) ||
 				mutation.ExpectedValueDigest != replication.Digest(sha256.Sum256([]byte(test.fresh))) || string(mutation.Value) != test.result {
 				t.Fatalf("recipe did not retain exact fresh evaluation and guard: %+v", mutation)
@@ -150,8 +150,8 @@ func TestPreparedDirectReviewUsesCachedLeaderWithoutChangingPublicReads(t *testi
 		}
 	}
 	queries := []Query{{SQL: `UPDATE messages SET n=n+1 WHERE id='message-1'`}}
-	participants, handled, err := executor.planner.planReplicatedSQLTransactionWithData(ctx, executor.planner.catalog.Current(), queries, executor.planner.profileFor(ClassInteractive), executor.data)
-	if err != nil || !handled || len(participants) != 1 || leaderAddress == "" {
+	targets, handled, err := executor.planner.planReplicatedSQLTransactionWithData(ctx, executor.planner.catalog.Current(), queries, executor.planner.profileFor(ClassInteractive), executor.data)
+	if err != nil || !handled || len(targets) != 1 || leaderAddress == "" {
 		t.Fatalf("linearizable warmup failed: %v", err)
 	}
 	client.calls = nil
@@ -162,8 +162,8 @@ func TestPreparedDirectReviewUsesCachedLeaderWithoutChangingPublicReads(t *testi
 	}
 	for _, linearizable := range []bool{true, false} {
 		client.calls = nil
-		_, err = executor.data.ReadPoint(ctx, plan.Participant.Route, ReplicatedPointRead{
-			Relation: plan.Participant.Batches[0].Relation, Key: plan.Participant.Batches[0].Mutations[0].Key,
+		_, err = executor.data.ReadPoint(ctx, plan.Target.Route, ReplicatedPointRead{
+			Relation: plan.Target.Batches[0].Relation, Key: plan.Target.Batches[0].Mutations[0].Key,
 			MinimumApplied: 1, MaxValueBytes: 4 << 20, Linearizable: linearizable,
 		})
 		if err != nil || len(client.calls) == 0 {
@@ -216,8 +216,8 @@ func TestPreparedDirectReviewRequiresNonzeroGuardFields(t *testing.T) {
 		{Kind: replication.MutationPutDigestEqual, ExpectedValueDigest: replication.Digest{1}},
 		{Kind: replication.MutationPutPresent, ExpectedValueLength: 10, ExpectedValueDigest: replication.Digest{1}},
 	} {
-		participants := []ReplicatedTransactionParticipant{{Batches: []replication.RelationMutationBatch{{Relation: 1, Mutations: []replication.Mutation{mutation}}}}}
-		if preparedDirectEligible(queries, participants) {
+		targets := []ReplicatedTransactionTarget{{Batches: []replication.RelationMutationBatch{{Relation: 1, Mutations: []replication.Mutation{mutation}}}}}
+		if preparedDirectEligible(queries, targets) {
 			t.Fatalf("incomplete guard accepted: %+v", mutation)
 		}
 	}

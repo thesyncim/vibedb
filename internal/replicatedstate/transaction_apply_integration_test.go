@@ -53,7 +53,7 @@ func transactionCommandWithFingerprint(
 	return encodeCommand(t, command)
 }
 
-func transactionParticipantStageCommand(
+func transactionTargetStageCommand(
 	t testing.TB,
 	fixture relationBundleFixture,
 	id distributedtxn.ID,
@@ -65,11 +65,11 @@ func transactionParticipantStageCommand(
 		t.Fatal(err)
 	}
 	return transactionCompletionCommand(t, fixture.binding, distributedtxn.ReplicatedCommand{
-		Role:        distributedtxn.ReplicatedRoleParticipant,
-		Operation:   distributedtxn.ReplicatedStageParticipant,
+		Role:        distributedtxn.ReplicatedRoleTarget,
+		Operation:   distributedtxn.ReplicatedStageTarget,
 		ID:          id,
-		PayloadKind: distributedtxn.ReplicatedPayloadParticipantStage,
-		Participant: distributedtxn.ParticipantStage{
+		PayloadKind: distributedtxn.ReplicatedPayloadTargetStage,
+		Target: distributedtxn.TransactionTargetStage{
 			CoordinatorGroup:            distributedtxn.ID(fixture.binding.GroupID),
 			CoordinatorShardIncarnation: distributedtxn.ID(fixture.binding.ShardIncarnation),
 			CoordinatorAllocation:       fixture.binding.AllocationGeneration,
@@ -80,7 +80,7 @@ func transactionParticipantStageCommand(
 	}, batches)
 }
 
-func transactionParticipantTransitionCommand(
+func transactionTargetTransitionCommand(
 	t testing.TB,
 	fixture relationBundleFixture,
 	id distributedtxn.ID,
@@ -89,7 +89,7 @@ func transactionParticipantTransitionCommand(
 ) []byte {
 	t.Helper()
 	return transactionCompletionCommand(t, fixture.binding, distributedtxn.ReplicatedCommand{
-		Role:             distributedtxn.ReplicatedRoleParticipant,
+		Role:             distributedtxn.ReplicatedRoleTarget,
 		Operation:        operation,
 		ID:               id,
 		ExpectedRevision: expected,
@@ -97,25 +97,25 @@ func transactionParticipantTransitionCommand(
 	}, nil)
 }
 
-func transactionParticipantAbortFenceCommand(
+func transactionTargetAbortFenceCommand(
 	t testing.TB,
 	fixture relationBundleFixture,
 	id distributedtxn.ID,
 	mutationDigest distributedtxn.Digest,
-	participantOrdinal uint32,
+	targetOrdinal uint32,
 ) []byte {
 	t.Helper()
 	return transactionCompletionCommand(t, fixture.binding, distributedtxn.ReplicatedCommand{
-		Role:        distributedtxn.ReplicatedRoleParticipant,
-		Operation:   distributedtxn.ReplicatedAbortReleaseParticipant,
+		Role:        distributedtxn.ReplicatedRoleTarget,
+		Operation:   distributedtxn.ReplicatedAbortReleaseTarget,
 		ID:          id,
-		PayloadKind: distributedtxn.ReplicatedPayloadParticipantStage,
-		Participant: distributedtxn.ParticipantStage{
+		PayloadKind: distributedtxn.ReplicatedPayloadTargetStage,
+		Target: distributedtxn.TransactionTargetStage{
 			CoordinatorGroup:            distributedtxn.ID(fixture.binding.GroupID),
 			CoordinatorShardIncarnation: distributedtxn.ID(fixture.binding.ShardIncarnation),
 			CoordinatorAllocation:       fixture.binding.AllocationGeneration,
 			MutationDigest:              mutationDigest,
-			ParticipantOrdinal:          participantOrdinal,
+			TargetOrdinal:               targetOrdinal,
 		},
 	}, nil)
 }
@@ -140,7 +140,7 @@ func applyTransactionCommand(
 	return result
 }
 
-func TestTransactionParticipantIntentBarrierPrepareApplyAndRelease(t *testing.T) {
+func TestTransactionTargetIntentBarrierPrepareApplyAndRelease(t *testing.T) {
 	fixture := newRelationBundleFixture(t, true)
 	id := transactionCodecID(231)
 	documentKey := []byte("txn-document")
@@ -155,7 +155,7 @@ func TestTransactionParticipantIntentBarrierPrepareApplyAndRelease(t *testing.T)
 			Kind: replication.MutationPutAbsentOrEqual, Key: globalKey, Value: globalValue,
 		}}},
 	}
-	stage := transactionParticipantStageCommand(t, fixture, id, batches)
+	stage := transactionTargetStageCommand(t, fixture, id, batches)
 	applyTransactionCommand(t, fixture.machine, 3, stage)
 	if fixture.machine.state.TransactionControlCount != 1 ||
 		fixture.machine.state.ActiveTransactionCount != 1 ||
@@ -206,12 +206,12 @@ func TestTransactionParticipantIntentBarrierPrepareApplyAndRelease(t *testing.T)
 		t.Fatalf("disjoint ordinary write result = %d, want %d", got, ResultApplied)
 	}
 
-	prepare := transactionParticipantTransitionCommand(
-		t, fixture, id, distributedtxn.ReplicatedPrepareParticipant, 1,
+	prepare := transactionTargetTransitionCommand(
+		t, fixture, id, distributedtxn.ReplicatedPrepareTarget, 1,
 	)
 	applyTransactionCommand(t, fixture.machine, 6, prepare)
-	apply := transactionParticipantTransitionCommand(
-		t, fixture, id, distributedtxn.ReplicatedApplyParticipant, 2,
+	apply := transactionTargetTransitionCommand(
+		t, fixture, id, distributedtxn.ReplicatedApplyTarget, 2,
 	)
 	result := applyTransactionCommand(t, fixture.machine, 7, apply)
 	if !result.AffectedRowsValid || result.AffectedRows != 1 {
@@ -232,8 +232,8 @@ func TestTransactionParticipantIntentBarrierPrepareApplyAndRelease(t *testing.T)
 		}
 	}
 
-	release := transactionParticipantTransitionCommand(
-		t, fixture, id, distributedtxn.ReplicatedReleaseParticipant, 3,
+	release := transactionTargetTransitionCommand(
+		t, fixture, id, distributedtxn.ReplicatedReleaseTarget, 3,
 	)
 	applyTransactionCommand(t, fixture.machine, 8, release)
 	read, err := fixture.machine.PointReadInto(
@@ -250,13 +250,13 @@ func TestTransactionParticipantIntentBarrierPrepareApplyAndRelease(t *testing.T)
 	}
 }
 
-func TestTransactionParticipantControllerEpochFencesStaleTakeover(t *testing.T) {
-	type stagedParticipant struct {
+func TestTransactionTargetControllerEpochFencesStaleTakeover(t *testing.T) {
+	type stagedTarget struct {
 		fixture   relationBundleFixture
 		id        distributedtxn.ID
 		pinDigest distributedtxn.Digest
 	}
-	stage := func(suffix byte, key string) stagedParticipant {
+	stage := func(suffix byte, key string) stagedTarget {
 		fixture := newRelationBundleFixture(t, true)
 		id := transactionCodecID(suffix)
 		batches := []replication.RelationMutationBatch{{
@@ -272,10 +272,10 @@ func TestTransactionParticipantControllerEpochFencesStaleTakeover(t *testing.T) 
 		}
 		pinDigest := transactionCodecDigest(201)
 		command := transactionCompletionCommand(t, fixture.binding, distributedtxn.ReplicatedCommand{
-			Role: distributedtxn.ReplicatedRoleParticipant, Operation: distributedtxn.ReplicatedStageParticipant,
-			ID: id, PayloadKind: distributedtxn.ReplicatedPayloadParticipantStage,
+			Role: distributedtxn.ReplicatedRoleTarget, Operation: distributedtxn.ReplicatedStageTarget,
+			ID: id, PayloadKind: distributedtxn.ReplicatedPayloadTargetStage,
 			ControllerEpoch: 7, ExecutionPinDigest: pinDigest,
-			Participant: distributedtxn.ParticipantStage{
+			Target: distributedtxn.TransactionTargetStage{
 				CoordinatorGroup:            distributedtxn.ID(fixture.binding.GroupID),
 				CoordinatorShardIncarnation: distributedtxn.ID(fixture.binding.ShardIncarnation),
 				CoordinatorAllocation:       fixture.binding.AllocationGeneration,
@@ -285,9 +285,9 @@ func TestTransactionParticipantControllerEpochFencesStaleTakeover(t *testing.T) 
 			},
 		}, batches)
 		applyTransactionCommand(t, fixture.machine, 3, command)
-		return stagedParticipant{fixture: fixture, id: id, pinDigest: pinDigest}
+		return stagedTarget{fixture: fixture, id: id, pinDigest: pinDigest}
 	}
-	applyAndResult := func(staged stagedParticipant, index uint64, control distributedtxn.ReplicatedCommand) uint32 {
+	applyAndResult := func(staged stagedTarget, index uint64, control distributedtxn.ReplicatedCommand) uint32 {
 		t.Helper()
 		command := transactionCompletionCommand(t, staged.fixture.binding, control, nil)
 		if err := staged.fixture.machine.AdmitCommand(command); err != nil {
@@ -299,7 +299,7 @@ func TestTransactionParticipantControllerEpochFencesStaleTakeover(t *testing.T) 
 		completion, _ := openTransactionCompletion(t, staged.fixture.machine, command)
 		return completion.ResultCode
 	}
-	applyOnly := func(staged stagedParticipant, index uint64, control distributedtxn.ReplicatedCommand) {
+	applyOnly := func(staged stagedTarget, index uint64, control distributedtxn.ReplicatedCommand) {
 		t.Helper()
 		command := transactionCompletionCommand(t, staged.fixture.binding, control, nil)
 		if err := staged.fixture.machine.AdmitCommand(command); err != nil {
@@ -309,9 +309,9 @@ func TestTransactionParticipantControllerEpochFencesStaleTakeover(t *testing.T) 
 			t.Fatalf("apply at %d: %v", index, err)
 		}
 	}
-	readControl := func(staged stagedParticipant) TransactionControlView {
+	readControl := func(staged stagedTarget) TransactionControlView {
 		t.Helper()
-		key, _ := TransactionControlStorageKey(distributedtxn.ReplicatedRoleParticipant, staged.id)
+		key, _ := TransactionControlStorageKey(distributedtxn.ReplicatedRoleTarget, staged.id)
 		raw, found, err := staged.fixture.system.Collection.AppendRaw(nil, key[:])
 		if err != nil || !found {
 			t.Fatalf("read durable participant: found=%v err=%v", found, err)
@@ -322,36 +322,36 @@ func TestTransactionParticipantControllerEpochFencesStaleTakeover(t *testing.T) 
 		}
 		return control
 	}
-	transition := func(staged stagedParticipant, epoch uint64, digest distributedtxn.Digest, operation distributedtxn.ReplicatedOperation, revision uint64) distributedtxn.ReplicatedCommand {
+	transition := func(staged stagedTarget, epoch uint64, digest distributedtxn.Digest, operation distributedtxn.ReplicatedOperation, revision uint64) distributedtxn.ReplicatedCommand {
 		return distributedtxn.ReplicatedCommand{
-			Role: distributedtxn.ReplicatedRoleParticipant, Operation: operation,
+			Role: distributedtxn.ReplicatedRoleTarget, Operation: operation,
 			ID: staged.id, ExpectedRevision: revision, PayloadKind: distributedtxn.ReplicatedPayloadNone,
 			ControllerEpoch: epoch, ExecutionPinDigest: digest,
 		}
 	}
 	mismatch := stage(246, "pin-mismatch")
-	applyOnly(mismatch, 4, transition(mismatch, 8, transactionCodecDigest(202), distributedtxn.ReplicatedPrepareParticipant, 1))
+	applyOnly(mismatch, 4, transition(mismatch, 8, transactionCodecDigest(202), distributedtxn.ReplicatedPrepareTarget, 1))
 	if got := readControl(mismatch); got.ControllerEpoch != 7 || got.Revision != 1 {
 		t.Fatalf("mismatched pin digest mutated control=%+v", got.TransactionControl)
 	}
 	lower := stage(245, "lower-epoch")
-	applyOnly(lower, 4, transition(lower, 6, lower.pinDigest, distributedtxn.ReplicatedPrepareParticipant, 1))
+	applyOnly(lower, 4, transition(lower, 6, lower.pinDigest, distributedtxn.ReplicatedPrepareTarget, 1))
 	if got := readControl(lower); got.ControllerEpoch != 7 || got.Revision != 1 {
 		t.Fatalf("lower controller epoch mutated control=%+v", got.TransactionControl)
 	}
 	takeover := stage(244, "certified-takeover")
-	if got := applyAndResult(takeover, 4, transition(takeover, 8, takeover.pinDigest, distributedtxn.ReplicatedPrepareParticipant, 1)); got != ResultApplied {
+	if got := applyAndResult(takeover, 4, transition(takeover, 8, takeover.pinDigest, distributedtxn.ReplicatedPrepareTarget, 1)); got != ResultApplied {
 		t.Fatalf("certified takeover result=%d", got)
 	}
-	applyOnly(takeover, 5, transition(takeover, 7, takeover.pinDigest, distributedtxn.ReplicatedApplyParticipant, 2))
+	applyOnly(takeover, 5, transition(takeover, 7, takeover.pinDigest, distributedtxn.ReplicatedApplyTarget, 2))
 	control := readControl(takeover)
 	if control.ControllerEpoch != 8 || control.ExecutionPinDigest != takeover.pinDigest ||
-		control.State != uint8(distributedtxn.ParticipantPrepared) || control.Revision != 2 {
+		control.State != uint8(distributedtxn.TargetPrepared) || control.Revision != 2 {
 		t.Fatalf("durable takeover fence=%+v", control.TransactionControl)
 	}
 }
 
-func fusedParticipantControl(
+func fusedTargetControl(
 	t testing.TB,
 	fixture relationBundleFixture,
 	id distributedtxn.ID,
@@ -361,17 +361,17 @@ func fusedParticipantControl(
 ) distributedtxn.ReplicatedCommand {
 	t.Helper()
 	control := distributedtxn.ReplicatedCommand{
-		Role: distributedtxn.ReplicatedRoleParticipant, Operation: operation,
+		Role: distributedtxn.ReplicatedRoleTarget, Operation: operation,
 		ID: id, ExpectedRevision: expected, PayloadKind: distributedtxn.ReplicatedPayloadNone,
 	}
-	if operation == distributedtxn.ReplicatedStagePrepareParticipant ||
-		operation == distributedtxn.ReplicatedApplySingleParticipant {
+	if operation == distributedtxn.ReplicatedStagePrepareTarget ||
+		operation == distributedtxn.ReplicatedApplySingleTarget {
 		digest, err := replication.TransactionMutationDigest(batches)
 		if err != nil {
 			t.Fatal(err)
 		}
-		control.PayloadKind = distributedtxn.ReplicatedPayloadParticipantStage
-		control.Participant = distributedtxn.ParticipantStage{
+		control.PayloadKind = distributedtxn.ReplicatedPayloadTargetStage
+		control.Target = distributedtxn.TransactionTargetStage{
 			CoordinatorGroup:            distributedtxn.ID(fixture.binding.GroupID),
 			CoordinatorShardIncarnation: distributedtxn.ID(fixture.binding.ShardIncarnation),
 			CoordinatorAllocation:       fixture.binding.AllocationGeneration,
@@ -383,7 +383,7 @@ func fusedParticipantControl(
 	return control
 }
 
-func TestTransactionSingleParticipantAppliesAndRetainsExactResultInOneEntry(t *testing.T) {
+func TestTransactionSingleTargetAppliesAndRetainsExactResultInOneEntry(t *testing.T) {
 	fixture := newRelationBundleFixture(t, true)
 	id := transactionCodecID(240)
 	documentKey := []byte("direct-document")
@@ -398,21 +398,21 @@ func TestTransactionSingleParticipantAppliesAndRetainsExactResultInOneEntry(t *t
 			Kind: replication.MutationPutAbsentOrEqual, Key: globalKey, Value: globalValue,
 		}}},
 	}
-	control := fusedParticipantControl(
-		t, fixture, id, distributedtxn.ReplicatedApplySingleParticipant, 9, batches,
+	control := fusedTargetControl(
+		t, fixture, id, distributedtxn.ReplicatedApplySingleTarget, 9, batches,
 	)
 	command := transactionCompletionCommand(t, fixture.binding, control, batches)
 	result := applyTransactionCommand(t, fixture.machine, 3, command)
 	if result.Revision != 9 || !result.AffectedRowsValid || result.AffectedRows != 1 {
 		t.Fatalf("direct result = %+v", result)
 	}
-	controlKey, _ := TransactionControlStorageKey(distributedtxn.ReplicatedRoleParticipant, id)
+	controlKey, _ := TransactionControlStorageKey(distributedtxn.ReplicatedRoleTarget, id)
 	raw, found, err := fixture.system.Collection.AppendRaw(nil, controlKey[:])
 	if err != nil || !found {
 		t.Fatalf("read direct control: found=%v err=%v", found, err)
 	}
 	retained, err := OpenTransactionControl(raw)
-	if err != nil || retained.State != uint8(distributedtxn.ParticipantReleased) ||
+	if err != nil || retained.State != uint8(distributedtxn.TargetReleased) ||
 		retained.Revision != 9 || retained.ResidentMutationBytes != 0 ||
 		retained.ResidentIntentBytes != 0 || retained.ResidentControlBytes == 0 ||
 		retained.PrepareResultCode != ResultApplied || !retained.AffectedRowsValid ||
@@ -460,8 +460,8 @@ func TestTransactionSingleParticipantAppliesAndRetainsExactResultInOneEntry(t *t
 			Kind: replication.MutationPutAbsentOrEqual, Key: globalKey, Value: globalValue,
 		}}},
 	}
-	competing := transactionCompletionCommand(t, fixture.binding, fusedParticipantControl(
-		t, fixture, id, distributedtxn.ReplicatedApplySingleParticipant, 9, competingBatches,
+	competing := transactionCompletionCommand(t, fixture.binding, fusedTargetControl(
+		t, fixture, id, distributedtxn.ReplicatedApplySingleTarget, 9, competingBatches,
 	), competingBatches)
 	if err := fixture.machine.AdmitCommand(competing); err != nil {
 		t.Fatal(err)
@@ -484,8 +484,8 @@ func TestTransactionSingleParticipantAppliesAndRetainsExactResultInOneEntry(t *t
 			Kind: replication.MutationPutAbsentOrEqual, Key: nextKey, Value: nextValue,
 		}},
 	}}
-	nextControl := fusedParticipantControl(
-		t, fixture, id, distributedtxn.ReplicatedApplySingleParticipant, 10, nextBatches,
+	nextControl := fusedTargetControl(
+		t, fixture, id, distributedtxn.ReplicatedApplySingleTarget, 10, nextBatches,
 	)
 	next := transactionCompletionCommand(t, fixture.binding, nextControl, nextBatches)
 	nextResult := applyTransactionCommand(t, fixture.machine, 6, next)
@@ -528,8 +528,8 @@ func TestTransactionFusedPrepareApplyReleaseIsOneAtomicFinish(t *testing.T) {
 			Kind: replication.MutationPutAbsentOrEqual, Key: globalKey, Value: globalValue,
 		}}},
 	}
-	prepareControl := fusedParticipantControl(
-		t, fixture, id, distributedtxn.ReplicatedStagePrepareParticipant, 0, batches,
+	prepareControl := fusedTargetControl(
+		t, fixture, id, distributedtxn.ReplicatedStagePrepareTarget, 0, batches,
 	)
 	prepare := transactionCompletionCommand(t, fixture.binding, prepareControl, batches)
 	prepareResult := applyTransactionCommand(t, fixture.machine, 3, prepare)
@@ -537,14 +537,14 @@ func TestTransactionFusedPrepareApplyReleaseIsOneAtomicFinish(t *testing.T) {
 		t.Fatalf("fused prepare result = %+v", prepareResult)
 	}
 	controlKey, _ := TransactionControlStorageKey(
-		distributedtxn.ReplicatedRoleParticipant, id,
+		distributedtxn.ReplicatedRoleTarget, id,
 	)
 	raw, found, err := fixture.system.Collection.AppendRaw(nil, controlKey[:])
 	if err != nil || !found {
 		t.Fatalf("read fused prepare control: found=%v err=%v", found, err)
 	}
 	prepared, err := OpenTransactionControl(raw)
-	if err != nil || prepared.State != uint8(distributedtxn.ParticipantPrepared) ||
+	if err != nil || prepared.State != uint8(distributedtxn.TargetPrepared) ||
 		prepared.Revision != 2 || prepared.PrepareResultCode != ResultApplied ||
 		prepared.PrepareCommandDigest == (replication.Digest{}) || !prepared.FusedPath {
 		t.Fatalf("fused prepared control = %+v err=%v", prepared.TransactionControl, err)
@@ -555,8 +555,8 @@ func TestTransactionFusedPrepareApplyReleaseIsOneAtomicFinish(t *testing.T) {
 		t.Fatalf("prepared point read error = %v", err)
 	}
 
-	finishControl := fusedParticipantControl(
-		t, fixture, id, distributedtxn.ReplicatedApplyReleaseParticipant, 2, nil,
+	finishControl := fusedTargetControl(
+		t, fixture, id, distributedtxn.ReplicatedApplyReleaseTarget, 2, nil,
 	)
 	finish := transactionCompletionCommand(t, fixture.binding, finishControl, nil)
 	finishResult := applyTransactionCommand(t, fixture.machine, 4, finish)
@@ -569,7 +569,7 @@ func TestTransactionFusedPrepareApplyReleaseIsOneAtomicFinish(t *testing.T) {
 		t.Fatalf("read fused released control: found=%v err=%v", found, err)
 	}
 	released, err := OpenTransactionControl(raw)
-	if err != nil || released.State != uint8(distributedtxn.ParticipantReleased) ||
+	if err != nil || released.State != uint8(distributedtxn.TargetReleased) ||
 		released.Revision != 4 || released.ResidentMutationBytes != 0 ||
 		released.ResidentIntentBytes != 0 || released.PrepareResultCode != ResultApplied ||
 		!released.FusedPath {
@@ -611,12 +611,12 @@ func TestTransactionFusedPrepareAbortReleaseReclaimsWithoutApply(t *testing.T) {
 			Value: []byte(`{"email":"abort@example.com"}`),
 		}},
 	}}
-	prepare := transactionCompletionCommand(t, fixture.binding, fusedParticipantControl(
-		t, fixture, id, distributedtxn.ReplicatedStagePrepareParticipant, 0, batches,
+	prepare := transactionCompletionCommand(t, fixture.binding, fusedTargetControl(
+		t, fixture, id, distributedtxn.ReplicatedStagePrepareTarget, 0, batches,
 	), batches)
 	applyTransactionCommand(t, fixture.machine, 3, prepare)
-	abort := transactionCompletionCommand(t, fixture.binding, fusedParticipantControl(
-		t, fixture, id, distributedtxn.ReplicatedAbortReleaseParticipant, 2, nil,
+	abort := transactionCompletionCommand(t, fixture.binding, fusedTargetControl(
+		t, fixture, id, distributedtxn.ReplicatedAbortReleaseTarget, 2, nil,
 	), nil)
 	result := applyTransactionCommand(t, fixture.machine, 4, abort)
 	if result.AffectedRowsValid || result.Revision != 4 {
@@ -632,7 +632,7 @@ func TestTransactionFusedPrepareAbortReleaseReclaimsWithoutApply(t *testing.T) {
 	}
 }
 
-func TestTransactionFusedBeginPreparesLocalParticipantAndSurvivesRetire(t *testing.T) {
+func TestTransactionFusedBeginPreparesLocalTargetAndSurvivesRetire(t *testing.T) {
 	fixture := newRelationBundleFixture(t, true)
 	id := transactionCodecID(243)
 	key := []byte("fused-local")
@@ -647,19 +647,19 @@ func TestTransactionFusedBeginPreparesLocalParticipantAndSurvivesRetire(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	participantRef := distributedtxn.ParticipantRef{
+	targetRef := distributedtxn.TransactionTargetRef{
 		Distribution:         []byte(fixture.binding.Distribution),
 		Shard:                []byte(fixture.binding.Shard),
 		RoutingVersion:       fixture.binding.RoutingVersion,
 		AllocationGeneration: fixture.binding.AllocationGeneration,
 		OwnershipEpoch:       fixture.binding.OwnershipEpoch,
 		AuthorityWitness:     transactionRouteAuthorityWitness(fixture.binding, fixture.machine.manifestDigest),
-		MutationDigest:       digest, State: distributedtxn.ParticipantStaged,
+		MutationDigest:       digest, State: distributedtxn.TargetStaged,
 	}
 	payload, err := distributedtxn.AppendCoordinator(nil, distributedtxn.CoordinatorRecord{
 		ID: id, State: distributedtxn.CoordinatorStaging, Revision: 1,
 		CatalogGeneration: fixture.binding.SchemaGeneration, RecoveryDeadline: 1,
-		Participants: []distributedtxn.ParticipantRef{participantRef},
+		Targets: []distributedtxn.TransactionTargetRef{targetRef},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -670,25 +670,25 @@ func TestTransactionFusedBeginPreparesLocalParticipantAndSurvivesRetire(t *testi
 		ID:          id,
 		PayloadKind: distributedtxn.ReplicatedPayloadCoordinator,
 		Payload:     payload,
-		Participant: distributedtxn.ParticipantStage{
+		Target: distributedtxn.TransactionTargetStage{
 			CoordinatorGroup:            distributedtxn.ID(fixture.binding.GroupID),
 			CoordinatorShardIncarnation: distributedtxn.ID(fixture.binding.ShardIncarnation),
 			CoordinatorAllocation:       fixture.binding.AllocationGeneration,
 			BucketBits:                  8,
 			IntentScopes:                []distributedtxn.IntentScope{{Start: 0, End: 256}},
 			MutationDigest:              digest,
-			ParticipantOrdinal:          0,
+			TargetOrdinal:               0,
 		},
 	}
 	for name, mutate := range map[string]func(*distributedtxn.ReplicatedCommand){
 		"coordinator group": func(candidate *distributedtxn.ReplicatedCommand) {
-			candidate.Participant.CoordinatorGroup[0] ^= 0xff
+			candidate.Target.CoordinatorGroup[0] ^= 0xff
 		},
 		"coordinator shard incarnation": func(candidate *distributedtxn.ReplicatedCommand) {
-			candidate.Participant.CoordinatorShardIncarnation[0] ^= 0xff
+			candidate.Target.CoordinatorShardIncarnation[0] ^= 0xff
 		},
 		"coordinator allocation": func(candidate *distributedtxn.ReplicatedCommand) {
-			candidate.Participant.CoordinatorAllocation++
+			candidate.Target.CoordinatorAllocation++
 		},
 	} {
 		t.Run(name+" binding", func(t *testing.T) {
@@ -700,12 +700,12 @@ func TestTransactionFusedBeginPreparesLocalParticipantAndSurvivesRetire(t *testi
 			}
 		})
 	}
-	wrongAuthority := participantRef
+	wrongAuthority := targetRef
 	wrongAuthority.AuthorityWitness[0] ^= 0xff
 	wrongPayload, err := distributedtxn.AppendCoordinator(nil, distributedtxn.CoordinatorRecord{
 		ID: id, State: distributedtxn.CoordinatorStaging, Revision: 1,
 		CatalogGeneration: fixture.binding.SchemaGeneration, RecoveryDeadline: 1,
-		Participants: []distributedtxn.ParticipantRef{wrongAuthority},
+		Targets: []distributedtxn.TransactionTargetRef{wrongAuthority},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -717,23 +717,23 @@ func TestTransactionFusedBeginPreparesLocalParticipantAndSurvivesRetire(t *testi
 	)); !errors.Is(err, ErrAdmissionBound) {
 		t.Fatalf("route authority witness mismatch admission error=%v", err)
 	}
-	zeroOther := distributedtxn.ParticipantRef{
+	zeroOther := distributedtxn.TransactionTargetRef{
 		Distribution: []byte("a"), Shard: []byte("unselected"),
 		RoutingVersion: 1, AllocationGeneration: 1, OwnershipEpoch: 1,
 		MutationDigest: sha256.Sum256([]byte("unselected-inline")),
-		State:          distributedtxn.ParticipantStaged,
+		State:          distributedtxn.TargetStaged,
 	}
 	zeroOtherPayload, err := distributedtxn.AppendCoordinator(nil, distributedtxn.CoordinatorRecord{
 		ID: id, State: distributedtxn.CoordinatorStaging, Revision: 1,
 		CatalogGeneration: fixture.binding.SchemaGeneration, RecoveryDeadline: 1,
-		Participants: []distributedtxn.ParticipantRef{zeroOther, participantRef},
+		Targets: []distributedtxn.TransactionTargetRef{zeroOther, targetRef},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	zeroOtherBegin := beginControl
 	zeroOtherBegin.Payload = zeroOtherPayload
-	zeroOtherBegin.Participant.ParticipantOrdinal = 1
+	zeroOtherBegin.Target.TargetOrdinal = 1
 	if _, err = distributedtxn.AppendReplicatedCommand(nil, zeroOtherBegin); !errors.Is(err, distributedtxn.ErrCorrupt) {
 		t.Fatalf("zero unselected inline authority codec error=%v", err)
 	}
@@ -749,8 +749,8 @@ func TestTransactionFusedBeginPreparesLocalParticipantAndSurvivesRetire(t *testi
 	coordinatorKey, _ := TransactionControlStorageKey(
 		distributedtxn.ReplicatedRoleCoordinator, id,
 	)
-	participantKey, _ := TransactionControlStorageKey(
-		distributedtxn.ReplicatedRoleParticipant, id,
+	targetKey, _ := TransactionControlStorageKey(
+		distributedtxn.ReplicatedRoleTarget, id,
 	)
 	coordinatorRaw, found, err := fixture.system.Collection.AppendRaw(nil, coordinatorKey[:])
 	if err != nil || !found {
@@ -759,18 +759,18 @@ func TestTransactionFusedBeginPreparesLocalParticipantAndSurvivesRetire(t *testi
 	coordinator, err := OpenTransactionControl(coordinatorRaw)
 	if err != nil || coordinator.State != uint8(distributedtxn.CoordinatorStaging) ||
 		coordinator.PrepareResultCode != ResultApplied ||
-		coordinator.CoordinatorParticipantOrdinal != 0 || !coordinator.FusedPath {
+		coordinator.CoordinatorTargetOrdinal != 0 || !coordinator.FusedPath {
 		t.Fatalf("fused coordinator = %+v err=%v", coordinator.TransactionControl, err)
 	}
-	participantRaw, found, err := fixture.system.Collection.AppendRaw(nil, participantKey[:])
+	targetRaw, found, err := fixture.system.Collection.AppendRaw(nil, targetKey[:])
 	if err != nil || !found {
 		t.Fatalf("read local participant: found=%v err=%v", found, err)
 	}
-	participant, err := OpenTransactionControl(participantRaw)
-	if err != nil || participant.State != uint8(distributedtxn.ParticipantPrepared) ||
-		participant.Revision != 2 || participant.PrepareResultCode != ResultApplied ||
-		!participant.FusedPath {
-		t.Fatalf("local participant = %+v err=%v", participant.TransactionControl, err)
+	target, err := OpenTransactionControl(targetRaw)
+	if err != nil || target.State != uint8(distributedtxn.TargetPrepared) ||
+		target.Revision != 2 || target.PrepareResultCode != ResultApplied ||
+		!target.FusedPath {
+		t.Fatalf("local participant = %+v err=%v", target.TransactionControl, err)
 	}
 	if fixture.machine.state.TransactionControlCount != 2 ||
 		fixture.machine.state.ActiveTransactionCount != 2 ||
@@ -801,8 +801,8 @@ func TestTransactionFusedBeginPreparesLocalParticipantAndSurvivesRetire(t *testi
 		ExpectedRevision: 1, PayloadKind: distributedtxn.ReplicatedPayloadNone,
 	}, nil)
 	applyTransactionCommand(t, fixture.machine, 5, commit)
-	finish := transactionCompletionCommand(t, fixture.binding, fusedParticipantControl(
-		t, fixture, id, distributedtxn.ReplicatedApplyReleaseParticipant, 2, nil,
+	finish := transactionCompletionCommand(t, fixture.binding, fusedTargetControl(
+		t, fixture, id, distributedtxn.ReplicatedApplyReleaseTarget, 2, nil,
 	), nil)
 	applyTransactionCommand(t, fixture.machine, 6, finish)
 	retire := transactionCompletionCommand(t, fixture.binding, distributedtxn.ReplicatedCommand{
@@ -827,7 +827,7 @@ func TestTransactionFusedBeginPreparesLocalParticipantAndSurvivesRetire(t *testi
 	}
 }
 
-func TestTransactionFusedManifestDeferredParticipantBinding(t *testing.T) {
+func TestTransactionFusedManifestDeferredTargetBinding(t *testing.T) {
 	fixture := newRelationBundleFixture(t, true)
 	id := transactionCodecID(245)
 	key := []byte("deferred-fused-local")
@@ -844,19 +844,19 @@ func TestTransactionFusedManifestDeferredParticipantBinding(t *testing.T) {
 	if bytes.Compare([]byte("a"), []byte(fixture.binding.Distribution)) >= 0 {
 		t.Fatalf("fixture distribution %q does not follow synthetic manifest prefix", fixture.binding.Distribution)
 	}
-	refs := make([]distributedtxn.ParticipantRef, 0, 17_001)
+	refs := make([]distributedtxn.TransactionTargetRef, 0, 17_001)
 	for index := 0; index < 17_000; index++ {
 		mutationDigest := sha256.Sum256([]byte(fmt.Sprintf("mutation-%08d", index)))
-		refs = append(refs, distributedtxn.ParticipantRef{
+		refs = append(refs, distributedtxn.TransactionTargetRef{
 			Distribution: []byte("a"), Shard: []byte(fmt.Sprintf("shard-%08d", index)),
 			RoutingVersion: 1, AllocationGeneration: 1, OwnershipEpoch: 1,
 			AuthorityWitness: distributedtxn.AuthorityWitness(mutationDigest[:16]),
 			MutationDigest:   mutationDigest,
-			State:            distributedtxn.ParticipantStaged,
+			State:            distributedtxn.TargetStaged,
 		})
 	}
 	selectedOrdinal := uint32(len(refs))
-	refs = append(refs, distributedtxn.ParticipantRef{
+	refs = append(refs, distributedtxn.TransactionTargetRef{
 		Distribution:         []byte(fixture.binding.Distribution),
 		Shard:                []byte(fixture.binding.Shard),
 		RoutingVersion:       fixture.binding.RoutingVersion,
@@ -864,9 +864,9 @@ func TestTransactionFusedManifestDeferredParticipantBinding(t *testing.T) {
 		OwnershipEpoch:       fixture.binding.OwnershipEpoch,
 		AuthorityWitness:     transactionRouteAuthorityWitness(fixture.binding, fixture.machine.manifestDigest),
 		MutationDigest:       digest,
-		State:                distributedtxn.ParticipantStaged,
+		State:                distributedtxn.TargetStaged,
 	})
-	build := func(participants []distributedtxn.ParticipantRef) (
+	build := func(targets []distributedtxn.TransactionTargetRef) (
 		distributedtxn.ManifestDescriptor, [][]byte,
 	) {
 		pageScratch := make([]byte, distributedtxn.ManifestSegmentBytes)
@@ -880,8 +880,8 @@ func TestTransactionFusedManifestDeferredParticipantBinding(t *testing.T) {
 		if buildErr != nil {
 			t.Fatal(buildErr)
 		}
-		for index := range participants {
-			if buildErr = builder.Append(participants[index]); buildErr != nil {
+		for index := range targets {
+			if buildErr = builder.Append(targets[index]); buildErr != nil {
 				t.Fatalf("append participant %d: %v", index, buildErr)
 			}
 		}
@@ -902,8 +902,8 @@ func TestTransactionFusedManifestDeferredParticipantBinding(t *testing.T) {
 		if openErr != nil {
 			t.Fatal(openErr)
 		}
-		if uint64(selectedOrdinal) >= sequence.FirstParticipant() &&
-			uint64(selectedOrdinal) < sequence.FirstParticipant()+sequence.ParticipantCount() {
+		if uint64(selectedOrdinal) >= sequence.FirstTarget() &&
+			uint64(selectedOrdinal) < sequence.FirstTarget()+sequence.TargetCount() {
 			selectedPage = index
 			break
 		}
@@ -918,8 +918,8 @@ func TestTransactionFusedManifestDeferredParticipantBinding(t *testing.T) {
 		if openErr != nil {
 			t.Fatal(openErr)
 		}
-		if uint64(deferredUnselectedOrdinal) >= sequence.FirstParticipant() &&
-			uint64(deferredUnselectedOrdinal) < sequence.FirstParticipant()+sequence.ParticipantCount() {
+		if uint64(deferredUnselectedOrdinal) >= sequence.FirstTarget() &&
+			uint64(deferredUnselectedOrdinal) < sequence.FirstTarget()+sequence.TargetCount() {
 			deferredUnselectedPage = index
 			break
 		}
@@ -940,22 +940,22 @@ func TestTransactionFusedManifestDeferredParticipantBinding(t *testing.T) {
 	for _, page := range pages[:initialCount] {
 		initial = append(initial, page...)
 	}
-	participant := distributedtxn.ParticipantStage{
+	target := distributedtxn.TransactionTargetStage{
 		CoordinatorGroup:            distributedtxn.ID(fixture.binding.GroupID),
 		CoordinatorShardIncarnation: distributedtxn.ID(fixture.binding.ShardIncarnation),
 		CoordinatorAllocation:       fixture.binding.AllocationGeneration,
 		BucketBits:                  8,
 		IntentScopes:                []distributedtxn.IntentScope{{Start: 0, End: 256}},
 		MutationDigest:              digest,
-		ParticipantOrdinal:          selectedOrdinal,
+		TargetOrdinal:               selectedOrdinal,
 	}
 	beginControl := distributedtxn.ReplicatedCommand{
 		Role:      distributedtxn.ReplicatedRoleCoordinator,
 		Operation: distributedtxn.ReplicatedBeginPrepareManifestCoordinator,
 		ID:        id, PayloadKind: distributedtxn.ReplicatedPayloadManifestCoordinator,
-		Payload: initial, Participant: participant,
+		Payload: initial, Target: target,
 	}
-	zeroInitialRefs := append([]distributedtxn.ParticipantRef(nil), refs...)
+	zeroInitialRefs := append([]distributedtxn.TransactionTargetRef(nil), refs...)
 	zeroInitialRefs[0].AuthorityWitness = distributedtxn.AuthorityWitness{}
 	zeroInitialDescriptor, zeroInitialPages := build(zeroInitialRefs)
 	zeroInitialCoordinator, err := distributedtxn.AppendManifestCoordinator(
@@ -1051,13 +1051,13 @@ func TestTransactionFusedManifestDeferredParticipantBinding(t *testing.T) {
 	}
 	assertUnchangedRevision(uint64(initialCount))
 
-	for name, mutate := range map[string]func(*distributedtxn.ParticipantRef){
-		"mutation digest": func(ref *distributedtxn.ParticipantRef) { ref.MutationDigest[0] ^= 0xff },
-		"authority witness": func(ref *distributedtxn.ParticipantRef) {
+	for name, mutate := range map[string]func(*distributedtxn.TransactionTargetRef){
+		"mutation digest": func(ref *distributedtxn.TransactionTargetRef) { ref.MutationDigest[0] ^= 0xff },
+		"authority witness": func(ref *distributedtxn.TransactionTargetRef) {
 			ref.AuthorityWitness[0] ^= 0xff
 		},
 	} {
-		wrongRefs := append([]distributedtxn.ParticipantRef(nil), refs...)
+		wrongRefs := append([]distributedtxn.TransactionTargetRef(nil), refs...)
 		mutate(&wrongRefs[selectedOrdinal])
 		_, wrongPages := build(wrongRefs)
 		wrongPack := appendManifestPageBytes(nil, wrongPages[initialCount:])
@@ -1072,7 +1072,7 @@ func TestTransactionFusedManifestDeferredParticipantBinding(t *testing.T) {
 		}
 		assertUnchangedRevision(uint64(initialCount))
 	}
-	zeroSuffixRefs := append([]distributedtxn.ParticipantRef(nil), refs...)
+	zeroSuffixRefs := append([]distributedtxn.TransactionTargetRef(nil), refs...)
 	zeroSuffixRefs[deferredUnselectedOrdinal].AuthorityWitness = distributedtxn.AuthorityWitness{}
 	_, zeroSuffixPages := build(zeroSuffixRefs)
 	zeroSuffixPack := appendManifestPageBytes(nil, zeroSuffixPages[initialCount:])
@@ -1131,8 +1131,8 @@ func TestTransactionFusedPrepareConflictLeavesOnlyExactVote(t *testing.T) {
 			Value: []byte(`{"email":"other@example.com"}`),
 		}},
 	}}
-	control := fusedParticipantControl(
-		t, fixture, id, distributedtxn.ReplicatedStagePrepareParticipant, 0, batches,
+	control := fusedTargetControl(
+		t, fixture, id, distributedtxn.ReplicatedStagePrepareTarget, 0, batches,
 	)
 	command := transactionCompletionCommand(t, fixture.binding, control, batches)
 	if err := fixture.machine.AdmitCommand(command); err != nil {
@@ -1147,14 +1147,14 @@ func TestTransactionFusedPrepareConflictLeavesOnlyExactVote(t *testing.T) {
 		t.Fatalf("fused conflict completion=%+v result=%+v", completion, result)
 	}
 	keyControl, _ := TransactionControlStorageKey(
-		distributedtxn.ReplicatedRoleParticipant, id,
+		distributedtxn.ReplicatedRoleTarget, id,
 	)
 	raw, found, err := fixture.system.Collection.AppendRaw(nil, keyControl[:])
 	if err != nil || !found {
 		t.Fatalf("read rejected vote: found=%v err=%v", found, err)
 	}
 	vote, err := OpenTransactionControl(raw)
-	if err != nil || vote.State != uint8(distributedtxn.ParticipantReleased) ||
+	if err != nil || vote.State != uint8(distributedtxn.TargetReleased) ||
 		vote.PrepareResultCode != ResultIndexConflict || vote.Revision != 3 ||
 		vote.ResidentMutationBytes != 0 || vote.ResidentIntentBytes != 0 || !vote.FusedPath {
 		t.Fatalf("rejected vote = %+v err=%v", vote.TransactionControl, err)
@@ -1243,7 +1243,7 @@ func TestTransactionPrepareNormalizesMutationRefusalsToExactConflictVote(t *test
 					}
 				}
 				controlKey, _ := TransactionControlStorageKey(
-					distributedtxn.ReplicatedRoleParticipant, id,
+					distributedtxn.ReplicatedRoleTarget, id,
 				)
 				readControl := func(stage string) ([]byte, TransactionControlView) {
 					t.Helper()
@@ -1260,9 +1260,9 @@ func TestTransactionPrepareNormalizesMutationRefusalsToExactConflictVote(t *test
 
 				if fused {
 					prepare := transactionCompletionCommand(
-						t, fixture.binding, fusedParticipantControl(
+						t, fixture.binding, fusedTargetControl(
 							t, fixture, id,
-							distributedtxn.ReplicatedStagePrepareParticipant, 0, batches,
+							distributedtxn.ReplicatedStagePrepareTarget, 0, batches,
 						), batches,
 					)
 					result := applyWant(3, prepare, ResultIndexConflict)
@@ -1270,7 +1270,7 @@ func TestTransactionPrepareNormalizesMutationRefusalsToExactConflictVote(t *test
 						t.Fatalf("fused refusal result = %+v", result)
 					}
 					beforeRetry, vote := readControl("fused refusal")
-					if vote.State != uint8(distributedtxn.ParticipantReleased) ||
+					if vote.State != uint8(distributedtxn.TargetReleased) ||
 						vote.Revision != 3 || vote.PrepareResultCode != ResultIndexConflict ||
 						vote.LastResultCode != ResultIndexConflict || !vote.FusedPath ||
 						vote.ResidentMutationBytes != 0 || vote.ResidentIntentBytes != 0 {
@@ -1294,18 +1294,18 @@ func TestTransactionPrepareNormalizesMutationRefusalsToExactConflictVote(t *test
 					return
 				}
 
-				stage := transactionParticipantStageCommand(t, fixture, id, batches)
+				stage := transactionTargetStageCommand(t, fixture, id, batches)
 				applyTransactionCommand(t, fixture.machine, 3, stage)
 				assertAbsent("split stage")
-				prepare := transactionParticipantTransitionCommand(
-					t, fixture, id, distributedtxn.ReplicatedPrepareParticipant, 1,
+				prepare := transactionTargetTransitionCommand(
+					t, fixture, id, distributedtxn.ReplicatedPrepareTarget, 1,
 				)
 				result := applyWant(4, prepare, ResultIndexConflict)
 				if result.Revision != 1 || result.AffectedRowsValid {
 					t.Fatalf("split refusal result = %+v", result)
 				}
 				beforeRetry, vote := readControl("split refusal")
-				if vote.State != uint8(distributedtxn.ParticipantStaged) ||
+				if vote.State != uint8(distributedtxn.TargetStaged) ||
 					vote.Revision != 1 || vote.PrepareResultCode != ResultIndexConflict ||
 					vote.LastResultCode != ResultIndexConflict || vote.FusedPath ||
 					vote.ResidentMutationBytes == 0 || vote.ResidentIntentBytes == 0 {
@@ -1321,16 +1321,16 @@ func TestTransactionPrepareNormalizesMutationRefusalsToExactConflictVote(t *test
 					t.Fatal("split exact retry rewrote its staged conflict vote")
 				}
 
-				abort := transactionParticipantTransitionCommand(
-					t, fixture, id, distributedtxn.ReplicatedAbortParticipant, 1,
+				abort := transactionTargetTransitionCommand(
+					t, fixture, id, distributedtxn.ReplicatedAbortTarget, 1,
 				)
 				applyTransactionCommand(t, fixture.machine, 6, abort)
-				release := transactionParticipantTransitionCommand(
-					t, fixture, id, distributedtxn.ReplicatedReleaseParticipant, 2,
+				release := transactionTargetTransitionCommand(
+					t, fixture, id, distributedtxn.ReplicatedReleaseTarget, 2,
 				)
 				applyTransactionCommand(t, fixture.machine, 7, release)
 				beforeHistoricalRetry, released := readControl("split cleanup")
-				if released.State != uint8(distributedtxn.ParticipantReleased) ||
+				if released.State != uint8(distributedtxn.TargetReleased) ||
 					released.Revision != 3 || released.PrepareResultCode != ResultIndexConflict ||
 					released.ResidentMutationBytes != 0 || released.ResidentIntentBytes != 0 {
 					t.Fatalf("split released vote = %+v", released.TransactionControl)
@@ -1369,7 +1369,7 @@ func TestTransactionPrepareConflictStaysStagedAndCanAbort(t *testing.T) {
 		t.Fatal(err)
 	}
 	id := transactionCodecID(232)
-	stage := transactionParticipantStageCommand(t, fixture, id, []replication.RelationMutationBatch{{
+	stage := transactionTargetStageCommand(t, fixture, id, []replication.RelationMutationBatch{{
 		Relation: 1,
 		Mutations: []replication.Mutation{{
 			Kind: replication.MutationPutAbsentOrEqual, Key: key,
@@ -1377,8 +1377,8 @@ func TestTransactionPrepareConflictStaysStagedAndCanAbort(t *testing.T) {
 		}},
 	}})
 	applyTransactionCommand(t, fixture.machine, 4, stage)
-	prepare := transactionParticipantTransitionCommand(
-		t, fixture, id, distributedtxn.ReplicatedPrepareParticipant, 1,
+	prepare := transactionTargetTransitionCommand(
+		t, fixture, id, distributedtxn.ReplicatedPrepareTarget, 1,
 	)
 	if err := fixture.machine.AdmitCommand(prepare); err != nil {
 		t.Fatalf("admit deterministic prepare conflict: %v", err)
@@ -1391,20 +1391,20 @@ func TestTransactionPrepareConflictStaysStagedAndCanAbort(t *testing.T) {
 		t.Fatalf("prepare conflict completion=%+v result=%+v", completion, result)
 	}
 	controlKey, _ := TransactionControlStorageKey(
-		distributedtxn.ReplicatedRoleParticipant, id,
+		distributedtxn.ReplicatedRoleTarget, id,
 	)
 	raw, found, err := fixture.system.Collection.AppendRaw(nil, controlKey[:])
 	if err != nil || !found {
 		t.Fatalf("read participant control: found=%v err=%v", found, err)
 	}
 	control, err := OpenTransactionControl(raw)
-	if err != nil || control.State != uint8(distributedtxn.ParticipantStaged) || control.Revision != 1 ||
+	if err != nil || control.State != uint8(distributedtxn.TargetStaged) || control.Revision != 1 ||
 		control.LastResultCode != ResultIndexConflict {
 		t.Fatalf("failed prepare control=%+v err=%v", control.TransactionControl, err)
 	}
 	competingControl := distributedtxn.ReplicatedCommand{
-		Role:      distributedtxn.ReplicatedRoleParticipant,
-		Operation: distributedtxn.ReplicatedPrepareParticipant, ID: id,
+		Role:      distributedtxn.ReplicatedRoleTarget,
+		Operation: distributedtxn.ReplicatedPrepareTarget, ID: id,
 		ExpectedRevision: 1, PayloadKind: distributedtxn.ReplicatedPayloadNone,
 	}
 	competing := transactionCommandWithFingerprint(
@@ -1421,12 +1421,12 @@ func TestTransactionPrepareConflictStaysStagedAndCanAbort(t *testing.T) {
 		t.Fatalf("competing prepare result=%d, want %d",
 			competingCompletion.ResultCode, ResultTransactionConflict)
 	}
-	abort := transactionParticipantTransitionCommand(
-		t, fixture, id, distributedtxn.ReplicatedAbortParticipant, 1,
+	abort := transactionTargetTransitionCommand(
+		t, fixture, id, distributedtxn.ReplicatedAbortTarget, 1,
 	)
 	applyTransactionCommand(t, fixture.machine, 7, abort)
-	release := transactionParticipantTransitionCommand(
-		t, fixture, id, distributedtxn.ReplicatedReleaseParticipant, 2,
+	release := transactionTargetTransitionCommand(
+		t, fixture, id, distributedtxn.ReplicatedReleaseTarget, 2,
 	)
 	applyTransactionCommand(t, fixture.machine, 8, release)
 }
@@ -1434,7 +1434,7 @@ func TestTransactionPrepareConflictStaysStagedAndCanAbort(t *testing.T) {
 func TestTransactionCommandIsAnExplicitNormalBatchBoundary(t *testing.T) {
 	fixture := newRelationBundleFixture(t, true)
 	id := transactionCodecID(233)
-	stage := transactionParticipantStageCommand(t, fixture, id, []replication.RelationMutationBatch{{
+	stage := transactionTargetStageCommand(t, fixture, id, []replication.RelationMutationBatch{{
 		Relation: 1,
 		Mutations: []replication.Mutation{{
 			Kind: replication.MutationPut, Key: []byte("batch-boundary"),
@@ -1451,7 +1451,7 @@ func TestTransactionCommandIsAnExplicitNormalBatchBoundary(t *testing.T) {
 	applyTransactionCommand(t, fixture.machine, 3, stage)
 }
 
-func TestTransactionParticipantAbortFenceWinsDelayedPrepare(t *testing.T) {
+func TestTransactionTargetAbortFenceWinsDelayedPrepare(t *testing.T) {
 	fixture := newRelationBundleFixture(t, true)
 	id := transactionCodecID(245)
 	batches := []replication.RelationMutationBatch{{
@@ -1465,7 +1465,7 @@ func TestTransactionParticipantAbortFenceWinsDelayedPrepare(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fence := transactionParticipantAbortFenceCommand(t, fixture, id, digest, 4096)
+	fence := transactionTargetAbortFenceCommand(t, fixture, id, digest, 4096)
 	result := applyTransactionCommand(t, fixture.machine, 3, fence)
 	if result.Revision != 1 || result.AffectedRowsValid {
 		t.Fatalf("abort fence completion=%+v", result)
@@ -1474,10 +1474,10 @@ func TestTransactionParticipantAbortFenceWinsDelayedPrepare(t *testing.T) {
 	if result.Revision != 1 {
 		t.Fatalf("abort fence retry=%+v", result)
 	}
-	prepareControl := fusedParticipantControl(
-		t, fixture, id, distributedtxn.ReplicatedStagePrepareParticipant, 0, batches,
+	prepareControl := fusedTargetControl(
+		t, fixture, id, distributedtxn.ReplicatedStagePrepareTarget, 0, batches,
 	)
-	prepareControl.Participant.ParticipantOrdinal = 4096
+	prepareControl.Target.TargetOrdinal = 4096
 	prepare := transactionCommandWithFingerprint(
 		t, fixture, prepareControl, batches, sha256.Sum256([]byte("delayed-wide-prepare")),
 	)
@@ -1492,7 +1492,7 @@ func TestTransactionParticipantAbortFenceWinsDelayedPrepare(t *testing.T) {
 		t.Fatalf("delayed prepare result=%d", completion.ResultCode)
 	}
 	controlKey, _ := TransactionControlStorageKey(
-		distributedtxn.ReplicatedRoleParticipant, id,
+		distributedtxn.ReplicatedRoleTarget, id,
 	)
 	raw, found, err := fixture.system.Collection.AppendRaw(nil, controlKey[:])
 	if err != nil || !found {
@@ -1500,9 +1500,9 @@ func TestTransactionParticipantAbortFenceWinsDelayedPrepare(t *testing.T) {
 	}
 	control, err := OpenTransactionControl(raw)
 	if err != nil || !control.CancellationWitness || !control.FusedPath ||
-		control.State != uint8(distributedtxn.ParticipantReleased) || control.Revision != 1 ||
+		control.State != uint8(distributedtxn.TargetReleased) || control.Revision != 1 ||
 		control.PrepareResultCode != 0 || control.MutationDigest != digest ||
-		control.ParticipantOrdinal != 4096 ||
+		control.TargetOrdinal != 4096 ||
 		control.ResidentMutationBytes != 0 || control.ResidentIntentBytes != 0 {
 		t.Fatalf("abort fence control=%+v err=%v", control.TransactionControl, err)
 	}
@@ -1515,7 +1515,7 @@ func TestTransactionParticipantAbortFenceWinsDelayedPrepare(t *testing.T) {
 	}
 }
 
-func TestTransactionParticipantPrepareWinsAbortFenceRace(t *testing.T) {
+func TestTransactionTargetPrepareWinsAbortFenceRace(t *testing.T) {
 	fixture := newRelationBundleFixture(t, true)
 	id := transactionCodecID(246)
 	batches := []replication.RelationMutationBatch{{
@@ -1529,15 +1529,15 @@ func TestTransactionParticipantPrepareWinsAbortFenceRace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	prepareControl := fusedParticipantControl(
-		t, fixture, id, distributedtxn.ReplicatedStagePrepareParticipant, 0, batches,
+	prepareControl := fusedTargetControl(
+		t, fixture, id, distributedtxn.ReplicatedStagePrepareTarget, 0, batches,
 	)
-	prepareControl.Participant.ParticipantOrdinal = 4096
+	prepareControl.Target.TargetOrdinal = 4096
 	prepare := transactionCommandWithFingerprint(
 		t, fixture, prepareControl, batches, sha256.Sum256([]byte("winning-wide-prepare")),
 	)
 	applyTransactionCommand(t, fixture.machine, 3, prepare)
-	fence := transactionParticipantAbortFenceCommand(t, fixture, id, digest, 4096)
+	fence := transactionTargetAbortFenceCommand(t, fixture, id, digest, 4096)
 	if err := fixture.machine.AdmitCommand(fence); err != nil {
 		t.Fatalf("admit losing abort fence: %v", err)
 	}
@@ -1548,12 +1548,12 @@ func TestTransactionParticipantPrepareWinsAbortFenceRace(t *testing.T) {
 	if completion.ResultCode != ResultTransactionConflict {
 		t.Fatalf("losing abort fence result=%d", completion.ResultCode)
 	}
-	abort := transactionParticipantTransitionCommand(
-		t, fixture, id, distributedtxn.ReplicatedAbortReleaseParticipant, 2,
+	abort := transactionTargetTransitionCommand(
+		t, fixture, id, distributedtxn.ReplicatedAbortReleaseTarget, 2,
 	)
 	applyTransactionCommand(t, fixture.machine, 5, abort)
 	controlKey, _ := TransactionControlStorageKey(
-		distributedtxn.ReplicatedRoleParticipant, id,
+		distributedtxn.ReplicatedRoleTarget, id,
 	)
 	raw, found, err := fixture.system.Collection.AppendRaw(nil, controlKey[:])
 	if err != nil || !found {
@@ -1561,13 +1561,13 @@ func TestTransactionParticipantPrepareWinsAbortFenceRace(t *testing.T) {
 	}
 	control, err := OpenTransactionControl(raw)
 	if err != nil || control.CancellationWitness || control.Revision != 4 ||
-		control.State != uint8(distributedtxn.ParticipantReleased) ||
+		control.State != uint8(distributedtxn.TargetReleased) ||
 		control.PrepareResultCode != ResultApplied {
 		t.Fatalf("prepare winner control=%+v err=%v", control.TransactionControl, err)
 	}
 }
 
-func TestSingleParticipantConditionalUpdateIsAtomicAndReplayStable(t *testing.T) {
+func TestSingleTargetConditionalUpdateIsAtomicAndReplayStable(t *testing.T) {
 	fixture := newRelationBundleFixture(t, true)
 	id := transactionCodecID(241)
 	key := []byte("conditional-update")
@@ -1575,7 +1575,7 @@ func TestSingleParticipantConditionalUpdateIsAtomicAndReplayStable(t *testing.T)
 	after := []byte(`{"id":"conditional-update","n":42}`)
 	makeCommand := func(sequence uint64, mutation replication.Mutation) []byte {
 		batches := []replication.RelationMutationBatch{{Relation: 1, Mutations: []replication.Mutation{mutation}}}
-		control := fusedParticipantControl(t, fixture, id, distributedtxn.ReplicatedApplySingleParticipant, sequence, batches)
+		control := fusedTargetControl(t, fixture, id, distributedtxn.ReplicatedApplySingleTarget, sequence, batches)
 		return transactionCompletionCommand(t, fixture.binding, control, batches)
 	}
 	seed := makeCommand(1, replication.Mutation{Kind: replication.MutationPut, Key: key, Value: before})
@@ -1607,14 +1607,14 @@ func TestSingleParticipantConditionalUpdateIsAtomicAndReplayStable(t *testing.T)
 
 // A point read after every commit used to materialize a detached physical
 // snapshot, defeating the checkpoint group's deferred durability schedule.
-func TestSingleParticipantPointReadDoesNotForceCheckpoint(t *testing.T) {
+func TestSingleTargetPointReadDoesNotForceCheckpoint(t *testing.T) {
 	fixture := newRelationBundleFixture(t, true)
 	id := transactionCodecID(242)
 	key := []byte("live-point")
 	for sequence := uint64(1); sequence <= 32; sequence++ {
 		value := []byte(fmt.Sprintf(`{"id":"live-point","n":%d}`, sequence))
 		batches := []replication.RelationMutationBatch{{Relation: 1, Mutations: []replication.Mutation{{Kind: replication.MutationPut, Key: key, Value: value}}}}
-		control := fusedParticipantControl(t, fixture, id, distributedtxn.ReplicatedApplySingleParticipant, sequence, batches)
+		control := fusedTargetControl(t, fixture, id, distributedtxn.ReplicatedApplySingleTarget, sequence, batches)
 		command := transactionCompletionCommand(t, fixture.binding, control, batches)
 		publication, err := fixture.machine.ApplyNormal(normalMeta(sequence+2), command)
 		if err != nil {
@@ -1649,13 +1649,13 @@ func TestSingleParticipantPointReadDoesNotForceCheckpoint(t *testing.T) {
 	}
 }
 
-func TestSingleParticipantReservedSequenceFencesLateCommands(t *testing.T) {
+func TestSingleTargetReservedSequenceFencesLateCommands(t *testing.T) {
 	fixture := newRelationBundleFixture(t, true)
 	id := transactionCodecID(243)
 	key := []byte("reserved-sequence")
 	makeCommand := func(sequence uint64, value string) []byte {
 		batches := []replication.RelationMutationBatch{{Relation: 1, Mutations: []replication.Mutation{{Kind: replication.MutationPut, Key: key, Value: []byte(value)}}}}
-		control := fusedParticipantControl(t, fixture, id, distributedtxn.ReplicatedApplySingleParticipant, sequence, batches)
+		control := fusedTargetControl(t, fixture, id, distributedtxn.ReplicatedApplySingleTarget, sequence, batches)
 		return transactionCompletionCommand(t, fixture.binding, control, batches)
 	}
 	old := makeCommand(1, `{"n":1}`)

@@ -687,16 +687,16 @@ func TestComputedUpdateGlobalIndexCaptureUsesShardPostimage(t *testing.T) {
 			shardservice.StringParam("tenant-7"),
 		},
 	}
-	participants, err := appendBoundWriteParticipants(
+	targets, err := appendBoundWriteTargets(
 		nil, baseCall, &query, bound, DefaultProfiles()[ClassInteractive],
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var baseStatements []shardservice.MutationStatement
-	for i := range participants {
-		if sameTransactionTarget(participants[i].call.req, baseCall.req) {
-			baseStatements = participants[i].statements
+	for i := range targets {
+		if sameTransactionTarget(targets[i].call.req, baseCall.req) {
+			baseStatements = targets[i].statements
 			break
 		}
 	}
@@ -904,21 +904,21 @@ func TestComputedUpdateGlobalIndexCaptureOrdersUniqueSwapDeletesBeforePuts(t *te
 			shardservice.StringParam("tenant-7"),
 		},
 	}
-	participants, err := appendBoundWriteParticipants(
+	targets, err := appendBoundWriteTargets(
 		nil, baseCall, &query, bound, DefaultProfiles()[ClassInteractive],
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	sortTransactionParticipants(participants)
+	sortTransactionTargets(targets)
 	deletes, puts := 0, 0
-	for i := range participants {
+	for i := range targets {
 		sawPut := false
-		for j := range participants[i].statements {
-			switch participants[i].statements[j].Kind {
+		for j := range targets[i].statements {
+			switch targets[i].statements[j].Kind {
 			case shardservice.MutationGlobalIndexDelete:
 				if sawPut {
-					t.Fatalf("index participant %d has a delete after a put: %+v", i, participants[i].statements)
+					t.Fatalf("index participant %d has a delete after a put: %+v", i, targets[i].statements)
 				}
 				deletes++
 			case shardservice.MutationGlobalIndexPut:
@@ -943,16 +943,16 @@ func TestStaticTransactionOrdersGlobalIndexDeletesAcrossStatements(t *testing.T)
 		{Kind: shardservice.MutationGlobalIndexDelete, Relation: "idx", IndexID: 1},
 		{Kind: shardservice.MutationGlobalIndexPut, Relation: "idx", IndexID: 1},
 	}
-	var participants []transactionParticipant
+	var targets []transactionTarget
 	var err error
 	for i := range statements {
-		participants, err = appendTransactionStatement(participants, call, statements[i])
+		targets, err = appendTransactionStatement(targets, call, statements[i])
 		if err != nil {
 			t.Fatal(err)
 		}
 	}
-	sortTransactionParticipants(participants)
-	got := participants[0].statements
+	sortTransactionTargets(targets)
+	got := targets[0].statements
 	if len(got) != 4 ||
 		got[0].Kind != shardservice.MutationGlobalIndexDelete ||
 		got[1].Kind != shardservice.MutationGlobalIndexDelete ||

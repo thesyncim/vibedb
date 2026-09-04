@@ -15,7 +15,7 @@ import (
 	"github.com/thesyncim/vibedb/store"
 )
 
-// This is a startup inventory bound, not a per-request participant limit.
+// This is a startup inventory bound, not a per-request target limit.
 // The canonical manifest also has an independent four MiB byte bound.
 const maxGatewaySplitSources = 4096
 

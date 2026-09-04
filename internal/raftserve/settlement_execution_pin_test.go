@@ -16,7 +16,7 @@ func settlementPinAcquire(t testing.TB) executionpin.Command {
 	t.Helper()
 	binding := executionpin.Binding{RequestKeyDigest: executionpin.Digest{1}, RequestDigest: executionpin.Digest{2},
 		CatalogGeneration: 3, SchemaManifestDigest: executionpin.Digest{4}, TransactionManifestDigest: executionpin.Digest{5},
-		ParticipantAuthorityRoot: executionpin.Digest{6}, ParticipantCount: 2, ExecutionContractDigest: executionpin.Digest{7}, LedgerHomeGroup: executionpin.ID{8}}
+		TargetAuthorityRoot: executionpin.Digest{6}, TargetCount: 2, ExecutionContractDigest: executionpin.Digest{7}, LedgerHomeGroup: executionpin.ID{8}}
 	pin, err := executionpin.DerivePinID(binding)
 	if err != nil {
 		t.Fatal(err)

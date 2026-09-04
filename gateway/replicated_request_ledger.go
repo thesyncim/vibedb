@@ -29,7 +29,7 @@ var (
 )
 
 const (
-	// The request recipe is admitted by encoded bytes, never by participant
+	// The request recipe is admitted by encoded bytes, never by target
 	// count. A wider transaction is legal when its complete portable recipe fits.
 	MaxDurableRequestRecipeBytes = requestledger.MaxPlanBytes - 28
 	DurableRequestInlineBytes    = 32 << 10
@@ -340,14 +340,14 @@ type DurableRequestRecipe struct {
 	KeyDigest         replication.Digest
 	RequestID         replication.ID128
 	RequestDigest     replication.Digest
-	ParticipantCount  uint64
-	// ParticipantStream exposes at most one decoded participant at a time. A
+	TargetCount       uint64
+	// TargetStream exposes at most one decoded target at a time. A
 	// runner must not retain Current across Next; the backing page/frame scratch
 	// is reused to keep replay memory independent of total plan size.
-	ParticipantStream DurableRequestParticipantStream
-	// Participants is retained only for the legacy in-memory codec tests. The
+	TargetStream DurableRequestTargetStream
+	// Targets is retained only for the legacy in-memory codec tests. The
 	// durable executor never populates it.
-	Participants []ReplicatedTransactionParticipant
+	Targets []ReplicatedTransactionTarget
 	// Pending is nonzero only when the ledger proves that these exact outbound
 	// bytes were write-ahead staged but not yet durably advanced.
 	Pending        DurableRequestPending
@@ -355,20 +355,20 @@ type DurableRequestRecipe struct {
 	Progress       []byte
 }
 
-type DurableRequestParticipantStream interface {
+type DurableRequestTargetStream interface {
 	Next() bool
-	Current() DurableRequestLogicalParticipant
+	Current() DurableRequestLogicalTarget
 	Err() error
 	Complete() bool
 	BufferedBytes() int
 }
 
-// DurableRequestReplayableParticipantStream is an authenticated sealed-plan
+// DurableRequestReplayableTargetStream is an authenticated sealed-plan
 // stream which can begin another bounded pass over the same immutable bytes.
 // Streaming transaction protocols use multiple passes for manifest, prepare,
-// decision, and finish without retaining an unbounded participant slice.
-type DurableRequestReplayableParticipantStream interface {
-	DurableRequestParticipantStream
+// decision, and finish without retaining an unbounded target slice.
+type DurableRequestReplayableTargetStream interface {
+	DurableRequestTargetStream
 	Reset() error
 }
 
@@ -425,7 +425,7 @@ type DurableRequestExecutionContract struct {
 	RetirementWitnessDigest      replication.Digest
 	CommitTransitionTag          uint32
 	AbortTransitionTag           uint32
-	ParticipantCount             uint64
+	TargetCount                  uint64
 	CommitFinalWaveCount         uint64
 	AbortFinalWaveCount          uint64
 	MaxPendingWaveBytes          uint64
@@ -438,10 +438,10 @@ type DurableRequestExecutionContract struct {
 	PlanningLeaseGeneration      uint64
 }
 
-// DurableRequestLogicalParticipant seals stable logical authority and
+// DurableRequestLogicalTarget seals stable logical authority and
 // mutations, not replaceable endpoints or live command fences. Resolve is
 // performed immediately before each journaled wave.
-type DurableRequestLogicalParticipant struct {
+type DurableRequestLogicalTarget struct {
 	Distribution           distribution.DistributionName
 	Shard                  distribution.ShardID
 	RangeIdentity          replication.Digest
@@ -463,16 +463,16 @@ type DurableRequestLogicalProgram struct {
 	KeyDigest     replication.Digest
 	RequestID     replication.ID128
 	RequestDigest replication.Digest
-	Participants  []DurableRequestLogicalParticipant
+	Targets       []DurableRequestLogicalTarget
 }
 
 // DurableRequestRouteResolver resolves current physical authority for one
-// sealed logical participant. Once a wave is PutPending, recovery uses the
+// sealed logical target. Once a wave is PutPending, recovery uses the
 // exact retained route/command bytes and never calls Resolve for that wave.
 type DurableRequestRouteResolver interface {
-	ResolveDurableRequestParticipant(
+	ResolveDurableRequestTarget(
 		context.Context,
-		DurableRequestLogicalParticipant,
+		DurableRequestLogicalTarget,
 	) (ReplicatedRoute, error)
 }
 

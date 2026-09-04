@@ -19,11 +19,11 @@ import (
 
 // TestSegmentedExecBatchAcross65RealShardServers is the public regression gate
 // for the old inline-manifest boundary. Every mutation is SQL-planned and
-// routed by Executor, then crosses the real shard wire and durable participant
+// routed by Executor, then crosses the real shard wire and durable target
 // journal before it is applied. Sixty-five distinct fenced shard targets force
 // the VTM1/VTCM lane; the number is not itself an admission limit.
 func TestSegmentedExecBatchAcross65RealShardServers(t *testing.T) {
-	const shardCount = distributedtxn.MaxInlineParticipants + 1
+	const shardCount = distributedtxn.MaxInlineTargets + 1
 	cluster := newSegmentedE2ECluster(t, shardCount)
 	queries := make([]Query, shardCount)
 	for i := range queries {
@@ -106,7 +106,7 @@ func TestSegmentedExecBatchAcross65RealShardServers(t *testing.T) {
 	}
 	manifestRecord, openErr := distributedtxn.OpenManifestCoordinator(observed.Transaction.Record)
 	if openErr != nil || observed.Transaction.RecordKind != shardservice.TransactionRecordManifestCoordinator ||
-		manifestRecord.Manifest.ParticipantCount != shardCount {
+		manifestRecord.Manifest.TargetCount != shardCount {
 		t.Fatalf("resolved coordinator = %+v open=%v", observed.Transaction, openErr)
 	}
 	pageRequest := transactionRequest(
@@ -266,9 +266,9 @@ func TestSegmentedCoordinatorResponseLossAndRestartBoundaries(t *testing.T) {
 	executor := NewExecutor(client, NewCatalogHolder(nil), Options{})
 	profile := DefaultProfiles()[ClassAdmin].withDefaults()
 	template := segmentedOwnedRequest(own)
-	participant := transactionParticipant{call: shardCall{address: "coordinator", req: template}}
+	target := transactionTarget{call: shardCall{address: "coordinator", req: template}}
 	stager := gatewayCoordinatorStager{
-		executor: executor, ctx: t.Context(), coordinator: &participant, profile: profile,
+		executor: executor, ctx: t.Context(), coordinator: &target, profile: profile,
 	}
 
 	record, pages, id := segmentedCoordinatorFixture(t, own, 2200)

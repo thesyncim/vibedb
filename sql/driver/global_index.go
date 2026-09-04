@@ -44,7 +44,7 @@ func appendGlobalIndexMarker(dst []byte, indexID, incarnation uint64) []byte {
 
 // ApplyGlobalIndexMutation stages one byte-native global-index entry in the
 // active SQL transaction. The caller has already admitted the containing
-// distributed participant by virtual bucket. This method still validates the
+// distributed target by virtual bucket. This method still validates the
 // relation incarnation and exact locator shape and participates in the SQL
 // runtime's serializable conflict validation before publication.
 //

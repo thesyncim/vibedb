@@ -265,12 +265,12 @@ func rf3TransactionCoordinatorRecord(
 	record, err := distributedtxn.AppendCoordinator(nil, distributedtxn.CoordinatorRecord{
 		ID: id, State: distributedtxn.CoordinatorStaging, Revision: 1,
 		CatalogGeneration: 1, RecoveryDeadline: int64(distributedtxn.MaxRecoveryPulses),
-		Participants: []distributedtxn.ParticipantRef{{
+		Targets: []distributedtxn.TransactionTargetRef{{
 			Distribution: []byte(base.Binding.Distribution), Shard: []byte(base.Binding.Shard),
 			RoutingVersion:       base.Binding.Authority.RoutingVersion,
 			AllocationGeneration: base.Binding.AllocationGeneration,
 			OwnershipEpoch:       base.Binding.Authority.OwnershipEpoch,
-			MutationDigest:       digest, State: distributedtxn.ParticipantStaged,
+			MutationDigest:       digest, State: distributedtxn.TargetStaged,
 		}},
 	})
 	if err != nil {
@@ -341,27 +341,27 @@ func TestRF3TransactionCommandFixturesPreflight(t *testing.T) {
 	for _, control := range []distributedtxn.ReplicatedCommand{
 		{Role: distributedtxn.ReplicatedRoleCoordinator, Operation: distributedtxn.ReplicatedStageCoordinator,
 			ID: id, PayloadKind: distributedtxn.ReplicatedPayloadCoordinator, Payload: record},
-		{Role: distributedtxn.ReplicatedRoleParticipant, Operation: distributedtxn.ReplicatedStageParticipant,
-			ID: id, PayloadKind: distributedtxn.ReplicatedPayloadParticipantStage,
-			Participant: distributedtxn.ParticipantStage{
+		{Role: distributedtxn.ReplicatedRoleTarget, Operation: distributedtxn.ReplicatedStageTarget,
+			ID: id, PayloadKind: distributedtxn.ReplicatedPayloadTargetStage,
+			Target: distributedtxn.TransactionTargetStage{
 				CoordinatorGroup:            distributedtxn.ID(base.Binding.GroupID),
 				CoordinatorShardIncarnation: distributedtxn.ID(base.Binding.ShardIncarnation),
 				CoordinatorAllocation:       base.Binding.AllocationGeneration, BucketBits: 8,
 				IntentScopes: []distributedtxn.IntentScope{{Start: 0, End: 256}}, MutationDigest: digest,
 			}},
-		{Role: distributedtxn.ReplicatedRoleParticipant, Operation: distributedtxn.ReplicatedPrepareParticipant,
+		{Role: distributedtxn.ReplicatedRoleTarget, Operation: distributedtxn.ReplicatedPrepareTarget,
 			ID: id, ExpectedRevision: 1, PayloadKind: distributedtxn.ReplicatedPayloadNone},
 		{Role: distributedtxn.ReplicatedRoleCoordinator, Operation: distributedtxn.ReplicatedCommitCoordinator,
 			ID: id, ExpectedRevision: 1, PayloadKind: distributedtxn.ReplicatedPayloadNone},
-		{Role: distributedtxn.ReplicatedRoleParticipant, Operation: distributedtxn.ReplicatedApplyParticipant,
+		{Role: distributedtxn.ReplicatedRoleTarget, Operation: distributedtxn.ReplicatedApplyTarget,
 			ID: id, ExpectedRevision: 2, PayloadKind: distributedtxn.ReplicatedPayloadNone},
-		{Role: distributedtxn.ReplicatedRoleParticipant, Operation: distributedtxn.ReplicatedReleaseParticipant,
+		{Role: distributedtxn.ReplicatedRoleTarget, Operation: distributedtxn.ReplicatedReleaseTarget,
 			ID: id, ExpectedRevision: 3, PayloadKind: distributedtxn.ReplicatedPayloadNone},
 		{Role: distributedtxn.ReplicatedRoleCoordinator, Operation: distributedtxn.ReplicatedRetireCoordinator,
 			ID: id, ExpectedRevision: 2, PayloadKind: distributedtxn.ReplicatedPayloadRetirement, Payload: retirement},
 	} {
 		var mutations []replication.RelationMutationBatch
-		if control.Operation == distributedtxn.ReplicatedStageParticipant {
+		if control.Operation == distributedtxn.ReplicatedStageTarget {
 			mutations = batches
 		}
 		outer, err := replication.OpenCommand(rf3TransactionCommand(t, base, control, mutations))
@@ -458,10 +458,10 @@ func TestRF3TransactionSurvivesLeaderLossAndPublishesRelationBundleAtomically(t 
 		ID: id, PayloadKind: distributedtxn.ReplicatedPayloadCoordinator, Payload: coordinatorRecord,
 	}, nil)
 	_, _, _ = submitRF3Transaction(t, ctx, cluster.owners[leader], cluster.group, stageCoordinator)
-	stageParticipant := rf3TransactionCommand(t, cluster.bases[leader], distributedtxn.ReplicatedCommand{
-		Role: distributedtxn.ReplicatedRoleParticipant, Operation: distributedtxn.ReplicatedStageParticipant,
-		ID: id, PayloadKind: distributedtxn.ReplicatedPayloadParticipantStage,
-		Participant: distributedtxn.ParticipantStage{
+	stageTarget := rf3TransactionCommand(t, cluster.bases[leader], distributedtxn.ReplicatedCommand{
+		Role: distributedtxn.ReplicatedRoleTarget, Operation: distributedtxn.ReplicatedStageTarget,
+		ID: id, PayloadKind: distributedtxn.ReplicatedPayloadTargetStage,
+		Target: distributedtxn.TransactionTargetStage{
 			CoordinatorGroup:            distributedtxn.ID(cluster.bases[leader].Binding.GroupID),
 			CoordinatorShardIncarnation: distributedtxn.ID(cluster.bases[leader].Binding.ShardIncarnation),
 			CoordinatorAllocation:       cluster.bases[leader].Binding.AllocationGeneration,
@@ -469,7 +469,7 @@ func TestRF3TransactionSurvivesLeaderLossAndPublishesRelationBundleAtomically(t 
 			MutationDigest: mutationDigest,
 		},
 	}, batches)
-	staged, _, _ := submitRF3Transaction(t, ctx, cluster.owners[leader], cluster.group, stageParticipant)
+	staged, _, _ := submitRF3Transaction(t, ctx, cluster.owners[leader], cluster.group, stageTarget)
 	waitRF3Applied(t, ctx, cluster.owners[:], nil, cluster.group, staged.Outcome.AppliedIndex)
 
 	follower := (leader + 1) % len(cluster.owners)
@@ -497,7 +497,7 @@ func TestRF3TransactionSurvivesLeaderLossAndPublishesRelationBundleAtomically(t 
 	}
 
 	prepare := rf3TransactionCommand(t, cluster.bases[leader], distributedtxn.ReplicatedCommand{
-		Role: distributedtxn.ReplicatedRoleParticipant, Operation: distributedtxn.ReplicatedPrepareParticipant,
+		Role: distributedtxn.ReplicatedRoleTarget, Operation: distributedtxn.ReplicatedPrepareTarget,
 		ID: id, ExpectedRevision: 1, PayloadKind: distributedtxn.ReplicatedPayloadNone,
 	}, nil)
 	_, _, _ = submitRF3Transaction(t, ctx, cluster.owners[leader], cluster.group, prepare)
@@ -527,7 +527,7 @@ func TestRF3TransactionSurvivesLeaderLossAndPublishesRelationBundleAtomically(t 
 	}
 
 	apply := rf3TransactionCommand(t, cluster.bases[newLeader], distributedtxn.ReplicatedCommand{
-		Role: distributedtxn.ReplicatedRoleParticipant, Operation: distributedtxn.ReplicatedApplyParticipant,
+		Role: distributedtxn.ReplicatedRoleTarget, Operation: distributedtxn.ReplicatedApplyTarget,
 		ID: id, ExpectedRevision: 2, PayloadKind: distributedtxn.ReplicatedPayloadNone,
 	}, nil)
 	applied, _, appliedResult := submitRF3Transaction(t, ctx, cluster.owners[newLeader], cluster.group, apply)
@@ -553,7 +553,7 @@ func TestRF3TransactionSurvivesLeaderLossAndPublishesRelationBundleAtomically(t 
 	}
 
 	release := rf3TransactionCommand(t, cluster.bases[newLeader], distributedtxn.ReplicatedCommand{
-		Role: distributedtxn.ReplicatedRoleParticipant, Operation: distributedtxn.ReplicatedReleaseParticipant,
+		Role: distributedtxn.ReplicatedRoleTarget, Operation: distributedtxn.ReplicatedReleaseTarget,
 		ID: id, ExpectedRevision: 3, PayloadKind: distributedtxn.ReplicatedPayloadNone,
 	}, nil)
 	released, _, _ := submitRF3Transaction(t, ctx, cluster.owners[newLeader], cluster.group, release)

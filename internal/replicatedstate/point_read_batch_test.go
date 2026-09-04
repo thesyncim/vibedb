@@ -127,7 +127,7 @@ func TestPointReadBatchRejectsWholeCutOnAnyActiveIntent(t *testing.T) {
 		t.Fatal(err)
 	}
 	blockedKey := []byte("blocked")
-	stage := transactionParticipantStageCommand(t, fixture, transactionCodecID(199),
+	stage := transactionTargetStageCommand(t, fixture, transactionCodecID(199),
 		[]replication.RelationMutationBatch{{Relation: 1, Mutations: []replication.Mutation{{
 			Kind: replication.MutationPutAbsentOrEqual, Key: blockedKey,
 			Value: []byte(`{"email":"blocked"}`),

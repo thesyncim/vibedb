@@ -33,10 +33,10 @@ func TestDurableSQLRequestExecutorFusesLoweringCreateAndTypedExecution(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	homeParticipants := durableFaultParticipants(t)
+	homeTargets := durableFaultTargets(t)
 	ledger := new(typedServiceLedger)
 	pins := new(typedServicePinStop)
-	topology := durableFaultTopology(t, homeParticipants)
+	topology := durableFaultTopology(t, homeTargets)
 	current := topology.Current()
 	current.Generation = 7
 	if err = topology.Publish(*current); err != nil {
@@ -89,7 +89,7 @@ func TestDurableSQLRequestExecutorAdmitsAtomicMultiRowCrossShardInsert(t *testin
 	}
 	ledger := new(typedServiceLedger)
 	pins := new(typedServicePinStop)
-	topology := durableFaultTopology(t, durableFaultParticipants(t))
+	topology := durableFaultTopology(t, durableFaultTargets(t))
 	current := topology.Current()
 	current.Generation = 7
 	if err = topology.Publish(*current); err != nil {
@@ -130,7 +130,7 @@ func TestDurableSQLRequestExecutorReplaysOwnPreparedIntent(t *testing.T) {
 		TenantDigest: requestledger.Digest(sha256.Sum256(tenant)), IssuerEpoch: 7,
 		IssuerLane: requestledger.IssuerLane{3}, IssuerSequence: 1}
 	ledger, pins := new(typedServiceLedger), new(typedServicePinStop)
-	topology := durableFaultTopology(t, durableFaultParticipants(t))
+	topology := durableFaultTopology(t, durableFaultTargets(t))
 	current := topology.Current()
 	current.Generation = 7
 	if err := topology.Publish(*current); err != nil {
@@ -180,7 +180,7 @@ func TestDurableSQLComputedUpdateRetryRecoversRetainedProgramAfterReevaluationEr
 		IssuerLane: requestledger.IssuerLane{13}, IssuerSequence: 1,
 	}
 	ledger, pins := new(typedServiceLedger), new(typedServicePinStop)
-	topology := durableFaultTopology(t, durableFaultParticipants(t))
+	topology := durableFaultTopology(t, durableFaultTargets(t))
 	current := topology.Current()
 	current.Generation = 7
 	if err := topology.Publish(*current); err != nil {
@@ -231,7 +231,7 @@ func TestDurableSQLRequestExecutorAdmitsAtomicFiniteCrossShardDelete(t *testing.
 	}
 	ledger := new(typedServiceLedger)
 	pins := new(typedServicePinStop)
-	topology := durableFaultTopology(t, durableFaultParticipants(t))
+	topology := durableFaultTopology(t, durableFaultTargets(t))
 	current := topology.Current()
 	current.Generation = 7
 	if err = topology.Publish(*current); err != nil {
@@ -332,8 +332,8 @@ func TestDurableSQLExecuteAdmitsEveryItemBeforeSemanticPreparation(t *testing.T)
 }
 
 func TestDurableSQLReplayUsesRetainedBytesWithoutCurrentPlannerSemantics(t *testing.T) {
-	participants := durableFaultParticipants(t)
-	base := durableFaultRequest(t, participants)
+	targets := durableFaultTargets(t)
+	base := durableFaultRequest(t, targets)
 	queries := []Query{{
 		SQL: "DELETE FROM messages WHERE id IN (SELECT BOOL 't' UNION ALL SELECT ?)",
 		Params: []shardservice.Param{
@@ -354,7 +354,7 @@ func TestDurableSQLReplayUsesRetainedBytesWithoutCurrentPlannerSemantics(t *test
 	resultRaw, err := AppendDurableRequestResult(nil, DurableRequestResult{
 		Committed: true, AffectedRows: 2, Transaction: base.Program.Identity.ID,
 		CatalogGeneration:       base.Program.Identity.CatalogGeneration,
-		ShardsFanned:            uint64(len(base.Program.Participants)),
+		ShardsFanned:            uint64(len(base.Program.Targets)),
 		TransitionTag:           base.Program.Contract.CommitTransitionTag,
 		TerminalStateDigest:     base.Program.Contract.CommitTerminalStateDigest,
 		TerminalContractDigest:  base.Program.Contract.TerminalContractDigest,
@@ -383,7 +383,7 @@ func TestDurableSQLReplayUsesRetainedBytesWithoutCurrentPlannerSemantics(t *test
 		t.Fatal(err)
 	}
 	service, err := newDurableRequestService(
-		durableFaultTopology(t, participants), ledger,
+		durableFaultTopology(t, targets), ledger,
 		typedServiceRunnerStop{}, new(typedServicePinStop),
 	)
 	if err != nil {
@@ -434,10 +434,10 @@ func TestDurableSQLRequestExecutorRejectsCatalogLedgerGenerationMixBeforeAdmissi
 		Request: requestledger.RequestID{0x52}, TenantDigest: requestledger.Digest(sha256.Sum256(tenant)),
 		IssuerEpoch: 7, IssuerLane: requestledger.IssuerLane{0x53}, IssuerSequence: 1,
 	}
-	participants := durableFaultParticipants(t)
+	targets := durableFaultTargets(t)
 	ledger := new(typedServiceLedger)
 	service, err := newDurableRequestService(
-		durableFaultTopology(t, participants), ledger, typedServiceRunnerStop{}, new(typedServicePinStop),
+		durableFaultTopology(t, targets), ledger, typedServiceRunnerStop{}, new(typedServicePinStop),
 	)
 	if err != nil {
 		t.Fatal(err)

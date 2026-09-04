@@ -6,11 +6,11 @@ import (
 )
 
 func FuzzOpenReplicatedCommand(f *testing.F) {
-	participant, err := AppendReplicatedCommand(nil, replicatedTestParticipant())
+	target, err := AppendReplicatedCommand(nil, replicatedTestTarget())
 	if err != nil {
 		f.Fatal(err)
 	}
-	f.Add(participant)
+	f.Add(target)
 	inline, err := AppendReplicatedCommand(nil, fencedReplicatedTestCommand(ReplicatedCommand{
 		Role: ReplicatedRoleCoordinator, Operation: ReplicatedStageCoordinator,
 		ID: testID(), PayloadKind: ReplicatedPayloadCoordinator,
@@ -48,13 +48,13 @@ func FuzzOpenReplicatedCommand(f *testing.F) {
 	wideCount := min(len(widePages), MaxManifestSegmentsPerCommand)
 	widePayload := appendManifestPages(wideCoordinator, widePages[:wideCount])
 	wideOrdinal := uint32(64)
-	wideMutation := manifestParticipant(uint64(wideOrdinal)).MutationDigest
+	wideMutation := manifestTarget(uint64(wideOrdinal)).MutationDigest
 	fused, err := AppendReplicatedCommand(nil, fencedReplicatedTestCommand(ReplicatedCommand{
 		Role:      ReplicatedRoleCoordinator,
 		Operation: ReplicatedBeginPrepareManifestCoordinator,
 		ID:        testID(), PayloadKind: ReplicatedPayloadManifestCoordinator,
 		Payload: widePayload,
-		Participant: fusedParticipantStage(
+		Target: fusedTargetStage(
 			ReplicatedBeginPrepareManifestCoordinator, wideOrdinal, wideMutation,
 		),
 	}))

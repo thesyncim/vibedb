@@ -43,9 +43,9 @@ type DurableSQLRequestExecutorOptions struct {
 	Requests           *DurableRequestService
 	RecoveryPulseLimit uint8
 	PlanningLeaseSpan  uint64
-	// SingleParticipantFastPath enables explicit direct execution and prepared
+	// SingleTargetFastPath enables explicit direct execution and prepared
 	// recipes. Execute itself always uses the coordinated issuer domain.
-	SingleParticipantFastPath bool
+	SingleTargetFastPath bool
 }
 
 // DurableSQLRequestExecutor is the production composition boundary from one
@@ -66,7 +66,7 @@ type DurableSQLRequestResult struct {
 	TerminalRevision uint64
 	ResultDigest     replication.Digest
 	AckToken         DurableRequestAckToken
-	// Direct is terminal in the participant group itself and therefore has no
+	// Direct is terminal in the target group itself and therefore has no
 	// request-ledger ACK capability or terminal-ledger revision.
 	Direct bool
 }
@@ -96,7 +96,7 @@ func NewDurableSQLRequestExecutor(
 	return &DurableSQLRequestExecutor{
 		planner: options.Planner, data: options.ReplicatedData, requests: options.Requests,
 		recoveryPulses: options.RecoveryPulseLimit, planningLeaseSpan: options.PlanningLeaseSpan,
-		singleFast: options.SingleParticipantFastPath,
+		singleFast: options.SingleTargetFastPath,
 	}, nil
 }
 
@@ -147,7 +147,7 @@ func (executor *DurableSQLRequestExecutor) ExecuteMode(
 	defer cancel()
 	var lease catalogLease
 	var home DurableRequestLedgerHome
-	var participants []ReplicatedTransactionParticipant
+	var targets []ReplicatedTransactionTarget
 	var handled bool
 	refreshedMiss := false
 	for {
@@ -166,7 +166,7 @@ func (executor *DurableSQLRequestExecutor) ExecuteMode(
 			return DurableSQLRequestResult{}, fmt.Errorf("gateway: SQL catalog generation %d differs from ledger topology %d: %w",
 				lease.generation, home.TopologyGeneration, ErrDurableRequestConflict)
 		}
-		participants, handled, err = executor.planner.planReplicatedSQLTransactionWithData(
+		targets, handled, err = executor.planner.planReplicatedSQLTransactionWithData(
 			opctx, lease.snapshot, queries, profile, executor.data,
 		)
 		if !errors.Is(err, ErrTableNotPlaced) || refreshedMiss {
@@ -185,7 +185,15 @@ func (executor *DurableSQLRequestExecutor) ExecuteMode(
 		}
 	}
 	defer lease.release()
-	if err != nil || !handled || len(participants) == 0 {
+	home, err = executor.requests.home(key)
+	if err != nil {
+		return DurableSQLRequestResult{}, err
+	}
+	if home.TopologyGeneration != lease.generation {
+		return DurableSQLRequestResult{}, fmt.Errorf("gateway: SQL catalog generation %d differs from ledger topology %d: %w",
+			lease.generation, home.TopologyGeneration, ErrDurableRequestConflict)
+	}
+	if err != nil || !handled || len(targets) == 0 {
 		if err != nil {
 			// Planning happens before the fused ledger Create. An exact retry can
 			// therefore observe its own prepared intent or a committed row whose
@@ -202,13 +210,13 @@ func (executor *DurableSQLRequestExecutor) ExecuteMode(
 		return DurableSQLRequestResult{}, fmt.Errorf("gateway: durable SQL lowering: %w", errors.Join(err, ErrDurableSQLRequest))
 	}
 	if mode != DurableSQLCoordinated && executor.singleFast && key.IssuerSequence != 0 &&
-		directSQLMutationEligible(queries, participants) {
+		directSQLMutationEligible(queries, targets) {
 		admitted = true
 		direct, directErr := executor.executeDirect(
-			opctx, key, tenant, lease.generation, participants[0],
+			opctx, key, tenant, lease.generation, targets[0],
 		)
 		if direct.Result != nil && !direct.duplicate {
-			executor.observeMutationPressure(lease.snapshot, participants)
+			executor.observeMutationPressure(lease.snapshot, targets)
 		}
 		if directErr != nil {
 			if errors.Is(directErr, ErrReplicatedTransactionConflict) {
@@ -228,7 +236,7 @@ func (executor *DurableSQLRequestExecutor) ExecuteMode(
 		RecoveryDeadline:        int64(executor.recoveryPulses),
 		PlanningLeaseSpan:       executor.planningLeaseSpan,
 		PlanningLeaseGeneration: home.TopologyGeneration,
-		PinEpoch:                home.TopologyGeneration, Participants: participants,
+		PinEpoch:                home.TopologyGeneration, Targets: targets,
 		MembershipStable: true,
 	})
 	if err != nil {
@@ -243,11 +251,11 @@ func (executor *DurableSQLRequestExecutor) ExecuteMode(
 	var outcome DurableRequestOutcome
 	if begin.ProgramMatches {
 		// The fused Create is the one logical admission point for a caller
-		// request. Sample its already-grouped shard participants only for the
+		// request. Sample its already-grouped shard targets only for the
 		// successful creator: request retries and transaction recovery waves must
 		// not amplify hot-shard pressure.
 		if begin.Created {
-			executor.observeMutationPressure(lease.snapshot, participants)
+			executor.observeMutationPressure(lease.snapshot, targets)
 		}
 		outcome, err = executor.requests.ExecuteBegun(opctx, request, begin)
 	} else {
@@ -273,10 +281,10 @@ func (executor *DurableSQLRequestExecutor) executeDirect(
 	key DurableRequestLedgerKey,
 	tenant []byte,
 	catalogGeneration uint64,
-	participant ReplicatedTransactionParticipant,
+	target ReplicatedTransactionTarget,
 ) (directSQLRequestResult, error) {
 	direct, err := executor.data.DirectMutate(ctx, ReplicatedDirectMutation{
-		Key: key.RequestKey, RequestDigest: key.Digest, Tenant: tenant, Participant: participant,
+		Key: key.RequestKey, RequestDigest: key.Digest, Tenant: tenant, Target: target,
 	})
 	if direct.ID == (distributedtxn.ID{}) {
 		return directSQLRequestResult{}, err
@@ -300,12 +308,12 @@ func (executor *DurableSQLRequestExecutor) executeDirect(
 
 func directSQLMutationEligible(
 	queries []Query,
-	participants []ReplicatedTransactionParticipant,
+	targets []ReplicatedTransactionTarget,
 ) bool {
-	if len(queries) != 1 || len(participants) != 1 || len(participants[0].Batches) != 1 {
+	if len(queries) != 1 || len(targets) != 1 || len(targets[0].Batches) != 1 {
 		return false
 	}
-	mutations := participants[0].Batches[0].Mutations
+	mutations := targets[0].Batches[0].Mutations
 	if len(mutations) == 0 {
 		return false
 	}
@@ -371,21 +379,21 @@ func (executor *DurableSQLRequestExecutor) ReplayRequestWithTenant(
 		return DurableSQLRequestResult{}, false, ErrNoCatalog
 	}
 	defer lease.release()
-	participants, handled, planErr := executor.planner.planReplicatedSQLTransactionWithData(
+	targets, handled, planErr := executor.planner.planReplicatedSQLTransactionWithData(
 		opctx, lease.snapshot, queries, profile, executor.data,
 	)
 	if planErr != nil || !handled || key.IssuerSequence == 0 ||
-		!directSQLMutationEligible(queries, participants) {
+		!directSQLMutationEligible(queries, targets) {
 		return executor.Replay(opctx, key)
 	}
 	direct, directErr := executor.executeDirect(
-		opctx, key, tenant, lease.generation, participants[0],
+		opctx, key, tenant, lease.generation, targets[0],
 	)
 	if direct.Result == nil || direct.Result.TransactionID == (replication.ID128{}) {
 		return DurableSQLRequestResult{}, true, directErr
 	}
 	if !direct.duplicate {
-		executor.observeMutationPressure(lease.snapshot, participants)
+		executor.observeMutationPressure(lease.snapshot, targets)
 	}
 	if errors.Is(directErr, ErrReplicatedTransactionConflict) {
 		return direct.DurableSQLRequestResult, true, ErrDurableSQLAborted
@@ -393,26 +401,26 @@ func (executor *DurableSQLRequestExecutor) ReplayRequestWithTenant(
 	return direct.DurableSQLRequestResult, true, directErr
 }
 
-// observeMutationPressure samples one logical write per routed participant.
-// Participant scopes were canonicalized by SQL lowering, so this boundary
+// observeMutationPressure samples one logical write per routed target.
+// Target scopes were canonicalized by SQL lowering, so this boundary
 // preserves exact bucket locality without counting every statement, relation
 // batch, global-index side effect, or distributed-transaction retry again.
 func (executor *DurableSQLRequestExecutor) observeMutationPressure(
 	snapshot *Snapshot,
-	participants []ReplicatedTransactionParticipant,
+	targets []ReplicatedTransactionTarget,
 ) {
 	if executor == nil || executor.planner == nil || executor.planner.pressure == nil ||
 		snapshot == nil {
 		return
 	}
-	for index := range participants {
-		participant := &participants[index]
-		source := replicatedDataPressureSource(snapshot, participant.Route)
+	for index := range targets {
+		target := &targets[index]
+		source := replicatedDataPressureSource(snapshot, target.Route)
 		if source == (autosplit.SourceIdentity{}) {
 			continue
 		}
 		executor.planner.pressure.ObservePressure(PressureObservation{
-			Source: source, AccessScopes: participant.IntentScopes, Write: true,
+			Source: source, AccessScopes: target.IntentScopes, Write: true,
 		})
 	}
 }

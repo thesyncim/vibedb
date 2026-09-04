@@ -179,15 +179,15 @@ func (waves *distributedRunnerWaves) ReadTransactionRecovery(_ context.Context, 
 	if route.membershipStable != waves.wantMembershipStable {
 		return ReplicatedTransactionRecoveryResult{}, errors.New("recovery lost sealed membership mode")
 	}
-	if read.Kind == replicatedstate.TransactionRecoveryLookupParticipant {
+	if read.Kind == replicatedstate.TransactionRecoveryLookupTarget {
 		if waves.decisionSettled {
 			// Once the decision is durable, participants may already have
 			// applied/released and retired their prepare records.
 			return ReplicatedTransactionRecoveryResult{}, errors.New("prepared state read after durable decision")
 		}
 		return ReplicatedTransactionRecoveryResult{Complete: true, Records: []replicatedstate.TransactionRecoveryRecord{{
-			ID: read.ID, Role: distributedtxn.ReplicatedRoleParticipant,
-			State: uint8(distributedtxn.ParticipantPrepared),
+			ID: read.ID, Role: distributedtxn.ReplicatedRoleTarget,
+			State: uint8(distributedtxn.TargetPrepared),
 		}}}, nil
 	}
 	if len(waves.manifestPayload) == 0 {
@@ -237,7 +237,7 @@ func (waves *distributedRunnerWaves) RunStagedWave(_ context.Context, wave Durab
 		waves.manifestPayload = bytes.Clone(coordinator)
 	}
 	affected := int64(-1)
-	if control.Operation == distributedtxn.ReplicatedApplyReleaseParticipant {
+	if control.Operation == distributedtxn.ReplicatedApplyReleaseTarget {
 		affected = 1
 	}
 	if control.Operation == distributedtxn.ReplicatedRetireCoordinator {
@@ -250,7 +250,7 @@ func (waves *distributedRunnerWaves) RunStagedWave(_ context.Context, wave Durab
 		}
 	}
 	code := uint32(replicatedstate.ResultApplied)
-	if waves.prepareConflict && control.Operation == distributedtxn.ReplicatedStagePrepareParticipant {
+	if waves.prepareConflict && control.Operation == distributedtxn.ReplicatedStagePrepareTarget {
 		waves.prepareConflict = false
 		code = replicatedstate.ResultIndexConflict
 	}
@@ -363,7 +363,7 @@ func TestDurableRequestDistributedRunnerRefreshesOnlyUnfinishedWavesAndTerminal(
 	if pins.calls != 1 {
 		t.Fatalf("first wave acquisitions=%d", pins.calls)
 	}
-	if err = execution.Participants.Reset(); err != nil {
+	if err = execution.Targets.Reset(); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = runner.RunTyped(t.Context(), execution); err != nil {
@@ -456,7 +456,7 @@ func (authority distributedRunnerAuthority) TerminalAuthority(context.Context, D
 
 type distributedRunnerResolver struct{ base ReplicatedRoute }
 
-func (resolver distributedRunnerResolver) ResolveDurableRequestParticipant(_ context.Context, logical DurableRequestLogicalParticipant) (ReplicatedRoute, error) {
+func (resolver distributedRunnerResolver) ResolveDurableRequestTarget(_ context.Context, logical DurableRequestLogicalTarget) (ReplicatedRoute, error) {
 	route := cloneDurableRequestRoute(resolver.base)
 	route.Distribution, route.Shard, route.Group = logical.Distribution, logical.Shard, logical.Group
 	route.RangeIdentity = logical.RangeIdentity
@@ -479,15 +479,15 @@ func TestDurableRequestDistributedRunnerResumesProtocolCuts(t *testing.T) {
 func testDurableRequestDistributedRunnerResumesProtocolCuts(t *testing.T, stable bool) {
 	for _, fault := range []distributedtxn.ReplicatedOperation{
 		distributedtxn.ReplicatedBeginPrepareManifestCoordinator,
-		distributedtxn.ReplicatedStagePrepareParticipant,
+		distributedtxn.ReplicatedStagePrepareTarget,
 		distributedtxn.ReplicatedCommitCoordinator,
-		distributedtxn.ReplicatedApplyReleaseParticipant,
+		distributedtxn.ReplicatedApplyReleaseTarget,
 		distributedtxn.ReplicatedRetireCoordinator,
 		distributedtxn.ReplicatedAbortCoordinator,
-		distributedtxn.ReplicatedAbortReleaseParticipant,
+		distributedtxn.ReplicatedAbortReleaseTarget,
 	} {
 		t.Run(fmt.Sprintf("operation_%d", fault), func(t *testing.T) {
-			aborted := fault == distributedtxn.ReplicatedAbortCoordinator || fault == distributedtxn.ReplicatedAbortReleaseParticipant
+			aborted := fault == distributedtxn.ReplicatedAbortCoordinator || fault == distributedtxn.ReplicatedAbortReleaseTarget
 			execution := typedExecutionFixture(t)
 			execution.Recipe.Contract.CommitFinalWaveCount = 8
 			execution.Recipe.Contract.AbortFinalWaveCount = 11
@@ -513,7 +513,7 @@ func testDurableRequestDistributedRunnerResumesProtocolCuts(t *testing.T, stable
 			if _, err = runner.RunTyped(context.Background(), execution); !errors.Is(err, errLifecycleRunnerFault) {
 				t.Fatalf("first run err=%v", err)
 			}
-			if err = execution.Participants.Reset(); err != nil {
+			if err = execution.Targets.Reset(); err != nil {
 				t.Fatal(err)
 			}
 			if _, err = runner.RunTyped(context.Background(), execution); err != nil {
@@ -606,7 +606,7 @@ func TestDurableRequestDistributedRunnerResumesTerminalHandoff(t *testing.T) {
 	if ledger.head.NextStepOrdinal != 8 {
 		t.Fatalf("waves=%d", ledger.head.NextStepOrdinal)
 	}
-	if err = execution.Participants.Reset(); err != nil {
+	if err = execution.Targets.Reset(); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = runner.RunTyped(context.Background(), execution); err != nil {
@@ -649,7 +649,7 @@ func BenchmarkDurableRequestDistributedRunnerBoundedStream(b *testing.B) {
 	}
 }
 
-func TestDurableRequestDistributedRunnerStreamsMoreThan64Participants(t *testing.T) {
+func TestDurableRequestDistributedRunnerStreamsMoreThan64Targets(t *testing.T) {
 	execution := typedExecutionFixtureCount(t, 129)
 	// One manifest command + (P-1) prepare + decision + P finish + retire.
 	execution.Recipe.Contract.CommitFinalWaveCount = 260
@@ -672,7 +672,7 @@ func TestDurableRequestDistributedRunnerStreamsMoreThan64Participants(t *testing
 		t.Fatal(err)
 	}
 	if ledger.head.NextStepOrdinal != 260 || terminal.plan.AffectedRows != 129 ||
-		execution.Participants.BufferedBytes() > durableRequestReaderMaxLiveBytes {
-		t.Fatalf("waves=%d rows=%d buffered=%d", ledger.head.NextStepOrdinal, terminal.plan.AffectedRows, execution.Participants.BufferedBytes())
+		execution.Targets.BufferedBytes() > durableRequestReaderMaxLiveBytes {
+		t.Fatalf("waves=%d rows=%d buffered=%d", ledger.head.NextStepOrdinal, terminal.plan.AffectedRows, execution.Targets.BufferedBytes())
 	}
 }

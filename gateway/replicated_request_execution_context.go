@@ -19,7 +19,7 @@ type DurableRequestTypedExecutionContext struct {
 	Home                DurableRequestLedgerHome
 	Key                 DurableRequestLedgerKey
 	Recipe              DurableRequestRecipe
-	Participants        DurableRequestReplayableParticipantStream
+	Targets             DurableRequestReplayableTargetStream
 	ExecutionPinRoute   ReplicatedRoute
 	ExecutionPinAcquire executionpin.AcquireCertificate
 	ExecutionPinLease   executionpin.LeaseCertificate
@@ -30,7 +30,7 @@ type DurableRequestTypedExecutionContext struct {
 
 // BuildDurableRequestExecutionPinBinding derives the one aggregate authority
 // for a sealed request. It deliberately names the ledger-home Raft group, not
-// a participant: a tenant may span any number of shards and tables while one
+// a target: a tenant may span any number of shards and tables while one
 // clockless controller epoch fences the complete ordered program.
 func BuildDurableRequestExecutionPinBinding(
 	execution DurableRequestTypedExecutionContext,
@@ -43,14 +43,14 @@ func BuildDurableRequestExecutionPinBinding(
 		CatalogGeneration:         execution.Recipe.CatalogGeneration,
 		SchemaManifestDigest:      executionpin.Digest(contract.SchemaManifestDigest),
 		TransactionManifestDigest: executionpin.Digest(contract.TransactionManifestDigest),
-		ParticipantAuthorityRoot:  executionpin.Digest(contract.LineageForwardingDigest),
-		ParticipantCount:          execution.Recipe.ParticipantCount,
+		TargetAuthorityRoot:       executionpin.Digest(contract.LineageForwardingDigest),
+		TargetCount:               execution.Recipe.TargetCount,
 		ExecutionContractDigest:   executionpin.Digest(contract.ProtocolProgramDigest),
 		LedgerHomeGroup:           executionpin.ID(homeRoute.Group.GroupID),
 	}
 	if !validReplicatedRoute(homeRoute) || !binding.Valid() ||
 		contract.CatalogGeneration != execution.Recipe.CatalogGeneration ||
-		contract.ParticipantCount != execution.Recipe.ParticipantCount ||
+		contract.TargetCount != execution.Recipe.TargetCount ||
 		contract.KeyDigest != execution.Recipe.KeyDigest ||
 		contract.RequestDigest != execution.Recipe.RequestDigest {
 		return executionpin.Binding{}, ErrDurableRequestConflict
@@ -163,13 +163,13 @@ func NewDurableRequestTypedExecutionContext(
 	key DurableRequestLedgerKey,
 	recipe DurableRequestRecipe,
 ) (DurableRequestTypedExecutionContext, error) {
-	participants, ok := recipe.ParticipantStream.(DurableRequestReplayableParticipantStream)
-	if !ok || participants == nil || len(recipe.Participants) != 0 ||
+	targets, ok := recipe.TargetStream.(DurableRequestReplayableTargetStream)
+	if !ok || targets == nil || len(recipe.Targets) != 0 ||
 		home.Identity == (replication.Digest{}) || home.Point == (requestledger.LedgerHome{}) ||
 		!key.RequestKey.Valid() || key.Digest == (replication.Digest{}) ||
 		len(recipe.Tenant) == 0 || len(recipe.Tenant) > replication.MaxIdentityBytes ||
 		recipe.RequestID == (replication.ID128{}) || recipe.RequestDigest == (replication.Digest{}) ||
-		recipe.KeyDigest == (replication.Digest{}) || recipe.ParticipantCount == 0 {
+		recipe.KeyDigest == (replication.Digest{}) || recipe.TargetCount == 0 {
 		return DurableRequestTypedExecutionContext{}, ErrDurableRequest
 	}
 	keyDigest, err := requestledger.KeyDigest(key.RequestKey)
@@ -180,14 +180,14 @@ func NewDurableRequestTypedExecutionContext(
 		requestledger.Digest(sha256.Sum256(recipe.Tenant)) != key.RequestKey.TenantDigest ||
 		recipe.Contract.KeyDigest != recipe.KeyDigest ||
 		recipe.Contract.RequestDigest != recipe.RequestDigest ||
-		recipe.Contract.ParticipantCount != recipe.ParticipantCount ||
+		recipe.Contract.TargetCount != recipe.TargetCount ||
 		recipe.Contract.CatalogGeneration != recipe.CatalogGeneration ||
 		recipe.Identity.CatalogGeneration != recipe.CatalogGeneration ||
 		recipe.Identity.ID == ([16]byte{}) {
 		return DurableRequestTypedExecutionContext{}, errors.Join(err, homeErr, ErrDurableRequestConflict)
 	}
-	recipe.ParticipantStream = participants
+	recipe.TargetStream = targets
 	return DurableRequestTypedExecutionContext{
-		Home: home, Key: key, Recipe: recipe, Participants: participants,
+		Home: home, Key: key, Recipe: recipe, Targets: targets,
 	}, nil
 }

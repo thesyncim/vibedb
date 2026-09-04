@@ -87,14 +87,14 @@ func (runner *DurableRequestLifecycleRunner) openAdvancedWave(
 	return wave, nil
 }
 
-// ResumeAdvancedWave completes only the retained route release. Participant
+// ResumeAdvancedWave completes only the retained route release. Target
 // work and its settlement callback have already completed at OperationAdvance.
 // The payload stays immutable and pinned until the release proof is durable.
 func (runner *DurableRequestLifecycleRunner) ResumeAdvancedWave(
 	ctx context.Context, execution DurableRequestTypedExecutionContext,
 ) error {
 	if runner == nil || runner.ledger == nil || runner.resolver == nil || runner.proposer == nil ||
-		runner.pinFencer == nil || runner.gateSessions == nil || ctx == nil || execution.Participants == nil {
+		runner.pinFencer == nil || runner.gateSessions == nil || ctx == nil || execution.Targets == nil {
 		return ErrDurableRequest
 	}
 	wave := DurableRequestWave{
@@ -117,20 +117,20 @@ func (runner *DurableRequestLifecycleRunner) ResumeAdvancedWave(
 		return err
 	}
 	wave.GateEpoch = gate.Epoch
-	if err := execution.Participants.Reset(); err != nil {
+	if err := execution.Targets.Reset(); err != nil {
 		return err
 	}
 	found := false
-	for visited := uint64(0); visited < execution.Recipe.ParticipantCount && execution.Participants.Next(); visited++ {
-		participant := execution.Participants.Current()
-		if participant.Group.GroupID == outer.GroupID && bytes.Equal([]byte(participant.Distribution), outer.Distribution) &&
-			bytes.Equal([]byte(participant.Shard), outer.Shard) {
-			wave.Participant, found = participant, true
+	for visited := uint64(0); visited < execution.Recipe.TargetCount && execution.Targets.Next(); visited++ {
+		target := execution.Targets.Current()
+		if target.Group.GroupID == outer.GroupID && bytes.Equal([]byte(target.Distribution), outer.Distribution) &&
+			bytes.Equal([]byte(target.Shard), outer.Shard) {
+			wave.LogicalTarget, found = target, true
 			break
 		}
 	}
 	if !found {
-		return errors.Join(execution.Participants.Err(), ErrDurableRequestConflict)
+		return errors.Join(execution.Targets.Err(), ErrDurableRequestConflict)
 	}
 	wave, err = runner.openAdvancedWave(ctx, wave, cut, uint64(len(outer.GroupID)))
 	if err != nil || !bytes.Equal(wave.Target, outer.GroupID[:]) {

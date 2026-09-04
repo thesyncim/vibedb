@@ -61,7 +61,7 @@ func (batch *WriteBatch) logicalBytes() int64 {
 	return total
 }
 
-// All participant writers must be held. Complete normalization and final-byte
+// All target writers must be held. Complete normalization and final-byte
 // admission for every member before any staged plan can borrow an arena. Raw
 // Unicode line separators can expand even when the original input fit limits.
 func canonicalizePrimaryTransactionBatches(members []NamedCollection, byName map[string]*WriteBatch, limits TxnLimits) error {

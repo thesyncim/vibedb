@@ -316,14 +316,14 @@ func openCollection(
 
 // collectionOpenResolver builds the per-collection decision resolver. The
 // resolver closes over this collection's (StoreID, JournalID) so a decision
-// commits the record only when its participant list names them.
+// commits the record only when its target list names them.
 func collectionOpenResolver(
 	cfg collectionOpenConfig,
 	storeID, journalID [16]byte,
 	primaryPath string,
 ) (recoveryJournalDecisionResolver, uint64, error) {
 	if cfg.decisions != nil {
-		return participantBindingResolver(
+		return targetBindingResolver(
 			cfg.decisions, storeID, journalID,
 		), cfg.decisions.Epoch(), nil
 	}

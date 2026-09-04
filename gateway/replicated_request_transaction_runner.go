@@ -25,8 +25,8 @@ type DurableRequestTerminalAuthorityProvider interface {
 }
 
 // DurableRequestDistributedRunner executes the actual replicated transaction
-// protocol sequentially over a replayable participant stream. It retains one
-// participant, one manifest page pack, and one exact requestledger wave.
+// protocol sequentially over a replayable target stream. It retains one
+// target, one manifest page pack, and one exact requestledger wave.
 type DurableRequestDistributedRunner struct {
 	ledger    DurableRequestLedger
 	resolver  DurableRequestRouteResolver
@@ -133,7 +133,7 @@ func (runner *DurableRequestDistributedRunner) RunTyped(
 			failure = fmt.Errorf("gateway: distributed request %s: %w", stage, failure)
 		}
 	}()
-	if runner == nil || ctx == nil || execution.Participants == nil {
+	if runner == nil || ctx == nil || execution.Targets == nil {
 		return DurableRequestTerminalResult{}, ErrDurableRequest
 	}
 	if !validDurableRequestProtocolProgram(execution.Recipe.Contract) {
@@ -241,8 +241,8 @@ func (runner *DurableRequestDistributedRunner) RunTyped(
 		manifestCommands += uint64(descriptor.SegmentCount-distributedtxn.MaxManifestSegmentsPerCommand+
 			distributedtxn.MaxManifestSegmentsPerCommand-1) / uint64(distributedtxn.MaxManifestSegmentsPerCommand)
 	}
-	commitWaves := manifestCommands + 2*execution.Recipe.ParticipantCount + 1
-	abortWaves := manifestCommands + 3*execution.Recipe.ParticipantCount + 1
+	commitWaves := manifestCommands + 2*execution.Recipe.TargetCount + 1
+	abortWaves := manifestCommands + 3*execution.Recipe.TargetCount + 1
 	if execution.Recipe.Contract.CommitFinalWaveCount != commitWaves ||
 		execution.Recipe.Contract.AbortFinalWaveCount != abortWaves {
 		return DurableRequestTerminalResult{}, ErrDurableRequestConflict
@@ -385,7 +385,7 @@ func (runner *DurableRequestDistributedRunner) recoverManifestDescriptor(
 	manifest, openErr := distributedtxn.OpenManifestCoordinator(record.Payload)
 	if openErr != nil || record.ID != execution.Recipe.Identity.ID ||
 		record.PayloadKind != distributedtxn.ReplicatedPayloadManifestCoordinator ||
-		manifest.Manifest.ParticipantCount != execution.Recipe.ParticipantCount {
+		manifest.Manifest.TargetCount != execution.Recipe.TargetCount {
 		return distributedtxn.ManifestDescriptor{}, errors.Join(openErr, ErrDurableRequestConflict)
 	}
 	return manifest.Manifest, nil
@@ -393,15 +393,15 @@ func (runner *DurableRequestDistributedRunner) recoverManifestDescriptor(
 
 func (progress *durableDistributedProgress) prepare(
 	ctx context.Context,
-	coordinator DurableRequestLogicalParticipant,
+	coordinator DurableRequestLogicalTarget,
 	coordinatorRoute ReplicatedRoute,
 ) error {
-	if err := progress.execution.Participants.Reset(); err != nil {
+	if err := progress.execution.Targets.Reset(); err != nil {
 		return err
 	}
 	var ordinal uint64
-	for progress.execution.Participants.Next() {
-		logical := progress.execution.Participants.Current()
+	for progress.execution.Targets.Next() {
+		logical := progress.execution.Targets.Current()
 		if ordinal == uint64(progress.execution.Recipe.Identity.CoordinatorOrdinal) {
 			ordinal++
 			continue
@@ -411,11 +411,11 @@ func (progress *durableDistributedProgress) prepare(
 			return err
 		}
 		control := distributedtxn.ReplicatedCommand{
-			Role:        distributedtxn.ReplicatedRoleParticipant,
-			Operation:   distributedtxn.ReplicatedStagePrepareParticipant,
+			Role:        distributedtxn.ReplicatedRoleTarget,
+			Operation:   distributedtxn.ReplicatedStagePrepareTarget,
 			ID:          progress.execution.Recipe.Identity.ID,
-			PayloadKind: distributedtxn.ReplicatedPayloadParticipantStage,
-			Participant: progress.participantStage(logical, coordinatorRoute, uint32(ordinal)),
+			PayloadKind: distributedtxn.ReplicatedPayloadTargetStage,
+			Target:      progress.targetStage(logical, coordinatorRoute, uint32(ordinal)),
 		}
 		_, err = progress.command(ctx, logical, route, control, logical.Batches,
 			func(code uint32, _ replicatedstate.TransactionCompletionResult) error {
@@ -434,7 +434,7 @@ func (progress *durableDistributedProgress) prepare(
 		}
 		ordinal++
 	}
-	return errors.Join(progress.execution.Participants.Err())
+	return errors.Join(progress.execution.Targets.Err())
 }
 
 func (progress *durableDistributedProgress) recoverPreparedPrefix(
@@ -444,16 +444,16 @@ func (progress *durableDistributedProgress) recoverPreparedPrefix(
 	if progress.runner.recovery == nil {
 		return ErrDurableRequestUnresolved
 	}
-	completed := min(progress.next-manifestCommands, progress.execution.Recipe.ParticipantCount-1)
+	completed := min(progress.next-manifestCommands, progress.execution.Recipe.TargetCount-1)
 	if completed == 0 {
 		return nil
 	}
-	if err := progress.execution.Participants.Reset(); err != nil {
+	if err := progress.execution.Targets.Reset(); err != nil {
 		return err
 	}
 	var ordinal, checked uint64
-	for progress.execution.Participants.Next() && checked < completed {
-		logical := progress.execution.Participants.Current()
+	for progress.execution.Targets.Next() && checked < completed {
+		logical := progress.execution.Targets.Current()
 		if ordinal == uint64(progress.execution.Recipe.Identity.CoordinatorOrdinal) {
 			ordinal++
 			continue
@@ -464,7 +464,7 @@ func (progress *durableDistributedProgress) recoverPreparedPrefix(
 		}
 		result, readErr := progress.runner.recovery.ReadTransactionRecovery(ctx, route,
 			replicatedstate.TransactionRecoveryReadRequest{
-				Kind: replicatedstate.TransactionRecoveryLookupParticipant,
+				Kind: replicatedstate.TransactionRecoveryLookupTarget,
 				ID:   progress.execution.Recipe.Identity.ID, MinimumApplied: 1,
 				MaxRows: 1, MaxBytes: replicatedstate.TransactionRecoverySummaryBytes,
 			})
@@ -474,14 +474,14 @@ func (progress *durableDistributedProgress) recoverPreparedPrefix(
 		if len(result.Records) == 0 {
 			progress.state.conflict = true
 		} else if len(result.Records) != 1 || result.Records[0].ID != progress.execution.Recipe.Identity.ID ||
-			result.Records[0].Role != distributedtxn.ReplicatedRoleParticipant ||
-			distributedtxn.ParticipantState(result.Records[0].State) != distributedtxn.ParticipantPrepared {
+			result.Records[0].Role != distributedtxn.ReplicatedRoleTarget ||
+			distributedtxn.TargetState(result.Records[0].State) != distributedtxn.TargetPrepared {
 			return ErrDurableRequestConflict
 		}
 		checked++
 		ordinal++
 	}
-	if err := progress.execution.Participants.Err(); err != nil {
+	if err := progress.execution.Targets.Err(); err != nil {
 		return err
 	}
 	if checked != completed {
@@ -492,7 +492,7 @@ func (progress *durableDistributedProgress) recoverPreparedPrefix(
 
 func (progress *durableDistributedProgress) decide(
 	ctx context.Context,
-	coordinator DurableRequestLogicalParticipant,
+	coordinator DurableRequestLogicalTarget,
 	route ReplicatedRoute,
 	decisionRevision uint64,
 ) error {
@@ -519,33 +519,33 @@ func (progress *durableDistributedProgress) decide(
 
 func (progress *durableDistributedProgress) finish(
 	ctx context.Context,
-	_ DurableRequestLogicalParticipant,
+	_ DurableRequestLogicalTarget,
 	coordinatorRoute ReplicatedRoute,
 ) error {
 	if progress.state.branch == durableDistributedUndecided {
 		return ErrDurableRequestConflict
 	}
-	if err := progress.execution.Participants.Reset(); err != nil {
+	if err := progress.execution.Targets.Reset(); err != nil {
 		return err
 	}
 	var ordinal uint32
-	for progress.execution.Participants.Next() {
-		logical := progress.execution.Participants.Current()
+	for progress.execution.Targets.Next() {
+		logical := progress.execution.Targets.Current()
 		route, _, err := progress.resolve(ctx, logical)
 		if err != nil {
 			return err
 		}
 		if progress.state.branch == durableDistributedAborted {
 			fence := distributedtxn.ReplicatedCommand{
-				Role:      distributedtxn.ReplicatedRoleParticipant,
-				Operation: distributedtxn.ReplicatedAbortReleaseParticipant,
+				Role:      distributedtxn.ReplicatedRoleTarget,
+				Operation: distributedtxn.ReplicatedAbortReleaseTarget,
 				ID:        progress.execution.Recipe.Identity.ID, ExpectedRevision: 0,
-				PayloadKind: distributedtxn.ReplicatedPayloadParticipantStage,
-				Participant: distributedtxn.ParticipantStage{
+				PayloadKind: distributedtxn.ReplicatedPayloadTargetStage,
+				Target: distributedtxn.TransactionTargetStage{
 					CoordinatorGroup:            distributedtxn.ID(coordinatorRoute.Group.GroupID),
 					CoordinatorShardIncarnation: distributedtxn.ID(coordinatorRoute.Group.ShardIncarnation),
 					CoordinatorAllocation:       coordinatorRoute.AllocationGeneration,
-					MutationDigest:              logical.MutationDigest, ParticipantOrdinal: ordinal,
+					MutationDigest:              logical.MutationDigest, TargetOrdinal: ordinal,
 				},
 			}
 			if _, err = progress.command(ctx, logical, route, fence, nil,
@@ -558,12 +558,12 @@ func (progress *durableDistributedProgress) finish(
 				return err
 			}
 		}
-		operation := distributedtxn.ReplicatedApplyReleaseParticipant
+		operation := distributedtxn.ReplicatedApplyReleaseTarget
 		if progress.state.branch == durableDistributedAborted {
-			operation = distributedtxn.ReplicatedAbortReleaseParticipant
+			operation = distributedtxn.ReplicatedAbortReleaseTarget
 		}
 		release := distributedtxn.ReplicatedCommand{
-			Role: distributedtxn.ReplicatedRoleParticipant, Operation: operation,
+			Role: distributedtxn.ReplicatedRoleTarget, Operation: operation,
 			ID: progress.execution.Recipe.Identity.ID, ExpectedRevision: 2,
 			PayloadKind: distributedtxn.ReplicatedPayloadNone,
 		}
@@ -586,12 +586,12 @@ func (progress *durableDistributedProgress) finish(
 		}
 		ordinal++
 	}
-	return errors.Join(progress.execution.Participants.Err())
+	return errors.Join(progress.execution.Targets.Err())
 }
 
 func (progress *durableDistributedProgress) retire(
 	ctx context.Context,
-	coordinator DurableRequestLogicalParticipant,
+	coordinator DurableRequestLogicalTarget,
 	route ReplicatedRoute,
 	decisionRevision uint64,
 ) error {
@@ -633,7 +633,7 @@ func (progress *durableDistributedProgress) result() ([]byte, error) {
 		Committed: committed, AffectedRows: progress.state.affected,
 		Transaction:       progress.execution.Recipe.Identity.ID,
 		CatalogGeneration: progress.execution.Recipe.CatalogGeneration,
-		ShardsFanned:      progress.execution.Recipe.ParticipantCount,
+		ShardsFanned:      progress.execution.Recipe.TargetCount,
 		TransitionTag:     transition, TerminalStateDigest: stateDigest,
 		TerminalContractDigest:  progress.execution.Recipe.Contract.TerminalContractDigest,
 		RetirementWitnessDigest: progress.execution.Recipe.Contract.RetirementWitnessDigest,
@@ -652,37 +652,37 @@ type durableDistributedProgress struct {
 
 func (progress *durableDistributedProgress) measureManifest(
 	ctx context.Context,
-) (distributedtxn.ManifestDescriptor, DurableRequestLogicalParticipant, ReplicatedRoute, error) {
-	if err := progress.execution.Participants.Reset(); err != nil {
-		return distributedtxn.ManifestDescriptor{}, DurableRequestLogicalParticipant{}, ReplicatedRoute{}, err
+) (distributedtxn.ManifestDescriptor, DurableRequestLogicalTarget, ReplicatedRoute, error) {
+	if err := progress.execution.Targets.Reset(); err != nil {
+		return distributedtxn.ManifestDescriptor{}, DurableRequestLogicalTarget{}, ReplicatedRoute{}, err
 	}
 	scratch := make([]byte, distributedtxn.ManifestSegmentBytes)
 	builder, err := distributedtxn.NewManifestBuilder(scratch, func(distributedtxn.ManifestSegment) error { return nil })
 	if err != nil {
-		return distributedtxn.ManifestDescriptor{}, DurableRequestLogicalParticipant{}, ReplicatedRoute{}, err
+		return distributedtxn.ManifestDescriptor{}, DurableRequestLogicalTarget{}, ReplicatedRoute{}, err
 	}
-	var coordinator DurableRequestLogicalParticipant
+	var coordinator DurableRequestLogicalTarget
 	var coordinatorRoute ReplicatedRoute
 	var ordinal uint64
-	for progress.execution.Participants.Next() {
-		logical := progress.execution.Participants.Current()
+	for progress.execution.Targets.Next() {
+		logical := progress.execution.Targets.Current()
 		route, ref, resolveErr := progress.resolve(ctx, logical)
 		if resolveErr != nil {
-			return distributedtxn.ManifestDescriptor{}, DurableRequestLogicalParticipant{}, ReplicatedRoute{}, resolveErr
+			return distributedtxn.ManifestDescriptor{}, DurableRequestLogicalTarget{}, ReplicatedRoute{}, resolveErr
 		}
 		if ordinal == uint64(progress.execution.Recipe.Identity.CoordinatorOrdinal) {
-			coordinator = cloneDurableLogicalParticipant(logical)
+			coordinator = cloneDurableLogicalTarget(logical)
 			coordinatorRoute = cloneDurableRequestRoute(route)
 		}
 		if err = builder.Append(ref); err != nil {
-			return distributedtxn.ManifestDescriptor{}, DurableRequestLogicalParticipant{}, ReplicatedRoute{}, err
+			return distributedtxn.ManifestDescriptor{}, DurableRequestLogicalTarget{}, ReplicatedRoute{}, err
 		}
 		ordinal++
 	}
-	if err = progress.execution.Participants.Err(); err != nil ||
-		!progress.execution.Participants.Complete() || ordinal != progress.execution.Recipe.ParticipantCount ||
+	if err = progress.execution.Targets.Err(); err != nil ||
+		!progress.execution.Targets.Complete() || ordinal != progress.execution.Recipe.TargetCount ||
 		coordinatorRoute.Group == (raftmember.GroupKey{}) {
-		return distributedtxn.ManifestDescriptor{}, DurableRequestLogicalParticipant{}, ReplicatedRoute{},
+		return distributedtxn.ManifestDescriptor{}, DurableRequestLogicalTarget{}, ReplicatedRoute{},
 			errors.Join(err, ErrDurableRequestConflict)
 	}
 	descriptor, err := builder.Seal()
@@ -692,10 +692,10 @@ func (progress *durableDistributedProgress) measureManifest(
 func (progress *durableDistributedProgress) beginManifest(
 	ctx context.Context,
 	descriptor distributedtxn.ManifestDescriptor,
-	coordinator DurableRequestLogicalParticipant,
+	coordinator DurableRequestLogicalTarget,
 	coordinatorRoute ReplicatedRoute,
 ) error {
-	if err := progress.execution.Participants.Reset(); err != nil {
+	if err := progress.execution.Targets.Reset(); err != nil {
 		return err
 	}
 	scratch := make([]byte, distributedtxn.ManifestSegmentBytes)
@@ -719,7 +719,7 @@ func (progress *durableDistributedProgress) beginManifest(
 			ID:          progress.execution.Recipe.Identity.ID,
 			PayloadKind: distributedtxn.ReplicatedPayloadManifestCoordinator,
 			Payload:     append(record, initial...),
-			Participant: progress.participantStage(coordinator, coordinatorRoute,
+			Target: progress.targetStage(coordinator, coordinatorRoute,
 				progress.execution.Recipe.Identity.CoordinatorOrdinal),
 		}
 		_, err = progress.command(ctx, coordinator, coordinatorRoute, control, coordinator.Batches,
@@ -779,8 +779,8 @@ func (progress *durableDistributedProgress) beginManifest(
 	if err != nil {
 		return err
 	}
-	for progress.execution.Participants.Next() {
-		_, ref, resolveErr := progress.resolve(ctx, progress.execution.Participants.Current())
+	for progress.execution.Targets.Next() {
+		_, ref, resolveErr := progress.resolve(ctx, progress.execution.Targets.Current())
 		if resolveErr != nil {
 			return resolveErr
 		}
@@ -788,7 +788,7 @@ func (progress *durableDistributedProgress) beginManifest(
 			return err
 		}
 	}
-	if err = progress.execution.Participants.Err(); err != nil {
+	if err = progress.execution.Targets.Err(); err != nil {
 		return err
 	}
 	got, err := builder.Seal()
@@ -803,7 +803,7 @@ func (progress *durableDistributedProgress) beginManifest(
 
 func (progress *durableDistributedProgress) command(
 	ctx context.Context,
-	logical DurableRequestLogicalParticipant,
+	logical DurableRequestLogicalTarget,
 	route ReplicatedRoute,
 	control distributedtxn.ReplicatedCommand,
 	batches []replication.RelationMutationBatch,
@@ -863,7 +863,7 @@ func (progress *durableDistributedProgress) command(
 	target := bytes.Clone(route.Group.GroupID[:])
 	wave := DurableRequestWave{
 		Home: progress.execution.Home, Key: progress.execution.Key.RequestKey,
-		Participant: logical, Identity: progress.execution.Recipe.Identity,
+		LogicalTarget: logical, Identity: progress.execution.Recipe.Identity,
 		Tenant:            progress.execution.Recipe.Tenant,
 		PinID:             progress.execution.Recipe.Contract.PinID,
 		GateEpoch:         lease.ControllerEpoch,
@@ -920,19 +920,19 @@ func (progress *durableDistributedProgress) command(
 
 func (progress *durableDistributedProgress) resolve(
 	ctx context.Context,
-	logical DurableRequestLogicalParticipant,
-) (ReplicatedRoute, distributedtxn.ParticipantRef, error) {
-	route, err := progress.runner.resolver.ResolveDurableRequestParticipant(ctx, logical)
+	logical DurableRequestLogicalTarget,
+) (ReplicatedRoute, distributedtxn.TransactionTargetRef, error) {
+	route, err := progress.runner.resolver.ResolveDurableRequestTarget(ctx, logical)
 	if err != nil {
-		return ReplicatedRoute{}, distributedtxn.ParticipantRef{}, err
+		return ReplicatedRoute{}, distributedtxn.TransactionTargetRef{}, err
 	}
-	if !durableRequestRouteMatchesParticipant(route, logical) ||
+	if !durableRequestRouteMatchesTarget(route, logical) ||
 		!distributedtxn.ValidateIntentScopes(logical.IntentScopes, logical.BucketBits) ||
 		logical.MutationDigest == (distributedtxn.Digest{}) {
-		return ReplicatedRoute{}, distributedtxn.ParticipantRef{}, ErrDurableRequestConflict
+		return ReplicatedRoute{}, distributedtxn.TransactionTargetRef{}, ErrDurableRequestConflict
 	}
 	route.membershipStable = progress.encoder.membershipStable
-	return route, distributedtxn.ParticipantRef{
+	return route, distributedtxn.TransactionTargetRef{
 		Distribution:         byteview.Bytes(string(route.Distribution)),
 		Shard:                byteview.Bytes(string(route.Shard)),
 		RoutingVersion:       route.Command.RoutingVersion,
@@ -940,21 +940,21 @@ func (progress *durableDistributedProgress) resolve(
 		OwnershipEpoch:       route.Command.OwnershipEpoch,
 		AuthorityWitness:     replicatedTransactionRouteAuthorityWitness(route, progress.encoder.membershipStable),
 		MutationDigest:       logical.MutationDigest,
-		State:                distributedtxn.ParticipantStaged,
+		State:                distributedtxn.TargetStaged,
 	}, nil
 }
 
-func (progress *durableDistributedProgress) participantStage(
-	logical DurableRequestLogicalParticipant,
+func (progress *durableDistributedProgress) targetStage(
+	logical DurableRequestLogicalTarget,
 	coordinator ReplicatedRoute,
 	ordinal uint32,
-) distributedtxn.ParticipantStage {
-	return distributedtxn.ParticipantStage{
+) distributedtxn.TransactionTargetStage {
+	return distributedtxn.TransactionTargetStage{
 		CoordinatorGroup:            distributedtxn.ID(coordinator.Group.GroupID),
 		CoordinatorShardIncarnation: distributedtxn.ID(coordinator.Group.ShardIncarnation),
 		CoordinatorAllocation:       coordinator.AllocationGeneration,
 		BucketBits:                  logical.BucketBits, IntentScopes: logical.IntentScopes,
-		MutationDigest: logical.MutationDigest, ParticipantOrdinal: ordinal,
+		MutationDigest: logical.MutationDigest, TargetOrdinal: ordinal,
 	}
 }
 
@@ -1039,7 +1039,7 @@ func openDurableDistributedState(raw []byte) (durableDistributedState, error) {
 	return state, nil
 }
 
-func cloneDurableLogicalParticipant(value DurableRequestLogicalParticipant) DurableRequestLogicalParticipant {
+func cloneDurableLogicalTarget(value DurableRequestLogicalTarget) DurableRequestLogicalTarget {
 	cloned := value
 	// The recipe reader lends names from its reusable participant frame too.
 	cloned.Distribution = distribution.DistributionName(strings.Clone(string(value.Distribution)))

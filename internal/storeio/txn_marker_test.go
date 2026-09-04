@@ -12,8 +12,8 @@ import (
 	"testing"
 )
 
-func testTxnParticipants(n int) []TxnParticipant {
-	out := make([]TxnParticipant, n)
+func testTxnCollectionRefs(n int) []TxnCollectionRef {
+	out := make([]TxnCollectionRef, n)
 	for i := range out {
 		for j := range out[i].StoreID {
 			out[i].StoreID[j] = byte(i + 1)
@@ -135,7 +135,7 @@ func TestTxnMarkerRecoveryAnchorRoundTrip(t *testing.T) {
 		t.Fatalf("reopened anchor = %+v decisions %+v", reopened.Header(), decisions)
 	}
 	sequence, err := reopened.AppendDecision(
-		anchor.BaseSequence+1, testTxnParticipants(1),
+		anchor.BaseSequence+1, testTxnCollectionRefs(1),
 	)
 	if err != nil || sequence != anchor.BaseSequence+1 {
 		t.Fatalf("first anchored decision sequence = %d, %v", sequence, err)
@@ -208,7 +208,7 @@ func TestTxnMarkerRecoveryAnchorTerminalBaseIsExhausted(t *testing.T) {
 			t.Fatalf("terminal anchor = next %d cursor %d retirement room %v",
 				marker.NextSequence(), marker.Cursor(), marker.FitsRetirement())
 		}
-		if sequence, appendErr := marker.AppendDecision(1, testTxnParticipants(1)); sequence != 0 || !errors.Is(appendErr, ErrTxnMarkerFull) {
+		if sequence, appendErr := marker.AppendDecision(1, testTxnCollectionRefs(1)); sequence != 0 || !errors.Is(appendErr, ErrTxnMarkerFull) {
 			t.Fatalf("terminal decision append = %d, %v", sequence, appendErr)
 		}
 		if sequence, appendErr := marker.AppendRetirement([16]byte{1}); sequence != 0 || !errors.Is(appendErr, ErrTxnMarkerFull) {
@@ -276,8 +276,8 @@ func TestTxnMarkerCreateOpenEmpty(t *testing.T) {
 
 func TestTxnMarkerDecisionRetirementRoundTrip(t *testing.T) {
 	m, path := createTestTxnMarker(t, 256*TxnMarkerMinSectorSize)
-	participants := testTxnParticipants(3)
-	dcsn, err := m.AppendDecision(11, participants)
+	targets := testTxnCollectionRefs(3)
+	dcsn, err := m.AppendDecision(11, targets)
 	if err != nil {
 		t.Fatalf("AppendDecision: %v", err)
 	}
@@ -307,12 +307,12 @@ func TestTxnMarkerDecisionRetirementRoundTrip(t *testing.T) {
 	if !ok {
 		t.Fatal("decision missing after reopen")
 	}
-	if len(got) != len(participants) {
-		t.Fatalf("participants = %d, want %d", len(got), len(participants))
+	if len(got) != len(targets) {
+		t.Fatalf("participants = %d, want %d", len(got), len(targets))
 	}
-	for i := range participants {
-		if got[i] != participants[i] {
-			t.Fatalf("participant %d = %+v, want %+v", i, got[i], participants[i])
+	for i := range targets {
+		if got[i] != targets[i] {
+			t.Fatalf("participant %d = %+v, want %+v", i, got[i], targets[i])
 		}
 	}
 	if !decisions.Retired(retired) {
@@ -324,7 +324,7 @@ func TestTxnMarkerDecisionRetirementRoundTrip(t *testing.T) {
 	if m.NextSequence() != 3 {
 		t.Fatalf("next sequence = %d, want 3", m.NextSequence())
 	}
-	dcsn2, err := m.AppendDecision(12, testTxnParticipants(1))
+	dcsn2, err := m.AppendDecision(12, testTxnCollectionRefs(1))
 	if err != nil {
 		t.Fatalf("second AppendDecision: %v", err)
 	}
@@ -344,7 +344,7 @@ func TestTxnMarkerShortWriteDoesNotAdvanceAppendState(t *testing.T) {
 		return len(p) - 1, nil
 	}
 	if _, err := m.AppendDecision(
-		17, testTxnParticipants(1),
+		17, testTxnCollectionRefs(1),
 	); !errors.Is(err, io.ErrShortWrite) {
 		t.Fatalf("short AppendDecision = %v, want io.ErrShortWrite", err)
 	}
@@ -360,7 +360,7 @@ func TestTxnMarkerShortWriteDoesNotAdvanceAppendState(t *testing.T) {
 	// The failed ID remains a valid strict successor; retrying it through the
 	// real writer must consume the original sequence exactly once.
 	m.writeAt = writeAt
-	dcsn, err := m.AppendDecision(17, testTxnParticipants(1))
+	dcsn, err := m.AppendDecision(17, testTxnCollectionRefs(1))
 	if err != nil || dcsn != beforeSequence {
 		t.Fatalf("retry AppendDecision = dcsn %d, err %v", dcsn, err)
 	}
@@ -370,7 +370,7 @@ func TestTxnDecisionsRangeSparseTxnIDs(t *testing.T) {
 	m, path := createTestTxnMarker(t, 64*TxnMarkerMinSectorSize)
 	const sparseTxnID = uint64(1) << 60
 	for _, txnID := range []uint64{7, sparseTxnID} {
-		if _, err := m.AppendDecision(txnID, testTxnParticipants(1)); err != nil {
+		if _, err := m.AppendDecision(txnID, testTxnCollectionRefs(1)); err != nil {
 			t.Fatalf("AppendDecision(%d): %v", txnID, err)
 		}
 	}
@@ -384,9 +384,9 @@ func TestTxnDecisionsRangeSparseTxnIDs(t *testing.T) {
 	m, decisions := reopenTestTxnMarker(t, path)
 	defer m.Close()
 	var got []uint64
-	decisions.RangeDecisions(func(txnID uint64, participants []TxnParticipant) bool {
-		if len(participants) != 1 {
-			t.Fatalf("txn %d participants = %d, want 1", txnID, len(participants))
+	decisions.RangeDecisions(func(txnID uint64, targets []TxnCollectionRef) bool {
+		if len(targets) != 1 {
+			t.Fatalf("txn %d participants = %d, want 1", txnID, len(targets))
 		}
 		got = append(got, txnID)
 		return true
@@ -397,9 +397,9 @@ func TestTxnDecisionsRangeSparseTxnIDs(t *testing.T) {
 }
 
 func TestTxnMarkerSequenceRejection(t *testing.T) {
-	participants := testTxnParticipants(1)
+	targets := testTxnCollectionRefs(1)
 	buf := make([]byte, 2*TxnMarkerMinSectorSize)
-	n, err := encodeTxnDecisionRecord(buf, 5, 1, participants)
+	n, err := encodeTxnDecisionRecord(buf, 5, 1, targets)
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
@@ -416,7 +416,7 @@ func TestTxnMarkerSequenceRejection(t *testing.T) {
 
 func TestTxnMarkerRecycleSelectsGreaterRecycleCount(t *testing.T) {
 	m, path := createTestTxnMarker(t, 64*TxnMarkerMinSectorSize)
-	if _, err := m.AppendDecision(1, testTxnParticipants(1)); err != nil {
+	if _, err := m.AppendDecision(1, testTxnCollectionRefs(1)); err != nil {
 		t.Fatalf("AppendDecision: %v", err)
 	}
 	if err := m.Sync(); err != nil {
@@ -430,7 +430,7 @@ func TestTxnMarkerRecycleSelectsGreaterRecycleCount(t *testing.T) {
 		m.Header().MarkerID != beforeID || m.Cursor() != 0 {
 		t.Fatalf("recycled header = %+v cursor=%d", m.Header(), m.Cursor())
 	}
-	if _, err := m.AppendDecision(9, testTxnParticipants(1)); err != nil {
+	if _, err := m.AppendDecision(9, testTxnCollectionRefs(1)); err != nil {
 		t.Fatalf("post-recycle AppendDecision: %v", err)
 	}
 	if err := m.Sync(); err != nil {
@@ -503,7 +503,7 @@ func TestTxnMarkerRecycleCountExhaustionFailsBeforeMutation(t *testing.T) {
 func TestTxnMarkerTornRecycleFallsBack(t *testing.T) {
 	m, path := createTestTxnMarker(t, 64*TxnMarkerMinSectorSize)
 	fm := NewFaultTxnMarker(m)
-	if _, err := m.AppendDecision(1, testTxnParticipants(1)); err != nil {
+	if _, err := m.AppendDecision(1, testTxnCollectionRefs(1)); err != nil {
 		t.Fatalf("AppendDecision: %v", err)
 	}
 	if err := m.Sync(); err != nil {
@@ -536,7 +536,7 @@ func TestTxnMarkerTornRecycleFallsBack(t *testing.T) {
 func TestTxnMarkerRecoveryRecycleAnchorsSelectedBase(t *testing.T) {
 	m, path := createTestTxnMarker(t, 64*TxnMarkerMinSectorSize)
 	for txnID := uint64(1); txnID <= 2; txnID++ {
-		if _, err := m.AppendDecision(txnID, testTxnParticipants(1)); err != nil {
+		if _, err := m.AppendDecision(txnID, testTxnCollectionRefs(1)); err != nil {
 			t.Fatalf("AppendDecision(%d): %v", txnID, err)
 		}
 	}
@@ -574,7 +574,7 @@ func TestTxnMarkerRecoveryRecycleAnchorsSelectedBase(t *testing.T) {
 
 func TestTxnMarkerRecoveryRecycleInvalidatesEqualBaseSuffix(t *testing.T) {
 	m, path := createTestTxnMarker(t, 64*TxnMarkerMinSectorSize)
-	if _, err := m.AppendDecision(1, testTxnParticipants(1)); err != nil {
+	if _, err := m.AppendDecision(1, testTxnCollectionRefs(1)); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.Sync(); err != nil {
@@ -614,7 +614,7 @@ func TestTxnMarkerRecoveryRecycleInvalidatesEqualBaseSuffix(t *testing.T) {
 			decisions.MaxDCSN(), decisions.MaxTxnID(), m.Cursor(),
 		)
 	}
-	if dcsn, err := m.AppendDecision(1, testTxnParticipants(1)); err != nil || dcsn != 1 {
+	if dcsn, err := m.AppendDecision(1, testTxnCollectionRefs(1)); err != nil || dcsn != 1 {
 		_ = m.Close()
 		t.Fatalf("post-recovery decision = dcsn %d err %v", dcsn, err)
 	}
@@ -669,7 +669,7 @@ func TestTxnMarkerRecoveryInvalidateCrashCuts(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			m, path := createTestTxnMarker(t, 64*TxnMarkerMinSectorSize)
-			if _, err := m.AppendDecision(1, testTxnParticipants(1)); err != nil {
+			if _, err := m.AppendDecision(1, testTxnCollectionRefs(1)); err != nil {
 				t.Fatal(err)
 			}
 			if err := m.Sync(); err != nil {
@@ -729,7 +729,7 @@ func TestTxnMarkerRecoveryInvalidateCrashCuts(t *testing.T) {
 				_ = m.Close()
 				t.Fatalf("retried recovery state = cursor %d next %d", m.Cursor(), m.NextSequence())
 			}
-			if dcsn, err := m.AppendDecision(1, testTxnParticipants(1)); err != nil || dcsn != 1 {
+			if dcsn, err := m.AppendDecision(1, testTxnCollectionRefs(1)); err != nil || dcsn != 1 {
 				_ = m.Close()
 				t.Fatalf("post-crash recovery decision = dcsn %d err %v", dcsn, err)
 			}
@@ -747,7 +747,7 @@ func TestTxnMarkerRecoveryInvalidateCrashCuts(t *testing.T) {
 
 func TestTxnMarkerRecoveryAnchorRefusalsAreSideEffectFree(t *testing.T) {
 	m, path := createTestTxnMarker(t, 64*TxnMarkerMinSectorSize)
-	if _, err := m.AppendDecision(1, testTxnParticipants(1)); err != nil {
+	if _, err := m.AppendDecision(1, testTxnCollectionRefs(1)); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.Sync(); err != nil {
@@ -756,7 +756,7 @@ func TestTxnMarkerRecoveryAnchorRefusalsAreSideEffectFree(t *testing.T) {
 	if err := m.Recycle(m.Header().Epoch + 1); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.AppendDecision(2, testTxnParticipants(1)); err != nil {
+	if _, err := m.AppendDecision(2, testTxnCollectionRefs(1)); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.Sync(); err != nil {
@@ -867,10 +867,10 @@ func TestTxnMarkerRecoveryAnchorRefusalsAreSideEffectFree(t *testing.T) {
 
 func TestTxnMarkerTornTailBytePrefixSweep(t *testing.T) {
 	m, path := createTestTxnMarker(t, 256*TxnMarkerMinSectorSize)
-	if _, err := m.AppendDecision(1, testTxnParticipants(2)); err != nil {
+	if _, err := m.AppendDecision(1, testTxnCollectionRefs(2)); err != nil {
 		t.Fatalf("first AppendDecision: %v", err)
 	}
-	if _, err := m.AppendDecision(2, testTxnParticipants(3)); err != nil {
+	if _, err := m.AppendDecision(2, testTxnCollectionRefs(3)); err != nil {
 		t.Fatalf("second AppendDecision: %v", err)
 	}
 	if err := m.Sync(); err != nil {
@@ -936,7 +936,7 @@ func TestTxnMarkerTornTailBytePrefixSweep(t *testing.T) {
 		}
 		if _, ok := decisions.Lookup(opened.Header().MarkerID, opened.Header().Epoch, 2); ok {
 			secondLogical := TxnMarkerRecordPrefixSize +
-				3*TxnParticipantSize + TxnMarkerRecordTrailerSize
+				3*TxnCollectionRefSize + TxnMarkerRecordTrailerSize
 			need := txnMarkerRegionStart + firstPadded + secondLogical
 			if size < need {
 				opened.Close()
@@ -1005,7 +1005,7 @@ func TestTxnMarkerFaultSeamPhases(t *testing.T) {
 	t.Run("torn-append", func(t *testing.T) {
 		m, path := createTestTxnMarker(t, 64*TxnMarkerMinSectorSize)
 		fm := NewFaultTxnMarker(m)
-		if _, err := m.AppendDecision(1, testTxnParticipants(1)); err != nil {
+		if _, err := m.AppendDecision(1, testTxnCollectionRefs(1)); err != nil {
 			t.Fatalf("clean append: %v", err)
 		}
 		if err := m.Sync(); err != nil {
@@ -1015,7 +1015,7 @@ func TestTxnMarkerFaultSeamPhases(t *testing.T) {
 		beforeCursor, beforeSequence, beforeTxnID :=
 			m.Cursor(), m.NextSequence(), m.lastTxnID
 		if _, err := m.AppendDecision(
-			2, testTxnParticipants(1),
+			2, testTxnCollectionRefs(1),
 		); !errors.Is(err, io.ErrShortWrite) {
 			t.Fatalf("torn append = %v, want io.ErrShortWrite", err)
 		}
@@ -1046,7 +1046,7 @@ func TestTxnMarkerFaultSeamPhases(t *testing.T) {
 		fm := NewFaultTxnMarker(m)
 		fm.Program(TxnMarkerFaultPlan{Phase: TxnMarkerFaultAppendError, AppendIndex: 0})
 		before := m.Cursor()
-		_, err := m.AppendDecision(1, testTxnParticipants(1))
+		_, err := m.AppendDecision(1, testTxnCollectionRefs(1))
 		if !errors.Is(err, syscall.EIO) {
 			t.Fatalf("append error = %v, want EIO", err)
 		}
@@ -1060,7 +1060,7 @@ func TestTxnMarkerFaultSeamPhases(t *testing.T) {
 		defer m.Close()
 		fm := NewFaultTxnMarker(m)
 		fm.Program(TxnMarkerFaultPlan{Phase: TxnMarkerFaultENOSPCAppend, AppendIndex: 0})
-		_, err := m.AppendDecision(1, testTxnParticipants(1))
+		_, err := m.AppendDecision(1, testTxnCollectionRefs(1))
 		if !errors.Is(err, syscall.ENOSPC) {
 			t.Fatalf("append error = %v, want ENOSPC", err)
 		}
@@ -1073,7 +1073,7 @@ func TestTxnMarkerFaultSeamPhases(t *testing.T) {
 		m, _ := createTestTxnMarker(t, 64*TxnMarkerMinSectorSize)
 		defer m.Close()
 		fm := NewFaultTxnMarker(m)
-		if _, err := m.AppendDecision(1, testTxnParticipants(1)); err != nil {
+		if _, err := m.AppendDecision(1, testTxnCollectionRefs(1)); err != nil {
 			t.Fatalf("AppendDecision: %v", err)
 		}
 		fm.Program(TxnMarkerFaultPlan{Phase: TxnMarkerFaultSyncError, SyncIndex: 0})
@@ -1175,7 +1175,7 @@ func TestTxnMarkerFull(t *testing.T) {
 	defer m.Close()
 	appended := 0
 	for {
-		_, err := m.AppendDecision(uint64(appended+1), testTxnParticipants(1))
+		_, err := m.AppendDecision(uint64(appended+1), testTxnCollectionRefs(1))
 		if errors.Is(err, ErrTxnMarkerFull) {
 			break
 		}
@@ -1187,7 +1187,7 @@ func TestTxnMarkerFull(t *testing.T) {
 	if appended == 0 {
 		t.Fatal("capacity too small to append any decision")
 	}
-	if _, err := m.AppendDecision(uint64(appended+1), testTxnParticipants(1)); !errors.Is(err, ErrTxnMarkerFull) {
+	if _, err := m.AppendDecision(uint64(appended+1), testTxnCollectionRefs(1)); !errors.Is(err, ErrTxnMarkerFull) {
 		t.Fatalf("full append = %v, want ErrTxnMarkerFull", err)
 	}
 }

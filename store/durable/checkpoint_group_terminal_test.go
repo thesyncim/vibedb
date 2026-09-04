@@ -476,7 +476,7 @@ func TestCheckpointGroupAlignedTerminalRecoveryFoldsCertifiedSuffixOnce(t *testi
 	checkpointGroupTestRequireTerminalReopenSucceeds(t, damaged)
 }
 
-func TestCheckpointGroupParticipantTerminalAdmissionIsSideEffectFree(t *testing.T) {
+func TestCheckpointGroupTargetTerminalAdmissionIsSideEffectFree(t *testing.T) {
 	t.Run("declared-dirty-recycle-count", func(t *testing.T) {
 		dir, members, log, group := newCheckpointGroupTestStore(t, 8)
 		checkpointGroupPut(t, group, 1, members[1:], "dirty-terminal-member")
@@ -488,7 +488,7 @@ func TestCheckpointGroupParticipantTerminalAdmissionIsSideEffectFree(t *testing.
 				header.RecycleCount = math.MaxUint64
 			},
 		)
-		checkpointGroupTestRequireRejectedParticipantUpdate(
+		checkpointGroupTestRequireRejectedTargetUpdate(
 			t, dir, group, log, members[1:], 2,
 		)
 	})
@@ -503,7 +503,7 @@ func TestCheckpointGroupParticipantTerminalAdmissionIsSideEffectFree(t *testing.
 				header.BaseSequence = math.MaxUint64
 			},
 		)
-		checkpointGroupTestRequireRejectedParticipantUpdate(
+		checkpointGroupTestRequireRejectedTargetUpdate(
 			t, dir, group, log, members[:1], 1,
 		)
 	})
@@ -517,7 +517,7 @@ func TestCheckpointGroupParticipantTerminalAdmissionIsSideEffectFree(t *testing.
 		if got := collection.Generation(); got != fileLogicalCutGenerationMask {
 			t.Fatalf("terminal fixture generation = %d", got)
 		}
-		checkpointGroupTestRequireRejectedParticipantUpdate(
+		checkpointGroupTestRequireRejectedTargetUpdate(
 			t, dir, group, log, members[:1], 1,
 		)
 	})
@@ -566,7 +566,7 @@ func TestCheckpointGroupParticipantTerminalAdmissionIsSideEffectFree(t *testing.
 		checkpointGroupTestSetVisibleGeneration(
 			t, members[0].Collection, fileLogicalCutGenerationMask-budget+1,
 		)
-		checkpointGroupTestRequireRejectedParticipantUpdate(
+		checkpointGroupTestRequireRejectedTargetUpdate(
 			t, dir, group, log, members[:1], 1,
 		)
 	})
@@ -625,7 +625,7 @@ func TestCheckpointGroupParticipantTerminalAdmissionIsSideEffectFree(t *testing.
 				header.RecycleCount = math.MaxUint64 - budget + 1
 			},
 		)
-		checkpointGroupTestRequireRejectedParticipantUpdate(
+		checkpointGroupTestRequireRejectedTargetUpdate(
 			t, dir, group, log, members[:1], 1,
 		)
 	})
@@ -641,13 +641,13 @@ func TestCheckpointGroupParticipantTerminalAdmissionIsSideEffectFree(t *testing.
 				header.RecycleCount = math.MaxUint64 - 1
 			},
 		)
-		checkpointGroupTestRequireRejectedParticipantUpdate(
+		checkpointGroupTestRequireRejectedTargetUpdate(
 			t, dir, group, log, members[:1], 2,
 		)
 	})
 }
 
-func TestCheckpointGroupParticipantTopologyGenerationTerminalAdmission(t *testing.T) {
+func TestCheckpointGroupTargetTopologyGenerationTerminalAdmission(t *testing.T) {
 	// Prove this exact fresh-store workload takes the content-equivalent topology
 	// path under the same fixed collection profile.
 	_, controlMembers, _, control := newCheckpointGroupTestStore(t, 8)
@@ -704,7 +704,7 @@ func TestCheckpointGroupParticipantTopologyGenerationTerminalAdmission(t *testin
 	}
 }
 
-func TestCheckpointGroupSeedParticipantTerminalAdmissionIsSideEffectFree(t *testing.T) {
+func TestCheckpointGroupSeedTargetTerminalAdmissionIsSideEffectFree(t *testing.T) {
 	for _, test := range []struct {
 		name   string
 		mutate func(testing.TB, *CheckpointGroup, *Collection)
@@ -780,7 +780,7 @@ func TestCheckpointGroupSeedParticipantTerminalAdmissionIsSideEffectFree(t *test
 	}
 }
 
-func TestCheckpointGroupParticipantFinalDCSNCanBeCertifiedAndFolded(t *testing.T) {
+func TestCheckpointGroupTargetFinalDCSNCanBeCertifiedAndFolded(t *testing.T) {
 	dir, members, log, group := newCheckpointGroupTestStore(t, 8)
 	checkpointGroupTestRewriteLiveJournalHeader(
 		t,
@@ -809,7 +809,7 @@ func TestCheckpointGroupParticipantFinalDCSNCanBeCertifiedAndFolded(t *testing.T
 			terminal.Header().BaseSequence, terminal.NextSequence(), terminal.Cursor(),
 		)
 	}
-	checkpointGroupTestRequireRejectedParticipantUpdate(
+	checkpointGroupTestRequireRejectedTargetUpdate(
 		t, dir, group, log, members[:1], 2,
 	)
 
@@ -829,7 +829,7 @@ func TestCheckpointGroupParticipantFinalDCSNCanBeCertifiedAndFolded(t *testing.T
 	}
 }
 
-func TestCheckpointGroupParticipantRecycleTerminalCheckpointRefusesBeforeMutation(t *testing.T) {
+func TestCheckpointGroupTargetRecycleTerminalCheckpointRefusesBeforeMutation(t *testing.T) {
 	dir, members, log, group := newCheckpointGroupTestStore(t, 8)
 	checkpointGroupPut(t, group, 1, members[:1], "dirty")
 	checkpointGroupTestRewriteLiveJournalHeader(
@@ -869,7 +869,7 @@ func TestCheckpointGroupParticipantRecycleTerminalCheckpointRefusesBeforeMutatio
 	)
 }
 
-func TestCheckpointGroupParticipantRecycleTerminalRecoveryRefusesBeforeMutation(t *testing.T) {
+func TestCheckpointGroupTargetRecycleTerminalRecoveryRefusesBeforeMutation(t *testing.T) {
 	dir, members, _, group := newCheckpointGroupTestStore(t, 8)
 	checkpointGroupPut(t, group, 1, members[:1], "dirty")
 	crashImage := copyCheckpointGroupDirectory(t, dir)
@@ -959,7 +959,7 @@ func TestCheckpointGroupRecoveryGenerationBudgetRefusesBeforeMemberReplay(t *tes
 	requireCheckpointGroupDirectoryBytes(t, crashImage, beforeDirectory)
 }
 
-func TestCheckpointGroupCleanTerminalParticipantRecovery(t *testing.T) {
+func TestCheckpointGroupCleanTerminalTargetRecovery(t *testing.T) {
 	for _, test := range []struct {
 		name      string
 		mutate    func(*storeio.RecoveryJournalHeader)
@@ -993,7 +993,7 @@ func TestCheckpointGroupCleanTerminalParticipantRecovery(t *testing.T) {
 				{Name: "system", Collection: collections[0]},
 				{Name: "user", Collection: collections[1]},
 			}
-			checkpointGroupTestRequireRejectedParticipantUpdate(
+			checkpointGroupTestRequireRejectedTargetUpdate(
 				t, reopenedDir, group, log, members[:1], 1,
 			)
 			if test.cleanNoop {
@@ -1039,7 +1039,7 @@ func TestCheckpointGroupCleanTerminalParticipantRecovery(t *testing.T) {
 	}
 }
 
-func checkpointGroupTestRequireRejectedParticipantUpdate(
+func checkpointGroupTestRequireRejectedTargetUpdate(
 	t testing.TB,
 	dir string,
 	group *CheckpointGroup,

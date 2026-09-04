@@ -12,7 +12,7 @@ import (
 )
 
 // The transaction decision log (txn.vtm) is a database-scoped sidecar that
-// records cross-collection commit decisions and participant retirements. It is
+// records cross-collection commit decisions and target retirements. It is
 // a sibling of the recovery journal: two alternating, independently checksummed
 // 512-byte header sectors, a fixed-capacity preallocated record region,
 // positional sector-aligned appends, strict sequence validation, and torn-tail
@@ -26,7 +26,7 @@ import (
 // valid-empty log, or ErrTxnMarkerNoValidHeader. Policy over that residue
 // (fresh creation versus fail-closed) belongs to the durable layer, not this package.
 //
-// Recycle legality ("no participant journal still holds current-epoch kind-4
+// Recycle legality ("no target journal still holds current-epoch kind-4
 // records") is also the caller's rule; this package only provides Recycle.
 const (
 	// TxnMarkerHeaderSize is one damage-granule-aligned header sector.
@@ -39,7 +39,7 @@ const (
 	TxnMarkerMinSectorSize = 512
 	// TxnMarkerMaxCapacityBytes is the independent decision-log clamp. It does
 	// not inherit recovery-journal envelope overhead: decision records have their
-	// own fixed participant ceiling, and a checksummed hostile header must not
+	// own fixed target ceiling, and a checksummed hostile header must not
 	// gain allocation authority when the recovery-journal bound changes.
 	TxnMarkerMaxCapacityBytes = uint64(16) << 20
 	// txnMarkerDefaultCapacityBytes is the create-time default record region.
@@ -66,12 +66,12 @@ const (
 	TxnMarkerRecordPrefixSize = 32
 	// TxnMarkerRecordTrailerSize is the CRC32C and its complement.
 	TxnMarkerRecordTrailerSize = 8
-	// TxnParticipantSize is the fixed on-disk participant tuple.
-	TxnParticipantSize = 40
+	// TxnCollectionRefSize is the fixed on-disk target tuple.
+	TxnCollectionRefSize = 40
 
-	// TxnMarkerMaxParticipants is the hard encode-time participant ceiling for
+	// TxnMarkerMaxCollections is the hard encode-time target ceiling for
 	// one decision record. Durable TxnLimits.MaxCollections is capped by this.
-	TxnMarkerMaxParticipants = 64
+	TxnMarkerMaxCollections = 64
 )
 
 var (
@@ -139,8 +139,8 @@ type TxnMarkerHeader struct {
 	RecycleCount uint64
 }
 
-// TxnParticipant is one collection named by a committed decision.
-type TxnParticipant struct {
+// TxnCollectionRef is one collection named by a committed decision.
+type TxnCollectionRef struct {
 	StoreID            [16]byte
 	JournalID          [16]byte
 	PreparedGeneration uint64
@@ -224,7 +224,7 @@ func (i *TxnMarkerInspection) Close() error {
 	return err
 }
 
-// TxnDecisions is the scan of one open decision log: committed participant
+// TxnDecisions is the scan of one open decision log: committed target
 // sets keyed by TxnID within the selected header's epoch, the retired StoreID
 // set, and the high-water TxnID / DCSN for counter seeding.
 type TxnDecisions struct {
@@ -232,7 +232,7 @@ type TxnDecisions struct {
 	sourceDirInfo os.FileInfo
 	markerID      [16]byte
 	epoch         uint64
-	decisions     map[uint64][]TxnParticipant
+	decisions     map[uint64][]TxnCollectionRef
 	decisionIDs   []uint64
 	retired       map[[16]byte]struct{}
 	maxTxnID      uint64
@@ -240,16 +240,16 @@ type TxnDecisions struct {
 }
 
 // RangeDecisions visits committed decisions in authenticated record order.
-// Each participant slice is a defensive copy. Returning false stops iteration.
+// Each target slice is a defensive copy. Returning false stops iteration.
 func (d *TxnDecisions) RangeDecisions(
-	visit func(txnID uint64, participants []TxnParticipant) bool,
+	visit func(txnID uint64, targets []TxnCollectionRef) bool,
 ) {
 	if d == nil || visit == nil {
 		return
 	}
 	for _, txnID := range d.decisionIDs {
-		participants := append([]TxnParticipant(nil), d.decisions[txnID]...)
-		if !visit(txnID, participants) {
+		targets := append([]TxnCollectionRef(nil), d.decisions[txnID]...)
+		if !visit(txnID, targets) {
 			return
 		}
 	}
@@ -356,26 +356,26 @@ func (d *TxnDecisions) MaxDCSN() uint64 {
 	return d.maxDCSN
 }
 
-// Lookup reports the committed participant set for (markerID, epoch, txnID).
+// Lookup reports the committed target set for (markerID, epoch, txnID).
 // A mismatched marker identity or epoch returns false — the record is not
 // authoritative for that key.
 func (d *TxnDecisions) Lookup(
 	markerID [16]byte, epoch, txnID uint64,
-) ([]TxnParticipant, bool) {
+) ([]TxnCollectionRef, bool) {
 	if d == nil || d.decisions == nil ||
 		markerID != d.markerID || epoch != d.epoch {
 		return nil, false
 	}
-	participants, ok := d.decisions[txnID]
+	targets, ok := d.decisions[txnID]
 	if !ok {
 		return nil, false
 	}
-	out := make([]TxnParticipant, len(participants))
-	copy(out, participants)
+	out := make([]TxnCollectionRef, len(targets))
+	copy(out, targets)
 	return out, true
 }
 
-// Retired reports whether a participant-retired record covers storeID.
+// Retired reports whether a target-retired record covers storeID.
 func (d *TxnDecisions) Retired(storeID [16]byte) bool {
 	if d == nil || d.retired == nil {
 		return false
@@ -384,7 +384,7 @@ func (d *TxnDecisions) Retired(storeID [16]byte) bool {
 	return ok
 }
 
-// RetirementCount reports how many participant-retirement records survived
+// RetirementCount reports how many target-retirement records survived
 // the selected marker epoch. Fixed-membership checkpoint groups reject any
 // such record; ordinary transaction recovery retains its existing semantics.
 func (d *TxnDecisions) RetirementCount() int {
@@ -419,12 +419,12 @@ func checkedTxnMarkerPadRaw(raw uint64) (int, bool) {
 	return checkedRecoveryPadRaw(TxnMarkerMinSectorSize, raw)
 }
 
-func checkedTxnDecisionPaddedSize(participantCount int) (int, bool) {
-	if participantCount <= 0 || participantCount > TxnMarkerMaxParticipants {
+func checkedTxnDecisionPaddedSize(targetCount int) (int, bool) {
+	if targetCount <= 0 || targetCount > TxnMarkerMaxCollections {
 		return 0, false
 	}
 	body, ok := checkedSizeMul(
-		uint64(participantCount), TxnParticipantSize, uint64(maxIntValue),
+		uint64(targetCount), TxnCollectionRefSize, uint64(maxIntValue),
 	)
 	if !ok {
 		return 0, false
@@ -438,10 +438,10 @@ func checkedTxnDecisionPaddedSize(participantCount int) (int, bool) {
 }
 
 // TxnDecisionRecordPaddedSize returns the exact current record-region charge
-// for one transaction decision. A false result means the participant count is
+// for one transaction decision. A false result means the target count is
 // outside the current grammar.
-func TxnDecisionRecordPaddedSize(participantCount int) (int, bool) {
-	return checkedTxnDecisionPaddedSize(participantCount)
+func TxnDecisionRecordPaddedSize(targetCount int) (int, bool) {
+	return checkedTxnDecisionPaddedSize(targetCount)
 }
 
 func checkedTxnRetirementPaddedSize() (int, bool) {
@@ -530,19 +530,19 @@ func txnMarkerHeaderAuthenticated(src []byte) bool {
 		PageChecksum(src[:TxnMarkerHeaderSize-8]) == checksum
 }
 
-func validateTxnParticipants(participants []TxnParticipant) error {
-	if len(participants) == 0 || len(participants) > TxnMarkerMaxParticipants {
+func validateTxnCollectionRefs(targets []TxnCollectionRef) error {
+	if len(targets) == 0 || len(targets) > TxnMarkerMaxCollections {
 		return fmt.Errorf("%w: participant count", ErrInvalidWrite)
 	}
-	for i := range participants {
-		if participants[i].StoreID == ([16]byte{}) ||
-			participants[i].JournalID == ([16]byte{}) ||
-			participants[i].PreparedGeneration == 0 {
+	for i := range targets {
+		if targets[i].StoreID == ([16]byte{}) ||
+			targets[i].JournalID == ([16]byte{}) ||
+			targets[i].PreparedGeneration == 0 {
 			return fmt.Errorf("%w: participant identity or generation", ErrInvalidWrite)
 		}
 		for previous := 0; previous < i; previous++ {
-			if participants[previous].StoreID == participants[i].StoreID ||
-				participants[previous].JournalID == participants[i].JournalID {
+			if targets[previous].StoreID == targets[i].StoreID ||
+				targets[previous].JournalID == targets[i].JournalID {
 				return fmt.Errorf("%w: duplicate participant identity", ErrInvalidWrite)
 			}
 		}
@@ -551,15 +551,14 @@ func validateTxnParticipants(participants []TxnParticipant) error {
 }
 
 func encodeTxnDecisionRecord(
-	dst []byte, sequence, txnID uint64, participants []TxnParticipant,
-) (int, error) {
+	dst []byte, sequence, txnID uint64, targets []TxnCollectionRef) (int, error) {
 	if sequence == 0 || txnID == 0 {
 		return 0, fmt.Errorf("%w: zero sequence or txn id", ErrInvalidWrite)
 	}
-	if err := validateTxnParticipants(participants); err != nil {
+	if err := validateTxnCollectionRefs(targets); err != nil {
 		return 0, err
 	}
-	padded, ok := checkedTxnDecisionPaddedSize(len(participants))
+	padded, ok := checkedTxnDecisionPaddedSize(len(targets))
 	if !ok {
 		return 0, fmt.Errorf("%w: decision record length", ErrInvalidWrite)
 	}
@@ -575,15 +574,15 @@ func encodeTxnDecisionRecord(
 	binary.LittleEndian.PutUint16(buf[4:6], TxnMarkerRecordKindDecision)
 	binary.LittleEndian.PutUint64(buf[8:16], sequence)
 	binary.LittleEndian.PutUint64(buf[16:24], txnID)
-	binary.LittleEndian.PutUint32(buf[24:28], uint32(len(participants)))
+	binary.LittleEndian.PutUint32(buf[24:28], uint32(len(targets)))
 	cursor := TxnMarkerRecordPrefixSize
-	for i := range participants {
-		copy(buf[cursor:cursor+16], participants[i].StoreID[:])
-		copy(buf[cursor+16:cursor+32], participants[i].JournalID[:])
+	for i := range targets {
+		copy(buf[cursor:cursor+16], targets[i].StoreID[:])
+		copy(buf[cursor+16:cursor+32], targets[i].JournalID[:])
 		binary.LittleEndian.PutUint64(
-			buf[cursor+32:cursor+40], participants[i].PreparedGeneration,
+			buf[cursor+32:cursor+40], targets[i].PreparedGeneration,
 		)
-		cursor += TxnParticipantSize
+		cursor += TxnCollectionRefSize
 	}
 	checksum := PageChecksum(buf[:cursor])
 	binary.LittleEndian.PutUint32(buf[cursor:cursor+4], checksum)
@@ -628,11 +627,11 @@ func encodeTxnRetirementRecord(
 
 // txnMarkerRecord is one decoded decision-log record used while scanning.
 type txnMarkerRecord struct {
-	Sequence     uint64
-	Kind         uint16
-	TxnID        uint64
-	Participants []TxnParticipant
-	StoreID      [16]byte
+	Sequence uint64
+	Kind     uint16
+	TxnID    uint64
+	Targets  []TxnCollectionRef
+	StoreID  [16]byte
 }
 
 func decodeTxnMarkerRecord(
@@ -726,12 +725,12 @@ func txnMarkerRecordHasAuthenticatedDecisionLayout(src []byte) bool {
 	if len(src) < TxnMarkerRecordPrefixSize+TxnMarkerRecordTrailerSize {
 		return false
 	}
-	participantCount := binary.LittleEndian.Uint32(src[24:28])
-	if participantCount == 0 {
+	targetCount := binary.LittleEndian.Uint32(src[24:28])
+	if targetCount == 0 {
 		return false
 	}
 	body, ok := checkedSizeMul(
-		uint64(participantCount), TxnParticipantSize, uint64(maxIntValue),
+		uint64(targetCount), TxnCollectionRefSize, uint64(maxIntValue),
 	)
 	if !ok {
 		return false
@@ -746,9 +745,9 @@ func decodeTxnDecisionRecord(
 	src []byte, sequence uint64,
 ) (txnMarkerRecord, int, error) {
 	txnID := binary.LittleEndian.Uint64(src[16:24])
-	participantCount := binary.LittleEndian.Uint32(src[24:28])
+	targetCount := binary.LittleEndian.Uint32(src[24:28])
 	body, ok := checkedSizeMul(
-		uint64(participantCount), TxnParticipantSize, uint64(maxIntValue),
+		uint64(targetCount), TxnCollectionRefSize, uint64(maxIntValue),
 	)
 	if !ok {
 		return txnMarkerRecord{}, 0, txnMarkerTailError("decision body")
@@ -767,8 +766,8 @@ func decodeTxnDecisionRecord(
 		PageChecksum(src[:bodyEnd]) != checksum {
 		return txnMarkerRecord{}, 0, txnMarkerTailError("checksum")
 	}
-	if sequence == 0 || txnID == 0 || participantCount == 0 ||
-		participantCount > TxnMarkerMaxParticipants ||
+	if sequence == 0 || txnID == 0 || targetCount == 0 ||
+		targetCount > TxnMarkerMaxCollections ||
 		binary.LittleEndian.Uint16(src[6:8]) != 0 ||
 		binary.LittleEndian.Uint32(src[28:32]) != 0 {
 		return txnMarkerRecord{}, 0, txnMarkerSemanticError(
@@ -779,33 +778,33 @@ func decodeTxnDecisionRecord(
 	if !ok || len(src) < padded {
 		return txnMarkerRecord{}, 0, txnMarkerTailError("padded length")
 	}
-	participants := make([]TxnParticipant, participantCount)
+	targets := make([]TxnCollectionRef, targetCount)
 	cursor := TxnMarkerRecordPrefixSize
-	for i := range participants {
-		copy(participants[i].StoreID[:], src[cursor:cursor+16])
-		copy(participants[i].JournalID[:], src[cursor+16:cursor+32])
-		participants[i].PreparedGeneration = binary.LittleEndian.Uint64(
+	for i := range targets {
+		copy(targets[i].StoreID[:], src[cursor:cursor+16])
+		copy(targets[i].JournalID[:], src[cursor+16:cursor+32])
+		targets[i].PreparedGeneration = binary.LittleEndian.Uint64(
 			src[cursor+32 : cursor+40],
 		)
-		if participants[i].StoreID == ([16]byte{}) ||
-			participants[i].JournalID == ([16]byte{}) ||
-			participants[i].PreparedGeneration == 0 {
+		if targets[i].StoreID == ([16]byte{}) ||
+			targets[i].JournalID == ([16]byte{}) ||
+			targets[i].PreparedGeneration == 0 {
 			return txnMarkerRecord{}, 0, txnMarkerSemanticError(
 				"checksum-valid participant identity or generation",
 			)
 		}
-		cursor += TxnParticipantSize
+		cursor += TxnCollectionRefSize
 	}
-	if err := validateTxnParticipants(participants); err != nil {
+	if err := validateTxnCollectionRefs(targets); err != nil {
 		return txnMarkerRecord{}, 0, txnMarkerSemanticError(
 			"checksum-valid duplicate participant identity",
 		)
 	}
 	return txnMarkerRecord{
-		Sequence:     sequence,
-		Kind:         TxnMarkerRecordKindDecision,
-		TxnID:        txnID,
-		Participants: participants,
+		Sequence: sequence,
+		Kind:     TxnMarkerRecordKindDecision,
+		TxnID:    txnID,
+		Targets:  targets,
 	}, padded, nil
 }
 
@@ -1394,7 +1393,7 @@ func (m *TxnMarker) NextSequence() uint64 { return m.nextSequence }
 // Cursor reports the in-region byte offset of the next append.
 func (m *TxnMarker) Cursor() uint64 { return m.cursor }
 
-// FitsRetirement reports whether one participant-retirement record can consume
+// FitsRetirement reports whether one target-retirement record can consume
 // the next sequence and fit at the current cursor without recycling. It is a
 // pure preflight used by catalog drop barriers so ordinary pressure remains a
 // definite capacity condition rather than being misclassified as a failed
@@ -1495,10 +1494,10 @@ func (m *TxnMarker) scanDecisions(dst *TxnDecisions) error {
 				)
 			}
 			if dst.decisions == nil {
-				dst.decisions = make(map[uint64][]TxnParticipant)
+				dst.decisions = make(map[uint64][]TxnCollectionRef)
 			}
-			for _, participant := range rec.Participants {
-				if _, retired := dst.retired[participant.StoreID]; retired {
+			for _, target := range rec.Targets {
+				if _, retired := dst.retired[target.StoreID]; retired {
 					return txnMarkerSemanticError(
 						"decision names an already-retired participant",
 					)
@@ -1507,9 +1506,9 @@ func (m *TxnMarker) scanDecisions(dst *TxnDecisions) error {
 			if _, exists := dst.decisions[rec.TxnID]; exists {
 				return txnMarkerSemanticError("duplicate txn id")
 			}
-			participants := make([]TxnParticipant, len(rec.Participants))
-			copy(participants, rec.Participants)
-			dst.decisions[rec.TxnID] = participants
+			targets := make([]TxnCollectionRef, len(rec.Targets))
+			copy(targets, rec.Targets)
+			dst.decisions[rec.TxnID] = targets
 			dst.decisionIDs = append(dst.decisionIDs, rec.TxnID)
 			dst.maxTxnID = rec.TxnID
 			lastTxnID = rec.TxnID
@@ -1546,22 +1545,21 @@ func (m *TxnMarker) scanDecisions(dst *TxnDecisions) error {
 // AppendDecision appends one committed decision and returns its assigned DCSN.
 // It does not sync; the caller issues Sync exactly once after the append.
 func (m *TxnMarker) AppendDecision(
-	txnID uint64, participants []TxnParticipant,
-) (uint64, error) {
+	txnID uint64, targets []TxnCollectionRef) (uint64, error) {
 	if m.nextSequence == 0 {
 		return 0, ErrTxnMarkerFull
 	}
 	if txnID == 0 || txnID <= m.lastTxnID || txnID == ^uint64(0) {
 		return 0, fmt.Errorf("%w: txn id is not a usable strict successor", ErrInvalidWrite)
 	}
-	for _, participant := range participants {
-		if _, retired := m.retired[participant.StoreID]; retired {
+	for _, target := range targets {
+		if _, retired := m.retired[target.StoreID]; retired {
 			return 0, fmt.Errorf(
 				"%w: decision names an already-retired participant", ErrInvalidWrite,
 			)
 		}
 	}
-	padded, ok := checkedTxnDecisionPaddedSize(len(participants))
+	padded, ok := checkedTxnDecisionPaddedSize(len(targets))
 	if !ok {
 		return 0, fmt.Errorf("%w: decision record length", ErrInvalidWrite)
 	}
@@ -1573,7 +1571,7 @@ func (m *TxnMarker) AppendDecision(
 		m.scratch = make([]byte, padded)
 	}
 	if _, err := encodeTxnDecisionRecord(
-		m.scratch[:padded], m.nextSequence, txnID, participants,
+		m.scratch[:padded], m.nextSequence, txnID, targets,
 	); err != nil {
 		return 0, err
 	}
@@ -1588,7 +1586,7 @@ func (m *TxnMarker) AppendDecision(
 	return sequence, nil
 }
 
-// AppendRetirement appends one participant-retired record and returns its
+// AppendRetirement appends one target-retired record and returns its
 // assigned DCSN. It does not sync.
 func (m *TxnMarker) AppendRetirement(storeID [16]byte) (uint64, error) {
 	if m.nextSequence == 0 {

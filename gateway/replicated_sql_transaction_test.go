@@ -30,12 +30,12 @@ type replicatedSQLIndexedReadClient struct {
 func TestReplicatedSQLFlatInsertUsesCanonicalRuntimeDocuments(t *testing.T) {
 	snapshot, executor := replicatedSQLTransactionFixture(t, true)
 	queries := []Query{{SQL: `INSERT INTO messages (n,id,label) VALUES (?,?,'quoted " value'), (3,'message-2',?)`, Params: []shardservice.Param{shardservice.NumberParam("1.25"), shardservice.StringParam("message-1"), shardservice.NullParam()}}}
-	participants, handled, err := executor.planReplicatedSQLTransaction(t.Context(), snapshot, queries, executor.profileFor(ClassInteractive))
+	targets, handled, err := executor.planReplicatedSQLTransaction(t.Context(), snapshot, queries, executor.profileFor(ClassInteractive))
 	if err != nil || !handled {
 		t.Fatalf("flat lowering: %v", err)
 	}
 	got := map[string]bool{}
-	for _, p := range participants {
+	for _, p := range targets {
 		for _, b := range p.Batches {
 			for _, m := range b.Mutations {
 				got[string(m.Value)] = true
@@ -50,11 +50,11 @@ func TestReplicatedSQLFlatInsertUsesCanonicalRuntimeDocuments(t *testing.T) {
 func TestReplicatedSQLFlatInsertRoutesAcrossDataShards(t *testing.T) {
 	snapshot, executor, keys := replicatedSQLSplitTransactionFixture(t)
 	queries := []Query{{SQL: `INSERT INTO messages (id,n) VALUES (?,1),(?,2)`, Params: []shardservice.Param{shardservice.StringParam(keys[0]), shardservice.StringParam(keys[1])}}}
-	participants, handled, err := executor.planReplicatedSQLTransaction(t.Context(), snapshot, queries, executor.profileFor(ClassInteractive))
-	if err != nil || !handled || len(participants) != 2 {
-		t.Fatalf("distributed flat INSERT participants=%d handled=%v err=%v", len(participants), handled, err)
+	targets, handled, err := executor.planReplicatedSQLTransaction(t.Context(), snapshot, queries, executor.profileFor(ClassInteractive))
+	if err != nil || !handled || len(targets) != 2 {
+		t.Fatalf("distributed flat INSERT participants=%d handled=%v err=%v", len(targets), handled, err)
 	}
-	for _, p := range participants {
+	for _, p := range targets {
 		if len(p.Batches) != 1 || len(p.Batches[0].Mutations) != 1 {
 			t.Fatalf("incorrect row distribution: %+v", p)
 		}
@@ -115,27 +115,27 @@ func TestReplicatedSQLTransactionLowersExactMultiTableMutationsByGroupAndRelatio
 			},
 		},
 	}
-	participants, handled, err := executor.planReplicatedSQLTransaction(
+	targets, handled, err := executor.planReplicatedSQLTransaction(
 		t.Context(), snapshot, queries, executor.profileFor(ClassInteractive),
 	)
 	if err != nil || !handled {
 		t.Fatalf("plan = handled %v err %v", handled, err)
 	}
-	if len(participants) != 2 {
-		t.Fatalf("participants = %d, want 2", len(participants))
+	if len(targets) != 2 {
+		t.Fatalf("participants = %d, want 2", len(targets))
 	}
-	var data, logs *ReplicatedTransactionParticipant
-	for index := range participants {
-		participant := &participants[index]
-		switch participant.Route.Distribution {
+	var data, logs *ReplicatedTransactionTarget
+	for index := range targets {
+		target := &targets[index]
+		switch target.Route.Distribution {
 		case "data":
-			data = participant
+			data = target
 		case "logs-data":
-			logs = participant
+			logs = target
 		}
 	}
 	if data == nil || logs == nil {
-		t.Fatalf("routes = %+v", participants)
+		t.Fatalf("routes = %+v", targets)
 	}
 	if len(data.Batches) != 2 || data.Batches[0].Relation != 1 ||
 		data.Batches[1].Relation != 2 {
@@ -156,12 +156,12 @@ func TestReplicatedSQLTransactionLowersExactMultiTableMutationsByGroupAndRelatio
 		!bytes.Equal(data.Batches[1].Mutations[0].Value, []byte(`{"id":"message-1","n":1}`)) {
 		t.Fatalf("message mutation = %+v", data.Batches[1].Mutations[0])
 	}
-	for index := range participants {
-		participant := &participants[index]
-		if len(participant.Route.Replicas) != ServingReplicaCount ||
-			participant.BucketBits != distribution.DefaultVirtualBucketBits ||
-			len(participant.IntentScopes) == 0 {
-			t.Fatalf("participant %d route/scope = %+v", index, participant)
+	for index := range targets {
+		target := &targets[index]
+		if len(target.Route.Replicas) != ServingReplicaCount ||
+			target.BucketBits != distribution.DefaultVirtualBucketBits ||
+			len(target.IntentScopes) == 0 {
+			t.Fatalf("participant %d route/scope = %+v", index, target)
 		}
 	}
 }
@@ -297,11 +297,11 @@ func TestReplicatedSQLTransactionRejectsDuplicateAndResidualBeforeExecution(t *t
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			participants, handled, err := executor.planReplicatedSQLTransaction(
+			targets, handled, err := executor.planReplicatedSQLTransaction(
 				t.Context(), snapshot, test.queries, executor.profileFor(ClassInteractive),
 			)
-			if !handled || !errors.Is(err, test.want) || len(participants) != 0 {
-				t.Fatalf("plan = %d handled %v err %v, want %v", len(participants), handled, err, test.want)
+			if !handled || !errors.Is(err, test.want) || len(targets) != 0 {
+				t.Fatalf("plan = %d handled %v err %v, want %v", len(targets), handled, err, test.want)
 			}
 		})
 	}
@@ -313,7 +313,7 @@ func TestReplicatedSQLTransactionLowersOneMultiRowInsertAcrossRF3Shards(t *testi
 		[]byte(`{"id":"` + keys[0] + `","n":1}`),
 		[]byte(`{"id":"` + keys[1] + `","n":2}`),
 	}
-	participants, handled, err := executor.planReplicatedSQLTransaction(
+	targets, handled, err := executor.planReplicatedSQLTransaction(
 		t.Context(), snapshot, []Query{{
 			SQL: `INSERT INTO messages VALUES (?),(?)`,
 			Params: []shardservice.Param{
@@ -325,24 +325,24 @@ func TestReplicatedSQLTransactionLowersOneMultiRowInsertAcrossRF3Shards(t *testi
 	if err != nil || !handled {
 		t.Fatalf("plan handled=%v err=%v", handled, err)
 	}
-	if len(participants) != 2 {
-		t.Fatalf("participants=%d want=2 cross-shard RF3 groups", len(participants))
+	if len(targets) != 2 {
+		t.Fatalf("participants=%d want=2 cross-shard RF3 groups", len(targets))
 	}
-	if participants[0].Route.Command.RelationManifestDigest == participants[1].Route.Command.RelationManifestDigest ||
-		participants[0].Route.LogicalSchemaDigest != participants[1].Route.LogicalSchemaDigest {
+	if targets[0].Route.Command.RelationManifestDigest == targets[1].Route.Command.RelationManifestDigest ||
+		targets[0].Route.LogicalSchemaDigest != targets[1].Route.LogicalSchemaDigest {
 		t.Fatal("shared logical table did not preserve distinct shard machine fences")
 	}
 	seen := make(map[string][]byte, len(documents))
 	borrowed := make(map[string]bool, len(documents))
-	for participantIndex := range participants {
-		participant := &participants[participantIndex]
-		if len(participant.IntentScopes) != 1 {
-			t.Fatalf("participant %d intent scopes=%v want one exact bucket", participantIndex, participant.IntentScopes)
+	for targetIndex := range targets {
+		target := &targets[targetIndex]
+		if len(target.IntentScopes) != 1 {
+			t.Fatalf("participant %d intent scopes=%v want one exact bucket", targetIndex, target.IntentScopes)
 		}
-		for batchIndex := range participant.Batches {
-			batch := &participant.Batches[batchIndex]
+		for batchIndex := range target.Batches {
+			batch := &target.Batches[batchIndex]
 			if batch.Relation != 1 {
-				t.Fatalf("participant %d relation=%d want messages relation 1", participantIndex, batch.Relation)
+				t.Fatalf("participant %d relation=%d want messages relation 1", targetIndex, batch.Relation)
 			}
 			for mutationIndex := range batch.Mutations {
 				mutation := &batch.Mutations[mutationIndex]
@@ -370,7 +370,7 @@ func TestReplicatedSQLTransactionLowersOneMultiRowInsertAcrossRF3Shards(t *testi
 
 func TestReplicatedSQLTransactionLowersFiniteDeleteAcrossRF3Shards(t *testing.T) {
 	snapshot, executor, keys := replicatedSQLSplitTransactionFixture(t)
-	participants, handled, err := executor.planReplicatedSQLTransaction(
+	targets, handled, err := executor.planReplicatedSQLTransaction(
 		t.Context(), snapshot, []Query{{
 			SQL: `DELETE FROM messages WHERE id IN (?, ?)`,
 			Params: []shardservice.Param{
@@ -381,20 +381,20 @@ func TestReplicatedSQLTransactionLowersFiniteDeleteAcrossRF3Shards(t *testing.T)
 	if err != nil || !handled {
 		t.Fatalf("plan handled=%v err=%v", handled, err)
 	}
-	if len(participants) != 2 {
-		t.Fatalf("participants=%d want=2 cross-shard RF3 groups", len(participants))
+	if len(targets) != 2 {
+		t.Fatalf("participants=%d want=2 cross-shard RF3 groups", len(targets))
 	}
 	mutations := 0
-	for participantIndex := range participants {
-		participant := &participants[participantIndex]
-		if len(participant.IntentScopes) != 1 || len(participant.Batches) != 1 ||
-			participant.Batches[0].Relation != 1 {
-			t.Fatalf("participant %d=%+v", participantIndex, participant)
+	for targetIndex := range targets {
+		target := &targets[targetIndex]
+		if len(target.IntentScopes) != 1 || len(target.Batches) != 1 ||
+			target.Batches[0].Relation != 1 {
+			t.Fatalf("participant %d=%+v", targetIndex, target)
 		}
-		for mutationIndex := range participant.Batches[0].Mutations {
-			if participant.Batches[0].Mutations[mutationIndex].Kind != replication.MutationDelete {
-				t.Fatalf("participant %d mutation %d kind=%d", participantIndex, mutationIndex,
-					participant.Batches[0].Mutations[mutationIndex].Kind)
+		for mutationIndex := range target.Batches[0].Mutations {
+			if target.Batches[0].Mutations[mutationIndex].Kind != replication.MutationDelete {
+				t.Fatalf("participant %d mutation %d kind=%d", targetIndex, mutationIndex,
+					target.Batches[0].Mutations[mutationIndex].Kind)
 			}
 			mutations++
 		}
@@ -476,7 +476,7 @@ func replicatedSQLSplitTransactionFixture(
 
 func TestReplicatedSQLTransactionMultiRowInsertMaintainsGlobalIndexAtomically(t *testing.T) {
 	snapshot, executor := replicatedSQLTransactionFixture(t, true, true)
-	participants, handled, err := executor.planReplicatedSQLTransaction(
+	targets, handled, err := executor.planReplicatedSQLTransaction(
 		t.Context(), snapshot, []Query{{
 			SQL: `INSERT INTO messages VALUES (?),(?)`,
 			Params: []shardservice.Param{
@@ -490,11 +490,11 @@ func TestReplicatedSQLTransactionMultiRowInsertMaintainsGlobalIndexAtomically(t 
 	}
 	baseMutations, indexMutations := 0, 0
 	locators := make(map[string]bool, 2)
-	for participantIndex := range participants {
-		participant := &participants[participantIndex]
-		for batchIndex := range participant.Batches {
-			batch := &participant.Batches[batchIndex]
-			if participant.Route.Distribution == "messages-email" {
+	for targetIndex := range targets {
+		target := &targets[targetIndex]
+		for batchIndex := range target.Batches {
+			batch := &target.Batches[batchIndex]
+			if target.Route.Distribution == "messages-email" {
 				for mutationIndex := range batch.Mutations {
 					mutation := &batch.Mutations[mutationIndex]
 					if mutation.Kind != replication.MutationPutAbsentOrEqual {
@@ -503,7 +503,7 @@ func TestReplicatedSQLTransactionMultiRowInsertMaintainsGlobalIndexAtomically(t 
 					locators[string(mutation.Value)] = true
 					indexMutations++
 				}
-			} else if participant.Route.Distribution == "data" && batch.Relation == 2 {
+			} else if target.Route.Distribution == "data" && batch.Relation == 2 {
 				baseMutations += len(batch.Mutations)
 			}
 		}
@@ -514,9 +514,9 @@ func TestReplicatedSQLTransactionMultiRowInsertMaintainsGlobalIndexAtomically(t 
 	}
 }
 
-func TestReplicatedSQLTransactionRoutesReadyGlobalIndexAsIndependentRF3Participant(t *testing.T) {
+func TestReplicatedSQLTransactionRoutesReadyGlobalIndexAsIndependentRF3Target(t *testing.T) {
 	snapshot, executor := replicatedSQLTransactionFixture(t, true, true)
-	participants, handled, err := executor.planReplicatedSQLTransaction(
+	targets, handled, err := executor.planReplicatedSQLTransaction(
 		t.Context(), snapshot, []Query{
 			{SQL: `INSERT INTO messages VALUES (?)`, Params: []shardservice.Param{
 				shardservice.DocumentParam(`{"id":"message-1","email":"m@example.test"}`),
@@ -526,13 +526,13 @@ func TestReplicatedSQLTransactionRoutesReadyGlobalIndexAsIndependentRF3Participa
 			}},
 		}, executor.profileFor(ClassInteractive),
 	)
-	if len(participants) != 3 || !handled || err != nil {
-		t.Fatalf("plan = %d handled %v err %v", len(participants), handled, err)
+	if len(targets) != 3 || !handled || err != nil {
+		t.Fatalf("plan = %d handled %v err %v", len(targets), handled, err)
 	}
-	var index *ReplicatedTransactionParticipant
-	for ordinal := range participants {
-		if participants[ordinal].Route.Distribution == "messages-email" {
-			index = &participants[ordinal]
+	var index *ReplicatedTransactionTarget
+	for ordinal := range targets {
+		if targets[ordinal].Route.Distribution == "messages-email" {
+			index = &targets[ordinal]
 		}
 	}
 	if index == nil || len(index.Batches) != 1 || index.Batches[0].Relation != 1 ||
@@ -552,17 +552,17 @@ func TestReplicatedSQLTransactionGlobalIndexMutationsConsumeAdmissionBudget(t *t
 	}}
 	profile := executor.profileFor(ClassInteractive)
 	profile.MaxTransactionMutations = 1
-	if participants, handled, err := executor.planReplicatedSQLTransaction(
+	if targets, handled, err := executor.planReplicatedSQLTransaction(
 		t.Context(), snapshot, query, profile,
-	); len(participants) != 0 || !handled || !errors.Is(err, ErrTransactionMutationLimit) {
-		t.Fatalf("mutation bound participants=%d handled=%v err=%v", len(participants), handled, err)
+	); len(targets) != 0 || !handled || !errors.Is(err, ErrTransactionMutationLimit) {
+		t.Fatalf("mutation bound participants=%d handled=%v err=%v", len(targets), handled, err)
 	}
 	profile = executor.profileFor(ClassInteractive)
 	profile.MaxTransactionBytes = uint64(len(`{"id":"message-1","email":"m@example.test"}`)) + 32
-	if participants, handled, err := executor.planReplicatedSQLTransaction(
+	if targets, handled, err := executor.planReplicatedSQLTransaction(
 		t.Context(), snapshot, query, profile,
-	); len(participants) != 0 || !handled || !errors.Is(err, ErrTransactionByteLimit) {
-		t.Fatalf("byte bound participants=%d handled=%v err=%v", len(participants), handled, err)
+	); len(targets) != 0 || !handled || !errors.Is(err, ErrTransactionByteLimit) {
+		t.Fatalf("byte bound participants=%d handled=%v err=%v", len(targets), handled, err)
 	}
 }
 
@@ -629,19 +629,19 @@ func TestReplicatedSQLTransactionGlobalIndexUpdateAndDeleteBindExactOldValue(t *
 			snapshot, executor := replicatedSQLTransactionFixture(t, true, true)
 			old := []byte(`{"id":"message-1","email":"old@example.test"}`)
 			client, data := attachReplicatedSQLIndexedReadClient(t, snapshot, old)
-			participants, handled, err := executor.planReplicatedSQLTransactionWithData(
+			targets, handled, err := executor.planReplicatedSQLTransactionWithData(
 				t.Context(), snapshot, []Query{test.query}, executor.profileFor(ClassInteractive), data,
 			)
-			if err != nil || !handled || client.reads != 1 || len(participants) != 2 {
-				t.Fatalf("plan=%d handled=%v reads=%d err=%v", len(participants), handled, client.reads, err)
+			if err != nil || !handled || client.reads != 1 || len(targets) != 2 {
+				t.Fatalf("plan=%d handled=%v reads=%d err=%v", len(targets), handled, client.reads, err)
 			}
-			var base, index *ReplicatedTransactionParticipant
-			for ordinal := range participants {
-				switch participants[ordinal].Route.Distribution {
+			var base, index *ReplicatedTransactionTarget
+			for ordinal := range targets {
+				switch targets[ordinal].Route.Distribution {
 				case "data":
-					base = &participants[ordinal]
+					base = &targets[ordinal]
 				case "messages-email":
-					index = &participants[ordinal]
+					index = &targets[ordinal]
 				}
 			}
 			if base == nil || len(base.Batches) != 1 || len(base.Batches[0].Mutations) != 1 {
@@ -676,7 +676,7 @@ func TestReplicatedSQLDeclaredColumnUpdateIsExactCAS(t *testing.T) {
 	snapshot, executor := replicatedSQLTransactionFixture(t, true)
 	old := []byte(`{"email":"old@example.test","id":"message-1","n":1}`)
 	client, data := attachReplicatedSQLIndexedReadClient(t, snapshot, old)
-	participants, handled, err := executor.planReplicatedSQLTransactionWithData(
+	targets, handled, err := executor.planReplicatedSQLTransactionWithData(
 		t.Context(), snapshot, []Query{{
 			SQL: `UPDATE messages SET email = ?, n = 2 WHERE id = ?`,
 			Params: []shardservice.Param{
@@ -685,10 +685,10 @@ func TestReplicatedSQLDeclaredColumnUpdateIsExactCAS(t *testing.T) {
 			},
 		}}, executor.profileFor(ClassInteractive), data,
 	)
-	if err != nil || !handled || client.reads != 1 || len(participants) != 1 {
-		t.Fatalf("plan=%d handled=%v reads=%d err=%v", len(participants), handled, client.reads, err)
+	if err != nil || !handled || client.reads != 1 || len(targets) != 1 {
+		t.Fatalf("plan=%d handled=%v reads=%d err=%v", len(targets), handled, client.reads, err)
 	}
-	mutation := participants[0].Batches[0].Mutations[0]
+	mutation := targets[0].Batches[0].Mutations[0]
 	if mutation.Kind != replication.MutationPutDigestEqual ||
 		mutation.ExpectedValueLength != uint64(len(old)) ||
 		mutation.ExpectedValueDigest != replication.Digest(sha256.Sum256(old)) {
@@ -707,7 +707,7 @@ func TestReplicatedSQLComputedUpdateRetainsCanonicalExactCAS(t *testing.T) {
 		t, snapshot, old,
 	)
 
-	participants, handled, err := executor.planReplicatedSQLTransactionWithData(
+	targets, handled, err := executor.planReplicatedSQLTransactionWithData(
 		t.Context(), snapshot, []Query{{
 			SQL: source,
 			Params: []shardservice.Param{
@@ -722,10 +722,10 @@ func TestReplicatedSQLComputedUpdateRetainsCanonicalExactCAS(t *testing.T) {
 			},
 		}}, executor.profileFor(ClassInteractive), data,
 	)
-	if err != nil || !handled || len(participants) != 1 || client.reads != 1 {
-		t.Fatalf("plan=%d handled=%v reads=%d err=%v", len(participants), handled, client.reads, err)
+	if err != nil || !handled || len(targets) != 1 || client.reads != 1 {
+		t.Fatalf("plan=%d handled=%v reads=%d err=%v", len(targets), handled, client.reads, err)
 	}
-	mutation := participants[0].Batches[0].Mutations[0]
+	mutation := targets[0].Batches[0].Mutations[0]
 	if mutation.Kind != replication.MutationPutDigestEqual ||
 		mutation.ExpectedValueLength != uint64(len(old)) ||
 		mutation.ExpectedValueDigest != replication.Digest(sha256.Sum256(old)) {
@@ -741,7 +741,7 @@ func TestReplicatedSQLComputedUpdateDerivesGlobalIndexFromRetainedPostimage(t *t
 	snapshot, executor := replicatedSQLTransactionFixture(t, true, true)
 	old := []byte(`{"email":"old@example.test","id":"message-1","n":1}`)
 	client, data := attachReplicatedSQLIndexedReadClient(t, snapshot, old)
-	participants, handled, err := executor.planReplicatedSQLTransactionWithData(
+	targets, handled, err := executor.planReplicatedSQLTransactionWithData(
 		t.Context(), snapshot, []Query{{
 			SQL: `UPDATE messages SET email = email || '.invalid', n = n + 1 WHERE id = ?`,
 			Params: []shardservice.Param{
@@ -749,16 +749,16 @@ func TestReplicatedSQLComputedUpdateDerivesGlobalIndexFromRetainedPostimage(t *t
 			},
 		}}, executor.profileFor(ClassInteractive), data,
 	)
-	if err != nil || !handled || len(participants) != 2 || client.reads != 1 {
-		t.Fatalf("plan=%d handled=%v reads=%d err=%v", len(participants), handled, client.reads, err)
+	if err != nil || !handled || len(targets) != 2 || client.reads != 1 {
+		t.Fatalf("plan=%d handled=%v reads=%d err=%v", len(targets), handled, client.reads, err)
 	}
-	var base, index *ReplicatedTransactionParticipant
-	for ordinal := range participants {
-		switch participants[ordinal].Route.Distribution {
+	var base, index *ReplicatedTransactionTarget
+	for ordinal := range targets {
+		switch targets[ordinal].Route.Distribution {
 		case "data":
-			base = &participants[ordinal]
+			base = &targets[ordinal]
 		case "messages-email":
-			index = &participants[ordinal]
+			index = &targets[ordinal]
 		}
 	}
 	if base == nil || len(base.Batches) != 1 || len(base.Batches[0].Mutations) != 1 {
@@ -786,7 +786,7 @@ func TestReplicatedSQLComputedPostimageIsOwnedByDurableLogicalProgram(t *testing
 	snapshot, executor := replicatedSQLTransactionFixture(t, true)
 	old := []byte(`{"id":"message-1","n":41}`)
 	_, data := attachReplicatedSQLIndexedReadClient(t, snapshot, old)
-	participants, handled, err := executor.planReplicatedSQLTransactionWithData(
+	targets, handled, err := executor.planReplicatedSQLTransactionWithData(
 		t.Context(), snapshot, []Query{{
 			SQL: `UPDATE messages SET n = n + 1 WHERE id = ?`,
 			Params: []shardservice.Param{
@@ -794,25 +794,25 @@ func TestReplicatedSQLComputedPostimageIsOwnedByDurableLogicalProgram(t *testing
 			},
 		}}, executor.profileFor(ClassInteractive), data,
 	)
-	if err != nil || !handled || len(participants) != 1 {
-		t.Fatalf("plan=%d handled=%v err=%v", len(participants), handled, err)
+	if err != nil || !handled || len(targets) != 1 {
+		t.Fatalf("plan=%d handled=%v err=%v", len(targets), handled, err)
 	}
 	build := durableRequestProgramBuildFixture(t)
-	build.Participants = participants
+	build.Targets = targets
 	program, err := BuildDurableRequestLogicalProgram(build)
-	if err != nil || len(program.Participants) != 1 ||
-		len(program.Participants[0].Batches) != 1 ||
-		len(program.Participants[0].Batches[0].Mutations) != 1 {
+	if err != nil || len(program.Targets) != 1 ||
+		len(program.Targets[0].Batches) != 1 ||
+		len(program.Targets[0].Batches[0].Mutations) != 1 {
 		t.Fatalf("durable program=%+v err=%v", program, err)
 	}
-	retained := program.Participants[0].Batches[0].Mutations[0]
+	retained := program.Targets[0].Batches[0].Mutations[0]
 	if retained.Kind != replication.MutationPutDigestEqual ||
 		string(retained.Value) != `{"id":"message-1","n":42}` ||
 		retained.ExpectedValueDigest != replication.Digest(sha256.Sum256(old)) {
 		t.Fatalf("retained computed mutation=%+v", retained)
 	}
-	participants[0].Batches[0].Mutations[0].Value[0] = '['
-	if string(program.Participants[0].Batches[0].Mutations[0].Value) !=
+	targets[0].Batches[0].Mutations[0].Value[0] = '['
+	if string(program.Targets[0].Batches[0].Mutations[0].Value) !=
 		`{"id":"message-1","n":42}` {
 		t.Fatal("durable program borrowed the planner postimage")
 	}
@@ -839,7 +839,7 @@ func TestReplicatedSQLComputedUpdateConcurrentPlanningOwnsEvaluatorState(t *test
 		wait.Add(1)
 		go func(worker int) {
 			defer wait.Done()
-			participants, handled, err := executor.planReplicatedSQLTransactionWithData(
+			targets, handled, err := executor.planReplicatedSQLTransactionWithData(
 				ctx, snapshot, []Query{{
 					SQL: `UPDATE messages SET n = n + 1 WHERE id = ?`,
 					Params: []shardservice.Param{
@@ -847,13 +847,13 @@ func TestReplicatedSQLComputedUpdateConcurrentPlanningOwnsEvaluatorState(t *test
 					},
 				}}, profile, fixtures[worker].data,
 			)
-			if err != nil || !handled || len(participants) != 1 {
+			if err != nil || !handled || len(targets) != 1 {
 				errorsByWorker[worker] = fmt.Errorf(
-					"plan=%d handled=%v: %w", len(participants), handled, err,
+					"plan=%d handled=%v: %w", len(targets), handled, err,
 				)
 				return
 			}
-			mutation := participants[0].Batches[0].Mutations[0]
+			mutation := targets[0].Batches[0].Mutations[0]
 			want := fmt.Sprintf(`{"id":"message-1","n":%d}`, worker+1)
 			if string(mutation.Value) != want ||
 				mutation.ExpectedValueDigest != replication.Digest(sha256.Sum256(fixtures[worker].old)) {
@@ -876,7 +876,7 @@ func TestReplicatedSQLComputedUpdateValidatesBindingsBeforeCurrentRowRead(t *tes
 	client, data := attachReplicatedSQLIndexedReadClient(
 		t, snapshot, []byte(`{"id":"message-1","n":1}`),
 	)
-	participants, handled, err := executor.planReplicatedSQLTransactionWithData(
+	targets, handled, err := executor.planReplicatedSQLTransactionWithData(
 		t.Context(), snapshot, []Query{{
 			SQL: `UPDATE messages SET n = n + CAST(? AS INTEGER) WHERE id = ?`,
 			Params: []shardservice.Param{
@@ -889,8 +889,8 @@ func TestReplicatedSQLComputedUpdateValidatesBindingsBeforeCurrentRowRead(t *tes
 			},
 		}}, executor.profileFor(ClassInteractive), data,
 	)
-	if err == nil || handled || len(participants) != 0 || client.reads != 0 {
-		t.Fatalf("participants=%d handled=%v reads=%d err=%v", len(participants), handled, client.reads, err)
+	if err == nil || handled || len(targets) != 0 || client.reads != 0 {
+		t.Fatalf("participants=%d handled=%v reads=%d err=%v", len(targets), handled, client.reads, err)
 	}
 }
 
@@ -899,7 +899,7 @@ func TestReplicatedSQLComputedUpdateRejectsPrimaryKeyMoveBeforeAdmission(t *test
 	client, data := attachReplicatedSQLIndexedReadClient(
 		t, snapshot, []byte(`{"id":"message-1","n":1}`),
 	)
-	participants, handled, err := executor.planReplicatedSQLTransactionWithData(
+	targets, handled, err := executor.planReplicatedSQLTransactionWithData(
 		t.Context(), snapshot, []Query{{
 			SQL: `UPDATE messages SET id = id || '-moved', n = n + 1 WHERE id = ?`,
 			Params: []shardservice.Param{
@@ -908,8 +908,8 @@ func TestReplicatedSQLComputedUpdateRejectsPrimaryKeyMoveBeforeAdmission(t *test
 		}}, executor.profileFor(ClassInteractive), data,
 	)
 	if !errors.Is(err, ErrWriteShardKeyMove) || !handled ||
-		len(participants) != 0 || client.reads != 1 {
-		t.Fatalf("participants=%d handled=%v reads=%d err=%v", len(participants), handled, client.reads, err)
+		len(targets) != 0 || client.reads != 1 {
+		t.Fatalf("participants=%d handled=%v reads=%d err=%v", len(targets), handled, client.reads, err)
 	}
 }
 
@@ -958,7 +958,7 @@ func TestReplicatedSQLConflictActionsRejectBeforeBindOrCurrentRowRead(t *testing
 				table:     test.insert.Table,
 			})
 
-			participants, handled, err := executor.planReplicatedSQLTransactionWithData(
+			targets, handled, err := executor.planReplicatedSQLTransactionWithData(
 				t.Context(), snapshot, []Query{{SQL: test.source}},
 				executor.profileFor(ClassInteractive), data,
 			)
@@ -972,10 +972,10 @@ func TestReplicatedSQLConflictActionsRejectBeforeBindOrCurrentRowRead(t *testing
 			if !errors.Is(err, ErrReplicatedSQLTransactionUnsupported) {
 				t.Fatalf("plan error %v does not retain ErrReplicatedSQLTransactionUnsupported", err)
 			}
-			if !handled || len(participants) != 0 || client.reads != 0 {
+			if !handled || len(targets) != 0 || client.reads != 0 {
 				t.Fatalf(
 					"plan participants=%d handled=%v current-row reads=%d, want 0,true,0",
-					len(participants), handled, client.reads,
+					len(targets), handled, client.reads,
 				)
 			}
 		})
@@ -990,7 +990,7 @@ func TestReplicatedSQLColumnUpdateMissingRetainsDurableNoOp(t *testing.T) {
 		t.Run(source, func(t *testing.T) {
 			snapshot, executor := replicatedSQLTransactionFixture(t, true)
 			client, data := attachReplicatedSQLIndexedReadClient(t, snapshot, nil)
-			participants, handled, err := executor.planReplicatedSQLTransactionWithData(
+			targets, handled, err := executor.planReplicatedSQLTransactionWithData(
 				t.Context(), snapshot, []Query{{
 					SQL: source,
 					Params: []shardservice.Param{
@@ -998,10 +998,10 @@ func TestReplicatedSQLColumnUpdateMissingRetainsDurableNoOp(t *testing.T) {
 					},
 				}}, executor.profileFor(ClassInteractive), data,
 			)
-			if err != nil || !handled || len(participants) != 1 || client.reads != 1 {
-				t.Fatalf("plan=%d handled=%v reads=%d err=%v", len(participants), handled, client.reads, err)
+			if err != nil || !handled || len(targets) != 1 || client.reads != 1 {
+				t.Fatalf("plan=%d handled=%v reads=%d err=%v", len(targets), handled, client.reads, err)
 			}
-			mutation := participants[0].Batches[0].Mutations[0]
+			mutation := targets[0].Batches[0].Mutations[0]
 			if mutation.Kind != replication.MutationPutPresent || string(mutation.Value) != `{}` {
 				t.Fatalf("durable no-op mutation=%+v", mutation)
 			}
@@ -1013,7 +1013,7 @@ func TestReplicatedSQLColumnUpdateRejectsFoundEmptyDocument(t *testing.T) {
 	snapshot, executor := replicatedSQLTransactionFixture(t, true)
 	client, data := attachReplicatedSQLIndexedReadClient(t, snapshot, nil)
 	client.foundEmpty = true
-	participants, handled, err := executor.planReplicatedSQLTransactionWithData(
+	targets, handled, err := executor.planReplicatedSQLTransactionWithData(
 		t.Context(), snapshot, []Query{{
 			SQL: `UPDATE messages SET n = n + 1 WHERE id = ?`,
 			Params: []shardservice.Param{
@@ -1022,8 +1022,8 @@ func TestReplicatedSQLColumnUpdateRejectsFoundEmptyDocument(t *testing.T) {
 		}}, executor.profileFor(ClassInteractive), data,
 	)
 	if !errors.Is(err, ErrReplicatedRoute) || !handled ||
-		len(participants) != 0 || client.reads != 1 {
-		t.Fatalf("participants=%d handled=%v reads=%d err=%v", len(participants), handled, client.reads, err)
+		len(targets) != 0 || client.reads != 1 {
+		t.Fatalf("participants=%d handled=%v reads=%d err=%v", len(targets), handled, client.reads, err)
 	}
 }
 
@@ -1031,7 +1031,7 @@ func TestReplicatedSQLTransactionGlobalIndexSameKeyUsesExactReplacement(t *testi
 	snapshot, executor := replicatedSQLTransactionFixture(t, true, true, true, true)
 	old := []byte(`{"id":"message-1","email":"same@example.test","region":"old"}`)
 	_, data := attachReplicatedSQLIndexedReadClient(t, snapshot, old)
-	participants, handled, err := executor.planReplicatedSQLTransactionWithData(
+	targets, handled, err := executor.planReplicatedSQLTransactionWithData(
 		t.Context(), snapshot, []Query{{
 			SQL: `UPDATE messages SET "$doc" = ? WHERE id = ?`,
 			Params: []shardservice.Param{
@@ -1040,19 +1040,19 @@ func TestReplicatedSQLTransactionGlobalIndexSameKeyUsesExactReplacement(t *testi
 			},
 		}}, executor.profileFor(ClassInteractive), data,
 	)
-	if err != nil || !handled || len(participants) != 3 {
-		t.Fatalf("plan=%d handled=%v err=%v", len(participants), handled, err)
+	if err != nil || !handled || len(targets) != 3 {
+		t.Fatalf("plan=%d handled=%v err=%v", len(targets), handled, err)
 	}
 	foundEmail, foundRegion := false, false
-	for ordinal := range participants {
-		participant := &participants[ordinal]
-		switch participant.Route.Distribution {
+	for ordinal := range targets {
+		target := &targets[ordinal]
+		switch target.Route.Distribution {
 		case "messages-email":
 			foundEmail = true
-			if len(participant.Batches) != 1 || len(participant.Batches[0].Mutations) != 1 {
-				t.Fatalf("same-key index participant=%+v", participant)
+			if len(target.Batches) != 1 || len(target.Batches[0].Mutations) != 1 {
+				t.Fatalf("same-key index participant=%+v", target)
 			}
-			mutation := participant.Batches[0].Mutations[0]
+			mutation := target.Batches[0].Mutations[0]
 			if mutation.Kind != replication.MutationPutDigestEqual ||
 				mutation.ExpectedValueLength == 0 ||
 				mutation.ExpectedValueDigest == (replication.Digest{}) || len(mutation.Value) == 0 {
@@ -1060,10 +1060,10 @@ func TestReplicatedSQLTransactionGlobalIndexSameKeyUsesExactReplacement(t *testi
 			}
 		case "messages-region":
 			foundRegion = true
-			if len(participant.Batches) != 1 || len(participant.Batches[0].Mutations) != 2 ||
-				participant.Batches[0].Mutations[0].Kind != replication.MutationDeleteDigestEqual ||
-				participant.Batches[0].Mutations[1].Kind != replication.MutationPutAbsentOrEqual {
-				t.Fatalf("changed-key index participant=%+v", participant)
+			if len(target.Batches) != 1 || len(target.Batches[0].Mutations) != 2 ||
+				target.Batches[0].Mutations[0].Kind != replication.MutationDeleteDigestEqual ||
+				target.Batches[0].Mutations[1].Kind != replication.MutationPutAbsentOrEqual {
+				t.Fatalf("changed-key index participant=%+v", target)
 			}
 		}
 	}
@@ -1116,21 +1116,21 @@ func TestReplicatedSQLTransactionRejectsMixedAuthorityAndLeavesStaticBatchUnclai
 		{SQL: `DELETE FROM messages WHERE id = ?`, Params: []shardservice.Param{shardservice.StringParam("m")}},
 		{SQL: `DELETE FROM legacy WHERE id = ?`, Params: []shardservice.Param{shardservice.StringParam("l")}},
 	}
-	participants, handled, err := executor.planReplicatedSQLTransaction(
+	targets, handled, err := executor.planReplicatedSQLTransaction(
 		t.Context(), snapshot, mixed, executor.profileFor(ClassInteractive),
 	)
-	if !handled || !errors.Is(err, ErrReplicatedSQLTransactionMixed) || len(participants) != 0 {
-		t.Fatalf("mixed = %d handled %v err %v", len(participants), handled, err)
+	if !handled || !errors.Is(err, ErrReplicatedSQLTransactionMixed) || len(targets) != 0 {
+		t.Fatalf("mixed = %d handled %v err %v", len(targets), handled, err)
 	}
 	static := []Query{
 		{SQL: `DELETE FROM legacy WHERE id = ?`, Params: []shardservice.Param{shardservice.StringParam("l1")}},
 		{SQL: `DELETE FROM legacy WHERE id = ?`, Params: []shardservice.Param{shardservice.StringParam("l2")}},
 	}
-	participants, handled, err = executor.planReplicatedSQLTransaction(
+	targets, handled, err = executor.planReplicatedSQLTransaction(
 		t.Context(), snapshot, static, executor.profileFor(ClassInteractive),
 	)
-	if handled || err != nil || len(participants) != 0 {
-		t.Fatalf("static = %d handled %v err %v", len(participants), handled, err)
+	if handled || err != nil || len(targets) != 0 {
+		t.Fatalf("static = %d handled %v err %v", len(targets), handled, err)
 	}
 }
 

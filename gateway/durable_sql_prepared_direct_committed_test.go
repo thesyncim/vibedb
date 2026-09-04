@@ -69,7 +69,7 @@ func TestPrepareDirectUsesCommittedLeaderReadAndFullRowGuard(t *testing.T) {
 		recorder.operations[1] != shardservice.ReplicatedReadFollower {
 		t.Fatalf("private read operations=%v, want probe then follower", recorder.operations)
 	}
-	mutation := plan.Participant.Batches[0].Mutations[0]
+	mutation := plan.Target.Batches[0].Mutations[0]
 	if mutation.Kind != replication.MutationPutDigestEqual ||
 		mutation.ExpectedValueLength != uint64(len(reader.value)) ||
 		mutation.ExpectedValueDigest != replication.Digest(sha256.Sum256(reader.value)) {
@@ -112,8 +112,8 @@ func TestPrepareDirectCommittedMissingFallsBackToLinearizableOnce(t *testing.T) 
 		recorder.operations[2] != shardservice.ReplicatedReadLeader {
 		t.Fatalf("fallback read operations=%v, want probe, follower, leader", recorder.operations)
 	}
-	if plan.Participant.Batches[0].Mutations[0].Kind != replication.MutationPutDigestEqual {
-		t.Fatalf("fallback mutation=%+v", plan.Participant.Batches[0].Mutations[0])
+	if plan.Target.Batches[0].Mutations[0].Kind != replication.MutationPutDigestEqual {
+		t.Fatalf("fallback mutation=%+v", plan.Target.Batches[0].Mutations[0])
 	}
 }
 

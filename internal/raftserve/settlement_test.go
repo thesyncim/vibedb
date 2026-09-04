@@ -309,8 +309,8 @@ func testTransactionCommand(
 	t.Helper()
 	id := distributedtxn.ID{0xc1, 0x55, 0x81}
 	control, err := distributedtxn.AppendReplicatedCommand(nil, distributedtxn.ReplicatedCommand{
-		Role:               distributedtxn.ReplicatedRoleParticipant,
-		Operation:          distributedtxn.ReplicatedPrepareParticipant,
+		Role:               distributedtxn.ReplicatedRoleTarget,
+		Operation:          distributedtxn.ReplicatedPrepareTarget,
 		ID:                 id,
 		ExpectedRevision:   1,
 		PayloadKind:        distributedtxn.ReplicatedPayloadNone,
@@ -329,7 +329,7 @@ func testTransactionCommand(
 	command.Transaction = control
 	command.Batches = nil
 	command.ClientID = replication.ID128(id)
-	command.ClientEpoch = uint64(distributedtxn.ReplicatedRoleParticipant)
+	command.ClientEpoch = uint64(distributedtxn.ReplicatedRoleTarget)
 	command.ClientSequence = sequence
 	command.AckThrough = 0
 	command.Fingerprint = sha256.Sum256(control)
@@ -430,8 +430,8 @@ func TestRegistrySettlementValidatesTransactionResultIdentityWithoutAllocations(
 	const applied = uint64(29)
 	lookup := testTransactionCompletion(
 		t, group, command, applied,
-		distributedtxn.ReplicatedRoleParticipant,
-		distributedtxn.ReplicatedPrepareParticipant,
+		distributedtxn.ReplicatedRoleTarget,
+		distributedtxn.ReplicatedPrepareTarget,
 	)
 	identity, err := openCommandIdentity(group, command)
 	if err != nil {
@@ -467,7 +467,7 @@ func TestRegistrySettlementValidatesTransactionResultIdentityWithoutAllocations(
 		role      distributedtxn.ReplicatedRole
 		operation distributedtxn.ReplicatedOperation
 	}{
-		{distributedtxn.ReplicatedRoleParticipant, distributedtxn.ReplicatedAbortParticipant},
+		{distributedtxn.ReplicatedRoleTarget, distributedtxn.ReplicatedAbortTarget},
 		{distributedtxn.ReplicatedRoleCoordinator, distributedtxn.ReplicatedCommitCoordinator},
 	} {
 		candidate := testTransactionCompletion(

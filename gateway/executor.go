@@ -446,14 +446,14 @@ func (e *Executor) Exec(ctx context.Context, q Query) (*Result, error) {
 			e.observePressureCall(*call)
 		}
 		if call != nil && bound.requiresIndexTransaction() {
-			participants, participantErr := appendBoundWriteParticipants(
+			targets, targetErr := appendBoundWriteTargets(
 				nil, *call, &q, bound, profile,
 			)
-			if participantErr != nil {
-				return nil, participantErr
+			if targetErr != nil {
+				return nil, targetErr
 			}
-			sortTransactionParticipants(participants)
-			res, err = e.executeTransaction(opctx, snap, participants, profile)
+			sortTransactionTargets(targets)
+			res, err = e.executeTransaction(opctx, snap, targets, profile)
 		} else if call != nil {
 			e.metrics.observeRoute(kind, 1, scatter)
 			res, err = e.single(opctx, *call, profile)

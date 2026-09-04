@@ -30,8 +30,8 @@ func TestDurableRequestTypedExecutionContextBindsWideReplay(t *testing.T) {
 		KeyDigest:         reader.KeyDigest,
 		RequestID:         reader.RequestID,
 		RequestDigest:     reader.RequestDigest,
-		ParticipantCount:  reader.ParticipantCount,
-		ParticipantStream: reader,
+		TargetCount:       reader.TargetCount,
+		TargetStream:      reader,
 	}
 	execution, err := NewDurableRequestTypedExecutionContext(
 		DurableRequestLedgerHome{
@@ -45,20 +45,20 @@ func TestDurableRequestTypedExecutionContextBindsWideReplay(t *testing.T) {
 	}
 	for pass := 0; pass < 2; pass++ {
 		if pass != 0 {
-			if err = execution.Participants.Reset(); err != nil {
+			if err = execution.Targets.Reset(); err != nil {
 				t.Fatal(err)
 			}
 		}
 		var count uint64
-		for execution.Participants.Next() {
+		for execution.Targets.Next() {
 			count++
-			if execution.Participants.BufferedBytes() > durableRequestReaderMaxLiveBytes {
+			if execution.Targets.BufferedBytes() > durableRequestReaderMaxLiveBytes {
 				t.Fatalf("live bytes exceeded fixed bound")
 			}
 		}
-		if err = execution.Participants.Err(); err != nil ||
-			!execution.Participants.Complete() || count != 4097 {
-			t.Fatalf("pass=%d count=%d complete=%v err=%v", pass, count, execution.Participants.Complete(), err)
+		if err = execution.Targets.Err(); err != nil ||
+			!execution.Targets.Complete() || count != 4097 {
+			t.Fatalf("pass=%d count=%d complete=%v err=%v", pass, count, execution.Targets.Complete(), err)
 		}
 	}
 }
@@ -126,8 +126,8 @@ func typedExecutionFixtureCount(t testing.TB, count int) DurableRequestTypedExec
 			CatalogGeneration: reader.CatalogGeneration, Identity: reader.Identity,
 			Contract: reader.Contract, Tenant: bytes.Clone(reader.Tenant),
 			KeyDigest: reader.KeyDigest, RequestID: reader.RequestID,
-			RequestDigest: reader.RequestDigest, ParticipantCount: reader.ParticipantCount,
-			ParticipantStream: reader,
+			RequestDigest: reader.RequestDigest, TargetCount: reader.TargetCount,
+			TargetStream: reader,
 		},
 	)
 	if err != nil {
@@ -231,8 +231,8 @@ func TestDurableRequestTypedExecutionContextRejectsIdentityDrift(t *testing.T) {
 		KeyDigest:         reader.KeyDigest,
 		RequestID:         reader.RequestID,
 		RequestDigest:     reader.RequestDigest,
-		ParticipantCount:  reader.ParticipantCount,
-		ParticipantStream: reader,
+		TargetCount:       reader.TargetCount,
+		TargetStream:      reader,
 	}
 	validHome := DurableRequestLedgerHome{Identity: replication.Digest{1}, Point: home}
 	tests := []struct {
@@ -252,7 +252,7 @@ func TestDurableRequestTypedExecutionContextRejectsIdentityDrift(t *testing.T) {
 			recipe.Tenant[0] ^= 1
 		}},
 		{"count", func(_ *DurableRequestLedgerHome, _ *DurableRequestLedgerKey, recipe *DurableRequestRecipe) {
-			recipe.ParticipantCount++
+			recipe.TargetCount++
 		}},
 	}
 	for _, test := range tests {

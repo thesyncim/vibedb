@@ -66,7 +66,7 @@ func pgCapabilityTables(multi bool) []string {
 }
 
 // connectSeededPGWireCatalog materializes the fixture, then reopens the catalog
-// so each participant journal is folded past the seed window and reminted at
+// so each target journal is folded past the seed window and reminted at
 // the conditional format word before multi-table commits prepare.
 func connectSeededPGWireCatalog(t *testing.T, multi, indexed bool) *testClient {
 	t.Helper()

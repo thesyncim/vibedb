@@ -361,7 +361,7 @@ type Options struct {
 	MaxBatchBytes int
 }
 
-// TxnLimits bounds one multi-collection commit across participants. Accounting
+// TxnLimits bounds one multi-collection commit across targets. Accounting
 // completes before any durable work; exceeding any bound is a typed refusal
 // with nothing staged, journaled, or published.
 //
@@ -371,18 +371,18 @@ type Options struct {
 // facade AdvancedOptions, and SQL driver option normalization — never inside
 // the primitive.
 type TxnLimits struct {
-	// MaxCollections bounds how many dirty participants one commit may name.
+	// MaxCollections bounds how many dirty targets one commit may name.
 	// Zero is fail-closed at UpdateCollections. Database.Update normalizes
 	// zero to defaultTxnMaxCollections (16), hard-capped by
-	// storeio.TxnMarkerMaxParticipants.
+	// storeio.TxnMarkerMaxCollections.
 	MaxCollections int
 	// MaxDocuments bounds the total distinct keys staged across every
-	// participant. Zero is fail-closed at UpdateCollections; Database.Update
+	// target. Zero is fail-closed at UpdateCollections; Database.Update
 	// normalizes zero to defaultTxnMaxDocuments (4× the single-collection
 	// MaxBatchDocuments default).
 	MaxDocuments int
 	// MaxBytes bounds the total key and value bytes staged across every
-	// participant. Zero is fail-closed at UpdateCollections; Database.Update
+	// target. Zero is fail-closed at UpdateCollections; Database.Update
 	// normalizes zero to defaultTxnMaxBytes (4× the single-collection
 	// MaxBatchBytes default).
 	MaxBytes int64
@@ -391,7 +391,7 @@ type TxnLimits struct {
 const (
 	// defaultTxnMaxCollections is the Database.Update / package-default
 	// MaxCollections. It matches the design's default of 16 and sits below
-	// storeio.TxnMarkerMaxParticipants (64), the hard encode-time ceiling.
+	// storeio.TxnMarkerMaxCollections (64), the hard encode-time ceiling.
 	defaultTxnMaxCollections = 16
 	// defaultTxnMaxDocuments is 4× store.MaxChunkDocuments, the zero-value
 	// Options.MaxBatchDocuments default.

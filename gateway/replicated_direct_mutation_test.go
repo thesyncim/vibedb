@@ -37,7 +37,7 @@ func TestReplicatedDirectMutationIsOneProposalWithCrossGatewayExactRetry(t *test
 	document := []byte(`{"id":1,"state":"paid"}`)
 	request := ReplicatedDirectMutation{
 		Key: key, RequestDigest: replication.Digest{0x41}, Tenant: tenant,
-		Participant: ReplicatedTransactionParticipant{
+		Target: ReplicatedTransactionTarget{
 			Route: route, BucketBits: 8,
 			IntentScopes: []distributedtxn.IntentScope{{Start: 0, End: 256}},
 			Batches: []replication.RelationMutationBatch{{
@@ -95,7 +95,7 @@ func TestReplicatedDirectMutationIsOneProposalWithCrossGatewayExactRetry(t *test
 	next.RequestDigest[0]++
 	nextKey := []byte("direct-key-next")
 	nextValue := []byte(`{"id":2,"state":"paid"}`)
-	next.Participant.Batches = []replication.RelationMutationBatch{{
+	next.Target.Batches = []replication.RelationMutationBatch{{
 		Relation: 1, Mutations: []replication.Mutation{{
 			Kind: replication.MutationPutAbsentOrEqual, Key: nextKey, Value: nextValue,
 		}},

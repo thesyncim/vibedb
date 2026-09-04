@@ -137,7 +137,7 @@ func TestUpdateCollectionsBatchDocumentsHintIsReservationOnly(t *testing.T) {
 	if err := UpdateCollections(log, []NamedCollection{a, b}, defaultTxnLimits(), func(*DatabaseBatch) error {
 		called = true
 		return nil
-	}); !errors.Is(err, ErrTxnParticipant) || called {
+	}); !errors.Is(err, ErrTxnCollection) || called {
 		t.Fatalf("invalid hint = %v, callback=%t", err, called)
 	}
 }
@@ -191,7 +191,7 @@ func TestTxnLogValidateCollectionsIsReadOnlyAndFailsClosed(t *testing.T) {
 	if err := b.Collection.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := log.ValidateCollections([]NamedCollection{a, b}); !errors.Is(err, ErrTxnParticipant) {
+	if err := log.ValidateCollections([]NamedCollection{a, b}); !errors.Is(err, ErrTxnCollection) {
 		t.Fatalf("closed participant error = %v", err)
 	}
 	if err := log.Close(); err != nil {
@@ -202,7 +202,7 @@ func TestTxnLogValidateCollectionsIsReadOnlyAndFailsClosed(t *testing.T) {
 	}
 }
 
-func TestTxnLogPinnedDirectoryAndParticipantIdentity(t *testing.T) {
+func TestTxnLogPinnedDirectoryAndTargetIdentity(t *testing.T) {
 	t.Run("retarget after open", func(t *testing.T) {
 		dirA := t.TempDir()
 		dirB := t.TempDir()
@@ -1294,16 +1294,16 @@ func TestDatabaseTxnAllocationBudget(t *testing.T) {
 	if err := UpdateCollections(log, members, limits, workload); err != nil {
 		t.Fatalf("warm: %v", err)
 	}
-	const perParticipantBudget = 64
+	const perTargetBudget = 64
 	allocs := testing.AllocsPerRun(50, func() {
 		if err := UpdateCollections(log, members, limits, workload); err != nil {
 			t.Fatalf("commit: %v", err)
 		}
 	})
 	// Budget is stated per participant for the K=2 path.
-	if allocs > float64(2*perParticipantBudget) {
+	if allocs > float64(2*perTargetBudget) {
 		t.Fatalf("K=2 allocations = %.2f, want ≤ %d (2×%d per participant)",
-			allocs, 2*perParticipantBudget, perParticipantBudget)
+			allocs, 2*perTargetBudget, perTargetBudget)
 	}
 }
 

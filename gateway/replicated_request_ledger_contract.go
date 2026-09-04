@@ -70,22 +70,22 @@ func SealDurableRequestLogicalProgram(
 	contract.CatalogGeneration = program.Identity.CatalogGeneration
 	contract.KeyDigest = program.KeyDigest
 	contract.RequestDigest = program.RequestDigest
-	contract.ParticipantCount = uint64(len(program.Participants))
+	contract.TargetCount = uint64(len(program.Targets))
 	contract.KernelSemanticsDigest = replication.Digest(requestledger.SemanticsDigest())
 	var mutationDigester replication.TransactionMutationDigester
-	for index := range program.Participants {
-		digest, err := mutationDigester.Digest(program.Participants[index].Batches)
+	for index := range program.Targets {
+		digest, err := mutationDigester.Digest(program.Targets[index].Batches)
 		if err != nil {
 			return DurableRequestLogicalProgram{}, err
 		}
-		program.Participants[index].MutationDigest = digest
+		program.Targets[index].MutationDigest = digest
 	}
 	contract.TransactionManifestDigest = durableRequestTransactionManifestDigest(program)
 	contract.RetryHomeDerivationDigest = durableRequestRetryHomeContractDigest(program)
 	contract.ClockContractDigest = durableRequestClockContractDigest(program)
 	contract.CoordinatorIdentityDigest = durableRequestCoordinatorIdentityDigest(program)
-	contract.SchemaManifestDigest = durableRequestSchemaManifestDigest(program.Participants)
-	contract.LineageForwardingDigest = durableRequestLineageForwardingDigest(program.Participants)
+	contract.SchemaManifestDigest = durableRequestSchemaManifestDigest(program.Targets)
+	contract.LineageForwardingDigest = durableRequestLineageForwardingDigest(program.Targets)
 	contract.ProtocolProgramDigest = durableRequestProtocolProgramDigest(*contract)
 	if stableMembership {
 		contract.ProtocolProgramDigest = durableRequestMembershipStableProgramDigest(*contract)
@@ -138,23 +138,23 @@ func validDurableRequestLogicalProgram(program DurableRequestLogicalProgram) boo
 	contract := program.Contract
 	if contract.CatalogGeneration != program.Identity.CatalogGeneration ||
 		contract.KeyDigest != program.KeyDigest || contract.RequestDigest != program.RequestDigest ||
-		contract.ParticipantCount != uint64(len(program.Participants)) ||
+		contract.TargetCount != uint64(len(program.Targets)) ||
 		contract.KernelSemanticsDigest != replication.Digest(requestledger.SemanticsDigest()) ||
 		contract.TransactionManifestDigest != durableRequestTransactionManifestDigest(program) ||
 		contract.RetryHomeDerivationDigest != durableRequestRetryHomeContractDigest(program) ||
 		contract.ClockContractDigest != durableRequestClockContractDigest(program) ||
 		contract.CoordinatorIdentityDigest != durableRequestCoordinatorIdentityDigest(program) ||
-		contract.SchemaManifestDigest != durableRequestSchemaManifestDigest(program.Participants) ||
-		contract.LineageForwardingDigest != durableRequestLineageForwardingDigest(program.Participants) ||
+		contract.SchemaManifestDigest != durableRequestSchemaManifestDigest(program.Targets) ||
+		contract.LineageForwardingDigest != durableRequestLineageForwardingDigest(program.Targets) ||
 		contract.ResultGrammarDigest != durableRequestResultGrammarDigest() ||
 		!validDurableRequestProtocolProgram(contract) ||
 		contract.TerminalContractDigest != durableRequestTerminalContractDigest(contract) {
 		return false
 	}
 	var mutationDigester replication.TransactionMutationDigester
-	for index := range program.Participants {
-		digest, err := mutationDigester.Digest(program.Participants[index].Batches)
-		if err != nil || digest != program.Participants[index].MutationDigest {
+	for index := range program.Targets {
+		digest, err := mutationDigester.Digest(program.Targets[index].Batches)
+		if err != nil || digest != program.Targets[index].MutationDigest {
 			return false
 		}
 	}
@@ -170,8 +170,8 @@ func durableRequestLogicalProgramBaseValid(program DurableRequestLogicalProgram)
 		identity.CatalogGeneration == 0 || identity.RecoveryDeadline <= 0 ||
 		len(program.Tenant) == 0 || len(program.Tenant) > replication.MaxIdentityBytes ||
 		program.KeyDigest == (replication.Digest{}) || program.RequestID == (replication.ID128{}) ||
-		program.RequestDigest == (replication.Digest{}) || len(program.Participants) == 0 ||
-		uint64(identity.CoordinatorOrdinal) >= uint64(len(program.Participants)) ||
+		program.RequestDigest == (replication.Digest{}) || len(program.Targets) == 0 ||
+		uint64(identity.CoordinatorOrdinal) >= uint64(len(program.Targets)) ||
 		contract.PinID != durableRequestPinID(program.KeyDigest, program.RequestDigest) || contract.PinEpoch == 0 ||
 		contract.PinDigest == (replication.Digest{}) ||
 		contract.RouteSchemaCertificateDigest == (replication.Digest{}) ||
@@ -200,21 +200,21 @@ func durableRequestLogicalProgramBaseValid(program DurableRequestLogicalProgram)
 		contract.PlanningLeaseGeneration == 0 {
 		return false
 	}
-	for index := range program.Participants {
-		participant := &program.Participants[index]
-		if len(participant.Distribution) == 0 || len(participant.Distribution) > replication.MaxIdentityBytes ||
-			len(participant.Shard) == 0 || len(participant.Shard) > replication.MaxIdentityBytes ||
-			participant.RangeIdentity == (replication.Digest{}) ||
-			participant.SchemaGeneration == 0 ||
-			participant.RelationManifestDigest == (replication.Digest{}) ||
-			participant.LineageDigest == (replication.Digest{}) ||
-			participant.ForwardingRuleDigest == (replication.Digest{}) ||
-			!validDurableRequestLogicalGroup(participant.Group) ||
-			!distributedtxn.ValidateIntentScopes(participant.IntentScopes, participant.BucketBits) {
+	for index := range program.Targets {
+		target := &program.Targets[index]
+		if len(target.Distribution) == 0 || len(target.Distribution) > replication.MaxIdentityBytes ||
+			len(target.Shard) == 0 || len(target.Shard) > replication.MaxIdentityBytes ||
+			target.RangeIdentity == (replication.Digest{}) ||
+			target.SchemaGeneration == 0 ||
+			target.RelationManifestDigest == (replication.Digest{}) ||
+			target.LineageDigest == (replication.Digest{}) ||
+			target.ForwardingRuleDigest == (replication.Digest{}) ||
+			!validDurableRequestLogicalGroup(target.Group) ||
+			!distributedtxn.ValidateIntentScopes(target.IntentScopes, target.BucketBits) {
 			return false
 		}
-		if index != 0 && compareDurableRequestLogicalParticipant(
-			program.Participants[index-1], *participant,
+		if index != 0 && compareDurableRequestLogicalTarget(
+			program.Targets[index-1], *target,
 		) >= 0 {
 			return false
 		}
@@ -222,7 +222,7 @@ func durableRequestLogicalProgramBaseValid(program DurableRequestLogicalProgram)
 	return true
 }
 
-func compareDurableRequestLogicalParticipant(left, right DurableRequestLogicalParticipant) int {
+func compareDurableRequestLogicalTarget(left, right DurableRequestLogicalTarget) int {
 	if order := bytes.Compare(byteview.Bytes(string(left.Distribution)), byteview.Bytes(string(right.Distribution))); order != 0 {
 		return order
 	}
@@ -245,8 +245,8 @@ func durableRequestTransactionManifestDigest(program DurableRequestLogicalProgra
 	writeDurableRequestIdentity(hash, &scratch, program.Identity)
 	_, _ = hash.Write(program.KeyDigest[:])
 	_, _ = hash.Write(program.RequestDigest[:])
-	for index := range program.Participants {
-		writeDurableRequestParticipantIdentity(hash, &scratch, &program.Participants[index])
+	for index := range program.Targets {
+		writeDurableRequestTargetIdentity(hash, &scratch, &program.Targets[index])
 	}
 	return sumDurableRequestDigest(hash)
 }
@@ -289,31 +289,31 @@ func durableRequestCoordinatorIdentityDigest(program DurableRequestLogicalProgra
 	var scratch [8]byte
 	_, _ = hash.Write(byteview.Bytes(durableRequestCoordinatorDomain))
 	writeDurableRequestU64(hash, &scratch, uint64(program.Identity.CoordinatorOrdinal))
-	writeDurableRequestParticipantIdentity(hash, &scratch, &program.Participants[program.Identity.CoordinatorOrdinal])
+	writeDurableRequestTargetIdentity(hash, &scratch, &program.Targets[program.Identity.CoordinatorOrdinal])
 	return sumDurableRequestDigest(hash)
 }
 
-func durableRequestSchemaManifestDigest(participants []DurableRequestLogicalParticipant) replication.Digest {
+func durableRequestSchemaManifestDigest(targets []DurableRequestLogicalTarget) replication.Digest {
 	hash := sha256.New()
 	var scratch [8]byte
 	_, _ = hash.Write(byteview.Bytes(durableRequestSchemaDomain))
-	writeDurableRequestU64(hash, &scratch, uint64(len(participants)))
-	for index := range participants {
-		writeDurableRequestU64(hash, &scratch, participants[index].SchemaGeneration)
-		_, _ = hash.Write(participants[index].RelationManifestDigest[:])
+	writeDurableRequestU64(hash, &scratch, uint64(len(targets)))
+	for index := range targets {
+		writeDurableRequestU64(hash, &scratch, targets[index].SchemaGeneration)
+		_, _ = hash.Write(targets[index].RelationManifestDigest[:])
 	}
 	return sumDurableRequestDigest(hash)
 }
 
-func durableRequestLineageForwardingDigest(participants []DurableRequestLogicalParticipant) replication.Digest {
+func durableRequestLineageForwardingDigest(targets []DurableRequestLogicalTarget) replication.Digest {
 	hash := sha256.New()
 	var scratch [8]byte
 	_, _ = hash.Write(byteview.Bytes(durableRequestLineageDomain))
-	writeDurableRequestU64(hash, &scratch, uint64(len(participants)))
-	for index := range participants {
-		_, _ = hash.Write(participants[index].RangeIdentity[:])
-		_, _ = hash.Write(participants[index].LineageDigest[:])
-		_, _ = hash.Write(participants[index].ForwardingRuleDigest[:])
+	writeDurableRequestU64(hash, &scratch, uint64(len(targets)))
+	for index := range targets {
+		_, _ = hash.Write(targets[index].RangeIdentity[:])
+		_, _ = hash.Write(targets[index].LineageDigest[:])
+		_, _ = hash.Write(targets[index].ForwardingRuleDigest[:])
 	}
 	return sumDurableRequestDigest(hash)
 }
@@ -336,7 +336,7 @@ func durableRequestProtocolProgramDigest(contract DurableRequestExecutionContrac
 	}
 	writeDurableRequestU64(hash, &scratch, uint64(contract.CommitTransitionTag))
 	writeDurableRequestU64(hash, &scratch, uint64(contract.AbortTransitionTag))
-	writeDurableRequestU64(hash, &scratch, contract.ParticipantCount)
+	writeDurableRequestU64(hash, &scratch, contract.TargetCount)
 	writeDurableRequestU64(hash, &scratch, contract.CommitFinalWaveCount)
 	writeDurableRequestU64(hash, &scratch, contract.AbortFinalWaveCount)
 	writeDurableRequestU64(hash, &scratch, contract.MaxActivePayloadBytes)
@@ -384,7 +384,7 @@ func durableRequestTerminalContractDigest(contract DurableRequestExecutionContra
 	_, _ = hash.Write(contract.PinID[:])
 	for _, value := range [...]uint64{
 		contract.PinEpoch, uint64(contract.CommitTransitionTag), uint64(contract.AbortTransitionTag),
-		contract.ParticipantCount, contract.MaxPendingWaveBytes,
+		contract.TargetCount, contract.MaxPendingWaveBytes,
 		contract.MaxContinuationBytes, contract.MaxTerminalBytes,
 		contract.CommitFinalWaveCount, contract.AbortFinalWaveCount,
 		contract.MaxActivePayloadBytes, contract.MaxActivePayloadChunks,
@@ -409,30 +409,30 @@ func writeDurableRequestIdentity(
 	writeDurableRequestU64(hash, scratch, uint64(identity.CoordinatorOrdinal))
 }
 
-func writeDurableRequestParticipantIdentity(
+func writeDurableRequestTargetIdentity(
 	hash durableRequestHashWriter,
 	scratch *[8]byte,
-	participant *DurableRequestLogicalParticipant,
+	target *DurableRequestLogicalTarget,
 ) {
-	writeDurableRequestBytes(hash, scratch, byteview.Bytes(string(participant.Distribution)))
-	writeDurableRequestBytes(hash, scratch, byteview.Bytes(string(participant.Shard)))
-	_, _ = hash.Write(participant.RangeIdentity[:])
-	_, _ = hash.Write(participant.Group.ClusterID[:])
-	_, _ = hash.Write(participant.Group.ClusterIncarnation[:])
-	writeDurableRequestU64(hash, scratch, participant.Group.TopologyRecoveryEpoch)
-	_, _ = hash.Write(participant.Group.ShardIncarnation[:])
-	_, _ = hash.Write(participant.Group.GroupID[:])
-	writeDurableRequestU64(hash, scratch, participant.SchemaGeneration)
-	_, _ = hash.Write(participant.RelationManifestDigest[:])
-	_, _ = hash.Write(participant.LineageDigest[:])
-	_, _ = hash.Write(participant.ForwardingRuleDigest[:])
-	_, _ = hash.Write(participant.MutationDigest[:])
-	scratch[0] = participant.BucketBits
+	writeDurableRequestBytes(hash, scratch, byteview.Bytes(string(target.Distribution)))
+	writeDurableRequestBytes(hash, scratch, byteview.Bytes(string(target.Shard)))
+	_, _ = hash.Write(target.RangeIdentity[:])
+	_, _ = hash.Write(target.Group.ClusterID[:])
+	_, _ = hash.Write(target.Group.ClusterIncarnation[:])
+	writeDurableRequestU64(hash, scratch, target.Group.TopologyRecoveryEpoch)
+	_, _ = hash.Write(target.Group.ShardIncarnation[:])
+	_, _ = hash.Write(target.Group.GroupID[:])
+	writeDurableRequestU64(hash, scratch, target.SchemaGeneration)
+	_, _ = hash.Write(target.RelationManifestDigest[:])
+	_, _ = hash.Write(target.LineageDigest[:])
+	_, _ = hash.Write(target.ForwardingRuleDigest[:])
+	_, _ = hash.Write(target.MutationDigest[:])
+	scratch[0] = target.BucketBits
 	_, _ = hash.Write(scratch[:1])
-	writeDurableRequestU64(hash, scratch, uint64(len(participant.IntentScopes)))
-	for index := range participant.IntentScopes {
-		writeDurableRequestU64(hash, scratch, uint64(participant.IntentScopes[index].Start))
-		writeDurableRequestU64(hash, scratch, uint64(participant.IntentScopes[index].End))
+	writeDurableRequestU64(hash, scratch, uint64(len(target.IntentScopes)))
+	for index := range target.IntentScopes {
+		writeDurableRequestU64(hash, scratch, uint64(target.IntentScopes[index].Start))
+		writeDurableRequestU64(hash, scratch, uint64(target.IntentScopes[index].End))
 	}
 }
 

@@ -35,8 +35,8 @@ type Binding struct {
 	CatalogGeneration         uint64
 	SchemaManifestDigest      Digest
 	TransactionManifestDigest Digest
-	ParticipantAuthorityRoot  Digest
-	ParticipantCount          uint64
+	TargetAuthorityRoot       Digest
+	TargetCount               uint64
 	ExecutionContractDigest   Digest
 	LedgerHomeGroup           ID
 }
@@ -46,7 +46,7 @@ func (binding Binding) Valid() bool {
 		binding.CatalogGeneration != 0 &&
 		binding.SchemaManifestDigest != (Digest{}) &&
 		binding.TransactionManifestDigest != (Digest{}) &&
-		binding.ParticipantAuthorityRoot != (Digest{}) && binding.ParticipantCount != 0 &&
+		binding.TargetAuthorityRoot != (Digest{}) && binding.TargetCount != 0 &&
 		binding.ExecutionContractDigest != (Digest{}) && binding.LedgerHomeGroup != (ID{})
 }
 
@@ -94,8 +94,8 @@ func appendBinding(dst []byte, binding Binding) []byte {
 	dst = binary.LittleEndian.AppendUint64(dst, binding.CatalogGeneration)
 	dst = append(dst, binding.SchemaManifestDigest[:]...)
 	dst = append(dst, binding.TransactionManifestDigest[:]...)
-	dst = append(dst, binding.ParticipantAuthorityRoot[:]...)
-	dst = binary.LittleEndian.AppendUint64(dst, binding.ParticipantCount)
+	dst = append(dst, binding.TargetAuthorityRoot[:]...)
+	dst = binary.LittleEndian.AppendUint64(dst, binding.TargetCount)
 	dst = append(dst, binding.ExecutionContractDigest[:]...)
 	return append(dst, binding.LedgerHomeGroup[:]...)
 }
@@ -110,8 +110,8 @@ func openBinding(raw []byte) (Binding, bool) {
 	binding.CatalogGeneration = binary.LittleEndian.Uint64(raw[64:72])
 	copy(binding.SchemaManifestDigest[:], raw[72:104])
 	copy(binding.TransactionManifestDigest[:], raw[104:136])
-	copy(binding.ParticipantAuthorityRoot[:], raw[136:168])
-	binding.ParticipantCount = binary.LittleEndian.Uint64(raw[168:176])
+	copy(binding.TargetAuthorityRoot[:], raw[136:168])
+	binding.TargetCount = binary.LittleEndian.Uint64(raw[168:176])
 	copy(binding.ExecutionContractDigest[:], raw[176:208])
 	copy(binding.LedgerHomeGroup[:], raw[208:224])
 	return binding, binding.Valid()
