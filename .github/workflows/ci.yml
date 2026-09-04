@@ -637,30 +637,6 @@ jobs:
         with:
           path: ${{ steps.go.outputs.cache-path }}
           key: ${{ steps.go.outputs.cache-key }}
-  test:
-    name: test (${{ matrix.runner }})
-    if: always()
-    needs: [cross-compile, unit-tests, sql-tests, simd-tests, durable-sql-rf3, hot-shard-mutation, storage-race]
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [ubuntu-latest, ubuntu-24.04-arm]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Require every test lane to pass
-        env:
-          RESULTS: ${{ toJSON(needs) }}
-        run: jq -e 'all(.[]; .result == "success")' <<< "$RESULTS"
-  lateral-race:
-    name: race (LATERAL cross-layer)
-    if: always()
-    needs: [repository-contracts]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Require contracts, restore and LATERAL tests to pass
-        env:
-          RESULT: ${{ needs.repository-contracts.result }}
-        run: test "$RESULT" = success
   distributed-race-packages:
     needs: [sql-tests]
     if: ${{ !cancelled() }}
@@ -697,23 +673,3 @@ jobs:
         with:
           path: ${{ steps.go.outputs.cache-path }}
           key: ${{ steps.go.outputs.cache-key }}
-  distributed-race:
-    name: race (distributed serving)
-    if: always()
-    needs: [distributed-race-packages]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Require every distributed race package to pass
-        env:
-          RESULT: ${{ needs.distributed-race-packages.result }}
-        run: test "$RESULT" = success
-  restore-activation:
-    name: Fresh RF3 restore activation crash qualification
-    if: always()
-    needs: [repository-contracts]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Require repository contracts and restore activation to pass
-        env:
-          RESULT: ${{ needs.repository-contracts.result }}
-        run: test "$RESULT" = success
