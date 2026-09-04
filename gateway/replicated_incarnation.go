@@ -71,6 +71,21 @@ func (client *AuthenticatedReplicatedClient) probeReplicatedBound(
 func bindReplicatedObservation(route ReplicatedRoute, endpoint ReplicatedEndpoint,
 	response *shardservice.ReplicatedResponse,
 ) (ReplicatedEndpoint, error) {
+	// A prepared group can be absent briefly while its local owner is being
+	// installed. Preserve this authenticated refusal for bounded read retry;
+	// an attached observation must still match every ordinary probe fence.
+	if response != nil && response.Kind == shardservice.ReplicatedRefusal &&
+		response.Refusal == shardservice.ReplicatedRefusalUnavailable &&
+		shardservice.ValidateReplicatedResponse(response) == nil {
+		if response.HasState {
+			observation := *response
+			observation.Kind, observation.Refusal = shardservice.ReplicatedHandshake, 0
+			if _, err := bindReplicatedObservation(route, endpoint, &observation); err != nil {
+				return ReplicatedEndpoint{}, err
+			}
+		}
+		return ReplicatedEndpoint{}, &ReplicatedRefusalError{Code: response.Refusal}
+	}
 	if response == nil || response.Kind != shardservice.ReplicatedHandshake ||
 		!validReplicatedResponseState(response) || !validReplicatedNonterminalResponse(response) {
 		return ReplicatedEndpoint{}, ErrReplicatedRoute
