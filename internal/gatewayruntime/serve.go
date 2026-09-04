@@ -836,6 +836,11 @@ func handleConnPolicyDurable(ctx context.Context, conn net.Conn, exec *gateway.E
 	var requestScratch serveRequestDecodeScratch
 	for scanner.Scan() {
 		line := scanner.Bytes()
+		if exactOperationCandidate(line, []byte(`"ddl_forward"`)) {
+			owner, _ := ctx.Value(gatewayDDLForwardContextKey{}).(*gatewayDDLForwardOwner)
+			serveGatewayDDLForward(ctx, conn, owner, line)
+			return
+		}
 		structuredExecCandidate := durableExecBatchRequestCandidate(line)
 		backupCandidate := gatewayBackupRequestCandidate(line)
 		backupValid := backupCandidate && validateGatewayBackupEnvelope(line) == nil

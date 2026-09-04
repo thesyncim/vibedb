@@ -69,13 +69,13 @@ func (runtime *Runtime) open() error {
 			serviceauthz.CapabilityDelegate | serviceauthz.CapabilityTopology |
 			serviceauthz.CapabilityTransactionRecovery | serviceauthz.CapabilityRequestLedger |
 			serviceauthz.CapabilityExecutionPin
-		if config.SchemaRolloutPlan != "" {
+		if config.SchemaRolloutPlan != "" || config.PGDDLSocket != "" || config.DDLOwnerAddress != "" {
 			required |= serviceauthz.CapabilitySchema
 		}
 		if config.BackupRepositoryPath != "" {
 			required |= serviceauthz.CapabilityBackup
 		}
-		if config.ReplicaControlManifestPath != "" {
+		if config.ReplicaControlManifestPath != "" && !config.ControlParticipantOnly {
 			required |= serviceauthz.CapabilityMembership
 		}
 		if policy.Check(authority.Node, required) != serviceauthz.DecisionAllow {
@@ -148,7 +148,15 @@ func (runtime *Runtime) open() error {
 		}
 		runtime.routeSeedControl = runtime.authority.ReplicatedCatalogRouteSeedControl()
 	}
-	for _, path := range config.TableCatalogs {
+	tableCatalogs := config.TableCatalogs
+	if config.TableCatalogsPath != "" {
+		listed, loadErr := loadGatewayTableCatalogPaths(config.TableCatalogsPath)
+		if loadErr != nil {
+			return fmt.Errorf("load table catalogs: %w", loadErr)
+		}
+		tableCatalogs = append(append([]string(nil), tableCatalogs...), listed...)
+	}
+	for _, path := range tableCatalogs {
 		if runtime.authority == nil {
 			return fmt.Errorf("%w: table registration requires replicated catalog authority", ErrInvalidConfig)
 		}
@@ -203,6 +211,9 @@ func (runtime *Runtime) open() error {
 		}
 	}
 	if err = runtime.openReplicaControl(); err != nil {
+		return err
+	}
+	if err = runtime.openDDL(); err != nil {
 		return err
 	}
 	if config.Listener != nil {

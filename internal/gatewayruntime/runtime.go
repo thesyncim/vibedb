@@ -7,6 +7,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -100,19 +102,32 @@ type Config struct {
 	// identity while remaining separate from the catalog session journal.
 	PGListenAddress string
 	PGDDLSocket     string
+	// A participant forwards DDL once to this exact authenticated gateway
+	// principal. The owner retains the only schema journal and recovery loop.
+	DDLOwnerAddress string
+	DDLOwnerNode    rafttransport.NodeID
 
-	TableCatalogs              []string
+	TableCatalogs []string
+	// TableCatalogsPath is a fixed manifest path whose canonical array of
+	// provisioned table fragments is read once at Open by the controller owner.
+	// Live provisioning can update that file without changing runtime config.
+	TableCatalogsPath          string
 	HotShardCapacityPath       string
 	HotShardInterval           time.Duration
 	ReplicaControlManifestPath string
-	BackupRepositoryPath       string
-	BackupMaxBackups           int
-	BackupMaxArtifacts         int
-	BackupMaxArtifactBytes     uint64
-	BackupMaxDiskBytes         uint64
-	ControllerInterval         time.Duration
-	SchemaRolloutPlan          string
-	SchemaRolloutOnce          bool
+	// ControlParticipantOnly serves authenticated catalog drain requests for
+	// this admitting frontend without starting autonomous topology controllers.
+	// Every manifest must list the full roster of admitting gateway principals;
+	// only the designated controller frontend leaves this false.
+	ControlParticipantOnly bool
+	BackupRepositoryPath   string
+	BackupMaxBackups       int
+	BackupMaxArtifacts     int
+	BackupMaxArtifactBytes uint64
+	BackupMaxDiskBytes     uint64
+	ControllerInterval     time.Duration
+	SchemaRolloutPlan      string
+	SchemaRolloutOnce      bool
 
 	Logf func(format string, args ...any)
 }
@@ -142,6 +157,9 @@ type Runtime struct {
 	pg               interface{ Close() error }
 	pgWriter         interface{ Close() error }
 	pgWriterDone     <-chan struct{}
+	pgDDL            func(context.Context, serviceauthz.Authority, string) error
+	ddlForwardTLS    *servicetls.Client
+	ddlForwardOwner  *gatewayDDLForwardOwner
 
 	replicaControlManifest        *gatewayReplicaControlManifest
 	controlListener               net.Listener
@@ -280,6 +298,30 @@ func (config *Config) withDefaults() {
 }
 
 func (config Config) validate() error {
+	if config.ControlParticipantOnly {
+		if config.ReplicaControlManifestPath == "" || config.DevStaticCatalog || config.DevPlaintext {
+			return fmt.Errorf("%w: control participation requires an authenticated replicated catalog and control manifest", ErrInvalidConfig)
+		}
+		if config.HotShardCapacityPath != "" || config.BackupRepositoryPath != "" ||
+			config.SchemaRolloutPlan != "" || config.SchemaRolloutOnce || config.TableCatalogsPath != "" || len(config.TableCatalogs) != 0 {
+			return fmt.Errorf("%w: control participant cannot configure autonomous topology, backup, or schema rollout controllers", ErrInvalidConfig)
+		}
+		if config.PGListenAddress != "" && (config.DDLOwnerAddress == "" || config.DDLOwnerNode == (rafttransport.NodeID{})) {
+			return fmt.Errorf("%w: participant PostgreSQL requires an authenticated DDL owner", ErrInvalidConfig)
+		}
+	}
+	if config.DDLOwnerAddress != "" || config.DDLOwnerNode != (rafttransport.NodeID{}) {
+		if !config.ControlParticipantOnly || config.PGListenAddress == "" ||
+			config.DDLOwnerAddress == "" || config.DDLOwnerNode == (rafttransport.NodeID{}) {
+			return fmt.Errorf("%w: DDL owner requires a PostgreSQL control participant and exact endpoint identity", ErrInvalidConfig)
+		}
+		host, port, addressErr := net.SplitHostPort(config.DDLOwnerAddress)
+		portNumber, portErr := strconv.ParseUint(port, 10, 16)
+		if addressErr != nil || portErr != nil || portNumber == 0 || host == "" ||
+			len(config.DDLOwnerAddress) > 1024 || strings.IndexByte(config.DDLOwnerAddress, 0) >= 0 {
+			return fmt.Errorf("%w: invalid DDL owner endpoint", ErrInvalidConfig)
+		}
+	}
 	if err := validateGatewayConfigPath("catalog path", config.CatalogPath, true); err != nil {
 		return err
 	}
@@ -329,6 +371,7 @@ func (config Config) validate() error {
 		}
 	}
 	for label, path := range map[string]string{
+		"table catalogs path":      config.TableCatalogsPath,
 		"PostgreSQL DDL socket":    config.PGDDLSocket,
 		"hot-shard capacity path":  config.HotShardCapacityPath,
 		"replica-control manifest": config.ReplicaControlManifestPath,
@@ -352,6 +395,10 @@ func (config Config) validate() error {
 	}
 	if config.SchemaRolloutOnce && config.SchemaRolloutPlan == "" {
 		return fmt.Errorf("%w: schema rollout once requires a rollout plan", ErrInvalidConfig)
+	}
+	if config.TableCatalogsPath != "" &&
+		(config.DevStaticCatalog || config.DevPlaintext || config.ReplicaControlManifestPath == "") {
+		return fmt.Errorf("%w: persistent table catalog registration requires an authenticated controller", ErrInvalidConfig)
 	}
 	if config.SchemaRolloutPlan != "" &&
 		(config.DevStaticCatalog || config.DevPlaintext || config.ReplicaControlManifestPath == "") {

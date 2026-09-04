@@ -7,7 +7,6 @@ import (
 	"net"
 
 	"github.com/thesyncim/vibedb/gateway"
-	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/servicetls"
 	"github.com/thesyncim/vibedb/internal/storeio"
 )
@@ -52,12 +51,8 @@ func (runtime *Runtime) runServe() {
 			defer close(writerDone)
 			writer.Run(runtime.ctx)
 		}()
-		var ddl func(context.Context, serviceauthz.Authority, string) error
-		if runtime.config.PGDDLSocket != "" {
-			ddl = newGatewayDevDDL(runtime.config.PGDDLSocket, runtime.authority, runtime.schemaDDL)
-		}
 		pg, err := startGatewayPostgreSQL(runtime.ctx, runtime.config.PGListenAddress,
-			runtime.exec, runtime.config.InternalAuthority, writer.Write, logf, ddl)
+			runtime.exec, runtime.config.InternalAuthority, writer.Write, logf, runtime.pgDDL)
 		if err != nil {
 			runtime.setServeError(err)
 			return
@@ -182,6 +177,9 @@ func (runtime *Runtime) closeResources() error {
 	}
 	if runtime.shardTLS != nil {
 		err = errors.Join(err, runtime.shardTLS.Close())
+	}
+	if runtime.ddlForwardTLS != nil {
+		err = errors.Join(err, runtime.ddlForwardTLS.Close())
 	}
 	// Recovery identities remain exclusively owned until every frontend user,
 	// route handoff and owned transport has finished closing. Keep the lock

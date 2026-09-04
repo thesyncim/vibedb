@@ -7,7 +7,6 @@ import (
 	"net"
 	"time"
 
-	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/clusterbackup"
 	"github.com/thesyncim/vibedb/internal/hotshard"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
@@ -41,14 +40,23 @@ func (runtime *Runtime) openReplicaControl() error {
 	if err = manifest.ValidateCatalog(runtime.holder.Current()); err != nil {
 		return fmt.Errorf("replica control catalog endpoints: %w", err)
 	}
-	if runtime.config.Authorization.Check(profile.LocalIdentity().Node,
-		serviceauthz.CapabilityTopology|serviceauthz.CapabilityMembership) != serviceauthz.DecisionAllow {
-		return fmt.Errorf("%w: replica controller identity lacks topology and membership authority", ErrInvalidConfig)
+	required := serviceauthz.CapabilityTopology
+	if !config.ControlParticipantOnly {
+		required |= serviceauthz.CapabilityMembership
+	}
+	if runtime.config.Authorization.Check(profile.LocalIdentity().Node, required) != serviceauthz.DecisionAllow {
+		return fmt.Errorf("%w: gateway control identity lacks required authority", ErrInvalidConfig)
 	}
 	for _, endpoint := range manifest.Gateways {
 		if runtime.config.Authorization.Check(endpoint.Member.Node, serviceauthz.CapabilityTopology) != serviceauthz.DecisionAllow {
 			return fmt.Errorf("%w: replica control roster contains a gateway without topology authority", ErrInvalidConfig)
 		}
+	}
+	if err := runtime.openCatalogDrainService(manifest, runtime.authority); err != nil {
+		return err
+	}
+	if config.ControlParticipantOnly {
+		return nil
 	}
 
 	handshakeDeadline := servicetls.FixedDeadline(config.TLSHandshakeTimeout)
@@ -160,46 +168,6 @@ func (runtime *Runtime) openReplicaControl() error {
 		return fmt.Errorf("open replica health revisions: %w", err)
 	}
 	runtime.healthRevisions = healthRevisions
-	gatewayNodes := make([]rafttransport.NodeID, len(manifest.Gateways))
-	gatewayRoster := make(map[rafttransport.NodeID]uint64, len(manifest.Gateways))
-	for index, endpoint := range manifest.Gateways {
-		gatewayNodes[index] = endpoint.Member.Node
-		gatewayRoster[endpoint.Member.Node] = endpoint.Member.Incarnation
-	}
-	authorizer, err := servicetls.NewNodeAuthorizer(gatewayNodes)
-	if err != nil {
-		return fmt.Errorf("open gateway control authorizer: %w", err)
-	}
-	runtime.controlTLS, err = servicetls.NewServer(
-		profile.WithLocalGatewayControlConnections(), rafttransport.TrafficGatewayControl, authorizer,
-	)
-	if err != nil {
-		return fmt.Errorf("open gateway control TLS: %w", err)
-	}
-	runtime.controlService, err = gateway.NewClusterCatalogDrainControlService(
-		gateway.ClusterCatalogDrainControlOptions{Holder: runtime.holder,
-			Catalog: gatewayCatalogDigestVerifier{catalog: runtime.authority}, Member: manifest.Local.Member,
-			Authorize: func(identity rafttransport.PeerIdentity, _ gateway.ClusterCatalogDrainRequest) bool {
-				incarnation, found := gatewayRoster[identity.Node]
-				return found && incarnation != 0 && runtime.config.Authorization.Check(
-					identity.Node, serviceauthz.CapabilityTopology,
-				) == serviceauthz.DecisionAllow
-			}, ReadDeadline: readDeadline, WriteDeadline: writeDeadline},
-	)
-	if err != nil {
-		return fmt.Errorf("open catalog drain service: %w", err)
-	}
-	runtime.controlListener, err = net.Listen("tcp", manifest.Local.Address)
-	if err != nil {
-		return fmt.Errorf("listen gateway control %q: %w", manifest.Local.Address, err)
-	}
-	runtime.replicaControlManifest = &manifest
-	controllerCtx, authorityErr := serviceauthz.WithAuthority(runtime.ctx, runtime.config.InternalAuthority)
-	if authorityErr != nil {
-		return fmt.Errorf("establish controller authority: %w", authorityErr)
-	}
-	runtime.controllerContext = controllerCtx
-	runtime.controllerMetrics = new(gatewayControllerMetrics)
 	return nil
 }
 
@@ -262,13 +230,15 @@ func (runtime *Runtime) startOptionalServices() error {
 	}
 	if runtime.replicaControlManifest != nil {
 		manifest := *runtime.replicaControlManifest
-		var err error
-		runtime.replicaControllersDone, err = startGatewayReplicaControllers(
-			controllerCtx, runtime.healthRevisions, runtime.moveController, runtime.healthController,
-			time.Duration(manifest.Bounds.ControllerInterval)*time.Millisecond, runtime.config.Logf,
-		)
-		if err != nil {
-			return fmt.Errorf("start replica controllers: %w", err)
+		if !runtime.config.ControlParticipantOnly {
+			var err error
+			runtime.replicaControllersDone, err = startGatewayReplicaControllers(
+				controllerCtx, runtime.healthRevisions, runtime.moveController, runtime.healthController,
+				time.Duration(manifest.Bounds.ControllerInterval)*time.Millisecond, runtime.config.Logf,
+			)
+			if err != nil {
+				return fmt.Errorf("start replica controllers: %w", err)
+			}
 		}
 		controlDone := make(chan error, 1)
 		runtime.controlDone = controlDone
@@ -301,6 +271,9 @@ func (runtime *Runtime) startOptionalServices() error {
 		}
 	}
 	servingContext = withGatewayControllerMetrics(servingContext, runtime.controllerMetrics)
+	if runtime.ddlForwardOwner != nil {
+		servingContext = context.WithValue(servingContext, gatewayDDLForwardContextKey{}, runtime.ddlForwardOwner)
+	}
 	if runtime.backupOperator != nil {
 		servingContext = withGatewayBackupOperator(servingContext, runtime.backupOperator)
 	}
