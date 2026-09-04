@@ -14,12 +14,14 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/clusterbackup"
 	"github.com/thesyncim/vibedb/internal/clusterbackupservice"
+	"github.com/thesyncim/vibedb/internal/gatewayruntime"
 	"github.com/thesyncim/vibedb/internal/kubeoperator"
 	"github.com/thesyncim/vibedb/internal/multiraft"
 	"github.com/thesyncim/vibedb/internal/raftmember"
@@ -85,6 +87,34 @@ func rf3ControlNodes(policy *serviceauthz.Policy) []rafttransport.NodeID {
 	return slices.Compact(nodes)
 }
 
+// TLS admits both service principals and enrolled physical peers. A physical
+// peer only gains access to the existing exact split tail/artifact grants;
+// every control handler still checks its own capability or operation grant.
+// Transport admission never grants storage nodes delegation or topology.
+func rf3ControlPeerNodes(manifest rf3Manifest, authorized []rafttransport.NodeID) []rafttransport.NodeID {
+	nodes := slices.Clone(authorized)
+	for _, group := range manifest.groupBundles() {
+		for _, member := range group.Members {
+			if member.NodeID != (rafttransport.NodeID{}) {
+				nodes = append(nodes, member.NodeID)
+			}
+		}
+		if target := group.EnrolledTarget; target != nil {
+			nodes = append(nodes, target.NodeID)
+		}
+	}
+	if manifest.Gateway != nil {
+		// Include declared future destinations for append-only group reloads.
+		for _, endpoint := range manifest.Gateway.ShardPeers {
+			if node, valid := rf3GatewayNodeID(endpoint.NodeID); valid {
+				nodes = append(nodes, node)
+			}
+		}
+	}
+	slices.SortFunc(nodes, func(a, b rafttransport.NodeID) int { return bytes.Compare(a[:], b[:]) })
+	return slices.Compact(nodes)
+}
+
 func rf3ReplicaObservationAuthorizer(registry *rafttransport.StaticRegistry, policy *serviceauthz.Policy) replicacontrol.AuthorizeFunc {
 	return func(identity rafttransport.PeerIdentity, request replicacontrol.Request) bool {
 		if registry == nil || policy == nil || identity.TrustDomain != registry.TrustDomain() ||
@@ -116,18 +146,30 @@ func runServeRF3(args []string) int {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	if *reload {
-		changes := make(chan os.Signal, 1)
-		signal.Notify(changes, syscall.SIGHUP)
-		defer signal.Stop(changes)
-		manifest.reloadPath, manifest.reloadSignals = *manifestPath, changes
-	}
+	stopReload := configureRF3ManifestReload(&manifest, *manifestPath, *reload)
+	defer stopReload()
 	err = servePreparedRF3WithExecutionLanes(ctx, manifest, *executionLanes, net.Listen)
 	if err = componentShutdownError(err, context.Cause(ctx)); err != nil {
 		fmt.Fprintf(os.Stderr, "error serve RF3: %v\n", err)
 		return 1
 	}
 	return 0
+}
+
+// configureRF3ManifestReload is shared by the standalone RF3 and physical
+// node commands. The reload channel remains attached to the loaded manifest,
+// so the serving loop can append prepared groups without changing process
+// configuration. Call the returned cleanup function when the command exits.
+func configureRF3ManifestReload(manifest *rf3Manifest, path string, enabled bool) func() {
+	if manifest == nil || !enabled {
+		return func() {}
+	}
+	changes := make(chan os.Signal, 1)
+	signal.Notify(changes, syscall.SIGHUP)
+	manifest.reloadPath, manifest.reloadSignals = path, changes
+	return func() {
+		signal.Stop(changes)
+	}
 }
 
 // servePreparedRF3 opens only previously prepared durable artifacts. It never
@@ -386,11 +428,60 @@ func servePreparedRF3WithListen(
 	return servePreparedRF3WithExecutionLanes(parent, manifest, rf3DefaultExecutionLanes, listen)
 }
 
+// servePreparedRF3WithListenAndDiagnostics is used by filesystem-backed
+// process qualification to exercise the same synchronous SIGUSR1 snapshot
+// path as serve-node while retaining the standalone frontend shape.
+func servePreparedRF3WithListenAndDiagnostics(
+	parent context.Context,
+	manifest rf3Manifest,
+	listen rf3ListenFunc,
+	diagnostics <-chan os.Signal,
+) error {
+	return servePreparedRF3WithExecutionLanesAndGateway(parent, manifest, rf3DefaultExecutionLanes, listen, nil, diagnostics)
+}
+
 func servePreparedRF3WithExecutionLanes(
 	parent context.Context,
 	manifest rf3Manifest,
 	executionLaneCount int,
 	listen rf3ListenFunc,
+) (resultErr error) {
+	return servePreparedRF3WithExecutionLanesAndGateway(parent, manifest, executionLaneCount, listen, nil, nil)
+}
+
+func servePreparedRF3WithEmbeddedGateway(
+	parent context.Context,
+	manifest rf3Manifest,
+	executionLaneCount int,
+	listen rf3ListenFunc,
+) (resultErr error) {
+	return servePreparedRF3WithEmbeddedGatewayAndDiagnostics(parent, manifest, executionLaneCount, listen, nil)
+}
+
+// servePreparedRF3WithEmbeddedGatewayAndDiagnostics is the production
+// serve-node entry point. The diagnostic channel is deliberately injected by
+// the command so signal handling remains outside the owner lifecycle and a
+// snapshot is collected synchronously while every owner is still live.
+func servePreparedRF3WithEmbeddedGatewayAndDiagnostics(
+	parent context.Context,
+	manifest rf3Manifest,
+	executionLaneCount int,
+	listen rf3ListenFunc,
+	diagnostics <-chan os.Signal,
+) (resultErr error) {
+	if manifest.Gateway == nil {
+		return errRF3Serving
+	}
+	return servePreparedRF3WithExecutionLanesAndGateway(parent, manifest, executionLaneCount, listen, manifest.Gateway, diagnostics)
+}
+
+func servePreparedRF3WithExecutionLanesAndGateway(
+	parent context.Context,
+	manifest rf3Manifest,
+	executionLaneCount int,
+	listen rf3ListenFunc,
+	embeddedGateway *rf3ManifestGateway,
+	diagnostics <-chan os.Signal,
 ) (resultErr error) {
 	if parent == nil {
 		return errRF3Serving
@@ -426,6 +517,14 @@ func servePreparedRF3WithExecutionLanes(
 	if err != nil {
 		return fmt.Errorf("%w: authorization policy: %v", errRF3Serving, err)
 	}
+	var frontendProfile *rafttransport.PeerTLS
+	var frontendPolicy *serviceauthz.Policy
+	if embeddedGateway != nil {
+		frontendProfile, frontendPolicy, err = loadRF3EmbeddedGatewayCredentials(manifest, profile, policy)
+		if err != nil {
+			return err
+		}
+	}
 	gate, err := serviceauthz.NewGate(policy)
 	if err != nil {
 		return fmt.Errorf("%w: authorization gate: %v", errRF3Serving, err)
@@ -437,7 +536,7 @@ func servePreparedRF3WithExecutionLanes(
 		return fmt.Errorf("%w: native TLS authority: %v", errRF3Serving, err)
 	}
 	controlAuthorizer, err := servicetls.NewNodeAuthorizer(
-		rf3ControlNodes(policy),
+		rf3ControlPeerNodes(manifest, rf3ControlNodes(policy)),
 	)
 	if err != nil {
 		return fmt.Errorf("%w: control TLS authority: %v", errRF3Serving, err)
@@ -602,8 +701,13 @@ func servePreparedRF3WithExecutionLanes(
 	if err != nil {
 		return errors.Join(closeAdopted(err), servingRegistry.Close())
 	}
-	for _, runtime := range runtimes {
+	for index, runtime := range runtimes {
 		if err := lanes.Add(runtime); err != nil {
+			// Failed Add leaves this runtime and the remaining suffix owned
+			// here; Close on the lanes retires only the adopted prefix.
+			for _, unowned := range runtimes[index:] {
+				err = errors.Join(err, unowned.Close())
+			}
 			return errors.Join(err, lanes.Close(), servingRegistry.Close())
 		}
 	}
@@ -638,16 +742,23 @@ func servePreparedRF3WithExecutionLanes(
 	if err != nil {
 		return errors.Join(err, lanes.Close(), servingRegistry.Close())
 	}
+	// An assembly error after ownership transfer must close every runtime even
+	// when the listeners never start. Normal serving takes over this join below.
+	peerStarted := false
+	defer func() {
+		if !peerStarted {
+			retireCtx, retire := context.WithCancelCause(context.Background())
+			retire(context.Canceled)
+			resultErr = finishRF3Serving(errors.Join(resultErr, componentShutdownError(peer.Run(retireCtx))), lanes, servingRegistry)
+		}
+	}()
 	observationControl, err := replicacontrol.NewService(replicacontrol.ServiceOptions{
 		Observer:     peer.Owners(),
 		Authorize:    rf3ReplicaObservationAuthorizer(transportRegistry, policy),
 		ReadDeadline: deadline, WriteDeadline: deadline, MaxConcurrent: 32,
 	})
 	if err != nil {
-		retireCtx, retire := context.WithCancelCause(context.Background())
-		retire(context.Canceled)
-		peerErr := peer.Run(retireCtx)
-		return errors.Join(err, componentShutdownError(peerErr), servingRegistry.Close())
+		return err
 	}
 	backupControl, err := clusterbackupservice.New(clusterbackupservice.Options{
 		Owner: peer.Owners(),
@@ -661,20 +772,14 @@ func servePreparedRF3WithExecutionLanes(
 		MaxConcurrent: manifest.ReplicaControl.MaxSourceConcurrent,
 	})
 	if err != nil {
-		retireCtx, retire := context.WithCancelCause(context.Background())
-		retire(context.Canceled)
-		peerErr := peer.Run(retireCtx)
-		return errors.Join(err, componentShutdownError(peerErr), servingRegistry.Close())
+		return err
 	}
 	actionJournal, err := replicaaction.OpenFileJournal(
 		manifest.ReplicaControl.ActionJournalPath,
 		manifest.ReplicaControl.MaxActionRecords,
 	)
 	if err != nil {
-		retireCtx, retire := context.WithCancelCause(context.Background())
-		retire(context.Canceled)
-		peerErr := peer.Run(retireCtx)
-		return errors.Join(err, componentShutdownError(peerErr), servingRegistry.Close())
+		return err
 	}
 	defer func() { resultErr = errors.Join(resultErr, actionJournal.Close()) }()
 	actionControl, err := replicaaction.NewService(replicaaction.Options{
@@ -687,27 +792,18 @@ func servePreparedRF3WithExecutionLanes(
 		ReadDeadline: deadline, WriteDeadline: deadline, MaxConcurrent: 32,
 	})
 	if err != nil {
-		retireCtx, retire := context.WithCancelCause(context.Background())
-		retire(context.Canceled)
-		peerErr := peer.Run(retireCtx)
-		return errors.Join(err, componentShutdownError(peerErr), servingRegistry.Close())
+		return err
 	}
 	schemaActivator, err := newRF3SchemaActivator(peer.Owners(), preparedSet.groups, identities)
 	if err != nil {
-		retireCtx, retire := context.WithCancelCause(context.Background())
-		retire(context.Canceled)
-		peerErr := peer.Run(retireCtx)
-		return errors.Join(err, componentShutdownError(peerErr), servingRegistry.Close())
+		return err
 	}
 	schemaRoot := manifest.ReplicaControl.SourceDataRoot
 	schemaJournal, err := schemainstall.OpenFileJournal(
 		filepath.Join(schemaRoot, "schema-rollout-journal"), rf3SchemaInstallRecords,
 	)
 	if err != nil {
-		retireCtx, retire := context.WithCancelCause(context.Background())
-		retire(context.Canceled)
-		peerErr := peer.Run(retireCtx)
-		return errors.Join(err, componentShutdownError(peerErr), servingRegistry.Close())
+		return err
 	}
 	defer func() { resultErr = errors.Join(resultErr, schemaJournal.Close()) }()
 	schemaArtifacts, err := schemainstall.OpenDirectoryBackend(schemainstall.DirectoryOptions{
@@ -716,10 +812,7 @@ func servePreparedRF3WithExecutionLanes(
 		Activator: schemaActivator,
 	})
 	if err != nil {
-		retireCtx, retire := context.WithCancelCause(context.Background())
-		retire(context.Canceled)
-		peerErr := peer.Run(retireCtx)
-		return errors.Join(err, componentShutdownError(peerErr), servingRegistry.Close())
+		return err
 	}
 	defer func() { resultErr = errors.Join(resultErr, schemaArtifacts.Close()) }()
 	if err = schemaActivator.bindArtifacts(schemaArtifacts); err != nil {
@@ -770,21 +863,14 @@ func servePreparedRF3WithExecutionLanes(
 			continue
 		}
 		if policy.Check(target.NodeID, serviceauthz.CapabilityMembership) != serviceauthz.DecisionAllow {
-			retireCtx, retire := context.WithCancelCause(context.Background())
-			retire(context.Canceled)
-			peerErr := peer.Run(retireCtx)
-			return errors.Join(errRF3Serving, errors.New("enrolled target lacks membership capability"),
-				componentShutdownError(peerErr), servingRegistry.Close())
+			return errors.Join(errRF3Serving, errors.New("enrolled target lacks membership capability"))
 		}
 		sourceJournal, openErr := snapshottransfer.OpenSourceFileJournal(
 			rf3SnapshotGroupPath(manifest.ReplicaControl.SourceJournalPath, itemGroup, len(preparedSet.groups) > 1),
 			manifest.ReplicaControl.MaxSourceRecords,
 		)
 		if openErr != nil {
-			retireCtx, retire := context.WithCancelCause(context.Background())
-			retire(context.Canceled)
-			peerErr := peer.Run(retireCtx)
-			return errors.Join(openErr, componentShutdownError(peerErr), servingRegistry.Close())
+			return openErr
 		}
 		defer func(journal *snapshottransfer.SourceFileJournal) {
 			resultErr = errors.Join(resultErr, journal.Close())
@@ -812,10 +898,7 @@ func servePreparedRF3WithExecutionLanes(
 			)
 		}
 		if providerErr != nil {
-			retireCtx, retire := context.WithCancelCause(context.Background())
-			retire(context.Canceled)
-			peerErr := peer.Run(retireCtx)
-			return errors.Join(providerErr, componentShutdownError(peerErr), servingRegistry.Close())
+			return providerErr
 		}
 		if phase := os.Getenv("VIBEDB_QUALIFICATION_ABANDON_CRASH"); phase != "" {
 			if os.Getenv("VIBEDB_REPLICA_REPLACEMENT_E2E") != "1" ||
@@ -842,10 +925,7 @@ func servePreparedRF3WithExecutionLanes(
 			},
 		)
 		if serviceErr != nil {
-			retireCtx, retire := context.WithCancelCause(context.Background())
-			retire(context.Canceled)
-			peerErr := peer.Run(retireCtx)
-			return errors.Join(serviceErr, componentShutdownError(peerErr), servingRegistry.Close())
+			return serviceErr
 		}
 		controlServices = append(controlServices, snapshottransfer.GroupSourceControlService{
 			Group: itemGroup, Service: sourceService,
@@ -860,10 +940,7 @@ func servePreparedRF3WithExecutionLanes(
 				int64(manifest.ReplicaControl.MaxSourceConcurrent),
 		})
 		if serviceErr != nil {
-			retireCtx, retire := context.WithCancelCause(context.Background())
-			retire(context.Canceled)
-			peerErr := peer.Run(retireCtx)
-			return errors.Join(serviceErr, componentShutdownError(peerErr), servingRegistry.Close())
+			return serviceErr
 		}
 		dataServices = append(dataServices, snapshottransfer.GroupDataService{
 			Group: itemGroup, Service: dataService,
@@ -891,13 +968,10 @@ func servePreparedRF3WithExecutionLanes(
 		slices.SortFunc(targetNodes, func(a, b rafttransport.NodeID) int { return bytes.Compare(a[:], b[:]) })
 		targetNodes = slices.Compact(targetNodes)
 		if serviceErr != nil {
-			retireCtx, retire := context.WithCancelCause(context.Background())
-			retire(context.Canceled)
-			peerErr := peer.Run(retireCtx)
-			return errors.Join(serviceErr, componentShutdownError(peerErr), servingRegistry.Close())
+			return serviceErr
 		}
 	}
-	snapshotNodes := policy.NodesWith(serviceauthz.CapabilityMembership)
+	snapshotNodes := rf3ControlPeerNodes(manifest, policy.NodesWith(serviceauthz.CapabilityMembership))
 	snapshotAuthorizer, err := servicetls.NewNodeAuthorizer(snapshotNodes)
 	if err == nil {
 		snapshotTLS, err = servicetls.NewServer(
@@ -936,23 +1010,18 @@ func servePreparedRF3WithExecutionLanes(
 			)
 		}
 		if childErr != nil {
-			retireCtx, retire := context.WithCancelCause(context.Background())
-			retire(context.Canceled)
-			peerErr := peer.Run(retireCtx)
-			return errors.Join(childErr, componentShutdownError(peerErr), servingRegistry.Close())
+			return childErr
 		}
 	}
 	splitRuntime, splitRuntimeErr := newRF3SplitServingRuntime(rf3SplitServingOptions{
 		manifest: manifest, prepared: preparedSet.groups, identities: identities, commands: commands,
 		owners: peer.Owners(), registrar: peer, profile: profile, policy: policy, deadline: deadline,
-		childPreparer: childPreparer,
-		inventory:     adoptedInventory,
+		topologyProfile: frontendProfile,
+		childPreparer:   childPreparer,
+		inventory:       adoptedInventory,
 	})
 	if splitRuntimeErr != nil {
-		retireCtx, retire := context.WithCancelCause(context.Background())
-		retire(context.Canceled)
-		peerErr := peer.Run(retireCtx)
-		return errors.Join(splitRuntimeErr, componentShutdownError(peerErr), servingRegistry.Close())
+		return splitRuntimeErr
 	}
 	defer func() { resultErr = errors.Join(resultErr, splitRuntime.Close()) }()
 	metricsControl, err := servicemetrics.NewService(servicemetrics.ServiceOptions{
@@ -964,10 +1033,7 @@ func servePreparedRF3WithExecutionLanes(
 		ReadDeadline: deadline, WriteDeadline: deadline,
 	})
 	if err != nil {
-		retireCtx, retire := context.WithCancelCause(context.Background())
-		retire(context.Canceled)
-		peerErr := peer.Run(retireCtx)
-		return errors.Join(err, componentShutdownError(peerErr), servingRegistry.Close())
+		return err
 	}
 	var restoreServingControl shardcontrol.Handler
 	if len(restoreGateList) != 0 {
@@ -975,10 +1041,7 @@ func servePreparedRF3WithExecutionLanes(
 			restoreGateList, policy, deadline, deadline,
 		)
 		if err != nil {
-			retireCtx, retire := context.WithCancelCause(context.Background())
-			retire(context.Canceled)
-			peerErr := peer.Run(retireCtx)
-			return errors.Join(err, componentShutdownError(peerErr), servingRegistry.Close())
+			return err
 		}
 	}
 	controlMux, err := newRF3ControlMux(
@@ -988,14 +1051,11 @@ func servePreparedRF3WithExecutionLanes(
 		restoreServingControl, schemaBuildControl,
 	)
 	if err != nil {
-		retireCtx, retire := context.WithCancelCause(context.Background())
-		retire(context.Canceled)
-		peerErr := peer.Run(retireCtx)
-		return errors.Join(err, componentShutdownError(peerErr), servingRegistry.Close())
+		return err
 	}
 	snapshotMux, err := newRF3SnapshotMux(sourceData, splitRuntime.artifact)
 	if err != nil {
-		return errors.Join(err, servingRegistry.Close())
+		return err
 	}
 	var server *shardservice.ReplicatedServer
 	if nativeConfigured {
@@ -1018,11 +1078,17 @@ func servePreparedRF3WithExecutionLanes(
 			err = server.BindTransitionalServingAuthority(authorities.transitional)
 		}
 		if err != nil {
-			retireCtx, retire := context.WithCancelCause(context.Background())
-			retire(context.Canceled)
-			peerErr := peer.Run(retireCtx)
-			return errors.Join(err, componentShutdownError(peerErr), servingRegistry.Close())
+			return err
 		}
+	}
+
+	var preparedGateway *rf3EmbeddedGateway
+	if embeddedGateway != nil {
+		preparedGateway, err = prepareRF3EmbeddedGateway(manifest, frontendProfile, frontendPolicy, nativeTLS, server)
+		if err != nil {
+			return err
+		}
+		defer func() { resultErr = errors.Join(resultErr, preparedGateway.remote.Close()) }()
 	}
 
 	peerCtx, stopPeer := context.WithCancelCause(context.Background())
@@ -1034,6 +1100,7 @@ func servePreparedRF3WithExecutionLanes(
 	defer stopSnapshot(context.Canceled)
 	defer stopNative(context.Canceled)
 	peerDone := make(chan error, 1)
+	peerStarted = true
 	go func() { peerDone <- peer.Run(peerCtx) }()
 	select {
 	case <-peer.Started():
@@ -1052,9 +1119,10 @@ func servePreparedRF3WithExecutionLanes(
 
 	pulseDone := make(chan struct{})
 	go runRF3Pulse(peerCtx, pulse, pulseDone)
+	controlAdmission := newRF3AcceptReadyListener(controlListener)
 	controlDone := make(chan error, 1)
 	go func() {
-		controlDone <- controlTLS.Serve(controlCtx, controlListener, servicetls.Limits{
+		controlDone <- controlTLS.Serve(controlCtx, controlAdmission, servicetls.Limits{
 			MaxConnections: 32, MaxHandshakes: 8, HandshakeDeadline: deadline,
 		}, func(ctx context.Context, connection rafttransport.PeerConnection) {
 			if err := controlMux.Serve(ctx, connection); err != nil && ctx.Err() == nil {
@@ -1063,11 +1131,12 @@ func servePreparedRF3WithExecutionLanes(
 		})
 	}()
 	snapshotDone := make(chan error, 1)
+	snapshotAdmission := newRF3AcceptReadyListener(snapshotListener)
 	snapshotAddress := snapshotListener.Addr().String()
 	snapshotConcurrency := max(manifest.ReplicaControl.MaxSourceConcurrent,
 		min(manifest.SplitControl.operationLimit(), 8))
 	go func() {
-		snapshotDone <- snapshotTLS.Serve(snapshotCtx, snapshotListener, servicetls.Limits{
+		snapshotDone <- snapshotTLS.Serve(snapshotCtx, snapshotAdmission, servicetls.Limits{
 			MaxConnections: snapshotConcurrency, MaxHandshakes: snapshotConcurrency,
 			HandshakeDeadline: deadline,
 		}, func(ctx context.Context, connection rafttransport.PeerConnection) {
@@ -1075,53 +1144,152 @@ func servePreparedRF3WithExecutionLanes(
 		})
 	}()
 	var nativeDone chan error
+	var nativeAdmission *rf3AcceptReadyListener
 	nativeAddress := "fenced"
 	if nativeConfigured {
 		nativeDone = make(chan error, 1)
+		nativeAdmission = newRF3AcceptReadyListener(nativeListener)
 		nativeAddress = nativeListener.Addr().String()
 		go func() {
 			nativeDone <- server.ServeAuthenticated(
-				nativeCtx, nativeListener, nativeTLS, deadline, 64, 16,
+				nativeCtx, nativeAdmission, nativeTLS, deadline, 64, 16,
 			)
 		}()
+	}
+	var (
+		embeddedGatewayState    *rf3EmbeddedGateway
+		embeddedGatewayOpened   chan *rf3EmbeddedGateway
+		embeddedGatewayDone     chan error
+		stopEmbeddedGateway     context.CancelCauseFunc
+		embeddedGatewayFinished bool
+	)
+	var diagnosticSerial atomic.Uint64
+	if embeddedGateway != nil {
+		gatewayCtx, stopGateway := context.WithCancelCause(context.Background())
+		stopEmbeddedGateway = stopGateway
+		embeddedGatewayOpened = make(chan *rf3EmbeddedGateway, 1)
+		embeddedGatewayDone = make(chan error, 1)
+		go func() {
+			state := preparedGateway
+			var result error
+			defer func() { embeddedGatewayDone <- errors.Join(result, state.remote.Close()) }()
+			if err := waitRF3ServiceAdmission(gatewayCtx, controlAdmission, snapshotAdmission, nativeAdmission); err != nil {
+				result = err
+				return
+			}
+			runtime, openErr := gatewayruntime.Open(gatewayCtx, state.config)
+			if openErr != nil {
+				result = fmt.Errorf("%w: open embedded gateway: %v", errRF3Serving, openErr)
+				return
+			}
+			state.runtime = runtime
+			serveDone := make(chan error, 1)
+			go func() { serveDone <- state.runtime.Serve(gatewayCtx) }()
+			var serveErr error
+			select {
+			case <-state.runtime.Ready():
+				// Publish the state only after optional controllers, PostgreSQL,
+				// and every configured frontend listener have started. Open's
+				// catalog recovery is already complete at this point.
+				embeddedGatewayOpened <- state
+				serveErr = <-serveDone
+			case serveErr = <-serveDone:
+				// A startup failure before Ready must still enter the common
+				// node shutdown path, without advertising frontend readiness.
+			case <-gatewayCtx.Done():
+				serveErr = <-serveDone
+			}
+			result = errors.Join(serveErr, state.runtime.Close())
+		}()
+	}
+	var primary error
+	peerFinished, controlFinished, snapshotFinished, nativeFinished := false, false, false, false
+	frontendStartupCanceled := false
+	// Catalog recovery is allowed to take its bounded election attempts, but it
+	// must remain concurrent with component failure and parent cancellation. A
+	// frontend failure after owners have started enters the same reverse drain
+	// path as any listener failure below.
+	if embeddedGatewayOpened != nil {
+		for embeddedGatewayState == nil && primary == nil && !frontendStartupCanceled {
+			select {
+			case embeddedGatewayState = <-embeddedGatewayOpened:
+			case <-diagnostics:
+				emitRF3DiagnosticSnapshot(manifest, profile, nodeOwner, server, nil, &diagnosticSerial, adoptedInventory)
+			case err := <-embeddedGatewayDone:
+				embeddedGatewayFinished = true
+				primary = fmt.Errorf("RF3 embedded gateway stopped during startup: %w", err)
+			case <-parent.Done():
+				// Parent cancellation is the normal lifecycle request.
+				frontendStartupCanceled = true
+				if stopEmbeddedGateway != nil {
+					stopEmbeddedGateway(context.Cause(parent))
+				}
+			case err := <-peerDone:
+				primary, peerFinished = fmt.Errorf("RF3 peer stopped during embedded gateway startup: %w", err), true
+			case err := <-controlDone:
+				primary, controlFinished = fmt.Errorf("RF3 control listener stopped during embedded gateway startup: %w", err), true
+			case err := <-snapshotDone:
+				primary, snapshotFinished = fmt.Errorf("RF3 snapshot listener stopped during embedded gateway startup: %w", err), true
+			case err := <-nativeDone:
+				primary, nativeFinished = fmt.Errorf("RF3 native listener stopped during embedded gateway startup: %w", err), true
+			}
+		}
 	}
 	topology := "RF3"
 	if manifest.DevelopmentOnly {
 		topology = "RF1-development-only-no-HA"
 	}
-	fmt.Fprintf(os.Stderr,
-		"vibedb-shard %s ready distribution=%q shard=%q member=%d replica-set=%d peer=%s native=%s snapshot=%s control=%s\n",
-		topology,
-		base.Binding.Distribution, base.Binding.Shard, base.Binding.MemberID,
-		runtimePublication.ReplicaSetVersion, peerListener.Addr(), nativeAddress,
-		snapshotAddress, controlListener.Addr(),
-	)
-
-	var primary error
-	peerFinished, controlFinished, snapshotFinished, nativeFinished := false, false, false, false
-	for {
-		select {
-		case <-manifest.reloadSignals:
-			if err := reloadPreparedRF3Groups(parent, &manifest, profile, peer, adoptedInventory, schemaActivator, nodeOwner); err != nil {
-				fmt.Fprintf(os.Stderr, "RF3 prepared group reload refused: %v\n", err)
-			}
-			continue
-		case <-parent.Done():
-			// A requested shutdown is not an error. Component failures observed below
-			// remain visible unless they are the expected cancellation result.
-		case err := <-peerDone:
-			primary, peerFinished = fmt.Errorf("RF3 peer stopped: %w", err), true
-		case err := <-controlDone:
-			primary, controlFinished = fmt.Errorf("RF3 control listener stopped: %w", err), true
-		case err := <-snapshotDone:
-			primary, snapshotFinished = fmt.Errorf("RF3 snapshot listener stopped: %w", err), true
-		case err := <-nativeDone:
-			primary, nativeFinished = fmt.Errorf("RF3 native listener stopped: %w", err), true
+	if primary == nil && !frontendStartupCanceled {
+		gatewayAddress := "disabled"
+		if embeddedGatewayState != nil && embeddedGatewayState.runtime.Listener() != nil {
+			gatewayAddress = embeddedGatewayState.runtime.Listener().Addr().String()
 		}
-		break
+		fmt.Fprintf(os.Stderr,
+			"vibedb-shard %s ready distribution=%q shard=%q member=%d replica-set=%d peer=%s native=%s snapshot=%s control=%s gateway=%s\n",
+			topology,
+			base.Binding.Distribution, base.Binding.Shard, base.Binding.MemberID,
+			runtimePublication.ReplicaSetVersion, peerListener.Addr(), nativeAddress,
+			snapshotAddress, controlListener.Addr(), gatewayAddress,
+		)
+		for {
+			select {
+			case <-diagnostics:
+				emitRF3DiagnosticSnapshot(manifest, profile, nodeOwner, server, embeddedGatewayState, &diagnosticSerial, adoptedInventory)
+				continue
+			case <-manifest.reloadSignals:
+				if err := reloadPreparedRF3Groups(parent, &manifest, profile, peer, adoptedInventory, schemaActivator, nodeOwner); err != nil {
+					fmt.Fprintf(os.Stderr, "RF3 prepared group reload refused: %v\n", err)
+				}
+				continue
+			case <-parent.Done():
+				// A requested shutdown is not an error. Component failures observed below
+				// remain visible unless they are the expected cancellation result.
+			case err := <-peerDone:
+				primary, peerFinished = fmt.Errorf("RF3 peer stopped: %w", err), true
+			case err := <-controlDone:
+				primary, controlFinished = fmt.Errorf("RF3 control listener stopped: %w", err), true
+			case err := <-snapshotDone:
+				primary, snapshotFinished = fmt.Errorf("RF3 snapshot listener stopped: %w", err), true
+			case err := <-nativeDone:
+				primary, nativeFinished = fmt.Errorf("RF3 native listener stopped: %w", err), true
+			case err := <-embeddedGatewayDone:
+				embeddedGatewayFinished = true
+				primary = fmt.Errorf("RF3 embedded gateway stopped: %w", err)
+			}
+			break
+		}
 	}
 
 	// Fence and join client ingress before retiring Owner/Host/runtime.
+	if stopEmbeddedGateway != nil {
+		stopEmbeddedGateway(context.Canceled)
+		if embeddedGatewayState != nil {
+			primary = errors.Join(primary, embeddedGatewayState.runtime.Drain(context.Background()))
+		}
+		if embeddedGatewayDone != nil && !embeddedGatewayFinished {
+			primary = errors.Join(primary, componentShutdownError(<-embeddedGatewayDone))
+		}
+	}
 	if nativeConfigured {
 		stopNative(context.Canceled)
 		if !nativeFinished {
@@ -1136,6 +1304,8 @@ func servePreparedRF3WithExecutionLanes(
 	if !controlFinished {
 		primary = errors.Join(primary, componentShutdownError(<-controlDone))
 	}
+	primary = errors.Join(primary, splitRuntime.Close())
+	splitRuntime = nil
 	stopPeer(context.Canceled)
 	if !peerFinished {
 		primary = errors.Join(primary, componentShutdownError(<-peerDone))
