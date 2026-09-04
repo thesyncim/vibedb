@@ -268,6 +268,14 @@ waits remain substantial. These instrumented timings are not a new speedup
 claim. The next investigations are private guarded preimage reads and compact
 column patching during batch application.
 
+The [compact batch experiment](benchmarks/fused-storage-2026-09-04/README.md)
+at `7aa4f496` passed focused correctness/race tests but failed its SQL performance
+comparison: after/before geomeans 0.884x / 0.852x, with inconsistent write results.
+Reverse-order locality differs; first-order local-read slow bursts are unresolved.
+All 120 trials validate, and all regressions are retained. Revert `d6374d33`
+removes the experiment. The separately reviewed guarded-preimage change at
+`7b8efb88` is not included in those timings and must be measured independently.
+
 The real Linux physical3/physical6 process test remains a failing gate.
 Both layouts create three tables and validate topology and identities.
 Physical3 acknowledges 18 writes and passes the owner PG content oracle,
