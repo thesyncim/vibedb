@@ -526,30 +526,26 @@ func (t *Tx) newCollectionState(name string) *txCollectionState {
 }
 
 // newCollectionStateResolved builds the state for a read-write touch from an
-// already-resolved backend, deriving admission limits from the held pointers
-// instead of repeating catalog lookups. The values match batchBounds and
-// documentBounds exactly: the memory profile reports constants and facade
-// defaults regardless of existence; a resolved durable collection reports its
-// persisted limits; an absent collection falls back to facade and engine
-// defaults. (A collection dropped concurrently between resolution and use may
+// already-resolved backend instead of repeating catalog lookups. Document
+// limits reuse Collection.bounds so transactions admit exactly what direct
+// writes admit; batch limits match batchBounds (constants for memory,
+// persisted limits for a resolved durable collection, engine fallbacks when
+// absent). A collection dropped concurrently between resolution and use may
 // observe either source; both directions fail safe because the engines
-// re-enforce their own limits at publish.)
-func (t *Tx) newCollectionStateResolved(name string, memory *store.Collection, disk *durable.Collection) *txCollectionState {
+// re-enforce their own limits at publish.
+func (t *Tx) newCollectionStateResolved(name string, coll *Collection, disk *durable.Collection) *txCollectionState {
 	maxDocs, maxBytes := defaultFacadeMaxBatchDocuments, defaultFacadeMaxBatchBytes
 	maxKey, maxDoc := defaultMaxKeyBytes, defaultMaxDocumentBytes
 	if db := t.db; db != nil {
-		maxKey, maxDoc = db.maxKeyBytes, db.maxDocumentBytes
-		if db.profile != Memory {
-			if disk != nil {
-				maxKey, maxDoc = disk.MaxKeyBytes(), disk.MaxDocumentBytes()
-				maxDocs, maxBytes = disk.MaxBatchDocuments(), disk.MaxBatchBytes()
-			} else {
-				if db.engine.MaxBatchDocuments > 0 {
-					maxDocs = db.engine.MaxBatchDocuments
-				}
-				if db.engine.MaxBatchBytes > 0 {
-					maxBytes = db.engine.MaxBatchBytes
-				}
+		maxKey, maxDoc = coll.bounds(disk)
+		if db.profile != Memory && disk != nil {
+			maxDocs, maxBytes = disk.MaxBatchDocuments(), disk.MaxBatchBytes()
+		} else if db.profile != Memory {
+			if db.engine.MaxBatchDocuments > 0 {
+				maxDocs = db.engine.MaxBatchDocuments
+			}
+			if db.engine.MaxBatchBytes > 0 {
+				maxBytes = db.engine.MaxBatchBytes
 			}
 		}
 	}
@@ -620,7 +616,7 @@ func (t *Tx) ensureCollection(name string) (*txCollectionState, error) {
 	if err != nil {
 		return nil, err
 	}
-	state := t.newCollectionStateResolved(name, memory, disk)
+	state := t.newCollectionStateResolved(name, coll, disk)
 	state.absent = true
 	state.coll = coll
 	if memory == nil && disk == nil {
