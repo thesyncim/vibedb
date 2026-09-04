@@ -1034,29 +1034,6 @@ func compactPutBits(dst []byte, bit, width int, value uint64) {
 }
 
 func compactReadBits(src []byte, bit, width int) uint64 {
-	// Constant streams must stay an inline zero, without loading any source.
-	if width == 0 {
-		return 0
-	}
-	return compactReadBitsNonzero(src, bit, width)
-}
-
-func compactReadBitsNonzero(src []byte, bit, width int) uint64 {
-	// A bounded word covers most fields. Unaligned fields wider than 56 bits
-	// may need the low bits of a ninth byte; the final seven source bytes keep
-	// the byte reader. The admitted grammar restricts widths to 0..64.
-	at, shift := bit>>3, uint(bit&7)
-	if uint(width) <= 64 && bit >= 0 && len(src)-at >= 8 {
-		value := binary.LittleEndian.Uint64(src[at:]) >> shift
-		if uint(width) > 64-shift {
-			value |= uint64(src[at+8]) << (64 - shift)
-		}
-		return value & (uint64(1)<<uint(width) - 1)
-	}
-	return compactReadBitsTail(src, bit, width)
-}
-
-func compactReadBitsTail(src []byte, bit, width int) uint64 {
 	var value uint64
 	written := 0
 	for width > 0 {

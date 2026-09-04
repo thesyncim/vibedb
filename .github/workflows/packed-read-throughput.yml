@@ -62,7 +62,12 @@ jobs:
           for revision in base head head base; do
             "$RUNNER_TEMP/packed-read-$revision.test" \
               -test.run '^$' \
-              -test.bench '^(BenchmarkUnifiedPartitionedScanAllBytes(Million|HighCardinality)?|BenchmarkUnifiedGetRawHighCardinalityAllBytes)$/workers=(1|4)$' \
+              -test.bench '^BenchmarkUnifiedPartitionedScanAllBytes(Million|HighCardinality)?$/workers=(1|4)$' \
+              -test.benchtime=300ms -test.count=5 \
+              | tee -a "$RUNNER_TEMP/packed-read-results/$revision.txt"
+            "$RUNNER_TEMP/packed-read-$revision.test" \
+              -test.run '^$' \
+              -test.bench '^BenchmarkUnifiedGetRawHighCardinalityAllBytes$' \
               -test.benchtime=300ms -test.count=5 \
               | tee -a "$RUNNER_TEMP/packed-read-results/$revision.txt"
           done
