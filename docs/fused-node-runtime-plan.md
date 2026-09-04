@@ -294,14 +294,14 @@ Main `c0675b8a` (PR #134, ARM64 SIMD packed equality counts) was merged next at
 above. Future comparison builds continue to require Go 1.27 with the SIMD
 experiment and verify Linux/ARM64 in each executable's build metadata.
 
-The real Linux physical3/physical6 process test remains a failing gate.
+At `7dc21395`, the real Linux physical3/physical6 process test was a failing gate.
 Both layouts create three tables and validate topology and identities.
 Physical3 acknowledges 18 writes and passes the owner PG content oracle,
 then native frontend2 returns an internal error. Physical6 reports missing
 table placement in its pinned catalog during PG verification. The latter
-failure does not record which frontend returned it. Crash/restart is not
-reached. Keep this regression visible; neither recovery qualification nor
-complete frontend visibility is established.
+failure did not record which frontend returned it. Crash/restart was not
+reached. That baseline established neither recovery qualification nor complete
+frontend visibility; its failures remain recorded below.
 
 Main `f4644b8e` (PR #133, bounded scans and packed string/date rendering) was
 merged at `38e5ff72`. Independent source review found no blocking issue in
@@ -314,3 +314,14 @@ comparison reported above and receives no performance credit from those runs.
 The durable bounded-scan binary-prefix, overflow and held-snapshot regression
 also passed with SIMD enabled from a frozen archive of `38e5ff72`, excluding
 the active row-overlay experiment.
+
+The [catalog refresh qualification](qualification/fused-catalog-refresh-2026-09-04/README.md)
+at frozen `6402842c` now passes both physical3 and physical6 on Go 1.27 SIMD,
+Linux ARM64. Each layout checks 18 acknowledged rows across three tables,
+SIGKILLs every exact serving child, reopens the same roots and verifies topology,
+identities and row contents through all configured PG and native frontends.
+The full gate takes 76.137s; no subtest skips. The catalog fix refreshes once on
+definite local table absence while preserving durable replay and existing-table
+preparation. No batch overlay or new diagnostics are included in this source.
+This clears the previously failing gate, not the wider fault/scalability or
+performance objective.
