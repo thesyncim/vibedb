@@ -43,7 +43,7 @@ func TestClientsRejectDuplicateTrials(t *testing.T) {
 func TestEarlyConnectionFailureRetainsStructuredReport(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "report.json")
 	c := config{engine: "vibedb", url: "postgresql://alice:swordfish@127.0.0.1:1/db?sslmode=disable", output: path,
-		phase: "run", rows: 64, operations: 2, scans: 1, repetitions: 1, clients: "1",
+		phase: "run", rows: 64, operations: 2, scans: 1, repetitions: 1, seedBatch: 64, clients: "1",
 		tables: defaultTable, workloads: "point_hit", groupDistribution: "uniform", skewPercent: 80}
 	if err := run(c); err == nil {
 		t.Fatal("connection unexpectedly succeeded")
@@ -366,6 +366,73 @@ func TestUniformTrialWarmupPriorReadsAndFullVerification(t *testing.T) {
 	}
 }
 
+func TestRangeVariantsValidateTailCountOrderAndOperationIdentity(t *testing.T) {
+	const rep = 7
+	for _, rangeRows := range []int{32, 256} {
+		workload := "range_" + strconv.Itoa(rangeRows)
+		rows := rangeRows + 7
+		tailOrdinal := -1
+		for ordinal := 0; ordinal < 10000; ordinal++ {
+			id := readKeyFor(rows, rep, ordinal)
+			if id/rangeRows*rangeRows == rangeRows {
+				tailOrdinal = ordinal
+				break
+			}
+		}
+		if tailOrdinal < 0 {
+			t.Fatalf("%s deterministic stream never reached the tail", workload)
+		}
+		for _, corrupt := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/corrupt=%v", workload, corrupt), func(t *testing.T) {
+				calls, sawTail := 0, false
+				endpoint := uniformTrialServer(t, func(_ int, sql string, params [][]byte) ([][][]byte, string, error) {
+					ordinal := calls
+					calls++
+					id := readKeyFor(rows, rep, ordinal)
+					id = id / rangeRows * rangeRows
+					wantSQL := "SELECT id,score FROM rf3_sql_bench WHERE id >= $1 ORDER BY id LIMIT " + strconv.Itoa(rangeRows)
+					if sql != wantSQL || len(params) != 1 || string(params[0]) != key(id) {
+						return nil, "", fmt.Errorf("ordinal %d range statement/key mismatch: %q %q", ordinal, sql, params)
+					}
+					count := min(rangeRows, rows-id)
+					result := make([][][]byte, count)
+					for offset := range count {
+						rowID := id + offset
+						result[offset] = [][]byte{[]byte(key(rowID)), []byte(strconv.Itoa(rowID % 100))}
+					}
+					if id == rangeRows {
+						sawTail = true
+						if corrupt && len(result) > 1 {
+							result[0], result[1] = result[1], result[0]
+						}
+					}
+					return result, "SELECT " + strconv.Itoa(count), nil
+				})
+				c := config{engine: "cockroachdb", rows: rows, groupDistribution: "uniform"}
+				scores := [][]int{make([]int, rows)}
+				for id := range rows {
+					scores[0][id] = id % 100
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+				defer cancel()
+				out, err := trial(ctx, c, workload, 1, rep, tailOrdinal+1,
+					[]string{defaultTable}, scores, []string{endpoint})
+				if err != nil || !sawTail || calls != tailOrdinal+1 {
+					t.Fatalf("err=%v sawTail=%v calls=%d want=%d", err, sawTail, calls, tailOrdinal+1)
+				}
+				for ordinal, sample := range out.Samples {
+					if sample.Ordinal != ordinal || sample.Operation != workload {
+						t.Fatalf("sample %d identity: %+v", ordinal, sample)
+					}
+				}
+				if corrupt && out.Errors == 0 || !corrupt && out.Errors != 0 {
+					t.Fatalf("corrupt=%v errors=%d", corrupt, out.Errors)
+				}
+			})
+		}
+	}
+}
+
 func uniformTrialServer(t *testing.T, execute func(int, string, [][]byte) ([][][]byte, string, error)) string {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -535,6 +602,16 @@ func TestParseWorkloadsAcceptsExplicitUniformNames(t *testing.T) {
 	}
 	if _, err := parseWorkloads("update_uniform,update_uniform"); err == nil {
 		t.Fatal("duplicate update_uniform workload accepted")
+	}
+}
+
+func TestParseWorkloadsAcceptsOptionalRangeSizes(t *testing.T) {
+	got, err := parseWorkloads("range_32,range_64,range_256")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(got, ",") != "range_32,range_64,range_256" {
+		t.Fatalf("unexpected range workloads: %v", got)
 	}
 }
 

@@ -37,7 +37,7 @@ PARENT_DEFAULT_REF = "82ea6abfcf51de01745a99609d5ffb0cbbb828d0"
 DEFAULT_WORKLOADS = "point_hit,point_miss,range_64,group_16,update_existing"
 DEFAULT_PAYLOAD_BYTES = 256
 ALLOWED_WORKLOADS = {
-    "point_hit", "point_miss", "range_64", "group_16", "update_existing",
+    "point_hit", "point_miss", "range_32", "range_64", "range_256", "group_16", "update_existing",
     "mixed_read_update", "update_uniform", "mixed_uniform",
 }
 COMMAND_LOG = None
@@ -998,6 +998,7 @@ def validate_client_report(path, args, cell, engine, server_engine):
     report, samples = validator.load(path, engine)
     expected = {"Rows": args.rows, "Operations": args.operations, "ScanOperations": args.scans,
                 "Warmup": args.warmup, "Repetitions": args.repetitions, "Clients": cell["clients"],
+                "SeedBatch": 64, "VerifyEveryTrial": True,
                 "Tables": cell["tables"], "Workloads": parse_workloads(cell["workloads"], "workloads"),
                 "GroupDistribution": cell["group_distribution"], "SkewPercent": args.skew_percent,
                 "PayloadBytes": DEFAULT_PAYLOAD_BYTES,

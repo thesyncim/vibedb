@@ -1,0 +1,25 @@
+vibedb point_hit c=1 rep=1 3077.9 ops/s p99=0.693ms errors=0 verified=true
+vibedb point_hit c=1 rep=2 3207.9 ops/s p99=0.593ms errors=0 verified=true
+vibedb point_hit c=1 rep=3 3171.5 ops/s p99=0.591ms errors=0 verified=true
+vibedb point_hit c=8 rep=1 13729.0 ops/s p99=1.303ms errors=0 verified=true
+vibedb point_hit c=8 rep=2 13752.0 ops/s p99=1.146ms errors=0 verified=true
+vibedb point_hit c=8 rep=3 14084.4 ops/s p99=1.210ms errors=0 verified=true
+vibedb point_miss c=1 rep=1 3307.1 ops/s p99=0.585ms errors=0 verified=true
+vibedb point_miss c=1 rep=2 3229.8 ops/s p99=0.624ms errors=0 verified=true
+vibedb point_miss c=1 rep=3 3328.6 ops/s p99=0.577ms errors=0 verified=true
+vibedb point_miss c=8 rep=1 14455.7 ops/s p99=1.105ms errors=0 verified=true
+vibedb point_miss c=8 rep=2 14341.6 ops/s p99=1.126ms errors=0 verified=true
+vibedb point_miss c=8 rep=3 13834.3 ops/s p99=1.104ms errors=0 verified=true
+vibedb range_32 c=1 rep=1 2357.7 ops/s p99=0.761ms errors=0 verified=true
+vibedb range_32 c=1 rep=2 2294.7 ops/s p99=0.744ms errors=0 verified=true
+vibedb range_32 c=1 rep=3 2439.4 ops/s p99=0.696ms errors=0 verified=true
+vibedb range_32 c=8 rep=1 12147.5 ops/s p99=1.295ms errors=0 verified=true
+vibedb range_32 c=8 rep=2 11684.6 ops/s p99=1.309ms errors=0 verified=true
+vibedb range_32 c=8 rep=3 11746.9 ops/s p99=1.254ms errors=0 verified=true
+vibedb range_64 c=1 rep=1 2085.3 ops/s p99=0.802ms errors=0 verified=true
+vibedb range_64 c=1 rep=2 2032.4 ops/s p99=0.786ms errors=0 verified=true
+vibedb range_64 c=1 rep=3 2049.3 ops/s p99=0.822ms errors=0 verified=true
+vibedb range_64 c=8 rep=1 11194.8 ops/s p99=1.391ms errors=0 verified=true
+vibedb range_64 c=8 rep=2 10169.4 ops/s p99=1.819ms errors=0 verified=true
+vibedb range_64 c=8 rep=3 10887.2 ops/s p99=1.399ms errors=0 verified=true
+Terminated

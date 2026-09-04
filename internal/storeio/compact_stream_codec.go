@@ -2189,8 +2189,14 @@ func countCompactPackedEqual(
 	if width == 7 {
 		return countCompactPacked7EqualImpl(data, count, want)
 	}
+	if width == 8 {
+		return countCompactPacked8EqualImpl(data, count, want)
+	}
 	if width == 10 {
 		return countCompactPacked10EqualImpl(data, count, want)
+	}
+	if width == 16 {
+		return countCompactPacked16EqualImpl(data, count, want)
 	}
 	if width > 56 {
 		for row := 0; row < count; row++ {
@@ -2215,6 +2221,27 @@ func countCompactPackedEqual(
 		}
 		reservoir >>= uint(width)
 		available -= width
+	}
+	return matched
+}
+
+// Byte-aligned widths can compare values directly without a bit reservoir.
+// Keep the full uint64 needle so out-of-range values scan without matching.
+func countCompactPacked8EqualScalar(data []byte, count int, want uint64) (matched int) {
+	for row := 0; row < count; row++ {
+		if uint64(data[row]) == want {
+			matched++
+		}
+	}
+	return matched
+}
+
+func countCompactPacked16EqualScalar(data []byte, count int, want uint64) (matched int) {
+	for row := 0; row < count; row++ {
+		value := binary.LittleEndian.Uint16(data[row*2:])
+		if uint64(value) == want {
+			matched++
+		}
 	}
 	return matched
 }

@@ -182,6 +182,48 @@ class FusedNodeRunnerTest(unittest.TestCase):
         self.assertIn("mixed_uniform", MODULE.ALLOWED_WORKLOADS)
         self.assertEqual(MODULE.cell_matrix(Arguments())[0]["workloads"], MODULE.DEFAULT_WORKLOADS)
 
+    def test_optional_range_sizes_are_supported_without_changing_defaults(self):
+        self.assertEqual(MODULE.parse_workloads("range_32,range_256", "workloads"),
+                         ["range_32", "range_256"])
+        self.assertEqual(MODULE.DEFAULT_WORKLOADS,
+                         "point_hit,point_miss,range_64,group_16,update_existing")
+
+    def test_client_report_requires_seed_and_per_trial_verification_controls(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            validator = root / "validator.py"
+            report_path = root / "report.json"
+            report_path.write_text("{}")
+            config = {
+                "Rows": 64, "Operations": 20, "ScanOperations": 10,
+                "Warmup": 2, "Repetitions": 1, "Clients": "1",
+                "SeedBatch": 64, "VerifyEveryTrial": True,
+                "Tables": ["rf3_sql_bench"], "Workloads": ["point_hit"],
+                "GroupDistribution": "uniform", "SkewPercent": 80,
+                "PayloadBytes": MODULE.DEFAULT_PAYLOAD_BYTES,
+                "KeySelection": "splitmix64-independent-with-replacement-v1",
+                "DiagnosticMode": "none", "PhysicalNodes": 9, "EndpointCount": 1,
+            }
+
+            class Args:
+                validator_path = validator
+                rows, operations, scans, warmup, repetitions = 64, 20, 10, 2, 1
+                skew_percent = 80
+
+            cell = {"clients": "1", "tables": ["rf3_sql_bench"], "workloads": "point_hit",
+                    "group_distribution": "uniform", "physical_nodes": 3, "endpoint_mode": "single"}
+            for field, invalid in ((None, None), ("SeedBatch", 32), ("VerifyEveryTrial", False)):
+                candidate = dict(config)
+                if field is not None:
+                    candidate[field] = invalid
+                validator.write_text("def load(path, engine):\n    return " + repr({"config": candidate, "status": "complete"}) + ", 20\n")
+                if field is None:
+                    got = MODULE.validate_client_report(report_path, Args, cell, "vibedb", "parent")
+                    self.assertEqual(got, {"samples_checked": 20, "complete": True})
+                else:
+                    with self.assertRaisesRegex(MODULE.RunnerError, "planned workload"):
+                        MODULE.validate_client_report(report_path, Args, cell, "vibedb", "parent")
+
     def test_output_directory_refuses_reuse(self):
         with tempfile.TemporaryDirectory() as parent:
             path = Path(parent) / "evidence"

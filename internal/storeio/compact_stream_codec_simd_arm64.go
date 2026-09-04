@@ -6,7 +6,9 @@ import "simd/archsimd"
 
 var (
 	countCompactPacked7EqualImpl  = countCompactPacked7EqualNEON
+	countCompactPacked8EqualImpl  = countCompactPacked8EqualNEON
 	countCompactPacked10EqualImpl = countCompactPacked10EqualNEON
+	countCompactPacked16EqualImpl = countCompactPacked16EqualNEON
 )
 
 // The lookup indices interleave the two bytes needed by each little-endian
@@ -26,6 +28,14 @@ var (
 	compactPacked10NEONIndices = [16]uint8{
 		0, 1, 1, 2, 2, 3, 3, 4,
 		5, 6, 6, 7, 7, 8, 8, 9,
+	}
+	// The final 32-row width10 load starts at byte 24 and looks up bytes
+	// 30..39. It overlaps the preceding load by 12 bytes and starts six bytes
+	// before its logical byte-30 input, staying inside the exact 40-byte input
+	// without a 46-byte lookahead.
+	compactPacked10NEONIndicesOffset6 = [16]uint8{
+		6, 7, 7, 8, 8, 9, 9, 10,
+		11, 12, 12, 13, 13, 14, 14, 15,
 	}
 	compactPacked10NEONShifts = [8]int16{0, -2, -4, -6, 0, -2, -4, -6}
 )
@@ -75,9 +85,11 @@ func countCompactPacked7EqualNEON(data []byte, count int, want uint64) (matched 
 	return matched
 }
 
-// countCompactPacked10EqualNEON scans eight 10-bit lanes per 16-byte load.
-// Ten bytes are consumed from each load; the remaining rows and any load
-// whose final six bytes would cross the logical input use the scalar oracle.
+// countCompactPacked10EqualNEON scans 32 10-bit lanes per four loads. The
+// final load starts at byte 24 and uses indices 6..15, so four loads consume
+// exactly 40 bytes while the last two loads overlap 12 bytes. Keeping four
+// independent accumulators removes the old per-eight-row flush branch; each
+// chunk is bounded to 4096 rows so uint16 reduction cannot overflow.
 func countCompactPacked10EqualNEON(data []byte, count int, want uint64) (matched int) {
 	if count <= 0 {
 		return 0
@@ -89,26 +101,132 @@ func countCompactPacked10EqualNEON(data []byte, count int, want uint64) (matched
 		want = 1024
 	}
 	indices := archsimd.LoadUint8x16Array(&compactPacked10NEONIndices)
+	indicesOffset6 := archsimd.LoadUint8x16Array(&compactPacked10NEONIndicesOffset6)
 	shifts := archsimd.LoadInt16x8Array(&compactPacked10NEONShifts)
 	mask := archsimd.BroadcastUint16x8(1023)
 	needle := archsimd.BroadcastUint16x8(uint16(want))
-	// Bound each uint16 reduction independently of the total input length.
-	var sums archsimd.Uint16x8
+	var sums0, sums1, sums2, sums3 archsimd.Uint16x8
 	row := 0
 	remaining := data
-	for ; row+8 <= count && len(remaining) >= 16; row += 8 {
-		loaded := archsimd.LoadUint8x16Array((*[16]uint8)(remaining))
-		lanes := loaded.LookupOrZero(indices).ReshapeToUint16s().Shift(shifts)
-		sums = sums.Sub(lanes.And(mask).Equal(needle).ToInt16x8().ToBits())
-		remaining = remaining[10:]
-		if row&4095 == 4088 {
-			matched += int(sums.ReduceSum())
-			sums = archsimd.Uint16x8{}
+	for row < count {
+		chunkEnd := count
+		if remainingRows := 4096; chunkEnd-row > remainingRows {
+			chunkEnd = row + remainingRows
+		}
+		vectorEnd := row + (chunkEnd-row)/32*32
+		for ; row < vectorEnd && len(remaining) >= 40; row += 32 {
+			loaded0 := archsimd.LoadUint8x16Array((*[16]uint8)(remaining))
+			loaded1 := archsimd.LoadUint8x16Array((*[16]uint8)(remaining[10:]))
+			loaded2 := archsimd.LoadUint8x16Array((*[16]uint8)(remaining[20:]))
+			loaded3 := archsimd.LoadUint8x16Array((*[16]uint8)(remaining[24:]))
+			lanes0 := loaded0.LookupOrZero(indices).ReshapeToUint16s().Shift(shifts)
+			lanes1 := loaded1.LookupOrZero(indices).ReshapeToUint16s().Shift(shifts)
+			lanes2 := loaded2.LookupOrZero(indices).ReshapeToUint16s().Shift(shifts)
+			lanes3 := loaded3.LookupOrZero(indicesOffset6).ReshapeToUint16s().Shift(shifts)
+			sums0 = sums0.Sub(lanes0.And(mask).Equal(needle).ToInt16x8().ToBits())
+			sums1 = sums1.Sub(lanes1.And(mask).Equal(needle).ToInt16x8().ToBits())
+			sums2 = sums2.Sub(lanes2.And(mask).Equal(needle).ToInt16x8().ToBits())
+			sums3 = sums3.Sub(lanes3.And(mask).Equal(needle).ToInt16x8().ToBits())
+			remaining = remaining[40:]
+		}
+		matched += int(sums0.ReduceSum()) + int(sums1.ReduceSum()) +
+			int(sums2.ReduceSum()) + int(sums3.ReduceSum())
+		sums0, sums1, sums2, sums3 = archsimd.Uint16x8{}, archsimd.Uint16x8{}, archsimd.Uint16x8{}, archsimd.Uint16x8{}
+		if row < chunkEnd {
+			tail := chunkEnd - row
+			matched += countCompactPacked10EqualScalar(remaining, tail, want)
+			remaining = remaining[(tail*10+7)/8:]
+			row = chunkEnd
 		}
 	}
-	matched += int(sums.ReduceSum())
-	if row < count {
-		matched += countCompactPacked10EqualScalar(remaining, count-row, want)
+	return matched
+}
+
+// countCompactPacked8EqualNEON scans byte-aligned eight-bit values in four
+// accumulators. Each 512-row chunk gives every accumulator at most eight
+// vectors, and the final partial group adds at most three more, so every
+// uint8 reduction stays below 256. Values left after complete vectors use the
+// scalar oracle.
+func countCompactPacked8EqualNEON(data []byte, count int, want uint64) (matched int) {
+	if count <= 0 {
+		return 0
+	}
+	if count < 32 || want > 255 {
+		return countCompactPacked8EqualScalar(data, count, want)
+	}
+	needle := archsimd.BroadcastUint8x16(uint8(want))
+	row := 0
+	remaining := data
+	for row < count {
+		chunkEnd := count
+		if chunkEnd-row > 512 {
+			chunkEnd = row + 512
+		}
+		vectorEnd := row + (chunkEnd-row)/64*64
+		var sums0, sums1, sums2, sums3 archsimd.Uint8x16
+		for ; row < vectorEnd && len(remaining) >= 64; row += 64 {
+			loaded0 := archsimd.LoadUint8x16Array((*[16]uint8)(remaining))
+			loaded1 := archsimd.LoadUint8x16Array((*[16]uint8)(remaining[16:]))
+			loaded2 := archsimd.LoadUint8x16Array((*[16]uint8)(remaining[32:]))
+			loaded3 := archsimd.LoadUint8x16Array((*[16]uint8)(remaining[48:]))
+			sums0 = sums0.Sub(loaded0.Equal(needle).ToInt8x16().ToBits())
+			sums1 = sums1.Sub(loaded1.Equal(needle).ToInt8x16().ToBits())
+			sums2 = sums2.Sub(loaded2.Equal(needle).ToInt8x16().ToBits())
+			sums3 = sums3.Sub(loaded3.Equal(needle).ToInt8x16().ToBits())
+			remaining = remaining[64:]
+		}
+		// A final partial group has at most three vectors. Adding it to sums0
+		// remains bounded by (8+3)*16 = 176 per reduction.
+		for ; row+16 <= chunkEnd && len(remaining) >= 16; row += 16 {
+			loaded := archsimd.LoadUint8x16Array((*[16]uint8)(remaining))
+			sums0 = sums0.Sub(loaded.Equal(needle).ToInt8x16().ToBits())
+			remaining = remaining[16:]
+		}
+		matched += int(sums0.ReduceSum()) + int(sums1.ReduceSum()) +
+			int(sums2.ReduceSum()) + int(sums3.ReduceSum())
+		if row < chunkEnd {
+			tail := chunkEnd - row
+			matched += countCompactPacked8EqualScalar(remaining, tail, want)
+			remaining = remaining[tail:]
+			row = chunkEnd
+		}
+	}
+	return matched
+}
+
+// countCompactPacked16EqualNEON scans eight little-endian uint16 values per
+// load. A uint16 accumulator is reduced at most once per 4096-row chunk,
+// keeping each lane's sum at 512 or less. Impossible needles take the scalar
+// path so a uint64 value is never truncated into a false uint16 match.
+func countCompactPacked16EqualNEON(data []byte, count int, want uint64) (matched int) {
+	if count <= 0 {
+		return 0
+	}
+	if count < 32 || want > 65535 {
+		return countCompactPacked16EqualScalar(data, count, want)
+	}
+	needle := archsimd.BroadcastUint16x8(uint16(want))
+	row := 0
+	remaining := data
+	for row < count {
+		chunkEnd := count
+		if chunkEnd-row > 4096 {
+			chunkEnd = row + 4096
+		}
+		vectorEnd := row + (chunkEnd-row)/8*8
+		var sums archsimd.Uint16x8
+		for ; row < vectorEnd && len(remaining) >= 16; row += 8 {
+			loaded := archsimd.LoadUint8x16Array((*[16]uint8)(remaining)).ReshapeToUint16s()
+			sums = sums.Sub(loaded.Equal(needle).ToInt16x8().ToBits())
+			remaining = remaining[16:]
+		}
+		matched += int(sums.ReduceSum())
+		if row < chunkEnd {
+			tail := chunkEnd - row
+			matched += countCompactPacked16EqualScalar(remaining, tail, want)
+			remaining = remaining[tail*2:]
+			row = chunkEnd
+		}
 	}
 	return matched
 }

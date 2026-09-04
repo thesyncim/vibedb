@@ -53,6 +53,8 @@ def report(engine="vibedb", *, new=False):
     result["samples"][1]["start_offset_ns"] = 20
     if new:
         config.update({
+            "SeedBatch": 64,
+            "VerifyEveryTrial": True,
             "Tables": ["rf3_sql_bench", "orders_01"],
             "Workloads": ["point_hit"],
             "GroupDistribution": "uniform",
@@ -148,6 +150,17 @@ class SummarizeCRDBSQLTest(unittest.TestCase):
             path = write_report(directory, report(new=True))
             _, samples = MODULE.load(path, "vibedb")
             self.assertEqual(samples, 2)
+
+    def test_new_seed_and_verification_controls_are_validated(self):
+        for field, invalid in (("SeedBatch", 0), ("SeedBatch", True),
+                               ("VerifyEveryTrial", 1), ("VerifyEveryTrial", "true")):
+            with self.subTest(field=field, invalid=invalid), tempfile.TemporaryDirectory() as directory:
+                value = report(new=True)
+                value.update(schema_version=2, status="complete", started_utc="2026-09-04T00:00:00Z")
+                value.pop("verification_error")
+                value["config"][field] = invalid
+                with self.assertRaises(ValueError):
+                    MODULE.load(write_report(directory, value), "vibedb")
 
     def test_uniform_workloads_validate_actual_operation_labels(self):
         for workload in ("update_uniform", "mixed_uniform"):

@@ -15,11 +15,12 @@ import re
 from statistics import median
 
 WORKLOADS = ("point_hit", "point_miss", "range_64", "group_16", "update_existing")
+OPTIONAL_RANGE_WORKLOADS = ("range_32", "range_256")
 DEFAULT_TABLES = ("rf3_sql_bench",)
 MIXED_WORKLOAD = "mixed_read_update"
 UNIFORM_UPDATE_WORKLOAD = "update_uniform"
 UNIFORM_MIXED_WORKLOAD = "mixed_uniform"
-ALL_WORKLOADS = WORKLOADS + (MIXED_WORKLOAD, UNIFORM_UPDATE_WORKLOAD, UNIFORM_MIXED_WORKLOAD)
+ALL_WORKLOADS = WORKLOADS + OPTIONAL_RANGE_WORKLOADS + (MIXED_WORKLOAD, UNIFORM_UPDATE_WORKLOAD, UNIFORM_MIXED_WORKLOAD)
 UINT64_MASK = (1 << 64) - 1
 DIAGNOSTIC_COUNTERS = (
     "ready_waves", "ready_durable_waves", "observed_append_barriers", "multi_group_waves", "failed_waves",
@@ -217,6 +218,11 @@ def load(path, engine):
     require(is_integer(schema_version) and schema_version in (1, 2), "unknown report schema")
     if schema_version == 2:
         require(config.get("KeySelection") == "splitmix64-independent-with-replacement-v1", "missing or unknown read-key selection")
+        if "SeedBatch" in config:
+            require(is_integer(config["SeedBatch"]) and 1 <= config["SeedBatch"] <= 1024,
+                    "invalid seed batch")
+        if "VerifyEveryTrial" in config:
+            require(isinstance(config["VerifyEveryTrial"], bool), "invalid per-trial verification mode")
         require(report.get("status") in {"complete", "failed", "incomplete"}, "invalid report status")
         validate_anchor(report.get("started_utc"))
         if report["status"] != "complete":
@@ -282,7 +288,7 @@ def load(path, engine):
             validate_anchor(trial["measurement_started_utc"])
         count = trial.get("operations")
         require(is_integer(count) and count > 0, "invalid trial operation count")
-        expected_count = config["ScanOperations"] if trial["workload"] in ("range_64", "group_16") else config["Operations"]
+        expected_count = config["ScanOperations"] if trial["workload"].startswith("range_") or trial["workload"] == "group_16" else config["Operations"]
         require(trial["engine"] == engine and count == expected_count and
                 (schema_version == 1 or count >= trial["clients"]),
                 "trial operation count/engine mismatch")

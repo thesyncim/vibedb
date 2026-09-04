@@ -9,5 +9,7 @@ package storeio
 // function value to inspect.
 var (
 	countCompactPacked7EqualImpl  = countCompactPacked7EqualScalar
+	countCompactPacked8EqualImpl  = countCompactPacked8EqualScalar
 	countCompactPacked10EqualImpl = countCompactPacked10EqualScalar
+	countCompactPacked16EqualImpl = countCompactPacked16EqualScalar
 )

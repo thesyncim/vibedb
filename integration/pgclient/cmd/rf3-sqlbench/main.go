@@ -24,11 +24,12 @@ type config struct {
 	diagnostics                                  *diagnosticControl
 	engine, url, output, phase                   string
 	rows, operations, scans, warmup, repetitions int
+	seedBatch                                    int
 	clients                                      string
 	tables, workloads, groupDistribution         string
 	skewPercent                                  int
 	physicalNodes                                int
-	requireExistingTables                        bool
+	requireExistingTables, verifyEveryTrial      bool
 	urls                                         string
 }
 type sample struct {
@@ -78,6 +79,8 @@ type trialRecord struct {
 type configRecord struct {
 	KeySelection                                                        string
 	DiagnosticMode                                                      string
+	SeedBatch                                                           int
+	VerifyEveryTrial                                                    bool
 	Engine                                                              string
 	Rows, PayloadBytes, Operations, ScanOperations, Warmup, Repetitions int
 	Clients                                                             string
@@ -107,6 +110,7 @@ func main() {
 	flag.IntVar(&c.scans, "scans", 200, "measured range/group operations per trial")
 	flag.IntVar(&c.warmup, "warmup", 100, "unmeasured operations before each trial")
 	flag.IntVar(&c.repetitions, "repetitions", 3, "repetitions per workload and concurrency")
+	flag.IntVar(&c.seedBatch, "seed-batch", 64, "rows per untimed INSERT (1..1024; subject to engine admission limits)")
 	flag.StringVar(&c.clients, "clients", "1,8", "closed-loop concurrency list (maximum 15)")
 	flag.StringVar(&c.tables, "tables", defaultTable, "comma-separated lowercase logical table names; group placement requires runtime inventory")
 	flag.StringVar(&c.workloads, "workloads", strings.Join(defaultWorkloads, ","), "comma-separated workloads; default is the five-workload C1/C8 matrix")
@@ -114,6 +118,7 @@ func main() {
 	flag.IntVar(&c.skewPercent, "skew-percent", 80, "skewed selection percentage assigned to the first table")
 	flag.IntVar(&c.physicalNodes, "physical-nodes", 0, "reported physical-node count for matrix metadata; does not alter routing")
 	flag.BoolVar(&c.requireExistingTables, "require-existing-tables", false, "fail if a requested table was not provisioned before setup")
+	flag.BoolVar(&c.verifyEveryTrial, "verify-every-trial", true, "verify every row after each trial; false verifies before and after the full run (each operation is always checked)")
 	flag.StringVar(&c.urls, "urls", "", "comma-separated PostgreSQL URLs; clients use endpoint client index modulo this list")
 	flag.StringVar(&c.diagnosticTargets, "diagnostic-targets", "", "ready candidate PID/node/snapshot bindings for untimed acknowledged diagnostic brackets")
 	flag.Parse()
@@ -123,6 +128,9 @@ func main() {
 	}
 }
 func run(c config) (runErr error) {
+	if c.seedBatch < 1 || c.seedBatch > 1024 {
+		return fmt.Errorf("invalid seed batch")
+	}
 	if (c.engine != "vibedb" && c.engine != "cockroachdb") || c.url == "" || c.rows < 64 || c.rows > 1000000 || c.operations < 1 || c.operations > 1000000 || c.scans < 1 || c.scans > 100000 || c.warmup < 0 || c.warmup > 100000 || c.repetitions < 1 || c.repetitions > 20 || (c.phase != "all" && c.phase != "setup" && c.phase != "run") {
 		return fmt.Errorf("invalid benchmark configuration")
 	}
@@ -151,7 +159,7 @@ func run(c config) (runErr error) {
 	for _, n := range concurrencies {
 		for _, workload := range workloads {
 			count := c.operations
-			if workload == "range_64" || workload == "group_16" {
+			if strings.HasPrefix(workload, "range_") || workload == "group_16" {
 				count = c.scans
 			}
 			if count < n {
@@ -159,7 +167,7 @@ func run(c config) (runErr error) {
 			}
 		}
 	}
-	r := report{SchemaVersion: 2, Status: "incomplete", Results: []result{}, VerificationError: "benchmark did not finish", Config: configRecord{Engine: c.engine, Rows: c.rows, PayloadBytes: len(payload), Operations: c.operations, ScanOperations: c.scans, Warmup: c.warmup, Repetitions: c.repetitions, Clients: c.clients, Protocol: "extended unnamed parse/bind/execute; text parameters/results; one autocommit statement per operation", Tables: tables, Workloads: workloads, GroupDistribution: c.groupDistribution, SkewPercent: c.skewPercent, PhysicalNodes: c.physicalNodes, EndpointCount: len(endpointLabels), EndpointRouting: "round-robin-per-client"}, Started: time.Now().UTC().Format(time.RFC3339Nano)}
+	r := report{SchemaVersion: 2, Status: "incomplete", Results: []result{}, VerificationError: "benchmark did not finish", Config: configRecord{SeedBatch: c.seedBatch, VerifyEveryTrial: c.verifyEveryTrial, Engine: c.engine, Rows: c.rows, PayloadBytes: len(payload), Operations: c.operations, ScanOperations: c.scans, Warmup: c.warmup, Repetitions: c.repetitions, Clients: c.clients, Protocol: "extended unnamed parse/bind/execute; text parameters/results; one autocommit statement per operation", Tables: tables, Workloads: workloads, GroupDistribution: c.groupDistribution, SkewPercent: c.skewPercent, PhysicalNodes: c.physicalNodes, EndpointCount: len(endpointLabels), EndpointRouting: "round-robin-per-client"}, Started: time.Now().UTC().Format(time.RFC3339Nano)}
 	r.Config.DiagnosticMode = "none"
 	r.Config.KeySelection = "splitmix64-independent-with-replacement-v1"
 	if c.diagnosticTargets != "" {
@@ -245,7 +253,7 @@ func run(c config) (runErr error) {
 		for _, n := range concurrencies {
 			for rep := 1; rep <= c.repetitions; rep++ {
 				count := c.operations
-				if workload == "range_64" || workload == "group_16" {
+				if strings.HasPrefix(workload, "range_") || workload == "group_16" {
 					count = c.scans
 				}
 				r.ActiveTrial = &trialRecord{Workload: workload, Clients: n, Repetition: rep, Phase: "preparing-or-measuring"}
@@ -265,8 +273,12 @@ func run(c config) (runErr error) {
 				if err := writeReport(c.output, r); err != nil {
 					return err
 				}
-				verifyErr := verify(ctx, admin, c, tables, scores)
-				out.Verified = verifyErr == nil && out.Errors == 0
+				var verifyErr error
+				verifyThisTrial := c.verifyEveryTrial || workload == "update_uniform" || workload == "mixed_uniform"
+				if verifyThisTrial {
+					verifyErr = verify(ctx, admin, c, tables, scores)
+				}
+				out.Verified = verifyThisTrial && verifyErr == nil && out.Errors == 0
 				r.Results[len(r.Results)-1].Verified = out.Verified
 				fmt.Fprintf(os.Stderr, "%s %s c=%d rep=%d %.1f ops/s p99=%.3fms errors=%d verified=%v\n", c.engine, workload, n, rep, out.Throughput, float64(out.P99)/1e6, out.Errors, out.Verified)
 				if verifyErr != nil {
@@ -280,6 +292,22 @@ func run(c config) (runErr error) {
 					return err
 				}
 			}
+		}
+	}
+	if !c.verifyEveryTrial {
+		r.ActiveTrial = &trialRecord{Phase: "verifying-full-run"}
+		if err := writeReport(c.output, r); err != nil {
+			return err
+		}
+		if err := verify(ctx, admin, c, tables, scores); err != nil {
+			return err
+		}
+		for i := range r.Results {
+			r.Results[i].Verified = r.Results[i].Errors == 0
+		}
+		r.ActiveTrial = nil
+		if err := writeReport(c.output, r); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -375,7 +403,7 @@ func parseWorkloads(raw string) ([]string, error) {
 		return nil, fmt.Errorf("workloads must not be empty")
 	}
 	allowed := map[string]struct{}{
-		"point_hit": {}, "point_miss": {}, "range_64": {}, "group_16": {},
+		"point_hit": {}, "point_miss": {}, "range_32": {}, "range_64": {}, "range_256": {}, "group_16": {},
 		"update_existing": {}, "mixed_read_update": {}, "update_uniform": {}, "mixed_uniform": {},
 	}
 	workloads := make([]string, 0, len(strings.Split(raw, ",")))
@@ -521,10 +549,13 @@ func setup(ctx context.Context, conn *pgconn.PgConn, c config, tables []string) 
 		if e := conn.ExecParams(ctx, ddl, nil, nil, nil, nil).Read().Err; e != nil {
 			return fmt.Errorf("create %s: %w", table, e)
 		}
-		for first := 0; first < c.rows; first += 64 {
+		for first := 0; first < c.rows; first += c.seedBatch {
+			if first%65536 == 0 {
+				fmt.Fprintf(os.Stderr, "seeding %s %d/%d rows\n", table, first, c.rows)
+			}
 			var sql strings.Builder
 			sql.WriteString("INSERT INTO " + table + " (id,bucket,score,payload) VALUES ")
-			for i := first; i < min(first+64, c.rows); i++ {
+			for i := first; i < min(first+c.seedBatch, c.rows); i++ {
 				if i != first {
 					sql.WriteByte(',')
 				}
@@ -534,7 +565,7 @@ func setup(ctx context.Context, conn *pgconn.PgConn, c config, tables []string) 
 			if res.Err != nil {
 				return fmt.Errorf("seed %s row %d: %w", table, first, res.Err)
 			}
-			if res.CommandTag.RowsAffected() != int64(min(64, c.rows-first)) {
+			if res.CommandTag.RowsAffected() != int64(min(c.seedBatch, c.rows-first)) {
 				return fmt.Errorf("seed %s affected rows", table)
 			}
 		}
@@ -605,6 +636,10 @@ func trial(ctx context.Context, c config, workload string, clients, rep, count i
 	if len(endpoints) == 0 {
 		return result{}, fmt.Errorf("PostgreSQL endpoint list must not be empty")
 	}
+	rangeRows := 64
+	if strings.HasPrefix(workload, "range_") {
+		rangeRows, _ = strconv.Atoi(strings.TrimPrefix(workload, "range_"))
+	}
 	out := result{Engine: c.engine, Workload: workload, Clients: clients, Repetition: rep, Operations: count, Samples: make([]sample, count)}
 	connections := make([]*pgconn.PgConn, clients)
 	defer func() {
@@ -636,9 +671,9 @@ func trial(ctx context.Context, c config, workload string, clients, rep, count i
 		case "point_miss":
 			sql = "SELECT id,bucket,score,payload FROM " + table + " WHERE id=$1"
 			params = [][]byte{[]byte(key(c.rows + id))}
-		case "range_64":
-			id = (id / 64) * 64
-			sql = "SELECT id,score FROM " + table + " WHERE id >= $1 ORDER BY id LIMIT 64"
+		case "range_32", "range_64", "range_256":
+			id = (id / rangeRows) * rangeRows
+			sql = "SELECT id,score FROM " + table + " WHERE id >= $1 ORDER BY id LIMIT " + strconv.Itoa(rangeRows)
 			params = [][]byte{[]byte(key(id))}
 		case "group_16":
 			sql = "SELECT bucket,COUNT(*),SUM(score) FROM " + table + " GROUP BY bucket ORDER BY bucket"
@@ -694,8 +729,8 @@ func trial(ctx context.Context, c config, workload string, clients, rep, count i
 			if len(res.Rows) != 0 {
 				return fmt.Errorf("miss returned rows")
 			}
-		case "range_64":
-			if len(res.Rows) != min(64, c.rows-id) {
+		case "range_32", "range_64", "range_256":
+			if len(res.Rows) != min(rangeRows, c.rows-id) {
 				return fmt.Errorf("range count")
 			}
 			for j, row := range res.Rows {
