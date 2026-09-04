@@ -1,0 +1,936 @@
+{
+  "schema": "vibedb.fused-short-audit/1",
+  "evidence_directory": "vibedb-fused-short-27b89cd6",
+  "refs": {
+    "parent": "82ea6abfcf51de01745a99609d5ffb0cbbb828d0",
+    "candidate": "27b89cd661b944f6c4738a8d240ffc0ffc649483",
+    "requested_parent": "82ea6abfcf51de01745a99609d5ffb0cbbb828d0",
+    "requested_candidate": "27b89cd661b944f6c4738a8d240ffc0ffc649483"
+  },
+  "source_revisions": {
+    "parent": {
+      "revision": "82ea6abfcf51de01745a99609d5ffb0cbbb828d0",
+      "dirty": false,
+      "status": ""
+    },
+    "client": {
+      "revision": "27b89cd661b944f6c4738a8d240ffc0ffc649483",
+      "dirty": false,
+      "status": ""
+    },
+    "candidate": {
+      "revision": "27b89cd661b944f6c4738a8d240ffc0ffc649483",
+      "dirty": false,
+      "status": ""
+    }
+  },
+  "crdb_image": "cockroachdb/cockroach:v26.3.1@sha256:204f131510c78393adb02345f289a8dbb32e1491e26cc92b6c7751f3b97be3c5",
+  "runtime_image": "golang:1.27-bookworm",
+  "runtime_image_id": "sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b",
+  "go_version": "go version go1.27.0 darwin/arm64",
+  "binary_sha256": {
+    "candidate-vibedb": "eea601d94ac5d25fa293dce6ea1d6016f5dd710325f9913d02e8ef3425344a79",
+    "candidate-vibedb-gateway": "fbfa1722d5d30ddd19f3f20515b98418214cbea37672bc3616323f223abb9e4e",
+    "candidate-vibedb-shard": "e8f6a00ca83d531306a20efa9821dc93b452811d046f8cbda2e84002f5791e29",
+    "cockroach": "7923d5eca1fc275abebd64863fa5e5c51be3504fd57f37c5b8c4f8579bd54c3e",
+    "parent-vibedb": "b70fd81e8b23ad12f47ed68e43c8db3477601a30b8b6fa22048f06c32ad125d1",
+    "parent-vibedb-gateway": "e8b54378e2f4359a5c5fee1a871092561a05a6495d6123a86ec1bd5d4760f499",
+    "parent-vibedb-shard": "cb180ad2baaa81a95195b03e4ce37624cc026652117b641c8a7711709b7e5401",
+    "rf3-sqlbench": "9b70628460529c7af78be7b2249a603b6fda730444d2b852502ae4e45b1fcf2b"
+  },
+  "control_sha256": {
+    "run-fused-node-comparison.py": "c163e48b156baf41929e3f6a036776ca792feed8afc98d1db3a2befd43c4198c",
+    "summarize-crdb-sql.py": "9f1f3622bb1c3904a211e8a848e9c6a30d7edc79cd6ef65fa517741260ac4fb2"
+  },
+  "config": {
+    "KeySelection": "splitmix64-independent-with-replacement-v1",
+    "Rows": 1024,
+    "PayloadBytes": 256,
+    "Operations": 2000,
+    "ScanOperations": 200,
+    "Warmup": 100,
+    "Repetitions": 2,
+    "Clients": "1,8",
+    "Protocol": "extended unnamed parse/bind/execute; text parameters/results; one autocommit statement per operation",
+    "Tables": [
+      "rf3_sql_bench"
+    ],
+    "Workloads": [
+      "point_hit",
+      "point_miss",
+      "range_64",
+      "group_16",
+      "update_existing"
+    ],
+    "GroupDistribution": "uniform",
+    "SkewPercent": 80,
+    "EndpointCount": 1,
+    "EndpointRouting": "round-robin-per-client"
+  },
+  "engine_sequences": {
+    "parent-first": [
+      "parent",
+      "candidate",
+      "crdb"
+    ],
+    "candidate-first": [
+      "crdb",
+      "candidate",
+      "parent"
+    ]
+  },
+  "counts": {
+    "fixtures": 6,
+    "successful_setup_phases": 6,
+    "trials": 120,
+    "samples_validated": 153600,
+    "sql_errors": 0,
+    "unverified_trials": 0,
+    "warmup_operations": 12000,
+    "candidate_diagnostic_snapshots": 240,
+    "summed_measured_window_seconds": 95.395237086
+  },
+  "sources": [
+    {
+      "order": "parent-first",
+      "engine": "parent",
+      "report": "baseline-c1-c8/parent-first/parent/report.json",
+      "report_sha256": "ac74de22de984b9990fd900b411b499025bc10ce3a217f7843f71dc68a044219",
+      "version": "PostgreSQL 16.0 (vibedb pgwire)",
+      "trials": 20,
+      "samples_validated": 25600,
+      "sql_errors": 0,
+      "all_trials_verified": true,
+      "setup_exit_code": 0,
+      "serving_process_counts": {
+        "vibedb": 1,
+        "vibedb_shard": 9,
+        "vibedb_gateway": 1,
+        "cockroach": 0
+      },
+      "actual_resource_limits": {
+        "NanoCpus": 12000000000,
+        "Memory": 25769803776,
+        "MemorySwap": 25769803776
+      },
+      "inventory_parse_warning_counts": {
+        "ready": 9,
+        "after": 9
+      }
+    },
+    {
+      "order": "parent-first",
+      "engine": "candidate",
+      "report": "baseline-c1-c8/parent-first/candidate/report.json",
+      "report_sha256": "aae4317019b2e898ae9e1314a773e1f500ef1d1ea6dacda287e9e3f6bfb88ca5",
+      "version": "PostgreSQL 16.0 (vibedb pgwire)",
+      "trials": 20,
+      "samples_validated": 25600,
+      "sql_errors": 0,
+      "all_trials_verified": true,
+      "setup_exit_code": 0,
+      "serving_process_counts": {
+        "vibedb": 1,
+        "vibedb_shard": 3,
+        "vibedb_gateway": 0,
+        "cockroach": 0
+      },
+      "actual_resource_limits": {
+        "NanoCpus": 12000000000,
+        "Memory": 25769803776,
+        "MemorySwap": 25769803776
+      },
+      "inventory_parse_warning_counts": {
+        "ready": 9,
+        "after": 9
+      }
+    },
+    {
+      "order": "parent-first",
+      "engine": "crdb",
+      "report": "baseline-c1-c8/parent-first/crdb/report.json",
+      "report_sha256": "7e7461a58e5905141ac79f027031c7b3cc2a249ed3f6d74066d66685f66425c0",
+      "version": "CockroachDB CCL v26.3.1 (aarch64-unknown-linux-gnu, built 2026/08/24 17:37:27, go1.26.6)",
+      "trials": 20,
+      "samples_validated": 25600,
+      "sql_errors": 0,
+      "all_trials_verified": true,
+      "setup_exit_code": 0,
+      "serving_process_counts": {
+        "vibedb": 0,
+        "vibedb_shard": 0,
+        "vibedb_gateway": 0,
+        "cockroach": 3
+      },
+      "actual_resource_limits": {
+        "NanoCpus": 12000000000,
+        "Memory": 25769803776,
+        "MemorySwap": 25769803776
+      },
+      "inventory_parse_warning_counts": {
+        "ready": 12,
+        "after": 12
+      }
+    },
+    {
+      "order": "candidate-first",
+      "engine": "crdb",
+      "report": "baseline-c1-c8/candidate-first/crdb/report.json",
+      "report_sha256": "abd9ac301313684b272ad11cadefdb4e710942c6b995d072cb6a10ba9f572021",
+      "version": "CockroachDB CCL v26.3.1 (aarch64-unknown-linux-gnu, built 2026/08/24 17:37:27, go1.26.6)",
+      "trials": 20,
+      "samples_validated": 25600,
+      "sql_errors": 0,
+      "all_trials_verified": true,
+      "setup_exit_code": 0,
+      "serving_process_counts": {
+        "vibedb": 0,
+        "vibedb_shard": 0,
+        "vibedb_gateway": 0,
+        "cockroach": 3
+      },
+      "actual_resource_limits": {
+        "NanoCpus": 12000000000,
+        "Memory": 25769803776,
+        "MemorySwap": 25769803776
+      },
+      "inventory_parse_warning_counts": {
+        "ready": 12,
+        "after": 12
+      }
+    },
+    {
+      "order": "candidate-first",
+      "engine": "candidate",
+      "report": "baseline-c1-c8/candidate-first/candidate/report.json",
+      "report_sha256": "9e2cde62736c9e2a74c2b601fe6015a9cfa5f65a7597fb8e39af9ed233ebebab",
+      "version": "PostgreSQL 16.0 (vibedb pgwire)",
+      "trials": 20,
+      "samples_validated": 25600,
+      "sql_errors": 0,
+      "all_trials_verified": true,
+      "setup_exit_code": 0,
+      "serving_process_counts": {
+        "vibedb": 1,
+        "vibedb_shard": 3,
+        "vibedb_gateway": 0,
+        "cockroach": 0
+      },
+      "actual_resource_limits": {
+        "NanoCpus": 12000000000,
+        "Memory": 25769803776,
+        "MemorySwap": 25769803776
+      },
+      "inventory_parse_warning_counts": {
+        "ready": 9,
+        "after": 9
+      }
+    },
+    {
+      "order": "candidate-first",
+      "engine": "parent",
+      "report": "baseline-c1-c8/candidate-first/parent/report.json",
+      "report_sha256": "a59bde6df8a30deae353c31b0fe2970c0a352564450414bfe4f45ab82c85a865",
+      "version": "PostgreSQL 16.0 (vibedb pgwire)",
+      "trials": 20,
+      "samples_validated": 25600,
+      "sql_errors": 0,
+      "all_trials_verified": true,
+      "setup_exit_code": 0,
+      "serving_process_counts": {
+        "vibedb": 1,
+        "vibedb_shard": 9,
+        "vibedb_gateway": 1,
+        "cockroach": 0
+      },
+      "actual_resource_limits": {
+        "NanoCpus": 12000000000,
+        "Memory": 25769803776,
+        "MemorySwap": 25769803776
+      },
+      "inventory_parse_warning_counts": {
+        "ready": 9,
+        "after": 9
+      }
+    }
+  ],
+  "order_summaries": {
+    "parent-first": {
+      "candidate_parent_throughput_geomean": 1.0813626029496248,
+      "candidate_crdb_throughput_geomean": 0.41827588503716795,
+      "worst_candidate_parent_throughput_ratio": 0.9518928208402069,
+      "worst_candidate_parent_p99_ratio": 1.025400628639653,
+      "cells_below_0_95_parent_throughput": 0,
+      "cells_above_1_10_parent_p99": 0
+    },
+    "candidate-first": {
+      "candidate_parent_throughput_geomean": 1.2436578248921888,
+      "candidate_crdb_throughput_geomean": 0.5335795236770665,
+      "worst_candidate_parent_throughput_ratio": 0.965016756501045,
+      "worst_candidate_parent_p99_ratio": 1.078563174134172,
+      "cells_below_0_95_parent_throughput": 0,
+      "cells_above_1_10_parent_p99": 0
+    }
+  },
+  "per_order_tables": {
+    "parent-first": [
+      {
+        "workload": "point_hit",
+        "clients": 1,
+        "engines": {
+          "parent": {
+            "median_ops_per_second": 2917.808604816199,
+            "median_trial_p99_ms": 0.7042295
+          },
+          "candidate": {
+            "median_ops_per_second": 3134.479569953569,
+            "median_trial_p99_ms": 0.5605835
+          },
+          "crdb": {
+            "median_ops_per_second": 7128.03333133207,
+            "median_trial_p99_ms": 0.2405625
+          }
+        },
+        "candidate_parent_throughput_ratio": 1.0742581143875332,
+        "candidate_crdb_throughput_ratio": 0.4397397464705464,
+        "candidate_parent_p99_ratio": 0.7960238814193386,
+        "candidate_crdb_p99_ratio": 2.3303029358274876
+      },
+      {
+        "workload": "point_hit",
+        "clients": 8,
+        "engines": {
+          "parent": {
+            "median_ops_per_second": 13908.392400269593,
+            "median_trial_p99_ms": 1.1731255
+          },
+          "candidate": {
+            "median_ops_per_second": 15936.60015358994,
+            "median_trial_p99_ms": 0.94725
+          },
+          "crdb": {
+            "median_ops_per_second": 43495.46523839941,
+            "median_trial_p99_ms": 0.3165
+          }
+        },
+        "candidate_parent_throughput_ratio": 1.1458261814126722,
+        "candidate_crdb_throughput_ratio": 0.3663968201338037,
+        "candidate_parent_p99_ratio": 0.8074583665600995,
+        "candidate_crdb_p99_ratio": 2.9928909952606637
+      },
+      {
+        "workload": "point_miss",
+        "clients": 1,
+        "engines": {
+          "parent": {
+            "median_ops_per_second": 3218.343948971946,
+            "median_trial_p99_ms": 0.6241045
+          },
+          "candidate": {
+            "median_ops_per_second": 3219.8275145816033,
+            "median_trial_p99_ms": 0.5111875
+          },
+          "crdb": {
+            "median_ops_per_second": 6712.1981288726765,
+            "median_trial_p99_ms": 0.304146
+          }
+        },
+        "candidate_parent_throughput_ratio": 1.00046097173987,
+        "candidate_crdb_throughput_ratio": 0.47969792499590264,
+        "candidate_parent_p99_ratio": 0.8190735686091032,
+        "candidate_crdb_p99_ratio": 1.680730635944579
+      },
+      {
+        "workload": "point_miss",
+        "clients": 8,
+        "engines": {
+          "parent": {
+            "median_ops_per_second": 13898.647622798213,
+            "median_trial_p99_ms": 1.220667
+          },
+          "candidate": {
+            "median_ops_per_second": 16450.12581774177,
+            "median_trial_p99_ms": 0.8243755
+          },
+          "crdb": {
+            "median_ops_per_second": 43779.8154296025,
+            "median_trial_p99_ms": 0.3120415
+          }
+        },
+        "candidate_parent_throughput_ratio": 1.1835774432296793,
+        "candidate_crdb_throughput_ratio": 0.3757468060639361,
+        "candidate_parent_p99_ratio": 0.6753483955902798,
+        "candidate_crdb_p99_ratio": 2.6418777630539525
+      },
+      {
+        "workload": "range_64",
+        "clients": 1,
+        "engines": {
+          "parent": {
+            "median_ops_per_second": 2014.712630984398,
+            "median_trial_p99_ms": 0.8161665
+          },
+          "candidate": {
+            "median_ops_per_second": 2025.5286542549966,
+            "median_trial_p99_ms": 0.765979
+          },
+          "crdb": {
+            "median_ops_per_second": 4567.374839807822,
+            "median_trial_p99_ms": 0.3515625
+          }
+        },
+        "candidate_parent_throughput_ratio": 1.0053685191149637,
+        "candidate_crdb_throughput_ratio": 0.4434776486048653,
+        "candidate_parent_p99_ratio": 0.9385082578125908,
+        "candidate_crdb_p99_ratio": 2.178784711111111
+      },
+      {
+        "workload": "range_64",
+        "clients": 8,
+        "engines": {
+          "parent": {
+            "median_ops_per_second": 9298.552560504926,
+            "median_trial_p99_ms": 2.2455835
+          },
+          "candidate": {
+            "median_ops_per_second": 12005.349289530779,
+            "median_trial_p99_ms": 1.0959165
+          },
+          "crdb": {
+            "median_ops_per_second": 29743.867233862176,
+            "median_trial_p99_ms": 0.4323545
+          }
+        },
+        "candidate_parent_throughput_ratio": 1.2910987179362536,
+        "candidate_crdb_throughput_ratio": 0.40362435708639727,
+        "candidate_parent_p99_ratio": 0.48803195249697906,
+        "candidate_crdb_p99_ratio": 2.5347637181988394
+      },
+      {
+        "workload": "group_16",
+        "clients": 1,
+        "engines": {
+          "parent": {
+            "median_ops_per_second": 1053.133972500084,
+            "median_trial_p99_ms": 1.3710205
+          },
+          "candidate": {
+            "median_ops_per_second": 1099.418317613452,
+            "median_trial_p99_ms": 1.155979
+          },
+          "crdb": {
+            "median_ops_per_second": 2437.0412117050873,
+            "median_trial_p99_ms": 0.6529375
+          }
+        },
+        "candidate_parent_throughput_ratio": 1.0439491520755821,
+        "candidate_crdb_throughput_ratio": 0.45112832410586884,
+        "candidate_parent_p99_ratio": 0.8431522358710173,
+        "candidate_crdb_p99_ratio": 1.7704282569158614
+      },
+      {
+        "workload": "group_16",
+        "clients": 8,
+        "engines": {
+          "parent": {
+            "median_ops_per_second": 6419.256777350019,
+            "median_trial_p99_ms": 2.4636665
+          },
+          "candidate": {
+            "median_ops_per_second": 7402.516429513461,
+            "median_trial_p99_ms": 2.1016875
+          },
+          "crdb": {
+            "median_ops_per_second": 17594.60140231713,
+            "median_trial_p99_ms": 0.6190625
+          }
+        },
+        "candidate_parent_throughput_ratio": 1.153173441453973,
+        "candidate_crdb_throughput_ratio": 0.4207265774454307,
+        "candidate_parent_p99_ratio": 0.8530730518923727,
+        "candidate_crdb_p99_ratio": 3.3949520444220096
+      },
+      {
+        "workload": "update_existing",
+        "clients": 1,
+        "engines": {
+          "parent": {
+            "median_ops_per_second": 336.44880221079336,
+            "median_trial_p99_ms": 12.8253125
+          },
+          "candidate": {
+            "median_ops_per_second": 320.26319940474093,
+            "median_trial_p99_ms": 13.1510835
+          },
+          "crdb": {
+            "median_ops_per_second": 584.5423186214706,
+            "median_trial_p99_ms": 3.958937
+          }
+        },
+        "candidate_parent_throughput_ratio": 0.9518928208402069,
+        "candidate_crdb_throughput_ratio": 0.5478871062064752,
+        "candidate_parent_p99_ratio": 1.025400628639653,
+        "candidate_crdb_p99_ratio": 3.3218723864512114
+      },
+      {
+        "workload": "update_existing",
+        "clients": 8,
+        "engines": {
+          "parent": {
+            "median_ops_per_second": 1077.8466727535822,
+            "median_trial_p99_ms": 29.347083
+          },
+          "candidate": {
+            "median_ops_per_second": 1086.9247323442296,
+            "median_trial_p99_ms": 25.607354
+          },
+          "crdb": {
+            "median_ops_per_second": 3584.4455117373436,
+            "median_trial_p99_ms": 4.493583
+          }
+        },
+        "candidate_parent_throughput_ratio": 1.00842240350147,
+        "candidate_crdb_throughput_ratio": 0.30323371600574517,
+        "candidate_parent_p99_ratio": 0.8725689704833697,
+        "candidate_crdb_p99_ratio": 5.6986493851343125
+      }
+    ],
+    "candidate-first": [
+      {
+        "workload": "point_hit",
+        "clients": 1,
+        "engines": {
+          "parent": {
+            "median_ops_per_second": 3004.5516520006468,
+            "median_trial_p99_ms": 0.697396
+          },
+          "candidate": {
+            "median_ops_per_second": 3861.6820325643284,
+            "median_trial_p99_ms": 0.470167
+          },
+          "crdb": {
+            "median_ops_per_second": 7208.846755178571,
+            "median_trial_p99_ms": 0.2318335
+          }
+        },
+        "candidate_parent_throughput_ratio": 1.2852772991913595,
+        "candidate_crdb_throughput_ratio": 0.5356865201483494,
+        "candidate_parent_p99_ratio": 0.6741750741329173,
+        "candidate_crdb_p99_ratio": 2.028037363021306
+      },
+      {
+        "workload": "point_hit",
+        "clients": 8,
+        "engines": {
+          "parent": {
+            "median_ops_per_second": 13791.533357640283,
+            "median_trial_p99_ms": 1.1349165
+          },
+          "candidate": {
+            "median_ops_per_second": 20864.804857249215,
+            "median_trial_p99_ms": 0.727125
+          },
+          "crdb": {
+            "median_ops_per_second": 42647.84115059892,
+            "median_trial_p99_ms": 0.312854
+          }
+        },
+        "candidate_parent_throughput_ratio": 1.5128705645837746,
+        "candidate_crdb_throughput_ratio": 0.4892347254711204,
+        "candidate_parent_p99_ratio": 0.6406859006807989,
+        "candidate_crdb_p99_ratio": 2.324167183414628
+      },
+      {
+        "workload": "point_miss",
+        "clients": 1,
+        "engines": {
+          "parent": {
+            "median_ops_per_second": 3399.0240511298134,
+            "median_trial_p99_ms": 0.566188
+          },
+          "candidate": {
+            "median_ops_per_second": 4381.921006726476,
+            "median_trial_p99_ms": 0.3518125
+          },
+          "crdb": {
+            "median_ops_per_second": 6797.47985161125,
+            "median_trial_p99_ms": 0.240667
+          }
+        },
+        "candidate_parent_throughput_ratio": 1.2891703444316476,
+        "candidate_crdb_throughput_ratio": 0.6446390577660633,
+        "candidate_parent_p99_ratio": 0.6213704635209506,
+        "candidate_crdb_p99_ratio": 1.4618227675584936
+      },
+      {
+        "workload": "point_miss",
+        "clients": 8,
+        "engines": {
+          "parent": {
+            "median_ops_per_second": 14476.857562914745,
+            "median_trial_p99_ms": 1.097209
+          },
+          "candidate": {
+            "median_ops_per_second": 20809.818847533796,
+            "median_trial_p99_ms": 0.8112085
+          },
+          "crdb": {
+            "median_ops_per_second": 42901.72922211538,
+            "median_trial_p99_ms": 0.315958
+          }
+        },
+        "candidate_parent_throughput_ratio": 1.4374541406584085,
+        "candidate_crdb_throughput_ratio": 0.4850578106023419,
+        "candidate_parent_p99_ratio": 0.7393381753157329,
+        "candidate_crdb_p99_ratio": 2.567456750580773
+      },
+      {
+        "workload": "range_64",
+        "clients": 1,
+        "engines": {
+          "parent": {
+            "median_ops_per_second": 2037.0532240104806,
+            "median_trial_p99_ms": 0.8387085
+          },
+          "candidate": {
+            "median_ops_per_second": 2569.2367379236493,
+            "median_trial_p99_ms": 0.5455415
+          },
+          "crdb": {
+            "median_ops_per_second": 4354.711471046095,
+            "median_trial_p99_ms": 0.3363955
+          }
+        },
+        "candidate_parent_throughput_ratio": 1.2612516490194714,
+        "candidate_crdb_throughput_ratio": 0.589990118749811,
+        "candidate_parent_p99_ratio": 0.6504542400607601,
+        "candidate_crdb_p99_ratio": 1.6217265094212021
+      },
+      {
+        "workload": "range_64",
+        "clients": 8,
+        "engines": {
+          "parent": {
+            "median_ops_per_second": 10589.457244644549,
+            "median_trial_p99_ms": 1.3556045
+          },
+          "candidate": {
+            "median_ops_per_second": 14922.35680895664,
+            "median_trial_p99_ms": 1.0211665
+          },
+          "crdb": {
+            "median_ops_per_second": 23190.553166737227,
+            "median_trial_p99_ms": 0.721542
+          }
+        },
+        "candidate_parent_throughput_ratio": 1.4091710712089032,
+        "candidate_crdb_throughput_ratio": 0.6434670489171487,
+        "candidate_parent_p99_ratio": 0.7532923503868569,
+        "candidate_crdb_p99_ratio": 1.4152557993852057
+      },
+      {
+        "workload": "group_16",
+        "clients": 1,
+        "engines": {
+          "parent": {
+            "median_ops_per_second": 1136.900445570826,
+            "median_trial_p99_ms": 1.148542
+          },
+          "candidate": {
+            "median_ops_per_second": 1262.3827851751826,
+            "median_trial_p99_ms": 0.9605835
+          },
+          "crdb": {
+            "median_ops_per_second": 2483.0764792125356,
+            "median_trial_p99_ms": 0.623896
+          }
+        },
+        "candidate_parent_throughput_ratio": 1.110372319839626,
+        "candidate_crdb_throughput_ratio": 0.5083946450072796,
+        "candidate_parent_p99_ratio": 0.8363503467874924,
+        "candidate_crdb_p99_ratio": 1.5396532434892996
+      },
+      {
+        "workload": "group_16",
+        "clients": 8,
+        "engines": {
+          "parent": {
+            "median_ops_per_second": 6756.771406104639,
+            "median_trial_p99_ms": 3.008146
+          },
+          "candidate": {
+            "median_ops_per_second": 8329.378148875288,
+            "median_trial_p99_ms": 1.730521
+          },
+          "crdb": {
+            "median_ops_per_second": 16986.10782769743,
+            "median_trial_p99_ms": 0.7685215
+          }
+        },
+        "candidate_parent_throughput_ratio": 1.2327452933141743,
+        "candidate_crdb_throughput_ratio": 0.49036413952897806,
+        "candidate_parent_p99_ratio": 0.5752782610950399,
+        "candidate_crdb_p99_ratio": 2.2517535293417295
+      },
+      {
+        "workload": "update_existing",
+        "clients": 1,
+        "engines": {
+          "parent": {
+            "median_ops_per_second": 337.6402305363064,
+            "median_trial_p99_ms": 12.393521
+          },
+          "candidate": {
+            "median_ops_per_second": 353.27917702811703,
+            "median_trial_p99_ms": 12.2300005
+          },
+          "crdb": {
+            "median_ops_per_second": 586.0693103445022,
+            "median_trial_p99_ms": 4.0456665
+          }
+        },
+        "candidate_parent_throughput_ratio": 1.0463183740485245,
+        "candidate_crdb_throughput_ratio": 0.6027941930971493,
+        "candidate_parent_p99_ratio": 0.9868059690220398,
+        "candidate_crdb_p99_ratio": 3.0229878068298506
+      },
+      {
+        "workload": "update_existing",
+        "clients": 8,
+        "engines": {
+          "parent": {
+            "median_ops_per_second": 1209.879197695893,
+            "median_trial_p99_ms": 25.3296665
+          },
+          "candidate": {
+            "median_ops_per_second": 1167.5536991185772,
+            "median_trial_p99_ms": 27.3196455
+          },
+          "crdb": {
+            "median_ops_per_second": 2917.986008023555,
+            "median_trial_p99_ms": 5.377459
+          }
+        },
+        "candidate_parent_throughput_ratio": 0.965016756501045,
+        "candidate_crdb_throughput_ratio": 0.4001231314708732,
+        "candidate_parent_p99_ratio": 1.078563174134172,
+        "candidate_crdb_p99_ratio": 5.080400520022561
+      }
+    ]
+  },
+  "candidate_update_diagnostics": [
+    {
+      "order": "parent-first",
+      "clients": 1,
+      "successful_updates": 4000,
+      "counter_scope": "sum of all three nodes across both repetition brackets; includes background work between snapshots",
+      "counters": {
+        "checkpoint_queue_rejected": 0,
+        "checkpoint_queue_submissions": 0,
+        "checkpoint_queue_wait_ns": 0,
+        "checkpoint_service_ns": 0,
+        "failed_waves": 0,
+        "gateway_legacy_calls": 16309,
+        "gateway_local_calls": 0,
+        "gateway_remote_calls": 16309,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encoded_bytes": 0,
+        "gateway_sql_request_encodings": 0,
+        "multi_group_waves": 6,
+        "native_accepted": 0,
+        "native_failed": 5,
+        "native_rejected": 0,
+        "native_semantic_dispatches": 0,
+        "observed_append_barriers": 24608,
+        "ready_durable_waves": 24608,
+        "ready_waves": 24608,
+        "remote_dials": 0,
+        "remote_handshake_failures": 0,
+        "remote_poisoned": 0,
+        "remote_rejected": 0,
+        "remote_reuses": 16309
+      },
+      "cluster_append_barriers_per_update": 6.152,
+      "local_calls_per_update": 0.0,
+      "remote_calls_per_update": 4.07725,
+      "multi_group_wave_fraction": 0.00024382314694408323
+    },
+    {
+      "order": "parent-first",
+      "clients": 8,
+      "successful_updates": 4000,
+      "counter_scope": "sum of all three nodes across both repetition brackets; includes background work between snapshots",
+      "counters": {
+        "checkpoint_queue_rejected": 0,
+        "checkpoint_queue_submissions": 0,
+        "checkpoint_queue_wait_ns": 0,
+        "checkpoint_service_ns": 0,
+        "failed_waves": 0,
+        "gateway_legacy_calls": 11240,
+        "gateway_local_calls": 0,
+        "gateway_remote_calls": 11240,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encoded_bytes": 0,
+        "gateway_sql_request_encodings": 0,
+        "multi_group_waves": 165,
+        "native_accepted": 206,
+        "native_failed": 0,
+        "native_rejected": 0,
+        "native_semantic_dispatches": 0,
+        "observed_append_barriers": 6074,
+        "ready_durable_waves": 6074,
+        "ready_waves": 6074,
+        "remote_dials": 206,
+        "remote_handshake_failures": 0,
+        "remote_poisoned": 0,
+        "remote_rejected": 0,
+        "remote_reuses": 11034
+      },
+      "cluster_append_barriers_per_update": 1.5185,
+      "local_calls_per_update": 0.0,
+      "remote_calls_per_update": 2.81,
+      "multi_group_wave_fraction": 0.027164965426407638
+    },
+    {
+      "order": "candidate-first",
+      "clients": 1,
+      "successful_updates": 4000,
+      "counter_scope": "sum of all three nodes across both repetition brackets; includes background work between snapshots",
+      "counters": {
+        "checkpoint_queue_rejected": 0,
+        "checkpoint_queue_submissions": 0,
+        "checkpoint_queue_wait_ns": 0,
+        "checkpoint_service_ns": 0,
+        "failed_waves": 0,
+        "gateway_legacy_calls": 15472,
+        "gateway_local_calls": 15472,
+        "gateway_remote_calls": 0,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encoded_bytes": 0,
+        "gateway_sql_request_encodings": 0,
+        "multi_group_waves": 8,
+        "native_accepted": 0,
+        "native_failed": 6,
+        "native_rejected": 0,
+        "native_semantic_dispatches": 15472,
+        "observed_append_barriers": 25498,
+        "ready_durable_waves": 25498,
+        "ready_waves": 25498,
+        "remote_dials": 0,
+        "remote_handshake_failures": 0,
+        "remote_poisoned": 0,
+        "remote_rejected": 0,
+        "remote_reuses": 0
+      },
+      "cluster_append_barriers_per_update": 6.3745,
+      "local_calls_per_update": 3.868,
+      "remote_calls_per_update": 0.0,
+      "multi_group_wave_fraction": 0.0003137500980469056
+    },
+    {
+      "order": "candidate-first",
+      "clients": 8,
+      "successful_updates": 4000,
+      "counter_scope": "sum of all three nodes across both repetition brackets; includes background work between snapshots",
+      "counters": {
+        "checkpoint_queue_rejected": 0,
+        "checkpoint_queue_submissions": 0,
+        "checkpoint_queue_wait_ns": 0,
+        "checkpoint_service_ns": 0,
+        "failed_waves": 0,
+        "gateway_legacy_calls": 12102,
+        "gateway_local_calls": 12102,
+        "gateway_remote_calls": 0,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encoded_bytes": 0,
+        "gateway_sql_request_encodings": 0,
+        "multi_group_waves": 160,
+        "native_accepted": 0,
+        "native_failed": 0,
+        "native_rejected": 0,
+        "native_semantic_dispatches": 12102,
+        "observed_append_barriers": 6355,
+        "ready_durable_waves": 6355,
+        "ready_waves": 6355,
+        "remote_dials": 0,
+        "remote_handshake_failures": 0,
+        "remote_poisoned": 0,
+        "remote_rejected": 0,
+        "remote_reuses": 0
+      },
+      "cluster_append_barriers_per_update": 1.58875,
+      "local_calls_per_update": 3.0255,
+      "remote_calls_per_update": 0.0,
+      "multi_group_wave_fraction": 0.025177025963808025
+    }
+  ],
+  "candidate_read_locality": {
+    "parent-first": {
+      "read_successes": 17600,
+      "gateway_local_calls": 0,
+      "gateway_remote_calls": 20100,
+      "gateway_semantic_sql_calls": 17600,
+      "gateway_sql_request_encodings": 17600
+    },
+    "candidate-first": {
+      "read_successes": 17600,
+      "gateway_local_calls": 19551,
+      "gateway_remote_calls": 0,
+      "gateway_semantic_sql_calls": 17600,
+      "gateway_sql_request_encodings": 0
+    }
+  },
+  "all_candidate_trial_checkpoint_counters": {
+    "checkpoint_queue_submissions": 0,
+    "checkpoint_queue_wait_ns": 0,
+    "checkpoint_service_ns": 0,
+    "checkpoint_queue_rejected": 0
+  },
+  "audit_checks": {
+    "archived_strict_validator": "all six reports passed, including raw timing/percentile/sample checks and diagnostic archive identity/hash/delta checks",
+    "matching_workload_configuration": true,
+    "all_binary_and_control_hashes_match": true,
+    "raw_report_copies_match": true,
+    "fresh_container_and_volume_count": 6,
+    "planned_and_actual_engine_sequences_match": true
+  },
+  "conclusion": "diagnostic gain over parent with material locality sensitivity; below parent geomean target in both orders and slower than CRDB in every cell; no promotion or full-goal completion",
+  "notes": [
+    "Short diagnostic: one table, 1024 rows, two repetitions, C1/C8, one ordinary SQL entrypoint, one Docker host; three fused nodes / three CRDB nodes versus nine parent role processes plus standalone gateway.",
+    "Throughput and p99 entries are medians of the two trial summaries within each order. Geomeans give equal weight to all ten workload/concurrency cells. Order results are not pooled.",
+    "The first candidate fixture used remote gateway calls for reads and updates; the second used local calls. This observed locality difference correlates with the read-rate change and prevents treating the order difference as purely temporal noise. No leader-aware routing was configured.",
+    "Update append-barrier counts are cluster totals across three nodes, not six barriers on each node and not directly measured fsync latency. Brackets include background work.",
+    "Zero update gateway_semantic_sql_calls and SQL request encodings describe the semantic SQL path only. Legacy command calls remain, including local native semantic transport dispatches in the second fixture; zero SQL encodes does not prove zero serialization.",
+    "All checkpoint submission, wait and service counters were zero across candidate trial brackets. This run does not measure checkpoint overhead or prove performance under checkpoints.",
+    "There were zero SQL/sample errors and all trials verified. Native transport failed counters increased by five in the first candidate fixture and six in the second, during C1 updates; these are connection-service failure counters, not SQL failure counts, and their cause was not established by this audit. Ready-wave failures, native rejections, remote poison/rejection/handshake-failure counters and checkpoint rejections stayed zero during trial brackets.",
+    "Inventory parsing recorded warnings for non-JSON VibeDB manifest.binding and CockroachDB MANIFEST/marker files. These are separate from SQL operation failures; counts are retained in source records.",
+    "The 1.25x parent geomean target was not met in either ordering. No per-order cell crossed the 5% throughput or 10% p99 regression guardrails, but this shortened run cannot qualify the registered 8192-row/three-repetition matrix, multigroup benefit, full correctness gates or full 2x CockroachDB objective."
+  ],
+  "recommended_repository_artifacts": {
+    "directory": "docs/benchmarks/fused-node-short-2026-09-04",
+    "analysis": [
+      "audit-summary.json",
+      "audit-summary.md"
+    ],
+    "compressed_raw": "raw-trials.tar.gz",
+    "archive_exact_reports": [
+      "baseline-c1-c8/parent-first/parent/report.json",
+      "baseline-c1-c8/parent-first/candidate/report.json",
+      "baseline-c1-c8/parent-first/crdb/report.json",
+      "baseline-c1-c8/candidate-first/crdb/report.json",
+      "baseline-c1-c8/candidate-first/candidate/report.json",
+      "baseline-c1-c8/candidate-first/parent/report.json"
+    ],
+    "archive_diagnostic_globs": [
+      "baseline-c1-c8/parent-first/candidate/diagnostics/*.json",
+      "baseline-c1-c8/candidate-first/candidate/diagnostics/*.json"
+    ],
+    "archive_counts": {
+      "reports": 6,
+      "diagnostic_snapshots": 240
+    },
+    "allowlist_only": true,
+    "excluded": "bin/, raw/ duplicates, manifests/, control commands, supervisor configuration, node data, certificates and keys; no whole-directory archive",
+    "byte_preservation": "Selected report and diagnostic JSON contains no PostgreSQL URLs or private key material; preserve exact bytes and relative paths so archived diagnostic hashes continue to validate. Sanitization is by explicit file allowlist."
+  }
+}
