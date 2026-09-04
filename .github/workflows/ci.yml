@@ -614,22 +614,23 @@ jobs:
           key: ${{ steps.go.outputs.cache-key }}
   storage-race:
     if: ${{ !cancelled() }}
-    name: race storage (${{ matrix.runner }})
+    name: race storage (${{ matrix.runner }}, ${{ matrix.lane }})
     strategy:
       fail-fast: false
       matrix:
         runner: [ubuntu-latest, ubuntu-24.04-arm]
+        lane: [storeio, durable-heavy, durable-rest]
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-go-ci
         id: go
         with:
-          scope: storage-race
+          scope: storage-race-${{ matrix.lane }}
       - name: Race, storage suites
         # Qualification tests build multi-hundred-MiB corpora and are geometry/
         # throughput gates; under -race on ARM they alone can exhaust the budget.
-        run: go test -race -timeout=25m -skip 'Qualification' -run 'Primary|BufferedInplace|Committer|PageCache|WriteTransaction' ./internal/storeio/ ./store/durable/
+        run: scripts/ci/storage-race.sh "${{ matrix.lane }}"
       - name: Save Go build cache
         if: ${{ always() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
