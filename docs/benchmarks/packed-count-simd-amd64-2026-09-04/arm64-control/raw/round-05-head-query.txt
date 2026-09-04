@@ -1,0 +1,8 @@
+goos: linux
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/query
+BenchmarkFilePackedEqualityCount/label/dictionary7         	   33336	      8962 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedEqualityCount/n/FOR10                   	   48856	      6100 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedEqualityCountWide/label/dictionary8     	   36106	      8239 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedEqualityCountWide/n/FOR16               	   47792	      6274 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+PASS

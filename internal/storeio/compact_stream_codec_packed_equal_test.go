@@ -61,6 +61,8 @@ func TestCompactPackedEqualWidth7Through16Parity(t *testing.T) {
 		counts = append(counts, count)
 	}
 	counts = append(counts,
+		95, 96, 97,
+		127, 128, 129,
 		255, 256, 257,
 		511, 512, 513,
 		65535, 65536,
@@ -134,20 +136,26 @@ func TestCompactPackedEqualFirstRowsExerciseEveryLane(t *testing.T) {
 	const count = 4096
 	for _, width := range []int{7, 8, 10, 16} {
 		mask := uint64(1)<<uint(width) - 1
+		firstRows := 64
+		if width == 8 {
+			firstRows = 128
+		}
 		data := make([]byte, (count*width+7)/8)
 		const background = uint64(0)
 		for row := 0; row < count; row++ {
 			value := background
-			if row < 64 {
+			if row < firstRows {
 				value = uint64(row*37+1) & mask
+				if width == 8 {
+					value = uint64(row + 1)
+				}
 			}
 			compactPutBits(data, row*width, width, value)
 		}
-		for row := 0; row < 64; row++ {
+		for row := 0; row < firstRows; row++ {
 			want := compactReadBits(data, row*width, width)
-			// These first 64 values are distinct and exclude background. This
-			// covers all four width8 accumulators, with exactly one match per
-			// lane and no oracle scan.
+			// Distinct nonzero values cover every lane, including all four
+			// 32-byte AMD64 accumulators, with exactly one match per needle.
 			if got := countCompactPackedEqual(data, count, width, want); got != 1 {
 				t.Fatalf("width=%d first-row=%d got=%d expected=1", width, row, got)
 			}
@@ -176,19 +184,23 @@ func TestCountCompactPackedEqualDispatch(t *testing.T) {
 		t.Fatalf("missing packed dispatch function names: width7=%q width8=%q width10=%q width16=%q", name7, name8, name10, name16)
 	}
 	if !strings.HasSuffix(name7, "countCompactPacked7EqualScalar") &&
-		!strings.HasSuffix(name7, "countCompactPacked7EqualNEON") {
+		!strings.HasSuffix(name7, "countCompactPacked7EqualNEON") &&
+		!strings.HasSuffix(name7, "countCompactPacked7EqualAVX2") {
 		t.Fatalf("unexpected width7 dispatch=%q", name7)
 	}
 	if !strings.HasSuffix(name8, "countCompactPacked8EqualScalar") &&
-		!strings.HasSuffix(name8, "countCompactPacked8EqualNEON") {
+		!strings.HasSuffix(name8, "countCompactPacked8EqualNEON") &&
+		!strings.HasSuffix(name8, "countCompactPacked8EqualAVX2") {
 		t.Fatalf("unexpected width8 dispatch=%q", name8)
 	}
 	if !strings.HasSuffix(name10, "countCompactPacked10EqualScalar") &&
-		!strings.HasSuffix(name10, "countCompactPacked10EqualNEON") {
+		!strings.HasSuffix(name10, "countCompactPacked10EqualNEON") &&
+		!strings.HasSuffix(name10, "countCompactPacked10EqualAVX2") {
 		t.Fatalf("unexpected width10 dispatch=%q", name10)
 	}
 	if !strings.HasSuffix(name16, "countCompactPacked16EqualScalar") &&
-		!strings.HasSuffix(name16, "countCompactPacked16EqualNEON") {
+		!strings.HasSuffix(name16, "countCompactPacked16EqualNEON") &&
+		!strings.HasSuffix(name16, "countCompactPacked16EqualAVX2") {
 		t.Fatalf("unexpected width16 dispatch=%q", name16)
 	}
 }

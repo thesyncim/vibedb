@@ -1,0 +1,27 @@
+File: vibedb-gateway
+Build ID: 62952dff8bd297d107bd0675a48688cf8bceacfc
+Type: cpu
+Time: 2026-09-04 19:59:16 CEST
+Duration: 67.93s, Total samples = 17.18s (25.29%)
+Showing nodes accounting for 0.14s, 0.81% of 17.18s total
+Dropped 1009 nodes (cum <= 0.09s)
+Showing top 18 nodes out of 377
+      flat  flat%   sum%        cum   cum%
+         0     0%     0%      6.67s 38.82%  github.com/thesyncim/vibedb/pgwire.(*Server).serveAdmittedConnection
+         0     0%     0%      6.67s 38.82%  github.com/thesyncim/vibedb/pgwire.(*Server).serveConn
+         0     0%     0%      6.67s 38.82%  github.com/thesyncim/vibedb/pgwire.(*session).loop
+         0     0%     0%      6.67s 38.82%  github.com/thesyncim/vibedb/pgwire.(*session).serve
+         0     0%     0%      6.38s 37.14%  github.com/thesyncim/vibedb/pgwire.(*session).dispatch
+     0.01s 0.058% 0.058%      6.37s 37.08%  github.com/thesyncim/vibedb/pgwire.(*session).extended
+         0     0% 0.058%      4.74s 27.59%  github.com/thesyncim/vibedb/pgwire.(*session).handleExecute
+         0     0% 0.058%      4.73s 27.53%  github.com/thesyncim/vibedb/pgwire.(*session).execute
+     0.02s  0.12%  0.17%      4.73s 27.53%  github.com/thesyncim/vibedb/pgwire.(*session).executeRuntimeQuery
+     0.01s 0.058%  0.23%      4.53s 26.37%  main.(*gatewayShardControlOpener).OpenShardControl
+         0     0%  0.23%      4.31s 25.09%  main.(*gatewayReplicaHealthRevisionController).observeGroup.func1
+         0     0%  0.23%      4.28s 24.91%  github.com/thesyncim/vibedb/internal/replicacontrol.(*Client).Observe
+         0     0%  0.23%      4.23s 24.62%  github.com/thesyncim/vibedb/pgwire.(*session).startRuntime
+     0.08s  0.47%   0.7%      4.12s 23.98%  github.com/thesyncim/vibedb/gateway.(*postgresStatement).QueryInto
+         0     0%   0.7%      4.09s 23.81%  github.com/thesyncim/vibedb/internal/rafttransport.(*PeerTLS).Client
+         0     0%   0.7%      4.07s 23.69%  github.com/thesyncim/vibedb/internal/rafttransport.(*PeerTLS).handshake
+         0     0%   0.7%      4.04s 23.52%  crypto/tls.(*Conn).HandshakeContext (inline)
+     0.02s  0.12%  0.81%      4.04s 23.52%  crypto/tls.(*Conn).handshakeContext

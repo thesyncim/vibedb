@@ -1,0 +1,17 @@
+goos: linux
+goarch: amd64
+pkg: github.com/thesyncim/vibedb/internal/storeio
+cpu: AMD EPYC 9V74 80-Core Processor                
+BenchmarkCompactStreamPackedEquality7         	   86324	      3473 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamSpellingEquality7       	   76947	      3918 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEquality10        	   90592	      3304 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamIntegerEquality10       	   93025	      3219 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEquality8         	  103664	      2904 ns/op	      4096 rows	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamSpellingEquality8       	   76099	      3907 ns/op	      4096 rows	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEquality16        	   57037	      5131 ns/op	      4096 rows	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamIntegerEquality16       	   58518	      5131 ns/op	      4096 rows	       0 B/op	       0 allocs/op
+BenchmarkCompactPrimaryStripePackedEquality7  	   73869	      4064 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactPrimaryStripePackedEquality10 	   86300	      3480 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactPrimaryStripePackedEquality8  	   73836	      4066 ns/op	      4096 rows	       0 B/op	       0 allocs/op
+BenchmarkCompactPrimaryStripePackedEquality16 	   56670	      5294 ns/op	      4096 rows	       0 B/op	       0 allocs/op
+PASS

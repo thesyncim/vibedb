@@ -2101,8 +2101,12 @@ func DecodeResponse(r io.Reader) (*ShardResponse, error) {
 		}
 		if nr > 0 {
 			resp.Rows = make([][]Cell, nr)
+			// d.count proved that nr*nc fits in the bounded frame. Retain
+			// one cell slab and the owned frame, as for ResponseRowBatch.
+			cells := make([]Cell, nr*nc)
 			for i := 0; i < nr; i++ {
-				row := make([]Cell, nc)
+				start := i * nc
+				row := cells[start : start+nc : start+nc]
 				for j := 0; j < nc; j++ {
 					marker := d.u8()
 					if marker > 1 {
@@ -2111,7 +2115,8 @@ func DecodeResponse(r io.Reader) (*ShardResponse, error) {
 					if marker == 1 {
 						row[j] = Cell{Null: true}
 					} else {
-						row[j] = Cell{Bytes: d.bytesCopy()}
+						payload := d.slice()
+						row[j] = Cell{Bytes: payload[:len(payload):len(payload)]}
 					}
 				}
 				resp.Rows[i] = row

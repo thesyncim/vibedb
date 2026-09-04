@@ -1,0 +1,12 @@
+vibedb point_hit c=1 rep=1 3196.5 ops/s p99=0.652ms errors=0 verified=true
+vibedb point_hit c=1 rep=2 3301.3 ops/s p99=0.623ms errors=0 verified=true
+vibedb point_hit c=1 rep=3 3380.6 ops/s p99=0.600ms errors=0 verified=true
+vibedb point_hit c=8 rep=1 18282.1 ops/s p99=0.954ms errors=0 verified=true
+vibedb point_hit c=8 rep=2 18403.0 ops/s p99=0.968ms errors=0 verified=true
+vibedb point_hit c=8 rep=3 18437.5 ops/s p99=0.914ms errors=0 verified=true
+vibedb point_miss c=1 rep=1 3698.4 ops/s p99=0.546ms errors=0 verified=true
+vibedb point_miss c=1 rep=2 3396.0 ops/s p99=1.177ms errors=0 verified=true
+vibedb point_miss c=1 rep=3 3739.7 ops/s p99=0.553ms errors=0 verified=true
+vibedb point_miss c=8 rep=1 19109.1 ops/s p99=0.899ms errors=0 verified=true
+vibedb point_miss c=8 rep=2 18336.7 ops/s p99=0.969ms errors=0 verified=true
+vibedb point_miss c=8 rep=3 18928.7 ops/s p99=0.882ms errors=0 verified=true
