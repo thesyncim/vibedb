@@ -73,7 +73,10 @@ recipe before proposing. An unknown outcome blocks reuse of that slot until the
 same recipe resolves. It never triggers SQL reevaluation under the same identity.
 A definitive preimage-conflict abort permits up to eight autocommit attempts,
 each with a new identity and preimage. Failed attempts count toward request
-latency. Other errors are not treated as permission to replan.
+latency. Other execution errors are not treated as permission to replan. Read-only
+preparation retries transient admission pressure or leader changes up to eight
+times with bounded backoff (1–16 ms), under the caller deadline. No proposal
+is made until preparation succeeds.
 
 **Crash contract:** after a gateway process crash, an interrupted PG statement
 has an ambiguous outcome. The client must verify database state before deciding
@@ -111,6 +114,14 @@ requests and native callers with mixed-protocol history need a separate recovery
 procedure; this change does not claim to repair those records automatically.
 PostgreSQL reconnects carry no application idempotency key and are not exactly-once
 application retries.
+
+## Proposal scheduling
+
+A lone proposal no longer waits for the fixed 500-microsecond coalescing timer.
+It enters the existing Raft pipeline immediately. When concurrent pending or
+learned cohort work exists, the bounded collector still assembles shared
+Raft/storage durability batches. This changes admission scheduling only; quorum,
+log persistence, apply, and result publication fences remain unchanged.
 
 ## Applied point reads
 

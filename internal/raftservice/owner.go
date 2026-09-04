@@ -956,7 +956,11 @@ func (collector *proposalIngressCollector) start(owner *Owner, request ownerRequ
 		)
 	}
 	collector.rounds = 0
-	collector.resetTimer(proposalIngressCoalesceWindow)
+	if collector.known {
+		collector.resetTimer(proposalIngressCoalesceWindow)
+	} else {
+		collector.stopTimer()
+	}
 }
 
 func proposalIngressCandidate(request ownerRequest) bool {
@@ -1122,6 +1126,15 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 		collector.reset()
 		return nil
 	}
+	// A lone proposal has no known durability work to share. Submit it
+	// immediately; pending concurrent requests still form the learned cohort.
+	startCollected := func(request ownerRequest) error {
+		collector.start(owner, request)
+		if !collector.known {
+			return flushCollected()
+		}
+		return nil
+	}
 	defer func() {
 		if collector.active() {
 			failCollected(errors.Join(ErrOwnerClosed, runErr))
@@ -1206,7 +1219,9 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 			proposal := proposalIngressCandidate(request)
 			switch {
 			case !collector.active() && proposal:
-				collector.start(owner, request)
+				if err := startCollected(request); err != nil {
+					return owner.stop(err)
+				}
 			case collector.accepts(request):
 				collector.append(request)
 				if collector.full() {
@@ -1232,7 +1247,9 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 					}
 				}
 				if proposal {
-					collector.start(owner, request)
+					if err := startCollected(request); err != nil {
+						return owner.stop(err)
+					}
 				} else if err := handleRequest(request); err != nil {
 					return owner.stop(err)
 				}

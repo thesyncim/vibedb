@@ -816,3 +816,28 @@ func TestProposalIngressCollectorBuildsFixedBoundedPipelineWindows(t *testing.T)
 	}
 	collector.reset()
 }
+
+func TestProposalIngressSingletonHasNoArtificialTimer(t *testing.T) {
+	group := peerServerTestGroup()
+	owner := &Owner{pendingProposalGroup: map[raftmember.GroupKey]int{group: 1}}
+	collector := newProposalIngressCollector(16)
+	defer collector.reset()
+	request := ownerRequest{kind: requestProposal, group: group, data: []byte{1}}
+	collector.start(owner, request)
+	if collector.known || collector.timerC != nil {
+		t.Fatal("lone proposal waits for an imaginary cohort")
+	}
+	collector.observe(owner)
+	collector.reset()
+	owner.pendingProposalGroup[group] = 8
+	collector.start(owner, request)
+	if !collector.known || collector.target != 8 || collector.timerC == nil {
+		t.Fatal("lost concurrent durability batching")
+	}
+	for i := 1; i < 8; i++ {
+		collector.append(request)
+	}
+	if !collector.full() {
+		t.Fatal("complete cohort still waiting")
+	}
+}

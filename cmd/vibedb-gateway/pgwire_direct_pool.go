@@ -13,8 +13,10 @@ import (
 	"path/filepath"
 	"runtime/trace"
 	"sync"
+	"time"
 
 	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/storeio"
@@ -266,6 +268,26 @@ func (p *postgresDirectPool) resolve(ctx context.Context, slot *postgresDirectSl
 	return result.Result, nil
 }
 
+// Preparation is read-only. Admission backpressure or a changing leader can
+// therefore be retried without creating an ambiguous write. Wait instead of
+// spinning through every replica while the leader's response budget is full.
+func (p *postgresDirectPool) prepare(ctx context.Context, id durableExecBatchIdentity, queries []gateway.Query) (*gateway.DurableSQLDirectPlan, error) {
+	for attempt := 0; ; attempt++ {
+		plan, err := p.prepared.PrepareDirectBatch(ctx, p.record.Authority, id, queries)
+		if err == nil || attempt == 7 || ctx.Err() != nil ||
+			!(errors.Is(err, raftmodel.ErrAdmissionBound) || errors.Is(err, gateway.ErrReplicatedLeader) || errors.Is(err, gateway.ErrReplicatedReadBehind)) {
+			return plan, err
+		}
+		timer := time.NewTimer(time.Duration(1<<min(attempt, 4)) * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, errors.Join(err, ctx.Err())
+		case <-timer.C:
+		}
+	}
+}
+
 // handled=false is possible only before a proposal. Unknown commands are never
 // replanned or resubmitted under a new identity. A definitive guard abort can
 // safely retry an implicit single-statement transaction using a fresh preimage.
@@ -311,7 +333,7 @@ func (p *postgresDirectPool) Write(ctx context.Context, q gateway.Query) (*gatew
 			return nil, true, err
 		}
 		region := trace.StartRegion(ctx, "pg.direct.prepare")
-		plan, err := p.prepared.PrepareDirectBatch(ctx, p.record.Authority, id, queries)
+		plan, err := p.prepare(ctx, id, queries)
 		region.End()
 		if err != nil {
 			return nil, !errors.Is(err, gateway.ErrDurableSQLDirectIneligible), err

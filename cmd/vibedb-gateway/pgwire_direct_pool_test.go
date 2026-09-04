@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"os"
 	"os/exec"
@@ -17,6 +18,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
+	"github.com/thesyncim/vibedb/shardservice"
 	"github.com/thesyncim/vibedb/store/durable"
 	vibejson "github.com/thesyncim/vibejson"
 )
@@ -455,5 +457,68 @@ func TestPostgreSQLDirectWaitsForLegacyPendingTable(t *testing.T) {
 	}
 	if _, ok := s.requests[identity]; !ok {
 		t.Fatal("lost legacy identity")
+	}
+}
+
+func TestPostgreSQLDirectPreparationBackpressureDoesNotProposeOrRenumber(t *testing.T) {
+	s := &directPoolService{}
+	p := testDirectPool(t, s)
+	attempts, executions := 0, 0
+	var original durableExecBatchIdentity
+	s.prepare = func(_ context.Context, id durableExecBatchIdentity, _ []gateway.Query) (*gateway.DurableSQLDirectPlan, error) {
+		attempts++
+		if attempts == 1 {
+			original = id
+		}
+		if id != original || executions != 0 {
+			t.Fatal("preparation admitted or renumbered a write")
+		}
+		if attempts < 3 {
+			return nil, errors.Join(gateway.ErrDurableSQLNotAdmitted, gateway.ErrReplicatedLeader, &gateway.ReplicatedRefusalError{Code: shardservice.ReplicatedRefusalAdmissionBound})
+		}
+		return &gateway.DurableSQLDirectPlan{CatalogGeneration: 1}, nil
+	}
+	s.execute = func(_ context.Context, id durableExecBatchIdentity, _ []gateway.Query, _ *gateway.DurableSQLDirectPlan) (durableExecBatchExecuteResult, error) {
+		executions++
+		if id != original {
+			t.Fatal("prepared identity changed")
+		}
+		return durableExecBatchExecuteResult{Direct: true, Result: &gateway.Result{RowsAffected: 1}}, nil
+	}
+	if _, _, err := p.Write(t.Context(), gateway.Query{SQL: "UPDATE docs SET n=n+1 WHERE id='a'"}); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 3 || executions != 1 {
+		t.Fatal(attempts, executions)
+	}
+}
+
+func TestPostgreSQLDirectPreparationCancellationAndRetryBound(t *testing.T) {
+	for _, cancelled := range []bool{false, true} {
+		t.Run(fmt.Sprint(cancelled), func(t *testing.T) {
+			s := &directPoolService{}
+			p := testDirectPool(t, s)
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			attempts := 0
+			s.prepare = func(context.Context, durableExecBatchIdentity, []gateway.Query) (*gateway.DurableSQLDirectPlan, error) {
+				attempts++
+				if cancelled {
+					cancel()
+				}
+				return nil, errors.Join(gateway.ErrDurableSQLNotAdmitted, gateway.ErrReplicatedLeader)
+			}
+			s.execute = func(context.Context, durableExecBatchIdentity, []gateway.Query, *gateway.DurableSQLDirectPlan) (durableExecBatchExecuteResult, error) {
+				t.Fatal("proposed failed preparation")
+				return durableExecBatchExecuteResult{}, nil
+			}
+			_, _, err := p.Write(ctx, gateway.Query{SQL: "UPDATE docs SET n=n+1 WHERE id='a'"})
+			if err == nil || errors.Is(err, durable.ErrCommitOutcomeUnknown) {
+				t.Fatal(err)
+			}
+			if cancelled && attempts != 1 || !cancelled && attempts != 8 {
+				t.Fatal(attempts)
+			}
+		})
 	}
 }
