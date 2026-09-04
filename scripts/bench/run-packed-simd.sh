@@ -39,7 +39,7 @@ if [[ ! ${benchtime} =~ ^2(0[0-9]|[1-4][0-9]|50)ms$ ]]; then
 fi
 
 raw_directory=${evidence}/raw
-mkdir -m 700 -p "${raw_directory}"
+mkdir -p "${raw_directory}"
 commands_file=${evidence}/benchmark-commands.tsv
 order_file=${evidence}/benchmark-order.tsv
 printf 'round\trole\tpackage\toutput\n' > "${order_file}"
@@ -131,7 +131,8 @@ run_benchmark() {
 	local package_name=$3
 	local binary=$4
 	local bench_expression=$5
-	local output=${raw_directory}/round-$(printf '%02d' "${round}")-${role}-${package_name}.txt
+	local output
+	output=${raw_directory}/round-$(printf '%02d' "${round}")-${role}-${package_name}.txt
 	local -a args=(
 		-test.run '^$'
 		-test.bench "${bench_expression}"

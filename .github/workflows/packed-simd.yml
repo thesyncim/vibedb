@@ -58,7 +58,7 @@ jobs:
           metadata="${evidence}/metadata"
           binaries="${RUNNER_TEMP}/packed-simd-binaries"
           base_worktree="${RUNNER_TEMP}/packed-simd-base"
-          mkdir -m 700 -p "${metadata}" "${binaries}"
+          mkdir -p "${metadata}" "${binaries}"
           test ! -e "${base_worktree}"
 
           base_selector="${PULL_REQUEST_BASE_SHA:-}"
