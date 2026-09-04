@@ -383,7 +383,7 @@ func (c *Collection) planWriteBatchLocked(batch *WriteBatch) (heapTxnPublish, er
 		return heapTxnPublish{}, err
 	}
 	working := *state
-	free := cloneStoreIDSet(c.free)
+	free := cowStoreIDSet{src: &c.free}
 	edits := make([]heapChunkEdit, 0, len(batch.entries))
 	for _, entry := range batch.entries {
 		key := batch.key(entry)
@@ -412,7 +412,7 @@ func (c *Collection) planWriteBatchLocked(batch *WriteBatch) (heapTxnPublish, er
 		collection: c,
 		next:       &working,
 		edits:      edits,
-		free:       free,
+		free:       free.result(),
 	}, nil
 }
 
@@ -440,7 +440,7 @@ func (c *Collection) publishWriteBatchLocked(pub heapTxnPublish) {
 func planPutEntry(
 	c *Collection,
 	state *State,
-	free *storeIDSet,
+	free *cowStoreIDSet,
 	key string,
 	src []byte,
 ) (heapChunkEdit, error) {
@@ -472,10 +472,10 @@ func planPutEntry(
 		}, nil
 	}
 
-	if len(free.ids) == 0 && state.Chunks.Count == ^uint32(0) {
+	if len(free.ids()) == 0 && state.Chunks.Count == ^uint32(0) {
 		return heapChunkEdit{}, ErrTooLarge
 	}
-	chunkID, slot, old := allocateSlotFromFree(free, state)
+	chunkID, slot, old := allocateSlotFromFree(free.ids(), state)
 	var chunk *Chunk
 	var err error
 	if schema := c.options.Schema; schema != nil {
@@ -519,7 +519,7 @@ func planPutEntry(
 func planDeleteEntry(
 	c *Collection,
 	state *State,
-	free *storeIDSet,
+	free *cowStoreIDSet,
 	key string,
 ) (heapChunkEdit, bool, error) {
 	hash := maphash.String(state.seed, key)
@@ -561,11 +561,55 @@ func cloneStoreIDSet(s storeIDSet) storeIDSet {
 	return out
 }
 
-func allocateSlotFromFree(free *storeIDSet, state *State) (uint32, int, *Chunk) {
-	if len(free.ids) == 0 {
+// cowStoreIDSet defers cloning the free-chunk-ID set until the first update.
+// Overwrite-only batches never add or remove chunk IDs, so they publish with
+// zero ID bookkeeping garbage; insert/delete batches pay exactly one clone,
+// as before. Reads before the first update serve the shared source, which is
+// stable because planning holds the collection writer lock throughout.
+type cowStoreIDSet struct {
+	src   *storeIDSet
+	set   storeIDSet
+	owned bool
+}
+
+func (w *cowStoreIDSet) ids() []uint32 {
+	if w.owned {
+		return w.set.ids
+	}
+	return w.src.ids
+}
+
+func (w *cowStoreIDSet) edit() *storeIDSet {
+	if !w.owned {
+		w.set = cloneStoreIDSet(*w.src)
+		w.owned = true
+	}
+	return &w.set
+}
+
+func (w *cowStoreIDSet) add(id uint32) {
+	w.edit().add(id)
+}
+
+func (w *cowStoreIDSet) remove(id uint32) {
+	w.edit().remove(id)
+}
+
+// result returns the set to publish: the owned clone after any update, or
+// the untouched source (shared, never mutated) when the batch left free
+// space allocation alone.
+func (w *cowStoreIDSet) result() storeIDSet {
+	if w.owned {
+		return w.set
+	}
+	return *w.src
+}
+
+func allocateSlotFromFree(ids []uint32, state *State) (uint32, int, *Chunk) {
+	if len(ids) == 0 {
 		return state.Chunks.Count, 0, nil
 	}
-	id := free.ids[len(free.ids)-1]
+	id := ids[len(ids)-1]
 	chunk := state.Chunks.Get(id)
 	if chunk == nil {
 		return id, 0, nil
