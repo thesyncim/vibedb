@@ -105,8 +105,8 @@ func (d *Database) runClosure(readOnly bool, fn func(*Tx) error) (err error) {
 }
 
 // Begin starts a serializable read-write transaction: it samples and arms one
-// database-global logical clock before capturing a coherent multi-collection
-// cut.
+// database-global logical clock before lazily capturing participating
+// collections. Commit validates those reads even if no writes were staged.
 func (d *Database) Begin() (*Tx, error) {
 	return d.begin(false)
 }
@@ -138,17 +138,16 @@ func (d *Database) begin(readOnly bool) (*Tx, error) {
 	return tx, nil
 }
 
-// Tx is one leased multi-collection cut plus bounded per-collection overlays.
+// Tx holds collection snapshots plus bounded per-collection overlays.
 // A Tx must not be copied after first use.
 type Tx struct {
 	db       *Database
 	readOnly bool
 	done     bool
 
-	diskCut durable.DatabaseSnapshot
-	hasDisk bool
-	heapCut store.DatabaseSnapshot
-	hasHeap bool
+	// Read-only transactions retain one coherent database cut. Their states
+	// borrow its durable snapshots; read-write states own independent snapshots.
+	diskCut *durable.DatabaseSnapshot
 
 	colls map[string]*txCollectionState
 
@@ -174,7 +173,7 @@ type txCollectionState struct {
 	diskSnap *durable.Snapshot
 	heapSnap store.Snapshot
 	hasHeap  bool
-	absent   bool // not present in the begin cut
+	absent   bool // not present in the captured collection view
 
 	pending map[string]*txMutation
 	order   []string
@@ -248,9 +247,8 @@ func (t *Tx) Commit() error {
 	}
 
 	dirty := t.dirtyStates()
-	if len(dirty) == 0 {
-		// With no publication this cut can serialize at Begin, so even a
-		// read-write handle that only read needs no commit-time validation.
+	participants := t.participantStates()
+	if len(participants) == 0 {
 		t.finish(nil)
 		return nil
 	}
@@ -259,14 +257,27 @@ func (t *Tx) Commit() error {
 	// blocked by generation leases during validation/publication.
 	t.releaseCuts()
 
-	db.commitMu.Lock()
-	defer db.commitMu.Unlock()
+	// Choose the commit lock mode before locking. A transaction confined to a
+	// single collection (its only participant is its only dirty collection)
+	// cannot create a cross-collection read-write cycle with another confined
+	// transaction on a different collection, so shared mode is sufficient;
+	// same-collection peers still serialize on that collection's txnFence.
+	// Anything wider (cross-collection reads, multi-collection writes) takes
+	// the exclusive mode to preserve serializable validation.
+	sharedCommit := len(dirty) == 1 && len(participants) == 1 &&
+		participants[0].name == dirty[0].name
+	if sharedCommit {
+		db.commitMu.RLock()
+		defer db.commitMu.RUnlock()
+	} else {
+		db.commitMu.Lock()
+		defer db.commitMu.Unlock()
+	}
 	// dirty is name-sorted, so every transaction takes collection fences in one
 	// stable order. Keep them through conflict validation, materialization,
 	// publication, and conflict-clock recording. A direct Put/Delete on a dirty
 	// collection therefore linearizes wholly before validation or after COMMIT;
 	// writes to unrelated collections remain independent.
-	participants := t.participantStates()
 	lockedCollections := make([]*Collection, 0, len(participants))
 	for _, state := range participants {
 		collection := db.Collection(state.name)
@@ -294,6 +305,12 @@ func (t *Tx) Commit() error {
 	if err := t.validateDependencies(participants); err != nil {
 		t.finish(nil)
 		return err
+	}
+	if len(dirty) == 0 {
+		// Lazy collection snapshots need validation even without publication:
+		// successive reads may otherwise straddle one atomic database commit.
+		t.finish(nil)
+		return nil
 	}
 	for _, state := range dirty {
 		if err := t.validateState(state); err != nil {
@@ -383,7 +400,10 @@ func (t *Tx) finish(published map[string][]string) {
 
 func (t *Tx) scrubStates() {
 	for _, state := range t.colls {
-		state.diskSnap = nil
+		if state.diskSnap != nil {
+			_ = state.diskSnap.Close()
+			state.diskSnap = nil
+		}
 		state.heapSnap = store.Snapshot{}
 		state.hasHeap = false
 		state.pending = nil
@@ -398,52 +418,64 @@ func (t *Tx) scrubStates() {
 }
 
 func (t *Tx) releaseCuts() {
-	if t.hasDisk {
+	// Read-only states borrow from the database cut; read-write states own
+	// their lazily captured snapshots. Close each durable lease exactly once.
+	ownedByCut := t.diskCut != nil
+	if ownedByCut {
 		_ = t.diskCut.Close()
-		t.diskCut = durable.DatabaseSnapshot{}
-		t.hasDisk = false
+		t.diskCut = nil
 	}
-	t.heapCut = store.DatabaseSnapshot{}
-	t.hasHeap = false
 	for _, state := range t.colls {
-		state.diskSnap = nil
+		if state.diskSnap != nil {
+			if !ownedByCut {
+				_ = state.diskSnap.Close()
+			}
+			state.diskSnap = nil
+		}
 		state.heapSnap = store.Snapshot{}
 		state.hasHeap = false
 	}
 }
 
+// captureCut preserves a coherent database snapshot for read-only transactions,
+// which neither track dependencies nor validate at Commit. The backend holds
+// every collection's publication gate while acquiring this cut, including for
+// disjoint commits that share the facade commit lock.
+//
+// Read-write transactions capture collection snapshots lazily on first touch.
+// Their Begin stays O(1); beginRev-anchored validation at Commit rejects any
+// fractured reads, including transactions with no publishable writes.
 func (t *Tx) captureCut() error {
 	db := t.db
-	switch db.profile {
-	case Memory:
-		t.heapCut = db.heap.Snapshot()
-		t.hasHeap = true
-		for _, info := range db.heap.AppendCollections(nil) {
-			snap, ok := t.heapCut.Collection(info.Name)
-			state := t.newCollectionState(info.Name)
-			state.hasHeap = ok
-			state.heapSnap = snap
-			state.absent = !ok
-			t.colls[info.Name] = state
-		}
-	default:
-		if db.disk == nil {
-			return ErrClosed
-		}
-		cut, err := db.disk.Snapshot()
-		if err != nil {
-			return facadeError(err)
-		}
-		t.diskCut = cut
-		t.hasDisk = true
-		cut.All(func(name string, snap *durable.Snapshot) bool {
+	if db.profile != Memory && db.disk == nil {
+		return ErrClosed
+	}
+	if !t.readOnly {
+		return nil
+	}
+	if db.profile == Memory {
+		cut := db.heap.Snapshot()
+		cut.All(func(name string, snap store.Snapshot) bool {
 			state := t.newCollectionState(name)
-			state.diskSnap = snap
-			state.absent = snap == nil
+			state.heapSnap = snap
+			state.hasHeap = true
 			t.colls[name] = state
 			return true
 		})
+		return nil
 	}
+	cut, err := db.disk.Snapshot()
+	if err != nil {
+		return facadeError(err)
+	}
+	t.diskCut = &cut
+	cut.All(func(name string, snap *durable.Snapshot) bool {
+		state := t.newCollectionState(name)
+		state.diskSnap = snap
+		state.absent = snap == nil
+		t.colls[name] = state
+		return true
+	})
 	return nil
 }
 
@@ -466,31 +498,84 @@ func (t *Tx) ensureCollection(name string) (*txCollectionState, error) {
 	if state := t.colls[name]; state != nil {
 		return state, nil
 	}
-	// Cataloged states were captured once at Begin. Bound only dynamically
-	// discovered absent names here, before allocating or retaining a map entry,
-	// so callers may keep the lazy TxCollection API without growing a live
-	// transaction through repeated rejected names.
 	if t.dynamicStates >= maxSerializableReadCollections {
-		return nil, fmt.Errorf("%w: dynamic collections", ErrTxTooLarge)
+		// Check the catalog before asking for a stable facade handle: rejected
+		// names must not grow Database.handles for the database's lifetime.
+		var exists bool
+		if !t.readOnly {
+			db := t.db
+			// Close resets the memory catalog under handlesMu.
+			db.handlesMu.Lock()
+			if db.closed.Load() {
+				db.handlesMu.Unlock()
+				return nil, ErrClosed
+			}
+			if db.profile == Memory {
+				_, exists = db.heap.Collection(name)
+			} else {
+				_, exists = db.disk.Collection(name)
+			}
+			db.handlesMu.Unlock()
+		}
+		if !exists {
+			return nil, fmt.Errorf("%w: dynamic collections", ErrTxTooLarge)
+		}
 	}
 	state := t.newCollectionState(name)
 	state.absent = true
-	if t.hasHeap {
-		if snap, ok := t.heapCut.Collection(name); ok {
-			state.heapSnap = snap
-			state.hasHeap = true
-			state.absent = false
+	if t.readOnly {
+		// Every collection present at BeginReadOnly already has a state. A
+		// name outside that cut remains absent even if it was created later.
+		if t.dynamicStates >= maxSerializableReadCollections {
+			return nil, fmt.Errorf("%w: dynamic collections", ErrTxTooLarge)
 		}
+		t.dynamicStates++
+		t.colls[name] = state
+		return state, nil
 	}
-	if t.hasDisk {
-		if snap, ok := t.diskCut.Collection(name); ok {
-			state.diskSnap = snap
-			state.absent = snap == nil
+	// Resolve the live backend without creating it, then capture only this
+	// collection's snapshot. Collections that exist do not consume the
+	// dynamic-state budget; only genuinely absent names do, so callers may
+	// keep the lazy TxCollection API without growing a live transaction
+	// through repeated rejected names.
+	coll := t.db.Collection(name)
+	memory, disk, err := coll.backend(false)
+	if err != nil {
+		return nil, err
+	}
+	if memory == nil && disk == nil {
+		if t.dynamicStates >= maxSerializableReadCollections {
+			return nil, fmt.Errorf("%w: dynamic collections", ErrTxTooLarge)
 		}
+		t.dynamicStates++
+	} else if err := state.captureSnap(memory, disk); err != nil {
+		return nil, err
 	}
 	t.colls[name] = state
-	t.dynamicStates++
 	return state, nil
+}
+
+// captureSnap pins this collection's current snapshot for the transaction.
+// Exactly one of memory/disk is non-nil for a database-owned handle.
+func (s *txCollectionState) captureSnap(memory *store.Collection, disk *durable.Collection) error {
+	switch {
+	case memory != nil:
+		snap, err := memory.Snapshot()
+		if err != nil {
+			return facadeError(err)
+		}
+		s.heapSnap = snap
+		s.hasHeap = true
+		s.absent = false
+	case disk != nil:
+		snap, err := disk.Snapshot()
+		if err != nil {
+			return facadeError(err)
+		}
+		s.diskSnap = snap
+		s.absent = false
+	}
+	return nil
 }
 
 func (t *Tx) dirtyStates() []*txCollectionState {
@@ -577,8 +662,11 @@ func (t *Tx) validateState(state *txCollectionState) error {
 
 func (t *Tx) validateDependencies(states []*txCollectionState) error {
 	db := t.db
-	db.clockMu.Lock()
-	defer db.clockMu.Unlock()
+	// Read-only pass over beginRev-anchored histories: shared mode lets
+	// disjoint collections validate concurrently. All history mutations take
+	// the exclusive mode, so shared readers never observe a torn map or entry.
+	db.clockMu.RLock()
+	defer db.clockMu.RUnlock()
 	if db.txnRevisionStopped ||
 		(db.txnHistoryFloor != 0 && t.beginRev < db.txnHistoryFloor) {
 		return fmt.Errorf("%w: bounded database history", ErrTxConflict)
@@ -769,8 +857,12 @@ func (c *TxCollection) Put(key string, document []byte) (created bool, err error
 		c.state.canonical = nil
 		return false, err
 	}
-	c.state.canonical = canonical
-	owned := append([]byte(nil), canonical...)
+	// Transfer scratch ownership to the staged mutation instead of copying:
+	// the canonical buffer is already an owned exact-size rendering, so the
+	// extra alloc+memcpy per Put is pure overhead. The next Put allocates a
+	// fresh scratch, matching the previous per-Put allocation count.
+	c.state.canonical = nil
+	owned := canonical
 	baseExisted, err := c.baseExisted(key)
 	if err != nil {
 		c.state.canonical = nil
