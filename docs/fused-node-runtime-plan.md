@@ -289,6 +289,11 @@ The reviewed guarded path remains on the redesign branch. Next resolve baseline
 stalls and C1 proposal/durability costs, together with the outstanding process
 correctness gate; do not infer further structural benefits from these short runs.
 
+Main `c0675b8a` (PR #134, ARM64 SIMD packed equality counts) was merged next at
+`7b00ed3b`. It is upstream work and is absent from all SQL comparison timings
+above. Future comparison builds continue to require Go 1.27 with the SIMD
+experiment and verify Linux/ARM64 in each executable's build metadata.
+
 The real Linux physical3/physical6 process test remains a failing gate.
 Both layouts create three tables and validate topology and identities.
 Physical3 acknowledges 18 writes and passes the owner PG content oracle,
