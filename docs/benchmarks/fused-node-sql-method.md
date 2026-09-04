@@ -5,9 +5,10 @@ It records evidence and failures; it does not automatically approve promotion
 or claim the full 2x CockroachDB objective. Actual timing must wait for runtime
 correctness review and a quiet measurement host.
 
-The pinned parent is `37a171521459199b8cea9fe5f3ad50ce0b325597`, including the
-reviewed read-only-cut and no-write-transaction fixes. The candidate must be a
-different commit containing those fixes. References are resolved once and exact
+The pinned parent is `82ea6abfcf51de01745a99609d5ffb0cbbb828d0`, including the
+reviewed read-only-cut and no-write-transaction fixes, upstream clock sharding
+and allocation reductions, and the subsequent conflict-history race corrections.
+The candidate must be a different commit containing those fixes. References are resolved once and exact
 commits are checked out into detached server worktrees. The client source must
 be clean and receives a third detached worktree. The caller's checkout is never
 reset. Go 1.27 server/client builds, with `GOEXPERIMENT=simd` and read-only module

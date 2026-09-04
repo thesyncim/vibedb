@@ -33,7 +33,7 @@ import uuid
 ROOT = Path(__file__).resolve().parents[2]
 CRDB = "cockroachdb/cockroach:v26.3.1@sha256:204f131510c78393adb02345f289a8dbb32e1491e26cc92b6c7751f3b97be3c5"
 RUNTIME = "golang:1.27-bookworm"
-PARENT_DEFAULT_REF = "37a171521459199b8cea9fe5f3ad50ce0b325597"
+PARENT_DEFAULT_REF = "82ea6abfcf51de01745a99609d5ffb0cbbb828d0"
 DEFAULT_WORKLOADS = "point_hit,point_miss,range_64,group_16,update_existing"
 DEFAULT_PAYLOAD_BYTES = 256
 ALLOWED_WORKLOADS = {

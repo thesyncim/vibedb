@@ -14,9 +14,16 @@ Sol max review then reproduced and fixed fractured read-only cuts, missing
 validation for no-write transactions, and permanent handles created by rejected
 collection names. Five regression tests fail on `0128e794` and pass with the
 fix; the full root race suite passes. The reviewed fix is on main at
-`37a171521459199b8cea9fe5f3ad50ce0b325597`, which is the final parent baseline
-for this tranche. The active branch includes it at merge `f3281140`.
-The registered promotion thresholds below are unchanged.
+`37a171521459199b8cea9fe5f3ad50ce0b325597`. The active branch includes it at merge
+`f3281140`. At the next requested refresh, main `ea8dfc0f` added striped conflict
+tracking, smaller commit allocations, and cached collection handles. Sol review
+then reproduced and fixed lost conflict history during quiescence/overflow,
+stale pruning boundaries, counter exhaustion, and retained finished handles.
+The corrected main and final comparison parent is
+`82ea6abfcf51de01745a99609d5ffb0cbbb828d0`. Its clean root race suite passes;
+[regressions and raw validation](qualification/sharded-clock-2026-09-04/README.md)
+are retained. Both engines keep these upstream improvements. No tranche timing
+preceded this baseline change, and the promotion thresholds remain unchanged.
 
 The full objective remains at least 2× CockroachDB on a representative matched
 read/write matrix with comparable durability/consistency, substantially better
@@ -158,8 +165,12 @@ parser/runtime's existing roster-union support.
 
 Separate physical-node count from replication factor. Support deterministic
 3- and 6-node fixtures with multiple active data groups, overlapping placements
-and different RF3 subsets. This establishes a scaling test seam, not automatic
-balancing. Reject incompatible old fresh-cluster manifests clearly; no legacy
+and different RF3 subsets. The six-node fixture cycles the three initial
+subsets `{0,1,2}`, `{2,3,4}`, and `{4,5,0}`; each target therefore already has
+the complete peer roster needed by an appended group. Reload rejects a new
+physical peer outside the running transport roster. Arbitrary new-peer
+placement/rebalance needs a separately qualified enrollment protocol. This
+establishes a scaling test seam, not automatic balancing. Reject incompatible old fresh-cluster manifests clearly; no legacy
 data migration framework is required for this unreleased redesign.
 
 ## 4. Correctness and failure gates
