@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/thesyncim/vibedb/internal/raftmodel"
 	pb "go.etcd.io/raft/v3/raftpb"
 )
 
@@ -41,7 +42,13 @@ const (
 // values reachable through it remain immutable from successful TrySubmit until
 // Poll or Wait reports completion.
 type Submission struct {
-	Ready        NodeReady
+	Ready NodeReady
+	// readySeries is fixed caller-owned storage. PrepareReadySeries copies
+	// descriptors here and leaves their reachable protobuf values borrowed until
+	// completion, matching the ordinary Prepare ownership contract.
+	readySeries  [MaxReadySeries]raftmodel.PersistBatch
+	seriesGroup  uint64
+	seriesCount  uint8
 	kind         submissionKind
 	count        uint8
 	groups       [MaxPersistGroupBatches]uint64
@@ -79,14 +86,18 @@ func (s *Submission) Prepare(ready NodeReady) error {
 	if state := s.state.Load(); state == submissionQueued || state == submissionWaiting {
 		return ErrSubmissionPending
 	}
-	s.Ready, s.err, s.kind, s.count, s.catalog, s.snapshot = ready, nil, submissionReady, 0, descriptorCatalogCandidate{}, nil
+	clear(s.readySeries[:])
+	s.Ready, s.seriesGroup, s.seriesCount = ready, 0, 0
+	s.err, s.kind, s.count, s.catalog, s.snapshot = nil, submissionReady, 0, descriptorCatalogCandidate{}, nil
 	s.ticket.Store(0)
 	s.state.Store(submissionIdle)
 	return nil
 }
 
 func (s *Submission) invalidatePrepare() {
-	s.Ready, s.err, s.kind, s.count, s.catalog, s.snapshot = NodeReady{}, nil, 0, 0, descriptorCatalogCandidate{}, nil
+	clear(s.readySeries[:])
+	s.Ready, s.seriesGroup, s.seriesCount = NodeReady{}, 0, 0
+	s.err, s.kind, s.count, s.catalog, s.snapshot = nil, 0, 0, descriptorCatalogCandidate{}, nil
 	s.ticket.Store(0)
 	s.state.Store(submissionUnprepared)
 }
@@ -102,10 +113,78 @@ func (s *Submission) prepareControl(kind submissionKind, count int) error {
 		s.invalidatePrepare()
 		return ErrInvalid
 	}
-	s.Ready, s.err, s.kind, s.count, s.catalog, s.snapshot = NodeReady{}, nil, kind, uint8(count), descriptorCatalogCandidate{}, nil
+	clear(s.readySeries[:])
+	s.Ready, s.seriesGroup, s.seriesCount = NodeReady{}, 0, 0
+	s.err, s.kind, s.count, s.catalog, s.snapshot = nil, kind, uint8(count), descriptorCatalogCandidate{}, nil
 	s.ticket.Store(0)
 	s.state.Store(submissionIdle)
 	return nil
+}
+
+// PrepareReadySeries copies a same-group series' fixed PersistBatch
+// descriptors into this caller-owned submission. The pointed-to Entries,
+// HardState and Snapshot values remain borrowed until completion. Unsupported
+// multi-Ready snapshots are rejected before a ticket can be published; callers
+// can submit those values as ordinary singleton Readies.
+func (s *Submission) PrepareReadySeries(group uint64, batches []raftmodel.PersistBatch) error {
+	if s == nil || s.done == nil {
+		return ErrInvalid
+	}
+	if state := s.state.Load(); state == submissionQueued || state == submissionWaiting {
+		return ErrSubmissionPending
+	}
+	if err := validateReadySeriesDescriptors(group, batches); err != nil {
+		s.invalidatePrepare()
+		return err
+	}
+	clear(s.readySeries[:])
+	copy(s.readySeries[:], batches)
+	// Keep the first logical Ready visible through the long-standing Ready
+	// field for callers which inspect a completed Submission; the fixed series
+	// storage is the authoritative value consumed by the worker.
+	s.Ready, s.err, s.kind, s.count = NodeReady{GroupID: group, Batch: batches[0]}, nil, submissionReady, 0
+	s.seriesGroup, s.seriesCount = group, uint8(len(batches))
+	s.catalog, s.snapshot = descriptorCatalogCandidate{}, nil
+	s.ticket.Store(0)
+	s.state.Store(submissionIdle)
+	return nil
+}
+
+// ReadySeriesLen reports the number of logical Readies represented by this
+// submission. Ordinary Prepare submissions report one.
+func (s *Submission) ReadySeriesLen() int {
+	if s == nil || s.kind != submissionReady {
+		return 0
+	}
+	if s.seriesCount == 0 {
+		return 1
+	}
+	return int(s.seriesCount)
+}
+
+// nodeReady returns the immutable value published to the sequencer ring. A
+// series copies its fixed descriptor array into the NodeReady envelope; the
+// pointed-to protobuf values remain borrowed under the Submission ownership
+// contract. It is called before publication by producers and after dequeue by
+// the single worker, never while a caller may prepare the cell.
+func (s *Submission) nodeReady() NodeReady {
+	if s == nil || s.seriesCount == 0 {
+		if s == nil {
+			return NodeReady{}
+		}
+		return s.Ready
+	}
+	return NodeReady{GroupID: s.seriesGroup, series: s.readySeries, seriesCount: s.seriesCount}
+}
+
+func (s *Submission) nodeReadyGroup() uint64 {
+	if s == nil {
+		return 0
+	}
+	if s.seriesCount != 0 {
+		return s.seriesGroup
+	}
+	return s.Ready.GroupID
 }
 
 // PrepareBeginIncarnations copies caller-sorted dense log keys into fixed
@@ -284,21 +363,34 @@ type submissionRingSlot struct {
 // post-sync failures contribute no append count. These are lower-bound
 // observations, not total device sync counts or unknown-outcome resolution.
 type NodeSubmissionSequencerStats struct {
-	SubmissionAttempts            uint64
-	AcceptedSubmissions           uint64
-	RejectedSubmissions           uint64
-	BackpressureSubmissions       uint64
-	ReadySubmissions              uint64
-	ControlSubmissions            uint64
-	ReadyQueueWaitNanos           uint64
-	ControlQueueWaitNanos         uint64
-	ReadyWavesAttempted           uint64
-	ReadyPersistAttempts          uint64
-	ReadyWavesSucceeded           uint64
-	ReadyWavesFailed              uint64
-	ReadyPersistSuccesses         uint64
-	ReadyPersistFailures          uint64
-	ReadyDurableWaves             uint64
+	SubmissionAttempts      uint64
+	AcceptedSubmissions     uint64
+	RejectedSubmissions     uint64
+	BackpressureSubmissions uint64
+	ReadySubmissions        uint64
+	ControlSubmissions      uint64
+	ReadyQueueWaitNanos     uint64
+	ControlQueueWaitNanos   uint64
+	ReadyWavesAttempted     uint64
+	ReadyPersistAttempts    uint64
+	ReadyWavesSucceeded     uint64
+	ReadyWavesFailed        uint64
+	ReadyPersistSuccesses   uint64
+	ReadyPersistFailures    uint64
+	ReadyDurableWaves       uint64
+	// ReadyLogicalBatches counts constituent logical Readies accepted by the
+	// lane, while ReadySeriesSubmissions counts their physical submission
+	// envelopes. A singleton ordinary Ready is one series of length one.
+	ReadyLogicalBatches             uint64
+	ReadySeriesSubmissions          uint64
+	ReadySingletonSeriesSubmissions uint64
+	ReadyMultiSeriesSubmissions     uint64
+	ReadySeriesHistogram            [MaxReadySeries + 1]uint64
+	// ReadyDurableLogicalBatches advances only when the engine append witness
+	// proves that the corresponding physical wave reached the log.
+	ReadyDurableLogicalBatches    uint64
+	ReadyDurableSeriesSubmissions uint64
+	ReadyDurableSeriesHistogram   [MaxReadySeries + 1]uint64
 	FailedWaves                   uint64
 	ControlWavesAttempted         uint64
 	ControlPersistAttempts        uint64
@@ -330,41 +422,49 @@ type NodeSubmissionSequencerStats struct {
 // atomic values are copied. It also keeps the hot producer and worker paths
 // allocation-free while Stats loads a detached value.
 type nodeSequencerCounters struct {
-	submissionAttempts            atomic.Uint64
-	acceptedSubmissions           atomic.Uint64
-	rejectedSubmissions           atomic.Uint64
-	backpressureSubmissions       atomic.Uint64
-	readySubmissions              atomic.Uint64
-	controlSubmissions            atomic.Uint64
-	readyQueueWaitNanos           atomic.Uint64
-	controlQueueWaitNanos         atomic.Uint64
-	readyWavesAttempted           atomic.Uint64
-	readyPersistAttempts          atomic.Uint64
-	readyWavesSucceeded           atomic.Uint64
-	readyWavesFailed              atomic.Uint64
-	readyPersistSuccesses         atomic.Uint64
-	readyPersistFailures          atomic.Uint64
-	readyDurableWaves             atomic.Uint64
-	failedWaves                   atomic.Uint64
-	controlWavesAttempted         atomic.Uint64
-	controlPersistAttempts        atomic.Uint64
-	controlWavesSucceeded         atomic.Uint64
-	controlWavesFailed            atomic.Uint64
-	controlPersistSuccesses       atomic.Uint64
-	controlPersistFailures        atomic.Uint64
-	observedAppendBarriers        atomic.Uint64
-	readyObservedAppendBarriers   atomic.Uint64
-	controlObservedAppendBarriers atomic.Uint64
-	readyPersistDurationNanos     atomic.Uint64
-	controlPersistDurationNanos   atomic.Uint64
-	readyWaveDurationNanos        atomic.Uint64
-	controlWaveDurationNanos      atomic.Uint64
-	readyWaveGroupHistogram       [MaxPersistGroupBatches + 1]atomic.Uint64
-	multiGroupWaves               atomic.Uint64
-	checkpointQueueSubmissions    atomic.Uint64
-	checkpointQueueRejected       atomic.Uint64
-	checkpointQueueWaitNanos      atomic.Uint64
-	checkpointServiceNanos        atomic.Uint64
+	submissionAttempts              atomic.Uint64
+	acceptedSubmissions             atomic.Uint64
+	rejectedSubmissions             atomic.Uint64
+	backpressureSubmissions         atomic.Uint64
+	readySubmissions                atomic.Uint64
+	controlSubmissions              atomic.Uint64
+	readyQueueWaitNanos             atomic.Uint64
+	controlQueueWaitNanos           atomic.Uint64
+	readyWavesAttempted             atomic.Uint64
+	readyPersistAttempts            atomic.Uint64
+	readyWavesSucceeded             atomic.Uint64
+	readyWavesFailed                atomic.Uint64
+	readyPersistSuccesses           atomic.Uint64
+	readyPersistFailures            atomic.Uint64
+	readyDurableWaves               atomic.Uint64
+	readyLogicalBatches             atomic.Uint64
+	readySeriesSubmissions          atomic.Uint64
+	readySingletonSeriesSubmissions atomic.Uint64
+	readyMultiSeriesSubmissions     atomic.Uint64
+	readySeriesHistogram            [MaxReadySeries + 1]atomic.Uint64
+	readyDurableLogicalBatches      atomic.Uint64
+	readyDurableSeriesSubmissions   atomic.Uint64
+	readyDurableSeriesHistogram     [MaxReadySeries + 1]atomic.Uint64
+	failedWaves                     atomic.Uint64
+	controlWavesAttempted           atomic.Uint64
+	controlPersistAttempts          atomic.Uint64
+	controlWavesSucceeded           atomic.Uint64
+	controlWavesFailed              atomic.Uint64
+	controlPersistSuccesses         atomic.Uint64
+	controlPersistFailures          atomic.Uint64
+	observedAppendBarriers          atomic.Uint64
+	readyObservedAppendBarriers     atomic.Uint64
+	controlObservedAppendBarriers   atomic.Uint64
+	readyPersistDurationNanos       atomic.Uint64
+	controlPersistDurationNanos     atomic.Uint64
+	readyWaveDurationNanos          atomic.Uint64
+	controlWaveDurationNanos        atomic.Uint64
+	readyWaveGroupHistogram         [MaxPersistGroupBatches + 1]atomic.Uint64
+	multiGroupWaves                 atomic.Uint64
+	checkpointQueueSubmissions      atomic.Uint64
+	checkpointQueueRejected         atomic.Uint64
+	checkpointQueueWaitNanos        atomic.Uint64
+	checkpointServiceNanos          atomic.Uint64
 }
 
 // Stats returns a detached diagnostics snapshot without acquiring the node
@@ -391,6 +491,16 @@ func (q *NodeSubmissionSequencer) Stats() NodeSubmissionSequencerStats {
 	result.ReadyPersistSuccesses = c.readyPersistSuccesses.Load()
 	result.ReadyPersistFailures = c.readyPersistFailures.Load()
 	result.ReadyDurableWaves = c.readyDurableWaves.Load()
+	result.ReadyLogicalBatches = c.readyLogicalBatches.Load()
+	result.ReadySeriesSubmissions = c.readySeriesSubmissions.Load()
+	result.ReadySingletonSeriesSubmissions = c.readySingletonSeriesSubmissions.Load()
+	result.ReadyMultiSeriesSubmissions = c.readyMultiSeriesSubmissions.Load()
+	for i := range result.ReadySeriesHistogram {
+		result.ReadySeriesHistogram[i] = c.readySeriesHistogram[i].Load()
+		result.ReadyDurableSeriesHistogram[i] = c.readyDurableSeriesHistogram[i].Load()
+	}
+	result.ReadyDurableLogicalBatches = c.readyDurableLogicalBatches.Load()
+	result.ReadyDurableSeriesSubmissions = c.readyDurableSeriesSubmissions.Load()
 	result.FailedWaves = c.failedWaves.Load()
 	result.ControlWavesAttempted = c.controlWavesAttempted.Load()
 	result.ControlPersistAttempts = c.controlPersistAttempts.Load()
@@ -519,31 +629,53 @@ func (s *NodeStore) readyWaveAdmission(ready NodeReady) (nodeWaveAdmission, erro
 	if s == nil || s.bounds.maxWaveBytes == 0 {
 		return nodeWaveAdmission{}, nil
 	}
-	batch := ready.Batch
-	if ready.GroupID == 0 || batch.NodeIncarnation == 0 || batch.ReadyID == 0 ||
-		uint64(len(batch.Entries)) > s.bounds.maxEntriesPerGroup {
+	count := nodeReadySeriesCount(ready)
+	if ready.GroupID == 0 || count < 1 || count > MaxReadySeries {
 		return nodeWaveAdmission{}, ErrBounds
 	}
-	plainBytes, nonemptyEntries := 0, 0
-	for _, entry := range batch.Entries {
-		if entry == nil || !addAdmissionInt(&plainBytes, len(entry.GetData())) {
+	var batches [MaxReadySeries]raftmodel.PersistBatch
+	if ready.seriesCount == 0 {
+		batches[0] = ready.Batch
+	} else {
+		if err := validateReadySeriesDescriptors(ready.GroupID, ready.series[:count]); err != nil {
+			return nodeWaveAdmission{}, err
+		}
+		copy(batches[:count], ready.series[:count])
+	}
+	plainBytes, nonemptyEntries, totalEntries, readyBytes := 0, 0, 0, 0
+	for index := 0; index < count; index++ {
+		batch := batches[index]
+		if batch.NodeIncarnation == 0 || batch.ReadyID == 0 {
+			return nodeWaveAdmission{}, ErrInvalid
+		}
+		if uint64(len(batch.Entries)) > s.bounds.maxEntriesPerGroup ||
+			totalEntries > int(s.bounds.maxEntriesPerGroup)-len(batch.Entries) {
 			return nodeWaveAdmission{}, ErrBounds
 		}
-		if len(entry.GetData()) != 0 {
-			nonemptyEntries++
+		totalEntries += len(batch.Entries)
+		for _, entry := range batch.Entries {
+			if entry == nil || !addAdmissionInt(&plainBytes, len(entry.GetData())) {
+				return nodeWaveAdmission{}, ErrBounds
+			}
+			if len(entry.GetData()) != 0 {
+				nonemptyEntries++
+			}
 		}
-	}
-	readyBytes, err := readyPayloadSize(batch)
-	if err != nil {
-		return nodeWaveAdmission{}, err
-	}
-	if !canonicalEmptySnapshot(batch.Snapshot) {
-		snapshotBytes, snapshotErr := snapshotPayloadSize(batch.Snapshot)
-		if snapshotErr != nil || !addAdmissionInt(&readyBytes, snapshotBytes) {
-			if snapshotErr != nil {
-				return nodeWaveAdmission{}, snapshotErr
+		payloadBytes, err := readyPayloadSize(batch)
+		if err != nil || !addAdmissionInt(&readyBytes, payloadBytes) {
+			if err != nil {
+				return nodeWaveAdmission{}, err
 			}
 			return nodeWaveAdmission{}, ErrBounds
+		}
+		if !canonicalEmptySnapshot(batch.Snapshot) {
+			snapshotBytes, snapshotErr := snapshotPayloadSize(batch.Snapshot)
+			if snapshotErr != nil || !addAdmissionInt(&readyBytes, snapshotBytes) {
+				if snapshotErr != nil {
+					return nodeWaveAdmission{}, snapshotErr
+				}
+				return nodeWaveAdmission{}, ErrBounds
+			}
 		}
 	}
 	if uint64(readyBytes) > s.bounds.maxWaveBytes {
@@ -552,18 +684,23 @@ func (s *NodeStore) readyWaveAdmission(ready NodeReady) (nodeWaveAdmission, erro
 
 	// 92 covers the fixed wave header and both count varints. 169 covers the
 	// worst batch descriptor (identity, replacement, checkpoint, HardState and
-	// counts). Each entry then has at most eight uint64 varints in blob form.
-	// AEAD contributes one 16-byte tag per nonempty entry in the worst packing.
+	// counts). A series identity adds a versioned span and one ReadyID/digest
+	// pair per constituent; charge a fixed 32 bytes per constituent so the
+	// admission remains conservative without encoding or allocating. Each entry
+	// then has at most eight uint64 varints in blob form. AEAD contributes one
+	// 16-byte tag per nonempty entry in the worst packing.
 	frameBytes := 92 + 169
-	if len(batch.Entries) > (int(^uint(0)>>1)-frameBytes)/80 ||
-		!addAdmissionInt(&frameBytes, len(batch.Entries)*80) ||
+	if count > (int(^uint(0)>>1)-frameBytes)/32 ||
+		!addAdmissionInt(&frameBytes, count*32) ||
+		totalEntries > (int(^uint(0)>>1)-frameBytes)/80 ||
+		!addAdmissionInt(&frameBytes, totalEntries*80) ||
 		!addAdmissionInt(&frameBytes, plainBytes) ||
 		nonemptyEntries > (int(^uint(0)>>1)-frameBytes)/16 ||
 		!addAdmissionInt(&frameBytes, nonemptyEntries*16) {
 		return nodeWaveAdmission{}, ErrBounds
 	}
 	events := 6
-	if !addAdmissionInt(&events, len(batch.Entries)) ||
+	if !addAdmissionInt(&events, totalEntries) ||
 		uint64(frameBytes) > s.bounds.maxWaveBytes ||
 		uint64(events) > s.bounds.maxSegmentEvents {
 		return nodeWaveAdmission{}, ErrBounds
@@ -826,7 +963,7 @@ func (q *NodeSubmissionSequencer) TrySubmit(submission *Submission) (uint64, err
 		return q.rejectSubmission(ErrInvalid)
 	}
 	if submission.kind == submissionReady {
-		if _, err := q.store.readyWaveAdmission(submission.Ready); err != nil {
+		if _, err := q.store.readyWaveAdmission(submission.nodeReady()); err != nil {
 			return q.rejectSubmission(err)
 		}
 	}
@@ -856,6 +993,17 @@ func (q *NodeSubmissionSequencer) TrySubmit(submission *Submission) (uint64, err
 			q.stats.acceptedSubmissions.Add(1)
 			if submission.kind == submissionReady {
 				q.stats.readySubmissions.Add(1)
+				seriesLength := submission.ReadySeriesLen()
+				q.stats.readySeriesSubmissions.Add(1)
+				q.stats.readyLogicalBatches.Add(uint64(seriesLength))
+				if seriesLength == 1 {
+					q.stats.readySingletonSeriesSubmissions.Add(1)
+				} else if seriesLength > 1 {
+					q.stats.readyMultiSeriesSubmissions.Add(1)
+				}
+				if seriesLength >= 1 && seriesLength <= MaxReadySeries {
+					q.stats.readySeriesHistogram[seriesLength].Add(1)
+				}
 			} else {
 				q.stats.controlSubmissions.Add(1)
 			}
@@ -894,7 +1042,7 @@ func (q *NodeSubmissionSequencer) pop() *Submission {
 
 func submissionGroupSeen(items *[MaxPersistGroupBatches]*Submission, count int, group uint64) bool {
 	for i := 0; i < count; i++ {
-		if items[i].Ready.GroupID == group {
+		if items[i].nodeReadyGroup() == group {
 			return true
 		}
 	}
@@ -926,7 +1074,7 @@ func (q *NodeSubmissionSequencer) runWave(items *[MaxPersistGroupBatches]*Submis
 		return q.observeControlPersist(items[0])
 	}
 	for i := 0; i < count; i++ {
-		value := items[i].Ready
+		value := items[i].nodeReady()
 		at := i
 		for at > 0 && ready[at-1].GroupID > value.GroupID {
 			ready[at] = ready[at-1]
@@ -985,6 +1133,23 @@ func (q *NodeSubmissionSequencer) observeWaveResult(items *[MaxPersistGroupBatch
 		}
 		if engineDelta != 0 {
 			q.stats.readyDurableWaves.Add(engineDelta)
+			// One runWave call submits one physical frame. Attribute every logical
+			// Ready only when its appended group count proves that no outer item was
+			// an earlier exact retry. Mixed retry/new waves remain a lower bound
+			// because the scalar witness does not identify the appended items.
+			if engineDelta == 1 && appendedGroups == count {
+				logical := uint64(0)
+				for index := 0; index < count; index++ {
+					seriesLength := items[index].ReadySeriesLen()
+					if seriesLength < 1 || seriesLength > MaxReadySeries {
+						continue
+					}
+					logical += uint64(seriesLength)
+					q.stats.readyDurableSeriesSubmissions.Add(1)
+					q.stats.readyDurableSeriesHistogram[seriesLength].Add(1)
+				}
+				q.stats.readyDurableLogicalBatches.Add(logical)
+			}
 			// A production Ready wave appends at most one frame. If a test
 			// persistence adapter appends more, the final witness cannot tell
 			// us the earlier frames' group counts, so do not invent them.
@@ -1026,11 +1191,11 @@ func (q *NodeSubmissionSequencer) run() {
 		for count < len(items) {
 			s, ok := q.peek()
 			if !ok || count > 0 && (items[0].kind != submissionReady || s.kind != submissionReady) ||
-				s.kind == submissionReady && submissionGroupSeen(&items, count, s.Ready.GroupID) {
+				s.kind == submissionReady && submissionGroupSeen(&items, count, s.nodeReadyGroup()) {
 				break
 			}
 			if s.kind == submissionReady {
-				next, admissionErr := q.store.readyWaveAdmission(s.Ready)
+				next, admissionErr := q.store.readyWaveAdmission(s.nodeReady())
 				if admissionErr != nil {
 					// TrySubmit performs the same immutable geometry check before
 					// publishing a ticket. Reaching this branch means caller-owned

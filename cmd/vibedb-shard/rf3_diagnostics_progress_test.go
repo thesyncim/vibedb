@@ -8,7 +8,11 @@ import (
 )
 
 func TestRF3DiagnosticCanaryCountersMapExactSnapshots(t *testing.T) {
-	var snapshot rf3DiagnosticSnapshot
+	snapshot := rf3DiagnosticSnapshot{
+		ReadyWaveHistogram:    make([]uint64, raftstore.MaxPersistGroupBatches+1),
+		ReadySeriesHistogram:  make([]uint64, raftstore.MaxReadySeries+1),
+		ReadyDurableHistogram: make([]uint64, raftstore.MaxReadySeries+1),
+	}
 	applyRF3DiagnosticProgress(&snapshot, raftservice.ProgressMetricsSnapshot{
 		ProposalBatches:    1,
 		ProposalCommands:   2,
@@ -27,21 +31,33 @@ func TestRF3DiagnosticCanaryCountersMapExactSnapshots(t *testing.T) {
 	}
 
 	applyRF3DiagnosticSequencer(&snapshot, raftstore.NodeSubmissionSequencerStats{
-		ReadySubmissions:          11,
-		ReadyQueueWaitNanos:       12,
-		ReadyWavesAttempted:       13,
-		ReadyPersistAttempts:      14,
-		ReadyPersistSuccesses:     15,
-		ReadyPersistFailures:      16,
-		ReadyWavesFailed:          17,
-		ReadyPersistDurationNanos: 18,
-		ReadyWaveDurationNanos:    19,
+		ReadySubmissions:                11,
+		ReadyQueueWaitNanos:             12,
+		ReadyWavesAttempted:             13,
+		ReadyPersistAttempts:            14,
+		ReadyPersistSuccesses:           15,
+		ReadyPersistFailures:            16,
+		ReadyWavesFailed:                17,
+		ReadyPersistDurationNanos:       18,
+		ReadyWaveDurationNanos:          19,
+		ReadyLogicalBatches:             20,
+		ReadySeriesSubmissions:          21,
+		ReadySingletonSeriesSubmissions: 22,
+		ReadyMultiSeriesSubmissions:     23,
+		ReadySeriesHistogram:            [raftstore.MaxReadySeries + 1]uint64{2: 24},
+		ReadyDurableLogicalBatches:      25,
+		ReadyDurableSeriesSubmissions:   26,
+		ReadyDurableSeriesHistogram:     [raftstore.MaxReadySeries + 1]uint64{2: 27},
 	})
 	if snapshot.ReadySubmissions != 11 || snapshot.ReadyQueueWaitNs != 12 ||
 		snapshot.ReadyWavesAttempted != 13 || snapshot.ReadyPersistAttempts != 14 ||
 		snapshot.ReadyPersistSuccesses != 15 || snapshot.ReadyPersistFailures != 16 ||
 		snapshot.ReadyWavesFailed != 17 || snapshot.ReadyPersistDurationNs != 18 ||
-		snapshot.ReadyWaveDurationNs != 19 {
+		snapshot.ReadyWaveDurationNs != 19 || snapshot.ReadyLogicalBatches != 20 ||
+		snapshot.ReadySeriesSubmissions != 21 || snapshot.ReadySingletonSeries != 22 ||
+		snapshot.ReadyMultiSeries != 23 || snapshot.ReadySeriesHistogram[2] != 24 ||
+		snapshot.ReadyDurableLogical != 25 || snapshot.ReadyDurableSeries != 26 ||
+		snapshot.ReadyDurableHistogram[2] != 27 {
 		t.Fatalf("sequencer counters were not copied exactly: %+v", snapshot)
 	}
 

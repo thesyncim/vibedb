@@ -56,6 +56,8 @@ var diagnosticCounters = []string{
 	"ready_waves", "ready_durable_waves", "observed_append_barriers", "multi_group_waves", "failed_waves",
 	"ready_submissions", "ready_queue_wait_ns", "ready_waves_attempted", "ready_persist_attempts",
 	"ready_persist_successes", "ready_persist_failures", "ready_waves_failed", "ready_persist_duration_ns", "ready_wave_duration_ns",
+	"ready_logical_batches", "ready_series_submissions", "ready_singleton_series_submissions", "ready_multi_series_submissions",
+	"ready_durable_logical_batches", "ready_durable_series_submissions",
 	"checkpoint_queue_submissions", "checkpoint_queue_rejected", "checkpoint_queue_wait_ns", "checkpoint_service_ns",
 	"native_accepted", "native_rejected", "native_failed", "native_semantic_dispatches",
 	"gateway_local_calls", "gateway_remote_calls", "gateway_semantic_sql_calls", "gateway_legacy_calls",

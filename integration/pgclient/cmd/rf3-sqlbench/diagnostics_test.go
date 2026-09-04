@@ -101,6 +101,7 @@ func TestDiagnosticDeltasKeepUint64PrecisionAndRejectReset(t *testing.T) {
 	deltas, err := diagnosticDeltas([]diagnosticRecord{before}, []diagnosticRecord{after})
 	if err != nil || len(deltas) != 1 || deltas[0].Counters["gateway_local_calls"] != 3 ||
 		deltas[0].Counters["raft_proposal_bytes"] != 3 || deltas[0].Counters["ready_queue_wait_ns"] != 3 ||
+		deltas[0].Counters["ready_logical_batches"] != 3 || deltas[0].Counters["ready_durable_logical_batches"] != 3 ||
 		deltas[0].Histogram[1] != 3 {
 		t.Fatalf("delta lost precision: %v %v", deltas, err)
 	}

@@ -122,6 +122,8 @@ class SummarizeCRDBSQLTest(unittest.TestCase):
             counters = value["results"][0]["diagnostics"]["deltas"][0]["counters"]
             self.assertEqual(counters["ready_queue_wait_ns"], 3)
             self.assertEqual(counters["raft_proposal_commands"], 3)
+            self.assertEqual(counters["ready_logical_batches"], 3)
+            self.assertEqual(counters["ready_durable_logical_batches"], 3)
             value["results"][0]["diagnostics"]["deltas"][0]["counters"]["ready_waves"] = 4
             with self.assertRaisesRegex(ValueError, "counter delta"):
                 MODULE.load(write_report(directory, value), "vibedb")

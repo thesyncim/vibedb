@@ -46,6 +46,14 @@ type rf3DiagnosticSnapshot struct {
 	ReadyWavesFailed       uint64   `json:"ready_waves_failed"`
 	ReadyPersistDurationNs uint64   `json:"ready_persist_duration_ns"`
 	ReadyWaveDurationNs    uint64   `json:"ready_wave_duration_ns"`
+	ReadyLogicalBatches    uint64   `json:"ready_logical_batches"`
+	ReadySeriesSubmissions uint64   `json:"ready_series_submissions"`
+	ReadySingletonSeries   uint64   `json:"ready_singleton_series_submissions"`
+	ReadyMultiSeries       uint64   `json:"ready_multi_series_submissions"`
+	ReadySeriesHistogram   []uint64 `json:"ready_series_histogram"`
+	ReadyDurableLogical    uint64   `json:"ready_durable_logical_batches"`
+	ReadyDurableSeries     uint64   `json:"ready_durable_series_submissions"`
+	ReadyDurableHistogram  []uint64 `json:"ready_durable_series_histogram"`
 	ActiveSubmitters       int64    `json:"active_submitters"`
 	FailedWaves            uint64   `json:"failed_waves"`
 	CheckpointQueue        uint64   `json:"checkpoint_queue_submissions"`
@@ -367,6 +375,14 @@ func applyRF3DiagnosticSequencer(snapshot *rf3DiagnosticSnapshot, stats raftstor
 	snapshot.ReadyWavesFailed = stats.ReadyWavesFailed
 	snapshot.ReadyPersistDurationNs = stats.ReadyPersistDurationNanos
 	snapshot.ReadyWaveDurationNs = stats.ReadyWaveDurationNanos
+	snapshot.ReadyLogicalBatches = stats.ReadyLogicalBatches
+	snapshot.ReadySeriesSubmissions = stats.ReadySeriesSubmissions
+	snapshot.ReadySingletonSeries = stats.ReadySingletonSeriesSubmissions
+	snapshot.ReadyMultiSeries = stats.ReadyMultiSeriesSubmissions
+	copy(snapshot.ReadySeriesHistogram, stats.ReadySeriesHistogram[:])
+	snapshot.ReadyDurableLogical = stats.ReadyDurableLogicalBatches
+	snapshot.ReadyDurableSeries = stats.ReadyDurableSeriesSubmissions
+	copy(snapshot.ReadyDurableHistogram, stats.ReadyDurableSeriesHistogram[:])
 	snapshot.ActiveSubmitters = stats.ActiveSubmitters
 	snapshot.FailedWaves = stats.FailedWaves
 	snapshot.CheckpointQueue = stats.CheckpointQueueSubmissions
@@ -407,7 +423,10 @@ func emitRF3DiagnosticSnapshotWithResources(
 ) {
 	snapshot := rf3DiagnosticSnapshot{
 		UTC: time.Now().UTC().Format(time.RFC3339Nano), Event: "snapshot", PID: os.Getpid(),
-		Groups: len(manifest.groupBundles()), ReadyWaveHistogram: make([]uint64, raftstore.MaxPersistGroupBatches+1),
+		Groups:                len(manifest.groupBundles()),
+		ReadyWaveHistogram:    make([]uint64, raftstore.MaxPersistGroupBatches+1),
+		ReadySeriesHistogram:  make([]uint64, raftstore.MaxReadySeries+1),
+		ReadyDurableHistogram: make([]uint64, raftstore.MaxReadySeries+1),
 	}
 	resources := collectRF3DiagnosticResources(manifest, prepared, inventory, schemas)
 	// Production manifests always carry nonzero group identities. Preserve the
