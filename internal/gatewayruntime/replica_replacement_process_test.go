@@ -464,17 +464,27 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 				t.Fatalf("catalog self-move supervisor restart: %v\n%s", err, gatewayProcess.Diagnostics())
 			}
 		}
-		current, loadErr := catalogAuthority.Read(ctx)
-		if measurements.admissionMillis == 0 {
-			operations, operationErr := catalogAuthority.ReadOperationIDs(ctx)
-			if operationErr == nil && len(operations) >= len(baselineOperations)+2 {
-				measurements.admissionMillis = uint64(max(time.Since(started).Milliseconds(), 1))
-			}
-		}
 		if measurements.failoverMillis == 0 &&
 			strings.Contains(gatewayProcess.Diagnostics(), "revision controller published") {
 			measurements.failoverMillis = uint64(time.Since(started).Milliseconds())
 		}
+		if measurements.admissionMillis == 0 {
+			// Observe the atomic directory cut before reading the catalog head.
+			// Catalog self-move retries can span the entire admission window;
+			// the final empty directory cannot prove that both moves coexisted.
+			operations, operationErr := catalogAuthority.ReadOperationIDs(ctx)
+			if operationErr == nil && replicaProcessNewOperationCount(operations, baselineOperations) >= 2 {
+				measurements.admissionMillis = uint64(max(time.Since(started).Milliseconds(), 1))
+			} else {
+				if time.Since(started) > 30*time.Second {
+					t.Fatalf("two-group admission not observed: baseline=%x current=%x err=%v",
+						baselineOperations, operations, operationErr)
+				}
+				time.Sleep(20 * time.Millisecond)
+				continue
+			}
+		}
+		current, loadErr := catalogAuthority.Read(ctx)
 		if loadErr == nil {
 			descriptors := current.ReplicatedShardDescriptors()
 			for _, descriptor := range descriptors {
@@ -871,6 +881,40 @@ func replicaProcessGateway(binary, catalog, listen, controlManifest string,
 		args = append(args, "-shard-peer", listeners[index].Native+"="+fmt.Sprintf("%x", nodes[index]))
 	}
 	return &rf3testfixture.ExternalProcess{Binary: binary, Args: args}
+}
+
+// Count identities, not directory growth: completed baseline operations may be
+// deleted before both new moves become visible in the same directory cut.
+func replicaProcessNewOperationCount(current, baseline [][32]byte) int {
+	count := 0
+	for _, id := range current {
+		if !slices.Contains(baseline, id) {
+			count++
+		}
+	}
+	return count
+}
+
+func TestReplicaProcessAdmissionIgnoresRetiredBaselineOperations(t *testing.T) {
+	old, first, second := [32]byte{1}, [32]byte{2}, [32]byte{3}
+	for _, test := range []struct {
+		name    string
+		current [][32]byte
+		want    int
+	}{
+		{"unchanged", [][32]byte{old}, 0},
+		{"baseline retired", nil, 0},
+		{"one new alongside baseline", [][32]byte{old, first}, 1},
+		{"one new after retirement", [][32]byte{first}, 1},
+		{"both new alongside baseline", [][32]byte{old, first, second}, 2},
+		{"both new after retirement", [][32]byte{first, second}, 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := replicaProcessNewOperationCount(test.current, [][32]byte{old}); got != test.want {
+				t.Fatalf("new operations=%d want=%d", got, test.want)
+			}
+		})
+	}
 }
 
 func replicaProcessRosterContains(descriptor gateway.ReplicatedShardDescriptor, member uint64) bool {

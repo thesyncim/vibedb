@@ -13,6 +13,9 @@ concurrency:
   group: durable-rf3-external-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+env:
+  GOEXPERIMENT: simd
+
 jobs:
   qualify-read-batch:
     name: Ubuntu RF3 multi-table read batch chaos (count=3)

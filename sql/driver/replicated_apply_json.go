@@ -265,7 +265,7 @@ func decodeReplicatedApplyMetaVibe(
 				return err
 			}
 		case 3:
-			if err := c.Uint8(&decoded.ValidationProfile); err != nil {
+			if err := c.Uint(&decoded.ValidationProfile); err != nil {
 				return err
 			}
 		case 4:
@@ -285,11 +285,11 @@ func decodeReplicatedApplyMetaVibe(
 				return err
 			}
 		case 7:
-			if err := c.Uint64(&decoded.MaxSessions); err != nil {
+			if err := c.Uint(&decoded.MaxSessions); err != nil {
 				return err
 			}
 		case 8:
-			if err := c.Uint16(&decoded.RetryWindow); err != nil {
+			if err := c.Uint(&decoded.RetryWindow); err != nil {
 				return err
 			}
 		case 9:
@@ -301,15 +301,15 @@ func decodeReplicatedApplyMetaVibe(
 				return err
 			}
 		case 11:
-			if err := c.Int64(&decoded.TxnMaxBytes); err != nil {
+			if err := c.Int(&decoded.TxnMaxBytes); err != nil {
 				return err
 			}
 		case 12:
-			if err := c.Uint64(&decoded.RequestLedgerCapacityBytes); err != nil {
+			if err := c.Uint(&decoded.RequestLedgerCapacityBytes); err != nil {
 				return err
 			}
 		case 13:
-			if err := c.Uint64(&decoded.RequestLedgerCleanupReserveBytes); err != nil {
+			if err := c.Uint(&decoded.RequestLedgerCleanupReserveBytes); err != nil {
 				return err
 			}
 		case 14:
@@ -414,17 +414,13 @@ func decodeReplicatedPlacementVibe(
 				return err
 			}
 		case 2:
-			var value uint32
-			if err := c.Uint32(&value); err != nil {
+			if err := c.Uint(&decoded.TupleVersion); err != nil {
 				return err
 			}
-			decoded.TupleVersion = distribution.TupleVersion(value)
 		case 3:
-			var value uint32
-			if err := c.Uint32(&value); err != nil {
+			if err := c.Uint(&decoded.MapperVersion); err != nil {
 				return err
 			}
-			decoded.MapperVersion = distribution.MapperVersion(value)
 		case 4:
 			if err := decodeReplicatedLowerHex(
 				c, decoded.Range.Start[:],
@@ -538,7 +534,7 @@ func decodeReplicatedApplySidecarsVibe(
 		if err := markReplicatedCatalogField(&seen, index, "replicated apply sidecars", name); err != nil {
 			return err
 		}
-		if err := c.Uint64(&decoded.SystemRecoveryJournalBytes); err != nil {
+		if err := c.Uint(&decoded.SystemRecoveryJournalBytes); err != nil {
 			return err
 		}
 	}
@@ -584,7 +580,7 @@ func decodeRequiredReplicatedUint16(
 	if null {
 		return fmt.Errorf("vibedb: %s must not be null", label)
 	}
-	return c.Uint16(dst)
+	return c.Uint(dst)
 }
 
 func decodeReplicatedLowerHex(

@@ -11,7 +11,12 @@
 performance, cost, storage, or scaling number. A green test, a generated coverage
 cell, or a CI artifact is not a result.
 
-This is a separate Go 1.26 module so competitor dependencies do not enter VibeDB's
+The standalone evidence scripts default to `GOEXPERIMENT=simd`, and record the
+selected experiment and amd64 level in their metadata. Set
+`GOEXPERIMENT=nosimd` explicitly for a portable comparison. Raw commands in
+this module should use `GOEXPERIMENT=simd go test` or `GOEXPERIMENT=simd go run`.
+
+This is a separate Go 1.27 module so competitor dependencies do not enter VibeDB's
 root module. The current adapters use VibeDB from this checkout, Badger v4.9.5,
 bbolt v1.5.0, Pebble v1.1.5, and modernc SQLite v1.54.0. `go.mod` is authoritative.
 

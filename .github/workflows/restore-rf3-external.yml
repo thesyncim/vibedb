@@ -13,6 +13,9 @@ concurrency:
   group: restore-rf3-external-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+env:
+  GOEXPERIMENT: simd
+
 jobs:
   qualify:
     name: Ubuntu restored catalog and data RF3 serving (count=3)

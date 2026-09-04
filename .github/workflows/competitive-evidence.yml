@@ -7,6 +7,9 @@ permissions:
 concurrency:
   group: competitive-evidence-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
+env:
+  GOEXPERIMENT: simd
+
 jobs:
   clean-ubuntu-qualification:
     name: clean Ubuntu competitive and RF3 evidence

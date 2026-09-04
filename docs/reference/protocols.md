@@ -45,6 +45,21 @@ default). A bound prefix maps to the full keyspace because it cannot predict
 the remaining hash input. The hash selects placement; canonical tuple bytes
 define equality.
 
+`DocumentPointProgram` builds a validating vibejson index directly into its
+workspace's retained capacity and extracts every compiled placement pointer
+from that index. It counts entries only when the workspace must grow. String
+and number accessors reuse validated nodes; escaped strings use workspace
+scratch. The complete document must be valid even when every placement field
+appears before an invalid suffix. Duplicate object keys resolve to their last
+occurrence, and borrowed scalar references are cleared before returning.
+Each worker needs its own workspace. These storage and scanning choices do not
+change tuple bytes, mapper version, or placement identity.
+
+SQL catalog and replicated apply decoders use vibejson's generic native cursor
+readers. The destination type determines integer width and overflow checks;
+tuple and mapper versions decode directly into their defined types. This is an
+implementation API migration, with the same serialized field names and values.
+
 ## Gateway newline-delimited JSON
 
 `vibedb-gateway serve` accepts a raw byte stream. Each request is one JSON

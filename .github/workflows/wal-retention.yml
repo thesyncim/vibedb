@@ -12,6 +12,9 @@ concurrency:
   group: wal-retention-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+env:
+  GOEXPERIMENT: simd
+
 jobs:
   external-crash-loop:
     name: external crash loop and retained/live bound

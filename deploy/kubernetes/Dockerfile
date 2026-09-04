@@ -1,5 +1,7 @@
 # syntax=docker/dockerfile:1.7
 FROM golang:1.27-bookworm AS build
+ARG GOEXPERIMENT=simd
+ENV GOEXPERIMENT=${GOEXPERIMENT}
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN --mount=type=cache,target=/go/pkg/mod go mod download

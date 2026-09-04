@@ -25,7 +25,7 @@ It does not test a mixed-build upgrade, multi-zone failure, backup policy, produ
 
 The qualified CI environment is Linux. Run from the repository root; the script records `HEAD` but does not prove that the worktree is clean. It requires:
 
-- Go 1.26
+- Go 1.27
 - Git
 - Docker with permission to build and load images
 - Kind; CI installs `sigs.k8s.io/kind@v0.32.0`
@@ -35,6 +35,13 @@ The qualified CI environment is Linux. Run from the repository root; the script 
 - enough local resources for one control-plane node, three worker nodes, ten Pods, and ten PVCs
 
 The Kind node image is Kubernetes `v1.34.8` pinned by SHA-256 in `deploy/kubernetes/kind-3-worker.yaml`.
+
+The Docker build and qualification helpers enable `GOEXPERIMENT=simd` by
+default, with runtime CPU fallback on amd64. Set `GOEXPERIMENT=nosimd` when
+running the qualification script to select portable builds for both helpers
+and containers. For a standalone Docker build, pass
+`--build-arg GOEXPERIMENT=nosimd`. The evidence records the selected backend
+in `go-backend.txt`.
 
 ## Run it
 

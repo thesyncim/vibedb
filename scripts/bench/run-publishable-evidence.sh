@@ -3,6 +3,8 @@
 # The final receipt is created only after every artifact validates.
 set -euo pipefail
 
+export GOEXPERIMENT=${GOEXPERIMENT:-simd}
+
 if [[ $# -ne 2 ]]; then
   echo "usage: $0 ABSOLUTE_NEW_OUTPUT_DIRECTORY OUT_OF_RAM_DOCUMENTS" >&2
   exit 2
@@ -53,6 +55,7 @@ if [[ $(git rev-parse HEAD) != "${revision}" || -n $(git status --porcelain=v1 -
 fi
 
 filesystem=$(stat -f -c '%T' "${evidence}")
+bench_amd64_level=$(go env GOAMD64)
 {
   printf 'meta\tcommand_schema\tvibedb.publish-evidence/1\n'
   printf 'meta\trevision\t%s\n' "${revision}"
@@ -60,6 +63,8 @@ filesystem=$(stat -f -c '%T' "${evidence}")
   printf 'meta\tgo_version\t%s\n' "$(go version | tr '\t\r\n' '   ')"
   printf 'meta\tgoos\t%s\n' "$(go env GOOS)"
   printf 'meta\tgoarch\t%s\n' "$(go env GOARCH)"
+  printf 'meta\tgoexperiment\t%s\n' "$(go env GOEXPERIMENT)"
+  printf 'meta\tgoamd64\t%s\n' "${bench_amd64_level:-not-applicable}"
   printf 'meta\tkernel\t%s\n' "$(uname -srvmo | tr '\t\r\n' '   ')"
   printf 'meta\tfilesystem\t%s\n' "${filesystem}"
   printf 'meta\tout_of_ram_documents\t%s\n' "${out_of_ram_documents}"
