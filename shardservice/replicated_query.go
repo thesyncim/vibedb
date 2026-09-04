@@ -211,34 +211,29 @@ func (server *ReplicatedServer) executeReplicatedQueryTier(ctx context.Context, 
 		return refuse(ReplicatedRefusalUnavailable)
 	}
 	execution := trace.StartRegion(ctx, "sql.read.execute")
-	result, err := executeFencedSQLBudget(ctx, source, cut.Data(), inner, budget)
+	encoded, err := executeFencedSQLBudget(ctx, source, cut.Data(), inner, budget)
 	execution.End()
 	if err != nil {
-		if ctx.Err() == nil && budget.canGrow(err, maximum) {
+		if ctx.Err() == nil && (budget.canGrow(err, maximum) ||
+			errors.Is(err, errSQLReadFrameBound) && budget.resultBytes < int(request.MaxValueBytes)) {
 			return nil, true
 		}
-		result = classifyError(err)
-	}
-	// Bound the complete inner frame (including metadata) before allocating
-	// its encoding. The caller's logical result cap and the wire cap differ.
-	if !replicatedSQLResponseFits(result, budget.resultBytes) {
-		if budget.resultBytes < int(request.MaxValueBytes) && ctx.Err() == nil {
-			return nil, true
+		if errors.Is(err, errSQLReadFrameBound) {
+			return refuse(ReplicatedRefusalReadBufferBound)
 		}
-		return refuse(ReplicatedRefusalReadBufferBound)
-	}
-	var encoded bytes.Buffer
-	encoding := trace.StartRegion(ctx, "sql.read.encode")
-	encodeErr := EncodeResponse(&encoded, result)
-	encoding.End()
-	if encodeErr != nil {
-		return refuse(ReplicatedRefusalUnavailable)
-	}
-	if encoded.Len() > budget.resultBytes {
-		return refuse(ReplicatedRefusalReadBufferBound)
+		encoded, err = encodeSQLReadError(classifyError(err), budget.resultBytes)
+		if err != nil {
+			if errors.Is(err, errSQLReadFrameBound) {
+				if budget.resultBytes < int(request.MaxValueBytes) && ctx.Err() == nil {
+					return nil, true
+				}
+				return refuse(ReplicatedRefusalReadBufferBound)
+			}
+			return refuse(ReplicatedRefusalUnavailable)
+		}
 	}
 	wireState = replicatedReadState(wireState, request.Fence, cut.Data().Fence().Applied)
-	response := &ReplicatedResponse{Kind: ReplicatedQueryResult, HasState: true, State: wireState, ReadApplied: cut.Data().Fence().Applied, Value: encoded.Bytes(), readLease: lease}
+	response := &ReplicatedResponse{Kind: ReplicatedQueryResult, HasState: true, State: wireState, ReadApplied: cut.Data().Fence().Applied, Value: encoded, readLease: lease}
 	if !validReplicatedResponse(response) {
 		return refuse(ReplicatedRefusalUnavailable)
 	}
@@ -246,7 +241,7 @@ func (server *ReplicatedServer) executeReplicatedQueryTier(ctx context.Context, 
 	return response, false
 }
 
-// These are the two response shapes executeFencedSQLBudget can produce.
+// These are the response shapes admitted by the RF3 SQL wire budget.
 // Charge the full frame grammar without allocating or overflowing on lengths.
 func replicatedSQLResponseFits(response *ShardResponse, limit int) bool {
 	if response == nil || response.HasReadPosition || response.DocumentScan.Present || response.Exchange.present() || response.Transaction.Role != TransactionRoleNone {
@@ -297,13 +292,13 @@ func replicatedSQLResponseFits(response *ShardResponse, limit int) bool {
 
 func executeFencedSQLBudget(ctx context.Context, source interface {
 	NewDataReadSession(context.Context, *replicatedstate.DataReadCut, query.ExecOptions) (*sqldriver.ReplicatedReadSession, error)
-}, cut *replicatedstate.DataReadCut, req *ShardRequest, budget replicatedSQLBudget) (*ShardResponse, error) {
+}, cut *replicatedstate.DataReadCut, req *ShardRequest, budget replicatedSQLBudget) ([]byte, error) {
 	maxBytes := budget.resultBytes
 	if req.ExecutionMode != ExecutionReadOnly || req.ReadPolicy != ReadStrong ||
 		req.Transaction.Operation != 0 || req.Exchange.Operation != 0 || req.Repartition.present() ||
 		req.DocumentScan.present() || req.GlobalIndexLookup.present() || req.mutationCapturePresent() ||
 		!req.ReadFenceID.IsZero() || req.HasMinPosition || req.RowBatch.present() {
-		return NewErrorResponse(ErrorMalformedRequest, "RF3 SQL read does not support this execution mode"), nil
+		return encodeSQLReadError(NewErrorResponse(ErrorMalformedRequest, "RF3 SQL read does not support this execution mode"), budget.resultBytes)
 	}
 	rows := replicatedSQLMaxRows
 	if req.MaxRows > 0 && req.MaxRows < uint64(rows) {
@@ -341,8 +336,9 @@ func executeFencedSQLBudget(ctx context.Context, source interface {
 	if err != nil {
 		return nil, err
 	}
-	columns := responseColumns(prepared)
-	return RowsResponse(columns, collectRows(&cursor, len(columns))), nil
+	encoding := trace.StartRegion(ctx, "sql.read.encode")
+	defer encoding.End()
+	return encodeSQLReadCursor(cursor.Snapshot(), prepared.Columns(), budget.resultBytes, &flag)
 }
 
 // sqlLimit leaves native frame capacity outside SQL execution reservations.

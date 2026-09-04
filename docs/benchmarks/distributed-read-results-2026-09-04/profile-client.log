@@ -1,0 +1,6 @@
+vibedb point_hit c=1 rep=1 3473.2 ops/s p99=0.549ms errors=0 verified=true
+vibedb point_hit c=8 rep=1 17304.0 ops/s p99=0.989ms errors=0 verified=true
+vibedb range_32 c=1 rep=1 3117.6 ops/s p99=0.649ms errors=0 verified=true
+vibedb range_32 c=8 rep=1 14624.6 ops/s p99=1.256ms errors=0 verified=true
+vibedb range_64 c=1 rep=1 2469.6 ops/s p99=0.733ms errors=0 verified=true
+vibedb range_64 c=8 rep=1 12342.8 ops/s p99=1.560ms errors=0 verified=true

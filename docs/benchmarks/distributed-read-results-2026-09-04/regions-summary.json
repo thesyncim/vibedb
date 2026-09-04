@@ -1,0 +1,30 @@
+{
+  "unmatched_ends": 1,
+  "unfinished_regions": 0,
+  "regions": {
+    "sql.read.admission": {
+      "count": 33880,
+      "mean_us": 0.1933249114521842,
+      "p50_us": 0.128,
+      "p95_us": 0.384
+    },
+    "sql.read.encode": {
+      "count": 33881,
+      "mean_us": 3.332107611935893,
+      "p50_us": 1.92,
+      "p95_us": 4.672
+    },
+    "sql.read.execute": {
+      "count": 33880,
+      "mean_us": 96.83512263872491,
+      "p50_us": 66.56,
+      "p95_us": 160.128
+    },
+    "sql.read.quorum": {
+      "count": 33880,
+      "mean_us": 173.76127904368357,
+      "p50_us": 142.528,
+      "p95_us": 351.552
+    }
+  }
+}
