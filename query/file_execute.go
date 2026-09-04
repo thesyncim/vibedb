@@ -643,6 +643,17 @@ func (p *plan) runFileOverlayInto(e *Exec, snapshot *durable.Snapshot, overlay F
 	return err
 }
 
+// A unique primary key supplies the entire ordering. Restrict this proof to
+// plain projections: joins can multiply rows and aggregate LIMIT applies only
+// after the complete input has been reduced.
+func (p *plan) primaryOrderedLimit(source *FileRangeSource) bool {
+	return source != nil && source.orderedPath != "" && p.hasLimit &&
+		p.limit > 0 && !p.grouped && !p.hasAggregate &&
+		len(p.joins) == 0 && len(p.marks) == 0 && !p.requiresSQLDomainScan() &&
+		len(p.order) == 1 && p.order[0].dir == Asc &&
+		p.valuePaths[p.order[0].value].pointer.String() == source.orderedPath
+}
+
 // runFileSnapshotBatched is kept outside the direct covering dispatcher so
 // goroutine captures in the general executor cannot force the fast path's
 // stats and fallback workspace onto the heap.
@@ -658,6 +669,12 @@ func (p *plan) runFileSnapshotBatched(
 	// tails below stay one expression each; the caller stores it back into the
 	// Exec. Taking it from e keeps its retained cell and arena capacity.
 	result, stats = e.Result, base
+	orderedLimit := p.primaryOrderedLimit(rangeSource)
+	if orderedLimit {
+		// Small pages must not start by decoding a full 4096-row batch. The
+		// credit ring still bounds speculative work when filters reject rows.
+		n.batchRows = min(n.batchRows, p.limit)
+	}
 	if err := e.Workspace.checkCanceled(); err != nil {
 		return result, stats, err
 	}
@@ -820,6 +837,7 @@ func (p *plan) runFileSnapshotBatched(
 	cancel := func() { pool.stopped.Store(true) }
 
 	var firstErr error
+	limitReached := false
 	rows := e.file.rows[:0]
 	var rowBytes int64
 	var resultRows int
@@ -838,6 +856,11 @@ func (p *plan) runFileSnapshotBatched(
 	// frontier the workers rewind their arenas against.
 	nextSequence := uint64(0)
 	consume := func(part filePartial) {
+		// Partials are consumed in source order. Once the ordered prefix is
+		// complete, drain speculative batches without retaining their rows.
+		if limitReached {
+			return
+		}
 		if part.err != nil {
 			if firstErr == nil {
 				firstErr = part.err
@@ -951,7 +974,14 @@ func (p *plan) runFileSnapshotBatched(
 					return
 				}
 			}
+			if orderedLimit {
+				part.rows = part.rows[:min(len(part.rows), p.limit-len(rows))]
+			}
 			rows = append(rows, part.rows...)
+			if orderedLimit && len(rows) == p.limit {
+				limitReached = true
+				cancel()
+			}
 			rowBytes += part.bytes
 			// An unordered LIMIT needs only the earliest source ordinals.
 			if len(p.order) == 0 && p.hasLimit &&

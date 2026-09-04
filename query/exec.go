@@ -143,6 +143,7 @@ func FromFile(s *durable.Snapshot) Source {
 // source pays for two slice headers, while FromFile and every heap source retain
 // their existing size and allocation behavior.
 type FileRangeSource struct {
+	orderedPath    string
 	lower          []byte
 	upper          []byte
 	lowerExclusive bool
@@ -159,6 +160,17 @@ func NewFileRangeSource(lower, upper []byte, lowerExclusive bool) FileRangeSourc
 func (s *FileRangeSource) Bind(lower, upper []byte, lowerExclusive bool) {
 	if s != nil {
 		s.lower, s.upper, s.lowerExclusive = lower, upper, lowerExclusive
+		s.orderedPath = ""
+	}
+}
+
+// BindPrimaryOrder certifies that the snapshot's native keys encode this unique
+// document path (an RFC 6901 pointer) in the query scalar's ascending order.
+// Callers must own that schema invariant; arbitrary durable collections need not store matching keys.
+// Bind clears the certificate before every reuse.
+func (s *FileRangeSource) BindPrimaryOrder(path string) {
+	if s != nil {
+		s.orderedPath = path
 	}
 }
 

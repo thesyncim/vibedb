@@ -453,6 +453,7 @@ func (s *stmt) queryRowsCandidates(
 				source, err = s.conn.tx.querySource(s.query.Collection())
 			default:
 				s.conn.fileRange.Bind(bounds.lower, bounds.upper, bounds.lowerExclusive)
+				s.conn.fileRange.BindPrimaryOrder(s.primaryRange.path)
 				source = query.FromFileRange(state.snapshot, &s.conn.fileRange)
 			}
 		} else {
@@ -599,6 +600,7 @@ func (s *stmt) queryRowsCandidates(
 					s.conn.fileRange.Bind(
 						bounds.lower, bounds.upper, bounds.lowerExclusive,
 					)
+					s.conn.fileRange.BindPrimaryOrder(s.primaryRange.path)
 					source = query.FromFileRange(snapshot, &s.conn.fileRange)
 				}
 			}

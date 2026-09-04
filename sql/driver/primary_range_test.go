@@ -1,6 +1,7 @@
 package driver
 
 import (
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -184,4 +185,47 @@ func TestTransactionPrimaryRangeKeepsOverlayVisibility(t *testing.T) {
 		t.Fatal(err)
 	}
 	check(30)
+}
+
+func TestSQLPrimaryOrderedLimit(t *testing.T) {
+	db := openTestDB(t)
+	if _, err := db.Exec(`CREATE TABLE pages (id INTEGER PRIMARY KEY, bucket INTEGER)`); err != nil {
+		t.Fatal(err)
+	}
+	for batch := range 16 {
+		var insert strings.Builder
+		insert.WriteString("INSERT INTO pages (id,bucket) VALUES ")
+		for row := range 64 {
+			if row != 0 {
+				insert.WriteByte(',')
+			}
+			id := batch*64 + row
+			fmt.Fprintf(&insert, "(%d,%d)", id, id%7)
+		}
+		if _, err := db.Exec(insert.String()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, statement := range []string{
+		`SELECT id FROM pages WHERE id >= 0 ORDER BY id LIMIT 17`,
+		`SELECT id FROM pages p WHERE p.id >= 0 AND p.bucket=5 ORDER BY p.id LIMIT 17`,
+	} {
+		var plan string
+		if err := db.QueryRow("EXPLAIN ANALYZE " + statement).Scan(&plan); err != nil {
+			t.Fatal(err)
+		}
+		var decoded struct {
+			Plan struct {
+				Analyze struct {
+					RowsScanned uint64 `json:"rows_scanned"`
+				} `json:"analyze"`
+			} `json:"plan"`
+		}
+		if err := vibejson.Unmarshal([]byte(plan), &decoded); err != nil {
+			t.Fatal(err)
+		}
+		if decoded.Plan.Analyze.RowsScanned == 0 || decoded.Plan.Analyze.RowsScanned >= 512 {
+			t.Fatalf("LIMIT did not bound SQL scan: %s", plan)
+		}
+	}
 }

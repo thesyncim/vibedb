@@ -364,3 +364,74 @@ func TestRunFileSnapshotPersistentCompoundIndexPushdown(t *testing.T) {
 		t.Fatalf("unindexed range pushdown stats = %+v", stats)
 	}
 }
+
+func TestPrimaryOrderedLimitStopsAfterFilteredPrefix(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "ordered-limit-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	fs, err := durable.Create(f, durable.Options{Durability: durable.DurabilityAsyncVisible})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fs.Close()
+	set := &store.Segment{}
+	for i := range 2048 {
+		key := fmt.Sprintf("%04d", i)
+		doc := []byte(fmt.Sprintf(`{"id":%q,"bucket":%d}`, key, i%7))
+		if _, err := fs.Put([]byte(key), doc); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := set.Append(doc); err != nil {
+			t.Fatal(err)
+		}
+	}
+	snap, err := fs.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snap.Close()
+	for _, workers := range []int{1, 4} {
+		for _, test := range []struct {
+			name    string
+			q       *Query
+			bounded bool
+		}{
+			{"prefix", Select(Path("/id")).OrderBy("/id", Asc).Limit(17), true},
+			{"residual", Select(Path("/id")).Where(Cmp("/bucket", Eq, 5)).OrderBy("/id", Asc).Limit(17), true},
+			{"late match", Select(Path("/id")).Where(Cmp("/id", Ge, "0500")).OrderBy("/id", Asc).Limit(17), true},
+			{"no matches", Select(Path("/id")).Where(Cmp("/bucket", Eq, 99)).OrderBy("/id", Asc).Limit(17), false},
+			{"descending", Select(Path("/id")).OrderBy("/id", Desc).Limit(17), false},
+			{"other order", Select(Path("/id")).OrderBy("/bucket", Asc).Limit(17), false},
+			{"aggregate", Select(Path("/id"), Count()).GroupBy("/id").OrderBy("/id", Asc).Limit(17), false},
+		} {
+			t.Run(fmt.Sprintf("%s/workers%d", test.name, workers), func(t *testing.T) {
+				want, err := test.q.Run(FromSegment(set))
+				if err != nil {
+					t.Fatal(err)
+				}
+				span := NewFileRangeSource([]byte("0000"), nil, false)
+				span.BindPrimaryOrder("/id")
+				e := Exec{Options: ExecOptions{Workers: workers}}
+				defer e.Release()
+				// Reuse catches credits, stopped flags and stale arena rows from
+				// the speculative batches that must be drained after LIMIT.
+				for range 3 {
+					if err := test.q.RunInto(&e, FromFileRange(snap, &span)); err != nil {
+						t.Fatal(err)
+					}
+					if resultKey(e.Result) != resultKey(want) {
+						t.Fatalf("got %s want %s", resultKey(e.Result), resultKey(want))
+					}
+					if test.bounded && e.Stats.RowsScanned >= 1024 {
+						t.Fatalf("did not stop: %+v", e.Stats)
+					}
+					if !test.bounded && e.Stats.RowsScanned != 2048 {
+						t.Fatalf("unsafe pruning: %+v", e.Stats)
+					}
+				}
+			})
+		}
+	}
+}
