@@ -133,8 +133,24 @@ func (b *WriteBatch) Delete(key string) error {
 	return b.record(key, nil, true)
 }
 
+// positionOf resolves a staged key to its entry. The position index exists
+// only once a batch holds two distinct keys; at most one entry compares
+// directly (a no-alloc byte compare), so single-key commits — the common
+// transaction — never buy index storage while repeat-key replacement keeps
+// exact map semantics.
+func (b *WriteBatch) positionOf(key string) (int, bool) {
+	if b.position != nil {
+		at, exists := b.position[key]
+		return at, exists
+	}
+	if len(b.entries) == 1 && string(b.keyBytes(b.entries[0])) == key {
+		return 0, true
+	}
+	return 0, false
+}
+
 func (b *WriteBatch) record(key string, src []byte, remove bool) error {
-	if at, exists := b.position[key]; exists {
+	if at, exists := b.positionOf(key); exists {
 		old := b.entries[at]
 		nextBytes := len(b.keys) + len(b.values) - old.valueLength
 		if len(src) > b.maxBytes-nextBytes {
@@ -158,7 +174,13 @@ func (b *WriteBatch) record(key string, src []byte, remove bool) error {
 	b.keys = append(b.keys, key...)
 	b.values = append(b.values, src...)
 	b.entries = append(b.entries, entry)
-	b.position[string(b.keyBytes(entry))] = len(b.entries) - 1
+	if len(b.entries) > 1 {
+		if b.position == nil {
+			b.position = make(map[string]int, defaultHeapBatchPositionHint)
+			b.position[string(b.keyBytes(b.entries[0]))] = 0
+		}
+		b.position[string(b.keyBytes(entry))] = len(b.entries) - 1
+	}
 	return nil
 }
 
@@ -189,12 +211,19 @@ func (b *WriteBatch) replaceValue(at int, src []byte) {
 // Collection returns the WriteBatch for a participant name.
 type DatabaseBatch struct {
 	byName map[string]*WriteBatch
+	// first serves the lone-participant apply without map storage: single
+	// collection commits skip the map make and the first insert. The map
+	// is made lazily once a second distinct collection arrives.
+	first *WriteBatch
 }
 
 // Collection returns the participant WriteBatch for name.
 func (b *DatabaseBatch) Collection(name string) (*WriteBatch, error) {
 	if b == nil {
 		return nil, ErrTxnParticipant
+	}
+	if b.first != nil && b.first.collection != nil && b.first.collection.name == name {
+		return b.first, nil
 	}
 	batch, ok := b.byName[name]
 	if !ok || batch == nil {
@@ -230,21 +259,27 @@ func UpdateCollections(participants []*Collection, fn func(*DatabaseBatch) error
 		)
 	}
 
-	batch := &DatabaseBatch{byName: make(map[string]*WriteBatch, len(ordered))}
+	batch := &DatabaseBatch{}
 	batches := make([]*WriteBatch, len(ordered))
 	for i, collection := range ordered {
 		wb := &WriteBatch{
 			collection: collection,
-			// Size the position index for the common small batch and let it
-			// grow: a max-sized index on every commit costs ~2KB per
-			// single-key transaction (a top allocator in commit profiles)
-			// while regrowth on genuinely large batches amortizes.
-			position:     make(map[string]int, defaultHeapBatchPositionHint),
-			active:       true,
+			active:     true,
+			// The position index stays nil until a second distinct key
+			// arrives (see record): single-key commits never buy map
+			// storage, and the byName map below stays nil for the
+			// lone-participant apply, which Collection serves from first.
 			maxDocuments: defaultHeapMaxBatchDocuments,
 			maxBytes:     defaultHeapMaxBatchBytes,
 		}
 		batches[i] = wb
+		if i == 0 {
+			batch.first = wb
+			continue
+		}
+		if batch.byName == nil {
+			batch.byName = make(map[string]*WriteBatch, len(ordered))
+		}
 		batch.byName[collection.name] = wb
 	}
 	defer closeHeapWriteBatches(batches)
@@ -264,12 +299,12 @@ func UpdateCollections(participants []*Collection, fn func(*DatabaseBatch) error
 		return nil
 	}
 
-	for _, collection := range ordered {
-		collection.mu.Lock()
+	for i := range batches {
+		batches[i].collection.mu.Lock()
 	}
 	defer func() {
-		for i := len(ordered) - 1; i >= 0; i-- {
-			ordered[i].mu.Unlock()
+		for i := len(batches) - 1; i >= 0; i-- {
+			batches[i].collection.mu.Unlock()
 		}
 	}()
 
@@ -322,6 +357,19 @@ func (d *Database) Update(fn func(*DatabaseBatch) error) error {
 func orderTxnParticipants(participants []*Collection) ([]*Collection, error) {
 	if len(participants) == 0 {
 		return nil, nil
+	}
+	// A lone participant is already ordered, distinct, and needs no
+	// copied slice, sort, or dedup set: the per-commit scaffolding below
+	// exists for the multi-collection case only.
+	if len(participants) == 1 {
+		only := participants[0]
+		if only == nil {
+			return nil, fmt.Errorf("%w: nil collection", ErrTxnParticipant)
+		}
+		if only.name == "" {
+			return nil, fmt.Errorf("%w: unnamed collection", ErrTxnParticipant)
+		}
+		return participants, nil
 	}
 	ordered := make([]*Collection, len(participants))
 	copy(ordered, participants)
@@ -383,7 +431,7 @@ func (c *Collection) planWriteBatchLocked(batch *WriteBatch) (heapTxnPublish, er
 		return heapTxnPublish{}, err
 	}
 	working := *state
-	free := cloneStoreIDSet(c.free)
+	free := cowStoreIDSet{src: &c.free}
 	edits := make([]heapChunkEdit, 0, len(batch.entries))
 	for _, entry := range batch.entries {
 		key := batch.key(entry)
@@ -412,7 +460,7 @@ func (c *Collection) planWriteBatchLocked(batch *WriteBatch) (heapTxnPublish, er
 		collection: c,
 		next:       &working,
 		edits:      edits,
-		free:       free,
+		free:       free.result(),
 	}, nil
 }
 
@@ -440,7 +488,7 @@ func (c *Collection) publishWriteBatchLocked(pub heapTxnPublish) {
 func planPutEntry(
 	c *Collection,
 	state *State,
-	free *storeIDSet,
+	free *cowStoreIDSet,
 	key string,
 	src []byte,
 ) (heapChunkEdit, error) {
@@ -472,10 +520,10 @@ func planPutEntry(
 		}, nil
 	}
 
-	if len(free.ids) == 0 && state.Chunks.Count == ^uint32(0) {
+	if len(free.ids()) == 0 && state.Chunks.Count == ^uint32(0) {
 		return heapChunkEdit{}, ErrTooLarge
 	}
-	chunkID, slot, old := allocateSlotFromFree(free, state)
+	chunkID, slot, old := allocateSlotFromFree(free.ids(), state)
 	var chunk *Chunk
 	var err error
 	if schema := c.options.Schema; schema != nil {
@@ -519,7 +567,7 @@ func planPutEntry(
 func planDeleteEntry(
 	c *Collection,
 	state *State,
-	free *storeIDSet,
+	free *cowStoreIDSet,
 	key string,
 ) (heapChunkEdit, bool, error) {
 	hash := maphash.String(state.seed, key)
@@ -561,11 +609,55 @@ func cloneStoreIDSet(s storeIDSet) storeIDSet {
 	return out
 }
 
-func allocateSlotFromFree(free *storeIDSet, state *State) (uint32, int, *Chunk) {
-	if len(free.ids) == 0 {
+// cowStoreIDSet defers cloning the free-chunk-ID set until the first update.
+// Overwrite-only batches never add or remove chunk IDs, so they publish with
+// zero ID bookkeeping garbage; insert/delete batches pay exactly one clone,
+// as before. Reads before the first update serve the shared source, which is
+// stable because planning holds the collection writer lock throughout.
+type cowStoreIDSet struct {
+	src   *storeIDSet
+	set   storeIDSet
+	owned bool
+}
+
+func (w *cowStoreIDSet) ids() []uint32 {
+	if w.owned {
+		return w.set.ids
+	}
+	return w.src.ids
+}
+
+func (w *cowStoreIDSet) edit() *storeIDSet {
+	if !w.owned {
+		w.set = cloneStoreIDSet(*w.src)
+		w.owned = true
+	}
+	return &w.set
+}
+
+func (w *cowStoreIDSet) add(id uint32) {
+	w.edit().add(id)
+}
+
+func (w *cowStoreIDSet) remove(id uint32) {
+	w.edit().remove(id)
+}
+
+// result returns the set to publish: the owned clone after any update, or
+// the untouched source (shared, never mutated) when the batch left free
+// space allocation alone.
+func (w *cowStoreIDSet) result() storeIDSet {
+	if w.owned {
+		return w.set
+	}
+	return *w.src
+}
+
+func allocateSlotFromFree(ids []uint32, state *State) (uint32, int, *Chunk) {
+	if len(ids) == 0 {
 		return state.Chunks.Count, 0, nil
 	}
-	id := free.ids[len(free.ids)-1]
+	id := ids[len(ids)-1]
 	chunk := state.Chunks.Get(id)
 	if chunk == nil {
 		return id, 0, nil

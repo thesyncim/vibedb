@@ -146,6 +146,27 @@ func TestUpdateCollectionsUnknownParticipant(t *testing.T) {
 	}
 }
 
+func TestUpdateCollectionsLoneParticipantCallerMutation(t *testing.T) {
+	var db Database
+	original := mustCollection(t, &db, "original")
+	participants := []*Collection{original}
+
+	err := UpdateCollections(participants, func(batch *DatabaseBatch) error {
+		participants[0] = nil
+		wb, err := batch.Collection("original")
+		if err != nil {
+			return err
+		}
+		return wb.Put("k", []byte(`{"n":1}`))
+	})
+	if err != nil {
+		t.Fatalf("UpdateCollections: %v", err)
+	}
+	if raw, ok := mustSnapshotRaw(t, original, "k"); !ok || string(raw) != `{"n":1}` {
+		t.Fatalf("original.k=%q,%v", raw, ok)
+	}
+}
+
 func TestUpdateCollectionsBatchClosedAfterReturn(t *testing.T) {
 	var db Database
 	a := mustCollection(t, &db, "a")

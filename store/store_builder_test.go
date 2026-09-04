@@ -324,8 +324,11 @@ func TestStoreBuilderSharesImmutableShapesAcrossChunks(t *testing.T) {
 	}
 	var shared *ShapeRecord
 	collection.state.Load().Chunks.Each(func(id uint32, chunk *Chunk) bool {
-		if len(chunk.Docs.mappedShapes) != 1 || len(chunk.Docs.shapes.shapes) != 0 {
-			t.Fatalf("chunk %d mapped/heap shapes = %d/%d, want 1/0", id, len(chunk.Docs.mappedShapes), len(chunk.Docs.shapes.shapes))
+		// The ingest cache is released when chunks publish: shapes live in
+		// mappedShapes and the rows' Rec pointers, never in heap tables.
+		if len(chunk.Docs.mappedShapes) != 1 || chunk.Docs.shapes != nil {
+			t.Fatalf("chunk %d mapped shapes = %d, heap cache released = %v, want 1/true",
+				id, len(chunk.Docs.mappedShapes), chunk.Docs.shapes == nil)
 		}
 		rec := chunk.Docs.mappedShapes[0]
 		if shared == nil {

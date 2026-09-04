@@ -288,7 +288,9 @@ func (s *Segment) shapeTapeCompact(index vibejson.Index) (vibejson.Index, ShapeT
 	if root.Kind() != document.Object || count == 0 {
 		return index, ShapeTapeRef{}
 	}
-	shape, ok := s.shapes.Resolve(vibejson.NodeFromEntries(index.Src, entries))
+	// Raw scratch Segments carry no cache until their first conforming
+	// document; collection chunks arrive with one from initChunkSegment.
+	shape, ok := s.ensureShapeCache().Resolve(vibejson.NodeFromEntries(index.Src, entries))
 	if !ok {
 		// Non-flat, too wide, or a layout the sighting gate has not yet
 		// compiled; the second same-layout document promotes it.
@@ -488,7 +490,14 @@ type SegmentStats struct {
 // document table and reads nothing through Doc, so it is safe to call for
 // accounting at any point between appends.
 func (s *Segment) Stats() SegmentStats {
-	st := SegmentStats{Docs: s.Len(), Shapes: len(s.shapes.shapes)}
+	// A sealed chunk's ingest cache is released, so Shapes counts the
+	// compiled records only while the segment is still filling; per-row
+	// shape identity remains available through ShapeTapeRefAt.
+	shapes := 0
+	if s.shapes != nil {
+		shapes = len(s.shapes.shapes)
+	}
+	st := SegmentStats{Docs: s.Len(), Shapes: shapes}
 	for i := 0; i < s.Len(); i++ {
 		switch r := s.ShapeTapeRefAt(i); {
 		case r.Rec == nil:
