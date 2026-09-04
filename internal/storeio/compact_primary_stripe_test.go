@@ -1394,15 +1394,15 @@ func TestCompactPrimaryScanDecoderDictionaryPlanBounds(t *testing.T) {
 			{"shape metadata", unsafe.Sizeof(compactPrimaryScanShape{}), 96},
 			{"stream view", unsafe.Sizeof(compactStreamView{}), 104},
 			{"stream plan", unsafe.Sizeof(compactPrimaryScanStream{}), 4},
-			{"scan decoder", size, 48_080},
+			{"scan decoder", size, 38_864},
 		} {
 			if pin.got != pin.want {
 				t.Fatalf("64-bit %s bytes=%d, want %d", pin.name, pin.got, pin.want)
 			}
 		}
 	}
-	if size > 47<<10 {
-		t.Fatalf("scan decoder bytes=%d exceed bounded 47 KiB footprint", size)
+	if size > 38<<10 {
+		t.Fatalf("scan decoder bytes=%d exceed bounded 38 KiB footprint", size)
 	}
 	for _, high := range []bool{false, true} {
 		rows := 4096
