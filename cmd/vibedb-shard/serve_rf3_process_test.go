@@ -605,10 +605,16 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 	if dataProbe.Kind != shardservice.ReplicatedRefusal || dataProbe.Refusal != shardservice.ReplicatedRefusalUnavailable {
 		t.Fatalf("RF4 target served public data: %+v", dataProbe)
 	}
-	observationRequest.ExpectedReplicaSetVersion = promotedState.Fence.Command.ReplicaSetVersion
-	targetObservation, err = observationClient.Observe(t.Context(), targetNode, observationRequest)
+	promotionContext, cancelPromotion := context.WithTimeout(t.Context(), 30*time.Second)
+	targetObservation, err = rf3AwaitTargetPublication(
+		promotionContext, targetObservation, observationRequest, promotedState.Fence.Command,
+		func(ctx context.Context, request replicacontrol.Request) (replicacontrol.Observation, error) {
+			return observationClient.Observe(ctx, targetNode, request)
+		},
+	)
+	cancelPromotion()
 	if err != nil {
-		t.Fatalf("observe promoted target: %v", err)
+		t.Fatalf("observe promoted target publication: %v", err)
 	}
 	binding := targetObservation.State.Binding
 	ownership, err := replicatedstate.AppendOwnershipTransition(nil, replicatedstate.OwnershipTransition{
