@@ -404,7 +404,7 @@ func TestApplyNormalBatchOnePhysicalUpdateZeroSyncAndBoundedWarmScratch(t *testi
 	t.Logf("8-command pooled workspace retained %d bytes", stable)
 }
 
-func TestApplyNormalBatchSingleParticipantTransactionsShareOnePhysicalUpdate(t *testing.T) {
+func TestApplyNormalBatchSingleTargetTransactionsShareOnePhysicalUpdate(t *testing.T) {
 	const count = 8
 	fixture := newNormalBatchFixtureWithSystemDocuments(t, count, 8, 2*count+1)
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
@@ -427,11 +427,11 @@ func TestApplyNormalBatchSingleParticipantTransactionsShareOnePhysicalUpdate(t *
 		}
 		commands[index] = transactionCompletionCommand(t, fixture.binding,
 			distributedtxn.ReplicatedCommand{
-				Role:      distributedtxn.ReplicatedRoleParticipant,
-				Operation: distributedtxn.ReplicatedApplySingleParticipant,
+				Role:      distributedtxn.ReplicatedRoleTarget,
+				Operation: distributedtxn.ReplicatedApplySingleTarget,
 				ID:        transactionCodecID(byte(80 + index)), ExpectedRevision: 1,
-				PayloadKind: distributedtxn.ReplicatedPayloadParticipantStage,
-				Participant: distributedtxn.ParticipantStage{
+				PayloadKind: distributedtxn.ReplicatedPayloadTargetStage,
+				Target: distributedtxn.TransactionTargetStage{
 					CoordinatorGroup:            distributedtxn.ID(fixture.binding.GroupID),
 					CoordinatorShardIncarnation: distributedtxn.ID(fixture.binding.ShardIncarnation),
 					CoordinatorAllocation:       fixture.binding.AllocationGeneration,

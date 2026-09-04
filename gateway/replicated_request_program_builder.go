@@ -41,7 +41,7 @@ type DurableRequestLogicalProgramBuild struct {
 	PlanningLeaseSpan       uint64
 	PlanningLeaseGeneration uint64
 	PinEpoch                uint64
-	Participants            []ReplicatedTransactionParticipant
+	Targets                 []ReplicatedTransactionTarget
 	// New SQL requests opt in. Retained programs select their original mode
 	// from the sealed protocol digest, never from a process-local default.
 	MembershipStable bool
@@ -49,7 +49,7 @@ type DurableRequestLogicalProgramBuild struct {
 
 // BuildDurableRequestLogicalProgram lowers physical catalog routes to one
 // immutable ordered logical recipe. It performs two aggregate passes: the
-// first seals all participant/protocol witnesses; the second binds those
+// first seals all target/protocol witnesses; the second binds those
 // witnesses and the ledger-home Raft group into the execution-pin digest.
 func BuildDurableRequestLogicalProgram(
 	build DurableRequestLogicalProgramBuild,
@@ -63,7 +63,7 @@ func BuildDurableRequestLogicalProgram(
 		build.CatalogGeneration == 0 || build.RecoveryDeadline <= 0 ||
 		build.PlanningLeaseSpan == 0 || build.PlanningLeaseSpan > requestledger.MaxPlanningLeaseSpan ||
 		build.PlanningLeaseGeneration == 0 ||
-		build.PinEpoch == 0 || len(build.Participants) == 0 {
+		build.PinEpoch == 0 || len(build.Targets) == 0 {
 		return DurableRequestLogicalProgram{}, ErrDurableRequest
 	}
 	home, err := requestledger.Home(build.Key.RequestKey)
@@ -75,26 +75,26 @@ func BuildDurableRequestLogicalProgram(
 		return DurableRequestLogicalProgram{}, errors.Join(err, ErrDurableRequest)
 	}
 
-	logical := make([]DurableRequestLogicalParticipant, len(build.Participants))
-	physical := make([]ReplicatedTransactionParticipant, len(build.Participants))
-	for index := range build.Participants {
-		participant := build.Participants[index]
-		if !validReplicatedRoute(participant.Route) ||
-			!distributedtxn.ValidateIntentScopes(participant.IntentScopes, participant.BucketBits) ||
-			len(participant.Batches) == 0 {
+	logical := make([]DurableRequestLogicalTarget, len(build.Targets))
+	physical := make([]ReplicatedTransactionTarget, len(build.Targets))
+	for index := range build.Targets {
+		target := build.Targets[index]
+		if !validReplicatedRoute(target.Route) ||
+			!distributedtxn.ValidateIntentScopes(target.IntentScopes, target.BucketBits) ||
+			len(target.Batches) == 0 {
 			return DurableRequestLogicalProgram{}, ErrDurableRequest
 		}
-		physical[index] = participant
-		logical[index] = DurableRequestLogicalParticipant{
-			Distribution: participant.Route.Distribution, Shard: participant.Route.Shard,
-			RangeIdentity: participant.Route.RangeIdentity, Group: participant.Route.Group,
-			SchemaGeneration:       participant.Route.Command.SchemaGeneration,
-			RelationManifestDigest: participant.Route.Command.RelationManifestDigest,
-			LineageDigest:          participant.Route.LineageDigest,
-			ForwardingRuleDigest:   participant.Route.ForwardingRuleDigest,
-			BucketBits:             participant.BucketBits,
-			IntentScopes:           slices.Clone(participant.IntentScopes),
-			Batches:                cloneRelationMutationBatches(participant.Batches),
+		physical[index] = target
+		logical[index] = DurableRequestLogicalTarget{
+			Distribution: target.Route.Distribution, Shard: target.Route.Shard,
+			RangeIdentity: target.Route.RangeIdentity, Group: target.Route.Group,
+			SchemaGeneration:       target.Route.Command.SchemaGeneration,
+			RelationManifestDigest: target.Route.Command.RelationManifestDigest,
+			LineageDigest:          target.Route.LineageDigest,
+			ForwardingRuleDigest:   target.Route.ForwardingRuleDigest,
+			BucketBits:             target.BucketBits,
+			IntentScopes:           slices.Clone(target.IntentScopes),
+			Batches:                cloneRelationMutationBatches(target.Batches),
 		}
 	}
 	order := make([]int, len(logical))
@@ -102,13 +102,13 @@ func BuildDurableRequestLogicalProgram(
 		order[index] = index
 	}
 	slices.SortFunc(order, func(left, right int) int {
-		return compareDurableRequestLogicalParticipant(logical[left], logical[right])
+		return compareDurableRequestLogicalTarget(logical[left], logical[right])
 	})
-	orderedLogical := make([]DurableRequestLogicalParticipant, len(logical))
-	orderedPhysical := make([]ReplicatedTransactionParticipant, len(physical))
+	orderedLogical := make([]DurableRequestLogicalTarget, len(logical))
+	orderedPhysical := make([]ReplicatedTransactionTarget, len(physical))
 	for index, source := range order {
 		orderedLogical[index], orderedPhysical[index] = logical[source], physical[source]
-		if index != 0 && compareDurableRequestLogicalParticipant(orderedLogical[index-1], orderedLogical[index]) >= 0 {
+		if index != 0 && compareDurableRequestLogicalTarget(orderedLogical[index-1], orderedLogical[index]) >= 0 {
 			return DurableRequestLogicalProgram{}, ErrDurableRequestConflict
 		}
 	}
@@ -121,7 +121,7 @@ func BuildDurableRequestLogicalProgram(
 		},
 		Tenant: bytes.Clone(build.Tenant), KeyDigest: replication.Digest(keyDigest),
 		RequestID:     replication.ID128(build.Key.RequestKey.Request),
-		RequestDigest: build.Key.Digest, Participants: orderedLogical,
+		RequestDigest: build.Key.Digest, Targets: orderedLogical,
 	}
 	program.Identity.ID = durableRequestTransactionID(program.KeyDigest, program.RequestDigest)
 	program.Identity.RetryHome = durableRequestRetryHome(program.KeyDigest, program.Identity.ID)
@@ -134,7 +134,7 @@ func BuildDurableRequestLogicalProgram(
 	contract.PlanBuildID = durableRequestPlanBuildID(program.KeyDigest, program.RequestDigest)
 	contract.PlanningLeaseSpan = build.PlanningLeaseSpan
 	contract.PlanningLeaseGeneration = build.PlanningLeaseGeneration
-	contract.ParticipantCount = uint64(len(program.Participants))
+	contract.TargetCount = uint64(len(program.Targets))
 	contract.CommitTransitionTag = durableRequestCommitTransitionTag
 	contract.AbortTransitionTag = durableRequestAbortTransitionTag
 	// The typed runner persists one group ID and one command, settles it, then
@@ -156,21 +156,21 @@ func BuildDurableRequestLogicalProgram(
 	contract.ResultGrammarDigest = durableRequestResultGrammarDigest()
 
 	var mutationDigester replication.TransactionMutationDigester
-	for index := range program.Participants {
-		digest, digestErr := mutationDigester.Digest(program.Participants[index].Batches)
+	for index := range program.Targets {
+		digest, digestErr := mutationDigester.Digest(program.Targets[index].Batches)
 		if digestErr != nil {
 			return DurableRequestLogicalProgram{}, digestErr
 		}
-		program.Participants[index].MutationDigest = digest
+		program.Targets[index].MutationDigest = digest
 	}
-	contract.ApplyContractDigest = durableRequestApplyContractDigest(program.Participants)
+	contract.ApplyContractDigest = durableRequestApplyContractDigest(program.Targets)
 	contract.TransactionManifestDigest = durableRequestTransactionManifestDigest(program)
 	contract.RetryHomeDerivationDigest = durableRequestRetryHomeContractDigest(program)
 	contract.ClockContractDigest = durableRequestClockContractDigest(program)
 	contract.CoordinatorIdentityDigest = durableRequestCoordinatorIdentityDigest(program)
-	contract.SchemaManifestDigest = durableRequestSchemaManifestDigest(program.Participants)
-	contract.LineageForwardingDigest = durableRequestLineageForwardingDigest(program.Participants)
-	contract.RouteSchemaCertificateDigest = durableRequestRouteCertificateDigest(program.Participants)
+	contract.SchemaManifestDigest = durableRequestSchemaManifestDigest(program.Targets)
+	contract.LineageForwardingDigest = durableRequestLineageForwardingDigest(program.Targets)
+	contract.RouteSchemaCertificateDigest = durableRequestRouteCertificateDigest(program.Targets)
 	contract.InitialStateDigest = durableRequestInitialStateDigest(program)
 	commitCursor := appendDurableDistributedState(nil, durableDistributedState{branch: durableDistributedCommitted})
 	abortCursor := appendDurableDistributedState(nil, durableDistributedState{branch: durableDistributedAborted})
@@ -187,8 +187,8 @@ func BuildDurableRequestLogicalProgram(
 		manifestCommands += uint64(segments-distributedtxn.MaxManifestSegmentsPerCommand+
 			distributedtxn.MaxManifestSegmentsPerCommand-1) / uint64(distributedtxn.MaxManifestSegmentsPerCommand)
 	}
-	contract.CommitFinalWaveCount = manifestCommands + 2*contract.ParticipantCount + 1
-	contract.AbortFinalWaveCount = manifestCommands + 3*contract.ParticipantCount + 1
+	contract.CommitFinalWaveCount = manifestCommands + 2*contract.TargetCount + 1
+	contract.AbortFinalWaveCount = manifestCommands + 3*contract.TargetCount + 1
 	contract.ProtocolProgramDigest = durableRequestProtocolProgramDigest(*contract)
 	if build.MembershipStable {
 		contract.ProtocolProgramDigest = durableRequestMembershipStableProgramDigest(*contract)
@@ -200,8 +200,8 @@ func BuildDurableRequestLogicalProgram(
 		CatalogGeneration:         program.Identity.CatalogGeneration,
 		SchemaManifestDigest:      executionpin.Digest(contract.SchemaManifestDigest),
 		TransactionManifestDigest: executionpin.Digest(contract.TransactionManifestDigest),
-		ParticipantAuthorityRoot:  executionpin.Digest(contract.LineageForwardingDigest),
-		ParticipantCount:          contract.ParticipantCount,
+		TargetAuthorityRoot:       executionpin.Digest(contract.LineageForwardingDigest),
+		TargetCount:               contract.TargetCount,
 		ExecutionContractDigest:   executionpin.Digest(contract.ProtocolProgramDigest),
 		LedgerHomeGroup:           executionpin.ID(build.Home.borrowedRoute().Group.GroupID),
 	}
@@ -231,27 +231,27 @@ func cloneRelationMutationBatches(source []replication.RelationMutationBatch) []
 	return result
 }
 
-func durableRequestManifestSegmentCount(participants []ReplicatedTransactionParticipant) (uint32, error) {
+func durableRequestManifestSegmentCount(targets []ReplicatedTransactionTarget) (uint32, error) {
 	scratch := make([]byte, distributedtxn.ManifestSegmentBytes)
 	builder, err := distributedtxn.NewManifestBuilder(scratch, func(distributedtxn.ManifestSegment) error { return nil })
 	if err != nil {
 		return 0, err
 	}
 	var digester replication.TransactionMutationDigester
-	for index := range participants {
-		participant := &participants[index]
-		digest, digestErr := digester.Digest(participant.Batches)
+	for index := range targets {
+		target := &targets[index]
+		digest, digestErr := digester.Digest(target.Batches)
 		if digestErr != nil {
 			return 0, digestErr
 		}
-		if err = builder.Append(distributedtxn.ParticipantRef{
-			Distribution:         byteview.Bytes(string(participant.Route.Distribution)),
-			Shard:                byteview.Bytes(string(participant.Route.Shard)),
-			RoutingVersion:       participant.Route.Command.RoutingVersion,
-			AllocationGeneration: participant.Route.AllocationGeneration,
-			OwnershipEpoch:       participant.Route.Command.OwnershipEpoch,
-			AuthorityWitness:     replicatedRouteAuthorityWitness(participant.Route),
-			MutationDigest:       digest, State: distributedtxn.ParticipantStaged,
+		if err = builder.Append(distributedtxn.TransactionTargetRef{
+			Distribution:         byteview.Bytes(string(target.Route.Distribution)),
+			Shard:                byteview.Bytes(string(target.Route.Shard)),
+			RoutingVersion:       target.Route.Command.RoutingVersion,
+			AllocationGeneration: target.Route.AllocationGeneration,
+			OwnershipEpoch:       target.Route.Command.OwnershipEpoch,
+			AuthorityWitness:     replicatedRouteAuthorityWitness(target.Route),
+			MutationDigest:       digest, State: distributedtxn.TargetStaged,
 		}); err != nil {
 			return 0, err
 		}
@@ -266,10 +266,10 @@ func durableRequestDomainDigest(domain []byte, program DurableRequestLogicalProg
 	_, _ = hash.Write(program.KeyDigest[:])
 	_, _ = hash.Write(program.RequestDigest[:])
 	var fixed [8]byte
-	binary.LittleEndian.PutUint64(fixed[:], uint64(len(program.Participants)))
+	binary.LittleEndian.PutUint64(fixed[:], uint64(len(program.Targets)))
 	_, _ = hash.Write(fixed[:])
-	for index := range program.Participants {
-		_, _ = hash.Write(program.Participants[index].MutationDigest[:])
+	for index := range program.Targets {
+		_, _ = hash.Write(program.Targets[index].MutationDigest[:])
 	}
 	for index := range extras {
 		_, _ = hash.Write(extras[index][:])
@@ -277,36 +277,36 @@ func durableRequestDomainDigest(domain []byte, program DurableRequestLogicalProg
 	return sumDurableRequestDigest(hash)
 }
 
-func durableRequestApplyContractDigest(participants []DurableRequestLogicalParticipant) replication.Digest {
+func durableRequestApplyContractDigest(targets []DurableRequestLogicalTarget) replication.Digest {
 	hash := sha256.New()
 	_, _ = hash.Write(durableRequestApplyContractDomain)
 	var fixed [8]byte
-	binary.LittleEndian.PutUint64(fixed[:], uint64(len(participants)))
+	binary.LittleEndian.PutUint64(fixed[:], uint64(len(targets)))
 	_, _ = hash.Write(fixed[:])
-	for index := range participants {
-		_, _ = hash.Write(participants[index].MutationDigest[:])
+	for index := range targets {
+		_, _ = hash.Write(targets[index].MutationDigest[:])
 	}
 	return sumDurableRequestDigest(hash)
 }
 
-func durableRequestRouteCertificateDigest(participants []DurableRequestLogicalParticipant) replication.Digest {
+func durableRequestRouteCertificateDigest(targets []DurableRequestLogicalTarget) replication.Digest {
 	hash := sha256.New()
 	_, _ = hash.Write(durableRequestRouteCertificateDomain)
 	var fixed [8]byte
-	binary.LittleEndian.PutUint64(fixed[:], uint64(len(participants)))
+	binary.LittleEndian.PutUint64(fixed[:], uint64(len(targets)))
 	_, _ = hash.Write(fixed[:])
-	for index := range participants {
-		participant := &participants[index]
-		_, _ = hash.Write(participant.Group.ClusterID[:])
-		_, _ = hash.Write(participant.Group.ClusterIncarnation[:])
-		binary.LittleEndian.PutUint64(fixed[:], participant.Group.TopologyRecoveryEpoch)
+	for index := range targets {
+		target := &targets[index]
+		_, _ = hash.Write(target.Group.ClusterID[:])
+		_, _ = hash.Write(target.Group.ClusterIncarnation[:])
+		binary.LittleEndian.PutUint64(fixed[:], target.Group.TopologyRecoveryEpoch)
 		_, _ = hash.Write(fixed[:])
-		_, _ = hash.Write(participant.Group.ShardIncarnation[:])
-		_, _ = hash.Write(participant.Group.GroupID[:])
-		_, _ = hash.Write(participant.RangeIdentity[:])
-		binary.LittleEndian.PutUint64(fixed[:], participant.SchemaGeneration)
+		_, _ = hash.Write(target.Group.ShardIncarnation[:])
+		_, _ = hash.Write(target.Group.GroupID[:])
+		_, _ = hash.Write(target.RangeIdentity[:])
+		binary.LittleEndian.PutUint64(fixed[:], target.SchemaGeneration)
 		_, _ = hash.Write(fixed[:])
-		_, _ = hash.Write(participant.RelationManifestDigest[:])
+		_, _ = hash.Write(target.RelationManifestDigest[:])
 	}
 	return sumDurableRequestDigest(hash)
 }

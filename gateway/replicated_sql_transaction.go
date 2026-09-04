@@ -50,14 +50,14 @@ type replicatedSQLBoundStatement struct {
 	updateExec       query.Exec
 }
 
-type replicatedSQLParticipantBuilder struct {
-	participant ReplicatedTransactionParticipant
+type replicatedSQLTargetBuilder struct {
+	target ReplicatedTransactionTarget
 }
 
 type replicatedSQLMutationIdentity struct {
-	participant int
-	relation    replication.RelationID
-	key         []byte
+	target   int
+	relation replication.RelationID
+	key      []byte
 }
 
 // replicatedSQLTransactionRequestDigest binds a request ID to the exact caller
@@ -121,7 +121,7 @@ func (executor *Executor) planReplicatedSQLTransaction(
 	snapshot *Snapshot,
 	queries []Query,
 	profile Profile,
-) ([]ReplicatedTransactionParticipant, bool, error) {
+) ([]ReplicatedTransactionTarget, bool, error) {
 	return executor.planReplicatedSQLTransactionWithData(ctx, snapshot, queries, profile, nil)
 }
 
@@ -131,7 +131,7 @@ func (executor *Executor) planReplicatedSQLTransactionWithData(
 	queries []Query,
 	profile Profile,
 	data *ReplicatedExecutor,
-) ([]ReplicatedTransactionParticipant, bool, error) {
+) ([]ReplicatedTransactionTarget, bool, error) {
 	if executor == nil || snapshot == nil ||
 		len(queries) == 0 {
 		return nil, false, nil
@@ -269,7 +269,7 @@ func (executor *Executor) planReplicatedSQLTransactionWithData(
 		baseMutationCount += count
 	}
 
-	builders := make([]replicatedSQLParticipantBuilder, 0, min(baseMutationCount, 8))
+	builders := make([]replicatedSQLTargetBuilder, 0, min(baseMutationCount, 8))
 	identities := make([]replicatedSQLMutationIdentity, 0, min(baseMutationCount, 256))
 	keyArena := make([]byte, 0, min(baseMutationCount, 256)*32)
 	var byGroup map[raftmember.GroupKey]int
@@ -439,7 +439,7 @@ func (executor *Executor) planReplicatedSQLTransactionWithData(
 				baseMutation.ExpectedValueDigest = replication.Digest(sha256.Sum256(oldDocument))
 				baseMutation.Kind = replication.MutationPutDigestEqual
 			}
-			participantIndex, appendErr := appendReplicatedSQLMutation(
+			targetIndex, appendErr := appendReplicatedSQLMutation(
 				&builders, &byGroup, resolved.Route, bits,
 				distributedtxn.IntentScope{Start: uint32(bucket), End: uint32(bucket) + 1},
 				statement.profile.Relation, baseMutation,
@@ -453,7 +453,7 @@ func (executor *Executor) planReplicatedSQLTransactionWithData(
 				return nil, true, err
 			}
 			identities = append(identities, replicatedSQLMutationIdentity{
-				participant: participantIndex, relation: statement.profile.Relation, key: ownedKey,
+				target: targetIndex, relation: statement.profile.Relation, key: ownedKey,
 			})
 
 			indexEnd := len(statement.bound.globalIndexes)
@@ -508,7 +508,7 @@ func (executor *Executor) planReplicatedSQLTransactionWithData(
 					indexMutation.ExpectedValueDigest == (replication.Digest{}) {
 					return nil, true, ErrReplicatedSQLTransactionUnsupported
 				}
-				indexParticipant, indexErr := appendReplicatedSQLMutation(
+				indexTarget, indexErr := appendReplicatedSQLMutation(
 					&builders, &byGroup, indexRoute, index.bucketBits, index.scope,
 					indexProfile.Relation, indexMutation,
 				)
@@ -521,15 +521,15 @@ func (executor *Executor) planReplicatedSQLTransactionWithData(
 					return nil, true, err
 				}
 				identities = append(identities, replicatedSQLMutationIdentity{
-					participant: indexParticipant, relation: indexProfile.Relation, key: entryKey,
+					target: indexTarget, relation: indexProfile.Relation, key: entryKey,
 				})
 			}
 		}
 	}
 
 	slices.SortFunc(identities, func(left, right replicatedSQLMutationIdentity) int {
-		if left.participant != right.participant {
-			return left.participant - right.participant
+		if left.target != right.target {
+			return left.target - right.target
 		}
 		if left.relation < right.relation {
 			return -1
@@ -541,28 +541,28 @@ func (executor *Executor) planReplicatedSQLTransactionWithData(
 	})
 	for index := 1; index < len(identities); index++ {
 		prior, current := identities[index-1], identities[index]
-		if prior.participant == current.participant && prior.relation == current.relation &&
+		if prior.target == current.target && prior.relation == current.relation &&
 			bytes.Equal(prior.key, current.key) {
 			return nil, true, ErrReplicatedSQLTransactionDuplicate
 		}
 	}
 
-	participants := make([]ReplicatedTransactionParticipant, len(builders))
+	targets := make([]ReplicatedTransactionTarget, len(builders))
 	for index := range builders {
-		participant := builders[index].participant
-		slices.SortFunc(participant.Batches, func(
+		target := builders[index].target
+		slices.SortFunc(target.Batches, func(
 			left, right replication.RelationMutationBatch,
 		) int {
 			return int(left.Relation) - int(right.Relation)
 		})
-		participant.IntentScopes = coalesceIntentScopes(participant.IntentScopes)
-		if len(participant.IntentScopes) == 0 ||
-			len(participant.IntentScopes) > distributedtxn.MaxIntentScopes {
+		target.IntentScopes = coalesceIntentScopes(target.IntentScopes)
+		if len(target.IntentScopes) == 0 ||
+			len(target.IntentScopes) > distributedtxn.MaxIntentScopes {
 			return nil, true, ErrReplicatedSQLTransactionUnsupported
 		}
-		participants[index] = participant
+		targets[index] = target
 	}
-	return participants, true, nil
+	return targets, true, nil
 }
 
 func replicatedSQLConflictActionPosition(insert *sqlast.InsertStmt) int {
@@ -791,7 +791,7 @@ func (snapshot *Snapshot) resolveReplicatedSQLGlobalIndex(
 }
 
 func appendReplicatedSQLMutation(
-	builders *[]replicatedSQLParticipantBuilder,
+	builders *[]replicatedSQLTargetBuilder,
 	byGroup *map[raftmember.GroupKey]int,
 	route ReplicatedRoute,
 	bucketBits uint8,
@@ -803,33 +803,33 @@ func appendReplicatedSQLMutation(
 		!distributedtxn.ValidateIntentScopes([]distributedtxn.IntentScope{scope}, bucketBits) {
 		return -1, ErrReplicatedSQLTransactionUnsupported
 	}
-	participantIndex := replicatedSQLParticipantIndex(*builders, *byGroup, route.Group)
-	if participantIndex < 0 {
+	targetIndex := replicatedSQLTargetIndex(*builders, *byGroup, route.Group)
+	if targetIndex < 0 {
 		replicas := make([]ReplicatedEndpoint, len(route.Replicas))
 		copy(replicas, route.Replicas)
 		route.Replicas = replicas
-		*builders = append(*builders, replicatedSQLParticipantBuilder{
-			participant: ReplicatedTransactionParticipant{
+		*builders = append(*builders, replicatedSQLTargetBuilder{
+			target: ReplicatedTransactionTarget{
 				Route: route, BucketBits: bucketBits,
 			},
 		})
-		participantIndex = len(*builders) - 1
+		targetIndex = len(*builders) - 1
 		if *byGroup != nil {
-			(*byGroup)[route.Group] = participantIndex
+			(*byGroup)[route.Group] = targetIndex
 		} else if len(*builders) == 16 {
 			index := make(map[raftmember.GroupKey]int, len(*builders))
 			for builderIndex := range *builders {
-				index[(*builders)[builderIndex].participant.Route.Group] = builderIndex
+				index[(*builders)[builderIndex].target.Route.Group] = builderIndex
 			}
 			*byGroup = index
 		}
 	} else if !sameReplicatedSQLRoute(
-		(*builders)[participantIndex].participant.Route, route,
-	) || (*builders)[participantIndex].participant.BucketBits != bucketBits {
+		(*builders)[targetIndex].target.Route, route,
+	) || (*builders)[targetIndex].target.BucketBits != bucketBits {
 		return -1, ErrReplicatedSQLTransactionUnsupported
 	}
 
-	builder := &(*builders)[participantIndex].participant
+	builder := &(*builders)[targetIndex].target
 	batchIndex := replicatedSQLRelationBatch(builder.Batches, relation)
 	if batchIndex < 0 {
 		if len(builder.Batches) == replication.MaxRelationBatches {
@@ -846,7 +846,7 @@ func appendReplicatedSQLMutation(
 	}
 	batch.Mutations = append(batch.Mutations, mutation)
 	builder.IntentScopes = append(builder.IntentScopes, scope)
-	return participantIndex, nil
+	return targetIndex, nil
 }
 
 func admitReplicatedSQLMutation(
@@ -1010,8 +1010,8 @@ func replicatedSQLDocumentPrimaryScalar(
 	}
 }
 
-func replicatedSQLParticipantIndex(
-	builders []replicatedSQLParticipantBuilder,
+func replicatedSQLTargetIndex(
+	builders []replicatedSQLTargetBuilder,
 	byGroup map[raftmember.GroupKey]int,
 	group raftmember.GroupKey,
 ) int {
@@ -1022,7 +1022,7 @@ func replicatedSQLParticipantIndex(
 		return -1
 	}
 	for index := range builders {
-		if builders[index].participant.Route.Group == group {
+		if builders[index].target.Route.Group == group {
 			return index
 		}
 	}

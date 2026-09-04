@@ -13,7 +13,7 @@ import (
 )
 
 func TestServerJournalCompactorReclaimsRecommendedGeneration(t *testing.T) {
-	const participantCount = 50_000
+	const targetCount = 50_000
 	var pages [][]byte
 	builder, err := distributedtxn.NewManifestBuilder(
 		make([]byte, distributedtxn.ManifestSegmentBytes),
@@ -25,17 +25,17 @@ func TestServerJournalCompactorReclaimsRecommendedGeneration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for index := uint64(0); index < participantCount; index++ {
+	for index := uint64(0); index < targetCount; index++ {
 		var digest distributedtxn.Digest
 		binary.LittleEndian.PutUint64(digest[:8], index+1)
 		for at := 8; at < len(digest); at++ {
 			digest[at] = byte(at)
 		}
-		if err = builder.Append(distributedtxn.ParticipantRef{
+		if err = builder.Append(distributedtxn.TransactionTargetRef{
 			Distribution: []byte("docs"), Shard: []byte(fmt.Sprintf("%016x", index)),
 			RoutingVersion: 7, AllocationGeneration: 11, OwnershipEpoch: 13,
 			AuthorityWitness: distributedtxn.AuthorityWitness(digest[:16]),
-			MutationDigest:   digest, State: distributedtxn.ParticipantStaged,
+			MutationDigest:   digest, State: distributedtxn.TargetStaged,
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -60,10 +60,10 @@ func TestServerJournalCompactorReclaimsRecommendedGeneration(t *testing.T) {
 	if _, err = journal.StageManifestCoordinator(raw); err != nil {
 		t.Fatal(err)
 	}
-	participants := make([]distributedtxn.ParticipantRef, distributedtxn.MaxManifestPageParticipants)
-	identities := make([]byte, distributedtxn.MaxManifestPageParticipants*distributedtxn.MaxShardIdentityBytes*2)
+	targets := make([]distributedtxn.TransactionTargetRef, distributedtxn.MaxManifestPageTargets)
+	identities := make([]byte, distributedtxn.MaxManifestPageTargets*distributedtxn.MaxShardIdentityBytes*2)
 	for _, page := range pages {
-		if _, err = journal.StageManifestSegment(id, page, participants, identities); err != nil {
+		if _, err = journal.StageManifestSegment(id, page, targets, identities); err != nil {
 			t.Fatal(err)
 		}
 	}

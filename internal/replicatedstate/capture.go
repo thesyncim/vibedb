@@ -116,7 +116,7 @@ type TransitionCapture interface {
 	Target() TransitionCaptureTarget
 	// Begin creates or recovers the capture header. An empty target must publish
 	// exactly one header through publish; a non-empty target must recover without
-	// calling it. Machine supplies the only mutation authority, so a participant
+	// calling it. Machine supplies the only mutation authority, so a target
 	// reserved by a CheckpointGroup never escapes through Collection.Update.
 	Begin(State, func(key, value []byte) error) error
 	MaxEncodedBytes(TransitionCaptureBounds) (int, error)

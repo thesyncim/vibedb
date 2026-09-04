@@ -163,7 +163,7 @@ func TestAcknowledgedExecutionPinJournalCleanupUsesExactFullPinIdentity(t *testi
 		RequestKeyDigest: executionpin.Digest{1}, RequestDigest: executionpin.Digest{2},
 		CatalogGeneration: 3, SchemaManifestDigest: executionpin.Digest{4},
 		TransactionManifestDigest: executionpin.Digest{5},
-		ParticipantAuthorityRoot:  executionpin.Digest{6}, ParticipantCount: 1,
+		TargetAuthorityRoot:       executionpin.Digest{6}, TargetCount: 1,
 		ExecutionContractDigest: executionpin.Digest{7}, LedgerHomeGroup: executionpin.ID{8},
 	}
 	bindingDigest, err := executionpin.BindingDigest(binding)
@@ -186,7 +186,7 @@ func TestAcknowledgedExecutionPinJournalCleanupUsesExactFullPinIdentity(t *testi
 	factory := &JournaledDurableRequestExecutionPinSessionFactory{
 		directory: directory, principal: principal,
 	}
-	route := durableFaultParticipants(t)[0].Route
+	route := durableFaultTargets(t)[0].Route
 	if err = factory.RetireAcknowledgedExecutionPinSession(
 		t.Context(), pin, route, replication.Digest{10},
 	); err != nil {

@@ -31,7 +31,7 @@ func TestTxnLogRejectedMemberDoesNotContaminateRegistry(t *testing.T) {
 				}
 				return stale
 			},
-			wantInvalid: ErrTxnParticipant,
+			wantInvalid: ErrTxnCollection,
 		},
 	}
 	for _, tc := range tests {

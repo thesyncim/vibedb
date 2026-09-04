@@ -112,7 +112,7 @@ type RouteAuthority struct {
 var routeAuthorityDigestDomain = []byte("vibedb/gateway/replicated-route-id\x00")
 
 // RouteAuthorityDigest returns the canonical allocation-free identity used to
-// bind distributed-transaction participant references to one exact route
+// bind distributed-transaction target references to one exact route
 // authority. Field order and domain are intentionally stable and match the
 // sole unreleased gateway route identity grammar.
 func RouteAuthorityDigest(authority RouteAuthority) Digest {
@@ -247,7 +247,7 @@ const (
 	// lease deadline. ExpectedDeadlineUnixNano fences delayed revocations.
 	CommandSessionRevoke
 	// CommandTransaction applies one canonical distributed transaction control
-	// transition. Only participant staging carries native relation batches.
+	// transition. Only target staging carries native relation batches.
 	CommandTransaction
 	// CommandRequestLedger applies one hidden, durable cross-shard request
 	// lifecycle transition. Its byte-native body is interpreted by the request

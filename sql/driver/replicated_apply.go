@@ -33,7 +33,7 @@ import (
 const (
 	// ReplicatedApplyFormat is the current catalog-owned hidden apply-store
 	// profile. It is deliberately separate from the public SQL table catalog:
-	// the hidden collection is a state-machine participant, never a SQL relation.
+	// the hidden collection is a state-machine target, never a SQL relation.
 	ReplicatedApplyFormat uint16 = 0
 
 	// ReplicatedPlacementProfileFormat is the current exact key-to-shard
@@ -90,7 +90,7 @@ type ReplicatedApplyOptions struct {
 }
 
 // ReplicatedApplyIdentity is the complete retained identity of the private
-// state-machine participant. Storage is random local namespace identity; the
+// state-machine target. Storage is random local namespace identity; the
 // remaining fields freeze the portable validation and bounded apply profile.
 // Exact restart must retain this value separately from the base SQL/WAL binding.
 type ReplicatedApplyIdentity struct {
@@ -531,7 +531,7 @@ func validateReplicatedApplyCollection(
 
 // OpenReplicatedApply creates or acquires the sole trusted apply claim over an
 // exactly bound root. First activation requires an empty user collection and
-// publishes the hidden system participant before its catalog descriptor. The
+// publishes the hidden system target before its catalog descriptor. The
 // returned identity must be retained for exact restart. If catalog publication
 // is indeterminate, the identity is returned with the error and no claim; an
 // exact same-handle retry or the settlement open resolves the outcome.
@@ -948,8 +948,8 @@ func (v replicatedGlobalIndexMutationValidator) GlobalIndexPlacementRange() dist
 	return v.placement
 }
 
-// prepareReplicatedApplyStorageLocked makes the hidden participant and its
-// descriptor durable, or validates the exact already-published participant.
+// prepareReplicatedApplyStorageLocked makes the hidden target and its
+// descriptor durable, or validates the exact already-published target.
 // The caller owns database.mu and is responsible for deciding whether a
 // non-empty user collection is legal before calling this common publication
 // boundary.
@@ -1567,7 +1567,7 @@ func (a *ReplicatedApply) ClaimRuntimeOwnership(database *Database) error {
 }
 
 // Close releases the singleton apply claim and its connector lifetime
-// reference. It does not unbind or remove the durable hidden participant. A
+// reference. It does not unbind or remove the durable hidden target. A
 // pending WAL-generation selection retires the connector before releasing the
 // claim: only a complete root close/reopen may reconstruct that durable fence,
 // so the same Database can never mint an unfenced replacement claim.
@@ -1630,7 +1630,7 @@ func (a *ReplicatedApply) Applied() uint64 {
 }
 
 // BeginRangeSplitCapture installs or recovers the exact source transition log
-// in the capture participant reserved at first apply activation. The database
+// in the capture target reserved at first apply activation. The database
 // lock orders this cold control operation before subsequent committed apply.
 func (a *ReplicatedApply) BeginRangeSplitCapture(
 	partitioner *rangesplit.Partitioner,
@@ -1887,7 +1887,7 @@ func (a *ReplicatedApply) SchemaApplyContractDigest() ([sha256.Size]byte, error)
 }
 
 // RangeSplitCaptureCount is an O(1) recovery guard for a persisted capture
-// descriptor. Zero proves that no matching capture participant exists locally.
+// descriptor. Zero proves that no matching capture target exists locally.
 func (a *ReplicatedApply) RangeSplitCaptureCount() (uint64, error) {
 	if a == nil || a.database == nil {
 		return 0, ErrReplicatedApplyClosed
@@ -2289,7 +2289,7 @@ func (a *ReplicatedApply) DurabilityStats() (durable.CheckpointGroupStats, error
 
 // ReplicatedApplyResourceStats is one detached, fixed-space storage snapshot
 // for a serving replicated bundle. Relations are dense in authenticated
-// relation-ID order. The hidden system and split-capture participants are
+// relation-ID order. The hidden system and split-capture targets are
 // reported separately so benchmark tooling can account for every physical
 // byte without acquiring a collection or database capability.
 type ReplicatedApplyResourceStats struct {

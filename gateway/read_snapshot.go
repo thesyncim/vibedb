@@ -35,7 +35,7 @@ func (e *Executor) snapshotFanout(ctx context.Context, plan *plan, profile Profi
 }
 
 // acquireReadFences uses an all-or-nothing try/release loop. This avoids a
-// distributed lock cycle when a transaction participant and a reader each win
+// distributed lock cycle when a transaction target and a reader each win
 // admission on a different shard. Every retry gets a fresh identity so a late
 // release from an uncertain prior attempt cannot tear down the new cut.
 func (e *Executor) acquireReadFences(

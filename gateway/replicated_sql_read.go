@@ -27,7 +27,7 @@ var (
 )
 
 // ReplicatedSQLBatchReadRequest is an ordered set of exact-primary-key SELECT
-// statements. There is no participant-count ceiling: the packed request,
+// statements. There is no target-count ceiling: the packed request,
 // result, and uint32 ordinal representation are the admission bounds.
 type ReplicatedSQLBatchReadRequest struct {
 	Queries        []Query

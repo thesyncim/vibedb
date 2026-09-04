@@ -42,8 +42,8 @@ func stageManifestForHardening(
 
 func TestJournalManifestLargePageIndexesFailClosed(t *testing.T) {
 	descriptor, pages := buildManifest(t, 1)
-	participants := make([]ParticipantRef, MaxManifestPageParticipants)
-	identities := make([]byte, MaxManifestPageParticipants*MaxShardIdentityBytes*2)
+	targets := make([]TransactionTargetRef, MaxManifestPageTargets)
+	identities := make([]byte, MaxManifestPageTargets*MaxShardIdentityBytes*2)
 
 	for _, index := range []uint32{1 << 31, math.MaxUint32} {
 		t.Run(stringIndex(index), func(t *testing.T) {
@@ -55,11 +55,11 @@ func TestJournalManifestLargePageIndexesFailClosed(t *testing.T) {
 			id := journalID(byte(index >> 24))
 			stageManifestForHardening(t, j, id, descriptor)
 			mutated := manifestPageIndex(t, pages[0], index)
-			if _, err := j.StageManifestSegment(id, mutated, participants, identities); !errors.Is(err, ErrJournalConflict) {
+			if _, err := j.StageManifestSegment(id, mutated, targets, identities); !errors.Is(err, ErrJournalConflict) {
 				t.Fatalf("StageManifestSegment index %#x = %v", index, err)
 			}
 
-			page, err := OpenManifestSegment(mutated, participants, identities)
+			page, err := OpenManifestSegment(mutated, targets, identities)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -68,7 +68,7 @@ func TestJournalManifestLargePageIndexesFailClosed(t *testing.T) {
 			}
 
 			j.manifests[id].segments = append(j.manifests[id].segments, pages[0])
-			if _, err := j.ManifestPage(id, index, participants, identities); !errors.Is(err, ErrJournalNotFound) {
+			if _, err := j.ManifestPage(id, index, targets, identities); !errors.Is(err, ErrJournalNotFound) {
 				t.Fatalf("ManifestPage index %#x = %v", index, err)
 			}
 		})
@@ -89,8 +89,8 @@ func TestJournalRetiredManifestReclaimsPagesAcrossReplay(t *testing.T) {
 	descriptor, pages := buildManifest(t, 4097)
 	path := filepath.Join(t.TempDir(), "transactions.vtj")
 	id := journalID(201)
-	participants := make([]ParticipantRef, MaxManifestPageParticipants)
-	identities := make([]byte, MaxManifestPageParticipants*MaxShardIdentityBytes*2)
+	targets := make([]TransactionTargetRef, MaxManifestPageTargets)
+	identities := make([]byte, MaxManifestPageTargets*MaxShardIdentityBytes*2)
 
 	j, err := OpenJournal(path)
 	if err != nil {
@@ -99,7 +99,7 @@ func TestJournalRetiredManifestReclaimsPagesAcrossReplay(t *testing.T) {
 	stageManifestForHardening(t, j, id, descriptor)
 	var retained uint64
 	for _, raw := range pages {
-		if _, err := j.StageManifestSegment(id, raw, participants, identities); err != nil {
+		if _, err := j.StageManifestSegment(id, raw, targets, identities); err != nil {
 			t.Fatal(err)
 		}
 		retained += uint64(len(raw))
@@ -107,7 +107,7 @@ func TestJournalRetiredManifestReclaimsPagesAcrossReplay(t *testing.T) {
 	if j.manifestBytes != retained {
 		t.Fatalf("manifest bytes = %d, want %d", j.manifestBytes, retained)
 	}
-	if _, err := j.StageManifestSegment(id, pages[len(pages)-1], participants, identities); err != nil {
+	if _, err := j.StageManifestSegment(id, pages[len(pages)-1], targets, identities); err != nil {
 		t.Fatalf("idempotent final page: %v", err)
 	}
 	if j.manifestBytes != retained {
@@ -126,7 +126,7 @@ func TestJournalRetiredManifestReclaimsPagesAcrossReplay(t *testing.T) {
 	if status, ok := j.CoordinatorStatus(id); !ok || status != retired {
 		t.Fatalf("retired tombstone = %+v,%v", status, ok)
 	}
-	if _, err := j.ManifestPage(id, 0, participants, identities); !errors.Is(err, ErrJournalNotFound) {
+	if _, err := j.ManifestPage(id, 0, targets, identities); !errors.Is(err, ErrJournalNotFound) {
 		t.Fatalf("retired ManifestPage = %v", err)
 	}
 	if err := j.Close(); err != nil {
@@ -159,10 +159,10 @@ func TestJournalByteAdmissionsAreFiniteAndNonMutating(t *testing.T) {
 	defer j.Close()
 	id := journalID(211)
 	stageManifestForHardening(t, j, id, descriptor)
-	participants := make([]ParticipantRef, MaxManifestPageParticipants)
-	identities := make([]byte, MaxManifestPageParticipants*MaxShardIdentityBytes*2)
+	targets := make([]TransactionTargetRef, MaxManifestPageTargets)
+	identities := make([]byte, MaxManifestPageTargets*MaxShardIdentityBytes*2)
 	j.manifestBytes = MaxActiveManifestBytes
-	if _, err := j.StageManifestSegment(id, pages[0], participants, identities); !errors.Is(err, ErrTooLarge) {
+	if _, err := j.StageManifestSegment(id, pages[0], targets, identities); !errors.Is(err, ErrTooLarge) {
 		t.Fatalf("active manifest admission = %v", err)
 	}
 	if len(j.manifests[id].segments) != 0 || j.manifestBytes != MaxActiveManifestBytes {
@@ -195,9 +195,9 @@ func TestJournalControlReserveCompletesCleanupAtAdmissionEdge(t *testing.T) {
 	defer j.Close()
 	id := journalID(221)
 	stageManifestForHardening(t, j, id, descriptor)
-	participants := make([]ParticipantRef, MaxManifestPageParticipants)
-	identities := make([]byte, MaxManifestPageParticipants*MaxShardIdentityBytes*2)
-	if _, err := j.StageManifestSegment(id, pages[0], participants, identities); err != nil {
+	targets := make([]TransactionTargetRef, MaxManifestPageTargets)
+	identities := make([]byte, MaxManifestPageTargets*MaxShardIdentityBytes*2)
+	if _, err := j.StageManifestSegment(id, pages[0], targets, identities); err != nil {
 		t.Fatal(err)
 	}
 	usage := j.Usage()
@@ -210,7 +210,7 @@ func TestJournalControlReserveCompletesCleanupAtAdmissionEdge(t *testing.T) {
 	// needed for abort plus retirement. Another page must be refused without
 	// consuming that control reserve.
 	j.retainedBytes = MaxRetainedJournalBytes - j.controlReserve
-	if _, err := j.StageManifestSegment(id, pages[1], participants, identities); !errors.Is(err, ErrTooLarge) {
+	if _, err := j.StageManifestSegment(id, pages[1], targets, identities); !errors.Is(err, ErrTooLarge) {
 		t.Fatalf("page at reserved edge = %v", err)
 	}
 	if j.controlReserve != wantReserve || j.manifestBytes != uint64(len(pages[0])) {

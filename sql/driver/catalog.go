@@ -244,7 +244,7 @@ type database struct {
 	// durable ShardStoreFence before the pointer is installed.
 	servingClaim *ShardStoreServingClaim
 	// replicatedApplyCollection is the catalog-owned, non-SQL-visible system
-	// participant paired atomically with the sole replicated user table. It is
+	// target paired atomically with the sole replicated user table. It is
 	// opened through txnDecisions and closed before txnLog, exactly like catalog
 	// tables, but never enters the SQL namespace or layout epoch.
 	replicatedApplyFile         *os.File
@@ -256,7 +256,7 @@ type database struct {
 	// while a certified split child is received and converted in place into
 	// replicated apply. It is never a SQL or serving capability.
 	replicatedChildStageClaim *ReplicatedChildStage
-	// replicatedSnapshotStageClaim exclusively owns the hidden participant and
+	// replicatedSnapshotStageClaim exclusively owns the hidden target and
 	// sole user relation while a certified RF learner snapshot is materialized.
 	// It grants neither SQL sessions nor serving authority.
 	replicatedSnapshotStageClaim *ReplicatedSnapshotStage
@@ -273,7 +273,7 @@ type database struct {
 	schemaAuthorization       [32]byte
 	schemaCatalogCAS          [32]byte
 	schemaSourceRecovery      *replicatedstate.SchemaSourceRecoveryProof
-	// distributedTxnCollection is the raw-ID keyed, SQL-invisible participant
+	// distributedTxnCollection is the raw-ID keyed, SQL-invisible target
 	// state joined atomically with user-table publication. The larger staged
 	// mutation remains in the append-only transaction journal.
 	distributedTxnFile       *os.File

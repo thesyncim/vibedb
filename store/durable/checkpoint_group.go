@@ -193,7 +193,7 @@ func checkpointGroupSeedProfile(seed CheckpointGroupSeed) (
 }
 
 // CheckpointGroupStats is a detached counter snapshot. BarrierSyncs counts the
-// K participant-journal Syncs plus the one certificate Sync used by ordinary
+// K target-journal Syncs plus the one certificate Sync used by ordinary
 // checkpoints. MarkerSyncs counts only exceptional marker recycling; the
 // marker is not commit authority and is never synced by the normal barrier.
 // A normal transition leaves every Sync counter unchanged.
@@ -362,20 +362,20 @@ func (workspace *checkpointGroupBatchWorkspace) prepare(
 			return nil, ErrCollectionName
 		}
 		if member.Collection == nil {
-			return nil, fmt.Errorf("%w: nil collection %q", ErrTxnParticipant, member.Name)
+			return nil, fmt.Errorf("%w: nil collection %q", ErrTxnCollection, member.Name)
 		}
 		if member.BatchDocumentsHint < 0 ||
 			member.BatchDocumentsHint > member.Collection.options.MaxBatchDocuments {
 			return nil, fmt.Errorf(
 				"%w: collection %q batch hint %d exceeds [0,%d]",
-				ErrTxnParticipant, member.Name, member.BatchDocumentsHint,
+				ErrTxnCollection, member.Name, member.BatchDocumentsHint,
 				member.Collection.options.MaxBatchDocuments,
 			)
 		}
 		for prior := range index {
 			if members[prior].Name == member.Name {
 				return nil, fmt.Errorf(
-					"%w: duplicate name %q", ErrTxnParticipant, member.Name,
+					"%w: duplicate name %q", ErrTxnCollection, member.Name,
 				)
 			}
 			if members[prior].Collection == member.Collection {
@@ -512,7 +512,7 @@ func (l *TxnLog) ResetDischargedForCheckpointGroupActivation() error {
 	registered := l.registeredCollections()
 	for _, collection := range registered {
 		if collection == nil {
-			return fmt.Errorf("%w: nil registered collection", ErrTxnParticipant)
+			return fmt.Errorf("%w: nil registered collection", ErrTxnCollection)
 		}
 	}
 	sortCollectionSnapshotOrder(registered)
@@ -1003,7 +1003,7 @@ func claimCheckpointGroupCatalogLocked(
 			log.regMu.Unlock()
 			return fmt.Errorf(
 				"%w: registered collection outside fixed checkpoint membership",
-				ErrTxnParticipant,
+				ErrTxnCollection,
 			)
 		}
 	}
@@ -1045,7 +1045,7 @@ func validateCheckpointGroupDirectoryMembership(
 				return infoErr
 			}
 			if !info.Mode().IsRegular() {
-				return fmt.Errorf("%w: checkpoint member entry %q is not regular", ErrTxnParticipant, name)
+				return fmt.Errorf("%w: checkpoint member entry %q is not regular", ErrTxnCollection, name)
 			}
 			seen[name] = struct{}{}
 			continue
@@ -1055,7 +1055,7 @@ func validateCheckpointGroupDirectoryMembership(
 			strings.HasSuffix(lower, collectionname.JournalSuffix) {
 			return fmt.Errorf(
 				"%w: unowned collection entry %q outside fixed checkpoint membership",
-				ErrTxnParticipant, name,
+				ErrTxnCollection, name,
 			)
 		}
 		info, infoErr := entry.Info()
@@ -1078,12 +1078,12 @@ func validateCheckpointGroupDirectoryMembership(
 		if discoverErr == nil || errors.Is(discoverErr, storeio.ErrSuperblockConflict) {
 			return fmt.Errorf(
 				"%w: unowned format-0 collection %q outside fixed checkpoint membership",
-				ErrTxnParticipant, name,
+				ErrTxnCollection, name,
 			)
 		}
 	}
 	if len(seen) != len(allowed) {
-		return fmt.Errorf("%w: fixed checkpoint member entry is missing", ErrTxnParticipant)
+		return fmt.Errorf("%w: fixed checkpoint member entry is missing", ErrTxnCollection)
 	}
 	return nil
 }
@@ -1108,14 +1108,14 @@ func terminalFenceCheckpointGroupActivationLocked(
 
 func checkpointGroupMembers(members []NamedCollection) ([]checkpointGroupMember, error) {
 	if len(members) == 0 || len(members) > checkpointGroupMaxMembers {
-		return nil, fmt.Errorf("%w: fixed membership size %d", ErrTxnParticipant, len(members))
+		return nil, fmt.Errorf("%w: fixed membership size %d", ErrTxnCollection, len(members))
 	}
 	validated, err := validateTxnMembers(members)
 	if err != nil {
 		return nil, err
 	}
 	if len(validated) == 0 || len(validated) > checkpointGroupMaxMembers {
-		return nil, fmt.Errorf("%w: fixed membership size %d", ErrTxnParticipant, len(validated))
+		return nil, fmt.Errorf("%w: fixed membership size %d", ErrTxnCollection, len(validated))
 	}
 	slices.SortFunc(validated, func(a, b NamedCollection) int {
 		return strings.Compare(a.Name, b.Name)
@@ -1391,13 +1391,13 @@ func (g *CheckpointGroup) qualifyLog(log *TxnLog) error {
 	log.regMu.Lock()
 	if len(log.registered) != len(g.members) {
 		log.regMu.Unlock()
-		return fmt.Errorf("%w: fixed checkpoint registration count", ErrTxnParticipant)
+		return fmt.Errorf("%w: fixed checkpoint registration count", ErrTxnCollection)
 	}
 	for _, member := range g.members {
 		if _, ok := log.registered[member.collection]; !ok ||
 			member.collection.checkpointGroup.Load() != g {
 			log.regMu.Unlock()
-			return fmt.Errorf("%w: fixed checkpoint member %q", ErrTxnParticipant, member.name)
+			return fmt.Errorf("%w: fixed checkpoint member %q", ErrTxnCollection, member.name)
 		}
 	}
 	log.regMu.Unlock()
@@ -1417,7 +1417,7 @@ func (g *CheckpointGroup) AppliedIndex() uint64 {
 
 // CheckpointAppliedIndex is the certificate-backed contiguous apply cut. It
 // moves immediately after the authenticated certificate Sync, even if a later
-// physical fold must be retried; the synced participant journals and decision
+// physical fold must be retried; the synced target journals and decision
 // prefix already make that cut replayable. WAL deletion requires additional
 // Raft term, configuration, lineage, witness, and retained-suffix proofs.
 func (g *CheckpointGroup) CheckpointAppliedIndex() uint64 {
@@ -1573,7 +1573,7 @@ func (g *CheckpointGroup) Seed(
 }
 
 // Update publishes one fixed-group transition. The normal per-transition path
-// appends conditional participant records and one decision with zero Sync. All
+// appends conditional target records and one decision with zero Sync. All
 // fallible work precedes the simultaneous snapshot-gate publication.
 func (g *CheckpointGroup) Update(
 	applied uint64,
@@ -1912,21 +1912,21 @@ func (g *CheckpointGroup) commitTransitionLocked(
 			return stageErr
 		}
 		if !st.live {
-			return fmt.Errorf("%w: staged empty member %q", ErrTxnParticipant, nameOf[c])
+			return fmt.Errorf("%w: staged empty member %q", ErrTxnCollection, nameOf[c])
 		}
 		staged[i] = st
 		stagedLive = i + 1
 	}
 
 	header := log.marker.Header()
-	participants := make([]storeio.TxnParticipant, len(order))
+	targets := make([]storeio.TxnCollectionRef, len(order))
 	for i, c := range order {
 		if prepErr := c.preparePrimaryBatchConditionalLocked(
 			&staged[i], header.MarkerID, header.Epoch, txnID, false,
 		); prepErr != nil {
 			return prepErr
 		}
-		participants[i] = storeio.TxnParticipant{
+		targets[i] = storeio.TxnCollectionRef{
 			StoreID: c.storeID, JournalID: c.journalID,
 			PreparedGeneration: staged[i].generation,
 		}
@@ -1936,7 +1936,7 @@ func (g *CheckpointGroup) commitTransitionLocked(
 			return err
 		}
 	}
-	dcsn, appendErr := log.marker.AppendDecision(txnID, participants)
+	dcsn, appendErr := log.marker.AppendDecision(txnID, targets)
 	if appendErr != nil {
 		poisoned := journalCommitOutcomeUnknown(appendErr)
 		log.poison = poisoned
@@ -2084,7 +2084,7 @@ func checkpointGroupMemberRecycleBudget(maxDocuments int) (uint64, bool) {
 // marker-room acquisition while refusing independent marker sequence exhaustion
 // and a definitely required terminal rollover before its callback.
 func (g *CheckpointGroup) markerAdmissionSnapshotLocked(
-	maxParticipants int,
+	maxTargets int,
 	inspectWindow bool,
 ) (
 	cursor uint64,
@@ -2120,7 +2120,7 @@ func (g *CheckpointGroup) markerAdmissionSnapshotLocked(
 	if cursor > capacity {
 		return 0, 0, false, false, ErrCheckpointGroupCorrupt
 	}
-	padded, ok := txnDecisionRecordBytes(maxParticipants)
+	padded, ok := txnDecisionRecordBytes(maxTargets)
 	fullSetFits := false
 	if ok {
 		fullSetFits = uint64(padded) <= capacity-cursor
@@ -2132,8 +2132,8 @@ func (g *CheckpointGroup) markerAdmissionSnapshotLocked(
 	return cursor, capacity, mayNeedRollover, true, nil
 }
 
-func (g *CheckpointGroup) markerRoomLocked(participantCount int) (bool, error) {
-	padded, ok := txnDecisionRecordBytes(participantCount)
+func (g *CheckpointGroup) markerRoomLocked(targetCount int) (bool, error) {
+	padded, ok := txnDecisionRecordBytes(targetCount)
 	if !ok {
 		return false, ErrTxnTooLarge
 	}
@@ -2184,8 +2184,8 @@ func (g *CheckpointGroup) MaybeCheckpoint() error {
 }
 
 // Checkpoint durably certifies the current contiguous cut and folds every
-// participant. K journal Syncs and one authenticated certificate Sync are
-// ordered before any participant may recycle its journal. txn.vtm is an
+// target. K journal Syncs and one authenticated certificate Sync are
+// ordered before any target may recycle its journal. txn.vtm is an
 // unsynced, recyclable implementation log; its records are not commit
 // authority.
 func (g *CheckpointGroup) Checkpoint() error {
@@ -2977,7 +2977,7 @@ func validateCheckpointMarkerRecords(
 		return nil
 	}
 	var result error
-	decisions.RangeDecisions(func(txnID uint64, participants []storeio.TxnParticipant) bool {
+	decisions.RangeDecisions(func(txnID uint64, targets []storeio.TxnCollectionRef) bool {
 		if txnID != expected {
 			result = fmt.Errorf(
 				"%w: marker transaction prefix wants %d, found %d",
@@ -2985,22 +2985,22 @@ func validateCheckpointMarkerRecords(
 			)
 			return false
 		}
-		if len(participants) == 0 || len(participants) > len(members) {
+		if len(targets) == 0 || len(targets) > len(members) {
 			result = fmt.Errorf("%w: transaction %d participant count", ErrCheckpointGroupCorrupt, txnID)
 			return false
 		}
-		seen := make(map[[16]byte]struct{}, len(participants))
-		for _, participant := range participants {
-			member, ok := memberByStore[participant.StoreID]
-			if !ok || member.journalID != participant.JournalID {
+		seen := make(map[[16]byte]struct{}, len(targets))
+		for _, target := range targets {
+			member, ok := memberByStore[target.StoreID]
+			if !ok || member.journalID != target.JournalID {
 				result = fmt.Errorf("%w: transaction %d participant binding", ErrCheckpointGroupCorrupt, txnID)
 				return false
 			}
-			if _, duplicate := seen[participant.StoreID]; duplicate {
+			if _, duplicate := seen[target.StoreID]; duplicate {
 				result = fmt.Errorf("%w: transaction %d duplicate participant", ErrCheckpointGroupCorrupt, txnID)
 				return false
 			}
-			seen[participant.StoreID] = struct{}{}
+			seen[target.StoreID] = struct{}{}
 		}
 		expected++
 		if expected == 0 {

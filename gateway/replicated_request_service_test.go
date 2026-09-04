@@ -75,11 +75,11 @@ func (ledger *typedServiceLedger) ReadRow(
 }
 
 func TestDurableRequestBeginFusesCreateWithoutPreflightRead(t *testing.T) {
-	participants := durableFaultParticipants(t)
-	request := durableFaultRequest(t, participants)
+	targets := durableFaultTargets(t)
+	request := durableFaultRequest(t, targets)
 	ledger := new(typedServiceLedger)
 	service, err := newDurableRequestService(
-		durableFaultTopology(t, participants), ledger, typedServiceRunnerStop{}, new(typedServicePinStop),
+		durableFaultTopology(t, targets), ledger, typedServiceRunnerStop{}, new(typedServicePinStop),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -105,7 +105,7 @@ func (pins *typedServicePinStop) AcquireOrRecover(
 	_ context.Context,
 	execution DurableRequestTypedExecutionContext,
 ) (ReplicatedRoute, executionpin.AcquireCertificate, executionpin.LeaseCertificate, error) {
-	if execution.Key.RequestKey.Valid() && execution.Participants != nil {
+	if execution.Key.RequestKey.Valid() && execution.Targets != nil {
 		pins.called++
 	}
 	return ReplicatedRoute{}, executionpin.AcquireCertificate{}, executionpin.LeaseCertificate{}, errTypedServicePin
@@ -144,11 +144,11 @@ func (pins *typedServiceAdvancePins) AcquireOrRecover(_ context.Context, _ Durab
 func TestDurableRequestServiceResumesOnlyProvenExactRetryProgress(t *testing.T) {
 	for _, corrupt := range []string{"", "no-progress", "request", "plan", "conflict", "conflict-no-progress", "conflict-request", "conflict-plan"} {
 		t.Run(corrupt, func(t *testing.T) {
-			participants := durableFaultParticipants(t)
-			request := durableFaultRequest(t, participants)
+			targets := durableFaultTargets(t)
+			request := durableFaultRequest(t, targets)
 			ledger := new(typedServiceLedger)
 			pins := &typedServiceAdvancePins{ledger: ledger, corrupt: corrupt}
-			service, err := newDurableRequestService(durableFaultTopology(t, participants), ledger, typedServiceRunnerStop{}, pins)
+			service, err := newDurableRequestService(durableFaultTopology(t, targets), ledger, typedServiceRunnerStop{}, pins)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -186,12 +186,12 @@ func (retirer *typedServiceAckRetirer) RetireAcknowledged(
 }
 
 func TestDurableRequestServiceAdmitsSealsAndReopensBeforePin(t *testing.T) {
-	participants := durableFaultParticipants(t)
-	request := durableFaultRequest(t, participants)
+	targets := durableFaultTargets(t)
+	request := durableFaultRequest(t, targets)
 	ledger := new(typedServiceLedger)
 	pins := new(typedServicePinStop)
 	service, err := newDurableRequestService(
-		durableFaultTopology(t, participants), ledger, typedServiceRunnerStop{}, pins,
+		durableFaultTopology(t, targets), ledger, typedServiceRunnerStop{}, pins,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -207,12 +207,12 @@ func TestDurableRequestServiceAdmitsSealsAndReopensBeforePin(t *testing.T) {
 }
 
 func TestDurableRequestServiceReplaysTerminalFromReplicatedStateOnly(t *testing.T) {
-	participants := durableFaultParticipants(t)
-	request := durableFaultRequest(t, participants)
+	targets := durableFaultTargets(t)
+	request := durableFaultRequest(t, targets)
 	resultRaw, err := AppendDurableRequestResult(nil, DurableRequestResult{
 		Committed: true, AffectedRows: 2, Transaction: request.Program.Identity.ID,
 		CatalogGeneration:       request.Program.Identity.CatalogGeneration,
-		ShardsFanned:            uint64(len(request.Program.Participants)),
+		ShardsFanned:            uint64(len(request.Program.Targets)),
 		TransitionTag:           request.Program.Contract.CommitTransitionTag,
 		TerminalStateDigest:     request.Program.Contract.CommitTerminalStateDigest,
 		TerminalContractDigest:  request.Program.Contract.TerminalContractDigest,
@@ -241,7 +241,7 @@ func TestDurableRequestServiceReplaysTerminalFromReplicatedStateOnly(t *testing.
 		t.Fatal(err)
 	}
 	service, err := newDurableRequestService(
-		durableFaultTopology(t, participants), ledger, typedServiceRunnerStop{}, new(typedServicePinStop),
+		durableFaultTopology(t, targets), ledger, typedServiceRunnerStop{}, new(typedServicePinStop),
 	)
 	if err != nil {
 		t.Fatal(err)

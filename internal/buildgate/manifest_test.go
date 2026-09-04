@@ -19,7 +19,7 @@ var buildgateAt1AEB86A = Profile{
 
 // buildgateBeforeSQLParameterTypes freezes the immediately preceding grammar
 // identities. Parameter-analysis metadata extends both shard SQL requests and
-// the durable participant mutation batch, so neither identity may silently
+// the durable target mutation batch, so neither identity may silently
 // remain compatible with a build that predates those fields.
 var buildgateBeforeSQLParameterTypes = Profile{
 	WireGrammar: GrammarID{0x5b, 0x58, 0x5a, 0x02, 0xd6, 0xc4, 0x83, 0x52, 0x31, 0xd8, 0x75, 0x9c, 0x62, 0x10, 0x36, 0xe2},

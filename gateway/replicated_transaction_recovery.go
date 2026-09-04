@@ -213,8 +213,8 @@ func replicatedTransactionRecoveryWireRead(
 	switch read.Kind {
 	case replicatedstate.TransactionRecoveryLookupCoordinator:
 		kind = shardservice.ReplicatedTransactionLookupCoordinator
-	case replicatedstate.TransactionRecoveryLookupParticipant:
-		kind = shardservice.ReplicatedTransactionLookupParticipant
+	case replicatedstate.TransactionRecoveryLookupTarget:
+		kind = shardservice.ReplicatedTransactionLookupTarget
 	case replicatedstate.TransactionRecoveryReadManifestPage:
 		kind = shardservice.ReplicatedTransactionReadManifestPage
 	case replicatedstate.TransactionRecoveryScanCoordinator:

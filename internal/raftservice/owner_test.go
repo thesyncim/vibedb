@@ -498,7 +498,7 @@ func TestPointReadLeaseKeepsConcurrentResponseBudgetCharged(t *testing.T) {
 
 func TestTransactionRecoveryOwnerRequiresExactDedicatedCapability(t *testing.T) {
 	request := TransactionReadRequest{Read: replicatedstate.TransactionRecoveryReadRequest{
-		Kind: replicatedstate.TransactionRecoveryLookupParticipant,
+		Kind: replicatedstate.TransactionRecoveryLookupTarget,
 		ID:   distributedtxn.ID{1}, MinimumApplied: 1, MaxRows: 1,
 		MaxBytes: replicatedstate.TransactionRecoverySummaryBytes,
 	}}
@@ -526,18 +526,18 @@ func TestTransactionRecoveryOwnerRequiresExactDedicatedCapability(t *testing.T) 
 }
 
 func TestTransactionRecoveryResponseChargeIncludesTypedArenaAndMaterialScratch(t *testing.T) {
-	participant := replicatedstate.TransactionRecoveryReadRequest{
-		Kind: replicatedstate.TransactionRecoveryLookupParticipant,
+	target := replicatedstate.TransactionRecoveryReadRequest{
+		Kind: replicatedstate.TransactionRecoveryLookupTarget,
 		ID:   distributedtxn.ID{1}, MinimumApplied: 1, MaxRows: 1,
 		MaxBytes: replicatedstate.TransactionRecoverySummaryBytes,
 	}
-	charge, records, scratch, ok := transactionReadResponseCharge(participant)
+	charge, records, scratch, ok := transactionReadResponseCharge(target)
 	wire, _ := pointReadResponseCharge(replicatedstate.TransactionRecoverySummaryBytes)
 	if !ok || records != 1 || scratch != 0 ||
 		charge != wire+transactionRecoveryRecordRetainedBytes {
 		t.Fatalf("participant charge=%d records=%d scratch=%d ok=%t", charge, records, scratch, ok)
 	}
-	coordinator := participant
+	coordinator := target
 	coordinator.Kind = replicatedstate.TransactionRecoveryLookupCoordinator
 	coordinator.MaxBytes = replicatedstate.TransactionRecoverySummaryBytes +
 		distributedtxn.MaxCoordinatorRecordBytes

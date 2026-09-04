@@ -9,7 +9,7 @@ import (
 
 // This assertion intentionally fails at compile/review time if the current
 // parent lifecycle silently grows a second route-pin/pending authority. Real
-// parallel participant proposals belong to independently homed child ledgers,
+// parallel target proposals belong to independently homed child ledgers,
 // not an unreviewed relaxation of the single-wave safety invariant.
 func TestDurableRequestParentLifecycleRemainsSingleWave(t *testing.T) {
 	pending := reflect.TypeOf(requestledger.PendingWaveRecord{})

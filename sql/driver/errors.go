@@ -120,7 +120,7 @@ var (
 	ErrArgumentsTooLarge = errors.New("vibedb: SQL arguments exceed the execution payload bound")
 	// ErrCrossShardWrite reports a multi-row INSERT whose rows do not all route
 	// to one physical shard. The current contract dispatches each write to a
-	// single shard, so a cross-shard batch is refused before any participant
+	// single shard, so a cross-shard batch is refused before any target
 	// receives work.
 	ErrCrossShardWrite = errors.New("vibedb: cross-shard write unsupported")
 	// ErrShardKeyImmutable reports a whole-document UPDATE whose replacement would

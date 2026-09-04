@@ -732,7 +732,7 @@ func (s *Session) ValidatePrimaryDocumentDigests(
 
 // CheckPrimaryDocumentDigests retains the same serializable point
 // dependencies as ValidatePrimaryDocumentDigests without arming a following
-// SQL mutation guard. Online backfill uses it as the base participant of a
+// SQL mutation guard. Online backfill uses it as the base target of a
 // compare-and-put transaction.
 func (s *Session) CheckPrimaryDocumentDigests(
 	ctx context.Context,

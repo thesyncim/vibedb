@@ -106,9 +106,9 @@ func newReplicatedDurableRuntime(
 	}
 	sql, err := gateway.NewDurableSQLRequestExecutor(gateway.DurableSQLRequestExecutorOptions{
 		Planner: options.Planner, ReplicatedData: options.Replicated, Requests: requests,
-		RecoveryPulseLimit:        distributedtxn.MaxRecoveryPulses,
-		PlanningLeaseSpan:         requestledger.MaxPlanningLeaseSpan,
-		SingleParticipantFastPath: true,
+		RecoveryPulseLimit:   distributedtxn.MaxRecoveryPulses,
+		PlanningLeaseSpan:    requestledger.MaxPlanningLeaseSpan,
+		SingleTargetFastPath: true,
 	})
 	if err != nil {
 		return nil, errors.Join(err, errInvalidDurableRequestAdapter)

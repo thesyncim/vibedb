@@ -20,12 +20,12 @@ const (
 	// MaxPlanPageBytes bounds page payload, not its small fixed record frame.
 	MaxPlanPageBytes = 512 << 10
 	// MaxPlanBytes is the shipped aggregate transaction recipe bound. It is a
-	// byte bound, never a participant-count ceiling. Individual replicated
+	// byte bound, never a target-count ceiling. Individual replicated
 	// ledger commands remain bounded by MaxCommandBytes and stream these bytes
 	// in page batches.
 	MaxPlanBytes = 1 << 30
 	// MaxTargetBytes bounds one portable routing target. It is intentionally a
-	// byte bound, not a shard, participant, or topology-count policy.
+	// byte bound, not a shard, target, or topology-count policy.
 	MaxTargetBytes = 64 << 10
 
 	checksumBytes = 4

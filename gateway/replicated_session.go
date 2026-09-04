@@ -713,7 +713,7 @@ func (session *NativeSession) ExecutionPin(
 }
 
 // RouteGate orders one typed shared pin or topology drain through the opened
-// session's exact-retry journal. Gate epochs are participant gate epochs, not
+// session's exact-retry journal. Gate epochs are target gate epochs, not
 // session epochs or execution-controller epochs.
 func (session *NativeSession) RouteGate(ctx context.Context, transition routegate.Command) (NativeResult, error) {
 	if ctx == nil {

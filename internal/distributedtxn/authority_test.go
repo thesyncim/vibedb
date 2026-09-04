@@ -7,10 +7,10 @@ import (
 )
 
 func TestReplicatedCoordinatorAuthorityWitnessesAreStrictAndAllocationFree(t *testing.T) {
-	refs := []ParticipantRef{manifestParticipant(1), manifestParticipant(2)}
+	refs := []TransactionTargetRef{manifestTarget(1), manifestTarget(2)}
 	inline, err := AppendCoordinator(nil, CoordinatorRecord{
 		ID: testID(), State: CoordinatorStaging, Revision: 1,
-		CatalogGeneration: 1, Participants: refs,
+		CatalogGeneration: 1, Targets: refs,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -26,11 +26,11 @@ func TestReplicatedCoordinatorAuthorityWitnessesAreStrictAndAllocationFree(t *te
 		t.Fatalf("inline allocations=%v, want 0", allocations)
 	}
 
-	staticRefs := append([]ParticipantRef(nil), refs...)
+	staticRefs := append([]TransactionTargetRef(nil), refs...)
 	staticRefs[1].AuthorityWitness = AuthorityWitness{}
 	staticInline, err := AppendCoordinator(nil, CoordinatorRecord{
 		ID: testID(), State: CoordinatorStaging, Revision: 1,
-		CatalogGeneration: 1, Participants: staticRefs,
+		CatalogGeneration: 1, Targets: staticRefs,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -46,7 +46,7 @@ func TestReplicatedCoordinatorAuthorityWitnessesAreStrictAndAllocationFree(t *te
 	fused := ReplicatedCommand{
 		Role: ReplicatedRoleCoordinator, Operation: ReplicatedBeginPrepareCoordinator,
 		ID: testID(), PayloadKind: ReplicatedPayloadCoordinator, Payload: staticInline,
-		Participant: ParticipantStage{
+		Target: TransactionTargetStage{
 			CoordinatorGroup: group, CoordinatorShardIncarnation: incarnation,
 			CoordinatorAllocation: 1, MutationDigest: refs[0].MutationDigest,
 		},
@@ -84,7 +84,7 @@ func TestReplicatedCoordinatorAuthorityWitnessesAreStrictAndAllocationFree(t *te
 }
 
 func TestManifestSequenceAuthorityWitnessesRejectZeroWithoutChangingStaticGrammar(t *testing.T) {
-	refs := []ParticipantRef{manifestParticipant(10), manifestParticipant(11)}
+	refs := []TransactionTargetRef{manifestTarget(10), manifestTarget(11)}
 	refs[1].AuthorityWitness = AuthorityWitness{}
 	pageArena := make([]byte, ManifestSegmentBytes)
 	var raw []byte
@@ -103,9 +103,9 @@ func TestManifestSequenceAuthorityWitnessesRejectZeroWithoutChangingStaticGramma
 	if _, err = builder.Seal(); err != nil {
 		t.Fatal(err)
 	}
-	participants := make([]ParticipantRef, MaxManifestPageParticipants)
-	identities := make([]byte, MaxManifestPageParticipants*MaxShardIdentityBytes*2)
-	if _, err = OpenManifestSegment(raw, participants, identities); err != nil {
+	targets := make([]TransactionTargetRef, MaxManifestPageTargets)
+	identities := make([]byte, MaxManifestPageTargets*MaxShardIdentityBytes*2)
+	if _, err = OpenManifestSegment(raw, targets, identities); err != nil {
 		t.Fatalf("common static decoder rejected zero witness: %v", err)
 	}
 	sequence, err := OpenManifestSegmentSequence(raw)

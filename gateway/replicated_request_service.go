@@ -598,8 +598,8 @@ func (service *DurableRequestService) driveOnce(
 		CatalogGeneration: reader.CatalogGeneration, Identity: reader.Identity,
 		Contract: reader.Contract, Tenant: bytes.Clone(reader.Tenant),
 		KeyDigest: reader.KeyDigest, RequestID: reader.RequestID,
-		RequestDigest: reader.RequestDigest, ParticipantCount: reader.ParticipantCount,
-		ParticipantStream: reader, ResumeRevision: head.Revision,
+		RequestDigest: reader.RequestDigest, TargetCount: reader.TargetCount,
+		TargetStream: reader, ResumeRevision: head.Revision,
 	}
 	execution, err := NewDurableRequestTypedExecutionContext(home, key, recipe)
 	if err != nil {
@@ -690,8 +690,8 @@ func (service *DurableRequestService) openTerminalExecution(
 		CatalogGeneration: reader.CatalogGeneration, Identity: reader.Identity,
 		Contract: reader.Contract, Tenant: bytes.Clone(reader.Tenant),
 		KeyDigest: reader.KeyDigest, RequestID: reader.RequestID,
-		RequestDigest: reader.RequestDigest, ParticipantCount: reader.ParticipantCount,
-		ParticipantStream: reader, ResumeRevision: head.Revision,
+		RequestDigest: reader.RequestDigest, TargetCount: reader.TargetCount,
+		TargetStream: reader, ResumeRevision: head.Revision,
 	})
 }
 

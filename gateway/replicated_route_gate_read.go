@@ -19,7 +19,7 @@ type ReplicatedRouteGateReadResult struct {
 	Retries int
 }
 
-// ReadRouteGate observes the participant's independent gate epoch and pin
+// ReadRouteGate observes the target's independent gate epoch and pin
 // counts through its authenticated leader, never a follower or lease epoch.
 func (executor *ReplicatedExecutor) ReadRouteGate(
 	ctx context.Context,

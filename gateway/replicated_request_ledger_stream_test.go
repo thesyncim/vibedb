@@ -63,11 +63,11 @@ func durableLogicalStreamFixture(
 		t.Fatal(err)
 	}
 	value := bytes.Repeat([]byte{0x5a}, max(1, valueBytes))
-	participants := make([]DurableRequestLogicalParticipant, count)
-	for index := range participants {
+	targets := make([]DurableRequestLogicalTarget, count)
+	for index := range targets {
 		shard := distribution.ShardID(fmt.Sprintf("shard-%08d", index))
-		participant := &participants[index]
-		*participant = DurableRequestLogicalParticipant{
+		target := &targets[index]
+		*target = DurableRequestLogicalTarget{
 			Distribution: distribution.DistributionName("orders"), Shard: shard,
 			RangeIdentity: replication.Digest{0x51, byte(index), byte(index >> 8)},
 			Group: raftmember.GroupKey{
@@ -111,7 +111,7 @@ func durableLogicalStreamFixture(
 			PlanningLeaseGeneration: 1,
 		},
 		Tenant: tenant, KeyDigest: replication.Digest(keyDigest),
-		RequestID: requestID, RequestDigest: requestDigest, Participants: participants,
+		RequestID: requestID, RequestDigest: requestDigest, Targets: targets,
 	}
 	program, err = SealDurableRequestLogicalProgram(program)
 	if err != nil {
@@ -158,13 +158,13 @@ func TestDurableRequestLogicalPlanStreamRoundTripWide(t *testing.T) {
 			if reader.Identity != program.Identity || reader.Contract != program.Contract ||
 				reader.KeyDigest != program.KeyDigest || reader.RequestID != program.RequestID ||
 				reader.RequestDigest != program.RequestDigest ||
-				!bytes.Equal(reader.Tenant, program.Tenant) || reader.ParticipantCount != uint64(count) {
+				!bytes.Equal(reader.Tenant, program.Tenant) || reader.TargetCount != uint64(count) {
 				t.Fatal("decoded fixed logical program differs")
 			}
 			visited := 0
 			for reader.Next() {
 				current := reader.Current()
-				want := program.Participants[visited]
+				want := program.Targets[visited]
 				if current.Distribution != want.Distribution || current.Shard != want.Shard ||
 					current.RangeIdentity != want.RangeIdentity || current.Group != want.Group ||
 					current.SchemaGeneration != want.SchemaGeneration ||
@@ -202,9 +202,9 @@ func TestDurableRequestLogicalPlanStreamReplayWideBounded(t *testing.T) {
 		hash := sha256.New()
 		var count uint64
 		for reader.Next() {
-			participant := reader.Current()
-			_, _ = hash.Write([]byte(participant.Distribution))
-			_, _ = hash.Write([]byte(participant.Shard))
+			target := reader.Current()
+			_, _ = hash.Write([]byte(target.Distribution))
+			_, _ = hash.Write([]byte(target.Shard))
 			count++
 			if reader.BufferedBytes() > durableRequestReaderMaxLiveBytes {
 				t.Fatalf("live bytes=%d exceed fixed bound=%d", reader.BufferedBytes(), durableRequestReaderMaxLiveBytes)
@@ -230,8 +230,8 @@ func TestDurableRequestLogicalPlanFragmentationAndMaxScopes(t *testing.T) {
 	for index := range scopes {
 		scopes[index] = distributedtxn.IntentScope{Start: uint32(index * 2), End: uint32(index*2 + 1)}
 	}
-	program.Participants[0].BucketBits = 16
-	program.Participants[0].IntentScopes = scopes
+	program.Targets[0].BucketBits = 16
+	program.Targets[0].IntentScopes = scopes
 	var err error
 	program, err = SealDurableRequestLogicalProgram(program)
 	if err != nil {
@@ -260,9 +260,9 @@ func TestDurableRequestLogicalPlanRejectsProgramPerturbation(t *testing.T) {
 		func(value *DurableRequestLogicalProgram) { value.Contract.TerminalSummaryDigest[0] ^= 1 },
 		func(value *DurableRequestLogicalProgram) { value.Contract.PlanBuildID[0] ^= 1 },
 		func(value *DurableRequestLogicalProgram) { value.Contract.PlanningLeaseGeneration++ },
-		func(value *DurableRequestLogicalProgram) { value.Participants[0].SchemaGeneration++ },
-		func(value *DurableRequestLogicalProgram) { value.Participants[0].BucketBits++ },
-		func(value *DurableRequestLogicalProgram) { value.Participants[0].IntentScopes[0].End++ },
+		func(value *DurableRequestLogicalProgram) { value.Targets[0].SchemaGeneration++ },
+		func(value *DurableRequestLogicalProgram) { value.Targets[0].BucketBits++ },
+		func(value *DurableRequestLogicalProgram) { value.Targets[0].IntentScopes[0].End++ },
 	} {
 		changed := cloneDurableLogicalStreamProgram(program)
 		mutate(&changed)
@@ -271,12 +271,12 @@ func TestDurableRequestLogicalPlanRejectsProgramPerturbation(t *testing.T) {
 		}
 	}
 	reordered := cloneDurableLogicalStreamProgram(program)
-	reordered.Participants[0], reordered.Participants[1] = reordered.Participants[1], reordered.Participants[0]
+	reordered.Targets[0], reordered.Targets[1] = reordered.Targets[1], reordered.Targets[0]
 	if _, err := measureDurableRequestPlan(key, reordered); err == nil {
 		t.Fatal("noncanonical participant order accepted")
 	}
 	duplicate := cloneDurableLogicalStreamProgram(program)
-	duplicate.Participants[1] = duplicate.Participants[0]
+	duplicate.Targets[1] = duplicate.Targets[0]
 	if _, err := measureDurableRequestPlan(key, duplicate); err == nil {
 		t.Fatal("duplicate logical participant accepted")
 	}
@@ -285,10 +285,10 @@ func TestDurableRequestLogicalPlanRejectsProgramPerturbation(t *testing.T) {
 func cloneDurableLogicalStreamProgram(program DurableRequestLogicalProgram) DurableRequestLogicalProgram {
 	cloned := program
 	cloned.Tenant = bytes.Clone(program.Tenant)
-	cloned.Participants = append([]DurableRequestLogicalParticipant(nil), program.Participants...)
-	for index := range cloned.Participants {
-		cloned.Participants[index].IntentScopes = append([]distributedtxn.IntentScope(nil), program.Participants[index].IntentScopes...)
-		cloned.Participants[index].Batches = append([]replication.RelationMutationBatch(nil), program.Participants[index].Batches...)
+	cloned.Targets = append([]DurableRequestLogicalTarget(nil), program.Targets...)
+	for index := range cloned.Targets {
+		cloned.Targets[index].IntentScopes = append([]distributedtxn.IntentScope(nil), program.Targets[index].IntentScopes...)
+		cloned.Targets[index].Batches = append([]replication.RelationMutationBatch(nil), program.Targets[index].Batches...)
 	}
 	return cloned
 }

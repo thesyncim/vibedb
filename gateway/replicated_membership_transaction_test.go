@@ -41,10 +41,10 @@ func TestMembershipStableTransactionFinishesAcrossLostResponsesAndReopen(t *test
 			mutationDigest := transactionMutationDigest(batches)
 			payload, err := distributedtxn.AppendCoordinator(nil, distributedtxn.CoordinatorRecord{
 				ID: id, State: distributedtxn.CoordinatorStaging, Revision: 1, CatalogGeneration: 1, RecoveryDeadline: 3,
-				Participants: []distributedtxn.ParticipantRef{{Distribution: []byte(route.Distribution), Shard: []byte(route.Shard),
+				Targets: []distributedtxn.TransactionTargetRef{{Distribution: []byte(route.Distribution), Shard: []byte(route.Shard),
 					RoutingVersion: route.Command.RoutingVersion, AllocationGeneration: route.AllocationGeneration,
 					OwnershipEpoch: route.Command.OwnershipEpoch, AuthorityWitness: replicatedTransactionRouteAuthorityWitness(route, true),
-					MutationDigest: mutationDigest, State: distributedtxn.ParticipantStaged}},
+					MutationDigest: mutationDigest, State: distributedtxn.TargetStaged}},
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -56,11 +56,11 @@ func TestMembershipStableTransactionFinishesAcrossLostResponsesAndReopen(t *test
 			controls := []distributedtxn.ReplicatedCommand{
 				{Role: distributedtxn.ReplicatedRoleCoordinator, Operation: distributedtxn.ReplicatedBeginPrepareCoordinator,
 					PayloadKind: distributedtxn.ReplicatedPayloadCoordinator, Payload: payload,
-					Participant: distributedtxn.ParticipantStage{CoordinatorGroup: distributedtxn.ID(route.Group.GroupID),
+					Target: distributedtxn.TransactionTargetStage{CoordinatorGroup: distributedtxn.ID(route.Group.GroupID),
 						CoordinatorShardIncarnation: distributedtxn.ID(route.Group.ShardIncarnation), CoordinatorAllocation: route.AllocationGeneration,
 						BucketBits: 8, IntentScopes: []distributedtxn.IntentScope{{Start: 0, End: 256}}, MutationDigest: mutationDigest}},
 				{Role: distributedtxn.ReplicatedRoleCoordinator, Operation: distributedtxn.ReplicatedCommitCoordinator, ExpectedRevision: 1},
-				{Role: distributedtxn.ReplicatedRoleParticipant, Operation: distributedtxn.ReplicatedApplyReleaseParticipant, ExpectedRevision: 2},
+				{Role: distributedtxn.ReplicatedRoleTarget, Operation: distributedtxn.ReplicatedApplyReleaseTarget, ExpectedRevision: 2},
 				{Role: distributedtxn.ReplicatedRoleCoordinator, Operation: distributedtxn.ReplicatedRetireCoordinator, ExpectedRevision: 2,
 					PayloadKind: distributedtxn.ReplicatedPayloadRetirement, Payload: retirement},
 			}

@@ -13,8 +13,8 @@ import (
 )
 
 var (
-	durableSQLPerfDigest       replication.Digest
-	durableSQLPerfParticipants []ReplicatedTransactionParticipant
+	durableSQLPerfDigest  replication.Digest
+	durableSQLPerfTargets []ReplicatedTransactionTarget
 )
 
 const durableSQLWideLoweringMaxAllocations = 1024
@@ -48,13 +48,13 @@ func TestDurableSQLWideLoweringAllocationGate(t *testing.T) {
 	queries := durableSQLPerfQueries(replicatedstate.MaxDistinctMutations)
 	profile := planner.profileFor(ClassInteractive)
 	allocations := testing.AllocsPerRun(20, func() {
-		participants, handled, err := planner.planReplicatedSQLTransactionWithData(
+		targets, handled, err := planner.planReplicatedSQLTransactionWithData(
 			context.Background(), snapshot, queries, profile, nil,
 		)
-		if err != nil || !handled || len(participants) != 2 {
+		if err != nil || !handled || len(targets) != 2 {
 			panic("wide durable SQL lowering changed semantics")
 		}
-		durableSQLPerfParticipants = participants
+		durableSQLPerfTargets = targets
 	})
 	// The bound is intentionally linear in caller statements and independent of
 	// participant count, registry capacity, or a process-local retry cache.
@@ -77,13 +77,13 @@ func TestDurableSQLSetMutationLoweringAllocationGates(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			allocations := testing.AllocsPerRun(50, func() {
-				participants, handled, err := planner.planReplicatedSQLTransactionWithData(
+				targets, handled, err := planner.planReplicatedSQLTransactionWithData(
 					context.Background(), snapshot, []Query{test.query}, profile, nil,
 				)
-				if err != nil || !handled || len(participants) == 0 {
+				if err != nil || !handled || len(targets) == 0 {
 					panic("set mutation lowering changed semantics")
 				}
-				durableSQLPerfParticipants = participants
+				durableSQLPerfTargets = targets
 			})
 			if allocations > test.maximum {
 				t.Fatalf("allocations/run=%v want <=%v", allocations, test.maximum)
@@ -114,13 +114,13 @@ func BenchmarkDurableSQLWideLowering(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for range b.N {
-				participants, handled, err := planner.planReplicatedSQLTransactionWithData(
+				targets, handled, err := planner.planReplicatedSQLTransactionWithData(
 					context.Background(), snapshot, queries, profile, nil,
 				)
 				if err != nil || !handled {
 					b.Fatal(err)
 				}
-				durableSQLPerfParticipants = participants
+				durableSQLPerfTargets = targets
 			}
 		})
 	}
@@ -135,13 +135,13 @@ func BenchmarkDurableSQLMultiRowInsertLowering(b *testing.B) {
 			b.ReportAllocs()
 			b.SetBytes(int64(rows * 32))
 			for b.Loop() {
-				participants, handled, err := planner.planReplicatedSQLTransactionWithData(
+				targets, handled, err := planner.planReplicatedSQLTransactionWithData(
 					context.Background(), snapshot, []Query{query}, profile, nil,
 				)
-				if err != nil || !handled || len(participants) == 0 {
+				if err != nil || !handled || len(targets) == 0 {
 					b.Fatal(err)
 				}
-				durableSQLPerfParticipants = participants
+				durableSQLPerfTargets = targets
 			}
 		})
 	}
@@ -155,13 +155,13 @@ func BenchmarkDurableSQLFiniteDeleteLowering(b *testing.B) {
 		b.Run(strconv.Itoa(rows), func(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
-				participants, handled, err := planner.planReplicatedSQLTransactionWithData(
+				targets, handled, err := planner.planReplicatedSQLTransactionWithData(
 					context.Background(), snapshot, []Query{query}, profile, nil,
 				)
-				if err != nil || !handled || len(participants) == 0 {
+				if err != nil || !handled || len(targets) == 0 {
 					b.Fatal(err)
 				}
-				durableSQLPerfParticipants = participants
+				durableSQLPerfTargets = targets
 			}
 		})
 	}

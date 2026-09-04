@@ -1449,7 +1449,7 @@ func TestCheckpointGroupTerminalMarkerTransitionalBoundary(t *testing.T) {
 				{Name: "system", Collection: collections[0]},
 				{Name: "user", Collection: collections[1]},
 			}
-			checkpointGroupTestRequireRejectedParticipantUpdate(
+			checkpointGroupTestRequireRejectedTargetUpdate(
 				t, reopenedDir, group, log, named[:1], group.AppliedIndex(),
 			)
 			closeCheckpointGroupTestHandles(t, collections, log, group)

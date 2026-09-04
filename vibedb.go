@@ -92,7 +92,7 @@ type AdvancedOptions struct {
 	// zero values select private 0o600 and 0o700 permissions respectively.
 	FileMode os.FileMode
 	DirMode  os.FileMode
-	// TxnLimits bounds one multi-collection transaction across participants.
+	// TxnLimits bounds one multi-collection transaction across targets.
 	// Zero dimensions normalize to the durable package defaults (16
 	// collections; documents and bytes four times the single-collection
 	// batch defaults). Violations surface as ErrTxTooLarge.

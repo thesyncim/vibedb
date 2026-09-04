@@ -235,7 +235,7 @@ func (h snapshotCutHold) release() {
 // another into customers through a second Update has performed two commits, and
 // a snapshot may legitimately fall between them. Database.Update (and
 // UpdateCollections) is the cross-collection transaction: its decision-log
-// sync is the sole commit point, every participant publishes under gates held
+// sync is the sole commit point, every target publishes under gates held
 // at once, and this cut therefore never observes a torn multi-collection
 // commit. The snapshot is consistent with respect to the database's own
 // commits — including those transactions — not with respect to an
@@ -244,7 +244,7 @@ func (h snapshotCutHold) release() {
 // It does not survive a crash as a lease. A lease is process memory, not a
 // durable reservation. After a restart OpenDatabase reconciles txn.vtm against
 // each collection's journal so every decided multi-collection transaction is
-// all-committed or all-aborted across participants; independent
+// all-committed or all-aborted across targets; independent
 // single-collection commits recover per file as before. Consistency of this
 // snapshot value is still a read-time property of a running process.
 //

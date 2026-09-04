@@ -239,7 +239,7 @@ func terminalCoordinatorFixture(t testing.TB) (
 		CatalogGeneration:         7,
 		SchemaManifestDigest:      executionpin.Digest(lifecycleDigest("schema-certificate")),
 		TransactionManifestDigest: executionpin.Digest{6},
-		ParticipantAuthorityRoot:  executionpin.Digest{7}, ParticipantCount: 1,
+		TargetAuthorityRoot:       executionpin.Digest{7}, TargetCount: 1,
 		ExecutionContractDigest: executionpin.Digest{9},
 		LedgerHomeGroup:         executionpin.ID(route.Group.GroupID),
 	}

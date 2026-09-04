@@ -552,7 +552,7 @@ func transactionReadResponseCharge(
 	case replicatedstate.TransactionRecoveryLookupCoordinator,
 		replicatedstate.TransactionRecoveryReadManifestPage:
 		scratch = replicatedstate.MaxTransactionRecoveryPayloadArenaBytes
-	case replicatedstate.TransactionRecoveryLookupParticipant:
+	case replicatedstate.TransactionRecoveryLookupTarget:
 	case replicatedstate.TransactionRecoveryScanCoordinator:
 		records = int(request.MaxRows)
 	default:

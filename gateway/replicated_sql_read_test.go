@@ -119,7 +119,7 @@ func TestReplicatedSQLReadCrossGroupReturnsObservationVector(t *testing.T) {
 	}
 }
 
-func TestReplicatedSQLReadDrainsSixtyFiveGroupsWithoutParticipantCap(t *testing.T) {
+func TestReplicatedSQLReadDrainsSixtyFiveGroupsWithoutTargetCap(t *testing.T) {
 	fixture := newScatterCatalogFixture(t, 65, 5)
 	client := &scatterReadClient{delay: 200 * time.Microsecond}
 	reader := newScatterReader(t, fixture, client, nil, 3)

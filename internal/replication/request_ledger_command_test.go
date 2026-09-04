@@ -148,10 +148,10 @@ func TestRequestLedgerRejectsRelationCountFields(t *testing.T) {
 }
 
 func TestTransactionRelationCountMatrixRemainsClosed(t *testing.T) {
-	withRelations := encodeCommand(t, testParticipantStageCommand(t))
+	withRelations := encodeCommand(t, testTargetStageCommand(t))
 	withoutRelationsCommand := testTransactionTransitionCommand(t, distributedtxn.ReplicatedCommand{
-		Role:      distributedtxn.ReplicatedRoleParticipant,
-		Operation: distributedtxn.ReplicatedPrepareParticipant,
+		Role:      distributedtxn.ReplicatedRoleTarget,
+		Operation: distributedtxn.ReplicatedPrepareTarget,
 		ID:        transactionControlID(0xd7), ExpectedRevision: 1,
 		PayloadKind: distributedtxn.ReplicatedPayloadNone,
 	})

@@ -14,11 +14,11 @@ func replicatedTestCoordinator(t testing.TB) []byte {
 	payload, err := AppendCoordinator(nil, CoordinatorRecord{
 		ID: testID(), State: CoordinatorStaging, Revision: 1,
 		CatalogGeneration: 9, RecoveryDeadline: 100,
-		Participants: []ParticipantRef{{
+		Targets: []TransactionTargetRef{{
 			Distribution: []byte("docs"), Shard: []byte("-80"),
 			RoutingVersion: 3, AllocationGeneration: 5, OwnershipEpoch: 7,
 			AuthorityWitness: authorityWitness("docs/-80"),
-			MutationDigest:   digest("mutation"), State: ParticipantStaged,
+			MutationDigest:   digest("mutation"), State: TargetStaged,
 		}},
 	})
 	if err != nil {
@@ -27,14 +27,14 @@ func replicatedTestCoordinator(t testing.TB) []byte {
 	return payload
 }
 
-func replicatedTestParticipant() ReplicatedCommand {
+func replicatedTestTarget() ReplicatedCommand {
 	group, incarnation := testID(), testID()
 	group[0], incarnation[0] = 1, 2
 	return ReplicatedCommand{
-		Role: ReplicatedRoleParticipant, Operation: ReplicatedStageParticipant,
-		ID: testID(), PayloadKind: ReplicatedPayloadParticipantStage,
+		Role: ReplicatedRoleTarget, Operation: ReplicatedStageTarget,
+		ID: testID(), PayloadKind: ReplicatedPayloadTargetStage,
 		ControllerEpoch: 7, ExecutionPinDigest: digest("execution-pin"),
-		Participant: ParticipantStage{
+		Target: TransactionTargetStage{
 			CoordinatorGroup: group, CoordinatorShardIncarnation: incarnation,
 			CoordinatorAllocation: 11, BucketBits: 8,
 			IntentScopes:   []IntentScope{{Start: 1, End: 3}, {Start: 7, End: 9}},
@@ -49,14 +49,14 @@ func fencedReplicatedTestCommand(command ReplicatedCommand) ReplicatedCommand {
 	return command
 }
 
-func TestReplicatedParticipantStageRoundTripCanonicalAndCompact(t *testing.T) {
-	command := replicatedTestParticipant()
+func TestReplicatedTargetStageRoundTripCanonicalAndCompact(t *testing.T) {
+	command := replicatedTestTarget()
 	encoded, err := AppendReplicatedCommand([]byte("prefix"), command)
 	if err != nil {
 		t.Fatal(err)
 	}
 	encoded = encoded[len("prefix"):]
-	wantBytes := replicatedCommandHeaderBytes + len(command.Participant.IntentScopes)*8 + 4
+	wantBytes := replicatedCommandHeaderBytes + len(command.Target.IntentScopes)*8 + 4
 	if len(encoded) != wantBytes {
 		t.Fatalf("encoded bytes = %d, want %d", len(encoded), wantBytes)
 	}
@@ -71,8 +71,8 @@ func TestReplicatedParticipantStageRoundTripCanonicalAndCompact(t *testing.T) {
 	if !bytes.Equal(view.Bytes(), encoded) || view.ID != command.ID ||
 		view.ControllerEpoch != command.ControllerEpoch ||
 		view.ExecutionPinDigest != command.ExecutionPinDigest ||
-		view.Participant.MutationDigest != command.Participant.MutationDigest ||
-		!slices.Equal(view.Participant.IntentScopes, command.Participant.IntentScopes) ||
+		view.Target.MutationDigest != command.Target.MutationDigest ||
+		!slices.Equal(view.Target.IntentScopes, command.Target.IntentScopes) ||
 		len(view.Payload) != 0 {
 		t.Fatalf("round trip = %+v", view.ReplicatedCommand)
 	}
@@ -109,7 +109,7 @@ func TestReplicatedCoordinatorRecordGrammarsAndTransitions(t *testing.T) {
 			ID: testID(), ExpectedRevision: 1, PayloadKind: ReplicatedPayloadManifestSegment, Payload: pages[1]},
 		{Role: ReplicatedRoleCoordinator, Operation: ReplicatedCommitCoordinator,
 			ID: testID(), ExpectedRevision: 2, PayloadKind: ReplicatedPayloadNone},
-		{Role: ReplicatedRoleParticipant, Operation: ReplicatedPrepareParticipant,
+		{Role: ReplicatedRoleTarget, Operation: ReplicatedPrepareTarget,
 			ID: testID(), ExpectedRevision: 1, PayloadKind: ReplicatedPayloadNone},
 	}
 	for i, command := range cases {
@@ -178,7 +178,7 @@ func TestReplicatedCoordinatorRecoveryPulseUsesReservedByteCanonically(t *testin
 }
 
 func TestReplicatedCommandRejectsNonCanonicalAndMismatchedInputs(t *testing.T) {
-	valid, err := AppendReplicatedCommand(nil, replicatedTestParticipant())
+	valid, err := AppendReplicatedCommand(nil, replicatedTestTarget())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,13 +213,13 @@ func TestReplicatedCommandRejectsNonCanonicalAndMismatchedInputs(t *testing.T) {
 		t.Fatal("accepted noncanonical embedded coordinator record")
 	}
 
-	wrong := replicatedTestParticipant()
+	wrong := replicatedTestTarget()
 	wrong.ExpectedRevision = 1
 	if _, appendErr := AppendReplicatedCommand(nil, wrong); appendErr == nil {
 		t.Fatal("accepted nonzero creation revision")
 	}
-	wrong = replicatedTestParticipant()
-	wrong.Participant.IntentScopes[1] = IntentScope{Start: 2, End: 8}
+	wrong = replicatedTestTarget()
+	wrong.Target.IntentScopes[1] = IntentScope{Start: 2, End: 8}
 	if _, appendErr := AppendReplicatedCommand(nil, wrong); appendErr == nil {
 		t.Fatal("accepted overlapping participant scopes")
 	}
@@ -255,13 +255,13 @@ func TestReplicatedCommandRejectsNonCanonicalAndMismatchedInputs(t *testing.T) {
 }
 
 func TestReplicatedCommandStrictBounds(t *testing.T) {
-	command := replicatedTestParticipant()
-	command.Participant.IntentScopes = make([]IntentScope, MaxIntentScopes)
-	for i := range command.Participant.IntentScopes {
+	command := replicatedTestTarget()
+	command.Target.IntentScopes = make([]IntentScope, MaxIntentScopes)
+	for i := range command.Target.IntentScopes {
 		start := uint32(i * 2)
-		command.Participant.IntentScopes[i] = IntentScope{Start: start, End: start + 1}
+		command.Target.IntentScopes[i] = IntentScope{Start: start, End: start + 1}
 	}
-	command.Participant.BucketBits = 24
+	command.Target.BucketBits = 24
 	encoded, err := AppendReplicatedCommand(nil, command)
 	if err != nil {
 		t.Fatal(err)
@@ -269,19 +269,19 @@ func TestReplicatedCommandStrictBounds(t *testing.T) {
 	if _, err = OpenReplicatedCommandInto(encoded, make([]IntentScope, MaxIntentScopes-1)); err == nil {
 		t.Fatal("accepted undersized caller scratch")
 	}
-	command.Participant.IntentScopes = append(command.Participant.IntentScopes, IntentScope{Start: 1000, End: 1001})
+	command.Target.IntentScopes = append(command.Target.IntentScopes, IntentScope{Start: 1000, End: 1001})
 	if _, err = AppendReplicatedCommand(nil, command); err == nil {
 		t.Fatal("accepted too many intent scopes")
 	}
 }
 
 func TestReplicatedCommandPreSizedAppendAllocatesZero(t *testing.T) {
-	participant := replicatedTestParticipant()
-	participantBytes := replicatedCommandHeaderBytes + len(participant.Participant.IntentScopes)*8 + 4
-	participantDst := make([]byte, 0, participantBytes)
+	target := replicatedTestTarget()
+	targetBytes := replicatedCommandHeaderBytes + len(target.Target.IntentScopes)*8 + 4
+	targetDst := make([]byte, 0, targetBytes)
 	if got := testing.AllocsPerRun(1000, func() {
 		var err error
-		participantDst, err = AppendReplicatedCommand(participantDst[:0], participant)
+		targetDst, err = AppendReplicatedCommand(targetDst[:0], target)
 		if err != nil {
 			panic(err)
 		}
@@ -333,17 +333,17 @@ func TestReplicatedCommandPreSizedAppendAllocatesZero(t *testing.T) {
 }
 
 func TestReplicatedCommandSizeExactParityAndAllocatesZero(t *testing.T) {
-	participant := replicatedTestParticipant()
-	size, err := ReplicatedCommandSize(participant)
+	target := replicatedTestTarget()
+	size, err := ReplicatedCommandSize(target)
 	if err != nil {
 		t.Fatal(err)
 	}
-	encoded, err := AppendReplicatedCommand(make([]byte, 0, size), participant)
+	encoded, err := AppendReplicatedCommand(make([]byte, 0, size), target)
 	if err != nil || len(encoded) != size {
 		t.Fatalf("participant size=%d encoded=%d err=%v", size, len(encoded), err)
 	}
 	if got := testing.AllocsPerRun(1000, func() {
-		measured, sizeErr := ReplicatedCommandSize(participant)
+		measured, sizeErr := ReplicatedCommandSize(target)
 		if sizeErr != nil || measured != size {
 			panic("replicated command size diverged")
 		}
@@ -351,7 +351,7 @@ func TestReplicatedCommandSizeExactParityAndAllocatesZero(t *testing.T) {
 		t.Fatalf("replicated command size allocs = %v", got)
 	}
 
-	invalid := participant
+	invalid := target
 	invalid.ID = ID{}
 	if measured, sizeErr := ReplicatedCommandSize(invalid); sizeErr == nil || measured != 0 {
 		t.Fatalf("invalid size=%d err=%v", measured, sizeErr)
@@ -407,7 +407,7 @@ func TestAppendReplicatedCommandRejectsPayloadAppendRegionOverlapWithoutMutation
 }
 
 func TestValidateReplicatedCommandAllocatesZero(t *testing.T) {
-	participant, err := AppendReplicatedCommand(nil, replicatedTestParticipant())
+	target, err := AppendReplicatedCommand(nil, replicatedTestTarget())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -444,7 +444,7 @@ func TestValidateReplicatedCommandAllocatesZero(t *testing.T) {
 		t.Fatal(err)
 	}
 	for name, raw := range map[string][]byte{
-		"participant": participant, "inline": inline, "manifest-start": manifestStart,
+		"participant": target, "inline": inline, "manifest-start": manifestStart,
 		"segment": segment,
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -459,14 +459,14 @@ func TestValidateReplicatedCommandAllocatesZero(t *testing.T) {
 	}
 }
 
-func fusedParticipantStage(operation ReplicatedOperation, ordinal uint32, mutation Digest) ParticipantStage {
+func fusedTargetStage(operation ReplicatedOperation, ordinal uint32, mutation Digest) TransactionTargetStage {
 	group, incarnation := testID(), testID()
 	group[0], incarnation[0] = 31, 47
-	return ParticipantStage{
+	return TransactionTargetStage{
 		CoordinatorGroup: group, CoordinatorShardIncarnation: incarnation,
 		CoordinatorAllocation: 19, BucketBits: 8,
 		IntentScopes:   []IntentScope{{Start: 1, End: 4}, {Start: 8, End: 11}},
-		MutationDigest: mutation, ParticipantOrdinal: ordinal,
+		MutationDigest: mutation, TargetOrdinal: ordinal,
 	}
 }
 
@@ -478,37 +478,37 @@ func appendManifestPages(dst []byte, pages [][]byte) []byte {
 }
 
 func TestFusedReplicatedOperationsUseFreshCanonicalCodes(t *testing.T) {
-	if ReplicatedBeginPrepareCoordinator <= ReplicatedReleaseParticipant ||
-		ReplicatedBeginPrepareManifestCoordinator <= ReplicatedReleaseParticipant ||
-		ReplicatedAppendManifestSegments <= ReplicatedReleaseParticipant ||
-		ReplicatedStagePrepareParticipant <= ReplicatedReleaseParticipant ||
-		ReplicatedApplyReleaseParticipant <= ReplicatedReleaseParticipant ||
-		ReplicatedAbortReleaseParticipant <= ReplicatedReleaseParticipant ||
-		ReplicatedApplySingleParticipant <= ReplicatedReleaseParticipant {
+	if ReplicatedBeginPrepareCoordinator <= ReplicatedReleaseTarget ||
+		ReplicatedBeginPrepareManifestCoordinator <= ReplicatedReleaseTarget ||
+		ReplicatedAppendManifestSegments <= ReplicatedReleaseTarget ||
+		ReplicatedStagePrepareTarget <= ReplicatedReleaseTarget ||
+		ReplicatedApplyReleaseTarget <= ReplicatedReleaseTarget ||
+		ReplicatedAbortReleaseTarget <= ReplicatedReleaseTarget ||
+		ReplicatedApplySingleTarget <= ReplicatedReleaseTarget {
 		t.Fatal("fused operation aliases an old split operation")
 	}
-	participant := ReplicatedCommand{
-		Role: ReplicatedRoleParticipant, Operation: ReplicatedStagePrepareParticipant,
-		ID: testID(), PayloadKind: ReplicatedPayloadParticipantStage,
-		Participant: fusedParticipantStage(
-			ReplicatedStagePrepareParticipant, 4096, digest("fused-participant"),
+	target := ReplicatedCommand{
+		Role: ReplicatedRoleTarget, Operation: ReplicatedStagePrepareTarget,
+		ID: testID(), PayloadKind: ReplicatedPayloadTargetStage,
+		Target: fusedTargetStage(
+			ReplicatedStagePrepareTarget, 4096, digest("fused-participant"),
 		),
 	}
-	participant = fencedReplicatedTestCommand(participant)
-	encoded, err := AppendReplicatedCommand(nil, participant)
+	target = fencedReplicatedTestCommand(target)
+	encoded, err := AppendReplicatedCommand(nil, target)
 	if err != nil {
 		t.Fatal(err)
 	}
 	view, err := OpenReplicatedCommand(encoded)
-	if err != nil || view.Operation != ReplicatedStagePrepareParticipant ||
-		view.Participant.ParticipantOrdinal != 4096 {
+	if err != nil || view.Operation != ReplicatedStagePrepareTarget ||
+		view.Target.TargetOrdinal != 4096 {
 		t.Fatalf("fused participant = %+v err=%v", view.ReplicatedCommand, err)
 	}
 	for _, operation := range []ReplicatedOperation{
-		ReplicatedApplyReleaseParticipant, ReplicatedAbortReleaseParticipant,
+		ReplicatedApplyReleaseTarget, ReplicatedAbortReleaseTarget,
 	} {
 		command := ReplicatedCommand{
-			Role: ReplicatedRoleParticipant, Operation: operation, ID: testID(),
+			Role: ReplicatedRoleTarget, Operation: operation, ID: testID(),
 			ExpectedRevision: 2, PayloadKind: ReplicatedPayloadNone,
 		}
 		command = fencedReplicatedTestCommand(command)
@@ -517,34 +517,34 @@ func TestFusedReplicatedOperationsUseFreshCanonicalCodes(t *testing.T) {
 		}
 	}
 	direct := ReplicatedCommand{
-		Role: ReplicatedRoleParticipant, Operation: ReplicatedApplySingleParticipant,
+		Role: ReplicatedRoleTarget, Operation: ReplicatedApplySingleTarget,
 		ID: testID(), ExpectedRevision: 9,
-		PayloadKind: ReplicatedPayloadParticipantStage,
-		Participant: fusedParticipantStage(
-			ReplicatedApplySingleParticipant, 0, digest("direct-participant"),
+		PayloadKind: ReplicatedPayloadTargetStage,
+		Target: fusedTargetStage(
+			ReplicatedApplySingleTarget, 0, digest("direct-participant"),
 		),
 	}
 	direct = fencedReplicatedTestCommand(direct)
 	if _, err := AppendReplicatedCommand(nil, direct); err != nil {
 		t.Fatalf("direct operation: %v", err)
 	}
-	old := participant
-	old.Operation = ReplicatedStageParticipant
+	old := target
+	old.Operation = ReplicatedStageTarget
 	if _, err := AppendReplicatedCommand(nil, old); err == nil {
 		t.Fatal("old stage accepted fused participant ordinal")
 	}
 }
 
-func TestReplicatedParticipantAbortFenceIsCanonicalAndCompact(t *testing.T) {
-	stage := fusedParticipantStage(
-		ReplicatedAbortReleaseParticipant, 4096, digest("abort-fence"),
+func TestReplicatedTargetAbortFenceIsCanonicalAndCompact(t *testing.T) {
+	stage := fusedTargetStage(
+		ReplicatedAbortReleaseTarget, 4096, digest("abort-fence"),
 	)
 	stage.BucketBits = 0
 	stage.IntentScopes = nil
 	command := ReplicatedCommand{
-		Role: ReplicatedRoleParticipant, Operation: ReplicatedAbortReleaseParticipant,
-		ID: testID(), PayloadKind: ReplicatedPayloadParticipantStage,
-		Participant: stage,
+		Role: ReplicatedRoleTarget, Operation: ReplicatedAbortReleaseTarget,
+		ID: testID(), PayloadKind: ReplicatedPayloadTargetStage,
+		Target: stage,
 	}
 	command = fencedReplicatedTestCommand(command)
 	encoded, err := AppendReplicatedCommand(nil, command)
@@ -557,9 +557,9 @@ func TestReplicatedParticipantAbortFenceIsCanonicalAndCompact(t *testing.T) {
 	var scopes [MaxIntentScopes]IntentScope
 	view, err := OpenReplicatedCommandInto(encoded, scopes[:])
 	if err != nil || view.ExpectedRevision != 0 ||
-		view.PayloadKind != ReplicatedPayloadParticipantStage ||
-		view.Participant.MutationDigest != stage.MutationDigest ||
-		view.Participant.ParticipantOrdinal != 4096 {
+		view.PayloadKind != ReplicatedPayloadTargetStage ||
+		view.Target.MutationDigest != stage.MutationDigest ||
+		view.Target.TargetOrdinal != 4096 {
 		t.Fatalf("abort fence=%+v err=%v", view.ReplicatedCommand, err)
 	}
 	reencoded, err := AppendReplicatedCommand(nil, view.Command())
@@ -575,16 +575,16 @@ func TestReplicatedParticipantAbortFenceIsCanonicalAndCompact(t *testing.T) {
 	}
 }
 
-func TestReplicatedParticipantAbortFenceRejectsAmbiguousShapes(t *testing.T) {
-	stage := fusedParticipantStage(
-		ReplicatedAbortReleaseParticipant, 4096, digest("abort-fence"),
+func TestReplicatedTargetAbortFenceRejectsAmbiguousShapes(t *testing.T) {
+	stage := fusedTargetStage(
+		ReplicatedAbortReleaseTarget, 4096, digest("abort-fence"),
 	)
 	stage.BucketBits = 0
 	stage.IntentScopes = nil
 	valid := ReplicatedCommand{
-		Role: ReplicatedRoleParticipant, Operation: ReplicatedAbortReleaseParticipant,
-		ID: testID(), PayloadKind: ReplicatedPayloadParticipantStage,
-		Participant: stage,
+		Role: ReplicatedRoleTarget, Operation: ReplicatedAbortReleaseTarget,
+		ID: testID(), PayloadKind: ReplicatedPayloadTargetStage,
+		Target: stage,
 	}
 	valid = fencedReplicatedTestCommand(valid)
 	tests := []func(*ReplicatedCommand){
@@ -592,13 +592,13 @@ func TestReplicatedParticipantAbortFenceRejectsAmbiguousShapes(t *testing.T) {
 		func(c *ReplicatedCommand) { c.ExpectedRevision = 2 },
 		func(c *ReplicatedCommand) { c.Payload = []byte{1} },
 		func(c *ReplicatedCommand) {
-			c.Participant.BucketBits = 8
-			c.Participant.IntentScopes = []IntentScope{{Start: 1, End: 2}}
+			c.Target.BucketBits = 8
+			c.Target.IntentScopes = []IntentScope{{Start: 1, End: 2}}
 		},
-		func(c *ReplicatedCommand) { c.Participant.CoordinatorGroup = ID{} },
-		func(c *ReplicatedCommand) { c.Participant.CoordinatorShardIncarnation = ID{} },
-		func(c *ReplicatedCommand) { c.Participant.CoordinatorAllocation = 0 },
-		func(c *ReplicatedCommand) { c.Participant.MutationDigest = Digest{} },
+		func(c *ReplicatedCommand) { c.Target.CoordinatorGroup = ID{} },
+		func(c *ReplicatedCommand) { c.Target.CoordinatorShardIncarnation = ID{} },
+		func(c *ReplicatedCommand) { c.Target.CoordinatorAllocation = 0 },
+		func(c *ReplicatedCommand) { c.Target.MutationDigest = Digest{} },
 	}
 	for index, mutate := range tests {
 		candidate := valid
@@ -610,21 +610,21 @@ func TestReplicatedParticipantAbortFenceRejectsAmbiguousShapes(t *testing.T) {
 	transition := valid
 	transition.ExpectedRevision = 2
 	transition.PayloadKind = ReplicatedPayloadNone
-	transition.Participant = ParticipantStage{}
+	transition.Target = TransactionTargetStage{}
 	if _, err := AppendReplicatedCommand(nil, transition); err != nil {
 		t.Fatalf("ordinary abort-release rejected: %v", err)
 	}
 }
 
-func TestFusedInlineCoordinatorBindsParticipantOrdinal(t *testing.T) {
+func TestFusedInlineCoordinatorBindsTargetOrdinal(t *testing.T) {
 	payload := replicatedTestCoordinator(t)
-	stage := fusedParticipantStage(
+	stage := fusedTargetStage(
 		ReplicatedBeginPrepareCoordinator, 0, digest("mutation"),
 	)
 	command := ReplicatedCommand{
 		Role: ReplicatedRoleCoordinator, Operation: ReplicatedBeginPrepareCoordinator,
 		ID: testID(), PayloadKind: ReplicatedPayloadCoordinator,
-		Payload: payload, Participant: stage,
+		Payload: payload, Target: stage,
 	}
 	command = fencedReplicatedTestCommand(command)
 	encoded, err := AppendReplicatedCommand(nil, command)
@@ -634,17 +634,17 @@ func TestFusedInlineCoordinatorBindsParticipantOrdinal(t *testing.T) {
 	if err := ValidateReplicatedCommand(encoded); err != nil {
 		t.Fatal(err)
 	}
-	want := ParticipantRef{
+	want := TransactionTargetRef{
 		Distribution: []byte("docs"), Shard: []byte("-80"),
 		RoutingVersion: 3, AllocationGeneration: 5, OwnershipEpoch: 7,
 		AuthorityWitness: authorityWitness("docs/-80"),
-		MutationDigest:   digest("mutation"), State: ParticipantStaged,
+		MutationDigest:   digest("mutation"), State: TargetStaged,
 	}
-	present, matches, err := ReplicatedCoordinatorBindsParticipant(payload, 0, want)
+	present, matches, err := ReplicatedCoordinatorBindsTarget(payload, 0, want)
 	if err != nil || !present || !matches {
 		t.Fatalf("inline bind = %t/%t err=%v", present, matches, err)
 	}
-	command.Participant.MutationDigest[0] ^= 1
+	command.Target.MutationDigest[0] ^= 1
 	if _, err := AppendReplicatedCommand(nil, command); err == nil {
 		t.Fatal("inline begin accepted mismatched participant digest")
 	}
@@ -658,7 +658,7 @@ func TestManifestSegmentSequenceFusedPackingAndOrdinalBinding(t *testing.T) {
 	initialBytes := appendManifestPages(nil, pages[:MaxManifestSegmentsPerCommand])
 	initial, err := OpenManifestSegmentSequence(initialBytes)
 	if err != nil || initial.Count() != MaxManifestSegmentsPerCommand ||
-		initial.FirstIndex() != 0 || initial.FirstParticipant() != 0 ||
+		initial.FirstIndex() != 0 || initial.FirstTarget() != 0 ||
 		initial.EncodedBytes() != uint64(len(initialBytes)) {
 		t.Fatalf("initial sequence = %+v err=%v", initial, err)
 	}
@@ -683,14 +683,14 @@ func TestManifestSegmentSequenceFusedPackingAndOrdinalBinding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ordinal := uint32(initial.ParticipantCount() - 1)
-	want := manifestParticipant(uint64(ordinal))
+	ordinal := uint32(initial.TargetCount() - 1)
+	want := manifestTarget(uint64(ordinal))
 	command := ReplicatedCommand{
 		Role:      ReplicatedRoleCoordinator,
 		Operation: ReplicatedBeginPrepareManifestCoordinator,
 		ID:        testID(), PayloadKind: ReplicatedPayloadManifestCoordinator,
 		Payload: appendManifestPages(coordinator, pages[:MaxManifestSegmentsPerCommand]),
-		Participant: fusedParticipantStage(
+		Target: fusedTargetStage(
 			ReplicatedBeginPrepareManifestCoordinator, ordinal, want.MutationDigest,
 		),
 	}
@@ -702,14 +702,14 @@ func TestManifestSegmentSequenceFusedPackingAndOrdinalBinding(t *testing.T) {
 	if err := ValidateReplicatedCommand(encoded); err != nil {
 		t.Fatal(err)
 	}
-	present, matches, err := ReplicatedCoordinatorBindsParticipant(
+	present, matches, err := ReplicatedCoordinatorBindsTarget(
 		command.Payload, uint64(ordinal), want,
 	)
 	if err != nil || !present || !matches {
 		t.Fatalf("manifest bind = %t/%t err=%v", present, matches, err)
 	}
-	present, matches, err = ReplicatedCoordinatorBindsParticipant(
-		command.Payload, initial.ParticipantCount(), manifestParticipant(initial.ParticipantCount()),
+	present, matches, err = ReplicatedCoordinatorBindsTarget(
+		command.Payload, initial.TargetCount(), manifestTarget(initial.TargetCount()),
 	)
 	if err != nil || present || matches {
 		t.Fatalf("deferred bind = %t/%t err=%v", present, matches, err)
@@ -756,15 +756,15 @@ func TestManifestSegmentSequenceStrictCorruptionAndZeroAllocation(t *testing.T) 
 		t.Fatal("missing first page")
 	}
 	page := first.Segment()
-	want := manifestParticipant(page.FirstParticipant)
-	present, matches, err := ManifestSegmentMatchesParticipant(
-		page.Raw, page.FirstParticipant, want,
+	want := manifestTarget(page.FirstTarget)
+	present, matches, err := ManifestSegmentMatchesTarget(
+		page.Raw, page.FirstTarget, want,
 	)
 	if err != nil || !present || !matches {
 		t.Fatalf("page match=%t/%t err=%v", present, matches, err)
 	}
-	present, matches, err = ManifestSegmentMatchesParticipant(
-		page.Raw, page.FirstParticipant+uint64(page.ParticipantCount), want,
+	present, matches, err = ManifestSegmentMatchesTarget(
+		page.Raw, page.FirstTarget+uint64(page.TargetCount), want,
 	)
 	if err != nil || present || matches {
 		t.Fatalf("outside match=%t/%t err=%v", present, matches, err)
@@ -807,7 +807,7 @@ func TestManifestSegmentSequenceFollowsStrictIdentityBoundary(t *testing.T) {
 		t.Fatalf("boundary validation allocations=%v", got)
 	}
 
-	onePage := func(participant ParticipantRef) []byte {
+	onePage := func(target TransactionTargetRef) []byte {
 		t.Helper()
 		arena := make([]byte, ManifestSegmentBytes)
 		var raw []byte
@@ -818,7 +818,7 @@ func TestManifestSegmentSequenceFollowsStrictIdentityBoundary(t *testing.T) {
 		if buildErr != nil {
 			t.Fatal(buildErr)
 		}
-		if buildErr = builder.Append(participant); buildErr != nil {
+		if buildErr = builder.Append(target); buildErr != nil {
 			t.Fatal(buildErr)
 		}
 		if _, buildErr = builder.Seal(); buildErr != nil {
@@ -826,7 +826,7 @@ func TestManifestSegmentSequenceFollowsStrictIdentityBoundary(t *testing.T) {
 		}
 		return raw
 	}
-	previous := onePage(manifestParticipant(100))
+	previous := onePage(manifestTarget(100))
 	for _, tc := range []struct {
 		name  string
 		index uint64
@@ -835,7 +835,7 @@ func TestManifestSegmentSequenceFollowsStrictIdentityBoundary(t *testing.T) {
 		{name: "reordered", index: 99},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			candidate, openErr := OpenManifestSegmentSequence(onePage(manifestParticipant(tc.index)))
+			candidate, openErr := OpenManifestSegmentSequence(onePage(manifestTarget(tc.index)))
 			if openErr != nil {
 				t.Fatal(openErr)
 			}
@@ -851,11 +851,11 @@ func TestFusedReplicatedCommandExactMaximum(t *testing.T) {
 	if MaxReplicatedCommandBytes != want {
 		t.Fatalf("max replicated command=%d want=%d", MaxReplicatedCommandBytes, want)
 	}
-	const singleParticipantWant = 2220
-	if MaxSingleParticipantControlBytes != singleParticipantWant {
+	const singleTargetWant = 2220
+	if MaxSingleTargetControlBytes != singleTargetWant {
 		t.Fatalf(
 			"max single-participant control=%d want=%d",
-			MaxSingleParticipantControlBytes, singleParticipantWant,
+			MaxSingleTargetControlBytes, singleTargetWant,
 		)
 	}
 }

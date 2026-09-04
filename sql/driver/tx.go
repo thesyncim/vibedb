@@ -89,25 +89,25 @@ type txTable struct {
 // tx owns one coherent generation-leased cut. Read Committed replaces its base
 // snapshots at statement boundaries; fixed-cut modes retain the BEGIN cut. The
 // dirty set is every table with a non-empty overlay; COMMIT validates each
-// participant and publishes through Collection.Update or UpdateCollections.
+// target and publishes through Collection.Update or UpdateCollections.
 type tx struct {
-	borrowedSnapshots      bool
-	conn                   *conn
-	tables                 map[string]*txTable
-	views                  map[string]*viewMeta
-	layoutEpoch            *catalogLayoutEpoch
-	refreshStates          []*txTable
-	refreshStaged          map[string]*txTable
-	savepoints             []savepointFrame
-	readOnly               bool
-	isolation              IsolationLevel
-	done                   bool
-	staged                 []stagedTxMutation
-	serialReadKeys         int
-	serialReadBytes        int
-	serialReadRetained     int
-	distributedParticipant *distributedParticipantCommit
-	primaryMutationGuard   *primaryMutationGuard
+	borrowedSnapshots    bool
+	conn                 *conn
+	tables               map[string]*txTable
+	views                map[string]*viewMeta
+	layoutEpoch          *catalogLayoutEpoch
+	refreshStates        []*txTable
+	refreshStaged        map[string]*txTable
+	savepoints           []savepointFrame
+	readOnly             bool
+	isolation            IsolationLevel
+	done                 bool
+	staged               []stagedTxMutation
+	serialReadKeys       int
+	serialReadBytes      int
+	serialReadRetained   int
+	distributedTarget    *distributedTargetCommit
+	primaryMutationGuard *primaryMutationGuard
 }
 
 var (
@@ -2144,7 +2144,7 @@ func (t *tx) Commit() error {
 		return ErrDistributedTransactionConflict
 	}
 	dirtyNames := t.dirtyTableNames()
-	if len(dirtyNames) == 0 && t.distributedParticipant == nil {
+	if len(dirtyNames) == 0 && t.distributedTarget == nil {
 		return nil
 	}
 	if err := t.conn.requireDirectWriteAllowed(); err != nil {
@@ -2157,7 +2157,7 @@ func (t *tx) Commit() error {
 	if err := t.conn.db.settleCatalogLocked(); err != nil {
 		return err
 	}
-	if err := t.checkDistributedParticipantLocked(); err != nil {
+	if err := t.checkDistributedTargetLocked(); err != nil {
 		return err
 	}
 	if t.isolation == IsolationSerializable {
@@ -2271,7 +2271,7 @@ func (t *tx) Commit() error {
 		}
 	}
 
-	if len(dirty) == 1 && t.distributedParticipant == nil {
+	if len(dirty) == 1 && t.distributedTarget == nil {
 		return t.commitOneTable(dirty[0].name, dirty[0].table, dirty[0].state)
 	}
 	return t.commitManyTables(dirty)
@@ -2356,7 +2356,7 @@ func (t *tx) commitManyTables(dirty []commitDirtyTable) error {
 			Name: name, Collection: table.collection,
 		})
 	}
-	if t.distributedParticipant != nil {
+	if t.distributedTarget != nil {
 		if t.conn.db.distributedTxnCollection == nil {
 			return errors.New("vibedb: distributed transaction state collection is not open")
 		}
@@ -2394,12 +2394,12 @@ func (t *tx) commitManyTables(dirty []commitDirtyTable) error {
 					return fillErr
 				}
 			}
-			if t.distributedParticipant != nil {
+			if t.distributedTarget != nil {
 				wb, batchErr := batch.Collection(distributedTransactionMember)
 				if batchErr != nil {
 					return batchErr
 				}
-				if putErr := wb.Put(t.distributedParticipant.id[:], t.distributedParticipant.document); putErr != nil {
+				if putErr := wb.Put(t.distributedTarget.id[:], t.distributedTarget.document); putErr != nil {
 					return transactionBatchError(putErr)
 				}
 			}

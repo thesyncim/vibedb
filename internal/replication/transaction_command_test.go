@@ -43,7 +43,7 @@ func testTransactionRetirementPayload(
 	return encoded
 }
 
-func testParticipantStageCommand(t testing.TB) Command {
+func testTargetStageCommand(t testing.TB) Command {
 	t.Helper()
 	command := testMultiRelationCommand()
 	digest, err := TransactionMutationDigest(command.Batches)
@@ -52,11 +52,11 @@ func testParticipantStageCommand(t testing.TB) Command {
 	}
 	id := transactionControlID(0xd1)
 	control := distributedtxn.ReplicatedCommand{
-		Role:        distributedtxn.ReplicatedRoleParticipant,
-		Operation:   distributedtxn.ReplicatedStageParticipant,
+		Role:        distributedtxn.ReplicatedRoleTarget,
+		Operation:   distributedtxn.ReplicatedStageTarget,
 		ID:          id,
-		PayloadKind: distributedtxn.ReplicatedPayloadParticipantStage,
-		Participant: distributedtxn.ParticipantStage{
+		PayloadKind: distributedtxn.ReplicatedPayloadTargetStage,
+		Target: distributedtxn.TransactionTargetStage{
 			CoordinatorGroup:            transactionControlID(0x31),
 			CoordinatorShardIncarnation: transactionControlID(0x51),
 			CoordinatorAllocation:       7,
@@ -70,22 +70,22 @@ func testParticipantStageCommand(t testing.TB) Command {
 	command.Kind = CommandTransaction
 	command.Transaction = encodeTransactionControl(t, control)
 	command.ClientID = ID128(id)
-	command.ClientEpoch = transactionParticipantEpoch
+	command.ClientEpoch = transactionTargetEpoch
 	command.ClientSequence = 1
 	command.AckThrough = 0
 	return command
 }
 
-func testFusedParticipantStageCommand(t testing.TB) Command {
+func testFusedTargetStageCommand(t testing.TB) Command {
 	t.Helper()
-	command := testParticipantStageCommand(t)
+	command := testTargetStageCommand(t)
 	view, err := distributedtxn.OpenReplicatedCommand(command.Transaction)
 	if err != nil {
 		t.Fatal(err)
 	}
 	control := view.Command()
-	control.Operation = distributedtxn.ReplicatedStagePrepareParticipant
-	control.Participant.ParticipantOrdinal = 7
+	control.Operation = distributedtxn.ReplicatedStagePrepareTarget
+	control.Target.TargetOrdinal = 7
 	command.Transaction = encodeTransactionControl(t, control)
 	sequence, err := TransactionClientSequence(command.Transaction)
 	if err != nil {
@@ -107,7 +107,7 @@ func testTransactionTransitionCommand(
 	if control.Role == distributedtxn.ReplicatedRoleCoordinator {
 		command.ClientEpoch = transactionCoordinatorEpoch
 	} else {
-		command.ClientEpoch = transactionParticipantEpoch
+		command.ClientEpoch = transactionTargetEpoch
 	}
 	sequence, err := TransactionClientSequence(command.Transaction)
 	if err != nil {
@@ -118,8 +118,8 @@ func testTransactionTransitionCommand(
 	return command
 }
 
-func TestTransactionParticipantStageRoundTripBorrowedAndZeroAllocation(t *testing.T) {
-	command := testParticipantStageCommand(t)
+func TestTransactionTargetStageRoundTripBorrowedAndZeroAllocation(t *testing.T) {
+	command := testTargetStageCommand(t)
 	encoded := encodeCommand(t, command)
 	view, err := OpenCommand(encoded)
 	if err != nil {
@@ -134,8 +134,8 @@ func TestTransactionParticipantStageRoundTripBorrowedAndZeroAllocation(t *testin
 		t.Fatal("transaction bytes are not capacity clamped")
 	}
 	role, operation, ok := view.TransactionIdentity()
-	if !ok || role != distributedtxn.ReplicatedRoleParticipant ||
-		operation != distributedtxn.ReplicatedStageParticipant {
+	if !ok || role != distributedtxn.ReplicatedRoleTarget ||
+		operation != distributedtxn.ReplicatedStageTarget {
 		t.Fatalf("transaction identity = (%d,%d,%t)", role, operation, ok)
 	}
 	var scopes [distributedtxn.MaxIntentScopes]distributedtxn.IntentScope
@@ -143,16 +143,16 @@ func TestTransactionParticipantStageRoundTripBorrowedAndZeroAllocation(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if control.Operation != distributedtxn.ReplicatedStageParticipant ||
-		control.Participant.MutationDigest == (distributedtxn.Digest{}) {
+	if control.Operation != distributedtxn.ReplicatedStageTarget ||
+		control.Target.MutationDigest == (distributedtxn.Digest{}) {
 		t.Fatalf("unexpected control: %+v", control.ReplicatedCommand)
 	}
 	if got := testing.AllocsPerRun(1000, func() {
 		opened, openErr := OpenCommand(encoded)
 		openedRole, openedOperation, openedOK := opened.TransactionIdentity()
 		if openErr != nil || len(opened.TransactionBytes()) == 0 || !openedOK ||
-			openedRole != distributedtxn.ReplicatedRoleParticipant ||
-			openedOperation != distributedtxn.ReplicatedStageParticipant {
+			openedRole != distributedtxn.ReplicatedRoleTarget ||
+			openedOperation != distributedtxn.ReplicatedStageTarget {
 			panic(openErr)
 		}
 	}); got != 0 {
@@ -168,16 +168,16 @@ func TestTransactionParticipantStageRoundTripBorrowedAndZeroAllocation(t *testin
 	}
 }
 
-func TestFusedTransactionParticipantStagePrepareRoundTripBorrowedAndZeroAllocation(t *testing.T) {
-	command := testFusedParticipantStageCommand(t)
+func TestFusedTransactionTargetStagePrepareRoundTripBorrowedAndZeroAllocation(t *testing.T) {
+	command := testFusedTargetStageCommand(t)
 	encoded := encodeCommand(t, command)
 	view, err := OpenCommand(encoded)
 	if err != nil {
 		t.Fatal(err)
 	}
 	role, operation, ok := view.TransactionIdentity()
-	if !ok || role != distributedtxn.ReplicatedRoleParticipant ||
-		operation != distributedtxn.ReplicatedStagePrepareParticipant ||
+	if !ok || role != distributedtxn.ReplicatedRoleTarget ||
+		operation != distributedtxn.ReplicatedStagePrepareTarget ||
 		view.RelationCount() != len(command.Batches) ||
 		view.MutationCount() != commandMutationCount(command) {
 		t.Fatalf("fused transaction view = role:%d operation:%d ok:%t relations:%d mutations:%d",
@@ -185,15 +185,15 @@ func TestFusedTransactionParticipantStagePrepareRoundTripBorrowedAndZeroAllocati
 	}
 	var scopes [distributedtxn.MaxIntentScopes]distributedtxn.IntentScope
 	control, err := view.OpenTransactionInto(scopes[:])
-	if err != nil || control.Participant.ParticipantOrdinal != 7 {
+	if err != nil || control.Target.TargetOrdinal != 7 {
 		t.Fatalf("fused transaction control=%+v err=%v", control.ReplicatedCommand, err)
 	}
 	if got := testing.AllocsPerRun(1000, func() {
 		opened, openErr := OpenCommand(encoded)
 		openedRole, openedOperation, openedOK := opened.TransactionIdentity()
 		if openErr != nil || !openedOK ||
-			openedRole != distributedtxn.ReplicatedRoleParticipant ||
-			openedOperation != distributedtxn.ReplicatedStagePrepareParticipant {
+			openedRole != distributedtxn.ReplicatedRoleTarget ||
+			openedOperation != distributedtxn.ReplicatedStagePrepareTarget {
 			panic(openErr)
 		}
 	}); got != 0 {
@@ -202,7 +202,7 @@ func TestFusedTransactionParticipantStagePrepareRoundTripBorrowedAndZeroAllocati
 }
 
 func TestFusedTransactionRelationBatchShapeAndDigestAreExact(t *testing.T) {
-	fused := testFusedParticipantStageCommand(t)
+	fused := testFusedTargetStageCommand(t)
 	withoutBatches := fused
 	withoutBatches.Batches = nil
 	if _, err := AppendCommand(nil, withoutBatches); !errors.Is(err, ErrEnvelopeSemantic) {
@@ -214,7 +214,7 @@ func TestFusedTransactionRelationBatchShapeAndDigestAreExact(t *testing.T) {
 		t.Fatal(err)
 	}
 	wrongDigest := view.Command()
-	wrongDigest.Participant.MutationDigest[0] ^= 1
+	wrongDigest.Target.MutationDigest[0] ^= 1
 	fused.Transaction = encodeTransactionControl(t, wrongDigest)
 	if _, err = AppendCommand(nil, fused); !errors.Is(err, ErrEnvelopeSemantic) {
 		t.Fatalf("fused prepare with mismatched mutation digest error=%v", err)
@@ -222,8 +222,8 @@ func TestFusedTransactionRelationBatchShapeAndDigestAreExact(t *testing.T) {
 
 	id := transactionControlID(0xef)
 	applyRelease := testTransactionTransitionCommand(t, distributedtxn.ReplicatedCommand{
-		Role:      distributedtxn.ReplicatedRoleParticipant,
-		Operation: distributedtxn.ReplicatedApplyReleaseParticipant,
+		Role:      distributedtxn.ReplicatedRoleTarget,
+		Operation: distributedtxn.ReplicatedApplyReleaseTarget,
 		ID:        id, ExpectedRevision: 2, PayloadKind: distributedtxn.ReplicatedPayloadNone,
 	})
 	applyRelease.Batches = testMultiRelationCommand().Batches
@@ -235,8 +235,8 @@ func TestFusedTransactionRelationBatchShapeAndDigestAreExact(t *testing.T) {
 func TestTransactionTransitionsCarryNoRelationBatches(t *testing.T) {
 	id := transactionControlID(0xe1)
 	cases := []distributedtxn.ReplicatedCommand{
-		{Role: distributedtxn.ReplicatedRoleParticipant,
-			Operation: distributedtxn.ReplicatedPrepareParticipant, ID: id,
+		{Role: distributedtxn.ReplicatedRoleTarget,
+			Operation: distributedtxn.ReplicatedPrepareTarget, ID: id,
 			ExpectedRevision: 1, PayloadKind: distributedtxn.ReplicatedPayloadNone},
 		{Role: distributedtxn.ReplicatedRoleCoordinator,
 			Operation: distributedtxn.ReplicatedCommitCoordinator, ID: id,
@@ -247,11 +247,11 @@ func TestTransactionTransitionsCarryNoRelationBatches(t *testing.T) {
 			Payload: testTransactionRetirementPayload(
 				t, distributedtxn.ReplicatedRetirementSummary{},
 			)},
-		{Role: distributedtxn.ReplicatedRoleParticipant,
-			Operation: distributedtxn.ReplicatedApplyReleaseParticipant, ID: id,
+		{Role: distributedtxn.ReplicatedRoleTarget,
+			Operation: distributedtxn.ReplicatedApplyReleaseTarget, ID: id,
 			ExpectedRevision: 2, PayloadKind: distributedtxn.ReplicatedPayloadNone},
-		{Role: distributedtxn.ReplicatedRoleParticipant,
-			Operation: distributedtxn.ReplicatedAbortReleaseParticipant, ID: id,
+		{Role: distributedtxn.ReplicatedRoleTarget,
+			Operation: distributedtxn.ReplicatedAbortReleaseTarget, ID: id,
 			ExpectedRevision: 1, PayloadKind: distributedtxn.ReplicatedPayloadNone},
 	}
 	for _, control := range cases {
@@ -270,12 +270,12 @@ func TestTransactionTransitionsCarryNoRelationBatches(t *testing.T) {
 }
 
 func TestTransactionMutationDigestBindsExactCanonicalRelationBytes(t *testing.T) {
-	command := testParticipantStageCommand(t)
+	command := testTargetStageCommand(t)
 	digest, err := TransactionMutationDigest(command.Batches)
 	if err != nil {
 		t.Fatal(err)
 	}
-	other := testParticipantStageCommand(t)
+	other := testTargetStageCommand(t)
 	other.Batches[2].Mutations[1].Value = []byte("LAST")
 	if got, digestErr := TransactionMutationDigest(other.Batches); digestErr != nil || got == digest {
 		t.Fatalf("changed canonical bytes did not change digest: digest=%x err=%v", got, digestErr)
@@ -355,15 +355,15 @@ func TestStrictConditionalMutationKindsAreCanonicalAndDigestBound(t *testing.T) 
 }
 
 func TestTransactionClientIdentityIsCanonical(t *testing.T) {
-	participantID := transactionControlID(0xf1)
+	targetID := transactionControlID(0xf1)
 	prepare := distributedtxn.ReplicatedCommand{
-		Role:      distributedtxn.ReplicatedRoleParticipant,
-		Operation: distributedtxn.ReplicatedPrepareParticipant, ID: participantID,
+		Role:      distributedtxn.ReplicatedRoleTarget,
+		Operation: distributedtxn.ReplicatedPrepareTarget, ID: targetID,
 		ExpectedRevision: 8, PayloadKind: distributedtxn.ReplicatedPayloadNone,
 	}
-	participant := testTransactionTransitionCommand(t, prepare)
-	if participant.ClientEpoch != 2 || participant.ClientSequence != 9 || participant.AckThrough != 0 {
-		t.Fatalf("participant tuple = (%d,%d,%d)", participant.ClientEpoch, participant.ClientSequence, participant.AckThrough)
+	target := testTransactionTransitionCommand(t, prepare)
+	if target.ClientEpoch != 2 || target.ClientSequence != 9 || target.AckThrough != 0 {
+		t.Fatalf("participant tuple = (%d,%d,%d)", target.ClientEpoch, target.ClientSequence, target.AckThrough)
 	}
 
 	decisionID := transactionControlID(0xa7)
@@ -422,18 +422,18 @@ func TestTransactionClientIdentityIsCanonical(t *testing.T) {
 
 func TestFusedTransactionClientSequencesAreCanonicalAndNonAliasing(t *testing.T) {
 	id := transactionControlID(0xc3)
-	fused := testFusedParticipantStageCommand(t)
+	fused := testFusedTargetStageCommand(t)
 	fusedView, err := distributedtxn.OpenReplicatedCommand(fused.Transaction)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fused.ClientEpoch != transactionParticipantEpoch || fused.ClientSequence != 1 {
+	if fused.ClientEpoch != transactionTargetEpoch || fused.ClientSequence != 1 {
 		t.Fatalf("fused participant tuple=(%d,%d)", fused.ClientEpoch, fused.ClientSequence)
 	}
 
 	split := fusedView.Command()
-	split.Operation = distributedtxn.ReplicatedStageParticipant
-	split.Participant.ParticipantOrdinal = 0
+	split.Operation = distributedtxn.ReplicatedStageTarget
+	split.Target.TargetOrdinal = 0
 	splitBytes := encodeTransactionControl(t, split)
 	splitSequence, err := TransactionClientSequence(splitBytes)
 	if err != nil || splitSequence != fused.ClientSequence || bytes.Equal(splitBytes, fused.Transaction) {
@@ -464,7 +464,7 @@ func TestFusedTransactionClientSequencesAreCanonicalAndNonAliasing(t *testing.T)
 	}
 
 	otherOrdinal := fusedView.Command()
-	otherOrdinal.Participant.ParticipantOrdinal++
+	otherOrdinal.Target.TargetOrdinal++
 	otherOrdinalBytes := encodeTransactionControl(t, otherOrdinal)
 	otherOrdinalSequence, err := TransactionClientSequence(otherOrdinalBytes)
 	if err != nil || otherOrdinalSequence != fused.ClientSequence ||
@@ -484,11 +484,11 @@ func TestFusedTransactionClientSequencesAreCanonicalAndNonAliasing(t *testing.T)
 	}
 
 	for _, operation := range []distributedtxn.ReplicatedOperation{
-		distributedtxn.ReplicatedApplyReleaseParticipant,
-		distributedtxn.ReplicatedAbortReleaseParticipant,
+		distributedtxn.ReplicatedApplyReleaseTarget,
+		distributedtxn.ReplicatedAbortReleaseTarget,
 	} {
 		control := distributedtxn.ReplicatedCommand{
-			Role: distributedtxn.ReplicatedRoleParticipant, Operation: operation,
+			Role: distributedtxn.ReplicatedRoleTarget, Operation: operation,
 			ID: id, ExpectedRevision: 2, PayloadKind: distributedtxn.ReplicatedPayloadNone,
 		}
 		raw := encodeTransactionControl(t, control)
@@ -498,11 +498,11 @@ func TestFusedTransactionClientSequencesAreCanonicalAndNonAliasing(t *testing.T)
 		}
 	}
 	direct := distributedtxn.ReplicatedCommand{
-		Role:      distributedtxn.ReplicatedRoleParticipant,
-		Operation: distributedtxn.ReplicatedApplySingleParticipant,
+		Role:      distributedtxn.ReplicatedRoleTarget,
+		Operation: distributedtxn.ReplicatedApplySingleTarget,
 		ID:        id, ExpectedRevision: 9,
-		PayloadKind: distributedtxn.ReplicatedPayloadParticipantStage,
-		Participant: fusedView.Participant,
+		PayloadKind: distributedtxn.ReplicatedPayloadTargetStage,
+		Target:      fusedView.Target,
 	}
 	directBytes := encodeTransactionControl(t, direct)
 	directSequence, err := TransactionClientSequence(directBytes)
@@ -510,15 +510,15 @@ func TestFusedTransactionClientSequencesAreCanonicalAndNonAliasing(t *testing.T)
 		t.Fatalf("direct issuer sequence=%d err=%v", directSequence, err)
 	}
 	fence := distributedtxn.ReplicatedCommand{
-		Role:      distributedtxn.ReplicatedRoleParticipant,
-		Operation: distributedtxn.ReplicatedAbortReleaseParticipant,
-		ID:        id, PayloadKind: distributedtxn.ReplicatedPayloadParticipantStage,
-		Participant: distributedtxn.ParticipantStage{
+		Role:      distributedtxn.ReplicatedRoleTarget,
+		Operation: distributedtxn.ReplicatedAbortReleaseTarget,
+		ID:        id, PayloadKind: distributedtxn.ReplicatedPayloadTargetStage,
+		Target: distributedtxn.TransactionTargetStage{
 			CoordinatorGroup:            distributedtxn.ID{1},
 			CoordinatorShardIncarnation: distributedtxn.ID{2},
 			CoordinatorAllocation:       3,
 			MutationDigest:              distributedtxn.Digest{4},
-			ParticipantOrdinal:          4096,
+			TargetOrdinal:               4096,
 		},
 	}
 	fenceRaw := encodeTransactionControl(t, fence)
@@ -549,18 +549,18 @@ func TestFusedFinishCommandsDoNotAliasSplitFinishCommands(t *testing.T) {
 		split distributedtxn.ReplicatedOperation
 		fused distributedtxn.ReplicatedOperation
 	}{
-		{name: "apply", split: distributedtxn.ReplicatedApplyParticipant,
-			fused: distributedtxn.ReplicatedApplyReleaseParticipant},
-		{name: "abort", split: distributedtxn.ReplicatedAbortParticipant,
-			fused: distributedtxn.ReplicatedAbortReleaseParticipant},
+		{name: "apply", split: distributedtxn.ReplicatedApplyTarget,
+			fused: distributedtxn.ReplicatedApplyReleaseTarget},
+		{name: "abort", split: distributedtxn.ReplicatedAbortTarget,
+			fused: distributedtxn.ReplicatedAbortReleaseTarget},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			split := testTransactionTransitionCommand(t, distributedtxn.ReplicatedCommand{
-				Role: distributedtxn.ReplicatedRoleParticipant, Operation: test.split,
+				Role: distributedtxn.ReplicatedRoleTarget, Operation: test.split,
 				ID: id, ExpectedRevision: 2, PayloadKind: distributedtxn.ReplicatedPayloadNone,
 			})
 			fused := testTransactionTransitionCommand(t, distributedtxn.ReplicatedCommand{
-				Role: distributedtxn.ReplicatedRoleParticipant, Operation: test.fused,
+				Role: distributedtxn.ReplicatedRoleTarget, Operation: test.fused,
 				ID: id, ExpectedRevision: 2, PayloadKind: distributedtxn.ReplicatedPayloadNone,
 			})
 			if split.ClientSequence != fused.ClientSequence {
@@ -581,7 +581,7 @@ func TestFusedFinishCommandsDoNotAliasSplitFinishCommands(t *testing.T) {
 
 func TestPackedManifestClientSequenceBindsFirstPageOrdinal(t *testing.T) {
 	digest := distributedtxn.Digest{1}
-	refs := transactionPerformanceParticipants(2048, digest)
+	refs := transactionPerformanceTargets(2048, digest)
 	pageScratch := make([]byte, distributedtxn.ManifestSegmentBytes)
 	var pages [][]byte
 	builder, err := distributedtxn.NewManifestBuilder(
@@ -640,7 +640,7 @@ func TestPackedManifestClientSequenceBindsFirstPageOrdinal(t *testing.T) {
 }
 
 func TestTransactionControlLengthAndAliasAreStrict(t *testing.T) {
-	command := testParticipantStageCommand(t)
+	command := testTargetStageCommand(t)
 	encoded := encodeCommand(t, command)
 	bodyStart := commandHeaderBytes + len(command.Tenant) + len(command.Distribution) + len(command.Shard)
 	for _, length := range []uint32{0, uint32(len(command.Transaction) - 1), uint32(len(encoded))} {
@@ -668,7 +668,7 @@ func TestTransactionControlLengthAndAliasAreStrict(t *testing.T) {
 
 func TestTransactionCommandSizePreflightIsExactAllocationFreeAndStrictlyOuter(t *testing.T) {
 	commands := []Command{
-		testFusedParticipantStageCommand(t),
+		testFusedTargetStageCommand(t),
 		testTransactionTransitionCommand(t, distributedtxn.ReplicatedCommand{
 			Role:      distributedtxn.ReplicatedRoleCoordinator,
 			Operation: distributedtxn.ReplicatedCommitCoordinator,
@@ -706,7 +706,7 @@ func TestTransactionCommandSizePreflightIsExactAllocationFreeAndStrictlyOuter(t 
 }
 
 func TestTransactionCommandSizePreflightRejectsBoundsWithoutClaimingControlSemantics(t *testing.T) {
-	full := testFusedParticipantStageCommand(t)
+	full := testFusedTargetStageCommand(t)
 	controlBytes := len(full.Transaction)
 	preflight := full
 	preflight.Transaction = nil
@@ -781,10 +781,10 @@ func TestTransactionGrammarLeavesOrdinaryFramingByteIdentical(t *testing.T) {
 }
 
 func FuzzOpenTransactionCommand(f *testing.F) {
-	f.Add(encodeCommand(f, testParticipantStageCommand(f)))
+	f.Add(encodeCommand(f, testTargetStageCommand(f)))
 	f.Add(encodeCommand(f, testTransactionTransitionCommand(f, distributedtxn.ReplicatedCommand{
-		Role:      distributedtxn.ReplicatedRoleParticipant,
-		Operation: distributedtxn.ReplicatedPrepareParticipant,
+		Role:      distributedtxn.ReplicatedRoleTarget,
+		Operation: distributedtxn.ReplicatedPrepareTarget,
 		ID:        transactionControlID(0xb1), ExpectedRevision: 1,
 		PayloadKind: distributedtxn.ReplicatedPayloadNone,
 	})))

@@ -86,7 +86,7 @@ type ReplacementCandidate struct {
 }
 
 // FailedReplicaPlanningCut contains one exact catalog/Raft/evidence cut. The
-// candidate slice has no participant-count ceiling: selection is O(n), uses
+// candidate slice has no target-count ceiling: selection is O(n), uses
 // constant workspace, and never sorts or copies the pool.
 type FailedReplicaPlanningCut struct {
 	Catalog     *gateway.Snapshot

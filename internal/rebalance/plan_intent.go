@@ -17,7 +17,7 @@ import (
 // MaxPlanIntentBytes bounds the canonical control-plane record. The binary
 // certificate is base64 encoded by vibejson, so twice its strict binary bound
 // leaves room for the fixed request and operation identity without inventing a
-// participant-count restriction.
+// target-count restriction.
 const MaxPlanIntentBytes = 2 * replicatedstate.MaxSnapshotBaseCertificateBytes
 
 var ErrPlanIntent = errors.New("rebalance: invalid persisted replica move intent")

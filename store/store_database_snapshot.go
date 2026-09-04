@@ -39,7 +39,7 @@ import (
 // What it guarantees is the absence of skew: every collection is observed at
 // the same instant, so a generation seen for one collection coexisted with the
 // generation seen for every other. [Database.Update] and [UpdateCollections]
-// publish their participant set atomically. Separate point writes remain
+// publish their target set atomically. Separate point writes remain
 // independent commits, and a snapshot may fall between them.
 type DatabaseSnapshot struct {
 	// entries is ordered by name so lookup can binary-search it, and so a

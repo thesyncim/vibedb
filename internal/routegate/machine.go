@@ -5,7 +5,7 @@ import "math"
 const (
 	// MaxSnapshotBytes is the hard encoded-state admission ceiling used to
 	// derive the maximum retained record count. It bounds one shard's control
-	// state, not the participants in one distributed request.
+	// state, not the targets in one distributed request.
 	MaxSnapshotBytes = uint64(64 << 20)
 
 	// SnapshotHeaderBytes, SnapshotRecordBytes, and SnapshotChecksumBytes are
@@ -107,7 +107,7 @@ type Outcome struct {
 
 // Machine is one shard-local gate. It is intentionally not synchronized:
 // callers apply commands on the owning Raft state-machine lane. maxRecords is
-// a total retained-state admission bound, never a per-request participant cap.
+// a total retained-state admission bound, never a per-request target cap.
 type Machine struct {
 	revision     uint64
 	epoch        uint64
@@ -360,7 +360,7 @@ func (machine *Machine) compact(command Command, writePin bool) (Reason, bool) {
 
 // CompactCandidate returns the deterministic single tombstone reclaimed by
 // the next successful compaction. One-record compaction keeps every replicated
-// transition constant-write without imposing a participant-count ceiling.
+// transition constant-write without imposing a target-count ceiling.
 func (machine *Machine) CompactCandidate() (Identity, bool) {
 	if machine == nil {
 		return Identity{}, false

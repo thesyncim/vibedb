@@ -15,7 +15,7 @@ func TestTransactionRecoveryReadRequestGrammarAndBounds(t *testing.T) {
 	id := transactionCodecID(211)
 	valid := []TransactionRecoveryReadRequest{
 		{Kind: TransactionRecoveryLookupCoordinator, ID: id, MinimumApplied: 1, MaxRows: 1, MaxBytes: TransactionRecoverySummaryBytes},
-		{Kind: TransactionRecoveryLookupParticipant, ID: id, MinimumApplied: 1, MaxRows: 1, MaxBytes: TransactionRecoverySummaryBytes},
+		{Kind: TransactionRecoveryLookupTarget, ID: id, MinimumApplied: 1, MaxRows: 1, MaxBytes: TransactionRecoverySummaryBytes},
 		{Kind: TransactionRecoveryReadManifestPage, ID: id, ManifestPage: 7, MinimumApplied: 1, MaxRows: 1, MaxBytes: MaxTransactionRecoveryReadBytes},
 		{Kind: TransactionRecoveryScanCoordinator, MinimumApplied: 1, MaxRows: MaxTransactionRecoveryScanRows, MaxBytes: MaxTransactionRecoveryScanBytes},
 	}
@@ -28,7 +28,7 @@ func TestTransactionRecoveryReadRequestGrammarAndBounds(t *testing.T) {
 		{},
 		{Kind: TransactionRecoveryLookupCoordinator, ID: id, MaxRows: 1, MaxBytes: TransactionRecoverySummaryBytes},
 		{Kind: TransactionRecoveryLookupCoordinator, MinimumApplied: 1, MaxRows: 1, MaxBytes: TransactionRecoverySummaryBytes},
-		{Kind: TransactionRecoveryLookupParticipant, ID: id, MinimumApplied: 1, MaxRows: 1, MaxBytes: TransactionRecoverySummaryBytes + 1},
+		{Kind: TransactionRecoveryLookupTarget, ID: id, MinimumApplied: 1, MaxRows: 1, MaxBytes: TransactionRecoverySummaryBytes + 1},
 		{Kind: TransactionRecoveryReadManifestPage, ID: id, MinimumApplied: 1, MaxRows: 1, MaxBytes: MaxTransactionRecoveryReadBytes + 1},
 		{Kind: TransactionRecoveryScanCoordinator, MinimumApplied: 1, MaxRows: MaxTransactionRecoveryScanRows + 1, MaxBytes: MaxTransactionRecoveryScanBytes},
 		{Kind: TransactionRecoveryScanCoordinator, MinimumApplied: 1, MaxRows: 1, MaxBytes: MaxTransactionRecoveryScanBytes + 1},
@@ -53,7 +53,7 @@ func TestTransactionRecoveryReadRequestGrammarAndBounds(t *testing.T) {
 	}
 }
 
-func TestTransactionRecoveryReadInlineParticipantAndExclusiveScan(t *testing.T) {
+func TestTransactionRecoveryReadInlineTargetAndExclusiveScan(t *testing.T) {
 	fixture := newMachineFixture(t)
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatal(err)
@@ -65,17 +65,17 @@ func TestTransactionRecoveryReadInlineParticipantAndExclusiveScan(t *testing.T) 
 	}, nil)
 	applyTransactionCommand(t, fixture.machine, 2, coordinatorCommand)
 
-	participantID := transactionCodecID(212)
+	targetID := transactionCodecID(212)
 	mutation := replication.Mutation{Kind: replication.MutationPut, Key: []byte{1, 2}, Value: []byte{3}}
 	batches := []replication.RelationMutationBatch{{Relation: 1, Mutations: []replication.Mutation{mutation}}}
 	mutationDigest, err := replication.TransactionMutationDigest(batches)
 	if err != nil {
 		t.Fatal(err)
 	}
-	participantCommand := transactionCompletionCommand(t, fixture.binding, distributedtxn.ReplicatedCommand{
-		Role: distributedtxn.ReplicatedRoleParticipant, Operation: distributedtxn.ReplicatedStageParticipant,
-		ID: participantID, PayloadKind: distributedtxn.ReplicatedPayloadParticipantStage,
-		Participant: distributedtxn.ParticipantStage{
+	targetCommand := transactionCompletionCommand(t, fixture.binding, distributedtxn.ReplicatedCommand{
+		Role: distributedtxn.ReplicatedRoleTarget, Operation: distributedtxn.ReplicatedStageTarget,
+		ID: targetID, PayloadKind: distributedtxn.ReplicatedPayloadTargetStage,
+		Target: distributedtxn.TransactionTargetStage{
 			CoordinatorGroup:            distributedtxn.ID(fixture.binding.GroupID),
 			CoordinatorShardIncarnation: distributedtxn.ID(fixture.binding.ShardIncarnation),
 			CoordinatorAllocation:       fixture.binding.AllocationGeneration,
@@ -83,7 +83,7 @@ func TestTransactionRecoveryReadInlineParticipantAndExclusiveScan(t *testing.T) 
 			MutationDigest: mutationDigest,
 		},
 	}, batches)
-	applyTransactionCommand(t, fixture.machine, 3, participantCommand)
+	applyTransactionCommand(t, fixture.machine, 3, targetCommand)
 
 	records := make([]TransactionRecoveryRecord, 0, MaxTransactionRecoveryScanRows)
 	payload := make([]byte, 0, MaxTransactionRecoveryPayloadArenaBytes)
@@ -102,18 +102,18 @@ func TestTransactionRecoveryReadInlineParticipantAndExclusiveScan(t *testing.T) 
 	}, records, payload); !errors.Is(err, ErrTransactionRecoveryRead) {
 		t.Fatalf("inline manifest-page error=%v", err)
 	}
-	participant, err := fixture.machine.TransactionRecoveryReadInto(TransactionRecoveryReadRequest{
-		Kind: TransactionRecoveryLookupParticipant, ID: participantID, MinimumApplied: 3,
+	target, err := fixture.machine.TransactionRecoveryReadInto(TransactionRecoveryReadRequest{
+		Kind: TransactionRecoveryLookupTarget, ID: targetID, MinimumApplied: 3,
 		MaxRows: 1, MaxBytes: TransactionRecoverySummaryBytes,
 	}, records, nil)
-	if err != nil || len(participant.Records) != 1 || participant.Records[0].ID != participantID ||
-		participant.Records[0].Role != distributedtxn.ReplicatedRoleParticipant ||
-		len(participant.Records[0].Payload) != 0 {
-		t.Fatalf("participant recovery=%+v err=%v", participant, err)
+	if err != nil || len(target.Records) != 1 || target.Records[0].ID != targetID ||
+		target.Records[0].Role != distributedtxn.ReplicatedRoleTarget ||
+		len(target.Records[0].Payload) != 0 {
+		t.Fatalf("participant recovery=%+v err=%v", target, err)
 	}
 	if allocations := testing.AllocsPerRun(100, func() {
 		result, readErr := fixture.machine.TransactionRecoveryReadInto(TransactionRecoveryReadRequest{
-			Kind: TransactionRecoveryLookupParticipant, ID: participantID, MinimumApplied: 3,
+			Kind: TransactionRecoveryLookupTarget, ID: targetID, MinimumApplied: 3,
 			MaxRows: 1, MaxBytes: TransactionRecoverySummaryBytes,
 		}, records, nil)
 		if readErr != nil || len(result.Records) != 1 {
@@ -149,14 +149,14 @@ func TestTransactionRecoveryReadInlineParticipantAndExclusiveScan(t *testing.T) 
 		t.Fatalf("response byte bound error=%v", err)
 	}
 	if _, err := fixture.machine.TransactionRecoveryReadInto(TransactionRecoveryReadRequest{
-		Kind: TransactionRecoveryLookupParticipant, ID: transactionCodecID(250), MinimumApplied: 3,
+		Kind: TransactionRecoveryLookupTarget, ID: transactionCodecID(250), MinimumApplied: 3,
 		MaxRows: 1, MaxBytes: TransactionRecoverySummaryBytes,
 	}, records, nil); err != nil {
 		t.Fatalf("missing participant lookup error=%v", err)
 	}
 }
 
-func TestTransactionRecoveryReadReturnsExactParticipantCancellationWitness(t *testing.T) {
+func TestTransactionRecoveryReadReturnsExactTargetCancellationWitness(t *testing.T) {
 	fixture := newMachineFixture(t)
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatal(err)
@@ -164,38 +164,38 @@ func TestTransactionRecoveryReadReturnsExactParticipantCancellationWitness(t *te
 	id := transactionCodecID(253)
 	mutationDigest := distributedtxn.Digest{9}
 	fence := transactionCompletionCommand(t, fixture.binding, distributedtxn.ReplicatedCommand{
-		Role:        distributedtxn.ReplicatedRoleParticipant,
-		Operation:   distributedtxn.ReplicatedAbortReleaseParticipant,
+		Role:        distributedtxn.ReplicatedRoleTarget,
+		Operation:   distributedtxn.ReplicatedAbortReleaseTarget,
 		ID:          id,
-		PayloadKind: distributedtxn.ReplicatedPayloadParticipantStage,
-		Participant: distributedtxn.ParticipantStage{
+		PayloadKind: distributedtxn.ReplicatedPayloadTargetStage,
+		Target: distributedtxn.TransactionTargetStage{
 			CoordinatorGroup:            distributedtxn.ID(fixture.binding.GroupID),
 			CoordinatorShardIncarnation: distributedtxn.ID(fixture.binding.ShardIncarnation),
 			CoordinatorAllocation:       fixture.binding.AllocationGeneration,
 			MutationDigest:              mutationDigest,
-			ParticipantOrdinal:          4096,
+			TargetOrdinal:               4096,
 		},
 	}, nil)
 	applyTransactionCommand(t, fixture.machine, 2, fence)
 	records := make([]TransactionRecoveryRecord, 0, 1)
 	result, err := fixture.machine.TransactionRecoveryReadInto(TransactionRecoveryReadRequest{
-		Kind: TransactionRecoveryLookupParticipant, ID: id, MinimumApplied: 2,
+		Kind: TransactionRecoveryLookupTarget, ID: id, MinimumApplied: 2,
 		MaxRows: 1, MaxBytes: TransactionRecoverySummaryBytes,
 	}, records, nil)
 	if err != nil || len(result.Records) != 1 {
 		t.Fatalf("cancellation recovery=%+v err=%v", result, err)
 	}
 	record := result.Records[0]
-	if record.ID != id || record.Role != distributedtxn.ReplicatedRoleParticipant ||
-		distributedtxn.ParticipantState(record.State) != distributedtxn.ParticipantReleased ||
+	if record.ID != id || record.Role != distributedtxn.ReplicatedRoleTarget ||
+		distributedtxn.TargetState(record.State) != distributedtxn.TargetReleased ||
 		record.Revision != 1 || record.PayloadCount != 0 || !record.CancellationWitness ||
-		record.ParticipantOrdinal != 4096 || record.MutationDigest != mutationDigest ||
+		record.TargetOrdinal != 4096 || record.MutationDigest != mutationDigest ||
 		record.AffectedRowsValid || record.AffectedRows != 0 || len(record.Payload) != 0 {
 		t.Fatalf("cancellation recovery record=%+v", record)
 	}
 }
 
-func TestTransactionRecoveryReadManifestBeyondInlineParticipantLimit(t *testing.T) {
+func TestTransactionRecoveryReadManifestBeyondInlineTargetLimit(t *testing.T) {
 	fixture := newMachineFixture(t)
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatal(err)
@@ -212,19 +212,19 @@ func TestTransactionRecoveryReadManifestBeyondInlineParticipantLimit(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	for index := 0; index < distributedtxn.MaxInlineParticipants+1; index++ {
+	for index := 0; index < distributedtxn.MaxInlineTargets+1; index++ {
 		var digest distributedtxn.Digest
 		digest[0] = byte(index + 1)
-		if err := builder.Append(distributedtxn.ParticipantRef{
+		if err := builder.Append(distributedtxn.TransactionTargetRef{
 			Distribution: []byte{1}, Shard: []byte{byte(index + 1)},
 			RoutingVersion: 1, AllocationGeneration: 1, OwnershipEpoch: 1,
-			MutationDigest: digest, State: distributedtxn.ParticipantStaged,
+			MutationDigest: digest, State: distributedtxn.TargetStaged,
 		}); err != nil {
 			t.Fatal(err)
 		}
 	}
 	descriptor, err := builder.Seal()
-	if err != nil || descriptor.ParticipantCount != distributedtxn.MaxInlineParticipants+1 || len(pageZero) == 0 {
+	if err != nil || descriptor.TargetCount != distributedtxn.MaxInlineTargets+1 || len(pageZero) == 0 {
 		t.Fatalf("manifest descriptor=%+v page=%d err=%v", descriptor, len(pageZero), err)
 	}
 	coordinator, err := distributedtxn.AppendManifestCoordinator(nil, distributedtxn.ManifestCoordinatorRecord{
@@ -247,7 +247,7 @@ func TestTransactionRecoveryReadManifestBeyondInlineParticipantLimit(t *testing.
 		MaxRows: 1, MaxBytes: MaxTransactionRecoveryReadBytes,
 	}, records, payload)
 	if err != nil || len(result.Records) != 1 ||
-		result.Records[0].PayloadCount != distributedtxn.MaxInlineParticipants+1 ||
+		result.Records[0].PayloadCount != distributedtxn.MaxInlineTargets+1 ||
 		!bytes.Equal(result.Records[0].Payload, pageZero) {
 		t.Fatalf("manifest page recovery=%+v err=%v", result, err)
 	}
@@ -286,41 +286,41 @@ func TestTransactionRecoveryReadFusedInitialManifestPacks(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			participantOrdinal := uint64(0)
+			targetOrdinal := uint64(0)
 			for len(pages) < pageCount-1 {
 				var shard [16]byte
 				for index := range shard {
 					shard[index] = '0'
 				}
-				value := participantOrdinal
+				value := targetOrdinal
 				const hex = "0123456789abcdef"
 				for index := len(shard) - 1; index >= 0; index-- {
 					shard[index] = hex[value&15]
 					value >>= 4
 				}
 				var digest distributedtxn.Digest
-				binary.LittleEndian.PutUint64(digest[:8], participantOrdinal+1)
-				if err := builder.Append(distributedtxn.ParticipantRef{
+				binary.LittleEndian.PutUint64(digest[:8], targetOrdinal+1)
+				if err := builder.Append(distributedtxn.TransactionTargetRef{
 					Distribution: []byte(fixture.binding.Distribution), Shard: shard[:],
 					RoutingVersion: 1, AllocationGeneration: 1, OwnershipEpoch: 1,
 					AuthorityWitness: distributedtxn.AuthorityWitness(digest[:16]),
-					MutationDigest:   digest, State: distributedtxn.ParticipantStaged,
+					MutationDigest:   digest, State: distributedtxn.TargetStaged,
 				}); err != nil {
-					t.Fatalf("append filler participant %d: %v", participantOrdinal, err)
+					t.Fatalf("append filler participant %d: %v", targetOrdinal, err)
 				}
-				participantOrdinal++
+				targetOrdinal++
 			}
-			if participantOrdinal > uint64(^uint32(0)) {
+			if targetOrdinal > uint64(^uint32(0)) {
 				t.Fatal("test manifest ordinal exceeded wire bound")
 			}
-			if err := builder.Append(distributedtxn.ParticipantRef{
+			if err := builder.Append(distributedtxn.TransactionTargetRef{
 				Distribution:         []byte(fixture.binding.Distribution),
 				Shard:                []byte(fixture.binding.Shard),
 				RoutingVersion:       fixture.binding.RoutingVersion,
 				AllocationGeneration: fixture.binding.AllocationGeneration,
 				OwnershipEpoch:       fixture.binding.OwnershipEpoch,
 				AuthorityWitness:     transactionRouteAuthorityWitness(fixture.binding, fixture.machine.manifestDigest),
-				MutationDigest:       mutationDigest, State: distributedtxn.ParticipantStaged,
+				MutationDigest:       mutationDigest, State: distributedtxn.TargetStaged,
 			}); err != nil {
 				t.Fatal(err)
 			}
@@ -350,12 +350,12 @@ func TestTransactionRecoveryReadFusedInitialManifestPacks(t *testing.T) {
 				Operation: distributedtxn.ReplicatedBeginPrepareManifestCoordinator,
 				ID:        id, PayloadKind: distributedtxn.ReplicatedPayloadManifestCoordinator,
 				Payload: start,
-				Participant: distributedtxn.ParticipantStage{
+				Target: distributedtxn.TransactionTargetStage{
 					CoordinatorGroup:            distributedtxn.ID(fixture.binding.GroupID),
 					CoordinatorShardIncarnation: distributedtxn.ID(fixture.binding.ShardIncarnation),
 					CoordinatorAllocation:       fixture.binding.AllocationGeneration,
 					BucketBits:                  8, IntentScopes: []distributedtxn.IntentScope{{Start: 0, End: 256}},
-					MutationDigest: mutationDigest, ParticipantOrdinal: uint32(participantOrdinal),
+					MutationDigest: mutationDigest, TargetOrdinal: uint32(targetOrdinal),
 				},
 			}, batches)
 			applyTransactionCommand(t, fixture.machine, 3, command)
@@ -468,7 +468,7 @@ func TestTransactionRecoveryReadFailsClosedOnCorruptPayload(t *testing.T) {
 		t.Fatalf("corrupt coordinator payload error=%v", err)
 	}
 	if _, nextErr := fixture.machine.TransactionRecoveryReadInto(TransactionRecoveryReadRequest{
-		Kind: TransactionRecoveryLookupParticipant, ID: transactionCodecID(251), MinimumApplied: 2,
+		Kind: TransactionRecoveryLookupTarget, ID: transactionCodecID(251), MinimumApplied: 2,
 		MaxRows: 1, MaxBytes: TransactionRecoverySummaryBytes,
 	}, records, nil); nextErr == nil {
 		t.Fatal("corrupt recovery read did not poison machine")

@@ -70,39 +70,39 @@ func stageRecoveryTransaction(
 	snapshot *Snapshot,
 	queries []Query,
 	id distributedtxn.ID,
-	participantCount int,
+	targetCount int,
 	commit bool,
-) []transactionParticipant {
+) []transactionTarget {
 	t.Helper()
 	profile := executor.profileFor(ClassInteractive)
-	participants, err := executor.planTransaction(t.Context(), snapshot, queries, profile)
+	targets, err := executor.planTransaction(t.Context(), snapshot, queries, profile)
 	if err != nil {
 		t.Fatalf("planTransaction: %v", err)
 	}
-	refs := make([]distributedtxn.ParticipantRef, len(participants))
-	for i := range participants {
-		participant := &participants[i]
-		participant.mutation, err = shardservice.AppendMutationBatch(nil, participant.statements)
+	refs := make([]distributedtxn.TransactionTargetRef, len(targets))
+	for i := range targets {
+		target := &targets[i]
+		target.mutation, err = shardservice.AppendMutationBatch(nil, target.statements)
 		if err != nil {
 			t.Fatal(err)
 		}
-		participant.digest = distributedtxn.ParticipantDigest(
-			participant.bucketBits, participant.scopes, participant.mutation,
+		target.digest = distributedtxn.TargetDigest(
+			target.bucketBits, target.scopes, target.mutation,
 		)
-		request := participant.call.req
-		refs[i] = distributedtxn.ParticipantRef{
+		request := target.call.req
+		refs[i] = distributedtxn.TransactionTargetRef{
 			Distribution: []byte(request.Distribution), Shard: []byte(request.Shard),
 			RoutingVersion:       uint64(request.RoutingVersion),
 			AllocationGeneration: uint64(request.AllocationGeneration),
-			OwnershipEpoch:       uint64(request.OwnershipEpoch), MutationDigest: participant.digest,
-			State: distributedtxn.ParticipantStaged,
+			OwnershipEpoch:       uint64(request.OwnershipEpoch), MutationDigest: target.digest,
+			State: distributedtxn.TargetStaged,
 		}
 	}
-	coordinator := &participants[0]
+	coordinator := &targets[0]
 	coordinatorRecord, err := distributedtxn.AppendCoordinator(nil, distributedtxn.CoordinatorRecord{
 		ID: id, State: distributedtxn.CoordinatorStaging, Revision: 1,
 		CatalogGeneration: snapshot.Generation(),
-		RecoveryDeadline:  1, Participants: refs,
+		RecoveryDeadline:  1, Targets: refs,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -114,53 +114,53 @@ func stageRecoveryTransaction(
 	if _, err := executor.transactionRoundTrip(t.Context(), coordinator.call.address, request, profile); err != nil {
 		t.Fatalf("stage coordinator: %v", err)
 	}
-	for i := range participants {
-		participant := &participants[i]
-		participant.record, err = distributedtxn.AppendParticipant(nil, distributedtxn.ParticipantRecord{
-			ID: id, State: distributedtxn.ParticipantStaged, Revision: 1,
-			RoutingVersion:            uint64(participant.call.req.RoutingVersion),
-			AllocationGeneration:      uint64(participant.call.req.AllocationGeneration),
-			OwnershipEpoch:            uint64(participant.call.req.OwnershipEpoch),
+	for i := range targets {
+		target := &targets[i]
+		target.record, err = distributedtxn.AppendTarget(nil, distributedtxn.TargetRecord{
+			ID: id, State: distributedtxn.TargetStaged, Revision: 1,
+			RoutingVersion:            uint64(target.call.req.RoutingVersion),
+			AllocationGeneration:      uint64(target.call.req.AllocationGeneration),
+			OwnershipEpoch:            uint64(target.call.req.OwnershipEpoch),
 			CoordinatorDistribution:   []byte(coordinator.call.req.Distribution),
 			CoordinatorShard:          []byte(coordinator.call.req.Shard),
 			CoordinatorAllocation:     uint64(coordinator.call.req.AllocationGeneration),
 			CoordinatorRoutingVersion: uint64(coordinator.call.req.RoutingVersion),
 			CoordinatorOwnershipEpoch: uint64(coordinator.call.req.OwnershipEpoch),
-			BucketBits:                participant.bucketBits, IntentScopes: participant.scopes,
-			MutationDigest: participant.digest, Mutation: participant.mutation,
+			BucketBits:                target.bucketBits, IntentScopes: target.scopes,
+			MutationDigest: target.digest, Mutation: target.mutation,
 		})
 		if err != nil {
 			t.Fatal(err)
 		}
 	}
-	if participantCount > len(participants) {
-		participantCount = len(participants)
+	if targetCount > len(targets) {
+		targetCount = len(targets)
 	}
-	if _, err := executor.participantPhase(
-		t.Context(), id, participants[:participantCount], profile,
-		shardservice.TransactionStageParticipant, 0,
+	if _, err := executor.targetPhase(
+		t.Context(), id, targets[:targetCount], profile,
+		shardservice.TransactionStageTarget, 0,
 	); err != nil {
 		t.Fatalf("stage participants: %v", err)
 	}
 	if !commit {
-		return participants
+		return targets
 	}
-	if participantCount != len(participants) {
+	if targetCount != len(targets) {
 		t.Fatal("cannot commit an incomplete recovery fixture")
 	}
-	if _, err := executor.participantPhase(
-		t.Context(), id, participants, profile,
-		shardservice.TransactionPrepareParticipant, 1,
+	if _, err := executor.targetPhase(
+		t.Context(), id, targets, profile,
+		shardservice.TransactionPrepareTarget, 1,
 	); err != nil {
 		t.Fatalf("prepare participants: %v", err)
 	}
 	if err := executor.commitCoordinator(t.Context(), id, coordinator, profile); err != nil {
 		t.Fatalf("commit coordinator: %v", err)
 	}
-	return participants
+	return targets
 }
 
-func TestRecoverTransactionRedrivesCommittedParticipants(t *testing.T) {
+func TestRecoverTransactionRedrivesCommittedTargets(t *testing.T) {
 	cluster := newE2ECluster(t)
 	snapshot := cluster.snapshot(t, 11)
 	executor := NewExecutor(cluster.client, NewCatalogHolder(snapshot), Options{})
@@ -181,7 +181,7 @@ func TestRecoverTransactionRedrivesCommittedParticipants(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RecoverTransaction: %v", err)
 	}
-	if result.State != distributedtxn.CoordinatorRetired || result.Participants != 2 ||
+	if result.State != distributedtxn.CoordinatorRetired || result.Targets != 2 ||
 		result.RowsAffected != 2 {
 		t.Fatalf("recovery result = %+v", result)
 	}
@@ -222,7 +222,7 @@ type manifestRecoveryFixture struct {
 	record      []byte
 	descriptor  distributedtxn.ManifestDescriptor
 	pages       [][]byte
-	refs        map[string]distributedtxn.ParticipantRef
+	refs        map[string]distributedtxn.TransactionTargetRef
 	snapshot    *Snapshot
 	coordinator recoveryCoordinator
 }
@@ -239,8 +239,8 @@ func newManifestRecoveryFixture(
 		version = distribution.RoutingVersion(7)
 	)
 	id := recoveryTestID(91)
-	refs := make([]distributedtxn.ParticipantRef, count)
-	byShard := make(map[string]distributedtxn.ParticipantRef, count)
+	refs := make([]distributedtxn.TransactionTargetRef, count)
+	byShard := make(map[string]distributedtxn.TransactionTargetRef, count)
 	shards := make([]distribution.Shard, count)
 	for index := range count {
 		shardID := distribution.ShardID(fmt.Sprintf("s%08d", index))
@@ -259,11 +259,11 @@ func newManifestRecoveryFixture(
 		}
 		var digest distributedtxn.Digest
 		binary.LittleEndian.PutUint64(digest[:8], uint64(index+1))
-		ref := distributedtxn.ParticipantRef{
+		ref := distributedtxn.TransactionTargetRef{
 			Distribution: []byte(dist), Shard: []byte(shardID),
 			RoutingVersion: uint64(version), AllocationGeneration: uint64(generation),
 			OwnershipEpoch: uint64(epoch), MutationDigest: digest,
-			State: distributedtxn.ParticipantStaged,
+			State: distributedtxn.TargetStaged,
 		}
 		refs[index] = ref
 		byShard[string(shardID)] = ref
@@ -340,22 +340,22 @@ func newManifestRecoveryFixture(
 type manifestRecoveryScript struct {
 	mu sync.Mutex
 
-	fixture              manifestRecoveryFixture
-	state                distributedtxn.CoordinatorState
-	revision             uint64
-	recoveryPulse        uint8
-	missingPage          int
-	reorderFirst         bool
-	dropCommitOnce       bool
-	dropLookupOnce       bool
-	dropRetireOnce       bool
-	commitWinsAbort      bool
-	participantAborted   bool
-	participantDelay     time.Duration
-	participantInFlight  int
-	participantMaxFlight int
-	operations           map[shardservice.TransactionOperation]int
-	serveErr             error
+	fixture         manifestRecoveryFixture
+	state           distributedtxn.CoordinatorState
+	revision        uint64
+	recoveryPulse   uint8
+	missingPage     int
+	reorderFirst    bool
+	dropCommitOnce  bool
+	dropLookupOnce  bool
+	dropRetireOnce  bool
+	commitWinsAbort bool
+	targetAborted   bool
+	targetDelay     time.Duration
+	targetInFlight  int
+	targetMaxFlight int
+	operations      map[shardservice.TransactionOperation]int
+	serveErr        error
 }
 
 func newManifestRecoveryScript(fixture manifestRecoveryFixture, state distributedtxn.CoordinatorState) *manifestRecoveryScript {
@@ -438,39 +438,39 @@ func (s *manifestRecoveryScript) respond(request *shardservice.ShardRequest) *sh
 			SegmentIndex: index, Record: s.fixture.pages[index],
 		}
 		return response
-	case shardservice.TransactionReadParticipant:
+	case shardservice.TransactionReadTarget:
 		ref, ok := s.fixture.refs[string(request.Shard)]
 		if !ok {
 			return shardservice.NewErrorResponse(shardservice.ErrorTransactionNotFound, "missing participant")
 		}
-		record, err := s.participantRecord(ref)
+		record, err := s.targetRecord(ref)
 		if err != nil {
 			s.setServeErr(err)
 			return nil
 		}
 		response := shardservice.CompletionResponse(0)
-		participantState := distributedtxn.ParticipantStaged
-		if s.participantAborted {
-			participantState = distributedtxn.ParticipantAborted
+		targetState := distributedtxn.TargetStaged
+		if s.targetAborted {
+			targetState = distributedtxn.TargetAborted
 		}
 		response.Transaction = shardservice.TransactionReply{
-			Role: shardservice.TransactionRoleParticipant, ID: s.fixture.id, Revision: 1,
-			ParticipantState: participantState,
-			RecordKind:       shardservice.TransactionRecordParticipant, Record: record,
+			Role: shardservice.TransactionRoleTarget, ID: s.fixture.id, Revision: 1,
+			TargetState: targetState,
+			RecordKind:  shardservice.TransactionRecordTarget, Record: record,
 		}
 		return response
-	case shardservice.TransactionPrepareParticipant:
-		return manifestParticipantStatus(s.fixture.id, distributedtxn.ParticipantPrepared, 2, 0)
-	case shardservice.TransactionApplyParticipant:
-		return manifestParticipantStatus(s.fixture.id, distributedtxn.ParticipantApplied, 3, 1)
-	case shardservice.TransactionReleaseParticipant:
-		return manifestParticipantStatus(s.fixture.id, distributedtxn.ParticipantReleased, 4, 0)
-	case shardservice.TransactionAbortParticipant:
-		return manifestParticipantStatus(s.fixture.id, distributedtxn.ParticipantAborted, 2, 0)
-	case shardservice.TransactionLookupParticipant:
-		s.beginParticipantLookup()
-		defer s.endParticipantLookup()
-		return manifestParticipantStatus(s.fixture.id, distributedtxn.ParticipantStaged, 1, 0)
+	case shardservice.TransactionPrepareTarget:
+		return manifestTargetStatus(s.fixture.id, distributedtxn.TargetPrepared, 2, 0)
+	case shardservice.TransactionApplyTarget:
+		return manifestTargetStatus(s.fixture.id, distributedtxn.TargetApplied, 3, 1)
+	case shardservice.TransactionReleaseTarget:
+		return manifestTargetStatus(s.fixture.id, distributedtxn.TargetReleased, 4, 0)
+	case shardservice.TransactionAbortTarget:
+		return manifestTargetStatus(s.fixture.id, distributedtxn.TargetAborted, 2, 0)
+	case shardservice.TransactionLookupTarget:
+		s.beginTargetLookup()
+		defer s.endTargetLookup()
+		return manifestTargetStatus(s.fixture.id, distributedtxn.TargetStaged, 1, 0)
 	case shardservice.TransactionCommitCoordinator:
 		s.mu.Lock()
 		s.state, s.revision = distributedtxn.CoordinatorCommitted, 2
@@ -519,27 +519,27 @@ func (s *manifestRecoveryScript) respond(request *shardservice.ShardRequest) *sh
 	}
 }
 
-func (s *manifestRecoveryScript) beginParticipantLookup() {
+func (s *manifestRecoveryScript) beginTargetLookup() {
 	s.mu.Lock()
-	delay := s.participantDelay
-	s.participantInFlight++
-	s.participantMaxFlight = max(s.participantMaxFlight, s.participantInFlight)
+	delay := s.targetDelay
+	s.targetInFlight++
+	s.targetMaxFlight = max(s.targetMaxFlight, s.targetInFlight)
 	s.mu.Unlock()
 	if delay > 0 {
 		time.Sleep(delay)
 	}
 }
 
-func (s *manifestRecoveryScript) endParticipantLookup() {
+func (s *manifestRecoveryScript) endTargetLookup() {
 	s.mu.Lock()
-	s.participantInFlight--
+	s.targetInFlight--
 	s.mu.Unlock()
 }
 
-func (s *manifestRecoveryScript) participantRecord(ref distributedtxn.ParticipantRef) ([]byte, error) {
+func (s *manifestRecoveryScript) targetRecord(ref distributedtxn.TransactionTargetRef) ([]byte, error) {
 	first := s.fixture.refs["s00000000"]
-	return distributedtxn.AppendParticipant(nil, distributedtxn.ParticipantRecord{
-		ID: s.fixture.id, State: distributedtxn.ParticipantStaged, Revision: 1,
+	return distributedtxn.AppendTarget(nil, distributedtxn.TargetRecord{
+		ID: s.fixture.id, State: distributedtxn.TargetStaged, Revision: 1,
 		RoutingVersion: ref.RoutingVersion, AllocationGeneration: ref.AllocationGeneration,
 		OwnershipEpoch:          ref.OwnershipEpoch,
 		CoordinatorDistribution: first.Distribution, CoordinatorShard: first.Shard,
@@ -551,16 +551,16 @@ func (s *manifestRecoveryScript) participantRecord(ref distributedtxn.Participan
 	})
 }
 
-func manifestParticipantStatus(
+func manifestTargetStatus(
 	id distributedtxn.ID,
-	state distributedtxn.ParticipantState,
+	state distributedtxn.TargetState,
 	revision uint64,
 	rows int64,
 ) *shardservice.ShardResponse {
 	response := shardservice.CompletionResponse(rows)
 	response.Transaction = shardservice.TransactionReply{
-		Role: shardservice.TransactionRoleParticipant, ID: id, Revision: revision,
-		ParticipantState: state,
+		Role: shardservice.TransactionRoleTarget, ID: id, Revision: revision,
+		TargetState: state,
 	}
 	return response
 }
@@ -631,8 +631,8 @@ func TestRecoveryManifestWalk4097UsesBoundedPagedArena(t *testing.T) {
 	err = executor.walkRecoveryManifest(
 		t.Context(), routes, fixture.coordinator, fixture.id, fixture.descriptor,
 		profile, arena,
-		func(refs []distributedtxn.ParticipantRef, participants []transactionParticipant) error {
-			if len(refs) != len(participants) {
+		func(refs []distributedtxn.TransactionTargetRef, targets []transactionTarget) error {
+			if len(refs) != len(targets) {
 				return ErrTransactionConflict
 			}
 			seen += len(refs)
@@ -643,7 +643,7 @@ func TestRecoveryManifestWalk4097UsesBoundedPagedArena(t *testing.T) {
 	if err != nil {
 		t.Fatalf("walkRecoveryManifest: %v", err)
 	}
-	if seen != 4097 || largestPage > distributedtxn.MaxManifestPageParticipants ||
+	if seen != 4097 || largestPage > distributedtxn.MaxManifestPageTargets ||
 		len(arena.windowResults) != profile.MaxConcurrency {
 		t.Fatalf("seen=%d largest=%d window=%d", seen, largestPage, len(arena.windowResults))
 	}
@@ -664,7 +664,7 @@ func TestRecoveryManifestMissingPageRequiresLogicalPulsesAcrossRestart(t *testin
 	if !errors.Is(err, ErrRecoveryNotReady) || result.ID != fixture.id {
 		t.Fatalf("before deadline result=%+v err=%v", result, err)
 	}
-	if got := script.operationCount(shardservice.TransactionReadParticipant); got != 0 {
+	if got := script.operationCount(shardservice.TransactionReadTarget); got != 0 {
 		t.Fatalf("incomplete manifest fanned out %d participant reads", got)
 	}
 	result, err = executor.recoverManifestCoordinator(
@@ -687,7 +687,7 @@ func TestRecoveryManifestMissingPageRequiresLogicalPulsesAcrossRestart(t *testin
 	result, err = restarted.recoverManifestCoordinator(
 		t.Context(), fixture.snapshot, script.coordinatorResponse(), restarted.profileFor(ClassAdmin),
 	)
-	if err != nil || result.State != distributedtxn.CoordinatorRetired || result.Participants != 4097 {
+	if err != nil || result.State != distributedtxn.CoordinatorRetired || result.Targets != 4097 {
 		t.Fatalf("after restart result=%+v err=%v", result, err)
 	}
 	if script.operationCount(shardservice.TransactionAbortCoordinator) != 1 ||
@@ -718,7 +718,7 @@ func TestRecoveryManifestCommittedMissingAndReorderedPagesFailClosed(t *testing.
 			if !errors.Is(err, ErrTransactionConflict) {
 				t.Fatalf("error=%v", err)
 			}
-			if script.operationCount(shardservice.TransactionApplyParticipant) != 0 {
+			if script.operationCount(shardservice.TransactionApplyTarget) != 0 {
 				t.Fatal("unverified manifest applied a participant")
 			}
 			script.check(t)
@@ -726,7 +726,7 @@ func TestRecoveryManifestCommittedMissingAndReorderedPagesFailClosed(t *testing.
 	}
 }
 
-func TestRecoveryManifest65CommittedParticipants(t *testing.T) {
+func TestRecoveryManifest65CommittedTargets(t *testing.T) {
 	fixture := newManifestRecoveryFixture(
 		t, 65, distributedtxn.CoordinatorCommitted, 3,
 	)
@@ -736,14 +736,14 @@ func TestRecoveryManifest65CommittedParticipants(t *testing.T) {
 		t.Context(), fixture.snapshot, script.coordinatorResponse(), executor.profileFor(ClassAdmin),
 	)
 	if err != nil || result.State != distributedtxn.CoordinatorRetired ||
-		result.Participants != 65 || result.RowsAffected != 65 {
+		result.Targets != 65 || result.RowsAffected != 65 {
 		script.check(t)
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
 	for _, operation := range []shardservice.TransactionOperation{
-		shardservice.TransactionReadParticipant,
-		shardservice.TransactionApplyParticipant,
-		shardservice.TransactionReleaseParticipant,
+		shardservice.TransactionReadTarget,
+		shardservice.TransactionApplyTarget,
+		shardservice.TransactionReleaseTarget,
 	} {
 		if got := script.operationCount(operation); got != 65 {
 			t.Fatalf("operation %d count=%d", operation, got)
@@ -752,23 +752,23 @@ func TestRecoveryManifest65CommittedParticipants(t *testing.T) {
 	script.check(t)
 }
 
-func TestLiveInlineAbortLosesToCommitBeforeParticipantMutation(t *testing.T) {
+func TestLiveInlineAbortLosesToCommitBeforeTargetMutation(t *testing.T) {
 	fixture := newManifestRecoveryFixture(
 		t, 1, distributedtxn.CoordinatorStaging, 3,
 	)
 	script := newManifestRecoveryScript(fixture, distributedtxn.CoordinatorStaging)
 	script.commitWinsAbort = true
 	executor := script.executor()
-	participant := transactionParticipant{call: fixture.coordinator.call}
+	target := transactionTarget{call: fixture.coordinator.call}
 	err := executor.abortTransaction(
-		t.Context(), fixture.id, &participant, []transactionParticipant{participant},
+		t.Context(), fixture.id, &target, []transactionTarget{target},
 		executor.profileFor(ClassInteractive),
 	)
 	if !errors.Is(err, ErrTransactionCommitted) {
 		t.Fatalf("abort error=%v", err)
 	}
-	if got := script.operationCount(shardservice.TransactionLookupParticipant) +
-		script.operationCount(shardservice.TransactionAbortParticipant); got != 0 {
+	if got := script.operationCount(shardservice.TransactionLookupTarget) +
+		script.operationCount(shardservice.TransactionAbortTarget); got != 0 {
 		t.Fatalf("committed winner observed %d participant mutations/lookups", got)
 	}
 	script.check(t)
@@ -779,37 +779,37 @@ func TestLiveAbortCleanupUsesBoundedConcurrency(t *testing.T) {
 		t, 1, distributedtxn.CoordinatorStaging, 3,
 	)
 	script := newManifestRecoveryScript(fixture, distributedtxn.CoordinatorStaging)
-	script.participantDelay = 10 * time.Millisecond
+	script.targetDelay = 10 * time.Millisecond
 	executor := script.executor()
-	participants := make([]transactionParticipant, 16)
-	for i := range participants {
-		participants[i].call = fixture.coordinator.call
+	targets := make([]transactionTarget, 16)
+	for i := range targets {
+		targets[i].call = fixture.coordinator.call
 	}
 	profile := executor.profileFor(ClassInteractive)
 	profile.MaxConcurrency = 4
 	if err := executor.abortTransaction(
-		t.Context(), fixture.id, &participants[0], participants, profile,
+		t.Context(), fixture.id, &targets[0], targets, profile,
 	); err != nil {
 		t.Fatalf("abort transaction: %v", err)
 	}
 	script.mu.Lock()
-	maxFlight := script.participantMaxFlight
+	maxFlight := script.targetMaxFlight
 	script.mu.Unlock()
 	if maxFlight != profile.MaxConcurrency {
 		t.Fatalf("participant cleanup concurrency=%d want=%d", maxFlight, profile.MaxConcurrency)
 	}
-	if got := script.operationCount(shardservice.TransactionAbortParticipant); got != len(participants) {
-		t.Fatalf("participant aborts=%d want=%d", got, len(participants))
+	if got := script.operationCount(shardservice.TransactionAbortTarget); got != len(targets) {
+		t.Fatalf("participant aborts=%d want=%d", got, len(targets))
 	}
 	script.check(t)
 }
 
-func TestRecoveryManifestAbortLosesToCommitBeforeParticipantMutation(t *testing.T) {
+func TestRecoveryManifestAbortLosesToCommitBeforeTargetMutation(t *testing.T) {
 	fixture := newManifestRecoveryFixture(
 		t, 65, distributedtxn.CoordinatorStaging, 3,
 	)
 	script := newManifestRecoveryScript(fixture, distributedtxn.CoordinatorStaging)
-	script.participantAborted = true
+	script.targetAborted = true
 	script.commitWinsAbort = true
 	executor := script.executor()
 	_, err := executor.recoverManifestCoordinator(
@@ -820,7 +820,7 @@ func TestRecoveryManifestAbortLosesToCommitBeforeParticipantMutation(t *testing.
 		script.check(t)
 		t.Fatalf("recovery error=%v", err)
 	}
-	if got := script.operationCount(shardservice.TransactionAbortParticipant); got != 0 {
+	if got := script.operationCount(shardservice.TransactionAbortTarget); got != 0 {
 		t.Fatalf("committed winner aborted %d participants", got)
 	}
 	script.check(t)
@@ -839,7 +839,7 @@ func TestRecoveryManifestRetiredDoesNotReadPrunedPages(t *testing.T) {
 		t.Context(), fixture.snapshot, script.coordinatorResponse(),
 		executor.profileFor(ClassAdmin),
 	)
-	if err != nil || result.State != distributedtxn.CoordinatorRetired || result.Participants != 65 {
+	if err != nil || result.State != distributedtxn.CoordinatorRetired || result.Targets != 65 {
 		t.Fatalf("retired recovery result=%+v err=%v", result, err)
 	}
 	if got := script.operationCount(shardservice.TransactionReadManifestSegment); got != 0 {
@@ -869,7 +869,7 @@ func TestRecoveryManifestOutcomeUnknownResumesCommittedDecision(t *testing.T) {
 	if err != nil || result.State != distributedtxn.CoordinatorRetired || result.RowsAffected != 65 {
 		t.Fatalf("resumed result=%+v err=%v", result, err)
 	}
-	if got := script.operationCount(shardservice.TransactionPrepareParticipant); got != 65 {
+	if got := script.operationCount(shardservice.TransactionPrepareTarget); got != 65 {
 		t.Fatalf("prepare retries=%d", got)
 	}
 	script.check(t)
@@ -885,16 +885,16 @@ func TestRecoveryManifestRouteIndexFencesCatalogCoordinates(t *testing.T) {
 		t.Fatal(err)
 	}
 	ref := fixture.refs["s00004096"]
-	participants := make([]transactionParticipant, 1)
-	for _, mutate := range []func(*distributedtxn.ParticipantRef){
-		func(value *distributedtxn.ParticipantRef) { value.RoutingVersion++ },
-		func(value *distributedtxn.ParticipantRef) { value.AllocationGeneration++ },
-		func(value *distributedtxn.ParticipantRef) { value.OwnershipEpoch++ },
+	targets := make([]transactionTarget, 1)
+	for _, mutate := range []func(*distributedtxn.TransactionTargetRef){
+		func(value *distributedtxn.TransactionTargetRef) { value.RoutingVersion++ },
+		func(value *distributedtxn.TransactionTargetRef) { value.AllocationGeneration++ },
+		func(value *distributedtxn.TransactionTargetRef) { value.OwnershipEpoch++ },
 	} {
 		changed := ref
 		mutate(&changed)
-		if err := resolveRecoveryParticipantsFromIndex(
-			routes, []distributedtxn.ParticipantRef{changed}, participants,
+		if err := resolveRecoveryTargetsFromIndex(
+			routes, []distributedtxn.TransactionTargetRef{changed}, targets,
 		); !errors.Is(err, ErrTransactionConflict) {
 			t.Fatalf("coordinate mismatch error=%v", err)
 		}

@@ -839,8 +839,8 @@ func TestNativeTransactionCompletionBindsValidatedRoleOperationAndFixedResult(t 
 	}
 
 	wrongIdentity := result
-	wrongIdentity[0] = byte(distributedtxn.ReplicatedRoleParticipant)
-	wrongIdentity[1] = byte(distributedtxn.ReplicatedPrepareParticipant)
+	wrongIdentity[0] = byte(distributedtxn.ReplicatedRoleTarget)
+	wrongIdentity[1] = byte(distributedtxn.ReplicatedPrepareTarget)
 	if nativeCompletionMatches(view, appendNativeTransactionCompletion(
 		t, view, replicatedstate.ResultApplied, wrongIdentity[:],
 	)) {

@@ -104,7 +104,7 @@ func TestDataReadCutAdmission(t *testing.T) {
 func TestDataReadCutRefusesActiveIntentsUntilRelease(t *testing.T) {
 	fixture := newRelationBundleFixture(t, true)
 	id := transactionCodecID(231)
-	stage := transactionParticipantStageCommand(t, fixture, id, []replication.RelationMutationBatch{{
+	stage := transactionTargetStageCommand(t, fixture, id, []replication.RelationMutationBatch{{
 		Relation: 1, Mutations: []replication.Mutation{{
 			Kind: replication.MutationPutAbsentOrEqual, Key: []byte("pending"), Value: []byte(`{"n":1}`),
 		}},
@@ -118,11 +118,11 @@ func TestDataReadCutRefusesActiveIntentsUntilRelease(t *testing.T) {
 		}
 	}
 	for step, op := range []distributedtxn.ReplicatedOperation{
-		distributedtxn.ReplicatedPrepareParticipant,
-		distributedtxn.ReplicatedApplyParticipant,
-		distributedtxn.ReplicatedReleaseParticipant,
+		distributedtxn.ReplicatedPrepareTarget,
+		distributedtxn.ReplicatedApplyTarget,
+		distributedtxn.ReplicatedReleaseTarget,
 	} {
-		command := transactionParticipantTransitionCommand(t, fixture, id, op, uint64(step+1))
+		command := transactionTargetTransitionCommand(t, fixture, id, op, uint64(step+1))
 		applyTransactionCommand(t, fixture.machine, uint64(step+4), command)
 		if step < 2 {
 			if err := fixture.machine.DataReadCutInto([]replication.RelationID{1}, uint64(step+4), &cut); !errors.Is(err, ErrTransactionIntentActive) {

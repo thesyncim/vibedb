@@ -39,7 +39,7 @@ const (
 		replication.MaxMutationKeyBytes + recordChecksumLen
 
 	// MaxTransactionResidentBytes is a per-transaction byte admission ceiling,
-	// not a participant or mutation-count contract. It includes exact encoded
+	// not a target or mutation-count contract. It includes exact encoded
 	// system keys and values retained by the shard state machine.
 	MaxTransactionResidentBytes = 128 << 20
 )
@@ -85,7 +85,7 @@ var (
 )
 
 // TransactionControl is the compact durable authority for one coordinator or
-// participant. Creation identity survives retirement/release so delayed stage
+// target. Creation identity survives retirement/release so delayed stage
 // retries cannot become new. Last* retains the exact applied transition needed
 // to settle a response-lost retry after the ordinary session ring is gone.
 type TransactionControl struct {
@@ -101,7 +101,7 @@ type TransactionControl struct {
 	PayloadBytes       uint64
 	PayloadCount       uint64
 	// PayloadRelationCount is zero for coordinators and the exact number of
-	// packed native relation rows for a participant stage.
+	// packed native relation rows for a target stage.
 	PayloadRelationCount uint16
 
 	CoordinatorGroup            replication.ID128
@@ -116,15 +116,15 @@ type TransactionControl struct {
 
 	AffectedRows      int64
 	AffectedRowsValid bool
-	// CoordinatorParticipantOrdinal occupies the same durable scalar as
+	// CoordinatorTargetOrdinal occupies the same durable scalar as
 	// AffectedRows. Active coordinators never publish affected rows, while
-	// participants never own a coordinator ordinal, so the role overlay keeps
+	// targets never own a coordinator ordinal, so the role overlay keeps
 	// the fixed control record compact.
-	CoordinatorParticipantOrdinal uint64
-	// ParticipantOrdinal reuses the affected-row scalar only for compact
-	// cancellation witnesses. It binds a missing participant's exact manifest
+	CoordinatorTargetOrdinal uint64
+	// TargetOrdinal reuses the affected-row scalar only for compact
+	// cancellation witnesses. It binds a missing target's exact manifest
 	// position without growing every durable control.
-	ParticipantOrdinal uint32
+	TargetOrdinal uint32
 	// PrepareResultCode is the immutable vote produced by an atomic
 	// stage+prepare. Zero denotes a legacy split-stage control which has not yet
 	// recorded a vote; the durable nonzero values are ResultApplied,
@@ -134,7 +134,7 @@ type TransactionControl struct {
 	// operations from legacy split controls. The bit survives finish/retire so
 	// historical retries cannot reinterpret one protocol as the other.
 	FusedPath bool
-	// CancellationWitness is the compact abort fence for a participant whose
+	// CancellationWitness is the compact abort fence for a target whose
 	// stage+prepare outcome was never observed. It carries no mutation image or
 	// vote and permanently prevents a delayed creation command from installing
 	// intents under the same transaction identity.
@@ -157,16 +157,16 @@ type TransactionControl struct {
 	LastAppliedIndex     uint64
 
 	// Manifest* is the O(1) incremental seal witness for a segmented
-	// coordinator. NextPage and NextParticipant identify the only canonical
+	// coordinator. NextPage and NextTarget identify the only canonical
 	// successor; EncodedBytes and ChainDigest bind every accepted page without
 	// rescanning retained page rows. The tuple is zero before the first page and
 	// for every non-manifest transaction.
-	ManifestNextPage        uint32
-	ManifestNextParticipant uint64
-	ManifestEncodedBytes    uint64
-	ManifestChainDigest     distributedtxn.Digest
-	// PrepareCommandDigest role-overlays ManifestChainDigest for participants.
-	// Participant controls never own manifest progress; retaining the original
+	ManifestNextPage     uint32
+	ManifestNextTarget   uint64
+	ManifestEncodedBytes uint64
+	ManifestChainDigest  distributedtxn.Digest
+	// PrepareCommandDigest role-overlays ManifestChainDigest for targets.
+	// Target controls never own manifest progress; retaining the original
 	// prepare command digest makes response-lost vote lookup exact even after a
 	// finish operation overwrites LastCommandDigest.
 	PrepareCommandDigest replication.Digest
@@ -360,9 +360,9 @@ func AppendTransactionControl(dst []byte, control TransactionControl) ([]byte, e
 	copy(frame[136:168], control.MutationDigest[:])
 	if control.Role == distributedtxn.ReplicatedRoleCoordinator &&
 		distributedtxn.CoordinatorState(control.State) != distributedtxn.CoordinatorRetired {
-		binary.LittleEndian.PutUint64(frame[168:176], control.CoordinatorParticipantOrdinal)
+		binary.LittleEndian.PutUint64(frame[168:176], control.CoordinatorTargetOrdinal)
 	} else if control.CancellationWitness {
-		binary.LittleEndian.PutUint64(frame[168:176], uint64(control.ParticipantOrdinal))
+		binary.LittleEndian.PutUint64(frame[168:176], uint64(control.TargetOrdinal))
 	} else {
 		binary.LittleEndian.PutUint64(frame[168:176], uint64(control.AffectedRows))
 	}
@@ -376,7 +376,7 @@ func AppendTransactionControl(dst []byte, control TransactionControl) ([]byte, e
 	copy(frame[232:264], control.LastCommandDigest[:])
 	binary.LittleEndian.PutUint32(frame[264:268], control.LastResultCode)
 	binary.LittleEndian.PutUint32(frame[268:272], control.ManifestNextPage)
-	binary.LittleEndian.PutUint64(frame[272:280], control.ManifestNextParticipant)
+	binary.LittleEndian.PutUint64(frame[272:280], control.ManifestNextTarget)
 	binary.LittleEndian.PutUint64(frame[280:288], control.ManifestEncodedBytes)
 	if control.Role == distributedtxn.ReplicatedRoleCoordinator {
 		copy(frame[288:320], control.ManifestChainDigest[:])
@@ -460,13 +460,13 @@ func OpenTransactionControlInto(
 	copy(view.MutationDigest[:], src[136:168])
 	if view.Role == distributedtxn.ReplicatedRoleCoordinator &&
 		distributedtxn.CoordinatorState(view.State) != distributedtxn.CoordinatorRetired {
-		view.CoordinatorParticipantOrdinal = binary.LittleEndian.Uint64(src[168:176])
+		view.CoordinatorTargetOrdinal = binary.LittleEndian.Uint64(src[168:176])
 	} else if view.CancellationWitness {
 		ordinal := binary.LittleEndian.Uint64(src[168:176])
 		if ordinal > math.MaxUint32 {
 			return TransactionControlView{}, ErrTransactionStateCorrupt
 		}
-		view.ParticipantOrdinal = uint32(ordinal)
+		view.TargetOrdinal = uint32(ordinal)
 	} else {
 		view.AffectedRows = int64(binary.LittleEndian.Uint64(src[168:176]))
 	}
@@ -480,7 +480,7 @@ func OpenTransactionControlInto(
 	copy(view.LastCommandDigest[:], src[232:264])
 	view.LastResultCode = binary.LittleEndian.Uint32(src[264:268])
 	view.ManifestNextPage = binary.LittleEndian.Uint32(src[268:272])
-	view.ManifestNextParticipant = binary.LittleEndian.Uint64(src[272:280])
+	view.ManifestNextTarget = binary.LittleEndian.Uint64(src[272:280])
 	view.ManifestEncodedBytes = binary.LittleEndian.Uint64(src[280:288])
 	view.ControllerEpoch = binary.LittleEndian.Uint64(src[320:328])
 	copy(view.ExecutionPinDigest[:], src[328:360])
@@ -586,13 +586,13 @@ func OpenTransactionCoordinatorPayload(src []byte) (TransactionCoordinatorPayloa
 }
 
 type TransactionManifestPageView struct {
-	ID               distributedtxn.ID
-	Index            uint32
-	FirstParticipant uint64
-	ParticipantCount uint32
-	Digest           distributedtxn.Digest
-	Raw              []byte
-	raw              []byte
+	ID          distributedtxn.ID
+	Index       uint32
+	FirstTarget uint64
+	TargetCount uint32
+	Digest      distributedtxn.Digest
+	Raw         []byte
+	raw         []byte
 }
 
 func (view TransactionManifestPageView) Bytes() []byte {
@@ -608,13 +608,13 @@ func AppendTransactionManifestPage(
 	id distributedtxn.ID,
 	segment distributedtxn.ManifestSegment,
 ) ([]byte, error) {
-	if id.IsZero() || segment.ParticipantCount == 0 || len(segment.Raw) == 0 ||
+	if id.IsZero() || segment.TargetCount == 0 || len(segment.Raw) == 0 ||
 		len(segment.Raw) > distributedtxn.ManifestSegmentBytes {
 		return dst, ErrTransactionStateCorrupt
 	}
 	meta, ok := openTransactionManifestSegmentMeta(segment.Raw)
-	if !ok || meta.Index != segment.Index || meta.FirstParticipant != segment.FirstParticipant ||
-		meta.ParticipantCount != segment.ParticipantCount || meta.Digest != segment.Digest {
+	if !ok || meta.Index != segment.Index || meta.FirstTarget != segment.FirstTarget ||
+		meta.TargetCount != segment.TargetCount || meta.Digest != segment.Digest {
 		return dst, ErrTransactionStateCorrupt
 	}
 	total := transactionManifestHeaderBytes + len(segment.Raw) + recordChecksumLen
@@ -630,8 +630,8 @@ func AppendTransactionManifestPage(
 	binary.LittleEndian.PutUint32(frame[12:16], uint32(total))
 	binary.LittleEndian.PutUint32(frame[16:20], uint32(len(segment.Raw)))
 	binary.LittleEndian.PutUint32(frame[20:24], segment.Index)
-	binary.LittleEndian.PutUint64(frame[24:32], segment.FirstParticipant)
-	binary.LittleEndian.PutUint32(frame[32:36], segment.ParticipantCount)
+	binary.LittleEndian.PutUint64(frame[24:32], segment.FirstTarget)
+	binary.LittleEndian.PutUint32(frame[32:36], segment.TargetCount)
 	copy(frame[40:56], id[:])
 	copy(frame[56:88], segment.Digest[:])
 	copy(frame[transactionManifestHeaderBytes:], segment.Raw)
@@ -643,8 +643,7 @@ func AppendTransactionManifestPage(
 // nested canonical VTM1 page using caller-owned decode arenas.
 func OpenTransactionManifestPageInto(
 	src []byte,
-	participantScratch []distributedtxn.ParticipantRef,
-	identityScratch []byte,
+	targetScratch []distributedtxn.TransactionTargetRef, identityScratch []byte,
 ) (TransactionManifestPageView, error) {
 	if len(src) < transactionManifestHeaderBytes+1+recordChecksumLen ||
 		len(src) > MaxTransactionManifestPageRecordBytes ||
@@ -665,16 +664,16 @@ func OpenTransactionManifestPageInto(
 	rawBytes := int(rawBytes64)
 	view := TransactionManifestPageView{raw: src[:len(src):len(src)]}
 	view.Index = binary.LittleEndian.Uint32(src[20:24])
-	view.FirstParticipant = binary.LittleEndian.Uint64(src[24:32])
-	view.ParticipantCount = binary.LittleEndian.Uint32(src[32:36])
+	view.FirstTarget = binary.LittleEndian.Uint64(src[24:32])
+	view.TargetCount = binary.LittleEndian.Uint32(src[32:36])
 	copy(view.ID[:], src[40:56])
 	copy(view.Digest[:], src[56:88])
 	end := transactionManifestHeaderBytes + rawBytes
 	view.Raw = src[transactionManifestHeaderBytes:end:end]
-	page, err := distributedtxn.OpenManifestSegment(view.Raw, participantScratch, identityScratch)
+	page, err := distributedtxn.OpenManifestSegment(view.Raw, targetScratch, identityScratch)
 	if err != nil || view.ID.IsZero() || page.Segment.Index != view.Index ||
-		page.Segment.FirstParticipant != view.FirstParticipant ||
-		page.Segment.ParticipantCount != view.ParticipantCount ||
+		page.Segment.FirstTarget != view.FirstTarget ||
+		page.Segment.TargetCount != view.TargetCount ||
 		page.Segment.Digest != view.Digest {
 		return TransactionManifestPageView{}, ErrTransactionStateCorrupt
 	}
@@ -907,7 +906,7 @@ func transactionControlValid(control TransactionControl) bool {
 	cancellation := transactionCancellationWitnessValid(control)
 	if control.ID.IsZero() || !transactionRoleValid(control.Role) || control.Revision == 0 ||
 		control.ControllerEpoch == 0 || control.ExecutionPinDigest == (distributedtxn.Digest{}) ||
-		control.Role == distributedtxn.ReplicatedRoleParticipant && control.RecoveryPulse != 0 ||
+		control.Role == distributedtxn.ReplicatedRoleTarget && control.RecoveryPulse != 0 ||
 		control.PayloadDigest == (distributedtxn.Digest{}) ||
 		(!cancellation && (control.PayloadBytes == 0 || control.PayloadCount == 0)) ||
 		control.CoordinatorGroup == (replication.ID128{}) ||
@@ -926,10 +925,10 @@ func transactionControlValid(control TransactionControl) bool {
 	}
 	creation := control.LastOperation == distributedtxn.ReplicatedStageCoordinator ||
 		control.LastOperation == distributedtxn.ReplicatedStageManifestCoordinator ||
-		control.LastOperation == distributedtxn.ReplicatedStageParticipant ||
+		control.LastOperation == distributedtxn.ReplicatedStageTarget ||
 		control.LastOperation == distributedtxn.ReplicatedBeginPrepareCoordinator ||
 		control.LastOperation == distributedtxn.ReplicatedBeginPrepareManifestCoordinator ||
-		control.LastOperation == distributedtxn.ReplicatedStagePrepareParticipant ||
+		control.LastOperation == distributedtxn.ReplicatedStagePrepareTarget ||
 		control.CancellationWitness
 	if creation != (control.LastExpectedRevision == 0) {
 		return false
@@ -955,7 +954,7 @@ func transactionControlValid(control TransactionControl) bool {
 		if control.PayloadKind == distributedtxn.ReplicatedPayloadCoordinator &&
 			(control.ResidentManifestBytes != 0 ||
 				control.PayloadBytes > distributedtxn.MaxCoordinatorRecordBytes ||
-				control.PayloadCount > distributedtxn.MaxInlineParticipants ||
+				control.PayloadCount > distributedtxn.MaxInlineTargets ||
 				!transactionManifestProgressZero(control)) {
 			return false
 		}
@@ -976,11 +975,11 @@ func transactionControlValid(control TransactionControl) bool {
 		if control.FusedPath && control.PrepareResultCode == 0 {
 			return false
 		}
-		if control.PrepareResultCode == 0 && control.CoordinatorParticipantOrdinal != 0 {
+		if control.PrepareResultCode == 0 && control.CoordinatorTargetOrdinal != 0 {
 			return false
 		}
 		if control.PrepareResultCode != 0 &&
-			control.CoordinatorParticipantOrdinal >= control.PayloadCount {
+			control.CoordinatorTargetOrdinal >= control.PayloadCount {
 			return false
 		}
 		return (control.PayloadKind == distributedtxn.ReplicatedPayloadCoordinator ||
@@ -994,22 +993,22 @@ func transactionControlValid(control TransactionControl) bool {
 	if control.CancellationWitness {
 		return cancellation
 	}
-	if control.ParticipantOrdinal != 0 {
+	if control.TargetOrdinal != 0 {
 		return false
 	}
-	if control.PayloadKind != distributedtxn.ReplicatedPayloadParticipantStage ||
+	if control.PayloadKind != distributedtxn.ReplicatedPayloadTargetStage ||
 		control.PayloadBytes > replication.MaxCommandBytes ||
 		control.PayloadCount > replication.MaxMutations ||
 		control.PayloadRelationCount == 0 ||
 		control.PayloadRelationCount > replication.MaxRelationsPerBundle ||
 		uint64(control.PayloadRelationCount) > control.PayloadCount ||
 		!distributedtxn.ValidateIntentScopes(control.IntentScopes, control.BucketBits) ||
-		control.State < uint8(distributedtxn.ParticipantStaged) ||
-		control.State > uint8(distributedtxn.ParticipantReleased) || control.AffectedRows < 0 ||
+		control.State < uint8(distributedtxn.TargetStaged) ||
+		control.State > uint8(distributedtxn.TargetReleased) || control.AffectedRows < 0 ||
 		control.ResidentPayloadBytes != 0 || control.ResidentManifestBytes != 0 ||
 		!transactionManifestProgressZero(control) ||
 		control.CoordinatorDecision != distributedtxn.CoordinatorInvalid ||
-		control.CoordinatorParticipantOrdinal != 0 ||
+		control.CoordinatorTargetOrdinal != 0 ||
 		(control.PrepareResultCode != 0 && control.PrepareResultCode != ResultApplied &&
 			control.PrepareResultCode != ResultIndexConflict &&
 			control.PrepareResultCode != ResultWrongShard) {
@@ -1022,16 +1021,16 @@ func transactionControlValid(control TransactionControl) bool {
 	if control.FusedPath && control.PrepareResultCode == 0 {
 		return false
 	}
-	active := distributedtxn.ParticipantState(control.State) != distributedtxn.ParticipantReleased
+	active := distributedtxn.TargetState(control.State) != distributedtxn.TargetReleased
 	if active != (control.ResidentMutationBytes != 0) || active != (control.ResidentIntentBytes != 0) {
 		return false
 	}
-	switch distributedtxn.ParticipantState(control.State) {
-	case distributedtxn.ParticipantApplied:
+	switch distributedtxn.TargetState(control.State) {
+	case distributedtxn.TargetApplied:
 		return control.AffectedRowsValid
-	case distributedtxn.ParticipantAborted:
+	case distributedtxn.TargetAborted:
 		return !control.AffectedRowsValid && control.AffectedRows == 0
-	case distributedtxn.ParticipantReleased:
+	case distributedtxn.TargetReleased:
 		return !control.AffectedRowsValid && control.AffectedRows == 0 || control.AffectedRowsValid
 	default:
 		return !control.AffectedRowsValid && control.AffectedRows == 0
@@ -1051,21 +1050,21 @@ func transactionCoordinatorAffectedRowsValid(control TransactionControl) bool {
 
 func transactionCancellationWitnessValid(control TransactionControl) bool {
 	return control.CancellationWitness && control.FusedPath &&
-		control.Role == distributedtxn.ReplicatedRoleParticipant &&
-		distributedtxn.ParticipantState(control.State) == distributedtxn.ParticipantReleased &&
+		control.Role == distributedtxn.ReplicatedRoleTarget &&
+		distributedtxn.TargetState(control.State) == distributedtxn.TargetReleased &&
 		control.Revision == 1 &&
-		control.PayloadKind == distributedtxn.ReplicatedPayloadParticipantStage &&
+		control.PayloadKind == distributedtxn.ReplicatedPayloadTargetStage &&
 		control.PayloadDigest == control.MutationDigest && control.PayloadBytes == 0 &&
 		control.PayloadCount == 0 && control.PayloadRelationCount == 0 &&
 		control.BucketBits == 0 && len(control.IntentScopes) == 0 &&
 		!control.AffectedRowsValid && control.AffectedRows == 0 &&
 		control.PrepareResultCode == 0 && control.PrepareCommandDigest == (replication.Digest{}) &&
 		control.CoordinatorDecision == distributedtxn.CoordinatorInvalid &&
-		control.CoordinatorParticipantOrdinal == 0 &&
+		control.CoordinatorTargetOrdinal == 0 &&
 		control.ResidentPayloadBytes == 0 && control.ResidentManifestBytes == 0 &&
 		control.ResidentMutationBytes == 0 && control.ResidentIntentBytes == 0 &&
 		transactionManifestProgressZero(control) &&
-		control.LastOperation == distributedtxn.ReplicatedAbortReleaseParticipant &&
+		control.LastOperation == distributedtxn.ReplicatedAbortReleaseTarget &&
 		control.LastExpectedRevision == 0 && control.LastResultCode == ResultApplied
 }
 
@@ -1074,18 +1073,18 @@ func operationHasExclusiveTransactionPath(operation distributedtxn.ReplicatedOpe
 	case distributedtxn.ReplicatedStageCoordinator,
 		distributedtxn.ReplicatedStageManifestCoordinator,
 		distributedtxn.ReplicatedStageManifestSegment,
-		distributedtxn.ReplicatedStageParticipant,
-		distributedtxn.ReplicatedPrepareParticipant,
-		distributedtxn.ReplicatedApplyParticipant,
-		distributedtxn.ReplicatedAbortParticipant,
-		distributedtxn.ReplicatedReleaseParticipant,
+		distributedtxn.ReplicatedStageTarget,
+		distributedtxn.ReplicatedPrepareTarget,
+		distributedtxn.ReplicatedApplyTarget,
+		distributedtxn.ReplicatedAbortTarget,
+		distributedtxn.ReplicatedReleaseTarget,
 		distributedtxn.ReplicatedBeginPrepareCoordinator,
 		distributedtxn.ReplicatedBeginPrepareManifestCoordinator,
 		distributedtxn.ReplicatedAppendManifestSegments,
-		distributedtxn.ReplicatedStagePrepareParticipant,
-		distributedtxn.ReplicatedApplySingleParticipant,
-		distributedtxn.ReplicatedApplyReleaseParticipant,
-		distributedtxn.ReplicatedAbortReleaseParticipant:
+		distributedtxn.ReplicatedStagePrepareTarget,
+		distributedtxn.ReplicatedApplySingleTarget,
+		distributedtxn.ReplicatedApplyReleaseTarget,
+		distributedtxn.ReplicatedAbortReleaseTarget:
 		return true
 	default:
 		return false
@@ -1097,10 +1096,10 @@ func operationUsesFusedTransactionPath(operation distributedtxn.ReplicatedOperat
 	case distributedtxn.ReplicatedBeginPrepareCoordinator,
 		distributedtxn.ReplicatedBeginPrepareManifestCoordinator,
 		distributedtxn.ReplicatedAppendManifestSegments,
-		distributedtxn.ReplicatedStagePrepareParticipant,
-		distributedtxn.ReplicatedApplySingleParticipant,
-		distributedtxn.ReplicatedApplyReleaseParticipant,
-		distributedtxn.ReplicatedAbortReleaseParticipant:
+		distributedtxn.ReplicatedStagePrepareTarget,
+		distributedtxn.ReplicatedApplySingleTarget,
+		distributedtxn.ReplicatedApplyReleaseTarget,
+		distributedtxn.ReplicatedAbortReleaseTarget:
 		return true
 	default:
 		return false
@@ -1108,18 +1107,18 @@ func operationUsesFusedTransactionPath(operation distributedtxn.ReplicatedOperat
 }
 
 func transactionFailedPrepareWitness(control TransactionControl) bool {
-	return control.Role == distributedtxn.ReplicatedRoleParticipant &&
-		distributedtxn.ParticipantState(control.State) == distributedtxn.ParticipantStaged &&
-		control.LastOperation == distributedtxn.ReplicatedPrepareParticipant &&
+	return control.Role == distributedtxn.ReplicatedRoleTarget &&
+		distributedtxn.TargetState(control.State) == distributedtxn.TargetStaged &&
+		control.LastOperation == distributedtxn.ReplicatedPrepareTarget &&
 		control.LastExpectedRevision == control.Revision &&
 		(control.LastResultCode == ResultIndexConflict ||
 			control.LastResultCode == ResultWrongShard)
 }
 
 func transactionFailedFusedPrepareWitness(control TransactionControl) bool {
-	return control.Role == distributedtxn.ReplicatedRoleParticipant &&
-		distributedtxn.ParticipantState(control.State) == distributedtxn.ParticipantReleased &&
-		control.LastOperation == distributedtxn.ReplicatedStagePrepareParticipant &&
+	return control.Role == distributedtxn.ReplicatedRoleTarget &&
+		distributedtxn.TargetState(control.State) == distributedtxn.TargetReleased &&
+		control.LastOperation == distributedtxn.ReplicatedStagePrepareTarget &&
 		control.LastExpectedRevision == 0 &&
 		(control.LastResultCode == ResultIndexConflict ||
 			control.LastResultCode == ResultWrongShard) &&
@@ -1145,20 +1144,20 @@ func transactionCoordinatorDecisionValid(control TransactionControl) bool {
 }
 
 func transactionManifestProgressZero(control TransactionControl) bool {
-	return control.ManifestNextPage == 0 && control.ManifestNextParticipant == 0 &&
+	return control.ManifestNextPage == 0 && control.ManifestNextTarget == 0 &&
 		control.ManifestEncodedBytes == 0 &&
 		control.ManifestChainDigest == (distributedtxn.Digest{})
 }
 
 func transactionManifestProgressValid(control TransactionControl) bool {
 	zero := transactionManifestProgressZero(control)
-	if control.ManifestNextPage == 0 || control.ManifestNextParticipant == 0 ||
+	if control.ManifestNextPage == 0 || control.ManifestNextTarget == 0 ||
 		control.ManifestEncodedBytes == 0 ||
 		control.ManifestChainDigest == (distributedtxn.Digest{}) {
 		return zero
 	}
 	return uint64(control.ManifestNextPage) <= control.PayloadCount &&
-		control.ManifestNextParticipant <= control.PayloadCount &&
+		control.ManifestNextTarget <= control.PayloadCount &&
 		control.ManifestEncodedBytes <= control.PayloadBytes
 }
 
@@ -1181,14 +1180,14 @@ func advanceTransactionManifestChain(
 
 func finishTransactionManifestRoot(
 	chain distributedtxn.Digest,
-	participantCount uint64,
+	targetCount uint64,
 	encodedBytes uint64,
 	segmentCount uint32,
 ) distributedtxn.Digest {
 	var encoded [8 + 32 + 8 + 8 + 4]byte
 	copy(encoded[0:8], transactionManifestRootDomain[:])
 	copy(encoded[8:40], chain[:])
-	binary.LittleEndian.PutUint64(encoded[40:48], participantCount)
+	binary.LittleEndian.PutUint64(encoded[40:48], targetCount)
 	binary.LittleEndian.PutUint64(encoded[48:56], encodedBytes)
 	binary.LittleEndian.PutUint32(encoded[56:60], segmentCount)
 	return sha256.Sum256(encoded[:])
@@ -1213,8 +1212,8 @@ func transactionResidentCountersValid(control TransactionControl) bool {
 	}
 	terminal := control.Role == distributedtxn.ReplicatedRoleCoordinator &&
 		distributedtxn.CoordinatorState(control.State) == distributedtxn.CoordinatorRetired ||
-		control.Role == distributedtxn.ReplicatedRoleParticipant &&
-			distributedtxn.ParticipantState(control.State) == distributedtxn.ParticipantReleased
+		control.Role == distributedtxn.ReplicatedRoleTarget &&
+			distributedtxn.TargetState(control.State) == distributedtxn.TargetReleased
 	return !terminal || control.ResidentPayloadBytes == 0 &&
 		control.ResidentManifestBytes == 0 && control.ResidentMutationBytes == 0 &&
 		control.ResidentIntentBytes == 0
@@ -1230,7 +1229,7 @@ func transactionCoordinatorPayloadValid(
 	}
 	switch kind {
 	case distributedtxn.ReplicatedPayloadCoordinator:
-		var scratch [distributedtxn.MaxInlineParticipants]distributedtxn.ParticipantRef
+		var scratch [distributedtxn.MaxInlineTargets]distributedtxn.TransactionTargetRef
 		record, err := distributedtxn.OpenCoordinatorInto(payload, scratch[:])
 		return err == nil && record.ID == id && record.State == distributedtxn.CoordinatorStaging &&
 			transactionInlineCoordinatorCanonical(payload)
@@ -1267,7 +1266,7 @@ func transactionInlineCoordinatorCanonical(raw []byte) bool {
 
 func transactionRoleValid(role distributedtxn.ReplicatedRole) bool {
 	return role == distributedtxn.ReplicatedRoleCoordinator ||
-		role == distributedtxn.ReplicatedRoleParticipant
+		role == distributedtxn.ReplicatedRoleTarget
 }
 
 func transactionRelationValid(relation replication.RelationID) bool {
@@ -1291,16 +1290,16 @@ func transactionOperationRole(
 		return role == distributedtxn.ReplicatedRoleCoordinator
 	case distributedtxn.ReplicatedPulseCoordinator:
 		return role == distributedtxn.ReplicatedRoleCoordinator
-	case distributedtxn.ReplicatedStageParticipant,
-		distributedtxn.ReplicatedStagePrepareParticipant,
-		distributedtxn.ReplicatedApplySingleParticipant,
-		distributedtxn.ReplicatedPrepareParticipant,
-		distributedtxn.ReplicatedApplyParticipant,
-		distributedtxn.ReplicatedApplyReleaseParticipant,
-		distributedtxn.ReplicatedAbortParticipant,
-		distributedtxn.ReplicatedAbortReleaseParticipant,
-		distributedtxn.ReplicatedReleaseParticipant:
-		return role == distributedtxn.ReplicatedRoleParticipant
+	case distributedtxn.ReplicatedStageTarget,
+		distributedtxn.ReplicatedStagePrepareTarget,
+		distributedtxn.ReplicatedApplySingleTarget,
+		distributedtxn.ReplicatedPrepareTarget,
+		distributedtxn.ReplicatedApplyTarget,
+		distributedtxn.ReplicatedApplyReleaseTarget,
+		distributedtxn.ReplicatedAbortTarget,
+		distributedtxn.ReplicatedAbortReleaseTarget,
+		distributedtxn.ReplicatedReleaseTarget:
+		return role == distributedtxn.ReplicatedRoleTarget
 	default:
 		return false
 	}
@@ -1330,21 +1329,21 @@ func transactionStateOperationCompatible(
 		}
 		return false
 	}
-	switch distributedtxn.ParticipantState(state) {
-	case distributedtxn.ParticipantStaged:
-		return operation == distributedtxn.ReplicatedStageParticipant
-	case distributedtxn.ParticipantPrepared:
-		return operation == distributedtxn.ReplicatedPrepareParticipant ||
-			operation == distributedtxn.ReplicatedStagePrepareParticipant
-	case distributedtxn.ParticipantApplied:
-		return operation == distributedtxn.ReplicatedApplyParticipant
-	case distributedtxn.ParticipantAborted:
-		return operation == distributedtxn.ReplicatedAbortParticipant
-	case distributedtxn.ParticipantReleased:
-		return operation == distributedtxn.ReplicatedReleaseParticipant ||
-			operation == distributedtxn.ReplicatedApplyReleaseParticipant ||
-			operation == distributedtxn.ReplicatedApplySingleParticipant ||
-			operation == distributedtxn.ReplicatedAbortReleaseParticipant
+	switch distributedtxn.TargetState(state) {
+	case distributedtxn.TargetStaged:
+		return operation == distributedtxn.ReplicatedStageTarget
+	case distributedtxn.TargetPrepared:
+		return operation == distributedtxn.ReplicatedPrepareTarget ||
+			operation == distributedtxn.ReplicatedStagePrepareTarget
+	case distributedtxn.TargetApplied:
+		return operation == distributedtxn.ReplicatedApplyTarget
+	case distributedtxn.TargetAborted:
+		return operation == distributedtxn.ReplicatedAbortTarget
+	case distributedtxn.TargetReleased:
+		return operation == distributedtxn.ReplicatedReleaseTarget ||
+			operation == distributedtxn.ReplicatedApplyReleaseTarget ||
+			operation == distributedtxn.ReplicatedApplySingleTarget ||
+			operation == distributedtxn.ReplicatedAbortReleaseTarget
 	default:
 		return false
 	}
@@ -1378,14 +1377,14 @@ func transactionMutationValid(mutation replication.Mutation) bool {
 }
 
 type transactionManifestSegmentMeta struct {
-	Index            uint32
-	FirstParticipant uint64
-	ParticipantCount uint32
-	Digest           distributedtxn.Digest
+	Index       uint32
+	FirstTarget uint64
+	TargetCount uint32
+	Digest      distributedtxn.Digest
 }
 
 // openTransactionManifestSegmentMeta validates the exact VTM1 grammar without
-// materializing participant slices. Full recovery decoding still uses
+// materializing target slices. Full recovery decoding still uses
 // distributedtxn.OpenManifestSegment with caller scratch.
 func openTransactionManifestSegmentMeta(raw []byte) (transactionManifestSegmentMeta, bool) {
 	const (
@@ -1405,7 +1404,7 @@ func openTransactionManifestSegmentMeta(raw []byte) (transactionManifestSegmentM
 	count := binary.LittleEndian.Uint32(raw[12:16])
 	first := binary.LittleEndian.Uint64(raw[16:24])
 	payloadBytes := binary.LittleEndian.Uint32(raw[24:28])
-	if count == 0 || count > distributedtxn.MaxManifestPageParticipants ||
+	if count == 0 || count > distributedtxn.MaxManifestPageTargets ||
 		binary.LittleEndian.Uint32(raw[28:32]) != 0 ||
 		uint64(headerBytes)+uint64(payloadBytes)+checksum != uint64(len(raw)) {
 		return transactionManifestSegmentMeta{}, false
@@ -1413,7 +1412,7 @@ func openTransactionManifestSegmentMeta(raw []byte) (transactionManifestSegmentM
 	cursor, end := headerBytes, len(raw)-checksum
 	var priorDistribution, priorShard [distributedtxn.MaxShardIdentityBytes]byte
 	priorDistributionBytes, priorShardBytes := 0, 0
-	for participant := uint32(0); participant < count; participant++ {
+	for target := uint32(0); target < count; target++ {
 		if end-cursor < entryBytes {
 			return transactionManifestSegmentMeta{}, false
 		}
@@ -1422,14 +1421,14 @@ func openTransactionManifestSegmentMeta(raw []byte) (transactionManifestSegmentM
 		shardPrefix, shardSuffix := int(entry[2]), int(entry[3])
 		distributionBytes := distributionPrefix + distributionSuffix
 		shardBytes := shardPrefix + shardSuffix
-		state := distributedtxn.ParticipantState(entry[4])
+		state := distributedtxn.TargetState(entry[4])
 		if entry[5] != 0 || entry[6] != 0 || entry[7] != 0 ||
-			(participant == 0 && (distributionPrefix != 0 || shardPrefix != 0)) ||
+			(target == 0 && (distributionPrefix != 0 || shardPrefix != 0)) ||
 			distributionPrefix > priorDistributionBytes || shardPrefix > priorShardBytes ||
 			distributionBytes == 0 || distributionBytes > distributedtxn.MaxShardIdentityBytes ||
 			shardBytes == 0 || shardBytes > distributedtxn.MaxShardIdentityBytes ||
 			end-cursor-entryBytes < distributionSuffix+shardSuffix ||
-			state < distributedtxn.ParticipantStaged || state > distributedtxn.ParticipantReleased ||
+			state < distributedtxn.TargetStaged || state > distributedtxn.TargetReleased ||
 			binary.LittleEndian.Uint64(entry[8:16]) == 0 ||
 			binary.LittleEndian.Uint64(entry[16:24]) == 0 ||
 			binary.LittleEndian.Uint64(entry[24:32]) == 0 || allZero(entry[32:64]) {
@@ -1448,7 +1447,7 @@ func openTransactionManifestSegmentMeta(raw []byte) (transactionManifestSegmentM
 		priorDistributionView := priorDistribution[:priorDistributionBytes]
 		priorShardView := priorShard[:priorShardBytes]
 		if !utf8.Valid(currentDistribution) || !utf8.Valid(currentShard) ||
-			(participant != 0 && (transactionIdentityCompare(
+			(target != 0 && (transactionIdentityCompare(
 				priorDistributionView, priorShardView, currentDistribution, currentShard,
 			) >= 0 || transactionCommonPrefix(priorDistributionView, currentDistribution) != distributionPrefix ||
 				transactionCommonPrefix(priorShardView, currentShard) != shardPrefix)) {
@@ -1461,7 +1460,7 @@ func openTransactionManifestSegmentMeta(raw []byte) (transactionManifestSegmentM
 		return transactionManifestSegmentMeta{}, false
 	}
 	return transactionManifestSegmentMeta{
-		Index: index, FirstParticipant: first, ParticipantCount: count,
+		Index: index, FirstTarget: first, TargetCount: count,
 		Digest: distributedtxn.Digest(sha256.Sum256(raw)),
 	}, true
 }

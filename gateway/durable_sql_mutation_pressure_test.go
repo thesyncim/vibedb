@@ -58,29 +58,29 @@ func TestDurableSQLMutationPressureCoversSingleBatchAndMultiTable(t *testing.T) 
 			if !planner.InstallPressureObserver(observer) {
 				t.Fatal("install pressure observer")
 			}
-			participants, handled, err := planner.planReplicatedSQLTransactionWithData(
+			targets, handled, err := planner.planReplicatedSQLTransactionWithData(
 				context.Background(), snapshot, test.queries,
 				planner.profileFor(ClassInteractive), nil,
 			)
-			if err != nil || !handled || len(participants) != test.want {
-				t.Fatalf("participants=%d handled=%v err=%v", len(participants), handled, err)
+			if err != nil || !handled || len(targets) != test.want {
+				t.Fatalf("participants=%d handled=%v err=%v", len(targets), handled, err)
 			}
 			executor := &DurableSQLRequestExecutor{planner: planner}
-			executor.observeMutationPressure(snapshot, participants)
+			executor.observeMutationPressure(snapshot, targets)
 			if observer.calls != test.want {
 				t.Fatalf("pressure calls=%d want=%d", observer.calls, test.want)
 			}
-			for index := range participants {
+			for index := range targets {
 				observation := observer.observations[index]
-				wantSource := replicatedDataPressureSource(snapshot, participants[index].Route)
+				wantSource := replicatedDataPressureSource(snapshot, targets[index].Route)
 				if !observation.Write || observation.Source != wantSource ||
-					len(observation.AccessScopes) != len(participants[index].IntentScopes) {
-					t.Fatalf("observation[%d]=%+v participant=%+v", index, observation, participants[index])
+					len(observation.AccessScopes) != len(targets[index].IntentScopes) {
+					t.Fatalf("observation[%d]=%+v participant=%+v", index, observation, targets[index])
 				}
 				for scope := range observation.AccessScopes {
-					if observation.AccessScopes[scope] != participants[index].IntentScopes[scope] {
+					if observation.AccessScopes[scope] != targets[index].IntentScopes[scope] {
 						t.Fatalf("observation[%d] scopes=%+v want=%+v", index,
-							observation.AccessScopes, participants[index].IntentScopes)
+							observation.AccessScopes, targets[index].IntentScopes)
 					}
 				}
 			}
@@ -108,7 +108,7 @@ func TestDurableSQLMutationPressureCountsFusedAdmissionOnceAcrossRestartedRetry(
 		Request: requestledger.RequestID{0x62}, TenantDigest: requestledger.Digest(sha256.Sum256(tenant)),
 		IssuerEpoch: 7, IssuerLane: requestledger.IssuerLane{0x63}, IssuerSequence: 1,
 	}
-	topology := durableFaultTopology(t, durableFaultParticipants(t))
+	topology := durableFaultTopology(t, durableFaultTargets(t))
 	current := topology.Current()
 	current.Generation = 7
 	if err = topology.Publish(*current); err != nil {
@@ -156,18 +156,18 @@ func TestDurableSQLMutationPressureForegroundGate(t *testing.T) {
 	snapshot, planner := replicatedSQLTransactionFixture(t, true)
 	observer := new(durableSQLPressureObserver)
 	planner.pressure = observer
-	participants, handled, err := planner.planReplicatedSQLTransactionWithData(
+	targets, handled, err := planner.planReplicatedSQLTransactionWithData(
 		context.Background(), snapshot, []Query{{
 			SQL: `DELETE FROM messages WHERE id = ?`, Class: ClassInteractive,
 			Params: []shardservice.Param{shardservice.StringParam("message-hot")},
 		}}, planner.profileFor(ClassInteractive), nil,
 	)
-	if err != nil || !handled || len(participants) != 1 {
-		t.Fatalf("participants=%d handled=%v err=%v", len(participants), handled, err)
+	if err != nil || !handled || len(targets) != 1 {
+		t.Fatalf("participants=%d handled=%v err=%v", len(targets), handled, err)
 	}
 	executor := &DurableSQLRequestExecutor{planner: planner}
 	if allocations := testing.AllocsPerRun(2_000, func() {
-		executor.observeMutationPressure(snapshot, participants)
+		executor.observeMutationPressure(snapshot, targets)
 	}); allocations != 0 {
 		t.Fatalf("pressure allocations/op=%f want=0", allocations)
 	}
@@ -177,7 +177,7 @@ func TestDurableSQLMutationPressureForegroundGate(t *testing.T) {
 	for sample := range latencies {
 		started := time.Now()
 		for range batch {
-			executor.observeMutationPressure(snapshot, participants)
+			executor.observeMutationPressure(snapshot, targets)
 		}
 		latencies[sample] = time.Since(started) / batch
 	}
@@ -193,18 +193,18 @@ func TestDurableSQLMutationPressureForegroundGate(t *testing.T) {
 func BenchmarkDurableSQLMutationPressure(b *testing.B) {
 	snapshot, planner := replicatedSQLTransactionFixture(b, true)
 	planner.pressure = new(durableSQLPressureObserver)
-	participants, handled, err := planner.planReplicatedSQLTransactionWithData(
+	targets, handled, err := planner.planReplicatedSQLTransactionWithData(
 		context.Background(), snapshot, []Query{{
 			SQL: `DELETE FROM messages WHERE id = ?`, Class: ClassInteractive,
 			Params: []shardservice.Param{shardservice.StringParam("message-hot")},
 		}}, planner.profileFor(ClassInteractive), nil,
 	)
-	if err != nil || !handled || len(participants) != 1 {
+	if err != nil || !handled || len(targets) != 1 {
 		b.Fatal(err)
 	}
 	executor := &DurableSQLRequestExecutor{planner: planner}
 	b.ReportAllocs()
 	for b.Loop() {
-		executor.observeMutationPressure(snapshot, participants)
+		executor.observeMutationPressure(snapshot, targets)
 	}
 }
