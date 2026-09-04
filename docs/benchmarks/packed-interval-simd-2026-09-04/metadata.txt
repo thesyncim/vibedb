@@ -1,0 +1,11 @@
+hardware=Apple M4 Max
+os=darwin
+arch=arm64
+toolchain=go1.27.0
+base=de6c448dc75838fbfa1b9ec63875ca8b0769190a
+candidate=4a42c581c5668172f80117a9719de0d20dc541c6
+benchmark_source=query/file_packed_interval_bench_test.go
+benchmark_source_sha256=5c55cd3ee561e1b2e4f7f98c1c75e9a3be8bad1320820ad438415ea16bbdf61d
+base_worktree_status=?? query/file_packed_interval_bench_test.go
+sampling=sequential five-sample blocks, benchtime 200ms, default GOMAXPROCS
+power_and_thermal_state=uncontrolled development machine

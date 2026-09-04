@@ -60,6 +60,13 @@ type UnifiedIntegerOrderFilter struct {
 	op       UnifiedIntegerOrder
 }
 
+// UnifiedIntegerIntervalFilter is the reusable state of one normalized
+// integer interval predicate over compact FOR streams.
+type UnifiedIntegerIntervalFilter struct {
+	resolver UnifiedHoleResolver
+	interval UnifiedIntegerInterval
+}
+
 // NewUnifiedIntegerOrderFilter builds an exact ordered integer filter over a
 // unified field path. The caller proves the query literal is an int64 before
 // constructing this filter; the storage layer still validates the operation.
@@ -70,6 +77,19 @@ func NewUnifiedIntegerOrderFilter(
 		return nil, fmt.Errorf("%w: unified integer order", ErrInvalidWrite)
 	}
 	f := &UnifiedIntegerOrderFilter{needle: needle, op: op}
+	if err := f.resolver.SetPath(path); err != nil {
+		return nil, err
+	}
+	return f, nil
+}
+
+// NewUnifiedIntegerIntervalFilter builds an exact normalized interval filter
+// over a unified field path. The caller proves the query literals are int64;
+// the storage layer still validates the path grammar.
+func NewUnifiedIntegerIntervalFilter(
+	path []byte, interval UnifiedIntegerInterval,
+) (*UnifiedIntegerIntervalFilter, error) {
+	f := &UnifiedIntegerIntervalFilter{interval: interval}
 	if err := f.resolver.SetPath(path); err != nil {
 		return nil, err
 	}
@@ -402,6 +422,41 @@ func (c *PrimaryGraphCursor) FilterCountIntegerOrdered(
 		if c.row == 0 {
 			matched, ok := c.leaf.CountResolvedIntegerOrdered(
 				&f.resolver, f.needle, f.op,
+			)
+			if !ok {
+				return false, nil
+			}
+			progress.Scanned += c.leaf.Len()
+			progress.Matched += matched
+			c.row = c.leaf.Len()
+		}
+		if err := c.advanceLeaf(); err != nil {
+			c.Close()
+			return false, err
+		}
+		if c.done {
+			return true, nil
+		}
+	}
+}
+
+// FilterCountIntegerInterval scans every compact leaf with an all-or-nothing
+// FOR interval counter. A false result means no count is authoritative: the
+// caller must discard progress and execute the original predicate generically.
+func (c *PrimaryGraphCursor) FilterCountIntegerInterval(
+	f *UnifiedIntegerIntervalFilter,
+	progress *UnifiedFilterProgress,
+) (supported bool, err error) {
+	if c == nil || f == nil || progress == nil {
+		return false, nil
+	}
+	if c.done {
+		return true, nil
+	}
+	for {
+		if c.row == 0 {
+			matched, ok := c.leaf.CountResolvedIntegerInterval(
+				&f.resolver, f.interval,
 			)
 			if !ok {
 				return false, nil

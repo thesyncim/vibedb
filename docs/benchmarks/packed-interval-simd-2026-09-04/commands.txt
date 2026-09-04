@@ -1,0 +1,12 @@
+Base (current main de6c448dc75838fbfa1b9ec63875ca8b0769190a):
+git worktree add --detach /private/tmp/vibedb-range-baseline de6c448dc75838fbfa1b9ec63875ca8b0769190a
+cp query/file_packed_interval_bench_test.go /private/tmp/vibedb-range-baseline/query/file_packed_interval_bench_test.go
+cd /private/tmp/vibedb-range-baseline
+GOTOOLCHAIN=go1.27.0 GOEXPERIMENT=simd go test -count=5 -run '^$' -bench '^BenchmarkFilePackedIntegerInterval(Count|CountWide)$' -benchtime=200ms -benchmem ./query
+
+Candidate (4a42c581c5668172f80117a9719de0d20dc541c6):
+cd /private/tmp/vibedb-go127-simd-range-count
+GOTOOLCHAIN=go1.27.0 GOEXPERIMENT=simd VIBEDB_EXPECT_INTERVAL=1 go test -count=5 -run '^$' -bench '^BenchmarkFilePackedIntegerInterval(Count|CountWide)$' -benchtime=200ms -benchmem ./query
+
+Candidate portable fallback:
+GOTOOLCHAIN=go1.27.0 GOEXPERIMENT=nosimd VIBEDB_EXPECT_INTERVAL=1 go test -count=5 -run '^$' -bench '^BenchmarkFilePackedIntegerInterval(Count|CountWide)$' -benchtime=200ms -benchmem ./query
