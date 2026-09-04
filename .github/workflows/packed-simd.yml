@@ -12,7 +12,7 @@ on:
       - 'query/raw_match.go'
       - 'query/file_packed_count_bench_test.go'
       - 'query/file_packed_order_bench_test.go'
-      - 'query/file_packed_interval_bench_test.go'
+      - 'query/file_packed_interval*_test.go'
       - '.github/workflows/packed-simd.yml'
       - 'scripts/bench/run-packed-simd.sh'
   workflow_dispatch:
