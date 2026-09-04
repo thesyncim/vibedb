@@ -224,13 +224,15 @@ func (s *compactStreamSequentialState) appendArithmeticPrefixKey(
 	suffixValue, _ := v.dictionaryEntry(1)
 	dst = append(dst, prefixValue...)
 	digits := len(dst)
-	if value < 1_000_000 {
+	width := int(v.data[1])
+	if v.data[0]&1 != 0 && width == 8 && value < 100_000_000 {
+		dst = appendFixedUint8(dst, uint32(value))
+	} else if value < 1_000_000 {
 		dst = appendCanonicalUint6(dst, uint64(value))
 	} else {
 		dst = strconv.AppendUint(dst, uint64(value), 10)
 	}
-	if v.data[0]&1 != 0 {
-		width := int(v.data[1])
+	if v.data[0]&1 != 0 && width != 8 {
 		n := len(dst) - digits
 		if n > width {
 			return dst, false
