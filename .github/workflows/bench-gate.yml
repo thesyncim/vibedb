@@ -6,6 +6,9 @@ permissions:
 concurrency:
   group: bench-gate-${{ github.event.pull_request.number }}
   cancel-in-progress: true
+env:
+  GOEXPERIMENT: simd
+
 jobs:
   competitive-evidence:
     name: competitive lifecycle evidence

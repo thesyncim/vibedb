@@ -13,6 +13,9 @@ concurrency:
   group: durable-rf3-multirelation-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+env:
+  GOEXPERIMENT: simd
+
 jobs:
   qualify:
     name: Ubuntu multi-relation RF3 chaos (count=3)

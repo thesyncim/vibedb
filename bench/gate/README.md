@@ -8,6 +8,10 @@ The gate compares allocation measurements from the current checkout with a Git
 base built in a temporary detached worktree on the same machine. It keeps no
 checked-in baseline and never gates elapsed time.
 
+The gate's baseline and candidate subprocesses default to
+`GOEXPERIMENT=simd`. Set `GOEXPERIMENT=nosimd` for a portable comparison;
+the selected experiment is printed before measurements.
+
 ## Run it
 
 From the repository root, compare with the local merge base of `HEAD` and

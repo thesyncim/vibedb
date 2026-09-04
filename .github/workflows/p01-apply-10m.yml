@@ -12,6 +12,9 @@ concurrency:
   group: p01-apply-10m-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  GOEXPERIMENT: simd
+
 jobs:
   qualify:
     name: 10M-row point apply

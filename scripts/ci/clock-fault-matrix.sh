@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+export GOEXPERIMENT=${GOEXPERIMENT:-simd}
+
 evidence_dir="${VIBEDB_CLOCK_FAULT_EVIDENCE:?set VIBEDB_CLOCK_FAULT_EVIDENCE to an absolute directory}"
 case "${evidence_dir}" in
   /*) ;;

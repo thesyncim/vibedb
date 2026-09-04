@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+export GOEXPERIMENT=${GOEXPERIMENT:-simd}
+
 # Keep mmap-heavy package binaries serial within a runner. Parallelism is
 # provided by isolated Actions runners, not competing arenas on one machine.
 shard=${1:?usage: test-shard.sh durable|durable-pressure|sql|process|core [--list]}

@@ -17,11 +17,35 @@
 The repository targets the Go version in `go.mod`. Use focused tests while
 iterating, then run the root and nested-module checks that match the change.
 
+## Default build, test, and benchmark commands
+
+Repository commands default to `GOEXPERIMENT=simd` on Go 1.27:
+
+```sh
+make build
+make test
+make bench
+make info
+```
+
+`make bench` selects a small set of public-operation benchmarks for fast
+feedback. Narrow tests with `PACKAGES` and `TEST_FLAGS`; choose benchmark
+packages and rows with `BENCH_PACKAGES` and `BENCH`. `BENCHTIME` defaults to
+250 ms and `COUNT` to one; use `COUNT=10` for repeated measurements. Override
+`GO` to select a specific compiler. Run benchmarks alone after correctness
+checks; building or testing concurrently invalidates timing comparisons.
+
+Portable checks are explicit: `make test GOEXPERIMENT=nosimd` or
+`make bench GOEXPERIMENT=nosimd`. CI and standalone test/benchmark scripts use
+SIMD by default and retain named portable parity checks. For raw Go commands
+and nested modules, set `GOEXPERIMENT=simd` in the command or shell environment;
+`go.mod` cannot enable compiler experiments.
+
 ## Fast feedback
 
 ```bash
-go test ./path/to/package -run '^TestName$' -count=1
-go test -race ./path/to/package -run '^TestConcurrentName$' -count=1
+make test PACKAGES=./path/to/package TEST_FLAGS='-run ^TestName$ -count=1'
+make test PACKAGES=./path/to/package TEST_FLAGS='-race -run ^TestConcurrentName$ -count=1'
 ```
 
 Use fault injection and reopen oracles for persistence work. Use real process
@@ -31,9 +55,10 @@ boundary. A benchmark is never a correctness test.
 ## Root checks
 
 ```bash
-go build ./...
-go vet ./...
-go test -p=1 -timeout=25m ./...
+make build
+make vet
+make test TEST_FLAGS='-p=1 -timeout=25m'
+make test GOEXPERIMENT=nosimd PACKAGES='./distribution ./internal/rangesplit ./sql/driver'
 git diff --check
 ```
 
@@ -44,10 +69,10 @@ silently attribute an old failure to your change or hide a new one as
 ## Nested modules
 
 ```bash
-(cd bench/competitive && go test ./...)
-(cd integration/pgclient && go test -timeout=2m ./...)
-(cd integration/pgcompat && go test ./...)
-(cd x/vitessroute && go test ./...)
+(cd bench/competitive && GOEXPERIMENT=simd go test ./...)
+(cd integration/pgclient && GOEXPERIMENT=simd go test -timeout=2m ./...)
+(cd integration/pgcompat && GOEXPERIMENT=simd go test ./...)
+(cd x/vitessroute && GOEXPERIMENT=simd go test ./...)
 ```
 
 Java/JDBC, stock `psql`, Linux fault, Docker, and Kind lanes are opt-in or
@@ -91,7 +116,7 @@ go generate ./internal/featurestate
 go generate ./internal/conformance
 (cd bench/competitive && go generate .)
 go test ./internal/buildgate ./internal/featurestate ./internal/conformance
-(cd bench/competitive && go test ./internal/coverage)
+(cd bench/competitive && GOEXPERIMENT=simd go test ./internal/coverage)
 ```
 
 Refresh the unsafe inventory when a production import changes:

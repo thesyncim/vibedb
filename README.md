@@ -79,10 +79,20 @@ only after its recovery record is power-safe. A collection may use a primary
 file and a recovery-journal sidecar; copy or back up the complete closed
 database directory, never an arbitrary live file.
 
-For Go 1.27 applications, build with `GOEXPERIMENT=simd` to enable VibeJSON
-SIMD kernels on arm64 and supported amd64 CPUs. This flag must be set when
-building the application; a dependency cannot enable it through `go.mod`.
-The local-cluster instructions and Kubernetes image enable it explicitly.
+Repository builds, tests, and focused benchmarks default to SIMD:
+
+```sh
+make build
+make test
+make bench
+```
+
+Use `make test GOEXPERIMENT=nosimd` for the portable parity check. CI,
+standalone test/benchmark scripts, and deployment builds select SIMD by
+default too. For an embedding application or a raw Go command, pass
+`GOEXPERIMENT=simd`; a dependency cannot enable this compiler experiment
+through `go.mod`. Go 1.27 SIMD kernels support arm64 and supported amd64 CPUs,
+with runtime CPU fallback on amd64.
 
 ## What is implemented
 
