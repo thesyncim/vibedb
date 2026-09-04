@@ -61,20 +61,15 @@ if [[ "$shard" != core ]]; then
   exec go test "${test_args[@]}" "${selected[@]}"
 fi
 
-# Keep the repository-wide analyzer coverage, but do not put it serially in
-# front of core tests. Both commands report their own failure after the other
-# has completed so neither gate masks the other.
-work=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/vibedb-unit-core.XXXXXX")
-trap 'rm -rf "$work"' EXIT
-go vet ./... >"$work/vet.log" 2>&1 &
-vet_pid=$!
+# Keep the repository-wide analyzer coverage. Run it after the core tests so
+# vet reuses their compiled objects instead of competing to compile the same
+# dependency graph on a four-core runner.
 set +e
 go test "${test_args[@]}" "${selected[@]}"
 test_status=$?
-wait "$vet_pid"
+go vet ./...
 vet_status=$?
 set -e
-cat "$work/vet.log"
 if (( test_status != 0 )); then
   exit "$test_status"
 fi

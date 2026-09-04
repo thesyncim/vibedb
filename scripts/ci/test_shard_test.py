@@ -96,13 +96,14 @@ sys.exit(99)
         self.assertEqual(args, ["test", "-json", "-p=2", "-timeout=25m",
                                 PREFIX + "/cmd/vibedb-gateway", PREFIX + "/cmd/vibedb-shard"])
 
-    def test_core_runs_full_vet_and_tests_concurrently(self):
+    def test_core_runs_tests_then_full_vet(self):
         result = self.run_shard("core")
         self.assertEqual(result.returncode, 0, result.stderr)
         commands = [json.loads(line) for line in result.stdout.splitlines()
                     if line.startswith("[")]
-        self.assertIn(["vet", "./..."], commands)
-        core_test = next(command for command in commands if command[0] == "test")
+        self.assertEqual(commands[-1], ["vet", "./..."])
+        core_test = commands[0]
+        self.assertEqual(core_test[0], "test")
         self.assertEqual(core_test[1:4], ["-json", "-p=4", "-timeout=25m"])
 
         self.env["VET_STATUS"] = "8"
