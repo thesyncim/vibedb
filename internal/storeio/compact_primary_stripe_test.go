@@ -1564,7 +1564,7 @@ func TestCompactPrimaryScanDictionaryReservoirAllWidths(t *testing.T) {
 				if fragmentSupported {
 					fragmentDecoder.streamView[0] = stream
 					fragmentDecoder.streamPlan[0] = compactPrimaryScanStream{
-						dictionaryCount: uint16(stream.dictCount),
+						dictionary: uint32(uint16(1)<<stream.width) << 16,
 					}
 					copy(fragmentDecoder.dictionary[:], bounds)
 					copy(fragmentDecoder.fragments[:], stream.dictData)
@@ -1774,7 +1774,7 @@ func TestCompactPrimaryScanDictionaryReservoirReprepareSameSlot(t *testing.T) {
 	var decoder CompactPrimaryScanDecoder
 	decoder.prepare(&dictionary, 7)
 	plan := decoder.streamPlan[0]
-	if !decoder.supported || plan.dictionaryCount == 0 {
+	if !decoder.supported || plan.dictionary == 0 {
 		t.Fatal("initial dictionary stream was not planned")
 	}
 	for row := 0; row < 2; row++ {
@@ -1798,7 +1798,7 @@ func TestCompactPrimaryScanDictionaryReservoirReprepareSameSlot(t *testing.T) {
 
 	decoder.prepare(&dictionaryAgain, 7)
 	plan = decoder.streamPlan[0]
-	if !decoder.supported || plan.dictionaryCount == 0 ||
+	if !decoder.supported || plan.dictionary == 0 ||
 		decoder.streams[0] != (compactStreamSequentialState{}) {
 		t.Fatalf("dictionary reprepare plan=%+v state=%+v", plan, decoder.streams[0])
 	}
