@@ -1,0 +1,5 @@
+GOCACHE=/private/tmp/vibedb-go-cache go test ./query ./pgwire ./gateway -count=1
+
+ok  github.com/thesyncim/vibedb/query    224.429s
+ok  github.com/thesyncim/vibedb/pgwire   171.910s
+ok  github.com/thesyncim/vibedb/gateway  140.887s
