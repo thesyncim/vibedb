@@ -192,6 +192,105 @@ func TestReplicatedDataReaderLinearizableRefreshesNotLeader(t *testing.T) {
 	}
 }
 
+type sameGroupBatchReadClient struct {
+	states   map[string]shardservice.ReplicatedMemberState
+	response []byte
+	wantMax  uint32
+	reads    int
+}
+
+func (client *sameGroupBatchReadClient) DoReplicated(
+	_ context.Context,
+	endpoint ReplicatedEndpoint,
+	request *shardservice.ReplicatedRequest,
+) (*shardservice.ReplicatedResponse, error) {
+	state := client.states[endpoint.Address]
+	if request.Operation == shardservice.ReplicatedProbe {
+		return &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedHandshake,
+			HasState: true, State: state}, nil
+	}
+	client.reads++
+	batch, err := replicatedstate.OpenPointReadBatch(request.BatchRead)
+	if err != nil || request.Operation != shardservice.ReplicatedReadBatchLeader ||
+		request.Capability != serviceauthz.CapabilityDataRead ||
+		request.MinimumApplied != 1 || request.MaxValueBytes != client.wantMax {
+		return nil, ErrReplicatedRoute
+	}
+	_ = batch
+	return &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedReadBatchResult,
+		HasState: true, State: state, ReadApplied: state.Applied,
+		Value: client.response}, nil
+}
+
+// BenchmarkReplicatedDataReaderBatchSameGroupEightPoints measures one
+// same-group eight-point batch end to end: per-point resolution against the
+// pinned catalog, grouping, one RPC, and the ordered merge.
+func BenchmarkReplicatedDataReaderBatchSameGroupEightPoints(b *testing.B) {
+	config, endpoints, descriptor, profile := testReplicatedTableInput(b)
+	snapshot, err := NewSnapshotWithReplicatedTableMetadata(
+		config, endpoints, 5, nil, nil, []ReplicatedShardDescriptor{descriptor},
+		[]ReplicatedTableProfile{profile},
+	)
+	if err != nil {
+		b.Fatal(err)
+	}
+	const pointCount = 8
+	packed := binary.LittleEndian.AppendUint32(nil, pointCount)
+	packed = append(packed, 0xFF)
+	points := make([]ReplicatedTableBatchPoint, 0, pointCount)
+	values := make([]byte, 0, pointCount*2)
+	for index := range pointCount {
+		key, ok := orderedkey.AppendString(nil, []byte{'k', byte('0' + index)}, orderedkey.Ascending)
+		if !ok {
+			b.Fatal("key")
+		}
+		value := []byte{'v', byte('0' + index)}
+		packed = binary.LittleEndian.AppendUint32(packed, uint32(len(value)))
+		values = append(values, value...)
+		points = append(points, ReplicatedTableBatchPoint{Table: []byte("messages"), Key: key})
+	}
+	packed = append(packed, values...)
+	var replicas [ServingReplicaCount]ReplicatedEndpoint
+	var scratch [replication.MaxMutationKeyBytes + 16]byte
+	resolved, ok := snapshot.ResolveReplicatedTableKey(
+		[]byte("messages"), points[0].Key, scratch[:0], replicas[:0],
+	)
+	if !ok {
+		b.Fatal("resolve")
+	}
+	client := &sameGroupBatchReadClient{wantMax: 1 << 20, response: packed}
+	client.states = make(map[string]shardservice.ReplicatedMemberState)
+	for _, endpoint := range resolved.Route.Replicas {
+		client.states[endpoint.Address] = shardservice.ReplicatedMemberState{
+			Fence: shardservice.ReplicatedFence{Group: resolved.Route.Group,
+				AllocationGeneration: resolved.Route.AllocationGeneration,
+				Command:              resolved.Route.Command, MemberID: endpoint.Member,
+				StoreID: endpoint.StoreID, NodeIncarnation: endpoint.NodeIncarnation, Term: 7},
+			LeaderID: 2, Commit: 12, Applied: 12, CheckpointApplied: 11,
+		}
+	}
+	executor, err := NewReplicatedExecutor(client, 3, time.Second)
+	if err != nil {
+		b.Fatal(err)
+	}
+	reader, err := NewReplicatedDataReader(NewCatalogHolder(snapshot), executor)
+	if err != nil {
+		b.Fatal(err)
+	}
+	request := ReplicatedTableBatchReadRequest{MaxResultBytes: 1 << 20, Points: points}
+	b.ReportAllocs()
+	for b.Loop() {
+		result, err := reader.ReadBatch(context.Background(), request)
+		if err != nil || result.Count() != pointCount {
+			b.Fatalf("count=%d err=%v", result.Count(), err)
+		}
+		result.Release()
+	}
+	if client.reads != b.N {
+		b.Fatalf("reads=%d for %d batches, want one RPC per batch", client.reads, b.N)
+	}
+}
+
 func TestReplicatedDataReaderBatchUsesOneReadForTwoTables(t *testing.T) {
 	config, endpoints, descriptor, profile := testReplicatedTableInput(t)
 	config.Placements = append(config.Placements, config.Placements[0])

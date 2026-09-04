@@ -376,12 +376,24 @@ func (reader *ReplicatedDataReader) readBatchPinned(
 		pressurePoints = make([]distribution.KeyspacePoint, len(request.Points))
 	}
 	points := make([]ReplicatedBatchPointRead, len(request.Points))
+	// Only the first point's route leaves this loop (it addresses the RPC);
+	// later points keep nothing but their RouteID digest, captured before the
+	// next iteration overwrites the workspace. They therefore share one
+	// scratch pair instead of escaping a replica table and decode slab per
+	// point. The shared pair is never retained: resolved routes alias it, and
+	// only index zero's route is kept.
+	var firstReplicas [ServingReplicaCount]ReplicatedEndpoint
+	var firstScalar [replication.MaxMutationKeyBytes + 16]byte
+	var routeReplicas [ServingReplicaCount]ReplicatedEndpoint
+	var routeScalar [replication.MaxMutationKeyBytes + 16]byte
 	for index := range request.Points {
-		var replicas [ServingReplicaCount]ReplicatedEndpoint
-		var scalarScratch [replication.MaxMutationKeyBytes + 16]byte
+		replicaScratch, scalarScratch := routeReplicas[:0], routeScalar[:0]
+		if index == 0 {
+			replicaScratch, scalarScratch = firstReplicas[:0], firstScalar[:0]
+		}
 		resolved, ok := lease.snapshot.ResolveReplicatedTableKey(
 			request.Points[index].Table, request.Points[index].Key,
-			scalarScratch[:0], replicas[:0],
+			scalarScratch, replicaScratch,
 		)
 		if !ok {
 			return ReplicatedTableBatchReadResult{}, lease.generation, ErrReplicatedTableRoute
