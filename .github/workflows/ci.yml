@@ -182,7 +182,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: [ubuntu-latest, ubuntu-24.04-arm]
-        shard: [durable, durable-pressure, process, core]
+        shard: [durable, durable-churn, durable-large-cache, process, core]
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6

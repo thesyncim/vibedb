@@ -51,20 +51,25 @@ sys.exit(99)
 
     def test_pressure_filters_are_complementary(self):
         regular = json.loads(self.run_shard("durable").stdout.splitlines()[-1])
-        pressure = json.loads(self.run_shard("durable-pressure").stdout.splitlines()[-1])
+        churn = json.loads(self.run_shard("durable-churn").stdout.splitlines()[-1])
+        large = json.loads(self.run_shard("durable-large-cache").stdout.splitlines()[-1])
         self.assertEqual(regular[-1], PREFIX + "/store/durable")
-        self.assertEqual(pressure[-1], regular[-1])
+        self.assertEqual(churn[-1], regular[-1])
+        self.assertEqual(large[-1], regular[-1])
         skip = regular[regular.index("-skip") + 1]
-        run = pressure[pressure.index("-run") + 1]
-        self.assertEqual(skip, run)
+        runs = [churn[churn.index("-run") + 1], large[large.index("-run") + 1]]
+        self.assertEqual(
+            runs,
+            ["^TestFilePrimaryChurnQualification$",
+             "^TestFilePrimaryLargerThanCacheQualification$"],
+        )
         for test in ("TestFilePrimaryChurnQualification",
                      "TestFilePrimaryLargerThanCacheQualification",
                      "TestNewDurableBehavior", "ExampleStore", "FuzzRecovery",
                      "TestFilePrimaryChurnQualificationExtra"):
-            pressure_selected = re.search(run, test) is not None
-            regular_selected = re.search(skip, test) is None
-            self.assertNotEqual(pressure_selected, regular_selected)
-        self.assertIsNone(re.search(run, "TestFilePrimaryChurnQualificationExtra"))
+            selected = [re.search(skip, test) is None]
+            selected.extend(re.search(run, test) is not None for run in runs)
+            self.assertEqual(sum(selected), 1, (test, selected))
 
     def test_invalid_arguments_fail(self):
         for args in ((), ("typo",), ("core", "typo"), ("core", "--list", "extra")):
