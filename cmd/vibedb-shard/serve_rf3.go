@@ -1214,7 +1214,7 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 			select {
 			case embeddedGatewayState = <-embeddedGatewayOpened:
 			case <-diagnostics:
-				emitRF3DiagnosticSnapshotWithResources(manifest, profile, nodeOwner, server, nil, &diagnosticSerial, adoptedInventory, preparedSet.groups, schemaActivator)
+				emitRF3DiagnosticSnapshotWithResources(manifest, profile, nodeOwner, server, nil, &diagnosticSerial, adoptedInventory, preparedSet.groups, schemaActivator, progressMetrics)
 			case err := <-embeddedGatewayDone:
 				embeddedGatewayFinished = true
 				primary = fmt.Errorf("RF3 embedded gateway stopped during startup: %w", err)
@@ -1254,7 +1254,7 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 		for {
 			select {
 			case <-diagnostics:
-				emitRF3DiagnosticSnapshotWithResources(manifest, profile, nodeOwner, server, embeddedGatewayState, &diagnosticSerial, adoptedInventory, preparedSet.groups, schemaActivator)
+				emitRF3DiagnosticSnapshotWithResources(manifest, profile, nodeOwner, server, embeddedGatewayState, &diagnosticSerial, adoptedInventory, preparedSet.groups, schemaActivator, progressMetrics)
 				continue
 			case <-manifest.reloadSignals:
 				if err := reloadPreparedRF3Groups(parent, &manifest, profile, peer, adoptedInventory, schemaActivator, nodeOwner); err != nil {

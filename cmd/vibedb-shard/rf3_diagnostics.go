@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/shardservice"
@@ -36,6 +37,15 @@ type rf3DiagnosticSnapshot struct {
 	ReadyWaveHistogram     []uint64 `json:"ready_wave_group_histogram"`
 	ReadyQueueDepth        uint64   `json:"ready_queue_depth"`
 	ReadyQueueCapacity     uint64   `json:"ready_queue_capacity"`
+	ReadySubmissions       uint64   `json:"ready_submissions"`
+	ReadyQueueWaitNs       uint64   `json:"ready_queue_wait_ns"`
+	ReadyWavesAttempted    uint64   `json:"ready_waves_attempted"`
+	ReadyPersistAttempts   uint64   `json:"ready_persist_attempts"`
+	ReadyPersistSuccesses  uint64   `json:"ready_persist_successes"`
+	ReadyPersistFailures   uint64   `json:"ready_persist_failures"`
+	ReadyWavesFailed       uint64   `json:"ready_waves_failed"`
+	ReadyPersistDurationNs uint64   `json:"ready_persist_duration_ns"`
+	ReadyWaveDurationNs    uint64   `json:"ready_wave_duration_ns"`
 	ActiveSubmitters       int64    `json:"active_submitters"`
 	FailedWaves            uint64   `json:"failed_waves"`
 	CheckpointQueue        uint64   `json:"checkpoint_queue_submissions"`
@@ -67,6 +77,15 @@ type rf3DiagnosticSnapshot struct {
 	RemoteConnections       int    `json:"remote_connections"`
 	RemoteIdle              int    `json:"remote_idle"`
 	RemoteWaiters           int    `json:"remote_waiters"`
+
+	RaftProposalBatches    uint64 `json:"raft_proposal_batches"`
+	RaftProposalCommands   uint64 `json:"raft_proposal_commands"`
+	RaftProposalBytes      uint64 `json:"raft_proposal_bytes"`
+	RaftApplyBatches       uint64 `json:"raft_apply_batches"`
+	RaftAppliedEntries     uint64 `json:"raft_applied_entries"`
+	RaftCommitAdvancements uint64 `json:"raft_commit_advancements"`
+	RaftCommittedEntries   uint64 `json:"raft_committed_entries"`
+	RaftReadyPersisted     uint64 `json:"raft_ready_persisted"`
 
 	// Resource counters sum the currently open collection generations. Schema
 	// replacement or group retirement can reset them within one process, so
@@ -314,6 +333,48 @@ func collectRF3DiagnosticResources(
 	return aggregateRF3DiagnosticResources(expected, providers, inventory != nil && !inventorySnapshot.usable)
 }
 
+func applyRF3DiagnosticProgress(snapshot *rf3DiagnosticSnapshot, metrics raftservice.ProgressMetricsSnapshot) {
+	if snapshot == nil {
+		return
+	}
+	snapshot.RaftProposalBatches = metrics.ProposalBatches
+	snapshot.RaftProposalCommands = metrics.ProposalCommands
+	snapshot.RaftProposalBytes = metrics.ProposalBytes
+	snapshot.RaftApplyBatches = metrics.ApplyBatches
+	snapshot.RaftAppliedEntries = metrics.AppliedEntries
+	snapshot.RaftCommitAdvancements = metrics.CommitAdvancements
+	snapshot.RaftCommittedEntries = metrics.CommittedEntries
+	snapshot.RaftReadyPersisted = metrics.ReadyPersisted
+}
+
+func applyRF3DiagnosticSequencer(snapshot *rf3DiagnosticSnapshot, stats raftstore.NodeSubmissionSequencerStats) {
+	if snapshot == nil {
+		return
+	}
+	snapshot.ReadyWaves = stats.ReadyWavesSucceeded
+	snapshot.ReadyDurableWaves = stats.ReadyDurableWaves
+	snapshot.ObservedAppendBarriers = stats.ObservedAppendBarriers
+	snapshot.MultiGroupWaves = stats.MultiGroupWaves
+	copy(snapshot.ReadyWaveHistogram, stats.ReadyWaveGroupHistogram[:])
+	snapshot.ReadyQueueDepth = stats.QueueDepth
+	snapshot.ReadyQueueCapacity = stats.QueueCapacity
+	snapshot.ReadySubmissions = stats.ReadySubmissions
+	snapshot.ReadyQueueWaitNs = stats.ReadyQueueWaitNanos
+	snapshot.ReadyWavesAttempted = stats.ReadyWavesAttempted
+	snapshot.ReadyPersistAttempts = stats.ReadyPersistAttempts
+	snapshot.ReadyPersistSuccesses = stats.ReadyPersistSuccesses
+	snapshot.ReadyPersistFailures = stats.ReadyPersistFailures
+	snapshot.ReadyWavesFailed = stats.ReadyWavesFailed
+	snapshot.ReadyPersistDurationNs = stats.ReadyPersistDurationNanos
+	snapshot.ReadyWaveDurationNs = stats.ReadyWaveDurationNanos
+	snapshot.ActiveSubmitters = stats.ActiveSubmitters
+	snapshot.FailedWaves = stats.FailedWaves
+	snapshot.CheckpointQueue = stats.CheckpointQueueSubmissions
+	snapshot.CheckpointRejected = stats.CheckpointQueueRejected
+	snapshot.CheckpointQueueWaitNs = stats.CheckpointQueueWaitNanos
+	snapshot.CheckpointServiceNs = stats.CheckpointServiceNanos
+}
+
 // emitRF3DiagnosticSnapshot writes one machine-readable line with a stable
 // prefix and atomically replaces the bounded node-root latest snapshot.
 // Benchmark harnesses can send SIGUSR1 at trial boundaries and parse the
@@ -329,7 +390,7 @@ func emitRF3DiagnosticSnapshot(
 	serial *atomic.Uint64,
 	inventory *rf3AdoptedGroupInventory,
 ) {
-	emitRF3DiagnosticSnapshotWithResources(manifest, profile, nodeOwner, server, embedded, serial, inventory, nil, nil)
+	emitRF3DiagnosticSnapshotWithResources(manifest, profile, nodeOwner, server, embedded, serial, inventory, nil, nil, nil)
 }
 
 func emitRF3DiagnosticSnapshotWithResources(
@@ -342,6 +403,7 @@ func emitRF3DiagnosticSnapshotWithResources(
 	inventory *rf3AdoptedGroupInventory,
 	prepared []preparedRF3Group,
 	schemas *rf3SchemaActivator,
+	progressMetrics *raftservice.ProgressMetrics,
 ) {
 	snapshot := rf3DiagnosticSnapshot{
 		UTC: time.Now().UTC().Format(time.RFC3339Nano), Event: "snapshot", PID: os.Getpid(),
@@ -382,20 +444,10 @@ func emitRF3DiagnosticSnapshotWithResources(
 		snapshot.NodeID = fmt.Sprintf("%x", node[:])
 	}
 	if nodeOwner != nil && nodeOwner.sequencer != nil {
-		stats := nodeOwner.sequencer.Stats()
-		snapshot.ReadyWaves = stats.ReadyWavesSucceeded
-		snapshot.ReadyDurableWaves = stats.ReadyDurableWaves
-		snapshot.ObservedAppendBarriers = stats.ObservedAppendBarriers
-		snapshot.MultiGroupWaves = stats.MultiGroupWaves
-		copy(snapshot.ReadyWaveHistogram, stats.ReadyWaveGroupHistogram[:])
-		snapshot.ReadyQueueDepth = stats.QueueDepth
-		snapshot.ReadyQueueCapacity = stats.QueueCapacity
-		snapshot.ActiveSubmitters = stats.ActiveSubmitters
-		snapshot.FailedWaves = stats.FailedWaves
-		snapshot.CheckpointQueue = stats.CheckpointQueueSubmissions
-		snapshot.CheckpointRejected = stats.CheckpointQueueRejected
-		snapshot.CheckpointQueueWaitNs = stats.CheckpointQueueWaitNanos
-		snapshot.CheckpointServiceNs = stats.CheckpointServiceNanos
+		applyRF3DiagnosticSequencer(&snapshot, nodeOwner.sequencer.Stats())
+	}
+	if progressMetrics != nil {
+		applyRF3DiagnosticProgress(&snapshot, progressMetrics.Snapshot())
 	}
 	if server != nil {
 		stats := server.Stats()

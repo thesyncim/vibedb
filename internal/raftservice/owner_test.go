@@ -502,10 +502,7 @@ func TestTransactionRecoveryOwnerRequiresExactDedicatedCapability(t *testing.T) 
 		ID:   distributedtxn.ID{1}, MinimumApplied: 1, MaxRows: 1,
 		MaxBytes: replicatedstate.TransactionRecoverySummaryBytes,
 	}}
-	owner := &Owner{
-		proposalCohort:       make(map[raftmember.GroupKey]int),
-		pendingProposalGroup: make(map[raftmember.GroupKey]int),
-	}
+	owner := &Owner{}
 	for _, capability := range []serviceauthz.Capability{
 		serviceauthz.CapabilityDataRead,
 		serviceauthz.CapabilityDataWrite,
@@ -776,7 +773,154 @@ func TestOwnerPendingProposalBudgetIsIndependentAndReclaimable(t *testing.T) {
 	}
 }
 
-func TestProposalIngressCollectorBuildsFixedBoundedPipelineWindows(t *testing.T) {
+type proposalPrefixOwnerHost struct {
+	ownerHost
+	firstRunEntered chan struct{}
+	releaseFirstRun chan struct{}
+	queuedAtRun     chan int
+	runs            int
+	queued          int
+	status          raftmember.RuntimeStatus
+}
+
+func (host *proposalPrefixOwnerHost) EnqueueTrackedProposal(
+	raftmember.GroupKey, []byte, multiraft.ProposalToken,
+) error {
+	host.queued++
+	return nil
+}
+
+func (host *proposalPrefixOwnerHost) RunOne() (multiraft.Progress, bool, error) {
+	host.runs++
+	if host.runs == 1 {
+		close(host.firstRunEntered)
+		<-host.releaseFirstRun
+	} else if host.runs == 2 {
+		host.queuedAtRun <- host.queued
+	}
+	return multiraft.Progress{}, false, nil
+}
+
+func (host *proposalPrefixOwnerHost) PopOutbound() (raftmember.OutboundMessage, bool) {
+	return raftmember.OutboundMessage{}, false
+}
+
+func (host *proposalPrefixOwnerHost) Status(raftmember.GroupKey) (raftmember.RuntimeStatus, error) {
+	return host.status, nil
+}
+
+func (host *proposalPrefixOwnerHost) Close() error { return nil }
+
+func proposalPrefixCommand(t *testing.T, group raftmember.GroupKey, sequence uint64) []byte {
+	t.Helper()
+	command := replication.Command{
+		Kind:                   replication.CommandMutationBatch,
+		ClusterID:              replication.ID128(group.ClusterID),
+		ClusterIncarnation:     replication.ID128(group.ClusterIncarnation),
+		TopologyRecoveryEpoch:  group.TopologyRecoveryEpoch,
+		Distribution:           "docs",
+		Shard:                  "0000-ffff",
+		AllocationGeneration:   1,
+		ShardIncarnation:       replication.ID128(group.ShardIncarnation),
+		GroupID:                replication.ID128(group.GroupID),
+		ReplicaSetVersion:      1,
+		ActivePolicyGeneration: 1,
+		ProtectionEpoch:        1,
+		OwnershipEpoch:         1,
+		SchemaGeneration:       1,
+		RoutingVersion:         1,
+		RouteGeneration:        1,
+		Tenant:                 []byte("tenant"),
+		ClientID:               replication.ID128{1},
+		ClientEpoch:            1,
+		ClientSequence:         sequence,
+		Fingerprint:            replication.Digest{byte(sequence)},
+		Batches: []replication.RelationMutationBatch{{
+			Relation: 1,
+			Mutations: []replication.Mutation{{
+				Kind: replication.MutationPut, Key: []byte{byte(sequence)}, Value: []byte("v"),
+			}},
+		}},
+	}
+	data, err := replication.AppendCommand(nil, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+func TestOwnerQueuesSameGroupPrefixBeforeNextHostRunOne(t *testing.T) {
+	registry, err := raftserve.NewRegistry(raftserve.Limits{
+		MaxGroups: 1, MaxOutstandingIdentities: 2,
+		MaxOutstandingAttempts: 2, MaxWaiters: 2,
+		MaxAttemptsPerIdentity:     1,
+		MaxRetainedCompletionBytes: 2 * int64(replicatedstate.MaxCompletionEnvelopeBytes),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer registry.Close()
+
+	group := peerServerTestGroup()
+	identity := raftmember.RuntimeIdentity{Group: group, AllocationGeneration: 1,
+		MemberID: 1, StoreID: [16]byte{1}, NodeIncarnation: 1,
+		RelationManifestDigest: [32]byte{1}}
+	command := CommandFence{ReplicaSetVersion: 1, ActivePolicyGeneration: 1,
+		ProtectionEpoch: 1, OwnershipEpoch: 1, SchemaGeneration: 1,
+		RelationManifestDigest: [32]byte{1}, RoutingVersion: 1, RouteGeneration: 1}
+	host := &proposalPrefixOwnerHost{
+		firstRunEntered: make(chan struct{}), releaseFirstRun: make(chan struct{}),
+		queuedAtRun: make(chan int, 1),
+		status:      raftmember.RuntimeStatus{MemberID: 1, LeaderID: 1, Term: 2},
+	}
+	owner := &Owner{
+		registry: registry, host: host, groups: []raftmember.GroupKey{group},
+		members: map[raftmember.GroupKey]ownerMember{group: {
+			identity: identity, command: command, generation: &ownerGeneration{},
+		}},
+		limits:  Limits{MaxIngressItems: 4, MaxIngressBytes: 1 << 20},
+		ingress: make(chan ownerRequest, 4), ready: make(chan struct{}), done: make(chan struct{}),
+		pendingReads: make(map[[16]byte]*readDelivery),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- owner.Run(ctx) }()
+	<-owner.ready
+	<-host.firstRunEntered
+
+	replies := [2]chan ownerReply{make(chan ownerReply, 1), make(chan ownerReply, 1)}
+	for index := range replies {
+		data := proposalPrefixCommand(t, group, uint64(index+1))
+		if err := owner.publish(ownerRequest{
+			kind: requestProposal, group: group,
+			fence: ServingFence{Group: group, AllocationGeneration: 1, Command: command,
+				MemberID: 1, StoreID: [16]byte{1}, NodeIncarnation: 1, Term: 2},
+			data: data, reply: replies[index], bytes: int64(len(data)), delivery: &proposalDelivery{},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	close(host.releaseFirstRun)
+	if queued := <-host.queuedAtRun; queued != len(replies) {
+		t.Fatalf("Host.RunOne saw %d queued proposals, want %d", queued, len(replies))
+	}
+	for _, reply := range replies {
+		result := <-reply
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		result.waiter.Cancel()
+	}
+	cancel()
+	if err := <-runDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("owner shutdown=%v", err)
+	}
+	if owner.ingressItems != 0 || owner.ingressBytes != 0 {
+		t.Fatalf("ingress accounting after shutdown=%d/%d", owner.ingressItems, owner.ingressBytes)
+	}
+}
+
+func TestProposalIngressCollectorDrainsAlreadyQueuedSameGroupPrefix(t *testing.T) {
 	group := peerServerTestGroup()
 	request := func(sequence byte) ownerRequest {
 		return ownerRequest{
@@ -784,21 +928,21 @@ func TestProposalIngressCollectorBuildsFixedBoundedPipelineWindows(t *testing.T)
 			reply: make(chan ownerReply, 1), bytes: 1,
 		}
 	}
-	owner := &Owner{
-		proposalCohort:       make(map[raftmember.GroupKey]int),
-		pendingProposalGroup: make(map[raftmember.GroupKey]int),
-	}
 	collector := newProposalIngressCollector(4)
-	collector.start(owner, request(1))
-	if !collector.active() || collector.bytes != 1 || collector.known || collector.full() {
+	collector.start(request(1))
+	if !collector.active() || collector.bytes != 1 || collector.full() {
 		t.Fatalf("initial collector=%+v", collector)
 	}
+	queue := make(chan ownerRequest, 4)
 	for sequence := byte(2); sequence <= 4; sequence++ {
-		next := request(sequence)
-		if !collector.accepts(next) {
-			t.Fatalf("collector refused same-group request %d", sequence)
-		}
-		collector.append(next)
+		queue <- request(sequence)
+	}
+	barrier, present, err := collector.drain(queue, func(ownerRequest) error {
+		t.Fatal("same-group prefix invoked independent handler")
+		return nil
+	})
+	if err != nil || present || barrier.kind != 0 || barrier.data != nil {
+		t.Fatalf("drain barrier=%+v present=%t err=%v", barrier, present, err)
 	}
 	if !collector.full() || len(collector.requests) != 4 || collector.bytes != 4 {
 		t.Fatalf("full collector=%+v", collector)
@@ -809,35 +953,62 @@ func TestProposalIngressCollectorBuildsFixedBoundedPipelineWindows(t *testing.T)
 		t.Fatal("collector accepted a cross-group proposal")
 	}
 	collector.reset()
-
-	collector.start(owner, request(7))
-	if !collector.expire(owner) || owner.proposalCohort[group] != 1 {
-		t.Fatalf("partial window did not expire: %+v", collector)
-	}
-	collector.reset()
 }
 
 func TestProposalIngressSingletonHasNoArtificialTimer(t *testing.T) {
 	group := peerServerTestGroup()
-	owner := &Owner{pendingProposalGroup: map[raftmember.GroupKey]int{group: 1}}
 	collector := newProposalIngressCollector(16)
 	defer collector.reset()
 	request := ownerRequest{kind: requestProposal, group: group, data: []byte{1}}
-	collector.start(owner, request)
-	if collector.known || collector.timerC != nil {
-		t.Fatal("lone proposal waits for an imaginary cohort")
+	collector.start(request)
+	queue := make(chan ownerRequest)
+	barrier, present, err := collector.drain(queue, func(ownerRequest) error { return nil })
+	if err != nil || present || barrier.kind != 0 || barrier.data != nil || len(collector.requests) != 1 {
+		t.Fatalf("singleton drain barrier=%+v present=%t err=%v collector=%+v",
+			barrier, present, err, collector)
 	}
-	collector.observe(owner)
-	collector.reset()
-	owner.pendingProposalGroup[group] = 8
-	collector.start(owner, request)
-	if !collector.known || collector.target != 8 || collector.timerC == nil {
-		t.Fatal("lost concurrent durability batching")
+}
+
+func TestProposalIngressCollectorPreservesIndependentLanesAndOrderingBarrier(t *testing.T) {
+	group := peerServerTestGroup()
+	proposal := func(group raftmember.GroupKey, sequence byte) ownerRequest {
+		return ownerRequest{kind: requestProposal, group: group, data: []byte{sequence}}
 	}
-	for i := 1; i < 8; i++ {
-		collector.append(request)
+	collector := newProposalIngressCollector(8)
+	collector.start(proposal(group, 1))
+	queue := make(chan ownerRequest, 4)
+	queue <- ownerRequest{kind: requestReadLinear}
+	queue <- ownerRequest{kind: requestInbound}
+	queue <- proposal(group, 2)
+	other := group
+	other.GroupID[0] ^= 0xff
+	queue <- proposal(other, 3)
+	independent := make([]requestKind, 0, 2)
+	barrier, present, err := collector.drain(queue, func(request ownerRequest) error {
+		independent = append(independent, request.kind)
+		return nil
+	})
+	if err != nil || !present || barrier.group != other ||
+		len(collector.requests) != 2 || len(independent) != 2 ||
+		independent[0] != requestReadLinear || independent[1] != requestInbound {
+		t.Fatalf("collector=%+v independent=%v barrier=%+v present=%t err=%v",
+			collector, independent, barrier, present, err)
 	}
-	if !collector.full() {
-		t.Fatal("complete cohort still waiting")
+}
+
+func TestProposalIngressCollectorSplitsAtExactByteBound(t *testing.T) {
+	group := peerServerTestGroup()
+	collector := newProposalIngressCollector(4)
+	first := ownerRequest{kind: requestProposal, group: group,
+		data: make([]byte, raftmodel.MaxProposalBatchBytes-1)}
+	collector.start(first)
+	queue := make(chan ownerRequest, 1)
+	next := ownerRequest{kind: requestProposal, group: group, data: []byte{1, 2}}
+	queue <- next
+	barrier, present, err := collector.drain(queue, func(ownerRequest) error { return nil })
+	if err != nil || !present || len(barrier.data) != len(next.data) ||
+		len(collector.requests) != 1 || collector.bytes != raftmodel.MaxProposalBatchBytes-1 {
+		t.Fatalf("collector=%+v barrier bytes=%d present=%t err=%v",
+			collector, len(barrier.data), present, err)
 	}
 }

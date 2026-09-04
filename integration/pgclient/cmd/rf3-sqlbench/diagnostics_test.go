@@ -99,7 +99,9 @@ func TestDiagnosticDeltasKeepUint64PrecisionAndRejectReset(t *testing.T) {
 	before, _ := decodeDiagnostic(diagnosticFixture(t, node, 202, 1, 1<<60))
 	after, _ := decodeDiagnostic(diagnosticFixture(t, node, 202, 2, (1<<60)+3))
 	deltas, err := diagnosticDeltas([]diagnosticRecord{before}, []diagnosticRecord{after})
-	if err != nil || len(deltas) != 1 || deltas[0].Counters["gateway_local_calls"] != 3 || deltas[0].Histogram[1] != 3 {
+	if err != nil || len(deltas) != 1 || deltas[0].Counters["gateway_local_calls"] != 3 ||
+		deltas[0].Counters["raft_proposal_bytes"] != 3 || deltas[0].Counters["ready_queue_wait_ns"] != 3 ||
+		deltas[0].Histogram[1] != 3 {
 		t.Fatalf("delta lost precision: %v %v", deltas, err)
 	}
 	reset, _ := decodeDiagnostic(diagnosticFixture(t, node, 202, 3, 1))

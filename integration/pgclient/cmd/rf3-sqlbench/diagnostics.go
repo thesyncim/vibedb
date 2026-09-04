@@ -54,11 +54,15 @@ type diagnosticControl struct {
 
 var diagnosticCounters = []string{
 	"ready_waves", "ready_durable_waves", "observed_append_barriers", "multi_group_waves", "failed_waves",
+	"ready_submissions", "ready_queue_wait_ns", "ready_waves_attempted", "ready_persist_attempts",
+	"ready_persist_successes", "ready_persist_failures", "ready_waves_failed", "ready_persist_duration_ns", "ready_wave_duration_ns",
 	"checkpoint_queue_submissions", "checkpoint_queue_rejected", "checkpoint_queue_wait_ns", "checkpoint_service_ns",
 	"native_accepted", "native_rejected", "native_failed", "native_semantic_dispatches",
 	"gateway_local_calls", "gateway_remote_calls", "gateway_semantic_sql_calls", "gateway_legacy_calls",
 	"gateway_sql_request_encodings", "gateway_sql_request_encoded_bytes", "remote_dials", "remote_reuses",
 	"remote_poisoned", "remote_rejected", "remote_handshake_failures",
+	"raft_proposal_batches", "raft_proposal_commands", "raft_proposal_bytes", "raft_apply_batches",
+	"raft_applied_entries", "raft_commit_advancements", "raft_committed_entries", "raft_ready_persisted",
 }
 
 func readBounded(path string) ([]byte, error) {
