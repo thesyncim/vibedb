@@ -58,6 +58,11 @@ const (
 	// defaultHeapMaxTxnCollections mirrors durable.TxnLimits' default
 	// MaxCollections.
 	defaultHeapMaxTxnCollections = 16
+	// defaultHeapBatchPositionHint sizes the per-batch key-position index.
+	// The batch bound (maxDocuments) is enforced independently, so the hint
+	// only trades one regrowth on large batches against a max-sized map on
+	// every small commit.
+	defaultHeapBatchPositionHint = 8
 )
 
 // WriteBatch accumulates the mutations one participant contributes to an
@@ -229,8 +234,12 @@ func UpdateCollections(participants []*Collection, fn func(*DatabaseBatch) error
 	batches := make([]*WriteBatch, len(ordered))
 	for i, collection := range ordered {
 		wb := &WriteBatch{
-			collection:   collection,
-			position:     make(map[string]int, defaultHeapMaxBatchDocuments),
+			collection: collection,
+			// Size the position index for the common small batch and let it
+			// grow: a max-sized index on every commit costs ~2KB per
+			// single-key transaction (a top allocator in commit profiles)
+			// while regrowth on genuinely large batches amortizes.
+			position:     make(map[string]int, defaultHeapBatchPositionHint),
 			active:       true,
 			maxDocuments: defaultHeapMaxBatchDocuments,
 			maxBytes:     defaultHeapMaxBatchBytes,
