@@ -70,12 +70,13 @@ func preparedDirectEligible(queries []Query, participants []ReplicatedTransactio
 	// RF3 UPDATE lowering already requires exactly one primary-key equality,
 	// with no subquery, ORDER BY, LIMIT, RETURNING or primary-key movement. Its
 	// one preimage guard therefore covers the complete row read set. Do not
-	// extend this to scans or multi-key reads: omitted keys would need guards too.
+	// extend this to scans, multi-key reads or a missing preimage: omitted keys
+	// need absence guards, and PutPresent is not an absence guard.
 	if len(queries) != 1 || len(participants) != 1 || len(participants[0].Batches) != 1 || len(participants[0].Batches[0].Mutations) != 1 {
 		return false
 	}
 	kind := participants[0].Batches[0].Mutations[0].Kind
-	if kind != replication.MutationPutDigestEqual && kind != replication.MutationPutPresent {
+	if kind != replication.MutationPutDigestEqual {
 		return false
 	}
 	statement, err := sqlast.ParseStatement(queries[0].SQL)

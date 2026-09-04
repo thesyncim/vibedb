@@ -41,7 +41,9 @@ retry returns the retained original result. A lost response cannot turn `n=n+1`
 into a second increment.
 
 The added UPDATE path requires one exact primary-key equality, one participant,
-one relation and one physical mutation. Existing lowering rejects primary-key
+one relation, one existing-row preimage and one digest-guarded physical mutation.
+A missing-row placeholder is ineligible: presence alone cannot authenticate
+the earlier absence. Existing lowering rejects primary-key
 movement, subqueries, ORDER BY, LIMIT and RETURNING. These limits matter: the
 single digest guard covers the complete read set. General scans and multi-key
 updates need additional read/absence/phantom guards and remain in the coordinated
@@ -70,7 +72,9 @@ A point read holds the state machine publication lock while checking the hidden
 transaction intent and reading the selected relation's current primary router.
 The machine exclusively owns mutations to these collections, so both reads belong
 to one completed applied state. The existing minimum applied index, ownership,
-intent and response-size checks remain. Detached scans still acquire snapshots.
+intent and response-size checks remain. Completion lookup likewise holds the publication lock while reading the live
+hidden state, preserving exact retry/result checks without checkpointing.
+Detached scans still acquire snapshots.
 
 The old point path captured all collection snapshots and could force a physical
 checkpoint after every update. Live point reads include acknowledged overlay
@@ -82,7 +86,7 @@ replicated durability publication are unchanged.
 Tests cover independent sequence domains across restart, lost replies in both
 modes, retained ACKs, refusal cleanup failure, identity/version fences, exact
 recipe publication before execution, replay without a new preimage, stale-preimage
-abort, retained terminal replay, and point reads that leave checkpoint counters
+abort, retained terminal replay, and point/completion reads that leave checkpoint counters
 unchanged after every commit. The gateway suites and focused race checks exercise
 these paths; the comparative harness verifies every row after each workload.
 

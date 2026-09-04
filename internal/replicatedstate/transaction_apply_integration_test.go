@@ -1628,5 +1628,23 @@ func TestSingleParticipantPointReadDoesNotForceCheckpoint(t *testing.T) {
 		if after := fixture.group.Stats(); after != before {
 			t.Fatalf("point read performed storage work: before=%+v after=%+v", before, after)
 		}
+		var workspace CompletionLookupWorkspace
+		if err := fixture.machine.BeginCompletionLookupBatch(&workspace, publication); err != nil {
+			t.Fatal(err)
+		}
+		var resultBytes [MaxTransactionCompletionEnvelopeBytes]byte
+		completion, err := fixture.machine.LookupCompletionIntoWorkspace(&workspace, command, resultBytes[:0])
+		if err != nil || completion.AppliedSequence != publication.Applied {
+			t.Fatalf("completion=%+v err=%v", completion, err)
+		}
+		if err := fixture.machine.EndCompletionLookupBatch(&workspace); err != nil {
+			t.Fatal(err)
+		}
+		if err := workspace.Release(); err != nil {
+			t.Fatal(err)
+		}
+		if after := fixture.group.Stats(); after != before {
+			t.Fatalf("completion lookup performed storage work: before=%+v after=%+v", before, after)
+		}
 	}
 }

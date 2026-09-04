@@ -149,7 +149,7 @@ func (m *Machine) lookupTransactionCompletionAtSnapshot(
 	if err != nil {
 		return CompletionLookup{}, m.fail(err)
 	}
-	snapshot := pointSnapshot{value: workspace.snapshot}
+	snapshot := workspace.snapshot
 	raw, found, err := snapshot.appendRaw(workspace.transactionRead[:0], storageKey[:])
 	if err != nil {
 		return CompletionLookup{}, m.fail(err)

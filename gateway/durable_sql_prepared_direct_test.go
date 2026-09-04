@@ -3,6 +3,7 @@ package gateway
 import (
 	"bytes"
 	"crypto/sha256"
+	"errors"
 	"testing"
 	"time"
 
@@ -69,5 +70,22 @@ func TestDurableSQLPreparedUpdateReplaysPersistedMutation(t *testing.T) {
 	queries[0].SQL = `UPDATE messages SET n=n+2 WHERE id=?`
 	if _, err = executor.ExecutePreparedDirect(ctx, key, tenant, queries, &recovered); err == nil || proposer.proposals != 2 {
 		t.Fatal("changed caller input accepted")
+	}
+}
+
+func TestDurableSQLPreparedUpdateRequiresExactPreimageGuard(t *testing.T) {
+	query := []Query{{SQL: `UPDATE messages SET n=n+1 WHERE id='missing'`}}
+	participants := []ReplicatedTransactionParticipant{{Batches: []replication.RelationMutationBatch{{Relation: 1, Mutations: []replication.Mutation{{Kind: replication.MutationPutPresent, Key: []byte("missing"), Value: []byte(`{}`)}}}}}}
+	if preparedDirectEligible(query, participants) {
+		t.Fatal("a missing-row placeholder is not a guarded update")
+	}
+	snapshot, planner := replicatedSQLTransactionFixture(t, true)
+	reader, data := attachReplicatedSQLIndexedReadClient(t, snapshot, nil)
+	executor := &DurableSQLRequestExecutor{planner: planner, data: data, singleFast: true}
+	tenant := []byte("prepared-missing")
+	key := requestledger.RequestKey{Scope: requestledger.ScopeAuthenticated, Principal: requestledger.PrincipalID{1}, Request: requestledger.RequestID{2}, TenantDigest: requestledger.Digest(sha256.Sum256(tenant)), IssuerEpoch: 1, IssuerLane: requestledger.IssuerLane{3}, IssuerSequence: 1}
+	plan, err := executor.PrepareDirect(t.Context(), key, tenant, query)
+	if plan != nil || !errors.Is(err, ErrDurableSQLDirectIneligible) || !errors.Is(err, ErrDurableSQLNotAdmitted) || reader.reads != 1 {
+		t.Fatalf("missing preimage plan=%+v reads=%d err=%v", plan, reader.reads, err)
 	}
 }

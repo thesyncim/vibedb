@@ -12,11 +12,11 @@ func (m *Machine) lookupRequestLedgerCompletionAtSnapshot(
 	dst []byte,
 	workspace *CompletionLookupWorkspace,
 ) (CompletionLookup, error) {
-	if workspace == nil || workspace.snapshot == nil {
+	if workspace == nil || workspace.snapshot.live == nil {
 		return CompletionLookup{}, ErrCompletionWorkspaceBusy
 	}
 	plan, err := m.planRequestLedgerCommand(
-		command, m.state, pointSnapshot{value: workspace.snapshot},
+		command, m.state, workspace.snapshot,
 	)
 	if err != nil {
 		if errors.Is(err, ErrAdmissionBound) {
