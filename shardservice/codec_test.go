@@ -13,6 +13,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/distributedagg"
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/exchange"
+	"github.com/thesyncim/vibedb/internal/replication"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	vibejson "github.com/thesyncim/vibejson"
 )
@@ -198,6 +199,7 @@ func TestRequestRoundTrip(t *testing.T) {
 				BucketBits: 20, AccessScopes: []distributedtxn.IntentScope{{Start: 31, End: 32}},
 				ReadFenceID: testTransactionID(52),
 				PrimaryKeyRead: PrimaryKeyReadRequest{
+					Relation: 1, MaxDocumentBytes: 4 << 20,
 					PrimaryPath: []byte("/id"), Keys: [][]byte{{1, 'a'}, {1, 'b'}},
 				},
 			},
@@ -441,7 +443,9 @@ func TestRequestRoundTrip(t *testing.T) {
 					}
 				}
 			}
-			if !bytes.Equal(got.PrimaryKeyRead.PrimaryPath, tc.req.PrimaryKeyRead.PrimaryPath) ||
+			if got.PrimaryKeyRead.Relation != tc.req.PrimaryKeyRead.Relation ||
+				got.PrimaryKeyRead.MaxDocumentBytes != tc.req.PrimaryKeyRead.MaxDocumentBytes ||
+				!bytes.Equal(got.PrimaryKeyRead.PrimaryPath, tc.req.PrimaryKeyRead.PrimaryPath) ||
 				len(got.PrimaryKeyRead.Keys) != len(tc.req.PrimaryKeyRead.Keys) {
 				t.Fatalf("PrimaryKeyRead = %+v, want %+v", got.PrimaryKeyRead, tc.req.PrimaryKeyRead)
 			}
@@ -458,6 +462,72 @@ func TestRequestRoundTrip(t *testing.T) {
 				t.Errorf("DocumentScan = %+v, want %+v", got.DocumentScan, tc.req.DocumentScan)
 			}
 		})
+	}
+}
+
+func TestPrimaryKeyReadWireCompatibilityAndExtendedBounds(t *testing.T) {
+	legacy := &ShardRequest{
+		SQL: `SELECT id FROM messages WHERE id = ?`,
+		PrimaryKeyRead: PrimaryKeyReadRequest{
+			PrimaryPath: []byte("/id"), Keys: [][]byte{{1, 'a'}, {1, 'b'}},
+		},
+	}
+	legacyWire := encodeRequest(t, legacy)
+	legacySuffix := []byte{primaryKeyReadMarker}
+	legacySuffix = binary.BigEndian.AppendUint32(legacySuffix, uint32(len(legacy.PrimaryKeyRead.PrimaryPath)))
+	legacySuffix = append(legacySuffix, legacy.PrimaryKeyRead.PrimaryPath...)
+	legacySuffix = binary.BigEndian.AppendUint32(legacySuffix, uint32(len(legacy.PrimaryKeyRead.Keys)))
+	for _, key := range legacy.PrimaryKeyRead.Keys {
+		legacySuffix = binary.BigEndian.AppendUint32(legacySuffix, uint32(len(key)))
+		legacySuffix = append(legacySuffix, key...)
+	}
+	if !bytes.HasSuffix(legacyWire[5:], legacySuffix) {
+		t.Fatalf("legacy primary-key grammar changed: suffix=%x want=%x", legacyWire[5:], legacySuffix)
+	}
+	if got, err := RequestFrameBytes(legacy); err != nil || got != len(legacyWire) {
+		t.Fatalf("legacy RequestFrameBytes = %d, %v; encoded length = %d", got, err, len(legacyWire))
+	}
+	decoded, err := DecodeRequest(bytes.NewReader(legacyWire))
+	if err != nil {
+		t.Fatalf("DecodeRequest legacy: %v", err)
+	}
+	if decoded.PrimaryKeyRead.Relation != 0 || decoded.PrimaryKeyRead.MaxDocumentBytes != 0 {
+		t.Fatalf("legacy bounds = relation %d max %d, want zero", decoded.PrimaryKeyRead.Relation, decoded.PrimaryKeyRead.MaxDocumentBytes)
+	}
+	if reencoded := encodeRequest(t, decoded); !bytes.Equal(reencoded, legacyWire) {
+		t.Fatalf("legacy request was not byte-for-byte stable:\n got %x\nwant %x", reencoded, legacyWire)
+	}
+
+	extended := *legacy
+	extended.PrimaryKeyRead.Relation = 1
+	extended.PrimaryKeyRead.MaxDocumentBytes = 4 << 20
+	extendedWire := encodeRequest(t, &extended)
+	// Build the fixed-width bound explicitly so this check remains independent
+	// of EncodeRequest's optional-field implementation.
+	extendedSuffix := []byte{primaryKeyReadExtendedMarker, 1}
+	extendedSuffix = binary.BigEndian.AppendUint32(extendedSuffix, 4<<20)
+	extendedSuffix = append(extendedSuffix, legacySuffix[1:]...)
+	if !bytes.HasSuffix(extendedWire[5:], extendedSuffix) {
+		t.Fatalf("extended primary-key grammar = %x, want suffix %x", extendedWire[5:], extendedSuffix)
+	}
+	if got, want := len(extendedWire), len(legacyWire)+5; got != want {
+		t.Fatalf("extended frame length = %d, want legacy length + 5 = %d", got, want)
+	}
+	if got, err := RequestFrameBytes(&extended); err != nil || got != len(extendedWire) {
+		t.Fatalf("extended RequestFrameBytes = %d, %v; encoded length = %d", got, err, len(extendedWire))
+	}
+	decoded, err = DecodeRequest(bytes.NewReader(extendedWire))
+	if err != nil {
+		t.Fatalf("DecodeRequest extended: %v", err)
+	}
+	if decoded.PrimaryKeyRead.Relation != extended.PrimaryKeyRead.Relation ||
+		decoded.PrimaryKeyRead.MaxDocumentBytes != extended.PrimaryKeyRead.MaxDocumentBytes {
+		t.Fatalf("extended bounds = relation %d max %d, want relation %d max %d",
+			decoded.PrimaryKeyRead.Relation, decoded.PrimaryKeyRead.MaxDocumentBytes,
+			extended.PrimaryKeyRead.Relation, extended.PrimaryKeyRead.MaxDocumentBytes)
+	}
+	if reencoded := encodeRequest(t, decoded); !bytes.Equal(reencoded, extendedWire) {
+		t.Fatalf("extended request was not byte-for-byte stable")
 	}
 }
 
@@ -1182,6 +1252,56 @@ func TestEncodeRejectsInvalid(t *testing.T) {
 					SQL: `SELECT id FROM messages`,
 					PrimaryKeyRead: PrimaryKeyReadRequest{
 						PrimaryPath: []byte("/id"), Keys: [][]byte{{1, 'b'}, {1, 'a'}},
+					},
+				})
+			},
+			want: errBadPrimaryKeyRead,
+		},
+		{
+			name: "candidate_keys_relation_without_document_bound",
+			enc: func() error {
+				return EncodeRequest(io.Discard, &ShardRequest{
+					SQL: `SELECT id FROM messages`,
+					PrimaryKeyRead: PrimaryKeyReadRequest{
+						Relation: 1, PrimaryPath: []byte("/id"), Keys: [][]byte{{1, 'a'}},
+					},
+				})
+			},
+			want: errBadPrimaryKeyRead,
+		},
+		{
+			name: "candidate_keys_document_bound_without_relation",
+			enc: func() error {
+				return EncodeRequest(io.Discard, &ShardRequest{
+					SQL: `SELECT id FROM messages`,
+					PrimaryKeyRead: PrimaryKeyReadRequest{
+						MaxDocumentBytes: 1, PrimaryPath: []byte("/id"), Keys: [][]byte{{1, 'a'}},
+					},
+				})
+			},
+			want: errBadPrimaryKeyRead,
+		},
+		{
+			name: "candidate_keys_relation_out_of_bounds",
+			enc: func() error {
+				return EncodeRequest(io.Discard, &ShardRequest{
+					SQL: `SELECT id FROM messages`,
+					PrimaryKeyRead: PrimaryKeyReadRequest{
+						Relation: replication.MaxRelationID + 1, MaxDocumentBytes: 1,
+						PrimaryPath: []byte("/id"), Keys: [][]byte{{1, 'a'}},
+					},
+				})
+			},
+			want: errBadPrimaryKeyRead,
+		},
+		{
+			name: "candidate_keys_document_bound_out_of_bounds",
+			enc: func() error {
+				return EncodeRequest(io.Discard, &ShardRequest{
+					SQL: `SELECT id FROM messages`,
+					PrimaryKeyRead: PrimaryKeyReadRequest{
+						Relation: 1, MaxDocumentBytes: replication.MaxMutationValueBytes + 1,
+						PrimaryPath: []byte("/id"), Keys: [][]byte{{1, 'a'}},
 					},
 				})
 			},

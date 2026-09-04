@@ -47,16 +47,24 @@ type primaryMutationGuard struct {
 }
 
 type txTable struct {
-	readCut            *replicatedstate.DataReadCut
-	readRelation       replication.RelationID
-	filterSource       query.FileFilterSource
-	name               string
-	incarnation        *table
-	snapshot           *durable.Snapshot
-	refreshSnapshot    *durable.Snapshot
-	refreshCaptured    bool
-	pending            map[string]*txMutation
-	order              []string
+	readCut         *replicatedstate.DataReadCut
+	readRelation    replication.RelationID
+	filterSource    query.FileFilterSource
+	name            string
+	incarnation     *table
+	snapshot        *durable.Snapshot
+	refreshSnapshot *durable.Snapshot
+	refreshCaptured bool
+	pending         map[string]*txMutation
+	order           []string
+	// pointBacked is the bounded replicated point-read source. It owns one
+	// detached document (or an explicit miss) and deliberately has no durable
+	// snapshot. appendRaw is the only physical lookup used by candidate-key
+	// execution, so the exact key is the complete source boundary.
+	pointBacked        bool
+	pointKey           string
+	pointDocument      []byte
+	pointFound         bool
 	primaryKey         string
 	primary            vibejson.CompiledPointer
 	schema             *store.Schema
@@ -856,6 +864,19 @@ func (t *tx) querySource(tableName string) (query.Source, error) {
 		}
 		return query.FromFileOverlay(state.snapshot, &state.overlaySource), nil
 	}
+	if state.pointBacked {
+		// A point session has no durable snapshot. Preserve its exact source for
+		// callers that use QueryInto directly; QueryCandidateKeysInto reaches the
+		// same document through appendRaw and therefore retains identical
+		// predicate, projection, aggregate, order, and limit semantics.
+		state.emptyDocs.Reset()
+		if state.pointFound {
+			if _, err := state.emptyDocs.Append(state.pointDocument); err != nil {
+				return query.Source{}, err
+			}
+		}
+		return query.FromSegment(&state.emptyDocs), nil
+	}
 
 	// A table without a durable file was empty at the selected isolation cut.
 	// Its transaction view therefore consists only of the bounded pending set.
@@ -934,6 +955,12 @@ func (s *txTable) appendRaw(dst []byte, key string) ([]byte, bool, error) {
 	if !s.Keep(byteview.Bytes(key)) {
 		return dst, false, nil
 	}
+	if s.pointBacked {
+		if !s.pointFound || key != s.pointKey {
+			return dst, false, nil
+		}
+		return append(dst, s.pointDocument...), true, nil
+	}
 	if mutation, ok := s.pending[key]; ok {
 		if mutation.remove {
 			return dst, false, nil
@@ -947,6 +974,9 @@ func (s *txTable) appendRaw(dst []byte, key string) ([]byte, bool, error) {
 }
 
 func (s *txTable) contains(key string) (bool, error) {
+	if s.pointBacked {
+		return s.pointFound && key == s.pointKey, nil
+	}
 	if mutation, ok := s.pending[key]; ok {
 		return !mutation.remove, nil
 	}

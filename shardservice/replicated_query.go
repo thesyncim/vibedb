@@ -4,12 +4,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"math"
 	"runtime/trace"
 	"sync"
 
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/query"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 )
@@ -85,10 +87,19 @@ func (server *ReplicatedServer) executeReplicatedQueryCall(
 		uint64(inner.OwnershipEpoch) != request.Fence.Command.OwnershipEpoch {
 		return refuse(ReplicatedRefusalStaleFence)
 	}
-	owner, ok := server.owner.(interface {
-		ReadLinearizableDataInto(context.Context, raftservice.LinearizableDataReadRequest, *raftservice.LinearizableDataReadCut) error
-	})
-	if !ok {
+	owner := any(server.owner)
+	if _, dataOK := owner.(replicatedSQLReadOwner); !dataOK {
+		// A canonical single-key request can use the narrow point lane without
+		// requiring the complete data-cut interface. Other requests still need
+		// their ordinary snapshot source below.
+		if !replicatedSQLPointReadEligible(inner) {
+			return refuse(ReplicatedRefusalUnavailable)
+		}
+		if _, pointOK := owner.(replicatedSQLPointReadOwner); !pointOK {
+			return refuse(ReplicatedRefusalUnavailable)
+		}
+	}
+	if owner == nil {
 		return refuse(ReplicatedRefusalUnavailable)
 	}
 	// All attempts share the caller's original execution deadline. A larger
@@ -168,7 +179,44 @@ var replicatedSQLTiers = [...]replicatedSQLBudget{
 }
 
 func (budget replicatedSQLBudget) reservationBytes() int64 {
-	return replicatedSQLResultReservationCopies*int64(budget.resultBytes) + replicatedSQLWorkingReservationBudgets*budget.workingBytes
+	bytes, ok := budget.reservationBytesChecked(0)
+	if !ok {
+		return 0
+	}
+	return bytes
+}
+
+// reservationBytesForPoint includes the full catalog-frozen point document
+// bound in the admission charge. The point cut returns a detached value before
+// the SQL session can copy it, so this charge must be secured before either
+// operation starts. Keep the ordinary query reservation unchanged: its result,
+// work, intermediate, and aggregate budgets still control SQL execution and
+// tier growth independently of this source-side bound.
+func (budget replicatedSQLBudget) reservationBytesForPoint(maxDocumentBytes uint32) (int64, bool) {
+	return budget.reservationBytesChecked(maxDocumentBytes)
+}
+
+func (budget replicatedSQLBudget) reservationBytesChecked(extra uint32) (int64, bool) {
+	if budget.resultBytes < 0 || budget.workingBytes < 0 {
+		return 0, false
+	}
+	result := int64(budget.resultBytes)
+	working := budget.workingBytes
+	if result > math.MaxInt64/replicatedSQLResultReservationCopies ||
+		working > math.MaxInt64/replicatedSQLWorkingReservationBudgets {
+		return 0, false
+	}
+	result *= replicatedSQLResultReservationCopies
+	working *= replicatedSQLWorkingReservationBudgets
+	if result > math.MaxInt64-working {
+		return 0, false
+	}
+	result += working
+	extraBytes := int64(extra)
+	if result > math.MaxInt64-extraBytes {
+		return 0, false
+	}
+	return result + extraBytes, true
 }
 func (budget replicatedSQLBudget) canGrow(err error, maximum int) bool {
 	if budget.resultBytes < maximum && errors.Is(err, query.ErrResultBudget) {
@@ -184,19 +232,61 @@ type replicatedSQLReadOwner interface {
 	ReadLinearizableDataInto(context.Context, raftservice.LinearizableDataReadRequest, *raftservice.LinearizableDataReadCut) error
 }
 
+type replicatedSQLPointReadOwner interface {
+	ReadLinearizablePointInto(context.Context, raftservice.LinearizablePointReadRequest, *raftservice.LinearizablePointReadCut) error
+}
+
+type replicatedSQLPointReadSource interface {
+	NewPointReadSession(
+		context.Context,
+		replication.RelationID,
+		[]byte,
+		bool,
+		[]byte,
+		[]byte,
+		query.ExecOptions,
+	) (*sqldriver.ReplicatedReadSession, error)
+}
+
+// replicatedSQLPointReadEligible is deliberately narrower than the wire's
+// legacy candidate-key form. The point lane may borrow one exact live row only
+// when every other part of the RF3 SQL contract is the existing read-only,
+// strong, single-relation execution. Unsupported forms continue through the
+// complete data snapshot path, preserving its validation and refusal behavior.
+func replicatedSQLPointReadEligible(req *ShardRequest) bool {
+	if req == nil || !req.PrimaryKeyRead.canonical() ||
+		!req.PrimaryKeyRead.livePointEligible() {
+		return false
+	}
+	return req.ExecutionMode == ExecutionReadOnly && req.ReadPolicy == ReadStrong &&
+		req.Transaction.Operation == 0 && req.Exchange.Operation == 0 &&
+		!req.Repartition.present() && !req.DocumentScan.present() &&
+		!req.GlobalIndexLookup.present() && !req.mutationCapturePresent() &&
+		!req.HasMinPosition && req.ReadFenceID.IsZero() && !req.RowBatch.present()
+}
+
 func (server *ReplicatedServer) executeReplicatedQueryTier(ctx context.Context, request *ReplicatedRequest, state raftservice.ServingState,
-	inner *ShardRequest, owner replicatedSQLReadOwner, budget replicatedSQLBudget, maximum int) (*ReplicatedResponse, bool) {
+	inner *ShardRequest, owner any, budget replicatedSQLBudget, maximum int) (*ReplicatedResponse, bool) {
 	return server.executeReplicatedQueryTierCall(ctx, request, state, inner, owner, budget, maximum, nil)
 }
 
 func (server *ReplicatedServer) executeReplicatedQueryTierCall(ctx context.Context, request *ReplicatedRequest, state raftservice.ServingState,
-	inner *ShardRequest, owner replicatedSQLReadOwner, budget replicatedSQLBudget, maximum int,
+	inner *ShardRequest, owner any, budget replicatedSQLBudget, maximum int,
 	authorize raftservice.ProposalAuthorization) (*ReplicatedResponse, bool) {
 	wireState := replicatedWireState(state)
 	refuse := func(code ReplicatedRefusalCode) (*ReplicatedResponse, bool) {
 		return &ReplicatedResponse{Kind: ReplicatedRefusal, Refusal: code, HasState: true, State: wireState}, false
 	}
-	charge := budget.reservationBytes()
+	charge, chargeOK := budget.reservationBytesChecked(0)
+	pointRead := replicatedSQLPointReadEligible(inner)
+	if pointRead {
+		if _, pointOwner := owner.(replicatedSQLPointReadOwner); pointOwner {
+			charge, chargeOK = budget.reservationBytesForPoint(inner.PrimaryKeyRead.MaxDocumentBytes)
+		}
+	}
+	if !chargeOK {
+		return refuse(ReplicatedRefusalAdmissionBound)
+	}
 	admission := trace.StartRegion(ctx, "sql.read.admission")
 	admitted := server.frames.reserveSQL(ctx, charge)
 	admission.End()
@@ -210,9 +300,21 @@ func (server *ReplicatedServer) executeReplicatedQueryTierCall(ctx context.Conte
 			lease.Release()
 		}
 	}()
+	if pointRead {
+		if pointOwner, ok := owner.(replicatedSQLPointReadOwner); ok {
+			return server.executeReplicatedPointQueryTierCall(
+				ctx, request, state, inner, pointOwner, budget, maximum,
+				authorize, lease, &retained,
+			)
+		}
+	}
+	dataOwner, ok := owner.(replicatedSQLReadOwner)
+	if !ok {
+		return refuse(ReplicatedRefusalUnavailable)
+	}
 	var cut raftservice.LinearizableDataReadCut
 	quorum := trace.StartRegion(ctx, "sql.read.quorum")
-	err := owner.ReadLinearizableDataInto(ctx, raftservice.LinearizableDataReadRequest{Fence: state.Fence(), Capability: request.Capability, Authorize: authorize}, &cut)
+	err := dataOwner.ReadLinearizableDataInto(ctx, raftservice.LinearizableDataReadRequest{Fence: state.Fence(), Capability: request.Capability, Authorize: authorize}, &cut)
 	quorum.End()
 	if err != nil {
 		switch {
@@ -263,6 +365,102 @@ func (server *ReplicatedServer) executeReplicatedQueryTierCall(ctx context.Conte
 		return refuse(ReplicatedRefusalUnavailable)
 	}
 	retained = true
+	return response, false
+}
+
+func (server *ReplicatedServer) executeReplicatedPointQueryTierCall(
+	ctx context.Context,
+	request *ReplicatedRequest,
+	state raftservice.ServingState,
+	inner *ShardRequest,
+	owner replicatedSQLPointReadOwner,
+	budget replicatedSQLBudget,
+	maximum int,
+	authorize raftservice.ProposalAuthorization,
+	lease *replicatedSQLLease,
+	retained *bool,
+) (*ReplicatedResponse, bool) {
+	wireState := replicatedWireState(state)
+	refuse := func(code ReplicatedRefusalCode) (*ReplicatedResponse, bool) {
+		return &ReplicatedResponse{
+			Kind: ReplicatedRefusal, Refusal: code,
+			HasState: true, State: wireState,
+		}, false
+	}
+	pointRefuse := func(err error) (*ReplicatedResponse, bool) {
+		switch {
+		case errors.Is(err, raftmodel.ErrNotLeader), errors.Is(err, raftmodel.ErrReadLeadershipLost):
+			return &ReplicatedResponse{Kind: ReplicatedNotLeader, HasState: true, State: wireState}, false
+		case errors.Is(err, raftservice.ErrServingFence):
+			return refuse(ReplicatedRefusalStaleFence)
+		case errors.Is(err, raftservice.ErrServingAuthorization):
+			return refuse(ReplicatedRefusalUnavailable)
+		case errors.Is(err, replicatedstate.ErrReadBehind):
+			return refuse(ReplicatedRefusalReadBehind)
+		case errors.Is(err, replicatedstate.ErrReadBufferBound):
+			return refuse(ReplicatedRefusalReadBufferBound)
+		case errors.Is(err, replicatedstate.ErrTransactionIntentActive):
+			return refuse(ReplicatedRefusalReadIntentActive)
+		case errors.Is(err, raftservice.ErrIngressFull), errors.Is(err, raftservice.ErrPendingReadsFull):
+			return refuse(ReplicatedRefusalAdmissionBound)
+		default:
+			return refuse(ReplicatedRefusalUnavailable)
+		}
+	}
+	primary := inner.PrimaryKeyRead
+	var cut raftservice.LinearizablePointReadCut
+	quorum := trace.StartRegion(ctx, "sql.read.quorum")
+	err := owner.ReadLinearizablePointInto(ctx, raftservice.LinearizablePointReadRequest{
+		Fence: state.Fence(), Capability: request.Capability, Authorize: authorize,
+	}, &cut)
+	quorum.End()
+	if err != nil {
+		return pointRefuse(err)
+	}
+	defer cut.Close()
+	point, err := cut.PointReadInto(
+		ctx, primary.Relation, primary.Keys[0], int(primary.MaxDocumentBytes), nil,
+	)
+	if err != nil {
+		return pointRefuse(err)
+	}
+	source, ok := cut.Source().(replicatedSQLPointReadSource)
+	if !ok {
+		return refuse(ReplicatedRefusalUnavailable)
+	}
+	execution := trace.StartRegion(ctx, "sql.read.execute")
+	encoded, err := executeFencedSQLPointBudget(
+		ctx, source, primary, inner, budget, point,
+	)
+	execution.End()
+	if err != nil {
+		if ctx.Err() == nil && (budget.canGrow(err, maximum) ||
+			errors.Is(err, errSQLReadFrameBound) && budget.resultBytes < int(request.MaxValueBytes)) {
+			return nil, true
+		}
+		if errors.Is(err, errSQLReadFrameBound) {
+			return refuse(ReplicatedRefusalReadBufferBound)
+		}
+		encoded, err = encodeSQLReadError(classifyError(err), budget.resultBytes)
+		if err != nil {
+			if errors.Is(err, errSQLReadFrameBound) {
+				if budget.resultBytes < int(request.MaxValueBytes) && ctx.Err() == nil {
+					return nil, true
+				}
+				return refuse(ReplicatedRefusalReadBufferBound)
+			}
+			return refuse(ReplicatedRefusalUnavailable)
+		}
+	}
+	wireState = replicatedReadState(wireState, request.Fence, point.Fence.Applied)
+	response := &ReplicatedResponse{
+		Kind: ReplicatedQueryResult, HasState: true, State: wireState,
+		ReadApplied: point.Fence.Applied, Value: encoded, readLease: lease,
+	}
+	if !validReplicatedResponse(response) {
+		return refuse(ReplicatedRefusalUnavailable)
+	}
+	*retained = true
 	return response, false
 }
 
@@ -374,6 +572,62 @@ func executeFencedSQLBudget(ctx context.Context, source interface {
 		err = prepared.QueryInto(ctx, runtimeArgs(req.Params), &cursor)
 	}
 	if err != nil {
+		return nil, err
+	}
+	encoding := trace.StartRegion(ctx, "sql.read.encode")
+	defer encoding.End()
+	return encodeSQLReadCursor(cursor.Snapshot(), prepared.Columns(), budget.resultBytes, &flag)
+}
+
+func executeFencedSQLPointBudget(
+	ctx context.Context,
+	source replicatedSQLPointReadSource,
+	primary PrimaryKeyReadRequest,
+	req *ShardRequest,
+	budget replicatedSQLBudget,
+	point replicatedstate.PointReadResult,
+) ([]byte, error) {
+	maxBytes := budget.resultBytes
+	if req.ExecutionMode != ExecutionReadOnly || req.ReadPolicy != ReadStrong ||
+		req.Transaction.Operation != 0 || req.Exchange.Operation != 0 || req.Repartition.present() ||
+		req.DocumentScan.present() || req.GlobalIndexLookup.present() || req.mutationCapturePresent() ||
+		!req.ReadFenceID.IsZero() || req.HasMinPosition || req.RowBatch.present() {
+		return encodeSQLReadError(NewErrorResponse(ErrorMalformedRequest, "RF3 SQL read does not support this execution mode"), budget.resultBytes)
+	}
+	rows := replicatedSQLMaxRows
+	if req.MaxRows > 0 && req.MaxRows < uint64(rows) {
+		rows = int(req.MaxRows)
+	}
+	if req.MaxResultBytes > 0 && req.MaxResultBytes < uint64(maxBytes) {
+		maxBytes = int(req.MaxResultBytes)
+	}
+	var flag query.CancelFlag
+	stop := context.AfterFunc(ctx, flag.Cancel)
+	defer stop()
+	session, err := source.NewPointReadSession(
+		ctx, primary.Relation, primary.Keys[0], point.Found, point.Value,
+		primary.PrimaryPath, query.ExecOptions{
+			Cancel: &flag, ResultRows: rows, ResultBytes: int64(maxBytes),
+			MemoryBytes: budget.workingBytes, IntermediateBytes: budget.workingBytes,
+			AggregateBytes: budget.workingBytes,
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer session.Close()
+	prepared, err := prepareShardSQL(
+		ctx, session, req.SQL, req.ParamTypes, req.PartialAggregate,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer prepared.Close()
+	var cursor sqldriver.Cursor
+	defer cursor.Close()
+	if err := prepared.QueryCandidateKeysInto(
+		ctx, runtimeArgs(req.Params), primary.PrimaryPath, primary.Keys, &cursor,
+	); err != nil {
 		return nil, err
 	}
 	encoding := trace.StartRegion(ctx, "sql.read.encode")

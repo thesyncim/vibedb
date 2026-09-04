@@ -6,9 +6,11 @@ import (
 
 	"github.com/thesyncim/vibedb/autosplit"
 	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibedb/internal/replication"
 	queryplanner "github.com/thesyncim/vibedb/planner"
 	"github.com/thesyncim/vibedb/shardservice"
 	sqlast "github.com/thesyncim/vibedb/sql"
+	"github.com/thesyncim/vibejson/x/byteview"
 )
 
 // The route glue: it turns one pinned snapshot generation plus a bound key into
@@ -127,6 +129,7 @@ func (e *Executor) routeContext(ctx context.Context, snap *Snapshot, q *Query, b
 			},
 		}
 	}
+	populateReplicatedPrimaryKeyRead(snap, bound, route, mapper, calls)
 
 	physical, planning, err := optimizeDistributedPlan(ctx, snap, bound, route, p)
 	if err != nil {
@@ -151,6 +154,73 @@ func (e *Executor) routeContext(ctx context.Context, snap *Snapshot, q *Query, b
 		physical:     physical,
 		planning:     planning,
 	}, nil
+}
+
+// populateReplicatedPrimaryKeyRead adds the native primary-key candidate only
+// when the pinned catalog and bound route prove one exact RF3 base relation and
+// one physical destination. The original SQL remains on the request so the
+// shard still evaluates every residual predicate and projection.
+func populateReplicatedPrimaryKeyRead(
+	snap *Snapshot,
+	bound *BoundPlan,
+	route distribution.Route,
+	mapper *distribution.NativeMapper,
+	calls []shardCall,
+) {
+	if snap == nil || bound == nil || len(calls) != 1 || len(route.Targets) != 1 ||
+		route.Kind != distribution.RouteSingle || bound.generation != snap.Generation() ||
+		len(bound.tables) != 1 || bound.tables[0] != bound.table || bound.spec.Arity != 1 ||
+		bound.manifest == nil || mapper == nil || route.Distribution != bound.distribution ||
+		route.RoutingVersion != bound.manifest.Version() {
+		return
+	}
+	placement, spec, manifest, placed := snap.plannerTableFor(bound.table)
+	if !placed || manifest == nil || manifest != bound.manifest ||
+		placement.Distribution != bound.distribution || spec != bound.spec ||
+		spec.Arity != 1 || len(placement.Columns) != 1 {
+		return
+	}
+	entry, replicated := snap.replicatedTableAtBytes(byteview.Bytes(bound.table))
+	if !replicated {
+		return
+	}
+	profile, ok := snap.replicatedTableProfileAt(entry)
+	if !ok || profile.Table != bound.table || profile.Relation == 0 ||
+		profile.Relation > replication.MaxRelationID || profile.PrimaryKey == "" ||
+		placement.Columns[0] != profile.PrimaryKey || profile.MaxKeyBytes == 0 ||
+		profile.MaxDocumentBytes == 0 ||
+		profile.MaxDocumentBytes > replication.MaxMutationValueBytes {
+		return
+	}
+	scalar, ok := replicatedSQLExactConstraint(bound.constraints)
+	if !ok {
+		return
+	}
+	var keyStorage [replication.MaxMutationKeyBytes]byte
+	key, ok := appendReplicatedSQLScalarKey(keyStorage[:0], scalar)
+	if !ok || len(key) == 0 || len(key) > int(profile.MaxKeyBytes) {
+		return
+	}
+	var values [1]distribution.Scalar
+	values[0] = scalar
+	point, err := mapper.PointFor(values[:])
+	if err != nil {
+		return
+	}
+	resolved, ok := manifest.ResolvePointTarget(point)
+	target := route.Targets[0]
+	if !ok || resolved.Shard != target.Shard ||
+		resolved.AllocationGeneration != target.AllocationGeneration ||
+		resolved.Endpoint != target.Endpoint || resolved.OwnershipEpoch != target.OwnershipEpoch ||
+		resolved.Role != target.Role {
+		return
+	}
+	calls[0].req.PrimaryKeyRead = shardservice.PrimaryKeyReadRequest{
+		Relation:         profile.Relation,
+		MaxDocumentBytes: profile.MaxDocumentBytes,
+		PrimaryPath:      byteview.Bytes(profile.PrimaryKey),
+		Keys:             [][]byte{key},
+	}
 }
 
 func pressureSourceForTarget(

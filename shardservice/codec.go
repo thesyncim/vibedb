@@ -15,6 +15,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/exchange"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	"github.com/thesyncim/vibedb/internal/replication"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 )
 
@@ -51,6 +52,10 @@ const (
 	authorityMarker         = 0xe2
 	parameterTypesMarker    = 0xe3
 	mutationImageMarker     = 0xe4
+	// primaryKeyReadExtendedMarker adds the relation and catalog-frozen
+	// document bound. Keep primaryKeyReadMarker on its original grammar so
+	// zero-bound candidate requests remain byte-for-byte compatible.
+	primaryKeyReadExtendedMarker = 0xe5
 )
 
 // Limits. Each bounds an allocation a peer would otherwise size. The frame body
@@ -890,6 +895,9 @@ func ValidateRequest(req *ShardRequest) error {
 	}
 	mutationCapture := req.mutationCapturePresent()
 	primaryReadBytes := uint64(1 + 4 + len(req.PrimaryKeyRead.PrimaryPath) + 4)
+	if req.PrimaryKeyRead.Relation != 0 || req.PrimaryKeyRead.MaxDocumentBytes != 0 {
+		primaryReadBytes += 1 + 4
+	}
 	for i := range req.PrimaryKeyRead.Keys {
 		primaryReadBytes += uint64(4 + len(req.PrimaryKeyRead.Keys[i]))
 		if primaryReadBytes > maxFrameBody {
@@ -1036,7 +1044,11 @@ func requestFrameBytes(req *ShardRequest) (int, error) {
 		}
 	}
 	if req.PrimaryKeyRead.present() {
-		if err := add(1 + 4); err != nil {
+		primaryKeyReadBytes := 1 + 4
+		if req.PrimaryKeyRead.Relation != 0 || req.PrimaryKeyRead.MaxDocumentBytes != 0 {
+			primaryKeyReadBytes += 1 + 4
+		}
+		if err := add(primaryKeyReadBytes); err != nil {
 			return 0, err
 		}
 		if err := addBytes(req.PrimaryKeyRead.PrimaryPath); err != nil {
@@ -1604,7 +1616,13 @@ func EncodeRequest(w io.Writer, req *ShardRequest) error {
 		}
 	}
 	if req.PrimaryKeyRead.present() {
-		e.u8(primaryKeyReadMarker)
+		if req.PrimaryKeyRead.Relation != 0 || req.PrimaryKeyRead.MaxDocumentBytes != 0 {
+			e.u8(primaryKeyReadExtendedMarker)
+			e.u8(uint8(req.PrimaryKeyRead.Relation))
+			e.u32(req.PrimaryKeyRead.MaxDocumentBytes)
+		} else {
+			e.u8(primaryKeyReadMarker)
+		}
 		e.bytes(req.PrimaryKeyRead.PrimaryPath)
 		e.u32(uint32(len(req.PrimaryKeyRead.Keys)))
 		for i := range req.PrimaryKeyRead.Keys {
@@ -1768,8 +1786,13 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 			return nil, errBadGlobalIndexLookup
 		}
 	}
-	if len(d.b) != 0 && d.b[0] == primaryKeyReadMarker {
+	if len(d.b) != 0 && (d.b[0] == primaryKeyReadMarker || d.b[0] == primaryKeyReadExtendedMarker) {
+		extended := d.b[0] == primaryKeyReadExtendedMarker
 		d.u8()
+		if extended {
+			req.PrimaryKeyRead.Relation = replication.RelationID(d.u8())
+			req.PrimaryKeyRead.MaxDocumentBytes = d.u32()
+		}
 		req.PrimaryKeyRead.PrimaryPath = d.slice()
 		count := d.count(4, maxParams)
 		if count != 0 {
