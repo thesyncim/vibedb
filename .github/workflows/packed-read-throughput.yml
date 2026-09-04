@@ -27,25 +27,26 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-          ref: ${{ github.event.pull_request.head.sha }}
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
       - name: Build both revisions before timing
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_SHA: ${{ github.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/packed-read-results"
           git worktree add --detach "$RUNNER_TEMP/packed-read-base" "$BASE_SHA"
-          # Identical harness on both revisions; only production code differs.
+          # Compare the PR test merge with its base, including concurrent main
+          # changes in both sides. The benchmark harness is identical.
           cp store/durable/store_file_parallel_scan_bench_test.go "$RUNNER_TEMP/packed-read-base/store/durable/"
           cp store/durable/store_file_high_cardinality_point_bench_test.go "$RUNNER_TEMP/packed-read-base/store/durable/"
           go test -c ./store/durable -o "$RUNNER_TEMP/packed-read-head.test"
           (cd "$RUNNER_TEMP/packed-read-base" && go test -c ./store/durable -o "$RUNNER_TEMP/packed-read-base.test")
           {
-            echo "base=$BASE_SHA head=$HEAD_SHA runner=${{ matrix.os }}"
+            echo "base=$BASE_SHA merge=$HEAD_SHA pr_head=$PR_HEAD_SHA runner=${{ matrix.os }}"
             go version
             uname -a
             lscpu
