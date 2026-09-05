@@ -137,6 +137,7 @@ const (
 	requestSplitSourceLeadership
 	requestSchemaLeadershipTransfer
 	requestFenceCommittedSchemaGeneration
+	requestReadAuthorityValidate
 )
 
 const (
@@ -152,28 +153,30 @@ type proposalDelivery struct {
 }
 
 type ownerRequest struct {
-	kind         requestKind
-	group        raftmember.GroupKey
-	data         []byte
-	fence        ServingFence
-	inbound      rafttransport.Inbound
-	reply        chan ownerReply
-	bytes        int64
-	async        bool
-	delivery     *proposalDelivery
-	authorize    ProposalAuthorization
-	membership   MembershipRequest
-	read         readRequest
-	targetMember uint64
-	operation    [32]byte
-	step         [32]byte
-	sourceMember uint64
-	install      ExecutionGroup
-	publish      func()
-	database     *sqldriver.Database
-	apply        *sqldriver.ReplicatedApply
-	schemaSQL    sqldriver.ReplicatedShardStoreIdentity
-	schemaApply  sqldriver.ReplicatedApplyIdentity
+	kind                requestKind
+	group               raftmember.GroupKey
+	data                []byte
+	fence               ServingFence
+	inbound             rafttransport.Inbound
+	reply               chan ownerReply
+	bytes               int64
+	async               bool
+	delivery            *proposalDelivery
+	authorize           ProposalAuthorization
+	authorityToken      raftauthority.AuthorityToken
+	authorityGeneration *ownerGeneration
+	membership          MembershipRequest
+	read                readRequest
+	targetMember        uint64
+	operation           [32]byte
+	step                [32]byte
+	sourceMember        uint64
+	install             ExecutionGroup
+	publish             func()
+	database            *sqldriver.Database
+	apply               *sqldriver.ReplicatedApply
+	schemaSQL           sqldriver.ReplicatedShardStoreIdentity
+	schemaApply         sqldriver.ReplicatedApplyIdentity
 }
 
 type ownerReply struct {
@@ -214,10 +217,13 @@ type ReplicaHealthObservation struct {
 }
 
 type readRequest struct {
-	fence          ServingFence
-	minimumApplied uint64
-	delivery       *readDelivery
-	authorize      ProposalAuthorization
+	fence             ServingFence
+	minimumApplied    uint64
+	delivery          *readDelivery
+	authorize         ProposalAuthorization
+	authorityEligible bool
+	forceReadIndex    bool
+	authorityFallback bool
 }
 
 type readAuthorization struct {
@@ -228,6 +234,8 @@ type readAuthorization struct {
 	routeGate      RouteGateSource
 	minimumApplied uint64
 	generation     *ownerGeneration
+	authorityToken raftauthority.AuthorityToken
+	authorityFast  bool
 	state          ServingState
 }
 
@@ -361,7 +369,11 @@ type ProposalAuthorization func(ServingState) bool
 // Linearizable uses a leader ReadIndex barrier. Follower mode serves only when
 // the local publication reaches MinimumApplied; it makes no time-based claim.
 type PointReadRequest struct {
-	Fence          ServingFence
+	Fence ServingFence
+	// Capability identifies the already authenticated serving lane. Only an
+	// exact ordinary data-read capability may use the optional read-authority
+	// fast path; all other capabilities retain the existing ReadIndex path.
+	Capability     serviceauthz.Capability
 	Relation       replication.RelationID
 	Key            []byte
 	MinimumApplied uint64
@@ -383,7 +395,11 @@ type PointReadResult struct {
 // multi-relation request. Packed is the canonical replicatedstate grammar and
 // MaxResultBytes bounds its complete bitmap/length/value response.
 type PointReadBatchRequest struct {
-	Fence          ServingFence
+	Fence ServingFence
+	// Capability identifies the already authenticated serving lane. Only an
+	// exact ordinary data-read capability may use the optional read-authority
+	// fast path.
+	Capability     serviceauthz.Capability
 	Packed         []byte
 	MinimumApplied uint64
 	MaxResultBytes int
@@ -1554,6 +1570,32 @@ func (owner *Owner) handle(request ownerRequest) error {
 		reply.err = owner.quiesceSchemaGeneration(request)
 	case requestInstallSchemaGeneration:
 		reply.err = owner.installSchemaGeneration(request)
+	case requestReadAuthorityValidate:
+		member, found := owner.members[request.group]
+		if !found || request.authorityGeneration == nil ||
+			member.generation != request.authorityGeneration ||
+			member.generation.transitionFenced.Load() || member.generation.quiescing.Load() ||
+			!servingFenceMatchesIdentity(request.fence, member) {
+			reply.err = ErrServingFence
+			break
+		}
+		status, statusErr := owner.host.Status(request.group)
+		if statusErr != nil {
+			reply.err = statusErr
+			break
+		}
+		if status.MemberID != member.identity.MemberID || status.LeaderID != member.identity.MemberID ||
+			status.Term != request.fence.Term {
+			reply.err = &NotLeaderError{Status: status}
+			break
+		}
+		if authorityHost, ok := owner.host.(readAuthorityOwnerHost); ok {
+			reply.err = authorityHost.ValidateReadAuthorityToken(
+				request.group, request.authorityToken,
+			)
+		} else {
+			reply.err = raftauthority.ErrPolicyDisabled
+		}
 	case requestReadLinear, requestReadFollower, requestReadTransaction, requestReadRequestLedger,
 		requestReadExecutionPin, requestReadRouteGate:
 		member, found := owner.members[request.group]
@@ -1626,6 +1668,22 @@ func (owner *Owner) handle(request ownerRequest) error {
 			reply.err = &NotLeaderError{Status: status}
 			break
 		}
+		authorityTried := false
+		if request.kind == requestReadLinear && request.read.authorityEligible &&
+			!request.read.forceReadIndex && request.read.delivery != nil {
+			if authority, usable, authorityErr, tried := owner.tryReadAuthority(
+				request.group, request.read.minimumApplied, status, member, serving,
+			); usable {
+				if authorityErr != nil {
+					reply.err = authorityErr
+				} else {
+					reply.read = authority
+				}
+				break
+			} else {
+				authorityTried = tried
+			}
+		}
 		request.read.delivery.source = member.read
 		request.read.delivery.recovery = member.recovery
 		request.read.delivery.requestLedger, _ = member.recovery.(RequestLedgerSource)
@@ -1655,6 +1713,9 @@ func (owner *Owner) handle(request ownerRequest) error {
 			reply.err = err
 			break
 		}
+		if authorityTried || request.read.authorityFallback {
+			owner.metrics.observeAuthorityReadIndexFallback(request.group)
+		}
 		owner.pendingReads[delivery.context] = delivery
 		// The reply is settled only by the matching quorum barrier.
 		return nil
@@ -1664,7 +1725,9 @@ func (owner *Owner) handle(request ownerRequest) error {
 	if (request.kind == requestReadLinear || request.kind == requestReadTransaction ||
 		request.kind == requestReadRequestLedger || request.kind == requestReadExecutionPin || request.kind == requestReadRouteGate) &&
 		request.read.delivery != nil {
-		owner.settleReadDelivery(request.read.delivery, reply)
+		if !owner.settleReadDelivery(request.read.delivery, reply) && reply.read.generation != nil {
+			reply.read.generation.release()
+		}
 	} else {
 		request.reply <- reply
 	}
@@ -1989,7 +2052,9 @@ func (owner *Owner) finishReadOutcomes(outcomes []raftmodel.ReadOutcome) {
 		if outcome.Err == nil {
 			if !delivery.generation.acquire() {
 				reply.err = ErrServingFence
-				owner.settleReadDelivery(delivery, reply)
+				if !owner.settleReadDelivery(delivery, reply) && reply.read.generation != nil {
+					reply.read.generation.release()
+				}
 				continue
 			}
 			reply.read.minimumApplied = max(delivery.minimumApplied, outcome.Barrier.Index)
@@ -2003,14 +2068,18 @@ func (owner *Owner) finishReadOutcomes(outcomes []raftmodel.ReadOutcome) {
 			reply.read.routeGate = delivery.routeGate
 			reply.read.state = delivery.serving
 		}
-		owner.settleReadDelivery(delivery, reply)
+		if !owner.settleReadDelivery(delivery, reply) && reply.read.generation != nil {
+			reply.read.generation.release()
+		}
 	}
 }
 
-func (owner *Owner) settleReadDelivery(delivery *readDelivery, reply ownerReply) {
+func (owner *Owner) settleReadDelivery(delivery *readDelivery, reply ownerReply) bool {
 	if delivery != nil && delivery.state.CompareAndSwap(readDeliveryPending, readDeliveryReady) {
 		delivery.reply <- reply
+		return true
 	}
+	return false
 }
 
 func handoffProposalWaiter(
@@ -2446,47 +2515,79 @@ func (owner *Owner) ReadPoint(
 	}()
 	key := make([]byte, len(request.Key))
 	copy(key, request.Key)
-	kind := requestReadFollower
-	var reply ownerReply
-	var err error
-	if request.Linearizable {
-		kind = requestReadLinear
-		delivery := &readDelivery{reply: make(chan ownerReply, 1)}
-		ownerRequest := ownerRequest{
-			kind: kind, group: request.Fence.Group, reply: delivery.reply,
-			bytes: int64(cap(key)), read: readRequest{
-				fence: request.Fence, minimumApplied: request.MinimumApplied,
-				delivery: delivery, authorize: request.Authorize,
-			},
-		}
-		reply, err = owner.enqueueRead(ctx, ownerRequest, delivery)
-	} else {
-		reply, err = owner.enqueue(ctx, ownerRequest{
-			kind: kind, group: request.Fence.Group, reply: make(chan ownerReply, 1),
+	if !request.Linearizable {
+		reply, err := owner.enqueue(ctx, ownerRequest{
+			kind: requestReadFollower, group: request.Fence.Group, reply: make(chan ownerReply, 1),
 			bytes: int64(cap(key)), read: readRequest{
 				fence: request.Fence, minimumApplied: request.MinimumApplied,
 				authorize: request.Authorize,
 			},
 		})
-	}
-	if err != nil {
-		return PointReadResult{}, nil, err
-	}
-	defer reply.read.generation.release()
-	value, err := reply.read.source.PointReadInto(
-		request.Relation, key, reply.read.minimumApplied, request.MaxValueBytes,
-		nil,
-	)
-	if err != nil || !pointReadFenceMatches(value.Fence, request.Fence) ||
-		value.Fence.Applied < reply.read.minimumApplied || len(value.Value) > request.MaxValueBytes {
 		if err != nil {
 			return PointReadResult{}, nil, err
 		}
-		return PointReadResult{}, nil, ErrServingFence
+		defer reply.read.generation.release()
+		value, readErr := reply.read.source.PointReadInto(
+			request.Relation, key, reply.read.minimumApplied, request.MaxValueBytes, nil,
+		)
+		if readErr != nil {
+			return PointReadResult{}, nil, readErr
+		}
+		if !pointReadFenceMatches(value.Fence, request.Fence) ||
+			value.Fence.Applied < reply.read.minimumApplied || len(value.Value) > request.MaxValueBytes {
+			return PointReadResult{}, nil, ErrServingFence
+		}
+		releaseReservation = false
+		return PointReadResult{Applied: value.Fence.Applied, Found: value.Found,
+				Value: value.Value, State: reply.read.state},
+			&pointReadLease{owner: owner, bytes: responseCharge}, nil
 	}
-	releaseReservation = false
-	return PointReadResult{Applied: value.Fence.Applied, Found: value.Found, Value: value.Value, State: reply.read.state},
-		&pointReadLease{owner: owner, bytes: responseCharge}, nil
+	for attempt := 0; attempt < 2; attempt++ {
+		reply, err := owner.enqueuePointRead(ctx, request, key, attempt != 0)
+		if err != nil {
+			return PointReadResult{}, nil, err
+		}
+		generation := reply.read.generation
+		value, readErr := reply.read.source.PointReadInto(
+			request.Relation, key, reply.read.minimumApplied, request.MaxValueBytes, nil,
+		)
+		fenceOK := readErr == nil && pointReadFenceMatches(value.Fence, request.Fence) &&
+			value.Fence.Applied >= reply.read.minimumApplied && len(value.Value) <= request.MaxValueBytes
+		if !fenceOK {
+			generation.release()
+			if attempt == 0 && reply.read.authorityFast && readAuthoritySourceFallback(readErr, fenceOK) {
+				continue
+			}
+			if readErr != nil {
+				return PointReadResult{}, nil, readErr
+			}
+			return PointReadResult{}, nil, ErrServingFence
+		}
+		if reply.read.authorityFast {
+			if cause := context.Cause(ctx); cause != nil {
+				generation.release()
+				return PointReadResult{}, nil, cause
+			}
+			if validationErr := owner.validateReadAuthority(
+				ctx, request.Fence, reply.read.generation, reply.read.authorityToken,
+			); validationErr != nil {
+				retry := attempt == 0 && readAuthorityFallback(validationErr)
+				owner.recordAuthorityValidation(request.Fence.Group, validationErr, retry)
+				generation.release()
+				if retry {
+					continue
+				}
+				return PointReadResult{}, nil, validationErr
+			}
+			owner.recordAuthorityHit(request.Fence.Group)
+		}
+		generation.release()
+		releaseReservation = false
+		return PointReadResult{Applied: value.Fence.Applied, Found: value.Found,
+				Value: value.Value, State: reply.read.state},
+			&pointReadLease{owner: owner, bytes: responseCharge}, nil
+	}
+	return PointReadResult{}, nil, ErrServingFence
 }
 
 // ReadPointBatch authorizes exactly one leader ReadIndex and then reads one
@@ -2516,39 +2617,63 @@ func (owner *Owner) ReadPointBatch(
 		}
 	}()
 	owned := append([]byte(nil), request.Packed...)
-	delivery := &readDelivery{reply: make(chan ownerReply, 1)}
-	reply, err := owner.enqueueRead(ctx, ownerRequest{
-		kind: requestReadLinear, group: request.Fence.Group, reply: delivery.reply,
-		bytes: int64(cap(owned)), read: readRequest{
-			fence: request.Fence, minimumApplied: request.MinimumApplied,
-			delivery: delivery, authorize: request.Authorize,
-		},
-	}, delivery)
-	if err != nil {
-		return PointReadBatchResult{}, nil, err
+	for attempt := 0; attempt < 2; attempt++ {
+		reply, err := owner.enqueuePointBatchRead(ctx, request, owned, attempt != 0)
+		if err != nil {
+			return PointReadBatchResult{}, nil, err
+		}
+		generation := reply.read.generation
+		source, ok := reply.read.source.(BatchReadSource)
+		if !ok {
+			generation.release()
+			return PointReadBatchResult{}, nil, ErrInvalidOwner
+		}
+		value, readErr := source.PointReadBatchInto(
+			owned, reply.read.minimumApplied, request.MaxResultBytes, nil,
+		)
+		fenceOK := readErr == nil && pointReadFenceMatches(value.Fence, request.Fence) &&
+			value.Fence.Applied >= reply.read.minimumApplied && len(value.Data) <= request.MaxResultBytes
+		if fenceOK {
+			_, fenceErr := replicatedstate.OpenPointReadBatchValue(value.Data)
+			fenceOK = fenceErr == nil
+			if fenceErr != nil {
+				readErr = ErrServingFence
+			}
+		}
+		if !fenceOK {
+			generation.release()
+			if attempt == 0 && reply.read.authorityFast && readAuthoritySourceFallback(readErr, fenceOK) {
+				continue
+			}
+			if readErr != nil {
+				return PointReadBatchResult{}, nil, readErr
+			}
+			return PointReadBatchResult{}, nil, ErrServingFence
+		}
+		if reply.read.authorityFast {
+			if cause := context.Cause(ctx); cause != nil {
+				generation.release()
+				return PointReadBatchResult{}, nil, cause
+			}
+			if validationErr := owner.validateReadAuthority(
+				ctx, request.Fence, reply.read.generation, reply.read.authorityToken,
+			); validationErr != nil {
+				retry := attempt == 0 && readAuthorityFallback(validationErr)
+				owner.recordAuthorityValidation(request.Fence.Group, validationErr, retry)
+				generation.release()
+				if retry {
+					continue
+				}
+				return PointReadBatchResult{}, nil, validationErr
+			}
+			owner.recordAuthorityHit(request.Fence.Group)
+		}
+		generation.release()
+		releaseReservation = false
+		return PointReadBatchResult{Applied: value.Fence.Applied, Data: value.Data,
+			State: reply.read.state}, &pointReadLease{owner: owner, bytes: responseCharge}, nil
 	}
-	defer reply.read.generation.release()
-	source, ok := reply.read.source.(BatchReadSource)
-	if !ok {
-		return PointReadBatchResult{}, nil, ErrInvalidOwner
-	}
-	value, err := source.PointReadBatchInto(
-		owned, reply.read.minimumApplied, request.MaxResultBytes, nil,
-	)
-	if err != nil {
-		return PointReadBatchResult{}, nil, err
-	}
-	if !pointReadFenceMatches(value.Fence, request.Fence) ||
-		value.Fence.Applied < reply.read.minimumApplied ||
-		len(value.Data) > request.MaxResultBytes {
-		return PointReadBatchResult{}, nil, ErrServingFence
-	}
-	if _, err := replicatedstate.OpenPointReadBatchValue(value.Data); err != nil {
-		return PointReadBatchResult{}, nil, ErrServingFence
-	}
-	releaseReservation = false
-	return PointReadBatchResult{Applied: value.Fence.Applied, Data: value.Data, State: reply.read.state},
-		&pointReadLease{owner: owner, bytes: responseCharge}, nil
+	return PointReadBatchResult{}, nil, ErrServingFence
 }
 
 // ReadTransaction serves one bounded transaction-control recovery read after
