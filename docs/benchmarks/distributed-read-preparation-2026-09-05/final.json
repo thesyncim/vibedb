@@ -1,0 +1,6 @@
+{
+  "revision": "0da6e75c26bf34f6ec59ff7f1738c3c2d2f092ea",
+  "binary": "driver-final.test",
+  "binary_sha256": "ec1d4c7fc1c3ad2645fd319b7721a135bf63c1e5aaa8a96f9064b5d922e8e5d7",
+  "change_from_abba_revision": "Direct conn literal initialization and two test copylocks fixes; production behavior unchanged; final allocation confirmation recorded separately."
+}

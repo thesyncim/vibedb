@@ -1,0 +1,47 @@
+=== RUN   TestReplicatedReadSessionUsesPrimaryProjectionLane
+--- PASS: TestReplicatedReadSessionUsesPrimaryProjectionLane (61.25s)
+=== RUN   TestReplicatedReadReuseDataCutMutationAndParameterKey
+--- PASS: TestReplicatedReadReuseDataCutMutationAndParameterKey (2.94s)
+=== RUN   TestReplicatedReadReusePointAlternatesHitsMissesAndUpdates
+--- PASS: TestReplicatedReadReusePointAlternatesHitsMissesAndUpdates (1.70s)
+=== RUN   TestReplicatedReadReuseBudgetCancellationRollbackAndReuse
+--- PASS: TestReplicatedReadReuseBudgetCancellationRollbackAndReuse (1.70s)
+=== RUN   TestReplicatedReadReuseLeasesAreExclusiveAndStaleHandlesClose
+--- PASS: TestReplicatedReadReuseLeasesAreExclusiveAndStaleHandlesClose (1.77s)
+=== RUN   TestReplicatedReadReuseConcurrentIndependentLeases
+--- PASS: TestReplicatedReadReuseConcurrentIndependentLeases (2.55s)
+=== RUN   TestReplicatedReadReuseUnsupportedShapesAreNeverRetained
+--- PASS: TestReplicatedReadReuseUnsupportedShapesAreNeverRetained (5.31s)
+=== RUN   TestReplicatedReadReuseRejectsForeignAndClosedCuts
+--- PASS: TestReplicatedReadReuseRejectsForeignAndClosedCuts (4.45s)
+=== RUN   TestReplicatedReadReuseLayoutReplacementDoesNotReuseStaleSlot
+--- PASS: TestReplicatedReadReuseLayoutReplacementDoesNotReuseStaleSlot (3.22s)
+=== RUN   TestReplicatedReadReuseApplyCloseRejectsAndRetiresLeases
+--- PASS: TestReplicatedReadReuseApplyCloseRejectsAndRetiresLeases (5.79s)
+=== RUN   TestReplicatedReadReuseIdleStateDropsRequestReferences
+--- PASS: TestReplicatedReadReuseIdleStateDropsRequestReferences (3.14s)
+=== RUN   TestReplicatedReadReuseLayoutTokensOutliveEpochs
+--- PASS: TestReplicatedReadReuseLayoutTokensOutliveEpochs (0.01s)
+=== RUN   TestReplicatedReadReusePreparationOwnsSourceAndAccountsObjects
+--- PASS: TestReplicatedReadReusePreparationOwnsSourceAndAccountsObjects (0.12s)
+=== RUN   TestReplicatedReadReusePublicationBetweenLookupAndAttach
+=== RUN   TestReplicatedReadReusePublicationBetweenLookupAndAttach/cold
+=== RUN   TestReplicatedReadReusePublicationBetweenLookupAndAttach/hit
+--- PASS: TestReplicatedReadReusePublicationBetweenLookupAndAttach (5.80s)
+    --- PASS: TestReplicatedReadReusePublicationBetweenLookupAndAttach/cold (2.65s)
+    --- PASS: TestReplicatedReadReusePublicationBetweenLookupAndAttach/hit (3.15s)
+=== RUN   TestReplicatedReadReuseAcquirePanicRetiresReservation
+=== RUN   TestReplicatedReadReuseAcquirePanicRetiresReservation/cold
+=== RUN   TestReplicatedReadReuseAcquirePanicRetiresReservation/hit
+--- PASS: TestReplicatedReadReuseAcquirePanicRetiresReservation (5.80s)
+    --- PASS: TestReplicatedReadReuseAcquirePanicRetiresReservation/cold (3.15s)
+    --- PASS: TestReplicatedReadReuseAcquirePanicRetiresReservation/hit (2.65s)
+=== RUN   TestReplicatedReadReuseResetDeclinePreservesSuccessfulRead
+--- PASS: TestReplicatedReadReuseResetDeclinePreservesSuccessfulRead (0.25s)
+=== RUN   TestReplicatedReadReuseAbortClosesUnpublishedRows
+--- PASS: TestReplicatedReadReuseAbortClosesUnpublishedRows (0.20s)
+=== RUN   TestReplicatedReadReuseQueryPanicStopsContextWatcher
+--- PASS: TestReplicatedReadReuseQueryPanicStopsContextWatcher (0.17s)
+=== RUN   TestTypedRuntimeCancellationAndExternalFailureState
+--- PASS: TestTypedRuntimeCancellationAndExternalFailureState (0.53s)
+PASS

@@ -1,0 +1,1784 @@
+{
+  "aggregate": {
+    "point_hit": {
+      "medians": {
+        "baseline_fresh": {
+          "B/op": 79992.0,
+          "allocs/op": 202.0,
+          "ns/op": 41006.5
+        },
+        "candidate_fresh": {
+          "B/op": 80024.0,
+          "allocs/op": 202.0,
+          "ns/op": 28343.0
+        },
+        "candidate_prepared_reuse": {
+          "B/op": 61544.0,
+          "allocs/op": 165.0,
+          "ns/op": 25521.5
+        }
+      },
+      "ratios": {
+        "candidate_fresh_over_baseline_fresh": {
+          "B/op": 1.0004000400040003,
+          "allocs/op": 1.0,
+          "ns/op": 0.6911831051174814
+        },
+        "candidate_prepared_reuse_over_baseline_fresh": {
+          "B/op": 0.7693769376937694,
+          "allocs/op": 0.8168316831683168,
+          "ns/op": 0.6223769402411813
+        },
+        "candidate_prepared_reuse_over_candidate_fresh": {
+          "B/op": 0.7690692792162351,
+          "allocs/op": 0.8168316831683168,
+          "ns/op": 0.9004516106269626
+        }
+      }
+    },
+    "point_miss": {
+      "medians": {
+        "baseline_fresh": {
+          "B/op": 31184.0,
+          "allocs/op": 172.0,
+          "ns/op": 21712.0
+        },
+        "candidate_fresh": {
+          "B/op": 31216.0,
+          "allocs/op": 172.0,
+          "ns/op": 21888.5
+        },
+        "candidate_prepared_reuse": {
+          "B/op": 12720.0,
+          "allocs/op": 135.0,
+          "ns/op": 15274.5
+        }
+      },
+      "ratios": {
+        "candidate_fresh_over_baseline_fresh": {
+          "B/op": 1.0010261672652643,
+          "allocs/op": 1.0,
+          "ns/op": 1.0081291451731762
+        },
+        "candidate_prepared_reuse_over_baseline_fresh": {
+          "B/op": 0.4079014879425346,
+          "allocs/op": 0.7848837209302325,
+          "ns/op": 0.7035049742078113
+        },
+        "candidate_prepared_reuse_over_candidate_fresh": {
+          "B/op": 0.407483341875961,
+          "allocs/op": 0.7848837209302325,
+          "ns/op": 0.6978321949882358
+        }
+      }
+    },
+    "range_256": {
+      "medians": {
+        "baseline_fresh": {
+          "B/op": 121208.0,
+          "allocs/op": 132.0,
+          "ns/op": 94018.5
+        },
+        "candidate_fresh": {
+          "B/op": 121240.0,
+          "allocs/op": 132.0,
+          "ns/op": 86677.0
+        },
+        "candidate_prepared_reuse": {
+          "B/op": 103184.0,
+          "allocs/op": 99.0,
+          "ns/op": 97699.0
+        }
+      },
+      "ratios": {
+        "candidate_fresh_over_baseline_fresh": {
+          "B/op": 1.0002640089763053,
+          "allocs/op": 1.0,
+          "ns/op": 0.9219143040997251
+        },
+        "candidate_prepared_reuse_over_baseline_fresh": {
+          "B/op": 0.8512969440960992,
+          "allocs/op": 0.75,
+          "ns/op": 1.0391465509447608
+        },
+        "candidate_prepared_reuse_over_candidate_fresh": {
+          "B/op": 0.8510722533817222,
+          "allocs/op": 0.75,
+          "ns/op": 1.1271617614822849
+        }
+      }
+    },
+    "range_32": {
+      "medians": {
+        "baseline_fresh": {
+          "B/op": 47290.0,
+          "allocs/op": 120.0,
+          "ns/op": 29107.5
+        },
+        "candidate_fresh": {
+          "B/op": 47322.0,
+          "allocs/op": 120.0,
+          "ns/op": 31353.5
+        },
+        "candidate_prepared_reuse": {
+          "B/op": 29266.0,
+          "allocs/op": 87.0,
+          "ns/op": 27746.5
+        }
+      },
+      "ratios": {
+        "candidate_fresh_over_baseline_fresh": {
+          "B/op": 1.0006766758299852,
+          "allocs/op": 1.0,
+          "ns/op": 1.0771622434080563
+        },
+        "candidate_prepared_reuse_over_baseline_fresh": {
+          "B/op": 0.6188623387608374,
+          "allocs/op": 0.725,
+          "ns/op": 0.9532422915056257
+        },
+        "candidate_prepared_reuse_over_candidate_fresh": {
+          "B/op": 0.6184438527534761,
+          "allocs/op": 0.725,
+          "ns/op": 0.8849570223420032
+        }
+      }
+    },
+    "range_64": {
+      "medians": {
+        "baseline_fresh": {
+          "B/op": 57464.0,
+          "allocs/op": 124.0,
+          "ns/op": 42874.0
+        },
+        "candidate_fresh": {
+          "B/op": 57496.0,
+          "allocs/op": 124.0,
+          "ns/op": 40177.5
+        },
+        "candidate_prepared_reuse": {
+          "B/op": 39440.0,
+          "allocs/op": 91.0,
+          "ns/op": 42753.0
+        }
+      },
+      "ratios": {
+        "candidate_fresh_over_baseline_fresh": {
+          "B/op": 1.0005568703884171,
+          "allocs/op": 1.0,
+          "ns/op": 0.9371064048141065
+        },
+        "candidate_prepared_reuse_over_baseline_fresh": {
+          "B/op": 0.6863427537240707,
+          "allocs/op": 0.7338709677419355,
+          "ns/op": 0.9971777767411485
+        },
+        "candidate_prepared_reuse_over_candidate_fresh": {
+          "B/op": 0.6859607624878252,
+          "allocs/op": 0.7338709677419355,
+          "ns/op": 1.0641030427478066
+        }
+      }
+    }
+  },
+  "metrics": [
+    "ns/op",
+    "B/op",
+    "allocs/op"
+  ],
+  "orders": {
+    "after-1": {
+      "arm": "after",
+      "lanes": {
+        "candidate_fresh": {
+          "point_hit": {
+            "median": {
+              "B/op": 80024.0,
+              "allocs/op": 202.0,
+              "ns/op": 29103.0
+            },
+            "samples": [
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/point_hit/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/point_hit/fresh-4         \t    1000\t     29984 ns/op\t       975.9 close-ns/op\t         3.222 close-pct\t      9345 construct-ns/op\t        30.85 construct-pct\t       801.7 encode-ns/op\t         2.646 encode-pct\t      9381 execute-ns/op\t        30.97 execute-pct\t     30293 phases-ns/op\t      9789 prepare-ns/op\t        32.31 prepare-pct\t   80024 B/op\t     202 allocs/op",
+                "line_number": 4,
+                "metrics": {
+                  "B/op": 80024.0,
+                  "allocs/op": 202.0,
+                  "ns/op": 29984.0
+                },
+                "workload": "point_hit"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/point_hit/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/point_hit/fresh-4         \t    1000\t     29103 ns/op\t       750.8 close-ns/op\t         2.560 close-pct\t      9207 construct-ns/op\t        31.39 construct-pct\t       704.4 encode-ns/op\t         2.401 encode-pct\t      9614 execute-ns/op\t        32.78 execute-pct\t     29333 phases-ns/op\t      9056 prepare-ns/op\t        30.87 prepare-pct\t   80024 B/op\t     202 allocs/op",
+                "line_number": 5,
+                "metrics": {
+                  "B/op": 80024.0,
+                  "allocs/op": 202.0,
+                  "ns/op": 29103.0
+                },
+                "workload": "point_hit"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/point_hit/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/point_hit/fresh-4         \t    1000\t     27679 ns/op\t       804.2 close-ns/op\t         2.880 close-pct\t      9259 construct-ns/op\t        33.15 construct-pct\t       749.9 encode-ns/op\t         2.685 encode-pct\t      8499 execute-ns/op\t        30.43 execute-pct\t     27929 phases-ns/op\t      8617 prepare-ns/op\t        30.85 prepare-pct\t   80024 B/op\t     202 allocs/op",
+                "line_number": 6,
+                "metrics": {
+                  "B/op": 80024.0,
+                  "allocs/op": 202.0,
+                  "ns/op": 27679.0
+                },
+                "workload": "point_hit"
+              }
+            ]
+          },
+          "point_miss": {
+            "median": {
+              "B/op": 31216.0,
+              "allocs/op": 172.0,
+              "ns/op": 22259.0
+            },
+            "samples": [
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/point_miss/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/point_miss/fresh-4        \t    1000\t     21532 ns/op\t       710.2 close-ns/op\t         3.314 close-pct\t      9047 construct-ns/op\t        42.22 construct-pct\t       377.3 encode-ns/op\t         1.761 encode-pct\t      1994 execute-ns/op\t         9.303 execute-pct\t     21429 phases-ns/op\t      9301 prepare-ns/op\t        43.40 prepare-pct\t   31216 B/op\t     172 allocs/op",
+                "line_number": 7,
+                "metrics": {
+                  "B/op": 31216.0,
+                  "allocs/op": 172.0,
+                  "ns/op": 21532.0
+                },
+                "workload": "point_miss"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/point_miss/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/point_miss/fresh-4        \t    1000\t     22259 ns/op\t       676.1 close-ns/op\t         3.048 close-pct\t      9368 construct-ns/op\t        42.24 construct-pct\t       373.7 encode-ns/op\t         1.685 encode-pct\t      1947 execute-ns/op\t         8.779 execute-pct\t     22178 phases-ns/op\t      9813 prepare-ns/op\t        44.25 prepare-pct\t   31216 B/op\t     172 allocs/op",
+                "line_number": 8,
+                "metrics": {
+                  "B/op": 31216.0,
+                  "allocs/op": 172.0,
+                  "ns/op": 22259.0
+                },
+                "workload": "point_miss"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/point_miss/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/point_miss/fresh-4        \t    1000\t     22966 ns/op\t       818.3 close-ns/op\t         3.574 close-pct\t      9884 construct-ns/op\t        43.17 construct-pct\t       368.0 encode-ns/op\t         1.607 encode-pct\t      2062 execute-ns/op\t         9.007 execute-pct\t     22896 phases-ns/op\t      9763 prepare-ns/op\t        42.64 prepare-pct\t   31216 B/op\t     172 allocs/op",
+                "line_number": 9,
+                "metrics": {
+                  "B/op": 31216.0,
+                  "allocs/op": 172.0,
+                  "ns/op": 22966.0
+                },
+                "workload": "point_miss"
+              }
+            ]
+          },
+          "range_256": {
+            "median": {
+              "B/op": 121240.0,
+              "allocs/op": 132.0,
+              "ns/op": 85224.0
+            },
+            "samples": [
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/range_256/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/range_256/fresh-4         \t    1000\t     88130 ns/op\t      1568 close-ns/op\t         1.666 close-pct\t      2128 construct-ns/op\t         2.261 construct-pct\t      6488 encode-ns/op\t         6.894 encode-pct\t     75152 execute-ns/op\t        79.85 execute-pct\t     94120 phases-ns/op\t      8783 prepare-ns/op\t         9.332 prepare-pct\t  121240 B/op\t     132 allocs/op",
+                "line_number": 16,
+                "metrics": {
+                  "B/op": 121240.0,
+                  "allocs/op": 132.0,
+                  "ns/op": 88130.0
+                },
+                "workload": "range_256"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/range_256/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/range_256/fresh-4         \t    1000\t     84905 ns/op\t      1514 close-ns/op\t         1.673 close-pct\t      2203 construct-ns/op\t         2.434 construct-pct\t      6146 encode-ns/op\t         6.789 encode-pct\t     72084 execute-ns/op\t        79.63 execute-pct\t     90527 phases-ns/op\t      8579 prepare-ns/op\t         9.477 prepare-pct\t  121240 B/op\t     132 allocs/op",
+                "line_number": 17,
+                "metrics": {
+                  "B/op": 121240.0,
+                  "allocs/op": 132.0,
+                  "ns/op": 84905.0
+                },
+                "workload": "range_256"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/range_256/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/range_256/fresh-4         \t    1000\t     85224 ns/op\t      1512 close-ns/op\t         1.660 close-pct\t      1985 construct-ns/op\t         2.180 construct-pct\t      6321 encode-ns/op\t         6.941 encode-pct\t     73205 execute-ns/op\t        80.38 execute-pct\t     91079 phases-ns/op\t      8055 prepare-ns/op\t         8.845 prepare-pct\t  121240 B/op\t     132 allocs/op",
+                "line_number": 18,
+                "metrics": {
+                  "B/op": 121240.0,
+                  "allocs/op": 132.0,
+                  "ns/op": 85224.0
+                },
+                "workload": "range_256"
+              }
+            ]
+          },
+          "range_32": {
+            "median": {
+              "B/op": 47322.0,
+              "allocs/op": 120.0,
+              "ns/op": 32020.0
+            },
+            "samples": [
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/range_32/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/range_32/fresh-4          \t    1000\t     32020 ns/op\t       940.0 close-ns/op\t         2.863 close-pct\t      2988 construct-ns/op\t         9.099 construct-pct\t      1358 encode-ns/op\t         4.136 encode-pct\t     18409 execute-ns/op\t        56.06 execute-pct\t     32835 phases-ns/op\t      9140 prepare-ns/op\t        27.84 prepare-pct\t   47322 B/op\t     120 allocs/op",
+                "line_number": 10,
+                "metrics": {
+                  "B/op": 47322.0,
+                  "allocs/op": 120.0,
+                  "ns/op": 32020.0
+                },
+                "workload": "range_32"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/range_32/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/range_32/fresh-4          \t    1000\t     32209 ns/op\t       947.0 close-ns/op\t         2.861 close-pct\t      2913 construct-ns/op\t         8.799 construct-pct\t      1425 encode-ns/op\t         4.305 encode-pct\t     18177 execute-ns/op\t        54.91 execute-pct\t     33102 phases-ns/op\t      9641 prepare-ns/op\t        29.12 prepare-pct\t   47322 B/op\t     120 allocs/op",
+                "line_number": 11,
+                "metrics": {
+                  "B/op": 47322.0,
+                  "allocs/op": 120.0,
+                  "ns/op": 32209.0
+                },
+                "workload": "range_32"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/range_32/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/range_32/fresh-4          \t    1000\t     31221 ns/op\t       969.8 close-ns/op\t         3.013 close-pct\t      2559 construct-ns/op\t         7.952 construct-pct\t      1426 encode-ns/op\t         4.432 encode-pct\t     18394 execute-ns/op\t        57.16 execute-pct\t     32180 phases-ns/op\t      8832 prepare-ns/op\t        27.44 prepare-pct\t   47322 B/op\t     120 allocs/op",
+                "line_number": 12,
+                "metrics": {
+                  "B/op": 47322.0,
+                  "allocs/op": 120.0,
+                  "ns/op": 31221.0
+                },
+                "workload": "range_32"
+              }
+            ]
+          },
+          "range_64": {
+            "median": {
+              "B/op": 57496.0,
+              "allocs/op": 124.0,
+              "ns/op": 40111.0
+            },
+            "samples": [
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/range_64/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/range_64/fresh-4          \t    1000\t     40831 ns/op\t      1069 close-ns/op\t         2.514 close-pct\t      2699 construct-ns/op\t         6.351 construct-pct\t      2204 encode-ns/op\t         5.185 encode-pct\t     27287 execute-ns/op\t        64.20 execute-pct\t     42501 phases-ns/op\t      9242 prepare-ns/op\t        21.75 prepare-pct\t   57496 B/op\t     124 allocs/op",
+                "line_number": 13,
+                "metrics": {
+                  "B/op": 57496.0,
+                  "allocs/op": 124.0,
+                  "ns/op": 40831.0
+                },
+                "workload": "range_64"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/range_64/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/range_64/fresh-4          \t    1000\t     40111 ns/op\t      1133 close-ns/op\t         2.726 close-pct\t      2385 construct-ns/op\t         5.738 construct-pct\t      2206 encode-ns/op\t         5.306 encode-pct\t     27132 execute-ns/op\t        65.26 execute-pct\t     41572 phases-ns/op\t      8715 prepare-ns/op\t        20.96 prepare-pct\t   57496 B/op\t     124 allocs/op",
+                "line_number": 14,
+                "metrics": {
+                  "B/op": 57496.0,
+                  "allocs/op": 124.0,
+                  "ns/op": 40111.0
+                },
+                "workload": "range_64"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/range_64/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/range_64/fresh-4          \t    1000\t     39965 ns/op\t      2054 close-ns/op\t         4.938 close-pct\t      2532 construct-ns/op\t         6.088 construct-pct\t      2159 encode-ns/op\t         5.192 encode-pct\t     25887 execute-ns/op\t        62.25 execute-pct\t     41586 phases-ns/op\t      8955 prepare-ns/op\t        21.53 prepare-pct\t   57496 B/op\t     124 allocs/op",
+                "line_number": 15,
+                "metrics": {
+                  "B/op": 57496.0,
+                  "allocs/op": 124.0,
+                  "ns/op": 39965.0
+                },
+                "workload": "range_64"
+              }
+            ]
+          }
+        },
+        "candidate_prepared_reuse": {
+          "point_hit": {
+            "median": {
+              "B/op": 61544.0,
+              "allocs/op": 165.0,
+              "ns/op": 25577.0
+            },
+            "samples": [
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutorPreparedReuse/point_hit/prepared_reuse",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "prepared_reuse",
+                "line": "BenchmarkReplicatedReadExecutorPreparedReuse/point_hit/prepared_reuse-4         \t    1000\t     26849 ns/op\t      9163 reuse-acquire-ns/op\t        33.64 reuse-acquire-pct\t       803.3 reuse-cursor-verify-ns/op\t         2.949 reuse-cursor-verify-pct\t     15213 reuse-execute-ns/op\t        55.85 reuse-execute-pct\t      2062 reuse-finish-ns/op\t         7.569 reuse-finish-pct\t     27241 reuse-phases-ns/op\t   61544 B/op\t     165 allocs/op",
+                "line_number": 19,
+                "metrics": {
+                  "B/op": 61544.0,
+                  "allocs/op": 165.0,
+                  "ns/op": 26849.0
+                },
+                "workload": "point_hit"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutorPreparedReuse/point_hit/prepared_reuse",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "prepared_reuse",
+                "line": "BenchmarkReplicatedReadExecutorPreparedReuse/point_hit/prepared_reuse-4         \t    1000\t     25577 ns/op\t      8964 reuse-acquire-ns/op\t        34.56 reuse-acquire-pct\t       769.1 reuse-cursor-verify-ns/op\t         2.965 reuse-cursor-verify-pct\t     14311 reuse-execute-ns/op\t        55.18 reuse-execute-pct\t      1890 reuse-finish-ns/op\t         7.289 reuse-finish-pct\t     25934 reuse-phases-ns/op\t   61544 B/op\t     165 allocs/op",
+                "line_number": 20,
+                "metrics": {
+                  "B/op": 61544.0,
+                  "allocs/op": 165.0,
+                  "ns/op": 25577.0
+                },
+                "workload": "point_hit"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutorPreparedReuse/point_hit/prepared_reuse",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "prepared_reuse",
+                "line": "BenchmarkReplicatedReadExecutorPreparedReuse/point_hit/prepared_reuse-4         \t    1000\t     25466 ns/op\t      8392 reuse-acquire-ns/op\t        32.60 reuse-acquire-pct\t       710.4 reuse-cursor-verify-ns/op\t         2.760 reuse-cursor-verify-pct\t     14652 reuse-execute-ns/op\t        56.92 reuse-execute-pct\t      1988 reuse-finish-ns/op\t         7.724 reuse-finish-pct\t     25743 reuse-phases-ns/op\t   61544 B/op\t     165 allocs/op",
+                "line_number": 21,
+                "metrics": {
+                  "B/op": 61544.0,
+                  "allocs/op": 165.0,
+                  "ns/op": 25466.0
+                },
+                "workload": "point_hit"
+              }
+            ]
+          },
+          "point_miss": {
+            "median": {
+              "B/op": 12720.0,
+              "allocs/op": 135.0,
+              "ns/op": 15250.0
+            },
+            "samples": [
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutorPreparedReuse/point_miss/prepared_reuse",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "prepared_reuse",
+                "line": "BenchmarkReplicatedReadExecutorPreparedReuse/point_miss/prepared_reuse-4        \t    1000\t     15132 ns/op\t      7816 reuse-acquire-ns/op\t        51.68 reuse-acquire-pct\t       340.3 reuse-cursor-verify-ns/op\t         2.250 reuse-cursor-verify-pct\t      5320 reuse-execute-ns/op\t        35.18 reuse-execute-pct\t      1648 reuse-finish-ns/op\t        10.90 reuse-finish-pct\t     15125 reuse-phases-ns/op\t   12720 B/op\t     135 allocs/op",
+                "line_number": 22,
+                "metrics": {
+                  "B/op": 12720.0,
+                  "allocs/op": 135.0,
+                  "ns/op": 15132.0
+                },
+                "workload": "point_miss"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutorPreparedReuse/point_miss/prepared_reuse",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "prepared_reuse",
+                "line": "BenchmarkReplicatedReadExecutorPreparedReuse/point_miss/prepared_reuse-4        \t    1000\t     15250 ns/op\t      7820 reuse-acquire-ns/op\t        51.33 reuse-acquire-pct\t       327.0 reuse-cursor-verify-ns/op\t         2.147 reuse-cursor-verify-pct\t      5395 reuse-execute-ns/op\t        35.41 reuse-execute-pct\t      1692 reuse-finish-ns/op\t        11.11 reuse-finish-pct\t     15233 reuse-phases-ns/op\t   12720 B/op\t     135 allocs/op",
+                "line_number": 23,
+                "metrics": {
+                  "B/op": 12720.0,
+                  "allocs/op": 135.0,
+                  "ns/op": 15250.0
+                },
+                "workload": "point_miss"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutorPreparedReuse/point_miss/prepared_reuse",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "prepared_reuse",
+                "line": "BenchmarkReplicatedReadExecutorPreparedReuse/point_miss/prepared_reuse-4        \t    1000\t     15299 ns/op\t      7847 reuse-acquire-ns/op\t        51.38 reuse-acquire-pct\t       329.5 reuse-cursor-verify-ns/op\t         2.157 reuse-cursor-verify-pct\t      5344 reuse-execute-ns/op\t        34.99 reuse-execute-pct\t      1754 reuse-finish-ns/op\t        11.48 reuse-finish-pct\t     15275 reuse-phases-ns/op\t   12720 B/op\t     135 allocs/op",
+                "line_number": 24,
+                "metrics": {
+                  "B/op": 12720.0,
+                  "allocs/op": 135.0,
+                  "ns/op": 15299.0
+                },
+                "workload": "point_miss"
+              }
+            ]
+          },
+          "range_256": {
+            "median": {
+              "B/op": 103184.0,
+              "allocs/op": 99.0,
+              "ns/op": 88015.0
+            },
+            "samples": [
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutorPreparedReuse/range_256/prepared_reuse",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "prepared_reuse",
+                "line": "BenchmarkReplicatedReadExecutorPreparedReuse/range_256/prepared_reuse-4         \t    1000\t     88349 ns/op\t      1720 reuse-acquire-ns/op\t         1.830 reuse-acquire-pct\t      6057 reuse-cursor-verify-ns/op\t         6.445 reuse-cursor-verify-pct\t     83944 reuse-execute-ns/op\t        89.33 reuse-execute-pct\t      2254 reuse-finish-ns/op\t         2.398 reuse-finish-pct\t     93975 reuse-phases-ns/op\t  103184 B/op\t      99 allocs/op",
+                "line_number": 31,
+                "metrics": {
+                  "B/op": 103184.0,
+                  "allocs/op": 99.0,
+                  "ns/op": 88349.0
+                },
+                "workload": "range_256"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutorPreparedReuse/range_256/prepared_reuse",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "prepared_reuse",
+                "line": "BenchmarkReplicatedReadExecutorPreparedReuse/range_256/prepared_reuse-4         \t    1000\t     88009 ns/op\t      1742 reuse-acquire-ns/op\t         1.861 reuse-acquire-pct\t      5994 reuse-cursor-verify-ns/op\t         6.404 reuse-cursor-verify-pct\t     83532 reuse-execute-ns/op\t        89.25 reuse-execute-pct\t      2326 reuse-finish-ns/op\t         2.485 reuse-finish-pct\t     93593 reuse-phases-ns/op\t  103184 B/op\t      99 allocs/op",
+                "line_number": 32,
+                "metrics": {
+                  "B/op": 103184.0,
+                  "allocs/op": 99.0,
+                  "ns/op": 88009.0
+                },
+                "workload": "range_256"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutorPreparedReuse/range_256/prepared_reuse",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "prepared_reuse",
+                "line": "BenchmarkReplicatedReadExecutorPreparedReuse/range_256/prepared_reuse-4         \t    1000\t     88015 ns/op\t      1715 reuse-acquire-ns/op\t         1.820 reuse-acquire-pct\t      6643 reuse-cursor-verify-ns/op\t         7.050 reuse-cursor-verify-pct\t     83628 reuse-execute-ns/op\t        88.75 reuse-execute-pct\t      2244 reuse-finish-ns/op\t         2.381 reuse-finish-pct\t     94230 reuse-phases-ns/op\t  103184 B/op\t      99 allocs/op",
+                "line_number": 33,
+                "metrics": {
+                  "B/op": 103184.0,
+                  "allocs/op": 99.0,
+                  "ns/op": 88015.0
+                },
+                "workload": "range_256"
+              }
+            ]
+          },
+          "range_32": {
+            "median": {
+              "B/op": 29266.0,
+              "allocs/op": 87.0,
+              "ns/op": 25648.0
+            },
+            "samples": [
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutorPreparedReuse/range_32/prepared_reuse",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "prepared_reuse",
+                "line": "BenchmarkReplicatedReadExecutorPreparedReuse/range_32/prepared_reuse-4          \t    1000\t     25648 ns/op\t      1860 reuse-acquire-ns/op\t         6.967 reuse-acquire-pct\t      1449 reuse-cursor-verify-ns/op\t         5.427 reuse-cursor-verify-pct\t     21577 reuse-execute-ns/op\t        80.83 reuse-execute-pct\t      1810 reuse-finish-ns/op\t         6.779 reuse-finish-pct\t     26695 reuse-phases-ns/op\t   29266 B/op\t      87 allocs/op",
+                "line_number": 25,
+                "metrics": {
+                  "B/op": 29266.0,
+                  "allocs/op": 87.0,
+                  "ns/op": 25648.0
+                },
+                "workload": "range_32"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutorPreparedReuse/range_32/prepared_reuse",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "prepared_reuse",
+                "line": "BenchmarkReplicatedReadExecutorPreparedReuse/range_32/prepared_reuse-4          \t    1000\t     26259 ns/op\t      1980 reuse-acquire-ns/op\t         7.286 reuse-acquire-pct\t      1309 reuse-cursor-verify-ns/op\t         4.816 reuse-cursor-verify-pct\t     22148 reuse-execute-ns/op\t        81.49 reuse-execute-pct\t      1741 reuse-finish-ns/op\t         6.405 reuse-finish-pct\t     27178 reuse-phases-ns/op\t   29266 B/op\t      87 allocs/op",
+                "line_number": 26,
+                "metrics": {
+                  "B/op": 29266.0,
+                  "allocs/op": 87.0,
+                  "ns/op": 26259.0
+                },
+                "workload": "range_32"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutorPreparedReuse/range_32/prepared_reuse",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "prepared_reuse",
+                "line": "BenchmarkReplicatedReadExecutorPreparedReuse/range_32/prepared_reuse-4          \t    1000\t     25455 ns/op\t      1796 reuse-acquire-ns/op\t         6.794 reuse-acquire-pct\t      1413 reuse-cursor-verify-ns/op\t         5.344 reuse-cursor-verify-pct\t     21464 reuse-execute-ns/op\t        81.19 reuse-execute-pct\t      1764 reuse-finish-ns/op\t         6.674 reuse-finish-pct\t     26438 reuse-phases-ns/op\t   29266 B/op\t      87 allocs/op",
+                "line_number": 27,
+                "metrics": {
+                  "B/op": 29266.0,
+                  "allocs/op": 87.0,
+                  "ns/op": 25455.0
+                },
+                "workload": "range_32"
+              }
+            ]
+          },
+          "range_64": {
+            "median": {
+              "B/op": 39440.0,
+              "allocs/op": 91.0,
+              "ns/op": 35567.0
+            },
+            "samples": [
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutorPreparedReuse/range_64/prepared_reuse",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "prepared_reuse",
+                "line": "BenchmarkReplicatedReadExecutorPreparedReuse/range_64/prepared_reuse-4          \t    1000\t     35567 ns/op\t      1803 reuse-acquire-ns/op\t         4.847 reuse-acquire-pct\t      2057 reuse-cursor-verify-ns/op\t         5.529 reuse-cursor-verify-pct\t     31468 reuse-execute-ns/op\t        84.60 reuse-execute-pct\t      1870 reuse-finish-ns/op\t         5.028 reuse-finish-pct\t     37198 reuse-phases-ns/op\t   39440 B/op\t      91 allocs/op",
+                "line_number": 28,
+                "metrics": {
+                  "B/op": 39440.0,
+                  "allocs/op": 91.0,
+                  "ns/op": 35567.0
+                },
+                "workload": "range_64"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutorPreparedReuse/range_64/prepared_reuse",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "prepared_reuse",
+                "line": "BenchmarkReplicatedReadExecutorPreparedReuse/range_64/prepared_reuse-4          \t    1000\t     35312 ns/op\t      1922 reuse-acquire-ns/op\t         5.200 reuse-acquire-pct\t      2047 reuse-cursor-verify-ns/op\t         5.539 reuse-cursor-verify-pct\t     31195 reuse-execute-ns/op\t        84.41 reuse-execute-pct\t      1794 reuse-finish-ns/op\t         4.853 reuse-finish-pct\t     36957 reuse-phases-ns/op\t   39440 B/op\t      91 allocs/op",
+                "line_number": 29,
+                "metrics": {
+                  "B/op": 39440.0,
+                  "allocs/op": 91.0,
+                  "ns/op": 35312.0
+                },
+                "workload": "range_64"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutorPreparedReuse/range_64/prepared_reuse",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "prepared_reuse",
+                "line": "BenchmarkReplicatedReadExecutorPreparedReuse/range_64/prepared_reuse-4          \t    1000\t     35794 ns/op\t      1966 reuse-acquire-ns/op\t         5.237 reuse-acquire-pct\t      2161 reuse-cursor-verify-ns/op\t         5.756 reuse-cursor-verify-pct\t     31564 reuse-execute-ns/op\t        84.07 reuse-execute-pct\t      1852 reuse-finish-ns/op\t         4.933 reuse-finish-pct\t     37543 reuse-phases-ns/op\t   39440 B/op\t      91 allocs/op",
+                "line_number": 30,
+                "metrics": {
+                  "B/op": 39440.0,
+                  "allocs/op": 91.0,
+                  "ns/op": 35794.0
+                },
+                "workload": "range_64"
+              }
+            ]
+          }
+        }
+      }
+    },
+    "after-2": {
+      "arm": "after",
+      "lanes": {
+        "candidate_fresh": {
+          "point_hit": {
+            "median": {
+              "B/op": 80024.0,
+              "allocs/op": 202.0,
+              "ns/op": 27878.0
+            },
+            "samples": [
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/point_hit/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/point_hit/fresh-4         \t    1000\t     28808 ns/op\t       773.3 close-ns/op\t         2.670 close-pct\t      8997 construct-ns/op\t        31.06 construct-pct\t       647.6 encode-ns/op\t         2.236 encode-pct\t      9147 execute-ns/op\t        31.58 execute-pct\t     28963 phases-ns/op\t      9399 prepare-ns/op\t        32.45 prepare-pct\t   80024 B/op\t     202 allocs/op",
+                "line_number": 4,
+                "metrics": {
+                  "B/op": 80024.0,
+                  "allocs/op": 202.0,
+                  "ns/op": 28808.0
+                },
+                "workload": "point_hit"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/point_hit/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/point_hit/fresh-4         \t    1000\t     27878 ns/op\t       803.3 close-ns/op\t         2.858 close-pct\t      9199 construct-ns/op\t        32.73 construct-pct\t       701.5 encode-ns/op\t         2.496 encode-pct\t      8580 execute-ns/op\t        30.53 execute-pct\t     28106 phases-ns/op\t      8822 prepare-ns/op\t        31.39 prepare-pct\t   80024 B/op\t     202 allocs/op",
+                "line_number": 5,
+                "metrics": {
+                  "B/op": 80024.0,
+                  "allocs/op": 202.0,
+                  "ns/op": 27878.0
+                },
+                "workload": "point_hit"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/point_hit/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/point_hit/fresh-4         \t    1000\t     26853 ns/op\t       710.3 close-ns/op\t         2.624 close-pct\t      9181 construct-ns/op\t        33.92 construct-pct\t       651.1 encode-ns/op\t         2.405 encode-pct\t      8413 execute-ns/op\t        31.08 execute-pct\t     27071 phases-ns/op\t      8115 prepare-ns/op\t        29.98 prepare-pct\t   80024 B/op\t     202 allocs/op",
+                "line_number": 6,
+                "metrics": {
+                  "B/op": 80024.0,
+                  "allocs/op": 202.0,
+                  "ns/op": 26853.0
+                },
+                "workload": "point_hit"
+              }
+            ]
+          },
+          "point_miss": {
+            "median": {
+              "B/op": 31216.0,
+              "allocs/op": 172.0,
+              "ns/op": 21780.0
+            },
+            "samples": [
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/point_miss/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/point_miss/fresh-4        \t    1000\t     21997 ns/op\t       761.6 close-ns/op\t         3.486 close-pct\t      9098 construct-ns/op\t        41.64 construct-pct\t       373.6 encode-ns/op\t         1.710 encode-pct\t      2128 execute-ns/op\t         9.738 execute-pct\t     21851 phases-ns/op\t      9490 prepare-ns/op\t        43.43 prepare-pct\t   31216 B/op\t     172 allocs/op",
+                "line_number": 7,
+                "metrics": {
+                  "B/op": 31216.0,
+                  "allocs/op": 172.0,
+                  "ns/op": 21997.0
+                },
+                "workload": "point_miss"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/point_miss/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/point_miss/fresh-4        \t    1000\t     21780 ns/op\t       712.9 close-ns/op\t         3.288 close-pct\t      9285 construct-ns/op\t        42.83 construct-pct\t       366.8 encode-ns/op\t         1.692 encode-pct\t      2066 execute-ns/op\t         9.530 execute-pct\t     21681 phases-ns/op\t      9250 prepare-ns/op\t        42.66 prepare-pct\t   31216 B/op\t     172 allocs/op",
+                "line_number": 8,
+                "metrics": {
+                  "B/op": 31216.0,
+                  "allocs/op": 172.0,
+                  "ns/op": 21780.0
+                },
+                "workload": "point_miss"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/point_miss/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/point_miss/fresh-4        \t    1000\t     20847 ns/op\t       613.1 close-ns/op\t         2.951 close-pct\t      9030 construct-ns/op\t        43.46 construct-pct\t       351.8 encode-ns/op\t         1.693 encode-pct\t      1884 execute-ns/op\t         9.068 execute-pct\t     20778 phases-ns/op\t      8899 prepare-ns/op\t        42.83 prepare-pct\t   31216 B/op\t     172 allocs/op",
+                "line_number": 9,
+                "metrics": {
+                  "B/op": 31216.0,
+                  "allocs/op": 172.0,
+                  "ns/op": 20847.0
+                },
+                "workload": "point_miss"
+              }
+            ]
+          },
+          "range_256": {
+            "median": {
+              "B/op": 121240.0,
+              "allocs/op": 132.0,
+              "ns/op": 88685.0
+            },
+            "samples": [
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/range_256/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/range_256/fresh-4         \t    1000\t     88685 ns/op\t      1645 close-ns/op\t         1.735 close-pct\t      2389 construct-ns/op\t         2.521 construct-pct\t      6653 encode-ns/op\t         7.020 encode-pct\t     74503 execute-ns/op\t        78.61 execute-pct\t     94782 phases-ns/op\t      9592 prepare-ns/op\t        10.12 prepare-pct\t  121240 B/op\t     132 allocs/op",
+                "line_number": 16,
+                "metrics": {
+                  "B/op": 121240.0,
+                  "allocs/op": 132.0,
+                  "ns/op": 88685.0
+                },
+                "workload": "range_256"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/range_256/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/range_256/fresh-4         \t    1000\t     89363 ns/op\t      1903 close-ns/op\t         1.994 close-pct\t      2374 construct-ns/op\t         2.487 construct-pct\t      6597 encode-ns/op\t         6.912 encode-pct\t     75207 execute-ns/op\t        78.80 execute-pct\t     95444 phases-ns/op\t      9363 prepare-ns/op\t         9.810 prepare-pct\t  121240 B/op\t     132 allocs/op",
+                "line_number": 17,
+                "metrics": {
+                  "B/op": 121240.0,
+                  "allocs/op": 132.0,
+                  "ns/op": 89363.0
+                },
+                "workload": "range_256"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/range_256/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/range_256/fresh-4         \t    1000\t     83466 ns/op\t      1518 close-ns/op\t         1.703 close-pct\t      2191 construct-ns/op\t         2.458 construct-pct\t      6203 encode-ns/op\t         6.957 encode-pct\t     70595 execute-ns/op\t        79.18 execute-pct\t     89153 phases-ns/op\t      8645 prepare-ns/op\t         9.697 prepare-pct\t  121240 B/op\t     132 allocs/op",
+                "line_number": 18,
+                "metrics": {
+                  "B/op": 121240.0,
+                  "allocs/op": 132.0,
+                  "ns/op": 83466.0
+                },
+                "workload": "range_256"
+              }
+            ]
+          },
+          "range_32": {
+            "median": {
+              "B/op": 47322.0,
+              "allocs/op": 120.0,
+              "ns/op": 29834.0
+            },
+            "samples": [
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/range_32/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/range_32/fresh-4          \t    1000\t     29834 ns/op\t       916.7 close-ns/op\t         2.968 close-pct\t      2455 construct-ns/op\t         7.948 construct-pct\t      1510 encode-ns/op\t         4.890 encode-pct\t     17140 execute-ns/op\t        55.50 execute-pct\t     30883 phases-ns/op\t      8861 prepare-ns/op\t        28.69 prepare-pct\t   47322 B/op\t     120 allocs/op",
+                "line_number": 10,
+                "metrics": {
+                  "B/op": 47322.0,
+                  "allocs/op": 120.0,
+                  "ns/op": 29834.0
+                },
+                "workload": "range_32"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/range_32/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/range_32/fresh-4          \t    1000\t     29493 ns/op\t       896.6 close-ns/op\t         2.959 close-pct\t      2949 construct-ns/op\t         9.733 construct-pct\t      1271 encode-ns/op\t         4.194 encode-pct\t     16578 execute-ns/op\t        54.71 execute-pct\t     30301 phases-ns/op\t      8606 prepare-ns/op\t        28.40 prepare-pct\t   47322 B/op\t     120 allocs/op",
+                "line_number": 11,
+                "metrics": {
+                  "B/op": 47322.0,
+                  "allocs/op": 120.0,
+                  "ns/op": 29493.0
+                },
+                "workload": "range_32"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/range_32/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/range_32/fresh-4          \t    1000\t     31486 ns/op\t       967.8 close-ns/op\t         2.987 close-pct\t      2790 construct-ns/op\t         8.612 construct-pct\t      1419 encode-ns/op\t         4.379 encode-pct\t     18013 execute-ns/op\t        55.60 execute-pct\t     32399 phases-ns/op\t      9209 prepare-ns/op\t        28.42 prepare-pct\t   47322 B/op\t     120 allocs/op",
+                "line_number": 12,
+                "metrics": {
+                  "B/op": 47322.0,
+                  "allocs/op": 120.0,
+                  "ns/op": 31486.0
+                },
+                "workload": "range_32"
+              }
+            ]
+          },
+          "range_64": {
+            "median": {
+              "B/op": 57496.0,
+              "allocs/op": 124.0,
+              "ns/op": 40244.0
+            },
+            "samples": [
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/range_64/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/range_64/fresh-4          \t    1000\t     40244 ns/op\t      1133 close-ns/op\t         2.708 close-pct\t      2642 construct-ns/op\t         6.315 construct-pct\t      2129 encode-ns/op\t         5.089 encode-pct\t     26553 execute-ns/op\t        63.48 execute-pct\t     41832 phases-ns/op\t      9375 prepare-ns/op\t        22.41 prepare-pct\t   57496 B/op\t     124 allocs/op",
+                "line_number": 13,
+                "metrics": {
+                  "B/op": 57496.0,
+                  "allocs/op": 124.0,
+                  "ns/op": 40244.0
+                },
+                "workload": "range_64"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/range_64/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/range_64/fresh-4          \t    1000\t     48441 ns/op\t      1352 close-ns/op\t         2.688 close-pct\t      3273 construct-ns/op\t         6.509 construct-pct\t      2540 encode-ns/op\t         5.052 encode-pct\t     30830 execute-ns/op\t        61.31 execute-pct\t     50283 phases-ns/op\t     12288 prepare-ns/op\t        24.44 prepare-pct\t   57496 B/op\t     124 allocs/op",
+                "line_number": 14,
+                "metrics": {
+                  "B/op": 57496.0,
+                  "allocs/op": 124.0,
+                  "ns/op": 48441.0
+                },
+                "workload": "range_64"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/range_64/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/range_64/fresh-4          \t    1000\t     39189 ns/op\t      1119 close-ns/op\t         2.743 close-pct\t      2566 construct-ns/op\t         6.293 construct-pct\t      2130 encode-ns/op\t         5.223 encode-pct\t     25994 execute-ns/op\t        63.74 execute-pct\t     40781 phases-ns/op\t      8972 prepare-ns/op\t        22.00 prepare-pct\t   57496 B/op\t     124 allocs/op",
+                "line_number": 15,
+                "metrics": {
+                  "B/op": 57496.0,
+                  "allocs/op": 124.0,
+                  "ns/op": 39189.0
+                },
+                "workload": "range_64"
+              }
+            ]
+          }
+        },
+        "candidate_prepared_reuse": {
+          "point_hit": {
+            "median": {
+              "B/op": 61544.0,
+              "allocs/op": 165.0,
+              "ns/op": 25428.0
+            },
+            "samples": [
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutorPreparedReuse/point_hit/prepared_reuse",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "prepared_reuse",
+                "line": "BenchmarkReplicatedReadExecutorPreparedReuse/point_hit/prepared_reuse-4         \t    1000\t     25428 ns/op\t      8554 reuse-acquire-ns/op\t        33.16 reuse-acquire-pct\t       776.3 reuse-cursor-verify-ns/op\t         3.009 reuse-cursor-verify-pct\t     14593 reuse-execute-ns/op\t        56.57 reuse-execute-pct\t      1872 reuse-finish-ns/op\t         7.257 reuse-finish-pct\t     25795 reuse-phases-ns/op\t   61544 B/op\t     165 allocs/op",
+                "line_number": 19,
+                "metrics": {
+                  "B/op": 61544.0,
+                  "allocs/op": 165.0,
+                  "ns/op": 25428.0
+                },
+                "workload": "point_hit"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutorPreparedReuse/point_hit/prepared_reuse",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "prepared_reuse",
+                "line": "BenchmarkReplicatedReadExecutorPreparedReuse/point_hit/prepared_reuse-4         \t    1000\t     26440 ns/op\t      9402 reuse-acquire-ns/op\t        35.05 reuse-acquire-pct\t       855.7 reuse-cursor-verify-ns/op\t         3.190 reuse-cursor-verify-pct\t     14483 reuse-execute-ns/op\t        54.00 reuse-execute-pct\t      2081 reuse-finish-ns/op\t         7.759 reuse-finish-pct\t     26821 reuse-phases-ns/op\t   61544 B/op\t     165 allocs/op",
+                "line_number": 20,
+                "metrics": {
+                  "B/op": 61544.0,
+                  "allocs/op": 165.0,
+                  "ns/op": 26440.0
+                },
+                "workload": "point_hit"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutorPreparedReuse/point_hit/prepared_reuse",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "prepared_reuse",
+                "line": "BenchmarkReplicatedReadExecutorPreparedReuse/point_hit/prepared_reuse-4         \t    1000\t     24637 ns/op\t      8582 reuse-acquire-ns/op\t        34.39 reuse-acquire-pct\t       710.3 reuse-cursor-verify-ns/op\t         2.846 reuse-cursor-verify-pct\t     13911 reuse-execute-ns/op\t        55.74 reuse-execute-pct\t      1754 reuse-finish-ns/op\t         7.028 reuse-finish-pct\t     24958 reuse-phases-ns/op\t   61544 B/op\t     165 allocs/op",
+                "line_number": 21,
+                "metrics": {
+                  "B/op": 61544.0,
+                  "allocs/op": 165.0,
+                  "ns/op": 24637.0
+                },
+                "workload": "point_hit"
+              }
+            ]
+          },
+          "point_miss": {
+            "median": {
+              "B/op": 12720.0,
+              "allocs/op": 135.0,
+              "ns/op": 15594.0
+            },
+            "samples": [
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutorPreparedReuse/point_miss/prepared_reuse",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "prepared_reuse",
+                "line": "BenchmarkReplicatedReadExecutorPreparedReuse/point_miss/prepared_reuse-4        \t    1000\t     14704 ns/op\t      7385 reuse-acquire-ns/op\t        50.28 reuse-acquire-pct\t       349.1 reuse-cursor-verify-ns/op\t         2.377 reuse-cursor-verify-pct\t      5341 reuse-execute-ns/op\t        36.37 reuse-execute-pct\t      1611 reuse-finish-ns/op\t        10.97 reuse-finish-pct\t     14687 reuse-phases-ns/op\t   12720 B/op\t     135 allocs/op",
+                "line_number": 22,
+                "metrics": {
+                  "B/op": 12720.0,
+                  "allocs/op": 135.0,
+                  "ns/op": 14704.0
+                },
+                "workload": "point_miss"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutorPreparedReuse/point_miss/prepared_reuse",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "prepared_reuse",
+                "line": "BenchmarkReplicatedReadExecutorPreparedReuse/point_miss/prepared_reuse-4        \t    1000\t     16154 ns/op\t      8153 reuse-acquire-ns/op\t        50.58 reuse-acquire-pct\t       375.5 reuse-cursor-verify-ns/op\t         2.329 reuse-cursor-verify-pct\t      5918 reuse-execute-ns/op\t        36.72 reuse-execute-pct\t      1673 reuse-finish-ns/op\t        10.38 reuse-finish-pct\t     16120 reuse-phases-ns/op\t   12720 B/op\t     135 allocs/op",
+                "line_number": 23,
+                "metrics": {
+                  "B/op": 12720.0,
+                  "allocs/op": 135.0,
+                  "ns/op": 16154.0
+                },
+                "workload": "point_miss"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutorPreparedReuse/point_miss/prepared_reuse",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "prepared_reuse",
+                "line": "BenchmarkReplicatedReadExecutorPreparedReuse/point_miss/prepared_reuse-4        \t    1000\t     15594 ns/op\t      7835 reuse-acquire-ns/op\t        50.31 reuse-acquire-pct\t       394.0 reuse-cursor-verify-ns/op\t         2.530 reuse-cursor-verify-pct\t      5677 reuse-execute-ns/op\t        36.45 reuse-execute-pct\t      1668 reuse-finish-ns/op\t        10.71 reuse-finish-pct\t     15574 reuse-phases-ns/op\t   12720 B/op\t     135 allocs/op",
+                "line_number": 24,
+                "metrics": {
+                  "B/op": 12720.0,
+                  "allocs/op": 135.0,
+                  "ns/op": 15594.0
+                },
+                "workload": "point_miss"
+              }
+            ]
+          },
+          "range_256": {
+            "median": {
+              "B/op": 103184.0,
+              "allocs/op": 99.0,
+              "ns/op": 109621.0
+            },
+            "samples": [
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutorPreparedReuse/range_256/prepared_reuse",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "prepared_reuse",
+                "line": "BenchmarkReplicatedReadExecutorPreparedReuse/range_256/prepared_reuse-4         \t    1000\t    109621 ns/op\t      3988 reuse-acquire-ns/op\t         3.422 reuse-acquire-pct\t      7881 reuse-cursor-verify-ns/op\t         6.761 reuse-cursor-verify-pct\t     99878 reuse-execute-ns/op\t        85.69 reuse-execute-pct\t      4816 reuse-finish-ns/op\t         4.131 reuse-finish-pct\t    116563 reuse-phases-ns/op\t  103184 B/op\t      99 allocs/op",
+                "line_number": 31,
+                "metrics": {
+                  "B/op": 103184.0,
+                  "allocs/op": 99.0,
+                  "ns/op": 109621.0
+                },
+                "workload": "range_256"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutorPreparedReuse/range_256/prepared_reuse",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "prepared_reuse",
+                "line": "BenchmarkReplicatedReadExecutorPreparedReuse/range_256/prepared_reuse-4         \t    1000\t    114914 ns/op\t      4523 reuse-acquire-ns/op\t         3.721 reuse-acquire-pct\t      7584 reuse-cursor-verify-ns/op\t         6.238 reuse-cursor-verify-pct\t    104540 reuse-execute-ns/op\t        85.99 reuse-execute-pct\t      4919 reuse-finish-ns/op\t         4.046 reuse-finish-pct\t    121565 reuse-phases-ns/op\t  103184 B/op\t      99 allocs/op",
+                "line_number": 32,
+                "metrics": {
+                  "B/op": 103184.0,
+                  "allocs/op": 99.0,
+                  "ns/op": 114914.0
+                },
+                "workload": "range_256"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutorPreparedReuse/range_256/prepared_reuse",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "prepared_reuse",
+                "line": "BenchmarkReplicatedReadExecutorPreparedReuse/range_256/prepared_reuse-4         \t    1000\t    107049 ns/op\t      3862 reuse-acquire-ns/op\t         3.392 reuse-acquire-pct\t      7577 reuse-cursor-verify-ns/op\t         6.656 reuse-cursor-verify-pct\t     97720 reuse-execute-ns/op\t        85.84 reuse-execute-pct\t      4677 reuse-finish-ns/op\t         4.109 reuse-finish-pct\t    113836 reuse-phases-ns/op\t  103184 B/op\t      99 allocs/op",
+                "line_number": 33,
+                "metrics": {
+                  "B/op": 103184.0,
+                  "allocs/op": 99.0,
+                  "ns/op": 107049.0
+                },
+                "workload": "range_256"
+              }
+            ]
+          },
+          "range_32": {
+            "median": {
+              "B/op": 29266.0,
+              "allocs/op": 87.0,
+              "ns/op": 34444.0
+            },
+            "samples": [
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutorPreparedReuse/range_32/prepared_reuse",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "prepared_reuse",
+                "line": "BenchmarkReplicatedReadExecutorPreparedReuse/range_32/prepared_reuse-4          \t    1000\t     29234 ns/op\t      2378 reuse-acquire-ns/op\t         7.883 reuse-acquire-pct\t      1379 reuse-cursor-verify-ns/op\t         4.572 reuse-cursor-verify-pct\t     24480 reuse-execute-ns/op\t        81.15 reuse-execute-pct\t      1931 reuse-finish-ns/op\t         6.400 reuse-finish-pct\t     30168 reuse-phases-ns/op\t   29266 B/op\t      87 allocs/op",
+                "line_number": 25,
+                "metrics": {
+                  "B/op": 29266.0,
+                  "allocs/op": 87.0,
+                  "ns/op": 29234.0
+                },
+                "workload": "range_32"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutorPreparedReuse/range_32/prepared_reuse",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "prepared_reuse",
+                "line": "BenchmarkReplicatedReadExecutorPreparedReuse/range_32/prepared_reuse-4          \t    1000\t     34444 ns/op\t      2920 reuse-acquire-ns/op\t         8.224 reuse-acquire-pct\t      1683 reuse-cursor-verify-ns/op\t         4.739 reuse-cursor-verify-pct\t     28285 reuse-execute-ns/op\t        79.66 reuse-execute-pct\t      2619 reuse-finish-ns/op\t         7.376 reuse-finish-pct\t     35507 reuse-phases-ns/op\t   29266 B/op\t      87 allocs/op",
+                "line_number": 26,
+                "metrics": {
+                  "B/op": 29266.0,
+                  "allocs/op": 87.0,
+                  "ns/op": 34444.0
+                },
+                "workload": "range_32"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutorPreparedReuse/range_32/prepared_reuse",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "prepared_reuse",
+                "line": "BenchmarkReplicatedReadExecutorPreparedReuse/range_32/prepared_reuse-4          \t    1000\t     42848 ns/op\t      4117 reuse-acquire-ns/op\t         9.332 reuse-acquire-pct\t      2067 reuse-cursor-verify-ns/op\t         4.686 reuse-cursor-verify-pct\t     34209 reuse-execute-ns/op\t        77.55 reuse-execute-pct\t      3719 reuse-finish-ns/op\t         8.431 reuse-finish-pct\t     44112 reuse-phases-ns/op\t   29266 B/op\t      87 allocs/op",
+                "line_number": 27,
+                "metrics": {
+                  "B/op": 29266.0,
+                  "allocs/op": 87.0,
+                  "ns/op": 42848.0
+                },
+                "workload": "range_32"
+              }
+            ]
+          },
+          "range_64": {
+            "median": {
+              "B/op": 39440.0,
+              "allocs/op": 91.0,
+              "ns/op": 51594.0
+            },
+            "samples": [
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutorPreparedReuse/range_64/prepared_reuse",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "prepared_reuse",
+                "line": "BenchmarkReplicatedReadExecutorPreparedReuse/range_64/prepared_reuse-4          \t    1000\t     51594 ns/op\t      4067 reuse-acquire-ns/op\t         7.606 reuse-acquire-pct\t      2646 reuse-cursor-verify-ns/op\t         4.949 reuse-cursor-verify-pct\t     43343 reuse-execute-ns/op\t        81.06 reuse-execute-pct\t      3415 reuse-finish-ns/op\t         6.387 reuse-finish-pct\t     53472 reuse-phases-ns/op\t   39440 B/op\t      91 allocs/op",
+                "line_number": 28,
+                "metrics": {
+                  "B/op": 39440.0,
+                  "allocs/op": 91.0,
+                  "ns/op": 51594.0
+                },
+                "workload": "range_64"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutorPreparedReuse/range_64/prepared_reuse",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "prepared_reuse",
+                "line": "BenchmarkReplicatedReadExecutorPreparedReuse/range_64/prepared_reuse-4          \t    1000\t     49712 ns/op\t      3712 reuse-acquire-ns/op\t         7.185 reuse-acquire-pct\t      2762 reuse-cursor-verify-ns/op\t         5.345 reuse-cursor-verify-pct\t     41641 reuse-execute-ns/op\t        80.60 reuse-execute-pct\t      3547 reuse-finish-ns/op\t         6.866 reuse-finish-pct\t     51662 reuse-phases-ns/op\t   39440 B/op\t      91 allocs/op",
+                "line_number": 29,
+                "metrics": {
+                  "B/op": 39440.0,
+                  "allocs/op": 91.0,
+                  "ns/op": 49712.0
+                },
+                "workload": "range_64"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutorPreparedReuse/range_64/prepared_reuse",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "prepared_reuse",
+                "line": "BenchmarkReplicatedReadExecutorPreparedReuse/range_64/prepared_reuse-4          \t    1000\t     52733 ns/op\t      4050 reuse-acquire-ns/op\t         7.405 reuse-acquire-pct\t      2727 reuse-cursor-verify-ns/op\t         4.986 reuse-cursor-verify-pct\t     44377 reuse-execute-ns/op\t        81.14 reuse-execute-pct\t      3539 reuse-finish-ns/op\t         6.471 reuse-finish-pct\t     54693 reuse-phases-ns/op\t   39440 B/op\t      91 allocs/op",
+                "line_number": 30,
+                "metrics": {
+                  "B/op": 39440.0,
+                  "allocs/op": 91.0,
+                  "ns/op": 52733.0
+                },
+                "workload": "range_64"
+              }
+            ]
+          }
+        }
+      }
+    },
+    "before-1": {
+      "arm": "before",
+      "lanes": {
+        "baseline_fresh": {
+          "point_hit": {
+            "median": {
+              "B/op": 79992.0,
+              "allocs/op": 202.0,
+              "ns/op": 57680.0
+            },
+            "samples": [
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/point_hit/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/point_hit/fresh-4         \t    1000\t     53110 ns/op\t      1008 close-ns/op\t         1.887 close-pct\t     16961 construct-ns/op\t        31.75 construct-pct\t       904.0 encode-ns/op\t         1.692 encode-pct\t     14736 execute-ns/op\t        27.58 execute-pct\t     53423 phases-ns/op\t     19814 prepare-ns/op\t        37.09 prepare-pct\t   79992 B/op\t     202 allocs/op",
+                "line_number": 4,
+                "metrics": {
+                  "B/op": 79992.0,
+                  "allocs/op": 202.0,
+                  "ns/op": 53110.0
+                },
+                "workload": "point_hit"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/point_hit/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/point_hit/fresh-4         \t    1000\t     57680 ns/op\t      1994 close-ns/op\t         3.402 close-pct\t     16993 construct-ns/op\t        29.00 construct-pct\t      2025 encode-ns/op\t         3.456 encode-pct\t     17679 execute-ns/op\t        30.17 execute-pct\t     58596 phases-ns/op\t     19906 prepare-ns/op\t        33.97 prepare-pct\t   79992 B/op\t     202 allocs/op",
+                "line_number": 5,
+                "metrics": {
+                  "B/op": 79992.0,
+                  "allocs/op": 202.0,
+                  "ns/op": 57680.0
+                },
+                "workload": "point_hit"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/point_hit/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/point_hit/fresh-4         \t    1000\t     58783 ns/op\t      2191 close-ns/op\t         3.696 close-pct\t     17893 construct-ns/op\t        30.18 construct-pct\t      1577 encode-ns/op\t         2.660 encode-pct\t     17909 execute-ns/op\t        30.20 execute-pct\t     59293 phases-ns/op\t     19723 prepare-ns/op\t        33.26 prepare-pct\t   79992 B/op\t     202 allocs/op",
+                "line_number": 6,
+                "metrics": {
+                  "B/op": 79992.0,
+                  "allocs/op": 202.0,
+                  "ns/op": 58783.0
+                },
+                "workload": "point_hit"
+              }
+            ]
+          },
+          "point_miss": {
+            "median": {
+              "B/op": 31184.0,
+              "allocs/op": 172.0,
+              "ns/op": 26561.0
+            },
+            "samples": [
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/point_miss/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/point_miss/fresh-4        \t    1000\t     26955 ns/op\t       976.0 close-ns/op\t         3.635 close-pct\t     10882 construct-ns/op\t        40.53 construct-pct\t       507.6 encode-ns/op\t         1.890 encode-pct\t      2405 execute-ns/op\t         8.959 execute-pct\t     26848 phases-ns/op\t     12077 prepare-ns/op\t        44.98 prepare-pct\t   31184 B/op\t     172 allocs/op",
+                "line_number": 7,
+                "metrics": {
+                  "B/op": 31184.0,
+                  "allocs/op": 172.0,
+                  "ns/op": 26955.0
+                },
+                "workload": "point_miss"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/point_miss/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/point_miss/fresh-4        \t    1000\t     22830 ns/op\t       722.7 close-ns/op\t         3.177 close-pct\t      9391 construct-ns/op\t        41.29 construct-pct\t       409.5 encode-ns/op\t         1.800 encode-pct\t      2070 execute-ns/op\t         9.099 execute-pct\t     22747 phases-ns/op\t     10154 prepare-ns/op\t        44.64 prepare-pct\t   31184 B/op\t     172 allocs/op",
+                "line_number": 8,
+                "metrics": {
+                  "B/op": 31184.0,
+                  "allocs/op": 172.0,
+                  "ns/op": 22830.0
+                },
+                "workload": "point_miss"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/point_miss/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/point_miss/fresh-4        \t    1000\t     26561 ns/op\t       761.9 close-ns/op\t         2.882 close-pct\t     11019 construct-ns/op\t        41.68 construct-pct\t       440.2 encode-ns/op\t         1.665 encode-pct\t      2226 execute-ns/op\t         8.420 execute-pct\t     26437 phases-ns/op\t     11990 prepare-ns/op\t        45.35 prepare-pct\t   31184 B/op\t     172 allocs/op",
+                "line_number": 9,
+                "metrics": {
+                  "B/op": 31184.0,
+                  "allocs/op": 172.0,
+                  "ns/op": 26561.0
+                },
+                "workload": "point_miss"
+              }
+            ]
+          },
+          "range_256": {
+            "median": {
+              "B/op": 121208.0,
+              "allocs/op": 132.0,
+              "ns/op": 109377.0
+            },
+            "samples": [
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/range_256/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/range_256/fresh-4         \t    1000\t    109377 ns/op\t      2618 close-ns/op\t         2.225 close-pct\t      4060 construct-ns/op\t         3.450 construct-pct\t      9237 encode-ns/op\t         7.848 encode-pct\t     85216 execute-ns/op\t        72.41 execute-pct\t    117686 phases-ns/op\t     16556 prepare-ns/op\t        14.07 prepare-pct\t  121208 B/op\t     132 allocs/op",
+                "line_number": 16,
+                "metrics": {
+                  "B/op": 121208.0,
+                  "allocs/op": 132.0,
+                  "ns/op": 109377.0
+                },
+                "workload": "range_256"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/range_256/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/range_256/fresh-4         \t    1000\t    122169 ns/op\t      2883 close-ns/op\t         2.234 close-pct\t      5101 construct-ns/op\t         3.952 construct-pct\t      7970 encode-ns/op\t         6.176 encode-pct\t     91376 execute-ns/op\t        70.80 execute-pct\t    129056 phases-ns/op\t     21726 prepare-ns/op\t        16.83 prepare-pct\t  121208 B/op\t     132 allocs/op",
+                "line_number": 17,
+                "metrics": {
+                  "B/op": 121208.0,
+                  "allocs/op": 132.0,
+                  "ns/op": 122169.0
+                },
+                "workload": "range_256"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/range_256/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/range_256/fresh-4         \t    1000\t    102456 ns/op\t      2143 close-ns/op\t         1.967 close-pct\t      3156 construct-ns/op\t         2.897 construct-pct\t      7345 encode-ns/op\t         6.743 encode-pct\t     82863 execute-ns/op\t        76.06 execute-pct\t    108939 phases-ns/op\t     13432 prepare-ns/op\t        12.33 prepare-pct\t  121208 B/op\t     132 allocs/op",
+                "line_number": 18,
+                "metrics": {
+                  "B/op": 121208.0,
+                  "allocs/op": 132.0,
+                  "ns/op": 102456.0
+                },
+                "workload": "range_256"
+              }
+            ]
+          },
+          "range_32": {
+            "median": {
+              "B/op": 47290.0,
+              "allocs/op": 120.0,
+              "ns/op": 32340.0
+            },
+            "samples": [
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/range_32/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/range_32/fresh-4          \t    1000\t     30939 ns/op\t       933.9 close-ns/op\t         2.935 close-pct\t      2950 construct-ns/op\t         9.271 construct-pct\t      1366 encode-ns/op\t         4.293 encode-pct\t     17355 execute-ns/op\t        54.54 execute-pct\t     31822 phases-ns/op\t      9217 prepare-ns/op\t        28.96 prepare-pct\t   47290 B/op\t     120 allocs/op",
+                "line_number": 10,
+                "metrics": {
+                  "B/op": 47290.0,
+                  "allocs/op": 120.0,
+                  "ns/op": 30939.0
+                },
+                "workload": "range_32"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/range_32/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/range_32/fresh-4          \t    1000\t     32340 ns/op\t       979.8 close-ns/op\t         2.960 close-pct\t      2962 construct-ns/op\t         8.949 construct-pct\t      1447 encode-ns/op\t         4.373 encode-pct\t     18086 execute-ns/op\t        54.64 execute-pct\t     33101 phases-ns/op\t      9625 prepare-ns/op\t        29.08 prepare-pct\t   47290 B/op\t     120 allocs/op",
+                "line_number": 11,
+                "metrics": {
+                  "B/op": 47290.0,
+                  "allocs/op": 120.0,
+                  "ns/op": 32340.0
+                },
+                "workload": "range_32"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/range_32/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/range_32/fresh-4          \t    1000\t     33310 ns/op\t      1082 close-ns/op\t         3.159 close-pct\t      3351 construct-ns/op\t         9.787 construct-pct\t      1519 encode-ns/op\t         4.438 encode-pct\t     18080 execute-ns/op\t        52.81 execute-pct\t     34235 phases-ns/op\t     10204 prepare-ns/op\t        29.81 prepare-pct\t   47290 B/op\t     120 allocs/op",
+                "line_number": 12,
+                "metrics": {
+                  "B/op": 47290.0,
+                  "allocs/op": 120.0,
+                  "ns/op": 33310.0
+                },
+                "workload": "range_32"
+              }
+            ]
+          },
+          "range_64": {
+            "median": {
+              "B/op": 57464.0,
+              "allocs/op": 124.0,
+              "ns/op": 50954.0
+            },
+            "samples": [
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/range_64/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/range_64/fresh-4          \t    1000\t     48477 ns/op\t      1673 close-ns/op\t         3.332 close-pct\t      3733 construct-ns/op\t         7.435 construct-pct\t      2532 encode-ns/op\t         5.043 encode-pct\t     29614 execute-ns/op\t        58.99 execute-pct\t     50205 phases-ns/op\t     12654 prepare-ns/op\t        25.20 prepare-pct\t   57464 B/op\t     124 allocs/op",
+                "line_number": 13,
+                "metrics": {
+                  "B/op": 57464.0,
+                  "allocs/op": 124.0,
+                  "ns/op": 48477.0
+                },
+                "workload": "range_64"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/range_64/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/range_64/fresh-4          \t    1000\t     55192 ns/op\t      1410 close-ns/op\t         2.633 close-pct\t      3547 construct-ns/op\t         6.623 construct-pct\t      2297 encode-ns/op\t         4.289 encode-pct\t     29839 execute-ns/op\t        55.72 execute-pct\t     53554 phases-ns/op\t     16462 prepare-ns/op\t        30.74 prepare-pct\t   57464 B/op\t     124 allocs/op",
+                "line_number": 14,
+                "metrics": {
+                  "B/op": 57464.0,
+                  "allocs/op": 124.0,
+                  "ns/op": 55192.0
+                },
+                "workload": "range_64"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/range_64/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/range_64/fresh-4          \t    1000\t     50954 ns/op\t      1743 close-ns/op\t         3.315 close-pct\t      3503 construct-ns/op\t         6.662 construct-pct\t      2571 encode-ns/op\t         4.889 encode-pct\t     31263 execute-ns/op\t        59.45 execute-pct\t     52587 phases-ns/op\t     13507 prepare-ns/op\t        25.68 prepare-pct\t   57464 B/op\t     124 allocs/op",
+                "line_number": 15,
+                "metrics": {
+                  "B/op": 57464.0,
+                  "allocs/op": 124.0,
+                  "ns/op": 50954.0
+                },
+                "workload": "range_64"
+              }
+            ]
+          }
+        }
+      }
+    },
+    "before-2": {
+      "arm": "before",
+      "lanes": {
+        "baseline_fresh": {
+          "point_hit": {
+            "median": {
+              "B/op": 79992.0,
+              "allocs/op": 202.0,
+              "ns/op": 24771.0
+            },
+            "samples": [
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/point_hit/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/point_hit/fresh-4         \t    1000\t     28903 ns/op\t       796.9 close-ns/op\t         2.743 close-pct\t      9646 construct-ns/op\t        33.20 construct-pct\t       631.5 encode-ns/op\t         2.174 encode-pct\t      8713 execute-ns/op\t        29.99 execute-pct\t     29050 phases-ns/op\t      9263 prepare-ns/op\t        31.89 prepare-pct\t   79992 B/op\t     202 allocs/op",
+                "line_number": 4,
+                "metrics": {
+                  "B/op": 79992.0,
+                  "allocs/op": 202.0,
+                  "ns/op": 28903.0
+                },
+                "workload": "point_hit"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/point_hit/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/point_hit/fresh-4         \t    1000\t     24771 ns/op\t       687.7 close-ns/op\t         2.758 close-pct\t      8329 construct-ns/op\t        33.41 construct-pct\t       573.9 encode-ns/op\t         2.302 encode-pct\t      7563 execute-ns/op\t        30.34 execute-pct\t     24931 phases-ns/op\t      7778 prepare-ns/op\t        31.20 prepare-pct\t   79992 B/op\t     202 allocs/op",
+                "line_number": 5,
+                "metrics": {
+                  "B/op": 79992.0,
+                  "allocs/op": 202.0,
+                  "ns/op": 24771.0
+                },
+                "workload": "point_hit"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/point_hit/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/point_hit/fresh-4         \t    1000\t     23766 ns/op\t       649.1 close-ns/op\t         2.716 close-pct\t      7778 construct-ns/op\t        32.55 construct-pct\t       514.7 encode-ns/op\t         2.154 encode-pct\t      7670 execute-ns/op\t        32.09 execute-pct\t     23899 phases-ns/op\t      7287 prepare-ns/op\t        30.49 prepare-pct\t   79992 B/op\t     202 allocs/op",
+                "line_number": 6,
+                "metrics": {
+                  "B/op": 79992.0,
+                  "allocs/op": 202.0,
+                  "ns/op": 23766.0
+                },
+                "workload": "point_hit"
+              }
+            ]
+          },
+          "point_miss": {
+            "median": {
+              "B/op": 31184.0,
+              "allocs/op": 172.0,
+              "ns/op": 19533.0
+            },
+            "samples": [
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/point_miss/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/point_miss/fresh-4        \t    1000\t     18866 ns/op\t       593.3 close-ns/op\t         3.152 close-pct\t      8020 construct-ns/op\t        42.60 construct-pct\t       322.6 encode-ns/op\t         1.714 encode-pct\t      1803 execute-ns/op\t         9.578 execute-pct\t     18825 phases-ns/op\t      8087 prepare-ns/op\t        42.96 prepare-pct\t   31184 B/op\t     172 allocs/op",
+                "line_number": 7,
+                "metrics": {
+                  "B/op": 31184.0,
+                  "allocs/op": 172.0,
+                  "ns/op": 18866.0
+                },
+                "workload": "point_miss"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/point_miss/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/point_miss/fresh-4        \t    1000\t     20594 ns/op\t       690.0 close-ns/op\t         3.364 close-pct\t      8669 construct-ns/op\t        42.26 construct-pct\t       338.8 encode-ns/op\t         1.652 encode-pct\t      1953 execute-ns/op\t         9.518 execute-pct\t     20513 phases-ns/op\t      8863 prepare-ns/op\t        43.21 prepare-pct\t   31184 B/op\t     172 allocs/op",
+                "line_number": 8,
+                "metrics": {
+                  "B/op": 31184.0,
+                  "allocs/op": 172.0,
+                  "ns/op": 20594.0
+                },
+                "workload": "point_miss"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/point_miss/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/point_miss/fresh-4        \t    1000\t     19533 ns/op\t       562.7 close-ns/op\t         2.888 close-pct\t      8437 construct-ns/op\t        43.30 construct-pct\t       323.6 encode-ns/op\t         1.661 encode-pct\t      1918 execute-ns/op\t         9.841 execute-pct\t     19487 phases-ns/op\t      8246 prepare-ns/op\t        42.31 prepare-pct\t   31184 B/op\t     172 allocs/op",
+                "line_number": 9,
+                "metrics": {
+                  "B/op": 31184.0,
+                  "allocs/op": 172.0,
+                  "ns/op": 19533.0
+                },
+                "workload": "point_miss"
+              }
+            ]
+          },
+          "range_256": {
+            "median": {
+              "B/op": 121208.0,
+              "allocs/op": 132.0,
+              "ns/op": 81377.0
+            },
+            "samples": [
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/range_256/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/range_256/fresh-4         \t    1000\t     80577 ns/op\t      1452 close-ns/op\t         1.684 close-pct\t      1977 construct-ns/op\t         2.292 construct-pct\t      6171 encode-ns/op\t         7.155 encode-pct\t     68548 execute-ns/op\t        79.48 execute-pct\t     86247 phases-ns/op\t      8099 prepare-ns/op\t         9.391 prepare-pct\t  121208 B/op\t     132 allocs/op",
+                "line_number": 16,
+                "metrics": {
+                  "B/op": 121208.0,
+                  "allocs/op": 132.0,
+                  "ns/op": 80577.0
+                },
+                "workload": "range_256"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/range_256/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/range_256/fresh-4         \t    1000\t     85581 ns/op\t      1378 close-ns/op\t         1.504 close-pct\t      2093 construct-ns/op\t         2.284 construct-pct\t      6552 encode-ns/op\t         7.148 encode-pct\t     73313 execute-ns/op\t        79.98 execute-pct\t     91661 phases-ns/op\t      8324 prepare-ns/op\t         9.081 prepare-pct\t  121208 B/op\t     132 allocs/op",
+                "line_number": 17,
+                "metrics": {
+                  "B/op": 121208.0,
+                  "allocs/op": 132.0,
+                  "ns/op": 85581.0
+                },
+                "workload": "range_256"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/range_256/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/range_256/fresh-4         \t    1000\t     81377 ns/op\t      1339 close-ns/op\t         1.533 close-pct\t      1907 construct-ns/op\t         2.183 construct-pct\t      6414 encode-ns/op\t         7.342 encode-pct\t     70167 execute-ns/op\t        80.32 execute-pct\t     87356 phases-ns/op\t      7529 prepare-ns/op\t         8.618 prepare-pct\t  121208 B/op\t     132 allocs/op",
+                "line_number": 18,
+                "metrics": {
+                  "B/op": 121208.0,
+                  "allocs/op": 132.0,
+                  "ns/op": 81377.0
+                },
+                "workload": "range_256"
+              }
+            ]
+          },
+          "range_32": {
+            "median": {
+              "B/op": 47290.0,
+              "allocs/op": 120.0,
+              "ns/op": 26452.0
+            },
+            "samples": [
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/range_32/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/range_32/fresh-4          \t    1000\t     26452 ns/op\t       756.7 close-ns/op\t         2.772 close-pct\t      2180 construct-ns/op\t         7.989 construct-pct\t      1230 encode-ns/op\t         4.506 encode-pct\t     15750 execute-ns/op\t        57.70 execute-pct\t     27294 phases-ns/op\t      7378 prepare-ns/op\t        27.03 prepare-pct\t   47290 B/op\t     120 allocs/op",
+                "line_number": 10,
+                "metrics": {
+                  "B/op": 47290.0,
+                  "allocs/op": 120.0,
+                  "ns/op": 26452.0
+                },
+                "workload": "range_32"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/range_32/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/range_32/fresh-4          \t    1000\t     27276 ns/op\t       840.8 close-ns/op\t         2.990 close-pct\t      2250 construct-ns/op\t         8.001 construct-pct\t      1294 encode-ns/op\t         4.600 encode-pct\t     15896 execute-ns/op\t        56.52 execute-pct\t     28124 phases-ns/op\t      7843 prepare-ns/op\t        27.89 prepare-pct\t   47290 B/op\t     120 allocs/op",
+                "line_number": 11,
+                "metrics": {
+                  "B/op": 47290.0,
+                  "allocs/op": 120.0,
+                  "ns/op": 27276.0
+                },
+                "workload": "range_32"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/range_32/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/range_32/fresh-4          \t    1000\t     25580 ns/op\t       780.0 close-ns/op\t         2.954 close-pct\t      1955 construct-ns/op\t         7.403 construct-pct\t      1219 encode-ns/op\t         4.617 encode-pct\t     15202 execute-ns/op\t        57.58 execute-pct\t     26404 phases-ns/op\t      7248 prepare-ns/op\t        27.45 prepare-pct\t   47290 B/op\t     120 allocs/op",
+                "line_number": 12,
+                "metrics": {
+                  "B/op": 47290.0,
+                  "allocs/op": 120.0,
+                  "ns/op": 25580.0
+                },
+                "workload": "range_32"
+              }
+            ]
+          },
+          "range_64": {
+            "median": {
+              "B/op": 57464.0,
+              "allocs/op": 124.0,
+              "ns/op": 36694.0
+            },
+            "samples": [
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/range_64/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/range_64/fresh-4          \t    1000\t     37271 ns/op\t      1055 close-ns/op\t         2.724 close-pct\t      2402 construct-ns/op\t         6.203 construct-pct\t      1980 encode-ns/op\t         5.113 encode-pct\t     24652 execute-ns/op\t        63.67 execute-pct\t     38717 phases-ns/op\t      8629 prepare-ns/op\t        22.29 prepare-pct\t   57464 B/op\t     124 allocs/op",
+                "line_number": 13,
+                "metrics": {
+                  "B/op": 57464.0,
+                  "allocs/op": 124.0,
+                  "ns/op": 37271.0
+                },
+                "workload": "range_64"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/range_64/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/range_64/fresh-4          \t    1000\t     36694 ns/op\t      1047 close-ns/op\t         2.741 close-pct\t      2333 construct-ns/op\t         6.108 construct-pct\t      2013 encode-ns/op\t         5.269 encode-pct\t     24315 execute-ns/op\t        63.66 execute-pct\t     38194 phases-ns/op\t      8487 prepare-ns/op\t        22.22 prepare-pct\t   57464 B/op\t     124 allocs/op",
+                "line_number": 14,
+                "metrics": {
+                  "B/op": 57464.0,
+                  "allocs/op": 124.0,
+                  "ns/op": 36694.0
+                },
+                "workload": "range_64"
+              },
+              {
+                "benchmark": "BenchmarkReplicatedReadExecutor/range_64/fresh",
+                "cpu": 4,
+                "iterations": 1000,
+                "lane": "fresh",
+                "line": "BenchmarkReplicatedReadExecutor/range_64/fresh-4          \t    1000\t     35355 ns/op\t       887.3 close-ns/op\t         2.403 close-pct\t      2174 construct-ns/op\t         5.887 construct-pct\t      2004 encode-ns/op\t         5.427 encode-pct\t     24352 execute-ns/op\t        65.95 execute-pct\t     36924 phases-ns/op\t      7507 prepare-ns/op\t        20.33 prepare-pct\t   57464 B/op\t     124 allocs/op",
+                "line_number": 15,
+                "metrics": {
+                  "B/op": 57464.0,
+                  "allocs/op": 124.0,
+                  "ns/op": 35355.0
+                },
+                "workload": "range_64"
+              }
+            ]
+          }
+        }
+      }
+    }
+  },
+  "schema": "vibedb.replicated_read_reuse_summary.v1",
+  "scope": "Local sql/driver benchmark micromeasurement only; not CRDB, RF3, or end-to-end SQL latency.",
+  "source_files": [
+    {
+      "bytes": 6060,
+      "path": "before-1.log",
+      "sha256": "2a8c011f1714d7e71ea4d58c6d8cf3710c4ac39d9d9cd7fb680bed579b4f3cff"
+    },
+    {
+      "bytes": 12603,
+      "path": "after-1.log",
+      "sha256": "b4382802a730547ad047948b4b86bf357f0b23117ad56e800877c77e1c08ddcc"
+    },
+    {
+      "bytes": 12602,
+      "path": "after-2.log",
+      "sha256": "05f99ecb063dcaec36df1b3c8cf9f8c5c81710b220d04d84dab233c4d1a45241"
+    },
+    {
+      "bytes": 6077,
+      "path": "before-2.log",
+      "sha256": "fc9e15ca457863b3831b29b735fea38beab69cfa17043718c17e8dc4cb85a867"
+    }
+  ],
+  "workloads": [
+    "point_hit",
+    "point_miss",
+    "range_32",
+    "range_64",
+    "range_256"
+  ]
+}
