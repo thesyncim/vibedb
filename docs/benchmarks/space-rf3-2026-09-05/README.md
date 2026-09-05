@@ -2,6 +2,15 @@
 
 ## Follow-up qualification
 
+The nine-pair `3548ad29` experiment saved 48.5% of allocated node-log space,
+but write p99 estimates remained higher: paired ratios were 1.016 for inserts
+and 1.034 for updates, with wide confidence intervals spanning 1. The raw
+baseline checkpoint indexes show every node already advancing its application
+checkpoint. The extra due-checkpoint scheduling change is therefore removed
+from the final candidate to keep checkpoint scheduling identical to main.
+That narrower candidate is being requalified; no absence-of-slowdown claim is
+made from this experiment.
+
 The resumed work is based on `b2f716ec`. A three-process pilot with the default
 32-MiB segments, two persistent authenticated clients, 4,096 writes of 64 KiB,
 and 2,048 linearizable full-value reads passed recovery but reclaimed no
