@@ -454,6 +454,9 @@ func (s *stmt) queryRowsCandidates(
 			default:
 				s.conn.fileRange.Bind(bounds.lower, bounds.upper, bounds.lowerExclusive)
 				s.conn.fileRange.BindPrimaryOrder(s.primaryRange.path)
+				if s.primaryRange.coversPredicate {
+					s.conn.fileRange.BindPrimaryPredicate(s.primaryRange.path)
+				}
 				source = query.FromFileRange(state.snapshot, &s.conn.fileRange)
 			}
 		} else {
@@ -567,7 +570,9 @@ func (s *stmt) queryRowsCandidates(
 			} else if t.collection == nil {
 				source = query.FromSnapshot(store.Snapshot{})
 			} else {
-				source, err = s.conn.pointCollectionSource(ctx, t.collection, keys)
+				source, err = s.conn.pointCollectionSource(
+					ctx, t.collection, keys, s.views == nil && !s.query.RequiresCatalog(),
+				)
 				if !candidateRead && errors.Is(err, errPointMaterializationTooLarge) {
 					snapshot, err = t.collection.Snapshot()
 					if err == nil {
@@ -601,6 +606,9 @@ func (s *stmt) queryRowsCandidates(
 						bounds.lower, bounds.upper, bounds.lowerExclusive,
 					)
 					s.conn.fileRange.BindPrimaryOrder(s.primaryRange.path)
+					if s.primaryRange.coversPredicate {
+						s.conn.fileRange.BindPrimaryPredicate(s.primaryRange.path)
+					}
 					source = query.FromFileRange(snapshot, &s.conn.fileRange)
 				}
 			}
@@ -948,6 +956,7 @@ func (c *conn) pointCollectionSource(
 	ctx context.Context,
 	collection *durable.Collection,
 	keys []string,
+	validatedRaw bool,
 ) (query.Source, error) {
 	c.pointDocs.Reset()
 	limit, err := driverQueryMemory(c.exec.Options)
@@ -956,6 +965,25 @@ func (c *conn) pointCollectionSource(
 	}
 	budget := pointMaterializationBudget{limit: limit}
 	document := c.pointRaw[:0]
+	if validatedRaw && len(keys) == 1 {
+		if err := contextCheckpoint(ctx); err != nil {
+			return query.Source{}, err
+		}
+		var found bool
+		document, found, err = collection.AppendRaw(document, byteview.Bytes(keys[0]))
+		c.pointRaw = document
+		if err != nil {
+			return query.Source{}, err
+		}
+		if !found {
+			return query.FromSnapshot(store.Snapshot{}), nil
+		}
+		if err := budget.add(keys[0], document); err != nil {
+			return query.Source{}, err
+		}
+		c.pointSource.Bind(document)
+		return query.FromValidatedRaw(&c.pointSource), nil
+	}
 	for _, key := range keys {
 		if err := contextCheckpoint(ctx); err != nil {
 			c.pointRaw = document

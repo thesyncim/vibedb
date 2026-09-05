@@ -78,6 +78,17 @@ func (e *Executor) route(snap *Snapshot, q *Query, bound *BoundPlan, p Profile) 
 }
 
 func (e *Executor) routeContext(ctx context.Context, snap *Snapshot, q *Query, bound *BoundPlan, p Profile) (*plan, error) {
+	return e.routeContextCached(ctx, snap, q, bound, p, nil)
+}
+
+func (e *Executor) routeContextCached(
+	ctx context.Context,
+	snap *Snapshot,
+	q *Query,
+	bound *BoundPlan,
+	p Profile,
+	cache *preparedQueryExecution,
+) (*plan, error) {
 	if bound == nil || bound.generation != snap.Generation() || bound.manifest == nil {
 		return nil, &CatalogError{Reason: "distributed plan does not belong to the pinned catalog generation"}
 	}
@@ -128,9 +139,23 @@ func (e *Executor) routeContext(ctx context.Context, snap *Snapshot, q *Query, b
 		}
 	}
 
-	physical, planning, err := optimizeDistributedPlan(ctx, snap, bound, route, p)
-	if err != nil {
-		return nil, err
+	var physical *queryplanner.Plan
+	var planning queryplanner.OptimizerStatistics
+	cacheable := cache != nil && len(bound.aggregates) == 0 && len(bound.groupKeys) == 0
+	if cacheable && cache.generation == snap.Generation() && cache.physical != nil &&
+		cache.routeKind == route.Kind && cache.targets == len(route.Targets) {
+		physical, planning = cache.physical, cache.planning
+	} else {
+		physical, planning, err = optimizeDistributedPlan(ctx, snap, bound, route, p)
+		if err != nil {
+			return nil, err
+		}
+		if cacheable {
+			cache.routeKind = route.Kind
+			cache.targets = len(route.Targets)
+			cache.physical = physical
+			cache.planning = planning
+		}
 	}
 	return &plan{
 		kind:         route.Kind,

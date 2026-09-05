@@ -15,8 +15,9 @@ import (
 // Node.Get semantics: names match by decoded content and duplicate keys
 // resolve to the last occurrence.
 type compiledPath struct {
-	single bool   // a single top-level object field
-	name   string // the field name when single
+	single   bool   // a single top-level object field
+	topLevel bool   // either spelling names exactly one unescaped object field
+	name     string // the field name when single or topLevel
 	// spec is the front-end spelling this path was compiled from. It is kept
 	// here so pathRegistry can dedupe by it without a second slice running
 	// alongside the paths: the pointer spelling is not the spec (a dotted path
@@ -48,7 +49,11 @@ func compilePath(spec string) (compiledPath, error) {
 		if err != nil {
 			return compiledPath{}, err
 		}
-		return compiledPath{spec: spec, pointer: pointer, join: joinPathOuter}, nil
+		name, topLevel := rawTopLevelPointerName(spec)
+		return compiledPath{
+			topLevel: topLevel, name: name, spec: spec,
+			pointer: pointer, join: joinPathOuter,
+		}, nil
 	}
 	if strings.IndexByte(spec, '.') < 0 {
 		pointer, err := vibejson.CompilePointer("/" + escapePointerSegment(spec))
@@ -56,12 +61,13 @@ func compilePath(spec string) (compiledPath, error) {
 			return compiledPath{}, err
 		}
 		return compiledPath{
-			single:  true,
-			name:    spec,
-			spec:    spec,
-			key:     vibejson.CompileKey(spec),
-			pointer: pointer,
-			join:    joinPathOuter,
+			single:   true,
+			topLevel: true,
+			name:     spec,
+			spec:     spec,
+			key:      vibejson.CompileKey(spec),
+			pointer:  pointer,
+			join:     joinPathOuter,
 		}, nil
 	}
 	pointer, err := vibejson.CompilePointer(pointerFromDotted(spec))
@@ -69,6 +75,18 @@ func compilePath(spec string) (compiledPath, error) {
 		return compiledPath{}, err
 	}
 	return compiledPath{spec: spec, pointer: pointer, join: joinPathOuter}, nil
+}
+
+func rawTopLevelPointerName(spec string) (string, bool) {
+	if len(spec) < 2 || spec[0] != '/' {
+		return "", false
+	}
+	for i := 1; i < len(spec); i++ {
+		if spec[i] == '/' || spec[i] == '~' {
+			return "", false
+		}
+	}
+	return spec[1:], true
 }
 
 func (p compiledPath) pointerForStore() vibejson.CompiledPointer { return p.pointer }

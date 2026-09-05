@@ -1771,7 +1771,7 @@ func (c *Cursor) nextWithCancel(cancel *CancelFlag) (bool, error) {
 		if err := cancellationCheckpoint(cancel, row); err != nil {
 			return false, err
 		}
-		if !c.st.having.keep(c.res, row) {
+		if c.st != nil && !c.st.having.keep(c.res, row) {
 			continue
 		}
 		if c.skip > 0 {
@@ -1791,7 +1791,9 @@ func (c *Cursor) nextWithCancel(cancel *CancelFlag) (bool, error) {
 // Cell returns the value of output column col in the current row. Calling it
 // before the first Next, or after Next reported false, returns a null cell.
 func (c *Cursor) Cell(col int) Cell {
-	if c.cur < 0 || c.res == nil || col < 0 || col >= c.st.outputs {
+	if c.cur < 0 || c.res == nil || col < 0 ||
+		(c.st != nil && col >= c.st.outputs) ||
+		(c.st == nil && col >= len(c.res.Columns)) {
 		return nullCell()
 	}
 	return c.res.Columns[col].Cells[c.cur]
