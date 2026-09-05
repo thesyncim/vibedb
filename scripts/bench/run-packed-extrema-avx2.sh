@@ -146,7 +146,8 @@ validate_benchmark_output() {
 run_benchmark() {
   local round=$1
   local mode=$2
-  local output=${raw_directory}/round-$(printf '%02d' "${round}")-${mode}.txt
+  local output
+  output=${raw_directory}/round-$(printf '%02d' "${round}")-${mode}.txt
   local debug=''
   if [[ ${mode} == disabled ]]; then
     debug='cpu.avx2=off'
