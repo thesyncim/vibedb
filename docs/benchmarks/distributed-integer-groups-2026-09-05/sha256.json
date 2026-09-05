@@ -1,0 +1,20 @@
+{
+  "archive-omissions.json": {
+    "bytes": 16886,
+    "sha256": "1a589fdd64d9ddff247be7634922448d2e820f46aa70217973da95962189f85f"
+  },
+  "archives": {
+    "profile-diagnostic.tar.gz": {
+      "bytes": 28453256,
+      "sha256": "3d762ff2e62754f8141f4361cffc908aa10b8e0419d0c20c86a5068f0f86de5c"
+    },
+    "raw-trials.tar.gz": {
+      "bytes": 23331847,
+      "sha256": "2a07c0558bbdc783b6475b3ab68519e3411e2a0f5350f0633fcd7bd27f81691f"
+    },
+    "validation-logs.tar.gz": {
+      "bytes": 8116,
+      "sha256": "f7fc2dd02dd11d23dbcc061b3e14a42c2eb69361680f577e09858495d6974f3d"
+    }
+  }
+}
