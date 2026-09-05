@@ -1,7 +1,8 @@
 # SQL workload compatibility tracker
 
 This audit compares the Chat product and its shared database layer in the local
-`chat` repository with VibeDB main at `9454ced0` (2026-09-05). **The application
+`chat` repository with VibeDB main at `9454ced0` (2026-09-05). The implementation
+batch is rebased onto main at `8e4e60f6`. **The application
 cannot yet run unchanged on VibeDB.** This change implements the conditional
 expressions, Boolean tests, explicit null ordering, INSERT NULL literals, and
 single-column primary conflict targets, and computed sort keys described below. The remaining reduced
