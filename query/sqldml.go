@@ -1040,14 +1040,16 @@ func (d *DMLStatement) EvaluateUpdateExpressions(
 }
 
 // EvaluateConflictUpdateExpressions filters the row through the conflict WHERE
-// condition, then runs every computed conflict SET
-// right-hand side over one current document and its effective EXCLUDED
+// condition, then runs every computed conflict SET right-hand side over
+// one current document and its effective EXCLUDED
 // candidate. Both namespaces are projected together, so every assignment sees
 // the same two pre-update rows and cannot observe an earlier assignment.
 //
 // The returned cursor and its cells borrow e and remain valid only until e is
-// used again. Callers must consume exactly one row before the next evaluation.
-// maxDocumentBytes bounds each input before the retained envelope is grown.
+// used again. A false or unknown condition returns zero rows. A true condition
+// returns the computed assignments, or one private unit column when every SET
+// value uses direct materialization. ConflictUpdateExpressionCount excludes that
+// unit column. maxDocumentBytes bounds each input before envelope growth.
 func (d *DMLStatement) EvaluateConflictUpdateExpressions(
 	e *Exec,
 	current []byte,
