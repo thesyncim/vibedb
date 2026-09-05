@@ -697,7 +697,10 @@ func TestCompactPrefixIntOverflowDeclinesWithoutChangingValues(t *testing.T) {
 			t.Errorf("accepted overflowing numeric spelling %q", raw)
 		}
 	}
-	for _, raw := range []string{"9223372036854775807", `"ticket:00000000000000000000"`} {
+	for _, raw := range []string{
+		"9223372036854775807", "999999999999999999",
+		`"ticket:00000000000000000000"`,
+	} {
 		if _, ok := parseCompactPrefixInt([]byte(raw)); !ok {
 			t.Errorf("rejected bounded numeric spelling %q", raw)
 		}

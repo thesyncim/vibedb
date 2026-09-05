@@ -31,42 +31,41 @@ func (v *compactStreamView) matchesShapeRows(shapeRows, leafRows int) bool {
 // view is borrowed for one synchronous patch/build call; it is never retained
 // by compactStreamScratch between columns.
 type compactRankContext struct {
-	view     *CompactPrimaryStripeView
-	shape    int
-	storage  []uint16
-	ranks    []uint16
-	resolved bool
+	shape     int
+	shapeRows int
+	storage   []uint16
+	ranks     []uint16
+	resolved  bool
 }
 
-func (c *compactRankContext) resolve() []uint16 {
+func (c *compactRankContext) resolve(v *CompactPrimaryStripeView) {
 	if c == nil {
-		return nil
+		return
 	}
 	if c.resolved {
-		return c.ranks
+		return
 	}
 	c.resolved = true
-	if c.view == nil || c.shape < 0 || c.shape >= c.view.shapeCount {
-		return nil
+	if v == nil || c.shape < 0 || c.shape >= v.shapeCount {
+		return
 	}
-	entry, ok := c.view.shapeEntry(c.shape)
-	if !ok || entry.rows < 0 || entry.rows > c.view.rows {
-		return nil
+	entry, ok := v.shapeEntry(c.shape)
+	if !ok || entry.rows != c.shapeRows || entry.rows < 0 || entry.rows > v.rows {
+		return
 	}
 	ranks := c.storage[:0]
 	if cap(ranks) < entry.rows {
 		ranks = slices.Grow(ranks, entry.rows)[:0]
 	}
-	for rank := 0; rank < c.view.rows; rank++ {
-		if c.view.rowShape(rank) == c.shape {
+	for rank := 0; rank < v.rows; rank++ {
+		if v.rowShape(rank) == c.shape {
 			ranks = append(ranks, uint16(rank))
 		}
 	}
 	if len(ranks) != entry.rows {
-		return nil
+		return
 	}
 	c.ranks = ranks
-	return ranks
 }
 
 // necessaryRankFit checks exact endpoint/interior witnesses before the full
@@ -74,25 +73,26 @@ func (c *compactRankContext) resolve() []uint16 {
 // these witnesses, so a late mismatch or random column declines without the
 // O(leafRows) map build. Full validation still runs after resolve succeeds.
 func (c *compactRankContext) necessaryRankFit(
+	v *CompactPrimaryStripeView,
 	parsed []uint64,
 	first compactPrefixIntValue,
 	fixedWidth bool,
 	leafRows int,
 ) bool {
-	if c == nil || c.view == nil || len(parsed) < 3 ||
-		len(parsed) > CompactPrimaryStripeMaxRows || leafRows != c.view.rows ||
+	if c == nil || v == nil || len(parsed) < 3 ||
+		len(parsed) > CompactPrimaryStripeMaxRows || leafRows != v.rows ||
 		leafRows <= len(parsed) {
 		return false
 	}
-	entry, ok := c.view.shapeEntry(c.shape)
-	if !ok || entry.rows != len(parsed) || entry.rows < compactStreamRestart ||
-		entry.rows >= c.view.rows {
+	entry, ok := v.shapeEntry(c.shape)
+	if !ok || entry.rows != c.shapeRows || entry.rows != len(parsed) ||
+		entry.rows < compactStreamRestart || entry.rows >= v.rows {
 		return false
 	}
-	firstRank, firstOK := c.view.shapeRank(c.shape, 0)
-	secondRank, secondOK := c.view.shapeRank(c.shape, 1)
-	thirdRank, thirdOK := c.view.shapeRank(c.shape, 2)
-	lastRank, lastOK := c.view.shapeRank(c.shape, len(parsed)-1)
+	firstRank, firstOK := v.shapeRank(c.shape, 0)
+	secondRank, secondOK := v.shapeRank(c.shape, 1)
+	thirdRank, thirdOK := v.shapeRank(c.shape, 2)
+	lastRank, lastOK := v.shapeRank(c.shape, len(parsed)-1)
 	if !firstOK || !secondOK || !thirdOK || !lastOK ||
 		secondRank <= firstRank || thirdRank <= secondRank || lastRank <= thirdRank {
 		return false
@@ -404,6 +404,7 @@ func (s *compactStreamScratch) encodeRankAffineParsed(
 	ranks []uint16,
 	leafRows int,
 	rankContext *compactRankContext,
+	rankView *CompactPrimaryStripeView,
 ) (compactStreamEncoding, bool) {
 	// Signed canonical numbers retain the existing signed integer codecs. A
 	// shared minus affix is not the bare numeric certificate used below.
@@ -420,10 +421,11 @@ func (s *compactStreamScratch) encodeRankAffineParsed(
 	// for noncanonical or affixed spellings before resolving physical ranks.
 	fixedWidth = fixedWidth && !(allCanonical && len(first.prefix) == 0 && len(first.suffix) == 0)
 	if len(ranks) == 0 && rankContext != nil {
-		if !rankContext.necessaryRankFit(parsed, first, fixedWidth, leafRows) {
+		if !rankContext.necessaryRankFit(rankView, parsed, first, fixedWidth, leafRows) {
 			return compactStreamEncoding{}, false
 		}
-		ranks = rankContext.resolve()
+		rankContext.resolve(rankView)
+		ranks = rankContext.ranks
 	}
 	if len(ranks) != len(parsed) {
 		return compactStreamEncoding{}, false

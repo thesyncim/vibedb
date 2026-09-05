@@ -919,14 +919,15 @@ func (v *CompactPrimaryStripeView) PatchCompactPrimaryStripeReplacements(
 			(oldStream.kind == compactStreamRankAffine || rankCandidateEligible)
 		if rankContextNeeded {
 			rankContext = compactRankContext{
-				view: v, shape: shape, storage: shapeRanks,
+				shape: shape, shapeRows: entry.rows, storage: shapeRanks,
 			}
 			if rankShape == shape {
 				rankContext.ranks = shapeRanks
 				rankContext.resolved = true
 			}
 			if oldStream.kind == compactStreamRankAffine && !rankContext.resolved {
-				ranks = rankContext.resolve()
+				rankContext.resolve(v)
+				ranks = rankContext.ranks
 				if len(ranks) != entry.rows {
 					return nil, false, corrupt("group rank map")
 				}
@@ -975,7 +976,7 @@ func (v *CompactPrimaryStripeView) PatchCompactPrimaryStripeReplacements(
 			rankContextPtr = &rankContext
 		}
 		encoded := patch.stream.encodeShapeWithRankContext(
-			patch.patchValues, ranks, v.rows, rankContextPtr,
+			patch.patchValues, ranks, v.rows, rankContextPtr, v,
 		)
 		if rankCandidateEligible && len(rankContext.ranks) != 0 {
 			shapeRanks = rankContext.ranks

@@ -51,20 +51,21 @@ type compactStreamSequentialState struct {
 // bounded random-rank decoding. The on-disk representation and point-read
 // restart bound are unchanged.
 type CompactPrimaryScanDecoder struct {
-	bucket     BucketID
-	generation uint64
-	lastRow    int
-	prepared   bool
-	supported  bool
-	shapes     [compactPrimaryScanShapes]compactPrimaryScanShape
-	streamView [compactPrimaryScanStreams]compactStreamView
-	streamPlan [compactPrimaryScanStreams]compactPrimaryScanStream
-	streams    [compactPrimaryScanStreams]compactStreamSequentialState
-	dictionary [compactPrimaryScanDictionaryBounds]uint16
-	fragments  [compactPrimaryScanDictionaryFragmentBytes]byte
-	key        compactStreamView
-	keyState   compactStreamSequentialState
-	keyPrior   [CommonPrimaryLeafMaxKeyBytes]byte
+	bucket        BucketID
+	generation    uint64
+	lastRow       int
+	prepared      bool
+	supported     bool
+	hasRankAffine bool
+	shapes        [compactPrimaryScanShapes]compactPrimaryScanShape
+	streamView    [compactPrimaryScanStreams]compactStreamView
+	streamPlan    [compactPrimaryScanStreams]compactPrimaryScanStream
+	streams       [compactPrimaryScanStreams]compactStreamSequentialState
+	dictionary    [compactPrimaryScanDictionaryBounds]uint16
+	fragments     [compactPrimaryScanDictionaryFragmentBytes]byte
+	key           compactStreamView
+	keyState      compactStreamSequentialState
+	keyPrior      [CommonPrimaryLeafMaxKeyBytes]byte
 }
 
 func (d *CompactPrimaryScanDecoder) prepare(
@@ -82,6 +83,7 @@ func (d *CompactPrimaryScanDecoder) prepare(
 	d.lastRow = -1
 	d.prepared = true
 	d.supported = false
+	d.hasRankAffine = false
 	d.key = v.key
 	d.keyState = compactStreamSequentialState{}
 	if v.shapeCount > len(d.shapes) {
@@ -112,6 +114,9 @@ func (d *CompactPrimaryScanDecoder) prepare(
 			stream, admitted := admittedCompactStream(streamRaw)
 			if !admitted || !stream.matchesShapeRows(entry.rows, v.rows) {
 				return
+			}
+			if stream.kind == compactStreamRankAffine {
+				d.hasRankAffine = true
 			}
 			d.streamView[streamCount+hole] = stream
 			prefixStart := uint32(0)
@@ -215,13 +220,40 @@ func (s *compactStreamSequentialState) appendArithmeticPrefixKey(
 	first := int64(binary.LittleEndian.Uint64(v.data[2:]))
 	delta := int64(binary.LittleEndian.Uint64(v.data[10:]))
 	value := first + int64(row)*delta
-	out, ok := appendCompactPrefixUint(dst, v, value)
-	if !ok {
+	if value < 0 {
 		return dst, false
 	}
 	s.value = value
 	s.next++
-	return out, true
+	prefixValue, _ := v.dictionaryEntry(0)
+	suffixValue, _ := v.dictionaryEntry(1)
+	dst = append(dst, prefixValue...)
+	digits := len(dst)
+	width := int(v.data[1])
+	if v.data[0]&1 != 0 && width == 8 && value < 100_000_000 {
+		dst = appendFixedUint8(dst, uint32(value))
+	} else if value < 1_000_000 {
+		dst = appendCanonicalUint6(dst, uint64(value))
+	} else {
+		dst = strconv.AppendUint(dst, uint64(value), 10)
+	}
+	if v.data[0]&1 != 0 && width != 8 {
+		n := len(dst) - digits
+		if n > width {
+			return dst, false
+		}
+		if n < width {
+			gap := width - n
+			for range gap {
+				dst = append(dst, 0)
+			}
+			copy(dst[digits+gap:], dst[digits:digits+n])
+			for at := digits; at < digits+gap; at++ {
+				dst[at] = '0'
+			}
+		}
+	}
+	return append(dst, suffixValue...), true
 }
 
 func (d *CompactPrimaryScanDecoder) appendValue(
@@ -252,6 +284,32 @@ func (d *CompactPrimaryScanDecoder) appendValue(
 		return dst, false
 	}
 	start := len(dst)
+	if !d.hasRankAffine {
+		previous := uint32(0)
+		for hole := 0; hole < int(meta.holes); hole++ {
+			end := meta.ends[hole]
+			streamAt := int(meta.first) + hole
+			stream := &d.streamView[streamAt]
+			var ok bool
+			plan := d.streamPlan[streamAt]
+			if plan.dictionaryCount != 0 {
+				dst, ok = d.appendDictionaryFragment(dst, streamAt, ordinal)
+			} else {
+				dst = append(dst, meta.static[previous:end]...)
+				state := &d.streams[streamAt]
+				if ordinal != state.next {
+					state.seek(stream, ordinal)
+				}
+				dst, ok = state.appendValue(dst, stream, ordinal)
+			}
+			previous = end
+			if !ok {
+				return dst[:start], false
+			}
+		}
+		end := meta.ends[meta.holes]
+		return append(dst, meta.static[previous:end]...), true
+	}
 	previous := uint32(0)
 	for hole := 0; hole < int(meta.holes); hole++ {
 		end := meta.ends[hole]
@@ -264,11 +322,14 @@ func (d *CompactPrimaryScanDecoder) appendValue(
 		} else {
 			dst = append(dst, meta.static[previous:end]...)
 			state := &d.streams[streamAt]
-			coordinate := stream.shapeCoordinate(row, ordinal)
-			if stream.kind != compactStreamRankAffine && coordinate != state.next {
-				state.seek(stream, coordinate)
+			if stream.kind == compactStreamRankAffine {
+				dst, ok = state.appendRankAffine(dst, stream, row)
+			} else {
+				if ordinal != state.next {
+					state.seek(stream, ordinal)
+				}
+				dst, ok = state.appendValue(dst, stream, ordinal)
 			}
-			dst, ok = state.appendValue(dst, stream, coordinate)
 		}
 		previous = end
 		if !ok {
@@ -524,8 +585,6 @@ func (s *compactStreamSequentialState) appendValue(
 		s.next++
 		base := int32(binary.LittleEndian.Uint32(v.data))
 		return appendCompactDate(dst, base+int32(offset)), true
-	case compactStreamRankAffine:
-		return s.appendRankAffine(dst, v, row)
 	case compactStreamDelta:
 	case compactStreamDeltaPack:
 	case compactStreamPrefixInt:
@@ -577,7 +636,36 @@ func (s *compactStreamSequentialState) appendValue(
 	if v.kind == compactStreamDelta || v.kind == compactStreamDeltaPack {
 		return AppendCanonicalInt(dst, s.value), true
 	}
-	return appendCompactPrefixUint(dst, v, s.value)
+	if s.value < 0 {
+		return dst, false
+	}
+	prefixValue, _ := v.dictionaryEntry(0)
+	suffixValue, _ := v.dictionaryEntry(1)
+	dst = append(dst, prefixValue...)
+	digits := len(dst)
+	if s.value < 1_000_000 {
+		dst = appendCanonicalUint6(dst, uint64(s.value))
+	} else {
+		dst = strconv.AppendUint(dst, uint64(s.value), 10)
+	}
+	if v.data[0]&1 != 0 {
+		width := int(v.data[1])
+		n := len(dst) - digits
+		if n > width {
+			return dst, false
+		}
+		if n < width {
+			gap := width - n
+			for range gap {
+				dst = append(dst, 0)
+			}
+			copy(dst[digits+gap:], dst[digits:digits+n])
+			for at := digits; at < digits+gap; at++ {
+				dst[at] = '0'
+			}
+		}
+	}
+	return append(dst, suffixValue...), true
 }
 
 // appendRankAffine evaluates the admitted physical-rank arithmetic directly.
@@ -597,32 +685,19 @@ func (s *compactStreamSequentialState) appendRankAffine(
 	base := int64(binary.LittleEndian.Uint64(v.data[2:]))
 	step := int64(binary.LittleEndian.Uint64(v.data[10:]))
 	value := base + step*int64(row)
-	out, ok := appendCompactPrefixUint(dst, v, value)
-	if !ok {
-		return dst, false
-	}
-	s.value = value
-	// Physical ranks contain shape gaps, so this stream cannot use the
-	// ordinal-style next-row synchronization. Retain the last rank only for
-	// diagnostics; every admitted rank is independently arithmetic.
-	s.next = row + 1
-	return out, true
-}
-
-// appendCompactPrefixUint renders an admitted nonnegative prefix-integer
-// spelling. The small-value path is intentionally shared by sequential
-// prefix and rank-affine scans; strconv remains only for larger values.
-func appendCompactPrefixUint(dst []byte, v *compactStreamView, value int64) ([]byte, bool) {
 	if value < 0 {
 		return dst, false
 	}
-	start := len(dst)
-	prefix, prefixOK := v.dictionaryEntry(0)
-	suffix, suffixOK := v.dictionaryEntry(1)
+	// Physical ranks contain shape gaps, so this stream cannot use the
+	// ordinal-style next-row synchronization. Retain the last rank only for
+	// diagnostics; every admitted rank is independently arithmetic.
+	prefixValue, prefixOK := v.dictionaryEntry(0)
+	suffixValue, suffixOK := v.dictionaryEntry(1)
 	if !prefixOK || !suffixOK {
 		return dst, false
 	}
-	dst = append(dst, prefix...)
+	start := len(dst)
+	dst = append(dst, prefixValue...)
 	digits := len(dst)
 	width := 0
 	if v.data[0]&1 != 0 {
@@ -651,7 +726,9 @@ func appendCompactPrefixUint(dst []byte, v *compactStreamView, value int64) ([]b
 			}
 		}
 	}
-	return append(dst, suffix...), true
+	s.value = value
+	s.next = row + 1
+	return append(dst, suffixValue...), true
 }
 
 // compactSpreadAlphabet5 expands eight packed five-bit codes into byte lanes.

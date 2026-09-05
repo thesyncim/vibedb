@@ -150,7 +150,7 @@ func (s *compactStreamScratch) encode(values [][]byte) compactStreamEncoding {
 }
 
 func (s *compactStreamScratch) encodeShape(values [][]byte, ranks []uint16, leafRows int) compactStreamEncoding {
-	return s.encodeShapeWithRankContext(values, ranks, leafRows, nil)
+	return s.encodeShapeWithRankContext(values, ranks, leafRows, nil, nil)
 }
 
 func (s *compactStreamScratch) encodeShapeWithRankContext(
@@ -158,6 +158,7 @@ func (s *compactStreamScratch) encodeShapeWithRankContext(
 	ranks []uint16,
 	leafRows int,
 	rankContext *compactRankContext,
+	rankView *CompactPrimaryStripeView,
 ) compactStreamEncoding {
 	if len(values) == 0 {
 		return compactStreamEncoding{kind: compactStreamDictionary}
@@ -173,7 +174,7 @@ func (s *compactStreamScratch) encodeShapeWithRankContext(
 	// Reserve the last backing slot for the prefix candidate so constructing
 	// the ordinary numeric alternatives below cannot overwrite its bytes.
 	numeric, hasPrefix := s.encodePrefixIntShapeWithRankContext(
-		7, values, ranks, leafRows, rankContext,
+		7, values, ranks, leafRows, rankContext, rankView,
 	)
 	rankNumber := hasPrefix && numeric.kind == compactStreamRankAffine &&
 		numeric.data[0] == 2 && len(numeric.dict[0]) == 0 && len(numeric.dict[1]) == 0
@@ -840,15 +841,24 @@ func parseCompactPrefixInt(src []byte) (compactPrefixIntValue, bool) {
 			return compactPrefixIntValue{}, false
 		}
 	}
-	var value uint64
-	for _, digit := range src[start:end] {
-		n := uint64(digit - '0')
-		if value > (uint64(1<<63-1)-n)/10 {
-			return compactPrefixIntValue{}, false
-		}
-		value = value*10 + n
-	}
 	width := end - start
+	var value uint64
+	if width <= 18 {
+		for _, digit := range src[start:end] {
+			value = value*10 + uint64(digit-'0')
+		}
+	} else {
+		const maxInt64Prefix = uint64(1<<63-1) / 10
+		const maxInt64Remainder = uint64(1<<63-1) % 10
+		for _, digit := range src[start:end] {
+			n := uint64(digit - '0')
+			if value >= maxInt64Prefix &&
+				(value != maxInt64Prefix || n > maxInt64Remainder) {
+				return compactPrefixIntValue{}, false
+			}
+			value = value*10 + n
+		}
+	}
 	return compactPrefixIntValue{
 		prefix: src[:start], suffix: src[end:], value: value, width: width,
 		canonical: width == 1 || src[start] != '0',
@@ -868,7 +878,7 @@ func (s *compactStreamScratch) encodePrefixInt(
 }
 
 func (s *compactStreamScratch) encodePrefixIntShape(slot int, values [][]byte, ranks []uint16, leafRows int) (compactStreamEncoding, bool) {
-	return s.encodePrefixIntShapeWithRankContext(slot, values, ranks, leafRows, nil)
+	return s.encodePrefixIntShapeWithRankContext(slot, values, ranks, leafRows, nil, nil)
 }
 
 func (s *compactStreamScratch) encodePrefixIntShapeWithRankContext(
@@ -877,6 +887,7 @@ func (s *compactStreamScratch) encodePrefixIntShapeWithRankContext(
 	ranks []uint16,
 	leafRows int,
 	rankContext *compactRankContext,
+	rankView *CompactPrimaryStripeView,
 ) (compactStreamEncoding, bool) {
 	first, ok := parseCompactPrefixInt(values[0])
 	if !ok {
@@ -931,7 +942,7 @@ func (s *compactStreamScratch) encodePrefixIntShapeWithRankContext(
 		}, true
 	}
 	if affine, ok := s.encodeRankAffineParsed(
-		slot, first, allCanonical, fixedWidth, ranks, leafRows, rankContext,
+		slot, first, allCanonical, fixedWidth, ranks, leafRows, rankContext, rankView,
 	); ok {
 		return affine, true
 	}
