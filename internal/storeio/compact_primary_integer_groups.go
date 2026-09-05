@@ -335,13 +335,24 @@ func (v *CompactPrimaryStripeView) VisitResolvedIntegerGroups(
 		len(shapeWork) < v.shapeCount {
 		return false, nil
 	}
-	clear(shapeSeen[:v.shapeCount])
+	// Admission precedes every ordinal read, so its temporary decoded keys
+	// can borrow the already charged integer arena. The memory contains no
+	// pointers, and the byte view stays within the supplied slice's bounds.
+	keySlots := min(len(shapeSeen), 1024/int(unsafe.Sizeof(int(0))))
+	keyScratch := unsafe.Slice((*byte)(unsafe.Pointer(unsafe.SliceData(shapeSeen))),
+		keySlots*int(unsafe.Sizeof(int(0))))
+	usedOrdinals := shapeSeen[:max(v.shapeCount, keySlots)]
+	defer func() {
+		if !supported {
+			clear(usedOrdinals)
+		}
+	}()
 	for shape := 0; shape < v.shapeCount; shape++ {
 		entry, ok := v.shapeEntry(shape)
 		if !ok || entry.rows < 0 {
 			return false, nil
 		}
-		groupHole := groupResolver.resolveCompactTemplate(entry.template)
+		groupHole := resolveCompactProjectionTemplate(groupResolver, entry.template, keyScratch)
 		if groupHole < 0 || groupHole >= entry.template.holes {
 			// UnifiedHoleAbsent and UnifiedHoleContainer are both negative;
 			// neither has SQL's all-integer semantics required by this lane.
@@ -353,7 +364,7 @@ func (v *CompactPrimaryStripeView) VisitResolvedIntegerGroups(
 		}
 		var sumStream compactStreamView
 		if sumResolver != nil {
-			sumHole := sumResolver.resolveCompactTemplate(entry.template)
+			sumHole := resolveCompactProjectionTemplate(sumResolver, entry.template, keyScratch)
 			if sumHole < 0 || sumHole >= entry.template.holes {
 				return false, nil
 			}
@@ -374,6 +385,7 @@ func (v *CompactPrimaryStripeView) VisitResolvedIntegerGroups(
 	// loop then follows physical order, while shapeSeen carries each stream's
 	// local ordinal. A shape-major callback order would alter first-seen group
 	// ordering for unordered output whenever shapes are interleaved.
+	clear(usedOrdinals)
 	for row := 0; row < v.rows; row++ {
 		shape := v.rowShape(row)
 		if shape < 0 || shape >= v.shapeCount {

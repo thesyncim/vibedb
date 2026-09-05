@@ -230,6 +230,7 @@ func (w *fileWorkspace) release() {
 	// dropping them is what makes the pool unreachable.
 	w.stopPool()
 	if w.small != nil {
+		w.small.releaseFileProjection()
 		w.small.work.Release()
 	}
 	w.small = nil
@@ -454,9 +455,14 @@ func clearTail[T any](s []T, n int) {
 // caller-owned final Result. CoveringColumns counts distinct typed columns
 // reduced without admitting JSON.
 type ExecStats struct {
-	Workers              int
-	RowsTotal            uint64
-	RowsScanned          uint64
+	Workers     int
+	RowsTotal   uint64
+	RowsScanned uint64
+	// ProjectedRows counts rows delivered by the storage-native scalar
+	// projection lane. It is separate from RowsScanned so benchmark and
+	// diagnostic callers can tell a projected primary-range read from the raw
+	// JSON small-page lane while both report the same bounded scan count.
+	ProjectedRows        uint64
 	Batches              uint64
 	PeakBatchRows        int
 	PeakBatchBytes       int64
