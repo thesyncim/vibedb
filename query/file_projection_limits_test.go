@@ -144,7 +144,7 @@ func fileProjectionTightMemoryQuery() *Query {
 		Limit(fileProjectionBenchPage)
 }
 
-func TestFileProjectionTightMemoryFallbackIsAtomic(t *testing.T) {
+func TestFileProjectionDeduplicatedPathsFitTightMemory(t *testing.T) {
 	snapshot := fileProjectionBenchSnapshot(t)
 	plan := fileProjectionTightMemoryQuery()
 	span := fileProjectionBenchRange()
@@ -170,11 +170,11 @@ func TestFileProjectionTightMemoryFallbackIsAtomic(t *testing.T) {
 	if got := fileProjectionResultKey(execution.Result); got != wantKey {
 		t.Fatal("tight-memory fallback differs from generic oracle")
 	}
-	if execution.Stats.ProjectedRows != 0 {
-		t.Fatalf("tight-memory stats=%+v, want generic fallback", execution.Stats)
+	if execution.Stats.ProjectedRows != fileProjectionBenchPage {
+		t.Fatalf("tight-memory stats=%+v, want native projection", execution.Stats)
 	}
-	if execution.file.small == nil || execution.file.small.projection != nil {
-		t.Fatal("tight-memory execution retained a native projection filter")
+	if execution.file.small == nil || execution.file.small.projection == nil {
+		t.Fatal("tight-memory execution did not retain a native projection filter")
 	}
 
 	execution.Options = ExecOptions{
@@ -206,8 +206,8 @@ func TestFileProjectionTightMemoryFallbackIsAtomic(t *testing.T) {
 	if got := fileProjectionResultKey(execution.Result); got != wantKey {
 		t.Fatal("tight-memory reuse differs from generic oracle")
 	}
-	if execution.Stats.ProjectedRows != 0 {
-		t.Fatalf("tight-memory reuse stats=%+v, want generic fallback", execution.Stats)
+	if execution.Stats.ProjectedRows != fileProjectionBenchPage {
+		t.Fatalf("tight-memory reuse stats=%+v, want native projection", execution.Stats)
 	}
 }
 
@@ -246,8 +246,12 @@ func TestFileProjectionEligibilityGuards(t *testing.T) {
 			if got := fileProjectionResultKey(execution.Result); got != wantKey {
 				t.Fatal("eligibility guard changed the generic result")
 			}
-			if execution.Stats.ProjectedRows != 0 {
-				t.Fatalf("eligibility guard stats=%+v, want no native projection", execution.Stats)
+			wantProjected := uint64(0)
+			if tc.name == "uncertified_range" {
+				wantProjected = uint64(fileProjectionBenchPage)
+			}
+			if execution.Stats.ProjectedRows != wantProjected {
+				t.Fatalf("eligibility guard stats=%+v, want ProjectedRows=%d", execution.Stats, wantProjected)
 			}
 			if tc.name == "filtered_source" && execution.Stats.PrimaryRangeBounded {
 				t.Fatalf("filtered source unexpectedly reports primary range: %+v", execution.Stats)

@@ -391,15 +391,32 @@ func (c *Collection) mintBufferedPrimaryOverflowChain(
 func (c *Collection) appendPrimaryOverflowValue(
 	dst []byte, first storeio.PageRef, bounds storeio.CommonPrimaryLeafBounds,
 ) ([]byte, error) {
+	resolved, _, err := c.appendPrimaryOverflowValueWithReserve(
+		dst, first, bounds, nil,
+	)
+	return resolved, err
+}
+
+// appendPrimaryOverflowValueWithReserve is the one overflow decoder used by
+// ordinary reads and bounded projection fallback. The optional reserve
+// callback is invoked after the authenticated first header declares the exact
+// total and before any extent bytes are appended; it returns an admitted buffer
+// or an error. A false bounded result means the caller declined this row
+// without changing its destination, allowing the cursor to report an
+// unsupported projected attempt rather than a storage corruption error.
+func (c *Collection) appendPrimaryOverflowValueWithReserve(
+	dst []byte, first storeio.PageRef, bounds storeio.CommonPrimaryLeafBounds,
+	reserve func(required int) ([]byte, error),
+) ([]byte, bool, error) {
 	ref := first
 	var total, have uint64
 	for pages := 0; ref != (storeio.PageRef{}); pages++ {
 		if pages > 0 && uint64(pages) > total {
-			return dst, ErrOverflowChainCorrupt
+			return dst, false, ErrOverflowChainCorrupt
 		}
 		lease, err := c.cache.Acquire(ref)
 		if err != nil {
-			return dst, err
+			return dst, false, err
 		}
 		view, err := storeio.OpenOverflowPage(
 			lease.Page(), bounds.FileEnd, bounds.NextLogicalID,
@@ -407,39 +424,58 @@ func (c *Collection) appendPrimaryOverflowValue(
 		)
 		if err != nil {
 			lease.Release()
-			return dst, err
+			return dst, false, err
 		}
 		header := view.Header()
 		if pages == 0 {
 			if header.Offset != 0 || header.Total > uint64(c.options.MaxDocumentBytes) ||
 				header.Total > uint64(math.MaxInt-len(dst)) {
 				lease.Release()
-				return dst, ErrOverflowChainCorrupt
+				return dst, false, ErrOverflowChainCorrupt
 			}
 			total = header.Total
-			// The authenticated first extent declares the complete value size.
-			// Allocate once before appending any pieces so the returned slice cannot
-			// retain growslice's geometric headroom. The backing object may still use
-			// the allocator's bounded size-class rounding.
+			// The authenticated first extent declares the complete value size before
+			// any extent bytes are appended. Ordinary readers grow exactly here;
+			// projection callers route growth through their admission callback.
 			required := len(dst) + int(total)
 			if required > cap(dst) {
-				grown := make([]byte, len(dst), required)
-				copy(grown, dst)
-				dst = grown
+				if reserve != nil {
+					grown, reserveErr := reserve(required)
+					if reserveErr != nil {
+						lease.Release()
+						return dst, false, reserveErr
+					}
+					if cap(grown) < required {
+						lease.Release()
+						return dst, false, nil
+					}
+					grown = grown[:0]
+					grown = append(grown, dst...)
+					dst = grown
+				} else {
+					grown := make([]byte, len(dst), required)
+					copy(grown, dst)
+					dst = grown
+				}
 			}
 		} else if header.Total != total || header.Offset != have {
 			lease.Release()
-			return dst, ErrOverflowChainCorrupt
+			return dst, false, ErrOverflowChainCorrupt
 		}
-		dst = append(dst, view.Data()...)
-		have += uint64(len(view.Data()))
+		piece := view.Data()
+		if uint64(len(piece)) > total-have || len(piece) > cap(dst)-len(dst) {
+			lease.Release()
+			return dst, false, ErrOverflowChainCorrupt
+		}
+		dst = append(dst, piece...)
+		have += uint64(len(piece))
 		ref = header.Next
 		lease.Release()
 	}
 	if have != total {
-		return dst, ErrOverflowChainCorrupt
+		return dst, false, ErrOverflowChainCorrupt
 	}
-	return dst, nil
+	return dst, true, nil
 }
 
 // collectPrimaryOverflowExtents appends every extent of the overflow chain
