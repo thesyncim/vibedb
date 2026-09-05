@@ -442,7 +442,23 @@ func assertRankAffineQueryBenchNative(
 		}
 		return
 	}
-	if !fixture.sparse || os.Getenv("VIBEDB_EXPECT_RANK_AFFINE_QUERY") != "1" {
+	if os.Getenv("VIBEDB_EXPECT_RANK_AFFINE_QUERY") != "1" {
+		return
+	}
+	if name == "numeric-eq" {
+		if stats.Workers != 1 || stats.RowsTotal != rows ||
+			stats.RowsScanned != rows || stats.TokenFilterRows != rows ||
+			stats.TokenFilterFallbackRows != 0 || stats.Batches != 0 {
+			lane := "ordinary"
+			if fixture.sparse {
+				lane = "sparse"
+			}
+			tb.Fatalf("%s numeric equality did not use native token lane: %+v",
+				lane, stats)
+		}
+		return
+	}
+	if !fixture.sparse {
 		return
 	}
 	switch name {
@@ -452,7 +468,7 @@ func assertRankAffineQueryBenchNative(
 			stats.Batches != 0 {
 			tb.Fatalf("sparse group query did not use native integer lane: %+v", stats)
 		}
-	case "numeric-eq", "spelling-eq", "ordered-half", "interval-middle":
+	case "spelling-eq", "ordered-half", "interval-middle":
 		if stats.Workers != 1 || stats.RowsTotal != rows ||
 			stats.RowsScanned != rows || stats.TokenFilterRows != rows ||
 			stats.TokenFilterFallbackRows != 0 || stats.Batches != 0 {

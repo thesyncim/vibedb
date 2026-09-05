@@ -1,0 +1,14 @@
+goos: linux
+goarch: amd64
+pkg: github.com/thesyncim/vibedb/store/durable
+cpu: AMD EPYC 7763 64-Core Processor                
+BenchmarkFileStoreBatchWrite/update/batch=1 	    2728	    638513 ns/op	       954.9 devB/doc	       109.1 docs/fsync	    638513 ns/doc
+BenchmarkFileStoreBatchWrite/update/batch=10         	     138	   1841460 ns/op	       979.5 devB/doc	       106.2 docs/fsync	    184146 ns/doc
+BenchmarkFileStoreBatchWrite/update/batch=100        	     100	  10443427 ns/op	       848.3 devB/doc	       129.9 docs/fsync	    104434 ns/doc
+BenchmarkFileStoreBatchWrite/update/batch=1000       	       4	  70860098 ns/op	       245.8 devB/doc	       500.0 docs/fsync	     70860 ns/doc
+BenchmarkFileStoreBatchWrite/put                     	   13723	     18238 ns/op	        93.12 devB/doc	      1372 docs/fsync	     18238 ns/doc
+BenchmarkUnifiedGetRaw                               	  129612	      1788 ns/op	      1584 p50-batch16-ns/op	      1643 p50-ns/op	      2224 p99-ns/op	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPrimaryReplace                       	   29233	      7947 ns/op	      3607 p50-ns/op	      5390 p99-ns/op	     911 B/op	       0 allocs/op
+BenchmarkUnifiedScanAllBytesLowCardinality           	       6	  33770154 ns/op	 736.78 MB/s	       248.8 bytes/doc	       337.7 ns/doc	       0 B/op	       0 allocs/op
+BenchmarkUnifiedScanAllBytesHighCardinality          	       4	  56607930 ns/op	 439.53 MB/s	       248.8 bytes/doc	       566.1 ns/doc	       0 B/op	       0 allocs/op
+PASS

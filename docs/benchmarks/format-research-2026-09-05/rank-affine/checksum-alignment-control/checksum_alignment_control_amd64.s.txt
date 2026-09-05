@@ -1,0 +1,143 @@
+#include "textflag.h"
+
+// xorAt24 and xorAt56 deliberately preserve the original compiler-shaped
+// byte-XOR loop. The five instructions beginning at the aligned offset are
+// exactly 16 bytes:
+//   MOVZX 0(DI)(R8*1), R9  (5)
+//   XORL  R9, DX            (3)
+//   INCQ  R8                (3)
+//   CMPQ  SI, R8            (3)
+//   JG    loop              (2)
+// The short entry jump reaches compare without executing alignment padding.
+
+TEXT ·xorAt24(SB), NOSPLIT, $0-25
+	MOVQ data_base+0(FP), DI
+	MOVQ data_len+8(FP), SI
+	XORL DX, DX
+	XORL R8, R8
+	JMP compare24
+	PCALIGN $64
+	// 24 bytes: the loop begins at the next 64-byte boundary plus 24.
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+loop24:
+	BYTE $0x46
+	BYTE $0x0f
+	BYTE $0xb6
+	BYTE $0x0c
+	BYTE $0x07
+	BYTE $0x44
+	BYTE $0x31
+	BYTE $0xca
+	BYTE $0x49
+	BYTE $0xff
+	BYTE $0xc0
+compare24:
+	CMPQ SI, R8
+	JG loop24
+	MOVB DL, ret+24(FP)
+	RET
+
+TEXT ·xorAt56(SB), NOSPLIT, $0-25
+	MOVQ data_base+0(FP), DI
+	MOVQ data_len+8(FP), SI
+	XORL DX, DX
+	XORL R8, R8
+	JMP compare56
+	PCALIGN $64
+	// 56 bytes: the loop begins at the next 64-byte boundary plus 56.
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+	BYTE $0x90
+loop56:
+	BYTE $0x46
+	BYTE $0x0f
+	BYTE $0xb6
+	BYTE $0x0c
+	BYTE $0x07
+	BYTE $0x44
+	BYTE $0x31
+	BYTE $0xca
+	BYTE $0x49
+	BYTE $0xff
+	BYTE $0xc0
+compare56:
+	CMPQ SI, R8
+	JG loop56
+	MOVB DL, ret+24(FP)
+	RET
