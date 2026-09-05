@@ -48,6 +48,21 @@ existing durable acknowledgement boundary. No novelty claim is established.
   Reads return detached payloads and scalar fields. Staging and warmed persistence
   allocate nothing.
 
+## Frozen a2ac5fd8 point checkpoint
+
+The baseline-to-frozen-G point checkpoint is retained in
+[`point-assessment/README.md`](point-assessment/README.md). It freezes M at
+`5160e0f6` and G at `a2ac5fd8`, with read authority disabled in both arms. N3
+retry2 completed 72 verified report cells with zero workload errors. N6 has 60
+verified report cells; the reverse-order M arm failed before reporting because
+startup hit a replicated catalog compare-and-publish conflict, while its valid
+G/CRDB pairs remain archived. Complete G/M median-throughput ratios span
+0.478–1.197×, and valid G/CRDB ratios span 0.569–0.935× in N3 and
+0.663–1.051× in N6 before-first, with 0.663–0.825× in the valid N6
+after-first G/CRDB-only rows. These are fixed-host diagnostic comparisons; they do not
+complete the nine-workload assessment or establish a 2× or final enabled-feature
+claim.
+
 ## Matched complete SQL campaigns
 
 Each cell uses 16 independent table groups, three physical node processes, RF3,
