@@ -36,6 +36,13 @@ type collectionOpenConfig struct {
 	// for every retained kind-4 lookup. Used when the database directory has
 	// no txn.vtm. Mutually exclusive with a non-nil decisions pointer.
 	absentLog bool
+	// exactRoot is supplied only by the authenticated group-vector opener. It
+	// is repaired into both mutable root slots before bootstrap discovers page
+	// geometry or exposes allocator state, so ordinary root selection cannot
+	// combine a member's ahead root with the selected group cut.
+	exactRoot          *storeio.InlineSuperblock
+	exactRootStoreID   [16]byte
+	exactRecoveryFloor uint64
 }
 
 // Create initializes an empty durable collection in file and fences its first
@@ -146,6 +153,30 @@ func openCollection(
 			_ = storeio.UnlockWriter(file)
 		}
 	}()
+	if cfg.exactRoot != nil {
+		if cfg.exactRootStoreID != ([16]byte{}) &&
+			cfg.exactRoot.StoreID != cfg.exactRootStoreID {
+			return nil, fmt.Errorf("%w: exact-root member identity", storeio.ErrRootVectorMember)
+		}
+		if cfg.exactRecoveryFloor == 0 ||
+			cfg.exactRecoveryFloor > cfg.exactRoot.Generation ||
+			cfg.exactRoot.State.MaxPageSize < cfg.exactRoot.PageSize ||
+			cfg.exactRoot.State.MaxPageSize > storeio.MaxPhysicalPageSize {
+			return nil, fmt.Errorf("%w: exact-root recovery bounds", storeio.ErrRootVectorMember)
+		}
+		exactScratch := make([]byte, int(cfg.exactRoot.State.MaxPageSize))
+		if err := storeio.ValidateInlineSuperblockForRecovery(
+			file, *cfg.exactRoot, exactScratch,
+		); err != nil {
+			return nil, fmt.Errorf("%w: exact-root file identity: %w", storeio.ErrRootVectorMember, err)
+		}
+		// The vector has already authenticated this complete image. Repair before
+		// DiscoverMutableInlineBootstrap so no ordinary root/resource/allocator
+		// selector can observe a different member generation.
+		if err := storeio.RewriteInlineSuperblockCopies(file, *cfg.exactRoot); err != nil {
+			return nil, err
+		}
+	}
 	// A catalog-held opener already owns the process namespace lease but still
 	// proves that this caller descriptor names an entry in the pinned catalog
 	// directory. A standalone opener performed the same proof atomically inside
@@ -229,6 +260,12 @@ func openCollection(
 		return nil, err
 	}
 	collection.physicalHighWater = physicalHighWater
+	if cfg.exactRecoveryFloor != 0 {
+		if err := collection.installExactRootRecoveryFloor(cfg.exactRecoveryFloor); err != nil {
+			_ = collection.closeResources()
+			return nil, err
+		}
+	}
 	collection.writerLocked = true
 	locked = false
 	if err := collection.committer.InitializeRecovery(

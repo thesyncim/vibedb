@@ -143,7 +143,13 @@ type Collection struct {
 	pendingVisible           []filePendingState
 
 	committer *storeio.Committer
-	cache     *storeio.PageCache
+	// exactRootRecoveryFloor is the minimum generation named by every complete
+	// exact-root checkpoint bank still selectable for this member. Zero means the
+	// ordinary committer/readers floor is in force. It is installed before an
+	// exact-root opener exposes allocator state and is consulted by every free,
+	// pressure, epoch, and hole-punch path.
+	exactRootRecoveryFloor atomic.Uint64
+	cache                  *storeio.PageCache
 	// primaryUnifiedOverlay is the bounded, generation-stamped mutable row
 	// window for compact VCS1 inline puts and tombstones. Its byte arena is carved out of
 	// Options.ResidentBytes; PageCache owns the remainder.
