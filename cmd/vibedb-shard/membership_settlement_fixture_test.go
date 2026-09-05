@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"time"
 
@@ -74,6 +75,128 @@ func rf3ExpectedMembership(before replicacontrol.Observation, request shardservi
 // This callback is deliberately observation-only. Admission has finished and
 // cannot be repeated by the bounded settlement loop.
 type rf3MembershipObservationFunc func(context.Context) (shardservice.ReplicatedMemberState, replicacontrol.Observation, error)
+
+type rf3TargetPublicationObservationFunc func(context.Context, replicacontrol.Request) (replicacontrol.Observation, error)
+
+var errRF3TargetPublication = errors.New("RF3 target publication did not settle")
+
+type rf3TargetPublicationError struct {
+	cause           error
+	attempts        int
+	lastObservation replicacontrol.Observation
+	lastError       error
+}
+
+func (err *rf3TargetPublicationError) Error() string {
+	return fmt.Sprintf("%v after %d attempts: last observation=%+v last error=%v",
+		errRF3TargetPublication, err.attempts, err.lastObservation, err.lastError)
+}
+
+func (err *rf3TargetPublicationError) Unwrap() error { return err.cause }
+
+func rf3ExpectedTargetPromotion(before replicacontrol.Observation, target uint64) *pb.ConfState {
+	conf := before.State.ConfState
+	if conf == nil || target == 0 || slices.Contains(conf.GetVoters(), target) ||
+		!slices.Contains(conf.GetLearners(), target) || len(conf.GetVotersOutgoing()) != 0 ||
+		len(conf.GetLearnersNext()) != 0 || conf.GetAutoLeave() {
+		return nil
+	}
+	expected := proto.Clone(conf).(*pb.ConfState)
+	expected.Learners = slices.DeleteFunc(expected.Learners, func(member uint64) bool { return member == target })
+	expected.Voters = append(expected.Voters, target)
+	slices.Sort(expected.Voters)
+	expected.AutoLeave = new(false)
+	return expected
+}
+
+func rf3TargetPublicationMatches(
+	before replicacontrol.Observation,
+	request replicacontrol.Request,
+	promoted raftservice.CommandFence,
+	observed replicacontrol.Observation,
+) bool {
+	expectedRequest := request
+	expectedRequest.ExpectedReplicaSetVersion = promoted.ReplicaSetVersion
+	expectedConf := rf3ExpectedTargetPromotion(before, request.TargetMember)
+	zeroDigest := [32]byte{}
+	return before.Request == request && request.ExpectedReplicaSetVersion == before.State.ReplicaSetVersion &&
+		promoted.ReplicaSetVersion > before.State.ReplicaSetVersion && observed.Request == expectedRequest &&
+		observed.Status.MemberID == request.TargetMember &&
+		observed.State.ReplicaSetVersion == promoted.ReplicaSetVersion &&
+		observed.Publication.ReplicaSetVersion == promoted.ReplicaSetVersion &&
+		observed.State.Applied >= promoted.ReplicaSetVersion &&
+		observed.Publication.Applied == observed.State.Applied &&
+		observed.Status.Applied == observed.State.Applied &&
+		observed.Publication.DataChainDigest == observed.State.DataChainDigest &&
+		expectedConf != nil && proto.Equal(observed.State.ConfState, expectedConf) &&
+		proto.Equal(observed.Publication.ConfState, observed.State.ConfState) &&
+		observed.State.Binding == before.State.Binding &&
+		before.State.SnapshotBaseDigest != zeroDigest &&
+		observed.State.SnapshotBaseDigest == before.State.SnapshotBaseDigest
+}
+
+func rf3AwaitTargetPublication(
+	ctx context.Context,
+	before replicacontrol.Observation,
+	request replicacontrol.Request,
+	promoted raftservice.CommandFence,
+	observe rf3TargetPublicationObservationFunc,
+) (replicacontrol.Observation, error) {
+	if ctx == nil || observe == nil || request.TargetMember == 0 || promoted.ReplicaSetVersion == 0 {
+		return replicacontrol.Observation{}, &rf3TargetPublicationError{
+			cause: errRF3TargetPublication,
+		}
+	}
+	if before.State.SnapshotBaseDigest == ([32]byte{}) {
+		return replicacontrol.Observation{}, &rf3TargetPublicationError{
+			cause:     errRF3TargetPublication,
+			lastError: errors.New("target publication has no snapshot-base digest"),
+		}
+	}
+	var (
+		attempts        int
+		lastObservation replicacontrol.Observation
+		lastError       error
+	)
+	for {
+		if cause := context.Cause(ctx); cause != nil {
+			return replicacontrol.Observation{}, &rf3TargetPublicationError{
+				cause: cause, attempts: attempts, lastObservation: lastObservation, lastError: lastError,
+			}
+		}
+		attempt := request
+		attempt.ExpectedReplicaSetVersion = 0
+		attempts++
+		observed, err := observe(ctx, attempt)
+		lastObservation, lastError = observed, err
+		if err == nil && rf3TargetPublicationMatches(before, request, promoted, observed) {
+			return observed, nil
+		}
+		if cause := context.Cause(ctx); cause != nil {
+			return replicacontrol.Observation{}, &rf3TargetPublicationError{
+				cause: cause, attempts: attempts, lastObservation: lastObservation, lastError: lastError,
+			}
+		}
+		timer := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			cause := context.Cause(ctx)
+			if cause == nil {
+				cause = context.Canceled
+			}
+			return replicacontrol.Observation{}, &rf3TargetPublicationError{
+				cause: cause, attempts: attempts, lastObservation: lastObservation, lastError: lastError,
+			}
+		case <-timer.C:
+		}
+	}
+}
 
 func rf3MembershipNetworkObserver(observer *replicacontrol.Client, address string, node rafttransport.NodeID,
 	profile *rafttransport.PeerTLS, authority serviceauthz.Authority, allocation uint64, request replicacontrol.Request,

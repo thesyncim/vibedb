@@ -169,16 +169,16 @@ func sealedRequestCapability(request *ShardRequest) (serviceauthz.Capability, bo
 	}
 	if operation := request.Transaction.Operation; operation != TransactionNone {
 		switch operation {
-		case TransactionLookupCoordinator, TransactionLookupParticipant,
-			TransactionScanCoordinator, TransactionReadParticipant,
+		case TransactionLookupCoordinator, TransactionLookupTarget,
+			TransactionScanCoordinator, TransactionReadTarget,
 			TransactionReadManifestSegment:
 			return serviceauthz.CapabilityDataRead, true
-		case TransactionStageCoordinator, TransactionStageParticipant,
+		case TransactionStageCoordinator, TransactionStageTarget,
 			TransactionStageManifestCoordinator, TransactionStageManifestSegment,
-			TransactionCommitCoordinator, TransactionApplyParticipant,
-			TransactionAbortCoordinator, TransactionAbortParticipant,
-			TransactionRetireCoordinator, TransactionReleaseParticipant,
-			TransactionPrepareParticipant, TransactionAcquireReadFence,
+			TransactionCommitCoordinator, TransactionApplyTarget,
+			TransactionAbortCoordinator, TransactionAbortTarget,
+			TransactionRetireCoordinator, TransactionReleaseTarget,
+			TransactionPrepareTarget, TransactionAcquireReadFence,
 			TransactionReleaseReadFence, TransactionPulseCoordinator:
 			return serviceauthz.CapabilityDataWrite, true
 		default:
@@ -331,7 +331,7 @@ func (c *shardConn) handleAdmitted(req *ShardRequest, write func(*ShardResponse)
 	if req.ExecutionMode == ExecutionReadWrite {
 		writeCtx, writeCancel := c.server.requestContext(req)
 		for {
-			if err := c.server.journal.WaitNoParticipantBarrier(
+			if err := c.server.journal.WaitNoTargetBarrier(
 				writeCtx, req.BucketBits, req.AccessScopes,
 			); err != nil {
 				writeCancel()
@@ -344,7 +344,7 @@ func (c *shardConn) handleAdmitted(req *ShardRequest, write func(*ShardResponse)
 				writeCancel()
 				return write(classifyError(err))
 			}
-			conflict, barrierErr := c.server.journal.ParticipantBarrierConflict(
+			conflict, barrierErr := c.server.journal.TargetBarrierConflict(
 				req.BucketBits, req.AccessScopes,
 			)
 			if barrierErr != nil {
@@ -364,7 +364,7 @@ func (c *shardConn) handleAdmitted(req *ShardRequest, write func(*ShardResponse)
 		}
 	} else {
 		barrierCtx, barrierCancel := c.server.requestContext(req)
-		err := c.server.journal.WaitNoParticipantBarrier(
+		err := c.server.journal.WaitNoTargetBarrier(
 			barrierCtx, req.BucketBits, req.AccessScopes,
 		)
 		barrierCancel()
@@ -722,7 +722,7 @@ func exchangeError(err error) *ShardResponse {
 
 // transaction executes the durable subset of the transaction protocol. Stage
 // and lookup are safe independently of SQL publication. State transitions stay
-// closed until commit proof and participant apply are joined to the local SQL
+// closed until commit proof and target apply are joined to the local SQL
 // transaction boundary; accepting them earlier would permit partial commit.
 func (c *shardConn) transaction(req *ShardRequest) *ShardResponse {
 	tx := req.Transaction
@@ -735,8 +735,8 @@ func (c *shardConn) transaction(req *ShardRequest) *ShardResponse {
 			"shardservice: a transaction command cannot also carry SQL or parameters")
 	}
 	if tx.Operation != TransactionLookupCoordinator &&
-		tx.Operation != TransactionLookupParticipant &&
-		tx.Operation != TransactionReadParticipant &&
+		tx.Operation != TransactionLookupTarget &&
+		tx.Operation != TransactionReadTarget &&
 		tx.Operation != TransactionReadManifestSegment &&
 		tx.Operation != TransactionScanCoordinator &&
 		req.ExecutionMode != ExecutionReadWrite {
@@ -754,7 +754,7 @@ func (c *shardConn) transaction(req *ShardRequest) *ShardResponse {
 		); err != nil {
 			return transactionError(err)
 		}
-		conflict, err := c.server.journal.ParticipantBarrierConflict(
+		conflict, err := c.server.journal.TargetBarrierConflict(
 			req.BucketBits, req.AccessScopes,
 		)
 		if err != nil || conflict {
@@ -771,14 +771,14 @@ func (c *shardConn) transaction(req *ShardRequest) *ShardResponse {
 		}
 		return CompletionResponse(0)
 	case TransactionStageCoordinator:
-		var participants [distributedtxn.MaxInlineParticipants]distributedtxn.ParticipantRef
-		record, openErr := distributedtxn.OpenCoordinatorInto(tx.Record, participants[:])
+		var targets [distributedtxn.MaxInlineTargets]distributedtxn.TransactionTargetRef
+		record, openErr := distributedtxn.OpenCoordinatorInto(tx.Record, targets[:])
 		if openErr != nil {
 			return transactionError(openErr)
 		}
 		// The fixed-set protocol designates the first sorted participant as
 		// coordinator, avoiding another identity field in every record.
-		first := record.Participants[0]
+		first := record.Targets[0]
 		if !vibejson.BytesEqualString(first.Distribution, string(req.Distribution)) ||
 			!vibejson.BytesEqualString(first.Shard, string(req.Shard)) ||
 			first.RoutingVersion != uint64(req.RoutingVersion) ||
@@ -787,9 +787,9 @@ func (c *shardConn) transaction(req *ShardRequest) *ShardResponse {
 			return transactionError(distributedtxn.ErrJournalConflict)
 		}
 		status, err = c.server.journal.StageCoordinator(tx.Record)
-	case TransactionStageParticipant:
+	case TransactionStageTarget:
 		var scopes [distributedtxn.MaxIntentScopes]distributedtxn.IntentScope
-		record, openErr := distributedtxn.OpenParticipantInto(tx.Record, scopes[:])
+		record, openErr := distributedtxn.OpenTargetInto(tx.Record, scopes[:])
 		if openErr != nil {
 			return transactionError(openErr)
 		}
@@ -799,7 +799,7 @@ func (c *shardConn) transaction(req *ShardRequest) *ShardResponse {
 			return transactionError(distributedtxn.ErrJournalConflict)
 		}
 		writeCtx, writeCancel := c.server.requestContext(req)
-		writeToken, waitErr := c.server.readFences.enterParticipant(
+		writeToken, waitErr := c.server.readFences.enterTarget(
 			writeCtx, record.BucketBits, record.IntentScopes,
 		)
 		if waitErr != nil {
@@ -807,8 +807,8 @@ func (c *shardConn) transaction(req *ShardRequest) *ShardResponse {
 			return classifyError(waitErr)
 		}
 		defer writeCancel()
-		defer c.server.readFences.leaveParticipant(writeToken)
-		status, err = c.server.journal.StageParticipant(tx.Record)
+		defer c.server.readFences.leaveTarget(writeToken)
+		status, err = c.server.journal.StageTarget(tx.Record)
 	case TransactionStageManifestCoordinator:
 		return c.stageManifestCoordinator(req)
 	case TransactionStageManifestSegment:
@@ -819,14 +819,14 @@ func (c *shardConn) transaction(req *ShardRequest) *ShardResponse {
 		return c.lookupCoordinator(tx.ID)
 	case TransactionScanCoordinator:
 		return c.scanCoordinator(tx.ID)
-	case TransactionLookupParticipant:
-		return c.lookupParticipant(tx.ID)
-	case TransactionReadParticipant:
-		return c.readParticipant(tx.ID)
-	case TransactionPrepareParticipant:
-		return c.prepareParticipant(req)
-	case TransactionApplyParticipant:
-		return c.applyParticipant(req)
+	case TransactionLookupTarget:
+		return c.lookupTarget(tx.ID)
+	case TransactionReadTarget:
+		return c.readTarget(tx.ID)
+	case TransactionPrepareTarget:
+		return c.prepareTarget(req)
+	case TransactionApplyTarget:
+		return c.applyTarget(req)
 	case TransactionCommitCoordinator:
 		status, err = c.transitionCoordinator(
 			tx.ID, tx.Revision, distributedtxn.CoordinatorCommitted)
@@ -837,11 +837,11 @@ func (c *shardConn) transaction(req *ShardRequest) *ShardResponse {
 		status, err = c.server.journal.PulseCoordinator(
 			tx.ID, tx.Revision, tx.RecoveryPulse,
 		)
-	case TransactionAbortParticipant:
-		status, err = c.server.journal.AbortParticipant(tx.ID, tx.Revision)
-	case TransactionReleaseParticipant:
-		status, err = c.server.journal.TransitionParticipant(
-			tx.ID, tx.Revision, distributedtxn.ParticipantReleased,
+	case TransactionAbortTarget:
+		status, err = c.server.journal.AbortTarget(tx.ID, tx.Revision)
+	case TransactionReleaseTarget:
+		status, err = c.server.journal.TransitionTarget(
+			tx.ID, tx.Revision, distributedtxn.TargetReleased,
 		)
 	case TransactionRetireCoordinator:
 		status, err = c.server.journal.TransitionCoordinator(
@@ -855,14 +855,14 @@ func (c *shardConn) transaction(req *ShardRequest) *ShardResponse {
 		return transactionError(err)
 	}
 	if status.CoordinatorState == distributedtxn.CoordinatorRetired ||
-		status.ParticipantState == distributedtxn.ParticipantReleased {
+		status.TargetState == distributedtxn.TargetReleased {
 		c.server.scheduleJournalCompaction()
 	}
 	return transactionStatusResponse(status)
 }
 
 // executeGlobalIndexLookup serves the raw index lane after ordinary ownership,
-// participant-barrier, scoped-intent, and optional coherent-read-fence
+// target-barrier, scoped-intent, and optional coherent-read-fence
 // admission. The driver pins exactly one relation snapshot and performs one
 // point lookup or prefix-seek scan per ordered finite-domain key; no SQL
 // parsing or JSON re-encoding occurs on this path.
@@ -1086,26 +1086,26 @@ func (c *shardConn) scanCoordinator(after distributedtxn.ID) *ShardResponse {
 	return response
 }
 
-func (c *shardConn) lookupParticipant(id distributedtxn.ID) *ShardResponse {
-	status, ok := c.server.journal.ParticipantStatus(id)
+func (c *shardConn) lookupTarget(id distributedtxn.ID) *ShardResponse {
+	status, ok := c.server.journal.TargetStatus(id)
 	if !ok {
 		return transactionError(distributedtxn.ErrJournalNotFound)
 	}
-	revision, rowsAffected, applied, err := c.server.db.DistributedParticipantStatus(id)
+	revision, rowsAffected, applied, err := c.server.db.DistributedTargetStatus(id)
 	if err != nil {
 		return transactionError(err)
 	}
 	if applied {
-		if status.ParticipantState == distributedtxn.ParticipantPrepared && revision == status.Revision+1 {
-			if repaired, transitionErr := c.server.journal.TransitionParticipant(
-				id, status.Revision, distributedtxn.ParticipantApplied,
+		if status.TargetState == distributedtxn.TargetPrepared && revision == status.Revision+1 {
+			if repaired, transitionErr := c.server.journal.TransitionTarget(
+				id, status.Revision, distributedtxn.TargetApplied,
 			); transitionErr == nil {
 				status = repaired
 			}
 		}
-		validApplied := status.ParticipantState == distributedtxn.ParticipantApplied &&
+		validApplied := status.TargetState == distributedtxn.TargetApplied &&
 			status.Revision == revision
-		validReleased := status.ParticipantState == distributedtxn.ParticipantReleased &&
+		validReleased := status.TargetState == distributedtxn.TargetReleased &&
 			status.Revision == revision+1
 		if !validApplied && !validReleased {
 			return transactionError(sqldriver.ErrDistributedTransactionConflict)
@@ -1117,17 +1117,17 @@ func (c *shardConn) lookupParticipant(id distributedtxn.ID) *ShardResponse {
 	return transactionStatusResponse(status)
 }
 
-func (c *shardConn) readParticipant(id distributedtxn.ID) *ShardResponse {
-	response := c.lookupParticipant(id)
+func (c *shardConn) readTarget(id distributedtxn.ID) *ShardResponse {
+	response := c.lookupTarget(id)
 	if response.Kind == ResponseError {
 		return response
 	}
-	record, err := c.server.journal.ParticipantStage(id)
+	record, err := c.server.journal.TransactionTargetStage(id)
 	if err != nil {
 		return transactionError(err)
 	}
 	response.Transaction.Record = record
-	response.Transaction.RecordKind = TransactionRecordParticipant
+	response.Transaction.RecordKind = TransactionRecordTarget
 	return response
 }
 
@@ -1146,7 +1146,7 @@ func (c *shardConn) stageManifestSegment(req *ShardRequest) *ShardResponse {
 	scratch := borrowTransactionManifestScratch()
 	defer releaseTransactionManifestScratch(scratch)
 	if _, err := c.server.journal.StageManifestSegment(
-		tx.ID, tx.ManifestSegment, scratch.participants[:], scratch.identities[:],
+		tx.ID, tx.ManifestSegment, scratch.targets[:], scratch.identities[:],
 	); err != nil {
 		return transactionError(err)
 	}
@@ -1190,7 +1190,7 @@ func (c *shardConn) stageManifestCoordinator(req *ShardRequest) *ShardResponse {
 	defer releaseTransactionManifestScratch(scratch)
 	if status.CoordinatorState != distributedtxn.CoordinatorStaging {
 		page, pageErr := c.server.journal.ManifestPage(
-			record.ID, 0, scratch.participants[:], scratch.identities[:])
+			record.ID, 0, scratch.targets[:], scratch.identities[:])
 		if pageErr == nil {
 			if !bytes.Equal(page.Segment.Raw, tx.ManifestSegment) {
 				return transactionError(distributedtxn.ErrJournalConflict)
@@ -1207,7 +1207,7 @@ func (c *shardConn) stageManifestCoordinator(req *ShardRequest) *ShardResponse {
 		return transactionError(pageErr)
 	}
 	if _, err = c.server.journal.StageManifestSegment(
-		record.ID, tx.ManifestSegment, scratch.participants[:], scratch.identities[:],
+		record.ID, tx.ManifestSegment, scratch.targets[:], scratch.identities[:],
 	); err != nil {
 		return transactionError(err)
 	}
@@ -1222,7 +1222,7 @@ func (c *shardConn) readManifestSegment(id distributedtxn.ID, index uint32) *Sha
 	scratch := borrowTransactionManifestScratch()
 	defer releaseTransactionManifestScratch(scratch)
 	page, err := c.server.journal.ManifestPage(
-		id, index, scratch.participants[:], scratch.identities[:])
+		id, index, scratch.targets[:], scratch.identities[:])
 	if err != nil {
 		return transactionError(err)
 	}
@@ -1246,54 +1246,54 @@ func (c *shardConn) transitionCoordinator(
 	return c.server.journal.TransitionCoordinator(id, expected, next)
 }
 
-func (c *shardConn) applyParticipant(req *ShardRequest) *ShardResponse {
+func (c *shardConn) applyTarget(req *ShardRequest) *ShardResponse {
 	tx := req.Transaction
-	status, ok := c.server.journal.ParticipantStatus(tx.ID)
+	status, ok := c.server.journal.TargetStatus(tx.ID)
 	if !ok {
 		return transactionError(distributedtxn.ErrJournalNotFound)
 	}
-	if (status.ParticipantState == distributedtxn.ParticipantApplied && status.Revision == tx.Revision+1) ||
-		(status.ParticipantState == distributedtxn.ParticipantReleased && status.Revision == tx.Revision+2) {
-		return c.lookupParticipant(tx.ID)
+	if (status.TargetState == distributedtxn.TargetApplied && status.Revision == tx.Revision+1) ||
+		(status.TargetState == distributedtxn.TargetReleased && status.Revision == tx.Revision+2) {
+		return c.lookupTarget(tx.ID)
 	}
-	if status.ParticipantState != distributedtxn.ParticipantPrepared || status.Revision != tx.Revision {
+	if status.TargetState != distributedtxn.TargetPrepared || status.Revision != tx.Revision {
 		return transactionError(distributedtxn.ErrJournalConflict)
 	}
-	if revision, rowsAffected, found, err := c.server.db.DistributedParticipantStatus(tx.ID); err != nil {
+	if revision, rowsAffected, found, err := c.server.db.DistributedTargetStatus(tx.ID); err != nil {
 		return transactionError(err)
 	} else if found {
 		if revision != tx.Revision+1 {
 			return transactionError(sqldriver.ErrDistributedTransactionConflict)
 		}
-		_, _ = c.server.journal.TransitionParticipant(
-			tx.ID, tx.Revision, distributedtxn.ParticipantApplied,
+		_, _ = c.server.journal.TransitionTarget(
+			tx.ID, tx.Revision, distributedtxn.TargetApplied,
 		)
 		status.Revision = revision
-		status.ParticipantState = distributedtxn.ParticipantApplied
+		status.TargetState = distributedtxn.TargetApplied
 		resp := transactionStatusResponse(status)
 		resp.RowsAffected = rowsAffected
 		return resp
 	}
-	batch, err := c.participantBatch(tx.ID)
+	batch, err := c.targetBatch(tx.ID)
 	if err != nil {
 		return transactionError(err)
 	}
-	return c.executeParticipantMutation(req, batch)
+	return c.executeTargetMutation(req, batch)
 }
 
-func (c *shardConn) prepareParticipant(req *ShardRequest) *ShardResponse {
+func (c *shardConn) prepareTarget(req *ShardRequest) *ShardResponse {
 	tx := req.Transaction
-	status, ok := c.server.journal.ParticipantStatus(tx.ID)
+	status, ok := c.server.journal.TargetStatus(tx.ID)
 	if !ok {
 		return transactionError(distributedtxn.ErrJournalNotFound)
 	}
-	if status.ParticipantState == distributedtxn.ParticipantPrepared && status.Revision == tx.Revision+1 {
+	if status.TargetState == distributedtxn.TargetPrepared && status.Revision == tx.Revision+1 {
 		return transactionStatusResponse(status)
 	}
-	if status.ParticipantState != distributedtxn.ParticipantStaged || status.Revision != tx.Revision {
+	if status.TargetState != distributedtxn.TargetStaged || status.Revision != tx.Revision {
 		return transactionError(distributedtxn.ErrJournalConflict)
 	}
-	batch, err := c.participantBatch(tx.ID)
+	batch, err := c.targetBatch(tx.ID)
 	if err != nil {
 		return transactionError(err)
 	}
@@ -1310,14 +1310,14 @@ func (c *shardConn) prepareParticipant(req *ShardRequest) *ShardResponse {
 		return classifyError(err)
 	}
 	defer c.sess.Rollback(context.Background())
-	if _, response := c.executeParticipantStatements(ctx, batch); response != nil {
+	if _, response := c.executeTargetStatements(ctx, batch); response != nil {
 		return response
 	}
 	if err := c.sess.Rollback(ctx); err != nil {
 		return classifyError(err)
 	}
-	status, err = c.server.journal.TransitionParticipant(
-		tx.ID, tx.Revision, distributedtxn.ParticipantPrepared,
+	status, err = c.server.journal.TransitionTarget(
+		tx.ID, tx.Revision, distributedtxn.TargetPrepared,
 	)
 	if err != nil {
 		return transactionError(err)
@@ -1325,17 +1325,17 @@ func (c *shardConn) prepareParticipant(req *ShardRequest) *ShardResponse {
 	return transactionStatusResponse(status)
 }
 
-func (c *shardConn) participantBatch(id distributedtxn.ID) (MutationBatch, error) {
-	raw, err := c.server.journal.ParticipantStage(id)
+func (c *shardConn) targetBatch(id distributedtxn.ID) (MutationBatch, error) {
+	raw, err := c.server.journal.TransactionTargetStage(id)
 	if err != nil {
 		return MutationBatch{}, err
 	}
 	var scopes [distributedtxn.MaxIntentScopes]distributedtxn.IntentScope
-	record, err := distributedtxn.OpenParticipantInto(raw, scopes[:])
+	record, err := distributedtxn.OpenTargetInto(raw, scopes[:])
 	if err != nil {
 		return MutationBatch{}, err
 	}
-	if distributedtxn.ParticipantDigest(
+	if distributedtxn.TargetDigest(
 		record.BucketBits, record.IntentScopes, record.Mutation,
 	) != record.MutationDigest {
 		return MutationBatch{}, distributedtxn.ErrCorrupt
@@ -1343,7 +1343,7 @@ func (c *shardConn) participantBatch(id distributedtxn.ID) (MutationBatch, error
 	return OpenMutationBatch(record.Mutation)
 }
 
-func (c *shardConn) executeParticipantMutation(
+func (c *shardConn) executeTargetMutation(
 	outer *ShardRequest,
 	batch MutationBatch,
 ) *ShardResponse {
@@ -1360,26 +1360,26 @@ func (c *shardConn) executeParticipantMutation(
 		return classifyError(err)
 	}
 	defer c.sess.Rollback(context.Background())
-	rowsAffected, response := c.executeParticipantStatements(ctx, batch)
+	rowsAffected, response := c.executeTargetStatements(ctx, batch)
 	if response != nil {
 		return response
 	}
-	affected, err := c.sess.CommitDistributedParticipant(
+	affected, err := c.sess.CommitDistributedTarget(
 		ctx, outer.Transaction.ID, outer.Transaction.Revision, rowsAffected,
 	)
 	if err != nil {
 		return classifyError(err)
 	}
-	status, err := c.server.journal.TransitionParticipant(
-		outer.Transaction.ID, outer.Transaction.Revision, distributedtxn.ParticipantApplied,
+	status, err := c.server.journal.TransitionTarget(
+		outer.Transaction.ID, outer.Transaction.Revision, distributedtxn.TargetApplied,
 	)
 	if err != nil {
 		// SQL participant state is the atomic authority. A journal delta is a
 		// compact recovery index and lookup repairs it after reopen.
 		status = distributedtxn.Status{
-			Role: distributedtxn.RoleParticipant, ID: outer.Transaction.ID,
-			Revision:         outer.Transaction.Revision + 1,
-			ParticipantState: distributedtxn.ParticipantApplied,
+			Role: distributedtxn.RoleTarget, ID: outer.Transaction.ID,
+			Revision:    outer.Transaction.Revision + 1,
+			TargetState: distributedtxn.TargetApplied,
 		}
 	}
 	resp := transactionStatusResponse(status)
@@ -1387,7 +1387,7 @@ func (c *shardConn) executeParticipantMutation(
 	return resp
 }
 
-func (c *shardConn) executeParticipantStatements(
+func (c *shardConn) executeTargetStatements(
 	ctx context.Context,
 	batch MutationBatch,
 ) (int64, *ShardResponse) {
@@ -1479,9 +1479,9 @@ func transactionStatusResponse(status distributedtxn.Status) *ShardResponse {
 	case distributedtxn.RoleCoordinator:
 		resp.Transaction.Role = TransactionRoleCoordinator
 		resp.Transaction.CoordinatorState = status.CoordinatorState
-	case distributedtxn.RoleParticipant:
-		resp.Transaction.Role = TransactionRoleParticipant
-		resp.Transaction.ParticipantState = status.ParticipantState
+	case distributedtxn.RoleTarget:
+		resp.Transaction.Role = TransactionRoleTarget
+		resp.Transaction.TargetState = status.TargetState
 	}
 	return resp
 }

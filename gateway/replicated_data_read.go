@@ -3,7 +3,6 @@ package gateway
 import (
 	"context"
 	"errors"
-	"sync"
 	"sync/atomic"
 
 	"github.com/thesyncim/vibedb/autosplit"
@@ -161,9 +160,6 @@ type ReplicatedDataReader struct {
 	scatterSlots       chan struct{}
 	scatterConcurrency int
 	pressure           PressureObserver
-
-	refreshMu sync.Mutex
-	active    *replicatedDataCatalogRefresh
 }
 
 // InstallPressureObserver binds the startup-only bounded pressure intake used
@@ -178,13 +174,6 @@ func (reader *ReplicatedDataReader) InstallPressureObserver(observer PressureObs
 	return true
 }
 
-type replicatedDataCatalogRefresh struct {
-	done          chan struct{}
-	floor         uint64
-	err           error
-	ownerCanceled bool
-}
-
 type replicatedReadReservation struct {
 	epoch atomic.Uint64
 }
@@ -193,8 +182,8 @@ type ReplicatedDataReaderOptions struct {
 	Catalog  *CatalogHolder
 	Executor *ReplicatedExecutor
 	// Refresh obtains and authenticates a catalog generation strictly newer
-	// than the generation rejected by a serving fence. Definite stale-fence
-	// refusals are the only failures that invoke it.
+	// than the generation rejected by a serving fence or proven absent-table
+	// route. Only those definite metadata failures invoke it.
 	Refresh RefreshFunc
 	// MaxConcurrentReads bounds requests admitted to native RF3 point I/O.
 	// Zero selects DefaultReplicatedReadConcurrency.
@@ -284,7 +273,20 @@ func (reader *ReplicatedDataReader) Read(
 	}
 
 	result, generation, err := reader.readPinned(ctx, request, minimumApplied, linearizable)
-	if err == nil || !errors.Is(err, raftservice.ErrServingFence) {
+	if err == nil {
+		return result, nil
+	}
+	if errors.Is(err, errReplicatedTableCatalogMiss) {
+		// Route resolution was definite and no data admission or I/O happened.
+		// Refresh once, then reacquire and resolve the original request against
+		// one immutable newer generation.
+		if refreshErr := reader.refreshAfterFence(ctx, generation); refreshErr != nil {
+			return ReplicatedTableReadResult{}, preserveCatalogMiss(err, refreshErr)
+		}
+		result, _, err = reader.readPinned(ctx, request, minimumApplied, linearizable)
+		return result, err
+	}
+	if !errors.Is(err, raftservice.ErrServingFence) {
 		return result, err
 	}
 	// A serving-fence refusal is definite: the read did not execute against the
@@ -309,7 +311,17 @@ func (reader *ReplicatedDataReader) ReadBatch(
 		return ReplicatedTableBatchReadResult{}, err
 	}
 	result, generation, err := reader.readBatchPinned(ctx, request)
-	if err == nil || !errors.Is(err, raftservice.ErrServingFence) {
+	if err == nil {
+		return result, nil
+	}
+	if errors.Is(err, errReplicatedTableCatalogMiss) {
+		if refreshErr := reader.refreshAfterFence(ctx, generation); refreshErr != nil {
+			return ReplicatedTableBatchReadResult{}, preserveCatalogMiss(err, refreshErr)
+		}
+		result, _, err = reader.readBatchPinned(ctx, request)
+		return result, err
+	}
+	if !errors.Is(err, raftservice.ErrServingFence) {
 		return result, err
 	}
 	if refreshErr := reader.refreshAfterFence(ctx, generation); refreshErr != nil {
@@ -347,6 +359,24 @@ func validateReplicatedTableBatchReadRequest(
 		}
 	}
 	return nil
+}
+
+// replicatedTableBatchRouteError maps one point's resolve failure to the
+// refreshable catalog-miss error when the batch is eligible, and to
+// ErrReplicatedTableRoute otherwise. Cold path: runs only after a miss.
+func replicatedTableBatchRouteError(
+	snapshot *Snapshot,
+	request ReplicatedTableBatchReadRequest,
+	index int,
+) error {
+	routeErr := replicatedTableRouteError(
+		snapshot, request.Points[index].Table, request.Points[index].Key,
+	)
+	if errors.Is(routeErr, errReplicatedTableCatalogMiss) &&
+		!replicatedTableBatchCatalogMissEligible(snapshot, request.Points, true) {
+		routeErr = ErrReplicatedTableRoute
+	}
+	return routeErr
 }
 
 func (reader *ReplicatedDataReader) readBatchPinned(
@@ -403,7 +433,8 @@ func (reader *ReplicatedDataReader) readBatchPinned(
 				scalarScratch, replicaScratch,
 			)
 			if !ok {
-				return ReplicatedTableBatchReadResult{}, lease.generation, ErrReplicatedTableRoute
+				return ReplicatedTableBatchReadResult{}, lease.generation,
+					replicatedTableBatchRouteError(lease.snapshot, request, index)
 			}
 			route, routeID = resolved.Route, resolved.RouteID
 			routeAuthority = replicatedRouteAuthority(route)
@@ -419,7 +450,11 @@ func (reader *ReplicatedDataReader) readBatchPinned(
 			request.Points[index].Table, request.Points[index].Key,
 			scalarScratch, replicaScratch,
 		)
-		if !ok || replicatedRouteAuthority(resolved.Route) != routeAuthority {
+		if !ok {
+			return ReplicatedTableBatchReadResult{}, lease.generation,
+				replicatedTableBatchRouteError(lease.snapshot, request, index)
+		}
+		if replicatedRouteAuthority(resolved.Route) != routeAuthority {
 			return ReplicatedTableBatchReadResult{}, lease.generation, ErrReplicatedTableRoute
 		}
 		points[index] = ReplicatedBatchPointRead{
@@ -478,7 +513,9 @@ func (reader *ReplicatedDataReader) readPinned(
 		request.Table, request.Key, scalarScratch[:0], replicas[:0],
 	)
 	if !ok {
-		return ReplicatedTableReadResult{}, lease.generation, ErrReplicatedTableRoute
+		routeErr := replicatedTableRouteError(lease.snapshot, request.Table, request.Key)
+		return ReplicatedTableReadResult{}, lease.generation,
+			routeErr
 	}
 	if !linearizable && request.Position.RouteID != resolved.RouteID {
 		return ReplicatedTableReadResult{}, lease.generation, ErrReplicatedReadPositionMismatch
@@ -615,70 +652,5 @@ func (reader *ReplicatedDataReader) refreshAfterFence(
 	if reader == nil || reader.catalog == nil || ctx == nil || staleGeneration == 0 {
 		return ErrReplicatedDataRead
 	}
-	for {
-		if current := reader.catalog.Current(); current != nil &&
-			current.Generation() > staleGeneration {
-			return nil
-		}
-		reader.refreshMu.Lock()
-		if active := reader.active; active != nil {
-			reader.refreshMu.Unlock()
-			select {
-			case <-ctx.Done():
-				return context.Cause(ctx)
-			case <-active.done:
-			}
-			if current := reader.catalog.Current(); current != nil &&
-				current.Generation() > staleGeneration {
-				return nil
-			}
-			if active.floor >= staleGeneration {
-				if active.err != nil {
-					// A refresh owner lends only its authenticated result, not
-					// its request lifetime. A canceled owner must not poison a
-					// still-live waiter; let that waiter become the next owner.
-					if active.ownerCanceled {
-						continue
-					}
-					return active.err
-				}
-				return ErrStaleGeneration
-			}
-			continue
-		}
-		active := &replicatedDataCatalogRefresh{
-			done: make(chan struct{}), floor: staleGeneration,
-		}
-		reader.active = active
-		reader.refreshMu.Unlock()
-
-		var snapshot *Snapshot
-		if reader.refresh == nil {
-			active.err = ErrStaleGeneration
-		} else {
-			snapshot, active.err = reader.refresh(ctx, staleGeneration)
-			if active.err == nil && (snapshot == nil || snapshot.Generation() <= staleGeneration) {
-				active.err = ErrStaleGeneration
-			}
-			if active.err == nil {
-				current := reader.catalog.Current()
-				if current == nil || current.Generation() < snapshot.Generation() {
-					if publishErr := reader.catalog.publishNewerChecked(snapshot); publishErr != nil &&
-						!errors.Is(publishErr, ErrCatalogGenerationNotNewer) {
-						active.err = publishErr
-					}
-				}
-			}
-		}
-		if current := reader.catalog.Current(); current != nil &&
-			current.Generation() > staleGeneration {
-			active.err = nil
-		}
-		active.ownerCanceled = context.Cause(ctx) != nil
-		reader.refreshMu.Lock()
-		reader.active = nil
-		close(active.done)
-		reader.refreshMu.Unlock()
-		return active.err
-	}
+	return reader.catalog.refreshAfter(ctx, staleGeneration, reader.refresh)
 }

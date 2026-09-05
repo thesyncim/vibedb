@@ -99,6 +99,7 @@ type segmentEvent struct {
 	GroupID, Index, Term, Offset, Bytes uint64
 	Vote, Commit                        uint64
 	Incarnation, ReadyID                uint64
+	ReadySpan                           uint64
 	DataOffset, DataBytes               uint64
 	Reference                           [16]byte
 	ReadyDigest                         [16]byte

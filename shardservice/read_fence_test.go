@@ -116,7 +116,7 @@ func TestReadFenceCapacityIsBoundedAndRecovers(t *testing.T) {
 	}
 }
 
-func TestParticipantReservationHandsWriteToDurableBarrier(t *testing.T) {
+func TestTargetReservationHandsWriteToDurableBarrier(t *testing.T) {
 	gate := newReadFenceSet(DefaultMaxReadFences)
 	t.Cleanup(gate.close)
 	scope := []distributedtxn.IntentScope{{Start: 50, End: 51}}
@@ -128,14 +128,14 @@ func TestParticipantReservationHandsWriteToDurableBarrier(t *testing.T) {
 		token uint64
 		err   error
 	}
-	participant := make(chan admission, 1)
+	target := make(chan admission, 1)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	go func() {
-		token, err := gate.enterParticipant(ctx, 8, scope)
-		participant <- admission{token: token, err: err}
+		token, err := gate.enterTarget(ctx, 8, scope)
+		target <- admission{token: token, err: err}
 	}()
-	waitForParticipantReservations(t, gate, 1)
+	waitForTargetReservations(t, gate, 1)
 	second := make(chan admission, 1)
 	go func() {
 		token, err := gate.enterWrite(ctx, 8, scope)
@@ -147,13 +147,13 @@ func TestParticipantReservationHandsWriteToDurableBarrier(t *testing.T) {
 	case <-time.After(10 * time.Millisecond):
 	}
 	gate.leaveWrite(first)
-	var participantToken uint64
+	var targetToken uint64
 	select {
-	case result := <-participant:
+	case result := <-target:
 		if result.err != nil || result.token == 0 {
 			t.Fatalf("participant admission = %+v", result)
 		}
-		participantToken = result.token
+		targetToken = result.token
 	case <-time.After(time.Second):
 		t.Fatal("participant did not follow active writer")
 	}
@@ -162,7 +162,7 @@ func TestParticipantReservationHandsWriteToDurableBarrier(t *testing.T) {
 		t.Fatalf("writer crossed held participant reservation: %+v", result)
 	case <-time.After(10 * time.Millisecond):
 	}
-	gate.leaveParticipant(participantToken)
+	gate.leaveTarget(targetToken)
 	select {
 	case result := <-second:
 		if result.err != nil || result.token == 0 {
@@ -189,7 +189,7 @@ func waitForReadFenceWriters(t *testing.T, gate *readFenceSet, count int) {
 	t.Fatalf("writer count did not reach %d", count)
 }
 
-func waitForParticipantReservations(t *testing.T, gate *readFenceSet, count int) {
+func waitForTargetReservations(t *testing.T, gate *readFenceSet, count int) {
 	t.Helper()
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {

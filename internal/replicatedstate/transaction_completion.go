@@ -53,7 +53,7 @@ type TransactionCompletionResult struct {
 
 // OpenTransactionCompletionResult opens the sole fixed transaction-result
 // grammar. It rejects unknown flags, reserved bytes, invalid roles/operations,
-// and affected-row claims outside participant Apply or committed coordinator
+// and affected-row claims outside target Apply or committed coordinator
 // retirement.
 func OpenTransactionCompletionResult(
 	resultCode uint32,
@@ -75,9 +75,9 @@ func OpenTransactionCompletionResult(
 	if !transactionOperationRole(result.Operation, result.Role) ||
 		result.AffectedRows < 0 ||
 		result.AffectedRowsValid &&
-			result.Operation != distributedtxn.ReplicatedApplyParticipant &&
-			result.Operation != distributedtxn.ReplicatedApplyReleaseParticipant &&
-			result.Operation != distributedtxn.ReplicatedApplySingleParticipant &&
+			result.Operation != distributedtxn.ReplicatedApplyTarget &&
+			result.Operation != distributedtxn.ReplicatedApplyReleaseTarget &&
+			result.Operation != distributedtxn.ReplicatedApplySingleTarget &&
 			result.Operation != distributedtxn.ReplicatedRetireCoordinator ||
 		!result.AffectedRowsValid && result.AffectedRows != 0 ||
 		result.RevisionValid != (result.Revision != 0) {
@@ -99,9 +99,9 @@ func OpenTransactionCompletionResult(
 		) {
 		return TransactionCompletionResult{}, ErrCompletionCorrupt
 	}
-	apply := result.Operation == distributedtxn.ReplicatedApplyParticipant ||
-		result.Operation == distributedtxn.ReplicatedApplyReleaseParticipant ||
-		result.Operation == distributedtxn.ReplicatedApplySingleParticipant
+	apply := result.Operation == distributedtxn.ReplicatedApplyTarget ||
+		result.Operation == distributedtxn.ReplicatedApplyReleaseTarget ||
+		result.Operation == distributedtxn.ReplicatedApplySingleTarget
 	if resultCode == ResultApplied &&
 		(apply && !result.AffectedRowsValid ||
 			!apply && result.Operation != distributedtxn.ReplicatedRetireCoordinator &&
@@ -118,10 +118,10 @@ func transactionOperationCanRejectPrepare(
 	role distributedtxn.ReplicatedRole,
 	operation distributedtxn.ReplicatedOperation,
 ) bool {
-	if role == distributedtxn.ReplicatedRoleParticipant {
-		return operation == distributedtxn.ReplicatedPrepareParticipant ||
-			operation == distributedtxn.ReplicatedStagePrepareParticipant ||
-			operation == distributedtxn.ReplicatedApplySingleParticipant
+	if role == distributedtxn.ReplicatedRoleTarget {
+		return operation == distributedtxn.ReplicatedPrepareTarget ||
+			operation == distributedtxn.ReplicatedStagePrepareTarget ||
+			operation == distributedtxn.ReplicatedApplySingleTarget
 	}
 	return role == distributedtxn.ReplicatedRoleCoordinator &&
 		(operation == distributedtxn.ReplicatedBeginPrepareCoordinator ||
@@ -234,13 +234,13 @@ func transactionCompletionDisposition(
 			return transactionRetryUnknown, 0, ErrTransactionStateCorrupt
 		}
 	}
-	if lastIdentity && (command.Operation == distributedtxn.ReplicatedPrepareParticipant ||
-		command.Operation == distributedtxn.ReplicatedStagePrepareParticipant ||
+	if lastIdentity && (command.Operation == distributedtxn.ReplicatedPrepareTarget ||
+		command.Operation == distributedtxn.ReplicatedStagePrepareTarget ||
 		command.Operation == distributedtxn.ReplicatedBeginPrepareCoordinator ||
 		command.Operation == distributedtxn.ReplicatedBeginPrepareManifestCoordinator ||
-		command.Operation == distributedtxn.ReplicatedApplySingleParticipant ||
-		command.Operation == distributedtxn.ReplicatedApplyReleaseParticipant ||
-		command.Operation == distributedtxn.ReplicatedAbortReleaseParticipant) {
+		command.Operation == distributedtxn.ReplicatedApplySingleTarget ||
+		command.Operation == distributedtxn.ReplicatedApplyReleaseTarget ||
+		command.Operation == distributedtxn.ReplicatedAbortReleaseTarget) {
 		return transactionRetryConflict, ResultTransactionConflict, nil
 	}
 	exact, historicalResult, err := transactionHistoricalRetryExact(
@@ -301,18 +301,18 @@ func transactionHistoricalRetryExact(
 			distributedtxn.CoordinatorState(control.State) != distributedtxn.CoordinatorRetired,
 		)
 		return exact, ResultApplied, err
-	case distributedtxn.ReplicatedStageParticipant:
-		return !control.FusedPath && transactionParticipantStageRetryExact(command, control), ResultApplied, nil
-	case distributedtxn.ReplicatedStagePrepareParticipant:
-		return control.FusedPath && transactionParticipantStageRetryExact(command, control) &&
+	case distributedtxn.ReplicatedStageTarget:
+		return !control.FusedPath && transactionTargetStageRetryExact(command, control), ResultApplied, nil
+	case distributedtxn.ReplicatedStagePrepareTarget:
+		return control.FusedPath && transactionTargetStageRetryExact(command, control) &&
 			control.PrepareCommandDigest == commandDigest &&
 			(control.PrepareResultCode == ResultApplied ||
 				control.PrepareResultCode == ResultIndexConflict ||
 				control.PrepareResultCode == ResultWrongShard), control.PrepareResultCode, nil
-	case distributedtxn.ReplicatedApplySingleParticipant:
-		return control.FusedPath && transactionParticipantStageRetryExact(command, control) &&
+	case distributedtxn.ReplicatedApplySingleTarget:
+		return control.FusedPath && transactionTargetStageRetryExact(command, control) &&
 			control.PrepareCommandDigest == commandDigest &&
-			distributedtxn.ParticipantState(control.State) == distributedtxn.ParticipantReleased &&
+			distributedtxn.TargetState(control.State) == distributedtxn.TargetReleased &&
 			control.Revision == command.ExpectedRevision &&
 			(control.PrepareResultCode == ResultApplied ||
 				control.PrepareResultCode == ResultIndexConflict ||
@@ -334,7 +334,7 @@ func transactionHistoricalRetryExact(
 			control.Revision == command.ExpectedRevision+1 &&
 			control.AffectedRowsValid == summary.AffectedRowsValid &&
 			control.AffectedRows == summary.AffectedRows, ResultApplied, nil
-	case distributedtxn.ReplicatedPrepareParticipant:
+	case distributedtxn.ReplicatedPrepareTarget:
 		if control.FusedPath {
 			return false, 0, nil
 		}
@@ -345,50 +345,50 @@ func transactionHistoricalRetryExact(
 			return control.PrepareCommandDigest == commandDigest,
 				control.PrepareResultCode, nil
 		}
-		return transactionParticipantWasPrepared(control), ResultApplied, nil
-	case distributedtxn.ReplicatedApplyParticipant:
+		return transactionTargetWasPrepared(control), ResultApplied, nil
+	case distributedtxn.ReplicatedApplyTarget:
 		return !control.FusedPath && command.ExpectedRevision == 2 && control.AffectedRowsValid &&
-			(distributedtxn.ParticipantState(control.State) == distributedtxn.ParticipantApplied ||
-				distributedtxn.ParticipantState(control.State) == distributedtxn.ParticipantReleased), ResultApplied, nil
-	case distributedtxn.ReplicatedApplyReleaseParticipant:
+			(distributedtxn.TargetState(control.State) == distributedtxn.TargetApplied ||
+				distributedtxn.TargetState(control.State) == distributedtxn.TargetReleased), ResultApplied, nil
+	case distributedtxn.ReplicatedApplyReleaseTarget:
 		return control.FusedPath && command.ExpectedRevision == 2 && control.AffectedRowsValid &&
-			distributedtxn.ParticipantState(control.State) == distributedtxn.ParticipantReleased &&
+			distributedtxn.TargetState(control.State) == distributedtxn.TargetReleased &&
 			control.Revision == 4, ResultApplied, nil
-	case distributedtxn.ReplicatedAbortParticipant:
-		state := distributedtxn.ParticipantState(control.State)
+	case distributedtxn.ReplicatedAbortTarget:
+		state := distributedtxn.TargetState(control.State)
 		return !control.FusedPath && !control.AffectedRowsValid &&
-			(state == distributedtxn.ParticipantAborted && control.Revision == command.ExpectedRevision+1 ||
-				state == distributedtxn.ParticipantReleased && control.Revision == command.ExpectedRevision+2), ResultApplied, nil
-	case distributedtxn.ReplicatedAbortReleaseParticipant:
+			(state == distributedtxn.TargetAborted && control.Revision == command.ExpectedRevision+1 ||
+				state == distributedtxn.TargetReleased && control.Revision == command.ExpectedRevision+2), ResultApplied, nil
+	case distributedtxn.ReplicatedAbortReleaseTarget:
 		if command.ExpectedRevision == 0 {
-			return transactionParticipantAbortFenceRetryExact(command, control),
+			return transactionTargetAbortFenceRetryExact(command, control),
 				ResultApplied, nil
 		}
 		return control.FusedPath && command.ExpectedRevision == 2 && !control.AffectedRowsValid &&
-			distributedtxn.ParticipantState(control.State) == distributedtxn.ParticipantReleased &&
+			distributedtxn.TargetState(control.State) == distributedtxn.TargetReleased &&
 			control.Revision == 4, ResultApplied, nil
-	case distributedtxn.ReplicatedReleaseParticipant:
-		return !control.FusedPath && distributedtxn.ParticipantState(control.State) == distributedtxn.ParticipantReleased &&
+	case distributedtxn.ReplicatedReleaseTarget:
+		return !control.FusedPath && distributedtxn.TargetState(control.State) == distributedtxn.TargetReleased &&
 			control.Revision == command.ExpectedRevision+1, ResultApplied, nil
 	default:
 		return false, 0, ErrTransactionStateCorrupt
 	}
 }
 
-func transactionParticipantAbortFenceRetryExact(
+func transactionTargetAbortFenceRetryExact(
 	command distributedtxn.ReplicatedCommandView,
 	control TransactionControl,
 ) bool {
-	stage := command.Participant
+	stage := command.Target
 	return control.CancellationWitness && control.FusedPath && control.Revision == 1 &&
-		distributedtxn.ParticipantState(control.State) == distributedtxn.ParticipantReleased &&
-		control.PayloadKind == distributedtxn.ReplicatedPayloadParticipantStage &&
+		distributedtxn.TargetState(control.State) == distributedtxn.TargetReleased &&
+		control.PayloadKind == distributedtxn.ReplicatedPayloadTargetStage &&
 		control.PayloadDigest == stage.MutationDigest &&
 		control.MutationDigest == stage.MutationDigest &&
 		control.CoordinatorGroup == replication.ID128(stage.CoordinatorGroup) &&
 		control.CoordinatorShardIncarnation == replication.ID128(stage.CoordinatorShardIncarnation) &&
 		control.CoordinatorAllocation == stage.CoordinatorAllocation &&
-		control.ParticipantOrdinal == stage.ParticipantOrdinal &&
+		control.TargetOrdinal == stage.TargetOrdinal &&
 		stage.BucketBits == 0 && len(stage.IntentScopes) == 0
 }
 
@@ -429,25 +429,25 @@ func transactionCoordinatorDecisionExpected(control TransactionControl) uint64 {
 	return control.Revision - 1
 }
 
-func transactionParticipantWasPrepared(control TransactionControl) bool {
-	switch distributedtxn.ParticipantState(control.State) {
-	case distributedtxn.ParticipantPrepared, distributedtxn.ParticipantApplied:
+func transactionTargetWasPrepared(control TransactionControl) bool {
+	switch distributedtxn.TargetState(control.State) {
+	case distributedtxn.TargetPrepared, distributedtxn.TargetApplied:
 		return true
-	case distributedtxn.ParticipantAborted:
+	case distributedtxn.TargetAborted:
 		return control.Revision == 3
-	case distributedtxn.ParticipantReleased:
+	case distributedtxn.TargetReleased:
 		return control.AffectedRowsValid || control.Revision == 4
 	default:
 		return false
 	}
 }
 
-func transactionParticipantStageRetryExact(
+func transactionTargetStageRetryExact(
 	command distributedtxn.ReplicatedCommandView,
 	control TransactionControl,
 ) bool {
-	stage := command.Participant
-	return control.PayloadKind == distributedtxn.ReplicatedPayloadParticipantStage &&
+	stage := command.Target
+	return control.PayloadKind == distributedtxn.ReplicatedPayloadTargetStage &&
 		control.MutationDigest == stage.MutationDigest &&
 		control.CoordinatorGroup == replication.ID128(stage.CoordinatorGroup) &&
 		control.CoordinatorShardIncarnation == replication.ID128(stage.CoordinatorShardIncarnation) &&
@@ -468,14 +468,14 @@ func transactionCoordinatorBeginRetryExact(
 	if !control.FusedPath || control.PayloadKind != wantKind ||
 		control.PayloadDigest != distributedtxn.Digest(sha256.Sum256(command.Payload)) ||
 		distributedtxn.CoordinatorState(control.State) != distributedtxn.CoordinatorRetired &&
-			control.CoordinatorParticipantOrdinal != uint64(command.Participant.ParticipantOrdinal) ||
+			control.CoordinatorTargetOrdinal != uint64(command.Target.TargetOrdinal) ||
 		(control.PrepareResultCode != ResultApplied &&
 			control.PrepareResultCode != ResultIndexConflict &&
 			control.PrepareResultCode != ResultWrongShard) {
 		return false, 0, nil
 	}
 	key, err := TransactionControlStorageKey(
-		distributedtxn.ReplicatedRoleParticipant, command.ID,
+		distributedtxn.ReplicatedRoleTarget, command.ID,
 	)
 	if err != nil {
 		return false, 0, err
@@ -487,14 +487,14 @@ func transactionCoordinatorBeginRetryExact(
 	if !found {
 		return false, 0, ErrTransactionStateCorrupt
 	}
-	participant, err := OpenTransactionControl(raw)
-	if err != nil || participant.ID != command.ID ||
-		participant.Role != distributedtxn.ReplicatedRoleParticipant {
+	target, err := OpenTransactionControl(raw)
+	if err != nil || target.ID != command.ID ||
+		target.Role != distributedtxn.ReplicatedRoleTarget {
 		return false, 0, errors.Join(err, ErrTransactionStateCorrupt)
 	}
-	if !transactionParticipantStageRetryExact(command, participant.TransactionControl) ||
-		participant.PrepareResultCode != control.PrepareResultCode ||
-		participant.PrepareCommandDigest != commandDigest {
+	if !transactionTargetStageRetryExact(command, target.TransactionControl) ||
+		target.PrepareResultCode != control.PrepareResultCode ||
+		target.PrepareCommandDigest != commandDigest {
 		return false, 0, nil
 	}
 	return true, control.PrepareResultCode, nil
@@ -560,8 +560,8 @@ func openTransactionManifestPageWitness(
 	var digest distributedtxn.Digest
 	copy(digest[:], src[56:88])
 	if !ok || id.IsZero() || meta.Index != binary.LittleEndian.Uint32(src[20:24]) ||
-		meta.FirstParticipant != binary.LittleEndian.Uint64(src[24:32]) ||
-		meta.ParticipantCount != binary.LittleEndian.Uint32(src[32:36]) ||
+		meta.FirstTarget != binary.LittleEndian.Uint64(src[24:32]) ||
+		meta.TargetCount != binary.LittleEndian.Uint32(src[32:36]) ||
 		meta.Digest != digest {
 		return distributedtxn.ID{}, transactionManifestSegmentMeta{}, nil, ErrTransactionStateCorrupt
 	}
@@ -589,9 +589,9 @@ func (m *Machine) appendTransactionCompletion(
 		result[2] |= transactionCompletionControlRevision
 	}
 	binary.LittleEndian.PutUint64(result[8:16], control.Revision)
-	apply := transaction.Operation == distributedtxn.ReplicatedApplyParticipant ||
-		transaction.Operation == distributedtxn.ReplicatedApplyReleaseParticipant ||
-		transaction.Operation == distributedtxn.ReplicatedApplySingleParticipant
+	apply := transaction.Operation == distributedtxn.ReplicatedApplyTarget ||
+		transaction.Operation == distributedtxn.ReplicatedApplyReleaseTarget ||
+		transaction.Operation == distributedtxn.ReplicatedApplySingleTarget
 	retire := transaction.Operation == distributedtxn.ReplicatedRetireCoordinator
 	if exact && resultCode == ResultApplied && (apply || retire) {
 		if apply && (!control.AffectedRowsValid || control.AffectedRows < 0) ||

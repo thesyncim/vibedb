@@ -404,6 +404,78 @@ func TestReplicatedDataReaderRejectsForeignPositionBeforeIO(t *testing.T) {
 	}
 }
 
+func TestReplicatedDataReaderCatalogMissRefreshesBeforeIO(t *testing.T) {
+	client := &publicPointReadClient{
+		value: []byte(`{"id":"customer-17"}`), wantRelation: 2,
+		wantMaxValue: 4 << 20, wantMinimum: 1,
+	}
+	reader, holder, key, _ := testReplicatedDataReader(t, client)
+	config, endpoints, descriptor, profile := testReplicatedTableInput(t)
+	config.Placements = append(config.Placements, config.Placements[0])
+	config.Placements[1].Table = "fresh"
+	fresh := profile
+	fresh.Table, fresh.Relation = "fresh", 2
+	newer, err := NewSnapshotWithReplicatedTableMetadata(
+		config, endpoints, 6, nil, nil,
+		[]ReplicatedShardDescriptor{descriptor}, []ReplicatedTableProfile{profile, fresh},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var refreshes atomic.Int32
+	reader.refresh = func(_ context.Context, stale uint64) (*Snapshot, error) {
+		refreshes.Add(1)
+		if stale != 5 {
+			t.Fatalf("stale generation = %d, want 5", stale)
+		}
+		return newer, nil
+	}
+	result, err := reader.Read(context.Background(), ReplicatedTableReadRequest{
+		Table: []byte("fresh"), Key: key, Consistency: ReplicatedDataReadLinearizable,
+	})
+	defer result.Release()
+	if err != nil || !result.Found || !bytes.Equal(result.Value, client.value) {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	if refreshes.Load() != 1 || client.requests == 0 || holder.Current().Generation() != 6 {
+		t.Fatalf("refreshes=%d requests=%d generation=%d", refreshes.Load(), client.requests, holder.Current().Generation())
+	}
+}
+
+func TestReplicatedDataReaderCatalogMissRejectsMalformedKeysWithoutRefresh(t *testing.T) {
+	client := &publicPointReadClient{wantRelation: 1, wantMaxValue: 4 << 20, wantMinimum: 1}
+	reader, _, key, _ := testReplicatedDataReader(t, client)
+	var refreshes atomic.Uint32
+	reader.refresh = func(context.Context, uint64) (*Snapshot, error) {
+		refreshes.Add(1)
+		return nil, ErrReplicatedDataRead
+	}
+	malformed := append(append([]byte(nil), key...), 0)
+	if _, err := reader.Read(context.Background(), ReplicatedTableReadRequest{
+		Table: []byte("fresh"), Key: malformed,
+		Consistency: ReplicatedDataReadLinearizable,
+	}); !errors.Is(err, ErrReplicatedTableRoute) {
+		t.Fatalf("single malformed miss error=%v", err)
+	}
+	if refreshes.Load() != 0 || client.requests != 0 {
+		t.Fatalf("single malformed miss refreshed=%d requests=%d", refreshes.Load(), client.requests)
+	}
+
+	validFresh := append([]byte(nil), key...)
+	if _, err := reader.ReadBatch(context.Background(), ReplicatedTableBatchReadRequest{
+		MaxResultBytes: 1 << 20,
+		Points: []ReplicatedTableBatchPoint{
+			{Table: []byte("fresh"), Key: validFresh},
+			{Table: []byte("messages"), Key: malformed},
+		},
+	}); !errors.Is(err, ErrReplicatedTableRoute) {
+		t.Fatalf("batch malformed miss error=%v", err)
+	}
+	if refreshes.Load() != 0 || client.requests != 0 {
+		t.Fatalf("batch malformed miss refreshed=%d requests=%d", refreshes.Load(), client.requests)
+	}
+}
+
 func TestReplicatedDataReaderFailsClosedOnCatalogAndServingFence(t *testing.T) {
 	client := &publicPointReadClient{wantRelation: 1, wantMaxValue: 4 << 20, wantMinimum: 1}
 	reader, _, key, _ := testReplicatedDataReader(t, client)

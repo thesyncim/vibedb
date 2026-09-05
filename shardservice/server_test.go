@@ -563,8 +563,8 @@ func TestTransactionStageAndLookupAreDurableAndIdempotent(t *testing.T) {
 	conn := dial(t, srv)
 	owner := testOwner()
 	id := testTransactionID(11)
-	record, err := distributedtxn.AppendParticipant(nil, distributedtxn.ParticipantRecord{
-		ID: id, State: distributedtxn.ParticipantStaged, Revision: 1,
+	record, err := distributedtxn.AppendTarget(nil, distributedtxn.TargetRecord{
+		ID: id, State: distributedtxn.TargetStaged, Revision: 1,
 		RoutingVersion:       uint64(owner.RoutingVersion),
 		AllocationGeneration: uint64(owner.AllocationGeneration),
 		OwnershipEpoch:       uint64(owner.Epoch), CoordinatorDistribution: []byte(owner.Distribution), CoordinatorShard: []byte(owner.Shard),
@@ -576,11 +576,11 @@ func TestTransactionStageAndLookupAreDurableAndIdempotent(t *testing.T) {
 		t.Fatalf("AppendParticipant: %v", err)
 	}
 	stage := ownedRequest("")
-	stage.Transaction = TransactionRequest{Operation: TransactionStageParticipant, Record: record}
+	stage.Transaction = TransactionRequest{Operation: TransactionStageTarget, Record: record}
 	first := exec(t, conn, stage)
-	if first.Transaction.Role != TransactionRoleParticipant ||
+	if first.Transaction.Role != TransactionRoleTarget ||
 		first.Transaction.ID != id || first.Transaction.Revision != 1 ||
-		first.Transaction.ParticipantState != distributedtxn.ParticipantStaged {
+		first.Transaction.TargetState != distributedtxn.TargetStaged {
 		t.Fatalf("stage response = %+v", first)
 	}
 	// A lost stage response is retried byte-for-byte and resolves to the same
@@ -590,7 +590,7 @@ func TestTransactionStageAndLookupAreDurableAndIdempotent(t *testing.T) {
 		t.Fatalf("duplicate stage = %+v, want %+v", second.Transaction, first.Transaction)
 	}
 	lookup := ownedRequest("")
-	lookup.Transaction = TransactionRequest{Operation: TransactionLookupParticipant, ID: id}
+	lookup.Transaction = TransactionRequest{Operation: TransactionLookupTarget, ID: id}
 	observed := exec(t, conn, lookup)
 	if !observed.Transaction.Equal(first.Transaction) {
 		t.Fatalf("lookup = %+v, want %+v", observed.Transaction, first.Transaction)
@@ -601,8 +601,8 @@ func TestTransactionStageSurvivesShardRestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "shard.vdb")
 	owner := testOwner()
 	id := testTransactionID(21)
-	record, err := distributedtxn.AppendParticipant(nil, distributedtxn.ParticipantRecord{
-		ID: id, State: distributedtxn.ParticipantStaged, Revision: 1,
+	record, err := distributedtxn.AppendTarget(nil, distributedtxn.TargetRecord{
+		ID: id, State: distributedtxn.TargetStaged, Revision: 1,
 		RoutingVersion:       uint64(owner.RoutingVersion),
 		AllocationGeneration: uint64(owner.AllocationGeneration),
 		OwnershipEpoch:       uint64(owner.Epoch), CoordinatorDistribution: []byte(owner.Distribution), CoordinatorShard: []byte(owner.Shard),
@@ -621,7 +621,7 @@ func TestTransactionStageSurvivesShardRestart(t *testing.T) {
 	}
 	conn := dial(t, srv)
 	stage := ownedRequest("")
-	stage.Transaction = TransactionRequest{Operation: TransactionStageParticipant, Record: record}
+	stage.Transaction = TransactionRequest{Operation: TransactionStageTarget, Record: record}
 	want := exec(t, conn, stage).Transaction
 	_ = conn.Close()
 	if err := srv.Close(); err != nil {
@@ -639,13 +639,13 @@ func TestTransactionStageSurvivesShardRestart(t *testing.T) {
 	defer srv.Close()
 	conn = dial(t, srv)
 	lookup := ownedRequest("")
-	lookup.Transaction = TransactionRequest{Operation: TransactionLookupParticipant, ID: id}
+	lookup.Transaction = TransactionRequest{Operation: TransactionLookupTarget, ID: id}
 	if got := exec(t, conn, lookup).Transaction; !got.Equal(want) {
 		t.Fatalf("recovered transaction = %+v, want %+v", got, want)
 	}
 }
 
-func TestTransactionApplyPublishesMutationAndParticipantStateTogether(t *testing.T) {
+func TestTransactionApplyPublishesMutationAndTargetStateTogether(t *testing.T) {
 	srv, _ := newServer(t, Options{})
 	conn := dial(t, srv)
 	exec(t, conn, ownedRequest(ddlDocs))
@@ -658,9 +658,9 @@ func TestTransactionApplyPublishesMutationAndParticipantStateTogether(t *testing
 	if err != nil {
 		t.Fatalf("AppendMutationBatch: %v", err)
 	}
-	digest := distributedtxn.ParticipantDigest(0, nil, mutation)
-	record, err := distributedtxn.AppendParticipant(nil, distributedtxn.ParticipantRecord{
-		ID: id, State: distributedtxn.ParticipantStaged, Revision: 1,
+	digest := distributedtxn.TargetDigest(0, nil, mutation)
+	record, err := distributedtxn.AppendTarget(nil, distributedtxn.TargetRecord{
+		ID: id, State: distributedtxn.TargetStaged, Revision: 1,
 		RoutingVersion:       uint64(owner.RoutingVersion),
 		AllocationGeneration: uint64(owner.AllocationGeneration),
 		OwnershipEpoch:       uint64(owner.Epoch), CoordinatorDistribution: []byte(owner.Distribution), CoordinatorShard: []byte(owner.Shard),
@@ -672,24 +672,24 @@ func TestTransactionApplyPublishesMutationAndParticipantStateTogether(t *testing
 		t.Fatalf("AppendParticipant: %v", err)
 	}
 	stage := ownedRequest("")
-	stage.Transaction = TransactionRequest{Operation: TransactionStageParticipant, Record: record}
+	stage.Transaction = TransactionRequest{Operation: TransactionStageTarget, Record: record}
 	exec(t, conn, stage)
 	prepare := ownedRequest("")
 	prepare.Transaction = TransactionRequest{
-		Operation: TransactionPrepareParticipant, ID: id, Revision: 1,
+		Operation: TransactionPrepareTarget, ID: id, Revision: 1,
 	}
 	prepared := exec(t, conn, prepare)
-	if prepared.Transaction.ParticipantState != distributedtxn.ParticipantPrepared ||
+	if prepared.Transaction.TargetState != distributedtxn.TargetPrepared ||
 		prepared.Transaction.Revision != 2 {
 		t.Fatalf("prepare = %+v", prepared)
 	}
 	apply := ownedRequest("")
 	apply.Transaction = TransactionRequest{
-		Operation: TransactionApplyParticipant, ID: id, Revision: 2,
+		Operation: TransactionApplyTarget, ID: id, Revision: 2,
 	}
 	applied := exec(t, conn, apply)
 	if applied.RowsAffected != 1 ||
-		applied.Transaction.ParticipantState != distributedtxn.ParticipantApplied ||
+		applied.Transaction.TargetState != distributedtxn.TargetApplied ||
 		applied.Transaction.Revision != 3 {
 		t.Fatalf("apply = %+v", applied)
 	}
@@ -724,15 +724,15 @@ func TestTransactionApplyPublishesMutationAndParticipantStateTogether(t *testing
 	}
 	release := ownedRequest("")
 	release.Transaction = TransactionRequest{
-		Operation: TransactionReleaseParticipant, ID: id, Revision: 3,
+		Operation: TransactionReleaseTarget, ID: id, Revision: 3,
 	}
 	released := exec(t, conn, release)
-	if released.Transaction.ParticipantState != distributedtxn.ParticipantReleased ||
+	if released.Transaction.TargetState != distributedtxn.TargetReleased ||
 		released.Transaction.Revision != 4 {
 		t.Fatalf("release = %+v", released)
 	}
 	lookup := ownedRequest("")
-	lookup.Transaction = TransactionRequest{Operation: TransactionLookupParticipant, ID: id}
+	lookup.Transaction = TransactionRequest{Operation: TransactionLookupTarget, ID: id}
 	if retained := exec(t, conn, lookup); retained.RowsAffected != 1 ||
 		!retained.Transaction.Equal(released.Transaction) {
 		t.Fatalf("released lookup = %+v, want transaction %+v", retained, released.Transaction)
@@ -755,7 +755,7 @@ func TestTransactionApplyPublishesMutationAndParticipantStateTogether(t *testing
 	}
 }
 
-func TestScopedParticipantBlocksOnlyIntersectingTraffic(t *testing.T) {
+func TestScopedTargetBlocksOnlyIntersectingTraffic(t *testing.T) {
 	srv, _ := newServer(t, Options{})
 	conn := dial(t, srv)
 	exec(t, conn, ownedRequest(ddlDocs))
@@ -772,21 +772,21 @@ func TestScopedParticipantBlocksOnlyIntersectingTraffic(t *testing.T) {
 		t.Fatal(err)
 	}
 	scopes := []distributedtxn.IntentScope{{Start: 10, End: 11}}
-	record, err := distributedtxn.AppendParticipant(nil, distributedtxn.ParticipantRecord{
-		ID: id, State: distributedtxn.ParticipantStaged, Revision: 1,
+	record, err := distributedtxn.AppendTarget(nil, distributedtxn.TargetRecord{
+		ID: id, State: distributedtxn.TargetStaged, Revision: 1,
 		RoutingVersion: uint64(owner.RoutingVersion), AllocationGeneration: uint64(owner.AllocationGeneration),
 		OwnershipEpoch:          uint64(owner.Epoch),
 		CoordinatorDistribution: []byte(owner.Distribution), CoordinatorShard: []byte(owner.Shard),
 		CoordinatorAllocation:     uint64(owner.AllocationGeneration),
 		CoordinatorRoutingVersion: uint64(owner.RoutingVersion), CoordinatorOwnershipEpoch: uint64(owner.Epoch),
 		BucketBits: 8, IntentScopes: scopes,
-		MutationDigest: distributedtxn.ParticipantDigest(8, scopes, mutation), Mutation: mutation,
+		MutationDigest: distributedtxn.TargetDigest(8, scopes, mutation), Mutation: mutation,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	stage := ownedRequest("")
-	stage.Transaction = TransactionRequest{Operation: TransactionStageParticipant, Record: record}
+	stage.Transaction = TransactionRequest{Operation: TransactionStageTarget, Record: record}
 	exec(t, conn, stage)
 	disjointFenceID := testTransactionID(92)
 	disjointFence := ownedRequest("")
@@ -845,7 +845,7 @@ func TestScopedParticipantBlocksOnlyIntersectingTraffic(t *testing.T) {
 	}
 	abort := ownedRequest("")
 	abort.Transaction = TransactionRequest{
-		Operation: TransactionAbortParticipant, ID: id, Revision: 1,
+		Operation: TransactionAbortTarget, ID: id, Revision: 1,
 	}
 	exec(t, conn, abort)
 	select {

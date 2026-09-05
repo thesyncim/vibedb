@@ -151,7 +151,9 @@ func replicatedProvisionProfileMatches(current, origin ReplicatedTableProfile) b
 
 // RegisterProvisionedTable publishes only after a linearizable native read
 // proves the prepared group's serving fence. Publish uses the normal RF3
-// compare-and-swap and retains unknown commands for exact retry.
+// compare-and-swap and retains unknown commands for exact retry. Settling a
+// pending command also requires a certified read proving this table is already
+// registered; another controller may own the authority's pending command.
 func (authority *ReplicatedCatalogAuthority) RegisterProvisionedTable(ctx context.Context, addition *Snapshot) error {
 	current, err := authority.Read(ctx)
 	if err != nil {
@@ -190,8 +192,29 @@ func (authority *ReplicatedCatalogAuthority) RegisterProvisionedTable(ctx contex
 		return err
 	}
 	err = authority.Publish(ctx, current.generation, next)
+	retried := false
 	for retry := 0; retry < 3 && errors.Is(err, ErrReplicatedCatalogPending); retry++ {
+		retried = true
 		err = authority.RetryPending(ctx)
 	}
-	return err
+	if err != nil || !retried {
+		return err
+	}
+	// RetryPending settles only the session-owned bytes. They may belong to
+	// an unrelated operation that prevented Publish from proposing this table.
+	// Verify the requested effect without submitting a fresh command.
+	current, err = authority.Read(ctx)
+	if err != nil {
+		// The requested publication is still unverified. Keep outer read-only
+		// retry loops from treating this probe failure as permission to write.
+		return errors.Join(ErrReplicatedCatalogPending, err)
+	}
+	next, err = BuildReplicatedTableAddition(current, addition)
+	if err != nil {
+		return errors.Join(ErrReplicatedCatalogConflict, err)
+	}
+	if next != current {
+		return ErrReplicatedCatalogConflict
+	}
+	return nil
 }

@@ -26,6 +26,27 @@ var errPrimaryBatchExactCheckpointRequired = errors.New(
 	"vibedb: ordered primary stable-slot exact delta requires checkpoint",
 )
 
+func primaryUnifiedOverlayFoldExtent(
+	payloadBytes int, quantum, maxLeafBytes uint32,
+) (uint32, bool) {
+	if payloadBytes < 0 || quantum == 0 || maxLeafBytes < quantum {
+		return 0, false
+	}
+	need := uint64(storeio.PageHeaderSize) + uint64(payloadBytes) +
+		uint64(storeio.PageTrailerSize)
+	quantum64 := uint64(quantum)
+	if need > ^uint64(0)-(quantum64-1) {
+		return 0, false
+	}
+	extent := (need + quantum64 - 1) / quantum64 * quantum64
+	if extent < quantum64 || extent > uint64(maxLeafBytes) ||
+		extent > uint64(storeio.CommonPrimaryLeafMaxExtentBytes) ||
+		extent > uint64(^uint32(0)) {
+		return 0, false
+	}
+	return uint32(extent), true
+}
+
 // primaryBatchMutation is one resolved key in a primary Update: its resident
 // route and document bytes (nil for a delete). Keys and values borrow the
 // WriteBatch arena, stable for the whole Update.
@@ -69,10 +90,11 @@ type primaryBatchLeaf struct {
 // preparePrimaryBatchConditionalLocked, then publishes under externally held
 // snapshot gates.
 type stagedPrimaryBatch struct {
-	state         *fileStoreState
-	generation    uint64
-	preparedExact primaryExactPrepared
-	live          bool
+	state           *fileStoreState
+	generation      uint64
+	preparedExact   primaryExactPrepared
+	preparedOverlay *primaryUnifiedOverlayBatchPrepared
+	live            bool
 }
 
 // updatePrimaryBatch applies one WriteBatch to the ordered primary graph as one
@@ -197,7 +219,7 @@ func (c *Collection) stagePrimaryBatchLocked(
 	return c.stagePrimaryBatchForJournalLocked(batch, false)
 }
 
-// stagePrimaryBatchConditionalLocked stages a multi-collection participant
+// stagePrimaryBatchConditionalLocked stages a multi-collection target
 // after reserving room for its larger kind-4 conditional journal record. The
 // ordinary buffered single-collection lane keeps its compact kind-3 journal
 // policy and physical-checkpoint fallback.
@@ -207,9 +229,402 @@ func (c *Collection) stagePrimaryBatchConditionalLocked(
 	return c.stagePrimaryBatchForJournalLocked(batch, true)
 }
 
+// stagePrimaryBatchUnifiedOverlayLocked stages the narrow checkpoint-group
+// row-overlay batch. It deliberately declines unless every mutation is an
+// existing inline replacement in an unindexed, nonopaque collection. The
+// caller can then use the established COW batch path without changing its
+// topology, overflow, exact-index, or journal behavior.
+func (c *Collection) stagePrimaryBatchUnifiedOverlayLocked(
+	batch *WriteBatch,
+) (staged stagedPrimaryBatch, handled bool, err error) {
+	if c == nil || batch == nil || len(batch.entries) == 0 ||
+		c.checkpointGroup.Load() == nil || c.primaryUnifiedOverlay == nil ||
+		c.options.OpaqueValues {
+		return stagedPrimaryBatch{}, false, nil
+	}
+	if len(c.primaryPendingOverflowRetire) != 0 ||
+		len(c.primaryMutationAdmitted) != 0 ||
+		len(c.batchPrimaryAdmitted) != 0 {
+		return stagedPrimaryBatch{}, false, nil
+	}
+	state := c.state.Load()
+	if state == nil || state.root.PrimaryRoot == (storeio.PageRef{}) ||
+		state.root.IndexCount != 0 {
+		return stagedPrimaryBatch{}, false, nil
+	}
+	if state.root.Generation == 0 ||
+		state.root.Generation >= uint64(1)<<48 {
+		return stagedPrimaryBatch{}, true, storeio.ErrGenerationOrder
+	}
+	if err := c.planPrimaryBatch(state, batch); err != nil {
+		return stagedPrimaryBatch{}, true, err
+	}
+	if len(c.batchPrimaryLeaves) == 0 {
+		return stagedPrimaryBatch{}, false, nil
+	}
+	for index := range c.batchPrimaryMutations {
+		mutation := &c.batchPrimaryMutations[index]
+		if mutation.remove || mutation.stored.IsOverflow() ||
+			len(mutation.stored.Inline) == 0 {
+			return stagedPrimaryBatch{}, false, nil
+		}
+	}
+
+	generation := state.root.Generation + 1
+	mutations := make([]primaryUnifiedOverlayBatchMutation, 0,
+		len(c.batchPrimaryMutations))
+	overlay := c.primaryUnifiedOverlay
+	maxPayload := storeio.CommonPrimaryLeafMaxExtentBytes -
+		storeio.PageHeaderSize - storeio.PageTrailerSize
+	if configured := int(overlay.maxLeafBytes) -
+		storeio.PageHeaderSize - storeio.PageTrailerSize; configured < maxPayload {
+		maxPayload = configured
+	}
+	if maxPayload <= 0 {
+		return stagedPrimaryBatch{}, false, nil
+	}
+	for leafIndex := range c.batchPrimaryLeaves {
+		leaf := &c.batchPrimaryLeaves[leafIndex]
+		lease, acquireErr := c.primaryRouter.Load().AcquireLeaf(
+			c.cache, leaf.resident,
+		)
+		if acquireErr != nil {
+			return stagedPrimaryBatch{}, true, acquireErr
+		}
+		stripe, stripeOK := storeio.AdmittedCompactPrimaryStripe(
+			lease.Page(), c.storeID, leaf.resident.Bucket,
+		)
+		if !stripeOK {
+			lease.Release()
+			return stagedPrimaryBatch{}, false, nil
+		}
+		if stripe.HasOverflowRows() {
+			lease.Release()
+			return stagedPrimaryBatch{}, false, nil
+		}
+		_, pendingRows := overlay.pendingBucketDeltas(
+			leaf.resident.Bucket,
+		)
+		// A nonzero pending row delta means an earlier overlay changed the
+		// bucket cardinality. This batch's proof is replacement-only; the
+		// existing fold/COW path remains responsible for mixed row geometry.
+		if pendingRows != 0 {
+			lease.Release()
+			return stagedPrimaryBatch{}, false, nil
+		}
+		boundShape, boundHole, boundFixedBytes, boundColumn, compatible :=
+			overlay.scalarColumnForBatch(
+				leaf.resident.Bucket, leaf.resident.Ref,
+			)
+		if !compatible || !boundColumn && overlay.pendingBucket(
+			leaf.resident.Bucket,
+		) {
+			lease.Release()
+			return stagedPrimaryBatch{}, false, nil
+		}
+		var privateSlots [4]uint64
+		leafReplacements := make([]storeio.CommonPrimaryUnifiedReplacement, 0,
+			leaf.mutationEnd-leaf.mutationAt)
+		batchColumnSet := false
+		batchShape, batchHole := 0, 0
+		for mutationAt := leaf.mutationAt; mutationAt < leaf.mutationEnd; mutationAt++ {
+			mutation := &c.batchPrimaryMutations[mutationAt]
+			if mutation.resident.Bucket != leaf.resident.Bucket {
+				lease.Release()
+				return stagedPrimaryBatch{}, true,
+					storeio.ErrSegmentedTabletRouterCorrupt
+			}
+			hash := mutation.resident.Hash
+			rank, baseFound := stripe.FindKey(mutation.key)
+			if !baseFound {
+				lease.Release()
+				return stagedPrimaryBatch{}, false, nil
+			}
+			if _, overflow := stripe.OverflowRef(rank); overflow {
+				lease.Release()
+				return stagedPrimaryBatch{}, false, nil
+			}
+			largeUnindexed := stripe.Len() > storeio.CommonPrimaryLeafWideSlots
+			stableSlot := uint8(0)
+			if !largeUnindexed {
+				var slotOK bool
+				stableSlot, slotOK = stripe.PostingSlot(rank)
+				if !slotOK {
+					lease.Release()
+					return stagedPrimaryBatch{}, false, nil
+				}
+			}
+			current, disposition, overlaySlot := overlay.lookup(
+				leaf.resident.Bucket, hash, mutation.key,
+				state.root.Generation,
+			)
+			oldLen := 0
+			switch disposition {
+			case primaryUnifiedOverlayValue:
+				oldLen = len(current)
+				stableSlot = overlaySlot
+			case primaryUnifiedOverlayDeleted:
+				lease.Release()
+				return stagedPrimaryBatch{}, false, nil
+			case primaryUnifiedOverlayMissing:
+				var decoded bool
+				c.overflowValueScratch, decoded = stripe.AppendValue(
+					c.overflowValueScratch[:0], rank,
+				)
+				if !decoded {
+					lease.Release()
+					return stagedPrimaryBatch{}, true,
+						storeio.ErrCommonPrimaryLeafCorrupt
+				}
+				oldLen = len(c.overflowValueScratch)
+				if largeUnindexed {
+					var slotOK bool
+					stableSlot, slotOK =
+						overlay.chooseLargeUnindexedSlotWithAdditional(
+							leaf.resident.Bucket, hash,
+							privateSlots,
+						)
+					if !slotOK {
+						lease.Release()
+						return stagedPrimaryBatch{}, false, nil
+					}
+				}
+			default:
+				lease.Release()
+				return stagedPrimaryBatch{}, true,
+					storeio.ErrCommonPrimaryLeafCorrupt
+			}
+			if oldLen <= 0 {
+				lease.Release()
+				return stagedPrimaryBatch{}, false, nil
+			}
+			if largeUnindexed {
+				privateSlots[stableSlot>>6] |=
+					uint64(1) << uint(stableSlot&63)
+			}
+			rawDelta := len(mutation.stored.Inline) - oldLen
+			canonical, canonicalOK, canonicalErr :=
+				c.primaryUnifiedBuilder.CanonicalSpanIndex(mutation.stored.Inline)
+			if canonicalErr != nil {
+				lease.Release()
+				return stagedPrimaryBatch{}, true, canonicalErr
+			}
+			if !canonicalOK {
+				lease.Release()
+				return stagedPrimaryBatch{}, false, nil
+			}
+			scalarPatch, scratch, resolved, patchErr :=
+				stripe.PatchStableCanonicalReplacementScalarPatch(
+					mutation.key, stableSlot, canonical,
+					c.overflowValueScratch[:0],
+				)
+			c.overflowValueScratch = scratch
+			if patchErr != nil {
+				lease.Release()
+				return stagedPrimaryBatch{}, true, patchErr
+			}
+			if !resolved || scalarPatch ==
+				(storeio.CommonPrimaryUnifiedScalarPatch{}) {
+				lease.Release()
+				return stagedPrimaryBatch{}, false, nil
+			}
+			scalarShape, scalarHole, columnOK, columnErr :=
+				stripe.ScalarReplacementColumn(
+					mutation.key, stableSlot, scalarPatch,
+				)
+			if columnErr != nil {
+				lease.Release()
+				return stagedPrimaryBatch{}, true, columnErr
+			}
+			if !columnOK {
+				lease.Release()
+				return stagedPrimaryBatch{}, false, nil
+			}
+			if scalarShape >= 0 {
+				if boundColumn && (boundShape != scalarShape ||
+					boundHole != scalarHole) {
+					lease.Release()
+					return stagedPrimaryBatch{}, false, nil
+				}
+				if batchColumnSet && (batchShape != scalarShape ||
+					batchHole != scalarHole) {
+					lease.Release()
+					return stagedPrimaryBatch{}, false, nil
+				}
+				batchColumnSet = true
+				batchShape, batchHole = scalarShape, scalarHole
+			}
+			leafReplacements = append(leafReplacements,
+				storeio.CommonPrimaryUnifiedReplacement{
+					Key: mutation.key, Value: mutation.stored.Inline,
+					ScalarPatch: scalarPatch, Slot: stableSlot,
+				})
+			mutation.found = true
+			mutation.oldSlot = stableSlot
+			mutations = append(mutations, primaryUnifiedOverlayBatchMutation{
+				bucket:          leaf.resident.Bucket,
+				hash:            hash,
+				key:             mutation.key,
+				value:           mutation.stored.Inline,
+				rawDelta:        rawDelta,
+				countDelta:      0,
+				kind:            primaryUnifiedOverlayPut,
+				stableSlot:      stableSlot,
+				fixedLeafBytes:  boundFixedBytes,
+				reservationWide: false,
+				scalarPatch:     scalarPatch,
+				scalarBase:      leaf.resident.Ref,
+				scalarShape:     scalarShape,
+				scalarHole:      scalarHole,
+			})
+		}
+		leafExtent := boundFixedBytes
+		if !boundColumn {
+			// The first batch on an immutable leaf proves the complete target
+			// stream and reserves its worst-case fold envelope. Later batches are
+			// admitted only after ScalarReplacementColumn has bound every changed
+			// patch to that same PageRef/shape/hole, so repeating the dictionary
+			// census here would turn the row-sized lane back into a fold-sized
+			// walk. Exact replacements are already checked by the scalar patch
+			// verifier; the retained certificate is the cumulative geometry proof.
+			reservedPayload, geometryOK, geometryErr :=
+				stripe.ConservativeScalarReplacementBatchPayload(leafReplacements)
+			if geometryErr != nil {
+				lease.Release()
+				return stagedPrimaryBatch{}, true, geometryErr
+			}
+			if !geometryOK || reservedPayload < 0 || reservedPayload > maxPayload {
+				lease.Release()
+				return stagedPrimaryBatch{}, false, nil
+			}
+			var extentOK bool
+			leafExtent, extentOK = primaryUnifiedOverlayFoldExtent(
+				reservedPayload, state.root.PageSize, overlay.maxLeafBytes,
+			)
+			if !extentOK {
+				lease.Release()
+				return stagedPrimaryBatch{}, false, nil
+			}
+		}
+		if leafExtent == 0 {
+			lease.Release()
+			return stagedPrimaryBatch{}, false, nil
+		}
+		for mutationIndex := len(mutations) - len(leafReplacements); mutationIndex < len(mutations); mutationIndex++ {
+			mutations[mutationIndex].fixedLeafBytes = leafExtent
+			mutations[mutationIndex].reservationWide = false
+		}
+		lease.Release()
+	}
+	if len(mutations) == 0 {
+		return stagedPrimaryBatch{}, false, nil
+	}
+	// A future fold must be able to retain every superseded volatile frame
+	// while an old reader is pinned. Reserve that retention before any overlay
+	// record is written, matching materializePrimaryParentsOnceLocked's veto.
+	if err := c.reservePrimaryUnifiedOverlayRetentionLocked(
+		c.batchPrimaryLeaves,
+	); err != nil {
+		return stagedPrimaryBatch{}, true, err
+	}
+	// Conditional journal room is part of staging. If it checkpoints an older
+	// visible cut, the route/value proof above is stale and the caller retries
+	// through the established planner against the new state.
+	if err := c.ensurePrimaryBatchConditionalJournalRoom(
+		c.batchJournalEntries,
+	); err != nil {
+		return stagedPrimaryBatch{}, true, err
+	}
+	if c.state.Load() != state {
+		return stagedPrimaryBatch{}, false, nil
+	}
+	prepared, prepareErr := overlay.prepareBatch(generation, mutations)
+	if prepareErr != nil {
+		if errors.Is(prepareErr, storeio.ErrPageCachePinned) {
+			return stagedPrimaryBatch{}, true, ErrCheckpointGroupPressure
+		}
+		return stagedPrimaryBatch{}, true, prepareErr
+	}
+	return stagedPrimaryBatch{
+		state:           state,
+		generation:      generation,
+		preparedOverlay: &prepared,
+		live:            true,
+	}, true, nil
+}
+
+// reservePrimaryUnifiedOverlayRetentionLocked computes the complete pending
+// parent set a later fold will have to materialize. A row-overlay batch does not
+// publish parent descriptors while it is staged, so counting only its current
+// leaves would miss older overlay-only buckets and could publish a cut that an
+// active reader cannot retain. The union is also checked against the bounded
+// pending-parent table even when no reader is active; the materializer appends
+// overlay buckets into that table before it can run its own retirement check.
+func (c *Collection) reservePrimaryUnifiedOverlayRetentionLocked(
+	leaves []primaryBatchLeaf,
+) error {
+	if c == nil || c.primaryUnifiedOverlay == nil {
+		return nil
+	}
+	var seen [primaryUnifiedOverlayBuckets]storeio.BucketID
+	count := 0
+	add := func(bucket storeio.BucketID) bool {
+		for index := 0; index < count; index++ {
+			if seen[index] == bucket {
+				return true
+			}
+		}
+		if count == len(seen) {
+			return false
+		}
+		seen[count] = bucket
+		count++
+		return true
+	}
+	for index := range c.primaryPendingParents {
+		if !add(c.primaryPendingParents[index].leafRoute.Bucket) {
+			return ErrCheckpointGroupPressure
+		}
+	}
+	var overlayBuckets [primaryUnifiedOverlayBuckets]storeio.BucketID
+	var overlayKeys [primaryUnifiedOverlayBuckets][]byte
+	overlayCount, err := c.primaryUnifiedOverlay.pendingBuckets(
+		&overlayBuckets, &overlayKeys,
+	)
+	if err != nil {
+		if errors.Is(err, storeio.ErrPageCachePinned) {
+			return ErrCheckpointGroupPressure
+		}
+		return err
+	}
+	for index := 0; index < overlayCount; index++ {
+		if !add(overlayBuckets[index]) {
+			return ErrCheckpointGroupPressure
+		}
+	}
+	for index := range leaves {
+		if !add(leaves[index].resident.Bucket) {
+			return ErrCheckpointGroupPressure
+		}
+	}
+	if count > cap(c.primaryPendingParents) {
+		return ErrCheckpointGroupPressure
+	}
+	if c.anyActiveReaders() && len(c.primaryVolatileRetired)+count >
+		cap(c.primaryVolatileRetired) {
+		return ErrCheckpointGroupPressure
+	}
+	return nil
+}
+
 func (c *Collection) stagePrimaryBatchForJournalLocked(
 	batch *WriteBatch, conditional bool,
 ) (stagedPrimaryBatch, error) {
+	if conditional {
+		if staged, handled, err := c.stagePrimaryBatchUnifiedOverlayLocked(batch); handled {
+			return staged, err
+		}
+	}
 	if c.primaryUnifiedOverlay.hasPending() {
 		if err := c.materializePrimaryParentsLocked(primaryMaterializationBarrier); err != nil {
 			return stagedPrimaryBatch{}, err
@@ -343,6 +758,10 @@ func primaryBatchStageAttemptBudget(documents int) (int, bool) {
 func (c *Collection) unwindStagedPrimaryBatch(staged *stagedPrimaryBatch) {
 	if staged == nil || !staged.live {
 		return
+	}
+	if staged.preparedOverlay != nil {
+		c.primaryUnifiedOverlay.abortBatch(staged.preparedOverlay)
+		staged.preparedOverlay = nil
 	}
 	c.unwindPrimaryExactPrepared(&staged.preparedExact)
 	c.unadmitPrimaryBatchLeaves()
@@ -1203,13 +1622,28 @@ func (c *Collection) publishPrimaryBatch(
 }
 
 // publishPrimaryBatchGateHeld is the gate-held body of publishPrimaryBatch.
-// Multi-collection commit acquires every participant's snapshotGate write side
+// Multi-collection commit acquires every target's snapshotGate write side
 // in process-global order before calling this per member; single-collection
 // Update acquires the gate itself via publishPrimaryBatch. The writer must
 // already be held. Infallible by construction — see publishPrimaryBatch.
 func (c *Collection) publishPrimaryBatchGateHeld(staged stagedPrimaryBatch) {
 	state := staged.state
 	generation := staged.generation
+	if staged.preparedOverlay != nil {
+		nextRoot := state.root
+		nextRoot.Generation = generation
+		nextState := &fileStoreState{
+			root: nextRoot, fileEnd: state.fileEnd,
+			freeHead: state.freeHead,
+		}
+		c.beginReaderFence()
+		c.primaryUnifiedOverlay.publishBatch(staged.preparedOverlay)
+		c.primaryRouter.Load().AdvanceGeneration(generation)
+		c.pageValidator.update(nextState)
+		c.publishFileState(nextState)
+		c.endReaderFence()
+		return
+	}
 	preparedExact := staged.preparedExact
 	totalDelta := 0
 	for i := range c.batchPrimaryLeaves {

@@ -27,7 +27,7 @@ type readFenceWriter struct {
 	scopes     []distributedtxn.IntentScope
 }
 
-type participantReservation = readFenceWriter
+type targetReservation = readFenceWriter
 
 // readFenceSet is a short-lived, shard-local scoped reader/writer admission
 // gate. Read fences are rare and writes stay allocation-free after the writer
@@ -37,7 +37,7 @@ type readFenceSet struct {
 	mu        sync.Mutex
 	active    map[distributedtxn.ID]readFence
 	writers   []readFenceWriter
-	barriers  []participantReservation
+	barriers  []targetReservation
 	changed   chan struct{}
 	nextToken uint64
 	limit     int
@@ -212,10 +212,10 @@ func (f *readFenceSet) enterWrite(
 	}
 }
 
-// enterParticipant reserves a scope while an in-flight ordinary writer drains,
-// then holds it until the durable participant barrier is published. New
+// enterTarget reserves a scope while an in-flight ordinary writer drains,
+// then holds it until the durable target barrier is published. New
 // writers cannot cross the reservation; registered writers retain precedence.
-func (f *readFenceSet) enterParticipant(
+func (f *readFenceSet) enterTarget(
 	ctx context.Context,
 	bucketBits uint8,
 	scopes []distributedtxn.IntentScope,
@@ -229,7 +229,7 @@ func (f *readFenceSet) enterParticipant(
 		return 0, distributedtxn.ErrJournalClosed
 	}
 	token := f.nextTokenLocked()
-	f.barriers = append(f.barriers, participantReservation{
+	f.barriers = append(f.barriers, targetReservation{
 		token: token, bucketBits: bucketBits, scopes: scopes,
 	})
 	for {
@@ -247,7 +247,7 @@ func (f *readFenceSet) enterParticipant(
 			select {
 			case <-changed:
 			case <-ctx.Done():
-				f.leaveParticipant(token)
+				f.leaveTarget(token)
 				return 0, ctx.Err()
 			}
 		} else {
@@ -260,34 +260,34 @@ func (f *readFenceSet) enterParticipant(
 				case <-timer.C:
 				case <-ctx.Done():
 					stopReadFenceTimer(timer)
-					f.leaveParticipant(token)
+					f.leaveTarget(token)
 					return 0, ctx.Err()
 				}
 			}
 		}
 		f.mu.Lock()
 		if f.closed {
-			f.removeParticipantLocked(token)
+			f.removeTargetLocked(token)
 			f.mu.Unlock()
 			return 0, distributedtxn.ErrJournalClosed
 		}
 	}
 }
 
-func (f *readFenceSet) leaveParticipant(token uint64) {
+func (f *readFenceSet) leaveTarget(token uint64) {
 	f.mu.Lock()
-	f.removeParticipantLocked(token)
+	f.removeTargetLocked(token)
 	f.mu.Unlock()
 }
 
-func (f *readFenceSet) removeParticipantLocked(token uint64) {
+func (f *readFenceSet) removeTargetLocked(token uint64) {
 	for i := range f.barriers {
 		if f.barriers[i].token != token {
 			continue
 		}
 		last := len(f.barriers) - 1
 		f.barriers[i] = f.barriers[last]
-		f.barriers[last] = participantReservation{}
+		f.barriers[last] = targetReservation{}
 		f.barriers = f.barriers[:last]
 		f.signalLocked()
 		return

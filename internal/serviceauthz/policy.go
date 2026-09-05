@@ -42,7 +42,7 @@ const (
 	// CapabilityTransactionRecovery permits the replacement-gateway recovery
 	// reader to inspect replicated transaction control state. It is deliberately
 	// separate from ordinary data reads, writes, and topology authority: none of
-	// those capabilities can discover transaction participants or decisions.
+	// those capabilities can discover transaction targets or decisions.
 	CapabilityTransactionRecovery
 	// CapabilityRequestLedger permits only the internal durable request-result
 	// ledger grammar. It is separate from data, topology, and transaction

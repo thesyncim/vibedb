@@ -73,6 +73,103 @@ func rawTopLevelScalarMatch(
 	}
 }
 
+// rawTopLevelPathName recognizes a path whose value can be recovered while
+// walking one top-level object. Dotted single-field paths already retain their
+// decoded name. A one-token JSON pointer is equally cheap when it contains no
+// escape: the bytes after the slash are the decoded member name verbatim.
+func rawTopLevelPathName(path compiledPath) (string, bool) {
+	if path.join != joinPathOuter || !path.topLevel {
+		return "", false
+	}
+	return path.name, true
+}
+
+// rawTopLevelScalars extracts one row of simple top-level paths from a
+// validated JSON object without building a structural tape. dst has one
+// column per path and already contains a slot for row. Duplicate object keys
+// retain the last value, matching Node.Get. An escaped key or a non-object
+// root declines the lane because either can change JSON Pointer semantics.
+func rawTopLevelScalars(
+	src []byte,
+	paths []compiledPath,
+	dst [][]vibejson.RawValue,
+	row int,
+) bool {
+	i := rawSkipSpace(src, 0)
+	if i >= len(src) || src[i] != '{' {
+		return false
+	}
+	i++
+	for {
+		i = rawSkipSpace(src, i)
+		if i >= len(src) {
+			return false
+		}
+		if src[i] == '}' {
+			return true
+		}
+		if src[i] != '"' {
+			return false
+		}
+		keyStart := i
+		keyEnd, escaped, ok := rawScanString(src, i)
+		if !ok || escaped {
+			return false
+		}
+		i = rawSkipSpace(src, keyEnd)
+		if i >= len(src) || src[i] != ':' {
+			return false
+		}
+		i = rawSkipSpace(src, i+1)
+		valueStart := i
+		valueEnd, ok := rawSkipValue(src, i)
+		if !ok {
+			return false
+		}
+		key := src[keyStart+1 : keyEnd-1]
+		value := vibejson.RawValue{Src: src[valueStart:valueEnd]}
+		switch len(paths) {
+		case 1:
+			if rawEqualString(key, paths[0].name) {
+				dst[0][row] = value
+			}
+		case 2:
+			if rawEqualString(key, paths[0].name) {
+				dst[0][row] = value
+			} else if rawEqualString(key, paths[1].name) {
+				dst[1][row] = value
+			}
+		case 3:
+			if rawEqualString(key, paths[0].name) {
+				dst[0][row] = value
+			} else if rawEqualString(key, paths[1].name) {
+				dst[1][row] = value
+			} else if rawEqualString(key, paths[2].name) {
+				dst[2][row] = value
+			}
+		default:
+			for col := range paths {
+				if rawEqualString(key, paths[col].name) {
+					dst[col][row] = value
+					break
+				}
+			}
+		}
+		i = rawSkipSpace(src, valueEnd)
+		if i >= len(src) {
+			return false
+		}
+		switch src[i] {
+		case ',':
+			i++
+		case '}':
+			return true
+		default:
+			return false
+		}
+	}
+}
+
 func rawEqualString(value []byte, want string) bool {
 	if len(value) != len(want) {
 		return false
@@ -167,6 +264,109 @@ func (p *plan) scalarCountEqualityPath() (compiledPath, scalar, bool) {
 		}
 	}
 	return p.valuePaths[p.where.col], p.where.lit, true
+}
+
+// scalarCountIntegerOrderPath recognizes the strict ordered COUNT shape. The
+// storage lane only accepts an actual int64 literal: decimal and floating
+// literals retain the generic executor's exact-number semantics.
+func (p *plan) scalarCountIntegerOrderPath() (compiledPath, scalar, Op, bool) {
+	if p.where == nil || p.where.kind != predCmp ||
+		!orderedRangeOp(p.where.op) || p.grouped || !p.singleRow ||
+		p.where.col < 0 || p.where.col >= len(p.valuePaths) ||
+		p.where.lit.kind != kindNumber || !p.where.lit.isInt {
+		return compiledPath{}, scalar{}, 0, false
+	}
+	for _, col := range p.columns {
+		if col.agg != aggCount || col.value >= 0 {
+			return compiledPath{}, scalar{}, 0, false
+		}
+	}
+	return p.valuePaths[p.where.col], p.where.lit, p.where.op, true
+}
+
+// scalarCountIntegerIntervalPath recognizes exactly two ordered integer
+// comparisons conjoined on one path. The storage lane consumes a normalized
+// half-open interval [lower, upper); an empty interval is represented by
+// lower >= upper and remains exact without endpoint overflow.
+func (p *plan) scalarCountIntegerIntervalPath() (
+	path compiledPath,
+	lower, upper int64,
+	upperUnbounded bool,
+	ok bool,
+) {
+	if p == nil || p.where == nil || p.where.kind != predAnd ||
+		len(p.where.kids) != 2 || p.grouped || !p.singleRow {
+		return compiledPath{}, 0, 0, false, false
+	}
+	for _, col := range p.columns {
+		if col.agg != aggCount || col.value >= 0 {
+			return compiledPath{}, 0, 0, false, false
+		}
+	}
+	const maxInt64Value = int64(1<<63 - 1)
+	var pathSet, lowerSet, upperSet, empty bool
+	for _, kid := range p.where.kids {
+		if kid == nil || kid.kind != predCmp || !orderedRangeOp(kid.op) ||
+			kid.col < 0 || kid.col >= len(p.valuePaths) ||
+			kid.lit.kind != kindNumber || !kid.lit.isInt {
+			return compiledPath{}, 0, 0, false, false
+		}
+		candidate := p.valuePaths[kid.col]
+		if !candidate.single {
+			return compiledPath{}, 0, 0, false, false
+		}
+		if !pathSet {
+			path, pathSet = candidate, true
+		} else if path.indexPath() != candidate.indexPath() || path.join != candidate.join {
+			return compiledPath{}, 0, 0, false, false
+		}
+		switch kid.op {
+		case Gt:
+			if lowerSet {
+				return compiledPath{}, 0, 0, false, false
+			}
+			lowerSet = true
+			if kid.lit.ival == maxInt64Value {
+				// MaxInt64 + 1 is outside the int64 domain. Mark the
+				// interval empty without overflowing the endpoint.
+				lower, upper = maxInt64Value, maxInt64Value
+				empty = true
+			} else {
+				lower = kid.lit.ival + 1
+			}
+		case Ge:
+			if lowerSet {
+				return compiledPath{}, 0, 0, false, false
+			}
+			lowerSet = true
+			lower = kid.lit.ival
+		case Lt:
+			if upperSet {
+				return compiledPath{}, 0, 0, false, false
+			}
+			upperSet = true
+			upper = kid.lit.ival
+		case Le:
+			if upperSet {
+				return compiledPath{}, 0, 0, false, false
+			}
+			upperSet = true
+			if kid.lit.ival == maxInt64Value {
+				upperUnbounded = true
+				upper = maxInt64Value
+			} else {
+				upper = kid.lit.ival + 1
+			}
+		}
+	}
+	if !lowerSet || !upperSet {
+		return compiledPath{}, 0, 0, false, false
+	}
+	if empty {
+		upperUnbounded = false
+		upper = lower
+	}
+	return path, lower, upper, upperUnbounded, true
 }
 
 func (p *plan) scalarCountPath() (compiledPath, scalar, bool) {

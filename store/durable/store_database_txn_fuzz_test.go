@@ -263,7 +263,7 @@ func txnFuzzSeedMixed(t testing.TB) []byte {
 	const txnID = uint64(3)
 	genA := txnFuzzPrepareMaybePublish(t, a, header.MarkerID, header.Epoch, txnID, "m/3", `{"n":1}`, true)
 	genB := txnFuzzPrepareMaybePublish(t, b, header.MarkerID, header.Epoch, txnID, "m/3", `{"n":1}`, false)
-	if _, err := marker.AppendDecision(txnID, []storeio.TxnParticipant{
+	if _, err := marker.AppendDecision(txnID, []storeio.TxnCollectionRef{
 		{StoreID: a.storeID, JournalID: a.journalID, PreparedGeneration: genA},
 		{StoreID: b.storeID, JournalID: b.journalID, PreparedGeneration: genB},
 	}); err != nil {
@@ -294,7 +294,7 @@ func txnFuzzSeedTornDecision(t testing.TB) []byte {
 	fm.Program(storeio.TxnMarkerFaultPlan{
 		Phase: storeio.TxnMarkerFaultTornAppend, AppendIndex: 0,
 	})
-	if _, err := marker.AppendDecision(txnID, []storeio.TxnParticipant{
+	if _, err := marker.AppendDecision(txnID, []storeio.TxnCollectionRef{
 		{StoreID: a.storeID, JournalID: a.journalID, PreparedGeneration: genA},
 		{StoreID: b.storeID, JournalID: b.journalID, PreparedGeneration: genB},
 	}); !errors.Is(err, io.ErrShortWrite) {
@@ -321,7 +321,7 @@ func txnFuzzSeedStrayReuse(t testing.TB) []byte {
 	// joins symmetric multi-collection writes.
 	_ = txnFuzzPrepareUnpublished(t, a, header.MarkerID, header.Epoch, txnID, "stray", `{"n":1}`)
 	genB := txnFuzzPrepareUnpublished(t, b, header.MarkerID, header.Epoch, txnID, "reuse", `{"n":2}`)
-	if _, err := marker.AppendDecision(txnID, []storeio.TxnParticipant{
+	if _, err := marker.AppendDecision(txnID, []storeio.TxnCollectionRef{
 		{StoreID: b.storeID, JournalID: b.journalID, PreparedGeneration: genB},
 	}); err != nil {
 		t.Fatal(err)
@@ -386,13 +386,13 @@ func assertTxnFuzzAllInOut(t *testing.T, db *Database, prior *storeio.TxnDecisio
 	markerID := prior.MarkerID()
 	epoch := prior.Epoch()
 	for txnID := uint64(1); txnID <= prior.MaxTxnID(); txnID++ {
-		participants, ok := prior.Lookup(markerID, epoch, txnID)
+		targets, ok := prior.Lookup(markerID, epoch, txnID)
 		if !ok {
 			continue
 		}
 		covered := 0
 		living := 0
-		for _, p := range participants {
+		for _, p := range targets {
 			if prior.Retired(p.StoreID) {
 				continue
 			}

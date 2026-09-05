@@ -59,6 +59,7 @@ type Request struct {
 	Group                     raftmember.GroupKey
 	TargetMember              uint64
 	ExpectedReplicaSetVersion uint64
+	HealthOnly                bool
 }
 
 // Observation is a complete local cut. Status.LeaderID/Term/LeadTransferee are
@@ -84,6 +85,12 @@ func (observation Observation) TransferWitness(target uint64) (settled, inFlight
 
 type Observer interface {
 	ObserveReplica(context.Context, raftmember.GroupKey, uint64) (raftservice.ReplicaObservation, error)
+}
+
+// HealthObserver supplies the bounded liveness cut used by revision
+// controllers. Implementations must not substitute a full snapshot cut.
+type HealthObserver interface {
+	ObserveReplicaHealth(context.Context, raftmember.GroupKey, uint64) (raftservice.ReplicaHealthObservation, error)
 }
 
 type AuthorizeFunc func(rafttransport.PeerIdentity, Request) bool
@@ -157,6 +164,33 @@ func (service *Service) Serve(ctx context.Context, connection rafttransport.Peer
 	}
 	stripe := &service.stripes[binary.BigEndian.Uint64(request.Operation[:8])%uint64(len(service.stripes))]
 	stripe.Lock()
+	if request.HealthOnly {
+		healthObserver, supported := service.observer.(HealthObserver)
+		if !supported {
+			stripe.Unlock()
+			return ErrControl
+		}
+		cut, observeErr := healthObserver.ObserveReplicaHealth(ctx, request.Group, request.TargetMember)
+		stripe.Unlock()
+		if observeErr != nil {
+			return observeErr
+		}
+		health := HealthObservation{
+			Request: request, MemberID: cut.Status.MemberID, LeaderID: cut.Status.LeaderID,
+			Term: cut.Status.Term, Commit: cut.Status.Commit, Applied: cut.Status.Applied,
+			ReplicaSetVersion: cut.Publication.ReplicaSetVersion,
+		}
+		if cut.Identity.MemberID != health.MemberID ||
+			cut.Identity.Group != request.Group || !validHealthObservation(health) {
+			return ErrStale
+		}
+		if deadline := boundedDeadline(ctx, service.writeDeadline()); deadline.IsZero() {
+			return ErrControl
+		} else if err = connection.SetWriteDeadline(deadline); err != nil {
+			return err
+		}
+		return WriteHealthObservation(connection, health)
+	}
 	cut, err := service.observer.ObserveReplica(ctx, request.Group, request.TargetMember)
 	stripe.Unlock()
 	if err != nil {
@@ -194,12 +228,15 @@ func AppendRequest(dst []byte, request Request) ([]byte, error) {
 	appendGroup(b[72:160], request.Group)
 	binary.BigEndian.PutUint64(b[160:168], request.TargetMember)
 	binary.BigEndian.PutUint64(b[168:176], request.ExpectedReplicaSetVersion)
+	if request.HealthOnly {
+		b[176] = 1
+	}
 	return dst, nil
 }
 
 func OpenRequest(raw []byte) (Request, error) {
 	if len(raw) != RequestBytes || !bytes.Equal(raw[:8], requestMagic[:]) ||
-		!allZero(raw[144:160]) || !allZero(raw[176:]) {
+		!allZero(raw[144:160]) || raw[176] > 1 || !allZero(raw[177:]) {
 		return Request{}, ErrControl
 	}
 	var request Request
@@ -208,6 +245,7 @@ func OpenRequest(raw []byte) (Request, error) {
 	request.Group = openGroup(raw[72:160])
 	request.TargetMember = binary.BigEndian.Uint64(raw[160:168])
 	request.ExpectedReplicaSetVersion = binary.BigEndian.Uint64(raw[168:176])
+	request.HealthOnly = raw[176] == 1
 	if !validRequest(request) {
 		return Request{}, ErrControl
 	}
@@ -389,12 +427,13 @@ func WriteResponse(writer io.Writer, observation Observation) error {
 
 func validRequest(request Request) bool {
 	return request.Operation != ([32]byte{}) && request.Step != ([32]byte{}) &&
-		validGroup(request.Group) && request.TargetMember != 0
+		validGroup(request.Group) && request.TargetMember != 0 &&
+		(!request.HealthOnly || request.ExpectedReplicaSetVersion != 0)
 }
 
 func validObservation(observation Observation) bool {
 	state := observation.State
-	if !validRequest(observation.Request) || observation.Request.ExpectedReplicaSetVersion == 0 ||
+	if observation.Request.HealthOnly || !validRequest(observation.Request) || observation.Request.ExpectedReplicaSetVersion == 0 ||
 		state.ConfState == nil || state.Applied == 0 ||
 		state.ReplicaSetVersion != observation.Request.ExpectedReplicaSetVersion ||
 		observation.Publication.Applied != state.Applied ||

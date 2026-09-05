@@ -1,5 +1,5 @@
 // Package distributedtxn owns the compact durable record vocabulary for
-// cross-shard transaction coordinators and participants. It deliberately has no
+// cross-shard transaction coordinators and targets. It deliberately has no
 // networking, SQL, or JSON dependency.
 package distributedtxn
 
@@ -13,15 +13,15 @@ import (
 
 const (
 	FormatVersion = 1
-	// MaxInlineParticipants bounds only the legacy single-record VTC1
-	// encoding. It is not a distributed transaction participant limit;
+	// MaxInlineTargets bounds only the legacy single-record VTC1
+	// encoding. It is not a distributed transaction target limit;
 	// wider transactions use the segmented VTM1 manifest.
-	MaxInlineParticipants     = 64
+	MaxInlineTargets          = 64
 	MaxIntentScopes           = 256
 	MaxShardIdentityBytes     = 255
 	MaxMutationBytes          = 16 << 20
 	MaxCoordinatorRecordBytes = 32 << 10
-	MaxParticipantRecordBytes = MaxMutationBytes + MaxIntentScopes*8 + 1024
+	MaxTargetRecordBytes      = MaxMutationBytes + MaxIntentScopes*8 + 1024
 )
 
 var (
@@ -31,7 +31,7 @@ var (
 	ErrInvalidState  = errors.New("distributed transaction state transition is invalid")
 	castagnoli       = crc32.MakeTable(crc32.Castagnoli)
 	coordinatorMagic = [4]byte{'V', 'T', 'C', '1'}
-	participantMagic = [4]byte{'V', 'T', 'P', '1'}
+	targetMagic      = [4]byte{'V', 'T', 'P', '1'}
 )
 
 type ID [16]byte
@@ -40,13 +40,13 @@ type Digest [32]byte
 // AuthorityWitness is the compact 128-bit prefix of the full canonical route
 // authority digest. It provides 128-bit preimage strength, matching VibeDB's
 // shard, group, and transaction identifiers, while avoiding a second full
-// digest in every wide-manifest participant.
+// digest in every wide-manifest target.
 // Zero is reserved for the static non-RF3 path, whose complete authority is
-// already present in the participant record itself.
+// already present in the target record itself.
 type AuthorityWitness [16]byte
 
 // IntentScope is one half-open virtual-bucket interval [Start, End). Scopes in
-// a participant are sorted, disjoint, and coalesced before encoding.
+// a target are sorted, disjoint, and coalesced before encoding.
 type IntentScope struct {
 	Start uint32
 	End   uint32
@@ -89,10 +89,10 @@ func IntentScopesOverlap(a, b []IntentScope) bool {
 	return false
 }
 
-// ParticipantDigest binds the exact mutation bytes to their visibility scope.
+// TargetDigest binds the exact mutation bytes to their visibility scope.
 // A retry cannot retain the same SQL digest while widening or narrowing the
 // buckets it blocks.
-func ParticipantDigest(bucketBits uint8, scopes []IntentScope, mutation []byte) Digest {
+func TargetDigest(bucketBits uint8, scopes []IntentScope, mutation []byte) Digest {
 	hash := sha256.New()
 	domain := [5]byte{'V', 'P', 'D', '1', bucketBits}
 	_, _ = hash.Write(domain[:])
@@ -143,40 +143,40 @@ func (s CoordinatorState) CanTransitionTo(next CoordinatorState) bool {
 	}
 }
 
-type ParticipantState uint8
+type TargetState uint8
 
 const (
-	ParticipantInvalid ParticipantState = iota
-	ParticipantStaged
-	ParticipantPrepared
-	ParticipantApplied
-	ParticipantAborted
-	ParticipantReleased
+	TargetInvalid TargetState = iota
+	TargetStaged
+	TargetPrepared
+	TargetApplied
+	TargetAborted
+	TargetReleased
 )
 
-func (s ParticipantState) valid() bool {
-	return s >= ParticipantStaged && s <= ParticipantReleased
+func (s TargetState) valid() bool {
+	return s >= TargetStaged && s <= TargetReleased
 }
 
-func (s ParticipantState) CanTransitionTo(next ParticipantState) bool {
+func (s TargetState) CanTransitionTo(next TargetState) bool {
 	if s == next {
 		return s.valid()
 	}
 	switch s {
-	case ParticipantStaged:
-		return next == ParticipantPrepared || next == ParticipantAborted
-	case ParticipantPrepared:
-		return next == ParticipantApplied || next == ParticipantAborted
-	case ParticipantApplied, ParticipantAborted:
-		return next == ParticipantReleased
+	case TargetStaged:
+		return next == TargetPrepared || next == TargetAborted
+	case TargetPrepared:
+		return next == TargetApplied || next == TargetAborted
+	case TargetApplied, TargetAborted:
+		return next == TargetReleased
 	default:
 		return false
 	}
 }
 
-// ParticipantRef is one coordinator-owned participant identity. Shard is raw
+// TransactionTargetRef is one coordinator-owned target identity. Shard is raw
 // UTF-8 bytes so decoding can alias the durable record.
-type ParticipantRef struct {
+type TransactionTargetRef struct {
 	Distribution         []byte
 	Shard                []byte
 	RoutingVersion       uint64
@@ -184,7 +184,7 @@ type ParticipantRef struct {
 	OwnershipEpoch       uint64
 	AuthorityWitness     AuthorityWitness
 	MutationDigest       Digest
-	State                ParticipantState
+	State                TargetState
 }
 
 type CoordinatorRecord struct {
@@ -195,11 +195,11 @@ type CoordinatorRecord struct {
 	// RecoveryDeadline is the legacy field name for the bounded logical pulse
 	// limit. It is never a Unix timestamp and is interpreted only as 1..3.
 	RecoveryDeadline int64
-	Participants     []ParticipantRef
+	Targets          []TransactionTargetRef
 }
 
-// Coordinator record layout: 48-byte fixed header, packed participant entries,
-// and a CRC32C. Each participant has a 76-byte fixed identity and digest frame.
+// Coordinator record layout: 48-byte fixed header, packed target entries,
+// and a CRC32C. Each target has a 76-byte fixed identity and digest frame.
 const (
 	coordinatorHeaderBytes = 48
 	coordinatorEntryBytes  = 76
@@ -210,8 +210,8 @@ func AppendCoordinator(dst []byte, record CoordinatorRecord) ([]byte, error) {
 		return dst, err
 	}
 	total := coordinatorHeaderBytes + 4
-	for i := range record.Participants {
-		total += coordinatorEntryBytes + len(record.Participants[i].Distribution) + len(record.Participants[i].Shard)
+	for i := range record.Targets {
+		total += coordinatorEntryBytes + len(record.Targets[i].Distribution) + len(record.Targets[i].Shard)
 	}
 	if total > MaxCoordinatorRecordBytes {
 		return dst, ErrTooLarge
@@ -222,14 +222,14 @@ func AppendCoordinator(dst []byte, record CoordinatorRecord) ([]byte, error) {
 	copy(out[:4], coordinatorMagic[:])
 	out[4] = FormatVersion
 	out[5] = byte(record.State)
-	binary.LittleEndian.PutUint16(out[6:8], uint16(len(record.Participants)))
+	binary.LittleEndian.PutUint16(out[6:8], uint16(len(record.Targets)))
 	binary.LittleEndian.PutUint64(out[8:16], record.Revision)
 	binary.LittleEndian.PutUint64(out[16:24], record.CatalogGeneration)
 	binary.LittleEndian.PutUint64(out[24:32], uint64(record.RecoveryDeadline))
 	copy(out[32:48], record.ID[:])
 	cursor := coordinatorHeaderBytes
-	for i := range record.Participants {
-		p := &record.Participants[i]
+	for i := range record.Targets {
+		p := &record.Targets[i]
 		out[cursor] = byte(len(p.Distribution))
 		out[cursor+1] = byte(len(p.Shard))
 		out[cursor+2] = byte(p.State)
@@ -253,15 +253,15 @@ func OpenCoordinator(src []byte) (CoordinatorRecord, error) {
 		return CoordinatorRecord{}, ErrCorrupt
 	}
 	count := int(binary.LittleEndian.Uint16(src[6:8]))
-	if count <= 0 || count > MaxInlineParticipants {
+	if count <= 0 || count > MaxInlineTargets {
 		return CoordinatorRecord{}, ErrCorrupt
 	}
-	return OpenCoordinatorInto(src, make([]ParticipantRef, count))
+	return OpenCoordinatorInto(src, make([]TransactionTargetRef, count))
 }
 
-// OpenCoordinatorInto decodes into caller-owned participant storage. Hot
-// status/recovery loops keep a [MaxInlineParticipants] arena and allocate nothing.
-func OpenCoordinatorInto(src []byte, participants []ParticipantRef) (CoordinatorRecord, error) {
+// OpenCoordinatorInto decodes into caller-owned target storage. Hot
+// status/recovery loops keep a [MaxInlineTargets] arena and allocate nothing.
+func OpenCoordinatorInto(src []byte, targets []TransactionTargetRef) (CoordinatorRecord, error) {
 	if len(src) < coordinatorHeaderBytes+4 || len(src) > MaxCoordinatorRecordBytes ||
 		!equal4(src[:4], coordinatorMagic) || !checksumOK(src) {
 		return CoordinatorRecord{}, ErrCorrupt
@@ -270,16 +270,16 @@ func OpenCoordinatorInto(src []byte, participants []ParticipantRef) (Coordinator
 		return CoordinatorRecord{}, ErrUnsupported
 	}
 	count := int(binary.LittleEndian.Uint16(src[6:8]))
-	if count == 0 || count > MaxInlineParticipants || cap(participants) < count {
+	if count == 0 || count > MaxInlineTargets || cap(targets) < count {
 		return CoordinatorRecord{}, ErrCorrupt
 	}
-	participants = participants[:count]
-	clear(participants)
+	targets = targets[:count]
+	clear(targets)
 	record := CoordinatorRecord{
 		State: CoordinatorState(src[5]), Revision: binary.LittleEndian.Uint64(src[8:16]),
 		CatalogGeneration: binary.LittleEndian.Uint64(src[16:24]),
 		RecoveryDeadline:  int64(binary.LittleEndian.Uint64(src[24:32])),
-		Participants:      participants,
+		Targets:           targets,
 	}
 	copy(record.ID[:], src[32:48])
 	cursor, end := coordinatorHeaderBytes, len(src)-4
@@ -289,8 +289,8 @@ func OpenCoordinatorInto(src []byte, participants []ParticipantRef) (Coordinator
 		}
 		distributionLength := int(src[cursor])
 		shardLength := int(src[cursor+1])
-		p := &record.Participants[i]
-		p.State = ParticipantState(src[cursor+2])
+		p := &record.Targets[i]
+		p.State = TargetState(src[cursor+2])
 		p.AllocationGeneration = binary.LittleEndian.Uint64(src[cursor+4 : cursor+12])
 		p.OwnershipEpoch = binary.LittleEndian.Uint64(src[cursor+12 : cursor+20])
 		p.RoutingVersion = binary.LittleEndian.Uint64(src[cursor+20 : cursor+28])
@@ -315,9 +315,9 @@ func OpenCoordinatorInto(src []byte, participants []ParticipantRef) (Coordinator
 	return record, nil
 }
 
-type ParticipantRecord struct {
+type TargetRecord struct {
 	ID                        ID
-	State                     ParticipantState
+	State                     TargetState
 	Revision                  uint64
 	RoutingVersion            uint64
 	AllocationGeneration      uint64
@@ -333,21 +333,21 @@ type ParticipantRecord struct {
 	Mutation                  []byte
 }
 
-const participantHeaderBytes = 120
+const targetHeaderBytes = 120
 
-func AppendParticipant(dst []byte, record ParticipantRecord) ([]byte, error) {
-	if err := validateParticipant(record); err != nil {
+func AppendTarget(dst []byte, record TargetRecord) ([]byte, error) {
+	if err := validateTarget(record); err != nil {
 		return dst, err
 	}
-	total := participantHeaderBytes + len(record.CoordinatorDistribution) +
+	total := targetHeaderBytes + len(record.CoordinatorDistribution) +
 		len(record.CoordinatorShard) + len(record.IntentScopes)*8 + len(record.Mutation) + 4
-	if len(record.Mutation) > MaxMutationBytes || total > MaxParticipantRecordBytes {
+	if len(record.Mutation) > MaxMutationBytes || total > MaxTargetRecordBytes {
 		return dst, ErrTooLarge
 	}
 	start := len(dst)
 	dst = append(dst, make([]byte, total)...)
 	out := dst[start:]
-	copy(out[:4], participantMagic[:])
+	copy(out[:4], targetMagic[:])
 	out[4] = FormatVersion
 	out[5] = byte(record.State)
 	out[6] = byte(len(record.CoordinatorDistribution))
@@ -364,7 +364,7 @@ func AppendParticipant(dst []byte, record ParticipantRecord) ([]byte, error) {
 	binary.LittleEndian.PutUint64(out[108:116], record.CoordinatorOwnershipEpoch)
 	out[116] = record.BucketBits
 	binary.LittleEndian.PutUint16(out[118:120], uint16(len(record.IntentScopes)))
-	cursor := participantHeaderBytes
+	cursor := targetHeaderBytes
 	copy(out[cursor:], record.CoordinatorDistribution)
 	cursor += len(record.CoordinatorDistribution)
 	copy(out[cursor:], record.CoordinatorShard)
@@ -379,26 +379,26 @@ func AppendParticipant(dst []byte, record ParticipantRecord) ([]byte, error) {
 	return dst, nil
 }
 
-func OpenParticipant(src []byte) (ParticipantRecord, error) {
-	if len(src) < participantHeaderBytes+4 {
-		return ParticipantRecord{}, ErrCorrupt
+func OpenTarget(src []byte) (TargetRecord, error) {
+	if len(src) < targetHeaderBytes+4 {
+		return TargetRecord{}, ErrCorrupt
 	}
 	count := int(binary.LittleEndian.Uint16(src[118:120]))
 	if count > MaxIntentScopes {
-		return ParticipantRecord{}, ErrCorrupt
+		return TargetRecord{}, ErrCorrupt
 	}
-	return OpenParticipantInto(src, make([]IntentScope, count))
+	return OpenTargetInto(src, make([]IntentScope, count))
 }
 
-// OpenParticipantInto decodes using caller-owned scope storage. Apply,
+// OpenTargetInto decodes using caller-owned scope storage. Apply,
 // admission, and codec validation keep a fixed arena and allocate nothing.
-func OpenParticipantInto(src []byte, scopes []IntentScope) (ParticipantRecord, error) {
-	if len(src) < participantHeaderBytes+4 || len(src) > MaxParticipantRecordBytes ||
-		!equal4(src[:4], participantMagic) || !checksumOK(src) {
-		return ParticipantRecord{}, ErrCorrupt
+func OpenTargetInto(src []byte, scopes []IntentScope) (TargetRecord, error) {
+	if len(src) < targetHeaderBytes+4 || len(src) > MaxTargetRecordBytes ||
+		!equal4(src[:4], targetMagic) || !checksumOK(src) {
+		return TargetRecord{}, ErrCorrupt
 	}
 	if src[4] != FormatVersion {
-		return ParticipantRecord{}, ErrUnsupported
+		return TargetRecord{}, ErrUnsupported
 	}
 	distributionLen := int(src[6])
 	shardLen := int(src[7])
@@ -406,11 +406,11 @@ func OpenParticipantInto(src []byte, scopes []IntentScope) (ParticipantRecord, e
 	scopeCount := int(binary.LittleEndian.Uint16(src[118:120]))
 	if distributionLen == 0 || shardLen == 0 || mutationLen > MaxMutationBytes ||
 		scopeCount > MaxIntentScopes || cap(scopes) < scopeCount ||
-		participantHeaderBytes+distributionLen+shardLen+scopeCount*8+mutationLen+4 != len(src) {
-		return ParticipantRecord{}, ErrCorrupt
+		targetHeaderBytes+distributionLen+shardLen+scopeCount*8+mutationLen+4 != len(src) {
+		return TargetRecord{}, ErrCorrupt
 	}
-	record := ParticipantRecord{
-		State: ParticipantState(src[5]), Revision: binary.LittleEndian.Uint64(src[8:16]),
+	record := TargetRecord{
+		State: TargetState(src[5]), Revision: binary.LittleEndian.Uint64(src[8:16]),
 		RoutingVersion:            binary.LittleEndian.Uint64(src[16:24]),
 		AllocationGeneration:      binary.LittleEndian.Uint64(src[24:32]),
 		OwnershipEpoch:            binary.LittleEndian.Uint64(src[32:40]),
@@ -421,7 +421,7 @@ func OpenParticipantInto(src []byte, scopes []IntentScope) (ParticipantRecord, e
 	}
 	copy(record.ID[:], src[52:68])
 	copy(record.MutationDigest[:], src[68:100])
-	cursor := participantHeaderBytes
+	cursor := targetHeaderBytes
 	record.CoordinatorDistribution = src[cursor : cursor+distributionLen]
 	cursor += distributionLen
 	record.CoordinatorShard = src[cursor : cursor+shardLen]
@@ -437,22 +437,22 @@ func OpenParticipantInto(src []byte, scopes []IntentScope) (ParticipantRecord, e
 		}
 	}
 	record.Mutation = src[cursor : cursor+mutationLen]
-	if err := validateParticipant(record); err != nil {
-		return ParticipantRecord{}, ErrCorrupt
+	if err := validateTarget(record); err != nil {
+		return TargetRecord{}, ErrCorrupt
 	}
 	return record, nil
 }
 
 func validateCoordinator(record CoordinatorRecord) error {
 	if record.ID.IsZero() || !record.State.valid() || record.Revision == 0 ||
-		record.CatalogGeneration == 0 || len(record.Participants) == 0 {
+		record.CatalogGeneration == 0 || len(record.Targets) == 0 {
 		return ErrCorrupt
 	}
-	if len(record.Participants) > MaxInlineParticipants {
+	if len(record.Targets) > MaxInlineTargets {
 		return ErrTooLarge
 	}
-	for i := range record.Participants {
-		p := &record.Participants[i]
+	for i := range record.Targets {
+		p := &record.Targets[i]
 		if len(p.Distribution) == 0 || len(p.Distribution) > MaxShardIdentityBytes ||
 			!utf8.Valid(p.Distribution) || len(p.Shard) == 0 ||
 			len(p.Shard) > MaxShardIdentityBytes || !utf8.Valid(p.Shard) || p.RoutingVersion == 0 || p.AllocationGeneration == 0 ||
@@ -460,7 +460,7 @@ func validateCoordinator(record CoordinatorRecord) error {
 			return ErrCorrupt
 		}
 		if i != 0 {
-			prior := &record.Participants[i-1]
+			prior := &record.Targets[i-1]
 			order := compareBytes(prior.Distribution, p.Distribution)
 			if order > 0 || (order == 0 && compareBytes(prior.Shard, p.Shard) >= 0) {
 				return ErrCorrupt
@@ -470,7 +470,7 @@ func validateCoordinator(record CoordinatorRecord) error {
 	return nil
 }
 
-func validateParticipant(record ParticipantRecord) error {
+func validateTarget(record TargetRecord) error {
 	if record.ID.IsZero() || !record.State.valid() || record.Revision == 0 ||
 		record.RoutingVersion == 0 || record.AllocationGeneration == 0 ||
 		record.OwnershipEpoch == 0 || record.CoordinatorAllocation == 0 ||

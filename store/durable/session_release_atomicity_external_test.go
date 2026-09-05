@@ -74,7 +74,7 @@ func TestSessionReleaseSingleCollectionCrashAtomicity(t *testing.T) {
 }
 
 // TestSessionReleaseCaptureTransactionCrashAtomicity repeats the proof with a
-// transition-capture participant. Release now dirties two collections and the
+// transition-capture target. Release now dirties two collections and the
 // synced txn.vtm decision is the sole commit point. Faults span a missing/torn
 // decision and an ambiguous decision-sync result.
 func TestSessionReleaseCaptureTransactionCrashAtomicity(t *testing.T) {

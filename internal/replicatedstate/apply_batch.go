@@ -202,17 +202,17 @@ func (workspace *normalBatchWorkspace) attemptedOverlay(ordinal int) *logicalOve
 	return &workspace.attemptedExtra[ordinal]
 }
 
-func isSingleParticipantBatchCommand(data []byte) bool {
+func isSingleTargetBatchCommand(data []byte) bool {
 	command, err := replication.OpenCommand(data)
-	return err == nil && isSingleParticipantCommand(command)
+	return err == nil && isSingleTargetCommand(command)
 }
 
-func isSingleParticipantCommand(command replication.CommandView) bool {
+func isSingleTargetCommand(command replication.CommandView) bool {
 	if command.Kind() != replication.CommandTransaction {
 		return false
 	}
 	control, err := distributedtxn.OpenReplicatedCommand(command.TransactionBytes())
-	return err == nil && control.Operation == distributedtxn.ReplicatedApplySingleParticipant
+	return err == nil && control.Operation == distributedtxn.ReplicatedApplySingleTarget
 }
 
 // ApplyNormalBatch plans a bounded consecutive normal-entry run against one
@@ -297,7 +297,7 @@ func (m *Machine) applyNormalBatch(
 
 	var systemBase pointSnapshot
 	var relationSnapshots relationPointSnapshots
-	if isSingleParticipantBatchCommand(first.Data) {
+	if isSingleTargetBatchCommand(first.Data) {
 		systemBase.live = m.system.Collection
 		relationSnapshots.count = uint16(len(m.relations))
 		for ordinal := range m.relations {
@@ -423,7 +423,7 @@ func (m *Machine) applyNormalBatch(
 					deferredErr = controlErr
 					break
 				}
-				if control.Operation != distributedtxn.ReplicatedApplySingleParticipant {
+				if control.Operation != distributedtxn.ReplicatedApplySingleTarget {
 					break
 				}
 				transactionCommand = control

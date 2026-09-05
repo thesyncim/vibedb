@@ -132,7 +132,7 @@ var DatabaseTxnErrorLanes = []Lane{
 // Case is one row in the public capability table. Tests expand Tables, Keys,
 // Operations, and Lanes into named subtests. Rollback means every successful
 // atomic expansion must also execute a rejected sibling and prove that no
-// participant collection published rows or postings.
+// target collection published rows or postings.
 type Case struct {
 	ID          string
 	Entry       EntryPoint

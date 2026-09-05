@@ -26,7 +26,7 @@ func txnMarkerFuzzSeedEmpty(t testing.TB) []byte {
 func txnMarkerFuzzSeedOneDecision(t testing.TB) []byte {
 	t.Helper()
 	m, path := createTestTxnMarker(t, 64*TxnMarkerMinSectorSize)
-	if _, err := m.AppendDecision(3, testTxnParticipants(2)); err != nil {
+	if _, err := m.AppendDecision(3, testTxnCollectionRefs(2)); err != nil {
 		t.Fatalf("AppendDecision: %v", err)
 	}
 	if err := m.Sync(); err != nil {
@@ -47,7 +47,7 @@ func txnMarkerFuzzSeedTornDecision(t testing.TB) []byte {
 	m, path := createTestTxnMarker(t, 64*TxnMarkerMinSectorSize)
 	fm := NewFaultTxnMarker(m)
 	fm.Program(TxnMarkerFaultPlan{Phase: TxnMarkerFaultTornAppend, AppendIndex: 0})
-	if _, err := m.AppendDecision(3, testTxnParticipants(2)); !errors.Is(err, io.ErrShortWrite) {
+	if _, err := m.AppendDecision(3, testTxnCollectionRefs(2)); !errors.Is(err, io.ErrShortWrite) {
 		t.Fatalf("torn AppendDecision = %v, want io.ErrShortWrite", err)
 	}
 	if err := m.Close(); err != nil {

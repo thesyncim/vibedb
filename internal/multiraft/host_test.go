@@ -625,6 +625,37 @@ func TestHostSurfacesMembershipReadControlsAndOutcomes(t *testing.T) {
 	}
 }
 
+func TestHostReadIndexReadyRefusalRewakesRuntime(t *testing.T) {
+	host, err := NewHost(testHostLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := newFakeRuntime(94)
+	if err = host.addRuntime(runtime); err != nil {
+		t.Fatal(err)
+	}
+	if _, done, runErr := host.RunOne(); done || runErr != nil {
+		t.Fatalf("initial Ready probe = %t, %v", done, runErr)
+	}
+
+	runtime.inputErr = raftmodel.ErrReadyPending
+	context := []byte("deferred-linearizable-read")
+	if err = host.ReadIndex(runtime.identity.Group, context); !errors.Is(err, raftmodel.ErrReadyPending) ||
+		host.runnableLen() != 1 {
+		t.Fatalf("ReadIndex refusal err=%v runnable=%d", err, host.runnableLen())
+	}
+	runtime.inputErr = nil
+	runtime.ready = append(runtime.ready, fakeReady{kind: raftmember.DrivePersisted})
+	progress, done, runErr := host.RunOne()
+	if runErr != nil || !done || progress.Kind != ProgressReady ||
+		progress.ReadyKind != raftmember.DrivePersisted {
+		t.Fatalf("Ready after refusal = %+v, %t, %v", progress, done, runErr)
+	}
+	if len(runtime.readContexts) != 1 || string(runtime.readContexts[0]) != string(context) {
+		t.Fatalf("retained read contexts = %q", runtime.readContexts)
+	}
+}
+
 func TestHostAdoptMessageTransfersExactOwnedMessageOnlyOnSuccess(t *testing.T) {
 	host, err := NewHost(testHostLimits())
 	if err != nil {

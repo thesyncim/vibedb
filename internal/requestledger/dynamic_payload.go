@@ -6,7 +6,7 @@ import (
 )
 
 const (
-	// These are per-physical-wave byte/chunk bounds, never participant caps.
+	// These are per-physical-wave byte/chunk bounds, never target caps.
 	MaxDynamicWavePayloadBytes  = uint64(MaxPendingWaveSteps) * uint64(MaxTargetBytes+MaxCommandBytes)
 	MaxDynamicWavePayloadChunks = uint64(MaxPendingWaveSteps) * 2 *
 		uint64((MaxCommandBytes+MaxPlanPageBytes-1)/MaxPlanPageBytes)

@@ -100,16 +100,16 @@ func TestMultiJSONTransactionAffectedRowsExactRetryAndReopen(t *testing.T) {
 	fixture := newMultiJSONRelationBundleFixture(t, true)
 	const mutationsPerRelation = 8
 	id := transactionCodecID(0xc1)
-	stage := transactionParticipantStageCommand(
+	stage := transactionTargetStageCommand(
 		t, fixture, id, multiJSONMutationBatches('t', mutationsPerRelation),
 	)
 	applyTransactionCommand(t, fixture.machine, 3, stage)
-	prepare := transactionParticipantTransitionCommand(
-		t, fixture, id, distributedtxn.ReplicatedPrepareParticipant, 1,
+	prepare := transactionTargetTransitionCommand(
+		t, fixture, id, distributedtxn.ReplicatedPrepareTarget, 1,
 	)
 	applyTransactionCommand(t, fixture.machine, 4, prepare)
-	apply := transactionParticipantTransitionCommand(
-		t, fixture, id, distributedtxn.ReplicatedApplyParticipant, 2,
+	apply := transactionTargetTransitionCommand(
+		t, fixture, id, distributedtxn.ReplicatedApplyTarget, 2,
 	)
 	result := applyTransactionCommand(t, fixture.machine, 5, apply)
 	if !result.AffectedRowsValid || result.AffectedRows != 2*mutationsPerRelation {
@@ -140,8 +140,8 @@ func TestMultiJSONTransactionAffectedRowsExactRetryAndReopen(t *testing.T) {
 		t.Fatalf("multi-JSON transaction cardinality base=%d second=%d",
 			fixture.base.Collection.Len(), fixture.global.Collection.Len())
 	}
-	release := transactionParticipantTransitionCommand(
-		t, fixture, id, distributedtxn.ReplicatedReleaseParticipant, 3,
+	release := transactionTargetTransitionCommand(
+		t, fixture, id, distributedtxn.ReplicatedReleaseTarget, 3,
 	)
 	applyTransactionCommand(t, reopened, 7, release)
 }
@@ -297,21 +297,21 @@ func TestConditionalPutTransactionAffectedRowsAndConflict(t *testing.T) {
 			Kind: replication.MutationPutPresent, Key: missingKey, Value: []byte(`{"n":1}`),
 		}},
 	}}
-	stage := transactionParticipantStageCommand(t, fixture, missingID, missingBatches)
+	stage := transactionTargetStageCommand(t, fixture, missingID, missingBatches)
 	applyTransactionCommand(t, fixture.machine, 3, stage)
-	prepare := transactionParticipantTransitionCommand(
-		t, fixture, missingID, distributedtxn.ReplicatedPrepareParticipant, 1,
+	prepare := transactionTargetTransitionCommand(
+		t, fixture, missingID, distributedtxn.ReplicatedPrepareTarget, 1,
 	)
 	applyTransactionCommand(t, fixture.machine, 4, prepare)
-	apply := transactionParticipantTransitionCommand(
-		t, fixture, missingID, distributedtxn.ReplicatedApplyParticipant, 2,
+	apply := transactionTargetTransitionCommand(
+		t, fixture, missingID, distributedtxn.ReplicatedApplyTarget, 2,
 	)
 	result := applyTransactionCommand(t, fixture.machine, 5, apply)
 	if !result.AffectedRowsValid || result.AffectedRows != 0 {
 		t.Fatalf("missing conditional update result=%+v", result)
 	}
-	release := transactionParticipantTransitionCommand(
-		t, fixture, missingID, distributedtxn.ReplicatedReleaseParticipant, 3,
+	release := transactionTargetTransitionCommand(
+		t, fixture, missingID, distributedtxn.ReplicatedReleaseTarget, 3,
 	)
 	applyTransactionCommand(t, fixture.machine, 6, release)
 
@@ -333,14 +333,14 @@ func TestConditionalPutTransactionAffectedRowsAndConflict(t *testing.T) {
 			Key:  []byte{0x91, 0x01, 't'}, Value: []byte(`["transaction-missing"]`),
 		}}},
 	}
-	stage = transactionParticipantStageCommand(t, fixture, presentID, presentBatches)
+	stage = transactionTargetStageCommand(t, fixture, presentID, presentBatches)
 	applyTransactionCommand(t, fixture.machine, 8, stage)
-	prepare = transactionParticipantTransitionCommand(
-		t, fixture, presentID, distributedtxn.ReplicatedPrepareParticipant, 1,
+	prepare = transactionTargetTransitionCommand(
+		t, fixture, presentID, distributedtxn.ReplicatedPrepareTarget, 1,
 	)
 	applyTransactionCommand(t, fixture.machine, 9, prepare)
-	apply = transactionParticipantTransitionCommand(
-		t, fixture, presentID, distributedtxn.ReplicatedApplyParticipant, 2,
+	apply = transactionTargetTransitionCommand(
+		t, fixture, presentID, distributedtxn.ReplicatedApplyTarget, 2,
 	)
 	result = applyTransactionCommand(t, fixture.machine, 10, apply)
 	if !result.AffectedRowsValid || result.AffectedRows != 1 {
@@ -357,8 +357,8 @@ func TestConditionalPutTransactionAffectedRowsAndConflict(t *testing.T) {
 	if err != nil || !bytes.Equal(firstRetry.Bytes, secondRetry.Bytes) {
 		t.Fatalf("transaction affected-row retry changed: err=%v", err)
 	}
-	release = transactionParticipantTransitionCommand(
-		t, fixture, presentID, distributedtxn.ReplicatedReleaseParticipant, 3,
+	release = transactionTargetTransitionCommand(
+		t, fixture, presentID, distributedtxn.ReplicatedReleaseTarget, 3,
 	)
 	applyTransactionCommand(t, fixture.machine, 12, release)
 
@@ -368,10 +368,10 @@ func TestConditionalPutTransactionAffectedRowsAndConflict(t *testing.T) {
 			Kind: replication.MutationPutAbsent, Key: missingKey, Value: []byte(`{"n":3}`),
 		}},
 	}}
-	stage = transactionParticipantStageCommand(t, fixture, conflictID, conflictBatches)
+	stage = transactionTargetStageCommand(t, fixture, conflictID, conflictBatches)
 	applyTransactionCommand(t, fixture.machine, 13, stage)
-	prepare = transactionParticipantTransitionCommand(
-		t, fixture, conflictID, distributedtxn.ReplicatedPrepareParticipant, 1,
+	prepare = transactionTargetTransitionCommand(
+		t, fixture, conflictID, distributedtxn.ReplicatedPrepareTarget, 1,
 	)
 	if _, err := fixture.machine.ApplyNormal(normalMeta(14), prepare); err != nil {
 		t.Fatal(err)

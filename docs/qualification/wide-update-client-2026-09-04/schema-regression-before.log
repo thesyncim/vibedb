@@ -1,0 +1,37 @@
+
+======================================================================
+FAIL: test_uniform_workloads_cannot_use_legacy_schema_to_omit_operation_labels (test_summarize_crdb_sql.SummarizeCRDBSQLTest) (workload='update_uniform', schema=None)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/private/tmp/vibedb-fused-rf3-node/scripts/bench/test_summarize_crdb_sql.py", line 182, in test_uniform_workloads_cannot_use_legacy_schema_to_omit_operation_labels
+    MODULE.load(write_report(directory, value), "vibedb")
+AssertionError: ValueError not raised
+
+======================================================================
+FAIL: test_uniform_workloads_cannot_use_legacy_schema_to_omit_operation_labels (test_summarize_crdb_sql.SummarizeCRDBSQLTest) (workload='update_uniform', schema=1)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/private/tmp/vibedb-fused-rf3-node/scripts/bench/test_summarize_crdb_sql.py", line 182, in test_uniform_workloads_cannot_use_legacy_schema_to_omit_operation_labels
+    MODULE.load(write_report(directory, value), "vibedb")
+AssertionError: ValueError not raised
+
+======================================================================
+FAIL: test_uniform_workloads_cannot_use_legacy_schema_to_omit_operation_labels (test_summarize_crdb_sql.SummarizeCRDBSQLTest) (workload='mixed_uniform', schema=None)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/private/tmp/vibedb-fused-rf3-node/scripts/bench/test_summarize_crdb_sql.py", line 182, in test_uniform_workloads_cannot_use_legacy_schema_to_omit_operation_labels
+    MODULE.load(write_report(directory, value), "vibedb")
+AssertionError: ValueError not raised
+
+======================================================================
+FAIL: test_uniform_workloads_cannot_use_legacy_schema_to_omit_operation_labels (test_summarize_crdb_sql.SummarizeCRDBSQLTest) (workload='mixed_uniform', schema=1)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/private/tmp/vibedb-fused-rf3-node/scripts/bench/test_summarize_crdb_sql.py", line 182, in test_uniform_workloads_cannot_use_legacy_schema_to_omit_operation_labels
+    MODULE.load(write_report(directory, value), "vibedb")
+AssertionError: ValueError not raised
+
+----------------------------------------------------------------------
+Ran 1 test in 0.082s
+
+FAILED (failures=4)

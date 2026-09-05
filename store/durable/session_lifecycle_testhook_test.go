@@ -3,7 +3,7 @@ package durable
 import "github.com/thesyncim/vibedb/internal/storeio"
 
 // InstallCollectionJournalFaultForSessionLifecycleTest wraps one exact live
-// participant instead of relying on the global journal-open hook (which cannot
+// target instead of relying on the global journal-open hook (which cannot
 // distinguish system, user, and capture files). It is test-archive-only.
 func InstallCollectionJournalFaultForSessionLifecycleTest(
 	collection *Collection,

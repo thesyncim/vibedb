@@ -177,14 +177,14 @@ func TestCheckpointGroupCertificateMemberCapacity(t *testing.T) {
 		if _, _, _, err := OpenCollectionsWithCheckpointGroup(
 			filepath.Join(t.TempDir(), "must-not-open"), TxnLogOptions{},
 			requests, names(checkpointGroupMaxMembers+1), CheckpointGroupOptions{},
-		); !errors.Is(err, ErrTxnParticipant) {
+		); !errors.Is(err, ErrTxnCollection) {
 			t.Fatalf("oversized recovery admission = %v", err)
 		}
 		dir, members, log := newCheckpointGroupTestResources(
 			t, names(checkpointGroupMaxMembers+1)...,
 		)
 		group, err := NewCheckpointGroup(log, members, CheckpointGroupOptions{})
-		if group != nil || !errors.Is(err, ErrTxnParticipant) {
+		if group != nil || !errors.Is(err, ErrTxnCollection) {
 			t.Fatalf("oversized group=%v err=%v", group, err)
 		}
 		log.regMu.Lock()
@@ -1934,7 +1934,7 @@ func TestCheckpointGroupActivationRevalidatesExactRegisteredCatalog(t *testing.T
 		_ = activated.group.Close()
 		t.Fatal("activation accepted an extra registered collection")
 	}
-	if !errors.Is(activated.err, ErrTxnParticipant) {
+	if !errors.Is(activated.err, ErrTxnCollection) {
 		t.Fatalf("activation with extra registration = %v", activated.err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, checkpointGroupFilename)); !os.IsNotExist(err) {
@@ -1955,7 +1955,7 @@ func TestCheckpointGroupActivationRejectsUnregisteredEngineFile(t *testing.T) {
 		_ = group.Close()
 		t.Fatal("activation accepted an unregistered engine file")
 	}
-	if !errors.Is(err, ErrTxnParticipant) {
+	if !errors.Is(err, ErrTxnCollection) {
 		t.Fatalf("activation with unregistered engine file = %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, checkpointGroupFilename)); !os.IsNotExist(err) {
@@ -1988,7 +1988,7 @@ func TestCheckpointGroupActivationDiscoversArbitraryNamedEngineFile(t *testing.T
 		_ = group.Close()
 		t.Fatal("activation accepted an arbitrary-named format-0 engine")
 	}
-	if !errors.Is(err, ErrTxnParticipant) {
+	if !errors.Is(err, ErrTxnCollection) {
 		t.Fatalf("activation with arbitrary-named engine = %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, checkpointGroupFilename)); !os.IsNotExist(err) {
@@ -2951,7 +2951,7 @@ func TestCheckpointGroupRejectsNonContiguousSurvivingMarkerPrefix(t *testing.T) 
 		t.Fatal(err)
 	}
 	log.commitMu.Lock()
-	_, err = log.marker.AppendDecision(2, []storeio.TxnParticipant{{
+	_, err = log.marker.AppendDecision(2, []storeio.TxnCollectionRef{{
 		StoreID: members[0].storeID, JournalID: members[0].journalID,
 		PreparedGeneration: 1,
 	}})

@@ -99,16 +99,16 @@ func (m *Machine) planTransactionCommand(
 		plan.command.conflict = true
 		return plan, nil
 	}
-	direct := control.Operation == distributedtxn.ReplicatedApplySingleParticipant
+	direct := control.Operation == distributedtxn.ReplicatedApplySingleTarget
 	creation := control.Operation == distributedtxn.ReplicatedStageCoordinator ||
 		control.Operation == distributedtxn.ReplicatedStageManifestCoordinator ||
-		control.Operation == distributedtxn.ReplicatedStageParticipant ||
-		control.Operation == distributedtxn.ReplicatedStagePrepareParticipant ||
-		control.Operation == distributedtxn.ReplicatedAbortReleaseParticipant &&
+		control.Operation == distributedtxn.ReplicatedStageTarget ||
+		control.Operation == distributedtxn.ReplicatedStagePrepareTarget ||
+		control.Operation == distributedtxn.ReplicatedAbortReleaseTarget &&
 			control.ExpectedRevision == 0
 	if direct && found && (!existing.FusedPath ||
-		existing.LastOperation != distributedtxn.ReplicatedApplySingleParticipant ||
-		distributedtxn.ParticipantState(existing.State) != distributedtxn.ParticipantReleased ||
+		existing.LastOperation != distributedtxn.ReplicatedApplySingleTarget ||
+		distributedtxn.TargetState(existing.State) != distributedtxn.TargetReleased ||
 		control.ExpectedRevision <= existing.Revision) {
 		plan.command.resultCode = ResultTransactionConflict
 		plan.command.conflict = true
@@ -164,36 +164,36 @@ func (m *Machine) planTransactionCommand(
 		return m.planCoordinatorRecoveryPulse(
 			plan, control, existing.TransactionControl, applied, commandDigest, storageKey,
 		)
-	case distributedtxn.ReplicatedStageParticipant:
-		return m.planParticipantStage(
+	case distributedtxn.ReplicatedStageTarget:
+		return m.planTargetStage(
 			plan, command, control, applied, commandDigest, storageKey, systemSnapshot,
 		)
-	case distributedtxn.ReplicatedStagePrepareParticipant:
-		return m.planParticipantStagePrepared(
+	case distributedtxn.ReplicatedStagePrepareTarget:
+		return m.planTargetStagePrepared(
 			plan, command, control, applied, commandDigest, storageKey,
 			systemSnapshot, relationSnapshots,
 		)
-	case distributedtxn.ReplicatedApplySingleParticipant:
-		return m.planSingleParticipantApply(
+	case distributedtxn.ReplicatedApplySingleTarget:
+		return m.planSingleTargetApply(
 			plan, command, control, applied, commandDigest, storageKey,
 			systemSnapshot, relationSnapshots, existing.TransactionControl, found, scratch,
 		)
-	case distributedtxn.ReplicatedAbortReleaseParticipant:
+	case distributedtxn.ReplicatedAbortReleaseTarget:
 		if control.ExpectedRevision == 0 {
-			return m.planParticipantAbortFence(
+			return m.planTargetAbortFence(
 				plan, control, applied, commandDigest, storageKey,
 			)
 		}
-		return m.planParticipantTransition(
+		return m.planTargetTransition(
 			plan, command, control, existing.TransactionControl, applied,
 			commandDigest, storageKey, systemSnapshot, relationSnapshots,
 		)
-	case distributedtxn.ReplicatedPrepareParticipant,
-		distributedtxn.ReplicatedApplyParticipant,
-		distributedtxn.ReplicatedAbortParticipant,
-		distributedtxn.ReplicatedReleaseParticipant,
-		distributedtxn.ReplicatedApplyReleaseParticipant:
-		return m.planParticipantTransition(
+	case distributedtxn.ReplicatedPrepareTarget,
+		distributedtxn.ReplicatedApplyTarget,
+		distributedtxn.ReplicatedAbortTarget,
+		distributedtxn.ReplicatedReleaseTarget,
+		distributedtxn.ReplicatedApplyReleaseTarget:
+		return m.planTargetTransition(
 			plan, command, control, existing.TransactionControl, applied,
 			commandDigest, storageKey, systemSnapshot, relationSnapshots,
 		)
@@ -226,7 +226,7 @@ func (m *Machine) planCoordinatorRecoveryPulse(
 	return plan, nil
 }
 
-func (m *Machine) planParticipantAbortFence(
+func (m *Machine) planTargetAbortFence(
 	plan transactionCommandPlan,
 	control distributedtxn.ReplicatedCommand,
 	applied uint64,
@@ -238,18 +238,18 @@ func (m *Machine) planParticipantAbortFence(
 		return transactionCommandPlan{}, err
 	}
 	durableControl := TransactionControl{
-		ID: control.ID, Role: distributedtxn.ReplicatedRoleParticipant,
-		State: uint8(distributedtxn.ParticipantReleased), Revision: 1,
+		ID: control.ID, Role: distributedtxn.ReplicatedRoleTarget,
+		State: uint8(distributedtxn.TargetReleased), Revision: 1,
 		ControllerEpoch: control.ControllerEpoch, ExecutionPinDigest: control.ExecutionPinDigest,
 		PayloadKind:      control.PayloadKind,
-		PayloadDigest:    control.Participant.MutationDigest,
-		CoordinatorGroup: replication.ID128(control.Participant.CoordinatorGroup),
+		PayloadDigest:    control.Target.MutationDigest,
+		CoordinatorGroup: replication.ID128(control.Target.CoordinatorGroup),
 		CoordinatorShardIncarnation: replication.ID128(
-			control.Participant.CoordinatorShardIncarnation,
+			control.Target.CoordinatorShardIncarnation,
 		),
-		CoordinatorAllocation: control.Participant.CoordinatorAllocation,
-		MutationDigest:        control.Participant.MutationDigest,
-		ParticipantOrdinal:    control.Participant.ParticipantOrdinal,
+		CoordinatorAllocation: control.Target.CoordinatorAllocation,
+		MutationDigest:        control.Target.MutationDigest,
+		TargetOrdinal:         control.Target.TargetOrdinal,
 		FusedPath:             true, CancellationWitness: true,
 		ResidentControlBytes: controlBytes,
 		LastOperation:        control.Operation,
@@ -297,9 +297,9 @@ func (m *Machine) planCoordinatorBeginPrepare(
 	systemSnapshot pointSnapshot,
 	relationSnapshots relationPointSnapshots,
 ) (transactionCommandPlan, error) {
-	if replication.ID128(control.Participant.CoordinatorGroup) != command.GroupID ||
-		replication.ID128(control.Participant.CoordinatorShardIncarnation) != command.ShardIncarnation ||
-		control.Participant.CoordinatorAllocation != command.AllocationGeneration {
+	if replication.ID128(control.Target.CoordinatorGroup) != command.GroupID ||
+		replication.ID128(control.Target.CoordinatorShardIncarnation) != command.ShardIncarnation ||
+		control.Target.CoordinatorAllocation != command.AllocationGeneration {
 		plan.command.resultCode = ResultStaleFence
 		return plan, nil
 	}
@@ -316,26 +316,26 @@ func (m *Machine) planCoordinatorBeginPrepare(
 	coordinatorKey, _ := TransactionControlStorageKey(
 		distributedtxn.ReplicatedRoleCoordinator, control.ID,
 	)
-	participantKey, _ := TransactionControlStorageKey(
-		distributedtxn.ReplicatedRoleParticipant, control.ID,
+	targetKey, _ := TransactionControlStorageKey(
+		distributedtxn.ReplicatedRoleTarget, control.ID,
 	)
 	coordinator, coordinatorFound, err := transactionControlAt(systemSnapshot, coordinatorKey)
 	if err != nil {
 		return transactionCommandPlan{}, err
 	}
-	participant, participantFound, err := transactionControlAt(systemSnapshot, participantKey)
+	target, targetFound, err := transactionControlAt(systemSnapshot, targetKey)
 	if err != nil {
 		return transactionCommandPlan{}, err
 	}
-	if coordinatorFound || participantFound {
-		if coordinatorFound && participantFound &&
+	if coordinatorFound || targetFound {
+		if coordinatorFound && targetFound &&
 			coordinator.LastOperation == control.Operation &&
 			coordinator.LastExpectedRevision == 0 &&
 			coordinator.LastCommandDigest == commandDigest &&
-			participant.LastOperation == distributedtxn.ReplicatedStagePrepareParticipant &&
-			participant.LastExpectedRevision == 0 &&
-			participant.LastCommandDigest == commandDigest &&
-			coordinator.PrepareResultCode == participant.PrepareResultCode {
+			target.LastOperation == distributedtxn.ReplicatedStagePrepareTarget &&
+			target.LastExpectedRevision == 0 &&
+			target.LastCommandDigest == commandDigest &&
+			coordinator.PrepareResultCode == target.PrepareResultCode {
 			plan.command.resultCode = coordinator.PrepareResultCode
 			plan.command.exactDuplicate = true
 			return plan, nil
@@ -346,18 +346,18 @@ func (m *Machine) planCoordinatorBeginPrepare(
 		plan.command.refusal = ErrAdmissionBound
 		return plan, nil
 	}
-	wantParticipant := distributedtxn.ParticipantRef{
+	wantTarget := distributedtxn.TransactionTargetRef{
 		Distribution:         command.Distribution,
 		Shard:                command.Shard,
 		RoutingVersion:       command.RoutingVersion,
 		AllocationGeneration: command.AllocationGeneration,
 		OwnershipEpoch:       command.OwnershipEpoch,
 		AuthorityWitness:     authorityWitness,
-		MutationDigest:       control.Participant.MutationDigest,
-		State:                distributedtxn.ParticipantStaged,
+		MutationDigest:       control.Target.MutationDigest,
+		State:                distributedtxn.TargetStaged,
 	}
-	present, matches, err := distributedtxn.ReplicatedCoordinatorBindsParticipant(
-		control.Payload, uint64(control.Participant.ParticipantOrdinal), wantParticipant,
+	present, matches, err := distributedtxn.ReplicatedCoordinatorBindsTarget(
+		control.Payload, uint64(control.Target.TargetOrdinal), wantTarget,
 	)
 	if err != nil {
 		return transactionCommandPlan{}, ErrTransactionStateCorrupt
@@ -367,45 +367,45 @@ func (m *Machine) planCoordinatorBeginPrepare(
 		return plan, nil
 	}
 
-	participantControl := distributedtxn.ReplicatedCommand{
-		Role:               distributedtxn.ReplicatedRoleParticipant,
-		Operation:          distributedtxn.ReplicatedStagePrepareParticipant,
+	targetControl := distributedtxn.ReplicatedCommand{
+		Role:               distributedtxn.ReplicatedRoleTarget,
+		Operation:          distributedtxn.ReplicatedStagePrepareTarget,
 		ID:                 control.ID,
-		PayloadKind:        distributedtxn.ReplicatedPayloadParticipantStage,
-		Participant:        control.Participant,
+		PayloadKind:        distributedtxn.ReplicatedPayloadTargetStage,
+		Target:             control.Target,
 		ControllerEpoch:    control.ControllerEpoch,
 		ExecutionPinDigest: control.ExecutionPinDigest,
 	}
-	participantControl.Participant.ParticipantOrdinal = 0
-	participantPlan, err := m.planParticipantStagePrepared(
+	targetControl.Target.TargetOrdinal = 0
+	targetPlan, err := m.planTargetStagePrepared(
 		transactionCommandPlan{command: plan.command}, command,
-		participantControl, applied, commandDigest, participantKey,
+		targetControl, applied, commandDigest, targetKey,
 		systemSnapshot, relationSnapshots,
 	)
 	if err != nil {
 		return transactionCommandPlan{}, err
 	}
-	if participantPlan.command.resultCode == ResultTransactionConflict {
+	if targetPlan.command.resultCode == ResultTransactionConflict {
 		return transactionConflict(plan), nil
 	}
-	if participantPlan.command.resultCode != ResultApplied &&
-		participantPlan.command.resultCode != ResultIndexConflict &&
-		participantPlan.command.resultCode != ResultWrongShard {
+	if targetPlan.command.resultCode != ResultApplied &&
+		targetPlan.command.resultCode != ResultIndexConflict &&
+		targetPlan.command.resultCode != ResultWrongShard {
 		return transactionCommandPlan{}, ErrTransactionStateCorrupt
 	}
-	participantOrdinal := uint64(control.Participant.ParticipantOrdinal)
-	prepareResult := participantPlan.command.resultCode
+	targetOrdinal := uint64(control.Target.TargetOrdinal)
+	prepareResult := targetPlan.command.resultCode
 	var coordinatorPlan transactionCommandPlan
 	switch control.Operation {
 	case distributedtxn.ReplicatedBeginPrepareCoordinator:
 		coordinatorPlan, err = m.planInlineCoordinatorStage(
 			plan, command, control, applied, commandDigest, coordinatorKey,
-			participantOrdinal, prepareResult,
+			targetOrdinal, prepareResult,
 		)
 	case distributedtxn.ReplicatedBeginPrepareManifestCoordinator:
 		coordinatorPlan, err = m.planManifestCoordinatorStage(
 			plan, command, control, applied, commandDigest, coordinatorKey,
-			participantOrdinal, prepareResult,
+			targetOrdinal, prepareResult,
 		)
 	default:
 		return transactionCommandPlan{}, ErrTransactionStateCorrupt
@@ -413,14 +413,14 @@ func (m *Machine) planCoordinatorBeginPrepare(
 	if err != nil {
 		return transactionCommandPlan{}, err
 	}
-	coordinatorPlan.rows = append(coordinatorPlan.rows, participantPlan.rows...)
-	coordinatorPlan.delta.controls += participantPlan.delta.controls
-	coordinatorPlan.delta.active += participantPlan.delta.active
-	coordinatorPlan.delta.payloadRows += participantPlan.delta.payloadRows
-	coordinatorPlan.delta.intentRows += participantPlan.delta.intentRows
-	coordinatorPlan.delta.residentByte += participantPlan.delta.residentByte
+	coordinatorPlan.rows = append(coordinatorPlan.rows, targetPlan.rows...)
+	coordinatorPlan.delta.controls += targetPlan.delta.controls
+	coordinatorPlan.delta.active += targetPlan.delta.active
+	coordinatorPlan.delta.payloadRows += targetPlan.delta.payloadRows
+	coordinatorPlan.delta.intentRows += targetPlan.delta.intentRows
+	coordinatorPlan.delta.residentByte += targetPlan.delta.residentByte
 	wantActive := int64(1)
-	if participantPlan.command.resultCode == ResultApplied {
+	if targetPlan.command.resultCode == ResultApplied {
 		wantActive = 2
 	}
 	if coordinatorPlan.delta.controls != 2 || coordinatorPlan.delta.active != wantActive {
@@ -437,11 +437,11 @@ func (m *Machine) planInlineCoordinatorStage(
 	applied uint64,
 	commandDigest replication.Digest,
 	controlKey [transactionControlStorageKeyBytes]byte,
-	participantOrdinal uint64,
+	targetOrdinal uint64,
 	prepareResult uint32,
 ) (transactionCommandPlan, error) {
-	var participants [distributedtxn.MaxInlineParticipants]distributedtxn.ParticipantRef
-	record, err := distributedtxn.OpenCoordinatorInto(control.Payload, participants[:])
+	var targets [distributedtxn.MaxInlineTargets]distributedtxn.TransactionTargetRef
+	record, err := distributedtxn.OpenCoordinatorInto(control.Payload, targets[:])
 	if err != nil || record.ID != control.ID || record.Revision != 1 {
 		return transactionCommandPlan{}, ErrTransactionStateCorrupt
 	}
@@ -460,13 +460,13 @@ func (m *Machine) planInlineCoordinatorStage(
 		Revision: 1, PayloadKind: control.PayloadKind,
 		ControllerEpoch: control.ControllerEpoch, ExecutionPinDigest: control.ExecutionPinDigest,
 		PayloadDigest: payloadDigest, PayloadBytes: uint64(len(control.Payload)),
-		PayloadCount:     uint64(len(record.Participants)),
+		PayloadCount:     uint64(len(record.Targets)),
 		CoordinatorGroup: command.GroupID, CoordinatorShardIncarnation: command.ShardIncarnation,
 		CoordinatorAllocation: command.AllocationGeneration, MutationDigest: payloadDigest,
-		CoordinatorParticipantOrdinal: participantOrdinal,
-		PrepareResultCode:             prepareResult,
-		FusedPath:                     control.Operation == distributedtxn.ReplicatedBeginPrepareCoordinator,
-		ResidentControlBytes:          controlBytes, ResidentPayloadBytes: payloadBytes,
+		CoordinatorTargetOrdinal: targetOrdinal,
+		PrepareResultCode:        prepareResult,
+		FusedPath:                control.Operation == distributedtxn.ReplicatedBeginPrepareCoordinator,
+		ResidentControlBytes:     controlBytes, ResidentPayloadBytes: payloadBytes,
 		LastOperation: control.Operation, LastExpectedRevision: 0,
 		LastCommandDigest: commandDigest, LastResultCode: transactionPrepareResultOrApplied(prepareResult),
 		LastAppliedIndex: applied,
@@ -492,7 +492,7 @@ func (m *Machine) planManifestCoordinatorStage(
 	applied uint64,
 	commandDigest replication.Digest,
 	controlKey [transactionControlStorageKeyBytes]byte,
-	participantOrdinal uint64,
+	targetOrdinal uint64,
 	prepareResult uint32,
 ) (transactionCommandPlan, error) {
 	coordinatorRaw, pages, err := distributedtxn.OpenReplicatedManifestStart(control.Payload)
@@ -544,22 +544,22 @@ func (m *Machine) planManifestCoordinatorStage(
 		Revision: uint64(pages.Count()), PayloadKind: control.PayloadKind,
 		ControllerEpoch: control.ControllerEpoch, ExecutionPinDigest: control.ExecutionPinDigest,
 		PayloadDigest: payloadDigest, PayloadBytes: record.Manifest.EncodedBytes,
-		PayloadCount:     record.Manifest.ParticipantCount,
+		PayloadCount:     record.Manifest.TargetCount,
 		CoordinatorGroup: command.GroupID, CoordinatorShardIncarnation: command.ShardIncarnation,
-		CoordinatorAllocation:         command.AllocationGeneration,
-		MutationDigest:                transactionManifestStartDigest(coordinatorRaw, firstPage),
-		CoordinatorParticipantOrdinal: participantOrdinal,
-		PrepareResultCode:             prepareResult,
-		FusedPath:                     control.Operation == distributedtxn.ReplicatedBeginPrepareManifestCoordinator,
-		ResidentControlBytes:          controlBytes, ResidentPayloadBytes: payloadBytes,
+		CoordinatorAllocation:    command.AllocationGeneration,
+		MutationDigest:           transactionManifestStartDigest(coordinatorRaw, firstPage),
+		CoordinatorTargetOrdinal: targetOrdinal,
+		PrepareResultCode:        prepareResult,
+		FusedPath:                control.Operation == distributedtxn.ReplicatedBeginPrepareManifestCoordinator,
+		ResidentControlBytes:     controlBytes, ResidentPayloadBytes: payloadBytes,
 		ResidentManifestBytes: manifestBytes,
 		LastOperation:         control.Operation, LastExpectedRevision: 0,
 		LastCommandDigest: commandDigest, LastResultCode: transactionPrepareResultOrApplied(prepareResult),
-		LastAppliedIndex:        applied,
-		ManifestNextPage:        uint32(pages.Count()),
-		ManifestNextParticipant: pages.ParticipantCount(),
-		ManifestEncodedBytes:    pages.EncodedBytes(),
-		ManifestChainDigest:     manifestChain,
+		LastAppliedIndex:     applied,
+		ManifestNextPage:     uint32(pages.Count()),
+		ManifestNextTarget:   pages.TargetCount(),
+		ManifestEncodedBytes: pages.EncodedBytes(),
+		ManifestChainDigest:  manifestChain,
 	}
 	encodedControl, err := AppendTransactionControl(nil, durableControl)
 	if err != nil {
@@ -593,9 +593,9 @@ func (m *Machine) planManifestPageStage(
 	}
 	meta, ok := openTransactionManifestSegmentMeta(control.Payload)
 	if !ok || meta.Index != existing.ManifestNextPage ||
-		meta.FirstParticipant != existing.ManifestNextParticipant ||
+		meta.FirstTarget != existing.ManifestNextTarget ||
 		existing.ManifestNextPage == math.MaxUint32 ||
-		uint64(meta.ParticipantCount) > existing.PayloadCount-existing.ManifestNextParticipant ||
+		uint64(meta.TargetCount) > existing.PayloadCount-existing.ManifestNextTarget ||
 		uint64(len(control.Payload)) > existing.PayloadBytes-existing.ManifestEncodedBytes {
 		return transactionConflict(plan), nil
 	}
@@ -610,26 +610,26 @@ func (m *Machine) planManifestPageStage(
 		return transactionConflict(plan), nil
 	}
 	if existing.PrepareResultCode != 0 &&
-		existing.CoordinatorParticipantOrdinal >= meta.FirstParticipant &&
-		existing.CoordinatorParticipantOrdinal < meta.FirstParticipant+uint64(meta.ParticipantCount) {
-		participantKey, _ := TransactionControlStorageKey(
-			distributedtxn.ReplicatedRoleParticipant, control.ID,
+		existing.CoordinatorTargetOrdinal >= meta.FirstTarget &&
+		existing.CoordinatorTargetOrdinal < meta.FirstTarget+uint64(meta.TargetCount) {
+		targetKey, _ := TransactionControlStorageKey(
+			distributedtxn.ReplicatedRoleTarget, control.ID,
 		)
-		participant, found, participantErr := transactionControlAt(snapshot, participantKey)
-		if participantErr != nil || !found || participant.PrepareResultCode != existing.PrepareResultCode {
-			return transactionCommandPlan{}, errors.Join(participantErr, ErrTransactionStateCorrupt)
+		target, found, targetErr := transactionControlAt(snapshot, targetKey)
+		if targetErr != nil || !found || target.PrepareResultCode != existing.PrepareResultCode {
+			return transactionCommandPlan{}, errors.Join(targetErr, ErrTransactionStateCorrupt)
 		}
-		want := distributedtxn.ParticipantRef{
+		want := distributedtxn.TransactionTargetRef{
 			Distribution: command.Distribution, Shard: command.Shard,
 			RoutingVersion:       command.RoutingVersion,
 			AllocationGeneration: command.AllocationGeneration,
 			OwnershipEpoch:       command.OwnershipEpoch,
 			AuthorityWitness:     m.transactionRouteAuthorityWitness(command),
-			MutationDigest:       participant.MutationDigest,
-			State:                distributedtxn.ParticipantStaged,
+			MutationDigest:       target.MutationDigest,
+			State:                distributedtxn.TargetStaged,
 		}
-		present, matches, matchErr := distributedtxn.ManifestSegmentMatchesParticipant(
-			control.Payload, existing.CoordinatorParticipantOrdinal, want,
+		present, matches, matchErr := distributedtxn.ManifestSegmentMatchesTarget(
+			control.Payload, existing.CoordinatorTargetOrdinal, want,
 		)
 		if matchErr != nil || !present {
 			return transactionCommandPlan{}, errors.Join(matchErr, ErrTransactionStateCorrupt)
@@ -640,8 +640,8 @@ func (m *Machine) planManifestPageStage(
 		}
 	}
 	pageRecord, err := AppendTransactionManifestPage(nil, control.ID, distributedtxn.ManifestSegment{
-		Index: meta.Index, FirstParticipant: meta.FirstParticipant,
-		ParticipantCount: meta.ParticipantCount, Digest: meta.Digest, Raw: control.Payload,
+		Index: meta.Index, FirstTarget: meta.FirstTarget,
+		TargetCount: meta.TargetCount, Digest: meta.Digest, Raw: control.Payload,
 	})
 	if err != nil {
 		return transactionCommandPlan{}, err
@@ -651,7 +651,7 @@ func (m *Machine) planManifestPageStage(
 	existing.Revision++
 	existing.ResidentManifestBytes += pageBytes
 	existing.ManifestNextPage++
-	existing.ManifestNextParticipant += uint64(meta.ParticipantCount)
+	existing.ManifestNextTarget += uint64(meta.TargetCount)
 	existing.ManifestEncodedBytes += uint64(len(control.Payload))
 	existing.ManifestChainDigest = advanceTransactionManifestChain(
 		existing.ManifestChainDigest, meta.Index, meta.Digest,
@@ -689,9 +689,9 @@ func (m *Machine) planManifestSegmentsStage(
 	}
 	segments, err := distributedtxn.OpenManifestSegmentSequence(control.Payload)
 	if err != nil || segments.FirstIndex() != existing.ManifestNextPage ||
-		segments.FirstParticipant() != existing.ManifestNextParticipant ||
+		segments.FirstTarget() != existing.ManifestNextTarget ||
 		uint64(segments.Count()) > uint64(math.MaxUint32-existing.ManifestNextPage) ||
-		segments.ParticipantCount() > existing.PayloadCount-existing.ManifestNextParticipant ||
+		segments.TargetCount() > existing.PayloadCount-existing.ManifestNextTarget ||
 		segments.EncodedBytes() > existing.PayloadBytes-existing.ManifestEncodedBytes {
 		return transactionConflict(plan), nil
 	}
@@ -717,19 +717,19 @@ func (m *Machine) planManifestSegmentsStage(
 	if followErr != nil {
 		return transactionCommandPlan{}, followErr
 	}
-	if descriptor.ParticipantCount != existing.PayloadCount ||
+	if descriptor.TargetCount != existing.PayloadCount ||
 		descriptor.EncodedBytes != existing.PayloadBytes || wantPages == 0 ||
 		uint32(segments.Count()) != wantPages || !follows {
 		return transactionConflict(plan), nil
 	}
-	var participant TransactionControlView
+	var target TransactionControlView
 	if existing.PrepareResultCode != 0 {
-		participantKey, _ := TransactionControlStorageKey(
-			distributedtxn.ReplicatedRoleParticipant, control.ID,
+		targetKey, _ := TransactionControlStorageKey(
+			distributedtxn.ReplicatedRoleTarget, control.ID,
 		)
 		var found bool
-		participant, found, err = transactionControlAt(snapshot, participantKey)
-		if err != nil || !found || participant.PrepareResultCode != existing.PrepareResultCode {
+		target, found, err = transactionControlAt(snapshot, targetKey)
+		if err != nil || !found || target.PrepareResultCode != existing.PrepareResultCode {
 			return transactionCommandPlan{}, errors.Join(err, ErrTransactionStateCorrupt)
 		}
 	}
@@ -739,20 +739,20 @@ func (m *Machine) planManifestSegmentsStage(
 	for iterator.Next() {
 		segment := iterator.Segment()
 		if existing.PrepareResultCode != 0 &&
-			existing.CoordinatorParticipantOrdinal >= segment.FirstParticipant &&
-			existing.CoordinatorParticipantOrdinal <
-				segment.FirstParticipant+uint64(segment.ParticipantCount) {
-			want := distributedtxn.ParticipantRef{
+			existing.CoordinatorTargetOrdinal >= segment.FirstTarget &&
+			existing.CoordinatorTargetOrdinal <
+				segment.FirstTarget+uint64(segment.TargetCount) {
+			want := distributedtxn.TransactionTargetRef{
 				Distribution: command.Distribution, Shard: command.Shard,
 				RoutingVersion:       command.RoutingVersion,
 				AllocationGeneration: command.AllocationGeneration,
 				OwnershipEpoch:       command.OwnershipEpoch,
 				AuthorityWitness:     m.transactionRouteAuthorityWitness(command),
-				MutationDigest:       participant.MutationDigest,
-				State:                distributedtxn.ParticipantStaged,
+				MutationDigest:       target.MutationDigest,
+				State:                distributedtxn.TargetStaged,
 			}
-			present, matches, matchErr := distributedtxn.ManifestSegmentMatchesParticipant(
-				segment.Raw, existing.CoordinatorParticipantOrdinal, want,
+			present, matches, matchErr := distributedtxn.ManifestSegmentMatchesTarget(
+				segment.Raw, existing.CoordinatorTargetOrdinal, want,
 			)
 			if matchErr != nil || !present {
 				return transactionCommandPlan{}, errors.Join(matchErr, ErrTransactionStateCorrupt)
@@ -778,7 +778,7 @@ func (m *Machine) planManifestSegmentsStage(
 	existing.Revision += uint64(segments.Count())
 	existing.ResidentManifestBytes += resident
 	existing.ManifestNextPage += uint32(segments.Count())
-	existing.ManifestNextParticipant += segments.ParticipantCount()
+	existing.ManifestNextTarget += segments.TargetCount()
 	existing.ManifestEncodedBytes += segments.EncodedBytes()
 	stampTransactionWitness(&existing, control, commandDigest, applied, ResultApplied)
 	encoded, err := AppendTransactionControl(nil, existing)
@@ -911,10 +911,10 @@ func (m *Machine) planCoordinatorTransition(
 		}
 		descriptor, err := distributedtxn.OpenManifestCoordinator(payload.Payload)
 		if err != nil || existing.ManifestNextPage != descriptor.Manifest.SegmentCount ||
-			existing.ManifestNextParticipant != descriptor.Manifest.ParticipantCount ||
+			existing.ManifestNextTarget != descriptor.Manifest.TargetCount ||
 			existing.ManifestEncodedBytes != descriptor.Manifest.EncodedBytes ||
 			finishTransactionManifestRoot(
-				existing.ManifestChainDigest, existing.ManifestNextParticipant,
+				existing.ManifestChainDigest, existing.ManifestNextTarget,
 				existing.ManifestEncodedBytes, existing.ManifestNextPage,
 			) != descriptor.Manifest.Root {
 			return transactionConflict(plan), nil
@@ -967,7 +967,7 @@ func (m *Machine) planCoordinatorTransition(
 	return plan, nil
 }
 
-func (m *Machine) planParticipantStage(
+func (m *Machine) planTargetStage(
 	plan transactionCommandPlan,
 	command replication.CommandView,
 	control distributedtxn.ReplicatedCommand,
@@ -976,13 +976,13 @@ func (m *Machine) planParticipantStage(
 	controlKey [transactionControlStorageKeyBytes]byte,
 	snapshot pointSnapshot,
 ) (transactionCommandPlan, error) {
-	return m.planParticipantStageWithVote(
+	return m.planTargetStageWithVote(
 		plan, command, control, applied, commandDigest, controlKey,
 		snapshot, relationPointSnapshots{}, false,
 	)
 }
 
-func (m *Machine) planParticipantStagePrepared(
+func (m *Machine) planTargetStagePrepared(
 	plan transactionCommandPlan,
 	command replication.CommandView,
 	control distributedtxn.ReplicatedCommand,
@@ -992,17 +992,17 @@ func (m *Machine) planParticipantStagePrepared(
 	snapshot pointSnapshot,
 	relationSnapshots relationPointSnapshots,
 ) (transactionCommandPlan, error) {
-	return m.planParticipantStageWithVote(
+	return m.planTargetStageWithVote(
 		plan, command, control, applied, commandDigest, controlKey,
 		snapshot, relationSnapshots, true,
 	)
 }
 
-// planSingleParticipantApply is the one-consensus-round transaction kernel.
+// planSingleTargetApply is the one-consensus-round transaction kernel.
 // The command identity, user mutations, deterministic result, and compact
 // retry witness become durable in one state-machine transaction. Unlike the
 // distributed lane it never installs intents or retained mutation payloads.
-func (m *Machine) planSingleParticipantApply(
+func (m *Machine) planSingleTargetApply(
 	plan transactionCommandPlan,
 	command replication.CommandView,
 	control distributedtxn.ReplicatedCommand,
@@ -1015,7 +1015,7 @@ func (m *Machine) planSingleParticipantApply(
 	found bool,
 	scratch *commandPlanScratch,
 ) (transactionCommandPlan, error) {
-	controlBytes, err := TransactionControlResidentBytes(len(control.Participant.IntentScopes))
+	controlBytes, err := TransactionControlResidentBytes(len(control.Target.IntentScopes))
 	if err != nil {
 		return transactionCommandPlan{}, fmt.Errorf("%w: size direct control", err)
 	}
@@ -1081,16 +1081,16 @@ func (m *Machine) planSingleParticipantApply(
 	}
 	durableControl := TransactionControl{
 		ID: control.ID, Role: control.Role,
-		State: uint8(distributedtxn.ParticipantReleased), Revision: control.ExpectedRevision,
+		State: uint8(distributedtxn.TargetReleased), Revision: control.ExpectedRevision,
 		ControllerEpoch: control.ControllerEpoch, ExecutionPinDigest: control.ExecutionPinDigest,
-		PayloadKind: control.PayloadKind, PayloadDigest: control.Participant.MutationDigest,
+		PayloadKind: control.PayloadKind, PayloadDigest: control.Target.MutationDigest,
 		PayloadBytes: transactionCanonicalRelationBytes(command),
 		PayloadCount: uint64(command.MutationCount()), PayloadRelationCount: uint16(command.RelationCount()),
-		CoordinatorGroup:            replication.ID128(control.Participant.CoordinatorGroup),
-		CoordinatorShardIncarnation: replication.ID128(control.Participant.CoordinatorShardIncarnation),
-		CoordinatorAllocation:       control.Participant.CoordinatorAllocation,
-		MutationDigest:              control.Participant.MutationDigest,
-		BucketBits:                  control.Participant.BucketBits, IntentScopes: control.Participant.IntentScopes,
+		CoordinatorGroup:            replication.ID128(control.Target.CoordinatorGroup),
+		CoordinatorShardIncarnation: replication.ID128(control.Target.CoordinatorShardIncarnation),
+		CoordinatorAllocation:       control.Target.CoordinatorAllocation,
+		MutationDigest:              control.Target.MutationDigest,
+		BucketBits:                  control.Target.BucketBits, IntentScopes: control.Target.IntentScopes,
 		AffectedRows: affectedRows, AffectedRowsValid: resultCode == ResultApplied,
 		PrepareResultCode: resultCode, PrepareCommandDigest: commandDigest,
 		FusedPath: true, ResidentControlBytes: controlBytes,
@@ -1122,7 +1122,7 @@ func (m *Machine) planSingleParticipantApply(
 	return plan, nil
 }
 
-func (m *Machine) planParticipantStageWithVote(
+func (m *Machine) planTargetStageWithVote(
 	plan transactionCommandPlan,
 	command replication.CommandView,
 	control distributedtxn.ReplicatedCommand,
@@ -1133,7 +1133,7 @@ func (m *Machine) planParticipantStageWithVote(
 	relationSnapshots relationPointSnapshots,
 	prepare bool,
 ) (transactionCommandPlan, error) {
-	controlBytes, _ := TransactionControlResidentBytes(len(control.Participant.IntentScopes))
+	controlBytes, _ := TransactionControlResidentBytes(len(control.Target.IntentScopes))
 	residentMutation, residentIntent := uint64(0), uint64(0)
 	relationRows, intentRows := int64(0), int64(0)
 	var payloadArena [replication.MaxRelationsPerBundle]TransactionRelationPayloadView
@@ -1209,7 +1209,7 @@ func (m *Machine) planParticipantStageWithVote(
 		return transactionCommandPlan{}, ErrAdmissionBound
 	}
 	resultCode := uint32(ResultApplied)
-	state, revision := distributedtxn.ParticipantStaged, uint64(1)
+	state, revision := distributedtxn.TargetStaged, uint64(1)
 	var finishPlan commandPlan
 	if prepare {
 		changes, spans, digest, _, code, err := m.planStoredTransactionMutations(
@@ -1225,12 +1225,12 @@ func (m *Machine) planParticipantStageWithVote(
 		}
 		resultCode = code
 		if code == ResultApplied {
-			state, revision = distributedtxn.ParticipantPrepared, 2
+			state, revision = distributedtxn.TargetPrepared, 2
 			finishPlan = commandPlan{changes: changes, relations: spans, dataChainDigest: digest}
 		} else {
 			// A rejected vote retains only the compact control witness. No intent
 			// or mutation row becomes durable, so cleanup needs no proposal.
-			state, revision = distributedtxn.ParticipantReleased, 3
+			state, revision = distributedtxn.TargetReleased, 3
 			plan.rows = plan.rows[:0]
 			residentMutation, residentIntent = 0, 0
 			relationRows, intentRows = 0, 0
@@ -1240,14 +1240,14 @@ func (m *Machine) planParticipantStageWithVote(
 		ID: control.ID, Role: control.Role, State: uint8(state),
 		Revision: revision, PayloadKind: control.PayloadKind,
 		ControllerEpoch: control.ControllerEpoch, ExecutionPinDigest: control.ExecutionPinDigest,
-		PayloadDigest: control.Participant.MutationDigest,
+		PayloadDigest: control.Target.MutationDigest,
 		PayloadBytes:  transactionCanonicalRelationBytes(command), PayloadCount: uint64(command.MutationCount()),
 		PayloadRelationCount:        uint16(command.RelationCount()),
-		CoordinatorGroup:            replication.ID128(control.Participant.CoordinatorGroup),
-		CoordinatorShardIncarnation: replication.ID128(control.Participant.CoordinatorShardIncarnation),
-		CoordinatorAllocation:       control.Participant.CoordinatorAllocation,
-		MutationDigest:              control.Participant.MutationDigest,
-		BucketBits:                  control.Participant.BucketBits, IntentScopes: control.Participant.IntentScopes,
+		CoordinatorGroup:            replication.ID128(control.Target.CoordinatorGroup),
+		CoordinatorShardIncarnation: replication.ID128(control.Target.CoordinatorShardIncarnation),
+		CoordinatorAllocation:       control.Target.CoordinatorAllocation,
+		MutationDigest:              control.Target.MutationDigest,
+		BucketBits:                  control.Target.BucketBits, IntentScopes: control.Target.IntentScopes,
 		ResidentControlBytes: controlBytes, ResidentMutationBytes: residentMutation,
 		ResidentIntentBytes: residentIntent,
 		PrepareResultCode: func() uint32 {
@@ -1275,7 +1275,7 @@ func (m *Machine) planParticipantStageWithVote(
 		plan.rows, newTransactionPut(controlKey[:], encoded),
 	)
 	active := int64(1)
-	if state == distributedtxn.ParticipantReleased {
+	if state == distributedtxn.TargetReleased {
 		active = 0
 	}
 	plan.delta = transactionStateDelta{
@@ -1306,7 +1306,7 @@ func (m *Machine) planParticipantStageWithVote(
 	return plan, nil
 }
 
-func (m *Machine) planParticipantTransition(
+func (m *Machine) planTargetTransition(
 	plan transactionCommandPlan,
 	command replication.CommandView,
 	control distributedtxn.ReplicatedCommand,
@@ -1317,30 +1317,30 @@ func (m *Machine) planParticipantTransition(
 	snapshot pointSnapshot,
 	relationSnapshots relationPointSnapshots,
 ) (transactionCommandPlan, error) {
-	state := distributedtxn.ParticipantState(existing.State)
-	var next distributedtxn.ParticipantState
-	applyRelease := control.Operation == distributedtxn.ReplicatedApplyReleaseParticipant
-	abortRelease := control.Operation == distributedtxn.ReplicatedAbortReleaseParticipant
+	state := distributedtxn.TargetState(existing.State)
+	var next distributedtxn.TargetState
+	applyRelease := control.Operation == distributedtxn.ReplicatedApplyReleaseTarget
+	abortRelease := control.Operation == distributedtxn.ReplicatedAbortReleaseTarget
 	switch control.Operation {
-	case distributedtxn.ReplicatedPrepareParticipant:
-		next = distributedtxn.ParticipantPrepared
-	case distributedtxn.ReplicatedApplyParticipant:
-		next = distributedtxn.ParticipantApplied
-	case distributedtxn.ReplicatedAbortParticipant:
-		next = distributedtxn.ParticipantAborted
-	case distributedtxn.ReplicatedReleaseParticipant:
-		next = distributedtxn.ParticipantReleased
-	case distributedtxn.ReplicatedApplyReleaseParticipant,
-		distributedtxn.ReplicatedAbortReleaseParticipant:
-		next = distributedtxn.ParticipantReleased
+	case distributedtxn.ReplicatedPrepareTarget:
+		next = distributedtxn.TargetPrepared
+	case distributedtxn.ReplicatedApplyTarget:
+		next = distributedtxn.TargetApplied
+	case distributedtxn.ReplicatedAbortTarget:
+		next = distributedtxn.TargetAborted
+	case distributedtxn.ReplicatedReleaseTarget:
+		next = distributedtxn.TargetReleased
+	case distributedtxn.ReplicatedApplyReleaseTarget,
+		distributedtxn.ReplicatedAbortReleaseTarget:
+		next = distributedtxn.TargetReleased
 	}
 	validFusedFinish := (applyRelease || abortRelease) &&
-		state == distributedtxn.ParticipantPrepared && existing.PrepareResultCode == ResultApplied
+		state == distributedtxn.TargetPrepared && existing.PrepareResultCode == ResultApplied
 	if (!validFusedFinish && !state.CanTransitionTo(next)) || state == next {
 		return transactionConflict(plan), nil
 	}
 	var finishBatches []TransactionRelationPayloadView
-	if next == distributedtxn.ParticipantApplied || applyRelease {
+	if next == distributedtxn.TargetApplied || applyRelease {
 		batches, err := loadTransactionRelationPayloads(
 			snapshot, control.ID, existing.PayloadCount, existing.PayloadRelationCount,
 		)
@@ -1363,7 +1363,7 @@ func (m *Machine) planParticipantTransition(
 		existing.AffectedRows, existing.AffectedRowsValid = affectedRows, true
 		finishBatches = batches
 	}
-	if next == distributedtxn.ParticipantPrepared {
+	if next == distributedtxn.TargetPrepared {
 		batches, err := loadTransactionRelationPayloads(
 			snapshot, control.ID, existing.PayloadCount, existing.PayloadRelationCount,
 		)
@@ -1400,7 +1400,7 @@ func (m *Machine) planParticipantTransition(
 	} else {
 		existing.Revision++
 	}
-	if next == distributedtxn.ParticipantReleased {
+	if next == distributedtxn.TargetReleased {
 		batches := finishBatches
 		if batches == nil {
 			var err error

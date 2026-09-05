@@ -8,8 +8,16 @@ package storeio
 // site identical in portable and SIMD builds and gives tests a concrete
 // function value to inspect.
 var (
-	countCompactPacked7EqualImpl  = countCompactPacked7EqualScalar
-	countCompactPacked8EqualImpl  = countCompactPacked8EqualScalar
-	countCompactPacked10EqualImpl = countCompactPacked10EqualScalar
-	countCompactPacked16EqualImpl = countCompactPacked16EqualScalar
+	countCompactPacked7EqualImpl    = countCompactPacked7EqualScalar
+	countCompactPacked8EqualImpl    = countCompactPacked8EqualScalar
+	countCompactPacked10EqualImpl   = countCompactPacked10EqualScalar
+	countCompactPacked16EqualImpl   = countCompactPacked16EqualScalar
+	countCompactPacked7LessImpl     = countCompactPacked7LessScalar
+	countCompactPacked8LessImpl     = countCompactPacked8LessScalar
+	countCompactPacked10LessImpl    = countCompactPacked10LessScalar
+	countCompactPacked16LessImpl    = countCompactPacked16LessScalar
+	countCompactPacked7BetweenImpl  = countCompactPacked7BetweenScalar
+	countCompactPacked8BetweenImpl  = countCompactPacked8BetweenScalar
+	countCompactPacked10BetweenImpl = countCompactPacked10BetweenScalar
+	countCompactPacked16BetweenImpl = countCompactPacked16BetweenScalar
 )

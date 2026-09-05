@@ -37,8 +37,7 @@ func mintEmptyTxnMarker(t *testing.T, dir string) storeio.TxnMarkerHeader {
 }
 
 func appendSyncedDecision(
-	t *testing.T, dir string, txnID uint64, participants []storeio.TxnParticipant,
-) storeio.TxnMarkerHeader {
+	t *testing.T, dir string, txnID uint64, targets []storeio.TxnCollectionRef) storeio.TxnMarkerHeader {
 	t.Helper()
 	path := filepath.Join(dir, txnMarkerFilename)
 	marker, decisions, err := storeio.OpenTxnMarker(path, storeio.TxnMarkerOptions{})
@@ -49,7 +48,7 @@ func appendSyncedDecision(
 		}
 		_ = decisions
 	}
-	if _, err := marker.AppendDecision(txnID, participants); err != nil {
+	if _, err := marker.AppendDecision(txnID, targets); err != nil {
 		t.Fatal(err)
 	}
 	if err := marker.Sync(); err != nil {
@@ -162,7 +161,7 @@ func TestDatabaseTxnCrashMatrix(t *testing.T) {
 				const txnID = uint64(1)
 				genA := prepareMaybePublish(t, a, header.MarkerID, header.Epoch, txnID, "k", `{"n":1}`, tc.publishA)
 				genB := prepareMaybePublish(t, b, header.MarkerID, header.Epoch, txnID, "k", `{"n":1}`, tc.publishB)
-				_ = appendSyncedDecision(t, db.Dir(), txnID, []storeio.TxnParticipant{
+				_ = appendSyncedDecision(t, db.Dir(), txnID, []storeio.TxnCollectionRef{
 					{StoreID: a.storeID, JournalID: a.journalID, PreparedGeneration: genA},
 					{StoreID: b.storeID, JournalID: b.journalID, PreparedGeneration: genB},
 				})
@@ -181,7 +180,7 @@ func TestDatabaseTxnCrashMatrix(t *testing.T) {
 		const txnID = uint64(1)
 		genA := prepareMaybePublish(t, a, header.MarkerID, header.Epoch, txnID, "k", `{"n":1}`, true)
 		genB := prepareMaybePublish(t, b, header.MarkerID, header.Epoch, txnID, "k", `{"n":1}`, false)
-		_ = appendSyncedDecision(t, db.Dir(), txnID, []storeio.TxnParticipant{
+		_ = appendSyncedDecision(t, db.Dir(), txnID, []storeio.TxnCollectionRef{
 			{StoreID: a.storeID, JournalID: a.journalID, PreparedGeneration: genA},
 			{StoreID: b.storeID, JournalID: b.journalID, PreparedGeneration: genB},
 		})
@@ -264,7 +263,7 @@ func TestDatabaseTxnDecisionTornTail(t *testing.T) {
 	const txnID = uint64(1)
 	genA := prepareUnpublishedOn(t, a, header.MarkerID, header.Epoch, txnID, "k", `{"n":1}`)
 	genB := prepareUnpublishedOn(t, b, header.MarkerID, header.Epoch, txnID, "k", `{"n":1}`)
-	participants := []storeio.TxnParticipant{
+	targets := []storeio.TxnCollectionRef{
 		{StoreID: a.storeID, JournalID: a.journalID, PreparedGeneration: genA},
 		{StoreID: b.storeID, JournalID: b.journalID, PreparedGeneration: genB},
 	}
@@ -272,7 +271,7 @@ func TestDatabaseTxnDecisionTornTail(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := marker.AppendDecision(txnID, participants); err != nil {
+	if _, err := marker.AppendDecision(txnID, targets); err != nil {
 		t.Fatal(err)
 	}
 	if err := marker.Sync(); err != nil {
@@ -287,7 +286,7 @@ func TestDatabaseTxnDecisionTornTail(t *testing.T) {
 
 	regionStart := 2 * storeio.TxnMarkerHeaderSize
 	raw := storeio.TxnMarkerRecordPrefixSize +
-		2*storeio.TxnParticipantSize + storeio.TxnMarkerRecordTrailerSize
+		2*storeio.TxnCollectionRefSize + storeio.TxnMarkerRecordTrailerSize
 	padded := (raw + storeio.TxnMarkerMinSectorSize - 1) /
 		storeio.TxnMarkerMinSectorSize * storeio.TxnMarkerMinSectorSize
 	decisionEnd := regionStart + padded
@@ -370,8 +369,8 @@ func decisionPrefixCommitted(
 	return ok
 }
 
-// TestDatabaseTxnParticipantJournalMissing is W5.
-func TestDatabaseTxnParticipantJournalMissing(t *testing.T) {
+// TestDatabaseTxnCollectionRefJournalMissing is W5.
+func TestDatabaseTxnTargetJournalMissing(t *testing.T) {
 	db, _, _ := openTxnDBWithAB(t)
 	mustTxnUpdate2(t, db, "k", `{"n":1}`, "k", `{"n":1}`)
 	img := cloneDatabaseDir(t, db.Dir())
@@ -386,7 +385,7 @@ func TestDatabaseTxnParticipantJournalMissing(t *testing.T) {
 		t.Fatal("missing journal opened clean")
 	}
 	if !errors.Is(err, storeio.ErrRecoveryJournalMissing) &&
-		!errors.Is(err, ErrTransactionParticipantMissing) {
+		!errors.Is(err, ErrTransactionCollectionMissing) {
 		t.Fatalf("missing journal err=%v want journal-missing or participant-missing", err)
 	}
 
@@ -402,7 +401,7 @@ func TestDatabaseTxnParticipantJournalMissing(t *testing.T) {
 	if err := os.Remove(RecoveryJournalPath(primaryB)); err != nil {
 		t.Fatal(err)
 	}
-	assertReopenFailClosed(t, img2, ErrTransactionParticipantMissing)
+	assertReopenFailClosed(t, img2, ErrTransactionCollectionMissing)
 }
 
 // TestDatabaseTxnDecisionSyncFailurePoisonsCatalog is W6: live unknown-outcome
@@ -495,8 +494,8 @@ func TestDatabaseTxnDecisionDirectoryFence(t *testing.T) {
 	}
 }
 
-// TestDatabaseTxnDropParticipantRetiresFirst is W8.
-func TestDatabaseTxnDropParticipantRetiresFirst(t *testing.T) {
+// TestDatabaseTxnDropTargetRetiresFirst is W8.
+func TestDatabaseTxnDropTargetRetiresFirst(t *testing.T) {
 	// Clean drop then reopen.
 	db, _, _ := openTxnDBWithAB(t)
 	mustTxnUpdate2(t, db, "k", `{"n":1}`, "k", `{"n":1}`)
@@ -579,7 +578,7 @@ func TestDatabaseTxnDropParticipantRetiresFirst(t *testing.T) {
 }
 
 // TestDatabaseTxnMaterializationRollbackOrder is W9: torn in-flight
-// materialization capsule on a participant does not prevent decision replay;
+// materialization capsule on a target does not prevent decision replay;
 // open recovers materialization first, then applies the durable decision.
 func TestDatabaseTxnMaterializationRollbackOrder(t *testing.T) {
 	db, a, b := openTxnDBWithAB(t)
@@ -587,7 +586,7 @@ func TestDatabaseTxnMaterializationRollbackOrder(t *testing.T) {
 	const txnID = uint64(1)
 	genA := prepareUnpublishedOn(t, a, header.MarkerID, header.Epoch, txnID, "k", `{"n":1}`)
 	genB := prepareUnpublishedOn(t, b, header.MarkerID, header.Epoch, txnID, "k", `{"n":1}`)
-	_ = appendSyncedDecision(t, db.Dir(), txnID, []storeio.TxnParticipant{
+	_ = appendSyncedDecision(t, db.Dir(), txnID, []storeio.TxnCollectionRef{
 		{StoreID: a.storeID, JournalID: a.journalID, PreparedGeneration: genA},
 		{StoreID: b.storeID, JournalID: b.journalID, PreparedGeneration: genB},
 	})
@@ -715,7 +714,7 @@ func TestDatabaseTxnStrayConditionalTxnIDReuse(t *testing.T) {
 		const txnID = uint64(9)
 		_ = prepareUnpublishedOn(t, a, header.MarkerID, header.Epoch, txnID, "stray", `{"bad":1}`)
 		genB := prepareUnpublishedOn(t, b, header.MarkerID, header.Epoch, txnID, "k", `{"n":1}`)
-		_ = appendSyncedDecision(t, db.Dir(), txnID, []storeio.TxnParticipant{
+		_ = appendSyncedDecision(t, db.Dir(), txnID, []storeio.TxnCollectionRef{
 			{StoreID: b.storeID, JournalID: b.journalID, PreparedGeneration: genB},
 		})
 		img := cloneDatabaseDir(t, db.Dir())
@@ -738,7 +737,7 @@ func TestDatabaseTxnStrayConditionalTxnIDReuse(t *testing.T) {
 		_, openErr := OpenDatabase(
 			img, DatabaseOptions{Options: txnTestOptions()},
 		)
-		if !errors.Is(openErr, ErrTransactionParticipantBinding) {
+		if !errors.Is(openErr, ErrTransactionCollectionBinding) {
 			t.Fatalf("reused transaction id open = %v, want binding error", openErr)
 		}
 		afterA, err := os.ReadFile(journalA)
@@ -792,7 +791,7 @@ func TestDatabaseTxnDecisionEpochMismatch(t *testing.T) {
 
 // TestDatabaseTxnPublishExcludesSnapshotCut hammers multi-collection publish
 // against Snapshot / SnapshotCollections under -race: no cut observes a torn
-// participant set.
+// target set.
 func TestDatabaseTxnPublishExcludesSnapshotCut(t *testing.T) {
 	db := newTxnTestDatabase(t, "a", "b", "c")
 	var stop atomic.Bool

@@ -45,11 +45,11 @@ order_file=${evidence}/benchmark-order.tsv
 printf 'round\trole\tpackage\toutput\n' > "${order_file}"
 printf 'round\trole\tpackage\tcommand\n' > "${commands_file}"
 
-# Cover the packed kernels, stream scans, and primary-stripe scans for all
-# four specialized widths. Thresholds are measured separately from these
-# full-column workloads.
+# Cover the packed kernels, stream scans, primary-stripe scans, and durable
+# query scans for all four specialized widths. Thresholds are measured
+# separately from these full-column workloads.
 storeio_bench='^BenchmarkCompact(Stream(Packed|Spelling|Integer)|PrimaryStripePacked)Equality(7|8|10|16)$'
-query_bench='^BenchmarkFilePackedEqualityCount(Wide)?$'
+query_bench='^BenchmarkFilePacked(Equality|Ordered|IntegerInterval)Count(Wide)?$'
 
 record_command() {
 	local round=$1
@@ -71,10 +71,16 @@ require_benchmark_metrics() {
 			if ($0 !~ /ns\/op/ || $0 !~ /B\/op/ || $0 !~ /allocs\/op/) {
 				bad=1
 			}
+			for (field = 1; field <= NF; field++) {
+				if (($field == "B/op" || $field == "allocs/op") &&
+					$(field-1) + 0 != 0) {
+					bad=1
+				}
+			}
 		}
 		END { exit(lines == 0 || bad != 0) }
 	' "${output}"; then
-		echo "benchmark output lacks ns/op, B/op, or allocs/op: ${output}" >&2
+		echo "benchmark output lacks required metrics or reports allocations: ${output}" >&2
 		return 1
 	fi
 }
@@ -116,7 +122,31 @@ validate_query() {
 		'BenchmarkFilePackedEqualityCount/label/dictionary7' \
 		'BenchmarkFilePackedEqualityCount/n/FOR10' \
 		'BenchmarkFilePackedEqualityCountWide/label/dictionary8' \
-		'BenchmarkFilePackedEqualityCountWide/n/FOR16'; do
+		'BenchmarkFilePackedEqualityCountWide/n/FOR16' \
+		'BenchmarkFilePackedOrderedCount/sparse/lt' \
+		'BenchmarkFilePackedOrderedCount/sparse/le' \
+		'BenchmarkFilePackedOrderedCount/sparse/gt' \
+		'BenchmarkFilePackedOrderedCount/sparse/ge' \
+		'BenchmarkFilePackedOrderedCount/half/lt' \
+		'BenchmarkFilePackedOrderedCount/half/le' \
+		'BenchmarkFilePackedOrderedCount/half/gt' \
+		'BenchmarkFilePackedOrderedCount/half/ge' \
+		'BenchmarkFilePackedOrderedCountWide/sparse/lt' \
+		'BenchmarkFilePackedOrderedCountWide/sparse/le' \
+		'BenchmarkFilePackedOrderedCountWide/sparse/gt' \
+		'BenchmarkFilePackedOrderedCountWide/sparse/ge' \
+		'BenchmarkFilePackedOrderedCountWide/half/lt' \
+		'BenchmarkFilePackedOrderedCountWide/half/le' \
+		'BenchmarkFilePackedOrderedCountWide/half/gt' \
+		'BenchmarkFilePackedOrderedCountWide/half/ge' \
+		'BenchmarkFilePackedIntegerIntervalCount/empty' \
+		'BenchmarkFilePackedIntegerIntervalCount/sparse' \
+		'BenchmarkFilePackedIntegerIntervalCount/half' \
+		'BenchmarkFilePackedIntegerIntervalCount/full' \
+		'BenchmarkFilePackedIntegerIntervalCountWide/empty' \
+		'BenchmarkFilePackedIntegerIntervalCountWide/sparse' \
+		'BenchmarkFilePackedIntegerIntervalCountWide/half' \
+		'BenchmarkFilePackedIntegerIntervalCountWide/full'; do
 		if ! grep -Eq "^${expected}(-[0-9]+)?[[:space:]]" "${output}"; then
 			echo "missing packed-count query case ${expected}: ${output}" >&2
 			return 1
@@ -141,11 +171,19 @@ run_benchmark() {
 		-test.cpu=1
 		-test.benchmem
 	)
-	record_command "${round}" "${role}" "${package_name}" "${binary}" "${args[@]}"
+	local -a command=("${binary}" "${args[@]}")
+	if [[ ${package_name} == query ]]; then
+		if [[ ${role} == head ]]; then
+			command=(env VIBEDB_EXPECT_ORDERED=1 VIBEDB_EXPECT_INTERVAL=1 "${command[@]}")
+		else
+			command=(env VIBEDB_EXPECT_ORDERED=0 VIBEDB_EXPECT_INTERVAL=0 "${command[@]}")
+		fi
+	fi
+	record_command "${round}" "${role}" "${package_name}" "${command[@]}"
 	printf '%s\n' "round=${round} role=${role} package=${package_name} output=${output}"
 	# This invocation is intentionally synchronous. All test binaries were
 	# compiled before this function is entered, so no build can overlap timing.
-	"${binary}" "${args[@]}" > "${output}" 2>&1
+	"${command[@]}" > "${output}" 2>&1
 	case ${package_name} in
 		storeio) validate_storeio "${output}" ;;
 		query) validate_query "${output}" ;;

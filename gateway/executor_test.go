@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -306,6 +307,27 @@ func TestExecutorStaleWithoutNewerGenerationFails(t *testing.T) {
 	_, err := e.Query(context.Background(), scatterQuery())
 	if !errors.Is(err, ErrStaleGeneration) {
 		t.Fatalf("err = %v, want errors.Is ErrStaleGeneration", err)
+	}
+}
+
+// TestExecutorCatalogMissRefreshIsBounded proves an absent-table prepare
+// invokes one authenticated refresh at most, then retains the planner's
+// useful missing-table diagnostic when the newer generation still lacks it.
+func TestExecutorCatalogMissRefreshIsBounded(t *testing.T) {
+	holder := NewCatalogHolder(testSnapshot(t, 1))
+	var refreshes atomic.Int32
+	e := NewExecutor(NewClient(nil), holder, Options{
+		Refresh: func(_ context.Context, stale uint64) (*Snapshot, error) {
+			refreshes.Add(1)
+			return testSnapshot(t, stale+1), nil
+		},
+	})
+	_, err := e.Query(context.Background(), Query{SQL: `SELECT id FROM absent`})
+	if !errors.Is(err, ErrTableNotPlaced) {
+		t.Fatalf("err = %v, want errors.Is ErrTableNotPlaced", err)
+	}
+	if got := refreshes.Load(); got != 1 {
+		t.Fatalf("refreshes = %d, want one bounded refresh", got)
 	}
 }
 

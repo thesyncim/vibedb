@@ -1,0 +1,550 @@
+{
+  "schema": "vibedb.fused-write-comparison/1",
+  "started_utc": "2026-09-04T16:27:25.334157+00:00",
+  "finished_utc": "2026-09-04T16:31:09.887661+00:00",
+  "status": "complete",
+  "arm_contract": "before and after both use the existing candidate fused fixture; arm and revision identify source",
+  "topology": "three physical serving processes, RF3, one SQL endpoint, single Docker host",
+  "diagnostics": "identical signal-acknowledged snapshots on both VibeDB arms",
+  "limits": {
+    "NanoCpus": 12000000000,
+    "Memory": 25769803776,
+    "MemorySwap": 25769803776
+  },
+  "profiling": false,
+  "orders": {
+    "before-first": [
+      "before",
+      "after",
+      "crdb"
+    ],
+    "after-first": [
+      "crdb",
+      "after",
+      "before"
+    ]
+  },
+  "control_sha256": {
+    "run-fused-node-comparison.py": "c163e48b156baf41929e3f6a036776ca792feed8afc98d1db3a2befd43c4198c",
+    "run-fused-write-comparison.py": "af2209e4c42f07fe74495e2a69c8593aeccf1801fd32807aa087e45a2e22aba4",
+    "summarize-crdb-sql.py": "9f1f3622bb1c3904a211e8a848e9c6a30d7edc79cd6ef65fa517741260ac4fb2"
+  },
+  "refs": {
+    "before": "f2df4fac525fa0f73ff2e1b558f167e1e598f6c5",
+    "after": "7aa4f49602f85303d13689bce5beb1659e51cc52"
+  },
+  "before_after_patch_sha256": "ab53cd94ac817f9bda6c3d571b9af1211be3274253dec7f7a48d966225055994",
+  "docker_architecture": "arm64",
+  "vibedb_build_environment": {
+    "GOOS": "linux",
+    "GOARCH": "arm64",
+    "CGO_ENABLED": "0",
+    "GOEXPERIMENT": "simd",
+    "note": "go_version identifies the cross-compiler host; benchmark executables run in Linux"
+  },
+  "source": {
+    "before": {
+      "revision": "f2df4fac525fa0f73ff2e1b558f167e1e598f6c5",
+      "status": "",
+      "dirty": false,
+      "patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "after": {
+      "revision": "7aa4f49602f85303d13689bce5beb1659e51cc52",
+      "status": "",
+      "dirty": false,
+      "patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "client": {
+      "revision": "27b89cd661b944f6c4738a8d240ffc0ffc649483",
+      "status": "",
+      "dirty": false,
+      "patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  },
+  "go_version": "go version go1.27.0 darwin/arm64",
+  "images": {
+    "runtime": {
+      "Id": "sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b",
+      "RepoTags": [
+        "golang:1.27-bookworm"
+      ],
+      "RepoDigests": [
+        "golang@sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b"
+      ],
+      "Comment": "buildkit.dockerfile.v0",
+      "Created": "2026-09-01T23:25:34.866490453Z",
+      "Config": {
+        "Env": [
+          "PATH=/go/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "GOLANG_VERSION=1.27.1",
+          "GOTOOLCHAIN=local",
+          "GOPATH=/go"
+        ],
+        "Cmd": [
+          "bash"
+        ],
+        "WorkingDir": "/go"
+      },
+      "Architecture": "arm64",
+      "Variant": "v8",
+      "Os": "linux",
+      "Size": 290804573,
+      "RootFS": {
+        "Type": "layers",
+        "Layers": [
+          "sha256:ded5352e1593266510db9635d858232746801f4579439d3b7f9ae8da2b2bcd25",
+          "sha256:9d897f560191c6878a8f8478cf0712796beaa6960f1d5fd63765c64d877496f7",
+          "sha256:8b3ebe83732d60708c6694818d8456597ccb651bb94af1a7a5201b27e1b8d6a0",
+          "sha256:f997667b469edc604a315db9a3abaef6dbb2e0c546a753652f8ea58c734c0fb7",
+          "sha256:dea820b10a94a371d29ab056f0b76911f24da361fe021e5c7f3621db899fe768",
+          "sha256:5a3d84bf80f357404ee0ca5e8a981ed4654a55dadb0b8d8db496ef684a0ba942",
+          "sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef"
+        ]
+      },
+      "Metadata": {
+        "LastTagTime": "2026-09-03T20:56:47.111210876Z"
+      },
+      "Descriptor": {
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "digest": "sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b",
+        "size": 6526
+      },
+      "Identity": {
+        "Pull": [
+          {
+            "Repository": "docker.io/library/golang"
+          }
+        ]
+      }
+    },
+    "crdb": {
+      "Id": "sha256:204f131510c78393adb02345f289a8dbb32e1491e26cc92b6c7751f3b97be3c5",
+      "RepoTags": [
+        "cockroachdb/cockroach:v26.3.1",
+        "cockroachdb/cockroach@sha256:204f131510c78393adb02345f289a8dbb32e1491e26cc92b6c7751f3b97be3c5"
+      ],
+      "RepoDigests": [
+        "cockroachdb/cockroach@sha256:204f131510c78393adb02345f289a8dbb32e1491e26cc92b6c7751f3b97be3c5"
+      ],
+      "Comment": "buildkit.dockerfile.v0",
+      "Created": "2026-08-26T20:40:27.27593535Z",
+      "Config": {
+        "ExposedPorts": {
+          "26257/tcp": {},
+          "8080/tcp": {}
+        },
+        "Env": [
+          "PATH=/cockroach:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "container=oci",
+          "COCKROACH_CHANNEL=official-docker"
+        ],
+        "Entrypoint": [
+          "/cockroach/cockroach.sh"
+        ],
+        "WorkingDir": "/cockroach/",
+        "Labels": {
+          "architecture": "aarch64",
+          "build-date": "2026-08-20T05:45:03Z",
+          "com.redhat.component": "ubi10-minimal-container",
+          "com.redhat.license_terms": "https://www.redhat.com/en/about/red-hat-end-user-license-agreements#UBI",
+          "cpe": "cpe:/o:redhat:enterprise_linux:10.2",
+          "description": "The Universal Base Image Minimal is a stripped down image that uses microdnf as a package manager. This base image is freely redistributable, but Red Hat only supports Red Hat technologies through subscriptions for Red Hat products. This image is maintained by Red Hat and updated regularly.",
+          "distribution-scope": "public",
+          "io.buildah.version": "1.44.0",
+          "io.k8s.description": "The Universal Base Image Minimal is a stripped down image that uses microdnf as a package manager. This base image is freely redistributable, but Red Hat only supports Red Hat technologies through subscriptions for Red Hat products. This image is maintained by Red Hat and updated regularly.",
+          "io.k8s.display-name": "Red Hat Universal Base Image 10 Minimal",
+          "io.openshift.expose-services": "",
+          "io.openshift.tags": "minimal rhel10",
+          "maintainer": "Red Hat, Inc.",
+          "name": "ubi10/ubi-minimal",
+          "org.opencontainers.image.created": "2026-08-20T05:45:03Z",
+          "org.opencontainers.image.revision": "b2232799f269a1f388bb8eab702d61fa78c72fce",
+          "release": "1787204459",
+          "summary": "Provides the latest release of the minimal Red Hat Universal Base Image 10.",
+          "url": "https://catalog.redhat.com/en/search?searchType=containers",
+          "vcs-ref": "b2232799f269a1f388bb8eab702d61fa78c72fce",
+          "vcs-type": "git",
+          "vendor": "Red Hat, Inc.",
+          "version": "26.3.1"
+        }
+      },
+      "Architecture": "arm64",
+      "Os": "linux",
+      "Size": 177724392,
+      "RootFS": {
+        "Type": "layers",
+        "Layers": [
+          "sha256:69a988bb2156763f84f89e8ff433d762a0ff2db2f8ea854589f88336d6ee1934",
+          "sha256:f580786415ba246303dd33b1e7e4014e8510ab3f545243a1e3cb66ccc18d65e7",
+          "sha256:ac8aeee2688b530ee4cefccf6b9280f1c2bcb9195d950a8a74e19579a197dd65",
+          "sha256:a023ec4ba0b0678120b67698c971e6fec8b6115014bede33f44d553abaa59091",
+          "sha256:e986edfc5f69d8ccf6bb1163565090105966c7f447367fc077d8eb4666cc95ac",
+          "sha256:ef238409705a96d1e960649f29f04005aaff00af6922c03434883f01f248dc29",
+          "sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef",
+          "sha256:e627a19ab2cc02447a599a7dcdda7a937bc3749add241ccd03c791cd7d47268f"
+        ]
+      },
+      "Metadata": {
+        "LastTagTime": "2026-09-04T11:43:50.860354167Z"
+      },
+      "Descriptor": {
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "digest": "sha256:204f131510c78393adb02345f289a8dbb32e1491e26cc92b6c7751f3b97be3c5",
+        "size": 2362
+      },
+      "Identity": {
+        "Pull": [
+          {
+            "Repository": "docker.io/cockroachdb/cockroach"
+          }
+        ]
+      }
+    }
+  },
+  "build_binary_sha256": {
+    "candidate-vibedb": "ba81f9515aa9ffa8bb27fa0b32ae13546466804f066f75cc19d8df9d2d99c3c5",
+    "candidate-vibedb-gateway": "daf3177958801562107b58d5a93a54dc5af161d7c22231a82c03028aff79151a",
+    "candidate-vibedb-shard": "361a5327346e74cb6dd6edeb8b837a087222a9a66cd52b451dcc00555aff5fcb",
+    "cockroach": "7923d5eca1fc275abebd64863fa5e5c51be3504fd57f37c5b8c4f8579bd54c3e",
+    "parent-vibedb": "20c8e9260b07ffeaeabd11ca41459a9898889e2637e9b7036ab0dd9029dcf4dc",
+    "parent-vibedb-gateway": "96706dcde8a50a65f360808f850947614dc524523497fd1488afc30bb2fc7a45",
+    "parent-vibedb-shard": "72c150ae9c46b2dfddbc50878d6ebdb4e4ca9a5cd6f89546325eab42c66a4e0e",
+    "rf3-sqlbench": "9b70628460529c7af78be7b2249a603b6fda730444d2b852502ae4e45b1fcf2b"
+  },
+  "vibedb_build_metadata": {
+    "candidate-vibedb": "/private/tmp/vibedb-storage-short-7aa4f496-run2/bin/candidate-vibedb: go1.27.0-X:simd\n\tpath\tgithub.com/thesyncim/vibedb/cmd/vibedb\n\tmod\tgithub.com/thesyncim/vibedb\tv0.0.0-20260904162349-7aa4f49602f8\t\n\tdep\tgithub.com/cespare/xxhash/v2\tv2.3.0\th1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=\n\tdep\tgithub.com/thesyncim/vibejson\tv0.1.0\th1:Hk6Zp2RyiNuTBk7UiJ1I67ZJEpqIIiIE6J5gCUsAVc8=\n\tdep\tgo.etcd.io/raft/v3\tv3.7.0\th1:BGzlwx07bLv8PW6OU5HObuz1y4hlPZUXA07pM1mPUh4=\n\tdep\tgolang.org/x/sys\tv0.47.0\th1:o7XGOvZQCADBQQ4Y7VNq2dRWQR7JmOUW8Kxx4ZsNgWs=\n\tdep\tgoogle.golang.org/protobuf\tv1.36.11\th1:fV6ZwhNocDyBLK0dj+fg8ektcVegBBuEolpbTQyBNVE=\n\tbuild\t-buildmode=exe\n\tbuild\t-compiler=gc\n\tbuild\t-trimpath=true\n\tbuild\tCGO_ENABLED=0\n\tbuild\tGOARCH=arm64\n\tbuild\tGOEXPERIMENT=simd\n\tbuild\tGOOS=linux\n\tbuild\tGOARM64=v8.0\n\tbuild\tvcs=git\n\tbuild\tvcs.revision=7aa4f49602f85303d13689bce5beb1659e51cc52\n\tbuild\tvcs.time=2026-09-04T16:23:49Z\n\tbuild\tvcs.modified=false",
+    "candidate-vibedb-gateway": "/private/tmp/vibedb-storage-short-7aa4f496-run2/bin/candidate-vibedb-gateway: go1.27.0-X:simd\n\tpath\tgithub.com/thesyncim/vibedb/cmd/vibedb-gateway\n\tmod\tgithub.com/thesyncim/vibedb\tv0.0.0-20260904162349-7aa4f49602f8\t\n\tdep\tgithub.com/cespare/xxhash/v2\tv2.3.0\th1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=\n\tdep\tgithub.com/thesyncim/vibejson\tv0.1.0\th1:Hk6Zp2RyiNuTBk7UiJ1I67ZJEpqIIiIE6J5gCUsAVc8=\n\tdep\tgo.etcd.io/raft/v3\tv3.7.0\th1:BGzlwx07bLv8PW6OU5HObuz1y4hlPZUXA07pM1mPUh4=\n\tdep\tgolang.org/x/sys\tv0.47.0\th1:o7XGOvZQCADBQQ4Y7VNq2dRWQR7JmOUW8Kxx4ZsNgWs=\n\tdep\tgoogle.golang.org/protobuf\tv1.36.11\th1:fV6ZwhNocDyBLK0dj+fg8ektcVegBBuEolpbTQyBNVE=\n\tbuild\t-buildmode=exe\n\tbuild\t-compiler=gc\n\tbuild\t-trimpath=true\n\tbuild\tCGO_ENABLED=0\n\tbuild\tGOARCH=arm64\n\tbuild\tGOEXPERIMENT=simd\n\tbuild\tGOOS=linux\n\tbuild\tGOARM64=v8.0\n\tbuild\tvcs=git\n\tbuild\tvcs.revision=7aa4f49602f85303d13689bce5beb1659e51cc52\n\tbuild\tvcs.time=2026-09-04T16:23:49Z\n\tbuild\tvcs.modified=false",
+    "candidate-vibedb-shard": "/private/tmp/vibedb-storage-short-7aa4f496-run2/bin/candidate-vibedb-shard: go1.27.0-X:simd\n\tpath\tgithub.com/thesyncim/vibedb/cmd/vibedb-shard\n\tmod\tgithub.com/thesyncim/vibedb\tv0.0.0-20260904162349-7aa4f49602f8\t\n\tdep\tgithub.com/cespare/xxhash/v2\tv2.3.0\th1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=\n\tdep\tgithub.com/thesyncim/vibejson\tv0.1.0\th1:Hk6Zp2RyiNuTBk7UiJ1I67ZJEpqIIiIE6J5gCUsAVc8=\n\tdep\tgo.etcd.io/raft/v3\tv3.7.0\th1:BGzlwx07bLv8PW6OU5HObuz1y4hlPZUXA07pM1mPUh4=\n\tdep\tgolang.org/x/sys\tv0.47.0\th1:o7XGOvZQCADBQQ4Y7VNq2dRWQR7JmOUW8Kxx4ZsNgWs=\n\tdep\tgoogle.golang.org/protobuf\tv1.36.11\th1:fV6ZwhNocDyBLK0dj+fg8ektcVegBBuEolpbTQyBNVE=\n\tbuild\t-buildmode=exe\n\tbuild\t-compiler=gc\n\tbuild\t-trimpath=true\n\tbuild\tCGO_ENABLED=0\n\tbuild\tGOARCH=arm64\n\tbuild\tGOEXPERIMENT=simd\n\tbuild\tGOOS=linux\n\tbuild\tGOARM64=v8.0\n\tbuild\tvcs=git\n\tbuild\tvcs.revision=7aa4f49602f85303d13689bce5beb1659e51cc52\n\tbuild\tvcs.time=2026-09-04T16:23:49Z\n\tbuild\tvcs.modified=false",
+    "parent-vibedb": "/private/tmp/vibedb-storage-short-7aa4f496-run2/bin/parent-vibedb: go1.27.0-X:simd\n\tpath\tgithub.com/thesyncim/vibedb/cmd/vibedb\n\tmod\tgithub.com/thesyncim/vibedb\tv0.0.0-20260904160628-f2df4fac525f\t\n\tdep\tgithub.com/cespare/xxhash/v2\tv2.3.0\th1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=\n\tdep\tgithub.com/thesyncim/vibejson\tv0.1.0\th1:Hk6Zp2RyiNuTBk7UiJ1I67ZJEpqIIiIE6J5gCUsAVc8=\n\tdep\tgo.etcd.io/raft/v3\tv3.7.0\th1:BGzlwx07bLv8PW6OU5HObuz1y4hlPZUXA07pM1mPUh4=\n\tdep\tgolang.org/x/sys\tv0.47.0\th1:o7XGOvZQCADBQQ4Y7VNq2dRWQR7JmOUW8Kxx4ZsNgWs=\n\tdep\tgoogle.golang.org/protobuf\tv1.36.11\th1:fV6ZwhNocDyBLK0dj+fg8ektcVegBBuEolpbTQyBNVE=\n\tbuild\t-buildmode=exe\n\tbuild\t-compiler=gc\n\tbuild\t-trimpath=true\n\tbuild\tCGO_ENABLED=0\n\tbuild\tGOARCH=arm64\n\tbuild\tGOEXPERIMENT=simd\n\tbuild\tGOOS=linux\n\tbuild\tGOARM64=v8.0\n\tbuild\tvcs=git\n\tbuild\tvcs.revision=f2df4fac525fa0f73ff2e1b558f167e1e598f6c5\n\tbuild\tvcs.time=2026-09-04T16:06:28Z\n\tbuild\tvcs.modified=false",
+    "parent-vibedb-gateway": "/private/tmp/vibedb-storage-short-7aa4f496-run2/bin/parent-vibedb-gateway: go1.27.0-X:simd\n\tpath\tgithub.com/thesyncim/vibedb/cmd/vibedb-gateway\n\tmod\tgithub.com/thesyncim/vibedb\tv0.0.0-20260904160628-f2df4fac525f\t\n\tdep\tgithub.com/cespare/xxhash/v2\tv2.3.0\th1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=\n\tdep\tgithub.com/thesyncim/vibejson\tv0.1.0\th1:Hk6Zp2RyiNuTBk7UiJ1I67ZJEpqIIiIE6J5gCUsAVc8=\n\tdep\tgo.etcd.io/raft/v3\tv3.7.0\th1:BGzlwx07bLv8PW6OU5HObuz1y4hlPZUXA07pM1mPUh4=\n\tdep\tgolang.org/x/sys\tv0.47.0\th1:o7XGOvZQCADBQQ4Y7VNq2dRWQR7JmOUW8Kxx4ZsNgWs=\n\tdep\tgoogle.golang.org/protobuf\tv1.36.11\th1:fV6ZwhNocDyBLK0dj+fg8ektcVegBBuEolpbTQyBNVE=\n\tbuild\t-buildmode=exe\n\tbuild\t-compiler=gc\n\tbuild\t-trimpath=true\n\tbuild\tCGO_ENABLED=0\n\tbuild\tGOARCH=arm64\n\tbuild\tGOEXPERIMENT=simd\n\tbuild\tGOOS=linux\n\tbuild\tGOARM64=v8.0\n\tbuild\tvcs=git\n\tbuild\tvcs.revision=f2df4fac525fa0f73ff2e1b558f167e1e598f6c5\n\tbuild\tvcs.time=2026-09-04T16:06:28Z\n\tbuild\tvcs.modified=false",
+    "parent-vibedb-shard": "/private/tmp/vibedb-storage-short-7aa4f496-run2/bin/parent-vibedb-shard: go1.27.0-X:simd\n\tpath\tgithub.com/thesyncim/vibedb/cmd/vibedb-shard\n\tmod\tgithub.com/thesyncim/vibedb\tv0.0.0-20260904160628-f2df4fac525f\t\n\tdep\tgithub.com/cespare/xxhash/v2\tv2.3.0\th1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=\n\tdep\tgithub.com/thesyncim/vibejson\tv0.1.0\th1:Hk6Zp2RyiNuTBk7UiJ1I67ZJEpqIIiIE6J5gCUsAVc8=\n\tdep\tgo.etcd.io/raft/v3\tv3.7.0\th1:BGzlwx07bLv8PW6OU5HObuz1y4hlPZUXA07pM1mPUh4=\n\tdep\tgolang.org/x/sys\tv0.47.0\th1:o7XGOvZQCADBQQ4Y7VNq2dRWQR7JmOUW8Kxx4ZsNgWs=\n\tdep\tgoogle.golang.org/protobuf\tv1.36.11\th1:fV6ZwhNocDyBLK0dj+fg8ektcVegBBuEolpbTQyBNVE=\n\tbuild\t-buildmode=exe\n\tbuild\t-compiler=gc\n\tbuild\t-trimpath=true\n\tbuild\tCGO_ENABLED=0\n\tbuild\tGOARCH=arm64\n\tbuild\tGOEXPERIMENT=simd\n\tbuild\tGOOS=linux\n\tbuild\tGOARM64=v8.0\n\tbuild\tvcs=git\n\tbuild\tvcs.revision=f2df4fac525fa0f73ff2e1b558f167e1e598f6c5\n\tbuild\tvcs.time=2026-09-04T16:06:28Z\n\tbuild\tvcs.modified=false",
+    "rf3-sqlbench": "/private/tmp/vibedb-storage-short-7aa4f496-run2/bin/rf3-sqlbench: go1.27.0-X:simd\n\tpath\tgithub.com/thesyncim/vibedb/integration/pgclient/cmd/rf3-sqlbench\n\tmod\tgithub.com/thesyncim/vibedb/integration/pgclient\tv0.0.0-20260904142759-27b89cd661b9\t\n\tdep\tgithub.com/jackc/pgpassfile\tv1.0.0\th1:/6Hmqy13Ss2zCq62VdNG8tM1wchn8zjSGOBJ6icpsIM=\n\tdep\tgithub.com/jackc/pgservicefile\tv0.0.0-20240606120523-5a60cdf6a761\th1:iCEnooe7UlwOQYpKFhBabPMi4aNAfoODPEFNiAnClxo=\n\tdep\tgithub.com/jackc/pgx/v5\tv5.10.0\th1:VhSvgU2jSli8o3AqIEOTJr7rZwAEUVo4E4XhR94Zfr0=\n\tdep\tgolang.org/x/text\tv0.29.0\th1:1neNs90w9YzJ9BocxfsQNHKuAT4pkghyXc4nhZ6sJvk=\n\tbuild\t-buildmode=exe\n\tbuild\t-compiler=gc\n\tbuild\t-trimpath=true\n\tbuild\tCGO_ENABLED=0\n\tbuild\tGOARCH=arm64\n\tbuild\tGOEXPERIMENT=simd\n\tbuild\tGOOS=linux\n\tbuild\tGOARM64=v8.0\n\tbuild\tvcs=git\n\tbuild\tvcs.revision=27b89cd661b944f6c4738a8d240ffc0ffc649483\n\tbuild\tvcs.time=2026-09-04T14:27:59Z\n\tbuild\tvcs.modified=false"
+  },
+  "executable_formats": "/private/tmp/vibedb-storage-short-7aa4f496-run2/bin/parent-vibedb-shard:    ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, Go BuildID=RiTafuSBBzYGt7GjjpGf/fdvVY4Cl8R0w6Wveokzz/i3jp5EkFnW25UHK_gmWr/Lknn3xCSMZNgCss46ny_, BuildID[sha1]=256375129e0d9ac5defb39b2f87d5ccd26f9f386, with debug_info, not stripped\n/private/tmp/vibedb-storage-short-7aa4f496-run2/bin/candidate-vibedb-shard: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, Go BuildID=wuWk9U-bBv_7gnRXPrbF/HQFDjnzD8GPlSC-OyxK0/GGZDMmiC2QYNQuFXLP0F/YUQEA9GLj0C-RpqVn8h4, BuildID[sha1]=a8a5924e1c2357734e08bb7429831ebf7250fc05, with debug_info, not stripped\n/private/tmp/vibedb-storage-short-7aa4f496-run2/bin/cockroach:              ELF 64-bit LSB executable, ARM aarch64, version 1 (GNU/Linux), dynamically linked, interpreter /lib/ld-linux-aarch64.so.1, for GNU/Linux 3.10.108, Go BuildID=redacted, BuildID[sha1]=498919aff001d8366249403a2544fba2d833084f, with debug_info, not stripped\n/private/tmp/vibedb-storage-short-7aa4f496-run2/bin/rf3-sqlbench:           ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, Go BuildID=Q1KTqaQcj7GEu_WzV0qs/CkSVr7xREJtN0L7b_TpJ/77grPgJ7kjGzONXJ7Wd7/-yibGutKxbBrr7NHfEjt, BuildID[sha1]=33d44dee97eb711d227eed921a953cb8a0497c06, with debug_info, not stripped",
+  "fixture_binary_sha256": {
+    "before": {
+      "candidate-vibedb": "20c8e9260b07ffeaeabd11ca41459a9898889e2637e9b7036ab0dd9029dcf4dc",
+      "candidate-vibedb-gateway": "96706dcde8a50a65f360808f850947614dc524523497fd1488afc30bb2fc7a45",
+      "candidate-vibedb-shard": "72c150ae9c46b2dfddbc50878d6ebdb4e4ca9a5cd6f89546325eab42c66a4e0e",
+      "rf3-sqlbench": "9b70628460529c7af78be7b2249a603b6fda730444d2b852502ae4e45b1fcf2b"
+    },
+    "after": {
+      "candidate-vibedb": "ba81f9515aa9ffa8bb27fa0b32ae13546466804f066f75cc19d8df9d2d99c3c5",
+      "candidate-vibedb-gateway": "daf3177958801562107b58d5a93a54dc5af161d7c22231a82c03028aff79151a",
+      "candidate-vibedb-shard": "361a5327346e74cb6dd6edeb8b837a087222a9a66cd52b451dcc00555aff5fcb",
+      "rf3-sqlbench": "9b70628460529c7af78be7b2249a603b6fda730444d2b852502ae4e45b1fcf2b"
+    },
+    "crdb": {
+      "candidate-vibedb": "ba81f9515aa9ffa8bb27fa0b32ae13546466804f066f75cc19d8df9d2d99c3c5",
+      "candidate-vibedb-gateway": "daf3177958801562107b58d5a93a54dc5af161d7c22231a82c03028aff79151a",
+      "candidate-vibedb-shard": "361a5327346e74cb6dd6edeb8b837a087222a9a66cd52b451dcc00555aff5fcb",
+      "cockroach": "7923d5eca1fc275abebd64863fa5e5c51be3504fd57f37c5b8c4f8579bd54c3e",
+      "parent-vibedb": "20c8e9260b07ffeaeabd11ca41459a9898889e2637e9b7036ab0dd9029dcf4dc",
+      "parent-vibedb-gateway": "96706dcde8a50a65f360808f850947614dc524523497fd1488afc30bb2fc7a45",
+      "parent-vibedb-shard": "72c150ae9c46b2dfddbc50878d6ebdb4e4ca9a5cd6f89546325eab42c66a4e0e",
+      "rf3-sqlbench": "9b70628460529c7af78be7b2249a603b6fda730444d2b852502ae4e45b1fcf2b"
+    }
+  },
+  "docker_host": {
+    "Architecture": "aarch64",
+    "OSType": "linux",
+    "KernelVersion": "7.0.12-linuxkit",
+    "NCPU": 16,
+    "MemTotal": 50425147392
+  },
+  "runs": [
+    {
+      "engine": "candidate",
+      "arm": "before",
+      "revision": "f2df4fac525fa0f73ff2e1b558f167e1e598f6c5",
+      "order": "before-first",
+      "cell": {
+        "id": "baseline-c1-c8",
+        "kind": "baseline",
+        "physical_nodes": 3,
+        "tables": [
+          "rf3_sql_bench"
+        ],
+        "workloads": "point_hit,point_miss,range_64,group_16,update_existing",
+        "group_distribution": "uniform",
+        "clients": "1,8",
+        "groups": 1,
+        "endpoint_mode": "single"
+      },
+      "limits": {
+        "cpus": "12",
+        "memory": "24g"
+      },
+      "status": "completed",
+      "exit_code": null,
+      "errors": [],
+      "observed_limits": {
+        "NanoCpus": 12000000000,
+        "Memory": 25769803776,
+        "MemorySwap": 25769803776
+      },
+      "process_counts": {
+        "vibedb": 1,
+        "vibedb_shard": 3,
+        "vibedb_gateway": 0,
+        "cockroach": 0
+      },
+      "client_exit_code": 0,
+      "process_counts_after": {
+        "vibedb": 1,
+        "vibedb_shard": 3,
+        "vibedb_gateway": 0,
+        "cockroach": 0
+      },
+      "forced_shutdown": false,
+      "server_exit_codes": [
+        0
+      ]
+    },
+    {
+      "engine": "candidate",
+      "arm": "after",
+      "revision": "7aa4f49602f85303d13689bce5beb1659e51cc52",
+      "order": "before-first",
+      "cell": {
+        "id": "baseline-c1-c8",
+        "kind": "baseline",
+        "physical_nodes": 3,
+        "tables": [
+          "rf3_sql_bench"
+        ],
+        "workloads": "point_hit,point_miss,range_64,group_16,update_existing",
+        "group_distribution": "uniform",
+        "clients": "1,8",
+        "groups": 1,
+        "endpoint_mode": "single"
+      },
+      "limits": {
+        "cpus": "12",
+        "memory": "24g"
+      },
+      "status": "completed",
+      "exit_code": null,
+      "errors": [],
+      "observed_limits": {
+        "NanoCpus": 12000000000,
+        "Memory": 25769803776,
+        "MemorySwap": 25769803776
+      },
+      "process_counts": {
+        "vibedb": 1,
+        "vibedb_shard": 3,
+        "vibedb_gateway": 0,
+        "cockroach": 0
+      },
+      "client_exit_code": 0,
+      "process_counts_after": {
+        "vibedb": 1,
+        "vibedb_shard": 3,
+        "vibedb_gateway": 0,
+        "cockroach": 0
+      },
+      "forced_shutdown": false,
+      "server_exit_codes": [
+        0
+      ]
+    },
+    {
+      "engine": "crdb",
+      "arm": "crdb",
+      "revision": "cockroachdb/cockroach:v26.3.1@sha256:204f131510c78393adb02345f289a8dbb32e1491e26cc92b6c7751f3b97be3c5",
+      "order": "before-first",
+      "cell": {
+        "id": "baseline-c1-c8",
+        "kind": "baseline",
+        "physical_nodes": 3,
+        "tables": [
+          "rf3_sql_bench"
+        ],
+        "workloads": "point_hit,point_miss,range_64,group_16,update_existing",
+        "group_distribution": "uniform",
+        "clients": "1,8",
+        "groups": 1,
+        "endpoint_mode": "single"
+      },
+      "limits": {
+        "cpus": "12",
+        "memory": "24g"
+      },
+      "status": "completed",
+      "exit_code": null,
+      "errors": [],
+      "observed_limits": {
+        "NanoCpus": 12000000000,
+        "Memory": 25769803776,
+        "MemorySwap": 25769803776
+      },
+      "process_counts": {
+        "vibedb": 0,
+        "vibedb_shard": 0,
+        "vibedb_gateway": 0,
+        "cockroach": 3
+      },
+      "client_exit_code": 0,
+      "process_counts_after": {
+        "vibedb": 0,
+        "vibedb_shard": 0,
+        "vibedb_gateway": 0,
+        "cockroach": 3
+      },
+      "forced_shutdown": true,
+      "server_exit_codes": [
+        0,
+        0,
+        137
+      ]
+    },
+    {
+      "engine": "crdb",
+      "arm": "crdb",
+      "revision": "cockroachdb/cockroach:v26.3.1@sha256:204f131510c78393adb02345f289a8dbb32e1491e26cc92b6c7751f3b97be3c5",
+      "order": "after-first",
+      "cell": {
+        "id": "baseline-c1-c8",
+        "kind": "baseline",
+        "physical_nodes": 3,
+        "tables": [
+          "rf3_sql_bench"
+        ],
+        "workloads": "point_hit,point_miss,range_64,group_16,update_existing",
+        "group_distribution": "uniform",
+        "clients": "1,8",
+        "groups": 1,
+        "endpoint_mode": "single"
+      },
+      "limits": {
+        "cpus": "12",
+        "memory": "24g"
+      },
+      "status": "completed",
+      "exit_code": null,
+      "errors": [],
+      "observed_limits": {
+        "NanoCpus": 12000000000,
+        "Memory": 25769803776,
+        "MemorySwap": 25769803776
+      },
+      "process_counts": {
+        "vibedb": 0,
+        "vibedb_shard": 0,
+        "vibedb_gateway": 0,
+        "cockroach": 3
+      },
+      "client_exit_code": 0,
+      "process_counts_after": {
+        "vibedb": 0,
+        "vibedb_shard": 0,
+        "vibedb_gateway": 0,
+        "cockroach": 3
+      },
+      "forced_shutdown": true,
+      "server_exit_codes": [
+        0,
+        137,
+        0
+      ]
+    },
+    {
+      "engine": "candidate",
+      "arm": "after",
+      "revision": "7aa4f49602f85303d13689bce5beb1659e51cc52",
+      "order": "after-first",
+      "cell": {
+        "id": "baseline-c1-c8",
+        "kind": "baseline",
+        "physical_nodes": 3,
+        "tables": [
+          "rf3_sql_bench"
+        ],
+        "workloads": "point_hit,point_miss,range_64,group_16,update_existing",
+        "group_distribution": "uniform",
+        "clients": "1,8",
+        "groups": 1,
+        "endpoint_mode": "single"
+      },
+      "limits": {
+        "cpus": "12",
+        "memory": "24g"
+      },
+      "status": "completed",
+      "exit_code": null,
+      "errors": [],
+      "observed_limits": {
+        "NanoCpus": 12000000000,
+        "Memory": 25769803776,
+        "MemorySwap": 25769803776
+      },
+      "process_counts": {
+        "vibedb": 1,
+        "vibedb_shard": 3,
+        "vibedb_gateway": 0,
+        "cockroach": 0
+      },
+      "client_exit_code": 0,
+      "process_counts_after": {
+        "vibedb": 1,
+        "vibedb_shard": 3,
+        "vibedb_gateway": 0,
+        "cockroach": 0
+      },
+      "forced_shutdown": false,
+      "server_exit_codes": [
+        0
+      ]
+    },
+    {
+      "engine": "candidate",
+      "arm": "before",
+      "revision": "f2df4fac525fa0f73ff2e1b558f167e1e598f6c5",
+      "order": "after-first",
+      "cell": {
+        "id": "baseline-c1-c8",
+        "kind": "baseline",
+        "physical_nodes": 3,
+        "tables": [
+          "rf3_sql_bench"
+        ],
+        "workloads": "point_hit,point_miss,range_64,group_16,update_existing",
+        "group_distribution": "uniform",
+        "clients": "1,8",
+        "groups": 1,
+        "endpoint_mode": "single"
+      },
+      "limits": {
+        "cpus": "12",
+        "memory": "24g"
+      },
+      "status": "completed",
+      "exit_code": null,
+      "errors": [],
+      "observed_limits": {
+        "NanoCpus": 12000000000,
+        "Memory": 25769803776,
+        "MemorySwap": 25769803776
+      },
+      "process_counts": {
+        "vibedb": 1,
+        "vibedb_shard": 3,
+        "vibedb_gateway": 0,
+        "cockroach": 0
+      },
+      "client_exit_code": 0,
+      "process_counts_after": {
+        "vibedb": 1,
+        "vibedb_shard": 3,
+        "vibedb_gateway": 0,
+        "cockroach": 0
+      },
+      "forced_shutdown": false,
+      "server_exit_codes": [
+        0
+      ]
+    }
+  ]
+}

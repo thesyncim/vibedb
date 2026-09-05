@@ -1,0 +1,59 @@
+{
+  "schema": "vibedb.fused-catalog-baseline/1",
+  "source_revision": "7dc21395110fa79b90b13dde7848a3bc13090d6d",
+  "go_experiment": "simd",
+  "runtime": "Linux/ARM64",
+  "runtime_image": "golang:1.27-bookworm",
+  "runtime_image_id": "sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b",
+  "raw_log_path": "/private/tmp/vibedb-catalog-miss-baseline-7dc21395.jsonl",
+  "raw_log_sha256": "d8013a9eb46b6be8fa15428ce20b0e49d77590198a5b13e591b80408775e7cb4",
+  "raw_log_bytes": 184344,
+  "exit_code": 1,
+  "source_frozen": true,
+  "fresh_test_roots": true,
+  "reached_crash_injection": false,
+  "container_removed": true,
+  "events": [
+    {
+      "Time": "2026-09-04T17:00:20.084216511Z",
+      "Action": "output",
+      "Package": "github.com/thesyncim/vibedb/internal/gatewayruntime",
+      "Test": "TestFusedRF3NodeProcessQualification/default-physical3",
+      "Output": "    fused_node_process_test.go:76: frontend exact point 2/fused_alpha/fused_alpha-01: {\"ok\":false,\"code\":\"internal\",\"retryable\":false}\n"
+    },
+    {
+      "Time": "2026-09-04T17:00:20.112303678Z",
+      "Action": "fail",
+      "Package": "github.com/thesyncim/vibedb/internal/gatewayruntime",
+      "Test": "TestFusedRF3NodeProcessQualification/default-physical3",
+      "Elapsed": 4.16
+    },
+    {
+      "Time": "2026-09-04T17:00:24.791843013Z",
+      "Action": "output",
+      "Package": "github.com/thesyncim/vibedb/internal/gatewayruntime",
+      "Test": "TestFusedRF3NodeProcessQualification/explicit-physical6",
+      "Output": "    fused_node_process_test.go:76: exact PostgreSQL oracle did not settle: count fused_alpha: gateway: plan table \"fused_alpha\": no placement in pinned catalog generation (XX000)\n"
+    },
+    {
+      "Time": "2026-09-04T17:00:24.818011305Z",
+      "Action": "fail",
+      "Package": "github.com/thesyncim/vibedb/internal/gatewayruntime",
+      "Test": "TestFusedRF3NodeProcessQualification/explicit-physical6",
+      "Elapsed": 4.71
+    },
+    {
+      "Time": "2026-09-04T17:00:24.820338972Z",
+      "Action": "fail",
+      "Package": "github.com/thesyncim/vibedb/internal/gatewayruntime",
+      "Test": "TestFusedRF3NodeProcessQualification",
+      "Elapsed": 21.95
+    },
+    {
+      "Time": "2026-09-04T17:00:24.821212305Z",
+      "Action": "fail",
+      "Package": "github.com/thesyncim/vibedb/internal/gatewayruntime",
+      "Elapsed": 21.953
+    }
+  ]
+}

@@ -23,7 +23,7 @@ import (
 
 // This fixture transports opaque canonical table metadata unchanged. The
 // target relation identity and collection are built by the real SQL binder;
-// the source's hidden apply participants stay in the same checkpoint group.
+// the source's hidden apply targets stay in the same checkpoint group.
 type schemaStartupRaw []byte
 
 func (raw *schemaStartupRaw) UnmarshalJSON(value []byte) error { *raw = bytes.Clone(value); return nil }

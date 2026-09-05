@@ -65,9 +65,9 @@ func TestMembershipStableTransactionRecoveryRetainsLogicalAndServingFences(t *te
 				test.mutate(&state)
 				states[address] = state
 			}
-			record := replicatedTransactionParticipantRecord()
+			record := replicatedTransactionTargetRecord()
 			value, err := shardservice.AppendReplicatedTransactionReadValue(nil, shardservice.ReplicatedTransactionReadValue{
-				Kind: shardservice.ReplicatedTransactionLookupParticipant, Complete: true,
+				Kind: shardservice.ReplicatedTransactionLookupTarget, Complete: true,
 				Records: []replicatedstate.TransactionRecoveryRecord{record},
 			})
 			if err != nil {
@@ -79,7 +79,7 @@ func TestMembershipStableTransactionRecoveryRetainsLogicalAndServingFences(t *te
 				t.Fatal(err)
 			}
 			result, err := executor.ReadTransactionRecovery(t.Context(), route, replicatedstate.TransactionRecoveryReadRequest{
-				Kind: replicatedstate.TransactionRecoveryLookupParticipant, ID: record.ID, MinimumApplied: 10,
+				Kind: replicatedstate.TransactionRecoveryLookupTarget, ID: record.ID, MinimumApplied: 10,
 				MaxRows: 1, MaxBytes: replicatedstate.TransactionRecoverySummaryBytes,
 			})
 			if !test.allowed {
@@ -104,10 +104,10 @@ func TestReplicatedExecutorTransactionRecoveryIsLeaderOnlyAndCanonical(t *testin
 		state.Commit, state.Applied, state.CheckpointApplied = 11, 11, 10
 		states[address] = state
 	}
-	record := replicatedTransactionParticipantRecord()
+	record := replicatedTransactionTargetRecord()
 	value, err := shardservice.AppendReplicatedTransactionReadValue(nil,
 		shardservice.ReplicatedTransactionReadValue{
-			Kind:     shardservice.ReplicatedTransactionLookupParticipant,
+			Kind:     shardservice.ReplicatedTransactionLookupTarget,
 			Complete: true, Records: []replicatedstate.TransactionRecoveryRecord{record},
 		})
 	if err != nil {
@@ -120,7 +120,7 @@ func TestReplicatedExecutorTransactionRecoveryIsLeaderOnlyAndCanonical(t *testin
 	}
 	result, err := executor.ReadTransactionRecovery(context.Background(), route,
 		replicatedstate.TransactionRecoveryReadRequest{
-			Kind: replicatedstate.TransactionRecoveryLookupParticipant,
+			Kind: replicatedstate.TransactionRecoveryLookupTarget,
 			ID:   record.ID, MinimumApplied: 10, MaxRows: 1,
 			MaxBytes: replicatedstate.TransactionRecoverySummaryBytes,
 		})
@@ -139,10 +139,10 @@ func TestReplicatedExecutorTransactionRecoveryRejectsMalformedResult(t *testing.
 	state.Commit, state.Applied = 11, 11
 	states["m2"] = state
 	route.Replicas = []ReplicatedEndpoint{route.Replicas[1]}
-	record := replicatedTransactionParticipantRecord()
+	record := replicatedTransactionTargetRecord()
 	value, err := shardservice.AppendReplicatedTransactionReadValue(nil,
 		shardservice.ReplicatedTransactionReadValue{
-			Kind:     shardservice.ReplicatedTransactionLookupParticipant,
+			Kind:     shardservice.ReplicatedTransactionLookupTarget,
 			Complete: true, Records: []replicatedstate.TransactionRecoveryRecord{record},
 		})
 	if err != nil {
@@ -163,7 +163,7 @@ func TestReplicatedExecutorTransactionRecoveryRejectsMalformedResult(t *testing.
 			}
 			_, readErr := executor.ReadTransactionRecovery(context.Background(), route,
 				replicatedstate.TransactionRecoveryReadRequest{
-					Kind: replicatedstate.TransactionRecoveryLookupParticipant,
+					Kind: replicatedstate.TransactionRecoveryLookupTarget,
 					ID:   record.ID, MinimumApplied: 10, MaxRows: 1,
 					MaxBytes: replicatedstate.TransactionRecoverySummaryBytes,
 				})
@@ -194,12 +194,12 @@ func TestReplicatedTransactionRecoveryScanBindsExclusiveCursor(t *testing.T) {
 	}
 }
 
-func replicatedTransactionParticipantRecord() replicatedstate.TransactionRecoveryRecord {
+func replicatedTransactionTargetRecord() replicatedstate.TransactionRecoveryRecord {
 	id := distributedtxn.ID{0x72, 0x65, 0x63, 0x6f, 0x76, 0x65, 0x72, 0x79, 1}
 	return replicatedstate.TransactionRecoveryRecord{
-		ID: id, Role: distributedtxn.ReplicatedRoleParticipant,
-		State: uint8(distributedtxn.ParticipantStaged), Revision: 1,
-		PayloadKind: distributedtxn.ReplicatedPayloadParticipantStage, PayloadCount: 1,
+		ID: id, Role: distributedtxn.ReplicatedRoleTarget,
+		State: uint8(distributedtxn.TargetStaged), Revision: 1,
+		PayloadKind: distributedtxn.ReplicatedPayloadTargetStage, PayloadCount: 1,
 		CoordinatorGroup: [16]byte{1}, CoordinatorShardIncarnation: [16]byte{2},
 		CoordinatorAllocation: 3, MutationDigest: distributedtxn.Digest{4},
 	}

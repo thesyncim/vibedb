@@ -76,7 +76,7 @@ func (s *postgresSession) prepareWrite(
 	}
 	// The catalog prepare below compiles routing only and never analyzes scalar
 	// input types. The typed DML compile above is the sole semantic authority.
-	if _, err := s.backend.Executor.catalog.Current().Prepare(ctx, text); err != nil {
+	if _, err := s.backend.Executor.validateCatalogPrepare(ctx, text); err != nil {
 		if compiled != nil {
 			compiled.Release()
 		}

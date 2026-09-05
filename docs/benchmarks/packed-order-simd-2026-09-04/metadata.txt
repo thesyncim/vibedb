@@ -1,0 +1,17 @@
+Purpose: paired initial ordered packed FOR COUNT benchmark
+Date: 2026-09-04
+Candidate worktree: /private/tmp/vibedb-go127-simd-next-lane
+Candidate source commit: ede2b4f34e9693831f3e9adca1840fd0ccbbf19a (uncommitted ordered COUNT WIP)
+Baseline worktree: /private/tmp/vibedb-go127-simd-next-lane-base
+Baseline source commit: ede2b4f34e9693831f3e9adca1840fd0ccbbf19a
+Benchmark fixture: query/file_packed_order_bench_test.go, copied byte-for-byte to both worktrees
+Go: go1.27.0 darwin/arm64
+Experiment: GOEXPERIMENT=simd for both compiled binaries
+CPU: Apple M4 Max, Mac16,6, 16 cores (12 performance, 4 efficiency)
+Timing: GOMAXPROCS=1, -test.cpu=1, -test.benchtime=250ms, -test.count=1, -test.benchmem
+Order: baseline then candidate in each of five paired rounds
+Allocation result: every subbenchmark reported 0 B/op and 0 allocs/op
+Correctness gate: benchmark warm and post-loop assertions verify exact result and full-scan stats; candidate runs set VIBEDB_EXPECT_ORDERED=1 to require the ordered token lane
+Power/thermal state: uncontrolled
+Candidate nosimd control: query-candidate-nosimd.test, GOEXPERIMENT=nosimd, five additional 250ms rounds; see nosimd.tsv
+Fixture SHA-256: 0d8cd31e80435fdf492630bd14b5c7ac8946058ca4b98bc4bcda14c5cc2517cf (same in both worktrees)

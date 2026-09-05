@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"sync"
 
@@ -13,6 +14,11 @@ import (
 	"github.com/thesyncim/vibedb/shardservice"
 	sqlast "github.com/thesyncim/vibedb/sql"
 	driver "github.com/thesyncim/vibedb/sql/driver"
+)
+
+const (
+	maxPostgresReadCacheSQLBytes   = 4 << 10
+	maxPostgresReadCacheParameters = 256
 )
 
 // PostgreSQLBackend exposes distributed reads and optional durable autocommit
@@ -37,20 +43,48 @@ func (b *PostgreSQLBackend) NewSession(ctx context.Context, identity pgwire.Sess
 	if _, err := serviceauthz.WithAuthority(ctx, authority); err != nil {
 		return nil, err
 	}
-	return &postgresSession{backend: b, authority: authority, state: driver.SessionIdle, statements: make(map[pgwire.BackendStatement]struct{}), rows: 100000, bytes: shardservice.MaxReplicatedSQLResultBytes}, nil
+	session := &postgresSession{backend: b, authority: authority, state: driver.SessionIdle, statements: make(map[pgwire.BackendStatement]struct{}), rows: 100000, bytes: shardservice.MaxReplicatedSQLResultBytes}
+	session.materializedRelease = session.releaseMaterialized
+	return session, nil
 }
 
 type postgresSession struct {
-	backend      *PostgreSQLBackend
-	authority    serviceauthz.Authority
-	state        driver.SessionState
-	flag         *query.CancelFlag
-	rows         int
-	bytes        int64
-	intermediate int64
-	statements   map[pgwire.BackendStatement]struct{}
-	cancelMu     sync.Mutex
-	cancel       context.CancelFunc
+	backend             *PostgreSQLBackend
+	authority           serviceauthz.Authority
+	state               driver.SessionState
+	flag                *query.CancelFlag
+	rows                int
+	bytes               int64
+	intermediate        int64
+	statements          map[pgwire.BackendStatement]struct{}
+	readCache           postgresReadCache
+	params              []shardservice.Param
+	materialized        query.Result
+	materializedRelease func() error
+	cancelMu            sync.Mutex
+	cancel              context.CancelFunc
+}
+
+func (s *postgresSession) releaseMaterialized() error {
+	for i := range s.materialized.Columns {
+		clear(s.materialized.Columns[i].Cells)
+		s.materialized.Columns[i].Cells = s.materialized.Columns[i].Cells[:0]
+	}
+	s.materialized.RowCount = 0
+	return nil
+}
+
+// postgresReadCache owns one recently closed distributed SELECT. PostgreSQL's
+// extended unnamed protocol closes that backend statement before parsing the
+// next one, so a single exact entry covers the steady state without retaining
+// an unbounded SQL-keyed map per connection.
+type postgresReadCache struct {
+	text              string
+	parameterTypes    []driver.ParamType
+	compiled          *query.Statement
+	resultParamTypes  []driver.ParamType
+	catalogGeneration uint64
+	execution         preparedQueryExecution
 }
 
 func (s *postgresSession) State() driver.SessionState { return s.state }
@@ -123,11 +157,68 @@ func (s *postgresSession) RollbackTo(ctx context.Context, name string) error {
 }
 func (s *postgresSession) Close() error {
 	s.Cancel()
+	s.state = driver.SessionClosed
 	for statement := range s.statements {
 		_ = statement.Close()
 	}
-	s.state = driver.SessionClosed
+	s.releaseReadCache()
+	s.params = nil
+	s.materialized.Release()
 	return nil
+}
+
+func (s *postgresSession) releaseReadCache() {
+	if s.readCache.compiled != nil {
+		s.readCache.compiled.Release()
+	}
+	s.readCache = postgresReadCache{}
+}
+
+func (s *postgresSession) takeCachedRead(
+	text string,
+	parameterTypes []driver.ParamType,
+) *postgresStatement {
+	cache := &s.readCache
+	if cache.compiled == nil || cache.text != text ||
+		!slices.Equal(cache.parameterTypes, parameterTypes) {
+		return nil
+	}
+	snapshot := s.backend.Executor.catalog.Current()
+	if snapshot == nil || snapshot.Generation() != cache.catalogGeneration {
+		return nil
+	}
+	statement := &postgresStatement{
+		session: s, compiled: cache.compiled,
+		paramTypes:          cache.resultParamTypes,
+		cacheParameterTypes: cache.parameterTypes,
+		catalogGeneration:   cache.catalogGeneration,
+		execution:           cache.execution,
+	}
+	*cache = postgresReadCache{}
+	s.statements[statement] = struct{}{}
+	return statement
+}
+
+func (s *postgresSession) retainRead(statement *postgresStatement) bool {
+	if s == nil || s.state == driver.SessionClosed || statement == nil ||
+		statement.compiled == nil || statement.local ||
+		len(statement.compiled.SQL()) > maxPostgresReadCacheSQLBytes ||
+		statement.compiled.NumParams() > maxPostgresReadCacheParameters {
+		return false
+	}
+	s.releaseReadCache()
+	s.readCache = postgresReadCache{
+		text:              statement.compiled.SQL(),
+		parameterTypes:    statement.cacheParameterTypes,
+		compiled:          statement.compiled,
+		resultParamTypes:  statement.paramTypes,
+		catalogGeneration: statement.catalogGeneration,
+		execution:         statement.execution,
+	}
+	statement.compiled = nil
+	statement.paramTypes = nil
+	statement.cacheParameterTypes = nil
+	return true
 }
 func (s *postgresSession) Tables(ctx context.Context) ([]driver.TableInfo, error) {
 	if err := ctx.Err(); err != nil {
@@ -189,6 +280,9 @@ func (s *postgresSession) prepare(
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if cached := s.takeCachedRead(text, parameterTypes); cached != nil {
+		return cached, nil
+	}
 	var parser sqlast.Parser
 	var parsed sqlast.Statement
 	err := parser.ParseStatement(&parsed, text)
@@ -215,20 +309,32 @@ func (s *postgresSession) prepare(
 		return nil, err
 	}
 	local := len(tree.From) == 0
+	var catalogGeneration uint64
+	var execution preparedQueryExecution
 	if !local {
 		// Snapshot.Prepare is the catalog-pinned physical routing compiler. It
 		// parses placement, constraints, ordering, and aggregate shape but never
 		// performs scalar/common-type analysis; compiled above is therefore the
 		// sole semantic prepare and already consumed the declared type hints.
-		snapshot := s.backend.Executor.catalog.Current()
-		if _, err := snapshot.Prepare(ctx, text); err != nil {
+		generation, routing, prepareErr := s.backend.Executor.prepareCatalogWithRefresh(ctx, text)
+		if prepareErr != nil {
 			compiled.Release()
-			return nil, err
+			return nil, prepareErr
+		}
+		catalogGeneration = generation
+		execution = preparedQueryExecution{
+			generation: catalogGeneration, prepared: routing,
 		}
 	}
 	statement := &postgresStatement{
 		session: s, compiled: compiled, local: local,
-		paramTypes: postgresSelectParameterTypes(compiled),
+		paramTypes:        postgresSelectParameterTypes(compiled),
+		catalogGeneration: catalogGeneration,
+		execution:         execution,
+	}
+	if !local && len(text) <= maxPostgresReadCacheSQLBytes &&
+		len(parameterTypes) <= maxPostgresReadCacheParameters {
+		statement.cacheParameterTypes = slices.Clone(parameterTypes)
 	}
 	s.statements[statement] = struct{}{}
 	return statement, nil
@@ -326,6 +432,12 @@ type postgresStatement struct {
 	// execution forwards a present vector so the shard's independent prepare
 	// observes the same analyzed input domains as this gateway prepare.
 	paramTypes []driver.ParamType
+	// cacheParameterTypes is the exact input-hint vector for an eligible
+	// distributed SELECT. It moves with compiled into the session's one-entry
+	// cache and is reused without allocating on an exact hit.
+	cacheParameterTypes []driver.ParamType
+	catalogGeneration   uint64
+	execution           preparedQueryExecution
 }
 
 func (p *postgresStatement) Kind() sqlast.Kind { return sqlast.KindSelect }
@@ -357,16 +469,26 @@ func (p *postgresStatement) ParamTypeTargetDefault(i int) bool {
 	return p != nil && p.compiled != nil &&
 		p.compiled.ParameterTypeTargetDefault(i)
 }
+func (p *postgresStatement) ReusableForParse() bool {
+	if p == nil || p.session == nil || p.compiled == nil || p.local ||
+		p.session.state == driver.SessionClosed ||
+		p.session.state == driver.SessionFailedTransaction {
+		return false
+	}
+	snapshot := p.session.backend.Executor.catalog.Current()
+	return snapshot != nil && snapshot.Generation() == p.catalogGeneration
+}
 func (p *postgresStatement) Columns() []string { return p.compiled.Columns() }
 func (p *postgresStatement) AppendSchema(dst []query.OutputColumn) []query.OutputColumn {
 	return p.compiled.AppendSchema(dst)
 }
 func (p *postgresStatement) Close() error {
-	if p.compiled != nil {
+	if p.compiled != nil && !p.session.retainRead(p) {
 		p.compiled.Release()
 		p.compiled = nil
 	}
 	p.paramTypes = nil
+	p.cacheParameterTypes = nil
 	delete(p.session.statements, p)
 	return nil
 }
@@ -406,7 +528,10 @@ func (p *postgresStatement) QueryInto(ctx context.Context, args []any, rows *pgw
 		}
 		return nil
 	}
-	params := make([]shardservice.Param, len(args))
+	params := slices.Grow(s.params[:0], len(args))[:len(args)]
+	clear(params)
+	s.params = params
+	defer clear(s.params)
 	for i, value := range args {
 		switch v := value.(type) {
 		case *string:
@@ -471,9 +596,9 @@ func (p *postgresStatement) QueryInto(ctx context.Context, args []any, rows *pgw
 	profile.PerShardRows = min(profile.PerShardRows, profile.MaxAggregateRows)
 	profile.MaxAggregateBytes = min(profile.MaxAggregateBytes, uint64(s.bytes))
 	profile.PerShardBytes = min(profile.PerShardBytes, profile.MaxAggregateBytes)
-	result, err := s.backend.Executor.queryWithProfile(ctx, Query{
+	result, err := s.backend.Executor.queryPreparedWithProfile(ctx, Query{
 		SQL: p.compiled.SQL(), Params: params, ParamTypes: p.paramTypes, Class: ClassBatch,
-	}, profile)
+	}, profile, p.compiled.NumParams(), &p.execution)
 	if err != nil {
 		return err
 	}
@@ -489,9 +614,37 @@ func (p *postgresStatement) QueryInto(ctx context.Context, args []any, rows *pgw
 	if retained > s.bytes {
 		return ErrResultLimit
 	}
-	materialized := &query.Result{Columns: make([]query.ResultColumn, len(result.Columns)), RowCount: len(result.Rows)}
+	materialized := &s.materialized
+	installed := false
+	defer func() {
+		if !installed {
+			_ = s.releaseMaterialized()
+		}
+	}()
+	previousColumns := materialized.Columns
+	if cap(previousColumns) < len(result.Columns) {
+		for i := range previousColumns {
+			clear(previousColumns[i].Cells)
+		}
+		materialized.Columns = make([]query.ResultColumn, len(result.Columns))
+	} else {
+		for i := len(result.Columns); i < len(previousColumns); i++ {
+			clear(previousColumns[i].Cells)
+			previousColumns[i] = query.ResultColumn{}
+		}
+		materialized.Columns = previousColumns[:len(result.Columns)]
+	}
+	materialized.RowCount = len(result.Rows)
 	for i, column := range result.Columns {
-		materialized.Columns[i] = query.ResultColumn{Header: column.Name, Cells: make([]query.Cell, len(result.Rows))}
+		cells := materialized.Columns[i].Cells
+		if cap(cells) < len(result.Rows) {
+			clear(cells)
+			cells = make([]query.Cell, len(result.Rows))
+		} else {
+			cells = cells[:len(result.Rows)]
+			clear(cells)
+		}
+		materialized.Columns[i] = query.ResultColumn{Header: column.Name, Cells: cells}
 	}
 	for r, row := range result.Rows {
 		if len(row) != len(result.Columns) {
@@ -513,9 +666,9 @@ func (p *postgresStatement) QueryInto(ctx context.Context, args []any, rows *pgw
 	if err != nil {
 		return err
 	}
-	if err := rows.SetMaterialized(cursor, func() error { materialized.Release(); return nil }); err != nil {
-		materialized.Release()
+	if err := rows.SetMaterialized(cursor, s.materializedRelease); err != nil {
 		return err
 	}
+	installed = true
 	return nil
 }

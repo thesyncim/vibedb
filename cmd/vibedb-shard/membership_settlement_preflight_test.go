@@ -187,3 +187,175 @@ func TestRF3MembershipSettlementMatchesAppliedRaftConfiguration(t *testing.T) {
 		t.Fatal("settlement changed the original bootstrap proof")
 	}
 }
+
+func rf3TargetPublicationSettlementFixture() (
+	replicacontrol.Observation,
+	replicacontrol.Request,
+	raftservice.CommandFence,
+	replicacontrol.Observation,
+) {
+	before, membership := rf3MembershipSettlementFixture(raftservice.MembershipPromoteVoter)
+	request := replicacontrol.Request{
+		Operation: [32]byte{0x41}, Step: [32]byte{0x42},
+		Group: before.Request.Group, TargetMember: membership.TargetMember,
+		ExpectedReplicaSetVersion: membership.ExpectedReplicaSetVersion,
+	}
+	before.Request = request
+	before.Status.MemberID = request.TargetMember
+	before.State.Binding.AllocationGeneration = 7
+	before.State.SnapshotBaseDigest[0] = 0x43
+	promoted := raftservice.CommandFence{ReplicaSetVersion: 12}
+	ready := before
+	ready.Request.ExpectedReplicaSetVersion = promoted.ReplicaSetVersion
+	ready.State.ConfState = &pb.ConfState{Voters: []uint64{1, 2, 3, 4}, AutoLeave: new(false)}
+	ready.State.Applied = 15
+	ready.State.ReplicaSetVersion = promoted.ReplicaSetVersion
+	ready.Publication.Applied = ready.State.Applied
+	ready.Publication.ReplicaSetVersion = ready.State.ReplicaSetVersion
+	ready.Publication.ConfState = proto.Clone(ready.State.ConfState).(*pb.ConfState)
+	ready.Status.Applied = ready.State.Applied
+	return before, request, promoted, ready
+}
+
+func TestRF3TargetPublicationConvergesThroughDiscovery(t *testing.T) {
+	before, request, promoted, ready := rf3TargetPublicationSettlementFixture()
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	var calls int
+	var attemptedVersions []uint64
+	got, err := rf3AwaitTargetPublication(ctx, before, request, promoted,
+		func(_ context.Context, attempt replicacontrol.Request) (replicacontrol.Observation, error) {
+			calls++
+			attemptedVersions = append(attemptedVersions, attempt.ExpectedReplicaSetVersion)
+			switch calls {
+			case 1:
+				return before, replicacontrol.ErrStale
+			case 2:
+				return before, nil
+			default:
+				return ready, nil
+			}
+		})
+	if err != nil || calls != 3 {
+		t.Fatalf("target publication calls=%d err=%v", calls, err)
+	}
+	if got.State.ReplicaSetVersion != promoted.ReplicaSetVersion ||
+		got.Status.MemberID != request.TargetMember {
+		t.Fatalf("target publication=%+v", got)
+	}
+	for index, version := range attemptedVersions {
+		if version != 0 {
+			t.Fatalf("attempt %d pinned expected replica-set version=%d", index+1, version)
+		}
+	}
+	if request.ExpectedReplicaSetVersion == 0 {
+		t.Fatal("discovery helper mutated caller request")
+	}
+}
+
+func TestRF3TargetPublicationRejectsWrongCutsAndRetainsDiagnostics(t *testing.T) {
+	before, request, promoted, ready := rf3TargetPublicationSettlementFixture()
+	mutations := map[string]func(*replicacontrol.Observation){
+		"wrong operation": func(observation *replicacontrol.Observation) {
+			observation.Request.Operation[0]++
+		},
+		"wrong step": func(observation *replicacontrol.Observation) {
+			observation.Request.Step[0]++
+		},
+		"wrong group": func(observation *replicacontrol.Observation) {
+			observation.Request.Group.GroupID[0]++
+		},
+		"wrong target": func(observation *replicacontrol.Observation) {
+			observation.Request.TargetMember++
+		},
+		"wrong discovered version": func(observation *replicacontrol.Observation) {
+			observation.Request.ExpectedReplicaSetVersion++
+		},
+		"wrong status member": func(observation *replicacontrol.Observation) {
+			observation.Status.MemberID++
+		},
+		"wrong status applied": func(observation *replicacontrol.Observation) {
+			observation.Status.Applied--
+		},
+		"wrong state version": func(observation *replicacontrol.Observation) {
+			observation.State.ReplicaSetVersion++
+		},
+		"wrong publication version": func(observation *replicacontrol.Observation) {
+			observation.Publication.ReplicaSetVersion++
+		},
+		"state below config": func(observation *replicacontrol.Observation) {
+			observation.State.Applied = promoted.ReplicaSetVersion - 1
+		},
+		"publication below config": func(observation *replicacontrol.Observation) {
+			observation.Publication.Applied = promoted.ReplicaSetVersion - 1
+		},
+		"publication applied differs from state": func(observation *replicacontrol.Observation) {
+			observation.Publication.Applied--
+		},
+		"publication data chain differs from state": func(observation *replicacontrol.Observation) {
+			observation.Publication.DataChainDigest[0]++
+		},
+		"publication configuration differs from state": func(observation *replicacontrol.Observation) {
+			observation.Publication.ConfState.Voters[0]++
+		},
+		"binding changed": func(observation *replicacontrol.Observation) {
+			observation.State.Binding.AllocationGeneration++
+		},
+		"snapshot digest changed": func(observation *replicacontrol.Observation) {
+			observation.State.SnapshotBaseDigest[0]++
+		},
+		"target remains learner": func(observation *replicacontrol.Observation) {
+			observation.State.ConfState = &pb.ConfState{Voters: []uint64{1, 2, 3}, Learners: []uint64{4}}
+			observation.Publication.ConfState = proto.Clone(observation.State.ConfState).(*pb.ConfState)
+		},
+		"target is not a voter": func(observation *replicacontrol.Observation) {
+			observation.State.ConfState = &pb.ConfState{Voters: []uint64{1, 2, 3}}
+			observation.Publication.ConfState = proto.Clone(observation.State.ConfState).(*pb.ConfState)
+		},
+		"promotion adds another voter": func(observation *replicacontrol.Observation) {
+			observation.State.ConfState.Voters = append(observation.State.ConfState.Voters, 5)
+			observation.Publication.ConfState = proto.Clone(observation.State.ConfState).(*pb.ConfState)
+		},
+		"promotion removes an existing voter": func(observation *replicacontrol.Observation) {
+			observation.State.ConfState.Voters = observation.State.ConfState.Voters[1:]
+			observation.Publication.ConfState = proto.Clone(observation.State.ConfState).(*pb.ConfState)
+		},
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			bad := ready
+			bad.State.ConfState = proto.Clone(ready.State.ConfState).(*pb.ConfState)
+			bad.Publication.ConfState = proto.Clone(ready.Publication.ConfState).(*pb.ConfState)
+			mutate(&bad)
+			if rf3TargetPublicationMatches(before, request, promoted, bad) {
+				t.Fatal("wrong target publication cut was accepted")
+			}
+		})
+	}
+
+	bad := ready
+	bad.Request.Group.GroupID[0]++
+	ctx, cancel := context.WithTimeout(t.Context(), 25*time.Millisecond)
+	defer cancel()
+	calls := 0
+	_, err := rf3AwaitTargetPublication(ctx, before, request, promoted,
+		func(_ context.Context, attempt replicacontrol.Request) (replicacontrol.Observation, error) {
+			calls++
+			if attempt.ExpectedReplicaSetVersion != 0 {
+				t.Fatalf("attempt pinned expected replica-set version=%d", attempt.ExpectedReplicaSetVersion)
+			}
+			return bad, errors.New("transient observation failure")
+		})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("wrong-cut timeout error=%v", err)
+	}
+	var diagnostics *rf3TargetPublicationError
+	if !errors.As(err, &diagnostics) {
+		t.Fatalf("timeout error omitted diagnostics: %v", err)
+	}
+	if diagnostics.attempts != calls || diagnostics.attempts == 0 ||
+		diagnostics.lastObservation.Request.Group != bad.Request.Group ||
+		diagnostics.lastError == nil || diagnostics.lastError.Error() != "transient observation failure" {
+		t.Fatalf("timeout diagnostics=%+v calls=%d", diagnostics, calls)
+	}
+}

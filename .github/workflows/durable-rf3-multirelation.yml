@@ -11,7 +11,7 @@ permissions:
 
 concurrency:
   group: durable-rf3-multirelation-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: true
 
 env:
   GOEXPERIMENT: simd
@@ -49,9 +49,9 @@ jobs:
           test "$(( $(stat -c %b "${preflight}") * $(stat -c %B "${preflight}") ))" -ge 1048576
           rm -f "${preflight}"
           test_name='TestGatewayDurableRF3MultiRelationChaosProcess'
-          go test -list "^${test_name}$" ./cmd/vibedb-gateway > "${evidence}/test-list.txt"
+          go test -list "^${test_name}$" ./internal/gatewayruntime > "${evidence}/test-list.txt"
           grep -Fqx "${test_name}" "${evidence}/test-list.txt"
-          printf 'TMPDIR=%s VIBEDB_DURABLE_RF3_MULTIRELATION_E2E=1 go test -json -count=3 -timeout=18m -run %s ./cmd/vibedb-gateway\n' \
+          printf 'TMPDIR=%s VIBEDB_DURABLE_RF3_MULTIRELATION_E2E=1 go test -json -count=3 -timeout=18m -run %s ./internal/gatewayruntime\n' \
             "${test_root}" "^${test_name}$" > "${evidence}/command.txt"
       - name: Run shipped multi-relation RF3 chaos
         shell: bash
@@ -62,7 +62,7 @@ jobs:
           set -euo pipefail
           go test -json -count=3 -timeout=18m \
             -run '^TestGatewayDurableRF3MultiRelationChaosProcess$' \
-            ./cmd/vibedb-gateway \
+            ./internal/gatewayruntime \
             | tee "${RUNNER_TEMP}/durable-rf3-multirelation/go-test.jsonl"
       - name: Require default-pin unfinished-request recovery
         if: ${{ !cancelled() }}
@@ -74,6 +74,9 @@ jobs:
           set -euo pipefail
           test_name='TestTwoGatewayDurableSQLRF3RecoversUnfinishedWaveWithDefaultPinSpan'
           result="${RUNNER_TEMP}/durable-rf3-multirelation/unfinished-pin.jsonl"
+          test_list="${RUNNER_TEMP}/durable-rf3-multirelation/unfinished-pin-test-list.txt"
+          go test -list "^${test_name}$" ./internal/raftservice > "${test_list}"
+          grep -Fqx "${test_name}" "${test_list}"
           go test -json -count=3 -timeout=8m -run "^${test_name}$" ./internal/raftservice | tee "${result}"
           test "$(stat -c %s "${result}")" -le 50331648
           test "$(jq -r --arg test_name "${test_name}" \

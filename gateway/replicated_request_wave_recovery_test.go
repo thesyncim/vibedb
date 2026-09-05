@@ -47,32 +47,32 @@ func (l *advancedWaveLedger) ReadRow(ctx context.Context, home DurableRequestLed
 	}
 }
 
-type advancedWaveParticipantStream struct {
-	participant DurableRequestLogicalParticipant
-	consumed    bool
+type advancedWaveTargetStream struct {
+	target   DurableRequestLogicalTarget
+	consumed bool
 }
 
-func (s *advancedWaveParticipantStream) Reset() error { s.consumed = false; return nil }
-func (s *advancedWaveParticipantStream) Next() bool {
+func (s *advancedWaveTargetStream) Reset() error { s.consumed = false; return nil }
+func (s *advancedWaveTargetStream) Next() bool {
 	if s.consumed {
 		return false
 	}
 	s.consumed = true
 	return true
 }
-func (s *advancedWaveParticipantStream) Current() DurableRequestLogicalParticipant {
-	return s.participant
+func (s *advancedWaveTargetStream) Current() DurableRequestLogicalTarget {
+	return s.target
 }
-func (*advancedWaveParticipantStream) Err() error         { return nil }
-func (*advancedWaveParticipantStream) BufferedBytes() int { return 0 }
-func (s *advancedWaveParticipantStream) Complete() bool   { return s.consumed }
+func (*advancedWaveTargetStream) Err() error         { return nil }
+func (*advancedWaveTargetStream) BufferedBytes() int { return 0 }
+func (s *advancedWaveTargetStream) Complete() bool   { return s.consumed }
 
 func advancedExecution(wave DurableRequestWave) DurableRequestTypedExecutionContext {
 	return DurableRequestTypedExecutionContext{
 		Home: wave.Home, Key: DurableRequestLedgerKey{RequestKey: wave.Key},
-		Recipe: DurableRequestRecipe{Identity: wave.Identity, Tenant: wave.Tenant, ParticipantCount: 1,
+		Recipe: DurableRequestRecipe{Identity: wave.Identity, Tenant: wave.Tenant, TargetCount: 1,
 			Contract: DurableRequestExecutionContract{PinID: wave.PinID, PinDigest: replication.Digest(wave.Binding)}},
-		Participants:      &advancedWaveParticipantStream{participant: wave.Participant},
+		Targets:           &advancedWaveTargetStream{target: wave.LogicalTarget},
 		ExecutionPinRoute: wave.ExecutionPinRoute, ExecutionPinLease: wave.ExecutionPinLease,
 	}
 }

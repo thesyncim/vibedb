@@ -25,9 +25,9 @@ func TestCoordinatorRoundTripAndBorrowing(t *testing.T) {
 	record := CoordinatorRecord{
 		ID: testID(), State: CoordinatorStaging, Revision: 1, CatalogGeneration: 9,
 		RecoveryDeadline: 3,
-		Participants: []ParticipantRef{
-			{Distribution: []byte("docs"), Shard: []byte("-80"), RoutingVersion: 7, AllocationGeneration: 2, OwnershipEpoch: 3, AuthorityWitness: authorityWitness("a"), MutationDigest: digest("a"), State: ParticipantStaged},
-			{Distribution: []byte("docs"), Shard: []byte("80-"), RoutingVersion: 7, AllocationGeneration: 4, OwnershipEpoch: 5, AuthorityWitness: authorityWitness("b"), MutationDigest: digest("b"), State: ParticipantStaged},
+		Targets: []TransactionTargetRef{
+			{Distribution: []byte("docs"), Shard: []byte("-80"), RoutingVersion: 7, AllocationGeneration: 2, OwnershipEpoch: 3, AuthorityWitness: authorityWitness("a"), MutationDigest: digest("a"), State: TargetStaged},
+			{Distribution: []byte("docs"), Shard: []byte("80-"), RoutingVersion: 7, AllocationGeneration: 4, OwnershipEpoch: 5, AuthorityWitness: authorityWitness("b"), MutationDigest: digest("b"), State: TargetStaged},
 		},
 	}
 	encoded, err := AppendCoordinator([]byte("prefix"), record)
@@ -42,12 +42,12 @@ func TestCoordinatorRoundTripAndBorrowing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.ID != record.ID || got.State != record.State || got.Revision != 1 || len(got.Participants) != 2 {
+	if got.ID != record.ID || got.State != record.State || got.Revision != 1 || len(got.Targets) != 2 {
 		t.Fatalf("round trip = %+v", got)
 	}
 	offset := bytes.Index(encoded, []byte("80-"))
-	if !bytes.Equal(got.Participants[1].Shard, []byte("80-")) || offset < 0 ||
-		&got.Participants[1].Shard[0] != &encoded[offset] {
+	if !bytes.Equal(got.Targets[1].Shard, []byte("80-")) || offset < 0 ||
+		&got.Targets[1].Shard[0] != &encoded[offset] {
 		t.Fatal("participant identity did not decode as a borrowed view")
 	}
 	reencoded, err := AppendCoordinator(nil, got)
@@ -56,25 +56,25 @@ func TestCoordinatorRoundTripAndBorrowing(t *testing.T) {
 	}
 }
 
-func TestParticipantRoundTripAndExactSize(t *testing.T) {
+func TestTargetRoundTripAndExactSize(t *testing.T) {
 	mutation := []byte("compact-binary-sql-and-params")
-	record := ParticipantRecord{
-		ID: testID(), State: ParticipantStaged, Revision: 1, RoutingVersion: 9,
+	record := TargetRecord{
+		ID: testID(), State: TargetStaged, Revision: 1, RoutingVersion: 9,
 		AllocationGeneration: 2, OwnershipEpoch: 3, CoordinatorDistribution: []byte("docs"), CoordinatorShard: []byte("-80"),
 		CoordinatorAllocation: 2, CoordinatorRoutingVersion: 9, CoordinatorOwnershipEpoch: 3,
 		BucketBits: 8, IntentScopes: []IntentScope{{Start: 1, End: 3}, {Start: 5, End: 6}},
 		MutationDigest: sha256.Sum256(mutation), Mutation: mutation,
 	}
-	encoded, err := AppendParticipant(nil, record)
+	encoded, err := AppendTarget(nil, record)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := participantHeaderBytes + len(record.CoordinatorDistribution) + len(record.CoordinatorShard) +
+	want := targetHeaderBytes + len(record.CoordinatorDistribution) + len(record.CoordinatorShard) +
 		len(record.IntentScopes)*8 + len(mutation) + 4
 	if len(encoded) != want {
 		t.Fatalf("size = %d, want %d", len(encoded), want)
 	}
-	got, err := OpenParticipant(encoded)
+	got, err := OpenTarget(encoded)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,15 +92,15 @@ func TestParticipantRoundTripAndExactSize(t *testing.T) {
 func TestRecordCorruptionAndOrderingRejected(t *testing.T) {
 	record := CoordinatorRecord{
 		ID: testID(), State: CoordinatorStaging, Revision: 1, CatalogGeneration: 1,
-		Participants: []ParticipantRef{
-			{Distribution: []byte("docs"), Shard: []byte("b"), RoutingVersion: 1, AllocationGeneration: 1, OwnershipEpoch: 1, AuthorityWitness: authorityWitness("b"), MutationDigest: digest("b"), State: ParticipantStaged},
-			{Distribution: []byte("docs"), Shard: []byte("a"), RoutingVersion: 1, AllocationGeneration: 1, OwnershipEpoch: 1, AuthorityWitness: authorityWitness("a"), MutationDigest: digest("a"), State: ParticipantStaged},
+		Targets: []TransactionTargetRef{
+			{Distribution: []byte("docs"), Shard: []byte("b"), RoutingVersion: 1, AllocationGeneration: 1, OwnershipEpoch: 1, AuthorityWitness: authorityWitness("b"), MutationDigest: digest("b"), State: TargetStaged},
+			{Distribution: []byte("docs"), Shard: []byte("a"), RoutingVersion: 1, AllocationGeneration: 1, OwnershipEpoch: 1, AuthorityWitness: authorityWitness("a"), MutationDigest: digest("a"), State: TargetStaged},
 		},
 	}
 	if _, err := AppendCoordinator(nil, record); err == nil {
 		t.Fatal("unsorted participants accepted")
 	}
-	record.Participants[0], record.Participants[1] = record.Participants[1], record.Participants[0]
+	record.Targets[0], record.Targets[1] = record.Targets[1], record.Targets[0]
 	encoded, err := AppendCoordinator(nil, record)
 	if err != nil {
 		t.Fatal(err)
@@ -112,18 +112,18 @@ func TestRecordCorruptionAndOrderingRejected(t *testing.T) {
 }
 
 func TestAppendCoordinatorSignalsSegmentedFallback(t *testing.T) {
-	participants := make([]ParticipantRef, MaxInlineParticipants+1)
-	for i := range participants {
-		participants[i] = ParticipantRef{
+	targets := make([]TransactionTargetRef, MaxInlineTargets+1)
+	for i := range targets {
+		targets[i] = TransactionTargetRef{
 			Distribution: []byte("docs"), Shard: []byte{byte(i + 1)},
 			RoutingVersion: 1, AllocationGeneration: 1, OwnershipEpoch: 1,
 			AuthorityWitness: AuthorityWitness{byte(i + 1)},
-			MutationDigest:   Digest{byte(i + 1)}, State: ParticipantStaged,
+			MutationDigest:   Digest{byte(i + 1)}, State: TargetStaged,
 		}
 	}
 	_, err := AppendCoordinator(nil, CoordinatorRecord{
 		ID: testID(), State: CoordinatorStaging, Revision: 1,
-		CatalogGeneration: 1, Participants: participants,
+		CatalogGeneration: 1, Targets: targets,
 	})
 	if !errors.Is(err, ErrTooLarge) {
 		t.Fatalf("AppendCoordinator wider than inline lane = %v, want ErrTooLarge", err)
@@ -134,29 +134,29 @@ func TestStateTransitions(t *testing.T) {
 	if !CoordinatorStaging.CanTransitionTo(CoordinatorCommitted) ||
 		!CoordinatorStaging.CanTransitionTo(CoordinatorAborted) ||
 		CoordinatorCommitted.CanTransitionTo(CoordinatorAborted) ||
-		!ParticipantStaged.CanTransitionTo(ParticipantPrepared) ||
-		ParticipantStaged.CanTransitionTo(ParticipantApplied) ||
-		!ParticipantPrepared.CanTransitionTo(ParticipantApplied) ||
-		ParticipantApplied.CanTransitionTo(ParticipantAborted) ||
-		!ParticipantApplied.CanTransitionTo(ParticipantReleased) {
+		!TargetStaged.CanTransitionTo(TargetPrepared) ||
+		TargetStaged.CanTransitionTo(TargetApplied) ||
+		!TargetPrepared.CanTransitionTo(TargetApplied) ||
+		TargetApplied.CanTransitionTo(TargetAborted) ||
+		!TargetApplied.CanTransitionTo(TargetReleased) {
 		t.Fatal("state transition matrix is not monotone")
 	}
 }
 
-func BenchmarkCoordinatorCodec64Participants(b *testing.B) {
-	participants := make([]ParticipantRef, MaxInlineParticipants)
-	for i := range participants {
-		participants[i] = ParticipantRef{
+func BenchmarkCoordinatorCodec64Targets(b *testing.B) {
+	targets := make([]TransactionTargetRef, MaxInlineTargets)
+	for i := range targets {
+		targets[i] = TransactionTargetRef{
 			Distribution:         []byte("docs"),
 			Shard:                []byte{byte('a' + i/26), byte('a' + i%26)},
 			RoutingVersion:       1,
 			AllocationGeneration: 1, OwnershipEpoch: 1,
-			MutationDigest: digest(string(rune(i + 1))), State: ParticipantStaged,
+			MutationDigest: digest(string(rune(i + 1))), State: TargetStaged,
 		}
 	}
-	record := CoordinatorRecord{ID: testID(), State: CoordinatorStaging, Revision: 1, CatalogGeneration: 1, Participants: participants}
+	record := CoordinatorRecord{ID: testID(), State: CoordinatorStaging, Revision: 1, CatalogGeneration: 1, Targets: targets}
 	dst := make([]byte, 0, MaxCoordinatorRecordBytes)
-	participantsScratch := make([]ParticipantRef, MaxInlineParticipants)
+	targetsScratch := make([]TransactionTargetRef, MaxInlineTargets)
 	encoded, err := AppendCoordinator(dst[:0], record)
 	if err != nil {
 		b.Fatal(err)
@@ -169,16 +169,16 @@ func BenchmarkCoordinatorCodec64Participants(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		if _, err := OpenCoordinatorInto(encoded, participantsScratch); err != nil {
+		if _, err := OpenCoordinatorInto(encoded, targetsScratch); err != nil {
 			b.Fatal(err)
 		}
 	}
 }
 
-func BenchmarkParticipantCodecScopes(b *testing.B) {
+func BenchmarkTargetCodecScopes(b *testing.B) {
 	mutation := []byte("compact-mutation-batch")
-	record := ParticipantRecord{
-		ID: testID(), State: ParticipantStaged, Revision: 1, RoutingVersion: 9,
+	record := TargetRecord{
+		ID: testID(), State: TargetStaged, Revision: 1, RoutingVersion: 9,
 		AllocationGeneration: 2, OwnershipEpoch: 3,
 		CoordinatorDistribution: []byte("docs"), CoordinatorShard: []byte("-80"),
 		CoordinatorAllocation: 2, CoordinatorRoutingVersion: 9, CoordinatorOwnershipEpoch: 3,
@@ -193,17 +193,17 @@ func BenchmarkParticipantCodecScopes(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		encoded, err := AppendParticipant(dst[:0], record)
+		encoded, err := AppendTarget(dst[:0], record)
 		if err != nil {
 			b.Fatal(err)
 		}
-		if _, err := OpenParticipantInto(encoded, scopes[:]); err != nil {
+		if _, err := OpenTargetInto(encoded, scopes[:]); err != nil {
 			b.Fatal(err)
 		}
 	}
 }
 
-func BenchmarkParticipantDigestScopes(b *testing.B) {
+func BenchmarkTargetDigestScopes(b *testing.B) {
 	mutation := make([]byte, 1024)
 	scopes := []IntentScope{{Start: 17, End: 18}, {Start: 91, End: 92}, {Start: 700, End: 702}}
 	b.ReportAllocs()
@@ -211,7 +211,7 @@ func BenchmarkParticipantDigestScopes(b *testing.B) {
 	b.ResetTimer()
 	var digest Digest
 	for range b.N {
-		digest = ParticipantDigest(20, scopes, mutation)
+		digest = TargetDigest(20, scopes, mutation)
 	}
 	if digest == (Digest{}) {
 		b.Fatal("zero digest")

@@ -11,7 +11,7 @@ const (
 	stepRefBytes              = 104
 	MaxPendingWaveRecordBytes = pendingWaveHeaderBytes + MaxPendingWaveSteps*stepRefBytes + checksumBytes
 	// SingleStepPendingWaveRecordBytes permits serial runners to reserve only
-	// their one live step, without imposing a transaction participant limit.
+	// their one live step, without imposing a transaction target limit.
 	SingleStepPendingWaveRecordBytes = pendingWaveHeaderBytes + stepRefBytes + checksumBytes
 )
 
@@ -22,7 +22,7 @@ var (
 
 // StepRef names exact target and command bytes inside the immutable sealed
 // recipe. A physical wave is bounded for one proposal; wider transactions use
-// arbitrarily many monotone waves and have no participant-count policy ceiling.
+// arbitrarily many monotone waves and have no target-count policy ceiling.
 type StepRef struct {
 	TargetSource  PayloadSource
 	CommandSource PayloadSource

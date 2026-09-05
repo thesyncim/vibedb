@@ -12,8 +12,8 @@ import (
 const (
 	// CommandBytes is the exact size of every replicated route-gate command.
 	// A command always names at most one request or topology operation. Large
-	// distributed requests therefore stream one command to each participant;
-	// the grammar has no aggregate participant-count field or ceiling.
+	// distributed requests therefore stream one command to each target;
+	// the grammar has no aggregate target-count field or ceiling.
 	CommandBytes = 84
 
 	commandBodyBytes = CommandBytes - 4
@@ -28,14 +28,14 @@ var (
 	castagnoli   = crc32.MakeTable(crc32.Castagnoli)
 )
 
-// Identity is the stable digest of one physical participant wave/attempt or
+// Identity is the stable digest of one physical target wave/attempt or
 // topology operation. A long-lived logical request contract does not hold a
 // route pin: it may refresh physical placement between waves. Zero is never a
 // valid identity.
 type Identity [32]byte
 
 // Binding authenticates the exact physical group, member/endpoint fence, and
-// command fingerprint for a participant wave, or the topology plan bound to
+// command fingerprint for a target wave, or the topology plan bound to
 // an exclusive identity. Reusing an identity with another binding fails
 // closed, so outcome-unknown retries cannot silently change their route.
 type Binding [32]byte

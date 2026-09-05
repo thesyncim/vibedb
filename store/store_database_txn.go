@@ -34,12 +34,12 @@ var (
 	// that owns it returned.
 	ErrBatchClosed = errors.New("vibedb: collection write batch is no longer active")
 	// ErrTxnTooLarge reports a multi-collection apply that exceeds a
-	// cross-participant bound (collection count). Nothing was staged.
+	// cross-target bound (collection count). Nothing was staged.
 	ErrTxnTooLarge = errors.New("vibedb: database transaction exceeds a bounded limit")
-	// ErrTxnParticipant reports a nil participant, an unnamed collection, a
+	// ErrTxnCollection reports a nil target, an unnamed collection, a
 	// duplicate name, or a DatabaseBatch.Collection name outside the
-	// participant set.
-	ErrTxnParticipant = errors.New("vibedb: invalid database transaction participant")
+	// target set.
+	ErrTxnCollection = errors.New("vibedb: invalid database transaction participant")
 )
 
 const (
@@ -65,7 +65,7 @@ const (
 	defaultHeapBatchPositionHint = 8
 )
 
-// WriteBatch accumulates the mutations one participant contributes to an
+// WriteBatch accumulates the mutations one target contributes to an
 // UpdateCollections apply. Keys are deduplicated as they arrive; keys and
 // documents are copied into the batch so the caller may reuse its buffers as
 // soon as a method returns. Document syntax and schema are validated when the
@@ -208,47 +208,47 @@ func (b *WriteBatch) replaceValue(at int, src []byte) {
 }
 
 // DatabaseBatch is the per-apply staging handle passed to UpdateCollections.
-// Collection returns the WriteBatch for a participant name.
+// Collection returns the WriteBatch for a target name.
 type DatabaseBatch struct {
 	byName map[string]*WriteBatch
-	// first serves the lone-participant apply without map storage: single
+	// first serves the lone-target apply without map storage: single
 	// collection commits skip the map make and the first insert. The map
 	// is made lazily once a second distinct collection arrives.
 	first *WriteBatch
 }
 
-// Collection returns the participant WriteBatch for name.
+// Collection returns the target WriteBatch for name.
 func (b *DatabaseBatch) Collection(name string) (*WriteBatch, error) {
 	if b == nil {
-		return nil, ErrTxnParticipant
+		return nil, ErrTxnCollection
 	}
 	if b.first != nil && b.first.collection != nil && b.first.collection.name == name {
 		return b.first, nil
 	}
 	batch, ok := b.byName[name]
 	if !ok || batch == nil {
-		return nil, fmt.Errorf("%w: %q", ErrTxnParticipant, name)
+		return nil, fmt.Errorf("%w: %q", ErrTxnCollection, name)
 	}
 	return batch, nil
 }
 
 // UpdateCollections stages per-collection entry sets via fn, then holds every
-// participant writer in catalog name order and flips all published-state
+// target writer in catalog name order and flips all published-state
 // pointers inside that hold. A concurrent [Database.Snapshot] cut therefore
-// observes each transaction all-or-nothing across the participant set.
+// observes each transaction all-or-nothing across the target set.
 // Single-collection [Collection.Snapshot] readers may observe an individual
 // collection before or after its flip — the same promise [Collection.Put]
 // always made.
 //
-// participants must be non-nil, catalog-named collections with distinct names.
-// An empty participant list runs fn against an empty batch set and publishes
-// nothing. fn nil is refused. Exceeding the per-participant batch bound or the
-// participant-count cap refuses before any writer is taken.
-func UpdateCollections(participants []*Collection, fn func(*DatabaseBatch) error) error {
+// targets must be non-nil, catalog-named collections with distinct names.
+// An empty target list runs fn against an empty batch set and publishes
+// nothing. fn nil is refused. Exceeding the per-target batch bound or the
+// target-count cap refuses before any writer is taken.
+func UpdateCollections(targets []*Collection, fn func(*DatabaseBatch) error) error {
 	if fn == nil {
 		return errors.New("vibedb: UpdateCollections requires a function")
 	}
-	ordered, err := orderTxnParticipants(participants)
+	ordered, err := orderTxnCollectionRefs(targets)
 	if err != nil {
 		return err
 	}
@@ -299,12 +299,12 @@ func UpdateCollections(participants []*Collection, fn func(*DatabaseBatch) error
 		return nil
 	}
 
-	for _, collection := range ordered {
-		collection.mu.Lock()
+	for i := range batches {
+		batches[i].collection.mu.Lock()
 	}
 	defer func() {
-		for i := len(ordered) - 1; i >= 0; i-- {
-			ordered[i].mu.Unlock()
+		for i := len(batches) - 1; i >= 0; i-- {
+			batches[i].collection.mu.Unlock()
 		}
 	}()
 
@@ -332,47 +332,47 @@ func UpdateCollections(participants []*Collection, fn func(*DatabaseBatch) error
 
 // Update is the catalog-owned convenience form of UpdateCollections. It copies
 // the currently cataloged collection set under the catalog read lock, releases
-// that lock before calling fn, and uses the captured set as the participants in
+// that lock before calling fn, and uses the captured set as the targets in
 // the same staging and publication protocol.
 func (d *Database) Update(fn func(*DatabaseBatch) error) error {
 	if d == nil {
-		return ErrTxnParticipant
+		return ErrTxnCollection
 	}
 	if fn == nil {
 		return errors.New("vibedb: Database.Update requires a function")
 	}
 	d.mu.RLock()
-	participants := make([]*Collection, 0, len(d.collections))
+	targets := make([]*Collection, 0, len(d.collections))
 	for _, collection := range d.collections {
-		participants = append(participants, collection)
+		targets = append(targets, collection)
 	}
 	d.mu.RUnlock()
-	if len(participants) == 0 {
+	if len(targets) == 0 {
 		batch := &DatabaseBatch{byName: map[string]*WriteBatch{}}
 		return fn(batch)
 	}
-	return UpdateCollections(participants, fn)
+	return UpdateCollections(targets, fn)
 }
 
-func orderTxnParticipants(participants []*Collection) ([]*Collection, error) {
-	if len(participants) == 0 {
+func orderTxnCollectionRefs(targets []*Collection) ([]*Collection, error) {
+	if len(targets) == 0 {
 		return nil, nil
 	}
-	// A lone participant is already ordered, distinct, and needs no
+	// A lone target is already ordered, distinct, and needs no
 	// copied slice, sort, or dedup set: the per-commit scaffolding below
 	// exists for the multi-collection case only.
-	if len(participants) == 1 {
-		only := participants[0]
+	if len(targets) == 1 {
+		only := targets[0]
 		if only == nil {
-			return nil, fmt.Errorf("%w: nil collection", ErrTxnParticipant)
+			return nil, fmt.Errorf("%w: nil collection", ErrTxnCollection)
 		}
 		if only.name == "" {
-			return nil, fmt.Errorf("%w: unnamed collection", ErrTxnParticipant)
+			return nil, fmt.Errorf("%w: unnamed collection", ErrTxnCollection)
 		}
-		return participants, nil
+		return targets, nil
 	}
-	ordered := make([]*Collection, len(participants))
-	copy(ordered, participants)
+	ordered := make([]*Collection, len(targets))
+	copy(ordered, targets)
 	slices.SortFunc(ordered, func(a, b *Collection) int {
 		if a == nil && b == nil {
 			return 0
@@ -388,13 +388,13 @@ func orderTxnParticipants(participants []*Collection) ([]*Collection, error) {
 	seen := make(map[string]struct{}, len(ordered))
 	for _, collection := range ordered {
 		if collection == nil {
-			return nil, fmt.Errorf("%w: nil collection", ErrTxnParticipant)
+			return nil, fmt.Errorf("%w: nil collection", ErrTxnCollection)
 		}
 		if collection.name == "" {
-			return nil, fmt.Errorf("%w: unnamed collection", ErrTxnParticipant)
+			return nil, fmt.Errorf("%w: unnamed collection", ErrTxnCollection)
 		}
 		if _, dup := seen[collection.name]; dup {
-			return nil, fmt.Errorf("%w: duplicate name %q", ErrTxnParticipant, collection.name)
+			return nil, fmt.Errorf("%w: duplicate name %q", ErrTxnCollection, collection.name)
 		}
 		seen[collection.name] = struct{}{}
 	}

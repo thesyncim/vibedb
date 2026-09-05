@@ -25,6 +25,8 @@
 //
 //	vibedb-shard serve-rf3 -manifest <path>
 //
+//	vibedb-shard serve-node -manifest <path>
+//
 //	vibedb-shard prepare-rf3 -manifest <path>
 //
 //	vibedb-shard bootstrap-rf3 -manifest <path>
@@ -61,7 +63,7 @@ func main() {
 }
 
 func runProfiled(args []string) int {
-	if len(args) > 1 && args[1] == "serve-rf3" {
+	if len(args) > 1 && (args[1] == "serve-rf3" || args[1] == "serve-node") {
 		stop, err := processprofile.StartFromEnv("shard")
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -84,6 +86,8 @@ func run(args []string) int {
 		return runServe(args[2:])
 	case "serve-rf3":
 		return runServeRF3(args[2:])
+	case "serve-node":
+		return runServeNode(args[2:])
 	case "prepare-node-group-rf3":
 		return runPrepareNodeGroupRF3(args[2:])
 	case "prepare-node-rf3":
@@ -119,6 +123,7 @@ func usage() {
 		"-distribution <name> -shard <id> -allocation-generation <n> "+
 		"-epoch <n> -routing-version <n>")
 	fmt.Fprintln(os.Stderr, "  vibedb-shard serve-rf3 -manifest <path>")
+	fmt.Fprintln(os.Stderr, "  vibedb-shard serve-node -manifest <path>")
 	fmt.Fprintln(os.Stderr, "  vibedb-shard prepare-rf3 -manifest <path>")
 	fmt.Fprintln(os.Stderr, "  vibedb-shard prepare-node-rf3 -manifest <path>")
 	fmt.Fprintln(os.Stderr, "  vibedb-shard prepare-node-group-rf3 -manifest <path>")

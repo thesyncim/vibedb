@@ -97,10 +97,10 @@ func openTransactionCompletion(
 	return completion, result
 }
 
-func transactionCompletionParticipantControl(
+func transactionCompletionTargetControl(
 	t testing.TB,
 	id distributedtxn.ID,
-	state distributedtxn.ParticipantState,
+	state distributedtxn.TargetState,
 	revision uint64,
 	affected bool,
 ) TransactionControl {
@@ -115,16 +115,16 @@ func transactionCompletionParticipantControl(
 	}
 	control.LastResultCode = ResultApplied
 	control.LastAppliedIndex = 50
-	if state == distributedtxn.ParticipantReleased {
+	if state == distributedtxn.TargetReleased {
 		control.ResidentMutationBytes = 0
 		control.ResidentIntentBytes = 0
-		control.LastOperation = distributedtxn.ReplicatedReleaseParticipant
+		control.LastOperation = distributedtxn.ReplicatedReleaseTarget
 		control.LastExpectedRevision = revision - 1
-	} else if state == distributedtxn.ParticipantApplied {
-		control.LastOperation = distributedtxn.ReplicatedApplyParticipant
+	} else if state == distributedtxn.TargetApplied {
+		control.LastOperation = distributedtxn.ReplicatedApplyTarget
 		control.LastExpectedRevision = 2
-	} else if state == distributedtxn.ParticipantAborted {
-		control.LastOperation = distributedtxn.ReplicatedAbortParticipant
+	} else if state == distributedtxn.TargetAborted {
+		control.LastOperation = distributedtxn.ReplicatedAbortTarget
 		control.LastExpectedRevision = revision - 1
 	}
 	return control
@@ -137,12 +137,12 @@ func TestTransactionCompletionExactHistoricalConflictAndUnknown(t *testing.T) {
 	}
 	id := transactionCodecID(140)
 	apply := transactionCompletionCommand(t, fixture.binding, distributedtxn.ReplicatedCommand{
-		Role:      distributedtxn.ReplicatedRoleParticipant,
-		Operation: distributedtxn.ReplicatedApplyParticipant, ID: id,
+		Role:      distributedtxn.ReplicatedRoleTarget,
+		Operation: distributedtxn.ReplicatedApplyTarget, ID: id,
 		ExpectedRevision: 2, PayloadKind: distributedtxn.ReplicatedPayloadNone,
 	}, nil)
-	control := transactionCompletionParticipantControl(
-		t, id, distributedtxn.ParticipantApplied, 3, true,
+	control := transactionCompletionTargetControl(
+		t, id, distributedtxn.TargetApplied, 3, true,
 	)
 	view, err := replication.OpenCommand(apply)
 	if err != nil {
@@ -154,12 +154,12 @@ func TestTransactionCompletionExactHistoricalConflictAndUnknown(t *testing.T) {
 	completion, result := openTransactionCompletion(t, fixture.machine, apply)
 	if completion.ResultCode != ResultApplied || !result.AffectedRowsValid ||
 		result.AffectedRows != 7 || result.Revision != 3 ||
-		result.Operation != distributedtxn.ReplicatedApplyParticipant {
+		result.Operation != distributedtxn.ReplicatedApplyTarget {
 		t.Fatalf("exact completion=%+v result=%+v", completion, result)
 	}
 	prepare := transactionCompletionCommand(t, fixture.binding, distributedtxn.ReplicatedCommand{
-		Role:      distributedtxn.ReplicatedRoleParticipant,
-		Operation: distributedtxn.ReplicatedPrepareParticipant, ID: id,
+		Role:      distributedtxn.ReplicatedRoleTarget,
+		Operation: distributedtxn.ReplicatedPrepareTarget, ID: id,
 		ExpectedRevision: 1, PayloadKind: distributedtxn.ReplicatedPayloadNone,
 	}, nil)
 	completion, result = openTransactionCompletion(t, fixture.machine, prepare)
@@ -168,8 +168,8 @@ func TestTransactionCompletionExactHistoricalConflictAndUnknown(t *testing.T) {
 		t.Fatalf("historical completion=%+v result=%+v", completion, result)
 	}
 	abort := transactionCompletionCommand(t, fixture.binding, distributedtxn.ReplicatedCommand{
-		Role:      distributedtxn.ReplicatedRoleParticipant,
-		Operation: distributedtxn.ReplicatedAbortParticipant, ID: id,
+		Role:      distributedtxn.ReplicatedRoleTarget,
+		Operation: distributedtxn.ReplicatedAbortTarget, ID: id,
 		ExpectedRevision: 2, PayloadKind: distributedtxn.ReplicatedPayloadNone,
 	}, nil)
 	completion, result = openTransactionCompletion(t, fixture.machine, abort)
@@ -177,16 +177,16 @@ func TestTransactionCompletionExactHistoricalConflictAndUnknown(t *testing.T) {
 		t.Fatalf("conflict completion=%+v result=%+v", completion, result)
 	}
 	release := transactionCompletionCommand(t, fixture.binding, distributedtxn.ReplicatedCommand{
-		Role:      distributedtxn.ReplicatedRoleParticipant,
-		Operation: distributedtxn.ReplicatedReleaseParticipant, ID: id,
+		Role:      distributedtxn.ReplicatedRoleTarget,
+		Operation: distributedtxn.ReplicatedReleaseTarget, ID: id,
 		ExpectedRevision: 3, PayloadKind: distributedtxn.ReplicatedPayloadNone,
 	}, nil)
 	if _, err := fixture.machine.LookupCompletion(release); !errors.Is(err, ErrCompletionNotFound) {
 		t.Fatalf("future completion err=%v", err)
 	}
 	missing := transactionCompletionCommand(t, fixture.binding, distributedtxn.ReplicatedCommand{
-		Role:      distributedtxn.ReplicatedRoleParticipant,
-		Operation: distributedtxn.ReplicatedPrepareParticipant, ID: transactionCodecID(180),
+		Role:      distributedtxn.ReplicatedRoleTarget,
+		Operation: distributedtxn.ReplicatedPrepareTarget, ID: transactionCodecID(180),
 		ExpectedRevision: 1, PayloadKind: distributedtxn.ReplicatedPayloadNone,
 	}, nil)
 	if _, err := fixture.machine.LookupCompletion(missing); !errors.Is(err, ErrCompletionNotFound) {
@@ -196,8 +196,8 @@ func TestTransactionCompletionExactHistoricalConflictAndUnknown(t *testing.T) {
 	staleBinding := fixture.binding
 	staleBinding.RouteGeneration++
 	staleMissing := transactionCompletionCommand(t, staleBinding, distributedtxn.ReplicatedCommand{
-		Role:      distributedtxn.ReplicatedRoleParticipant,
-		Operation: distributedtxn.ReplicatedPrepareParticipant, ID: transactionCodecID(181),
+		Role:      distributedtxn.ReplicatedRoleTarget,
+		Operation: distributedtxn.ReplicatedPrepareTarget, ID: transactionCodecID(181),
 		ExpectedRevision: 1, PayloadKind: distributedtxn.ReplicatedPayloadNone,
 	}, nil)
 	completion, result = openTransactionCompletion(t, fixture.machine, staleMissing)
@@ -206,8 +206,8 @@ func TestTransactionCompletionExactHistoricalConflictAndUnknown(t *testing.T) {
 		t.Fatalf("missing stale completion=%+v result=%+v", completion, result)
 	}
 	staleUnknown := transactionCompletionCommand(t, staleBinding, distributedtxn.ReplicatedCommand{
-		Role:      distributedtxn.ReplicatedRoleParticipant,
-		Operation: distributedtxn.ReplicatedReleaseParticipant, ID: id,
+		Role:      distributedtxn.ReplicatedRoleTarget,
+		Operation: distributedtxn.ReplicatedReleaseTarget, ID: id,
 		ExpectedRevision: 3, PayloadKind: distributedtxn.ReplicatedPayloadNone,
 	}, nil)
 	completion, result = openTransactionCompletion(t, fixture.machine, staleUnknown)
@@ -217,8 +217,8 @@ func TestTransactionCompletionExactHistoricalConflictAndUnknown(t *testing.T) {
 		t.Fatalf("known stale completion=%+v result=%+v", completion, result)
 	}
 	staleExact := transactionCompletionCommand(t, staleBinding, distributedtxn.ReplicatedCommand{
-		Role:      distributedtxn.ReplicatedRoleParticipant,
-		Operation: distributedtxn.ReplicatedPrepareParticipant, ID: id,
+		Role:      distributedtxn.ReplicatedRoleTarget,
+		Operation: distributedtxn.ReplicatedPrepareTarget, ID: id,
 		ExpectedRevision: 1, PayloadKind: distributedtxn.ReplicatedPayloadNone,
 	}, nil)
 	completion, _ = openTransactionCompletion(t, fixture.machine, staleExact)
@@ -237,18 +237,18 @@ func TestTransactionCompletionReleasedOutcomeAndCreationRetention(t *testing.T) 
 	}{
 		{
 			name: "applied", revision: 4, affected: true,
-			exact:    distributedtxn.ReplicatedCommand{Operation: distributedtxn.ReplicatedApplyParticipant, ExpectedRevision: 2},
-			conflict: distributedtxn.ReplicatedCommand{Operation: distributedtxn.ReplicatedAbortParticipant, ExpectedRevision: 2},
+			exact:    distributedtxn.ReplicatedCommand{Operation: distributedtxn.ReplicatedApplyTarget, ExpectedRevision: 2},
+			conflict: distributedtxn.ReplicatedCommand{Operation: distributedtxn.ReplicatedAbortTarget, ExpectedRevision: 2},
 		},
 		{
 			name: "direct_abort", revision: 3,
-			exact:    distributedtxn.ReplicatedCommand{Operation: distributedtxn.ReplicatedAbortParticipant, ExpectedRevision: 1},
-			conflict: distributedtxn.ReplicatedCommand{Operation: distributedtxn.ReplicatedPrepareParticipant, ExpectedRevision: 1},
+			exact:    distributedtxn.ReplicatedCommand{Operation: distributedtxn.ReplicatedAbortTarget, ExpectedRevision: 1},
+			conflict: distributedtxn.ReplicatedCommand{Operation: distributedtxn.ReplicatedPrepareTarget, ExpectedRevision: 1},
 		},
 		{
 			name: "prepared_abort", revision: 4,
-			exact:    distributedtxn.ReplicatedCommand{Operation: distributedtxn.ReplicatedPrepareParticipant, ExpectedRevision: 1},
-			conflict: distributedtxn.ReplicatedCommand{Operation: distributedtxn.ReplicatedApplyParticipant, ExpectedRevision: 2},
+			exact:    distributedtxn.ReplicatedCommand{Operation: distributedtxn.ReplicatedPrepareTarget, ExpectedRevision: 1},
+			conflict: distributedtxn.ReplicatedCommand{Operation: distributedtxn.ReplicatedApplyTarget, ExpectedRevision: 2},
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -257,12 +257,12 @@ func TestTransactionCompletionReleasedOutcomeAndCreationRetention(t *testing.T) 
 				t.Fatal(err)
 			}
 			id := transactionCodecID(byte(190 + test.revision))
-			control := transactionCompletionParticipantControl(
-				t, id, distributedtxn.ParticipantReleased, test.revision, test.affected,
+			control := transactionCompletionTargetControl(
+				t, id, distributedtxn.TargetReleased, test.revision, test.affected,
 			)
 			putTransactionCompletionControl(t, fixture, control)
 			for _, candidate := range []*distributedtxn.ReplicatedCommand{&test.exact, &test.conflict} {
-				candidate.Role = distributedtxn.ReplicatedRoleParticipant
+				candidate.Role = distributedtxn.ReplicatedRoleTarget
 				candidate.ID = id
 				candidate.PayloadKind = distributedtxn.ReplicatedPayloadNone
 			}
@@ -280,7 +280,7 @@ func TestTransactionCompletionReleasedOutcomeAndCreationRetention(t *testing.T) 
 	}
 }
 
-func TestTransactionCompletionParticipantStageSurvivesRelease(t *testing.T) {
+func TestTransactionCompletionTargetStageSurvivesRelease(t *testing.T) {
 	fixture := newMachineFixture(t)
 	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
 		t.Fatal(err)
@@ -296,14 +296,14 @@ func TestTransactionCompletionParticipantStageSurvivesRelease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	control := transactionCompletionParticipantControl(
-		t, id, distributedtxn.ParticipantReleased, 4, true,
+	control := transactionCompletionTargetControl(
+		t, id, distributedtxn.TargetReleased, 4, true,
 	)
 	stage := distributedtxn.ReplicatedCommand{
-		Role:      distributedtxn.ReplicatedRoleParticipant,
-		Operation: distributedtxn.ReplicatedStageParticipant, ID: id,
-		PayloadKind: distributedtxn.ReplicatedPayloadParticipantStage,
-		Participant: distributedtxn.ParticipantStage{
+		Role:      distributedtxn.ReplicatedRoleTarget,
+		Operation: distributedtxn.ReplicatedStageTarget, ID: id,
+		PayloadKind: distributedtxn.ReplicatedPayloadTargetStage,
+		Target: distributedtxn.TransactionTargetStage{
 			CoordinatorGroup:            distributedtxn.ID(control.CoordinatorGroup),
 			CoordinatorShardIncarnation: distributedtxn.ID(control.CoordinatorShardIncarnation),
 			CoordinatorAllocation:       control.CoordinatorAllocation,
@@ -334,7 +334,7 @@ func TestTransactionCompletionParticipantStageSurvivesRelease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	stage.Participant.MutationDigest = otherDigest
+	stage.Target.MutationDigest = otherDigest
 	conflict := transactionCompletionCommand(t, fixture.binding, stage, otherBatches)
 	completion, _ = openTransactionCompletion(t, fixture.machine, conflict)
 	if completion.ResultCode != ResultTransactionConflict {
@@ -421,8 +421,8 @@ func transactionCompletionManifestPage(t testing.TB) distributedtxn.ManifestSegm
 		t.Fatal("manifest page transform is not canonical")
 	}
 	return distributedtxn.ManifestSegment{
-		Index: meta.Index, FirstParticipant: meta.FirstParticipant,
-		ParticipantCount: meta.ParticipantCount, Digest: meta.Digest, Raw: raw,
+		Index: meta.Index, FirstTarget: meta.FirstTarget,
+		TargetCount: meta.TargetCount, Digest: meta.Digest, Raw: raw,
 	}
 }
 
@@ -460,7 +460,7 @@ func TestTransactionCompletionManifestPageWitnessAndCorruption(t *testing.T) {
 		LastResultCode:              ResultApplied,
 		LastAppliedIndex:            80,
 		ManifestNextPage:            2,
-		ManifestNextParticipant:     2,
+		ManifestNextTarget:          2,
 		ManifestEncodedBytes:        uint64(len(page.Raw) * 2),
 		ManifestChainDigest:         transactionCodecDigest(88),
 	}
@@ -520,12 +520,12 @@ func TestTransactionCompletionWorkspaceIsAllocationFreeAndBounded(t *testing.T) 
 	}
 	id := transactionCodecID(230)
 	command := transactionCompletionCommand(t, fixture.binding, distributedtxn.ReplicatedCommand{
-		Role:      distributedtxn.ReplicatedRoleParticipant,
-		Operation: distributedtxn.ReplicatedApplyParticipant, ID: id,
+		Role:      distributedtxn.ReplicatedRoleTarget,
+		Operation: distributedtxn.ReplicatedApplyTarget, ID: id,
 		ExpectedRevision: 2, PayloadKind: distributedtxn.ReplicatedPayloadNone,
 	}, nil)
-	control := transactionCompletionParticipantControl(
-		t, id, distributedtxn.ParticipantApplied, 3, true,
+	control := transactionCompletionTargetControl(
+		t, id, distributedtxn.TargetApplied, 3, true,
 	)
 	putTransactionCompletionControl(t, fixture, control)
 	short := make([]byte, 0, replication.MaxEmptyResultCompletionEnvelopeBytes)
@@ -566,18 +566,18 @@ func TestTransactionCompletionRetainsFailedPrepareWitness(t *testing.T) {
 	}
 	id := transactionCodecID(235)
 	command := transactionCompletionCommand(t, fixture.binding, distributedtxn.ReplicatedCommand{
-		Role:      distributedtxn.ReplicatedRoleParticipant,
-		Operation: distributedtxn.ReplicatedPrepareParticipant, ID: id,
+		Role:      distributedtxn.ReplicatedRoleTarget,
+		Operation: distributedtxn.ReplicatedPrepareTarget, ID: id,
 		ExpectedRevision: 1, PayloadKind: distributedtxn.ReplicatedPayloadNone,
 	}, nil)
 	view, err := replication.OpenCommand(command)
 	if err != nil {
 		t.Fatal(err)
 	}
-	control := transactionCompletionParticipantControl(
-		t, id, distributedtxn.ParticipantStaged, 1, false,
+	control := transactionCompletionTargetControl(
+		t, id, distributedtxn.TargetStaged, 1, false,
 	)
-	control.LastOperation = distributedtxn.ReplicatedPrepareParticipant
+	control.LastOperation = distributedtxn.ReplicatedPrepareTarget
 	control.LastExpectedRevision = 1
 	control.LastCommandDigest = LogicalCommandDigest(view)
 	control.LastResultCode = ResultIndexConflict
@@ -586,7 +586,7 @@ func TestTransactionCompletionRetainsFailedPrepareWitness(t *testing.T) {
 	completion, result := openTransactionCompletion(t, fixture.machine, command)
 	if completion.ResultCode != ResultIndexConflict || result.Revision != 1 ||
 		result.AffectedRowsValid ||
-		result.Operation != distributedtxn.ReplicatedPrepareParticipant {
+		result.Operation != distributedtxn.ReplicatedPrepareTarget {
 		t.Fatalf("completion=%+v result=%+v", completion, result)
 	}
 	control.LastCommandDigest = transactionCodecCommandDigest(241)
@@ -599,8 +599,8 @@ func TestTransactionCompletionRetainsFailedPrepareWitness(t *testing.T) {
 
 func TestTransactionCompletionResultRejectsDamage(t *testing.T) {
 	raw := make([]byte, transactionCompletionResultBytes)
-	raw[0] = byte(distributedtxn.ReplicatedRoleParticipant)
-	raw[1] = byte(distributedtxn.ReplicatedApplyParticipant)
+	raw[0] = byte(distributedtxn.ReplicatedRoleTarget)
+	raw[1] = byte(distributedtxn.ReplicatedApplyTarget)
 	raw[2] = transactionCompletionAffectedRows | transactionCompletionControlRevision
 	binary.LittleEndian.PutUint64(raw[8:16], 3)
 	binary.LittleEndian.PutUint64(raw[16:24], 7)
@@ -611,7 +611,7 @@ func TestTransactionCompletionResultRejectsDamage(t *testing.T) {
 		func(candidate []byte) { candidate[3] = 1 },
 		func(candidate []byte) { candidate[4] = 1 },
 		func(candidate []byte) { candidate[2] = 2 },
-		func(candidate []byte) { candidate[1] = byte(distributedtxn.ReplicatedPrepareParticipant) },
+		func(candidate []byte) { candidate[1] = byte(distributedtxn.ReplicatedPrepareTarget) },
 		func(candidate []byte) { binary.LittleEndian.PutUint64(candidate[8:16], 0) },
 	} {
 		candidate := bytes.Clone(raw)
@@ -621,14 +621,14 @@ func TestTransactionCompletionResultRejectsDamage(t *testing.T) {
 		}
 	}
 	prepare := make([]byte, transactionCompletionResultBytes)
-	prepare[0] = byte(distributedtxn.ReplicatedRoleParticipant)
-	prepare[1] = byte(distributedtxn.ReplicatedPrepareParticipant)
+	prepare[0] = byte(distributedtxn.ReplicatedRoleTarget)
+	prepare[1] = byte(distributedtxn.ReplicatedPrepareTarget)
 	prepare[2] = transactionCompletionControlRevision
 	binary.LittleEndian.PutUint64(prepare[8:16], 1)
 	if _, err := OpenTransactionCompletionResult(ResultIndexConflict, prepare); err != nil {
 		t.Fatal(err)
 	}
-	prepare[1] = byte(distributedtxn.ReplicatedAbortParticipant)
+	prepare[1] = byte(distributedtxn.ReplicatedAbortTarget)
 	if _, err := OpenTransactionCompletionResult(ResultIndexConflict, prepare); !errors.Is(err, ErrCompletionCorrupt) {
 		t.Fatalf("non-prepare index conflict err=%v", err)
 	}

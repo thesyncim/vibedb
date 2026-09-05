@@ -15,6 +15,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/exchange"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	"github.com/thesyncim/vibedb/internal/replication"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 )
 
@@ -51,6 +52,10 @@ const (
 	authorityMarker         = 0xe2
 	parameterTypesMarker    = 0xe3
 	mutationImageMarker     = 0xe4
+	// primaryKeyReadExtendedMarker adds the relation and catalog-frozen
+	// document bound. Keep primaryKeyReadMarker on its original grammar so
+	// zero-bound candidate requests remain byte-for-byte compatible.
+	primaryKeyReadExtendedMarker = 0xe5
 )
 
 // Limits. Each bounds an allocation a peer would otherwise size. The frame body
@@ -529,11 +534,11 @@ func validateTransactionRequest(tx *TransactionRequest, cacheDecodedMeta bool) e
 		}
 		var err error
 		if tx.Operation == TransactionStageCoordinator {
-			var participants [distributedtxn.MaxInlineParticipants]distributedtxn.ParticipantRef
-			_, err = distributedtxn.OpenCoordinatorInto(tx.Record, participants[:])
+			var targets [distributedtxn.MaxInlineTargets]distributedtxn.TransactionTargetRef
+			_, err = distributedtxn.OpenCoordinatorInto(tx.Record, targets[:])
 		} else {
 			var scopes [distributedtxn.MaxIntentScopes]distributedtxn.IntentScope
-			_, err = distributedtxn.OpenParticipantInto(tx.Record, scopes[:])
+			_, err = distributedtxn.OpenTargetInto(tx.Record, scopes[:])
 		}
 		if err != nil {
 			return errors.Join(errBadTransaction, err)
@@ -588,7 +593,7 @@ func validateTransactionRequest(tx *TransactionRequest, cacheDecodedMeta bool) e
 		return errBadTransaction
 	}
 	lookup := tx.Operation == TransactionLookupCoordinator ||
-		tx.Operation == TransactionLookupParticipant || tx.Operation == TransactionReadParticipant
+		tx.Operation == TransactionLookupTarget || tx.Operation == TransactionReadTarget
 	if (lookup && tx.Revision != 0) || (!lookup && tx.Revision == 0) {
 		return errBadTransaction
 	}
@@ -600,7 +605,7 @@ func validateTransactionReply(tx TransactionReply) error {
 		if !tx.ID.IsZero() || tx.Revision != 0 ||
 			tx.RecoveryPulse != 0 ||
 			tx.CoordinatorState != distributedtxn.CoordinatorInvalid ||
-			tx.ParticipantState != distributedtxn.ParticipantInvalid ||
+			tx.TargetState != distributedtxn.TargetInvalid ||
 			tx.RecordKind != TransactionRecordNone || tx.SegmentIndex != 0 || len(tx.Record) != 0 {
 			return errBadTransaction
 		}
@@ -613,7 +618,7 @@ func validateTransactionReply(tx TransactionReply) error {
 	case TransactionRoleCoordinator:
 		if tx.CoordinatorState < distributedtxn.CoordinatorStaging ||
 			tx.CoordinatorState > distributedtxn.CoordinatorRetired ||
-			tx.ParticipantState != distributedtxn.ParticipantInvalid {
+			tx.TargetState != distributedtxn.TargetInvalid {
 			return errBadTransaction
 		}
 		switch tx.RecordKind {
@@ -625,8 +630,8 @@ func validateTransactionReply(tx TransactionReply) error {
 			if tx.SegmentIndex != 0 || len(tx.Record) == 0 {
 				return errBadTransaction
 			}
-			var participants [distributedtxn.MaxInlineParticipants]distributedtxn.ParticipantRef
-			record, err := distributedtxn.OpenCoordinatorInto(tx.Record, participants[:])
+			var targets [distributedtxn.MaxInlineTargets]distributedtxn.TransactionTargetRef
+			record, err := distributedtxn.OpenCoordinatorInto(tx.Record, targets[:])
 			if err != nil || record.ID != tx.ID {
 				return errors.Join(errBadTransaction, err)
 			}
@@ -649,9 +654,9 @@ func validateTransactionReply(tx TransactionReply) error {
 		default:
 			return errBadTransaction
 		}
-	case TransactionRoleParticipant:
-		if tx.RecoveryPulse != 0 || tx.ParticipantState < distributedtxn.ParticipantStaged ||
-			tx.ParticipantState > distributedtxn.ParticipantReleased ||
+	case TransactionRoleTarget:
+		if tx.RecoveryPulse != 0 || tx.TargetState < distributedtxn.TargetStaged ||
+			tx.TargetState > distributedtxn.TargetReleased ||
 			tx.CoordinatorState != distributedtxn.CoordinatorInvalid {
 			return errBadTransaction
 		}
@@ -663,12 +668,12 @@ func validateTransactionReply(tx TransactionReply) error {
 			if len(tx.Record) != 0 {
 				return errBadTransaction
 			}
-		case TransactionRecordParticipant:
+		case TransactionRecordTarget:
 			if len(tx.Record) == 0 {
 				return errBadTransaction
 			}
 			var scopes [distributedtxn.MaxIntentScopes]distributedtxn.IntentScope
-			record, err := distributedtxn.OpenParticipantInto(tx.Record, scopes[:])
+			record, err := distributedtxn.OpenTargetInto(tx.Record, scopes[:])
 			if err != nil || record.ID != tx.ID {
 				return errors.Join(errBadTransaction, err)
 			}
@@ -683,13 +688,13 @@ func validateTransactionReply(tx TransactionReply) error {
 
 // openTransactionManifestSegment bounds all decoder scratch to one manifest
 // page. The segmented lane is cold recovery/control traffic; it never sizes an
-// allocation from an unauthenticated aggregate participant count.
+// allocation from an unauthenticated aggregate target count.
 type transactionManifestScratch struct {
-	participants [distributedtxn.MaxManifestPageParticipants]distributedtxn.ParticipantRef
+	targets [distributedtxn.MaxManifestPageTargets]distributedtxn.TransactionTargetRef
 	// Prefix compression can reconstruct two full 255-byte identities per
-	// participant from one 64 KiB page. This exact one-page maximum is a scratch
+	// target from one 64 KiB page. This exact one-page maximum is a scratch
 	// bound, never an aggregate transaction allocation.
-	identities [distributedtxn.MaxManifestPageParticipants * distributedtxn.MaxShardIdentityBytes * 2]byte
+	identities [distributedtxn.MaxManifestPageTargets * distributedtxn.MaxShardIdentityBytes * 2]byte
 }
 
 var transactionManifestScratchPool = sync.Pool{New: func() any {
@@ -709,7 +714,7 @@ func releaseTransactionManifestScratch(scratch *transactionManifestScratch) {
 func inspectTransactionManifestSegment(raw []byte) (transactionManifestSegmentMeta, error) {
 	scratch := borrowTransactionManifestScratch()
 	defer releaseTransactionManifestScratch(scratch)
-	page, err := distributedtxn.OpenManifestSegment(raw, scratch.participants[:], scratch.identities[:])
+	page, err := distributedtxn.OpenManifestSegment(raw, scratch.targets[:], scratch.identities[:])
 	if err != nil {
 		return transactionManifestSegmentMeta{}, err
 	}
@@ -726,7 +731,7 @@ func inspectTransactionManifestFirstSegment(
 	}
 	scratch := borrowTransactionManifestScratch()
 	defer releaseTransactionManifestScratch(scratch)
-	page, err := reader.OpenNext(raw, scratch.participants[:], scratch.identities[:])
+	page, err := reader.OpenNext(raw, scratch.targets[:], scratch.identities[:])
 	if err != nil {
 		return transactionManifestSegmentMeta{}, err
 	}
@@ -743,12 +748,12 @@ func inspectTransactionManifestFirstSegment(
 }
 
 func transactionManifestMeta(page distributedtxn.ManifestPage) transactionManifestSegmentMeta {
-	first := page.Participants[0]
+	first := page.Targets[0]
 	meta := transactionManifestSegmentMeta{
 		valid: true, index: page.Segment.Index,
-		firstParticipant: page.Segment.FirstParticipant,
-		participantCount: page.Segment.ParticipantCount,
-		distributionLen:  uint8(len(first.Distribution)), shardLen: uint8(len(first.Shard)),
+		firstTarget:     page.Segment.FirstTarget,
+		targetCount:     page.Segment.TargetCount,
+		distributionLen: uint8(len(first.Distribution)), shardLen: uint8(len(first.Shard)),
 		routingVersion: first.RoutingVersion, allocation: first.AllocationGeneration,
 		ownershipEpoch: first.OwnershipEpoch,
 	}
@@ -762,16 +767,16 @@ func manifestFirstPageWithinDescriptor(
 	rawBytes int,
 	descriptor distributedtxn.ManifestDescriptor,
 ) bool {
-	if !meta.valid || meta.index != 0 || meta.firstParticipant != 0 || rawBytes <= 0 ||
-		descriptor.SegmentCount == 0 || uint64(meta.participantCount) > descriptor.ParticipantCount ||
+	if !meta.valid || meta.index != 0 || meta.firstTarget != 0 || rawBytes <= 0 ||
+		descriptor.SegmentCount == 0 || uint64(meta.targetCount) > descriptor.TargetCount ||
 		uint64(rawBytes) > descriptor.EncodedBytes {
 		return false
 	}
 	if descriptor.SegmentCount == 1 {
-		return uint64(meta.participantCount) == descriptor.ParticipantCount &&
+		return uint64(meta.targetCount) == descriptor.TargetCount &&
 			uint64(rawBytes) == descriptor.EncodedBytes
 	}
-	return uint64(meta.participantCount) < descriptor.ParticipantCount &&
+	return uint64(meta.targetCount) < descriptor.TargetCount &&
 		uint64(rawBytes) < descriptor.EncodedBytes
 }
 
@@ -816,6 +821,357 @@ func validateRepartitionRequest(req *ShardRequest) error {
 		return errBadRepartition
 	}
 	return nil
+}
+
+// ValidateRequest validates the complete semantic request grammar without
+// serializing it. The replicated semantic dispatcher uses this entry point
+// for its local path so local execution observes the same bounds and field
+// exclusions as the authenticated wire path. It deliberately does not mutate
+// req or retain any of its borrowed buffers.
+func ValidateRequest(req *ShardRequest) error {
+	if req == nil {
+		return errors.New("shardservice: ValidateRequest requires a non-nil request")
+	}
+	if req.Deadline < 0 {
+		return errNegativeDuration
+	}
+	if !req.ReadPolicy.valid() {
+		return errBadEnum
+	}
+	if !req.ExecutionMode.valid() {
+		return errBadEnum
+	}
+	authorityPresent := req.Authority.Node != (rafttransport.NodeID{}) ||
+		req.Authority.Generation != 0
+	if authorityPresent && !req.Authority.Valid() {
+		return errBadPresence
+	}
+	if len(req.Params) > maxParams {
+		return errFieldTooLarge
+	}
+	if len(req.ParamTypes) != 0 &&
+		(req.SQL == "" || !validSQLParameterTypes(req.Params, req.ParamTypes)) {
+		return errBadParameterTypes
+	}
+	for i := range req.Params {
+		p := req.Params[i]
+		if !p.Kind.valid() {
+			return errBadEnum
+		}
+		if !p.Valid() {
+			return errBadParam
+		}
+	}
+	if err := validateTransactionRequest(&req.Transaction, false); err != nil {
+		return err
+	}
+	if err := validateExchangeRequest(req); err != nil {
+		return err
+	}
+	if err := validateRepartitionRequest(req); err != nil {
+		return err
+	}
+	if !req.GlobalIndexLookup.canonical() {
+		return errBadGlobalIndexLookup
+	}
+	globalIndexLookupBytes := uint64(4)
+	for i := range req.GlobalIndexLookup.KeyTuples {
+		globalIndexLookupBytes += uint64(4 + len(req.GlobalIndexLookup.KeyTuples[i]))
+		if globalIndexLookupBytes > maxFrameBody {
+			return errFieldTooLarge
+		}
+	}
+	if len(req.PrimaryKeyRead.Keys) > maxParams {
+		return errFieldTooLarge
+	}
+	if !req.PrimaryKeyRead.canonical() {
+		return errBadPrimaryKeyRead
+	}
+	if !req.DocumentScan.canonical() {
+		return errBadDocumentScan
+	}
+	if req.MutationCapture && req.MutationImageCapture {
+		return errBadMutationCapture
+	}
+	mutationCapture := req.mutationCapturePresent()
+	primaryReadBytes := uint64(1 + 4 + len(req.PrimaryKeyRead.PrimaryPath) + 4)
+	if req.PrimaryKeyRead.Relation != 0 || req.PrimaryKeyRead.MaxDocumentBytes != 0 {
+		primaryReadBytes += 1 + 4
+	}
+	for i := range req.PrimaryKeyRead.Keys {
+		primaryReadBytes += uint64(4 + len(req.PrimaryKeyRead.Keys[i]))
+		if primaryReadBytes > maxFrameBody {
+			return errFieldTooLarge
+		}
+	}
+	if !distributedtxn.ValidateIntentScopes(req.AccessScopes, req.BucketBits) {
+		return errBadTransaction
+	}
+	if req.Transaction.Operation != TransactionNone &&
+		(len(req.ParamTypes) != 0 || !req.ReadFenceID.IsZero() || req.GlobalIndexLookup.present() || req.PrimaryKeyRead.present() || mutationCapture || req.DocumentScan.present()) {
+		if req.GlobalIndexLookup.present() {
+			return errBadGlobalIndexLookup
+		}
+		return errBadTransaction
+	}
+	if req.GlobalIndexLookup.present() &&
+		(req.SQL != "" || len(req.Params) != 0 || req.PrimaryKeyRead.present() || mutationCapture || req.DocumentScan.present() || req.ExecutionMode != ExecutionReadOnly) {
+		return errBadGlobalIndexLookup
+	}
+	if req.PrimaryKeyRead.present() && (req.SQL == "" || mutationCapture || req.DocumentScan.present() || req.ExecutionMode != ExecutionReadOnly) {
+		return errBadPrimaryKeyRead
+	}
+	if mutationCapture && (req.SQL == "" || req.ExecutionMode != ExecutionReadOnly || req.DocumentScan.present() ||
+		!req.ReadFenceID.IsZero()) {
+		return errBadMutationCapture
+	}
+	if req.DocumentScan.present() && (req.SQL != "" || len(req.Params) != 0 ||
+		req.ExecutionMode != ExecutionReadOnly || !req.ReadFenceID.IsZero() ||
+		req.MaxRows == 0 || req.MaxResultBytes == 0 || mutationCapture) {
+		return errBadDocumentScan
+	}
+	if req.PartialAggregate && (req.SQL == "" || req.ExecutionMode != ExecutionReadOnly ||
+		mutationCapture || req.DocumentScan.present() || req.GlobalIndexLookup.present() ||
+		req.Transaction.Operation != TransactionNone) {
+		return errBadPartialAggregate
+	}
+	if !req.RowBatch.canonical() || (req.RowBatch.present() &&
+		(req.SQL == "" || req.ExecutionMode != ExecutionReadOnly || mutationCapture ||
+			req.DocumentScan.present() || req.GlobalIndexLookup.present() ||
+			req.Transaction.Operation != TransactionNone || req.MaxRows == 0 ||
+			req.MaxResultBytes == 0)) {
+		return errBadRowBatch
+	}
+	if req.HasMinPosition {
+		if err := req.MinPosition.Validate(); err != nil {
+			return err
+		}
+	} else if !req.MinPosition.IsZero() {
+		return errNonCanonicalPosition
+	}
+	if _, err := requestFrameBytes(req); err != nil {
+		return err
+	}
+	return nil
+}
+
+// RequestFrameBytes returns the exact encoded request size, including the
+// five-byte frame header, without materializing a frame. It shares the same
+// checked size grammar used by ValidateRequest and is intended for admission
+// reservations at semantic and remote transport boundaries.
+func RequestFrameBytes(req *ShardRequest) (int, error) {
+	if err := ValidateRequest(req); err != nil {
+		return 0, err
+	}
+	return requestFrameBytes(req)
+}
+
+func requestFrameBytes(req *ShardRequest) (int, error) {
+	if req == nil {
+		return 0, errBadParam
+	}
+	total := 1 // wire version
+	add := func(n int) error {
+		if n < 0 || n > maxFrameBody-total {
+			return errFrameTooLarge
+		}
+		total += n
+		return nil
+	}
+	addBytes := func(p []byte) error {
+		if len(p) > maxFrameBody {
+			return errFieldTooLarge
+		}
+		return add(4 + len(p))
+	}
+	addString := func(s string) error {
+		if len(s) > maxFrameBody {
+			return errFieldTooLarge
+		}
+		return add(4 + len(s))
+	}
+	for _, value := range []string{string(req.SQL), string(req.Distribution), string(req.Shard)} {
+		if err := addString(value); err != nil {
+			return 0, err
+		}
+	}
+	if err := add(8*3 + 1 + 1 + 8 + 8 + 8 + 4); err != nil {
+		return 0, err
+	}
+	for _, parameter := range req.Params {
+		if err := add(1); err != nil {
+			return 0, err
+		}
+		switch parameter.Kind {
+		case ParamBool:
+			if err := add(1); err != nil {
+				return 0, err
+			}
+		case ParamNumber, ParamString, ParamDocument:
+			if err := addBytes(parameter.Bytes); err != nil {
+				return 0, err
+			}
+		}
+	}
+	if req.HasMinPosition {
+		if err := add(1 + 1 + len(req.MinPosition.Distribution) + 1 + len(req.MinPosition.Shard) + 16 + 8); err != nil {
+			return 0, err
+		}
+	} else if err := add(1); err != nil {
+		return 0, err
+	}
+	if len(req.AccessScopes) != 0 {
+		if err := add(1 + 1 + 4 + 8*len(req.AccessScopes)); err != nil {
+			return 0, err
+		}
+	}
+	if !req.ReadFenceID.IsZero() {
+		if err := add(1 + 16); err != nil {
+			return 0, err
+		}
+	}
+	if req.GlobalIndexLookup.present() {
+		if err := add(1 + 8 + 8 + 4 + 1 + 1); err != nil {
+			return 0, err
+		}
+		if err := addBytes(req.GlobalIndexLookup.Relation); err != nil {
+			return 0, err
+		}
+		for _, tuple := range req.GlobalIndexLookup.KeyTuples {
+			if err := addBytes(tuple); err != nil {
+				return 0, err
+			}
+		}
+	}
+	if req.PrimaryKeyRead.present() {
+		primaryKeyReadBytes := 1 + 4
+		if req.PrimaryKeyRead.Relation != 0 || req.PrimaryKeyRead.MaxDocumentBytes != 0 {
+			primaryKeyReadBytes += 1 + 4
+		}
+		if err := add(primaryKeyReadBytes); err != nil {
+			return 0, err
+		}
+		if err := addBytes(req.PrimaryKeyRead.PrimaryPath); err != nil {
+			return 0, err
+		}
+		for _, key := range req.PrimaryKeyRead.Keys {
+			if err := addBytes(key); err != nil {
+				return 0, err
+			}
+		}
+	}
+	if req.MutationCapture {
+		if err := add(1); err != nil {
+			return 0, err
+		}
+	}
+	if req.DocumentScan.present() {
+		if err := add(1); err != nil {
+			return 0, err
+		}
+		if err := addBytes(req.DocumentScan.Relation); err != nil {
+			return 0, err
+		}
+		if err := addBytes(req.DocumentScan.After); err != nil {
+			return 0, err
+		}
+	}
+	if req.PartialAggregate {
+		if err := add(1); err != nil {
+			return 0, err
+		}
+	}
+	if req.RowBatch.present() {
+		if err := add(1 + 4 + 4); err != nil {
+			return 0, err
+		}
+	}
+	if req.Repartition.present() {
+		if err := add(1 + repartitionRequestBytes(req.Repartition)); err != nil {
+			return 0, err
+		}
+	}
+	if req.Exchange.present() {
+		if err := add(1 + exchangeRequestBytes(req.Exchange)); err != nil {
+			return 0, err
+		}
+	}
+	if req.Transaction.Operation != TransactionNone {
+		if err := add(1 + transactionRequestBytes(req.Transaction)); err != nil {
+			return 0, err
+		}
+	}
+	if req.Authority.Valid() {
+		if err := add(1 + 16 + 8); err != nil {
+			return 0, err
+		}
+	}
+	if len(req.ParamTypes) != 0 {
+		if err := add(1 + 4 + len(req.ParamTypes)); err != nil {
+			return 0, err
+		}
+	}
+	if req.MutationImageCapture {
+		if err := add(1); err != nil {
+			return 0, err
+		}
+	}
+	return total + 5, nil // tag and four-byte length are included in the frame header
+}
+
+func repartitionRequestBytes(request RepartitionRequest) int {
+	// fixed operation plus stage, attempt, producer, key/target counts and
+	// block rows/bytes, followed by the memory ceiling.
+	total := 16 + 4*7 + 8
+	for _, column := range request.KeyColumns {
+		_ = column
+		total += 4
+	}
+	for _, target := range request.Targets {
+		total += 4 + len(target.Address) + 4 + len(target.Distribution) +
+			4 + len(target.Shard) + 8*3
+	}
+	return total
+}
+
+func exchangeRequestBytes(request ExchangeRequest) int {
+	total := 1 + 16 + 4 + 4 + 4
+	switch request.Operation {
+	case ExchangeOpen:
+		total += 4*3 + 8*4
+	case ExchangePush:
+		// producer, sequence, rows, final marker, and the length-prefixed
+		// mailbox bytes.
+		total += 4 + 4 + 4 + 1 + 4 + len(request.Batch.Data)
+	case ExchangePull:
+		total++
+		if request.HasAck {
+			total += 4 + 4
+		}
+	case ExchangeReduce:
+		total += 16 + 4*3 + 4 + len(request.Kinds) + 4 + 4*len(request.GroupKeys) + 8 + 4 + 4
+	}
+	return total
+}
+
+func transactionRequestBytes(request TransactionRequest) int {
+	total := 1
+	switch {
+	case request.Operation.stages():
+		total += 4 + len(request.Record)
+	case request.Operation.stagesManifestCoordinator():
+		total += 4 + len(request.Record) + 4 + len(request.ManifestSegment)
+	case request.Operation.stagesManifestSegment():
+		total += 16 + 4 + len(request.ManifestSegment)
+	case request.Operation.readsManifestSegment():
+		total += 16 + 4
+	default:
+		total += 16 + 8
+		if request.Operation == TransactionPulseCoordinator {
+			total++
+		}
+	}
+	return total
 }
 
 func encodeRepartitionRequest(e *encbuf, request RepartitionRequest) {
@@ -1156,7 +1512,7 @@ func encodeTransactionReply(e *encbuf, tx TransactionReply) {
 	if tx.Role == TransactionRoleCoordinator {
 		e.u8(uint8(tx.CoordinatorState))
 	} else {
-		e.u8(uint8(tx.ParticipantState))
+		e.u8(uint8(tx.TargetState))
 	}
 	e.u8(uint8(tx.RecordKind))
 	e.u32(tx.SegmentIndex)
@@ -1174,8 +1530,8 @@ func decodeTransactionReply(d *deccur) (TransactionReply, error) {
 	state := d.u8()
 	if tx.Role == TransactionRoleCoordinator {
 		tx.CoordinatorState = distributedtxn.CoordinatorState(state)
-	} else if tx.Role == TransactionRoleParticipant {
-		tx.ParticipantState = distributedtxn.ParticipantState(state)
+	} else if tx.Role == TransactionRoleTarget {
+		tx.TargetState = distributedtxn.TargetState(state)
 	}
 	tx.RecordKind = TransactionRecordKind(d.u8())
 	tx.SegmentIndex = d.u32()
@@ -1192,106 +1548,8 @@ func decodeTransactionReply(d *deccur) (TransactionReply, error) {
 // EncodeRequest writes req as one framed message. It is deterministic: equal
 // requests encode to identical bytes.
 func EncodeRequest(w io.Writer, req *ShardRequest) error {
-	if req == nil {
-		return errors.New("shardservice: EncodeRequest requires a non-nil request")
-	}
-	if req.Deadline < 0 {
-		return errNegativeDuration
-	}
-	if !req.ReadPolicy.valid() {
-		return errBadEnum
-	}
-	if !req.ExecutionMode.valid() {
-		return errBadEnum
-	}
-	authorityPresent := req.Authority.Node != (rafttransport.NodeID{}) ||
-		req.Authority.Generation != 0
-	if authorityPresent && !req.Authority.Valid() {
-		return errBadPresence
-	}
-	if len(req.Params) > maxParams {
-		return errFieldTooLarge
-	}
-	if len(req.ParamTypes) != 0 &&
-		(req.SQL == "" || !validSQLParameterTypes(req.Params, req.ParamTypes)) {
-		return errBadParameterTypes
-	}
-	if err := validateTransactionRequest(&req.Transaction, false); err != nil {
+	if err := ValidateRequest(req); err != nil {
 		return err
-	}
-	if err := validateExchangeRequest(req); err != nil {
-		return err
-	}
-	if err := validateRepartitionRequest(req); err != nil {
-		return err
-	}
-	if !req.GlobalIndexLookup.canonical() {
-		return errBadGlobalIndexLookup
-	}
-	globalIndexLookupBytes := uint64(4)
-	for i := range req.GlobalIndexLookup.KeyTuples {
-		globalIndexLookupBytes += uint64(4 + len(req.GlobalIndexLookup.KeyTuples[i]))
-		if globalIndexLookupBytes > maxFrameBody {
-			return errFieldTooLarge
-		}
-	}
-	if len(req.PrimaryKeyRead.Keys) > maxParams {
-		return errFieldTooLarge
-	}
-	if !req.PrimaryKeyRead.canonical() {
-		return errBadPrimaryKeyRead
-	}
-	if !req.DocumentScan.canonical() {
-		return errBadDocumentScan
-	}
-	if req.MutationCapture && req.MutationImageCapture {
-		return errBadMutationCapture
-	}
-	mutationCapture := req.mutationCapturePresent()
-	primaryReadBytes := uint64(1 + 4 + len(req.PrimaryKeyRead.PrimaryPath) + 4)
-	for i := range req.PrimaryKeyRead.Keys {
-		primaryReadBytes += uint64(4 + len(req.PrimaryKeyRead.Keys[i]))
-		if primaryReadBytes > maxFrameBody {
-			return errFieldTooLarge
-		}
-	}
-	if !distributedtxn.ValidateIntentScopes(req.AccessScopes, req.BucketBits) {
-		return errBadTransaction
-	}
-	if req.Transaction.Operation != TransactionNone &&
-		(len(req.ParamTypes) != 0 || !req.ReadFenceID.IsZero() || req.GlobalIndexLookup.present() || req.PrimaryKeyRead.present() || mutationCapture || req.DocumentScan.present()) {
-		if req.GlobalIndexLookup.present() {
-			return errBadGlobalIndexLookup
-		}
-		return errBadTransaction
-	}
-	if req.GlobalIndexLookup.present() &&
-		(req.SQL != "" || len(req.Params) != 0 || req.PrimaryKeyRead.present() || mutationCapture || req.DocumentScan.present() || req.ExecutionMode != ExecutionReadOnly) {
-		return errBadGlobalIndexLookup
-	}
-	if req.PrimaryKeyRead.present() && (req.SQL == "" || mutationCapture || req.DocumentScan.present() || req.ExecutionMode != ExecutionReadOnly) {
-		return errBadPrimaryKeyRead
-	}
-	if mutationCapture && (req.SQL == "" || req.ExecutionMode != ExecutionReadOnly || req.DocumentScan.present() ||
-		!req.ReadFenceID.IsZero()) {
-		return errBadMutationCapture
-	}
-	if req.DocumentScan.present() && (req.SQL != "" || len(req.Params) != 0 ||
-		req.ExecutionMode != ExecutionReadOnly || !req.ReadFenceID.IsZero() ||
-		req.MaxRows == 0 || req.MaxResultBytes == 0 || mutationCapture) {
-		return errBadDocumentScan
-	}
-	if req.PartialAggregate && (req.SQL == "" || req.ExecutionMode != ExecutionReadOnly ||
-		mutationCapture || req.DocumentScan.present() || req.GlobalIndexLookup.present() ||
-		req.Transaction.Operation != TransactionNone) {
-		return errBadPartialAggregate
-	}
-	if !req.RowBatch.canonical() || (req.RowBatch.present() &&
-		(req.SQL == "" || req.ExecutionMode != ExecutionReadOnly || mutationCapture ||
-			req.DocumentScan.present() || req.GlobalIndexLookup.present() ||
-			req.Transaction.Operation != TransactionNone || req.MaxRows == 0 ||
-			req.MaxResultBytes == 0)) {
-		return errBadRowBatch
 	}
 
 	e := newFrameEncoder(len(req.Exchange.Batch.Data))
@@ -1310,12 +1568,6 @@ func EncodeRequest(w io.Writer, req *ShardRequest) error {
 	e.u32(uint32(len(req.Params)))
 	for i := range req.Params {
 		p := req.Params[i]
-		if !p.Kind.valid() {
-			return errBadEnum
-		}
-		if !p.Valid() {
-			return errBadParam
-		}
 		e.u8(uint8(p.Kind))
 		switch p.Kind {
 		case ParamBool:
@@ -1364,7 +1616,13 @@ func EncodeRequest(w io.Writer, req *ShardRequest) error {
 		}
 	}
 	if req.PrimaryKeyRead.present() {
-		e.u8(primaryKeyReadMarker)
+		if req.PrimaryKeyRead.Relation != 0 || req.PrimaryKeyRead.MaxDocumentBytes != 0 {
+			e.u8(primaryKeyReadExtendedMarker)
+			e.u8(uint8(req.PrimaryKeyRead.Relation))
+			e.u32(req.PrimaryKeyRead.MaxDocumentBytes)
+		} else {
+			e.u8(primaryKeyReadMarker)
+		}
 		e.bytes(req.PrimaryKeyRead.PrimaryPath)
 		e.u32(uint32(len(req.PrimaryKeyRead.Keys)))
 		for i := range req.PrimaryKeyRead.Keys {
@@ -1528,8 +1786,13 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 			return nil, errBadGlobalIndexLookup
 		}
 	}
-	if len(d.b) != 0 && d.b[0] == primaryKeyReadMarker {
+	if len(d.b) != 0 && (d.b[0] == primaryKeyReadMarker || d.b[0] == primaryKeyReadExtendedMarker) {
+		extended := d.b[0] == primaryKeyReadExtendedMarker
 		d.u8()
+		if extended {
+			req.PrimaryKeyRead.Relation = replication.RelationID(d.u8())
+			req.PrimaryKeyRead.MaxDocumentBytes = d.u32()
+		}
 		req.PrimaryKeyRead.PrimaryPath = d.slice()
 		count := d.count(4, maxParams)
 		if count != 0 {

@@ -20,8 +20,16 @@ import (
 // group. Existing query routes and execution lanes are unchanged.
 func validateRF3GroupAppend(current, next rf3Manifest) error {
 	old, all := current.groupBundles(), next.groupBundles()
-	if len(all) < len(old) || len(all) > maxRF3ManifestGroups || current.DevelopmentOnly || next.DevelopmentOnly {
+	if len(old) == 0 || len(all) < len(old) || len(all) > maxRF3ManifestGroups || current.DevelopmentOnly || next.DevelopmentOnly {
 		return errInvalidRF3Manifest
+	}
+	if err := validateRF3GroupRosterUnion(all); err != nil {
+		return err
+	}
+	if next.Gateway != nil {
+		if _, err := rf3EmbeddedGatewayPeers(next, next.Gateway.ShardPeers); err != nil {
+			return err
+		}
 	}
 	a, b := current.withGroup(old[0]), next.withGroup(all[0])
 	a.Digest, b.Digest = [32]byte{}, [32]byte{}
@@ -39,7 +47,7 @@ func validateRF3GroupAppend(current, next rf3Manifest) error {
 	paths := make(map[string]bool, 2*len(all))
 	for _, group := range all {
 		if groups[group.Route.Group] || paths[group.WAL.Path] || paths[group.SQL.Path] || group.WAL.Path == group.SQL.Path ||
-			group.EnrolledTarget != nil || group.Members != all[0].Members || group.MemberCount != all[0].MemberCount {
+			group.EnrolledTarget != nil {
 			return errInvalidRF3Manifest
 		}
 		groups[group.Route.Group], paths[group.WAL.Path], paths[group.SQL.Path] = true, true, true
@@ -52,6 +60,14 @@ func validateRF3GroupTransition(current, next rf3Manifest) error {
 	if len(old) == 0 || len(all) == 0 || len(all) > maxRF3ManifestGroups ||
 		current.DevelopmentOnly || next.DevelopmentOnly {
 		return errInvalidRF3Manifest
+	}
+	if err := validateRF3GroupRosterUnion(all); err != nil {
+		return err
+	}
+	if next.Gateway != nil {
+		if _, err := rf3EmbeddedGatewayPeers(next, next.Gateway.ShardPeers); err != nil {
+			return err
+		}
 	}
 	a, b := current.withGroup(old[0]), next.withGroup(all[0])
 	a.Digest, b.Digest = [32]byte{}, [32]byte{}
@@ -69,7 +85,7 @@ func validateRF3GroupTransition(current, next rf3Manifest) error {
 	paths := make(map[string]bool, 2*len(all))
 	for _, bundle := range all {
 		if groups[bundle.Route.Group] || paths[bundle.WAL.Path] || paths[bundle.SQL.Path] || bundle.WAL.Path == bundle.SQL.Path ||
-			bundle.EnrolledTarget != nil || bundle.Members != all[0].Members || bundle.MemberCount != all[0].MemberCount {
+			bundle.EnrolledTarget != nil {
 			return errInvalidRF3Manifest
 		}
 		groups[bundle.Route.Group], paths[bundle.WAL.Path], paths[bundle.SQL.Path] = true, true, true
@@ -85,6 +101,84 @@ func validateRF3GroupTransition(current, next rf3Manifest) error {
 	removed := len(old) - retained
 	if added != 0 && removed != 0 || removed != 0 && all[0].Route.Group != old[0].Route.Group {
 		return errInvalidRF3Manifest
+	}
+	// Group ordinals are durable child-admission authority. Additions must be
+	// a suffix; retained groups must preserve order during retirement too.
+	if removed == 0 {
+		for index := range old {
+			if old[index].Route.Group != all[index].Route.Group {
+				return fmt.Errorf("%w: reload reorders retained groups", errInvalidRF3Manifest)
+			}
+		}
+	} else {
+		index := 0
+		for _, previous := range old {
+			if index < len(all) && previous.Route.Group == all[index].Route.Group {
+				index++
+			}
+		}
+		if index != len(all) {
+			return fmt.Errorf("%w: reload reorders retained groups", errInvalidRF3Manifest)
+		}
+	}
+	return nil
+}
+
+// validateRF3GroupRosterUnion qualifies reloads for physical nodes whose
+// groups have different RF3 placements. Every group remains independently
+// three replica, while a NodeID/address pair has one stable spelling across
+// the complete hosted roster. The parser performs the same check for files;
+// keeping it here protects in-memory callers of the append validators too.
+func validateRF3GroupRosterUnion(groups []rf3ManifestGroup) error {
+	nodes := make(map[rafttransport.NodeID]string, len(groups)*rf3ManifestMembers)
+	addresses := make(map[string]rafttransport.NodeID, len(groups)*rf3ManifestMembers)
+	for _, group := range groups {
+		count := group.MemberCount
+		if count == 0 {
+			count = rf3ManifestMembers
+		}
+		if count != rf3ManifestMembers {
+			return errInvalidRF3Manifest
+		}
+		members := make(map[uint64]bool, count)
+		groupNodes := make(map[rafttransport.NodeID]bool, count)
+		for _, member := range group.Members[:count] {
+			if member.MemberID == 0 || member.NodeID == (rafttransport.NodeID{}) ||
+				validateRF3Address(member.PeerAddress, false) != nil || members[member.MemberID] || groupNodes[member.NodeID] {
+				return errInvalidRF3Manifest
+			}
+			members[member.MemberID], groupNodes[member.NodeID] = true, true
+			if prior, found := nodes[member.NodeID]; found && prior != member.PeerAddress {
+				return errInvalidRF3Manifest
+			}
+			if prior, found := addresses[member.PeerAddress]; found && prior != member.NodeID {
+				return errInvalidRF3Manifest
+			}
+			nodes[member.NodeID], addresses[member.PeerAddress] = member.PeerAddress, member.NodeID
+		}
+	}
+	return nil
+}
+
+// The running transport has a fixed queue and dial destination for each
+// startup peer. New groups may combine that roster differently, but a reload
+// cannot enroll a new physical peer merely by publishing its group files.
+func validateRF3ReloadTransportRoster(current, next rf3Manifest) error {
+	known := make(map[rafttransport.NodeID]string)
+	for _, bundle := range current.groupBundles() {
+		for _, member := range bundle.Members {
+			known[member.NodeID] = member.PeerAddress
+		}
+		if target := bundle.EnrolledTarget; target != nil {
+			known[target.NodeID] = target.PeerAddress
+		}
+	}
+	for _, bundle := range next.groupBundles() {
+		for _, member := range bundle.Members {
+			if address, present := known[member.NodeID]; !present || address != member.PeerAddress {
+				return fmt.Errorf("%w: reload requires a peer outside the running transport roster", errInvalidRF3Manifest)
+			}
+		}
 	}
 	return nil
 }
@@ -110,6 +204,9 @@ func reloadPreparedRF3Groups(ctx context.Context, current *rf3Manifest, profile 
 		return err
 	}
 	if err := validateRF3GroupTransition(*current, next); err != nil {
+		return err
+	}
+	if err := validateRF3ReloadTransportRoster(*current, next); err != nil {
 		return err
 	}
 	// The configuration is the recovery inventory for these groups. Fence it

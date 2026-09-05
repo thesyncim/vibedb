@@ -13,8 +13,9 @@ import (
 // canonical storage bytes. The complete SQL predicate is still evaluated by
 // query after the seek.
 type primaryRangeProgram struct {
-	path  string
-	terms []primaryRangeTerm
+	path            string
+	terms           []primaryRangeTerm
+	coversPredicate bool
 }
 
 type primaryRangeTerm struct {
@@ -41,25 +42,26 @@ func compilePrimaryRangeProgram(
 		return nil
 	}
 	program := &primaryRangeProgram{path: primaryPath}
-	var collect func(*sqlast.Expr)
-	collect = func(expr *sqlast.Expr) {
+	var collect func(*sqlast.Expr) bool
+	collect = func(expr *sqlast.Expr) bool {
 		if expr == nil {
-			return
+			return false
 		}
 		if expr.Kind == sqlast.ExprAnd {
+			covered := len(expr.Kids) != 0
 			for i := range expr.Kids {
-				collect(expr.Kids[i])
+				covered = collect(expr.Kids[i]) && covered
 			}
-			return
+			return covered
 		}
 		if expr.Path == nil || expr.Agg != sqlast.AggNone ||
 			string(expr.Path.AppendPointer(nil)) != primaryPath {
-			return
+			return false
 		}
 		switch expr.Kind {
 		case sqlast.ExprCompare:
 			if expr.Subquery != nil || expr.RightPath != nil {
-				return
+				return false
 			}
 			term := primaryRangeTerm{operand: expr.Value}
 			switch expr.Op {
@@ -71,20 +73,23 @@ func compilePrimaryRangeProgram(
 			case sqlast.OpLe:
 				term.inclusive = true
 			default:
-				return
+				return false
 			}
 			program.terms = append(program.terms, term)
+			return true
 		case sqlast.ExprBetween:
 			if expr.Negated || len(expr.List) != 2 {
-				return
+				return false
 			}
 			program.terms = append(program.terms,
 				primaryRangeTerm{operand: expr.List[0], lower: true, inclusive: true},
 				primaryRangeTerm{operand: expr.List[1], inclusive: true},
 			)
+			return true
 		}
+		return false
 	}
-	collect(where)
+	program.coversPredicate = collect(where)
 	if len(program.terms) == 0 {
 		return nil
 	}

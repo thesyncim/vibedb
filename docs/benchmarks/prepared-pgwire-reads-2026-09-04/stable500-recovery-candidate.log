@@ -1,0 +1,5 @@
+cluster dev: catalog shard member 3 exited before cluster readiness
+exit status 1
+last child output (at most 65536 bytes):
+error serve RF3: seglog: bounds exceeded
+

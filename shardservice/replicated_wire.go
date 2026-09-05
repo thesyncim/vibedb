@@ -1,6 +1,7 @@
 package shardservice
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
@@ -65,6 +66,29 @@ const (
 
 var ErrReplicatedWire = errors.New("shardservice: invalid replicated native frame")
 
+// DecodeReplicatedSQLRequest validates the complete nested frame length against
+// its admitted outer payload before the general SQL decoder allocates a body.
+func DecodeReplicatedSQLRequest(frame []byte) (*ShardRequest, error) {
+	if !validReplicatedSQLFrame(frame, tagRequest, MaxReplicatedSQLRequestBytes) {
+		return nil, ErrReplicatedWire
+	}
+	return DecodeRequest(bytes.NewReader(frame))
+}
+
+// DecodeReplicatedSQLResponse bounds nested SQL result allocation by the exact
+// authenticated native payload, rather than trusting a second length prefix.
+func DecodeReplicatedSQLResponse(frame []byte) (*ShardResponse, error) {
+	if !validReplicatedSQLFrame(frame, tagResponse, MaxReplicatedSQLResultBytes) {
+		return nil, ErrReplicatedWire
+	}
+	return DecodeResponse(bytes.NewReader(frame))
+}
+
+func validReplicatedSQLFrame(frame []byte, tag byte, limit int) bool {
+	return len(frame) >= 5 && len(frame) <= limit && frame[0] == tag &&
+		binary.BigEndian.Uint32(frame[1:5]) == uint32(len(frame)-1)
+}
+
 // ReplicatedOperation is the closed byte-native serving operation set. Writes
 // remain canonical commands; SQL queries execute only on quorum-fenced cuts.
 type ReplicatedOperation uint8
@@ -91,7 +115,7 @@ type ReplicatedTransactionReadKind uint8
 
 const (
 	ReplicatedTransactionLookupCoordinator ReplicatedTransactionReadKind = iota + 1
-	ReplicatedTransactionLookupParticipant
+	ReplicatedTransactionLookupTarget
 	ReplicatedTransactionReadManifestPage
 	ReplicatedTransactionScanCoordinators
 )
@@ -243,6 +267,10 @@ type ReplicatedResponse struct {
 	ReadApplied   uint64
 	Value         []byte
 	readLease     interface{ Release() }
+	// sqlResult is populated only for an in-process semantic query. It is kept
+	// out of the wire grammar; remote callers receive Value encoded by the
+	// authenticated adapter instead.
+	sqlResult *ShardResponse
 }
 
 // EncodeReplicatedRequest emits one canonical native request frame.
@@ -304,6 +332,97 @@ func EncodeReplicatedRequest(w io.Writer, request *ReplicatedRequest) error {
 		tag = tagReplicatedExecutionPinRead
 	}
 	return writeEncodedFrame(w, tag, e.b)
+}
+
+// ReplicatedRequestFrameBytes returns the exact encoded native request size,
+// including its five-byte frame header, without allocating a frame. Semantic
+// local dispatch uses this for the same aggregate byte admission charged by a
+// remote request.
+func ReplicatedRequestFrameBytes(request *ReplicatedRequest) (int, error) {
+	if !validReplicatedRequest(request) {
+		return 0, ErrReplicatedWire
+	}
+	total := 242 // common prefix through the complete ServingFence
+	add := func(n int) error {
+		if n < 0 || n > maxFrameBody-total {
+			return errFrameTooLarge
+		}
+		total += n
+		return nil
+	}
+	addBytes := func(value []byte) error {
+		return add(4 + len(value))
+	}
+	switch request.Operation {
+	case ReplicatedPropose:
+		if err := addBytes(request.Command); err != nil {
+			return 0, err
+		}
+	case ReplicatedMembership:
+		if err := add(4 + len(request.Command) + 65); err != nil {
+			return 0, err
+		}
+	case ReplicatedReadLeader, ReplicatedReadFollower:
+		if err := add(1 + 8 + 4); err != nil {
+			return 0, err
+		}
+		if err := addBytes(request.Key); err != nil {
+			return 0, err
+		}
+	case ReplicatedReadBatchLeader:
+		if err := add(8 + 4); err != nil {
+			return 0, err
+		}
+		if err := addBytes(request.BatchRead); err != nil {
+			return 0, err
+		}
+	case ReplicatedQueryLeader:
+		if err := add(4); err != nil {
+			return 0, err
+		}
+		if err := addBytes(request.Query); err != nil {
+			return 0, err
+		}
+	case ReplicatedTransactionRead:
+		if err := add(1 + 16 + 8 + 4 + 2 + 4); err != nil {
+			return 0, err
+		}
+	case ReplicatedRequestLedgerRead:
+		if err := add(174); err != nil {
+			return 0, err
+		}
+	case ReplicatedExecutionPinRead:
+		if err := add(32 + 8); err != nil {
+			return 0, err
+		}
+	case ReplicatedRouteGateRead:
+		if err := add(8); err != nil {
+			return 0, err
+		}
+	}
+	return total + 5, nil
+}
+
+// ValidateReplicatedRequest exposes the exact native request grammar to
+// transport-neutral callers without exposing the wire encoder's internals.
+func ValidateReplicatedRequest(request *ReplicatedRequest) error {
+	if !validReplicatedRequest(request) {
+		return ErrReplicatedWire
+	}
+	if _, err := ReplicatedRequestFrameBytes(request); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ValidateReplicatedResponse exposes the same canonical response checks used
+// by DecodeReplicatedResponse. A response with a retained read lease remains
+// valid; ownership is released only by the corresponding reply lease.
+func ValidateReplicatedResponse(response *ReplicatedResponse) error {
+	if !validReplicatedResponse(response) {
+		return ErrReplicatedWire
+	}
+	return nil
 }
 
 // EncodeReplicatedRequestBorrowed emits the fixed request prefix and borrows
@@ -628,6 +747,17 @@ func readReplicatedRequestFrame(
 func EncodeReplicatedResponse(w io.Writer, response *ReplicatedResponse) error {
 	if w == nil || !validReplicatedResponse(response) {
 		return ErrReplicatedWire
+	}
+	if response.sqlResult != nil {
+		// This is the only response encoding boundary. The caller retains the
+		// reply lease through both encodings, including a slow socket writer.
+		var body bytes.Buffer
+		if err := EncodeResponse(&body, response.sqlResult); err != nil {
+			return err
+		}
+		wire := *response
+		wire.Value, wire.sqlResult = body.Bytes(), nil
+		response = &wire
 	}
 	bodyHint := replicatedResponseFixedBodyBytes + len(response.Completion)
 	if response.Kind == ReplicatedReadFound || response.Kind == ReplicatedReadMissing ||
@@ -1216,6 +1346,7 @@ func validReplicatedResponse(response *ReplicatedResponse) bool {
 		(response.HasState && !validReplicatedMemberState(response.State)) ||
 		len(response.Completion) > replicatedstate.MaxCompletionEnvelopeBytes ||
 		response.Outcome.CompletionBytes != len(response.Completion) ||
+		(response.sqlResult != nil && response.Kind != ReplicatedQueryResult) ||
 		len(response.Value) > max(replication.MaxMutationValueBytes,
 			replicatedstate.MaxRequestLedgerTerminalReadBytes+
 				replicatedRequestLedgerReadValueHeaderBytes) {
@@ -1302,6 +1433,13 @@ func validReplicatedResponse(response *ReplicatedResponse) bool {
 			response.Outcome == (raftserve.Outcome{}) && len(response.Completion) == 0 &&
 			response.ReadApplied != 0 && response.State.Applied >= response.ReadApplied
 	case ReplicatedQueryResult:
+		if response.sqlResult != nil {
+			return response.HasState && response.Refusal == ReplicatedRefusalNone &&
+				response.RequestDigest == ([sha256.Size]byte{}) &&
+				response.Outcome == (raftserve.Outcome{}) && len(response.Completion) == 0 &&
+				response.ReadApplied != 0 && response.State.Applied >= response.ReadApplied &&
+				len(response.Value) == 0 && replicatedSemanticSQLResultValid(response.sqlResult)
+		}
 		return response.HasState && response.Refusal == ReplicatedRefusalNone &&
 			response.RequestDigest == ([sha256.Size]byte{}) &&
 			response.Outcome == (raftserve.Outcome{}) && len(response.Completion) == 0 &&

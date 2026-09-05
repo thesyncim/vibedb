@@ -25,7 +25,8 @@ import (
 // exact allocated identities. Node-log groups share durability ownership;
 // every group retains an independent SQL root.
 type devTableInventory struct {
-	Tables []devTableProvision `json:"tables"`
+	NextPlacement uint64              `json:"next_placement,omitempty"`
+	Tables        []devTableProvision `json:"tables"`
 }
 type devTableProvision struct {
 	Table            string    `json:"table"`
@@ -35,6 +36,13 @@ type devTableProvision struct {
 	GroupID          string    `json:"group_id"`
 	ShardIncarnation string    `json:"shard_incarnation"`
 	Stores           [3]string `json:"stores"`
+	// Physical RF3 tables retain the exact node and group roots selected for
+	// each voter. This lets restart reconcile the same live node manifests
+	// without deriving a replacement placement from mutable directory order.
+	PlacementOrdinal uint64    `json:"placement_ordinal,omitempty"`
+	PhysicalNodes    [3]string `json:"physical_nodes,omitempty"`
+	GroupRoots       [3]string `json:"group_roots,omitempty"`
+	ServeManifests   [3]string `json:"serve_manifests,omitempty"`
 }
 
 func (table devTableProvision) distribution() string {
@@ -45,7 +53,7 @@ func (table devTableProvision) distribution() string {
 }
 
 func (table devTableProvision) artifactStem() string {
-	if table.Distribution == "" {
+	if table.Distribution == "" || len(table.GroupID) < 12 {
 		return "table-" + table.Table
 	}
 	return "table-" + table.Table + "-" + table.GroupID[:12]
@@ -87,6 +95,12 @@ func ensureDevTables(root, shardBinary string, cluster *devClusterManifest, sche
 	raw, err := readDevFile(inventoryPath, 4<<20)
 	if err == nil {
 		err = vibejson.Unmarshal(raw, &inventory)
+		if err == nil {
+			canonical, canonicalErr := vibejson.Marshal(&inventory)
+			if canonicalErr != nil || !bytes.Equal(canonical, raw) {
+				err = errors.Join(errDevCluster, canonicalErr)
+			}
+		}
 	}
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
@@ -96,6 +110,9 @@ func ensureDevTables(root, shardBinary string, cluster *devClusterManifest, sche
 			return fmt.Errorf("%w: additional groups require RF3", errDevCluster)
 		}
 		return nil
+	}
+	if cluster.PhysicalNodes != 0 {
+		return ensureDevPhysicalTables(root, shardBinary, cluster, schemaPath, inventoryPath, inventory)
 	}
 	if schemaPath != "" {
 		ddl, err := readDevFile(schemaPath, sqldriver.ReplicatedChildSchemaMaxBytes)

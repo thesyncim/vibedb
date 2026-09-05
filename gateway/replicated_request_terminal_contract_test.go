@@ -21,7 +21,7 @@ func TestDurableRequestBuiltProgramCompletesExactTerminalContract(t *testing.T) 
 		}
 		t.Run(name, func(t *testing.T) {
 			build := durableRequestProgramBuildFixture(t)
-			build.Participants = durableFaultParticipantsN(t, 1)
+			build.Targets = durableFaultTargetsN(t, 1)
 			program, err := BuildDurableRequestLogicalProgram(build)
 			if err != nil {
 				t.Fatal(err)
@@ -50,7 +50,7 @@ func TestDurableRequestBuiltProgramCompletesExactTerminalContract(t *testing.T) 
 			}
 			execution := DurableRequestTypedExecutionContext{Home: build.Home, Key: build.Key,
 				Recipe: DurableRequestRecipe{Identity: program.Identity, CatalogGeneration: build.CatalogGeneration,
-					Contract: program.Contract, ParticipantCount: program.Contract.ParticipantCount,
+					Contract: program.Contract, TargetCount: program.Contract.TargetCount,
 					KeyDigest: program.KeyDigest, RequestDigest: program.RequestDigest, Tenant: program.Tenant}}
 			binding, err := BuildDurableRequestExecutionPinBinding(execution)
 			if err != nil {

@@ -1,0 +1,28 @@
+--- FAIL: TestTxnClockQuiescenceCannotEraseNewObserver (0.00s)
+    vibedb_txn_clock_race_internal_test.go:54: commit after overlapping quiescence = <nil>, want conflict
+--- FAIL: TestTxnClockOverflowDuringValidationCannotEraseConflict (0.00s)
+    vibedb_txn_clock_race_internal_test.go:84: commit after history disappeared during validation = <nil>, want conflict
+--- FAIL: TestTxnClockConcurrentRegistrationSaturatesWithoutWrapping (0.00s)
+    vibedb_txn_clock_race_internal_test.go:107: registration wrapped or failed to latch: count=0 saturated=false
+    vibedb_txn_clock_race_internal_test.go:112: finish drained saturation: count=18446744073709551614 saturated=false
+--- FAIL: TestTxnClockRegistrationKeepsOldestHintConservative (0.00s)
+    vibedb_txn_clock_race_internal_test.go:134: registered begin=0 behind pruning hint=10
+--- FAIL: TestTxnClockDelayedRecordCannotLowerOverflowFloor (0.00s)
+    vibedb_txn_clock_race_internal_test.go:186: commit after an old reservation reset newer histories = <nil>, want conflict
+--- FAIL: TestTxnClockExhaustionConcurrentAllocationsRemainStopped (0.00s)
+    vibedb_txn_clock_race_internal_test.go:214: accepted reused revision 1 after exhaustion
+    vibedb_txn_clock_race_internal_test.go:214: accepted reused revision 2 after exhaustion
+    vibedb_txn_clock_race_internal_test.go:214: accepted reused revision 3 after exhaustion
+    vibedb_txn_clock_race_internal_test.go:214: accepted reused revision 4 after exhaustion
+    vibedb_txn_clock_race_internal_test.go:214: accepted reused revision 5 after exhaustion
+    vibedb_txn_clock_race_internal_test.go:214: accepted reused revision 6 after exhaustion
+    vibedb_txn_clock_race_internal_test.go:219: exhaustion accepted=7 revision=6 stopped=true
+--- FAIL: TestTxnClockExhaustionNeverReusesRevisionZero (0.00s)
+    vibedb_txn_clock_race_internal_test.go:228: exhausted allocation = 0, false; want saturated revision and refusal
+--- FAIL: TestTxnFinishedStateReleasesCachedDatabaseHandle (0.00s)
+    vibedb_txn_clock_race_internal_test.go:250: escaped finished state retains the owning database through its cached handle
+--- FAIL: TestNativeSerializableCoordinatorHolderSaturationIsPermanent (0.00s)
+    vibedb_txn_serializable_test.go:554: begin did not saturate saturated=false active=18446744073709551615
+FAIL
+FAIL	github.com/thesyncim/vibedb	0.368s
+FAIL

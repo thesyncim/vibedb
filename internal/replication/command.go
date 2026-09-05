@@ -35,7 +35,7 @@ var executionPinAuthorityDigestDomain = []byte("vibedb/execution-pin/catalog-aut
 
 const (
 	transactionCoordinatorEpoch       = uint64(1)
-	transactionParticipantEpoch       = uint64(2)
+	transactionTargetEpoch            = uint64(2)
 	transactionCoordinatorPulseTag    = uint64(1) << 62
 	transactionCoordinatorDecisionTag = uint64(2) << 62
 	transactionCoordinatorRetireTag   = uint64(3) << 62
@@ -93,7 +93,7 @@ type Command struct {
 	NextDeadlineUnixNano int64
 
 	// Transaction is one exact canonical distributed transaction control body.
-	// It is present only for CommandTransaction. Fused participant preparation
+	// It is present only for CommandTransaction. Fused target preparation
 	// mutations remain in Batches so the native relation codec is never
 	// duplicated.
 	Transaction []byte
@@ -1045,11 +1045,11 @@ func transactionOperationCarriesRelationBatches(
 	operation distributedtxn.ReplicatedOperation,
 ) bool {
 	switch operation {
-	case distributedtxn.ReplicatedStageParticipant,
+	case distributedtxn.ReplicatedStageTarget,
 		distributedtxn.ReplicatedBeginPrepareCoordinator,
 		distributedtxn.ReplicatedBeginPrepareManifestCoordinator,
-		distributedtxn.ReplicatedStagePrepareParticipant,
-		distributedtxn.ReplicatedApplySingleParticipant:
+		distributedtxn.ReplicatedStagePrepareTarget,
+		distributedtxn.ReplicatedApplySingleTarget:
 		return true
 	default:
 		return false
@@ -1162,7 +1162,7 @@ func TransactionMutationDigest(
 }
 
 // TransactionMutationDigester reuses one SHA-256 state across an ordered
-// participant stream. It is not safe for concurrent calls. Reset is implicit
+// target stream. It is not safe for concurrent calls. Reset is implicit
 // in Digest, and the result is byte-identical to TransactionMutationDigest.
 type TransactionMutationDigester struct {
 	hash            hash.Hash
@@ -1325,7 +1325,7 @@ func validatedTransactionControl(raw []byte) (transactionControlMetadata, error)
 
 // TransactionClientSequence derives the sole legal replicated retry sequence
 // for an exact canonical transaction control body. Coordinator decisions use
-// disjoint high-bit namespaces; participant CAS transitions at one revision
+// disjoint high-bit namespaces; target CAS transitions at one revision
 // intentionally share a sequence and therefore cannot alias as distinct work.
 func TransactionClientSequence(control []byte) (uint64, error) {
 	view, err := validatedTransactionControl(control)
@@ -1339,12 +1339,12 @@ func transactionClientSequence(control transactionControlMetadata) (uint64, erro
 	switch control.operation {
 	case distributedtxn.ReplicatedStageCoordinator,
 		distributedtxn.ReplicatedStageManifestCoordinator,
-		distributedtxn.ReplicatedStageParticipant,
+		distributedtxn.ReplicatedStageTarget,
 		distributedtxn.ReplicatedBeginPrepareCoordinator,
 		distributedtxn.ReplicatedBeginPrepareManifestCoordinator,
-		distributedtxn.ReplicatedStagePrepareParticipant:
+		distributedtxn.ReplicatedStagePrepareTarget:
 		return 1, nil
-	case distributedtxn.ReplicatedApplySingleParticipant:
+	case distributedtxn.ReplicatedApplySingleTarget:
 		if control.expectedRevision == 0 {
 			return 0, semantic("direct participant issuer sequence")
 		}
@@ -1366,12 +1366,12 @@ func transactionClientSequence(control transactionControlMetadata) (uint64, erro
 			return 0, semantic("transaction coordinator revision")
 		}
 		return transactionCoordinatorRetireTag | control.expectedRevision, nil
-	case distributedtxn.ReplicatedPrepareParticipant,
-		distributedtxn.ReplicatedApplyParticipant,
-		distributedtxn.ReplicatedAbortParticipant,
-		distributedtxn.ReplicatedReleaseParticipant,
-		distributedtxn.ReplicatedApplyReleaseParticipant,
-		distributedtxn.ReplicatedAbortReleaseParticipant:
+	case distributedtxn.ReplicatedPrepareTarget,
+		distributedtxn.ReplicatedApplyTarget,
+		distributedtxn.ReplicatedAbortTarget,
+		distributedtxn.ReplicatedReleaseTarget,
+		distributedtxn.ReplicatedApplyReleaseTarget,
+		distributedtxn.ReplicatedAbortReleaseTarget:
 		if control.expectedRevision == ^uint64(0) {
 			return 0, semantic("transaction participant revision")
 		}
@@ -1387,8 +1387,8 @@ func validateTransactionClientIdentity(
 	control transactionControlMetadata,
 ) error {
 	wantEpoch := transactionCoordinatorEpoch
-	if control.role == distributedtxn.ReplicatedRoleParticipant {
-		wantEpoch = transactionParticipantEpoch
+	if control.role == distributedtxn.ReplicatedRoleTarget {
+		wantEpoch = transactionTargetEpoch
 	}
 	wantSequence, err := transactionClientSequence(control)
 	if err != nil {

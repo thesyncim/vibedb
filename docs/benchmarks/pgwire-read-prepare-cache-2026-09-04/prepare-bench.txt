@@ -1,0 +1,16 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/gateway
+cpu: Apple M4 Max
+BenchmarkPostgreSQLBackendDistributedPrepare/cold-16         	  319839	      3512 ns/op	   12856 B/op	      56 allocs/op
+BenchmarkPostgreSQLBackendDistributedPrepare/cold-16         	  307833	      3540 ns/op	   12856 B/op	      56 allocs/op
+BenchmarkPostgreSQLBackendDistributedPrepare/cold-16         	  353197	      3425 ns/op	   12856 B/op	      56 allocs/op
+BenchmarkPostgreSQLBackendDistributedPrepare/cold-16         	  351602	      3443 ns/op	   12856 B/op	      56 allocs/op
+BenchmarkPostgreSQLBackendDistributedPrepare/cold-16         	  345296	      3619 ns/op	   12856 B/op	      56 allocs/op
+BenchmarkPostgreSQLBackendDistributedPrepare/cached-16       	22511800	        53.18 ns/op	      80 B/op	       1 allocs/op
+BenchmarkPostgreSQLBackendDistributedPrepare/cached-16       	22338446	        52.94 ns/op	      80 B/op	       1 allocs/op
+BenchmarkPostgreSQLBackendDistributedPrepare/cached-16       	22516447	        53.07 ns/op	      80 B/op	       1 allocs/op
+BenchmarkPostgreSQLBackendDistributedPrepare/cached-16       	22746586	        53.29 ns/op	      80 B/op	       1 allocs/op
+BenchmarkPostgreSQLBackendDistributedPrepare/cached-16       	22787910	        55.39 ns/op	      80 B/op	       1 allocs/op
+PASS
+ok  	github.com/thesyncim/vibedb/gateway	12.436s

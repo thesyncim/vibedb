@@ -2971,7 +2971,7 @@ func TestReplicatedApplyIdentityJSONGolden(t *testing.T) {
 	}
 }
 
-func TestReplicatedApplyCaptureParticipantCommitsAndRecoversWithCheckpointGroup(t *testing.T) {
+func TestReplicatedApplyCaptureTargetCommitsAndRecoversWithCheckpointGroup(t *testing.T) {
 	path, database, base := bindReplicatedApplyTestRoot(t, "capture-checkpoint-reopen")
 	options := testReplicatedApplyOptions()
 	var err error

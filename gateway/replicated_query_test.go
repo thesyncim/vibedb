@@ -89,7 +89,7 @@ func (c *sqlRF3TestTransport) DoReplicated(ctx context.Context, endpoint Replica
 	return &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedQueryResult, HasState: true, State: state, ReadApplied: 20, Value: encoded.Bytes()}, nil
 }
 
-func newSQLRF3TestExecutor(t *testing.T) (*Executor, *sqlRF3TestTransport) {
+func newSQLRF3TestExecutor(t testing.TB) (*Executor, *sqlRF3TestTransport) {
 	t.Helper()
 	config, endpoints, descriptor, profile := testReplicatedTableInput(t)
 	boundary := distribution.KeyspacePoint{0x80}
@@ -128,6 +128,12 @@ func newSQLRF3TestExecutor(t *testing.T) (*Executor, *sqlRF3TestTransport) {
 
 func TestRF3SQLReusesTargetingScatterGlobalOrderAndAggregate(t *testing.T) {
 	executor, client := newSQLRF3TestExecutor(t)
+	queryContext, err := serviceauthz.WithAuthority(context.Background(), serviceauthz.Authority{
+		Node: [16]byte{0x71}, Generation: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, test := range []struct {
 		sql, want string
 		calls     int
@@ -137,7 +143,7 @@ func TestRF3SQLReusesTargetingScatterGlobalOrderAndAggregate(t *testing.T) {
 		{`SELECT id FROM messages WHERE id = 'a'`, "", 1},
 	} {
 		before := client.queries
-		result, err := executor.Query(context.Background(), Query{SQL: test.sql, Class: ClassBatch})
+		result, err := executor.Query(queryContext, Query{SQL: test.sql, Class: ClassBatch})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -157,7 +163,7 @@ func TestRF3SQLReusesTargetingScatterGlobalOrderAndAggregate(t *testing.T) {
 		}
 	}
 	client.fail = true
-	result, err := executor.Query(context.Background(), Query{SQL: `SELECT id FROM messages ORDER BY id`, Class: ClassBatch})
+	result, err := executor.Query(queryContext, Query{SQL: `SELECT id FROM messages ORDER BY id`, Class: ClassBatch})
 	if err == nil || result != nil {
 		t.Fatalf("failed shard leaked result: %+v %v", result, err)
 	}
@@ -166,7 +172,7 @@ func TestRF3SQLReusesTargetingScatterGlobalOrderAndAggregate(t *testing.T) {
 		t.Fatalf("lost refusal: %v", err)
 	}
 	client.fail, client.sqlError = false, true
-	result, err = executor.Query(context.Background(), Query{SQL: `SELECT id FROM messages WHERE id = 'a'`, Class: ClassBatch})
+	result, err = executor.Query(queryContext, Query{SQL: `SELECT id FROM messages WHERE id = 'a'`, Class: ClassBatch})
 	var sqlErr *ShardError
 	if result != nil || !errors.As(err, &sqlErr) {
 		t.Fatalf("SQL error became success: %+v %v", result, err)
@@ -178,7 +184,7 @@ func TestRF3SQLReusesTargetingScatterGlobalOrderAndAggregate(t *testing.T) {
 	// byte position 9. This exercises both RF3 decode sites without importing a
 	// shardservice-internal constructor into the gateway.
 	client.sqlErrorMessage = "VDBSQL:ATIyMDEyAQAAAAkAEGRpdmlzaW9uIGJ5IHplcm8AAA"
-	result, err = executor.Query(context.Background(), Query{SQL: `SELECT id FROM messages WHERE id = 'a'`, Class: ClassBatch})
+	result, err = executor.Query(queryContext, Query{SQL: `SELECT id FROM messages WHERE id = 'a'`, Class: ClassBatch})
 	if result != nil || !errors.As(err, &sqlErr) || sqlErr.SQLState() != "22012" || sqlErr.Message != "division by zero" {
 		t.Fatalf("RF3 diagnostic error = result %+v, error %+v", result, err)
 	}

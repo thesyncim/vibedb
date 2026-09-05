@@ -48,8 +48,8 @@ func requestLedgerPreparedForExecutionPinRows(t testing.TB) (
 		CatalogGeneration:         7,
 		SchemaManifestDigest:      executionpin.Digest(requestLedgerStateTestDigest("logical schema manifest")),
 		TransactionManifestDigest: executionpin.Digest(requestLedgerStateTestDigest("transaction manifest")),
-		ParticipantAuthorityRoot:  executionpin.Digest(requestLedgerStateTestDigest("participant authority")),
-		ParticipantCount:          2,
+		TargetAuthorityRoot:       executionpin.Digest(requestLedgerStateTestDigest("participant authority")),
+		TargetCount:               2,
 		ExecutionContractDigest:   executionpin.Digest(requestLedgerStateTestDigest("execution contract")),
 		LedgerHomeGroup:           executionpin.ID{0x41},
 	}
@@ -371,8 +371,8 @@ func TestRequestLedgerSchemaReleaseEvidenceBindsFullExecutionPinProof(t *testing
 	for name, mutate := range map[string]func(*executionpin.Binding){
 		"schema":       func(binding *executionpin.Binding) { binding.SchemaManifestDigest[0] ^= 1 },
 		"manifest":     func(binding *executionpin.Binding) { binding.TransactionManifestDigest[0] ^= 1 },
-		"participants": func(binding *executionpin.Binding) { binding.ParticipantAuthorityRoot[0] ^= 1 },
-		"count":        func(binding *executionpin.Binding) { binding.ParticipantCount++ },
+		"participants": func(binding *executionpin.Binding) { binding.TargetAuthorityRoot[0] ^= 1 },
+		"count":        func(binding *executionpin.Binding) { binding.TargetCount++ },
 		"contract":     func(binding *executionpin.Binding) { binding.ExecutionContractDigest[0] ^= 1 },
 		"home":         func(binding *executionpin.Binding) { binding.LedgerHomeGroup[0] ^= 1 },
 	} {

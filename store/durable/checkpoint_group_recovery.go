@@ -78,7 +78,7 @@ func OpenCollectionsWithSeededCheckpointGroup(
 	options CheckpointGroupOptions,
 ) ([]*Collection, *TxnLog, *CheckpointGroup, error) {
 	if seedMember == "" {
-		return nil, nil, nil, fmt.Errorf("%w: empty seed member", ErrTxnParticipant)
+		return nil, nil, nil, fmt.Errorf("%w: empty seed member", ErrTxnCollection)
 	}
 	return openCollectionsWithCheckpointGroup(
 		dir, txnOptions, requests, names, seedMember, false, options, nil,
@@ -101,7 +101,7 @@ func OpenCollectionsWithSnapshotCheckpointGroup(
 	options CheckpointGroupOptions,
 ) ([]*Collection, *TxnLog, *CheckpointGroup, error) {
 	if seedMember == "" {
-		return nil, nil, nil, fmt.Errorf("%w: empty snapshot seed member", ErrTxnParticipant)
+		return nil, nil, nil, fmt.Errorf("%w: empty snapshot seed member", ErrTxnCollection)
 	}
 	return openCollectionsWithCheckpointGroup(
 		dir, txnOptions, requests, names, seedMember, true, options, nil,
@@ -121,7 +121,7 @@ func openCollectionsWithCheckpointGroup(
 	if len(requests) != len(names) || len(requests) == 0 ||
 		len(requests) > checkpointGroupMaxMembers {
 		return nil, nil, nil, fmt.Errorf(
-			"%w: checkpoint request/name membership", ErrTxnParticipant,
+			"%w: checkpoint request/name membership", ErrTxnCollection,
 		)
 	}
 	options, err := options.normalized()
@@ -269,7 +269,7 @@ func openCollectionsWithCheckpointGroup(
 		if previous, duplicate := seenStores[collection.storeID]; duplicate {
 			return abort(collections[:i+1], fmt.Errorf(
 				"%w: requests %d and %d have duplicate StoreID %x",
-				ErrTxnParticipant, previous, i, collection.storeID,
+				ErrTxnCollection, previous, i, collection.storeID,
 			))
 		}
 		seenStores[collection.storeID] = i
@@ -344,7 +344,7 @@ func openCollectionsWithCheckpointGroup(
 			); err != nil {
 				return abort(collections, err)
 			}
-			if err := validateCheckpointCommittedParticipants(
+			if err := validateCheckpointCommittedTargets(
 				recovery.decisions, collections, certificate.txnHighWater,
 			); err != nil {
 				return abort(collections, err)
@@ -444,7 +444,7 @@ func openCollectionsWithCheckpointGroup(
 
 // validateMissingCheckpointGroupActivation distinguishes the one legitimate
 // missing-certificate state from loss of an already-active certificate. SQL
-// publishes the empty fixed participant files before creating format 0, so a
+// publishes the empty fixed target files before creating format 0, so a
 // crash in that narrow seam has an empty marker, empty durable roots, and empty
 // journals. Anything else must fail before generic recovery can fold records
 // using txn.vtm as authority.
@@ -773,7 +773,7 @@ func validateCheckpointGroupJournalRecords(
 	)
 }
 
-func validateCheckpointCommittedParticipants(
+func validateCheckpointCommittedTargets(
 	decisions *storeio.TxnDecisions,
 	collections []*Collection,
 	txnHighWater uint64,
@@ -792,27 +792,27 @@ func validateCheckpointCommittedParticipants(
 	}
 	markerID, epoch := decisions.MarkerID(), decisions.Epoch()
 	var result error
-	decisions.RangeDecisions(func(txnID uint64, participants []storeio.TxnParticipant) bool {
+	decisions.RangeDecisions(func(txnID uint64, targets []storeio.TxnCollectionRef) bool {
 		if txnID > txnHighWater {
 			return true
 		}
-		for _, participant := range participants {
-			collection := byStore[participant.StoreID]
-			if collection == nil || collection.journalID != participant.JournalID {
+		for _, target := range targets {
+			collection := byStore[target.StoreID]
+			if collection == nil || collection.journalID != target.JournalID {
 				result = fmt.Errorf(
 					"%w: committed transaction %d participant",
 					ErrCheckpointGroupCorrupt, txnID,
 				)
 				return false
 			}
-			if collection.journal.BaseGeneration() >= participant.PreparedGeneration {
+			if collection.journal.BaseGeneration() >= target.PreparedGeneration {
 				continue
 			}
 			identity := conditionalPrepareIdentity{
 				markerID: markerID, epoch: epoch, txnID: txnID,
-				generation: participant.PreparedGeneration,
+				generation: target.PreparedGeneration,
 			}
-			if _, ok := preparesByStore[participant.StoreID][identity]; !ok {
+			if _, ok := preparesByStore[target.StoreID][identity]; !ok {
 				result = fmt.Errorf(
 					"%w: committed transaction %d prepare", ErrCheckpointGroupCorrupt, txnID,
 				)

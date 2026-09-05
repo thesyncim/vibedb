@@ -14,13 +14,37 @@ import (
 
 var (
 	_ pgwire.BackendSessionParameterPreparer     = (*postgresSession)(nil)
+	_ pgwire.BackendStatementParseReuser         = (*postgresStatement)(nil)
 	_ pgwire.BackendStatementParamTyper          = (*postgresStatement)(nil)
 	_ pgwire.BackendStatementParamTypePositioner = (*postgresStatement)(nil)
 	_ pgwire.BackendStatementParamTyper          = (*postgresWriteStatement)(nil)
 	_ pgwire.BackendStatementParamTypePositioner = (*postgresWriteStatement)(nil)
 )
 
-func newTypedPostgreSQLSession(t *testing.T) (pgwire.BackendSession, *sqlRF3TestTransport) {
+func TestPostgreSQLStatementParseReuseFollowsCatalogGeneration(t *testing.T) {
+	session, _ := newTypedPostgreSQLSession(t)
+	statement, err := session.Prepare(
+		t.Context(), "SELECT id FROM messages WHERE id = ? ORDER BY id LIMIT 32",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := statement.(*postgresStatement)
+	if !p.ReusableForParse() {
+		t.Fatal("current distributed statement declined exact Parse reuse")
+	}
+	p.session.state = sqldriver.SessionFailedTransaction
+	if p.ReusableForParse() {
+		t.Fatal("statement in a failed transaction allowed Parse reuse")
+	}
+	p.session.state = sqldriver.SessionIdle
+	p.catalogGeneration++
+	if p.ReusableForParse() {
+		t.Fatal("statement from a stale catalog generation allowed Parse reuse")
+	}
+}
+
+func newTypedPostgreSQLSession(t testing.TB) (pgwire.BackendSession, *sqlRF3TestTransport) {
 	t.Helper()
 	executor, transport := newSQLRF3TestExecutor(t)
 	authority := serviceauthz.Authority{Generation: 1}
@@ -37,6 +61,48 @@ func newTypedPostgreSQLSession(t *testing.T) (pgwire.BackendSession, *sqlRF3Test
 	}
 	t.Cleanup(func() { _ = session.Close() })
 	return session, transport
+}
+
+func BenchmarkPostgreSQLBackendDistributedPrepare(b *testing.B) {
+	session, _ := newTypedPostgreSQLSession(b)
+	s := session.(*postgresSession)
+	preparer := session.(pgwire.BackendSessionParameterPreparer)
+	const sql = "SELECT id FROM messages WHERE id = ? ORDER BY id LIMIT 256"
+	hints := []sqldriver.ParamType{sqldriver.ParamTypeText}
+
+	b.Run("cold", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			s.releaseReadCache()
+			statement, err := preparer.PrepareWithParameterTypes(b.Context(), sql, hints)
+			if err != nil {
+				b.Fatal(err)
+			}
+			if err := statement.Close(); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("cached", func(b *testing.B) {
+		statement, err := preparer.PrepareWithParameterTypes(b.Context(), sql, hints)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if err := statement.Close(); err != nil {
+			b.Fatal(err)
+		}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			statement, err := preparer.PrepareWithParameterTypes(b.Context(), sql, hints)
+			if err != nil {
+				b.Fatal(err)
+			}
+			if err := statement.Close(); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
 }
 
 func TestPostgreSQLBackendTypedPrepareMetadata(t *testing.T) {
@@ -117,6 +183,155 @@ func TestPostgreSQLBackendCarriesTypedNULLThroughRF3(t *testing.T) {
 	if len(transport.lastParams) != 1 || transport.lastParams[0].Kind != shardservice.ParamNull ||
 		!slices.Equal(transport.lastTypes, []sqldriver.ParamType{sqldriver.ParamTypeBool}) {
 		t.Fatalf("RF3 inputs = params %+v types %v", transport.lastParams, transport.lastTypes)
+	}
+}
+
+func TestPostgreSQLBackendReusesClosedDistributedReadPrepare(t *testing.T) {
+	session, _ := newTypedPostgreSQLSession(t)
+	s := session.(*postgresSession)
+	preparer := session.(pgwire.BackendSessionParameterPreparer)
+	const sql = "SELECT id FROM messages WHERE id = ? ORDER BY id LIMIT 32"
+	hints := []sqldriver.ParamType{sqldriver.ParamTypeText}
+
+	first, err := preparer.PrepareWithParameterTypes(t.Context(), sql, hints)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstCompiled := first.(*postgresStatement).compiled
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if s.readCache.compiled != firstCompiled {
+		t.Fatal("closed distributed read was not retained")
+	}
+
+	second, err := preparer.PrepareWithParameterTypes(t.Context(), sql, hints)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.(*postgresStatement).compiled != firstCompiled {
+		t.Fatal("exact SQL and parameter types did not reuse compiled statement")
+	}
+	if s.readCache.compiled != nil {
+		t.Fatal("cache retained a second owner after reuse")
+	}
+	if err := second.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPostgreSQLBackendReadPrepareCacheFollowsCatalogGeneration(t *testing.T) {
+	session, _ := newTypedPostgreSQLSession(t)
+	s := session.(*postgresSession)
+	preparer := session.(pgwire.BackendSessionParameterPreparer)
+	const sql = "SELECT id FROM messages WHERE id = ? ORDER BY id LIMIT 64"
+	hints := []sqldriver.ParamType{sqldriver.ParamTypeText}
+
+	first, err := preparer.PrepareWithParameterTypes(t.Context(), sql, hints)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstCompiled := first.(*postgresStatement).compiled
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s.readCache.catalogGeneration++
+
+	second, err := preparer.PrepareWithParameterTypes(t.Context(), sql, hints)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.(*postgresStatement).compiled == firstCompiled {
+		t.Fatal("stale catalog generation reused compiled statement")
+	}
+	if s.readCache.compiled != firstCompiled {
+		t.Fatal("generation miss mutated the prior cache entry before replacement")
+	}
+	if err := second.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPostgreSQLBackendReadPrepareCacheRequiresExactTypeHints(t *testing.T) {
+	session, _ := newTypedPostgreSQLSession(t)
+	s := session.(*postgresSession)
+	preparer := session.(pgwire.BackendSessionParameterPreparer)
+	const sql = "SELECT ? FROM messages LIMIT 1"
+
+	first, err := preparer.PrepareWithParameterTypes(
+		t.Context(), sql, []sqldriver.ParamType{sqldriver.ParamTypeBool},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstCompiled := first.(*postgresStatement).compiled
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := preparer.PrepareWithParameterTypes(
+		t.Context(), sql, []sqldriver.ParamType{sqldriver.ParamTypeText},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.(*postgresStatement).compiled == firstCompiled {
+		t.Fatal("different parameter type hints reused compiled statement")
+	}
+	if s.readCache.compiled != firstCompiled {
+		t.Fatal("type mismatch mutated the prior cache entry before replacement")
+	}
+	if err := second.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPostgreSQLBackendReadPrepareCacheIsBoundedAndReleased(t *testing.T) {
+	session, _ := newTypedPostgreSQLSession(t)
+	s := session.(*postgresSession)
+
+	local, err := session.Prepare(t.Context(), "SELECT 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := local.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if s.readCache.compiled != nil {
+		t.Fatal("local statement entered distributed read cache")
+	}
+	oversized, err := session.Prepare(
+		t.Context(), "SELECT id FROM messages"+
+			strings.Repeat(" ", maxPostgresReadCacheSQLBytes),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := oversized.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if s.readCache.compiled != nil {
+		t.Fatal("oversized statement entered bounded read cache")
+	}
+
+	distributed, err := session.Prepare(
+		t.Context(), "SELECT id FROM messages ORDER BY id LIMIT 256",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := distributed.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if s.readCache.compiled == nil {
+		t.Fatal("eligible distributed statement was not retained")
+	}
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if s.readCache.compiled != nil || s.readCache.text != "" ||
+		len(s.readCache.parameterTypes) != 0 {
+		t.Fatal("session close retained read cache ownership")
 	}
 }
 

@@ -47,16 +47,15 @@ func wireEdgeRewriteTxnMarkerBaseSequence(
 }
 
 func wireEdgeTxnDecisionWithSequence(
-	t *testing.T, sequence, txnID uint64, participants []TxnParticipant,
-) []byte {
+	t *testing.T, sequence, txnID uint64, targets []TxnCollectionRef) []byte {
 	t.Helper()
-	padded, ok := checkedTxnDecisionPaddedSize(len(participants))
+	padded, ok := checkedTxnDecisionPaddedSize(len(targets))
 	if !ok {
 		t.Fatal("checkedTxnDecisionPaddedSize rejected test participants")
 	}
 	record := make([]byte, padded)
 	if _, err := encodeTxnDecisionRecord(
-		record, sequence, txnID, participants,
+		record, sequence, txnID, targets,
 	); err != nil {
 		t.Fatalf("encodeTxnDecisionRecord: %v", err)
 	}
@@ -67,17 +66,17 @@ func wireEdgeTxnDecisionWithZeroSequence(
 	t *testing.T, txnID uint64,
 ) []byte {
 	t.Helper()
-	participants := testTxnParticipants(1)
-	record := wireEdgeTxnDecisionWithSequence(t, 1, txnID, participants)
+	targets := testTxnCollectionRefs(1)
+	record := wireEdgeTxnDecisionWithSequence(t, 1, txnID, targets)
 	binary.LittleEndian.PutUint64(record[8:16], 0)
-	bodyEnd := TxnMarkerRecordPrefixSize + len(participants)*TxnParticipantSize
+	bodyEnd := TxnMarkerRecordPrefixSize + len(targets)*TxnCollectionRefSize
 	wireEdgeSealTxnMarkerRecord(record, bodyEnd)
 	return record
 }
 
 func wireEdgeTxnRetirementWithZeroSequence(t *testing.T) []byte {
 	t.Helper()
-	storeID := testTxnParticipants(1)[0].StoreID
+	storeID := testTxnCollectionRefs(1)[0].StoreID
 	padded, ok := checkedTxnRetirementPaddedSize()
 	if !ok {
 		t.Fatal("checkedTxnRetirementPaddedSize")
@@ -104,7 +103,7 @@ func TestTxnMarkerSequenceExhaustion(t *testing.T) {
 		if err != nil {
 			t.Fatalf("OpenTxnMarker: %v", err)
 		}
-		dcsn, err := marker.AppendDecision(1, testTxnParticipants(1))
+		dcsn, err := marker.AppendDecision(1, testTxnCollectionRefs(1))
 		if err != nil {
 			t.Fatalf("terminal AppendDecision: %v", err)
 		}
@@ -116,11 +115,11 @@ func TestTxnMarkerSequenceExhaustion(t *testing.T) {
 		}
 		terminalCursor := marker.Cursor()
 		if _, err := marker.AppendDecision(
-			2, testTxnParticipants(1),
+			2, testTxnCollectionRefs(1),
 		); !errors.Is(err, ErrTxnMarkerFull) {
 			t.Fatalf("post-exhaustion AppendDecision = %v, want ErrTxnMarkerFull", err)
 		}
-		retiredStore := testTxnParticipants(2)[1].StoreID
+		retiredStore := testTxnCollectionRefs(2)[1].StoreID
 		if _, err := marker.AppendRetirement(retiredStore); !errors.Is(
 			err, ErrTxnMarkerFull,
 		) {
@@ -195,11 +194,11 @@ func TestTxnMarkerSequenceExhaustion(t *testing.T) {
 			)
 		}
 		if _, err := empty.AppendDecision(
-			1, testTxnParticipants(1),
+			1, testTxnCollectionRefs(1),
 		); !errors.Is(err, ErrTxnMarkerFull) {
 			t.Fatalf("exhausted AppendDecision = %v, want ErrTxnMarkerFull", err)
 		}
-		storeID := testTxnParticipants(2)[1].StoreID
+		storeID := testTxnCollectionRefs(2)[1].StoreID
 		if _, err := empty.AppendRetirement(storeID); !errors.Is(err, ErrTxnMarkerFull) {
 			t.Fatalf("exhausted AppendRetirement = %v, want ErrTxnMarkerFull", err)
 		}
@@ -292,7 +291,7 @@ func TestTxnMarkerEqualRecycleCountConflictFailsClosed(t *testing.T) {
 
 func TestTxnMarkerAuthenticatedInvalidNewestHeaderCannotResurrectEpoch(t *testing.T) {
 	marker, path := createTestTxnMarker(t, 8*TxnMarkerMinSectorSize)
-	if _, err := marker.AppendDecision(1, testTxnParticipants(1)); err != nil {
+	if _, err := marker.AppendDecision(1, testTxnCollectionRefs(1)); err != nil {
 		t.Fatalf("AppendDecision: %v", err)
 	}
 	if err := marker.Sync(); err != nil {
@@ -383,24 +382,24 @@ func TestTxnMarkerEpochZeroRejected(t *testing.T) {
 
 func wireEdgeTxnSemanticDecisions(t *testing.T) map[string][]byte {
 	t.Helper()
-	participants := testTxnParticipants(2)
-	zeroTxnID := wireEdgeTxnDecisionWithSequence(t, 1, 1, participants)
+	targets := testTxnCollectionRefs(2)
+	zeroTxnID := wireEdgeTxnDecisionWithSequence(t, 1, 1, targets)
 	binary.LittleEndian.PutUint64(zeroTxnID[16:24], 0)
-	bodyEnd := TxnMarkerRecordPrefixSize + len(participants)*TxnParticipantSize
+	bodyEnd := TxnMarkerRecordPrefixSize + len(targets)*TxnCollectionRefSize
 	wireEdgeSealTxnMarkerRecord(zeroTxnID, bodyEnd)
 
-	duplicateParticipant := wireEdgeTxnDecisionWithSequence(t, 1, 1, participants)
-	firstParticipant := TxnMarkerRecordPrefixSize
-	secondParticipant := firstParticipant + TxnParticipantSize
+	duplicateTarget := wireEdgeTxnDecisionWithSequence(t, 1, 1, targets)
+	firstTarget := TxnMarkerRecordPrefixSize
+	secondTarget := firstTarget + TxnCollectionRefSize
 	copy(
-		duplicateParticipant[secondParticipant:secondParticipant+16],
-		duplicateParticipant[firstParticipant:firstParticipant+16],
+		duplicateTarget[secondTarget:secondTarget+16],
+		duplicateTarget[firstTarget:firstTarget+16],
 	)
-	wireEdgeSealTxnMarkerRecord(duplicateParticipant, bodyEnd)
+	wireEdgeSealTxnMarkerRecord(duplicateTarget, bodyEnd)
 
 	return map[string][]byte{
 		"zero-txn-id":           zeroTxnID,
-		"duplicate-participant": duplicateParticipant,
+		"duplicate-participant": duplicateTarget,
 	}
 }
 
@@ -443,16 +442,16 @@ func TestTxnMarkerChecksumValidSemanticDecisionErrorsAreHard(t *testing.T) {
 }
 
 func TestTxnMarkerAuthenticatedCrossLayoutKindsAreHard(t *testing.T) {
-	participants := testTxnParticipants(2)
+	targets := testTxnCollectionRefs(2)
 	decisionAsRetirement := wireEdgeTxnDecisionWithSequence(
-		t, 1, 1, participants,
+		t, 1, 1, targets,
 	)
 	binary.LittleEndian.PutUint16(
 		decisionAsRetirement[4:6], TxnMarkerRecordKindRetirement,
 	)
 	wireEdgeSealTxnMarkerRecord(
 		decisionAsRetirement,
-		TxnMarkerRecordPrefixSize+len(participants)*TxnParticipantSize,
+		TxnMarkerRecordPrefixSize+len(targets)*TxnCollectionRefSize,
 	)
 
 	retirementSize, ok := checkedTxnRetirementPaddedSize()
@@ -461,7 +460,7 @@ func TestTxnMarkerAuthenticatedCrossLayoutKindsAreHard(t *testing.T) {
 	}
 	retirementAsDecision := make([]byte, retirementSize)
 	if _, err := encodeTxnRetirementRecord(
-		retirementAsDecision, 1, participants[0].StoreID,
+		retirementAsDecision, 1, targets[0].StoreID,
 	); err != nil {
 		t.Fatalf("encodeTxnRetirementRecord: %v", err)
 	}
@@ -514,17 +513,17 @@ func TestTxnMarkerAuthenticatedCrossLayoutKindsAreHard(t *testing.T) {
 func TestTxnMarkerDecisionLogicalRecordBeforePaddingMayReplay(t *testing.T) {
 	marker, path := createTestTxnMarker(t, 8*TxnMarkerMinSectorSize)
 	header := marker.Header()
-	participants := testTxnParticipants(2)
-	logicalLen := TxnMarkerRecordPrefixSize + len(participants)*TxnParticipantSize +
+	targets := testTxnCollectionRefs(2)
+	logicalLen := TxnMarkerRecordPrefixSize + len(targets)*TxnCollectionRefSize +
 		TxnMarkerRecordTrailerSize
-	padded, ok := checkedTxnDecisionPaddedSize(len(participants))
+	padded, ok := checkedTxnDecisionPaddedSize(len(targets))
 	if !ok || logicalLen >= padded {
 		t.Fatalf("logical/padded decision lengths = %d/%d", logicalLen, padded)
 	}
 	marker.writeAt = func(payload []byte, offset int64) (int, error) {
 		return marker.file.WriteAt(payload[:logicalLen], offset)
 	}
-	if dcsn, err := marker.AppendDecision(7, participants); dcsn != 0 ||
+	if dcsn, err := marker.AppendDecision(7, targets); dcsn != 0 ||
 		!errors.Is(err, io.ErrShortWrite) {
 		t.Fatalf("AppendDecision = dcsn %d, err %v; want 0, io.ErrShortWrite", dcsn, err)
 	}
@@ -550,7 +549,7 @@ func TestTxnMarkerDecisionLogicalRecordBeforePaddingMayReplay(t *testing.T) {
 		)
 	}
 	got, found := decisions.Lookup(header.MarkerID, header.Epoch, 7)
-	if !found || len(got) != len(participants) {
-		t.Fatalf("reopened decision = found %v participants %d, want true/%d", found, len(got), len(participants))
+	if !found || len(got) != len(targets) {
+		t.Fatalf("reopened decision = found %v participants %d, want true/%d", found, len(got), len(targets))
 	}
 }

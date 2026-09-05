@@ -12,6 +12,7 @@ import (
 	"encoding/asn1"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"flag"
@@ -46,9 +47,15 @@ import (
 )
 
 const (
-	devClusterFormat                                           = 1
+	// Format 2 is the first format that records physical-node composition.
+	// Format 1 described one OS process per role/member and is deliberately
+	// rejected on restart; there is no migration path for that unreleased
+	// development layout.
+	devClusterFormat                                           = 2
 	devClusterRF3                                              = 3
 	devClusterRF1                                              = 1
+	devClusterPhysicalNodes3                                   = 3
+	devClusterPhysicalNodes6                                   = 6
 	devClusterOID                                              = "1.3.6.1.4.1.32473.1.1"
 	devReadyTimeout                                            = 30 * time.Second
 	devChildDiagnosticBytes                                    = 64 << 10
@@ -70,10 +77,15 @@ const (
 var errDevCluster = errors.New("vibedb: invalid local development cluster")
 
 type devClusterManifest struct {
-	additionalCatalogs  []string
-	dataServeManifests  []string
-	Format              uint16             `json:"format"`
+	additionalCatalogs []string
+	dataServeManifests []string
+	Format             uint16 `json:"format"`
+	// Nodes retains the historical replication-factor spelling used by the
+	// catalog and existing operator scripts. PhysicalNodes is the number of
+	// serving OS processes and is independent from RF.
 	Nodes               uint8              `json:"nodes"`
+	Replicas            uint8              `json:"replicas,omitempty"`
+	PhysicalNodes       uint8              `json:"physical_nodes,omitempty"`
 	NodeLog             bool               `json:"node_log,omitempty"`
 	ClientEndpoint      string             `json:"client_endpoint"`
 	CatalogPath         string             `json:"catalog_path"`
@@ -92,17 +104,103 @@ type devClusterManifest struct {
 	Members             []devClusterMember `json:"members"`
 	LedgerMembers       []devClusterMember `json:"ledger_members"`
 	DataMembers         []devClusterMember `json:"data_members"`
+	NodeManifests       []devPhysicalNode  `json:"node_manifests,omitempty"`
 }
 
 type devClusterMember struct {
 	Member        uint64 `json:"member"`
 	Node          string `json:"node"`
 	Store         string `json:"store"`
+	PhysicalNode  string `json:"physical_node,omitempty"`
+	GroupRoot     string `json:"group_root,omitempty"`
 	Peer          string `json:"peer"`
 	Native        string `json:"native"`
 	Snapshot      string `json:"snapshot"`
 	Control       string `json:"control"`
 	ServeManifest string `json:"serve_manifest"`
+}
+
+// devPhysicalNode is the supervisor inventory for one serving process. The
+// storage identity and gateway identity intentionally have separate keypairs.
+// Groups remain listed in the node's canonical serve manifest; this inventory
+// only supplies the stable process-level paths and listener endpoints needed
+// by the development supervisor and diagnostics.
+type devPhysicalNode struct {
+	Node                  string   `json:"node"`
+	Certificate           string   `json:"certificate"`
+	Key                   string   `json:"key"`
+	GatewayNode           string   `json:"gateway_node"`
+	GatewayCertificate    string   `json:"gateway_certificate"`
+	GatewayKey            string   `json:"gateway_key"`
+	GatewayControl        string   `json:"gateway_control"`
+	FrontendListen        string   `json:"frontend_listen"`
+	ServeManifest         string   `json:"serve_manifest"`
+	CatalogSessionJournal string   `json:"catalog_session_journal"`
+	DirectIssuerJournal   string   `json:"direct_issuer_journal"`
+	FallbackJournal       string   `json:"fallback_journal"`
+	ExecutionPinJournal   string   `json:"execution_pin_journal"`
+	Groups                []string `json:"groups"`
+}
+
+// devGatewayConfig is the serializable subset of gatewayruntime.Config that
+// belongs in a prepared node manifest. Function, listener, and transport
+// interfaces are assembled by serve-node; paths and scalar bounds remain
+// explicit so startup can authenticate and validate each frontend before it
+// starts public admission.
+type devGatewayConfig struct {
+	CatalogPath                 string                `json:"catalog_path"`
+	CatalogRouteSeedPath        string                `json:"catalog_route_seed_path"`
+	CatalogBootstrapIfMissing   bool                  `json:"catalog_bootstrap_if_missing"`
+	CatalogRelation             uint64                `json:"catalog_relation"`
+	CatalogAttempts             uint64                `json:"catalog_attempts"`
+	CatalogAttemptTimeoutMillis uint64                `json:"catalog_attempt_timeout_millis"`
+	CatalogSessionLeaseMillis   uint64                `json:"catalog_session_lease_millis"`
+	CatalogSessionJournal       string                `json:"catalog_session_journal"`
+	CatalogClientID             string                `json:"catalog_client_id"`
+	CatalogRetryHome            string                `json:"catalog_retry_home"`
+	DurableAckKey               string                `json:"durable_ack_key"`
+	Listen                      string                `json:"listen"`
+	PGListen                    string                `json:"pg_listen"`
+	PGDDLSocket                 string                `json:"pg_ddl_socket"`
+	TLS                         devGatewayTLS         `json:"tls"`
+	TLSHandshakeTimeoutMillis   uint64                `json:"tls_handshake_timeout_millis"`
+	AuthorizationPolicy         string                `json:"authorization_policy"`
+	ShardPeers                  []devGatewayShardPeer `json:"shard_peers"`
+	MaxConnections              uint64                `json:"max_connections"`
+	MaxHandshakes               uint64                `json:"max_handshakes"`
+	MaxShardConnections         uint64                `json:"max_shard_connections"`
+	MaxShardHandshakes          uint64                `json:"max_shard_handshakes"`
+	MaxNativeReadConcurrency    uint64                `json:"max_native_read_concurrency"`
+	MaxNativeReadBytes          uint64                `json:"max_native_read_bytes"`
+	MaxNativeScatterConcurrency uint64                `json:"max_native_scatter_concurrency"`
+	TableCatalogs               []string              `json:"table_catalogs"`
+	TableCatalogsPath           string                `json:"table_catalogs_path"`
+	HotShardCapacity            string                `json:"hot_shard_capacity"`
+	HotShardIntervalMillis      uint64                `json:"hot_shard_interval_millis"`
+	ReplicaControlManifest      string                `json:"replica_control_manifest"`
+	ControlParticipantOnly      bool                  `json:"control_participant_only"`
+	DDLOwnerAddress             string                `json:"ddl_owner_address"`
+	DDLOwnerNode                string                `json:"ddl_owner_node"`
+	BackupRepository            string                `json:"backup_repository"`
+	BackupMaxBackups            uint64                `json:"backup_max_backups"`
+	BackupMaxArtifacts          uint64                `json:"backup_max_artifacts"`
+	BackupMaxArtifactBytes      uint64                `json:"backup_max_artifact_bytes"`
+	BackupMaxDiskBytes          uint64                `json:"backup_max_disk_bytes"`
+	ControllerIntervalMillis    uint64                `json:"controller_interval_millis"`
+	SchemaRolloutPlan           string                `json:"schema_rollout_plan"`
+	SchemaRolloutOnce           bool                  `json:"schema_rollout_once"`
+}
+
+type devGatewayTLS struct {
+	Certificate string `json:"certificate"`
+	Key         string `json:"key"`
+	Roots       string `json:"roots"`
+	IdentityOID string `json:"identity_oid"`
+}
+
+type devGatewayShardPeer struct {
+	Address string `json:"address"`
+	NodeID  string `json:"node_id"`
 }
 
 // These persisted types deliberately mirror the gateway's strict public
@@ -310,19 +408,28 @@ type devClusterOptions struct {
 	root, shardBinary, gatewayBinary string
 	replicas                         int
 	nodeLog                          bool
+	physicalNodes                    int
+	pgListen                         string
+	pgListens                        []string
 }
 
 func runClusterDev(args []string) int {
 	fs := flag.NewFlagSet("cluster dev", flag.ContinueOnError)
 	root := fs.String("root", "", "absolute durable cluster directory")
 	replicas := fs.Int("replicas", devClusterRF3, "Raft replicas: 1 for dev-only/no-HA or 3 for RF3")
+	physicalNodes := fs.Int("physical-nodes", 0, "serving physical nodes: 3 or 6 for RF3; defaults to 3")
 	nodeLog := fs.Bool("node-log", false, "use shared node logs for a fresh RF3 cluster")
 	nodes := fs.Int("nodes", 0, "deprecated alias for --replicas")
 	shardBinary := fs.String("shard-binary", "", "vibedb-shard executable; defaults beside vibedb or PATH")
 	gatewayBinary := fs.String("gateway-binary", "", "vibedb-gateway executable; defaults beside vibedb or PATH")
 	diagnosticsOnExit := fs.Bool("diagnostics-on-exit", false, "print bounded shard and gateway log tails when the development cluster stops")
 	pgListen := fs.String("pg-listen", "", "optional loopback PostgreSQL endpoint with durable auto-commit writes (RF3 only)")
-	tableSchema := fs.String("table-schema", "", "CREATE TABLE file to provision as an additional group on the existing three data nodes; retained on restart")
+	pgListens := fs.String("pg-listens", "", "comma-separated PostgreSQL loopback endpoints, one per physical node (RF3 only)")
+	var tableSchemas []string
+	fs.Func("table-schema", "CREATE TABLE file to provision as an additional RF3 group; repeatable and retained on restart", func(path string) error {
+		tableSchemas = append(tableSchemas, path)
+		return nil
+	})
 	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || *root == "" {
 		usage()
 		return 2
@@ -344,14 +451,25 @@ func runClusterDev(args []string) int {
 		usage()
 		return 2
 	}
-	if *pgListen != "" {
-		host, port, err := net.SplitHostPort(*pgListen)
-		address := net.ParseIP(host)
-		portNumber, portErr := strconv.Atoi(port)
-		if *replicas != devClusterRF3 || err != nil || address == nil || !address.IsLoopback() || portErr != nil || portNumber < 1 || portNumber > 65535 {
-			fmt.Fprintln(os.Stderr, "cluster dev: --pg-listen requires RF3 and a literal loopback IP with port 1..65535")
+	if *replicas == devClusterRF1 {
+		if *physicalNodes != 0 {
+			usage()
 			return 2
 		}
+		*physicalNodes = 0
+	} else {
+		if *physicalNodes == 0 {
+			*physicalNodes = devClusterPhysicalNodes3
+		}
+		if *physicalNodes != devClusterPhysicalNodes3 && *physicalNodes != devClusterPhysicalNodes6 {
+			fmt.Fprintln(os.Stderr, "cluster dev: --physical-nodes requires 3 or 6 for RF3")
+			return 2
+		}
+	}
+	listeners, err := devPhysicalPGListens(*pgListen, *pgListens, *replicas, *physicalNodes)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cluster dev: PostgreSQL endpoints: %v\n", err)
+		return 2
 	}
 	if !filepath.IsAbs(*root) || filepath.Clean(*root) != *root {
 		fmt.Fprintf(os.Stderr, "cluster dev: %v\n", errDevCluster)
@@ -368,21 +486,35 @@ func runClusterDev(args []string) int {
 		return 1
 	}
 	gw := ""
-	if *replicas == devClusterRF3 {
+	// RF3 frontends are embedded in the shard process. Keep resolving the
+	// optional gateway binary only for callers that explicitly request the
+	// legacy RF1 path; RF3 must not start a ninth role process.
+	if *replicas == devClusterRF1 && *gatewayBinary != "" {
 		gw, err = resolveDevBinary(*gatewayBinary, "vibedb-gateway")
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "cluster dev: %v\n", err)
 			return 1
 		}
 	}
-	manifest, err := ensureDevCluster(devClusterOptions{root: abs, replicas: *replicas, shardBinary: shard, gatewayBinary: gw, nodeLog: *nodeLog})
+	unlock, err := lockDevCluster(abs)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cluster dev: acquire supervisor ownership: %v\n", err)
+		return 1
+	}
+	defer unlock()
+	manifest, err := ensureDevCluster(devClusterOptions{root: abs, replicas: *replicas, shardBinary: shard, gatewayBinary: gw, nodeLog: *nodeLog, physicalNodes: *physicalNodes, pgListen: *pgListen, pgListens: listeners})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cluster dev: %v\n", err)
 		return 1
 	}
-	if err := ensureDevTables(abs, shard, &manifest, *tableSchema); err != nil {
-		fmt.Fprintf(os.Stderr, "cluster dev: prepare additional tables: %v\n", err)
-		return 1
+	if len(tableSchemas) == 0 {
+		tableSchemas = []string{""}
+	}
+	for _, schema := range tableSchemas {
+		if err := ensureDevTables(abs, shard, &manifest, schema); err != nil {
+			fmt.Fprintf(os.Stderr, "cluster dev: prepare additional tables: %v\n", err)
+			return 1
+		}
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -423,6 +555,13 @@ func ensureDevCluster(options devClusterOptions) (devClusterManifest, error) {
 	if options.replicas != devClusterRF1 && options.replicas != devClusterRF3 {
 		return devClusterManifest{}, errDevCluster
 	}
+	if options.replicas == devClusterRF3 && options.physicalNodes != 0 &&
+		options.physicalNodes != devClusterPhysicalNodes3 && options.physicalNodes != devClusterPhysicalNodes6 {
+		return devClusterManifest{}, fmt.Errorf("%w: physical node count must be 3 or 6", errDevCluster)
+	}
+	if options.replicas == devClusterRF1 && options.physicalNodes != 0 {
+		return devClusterManifest{}, fmt.Errorf("%w: RF1 does not support physical-node composition", errDevCluster)
+	}
 	manifestPath := filepath.Join(options.root, "cluster.vibejson")
 	if raw, err := readDevFile(manifestPath, 1<<20); err == nil {
 		var m devClusterManifest
@@ -431,15 +570,28 @@ func ensureDevCluster(options devClusterOptions) (devClusterManifest, error) {
 		}
 		canonical, e := vibejson.Marshal(&m)
 		if e != nil || !bytes.Equal(raw, canonical) || !validDevManifest(m, options.root) ||
-			m.Nodes != uint8(options.replicas) || m.NodeLog != options.nodeLog {
+			m.Nodes != uint8(options.replicas) ||
+			options.physicalNodes == 0 && m.NodeLog != options.nodeLog ||
+			options.physicalNodes != 0 && !m.NodeLog ||
+			options.physicalNodes != 0 && m.PhysicalNodes != uint8(options.physicalNodes) {
 			return m, errDevCluster
+		}
+		if m.PhysicalNodes != 0 {
+			if err := validateDevPhysicalPGOptions(m, options); err != nil {
+				return m, err
+			}
+			return m, completeDevPhysicalCluster(options, m)
 		}
 		return m, completeDevCluster(options, m)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return devClusterManifest{}, err
 	}
-	if entries, err := os.ReadDir(options.root); err == nil && len(entries) != 0 {
-		return devClusterManifest{}, errDevCluster
+	if entries, err := os.ReadDir(options.root); err == nil {
+		for _, entry := range entries {
+			if entry.Name() != devClusterLockName || !entry.Type().IsRegular() {
+				return devClusterManifest{}, errDevCluster
+			}
+		}
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return devClusterManifest{}, err
 	}
@@ -450,6 +602,9 @@ func ensureDevCluster(options devClusterOptions) (devClusterManifest, error) {
 }
 
 func initializeDevCluster(options devClusterOptions, manifestPath string) (devClusterManifest, error) {
+	if options.replicas == devClusterRF3 && options.physicalNodes != 0 {
+		return initializeDevPhysicalCluster(options, manifestPath)
+	}
 	var clusterID, clusterIncarnation [16]byte
 	var catalogShardIncarnation, catalogGroupID [16]byte
 	var ledgerShardIncarnation, ledgerGroupID [16]byte
@@ -909,7 +1064,7 @@ func inspectDevPreparedRoute(
 			NativeEndpoint: native, ControlEndpoint: control,
 		}
 		imageRaw, readErr := readDevFile(
-			filepath.Join(filepath.Dir(member.ServeManifest), "member.vdb"),
+			filepath.Join(devMemberRoot(member), "member.vdb"),
 			devSQLCatalogMaxBytes,
 		)
 		if readErr != nil {
@@ -1045,7 +1200,7 @@ func readDevReplicatedTableProfile(
 	requestLedgerIdentity replication.Digest,
 	image sqldriver.ReplicatedSchemaCatalogImage,
 ) (gateway.ReplicatedTableProfile, [32]byte, error) {
-	root := filepath.Dir(member.ServeManifest)
+	root := devMemberRoot(member)
 	identityRaw, err := readDevFile(filepath.Join(root, "sql-identity.vibejson"), 1<<20)
 	if err != nil {
 		return gateway.ReplicatedTableProfile{}, [32]byte{}, errors.Join(errDevCluster, err)
@@ -1136,6 +1291,16 @@ func readDevReplicatedTableProfile(
 		MaxKeyBytes:         uint16(identity.UserLimits.MaxKeyBytes),
 		MaxDocumentBytes:    uint32(identity.UserLimits.MaxDocumentBytes),
 	}, manifestDigest, nil
+}
+
+// devMemberRoot points at the group-local SQL/WAL directory. Legacy role
+// manifests kept those artifacts beside serve-rf3.vibejson; grouped physical
+// nodes record the independent root explicitly while sharing one node log.
+func devMemberRoot(member devClusterMember) string {
+	if member.GroupRoot != "" {
+		return member.GroupRoot
+	}
+	return filepath.Dir(member.ServeManifest)
 }
 
 func devLogicalSchemaForPreparedImage(identity sqldriver.ReplicatedShardStoreIdentity,
@@ -1240,6 +1405,9 @@ type devChildExit struct {
 }
 
 func serveDevCluster(ctx context.Context, m devClusterManifest, shardBinary, gatewayBinary string, diagnostics io.Writer, pgListen ...string) error {
+	if m.PhysicalNodes != 0 {
+		return serveDevPhysicalCluster(ctx, m, shardBinary, diagnostics)
+	}
 	memberCount := len(m.Members) + len(m.LedgerMembers) + len(m.DataMembers)
 	children := make([]*devChild, 0, memberCount+1)
 	var dataChildren []*devChild
@@ -1331,6 +1499,93 @@ func serveDevCluster(ctx context.Context, m devClusterManifest, shardBinary, gat
 	case exit := <-exits:
 		return errors.Join(fmt.Errorf("%s exited", exit.name), exit.err)
 	}
+}
+
+func serveDevPhysicalCluster(ctx context.Context, manifest devClusterManifest, shardBinary string, diagnostics io.Writer) error {
+	children := make([]*devChild, 0, len(manifest.NodeManifests))
+	exits := make(chan devChildExit, len(manifest.NodeManifests)+1)
+	defer func() {
+		stopDevChildren(children)
+		if diagnostics != nil {
+			for index, child := range children {
+				fmt.Fprintf(diagnostics, "development physical node %d (%s), last %d bytes:\n%s\n",
+					index+1, filepath.Base(child.command.Path), devChildDiagnosticBytes, child.diagnostics.String())
+			}
+		}
+	}()
+	for index, node := range manifest.NodeManifests {
+		child, err := startDevChild(shardBinary, []string{"serve-node", "-manifest", node.ServeManifest, "-reload-prepared-groups"}, "vibedb-shard RF3 ready")
+		if err != nil {
+			return err
+		}
+		children = append(children, child)
+		watchDevChildExit(exits, fmt.Sprintf("physical node %d", index+1), child)
+	}
+	ddlSocket, err := devPhysicalDDLSocket(manifest)
+	if err != nil {
+		return err
+	}
+	if ddlSocket != "" {
+		_, stopDDL, err := startDevDDLAt(ctx, manifest, shardBinary, children, ddlSocket)
+		if err != nil {
+			return err
+		}
+		defer stopDDL()
+	}
+	for _, child := range children {
+		if err := waitDevReadyOrExit(ctx, child, exits); err != nil {
+			return err
+		}
+	}
+	fmt.Fprintf(os.Stdout, "VibeDB development RF3 physical cluster ready: %s (%d nodes)\n", manifest.ClientEndpoint, manifest.PhysicalNodes)
+	select {
+	case <-ctx.Done():
+		return nil
+	case exit := <-exits:
+		return errors.Join(fmt.Errorf("%s exited", exit.name), exit.err)
+	}
+}
+
+// devPhysicalDDLSocket extracts the canonical gateway settings from every
+// generated node manifest. Only node zero may own a PostgreSQL listener and
+// its one supervisor socket; accepting a second endpoint would make a table
+// DDL request race two local inventories.
+func devPhysicalDDLSocket(manifest devClusterManifest) (string, error) {
+	if len(manifest.NodeManifests) == 0 {
+		return "", errDevCluster
+	}
+	var socket string
+	for index, node := range manifest.NodeManifests {
+		raw, err := readDevFile(node.ServeManifest, 4<<20)
+		if err != nil {
+			return "", err
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &fields); err != nil {
+			return "", errors.Join(errDevCluster, err)
+		}
+		gatewayRaw, ok := fields["gateway"]
+		if !ok || len(gatewayRaw) == 0 {
+			return "", errDevCluster
+		}
+		var gatewayConfig devGatewayConfig
+		if err := vibejson.Unmarshal(gatewayRaw, &gatewayConfig); err != nil {
+			return "", errors.Join(errDevCluster, err)
+		}
+		if gatewayConfig.PGListen == "" {
+			if gatewayConfig.PGDDLSocket != "" {
+				return "", fmt.Errorf("%w: PostgreSQL DDL socket without listener on physical node %d", errDevCluster, index+1)
+			}
+			continue
+		}
+		want := filepath.Join(filepath.Dir(manifest.NodeManifests[0].ServeManifest), "pg-ddl.sock")
+		if gatewayConfig.PGDDLSocket != want || index > 0 && (!gatewayConfig.ControlParticipantOnly ||
+			gatewayConfig.DDLOwnerNode != manifest.GatewayNode || gatewayConfig.DDLOwnerAddress != manifest.ClientEndpoint) {
+			return "", fmt.Errorf("%w: PostgreSQL DDL ownership must resolve to physical node 1", errDevCluster)
+		}
+		socket = gatewayConfig.PGDDLSocket
+	}
+	return socket, nil
 }
 
 func watchDevChildExit(exits chan<- devChildExit, name string, child *devChild) {
@@ -1509,26 +1764,54 @@ func (d *devDiagnostics) String() string {
 	return tail.String()
 }
 
-func reserveDevPorts(count int) ([]string, error) {
-	listeners := make([]net.Listener, count)
-	addresses := make([]string, count)
-	for i := range listeners {
-		l, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			for _, open := range listeners {
-				if open != nil {
-					open.Close()
-				}
-			}
-			return nil, err
-		}
-		listeners[i] = l
-		addresses[i] = l.Addr().String()
+func reserveDevPorts(count int, pgAddresses ...string) ([]string, error) {
+	return reserveDevPortsUsing(count, pgAddresses, net.Listen)
+}
+
+func reserveDevPortsUsing(count int, pgAddresses []string, listen func(string, string) (net.Listener, error)) (addresses []string, err error) {
+	if count < 0 {
+		return nil, errDevCluster
 	}
-	for _, l := range listeners {
-		if err := l.Close(); err != nil {
-			return nil, err
+	seen := make(map[string]bool, len(pgAddresses))
+	for _, address := range pgAddresses {
+		if address == "" {
+			continue
 		}
+		if !validDevPGAddress(address) || seen[address] {
+			return nil, fmt.Errorf("%w: PostgreSQL endpoints must be distinct literal loopback addresses", errDevCluster)
+		}
+		seen[address] = true
+	}
+	listeners := make([]net.Listener, 0, count+len(seen))
+	defer func() {
+		for index := len(listeners) - 1; index >= 0; index-- {
+			err = errors.Join(err, listeners[index].Close())
+		}
+		if err != nil {
+			addresses = nil
+		}
+	}()
+	// Hold the requested PG bindings while the kernel assigns every internal
+	// ephemeral port. Binding the actual addresses also handles address-family
+	// aliases according to the same socket rules used by the child processes.
+	for _, address := range pgAddresses {
+		if address == "" {
+			continue
+		}
+		listener, listenErr := listen("tcp", address)
+		if listenErr != nil {
+			return nil, fmt.Errorf("reserve PostgreSQL listener %q: %w", address, listenErr)
+		}
+		listeners = append(listeners, listener)
+	}
+	addresses = make([]string, count)
+	for index := range addresses {
+		listener, listenErr := listen("tcp", "127.0.0.1:0")
+		if listenErr != nil {
+			return nil, listenErr
+		}
+		listeners = append(listeners, listener)
+		addresses[index] = listener.Addr().String()
 	}
 	return addresses, nil
 }
@@ -1644,14 +1927,24 @@ func writeDevHotShardCapacity(
 	return writeDevExclusive(path, raw, 0o600)
 }
 
-func writeDevReplicaControl(
-	path string, cluster devClusterManifest,
-) error {
+func writeDevReplicaControl(path string, cluster devClusterManifest) error {
+	manifest, err := devReplicaControlConfig(cluster)
+	if err != nil {
+		return err
+	}
+	raw, err := vibejson.Marshal(&manifest)
+	if err != nil {
+		return err
+	}
+	return writeDevExclusive(path, raw, 0o600)
+}
+
+func devReplicaControlConfig(cluster devClusterManifest) (devReplicaControlManifest, error) {
 	members := [][]devClusterMember{cluster.Members, cluster.LedgerMembers, cluster.DataMembers}
-	if path == "" || len(cluster.Members) == 0 || len(cluster.Members) != len(cluster.LedgerMembers) ||
+	if len(cluster.Members) == 0 || len(cluster.Members) != len(cluster.LedgerMembers) ||
 		len(cluster.Members) != len(cluster.DataMembers) ||
 		!validDevLoopbackAddress(cluster.GatewayControl) {
-		return errDevCluster
+		return devReplicaControlManifest{}, errDevCluster
 	}
 	local := devReplicaControlEndpoint{Node: cluster.GatewayNode, Incarnation: 1,
 		ControlAddress: cluster.GatewayControl}
@@ -1665,25 +1958,34 @@ func writeDevReplicaControl(
 	if cluster.Nodes == devClusterRF3 {
 		source, err := devReplicaSplitSourceForCluster(cluster)
 		if err != nil {
-			return err
+			return devReplicaControlManifest{}, err
 		}
 		manifest.SplitSources = []devReplicaSplitSource{source}
 	}
+	// A physical node can host one member in each independent group. The
+	// gateway control grammar is node-wide, so collapse those repeated roster
+	// entries while proving that every group agrees on its shared listeners.
+	shards := make(map[string]devReplicaControlShard, len(cluster.Members))
 	for _, roleMembers := range members {
 		for _, member := range roleMembers {
-			manifest.ShardEndpoints = append(manifest.ShardEndpoints, devReplicaControlShard{
-				Node: member.Node, ControlAddress: member.Control,
-				SplitSnapshotAddress: member.Snapshot})
+			candidate := devReplicaControlShard{Node: member.Node, ControlAddress: member.Control,
+				SplitSnapshotAddress: member.Snapshot}
+			if prior, found := shards[member.Node]; found {
+				if prior != candidate {
+					return devReplicaControlManifest{}, errDevCluster
+				}
+				continue
+			}
+			shards[member.Node] = candidate
 		}
+	}
+	for _, shard := range shards {
+		manifest.ShardEndpoints = append(manifest.ShardEndpoints, shard)
 	}
 	sort.Slice(manifest.ShardEndpoints, func(left, right int) bool {
 		return manifest.ShardEndpoints[left].Node < manifest.ShardEndpoints[right].Node
 	})
-	raw, err := vibejson.Marshal(&manifest)
-	if err != nil {
-		return errors.Join(errDevCluster, err)
-	}
-	return writeDevExclusive(path, raw, 0o600)
+	return manifest, nil
 }
 
 // Build from immutable preparation authority and the actual prepared SQL
@@ -1692,7 +1994,15 @@ func devReplicaSplitSourceForCluster(cluster devClusterManifest) (devReplicaSpli
 	if cluster.Nodes != devClusterRF3 || len(cluster.DataMembers) != devClusterRF3 {
 		return devReplicaSplitSource{}, errDevCluster
 	}
-	raw, err := readDevFile(filepath.Join(filepath.Dir(cluster.CatalogPath), "prepare-data-member-1.vibejson"), 1<<20)
+	preparePath := filepath.Join(filepath.Dir(cluster.CatalogPath), "prepare-data-member-1.vibejson")
+	if cluster.PhysicalNodes != 0 && len(cluster.DataMembers) != 0 {
+		member := cluster.DataMembers[0]
+		if member.GroupRoot == "" {
+			return devReplicaSplitSource{}, errDevCluster
+		}
+		preparePath = filepath.Dir(member.GroupRoot) + "." + filepath.Base(member.GroupRoot) + ".prepare.vibejson"
+	}
+	raw, err := readDevFile(preparePath, 1<<20)
 	if err != nil {
 		return devReplicaSplitSource{}, err
 	}
@@ -1702,7 +2012,7 @@ func devReplicaSplitSourceForCluster(cluster devClusterManifest) (devReplicaSpli
 	}
 	member := cluster.DataMembers[0]
 	if prepare.MemberID != member.Member || prepare.StoreID != member.Store ||
-		prepare.Root != filepath.Dir(member.ServeManifest) ||
+		prepare.Root != devMemberRoot(member) ||
 		prepare.Distribution != string(devDataDistribution) || prepare.Shard != string(devDataShard) ||
 		prepare.Table != devDataTable {
 		return devReplicaSplitSource{}, errDevCluster
@@ -1769,17 +2079,17 @@ func devReplicaSplitSourceForCluster(cluster devClusterManifest) (devReplicaSpli
 		MaxBatchDocuments: limits.MaxBatchDocuments, MaxBatchBytes: limits.MaxBatchBytes}
 	for _, member := range cluster.DataMembers {
 		entry.Replicas = append(entry.Replicas, devReplicaSplitSourceReplica{Node: member.Node,
-			ChildRoot: filepath.Join(filepath.Dir(member.ServeManifest), "split-children")})
+			ChildRoot: filepath.Join(devMemberRoot(member), "split-children")})
 	}
 	sort.Slice(entry.Replicas, func(i, j int) bool { return entry.Replicas[i].Node < entry.Replicas[j].Node })
 	return entry, nil
 }
 
 func validDevManifest(m devClusterManifest, root string) bool {
-	if m.Format != devClusterFormat || m.Nodes != devClusterRF1 && m.Nodes != devClusterRF3 || m.NodeLog && m.Nodes != devClusterRF3 ||
-		len(m.Members) != int(m.Nodes) || len(m.LedgerMembers) != int(m.Nodes) ||
-		len(m.DataMembers) != int(m.Nodes) ||
-		!validDevLoopbackAddress(m.ClientEndpoint) || !validDevLoopbackAddress(m.GatewayControl) {
+	if m.Format != devClusterFormat || (m.Nodes != devClusterRF1 && m.Nodes != devClusterRF3) ||
+		(m.NodeLog && m.Nodes != devClusterRF3) || len(m.Members) != int(m.Nodes) ||
+		len(m.LedgerMembers) != int(m.Nodes) || len(m.DataMembers) != int(m.Nodes) ||
+		!validDevLoopbackAddress(m.ClientEndpoint) || !validDevLoopbackAddress(m.GatewayControl) || m.ClientEndpoint == m.GatewayControl {
 		return false
 	}
 	if _, err := decodeDev16(m.GatewayNode); err != nil {
@@ -1789,12 +2099,99 @@ func validDevManifest(m devClusterManifest, root string) bool {
 		return false
 	}
 	paths := []string{m.CatalogPath, m.GatewayCertificate, m.GatewayKey, m.ClientCertificate, m.ClientKey, m.Roots, m.AuthorizationPolicy, m.HotShardCapacity, m.ReplicaControl, m.DurableAckKey}
-	addresses := map[string]struct{}{m.ClientEndpoint: {}, m.GatewayControl: {}}
+	physical := m.PhysicalNodes != 0 || len(m.NodeManifests) != 0
+	if physical {
+		if m.Nodes != devClusterRF3 || m.Replicas != devClusterRF3 || !m.NodeLog ||
+			(m.PhysicalNodes != devClusterPhysicalNodes3 && m.PhysicalNodes != devClusterPhysicalNodes6) ||
+			len(m.NodeManifests) != int(m.PhysicalNodes) {
+			return false
+		}
+	}
+	// The gateway-control socket is a different service from a physical
+	// node's shard-control socket. Address ownership therefore allows repeated
+	// role entries only when they resolve to the same physical node.
+	addressOwners := map[string]string{m.ClientEndpoint: "client", m.GatewayControl: "gateway-control"}
 	nodes := map[string]struct{}{m.GatewayNode: {}, m.ClientNode: {}}
 	stores := make(map[string]struct{}, len(m.Members)+len(m.LedgerMembers)+len(m.DataMembers))
-	for _, members := range [][]devClusterMember{m.Members, m.LedgerMembers, m.DataMembers} {
+	physicalByNode := make(map[string]int, len(m.NodeManifests))
+	physicalListeners := make(map[string]devPrepareListeners, len(m.NodeManifests))
+	seenPhysicalNodes := make(map[string]struct{}, len(m.NodeManifests))
+	gatewayByNode := make(map[string]struct{}, len(m.NodeManifests))
+	if physical {
+		for index, node := range m.NodeManifests {
+			if _, err := decodeDev16(node.Node); err != nil || node.Node == m.ClientNode {
+				return false
+			}
+			if _, duplicate := physicalByNode[node.Node]; duplicate {
+				return false
+			}
+			physicalByNode[node.Node] = index
+			if _, err := decodeDev16(node.GatewayNode); err != nil || node.GatewayNode == node.Node || node.GatewayNode == m.ClientNode {
+				return false
+			}
+			if _, duplicate := gatewayByNode[node.GatewayNode]; duplicate {
+				return false
+			}
+			gatewayByNode[node.GatewayNode] = struct{}{}
+			if node.GatewayNode == m.GatewayNode && index != 0 {
+				return false
+			}
+			for _, path := range []string{node.Certificate, node.Key, node.ServeManifest, node.CatalogSessionJournal, node.DirectIssuerJournal, node.FallbackJournal, node.ExecutionPinJournal} {
+				paths = append(paths, path)
+			}
+			// The cluster-level gateway credential names the designated
+			// controller's frontend credential; the other frontend credentials
+			// remain node-local. Node manifests are shared by the role groups
+			// hosted on one physical process and are already included above.
+			if index == 0 && (node.GatewayCertificate != m.GatewayCertificate || node.GatewayKey != m.GatewayKey || node.FrontendListen != m.ClientEndpoint) {
+				return false
+			}
+			if index != 0 {
+				paths = append(paths, node.GatewayCertificate)
+				paths = append(paths, node.GatewayKey)
+			}
+			if !validDevLoopbackAddress(node.GatewayControl) || !validDevLoopbackAddress(node.FrontendListen) {
+				return false
+			}
+			if node.ServeManifest != filepath.Join(root, fmt.Sprintf("node-%d", index+1), "serve-rf3.vibejson") ||
+				len(node.Groups) == 0 || len(node.Groups) > devPhysicalMaxGroups {
+				return false
+			}
+			if node.CatalogSessionJournal != filepath.Join(filepath.Dir(node.ServeManifest), "gateway", "catalog-session") ||
+				node.DirectIssuerJournal != node.CatalogSessionJournal+".pg-writes.direct" ||
+				node.FallbackJournal != node.CatalogSessionJournal+".pg-writes" ||
+				node.ExecutionPinJournal != node.CatalogSessionJournal+".durable-pins" {
+				return false
+			}
+			if node.GatewayNode == m.GatewayNode && node.GatewayControl != m.GatewayControl {
+				return false
+			}
+			for _, address := range []string{node.GatewayControl, node.FrontendListen} {
+				if owner, exists := addressOwners[address]; exists && owner != "client" && owner != "gateway-control" {
+					return false
+				}
+				if address == m.ClientEndpoint && index != 0 || address == m.GatewayControl && node.GatewayNode != m.GatewayNode {
+					return false
+				}
+				addressOwners[address] = "physical:" + node.Node
+			}
+			for ordinal, groupRoot := range node.Groups {
+				if groupRoot != filepath.Join(filepath.Dir(node.ServeManifest), fmt.Sprintf("group-%d", ordinal)) {
+					return false
+				}
+				paths = append(paths, groupRoot)
+			}
+		}
+		if len(physicalByNode) != int(m.PhysicalNodes) || physicalByNode[m.NodeManifests[0].Node] != 0 || m.NodeManifests[0].GatewayNode != m.GatewayNode {
+			return false
+		}
+	}
+	for roleIndex, members := range [][]devClusterMember{m.Members, m.LedgerMembers, m.DataMembers} {
+		roleNodes := make(map[string]struct{}, len(members))
 		for index, member := range members {
-			paths = append(paths, member.ServeManifest)
+			if !physical {
+				paths = append(paths, member.ServeManifest)
+			}
 			if member.Member != uint64(index+1) {
 				return false
 			}
@@ -1804,10 +2201,41 @@ func validDevManifest(m devClusterManifest, root string) bool {
 			if _, err := decodeDev16(member.Store); err != nil {
 				return false
 			}
-			if _, duplicate := nodes[member.Node]; duplicate {
+			if _, duplicate := roleNodes[member.Node]; duplicate {
 				return false
 			}
-			nodes[member.Node] = struct{}{}
+			roleNodes[member.Node] = struct{}{}
+			if physical {
+				physicalIndex, found := physicalByNode[member.Node]
+				if !found || member.PhysicalNode != member.Node || member.ServeManifest != m.NodeManifests[physicalIndex].ServeManifest {
+					return false
+				}
+				seenPhysicalNodes[member.Node] = struct{}{}
+				placement := devPhysicalPlacement(int(m.PhysicalNodes), roleIndex)
+				if index >= len(placement) || placement[index] != physicalIndex {
+					return false
+				}
+				if member.GroupRoot == "" || filepath.Dir(member.GroupRoot) != filepath.Dir(member.ServeManifest) {
+					return false
+				}
+				if !containsString(m.NodeManifests[physicalIndex].Groups, member.GroupRoot) {
+					return false
+				}
+				listeners := devPrepareListeners{Peer: member.Peer, Native: member.Native, Snapshot: member.Snapshot, Control: member.Control}
+				if prior, exists := physicalListeners[member.Node]; exists && prior != listeners {
+					return false
+				}
+				physicalListeners[member.Node] = listeners
+				localAddresses := map[string]bool{m.NodeManifests[physicalIndex].FrontendListen: true, m.NodeManifests[physicalIndex].GatewayControl: true}
+				for _, address := range []string{member.Peer, member.Native, member.Snapshot, member.Control} {
+					if localAddresses[address] {
+						return false
+					}
+					localAddresses[address] = true
+				}
+			} else if member.PhysicalNode != "" || member.GroupRoot != "" {
+				return false
+			}
 			if _, duplicate := stores[member.Store]; duplicate {
 				return false
 			}
@@ -1816,10 +2244,31 @@ func validDevManifest(m devClusterManifest, root string) bool {
 				if !validDevLoopbackAddress(address) {
 					return false
 				}
-				if _, duplicate := addresses[address]; duplicate {
+				if owner, duplicate := addressOwners[address]; duplicate {
+					if !physical || owner != "physical:"+member.Node {
+						return false
+					}
+				}
+				addressOwners[address] = "physical:" + member.Node
+			}
+		}
+	}
+	if physical {
+		if len(seenPhysicalNodes) != len(m.NodeManifests) {
+			return false
+		}
+		for index, node := range m.NodeManifests {
+			if _, storageIdentity := physicalByNode[node.GatewayNode]; storageIdentity || node.GatewayNode == m.ClientNode || node.GatewayNode == m.GatewayNode && index != 0 {
+				return false
+			}
+		}
+	} else {
+		for _, members := range [][]devClusterMember{m.Members, m.LedgerMembers, m.DataMembers} {
+			for _, member := range members {
+				if _, duplicate := nodes[member.Node]; duplicate {
 					return false
 				}
-				addresses[address] = struct{}{}
+				nodes[member.Node] = struct{}{}
 			}
 		}
 	}
@@ -1836,6 +2285,15 @@ func validDevManifest(m devClusterManifest, root string) bool {
 	return true
 }
 
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
 func validDevLoopbackAddress(address string) bool {
 	host, port, err := net.SplitHostPort(address)
 	if err != nil || host != "127.0.0.1" {
@@ -1844,6 +2302,16 @@ func validDevLoopbackAddress(address string) bool {
 	value, err := strconv.Atoi(port)
 	return err == nil && value > 0 && value <= 65535 && strconv.Itoa(value) == port
 }
+
+func devIDString(raw []byte) string {
+	const digits = "0123456789abcdef"
+	result := make([]byte, len(raw)*2)
+	for index, value := range raw {
+		result[index*2], result[index*2+1] = digits[value>>4], digits[value&15]
+	}
+	return string(result)
+}
+
 func decodeDev16(value string) ([16]byte, error) {
 	var out [16]byte
 	if len(value) != 32 {

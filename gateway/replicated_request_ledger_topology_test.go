@@ -11,7 +11,7 @@ import (
 )
 
 func TestDurableRequestStreamBudgetIsHardAndContextBound(t *testing.T) {
-	worstOwned := requestledger.MaxPlanPageBytes + durableRequestMaxParticipantFrameBytes +
+	worstOwned := requestledger.MaxPlanPageBytes + durableRequestMaxTargetFrameBytes +
 		replication.MaxCommandBytes + requestledger.MaxContinuationRecordBytes + (8 << 20)
 	if durableRequestStreamSlotBytes < worstOwned {
 		t.Fatalf("slot=%d cannot hold conservative owned bytes=%d",
@@ -57,7 +57,7 @@ func TestDurableRequestStreamBudgetIsHardAndContextBound(t *testing.T) {
 var durableRequestLookupSink DurableRequestLedgerHome
 
 func TestDurableRequestTopologyLookupAllocationsIgnoreRangeCount(t *testing.T) {
-	base := durableFaultParticipants(t)[0].Route
+	base := durableFaultTargets(t)[0].Route
 	for _, count := range []int{1, 1_000, 100_000} {
 		ranges := make([]DurableRequestLedgerRange, count)
 		for index := range ranges {

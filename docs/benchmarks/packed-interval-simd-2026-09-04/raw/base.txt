@@ -1,0 +1,46 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/query
+cpu: Apple M4 Max
+BenchmarkFilePackedIntegerIntervalCount/empty-16  	     100	   2227635 ns/op	         1.000 result-rows	     16384 rows	       1 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCount/empty-16  	     100	   2236452 ns/op	         1.000 result-rows	     16384 rows	       2 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCount/empty-16  	     100	   2228878 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCount/empty-16  	     100	   2220551 ns/op	         1.000 result-rows	     16384 rows	       2 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCount/empty-16  	     100	   2221665 ns/op	         1.000 result-rows	     16384 rows	       2 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCount/sparse-16 	     100	   2235329 ns/op	         1.000 result-rows	     16384 rows	       1 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCount/sparse-16 	     100	   2231832 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCount/sparse-16 	     100	   2225734 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCount/sparse-16 	     100	   2231662 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCount/sparse-16 	     100	   2235601 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCount/half-16   	     100	   2361290 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCount/half-16   	      98	   2360160 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCount/half-16   	     100	   2360637 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCount/half-16   	     100	   2369692 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCount/half-16   	      99	   2376034 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCount/full-16   	     100	   2372441 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCount/full-16   	     100	   2380036 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCount/full-16   	      99	   2379847 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCount/full-16   	     100	   2382390 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCount/full-16   	     100	   2375832 ns/op	         1.000 result-rows	     16384 rows	       5 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCountWide/empty-16         	     100	   2177342 ns/op	         1.000 result-rows	     16384 rows	       2 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCountWide/empty-16         	     100	   2177451 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCountWide/empty-16         	     100	   2169895 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCountWide/empty-16         	     100	   2180317 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCountWide/empty-16         	     100	   2176732 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCountWide/sparse-16        	     100	   2178918 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCountWide/sparse-16        	     100	   2175561 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCountWide/sparse-16        	     100	   2175732 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCountWide/sparse-16        	     100	   2177216 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCountWide/sparse-16        	     100	   2172025 ns/op	         1.000 result-rows	     16384 rows	       1 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCountWide/half-16          	     100	   2174106 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCountWide/half-16          	     100	   2170199 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCountWide/half-16          	     100	   2170191 ns/op	         1.000 result-rows	     16384 rows	       1 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCountWide/half-16          	     100	   2178821 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCountWide/half-16          	     100	   2173688 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCountWide/full-16          	     100	   2319799 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCountWide/full-16          	     100	   2312523 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCountWide/full-16          	     100	   2312471 ns/op	         1.000 result-rows	     16384 rows	       1 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCountWide/full-16          	     100	   2321841 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCountWide/full-16          	     100	   2315316 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/thesyncim/vibedb/query	10.668s

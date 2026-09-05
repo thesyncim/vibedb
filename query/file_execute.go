@@ -144,9 +144,18 @@ type fileWorkspace struct {
 	// Execs. The path and needle copies let an Exec reused with freshly
 	// compiled equivalent queries retain the warmed filter without pinning any
 	// one query plan.
-	tokenFilter       *durable.EqFilter
-	tokenFilterPath   string
-	tokenFilterNeedle []byte
+	tokenFilter         *durable.EqFilter
+	tokenFilterPath     string
+	tokenFilterNeedle   []byte
+	orderedFilter       *durable.IntegerOrderFilter
+	orderedFilterPath   string
+	orderedFilterOp     durable.IntegerOrder
+	orderedFilterNeedle int64
+	intervalFilter      *durable.IntegerIntervalFilter
+	intervalFilterPath  string
+	intervalLower       int64
+	intervalUpper       int64
+	intervalUnbounded   bool
 
 	// workers is one scan Workspace per worker goroutine, indexed by worker
 	// number. Indexing by worker rather than by batch is deliberate: nothing a
@@ -227,6 +236,15 @@ func (w *fileWorkspace) release() {
 	w.tokenFilter = nil
 	w.tokenFilterPath = ""
 	w.tokenFilterNeedle = nil
+	w.orderedFilter = nil
+	w.orderedFilterPath = ""
+	w.orderedFilterOp = 0
+	w.orderedFilterNeedle = 0
+	w.intervalFilter = nil
+	w.intervalFilterPath = ""
+	w.intervalLower = 0
+	w.intervalUpper = 0
+	w.intervalUnbounded = false
 	w.workers = nil
 	w.segments = nil
 	w.arenas = nil
@@ -253,6 +271,45 @@ func (w *fileWorkspace) tokenEqFilterFor(path string, needle []byte) (*durable.E
 	w.tokenFilter = filter
 	w.tokenFilterPath = strings.Clone(path)
 	w.tokenFilterNeedle = append(w.tokenFilterNeedle[:0], needle...)
+	return filter, nil
+}
+
+func (w *fileWorkspace) tokenIntegerOrderFilterFor(
+	path string, needle int64, op durable.IntegerOrder,
+) (*durable.IntegerOrderFilter, error) {
+	if w.orderedFilter != nil && w.orderedFilterPath == path &&
+		w.orderedFilterNeedle == needle && w.orderedFilterOp == op {
+		return w.orderedFilter, nil
+	}
+	filter, err := durable.NewIntegerOrderFilter(path, needle, op)
+	if err != nil {
+		return nil, err
+	}
+	w.orderedFilter = filter
+	w.orderedFilterPath = strings.Clone(path)
+	w.orderedFilterNeedle = needle
+	w.orderedFilterOp = op
+	return filter, nil
+}
+
+func (w *fileWorkspace) tokenIntegerIntervalFilterFor(
+	path string, interval durable.IntegerInterval,
+) (*durable.IntegerIntervalFilter, error) {
+	if w.intervalFilter != nil && w.intervalFilterPath == path &&
+		w.intervalLower == interval.Lower &&
+		w.intervalUpper == interval.Upper &&
+		w.intervalUnbounded == interval.UpperUnbounded {
+		return w.intervalFilter, nil
+	}
+	filter, err := durable.NewIntegerIntervalFilter(path, interval)
+	if err != nil {
+		return nil, err
+	}
+	w.intervalFilter = filter
+	w.intervalFilterPath = strings.Clone(path)
+	w.intervalLower = interval.Lower
+	w.intervalUpper = interval.Upper
+	w.intervalUnbounded = interval.UpperUnbounded
 	return filter, nil
 }
 
@@ -589,6 +646,33 @@ func (p *plan) runFileInto(
 	coveringColumns, handled, directErr := p.runDirectFileAggregate(snapshot, e)
 	if handled {
 		stats.CoveringColumns = coveringColumns
+		e.Stats = stats
+		if directErr == nil {
+			directErr = e.Workspace.checkCanceled()
+		}
+		return directErr
+	}
+	intervalFilter, handled, directErr := p.runDirectFileTokenIntegerIntervalCount(snapshot, e)
+	if handled {
+		// The strict FOR interval lane is a serial full scan with no row
+		// fallback, just like the one-bound ordered lane.
+		stats.Workers = 1
+		stats.RowsScanned = intervalFilter.scanned
+		stats.TokenFilterRows = intervalFilter.token
+		stats.TokenFilterFallbackRows = intervalFilter.fallback
+		e.Stats = stats
+		if directErr == nil {
+			directErr = e.Workspace.checkCanceled()
+		}
+		return directErr
+	}
+	orderedFilter, handled, directErr := p.runDirectFileTokenIntegerOrderCount(snapshot, e)
+	if handled {
+		// The strict FOR lane is a serial full scan with no row fallback.
+		stats.Workers = 1
+		stats.RowsScanned = orderedFilter.scanned
+		stats.TokenFilterRows = orderedFilter.token
+		stats.TokenFilterFallbackRows = orderedFilter.fallback
 		e.Stats = stats
 		if directErr == nil {
 			directErr = e.Workspace.checkCanceled()
@@ -1323,9 +1407,10 @@ type fileGroup struct {
 type filePartialMode uint8
 
 const (
-	filePartialDetached filePartialMode = iota // worker rows outlive the batch
-	filePartialBorrowed                        // synchronous consumer owns cells before reuse
-	filePartialOrdered                         // synchronous consumer, certified primary order
+	filePartialDetached       filePartialMode = iota // worker rows outlive the batch
+	filePartialBorrowed                              // synchronous consumer owns cells before reuse
+	filePartialOrdered                               // synchronous consumer, certified primary order
+	filePartialOrderedCovered                        // ordered and native bounds cover the predicate
 )
 
 // makeFilePartial reduces one batch of raw documents. Workers detach rows
@@ -1354,6 +1439,13 @@ func (p *plan) makeFilePartial(
 		}
 	}
 	slot := &slots[batch.seq%uint64(len(slots))]
+	if mode != filePartialDetached {
+		if fast, handled := p.makeFileRawRowsPartial(
+			batch, w, slot, arena, mode,
+		); handled {
+			return fast
+		}
+	}
 	// The batch Segment carries no postings, and that is a decision, not an
 	// omission. Postings are an inverted index over a Segment's top-level keys
 	// and scalars; building one costs a hash and a bucket append per member of
@@ -1419,10 +1511,22 @@ func (p *plan) makeFilePartial(
 		part.err = err
 		return part
 	}
-	selected, err := p.selectRows(ctx, nil, false, w)
-	if err != nil {
-		part.err = err
-		return part
+	var (
+		selected []int
+		err      error
+	)
+	if mode == filePartialOrderedCovered {
+		selected = w.selected[:0]
+		for row := range ctx.rows {
+			selected = append(selected, row)
+		}
+		w.selected = selected
+	} else {
+		selected, err = p.selectRows(ctx, nil, false, w)
+		if err != nil {
+			part.err = err
+			return part
+		}
 	}
 	if err := w.eval.firstError(); err != nil {
 		part.err = err
@@ -1505,87 +1609,7 @@ func (p *plan) makeFilePartial(
 		slot.accs, part.accs = accs, accs
 		part.bytes = int64(len(accs)) * aggAccStructBytes
 	default:
-		if len(p.order) != 0 && mode != filePartialOrdered {
-			if err := w.checkCanceled(); err != nil {
-				part.err = err
-				return part
-			}
-			slices.SortStableFunc(selected, func(a, b int) int { return p.compareRows(ctx, a, b) })
-			if err := w.checkCanceled(); err != nil {
-				part.err = err
-				return part
-			}
-		}
-		if p.hasLimit && len(selected) > p.limit {
-			selected = selected[:p.limit]
-		}
-		// Reserve the whole batch's scalar-header slab before handing out the
-		// first row. Growing it a row at a time leaves every superseded array
-		// live through the rows already pointing into it; one exact batch
-		// reservation removes those transient generations and makes both the
-		// allocation and retained-memory cost proportional to the slab kept.
-		order := p.order
-		if mode != filePartialDetached {
-			order = nil
-		}
-		headsPerRow := len(p.columns) + len(order)
-		if headsPerRow != 0 &&
-			len(selected) > int(^uint(0)>>1)/headsPerRow {
-			part.err = fmt.Errorf("query: durable result scalar arena overflows int")
-			return part
-		}
-		if err := arena.reserveHeads(len(selected) * headsPerRow); err != nil {
-			part.err = err
-			return part
-		}
-		prev := slot.rows
-		rows := prev[:0]
-		for at, row := range selected {
-			if err := cancellationCheckpoint(w.cancel, at); err != nil {
-				part.err = err
-				return part
-			}
-			r := fileRow{ordinal: batch.base + uint64(row)}
-			// The projected and ordering scalars share one header span split in
-			// two, and every byte they detach is packed into one span of the
-			// worker's arena, so a row of c columns ordered by k keys costs two
-			// reservations instead of the 2+2(c+k) allocations that a slice per
-			// role plus a clone per field used to cost — and, since the arena
-			// outlives the execution, no allocation at all once it is warm.
-			var used int64
-			var arenaErr error
-			if mode != filePartialDetached {
-				// The synchronous consumer copies cells into Result before the
-				// batch workspace is reused. Only scalar headers are needed;
-				// detaching bytes here would copy every projected value twice.
-				r.values, arenaErr = arena.takeHeads(len(p.columns))
-				if arenaErr != nil {
-					part.err = arenaErr
-					return part
-				}
-				for col := range p.columns {
-					r.values[col] = scalar{}
-					if p.columns[col].value >= 0 {
-						r.values[col] = ctx.values[p.columns[col].value][row]
-					}
-					used += scalarBytes(r.values[col])
-				}
-			} else {
-				r.values, used, arenaErr = ownScalars(arena, ctx, row, p.columns, order, nil)
-			}
-			if arenaErr != nil {
-				part.err = arenaErr
-				return part
-			}
-			r.order = r.values[len(p.columns):len(r.values):len(r.values)]
-			r.values = r.values[:len(p.columns):len(p.columns)]
-			part.bytes += fileRowStructBytes + used
-			rows = append(rows, r)
-		}
-		// Same reason as the grouped branch: a stale row header still owns the
-		// bytes it detached from a batch two rings ago.
-		clearTail(prev, len(rows))
-		slot.rows, part.rows = rows, rows
+		return p.makeFileRowsPartial(part, selected, ctx, batch, slot, arena, mode, w)
 	}
 	for i := range part.groups {
 		detachAggregateExtremes(part.groups[i].accs, p.columns)

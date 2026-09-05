@@ -23,7 +23,7 @@ func executionPinTestBinding() executionpin.Binding {
 		RequestKeyDigest: digest(1), RequestDigest: digest(2),
 		CatalogGeneration:    3,
 		SchemaManifestDigest: digest(5), TransactionManifestDigest: digest(6),
-		ParticipantAuthorityRoot: digest(7), ParticipantCount: 8,
+		TargetAuthorityRoot: digest(7), TargetCount: 8,
 		ExecutionContractDigest: digest(9), LedgerHomeGroup: id(10),
 	}
 }

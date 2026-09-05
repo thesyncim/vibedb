@@ -16,8 +16,8 @@ const (
 	// request-ledger system journal ceiling.
 	ReplicatedUserRecoveryJournalBytes = (uint64(16) << 20) + 34*storeio.RecoveryJournalMinSectorSize
 	// ReplicatedTransactionMarkerBytes is the exact fixed decision-log window.
-	// Replicated SQL has exactly the user and system participants; one MiB holds
-	// 2,048 current two-participant decisions so recycle is pressure handling,
+	// Replicated SQL has exactly the user and system targets; one MiB holds
+	// 2,048 current two-target decisions so recycle is pressure handling,
 	// not a per-apply steady-state fence.
 	ReplicatedTransactionMarkerBytes uint64 = 1 << 20
 	// ReplicatedSystemRecoveryJournalBytes is the exact sealed decision suffix

@@ -122,7 +122,7 @@ func TestUpdateCollectionsAdmissionBounds(t *testing.T) {
 	}
 }
 
-func TestUpdateCollectionsParticipantCountBound(t *testing.T) {
+func TestUpdateCollectionsTargetCountBound(t *testing.T) {
 	var db Database
 	parts := make([]*Collection, defaultHeapMaxTxnCollections+1)
 	for i := range parts {
@@ -134,15 +134,36 @@ func TestUpdateCollectionsParticipantCountBound(t *testing.T) {
 	}
 }
 
-func TestUpdateCollectionsUnknownParticipant(t *testing.T) {
+func TestUpdateCollectionsUnknownTarget(t *testing.T) {
 	var db Database
 	a := mustCollection(t, &db, "a")
 	err := UpdateCollections([]*Collection{a}, func(b *DatabaseBatch) error {
 		_, err := b.Collection("missing")
 		return err
 	})
-	if !errors.Is(err, ErrTxnParticipant) {
-		t.Fatalf("err=%v want ErrTxnParticipant", err)
+	if !errors.Is(err, ErrTxnCollection) {
+		t.Fatalf("err=%v want ErrTxnCollection", err)
+	}
+}
+
+func TestUpdateCollectionsLoneTargetCallerMutation(t *testing.T) {
+	var db Database
+	original := mustCollection(t, &db, "original")
+	targets := []*Collection{original}
+
+	err := UpdateCollections(targets, func(batch *DatabaseBatch) error {
+		targets[0] = nil
+		wb, err := batch.Collection("original")
+		if err != nil {
+			return err
+		}
+		return wb.Put("k", []byte(`{"n":1}`))
+	})
+	if err != nil {
+		t.Fatalf("UpdateCollections: %v", err)
+	}
+	if raw, ok := mustSnapshotRaw(t, original, "k"); !ok || string(raw) != `{"n":1}` {
+		t.Fatalf("original.k=%q,%v", raw, ok)
 	}
 }
 

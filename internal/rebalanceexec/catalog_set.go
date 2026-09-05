@@ -17,7 +17,7 @@ type catalogSetAuthority interface {
 }
 
 // executeCatalogSet discovers siblings from the replicated directory, never
-// a process-local batch. All participants keep their ordinary per-group Raft
+// a process-local batch. All targets keep their ordinary per-group Raft
 // and action proofs; only the shared catalog publication is combined.
 func (executor *Executor) executeCatalogSet(ctx context.Context, operation rebalance.OperationID, plan *rebalance.Plan, postRemove bool) (bool, error) {
 	if executor.options.Directory == nil || executor.options.Observer == nil {

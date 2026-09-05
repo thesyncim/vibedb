@@ -13,10 +13,10 @@ var (
 	ErrReplicatedTransactionConflict = errors.New("gateway: replicated transaction mutation conflict")
 )
 
-// ReplicatedTransactionParticipant is one already grouped, byte-native shard
+// ReplicatedTransactionTarget is one already grouped, byte-native shard
 // mutation. Relation IDs are authenticated by Route.Command's schema
 // generation; SQL text and relation names never enter this boundary.
-type ReplicatedTransactionParticipant struct {
+type ReplicatedTransactionTarget struct {
 	Route        ReplicatedRoute
 	Batches      []replication.RelationMutationBatch
 	BucketBits   uint8

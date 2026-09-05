@@ -188,6 +188,19 @@ type Explanation struct {
 	ScatterReason   ScatterReason
 }
 
+// preparedQueryExecution is the session-local physical planning cache behind
+// the pgwire prepared-statement path. PreparedPlan and planner.Plan are
+// immutable; the remaining fields certify the catalog generation and route
+// shape for which the physical tree was selected.
+type preparedQueryExecution struct {
+	generation uint64
+	prepared   *PreparedPlan
+	routeKind  distribution.RouteKind
+	targets    int
+	physical   *queryplanner.Plan
+	planning   queryplanner.OptimizerStatistics
+}
+
 // Query routes and dispatches q, retrying against a refreshed generation when a
 // shard reports the pinned generation is stale. It pins one generation per
 // attempt and never mixes generations within an attempt.
@@ -196,14 +209,45 @@ func (e *Executor) Query(ctx context.Context, q Query) (*Result, error) {
 }
 
 func (e *Executor) queryWithProfile(ctx context.Context, q Query, profile Profile) (*Result, error) {
+	return e.queryWithProfileValidation(ctx, q, profile, -1)
+}
+
+// queryPreparedWithProfile is the pgwire read path. postgresStatement already
+// performed the full typed semantic prepare and retains that compiled statement,
+// so execution only needs to validate the bound transport values and arity.
+// Keeping this entry point private prevents general Executor callers from
+// bypassing validateTypedQuery.
+func (e *Executor) queryPreparedWithProfile(
+	ctx context.Context,
+	q Query,
+	profile Profile,
+	preparedParams int,
+	cache *preparedQueryExecution,
+) (*Result, error) {
+	return e.queryWithProfileValidation(ctx, q, profile, preparedParams, cache)
+}
+
+func (e *Executor) queryWithProfileValidation(
+	ctx context.Context,
+	q Query,
+	profile Profile,
+	preparedParams int,
+	preparedCache ...*preparedQueryExecution,
+) (*Result, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if err := validateTypedQuery(ctx, &q); err != nil {
-		return nil, err
+	if preparedParams >= 0 {
+		if err := validatePreparedQueryParameters(&q, preparedParams); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := validateTypedQuery(ctx, &q); err != nil {
+			return nil, err
+		}
 	}
 	opctx, cancel := context.WithTimeout(ctx, profile.GlobalDeadline)
 	defer cancel()
@@ -215,7 +259,8 @@ func (e *Executor) queryWithProfile(ctx context.Context, q Query, profile Profil
 	defer leases.release()
 
 	var staleGen uint64
-	for attempt := 0; ; attempt++ {
+	refreshedMiss := false
+	for attempt := 0; ; {
 		if err := opctx.Err(); err != nil {
 			return nil, err
 		}
@@ -230,9 +275,33 @@ func (e *Executor) queryWithProfile(ctx context.Context, q Query, profile Profil
 			nativeAttempt = &replicatedSQLAttempt{snapshot: snap}
 			attemptContext = context.WithValue(opctx, replicatedSQLSnapshotKey{}, nativeAttempt)
 		}
-		prepared, err := snap.Prepare(opctx, q.SQL)
-		if err != nil {
-			return nil, err
+		var cache *preparedQueryExecution
+		if len(preparedCache) != 0 {
+			cache = preparedCache[0]
+		}
+		prepared := (*PreparedPlan)(nil)
+		if cache != nil && cache.generation == snap.Generation() {
+			prepared = cache.prepared
+		}
+		if prepared == nil {
+			prepared, err = snap.Prepare(opctx, q.SQL)
+			if err != nil {
+				if errors.Is(err, ErrTableNotPlaced) && !refreshedMiss {
+					refreshedMiss = true
+					leases.releaseLast()
+					if refreshErr := e.refreshAfterCatalogMiss(opctx, snap.Generation()); refreshErr != nil {
+						return nil, preserveCatalogMiss(err, refreshErr)
+					}
+					staleGen = 0
+					continue
+				}
+				return nil, err
+			}
+			if cache != nil {
+				*cache = preparedQueryExecution{
+					generation: snap.Generation(), prepared: prepared,
+				}
+			}
 		}
 		if prepared.statement.Kind != sqlast.KindSelect {
 			// Query is the read path: it fans out and merges, so it must never
@@ -281,11 +350,12 @@ func (e *Executor) queryWithProfile(ctx context.Context, q Query, profile Profil
 			if isStaleErr(indexErr) && attempt < e.maxRetry {
 				staleGen = snap.Generation()
 				e.metrics.observeRetry()
+				attempt++
 				continue
 			}
 			return nil, indexErr
 		}
-		pl, err := e.routeContext(opctx, snap, &q, bound, profile)
+		pl, err := e.routeContextCached(opctx, snap, &q, bound, profile, cache)
 		if err != nil {
 			return nil, err
 		}
@@ -309,6 +379,7 @@ func (e *Executor) queryWithProfile(ctx context.Context, q Query, profile Profil
 		if isStaleErr(err) && attempt < e.maxRetry {
 			staleGen = snap.Generation()
 			e.metrics.observeRetry()
+			attempt++
 			continue
 		}
 		return nil, err
@@ -344,7 +415,8 @@ func (e *Executor) Exec(ctx context.Context, q Query) (*Result, error) {
 	defer leases.release()
 
 	var staleGen uint64
-	for attempt := 0; ; attempt++ {
+	refreshedMiss := false
+	for attempt := 0; ; {
 		if err := opctx.Err(); err != nil {
 			return nil, err
 		}
@@ -355,6 +427,15 @@ func (e *Executor) Exec(ctx context.Context, q Query) (*Result, error) {
 		leases.add(lease)
 		prepared, err := snap.Prepare(opctx, q.SQL)
 		if err != nil {
+			if errors.Is(err, ErrTableNotPlaced) && !refreshedMiss {
+				refreshedMiss = true
+				leases.releaseLast()
+				if refreshErr := e.refreshAfterCatalogMiss(opctx, snap.Generation()); refreshErr != nil {
+					return nil, preserveCatalogMiss(err, refreshErr)
+				}
+				staleGen = 0
+				continue
+			}
 			return nil, err
 		}
 		if prepared.statement.Kind == sqlast.KindSelect {
@@ -380,6 +461,7 @@ func (e *Executor) Exec(ctx context.Context, q Query) (*Result, error) {
 				if isStaleErr(err) && attempt < e.maxRetry {
 					staleGen = snap.Generation()
 					e.metrics.observeRetry()
+					attempt++
 					continue
 				}
 				return nil, err
@@ -394,14 +476,14 @@ func (e *Executor) Exec(ctx context.Context, q Query) (*Result, error) {
 			e.observePressureCall(*call)
 		}
 		if call != nil && bound.requiresIndexTransaction() {
-			participants, participantErr := appendBoundWriteParticipants(
+			targets, targetErr := appendBoundWriteTargets(
 				nil, *call, &q, bound, profile,
 			)
-			if participantErr != nil {
-				return nil, participantErr
+			if targetErr != nil {
+				return nil, targetErr
 			}
-			sortTransactionParticipants(participants)
-			res, err = e.executeTransaction(opctx, snap, participants, profile)
+			sortTransactionTargets(targets)
+			res, err = e.executeTransaction(opctx, snap, targets, profile)
 		} else if call != nil {
 			e.metrics.observeRoute(kind, 1, scatter)
 			res, err = e.single(opctx, *call, profile)
@@ -424,6 +506,7 @@ func (e *Executor) Exec(ctx context.Context, q Query) (*Result, error) {
 		if isStaleErr(err) && attempt < e.maxRetry {
 			staleGen = snap.Generation()
 			e.metrics.observeRetry()
+			attempt++
 			continue
 		}
 		return nil, err
@@ -642,15 +725,34 @@ func (e *Executor) Explain(ctx context.Context, q Query) (*Explanation, error) {
 	if err != nil {
 		return nil, err
 	}
-	snap, lease, err := e.pin(ctx, 0, 0)
-	if err != nil {
-		return nil, err
+	var snap *Snapshot
+	var lease catalogLease
+	var prepared *PreparedPlan
+	refreshedMiss := false
+	for {
+		snap, lease, err = e.pin(ctx, 0, 0)
+		if err != nil {
+			return nil, err
+		}
+		prepared, err = snap.Prepare(ctx, q.SQL)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, ErrTableNotPlaced) || refreshedMiss {
+			lease.release()
+			return nil, err
+		}
+		refreshedMiss = true
+		staleGeneration := lease.generation
+		lease.release()
+		refreshCtx, cancel := context.WithTimeout(ctx, e.profileFor(q.Class).GlobalDeadline)
+		refreshErr := e.refreshAfterCatalogMiss(refreshCtx, staleGeneration)
+		cancel()
+		if refreshErr != nil {
+			return nil, preserveCatalogMiss(err, refreshErr)
+		}
 	}
 	defer lease.release()
-	prepared, err := snap.Prepare(ctx, q.SQL)
-	if err != nil {
-		return nil, err
-	}
 	if prepared.statement.Kind != sqlast.KindSelect {
 		// Explain is a read-path diagnostic: it plans a distributed SELECT and
 		// never dispatches a mutation, so it refuses non-SELECT statements.
@@ -754,22 +856,9 @@ func (e *Executor) pin(ctx context.Context, attempt int, staleGen uint64) (*Snap
 	if e == nil || e.catalog == nil {
 		return nil, catalogLease{}, ErrNoCatalog
 	}
-	if e.refresh != nil {
-		if attempt > 0 {
-			snap, err := e.refresh(ctx, staleGen)
-			if err != nil {
-				return nil, catalogLease{}, err
-			}
-			if snap == nil || snap.Generation() <= staleGen {
-				return nil, catalogLease{}, ErrStaleGeneration
-			}
-			current := e.catalog.Current()
-			if current == nil || current.Generation() < snap.Generation() {
-				if err := e.catalog.publishNewerChecked(snap); err != nil &&
-					!errors.Is(err, ErrCatalogGenerationNotNewer) {
-					return nil, catalogLease{}, err
-				}
-			}
+	if e.refresh != nil && attempt > 0 && staleGen > 0 {
+		if err := e.catalog.refreshAfter(ctx, staleGen, e.refresh); err != nil {
+			return nil, catalogLease{}, err
 		}
 	}
 	lease := e.catalog.pinCurrent()

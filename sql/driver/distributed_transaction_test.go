@@ -25,7 +25,7 @@ func driverTransactionID(seed byte) distributedtxn.ID {
 	return id
 }
 
-func TestCommitDistributedParticipantPublishesDataAndStateAtomically(t *testing.T) {
+func TestCommitDistributedTargetPublishesDataAndStateAtomically(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "shard.vdb")
 	binding := ShardStoreBinding{
@@ -65,16 +65,16 @@ func TestCommitDistributedParticipantPublishesDataAndStateAtomically(t *testing.
 		t.Fatalf("INSERT: %v", err)
 	}
 	id := driverTransactionID(1)
-	rows, err := session.CommitDistributedParticipant(ctx, id, 1, result.RowsAffected)
+	rows, err := session.CommitDistributedTarget(ctx, id, 1, result.RowsAffected)
 	if err != nil || rows != 1 {
 		t.Fatalf("CommitDistributedParticipant = %d,%v, want 1,nil", rows, err)
 	}
-	revision, rows, found, err := db.DistributedParticipantStatus(id)
+	revision, rows, found, err := db.DistributedTargetStatus(id)
 	if err != nil || !found || revision != 2 || rows != 1 {
 		t.Fatalf("status = revision %d rows %d found %v err %v", revision, rows, found, err)
 	}
 	if allocations := testing.AllocsPerRun(1000, func() {
-		revision, rows, found, err = db.DistributedParticipantStatus(id)
+		revision, rows, found, err = db.DistributedTargetStatus(id)
 	}); allocations != 0 {
 		t.Fatalf("warm participant status allocations = %.2f, want 0", allocations)
 	}
@@ -88,13 +88,13 @@ func TestCommitDistributedParticipantPublishesDataAndStateAtomically(t *testing.
 	if _, err := insert.Exec(ctx, []any{"retry-must-not-publish", int64(2)}); err != nil {
 		t.Fatalf("retry INSERT: %v", err)
 	}
-	rows, err = session.CommitDistributedParticipant(ctx, id, 1, 9)
+	rows, err = session.CommitDistributedTarget(ctx, id, 1, 9)
 	if err != nil || rows != 1 {
 		t.Fatalf("exact retry = %d,%v, want retained 1,nil", rows, err)
 	}
-	count := distributedParticipantPrepare(t, session,
+	count := distributedTargetPrepare(t, session,
 		`SELECT COUNT(*) FROM docs WHERE id = ?`)
-	assertDistributedParticipantCount(t, count, "retry-must-not-publish", 0)
+	assertDistributedTargetCount(t, count, "retry-must-not-publish", 0)
 
 	if err := session.Begin(ctx, TxOptions{}); err != nil {
 		t.Fatalf("conflicting Begin: %v", err)
@@ -102,10 +102,10 @@ func TestCommitDistributedParticipantPublishesDataAndStateAtomically(t *testing.
 	if _, err := insert.Exec(ctx, []any{"conflict-must-not-publish", int64(3)}); err != nil {
 		t.Fatalf("conflicting INSERT: %v", err)
 	}
-	if _, err := session.CommitDistributedParticipant(ctx, id, 2, 1); !errors.Is(err, ErrDistributedTransactionConflict) {
+	if _, err := session.CommitDistributedTarget(ctx, id, 2, 1); !errors.Is(err, ErrDistributedTransactionConflict) {
 		t.Fatalf("revision mismatch = %v, want ErrDistributedTransactionConflict", err)
 	}
-	assertDistributedParticipantCount(t, count, "conflict-must-not-publish", 0)
+	assertDistributedTargetCount(t, count, "conflict-must-not-publish", 0)
 	_ = count.Close()
 	_ = insert.Close()
 	_ = session.Close()
@@ -118,24 +118,24 @@ func TestCommitDistributedParticipantPublishesDataAndStateAtomically(t *testing.
 		t.Fatalf("OpenShardStore: %v", err)
 	}
 	defer db.Close()
-	revision, rows, found, err = db.DistributedParticipantStatus(id)
+	revision, rows, found, err = db.DistributedTargetStatus(id)
 	if err != nil || !found || revision != 2 || rows != 1 {
 		t.Fatalf("reopened status = revision %d rows %d found %v err %v", revision, rows, found, err)
 	}
 	assertDistributedTransactionStateProfile(t, db.connector.db.distributedTxnCollection)
 }
 
-func TestDistributedParticipantStateCodecGoldenBoundaries(t *testing.T) {
-	if distributedtxn.ParticipantApplied != 3 {
-		t.Fatalf("ParticipantApplied = %d, want wire state 3", distributedtxn.ParticipantApplied)
+func TestDistributedTargetStateCodecGoldenBoundaries(t *testing.T) {
+	if distributedtxn.TargetApplied != 3 {
+		t.Fatalf("ParticipantApplied = %d, want wire state 3", distributedtxn.TargetApplied)
 	}
-	if distributedParticipantStateHeaderBytes != 8 ||
-		distributedParticipantStateMaxBytes != 27 ||
+	if distributedTargetStateHeaderBytes != 8 ||
+		distributedTargetStateMaxBytes != 27 ||
 		distributedTransactionStateKeyBytes != 16 ||
 		distributedTransactionStateBatchBytes != 43 {
 		t.Fatalf("participant geometry = header %d value %d key %d batch %d, want 8/27/16/43",
-			distributedParticipantStateHeaderBytes,
-			distributedParticipantStateMaxBytes,
+			distributedTargetStateHeaderBytes,
+			distributedTargetStateMaxBytes,
 			distributedTransactionStateKeyBytes,
 			distributedTransactionStateBatchBytes,
 		)
@@ -169,12 +169,12 @@ func TestDistributedParticipantStateCodecGoldenBoundaries(t *testing.T) {
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
-			var storage [distributedParticipantStateMaxBytes]byte
-			got := appendDistributedParticipantState(storage[:0], test.revision, test.rows)
+			var storage [distributedTargetStateMaxBytes]byte
+			got := appendDistributedTargetState(storage[:0], test.revision, test.rows)
 			if !bytes.Equal(got, test.want) {
 				t.Fatalf("encoded = %x, want %x", got, test.want)
 			}
-			revision, rows, err := openDistributedParticipantState(got)
+			revision, rows, err := openDistributedTargetState(got)
 			if err != nil || revision != test.revision || rows != test.rows {
 				t.Fatalf("open = (%d,%d,%v), want (%d,%d,nil)",
 					revision, rows, err, test.revision, test.rows)
@@ -183,33 +183,33 @@ func TestDistributedParticipantStateCodecGoldenBoundaries(t *testing.T) {
 	}
 }
 
-func TestOpenDistributedParticipantStateRejectsCorruption(t *testing.T) {
-	valid := appendDistributedParticipantState(nil, 300, 700)
+func TestOpenDistributedTargetStateRejectsCorruption(t *testing.T) {
+	valid := appendDistributedTargetState(nil, 300, 700)
 	for length := 0; length < len(valid); length++ {
-		if revision, rows, err := openDistributedParticipantState(valid[:length]); !errors.Is(err, ErrDistributedTransactionConflict) || revision != 0 || rows != 0 {
+		if revision, rows, err := openDistributedTargetState(valid[:length]); !errors.Is(err, ErrDistributedTransactionConflict) || revision != 0 || rows != 0 {
 			t.Fatalf("truncation %d = (%d,%d,%v), want zero conflict", length, revision, rows, err)
 		}
 	}
-	for offset := 0; offset < distributedParticipantStateHeaderBytes; offset++ {
+	for offset := 0; offset < distributedTargetStateHeaderBytes; offset++ {
 		corrupt := append([]byte(nil), valid...)
 		corrupt[offset] ^= 0x80
-		if _, _, err := openDistributedParticipantState(corrupt); !errors.Is(err, ErrDistributedTransactionConflict) {
+		if _, _, err := openDistributedTargetState(corrupt); !errors.Is(err, ErrDistributedTransactionConflict) {
 			t.Fatalf("header corruption at %d = %v, want conflict", offset, err)
 		}
 	}
 	cases := [][]byte{
 		append(append([]byte(nil), valid...), 0),
-		append(append([]byte(nil), valid...), make([]byte, distributedParticipantStateMaxBytes-len(valid)+1)...),
+		append(append([]byte(nil), valid...), make([]byte, distributedTargetStateMaxBytes-len(valid)+1)...),
 		[]byte(`[3,300,700]`),
 	}
 	for i, corrupt := range cases {
-		if _, _, err := openDistributedParticipantState(corrupt); !errors.Is(err, ErrDistributedTransactionConflict) {
+		if _, _, err := openDistributedTargetState(corrupt); !errors.Is(err, ErrDistributedTransactionConflict) {
 			t.Fatalf("corruption %d (%x) = %v, want conflict", i, corrupt, err)
 		}
 	}
 }
 
-func TestOpenDistributedParticipantStateRejectsNoncanonicalValues(t *testing.T) {
+func TestOpenDistributedTargetStateRejectsNoncanonicalValues(t *testing.T) {
 	header := []byte{'V', 'D', 'P', 'A', 0, 3, 0, 0}
 	appendValue := func(revision, rows uint64) []byte {
 		out := append([]byte(nil), header...)
@@ -229,14 +229,14 @@ func TestOpenDistributedParticipantStateRejectsNoncanonicalValues(t *testing.T) 
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
-			if revision, rows, err := openDistributedParticipantState(test.raw); !errors.Is(err, ErrDistributedTransactionConflict) || revision != 0 || rows != 0 {
+			if revision, rows, err := openDistributedTargetState(test.raw); !errors.Is(err, ErrDistributedTransactionConflict) || revision != 0 || rows != 0 {
 				t.Fatalf("open %x = (%d,%d,%v), want zero conflict", test.raw, revision, rows, err)
 			}
 		})
 	}
 }
 
-func TestDistributedParticipantStateProfileReopensAndRejectsMismatches(t *testing.T) {
+func TestDistributedTargetStateProfileReopensAndRejectsMismatches(t *testing.T) {
 	options := distributedTransactionStateOptions()
 	if !options.OpaqueValues || options.Durability != durable.DurabilitySync ||
 		options.MaxKeyBytes != 16 || options.InlineValueBytes != 27 ||
@@ -257,8 +257,8 @@ func TestDistributedParticipantStateProfileReopensAndRejectsMismatches(t *testin
 	}
 	assertDistributedTransactionStateProfile(t, collection)
 	id := driverTransactionID(41)
-	var storage [distributedParticipantStateMaxBytes]byte
-	want := appendDistributedParticipantState(storage[:0], math.MaxUint64, math.MaxInt64)
+	var storage [distributedTargetStateMaxBytes]byte
+	want := appendDistributedTargetState(storage[:0], math.MaxUint64, math.MaxInt64)
 	if _, err := collection.Put(id[:], want); err != nil {
 		t.Fatalf("Put max state: %v", err)
 	}
@@ -280,7 +280,7 @@ func TestDistributedParticipantStateProfileReopensAndRejectsMismatches(t *testin
 	}
 	t.Cleanup(func() { _ = collection.Close(); _ = file.Close() })
 	assertDistributedTransactionStateProfile(t, collection)
-	var rawBuf [distributedParticipantStateMaxBytes]byte
+	var rawBuf [distributedTargetStateMaxBytes]byte
 	raw, found, err := collection.AppendRaw(rawBuf[:0], id[:])
 	if err != nil || !found || !bytes.Equal(raw, want) {
 		t.Fatalf("reopened raw = (%x,%v,%v), want %x,true,nil", raw, found, err, want)
@@ -368,19 +368,19 @@ func TestDistributedParticipantStateProfileReopensAndRejectsMismatches(t *testin
 	})
 }
 
-func TestDistributedParticipantStateCodecAllocations(t *testing.T) {
-	var storage [distributedParticipantStateMaxBytes]byte
-	encoded := appendDistributedParticipantState(storage[:0], math.MaxUint64, math.MaxInt64)
+func TestDistributedTargetStateCodecAllocations(t *testing.T) {
+	var storage [distributedTargetStateMaxBytes]byte
+	encoded := appendDistributedTargetState(storage[:0], math.MaxUint64, math.MaxInt64)
 	if allocations := testing.AllocsPerRun(1000, func() {
-		out := appendDistributedParticipantState(storage[:0], math.MaxUint64, math.MaxInt64)
-		if len(out) != distributedParticipantStateMaxBytes {
+		out := appendDistributedTargetState(storage[:0], math.MaxUint64, math.MaxInt64)
+		if len(out) != distributedTargetStateMaxBytes {
 			panic("wrong encoded length")
 		}
 	}); allocations != 0 {
 		t.Fatalf("encode allocations = %.2f, want 0", allocations)
 	}
 	if allocations := testing.AllocsPerRun(1000, func() {
-		revision, rows, err := openDistributedParticipantState(encoded)
+		revision, rows, err := openDistributedTargetState(encoded)
 		if err != nil || revision != math.MaxUint64 || rows != math.MaxInt64 {
 			panic("wrong decoded state")
 		}
@@ -389,10 +389,10 @@ func TestDistributedParticipantStateCodecAllocations(t *testing.T) {
 	}
 }
 
-func FuzzOpenDistributedParticipantState(f *testing.F) {
+func FuzzOpenDistributedTargetState(f *testing.F) {
 	seeds := [][]byte{
-		appendDistributedParticipantState(nil, 1, 0),
-		appendDistributedParticipantState(nil, math.MaxUint64, math.MaxInt64),
+		appendDistributedTargetState(nil, 1, 0),
+		appendDistributedTargetState(nil, math.MaxUint64, math.MaxInt64),
 		[]byte(`[3,1,0]`),
 		{'V', 'D', 'P', 'A', 0, 3, 0, 0, 0x81, 0, 0},
 	}
@@ -400,7 +400,7 @@ func FuzzOpenDistributedParticipantState(f *testing.F) {
 		f.Add(seed)
 	}
 	f.Fuzz(func(t *testing.T, raw []byte) {
-		revision, rows, err := openDistributedParticipantState(raw)
+		revision, rows, err := openDistributedTargetState(raw)
 		if err != nil {
 			if !errors.Is(err, ErrDistributedTransactionConflict) || revision != 0 || rows != 0 {
 				t.Fatalf("rejected %x as (%d,%d,%v)", raw, revision, rows, err)
@@ -410,21 +410,21 @@ func FuzzOpenDistributedParticipantState(f *testing.F) {
 		if revision == 0 || rows < 0 {
 			t.Fatalf("accepted invalid semantics revision=%d rows=%d", revision, rows)
 		}
-		canonical := appendDistributedParticipantState(nil, revision, rows)
+		canonical := appendDistributedTargetState(nil, revision, rows)
 		if !bytes.Equal(raw, canonical) {
 			t.Fatalf("accepted noncanonical %x; canonical is %x", raw, canonical)
 		}
 	})
 }
 
-func BenchmarkDistributedParticipantStateEncode(b *testing.B) {
+func BenchmarkDistributedTargetStateEncode(b *testing.B) {
 	b.Run("binary_format0", func(b *testing.B) {
-		var storage [distributedParticipantStateMaxBytes]byte
+		var storage [distributedTargetStateMaxBytes]byte
 		b.ReportAllocs()
-		b.SetBytes(distributedParticipantStateMaxBytes)
+		b.SetBytes(distributedTargetStateMaxBytes)
 		for range b.N {
-			out := appendDistributedParticipantState(storage[:0], math.MaxUint64, math.MaxInt64)
-			if len(out) != distributedParticipantStateMaxBytes {
+			out := appendDistributedTargetState(storage[:0], math.MaxUint64, math.MaxInt64)
+			if len(out) != distributedTargetStateMaxBytes {
 				b.Fatal("wrong encoded length")
 			}
 		}
@@ -433,7 +433,7 @@ func BenchmarkDistributedParticipantStateEncode(b *testing.B) {
 		var storage [64]byte
 		b.ReportAllocs()
 		for range b.N {
-			out := appendLegacyDistributedParticipantState(storage[:0], math.MaxUint64, math.MaxInt64)
+			out := appendLegacyDistributedTargetState(storage[:0], math.MaxUint64, math.MaxInt64)
 			if len(out) == 0 {
 				b.Fatal("empty legacy encoding")
 			}
@@ -441,24 +441,24 @@ func BenchmarkDistributedParticipantStateEncode(b *testing.B) {
 	})
 }
 
-func BenchmarkDistributedParticipantStateDecode(b *testing.B) {
+func BenchmarkDistributedTargetStateDecode(b *testing.B) {
 	b.Run("binary_format0", func(b *testing.B) {
-		encoded := appendDistributedParticipantState(nil, math.MaxUint64, math.MaxInt64)
+		encoded := appendDistributedTargetState(nil, math.MaxUint64, math.MaxInt64)
 		b.ReportAllocs()
 		b.SetBytes(int64(len(encoded)))
 		for range b.N {
-			revision, rows, err := openDistributedParticipantState(encoded)
+			revision, rows, err := openDistributedTargetState(encoded)
 			if err != nil || revision != math.MaxUint64 || rows != math.MaxInt64 {
 				b.Fatal("wrong decoded state")
 			}
 		}
 	})
 	b.Run("legacy_decimal_JSON", func(b *testing.B) {
-		encoded := appendLegacyDistributedParticipantState(nil, math.MaxUint64, math.MaxInt64)
+		encoded := appendLegacyDistributedTargetState(nil, math.MaxUint64, math.MaxInt64)
 		b.ReportAllocs()
 		b.SetBytes(int64(len(encoded)))
 		for range b.N {
-			revision, rows, err := openLegacyDistributedParticipantState(encoded)
+			revision, rows, err := openLegacyDistributedTargetState(encoded)
 			if err != nil || revision != math.MaxUint64 || rows != math.MaxInt64 {
 				b.Fatal("wrong decoded legacy state")
 			}
@@ -466,17 +466,17 @@ func BenchmarkDistributedParticipantStateDecode(b *testing.B) {
 	})
 }
 
-func appendLegacyDistributedParticipantState(dst []byte, revision uint64, rowsAffected int64) []byte {
-	dst = append(dst, '[', byte('0'+distributedtxn.ParticipantApplied), ',')
+func appendLegacyDistributedTargetState(dst []byte, revision uint64, rowsAffected int64) []byte {
+	dst = append(dst, '[', byte('0'+distributedtxn.TargetApplied), ',')
 	dst = strconv.AppendUint(dst, revision, 10)
 	dst = append(dst, ',')
 	dst = strconv.AppendInt(dst, rowsAffected, 10)
 	return append(dst, ']')
 }
 
-func openLegacyDistributedParticipantState(src []byte) (revision uint64, rowsAffected int64, err error) {
+func openLegacyDistributedTargetState(src []byte) (revision uint64, rowsAffected int64, err error) {
 	if len(src) < 7 || src[0] != '[' ||
-		src[1] != byte('0'+distributedtxn.ParticipantApplied) ||
+		src[1] != byte('0'+distributedtxn.TargetApplied) ||
 		src[2] != ',' || src[len(src)-1] != ']' {
 		return 0, 0, ErrDistributedTransactionConflict
 	}
@@ -501,7 +501,7 @@ func openLegacyDistributedParticipantState(src []byte) (revision uint64, rowsAff
 	return revision, rowsAffected, nil
 }
 
-func distributedParticipantPrepare(t testing.TB, session *Session, statement string) *Prepared {
+func distributedTargetPrepare(t testing.TB, session *Session, statement string) *Prepared {
 	t.Helper()
 	prepared, err := session.Prepare(context.Background(), statement)
 	if err != nil {
@@ -510,7 +510,7 @@ func distributedParticipantPrepare(t testing.TB, session *Session, statement str
 	return prepared
 }
 
-func assertDistributedParticipantCount(t testing.TB, prepared *Prepared, key string, want int64) {
+func assertDistributedTargetCount(t testing.TB, prepared *Prepared, key string, want int64) {
 	t.Helper()
 	cursor, err := prepared.Query(context.Background(), []any{key})
 	if err != nil {

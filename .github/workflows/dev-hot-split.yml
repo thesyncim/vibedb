@@ -28,11 +28,14 @@ jobs:
           set -euo pipefail
           output="$(mktemp)"
           trap 'rm -f "$output"' EXIT
-          go test ./cmd/vibedb-gateway \
-            -run '^TestGatewayZeroConfigDevPressureCompletesReplicatedSplit$' \
+          test_name='TestGatewayZeroConfigDevPressureCompletesReplicatedSplit'
+          test_list="$(go test -list "^${test_name}$" ./internal/gatewayruntime)"
+          grep -Fqx "${test_name}" <<<"${test_list}"
+          go test ./internal/gatewayruntime \
+            -run "^${test_name}$" \
             -count=3 -timeout=15m -v | tee "$output"
-          count="$(grep -c -- '^--- PASS: TestGatewayZeroConfigDevPressureCompletesReplicatedSplit' "$output")"
+          count="$(grep -c -- "^--- PASS: ${test_name}" "$output")"
           test "$count" -eq 3
-          if grep -q -- '^--- SKIP: TestGatewayZeroConfigDevPressureCompletesReplicatedSplit' "$output"; then
+          if grep -q -- "^--- SKIP: ${test_name}" "$output"; then
             exit 1
           fi

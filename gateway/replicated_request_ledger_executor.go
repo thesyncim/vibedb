@@ -434,8 +434,8 @@ func (executor *DurableRequestExecutor) drive(
 			KeyDigest:         reader.KeyDigest,
 			RequestID:         reader.RequestID,
 			RequestDigest:     reader.RequestDigest,
-			ParticipantCount:  reader.ParticipantCount,
-			ParticipantStream: reader,
+			TargetCount:       reader.TargetCount,
+			TargetStream:      reader,
 		}
 		if entry.State == DurableRequestLedgerPending {
 			replay.Pending = cloneDurableRequestPending(entry.Pending)
@@ -501,7 +501,7 @@ func validDurableRequestTerminalForRecipe(
 	result, err := OpenDurableRequestResult(terminal.Result)
 	if err != nil || result.Transaction != recipe.Identity.ID ||
 		result.CatalogGeneration != recipe.Identity.CatalogGeneration ||
-		result.ShardsFanned != recipe.Contract.ParticipantCount ||
+		result.ShardsFanned != recipe.Contract.TargetCount ||
 		result.TerminalContractDigest != recipe.Contract.TerminalContractDigest ||
 		result.RetirementWitnessDigest != recipe.Contract.RetirementWitnessDigest ||
 		recipe.Contract.ResultGrammarDigest != durableRequestResultGrammarDigest() {

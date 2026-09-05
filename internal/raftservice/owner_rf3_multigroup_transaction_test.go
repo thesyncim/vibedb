@@ -1088,7 +1088,7 @@ func newMultiGroupRF3Runtime(
 	return runtime, wal, base, apply, storageRoot
 }
 
-func TestTwoRealRF3GroupsExecuteFusedTwoParticipantTransactionAcrossLeaderIsolation(t *testing.T) {
+func TestTwoRealRF3GroupsExecuteFusedTwoTargetTransactionAcrossLeaderIsolation(t *testing.T) {
 	cluster := newMultiGroupTransactionRF3Cluster(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
@@ -1143,23 +1143,23 @@ func TestTwoRealRF3GroupsExecuteFusedTwoParticipantTransactionAcrossLeaderIsolat
 	}
 
 	id := distributedtxn.ID{0x70, 0x32, 0x2d, 0x72, 0x66, 0x33, 1}
-	participants := make([]distributedtxn.ParticipantRef, multiGroupRF3Groups)
+	targets := make([]distributedtxn.TransactionTargetRef, multiGroupRF3Groups)
 	for group, leader := range []int{leader0, leader1} {
 		binding := cluster.groups[group].bases[leader].Binding
 		route := cluster.route(group)
-		participants[group] = distributedtxn.ParticipantRef{
+		targets[group] = distributedtxn.TransactionTargetRef{
 			Distribution: []byte(binding.Distribution), Shard: []byte(binding.Shard),
 			RoutingVersion:       uint64(binding.Authority.RoutingVersion),
 			AllocationGeneration: binding.AllocationGeneration,
 			OwnershipEpoch:       uint64(binding.Authority.OwnershipEpoch),
 			AuthorityWitness:     multiGroupRF3RouteAuthorityWitness(route),
-			MutationDigest:       digests[group], State: distributedtxn.ParticipantStaged,
+			MutationDigest:       digests[group], State: distributedtxn.TargetStaged,
 		}
 	}
 	coordinatorRecord, err := distributedtxn.AppendCoordinator(nil, distributedtxn.CoordinatorRecord{
 		ID: id, State: distributedtxn.CoordinatorStaging, Revision: 1,
 		CatalogGeneration: uint64(cluster.groups[0].bases[leader0].Binding.Authority.SchemaGeneration),
-		RecoveryDeadline:  int64(distributedtxn.MaxRecoveryPulses), Participants: participants,
+		RecoveryDeadline:  int64(distributedtxn.MaxRecoveryPulses), Targets: targets,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1169,12 +1169,12 @@ func TestTwoRealRF3GroupsExecuteFusedTwoParticipantTransactionAcrossLeaderIsolat
 		Role:      distributedtxn.ReplicatedRoleCoordinator,
 		Operation: distributedtxn.ReplicatedBeginPrepareCoordinator,
 		ID:        id, PayloadKind: distributedtxn.ReplicatedPayloadCoordinator, Payload: coordinatorRecord,
-		Participant: distributedtxn.ParticipantStage{
+		Target: distributedtxn.TransactionTargetStage{
 			CoordinatorGroup:            distributedtxn.ID(coordinatorBinding.GroupID),
 			CoordinatorShardIncarnation: distributedtxn.ID(coordinatorBinding.ShardIncarnation),
 			CoordinatorAllocation:       coordinatorBinding.AllocationGeneration,
 			BucketBits:                  8, IntentScopes: []distributedtxn.IntentScope{{Start: 0, End: 256}},
-			MutationDigest: digests[0], ParticipantOrdinal: 0,
+			MutationDigest: digests[0], TargetOrdinal: 0,
 		},
 	}, batches[0])
 	beginResult, err := cluster.submit(ctx, 0, leader0, begin, multiGroupRF3NoFault)
@@ -1186,15 +1186,15 @@ func TestTwoRealRF3GroupsExecuteFusedTwoParticipantTransactionAcrossLeaderIsolat
 	}
 
 	remotePrepare := rf3TransactionCommand(t, cluster.groups[1].bases[leader1], distributedtxn.ReplicatedCommand{
-		Role:      distributedtxn.ReplicatedRoleParticipant,
-		Operation: distributedtxn.ReplicatedStagePrepareParticipant,
-		ID:        id, PayloadKind: distributedtxn.ReplicatedPayloadParticipantStage,
-		Participant: distributedtxn.ParticipantStage{
+		Role:      distributedtxn.ReplicatedRoleTarget,
+		Operation: distributedtxn.ReplicatedStagePrepareTarget,
+		ID:        id, PayloadKind: distributedtxn.ReplicatedPayloadTargetStage,
+		Target: distributedtxn.TransactionTargetStage{
 			CoordinatorGroup:            distributedtxn.ID(coordinatorBinding.GroupID),
 			CoordinatorShardIncarnation: distributedtxn.ID(coordinatorBinding.ShardIncarnation),
 			CoordinatorAllocation:       coordinatorBinding.AllocationGeneration,
 			BucketBits:                  8, IntentScopes: []distributedtxn.IntentScope{{Start: 0, End: 256}},
-			MutationDigest: digests[1], ParticipantOrdinal: 1,
+			MutationDigest: digests[1], TargetOrdinal: 1,
 		},
 	}, batches[1])
 	remoteResult, err := cluster.submit(ctx, 1, leader1, remotePrepare, multiGroupRF3NoFault)
@@ -1210,9 +1210,9 @@ func TestTwoRealRF3GroupsExecuteFusedTwoParticipantTransactionAcrossLeaderIsolat
 	assertMultiGroupRF3Recovery(t, ctx, cluster, 0, leader0, id,
 		replicatedstate.TransactionRecoveryLookupCoordinator, coordinatorRecord, coordinatorBinding)
 	assertMultiGroupRF3Recovery(t, ctx, cluster, 0, leader0, id,
-		replicatedstate.TransactionRecoveryLookupParticipant, nil, coordinatorBinding)
+		replicatedstate.TransactionRecoveryLookupTarget, nil, coordinatorBinding)
 	assertMultiGroupRF3Recovery(t, ctx, cluster, 1, leader1, id,
-		replicatedstate.TransactionRecoveryLookupParticipant, nil, coordinatorBinding)
+		replicatedstate.TransactionRecoveryLookupTarget, nil, coordinatorBinding)
 
 	group1Before := mustRF3State(t, ctx, cluster.owners[leader1], cluster.groups[1].key)
 	formerState := mustRF3State(t, ctx, cluster.owners[leader0], cluster.groups[0].key)
@@ -1284,8 +1284,8 @@ func TestTwoRealRF3GroupsExecuteFusedTwoParticipantTransactionAcrossLeaderIsolat
 	applyResults := make([]Result, multiGroupRF3Groups)
 	for group, leader := range []int{newLeader0, leader1} {
 		apply := rf3TransactionCommand(t, cluster.groups[group].bases[leader], distributedtxn.ReplicatedCommand{
-			Role:      distributedtxn.ReplicatedRoleParticipant,
-			Operation: distributedtxn.ReplicatedApplyReleaseParticipant,
+			Role:      distributedtxn.ReplicatedRoleTarget,
+			Operation: distributedtxn.ReplicatedApplyReleaseTarget,
 			ID:        id, ExpectedRevision: 2, PayloadKind: distributedtxn.ReplicatedPayloadNone,
 		}, nil)
 		applyResults[group], err = cluster.submit(ctx, group, leader, apply, multiGroupRF3NoFault)
@@ -1424,15 +1424,15 @@ func TestMultiGroupRF3CommandFixturesPreflight(t *testing.T) {
 	coordinator, err := distributedtxn.AppendCoordinator(nil, distributedtxn.CoordinatorRecord{
 		ID: id, State: distributedtxn.CoordinatorStaging, Revision: 1,
 		CatalogGeneration: 13, RecoveryDeadline: int64(distributedtxn.MaxRecoveryPulses),
-		Participants: []distributedtxn.ParticipantRef{{Distribution: []byte("orders-a"),
+		Targets: []distributedtxn.TransactionTargetRef{{Distribution: []byte("orders-a"),
 			Shard: []byte("0000-7fff"), RoutingVersion: 17, AllocationGeneration: 7,
 			OwnershipEpoch: 11, AuthorityWitness: distributedtxn.AuthorityWitness{1},
-			MutationDigest: digest, State: distributedtxn.ParticipantStaged}},
+			MutationDigest: digest, State: distributedtxn.TargetStaged}},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	participant := distributedtxn.ParticipantStage{
+	target := distributedtxn.TransactionTargetStage{
 		CoordinatorGroup:            distributedtxn.ID(base.Binding.GroupID),
 		CoordinatorShardIncarnation: distributedtxn.ID(base.Binding.ShardIncarnation),
 		CoordinatorAllocation:       7, BucketBits: 8,
@@ -1440,12 +1440,12 @@ func TestMultiGroupRF3CommandFixturesPreflight(t *testing.T) {
 	}
 	for _, control := range []distributedtxn.ReplicatedCommand{
 		{Role: distributedtxn.ReplicatedRoleCoordinator, Operation: distributedtxn.ReplicatedBeginPrepareCoordinator,
-			ID: id, PayloadKind: distributedtxn.ReplicatedPayloadCoordinator, Payload: coordinator, Participant: participant},
-		{Role: distributedtxn.ReplicatedRoleParticipant, Operation: distributedtxn.ReplicatedStagePrepareParticipant,
-			ID: id, PayloadKind: distributedtxn.ReplicatedPayloadParticipantStage, Participant: participant},
+			ID: id, PayloadKind: distributedtxn.ReplicatedPayloadCoordinator, Payload: coordinator, Target: target},
+		{Role: distributedtxn.ReplicatedRoleTarget, Operation: distributedtxn.ReplicatedStagePrepareTarget,
+			ID: id, PayloadKind: distributedtxn.ReplicatedPayloadTargetStage, Target: target},
 		{Role: distributedtxn.ReplicatedRoleCoordinator, Operation: distributedtxn.ReplicatedCommitCoordinator,
 			ID: id, ExpectedRevision: 1, PayloadKind: distributedtxn.ReplicatedPayloadNone},
-		{Role: distributedtxn.ReplicatedRoleParticipant, Operation: distributedtxn.ReplicatedApplyReleaseParticipant,
+		{Role: distributedtxn.ReplicatedRoleTarget, Operation: distributedtxn.ReplicatedApplyReleaseTarget,
 			ID: id, ExpectedRevision: 2, PayloadKind: distributedtxn.ReplicatedPayloadNone},
 	} {
 		var mutations []replication.RelationMutationBatch

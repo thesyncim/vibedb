@@ -1,0 +1,19 @@
+# Source and fixture preparation
+git worktree add --detach /private/tmp/vibedb-go127-simd-next-lane-base ede2b4f34e9693831f3e9adca1840fd0ccbbf19a
+cp /private/tmp/vibedb-go127-simd-next-lane/query/file_packed_order_bench_test.go /private/tmp/vibedb-go127-simd-next-lane-base/query/file_packed_order_bench_test.go
+
+# Compile both binaries before timing; each compile was sequential.
+GOTOOLCHAIN=go1.27.0 GOEXPERIMENT=simd GOCACHE=/private/tmp/vibedb-packed-order-initial/cache-candidate go test -c ./query -o /private/tmp/vibedb-packed-order-initial/query-candidate-simd.test
+GOTOOLCHAIN=go1.27.0 GOEXPERIMENT=simd GOCACHE=/private/tmp/vibedb-packed-order-initial/cache-base go test -c ./query -o /private/tmp/vibedb-packed-order-initial/query-base-simd.test
+GOTOOLCHAIN=go1.27.0 GOEXPERIMENT=nosimd GOCACHE=/private/tmp/vibedb-packed-order-initial/cache-candidate-nosimd go test -c ./query -o /private/tmp/vibedb-packed-order-initial/query-candidate-nosimd.test
+
+# Each round ran baseline first, then candidate. The command was repeated for i=1..5,
+# writing base-round-i.txt and candidate-round-i.txt under raw/.
+GOMAXPROCS=1 /private/tmp/vibedb-packed-order-initial/query-base-simd.test -test.run '^$' -test.bench '^BenchmarkFilePackedOrderedCount(Wide)?$' -test.benchtime 250ms -test.count 1 -test.cpu 1 -test.benchmem > /private/tmp/vibedb-packed-order-initial/raw/base-round-i.txt
+GOMAXPROCS=1 VIBEDB_EXPECT_ORDERED=1 /private/tmp/vibedb-packed-order-initial/query-candidate-simd.test -test.run '^$' -test.bench '^BenchmarkFilePackedOrderedCount(Wide)?$' -test.benchtime 250ms -test.count 1 -test.cpu 1 -test.benchmem > /private/tmp/vibedb-packed-order-initial/raw/candidate-round-i.txt
+
+# Median calculation: take the five ns/op values for each benchmark name in raw/.
+# Every raw file ended with PASS and every displayed subbenchmark reported 0 B/op and 0 allocs/op.
+# Candidate nosimd runs repeated this command for i=1..5, writing
+# candidate-nosimd-round-i.txt under raw/.
+GOMAXPROCS=1 VIBEDB_EXPECT_ORDERED=1 /private/tmp/vibedb-packed-order-initial/query-candidate-nosimd.test -test.run '^$' -test.bench '^BenchmarkFilePackedOrderedCount(Wide)?$' -test.benchtime 250ms -test.count 1 -test.cpu 1 -test.benchmem > /private/tmp/vibedb-packed-order-initial/raw/candidate-nosimd-round-i.txt

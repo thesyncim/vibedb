@@ -3,6 +3,7 @@ package raftservice
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 
 	"github.com/thesyncim/vibedb/distribution"
@@ -498,14 +499,11 @@ func TestPointReadLeaseKeepsConcurrentResponseBudgetCharged(t *testing.T) {
 
 func TestTransactionRecoveryOwnerRequiresExactDedicatedCapability(t *testing.T) {
 	request := TransactionReadRequest{Read: replicatedstate.TransactionRecoveryReadRequest{
-		Kind: replicatedstate.TransactionRecoveryLookupParticipant,
+		Kind: replicatedstate.TransactionRecoveryLookupTarget,
 		ID:   distributedtxn.ID{1}, MinimumApplied: 1, MaxRows: 1,
 		MaxBytes: replicatedstate.TransactionRecoverySummaryBytes,
 	}}
-	owner := &Owner{
-		proposalCohort:       make(map[raftmember.GroupKey]int),
-		pendingProposalGroup: make(map[raftmember.GroupKey]int),
-	}
+	owner := &Owner{}
 	for _, capability := range []serviceauthz.Capability{
 		serviceauthz.CapabilityDataRead,
 		serviceauthz.CapabilityDataWrite,
@@ -526,18 +524,18 @@ func TestTransactionRecoveryOwnerRequiresExactDedicatedCapability(t *testing.T) 
 }
 
 func TestTransactionRecoveryResponseChargeIncludesTypedArenaAndMaterialScratch(t *testing.T) {
-	participant := replicatedstate.TransactionRecoveryReadRequest{
-		Kind: replicatedstate.TransactionRecoveryLookupParticipant,
+	target := replicatedstate.TransactionRecoveryReadRequest{
+		Kind: replicatedstate.TransactionRecoveryLookupTarget,
 		ID:   distributedtxn.ID{1}, MinimumApplied: 1, MaxRows: 1,
 		MaxBytes: replicatedstate.TransactionRecoverySummaryBytes,
 	}
-	charge, records, scratch, ok := transactionReadResponseCharge(participant)
+	charge, records, scratch, ok := transactionReadResponseCharge(target)
 	wire, _ := pointReadResponseCharge(replicatedstate.TransactionRecoverySummaryBytes)
 	if !ok || records != 1 || scratch != 0 ||
 		charge != wire+transactionRecoveryRecordRetainedBytes {
 		t.Fatalf("participant charge=%d records=%d scratch=%d ok=%t", charge, records, scratch, ok)
 	}
-	coordinator := participant
+	coordinator := target
 	coordinator.Kind = replicatedstate.TransactionRecoveryLookupCoordinator
 	coordinator.MaxBytes = replicatedstate.TransactionRecoverySummaryBytes +
 		distributedtxn.MaxCoordinatorRecordBytes
@@ -776,7 +774,601 @@ func TestOwnerPendingProposalBudgetIsIndependentAndReclaimable(t *testing.T) {
 	}
 }
 
-func TestProposalIngressCollectorBuildsFixedBoundedPipelineWindows(t *testing.T) {
+type proposalPrefixOwnerHost struct {
+	ownerHost
+	firstRunEntered chan struct{}
+	releaseFirstRun chan struct{}
+	queuedAtRun     chan int
+	runs            int
+	queued          int
+	status          raftmember.RuntimeStatus
+}
+
+type deferredReadOwnerHost struct {
+	ownerHost
+	mu                sync.Mutex
+	async             chan struct{}
+	firstRunEntered   chan struct{}
+	releaseFirstRun   chan struct{}
+	secondReadAttempt chan struct{}
+	firstRun          bool
+	readyPending      bool
+	woken             bool
+	readCalls         int
+	readContexts      [][16]byte
+	readContext       []byte
+	status            raftmember.RuntimeStatus
+}
+
+func (host *deferredReadOwnerHost) AsyncNotify() <-chan struct{} { return host.async }
+
+func (host *deferredReadOwnerHost) WakePipelined() {
+	host.mu.Lock()
+	host.woken = true
+	host.mu.Unlock()
+}
+
+func (host *deferredReadOwnerHost) RunOne() (multiraft.Progress, bool, error) {
+	if !host.firstRun {
+		host.firstRun = true
+		close(host.firstRunEntered)
+		<-host.releaseFirstRun
+		return multiraft.Progress{}, false, nil
+	}
+	host.mu.Lock()
+	defer host.mu.Unlock()
+	if host.woken && host.readyPending {
+		host.woken = false
+		host.readyPending = false
+		return multiraft.Progress{Kind: multiraft.ProgressReady,
+			ReadyKind: raftmember.DrivePersisted}, true, nil
+	}
+	if host.woken && len(host.readContext) != 0 {
+		host.woken = false
+		context := append([]byte(nil), host.readContext...)
+		host.readContext = nil
+		return multiraft.Progress{Kind: multiraft.ProgressReady,
+			ReadyKind: raftmember.DriveReadStatesFinished,
+			ReadOutcomes: []raftmodel.ReadOutcome{{Barrier: raftmodel.ReadBarrier{
+				Context: context, Index: host.status.Applied,
+				Term: host.status.Term, Incarnation: 1,
+			}}}}, true, nil
+	}
+	return multiraft.Progress{}, false, nil
+}
+
+func (host *deferredReadOwnerHost) PopOutbound() (raftmember.OutboundMessage, bool) {
+	return raftmember.OutboundMessage{}, false
+}
+
+func (host *deferredReadOwnerHost) Status(raftmember.GroupKey) (raftmember.RuntimeStatus, error) {
+	return host.status, nil
+}
+
+func (host *deferredReadOwnerHost) ReadIndex(_ raftmember.GroupKey, context []byte) error {
+	host.mu.Lock()
+	defer host.mu.Unlock()
+	host.readCalls++
+	var retained [16]byte
+	copy(retained[:], context)
+	host.readContexts = append(host.readContexts, retained)
+	if host.readCalls == 2 {
+		close(host.secondReadAttempt)
+	}
+	if host.readyPending {
+		return raftmodel.ErrReadyPending
+	}
+	host.readContext = append(host.readContext[:0], context...)
+	host.woken = true
+	return nil
+}
+
+func (host *deferredReadOwnerHost) Close() error { return nil }
+
+func newDeferredReadOwnerFixture() (
+	raftmember.GroupKey,
+	CommandFence,
+	*deferredReadOwnerHost,
+	*Owner,
+	*ownerTestReadSource,
+) {
+	group := peerServerTestGroup()
+	identity := raftmember.RuntimeIdentity{Group: group, AllocationGeneration: 1,
+		MemberID: 1, StoreID: [16]byte{1}, NodeIncarnation: 1,
+		RelationManifestDigest: [32]byte{1}}
+	command := CommandFence{ReplicaSetVersion: 1, ActivePolicyGeneration: 1,
+		ProtectionEpoch: 1, OwnershipEpoch: 1, SchemaGeneration: 1,
+		RelationManifestDigest: [32]byte{1}, RoutingVersion: 1, RouteGeneration: 1}
+	host := &deferredReadOwnerHost{
+		async: make(chan struct{}, 1), firstRunEntered: make(chan struct{}),
+		releaseFirstRun: make(chan struct{}), secondReadAttempt: make(chan struct{}),
+		status: raftmember.RuntimeStatus{MemberID: 1, LeaderID: 1, Term: 2,
+			Commit: 7, Applied: 7},
+	}
+	source := &ownerTestReadSource{}
+	owner := &Owner{
+		host: host, groups: []raftmember.GroupKey{group},
+		members: map[raftmember.GroupKey]ownerMember{group: {
+			identity: identity, command: command, generation: &ownerGeneration{}, read: source,
+		}},
+		limits: Limits{MaxIngressItems: 2, MaxIngressBytes: 64,
+			MaxPendingReadItems: 2, MaxPendingReadBytes: 2},
+		ingress: make(chan ownerRequest, 2), ready: make(chan struct{}), done: make(chan struct{}),
+		pendingReads: make(map[[16]byte]*readDelivery),
+	}
+	return group, command, host, owner, source
+}
+
+func deferredLinearizablePointRequest(
+	group raftmember.GroupKey,
+	command CommandFence,
+) LinearizablePointReadRequest {
+	return LinearizablePointReadRequest{
+		Fence: ServingFence{Group: group, AllocationGeneration: 1, Command: command,
+			MemberID: 1, StoreID: [16]byte{1}, NodeIncarnation: 1, Term: 2},
+		Capability: serviceauthz.CapabilityDataRead,
+	}
+}
+
+func TestOwnerDefersLinearizableReadAcrossAsyncReadyBoundary(t *testing.T) {
+	group, command, host, owner, source := newDeferredReadOwnerFixture()
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- owner.Run(ctx) }()
+	<-owner.ready
+	<-host.firstRunEntered
+
+	host.mu.Lock()
+	host.readyPending = true
+	host.mu.Unlock()
+	result := make(chan error, 1)
+	var cut LinearizablePointReadCut
+	go func() {
+		result <- owner.ReadLinearizablePointInto(context.Background(),
+			deferredLinearizablePointRequest(group, command), &cut)
+	}()
+	close(host.releaseFirstRun)
+	<-host.secondReadAttempt
+	select {
+	case err := <-result:
+		t.Fatalf("read settled before Ready completion: %v", err)
+	default:
+	}
+	owner.mu.Lock()
+	if owner.ingressItems != 1 || owner.pendingReadItems != 1 {
+		t.Fatalf("retained charges ingress=%d reads=%d", owner.ingressItems, owner.pendingReadItems)
+	}
+	owner.mu.Unlock()
+
+	host.async <- struct{}{}
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	if cut.Source() != source || cut.minimumApplied != 7 {
+		t.Fatalf("cut source=%T applied=%d", cut.Source(), cut.minimumApplied)
+	}
+	host.mu.Lock()
+	if host.readCalls != 3 || host.readyPending || len(host.readContext) != 0 ||
+		len(host.readContexts) != 3 || host.readContexts[0] != host.readContexts[1] ||
+		host.readContexts[1] != host.readContexts[2] || owner.readSequence != 1 {
+		t.Fatalf("read calls=%d ready=%t context=%x attempts=%x sequence=%d",
+			host.readCalls, host.readyPending, host.readContext, host.readContexts, owner.readSequence)
+	}
+	host.mu.Unlock()
+	if err := cut.Close(); err != nil {
+		t.Fatal(err)
+	}
+	owner.mu.Lock()
+	if owner.ingressItems != 0 || owner.pendingReadItems != 0 {
+		t.Fatalf("released charges ingress=%d reads=%d", owner.ingressItems, owner.pendingReadItems)
+	}
+	owner.mu.Unlock()
+	cancel()
+	if err := <-runDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("owner exit=%v", err)
+	}
+}
+
+func TestOwnerStopSettlesDeferredReadAndReleasesCharges(t *testing.T) {
+	group, command, host, owner, _ := newDeferredReadOwnerFixture()
+	runCtx, stop := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- owner.Run(runCtx) }()
+	<-owner.ready
+	<-host.firstRunEntered
+
+	host.mu.Lock()
+	host.readyPending = true
+	host.mu.Unlock()
+	result := make(chan error, 1)
+	go func() {
+		var cut LinearizablePointReadCut
+		result <- owner.ReadLinearizablePointInto(context.Background(),
+			deferredLinearizablePointRequest(group, command), &cut)
+	}()
+	close(host.releaseFirstRun)
+	<-host.secondReadAttempt
+	stop()
+	if err := <-runDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("owner exit=%v", err)
+	}
+	if err := <-result; !errors.Is(err, ErrOwnerClosed) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("deferred read exit=%v", err)
+	}
+	owner.mu.Lock()
+	defer owner.mu.Unlock()
+	if owner.ingressItems != 0 || owner.ingressBytes != 0 ||
+		owner.pendingReadItems != 0 || owner.pendingReadBytes != 0 ||
+		len(owner.pendingReads) != 0 {
+		t.Fatalf("retained accounting ingress=%d/%d reads=%d/%d barriers=%d",
+			owner.ingressItems, owner.ingressBytes, owner.pendingReadItems,
+			owner.pendingReadBytes, len(owner.pendingReads))
+	}
+}
+
+type synchronousDeferredReadOwnerHost struct {
+	ownerHost
+	status       raftmember.RuntimeStatus
+	ready        uint8
+	readCalls    int
+	readContexts [][16]byte
+	readContext  [16]byte
+}
+
+func (host *synchronousDeferredReadOwnerHost) RunOne() (multiraft.Progress, bool, error) {
+	switch host.ready {
+	case 1:
+		host.ready = 0
+		return multiraft.Progress{Kind: multiraft.ProgressReady,
+			ReadyKind: raftmember.DrivePersisted}, true, nil
+	case 2:
+		host.ready = 0
+		context := host.readContext
+		return multiraft.Progress{Kind: multiraft.ProgressReady,
+			ReadyKind: raftmember.DriveReadStatesFinished,
+			ReadOutcomes: []raftmodel.ReadOutcome{{Barrier: raftmodel.ReadBarrier{
+				Context: context[:], Index: host.status.Applied,
+				Term: host.status.Term, Incarnation: 1,
+			}}}}, true, nil
+	default:
+		return multiraft.Progress{}, false, nil
+	}
+}
+
+func (host *synchronousDeferredReadOwnerHost) PopOutbound() (raftmember.OutboundMessage, bool) {
+	return raftmember.OutboundMessage{}, false
+}
+
+func (host *synchronousDeferredReadOwnerHost) Status(raftmember.GroupKey) (raftmember.RuntimeStatus, error) {
+	return host.status, nil
+}
+
+func (host *synchronousDeferredReadOwnerHost) ReadIndex(_ raftmember.GroupKey, context []byte) error {
+	host.readCalls++
+	var retained [16]byte
+	copy(retained[:], context)
+	host.readContexts = append(host.readContexts, retained)
+	if host.readCalls == 1 {
+		host.ready = 1
+		return raftmodel.ErrReadyPending
+	}
+	host.readContext = retained
+	host.ready = 2
+	return nil
+}
+
+func (host *synchronousDeferredReadOwnerHost) Close() error { return nil }
+
+func TestOwnerDeferredReadDrainsSynchronousHostWithoutAsyncNotifier(t *testing.T) {
+	group := peerServerTestGroup()
+	identity := raftmember.RuntimeIdentity{Group: group, AllocationGeneration: 1,
+		MemberID: 1, StoreID: [16]byte{1}, NodeIncarnation: 1,
+		RelationManifestDigest: [32]byte{1}}
+	command := CommandFence{ReplicaSetVersion: 1, ActivePolicyGeneration: 1,
+		ProtectionEpoch: 1, OwnershipEpoch: 1, SchemaGeneration: 1,
+		RelationManifestDigest: [32]byte{1}, RoutingVersion: 1, RouteGeneration: 1}
+	host := &synchronousDeferredReadOwnerHost{status: raftmember.RuntimeStatus{
+		MemberID: 1, LeaderID: 1, Term: 2, Commit: 7, Applied: 7,
+	}}
+	source := &ownerTestReadSource{}
+	owner := &Owner{
+		host: host, groups: []raftmember.GroupKey{group},
+		members: map[raftmember.GroupKey]ownerMember{group: {
+			identity: identity, command: command, generation: &ownerGeneration{}, read: source,
+		}},
+		limits: Limits{MaxIngressItems: 1, MaxIngressBytes: 1,
+			MaxPendingReadItems: 1, MaxPendingReadBytes: 1},
+		ingress: make(chan ownerRequest, 1), ready: make(chan struct{}), done: make(chan struct{}),
+		pendingReads: make(map[[16]byte]*readDelivery),
+	}
+	runCtx, stop := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- owner.Run(runCtx) }()
+	<-owner.ready
+	var cut LinearizablePointReadCut
+	if err := owner.ReadLinearizablePointInto(context.Background(),
+		deferredLinearizablePointRequest(group, command), &cut); err != nil {
+		t.Fatal(err)
+	}
+	if cut.Source() != source || cut.minimumApplied != 7 || host.readCalls != 2 ||
+		len(host.readContexts) != 2 || host.readContexts[0] != host.readContexts[1] ||
+		owner.readSequence != 1 {
+		t.Fatalf("cut source=%T applied=%d calls=%d contexts=%x sequence=%d",
+			cut.Source(), cut.minimumApplied, host.readCalls, host.readContexts, owner.readSequence)
+	}
+	if err := cut.Close(); err != nil {
+		t.Fatal(err)
+	}
+	stop()
+	if err := <-runDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("owner exit=%v", err)
+	}
+}
+
+var errDeferredReadCollectorFlush = errors.New("deferred read collector flush")
+
+type deferredReadCollectorFailureHost struct {
+	ownerHost
+	firstRunEntered chan struct{}
+	releaseFirstRun chan struct{}
+	firstRun        bool
+	status          raftmember.RuntimeStatus
+}
+
+func (host *deferredReadCollectorFailureHost) RunOne() (multiraft.Progress, bool, error) {
+	if !host.firstRun {
+		host.firstRun = true
+		close(host.firstRunEntered)
+		<-host.releaseFirstRun
+	}
+	return multiraft.Progress{}, false, nil
+}
+
+func (host *deferredReadCollectorFailureHost) PopOutbound() (raftmember.OutboundMessage, bool) {
+	return raftmember.OutboundMessage{}, false
+}
+
+func (host *deferredReadCollectorFailureHost) Status(raftmember.GroupKey) (raftmember.RuntimeStatus, error) {
+	return host.status, nil
+}
+
+func (host *deferredReadCollectorFailureHost) ReadIndex(raftmember.GroupKey, []byte) error {
+	return raftmodel.ErrReadyPending
+}
+
+func (host *deferredReadCollectorFailureHost) EnqueueTrackedProposal(
+	raftmember.GroupKey, []byte, multiraft.ProposalToken,
+) error {
+	return errDeferredReadCollectorFlush
+}
+
+func (host *deferredReadCollectorFailureHost) Close() error { return nil }
+
+func TestOwnerCollectorFlushFailureSettlesDetachedDeferredRead(t *testing.T) {
+	registry, err := raftserve.NewRegistry(raftserve.Limits{
+		MaxGroups: 1, MaxOutstandingIdentities: 1,
+		MaxOutstandingAttempts: 1, MaxWaiters: 1,
+		MaxAttemptsPerIdentity:     1,
+		MaxRetainedCompletionBytes: int64(replicatedstate.MaxCompletionEnvelopeBytes),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer registry.Close()
+	group := peerServerTestGroup()
+	identity := raftmember.RuntimeIdentity{Group: group, AllocationGeneration: 1,
+		MemberID: 1, StoreID: [16]byte{1}, NodeIncarnation: 1,
+		RelationManifestDigest: [32]byte{1}}
+	commandFence := CommandFence{ReplicaSetVersion: 1, ActivePolicyGeneration: 1,
+		ProtectionEpoch: 1, OwnershipEpoch: 1, SchemaGeneration: 1,
+		RelationManifestDigest: [32]byte{1}, RoutingVersion: 1, RouteGeneration: 1}
+	host := &deferredReadCollectorFailureHost{
+		firstRunEntered: make(chan struct{}), releaseFirstRun: make(chan struct{}),
+		status: raftmember.RuntimeStatus{MemberID: 1, LeaderID: 1, Term: 2,
+			Commit: 7, Applied: 7},
+	}
+	owner := &Owner{
+		registry: registry, host: host, groups: []raftmember.GroupKey{group},
+		members: map[raftmember.GroupKey]ownerMember{group: {
+			identity: identity, command: commandFence, generation: &ownerGeneration{},
+			read: &ownerTestReadSource{},
+		}},
+		limits: Limits{MaxIngressItems: 2, MaxIngressBytes: 1 << 20,
+			MaxPendingReadItems: 1, MaxPendingReadBytes: 1},
+		ingress: make(chan ownerRequest, 2), ready: make(chan struct{}), done: make(chan struct{}),
+		pendingReads: make(map[[16]byte]*readDelivery),
+	}
+	runDone := make(chan error, 1)
+	go func() { runDone <- owner.Run(context.Background()) }()
+	<-owner.ready
+	<-host.firstRunEntered
+
+	proposalReply := make(chan ownerReply, 1)
+	proposal := proposalPrefixCommand(t, group, 1)
+	if err := owner.publish(ownerRequest{
+		kind: requestProposal, group: group,
+		fence: ServingFence{Group: group, AllocationGeneration: 1, Command: commandFence,
+			MemberID: 1, StoreID: [16]byte{1}, NodeIncarnation: 1, Term: 2},
+		data: proposal, reply: proposalReply, bytes: int64(len(proposal)),
+		delivery: &proposalDelivery{}, async: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.reservePendingRead(1); err != nil {
+		t.Fatal(err)
+	}
+	readDelivery := &readDelivery{reply: make(chan ownerReply, 1)}
+	if err := owner.publish(ownerRequest{
+		kind: requestReadLinear, group: group, reply: readDelivery.reply,
+		read: readRequest{
+			fence:    deferredLinearizablePointRequest(group, commandFence).Fence,
+			delivery: readDelivery,
+		},
+	}); err != nil {
+		owner.releasePendingRead(1)
+		t.Fatal(err)
+	}
+	close(host.releaseFirstRun)
+	if runErr := <-runDone; !errors.Is(runErr, errDeferredReadCollectorFlush) {
+		t.Fatalf("owner exit=%v", runErr)
+	}
+	if reply := <-proposalReply; !errors.Is(reply.err, errDeferredReadCollectorFlush) {
+		t.Fatalf("proposal reply=%v", reply.err)
+	}
+	if reply := <-readDelivery.reply; !errors.Is(reply.err, ErrOwnerClosed) ||
+		!errors.Is(reply.err, errDeferredReadCollectorFlush) {
+		t.Fatalf("read reply=%v", reply.err)
+	}
+	owner.releasePendingRead(1)
+	owner.mu.Lock()
+	defer owner.mu.Unlock()
+	if owner.ingressItems != 0 || owner.ingressBytes != 0 ||
+		owner.pendingReadItems != 0 || owner.pendingReadBytes != 0 ||
+		len(owner.pendingReads) != 0 {
+		t.Fatalf("retained accounting ingress=%d/%d reads=%d/%d barriers=%d",
+			owner.ingressItems, owner.ingressBytes, owner.pendingReadItems,
+			owner.pendingReadBytes, len(owner.pendingReads))
+	}
+}
+
+func (host *proposalPrefixOwnerHost) EnqueueTrackedProposal(
+	raftmember.GroupKey, []byte, multiraft.ProposalToken,
+) error {
+	host.queued++
+	return nil
+}
+
+func (host *proposalPrefixOwnerHost) RunOne() (multiraft.Progress, bool, error) {
+	host.runs++
+	if host.runs == 1 {
+		close(host.firstRunEntered)
+		<-host.releaseFirstRun
+	} else if host.runs == 2 {
+		host.queuedAtRun <- host.queued
+	}
+	return multiraft.Progress{}, false, nil
+}
+
+func (host *proposalPrefixOwnerHost) PopOutbound() (raftmember.OutboundMessage, bool) {
+	return raftmember.OutboundMessage{}, false
+}
+
+func (host *proposalPrefixOwnerHost) Status(raftmember.GroupKey) (raftmember.RuntimeStatus, error) {
+	return host.status, nil
+}
+
+func (host *proposalPrefixOwnerHost) Close() error { return nil }
+
+func proposalPrefixCommand(t *testing.T, group raftmember.GroupKey, sequence uint64) []byte {
+	t.Helper()
+	command := replication.Command{
+		Kind:                   replication.CommandMutationBatch,
+		ClusterID:              replication.ID128(group.ClusterID),
+		ClusterIncarnation:     replication.ID128(group.ClusterIncarnation),
+		TopologyRecoveryEpoch:  group.TopologyRecoveryEpoch,
+		Distribution:           "docs",
+		Shard:                  "0000-ffff",
+		AllocationGeneration:   1,
+		ShardIncarnation:       replication.ID128(group.ShardIncarnation),
+		GroupID:                replication.ID128(group.GroupID),
+		ReplicaSetVersion:      1,
+		ActivePolicyGeneration: 1,
+		ProtectionEpoch:        1,
+		OwnershipEpoch:         1,
+		SchemaGeneration:       1,
+		RoutingVersion:         1,
+		RouteGeneration:        1,
+		Tenant:                 []byte("tenant"),
+		ClientID:               replication.ID128{1},
+		ClientEpoch:            1,
+		ClientSequence:         sequence,
+		Fingerprint:            replication.Digest{byte(sequence)},
+		Batches: []replication.RelationMutationBatch{{
+			Relation: 1,
+			Mutations: []replication.Mutation{{
+				Kind: replication.MutationPut, Key: []byte{byte(sequence)}, Value: []byte("v"),
+			}},
+		}},
+	}
+	data, err := replication.AppendCommand(nil, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+func TestOwnerQueuesSameGroupPrefixBeforeNextHostRunOne(t *testing.T) {
+	registry, err := raftserve.NewRegistry(raftserve.Limits{
+		MaxGroups: 1, MaxOutstandingIdentities: 2,
+		MaxOutstandingAttempts: 2, MaxWaiters: 2,
+		MaxAttemptsPerIdentity:     1,
+		MaxRetainedCompletionBytes: 2 * int64(replicatedstate.MaxCompletionEnvelopeBytes),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer registry.Close()
+
+	group := peerServerTestGroup()
+	identity := raftmember.RuntimeIdentity{Group: group, AllocationGeneration: 1,
+		MemberID: 1, StoreID: [16]byte{1}, NodeIncarnation: 1,
+		RelationManifestDigest: [32]byte{1}}
+	command := CommandFence{ReplicaSetVersion: 1, ActivePolicyGeneration: 1,
+		ProtectionEpoch: 1, OwnershipEpoch: 1, SchemaGeneration: 1,
+		RelationManifestDigest: [32]byte{1}, RoutingVersion: 1, RouteGeneration: 1}
+	host := &proposalPrefixOwnerHost{
+		firstRunEntered: make(chan struct{}), releaseFirstRun: make(chan struct{}),
+		queuedAtRun: make(chan int, 1),
+		status:      raftmember.RuntimeStatus{MemberID: 1, LeaderID: 1, Term: 2},
+	}
+	owner := &Owner{
+		registry: registry, host: host, groups: []raftmember.GroupKey{group},
+		members: map[raftmember.GroupKey]ownerMember{group: {
+			identity: identity, command: command, generation: &ownerGeneration{},
+		}},
+		limits:  Limits{MaxIngressItems: 4, MaxIngressBytes: 1 << 20},
+		ingress: make(chan ownerRequest, 4), ready: make(chan struct{}), done: make(chan struct{}),
+		pendingReads: make(map[[16]byte]*readDelivery),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- owner.Run(ctx) }()
+	<-owner.ready
+	<-host.firstRunEntered
+
+	replies := [2]chan ownerReply{make(chan ownerReply, 1), make(chan ownerReply, 1)}
+	for index := range replies {
+		data := proposalPrefixCommand(t, group, uint64(index+1))
+		if err := owner.publish(ownerRequest{
+			kind: requestProposal, group: group,
+			fence: ServingFence{Group: group, AllocationGeneration: 1, Command: command,
+				MemberID: 1, StoreID: [16]byte{1}, NodeIncarnation: 1, Term: 2},
+			data: data, reply: replies[index], bytes: int64(len(data)), delivery: &proposalDelivery{},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	close(host.releaseFirstRun)
+	if queued := <-host.queuedAtRun; queued != len(replies) {
+		t.Fatalf("Host.RunOne saw %d queued proposals, want %d", queued, len(replies))
+	}
+	for _, reply := range replies {
+		result := <-reply
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		result.waiter.Cancel()
+	}
+	cancel()
+	if err := <-runDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("owner shutdown=%v", err)
+	}
+	if owner.ingressItems != 0 || owner.ingressBytes != 0 {
+		t.Fatalf("ingress accounting after shutdown=%d/%d", owner.ingressItems, owner.ingressBytes)
+	}
+}
+
+func TestProposalIngressCollectorDrainsAlreadyQueuedSameGroupPrefix(t *testing.T) {
 	group := peerServerTestGroup()
 	request := func(sequence byte) ownerRequest {
 		return ownerRequest{
@@ -784,21 +1376,21 @@ func TestProposalIngressCollectorBuildsFixedBoundedPipelineWindows(t *testing.T)
 			reply: make(chan ownerReply, 1), bytes: 1,
 		}
 	}
-	owner := &Owner{
-		proposalCohort:       make(map[raftmember.GroupKey]int),
-		pendingProposalGroup: make(map[raftmember.GroupKey]int),
-	}
 	collector := newProposalIngressCollector(4)
-	collector.start(owner, request(1))
-	if !collector.active() || collector.bytes != 1 || collector.known || collector.full() {
+	collector.start(request(1))
+	if !collector.active() || collector.bytes != 1 || collector.full() {
 		t.Fatalf("initial collector=%+v", collector)
 	}
+	queue := make(chan ownerRequest, 4)
 	for sequence := byte(2); sequence <= 4; sequence++ {
-		next := request(sequence)
-		if !collector.accepts(next) {
-			t.Fatalf("collector refused same-group request %d", sequence)
-		}
-		collector.append(next)
+		queue <- request(sequence)
+	}
+	barrier, present, err := collector.drain(queue, func(ownerRequest) error {
+		t.Fatal("same-group prefix invoked independent handler")
+		return nil
+	})
+	if err != nil || present || barrier.kind != 0 || barrier.data != nil {
+		t.Fatalf("drain barrier=%+v present=%t err=%v", barrier, present, err)
 	}
 	if !collector.full() || len(collector.requests) != 4 || collector.bytes != 4 {
 		t.Fatalf("full collector=%+v", collector)
@@ -809,35 +1401,62 @@ func TestProposalIngressCollectorBuildsFixedBoundedPipelineWindows(t *testing.T)
 		t.Fatal("collector accepted a cross-group proposal")
 	}
 	collector.reset()
-
-	collector.start(owner, request(7))
-	if !collector.expire(owner) || owner.proposalCohort[group] != 1 {
-		t.Fatalf("partial window did not expire: %+v", collector)
-	}
-	collector.reset()
 }
 
 func TestProposalIngressSingletonHasNoArtificialTimer(t *testing.T) {
 	group := peerServerTestGroup()
-	owner := &Owner{pendingProposalGroup: map[raftmember.GroupKey]int{group: 1}}
 	collector := newProposalIngressCollector(16)
 	defer collector.reset()
 	request := ownerRequest{kind: requestProposal, group: group, data: []byte{1}}
-	collector.start(owner, request)
-	if collector.known || collector.timerC != nil {
-		t.Fatal("lone proposal waits for an imaginary cohort")
+	collector.start(request)
+	queue := make(chan ownerRequest)
+	barrier, present, err := collector.drain(queue, func(ownerRequest) error { return nil })
+	if err != nil || present || barrier.kind != 0 || barrier.data != nil || len(collector.requests) != 1 {
+		t.Fatalf("singleton drain barrier=%+v present=%t err=%v collector=%+v",
+			barrier, present, err, collector)
 	}
-	collector.observe(owner)
-	collector.reset()
-	owner.pendingProposalGroup[group] = 8
-	collector.start(owner, request)
-	if !collector.known || collector.target != 8 || collector.timerC == nil {
-		t.Fatal("lost concurrent durability batching")
+}
+
+func TestProposalIngressCollectorPreservesIndependentLanesAndOrderingBarrier(t *testing.T) {
+	group := peerServerTestGroup()
+	proposal := func(group raftmember.GroupKey, sequence byte) ownerRequest {
+		return ownerRequest{kind: requestProposal, group: group, data: []byte{sequence}}
 	}
-	for i := 1; i < 8; i++ {
-		collector.append(request)
+	collector := newProposalIngressCollector(8)
+	collector.start(proposal(group, 1))
+	queue := make(chan ownerRequest, 4)
+	queue <- ownerRequest{kind: requestReadLinear}
+	queue <- ownerRequest{kind: requestInbound}
+	queue <- proposal(group, 2)
+	other := group
+	other.GroupID[0] ^= 0xff
+	queue <- proposal(other, 3)
+	independent := make([]requestKind, 0, 2)
+	barrier, present, err := collector.drain(queue, func(request ownerRequest) error {
+		independent = append(independent, request.kind)
+		return nil
+	})
+	if err != nil || !present || barrier.group != other ||
+		len(collector.requests) != 2 || len(independent) != 2 ||
+		independent[0] != requestReadLinear || independent[1] != requestInbound {
+		t.Fatalf("collector=%+v independent=%v barrier=%+v present=%t err=%v",
+			collector, independent, barrier, present, err)
 	}
-	if !collector.full() {
-		t.Fatal("complete cohort still waiting")
+}
+
+func TestProposalIngressCollectorSplitsAtExactByteBound(t *testing.T) {
+	group := peerServerTestGroup()
+	collector := newProposalIngressCollector(4)
+	first := ownerRequest{kind: requestProposal, group: group,
+		data: make([]byte, raftmodel.MaxProposalBatchBytes-1)}
+	collector.start(first)
+	queue := make(chan ownerRequest, 1)
+	next := ownerRequest{kind: requestProposal, group: group, data: []byte{1, 2}}
+	queue <- next
+	barrier, present, err := collector.drain(queue, func(ownerRequest) error { return nil })
+	if err != nil || !present || len(barrier.data) != len(next.data) ||
+		len(collector.requests) != 1 || collector.bytes != raftmodel.MaxProposalBatchBytes-1 {
+		t.Fatalf("collector=%+v barrier bytes=%d present=%t err=%v",
+			collector, len(barrier.data), present, err)
 	}
 }

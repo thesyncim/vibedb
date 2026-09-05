@@ -18,6 +18,7 @@ type sourceKind uint8
 const (
 	sourceInvalid sourceKind = iota
 	sourceSegment
+	sourceValidatedRaw
 	sourceHeapSnapshot
 	sourceFileSnapshot
 	sourceFileRange
@@ -31,8 +32,8 @@ const (
 
 // A Source is the collection a compiled query runs over. Construct one with
 // exactly one of [FromSegment], [FromSnapshot], [FromFile], [FromFileRange],
-// [FromFileOverlay], [FromSnapshotOverlay], [FromDatabase], or
-// [FromFileDatabase]; the zero Source names nothing and every execution
+// [FromValidatedRaw], [FromFileOverlay], [FromSnapshotOverlay], [FromDatabase],
+// or [FromFileDatabase]; the zero Source names nothing and every execution
 // rejects it.
 //
 // Source is a concrete discriminated struct rather than an interface. A
@@ -44,8 +45,9 @@ const (
 // escaping.
 type Source struct {
 	kind sourceKind
-	// payload is a *store.Segment for sourceSegment, a *FileRangeSource for
-	// sourceFileRange, and a *FileOverlaySource for sourceFileOverlay and
+	// payload is a *store.Segment for sourceSegment, a *ValidatedRawSource for
+	// sourceValidatedRaw, a *FileRangeSource for sourceFileRange, and a
+	// *FileOverlaySource for sourceFileOverlay and
 	// sourceSnapshotOverlay. Those variants are
 	// disjoint, so one GC-visible pointer keeps Source the same size it had
 	// before overlay support; adding an interface field here made every
@@ -57,6 +59,25 @@ type Source struct {
 	catalog store.DatabaseSnapshot
 	files   durable.DatabaseSnapshot
 	name    string
+}
+
+// ValidatedRawSource holds one validated JSON document for synchronous point
+// execution. The bytes are borrowed until RunInto returns.
+type ValidatedRawSource struct {
+	value []byte
+}
+
+// Bind replaces the borrowed validated document.
+func (s *ValidatedRawSource) Bind(value []byte) {
+	if s != nil {
+		s.value = value
+	}
+}
+
+// FromValidatedRaw names one JSON document already validated by its storage
+// reader. source must remain alive and unchanged until execution returns.
+func FromValidatedRaw(source *ValidatedRawSource) Source {
+	return Source{kind: sourceValidatedRaw, payload: unsafe.Pointer(source)}
 }
 
 func (s Source) subquerySource(outer, collection string) (Source, error) {
@@ -144,6 +165,7 @@ func FromFile(s *durable.Snapshot) Source {
 // their existing size and allocation behavior.
 type FileRangeSource struct {
 	orderedPath    string
+	predicatePath  string
 	lower          []byte
 	upper          []byte
 	lowerExclusive bool
@@ -161,6 +183,7 @@ func (s *FileRangeSource) Bind(lower, upper []byte, lowerExclusive bool) {
 	if s != nil {
 		s.lower, s.upper, s.lowerExclusive = lower, upper, lowerExclusive
 		s.orderedPath = ""
+		s.predicatePath = ""
 	}
 }
 
@@ -174,10 +197,22 @@ func (s *FileRangeSource) BindPrimaryOrder(path string) {
 	}
 }
 
+// BindPrimaryPredicate certifies that the complete compiled predicate is the
+// conjunction represented by this source's native bounds on path. The query
+// executor may therefore omit a redundant row-by-row predicate evaluation.
+// Callers must own both that predicate proof and the primary-key schema
+// invariant; Bind clears the certificate before every reuse.
+func (s *FileRangeSource) BindPrimaryPredicate(path string) {
+	if s != nil {
+		s.predicatePath = path
+	}
+}
+
 // FromFileRange names a page-backed snapshot restricted to one native ordered-
 // primary span. The complete compiled predicate remains authoritative after the
-// seek, so this changes physical work only. rangeSource must remain alive and
-// unchanged until execution returns.
+// seek unless the caller also supplies [FileRangeSource.BindPrimaryPredicate]'s
+// explicit coverage certificate. rangeSource must remain alive and unchanged
+// until execution returns.
 func FromFileRange(s *durable.Snapshot, rangeSource *FileRangeSource) Source {
 	return Source{
 		kind: sourceFileRange, file: s, payload: unsafe.Pointer(rangeSource),
@@ -499,7 +534,7 @@ func (q *Query) runInto(e *Exec, src Source, correlations []scalar) (err error) 
 	}
 	e.Workspace.heapWorkParent = nil
 	switch src.kind {
-	case sourceSegment, sourceHeapSnapshot, sourceSnapshotOverlay, sourceDatabase, sourceRelationSpool:
+	case sourceSegment, sourceValidatedRaw, sourceHeapSnapshot, sourceSnapshotOverlay, sourceDatabase, sourceRelationSpool:
 		memoryBytes, limitErr := normalizeHeapMemoryBytes(e.Options)
 		if limitErr != nil {
 			return limitErr
@@ -523,6 +558,15 @@ func (q *Query) runInto(e *Exec, src Source, correlations []scalar) (err error) 
 		}
 		e.Stats = ExecStats{}
 		return p.runInto(&e.Result, docs, &e.Workspace, e.Options.Workers)
+	case sourceValidatedRaw:
+		raw := (*ValidatedRawSource)(src.payload)
+		if raw == nil || len(raw.value) == 0 {
+			return fmt.Errorf("query: FromValidatedRaw was given an empty source")
+		}
+		if err := rejectJoins(p, "FromValidatedRaw"); err != nil {
+			return err
+		}
+		return p.runValidatedRawInto(e, raw.value)
 	case sourceRelationSpool:
 		spool := (*relationSpool)(src.payload)
 		if spool == nil {

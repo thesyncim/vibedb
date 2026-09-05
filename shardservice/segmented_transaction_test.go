@@ -38,12 +38,12 @@ func buildShardManifest(t testing.TB, id distributedtxn.ID, count int) ([]byte, 
 		digest := distributedtxn.Digest{1}
 		digest[1] = byte(i)
 		digest[2] = byte(i >> 8)
-		err = builder.Append(distributedtxn.ParticipantRef{
+		err = builder.Append(distributedtxn.TransactionTargetRef{
 			Distribution: []byte(owner.Distribution), Shard: shard,
 			RoutingVersion:       uint64(owner.RoutingVersion),
 			AllocationGeneration: uint64(owner.AllocationGeneration),
 			OwnershipEpoch:       uint64(owner.Epoch), MutationDigest: digest,
-			State: distributedtxn.ParticipantStaged,
+			State: distributedtxn.TargetStaged,
 		})
 		if err != nil {
 			t.Fatalf("append participant %d: %v", i, err)
@@ -342,10 +342,10 @@ func maximalExpansionManifestPage(t testing.TB) []byte {
 		shard := bytes.Repeat([]byte{'b'}, distributedtxn.MaxShardIdentityBytes-4)
 		shard = strconv.AppendInt(shard, int64(1000+i), 10)
 		digest := distributedtxn.Digest{1, byte(i), byte(i >> 8)}
-		if err := builder.Append(distributedtxn.ParticipantRef{
+		if err := builder.Append(distributedtxn.TransactionTargetRef{
 			Distribution: distribution, Shard: shard,
 			RoutingVersion: 1, AllocationGeneration: 1, OwnershipEpoch: 1,
-			MutationDigest: digest, State: distributedtxn.ParticipantStaged,
+			MutationDigest: digest, State: distributedtxn.TargetStaged,
 		}); err != nil {
 			t.Fatalf("append %d: %v", i, err)
 		}
@@ -365,12 +365,12 @@ func TestTransactionManifestScratchAcceptsMaximalPrefixExpansion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("inspect highly compressed page: %v", err)
 	}
-	if meta.participantCount == 0 ||
-		int(meta.participantCount)*distributedtxn.MaxShardIdentityBytes*2 <= distributedtxn.ManifestSegmentBytes {
-		t.Fatalf("page expansion is not above encoded page: participants=%d", meta.participantCount)
+	if meta.targetCount == 0 ||
+		int(meta.targetCount)*distributedtxn.MaxShardIdentityBytes*2 <= distributedtxn.ManifestSegmentBytes {
+		t.Fatalf("page expansion is not above encoded page: participants=%d", meta.targetCount)
 	}
 	scratch := new(transactionManifestScratch)
-	wantIdentityBytes := distributedtxn.MaxManifestPageParticipants *
+	wantIdentityBytes := distributedtxn.MaxManifestPageTargets *
 		distributedtxn.MaxShardIdentityBytes * 2
 	if len(scratch.identities) != wantIdentityBytes {
 		t.Fatalf("identity scratch bytes=%d, want exact one-page maximum %d",

@@ -379,8 +379,8 @@ type snapshotArtifactWriter struct {
 }
 
 type snapshotArtifactTransactionScratch struct {
-	participants []distributedtxn.ParticipantRef
-	identities   []byte
+	targets    []distributedtxn.TransactionTargetRef
+	identities []byte
 }
 
 // WriteSnapshotArtifact writes a deterministic, bounded-memory artifact for
@@ -1737,20 +1737,20 @@ func consumeSnapshotArtifactRows(
 					return false, fmt.Errorf("%w: transaction manifest", ErrSnapshotArtifact)
 				}
 				count := int(binary.LittleEndian.Uint32(value[32:36]))
-				if count <= 0 || count > distributedtxn.MaxManifestPageParticipants {
+				if count <= 0 || count > distributedtxn.MaxManifestPageTargets {
 					return false, fmt.Errorf("%w: transaction manifest count", ErrSnapshotArtifact)
 				}
 				if transactionScratch == nil {
 					return false, fmt.Errorf("%w: missing transaction scratch", ErrSnapshotArtifact)
 				}
-				if transactionScratch.participants == nil {
-					transactionScratch.participants = make([]distributedtxn.ParticipantRef,
-						distributedtxn.MaxManifestPageParticipants)
+				if transactionScratch.targets == nil {
+					transactionScratch.targets = make([]distributedtxn.TransactionTargetRef,
+						distributedtxn.MaxManifestPageTargets)
 					transactionScratch.identities = make([]byte,
-						distributedtxn.MaxManifestPageParticipants*distributedtxn.MaxShardIdentityBytes*2)
+						distributedtxn.MaxManifestPageTargets*distributedtxn.MaxShardIdentityBytes*2)
 				}
 				view, err := OpenTransactionManifestPageInto(
-					value, transactionScratch.participants, transactionScratch.identities,
+					value, transactionScratch.targets, transactionScratch.identities,
 				)
 				want, keyErr := view.StorageKey()
 				if err != nil || keyErr != nil || !bytes.Equal(key, want[:]) {

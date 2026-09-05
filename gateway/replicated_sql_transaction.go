@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"slices"
+	"strings"
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
@@ -14,6 +15,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/query"
 	"github.com/thesyncim/vibedb/shardservice"
 	sqlast "github.com/thesyncim/vibedb/sql"
@@ -40,6 +42,16 @@ var (
 	ErrReplicatedSQLTransactionDuplicate = errors.New(
 		"gateway: replicated SQL transaction repeats a relation key",
 	)
+	errPreparedDirectFallback = errors.New(
+		"gateway: prepared direct lowering requires a linearizable preimage",
+	)
+)
+
+type replicatedSQLPreimageMode uint8
+
+const (
+	replicatedSQLLinearizablePreimage replicatedSQLPreimageMode = iota
+	replicatedSQLCommittedLeaderPreimage
 )
 
 type replicatedSQLBoundStatement struct {
@@ -50,14 +62,61 @@ type replicatedSQLBoundStatement struct {
 	updateExec       query.Exec
 }
 
-type replicatedSQLParticipantBuilder struct {
-	participant ReplicatedTransactionParticipant
+type replicatedSQLTargetBuilder struct {
+	target ReplicatedTransactionTarget
 }
 
 type replicatedSQLMutationIdentity struct {
-	participant int
-	relation    replication.RelationID
-	key         []byte
+	target   int
+	relation replication.RelationID
+	key      []byte
+}
+
+// preparedDirectUpdateCandidate is the private precheck for the committed
+// preimage lane. It is intentionally stricter than the ordinary RF3 lowerer:
+// one exact primary-key row, declared column assignments, no maintained
+// global indexes, and no assignment that can move the primary key.
+func preparedDirectUpdateCandidate(
+	queries []Query,
+	statement *replicatedSQLBoundStatement,
+	profile ReplicatedTableProfile,
+) bool {
+	if len(queries) != 1 || statement == nil || statement.prepared == nil ||
+		statement.bound == nil || statement.profile.Relation == 0 ||
+		statement.profile.Relation != profile.Relation {
+		return false
+	}
+	prepared, bound := statement.prepared, statement.bound
+	update := prepared.statement.Update
+	if prepared.statement.Kind != sqlast.KindUpdate || bound.kind != sqlast.KindUpdate ||
+		update == nil || len(update.Assignments) == 0 || len(bound.updateAssignments) == 0 ||
+		len(prepared.writeGlobalIndexes) != 0 ||
+		!replicatedSQLExactPrimaryFilter(update.Filter, profile.PrimaryKey) ||
+		replicatedSQLUpdateAssignsPrimary(update, profile.PrimaryKey) {
+		return false
+	}
+	_, ok := replicatedSQLExactConstraint(bound.constraints)
+	return ok
+}
+
+func replicatedSQLUpdateAssignsPrimary(update *sqlast.UpdateStmt, primary string) bool {
+	if update == nil || len(update.Assignments) == 0 || len(primary) < 2 || primary[0] != '/' {
+		return false
+	}
+	encoded := primary[1:]
+	if strings.IndexByte(encoded, '/') >= 0 {
+		return false
+	}
+	column := encoded
+	if strings.IndexByte(encoded, '~') >= 0 {
+		column = strings.ReplaceAll(strings.ReplaceAll(encoded, "~1", "/"), "~0", "~")
+	}
+	for _, assignment := range update.Assignments {
+		if assignment.Column == column {
+			return true
+		}
+	}
+	return false
 }
 
 // replicatedSQLTransactionRequestDigest binds a request ID to the exact caller
@@ -121,7 +180,7 @@ func (executor *Executor) planReplicatedSQLTransaction(
 	snapshot *Snapshot,
 	queries []Query,
 	profile Profile,
-) ([]ReplicatedTransactionParticipant, bool, error) {
+) ([]ReplicatedTransactionTarget, bool, error) {
 	return executor.planReplicatedSQLTransactionWithData(ctx, snapshot, queries, profile, nil)
 }
 
@@ -131,13 +190,46 @@ func (executor *Executor) planReplicatedSQLTransactionWithData(
 	queries []Query,
 	profile Profile,
 	data *ReplicatedExecutor,
-) ([]ReplicatedTransactionParticipant, bool, error) {
+) ([]ReplicatedTransactionTarget, bool, error) {
+	return executor.planReplicatedSQLTransactionWithDataMode(
+		ctx, snapshot, queries, profile, data,
+		replicatedSQLLinearizablePreimage,
+	)
+}
+
+func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
+	ctx context.Context,
+	snapshot *Snapshot,
+	queries []Query,
+	profile Profile,
+	data *ReplicatedExecutor,
+	preimageMode replicatedSQLPreimageMode,
+) (targets []ReplicatedTransactionTarget, handled bool, err error) {
 	if executor == nil || snapshot == nil ||
 		len(queries) == 0 {
 		return nil, false, nil
 	}
+	if preimageMode == replicatedSQLCommittedLeaderPreimage && len(queries) != 1 {
+		return nil, true, errPreparedDirectFallback
+	}
 	statements := make([]replicatedSQLBoundStatement, len(queries))
 	var expressionCancel query.CancelFlag
+	committedPreimageRead := false
+	if preimageMode == replicatedSQLCommittedLeaderPreimage {
+		defer func() {
+			// Only errors derived from a successfully read committed row need
+			// a fresh linearizable evaluation. Binding/transport/fence errors
+			// retain their original class without repeating unrelated work.
+			if !committedPreimageRead || err == nil || errors.Is(err, errPreparedDirectFallback) {
+				return
+			}
+			if ctx != nil && context.Cause(ctx) != nil {
+				err = context.Cause(ctx)
+				return
+			}
+			err = errors.Join(errPreparedDirectFallback, err)
+		}()
+	}
 	var stopExpressionCancel func() bool
 	defer func() {
 		if stopExpressionCancel != nil {
@@ -189,6 +281,7 @@ func (executor *Executor) planReplicatedSQLTransactionWithData(
 		statements[index].prepared = prepared
 		statements[index].bound = bound
 		if !replicated {
+			preimageMode = replicatedSQLLinearizablePreimage
 			continue
 		}
 		tableProfile, ok := snapshot.replicatedTableProfileAt(entry)
@@ -196,6 +289,14 @@ func (executor *Executor) planReplicatedSQLTransactionWithData(
 			return nil, true, ErrReplicatedSQLTransactionUnsupported
 		}
 		statements[index].profile = tableProfile
+		if preimageMode == replicatedSQLCommittedLeaderPreimage &&
+			!preparedDirectUpdateCandidate(
+				queries, &statements[index], tableProfile,
+			) {
+			// The statement is already parsed and bound. Preserve ordinary
+			// lowering without binding INSERT, DELETE or indexed UPDATE twice.
+			preimageMode = replicatedSQLLinearizablePreimage
+		}
 		if hasComputedUpdateAssignments(&prepared.statement) {
 			parameterTypes, typeErr := postgresQueryParameterTypes(
 				queries[index].ParamTypes, prepared.params,
@@ -269,7 +370,7 @@ func (executor *Executor) planReplicatedSQLTransactionWithData(
 		baseMutationCount += count
 	}
 
-	builders := make([]replicatedSQLParticipantBuilder, 0, min(baseMutationCount, 8))
+	builders := make([]replicatedSQLTargetBuilder, 0, min(baseMutationCount, 8))
 	identities := make([]replicatedSQLMutationIdentity, 0, min(baseMutationCount, 256))
 	keyArena := make([]byte, 0, min(baseMutationCount, 256)*32)
 	var byGroup map[raftmember.GroupKey]int
@@ -349,13 +450,23 @@ func (executor *Executor) planReplicatedSQLTransactionWithData(
 			missingPartial := false
 			if kind == replication.MutationPutPresent && len(statement.bound.updateAssignments) != 0 {
 				var found bool
-				oldDocument, found, err = readReplicatedSQLDocument(
-					data, ctx, resolved.Route, statement.profile, ownedKey,
-				)
+				if preimageMode == replicatedSQLCommittedLeaderPreimage {
+					oldDocument, found, err = readReplicatedSQLDocumentCommitted(
+						data, ctx, resolved.Route, statement.profile, ownedKey,
+					)
+					committedPreimageRead = err == nil
+				} else {
+					oldDocument, found, err = readReplicatedSQLDocument(
+						data, ctx, resolved.Route, statement.profile, ownedKey,
+					)
+				}
 				if err != nil {
 					return nil, true, err
 				}
 				if !found {
+					if preimageMode == replicatedSQLCommittedLeaderPreimage {
+						return nil, true, errPreparedDirectFallback
+					}
 					// Retain a real participant so the durable request ledger can
 					// prove this zero-row result. Replicated apply checks PutPresent
 					// presence before schema validation and never publishes this value.
@@ -439,7 +550,7 @@ func (executor *Executor) planReplicatedSQLTransactionWithData(
 				baseMutation.ExpectedValueDigest = replication.Digest(sha256.Sum256(oldDocument))
 				baseMutation.Kind = replication.MutationPutDigestEqual
 			}
-			participantIndex, appendErr := appendReplicatedSQLMutation(
+			targetIndex, appendErr := appendReplicatedSQLMutation(
 				&builders, &byGroup, resolved.Route, bits,
 				distributedtxn.IntentScope{Start: uint32(bucket), End: uint32(bucket) + 1},
 				statement.profile.Relation, baseMutation,
@@ -453,7 +564,7 @@ func (executor *Executor) planReplicatedSQLTransactionWithData(
 				return nil, true, err
 			}
 			identities = append(identities, replicatedSQLMutationIdentity{
-				participant: participantIndex, relation: statement.profile.Relation, key: ownedKey,
+				target: targetIndex, relation: statement.profile.Relation, key: ownedKey,
 			})
 
 			indexEnd := len(statement.bound.globalIndexes)
@@ -508,7 +619,7 @@ func (executor *Executor) planReplicatedSQLTransactionWithData(
 					indexMutation.ExpectedValueDigest == (replication.Digest{}) {
 					return nil, true, ErrReplicatedSQLTransactionUnsupported
 				}
-				indexParticipant, indexErr := appendReplicatedSQLMutation(
+				indexTarget, indexErr := appendReplicatedSQLMutation(
 					&builders, &byGroup, indexRoute, index.bucketBits, index.scope,
 					indexProfile.Relation, indexMutation,
 				)
@@ -521,15 +632,15 @@ func (executor *Executor) planReplicatedSQLTransactionWithData(
 					return nil, true, err
 				}
 				identities = append(identities, replicatedSQLMutationIdentity{
-					participant: indexParticipant, relation: indexProfile.Relation, key: entryKey,
+					target: indexTarget, relation: indexProfile.Relation, key: entryKey,
 				})
 			}
 		}
 	}
 
 	slices.SortFunc(identities, func(left, right replicatedSQLMutationIdentity) int {
-		if left.participant != right.participant {
-			return left.participant - right.participant
+		if left.target != right.target {
+			return left.target - right.target
 		}
 		if left.relation < right.relation {
 			return -1
@@ -541,28 +652,31 @@ func (executor *Executor) planReplicatedSQLTransactionWithData(
 	})
 	for index := 1; index < len(identities); index++ {
 		prior, current := identities[index-1], identities[index]
-		if prior.participant == current.participant && prior.relation == current.relation &&
+		if prior.target == current.target && prior.relation == current.relation &&
 			bytes.Equal(prior.key, current.key) {
 			return nil, true, ErrReplicatedSQLTransactionDuplicate
 		}
 	}
 
-	participants := make([]ReplicatedTransactionParticipant, len(builders))
+	targets = make([]ReplicatedTransactionTarget, len(builders))
 	for index := range builders {
-		participant := builders[index].participant
-		slices.SortFunc(participant.Batches, func(
+		target := builders[index].target
+		slices.SortFunc(target.Batches, func(
 			left, right replication.RelationMutationBatch,
 		) int {
 			return int(left.Relation) - int(right.Relation)
 		})
-		participant.IntentScopes = coalesceIntentScopes(participant.IntentScopes)
-		if len(participant.IntentScopes) == 0 ||
-			len(participant.IntentScopes) > distributedtxn.MaxIntentScopes {
+		target.IntentScopes = coalesceIntentScopes(target.IntentScopes)
+		if len(target.IntentScopes) == 0 ||
+			len(target.IntentScopes) > distributedtxn.MaxIntentScopes {
 			return nil, true, ErrReplicatedSQLTransactionUnsupported
 		}
-		participants[index] = participant
+		targets[index] = target
 	}
-	return participants, true, nil
+	if committedPreimageRead && !preparedDirectFullRowGuard(targets) {
+		return nil, true, errPreparedDirectFallback
+	}
+	return targets, true, nil
 }
 
 func replicatedSQLConflictActionPosition(insert *sqlast.InsertStmt) int {
@@ -757,6 +871,35 @@ func readReplicatedSQLDocument(
 	return result.Value, true, nil
 }
 
+func readReplicatedSQLDocumentCommitted(
+	data *ReplicatedExecutor,
+	ctx context.Context,
+	route ReplicatedRoute,
+	profile ReplicatedTableProfile,
+	key []byte,
+) ([]byte, bool, error) {
+	if data == nil || profile.Relation == 0 ||
+		profile.MaxDocumentBytes == 0 {
+		return nil, false, ErrReplicatedSQLTransactionUnsupported
+	}
+	result, err := data.readCommittedPoint(
+		ctx, route, ReplicatedPointRead{
+			Relation: profile.Relation, Key: key, MinimumApplied: 1,
+			MaxValueBytes: profile.MaxDocumentBytes,
+		}, serviceauthz.CapabilityDataRead,
+	)
+	if err != nil {
+		return nil, false, err
+	}
+	if !result.Found {
+		return nil, false, nil
+	}
+	if len(result.Value) == 0 {
+		return nil, false, ErrReplicatedRoute
+	}
+	return result.Value, true, nil
+}
+
 func (snapshot *Snapshot) resolveReplicatedSQLGlobalIndex(
 	index *boundGlobalIndexMutation,
 ) (ReplicatedRoute, ReplicatedTableProfile, error) {
@@ -791,7 +934,7 @@ func (snapshot *Snapshot) resolveReplicatedSQLGlobalIndex(
 }
 
 func appendReplicatedSQLMutation(
-	builders *[]replicatedSQLParticipantBuilder,
+	builders *[]replicatedSQLTargetBuilder,
 	byGroup *map[raftmember.GroupKey]int,
 	route ReplicatedRoute,
 	bucketBits uint8,
@@ -803,33 +946,33 @@ func appendReplicatedSQLMutation(
 		!distributedtxn.ValidateIntentScopes([]distributedtxn.IntentScope{scope}, bucketBits) {
 		return -1, ErrReplicatedSQLTransactionUnsupported
 	}
-	participantIndex := replicatedSQLParticipantIndex(*builders, *byGroup, route.Group)
-	if participantIndex < 0 {
+	targetIndex := replicatedSQLTargetIndex(*builders, *byGroup, route.Group)
+	if targetIndex < 0 {
 		replicas := make([]ReplicatedEndpoint, len(route.Replicas))
 		copy(replicas, route.Replicas)
 		route.Replicas = replicas
-		*builders = append(*builders, replicatedSQLParticipantBuilder{
-			participant: ReplicatedTransactionParticipant{
+		*builders = append(*builders, replicatedSQLTargetBuilder{
+			target: ReplicatedTransactionTarget{
 				Route: route, BucketBits: bucketBits,
 			},
 		})
-		participantIndex = len(*builders) - 1
+		targetIndex = len(*builders) - 1
 		if *byGroup != nil {
-			(*byGroup)[route.Group] = participantIndex
+			(*byGroup)[route.Group] = targetIndex
 		} else if len(*builders) == 16 {
 			index := make(map[raftmember.GroupKey]int, len(*builders))
 			for builderIndex := range *builders {
-				index[(*builders)[builderIndex].participant.Route.Group] = builderIndex
+				index[(*builders)[builderIndex].target.Route.Group] = builderIndex
 			}
 			*byGroup = index
 		}
 	} else if !sameReplicatedSQLRoute(
-		(*builders)[participantIndex].participant.Route, route,
-	) || (*builders)[participantIndex].participant.BucketBits != bucketBits {
+		(*builders)[targetIndex].target.Route, route,
+	) || (*builders)[targetIndex].target.BucketBits != bucketBits {
 		return -1, ErrReplicatedSQLTransactionUnsupported
 	}
 
-	builder := &(*builders)[participantIndex].participant
+	builder := &(*builders)[targetIndex].target
 	batchIndex := replicatedSQLRelationBatch(builder.Batches, relation)
 	if batchIndex < 0 {
 		if len(builder.Batches) == replication.MaxRelationBatches {
@@ -846,7 +989,7 @@ func appendReplicatedSQLMutation(
 	}
 	batch.Mutations = append(batch.Mutations, mutation)
 	builder.IntentScopes = append(builder.IntentScopes, scope)
-	return participantIndex, nil
+	return targetIndex, nil
 }
 
 func admitReplicatedSQLMutation(
@@ -1010,8 +1153,8 @@ func replicatedSQLDocumentPrimaryScalar(
 	}
 }
 
-func replicatedSQLParticipantIndex(
-	builders []replicatedSQLParticipantBuilder,
+func replicatedSQLTargetIndex(
+	builders []replicatedSQLTargetBuilder,
 	byGroup map[raftmember.GroupKey]int,
 	group raftmember.GroupKey,
 ) int {
@@ -1022,7 +1165,7 @@ func replicatedSQLParticipantIndex(
 		return -1
 	}
 	for index := range builders {
-		if builders[index].participant.Route.Group == group {
+		if builders[index].target.Route.Group == group {
 			return index
 		}
 	}
