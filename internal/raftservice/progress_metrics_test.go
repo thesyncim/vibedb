@@ -35,6 +35,28 @@ func TestProgressMetricsCountsExistingOwnerSeamsExactly(t *testing.T) {
 	}
 }
 
+func TestProgressMetricsCountsLateJoinTelemetryWithFixedBuckets(t *testing.T) {
+	metrics := new(ProgressMetrics)
+	metrics.observeProgress(multiraft.Progress{
+		LateJoinQueued: 2, LateJoinUsed: true, LateJoinEntries: 2,
+	}, true, nil)
+	metrics.observeProgress(multiraft.Progress{
+		LateJoinQueued: 3, LateJoinMissed: true,
+	}, true, nil)
+	metrics.observeProgress(multiraft.Progress{
+		CapturedProposalCount: 2, CapturedProposalBytes: 100,
+	}, true, nil)
+	snapshot := metrics.Snapshot()
+	if snapshot.ProposalWindowQueued != 5 || snapshot.LateJoinUsed != 1 ||
+		snapshot.LateJoinMissed != 1 || snapshot.LateJoinEntries != 2 ||
+		snapshot.ProposalQueueDepthHistogram[2] != 1 ||
+		snapshot.ProposalQueueDepthHistogram[3] != 1 ||
+		snapshot.ProposalEntriesPerReady[2] != 1 ||
+		snapshot.ProposalBytesPerReady[1] != 1 {
+		t.Fatalf("late-join telemetry = %+v", snapshot)
+	}
+}
+
 func BenchmarkProgressMetricsObserveProposal(b *testing.B) {
 	metrics := new(ProgressMetrics)
 	progress := multiraft.Progress{Kind: multiraft.ProgressProposal,
@@ -57,10 +79,15 @@ func TestProgressMetricsGroupDirectoryIsExactAndBounded(t *testing.T) {
 		t.Fatal(err)
 	}
 	metrics.observeProgress(multiraft.Progress{Group: groupA, ProposalCount: 2, ProposalBytes: 11,
-		CommitAdvancements: 3, CommittedEntries: 7}, true, nil)
+		CommitAdvancements: 3, CommittedEntries: 7, LateJoinQueued: 2,
+		LateJoinUsed: true, LateJoinEntries: 1, CapturedProposalCount: 2,
+		CapturedProposalBytes: 11}, true, nil)
 	identity, got, found := metrics.GroupProgressMetrics(groupA)
 	if !found || identity.MemberID != 7 || got.ProposalCommands != 2 || got.ProposalBytes != 11 ||
-		got.CommitAdvancements != 3 || got.CommittedEntries != 7 {
+		got.CommitAdvancements != 3 || got.CommittedEntries != 7 || got.ProposalWindowQueued != 2 ||
+		got.LateJoinUsed != 1 || got.LateJoinEntries != 1 ||
+		got.ProposalQueueDepthHistogram[2] != 1 || got.ProposalEntriesPerReady[2] != 1 ||
+		got.ProposalBytesPerReady[1] != 1 {
 		t.Fatalf("identity=%+v metrics=%+v found=%v", identity, got, found)
 	}
 	if _, got, found = metrics.GroupProgressMetrics(groupB); !found || got != (ProgressMetricsSnapshot{}) {
