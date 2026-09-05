@@ -314,14 +314,8 @@ func (s *Statement) prepareScalar(preserveUnknownOutput bool) error {
 		runtime.ordered.projectionEnd = len(runtime.nodes)
 		runtime.ordered.havingEnd = runtime.ordered.projectionEnd
 		if exprHasScalar(s.tree.Having) {
-			if !exprEntirelyScalar(s.tree.Having) {
-				return sqlast.NewFeatureNotSupportedError(
-					s.text, firstScalarExprPos(s.tree.Having),
-					"a computed HAVING predicate may combine only computed scalar boolean terms",
-				)
-			}
 			runtime.predRoots = append(runtime.predRoots, -1)
-			root, err := runtime.compilePredicate(s, s.tree.Having)
+			root, err := runtime.compileFilterPredicate(s, s.tree.Having)
 			if err != nil {
 				return err
 			}
@@ -748,26 +742,27 @@ func (r *statementScalar) compileWhere(s *Statement, expr *sqlast.Expr) error {
 		if !exprHasScalar(term) {
 			continue
 		}
-		var root int32
-		var err error
-		if exprEntirelyScalar(term) {
-			root, err = r.compilePredicate(s, term)
-		} else {
-			// WHERE retains exactly TRUE. The shared searched-CASE evaluator
-			// preserves NULL, short-circuiting, and runtime operand checks across
-			// mixed path/scalar boolean trees before this final truth selection.
-			value := &sqlast.ScalarExpr{Kind: sqlast.ScalarCase, Pos: term.Pos,
-				Whens: []sqlast.ScalarWhen{{Predicate: term, Result: &sqlast.ScalarExpr{Kind: sqlast.ScalarLiteral, Value: sqlast.Operand{Kind: sqlast.OperandBool, Bool: true}}}},
-				Else:  &sqlast.ScalarExpr{Kind: sqlast.ScalarLiteral, Value: sqlast.Operand{Kind: sqlast.OperandBool}},
-			}
-			root, err = r.compilePredicate(s, &sqlast.Expr{Kind: sqlast.ExprScalarTruth, ScalarLeft: value, Pos: term.Pos})
-		}
+		root, err := r.compileFilterPredicate(s, term)
 		if err != nil {
 			return err
 		}
 		r.predRoots = append(r.predRoots, root)
 	}
 	return nil
+}
+
+// WHERE and HAVING both retain exactly TRUE. Use the shared searched-CASE
+// evaluator for mixed path/scalar trees to preserve NULL, short-circuiting,
+// and runtime operand checks at the appropriate row or grouped stage.
+func (r *statementScalar) compileFilterPredicate(s *Statement, expr *sqlast.Expr) (int32, error) {
+	if exprEntirelyScalar(expr) {
+		return r.compilePredicate(s, expr)
+	}
+	value := &sqlast.ScalarExpr{Kind: sqlast.ScalarCase, Pos: expr.Pos,
+		Whens: []sqlast.ScalarWhen{{Predicate: expr, Result: &sqlast.ScalarExpr{Kind: sqlast.ScalarLiteral, Value: sqlast.Operand{Kind: sqlast.OperandBool, Bool: true}}}},
+		Else:  &sqlast.ScalarExpr{Kind: sqlast.ScalarLiteral, Value: sqlast.Operand{Kind: sqlast.OperandBool}},
+	}
+	return r.compilePredicate(s, &sqlast.Expr{Kind: sqlast.ExprScalarTruth, ScalarLeft: value, Pos: expr.Pos})
 }
 
 func exprEntirelyScalar(expr *sqlast.Expr) bool {
