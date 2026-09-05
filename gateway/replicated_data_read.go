@@ -408,66 +408,78 @@ func (reader *ReplicatedDataReader) readBatchPinned(
 		pressurePoints = make([]distribution.KeyspacePoint, len(request.Points))
 	}
 	points := make([]ReplicatedBatchPointRead, len(request.Points))
-	// Only the first point's route leaves this loop (it addresses the RPC).
+	// The leading point resolves with dedicated scratch; its route is the
+	// only one retained (it addresses the RPC). Every later point shares a
+	// second pair whose routes feed only value comparisons and the reuse
+	// cache — never the RPC — so the compiler keeps the shared pair on the
+	// stack. Do not merge the head block back into the loop: sharing one
+	// result variable would merge the backings and heap-allocate both pairs.
 	// Per-table resolve prep is cached across points, and the shard lookup
 	// is skipped while the cached route already covers the key's shard; the
 	// route is a pure function of the pinned snapshot plus spec and shard,
 	// so the skipped lookup would rebuild an identical value. Later points
 	// additionally skip the SHA256 route digest and gate on a direct
-	// authority comparison instead. Points therefore share one scratch pair
-	// instead of escaping a replica table and decode slab per point. The
-	// shared pair is never retained: resolved routes alias it, and only
-	// index zero's route is kept.
+	// authority comparison instead.
 	var firstReplicas [ServingReplicaCount]ReplicatedEndpoint
 	var firstScalar [replication.MaxMutationKeyBytes + 16]byte
 	var routeReplicas [ServingReplicaCount]ReplicatedEndpoint
 	var routeScalar [replication.MaxMutationKeyBytes + 16]byte
 	var prep replicatedTableResolvePrep
-	havePrep := false
 	var reuseRoute ReplicatedRoute
 	haveReuse := false
-	for index := range request.Points {
-		replicaScratch, scalarScratch := routeReplicas[:0], routeScalar[:0]
-		if index == 0 {
-			replicaScratch, scalarScratch = firstReplicas[:0], firstScalar[:0]
-		}
+	head, ok := lease.snapshot.replicatedTableResolvePrepFor(request.Points[0].Table)
+	if !ok {
+		return ReplicatedTableBatchReadResult{}, lease.generation,
+			replicatedTableBatchRouteError(lease.snapshot, request, 0)
+	}
+	prep = head
+	headResolved, ok := lease.snapshot.resolveReplicatedTableKeyPrepared(
+		&prep, request.Points[0].Key, firstScalar[:0], firstReplicas[:0],
+		true, ReplicatedRoute{}, false,
+	)
+	if !ok {
+		return ReplicatedTableBatchReadResult{}, lease.generation,
+			replicatedTableBatchRouteError(lease.snapshot, request, 0)
+	}
+	route, routeID = headResolved.Route, headResolved.RouteID
+	routeAuthority = replicatedRouteAuthority(route)
+	// Seed the shard-lookup skip: same prep and shard rebuilds this route.
+	reuseRoute, haveReuse = headResolved.Route, true
+	points[0] = ReplicatedBatchPointRead{
+		Relation: headResolved.Profile.Relation, Key: request.Points[0].Key,
+	}
+	if pressurePoints != nil {
+		pressurePoints[0] = headResolved.Point
+	}
+	for index := 1; index < len(request.Points); index++ {
 		table := request.Points[index].Table
-		if !havePrep || !bytes.Equal(prep.table, table) {
+		if !bytes.Equal(prep.table, table) {
 			fresh, ok := lease.snapshot.replicatedTableResolvePrepFor(table)
 			if !ok {
 				return ReplicatedTableBatchReadResult{}, lease.generation,
 					replicatedTableBatchRouteError(lease.snapshot, request, index)
 			}
-			prep, havePrep, haveReuse = fresh, true, false
+			prep, haveReuse = fresh, false
 		}
-		// Only the leading point pays for the SHA256 route digest (it binds
-		// the result position). Later points resolve without it and gate on a
-		// direct authority comparison, which rejects exactly the same route
-		// mismatches without re-hashing identical authority bytes per point.
-		wantRouteID := index == 0
 		var reuse ReplicatedRoute
 		if haveReuse {
 			reuse = reuseRoute
 		}
 		resolved, ok := lease.snapshot.resolveReplicatedTableKeyPrepared(
-			&prep, request.Points[index].Key, scalarScratch, replicaScratch,
-			wantRouteID, reuse, haveReuse,
+			&prep, request.Points[index].Key, routeScalar[:0], routeReplicas[:0],
+			false, reuse, haveReuse,
 		)
 		if !ok {
 			return ReplicatedTableBatchReadResult{}, lease.generation,
 				replicatedTableBatchRouteError(lease.snapshot, request, index)
 		}
-		if index == 0 {
-			route, routeID = resolved.Route, resolved.RouteID
-			routeAuthority = replicatedRouteAuthority(route)
-		} else if replicatedRouteAuthority(resolved.Route) != routeAuthority {
+		if replicatedRouteAuthority(resolved.Route) != routeAuthority {
 			return ReplicatedTableBatchReadResult{}, lease.generation, ErrReplicatedTableRoute
 		}
 		// Cache the accepted route for the next point's shard lookup skip.
-		// Replicas is nilled: it may alias recycled scratch, and reuse only
-		// ever reads value fields (shard, generations, authority).
+		// Only value fields are ever read back (shard, generations,
+		// authority); the backing never reaches the RPC.
 		reuseRoute, haveReuse = resolved.Route, true
-		reuseRoute.Replicas = nil
 		points[index] = ReplicatedBatchPointRead{
 			Relation: resolved.Profile.Relation, Key: request.Points[index].Key,
 		}
