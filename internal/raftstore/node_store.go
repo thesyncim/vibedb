@@ -115,6 +115,9 @@ const (
 )
 
 type NodeStore struct {
+	coordinateMu                              sync.RWMutex
+	coordinates                               map[uint64]nodeLogCoordinates
+	coordinateFailure                         atomic.Pointer[nodeCoordinateFailure]
 	mu                                        sync.Mutex
 	catalogMu                                 sync.Mutex
 	maintenance                               sync.WaitGroup
@@ -726,7 +729,7 @@ func (s *NodeStore) publishGroupCheckpointSequenced(group uint64, snapshot *pb.S
 		return ErrClosed
 	}
 	if err := s.proveNamespace(); err != nil {
-		s.poisoned = err
+		s.poisonLocked(err)
 		return errors.Join(ErrPersistenceUnknown, err)
 	}
 	descriptor, registered := s.descriptorForLogKey(group)
@@ -788,7 +791,7 @@ func (s *NodeStore) publishGroupCheckpointSequenced(group uint64, snapshot *pb.S
 	}
 	if err != nil {
 		if fatal := s.engine.FatalError(); fatal != nil {
-			s.poisoned = fatal
+			s.poisonLocked(fatal)
 			return errors.Join(ErrPersistenceUnknown, err, fatal)
 		}
 		if errors.Is(err, seglog.ErrBackpressure) {
@@ -797,9 +800,10 @@ func (s *NodeStore) publishGroupCheckpointSequenced(group uint64, snapshot *pb.S
 		return errors.Join(ErrInvalid, err)
 	}
 	if err = s.proveNamespace(); err != nil {
-		s.poisoned = err
+		s.poisonLocked(err)
 		return errors.Join(ErrPersistenceUnknown, err)
 	}
+	s.publishCoordinatesLocked(group)
 	s.cacheValid = false
 	return nil
 }
@@ -1142,7 +1146,7 @@ func (s *NodeStore) persistWave(ready []NodeReady, sequenced bool) error {
 		return errors.Join(ErrPersistenceUnknown, s.poisoned)
 	}
 	if err := s.proveNamespace(); err != nil {
-		s.poisoned = err
+		s.poisonLocked(err)
 		return err
 	}
 	if len(ready) == 0 || len(ready) > MaxPersistGroupBatches {
@@ -1253,7 +1257,7 @@ func (s *NodeStore) persistWave(ready []NodeReady, sequenced bool) error {
 	}
 	if persistErr != nil {
 		if fatal := s.engine.FatalError(); fatal != nil {
-			s.poisoned = fatal
+			s.poisonLocked(fatal)
 			return errors.Join(ErrPersistenceUnknown, persistErr, fatal)
 		}
 		if errors.Is(persistErr, seglog.ErrBackpressure) {
@@ -1262,8 +1266,11 @@ func (s *NodeStore) persistWave(ready []NodeReady, sequenced bool) error {
 		return errors.Join(ErrInvalid, persistErr)
 	}
 	if err := s.proveNamespace(); err != nil {
-		s.poisoned = err
+		s.poisonLocked(err)
 		return errors.Join(ErrPersistenceUnknown, err)
+	}
+	for _, item := range ready {
+		s.publishCoordinatesLocked(item.GroupID)
 	}
 	s.cacheValid = false
 	return nil
@@ -1421,7 +1428,7 @@ func (s *NodeStore) persistIncarnationsLocked(requests []GroupIncarnation) error
 		return ErrInvalid
 	}
 	if err := s.proveNamespace(); err != nil {
-		s.poisoned = err
+		s.poisonLocked(err)
 		return err
 	}
 	mapped := 0
@@ -1454,13 +1461,13 @@ func (s *NodeStore) persistIncarnationsLocked(requests []GroupIncarnation) error
 	copy(id[:], digest[:16])
 	if err := s.engine.PersistWave(seglog.Wave{ID: id, Batches: s.waveBatches[:mapped]}); err != nil {
 		if fatal := s.engine.FatalError(); fatal != nil {
-			s.poisoned = fatal
+			s.poisonLocked(fatal)
 			return errors.Join(ErrPersistenceUnknown, err, fatal)
 		}
 		return errors.Join(ErrInvalid, err)
 	}
 	if err := s.proveNamespace(); err != nil {
-		s.poisoned = err
+		s.poisonLocked(err)
 		return errors.Join(ErrPersistenceUnknown, err)
 	}
 	return nil
@@ -1622,13 +1629,13 @@ func (s *NodeStore) registerGroupLocked(descriptor GroupDescriptor, snapshot *pb
 	}
 	if err = s.engine.PersistWave(seglog.Wave{ID: waveID, Batches: s.waveBatches[:2], Blob: s.cipherArena}); err != nil {
 		if fatal := s.engine.FatalError(); fatal != nil {
-			s.poisoned = fatal
+			s.poisonLocked(fatal)
 			return GroupIncarnation{}, errors.Join(ErrPersistenceUnknown, err, fatal)
 		}
 		return GroupIncarnation{}, err
 	}
 	if err = s.proveNamespace(); err != nil {
-		s.poisoned = err
+		s.poisonLocked(err)
 		return GroupIncarnation{}, errors.Join(ErrPersistenceUnknown, err)
 	}
 	s.descriptors = append(s.descriptors, descriptor)
@@ -1636,6 +1643,8 @@ func (s *NodeStore) registerGroupLocked(descriptor GroupDescriptor, snapshot *pb
 	copy(s.descriptorOrder[position+1:], s.descriptorOrder[position:len(s.descriptorOrder)-1])
 	s.descriptorOrder[position] = uint32(len(s.descriptors) - 1)
 	s.nextLogKey++
+	s.publishCoordinatesLocked(nodeDescriptorGroup)
+	s.publishCoordinatesLocked(descriptor.LogKey)
 	return GroupIncarnation{GroupID: descriptor.LogKey, Incarnation: 1}, nil
 }
 
@@ -1870,16 +1879,8 @@ func (v *GroupView) Term(index uint64) (uint64, error) {
 	return term, nil
 }
 func (v *GroupView) FirstIndex() (uint64, error) {
-	v.store.mu.Lock()
-	defer v.store.mu.Unlock()
-	if err := v.store.usable(); err != nil {
-		return 0, err
-	}
-	state, ok := v.store.engine.Metadata(v.group)
-	if !ok {
-		return 0, raft.ErrUnavailable
-	}
-	return state.FirstIndex, nil
+	cut, err := v.logCoordinates()
+	return cut.first, err
 }
 
 // ReadEntryInto authenticates and decrypts exactly the containing group batch.
@@ -1927,32 +1928,15 @@ func (v *GroupView) ReadEntryInto(index uint64, ciphertext, plaintext []byte) (B
 	return BorrowedEntry{Index: loc.Index, Term: loc.Term, Type: loc.Type, Data: plain[loc.DataOffset : loc.DataOffset+loc.DataBytes]}, nil
 }
 func (v *GroupView) LastIndex() (uint64, error) {
-	v.store.mu.Lock()
-	defer v.store.mu.Unlock()
-	if err := v.store.usable(); err != nil {
-		return 0, err
-	}
-	state, ok := v.store.engine.Metadata(v.group)
-	if !ok {
-		return 0, raft.ErrUnavailable
-	}
-	return state.LastIndex, nil
+	cut, err := v.logCoordinates()
+	return cut.last, err
 }
 
-// LogBounds returns the same Raft-visible coordinates as LastIndex and
-// InitialState under one lock. It neither opens the checkpoint object nor
-// constructs protobuf state, so repeated control probes allocate nothing.
+// LogBounds returns one published durable coordinate cut without waiting for
+// unrelated group writes or constructing protobuf checkpoint state.
 func (v *GroupView) LogBounds() (last, commit uint64, err error) {
-	v.store.mu.Lock()
-	defer v.store.mu.Unlock()
-	if err := v.store.usable(); err != nil {
-		return 0, 0, err
-	}
-	state, ok := v.store.engine.Metadata(v.group)
-	if !ok {
-		return 0, 0, raft.ErrUnavailable
-	}
-	return state.LastIndex, state.Hard.Commit, nil
+	cut, err := v.logCoordinates()
+	return cut.last, cut.commit, err
 }
 
 func (v *GroupView) InitialState() (*pb.HardState, *pb.ConfState, error) {

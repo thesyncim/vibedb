@@ -344,7 +344,7 @@ func (s *NodeStore) publishDescriptorCatalogReferenceLocked(candidate descriptor
 		return ErrInvalid
 	}
 	if err := s.proveNamespace(); err != nil {
-		s.poisoned = err
+		s.poisonLocked(err)
 		return err
 	}
 	metadata, ok := s.engine.Metadata(nodeDescriptorGroup)
@@ -363,16 +363,17 @@ func (s *NodeStore) publishDescriptorCatalogReferenceLocked(candidate descriptor
 	copy(waveID[:], digest[:16])
 	if err := s.engine.PersistWave(seglog.Wave{ID: waveID, Batches: s.waveBatches[:1]}); err != nil {
 		if fatal := s.engine.FatalError(); fatal != nil {
-			s.poisoned = fatal
+			s.poisonLocked(fatal)
 			return errors.Join(ErrPersistenceUnknown, err, fatal)
 		}
 		return err
 	}
 	s.cacheValid = false
 	if err := s.proveNamespace(); err != nil {
-		s.poisoned = err
+		s.poisonLocked(err)
 		return errors.Join(ErrPersistenceUnknown, err)
 	}
+	s.publishCoordinatesLocked(nodeDescriptorGroup)
 	return nil
 }
 

@@ -869,6 +869,19 @@ func (e *Engine) FatalError() error {
 	return e.log.usable()
 }
 
+// PublishedFailure is a concurrent, read-only failure fence for serving copies
+// of durable metadata. A nil value grants no access to mutable engine state;
+// callers still own their lifecycle and coordinate publication protocol.
+func (e *Engine) PublishedFailure() error {
+	if e == nil || e.log == nil {
+		return os.ErrClosed
+	}
+	if failure := e.log.publishedFailure.Load(); failure != nil {
+		return failure.err
+	}
+	return nil
+}
+
 // SetDataSyncForTesting installs a deterministic durability fault seam.
 func (e *Engine) SetDataSyncForTesting(sync func(*os.File) error) { e.syncData = sync }
 

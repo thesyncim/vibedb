@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 )
 
 type RotationPhase uint8
@@ -21,21 +22,24 @@ const (
 
 // Log owns one directory. Append writes only the active segment; Sync is the
 // publication boundary that makes its current offset recoverable.
+type publishedLogFailure struct{ err error }
+
 type Log struct {
-	dir           string
-	active        *os.File
-	activeOffset  uint64
-	activeHash    hash.Hash
-	digestScratch [32]byte
-	state         metadataState
-	metadata      *metadataStore
-	reserveFiles  [2]*os.File
-	records       uint64
-	events        []segmentEvent
-	eventSpare    []segmentEvent
-	poisoned      error
-	publishHook   func(metadataState) error
-	authKey       [32]byte
+	publishedFailure atomic.Pointer[publishedLogFailure]
+	dir              string
+	active           *os.File
+	activeOffset     uint64
+	activeHash       hash.Hash
+	digestScratch    [32]byte
+	state            metadataState
+	metadata         *metadataStore
+	reserveFiles     [2]*os.File
+	records          uint64
+	events           []segmentEvent
+	eventSpare       []segmentEvent
+	poisoned         error
+	publishHook      func(metadataState) error
+	authKey          [32]byte
 }
 
 func segmentPath(dir string, id fileID) string { return filepath.Join(dir, segmentFileName(id)) }
@@ -119,6 +123,7 @@ func (l *Log) poison(err error) error {
 	}
 	if l.poisoned == nil {
 		l.poisoned = errors.Join(ErrPoisoned, err)
+		l.publishedFailure.Store(&publishedLogFailure{err: l.poisoned})
 	}
 	return l.poisoned
 }
