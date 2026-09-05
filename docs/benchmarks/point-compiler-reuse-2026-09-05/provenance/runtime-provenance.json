@@ -1,0 +1,120 @@
+{
+  "schema": "vibedb.point-read-runtime-provenance/1",
+  "status": "complete",
+  "working_directory": "/private/tmp/vibedb-point-before-3a7d3b15",
+  "working_directory_requirement": "Run project-env from a Git checkout in the same project Git common directory; the recorded checkout is the exact baseline worktree.",
+  "project_env": "/Users/thesyncim/.codex/bin/project-env",
+  "host_environment": {
+    "CODEX_AGENT_ID": "luna-point-validation",
+    "CODEX_PROJECT_CACHE_ROOT": "/var/folders/x3/kqy4mlzx43n21g8wpjj2hp580000gn/C/codex-projects"
+  },
+  "container": {
+    "image": "golang:1.27-bookworm@sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b",
+    "platform": "linux/arm64",
+    "network": "none",
+    "pull": "never",
+    "output_mount": {
+      "source": "/private/tmp/vibedb-point-validation-371de0af-build",
+      "target": "/out",
+      "mode": "ro"
+    },
+    "module_cache_mount": {
+      "source": "/Users/thesyncim/go/pkg/mod",
+      "target": "/go/pkg/mod",
+      "mode": "ro"
+    },
+    "go_cache_mount": {
+      "source": "/private/var/folders/x3/kqy4mlzx43n21g8wpjj2hp580000gn/C/codex-projects/95786445379e5235/go-build",
+      "target": "/go/cache",
+      "mode": "rw"
+    },
+    "runtime_tmp_mount": {
+      "volume": "vibedb-point-validation-luna-371de0af",
+      "target": "/testtmp",
+      "mode": "rw"
+    },
+    "environment": {
+      "TMPDIR": "/testtmp",
+      "GOTMPDIR": "omitted"
+    },
+    "binary_build_environment": {
+      "GOEXPERIMENT": "simd",
+      "GOOS": "linux",
+      "GOARCH": "arm64",
+      "CGO_ENABLED": "0"
+    }
+  },
+  "benchmark_invocation": {
+    "run": "^$",
+    "bench": "^BenchmarkReplicatedPointReadCPU/(point_hit|point_miss)$",
+    "benchtime": "5000x",
+    "count": 3,
+    "cpu": 1,
+    "timer_scope": "Acquire, QueryCandidateKeysInto, complete cursor validation, cursor Close, and Finish; setup and probes are outside the timer",
+    "command_file": "../timing-commands.txt"
+  },
+  "binary_source": {
+    "directory": "/private/tmp/vibedb-point-validation-371de0af-build/bin",
+    "included_in_pack": false,
+    "reason": "The evidence pack retains binary hashes and metadata but omits the large binaries."
+  },
+  "quiet_window_utc": {
+    "granted_start": "2026-09-05T21:26:00Z",
+    "hard_end": "2026-09-05T21:31:00Z",
+    "reported_completion": "2026-09-05T21:30:29Z",
+    "reported_completion_precision": "approximate"
+  },
+  "order": [
+    {
+      "sequence": 1,
+      "arm": "before",
+      "binary": "/private/tmp/vibedb-point-validation-371de0af-build/bin/before-driver.test",
+      "log": "../valid/abba-06-before.log",
+      "log_sha256": "e60107912aac54a092f7943b6099110f3c179d6938400fd2bcbc63a7ad1abd3e",
+      "result": "PASS"
+    },
+    {
+      "sequence": 2,
+      "arm": "after",
+      "binary": "/private/tmp/vibedb-point-validation-371de0af-build/bin/after-driver.test",
+      "log": "../valid/abba-07-after.log",
+      "log_sha256": "fe45194297767459dcc6d85d1b0a3dc6d037023efc140f144763e3b1bd0330ee",
+      "result": "PASS"
+    },
+    {
+      "sequence": 3,
+      "arm": "after",
+      "binary": "/private/tmp/vibedb-point-validation-371de0af-build/bin/after-driver.test",
+      "log": "../valid/abba-08-after.log",
+      "log_sha256": "3d43c6d82d2eaa8ec1a9a832a2f048b291dd9562d6e857c3f97df7203a5f2506",
+      "result": "PASS"
+    },
+    {
+      "sequence": 4,
+      "arm": "before",
+      "binary": "/private/tmp/vibedb-point-validation-371de0af-build/bin/before-driver.test",
+      "log": "../valid/abba-09-before.log",
+      "log_sha256": "9c0e9b2b63d0191827af875c499bcc1f2c1a244450b23e297788bef135abd727",
+      "result": "PASS"
+    }
+  ],
+  "measurements": {
+    "valid_logs": 4,
+    "rows": 24,
+    "iterations_per_row": 5000,
+    "timed_verified_operations": 120000,
+    "skipped_rows": 0,
+    "failed_rows": 0,
+    "summary_file": "timing-summary.json",
+    "summary_sha256": "6278ba1222019f283727594ac011897dff576516d7461de0f1b9ec27ea1b236a"
+  },
+  "excluded_attempts": {
+    "read_only_tmp": [
+      "../excluded/abba-01-before.log",
+      "../excluded/abba-02-after.log",
+      "../excluded/abba-03-after.log",
+      "../excluded/abba-04-before.log"
+    ],
+    "host_bind_runtime_tmp": "../excluded/abba-05-before.log"
+  }
+}
