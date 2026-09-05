@@ -35,6 +35,11 @@ existing durable acknowledgement boundary. No novelty claim is established.
   signals invalidate the serving path. Checkpoints and suffix replacements update
   the coordinates; restart reconstructs them from recovered metadata.
 
+- `b5c3dcaa`: publish a fixed 64-entry recent-term ring with the durable
+  coordinates. Exact index tags prevent ring collisions. Replacement invalidates
+  the old suffix, checkpoint boundaries retain their exact term, and older terms
+  use the original storage lookup. Warm reads and persistence remain allocation-free.
+
 ## Matched complete SQL campaigns
 
 Each cell uses 16 independent table groups, three physical node processes, RF3,
@@ -68,7 +73,18 @@ before-first order, and 2,229.5 → 2,108.7 in reverse. CRDB reached 9,954.3 and
 9,780.9 respectively. All 144,000 measured operations verified. p95 medians were
 11.411 → 11.712 ms and 9.910 → 11.699 ms. This establishes no repeatable
 competitive gain from coordinates alone. Raft's adjacent `Term` call still takes
-the device mutex; a bounded recent-term publication follow-up is under test.
+the device mutex, motivating the recent-term follow-up.
+
+The recent-term campaign (`9e0bfee6` → `b5c3dcaa`) also does not establish a
+competitive breakthrough. Before-first throughput was 2,109.3 → 2,170.7 ops/s,
+with CRDB at 4,522.9. Reverse throughput was 562.2 → 592.7, with CRDB at 5,617.5.
+p95 medians were 10.557 → 11.976 ms and 46.437 → 48.077 ms. All 144,000 measured
+operations verified. The reverse candidate's three trials reached 478.0, 592.7,
+and 2,258.2 ops/s; average node persistence service dropped from 2.6–3.4 ms in the
+first two trials to 0.71–0.74 ms in the third. Those slow trials remain included.
+The paired arms improved only 3–5%, with worse p95 medians, amid substantial
+storage-service variation. A separate profile is being used to choose the next
+change; these data must not be represented as a 2× CRDB result.
 
 ## Mechanism evidence
 
@@ -124,5 +140,6 @@ inventories, logs, and immutable source hashes):
 - `/private/tmp/vibedb-horizontal-health-evidence` — health transport reuse.
 - `/private/tmp/vibedb-horizontal-yield-evidence` — bounded scheduler yield.
 - `/private/tmp/vibedb-horizontal-coordinate-evidence` — coordinate publication.
+- `/private/tmp/vibedb-horizontal-terms-evidence` — bounded recent terms.
 - `/private/tmp/vibedb-horizontal-profile-targeted` — pre-health diagnostic profile.
 - `/private/tmp/vibedb-horizontal-profile-health` — post-health diagnostic profile.
