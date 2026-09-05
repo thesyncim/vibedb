@@ -320,8 +320,8 @@ func TestPreparedPlanJoinColocationProof(t *testing.T) {
 	if _, err := nonaffine.Prepare(t.Context(), `
 		SELECT messages.n
 		FROM messages JOIN users ON messages.tenant_id = users.tenant_id
-		WHERE messages.tenant_id = 'acme'`); !errors.Is(err, ErrDistributedPlanUnsupported) {
-		t.Fatalf("nonaffine join prepare = %v, want unsupported", err)
+		WHERE messages.tenant_id = 'acme'`); err != nil {
+		t.Fatalf("nonaffine coordinator join prepare = %v", err)
 	}
 }
 

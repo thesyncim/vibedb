@@ -211,6 +211,9 @@ func checkAnyStatement(t *testing.T, s *Statement) {
 
 func checkInsert(t *testing.T, s *InsertStmt) {
 	t.Helper()
+	if s.ConflictTarget != nil && (!s.HasConflictAction() || len(s.ConflictTarget.Segments) != 1 || s.ConflictTarget.Segments[0].IsIndex) {
+		t.Fatal("invalid explicit primary conflict target")
+	}
 	checkMutationAliasState(t, s.Table, s.Alias, s.AliasPos, s.Pos)
 	if (s.Source == nil) == (len(s.Rows) == 0) {
 		t.Fatal("an accepted INSERT must own exactly one of VALUES rows and a query source")
@@ -236,7 +239,7 @@ func checkInsert(t *testing.T, s *InsertStmt) {
 		}
 		for _, value := range row.Values {
 			switch value.Kind {
-			case OperandString, OperandNumber, OperandBool, OperandJSON:
+			case OperandString, OperandNumber, OperandBool, OperandJSON, OperandNull:
 			case OperandParam:
 				seen++
 			default:

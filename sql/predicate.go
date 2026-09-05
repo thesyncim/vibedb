@@ -155,6 +155,22 @@ func (p *Parser) parseNot(ctx exprContext) (*Expr, error) {
 
 // parsePrimary parses a parenthesized predicate or a path-led leaf.
 func (p *Parser) parsePrimary(ctx exprContext) (*Expr, error) {
+	if op, ok := conditionalScalarOp(p.tok); ok {
+		pos := p.tok.pos
+		left, err := p.parseConditionalScalar(op, scalarContextForPredicate(ctx))
+		if err != nil {
+			return nil, err
+		}
+		if left.Kind == ScalarPath && !scalarContinues(p.tok) {
+			if p.inCaseTruth() && caseTruthTerminator(p.tok) {
+				node := p.exprs.one()
+				*node = Expr{Kind: ExprScalarTruth, Column: -1, ScalarLeft: left, Pos: pos}
+				return node, nil
+			}
+			return p.parseLeafTail(ctx, AggNone, left.Path, pos)
+		}
+		return p.parseScalarCondition(ctx, left, pos)
+	}
 	if _, _, known := scalarTypedStringHead(p.tok); known {
 		return p.parseTypedHeadPrimary(ctx)
 	}
@@ -338,7 +354,7 @@ func (p *Parser) parseScalarCondition(
 	if err != nil {
 		return nil, err
 	}
-	if p.inCaseTruth() && caseTruthTerminator(p.tok) {
+	if p.inCaseTruth() && caseTruthTerminator(p.tok) || predicateTruthTerminator(p.tok) {
 		if value, typed := directTypedConstantOperand(left); typed && value.Kind == OperandBool {
 			node := p.exprs.one()
 			*node = Expr{
@@ -355,6 +371,11 @@ func (p *Parser) parseScalarCondition(
 	}
 	if p.acceptKeyword(kwIs) {
 		negated := p.acceptKeyword(kwNot)
+		if p.atKeyword(kwTrue) || p.atKeyword(kwFalse) {
+			truth := p.atKeyword(kwTrue)
+			p.advance()
+			return p.scalarBooleanTest(left, truth, negated, pos)
+		}
 		if !p.acceptKeyword(kwNull) {
 			return nil, p.errHere("a computed scalar supports IS [NOT] NULL; IS MISSING applies only to a stored path")
 		}
@@ -507,6 +528,11 @@ func (p *Parser) parseLeafTail(
 	path *PathExpr,
 	pos int,
 ) (*Expr, error) {
+	if predicateTruthTerminator(p.tok) {
+		node := p.exprs.one()
+		*node = Expr{Kind: ExprScalarTruth, Column: -1, Pos: pos, ScalarLeft: p.scalarFromColumn(ResultColumn{Agg: agg, Path: path, Pos: pos})}
+		return node, nil
+	}
 	if p.acceptKeyword(kwIs) {
 		return p.parseIsTail(agg, path, pos)
 	}
@@ -539,6 +565,35 @@ func (p *Parser) parseLeafTail(
 	p.advance()
 	pathComparison := ctx == ctxWhere || ctx == ctxJoin || p.inCaseTruth() ||
 		p.correlation != nil && p.correlation.capture != nil
+	if function, ok := conditionalScalarOp(p.tok); ok {
+		scalarCtx := scalarContextForPredicate(ctx)
+		right, err := p.parseConditionalScalar(function, scalarCtx)
+		if err != nil {
+			return nil, err
+		}
+		if right.Kind == ScalarPath && !scalarContinues(p.tok) {
+			if !pathComparison {
+				return nil, p.errHere("expected a literal or '?' on the right side of the comparison")
+			}
+			e := p.exprs.one()
+			*e = Expr{
+				Kind: ExprCompare, Op: op, Agg: agg, Column: -1,
+				Path: path, RightPath: right.Path, Value: Operand{Pos: operatorPos}, Pos: pos,
+			}
+			return e, nil
+		}
+		right, err = p.continueScalarExpression(right, scalarCtx)
+		if err != nil {
+			return nil, err
+		}
+		e := p.exprs.one()
+		*e = Expr{
+			Kind: ExprScalarCompare, Op: op, Column: -1,
+			ScalarLeft:  p.scalarFromColumn(ResultColumn{Agg: agg, Path: path, Pos: pos}),
+			ScalarRight: right, Pos: pos,
+		}
+		return e, nil
+	}
 	if target, supported, known := scalarTypedStringHead(p.tok); known {
 		head := p.tok
 		p.advance()
@@ -672,7 +727,7 @@ func (p *Parser) parseLikeTail(
 	return e, nil
 }
 
-// parseIsTail parses IS [NOT] NULL and IS [NOT] MISSING.
+// parseIsTail parses IS [NOT] NULL/MISSING/TRUE/FALSE.
 func (p *Parser) parseIsTail(agg AggKind, path *PathExpr, pos int) (*Expr, error) {
 	negated := p.acceptKeyword(kwNot)
 	kind := ExprIsNull
@@ -681,13 +736,45 @@ func (p *Parser) parseIsTail(agg AggKind, path *PathExpr, pos int) (*Expr, error
 	case p.acceptKeyword(kwMissing):
 		kind = ExprIsMissing
 	case p.atKeyword(kwTrue), p.atKeyword(kwFalse):
-		return nil, p.errHere("IS TRUE / IS FALSE is not supported; write `flag = TRUE`")
+		truth := p.atKeyword(kwTrue)
+		p.advance()
+		return p.scalarBooleanTest(p.scalarFromColumn(ResultColumn{Agg: agg, Path: path, Pos: pos}), truth, negated, pos)
 	default:
-		return nil, p.errHere("expected NULL or MISSING after IS")
+		return nil, p.errHere("expected NULL, MISSING, TRUE, or FALSE after IS")
 	}
 	e := p.exprs.one()
 	*e = Expr{Kind: kind, Negated: negated, Agg: agg, Column: -1, Path: path, Pos: pos}
 	return e, nil
+}
+
+// scalarBooleanTest lowers the total Boolean tests to existing lazy CASE
+// control flow. A NULL WHEN is not selected, and CASE's Boolean input check
+// rejects non-Boolean values rather than interpreting them as false.
+func (p *Parser) scalarBooleanTest(left *ScalarExpr, truth, negated bool, pos int) (*Expr, error) {
+	state := p.scalarState()
+	state.caseItems++
+	if state.caseItems > maxClauseItems {
+		return nil, p.errfAt(pos, "a statement may hold at most %d CASE and Boolean test arms", maxClauseItems)
+	}
+	condition := p.exprs.one()
+	*condition = Expr{Kind: ExprScalarTruth, Column: -1, ScalarLeft: left, Pos: pos}
+	if !truth {
+		child := condition
+		condition = p.exprs.one()
+		kids := p.kids.allocDirty(1)
+		kids[0] = child
+		*condition = Expr{Kind: ExprNot, Column: -1, Kids: kids, Pos: pos}
+	}
+	yes, no := p.newScalar(ScalarLiteral, pos), p.newScalar(ScalarLiteral, pos)
+	yes.Value = Operand{Kind: OperandBool, Bool: true, Pos: pos}
+	no.Value = Operand{Kind: OperandBool, Bool: false, Pos: pos}
+	arms := state.whenRuns.allocDirty(1)
+	arms[0] = ScalarWhen{Predicate: condition, Result: yes, Pos: pos}
+	value := p.newScalar(ScalarCase, pos)
+	value.Whens, value.Else = arms, no
+	result := p.exprs.one()
+	*result = Expr{Kind: ExprScalarTruth, Column: -1, ScalarLeft: value, Negated: negated, Pos: pos}
+	return result, nil
 }
 
 // parseInTail parses the alternatives of IN, which the engine answers with a
@@ -1252,4 +1339,18 @@ func (p *Parser) parseTypedOperandAfterHead(
 		p.lx.src, castPos,
 		"this typed-constant cast chain needs scalar evaluation in an operand-only clause; use it in a SELECT expression or direct comparison",
 	)
+}
+
+func predicateTruthTerminator(tok token) bool {
+	if tok.kind == tokEOF || tok.kind == tokSemicolon || tok.kind == tokRParen {
+		return true
+	}
+	if tok.kind != tokIdent {
+		return false
+	}
+	switch tok.kw {
+	case kwAnd, kwOr, kwGroup, kwHaving, kwOrder, kwLimit, kwOffset, kwReturning, kwWindow, kwUnion, kwIntersect, kwExcept:
+		return true
+	}
+	return false
 }

@@ -10,6 +10,7 @@ import (
 
 func (c *conn) validateSurfaceContext(
 	ctx context.Context,
+	source string,
 	statement *sqlast.Statement,
 ) error {
 	switch statement.Kind {
@@ -31,6 +32,21 @@ func (c *conn) validateSurfaceContext(
 		}
 		return nil
 	case sqlast.KindInsert:
+		if statement.Insert.ConflictTarget != nil {
+			if err := rlockContext(ctx, &c.db.mu); err != nil {
+				return err
+			}
+			t, exists := c.mutationValidationTableLocked(statement.Insert.Table)
+			if !exists {
+				c.db.mu.RUnlock()
+				return fmt.Errorf("%w: %q", ErrTableNotFound, statement.Insert.Table)
+			}
+			err := validateInsertConflictTarget(source, statement.Insert, t.meta)
+			c.db.mu.RUnlock()
+			if err != nil {
+				return err
+			}
+		}
 		for i := range statement.Insert.Columns {
 			if pseudoDocumentPath(statement.Insert.Columns[i]) {
 				return reservedDocumentPathError(statement.Insert.Columns[i])
@@ -121,6 +137,17 @@ func (c *conn) validateSurfaceContext(
 	}
 	if _, exists := c.db.tables[statement.Table()]; !exists {
 		return fmt.Errorf("%w: %q", ErrTableNotFound, statement.Table())
+	}
+	return nil
+}
+
+func validateInsertConflictTarget(source string, insert *sqlast.InsertStmt, meta *tableMeta) error {
+	if insert.ConflictTarget == nil {
+		return nil
+	}
+	if meta == nil || string(insert.ConflictTarget.AppendPointer(nil)) != meta.PrimaryKey {
+		return sqlast.NewFeatureNotSupportedError(source, insert.ConflictTarget.Pos,
+			"ON CONFLICT target must match the table's declared primary key; secondary unique-index conflict arbitration is not supported")
 	}
 	return nil
 }

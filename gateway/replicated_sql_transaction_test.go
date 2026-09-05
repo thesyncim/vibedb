@@ -258,18 +258,6 @@ func TestReplicatedSQLTransactionRejectsDuplicateAndResidualBeforeExecution(t *t
 			want: ErrWriteShardKeyMove,
 		},
 		{
-			name: "flat insert on conflict",
-			queries: []Query{
-				{SQL: `INSERT INTO messages (id) VALUES (?) ON CONFLICT DO NOTHING`, Params: []shardservice.Param{
-					shardservice.StringParam("message-1"),
-				}},
-				{SQL: `DELETE FROM logs WHERE id = ?`, Params: []shardservice.Param{
-					shardservice.StringParam("log-1"),
-				}},
-			},
-			want: ErrReplicatedSQLTransactionUnsupported,
-		},
-		{
 			name: "duplicate rows within multi row insert",
 			queries: []Query{
 				{SQL: `INSERT INTO messages VALUES (?),(?)`, Params: []shardservice.Param{
@@ -925,12 +913,6 @@ func TestReplicatedSQLConflictActionsRejectBeforeBindOrCurrentRowRead(t *testing
 			source:     `INSERT INTO messages (id, value) VALUES (?, ?) ON CONFLICT DO UPDATE SET value = value || EXCLUDED.value`,
 			insert:     &sqlast.InsertStmt{Table: "messages", OnConflictUpdate: &sqlast.InsertConflictUpdate{}},
 			wantMarker: "UPDATE",
-		},
-		{
-			name:       "do nothing",
-			source:     "INSERT INTO messages (id) VALUES (?) ON /* authored */\nCONFLICT DO NOTHING",
-			insert:     &sqlast.InsertStmt{Table: "messages", OnConflictDoNothing: true},
-			wantMarker: "ON CONFLICT",
 		},
 	}
 	for _, test := range tests {

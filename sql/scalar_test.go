@@ -98,15 +98,14 @@ func TestScalarMinusWildcardExponentAndUnaryGrammar(t *testing.T) {
 	}
 }
 
-func TestScalarOrderByIsPreciselyRefused(t *testing.T) {
+func TestScalarOrderByRetainsExpression(t *testing.T) {
 	for _, source := range []string{
 		`SELECT a FROM docs ORDER BY a + 1`,
 		`SELECT a FROM docs ORDER BY -a`,
 	} {
-		_, err := Parse(source)
-		var unsupported *FeatureNotSupportedError
-		if !errors.As(err, &unsupported) || unsupported.Pos < strings.Index(source, "ORDER BY") {
-			t.Fatalf("%q error = %T %v", source, err, err)
+		statement, err := Parse(source)
+		if err != nil || statement.OrderBy[0].Scalar == nil || statement.OrderBy[0].Path != nil || statement.OrderBy[0].Output != 0 {
+			t.Fatalf("%q statement=%+v err=%v", source, statement, err)
 		}
 	}
 }

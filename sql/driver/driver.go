@@ -615,7 +615,7 @@ func (c *conn) prepareContextMode(
 			s.views = &preparedViewState{dependencies: dependencies}
 		}
 	}
-	if err := c.validateSurfaceContext(ctx, tree); err != nil {
+	if err := c.validateSurfaceContext(ctx, src, tree); err != nil {
 		return nil, err
 	}
 	if tree.Kind.IsQuery() {

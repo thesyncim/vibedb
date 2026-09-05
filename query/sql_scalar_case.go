@@ -460,6 +460,10 @@ func scalarASTCaseDomain(s *Statement, expr *sqlast.ScalarExpr) scalarCaseDomain
 	case sqlast.ScalarUnary, sqlast.ScalarAggregate:
 		return caseDomainNumeric
 	case sqlast.ScalarBinary:
+		if expr.Op.Conditional() {
+			domain, _ := unifyCaseDomain(scalarASTCaseDomain(s, expr.Left), scalarASTCaseDomain(s, expr.Right))
+			return domain
+		}
 		if expr.Op == sqlast.ScalarConcat {
 			return caseDomainText
 		}
@@ -506,7 +510,7 @@ func typedCaseResultPosition(expr *sqlast.ScalarExpr) int {
 
 type scalarCaseCompileMark struct {
 	nodes, dependencies, predicates int
-	cases, arms                     int
+	cases, arms, conditionals       int
 	hasAggregate                    bool
 }
 
@@ -514,7 +518,7 @@ func (r *statementScalar) caseCompileMark() scalarCaseCompileMark {
 	return scalarCaseCompileMark{
 		nodes: len(r.nodes), dependencies: len(r.deps),
 		predicates: len(r.predicates), cases: len(r.cases),
-		arms: len(r.caseArms), hasAggregate: r.hasAggregate,
+		arms: len(r.caseArms), conditionals: len(r.conditionals), hasAggregate: r.hasAggregate,
 	}
 }
 
@@ -529,6 +533,8 @@ func (r *statementScalar) rewindCaseCompile(mark scalarCaseCompileMark) {
 	r.cases = r.cases[:mark.cases]
 	clear(r.caseArms[mark.arms:])
 	r.caseArms = r.caseArms[:mark.arms]
+	clear(r.conditionals[mark.conditionals:])
+	r.conditionals = r.conditionals[:mark.conditionals]
 	r.hasAggregate = mark.hasAggregate
 }
 
@@ -1154,6 +1160,8 @@ func (r *statementScalar) nodeDomain(root int32) scalarCaseDomain {
 		}
 	case statementScalarCaseNode:
 		return r.cases[node.caseIndex].domain
+	case statementScalarConditionalNode:
+		return r.conditionals[node.conditionalIndex].domain
 	default:
 		return caseDomainDynamic
 	}

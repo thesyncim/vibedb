@@ -262,6 +262,17 @@ func scalarCaseExpressionResolution(
 	case ScalarUnary, ScalarAggregate:
 		return ScalarCastNumeric, true, false
 	case ScalarBinary:
+		if expr.Op.Conditional() {
+			left, lk, lt := scalarCaseExpressionResolution(expr.Left)
+			right, rk, rt := scalarCaseExpressionResolution(expr.Right)
+			if lk && rk && left != right {
+				return 0, false, lt || rt
+			}
+			if lk {
+				return left, true, lt || rt
+			}
+			return right, rk, lt || rt
+		}
 		if expr.Op == ScalarConcat {
 			return ScalarCastText, true, false
 		}

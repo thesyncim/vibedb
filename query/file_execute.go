@@ -2229,10 +2229,7 @@ func mergeAggs(
 
 func (p *plan) compareFileRows(a, b fileRow) int {
 	for i, o := range p.order {
-		c := compareScalar(a.order[i], b.order[i])
-		if o.dir == Desc {
-			c = -c
-		}
+		c := compareOrderedScalar(a.order[i], b.order[i], o.dir)
 		if c != 0 {
 			return c
 		}
@@ -2253,10 +2250,7 @@ func compareFileOrdinal(a, b fileRow) int {
 
 func (p *plan) compareFileGroups(a, b fileGroup) int {
 	for _, o := range p.order {
-		c := compareScalar(a.scalars[o.slot], b.scalars[o.slot])
-		if o.dir == Desc {
-			c = -c
-		}
+		c := compareOrderedScalar(a.scalars[o.slot], b.scalars[o.slot], o.dir)
 		if c != 0 {
 			return c
 		}
