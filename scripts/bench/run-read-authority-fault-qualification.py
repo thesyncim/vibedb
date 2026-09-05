@@ -193,6 +193,16 @@ def per_group_diagnostic_summary(path, expected_groups=7, expected_members=3):
             parse_errors.append(f"line {line_number}: {exc}")
     elapsed = [value.get("elapsed_ns") for value in records
                if isinstance(value.get("elapsed_ns"), int)]
+    status_cuts = sum(
+        1 for value in records for group in value["groups"]
+        for member in group["members"] if isinstance(member.get("status"), dict))
+    metrics_cuts = sum(
+        1 for value in records for group in value["groups"]
+        for member in group["members"] if isinstance(member.get("metrics"), dict))
+    valid_cuts = sum(
+        1 for value in records for group in value["groups"]
+        for member in group["members"]
+        if isinstance(member.get("status"), dict) and isinstance(member.get("metrics"), dict))
     return {
         "records": len(records),
         "first_sequence": records[0].get("sequence") if records else None,
@@ -200,8 +210,18 @@ def per_group_diagnostic_summary(path, expected_groups=7, expected_members=3):
         "max_cycle_elapsed_ns": max(elapsed, default=0),
         "sampling_errors": sum(value.get("sampling_errors", 0) for value in records
                                 if isinstance(value.get("sampling_errors"), int)),
+        "status_cuts": status_cuts,
+        "metrics_cuts": metrics_cuts,
+        "valid_cuts": valid_cuts,
+        "has_valid_cuts": valid_cuts > 0,
+        "preflight_ready_records": sum(
+            1 for value in records if value.get("preflight_ready") is True and
+            value.get("valid_cuts") == expected_groups * expected_members),
         "parse_errors": parse_errors,
-        "complete_shape": bool(records) and not parse_errors,
+        "complete_shape": bool(records) and not parse_errors and any(
+            value.get("preflight_ready") is True and
+            value.get("valid_cuts") == expected_groups * expected_members
+            for value in records),
     }
 
 
@@ -813,6 +833,7 @@ def main(argv=None):
             result.get("status") == "completed" and
             result.get("client_exit_code") == 0 and
             result.get("validation", {}).get("complete") and
+            manifest["per_group_diagnostic"].get("complete_shape") and
             fault_complete
         ) else "incomplete-or-failed"
     except BaseException as exc:

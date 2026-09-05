@@ -38,6 +38,7 @@ const (
 	maxManifestBytes      = 8 << 20
 	maxGroups             = 64
 	maxNodes              = 6
+	preflightCycles       = 3
 )
 
 type manifest struct {
@@ -54,6 +55,16 @@ type manifest struct {
 		IdentityOID string `json:"identity_oid"`
 	} `json:"tls"`
 	Groups []manifestGroup `json:"groups"`
+}
+
+// clusterManifest carries the controller credential that is authorized for
+// shard-control observations. A storage node credential can establish the
+// same mutually authenticated transport, but the RF3 policy deliberately
+// withholds membership capability from storage principals.
+type clusterManifest struct {
+	GatewayCertificate string `json:"gateway_certificate"`
+	GatewayKey         string `json:"gateway_key"`
+	Roots              string `json:"roots"`
 }
 
 type manifestGroup struct {
@@ -141,12 +152,16 @@ func (opener controlOpener) OpenShardControl(
 }
 
 type cycle struct {
-	Schema       string          `json:"schema"`
-	Sequence     uint64          `json:"sequence"`
-	UTC          string          `json:"utc"`
-	ElapsedNS    int64           `json:"elapsed_ns"`
-	Groups       []groupSnapshot `json:"groups"`
-	SamplingErrs uint64          `json:"sampling_errors"`
+	Schema          string          `json:"schema"`
+	Sequence        uint64          `json:"sequence"`
+	UTC             string          `json:"utc"`
+	ElapsedNS       int64           `json:"elapsed_ns"`
+	Groups          []groupSnapshot `json:"groups"`
+	ExpectedCuts    uint64          `json:"expected_cuts"`
+	ValidCuts       uint64          `json:"valid_cuts"`
+	PreflightReady  bool            `json:"preflight_ready"`
+	PreflightReason string          `json:"preflight_reason,omitempty"`
+	SamplingErrs    uint64          `json:"sampling_errors"`
 }
 
 type groupSnapshot struct {
@@ -224,6 +239,7 @@ func run(args []string) error {
 	flags.SetOutput(io.Discard)
 	root := flags.String("root", "/data/vibe", "candidate RF3 durable root")
 	output := flags.String("output", "/evidence/per-group-snapshots.jsonl", "bounded JSONL output")
+	readyFile := flags.String("ready-file", "", "write after every expected status and metrics cut is valid")
 	interval := flags.Duration("interval", defaultInterval, "interval between observation cycles")
 	timeout := flags.Duration("request-timeout", defaultRequestTimeout, "per-member observation timeout")
 	maxBytes := flags.Int64("max-bytes", defaultMaxBytes, "maximum output bytes")
@@ -250,6 +266,15 @@ func run(args []string) error {
 	}
 	defer file.Close()
 	writer := &boundedWriter{writer: file, left: cfg.MaxBytes}
+	expectedCuts := expectedValidCuts(cfg)
+	if expectedCuts == 0 {
+		return errors.New("rf3-diagnostic: no group/member bindings")
+	}
+	if *readyFile != "" {
+		if err = os.Remove(*readyFile); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()
 	var sequence uint64
@@ -258,6 +283,11 @@ func run(args []string) error {
 		started := time.Now()
 		record := capture(ctx, cfg, sequence)
 		record.ElapsedNS = time.Since(started).Nanoseconds()
+		record.ExpectedCuts = expectedCuts
+		record.PreflightReady = record.ValidCuts == expectedCuts
+		if !record.PreflightReady {
+			record.PreflightReason = fmt.Sprintf("valid status and metrics cuts %d/%d", record.ValidCuts, expectedCuts)
+		}
 		line, marshalErr := json.Marshal(record)
 		if marshalErr != nil {
 			return marshalErr
@@ -271,6 +301,14 @@ func run(args []string) error {
 		}
 		if err = file.Sync(); err != nil {
 			return err
+		}
+		if record.PreflightReady && *readyFile != "" {
+			if err = writeReadyFile(*readyFile); err != nil {
+				return err
+			}
+		}
+		if sequence >= preflightCycles && !record.PreflightReady {
+			return fmt.Errorf("rf3-diagnostic: preflight incomplete: %s", record.PreflightReason)
 		}
 		select {
 		case <-ctx.Done():
@@ -310,8 +348,25 @@ func loadConfig(root string, interval, timeout time.Duration, maxBytes int64) (c
 	if len(manifests) < 3 || len(manifests) > maxNodes {
 		return config{}, fmt.Errorf("rf3-diagnostic: expected 3..%d node manifests", maxNodes)
 	}
-	profile, err := servicetls.LoadProfile(manifests[0].TLS.Certificate, manifests[0].TLS.Key,
-		manifests[0].TLS.Roots, manifests[0].TLS.IdentityOID, time.Now)
+	if len(manifests[0].Groups) > maxGroups {
+		return config{}, fmt.Errorf("rf3-diagnostic: too many groups: %d", len(manifests[0].Groups))
+	}
+	clusterRaw, err := os.ReadFile(filepath.Join(root, "cluster.vibejson"))
+	if err != nil {
+		return config{}, fmt.Errorf("rf3-diagnostic: read cluster manifest: %w", err)
+	}
+	if len(clusterRaw) == 0 || len(clusterRaw) > maxManifestBytes {
+		return config{}, errors.New("rf3-diagnostic: cluster manifest exceeds bound")
+	}
+	var cluster clusterManifest
+	if err = json.Unmarshal(clusterRaw, &cluster); err != nil {
+		return config{}, fmt.Errorf("rf3-diagnostic: decode cluster manifest: %w", err)
+	}
+	if cluster.GatewayCertificate == "" || cluster.GatewayKey == "" || cluster.Roots == "" {
+		return config{}, errors.New("rf3-diagnostic: incomplete cluster TLS manifest")
+	}
+	profile, err := servicetls.LoadProfile(cluster.GatewayCertificate, cluster.GatewayKey,
+		cluster.Roots, manifests[0].TLS.IdentityOID, time.Now)
 	if err != nil {
 		return config{}, fmt.Errorf("rf3-diagnostic: load TLS profile: %w", err)
 	}
@@ -451,12 +506,34 @@ func capture(ctx context.Context, cfg config, sequence uint64) cycle {
 	wg.Wait()
 	for _, group := range record.Groups {
 		for _, member := range group.Members {
+			if member.Status != nil && member.Metrics != nil {
+				record.ValidCuts++
+			}
 			if member.Error != "" {
 				record.SamplingErrs++
 			}
 		}
 	}
 	return record
+}
+
+func expectedValidCuts(cfg config) uint64 {
+	var total uint64
+	for _, group := range cfg.Groups {
+		total += uint64(len(group.Members))
+	}
+	return total
+}
+
+func writeReadyFile(path string) error {
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err = io.WriteString(file, "rf3-diagnostic preflight ready\n"); err == nil {
+		err = file.Sync()
+	}
+	return errors.Join(err, file.Close())
 }
 
 func captureMember(ctx context.Context, cfg config, group groupConfig, member manifestMember) memberSnapshot {
