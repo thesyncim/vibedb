@@ -55,17 +55,16 @@ const (
 )
 
 type replicatedSQLBoundStatement struct {
-	prepared               *PreparedPlan
-	bound                  *BoundWritePlan
-	profile                ReplicatedTableProfile
-	assignmentExpression   *query.DMLStatement
-	updateExec             query.Exec
+	prepared             *PreparedPlan
+	bound                *BoundWritePlan
+	profile              ReplicatedTableProfile
+	assignmentExpression *query.DMLStatement
+	// updateExec is allocated only for computed SET expressions. A plain
+	// full-document UPDATE never touches it, so keeping the ~6KB query.Exec
+	// inline would tax every single-statement write lowering.
+	updateExec             *query.Exec
 	conflictArgs           []any
 	conflictParameterTypes []query.ParameterType
-}
-
-type replicatedSQLTargetBuilder struct {
-	target ReplicatedTransactionTarget
 }
 
 type replicatedSQLMutationIdentity struct {
@@ -330,7 +329,14 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 			if ctx != nil && ctx.Done() != nil && stopExpressionCancel == nil {
 				stopExpressionCancel = context.AfterFunc(ctx, expressionCancel.Cancel)
 			}
-			statements[index].updateExec.Options.Cancel = &expressionCancel
+			// The conflict lane (EncodeReplicatedConflictValue) never takes an
+			// evaluator; only computed UPDATE assignments materialize through
+			// updateExec, so conflict-only statements skip it entirely.
+			if expression.HasUpdateExpressions() {
+				updateExec := &query.Exec{}
+				updateExec.Options.Cancel = &expressionCancel
+				statements[index].updateExec = updateExec
+			}
 		}
 		if prepared.statement.Kind == sqlast.KindInsert && len(prepared.statement.Insert.Columns) != 0 {
 			insert := prepared.statement.Insert
@@ -380,7 +386,10 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 		baseMutationCount += count
 	}
 
-	builders := make([]replicatedSQLTargetBuilder, 0, min(baseMutationCount, 8))
+	// Targets are built directly in the result slice: the former builder
+	// wrapper held exactly one ReplicatedTransactionTarget, so a second
+	// slice plus a final copy taxed every transaction for no reason.
+	targets = make([]ReplicatedTransactionTarget, 0, min(baseMutationCount, 8))
 	identities := make([]replicatedSQLMutationIdentity, 0, min(baseMutationCount, 256))
 	keyArena := make([]byte, 0, min(baseMutationCount, 256)*32)
 	var byGroup map[raftmember.GroupKey]int
@@ -515,7 +524,7 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 					missingPartial = true
 				} else if statement.assignmentExpression != nil {
 					document, err = sqldriver.MaterializePreparedUpdateAssignments(
-						statement.assignmentExpression, &statement.updateExec,
+						statement.assignmentExpression, statement.updateExec,
 						oldDocument, statement.bound.updateArgs,
 						int(statement.profile.MaxDocumentBytes),
 					)
@@ -598,7 +607,7 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 				baseMutation.Kind = replication.MutationPutDigestEqual
 			}
 			targetIndex, appendErr := appendReplicatedSQLMutation(
-				&builders, &byGroup, resolved.Route, bits,
+				&targets, &byGroup, resolved.Route, bits,
 				distributedtxn.IntentScope{Start: uint32(bucket), End: uint32(bucket) + 1},
 				statement.profile.Relation, baseMutation,
 			)
@@ -667,7 +676,7 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 					return nil, true, ErrReplicatedSQLTransactionUnsupported
 				}
 				indexTarget, indexErr := appendReplicatedSQLMutation(
-					&builders, &byGroup, indexRoute, index.bucketBits, index.scope,
+					&targets, &byGroup, indexRoute, index.bucketBits, index.scope,
 					indexProfile.Relation, indexMutation,
 				)
 				if indexErr != nil {
@@ -705,20 +714,17 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 		}
 	}
 
-	targets = make([]ReplicatedTransactionTarget, len(builders))
-	for index := range builders {
-		target := builders[index].target
-		slices.SortFunc(target.Batches, func(
+	for index := range targets {
+		slices.SortFunc(targets[index].Batches, func(
 			left, right replication.RelationMutationBatch,
 		) int {
 			return int(left.Relation) - int(right.Relation)
 		})
-		target.IntentScopes = coalesceIntentScopes(target.IntentScopes)
-		if len(target.IntentScopes) == 0 ||
-			len(target.IntentScopes) > distributedtxn.MaxIntentScopes {
+		targets[index].IntentScopes = coalesceIntentScopes(targets[index].IntentScopes)
+		if len(targets[index].IntentScopes) == 0 ||
+			len(targets[index].IntentScopes) > distributedtxn.MaxIntentScopes {
 			return nil, true, ErrReplicatedSQLTransactionUnsupported
 		}
-		targets[index] = target
 	}
 	if committedPreimageRead && !preparedDirectFullRowGuard(targets) {
 		return nil, true, errPreparedDirectFallback
@@ -992,7 +998,7 @@ func (snapshot *Snapshot) resolveReplicatedSQLGlobalIndex(
 }
 
 func appendReplicatedSQLMutation(
-	builders *[]replicatedSQLTargetBuilder,
+	targets *[]ReplicatedTransactionTarget,
 	byGroup *map[raftmember.GroupKey]int,
 	route ReplicatedRoute,
 	bucketBits uint8,
@@ -1000,37 +1006,35 @@ func appendReplicatedSQLMutation(
 	relation replication.RelationID,
 	mutation replication.Mutation,
 ) (int, error) {
-	if builders == nil || byGroup == nil || relation == 0 || bucketBits == 0 ||
+	if targets == nil || byGroup == nil || relation == 0 || bucketBits == 0 ||
 		!distributedtxn.ValidateIntentScope(scope, bucketBits) {
 		return -1, ErrReplicatedSQLTransactionUnsupported
 	}
-	targetIndex := replicatedSQLTargetIndex(*builders, *byGroup, route.Group)
+	targetIndex := replicatedSQLTargetIndex(*targets, *byGroup, route.Group)
 	if targetIndex < 0 {
 		replicas := make([]ReplicatedEndpoint, len(route.Replicas))
 		copy(replicas, route.Replicas)
 		route.Replicas = replicas
-		*builders = append(*builders, replicatedSQLTargetBuilder{
-			target: ReplicatedTransactionTarget{
-				Route: route, BucketBits: bucketBits,
-			},
+		*targets = append(*targets, ReplicatedTransactionTarget{
+			Route: route, BucketBits: bucketBits,
 		})
-		targetIndex = len(*builders) - 1
+		targetIndex = len(*targets) - 1
 		if *byGroup != nil {
 			(*byGroup)[route.Group] = targetIndex
-		} else if len(*builders) == 16 {
-			index := make(map[raftmember.GroupKey]int, len(*builders))
-			for builderIndex := range *builders {
-				index[(*builders)[builderIndex].target.Route.Group] = builderIndex
+		} else if len(*targets) == 16 {
+			index := make(map[raftmember.GroupKey]int, len(*targets))
+			for targetOrdinal := range *targets {
+				index[(*targets)[targetOrdinal].Route.Group] = targetOrdinal
 			}
 			*byGroup = index
 		}
 	} else if !sameReplicatedSQLRoute(
-		(*builders)[targetIndex].target.Route, route,
-	) || (*builders)[targetIndex].target.BucketBits != bucketBits {
+		(*targets)[targetIndex].Route, route,
+	) || (*targets)[targetIndex].BucketBits != bucketBits {
 		return -1, ErrReplicatedSQLTransactionUnsupported
 	}
 
-	builder := &(*builders)[targetIndex].target
+	builder := &(*targets)[targetIndex]
 	batchIndex := replicatedSQLRelationBatch(builder.Batches, relation)
 	if batchIndex < 0 {
 		if len(builder.Batches) == replication.MaxRelationBatches {
@@ -1218,7 +1222,7 @@ func replicatedSQLDocumentPrimaryScalar(
 }
 
 func replicatedSQLTargetIndex(
-	builders []replicatedSQLTargetBuilder,
+	targets []ReplicatedTransactionTarget,
 	byGroup map[raftmember.GroupKey]int,
 	group raftmember.GroupKey,
 ) int {
@@ -1228,8 +1232,8 @@ func replicatedSQLTargetIndex(
 		}
 		return -1
 	}
-	for index := range builders {
-		if builders[index].target.Route.Group == group {
+	for index := range targets {
+		if targets[index].Route.Group == group {
 			return index
 		}
 	}
