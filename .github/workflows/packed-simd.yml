@@ -5,6 +5,7 @@ on:
     paths:
       - 'internal/storeio/compact_stream_codec*'
       - 'internal/storeio/compact_primary_stripe.go'
+      - 'internal/storeio/primary_graph_integer_extrema_test.go'
       - 'internal/storeio/primary_graph_unified_filter.go'
       - 'store/durable/store_file_unified_read.go'
       - 'query/file_execute.go'
@@ -13,8 +14,10 @@ on:
       - 'query/file_packed_count_bench_test.go'
       - 'query/file_packed_order_bench_test.go'
       - 'query/file_packed_interval*_test.go'
+      - 'query/file_packed_extrema*_test.go'
       - '.github/workflows/packed-simd.yml'
       - 'scripts/bench/run-packed-simd.sh'
+      - 'scripts/bench/run-packed-extrema-avx2.sh'
   workflow_dispatch:
     inputs:
       base_ref:
@@ -138,6 +141,9 @@ jobs:
             printf 'cp %q %q\n' \
               "${GITHUB_WORKSPACE}/query/file_packed_interval_bench_test.go" \
               "${base_worktree}/query/file_packed_interval_bench_test.go"
+            printf 'cp %q %q\n' \
+              "${GITHUB_WORKSPACE}/query/file_packed_extrema_bench_test.go" \
+              "${base_worktree}/query/file_packed_extrema_bench_test.go"
             printf 'go test -run %q -c -o %q ./internal/storeio\n' '^$' "${binaries}/base-storeio.test"
             printf 'go test -run %q -c -o %q ./query\n' '^$' "${binaries}/base-query.test"
             printf 'go test -run %q -c -o %q ./internal/storeio\n' '^$' "${binaries}/head-storeio.test"
@@ -150,6 +156,7 @@ jobs:
           test -f "${GITHUB_WORKSPACE}/query/file_packed_count_bench_test.go"
           test -f "${GITHUB_WORKSPACE}/query/file_packed_order_bench_test.go"
           test -f "${GITHUB_WORKSPACE}/query/file_packed_interval_bench_test.go"
+          test -f "${GITHUB_WORKSPACE}/query/file_packed_extrema_bench_test.go"
           mkdir -p "${base_worktree}/internal/storeio" "${base_worktree}/query"
           cp -- "${GITHUB_WORKSPACE}/internal/storeio/compact_stream_codec_packed_equal_bench_test.go" \
             "${base_worktree}/internal/storeio/compact_stream_codec_packed_equal_bench_test.go"
@@ -167,6 +174,10 @@ jobs:
             "${base_worktree}/query/file_packed_interval_bench_test.go"
           cmp -- "${GITHUB_WORKSPACE}/query/file_packed_interval_bench_test.go" \
             "${base_worktree}/query/file_packed_interval_bench_test.go"
+          cp -- "${GITHUB_WORKSPACE}/query/file_packed_extrema_bench_test.go" \
+            "${base_worktree}/query/file_packed_extrema_bench_test.go"
+          cmp -- "${GITHUB_WORKSPACE}/query/file_packed_extrema_bench_test.go" \
+            "${base_worktree}/query/file_packed_extrema_bench_test.go"
           git -C "${base_worktree}" status --short > "${metadata}/base-worktree-status.txt"
 
           cd "${GITHUB_WORKSPACE}"
@@ -189,21 +200,21 @@ jobs:
           {
             printf 'VIBEDB_TEST_REQUIRE_AVX2=%q go test -v -count=1 -timeout=5m ./internal/storeio -run %q\n' \
               "${VIBEDB_TEST_REQUIRE_AVX2}" \
-              'Test(CountCompact|CompactPacked|CompactInteger(Ordered|Interval)|CompactStream|CompactPrimaryStripe)'
+              'Test(CountCompact|CompactPacked|CompactInteger(Ordered|Interval|Extrema)|CompactStream|CompactPrimaryStripe|PrimaryGraphIntegerExtrema)'
             printf 'go test -count=1 -timeout=5m ./query -run %q\n' \
-              '^TestFilePacked(EqualityCount|OrderedCount|IntegerInterval).*$'
+              '^TestFilePacked(EqualityCount|OrderedCount|IntegerInterval|IntegerExtrema).*$'
             printf 'VIBEDB_TEST_REQUIRE_AVX2=%q go test -v -race -gcflags=all=-d=checkptr=2 -count=1 -timeout=5m ./internal/storeio -run %q\n' \
               "${VIBEDB_TEST_REQUIRE_AVX2}" \
-              '^(TestCountCompactPacked(Equal|Less|Between)|TestCompactPacked|TestCompactInteger(Ordered|Interval))'
+              '^(TestCountCompactPacked(Equal|Less|Between)|TestCompactPacked|TestCompactInteger(Ordered|Interval|Extrema)|TestPrimaryGraphIntegerExtrema)'
           } > "${evidence}/focused-test-commands.txt"
           go test -v -count=1 -timeout=5m ./internal/storeio \
-            -run 'Test(CountCompact|CompactPacked|CompactInteger(Ordered|Interval)|CompactStream|CompactPrimaryStripe)' \
+            -run 'Test(CountCompact|CompactPacked|CompactInteger(Ordered|Interval|Extrema)|CompactStream|CompactPrimaryStripe|PrimaryGraphIntegerExtrema)' \
             2>&1 | tee "${evidence}/focused-storeio-tests.txt"
           go test -count=1 -timeout=5m ./query \
-            -run '^TestFilePacked(EqualityCount|OrderedCount|IntegerInterval).*$' \
+            -run '^TestFilePacked(EqualityCount|OrderedCount|IntegerInterval|IntegerExtrema).*$' \
             2>&1 | tee "${evidence}/focused-query-tests.txt"
           go test -v -race -gcflags=all=-d=checkptr=2 -count=1 -timeout=5m ./internal/storeio \
-            -run '^(TestCountCompactPacked(Equal|Less|Between)|TestCompactPacked|TestCompactInteger(Ordered|Interval))' \
+            -run '^(TestCountCompactPacked(Equal|Less|Between)|TestCompactPacked|TestCompactInteger(Ordered|Interval|Extrema)|TestPrimaryGraphIntegerExtrema)' \
             2>&1 | tee "${evidence}/packed-race-checkptr-tests.txt"
 
       - name: SIMD packed-count fallback with AVX2 disabled (AMD64)
@@ -225,11 +236,28 @@ jobs:
             go env -json GOARCH GOAMD64 GOEXPERIMENT
             printf 'GODEBUG=%s\n' "${GODEBUG}"
           } > "${evidence}/environment.txt"
-          tests='Test(CountCompact|CompactPacked|CompactInteger(Ordered|Interval))|^TestFilePacked(EqualityCount|OrderedCount|IntegerInterval).*$'
+          tests='Test(CountCompact|CompactPacked|CompactInteger(Ordered|Interval|Extrema)|PrimaryGraphIntegerExtrema)|^TestFilePacked(EqualityCount|OrderedCount|IntegerInterval|IntegerExtrema).*$'
           printf 'GOAMD64=v1 GOEXPERIMENT=simd GODEBUG=cpu.avx2=off go test -v -count=1 -timeout=5m ./internal/storeio ./query -run %q\n' \
             "${tests}" > "${evidence}/commands.txt"
           go test -v -count=1 -timeout=5m ./internal/storeio ./query \
             -run "${tests}" 2>&1 | tee "${evidence}/tests.txt"
+
+      - name: Qualify AMD64 extrema AVX2 speed
+        if: matrix.runner == 'ubuntu-latest'
+        working-directory: ${{ github.workspace }}
+        env:
+          GOAMD64: v1
+          GOEXPERIMENT: simd
+        run: |
+          set -euo pipefail
+          test "$(go env GOARCH)" = amd64
+          test "$(go env GOAMD64)" = v1
+          VIBEDB_TEST_REQUIRE_AVX2=1 go test -count=1 -timeout=5m ./internal/storeio \
+            -run '^TestCountCompactPackedExtremaDispatchAVX2$'
+          bash scripts/bench/run-packed-extrema-avx2.sh \
+            "${RUNNER_TEMP}/packed-simd/avx2-extrema" \
+            "${RUNNER_TEMP}/packed-simd-binaries/head-query.test" \
+            "${RUNNER_TEMP}/packed-simd-binaries/head-storeio.test"
 
       - name: Collect alternating native raw benchmarks
         working-directory: ${{ github.workspace }}

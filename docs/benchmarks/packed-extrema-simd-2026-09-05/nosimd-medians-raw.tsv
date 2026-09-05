@@ -1,0 +1,7 @@
+benchmark	sample1_ns_op	sample2_ns_op	sample3_ns_op	sample4_ns_op	sample5_ns_op	median_ns_op
+BenchmarkFilePackedIntegerExtremaCount/max/FOR10	11450	11448	11497	11580	11483	11483
+BenchmarkFilePackedIntegerExtremaCount/min-max/FOR10	11515	11542	11571	11545	11587	11545
+BenchmarkFilePackedIntegerExtremaCount/min/FOR10	11627	11442	11468	11432	11459	11459
+BenchmarkFilePackedIntegerExtremaCountWide/max/FOR16	12611	12481	12576	12578	12633	12578
+BenchmarkFilePackedIntegerExtremaCountWide/min-max/FOR16	12856	12621	12783	12689	12460	12689
+BenchmarkFilePackedIntegerExtremaCountWide/min/FOR16	12647	12614	12453	12639	12607	12614

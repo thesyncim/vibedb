@@ -1,0 +1,39 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/query
+cpu: Apple M4 Max
+BenchmarkFilePackedEqualityCount/label/dictionary7         	   61939	      4791 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedEqualityCount/n/FOR10                   	   98192	      3079 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedEqualityCountWide/label/dictionary8     	   71553	      4153 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedEqualityCountWide/n/FOR16               	   88468	      3550 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerExtremaCount/min/FOR10           	   86912	      3462 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerExtremaCount/max/FOR10           	   87147	      3461 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerExtremaCount/min-max/FOR10       	   82388	      3526 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerExtremaCountWide/min/FOR16       	   85506	      3484 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerExtremaCountWide/max/FOR16       	   83311	      3583 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerExtremaCountWide/min-max/FOR16   	   84062	      3572 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCount/empty              	  111462	      2470 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCount/sparse             	   88928	      3361 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCount/half               	   98986	      3060 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCount/full               	  124785	      2420 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCountWide/empty          	  122566	      2448 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCountWide/sparse         	   84646	      3488 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCountWide/half           	   87030	      3413 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerIntervalCountWide/full           	  122338	      2466 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedOrderedCount/sparse/lt                  	   92894	      3240 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedOrderedCount/sparse/le                  	   94162	      3196 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedOrderedCount/sparse/gt                  	   94171	      3187 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedOrderedCount/sparse/ge                  	   94352	      3184 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedOrderedCount/half/lt                    	   94318	      3188 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedOrderedCount/half/le                    	   93698	      3220 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedOrderedCount/half/gt                    	   94382	      3186 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedOrderedCount/half/ge                    	   94251	      3182 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedOrderedCountWide/sparse/lt              	   97906	      3065 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedOrderedCountWide/sparse/le              	  105169	      2902 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedOrderedCountWide/sparse/gt              	  103792	      2885 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedOrderedCountWide/sparse/ge              	  105184	      2881 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedOrderedCountWide/half/lt                	   88933	      3376 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedOrderedCountWide/half/le                	   88930	      3372 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedOrderedCountWide/half/gt                	   88842	      3370 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedOrderedCountWide/half/ge                	   89233	      3364 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+PASS

@@ -1,0 +1,8 @@
+go version go1.27.0 darwin/arm64
+GOEXPERIMENT=simd (base and candidate SIMD binaries)
+GOEXPERIMENT=nosimd (candidate scalar-control binary)
+GOMAXPROCS=1
+platform=Apple M4 Max, Darwin arm64
+benchmark_time=250ms
+benchmark_rounds=5
+power_and_thermal_state=uncontrolled

@@ -1,0 +1,17 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/internal/storeio
+cpu: Apple M4 Max
+BenchmarkCompactStreamPackedEquality7         	  849386	       361.2 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamSpellingEquality7       	  512512	       580.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEquality10        	 1802901	       172.9 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamIntegerEquality10       	 1824489	       166.1 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEquality8         	 5608813	        52.21 ns/op	      4096 rows	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamSpellingEquality8       	  603514	       512.7 ns/op	      4096 rows	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamPackedEquality16        	 1000000	       297.0 ns/op	      4096 rows	       0 B/op	       0 allocs/op
+BenchmarkCompactStreamIntegerEquality16       	 1222314	       257.7 ns/op	      4096 rows	       0 B/op	       0 allocs/op
+BenchmarkCompactPrimaryStripePackedEquality7  	  475384	       646.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactPrimaryStripePackedEquality10 	 1000000	       293.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactPrimaryStripePackedEquality8  	  564727	       554.1 ns/op	      4096 rows	       0 B/op	       0 allocs/op
+BenchmarkCompactPrimaryStripePackedEquality16 	  904899	       330.4 ns/op	      4096 rows	       0 B/op	       0 allocs/op
+PASS

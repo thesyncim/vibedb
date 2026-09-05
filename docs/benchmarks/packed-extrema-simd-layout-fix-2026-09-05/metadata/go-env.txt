@@ -1,0 +1,5 @@
+GOTOOLCHAIN=go1.27.0
+go version go1.27.0 darwin/arm64
+GOEXPERIMENT=simd (paired and candidate SIMD control)
+GOEXPERIMENT=nosimd (candidate nosimd control)
+CGO_ENABLED=1

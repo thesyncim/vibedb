@@ -1,0 +1,19 @@
+Command:
+nm -arch arm64 <storeio-test-binary> | rg 'countCompactPacked8EqualNEON|countCompactPacked(7|8|10|16)ExtremaNEON'
+
+baseline 0951f0da, /private/tmp/vibedb-go127-simd-extrema-base-storeio-layout.test:
+0000000100224510 t _github.com/thesyncim/vibedb/internal/storeio.countCompactPacked8EqualNEON
+
+pre-fix address reference, /private/tmp/vibedb-go127-simd-extrema-candidate-storeio-final.test:
+0000000100225170 t _github.com/thesyncim/vibedb/internal/storeio.countCompactPacked8EqualNEON
+0000000100225610 t _github.com/thesyncim/vibedb/internal/storeio.countCompactPacked7ExtremaNEON
+00000001002257b0 t _github.com/thesyncim/vibedb/internal/storeio.countCompactPacked8ExtremaNEON
+0000000100225990 t _github.com/thesyncim/vibedb/internal/storeio.countCompactPacked10ExtremaNEON
+0000000100225b80 t _github.com/thesyncim/vibedb/internal/storeio.countCompactPacked16ExtremaNEON
+
+fixed a7fdae07, /private/tmp/vibedb-go127-simd-extrema-candidate-storeio-layout-fixed.test:
+0000000100224890 t _github.com/thesyncim/vibedb/internal/storeio.countCompactPacked8EqualNEON
+0000000100226ad0 t _github.com/thesyncim/vibedb/internal/storeio.countCompactPacked7ExtremaNEON
+0000000100226c70 t _github.com/thesyncim/vibedb/internal/storeio.countCompactPacked8ExtremaNEON
+0000000100226e50 t _github.com/thesyncim/vibedb/internal/storeio.countCompactPacked10ExtremaNEON
+0000000100227040 t _github.com/thesyncim/vibedb/internal/storeio.countCompactPacked16ExtremaNEON

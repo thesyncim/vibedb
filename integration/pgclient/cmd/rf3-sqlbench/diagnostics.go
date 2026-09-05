@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -125,11 +124,15 @@ func loadDiagnosticControl(path, directory string) (*diagnosticControl, error) {
 			return nil
 		},
 		signal: func(target diagnosticTarget) error {
+			signal := rf3DiagnosticSignal()
+			if signal == nil {
+				return fmt.Errorf("diagnostic signalling is unavailable on this platform")
+			}
 			process, err := os.FindProcess(target.PID)
 			if err != nil {
 				return err
 			}
-			return process.Signal(syscall.SIGUSR1)
+			return process.Signal(signal)
 		}}, nil
 }
 
