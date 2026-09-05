@@ -249,6 +249,15 @@ func (s *Snapshot) prepareWrite(plan *PreparedPlan, source string) error {
 			cause: ErrTableNotPlaced,
 		}
 	}
+	if stmt.Kind == sqlast.KindInsert && stmt.Insert.ConflictTarget != nil {
+		if entry, replicated := s.replicatedTableAtBytes(byteview.Bytes(plan.table)); replicated {
+			profile, ok := s.replicatedTableProfileAt(entry)
+			if !ok || !bytes.Equal(stmt.Insert.ConflictTarget.AppendPointer(nil), []byte(profile.PrimaryKey)) {
+				return sqlast.NewFeatureNotSupportedError(source, stmt.Insert.ConflictTarget.Pos,
+					"ON CONFLICT target must be the declared primary key")
+			}
+		}
+	}
 	plan.distribution = placement.Distribution
 	plan.spec = spec
 	plan.manifest = manifest

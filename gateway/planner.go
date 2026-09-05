@@ -245,14 +245,13 @@ func (s *Snapshot) Prepare(ctx context.Context, sqlText string) (*PreparedPlan, 
 		return plan, nil
 	}
 	selectStmt := plan.statement.Select
+	plan.params = plan.statement.Params()
 	if err := validatePlanPhysicalTables(s, selectStmt, make(map[*sqlast.SelectStmt]struct{})); err != nil {
 		return nil, err
 	}
 	if len(selectStmt.From) == 0 || selectStmt.From[0].Kind != sqlast.RelationCollection {
-		return nil, &PlanError{
-			Reason: "a physical driving table is required",
-			cause:  ErrDistributedPlanUnsupported,
-		}
+		// Relations without a physical driving table execute at the coordinator.
+		return plan, nil
 	}
 	plan.table = selectStmt.From[0].Name
 	plan.tables = append(plan.tables, plan.table)
@@ -314,22 +313,10 @@ func (s *Snapshot) Prepare(ctx context.Context, sqlText string) (*PreparedPlan, 
 				cause: ErrTableNotPlaced,
 			}
 		}
-		if joined.Distribution != plan.distribution {
-			return nil, &PlanError{
-				Table: relation.Name,
-				Reason: fmt.Sprintf("distribution %q is not colocated with %q",
-					joined.Distribution, plan.distribution),
-				cause: ErrDistributedPlanUnsupported,
-			}
-		}
-		if (placement.AffinityGroup != "" || joined.AffinityGroup != "") &&
-			joined.AffinityGroup != placement.AffinityGroup {
-			return nil, &PlanError{
-				Table: relation.Name,
-				Reason: fmt.Sprintf("affinity group %q is not colocated with %q",
-					joined.AffinityGroup, placement.AffinityGroup),
-				cause: ErrDistributedPlanUnsupported,
-			}
+		if joined.Distribution != plan.distribution ||
+			(placement.AffinityGroup != "" || joined.AffinityGroup != "") && joined.AffinityGroup != placement.AffinityGroup {
+			plan.alwaysReason = "join requires coordinator relation evaluation"
+			continue
 		}
 		plan.tables = append(plan.tables, relation.Name)
 		placements[i] = joined
@@ -611,7 +598,7 @@ func planOrder(stmt *sqlast.SelectStmt, reason string) ([]OrderKey, string) {
 			return nil, firstPlanReason(reason,
 				"ORDER BY keys outside the projected row require hidden merge columns")
 		}
-		order[i] = OrderKey{Column: output, Desc: term.Desc}
+		order[i] = OrderKey{Column: output, Desc: term.Desc, Nulls: term.Nulls}
 	}
 	return order, reason
 }

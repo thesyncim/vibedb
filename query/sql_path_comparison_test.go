@@ -349,8 +349,9 @@ func TestSQLWherePathComparisonKeepsAdversarialPlansSourceFree(t *testing.T) {
 func TestSQLPathComparisonColdScalarLayoutGate(t *testing.T) {
 	switch unsafe.Sizeof(uintptr(0)) {
 	case 8:
-		if got := unsafe.Sizeof(statementScalar{}); got != 824 {
-			t.Fatalf("unsafe.Sizeof(statementScalar{}) = %d, want unchanged 824", got)
+		// Conditional expressions add one cold program slice (24 bytes).
+		if got := unsafe.Sizeof(statementScalar{}); got != 848 {
+			t.Fatalf("unsafe.Sizeof(statementScalar{}) = %d, want 848", got)
 		}
 		if got := unsafe.Sizeof(statementScalarPredicate{}); got != 72 {
 			t.Fatalf("unsafe.Sizeof(statementScalarPredicate{}) = %d, want unchanged 72", got)
@@ -359,8 +360,8 @@ func TestSQLPathComparisonColdScalarLayoutGate(t *testing.T) {
 			t.Fatalf("unsafe.Sizeof(relationJoinKey{}) = %d, want unchanged 160", got)
 		}
 	case 4:
-		if got := unsafe.Sizeof(statementScalar{}); got != 428 {
-			t.Fatalf("unsafe.Sizeof(statementScalar{}) = %d, want unchanged 428", got)
+		if got := unsafe.Sizeof(statementScalar{}); got != 440 {
+			t.Fatalf("unsafe.Sizeof(statementScalar{}) = %d, want 440", got)
 		}
 		if got := unsafe.Sizeof(statementScalarPredicate{}); got != 44 {
 			t.Fatalf("unsafe.Sizeof(statementScalarPredicate{}) = %d, want unchanged 44", got)

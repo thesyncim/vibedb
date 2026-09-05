@@ -1129,6 +1129,18 @@ func (p *Parser) parseTypedHeadResultColumn(col ResultColumn) (ResultColumn, err
 // replaces the weaker inner type name; any arithmetic or concatenation root
 // deliberately falls back to ?column?.
 func typedConstantOutputName(expr *ScalarExpr) string {
+	if expr != nil && expr.Kind == ScalarBinary && expr.Op.Conditional() {
+		switch expr.Op {
+		case ScalarCoalesce:
+			return "coalesce"
+		case ScalarGreatest:
+			return "greatest"
+		case ScalarLeast:
+			return "least"
+		case ScalarNullIf:
+			return "nullif"
+		}
+	}
 	if expr == nil || expr.Kind != ScalarCast {
 		return ""
 	}
@@ -2771,8 +2783,15 @@ func (p *Parser) parseOrderTerm(
 		term.Desc = true
 	}
 	switch {
-	case p.atKeyword(kwNulls):
-		return term, p.errHere("NULLS FIRST/LAST is not supported: the engine sorts nulls first ascending and last descending")
+	case p.acceptKeyword(kwNulls):
+		switch {
+		case p.acceptKeyword(kwFirst):
+			term.Nulls = WindowNullsFirst
+		case p.acceptKeyword(kwLast):
+			term.Nulls = WindowNullsLast
+		default:
+			return term, p.errHere("expected FIRST or LAST after NULLS")
+		}
 	case p.atKeyword(kwCollate):
 		return term, p.errHere("COLLATE is not supported: strings compare by decoded content")
 	}

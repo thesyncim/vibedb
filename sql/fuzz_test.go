@@ -628,7 +628,7 @@ func checkScalarInvariants(t *testing.T, s *SelectStmt, e *ScalarExpr, outer *La
 		}
 		return checkScalarInvariants(t, s, e.Left, outer)
 	case ScalarBinary:
-		if e.Left == nil || e.Right == nil || e.Op > ScalarConcat {
+		if e.Left == nil || e.Right == nil || (e.Op > ScalarConcat && !e.Op.Conditional()) {
 			t.Fatalf("scalar binary has invalid payload: %+v", e)
 		}
 		return checkScalarInvariants(t, s, e.Left, outer) +

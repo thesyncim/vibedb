@@ -31,14 +31,15 @@ import (
 // cross-shard merge here and are out of scope; a caller must not rely on them.
 
 // OrderKey names one sort-key column of the shard result and its direction. The
-// merge decodes only these columns. Nulls sort with the kind order — first under
-// ascending, last under descending — mirroring the local executor, which has no
-// separate NULLS FIRST/LAST control.
+// merge decodes only these columns. Null placement matches the local executor,
+// including an explicitly authored NULLS FIRST/LAST override.
 type OrderKey struct {
 	// Column is the zero-based index of the sort column in the result rows.
 	Column int
 	// Desc reverses the comparison for this column.
 	Desc bool
+	// Nulls overrides the default placement and must match each shard's order.
+	Nulls sqlast.WindowNullOrder
 }
 
 // ErrUnmergeableResult reports a multi-shard response that is not a row set (for
@@ -230,15 +231,29 @@ func (h *mergeHeap) Pop() any {
 func compareHeads(a, b *shardRun, order []OrderKey) int {
 	ka, kb := a.keys[a.pos], b.keys[b.pos]
 	for k := range order {
-		c := compareCells(ka[k], kb[k])
-		if order[k].Desc {
-			c = -c
-		}
+		c := compareOrderedCells(ka[k], kb[k], order[k])
 		if c != 0 {
 			return c
 		}
 	}
 	return 0
+}
+
+func compareOrderedCells(a, b cellValue, order OrderKey) int {
+	if order.Nulls != sqlast.WindowNullsDefault && (a.kind == ckNull || b.kind == ckNull) {
+		if a.kind == b.kind {
+			return 0
+		}
+		if (a.kind == ckNull) == (order.Nulls == sqlast.WindowNullsFirst) {
+			return -1
+		}
+		return 1
+	}
+	cmp := compareCells(a, b)
+	if order.Desc {
+		return -cmp
+	}
+	return cmp
 }
 
 type groupedSortEntry struct {
@@ -250,10 +265,7 @@ type groupedSortEntry struct {
 
 func compareGroupedSortEntries(a, b *groupedSortEntry, order []OrderKey) int {
 	for key := range order {
-		comparison := compareCells(a.keys[key], b.keys[key])
-		if order[key].Desc {
-			comparison = -comparison
-		}
+		comparison := compareOrderedCells(a.keys[key], b.keys[key], order[key])
 		if comparison != 0 {
 			return comparison
 		}

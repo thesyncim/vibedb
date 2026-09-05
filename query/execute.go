@@ -1596,10 +1596,7 @@ func (p *plan) runProjectionInto(dst *Result, ctx *execCtx, selected []int, w *W
 
 func (p *plan) compareRows(ctx *execCtx, a, b int) int {
 	for _, o := range p.order {
-		c := compareScalar(ctx.values[o.value][a], ctx.values[o.value][b])
-		if o.dir == Desc {
-			c = -c
-		}
+		c := compareOrderedScalar(ctx.values[o.value][a], ctx.values[o.value][b], o.dir)
 		if c != 0 {
 			return c
 		}
@@ -1715,10 +1712,7 @@ func (p *plan) runGroupedInto(dst *Result, ctx *execCtx, selected []int, w *Work
 
 func (p *plan) compareGroups(a, b *group) int {
 	for _, o := range p.order {
-		c := compareScalar(a.scalars[o.slot], b.scalars[o.slot])
-		if o.dir == Desc {
-			c = -c
-		}
+		c := compareOrderedScalar(a.scalars[o.slot], b.scalars[o.slot], o.dir)
 		if c != 0 {
 			return c
 		}

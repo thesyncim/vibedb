@@ -249,3 +249,16 @@ func declaredSQLPathDomain(meta *tableMeta, pointer string) query.SQLPathDomain 
 	}
 	return query.SQLPathDomainUnknown
 }
+
+// ValidateSQLPathComparisonDomains applies the driver's analysis-time operator
+// resolution to a complete parsed SELECT graph. Adapters provide domains from
+// their pinned, authenticated schema catalog; unknown domains remain runtime
+// checks. The resolver and catalog are never retained by this function.
+func ValidateSQLPathComparisonDomains(source string, statement *sqlast.SelectStmt, resolve func(collection, pointer string) query.SQLPathDomain) error {
+	return sqlast.WalkSelectStatements(statement, func(s *sqlast.SelectStmt) error {
+		if s.Set != nil {
+			return nil
+		}
+		return validateDeclaredSQLPathComparisonDomains(source, s, resolve)
+	})
+}

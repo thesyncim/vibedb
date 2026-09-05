@@ -49,7 +49,7 @@ func (s *postgresSession) prepareWrite(
 	if parsed.Kind == sqlast.KindInsert && parsed.Insert.Source != nil {
 		return nil, sqlast.NewFeatureNotSupportedError(text, 0, "RF3 PostgreSQL INSERT requires VALUES")
 	}
-	if parsed.Kind == sqlast.KindInsert && parsed.Insert.HasConflictAction() {
+	if parsed.Kind == sqlast.KindInsert && parsed.Insert.OnConflictUpdate != nil {
 		return nil, sqlast.NewFeatureNotSupportedError(
 			text, replicatedSQLConflictActionPosition(parsed.Insert),
 			"RF3 PostgreSQL ON CONFLICT requires branch-aware replicated writes",

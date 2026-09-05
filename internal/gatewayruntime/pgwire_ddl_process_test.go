@@ -107,6 +107,23 @@ active BOOLEAN NOT NULL
 		}
 	}
 	check(connection)
+	for _, tc := range []struct{ sql, value string }{
+		{`SELECT COALESCE(SUM(score),0) FROM employees`, "49500"},
+		{`SELECT AVG(score) FROM employees`, "49.5"},
+		{`WITH selected AS (SELECT id AS owner, score FROM employees) SELECT COALESCE(SUM(score),0) FROM selected WHERE owner='employee-0001'`, "1"},
+		{`SELECT COUNT(*) FROM (SELECT id FROM employees WHERE id='employee-0001' UNION ALL SELECT id FROM employees WHERE id='employee-0002') AS selected`, "2"},
+		{`SELECT selected.score FROM (SELECT score, ROW_NUMBER() OVER (ORDER BY score DESC) AS ordinal FROM employees) AS selected WHERE ordinal=1`, "99"},
+	} {
+		result := ddlWireQuery(t, connection, tc.sql, false)
+		if result.code != "" || len(result.rows) != 1 || len(result.rows[0]) != 1 || result.rows[0][0] != tc.value {
+			t.Fatalf("distributed SQL %s: %+v, want %s", tc.sql, result, tc.value)
+		}
+	}
+	ignored := ddlWireQuery(t, connection, `INSERT INTO employees (id,name,team,city,score,active) VALUES ('employee-0001','Ignored','Platform',NULL,999,false) ON CONFLICT (id) DO NOTHING`, false)
+	if ignored.code != "" || ignored.tag != "INSERT 0 0" {
+		t.Fatalf("atomic conflict skip: %+v", ignored)
+	}
+	check(connection)
 	result = ddlWireQuery(t, connection, ddl, true)
 	if result.code != "42P07" {
 		t.Fatalf("duplicate table: %+v", result)

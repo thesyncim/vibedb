@@ -193,10 +193,7 @@ func (s *Statement) buildWindow(w *statementWindow, args []any) error {
 		if ordinal < 0 || ordinal >= len(w.ordinalSpec) {
 			return fmt.Errorf("query: window ORDER BY path has no input column")
 		}
-		direction := Asc
-		if term.Desc {
-			direction = Desc
-		}
+		direction := sqlOrderDirection(term.Desc, term.Nulls)
 		s.q.orderBy = append(s.q.orderBy, orderSpec{
 			path: w.ordinalSpec[ordinal], dir: direction,
 		})
@@ -317,10 +314,7 @@ func (s *Statement) buildOrderBy() error {
 		if path == nil {
 			return fmt.Errorf("query: malformed ORDER BY path")
 		}
-		dir := Asc
-		if term.Desc {
-			dir = Desc
-		}
+		dir := sqlOrderDirection(term.Desc, term.Nulls)
 		s.q.orderBy = append(s.q.orderBy, orderSpec{path: s.spec(path), dir: dir})
 	}
 	return nil

@@ -92,6 +92,10 @@ func inExpr(name string, vs ...sqlast.Operand) *sqlast.Expr {
 	return &sqlast.Expr{Kind: sqlast.ExprIn, Path: pathExpr(name), List: vs}
 }
 
+func orExpr(kids ...*sqlast.Expr) *sqlast.Expr {
+	return &sqlast.Expr{Kind: sqlast.ExprOr, Kids: kids}
+}
+
 func andExpr(kids ...*sqlast.Expr) *sqlast.Expr {
 	return &sqlast.Expr{Kind: sqlast.ExprAnd, Kids: kids}
 }
@@ -108,6 +112,41 @@ func TestConstraintProgramBind(t *testing.T) {
 		want    []distribution.DomainKind
 		wantLen []int // finite value count per ordinal, -1 to skip
 	}{
+		{
+			name: "disjunction of key values", binding: binding,
+			where: orExpr(eqExpr("tenant_id", strOp("a")), eqExpr("tenant_id", paramOp(0))), args: []any{"b"},
+			want: []distribution.DomainKind{distribution.DomainFinite}, wantLen: []int{2},
+		},
+		{
+			name: "disjunction intersects sibling", binding: binding,
+			where: andExpr(orExpr(eqExpr("tenant_id", strOp("a")), eqExpr("tenant_id", strOp("b"))), eqExpr("tenant_id", strOp("b"))),
+			want:  []distribution.DomainKind{distribution.DomainFinite}, wantLen: []int{1},
+		},
+		{
+			name: "unconstrained disjunction arm widens", binding: binding,
+			where: orExpr(eqExpr("tenant_id", strOp("a")), eqExpr("other", strOp("b"))),
+			want:  []distribution.DomainKind{distribution.DomainUnknown}, wantLen: []int{-1},
+		},
+		{
+			name: "disjunction canonical numeric deduplication", binding: binding,
+			where: orExpr(eqExpr("tenant_id", numOp("5")), eqExpr("tenant_id", numOp("5.0"))),
+			want:  []distribution.DomainKind{distribution.DomainFinite}, wantLen: []int{1},
+		},
+		{
+			name: "null disjunction arm contributes no key", binding: binding,
+			where: orExpr(eqExpr("tenant_id", paramOp(0)), eqExpr("tenant_id", strOp("a"))), args: []any{nil},
+			want: []distribution.DomainKind{distribution.DomainFinite}, wantLen: []int{1},
+		},
+		{
+			name: "path comparison prevents disjunction pruning", binding: binding,
+			where: andExpr(orExpr(eqExpr("tenant_id", strOp("a")), eqExpr("tenant_id", strOp("b"))), pathEqExpr("value", "other_value")),
+			want:  []distribution.DomainKind{distribution.DomainUnknown}, wantLen: []int{-1},
+		},
+		{
+			name: "compound disjunction keeps both ordinals complete", binding: compound,
+			where: orExpr(andExpr(eqExpr("tenant_id", strOp("a")), eqExpr("channel_id", numOp("1"))), andExpr(eqExpr("tenant_id", strOp("b")), eqExpr("channel_id", numOp("2")))),
+			want:  []distribution.DomainKind{distribution.DomainFinite, distribution.DomainFinite}, wantLen: []int{2, 2},
+		},
 		{
 			name:    "equality literal",
 			binding: binding,

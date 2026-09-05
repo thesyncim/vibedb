@@ -143,6 +143,10 @@ const (
 	Asc Direction = iota
 	// Desc sorts descending, nulls last.
 	Desc
+	// AscNullsLast sorts ascending with nulls after non-null values.
+	AscNullsLast
+	// DescNullsFirst sorts descending with nulls before non-null values.
+	DescNullsFirst
 )
 
 // A Query is a compiled, reusable query plan built by Select and the chaining

@@ -63,22 +63,25 @@ const (
 	statementScalarBinary
 	statementScalarCast
 	statementScalarCaseNode
+	statementScalarConditionalNode
+	statementScalarBooleanNode
 )
 
 type statementScalarNode struct {
-	kind           statementScalarNodeKind
-	op             sqlast.ScalarOp
-	cast           sqlast.ScalarCastTarget
-	left           int32
-	right          int32
-	dependency     int32
-	caseIndex      int32
-	skip           int32
-	operand        sqlast.Operand
-	pos            int
-	bound          scalar
-	known          bool
-	representation OutputRepresentation
+	kind             statementScalarNodeKind
+	op               sqlast.ScalarOp
+	cast             sqlast.ScalarCastTarget
+	left             int32
+	right            int32
+	dependency       int32
+	caseIndex        int32
+	conditionalIndex int32
+	skip             int32
+	operand          sqlast.Operand
+	pos              int
+	bound            scalar
+	known            bool
+	representation   OutputRepresentation
 }
 
 type statementScalarDependencySpec struct {
@@ -116,6 +119,7 @@ type statementScalarOrder struct {
 	end   int32
 	root  int32
 	desc  bool
+	nulls sqlast.WindowNullOrder
 }
 
 type statementScalarOrderRow struct {
@@ -146,6 +150,7 @@ type statementScalar struct {
 	predRoots      []int32
 	cases          []statementScalarCase
 	caseArms       []statementScalarCaseArm
+	conditionals   []statementScalarConditional
 	predicateNodes int
 	outputs        []int32
 	types          []ValueType
@@ -339,7 +344,7 @@ func (s *Statement) prepareScalar(preserveUnknownOutput bool) error {
 				end = root + 1
 			}
 			runtime.ordered.order = append(runtime.ordered.order, statementScalarOrder{
-				start: start, end: end, root: root, desc: term.Desc,
+				start: start, end: end, root: root, desc: term.Desc, nulls: term.Nulls,
 			})
 		}
 	}
@@ -542,6 +547,9 @@ func (r *statementScalar) compileExpr(s *Statement, expr *sqlast.ScalarExpr) (in
 			kind: statementScalarUnary, op: expr.Op, left: left, right: -1, pos: expr.Pos,
 		})
 	case sqlast.ScalarBinary:
+		if expr.Op.Conditional() {
+			return r.compileConditional(s, expr)
+		}
 		if expr.Op > sqlast.ScalarConcat {
 			return 0, fmt.Errorf("query: invalid scalar binary operation %d", expr.Op)
 		}
@@ -690,11 +698,20 @@ func (r *statementScalar) compileWhere(s *Statement, expr *sqlast.Expr) error {
 		if !exprHasScalar(term) {
 			continue
 		}
-		if !exprEntirelyScalar(term) {
-			return sqlast.NewFeatureNotSupportedError(s.text, firstScalarExprPos(term),
-				"a scalar predicate may mix with path predicates through top-level AND only; OR/NOT require one unified three-valued predicate stage")
+		var root int32
+		var err error
+		if exprEntirelyScalar(term) {
+			root, err = r.compilePredicate(s, term)
+		} else {
+			// WHERE retains exactly TRUE. The shared searched-CASE evaluator
+			// preserves NULL, short-circuiting, and runtime operand checks across
+			// mixed path/scalar boolean trees before this final truth selection.
+			value := &sqlast.ScalarExpr{Kind: sqlast.ScalarCase, Pos: term.Pos,
+				Whens: []sqlast.ScalarWhen{{Predicate: term, Result: &sqlast.ScalarExpr{Kind: sqlast.ScalarLiteral, Value: sqlast.Operand{Kind: sqlast.OperandBool, Bool: true}}}},
+				Else:  &sqlast.ScalarExpr{Kind: sqlast.ScalarLiteral, Value: sqlast.Operand{Kind: sqlast.OperandBool}},
+			}
+			root, err = r.compilePredicate(s, &sqlast.Expr{Kind: sqlast.ExprScalarTruth, ScalarLeft: value, Pos: term.Pos})
 		}
-		root, err := r.compilePredicate(s, term)
 		if err != nil {
 			return err
 		}
@@ -754,7 +771,12 @@ func (r *statementScalar) compilePredicate(s *Statement, expr *sqlast.Expr) (int
 		if err != nil {
 			return 0, err
 		}
-		node.left = left
+		domain := r.nodeDomain(left)
+		if domain != caseDomainDynamic && domain != caseDomainNull && domain != caseDomainBoolean {
+			return 0, &ScalarTypeError{Pos: expr.Pos, Operation: "Boolean predicate", Left: r.nodeType(left), Right: TypeBool}
+		}
+		r.nodes = append(r.nodes, statementScalarNode{kind: statementScalarBooleanNode, left: left, pos: expr.Pos})
+		node.left = int32(len(r.nodes) - 1)
 	default:
 		return 0, fmt.Errorf("query: invalid scalar predicate kind %d", expr.Kind)
 	}
@@ -873,6 +895,8 @@ func (r *statementScalar) nodeType(root int32) ValueType {
 		}
 	case statementScalarNull:
 		return TypeNull
+	case statementScalarBooleanNode:
+		return TypeBool
 	case statementScalarUnary:
 		return TypeNumber
 	case statementScalarBinary:
@@ -893,6 +917,8 @@ func (r *statementScalar) nodeType(root int32) ValueType {
 		}
 	case statementScalarCaseNode:
 		return r.cases[node.caseIndex].domain.schemaType()
+	case statementScalarConditionalNode:
+		return r.conditionals[node.conditionalIndex].domain.schemaType()
 	default:
 		return TypeAny
 	}
@@ -936,6 +962,8 @@ func (r *statementScalar) nodeRepresentation(root int32) OutputRepresentation {
 		}
 	case statementScalarCaseNode:
 		return r.cases[node.caseIndex].domain.representation()
+	case statementScalarConditionalNode:
+		return r.conditionals[node.conditionalIndex].domain.representation()
 	default:
 		return OutputJSON
 	}
@@ -1031,6 +1059,22 @@ func (r *statementScalar) evalNodes(
 			if err != nil {
 				return err
 			}
+		case statementScalarBooleanNode:
+			value = r.values[node.left]
+			if value.value.kind != kindNull && value.value.kind != kindBool {
+				return &ScalarTypeError{Pos: node.pos, Operation: "Boolean predicate", Left: valueTypeOfScalar(value.value), Right: TypeBool}
+			}
+		case statementScalarConditionalNode:
+			var err error
+			value, err = r.evalConditional(result, row, node, arena, budget,
+				intermediate, intermediateCharge, cancel)
+			if err != nil {
+				return err
+			}
+			if node.skip <= int32(i) || int(node.skip) > end {
+				return fmt.Errorf("query: malformed scalar conditional program range")
+			}
+			i = int(node.skip) - 1
 		case statementScalarCaseNode:
 			var err error
 			value, err = r.evalCase(
@@ -1813,13 +1857,11 @@ func (r *statementScalar) publishEmptyOrdered(
 
 func (o *statementScalarOrdered) compare(left, right statementScalarOrderRow) int {
 	for key := range o.order {
-		cmp := compareScalar(
+		cmp := compareOrderedScalar(
 			o.values[left.keyBase+key],
 			o.values[right.keyBase+key],
+			sqlOrderDirection(o.order[key].desc, o.order[key].nulls),
 		)
-		if o.order[key].desc {
-			cmp = -cmp
-		}
 		if cmp != 0 {
 			return cmp
 		}

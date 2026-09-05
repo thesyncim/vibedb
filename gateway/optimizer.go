@@ -265,7 +265,7 @@ func plannerOrdering(order []OrderKey) []queryplanner.OrderingColumn {
 		}
 		out[i] = queryplanner.OrderingColumn{
 			Column: queryplanner.ColumnID(order[i].Column), Direction: direction,
-			NullsFirst: !order[i].Desc,
+			NullsFirst: order[i].Nulls == bootstrap.WindowNullsFirst || (order[i].Nulls == bootstrap.WindowNullsDefault && !order[i].Desc),
 		}
 	}
 	return out

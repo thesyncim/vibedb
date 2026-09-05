@@ -857,6 +857,9 @@ func (c *conn) insertLocked(
 	returned *query.Cursor,
 ) (sqldriver.Result, error) {
 	tree := statement.Tree().Insert
+	if err := validateInsertConflictTarget(statement.SQL(), tree, t.meta); err != nil {
+		return nil, err
+	}
 	limits, err := tableMutationLimits(t)
 	if err != nil {
 		return nil, err

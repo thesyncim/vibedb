@@ -108,6 +108,12 @@ func dumpStmt(s *SelectStmt) string {
 			} else {
 				b.WriteString(":asc")
 			}
+			if s.OrderBy[i].Nulls == WindowNullsFirst {
+				b.WriteString(":nulls-first")
+			}
+			if s.OrderBy[i].Nulls == WindowNullsLast {
+				b.WriteString(":nulls-last")
+			}
 		}
 	}
 	if s.Limit != nil {
@@ -555,6 +561,14 @@ func dumpScalarOp(op ScalarOp) string {
 		return "u+"
 	case ScalarNegative:
 		return "u-"
+	case ScalarCoalesce:
+		return "coalesce"
+	case ScalarGreatest:
+		return "greatest"
+	case ScalarLeast:
+		return "least"
+	case ScalarNullIf:
+		return "nullif"
 	default:
 		return fmt.Sprintf("op(%d)", op)
 	}

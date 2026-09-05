@@ -44,6 +44,7 @@ type scalarParserState struct {
 	depth       int
 	caseItems   int
 	caseTruth   int
+	arguments   []*ScalarExpr
 	sized       bool
 }
 
@@ -59,6 +60,8 @@ func (s *scalarParserState) reset() {
 	s.depth = 0
 	s.caseItems = 0
 	s.caseTruth = 0
+	clear(s.arguments)
+	s.arguments = s.arguments[:0]
 }
 
 func (p *Parser) scalarState() *scalarParserState {
@@ -80,6 +83,9 @@ func scalarStarts(tok token) bool {
 	case tokNumber, tokString, tokParam, tokLParen, tokPlus, tokMinus:
 		return true
 	case tokIdent:
+		if _, ok := conditionalScalarOp(tok); ok {
+			return true
+		}
 		return tok.kw == kwTrue || tok.kw == kwFalse || tok.kw == kwNull ||
 			tok.kw == kwCase || tok.kw == kwCast
 	default:
@@ -512,6 +518,9 @@ func scalarCastTypeName(target ScalarCastTarget) string {
 
 func (p *Parser) parseScalarPrimary(ctx scalarExprContext) (*ScalarExpr, error) {
 	pos := p.tok.pos
+	if op, ok := conditionalScalarOp(p.tok); ok {
+		return p.parseConditionalScalar(op, ctx)
+	}
 	if target, supported, known := scalarTypedStringHead(p.tok); known {
 		head := p.tok
 		p.advance()

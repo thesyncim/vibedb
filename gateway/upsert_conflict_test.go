@@ -106,10 +106,6 @@ func TestPostgreSQLRF3PrepareRejectsConflictActionsAsFeatureNotSupported(t *test
 		marker string
 	}{
 		{
-			text:   `INSERT INTO messages (id, value) VALUES (?, ?) ON CONFLICT DO NOTHING`,
-			marker: "ON CONFLICT",
-		},
-		{
 			text:   `INSERT INTO messages (id, value) VALUES (?, ?) ON CONFLICT DO UPDATE SET value = EXCLUDED.value`,
 			marker: "UPDATE",
 		},
