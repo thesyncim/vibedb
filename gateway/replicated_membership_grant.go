@@ -788,7 +788,7 @@ func (authority *ReplicatedCatalogAuthority) PublishReplicaReplacement(
 	if result.Completion.ResultCode != replicatedstate.ResultApplied {
 		return ErrReplicatedCatalog
 	}
-	if err = authority.observePublishedCatalog(certified); err != nil {
+	if err = authority.observePublishedCatalog(ctx, certified); err != nil {
 		return err
 	}
 	return authority.holder.publishReplicaReplacementAfter(
@@ -919,7 +919,7 @@ func (authority *ReplicatedCatalogAuthority) PublishReplicaReplacementPostRemove
 	if result.Completion.ResultCode != replicatedstate.ResultApplied {
 		return ErrReplicatedCatalog
 	}
-	if err = authority.observePublishedCatalog(next); err != nil {
+	if err = authority.observePublishedCatalog(ctx, next); err != nil {
 		return err
 	}
 	return authority.holder.publishReplicaReplacementPostRemoveAfter(

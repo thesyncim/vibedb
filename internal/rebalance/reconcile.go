@@ -113,6 +113,11 @@ type Observation struct {
 
 	DrainedCatalogGeneration uint64
 	RetiringReplicaRetired   bool
+	// TransitionReceipt is produced by the authoritative catalog publication
+	// and read back by the observer. Its actual head generation is the only
+	// accepted catalog fence for receipt-aware plans.
+	TransitionReceipt      gateway.GroupPublicationReceipt
+	TransitionReceiptFound bool
 }
 
 type membershipStage uint8
@@ -142,7 +147,7 @@ func Reconcile(plan *Plan, observed Observation) (Action, error) {
 		observed.Publication.ReplicaSetVersion > observed.Publication.Applied {
 		return Action{}, ErrInvalidPlan
 	}
-	catalog, err := plan.catalogStage(observed.Catalog)
+	catalog, err := plan.catalogStageObserved(observed.Catalog, observed.TransitionReceipt, observed.TransitionReceiptFound)
 	if err != nil {
 		return Action{}, err
 	}
@@ -175,7 +180,13 @@ func Reconcile(plan *Plan, observed Observation) (Action, error) {
 			return Action{Kind: ActionTransferLeader, Member: plan.request.TargetMember}, nil
 		}
 		drainGeneration := plan.nextCatalogGeneration
-		if catalog == catalogTargetPostRemove {
+		if plan.transitionReady {
+			if observed.TransitionReceiptFound {
+				drainGeneration = observed.TransitionReceipt.CommittedHeadGeneration
+			} else if catalog == catalogTargetPostRemove {
+				return Action{}, ErrTopologyConflict
+			}
+		} else if catalog == catalogTargetPostRemove {
 			drainGeneration = plan.postRemoveGeneration
 		}
 		if observed.DrainedCatalogGeneration != drainGeneration {
@@ -187,8 +198,12 @@ func Reconcile(plan *Plan, observed Observation) (Action, error) {
 			return Action{Kind: ActionRemoveSource, Member: plan.request.RetiringMember}, nil
 		}
 		if catalog == catalogTargetPreRemove {
+			generation := plan.postRemoveGeneration
+			if plan.transitionReady {
+				generation = observed.Catalog.Generation() + 1
+			}
 			return Action{
-				Kind: ActionRefreshCatalogFence, CatalogGeneration: plan.postRemoveGeneration,
+				Kind: ActionRefreshCatalogFence, CatalogGeneration: generation,
 				ReplicaSetVersion: observed.Publication.ReplicaSetVersion,
 			}, nil
 		}
@@ -236,9 +251,14 @@ func Reconcile(plan *Plan, observed Observation) (Action, error) {
 		if !plan.targetBindingApplied(observed.TargetState) {
 			return Action{}, ErrTopologyConflict
 		}
-		return Action{
-			Kind: ActionPublishCatalog, CatalogGeneration: plan.nextCatalogGeneration,
-		}, nil
+		generation := plan.nextCatalogGeneration
+		if plan.transitionReady {
+			if observed.Catalog.Generation() == ^uint64(0) {
+				return Action{}, ErrTopologyConflict
+			}
+			generation = observed.Catalog.Generation() + 1
+		}
+		return Action{Kind: ActionPublishCatalog, CatalogGeneration: generation}, nil
 	case membershipRemoved:
 		return Action{}, ErrTopologyConflict
 	default:
@@ -247,9 +267,48 @@ func Reconcile(plan *Plan, observed Observation) (Action, error) {
 }
 
 func (p *Plan) catalogStage(snapshot *gateway.Snapshot) (catalogStage, error) {
+	return p.catalogStageObserved(snapshot, gateway.GroupPublicationReceipt{}, false)
+}
+
+func (p *Plan) catalogStageObserved(snapshot *gateway.Snapshot, receipt gateway.GroupPublicationReceipt, receiptFound bool) (catalogStage, error) {
+	if p == nil || snapshot == nil {
+		return 0, ErrTopologyConflict
+	}
 	manifest, ok := snapshot.Manifest(p.request.Distribution)
 	if !ok {
 		return 0, ErrTopologyConflict
+	}
+	if p.transitionReady {
+		if receiptFound {
+			if !receipt.Valid() || receipt.Key != p.transition.Key ||
+				snapshot.Generation() < receipt.CommittedHeadGeneration ||
+				manifest.Version() != receipt.CommittedDistributionVersion {
+				return 0, ErrTopologyConflict
+			}
+			descriptor, found := transitionDescriptor(snapshot, p.request.Group)
+			if !found || gateway.DigestReplicatedShardDescriptor(descriptor) != receipt.CommittedGroupDigest ||
+				gateway.DigestRoute(manifest, p.request.Shard) != receipt.CommittedRouteDigest {
+				return 0, ErrTopologyConflict
+			}
+			switch receipt.Phase {
+			case gateway.TransitionPhasePreRemove:
+				return catalogTargetPreRemove, nil
+			case gateway.TransitionPhasePostRemove, gateway.TransitionPhaseRetired, gateway.TransitionPhaseComplete:
+				return catalogTargetPostRemove, nil
+			default:
+				return 0, ErrTopologyConflict
+			}
+		}
+		if snapshot.Generation() < p.catalogGeneration ||
+			!manifest.Equal(p.sourceManifest) {
+			return 0, ErrTopologyConflict
+		}
+		descriptor, found := transitionDescriptor(snapshot, p.request.Group)
+		if !found || gateway.DigestReplicatedShardDescriptor(descriptor) != p.transition.Key.SourceDescriptorDigest ||
+			gateway.DigestRoute(manifest, p.request.Shard) != p.transition.SourceRouteDigest {
+			return 0, ErrTopologyConflict
+		}
+		return catalogSource, nil
 	}
 	switch snapshot.Generation() {
 	case p.catalogGeneration:
@@ -270,6 +329,15 @@ func (p *Plan) catalogStage(snapshot *gateway.Snapshot) (catalogStage, error) {
 	default:
 		return 0, ErrTopologyConflict
 	}
+}
+
+func transitionDescriptor(snapshot *gateway.Snapshot, group raftmember.GroupKey) (gateway.ReplicatedShardDescriptor, bool) {
+	for _, descriptor := range snapshot.ReplicatedShardDescriptors() {
+		if descriptor.Group == group {
+			return descriptor, true
+		}
+	}
+	return gateway.ReplicatedShardDescriptor{}, false
 }
 
 func (p *Plan) postRemoveCatalogFence(snapshot *gateway.Snapshot, replicaSetVersion uint64) bool {

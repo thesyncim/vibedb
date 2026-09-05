@@ -68,7 +68,13 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 	var measurements replicaProcessMeasurements
 	defer func() {
 		result := "pass"
-		if t.Failed() {
+		if t.Skipped() {
+			// t.Skip invokes runtime.Goexit after running defers. A skipped
+			// durable qualification must never leave a pass-shaped evidence
+			// record behind for CI or an operator to mistake for execution.
+			result = "skip"
+			phase = "skipped"
+		} else if t.Failed() {
 			result = "fail"
 		}
 		raw := fmt.Appendf(nil,

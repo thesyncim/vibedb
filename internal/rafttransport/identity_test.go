@@ -6,6 +6,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -400,6 +401,26 @@ func TestPeerTLSMutualAuthenticationDerivesExactNode(t *testing.T) {
 		client.TrafficClass() != TrafficOrdinary || server.TrafficClass() != TrafficOrdinary {
 		t.Fatalf("derived peers = client %+v/%d server %+v/%d",
 			client.PeerIdentity(), client.TrafficClass(), server.PeerIdentity(), server.TrafficClass())
+	}
+	serverLeaf, err := x509.ParseCertificate(serverTLS.certificate.Certificate[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientLeaf, err := x509.ParseCertificate(clientTLS.certificate.Certificate[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantClientKey := sha256.Sum256(serverLeaf.RawSubjectPublicKeyInfo)
+	wantServerKey := sha256.Sum256(clientLeaf.RawSubjectPublicKeyInfo)
+	if client.PeerKeyDigest() != wantClientKey || server.PeerKeyDigest() != wantServerKey ||
+		client.PeerKeyDigest() == ([sha256.Size]byte{}) || server.PeerKeyDigest() == ([sha256.Size]byte{}) {
+		t.Fatalf("peer key digests = client %x server %x, want client %x server %x",
+			client.PeerKeyDigest(), server.PeerKeyDigest(), wantClientKey, wantServerKey)
+	}
+	if clientTLS.LocalPeerKeyDigest() != wantServerKey ||
+		serverTLS.LocalServiceKeyDigest() != wantClientKey {
+		t.Fatalf("local key profile digests = client %x server %x, want client %x server %x",
+			clientTLS.LocalPeerKeyDigest(), serverTLS.LocalServiceKeyDigest(), wantServerKey, wantClientKey)
 	}
 }
 

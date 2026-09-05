@@ -21,6 +21,7 @@ type distributedMetricsTestConnection struct {
 func (connection *distributedMetricsTestConnection) PeerIdentity() rafttransport.PeerIdentity {
 	return connection.peer
 }
+func (*distributedMetricsTestConnection) PeerKeyDigest() [32]byte { return [32]byte{} }
 func (*distributedMetricsTestConnection) TrafficClass() rafttransport.TrafficClass {
 	return rafttransport.TrafficShardControl
 }

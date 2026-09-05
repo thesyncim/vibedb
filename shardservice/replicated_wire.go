@@ -163,18 +163,22 @@ type ReplicatedFence struct {
 // ReplicatedRequest carries an exact canonical command or asks for a live
 // serving handshake. Command aliases the decoded frame and is capacity-clamped.
 type ReplicatedRequest struct {
-	Operation         ReplicatedOperation
-	Authority         serviceauthz.Authority
-	Capability        serviceauthz.Capability
-	Fence             ReplicatedFence
-	Command           []byte
-	Membership        ReplicatedMembershipRequest
-	Relation          replication.RelationID
-	Key               []byte
-	MinimumApplied    uint64
-	MaxValueBytes     uint32
-	BatchRead         []byte
-	Query             []byte
+	Operation      ReplicatedOperation
+	Authority      serviceauthz.Authority
+	Capability     serviceauthz.Capability
+	Fence          ReplicatedFence
+	Command        []byte
+	Membership     ReplicatedMembershipRequest
+	Relation       replication.RelationID
+	Key            []byte
+	MinimumApplied uint64
+	MaxValueBytes  uint32
+	BatchRead      []byte
+	Query          []byte
+	// Continuation is an outer, connection-bound drain proof. It never
+	// changes the inner command/query bytes and is omitted on the ordinary
+	// Active path.
+	Continuation      *serviceauthz.FrontendContinuationEnvelope
 	TransactionRead   ReplicatedTransactionReadRequest
 	RequestLedgerRead ReplicatedRequestLedgerReadRequest
 	ExecutionPinRead  ReplicatedExecutionPinReadRequest
@@ -316,6 +320,9 @@ func EncodeReplicatedRequest(w io.Writer, request *ReplicatedRequest) error {
 	case ReplicatedExecutionPinRead:
 		encodeReplicatedExecutionPinRead(&e, request.ExecutionPinRead)
 	}
+	if request.Continuation != nil {
+		encodeFrontendContinuation(&e, request.Continuation)
+	}
 	if e.err != nil {
 		return e.err
 	}
@@ -400,6 +407,9 @@ func ReplicatedRequestFrameBytes(request *ReplicatedRequest) (int, error) {
 			return 0, err
 		}
 	}
+	if err := add(frontendContinuationTailBytes(request)); err != nil {
+		return 0, err
+	}
 	return total + 5, nil
 }
 
@@ -483,17 +493,24 @@ func EncodeReplicatedRequestBorrowed(w io.Writer, request *ReplicatedRequest) er
 		encodeReplicatedExecutionPinRead(&e, request.ExecutionPinRead)
 		tag = tagReplicatedExecutionPinRead
 	}
-	if e.err != nil || len(e.b)+len(payload)-5 > maxFrameBody {
+	var continuation encbuf
+	if request.Continuation != nil {
+		encodeFrontendContinuation(&continuation, request.Continuation)
+	}
+	if e.err != nil || len(e.b)+len(payload)+len(continuation.b)-5 > maxFrameBody {
 		return errFrameTooLarge
 	}
 	e.b[0] = tag
-	binary.BigEndian.PutUint32(e.b[1:5], uint32(len(e.b)+len(payload)-1))
+	binary.BigEndian.PutUint32(e.b[1:5], uint32(len(e.b)+len(payload)+len(continuation.b)-1))
 	buffers := net.Buffers{e.b}
 	if len(payload) != 0 {
 		buffers = append(buffers, payload)
 	}
+	if len(continuation.b) != 0 {
+		buffers = append(buffers, continuation.b)
+	}
 	written, err := buffers.WriteTo(w)
-	if err == nil && written != int64(len(e.b)+len(payload)) {
+	if err == nil && written != int64(len(e.b)+len(payload)+len(continuation.b)) {
 		return io.ErrShortWrite
 	}
 	return err
@@ -558,6 +575,13 @@ func decodeReplicatedRequest(
 	case ReplicatedExecutionPinRead:
 		request.ExecutionPinRead = decodeReplicatedExecutionPinRead(&d)
 	}
+	if len(d.b) != 0 {
+		if len(d.b) != continuationEnvelopeBytes {
+			d.fail(ErrInvalidFrontendContinuationEnvelope)
+		} else {
+			request.Continuation = decodeFrontendContinuation(&d)
+		}
+	}
 	if err := d.end(); err != nil {
 		if budget != nil {
 			budget.release(charged)
@@ -595,7 +619,7 @@ func readReplicatedRequestFrame(
 	size := int(length) - 4
 	switch tag {
 	case tagReplicatedMembershipRequest:
-		if size != replicatedMembershipRequestBodyBytes {
+		if !validContinuationBodySize(size, replicatedMembershipRequestBodyBytes) {
 			return nil, 0, tag, ErrReplicatedWire
 		}
 		var prefix [2]byte
@@ -620,7 +644,7 @@ func readReplicatedRequestFrame(
 		}
 		return body, charged, tag, nil
 	case tagReplicatedTransactionRead:
-		if size != replicatedTransactionReadRequestBodyBytes {
+		if !validContinuationBodySize(size, replicatedTransactionReadRequestBodyBytes) {
 			return nil, 0, tag, ErrReplicatedWire
 		}
 		var prefix [2]byte
@@ -645,7 +669,7 @@ func readReplicatedRequestFrame(
 		}
 		return body, charged, tag, nil
 	case tagReplicatedRequestLedgerRead:
-		if size != replicatedRequestLedgerReadRequestBodyBytes {
+		if !validContinuationBodySize(size, replicatedRequestLedgerReadRequestBodyBytes) {
 			return nil, 0, tag, ErrReplicatedWire
 		}
 		var prefix [2]byte
@@ -670,7 +694,7 @@ func readReplicatedRequestFrame(
 		}
 		return body, charged, tag, nil
 	case tagReplicatedRouteGateRead:
-		if size != replicatedRouteGateReadRequestBodyBytes {
+		if !validContinuationBodySize(size, replicatedRouteGateReadRequestBodyBytes) {
 			return nil, 0, tag, ErrReplicatedWire
 		}
 		var prefix [2]byte
@@ -695,7 +719,7 @@ func readReplicatedRequestFrame(
 		}
 		return body, charged, tag, nil
 	case tagReplicatedExecutionPinRead:
-		if size != replicatedExecutionPinReadRequestBodyBytes {
+		if !validContinuationBodySize(size, replicatedExecutionPinReadRequestBodyBytes) {
 			return nil, 0, tag, ErrReplicatedWire
 		}
 		var prefix [2]byte
@@ -741,6 +765,10 @@ func readReplicatedRequestFrame(
 		return nil, 0, tag, err
 	}
 	return body, charged, tag, nil
+}
+
+func validContinuationBodySize(size, base int) bool {
+	return size == base || size == base+continuationEnvelopeBytes
 }
 
 // EncodeReplicatedResponse emits one canonical typed native response.
@@ -1082,6 +1110,16 @@ func validReplicatedFence(fence ReplicatedFence, exact bool) bool {
 func validReplicatedRequest(request *ReplicatedRequest) bool {
 	if request == nil {
 		return false
+	}
+	if request.Continuation != nil {
+		if !request.Continuation.Valid() {
+			return false
+		}
+		scope, ok := FrontendContinuationScopeForReplicatedRequestWithProtocol(request,
+			request.Continuation.Scope.Protocol)
+		if !ok || !sameFrontendContinuationScope(scope, request.Continuation.Scope) {
+			return false
+		}
 	}
 	if request.Operation != ReplicatedQueryLeader && len(request.Query) != 0 {
 		return false

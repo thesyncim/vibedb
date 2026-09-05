@@ -8,13 +8,16 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/thesyncim/vibedb/internal/membershipgrant"
+	"github.com/thesyncim/vibedb/internal/migrationbudget"
 	"github.com/thesyncim/vibedb/internal/multiraft"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/replicacontrol"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/servicemetrics"
@@ -93,6 +96,11 @@ func bootstrapPreparedRF3Groups(
 	if len(pending) == 0 {
 		return servePreparedRF3(parent, combined)
 	}
+	migrationBudget, err := openRF3MigrationBudget(combined)
+	if err != nil {
+		return err
+	}
+	defer migrationBudget.Close()
 	profile, err := servicetls.LoadProfile(combined.TLS.Certificate, combined.TLS.Key,
 		combined.TLS.Roots, combined.TLS.IdentityOID, time.Now)
 	if err != nil {
@@ -145,7 +153,7 @@ func bootstrapPreparedRF3Groups(
 		WriterLockDeadline: time.Now().Add(rf3StartupWriterLockWait)}
 	for _, index := range pending {
 		group, prepareErr := prepareColdRF3Group(bootstrap.withGroup(bootstrap.Groups[index]),
-			members[index], profile, gate, deadline, host, openOptions)
+			members[index], profile, gate, deadline, host, openOptions, migrationBudget)
 		if prepareErr != nil {
 			return prepareErr
 		}
@@ -212,10 +220,59 @@ func bootstrapPreparedRF3Groups(
 	if err != nil {
 		return err
 	}
+	var capacityRevision atomic.Uint64
+	physicalCapacity := uint64(0)
+	for _, index := range pending {
+		configured := int64(members[index].WAL.Options.MaxFileBytes)
+		configured = max(configured, int64(raftstore.DefaultMaxFileBytes))
+		if configured <= 0 {
+			return replicacontrol.ErrCapacityUnavailable
+		}
+		var overflow bool
+		physicalCapacity, overflow = replicacontrol.AddCapacity(physicalCapacity, uint64(configured))
+		if overflow {
+			return replicacontrol.ErrCapacityUnavailable
+		}
+	}
+	capacityDirectory, err := newRF3CapacitySourceDirectory(nil, prepared, nil,
+		func(ctx context.Context, _ replicacontrol.CapacityRequest, samples []replicacontrol.CapacitySourceSample) (replicacontrol.NodeCapacity, error) {
+			if len(samples) == 0 {
+				return replicacontrol.NodeCapacity{}, replicacontrol.ErrCapacityUnavailable
+			}
+			return RF3CapacityNodeFromPhysical(ctx, profile.LocalIdentity().Node,
+				samples[0].Identity.NodeIncarnation, physicalCapacity, migrationBudget, &capacityRevision, samples)
+		})
+	if err != nil {
+		return err
+	}
+	capacityProvider, err := replicacontrol.NewCapacityProvider(capacityDirectory)
+	if err != nil {
+		return err
+	}
+	capacityControl, err := replicacontrol.NewCapacityService(replicacontrol.CapacityServiceOptions{
+		Observer: capacityProvider,
+		Authorize: func(identity rafttransport.PeerIdentity, request replicacontrol.CapacityRequest) bool {
+			if identity.TrustDomain != profile.LocalIdentity().TrustDomain ||
+				policy.Check(identity.Node, serviceauthz.CapabilityTopology) != serviceauthz.DecisionAllow {
+				return false
+			}
+			for _, group := range prepared {
+				if group != nil && group.group == request.Group && group.authority.target.MemberID == request.TargetMember {
+					return true
+				}
+			}
+			return false
+		},
+		ReadDeadline: deadline, WriteDeadline: deadline, MaxConcurrent: min(8, len(prepared)),
+	})
+	if err != nil {
+		return err
+	}
 	controlMux, err := shardcontrol.New(
 		shardcontrol.Route{Discriminator: shardservice.MembershipGrantRequestDiscriminator(), Handler: membershipControl},
 		shardcontrol.Route{Discriminator: servicemetrics.RequestDiscriminator(), Handler: metricsControl},
 		shardcontrol.Route{Discriminator: snapshottransfer.BootstrapRequestDiscriminator(), Handler: bootstrapControl},
+		shardcontrol.Route{Discriminator: replicacontrol.CapacityRequestDiscriminator(), Handler: capacityControl},
 	)
 	if err != nil {
 		return err
@@ -259,7 +316,7 @@ func bootstrapPreparedRF3Groups(
 func prepareColdRF3Group(
 	bootstrap bootstrapRF3Manifest, member rf3Manifest, profile *rafttransport.PeerTLS,
 	gate *serviceauthz.Gate, deadline rafttransport.DeadlineFunc, host *multiraft.Host,
-	openOptions sqldriver.ReplicatedOpenOptions,
+	openOptions sqldriver.ReplicatedOpenOptions, migrationBudget *migrationbudget.Budget,
 ) (_ *preparedColdRF3Group, resultErr error) {
 	if host == nil {
 		return nil, errInvalidBootstrapRF3Manifest
@@ -302,7 +359,8 @@ func prepareColdRF3Group(
 	clear(staticRaw)
 	prepared.repository, err = snapshottransfer.OpenRepository(bootstrap.RepositoryPath,
 		snapshottransfer.Limits{MaxArtifacts: 1, MaxArtifactBytes: bootstrap.MaxArtifactBytes,
-			MaxDiskBytes: bootstrap.MaxArtifactBytes + snapshottransfer.DescriptorBytes + 1<<20})
+			MaxDiskBytes: bootstrap.MaxArtifactBytes + snapshottransfer.DescriptorBytes + 1<<20,
+			Budget:       migrationBudget})
 	if err != nil {
 		return nil, err
 	}
@@ -327,12 +385,13 @@ func prepareColdRF3Group(
 			return (&net.Dialer{}).DialContext(ctx, "tcp", bootstrap.SourceSnapshotAddress)
 		}, HandshakeDeadline: deadline}
 	receiver := &snapshottransfer.Receiver{Repository: prepared.repository, Opener: opener,
+		Budget:       migrationBudget,
 		ReadDeadline: deadline, WriteDeadline: deadline,
-		Workspace: make([]byte, snapshottransfer.AbsoluteMaxChunkBytes)}
+	}
 	prepared.installer = &coldRF3Installer{repository: prepared.repository, cursor: prepared.cursor,
 		database: prepared.database, base: base, apply: applyIdentity, staticBootstrap: staticBootstrap,
 		walPath: member.WAL.Path, walKey: prepared.key, walOptions: member.WAL.Options,
-		host: host, settlement: new(snapshottransfer.LearnerInstallSettlement)}
+		host: host, settlement: new(snapshottransfer.LearnerInstallSettlement), budget: migrationBudget}
 	prepared.service, err = snapshottransfer.NewBootstrapControlService(snapshottransfer.BootstrapControlOptions{
 		Journal: prepared.journal, Receiver: receiver, Installer: prepared.installer, Releaser: prepared.repository,
 		Authorize: func(identity rafttransport.PeerIdentity, request snapshottransfer.BootstrapRequest) bool {
@@ -360,7 +419,8 @@ func combineColdRF3MemberManifests(members []rf3Manifest) (rf3Manifest, error) {
 	for _, member := range members {
 		bundles := member.groupBundles()
 		if len(bundles) != 1 || member.Listeners != combined.Listeners || member.TLS != combined.TLS ||
-			member.AuthorizationPolicy != combined.AuthorizationPolicy || member.DevelopmentOnly != combined.DevelopmentOnly {
+			member.AuthorizationPolicy != combined.AuthorizationPolicy || member.DevelopmentOnly != combined.DevelopmentOnly ||
+			member.ReplicaControl.Migration != combined.ReplicaControl.Migration {
 			return rf3Manifest{}, errInvalidBootstrapRF3Manifest
 		}
 		combined.Groups = append(combined.Groups, bundles[0])

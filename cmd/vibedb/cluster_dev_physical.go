@@ -158,8 +158,9 @@ func initializeDevPhysicalCluster(options devClusterOptions, manifestPath string
 		}
 	}
 	identities := append(append(append([]rafttransport.NodeID{}, storageNodes...), gatewayNodes...), clientNode)
-	credentials, roots, err := writeDevCredentials(options.root,
-		rafttransport.TrustDomain{ClusterID: clusterID, ClusterIncarnation: clusterIncarnation}, identities)
+	credentials, roots, err := writeDevCredentialsWithCA(options.root,
+		rafttransport.TrustDomain{ClusterID: clusterID, ClusterIncarnation: clusterIncarnation}, identities,
+		options.tlsCACertificate, options.tlsCAKey)
 	if err != nil {
 		return devClusterManifest{}, err
 	}

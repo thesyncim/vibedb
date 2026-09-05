@@ -24,6 +24,7 @@ type splitArtifactPeerConnection struct {
 func (connection *splitArtifactPeerConnection) PeerIdentity() rafttransport.PeerIdentity {
 	return connection.identity
 }
+func (*splitArtifactPeerConnection) PeerKeyDigest() [32]byte { return [32]byte{} }
 func (*splitArtifactPeerConnection) TrafficClass() rafttransport.TrafficClass {
 	return rafttransport.TrafficSnapshot
 }

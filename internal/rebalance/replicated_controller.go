@@ -73,7 +73,11 @@ type ReplicatedMoveExecution struct {
 	PublicationReplicaSet uint64
 	LeaderTerm            uint64
 	SnapshotBaseDigest    [32]byte
-	Proof                 [32]byte
+	// TransitionReceiptDigest is the predecessor receipt observed immediately
+	// before a receipt-aware publication. It is zero only for the first
+	// publication of an operation.
+	TransitionReceiptDigest [32]byte
+	Proof                   [32]byte
 }
 
 // OpenReplicatedMoveExecution verifies the already-journaled execution cut.
@@ -445,6 +449,11 @@ func replicaMoveExecution(
 	}
 	if plan != nil && plan.baseBound {
 		execution.SnapshotBaseDigest = plan.baseDigest
+	}
+	if cut.TransitionReceiptFound {
+		if digest, err := cut.TransitionReceipt.ReceiptDigest(); err == nil {
+			execution.TransitionReceiptDigest = digest
+		}
 	}
 	return execution
 }

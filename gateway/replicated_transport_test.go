@@ -107,6 +107,7 @@ func TestReplicatedCapabilityControlReserveClassification(t *testing.T) {
 func (connection *testAuthenticatedConnection) PeerIdentity() rafttransport.PeerIdentity {
 	return connection.identity
 }
+func (*testAuthenticatedConnection) PeerKeyDigest() [32]byte { return [32]byte{} }
 func (*testAuthenticatedConnection) TrafficClass() rafttransport.TrafficClass {
 	return rafttransport.TrafficShardNative
 }

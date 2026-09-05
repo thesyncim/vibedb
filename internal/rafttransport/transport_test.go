@@ -3,6 +3,7 @@ package rafttransport
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -992,6 +993,9 @@ func newTransportTestConnection(
 
 func (connection *transportTestConnection) PeerIdentity() PeerIdentity {
 	return connection.identity
+}
+func (connection *transportTestConnection) PeerKeyDigest() [sha256.Size]byte {
+	return [sha256.Size]byte{}
 }
 func (connection *transportTestConnection) TrafficClass() TrafficClass {
 	return connection.class

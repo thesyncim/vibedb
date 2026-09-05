@@ -46,6 +46,7 @@ var buildgateBeforeMutationImagesAndPostimages = Profile{
 	},
 }
 
+
 func TestGeneratedManifestMatchesCurrentLedgerSemantics(t *testing.T) {
 	semantics := requestledger.SemanticsDigest()
 	if [32]byte(semantics) != generatedRequestLedgerSemantics {
@@ -132,6 +133,7 @@ func TestBuildBeforeMutationImagesAndPostimagesIsIncompatibleBeforeAdmission(t *
 		t.Fatalf("legacy/current disk compatibility = %v, want ErrDiskGrammar", err)
 	}
 }
+
 
 func FuzzCanonicalManifestDerivation(f *testing.F) {
 	raw, err := os.ReadFile(filepath.Join("manifest", "current.txt"))

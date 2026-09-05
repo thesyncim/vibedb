@@ -24,7 +24,7 @@ const (
 )
 
 var ErrReplicatedCatalogRouteRestartRequired = errors.New(
-	"gateway: certified catalog route changed; restart required",
+	"gateway: certified catalog route rollover required",
 )
 
 type replicatedCatalogRouteSeedTracker struct {
@@ -39,17 +39,19 @@ type replicatedCatalogRouteSeedTracker struct {
 }
 
 // ReplicatedCatalogRouteSeedControl couples continuous certified catalog reads
-// to one local route seed. ShutdownRequired closes before a binding-changing
-// head can be used for further topology work. The owner must quiesce every
-// authority user, then call CompleteQuiescedHandoff before process restart.
+// to one local route seed. Route changes are durable live rollovers. The
+// shutdown channel is reserved for local seed corruption or durability
+// uncertainty; callers must quiesce and call CompleteQuiescedHandoff only for
+// that terminal case.
 type ReplicatedCatalogRouteSeedControl struct {
 	authority *ReplicatedCatalogAuthority
 	tracker   *replicatedCatalogRouteSeedTracker
 }
 
 // InstallReplicatedCatalogRouteSeed continuously persists certified catalog
-// heads. Byte-identical current heads do no disk I/O; same-route newer heads are
-// promoted live, while a self-route change is staged and seals the authority.
+// heads. Byte-identical current heads do no disk I/O. A reachability-only
+// change is promoted directly; a command-fence change is staged until the
+// authority's durable predecessor/new-session handoff completes.
 func (authority *ReplicatedCatalogAuthority) InstallReplicatedCatalogRouteSeed(
 	ctx context.Context,
 	path string,
@@ -96,8 +98,10 @@ func (authority *ReplicatedCatalogAuthority) InstallReplicatedCatalogRouteSeed(
 	return control, nil
 }
 
-// ShutdownRequired closes exactly once when continued service could use a
-// stale catalog route or when local certified-seed durability is uncertain.
+// ShutdownRequired closes exactly once when local certified-seed durability is
+// uncertain. A normal catalog membership/route rollover never closes it;
+// foreground traffic remains admitted while the session follows the new
+// certified route.
 func (control *ReplicatedCatalogRouteSeedControl) ShutdownRequired() <-chan struct{} {
 	if control == nil || control.tracker == nil {
 		return nil
@@ -244,13 +248,115 @@ func (tracker *replicatedCatalogRouteSeedTracker) observe(
 	if !ok {
 		return tracker.terminateLocked(ErrReplicatedCatalogMissing)
 	}
-	if !sameReplicatedCatalogRoute(receipt.authority.route, nextRoute) {
-		return tracker.terminateLocked(ErrReplicatedCatalogRouteRestartRequired)
+	previousRoute := receipt.authority.route
+	if tracker.activeExists {
+		var previousReplicas [ServingReplicaCount]ReplicatedEndpoint
+		if activeRoute, activeOK := tracker.active.ResolveReplicatedRoute(
+			ReplicatedCatalogDistribution, ReplicatedCatalogShard, previousReplicas[:0],
+		); !activeOK {
+			return tracker.terminateLocked(ErrReplicatedCatalogConflict)
+		} else {
+			previousRoute = activeRoute
+		}
+	}
+	if !catalogRouteRolloverCompatible(previousRoute, nextRoute) ||
+		!catalogCommandProgression(previousRoute.Command, nextRoute.Command) {
+		return tracker.terminateLocked(ErrReplicatedCatalogConflict)
+	}
+	if sameReplicatedCatalogRoute(previousRoute, nextRoute) {
+		if err = state.PromotePending(); err != nil {
+			return tracker.terminateLocked(err)
+		}
+		if err = tracker.updateSessionReachabilityLocked(receipt.authority, nextRoute); err != nil {
+			return tracker.terminateLocked(err)
+		}
+		tracker.active, tracker.activeExists = pending, true
+		return nil
+	}
+	// A physical endpoint reorder with an identical apply-visible command does
+	// not change the NativeSessionJournalBinding. It is safe to advance the
+	// reachability seed directly; only command-fence changes require the
+	// predecessor/new-journal handoff below.
+	if previousRoute.Command == nextRoute.Command {
+		if err = state.PromotePending(); err != nil {
+			return tracker.terminateLocked(err)
+		}
+		if err = tracker.updateSessionReachabilityLocked(receipt.authority, nextRoute); err != nil {
+			return tracker.terminateLocked(err)
+		}
+		tracker.active, tracker.activeExists = pending, true
+		return nil
+	}
+	// A changed route is staged but not promoted until the owning catalog
+	// session has completed its durable old-binding handoff. This keeps the
+	// active seed, session journal, and authority route coherent across a crash;
+	// the authority callback settles the old exact journal and then calls the
+	// proof-bearing promotion below.
+	return ErrReplicatedCatalogRouteRestartRequired
+}
+
+func (tracker *replicatedCatalogRouteSeedTracker) promotePending(
+	receipt ReplicatedCatalogSeedReceipt,
+) error {
+	if tracker == nil || receipt.snapshot == nil {
+		return ErrReplicatedCatalog
+	}
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	if tracker.terminal.Load() || receipt.authority == nil ||
+		receipt.authority.routeSeed.Load() != tracker {
+		return ErrReplicatedCatalogRouteRestartRequired
+	}
+	state, err := LoadReplicatedCatalogRouteSeed(tracker.path)
+	if err != nil {
+		return tracker.terminateLocked(err)
+	}
+	pending, found := state.Pending()
+	if !found || pending == nil {
+		return tracker.terminateLocked(ErrReplicatedCatalogConflict)
+	}
+	equal, err := equalCatalogSnapshots(pending, receipt.snapshot)
+	if err != nil || !equal {
+		return tracker.terminateLocked(errors.Join(err, ErrReplicatedCatalogConflict))
 	}
 	if err = state.PromotePending(); err != nil {
 		return tracker.terminateLocked(err)
 	}
 	tracker.active, tracker.activeExists = pending, true
+	return nil
+}
+
+// catalogRouteRolloverCompatible keeps the durable session bound to the same
+// catalog authority while allowing its placement fence and physical voter
+// addresses to advance. The group/range identity is authority; command
+// placement fields and replicas are the values that rollover is meant to
+// change.
+func catalogRouteRolloverCompatible(left, right ReplicatedRoute) bool {
+	return catalogBootstrapRoute(left) && catalogBootstrapRoute(right) &&
+		left.Group == right.Group && left.AllocationGeneration == right.AllocationGeneration &&
+		left.RangeIdentity == right.RangeIdentity &&
+		left.LineageDigest == right.LineageDigest &&
+		left.ForwardingRuleDigest == right.ForwardingRuleDigest &&
+		len(right.Replicas) == ServingReplicaCount
+}
+
+// updateSessionReachabilityLocked follows a route whose apply-visible command
+// is unchanged. NativeSessionJournalBinding intentionally excludes physical
+// addresses, so changing only this immutable reachability coordinate does not
+// require a new journal. The caller is observeCatalogReceiptLocked, which owns
+// authority.mu; keeping this mutation there prevents a rollover callback from
+// observing a holder cut that still carries predecessor addresses.
+func (tracker *replicatedCatalogRouteSeedTracker) updateSessionReachabilityLocked(
+	authority *ReplicatedCatalogAuthority, nextRoute ReplicatedRoute,
+) error {
+	if tracker == nil || authority == nil || authority.session == nil ||
+		!catalogBootstrapRoute(nextRoute) || authority.session.route.Command != nextRoute.Command ||
+		authority.session.route.Group != nextRoute.Group ||
+		authority.session.route.AllocationGeneration != nextRoute.AllocationGeneration {
+		return ErrReplicatedCatalogConflict
+	}
+	authority.session.route = nextRoute
+	authority.session.route.Replicas = append([]ReplicatedEndpoint(nil), nextRoute.Replicas...)
 	return nil
 }
 
@@ -276,8 +382,11 @@ func (tracker *replicatedCatalogRouteSeedTracker) fail(err error) error {
 }
 
 func (authority *ReplicatedCatalogAuthority) observePublishedCatalog(
-	snapshot *Snapshot,
+	ctx context.Context, snapshot *Snapshot,
 ) error {
+	if ctx == nil {
+		return ErrReplicatedCatalog
+	}
 	tracker := authority.routeSeed.Load()
 	if tracker == nil {
 		return nil
@@ -300,10 +409,95 @@ func (authority *ReplicatedCatalogAuthority) observePublishedCatalog(
 	if err != nil {
 		return tracker.fail(err)
 	}
-	return tracker.observe(ReplicatedCatalogSeedReceipt{
+	return authority.observeCatalogReceiptLocked(ctx, ReplicatedCatalogSeedReceipt{
 		authority: authority, snapshot: certified, canonical: canonical,
 		headBytes: uint64(len(head)), headDigest: sha256.Sum256(head),
 	})
+}
+
+func (authority *ReplicatedCatalogAuthority) observeCatalogReceiptLocked(
+	ctx context.Context, receipt ReplicatedCatalogSeedReceipt,
+) error {
+	if authority == nil || ctx == nil || receipt.snapshot == nil {
+		return ErrReplicatedCatalog
+	}
+	tracker := authority.routeSeed.Load()
+	if tracker == nil {
+		return nil
+	}
+	err := tracker.observe(receipt)
+	if !errors.Is(err, ErrReplicatedCatalogRouteRestartRequired) {
+		return err
+	}
+	if authority.rollover == nil {
+		return err
+	}
+	// Serialize callbacks independently of catalog publication. The tracker
+	// retains the pending candidate while the old journal is being settled.
+	authority.rolloverMu.Lock()
+	defer authority.rolloverMu.Unlock()
+	var oldRoute ReplicatedRoute
+	if authority.session != nil {
+		oldRoute = authority.session.route
+	} else {
+		oldRoute = authority.route
+	}
+	var scratch [ServingReplicaCount]ReplicatedEndpoint
+	nextRoute, ok := receipt.snapshot.ResolveReplicatedRoute(
+		ReplicatedCatalogDistribution, ReplicatedCatalogShard, scratch[:0],
+	)
+	if !ok || !catalogRouteRolloverCompatible(oldRoute, nextRoute) ||
+		!catalogCommandProgression(oldRoute.Command, nextRoute.Command) {
+		return errors.Join(err, ErrReplicatedCatalogConflict)
+	}
+	authorizedCtx, authorizeErr := authority.authorizedContext(ctx)
+	if authorizeErr != nil {
+		return authorizeErr
+	}
+	rollover, rolloverErr := authority.rollover(authorizedCtx, oldRoute, nextRoute, receipt.snapshot)
+	if rolloverErr != nil {
+		return rolloverErr
+	}
+	nextSession := rollover.Session
+	if authority.session == nil || nextSession == nil || nextSession.executor != authority.executor ||
+		nextSession.phase != nativeSessionActive || nextSession.pending ||
+		!nextSession.catalogControl ||
+		nextSession.proposalCapability != serviceauthz.CapabilityTopology ||
+		nativeSessionBaseRelation(nextSession) != nativeSessionBaseRelation(authority.session) ||
+		!bytes.Equal(nextSession.tenant, authority.session.tenant) ||
+		!sameReplicatedCatalogRoute(nextSession.route, nextRoute) {
+		return errors.Join(err, ErrNativeSession)
+	}
+	if nextSession.catalogBootstrap == nil || authority.session == nil ||
+		nextSession.clientID != authority.session.clientID ||
+		nextSession.retryHome != authority.session.retryHome {
+		return errors.Join(err, ErrNativeSession)
+	}
+	bootstrapEqual, bootstrapErr := equalCatalogSnapshots(
+		nextSession.catalogBootstrap, receipt.snapshot,
+	)
+	if bootstrapErr != nil || !bootstrapEqual {
+		return errors.Join(bootstrapErr, ErrNativeSession)
+	}
+	binding, bindingErr := NativeSessionJournalBinding(
+		nextRoute, nextSession.distribution, nextSession.shard, nextSession.tenant,
+		nativeSessionBaseRelation(nextSession), nextSession.proposalCapability,
+	)
+	if bindingErr != nil || nextSession.journal == nil || nextSession.journal.binding != binding {
+		return errors.Join(bindingErr, ErrNativeSession)
+	}
+	nextSession.catalogControl = true
+	nextSession.catalogHolder = authority.holder
+	authority.session = nextSession
+	if promoteErr := tracker.promotePending(receipt); promoteErr != nil {
+		return promoteErr
+	}
+	if rollover.Complete != nil {
+		if completeErr := rollover.Complete(); completeErr != nil {
+			return tracker.fail(completeErr)
+		}
+	}
+	return nil
 }
 
 type persistedReplicatedCatalogRouteSeedCandidate struct {

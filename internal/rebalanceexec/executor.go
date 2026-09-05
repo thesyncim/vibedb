@@ -374,6 +374,9 @@ func (executor *Executor) executeCatalog(
 		cut.Command.OwnershipEpoch == 0 || !cut.Command.Valid() {
 		return errors.Join(err, ErrExecutionFence)
 	}
+	if plan.TransitionRequired(cut.Catalog) {
+		return executor.executeReceiptPublication(ctx, operation, plan, execution, cut, gateway.TransitionPhasePreRemove)
+	}
 	target := gateway.ReplicatedReplicaDescriptor{
 		Member: cut.Target.Member, Node: cut.Target.Node, StoreID: cut.Target.StoreID,
 		NodeIncarnation: cut.Target.NodeIncarnation,
@@ -422,11 +425,13 @@ func (executor *Executor) executeCatalogRefresh(
 	}
 	cut, err := executor.resolve(ctx, operation, plan, execution)
 	if err != nil || cut.Catalog == nil ||
-		cut.Catalog.Generation() != plan.NextCatalogGeneration() ||
 		cut.Command.ReplicaSetVersion != execution.Action.ReplicaSetVersion ||
 		cut.Command.ReplicaSetVersion != execution.PublicationReplicaSet ||
 		!cut.Command.Valid() {
 		return errors.Join(err, ErrExecutionFence)
+	}
+	if plan.TransitionRequired(cut.Catalog) {
+		return executor.executeReceiptPublication(ctx, operation, plan, execution, cut, gateway.TransitionPhasePostRemove)
 	}
 	next, err := gateway.BuildReplicaReplacementPostRemoveTransition(
 		cut.Catalog, plan.PostRemoveCatalogGeneration(), grant,
@@ -452,6 +457,70 @@ func (executor *Executor) executeCatalogRefresh(
 		return errors.Join(err, ErrExecutionFence)
 	}
 	return nil
+}
+
+func (executor *Executor) executeReceiptPublication(
+	ctx context.Context,
+	operation rebalance.OperationID,
+	plan *rebalance.Plan,
+	execution rebalance.ReplicatedMoveExecution,
+	cut MoveRoute,
+	phase gateway.TransitionPhase,
+) error {
+	publisher, ok := executor.options.Catalog.(gateway.GroupTransitionPublisher)
+	if !ok {
+		return ErrExecutionFence
+	}
+	owner, ok := executor.options.Catalog.(gateway.DistributionTransitionOwner)
+	if !ok {
+		return ErrExecutionFence
+	}
+	intent, ok := plan.TransitionIntent()
+	if !ok || intent.Key.OperationID != [32]byte(operation) {
+		return ErrExecutionFence
+	}
+	lease, err := owner.AcquireDistributionTransition(ctx, intent.Key)
+	if err != nil || !lease.Valid() || lease.Distribution != intent.Key.Distribution || lease.OperationID != intent.Key.OperationID {
+		return errors.Join(err, ErrExecutionFence)
+	}
+	target := gateway.ReplicatedReplicaDescriptor{
+		Member: cut.Target.Member, Node: cut.Target.Node, StoreID: cut.Target.StoreID,
+		NodeIncarnation: cut.Target.NodeIncarnation,
+		Endpoint:        distribution.EndpointID(cut.Target.Endpoint),
+		NativeEndpoint:  distribution.EndpointID(cut.Target.NativeEndpoint),
+		ControlEndpoint: distribution.EndpointID(cut.Target.ControlEndpoint),
+	}
+	if !target.ValidForTransition() {
+		return ErrExecutionFence
+	}
+	next, err := plan.CatalogSnapshotAtHead(cut.Catalog, phase, target, cut.Command)
+	if err != nil {
+		return errors.Join(err, ErrExecutionFence)
+	}
+	receipt, err := publisher.PublishGroupTransition(ctx, lease, intent, phase, next, execution.TransitionReceiptDigest)
+	if err != nil {
+		return err
+	}
+	if !receipt.Valid() || receipt.Key != intent.Key || receipt.Phase != phase ||
+		receipt.CommittedHeadGeneration != next.Generation() ||
+		receipt.CommittedDistributionVersion != intent.TargetDistributionVersion {
+		return ErrExecutionFence
+	}
+	descriptor, found := transitionDescriptor(next, intent.Key.Group)
+	if !found || receipt.CommittedGroupDigest != gateway.DigestReplicatedShardDescriptor(descriptor) ||
+		receipt.CommittedRouteDigest != gateway.DigestRouteFor(next, intent.Key.Distribution, intent.Key.Shard) {
+		return ErrExecutionFence
+	}
+	return nil
+}
+
+func transitionDescriptor(snapshot *gateway.Snapshot, group raftmember.GroupKey) (gateway.ReplicatedShardDescriptor, bool) {
+	for _, descriptor := range snapshot.ReplicatedShardDescriptors() {
+		if descriptor.Group == group {
+			return descriptor, true
+		}
+	}
+	return gateway.ReplicatedShardDescriptor{}, false
 }
 
 func (executor *Executor) executeRetirement(
@@ -507,6 +576,35 @@ func (executor *Executor) executeRetirement(
 	_, stillPresent, err := executor.options.Grants.ReadMembershipGrant(ctx, plan.Group())
 	if err != nil || stillPresent {
 		return errors.Join(err, ErrExecutionFence)
+	}
+	if plan.TransitionRequired(cut.Catalog) {
+		if err = executor.releaseReceiptOwner(ctx, plan); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (executor *Executor) releaseReceiptOwner(ctx context.Context, plan *rebalance.Plan) error {
+	owner, ownerOK := executor.options.Catalog.(gateway.DistributionTransitionOwner)
+	reader, readerOK := executor.options.Catalog.(gateway.GroupTransitionReceiptReader)
+	if !ownerOK || !readerOK {
+		return ErrExecutionFence
+	}
+	key, ok := plan.TransitionKey()
+	if !ok {
+		return ErrExecutionFence
+	}
+	receipt, found, err := reader.ReadGroupPublicationReceipt(ctx, key)
+	if err != nil || !found || !receipt.Valid() || receipt.Key != key {
+		return errors.Join(err, ErrExecutionFence)
+	}
+	lease, err := owner.AcquireDistributionTransition(ctx, key)
+	if err != nil || !lease.Valid() {
+		return errors.Join(err, ErrExecutionFence)
+	}
+	if err = owner.ReleaseDistributionTransition(ctx, lease, receipt); err != nil {
+		return err
 	}
 	return nil
 }

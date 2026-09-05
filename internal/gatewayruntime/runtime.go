@@ -14,6 +14,7 @@ import (
 
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/clusterbackup"
+	"github.com/thesyncim/vibedb/internal/nodecontrol"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/rebalanceexec"
 	"github.com/thesyncim/vibedb/internal/replication"
@@ -73,7 +74,13 @@ type Config struct {
 	// When Transport is nil, Open creates and owns the standalone authenticated
 	// network pool from TLSProfile and ShardPeers.
 	Transport SemanticTransport
-	ShardDial gateway.DialFunc
+	// RequireServiceDirectoryBinding is set by an embedded production frontend
+	// whose transport owns a local native receiver. Such a frontend must expose
+	// BindServiceDirectoryGate; silently accepting a transport without that
+	// seam would leave local calls on the static delegate policy after the
+	// catalog cut has been installed.
+	RequireServiceDirectoryBinding bool
+	ShardDial                      gateway.DialFunc
 
 	ListenAddress string
 	Listener      net.Listener
@@ -115,11 +122,38 @@ type Config struct {
 	HotShardCapacityPath       string
 	HotShardInterval           time.Duration
 	ReplicaControlManifestPath string
+	// ControlDirectory is the authenticated catalog directory reader used to
+	// refresh shard-control and gateway-drain endpoints while this frontend is
+	// serving. A complete revision cut is required; historical identities are
+	// retained by the runtime until their immutable drain fences settle.
+	ControlDirectory gateway.DirectoryReader
+	// InitialNodeDirectory is the trusted prepared-node cut used only when the
+	// replicated authority has no physical-node directory yet. Callers must
+	// provide the complete original cut, including authenticated service-key
+	// pins, endpoint identities, capacity geometry, and gateway session
+	// identities. The runtime never derives or fills any of these fields from a
+	// route, manifest, or TLS policy, and it never uses this field to append a
+	// node to an existing directory.
+	InitialNodeDirectory []gateway.NodeRecord
+	// FrontendDrainIdentity binds admission-drain acknowledgements to the
+	// catalog gateway participant and its physical-node incarnation. A
+	// supervisor restoring a durable NodeDraining record should provide this
+	// identity; Open also discovers the lifecycle from ControlDirectory when
+	// one is available.
+	FrontendDrainIdentity    FrontendDrainIdentity
+	FrontendAdmissionDrained bool
 	// ControlParticipantOnly serves authenticated catalog drain requests for
 	// this admitting frontend without starting autonomous topology controllers.
 	// Every manifest must list the full roster of admitting gateway principals;
 	// only the designated controller frontend leaves this false.
 	ControlParticipantOnly bool
+	// ScalingProvisioner and ScalingEnrollment are the authenticated physical
+	// target and public preparation-spec adapters. They are supplied by the
+	// node-control/bootstrap owner; a missing adapter leaves a durable operator
+	// blocker and never activates a learner from a guessed manifest.
+	ScalingProvisioner     gateway.NodeProvisioner
+	ScalingReadiness       ScalingNodeReadiness
+	ScalingEnrollment      ScalingEnrollmentBuilder
 	BackupRepositoryPath   string
 	BackupMaxBackups       int
 	BackupMaxArtifacts     int
@@ -151,6 +185,7 @@ type Runtime struct {
 	clientTLS   *gateway.ClientTLS
 	shardTLS    *servicetls.Client
 	listener    net.Listener
+	frontend    *frontendAdmission
 	journalLock *os.File
 
 	routeSeedControl *gateway.ReplicatedCatalogRouteSeedControl
@@ -162,10 +197,18 @@ type Runtime struct {
 	ddlForwardOwner  *gatewayDDLForwardOwner
 
 	replicaControlManifest        *gatewayReplicaControlManifest
+	controlDirectory              *gateway.ReplicatedControlDirectory
+	serviceDirectory              *serviceauthz.ServiceDirectoryGate
 	controlListener               net.Listener
 	controlTLS                    *servicetls.Server
+	controlAuthorizer             *servicetls.NodeAuthorizer
 	controlService                *gateway.ClusterCatalogDrainControlService
+	bootstrapReadService          *nodecontrol.BootstrapReadService
 	controlOpener                 *gatewayShardControlOpener
+	clusterControlOpener          *gatewayClusterControlOpener
+	drainCoordinator              *gateway.ClusterCatalogDrainCoordinator
+	controlRosterMu               sync.RWMutex
+	controlRoster                 map[rafttransport.NodeID]map[uint64]struct{}
 	controlReadDeadline           rafttransport.DeadlineFunc
 	controlWriteDeadline          rafttransport.DeadlineFunc
 	controlHandshakeDeadline      rafttransport.DeadlineFunc
@@ -175,6 +218,7 @@ type Runtime struct {
 	hotShardDone                  <-chan struct{}
 	metricsDone                   <-chan struct{}
 	routeSeedDone                 <-chan struct{}
+	controlDirectoryDone          chan struct{}
 	splitRuntime                  *gatewayServingSplitRuntime
 	hotShardRuntime               *gatewayHotShardRuntime
 	backupOperator                gatewayBackupOperator
@@ -187,6 +231,9 @@ type Runtime struct {
 	healthController              *gatewayReplicaHealthController
 	healthRevisions               *gatewayReplicaHealthRevisionController
 	moveController                *rebalanceexec.Controller
+	scalingController             *ScalingController
+	clusterControlBackend         *ScalingOperatorBackend
+	scalingDone                   <-chan struct{}
 	servingContext                context.Context
 
 	ctx    context.Context
@@ -228,6 +275,8 @@ func Open(parent context.Context, config Config) (*Runtime, error) {
 	}
 	runtimeCtx, cancel := context.WithCancel(parent)
 	runtime := &Runtime{config: config, ctx: runtimeCtx, cancel: cancel,
+		frontend: newFrontendAdmission(config.FrontendDrainIdentity,
+			config.FrontendAdmissionDrained, config.PGListenAddress != ""),
 		ready: make(chan struct{}), serveDone: make(chan struct{}), drainDone: make(chan struct{})}
 	if runtime.config.Logf == nil {
 		runtime.config.Logf = func(format string, args ...any) {

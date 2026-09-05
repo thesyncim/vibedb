@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 )
 
 var (
@@ -28,10 +29,13 @@ const (
 	AbsoluteMaxIdentities  = 65536
 )
 
-// NodeAuthorizer is an immutable, compact allowlist of exact certificate Node
-// identities. Sorting makes lookup allocation-free and avoids a hash table's
-// per-entry space overhead. The trust domain is already verified by PeerTLS.
+// NodeAuthorizer is a compact allowlist of exact certificate Node identities.
+// Sorting makes lookup allocation-free and avoids a hash table's per-entry
+// space overhead. Updates replace or merge one complete directory under a
+// short lock; existing authenticated streams are never revoked by a
+// directory update. The trust domain is already verified by PeerTLS.
 type NodeAuthorizer struct {
+	mu    sync.RWMutex
 	nodes []rafttransport.NodeID
 }
 
@@ -62,8 +66,114 @@ func (authorizer *NodeAuthorizer) allows(identity rafttransport.PeerIdentity) bo
 	if authorizer == nil {
 		return false
 	}
+	authorizer.mu.RLock()
+	defer authorizer.mu.RUnlock()
 	_, found := slices.BinarySearchFunc(authorizer.nodes, identity.Node, compareNode)
 	return found
+}
+
+// Nodes returns a detached, sorted copy of the currently admitted identities.
+// It is a point-in-time directory cut and is safe to use while Serve admits
+// new streams.
+func (authorizer *NodeAuthorizer) Nodes() []rafttransport.NodeID {
+	if authorizer == nil {
+		return nil
+	}
+	authorizer.mu.RLock()
+	defer authorizer.mu.RUnlock()
+	return slices.Clone(authorizer.nodes)
+}
+
+// Update replaces the complete allowlist at one directory revision. The
+// revision is checked by the caller's directory authority; this primitive is
+// deliberately revision agnostic so it can also serve tests and local
+// certificate rotation. Existing streams continue until their handler
+// returns.
+func (authorizer *NodeAuthorizer) Update(nodes []rafttransport.NodeID) error {
+	if authorizer == nil || len(nodes) == 0 || len(nodes) > AbsoluteMaxIdentities {
+		return ErrInvalidProfile
+	}
+	owned := slices.Clone(nodes)
+	for _, node := range owned {
+		if node == (rafttransport.NodeID{}) {
+			return ErrInvalidProfile
+		}
+	}
+	slices.SortFunc(owned, compareNode)
+	for index := 1; index < len(owned); index++ {
+		if owned[index] == owned[index-1] {
+			return ErrInvalidProfile
+		}
+	}
+	authorizer.mu.Lock()
+	authorizer.nodes = owned
+	authorizer.mu.Unlock()
+	return nil
+}
+
+// Replace publishes the current directory allowlist and permits an empty
+// cut. An empty cut rejects new TLS admissions while already authenticated
+// streams continue under their captured generation; this is required when the
+// last current gateway leaves but an older drain fence is still settling.
+func (authorizer *NodeAuthorizer) Replace(nodes []rafttransport.NodeID) error {
+	if authorizer == nil || len(nodes) > AbsoluteMaxIdentities {
+		return ErrInvalidProfile
+	}
+	owned := slices.Clone(nodes)
+	for _, node := range owned {
+		if node == (rafttransport.NodeID{}) {
+			return ErrInvalidProfile
+		}
+	}
+	slices.SortFunc(owned, compareNode)
+	for index := 1; index < len(owned); index++ {
+		if owned[index] == owned[index-1] {
+			return ErrInvalidProfile
+		}
+	}
+	authorizer.mu.Lock()
+	authorizer.nodes = owned
+	authorizer.mu.Unlock()
+	return nil
+}
+
+// Merge adds identities from a newer authenticated directory while retaining
+// the prior cut. Retention is required for an in-flight catalog drain whose
+// immutable fence still names a departing participant; callers may use Update
+// after all such fences have settled.
+func (authorizer *NodeAuthorizer) Merge(nodes []rafttransport.NodeID) error {
+	if authorizer == nil || len(nodes) == 0 || len(nodes) > AbsoluteMaxIdentities {
+		return ErrInvalidProfile
+	}
+	owned := slices.Clone(nodes)
+	for _, node := range owned {
+		if node == (rafttransport.NodeID{}) {
+			return ErrInvalidProfile
+		}
+	}
+	slices.SortFunc(owned, compareNode)
+	for index := 1; index < len(owned); index++ {
+		if owned[index] == owned[index-1] {
+			return ErrInvalidProfile
+		}
+	}
+	authorizer.mu.Lock()
+	defer authorizer.mu.Unlock()
+	if len(authorizer.nodes) > AbsoluteMaxIdentities-len(owned) {
+		return ErrBound
+	}
+	merged := make([]rafttransport.NodeID, 0, len(authorizer.nodes)+len(owned))
+	merged = append(merged, authorizer.nodes...)
+	merged = append(merged, owned...)
+	slices.SortFunc(merged, compareNode)
+	unique := merged[:0]
+	for _, node := range merged {
+		if len(unique) == 0 || unique[len(unique)-1] != node {
+			unique = append(unique, node)
+		}
+	}
+	authorizer.nodes = unique
+	return nil
 }
 
 // Limits bound accepted sockets before a goroutine or TLS handshake can be
@@ -109,8 +219,13 @@ type Server struct {
 	tls        *rafttransport.PeerTLS
 	class      rafttransport.TrafficClass
 	authorizer *NodeAuthorizer
-	generation uint64
-	active     map[*trackedConnection]struct{}
+	// peerAuthorizer is an optional second, certificate-bound admission gate.
+	// NodeAuthorizer remains the coarse bounded TLS roster; this callback can
+	// compare the verified leaf key and lifecycle against a live committed
+	// directory without putting protocol fields into TLS policy.
+	peerAuthorizer func(rafttransport.PeerConnection) bool
+	generation     uint64
+	active         map[*trackedConnection]struct{}
 
 	authenticated atomic.Uint64
 	authRejected  atomic.Uint64
@@ -145,13 +260,39 @@ func (server *Server) snapshot() (*rafttransport.PeerTLS, *NodeAuthorizer, uint6
 	return server.tls, server.authorizer, server.generation, nil
 }
 
+// BindPeerAuthorizer installs the live certificate-binding fence used by a
+// production service directory. It is separate from Rotate because rotating
+// TLS credentials and publishing a catalog directory are independent durable
+// revisions; both are checked at admission.
+func (server *Server) BindPeerAuthorizer(authorize func(rafttransport.PeerConnection) bool) error {
+	if server == nil || authorize == nil {
+		return ErrInvalidProfile
+	}
+	server.mu.Lock()
+	server.peerAuthorizer = authorize
+	server.mu.Unlock()
+	return nil
+}
+
 func (server *Server) admit(connection rafttransport.PeerConnection, authorizer *NodeAuthorizer, generation uint64) (*trackedConnection, error) {
 	if connection == nil || connection.TrafficClass() != server.class || !authorizer.allows(connection.PeerIdentity()) {
+		return nil, ErrUnauthorized
+	}
+	server.mu.Lock()
+	if generation != server.generation || authorizer != server.authorizer {
+		server.mu.Unlock()
+		return nil, ErrUnauthorized
+	}
+	peerAuthorizer := server.peerAuthorizer
+	server.mu.Unlock()
+	if peerAuthorizer != nil && !peerAuthorizer(connection) {
 		return nil, ErrUnauthorized
 	}
 	tracked := &trackedConnection{PeerConnection: connection, generation: generation}
 	server.mu.Lock()
 	defer server.mu.Unlock()
+	// A directory publication or credential rotation can race the callback;
+	// never retain a stream admitted under the old generation.
 	if generation != server.generation || authorizer != server.authorizer {
 		return nil, ErrUnauthorized
 	}
@@ -253,13 +394,18 @@ func (server *Server) Serve(ctx context.Context, listener net.Listener, limits L
 		go func(raw net.Conn) {
 			defer workers.Done()
 			defer func() { <-connectionSlots }()
+			// A gateway frontend may attach a per-socket continuation token to
+			// the raw admission connection. Preserve that context across the
+			// TLS wrapper; the receiver still validates the committed grant and
+			// scope before accepting a request from a Draining principal.
+			handledContext := serviceauthz.FrontendConnectionContextFromConn(ctx, raw)
 			profile, authorizer, generation, err := server.snapshot()
 			if err != nil {
 				<-handshakeSlots
 				_ = raw.Close()
 				return
 			}
-			connection, err := profile.Server(ctx, raw, server.class, limits.HandshakeDeadline)
+			connection, err := profile.Server(handledContext, raw, server.class, limits.HandshakeDeadline)
 			<-handshakeSlots
 			if err != nil {
 				server.authRejected.Add(1)
@@ -276,7 +422,7 @@ func (server *Server) Serve(ctx context.Context, listener net.Listener, limits L
 			defer tracked.Close()
 			stopConnection := context.AfterFunc(ctx, func() { _ = tracked.Close() })
 			defer stopConnection()
-			handler(context.WithValue(ctx, admissionGenerationKey{}, generation), tracked)
+			handler(context.WithValue(handledContext, admissionGenerationKey{}, generation), tracked)
 		}(raw)
 	}
 }

@@ -46,6 +46,37 @@ catalog, request-ledger, and data group still has three replicas. The current
 launcher persists format-2 topology and rejects obsolete layouts. See the
 [local cluster tutorial](../operations/local-cluster.md).
 
+### Online cluster control
+
+The `nodes`, `join`, `rebalance`, `decommission`, and `status` commands use
+the authenticated gateway-client listener. They send one canonical,
+newline-delimited control envelope and return one bounded response. The
+profile is a local file containing the endpoint, expected server node ID, and
+the client certificate, key, roots, and identity OID paths:
+
+```json
+{"format":1,"address":"127.0.0.1:17400","server_node":"<32 hex characters>","certificate":"/path/client-cert.pem","key":"/path/client-key.pem","roots":"/path/roots.pem","identity_oid":"1.3.6.1.4.1.32473.1.1"}
+```
+
+```text
+vibedb cluster nodes --profile <auth-client.vibejson> [--json] [--wait duration]
+vibedb cluster join --profile <auth-client.vibejson> --node-file <public-node.vibejson> [--json] [--request-id <64 hex characters>] [--wait duration]
+vibedb cluster rebalance --profile <auth-client.vibejson> [--max-moves n] [--max-migration-bytes n] [--desired-node-count n] [--hysteresis-ppm n] [--json] [--request-id <64 hex characters>] [--wait duration]
+vibedb cluster decommission --profile <auth-client.vibejson> --node <32 hex characters> --incarnation n [--json] [--request-id <64 hex characters>] [--wait duration]
+vibedb cluster status --profile <auth-client.vibejson> --operation <64 hex characters> [--json] [--wait duration]
+```
+
+Mutating requests use the same request ID when retried after an ambiguous
+response. The server returns an operation ID before a long wait completes;
+`status --operation` resolves that durable operation later. Cancelling
+`--wait` only ends the client wait and never rolls back the operation. A join
+descriptor contains public node identity, roles, listener addresses, and
+capacity facts. Private keys, certificate paths, WAL paths, and process roots
+are rejected by the descriptor decoder and never enter the request envelope.
+`--json` emits the canonical response, including directory and catalog
+revisions, blockers, safe-to-stop, retirement evidence, and migration-budget
+counters.
+
 ## `vibedb-shard`
 
 ### `vibedb-shard` commands

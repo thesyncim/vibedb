@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/thesyncim/vibedb/internal/migrationbudget"
+	"github.com/thesyncim/vibedb/internal/nodecontrol"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
@@ -30,7 +32,11 @@ const (
 var errInvalidRF3Manifest = errors.New("vibedb-shard: invalid RF3 manifest")
 
 type rf3Manifest struct {
-	NodeLog             *rf3NodeLogManifest
+	NodeLog *rf3NodeLogManifest
+	// NodeIncarnation is explicit for grouped physical-node manifests. It is
+	// mandatory for the empty-capacity form and never inferred from a group
+	// roster.
+	NodeIncarnation     uint64
 	reloadPath          string
 	reloadSignals       <-chan os.Signal
 	Digest              [sha256.Size]byte
@@ -39,6 +45,7 @@ type rf3Manifest struct {
 	Listeners           rf3ManifestListeners
 	TLS                 rf3ManifestTLS
 	AuthorizationPolicy string
+	GatewaySeeds        []nodecontrol.BootstrapGatewaySeed
 	ReplicaControl      rf3ManifestReplicaControl
 	SplitControl        rf3ManifestSplitControl
 	Gateway             *rf3ManifestGateway
@@ -61,7 +68,10 @@ type rf3ManifestGroup struct {
 }
 
 func (manifest rf3Manifest) groupBundles() []rf3ManifestGroup {
-	if len(manifest.Groups) != 0 {
+	// A node log makes the grouped grammar unambiguous, including the valid
+	// empty-capacity form.  Legacy manifests have no NodeLog and retain their
+	// single-group fallback for compatibility.
+	if manifest.NodeLog != nil || len(manifest.Groups) != 0 {
 		return manifest.Groups
 	}
 	return []rf3ManifestGroup{{WAL: manifest.WAL, SQL: manifest.SQL,
@@ -73,8 +83,9 @@ func (manifest rf3Manifest) groupBundles() []rf3ManifestGroup {
 func (manifest rf3Manifest) withGroup(group rf3ManifestGroup) rf3Manifest {
 	split := manifest.SplitControl
 	split.ChildRegistry = group.ChildRegistry
-	return rf3Manifest{NodeLog: manifest.NodeLog, Digest: manifest.Digest, WAL: group.WAL, SQL: group.SQL, Listeners: manifest.Listeners,
+	return rf3Manifest{NodeLog: manifest.NodeLog, NodeIncarnation: manifest.NodeIncarnation, Digest: manifest.Digest, WAL: group.WAL, SQL: group.SQL, Listeners: manifest.Listeners,
 		TLS: manifest.TLS, AuthorizationPolicy: manifest.AuthorizationPolicy,
+		GatewaySeeds:   append([]nodecontrol.BootstrapGatewaySeed(nil), manifest.GatewaySeeds...),
 		ReplicaControl: manifest.ReplicaControl,
 		SplitControl:   split, Route: group.Route,
 		Gateway:         manifest.Gateway,
@@ -135,6 +146,51 @@ type rf3ManifestReplicaControl struct {
 	MaxSourceDiskBytes     uint64
 	SourceChunkBytes       uint32
 	MaxSourceConcurrent    int
+	Migration              rf3ManifestMigrationBudget
+}
+
+// rf3ManifestMigrationBudget is the canonical wire representation of the
+// node-wide transfer budget. It intentionally lives below replica_control so
+// a grouped RF3 manifest has exactly one copy for the physical node rather
+// than one allocation per group.
+type rf3ManifestMigrationBudget struct {
+	MaxActive      int                  `json:"max_active"`
+	CPU            rf3ManifestRateLimit `json:"cpu"`
+	DiskRead       rf3ManifestRateLimit `json:"disk_read"`
+	DiskWrite      rf3ManifestRateLimit `json:"disk_write"`
+	NetworkSend    rf3ManifestRateLimit `json:"network_send"`
+	NetworkReceive rf3ManifestRateLimit `json:"network_receive"`
+}
+
+type rf3ManifestRateLimit struct {
+	BytesPerSecond uint64 `json:"bytes_per_second"`
+	BurstBytes     uint64 `json:"burst_bytes"`
+}
+
+func defaultRF3ManifestMigrationBudget() rf3ManifestMigrationBudget {
+	return rf3ManifestMigrationBudgetFromConfig(migrationbudget.DefaultConfig())
+}
+
+func rf3ManifestMigrationBudgetFromConfig(config migrationbudget.Config) rf3ManifestMigrationBudget {
+	return rf3ManifestMigrationBudget{
+		MaxActive:      config.MaxActive,
+		CPU:            rf3ManifestRateLimit{BytesPerSecond: config.CPU.BytesPerSecond, BurstBytes: config.CPU.BurstBytes},
+		DiskRead:       rf3ManifestRateLimit{BytesPerSecond: config.DiskRead.BytesPerSecond, BurstBytes: config.DiskRead.BurstBytes},
+		DiskWrite:      rf3ManifestRateLimit{BytesPerSecond: config.DiskWrite.BytesPerSecond, BurstBytes: config.DiskWrite.BurstBytes},
+		NetworkSend:    rf3ManifestRateLimit{BytesPerSecond: config.NetworkSend.BytesPerSecond, BurstBytes: config.NetworkSend.BurstBytes},
+		NetworkReceive: rf3ManifestRateLimit{BytesPerSecond: config.NetworkReceive.BytesPerSecond, BurstBytes: config.NetworkReceive.BurstBytes},
+	}
+}
+
+func (budget rf3ManifestMigrationBudget) config() migrationbudget.Config {
+	return migrationbudget.Config{
+		MaxActive:      budget.MaxActive,
+		CPU:            migrationbudget.RateLimit{BytesPerSecond: budget.CPU.BytesPerSecond, BurstBytes: budget.CPU.BurstBytes},
+		DiskRead:       migrationbudget.RateLimit{BytesPerSecond: budget.DiskRead.BytesPerSecond, BurstBytes: budget.DiskRead.BurstBytes},
+		DiskWrite:      migrationbudget.RateLimit{BytesPerSecond: budget.DiskWrite.BytesPerSecond, BurstBytes: budget.DiskWrite.BurstBytes},
+		NetworkSend:    migrationbudget.RateLimit{BytesPerSecond: budget.NetworkSend.BytesPerSecond, BurstBytes: budget.NetworkSend.BurstBytes},
+		NetworkReceive: migrationbudget.RateLimit{BytesPerSecond: budget.NetworkReceive.BytesPerSecond, BurstBytes: budget.NetworkReceive.BurstBytes},
+	}
 }
 
 type rf3ManifestWAL struct {
@@ -247,6 +303,17 @@ func parseRF3Manifest(data []byte) (rf3Manifest, error) {
 		if !present {
 			return rf3Manifest{}, errInvalidRF3Manifest
 		}
+		if bytes.Equal(key.Raw().Bytes(), []byte(`"node_incarnation"`)) {
+			value, parseErr := rf3ManifestPositiveUint64(node)
+			if parseErr != nil {
+				return rf3Manifest{}, errInvalidRF3Manifest
+			}
+			manifest.NodeIncarnation = value
+			key, node, present = fields.Next()
+			if !present {
+				return rf3Manifest{}, errInvalidRF3Manifest
+			}
+		}
 	}
 	if bytes.Equal(key.Raw().Bytes(), []byte(`"listeners"`)) {
 		if manifest.Listeners, err = parseRF3ManifestListeners(node); err != nil {
@@ -266,9 +333,21 @@ func parseRF3Manifest(data []byte) (rf3Manifest, error) {
 		if manifest.AuthorizationPolicy, err = rf3ManifestString(node, maxRF3ManifestStringBytes); err != nil {
 			return rf3Manifest{}, err
 		}
-		node, err = nextRF3Field(&fields, `"replica_control"`)
-		if err != nil {
-			return rf3Manifest{}, err
+		key, node, present = fields.Next()
+		if !present {
+			return rf3Manifest{}, errInvalidRF3Manifest
+		}
+		if bytes.Equal(key.Raw().Bytes(), []byte(`"bootstrap_gateway_seeds"`)) {
+			if manifest.GatewaySeeds, err = parseRF3BootstrapGatewaySeeds(node); err != nil {
+				return rf3Manifest{}, err
+			}
+			key, node, present = fields.Next()
+			if !present {
+				return rf3Manifest{}, errInvalidRF3Manifest
+			}
+		}
+		if !bytes.Equal(key.Raw().Bytes(), []byte(`"replica_control"`)) {
+			return rf3Manifest{}, errInvalidRF3Manifest
 		}
 		if manifest.ReplicaControl, err = parseRF3ManifestReplicaControl(node); err != nil {
 			return rf3Manifest{}, err
@@ -298,6 +377,9 @@ func parseRF3Manifest(data []byte) (rf3Manifest, error) {
 		}
 		if manifest.Groups, err = parseRF3ManifestGroups(node, manifest.NodeLog); err != nil {
 			return rf3Manifest{}, err
+		}
+		if len(manifest.Groups) == 0 && (manifest.NodeIncarnation == 0 || len(manifest.GatewaySeeds) == 0) {
+			return rf3Manifest{}, errInvalidRF3Manifest
 		}
 		controlPaths := [...]string{
 			manifest.ReplicaControl.ActionJournalPath, manifest.ReplicaControl.SourceJournalPath,
@@ -440,7 +522,7 @@ func parseRF3Manifest(data []byte) (rf3Manifest, error) {
 
 func parseRF3ManifestGroups(node vibejson.Node, nodeLog *rf3NodeLogManifest) ([]rf3ManifestGroup, error) {
 	count, ok := node.ArrayLen()
-	if !ok || count < 1 || count > maxRF3ManifestGroups {
+	if !ok || count > maxRF3ManifestGroups || count == 0 && nodeLog == nil {
 		return nil, errInvalidRF3Manifest
 	}
 	iter, _ := node.ArrayIter()
@@ -881,6 +963,13 @@ func parseRF3ManifestReplicaControl(node vibejson.Node) (rf3ManifestReplicaContr
 		return rf3ManifestReplicaControl{}, errInvalidRF3Manifest
 	}
 	result.SourceChunkBytes = uint32(chunk)
+	value, err = nextRF3Field(&fields, `"migration_budget"`)
+	if err != nil {
+		return result, err
+	}
+	if result.Migration, err = parseRF3ManifestMigrationBudget(value); err != nil {
+		return rf3ManifestReplicaControl{}, err
+	}
 	if _, _, extra := fields.Next(); extra ||
 		result.MaxSourceArtifacts > 4096 ||
 		result.MaxSourceConcurrent > snapshottransfer.AbsoluteMaxSourceConcurrency ||
@@ -905,6 +994,92 @@ func parseRF3ManifestReplicaControl(node vibejson.Node) (rf3ManifestReplicaContr
 		}
 	}
 	return result, nil
+}
+
+func parseRF3ManifestMigrationBudget(node vibejson.Node) (rf3ManifestMigrationBudget, error) {
+	fields, ok := node.ObjectIter()
+	if !ok {
+		return rf3ManifestMigrationBudget{}, errInvalidRF3Manifest
+	}
+	var result rf3ManifestMigrationBudget
+	value, err := nextRF3Field(&fields, `"max_active"`)
+	if err != nil {
+		return result, err
+	}
+	if result.MaxActive, err = rf3ManifestPositiveInt(value); err != nil {
+		return result, err
+	}
+	limits := []*rf3ManifestRateLimit{
+		&result.CPU, &result.DiskRead, &result.DiskWrite,
+		&result.NetworkSend, &result.NetworkReceive,
+	}
+	names := [...]string{`"cpu"`, `"disk_read"`, `"disk_write"`, `"network_send"`, `"network_receive"`}
+	for index := range limits {
+		value, err = nextRF3Field(&fields, names[index])
+		if err != nil {
+			return result, err
+		}
+		if *limits[index], err = parseRF3ManifestRateLimit(value); err != nil {
+			return rf3ManifestMigrationBudget{}, err
+		}
+	}
+	if _, _, extra := fields.Next(); extra || result.config().Validate() != nil {
+		return rf3ManifestMigrationBudget{}, errInvalidRF3Manifest
+	}
+	return result, nil
+}
+
+func parseRF3ManifestRateLimit(node vibejson.Node) (rf3ManifestRateLimit, error) {
+	fields, ok := node.ObjectIter()
+	if !ok {
+		return rf3ManifestRateLimit{}, errInvalidRF3Manifest
+	}
+	var result rf3ManifestRateLimit
+	value, err := nextRF3Field(&fields, `"bytes_per_second"`)
+	if err != nil {
+		return result, err
+	}
+	if result.BytesPerSecond, err = rf3ManifestPositiveUint64(value); err != nil {
+		return result, err
+	}
+	value, err = nextRF3Field(&fields, `"burst_bytes"`)
+	if err != nil {
+		return result, err
+	}
+	if result.BurstBytes, err = rf3ManifestPositiveUint64(value); err != nil {
+		return result, err
+	}
+	if _, _, extra := fields.Next(); extra {
+		return rf3ManifestRateLimit{}, errInvalidRF3Manifest
+	}
+	return result, nil
+}
+
+func parseRF3BootstrapGatewaySeeds(node vibejson.Node) ([]nodecontrol.BootstrapGatewaySeed, error) {
+	count, ok := node.ArrayLen()
+	if !ok || count == 0 || count > nodecontrol.MaxBootstrapGatewaySeeds {
+		return nil, errInvalidRF3Manifest
+	}
+	raw := node.Raw().Bytes()
+	seeds := make([]nodecontrol.BootstrapGatewaySeed, count)
+	if err := vibejson.Unmarshal(raw, &seeds); err != nil {
+		return nil, errInvalidRF3Manifest
+	}
+	canonical, err := vibejson.Marshal(&seeds)
+	if err != nil || !bytes.Equal(canonical, raw) {
+		return nil, errInvalidRF3Manifest
+	}
+	seen := make(map[rafttransport.NodeID]struct{}, len(seeds))
+	for _, seed := range seeds {
+		if !seed.Valid() {
+			return nil, errInvalidRF3Manifest
+		}
+		if _, found := seen[seed.NodeID]; found {
+			return nil, errInvalidRF3Manifest
+		}
+		seen[seed.NodeID] = struct{}{}
+	}
+	return seeds, nil
 }
 
 func parseRF3ManifestWAL(node vibejson.Node) (rf3ManifestWAL, error) {

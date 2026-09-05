@@ -15,6 +15,7 @@ import (
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
+	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"go.etcd.io/raft/v3"
@@ -76,6 +77,12 @@ type Plan struct {
 	certificate           replicatedstate.SnapshotBaseCertificate
 	failureAuthorization  []byte
 	operation             OperationID
+	// transition is present when the detached catalog carries the RF3
+	// descriptor. Legacy unit fixtures without replicated metadata still use
+	// the original plan surface; production admission requires this provenance
+	// before a receipt-aware publication can be executed.
+	transition      gateway.GroupTransitionIntent
+	transitionReady bool
 }
 
 // OperationID is the fixed byte-native identity of one exact replica move.
@@ -128,9 +135,14 @@ func PlanReplicaMove(
 	if err != nil {
 		return nil, err
 	}
-	return newPlan(
+	plan, err := newPlan(
 		request, current.Generation(), manifest, targetManifest, initial, publication.Applied,
 	)
+	if err != nil {
+		return nil, err
+	}
+	plan.installTransitionIntent(current)
+	return plan, nil
 }
 
 func newPlan(
@@ -178,6 +190,94 @@ func newPlan(
 		return nil, ErrInvalidPlan
 	}
 	return plan, nil
+}
+
+// installTransitionIntent snapshots the full source provenance while the
+// caller still has the exact detached catalog cut. It is intentionally best
+// effort for old in-memory fixtures that predate replicated shard metadata;
+// the receipt-aware executor rejects such plans before publication.
+func (p *Plan) installTransitionIntent(current *gateway.Snapshot) {
+	if p == nil || current == nil || p.operation == (OperationID{}) {
+		return
+	}
+	var descriptor gateway.ReplicatedShardDescriptor
+	found := false
+	for _, candidate := range current.ReplicatedShardDescriptors() {
+		if candidate.Group == p.request.Group && candidate.Distribution == p.request.Distribution && candidate.Shard == p.request.Shard {
+			descriptor = candidate
+			found = true
+			break
+		}
+	}
+	if !found {
+		return
+	}
+	ordinal, ok := exactShard(p.sourceManifest, p.request.Shard)
+	if !ok {
+		return
+	}
+	metadata, ok := p.sourceManifest.ShardMetadataAt(ordinal)
+	if !ok {
+		return
+	}
+	route := make([]distribution.EndpointID, metadata.LeaderCount)
+	for index := range route {
+		leader, found := p.sourceManifest.ShardLeaderAt(ordinal, index)
+		if !found {
+			return
+		}
+		route[index] = leader
+	}
+	var replacement gateway.ReplicatedReplicaDescriptor
+	for _, candidate := range current.ReplicatedShardDescriptors() {
+		if candidate.Group != p.request.Group {
+			continue
+		}
+		if candidate.EnrolledTarget != nil &&
+			(candidate.EnrolledTarget.Endpoint == p.request.Target ||
+				candidate.EnrolledTarget.NativeEndpoint == p.request.Target ||
+				candidate.EnrolledTarget.ControlEndpoint == p.request.Target) {
+			replacement = *candidate.EnrolledTarget
+			break
+		}
+	}
+	if replacement.Member == 0 {
+		// Some callers carry the target identity in the cold endpoint directory
+		// before enrollment. Keep the intent unavailable until the authority has
+		// supplied a complete authenticated target rather than fabricating it.
+		return
+	}
+	headDigest, err := gateway.CatalogSnapshotDigest(current)
+	if err != nil {
+		return
+	}
+	groupDigest := gateway.DigestReplicatedShardDescriptor(descriptor)
+	rosterDigest := gateway.DigestReplicaRoster(descriptor.Replicas)
+	routeDigest := gateway.DigestRoute(p.sourceManifest, p.request.Shard)
+	commandDigest := gateway.DigestCommandFence(descriptor.Command)
+	intent := gateway.GroupTransitionIntent{
+		Key: gateway.GroupTransitionKey{
+			OperationID:                [32]byte(p.operation),
+			Distribution:               p.request.Distribution,
+			Shard:                      p.request.Shard,
+			Group:                      p.request.Group,
+			SourceAllocationGeneration: uint64(metadata.AllocationGeneration),
+			SourceDescriptorDigest:     groupDigest,
+			SourceCommandFenceDigest:   commandDigest,
+		},
+		SourceMember: p.request.RetiringMember, TargetMember: p.request.TargetMember,
+		SourceHeadGeneration: current.Generation(), SourceHeadDigest: headDigest,
+		SourceDistributionVersion: p.sourceManifest.Version(), SourceGroupDigest: groupDigest,
+		SourceRosterDigest: rosterDigest, SourceRouteDigest: routeDigest,
+		SourceCommandFenceDigest: commandDigest, SourceDescriptor: descriptor,
+		SourceRoute: route, Replacement: replacement,
+		TargetDistributionVersion: p.targetManifest.Version(),
+	}
+	if !intent.Valid() {
+		return
+	}
+	p.transition = intent
+	p.transitionReady = true
 }
 
 // BindSnapshotBase returns a new plan bound to one strictly verified learner
@@ -365,6 +465,78 @@ func (p *Plan) OperationID() OperationID {
 		return OperationID{}
 	}
 	return p.operation
+}
+
+// TransitionIntent returns the immutable source provenance required by a
+// receipt-aware catalog authority. The boolean is false for legacy detached
+// fixtures that do not carry a replicated shard descriptor.
+func (p *Plan) TransitionIntent() (gateway.GroupTransitionIntent, bool) {
+	if p == nil || !p.transitionReady {
+		return gateway.GroupTransitionIntent{}, false
+	}
+	intent := p.transition
+	intent.SourceDescriptor.Replicas = slices.Clone(intent.SourceDescriptor.Replicas)
+	intent.SourceDescriptor.RequestLedgerRanges = slices.Clone(intent.SourceDescriptor.RequestLedgerRanges)
+	if intent.SourceDescriptor.EnrolledTarget != nil {
+		target := *intent.SourceDescriptor.EnrolledTarget
+		intent.SourceDescriptor.EnrolledTarget = &target
+	}
+	intent.SourceRoute = slices.Clone(intent.SourceRoute)
+	return intent, true
+}
+
+// TransitionKey returns the durable per-distribution ownership identity.
+func (p *Plan) TransitionKey() (gateway.GroupTransitionKey, bool) {
+	intent, ok := p.TransitionIntent()
+	if !ok {
+		return gateway.GroupTransitionKey{}, false
+	}
+	return intent.Key, true
+}
+
+func (p *Plan) bindTransitionIntent(intent gateway.GroupTransitionIntent) error {
+	if p == nil || !intent.Valid() || intent.Key.OperationID != [32]byte(p.operation) ||
+		intent.Key.Distribution != p.request.Distribution || intent.Key.Shard != p.request.Shard ||
+		intent.Key.Group != p.request.Group || intent.SourceMember != p.request.RetiringMember ||
+		intent.TargetMember != p.request.TargetMember ||
+		intent.SourceDistributionVersion != p.sourceManifest.Version() ||
+		intent.TargetDistributionVersion != p.targetManifest.Version() {
+		return ErrPlanIntent
+	}
+	p.transition = intent
+	p.transitionReady = true
+	return nil
+}
+
+// TransitionRequired reports whether a real replicated catalog requires the
+// durable source/receipt contract. Metadata-free unit fixtures are the only
+// supported legacy shape; a production RF3 snapshot must never silently use
+// guessed global successor generations.
+func (p *Plan) TransitionRequired(catalog *gateway.Snapshot) bool {
+	// A plan becomes receipt-capable only after the target's authenticated
+	// enrollment descriptor is present. Before that point the request is an
+	// admission candidate, not an executable placement. Keeping the legacy
+	// metadata-free shape here lets the existing failure scheduler persist its
+	// candidate; OpenReplicaMoveIntent fails closed if execution later observes
+	// enrollment without a matching durable transition intent.
+	return p != nil && catalog != nil && p.transitionReady && catalog.ReplicatedRouteCount() != 0
+}
+
+// CatalogSnapshotAtHead applies the owned endpoint delta to the actual
+// catalog head. It is the receipt-aware replacement for CatalogSnapshot;
+// unrelated catalog generations are preserved and the gateway builder changes
+// only this group's shard.
+func (p *Plan) CatalogSnapshotAtHead(
+	current *gateway.Snapshot,
+	phase gateway.TransitionPhase,
+	replacement gateway.ReplicatedReplicaDescriptor,
+	command raftservice.CommandFence,
+) (*gateway.Snapshot, error) {
+	if p == nil || !p.transitionReady || current == nil {
+		return nil, ErrTopologyConflict
+	}
+	intent := p.transition
+	return gateway.BuildGroupOwnedShardTransition(current, intent, phase, replacement, command)
 }
 
 func replicaMoveOperationID(plan *Plan) OperationID {

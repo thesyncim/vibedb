@@ -78,8 +78,8 @@ func runServeNode(args []string) int {
 		fmt.Fprintf(os.Stderr, "error RF3 node manifest: %v\n", err)
 		return 2
 	}
-	if manifest.NodeLog == nil || len(manifest.Groups) == 0 || manifest.Gateway == nil {
-		fmt.Fprintln(os.Stderr, "error RF3 node manifest: serve-node requires grouped node_log and explicit gateway configuration")
+	if manifest.NodeLog == nil || len(manifest.Groups) == 0 && manifest.NodeIncarnation == 0 {
+		fmt.Fprintln(os.Stderr, "error RF3 node manifest: serve-node requires a grouped node_log and empty-node incarnation when groups are absent")
 		return 2
 	}
 	stopReload := configureRF3ManifestReload(&manifest, *manifestPath, *reload)
@@ -216,7 +216,7 @@ func prepareRF3EmbeddedGateway(
 		CatalogSessionLease:       rf3GatewayDuration(encoded.CatalogSessionLeaseMillis, 24*time.Hour),
 		CatalogSessionJournal:     encoded.CatalogSessionJournal, CatalogClientID: clientID,
 		CatalogRetryHome: retryHome, DurableAckKeyPath: encoded.DurableAckKeyPath,
-		Transport:      client,
+		Transport: client, RequireServiceDirectoryBinding: true,
 		ListenAddress:  encoded.ListenAddress,
 		TLSCertificate: encoded.TLS.Certificate, TLSKey: encoded.TLS.Key,
 		TLSRoots: encoded.TLS.Roots, TLSIdentityOID: encoded.TLS.IdentityOID,
@@ -263,6 +263,13 @@ func validateRF3EmbeddedGatewayLocalNative(manifest rf3Manifest, localNode raftt
 	if validateRF3Address(manifest.Listeners.Native, false) != nil {
 		return fmt.Errorf("%w: embedded gateway local native listener is invalid", errRF3Serving)
 	}
+	if len(manifest.groupBundles()) == 0 && len(peers) == 0 {
+		// A cold capacity node has no committed group roster yet. Its native
+		// listener is still started as an authenticated fail-closed endpoint;
+		// the directory and later learner installation publish the first local
+		// route without restarting this process.
+		return nil
+	}
 	for _, peer := range peers {
 		if peer.Node != localNode {
 			continue
@@ -289,7 +296,14 @@ func rf3EmbeddedGatewayPeers(manifest rf3Manifest, configured []rf3ManifestGatew
 		}
 	}
 	if len(expected) == 0 {
-		return nil, fmt.Errorf("%w: embedded gateway has no shard roster", errRF3Serving)
+		// An empty physical node may start its gateway/control plane before any
+		// group has been admitted. The replicated control directory supplies
+		// native peers after enrollment; requiring a fabricated shard roster
+		// here would make the node impossible to bootstrap safely.
+		if len(configured) != 0 {
+			return nil, fmt.Errorf("%w: empty node cannot carry a static shard peer roster", errRF3Serving)
+		}
+		return []servicetls.Endpoint{}, nil
 	}
 	if len(configured) == 0 {
 		return nil, fmt.Errorf("%w: embedded gateway requires an explicit native shard peer roster", errRF3Serving)

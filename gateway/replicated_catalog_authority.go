@@ -97,8 +97,25 @@ type ReplicatedCatalogAuthority struct {
 	pendingReplacementSetPostRemove    bool
 	pendingPostRemoveReplicaSetVersion uint64
 	issuerGrants                       *replicatedIssuerGrantCache
+	gatewayParticipants                GatewayParticipantScanner
 	routeSeed                          atomic.Pointer[replicatedCatalogRouteSeedTracker]
+	rollover                           ReplicatedCatalogSessionRollover
+	rolloverMu                         sync.Mutex
 }
+
+// ReplicatedCatalogSessionRollover performs the only legal transition between
+// two catalog session bindings. The callback must settle the old exact journal
+// (including an outcome-unknown command), open a distinct exact-next journal,
+// and return the new active session. Route-seed promotion happens only after
+// this callback returns successfully.
+type ReplicatedCatalogSessionRolloverResult struct {
+	Session  *NativeSession
+	Complete func() error
+}
+
+type ReplicatedCatalogSessionRollover func(
+	context.Context, ReplicatedRoute, ReplicatedRoute, *Snapshot,
+) (ReplicatedCatalogSessionRolloverResult, error)
 
 type ReplicatedCatalogAuthorityOptions struct {
 	Executor *ReplicatedExecutor
@@ -113,6 +130,15 @@ type ReplicatedCatalogAuthorityOptions struct {
 	// proposal, and byte-identical retry. Callers cannot accidentally fall back
 	// to an unclassified DataWrite request.
 	Authority serviceauthz.Authority
+	// SessionRollover is required for a live catalog route change. Without it,
+	// a changed certified candidate remains staged and the caller receives
+	// ErrReplicatedCatalogRouteRestartRequired rather than observing a seed or
+	// journal binding out of sync.
+	SessionRollover ReplicatedCatalogSessionRollover
+	// GatewayParticipants is the authenticated live-session directory used by
+	// safe-to-stop scans. Leaving it nil keeps gateway nodes conservatively
+	// blocked; role bits are never accepted as retirement evidence.
+	GatewayParticipants GatewayParticipantScanner
 }
 
 func NewReplicatedCatalogAuthority(options ReplicatedCatalogAuthorityOptions) (*ReplicatedCatalogAuthority, error) {
@@ -138,9 +164,11 @@ func NewReplicatedCatalogAuthority(options ReplicatedCatalogAuthorityOptions) (*
 	return &ReplicatedCatalogAuthority{
 		executor: options.Executor, route: route, relation: options.Relation,
 		holder: options.Holder, session: options.Session,
-		authority:    options.Authority,
-		scratch:      make([]byte, 0, 4<<10),
-		issuerGrants: newReplicatedIssuerGrantCache(MaxCachedReplicatedIssuerGrants),
+		authority:           options.Authority,
+		gatewayParticipants: options.GatewayParticipants,
+		rollover:            options.SessionRollover,
+		scratch:             make([]byte, 0, 4<<10),
+		issuerGrants:        newReplicatedIssuerGrantCache(MaxCachedReplicatedIssuerGrants),
 	}, nil
 }
 
@@ -433,7 +461,10 @@ func (authority *ReplicatedCatalogAuthority) readAttested(
 		headBytes: uint64(len(cut.head)), headDigest: sha256.Sum256(cut.head),
 	}
 	if tracker := authority.routeSeed.Load(); tracker != nil {
-		if err = tracker.observe(receipt); err != nil {
+		authority.mu.Lock()
+		err = authority.observeCatalogReceiptLocked(ctx, receipt)
+		authority.mu.Unlock()
+		if err != nil {
 			return ReplicatedCatalogSeedReceipt{}, err
 		}
 	}
@@ -948,7 +979,7 @@ func (authority *ReplicatedCatalogAuthority) Publish(
 	// reachability coordinate before making the head visible to any in-process
 	// consumer. A binding-changing route closes ShutdownRequired and leaves the
 	// holder on the old cut until the process is fully quiesced.
-	if err = authority.observePublishedCatalog(next); err != nil {
+	if err = authority.observePublishedCatalog(ctx, next); err != nil {
 		return err
 	}
 	return authority.publishCommittedCatalogAfter(expectedGeneration, next)
@@ -1030,7 +1061,7 @@ func (authority *ReplicatedCatalogAuthority) RetryPending(ctx context.Context) e
 		authority.pendingExpected = 0
 		authority.pendingGrant = membershipgrant.Grant{}
 		authority.pendingPostRemoveReplicaSetVersion = 0
-		if err = authority.observePublishedCatalog(published); err != nil {
+		if err = authority.observePublishedCatalog(ctx, published); err != nil {
 			return err
 		}
 		if len(set) != 0 {

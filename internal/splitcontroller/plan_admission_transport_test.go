@@ -19,6 +19,8 @@ type planAdmissionDropReadConnection struct {
 	dropped bool
 }
 
+func (*planAdmissionDropReadConnection) PeerKeyDigest() [32]byte { return [32]byte{} }
+
 func (connection *planAdmissionDropReadConnection) Read(buffer []byte) (int, error) {
 	if connection.dropped {
 		return 0, io.EOF

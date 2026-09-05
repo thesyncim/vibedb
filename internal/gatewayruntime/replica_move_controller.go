@@ -20,15 +20,19 @@ type gatewayReplicaMoveControls struct {
 	// HealthObservations is the authenticated shard-control client shared with
 	// the failure scheduler. It only supplies current liveness/donor cuts.
 	HealthObservations gatewayReplicaObservationClient
-	GrantInstaller     gatewayMembershipGrantInstaller
-	Routes             rebalanceexec.MoveRouteResolver
-	Membership         rebalanceexec.MembershipClient
-	Snapshots          rebalanceexec.SnapshotSource
-	Bootstrap          rebalanceexec.SnapshotBootstrapClient
-	Awaiter            rebalanceexec.MoveAwaiter
-	Ownership          rebalanceexec.OwnershipProposer
-	Drainer            rebalanceexec.CatalogDrainCertifier
-	Retirement         rebalanceexec.SourceRetirer
+	// Capacity is the authenticated, one-shot physical accounting client used
+	// by the scaling planner. It is kept separate from health observations so a
+	// liveness success can never be interpreted as zero demand.
+	Capacity       scalingCapacityReader
+	GrantInstaller gatewayMembershipGrantInstaller
+	Routes         rebalanceexec.MoveRouteResolver
+	Membership     rebalanceexec.MembershipClient
+	Snapshots      rebalanceexec.SnapshotSource
+	Bootstrap      rebalanceexec.SnapshotBootstrapClient
+	Awaiter        rebalanceexec.MoveAwaiter
+	Ownership      rebalanceexec.OwnershipProposer
+	Drainer        rebalanceexec.CatalogDrainCertifier
+	Retirement     rebalanceexec.SourceRetirer
 }
 
 func newGatewayReplicaMoveController(

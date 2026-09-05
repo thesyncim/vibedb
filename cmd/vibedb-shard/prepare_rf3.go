@@ -63,8 +63,12 @@ type prepareRF3Manifest struct {
 	TLS                   rf3ManifestTLS                            `json:"tls"`
 	AuthorizationPolicy   string                                    `json:"authorization_policy"`
 	SplitControl          prepareRF3SplitControl                    `json:"split_control"`
+	MigrationBudget       *rf3ManifestMigrationBudget               `json:"migration_budget,omitempty"`
 	DevelopmentOnly       bool                                      `json:"development_only,omitempty"`
 	Members               []prepareRF3Member                        `json:"members"`
+	// TargetMember is local adapter state for learner reservation. It is never
+	// serialized into a controller payload or a serving manifest.
+	TargetMember           *prepareRF3Member                         `json:"-"`
 }
 
 type prepareRF3SplitControl struct {
@@ -221,17 +225,18 @@ type persistedRF3SQL struct {
 	ApplyIdentityPath string `json:"apply_identity_path"`
 }
 type persistedRF3ReplicaControl struct {
-	ActionJournalPath      string `json:"action_journal_path"`
-	MaxActionRecords       int    `json:"max_action_records"`
-	SourceDataRoot         string `json:"source_data_root"`
-	SourceJournalPath      string `json:"source_journal_path"`
-	MaxSourceRecords       int    `json:"max_source_records"`
-	SourceRepositoryPath   string `json:"source_repository_path"`
-	MaxSourceArtifacts     int    `json:"max_source_artifacts"`
-	MaxSourceConcurrent    int    `json:"max_source_concurrent"`
-	MaxSourceArtifactBytes uint64 `json:"max_source_artifact_bytes"`
-	MaxSourceDiskBytes     uint64 `json:"max_source_disk_bytes"`
-	SourceChunkBytes       uint32 `json:"source_chunk_bytes"`
+	ActionJournalPath      string                     `json:"action_journal_path"`
+	MaxActionRecords       int                        `json:"max_action_records"`
+	SourceDataRoot         string                     `json:"source_data_root"`
+	SourceJournalPath      string                     `json:"source_journal_path"`
+	MaxSourceRecords       int                        `json:"max_source_records"`
+	SourceRepositoryPath   string                     `json:"source_repository_path"`
+	MaxSourceArtifacts     int                        `json:"max_source_artifacts"`
+	MaxSourceConcurrent    int                        `json:"max_source_concurrent"`
+	MaxSourceArtifactBytes uint64                     `json:"max_source_artifact_bytes"`
+	MaxSourceDiskBytes     uint64                     `json:"max_source_disk_bytes"`
+	SourceChunkBytes       uint32                     `json:"source_chunk_bytes"`
+	Migration              rf3ManifestMigrationBudget `json:"migration_budget"`
 }
 type persistedRF3Member struct {
 	MemberID    uint64 `json:"member_id"`
@@ -625,6 +630,9 @@ func validatePrepareRF3(input prepareRF3Manifest) (raftstore.Identity, sqldriver
 	if !filepath.IsAbs(input.Root) || filepath.Clean(input.Root) != input.Root || input.Root == string(filepath.Separator) || input.Distribution == "" || input.Shard == "" || input.MemberID == 0 || input.AllocationGeneration == 0 || input.TopologyRecoveryEpoch == 0 || input.Table == "" || input.CreateTable == "" || input.Apply.ShardKey == "" {
 		return bad()
 	}
+	if input.MigrationBudget != nil && input.MigrationBudget.config().Validate() != nil {
+		return bad()
+	}
 	if sqldriver.ValidateReplicatedChildSchemaDefinition(input.Table, input.Apply.ShardKey,
 		input.CreateTable, input.SchemaStatements, input.GlobalIndexes) != nil {
 		return bad()
@@ -800,6 +808,10 @@ func buildPreparedRF3Manifest(input prepareRF3Manifest, nodes [3]rafttransport.N
 		StaticBootstrapPath: filepath.Join(childRoot, "static-bootstrap.pb"),
 		ReplicaSetVersion:   1, Members: make([]persistedRF3Member, len(input.Members)),
 	}
+	migrationBudget := defaultRF3ManifestMigrationBudget()
+	if input.MigrationBudget != nil {
+		migrationBudget = *input.MigrationBudget
+	}
 	m := persistedRF3Manifest{
 		WAL: wal,
 		SQL: persistedRF3SQL{
@@ -823,6 +835,7 @@ func buildPreparedRF3Manifest(input prepareRF3Manifest, nodes [3]rafttransport.N
 			MaxSourceRecords: 4096, SourceRepositoryPath: filepath.Join(input.Root, "source-artifacts"),
 			MaxSourceArtifacts: 8, MaxSourceConcurrent: 2,
 			MaxSourceArtifactBytes: 1 << 30, MaxSourceDiskBytes: 4 << 30, SourceChunkBytes: 1 << 20,
+			Migration: migrationBudget,
 		},
 		SplitControl: persistedRF3SplitControl{
 			JournalPath: filepath.Join(input.Root, "split-control.journal"),

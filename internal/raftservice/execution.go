@@ -75,7 +75,7 @@ type ExecutionGroup struct {
 
 func NewExecutionOwners(options ExecutionOptions) (*ExecutionOwners, error) {
 	if options.Lanes == nil || options.Registry == nil || options.Lanes.Count() == 0 ||
-		len(options.Members) == 0 || len(options.CommandFences) != len(options.Members) ||
+		len(options.CommandFences) != len(options.Members) ||
 		(len(options.ReadSources) != 0 && len(options.ReadSources) != len(options.Members)) ||
 		(len(options.TransactionRecoverySources) != 0 && len(options.TransactionRecoverySources) != len(options.Members)) {
 		return nil, ErrInvalidOwner

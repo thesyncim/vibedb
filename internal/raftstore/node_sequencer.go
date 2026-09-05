@@ -57,8 +57,12 @@ type Submission struct {
 	groups       [MaxPersistGroupBatches]uint64
 	incarnations [MaxPersistGroupBatches]GroupIncarnation
 	descriptor   GroupDescriptor
-	catalog      descriptorCatalogCandidate
-	snapshot     *pb.Snapshot
+	// registerIncarnation is the exact node incarnation reserved by a
+	// dynamically enrolled group. Zero keeps the historical registration
+	// grammar, which starts a fresh group at incarnation one.
+	registerIncarnation uint64
+	catalog             descriptorCatalogCandidate
+	snapshot            *pb.Snapshot
 	// queuedAt is published before the ring sequence. Its monotonic component
 	// makes queue delay immune to UTC wall-clock steps. It is diagnostic only;
 	// no ordering or durability decision depends on it.
@@ -101,7 +105,7 @@ func (s *Submission) Prepare(ready NodeReady) error {
 func (s *Submission) invalidatePrepare() {
 	clear(s.readySeries[:])
 	s.Ready, s.seriesGroup, s.seriesCount = NodeReady{}, 0, 0
-	s.err, s.kind, s.count, s.catalog, s.snapshot = nil, 0, 0, descriptorCatalogCandidate{}, nil
+	s.err, s.kind, s.count, s.registerIncarnation, s.catalog, s.snapshot = nil, 0, 0, 0, descriptorCatalogCandidate{}, nil
 	s.ticket.Store(0)
 	s.state.Store(submissionUnprepared)
 }
@@ -119,7 +123,7 @@ func (s *Submission) prepareControl(kind submissionKind, count int) error {
 	}
 	clear(s.readySeries[:])
 	s.Ready, s.seriesGroup, s.seriesCount = NodeReady{}, 0, 0
-	s.err, s.kind, s.count, s.catalog, s.snapshot = nil, kind, uint8(count), descriptorCatalogCandidate{}, nil
+	s.err, s.kind, s.count, s.registerIncarnation, s.catalog, s.snapshot = nil, kind, uint8(count), 0, descriptorCatalogCandidate{}, nil
 	s.ticket.Store(0)
 	s.state.Store(submissionIdle)
 	return nil
@@ -251,6 +255,19 @@ func (s *Submission) PrepareRegisterGroup(descriptor GroupDescriptor) error {
 // term/commit and incarnation together; it must not be used for an existing
 // group's normal checkpoint maintenance.
 func (s *Submission) PrepareRegisterGroupWithSnapshot(descriptor GroupDescriptor, snapshot *pb.Snapshot) error {
+	return s.PrepareRegisterGroupWithSnapshotAt(descriptor, snapshot, 1)
+}
+
+// PrepareRegisterGroupWithSnapshotAt is the exact dynamic-enrollment form of
+// PrepareRegisterGroupWithSnapshot. The requested incarnation is part of the
+// durable descriptor wave, so a controller-selected target identity cannot be
+// silently replaced with the next local counter value after a crash.
+func (s *Submission) PrepareRegisterGroupWithSnapshotAt(
+	descriptor GroupDescriptor, snapshot *pb.Snapshot, incarnation uint64,
+) error {
+	if incarnation == 0 {
+		return ErrInvalid
+	}
 	if err := s.PrepareRegisterGroup(descriptor); err != nil {
 		return err
 	}
@@ -258,7 +275,7 @@ func (s *Submission) PrepareRegisterGroupWithSnapshot(descriptor GroupDescriptor
 		s.invalidatePrepare()
 		return err
 	}
-	s.snapshot = snapshot
+	s.snapshot, s.registerIncarnation = snapshot, incarnation
 	return nil
 }
 
@@ -919,7 +936,7 @@ func (q *NodeSubmissionSequencer) observeControlPersist(s *Submission) (err erro
 	case submissionPersistIncarnations:
 		return q.store.persistIncarnationsSequenced(s.incarnations[:s.count])
 	case submissionRegisterGroup:
-		incarnation, registerErr := q.store.registerGroupSequenced(s.descriptor, s.snapshot)
+		incarnation, registerErr := q.store.registerGroupSequencedAt(s.descriptor, s.snapshot, s.registerIncarnation)
 		if registerErr == nil {
 			s.incarnations[0] = incarnation
 			d, ok := q.store.descriptorForLogKey(incarnation.GroupID)

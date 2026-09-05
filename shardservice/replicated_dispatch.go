@@ -9,6 +9,7 @@ import (
 	"github.com/thesyncim/vibedb/distribution"
 
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 )
 
 // ReplicatedCall is the transport-neutral operation envelope. SQL remains a
@@ -90,6 +91,7 @@ func DetachReplicatedReply(lease ReplicatedReplyLease) (*ReplicatedReply, error)
 // Rotation replaces the binding and cancels its admitted requests.
 type replicatedLocalBinding struct {
 	principal                  rafttransport.PeerIdentity
+	servicePeer                serviceauthz.AuthenticatedPeer
 	node                       rafttransport.NodeID
 	storage                    *ReplicatedServerTLS
 	generation                 uint64
@@ -155,7 +157,7 @@ func (server *ReplicatedServer) DispatchReplicated(ctx context.Context, call Rep
 	}()
 	if call.Request.Fence.Group.ClusterID != binding.principal.TrustDomain.ClusterID ||
 		call.Request.Fence.Group.ClusterIncarnation != binding.principal.TrustDomain.ClusterIncarnation ||
-		!server.authorizeReplicated(binding.principal.Node, &call.Request) {
+		!server.authorizeReplicatedPeer(binding.servicePeer, &call.Request) {
 		return &replicatedReplyLease{reply: &ReplicatedReply{Response: ReplicatedResponse{
 			Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalUnauthorized,
 		}}}, nil
@@ -275,9 +277,10 @@ func ReplicatedCallFrameBytes(call *ReplicatedCall) (int, error) {
 		return 0, ErrReplicatedWire
 	}
 	// QueryLeader contributes max-value bytes, the four-byte payload length,
-	// and the complete inner SQL frame to the common 242-byte native prefix.
+	// the complete inner SQL frame, and any outer continuation proof to the
+	// common 242-byte native prefix.
 	const replicatedRequestPrefixBytes = 242
-	total := replicatedRequestPrefixBytes + 4 + 4 + inner + 5
+	total := replicatedRequestPrefixBytes + 4 + 4 + inner + frontendContinuationTailBytes(&call.Request) + 5
 	if total-5 > maxFrameBody {
 		return 0, ErrReplicatedWire
 	}
@@ -316,6 +319,10 @@ func cloneReplicatedRequest(request ReplicatedRequest) ReplicatedRequest {
 	request.Key = slices.Clone(request.Key)
 	request.BatchRead = slices.Clone(request.BatchRead)
 	request.Query = slices.Clone(request.Query)
+	if request.Continuation != nil {
+		copy := *request.Continuation
+		request.Continuation = &copy
+	}
 	return request
 }
 

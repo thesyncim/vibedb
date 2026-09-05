@@ -1596,6 +1596,16 @@ func (s *NodeStore) RegisterGroupWithSnapshot(descriptor GroupDescriptor, snapsh
 }
 
 func (s *NodeStore) registerGroupSequenced(descriptor GroupDescriptor, snapshot *pb.Snapshot) (GroupIncarnation, error) {
+	return s.registerGroupSequencedAt(descriptor, snapshot, 1)
+}
+
+// registerGroupSequencedAt is the node-log publication primitive used by a
+// dynamic learner install. The requested incarnation is authenticated in the
+// same descriptor/checkpoint wave; it is never inferred from a local counter
+// after the controller has committed the target identity.
+func (s *NodeStore) registerGroupSequencedAt(
+	descriptor GroupDescriptor, snapshot *pb.Snapshot, incarnation uint64,
+) (GroupIncarnation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.usable(); err != nil {
@@ -1604,12 +1614,21 @@ func (s *NodeStore) registerGroupSequenced(descriptor GroupDescriptor, snapshot 
 	if s.sequencer == nil {
 		return GroupIncarnation{}, ErrInvalid
 	}
-	return s.registerGroupLocked(descriptor, snapshot)
+	return s.registerGroupLockedAt(descriptor, snapshot, incarnation)
 }
 
 func (s *NodeStore) registerGroupLocked(descriptor GroupDescriptor, snapshot *pb.Snapshot) (GroupIncarnation, error) {
+	return s.registerGroupLockedAt(descriptor, snapshot, 1)
+}
+
+func (s *NodeStore) registerGroupLockedAt(
+	descriptor GroupDescriptor, snapshot *pb.Snapshot, incarnation uint64,
+) (GroupIncarnation, error) {
 	if descriptor.LogKey != 0 || validateGroupDescriptor(descriptor, true) != nil {
 		return GroupIncarnation{}, ErrBounds
+	}
+	if incarnation == 0 {
+		return GroupIncarnation{}, ErrInvalid
 	}
 	if snapshot != nil {
 		if err := validateSnapshotBase(snapshot, descriptor.MemberID); err != nil {
@@ -1659,6 +1678,9 @@ func (s *NodeStore) registerGroupLocked(descriptor GroupDescriptor, snapshot *pb
 				return GroupIncarnation{}, ErrRetryConflict
 			}
 		}
+		if state.NodeIncarnation != incarnation {
+			return GroupIncarnation{}, ErrRetryConflict
+		}
 		return GroupIncarnation{GroupID: existing.LogKey, Incarnation: state.NodeIncarnation}, nil
 	}
 	// Capacity limits apply to new groups, not exact unknown-outcome retries.
@@ -1689,7 +1711,7 @@ func (s *NodeStore) registerGroupLocked(descriptor GroupDescriptor, snapshot *pb
 		return GroupIncarnation{}, err
 	}
 	s.waveEntryArena[0] = seglog.Entry{Index: descriptor.LogKey, Term: 1, DataOffset: 0, DataBytes: uint64(len(s.plainArena))}
-	s.waveBatches[0] = seglog.ReadyBatch{GroupID: descriptor.LogKey, BeginIncarnation: 1}
+	s.waveBatches[0] = seglog.ReadyBatch{GroupID: descriptor.LogKey, BeginIncarnation: incarnation}
 	if snapshot != nil {
 		s.waveCheckpoint[0] = checkpoint
 		s.waveHard[0] = seglog.HardState{Term: checkpoint.Term, Commit: checkpoint.Index}
