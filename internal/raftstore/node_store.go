@@ -1216,6 +1216,10 @@ func (s *NodeStore) persistWave(ready []NodeReady, sequenced bool) error {
 	var overflowGroups [MaxPersistGroupBatches]uint64
 	overflowCount := 0
 	for i := range ready {
+		last := nodeReadySeriesBatch(&ready[i], nodeReadySeriesCount(ready[i])-1)
+		if last.ReadyID == states[i].ReadyID {
+			continue
+		} // exact retries never flush a pending span
 		if hint, ok := s.commitHints[ready[i].GroupID]; ok {
 			durable, _ := s.engine.Summary(ready[i].GroupID)
 			if hint.readyID-durable.ReadyID+uint64(nodeReadySeriesCount(ready[i])) > seglog.MaximumReadySpan {

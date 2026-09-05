@@ -296,3 +296,22 @@ func TestNodeCommitHintPreflightIsAtomicAcrossGroupsAndSeries(t *testing.T) {
 		t.Fatalf("hint bypassed namespace proof: %v", err)
 	}
 }
+
+func TestNodeCommitHintLargeExactRetryDoesNotForceSpanFlush(t *testing.T) {
+	s, _, _ := hintFixture(t)
+	batches := make([]raftmodel.PersistBatch, MaxReadySeries-1)
+	for i := range batches {
+		batches[i] = commitHint(uint64(i+2), 2)
+	}
+	syncs := 0
+	s.SetDataSyncForTesting(func(f *os.File) error { syncs++; return f.Sync() })
+	if err := s.PersistReadySeries(1, batches); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PersistReadySeries(1, batches); err != nil {
+		t.Fatal(err)
+	}
+	if syncs != 0 {
+		t.Fatalf("exact retry flushed %d waves", syncs)
+	}
+}
