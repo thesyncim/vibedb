@@ -181,7 +181,13 @@ func (c *Collection) createIndexContext(
 			ErrPrimaryCutoverUnsupported,
 		)
 	}
-	if c.packedLogicalCutPending() {
+	// An unindexed full compact stripe may keep its newest rows in the bounded
+	// overlay with temporary posting slots. Those slots are local to the
+	// overlay and may overlap every slot in the full physical stripe, so an
+	// online exact scan must first fold that suffix into a wide physical leaf.
+	// The repartitioner can then split the wide leaf into the exact index's
+	// 256-slot geometry before any bucket is captured.
+	if c.packedLogicalCutPending() || c.primaryUnifiedOverlay.hasPending() {
 		if err := c.materializePrimaryOverlayPressureLocked(); err != nil {
 			c.writer.Unlock()
 			return store.IndexInfo{}, err
