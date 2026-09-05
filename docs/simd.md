@@ -117,6 +117,7 @@ architecture, fixtures, and exact revision pairs.
 - `internal/storeio/compact_stream_codec_simd_extrema.go`: extrema front end and scalar packed reductions.
 - `internal/storeio/compact_stream_codec_simd_extrema_arm64.go`: ARM64 extrema kernels kept after the pre-existing packed kernels.
 - `internal/storeio/compact_stream_codec_simd_extrema_amd64.go`: AMD64 extrema reductions and kernels kept after the pre-existing packed kernels.
+- `scripts/bench/run-packed-extrema-avx2.sh`: same-binary AMD64 AVX2 enabled/disabled extrema speed qualification with a paired median gate.
 - `internal/storeio/compact_stream_codec_dispatch_scalar.go`: portable dispatch.
 - `internal/storeio/compact_primary_stripe.go`: compressed stripe count operations.
 - `internal/storeio/primary_graph_unified_filter.go`: durable packed equality, ordered count, and extrema integration.

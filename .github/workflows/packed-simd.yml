@@ -17,6 +17,7 @@ on:
       - 'query/file_packed_extrema*_test.go'
       - '.github/workflows/packed-simd.yml'
       - 'scripts/bench/run-packed-simd.sh'
+      - 'scripts/bench/run-packed-extrema-avx2.sh'
   workflow_dispatch:
     inputs:
       base_ref:
@@ -240,6 +241,23 @@ jobs:
             "${tests}" > "${evidence}/commands.txt"
           go test -v -count=1 -timeout=5m ./internal/storeio ./query \
             -run "${tests}" 2>&1 | tee "${evidence}/tests.txt"
+
+      - name: Qualify AMD64 extrema AVX2 speed
+        if: matrix.runner == 'ubuntu-latest'
+        working-directory: ${{ github.workspace }}
+        env:
+          GOAMD64: v1
+          GOEXPERIMENT: simd
+        run: |
+          set -euo pipefail
+          test "$(go env GOARCH)" = amd64
+          test "$(go env GOAMD64)" = v1
+          VIBEDB_TEST_REQUIRE_AVX2=1 go test -count=1 -timeout=5m ./internal/storeio \
+            -run '^TestCountCompactPackedExtremaDispatchAVX2$'
+          bash scripts/bench/run-packed-extrema-avx2.sh \
+            "${RUNNER_TEMP}/packed-simd/avx2-extrema" \
+            "${RUNNER_TEMP}/packed-simd-binaries/head-query.test" \
+            "${RUNNER_TEMP}/packed-simd-binaries/head-storeio.test"
 
       - name: Collect alternating native raw benchmarks
         working-directory: ${{ github.workspace }}
