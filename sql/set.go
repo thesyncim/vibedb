@@ -101,6 +101,7 @@ type SetOrderTerm struct {
 	Name   string
 	Output int
 	Desc   bool
+	Nulls  WindowNullOrder
 	Pos    int
 }
 
@@ -1051,9 +1052,15 @@ func (s *setExpressionParser) parseOrderTerm(
 		s.advance()
 	}
 	if s.tok.kind == tokIdent && s.tok.kw == kwNulls {
-		return term, s.errHere(
-			"NULLS FIRST/LAST is not supported: the engine sorts nulls first ascending and last descending",
-		)
+		s.advance()
+		if s.tok.kind == tokIdent && s.tok.kw == kwFirst {
+			term.Nulls = WindowNullsFirst
+		} else if s.tok.kind == tokIdent && s.tok.kw == kwLast {
+			term.Nulls = WindowNullsLast
+		} else {
+			return term, s.errHere("expected FIRST or LAST after NULLS")
+		}
+		s.advance()
 	}
 	if s.tok.kind == tokIdent && s.tok.kw == kwCollate {
 		return term, s.errHere("COLLATE is not supported: strings compare by decoded content")

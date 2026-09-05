@@ -192,6 +192,105 @@ func TestReplicatedDataReaderLinearizableRefreshesNotLeader(t *testing.T) {
 	}
 }
 
+type sameGroupBatchReadClient struct {
+	states   map[string]shardservice.ReplicatedMemberState
+	response []byte
+	wantMax  uint32
+	reads    int
+}
+
+func (client *sameGroupBatchReadClient) DoReplicated(
+	_ context.Context,
+	endpoint ReplicatedEndpoint,
+	request *shardservice.ReplicatedRequest,
+) (*shardservice.ReplicatedResponse, error) {
+	state := client.states[endpoint.Address]
+	if request.Operation == shardservice.ReplicatedProbe {
+		return &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedHandshake,
+			HasState: true, State: state}, nil
+	}
+	client.reads++
+	batch, err := replicatedstate.OpenPointReadBatch(request.BatchRead)
+	if err != nil || request.Operation != shardservice.ReplicatedReadBatchLeader ||
+		request.Capability != serviceauthz.CapabilityDataRead ||
+		request.MinimumApplied != 1 || request.MaxValueBytes != client.wantMax {
+		return nil, ErrReplicatedRoute
+	}
+	_ = batch
+	return &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedReadBatchResult,
+		HasState: true, State: state, ReadApplied: state.Applied,
+		Value: client.response}, nil
+}
+
+// BenchmarkReplicatedDataReaderBatchSameGroupEightPoints measures one
+// same-group eight-point batch end to end: per-point resolution against the
+// pinned catalog, grouping, one RPC, and the ordered merge.
+func BenchmarkReplicatedDataReaderBatchSameGroupEightPoints(b *testing.B) {
+	config, endpoints, descriptor, profile := testReplicatedTableInput(b)
+	snapshot, err := NewSnapshotWithReplicatedTableMetadata(
+		config, endpoints, 5, nil, nil, []ReplicatedShardDescriptor{descriptor},
+		[]ReplicatedTableProfile{profile},
+	)
+	if err != nil {
+		b.Fatal(err)
+	}
+	const pointCount = 8
+	packed := binary.LittleEndian.AppendUint32(nil, pointCount)
+	packed = append(packed, 0xFF)
+	points := make([]ReplicatedTableBatchPoint, 0, pointCount)
+	values := make([]byte, 0, pointCount*2)
+	for index := range pointCount {
+		key, ok := orderedkey.AppendString(nil, []byte{'k', byte('0' + index)}, orderedkey.Ascending)
+		if !ok {
+			b.Fatal("key")
+		}
+		value := []byte{'v', byte('0' + index)}
+		packed = binary.LittleEndian.AppendUint32(packed, uint32(len(value)))
+		values = append(values, value...)
+		points = append(points, ReplicatedTableBatchPoint{Table: []byte("messages"), Key: key})
+	}
+	packed = append(packed, values...)
+	var replicas [ServingReplicaCount]ReplicatedEndpoint
+	var scratch [replication.MaxMutationKeyBytes + 16]byte
+	resolved, ok := snapshot.ResolveReplicatedTableKey(
+		[]byte("messages"), points[0].Key, scratch[:0], replicas[:0],
+	)
+	if !ok {
+		b.Fatal("resolve")
+	}
+	client := &sameGroupBatchReadClient{wantMax: 1 << 20, response: packed}
+	client.states = make(map[string]shardservice.ReplicatedMemberState)
+	for _, endpoint := range resolved.Route.Replicas {
+		client.states[endpoint.Address] = shardservice.ReplicatedMemberState{
+			Fence: shardservice.ReplicatedFence{Group: resolved.Route.Group,
+				AllocationGeneration: resolved.Route.AllocationGeneration,
+				Command:              resolved.Route.Command, MemberID: endpoint.Member,
+				StoreID: endpoint.StoreID, NodeIncarnation: endpoint.NodeIncarnation, Term: 7},
+			LeaderID: 2, Commit: 12, Applied: 12, CheckpointApplied: 11,
+		}
+	}
+	executor, err := NewReplicatedExecutor(client, 3, time.Second)
+	if err != nil {
+		b.Fatal(err)
+	}
+	reader, err := NewReplicatedDataReader(NewCatalogHolder(snapshot), executor)
+	if err != nil {
+		b.Fatal(err)
+	}
+	request := ReplicatedTableBatchReadRequest{MaxResultBytes: 1 << 20, Points: points}
+	b.ReportAllocs()
+	for b.Loop() {
+		result, err := reader.ReadBatch(context.Background(), request)
+		if err != nil || result.Count() != pointCount {
+			b.Fatalf("count=%d err=%v", result.Count(), err)
+		}
+		result.Release()
+	}
+	if client.reads != b.N {
+		b.Fatalf("reads=%d for %d batches, want one RPC per batch", client.reads, b.N)
+	}
+}
+
 func TestReplicatedDataReaderBatchUsesOneReadForTwoTables(t *testing.T) {
 	config, endpoints, descriptor, profile := testReplicatedTableInput(t)
 	config.Placements = append(config.Placements, config.Placements[0])
@@ -674,4 +773,87 @@ func TestReplicatedDataReaderHoldsResponseReservationUntilRelease(t *testing.T) 
 		t.Fatal(err)
 	}
 	result.Release()
+}
+
+func TestReplicatedBatchLiteResolveMatchesFullResolve(t *testing.T) {
+	client := &publicPointReadClient{wantRelation: 1, wantMaxValue: 4 << 20, wantMinimum: 10}
+	reader, _, key, full := testReplicatedDataReader(t, client)
+	lease := reader.catalog.pinCurrent()
+	if lease.snapshot == nil {
+		t.Fatal("no catalog snapshot")
+	}
+	defer lease.release()
+	var replicas [ServingReplicaCount]ReplicatedEndpoint
+	var scalar [replication.MaxMutationKeyBytes + 16]byte
+	lite, ok := lease.snapshot.resolveReplicatedTableKeyWithoutRouteID(
+		[]byte("messages"), key, scalar[:0], replicas[:0],
+	)
+	if !ok {
+		t.Fatal("lite resolve failed for a resolvable key")
+	}
+	if lite.RouteID != (replication.Digest{}) {
+		t.Fatal("lite resolve must not compute a route digest")
+	}
+	if replicatedRouteAuthority(lite.Route) != replicatedRouteAuthority(full.Route) {
+		t.Fatal("lite resolve authority differs from full resolve")
+	}
+	if lite.Profile != full.Profile || lite.Point != full.Point {
+		t.Fatal("lite resolve profile/point differs from full resolve")
+	}
+	prep, ok := lease.snapshot.replicatedTableResolvePrepFor([]byte("messages"))
+	if !ok {
+		t.Fatal("resolve prep failed for a resolvable table")
+	}
+	reuse := lite.Route
+	reuse.Replicas = nil
+	var replicasAgain [ServingReplicaCount]ReplicatedEndpoint
+	var scalarAgain [replication.MaxMutationKeyBytes + 16]byte
+	again, ok := lease.snapshot.resolveReplicatedTableKeyPrepared(
+		&prep, key, scalarAgain[:0], replicasAgain[:0], false, reuse, true,
+	)
+	if !ok {
+		t.Fatal("prepared reuse resolve failed for a resolvable key")
+	}
+	if replicatedRouteAuthority(again.Route) != replicatedRouteAuthority(full.Route) ||
+		again.Profile != full.Profile || again.Point != full.Point {
+		t.Fatal("prepared reuse resolve differs from full resolve")
+	}
+	prepMiss, ok := lease.snapshot.replicatedTableResolvePrepFor([]byte("no-such-table"))
+	if ok || prepMiss.mapper != nil {
+		t.Fatal("resolve prep must fail for an unknown table")
+	}
+	// The authority comparison must discriminate every coordinate it
+	// claims to cover: flipping any one of them has to break equality,
+	// and the digest has to agree.
+	flip := func(route ReplicatedRoute) []ReplicatedRoute {
+		out := make([]ReplicatedRoute, 0, 8)
+		next := route
+		next.AllocationGeneration++
+		out = append(out, next)
+		next = route
+		next.Command.OwnershipEpoch++
+		out = append(out, next)
+		next = route
+		next.Command.SchemaGeneration++
+		out = append(out, next)
+		next = route
+		next.Command.RouteGeneration++
+		out = append(out, next)
+		next = route
+		next.Command.RoutingVersion++
+		out = append(out, next)
+		next = route
+		next.Group.GroupID[0]++
+		out = append(out, next)
+		return out
+	}
+	want := replicatedRouteAuthority(full.Route)
+	for index, tampered := range flip(full.Route) {
+		if replicatedRouteAuthority(tampered) == want {
+			t.Fatalf("authority comparison blind to coordinate %d", index)
+		}
+		if replicatedRouteAuthorityDigest(tampered) == replicatedRouteAuthorityDigest(full.Route) {
+			t.Fatalf("route digest blind to coordinate %d", index)
+		}
+	}
 }

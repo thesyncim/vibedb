@@ -329,7 +329,9 @@ func checkStatementInvariantsScoped(
 		checkPath(t, s, key, outer)
 	}
 	for i := range s.OrderBy {
-		if s.OrderBy[i].Output == 0 {
+		if s.OrderBy[i].Scalar != nil {
+			seen += checkScalarInvariants(t, s, s.OrderBy[i].Scalar, outer)
+		} else if s.OrderBy[i].Output == 0 {
 			checkPath(t, s, s.OrderBy[i].Path, outer)
 		} else if s.OrderBy[i].Output > len(s.Columns) {
 			t.Fatalf("OrderBy[%d] output %d is outside SELECT list", i, s.OrderBy[i].Output)
@@ -628,7 +630,7 @@ func checkScalarInvariants(t *testing.T, s *SelectStmt, e *ScalarExpr, outer *La
 		}
 		return checkScalarInvariants(t, s, e.Left, outer)
 	case ScalarBinary:
-		if e.Left == nil || e.Right == nil || e.Op > ScalarConcat {
+		if e.Left == nil || e.Right == nil || (e.Op > ScalarConcat && !e.Op.Conditional()) {
 			t.Fatalf("scalar binary has invalid payload: %+v", e)
 		}
 		return checkScalarInvariants(t, s, e.Left, outer) +

@@ -784,7 +784,8 @@ func (session *NativeSession) validateNativeMutation(mutation NativeMutation) er
 	}
 	switch mutation.Kind {
 	case replication.MutationPut, replication.MutationPutAbsentOrEqual,
-		replication.MutationPutDigestEqual:
+		replication.MutationPutDigestEqual, replication.MutationPutAbsent,
+		replication.MutationPutPresent, replication.MutationPutIfAbsent:
 		if len(mutation.Value) == 0 ||
 			len(mutation.Value) > replication.MaxMutationValueBytes ||
 			len(mutation.Value) > session.maxCommand {

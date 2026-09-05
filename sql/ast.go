@@ -617,7 +617,9 @@ type OrderTerm struct {
 	Scalar *ScalarExpr
 	// Desc sorts descending.
 	Desc bool
-	Pos  int
+	// Nulls explicitly overrides the legacy null placement when nonzero.
+	Nulls WindowNullOrder
+	Pos   int
 }
 
 // A PathExpr addresses a value inside one range variable's documents.

@@ -1357,7 +1357,7 @@ func transactionMutationValid(mutation replication.Mutation) bool {
 		mutation.ExpectedValueDigest == (replication.Digest{})
 	switch mutation.Kind {
 	case replication.MutationPut, replication.MutationPutAbsentOrEqual,
-		replication.MutationPutAbsent, replication.MutationPutPresent:
+		replication.MutationPutAbsent, replication.MutationPutPresent, replication.MutationPutIfAbsent:
 		return len(mutation.Value) > 0 && len(mutation.Value) <= replication.MaxMutationValueBytes &&
 			zeroExpected
 	case replication.MutationDelete:

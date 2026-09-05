@@ -17,7 +17,7 @@ const (
 	ScalarCase
 )
 
-// ScalarOp is an arithmetic, sign, or concatenation operation.
+// ScalarOp is an arithmetic, sign, concatenation, or conditional operation.
 type ScalarOp uint8
 
 const (
@@ -29,7 +29,16 @@ const (
 	ScalarConcat
 	ScalarPositive
 	ScalarNegative
+	ScalarCoalesce
+	ScalarGreatest
+	ScalarLeast
+	ScalarNullIf
 )
+
+// Conditional reports whether op selects among its operands. Variadic SQL
+// conditional expressions are represented by balanced binary trees, retaining
+// argument order and evaluating each argument at most once.
+func (op ScalarOp) Conditional() bool { return op >= ScalarCoalesce && op <= ScalarNullIf }
 
 // ScalarCastTarget is one closed, executable SQL conversion domain. JSON is
 // deliberately the textual json type, not jsonb: the engine preserves exact

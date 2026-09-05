@@ -21,6 +21,7 @@ same revision; [stability and compatibility](status.md) explains the boundaries.
 | Understand keys, JSON values, and index definitions | [Data model](data-model.md) |
 | Execute reusable typed plans | [Query API](api/query.md) |
 | Use Go's SQL connection pool | [SQL API](api/sql.md) |
+| Track application SQL compatibility gaps | [SQL workload tracker](compatibility/sql-workload.md) |
 | Connect a PostgreSQL client | [PostgreSQL wire adapter](api/pgwire.md) |
 | Commit related changes together | [Transactions](transactions.md) |
 | Choose when writes become durable | [Durability and recovery](durability.md) |

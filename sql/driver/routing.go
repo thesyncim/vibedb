@@ -136,7 +136,8 @@ type constraintProgram struct {
 // It is exported so the embedded cluster facade and distributed gateway share
 // one exact routing implementation rather than maintaining parity by convention.
 type ConstraintProgram struct {
-	slots []predicateSlot
+	slots   []predicateSlot
+	boolean *booleanConstraintProgram
 }
 
 // predicateSlot collects the narrowing predicates a WHERE tree places on one
@@ -171,7 +172,10 @@ func compileConstraintProgram(binding *placementBinding, where *sqlast.Expr) *co
 // safe for concurrent Bind calls.
 func CompileConstraintProgram(placementColumns []string, where *sqlast.Expr) *ConstraintProgram {
 	prog := &ConstraintProgram{slots: make([]predicateSlot, len(placementColumns))}
-	prog.discover(where, placementColumns)
+	prog.boolean = compileBooleanConstraints(placementColumns, where)
+	if prog.boolean == nil {
+		prog.discover(where, placementColumns)
+	}
 	return prog
 }
 
@@ -248,6 +252,9 @@ func matchPlacementColumn(path *sqlast.PathExpr, placementColumns []string) (int
 // a value that cannot be bound to a placement scalar preserves DomainUnknown, so
 // routing is never narrowed by a value it cannot canonically encode.
 func (p *ConstraintProgram) Bind(args []any) (distribution.BoundConstraints, error) {
+	if p.boolean != nil {
+		return p.boolean.bind(args)
+	}
 	cons := make(distribution.BoundConstraints, len(p.slots))
 	builder := distribution.NewConstraintBuilder()
 	var scratch []distribution.Scalar

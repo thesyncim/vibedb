@@ -285,6 +285,9 @@ const (
 	// an applied zero-row no-op. It is the byte-native conditional-update
 	// primitive.
 	MutationPutPresent MutationKind = 7
+	// MutationPutIfAbsent validates the candidate and inserts it only if absent.
+	// An existing key is a successful zero-row no-op, even if its value differs.
+	MutationPutIfAbsent MutationKind = 8
 )
 
 // Mutation is one caller-owned command mutation. Key and Value are borrowed

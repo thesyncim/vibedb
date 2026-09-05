@@ -192,6 +192,12 @@ func (r *statementSetSQL) explainTail() *explainSQLSetTail {
 		if term.Desc {
 			direction = " DESC"
 		}
+		if term.Nulls == sqlast.WindowNullsFirst {
+			direction += " NULLS FIRST"
+		}
+		if term.Nulls == sqlast.WindowNullsLast {
+			direction += " NULLS LAST"
+		}
 		tail.OrderBy = append(tail.OrderBy, term.Name+direction)
 	}
 	if r.hasLimit {

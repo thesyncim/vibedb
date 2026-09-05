@@ -282,6 +282,11 @@ func (p *Parser) validate() error {
 	grouped := len(p.out.GroupBy) > 0
 	aggregates, projections := 0, 0
 	firstProjection := -1
+	for i := range p.out.OrderBy {
+		if _, hasAggregate := scalarDependencyKinds(p.out.OrderBy[i].Scalar); hasAggregate {
+			aggregates++
+		}
+	}
 	for i := range p.out.Columns {
 		column := &p.out.Columns[i]
 		if column.Window != nil {
@@ -642,6 +647,13 @@ func (p *Parser) validateOrder(grouped, hasAggregate bool) error {
 			if term.Output != 0 {
 				continue
 			}
+			if term.Scalar != nil {
+				if path := firstUngroupedScalarPath(p, term.Scalar); path != nil {
+					return p.errfAt(path.Pos,
+						"ORDER BY expression reads path %q, which is not a GROUP BY key", path.Spec())
+				}
+				continue
+			}
 			if !p.isGroupKey(term.Path) {
 				return p.errfAt(term.Pos,
 					"ORDER BY %q is not a GROUP BY key: grouped rows are ordered by their key",
@@ -652,6 +664,11 @@ func (p *Parser) validateOrder(grouped, hasAggregate bool) error {
 	}
 	if hasAggregate {
 		for i := range p.out.OrderBy {
+			if scalar := p.out.OrderBy[i].Scalar; scalar != nil {
+				if hasPath, _ := scalarDependencyKinds(scalar); !hasPath {
+					continue
+				}
+			}
 			if p.out.OrderBy[i].Output == 0 {
 				// query's compiler silently drops ORDER BY for a single-row
 				// aggregate result. A window output may legitimately supply

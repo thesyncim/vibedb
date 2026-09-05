@@ -289,7 +289,21 @@ func (p *Parser) parseInsert() error {
 			return err
 		}
 		if p.tok.kind == tokLParen {
-			return p.featureNotSupportedHere("ON CONFLICT targets are not supported; omit the target because the document-derived primary key is the only conflict target")
+			p.advance()
+			path, err := p.parsePath(false)
+			if err != nil {
+				return err
+			}
+			if len(path.Segments) != 1 || path.Segments[0].IsIndex {
+				return p.featureNotSupportedHere("ON CONFLICT targets must name one unqualified primary-key column")
+			}
+			if p.tok.kind == tokComma {
+				return p.featureNotSupportedHere("composite ON CONFLICT targets require composite primary-key support")
+			}
+			if err := p.expect(tokRParen, "')' after ON CONFLICT target"); err != nil {
+				return err
+			}
+			p.ins.ConflictTarget = path
 		}
 		if p.atKeyword(kwOn) {
 			return p.featureNotSupportedHere("ON CONFLICT ON CONSTRAINT is not supported; the document-derived primary key is the only conflict target")
@@ -947,6 +961,11 @@ func (p *Parser) parseInsertRow() (InsertRow, error) {
 					return row, p.errfHere("the VALUES row has %d value(s), but the column list has %d", i, len(p.ins.Columns))
 				}
 				p.advance()
+			}
+			if p.atKeyword(kwNull) {
+				values[i] = Operand{Kind: OperandNull, Pos: p.tok.pos}
+				p.advance()
+				continue
 			}
 			value, err := p.parseOperand()
 			if err != nil {

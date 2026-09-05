@@ -41,6 +41,7 @@ func FuzzOpenCommand(f *testing.F) {
 	conditionalWrites.Batches[0].Mutations = []Mutation{
 		{Kind: MutationPutAbsent, Key: []byte("insert"), Value: []byte("new")},
 		{Kind: MutationPutPresent, Key: []byte("update"), Value: []byte("replacement")},
+		{Kind: MutationPutIfAbsent, Key: []byte("ignore"), Value: []byte("candidate")},
 	}
 	f.Add(encodeCommand(f, conditionalWrites))
 	multi := testCommand()
@@ -257,7 +258,7 @@ func assertFuzzCommandView(t *testing.T, data []byte, view CommandView) {
 				t.Fatal("accepted invalid or unclamped mutation")
 			}
 			switch mutation.Kind {
-			case MutationPut, MutationPutAbsentOrEqual, MutationPutAbsent, MutationPutPresent:
+			case MutationPut, MutationPutAbsentOrEqual, MutationPutAbsent, MutationPutPresent, MutationPutIfAbsent:
 				if len(mutation.Value) == 0 || len(mutation.Value) > MaxMutationValueBytes {
 					t.Fatal("accepted invalid put")
 				}

@@ -1,0 +1,4 @@
+ok  	github.com/thesyncim/vibedb/query	0.009s
+ok  	github.com/thesyncim/vibedb/sql	0.003s
+ok  	github.com/thesyncim/vibedb/sql/driver	10.810s
+ok  	github.com/thesyncim/vibedb/shardservice	0.004s [no tests to run]

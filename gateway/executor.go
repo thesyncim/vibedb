@@ -308,6 +308,23 @@ func (e *Executor) queryWithProfileValidation(
 			// partially commit a mutation. Writes dispatch through Exec instead.
 			return nil, &WriteNotSupportedError{Kind: prepared.statement.Kind}
 		}
+		if prepared.manifest == nil {
+			res, coordinatorErr := e.queryCoordinator(attemptContext, snap, q, prepared, profile, args)
+			if coordinatorErr == nil {
+				res.Retries = attempt
+				if nativeAttempt != nil {
+					res.Observations = nativeAttempt.resultObservations()
+				}
+				return res, nil
+			}
+			if isStaleErr(coordinatorErr) && attempt < e.maxRetry {
+				staleGen = snap.Generation()
+				attempt++
+				e.metrics.observeRetry()
+				continue
+			}
+			return nil, coordinatorErr
+		}
 		bound, err := prepared.Bind(args)
 		if err != nil {
 			return nil, err
@@ -356,6 +373,23 @@ func (e *Executor) queryWithProfileValidation(
 			return nil, indexErr
 		}
 		pl, err := e.routeContextCached(opctx, snap, &q, bound, profile, cache)
+		if errors.Is(err, ErrDistributedPlanUnsupported) {
+			res, coordinatorErr := e.queryCoordinator(attemptContext, snap, q, prepared, profile, args)
+			if coordinatorErr == nil {
+				res.Retries = attempt
+				if nativeAttempt != nil {
+					res.Observations = nativeAttempt.resultObservations()
+				}
+				return res, nil
+			}
+			if isStaleErr(coordinatorErr) && attempt < e.maxRetry {
+				staleGen = snap.Generation()
+				attempt++
+				e.metrics.observeRetry()
+				continue
+			}
+			return nil, coordinatorErr
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -758,11 +792,14 @@ func (e *Executor) Explain(ctx context.Context, q Query) (*Explanation, error) {
 		// never dispatches a mutation, so it refuses non-SELECT statements.
 		return nil, &WriteNotSupportedError{Kind: prepared.statement.Kind}
 	}
+	profile := e.profileFor(q.Class)
+	if prepared.manifest == nil {
+		return e.explainCoordinator(ctx, snap, q, prepared, profile, args)
+	}
 	bound, err := prepared.Bind(args)
 	if err != nil {
 		return nil, err
 	}
-	profile := e.profileFor(q.Class)
 	if useGlobalIndexRead(bound) {
 		if bound.alwaysReason != "" || (bound.globalEmpty && bound.emptyReason != "") {
 			reason := bound.alwaysReason
@@ -814,6 +851,9 @@ func (e *Executor) Explain(ctx context.Context, q Query) (*Explanation, error) {
 		}, nil
 	}
 	physical, err := e.routeContext(ctx, snap, &q, bound, profile)
+	if errors.Is(err, ErrDistributedPlanUnsupported) {
+		return e.explainCoordinator(ctx, snap, q, prepared, profile, args)
+	}
 	if err != nil {
 		return nil, err
 	}
