@@ -15,6 +15,29 @@ env:
   GOEXPERIMENT: simd
 
 jobs:
+  portable-rf3:
+    name: Native RF3 SQL and restart (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.27'
+      - name: Verify portable sidecar recovery and strict-mode separation
+        run: go test -count=1 ./internal/storeio ./store/durable ./sql/driver -run 'TestPortable|TestSealed|TestReplicatedShardStorePortableSealedBind'
+      - name: Verify ownership retries and core admission
+        run: go test -count=1 ./internal/multiraft ./internal/raftservice -run 'TestHostControlProposalReturnsCoreAdmission|TestReplicaActionFencesOwnershipAndRetirementExactly'
+      - name: Prepare command build cache
+        run: go build -trimpath ./cmd/vibedb ./cmd/vibedb-shard ./cmd/vibedb-gateway
+      - name: Create a table, write rows, restart RF3, and read them back
+        run: go test -count=1 -timeout=5m ./internal/gatewayruntime -run '^TestPostgreSQLDevOnlineCreateTableAndRestart$'
+      - name: Replace an RF3 replica with live ownership retries
+        run: go test -count=3 -timeout=5m ./cmd/vibedb-shard -run '^TestServeRF3ShippedCompositionThreeProcesses$'
   repository-contracts:
     if: ${{ !cancelled() }}
     name: repository contracts

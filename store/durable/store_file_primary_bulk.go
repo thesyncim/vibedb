@@ -503,7 +503,7 @@ func createFromPrimaryGraphRecords(
 						return normalized.primaryUnifiedOverlayBytes
 					}
 					return 0
-				}(), normalized.SealedRecoveryJournalBytes,
+				}(), normalized.SealedRecoveryJournalBytes, normalized.PortableSealedCapacity,
 			),
 		); err != nil {
 			_ = tx.Abort()

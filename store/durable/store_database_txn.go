@@ -60,16 +60,21 @@ var (
 
 // TxnLogOptions configures transaction-log construction and recovery. A zero Capacity selects the decision-log
 // package default at mint time. SealedCapacity requires a non-zero exact
-// Capacity and makes txn.vtm a Linux-only immutable physical allocation.
+// Capacity. Its allocation is strict unless PortableCapacity is enabled.
 type TxnLogOptions struct {
 	Capacity       uint64
 	SealedCapacity bool
+	// PortableCapacity permits fixed-size sidecars without a private physical reservation.
+	PortableCapacity bool
 }
 
 // ValidateTxnLogOptions validates the transaction-marker geometry without
 // opening a directory or creating txn.vtm. Unsealed zero capacity retains the
 // storeio default; a sealed profile must name one exact supported geometry.
 func ValidateTxnLogOptions(options TxnLogOptions) error {
+	if options.PortableCapacity && !options.SealedCapacity {
+		return fmt.Errorf("%w: portable capacity requires sealed geometry", ErrSealedJournalCapacity)
+	}
 	if options.SealedCapacity &&
 		(options.Capacity == 0 ||
 			options.Capacity > storeio.TxnMarkerMaxCapacityBytes ||
@@ -1154,7 +1159,7 @@ func (l *TxnLog) ensureMintedLocked() error {
 	marker, err := storeio.CreateTxnMarkerAt(
 		l.root, txnMarkerFilename,
 		storeio.TxnMarkerOptions{
-			Capacity: l.opts.Capacity, SealedCapacity: l.opts.SealedCapacity,
+			Capacity: l.opts.Capacity, SealedCapacity: l.opts.SealedCapacity, PortableCapacity: l.opts.PortableCapacity,
 		},
 	)
 	if err != nil {

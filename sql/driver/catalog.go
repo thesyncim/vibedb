@@ -857,7 +857,7 @@ func (d *database) openCatalogCollectionsWithTransactionsLocked(openOptions Repl
 	if replicated := d.catalog.ReplicatedShardStore; replicated != nil {
 		txnOptions = durable.TxnLogOptions{
 			Capacity:       replicated.Sidecars.TransactionMarkerBytes,
-			SealedCapacity: true,
+			SealedCapacity: true, PortableCapacity: true,
 		}
 	}
 	var collections []*durable.Collection
@@ -1096,6 +1096,7 @@ func durableOptions(t *table) durable.Options {
 		// same contract; batching changes barrier count, not durability semantics.
 		Durability:                 durable.DurabilitySync,
 		SealedRecoveryJournalBytes: t.meta.SealedRecoveryJournalBytes,
+		PortableSealedCapacity:     t.meta.SealedRecoveryJournalBytes != 0,
 	}
 	for _, index := range t.meta.Indexes {
 		options.Indexes = append(options.Indexes, store.IndexDefinition{

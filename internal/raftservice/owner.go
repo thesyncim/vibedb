@@ -5,6 +5,7 @@ package raftservice
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -724,6 +725,7 @@ type Owner struct {
 type ownerHost interface {
 	AdoptMessage(raftmember.GroupKey, *pb.Message) error
 	EnqueueProposal(raftmember.GroupKey, []byte) error
+	ProposeControl(raftmember.GroupKey, []byte) error
 	EnqueueTrackedProposal(raftmember.GroupKey, []byte, multiraft.ProposalToken) error
 	ProposeConfChange(raftmember.GroupKey, pb.ConfChangeI) error
 	ReadIndex(raftmember.GroupKey, []byte) error
@@ -775,12 +777,23 @@ type MembershipAuthority interface {
 }
 
 type ownerMember struct {
-	identity   raftmember.RuntimeIdentity
-	command    CommandFence
-	read       ReadSource
-	recovery   TransactionRecoverySource
-	retiring   bool
-	generation *ownerGeneration
+	identity          raftmember.RuntimeIdentity
+	command           CommandFence
+	read              ReadSource
+	recovery          TransactionRecoverySource
+	retiring          bool
+	generation        *ownerGeneration
+	ownershipProposal *ownershipProposal
+}
+
+// One accepted ownership proposal per command fence and leadership term is
+// enough: control callers may retry while its first copy is still awaiting
+// apply. Retaining only this bounded control state keeps retries out of Raft's
+// log without changing replicated transition validation.
+type ownershipProposal struct {
+	command CommandFence
+	term    uint64
+	digest  [32]byte
 }
 
 // ReplicaRetirementRequest is the exact final local-source fence for one
@@ -2128,7 +2141,20 @@ func (owner *Owner) applyOwnershipTransition(fence ServingFence, command []byte)
 		status.Term != fence.Term {
 		return &NotLeaderError{Status: status}
 	}
-	return owner.host.EnqueueProposal(fence.Group, command)
+	digest := sha256.Sum256(command)
+	if pending := member.ownershipProposal; pending != nil &&
+		pending.term == status.Term && pending.command == fence.Command {
+		if pending.digest != digest {
+			return ErrServingFence
+		}
+		return nil
+	}
+	if err := owner.host.ProposeControl(fence.Group, command); err != nil {
+		return err
+	}
+	member.ownershipProposal = &ownershipProposal{command: fence.Command, term: status.Term, digest: digest}
+	owner.members[fence.Group] = member
+	return nil
 }
 
 func ownershipTransitionMatchesFence(
@@ -3271,9 +3297,10 @@ func (owner *Owner) ApplyMembership(ctx context.Context, request MembershipReque
 }
 
 // ProposeOwnershipTransition admits one canonical ownership transition through
-// the serialized Owner lane. A nil result means the exact bytes entered the
-// bounded Host queue, not that they applied. Callers settle the outcome from
-// ObserveReplica and must replay the same operation/step on uncertainty.
+// the serialized Owner lane. A nil result means the local core accepted the
+// exact bytes in this term (including an in-flight exact retry); it does not
+// imply apply. Callers settle the outcome from ObserveReplica and must replay
+// the same operation/step on uncertainty.
 func (owner *Owner) ProposeOwnershipTransition(
 	ctx context.Context,
 	fence ServingFence,

@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 package gatewayruntime
 
@@ -23,7 +23,13 @@ import (
 func TestPostgreSQLDevOnlineCreateTableAndRestart(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Minute)
 	defer cancel()
-	root := t.TempDir()
+	// Keep the persisted DDL Unix socket below both platforms' pathname bound;
+	// macOS's default test temporary directory includes a long /var prefix.
+	root, err := os.MkdirTemp("/tmp", "vdb-ddl-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
 	bin := filepath.Join(root, "bin")
 	if err := os.Mkdir(bin, 0700); err != nil {
 		t.Fatal(err)

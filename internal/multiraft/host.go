@@ -1045,6 +1045,26 @@ func (host *Host) ValidateReadAuthorityToken(
 	return provider.ValidateReadAuthorityToken(token)
 }
 
+// ProposeControl synchronously admits one bounded, caller-authorized control
+// command to the local core. Unlike EnqueueProposal, success means admission
+// has occurred, so a caller can suppress in-flight retries without retaining
+// commands the core actually refused. Success still does not imply commit.
+func (host *Host) ProposeControl(key raftmember.GroupKey, data []byte) error {
+	group, err := host.lookup(key)
+	if err != nil {
+		return err
+	}
+	if group.schemaTransitionFenced || group.schemaQuiescing || group.schemaQuiesced {
+		return ErrGroupBusy
+	}
+	if len(data) > raftmodel.MaxProposalBytes {
+		return fmt.Errorf("%w: proposal exceeds bound", raftmodel.ErrAdmissionBound)
+	}
+	err = group.runtime.Propose(data)
+	host.finishDirectControl(group, err)
+	return err
+}
+
 // ProposeConfChange synchronously admits one caller-authorized membership
 // operation. Control input is intentionally not queued: the caller must drive
 // and retry after ErrReadyPending, preventing stale topology intent from
