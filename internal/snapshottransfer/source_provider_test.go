@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/thesyncim/vibedb/internal/migrationbudget"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
@@ -148,6 +149,90 @@ func TestRetainedSourceProviderRejectsWrongIdentityAndStaleMembership(t *testing
 	if _, err = provider.PinSourceExport(context.Background(), request); !errors.Is(err, ErrStaleFence) {
 		t.Fatalf("workspace was not returned after stale cut: %v", err)
 	}
+}
+
+func TestRetainedSourceProviderReservesBothWorkspacesAtomically(t *testing.T) {
+	cut, fixture := sourceExportFixture(t, sourceExportLimits())
+	root := t.TempDir()
+	node := rafttransport.NodeID{46}
+	config := transferBudgetConfig(2, 1<<30, MinChunkBytes)
+	config.BufferBytes = 2 * MinChunkBytes
+	budget, err := migrationbudget.New(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := retainedSourceOptions(fixture, root, filepath.Join(root, "artifacts"), node,
+		&retainedTestCut{cut: cut})
+	options.Budget = budget
+	options.MaxConcurrent = 2
+	provider, err := OpenRetainedSourceExportProvider(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer provider.Close()
+	request := retainedSourceRequest(fixture, node)
+	first, err := provider.PinSourceExport(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Release()
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		second, pinErr := provider.PinSourceExport(ctx, request)
+		if second.Release != nil {
+			second.Release()
+		}
+		result <- pinErr
+	}()
+	deadline := time.Now().Add(time.Second)
+	for budget.Metrics().BufferWaiters == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if budget.Metrics().BufferWaiters == 0 {
+		t.Fatalf("second plan did not wait for one atomic workspace reservation: %+v", budget.Metrics())
+	}
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("second plan cancellation = %v", err)
+	}
+}
+
+func TestRetainedSourceProviderSaturationReleasesPlan(t *testing.T) {
+	cut, fixture := sourceExportFixture(t, sourceExportLimits())
+	root := t.TempDir()
+	node := rafttransport.NodeID{47}
+	options := retainedSourceOptions(fixture, root, filepath.Join(root, "artifacts"), node,
+		&retainedTestCut{cut: cut})
+	options.MaxConcurrent = 1
+	provider, err := OpenRetainedSourceExportProvider(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer provider.Close()
+	request := retainedSourceRequest(fixture, node)
+	first, err := provider.PinSourceExport(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = provider.PinSourceExport(context.Background(), request); !errors.Is(err, ErrBound) {
+		t.Fatalf("saturated pin error = %v, want ErrBound", err)
+	}
+	released := make(chan struct{})
+	go func() {
+		first.Release()
+		close(released)
+	}()
+	select {
+	case <-released:
+	case <-time.After(time.Second):
+		t.Fatal("saturated plan release blocked returning its workspace")
+	}
+	second, err := provider.PinSourceExport(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second.Release()
 }
 
 func TestRetainedSourceProviderRepositoryPathCannotEscapeOrTraverseSymlink(t *testing.T) {

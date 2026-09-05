@@ -66,6 +66,9 @@ func (r *Repository) ReleasePublished(q ArtifactReleaseRequest) error {
 	if rec.descriptor != d {
 		return ErrStaleFence
 	}
+	if rec.finishing {
+		return ErrArtifactBusy
+	}
 	if !rec.complete {
 		return ErrStaleFence
 	}
@@ -147,6 +150,9 @@ func (r *Repository) AbandonArtifact(w ArtifactAbandonmentWitness) (uint64, erro
 	}
 	if rec.descriptor != d {
 		return 0, ErrStaleFence
+	}
+	if rec.finishing {
+		return 0, ErrArtifactBusy
 	}
 	if rec.readers != 0 {
 		return 0, ErrArtifactBusy
