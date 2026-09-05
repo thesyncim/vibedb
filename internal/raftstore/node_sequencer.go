@@ -2,6 +2,7 @@ package raftstore
 
 import (
 	"errors"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1206,9 +1207,18 @@ func (q *NodeSubmissionSequencer) run() {
 	var ready [MaxPersistGroupBatches]NodeReady
 	for {
 		count := 0
+		yielded := false
 		var admission nodeWaveAdmission
 		for count < len(items) {
 			s, ok := q.peek()
+			if !ok && count == 1 && items[0].kind == submissionReady && !yielded {
+				// A just-completed wave wakes multiple independent owners. Give their
+				// already-runnable work one scheduler turn before freezing a singleton
+				// wave; never wait on a timer, missing group, or new arrival.
+				yielded = true
+				runtime.Gosched()
+				continue
+			}
 			if !ok || count > 0 && (items[0].kind != submissionReady || s.kind != submissionReady) ||
 				s.kind == submissionReady && submissionGroupSeen(&items, count, s.nodeReadyGroup()) {
 				break
