@@ -65,3 +65,36 @@ func TestReplicatedWholeDocumentUpsertRoutesCanonicalAtomicPuts(t *testing.T) {
 		}
 	}
 }
+
+func TestReplicatedColumnUpsertRoutesConflictProgramWithoutPreimageRead(t *testing.T) {
+	config, endpoints, descriptor, profile := testReplicatedTableInput(t)
+	snapshot, err := NewSnapshotWithReplicatedTableMetadata(config, endpoints, 5, nil, nil,
+		[]ReplicatedShardDescriptor{descriptor}, []ReplicatedTableProfile{profile},
+		[]ReplicatedTableDeclaration{{Table: "messages", CreateTable: `CREATE TABLE messages (id TEXT PRIMARY KEY, n INTEGER, city TEXT)`}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// No client exists: preparing the atomic conflict must not read a preimage.
+	executor := NewExecutor(nil, NewCatalogHolder(snapshot), Options{})
+	targets, handled, err := executor.planReplicatedSQLTransaction(t.Context(), snapshot, []Query{{
+		SQL:    `INSERT INTO messages (id,n,city) VALUES (?,1,'candidate') ON CONFLICT (id) DO UPDATE SET n=?,city=EXCLUDED.city`,
+		Params: []shardservice.Param{shardservice.StringParam("a"), shardservice.NumberParam("9007199254740993")},
+	}}, executor.profileFor(ClassInteractive))
+	if err != nil || !handled || len(targets) != 1 || len(targets[0].Batches) != 1 || len(targets[0].Batches[0].Mutations) != 1 {
+		t.Fatalf("targets=%+v handled=%v err=%v", targets, handled, err)
+	}
+	mutation := targets[0].Batches[0].Mutations[0]
+	candidate, program, ok := replication.OpenConflictValue(mutation.Value)
+	if mutation.Kind != replication.MutationPutConflict || !ok || string(candidate) != `{"city":"candidate","id":"a","n":1}` || len(program) == 0 {
+		t.Fatalf("invalid conflict program: kind=%v candidate=%s program=%x", mutation.Kind, candidate, program)
+	}
+	for _, statement := range []string{
+		`INSERT INTO messages (id,n) VALUES ('a',1) ON CONFLICT DO UPDATE SET absent=1`,
+		`INSERT INTO messages (id,n) VALUES ('a',1) ON CONFLICT DO UPDATE SET n=EXCLUDED.absent`,
+		`INSERT INTO messages (id,n) VALUES ('a',1) ON CONFLICT DO UPDATE SET id='another'`,
+	} {
+		if _, err := snapshot.Prepare(t.Context(), statement); err == nil {
+			t.Fatalf("invalid conflict action accepted: %s", statement)
+		}
+	}
+}

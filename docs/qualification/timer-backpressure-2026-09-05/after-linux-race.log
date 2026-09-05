@@ -1,0 +1,2 @@
+ok  	github.com/thesyncim/vibedb/internal/raftservice	1.453s
+docker run --rm --pull=never --platform linux/arm64 --network=none --mount     0.01s user 0.01s system 0% cpu 10.981 total

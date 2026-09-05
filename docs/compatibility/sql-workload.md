@@ -46,6 +46,7 @@ source locations, not query execution counts or a compatibility percentage.
 | NULL in INSERT column VALUES | — | Literal NULL reaches the existing nullable-field validator; primary-key and NOT NULL failures remain atomic. |
 | Explicit ON CONFLICT target | 58 | A single primary-key column is validated at prepare and execution, including explicit transactions. Composite and secondary unique targets remain unsupported. Secondary unique violations are never silently skipped. |
 | Computed ORDER BY | 69 GREATEST/LEAST locations include sort usage | Hidden scalar and aggregate sort keys run before OFFSET/LIMIT. Grouping, joins, derived relations, and window outputs retain their own semantic stages; distributed sorts evaluate the complete qualifying relation. |
+| IS [NOT] DISTINCT FROM | Reduced comparison case | Total null-safe comparison over supported scalar domains, with each operand evaluated once. Uses the shared predicate/CASE stage on embedded and distributed reads and mutations. Equality against a placement key retains finite shard routing through CTE aliases. Existing scalar WHERE/grouping restrictions remain. |
 
 These features do not remove the existing restrictions on computed GROUP BY
 expressions, mixed scalar/path pattern predicates, grouped scalar
@@ -92,8 +93,12 @@ the original conflict action atomically in the shard driver. Arbitrary shard-key
 assignments still require a placement proof; copying the current or candidate
 key and whole-document EXCLUDED replacement preserve the routed owner.
 RF3 whole-document EXCLUDED replacement uses the native atomic put primitive
-and preserves its exact affected-row and retry semantics. Global-index conflict
-maintenance, column DO UPDATE, RETURNING, general mutation
+and preserves its exact affected-row and retry semantics. Declared RF3 column
+upserts now replicate a bounded conflict program with bound scalar constants
+and EXCLUDED column references. Each replica validates the candidate and column
+names before selecting the insert or update branch, then patches its current
+row atomically. Untouched fields and exact retry results are preserved.
+Computed conflict assignments, global-index conflict maintenance, RETURNING, general mutation
 predicates, and explicit transaction parity still need implementation. The
 bounded coordinator read path also still needs full RF3 global-index read
 integration. These are release gates for the requested distributed parity,
@@ -102,7 +107,7 @@ not claims closed by local tests.
 ## Remaining work
 
 The [SQL workload gap corpus](../../internal/conformance/sql_workload.go)
-contains 35 reduced statements. The
+contains 34 reduced statements. The
 [driver gate](../../sql/driver/sql_workload_compatibility_test.go) verifies that
 each still refuses at prepare or execution. When implementing a gap, replace
 its refusal expectation with result, metadata, and atomicity coverage and
@@ -117,7 +122,7 @@ update this table. A parser accepting a statement does not close a gap.
 | 1 | Relational mutations and queues | 36 UPDATE-FROM/DELETE-USING and 14 modifying-CTE locations. Requires atomic shared-snapshot execution, INSERT-SELECT with target columns, conflict-action WHERE, and returned-row dependencies. |
 | 1 | Locking and queue concurrency | 14 locking locations, including FOR UPDATE / SKIP LOCKED. Requires a real concurrency contract; accepting and ignoring lock clauses would be incorrect. |
 | 2 | Expression, partial, ordered, and covering indexes | 205 index-related locations. Required both for schema acceptance and efficient channel/member queries; uniqueness predicates and access-path proofs must remain correct. |
-| 2 | Remaining query expressions | Computed group keys; mixed scalar/path pattern predicates; scalar filtering before aggregates; derived wildcard + scalar outputs; IS DISTINCT FROM; string/date functions; DISTINCT ON; aggregate DISTINCT/FILTER and array/JSON aggregation. |
+| 2 | Remaining query expressions | Computed group keys; mixed scalar/path pattern predicates; scalar filtering before aggregates; derived wildcard + scalar outputs; string/date functions; DISTINCT ON; aggregate DISTINCT/FILTER and array/JSON aggregation. |
 | 2 | ALTER and migration lifecycle | 375 ALTER locations. Current ADD COLUMN is insufficient for historical migrations, type/default changes, drops, and index changes. |
 | 2 | Bulk and client/session behavior | 5 COPY and 10 session/catalog locations, plus ORM-generated connection and relation queries not established by static extraction. Requires wire/client tests and bounded bulk ingestion. |
 | 1 before application rollout | Distributed execution parity | Existing RF3 SQL mutation restrictions on ON CONFLICT, RETURNING, non-primary-key mutations, and bounded transactions still apply. Local database/sql success is not evidence that every RF3 path supports a feature. |

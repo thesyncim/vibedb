@@ -460,6 +460,9 @@ func scalarASTCaseDomain(s *Statement, expr *sqlast.ScalarExpr) scalarCaseDomain
 	case sqlast.ScalarUnary, sqlast.ScalarAggregate:
 		return caseDomainNumeric
 	case sqlast.ScalarBinary:
+		if expr.Op.NullSafeComparison() {
+			return caseDomainBoolean
+		}
 		if expr.Op.Conditional() {
 			domain, _ := unifyCaseDomain(scalarASTCaseDomain(s, expr.Left), scalarASTCaseDomain(s, expr.Right))
 			return domain
@@ -1161,6 +1164,9 @@ func (r *statementScalar) nodeDomain(root int32) scalarCaseDomain {
 	case statementScalarCaseNode:
 		return r.cases[node.caseIndex].domain
 	case statementScalarConditionalNode:
+		if node.op.NullSafeComparison() {
+			return caseDomainBoolean
+		}
 		return r.conditionals[node.conditionalIndex].domain
 	default:
 		return caseDomainDynamic

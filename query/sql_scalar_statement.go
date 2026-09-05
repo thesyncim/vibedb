@@ -941,6 +941,9 @@ func (r *statementScalar) nodeType(root int32) ValueType {
 	case statementScalarCaseNode:
 		return r.cases[node.caseIndex].domain.schemaType()
 	case statementScalarConditionalNode:
+		if node.op.NullSafeComparison() {
+			return TypeBool
+		}
 		return r.conditionals[node.conditionalIndex].domain.schemaType()
 	default:
 		return TypeAny
@@ -986,6 +989,9 @@ func (r *statementScalar) nodeRepresentation(root int32) OutputRepresentation {
 	case statementScalarCaseNode:
 		return r.cases[node.caseIndex].domain.representation()
 	case statementScalarConditionalNode:
+		if node.op.NullSafeComparison() {
+			return OutputSQLBool
+		}
 		return r.conditionals[node.conditionalIndex].domain.representation()
 	default:
 		return OutputJSON

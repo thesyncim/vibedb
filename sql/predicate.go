@@ -212,14 +212,18 @@ func (p *Parser) parsePrimary(ctx exprContext) (*Expr, error) {
 	case p.atKeyword(kwCase), p.atKeyword(kwCast),
 		p.tok.kind == tokNumber, p.tok.kind == tokString,
 		p.tok.kind == tokParam, p.tok.kind == tokPlus, p.tok.kind == tokMinus,
-		p.inCaseTruth() && p.atKeyword(kwNull):
+		p.atKeyword(kwNull):
 		return p.parseScalarCondition(ctx, nil, p.tok.pos)
-	case (ctx == ctxJoin || p.inCaseTruth()) &&
-		(p.atKeyword(kwTrue) || p.atKeyword(kwFalse)):
+	case p.atKeyword(kwTrue) || p.atKeyword(kwFalse):
 		pos := p.tok.pos
 		value, err := p.parseOperand()
 		if err != nil {
 			return nil, err
+		}
+		if p.atKeyword(kwIs) {
+			left := p.newScalar(ScalarLiteral, pos)
+			left.Value = value
+			return p.parseScalarCondition(ctx, left, pos)
 		}
 		e := p.exprs.one()
 		*e = Expr{Kind: ExprConstant, Column: -1, Value: value, Pos: pos}
@@ -371,6 +375,9 @@ func (p *Parser) parseScalarCondition(
 	}
 	if p.acceptKeyword(kwIs) {
 		negated := p.acceptKeyword(kwNot)
+		if p.acceptKeyword(kwDistinct) {
+			return p.parseDistinctTail(ctx, left, negated, pos)
+		}
 		if p.atKeyword(kwTrue) || p.atKeyword(kwFalse) {
 			truth := p.atKeyword(kwTrue)
 			p.advance()
@@ -534,7 +541,7 @@ func (p *Parser) parseLeafTail(
 		return node, nil
 	}
 	if p.acceptKeyword(kwIs) {
-		return p.parseIsTail(agg, path, pos)
+		return p.parseIsTail(ctx, agg, path, pos)
 	}
 	negated := p.acceptKeyword(kwNot)
 	switch {
@@ -728,10 +735,12 @@ func (p *Parser) parseLikeTail(
 }
 
 // parseIsTail parses IS [NOT] NULL/MISSING/TRUE/FALSE.
-func (p *Parser) parseIsTail(agg AggKind, path *PathExpr, pos int) (*Expr, error) {
+func (p *Parser) parseIsTail(ctx exprContext, agg AggKind, path *PathExpr, pos int) (*Expr, error) {
 	negated := p.acceptKeyword(kwNot)
 	kind := ExprIsNull
 	switch {
+	case p.acceptKeyword(kwDistinct):
+		return p.parseDistinctTail(ctx, p.scalarFromColumn(ResultColumn{Agg: agg, Path: path, Pos: pos}), negated, pos)
 	case p.acceptKeyword(kwNull):
 	case p.acceptKeyword(kwMissing):
 		kind = ExprIsMissing

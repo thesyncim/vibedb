@@ -200,6 +200,12 @@ func (p *ConstraintProgram) discoverResolved(where *sqlast.Expr, placementColumn
 		}
 		return
 	}
+	if path, value, ok := sqlast.NullSafeEqualityPathOperand(where); ok {
+		if ordinal, matches := matchPlacementColumn(path, placementColumns); matches {
+			p.slots[ordinal].constraints = append(p.slots[ordinal].constraints, shardConstraint{operands: []sqlast.Operand{value}})
+		}
+		return
+	}
 	ordinal, ok := matchPlacementColumn(where.Path, placementColumns)
 	if !ok {
 		return

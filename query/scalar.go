@@ -156,6 +156,20 @@ func compareScalar(a, b scalar) int {
 				return 0
 			}
 		}
+		// Native compact integer streams deliberately omit a JSON spelling.
+		// Keep the common int/int path above, but compare a missing spelling to
+		// an exact decimal without forcing every native value through a format
+		// and parse round trip. The bounded stack spelling is used only for the
+		// mixed representation case; ordinary classified integers retain their
+		// existing decimal-byte path.
+		if a.isInt && len(a.num) == 0 {
+			var raw [20]byte
+			return compareNumberBytes(strconv.AppendInt(raw[:0], a.ival, 10), b.num)
+		}
+		if b.isInt && len(b.num) == 0 {
+			var raw [20]byte
+			return -compareNumberBytes(strconv.AppendInt(raw[:0], b.ival, 10), a.num)
+		}
 		return compareNumberBytes(a.num, b.num)
 	case kindString:
 		switch {

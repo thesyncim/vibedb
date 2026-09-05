@@ -83,6 +83,10 @@ func (r *statementScalar) evalConditional(
 	if node.op == sqlast.ScalarCoalesce {
 		return right, nil
 	}
+	if node.op.NullSafeComparison() && (left.value.kind == kindNull || right.value.kind == kindNull) {
+		equal := left.value.kind == kindNull && right.value.kind == kindNull
+		return statementScalarValue{value: scalar{kind: kindBool, bval: equal == (node.op == sqlast.ScalarNotDistinct)}}, nil
+	}
 	if left.value.kind == kindNull {
 		if node.op == sqlast.ScalarNullIf {
 			return left, nil
@@ -99,6 +103,8 @@ func (r *statementScalar) evalConditional(
 	}
 	cmp := compareScalar(left.value, right.value)
 	switch node.op {
+	case sqlast.ScalarDistinct, sqlast.ScalarNotDistinct:
+		return statementScalarValue{value: scalar{kind: kindBool, bval: (cmp == 0) == (node.op == sqlast.ScalarNotDistinct)}}, nil
 	case sqlast.ScalarGreatest:
 		if cmp < 0 {
 			return right, nil
@@ -125,6 +131,10 @@ func conditionalOperationName(op sqlast.ScalarOp) string {
 		return "GREATEST"
 	case sqlast.ScalarLeast:
 		return "LEAST"
+	case sqlast.ScalarDistinct:
+		return "IS DISTINCT FROM"
+	case sqlast.ScalarNotDistinct:
+		return "IS NOT DISTINCT FROM"
 	default:
 		return "NULLIF"
 	}
