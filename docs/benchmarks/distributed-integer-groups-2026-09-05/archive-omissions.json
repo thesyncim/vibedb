@@ -1,0 +1,373 @@
+{
+  "files": [
+    {
+      "bytes": 7909882,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5-repeat",
+      "path": "read-3n-4g/after-first/crdb/published/server-logs/data/crdb-2/000065.log",
+      "sha256": "a2ebd592dd81922d5b0ae67c6d286e2c358fddaa936b6bf52996da1da9017ea9"
+    },
+    {
+      "bytes": 15361702,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5-repeat",
+      "path": "read-3n-4g/after-first/crdb/published/server-logs/data/crdb-2/000066.log",
+      "sha256": "d8855d6417ecb877e62a1a71408a21770614a2afe2b80eb7d3d4b48778e7e114"
+    },
+    {
+      "bytes": 30593780,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5-repeat",
+      "path": "read-3n-4g/after-first/crdb/published/server-logs/data/crdb-2/000078.log",
+      "sha256": "d6e063be311c8258a2b55e41566869427f473a493ea378dadbcce498de81b5e4"
+    },
+    {
+      "bytes": 3940097,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5-repeat",
+      "path": "read-3n-4g/after-first/crdb/published/server-logs/data/crdb-2/000079.log",
+      "sha256": "111cb03932adf776a25cb6c7a2bbc3ae6813ffe8c141d083f40768644e5731f7"
+    },
+    {
+      "bytes": 0,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5-repeat",
+      "path": "read-3n-4g/after-first/crdb/published/server-logs/data/crdb-2/cockroach-temp4092848307/000003.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "bytes": 153179,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5-repeat",
+      "path": "read-3n-4g/after-first/crdb/published/server-logs/data/crdb-0/000003.log",
+      "sha256": "e36d478ee635c8b6c3b4ecc3b9ecc49ed173b8ed2e0d91db4fd8cdb3620ed031"
+    },
+    {
+      "bytes": 480776,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5-repeat",
+      "path": "read-3n-4g/after-first/crdb/published/server-logs/data/crdb-0/000004.log",
+      "sha256": "c79ea109bc1b2618bf74bf97f4d53491bf0862411ced67f89824a1113276a185"
+    },
+    {
+      "bytes": 581915,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5-repeat",
+      "path": "read-3n-4g/after-first/crdb/published/server-logs/data/crdb-0/000005.log",
+      "sha256": "649dc9baba72cc05987285c45a3c5cb7eed69cc0696cd85e9c037d0a8ae42981"
+    },
+    {
+      "bytes": 1811761,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5-repeat",
+      "path": "read-3n-4g/after-first/crdb/published/server-logs/data/crdb-0/000006.log",
+      "sha256": "e06708aefc66ed85aa3cdcf067c040e52afbb65548d8fcd0623e7c15b49eaa18"
+    },
+    {
+      "bytes": 3963752,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5-repeat",
+      "path": "read-3n-4g/after-first/crdb/published/server-logs/data/crdb-0/000007.log",
+      "sha256": "8e06efc8beef2f538725bb7e639d62c006901023f4783a8fbbd8cc28c23c3715"
+    },
+    {
+      "bytes": 11504850,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5-repeat",
+      "path": "read-3n-4g/after-first/crdb/published/server-logs/data/crdb-0/000011.log",
+      "sha256": "e34a73f30f3ed21b46f0c5d4204ec2dff3a91184513e296fdf9cd59e4c102eb6"
+    },
+    {
+      "bytes": 7907401,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5-repeat",
+      "path": "read-3n-4g/after-first/crdb/published/server-logs/data/crdb-1/000069.log",
+      "sha256": "cec86e5287879cfb2f9af4993543c046810673e208d0a299f85f9cda6cc7b7d9"
+    },
+    {
+      "bytes": 14257369,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5-repeat",
+      "path": "read-3n-4g/after-first/crdb/published/server-logs/data/crdb-1/000070.log",
+      "sha256": "3ad545932c8bf78eb38bcedf72df08171b784eb42ddd8673c957fd63bc8cb81a"
+    },
+    {
+      "bytes": 30515240,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5-repeat",
+      "path": "read-3n-4g/after-first/crdb/published/server-logs/data/crdb-1/000082.log",
+      "sha256": "cddf64237bdd3ffa33d563dc819ea0ff7177934b9e249f694031a623718c6bcd"
+    },
+    {
+      "bytes": 3949710,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5-repeat",
+      "path": "read-3n-4g/after-first/crdb/published/server-logs/data/crdb-1/000083.log",
+      "sha256": "41d7151bd0d7ec01a6094adf3a771050b34e181427a49ad21b88d01641a87147"
+    },
+    {
+      "bytes": 7902022,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5-repeat",
+      "path": "read-3n-4g/before-first/crdb/published/server-logs/data/crdb-2/000072.log",
+      "sha256": "70a14248ae07274fddc70333aa44b6cff6465e1e4fe9a56154b5423604bc4a18"
+    },
+    {
+      "bytes": 14298143,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5-repeat",
+      "path": "read-3n-4g/before-first/crdb/published/server-logs/data/crdb-2/000073.log",
+      "sha256": "344ddbee4eea4b0da63c80ddbc352a50173048bbad6cf20948bcc73497de2959"
+    },
+    {
+      "bytes": 29466980,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5-repeat",
+      "path": "read-3n-4g/before-first/crdb/published/server-logs/data/crdb-2/000085.log",
+      "sha256": "12183086c9c23adb67b21cf9a751cd2135b8f6af6a99d1ef388eb1db9737a9af"
+    },
+    {
+      "bytes": 3926804,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5-repeat",
+      "path": "read-3n-4g/before-first/crdb/published/server-logs/data/crdb-2/000086.log",
+      "sha256": "e1f1c69c8596857aa58b1f4925a6b0dbe31f3044030c43ced377d2e39b1425ab"
+    },
+    {
+      "bytes": 153179,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5-repeat",
+      "path": "read-3n-4g/before-first/crdb/published/server-logs/data/crdb-0/000003.log",
+      "sha256": "be77d07b0a0e9a86ae2227779c1921a07a0e53f6458c154bf5477bee45908e33"
+    },
+    {
+      "bytes": 478571,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5-repeat",
+      "path": "read-3n-4g/before-first/crdb/published/server-logs/data/crdb-0/000004.log",
+      "sha256": "79350a366d33100ccc6c73439d085b7384f8d78608a9cc0a67e487811822605a"
+    },
+    {
+      "bytes": 579320,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5-repeat",
+      "path": "read-3n-4g/before-first/crdb/published/server-logs/data/crdb-0/000005.log",
+      "sha256": "ba6c88468a28ff108eaf720e68cc2a1ef0361ef5ed56c2f4977465cd7e9242af"
+    },
+    {
+      "bytes": 1875050,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5-repeat",
+      "path": "read-3n-4g/before-first/crdb/published/server-logs/data/crdb-0/000006.log",
+      "sha256": "380a590309f812777cfcf6fafa55db9f542a3cecd1f1e425f61638878fcb86c6"
+    },
+    {
+      "bytes": 3713517,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5-repeat",
+      "path": "read-3n-4g/before-first/crdb/published/server-logs/data/crdb-0/000007.log",
+      "sha256": "dacd3283c18f4569d8aa1159c038fceffea6afb91bc5d036b8eb3ed9422e73cf"
+    },
+    {
+      "bytes": 11365070,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5-repeat",
+      "path": "read-3n-4g/before-first/crdb/published/server-logs/data/crdb-0/000011.log",
+      "sha256": "dcbaa1bd2a23babf95f59b62a1ece0a2d71949936e36cbe2381a8ebe79f17519"
+    },
+    {
+      "bytes": 0,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5-repeat",
+      "path": "read-3n-4g/before-first/crdb/published/server-logs/data/crdb-0/cockroach-temp862154116/000003.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "bytes": 7905691,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5-repeat",
+      "path": "read-3n-4g/before-first/crdb/published/server-logs/data/crdb-1/000060.log",
+      "sha256": "a10ddf5a4a1c219708c3f5ff9314875c3c01d8ec91b8bd0bbffa9633cf55044d"
+    },
+    {
+      "bytes": 14947125,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5-repeat",
+      "path": "read-3n-4g/before-first/crdb/published/server-logs/data/crdb-1/000079.log",
+      "sha256": "cdabc8f054738a19c6892d7bbde0cfc127918ce0982a0b1ae0a617c280401fe0"
+    },
+    {
+      "bytes": 30449756,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5-repeat",
+      "path": "read-3n-4g/before-first/crdb/published/server-logs/data/crdb-1/000091.log",
+      "sha256": "a7e860b3ea30da57e61da52603a9595b437676b01734ee9c63939f66ccb11421"
+    },
+    {
+      "bytes": 2130760,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5-repeat",
+      "path": "read-3n-4g/before-first/crdb/published/server-logs/data/crdb-1/000092.log",
+      "sha256": "407f66ce04cd51d283dccd7112b5526ab220684a9b7420c5557fe516221d02b9"
+    },
+    {
+      "bytes": 3931676,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5",
+      "path": "read-3n-4g/after-first/crdb/published/server-logs/data/crdb-2/000051.log",
+      "sha256": "b12b58c21d60101f98fedfc6daca256ce65a88f38c6e80094de418d10f0c8c00"
+    },
+    {
+      "bytes": 7896776,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5",
+      "path": "read-3n-4g/after-first/crdb/published/server-logs/data/crdb-2/000064.log",
+      "sha256": "075aeb39c8c62b11af4fe144998f4d7643b9198bc0d98138e104e0f8bca80ade"
+    },
+    {
+      "bytes": 12981607,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5",
+      "path": "read-3n-4g/after-first/crdb/published/server-logs/data/crdb-2/000065.log",
+      "sha256": "d6c3c36b9bda6ab112cf22d7ad959ab87253f5cdc73770bcd47016a4949c47e6"
+    },
+    {
+      "bytes": 29321052,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5",
+      "path": "read-3n-4g/after-first/crdb/published/server-logs/data/crdb-2/000077.log",
+      "sha256": "d5d1e4c358116b9345c0e76daeab56023287c3b5782475fd3abcafdc9993d634"
+    },
+    {
+      "bytes": 153179,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5",
+      "path": "read-3n-4g/after-first/crdb/published/server-logs/data/crdb-0/000003.log",
+      "sha256": "7a25c811fd15858267df4fdb0d2c91bbd5f9635431410573f7442aea8d641950"
+    },
+    {
+      "bytes": 476494,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5",
+      "path": "read-3n-4g/after-first/crdb/published/server-logs/data/crdb-0/000004.log",
+      "sha256": "808a0fd0d783e313689e4c4fd6bf36b8a876a99dd0e6fc6c9c8f38069b1654b3"
+    },
+    {
+      "bytes": 579003,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5",
+      "path": "read-3n-4g/after-first/crdb/published/server-logs/data/crdb-0/000005.log",
+      "sha256": "555a136179f66f5e5d54b3e9097f396954df6c34348d4b8766dd93190510ac00"
+    },
+    {
+      "bytes": 1675806,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5",
+      "path": "read-3n-4g/after-first/crdb/published/server-logs/data/crdb-0/000006.log",
+      "sha256": "e83c5a40769283a27efae2c1f82b8bc99ec7ad7fc19092d2734731427f82665b"
+    },
+    {
+      "bytes": 3687609,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5",
+      "path": "read-3n-4g/after-first/crdb/published/server-logs/data/crdb-0/000007.log",
+      "sha256": "f22b4bee01a00c03138af530024dc100512d8aa9e588754bf43da555ef7b5439"
+    },
+    {
+      "bytes": 7336196,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5",
+      "path": "read-3n-4g/after-first/crdb/published/server-logs/data/crdb-0/000011.log",
+      "sha256": "0c49112c5a72907bf1e8398c224eeea00e659700027bf6111b0029b0147e0310"
+    },
+    {
+      "bytes": 0,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5",
+      "path": "read-3n-4g/after-first/crdb/published/server-logs/data/crdb-0/cockroach-temp2857328181/000003.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "bytes": 3885111,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5",
+      "path": "read-3n-4g/after-first/crdb/published/server-logs/data/crdb-1/000059.log",
+      "sha256": "1f520166b9cc10dd245787732225627a47f76d2634fa716113063a269f9a075a"
+    },
+    {
+      "bytes": 7916535,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5",
+      "path": "read-3n-4g/after-first/crdb/published/server-logs/data/crdb-1/000075.log",
+      "sha256": "a4d7a67c0445ea5b16fa02d70ca02767ff7c39bf63c3b30b417f226d2a12fbbf"
+    },
+    {
+      "bytes": 13477578,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5",
+      "path": "read-3n-4g/after-first/crdb/published/server-logs/data/crdb-1/000076.log",
+      "sha256": "2bfc53d02f7b0926fe239026fb614db56fc2195b2439a11d9b960c065eecfddd"
+    },
+    {
+      "bytes": 26789935,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5",
+      "path": "read-3n-4g/after-first/crdb/published/server-logs/data/crdb-1/000088.log",
+      "sha256": "a4eb57f95fc527d9ae2cf3e92d275d8c6a3b4219000089ce73eba2cdd93c87fd"
+    },
+    {
+      "bytes": 3836719,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5",
+      "path": "read-3n-4g/before-first/crdb/published/server-logs/data/crdb-2/000060.log",
+      "sha256": "24c904abb6699fdd0efa183776b7fc34a5721fdbea18de89a58ee3c517db20ba"
+    },
+    {
+      "bytes": 7924676,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5",
+      "path": "read-3n-4g/before-first/crdb/published/server-logs/data/crdb-2/000077.log",
+      "sha256": "b49e87036658b1de8ec2ddb547f4db02a5dc2cb60ab2691778ef2a451208bf8d"
+    },
+    {
+      "bytes": 14882268,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5",
+      "path": "read-3n-4g/before-first/crdb/published/server-logs/data/crdb-2/000078.log",
+      "sha256": "4115ff745c4c9934a629ecdbef865b2552dc24edce2a7b21724af6093f9d4e3f"
+    },
+    {
+      "bytes": 28351729,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5",
+      "path": "read-3n-4g/before-first/crdb/published/server-logs/data/crdb-2/000091.log",
+      "sha256": "04467d35ea413af2698e613c30a5b8d7f7b38305a576c9e916d613ecb69db8b6"
+    },
+    {
+      "bytes": 153255,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5",
+      "path": "read-3n-4g/before-first/crdb/published/server-logs/data/crdb-0/000003.log",
+      "sha256": "cf6743d9cd34eb99455469bc364bf2077180c71e266104db9db8d10f2462391d"
+    },
+    {
+      "bytes": 481860,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5",
+      "path": "read-3n-4g/before-first/crdb/published/server-logs/data/crdb-0/000004.log",
+      "sha256": "f17fd5413078c5854b64febc5fde2e63647415e6d508afaf4a043a6f5e47f6ab"
+    },
+    {
+      "bytes": 575814,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5",
+      "path": "read-3n-4g/before-first/crdb/published/server-logs/data/crdb-0/000005.log",
+      "sha256": "20a52fc8b2f7fc80e8c339a35973bb6f923b80231e597e4244f4b057141c8526"
+    },
+    {
+      "bytes": 1804933,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5",
+      "path": "read-3n-4g/before-first/crdb/published/server-logs/data/crdb-0/000006.log",
+      "sha256": "7679aa97e74c17f82c2851f10ca4ac0d005d8b6c9ec9b2f6396824478c2bd226"
+    },
+    {
+      "bytes": 3963680,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5",
+      "path": "read-3n-4g/before-first/crdb/published/server-logs/data/crdb-0/000007.log",
+      "sha256": "0393843ba32f00488952e19a1c89fe7420e0e5d14bb48c600bf8de430a6ac22e"
+    },
+    {
+      "bytes": 6436365,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5",
+      "path": "read-3n-4g/before-first/crdb/published/server-logs/data/crdb-0/000011.log",
+      "sha256": "3e03aef25bb4d6c8c48b34270a0631531ad2674acb7fe9e97c8796168d8e10cd"
+    },
+    {
+      "bytes": 257225,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5",
+      "path": "read-3n-4g/before-first/crdb/published/server-logs/data/crdb-1/000051.log",
+      "sha256": "295132b43af553c1819645e8361abd8c415fddfd9deffec386773be17a59b9bb"
+    },
+    {
+      "bytes": 7906642,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5",
+      "path": "read-3n-4g/before-first/crdb/published/server-logs/data/crdb-1/000052.log",
+      "sha256": "4081004cdd5b54fe8bf8d23ec9628204af537e0209814d9a010fc13aa787c8bf"
+    },
+    {
+      "bytes": 14815574,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5",
+      "path": "read-3n-4g/before-first/crdb/published/server-logs/data/crdb-1/000065.log",
+      "sha256": "b1e0ce4f62642065403afeae7346f85fe1f53b5f36404e583396ceb543cf6fb1"
+    },
+    {
+      "bytes": 30666376,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5",
+      "path": "read-3n-4g/before-first/crdb/published/server-logs/data/crdb-1/000076.log",
+      "sha256": "8f55034ee70cd50cab712488852f5ab84cb90fec49b34f41b2070a0967c9ea4a"
+    },
+    {
+      "bytes": 1368704,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5",
+      "path": "read-3n-4g/before-first/crdb/published/server-logs/data/crdb-1/000077.log",
+      "sha256": "33ccca81fe0051af936fc0401ad584f60f50cd0909b21d051dea6fca3211599c"
+    },
+    {
+      "bytes": 0,
+      "campaign": "vibedb-dist-read-comparison-740ad5c5",
+      "path": "read-3n-4g/before-first/crdb/published/server-logs/data/crdb-1/cockroach-temp2832150068/000003.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "omitted_bytes": 505657779,
+  "omitted_file_count": 61,
+  "rule": "Only six-digit CRDB database WAL segment names beneath published/server-logs/data/crdb-*/ are omitted from raw-trials.tar.gz."
+}

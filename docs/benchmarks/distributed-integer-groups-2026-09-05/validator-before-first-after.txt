@@ -1,0 +1,14 @@
+Validated 96,000 raw latency samples; medians require all repetitions to pass.
+
+| Workload | Clients | VibeDB ops/s | CRDB ops/s | VibeDB / CRDB |
+|---|---:|---:|---:|---:|
+| point_hit | 1 | 3,468.5 | 4,605.8 | 0.753× |
+| point_hit | 8 | 19,646.2 | 30,216.3 | 0.650× |
+| point_miss | 1 | 3,778.4 | 4,496.9 | 0.840× |
+| point_miss | 8 | 19,572.9 | 30,858.3 | 0.634× |
+| range_64 | 1 | 2,915.4 | 3,188.0 | 0.914× |
+| range_64 | 8 | 15,431.0 | 22,667.9 | 0.681× |
+| group_16 | 1 | 1,202.3 | 336.9 | 3.569× |
+| group_16 | 8 | 8,806.9 | 2,378.7 | 3.702× |
+| update_existing | 1 | 759.1 | 685.4 | 1.108× |
+| update_existing | 8 | 1,085.4 | 3,285.2 | 0.330× |
