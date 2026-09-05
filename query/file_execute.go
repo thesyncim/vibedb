@@ -158,6 +158,10 @@ type fileWorkspace struct {
 	intervalUnbounded   bool
 	extremaFilter       *durable.IntegerExtremaFilter
 	extremaFilterPath   string
+	integerGroupFilter  *durable.IntegerGroupFilter
+	integerGroupPath    string
+	integerGroupSumPath string
+	integerGroups       integerGroupWorkspace
 
 	// workers is one scan Workspace per worker goroutine, indexed by worker
 	// number. Indexing by worker rather than by batch is deliberate: nothing a
@@ -249,6 +253,10 @@ func (w *fileWorkspace) release() {
 	w.intervalUnbounded = false
 	w.extremaFilter = nil
 	w.extremaFilterPath = ""
+	w.integerGroupFilter = nil
+	w.integerGroupPath = ""
+	w.integerGroupSumPath = ""
+	w.integerGroups.release()
 	w.workers = nil
 	w.segments = nil
 	w.arenas = nil
@@ -366,6 +374,7 @@ func (w *fileWorkspace) abort() {
 	w.rowRuns = w.rowRuns[:0]
 	clear(w.groupRuns)
 	w.groupRuns = w.groupRuns[:0]
+	w.integerGroups.reset()
 }
 
 // A fileSlot is the scratch one in-flight batch sequence owns: the scan
@@ -473,6 +482,10 @@ type ExecStats struct {
 	// sum is RowsScanned for a token-filter execution; neither is an index hit.
 	TokenFilterRows         uint64
 	TokenFilterFallbackRows uint64
+	// GroupedIntegerRows counts rows consumed by the strict compact integer
+	// GROUP BY lane. It is zero for the generic grouped executor and for a
+	// declined native attempt.
+	GroupedIntegerRows uint64
 
 	// JoinMemberships counts the join clauses whose inner side fit under the
 	// threshold and were pushed into the outer predicate as a membership;
@@ -665,6 +678,22 @@ func (p *plan) runFileInto(
 	coveringColumns, handled, directErr := p.runDirectFileAggregate(snapshot, e)
 	if handled {
 		stats.CoveringColumns = coveringColumns
+		e.Stats = stats
+		if directErr == nil {
+			directErr = e.Workspace.checkCanceled()
+		}
+		return directErr
+	}
+	integerGroups, handled, directErr :=
+		p.runDirectFileIntegerGroups(snapshot, e, n.memoryBytes)
+	if handled {
+		// The strict integer GROUP BY lane scans one captured snapshot
+		// serially and publishes only after every compact shape has passed
+		// admission. Its scratch is bounded by the caller's MemoryBytes.
+		stats.Workers = 1
+		stats.RowsScanned = integerGroups.scanned
+		stats.GroupedIntegerRows = integerGroups.scanned
+		stats.BufferedBytes = integerGroups.bytes
 		e.Stats = stats
 		if directErr == nil {
 			directErr = e.Workspace.checkCanceled()

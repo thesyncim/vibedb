@@ -11,6 +11,13 @@ SPEC = importlib.util.spec_from_file_location("summarize_crdb_sql", MODULE_PATH)
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
+BASELINE_PROFILE_COUNTERS = (
+    "raft_proposal_window_queued",
+    "raft_late_join_used",
+    "raft_late_join_missed",
+    "raft_late_join_entries",
+)
+
 
 def write_report(directory, report):
     path = Path(directory) / (report["config"]["Engine"] + ".json")
@@ -127,6 +134,37 @@ class SummarizeCRDBSQLTest(unittest.TestCase):
             value["results"][0]["diagnostics"]["deltas"][0]["counters"]["ready_waves"] = 4
             with self.assertRaisesRegex(ValueError, "counter delta"):
                 MODULE.load(write_report(directory, value), "vibedb")
+
+    def test_a0de0919_profile_counters_are_accepted_and_strictly_checked(self):
+        # These fields are emitted by the retained ARM64 a0de0919 profile
+        # report. They were absent from the original validator tuple, so the
+        # complete report was incorrectly rejected as a counter-delta mismatch.
+        with tempfile.TemporaryDirectory() as directory:
+            value = diagnostic_report(directory)
+            bracket = value["results"][0]["diagnostics"]
+            for phase in ("before", "after"):
+                for record in bracket[phase]:
+                    for key in BASELINE_PROFILE_COUNTERS:
+                        record["snapshot"][key] = 0
+                    raw = (json.dumps(record["snapshot"], indent=1) + "\n").encode()
+                    (Path(directory) / record["file"]).write_bytes(raw)
+                    record["sha256"] = hashlib.sha256(raw).hexdigest()
+            for delta in bracket["deltas"]:
+                for key in BASELINE_PROFILE_COUNTERS:
+                    delta["counters"][key] = 0
+            _, checked = MODULE.load(write_report(directory, value), "vibedb")
+            self.assertEqual(checked, 2)
+            self.assertEqual(
+                {key: bracket["deltas"][0]["counters"][key] for key in BASELINE_PROFILE_COUNTERS},
+                {key: 0 for key in BASELINE_PROFILE_COUNTERS},
+            )
+
+        for invalid in (-1, True):
+            with self.subTest(invalid=invalid), tempfile.TemporaryDirectory() as directory:
+                value = diagnostic_report(directory)
+                value["results"][0]["diagnostics"]["deltas"][0]["counters"][BASELINE_PROFILE_COUNTERS[0]] = invalid
+                with self.assertRaisesRegex(ValueError, "counter delta"):
+                    MODULE.load(write_report(directory, value), "vibedb")
 
     def test_diagnostic_archive_tampering_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
