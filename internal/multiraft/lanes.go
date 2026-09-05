@@ -250,7 +250,7 @@ func (lane *ExecutionLane) AsyncNotify() <-chan struct{} {
 	return lane.set.lanes[lane.index].host.AsyncNotify()
 }
 
-// WakePipelined rebuilds this lane's runnable set after an append worker edge.
+// WakePipelined drains this lane's completed groups after an append worker edge.
 // The Owner is the serialized caller, but retain the lane lock so the wrapper
 // has the same synchronization contract as every other ExecutionLane method.
 func (lane *ExecutionLane) WakePipelined() {

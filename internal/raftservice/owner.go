@@ -1141,7 +1141,7 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 				// sink: the next bounded ingress event or logical pulse retries it.
 				readyBlocked = true
 			case done:
-				if err := owner.syncMembershipAuthorities(); err != nil {
+				if err := owner.syncMembershipAuthority(progress.Group); err != nil {
 					return owner.stop(err)
 				}
 				owner.finishReadOutcomes(progress.ReadOutcomes)
@@ -1251,41 +1251,43 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 	}
 }
 
+// Startup publishes every recovered group before any ingress is served. During
+// RunOne only Progress.Group can have changed: sweeping the other groups on
+// every Ready micro-step makes serving cost grow with the number of shards.
 func (owner *Owner) syncMembershipAuthorities() error {
-	if owner.authority == nil {
-		return nil
-	}
 	for _, group := range owner.groups {
-		publication, err := owner.host.Publication(group)
-		if err != nil {
-			return err
-		}
-		if err := owner.authority.PublishCommittedAuthority(
-			group, publication.ReplicaSetVersion, publication.ConfState,
-		); err != nil {
-			return err
-		}
-		grant, grantFound, err := owner.authority.CurrentTransitionGrant(group)
-		if err != nil {
-			return err
-		}
-		if !grantFound {
-			continue
-		}
-		proof, found, err := owner.host.DurablePromotion(group,
-			grant.TargetMember)
-		if err != nil {
-			return err
-		}
-		if found {
-			if err = owner.authority.PublishDurablePromotion(group, proof); err != nil {
-				return err
-			}
-		} else if err = owner.authority.ClearDurablePromotion(group); err != nil {
+		if err := owner.syncMembershipAuthority(group); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func (owner *Owner) syncMembershipAuthority(group raftmember.GroupKey) error {
+	if owner.authority == nil {
+		return nil
+	}
+	publication, err := owner.host.Publication(group)
+	if err != nil {
+		return err
+	}
+	if err := owner.authority.PublishCommittedAuthority(
+		group, publication.ReplicaSetVersion, publication.ConfState,
+	); err != nil {
+		return err
+	}
+	grant, grantFound, err := owner.authority.CurrentTransitionGrant(group)
+	if err != nil || !grantFound {
+		return err
+	}
+	proof, found, err := owner.host.DurablePromotion(group, grant.TargetMember)
+	if err != nil {
+		return err
+	}
+	if found {
+		return owner.authority.PublishDurablePromotion(group, proof)
+	}
+	return owner.authority.ClearDurablePromotion(group)
 }
 
 func (owner *Owner) handle(request ownerRequest) error {

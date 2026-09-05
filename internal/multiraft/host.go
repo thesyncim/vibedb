@@ -13,6 +13,7 @@ package multiraft
 import (
 	"errors"
 	"fmt"
+	"sync/atomic"
 
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
@@ -371,6 +372,11 @@ const (
 )
 
 type groupState struct {
+	// Append workers only touch these completion-list fields. queued owns next:
+	// one producer links the group, then the owner detaches it before clearing
+	// queued. Repeated worker edges coalesce into one bounded list entry.
+	asyncQueued            atomic.Bool
+	asyncNext              *groupState
 	key                    raftmember.GroupKey
 	memberID               uint64
 	sourceOwner            raftmember.AppliedSourceOwner
@@ -462,6 +468,7 @@ type Host struct {
 	settle      raftmember.ResultSettlementSink
 	serving     ServingSinks
 	asyncNotify chan struct{}
+	asyncReady  atomic.Pointer[groupState]
 	closed      bool
 }
 
@@ -612,15 +619,25 @@ func (host *Host) addRuntime(runtime memberRuntime) error {
 	host.groups[key] = group
 	host.order = append(host.order, group)
 	if pipelined, ok := runtime.(pipelinedRuntime); ok && pipelined.Pipelined() {
-		pipelined.SetPipelinedWake(host.signalAsync)
+		pipelined.SetPipelinedWake(func() { host.signalAsync(group) })
 	}
 	host.wake(group)
 	return nil
 }
 
-func (host *Host) signalAsync() {
-	if host == nil {
+// signalAsync is the sole worker-side entry point. The intrusive MPSC list
+// retains at most one entry per Runtime and does not allocate on completion.
+// It never reads scheduler-owned group state, including retirement/close state.
+func (host *Host) signalAsync(group *groupState) {
+	if !group.asyncQueued.CompareAndSwap(false, true) {
 		return
+	}
+	for {
+		head := host.asyncReady.Load()
+		group.asyncNext = head
+		if host.asyncReady.CompareAndSwap(head, group) {
+			break
+		}
 	}
 	select {
 	case host.asyncNotify <- struct{}{}:
@@ -629,8 +646,7 @@ func (host *Host) signalAsync() {
 }
 
 // AsyncNotify wakes the serialized scheduler when a local append lane finishes.
-// The channel is edge-triggered and coalesced; WakePipelined re-establishes the
-// runnable set from authoritative Runtime ownership.
+// The edge is coalesced; WakePipelined drains the exact completed-group set.
 func (host *Host) AsyncNotify() <-chan struct{} {
 	if host == nil {
 		return nil
@@ -638,19 +654,23 @@ func (host *Host) AsyncNotify() <-chan struct{} {
 	return host.asyncNotify
 }
 
-// WakePipelined makes every live pipelined group runnable after a coalesced
-// append completion signal. Group count is strictly bounded by Host limits.
+// WakePipelined makes only signalled groups runnable. Detaching one finite list
+// bounds each owner turn even while append workers keep completing more work.
 func (host *Host) WakePipelined() {
 	if host == nil || host.closed {
 		return
 	}
-	for _, group := range host.order {
-		if group == nil || group.runtime == nil || group.failure != nil || group.retiring {
-			continue
-		}
-		if runtime, ok := group.runtime.(pipelinedRuntime); ok && runtime.Pipelined() {
+	for group := host.asyncReady.Swap(nil); group != nil; {
+		next := group.asyncNext
+		group.asyncNext = nil
+		// Read next before releasing producer ownership. A completion before
+		// this release is covered by the wake below; one after it queues a new
+		// edge, so a racing append completion cannot be lost.
+		group.asyncQueued.Store(false)
+		if group.runtime != nil && group.failure == nil && !group.retiring {
 			host.wake(group)
 		}
+		group = next
 	}
 }
 
