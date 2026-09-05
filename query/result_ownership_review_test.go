@@ -9,6 +9,14 @@ import (
 )
 
 func TestResultOwnershipReview(t *testing.T) {
+	for _, projected := range []bool{false, true} {
+		t.Run(map[bool]string{false: "generic", true: "projected"}[projected], func(t *testing.T) {
+			testResultOwnershipReview(t, projected)
+		})
+	}
+}
+
+func testResultOwnershipReview(t *testing.T, projected bool) {
 	for _, test := range []struct {
 		name, json, text string
 		owned            int
@@ -24,7 +32,15 @@ func TestResultOwnershipReview(t *testing.T) {
 			var text []byte
 			borrowed := cellFromScalar(classifyRawInto(vibejson.RawValue{Src: source}, &text))
 			var result Result
-			owned := result.ownFileCell(borrowed)
+			var owned Cell
+			if projected {
+				owned = result.ownProjectedCell(borrowed)
+				if projectedCellPayloadBytes(borrowed) != resultCellPayloadBytes(borrowed) {
+					t.Fatal("projected and generic accounting disagree")
+				}
+			} else {
+				owned = result.ownFileCell(borrowed)
+			}
 			if len(result.fileData) != test.owned {
 				t.Fatalf("retained %d payload bytes, want %d", len(result.fileData), test.owned)
 			}
@@ -56,8 +72,29 @@ func TestResultOwnershipReview(t *testing.T) {
 		result.fileData = result.fileData[:0]
 		borrowed := cellFromScalar(value)
 		owned := result.ownFileCell(borrowed)
+		if projected {
+			owned = result.ownProjectedCell(borrowed)
+		}
 		if len(result.fileData) != 0 || !bytes.Equal(owned.JSON(), borrowed.JSON()) || owned.flag != borrowed.flag {
 			t.Fatal("immutable JSON primitive copied or changed")
+		}
+	}
+	for _, spelling := range []string{"9007199254740993", "-9007199254740993", "1.000e+0", "1e400", "-0", `{"n":1}`} {
+		source := []byte(spelling)
+		var scratch []byte
+		borrowed := cellFromScalar(classifyRawInto(vibejson.RawValue{Src: source}, &scratch))
+		var result Result
+		owned := result.ownFileCell(borrowed)
+		if projected {
+			result.fileData = result.fileData[:0]
+			owned = result.ownProjectedCell(borrowed)
+			if projectedCellPayloadBytes(borrowed) != resultCellPayloadBytes(borrowed) {
+				t.Fatalf("projected accounting mismatch for %s", spelling)
+			}
+		}
+		clear(source)
+		if string(owned.JSON()) != spelling || len(result.fileData) != len(spelling) {
+			t.Fatalf("ownership changed %s to %s", spelling, owned.JSON())
 		}
 	}
 }

@@ -230,6 +230,26 @@ func resultCellPayloadBytes(cell Cell) int64 {
 	return bytes + int64(len(dst))
 }
 
+// projectedCellPayloadBytes is the classifier-specialized form used by the
+// durable projection callback. Its input is always the Cell returned by
+// cellFromScalar, so a clean string is known by its raw/text shape and needs
+// no pointer inspection. Keep resultCellPayloadBytes exact for arbitrary Cells
+// entering the other materialization paths.
+func projectedCellPayloadBytes(cell Cell) int64 {
+	if len(cell.raw) != 0 {
+		bytes := int64(len(cell.raw))
+		if cell.kind == TypeString && (len(cell.raw) < 2 ||
+			len(cell.raw) != len(cell.text)+2) {
+			bytes += int64(len(cell.text))
+		}
+		return bytes
+	}
+	// The projected classifier normally retains raw for every scalar. Keep the
+	// generic formatter for the defensive computed-number case instead of
+	// carrying its scratch-heavy cold path through this hot helper.
+	return resultCellPayloadBytes(cell)
+}
+
 func (r *Result) abortResult() {
 	for i := range r.Columns {
 		clear(r.Columns[i].Cells)

@@ -216,6 +216,40 @@ func (r *Result) ownFileCell(cell Cell) Cell {
 	return cell
 }
 
+// ownProjectedCell owns a cell produced immediately by cellFromScalar in the
+// durable projection callback. That classifier guarantees bool/null spellings
+// are the immutable package constants and that a clean string's text is the
+// raw view between its quotes. Keeping those facts at this call site removes
+// repeated pointer checks from the narrow file range hot path; callers that
+// receive cells from any other source must use ownFileCell, whose exact
+// fallback still handles independently backed equal-length strings.
+func (r *Result) ownProjectedCell(cell Cell) Cell {
+	switch cell.kind {
+	case TypeNull, TypeBool:
+		return cell
+	case TypeString:
+		if len(cell.raw) >= 2 && len(cell.raw) == len(cell.text)+2 {
+			start := len(r.fileData)
+			r.fileData = append(r.fileData, cell.raw...)
+			cell.raw = r.fileData[start:len(r.fileData):len(r.fileData)]
+			cell.text = byteview.String(cell.raw[1 : len(cell.raw)-1])
+			return cell
+		}
+	case TypeNumber, TypeJSON:
+		// classifyRawInto retains the exact raw spelling for these projected
+		// values. Copy it directly so the ordinary ownership helper's alias
+		// checks stay off the numeric/JSON hot path. A nil raw is only possible
+		// for a computed value assembled outside the projection callback.
+		if len(cell.raw) != 0 {
+			start := len(r.fileData)
+			r.fileData = append(r.fileData, cell.raw...)
+			cell.raw = r.fileData[start:len(r.fileData):len(r.fileData)]
+			return cell
+		}
+	}
+	return r.ownFileCell(cell)
+}
+
 // resultCellOwnedBytes is the physical payload an ownership boundary will
 // append for cell. ResultBytes deliberately charges the logical JSON
 // representation (including the shared immutable primitive spellings), while
@@ -259,7 +293,6 @@ func ownResultCellInto(data []byte, cell Cell) (Cell, []byte) {
 	}
 	return cell, data
 }
-
 func staticResultBytes(value, static []byte) bool {
 	return len(value) == len(static) && len(value) != 0 &&
 		&value[0] == &static[0]
