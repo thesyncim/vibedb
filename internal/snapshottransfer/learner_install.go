@@ -1,10 +1,12 @@
 package snapshottransfer
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
 
+	"github.com/thesyncim/vibedb/internal/migrationbudget"
 	"github.com/thesyncim/vibedb/internal/multiraft"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftstore"
@@ -112,6 +114,10 @@ type LearnerInstallPlan struct {
 	Descriptor Descriptor
 	Cursor     *replicatedstate.SnapshotCursorStore
 	Database   *sqldriver.Database
+	// Context and Budget carry cancellation and node-wide pacing into the
+	// target-side artifact stage. Context is optional for legacy callers.
+	Context context.Context
+	Budget  *migrationbudget.Budget
 
 	SQLIdentity       sqldriver.ReplicatedShardStoreIdentity
 	ApplyOptions      sqldriver.ReplicatedApplyOptions
@@ -142,7 +148,11 @@ func InstallPublishedLearner(plan LearnerInstallPlan) (raftmember.RuntimeIdentit
 	if err := plan.Settlement.settleLocked(); err != nil {
 		return raftmember.RuntimeIdentity{}, err
 	}
-	manifest, err := plan.Repository.Manifest(plan.Descriptor)
+	ctx := budgetContext(plan.Context)
+	if err := plan.Repository.AttachBudget(plan.Budget); err != nil {
+		return raftmember.RuntimeIdentity{}, err
+	}
+	manifest, err := plan.Repository.ManifestContext(ctx, plan.Descriptor)
 	if err != nil || !proto.Equal(manifest.State.ConfState, plan.ExpectedConfState) {
 		return raftmember.RuntimeIdentity{}, errors.Join(ErrLearnerInstall, err)
 	}
@@ -178,8 +188,20 @@ func InstallPublishedLearner(plan LearnerInstallPlan) (raftmember.RuntimeIdentit
 		if openErr != nil {
 			return raftmember.RuntimeIdentity{}, openErr
 		}
-		_, receiveErr := stage.Receive(artifact, plan.Cursor.Persist)
+		var lease *migrationbudget.Lease
+		if plan.Budget != nil {
+			lease, err = plan.Budget.Acquire(ctx)
+			if err != nil {
+				_ = artifact.Close()
+				return raftmember.RuntimeIdentity{}, err
+			}
+		}
+		reader := budgetedReader{ctx: ctx, budget: plan.Budget, lease: lease, reader: artifact}
+		_, receiveErr := stage.Receive(reader, plan.Cursor.Persist)
 		closeErr := artifact.Close()
+		if lease != nil {
+			lease.Release()
+		}
 		if receiveErr != nil || closeErr != nil {
 			return raftmember.RuntimeIdentity{}, errors.Join(receiveErr, closeErr)
 		}
@@ -248,12 +270,14 @@ func validateLearnerInstallPlan(plan LearnerInstallPlan) error {
 		d.Group.ShardIncarnation != b.ShardIncarnation || d.Group.GroupID != b.GroupID ||
 		d.TargetMember != b.MemberID || d.TargetStore != b.StoreID ||
 		d.SchemaGeneration != b.Authority.SchemaGeneration ||
-		w.ClusterID != b.ClusterID || w.ClusterIncarnation != b.ClusterIncarnation ||
+		!exactLearnerConfState(conf, d.SourceMember, d.TargetMember) {
+		return ErrLearnerInstall
+	}
+	if w.ClusterID != b.ClusterID || w.ClusterIncarnation != b.ClusterIncarnation ||
 		w.Distribution != b.Distribution || w.Shard != b.Shard ||
 		w.AllocationGeneration != b.AllocationGeneration ||
 		w.ShardIncarnation != b.ShardIncarnation || w.GroupID != b.GroupID ||
-		w.MemberID != b.MemberID || w.StoreID != b.StoreID ||
-		!exactLearnerConfState(conf, d.SourceMember, d.TargetMember) {
+		w.MemberID != b.MemberID || w.StoreID != b.StoreID {
 		return ErrLearnerInstall
 	}
 	meta := plan.StaticBootstrap.GetMetadata()
