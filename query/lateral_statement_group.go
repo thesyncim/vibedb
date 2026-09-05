@@ -210,6 +210,10 @@ func (c *lateralClone) compileHaving(
 		node.ordinal = expr.Column
 		return node, nil
 	}
+	if expr.Agg != sqlast.AggNone {
+		return nil, sqlast.NewFeatureNotSupportedError(c.text, expr.Pos,
+			"an unprojected correlated LATERAL HAVING aggregate requires a child reduction binding")
+	}
 	if expr.Path == nil {
 		return nil, fmt.Errorf("query: correlated LATERAL HAVING leaf has no value")
 	}
