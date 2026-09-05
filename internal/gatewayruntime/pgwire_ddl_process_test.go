@@ -110,6 +110,8 @@ active BOOLEAN NOT NULL
 	for _, tc := range []struct{ sql, value string }{
 		{`SELECT COALESCE(SUM(score),0) FROM employees`, "49500"},
 		{`SELECT AVG(score) FROM employees`, "49.5"},
+		{`WITH c AS (SELECT id,score FROM employees) SELECT score FROM c WHERE id IS NOT DISTINCT FROM 'employee-0001'`, "1"},
+		{`SELECT CASE WHEN city IS DISTINCT FROM NULL THEN score ELSE 0 END FROM employees WHERE id='employee-0001'`, "1"},
 		{`SELECT score FROM employees ORDER BY GREATEST(score,0) DESC LIMIT 1`, "99"},
 		{`SELECT score FROM employees GROUP BY score ORDER BY SUM(score) DESC LIMIT 1`, "99"},
 		{`WITH selected AS (SELECT id AS owner, score FROM employees) SELECT COALESCE(SUM(score),0) FROM selected WHERE owner='employee-0001'`, "1"},
@@ -161,6 +163,22 @@ active BOOLEAN NOT NULL
 		}
 	}
 	checkColumnUpsert(connection)
+	for _, mutation := range []struct{ sql, tag string }{
+		{`UPDATE employees SET score=505 WHERE id IS NOT DISTINCT FROM 'employee-0005'`, "UPDATE 1"},
+		{`DELETE FROM employees WHERE id IS NOT DISTINCT FROM 'employee-0006'`, "DELETE 1"},
+		{`INSERT INTO employees (id,name,team,city,score,active) VALUES ('employee-0006','Employee 6','Platform','Lisbon',6,true)`, "INSERT 0 1"},
+	} {
+		if result := ddlWireQuery(t, connection, mutation.sql, true); result.code != "" || result.tag != mutation.tag {
+			t.Fatalf("null-safe routed mutation: %s: %+v", mutation.sql, result)
+		}
+	}
+	checkNullSafeUpdate := func(connection net.Conn) {
+		result := ddlWireQuery(t, connection, `SELECT score FROM employees WHERE id='employee-0005'`, true)
+		if result.code != "" || len(result.rows) != 1 || len(result.rows[0]) != 1 || result.rows[0][0] != "505" {
+			t.Fatalf("null-safe update did not persist: %+v", result)
+		}
+	}
+	checkNullSafeUpdate(connection)
 	result = ddlWireQuery(t, connection, ddl, true)
 	if result.code != "42P07" {
 		t.Fatalf("duplicate table: %+v", result)
@@ -179,6 +197,7 @@ active BOOLEAN NOT NULL
 	check(connection)
 	checkReplacement(connection)
 	checkColumnUpsert(connection)
+	checkNullSafeUpdate(connection)
 }
 
 type ddlWireResult struct {

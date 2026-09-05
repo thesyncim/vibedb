@@ -1044,6 +1044,9 @@ func replicatedSQLExactPrimaryFilter(filter *sqlast.SelectStmt, primary string) 
 		return false
 	}
 	where := filter.Where
+	if path, value, ok := sqlast.NullSafeEqualityPathOperand(where); ok {
+		where = &sqlast.Expr{Kind: sqlast.ExprCompare, Op: sqlast.OpEq, Path: path, Value: value, Column: -1}
+	}
 	if where.Kind != sqlast.ExprCompare || where.Op != sqlast.OpEq || where.Negated ||
 		where.Agg != sqlast.AggNone || where.Column != -1 || where.Path == nil ||
 		where.Path.Source != 0 || where.Path.MergedUsing != 0 || where.RightPath != nil ||
@@ -1067,6 +1070,9 @@ func replicatedSQLFinitePrimaryFilter(filter *sqlast.SelectStmt, primary string)
 		return false
 	}
 	where := filter.Where
+	if path, value, ok := sqlast.NullSafeEqualityPathOperand(where); ok {
+		where = &sqlast.Expr{Kind: sqlast.ExprCompare, Op: sqlast.OpEq, Path: path, Value: value, Column: -1}
+	}
 	if where.Negated || where.Agg != sqlast.AggNone || where.Column != -1 ||
 		where.Path == nil || where.Path.Source != 0 || where.Path.MergedUsing != 0 ||
 		where.RightPath != nil || where.Subquery != nil || len(where.Kids) != 0 {

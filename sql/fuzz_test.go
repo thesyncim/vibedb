@@ -29,6 +29,8 @@ func FuzzParseSQL(f *testing.F) {
 		``,
 		`SELECT`,
 		`SELECT a FROM t`,
+		`SELECT a FROM t WHERE a IS DISTINCT FROM NULL`,
+		`SELECT CASE WHEN a IS NOT DISTINCT FROM ? THEN TRUE ELSE FALSE END FROM t`,
 		`SELECT * FROM t`,
 		`SELECT a FROM t WHERE b = 1 AND c IN ('x', 'y') OR NOT d IS NULL`,
 		`SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.uid WHERE o.total BETWEEN ? AND ?`,
@@ -162,9 +164,8 @@ func checkStatementInvariantsScoped(
 	if len(s.Columns) == 0 {
 		t.Fatal("an accepted statement projects nothing")
 	}
-	if len(s.From) == 0 {
-		t.Fatal("an accepted statement reads no relation")
-	}
+	// A source-free SELECT evaluates one scalar row. The path checks below
+	// still reject any reference without a corresponding FROM source.
 	seen := 0
 	if s.With != nil {
 		if len(s.With.CTEs) == 0 {

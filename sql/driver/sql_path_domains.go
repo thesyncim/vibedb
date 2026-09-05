@@ -150,6 +150,11 @@ func walkDeclaredSQLScalarPathComparisons(
 	if expr == nil {
 		return nil
 	}
+	if comparison := sqlast.NullSafePathComparison(expr); comparison != nil {
+		if err := visit(comparison); err != nil {
+			return err
+		}
+	}
 	if err := walkDeclaredSQLScalarPathComparisons(expr.Left, visit); err != nil {
 		return err
 	}
