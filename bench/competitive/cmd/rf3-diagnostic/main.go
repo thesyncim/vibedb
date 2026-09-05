@@ -165,6 +165,26 @@ type cycle struct {
 	SamplingErrs    uint64          `json:"sampling_errors"`
 }
 
+// preflightTracker gates only the initial readiness check. Once one complete
+// cycle has established that every expected status and metrics cut is
+// observable, later cycles are evidence about transient failures (including a
+// deliberately paused node) and must be retained instead of aborting the
+// diagnostic.
+type preflightTracker struct {
+	satisfied bool
+}
+
+func (tracker *preflightTracker) observe(sequence uint64, ready bool, reason string) error {
+	if ready {
+		tracker.satisfied = true
+		return nil
+	}
+	if !tracker.satisfied && sequence >= preflightCycles {
+		return fmt.Errorf("rf3-diagnostic: preflight incomplete: %s", reason)
+	}
+	return nil
+}
+
 type groupSnapshot struct {
 	GroupID      string           `json:"group_id"`
 	Distribution string           `json:"distribution"`
@@ -282,6 +302,7 @@ func run(args []string) error {
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()
 	var sequence uint64
+	preflight := preflightTracker{}
 	for {
 		sequence++
 		started := time.Now()
@@ -311,8 +332,8 @@ func run(args []string) error {
 				return err
 			}
 		}
-		if sequence >= preflightCycles && !record.PreflightReady {
-			return fmt.Errorf("rf3-diagnostic: preflight incomplete: %s", record.PreflightReason)
+		if err = preflight.observe(sequence, record.PreflightReady, record.PreflightReason); err != nil {
+			return err
 		}
 		select {
 		case <-ctx.Done():

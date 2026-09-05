@@ -225,6 +225,48 @@ def per_group_diagnostic_summary(path, expected_groups=7, expected_members=3):
     }
 
 
+def diagnostic_output_path(run_dir):
+    """Locate the copied diagnostic stream, including a partial-run raw copy."""
+    direct = run_dir / "per-group-snapshots.jsonl"
+    if direct.is_file():
+        return direct
+    return run_dir / "raw" / "per-group-snapshots.jsonl"
+
+
+def primary_result_failure(result, run_dir):
+    """Retain the client failure when later qualification bookkeeping fails."""
+    if not isinstance(result, dict):
+        return None
+    errors = result.get("errors")
+    if not isinstance(errors, list) or not errors:
+        return None
+    failure = {
+        "status": result.get("status"),
+        "client_exit_code": result.get("client_exit_code"),
+        "errors": [str(error) for error in errors],
+        "client_log": "candidate/client.log",
+    }
+    client_log = run_dir / "client.log"
+    if client_log.is_file():
+        try:
+            lines = [line.strip() for line in client_log.read_text(errors="replace").splitlines()
+                     if line.strip()]
+            if lines:
+                failure["client_error_tail"] = lines[-1]
+        except OSError as exc:
+            failure["client_log_error"] = str(exc)
+    return failure
+
+
+def fault_qualification_complete(no_fault, pause, restart):
+    """Evaluate the fault contract without treating an absent restart as a dict."""
+    pause = pause if isinstance(pause, dict) else {}
+    restart = restart if isinstance(restart, dict) else {}
+    return no_fault or (
+        pause.get("status") == "verified-signals" and
+        restart.get("status") == "verified")
+
+
 def authority_proof(records):
     latest = {}
     for record in records:
@@ -821,14 +863,18 @@ def main(argv=None):
         manifest["diagnostic_records"] = diagnostics_summary(run_dir / "diagnostics")
         manifest["authority_proof"] = authority_proof(manifest["diagnostic_records"])
         manifest["per_group_diagnostic"] = per_group_diagnostic_summary(
-            run_dir / "per-group-snapshots.jsonl")
+            diagnostic_output_path(run_dir))
         manifest["pause"] = state.get("pause")
         manifest["pause_error"] = state.get("pause_error")
+        primary = primary_result_failure(result, run_dir)
+        if primary is not None:
+            manifest["primary_failure"] = primary
+            manifest["failure"] = primary.get("client_error_tail") or "; ".join(
+                primary["errors"])
         manifest["restart"] = next((event for event in reversed(manifest["events"])
                                      if event.get("event") == "sigkill-restart"), None)
-        fault_complete = selected.no_fault or (
-            state.get("pause", {}).get("status") == "verified-signals" and
-            manifest.get("restart", {}).get("status") == "verified")
+        fault_complete = fault_qualification_complete(
+            selected.no_fault, state.get("pause"), manifest.get("restart"))
         manifest["status"] = "complete" if (
             result.get("status") == "completed" and
             result.get("client_exit_code") == 0 and
@@ -838,7 +884,11 @@ def main(argv=None):
         ) else "incomplete-or-failed"
     except BaseException as exc:
         manifest["status"] = "incomplete-or-failed"
-        manifest["failure"] = str(exc) or exc.__class__.__name__
+        detail = str(exc) or exc.__class__.__name__
+        if manifest.get("failure"):
+            manifest["failure"] += "; qualification finalization: " + detail
+        else:
+            manifest["failure"] = detail
     finally:
         fixture.run = original_run
         subprocess.Popen = original_popen

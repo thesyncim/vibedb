@@ -77,6 +77,35 @@ class FaultQualificationProvenanceTest(unittest.TestCase):
             self.assertFalse(summary["complete_shape"])
             self.assertTrue(summary["parse_errors"])
 
+    def test_diagnostic_output_path_falls_back_to_partial_raw_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory) / "candidate"
+            path = run_dir / "raw" / "per-group-snapshots.jsonl"
+            path.parent.mkdir(parents=True)
+            path.write_text("partial\n")
+
+            self.assertEqual(MODULE.diagnostic_output_path(run_dir), path)
+
+    def test_primary_result_failure_keeps_client_error_when_restart_is_absent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory) / "candidate"
+            run_dir.mkdir()
+            error = "gateway: no authenticated replica reported itself as leader (ordinal=4)"
+            (run_dir / "client.log").write_text("warmup: ERROR: " + error + "\n")
+            failure = MODULE.primary_result_failure({
+                "status": "failed",
+                "client_exit_code": 1,
+                "errors": ["client report is incomplete or failed", "client exited nonzero"],
+            }, run_dir)
+
+            self.assertEqual(failure["client_error_tail"], "warmup: ERROR: " + error)
+            self.assertEqual(failure["client_log"], "candidate/client.log")
+
+            self.assertFalse(MODULE.fault_qualification_complete(
+                False, {"status": "verified-signals"}, None))
+            self.assertTrue(MODULE.fault_qualification_complete(
+                True, None, None))
+
 
 if __name__ == "__main__":
     unittest.main()

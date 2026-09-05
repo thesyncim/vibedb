@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/rafttransport"
@@ -59,6 +60,38 @@ func TestGroupFromManifestRejectsWrongTrustDomain(t *testing.T) {
 	group.Members = []manifestMember{{MemberID: 1, NodeID: hex16([16]byte{5})}, {MemberID: 2, NodeID: hex16([16]byte{6})}, {MemberID: 3, NodeID: hex16([16]byte{7})}}
 	if _, err := groupFromManifest(group, rafttransport.TrustDomain{ClusterID: [16]byte{9}, ClusterIncarnation: [16]byte{2}}); err == nil {
 		t.Fatal("group accepted a mismatched trust domain")
+	}
+}
+
+func TestPreflightTrackerRetainsPostReadyTransientFailures(t *testing.T) {
+	tracker := preflightTracker{}
+	if err := tracker.observe(1, true, ""); err != nil {
+		t.Fatalf("initial ready cut: %v", err)
+	}
+	if err := tracker.observe(2, false, "valid status and metrics cuts 14/21"); err != nil {
+		t.Fatalf("paused-node cut aborted after readiness: %v", err)
+	}
+	if err := tracker.observe(3, false, "valid status and metrics cuts 14/21"); err != nil {
+		t.Fatalf("repeated paused-node cut aborted after readiness: %v", err)
+	}
+	if !tracker.satisfied {
+		t.Fatal("preflight readiness was not latched")
+	}
+	if err := tracker.observe(4, true, ""); err != nil {
+		t.Fatalf("recovered cut: %v", err)
+	}
+}
+
+func TestPreflightTrackerRejectsMissingInitialCuts(t *testing.T) {
+	tracker := preflightTracker{}
+	for sequence := uint64(1); sequence < preflightCycles; sequence++ {
+		if err := tracker.observe(sequence, false, "valid status and metrics cuts 0/21"); err != nil {
+			t.Fatalf("early incomplete cut %d: %v", sequence, err)
+		}
+	}
+	err := tracker.observe(preflightCycles, false, "valid status and metrics cuts 0/21")
+	if err == nil || !strings.Contains(err.Error(), "preflight incomplete") {
+		t.Fatalf("missing initial cuts error = %v", err)
 	}
 }
 
