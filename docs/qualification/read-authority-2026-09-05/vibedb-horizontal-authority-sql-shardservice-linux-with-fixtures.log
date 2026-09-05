@@ -1,0 +1,3 @@
+--- FAIL: TestShardWireV1GoldenVectors (0.00s)
+    golden_vectors_test.go:214: open golden vectors: open testdata/shard_wire_v1_vectors.txt: no such file or directory
+FAIL

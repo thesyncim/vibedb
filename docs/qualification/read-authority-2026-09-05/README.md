@@ -54,3 +54,24 @@ anonymous `/tmp` volume and
 All selected cases passed with no skips. These are focused fake-host SQL owner
 tests; they do not constitute production RF3 integration qualification and
 make no performance claim.
+
+## Shardservice Linux harness evidence
+
+The three `vibedb-horizontal-authority-sql-shardservice-linux*.log` files
+retain the shardservice harness attempts for commit `e680bdf7`. The test
+binary was built for Linux arm64 with `GOOS=linux`, `GOARCH=arm64`,
+`CGO_ENABLED=0`, and `GOEXPERIMENT=simd`, then run in the pinned image
+`sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b`
+with an anonymous `/tmp` volume.
+
+The first run and the run with the fixture volume both failed at
+`TestShardWireV1GoldenVectors` because the process could not resolve the
+relative file `testdata/shard_wire_v1_vectors.txt`. The fixture volume did not
+make that relative path visible from the process working directory. The
+corrected run set `--workdir /`, bound `shardservice/testdata` to `/testdata`,
+executed `/runtime.test`, and used `-test.count=1 -test.timeout=5m`; its log is
+`PASS`.
+
+The corrected log is intentionally concise and does not report package-level
+skip details. The three copied logs and their byte counts and SHA-256 digests
+are listed in [checksums.json](checksums.json).
