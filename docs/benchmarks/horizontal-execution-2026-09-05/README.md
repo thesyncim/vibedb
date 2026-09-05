@@ -315,3 +315,24 @@ barrier and outcome-unknown semantics; it has not been implemented or measured.
 `profile-proposals.tar.gz` retains the frontend trace, all CPU profiles, build
 identities, run verification and controls. The region summary and targeted test
 output are retained under `validation/`.
+
+
+## Append-completion and apply diagnostic
+
+`c14d1ac0` adds logical append and peer-message trace events and apply execution
+regions. A fully verified 16,000-operation diagnostic used immutable binaries
+from that revision. This is not a comparative throughput result.
+
+The frontend trace contains 4,528 paired entry-bearing append submissions and
+owner-consumed completions, averaging 1.439 ms (p50 1.042 ms, p95 3.605 ms), with
+no unmatched append edges. Required persistence waves averaged 0.766 ms across
+2,738 regions. Apply execution averaged 0.178 ms across 4,511 regions, with two
+unmatched ends. These populations differ and must not be subtracted as paired
+measurements. This revision omitted empty append batches, so this run cannot
+measure commit-hint queue latency. `ee92ecf2` extends instrumentation and the
+parser to separate empty hint candidates, explicit syncs, and snapshots.
+
+`profile-peers.tar.gz` retains the frontend trace, all CPU profiles, verified
+report, and build identities. Parsed summaries are under `validation/`; archive
+hashes and omitted-file inventories follow the policy above. The parser's three
+focused tests and targeted raftmember tests passed.

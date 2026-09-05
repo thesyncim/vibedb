@@ -103,5 +103,12 @@
     "files": 1198,
     "source": "/private/tmp/vibedb-horizontal-profile-proposals",
     "excluded": "compiled executables; numeric binary CRDB WAL files; non-frontend execution traces. Source/build identities and all CPU profiles retained; omitted-files.json records other omitted file hashes."
+  },
+  "profile-peers.tar.gz": {
+    "sha256": "b3f073fae8a2567bdd83d512347bde135c61b3c6c536312d39b69588058f7430",
+    "bytes": 10485902,
+    "files": 1198,
+    "source": "/private/tmp/vibedb-horizontal-profile-peers",
+    "excluded": "compiled executables; numeric binary CRDB WAL files; non-frontend execution traces. Source/build identities and all CPU profiles retained; omitted-files.json records other omitted file hashes."
   }
 }

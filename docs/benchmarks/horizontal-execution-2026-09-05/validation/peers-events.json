@@ -1,0 +1,106 @@
+{
+  "append": {
+    "entry-bearing": {
+      "count": 4528,
+      "total_ms": 6515.721379000007,
+      "mean_ms": 1.4389844034893993,
+      "p50_ms": 1.041504,
+      "p95_ms": 3.604864,
+      "unmatched_submit": 0,
+      "unmatched_complete": 0,
+      "unmatched": 0,
+      "duplicates": 0,
+      "submit_sync": {
+        "true": 0,
+        "false": 0,
+        "unknown": 4528
+      }
+    },
+    "hint_candidate": {
+      "count": 0,
+      "total_ms": 0,
+      "mean_ms": null,
+      "p50_ms": null,
+      "p95_ms": null,
+      "unmatched_submit": 0,
+      "unmatched_complete": 0,
+      "unmatched": 0,
+      "duplicates": 0,
+      "submit_sync": {
+        "true": 0,
+        "false": 0,
+        "unknown": 0
+      }
+    },
+    "empty_sync": {
+      "count": 0,
+      "total_ms": 0,
+      "mean_ms": null,
+      "p50_ms": null,
+      "p95_ms": null,
+      "unmatched_submit": 0,
+      "unmatched_complete": 0,
+      "unmatched": 0,
+      "duplicates": 0,
+      "submit_sync": {
+        "true": 0,
+        "false": 0,
+        "unknown": 0
+      }
+    },
+    "empty_snapshot": {
+      "count": 0,
+      "total_ms": 0,
+      "mean_ms": null,
+      "p50_ms": null,
+      "p95_ms": null,
+      "unmatched_submit": 0,
+      "unmatched_complete": 0,
+      "unmatched": 0,
+      "duplicates": 0,
+      "submit_sync": {
+        "true": 0,
+        "false": 0,
+        "unknown": 0
+      }
+    },
+    "unknown": {
+      "count": 0,
+      "total_ms": 0,
+      "mean_ms": null,
+      "p50_ms": null,
+      "p95_ms": null,
+      "unmatched_submit": 0,
+      "unmatched_complete": 0,
+      "unmatched": 0,
+      "duplicates": 0,
+      "submit_sync": {
+        "true": 0,
+        "false": 0,
+        "unknown": 0
+      }
+    },
+    "empty": {
+      "count": 0,
+      "total_ms": 0,
+      "mean_ms": null,
+      "p50_ms": null,
+      "p95_ms": null,
+      "unmatched_submit": 0,
+      "unmatched_complete": 0,
+      "unmatched": 0,
+      "duplicates": 0,
+      "submit_sync": {
+        "true": 0,
+        "false": 0,
+        "unknown": 0
+      }
+    }
+  },
+  "scope_caveats": [
+    "Intervals are same-process diagnostic wall time from Ready submit to the owner consuming a successful persistence result; persistence queueing and wake/scheduling latency are included.",
+    "Only group and ReadyID are paired. A trace may begin or end mid-flight, and those boundary records are reported as unmatched.",
+    "A hint_candidate is entries=0, sync=false, snapshot=false. Older records missing sync or snapshot remain unknown, so empty delays are not all attributed to hints.",
+    "This parser does not subtract timestamps across processes or nodes; p50 and p95 are exact over completed delays."
+  ]
+}
