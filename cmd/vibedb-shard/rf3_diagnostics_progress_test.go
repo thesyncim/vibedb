@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/raftservice"
@@ -17,21 +18,26 @@ func TestRF3DiagnosticCanaryCountersMapExactSnapshots(t *testing.T) {
 		RaftProposalBytesPerReady:       make([]uint64, raftservice.ProposalBytesHistogramBuckets),
 	}
 	applyRF3DiagnosticProgress(&snapshot, raftservice.ProgressMetricsSnapshot{
-		ProposalBatches:             1,
-		ProposalCommands:            2,
-		ProposalBytes:               3,
-		ApplyBatches:                4,
-		AppliedEntries:              5,
-		CommitAdvancements:          6,
-		CommittedEntries:            7,
-		ReadyPersisted:              8,
-		ProposalWindowQueued:        9,
-		LateJoinUsed:                10,
-		LateJoinMissed:              11,
-		LateJoinEntries:             12,
-		ProposalQueueDepthHistogram: [raftservice.ProposalEntryHistogramBuckets]uint64{2: 13},
-		ProposalEntriesPerReady:     [raftservice.ProposalEntryHistogramBuckets]uint64{2: 14},
-		ProposalBytesPerReady:       [raftservice.ProposalBytesHistogramBuckets]uint64{1: 15},
+		ProposalBatches:                 1,
+		ProposalCommands:                2,
+		ProposalBytes:                   3,
+		ApplyBatches:                    4,
+		AppliedEntries:                  5,
+		CommitAdvancements:              6,
+		CommittedEntries:                7,
+		ReadyPersisted:                  8,
+		ProposalWindowQueued:            9,
+		LateJoinUsed:                    10,
+		LateJoinMissed:                  11,
+		LateJoinEntries:                 12,
+		AuthorityReadHits:               16,
+		AuthorityReadIndexFallbacks:     17,
+		AuthorityReadValidationRetries:  18,
+		AuthorityReadValidationFailures: 19,
+		AuthorityRoundAttempts:          20,
+		ProposalQueueDepthHistogram:     [raftservice.ProposalEntryHistogramBuckets]uint64{2: 13},
+		ProposalEntriesPerReady:         [raftservice.ProposalEntryHistogramBuckets]uint64{2: 14},
+		ProposalBytesPerReady:           [raftservice.ProposalBytesHistogramBuckets]uint64{1: 15},
 	})
 	if snapshot.RaftProposalBatches != 1 || snapshot.RaftProposalCommands != 2 ||
 		snapshot.RaftProposalBytes != 3 || snapshot.RaftApplyBatches != 4 ||
@@ -41,8 +47,30 @@ func TestRF3DiagnosticCanaryCountersMapExactSnapshots(t *testing.T) {
 		snapshot.RaftLateJoinMissed != 11 || snapshot.RaftLateJoinEntries != 12 ||
 		snapshot.RaftProposalQueueDepthHistogram[2] != 13 ||
 		snapshot.RaftProposalEntriesPerReady[2] != 14 ||
-		snapshot.RaftProposalBytesPerReady[1] != 15 {
+		snapshot.RaftProposalBytesPerReady[1] != 15 ||
+		snapshot.AuthorityReadHits != 16 ||
+		snapshot.AuthorityReadIndexFallbacks != 17 ||
+		snapshot.AuthorityReadValidationRetries != 18 ||
+		snapshot.AuthorityReadValidationFailures != 19 ||
+		snapshot.AuthorityRoundAttempts != 20 {
 		t.Fatalf("progress counters were not copied exactly: %+v", snapshot)
+	}
+	raw, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatalf("marshal diagnostic snapshot: %v", err)
+	}
+	var encoded map[string]any
+	if err := json.Unmarshal(raw, &encoded); err != nil {
+		t.Fatalf("decode diagnostic snapshot: %v", err)
+	}
+	for _, key := range []string{
+		"authority_read_hits", "authority_read_index_fallbacks",
+		"authority_read_validation_retries", "authority_read_validation_failures",
+		"authority_round_attempts",
+	} {
+		if _, ok := encoded[key]; !ok {
+			t.Fatalf("diagnostic JSON omitted %q: %s", key, raw)
+		}
 	}
 
 	applyRF3DiagnosticSequencer(&snapshot, raftstore.NodeSubmissionSequencerStats{

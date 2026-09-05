@@ -1,0 +1,102 @@
+=== RUN   TestFileSmallIndexedPages
+=== RUN   TestFileSmallIndexedPages/primary/1/residual=false
+=== RUN   TestFileSmallIndexedPages/primary/1/residual=true
+=== RUN   TestFileSmallIndexedPages/secondary/1
+=== RUN   TestFileSmallIndexedPages/primary/32/residual=false
+=== RUN   TestFileSmallIndexedPages/primary/32/residual=true
+=== RUN   TestFileSmallIndexedPages/secondary/32
+=== RUN   TestFileSmallIndexedPages/primary/64/residual=false
+=== RUN   TestFileSmallIndexedPages/primary/64/residual=true
+=== RUN   TestFileSmallIndexedPages/secondary/64
+=== RUN   TestFileSmallIndexedPages/primary/256/residual=false
+=== RUN   TestFileSmallIndexedPages/primary/256/residual=true
+=== RUN   TestFileSmallIndexedPages/secondary/256
+--- PASS: TestFileSmallIndexedPages (0.05s)
+    --- PASS: TestFileSmallIndexedPages/primary/1/residual=false (0.00s)
+    --- PASS: TestFileSmallIndexedPages/primary/1/residual=true (0.00s)
+    --- PASS: TestFileSmallIndexedPages/secondary/1 (0.00s)
+    --- PASS: TestFileSmallIndexedPages/primary/32/residual=false (0.00s)
+    --- PASS: TestFileSmallIndexedPages/primary/32/residual=true (0.00s)
+    --- PASS: TestFileSmallIndexedPages/secondary/32 (0.00s)
+    --- PASS: TestFileSmallIndexedPages/primary/64/residual=false (0.00s)
+    --- PASS: TestFileSmallIndexedPages/primary/64/residual=true (0.00s)
+    --- PASS: TestFileSmallIndexedPages/secondary/64 (0.00s)
+    --- PASS: TestFileSmallIndexedPages/primary/256/residual=false (0.00s)
+    --- PASS: TestFileSmallIndexedPages/primary/256/residual=true (0.01s)
+    --- PASS: TestFileSmallIndexedPages/secondary/256 (0.00s)
+=== RUN   TestValidatedRawPointMatchesSegment
+=== RUN   TestValidatedRawPointMatchesSegment/projection_and_residual
+=== RUN   TestValidatedRawPointMatchesSegment/escaped_unrelated_key_falls_back
+=== RUN   TestValidatedRawPointMatchesSegment/nested_pointer_falls_back
+=== RUN   TestValidatedRawPointMatchesSegment/array_root_preserves_pointer_semantics
+--- PASS: TestValidatedRawPointMatchesSegment (0.00s)
+    --- PASS: TestValidatedRawPointMatchesSegment/projection_and_residual (0.00s)
+    --- PASS: TestValidatedRawPointMatchesSegment/escaped_unrelated_key_falls_back (0.00s)
+    --- PASS: TestValidatedRawPointMatchesSegment/nested_pointer_falls_back (0.00s)
+    --- PASS: TestValidatedRawPointMatchesSegment/array_root_preserves_pointer_semantics (0.00s)
+=== RUN   TestValidatedRawSingleRowLimitsCancellationAndFallbackReuse
+--- PASS: TestValidatedRawSingleRowLimitsCancellationAndFallbackReuse (0.00s)
+=== RUN   TestFileProjectionMatchesGenericOnOneSnapshot
+--- PASS: TestFileProjectionMatchesGenericOnOneSnapshot (0.06s)
+=== RUN   TestFileProjectionBorrowsLargeDictionaryReview
+--- PASS: TestFileProjectionBorrowsLargeDictionaryReview (0.00s)
+=== RUN   TestFileProjectionDuplicateReview
+=== RUN   TestFileProjectionDuplicateReview/scalar
+=== RUN   TestFileProjectionDuplicateReview/escaped-scalar-key
+=== RUN   TestFileProjectionDuplicateReview/container-then-scalar
+=== RUN   TestFileProjectionDuplicateReview/scalar-then-container
+=== RUN   TestFileProjectionDuplicateReview/ancestor
+=== RUN   TestFileProjectionDuplicateReview/ancestor-removes-field
+=== RUN   TestFileProjectionDuplicateReview/ancestor-changes-type
+=== RUN   TestFileProjectionDuplicateReview/ancestor-restores-type
+=== RUN   TestFileProjectionDuplicateReview/nested-duplicates
+=== RUN   TestFileProjectionDuplicateReview/escaped-slash
+=== RUN   TestFileProjectionDuplicateReview/scalar-then-null
+=== RUN   TestFileProjectionDuplicateReview/null-then-scalar
+--- PASS: TestFileProjectionDuplicateReview (0.00s)
+    --- PASS: TestFileProjectionDuplicateReview/scalar (0.00s)
+    --- PASS: TestFileProjectionDuplicateReview/escaped-scalar-key (0.00s)
+    --- PASS: TestFileProjectionDuplicateReview/container-then-scalar (0.00s)
+    --- PASS: TestFileProjectionDuplicateReview/scalar-then-container (0.00s)
+    --- PASS: TestFileProjectionDuplicateReview/ancestor (0.00s)
+    --- PASS: TestFileProjectionDuplicateReview/ancestor-removes-field (0.00s)
+    --- PASS: TestFileProjectionDuplicateReview/ancestor-changes-type (0.00s)
+    --- PASS: TestFileProjectionDuplicateReview/ancestor-restores-type (0.00s)
+    --- PASS: TestFileProjectionDuplicateReview/nested-duplicates (0.00s)
+    --- PASS: TestFileProjectionDuplicateReview/escaped-slash (0.00s)
+    --- PASS: TestFileProjectionDuplicateReview/scalar-then-null (0.00s)
+    --- PASS: TestFileProjectionDuplicateReview/null-then-scalar (0.00s)
+=== RUN   TestFileProjectionCancellationResetAndEmptyRange
+--- PASS: TestFileProjectionCancellationResetAndEmptyRange (0.04s)
+=== RUN   TestFileProjectionResultBudgetRollbackAndReuse
+=== RUN   TestFileProjectionResultBudgetRollbackAndReuse/rows
+=== RUN   TestFileProjectionResultBudgetRollbackAndReuse/bytes
+--- PASS: TestFileProjectionResultBudgetRollbackAndReuse (0.05s)
+    --- PASS: TestFileProjectionResultBudgetRollbackAndReuse/rows (0.00s)
+    --- PASS: TestFileProjectionResultBudgetRollbackAndReuse/bytes (0.00s)
+=== RUN   TestFileProjectionTightMemoryFallbackIsAtomic
+--- PASS: TestFileProjectionTightMemoryFallbackIsAtomic (0.07s)
+=== RUN   TestFileProjectionEligibilityGuards
+=== RUN   TestFileProjectionEligibilityGuards/filtered_source
+=== RUN   TestFileProjectionEligibilityGuards/uncertified_range
+=== RUN   TestFileProjectionEligibilityGuards/wrong_certificate
+--- PASS: TestFileProjectionEligibilityGuards (0.05s)
+    --- PASS: TestFileProjectionEligibilityGuards/filtered_source (0.00s)
+    --- PASS: TestFileProjectionEligibilityGuards/uncertified_range (0.00s)
+    --- PASS: TestFileProjectionEligibilityGuards/wrong_certificate (0.00s)
+=== RUN   TestFileProjectionCandidateMaskDoesNotEnterNativeLane
+--- PASS: TestFileProjectionCandidateMaskDoesNotEnterNativeLane (0.00s)
+=== RUN   TestFileProjectionNativeLaneReportsProjectedRows
+--- PASS: TestFileProjectionNativeLaneReportsProjectedRows (0.05s)
+=== RUN   TestFileProjectionRecompiledPlanUsesCurrentPaths
+--- PASS: TestFileProjectionRecompiledPlanUsesCurrentPaths (0.05s)
+=== RUN   TestFileProjectionDeclinedReplacementPreservesFilterCharge
+--- PASS: TestFileProjectionDeclinedReplacementPreservesFilterCharge (0.05s)
+=== RUN   TestFileProjectionFilterEstimateCoversRetainedCapacity
+--- PASS: TestFileProjectionFilterEstimateCoversRetainedCapacity (0.00s)
+=== RUN   TestFileProjectionPreservesWideIntegerSpelling
+--- PASS: TestFileProjectionPreservesWideIntegerSpelling (0.00s)
+=== RUN   TestFileProjectionFallsBackAfterLateUnsupportedShape
+--- PASS: TestFileProjectionFallsBackAfterLateUnsupportedShape (0.00s)
+PASS
+ok  	github.com/thesyncim/vibedb/query	0.493s

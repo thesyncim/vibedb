@@ -393,10 +393,20 @@ func (p *Parser) parseInsertConflictUpdate() error {
 		p.conflictAssignments = assignments
 		p.conflict.Assignments = assignments
 	}
-	if p.atKeyword(kwWhere) {
-		return p.featureNotSupportedHere(
-			"ON CONFLICT DO UPDATE WHERE is not supported; the implicit primary-key conflict is always updated",
-		)
+	if p.acceptKeyword(kwWhere) {
+		pendingBase := len(p.pending)
+		predicate, err := p.parseExpr(ctxWhere)
+		if err != nil {
+			return err
+		}
+		if err = p.validateUpdatePredicateExpression(predicate); err != nil {
+			return err
+		}
+		if err = p.resolveConflictScalarPaths(pendingBase, p.ins.Table, p.ins.Alias); err != nil {
+			return err
+		}
+		p.pending = p.pending[:pendingBase]
+		p.conflict.Where = predicate
 	}
 	p.ins.OnConflictUpdate = &p.conflict
 	return nil

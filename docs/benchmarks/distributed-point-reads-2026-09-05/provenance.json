@@ -1,0 +1,185 @@
+{
+  "bottleneck_diagnostic": {
+    "interpretation": "startup-inclusive candidate miss trace; 43,424 sql.read.quorum regions median 156.45 us versus execution 17.79 us, admission 0.128 us, encode 0.320 us; subset diagnostic, no comparative latency claim",
+    "summary": "diagnostics/fused-miss-region-summary.json"
+  },
+  "correctness": {
+    "ci": [
+      "https://github.com/thesyncim/vibedb/pull/178",
+      "https://github.com/thesyncim/vibedb/pull/178/checks",
+      "https://github.com/thesyncim/vibedb/actions/runs/33983819485"
+    ],
+    "ci_revision": "93f85d56e71be35f043c7bf0cf0c4569ffdf806f",
+    "failures": 0,
+    "integrated_and_merged_tree": "809d3ff17301fc1bd9b04e156a47dc244bf113b4",
+    "integrated_focused_failures": 0,
+    "integrated_focused_passes": 114,
+    "integrated_focused_skips": 0,
+    "integrated_revision": "0770c9a51bce442937ec965a5301bab9e5e252ef",
+    "integration_log": "correctness/integration-0770c9a5.log",
+    "measured_revision": "93f85d56e71be35f043c7bf0cf0c4569ffdf806f",
+    "merged_revision": "f05df25e8bebc13d9bfe11a2038bab43805f6c3d",
+    "native_driver_passes": 55,
+    "native_query_passes": 50,
+    "pr_checks_passed": 37,
+    "race_passes_combined": 41,
+    "skips": 0
+  },
+  "driver_micro": {
+    "benchmark_source": "micro/replicated_point_cpu_bench_test.go.txt",
+    "benchmark_source_sha256": "46262105bd205fdc8c4e2e56d93e73b510fa01d5a2684783be811aed2763e0ab",
+    "diagnostic_only": true,
+    "go_version": "go version go1.27.1 linux/arm64",
+    "no_wire_encoding_claim": true,
+    "profile": {
+      "benchtime": "5s",
+      "path": "micro/after-point-miss.cpu.pprof",
+      "source_log": "micro/020-candidate-point-miss-cpuprofile.stdout",
+      "workload": "point_miss"
+    },
+    "runner_sha256": "4206fc170d6d59b8aab3af67e46b677cf9c87ca8a1e4574e4770648e23584689",
+    "runtime_image": "golang:1.27-bookworm@sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b",
+    "source_directory": "/private/tmp/vibedb-point-driver-93f85d56-final-abba",
+    "stats": {
+      "after_point_hit": {
+        "allocs_per_op": 131,
+        "bytes_per_op": 20085,
+        "median_ns_per_op": 10519.5,
+        "samples_ns_per_op": [
+          9506.0,
+          10249.0,
+          10892.0,
+          10103.0,
+          10790.0,
+          11036.0
+        ]
+      },
+      "after_point_miss": {
+        "allocs_per_op": 110,
+        "bytes_per_op": 11544,
+        "median_ns_per_op": 8328.0,
+        "samples_ns_per_op": [
+          8148.0,
+          8531.0,
+          8798.0,
+          8508.0,
+          8050.0,
+          8052.0
+        ]
+      },
+      "before_point_hit": {
+        "allocs_per_op": 165,
+        "bytes_per_op": 61536,
+        "median_ns_per_op": 15674.5,
+        "samples_ns_per_op": [
+          14769.0,
+          15715.0,
+          15174.0,
+          15634.0,
+          15897.0,
+          19831.0
+        ]
+      },
+      "before_point_miss": {
+        "allocs_per_op": 135,
+        "bytes_per_op": 12720,
+        "median_ns_per_op": 9487.0,
+        "samples_ns_per_op": [
+          9027.0,
+          9703.0,
+          10215.0,
+          10008.0,
+          9132.0,
+          9271.0
+        ]
+      },
+      "delta_point_hit_percent": -32.887811413442215,
+      "delta_point_miss_percent": -12.216717613576478
+    },
+    "status": "complete",
+    "timing_scope": "CPU benchmark timer covers Acquire, QueryCandidateKeysInto, complete cursor JSON verification, cursor Close, and lease Finish; setup is outside it."
+  },
+  "excluded_attempts": [
+    {
+      "path": "/private/tmp/vibedb-point-driver-fe8f5309",
+      "reason": "overlay-backed strict-allocation filesystem caused skipped native probes; not correctness evidence"
+    },
+    {
+      "path": "/private/tmp/vibedb-point-driver-fe8f5309-volume-abba",
+      "reason": "initial reuse copy lost executable mode and exited 255; not timing evidence"
+    },
+    {
+      "path": "/private/tmp/vibedb-point-driver-fe8f5309-volume-abba2",
+      "reason": "potentially contended micro timing; retained only as historical context, excluded from claims"
+    }
+  ],
+  "generated_utc": "2026-09-05",
+  "matched_campaign": {
+    "build_environment": {
+      "CGO_ENABLED": "0",
+      "GOARCH": "arm64",
+      "GOEXPERIMENT": "simd",
+      "GOOS": "linux",
+      "note": "the benchmark executables run in Linux containers"
+    },
+    "crdb_image_digest": "sha256:204f131510c78393adb02345f289a8dbb32e1491e26cc92b6c7751f3b97be3c5",
+    "docker_architecture": "arm64",
+    "errors": 0,
+    "go_version": "go version go1.27.0 darwin/arm64",
+    "interpretation": "Throughput differs substantially between orders; the cause is not established. Candidate exceeds CRDB throughput only in the two before-first 8-client rows; no robust CRDB win is established. Ratios above 1 favor candidate throughput; lower p99 favors candidate latency.",
+    "limits": {
+      "Memory": 25769803776,
+      "MemorySwap": 25769803776,
+      "NanoCpus": 12000000000
+    },
+    "operations": 1440000,
+    "orders": {
+      "after-first": [
+        "crdb",
+        "after",
+        "before"
+      ],
+      "before-first": [
+        "before",
+        "after",
+        "crdb"
+      ]
+    },
+    "raw_archive": "raw-campaign.tar.gz",
+    "report_json_contents": "all six order/arm reports, including all 72 verified trials and p99 observations; duplicate raw/report.json copies omitted",
+    "report_json_count": 6,
+    "runtime_image_digest": "sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b",
+    "source_directory": "/private/tmp/vibedb-point-4gN3-b2f-93f85d56",
+    "status": "complete",
+    "topology": {
+      "horizontal_multimachine_scaling": false,
+      "identical_fused_vibedb_topology": true,
+      "physical_nodes": 3,
+      "publication": false,
+      "replication_factor": 3,
+      "single_host_fixture": true
+    },
+    "verified_trials": 72,
+    "workload_contract": {
+      "clients": "1,8",
+      "groups": 4,
+      "operations": 20000,
+      "repetitions": 3,
+      "rows_per_table": 8192,
+      "scans": 2000,
+      "warmup": 1000,
+      "workloads": [
+        "point_hit,point_miss"
+      ]
+    }
+  },
+  "measured_candidate": {
+    "after_revision": "93f85d56e71be35f043c7bf0cf0c4569ffdf806f",
+    "baseline_is_ancestor": true,
+    "before_revision": "b2f716ecb6163539315d7863e806b428a17804cd",
+    "client_revision": "150912cfbe250dcf16fd4bcfdfea52e13027ed48",
+    "pr": "https://github.com/thesyncim/vibedb/pull/178"
+  },
+  "schema": "vibedb.distributed-point-reads-evidence/1",
+  "scope": "candidate point-read path evidence; single-host RF3 diagnostic, not a CRDB or multi-host latency claim"
+}

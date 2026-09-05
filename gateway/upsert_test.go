@@ -77,7 +77,7 @@ func TestReplicatedColumnUpsertRoutesConflictProgramWithoutPreimageRead(t *testi
 	// No client exists: preparing the atomic conflict must not read a preimage.
 	executor := NewExecutor(nil, NewCatalogHolder(snapshot), Options{})
 	targets, handled, err := executor.planReplicatedSQLTransaction(t.Context(), snapshot, []Query{{
-		SQL:    `INSERT INTO messages (id,n,city) VALUES (?,1,'candidate') ON CONFLICT (id) DO UPDATE SET n=?,city=EXCLUDED.city`,
+		SQL:    `INSERT INTO messages (id,n,city) VALUES (?,1,'candidate') ON CONFLICT (id) DO UPDATE SET n=messages.n+?,city=COALESCE(EXCLUDED.city,messages.city) WHERE messages.n<EXCLUDED.n`,
 		Params: []shardservice.Param{shardservice.StringParam("a"), shardservice.NumberParam("9007199254740993")},
 	}}, executor.profileFor(ClassInteractive))
 	if err != nil || !handled || len(targets) != 1 || len(targets[0].Batches) != 1 || len(targets[0].Batches[0].Mutations) != 1 {
@@ -90,11 +90,43 @@ func TestReplicatedColumnUpsertRoutesConflictProgramWithoutPreimageRead(t *testi
 	}
 	for _, statement := range []string{
 		`INSERT INTO messages (id,n) VALUES ('a',1) ON CONFLICT DO UPDATE SET absent=1`,
+		`INSERT INTO messages (id,n) VALUES ('a',1) ON CONFLICT DO UPDATE SET n=1 WHERE messages.absent=1`,
+		`INSERT INTO messages (id,n) VALUES ('a',1) ON CONFLICT DO UPDATE SET "$doc"=EXCLUDED."$doc" WHERE EXCLUDED.absent=1`,
 		`INSERT INTO messages (id,n) VALUES ('a',1) ON CONFLICT DO UPDATE SET n=EXCLUDED.absent`,
-		`INSERT INTO messages (id,n) VALUES ('a',1) ON CONFLICT DO UPDATE SET id='another'`,
 	} {
 		if _, err := snapshot.Prepare(t.Context(), statement); err == nil {
 			t.Fatalf("invalid conflict action accepted: %s", statement)
+		}
+	}
+}
+
+func TestReplicatedConflictKeyExpressionsRouteOnlyToCandidateOwner(t *testing.T) {
+	snapshot, executor, keys := replicatedSQLSplitTransactionFixture(t, ReplicatedTableDeclaration{
+		Table: "messages", CreateTable: `CREATE TABLE messages (id TEXT PRIMARY KEY,n INTEGER)`,
+	})
+	for _, action := range []string{
+		`id=COALESCE(messages.id,EXCLUDED.id),n=messages.n+EXCLUDED.n`,
+		`id=CASE WHEN messages.n>0 THEN CAST(messages.id AS TEXT) ELSE EXCLUDED.id END`,
+		`id='moved' WHERE false`,
+		`id='moved'`, // Whether this branch executes is known only at atomic apply.
+	} {
+		for ordinal, key := range keys {
+			targets, handled, err := executor.planReplicatedSQLTransaction(t.Context(), snapshot, []Query{{
+				SQL:    `INSERT INTO messages (id,n) VALUES (?,1) ON CONFLICT DO UPDATE SET ` + action,
+				Params: []shardservice.Param{shardservice.StringParam(key)},
+			}}, executor.profileFor(ClassInteractive))
+			if err != nil || !handled || len(targets) != 1 || len(targets[0].Batches) != 1 || len(targets[0].Batches[0].Mutations) != 1 {
+				t.Fatalf("action=%s targets=%+v handled=%v err=%v", action, targets, handled, err)
+			}
+			wantOwner := [2]string{"left", "right"}[ordinal]
+			if string(targets[0].Route.Shard) != wantOwner {
+				t.Fatalf("key %s owner=%s want=%s", key, targets[0].Route.Shard, wantOwner)
+			}
+			mutation := targets[0].Batches[0].Mutations[0]
+			candidate, _, ok := replication.OpenConflictValue(mutation.Value)
+			if !ok || mutation.Kind != replication.MutationPutConflict || string(candidate) != fmt.Sprintf(`{"id":%q,"n":1}`, key) {
+				t.Fatalf("wrong owner input: %+v candidate=%s", mutation, candidate)
+			}
 		}
 	}
 }

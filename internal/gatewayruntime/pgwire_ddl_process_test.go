@@ -182,6 +182,60 @@ active BOOLEAN NOT NULL
 		}
 	}
 	checkColumnUpsert(connection)
+
+	computed := ddlWireQuery(t, connection, `INSERT INTO employees (id,name,team,city,score,active) VALUES ('employee-0007','Candidate','Changed',NULL,3,false) ON CONFLICT (id) DO UPDATE SET score=employees.score+EXCLUDED.score,name=employees.name||':'||CAST(employees.score AS TEXT),city=COALESCE(EXCLUDED.city,employees.city)`, true)
+	if computed.code != "" || computed.tag != "INSERT 0 1" {
+		t.Fatalf("computed conflict: %+v", computed)
+	}
+	rejected := ddlWireQuery(t, connection, `INSERT INTO employees (id,name,team,city,score,active) VALUES ('employee-0007','Candidate','Changed',NULL,0,false) ON CONFLICT DO UPDATE SET score=employees.score/EXCLUDED.score`, true)
+	if rejected.code == "" {
+		t.Fatal("zero divisor committed")
+	}
+	checkComputedConflict := func(connection net.Conn) {
+		result := ddlWireQuery(t, connection, `SELECT name,score,city FROM employees WHERE id='employee-0007'`, true)
+		if result.code != "" || len(result.rows) != 1 || strings.Join(result.rows[0], "|") != `"Employee 7:7"|10|"Lisbon"` {
+			t.Fatalf("computed conflict persistence: %+v", result)
+		}
+	}
+	checkComputedConflict(connection)
+	for _, action := range []string{
+		`score=employees.score/EXCLUDED.score WHERE EXCLUDED.active`,
+		`score=EXCLUDED.score WHERE CAST(NULL AS BOOLEAN)`,
+		`"$doc"=EXCLUDED."$doc" WHERE employees.score<EXCLUDED.score`,
+	} {
+		result := ddlWireQuery(t, connection, `INSERT INTO employees (id,name,team,city,score,active) VALUES ('employee-0007','Skipped','Changed',NULL,0,false) ON CONFLICT DO UPDATE SET `+action, true)
+		if result.code != "" || result.tag != "INSERT 0 0" {
+			t.Fatalf("conditional conflict %s: %+v", action, result)
+		}
+	}
+	acceptedCondition := ddlWireQuery(t, connection, `INSERT INTO employees (id,name,team,city,score,active) VALUES ('employee-0007','Skipped','Changed',NULL,0,false) ON CONFLICT DO UPDATE SET score=employees.score+EXCLUDED.score WHERE employees.score>EXCLUDED.score`, true)
+	if acceptedCondition.code != "" || acceptedCondition.tag != "INSERT 0 1" {
+		t.Fatalf("matched unchanged conflict: %+v", acceptedCondition)
+	}
+	for _, action := range []struct{ sql, tag string }{
+		{`id=COALESCE(employees.id,EXCLUDED.id)`, "INSERT 0 1"},
+		{`id=CASE WHEN employees.active THEN CAST(employees.id AS TEXT) ELSE 'moved' END`, "INSERT 0 1"},
+		{`id='moved' WHERE EXCLUDED.active`, "INSERT 0 0"},
+		{`id='moved' WHERE false`, "INSERT 0 0"},
+	} {
+		result := ddlWireQuery(t, connection, `INSERT INTO employees (id,name,team,city,score,active) VALUES ('employee-0007','Skipped','Changed',NULL,0,false) ON CONFLICT DO UPDATE SET `+action.sql, true)
+		if result.code != "" || result.tag != action.tag {
+			t.Fatalf("key expression %s: %+v", action.sql, result)
+		}
+	}
+	moved := ddlWireQuery(t, connection, `INSERT INTO employees (id,name,team,city,score,active) VALUES ('employee-0007','Skipped','Changed',NULL,0,false) ON CONFLICT DO UPDATE SET id='moved'`, true)
+	if moved.code == "" {
+		t.Fatal("conflict moved its primary key")
+	}
+	insertedKey := ddlWireQuery(t, connection, `INSERT INTO employees (id,name,team,city,score,active) VALUES ('employee-key-insert','Inserted','Platform',NULL,1,true) ON CONFLICT DO UPDATE SET id='moved'`, true)
+	if insertedKey.code != "" || insertedKey.tag != "INSERT 0 1" {
+		t.Fatalf("insert evaluated unused key assignment: %+v", insertedKey)
+	}
+	removedKey := ddlWireQuery(t, connection, `DELETE FROM employees WHERE id='employee-key-insert'`, true)
+	if removedKey.code != "" || removedKey.tag != "DELETE 1" {
+		t.Fatalf("insert changed its routed key: %+v", removedKey)
+	}
+	checkComputedConflict(connection)
 	for _, mutation := range []struct{ sql, tag string }{
 		{`UPDATE employees SET score=505 WHERE id IS NOT DISTINCT FROM 'employee-0005'`, "UPDATE 1"},
 		{`DELETE FROM employees WHERE id IS NOT DISTINCT FROM 'employee-0006'`, "DELETE 1"},
@@ -216,6 +270,7 @@ active BOOLEAN NOT NULL
 	check(connection)
 	checkReplacement(connection)
 	checkColumnUpsert(connection)
+	checkComputedConflict(connection)
 	checkNullSafeUpdate(connection)
 }
 

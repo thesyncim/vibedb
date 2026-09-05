@@ -1,0 +1,111 @@
+import importlib.util
+import json
+import subprocess
+from pathlib import Path
+import tempfile
+import unittest
+
+
+MODULE_PATH = Path(__file__).with_name("run-read-authority-fault-qualification.py")
+SPEC = importlib.util.spec_from_file_location(
+    "run_read_authority_fault_qualification", MODULE_PATH)
+MODULE = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(MODULE)
+
+
+class FaultQualificationProvenanceTest(unittest.TestCase):
+    def test_source_snapshot_preserves_porcelain_status_prefix(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            destination = Path(directory) / "evidence"
+            repo.mkdir()
+            destination.mkdir()
+            run = lambda *args: subprocess.run(
+                ["git", "-C", str(repo), *args], check=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            run("init", "-q")
+            run("config", "user.email", "qualification-test@example.invalid")
+            run("config", "user.name", "qualification-test")
+            (repo / "tracked.txt").write_text("before\n")
+            run("add", "tracked.txt")
+            run("commit", "-qm", "initial")
+            (repo / "tracked.txt").write_text("after\n")
+            (repo / "untracked.txt").write_text("new\n")
+
+            fixture = MODULE.load_fixture()
+            fixture.COMMAND_LOG = None
+            snapshot = MODULE.source_snapshot(fixture, repo, destination, "before")
+            records = {record["path"]: record for record in snapshot["files"]}
+
+            self.assertEqual(records["tracked.txt"]["status"], " M")
+            self.assertEqual(records["untracked.txt"]["status"], "??")
+            self.assertEqual(snapshot["file_sha256"], {
+                "tracked.txt": records["tracked.txt"]["sha256"],
+                "untracked.txt": records["untracked.txt"]["sha256"],
+            })
+            self.assertEqual(
+                (destination / "source-before-files" / "tracked.txt").read_text(),
+                "after\n")
+            self.assertEqual(
+                (destination / "source-before-files" / "untracked.txt").read_text(),
+                "new\n")
+
+    def test_per_group_diagnostic_summary_requires_complete_rf3_shape(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "snapshots.jsonl"
+            members = [{"member_id": member, "node_id": f"{member:032x}",
+                        "status": {"term": 1}, "metrics": {"applied_entries": 1}}
+                       for member in range(1, 4)]
+            groups = [{"group_id": f"{group:032x}", "members": members}
+                      for group in range(7)]
+            path.write_text(json.dumps({"schema": "vibedb.rf3-diagnostic/1",
+                                        "sequence": 1, "elapsed_ns": 123,
+                                        "groups": groups, "expected_cuts": 21,
+                                        "valid_cuts": 21, "preflight_ready": True,
+                                        "sampling_errors": 0}) + "\n")
+            summary = MODULE.per_group_diagnostic_summary(path)
+            self.assertEqual(summary["records"], 1)
+            self.assertEqual(summary["max_cycle_elapsed_ns"], 123)
+            self.assertEqual(summary["valid_cuts"], 21)
+            self.assertEqual(summary["preflight_ready_records"], 1)
+            self.assertTrue(summary["complete_shape"])
+
+            path.write_text(json.dumps({"schema": "vibedb.rf3-diagnostic/1",
+                                        "sequence": 2, "groups": groups[:-1]}) + "\n")
+            summary = MODULE.per_group_diagnostic_summary(path)
+            self.assertEqual(summary["records"], 0)
+            self.assertFalse(summary["complete_shape"])
+            self.assertTrue(summary["parse_errors"])
+
+    def test_diagnostic_output_path_falls_back_to_partial_raw_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory) / "candidate"
+            path = run_dir / "raw" / "per-group-snapshots.jsonl"
+            path.parent.mkdir(parents=True)
+            path.write_text("partial\n")
+
+            self.assertEqual(MODULE.diagnostic_output_path(run_dir), path)
+
+    def test_primary_result_failure_keeps_client_error_when_restart_is_absent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory) / "candidate"
+            run_dir.mkdir()
+            error = "gateway: no authenticated replica reported itself as leader (ordinal=4)"
+            (run_dir / "client.log").write_text("warmup: ERROR: " + error + "\n")
+            failure = MODULE.primary_result_failure({
+                "status": "failed",
+                "client_exit_code": 1,
+                "errors": ["client report is incomplete or failed", "client exited nonzero"],
+            }, run_dir)
+
+            self.assertEqual(failure["client_error_tail"], "warmup: ERROR: " + error)
+            self.assertEqual(failure["client_log"], "candidate/client.log")
+
+            self.assertFalse(MODULE.fault_qualification_complete(
+                False, {"status": "verified-signals"}, None))
+            self.assertTrue(MODULE.fault_qualification_complete(
+                True, None, None))
+
+
+if __name__ == "__main__":
+    unittest.main()

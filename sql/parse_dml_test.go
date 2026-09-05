@@ -312,7 +312,6 @@ func TestRejectsMutationsTheEngineCannotExecute(t *testing.T) {
 		{"DEFAULT VALUES", `INSERT INTO t DEFAULT VALUES`, -1, "no declared columns"},
 		{"composite conflict target", `INSERT INTO t VALUES (?) ON CONFLICT (id, tenant) DO NOTHING`, -1, "composite ON CONFLICT targets"},
 		{"conflict constraint", `INSERT INTO t VALUES (?) ON CONFLICT ON CONSTRAINT t_pkey DO UPDATE SET value = EXCLUDED.value`, -1, "ON CONSTRAINT"},
-		{"conflict update where", `INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET value = EXCLUDED.value WHERE value = 'old'`, -1, "DO UPDATE WHERE"},
 		{"nested conflict target", `INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET profile.name = EXCLUDED.name`, -1, "top-level column"},
 		{"nested excluded source", `INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET name = EXCLUDED.profile.name`, -1, "nested paths"},
 		{"reserved excluded document", `INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET name = EXCLUDED."$doc"`, -1, "reserved"},
@@ -439,10 +438,6 @@ func TestInsertConflictUpdateUnsupportedFormsArePositioned(t *testing.T) {
 		{
 			`INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET value = EXCLUDED."$doc"['name']`,
 			`"$doc"`,
-		},
-		{
-			`INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET value = EXCLUDED.value WHERE value = 'old'`,
-			`WHERE`,
 		},
 	}
 	for _, test := range tests {

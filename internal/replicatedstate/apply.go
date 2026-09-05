@@ -2051,6 +2051,7 @@ func (m *Machine) planMutations(
 			return nil, 0, 0, err
 		}
 		mutation.beforeFound = found
+		conflictMatched := true
 		if mutation.condition == mutationPutConflict {
 			candidate, program, ok := replication.OpenConflictValue(mutation.value)
 			validator, supported := target.Validator.(ConflictMutationValidator)
@@ -2064,7 +2065,7 @@ func (m *Machine) planMutations(
 			if code != ResultApplied {
 				return nil, 0, code, nil
 			}
-			value, validation := validator.MaterializeConflict(mutation.key, candidate, program, current, found)
+			value, matched, validation := validator.MaterializeConflict(mutation.key, candidate, program, current, found)
 			switch validation {
 			case MutationValidationAccept:
 			case MutationValidationInvalid:
@@ -2077,6 +2078,10 @@ func (m *Machine) planMutations(
 				return nil, 0, 0, fmt.Errorf("%w: conflict validator returned %d", ErrInvalidCollection, validation)
 			}
 			mutation.value = value
+			conflictMatched = matched
+			if !matched && (!found || !bytes.Equal(value, current)) {
+				return nil, 0, ResultInvalidDocument, nil
+			}
 		}
 		// UPDATE of an absent row is an exact zero-row no-op. Check presence
 		// before validating the replacement so a coordinator can retain a
@@ -2150,6 +2155,11 @@ func (m *Machine) planMutations(
 					"%w: mutation validator returned %d", ErrInvalidCollection, validation,
 				)
 			}
+		}
+		// A false conflict condition still passes the schema/key and current
+		// ownership fence above, including after an ownership transfer.
+		if !conflictMatched {
+			continue
 		}
 		if relation.kind == RelationJSON && mutation.condition == mutationPutAbsentOrEqual && found {
 			if bytes.Equal(current, mutation.value) {

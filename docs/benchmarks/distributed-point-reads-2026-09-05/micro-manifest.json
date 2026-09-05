@@ -1,0 +1,411 @@
+{
+  "binaries": {
+    "after": {
+      "bytes": 37670121,
+      "path": "bin/after-driver.test",
+      "reused_from": "/private/tmp/vibedb-point-driver-93f85d56-build/bin/after-driver.test",
+      "sha256": "e4857f05ca2eb02e8f8853822eceef32f6c20ff8f35bdb526c439c0044f4fcdb"
+    },
+    "before": {
+      "bytes": 37588569,
+      "path": "bin/before-driver.test",
+      "reused_from": "/private/tmp/vibedb-point-driver-93f85d56-build/bin/before-driver.test",
+      "sha256": "c0c95c6dc0c1b324db7dcfd00d9af0503d412c7b593f528a3a8facba15c653c2"
+    }
+  },
+  "build_only": false,
+  "command_count": 21,
+  "diagnostic_only": true,
+  "docker_test_tmp_volume_inspect_log": "logs/012-docker-test-tmp-volume-inspect.stdout",
+  "finished_utc": "2026-09-05T18:35:38.766684+00:00",
+  "go_cache_directory": "/Users/thesyncim/Library/Caches/go-build",
+  "go_cache_mount": {
+    "container": "/go/cache",
+    "host": "/Users/thesyncim/Library/Caches/go-build",
+    "mode": "bind"
+  },
+  "go_version": "go version go1.27.1 linux/arm64",
+  "module_cache": "/Users/thesyncim/go/pkg/mod",
+  "no_network_downloads": true,
+  "no_wire_encoding_claim": true,
+  "reuse_binaries_from": "/private/tmp/vibedb-point-driver-93f85d56-build",
+  "reused_binary_manifest": {
+    "path": "/private/tmp/vibedb-point-driver-93f85d56-build/manifest.json",
+    "sha256": "cc9f1ad6af205392cbf7ad7752cba1137f34cc75a5c68878c503da049ad7d338"
+  },
+  "runs": [
+    {
+      "arm": "before",
+      "evidence": {
+        "passed": [
+          "TestReplicatedPointReadSessionCandidatePreservesQuerySemantics",
+          "TestReplicatedPointReadSessionMissAndWrongKeyAreBounded",
+          "TestReplicatedPointReadSessionRejectsStaleIdentityAndPath",
+          "TestReplicatedReadReuseDataCutMutationAndParameterKey",
+          "TestReplicatedReadReusePointAlternatesHitsMissesAndUpdates",
+          "TestReplicatedReadReuseBudgetCancellationRollbackAndReuse",
+          "TestReplicatedReadReuseLeasesAreExclusiveAndStaleHandlesClose",
+          "TestReplicatedReadReuseConcurrentIndependentLeases",
+          "TestReplicatedReadReuseUnsupportedShapesAreNeverRetained",
+          "TestReplicatedReadReuseRejectsForeignAndClosedCuts",
+          "TestReplicatedReadReuseLayoutReplacementDoesNotReuseStaleSlot",
+          "TestReplicatedReadReuseApplyCloseRejectsAndRetiresLeases",
+          "TestReplicatedReadReuseIdleStateDropsRequestReferences",
+          "TestReplicatedReadReuseLayoutTokensOutliveEpochs",
+          "TestReplicatedReadReusePreparationOwnsSourceAndAccountsObjects",
+          "TestReplicatedReadReusePublicationBetweenLookupAndAttach",
+          "TestReplicatedReadReusePublicationBetweenLookupAndAttach/cold",
+          "TestReplicatedReadReusePublicationBetweenLookupAndAttach/hit",
+          "TestReplicatedReadReuseAcquirePanicRetiresReservation",
+          "TestReplicatedReadReuseAcquirePanicRetiresReservation/cold",
+          "TestReplicatedReadReuseAcquirePanicRetiresReservation/hit",
+          "TestReplicatedReadReuseResetDeclinePreservesSuccessfulRead",
+          "TestReplicatedReadReuseAbortClosesUnpublishedRows",
+          "TestReplicatedReadReuseQueryPanicStopsContextWatcher"
+        ],
+        "skipped": [],
+        "started": [
+          "TestReplicatedPointReadSessionCandidatePreservesQuerySemantics",
+          "TestReplicatedPointReadSessionMissAndWrongKeyAreBounded",
+          "TestReplicatedPointReadSessionRejectsStaleIdentityAndPath",
+          "TestReplicatedReadReuseDataCutMutationAndParameterKey",
+          "TestReplicatedReadReusePointAlternatesHitsMissesAndUpdates",
+          "TestReplicatedReadReuseBudgetCancellationRollbackAndReuse",
+          "TestReplicatedReadReuseLeasesAreExclusiveAndStaleHandlesClose",
+          "TestReplicatedReadReuseConcurrentIndependentLeases",
+          "TestReplicatedReadReuseUnsupportedShapesAreNeverRetained",
+          "TestReplicatedReadReuseRejectsForeignAndClosedCuts",
+          "TestReplicatedReadReuseLayoutReplacementDoesNotReuseStaleSlot",
+          "TestReplicatedReadReuseApplyCloseRejectsAndRetiresLeases",
+          "TestReplicatedReadReuseIdleStateDropsRequestReferences",
+          "TestReplicatedReadReuseLayoutTokensOutliveEpochs",
+          "TestReplicatedReadReusePreparationOwnsSourceAndAccountsObjects",
+          "TestReplicatedReadReusePublicationBetweenLookupAndAttach",
+          "TestReplicatedReadReusePublicationBetweenLookupAndAttach/cold",
+          "TestReplicatedReadReusePublicationBetweenLookupAndAttach/hit",
+          "TestReplicatedReadReuseAcquirePanicRetiresReservation",
+          "TestReplicatedReadReuseAcquirePanicRetiresReservation/cold",
+          "TestReplicatedReadReuseAcquirePanicRetiresReservation/hit",
+          "TestReplicatedReadReuseResetDeclinePreservesSuccessfulRead",
+          "TestReplicatedReadReuseAbortClosesUnpublishedRows",
+          "TestReplicatedReadReuseQueryPanicStopsContextWatcher"
+        ]
+      },
+      "kind": "native-regression",
+      "regex": "Test(ReplicatedPointRaw|ReplicatedPointReadSession|ReplicatedReadReuse)"
+    },
+    {
+      "arm": "after",
+      "evidence": {
+        "passed": [
+          "TestReplicatedPointRawMatchesForcedSegmentFallback",
+          "TestReplicatedPointRawMatchesForcedSegmentFallback/full_predicate_with_null_missing_nested_and_escaped_scalar",
+          "TestReplicatedPointRawMatchesForcedSegmentFallback/residual_predicate_rejects_row",
+          "TestReplicatedPointRawMatchesForcedSegmentFallback/aggregate_fallback",
+          "TestReplicatedPointRawMatchesForcedSegmentFallback/point_miss",
+          "TestReplicatedPointRawMatchesForcedSegmentFallback/wrong_candidate_key",
+          "TestReplicatedPointRawAlternatesFreshOwnedDocuments",
+          "TestReplicatedPointRawAlternatesFreshOwnedDocuments/11",
+          "TestReplicatedPointRawAlternatesFreshOwnedDocuments/22",
+          "TestReplicatedPointRawAlternatesFreshOwnedDocuments/33",
+          "TestReplicatedPointRawAlternatesFreshOwnedDocuments/44",
+          "TestReplicatedPointRawBudgetAndCancellationMatchFallback",
+          "TestReplicatedPointRawWrapperClearsAcrossHitMissAndError",
+          "TestReplicatedPointRawPanicClearsBorrowedWrapper",
+          "TestReplicatedPointReadSessionCandidatePreservesQuerySemantics",
+          "TestReplicatedPointReadSessionMissAndWrongKeyAreBounded",
+          "TestReplicatedPointReadSessionRejectsStaleIdentityAndPath",
+          "TestReplicatedReadReuseDataCutMutationAndParameterKey",
+          "TestReplicatedReadReusePointAlternatesHitsMissesAndUpdates",
+          "TestReplicatedReadReuseBudgetCancellationRollbackAndReuse",
+          "TestReplicatedReadReuseLeasesAreExclusiveAndStaleHandlesClose",
+          "TestReplicatedReadReuseConcurrentIndependentLeases",
+          "TestReplicatedReadReuseUnsupportedShapesAreNeverRetained",
+          "TestReplicatedReadReuseRejectsForeignAndClosedCuts",
+          "TestReplicatedReadReuseLayoutReplacementDoesNotReuseStaleSlot",
+          "TestReplicatedReadReuseApplyCloseRejectsAndRetiresLeases",
+          "TestReplicatedReadReuseIdleStateDropsRequestReferences",
+          "TestReplicatedReadReuseLayoutTokensOutliveEpochs",
+          "TestReplicatedReadReusePreparationOwnsSourceAndAccountsObjects",
+          "TestReplicatedReadReusePublicationBetweenLookupAndAttach",
+          "TestReplicatedReadReusePublicationBetweenLookupAndAttach/cold",
+          "TestReplicatedReadReusePublicationBetweenLookupAndAttach/hit",
+          "TestReplicatedReadReuseAcquirePanicRetiresReservation",
+          "TestReplicatedReadReuseAcquirePanicRetiresReservation/cold",
+          "TestReplicatedReadReuseAcquirePanicRetiresReservation/hit",
+          "TestReplicatedReadReuseResetDeclinePreservesSuccessfulRead",
+          "TestReplicatedReadReuseAbortClosesUnpublishedRows",
+          "TestReplicatedReadReuseQueryPanicStopsContextWatcher"
+        ],
+        "skipped": [],
+        "started": [
+          "TestReplicatedPointRawMatchesForcedSegmentFallback",
+          "TestReplicatedPointRawMatchesForcedSegmentFallback/full_predicate_with_null_missing_nested_and_escaped_scalar",
+          "TestReplicatedPointRawMatchesForcedSegmentFallback/residual_predicate_rejects_row",
+          "TestReplicatedPointRawMatchesForcedSegmentFallback/aggregate_fallback",
+          "TestReplicatedPointRawMatchesForcedSegmentFallback/point_miss",
+          "TestReplicatedPointRawMatchesForcedSegmentFallback/wrong_candidate_key",
+          "TestReplicatedPointRawAlternatesFreshOwnedDocuments",
+          "TestReplicatedPointRawAlternatesFreshOwnedDocuments/11",
+          "TestReplicatedPointRawAlternatesFreshOwnedDocuments/22",
+          "TestReplicatedPointRawAlternatesFreshOwnedDocuments/33",
+          "TestReplicatedPointRawAlternatesFreshOwnedDocuments/44",
+          "TestReplicatedPointRawBudgetAndCancellationMatchFallback",
+          "TestReplicatedPointRawWrapperClearsAcrossHitMissAndError",
+          "TestReplicatedPointRawPanicClearsBorrowedWrapper",
+          "TestReplicatedPointReadSessionCandidatePreservesQuerySemantics",
+          "TestReplicatedPointReadSessionMissAndWrongKeyAreBounded",
+          "TestReplicatedPointReadSessionRejectsStaleIdentityAndPath",
+          "TestReplicatedReadReuseDataCutMutationAndParameterKey",
+          "TestReplicatedReadReusePointAlternatesHitsMissesAndUpdates",
+          "TestReplicatedReadReuseBudgetCancellationRollbackAndReuse",
+          "TestReplicatedReadReuseLeasesAreExclusiveAndStaleHandlesClose",
+          "TestReplicatedReadReuseConcurrentIndependentLeases",
+          "TestReplicatedReadReuseUnsupportedShapesAreNeverRetained",
+          "TestReplicatedReadReuseRejectsForeignAndClosedCuts",
+          "TestReplicatedReadReuseLayoutReplacementDoesNotReuseStaleSlot",
+          "TestReplicatedReadReuseApplyCloseRejectsAndRetiresLeases",
+          "TestReplicatedReadReuseIdleStateDropsRequestReferences",
+          "TestReplicatedReadReuseLayoutTokensOutliveEpochs",
+          "TestReplicatedReadReusePreparationOwnsSourceAndAccountsObjects",
+          "TestReplicatedReadReusePublicationBetweenLookupAndAttach",
+          "TestReplicatedReadReusePublicationBetweenLookupAndAttach/cold",
+          "TestReplicatedReadReusePublicationBetweenLookupAndAttach/hit",
+          "TestReplicatedReadReuseAcquirePanicRetiresReservation",
+          "TestReplicatedReadReuseAcquirePanicRetiresReservation/cold",
+          "TestReplicatedReadReuseAcquirePanicRetiresReservation/hit",
+          "TestReplicatedReadReuseResetDeclinePreservesSuccessfulRead",
+          "TestReplicatedReadReuseAbortClosesUnpublishedRows",
+          "TestReplicatedReadReuseQueryPanicStopsContextWatcher"
+        ]
+      },
+      "kind": "native-regression",
+      "regex": "Test(ReplicatedPointRaw|ReplicatedPointReadSession|ReplicatedReadReuse)"
+    },
+    {
+      "arm": "before",
+      "benchmark": "^BenchmarkReplicatedPointReadCPU/(point_hit|point_miss)$",
+      "benchtime": "5000x",
+      "count": 3,
+      "cpu": 1,
+      "kind": "cpu-abba",
+      "ordinal": 1,
+      "rows": [
+        {
+          "iterations": 5000,
+          "name": "point_hit",
+          "ns_per_op": 14769.0
+        },
+        {
+          "iterations": 5000,
+          "name": "point_hit",
+          "ns_per_op": 15715.0
+        },
+        {
+          "iterations": 5000,
+          "name": "point_hit",
+          "ns_per_op": 15174.0
+        },
+        {
+          "iterations": 5000,
+          "name": "point_miss",
+          "ns_per_op": 9027.0
+        },
+        {
+          "iterations": 5000,
+          "name": "point_miss",
+          "ns_per_op": 9703.0
+        },
+        {
+          "iterations": 5000,
+          "name": "point_miss",
+          "ns_per_op": 10215.0
+        }
+      ]
+    },
+    {
+      "arm": "after",
+      "benchmark": "^BenchmarkReplicatedPointReadCPU/(point_hit|point_miss)$",
+      "benchtime": "5000x",
+      "count": 3,
+      "cpu": 1,
+      "kind": "cpu-abba",
+      "ordinal": 1,
+      "rows": [
+        {
+          "iterations": 5000,
+          "name": "point_hit",
+          "ns_per_op": 9506.0
+        },
+        {
+          "iterations": 5000,
+          "name": "point_hit",
+          "ns_per_op": 10249.0
+        },
+        {
+          "iterations": 5000,
+          "name": "point_hit",
+          "ns_per_op": 10892.0
+        },
+        {
+          "iterations": 5000,
+          "name": "point_miss",
+          "ns_per_op": 8148.0
+        },
+        {
+          "iterations": 5000,
+          "name": "point_miss",
+          "ns_per_op": 8531.0
+        },
+        {
+          "iterations": 5000,
+          "name": "point_miss",
+          "ns_per_op": 8798.0
+        }
+      ]
+    },
+    {
+      "arm": "after",
+      "benchmark": "^BenchmarkReplicatedPointReadCPU/(point_hit|point_miss)$",
+      "benchtime": "5000x",
+      "count": 3,
+      "cpu": 1,
+      "kind": "cpu-abba",
+      "ordinal": 2,
+      "rows": [
+        {
+          "iterations": 5000,
+          "name": "point_hit",
+          "ns_per_op": 10103.0
+        },
+        {
+          "iterations": 5000,
+          "name": "point_hit",
+          "ns_per_op": 10790.0
+        },
+        {
+          "iterations": 5000,
+          "name": "point_hit",
+          "ns_per_op": 11036.0
+        },
+        {
+          "iterations": 5000,
+          "name": "point_miss",
+          "ns_per_op": 8508.0
+        },
+        {
+          "iterations": 5000,
+          "name": "point_miss",
+          "ns_per_op": 8050.0
+        },
+        {
+          "iterations": 5000,
+          "name": "point_miss",
+          "ns_per_op": 8052.0
+        }
+      ]
+    },
+    {
+      "arm": "before",
+      "benchmark": "^BenchmarkReplicatedPointReadCPU/(point_hit|point_miss)$",
+      "benchtime": "5000x",
+      "count": 3,
+      "cpu": 1,
+      "kind": "cpu-abba",
+      "ordinal": 2,
+      "rows": [
+        {
+          "iterations": 5000,
+          "name": "point_hit",
+          "ns_per_op": 15634.0
+        },
+        {
+          "iterations": 5000,
+          "name": "point_hit",
+          "ns_per_op": 15897.0
+        },
+        {
+          "iterations": 5000,
+          "name": "point_hit",
+          "ns_per_op": 19831.0
+        },
+        {
+          "iterations": 5000,
+          "name": "point_miss",
+          "ns_per_op": 10008.0
+        },
+        {
+          "iterations": 5000,
+          "name": "point_miss",
+          "ns_per_op": 9132.0
+        },
+        {
+          "iterations": 5000,
+          "name": "point_miss",
+          "ns_per_op": 9271.0
+        }
+      ]
+    },
+    {
+      "arm": "after",
+      "benchmark": "^BenchmarkReplicatedPointReadCPU/point_miss$",
+      "benchtime": "5s",
+      "count": 1,
+      "cpu": 1,
+      "kind": "candidate-cpuprofile",
+      "profile": {
+        "bytes": 39606,
+        "path": "profiles/after-point-miss.cpu.pprof",
+        "sha256": "f03a234032373eb4be8ccbcf62e42f372055128961062c0222d5ca323178d6cc"
+      },
+      "rows": [
+        {
+          "iterations": 777800,
+          "name": "point_miss",
+          "ns_per_op": 8650.0
+        }
+      ]
+    }
+  ],
+  "runtime_image": "golang:1.27-bookworm@sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b",
+  "schema": "vibedb.point-b2f-driver-diagnostics/1",
+  "sources": {
+    "after": {
+      "benchmark": {
+        "path": "sql/driver/replicated_point_cpu_bench_test.go",
+        "sha256": "46262105bd205fdc8c4e2e56d93e73b510fa01d5a2684783be811aed2763e0ab"
+      },
+      "expected_revision": "93f85d56e71be35f043c7bf0cf0c4569ffdf806f",
+      "label": "after",
+      "path": "/private/tmp/vibedb-point-after-93f85d56",
+      "revision": "93f85d56e71be35f043c7bf0cf0c4569ffdf806f",
+      "status_lines": [
+        "?? sql/driver/replicated_point_cpu_bench_test.go"
+      ],
+      "tree": "0e65f3a728435b489b57fde77860564dc4841022"
+    },
+    "before": {
+      "benchmark": {
+        "path": "sql/driver/replicated_point_cpu_bench_test.go",
+        "sha256": "46262105bd205fdc8c4e2e56d93e73b510fa01d5a2684783be811aed2763e0ab"
+      },
+      "expected_revision": "b2f716ecb6163539315d7863e806b428a17804cd",
+      "label": "before",
+      "path": "/private/tmp/vibedb-point-before-b2f716ec",
+      "revision": "b2f716ecb6163539315d7863e806b428a17804cd",
+      "status_lines": [
+        "?? sql/driver/replicated_point_cpu_bench_test.go"
+      ],
+      "tree": "6f36da96d28b581cece92b83ea1437be63fc7deb"
+    }
+  },
+  "standalone_benchmark": {
+    "path": "/private/tmp/vibedb-point-b2f-profile/replicated_point_cpu_bench_test.go",
+    "relative_destination": "sql/driver/replicated_point_cpu_bench_test.go",
+    "sha256": "46262105bd205fdc8c4e2e56d93e73b510fa01d5a2684783be811aed2763e0ab"
+  },
+  "started_utc": "2026-09-05T18:35:19.314119+00:00",
+  "status": "complete",
+  "test_tmp_volume": "vibedb-point-round-test-scratch",
+  "timing_scope": "CPU benchmark timer covers Acquire, QueryCandidateKeysInto, complete cursor JSON verification, cursor Close, and lease Finish; setup is outside it."
+}

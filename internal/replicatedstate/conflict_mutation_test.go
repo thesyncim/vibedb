@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"testing"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibejson"
@@ -17,15 +18,18 @@ type conflictReplacementValidator struct {
 	calls int
 }
 
-func (v *conflictReplacementValidator) MaterializeConflict(key, candidate, program, current []byte, found bool) ([]byte, MutationValidation) {
+func (v *conflictReplacementValidator) MaterializeConflict(key, candidate, program, current []byte, found bool) ([]byte, bool, MutationValidation) {
 	v.calls++
 	if !vibejson.Valid(program) {
-		return nil, MutationValidationInvalid
+		return nil, false, MutationValidationInvalid
 	}
 	if !found {
-		return candidate, MutationValidationAccept
+		return candidate, true, MutationValidationAccept
 	}
-	return program, MutationValidationAccept
+	if bytes.Equal(program, []byte("null")) {
+		return current, false, MutationValidationAccept
+	}
+	return program, true, MutationValidationAccept
 }
 
 func TestConflictMutationAppliesAtSnapshotAndRetainsResult(t *testing.T) {
@@ -41,6 +45,7 @@ func TestConflictMutationAppliesAtSnapshotAndRetainsResult(t *testing.T) {
 	}{
 		{`{"n":1}`, `{"n":9}`, `{"n":1}`, ResultApplied, 1},
 		{`{"n":2}`, `{"n":3}`, `{"n":3}`, ResultApplied, 1},
+		{`{"n":4}`, `null`, `{"n":3}`, ResultApplied, 0},
 		{`invalid`, `{"n":4}`, `{"n":3}`, ResultInvalidDocument, 0},
 		{`{"n":4}`, `invalid`, `{"n":3}`, ResultInvalidDocument, 0},
 	} {
@@ -85,6 +90,58 @@ func TestConflictMutationAppliesAtSnapshotAndRetainsResult(t *testing.T) {
 	raw, found, err := fixture.base.Collection.AppendRaw(nil, key)
 	if err != nil || !found || string(raw) != `{"n":7}` {
 		t.Fatalf("participant raw=%s found=%v err=%v", raw, found, err)
+	}
+}
+
+type ownedConflictValidator struct{ *conflictReplacementValidator }
+
+func (v ownedConflictValidator) ValidatePutOwnership(key, value []byte, owned distribution.KeyRange) MutationValidation {
+	return validateTestMutationPoint(key, owned)
+}
+
+func (v ownedConflictValidator) ValidateDeleteOwnership(key, current []byte, found bool, owned distribution.KeyRange) MutationValidation {
+	return validateTestMutationPoint(key, owned)
+}
+
+func TestConflictConditionNoopRetainsParticipantResultAndCurrentOwnershipFence(t *testing.T) {
+	fixture := newRelationBundleFixture(t, true)
+	validator := ownedConflictValidator{&conflictReplacementValidator{MutationValidator: fixture.machine.relations[0].target.Validator}}
+	fixture.machine.relations[0].target.Validator = validator
+	key := []byte{0x90}
+	value, _ := replication.AppendConflictValue(nil, []byte(`{"n":1}`), []byte("null"))
+	batch := replication.RelationMutationBatch{Relation: 1, Mutations: []replication.Mutation{{Kind: replication.MutationPutConflict, Key: key, Value: value}}}
+	seed := fixture.command(t, 1, batch)
+	if _, err := fixture.machine.ApplyNormal(normalMeta(3), seed); err != nil {
+		t.Fatal(err)
+	}
+	if code := bundleCompletionResult(t, fixture.machine, seed); code != ResultApplied {
+		t.Fatalf("seed code=%d", code)
+	}
+	id := transactionCodecID(0xd5)
+	applyTransactionCommand(t, fixture.machine, 4, transactionTargetStageCommand(t, fixture, id, []replication.RelationMutationBatch{batch}))
+	applyTransactionCommand(t, fixture.machine, 5, transactionTargetTransitionCommand(t, fixture, id, distributedtxn.ReplicatedPrepareTarget, 1))
+	apply := transactionTargetTransitionCommand(t, fixture, id, distributedtxn.ReplicatedApplyTarget, 2)
+	result := applyTransactionCommand(t, fixture.machine, 6, apply)
+	if !result.AffectedRowsValid || result.AffectedRows != 0 {
+		t.Fatalf("participant no-op=%+v", result)
+	}
+	calls := validator.calls
+	retry := applyTransactionCommand(t, fixture.machine, 7, apply)
+	if !retry.AffectedRowsValid || retry.AffectedRows != 0 || validator.calls != calls {
+		t.Fatalf("participant retry=%+v calls=%d/%d", retry, validator.calls, calls)
+	}
+	applyTransactionCommand(t, fixture.machine, 8, transactionTargetTransitionCommand(t, fixture, id, distributedtxn.ReplicatedReleaseTarget, 3))
+	fixture.machine.state.Binding.OwnedRange = distribution.KeyRange{End: distribution.KeyspaceEnd{Point: distribution.KeyspacePoint{0x80}}}
+	fixture.machine.binding.OwnedRange = fixture.machine.state.Binding.OwnedRange
+	outside := fixture.command(t, 2, batch)
+	if _, err := fixture.machine.ApplyNormal(normalMeta(9), outside); err != nil {
+		t.Fatal(err)
+	}
+	if code := bundleCompletionResult(t, fixture.machine, outside); code != ResultWrongShard {
+		t.Fatalf("no-op bypassed new ownership: %d", code)
+	}
+	if raw, found, err := fixture.base.Collection.AppendRaw(nil, key); err != nil || !found || string(raw) != `{"n":1}` {
+		t.Fatalf("no-op mutated row: %s %v %v", raw, found, err)
 	}
 }
 

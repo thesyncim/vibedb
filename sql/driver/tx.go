@@ -1113,11 +1113,11 @@ func (t *tx) execMutationCore(
 			return nil, err
 		}
 		conflictUpdate := tree.OnConflictUpdate
-		if conflictUpdate != nil && len(conflictUpdate.Assignments) != 0 {
-			if err := validateUpsertColumnAssignments(
+		if conflictUpdate != nil {
+			if err := validateUpsertConflictAction(
 				tableName, mutationTargetRelation(tableName, tree.Alias),
 				state.incarnation.meta,
-				conflictUpdate.Assignments,
+				conflictUpdate,
 			); err != nil {
 				return nil, err
 			}
@@ -1227,15 +1227,14 @@ func (t *tx) execMutationCore(
 			}
 			finalDocument := document
 			if found && conflictUpdate != nil {
-				if !conflictUpdate.WholeDocument() {
-					finalDocument, err = materializeConflictColumnAssignments(
-						statement, &t.conn.exec, scratch, document,
-						conflictUpdate.Assignments, args, limits.MaxDocumentBytes,
-					)
-					if err != nil {
-						t.conn.pointRaw = scratch
-						return nil, err
-					}
+				var matched bool
+				finalDocument, matched, err = materializeConflictUpdate(statement, &t.conn.exec, scratch, document, args, limits.MaxDocumentBytes)
+				if err != nil {
+					t.conn.pointRaw = scratch
+					return nil, err
+				}
+				if !matched {
+					continue
 				}
 				if err := validateDocument(
 					state.schema, finalDocument, limits.MaxDocumentBytes,

@@ -17,6 +17,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/rf3qualification"
 	"github.com/thesyncim/vibedb/query"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibejson"
@@ -28,6 +29,9 @@ func ensureDevPhysicalTables(root, binary string, cluster *devClusterManifest, s
 	if cluster == nil || !validDevManifest(*cluster, root) || cluster.PhysicalNodes == 0 ||
 		len(inventory.Tables) > int(cluster.PhysicalNodes)*devPhysicalMaxGroups/devClusterRF3 {
 		return errDevCluster
+	}
+	if cluster.ReadAuthority != nil && !rf3qualification.ReadAuthorityEnabled {
+		return fmt.Errorf("%w: enabled read authority requires the explicitly tagged laboratory build %q", errDevCluster, rf3qualification.ReadAuthorityLabBuildTag)
 	}
 	// A retained plan is the only authority for a new root. Reconcile plans
 	// before allocating another table, including a crash before cluster.json
@@ -258,6 +262,10 @@ func prepareDevPhysicalTable(root, binary string, cluster devClusterManifest, ta
 		if err := vibejson.Unmarshal(raw, &prepare); err != nil || prepare.Root != base.GroupRoot || prepare.StoreID != base.Store || prepare.MemberID != base.Member {
 			return nil, raftmember.GroupKey{}, errors.Join(errDevCluster, err)
 		}
+		if !devReadAuthorityEqual(prepare.ReadAuthority, cluster.ReadAuthority) ||
+			prepare.ReadAuthority != nil && !validDevReadAuthority(*prepare.ReadAuthority) {
+			return nil, raftmember.GroupKey{}, fmt.Errorf("%w: retained group read authority differs from cluster policy", errDevCluster)
+		}
 		prepare.Root, prepare.MemberID, prepare.StoreID = member.GroupRoot, member.Member, member.Store
 		prepare.Table, prepare.CreateTable = table.Table, table.CreateTable
 		prepare.Distribution, prepare.Shard = table.Distribution, "all"
@@ -266,8 +274,13 @@ func prepareDevPhysicalTable(root, binary string, cluster devClusterManifest, ta
 		// home identity or key profile into an ordinary user table.
 		prepare.Apply = devPrepareApplyProfile(table.PrimaryKey, replication.Digest{})
 		prepare.Members = make([]devPrepareMember, len(members))
+		prepare.ReadAuthority = cloneDevReadAuthority(cluster.ReadAuthority)
 		for peerIndex, peer := range members {
 			prepare.Members[peerIndex] = devPrepareMember{MemberID: peer.Member, NodeID: peer.Node, PeerAddress: peer.Peer}
+			if cluster.ReadAuthority != nil {
+				prepare.Members[peerIndex].StoreID = peer.Store
+				prepare.Members[peerIndex].NativeAddress = peer.Native
+			}
 		}
 		raw, err = vibejson.Marshal(&prepare)
 		if err != nil {
@@ -471,6 +484,10 @@ func reconcileDevPhysicalNodeGroup(member devClusterMember, appendMissing bool) 
 	if err := json.Unmarshal(nodeRaw, &source); err != nil {
 		return err
 	}
+	readAuthority := bytes.TrimSpace(source["read_authority"])
+	if len(readAuthority) != 0 && !bytes.Equal(readAuthority, []byte("null")) && !rf3qualification.ReadAuthorityEnabled {
+		return fmt.Errorf("%w: enabled read authority requires the explicitly tagged laboratory build %q", errDevCluster, rf3qualification.ReadAuthorityLabBuildTag)
+	}
 	if err := json.Unmarshal(groupRaw, &groupSource); err != nil {
 		return err
 	}
@@ -513,7 +530,12 @@ func reconcileDevPhysicalNodeGroup(member devClusterMember, appendMissing bool) 
 	if err != nil {
 		return err
 	}
-	raw, err := orderedDevManifestObject(source, []string{"node_log", "listeners", "tls", "authorization_policy", "replica_control", "split_control", "gateway", "groups"})
+	order := []string{"node_log", "listeners", "tls", "authorization_policy", "replica_control", "split_control"}
+	if len(source["read_authority"]) != 0 {
+		order = append(order, "read_authority")
+	}
+	order = append(order, "gateway", "groups")
+	raw, err := orderedDevManifestObject(source, order)
 	if err != nil {
 		return err
 	}

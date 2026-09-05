@@ -1,0 +1,79 @@
+{
+  "archives": [
+    {
+      "archive": "point-assessment/archives/green-main-points-3n-retry2-complete.tar.gz",
+      "bytes": 25425106,
+      "included_bytes": 459734847,
+      "included_files": 5629,
+      "omission_policy": "compiled binaries and CRDB database/WAL data omitted; hashes retained in archive-provenance.json and omitted-files.json",
+      "omitted_bytes": 1689027539,
+      "omitted_files": 116,
+      "sha256": "e1ab3b8817a3e6e669e9c228bee76d397d86197fe629753abc97559a58b48fa0",
+      "source_evidence_root": "/private/tmp/vibedb-green-main-assessment-points-3n-retry2",
+      "source_invocation_sha256": "ecda01685e1b8feaa83e8fe87ba7fc4b6ee025363e5b55853beae478dc8bad84",
+      "source_manifest_sha256": "cf5bb2ecd9c672af39188acea945e24c8cda5e4f0e5493dc5b28a16b404faf46",
+      "source_status": "complete"
+    },
+    {
+      "archive": "point-assessment/archives/green-main-points-6n-incomplete.tar.gz",
+      "bytes": 26099732,
+      "included_bytes": 390431643,
+      "included_files": 5436,
+      "omission_policy": "compiled binaries and CRDB database/WAL data omitted; hashes retained in archive-provenance.json and omitted-files.json",
+      "omitted_bytes": 2246670070,
+      "omitted_files": 217,
+      "sha256": "a73f56f38aaa371b047657a9668c2dce76293d0fa415a0107dd07f25aba36282",
+      "source_evidence_root": "/private/tmp/vibedb-green-main-assessment-points-6n",
+      "source_invocation_sha256": "53f9306764c600fa1e8f50f5ff7a500e1d1456daf179fe08f3f7e1aa15632e96",
+      "source_manifest_sha256": "fcc5c06e0ca43ce57e71158f59d4857b0ad4f0b2c3eac74a870ebaa4b74fbbd6",
+      "source_status": "incomplete-or-failed"
+    },
+    {
+      "archive": "point-assessment/archives/green-main-points-3n-first-failed.tar.gz",
+      "bytes": 8249906,
+      "included_bytes": 159653063,
+      "included_files": 2707,
+      "omission_policy": "compiled binaries and CRDB database/WAL data omitted; hashes retained in archive-provenance.json and omitted-files.json",
+      "omitted_bytes": 1071594310,
+      "omitted_files": 23,
+      "sha256": "f25f087eb13d0f2b48c867cffbfd769edd305c206e5363da104790b171f0364f",
+      "source_evidence_root": "/private/tmp/vibedb-green-main-assessment-points-3n",
+      "source_invocation_sha256": "5c9f33fb4b4971e9b098cb45bb7a87ce7623a517d537c5e05c4381fe7d3e4941",
+      "source_manifest_sha256": "2232aaec994ed41ca1956566a9f7b1816ece2abaa805dd2852cd3f8751bfb8be",
+      "source_status": "incomplete-or-failed"
+    },
+    {
+      "archive": "point-assessment/archives/green-main-points-3n-retry1-build-failed.tar.gz",
+      "bytes": 400531,
+      "included_bytes": 167906,
+      "included_files": 11,
+      "omission_policy": "compiled binaries and CRDB database/WAL data omitted; hashes retained in archive-provenance.json and omitted-files.json",
+      "omitted_bytes": 154857122,
+      "omitted_files": 2,
+      "sha256": "c9bbd1cc91c6b06c97a0ce4cdfcadb06ad58f3f1f3f094e6dc2bebe209157c1c",
+      "source_evidence_root": "/private/tmp/vibedb-green-main-assessment-points-3n-retry1",
+      "source_invocation_sha256": null,
+      "source_manifest_sha256": "99ea189800ebbb79afd75fceb380e33b60405d78a27bd1d07793217d4e3a46bf",
+      "source_status": "incomplete-or-failed"
+    }
+  ],
+  "crdb_image": "sha256:204f131510c78393adb02345f289a8dbb32e1491e26cc92b6c7751f3b97be3c5",
+  "exclusions": [
+    "Compiled VibeDB, client, and CockroachDB binaries are omitted; exact hashes remain in source manifests and each archive provenance.",
+    "CRDB database and WAL contents under published/*/data/crdb-* are omitted; retained CRDB server logs under published/server-logs/data/crdb-*/logs remain.",
+    "The repeated before-after.patch working-tree diff is omitted with its exact hash; each archive retains a filtered code/text patch and lists every omitted archive payload section by path and SHA.",
+    "N3 first-attempt, N3 retry1 build failure, and N6 reverse-order M startup failure are retained and excluded from complete paired comparisons."
+  ],
+  "format": "vibedb-green-main-point-assessment-catalog-v1",
+  "limits": {
+    "cpus": 12,
+    "memory_gib": 24
+  },
+  "runtime_image": "sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b",
+  "source_refs": {
+    "G": "a2ac5fd8d052d42046dd4c3ee9f5502dc1e48eed",
+    "M": "5160e0f6c8dc5b252e5c5ff75984bdd6fe49db02",
+    "client": "150912cfbe250dcf16fd4bcfdfea52e13027ed48"
+  },
+  "status": "diagnostic checkpoint; no final performance claim"
+}
