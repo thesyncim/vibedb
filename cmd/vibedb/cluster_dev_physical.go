@@ -25,6 +25,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/rf3qualification"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibejson"
 )
@@ -88,6 +89,9 @@ func writeDevPhysicalPolicy(path string, storage, gateways []rafttransport.NodeI
 }
 
 func initializeDevPhysicalCluster(options devClusterOptions, manifestPath string) (devClusterManifest, error) {
+	if options.readAuthority && !rf3qualification.ReadAuthorityEnabled {
+		return devClusterManifest{}, fmt.Errorf("%w: read authority requires the explicitly tagged laboratory build %q", errDevCluster, rf3qualification.ReadAuthorityLabBuildTag)
+	}
 	if options.replicas != devClusterRF3 ||
 		(options.physicalNodes != devClusterPhysicalNodes3 && options.physicalNodes != devClusterPhysicalNodes6) {
 		return devClusterManifest{}, fmt.Errorf("%w: RF3 physical nodes must be 3 or 6", errDevCluster)

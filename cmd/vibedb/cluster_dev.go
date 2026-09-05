@@ -42,6 +42,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/rf3qualification"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibedb/store/durable"
 	"github.com/thesyncim/vibejson"
@@ -194,6 +195,13 @@ func cloneDevReadAuthority(config *devReadAuthority) *devReadAuthority {
 func validateDevReadAuthorityRaw(raw []byte, expected *devReadAuthority) error {
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &fields); err != nil {
+		// Before the read-authority section was introduced, restart validation
+		// retained opaque child artifacts as-is. Preserve that default-off
+		// resume contract, while enabled clusters still require a structured
+		// artifact below and therefore never accept an opaque replacement.
+		if expected == nil {
+			return nil
+		}
 		return errors.Join(errDevCluster, err)
 	}
 	encoded, present := fields["read_authority"]
@@ -543,6 +551,11 @@ func runClusterDev(args []string) int {
 		usage()
 		return 2
 	}
+	if *readAuthority && !rf3qualification.ReadAuthorityEnabled {
+		fmt.Fprintf(os.Stderr, "cluster dev: --read-authority requires the explicitly tagged laboratory build %q\n",
+			rf3qualification.ReadAuthorityLabBuildTag)
+		return 2
+	}
 	replicasSet, nodesSet := false, false
 	fs.Visit(func(f *flag.Flag) {
 		replicasSet = replicasSet || f.Name == "replicas"
@@ -661,6 +674,9 @@ func resolveDevBinary(explicit, name string) (string, error) {
 }
 
 func ensureDevCluster(options devClusterOptions) (devClusterManifest, error) {
+	if options.readAuthority && !rf3qualification.ReadAuthorityEnabled {
+		return devClusterManifest{}, fmt.Errorf("%w: read authority requires the explicitly tagged laboratory build %q", errDevCluster, rf3qualification.ReadAuthorityLabBuildTag)
+	}
 	if options.replicas != devClusterRF1 && options.replicas != devClusterRF3 {
 		return devClusterManifest{}, errDevCluster
 	}
@@ -717,6 +733,9 @@ func ensureDevCluster(options devClusterOptions) (devClusterManifest, error) {
 }
 
 func initializeDevCluster(options devClusterOptions, manifestPath string) (devClusterManifest, error) {
+	if options.readAuthority && !rf3qualification.ReadAuthorityEnabled {
+		return devClusterManifest{}, fmt.Errorf("%w: read authority requires the explicitly tagged laboratory build %q", errDevCluster, rf3qualification.ReadAuthorityLabBuildTag)
+	}
 	if options.replicas == devClusterRF3 && options.physicalNodes != 0 {
 		return initializeDevPhysicalCluster(options, manifestPath)
 	}

@@ -7,6 +7,9 @@ pause beyond the configured grant and a same-root process restart.  The
 ``--no-fault`` mode preserves the same setup and workload while collecting
 bounded per-group Raft cuts without injecting a pause or restart.  It never
 produces a throughput comparison or a CRDB result.
+
+The qualification requires the explicit ``--laboratory-read-authority`` opt-in
+and builds every candidate executable with the labelled laboratory build tag.
 """
 
 from datetime import datetime, timezone
@@ -29,6 +32,7 @@ RUNTIME = (
     "golang:1.27-bookworm@sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b"
 )
 GOCACHE = Path("/private/tmp/vibedb-horizontal-gocache")
+LAB_BUILD_TAG = "vibedb_rf3_read_authority_lab"
 QUARANTINE_SECONDS = 6.11
 GRANT_SECONDS = 5.0
 
@@ -104,7 +108,8 @@ def build_candidate(fixture, repo, destination, arch):
     binaries = destination / "bin"
     binaries.mkdir(mode=0o700)
     env = dict(os.environ, GOOS="linux", GOARCH=arch, CGO_ENABLED="0",
-               GOEXPERIMENT="simd", GOCACHE=str(GOCACHE))
+               GOEXPERIMENT="simd", GOFLAGS="-tags=" + LAB_BUILD_TAG,
+               GOCACHE=str(GOCACHE))
     packages = (
         ("candidate-vibedb", repo, "./cmd/vibedb"),
         ("candidate-vibedb-shard", repo, "./cmd/vibedb-shard"),
@@ -121,6 +126,9 @@ def build_candidate(fixture, repo, destination, arch):
             if "\tbuild\t" + setting not in value:
                 raise fixture.RunnerError(
                     f"{executable.name} is missing required build setting {setting}")
+        if "\tbuild\t-tags=" + LAB_BUILD_TAG not in value:
+            raise fixture.RunnerError(
+                f"{executable.name} is missing required laboratory build tag {LAB_BUILD_TAG}")
         metadata[executable.name] = value
     return binaries, metadata, env
 
@@ -454,7 +462,11 @@ def main(argv=None):
     parser.add_argument("--ready-timeout", type=int, default=180)
     parser.add_argument("--no-fault", action="store_true",
                         help="run the original workload without SIGSTOP/SIGKILL fault injection")
+    parser.add_argument("--laboratory-read-authority", action="store_true",
+                        help="required explicit opt-in for the lab-tagged read-authority binary")
     selected = parser.parse_args(argv)
+    if not selected.laboratory_read_authority:
+        parser.error("--laboratory-read-authority is required for this qualification")
     repo = selected.repo.resolve()
     fixture = load_fixture()
     destination = fixture.require_new_directory(selected.output)
@@ -472,9 +484,13 @@ def main(argv=None):
         "timed_performance_claim": False,
         "throughput_comparison": False,
         "crdb_comparison": False,
+        "qualification_variant": "laboratory-read-authority",
+        "laboratory_read_authority": True,
+        "build_tag": LAB_BUILD_TAG,
         "runtime_image": RUNTIME,
         "environment": {
-            "GOEXPERIMENT": "simd", "GOCACHE": str(GOCACHE),
+            "GOEXPERIMENT": "simd", "GOFLAGS": "-tags=" + LAB_BUILD_TAG,
+            "GOCACHE": str(GOCACHE), "build_tags": [LAB_BUILD_TAG],
             "docker_resource_limits": {"cpus": "12", "memory": "24g", "memory_swap": "24g"},
         },
         "workload": {

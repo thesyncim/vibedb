@@ -75,8 +75,19 @@ node. The two listener flags are mutually exclusive.
 
 ### Optional read-authority qualification
 
-To exercise the explicit quorum read-authority protocol on the same RF3
-topology, add `--read-authority` on the first start and every restart:
+The standard binaries cannot enable read authority. To exercise the explicit
+quorum protocol, build a separately labelled laboratory variant with the
+required compile-time tag, keeping the launcher, shard, and gateway variants
+together:
+
+```sh
+GOEXPERIMENT=simd go build -tags=vibedb_rf3_read_authority_lab -o ./bin/vibedb ./cmd/vibedb
+GOEXPERIMENT=simd go build -tags=vibedb_rf3_read_authority_lab -o ./bin/vibedb-shard ./cmd/vibedb-shard
+GOEXPERIMENT=simd go build -tags=vibedb_rf3_read_authority_lab -o ./bin/vibedb-gateway ./cmd/vibedb-gateway
+```
+
+Run the laboratory binary with `--read-authority` on the first start and
+every restart:
 
 ```sh
 ./bin/vibedb cluster dev \
@@ -87,7 +98,10 @@ topology, add `--read-authority` on the first start and every restart:
   --pg-listen 127.0.0.1:7432
 ```
 
-This switch is disabled by default and requires Linux `CLOCK_BOOTTIME`. The
+This is a laboratory qualification variant; a normal build rejects the switch
+before creating a cluster, and a standard shard binary rejects an enabled
+manifest before preparing, serving, reloading, or adopting any artifact. The
+switch is disabled by default and requires Linux `CLOCK_BOOTTIME`. The
 deployment assumption is that every participant's elapsed clock rate stays
 within ±10% of real elapsed time, including across VM or container suspension
 and resume. `CLOCK_BOOTTIME` availability and one successful `Now` call at

@@ -17,6 +17,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/rf3qualification"
 	"github.com/thesyncim/vibedb/query"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibejson"
@@ -28,6 +29,9 @@ func ensureDevPhysicalTables(root, binary string, cluster *devClusterManifest, s
 	if cluster == nil || !validDevManifest(*cluster, root) || cluster.PhysicalNodes == 0 ||
 		len(inventory.Tables) > int(cluster.PhysicalNodes)*devPhysicalMaxGroups/devClusterRF3 {
 		return errDevCluster
+	}
+	if cluster.ReadAuthority != nil && !rf3qualification.ReadAuthorityEnabled {
+		return fmt.Errorf("%w: enabled read authority requires the explicitly tagged laboratory build %q", errDevCluster, rf3qualification.ReadAuthorityLabBuildTag)
 	}
 	// A retained plan is the only authority for a new root. Reconcile plans
 	// before allocating another table, including a crash before cluster.json
@@ -479,6 +483,10 @@ func reconcileDevPhysicalNodeGroup(member devClusterMember, appendMissing bool) 
 	var source, groupSource map[string]json.RawMessage
 	if err := json.Unmarshal(nodeRaw, &source); err != nil {
 		return err
+	}
+	readAuthority := bytes.TrimSpace(source["read_authority"])
+	if len(readAuthority) != 0 && !bytes.Equal(readAuthority, []byte("null")) && !rf3qualification.ReadAuthorityEnabled {
+		return fmt.Errorf("%w: enabled read authority requires the explicitly tagged laboratory build %q", errDevCluster, rf3qualification.ReadAuthorityLabBuildTag)
 	}
 	if err := json.Unmarshal(groupRaw, &groupSource); err != nil {
 		return err

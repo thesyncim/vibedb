@@ -1,3 +1,8 @@
+//go:build vibedb_rf3_read_authority_lab
+
+// Protocol enrollment and refresh tests run in the explicit laboratory CI
+// variant. Standard builds use rf3_read_authority_gate_default_test.go to
+// assert that an enabled manifest is refused before runtime setup.
 package main
 
 import (

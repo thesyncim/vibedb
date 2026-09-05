@@ -213,6 +213,36 @@ jobs:
         with:
           path: ${{ steps.go.outputs.cache-path }}
           key: ${{ steps.go.outputs.cache-key }}
+  rf3-read-authority-lab:
+    name: RF3 read-authority standard gate and laboratory protocol
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-go-ci
+        id: go
+        with:
+          scope: rf3-read-authority-lab
+      - name: Standard build denial and resume checks
+        run: |
+          set -euo pipefail
+          go test -count=1 -timeout=5m \
+            -run '^(TestStandardClusterDevRejectsReadAuthorityBeforeCreatingRoot|TestDefaultResumeAcceptsOpaqueArtifactButRejectsEnabledSection|TestStandardPhysicalManifestRejectsEnabledSectionBeforeRewrite|TestDevClusterManifestResumeIsCanonicalAndDoesNotReprovision)$' \
+            ./cmd/vibedb
+          go test -count=1 -timeout=5m \
+            -run '^(TestStandardShardRejectsEnabledReadAuthorityBeforeRuntime|TestStandardOmittedPolicyStillRefusesEnrolledMarker)$' \
+            ./cmd/vibedb-shard
+      - name: Explicit laboratory protocol and reconciliation checks
+        run: |
+          set -euo pipefail
+          go test -tags=vibedb_rf3_read_authority_lab -count=1 -timeout=10m \
+            -run '^TestRF3ReadAuthority|^TestDev(ReadAuthority|PhysicalReadAuthority)' \
+            ./cmd/vibedb ./cmd/vibedb-shard
+      - name: Save Go build cache
+        if: ${{ always() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.go.outputs.cache-path }}
+          key: ${{ steps.go.outputs.cache-key }}
   sql-tests:
     name: unit (${{ matrix.runner }}, ${{ matrix.shard }})
     strategy:

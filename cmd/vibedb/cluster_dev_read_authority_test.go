@@ -1,3 +1,7 @@
+//go:build vibedb_rf3_read_authority_lab
+
+// Enabled cluster reconciliation is exercised only by the explicit laboratory
+// CI variant; the standard variant tests denial before root creation.
 package main
 
 import (
