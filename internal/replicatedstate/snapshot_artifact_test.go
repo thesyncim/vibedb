@@ -65,7 +65,7 @@ func TestSnapshotArtifactDeterministicRoundTripAndCheckpoints(t *testing.T) {
 	// mutations or JSON-relation affected-row semantics changes this vector.
 	// The source data-chain hashes canonical persisted afterimages, including
 	// this fixture's originally reverse-ordered sequence/payload command fields.
-	const golden = "db418415dc0db8b9e57a8ebe63e4b6993209541f917d41db78f83dde53f6e266"
+	const golden = "f2071cee610913a9f52e3ddc65e5f4d38628f706f76760783a91c9c8b4718346"
 	if digest := fmt.Sprintf("%x", sha256.Sum256(first)); digest != golden {
 		t.Fatalf("artifact golden digest = %s, want %s", digest, golden)
 	}

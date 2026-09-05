@@ -802,7 +802,16 @@ func (p *Prepared) queryInto(
 		clear(args)
 		return p.fail(err)
 	}
+	finished := false
+	defer func() {
+		if !finished {
+			// A failed execution must not strand its cancellation watcher with
+			// the session/context graph after a caller aborts the read lease.
+			_ = scope.finish(nil)
+		}
+	}()
 	rowset, err := p.statement.queryRowsCandidates(ctx, args, primaryPath, keys)
+	finished = true
 	err = scope.finish(err)
 	if err != nil {
 		return p.fail(err)

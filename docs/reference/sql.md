@@ -130,7 +130,9 @@ fields with the table name or INSERT target alias and incoming fields with
 `EXCLUDED`; a bare field is ambiguous. Parameters, arithmetic, concatenation,
 casts, and CASE are valid in assignment expressions.
 
-Explicit targets, `ON CONSTRAINT`, action WHERE, nested assignments or `EXCLUDED`
+An explicit single-column primary-key target, such as `ON CONFLICT (id)`, is
+supported and validated against the table schema at prepare and execution.
+Composite targets, secondary unique-index targets, `ON CONSTRAINT`, action WHERE, nested assignments or `EXCLUDED`
 paths, and mixed document/column assignments are unsupported. A DO UPDATE batch containing the same canonical key twice fails atomically.
 
 ```sql
@@ -140,6 +142,8 @@ INSERT INTO archive SELECT "$doc" FROM accounts WHERE active = FALSE ON CONFLICT
 INSERT…SELECT requires one whole-document output and no target list. VALUES
 document rows accept parameter/quoted/bare JSON and are atomic. INSERT…SELECT
 with ON CONFLICT DO UPDATE is execution-refused; use VALUES or DO NOTHING.
+Declared-column VALUES rows accept literal NULL as well as null parameters;
+the primary key and NOT NULL constraints still apply atomically.
 
 ## UPDATE and DELETE
 
@@ -160,12 +164,20 @@ ORDER BY requires LIMIT; UPDATE FROM and mutation OFFSET are unsupported.
 The durable RF3 gateway is narrower than embedded execution. It accepts whole-
 document or declared top-level UPDATE only with exact-primary-key equality;
 top-level assignments may use supported scalar right-hand sides and are
-simultaneous. RETURNING, ORDER BY/LIMIT, nested targets, primary-key moves, and
-ON CONFLICT are refused. The coordinator linearizably reads the old row,
+simultaneous. RETURNING, ORDER BY/LIMIT, nested targets, and primary-key moves
+are refused. The coordinator linearizably reads the old row,
 evaluates each right-hand side once, and retains the canonical postimage with an
 exact old-length/SHA-256 CAS. Global indexes derive from that postimage. An
 ordinary exact retry may first replan; after admission, transaction execution
 and recovery use the retained program instead of reevaluating expressions.
+
+For RF3 INSERT without global indexes, primary-key DO NOTHING and whole-document
+EXCLUDED replacement are atomic. Declared column DO UPDATE supports bound scalar
+constants and EXCLUDED columns. A bounded binary conflict program is evaluated
+against the replica's current row during apply; no coordinator preimage is used.
+Both branches validate the candidate and referenced columns, and only the update
+branch evaluates assignments. Computed conflict assignments and indexed conflict
+maintenance remain unsupported.
 
 RETURNING accepts bounded path/scalar projections but no aggregates,
 parameters, or SELECT tail. Execute a returning mutation through a query API;
@@ -197,10 +209,16 @@ explicit GROUP BY. GROUP BY accepts stored paths, not expressions or ordinals.
 HAVING requires grouping/aggregation; its aggregates must also be projected and
 its plain paths must be group keys.
 
-ORDER BY accepts a path, projection alias, or positive one-based projection
-ordinal. Aliases win name resolution. A computed sort expression must be
-projected. Top-level NULLS FIRST/LAST and COLLATE are unsupported. Ascending
-uses nulls first; descending uses nulls last.
+ORDER BY accepts a path, supported scalar expression, aggregate, projection
+alias, or positive one-based projection ordinal. Aliases win name resolution
+when they are the entire sort key. Computed keys can remain hidden from the
+output, including in grouped and window queries; ordinary paths in a grouped
+sort expression must be group keys. A numeric constant starting an arithmetic
+sort expression must be parenthesized to distinguish it from an ordinal.
+NULLS FIRST/LAST is supported for paths, expressions, output aliases, ordinals,
+and set-result ordering, including distributed result merging. Without an
+explicit NULLS clause, ascending uses nulls first and descending uses nulls last.
+COLLATE is unsupported.
 
 LIMIT and OFFSET may appear in either order, at most once each. FETCH is
 unsupported.
@@ -228,6 +246,7 @@ numeric keys, and array indexing through these operators are unsupported.
 - Arithmetic `+ - * / %`, concatenation `||`, and JSON access.
 - CAST using `CAST(value AS type)` or `value::type`.
 - Simple and searched CASE with at least one WHEN and optional ELSE.
+- COALESCE, GREATEST, LEAST, and NULLIF.
 - COUNT, SUM, AVG, MIN, and MAX.
 - Window functions listed below.
 
@@ -235,8 +254,16 @@ CAST targets are TEXT, BOOL/BOOLEAN, NUMERIC/DECIMAL, and JSON. Type modifiers,
 arrays, qualified/multiword types, and collations are unsupported. Typed
 literal prefixes are limited to BOOL/BOOLEAN and TEXT.
 
+COALESCE returns the first non-null argument and does not evaluate later
+arguments. GREATEST/LEAST ignore null arguments and compare exact numbers,
+text, or booleans; NULLIF returns null on equality. Arguments must share a
+supported type; use explicit casts for other conversions. The existing
+BOOL/TEXT typed-string common-type rules also apply. JSON comparison and
+PostgreSQL timestamp/array domains are not added by these expressions.
+Variadic conditional expressions accept 1–1,024 arguments; NULLIF requires two.
+
 There is no general scalar-function catalog. Arithmetic over a window result
-is not supported. CASE is lazy and bounded to 1,024 WHEN arms.
+is not supported. CASE is lazy and bounded to 1,024 WHEN/Boolean-test arms.
 
 Aggregates behave as follows:
 
@@ -257,7 +284,8 @@ WHERE active = TRUE AND tier IN ('pro', 'team') AND score BETWEEN 10 AND 20
 ```
 
 Implemented predicates are comparisons, IS `[NOT]` NULL, IS `[NOT]` MISSING,
-IN/NOT IN lists or subqueries, BETWEEN, `@>`, LIKE/ILIKE, EXISTS, AND/OR/NOT,
+IN/NOT IN lists or subqueries, BETWEEN, `@>`, LIKE/ILIKE, EXISTS, IS [NOT]
+TRUE/FALSE, AND/OR/NOT,
 and bounded scalar subqueries.
 
 `IS NULL` is true for explicit JSON null and an absent path. `IS MISSING` is
@@ -266,7 +294,9 @@ Authored `value = NULL` and authored NULL members of IN are rejected; a bound
 parameter may evaluate to null and follows three-valued logic.
 
 LIKE has no ESCAPE clause. SIMILAR TO, regular-expression operators,
-`IS TRUE/FALSE`, and bare boolean-path predicates are unsupported.
+and bare boolean-path predicates are unsupported. IS [NOT] TRUE/FALSE returns
+true or false even for null/missing input and requires Boolean non-null values;
+these tests use the computed-predicate execution surface and its limits below.
 Computed scalar WHERE cannot share a grouped/aggregate statement. Mixed scalar/path
 predicates combine only under top-level AND, not OR/NOT; HAVING rejects IS MISSING/containment.
 

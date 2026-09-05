@@ -1,0 +1,51 @@
+{
+  "schema": "vibedb.distributed_read_preparation_metadata.v1",
+  "scope": "Local sql/driver microbenchmark only; not CRDB, RF3, end-to-end SQL latency, or horizontal scaling.",
+  "timing_binary_revision": "2402049ef159bd12421b5aee68d5d8692f945504",
+  "final_review_revision": "0da6e75c26bf34f6ec59ff7f1738c3c2d2f092ea",
+  "final_review_note": "The final review revision contains the no-copy and test copylock fixes after this ABBA timing binary was built; timing logs are attributed to timing_binary_revision. Its 30-line benchmark confirmation is retained separately.",
+  "baseline_manifest": "baseline.json",
+  "candidate_manifest": "candidate.json",
+  "orders": [
+    "before-1",
+    "after-1",
+    "after-2",
+    "before-2"
+  ],
+  "workloads": [
+    "point_hit",
+    "point_miss",
+    "range_32",
+    "range_64",
+    "range_256"
+  ],
+  "samples_per_cell": 3,
+  "benchmark_iterations": 1000,
+  "gomaxprocs": 4,
+  "platform": "linux/arm64 Docker",
+  "runtime_image": "golang:1.27-bookworm@sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b",
+  "quiet_window": false,
+  "contention_note": "Concurrent build/test work and unrelated local containers overlapped the campaign; latency is contended diagnostic evidence. Allocation counts and within-process characterization are retained.",
+  "validation_logs": {
+    "tests": "final-linux-tests.log",
+    "race": "final-linux-race.log",
+    "final_revision_linux": "final-revision-linux.log"
+  },
+  "raw_logs": [
+    "before-1.log",
+    "after-1.log",
+    "after-2.log",
+    "before-2.log",
+    "final-revision-bench.log"
+  ],
+  "final_manifest": "final.json",
+  "summary": [
+    "summary.json",
+    "summary.tsv"
+  ],
+  "hashes": [
+    "sha256.json",
+    "SHA256SUMS"
+  ],
+  "binaries_in_archive": false
+}

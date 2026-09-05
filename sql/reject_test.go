@@ -85,12 +85,10 @@ func TestRejectsSyntaxErrors(t *testing.T) {
 
 func TestRejectsNonPredicateExpressions(t *testing.T) {
 	runRejections(t, []rejection{
-		{"a bare path is not a condition", `SELECT a FROM t WHERE flag`, 26, "flag = TRUE"},
 		{"NULL is not an operand", `SELECT a FROM t WHERE b = NULL`, 26, "IS NULL"},
 		{"NULL is not a membership alternative", `SELECT a FROM t WHERE b IN (1, NULL)`, 31, "IS NULL"},
 		{"an empty membership", `SELECT a FROM t WHERE b IN ()`, 28, "no alternatives"},
-		{"IS wants NULL or MISSING", `SELECT a FROM t WHERE b IS 1`, 27, "NULL or MISSING"},
-		{"IS TRUE", `SELECT a FROM t WHERE b IS TRUE`, 27, "flag = TRUE"},
+		{"IS wants a supported test", `SELECT a FROM t WHERE b IS 1`, 27, "NULL, MISSING, TRUE, or FALSE"},
 		{"NOT wants a leaf operator", `SELECT a FROM t WHERE b NOT 1`, 28, "IN, BETWEEN, or LIKE"},
 		{"BETWEEN wants AND", `SELECT a FROM t WHERE b BETWEEN 1, 2`, 33, "AND between the bounds"},
 	})
@@ -113,10 +111,8 @@ func TestRejectsConstructsTheEngineCannotExecute(t *testing.T) {
 		{"DELETE", `DELETE FROM t`, 0, "parsed by ParseStatement"},
 		{"CREATE TABLE", `CREATE TABLE t (a STRING)`, 0, "parsed by ParseStatement"},
 		{"FETCH FIRST", `SELECT a FROM t FETCH FIRST 1 ROWS ONLY`, 16, "write LIMIT"},
-		{"NULLS FIRST", `SELECT a FROM t ORDER BY a NULLS FIRST`, 27, "NULLS FIRST/LAST"},
 		{"COLLATE", `SELECT a FROM t ORDER BY a COLLATE "C"`, 27, "COLLATE"},
 		{"GROUP BY an output position", `SELECT a FROM t GROUP BY 1`, 25, "output position"},
-		{"ORDER BY an aggregate", `SELECT team, SUM(a) FROM t GROUP BY team ORDER BY SUM(a)`, 53, "not by their reduction"},
 		{"GROUP BY an aggregate", `SELECT SUM(a) FROM t GROUP BY SUM(a)`, 33, "computed per group"},
 	})
 }

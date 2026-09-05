@@ -74,6 +74,7 @@ func (result *ReplicatedTableScatterReadResult) Release() {
 type replicatedScatterGroup struct {
 	route          ReplicatedRoute
 	routeID        replication.Digest
+	authority      replication.RouteAuthority
 	source         autosplit.SourceIdentity
 	points         []ReplicatedBatchPointRead
 	pressurePoints []distribution.KeyspacePoint
@@ -146,31 +147,84 @@ func (reader *ReplicatedDataReader) readScatterBatchSnapshot(
 		return ReplicatedTableScatterReadResult{}, generation, ErrNoCatalog
 	}
 	groups := make([]replicatedScatterGroup, 0, min(len(request.Points), 64))
-	groupByRoute := make(map[replication.Digest]int, min(len(request.Points), 64))
 	requestBytes := uint64(4)
+	// One shared scratch pair serves every point: only a new group's route
+	// retains storage, via a private replica backing. Per-table prep and the
+	// last route are cached across points; the SHA256 digest is computed once
+	// per group instead of once per point, and grouping scans the cached
+	// authorities instead of a map. The digest is a pure function of the
+	// authority, so the scan rejects exactly the same mismatches.
+	routeError := func(table, key []byte) error {
+		routeErr := replicatedTableRouteError(snapshot, table, key)
+		if errors.Is(routeErr, errReplicatedTableCatalogMiss) &&
+			!replicatedTableBatchCatalogMissEligible(snapshot, request.Points, false) {
+			routeErr = ErrReplicatedTableRoute
+		}
+		return routeErr
+	}
+	var routeReplicas [ServingReplicaCount]ReplicatedEndpoint
+	var routeScalar [replication.MaxMutationKeyBytes + 16]byte
+	var prep replicatedTableResolvePrep
+	havePrep := false
+	var reuseRoute ReplicatedRoute
+	haveReuse := false
 	for ordinal := range request.Points {
 		point := request.Points[ordinal]
-		var replicas [ServingReplicaCount]ReplicatedEndpoint
-		var scalarScratch [replication.MaxMutationKeyBytes + 16]byte
-		resolved, ok := snapshot.ResolveReplicatedTableKey(
-			point.Table, point.Key, scalarScratch[:0], replicas[:0],
+		if !havePrep || !bytes.Equal(prep.table, point.Table) {
+			fresh, ok := snapshot.replicatedTableResolvePrepFor(point.Table)
+			if !ok {
+				return ReplicatedTableScatterReadResult{}, generation,
+					routeError(point.Table, point.Key)
+			}
+			prep, havePrep, haveReuse = fresh, true, false
+		}
+		var reuse ReplicatedRoute
+		if haveReuse {
+			reuse = reuseRoute
+		}
+		resolved, ok := snapshot.resolveReplicatedTableKeyPrepared(
+			&prep, point.Key, routeScalar[:0], routeReplicas[:0],
+			false, reuse, haveReuse,
 		)
 		if !ok {
-			routeErr := replicatedTableRouteError(snapshot, point.Table, point.Key)
-			if errors.Is(routeErr, errReplicatedTableCatalogMiss) &&
-				!replicatedTableBatchCatalogMissEligible(snapshot, request.Points, false) {
-				routeErr = ErrReplicatedTableRoute
-			}
 			return ReplicatedTableScatterReadResult{}, generation,
-				routeErr
+				routeError(point.Table, point.Key)
 		}
-		groupIndex, exists := groupByRoute[resolved.RouteID]
-		if !exists {
+		authority := replicatedRouteAuthority(resolved.Route)
+		groupIndex := -1
+		for index := range groups {
+			if groups[index].authority == authority {
+				groupIndex = index
+				break
+			}
+		}
+		if groupIndex < 0 {
+			replicas := resolved.Route.Replicas
+			if len(replicas) != ServingReplicaCount {
+				// Unreachable: a reused route always matches an existing
+				// group's authority, so a miss implies a full resolve with
+				// intact backing. Re-resolve rather than retain a broken
+				// route.
+				full, ok := snapshot.resolveReplicatedTableKeyPrepared(
+					&prep, point.Key, routeScalar[:0], routeReplicas[:0],
+					false, ReplicatedRoute{}, false,
+				)
+				if !ok {
+					return ReplicatedTableScatterReadResult{}, generation,
+						routeError(point.Table, point.Key)
+				}
+				resolved = full
+				replicas = resolved.Route.Replicas
+			}
+			retained := make([]ReplicatedEndpoint, len(replicas))
+			copy(retained, replicas)
+			route := resolved.Route
+			route.Replicas = retained
 			groupIndex = len(groups)
-			groupByRoute[resolved.RouteID] = groupIndex
 			groups = append(groups, replicatedScatterGroup{
-				route: resolved.Route, routeID: resolved.RouteID,
-				source: replicatedDataPressureSource(snapshot, resolved.Route),
+				route: route, routeID: replicatedRouteAuthorityDigest(route),
+				authority: authority,
+				source: replicatedDataPressureSource(snapshot, route),
 			})
 		}
 		group := &groups[groupIndex]
@@ -182,6 +236,11 @@ func (reader *ReplicatedDataReader) readScatterBatchSnapshot(
 		}
 		group.ordinals = append(group.ordinals, uint32(ordinal))
 		requestBytes += 5 + uint64(len(point.Key))
+		// Cache the accepted route for the next point's shard lookup skip.
+		// Replicas is nilled: it may alias recycled scratch, and reuse only
+		// ever reads value fields (shard, generations, authority).
+		reuseRoute, haveReuse = resolved.Route, true
+		reuseRoute.Replicas = nil
 	}
 	slices.SortFunc(groups, func(left, right replicatedScatterGroup) int {
 		return bytes.Compare(left.routeID[:], right.routeID[:])

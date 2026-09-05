@@ -41,8 +41,16 @@ func FuzzOpenCommand(f *testing.F) {
 	conditionalWrites.Batches[0].Mutations = []Mutation{
 		{Kind: MutationPutAbsent, Key: []byte("insert"), Value: []byte("new")},
 		{Kind: MutationPutPresent, Key: []byte("update"), Value: []byte("replacement")},
+		{Kind: MutationPutIfAbsent, Key: []byte("ignore"), Value: []byte("candidate")},
 	}
 	f.Add(encodeCommand(f, conditionalWrites))
+	conflict := testCommand()
+	conflictValue, err := AppendConflictValue(nil, []byte(`{"n":1}`), []byte{1, 0})
+	if err != nil {
+		f.Fatal(err)
+	}
+	conflict.Batches[0].Mutations = []Mutation{{Kind: MutationPutConflict, Key: []byte("upsert"), Value: conflictValue}}
+	f.Add(encodeCommand(f, conflict))
 	multi := testCommand()
 	multi.Batches = []RelationMutationBatch{
 		{Relation: 1, Mutations: []Mutation{{Kind: MutationDelete, Key: []byte("a")}}},
@@ -257,7 +265,11 @@ func assertFuzzCommandView(t *testing.T, data []byte, view CommandView) {
 				t.Fatal("accepted invalid or unclamped mutation")
 			}
 			switch mutation.Kind {
-			case MutationPut, MutationPutAbsentOrEqual, MutationPutAbsent, MutationPutPresent:
+			case MutationPutConflict:
+				if _, _, ok := OpenConflictValue(mutation.Value); !ok || len(mutation.Compare) != 0 {
+					t.Fatal("accepted invalid conflict payload")
+				}
+			case MutationPut, MutationPutAbsentOrEqual, MutationPutAbsent, MutationPutPresent, MutationPutIfAbsent:
 				if len(mutation.Value) == 0 || len(mutation.Value) > MaxMutationValueBytes {
 					t.Fatal("accepted invalid put")
 				}

@@ -1356,8 +1356,11 @@ func transactionMutationValid(mutation replication.Mutation) bool {
 	zeroExpected := mutation.ExpectedValueLength == 0 &&
 		mutation.ExpectedValueDigest == (replication.Digest{})
 	switch mutation.Kind {
+	case replication.MutationPutConflict:
+		_, _, ok := replication.OpenConflictValue(mutation.Value)
+		return ok && zeroExpected
 	case replication.MutationPut, replication.MutationPutAbsentOrEqual,
-		replication.MutationPutAbsent, replication.MutationPutPresent:
+		replication.MutationPutAbsent, replication.MutationPutPresent, replication.MutationPutIfAbsent:
 		return len(mutation.Value) > 0 && len(mutation.Value) <= replication.MaxMutationValueBytes &&
 			zeroExpected
 	case replication.MutationDelete:

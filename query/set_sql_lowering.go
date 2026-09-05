@@ -1560,10 +1560,7 @@ func (r *statementSetSQL) bindTail(args []any) error {
 				Matches: 0, Pos: term.Pos,
 			}
 		}
-		direction := Asc
-		if term.Desc {
-			direction = Desc
-		}
+		direction := sqlOrderDirection(term.Desc, term.Nulls)
 		r.tailQuery.orderBy = append(r.tailQuery.orderBy, orderSpec{
 			path: r.ordinalSpec[ordinal], dir: direction,
 		})

@@ -1109,6 +1109,9 @@ func (t *tx) execMutationCore(
 	switch statement.Kind() {
 	case query.DMLInsert:
 		tree := statement.Tree().Insert
+		if err := validateInsertConflictTarget(statement.SQL(), tree, state.incarnation.meta); err != nil {
+			return nil, err
+		}
 		conflictUpdate := tree.OnConflictUpdate
 		if conflictUpdate != nil && len(conflictUpdate.Assignments) != 0 {
 			if err := validateUpsertColumnAssignments(

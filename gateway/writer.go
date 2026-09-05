@@ -199,13 +199,6 @@ func (s *Snapshot) prepareWrite(plan *PreparedPlan, source string) error {
 		if ins == nil {
 			return &PlanError{Reason: "malformed insert statement", cause: ErrDistributedWriteUnsupported}
 		}
-		if ins.OnConflictUpdate != nil {
-			return &PlanError{
-				Table:  ins.Table,
-				Reason: "ON CONFLICT DO UPDATE requires branch-aware distributed capture and is not supported",
-				cause:  ErrDistributedWriteUnsupported,
-			}
-		}
 		if ins.Source != nil {
 			plan.alwaysReason = "INSERT with a query source requires a distributed source plan"
 			break
@@ -247,6 +240,37 @@ func (s *Snapshot) prepareWrite(plan *PreparedPlan, source string) error {
 		return &PlanError{
 			Table: plan.table, Reason: "no placement in pinned catalog generation",
 			cause: ErrTableNotPlaced,
+		}
+	}
+	if stmt.Kind == sqlast.KindInsert && stmt.Insert.OnConflictUpdate != nil {
+		if _, replicated := s.replicatedTableAtBytes(byteview.Bytes(plan.table)); replicated {
+			action := stmt.Insert.OnConflictUpdate
+			if !replicatedConflictActionSupported(action) {
+				return &PlanError{Table: plan.table,
+					Reason: "RF3 computed conflict assignments require a native expression program",
+					cause:  ErrDistributedWriteUnsupported}
+			}
+			if !action.WholeDocument() {
+				info, ok := s.declaredTableInfo(plan.table)
+				if !ok {
+					return &PlanError{Table: plan.table, Reason: "RF3 column conflict assignments require an authenticated declaration", cause: ErrDistributedWriteUnsupported}
+				}
+				if err := sqldriver.ValidateReplicatedConflictAssignments(info, action); err != nil {
+					return err
+				}
+			}
+		}
+		if err := validateConflictShardKeyAssignments(stmt.Insert.OnConflictUpdate, placement.Columns); err != nil {
+			return err
+		}
+	}
+	if stmt.Kind == sqlast.KindInsert && stmt.Insert.ConflictTarget != nil {
+		if entry, replicated := s.replicatedTableAtBytes(byteview.Bytes(plan.table)); replicated {
+			profile, ok := s.replicatedTableProfileAt(entry)
+			if !ok || !bytes.Equal(stmt.Insert.ConflictTarget.AppendPointer(nil), []byte(profile.PrimaryKey)) {
+				return sqlast.NewFeatureNotSupportedError(source, stmt.Insert.ConflictTarget.Pos,
+					"ON CONFLICT target must be the declared primary key")
+			}
 		}
 	}
 	plan.distribution = placement.Distribution
@@ -312,6 +336,46 @@ func (s *Snapshot) prepareWrite(plan *PreparedPlan, source string) error {
 			Table:  plan.table,
 			Reason: "ON CONFLICT DO NOTHING with global indexes requires branch-aware index maintenance",
 			cause:  ErrDistributedWriteUnsupported,
+		}
+	}
+	if stmt.Kind == sqlast.KindInsert && stmt.Insert.OnConflictUpdate != nil && len(plan.writeGlobalIndexes) != 0 {
+		return &PlanError{Table: plan.table,
+			Reason: "ON CONFLICT DO UPDATE with global indexes requires branch-aware index maintenance",
+			cause:  ErrDistributedWriteUnsupported}
+	}
+	return nil
+}
+
+func replicatedConflictActionSupported(action *sqlast.InsertConflictUpdate) bool {
+	return action == nil || action.WholeDocument() || sqldriver.DirectReplicatedConflictAssignments(action)
+}
+
+// The shard executes the complete conflict action atomically. Its current row
+// and EXCLUDED row both belong to the selected owner, so copying either key is
+// safe. An arbitrary expression assigning an ancestor of a shard-key pointer
+// needs a postimage placement proof before it can be dispatched.
+func validateConflictShardKeyAssignments(action *sqlast.InsertConflictUpdate, keys []string) error {
+	if action.WholeDocument() {
+		return nil // EXCLUDED is exactly the already-routed candidate document.
+	}
+	for _, pointer := range keys {
+		root := strings.TrimPrefix(pointer, "/")
+		if end := strings.IndexByte(root, '/'); end >= 0 {
+			root = root[:end]
+		}
+		root = strings.ReplaceAll(strings.ReplaceAll(root, "~1", "/"), "~0", "~")
+		for _, assignment := range action.Assignments {
+			if assignment.Column != root {
+				continue
+			}
+			if assignment.Value.Kind == sqlast.OperandExcluded && assignment.Value.Text == root {
+				continue
+			}
+			if expr := assignment.Expr; expr != nil && expr.Kind == sqlast.ScalarPath && expr.Path != nil &&
+				(expr.Path.Source == 0 || expr.Path.Source == 1) && len(expr.Path.Segments) == 1 && expr.Path.Segments[0].Key == root {
+				continue
+			}
+			return ErrWriteShardKeyMove
 		}
 	}
 	return nil

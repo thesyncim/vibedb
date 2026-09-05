@@ -393,6 +393,7 @@ func TestConditionalRelationMutationsHaveOneCanonicalFraming(t *testing.T) {
 			},
 			{Kind: MutationPutAbsent, Key: []byte("insert-key"), Value: []byte(`{"v":1}`)},
 			{Kind: MutationPutPresent, Key: []byte("update-key"), Value: []byte(`{"v":2}`)},
+			{Kind: MutationPutIfAbsent, Key: []byte("ignore-key"), Value: []byte(`{"v":3}`)},
 			{
 				Kind: MutationPutDigestEqual, Key: []byte("catalog-head"),
 				Value:               []byte(`{"generation":2}`),
@@ -435,7 +436,7 @@ func TestConditionalRelationMutationsHaveOneCanonicalFraming(t *testing.T) {
 					mutation.ExpectedValueDigest != (Digest{}) {
 					t.Fatalf("put-absent compare fields = %+v", mutation)
 				}
-			case MutationPutAbsent, MutationPutPresent:
+			case MutationPutAbsent, MutationPutPresent, MutationPutIfAbsent:
 				if len(mutation.Value) == 0 || len(mutation.Compare) != 0 ||
 					mutation.ExpectedValueLength != 0 || mutation.ExpectedValueDigest != (Digest{}) {
 					t.Fatalf("strict conditional put fields = %+v", mutation)

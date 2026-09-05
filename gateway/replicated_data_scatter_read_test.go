@@ -390,3 +390,26 @@ func BenchmarkReplicatedScatterReadEightGroups(b *testing.B) {
 		result.Release()
 	}
 }
+
+func BenchmarkReplicatedScatterReadSixteenPointsFourGroups(b *testing.B) {
+	fixture := newScatterCatalogFixture(b, 4, 5)
+	fixture.request.MaxResultBytes = 64 << 10
+	rounds := fixture.request.Points
+	roundRoutes := fixture.routes
+	fixture.request.Points = make([]ReplicatedTableBatchPoint, 0, 16)
+	fixture.routes = make([]ResolvedReplicatedTableKey, 0, 16)
+	for range 4 {
+		fixture.request.Points = append(fixture.request.Points, rounds...)
+		fixture.routes = append(fixture.routes, roundRoutes...)
+	}
+	client := &scatterReadClient{}
+	reader := newScatterReader(b, fixture, client, nil, 4)
+	b.ReportAllocs()
+	for b.Loop() {
+		result, err := reader.ReadScatterBatch(context.Background(), fixture.request)
+		if err != nil || result.Count() != 16 {
+			b.Fatalf("count=%d err=%v", result.Count(), err)
+		}
+		result.Release()
+	}
+}

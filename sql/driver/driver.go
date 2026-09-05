@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"strings"
 	"sync"
 	"time"
 
@@ -289,6 +290,8 @@ type conn struct {
 	// connector lock and requires refs==0, so Connect either precedes bind and
 	// makes it return Busy, or observes the durable replicated binding here.
 	directWritesFenced bool
+	// retainReadPreparation is enabled only during private cache preparation.
+	retainReadPreparation bool
 	// routing is the per-connection Router used by the cluster facade's write
 	// preflight. It is created on first placed write and stays nil for the
 	// default single-store path.
@@ -526,23 +529,25 @@ func (c *conn) prepareContextMode(
 		return nil, err
 	}
 	var tree *sqlast.Statement
+	var parser *sqlast.Parser
+	var ownedText string
 	var err error
 	cancel := c.exec.Options.Cancel
-	if ctx.Done() == nil && cancel == nil {
-		tree, err = sqlast.ParseStatement(src)
-	} else {
-		var parser sqlast.Parser
-		parser.SetCancellationCheck(func() error {
-			if contextErr := contextCheckpoint(ctx); contextErr != nil {
-				return contextErr
-			}
-			if cancel != nil && cancel.Canceled() {
-				return query.ErrCanceled
-			}
-			return nil
-		})
+	if c.retainReadPreparation {
+		// Parser tokens and query metadata borrow src. Own it before parsing.
+		src = strings.Clone(src)
+		ownedText = src
+		parser = new(sqlast.Parser)
+		setReadPreparationCancellation(parser, ctx, cancel)
 		tree = new(sqlast.Statement)
 		err = parser.ParseStatement(tree, src)
+	} else if ctx.Done() == nil && cancel == nil {
+		tree, err = sqlast.ParseStatement(src)
+	} else {
+		var transient sqlast.Parser
+		setReadPreparationCancellation(&transient, ctx, cancel)
+		tree = new(sqlast.Statement)
+		err = transient.ParseStatement(tree, src)
 	}
 	if err != nil {
 		var parseErr *sqlast.ParseError
@@ -570,6 +575,8 @@ func (c *conn) prepareContextMode(
 	}
 	s := &stmt{
 		conn:       c,
+		text:       ownedText,
+		parser:     parser,
 		tree:       tree,
 		params:     tree.Params(),
 		paramKinds: statementParamKinds(tree),
@@ -608,7 +615,7 @@ func (c *conn) prepareContextMode(
 			s.views = &preparedViewState{dependencies: dependencies}
 		}
 	}
-	if err := c.validateSurfaceContext(ctx, tree); err != nil {
+	if err := c.validateSurfaceContext(ctx, src, tree); err != nil {
 		return nil, err
 	}
 	if tree.Kind.IsQuery() {

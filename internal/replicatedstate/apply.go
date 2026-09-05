@@ -1963,6 +1963,8 @@ func (m *Machine) planMutations(
 			mutation.Kind != replication.MutationPutAbsentOrEqual &&
 			mutation.Kind != replication.MutationPutAbsent &&
 			mutation.Kind != replication.MutationPutPresent &&
+			mutation.Kind != replication.MutationPutIfAbsent &&
+			mutation.Kind != replication.MutationPutConflict &&
 			mutation.Kind != replication.MutationPutDigestEqual &&
 			mutation.Kind != replication.MutationDelete &&
 			mutation.Kind != replication.MutationDeleteDigestEqual ||
@@ -1980,6 +1982,11 @@ func (m *Machine) planMutations(
 			}
 		}
 		if at >= 0 {
+			if mutation.Kind == replication.MutationPutConflict || ordered[at].condition == mutationPutConflict {
+				// SQL cannot update one conflicting row twice in one INSERT.
+				// Reject before deduplication could erase an earlier program.
+				return nil, 0, ResultInvalidDocument, nil
+			}
 			if relation.kind == RelationGlobalIndex {
 				return nil, 0, ResultIndexConflict, nil
 			}
@@ -2035,7 +2042,7 @@ func (m *Machine) planMutations(
 		// in mutation.value. It is command metadata, never a stored document, so
 		// only puts are constrained by the target document bound.
 		if len(mutation.key) > target.Limits.MaxKeyBytes ||
-			!mutation.delete && len(mutation.value) > target.Limits.MaxDocumentBytes {
+			!mutation.delete && mutation.condition != mutationPutConflict && len(mutation.value) > target.Limits.MaxDocumentBytes {
 			return nil, 0, ResultTargetBound, nil
 		}
 		compare := mutation.before
@@ -2044,6 +2051,33 @@ func (m *Machine) planMutations(
 			return nil, 0, 0, err
 		}
 		mutation.beforeFound = found
+		if mutation.condition == mutationPutConflict {
+			candidate, program, ok := replication.OpenConflictValue(mutation.value)
+			validator, supported := target.Validator.(ConflictMutationValidator)
+			if !ok || !supported || target.Validation != ValidationDeterministicMutation {
+				return nil, 0, ResultInvalidDocument, nil
+			}
+			if len(candidate) > target.Limits.MaxDocumentBytes {
+				return nil, 0, ResultTargetBound, nil
+			}
+			candidate, code := m.canonicalMutationValue(candidate)
+			if code != ResultApplied {
+				return nil, 0, code, nil
+			}
+			value, validation := validator.MaterializeConflict(mutation.key, candidate, program, current, found)
+			switch validation {
+			case MutationValidationAccept:
+			case MutationValidationInvalid:
+				return nil, 0, ResultInvalidDocument, nil
+			case MutationValidationTargetBound:
+				return nil, 0, ResultTargetBound, nil
+			case MutationValidationWrongShard:
+				return nil, 0, ResultWrongShard, nil
+			default:
+				return nil, 0, 0, fmt.Errorf("%w: conflict validator returned %d", ErrInvalidCollection, validation)
+			}
+			mutation.value = value
+		}
 		// UPDATE of an absent row is an exact zero-row no-op. Check presence
 		// before validating the replacement so a coordinator can retain a
 		// durable no-op participant without inventing values for required fields.
@@ -2122,6 +2156,9 @@ func (m *Machine) planMutations(
 				continue
 			}
 			return nil, 0, ResultIndexConflict, nil
+		}
+		if mutation.condition == mutationPutIfAbsent && found {
+			continue
 		}
 		if mutation.condition == mutationPutAbsent {
 			if found {
@@ -2248,6 +2285,10 @@ func finalMutationCondition(kind replication.MutationKind) mutationCondition {
 		return mutationPutAbsent
 	case replication.MutationPutPresent:
 		return mutationPutPresent
+	case replication.MutationPutIfAbsent:
+		return mutationPutIfAbsent
+	case replication.MutationPutConflict:
+		return mutationPutConflict
 	default:
 		return mutationUnconditional
 	}

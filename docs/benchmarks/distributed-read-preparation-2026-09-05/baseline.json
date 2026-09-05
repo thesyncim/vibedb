@@ -1,0 +1,7 @@
+{
+  "production_revision": "8e4e60f6bf5baa1eb2489e4a84a7eaec065ec51f",
+  "benchmark_file": "sql/driver/replicated_read_executor_bench_test.go",
+  "benchmark_sha256": "5b9e504eb1d22e159e3bd09391fab2ab1b38abd4b5a233a0570a055721b920ed",
+  "benchmark_bytes": 18629,
+  "common_benchmark_source": "identical to frozen corrected baseline and candidate fresh-control file"
+}
