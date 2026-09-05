@@ -62,3 +62,19 @@ func TestAuthorityWireRejectsReservedAndTruncatedBytes(t *testing.T) {
 		t.Fatalf("invalid kind err=%v", err)
 	}
 }
+
+func TestAuthorityWireRejectsInactiveUnionArm(t *testing.T) {
+	policy := authorityTestPolicy(true)
+	request := AuthorityRequest{
+		Group: authorityTestGroup(), Term: 9, Holder: 1, HolderIncarnation: 22,
+		Config: authorityTestConfig(), PolicyVersion: policy.PolicyVersion, PolicyDigest: policy.PolicyDigest(),
+		Nonce: 44,
+	}
+	message := Message{Kind: MessageRequest, Request: request, Grant: AuthorityGrant{
+		Request: request, Voter: 2, GrantedAt: time.Millisecond,
+		PromiseUntil: time.Second + time.Millisecond,
+	}}
+	if _, err := AppendCanonical(nil, message); err != ErrInvalidWire {
+		t.Fatalf("inactive union arm append error = %v", err)
+	}
+}
