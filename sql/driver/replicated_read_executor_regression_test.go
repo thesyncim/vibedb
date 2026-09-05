@@ -805,7 +805,11 @@ func TestReplicatedReadReuseLayoutReplacementDoesNotReuseStaleSlot(t *testing.T)
 		core.mu.Unlock()
 		t.Fatal("replicated fixture has no live docs layout")
 	}
-	replacement := *oldTable
+	// A new incarnation shares immutable/storage handles, never its mutex.
+	replacement := table{
+		meta: oldTable.meta, schema: oldTable.schema, primary: oldTable.primary,
+		file: oldTable.file, collection: oldTable.collection,
+	}
 	replacedTables := make(map[string]*table, len(oldTables))
 	for name, table := range oldTables {
 		replacedTables[name] = table

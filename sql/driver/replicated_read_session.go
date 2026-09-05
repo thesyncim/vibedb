@@ -73,7 +73,6 @@ func (a *ReplicatedApply) newDataReadSessionInto(
 		}
 		prepared = reader.session.prepared
 	}
-	newConn := conn{db: a.database, directWritesFenced: true, exec: query.Exec{Options: options}}
 	transaction := &tx{
 		conn: &reader.conn, readOnly: true, isolation: IsolationRepeatableRead,
 		borrowedSnapshots: true, layoutEpoch: a.database.layoutEpoch,
@@ -99,7 +98,7 @@ func (a *ReplicatedApply) newDataReadSessionInto(
 		state.filterSource = query.NewFileFilterSource(state)
 		transaction.tables[name] = state
 	}
-	reader.conn = newConn
+	reader.conn = conn{db: a.database, directWritesFenced: true, exec: query.Exec{Options: options}}
 	transaction.conn = &reader.conn
 	reader.conn.tx = transaction
 	reader.session = Session{

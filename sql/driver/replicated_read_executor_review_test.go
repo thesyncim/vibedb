@@ -89,7 +89,7 @@ func TestReplicatedReadReusePreparationOwnsSourceAndAccountsObjects(t *testing.T
 	if err := reader.resetForReadReuse(); err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(reader.conn.exec, query.Exec{}) {
+	if !reflect.DeepEqual(&reader.conn.exec, &query.Exec{}) {
 		t.Fatal("idle reader retained execution options or request cancellation")
 	}
 	before := got
