@@ -100,8 +100,9 @@ contains ARM64 measurements only.
 The [packed extrema layout follow-up](benchmarks/packed-extrema-simd-layout-fix-2026-09-05/README.md)
 records the source relocation that restores the pre-existing equality8 kernel
 alignment, the focused ordered wide sparse/less-than check, and fixed-candidate
-SIMD/nosimd extrema controls. Its ordered lane remains an explicitly reported
-development regression until separately resolved.
+SIMD/nosimd extrema controls. The [final latest-main qualification](benchmarks/packed-extrema-simd-final-2026-09-05/README.md)
+records the paired release measurements that close both existing-lane
+regression checks and describes the native AMD64 SIMD/scalar gate.
 Portable parity remains in the regular CI job.
 
 Each width follows the same evidence requirement: demonstrate that a real
