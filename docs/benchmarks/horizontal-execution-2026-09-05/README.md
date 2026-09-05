@@ -185,3 +185,32 @@ the frontend trace and all CPU profiles. Each archive's `omitted-files.json`
 records hashes of omitted WAL files and other node traces, which remain in the
 original working evidence roots. The archive does not replace those explicit source identities with
 the later documentation commit.
+
+## Remaining write-barrier diagnostic
+
+`3d65357c` adds trace-only classification of sequencer waves. `raft.persist.metadata`
+requires every logical Ready to have `MustSync=false`, no entries, and no snapshot;
+all other waves are `raft.persist.required`. Both classes still execute the same
+synchronous persistence path. Trace-disabled execution does not construct regions
+or format metadata. Focused sequencer and allocation tests passed.
+
+A verified 16,000-operation diagnostic run retained 578 completed metadata waves
+and 1,597 required waves in the frontend flight recorder. Their accumulated region
+times were 3,646.7 ms and 6,877.4 ms: metadata accounts for 26.6% of completed waves
+and 34.7% of these region times. One required-wave end was unmatched. The retained
+interval is incomplete and includes other activity; these fractions are not an
+end-to-end throughput estimate. Disk service was markedly slower than in the
+previous profile. The diagnostic does not replace the unprofiled paired results.
+
+The next architectural investigation is deferring commit-progress persistence
+while preserving durable data, term/vote, exact Ready identities, checkpoint cuts,
+and crash recovery. No such deferral is implemented: `StableStore.Persist` also
+promises stable HardState and retry-safe Ready IDs, so merely skipping `syncData`
+on metadata waves would violate the current contract. Required evidence includes
+bounded pending-state ownership, sequence folding, control-boundary flushing,
+and crash/restart and retry fault tests before any throughput claim.
+
+`profile-waves.tar.gz` retains the immutable build identity, driver, frontend trace,
+all CPU profiles, verification and diagnostics. `validation/wave-regions.json`
+contains the region summary. Like the other profile archives, it is diagnostic
+rather than a comparative benchmark.

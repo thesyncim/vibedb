@@ -1,0 +1,83 @@
+{
+  "pg.direct.execute": {
+    "count": 2880,
+    "total_ms": 57527.95441200009,
+    "mean_ms": 19.974984170833334,
+    "p50_ms": 17.972992,
+    "p95_ms": 48.963328,
+    "unmatched_begin": 0,
+    "unmatched_end": 6
+  },
+  "pg.direct.prepare": {
+    "count": 2880,
+    "total_ms": 1445.0092949999996,
+    "mean_ms": 0.5017393385416666,
+    "p50_ms": 0.11055999999999999,
+    "p95_ms": 0.312384,
+    "unmatched_begin": 0,
+    "unmatched_end": 0
+  },
+  "pg.write": {
+    "count": 2880,
+    "total_ms": 59009.901804999936,
+    "mean_ms": 20.48954923784722,
+    "p50_ms": 18.18416,
+    "p95_ms": 50.7856,
+    "unmatched_begin": 0,
+    "unmatched_end": 6
+  },
+  "raft.persist.metadata": {
+    "count": 578,
+    "total_ms": 3646.6677089999994,
+    "mean_ms": 6.309113683391003,
+    "p50_ms": 3.1025600000000004,
+    "p95_ms": 12.136512,
+    "unmatched_begin": 0,
+    "unmatched_end": 0
+  },
+  "raft.persist.required": {
+    "count": 1597,
+    "total_ms": 6877.363578000003,
+    "mean_ms": 4.30642678647464,
+    "p50_ms": 2.714048,
+    "p95_ms": 11.513856,
+    "unmatched_begin": 0,
+    "unmatched_end": 1
+  },
+  "sql.read.admission": {
+    "count": 1131,
+    "total_ms": 0.3846939999999997,
+    "mean_ms": 0.0003401361626878868,
+    "p50_ms": 0.000256,
+    "p95_ms": 0.000704,
+    "unmatched_begin": 0,
+    "unmatched_end": 0
+  },
+  "sql.read.encode": {
+    "count": 1132,
+    "total_ms": 1.2874349999999966,
+    "mean_ms": 0.0011373100706713781,
+    "p50_ms": 0.000768,
+    "p95_ms": 0.001728,
+    "unmatched_begin": 0,
+    "unmatched_end": 0
+  },
+  "sql.read.execute": {
+    "count": 1132,
+    "total_ms": 63.75971600000001,
+    "mean_ms": 0.05632483745583039,
+    "p50_ms": 0.042848,
+    "p95_ms": 0.113792,
+    "unmatched_begin": 0,
+    "unmatched_end": 0
+  },
+  "sql.read.quorum": {
+    "count": 1131,
+    "total_ms": 5751.883347000004,
+    "mean_ms": 5.085661668435013,
+    "p50_ms": 0.131904,
+    "p95_ms": 32.787776,
+    "unmatched_begin": 0,
+    "unmatched_end": 1
+  }
+}

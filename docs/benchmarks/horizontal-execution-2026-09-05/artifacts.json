@@ -68,5 +68,12 @@
     "files": 1198,
     "source": "/private/tmp/vibedb-horizontal-profile-entry",
     "excluded": "compiled executables; numeric binary CRDB WAL files; non-frontend execution traces. Source/build identities and all CPU profiles retained; omitted-files.json records other omitted file hashes."
+  },
+  "profile-waves.tar.gz": {
+    "sha256": "a7129e77d616b6543d6468700213efa78c8c6c729a372fc1d18184150a972a46",
+    "bytes": 11337240,
+    "files": 1198,
+    "source": "/private/tmp/vibedb-horizontal-profile-waves",
+    "excluded": "compiled executables; numeric binary CRDB WAL files; non-frontend execution traces. Source/build identities and all CPU profiles retained; omitted-files.json records other omitted file hashes."
   }
 }
