@@ -23,6 +23,21 @@ type ReplicatedReadSession struct {
 func (a *ReplicatedApply) NewDataReadSession(
 	ctx context.Context, cut *replicatedstate.DataReadCut, options query.ExecOptions,
 ) (*ReplicatedReadSession, error) {
+	return a.newDataReadSessionInto(ctx, cut, options, nil)
+}
+
+// newDataReadSessionInto is the constructor used by both the public cold path
+// and the bounded replicated-read reuse lane. When reuse is non-nil its
+// ReplicatedReadSession and conn objects are retained at the same addresses;
+// the transaction, read cut, and executor are replaced with fresh state. A
+// prepared statement retained by the reuse lane points at those addresses, so
+// it never observes an old cut or a closed connection.
+func (a *ReplicatedApply) newDataReadSessionInto(
+	ctx context.Context,
+	cut *replicatedstate.DataReadCut,
+	options query.ExecOptions,
+	reuse *ReplicatedReadSession,
+) (*ReplicatedReadSession, error) {
 	if a == nil || a.database == nil || ctx == nil {
 		return nil, ErrReplicatedApplyClosed
 	}
@@ -45,8 +60,20 @@ func (a *ReplicatedApply) NewDataReadSession(
 	if options.Workers == 0 {
 		options.Workers = driverQueryWorkers
 	}
-	reader := &ReplicatedReadSession{}
-	reader.conn = conn{db: a.database, directWritesFenced: true, exec: query.Exec{Options: options}}
+	reader := reuse
+	var prepared map[*Prepared]struct{}
+	if reader == nil {
+		reader = &ReplicatedReadSession{}
+	} else {
+		if reader.session.current != nil || reader.conn.open {
+			return nil, ErrCursorOpen
+		}
+		if reader.conn.tx != nil {
+			return nil, errors.New("vibedb: reusable replicated read has an active transaction")
+		}
+		prepared = reader.session.prepared
+	}
+	newConn := conn{db: a.database, directWritesFenced: true, exec: query.Exec{Options: options}}
 	transaction := &tx{
 		conn: &reader.conn, readOnly: true, isolation: IsolationRepeatableRead,
 		borrowedSnapshots: true, layoutEpoch: a.database.layoutEpoch,
@@ -72,8 +99,12 @@ func (a *ReplicatedApply) NewDataReadSession(
 		state.filterSource = query.NewFileFilterSource(state)
 		transaction.tables[name] = state
 	}
+	reader.conn = newConn
+	transaction.conn = &reader.conn
 	reader.conn.tx = transaction
-	reader.session = Session{conn: &reader.conn, state: SessionInTransaction}
+	reader.session = Session{
+		conn: &reader.conn, state: SessionInTransaction, prepared: prepared,
+	}
 	return reader, nil
 }
 

@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
@@ -27,6 +28,24 @@ func (a *ReplicatedApply) NewPointReadSession(
 	raw []byte,
 	primaryPath []byte,
 	options query.ExecOptions,
+) (*ReplicatedReadSession, error) {
+	return a.newPointReadSessionInto(
+		ctx, relation, key, found, raw, primaryPath, options, nil,
+	)
+}
+
+// newPointReadSessionInto repeats the live point proof and installs a fresh
+// detached value in a retained session object. The caller owns the key/value
+// only for this call; the reuse lane clears all copies when its lease ends.
+func (a *ReplicatedApply) newPointReadSessionInto(
+	ctx context.Context,
+	relation replication.RelationID,
+	key []byte,
+	found bool,
+	raw []byte,
+	primaryPath []byte,
+	options query.ExecOptions,
+	reuse *ReplicatedReadSession,
 ) (*ReplicatedReadSession, error) {
 	if a == nil || a.database == nil || ctx == nil {
 		return nil, ErrReplicatedApplyClosed
@@ -83,7 +102,19 @@ func (a *ReplicatedApply) NewPointReadSession(
 	}
 	state.filterSource = query.NewFileFilterSource(state)
 
-	reader := &ReplicatedReadSession{}
+	reader := reuse
+	var prepared map[*Prepared]struct{}
+	if reader == nil {
+		reader = &ReplicatedReadSession{}
+	} else {
+		if reader.session.current != nil || reader.conn.open {
+			return nil, ErrCursorOpen
+		}
+		if reader.conn.tx != nil {
+			return nil, errors.New("vibedb: reusable replicated read has an active transaction")
+		}
+		prepared = reader.session.prepared
+	}
 	reader.conn = conn{
 		db: a.database, directWritesFenced: true,
 		exec: query.Exec{Options: options},
@@ -97,7 +128,9 @@ func (a *ReplicatedApply) NewPointReadSession(
 	}
 	transaction.views = transaction.layoutEpoch.views
 	transaction.conn.tx = transaction
-	reader.session = Session{conn: &reader.conn, state: SessionInTransaction}
+	reader.session = Session{
+		conn: &reader.conn, state: SessionInTransaction, prepared: prepared,
+	}
 	return reader, nil
 }
 

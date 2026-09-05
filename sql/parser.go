@@ -384,6 +384,14 @@ func (p *Parser) parseSelectText(
 func (p *Parser) SetCancellationCheck(check func() error) {
 	if p != nil {
 		p.cancel = check
+		// Parse copies the hook into the lexer. Clear both locations so a
+		// prepared parser can safely drop a request-scoped closure after parsing;
+		// otherwise the parser would retain its context through lx even though
+		// cancel was nil.
+		p.lx.cancel = check
+		if check == nil {
+			p.lx.cancelErr = nil
+		}
 	}
 }
 

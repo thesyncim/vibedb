@@ -117,22 +117,26 @@ type transactionTableLayout struct {
 	limitsErr     error
 }
 
+// catalogLayoutIdentity can outlive its epoch without retaining the catalog.
+// It must have nonzero size: distinct live tokens must have distinct addresses.
+type catalogLayoutIdentity struct{ _ uint64 }
+
 // catalogLayoutEpoch is an immutable in-process catalog/layout generation.
 // Transactions retain one pointer instead of copying every table and view at
 // BEGIN. DDL is the cold copy-on-publish boundary: table layouts and the view
-// generation map are rebuilt once and then never mutated. Pointer identity has
-// no counter to wrap and no wall-clock dependency.
+// generation map are rebuilt once and then never mutated. Its separate identity
+// has no counter to wrap and no wall-clock dependency.
 type catalogLayoutEpoch struct {
-	generation byte
-	tables     map[string]transactionTableLayout
-	views      map[string]*viewMeta
+	identity *catalogLayoutIdentity
+	tables   map[string]transactionTableLayout
+	views    map[string]*viewMeta
 }
 
 func newCatalogLayoutEpoch(
 	tables map[string]*table,
 	views map[string]*viewMeta,
 ) *catalogLayoutEpoch {
-	epoch := &catalogLayoutEpoch{generation: 1}
+	epoch := &catalogLayoutEpoch{identity: new(catalogLayoutIdentity)}
 	if len(tables) != 0 {
 		epoch.tables = make(map[string]transactionTableLayout, len(tables))
 		for name, table := range tables {
