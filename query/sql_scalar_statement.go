@@ -192,6 +192,11 @@ func selectNeedsPostScalarOrder(tree *sqlast.SelectStmt) bool {
 	if exprHasScalar(tree.Having) {
 		return true
 	}
+	if tree.Having != nil && selectHasScalar(tree) {
+		// The post-output stage also handles HAVING before scalar projection
+		// and LIMIT/OFFSET when there are no authored sort keys.
+		return true
+	}
 	for i := range tree.OrderBy {
 		if tree.OrderBy[i].Scalar != nil {
 			return true
@@ -322,6 +327,8 @@ func (s *Statement) prepareScalar(preserveUnknownOutput bool) error {
 			}
 			runtime.predRoots = append(runtime.predRoots, root)
 			runtime.ordered.havingEnd = len(runtime.nodes)
+		} else if err := runtime.compileHavingDependencies(s, s.tree.Having); err != nil {
+			return err
 		}
 		for i := range s.tree.OrderBy {
 			term := &s.tree.OrderBy[i]
@@ -467,7 +474,27 @@ func selectHasAggregate(tree *sqlast.SelectStmt) bool {
 			return true
 		}
 	}
-	return false
+	return exprPredicateHasAggregate(tree.Having)
+}
+
+// compileHavingDependencies materializes ordinary HAVING operands in the
+// scalar dependency namespace before lowering. The HAVING program consumes
+// their reduced cells directly; these nodes are not projection expressions.
+func (r *statementScalar) compileHavingDependencies(s *Statement, expr *sqlast.Expr) error {
+	if expr == nil {
+		return nil
+	}
+	if expr.Path != nil || expr.Agg != sqlast.AggNone {
+		if _, err := r.compileDependency(s, expr.Path, expr.Agg, expr.Pos); err != nil {
+			return err
+		}
+	}
+	for _, kid := range expr.Kids {
+		if err := r.compileHavingDependencies(s, kid); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func scalarHasAggregate(expr *sqlast.ScalarExpr) bool {
