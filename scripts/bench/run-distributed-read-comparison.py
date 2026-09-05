@@ -31,7 +31,12 @@ DEFAULT_WORKLOADS = "point_hit,point_miss,range_64,group_16"
 # ``update_existing`` is retained as an optional control workload.  The
 # default remains the four requested reads, and the control is useful when a
 # campaign needs to separate read-path changes from write admission effects.
-ALLOWED_WORKLOADS = frozenset((*DEFAULT_WORKLOADS.split(","), "update_existing"))
+ALLOWED_WORKLOADS = frozenset((
+    *DEFAULT_WORKLOADS.split(","),
+    "range_32",
+    "range_256",
+    "update_existing",
+))
 ALLOWED_CLIENTS = frozenset((1, 8))
 ALLOWED_GROUPS = frozenset((4, 16))
 ALLOWED_PHYSICAL_NODES = frozenset((3, 6))
@@ -108,7 +113,7 @@ def parse_workloads(raw, fixture):
     workloads = fixture.parse_workloads(raw, "workloads")
     if any(workload not in ALLOWED_WORKLOADS for workload in workloads):
         raise fixture.RunnerError(
-            "workloads must be a unique subset of point_hit, point_miss, range_64, group_16, update_existing")
+            "workloads must be a unique subset of point_hit, point_miss, range_32, range_64, range_256, group_16, update_existing")
     return workloads
 
 

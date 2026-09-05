@@ -188,6 +188,7 @@ type explainAnalyze struct {
 	Workers                 int    `json:"workers"`
 	RowsTotal               uint64 `json:"rows_total"`
 	RowsScanned             uint64 `json:"rows_scanned"`
+	ProjectedRows           uint64 `json:"projected_rows"`
 	Batches                 uint64 `json:"batches"`
 	PeakBatchRows           int    `json:"peak_batch_rows"`
 	PeakBatchBytes          int64  `json:"peak_batch_bytes"`
@@ -229,6 +230,7 @@ func newExplainAnalyze(analysis *ExplainAnalysis) *explainAnalyze {
 		Workers:                 s.Workers,
 		RowsTotal:               s.RowsTotal,
 		RowsScanned:             s.RowsScanned,
+		ProjectedRows:           s.ProjectedRows,
 		Batches:                 s.Batches,
 		PeakBatchRows:           s.PeakBatchRows,
 		PeakBatchBytes:          s.PeakBatchBytes,

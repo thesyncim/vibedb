@@ -1,6 +1,7 @@
 package storeio
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 	"testing"
@@ -48,6 +49,70 @@ func TestCompactIntegerSpellingDecodersBoundMemory(t *testing.T) {
 				}
 			}); allocs != 0 {
 				t.Fatalf("long token rejection allocated %g times", allocs)
+			}
+		})
+	}
+}
+
+func TestCompactIntegerGroupsBoundedResolverNeverGrows(t *testing.T) {
+	for _, tc := range []struct {
+		name, groupPath, sumPath, narrow string
+	}{
+		{name: "plain", groupPath: "/g", sumPath: "/s", narrow: `{"g":3,"s":7}`},
+		{name: "escaped", groupPath: "/g~1k", sumPath: "/s~0v", narrow: `{"g\u002fk":3,"s~v":7}`},
+		{name: "count_only", groupPath: "/g", narrow: `{"g":3,"s":7}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			group := &UnifiedHoleResolver{}
+			if err := group.SetPath([]byte(tc.groupPath)); err != nil {
+				t.Fatal(err)
+			}
+			var sum *UnifiedHoleResolver
+			if tc.sumPath != "" {
+				sum = &UnifiedHoleResolver{}
+				if err := sum.SetPath([]byte(tc.sumPath)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			makeView := func(document string) CompactPrimaryStripeView {
+				return compactProjectionTestView(t, []CommonPrimaryLeafRecord{{Key: []byte("key"), Value: CommonPrimaryLeafValue{Inline: []byte(document)}}})
+			}
+			narrow := makeView(tc.narrow)
+			wide := makeView(strings.TrimSuffix(tc.narrow, "}") + fmt.Sprintf(`,"%s":0}`, strings.Repeat("x", 2048)))
+			largeTape := makeView(strings.TrimSuffix(tc.narrow, "}") + `,"items":[` + strings.Repeat("1,", 130) + `1]}`)
+			seen := make([]int, 128)
+			shapes := make([]IntegerGroupShapeWorkspace, 1)
+			callbacks := 0
+			visit := func(row int, key, value int64) error {
+				wantSum := int64(7)
+				if sum == nil {
+					wantSum = 0
+				}
+				if row != 0 || key != 3 || value != wantSum {
+					t.Fatalf("row=%d key=%d sum=%d", row, key, value)
+				}
+				callbacks++
+				return nil
+			}
+			// Alternate fresh wider snapshots with accepted scans through the
+			// same filter. Neither admission nor decline may grow its arenas.
+			allocs := testing.AllocsPerRun(100, func() {
+				for _, view := range []*CompactPrimaryStripeView{&narrow, &wide, &largeTape, &narrow} {
+					callbacks = 0
+					ok, err := view.VisitResolvedIntegerGroups(group, sum, seen, shapes, visit)
+					want := view == &narrow
+					if err != nil || ok != want || want && callbacks != 1 || !want && callbacks != 0 {
+						t.Fatalf("supported=%v want=%v callbacks=%d err=%v", ok, want, callbacks, err)
+					}
+				}
+			})
+			if allocs != 0 {
+				t.Fatalf("group resolver allocations=%v", allocs)
+			}
+			for _, resolver := range []*UnifiedHoleResolver{group, sum} {
+				if resolver != nil && (cap(resolver.filled) != 0 || cap(resolver.entries) != 0 || cap(resolver.keyScratch) != 0) {
+					t.Fatal("group resolver grew retained arenas")
+				}
 			}
 		})
 	}

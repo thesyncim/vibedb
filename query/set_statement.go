@@ -798,6 +798,7 @@ func mergeSetStatementStats(dst *ExecStats, src ExecStats) {
 	dst.Workers = max(dst.Workers, src.Workers)
 	dst.RowsTotal = saturatedSetStatementUint64(dst.RowsTotal, src.RowsTotal)
 	dst.RowsScanned = saturatedSetStatementUint64(dst.RowsScanned, src.RowsScanned)
+	dst.ProjectedRows = saturatedSetStatementUint64(dst.ProjectedRows, src.ProjectedRows)
 	dst.Batches = saturatedSetStatementUint64(dst.Batches, src.Batches)
 	dst.PeakBatchRows = max(dst.PeakBatchRows, src.PeakBatchRows)
 	dst.PeakBatchBytes = max(dst.PeakBatchBytes, src.PeakBatchBytes)
