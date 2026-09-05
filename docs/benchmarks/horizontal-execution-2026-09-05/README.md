@@ -286,3 +286,32 @@ to separate proposal admission, quorum completion and response transport.
 `hints.tar.gz`, `hint-crash-recovery.tar.gz`, and `profile-hints.tar.gz` retain the
 campaign, restart verification, and frontend trace respectively. Their hashes
 and omitted-file inventories follow the same artifact policy as prior runs.
+
+## Proposal-stage diagnostic
+
+`29e6e07b` separates leader discovery, gateway round trip, owner admission and
+proposal completion in execution traces. Targeted owner/proposal tests passed.
+A fully verified 16,000-operation diagnostic run used immutable Linux/arm64
+executables from that revision; it is not an additional throughput comparison.
+
+The frontend trace contains 3,681 matched owner admissions averaging 0.055 ms
+(p95 0.099 ms) and 3,681 proposal-completion waits averaging 3.225 ms (p50 2.448 ms,
+p95 8.165 ms). Gateway leader discovery averaged 0.000489 ms across 7,299 matched
+regions; proposal round trips averaged 3.425 ms across 7,299 matched regions.
+Required persistence waves averaged 0.797 ms, while metadata waves averaged
+0.00989 ms. Owner regions cover locally led proposals, and gateway regions also
+cover remote leaders: their different populations must not be subtracted as if
+paired observations. One completion end and two round-trip ends were unmatched.
+
+The evidence puts the dominant wait inside replication/application rather than
+leader discovery or owner admission. Source inspection confirms ordinary leader
+MsgApp traffic is already emitted through RawNode's asynchronous message path;
+the local self-ack remains behind durability. A future experiment should measure
+replication delivery and durable append completion before attributing this gap
+to either transport scheduling or storage. A possible bounded experiment is
+fusing Linux frame write and data-integrity completion, retaining the existing
+barrier and outcome-unknown semantics; it has not been implemented or measured.
+
+`profile-proposals.tar.gz` retains the frontend trace, all CPU profiles, build
+identities, run verification and controls. The region summary and targeted test
+output are retained under `validation/`.
