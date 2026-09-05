@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"runtime/trace"
 	"time"
 
 	"github.com/thesyncim/vibedb/distribution"
@@ -1317,11 +1318,13 @@ func (executor *ReplicatedExecutor) propose(
 			}
 		}
 		if state == (shardservice.ReplicatedMemberState{}) {
+			discoveryRegion := trace.StartRegion(ctx, "raft.proposal.discovery")
 			if lastUnknown != nil {
 				endpoint, state, err = executor.discoverLeaderFresh(ctx, route, preferred, capability)
 			} else {
 				endpoint, state, err = executor.discoverLeader(ctx, route, preferred, capability)
 			}
+			discoveryRegion.End()
 			if err != nil {
 				if lastUnknown != nil {
 					lastUnknown = errors.Join(lastUnknown, err)
@@ -1356,12 +1359,14 @@ func (executor *ReplicatedExecutor) propose(
 			}
 		}
 		preferred = state.LeaderID
+		roundTripRegion := trace.StartRegion(ctx, "raft.proposal.roundtrip")
 		response, err := executor.doReplicated(ctx, endpoint,
 			&shardservice.ReplicatedRequest{
 				Operation: shardservice.ReplicatedPropose, Capability: capability,
 				Fence:   state.Fence,
 				Command: original,
 			})
+		roundTripRegion.End()
 		if err != nil {
 			executor.leaderHints.invalidate(route, endpoint, state)
 			// A transport implementation might not wrap a proposal failure;

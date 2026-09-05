@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"runtime/trace"
 	"sync"
 	"sync/atomic"
 
@@ -2879,11 +2880,13 @@ func (owner *Owner) submit(
 		copy(owned, command)
 	}
 	delivery := &proposalDelivery{}
+	admissionRegion := trace.StartRegion(ctx, "raft.proposal.admission")
 	reply, err := owner.enqueue(ctx, ownerRequest{
 		kind: requestProposal, group: fence.Group, fence: fence, data: owned,
 		reply: make(chan ownerReply, 1), bytes: int64(cap(owned)),
 		delivery: delivery, authorize: authorize,
 	})
+	admissionRegion.End()
 	if err != nil {
 		result := Result{State: reply.state}
 		if errors.Is(err, ErrOutcomeUnknown) {
@@ -2897,7 +2900,9 @@ func (owner *Owner) submit(
 		return result, err
 	}
 	waiter := reply.waiter
+	commitRegion := trace.StartRegion(ctx, "raft.proposal.commit")
 	outcome, waitErr := waiter.Wait(ctx)
+	commitRegion.End()
 	if waitErr != nil {
 		waiter.Cancel()
 		return Result{State: reply.state}, &UnknownOutcomeError{
