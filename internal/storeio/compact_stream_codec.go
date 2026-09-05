@@ -150,6 +150,15 @@ func (s *compactStreamScratch) encode(values [][]byte) compactStreamEncoding {
 }
 
 func (s *compactStreamScratch) encodeShape(values [][]byte, ranks []uint16, leafRows int) compactStreamEncoding {
+	return s.encodeShapeWithRankContext(values, ranks, leafRows, nil)
+}
+
+func (s *compactStreamScratch) encodeShapeWithRankContext(
+	values [][]byte,
+	ranks []uint16,
+	leafRows int,
+	rankContext *compactRankContext,
+) compactStreamEncoding {
 	if len(values) == 0 {
 		return compactStreamEncoding{kind: compactStreamDictionary}
 	}
@@ -161,14 +170,28 @@ func (s *compactStreamScratch) encodeShape(values [][]byte, ranks []uint16, leaf
 		frontBytes,
 	)
 	alphabet, hasAlphabet := s.measureAlphabet(2, values, alphabetLimit)
-	s.integers = slices.Grow(s.integers[:0], len(values))[:len(values)]
-	allIntegers := true
-	for i := range values {
-		s.integers[i], allIntegers = CanonicalIntValue(values[i])
-		if !allIntegers {
-			break
+	// Reserve the last backing slot for the prefix candidate so constructing
+	// the ordinary numeric alternatives below cannot overwrite its bytes.
+	numeric, hasPrefix := s.encodePrefixIntShapeWithRankContext(
+		7, values, ranks, leafRows, rankContext,
+	)
+	rankNumber := hasPrefix && numeric.kind == compactStreamRankAffine &&
+		numeric.data[0] == 2 && len(numeric.dict[0]) == 0 && len(numeric.dict[1]) == 0
+	allIntegers := !rankNumber
+	if allIntegers {
+		s.integers = slices.Grow(s.integers[:0], len(values))[:len(values)]
+		for i := range values {
+			s.integers[i], allIntegers = CanonicalIntValue(values[i])
+			if !allIntegers {
+				break
+			}
 		}
 	}
+	// A bare rank descriptor is exactly 34 bytes and proves at least 64
+	// distinct integers. FOR and varint delta need at least 68/87 bytes.
+	// Packed delta needs at least 41 bytes: its only smaller 64-row case,
+	// constant -1 deltas, already selected the local-affine prefix form.
+	// Dictionary/front/alphabet choices and their tie policy still compete.
 	if allIntegers {
 		s.candidates[n] = s.encodeFOR(n, s.integers)
 		n++
@@ -177,19 +200,21 @@ func (s *compactStreamScratch) encodeShape(values [][]byte, ranks []uint16, leaf
 		s.candidates[n] = s.encodeDeltaPack(n, s.integers)
 		n++
 	}
-	s.dates = slices.Grow(s.dates[:0], len(values))[:len(values)]
-	allDates := true
-	for i := range values {
-		s.dates[i], allDates = compactDateOrdinal(values[i])
-		if !allDates {
-			break
+	allDates := !rankNumber
+	if allDates {
+		s.dates = slices.Grow(s.dates[:0], len(values))[:len(values)]
+		for i := range values {
+			s.dates[i], allDates = compactDateOrdinal(values[i])
+			if !allDates {
+				break
+			}
 		}
 	}
 	if allDates {
 		s.candidates[n] = s.encodeDate(n, s.dates)
 		n++
 	}
-	if numeric, ok := s.encodePrefixIntShape(n, values, ranks, leafRows); ok {
+	if hasPrefix {
 		s.candidates[n] = numeric
 		n++
 	}
@@ -843,6 +868,16 @@ func (s *compactStreamScratch) encodePrefixInt(
 }
 
 func (s *compactStreamScratch) encodePrefixIntShape(slot int, values [][]byte, ranks []uint16, leafRows int) (compactStreamEncoding, bool) {
+	return s.encodePrefixIntShapeWithRankContext(slot, values, ranks, leafRows, nil)
+}
+
+func (s *compactStreamScratch) encodePrefixIntShapeWithRankContext(
+	slot int,
+	values [][]byte,
+	ranks []uint16,
+	leafRows int,
+	rankContext *compactRankContext,
+) (compactStreamEncoding, bool) {
 	first, ok := parseCompactPrefixInt(values[0])
 	if !ok {
 		return compactStreamEncoding{}, false
@@ -895,7 +930,9 @@ func (s *compactStreamScratch) encodePrefixIntShape(slot int, values [][]byte, r
 			dict: dictionary,
 		}, true
 	}
-	if affine, ok := s.encodeRankAffineParsed(slot, first, allCanonical, fixedWidth, ranks, leafRows); ok {
+	if affine, ok := s.encodeRankAffineParsed(
+		slot, first, allCanonical, fixedWidth, ranks, leafRows, rankContext,
+	); ok {
 		return affine, true
 	}
 	restarts := (len(values) + compactStreamRestart - 1) / compactStreamRestart

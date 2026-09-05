@@ -36,7 +36,7 @@ func compactRankBenchRecords(name string) []CommonPrimaryLeafRecord {
 			number = int64(((uint64(row+17) * 0x9e3779b97f4a7c15) >> 1) % 1_000_000)
 		}
 		raw := fmt.Appendf(nil, `{"id":%d,"name":"item-%d","score":%d`, number, number, row%71)
-		if row%7 < 3 {
+		if name != "single" && row%7 < 3 {
 			raw = append(raw, `,"extra":true`...)
 		}
 		records[row] = CommonPrimaryLeafRecord{Key: fmt.Appendf(nil, "row-%04d", row), Value: CommonPrimaryLeafValue{Inline: append(raw, '}')}}
@@ -45,7 +45,7 @@ func compactRankBenchRecords(name string) []CommonPrimaryLeafRecord {
 }
 
 func BenchmarkCompactRankFormat(b *testing.B) {
-	for _, name := range []string{"low", "high", "late-miss", "negative", "unrelated"} {
+	for _, name := range []string{"low", "high", "late-miss", "negative", "unrelated", "single"} {
 		b.Run(name, func(b *testing.B) {
 			records := compactRankBenchRecords(name)
 			view := compactProjectionTestView(b, records)

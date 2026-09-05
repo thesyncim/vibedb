@@ -215,40 +215,13 @@ func (s *compactStreamSequentialState) appendArithmeticPrefixKey(
 	first := int64(binary.LittleEndian.Uint64(v.data[2:]))
 	delta := int64(binary.LittleEndian.Uint64(v.data[10:]))
 	value := first + int64(row)*delta
-	if value < 0 {
+	out, ok := appendCompactPrefixUint(dst, v, value)
+	if !ok {
 		return dst, false
 	}
 	s.value = value
 	s.next++
-	prefixValue, _ := v.dictionaryEntry(0)
-	suffixValue, _ := v.dictionaryEntry(1)
-	dst = append(dst, prefixValue...)
-	digits := len(dst)
-	width := int(v.data[1])
-	if v.data[0]&1 != 0 && width == 8 && value < 100_000_000 {
-		dst = appendFixedUint8(dst, uint32(value))
-	} else if value < 1_000_000 {
-		dst = appendCanonicalUint6(dst, uint64(value))
-	} else {
-		dst = strconv.AppendUint(dst, uint64(value), 10)
-	}
-	if v.data[0]&1 != 0 && width != 8 {
-		n := len(dst) - digits
-		if n > width {
-			return dst, false
-		}
-		if n < width {
-			gap := width - n
-			for range gap {
-				dst = append(dst, 0)
-			}
-			copy(dst[digits+gap:], dst[digits:digits+n])
-			for at := digits; at < digits+gap; at++ {
-				dst[at] = '0'
-			}
-		}
-	}
-	return append(dst, suffixValue...), true
+	return out, true
 }
 
 func (d *CompactPrimaryScanDecoder) appendValue(
@@ -551,6 +524,8 @@ func (s *compactStreamSequentialState) appendValue(
 		s.next++
 		base := int32(binary.LittleEndian.Uint32(v.data))
 		return appendCompactDate(dst, base+int32(offset)), true
+	case compactStreamRankAffine:
+		return s.appendRankAffine(dst, v, row)
 	case compactStreamDelta:
 	case compactStreamDeltaPack:
 	case compactStreamPrefixInt:
@@ -602,23 +577,68 @@ func (s *compactStreamSequentialState) appendValue(
 	if v.kind == compactStreamDelta || v.kind == compactStreamDeltaPack {
 		return AppendCanonicalInt(dst, s.value), true
 	}
-	if s.value < 0 {
+	return appendCompactPrefixUint(dst, v, s.value)
+}
+
+// appendRankAffine evaluates the admitted physical-rank arithmetic directly.
+// Rank-affine streams are complete leaf domains, so the row is already the
+// physical rank. Keeping this path pointer-based avoids copying the 104-byte
+// stream view and renders the shared prefix/suffix without the generic
+// random-rank decoder.
+func (s *compactStreamSequentialState) appendRankAffine(
+	dst []byte,
+	v *compactStreamView,
+	row int,
+) ([]byte, bool) {
+	if v.kind != compactStreamRankAffine || row < 0 || row >= v.count ||
+		len(v.data) != 18 {
+		return v.appendValue(dst, row)
+	}
+	base := int64(binary.LittleEndian.Uint64(v.data[2:]))
+	step := int64(binary.LittleEndian.Uint64(v.data[10:]))
+	value := base + step*int64(row)
+	out, ok := appendCompactPrefixUint(dst, v, value)
+	if !ok {
 		return dst, false
 	}
-	prefixValue, _ := v.dictionaryEntry(0)
-	suffixValue, _ := v.dictionaryEntry(1)
-	dst = append(dst, prefixValue...)
-	digits := len(dst)
-	if s.value < 1_000_000 {
-		dst = appendCanonicalUint6(dst, uint64(s.value))
-	} else {
-		dst = strconv.AppendUint(dst, uint64(s.value), 10)
+	s.value = value
+	// Physical ranks contain shape gaps, so this stream cannot use the
+	// ordinal-style next-row synchronization. Retain the last rank only for
+	// diagnostics; every admitted rank is independently arithmetic.
+	s.next = row + 1
+	return out, true
+}
+
+// appendCompactPrefixUint renders an admitted nonnegative prefix-integer
+// spelling. The small-value path is intentionally shared by sequential
+// prefix and rank-affine scans; strconv remains only for larger values.
+func appendCompactPrefixUint(dst []byte, v *compactStreamView, value int64) ([]byte, bool) {
+	if value < 0 {
+		return dst, false
 	}
+	start := len(dst)
+	prefix, prefixOK := v.dictionaryEntry(0)
+	suffix, suffixOK := v.dictionaryEntry(1)
+	if !prefixOK || !suffixOK {
+		return dst, false
+	}
+	dst = append(dst, prefix...)
+	digits := len(dst)
+	width := 0
 	if v.data[0]&1 != 0 {
-		width := int(v.data[1])
+		width = int(v.data[1])
+	}
+	if width == 8 && value < 100_000_000 {
+		dst = appendFixedUint8(dst, uint32(value))
+	} else if value < 1_000_000 {
+		dst = appendCanonicalUint6(dst, uint64(value))
+	} else {
+		dst = strconv.AppendUint(dst, uint64(value), 10)
+	}
+	if width != 0 {
 		n := len(dst) - digits
 		if n > width {
-			return dst, false
+			return dst[:start], false
 		}
 		if n < width {
 			gap := width - n
@@ -631,7 +651,7 @@ func (s *compactStreamSequentialState) appendValue(
 			}
 		}
 	}
-	return append(dst, suffixValue...), true
+	return append(dst, suffix...), true
 }
 
 // compactSpreadAlphabet5 expands eight packed five-bit codes into byte lanes.

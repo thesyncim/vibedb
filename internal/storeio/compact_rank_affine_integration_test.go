@@ -226,3 +226,127 @@ func TestCompactRankAffinePatchBreakAndRestore(t *testing.T) {
 		}
 	}
 }
+
+func TestCompactRankAffinePatchRestoresBareWidthBoundary(t *testing.T) {
+	const (
+		rows     = 320
+		targets  = 64
+		patchRow = 18 // i=16: i+i/7, with the interior value 900+18.
+	)
+	storeID := unifiedTestStoreID()
+	target := make([]bool, rows)
+	for i := 0; i < targets; i++ {
+		rank := i + i/7
+		target[rank] = true
+	}
+	records := make([]CommonPrimaryLeafRecord, rows)
+	for row := range records {
+		var value []byte
+		if target[row] {
+			value = fmt.Appendf(nil, `{"id":%d}`, 900+row)
+		} else {
+			value = fmt.Appendf(nil, `{"other":%d}`, row)
+		}
+		records[row] = CommonPrimaryLeafRecord{
+			Key:   fmt.Appendf(nil, "row-%03d", row),
+			Value: CommonPrimaryLeafValue{Inline: value},
+		}
+	}
+
+	encode := func(input []CommonPrimaryLeafRecord, generation uint64) (CompactPrimaryStripeView, []byte) {
+		t.Helper()
+		page, err := EncodeBestCompactPrimaryStripe(
+			make([]byte, CommonPrimaryLeafMaxExtentBytes),
+			CommonPrimaryLeafHeader{StoreID: storeID, Generation: generation, Bucket: 0},
+			storeID, input, NewUnifiedPrimaryLeafBuilder(),
+		)
+		if err != nil {
+			t.Fatalf("encode width-boundary fixture generation=%d: %v", generation, err)
+		}
+		logical, _ := CommonPrimaryLeafLogicalID(0)
+		view, err := OpenCompactPrimaryStripe(
+			page, storeID, 0,
+			PageRef{Offset: 4096, Length: uint32(len(page)), LogicalID: logical, Generation: generation, Kind: PagePrimaryLeaf},
+			generation, unifiedTestBounds(),
+		)
+		if err != nil {
+			t.Fatalf("open width-boundary fixture generation=%d: %v", generation, err)
+		}
+		return view, page
+	}
+	findRankStream := func(view CompactPrimaryStripeView) (int, compactStreamView) {
+		var resolver UnifiedHoleResolver
+		if err := resolver.SetPath([]byte("/id")); err != nil {
+			t.Fatal(err)
+		}
+		for shape := 0; shape < view.shapeCount; shape++ {
+			entry, ok := view.shapeEntry(shape)
+			if !ok {
+				continue
+			}
+			hole := resolver.resolveCompactTemplate(entry.template)
+			stream, ok := compactProjectionStreamAt(entry, hole, view.rows)
+			if ok && stream.kind == compactStreamRankAffine && stream.rankAffineIsNumber() {
+				return shape, stream
+			}
+		}
+		return -1, compactStreamView{}
+	}
+
+	originalView, _ := encode(records, 1)
+	shape, originalStream := findRankStream(originalView)
+	if shape < 0 {
+		t.Fatal("full writer did not select bare rank-affine stream")
+	}
+	if originalStream.width != 0 || originalStream.data[0] != 2 {
+		t.Fatalf("original rank stream mode=%d width=%d, want bare mode 2", originalStream.data[0], originalStream.width)
+	}
+
+	changedRecords := append([]CommonPrimaryLeafRecord(nil), records...)
+	originalValue := append([]byte(nil), changedRecords[patchRow].Value.Inline...)
+	changedValue := bytes.Replace(originalValue, []byte(`"id":918`), []byte(`"id":919`), 1)
+	if bytes.Equal(originalValue, changedValue) {
+		t.Fatal("width-boundary fixture did not contain the patch scalar")
+	}
+	changedRecords[patchRow].Value.Inline = changedValue
+	changedView, _ := encode(changedRecords, 2)
+
+	canonical, err := vibejson.AppendCanonicalize(nil, originalValue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificate := unifiedScalarCanonicalIndex(t, canonical)
+	patch, _, resolved, err := changedView.PatchStableCanonicalReplacementScalarPatch(
+		changedRecords[patchRow].Key, 0, certificate, nil,
+	)
+	if err != nil || !resolved || !patch.valid() || patch.exact() {
+		t.Fatalf("restore scalar certificate valid=%v exact=%v resolved=%v err=%v", patch.valid(), patch.exact(), resolved, err)
+	}
+	fast, ok, err := changedView.PatchCompactPrimaryStripeReplacements(
+		make([]byte, CommonPrimaryLeafMaxExtentBytes), 3,
+		[]CommonPrimaryUnifiedReplacement{{
+			Key: changedRecords[patchRow].Key, Value: canonical, ScalarPatch: patch,
+		}}, NewUnifiedPrimaryLeafBuilder(),
+	)
+	if err != nil || !ok {
+		t.Fatalf("restore width-boundary patch ok=%v err=%v", ok, err)
+	}
+	restoredRecords := append([]CommonPrimaryLeafRecord(nil), changedRecords...)
+	restoredRecords[patchRow].Value.Inline = originalValue
+	want, err := EncodeBestCompactPrimaryStripe(
+		make([]byte, CommonPrimaryLeafMaxExtentBytes),
+		CommonPrimaryLeafHeader{StoreID: storeID, Generation: 3, Bucket: 0},
+		storeID, restoredRecords, NewUnifiedPrimaryLeafBuilder(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(fast, want) {
+		t.Fatalf("width-boundary restore differs from full planner: patch=%d full=%d", len(fast), len(want))
+	}
+	patchedView, _ := encode(restoredRecords, 3)
+	_, patchedStream := findRankStream(patchedView)
+	if patchedStream.kind != compactStreamRankAffine || !patchedStream.rankAffineIsNumber() {
+		t.Fatal("full restore lost bare rank-affine stream")
+	}
+}

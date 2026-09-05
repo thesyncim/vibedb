@@ -902,26 +902,52 @@ func (v *CompactPrimaryStripeView) PatchCompactPrimaryStripeReplacements(
 		if group.offset < 0 || group.offset+group.oldBytes > len(v.payload) {
 			return nil, false, corrupt("group bounds")
 		}
-		if rankShape != shape {
-			shapeRanks = slices.Grow(patch.shapeOrder[:0], entry.rows)[:0]
-			for rank := 0; rank < v.rows; rank++ {
-				if v.rowShape(rank) == shape {
-					shapeRanks = append(shapeRanks, uint16(rank))
-				}
-			}
-			patch.shapeOrder = shapeRanks
-			rankShape = shape
-		}
-		if len(shapeRanks) != entry.rows || !oldStream.matchesShapeRows(entry.rows, v.rows) {
+		if !oldStream.matchesShapeRows(entry.rows, v.rows) {
 			return nil, false, corrupt("group row coordinates")
+		}
+		// The rank candidate is only possible for a long sparse shape. Keep
+		// this context local so ordinary streams never scan the leaf to build a
+		// map that their planner cannot use. An existing rank-affine stream
+		// resolves immediately because its physical coordinates are required
+		// for decoding; a newly planned candidate resolves only after the
+		// prefix parser rejects the local ordinal-affine form and its exact
+		// witness checks pass.
+		var rankContext compactRankContext
+		var ranks []uint16
+		rankCandidateEligible := entry.rows >= compactStreamRestart && entry.rows < v.rows
+		rankContextNeeded := entry.rows < v.rows &&
+			(oldStream.kind == compactStreamRankAffine || rankCandidateEligible)
+		if rankContextNeeded {
+			rankContext = compactRankContext{
+				view: v, shape: shape, storage: shapeRanks,
+			}
+			if rankShape == shape {
+				rankContext.ranks = shapeRanks
+				rankContext.resolved = true
+			}
+			if oldStream.kind == compactStreamRankAffine && !rankContext.resolved {
+				ranks = rankContext.resolve()
+				if len(ranks) != entry.rows {
+					return nil, false, corrupt("group rank map")
+				}
+				shapeRanks = ranks
+				patch.shapeOrder = shapeRanks
+				rankShape = shape
+			} else {
+				ranks = rankContext.ranks
+			}
 		}
 		patch.patchHeap = patch.patchHeap[:0]
 		patch.patchEnds = slices.Grow(
 			patch.patchEnds[:0], entry.rows,
 		)[:entry.rows]
-		for row, rank := range shapeRanks {
+		for row := 0; row < entry.rows; row++ {
+			coordinate := row
+			if oldStream.kind == compactStreamRankAffine && len(ranks) != 0 {
+				coordinate = int(ranks[row])
+			}
 			var decoded bool
-			patch.patchHeap, decoded = oldStream.appendValue(patch.patchHeap, oldStream.shapeCoordinate(int(rank), row))
+			patch.patchHeap, decoded = oldStream.appendValue(patch.patchHeap, coordinate)
 			if !decoded || uint64(len(patch.patchHeap)) > uint64(^uint32(0)) {
 				return nil, false, corrupt("group value")
 			}
@@ -944,7 +970,18 @@ func (v *CompactPrimaryStripeView) PatchCompactPrimaryStripeReplacements(
 			}
 			patch.patchValues[modification.ordinal] = modification.value
 		}
-		encoded := patch.stream.encodeShape(patch.patchValues, shapeRanks, v.rows)
+		var rankContextPtr *compactRankContext
+		if rankCandidateEligible {
+			rankContextPtr = &rankContext
+		}
+		encoded := patch.stream.encodeShapeWithRankContext(
+			patch.patchValues, ranks, v.rows, rankContextPtr,
+		)
+		if rankCandidateEligible && len(rankContext.ranks) != 0 {
+			shapeRanks = rankContext.ranks
+			patch.shapeOrder = shapeRanks
+			rankShape = shape
+		}
 		group.newStart = len(patch.patchStreams)
 		patch.patchStreams, err = encoded.appendBinary(patch.patchStreams)
 		if err != nil {

@@ -158,6 +158,6 @@ rerun in [linux-volume-focused.txt](linux-volume-focused.txt) passes it.
 
 - [Node log maintenance](../../../internal/raftstore/node_catalog.go)
 - [Production checkpoint worker](../../../internal/raftmember/node_checkpoint.go)
-- [Three-replica storage regression](../../../internal/raftstore/node_maintenance_test.go)
+- [Three-replica storage regression](https://github.com/thesyncim/vibedb/blob/837c68bfe14d6197159561e675c1386b982a1fa1/internal/raftstore/node_maintenance_test.go)
 - [Reclamation and crash tests](../../../internal/raftstore/seglog/reclaim_test.go)
 - [Production worker integration](../../../internal/raftmember/runtime_node_persistence_test.go)

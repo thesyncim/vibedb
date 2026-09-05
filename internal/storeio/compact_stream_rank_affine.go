@@ -26,6 +26,103 @@ func (v *compactStreamView) matchesShapeRows(shapeRows, leafRows int) bool {
 	return v.count == shapeRows
 }
 
+// compactRankContext supplies physical ranks only when the prefix-integer
+// planner has already proved that a local ordinal sequence cannot win. The
+// view is borrowed for one synchronous patch/build call; it is never retained
+// by compactStreamScratch between columns.
+type compactRankContext struct {
+	view     *CompactPrimaryStripeView
+	shape    int
+	storage  []uint16
+	ranks    []uint16
+	resolved bool
+}
+
+func (c *compactRankContext) resolve() []uint16 {
+	if c == nil {
+		return nil
+	}
+	if c.resolved {
+		return c.ranks
+	}
+	c.resolved = true
+	if c.view == nil || c.shape < 0 || c.shape >= c.view.shapeCount {
+		return nil
+	}
+	entry, ok := c.view.shapeEntry(c.shape)
+	if !ok || entry.rows < 0 || entry.rows > c.view.rows {
+		return nil
+	}
+	ranks := c.storage[:0]
+	if cap(ranks) < entry.rows {
+		ranks = slices.Grow(ranks, entry.rows)[:0]
+	}
+	for rank := 0; rank < c.view.rows; rank++ {
+		if c.view.rowShape(rank) == c.shape {
+			ranks = append(ranks, uint16(rank))
+		}
+	}
+	if len(ranks) != entry.rows {
+		return nil
+	}
+	c.ranks = ranks
+	return ranks
+}
+
+// necessaryRankFit checks exact endpoint/interior witnesses before the full
+// physical rank map is materialized. Any valid rank-affine candidate must fit
+// these witnesses, so a late mismatch or random column declines without the
+// O(leafRows) map build. Full validation still runs after resolve succeeds.
+func (c *compactRankContext) necessaryRankFit(
+	parsed []uint64,
+	first compactPrefixIntValue,
+	fixedWidth bool,
+	leafRows int,
+) bool {
+	if c == nil || c.view == nil || len(parsed) < 3 ||
+		len(parsed) > CompactPrimaryStripeMaxRows || leafRows != c.view.rows ||
+		leafRows <= len(parsed) {
+		return false
+	}
+	entry, ok := c.view.shapeEntry(c.shape)
+	if !ok || entry.rows != len(parsed) || entry.rows < compactStreamRestart ||
+		entry.rows >= c.view.rows {
+		return false
+	}
+	firstRank, firstOK := c.view.shapeRank(c.shape, 0)
+	secondRank, secondOK := c.view.shapeRank(c.shape, 1)
+	thirdRank, thirdOK := c.view.shapeRank(c.shape, 2)
+	lastRank, lastOK := c.view.shapeRank(c.shape, len(parsed)-1)
+	if !firstOK || !secondOK || !thirdOK || !lastOK ||
+		secondRank <= firstRank || thirdRank <= secondRank || lastRank <= thirdRank {
+		return false
+	}
+	firstValue := int64(first.value)
+	valueDelta := int64(parsed[1]) - firstValue
+	rankDelta := int64(secondRank - firstRank)
+	if valueDelta == 0 || valueDelta%rankDelta != 0 {
+		return false
+	}
+	step := valueDelta / rankDelta
+	base, ok := compactRankAffineBase(firstValue, step, int64(firstRank))
+	if !ok || !compactRankAffineDomain(base, step, leafRows) {
+		return false
+	}
+	if fixedWidth {
+		if first.width > math.MaxUint8 {
+			return false
+		}
+		lastValue := compactRankAffineValue(base, step, int64(leafRows-1))
+		var scratch [20]byte
+		if len(strconv.AppendInt(scratch[:0], base, 10)) > first.width ||
+			len(strconv.AppendInt(scratch[:0], lastValue, 10)) > first.width {
+			return false
+		}
+	}
+	return compactRankAffineValue(base, step, int64(thirdRank)) == int64(parsed[2]) &&
+		compactRankAffineValue(base, step, int64(lastRank)) == int64(parsed[len(parsed)-1])
+}
+
 func (v compactStreamView) validRankAffine() bool {
 	if v.kind != compactStreamRankAffine || v.width != 0 || v.count < 2 ||
 		v.count > CompactPrimaryStripeMaxRows || v.dictCount != 2 ||
@@ -274,18 +371,61 @@ func compactRankAffineDomain(first, step int64, count int) bool {
 	return step != math.MinInt64 && -step <= first/steps
 }
 
+func compactRankAffineBase(first, step, rank int64) (int64, bool) {
+	if first < 0 || rank < 0 || step == 0 || step == math.MinInt64 {
+		return 0, false
+	}
+	if rank == 0 {
+		return first, true
+	}
+	if step > 0 {
+		if step > first/rank {
+			return 0, false
+		}
+		return first - step*rank, true
+	}
+	if -step > (math.MaxInt64-first)/rank {
+		return 0, false
+	}
+	return first + (-step)*rank, true
+}
+
+func compactRankAffineValue(base, step, rank int64) int64 {
+	return base + step*rank
+}
+
 // The ordinary prefix parser already proved every spelling and populated
 // parsed. This candidate reuses those values and avoids building a packed
 // delta stream when physical ranks account exactly for the shape gaps.
-func (s *compactStreamScratch) encodeRankAffineParsed(slot int, first compactPrefixIntValue, allCanonical, fixedWidth bool, ranks []uint16, leafRows int) (compactStreamEncoding, bool) {
+func (s *compactStreamScratch) encodeRankAffineParsed(
+	slot int,
+	first compactPrefixIntValue,
+	allCanonical, fixedWidth bool,
+	ranks []uint16,
+	leafRows int,
+	rankContext *compactRankContext,
+) (compactStreamEncoding, bool) {
 	// Signed canonical numbers retain the existing signed integer codecs. A
 	// shared minus affix is not the bare numeric certificate used below.
 	if len(first.prefix) == 1 && first.prefix[0] == '-' && len(first.suffix) == 0 {
 		return compactStreamEncoding{}, false
 	}
 	parsed := s.parsed
-	if len(parsed) < compactStreamRestart || len(ranks) != len(parsed) ||
-		leafRows <= len(parsed) || leafRows > CompactPrimaryStripeMaxRows {
+	if len(parsed) < compactStreamRestart || leafRows <= len(parsed) ||
+		leafRows > CompactPrimaryStripeMaxRows || !allCanonical && !fixedWidth {
+		return compactStreamEncoding{}, false
+	}
+	// Bare canonical numbers use the unpadded rank renderer even when all
+	// values happen to have the same digit width. Keep fixed-width validation
+	// for noncanonical or affixed spellings before resolving physical ranks.
+	fixedWidth = fixedWidth && !(allCanonical && len(first.prefix) == 0 && len(first.suffix) == 0)
+	if len(ranks) == 0 && rankContext != nil {
+		if !rankContext.necessaryRankFit(parsed, first, fixedWidth, leafRows) {
+			return compactStreamEncoding{}, false
+		}
+		ranks = rankContext.resolve()
+	}
+	if len(ranks) != len(parsed) {
 		return compactStreamEncoding{}, false
 	}
 	gap := int64(ranks[1]) - int64(ranks[0])
@@ -294,30 +434,21 @@ func (s *compactStreamScratch) encodeRankAffineParsed(slot int, first compactPre
 		return compactStreamEncoding{}, false
 	}
 	step := delta / gap
-	base := int64(first.value)
-	rank0 := int64(ranks[0])
-	if rank0 != 0 {
-		if step > 0 {
-			if step > base/rank0 {
-				return compactStreamEncoding{}, false
-			}
-		} else if -step > (math.MaxInt64-base)/rank0 {
-			return compactStreamEncoding{}, false
-		}
-		base -= step * rank0
+	base, ok := compactRankAffineBase(int64(first.value), step, int64(ranks[0]))
+	if !ok {
+		return compactStreamEncoding{}, false
 	}
 	if !compactRankAffineDomain(base, step, leafRows) {
 		return compactStreamEncoding{}, false
 	}
 	for row, rank := range ranks {
 		if int(rank) >= leafRows || row != 0 && rank <= ranks[row-1] ||
-			base+step*int64(rank) != int64(parsed[row]) {
+			compactRankAffineValue(base, step, int64(rank)) != int64(parsed[row]) {
 			return compactStreamEncoding{}, false
 		}
 	}
-	// Bare canonical numbers must remain admitted by every native integer
-	// query. Quoted/affixed fixed-width values keep the optimized renderer.
-	fixedWidth = fixedWidth && !(allCanonical && len(first.prefix) == 0 && len(first.suffix) == 0)
+	// Bare canonical numbers remain admitted by every native integer query;
+	// quoted/affixed fixed-width values keep the optimized renderer.
 	if fixedWidth {
 		var scratch [20]byte
 		last := base + step*int64(leafRows-1)

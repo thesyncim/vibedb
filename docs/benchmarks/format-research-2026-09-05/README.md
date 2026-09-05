@@ -32,6 +32,10 @@ Neither is equivalent to merely increasing compression or running more GC.
 The detailed [primary analysis](astra-max-primary-format.md) and
 [replicated-format analysis](astra-max-replicated-format.md) include rejected
 alternatives, byte equations, exact source references and falsification tests.
+The [second Astra-max pass](astra-max-second-pass.md) records the sealed-route
+and immutable-overflow-suffix ideas; its sealed-route patch is retained only
+as an uncompiled research artifact. The [third pass](astra-max-third-pass.md)
+records the writer-work proof and the exception-design caveats.
 
 ## Measured: the medium-value boundary
 
