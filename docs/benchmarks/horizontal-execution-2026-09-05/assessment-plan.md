@@ -26,7 +26,7 @@ cd /private/tmp/vibedb-horizontal
 
 REPO=/private/tmp/vibedb-horizontal
 CLIENT_SOURCE="<CLEAN_IMMUTABLE_CLIENT_SOURCE>"
-M="<LATEST_MAIN_COMMIT>"
+M="5160e0f6c8dc5b252e5c5ff75984bdd6fe49db02"
 S="<FINAL_PRODUCTION_COMMIT>"
 WORKLOADS=point_hit,point_miss,range_32,range_64,range_256,group_16,update_existing,mixed_read_update,mixed_uniform
 
