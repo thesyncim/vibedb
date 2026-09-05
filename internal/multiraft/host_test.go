@@ -17,10 +17,12 @@ import (
 )
 
 type fakeReady struct {
-	kind         raftmember.DriveKind
-	outbound     *pb.Message
-	readOutcomes []raftmodel.ReadOutcome
-	err          error
+	kind          raftmember.DriveKind
+	outbound      *pb.Message
+	readOutcomes  []raftmodel.ReadOutcome
+	proposalCount int
+	proposalBytes int64
+	err           error
 }
 
 type fakeRuntime struct {
@@ -55,6 +57,12 @@ type fakeRuntime struct {
 	commitMetrics       raftmodel.CommitMetrics
 	schemaQuiesceCalls  int
 	schemaQuiesceErrs   []error
+	windowOpen          bool
+	windowEntries       int
+	windowBytes         int64
+	windowCalls         int
+	capturedProposalAt  int
+	capturedProposals   [][]byte
 }
 
 type fakeBatchRuntime struct {
@@ -160,6 +168,10 @@ func (runtime *fakeRuntime) Identity() raftmember.RuntimeIdentity   { return run
 func (runtime *fakeRuntime) Failure() error                         { return runtime.failure }
 func (runtime *fakeRuntime) HasPendingResultSettlement() bool       { return runtime.pendingSettlement }
 func (runtime *fakeRuntime) CommitMetrics() raftmodel.CommitMetrics { return runtime.commitMetrics }
+func (runtime *fakeRuntime) NormalProposalWindow() (bool, int, int64) {
+	runtime.windowCalls++
+	return runtime.windowOpen, runtime.windowEntries, runtime.windowBytes
+}
 func (runtime *fakeRuntime) QuiesceSQLGeneration() error {
 	runtime.schemaQuiesceCalls++
 	if len(runtime.schemaQuiesceErrs) != 0 {
@@ -290,10 +302,27 @@ func (runtime *fakeRuntime) DriveReady(
 			return raftmember.DriveResult{}, err
 		}
 	}
+	if step.kind == raftmember.DriveCaptured {
+		captured := runtime.proposals[runtime.capturedProposalAt:]
+		if step.proposalCount == 0 {
+			step.proposalCount = len(captured)
+		}
+		if step.proposalBytes == 0 {
+			for _, proposal := range captured {
+				step.proposalBytes += int64(len(proposal))
+			}
+		}
+		for _, proposal := range captured {
+			runtime.capturedProposals = append(runtime.capturedProposals,
+				append([]byte(nil), proposal...))
+		}
+		runtime.capturedProposalAt = len(runtime.proposals)
+	}
 	runtime.ready[0] = fakeReady{}
 	runtime.ready = runtime.ready[1:]
 	return raftmember.DriveResult{
 		Kind: step.kind, ReadyID: 1, ReadOutcomes: step.readOutcomes,
+		ProposalCount: step.proposalCount, ProposalBytes: step.proposalBytes,
 	}, nil
 }
 
@@ -538,6 +567,193 @@ func TestHostQueueDetachesAndRotatesInputClasses(t *testing.T) {
 	}
 	if host.queueItems != 0 || host.queueBytes != 0 {
 		t.Fatalf("queue accounting after drain = %d, %d", host.queueItems, host.queueBytes)
+	}
+}
+
+func TestHostLateJoinsOneProposalBeforeCapturingReady(t *testing.T) {
+	host, err := NewHost(testHostLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := newFakeRuntime(31)
+	if err := host.addRuntime(runtime); err != nil {
+		t.Fatal(err)
+	}
+	group := runtime.identity.Group
+	if err := host.EnqueueProposal(group, []byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	progress, done, err := host.RunOne()
+	if err != nil || !done || progress.Kind != ProgressProposal || progress.ProposalCount != 1 {
+		t.Fatalf("first proposal turn = %+v, %v, %v", progress, done, err)
+	}
+	runtime.windowOpen = true
+	runtime.windowEntries = raftmodel.MaxProposalBatchEntries - 1
+	runtime.windowBytes = raftmodel.MaxProposalBatchBytes - 1
+	runtime.ready = []fakeReady{{kind: raftmember.DriveCaptured}}
+	driveCalls := runtime.driveCalls
+	if err := host.EnqueueProposal(group, []byte{2}); err != nil {
+		t.Fatal(err)
+	}
+	progress, done, err = host.RunOne()
+	if err != nil || !done || progress.Kind != ProgressProposal || !progress.LateJoinUsed ||
+		progress.LateJoinMissed || progress.LateJoinQueued != 1 || progress.LateJoinEntries != 1 ||
+		progress.ProposalCount != 1 || runtime.driveCalls != driveCalls {
+		t.Fatalf("late-join turn = %+v, %v, %v drive calls=%d want=%d", progress, done, err,
+			runtime.driveCalls, driveCalls)
+	}
+	if len(runtime.proposals) != 2 || runtime.proposals[0][0] != 1 || runtime.proposals[1][0] != 2 {
+		t.Fatalf("admitted proposals = %v", runtime.proposals)
+	}
+	// A third proposal stays queued: the marker forces the following Host turn
+	// to capture the current Ready instead of opening a second late join.
+	if err := host.EnqueueProposal(group, []byte{3}); err != nil {
+		t.Fatal(err)
+	}
+	progress, done, err = host.RunOne()
+	if err != nil || !done || progress.Kind != ProgressReady ||
+		progress.CapturedProposalCount != 2 || progress.CapturedProposalBytes != 2 ||
+		progress.LateJoinUsed || progress.LateJoinMissed || len(runtime.proposals) != 2 ||
+		len(runtime.capturedProposals) != 2 || runtime.capturedProposals[0][0] != 1 ||
+		runtime.capturedProposals[1][0] != 2 {
+		t.Fatalf("capture after one late join = %+v, %v, %v proposals=%v", progress, done, err,
+			runtime.proposals)
+	}
+}
+
+func TestHostLateJoinMarkerSurvivesRetainedLifecycleTurn(t *testing.T) {
+	host, err := NewHost(testHostLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := newFakeRuntime(36)
+	if err := host.addRuntime(runtime); err != nil {
+		t.Fatal(err)
+	}
+	group := runtime.identity.Group
+	if err := host.EnqueueProposal(group, []byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	if progress, done, err := host.RunOne(); err != nil || !done ||
+		progress.Kind != ProgressProposal {
+		t.Fatalf("first proposal turn = %+v, %v, %v", progress, done, err)
+	}
+	runtime.windowOpen = true
+	runtime.windowEntries = raftmodel.MaxProposalBatchEntries - 1
+	runtime.windowBytes = raftmodel.MaxProposalBatchBytes - 1
+	runtime.ready = []fakeReady{
+		{kind: raftmember.DriveMessage},
+		{kind: raftmember.DriveCaptured},
+	}
+	if err := host.EnqueueProposal(group, []byte{2}); err != nil {
+		t.Fatal(err)
+	}
+	if progress, done, err := host.RunOne(); err != nil || !done ||
+		progress.Kind != ProgressProposal || !progress.LateJoinUsed {
+		t.Fatalf("late-join turn = %+v, %v, %v", progress, done, err)
+	}
+	if err := host.EnqueueProposal(group, []byte{3}); err != nil {
+		t.Fatal(err)
+	}
+	progress, done, err := host.RunOne()
+	if err != nil || !done || progress.ReadyKind != raftmember.DriveMessage ||
+		progress.LateJoinUsed || progress.LateJoinMissed || len(runtime.proposals) != 2 ||
+		host.groups[group].proposals.len() != 1 {
+		t.Fatalf("retained lifecycle turn = %+v, %v, %v proposals=%v queued=%d", progress,
+			done, err, runtime.proposals, host.groups[group].proposals.len())
+	}
+	progress, done, err = host.RunOne()
+	if err != nil || !done || progress.ReadyKind != raftmember.DriveCaptured ||
+		progress.CapturedProposalCount != 2 || len(runtime.proposals) != 2 ||
+		host.groups[group].proposals.len() != 1 {
+		t.Fatalf("capture after retained lifecycle turn = %+v, %v, %v proposals=%v queued=%d",
+			progress, done, err, runtime.proposals, host.groups[group].proposals.len())
+	}
+}
+
+func TestHostLateJoinYieldsToNextInputClass(t *testing.T) {
+	controls := []struct {
+		name string
+		add  func(*Host, raftmember.GroupKey, uint64) error
+	}{
+		{name: "message", add: func(host *Host, group raftmember.GroupKey, memberID uint64) error {
+			return host.EnqueueMessage(group, hostMessage(99, memberID, "control"))
+		}},
+		{name: "tick", add: func(host *Host, group raftmember.GroupKey, _ uint64) error {
+			return host.RequestTick(group)
+		}},
+		{name: "campaign", add: func(host *Host, group raftmember.GroupKey, _ uint64) error {
+			return host.RequestCampaign(group)
+		}},
+	}
+	for _, control := range controls {
+		t.Run(control.name, func(t *testing.T) {
+			host, err := NewHost(testHostLimits())
+			if err != nil {
+				t.Fatal(err)
+			}
+			runtime := newFakeRuntime(byte(41 + len(control.name)))
+			if err := host.addRuntime(runtime); err != nil {
+				t.Fatal(err)
+			}
+			group := runtime.identity.Group
+			if err := host.EnqueueProposal(group, []byte{1}); err != nil {
+				t.Fatal(err)
+			}
+			if progress, done, err := host.RunOne(); err != nil || !done ||
+				progress.Kind != ProgressProposal {
+				t.Fatalf("first proposal turn = %+v, %v, %v", progress, done, err)
+			}
+			runtime.windowOpen = true
+			runtime.windowEntries = raftmodel.MaxProposalBatchEntries - 1
+			runtime.windowBytes = raftmodel.MaxProposalBatchBytes - 1
+			runtime.ready = []fakeReady{{kind: raftmember.DriveCaptured}}
+			if err := host.EnqueueProposal(group, []byte{2}); err != nil {
+				t.Fatal(err)
+			}
+			if err := control.add(host, group, runtime.identity.MemberID); err != nil {
+				t.Fatal(err)
+			}
+			progress, done, err := host.RunOne()
+			if err != nil || !done || progress.Kind != ProgressReady ||
+				!progress.LateJoinMissed || progress.LateJoinUsed || progress.LateJoinQueued != 1 ||
+				len(runtime.proposals) != 1 {
+				t.Fatalf("control capture = %+v, %v, %v proposals=%v", progress, done, err,
+					runtime.proposals)
+			}
+		})
+	}
+}
+
+func TestHostLateJoinOversizedProposalWaitsForCapture(t *testing.T) {
+	host, err := NewHost(testHostLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := newFakeRuntime(52)
+	if err := host.addRuntime(runtime); err != nil {
+		t.Fatal(err)
+	}
+	group := runtime.identity.Group
+	if err := host.EnqueueProposal(group, []byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	if progress, done, err := host.RunOne(); err != nil || !done ||
+		progress.Kind != ProgressProposal {
+		t.Fatalf("first proposal turn = %+v, %v, %v", progress, done, err)
+	}
+	runtime.windowOpen = true
+	runtime.windowEntries = raftmodel.MaxProposalBatchEntries - 1
+	runtime.windowBytes = 1
+	runtime.ready = []fakeReady{{kind: raftmember.DriveCaptured}}
+	if err := host.EnqueueProposal(group, []byte{2, 3}); err != nil {
+		t.Fatal(err)
+	}
+	progress, done, err := host.RunOne()
+	if err != nil || !done || progress.Kind != ProgressReady || !progress.LateJoinMissed ||
+		progress.LateJoinUsed || len(runtime.proposals) != 1 || host.groups[group].proposals.len() != 1 {
+		t.Fatalf("oversized late-join capture = %+v, %v, %v proposals=%v queued=%d",
+			progress, done, err, runtime.proposals, host.groups[group].proposals.len())
 	}
 }
 

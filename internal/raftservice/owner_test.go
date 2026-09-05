@@ -779,10 +779,48 @@ type proposalPrefixOwnerHost struct {
 	firstRunEntered chan struct{}
 	releaseFirstRun chan struct{}
 	queuedAtRun     chan int
+	firstRunDone    bool
 	runs            int
 	queued          int
 	status          raftmember.RuntimeStatus
 }
+
+type readyFenceOwnerHost struct {
+	ownerHost
+	firstRunEntered chan struct{}
+	releaseFirstRun chan struct{}
+	campaignRun     chan int
+	runs            int
+}
+
+func (host *readyFenceOwnerHost) RunOne() (multiraft.Progress, bool, error) {
+	host.runs++
+	switch host.runs {
+	case 1:
+		close(host.firstRunEntered)
+		<-host.releaseFirstRun
+		return multiraft.Progress{Kind: multiraft.ProgressProposal}, true, nil
+	case 2:
+		return multiraft.Progress{Kind: multiraft.ProgressReady,
+			ReadyKind: raftmember.DriveCaptured}, true, nil
+	case 3:
+		return multiraft.Progress{Kind: multiraft.ProgressReady,
+			ReadyKind: raftmember.DrivePersisted}, true, nil
+	default:
+		return multiraft.Progress{}, false, nil
+	}
+}
+
+func (host *readyFenceOwnerHost) RequestCampaign(raftmember.GroupKey) error {
+	host.campaignRun <- host.runs
+	return nil
+}
+
+func (host *readyFenceOwnerHost) PopOutbound() (raftmember.OutboundMessage, bool) {
+	return raftmember.OutboundMessage{}, false
+}
+
+func (host *readyFenceOwnerHost) Close() error { return nil }
 
 type deferredReadOwnerHost struct {
 	ownerHost
@@ -1246,7 +1284,11 @@ func (host *proposalPrefixOwnerHost) RunOne() (multiraft.Progress, bool, error) 
 	} else if host.runs == 2 {
 		host.queuedAtRun <- host.queued
 	}
-	return multiraft.Progress{}, false, nil
+	progress := multiraft.Progress{}
+	if host.runs == 1 && host.firstRunDone {
+		progress.Kind = multiraft.ProgressProposal
+	}
+	return progress, host.runs == 1 && host.firstRunDone, nil
 }
 
 func (host *proposalPrefixOwnerHost) PopOutbound() (raftmember.OutboundMessage, bool) {
@@ -1358,6 +1400,117 @@ func TestOwnerQueuesSameGroupPrefixBeforeNextHostRunOne(t *testing.T) {
 			t.Fatal(result.err)
 		}
 		result.waiter.Cancel()
+	}
+	cancel()
+	if err := <-runDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("owner shutdown=%v", err)
+	}
+	if owner.ingressItems != 0 || owner.ingressBytes != 0 {
+		t.Fatalf("ingress accounting after shutdown=%d/%d", owner.ingressItems, owner.ingressBytes)
+	}
+}
+
+func TestOwnerAdmitsBoundedIngressBetweenSuccessfulHostTurns(t *testing.T) {
+	registry, err := raftserve.NewRegistry(raftserve.Limits{
+		MaxGroups: 1, MaxOutstandingIdentities: 3,
+		MaxOutstandingAttempts: 3, MaxWaiters: 3,
+		MaxAttemptsPerIdentity:     1,
+		MaxRetainedCompletionBytes: 3 * int64(replicatedstate.MaxCompletionEnvelopeBytes),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer registry.Close()
+
+	group := peerServerTestGroup()
+	identity := raftmember.RuntimeIdentity{Group: group, AllocationGeneration: 1,
+		MemberID: 1, StoreID: [16]byte{1}, NodeIncarnation: 1,
+		RelationManifestDigest: [32]byte{1}}
+	command := CommandFence{ReplicaSetVersion: 1, ActivePolicyGeneration: 1,
+		ProtectionEpoch: 1, OwnershipEpoch: 1, SchemaGeneration: 1,
+		RelationManifestDigest: [32]byte{1}, RoutingVersion: 1, RouteGeneration: 1}
+	host := &proposalPrefixOwnerHost{
+		firstRunEntered: make(chan struct{}), releaseFirstRun: make(chan struct{}),
+		queuedAtRun: make(chan int, 1), firstRunDone: true,
+		status: raftmember.RuntimeStatus{MemberID: 1, LeaderID: 1, Term: 2},
+	}
+	owner := &Owner{
+		registry: registry, host: host, groups: []raftmember.GroupKey{group},
+		members: map[raftmember.GroupKey]ownerMember{group: {
+			identity: identity, command: command, generation: &ownerGeneration{},
+		}},
+		limits:  Limits{MaxIngressItems: 4, MaxIngressBytes: 1 << 20},
+		ingress: make(chan ownerRequest, 4), ready: make(chan struct{}), done: make(chan struct{}),
+		pendingReads: make(map[[16]byte]*readDelivery),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- owner.Run(ctx) }()
+	<-owner.ready
+	<-host.firstRunEntered
+
+	replies := [3]chan ownerReply{make(chan ownerReply, 1), make(chan ownerReply, 1), make(chan ownerReply, 1)}
+	for index := range replies {
+		data := proposalPrefixCommand(t, group, uint64(index+1))
+		if err := owner.publish(ownerRequest{
+			kind: requestProposal, group: group,
+			fence: ServingFence{Group: group, AllocationGeneration: 1, Command: command,
+				MemberID: 1, StoreID: [16]byte{1}, NodeIncarnation: 1, Term: 2},
+			data: data, reply: replies[index], bytes: int64(len(data)), delivery: &proposalDelivery{},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	close(host.releaseFirstRun)
+	if queued := <-host.queuedAtRun; queued != len(replies) {
+		t.Fatalf("next Host turn saw %d admitted proposals, want %d", queued, len(replies))
+	}
+	for _, reply := range replies {
+		result := <-reply
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		result.waiter.Cancel()
+	}
+	cancel()
+	if err := <-runDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("owner shutdown=%v", err)
+	}
+	if host.runs != 2 {
+		t.Fatalf("Host turns before cancellation=%d, want 2", host.runs)
+	}
+	if owner.ingressItems != 0 || owner.ingressBytes != 0 {
+		t.Fatalf("ingress accounting after shutdown=%d/%d", owner.ingressItems, owner.ingressBytes)
+	}
+}
+
+func TestOwnerRetainsControlBarrierUntilReadyIsDrained(t *testing.T) {
+	host := &readyFenceOwnerHost{
+		firstRunEntered: make(chan struct{}), releaseFirstRun: make(chan struct{}),
+		campaignRun: make(chan int, 1),
+	}
+	owner := &Owner{
+		host:    host,
+		limits:  Limits{MaxIngressItems: 1, MaxIngressBytes: 1},
+		ingress: make(chan ownerRequest, 1), ready: make(chan struct{}), done: make(chan struct{}),
+		pendingReads: make(map[[16]byte]*readDelivery),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- owner.Run(ctx) }()
+	<-owner.ready
+	<-host.firstRunEntered
+	campaignReply := make(chan ownerReply, 1)
+	if err := owner.publish(ownerRequest{kind: requestCampaign,
+		group: raftmember.GroupKey{GroupID: [16]byte{1}}, reply: campaignReply}); err != nil {
+		t.Fatal(err)
+	}
+	close(host.releaseFirstRun)
+	if run := <-host.campaignRun; run != 4 {
+		t.Fatalf("campaign ran after Host turn %d, want idle probe after capture and persist", run)
+	}
+	if reply := <-campaignReply; reply.err != nil {
+		t.Fatal(reply.err)
 	}
 	cancel()
 	if err := <-runDone; !errors.Is(err, context.Canceled) {

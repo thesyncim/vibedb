@@ -403,6 +403,11 @@ type DriveResult struct {
 	ReadyID      uint64
 	ReadOutcomes []raftmodel.ReadOutcome
 	Applied      AppliedBatch
+	// ProposalCount and ProposalBytes report the normal proposals admitted
+	// into the Ready captured by this result. They are detached diagnostics;
+	// they are zero for every non-capture step.
+	ProposalCount int
+	ProposalBytes int64
 }
 
 // RuntimeStatus is a detached allocation-free control-plane view. It is
@@ -896,6 +901,29 @@ func (runtime *Runtime) requireEmptyInputWindow() error {
 	return nil
 }
 
+// NormalProposalWindow reports the remaining capacity in the current
+// uncaptured normal-proposal batch. It is a read-only owner-lane query: the
+// caller must still serialize any subsequent proposal admission and Ready
+// capture through Runtime. Open is true only while the Runtime is idle, has
+// admitted at least one normal proposal, and both coalescing bounds retain
+// room for another entry.
+func (runtime *Runtime) NormalProposalWindow() (open bool, remainingEntries int, remainingBytes int64) {
+	if runtime == nil || runtime.closed || runtime.stopping || runtime.failure != nil ||
+		runtime.node == nil || runtime.node.Phase() != raftmodel.PhaseIdle ||
+		runtime.proposalBatchEntries <= 0 {
+		return false, 0, 0
+	}
+	remainingEntries = raftmodel.MaxProposalBatchEntries - runtime.proposalBatchEntries
+	remainingBytes = raftmodel.MaxProposalBatchBytes - runtime.proposalBatchBytes
+	if remainingEntries < 0 {
+		remainingEntries = 0
+	}
+	if remainingBytes < 0 {
+		remainingBytes = 0
+	}
+	return remainingEntries > 0 && remainingBytes > 0, remainingEntries, remainingBytes
+}
+
 // Propose admits one already-encoded replicated command. Consecutive normal
 // proposals may share one bounded uncaptured Ready window. The first proposal
 // reserves worst-case WAL headroom; later proposals are admitted only while
@@ -1321,6 +1349,8 @@ func (runtime *Runtime) DriveReady(
 	}
 	switch runtime.node.Phase() {
 	case raftmodel.PhaseIdle:
+		proposalCount := runtime.proposalBatchEntries
+		proposalBytes := runtime.proposalBatchBytes
 		captured, err := runtime.node.CaptureReady()
 		if err != nil || !captured {
 			if err == nil && runtime.proposalBatchEntries != 0 {
@@ -1339,7 +1369,8 @@ func (runtime *Runtime) DriveReady(
 				Feature: "in-band Ready snapshots in the immutable-base WAL kernel",
 			})
 		}
-		return DriveResult{Kind: DriveCaptured, ReadyID: progress.ReadyID}, nil
+		return DriveResult{Kind: DriveCaptured, ReadyID: progress.ReadyID,
+			ProposalCount: proposalCount, ProposalBytes: proposalBytes}, nil
 
 	case raftmodel.PhaseCaptured:
 		readyID := runtime.node.ReadyID()
