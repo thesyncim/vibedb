@@ -388,11 +388,11 @@ func ddlSendWireCancelRequest(
 	binary.BigEndian.PutUint32(packet[4:8], codeCancelRequest)
 	binary.BigEndian.PutUint32(packet[8:12], uint32(pid))
 	binary.BigEndian.PutUint32(packet[12:16], uint32(secret))
-	if _, err := client.Write(packet[:]); err != nil {
-		t.Fatalf("write CancelRequest packet: %v", err)
-	}
 	if err := client.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		t.Fatalf("set CancelRequest read deadline: %v", err)
+	}
+	if _, err := client.Write(packet[:]); err != nil {
+		t.Fatalf("write CancelRequest packet: %v", err)
 	}
 	var response [1]byte
 	n, readErr := client.Read(response[:])
