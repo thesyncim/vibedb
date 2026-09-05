@@ -1,0 +1,5 @@
+--- FAIL: TestNodeCoordinatesDoNotWaitForInflightDurability (1.12s)
+    node_coordinates_regression_test.go:78: Raft coordinates blocked behind another group's data sync
+FAIL
+FAIL	github.com/thesyncim/vibedb/internal/raftstore	1.461s
+FAIL

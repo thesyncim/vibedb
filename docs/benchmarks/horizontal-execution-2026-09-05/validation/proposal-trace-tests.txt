@@ -1,0 +1,2 @@
+ok  	github.com/thesyncim/vibedb/internal/raftservice	0.542s
+ok  	github.com/thesyncim/vibedb/gateway	1.071s

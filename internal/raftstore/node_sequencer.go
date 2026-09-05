@@ -1,7 +1,10 @@
 package raftstore
 
 import (
+	"context"
 	"errors"
+	"runtime"
+	"runtime/trace"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -64,6 +67,7 @@ type Submission struct {
 	ticket   atomic.Uint64
 	err      error
 	done     chan struct{}
+	wake     atomic.Pointer[nodeSequencerWake]
 }
 
 // Initialize allocates the cold-path wait edge. The Submission itself remains
@@ -588,6 +592,7 @@ type NodeSubmissionSequencer struct {
 	wakeMu           sync.Mutex
 	ownerWakes       atomic.Pointer[nodeSequencerWakeSet]
 	maintenanceOwner atomic.Bool
+	capacityWaiters  atomic.Bool
 	stats            nodeSequencerCounters
 
 	persist func([]NodeReady) error
@@ -772,7 +777,8 @@ func (q *NodeSubmissionSequencer) ReleaseMaintenanceLane() {
 
 // SetWakeFor registers the execution owner of one caller-reserved submission
 // cell. Registration is cold-path and publishes one immutable callback vector;
-// durability completion only performs an atomic load and bounded iteration.
+// ordinary completion loads only that cell's callback. The vector is retained
+// for capacity-pressure and fatal-failure broadcasts.
 // Passing nil removes owner without disturbing any other execution lane.
 func (q *NodeSubmissionSequencer) SetWakeFor(owner *Submission, wake func()) {
 	if q == nil || owner == nil {
@@ -780,6 +786,11 @@ func (q *NodeSubmissionSequencer) SetWakeFor(owner *Submission, wake func()) {
 	}
 	q.wakeMu.Lock()
 	defer q.wakeMu.Unlock()
+	if wake == nil {
+		owner.wake.Store(nil)
+	} else {
+		owner.wake.Store(&nodeSequencerWake{owner: owner, fn: wake})
+	}
 	current := q.ownerWakes.Load()
 	count := 0
 	if current != nil {
@@ -931,6 +942,11 @@ func (q *NodeSubmissionSequencer) rejectSubmission(err error) (uint64, error) {
 	q.stats.rejectedSubmissions.Add(1)
 	if errors.Is(err, ErrSubmissionBackpressure) {
 		q.stats.backpressureSubmissions.Add(1)
+		// A refused cell has no completion of its own. Preserve the capacity
+		// retry edge for every registered owner, including a rejection racing
+		// with the worker's last completion or an idle ring.
+		q.capacityWaiters.Store(true)
+		q.signal()
 	}
 	return 0, err
 }
@@ -1050,6 +1066,7 @@ func submissionGroupSeen(items *[MaxPersistGroupBatches]*Submission, count int, 
 }
 
 func (q *NodeSubmissionSequencer) complete(s *Submission, err error) {
+	wake := s.wake.Load()
 	s.err = err
 	previous := s.state.Swap(submissionComplete)
 	if q.completeHookTest != nil {
@@ -1061,6 +1078,11 @@ func (q *NodeSubmissionSequencer) complete(s *Submission, err error) {
 		// Submission reuse. If completion displaced Queued, Wait observes
 		// Complete directly and no notification is needed.
 		s.done <- struct{}{}
+	}
+	// Capture the callback before publishing completion: the owner can reuse
+	// or unregister this cell as soon as Complete becomes visible.
+	if wake != nil && wake.fn != nil {
+		wake.fn()
 	}
 }
 
@@ -1081,6 +1103,26 @@ func (q *NodeSubmissionSequencer) runWave(items *[MaxPersistGroupBatches]*Submis
 			at--
 		}
 		ready[at] = value
+	}
+	if trace.IsEnabled() {
+		// Trace-only classification preserves the normal durability policy. A
+		// metadata wave still goes through the same synchronous persistence.
+		name := "raft.persist.metadata"
+		logical, entries := 0, 0
+		for i := 0; i < count; i++ {
+			for j := 0; j < nodeReadySeriesCount(ready[i]); j++ {
+				batch := nodeReadySeriesBatch(&ready[i], j)
+				logical++
+				entries += len(batch.Entries)
+				if batch.MustSync || len(batch.Entries) != 0 || !canonicalEmptySnapshot(batch.Snapshot) {
+					name = "raft.persist.required"
+				}
+			}
+		}
+		ctx := context.Background()
+		region := trace.StartRegion(ctx, name)
+		defer region.End()
+		trace.Logf(ctx, "raft.persist.wave", "groups=%d logical=%d entries=%d", count, logical, entries)
 	}
 	for {
 		err = q.observeReadyPersist(ready[:count])
@@ -1187,9 +1229,18 @@ func (q *NodeSubmissionSequencer) run() {
 	var ready [MaxPersistGroupBatches]NodeReady
 	for {
 		count := 0
+		yielded := false
 		var admission nodeWaveAdmission
 		for count < len(items) {
 			s, ok := q.peek()
+			if !ok && count == 1 && items[0].kind == submissionReady && !yielded {
+				// A just-completed wave wakes multiple independent owners. Give their
+				// already-runnable work one scheduler turn before freezing a singleton
+				// wave; never wait on a timer, missing group, or new arrival.
+				yielded = true
+				runtime.Gosched()
+				continue
+			}
 			if !ok || count > 0 && (items[0].kind != submissionReady || s.kind != submissionReady) ||
 				s.kind == submissionReady && submissionGroupSeen(&items, count, s.nodeReadyGroup()) {
 				break
@@ -1215,6 +1266,9 @@ func (q *NodeSubmissionSequencer) run() {
 			count++
 		}
 		if count == 0 {
+			if q.capacityWaiters.Swap(false) {
+				q.notifyOwner()
+			}
 			if q.closed.Load() && q.head.value.Load() == q.tail.value.Load() {
 				return
 			}
@@ -1249,7 +1303,9 @@ func (q *NodeSubmissionSequencer) run() {
 			q.complete(items[i], completionErr)
 			items[i] = nil
 		}
-		q.notifyOwner()
+		if q.capacityWaiters.Swap(false) {
+			q.notifyOwner()
+		}
 		if fatal {
 			failure := &sequencerFailure{err: completionErr}
 			q.fatal.CompareAndSwap(nil, failure)

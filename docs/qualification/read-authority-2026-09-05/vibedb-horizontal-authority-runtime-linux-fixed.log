@@ -1,0 +1,42 @@
+=== RUN   TestRuntimeReadAuthorityFollowerPromiseGatesElectionEdgesUntilExpiry
+=== RUN   TestRuntimeReadAuthorityFollowerPromiseGatesElectionEdgesUntilExpiry/tick
+=== RUN   TestRuntimeReadAuthorityFollowerPromiseGatesElectionEdgesUntilExpiry/campaign
+=== RUN   TestRuntimeReadAuthorityFollowerPromiseGatesElectionEdgesUntilExpiry/vote
+=== RUN   TestRuntimeReadAuthorityFollowerPromiseGatesElectionEdgesUntilExpiry/pre-vote
+=== RUN   TestRuntimeReadAuthorityFollowerPromiseGatesElectionEdgesUntilExpiry/timeout-now
+--- PASS: TestRuntimeReadAuthorityFollowerPromiseGatesElectionEdgesUntilExpiry (0.60s)
+    --- PASS: TestRuntimeReadAuthorityFollowerPromiseGatesElectionEdgesUntilExpiry/tick (0.00s)
+    --- PASS: TestRuntimeReadAuthorityFollowerPromiseGatesElectionEdgesUntilExpiry/campaign (0.00s)
+    --- PASS: TestRuntimeReadAuthorityFollowerPromiseGatesElectionEdgesUntilExpiry/vote (0.00s)
+    --- PASS: TestRuntimeReadAuthorityFollowerPromiseGatesElectionEdgesUntilExpiry/pre-vote (0.00s)
+    --- PASS: TestRuntimeReadAuthorityFollowerPromiseGatesElectionEdgesUntilExpiry/timeout-now (0.00s)
+=== RUN   TestRuntimeReadAuthorityLeaderPromiseAllowsTickButBlocksTransfer
+--- PASS: TestRuntimeReadAuthorityLeaderPromiseAllowsTickButBlocksTransfer (0.66s)
+=== RUN   TestRuntimeReadAuthorityClockFaultFailsClosedAfterGrant
+=== RUN   TestRuntimeReadAuthorityClockFaultFailsClosedAfterGrant/tick
+=== RUN   TestRuntimeReadAuthorityClockFaultFailsClosedAfterGrant/campaign
+--- PASS: TestRuntimeReadAuthorityClockFaultFailsClosedAfterGrant (0.59s)
+    --- PASS: TestRuntimeReadAuthorityClockFaultFailsClosedAfterGrant/tick (0.00s)
+    --- PASS: TestRuntimeReadAuthorityClockFaultFailsClosedAfterGrant/campaign (0.00s)
+=== RUN   TestRuntimeReadAuthorityRequiresIndependentLeaderIncarnation
+--- PASS: TestRuntimeReadAuthorityRequiresIndependentLeaderIncarnation (1.32s)
+=== RUN   TestRuntimeReadAuthorityRoundInvalidatesOnTermAndConfigChange
+=== RUN   TestRuntimeReadAuthorityRoundInvalidatesOnTermAndConfigChange/term
+=== RUN   TestRuntimeReadAuthorityRoundInvalidatesOnTermAndConfigChange/configuration
+--- PASS: TestRuntimeReadAuthorityRoundInvalidatesOnTermAndConfigChange (1.35s)
+    --- PASS: TestRuntimeReadAuthorityRoundInvalidatesOnTermAndConfigChange/term (0.75s)
+    --- PASS: TestRuntimeReadAuthorityRoundInvalidatesOnTermAndConfigChange/configuration (0.60s)
+=== RUN   TestRuntimeReadAuthorityPolicyChecksAndDisableReenableSafety
+=== RUN   TestRuntimeReadAuthorityPolicyChecksAndDisableReenableSafety/applied-voter-set-and-disabled-fallback
+=== RUN   TestRuntimeReadAuthorityPolicyChecksAndDisableReenableSafety/disable-reenable-enters-fresh-quarantine
+    read_authority_test.go:474: reenable authority: raftmember: read authority reconfiguration refused
+=== RUN   TestRuntimeReadAuthorityPolicyChecksAndDisableReenableSafety/disabled-clock-fault-remains-closed
+=== RUN   TestRuntimeReadAuthorityPolicyChecksAndDisableReenableSafety/disabled-clock-fault-remains-closed/tick
+=== RUN   TestRuntimeReadAuthorityPolicyChecksAndDisableReenableSafety/disabled-clock-fault-remains-closed/campaign
+--- FAIL: TestRuntimeReadAuthorityPolicyChecksAndDisableReenableSafety (2.16s)
+    --- PASS: TestRuntimeReadAuthorityPolicyChecksAndDisableReenableSafety/applied-voter-set-and-disabled-fallback (0.73s)
+    --- FAIL: TestRuntimeReadAuthorityPolicyChecksAndDisableReenableSafety/disable-reenable-enters-fresh-quarantine (0.60s)
+    --- PASS: TestRuntimeReadAuthorityPolicyChecksAndDisableReenableSafety/disabled-clock-fault-remains-closed (0.83s)
+        --- PASS: TestRuntimeReadAuthorityPolicyChecksAndDisableReenableSafety/disabled-clock-fault-remains-closed/tick (0.00s)
+        --- PASS: TestRuntimeReadAuthorityPolicyChecksAndDisableReenableSafety/disabled-clock-fault-remains-closed/campaign (0.00s)
+FAIL

@@ -1,0 +1,41 @@
+=== RUN   TestRuntimeReadAuthorityFollowerPromiseGatesElectionEdgesUntilExpiry
+=== RUN   TestRuntimeReadAuthorityFollowerPromiseGatesElectionEdgesUntilExpiry/tick
+=== RUN   TestRuntimeReadAuthorityFollowerPromiseGatesElectionEdgesUntilExpiry/campaign
+=== RUN   TestRuntimeReadAuthorityFollowerPromiseGatesElectionEdgesUntilExpiry/vote
+=== RUN   TestRuntimeReadAuthorityFollowerPromiseGatesElectionEdgesUntilExpiry/pre-vote
+=== RUN   TestRuntimeReadAuthorityFollowerPromiseGatesElectionEdgesUntilExpiry/timeout-now
+--- PASS: TestRuntimeReadAuthorityFollowerPromiseGatesElectionEdgesUntilExpiry (0.04s)
+    --- PASS: TestRuntimeReadAuthorityFollowerPromiseGatesElectionEdgesUntilExpiry/tick (0.00s)
+    --- PASS: TestRuntimeReadAuthorityFollowerPromiseGatesElectionEdgesUntilExpiry/campaign (0.00s)
+    --- PASS: TestRuntimeReadAuthorityFollowerPromiseGatesElectionEdgesUntilExpiry/vote (0.00s)
+    --- PASS: TestRuntimeReadAuthorityFollowerPromiseGatesElectionEdgesUntilExpiry/pre-vote (0.00s)
+    --- PASS: TestRuntimeReadAuthorityFollowerPromiseGatesElectionEdgesUntilExpiry/timeout-now (0.00s)
+=== RUN   TestRuntimeReadAuthorityLeaderPromiseAllowsTickButBlocksTransfer
+--- PASS: TestRuntimeReadAuthorityLeaderPromiseAllowsTickButBlocksTransfer (0.04s)
+=== RUN   TestRuntimeReadAuthorityClockFaultFailsClosedAfterGrant
+=== RUN   TestRuntimeReadAuthorityClockFaultFailsClosedAfterGrant/tick
+=== RUN   TestRuntimeReadAuthorityClockFaultFailsClosedAfterGrant/campaign
+--- PASS: TestRuntimeReadAuthorityClockFaultFailsClosedAfterGrant (0.03s)
+    --- PASS: TestRuntimeReadAuthorityClockFaultFailsClosedAfterGrant/tick (0.00s)
+    --- PASS: TestRuntimeReadAuthorityClockFaultFailsClosedAfterGrant/campaign (0.00s)
+=== RUN   TestRuntimeReadAuthorityRequiresIndependentLeaderIncarnation
+--- PASS: TestRuntimeReadAuthorityRequiresIndependentLeaderIncarnation (0.06s)
+=== RUN   TestRuntimeReadAuthorityRoundInvalidatesOnTermAndConfigChange
+=== RUN   TestRuntimeReadAuthorityRoundInvalidatesOnTermAndConfigChange/term
+=== RUN   TestRuntimeReadAuthorityRoundInvalidatesOnTermAndConfigChange/configuration
+--- PASS: TestRuntimeReadAuthorityRoundInvalidatesOnTermAndConfigChange (0.07s)
+    --- PASS: TestRuntimeReadAuthorityRoundInvalidatesOnTermAndConfigChange/term (0.04s)
+    --- PASS: TestRuntimeReadAuthorityRoundInvalidatesOnTermAndConfigChange/configuration (0.03s)
+=== RUN   TestRuntimeReadAuthorityPolicyChecksAndDisableReenableSafety
+=== RUN   TestRuntimeReadAuthorityPolicyChecksAndDisableReenableSafety/applied-voter-set-and-disabled-fallback
+=== RUN   TestRuntimeReadAuthorityPolicyChecksAndDisableReenableSafety/disable-reenable-preserves-immutable-policy
+=== RUN   TestRuntimeReadAuthorityPolicyChecksAndDisableReenableSafety/disabled-clock-fault-remains-closed
+=== RUN   TestRuntimeReadAuthorityPolicyChecksAndDisableReenableSafety/disabled-clock-fault-remains-closed/tick
+=== RUN   TestRuntimeReadAuthorityPolicyChecksAndDisableReenableSafety/disabled-clock-fault-remains-closed/campaign
+--- PASS: TestRuntimeReadAuthorityPolicyChecksAndDisableReenableSafety (0.09s)
+    --- PASS: TestRuntimeReadAuthorityPolicyChecksAndDisableReenableSafety/applied-voter-set-and-disabled-fallback (0.03s)
+    --- PASS: TestRuntimeReadAuthorityPolicyChecksAndDisableReenableSafety/disable-reenable-preserves-immutable-policy (0.03s)
+    --- PASS: TestRuntimeReadAuthorityPolicyChecksAndDisableReenableSafety/disabled-clock-fault-remains-closed (0.03s)
+        --- PASS: TestRuntimeReadAuthorityPolicyChecksAndDisableReenableSafety/disabled-clock-fault-remains-closed/tick (0.00s)
+        --- PASS: TestRuntimeReadAuthorityPolicyChecksAndDisableReenableSafety/disabled-clock-fault-remains-closed/campaign (0.00s)
+PASS

@@ -183,6 +183,9 @@ func (n *Node) BeginPipelinedApply(taskID uint64, entries []*pb.Entry) error {
 	n.ready = raft.Ready{CommittedEntries: entries}
 	n.readyID = taskID
 	n.entryPos = 0
+	if hasConfigurationEntry(entries) {
+		n.pendingConfChange = true
+	}
 	n.phase = PhaseSnapshotInstalled
 	return nil
 }

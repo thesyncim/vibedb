@@ -1,0 +1,5 @@
+--- FAIL: TestNodeEntryCacheReadsDuringUnrelatedSyncAndOwnsPayload (1.31s)
+    node_entry_cache_regression_test.go:48: committed entry retrieval blocked behind unrelated sync
+FAIL
+FAIL	github.com/thesyncim/vibedb/internal/raftstore	1.664s
+FAIL

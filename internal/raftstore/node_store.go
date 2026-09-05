@@ -115,6 +115,14 @@ const (
 )
 
 type NodeStore struct {
+	commitHints                               map[uint64]nodeCommitHint
+	pendingEntryPayloads                      [MaxPersistGroupBatches][nodeRecentTerms]nodeTermCoordinate
+	entryCacheArena                           []byte
+	entryCacheGenerations                     [nodeEntryCacheSlots]uint64
+	entryCacheGeneration                      uint64
+	coordinateMu                              sync.RWMutex
+	coordinates                               map[uint64]nodeLogCoordinates
+	coordinateFailure                         atomic.Pointer[nodeCoordinateFailure]
 	mu                                        sync.Mutex
 	catalogMu                                 sync.Mutex
 	maintenance                               sync.WaitGroup
@@ -726,12 +734,15 @@ func (s *NodeStore) publishGroupCheckpointSequenced(group uint64, snapshot *pb.S
 		return ErrClosed
 	}
 	if err := s.proveNamespace(); err != nil {
-		s.poisoned = err
+		s.poisonLocked(err)
 		return errors.Join(ErrPersistenceUnknown, err)
 	}
 	descriptor, registered := s.descriptorForLogKey(group)
 	if !registered || validateSnapshotBase(snapshot, descriptor.MemberID) != nil {
 		return ErrInvalid
+	}
+	if err := s.flushCommitHintsLocked([]uint64{group}); err != nil {
+		return err
 	}
 	metadata, ok := s.engine.Metadata(group)
 	if !ok {
@@ -788,7 +799,7 @@ func (s *NodeStore) publishGroupCheckpointSequenced(group uint64, snapshot *pb.S
 	}
 	if err != nil {
 		if fatal := s.engine.FatalError(); fatal != nil {
-			s.poisoned = fatal
+			s.poisonLocked(fatal)
 			return errors.Join(ErrPersistenceUnknown, err, fatal)
 		}
 		if errors.Is(err, seglog.ErrBackpressure) {
@@ -797,9 +808,10 @@ func (s *NodeStore) publishGroupCheckpointSequenced(group uint64, snapshot *pb.S
 		return errors.Join(ErrInvalid, err)
 	}
 	if err = s.proveNamespace(); err != nil {
-		s.poisoned = err
+		s.poisonLocked(err)
 		return errors.Join(ErrPersistenceUnknown, err)
 	}
+	s.publishCoordinatesLocked(group, nil, nil)
 	s.cacheValid = false
 	return nil
 }
@@ -1093,6 +1105,9 @@ func (s *NodeStore) preflightReadyItem(item *NodeReady) (raftmodel.PersistBatch,
 	if !ok || batch.NodeIncarnation == 0 || batch.NodeIncarnation != state.NodeIncarnation {
 		return raftmodel.PersistBatch{}, seglog.GroupSummary{}, [16]byte{}, false, ErrInvalid
 	}
+	if hint, exists := s.commitHints[item.GroupID]; exists {
+		state.ReadyID, state.ReadyDigest = hint.readyID, hint.digest
+	}
 	if batch.ReadyID == state.ReadyID {
 		if digest != state.ReadyDigest {
 			return raftmodel.PersistBatch{}, seglog.GroupSummary{}, [16]byte{}, false, ErrRetryConflict
@@ -1103,8 +1118,13 @@ func (s *NodeStore) preflightReadyItem(item *NodeReady) (raftmodel.PersistBatch,
 	if !metadataOK {
 		return raftmodel.PersistBatch{}, seglog.GroupSummary{}, [16]byte{}, false, ErrInvalid
 	}
-	if item.seriesCount != 0 {
-		if err := validateReadySeriesTransitions(state, metadata, item.series[:item.seriesCount]); err != nil {
+	metadata = s.liveNodeMetadata(item.GroupID, metadata)
+	if canonicalEmptySnapshot(batch.Snapshot) {
+		series := item.series[:item.seriesCount]
+		if item.seriesCount == 0 {
+			series = []raftmodel.PersistBatch{item.Batch}
+		}
+		if err := validateReadySeriesTransitions(state, metadata, series); err != nil {
 			return raftmodel.PersistBatch{}, seglog.GroupSummary{}, [16]byte{}, false, err
 		}
 	}
@@ -1141,8 +1161,12 @@ func (s *NodeStore) persistWave(ready []NodeReady, sequenced bool) error {
 	if s.poisoned != nil {
 		return errors.Join(ErrPersistenceUnknown, s.poisoned)
 	}
+	if err := s.engine.PublishedFailure(); err != nil {
+		s.poisonLocked(err)
+		return errors.Join(ErrPersistenceUnknown, err)
+	}
 	if err := s.proveNamespace(); err != nil {
-		s.poisoned = err
+		s.poisonLocked(err)
 		return err
 	}
 	if len(ready) == 0 || len(ready) > MaxPersistGroupBatches {
@@ -1186,6 +1210,31 @@ func (s *NodeStore) persistWave(ready []NodeReady, sequenced bool) error {
 	if totalPlain > cap(s.plainArena) || totalEntries > cap(s.pageRefs) || totalEntries > (cap(s.cipherArena)-totalPlain)/s.crypto.aead.Overhead() {
 		return ErrBounds
 	}
+	// A large caller series may not fit beside earlier volatile Readies in one
+	// bounded on-disk span. Flush only previously acknowledged hints, after the
+	// entire incoming wave has passed preflight.
+	var overflowGroups [MaxPersistGroupBatches]uint64
+	overflowCount := 0
+	for i := range ready {
+		last := nodeReadySeriesBatch(&ready[i], nodeReadySeriesCount(ready[i])-1)
+		if last.ReadyID == states[i].ReadyID {
+			continue
+		} // exact retries never flush a pending span
+		if hint, ok := s.commitHints[ready[i].GroupID]; ok {
+			durable, _ := s.engine.Summary(ready[i].GroupID)
+			if hint.readyID-durable.ReadyID+uint64(nodeReadySeriesCount(ready[i])) > seglog.MaximumReadySpan {
+				overflowGroups[overflowCount] = ready[i].GroupID
+				overflowCount++
+			}
+		}
+	}
+	if overflowCount != 0 {
+		if err := s.flushCommitHintsLocked(overflowGroups[:overflowCount]); err != nil {
+			return err
+		}
+	}
+	var deferred [MaxPersistGroupBatches]nodeCommitHint
+	var deferGroup [MaxPersistGroupBatches]bool
 	s.plainArena = s.plainArena[:totalPlain]
 	s.cipherArena = s.cipherArena[:0]
 	plainOffset, entryOffset, mappedCount := 0, 0, 0
@@ -1197,6 +1246,19 @@ func (s *NodeStore) persistWave(ready []NodeReady, sequenced bool) error {
 		}
 		state, retryDigest := states[i], digests[i]
 		if batch.NodeIncarnation == state.NodeIncarnation && batch.ReadyID == state.ReadyID {
+			continue
+		}
+		durable, _ := s.engine.Summary(item.GroupID)
+		metadata, _ := s.engine.Metadata(item.GroupID)
+		metadata = s.liveNodeMetadata(item.GroupID, metadata)
+		span := batch.ReadyID - durable.ReadyID
+		if nodeHintEligible(batch, metadata.Hard) && span < seglog.MaximumReadySpan {
+			hard := metadata.Hard
+			if !isEmptyHardState(batch.HardState) {
+				hard = seglog.HardState{Term: batch.HardState.GetTerm(), Vote: batch.HardState.GetVote(), Commit: batch.HardState.GetCommit()}
+			}
+			deferred[i] = nodeCommitHint{incarnation: batch.NodeIncarnation, readyID: batch.ReadyID, digest: retryDigest, hard: hard}
+			deferGroup[i] = true
 			continue
 		}
 		if len(batch.Entries) > len(s.waveEntryArena)-entryOffset {
@@ -1211,14 +1273,18 @@ func (s *NodeStore) persistWave(ready []NodeReady, sequenced bool) error {
 		}
 		entryOffset += len(entries)
 		mapped := seglog.ReadyBatch{GroupID: item.GroupID, NodeIncarnation: batch.NodeIncarnation, ReadyID: batch.ReadyID, ReadyDigest: retryDigest, Entries: entries}
-		if item.seriesCount != 0 {
-			mapped.ReadySpan = uint64(item.seriesCount)
+		if span > 1 {
+			mapped.ReadySpan = span
 		}
 		if len(entries) > 0 && entries[0].Index <= state.LastIndex {
 			mapped.ReplaceFrom = entries[0].Index
 		}
 		if batch.HardState != nil && !isEmptyHardState(batch.HardState) {
 			s.waveHard[mappedCount] = seglog.HardState{Term: batch.HardState.GetTerm(), Vote: batch.HardState.GetVote(), Commit: batch.HardState.GetCommit()}
+			mapped.Hard = &s.waveHard[mappedCount]
+		}
+		if mapped.Hard == nil && s.commitHints[item.GroupID].readyID != 0 {
+			s.waveHard[mappedCount] = metadata.Hard
 			mapped.Hard = &s.waveHard[mappedCount]
 		}
 		if !canonicalEmptySnapshot(batch.Snapshot) {
@@ -1240,10 +1306,19 @@ func (s *NodeStore) persistWave(ready []NodeReady, sequenced bool) error {
 	if duplicates == len(ready) {
 		return nil
 	}
+	if mappedCount == 0 {
+		for i := range ready {
+			if deferGroup[i] {
+				s.publishCommitHintLocked(ready[i].GroupID, deferred[i])
+			}
+		}
+		return nil
+	}
 	s.plainArena = s.plainArena[:plainOffset]
 	if err := s.packWaveExtents(id, mappedCount); err != nil {
 		return err
 	}
+	s.stageEntryPayloadsLocked(mappedCount)
 	wave := seglog.Wave{ID: id, Batches: s.waveBatches[:mappedCount], Blob: s.cipherArena}
 	var persistErr error
 	if s.persistWaveTest != nil {
@@ -1253,7 +1328,7 @@ func (s *NodeStore) persistWave(ready []NodeReady, sequenced bool) error {
 	}
 	if persistErr != nil {
 		if fatal := s.engine.FatalError(); fatal != nil {
-			s.poisoned = fatal
+			s.poisonLocked(fatal)
 			return errors.Join(ErrPersistenceUnknown, persistErr, fatal)
 		}
 		if errors.Is(persistErr, seglog.ErrBackpressure) {
@@ -1262,8 +1337,19 @@ func (s *NodeStore) persistWave(ready []NodeReady, sequenced bool) error {
 		return errors.Join(ErrInvalid, persistErr)
 	}
 	if err := s.proveNamespace(); err != nil {
-		s.poisoned = err
+		s.poisonLocked(err)
 		return errors.Join(ErrPersistenceUnknown, err)
+	}
+	for index := 0; index < mappedCount; index++ {
+		batch := &s.waveBatches[index]
+		delete(s.commitHints, batch.GroupID)
+		s.publishCoordinatesLocked(batch.GroupID, batch, &s.pendingEntryPayloads[index])
+	}
+
+	for i := range ready {
+		if deferGroup[i] {
+			s.publishCommitHintLocked(ready[i].GroupID, deferred[i])
+		}
 	}
 	s.cacheValid = false
 	return nil
@@ -1421,7 +1507,10 @@ func (s *NodeStore) persistIncarnationsLocked(requests []GroupIncarnation) error
 		return ErrInvalid
 	}
 	if err := s.proveNamespace(); err != nil {
-		s.poisoned = err
+		s.poisonLocked(err)
+		return err
+	}
+	if err := s.flushAllCommitHintsLocked(); err != nil {
 		return err
 	}
 	mapped := 0
@@ -1454,13 +1543,13 @@ func (s *NodeStore) persistIncarnationsLocked(requests []GroupIncarnation) error
 	copy(id[:], digest[:16])
 	if err := s.engine.PersistWave(seglog.Wave{ID: id, Batches: s.waveBatches[:mapped]}); err != nil {
 		if fatal := s.engine.FatalError(); fatal != nil {
-			s.poisoned = fatal
+			s.poisonLocked(fatal)
 			return errors.Join(ErrPersistenceUnknown, err, fatal)
 		}
 		return errors.Join(ErrInvalid, err)
 	}
 	if err := s.proveNamespace(); err != nil {
-		s.poisoned = err
+		s.poisonLocked(err)
 		return errors.Join(ErrPersistenceUnknown, err)
 	}
 	return nil
@@ -1622,13 +1711,13 @@ func (s *NodeStore) registerGroupLocked(descriptor GroupDescriptor, snapshot *pb
 	}
 	if err = s.engine.PersistWave(seglog.Wave{ID: waveID, Batches: s.waveBatches[:2], Blob: s.cipherArena}); err != nil {
 		if fatal := s.engine.FatalError(); fatal != nil {
-			s.poisoned = fatal
+			s.poisonLocked(fatal)
 			return GroupIncarnation{}, errors.Join(ErrPersistenceUnknown, err, fatal)
 		}
 		return GroupIncarnation{}, err
 	}
 	if err = s.proveNamespace(); err != nil {
-		s.poisoned = err
+		s.poisonLocked(err)
 		return GroupIncarnation{}, errors.Join(ErrPersistenceUnknown, err)
 	}
 	s.descriptors = append(s.descriptors, descriptor)
@@ -1636,6 +1725,8 @@ func (s *NodeStore) registerGroupLocked(descriptor GroupDescriptor, snapshot *pb
 	copy(s.descriptorOrder[position+1:], s.descriptorOrder[position:len(s.descriptorOrder)-1])
 	s.descriptorOrder[position] = uint32(len(s.descriptors) - 1)
 	s.nextLogKey++
+	s.publishCoordinatesLocked(nodeDescriptorGroup, nil, nil)
+	s.publishCoordinatesLocked(descriptor.LogKey, nil, nil)
 	return GroupIncarnation{GroupID: descriptor.LogKey, Incarnation: 1}, nil
 }
 
@@ -1832,6 +1923,9 @@ func (s *NodeStore) Close() error {
 	s.maintenance.Wait()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.poisoned == nil {
+		err = errors.Join(err, s.flushAllCommitHintsLocked())
+	}
 	s.closed = true
 	s.closing = false
 	if s.engine != nil {
@@ -1852,6 +1946,9 @@ func (s *NodeStore) Close() error {
 }
 
 func (v *GroupView) Term(index uint64) (uint64, error) {
+	if term, found, err := v.cachedTerm(index); found {
+		return term, err
+	}
 	v.store.mu.Lock()
 	defer v.store.mu.Unlock()
 	if err := v.store.usable(); err != nil {
@@ -1870,16 +1967,8 @@ func (v *GroupView) Term(index uint64) (uint64, error) {
 	return term, nil
 }
 func (v *GroupView) FirstIndex() (uint64, error) {
-	v.store.mu.Lock()
-	defer v.store.mu.Unlock()
-	if err := v.store.usable(); err != nil {
-		return 0, err
-	}
-	state, ok := v.store.engine.Metadata(v.group)
-	if !ok {
-		return 0, raft.ErrUnavailable
-	}
-	return state.FirstIndex, nil
+	cut, err := v.logCoordinates()
+	return cut.first, err
 }
 
 // ReadEntryInto authenticates and decrypts exactly the containing group batch.
@@ -1927,32 +2016,15 @@ func (v *GroupView) ReadEntryInto(index uint64, ciphertext, plaintext []byte) (B
 	return BorrowedEntry{Index: loc.Index, Term: loc.Term, Type: loc.Type, Data: plain[loc.DataOffset : loc.DataOffset+loc.DataBytes]}, nil
 }
 func (v *GroupView) LastIndex() (uint64, error) {
-	v.store.mu.Lock()
-	defer v.store.mu.Unlock()
-	if err := v.store.usable(); err != nil {
-		return 0, err
-	}
-	state, ok := v.store.engine.Metadata(v.group)
-	if !ok {
-		return 0, raft.ErrUnavailable
-	}
-	return state.LastIndex, nil
+	cut, err := v.logCoordinates()
+	return cut.last, err
 }
 
-// LogBounds returns the same Raft-visible coordinates as LastIndex and
-// InitialState under one lock. It neither opens the checkpoint object nor
-// constructs protobuf state, so repeated control probes allocate nothing.
+// LogBounds returns durable log bounds and live commit knowledge without
+// waiting for unrelated disk writes. Commit-only hints are not a persisted floor.
 func (v *GroupView) LogBounds() (last, commit uint64, err error) {
-	v.store.mu.Lock()
-	defer v.store.mu.Unlock()
-	if err := v.store.usable(); err != nil {
-		return 0, 0, err
-	}
-	state, ok := v.store.engine.Metadata(v.group)
-	if !ok {
-		return 0, 0, raft.ErrUnavailable
-	}
-	return state.LastIndex, state.Hard.Commit, nil
+	cut, err := v.logCoordinates()
+	return cut.last, max(cut.commit, cut.liveCommit), err
 }
 
 func (v *GroupView) InitialState() (*pb.HardState, *pb.ConfState, error) {
@@ -1969,6 +2041,7 @@ func (v *GroupView) InitialState() (*pb.HardState, *pb.ConfState, error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	state = v.store.liveNodeMetadata(v.group, state)
 	term, vote, commit := state.Hard.Term, state.Hard.Vote, state.Hard.Commit
 	return &pb.HardState{Term: &term, Vote: &vote, Commit: &commit}, cloneConfState(snapshot.GetMetadata().GetConfState()), nil
 }
@@ -1985,6 +2058,9 @@ func (v *GroupView) Snapshot() (*pb.Snapshot, error) {
 	return v.store.loadCheckpoint(v.group, state.Checkpoint)
 }
 func (v *GroupView) Entries(lo, hi, maxSize uint64) ([]*pb.Entry, error) {
+	if entries, found, err := v.cachedEntries(lo, hi, maxSize); found {
+		return entries, err
+	}
 	v.store.mu.Lock()
 	defer v.store.mu.Unlock()
 	if err := v.store.usable(); err != nil {

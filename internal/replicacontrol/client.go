@@ -3,6 +3,7 @@ package replicacontrol
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 )
@@ -12,22 +13,27 @@ type StreamOpener interface {
 }
 
 type ClientOptions struct {
-	Opener        StreamOpener
-	ReadDeadline  rafttransport.DeadlineFunc
-	WriteDeadline rafttransport.DeadlineFunc
+	// MaxHealthRoundConnections bounds idle connections retained by a health sweep.
+	// Zero keeps one-shot behavior. Reserve opener capacity for other controls.
+	MaxHealthRoundConnections int
+	Opener                    StreamOpener
+	ReadDeadline              rafttransport.DeadlineFunc
+	WriteDeadline             rafttransport.DeadlineFunc
 }
 
 type Client struct {
-	opener        StreamOpener
-	readDeadline  rafttransport.DeadlineFunc
-	writeDeadline rafttransport.DeadlineFunc
+	healthRoundActive         atomic.Bool
+	maxHealthRoundConnections int
+	opener                    StreamOpener
+	readDeadline              rafttransport.DeadlineFunc
+	writeDeadline             rafttransport.DeadlineFunc
 }
 
 func NewClient(options ClientOptions) (*Client, error) {
-	if options.Opener == nil || options.ReadDeadline == nil || options.WriteDeadline == nil {
+	if options.MaxHealthRoundConnections < 0 || options.MaxHealthRoundConnections > 2048 || options.Opener == nil || options.ReadDeadline == nil || options.WriteDeadline == nil {
 		return nil, ErrControl
 	}
-	return &Client{opener: options.Opener, readDeadline: options.ReadDeadline,
+	return &Client{maxHealthRoundConnections: options.MaxHealthRoundConnections, opener: options.Opener, readDeadline: options.ReadDeadline,
 		writeDeadline: options.WriteDeadline}, nil
 }
 
@@ -120,6 +126,12 @@ func (client *Client) ObserveHealth(
 		return HealthObservation{}, ErrControl
 	}
 	defer connection.Close()
+	return client.observeHealthConnection(ctx, node, request, connection)
+}
+
+func (client *Client) observeHealthConnection(ctx context.Context, node rafttransport.NodeID,
+	request Request, connection rafttransport.PeerConnection) (HealthObservation, error) {
+	var err error
 	peer := connection.PeerIdentity()
 	wantDomain := rafttransport.TrustDomain{ClusterID: request.Group.ClusterID,
 		ClusterIncarnation: request.Group.ClusterIncarnation}

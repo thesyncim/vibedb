@@ -1,0 +1,6 @@
+ok  	github.com/thesyncim/vibedb/internal/raftauthority	1.334s
+ok  	github.com/thesyncim/vibedb/internal/raftmodel	1.493s
+ok  	github.com/thesyncim/vibedb/internal/raftmember	10.943s
+ok  	github.com/thesyncim/vibedb/internal/rafttransport	3.516s
+ok  	github.com/thesyncim/vibedb/internal/multiraft	3.606s
+ok  	github.com/thesyncim/vibedb/internal/raftservice	12.732s

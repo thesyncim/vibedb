@@ -1,0 +1,25 @@
+=== RUN   TestOwnerGroupAuthorityRefreshRetainsPromotionAndErrors
+--- PASS: TestOwnerGroupAuthorityRefreshRetainsPromotionAndErrors (0.00s)
+=== RUN   TestOwnerPointReadAuthorityUnavailableEnsuresRoundThenUsesReadIndex
+--- PASS: TestOwnerPointReadAuthorityUnavailableEnsuresRoundThenUsesReadIndex (0.00s)
+=== RUN   TestOwnerPointReadAuthorityFastPathUsesCommitFloorAndSkipsReadIndex
+--- PASS: TestOwnerPointReadAuthorityFastPathUsesCommitFloorAndSkipsReadIndex (0.00s)
+=== RUN   TestOwnerPointReadAuthorityRequiresExactDataCapability
+--- PASS: TestOwnerPointReadAuthorityRequiresExactDataCapability (0.00s)
+=== RUN   TestOwnerLinearizablePointCutAuthorityPathSkipsReadIndex
+--- PASS: TestOwnerLinearizablePointCutAuthorityPathSkipsReadIndex (0.00s)
+=== RUN   TestOwnerLinearizablePointCutRetriesAfterAuthorityValidation
+--- PASS: TestOwnerLinearizablePointCutRetriesAfterAuthorityValidation (0.00s)
+=== RUN   TestOwnerLinearizablePointCutRejectsGenerationFenceChanges
+=== RUN   TestOwnerLinearizablePointCutRejectsGenerationFenceChanges/transition_fenced
+=== RUN   TestOwnerLinearizablePointCutRejectsGenerationFenceChanges/command_fence_changed
+=== RUN   TestOwnerLinearizablePointCutRejectsGenerationFenceChanges/generation_replaced
+--- PASS: TestOwnerLinearizablePointCutRejectsGenerationFenceChanges (0.00s)
+    --- PASS: TestOwnerLinearizablePointCutRejectsGenerationFenceChanges/transition_fenced (0.00s)
+    --- PASS: TestOwnerLinearizablePointCutRejectsGenerationFenceChanges/command_fence_changed (0.00s)
+    --- PASS: TestOwnerLinearizablePointCutRejectsGenerationFenceChanges/generation_replaced (0.00s)
+=== RUN   TestOwnerPointReadAuthorityExpiryFallsBackToReadIndexOnce
+--- PASS: TestOwnerPointReadAuthorityExpiryFallsBackToReadIndexOnce (0.00s)
+=== RUN   TestOwnerPointBatchAuthorityFastPathFinalValidationAndCancelCleanup
+--- PASS: TestOwnerPointBatchAuthorityFastPathFinalValidationAndCancelCleanup (0.00s)
+PASS

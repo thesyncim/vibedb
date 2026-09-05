@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync/atomic"
 
+	"github.com/thesyncim/vibedb/internal/raftauthority"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
@@ -49,15 +50,18 @@ type LinearizablePointReadRequest struct {
 }
 
 // LinearizablePointReadCut pins the authorized owner generation and live read
-// source after one leader ReadIndex. It owns no durable snapshot. The cut is
-// single-consumer and must be closed after the point result has been copied
-// into the SQL source.
+// source after either one leader ReadIndex or one currently valid read
+// authority. It owns no durable snapshot. The cut is single-consumer and must
+// be closed after the point result has been copied into the SQL source.
 type LinearizablePointReadCut struct {
 	source         ReadSource
 	fence          ServingFence
 	minimumApplied uint64
 	generation     *ownerGeneration
 	owner          *Owner
+	request        LinearizablePointReadRequest
+	authorityToken raftauthority.AuthorityToken
+	authorityFast  bool
 	released       atomic.Bool
 }
 
@@ -74,7 +78,9 @@ func (cut *LinearizablePointReadCut) Source() ReadSource {
 // PointReadInto reads one exact point against the cut's quorum-applied floor.
 // The source performs its live intent, ownership, and publication checks; the
 // cut verifies the returned fence against the serving identity that authorized
-// the request before releasing any caller-visible bytes.
+// the request. Authority-backed cuts perform a serialized final authority
+// validation before returning bytes. A failed validation discards the cut and
+// retries once through the original ReadIndex path.
 func (cut *LinearizablePointReadCut) PointReadInto(
 	ctx context.Context,
 	relation replication.RelationID,
@@ -91,20 +97,73 @@ func (cut *LinearizablePointReadCut) PointReadInto(
 	if err := context.Cause(ctx); err != nil {
 		return replicatedstate.PointReadResult{}, err
 	}
-	value, err := cut.source.PointReadInto(
-		relation, key, cut.minimumApplied, maxValueBytes, dst,
-	)
-	if err != nil {
-		return replicatedstate.PointReadResult{}, err
+	for attempt := 0; attempt < 2; attempt++ {
+		readDst := dst
+		if cut.authorityFast {
+			// Do not let a source write caller-owned bytes before the final
+			// serialized authority check. A failed check discards this local
+			// result and retries via ReadIndex without mutating dst.
+			readDst = nil
+		}
+		value, err := cut.source.PointReadInto(
+			relation, key, cut.minimumApplied, maxValueBytes, readDst,
+		)
+		if err != nil {
+			if attempt == 0 && cut.authorityFast && readAuthoritySourceFallback(err, false) {
+				if retryErr := cut.retryReadIndex(ctx); retryErr != nil {
+					return replicatedstate.PointReadResult{}, retryErr
+				}
+				continue
+			}
+			return replicatedstate.PointReadResult{}, err
+		}
+		if err := context.Cause(ctx); err != nil {
+			return replicatedstate.PointReadResult{}, err
+		}
+		fenceOK := pointReadFenceMatches(value.Fence, cut.fence) &&
+			value.Fence.Applied >= cut.minimumApplied && len(value.Value) <= maxValueBytes
+		if !fenceOK {
+			if attempt == 0 && cut.authorityFast && readAuthoritySourceFallback(nil, false) {
+				if retryErr := cut.retryReadIndex(ctx); retryErr != nil {
+					return replicatedstate.PointReadResult{}, retryErr
+				}
+				continue
+			}
+			return replicatedstate.PointReadResult{}, ErrServingFence
+		}
+		if cut.authorityFast {
+			if validationErr := cut.owner.validateReadAuthority(
+				ctx, cut.request.Fence, cut.generation, cut.authorityToken,
+			); validationErr != nil {
+				retry := attempt == 0 && readAuthorityFallback(validationErr)
+				cut.owner.recordAuthorityValidation(cut.request.Fence.Group, validationErr, retry)
+				if retry {
+					if retryErr := cut.retryReadIndex(ctx); retryErr != nil {
+						return replicatedstate.PointReadResult{}, retryErr
+					}
+					continue
+				}
+				return replicatedstate.PointReadResult{}, validationErr
+			}
+			cut.owner.recordAuthorityHit(cut.request.Fence.Group)
+			if dst != nil {
+				value.Value = append(dst[:0], value.Value...)
+			}
+		}
+		return value, nil
 	}
-	if err := context.Cause(ctx); err != nil {
-		return replicatedstate.PointReadResult{}, err
+	return replicatedstate.PointReadResult{}, ErrServingFence
+}
+
+func (cut *LinearizablePointReadCut) retryReadIndex(ctx context.Context) error {
+	if cut == nil || cut.owner == nil {
+		return ErrInvalidOwner
 	}
-	if !pointReadFenceMatches(value.Fence, cut.fence) ||
-		value.Fence.Applied < cut.minimumApplied || len(value.Value) > maxValueBytes {
-		return replicatedstate.PointReadResult{}, ErrServingFence
+	owner, request := cut.owner, cut.request
+	if err := cut.Close(); err != nil {
+		return err
 	}
-	return value, nil
+	return owner.readLinearizablePointInto(ctx, request, cut, true)
 }
 
 // Close releases the serving-generation and pending-read leases. It is safe
@@ -118,6 +177,9 @@ func (cut *LinearizablePointReadCut) Close() error {
 	cut.source = nil
 	cut.fence = ServingFence{}
 	cut.minimumApplied = 0
+	cut.request = LinearizablePointReadRequest{}
+	cut.authorityToken = raftauthority.AuthorityToken{}
+	cut.authorityFast = false
 	if generation != nil {
 		generation.release()
 	}
@@ -216,15 +278,24 @@ func (owner *Owner) ReadLinearizableDataInto(
 	return nil
 }
 
-// ReadLinearizablePointInto acquires the same leader ReadIndex, serving
-// authorization, applied floor, and generation lease as ReadLinearizableDataInto
-// while leaving durable snapshot materialization to the caller's exact point
-// read. This is intentionally a separate API so ordinary data-read callers
-// cannot accidentally skip their complete relation cut.
+// ReadLinearizablePointInto acquires the same serving authorization, applied
+// floor, and generation lease as ReadLinearizableDataInto while leaving the
+// point result materialization to the caller. When a current read authority is
+// available, PointReadInto performs the serialized final validation and can
+// retry this cut through ReadIndex if the authority expires.
 func (owner *Owner) ReadLinearizablePointInto(
 	ctx context.Context,
 	request LinearizablePointReadRequest,
 	dst *LinearizablePointReadCut,
+) error {
+	return owner.readLinearizablePointInto(ctx, request, dst, false)
+}
+
+func (owner *Owner) readLinearizablePointInto(
+	ctx context.Context,
+	request LinearizablePointReadRequest,
+	dst *LinearizablePointReadCut,
+	forceReadIndex bool,
 ) error {
 	if owner == nil || ctx == nil || dst == nil ||
 		request.Capability != serviceauthz.CapabilityDataRead {
@@ -245,7 +316,11 @@ func (owner *Owner) ReadLinearizablePointInto(
 	delivery := &readDelivery{reply: make(chan ownerReply, 1)}
 	reply, err := owner.enqueueRead(ctx, ownerRequest{
 		kind: requestReadLinear, group: request.Fence.Group, reply: delivery.reply,
-		read: readRequest{fence: request.Fence, delivery: delivery, authorize: request.Authorize},
+		read: readRequest{
+			fence: request.Fence, delivery: delivery, authorize: request.Authorize,
+			authorityEligible: !forceReadIndex, forceReadIndex: forceReadIndex,
+			authorityFallback: forceReadIndex,
+		},
 	}, delivery)
 	if err != nil {
 		return err
@@ -269,6 +344,9 @@ func (owner *Owner) ReadLinearizablePointInto(
 	dst.fence = request.Fence
 	dst.minimumApplied = reply.read.minimumApplied
 	dst.generation, dst.owner = reply.read.generation, owner
+	dst.request = request
+	dst.authorityToken = reply.read.authorityToken
+	dst.authorityFast = reply.read.authorityFast
 	dst.released.Store(false)
 	admitted = true
 	return nil

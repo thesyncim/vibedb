@@ -1,0 +1,128 @@
+{
+  "pg.direct.execute": {
+    "count": 4504,
+    "total_ms": 15473.76588600003,
+    "mean_ms": 3.435560809502664,
+    "p50_ms": 2.450752,
+    "p95_ms": 10.189632,
+    "unmatched_begin": 0,
+    "unmatched_end": 7
+  },
+  "pg.direct.prepare": {
+    "count": 4504,
+    "total_ms": 942.2678879999995,
+    "mean_ms": 0.2092069023090586,
+    "p50_ms": 0.10969599999999999,
+    "p95_ms": 0.25856,
+    "unmatched_begin": 0,
+    "unmatched_end": 0
+  },
+  "pg.write": {
+    "count": 4504,
+    "total_ms": 16466.230552000008,
+    "mean_ms": 3.655912644760213,
+    "p50_ms": 2.581568,
+    "p95_ms": 10.889856,
+    "unmatched_begin": 0,
+    "unmatched_end": 7
+  },
+  "raft.apply.execute": {
+    "count": 4511,
+    "total_ms": 801.6611600000012,
+    "mean_ms": 0.17771251607182442,
+    "p50_ms": 0.085057,
+    "p95_ms": 0.142976,
+    "unmatched_begin": 0,
+    "unmatched_end": 2
+  },
+  "raft.persist.metadata": {
+    "count": 1420,
+    "total_ms": 13.688401999999954,
+    "mean_ms": 0.00963971971830986,
+    "p50_ms": 0.008704,
+    "p95_ms": 0.016896,
+    "unmatched_begin": 0,
+    "unmatched_end": 1
+  },
+  "raft.persist.required": {
+    "count": 2738,
+    "total_ms": 2096.484850000002,
+    "mean_ms": 0.7656993608473338,
+    "p50_ms": 0.577216,
+    "p95_ms": 1.97792,
+    "unmatched_begin": 0,
+    "unmatched_end": 0
+  },
+  "raft.proposal.admission": {
+    "count": 2308,
+    "total_ms": 124.95436799999986,
+    "mean_ms": 0.05413967417677643,
+    "p50_ms": 0.047552,
+    "p95_ms": 0.099456,
+    "unmatched_begin": 0,
+    "unmatched_end": 0
+  },
+  "raft.proposal.commit": {
+    "count": 2308,
+    "total_ms": 8622.140375999996,
+    "mean_ms": 3.735762727902946,
+    "p50_ms": 2.373216,
+    "p95_ms": 13.291968,
+    "unmatched_begin": 0,
+    "unmatched_end": 2
+  },
+  "raft.proposal.discovery": {
+    "count": 4538,
+    "total_ms": 2.314178000000027,
+    "mean_ms": 0.0005099554869986778,
+    "p50_ms": 0.000448,
+    "p95_ms": 0.000704,
+    "unmatched_begin": 0,
+    "unmatched_end": 0
+  },
+  "raft.proposal.roundtrip": {
+    "count": 4538,
+    "total_ms": 15975.494301000012,
+    "mean_ms": 3.5203821729836933,
+    "p50_ms": 2.445024,
+    "p95_ms": 10.873344,
+    "unmatched_begin": 0,
+    "unmatched_end": 7
+  },
+  "sql.read.admission": {
+    "count": 2278,
+    "total_ms": 0.5632329999999885,
+    "mean_ms": 0.0002472489025460931,
+    "p50_ms": 0.000192,
+    "p95_ms": 0.000448,
+    "unmatched_begin": 0,
+    "unmatched_end": 0
+  },
+  "sql.read.encode": {
+    "count": 2278,
+    "total_ms": 2.238159000000015,
+    "mean_ms": 0.0009825105355575066,
+    "p50_ms": 0.000704,
+    "p95_ms": 0.001408,
+    "unmatched_begin": 0,
+    "unmatched_end": 0
+  },
+  "sql.read.execute": {
+    "count": 2278,
+    "total_ms": 110.8832150000001,
+    "mean_ms": 0.04867568700614574,
+    "p50_ms": 0.040735499999999994,
+    "p95_ms": 0.08,
+    "unmatched_begin": 0,
+    "unmatched_end": 0
+  },
+  "sql.read.quorum": {
+    "count": 2278,
+    "total_ms": 1991.9305799999986,
+    "mean_ms": 0.8744207989464442,
+    "p50_ms": 0.14768,
+    "p95_ms": 5.848064,
+    "unmatched_begin": 0,
+    "unmatched_end": 0
+  }
+}

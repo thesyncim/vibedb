@@ -36,21 +36,26 @@ type ProgressMetrics struct {
 	// Calls for different reasons may be concurrent. No command or raw error
 	// is exposed. The callback runs synchronously on an owner lane and should
 	// perform only bounded local diagnostic work, not remote I/O.
-	ProposalFailure     func(raftmember.GroupKey, ProposalFailureReason)
-	proposalFailureSeen atomic.Uint64
-	proposalBatches     atomic.Uint64
-	proposalCommands    atomic.Uint64
-	proposalBytes       atomic.Uint64
-	applyBatches        atomic.Uint64
-	appliedEntries      atomic.Uint64
-	commitAdvancements  atomic.Uint64
-	committedEntries    atomic.Uint64
-	readyPersisted      atomic.Uint64
-	snapshotsFinished   atomic.Uint64
-	readCompletions     atomic.Uint64
-	faults              atomic.Uint64
-	scheduler           progressMetricsSchedulerCounters
-	groups              atomic.Pointer[progressMetricsGroupTable]
+	ProposalFailure                 func(raftmember.GroupKey, ProposalFailureReason)
+	proposalFailureSeen             atomic.Uint64
+	proposalBatches                 atomic.Uint64
+	proposalCommands                atomic.Uint64
+	proposalBytes                   atomic.Uint64
+	applyBatches                    atomic.Uint64
+	appliedEntries                  atomic.Uint64
+	commitAdvancements              atomic.Uint64
+	committedEntries                atomic.Uint64
+	readyPersisted                  atomic.Uint64
+	snapshotsFinished               atomic.Uint64
+	readCompletions                 atomic.Uint64
+	faults                          atomic.Uint64
+	authorityReadHits               atomic.Uint64
+	authorityReadIndexFallbacks     atomic.Uint64
+	authorityReadValidationRetries  atomic.Uint64
+	authorityReadValidationFailures atomic.Uint64
+	authorityRoundAttempts          atomic.Uint64
+	scheduler                       progressMetricsSchedulerCounters
+	groups                          atomic.Pointer[progressMetricsGroupTable]
 }
 
 type progressMetricsGroup struct {
@@ -64,6 +69,10 @@ type progressMetricsCounters struct {
 	commitAdvancements, committedEntries             atomic.Uint64
 	readyPersisted, snapshotsFinished                atomic.Uint64
 	readCompletions, faults                          atomic.Uint64
+	authorityReadHits, authorityReadIndexFallbacks   atomic.Uint64
+	authorityReadValidationRetries                   atomic.Uint64
+	authorityReadValidationFailures                  atomic.Uint64
+	authorityRoundAttempts                           atomic.Uint64
 	scheduler                                        progressMetricsSchedulerCounters
 }
 
@@ -96,6 +105,16 @@ type ProgressMetricsSnapshot struct {
 	SnapshotsFinished  uint64
 	ReadCompletions    uint64
 	Faults             uint64
+	// AuthorityReadHits counts ordinary data point/batch results that passed
+	// the final serialized authority validation. AuthorityReadIndexFallbacks
+	// counts only ReadIndex admissions selected after an authority attempt or
+	// after a failed final validation. The remaining fields expose bounded
+	// validation and round-attempt evidence for benchmark interpretation.
+	AuthorityReadHits               uint64
+	AuthorityReadIndexFallbacks     uint64
+	AuthorityReadValidationRetries  uint64
+	AuthorityReadValidationFailures uint64
+	AuthorityRoundAttempts          uint64
 
 	// ProposalWindowQueued is the cumulative number of queued proposals
 	// observed while an open normal-proposal window had room. The depth
@@ -244,6 +263,56 @@ func (counters *progressMetricsCounters) observe(progress multiraft.Progress, do
 	}
 }
 
+func (metrics *ProgressMetrics) observeAuthorityReadHit(group raftmember.GroupKey) {
+	if metrics == nil {
+		return
+	}
+	metrics.authorityReadHits.Add(1)
+	if counters := metrics.group(group); counters != nil {
+		counters.counters.authorityReadHits.Add(1)
+	}
+}
+
+func (metrics *ProgressMetrics) observeAuthorityReadIndexFallback(group raftmember.GroupKey) {
+	if metrics == nil {
+		return
+	}
+	metrics.authorityReadIndexFallbacks.Add(1)
+	if counters := metrics.group(group); counters != nil {
+		counters.counters.authorityReadIndexFallbacks.Add(1)
+	}
+}
+
+func (metrics *ProgressMetrics) observeAuthorityReadValidationFailure(group raftmember.GroupKey) {
+	if metrics == nil {
+		return
+	}
+	metrics.authorityReadValidationFailures.Add(1)
+	if counters := metrics.group(group); counters != nil {
+		counters.counters.authorityReadValidationFailures.Add(1)
+	}
+}
+
+func (metrics *ProgressMetrics) observeAuthorityReadValidationRetry(group raftmember.GroupKey) {
+	if metrics == nil {
+		return
+	}
+	metrics.authorityReadValidationRetries.Add(1)
+	if counters := metrics.group(group); counters != nil {
+		counters.counters.authorityReadValidationRetries.Add(1)
+	}
+}
+
+func (metrics *ProgressMetrics) observeAuthorityRoundAttempt(group raftmember.GroupKey) {
+	if metrics == nil {
+		return
+	}
+	metrics.authorityRoundAttempts.Add(1)
+	if counters := metrics.group(group); counters != nil {
+		counters.counters.authorityRoundAttempts.Add(1)
+	}
+}
+
 // ConfigureGroups publishes a bounded immutable open-addressed directory for
 // zero-allocation per-group counter updates. It must run before owner lanes;
 // repeated configuration is rejected so no hot-path counter can be orphaned.
@@ -331,7 +400,11 @@ func (metrics *ProgressMetrics) GroupProgressMetrics(group raftmember.GroupKey) 
 		AppliedEntries: c.appliedEntries.Load(), ReadyPersisted: c.readyPersisted.Load(),
 		CommitAdvancements: c.commitAdvancements.Load(), CommittedEntries: c.committedEntries.Load(),
 		SnapshotsFinished: c.snapshotsFinished.Load(), ReadCompletions: c.readCompletions.Load(),
-		Faults: c.faults.Load(),
+		Faults: c.faults.Load(), AuthorityReadHits: c.authorityReadHits.Load(),
+		AuthorityReadIndexFallbacks:     c.authorityReadIndexFallbacks.Load(),
+		AuthorityReadValidationRetries:  c.authorityReadValidationRetries.Load(),
+		AuthorityReadValidationFailures: c.authorityReadValidationFailures.Load(),
+		AuthorityRoundAttempts:          c.authorityRoundAttempts.Load(),
 	}
 	c.scheduler.snapshot(&snapshot)
 	return slot.identity, snapshot, true
@@ -342,17 +415,22 @@ func (metrics *ProgressMetrics) Snapshot() ProgressMetricsSnapshot {
 		return ProgressMetricsSnapshot{}
 	}
 	snapshot := ProgressMetricsSnapshot{
-		ProposalBatches:    metrics.proposalBatches.Load(),
-		ProposalCommands:   metrics.proposalCommands.Load(),
-		ProposalBytes:      metrics.proposalBytes.Load(),
-		ApplyBatches:       metrics.applyBatches.Load(),
-		AppliedEntries:     metrics.appliedEntries.Load(),
-		CommitAdvancements: metrics.commitAdvancements.Load(),
-		CommittedEntries:   metrics.committedEntries.Load(),
-		ReadyPersisted:     metrics.readyPersisted.Load(),
-		SnapshotsFinished:  metrics.snapshotsFinished.Load(),
-		ReadCompletions:    metrics.readCompletions.Load(),
-		Faults:             metrics.faults.Load(),
+		ProposalBatches:                 metrics.proposalBatches.Load(),
+		ProposalCommands:                metrics.proposalCommands.Load(),
+		ProposalBytes:                   metrics.proposalBytes.Load(),
+		ApplyBatches:                    metrics.applyBatches.Load(),
+		AppliedEntries:                  metrics.appliedEntries.Load(),
+		CommitAdvancements:              metrics.commitAdvancements.Load(),
+		CommittedEntries:                metrics.committedEntries.Load(),
+		ReadyPersisted:                  metrics.readyPersisted.Load(),
+		SnapshotsFinished:               metrics.snapshotsFinished.Load(),
+		ReadCompletions:                 metrics.readCompletions.Load(),
+		Faults:                          metrics.faults.Load(),
+		AuthorityReadHits:               metrics.authorityReadHits.Load(),
+		AuthorityReadIndexFallbacks:     metrics.authorityReadIndexFallbacks.Load(),
+		AuthorityReadValidationRetries:  metrics.authorityReadValidationRetries.Load(),
+		AuthorityReadValidationFailures: metrics.authorityReadValidationFailures.Load(),
+		AuthorityRoundAttempts:          metrics.authorityRoundAttempts.Load(),
 	}
 	metrics.scheduler.snapshot(&snapshot)
 	return snapshot
