@@ -24,7 +24,9 @@ func TestStatementResetReadBindingsForReuseRebindsLikeFresh(t *testing.T) {
 	if retained < int64(unsafe.Sizeof(*statement)) {
 		t.Fatalf("retained bytes = %d, Statement object = %d", retained, unsafe.Sizeof(*statement))
 	}
-	if statement.c.plan != nil || statement.c.result != nil || statement.q.built != nil ||
+	if statement.c.plan == nil || statement.c.result == nil || statement.q.built != nil ||
+		statement.c.plan.where != nil || statement.c.plan.columns != nil ||
+		statement.c.result.plan != nil || statement.c.result.err != nil ||
 		statement.args != nil || statement.stack != nil || statement.having.active {
 		t.Fatal("binding/compiler state survived reset")
 	}
@@ -90,10 +92,15 @@ func TestStatementReadReuseAlternatesNullTypesLimitsAndErrors(t *testing.T) {
 			}
 			statement := prepare()
 			defer statement.Release()
-			for _, args := range [][]any{
+			text, limit := "2", int64(1)
+			floatValue := 2.0
+			boolValue := true
+			cases := [][]any{
 				{int64(2), int64(1)}, {nil, int64(2)}, {"2", int64(1)},
 				{true, int64(1)}, {int64(1), "bad"}, {"2", int64(0)}, {int64(1), int64(2)},
-			} {
+				{&text, &limit}, {&floatValue, &limit}, {&boolValue, &limit},
+			}
+			for _, args := range cases {
 				fresh := prepare()
 				var reusedExec, freshExec Exec
 				got, gotErr := statement.RunInto(&reusedExec, FromSegment(segment), args)
@@ -118,6 +125,118 @@ func TestStatementReadReuseAlternatesNullTypesLimitsAndErrors(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestStatementReadReuseScrubsArenaTails(t *testing.T) {
+	statement, err := PrepareStatement(`SELECT id FROM docs WHERE id = ?`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer statement.Release()
+	if _, ok := statement.ResetReadBindingsForReuse(); !ok {
+		t.Fatal("direct statement declined")
+	}
+	if err := statement.bind([]any{"small"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Keep one live any arena chunk and put a second chunk header in the
+	// directory's unused capacity. Both the object in the live tail and the
+	// chunk referenced only by the directory tail must be severed by reset.
+	poison := new(string)
+	*poison = strings.Repeat("poison", 128)
+	statement.c.boxes.chunks = make([][]any, 1, 2)
+	statement.c.boxes.chunks[0] = make([]any, 1, 4)
+	statement.c.boxes.chunks[0][0] = poison
+	statement.c.boxes.chunks[0][:4][3] = poison
+	directory := statement.c.boxes.chunks[:2]
+	directory[1] = []any{poison}
+	statement.c.boxes.chunks = directory[:1:2]
+	if _, ok := statement.ResetReadBindingsForReuse(); !ok {
+		t.Fatal("reset declined")
+	}
+	if got := statement.c.boxes.chunks[0][0]; got != nil {
+		t.Fatalf("live arena tail retained %T", got)
+	}
+	if got := statement.c.boxes.chunks[0][:cap(statement.c.boxes.chunks[0])][3]; got != nil {
+		t.Fatal("unused arena capacity retained a value")
+	}
+	if got := statement.c.boxes.chunks[:cap(statement.c.boxes.chunks)][1]; got != nil {
+		t.Fatal("arena directory tail retained a chunk")
+	}
+}
+
+func TestStatementReadReuseCountsCompilerStorage(t *testing.T) {
+	statement, err := PrepareStatement(`SELECT id FROM docs WHERE id = ?`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer statement.Release()
+	base, ok := statement.ResetReadBindingsForReuse()
+	if !ok {
+		t.Fatal("direct statement declined")
+	}
+
+	// Install known capacities in one retained plain slice and one retained
+	// arena. The difference between two resets must charge both the arena
+	// directory headers and every chunk's full backing capacity.
+	baseHeaders := cap(statement.c.headers)
+	statement.c.headers = make([]string, 0, baseHeaders+3)
+	statement.c.boxes.chunks = make([][]any, 2, 4)
+	statement.c.boxes.chunks[0] = make([]any, 0, 3)
+	statement.c.boxes.chunks[1] = make([]any, 0, 5)
+	got, ok := statement.ResetReadBindingsForReuse()
+	if !ok {
+		t.Fatal("second reset declined")
+	}
+	wantDelta := int64(3*unsafe.Sizeof(string(""))) +
+		int64(4*unsafe.Sizeof([]any{})) +
+		int64(8*unsafe.Sizeof(any(nil)))
+	if got-base != wantDelta {
+		t.Fatalf("compiler retained-byte delta = %d, want %d", got-base, wantDelta)
+	}
+}
+
+func TestStatementReadReuseSmallLargeSmallRecovery(t *testing.T) {
+	const source = `SELECT id FROM docs WHERE id = ?`
+	statement, err := PrepareStatement(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer statement.Release()
+	if _, ok := statement.ResetReadBindingsForReuse(); !ok {
+		t.Fatal("direct statement declined")
+	}
+	segment := mustSegment(t, `{"id":"small"}`)
+
+	run := func(value any) string {
+		var exec Exec
+		cursor, err := statement.RunInto(&exec, FromSegment(segment), []any{value})
+		if err != nil {
+			exec.Release()
+			t.Fatalf("bind %v: %v", value, err)
+		}
+		got := cursorKey(statement, cursor)
+		exec.Release()
+		if _, ok := statement.ResetReadBindingsForReuse(); !ok {
+			t.Fatalf("reset after %v declined", value)
+		}
+		return got
+	}
+
+	if got := run("small"); got != "|id\n4:\"small\"|\n" {
+		t.Fatalf("small result = %q", got)
+	}
+	long := strings.Repeat("x", 128<<10)
+	if got := run(long); got != "|id\n" {
+		t.Fatalf("large result = %q", got)
+	}
+	if statement.c.plan != nil || statement.c.result != nil {
+		t.Fatal("oversized compiler storage was retained")
+	}
+	if got := run("small"); got != "|id\n4:\"small\"|\n" {
+		t.Fatalf("recovered small result = %q", got)
 	}
 }
 

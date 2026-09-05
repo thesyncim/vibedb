@@ -1,0 +1,168 @@
+{
+  "schema": "vibedb.point-read-compiler-evidence/1",
+  "status": "complete",
+  "scope": {
+    "type": "local_prepared_driver_diagnostic",
+    "claim": "The measurement covers the prepared local replicated point-read caller only.",
+    "excluded_claims": [
+      "distributed throughput",
+      "CRDB end-to-end win",
+      "RF3 end-to-end win"
+    ]
+  },
+  "source_revisions": {
+    "measured_baseline": {
+      "revision": "3a7d3b15dfc82579c7080b4acf95a12383718737",
+      "tree": "85b86de4f2c15b99615ed52e3705e12cdb0de186",
+      "worktree": "/private/tmp/vibedb-point-before-3a7d3b15"
+    },
+    "measured_candidate": {
+      "revision": "371de0af92bb419126cf49c0843da9223f39043d",
+      "tree": "51e0f3cc4553cb4c050d1069824011966f59755f",
+      "worktree": "/private/tmp/vibedb-distributed-read-performance",
+      "role": "PR head used for the measured after binary"
+    },
+    "merge": {
+      "pull_request": 190,
+      "revision": "47cedea615c9642eb3afc3b178d8da414f47e457",
+      "merged_at": "2026-09-05T21:31:45Z",
+      "role": "later merge commit; not used to build the measured after binary"
+    }
+  },
+  "benchmark_source": {
+    "injected_path": "sql/driver/replicated_point_cpu_bench_test.go",
+    "evidence_copy": "provenance/replicated_point_cpu_bench_test.go.txt",
+    "sha256": "46262105bd205fdc8c4e2e56d93e73b510fa01d5a2684783be811aed2763e0ab"
+  },
+  "toolchain": {
+    "runtime_image": "golang:1.27-bookworm@sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b",
+    "runtime_image_inspect_sha256": "668c09685d43a1f244d7c1bd93af48f2b4a6fd2ef5d15ae71528f60b8e5271ef",
+    "go_version": "go1.27.1 linux/arm64",
+    "go_version_log": "provenance/016-docker-go-version.stdout",
+    "build_environment": {
+      "GOEXPERIMENT": "simd",
+      "GOOS": "linux",
+      "GOARCH": "arm64",
+      "CGO_ENABLED": "0",
+      "trimpath": true,
+      "GOTOOLCHAIN": "local"
+    },
+    "project_env": "/Users/thesyncim/.codex/bin/project-env",
+    "agent_id": "luna-point-validation"
+  },
+  "build": {
+    "historical_manifest": "provenance/manifest.json",
+    "historical_manifest_status": "built",
+    "historical_manifest_sha256": "dd0fff3346cd82754d51a4f1e335dad24a1ed2acb3d0cbcf8ebf7dd3151cd75f",
+    "commands": "provenance/commands.jsonl",
+    "commands_sha256": "53ed14710e3b266787915c3ee1c1839aac6597ee6df0a172466816c77ce0242f",
+    "copied_build_logs": "provenance/build-logs",
+    "binaries": {
+      "before": {
+        "sha256": "4491c6a07a4139db76167bd28c61defbf02d9d5d24f4e739b11a3a5ead6c4feb",
+        "bytes": 37859203
+      },
+      "after": {
+        "sha256": "e5d038c307459f36035e4456efb5b10951357dfbedaf5b818afdd14896ad67c2",
+        "bytes": 37874130
+      }
+    },
+    "cache": {
+      "project_cache_root": "/private/var/folders/x3/kqy4mlzx43n21g8wpjj2hp580000gn/C/codex-projects",
+      "gocache": "/private/var/folders/x3/kqy4mlzx43n21g8wpjj2hp580000gn/C/codex-projects/95786445379e5235/go-build",
+      "agent_tmp": "/private/var/folders/x3/kqy4mlzx43n21g8wpjj2hp580000gn/C/codex-projects/95786445379e5235/tmp/luna-point-validation_"
+    }
+  },
+  "native_correctness": {
+    "suite": "Test(ReplicatedPointRaw|ReplicatedPointReadSession|ReplicatedReadReuse)",
+    "before": {
+      "log": "native/native-before.log",
+      "sha256": "9d745cc746ee9c9ca125377250a141c1d05d42533168c7892b15b44d3b3fe093",
+      "started": 38,
+      "passed": 38,
+      "skipped": 0,
+      "failed": 0
+    },
+    "after": {
+      "log": "native/native-after.log",
+      "sha256": "72fbb02a1b5dc23df5d1eeaedafde8fdf3425a798a0c1f018cd67df20d516b7f",
+      "started": 38,
+      "passed": 38,
+      "skipped": 0,
+      "failed": 0
+    },
+    "counts_file": "native-counts.json",
+    "counts_file_sha256": "34b59ef85b4f01e1d3b799b8351b086ec5779b327e5eb239e515afcbb1dfc52e"
+  },
+  "timing": {
+    "runtime_provenance": "provenance/runtime-provenance.json",
+    "runtime_provenance_sha256": "d16ea77749a70f120154294c708bcbb3eefc98e5c9f552c707f0302624ba1a4e",
+    "replay_commands": "timing-commands.txt",
+    "replay_commands_sha256": "68f2ae2bde0f9e39aac0a681f29f43c92ca11216daffb7d804e5f14a81f8b008",
+    "quiet_window_utc": {
+      "granted_start": "2026-09-05T21:26:00Z",
+      "hard_end": "2026-09-05T21:31:00Z",
+      "reported_completion": "2026-09-05T21:30:29Z",
+      "reported_completion_precision": "approximate"
+    },
+    "order": ["before", "after", "after", "before"],
+    "valid_blocks": [
+      {"arm": "before", "log": "valid/abba-06-before.log", "sha256": "e60107912aac54a092f7943b6099110f3c179d6938400fd2bcbc63a7ad1abd3e"},
+      {"arm": "after", "log": "valid/abba-07-after.log", "sha256": "fe45194297767459dcc6d85d1b0a3dc6d037023efc140f144763e3b1bd0330ee"},
+      {"arm": "after", "log": "valid/abba-08-after.log", "sha256": "3d43c6d82d2eaa8ec1a9a832a2f048b291dd9562d6e857c3f97df7203a5f2506"},
+      {"arm": "before", "log": "valid/abba-09-before.log", "sha256": "9c0e9b2b63d0191827af875c499bcc1f2c1a244450b23e297788bef135abd727"}
+    ],
+    "raw_samples": {
+      "file": "provenance/timing-summary.json",
+      "sha256": "6278ba1222019f283727594ac011897dff576516d7461de0f1b9ec27ea1b236a",
+      "rows": 24,
+      "samples_per_workload_and_arm": 6,
+      "iterations_per_row": 5000,
+      "timed_verified_operations": 120000,
+      "skipped_rows": 0,
+      "failed_rows": 0
+    },
+    "summary": {
+      "before_point_hit": {"median_ns_per_op": 12975, "min_ns_per_op": 10399, "max_ns_per_op": 13421, "mean_ns_per_op": 12527, "bytes_per_op": 20101, "allocs_per_op": 131},
+      "after_point_hit": {"median_ns_per_op": 10655, "min_ns_per_op": 10119, "max_ns_per_op": 12405, "mean_ns_per_op": 11034.333333333334, "bytes_per_op": 16525, "allocs_per_op": 110},
+      "before_point_miss": {"median_ns_per_op": 9371, "min_ns_per_op": 9100, "max_ns_per_op": 9573, "mean_ns_per_op": 9351.5, "bytes_per_op": 11560, "allocs_per_op": 110},
+      "after_point_miss": {"median_ns_per_op": 8698, "min_ns_per_op": 7648, "max_ns_per_op": 10117, "mean_ns_per_op": 8719.166666666666, "bytes_per_op": 7984, "allocs_per_op": 89}
+    },
+    "median_delta": {
+      "point_hit_percent": -17.88,
+      "point_miss_percent": -7.18,
+      "point_hit_bytes_percent": -17.79,
+      "point_hit_allocs_percent": -16.03,
+      "point_miss_bytes_percent": -30.97,
+      "point_miss_allocs_percent": -19.09
+    },
+    "scratch": {
+      "volume": "vibedb-point-validation-luna-371de0af",
+      "container_tmp": "/testtmp",
+      "runtime_gotmpdir": "omitted"
+    }
+  },
+  "excluded_attempts": [
+    {"log": "excluded/abba-01-before.log", "sha256": "bb81f62840bafed9b7628ac96b78f090342c6c50007ee262fa5cead39ea1ebd3", "reason": "testing.TempDir failed because /go/tmp was read-only; no rows"},
+    {"log": "excluded/abba-02-after.log", "sha256": "bf08eb932d2f5ad1ac1a69846f10143e43966eed178782a019eb85a075c3b00e", "reason": "testing.TempDir failed because /go/tmp was read-only; no rows"},
+    {"log": "excluded/abba-03-after.log", "sha256": "73e3abb36ce4c22cbcc0587aeb8c55f57ef69496bfa1ec0709785b3a72aeb6ce", "reason": "testing.TempDir failed because /go/tmp was read-only; no rows"},
+    {"log": "excluded/abba-04-before.log", "sha256": "d0b07a84868216e25ad7d5f317c7d1eae6c736a31edcfa9be0841b82483b46f3", "reason": "testing.TempDir failed because /go/tmp was read-only; no rows"},
+    {"log": "excluded/abba-05-before.log", "sha256": "5a6ad51cd3b2515b025097a7272b797c2ca3695e887f25354d9fd2ed00532af2", "reason": "rows existed, but runtime temporary files used the host agent bind instead of the named volume"}
+  ],
+  "ci": {
+    "pull_request": 190,
+    "record": "ci-pr190.json",
+    "sha256": "d8c1b783b2f8d40ab5311fb57c3a06486a289fb81dda607924f09d87bbefd9ee",
+    "state": "MERGED",
+    "all_checks_success": true,
+    "check_count": 40
+  },
+  "artifact_hashes": {
+    "README.md": "3dd3ea6b4f7546e36a286841c31988fe08387a9a5023d5fb1b25aaa745000beb",
+    "provenance/replicated_point_cpu_bench_test.go.txt": "46262105bd205fdc8c4e2e56d93e73b510fa01d5a2684783be811aed2763e0ab",
+    "provenance/run_driver_diagnostics.py": "ce5b68bc596821a5f37f13b5012ddd550142e20627037b3f4e97af69761ea865",
+    "provenance/runtime-provenance.json": "d16ea77749a70f120154294c708bcbb3eefc98e5c9f552c707f0302624ba1a4e",
+    "native-counts.json": "34b59ef85b4f01e1d3b799b8351b086ec5779b327e5eb239e515afcbb1dfc52e",
+    "ci-pr190.json": "d8c1b783b2f8d40ab5311fb57c3a06486a289fb81dda607924f09d87bbefd9ee"
+  }
+}

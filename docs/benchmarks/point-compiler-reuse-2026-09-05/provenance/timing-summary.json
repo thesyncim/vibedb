@@ -1,0 +1,304 @@
+{
+  "files": [
+    {
+      "arm": "before",
+      "path": "/private/tmp/vibedb-point-validation-371de0af-build/abba-06-before.log",
+      "sha256": "e60107912aac54a092f7943b6099110f3c179d6938400fd2bcbc63a7ad1abd3e"
+    },
+    {
+      "arm": "after",
+      "path": "/private/tmp/vibedb-point-validation-371de0af-build/abba-07-after.log",
+      "sha256": "fe45194297767459dcc6d85d1b0a3dc6d037023efc140f144763e3b1bd0330ee"
+    },
+    {
+      "arm": "after",
+      "path": "/private/tmp/vibedb-point-validation-371de0af-build/abba-08-after.log",
+      "sha256": "3d43c6d82d2eaa8ec1a9a832a2f048b291dd9562d6e857c3f97df7203a5f2506"
+    },
+    {
+      "arm": "before",
+      "path": "/private/tmp/vibedb-point-validation-371de0af-build/abba-09-before.log",
+      "sha256": "9c0e9b2b63d0191827af875c499bcc1f2c1a244450b23e297788bef135abd727"
+    }
+  ],
+  "rows": [
+    {
+      "arm": "before",
+      "file": "abba-06-before.log",
+      "workload": "point_hit",
+      "iterations": 5000,
+      "ns_per_op": 13281.0,
+      "bytes_per_op": 20101.0,
+      "allocs_per_op": 131.0
+    },
+    {
+      "arm": "before",
+      "file": "abba-06-before.log",
+      "workload": "point_hit",
+      "iterations": 5000,
+      "ns_per_op": 13421.0,
+      "bytes_per_op": 20101.0,
+      "allocs_per_op": 131.0
+    },
+    {
+      "arm": "before",
+      "file": "abba-06-before.log",
+      "workload": "point_hit",
+      "iterations": 5000,
+      "ns_per_op": 12705.0,
+      "bytes_per_op": 20101.0,
+      "allocs_per_op": 131.0
+    },
+    {
+      "arm": "before",
+      "file": "abba-06-before.log",
+      "workload": "point_miss",
+      "iterations": 5000,
+      "ns_per_op": 9100.0,
+      "bytes_per_op": 11560.0,
+      "allocs_per_op": 110.0
+    },
+    {
+      "arm": "before",
+      "file": "abba-06-before.log",
+      "workload": "point_miss",
+      "iterations": 5000,
+      "ns_per_op": 9573.0,
+      "bytes_per_op": 11560.0,
+      "allocs_per_op": 110.0
+    },
+    {
+      "arm": "before",
+      "file": "abba-06-before.log",
+      "workload": "point_miss",
+      "iterations": 5000,
+      "ns_per_op": 9554.0,
+      "bytes_per_op": 11560.0,
+      "allocs_per_op": 110.0
+    },
+    {
+      "arm": "after",
+      "file": "abba-07-after.log",
+      "workload": "point_hit",
+      "iterations": 5000,
+      "ns_per_op": 12405.0,
+      "bytes_per_op": 16525.0,
+      "allocs_per_op": 110.0
+    },
+    {
+      "arm": "after",
+      "file": "abba-07-after.log",
+      "workload": "point_hit",
+      "iterations": 5000,
+      "ns_per_op": 11850.0,
+      "bytes_per_op": 16525.0,
+      "allocs_per_op": 110.0
+    },
+    {
+      "arm": "after",
+      "file": "abba-07-after.log",
+      "workload": "point_hit",
+      "iterations": 5000,
+      "ns_per_op": 10522.0,
+      "bytes_per_op": 16525.0,
+      "allocs_per_op": 110.0
+    },
+    {
+      "arm": "after",
+      "file": "abba-07-after.log",
+      "workload": "point_miss",
+      "iterations": 5000,
+      "ns_per_op": 10117.0,
+      "bytes_per_op": 7984.0,
+      "allocs_per_op": 89.0
+    },
+    {
+      "arm": "after",
+      "file": "abba-07-after.log",
+      "workload": "point_miss",
+      "iterations": 5000,
+      "ns_per_op": 9320.0,
+      "bytes_per_op": 7984.0,
+      "allocs_per_op": 89.0
+    },
+    {
+      "arm": "after",
+      "file": "abba-07-after.log",
+      "workload": "point_miss",
+      "iterations": 5000,
+      "ns_per_op": 7834.0,
+      "bytes_per_op": 7984.0,
+      "allocs_per_op": 89.0
+    },
+    {
+      "arm": "after",
+      "file": "abba-08-after.log",
+      "workload": "point_hit",
+      "iterations": 5000,
+      "ns_per_op": 10119.0,
+      "bytes_per_op": 16525.0,
+      "allocs_per_op": 110.0
+    },
+    {
+      "arm": "after",
+      "file": "abba-08-after.log",
+      "workload": "point_hit",
+      "iterations": 5000,
+      "ns_per_op": 10679.0,
+      "bytes_per_op": 16525.0,
+      "allocs_per_op": 110.0
+    },
+    {
+      "arm": "after",
+      "file": "abba-08-after.log",
+      "workload": "point_hit",
+      "iterations": 5000,
+      "ns_per_op": 10631.0,
+      "bytes_per_op": 16525.0,
+      "allocs_per_op": 110.0
+    },
+    {
+      "arm": "after",
+      "file": "abba-08-after.log",
+      "workload": "point_miss",
+      "iterations": 5000,
+      "ns_per_op": 8229.0,
+      "bytes_per_op": 7984.0,
+      "allocs_per_op": 89.0
+    },
+    {
+      "arm": "after",
+      "file": "abba-08-after.log",
+      "workload": "point_miss",
+      "iterations": 5000,
+      "ns_per_op": 7648.0,
+      "bytes_per_op": 7984.0,
+      "allocs_per_op": 89.0
+    },
+    {
+      "arm": "after",
+      "file": "abba-08-after.log",
+      "workload": "point_miss",
+      "iterations": 5000,
+      "ns_per_op": 9167.0,
+      "bytes_per_op": 7984.0,
+      "allocs_per_op": 89.0
+    },
+    {
+      "arm": "before",
+      "file": "abba-09-before.log",
+      "workload": "point_hit",
+      "iterations": 5000,
+      "ns_per_op": 10399.0,
+      "bytes_per_op": 20101.0,
+      "allocs_per_op": 131.0
+    },
+    {
+      "arm": "before",
+      "file": "abba-09-before.log",
+      "workload": "point_hit",
+      "iterations": 5000,
+      "ns_per_op": 12111.0,
+      "bytes_per_op": 20101.0,
+      "allocs_per_op": 131.0
+    },
+    {
+      "arm": "before",
+      "file": "abba-09-before.log",
+      "workload": "point_hit",
+      "iterations": 5000,
+      "ns_per_op": 13245.0,
+      "bytes_per_op": 20101.0,
+      "allocs_per_op": 131.0
+    },
+    {
+      "arm": "before",
+      "file": "abba-09-before.log",
+      "workload": "point_miss",
+      "iterations": 5000,
+      "ns_per_op": 9140.0,
+      "bytes_per_op": 11560.0,
+      "allocs_per_op": 110.0
+    },
+    {
+      "arm": "before",
+      "file": "abba-09-before.log",
+      "workload": "point_miss",
+      "iterations": 5000,
+      "ns_per_op": 9249.0,
+      "bytes_per_op": 11560.0,
+      "allocs_per_op": 110.0
+    },
+    {
+      "arm": "before",
+      "file": "abba-09-before.log",
+      "workload": "point_miss",
+      "iterations": 5000,
+      "ns_per_op": 9493.0,
+      "bytes_per_op": 11560.0,
+      "allocs_per_op": 110.0
+    }
+  ],
+  "summary": {
+    "after_point_hit": {
+      "samples": 6,
+      "ns_per_op": {
+        "median": 10655.0,
+        "min": 10119.0,
+        "max": 12405.0,
+        "mean": 11034.333333333334
+      },
+      "bytes_per_op": [
+        16525.0
+      ],
+      "allocs_per_op": [
+        110.0
+      ]
+    },
+    "after_point_miss": {
+      "samples": 6,
+      "ns_per_op": {
+        "median": 8698.0,
+        "min": 7648.0,
+        "max": 10117.0,
+        "mean": 8719.166666666666
+      },
+      "bytes_per_op": [
+        7984.0
+      ],
+      "allocs_per_op": [
+        89.0
+      ]
+    },
+    "before_point_hit": {
+      "samples": 6,
+      "ns_per_op": {
+        "median": 12975.0,
+        "min": 10399.0,
+        "max": 13421.0,
+        "mean": 12527.0
+      },
+      "bytes_per_op": [
+        20101.0
+      ],
+      "allocs_per_op": [
+        131.0
+      ]
+    },
+    "before_point_miss": {
+      "samples": 6,
+      "ns_per_op": {
+        "median": 9371.0,
+        "min": 9100.0,
+        "max": 9573.0,
+        "mean": 9351.5
+      },
+      "bytes_per_op": [
+        11560.0
+      ],
+      "allocs_per_op": [
+        110.0
+      ]
+    }
+  }
+}

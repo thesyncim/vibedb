@@ -1,0 +1,13 @@
+[
+    {
+        "CreatedAt": "2026-09-05T21:24:40Z",
+        "Driver": "local",
+        "Labels": {
+            "vibedb.point-round": "diagnostic"
+        },
+        "Mountpoint": "/var/lib/docker/volumes/vibedb-point-validation-luna-371de0af/_data",
+        "Name": "vibedb-point-validation-luna-371de0af",
+        "Options": null,
+        "Scope": "local"
+    }
+]
