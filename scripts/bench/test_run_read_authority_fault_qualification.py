@@ -14,6 +14,30 @@ SPEC.loader.exec_module(MODULE)
 
 
 class FaultQualificationProvenanceTest(unittest.TestCase):
+    def test_parse_utc_preserves_nanosecond_order_and_rfc3339_offsets(self):
+        first = MODULE._parse_utc(
+            "2026-09-05T19:18:50.123456789Z", "timestamp")
+        next_nanosecond = MODULE._parse_utc(
+            "2026-09-05T19:18:50.123456790Z", "timestamp")
+        self.assertIsInstance(first, int)
+        self.assertEqual(next_nanosecond - first, 1)
+        self.assertEqual(first, MODULE._parse_utc(
+            "2026-09-05T20:18:50.123456789+01:00", "timestamp"))
+        self.assertEqual(first, MODULE._parse_utc(
+            "2026-09-05T19:18:50.123456789+00:00", "timestamp"))
+        self.assertEqual(first, MODULE._parse_utc(
+            "2026-09-05T19:18:50.123456789Z", "timestamp"))
+        self.assertEqual(MODULE._parse_utc(
+            "2026-09-05T19:18:50Z", "timestamp"), MODULE._parse_utc(
+                "2026-09-05T19:18:50.000000000Z", "timestamp"))
+
+        with self.assertRaisesRegex(ValueError, "has invalid UTC"):
+            MODULE._parse_utc(
+                "2026-09-05T19:18:50.1234567890Z", "timestamp")
+        with self.assertRaisesRegex(ValueError, "has invalid UTC"):
+            MODULE._parse_utc(
+                "2026-09-05 19:18:50.123456789Z", "timestamp")
+
     def test_source_snapshot_preserves_porcelain_status_prefix(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"
@@ -86,6 +110,94 @@ class FaultQualificationProvenanceTest(unittest.TestCase):
 
             self.assertEqual(MODULE.diagnostic_output_path(run_dir), path)
 
+    def test_group_timeline_keeps_member_terms_and_node_authority_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            path = directory / "snapshots.jsonl"
+            output = directory / "timeline.json"
+            members = []
+            node_metrics = []
+            for member in range(1, 4):
+                node_id = f"{member:032x}"
+                members.append({
+                    "member_id": member,
+                    "node_id": node_id,
+                    "status": {
+                        "term": member,
+                        "leader_id": 2,
+                        "commit": 10 + member,
+                        "applied": 9 + member,
+                        "checkpoint_applied": 8 + member,
+                        "raft_state": 0,
+                        "raft_state_name": "StateFollower",
+                    },
+                    "progress": {"match": member},
+                    "metrics": {
+                        "applied_entries": member,
+                        "ready_persisted": member + 1,
+                        "commit_advancements": member + 2,
+                        "committed_entries": member + 3,
+                    },
+                })
+                node_metrics.append({
+                    "node_id": node_id,
+                    "scope": "node_process",
+                    "source": "rf3-diagnostics-file" if member == 1 else "servicemetrics",
+                    "utc": "2026-09-05T18:00:00Z",
+                    "serial": member,
+                    "pid": 40 + member,
+                    "authority_available": member == 1,
+                    "authority_error": None if member == 1 else "diagnostic file unavailable",
+                    "metrics": ({
+                        "authority_read_hits": 100 + member,
+                        "authority_round_attempts": 10 + member,
+                    } if member == 1 else {
+                        "applied_entries": member,
+                    }),
+                    "error": None if member == 1 else "diagnostic file unavailable",
+                })
+            groups = [{"group_id": f"{group:032x}", "distribution": "system",
+                       "shard": "all", "members": members} for group in range(6)]
+            groups.append({"group_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                           "distribution": "table-rf3_sql_group-b1c8362a213f",
+                           "shard": "all", "members": members})
+            path.write_text(json.dumps({
+                "schema": "vibedb.rf3-diagnostic/1",
+                "sequence": 4,
+                "utc": "2026-09-05T18:00:00Z",
+                "elapsed_ns": 12,
+                "groups": groups,
+                "node_metrics": node_metrics,
+                "expected_cuts": 21,
+                "valid_cuts": 21,
+                "preflight_ready": True,
+                "sampling_errors": 0,
+            }) + "\n")
+
+            summary = MODULE.write_group_timeline(path, output, "rf3_sql_group")
+            self.assertTrue(summary["complete"])
+            payload = json.loads(output.read_text())
+            self.assertEqual(payload["terms_scope"].count("cross-group"), 1)
+            self.assertEqual([member["term"] for member in payload["records"][0]["members"]], [1, 2, 3])
+            self.assertNotIn("term", payload["records"][0])
+            self.assertEqual(
+                payload["records"][0]["members"][0]["authority_metrics"]["scope"],
+                "node_process")
+            self.assertEqual(
+                payload["records"][0]["members"][0]["authority_metrics"]["metrics"]["authority_read_hits"],
+                101)
+            node_one = payload["records"][0]["node_process_metrics"]["00000000000000000000000000000001"]
+            self.assertEqual(node_one["source"], "rf3-diagnostics-file")
+            self.assertEqual(node_one["utc"], "2026-09-05T18:00:00Z")
+            self.assertEqual(node_one["serial"], 1)
+            self.assertEqual(node_one["pid"], 41)
+            self.assertTrue(node_one["authority_available"])
+            node_two = payload["records"][0]["node_process_metrics"]["00000000000000000000000000000002"]
+            self.assertEqual(node_two["source"], "servicemetrics")
+            self.assertFalse(node_two["authority_available"])
+            self.assertEqual(node_two["error"], "diagnostic file unavailable")
+            self.assertNotIn("authority_read_hits", node_two["metrics"])
+
     def test_primary_result_failure_keeps_client_error_when_restart_is_absent(self):
         with tempfile.TemporaryDirectory() as directory:
             run_dir = Path(directory) / "candidate"
@@ -101,10 +213,115 @@ class FaultQualificationProvenanceTest(unittest.TestCase):
             self.assertEqual(failure["client_error_tail"], "warmup: ERROR: " + error)
             self.assertEqual(failure["client_log"], "candidate/client.log")
 
+            self.assertIsNone(MODULE.primary_result_failure({
+                "status": "failed",
+                "client_exit_code": 0,
+                "validation": {"complete": True},
+                "errors": ["post-CONT diagnostic latch was not retained"],
+            }, run_dir))
+            self.assertIsNotNone(MODULE.primary_result_failure({
+                "status": "failed",
+                "client_exit_code": 0,
+                "validation": {"complete": False},
+                "errors": ["client report is incomplete or failed"],
+            }, run_dir))
+
             self.assertFalse(MODULE.fault_qualification_complete(
                 False, {"status": "verified-signals"}, None))
+            self.assertFalse(MODULE.fault_qualification_complete(
+                False, {"status": "verified-signals"}, {"status": "verified"}, False))
             self.assertTrue(MODULE.fault_qualification_complete(
                 True, None, None))
+
+    def test_post_cont_latch_requires_all_post_cont_authority_snapshots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "post-cont-cut.json"
+            counters = {
+                name: 0 for name in MODULE.REQUIRED_AUTHORITY_COUNTERS
+            }
+            nodes = []
+            for member in range(1, 4):
+                nodes.append({
+                    "node_id": f"{member:032x}",
+                    "source": "rf3-diagnostics-file",
+                    "utc": "2026-09-05T18:00:00.000000001Z",
+                    "serial": member,
+                    "pid": 40 + member,
+                    "authority_available": True,
+                    "metrics": dict(counters),
+                })
+            acknowledged = {
+                node["node_id"]: {
+                    "node_id": node["node_id"],
+                    "utc": node["utc"],
+                    "serial": node["serial"],
+                    "pid": node["pid"],
+                }
+                for node in nodes
+            }
+            cycle = {
+                "schema": "vibedb.rf3-diagnostic/1",
+                "sequence": 7,
+                "utc": "2026-09-05T18:00:02.000000001Z",
+                "expected_cuts": 21,
+                "valid_cuts": 21,
+                "preflight_ready": True,
+                "node_metrics": nodes,
+                "latch": {
+                    "sequence": 7,
+                    "complete": True,
+                    "requested_utc": "2026-09-05T18:00:00.000000001Z",
+                    "armed_utc": "2026-09-05T18:00:01.000000001Z",
+                    "captured_utc": "2026-09-05T18:00:03.000000001Z",
+                },
+            }
+
+            def write_artifact():
+                path.write_text(json.dumps({
+                    "schema": "vibedb.rf3-diagnostic-latch/1",
+                    "event": "post-cont",
+                    "requested_utc": "2026-09-05T18:00:00.000000001Z",
+                    "armed_utc": "2026-09-05T18:00:01.000000001Z",
+                    "captured_utc": "2026-09-05T18:00:03.000000001Z",
+                    "sequence": 7,
+                    "cycle": cycle,
+                }))
+
+            write_artifact()
+            summary = MODULE.validate_post_cont_latch(
+                path, post_pause_diagnostics=acknowledged)
+            self.assertTrue(summary["complete"])
+            self.assertEqual(summary["authority_snapshot_count"], 3)
+            self.assertEqual(
+                summary["authority_nodes"][0]["acknowledged_utc"],
+                "2026-09-05T18:00:00.000000001Z")
+
+            acknowledged[nodes[1]["node_id"]]["utc"] = (
+                "2026-09-05T18:00:00.000000000Z")
+            with self.assertRaisesRegex(
+                    ValueError, "acknowledged node .* predates controller handoff"):
+                MODULE.validate_post_cont_latch(
+                    path, post_pause_diagnostics=acknowledged)
+            acknowledged[nodes[1]["node_id"]]["utc"] = nodes[1]["utc"]
+
+            nodes[1]["authority_available"] = False
+            write_artifact()
+            with self.assertRaisesRegex(ValueError, "lacks authority availability"):
+                MODULE.validate_post_cont_latch(
+                    path, post_pause_diagnostics=acknowledged)
+
+            nodes[1]["authority_available"] = True
+            for field, value, message in (
+                    ("serial", 1, "serial regressed"),
+                    ("pid", 142, "PID differs"),
+                    ("utc", "2026-09-05T18:00:00.000000000Z", "timestamp regressed")):
+                original = nodes[1][field]
+                nodes[1][field] = value
+                write_artifact()
+                with self.assertRaisesRegex(ValueError, message):
+                    MODULE.validate_post_cont_latch(
+                        path, post_pause_diagnostics=acknowledged)
+                nodes[1][field] = original
 
 
 if __name__ == "__main__":

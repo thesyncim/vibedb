@@ -12,17 +12,19 @@ The qualification requires the explicit ``--laboratory-read-authority`` opt-in
 and builds every candidate executable with the labelled laboratory build tag.
 """
 
-from datetime import datetime, timezone
 import argparse
+import calendar
 import hashlib
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
 import threading
 import time
+from datetime import datetime, timezone
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -31,10 +33,20 @@ VALIDATOR_PATH = ROOT / "scripts/bench/summarize-crdb-sql.py"
 RUNTIME = (
     "golang:1.27-bookworm@sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b"
 )
-GOCACHE = Path("/private/tmp/vibedb-horizontal-gocache")
+GOCACHE = Path(os.environ.get("VIBEDB_GO_CACHE", "/Users/thesyncim/Library/Caches/go-build"))
 LAB_BUILD_TAG = "vibedb_rf3_read_authority_lab"
 QUARANTINE_SECONDS = 6.11
 GRANT_SECONDS = 5.0
+REQUIRED_AUTHORITY_COUNTERS = (
+    "authority_read_hits",
+    "authority_read_index_fallbacks",
+    "authority_read_validation_retries",
+    "authority_read_validation_failures",
+    "authority_round_attempts",
+    "read_authority_rounds_started",
+    "read_authority_requests_created",
+    "read_authority_grants_accepted",
+)
 
 
 def load_fixture():
@@ -241,17 +253,348 @@ def diagnostic_output_path(run_dir):
     return run_dir / "raw" / "per-group-snapshots.jsonl"
 
 
+def write_group_timeline(path, output, table):
+    """Retain one table group's member cuts without cross-group aggregation."""
+    prefix = f"table-{table}-"
+    rows = []
+    parse_errors = []
+    group_ids = set()
+    try:
+        lines = path.read_text().splitlines()
+    except (OSError, UnicodeDecodeError) as exc:
+        lines = []
+        parse_errors.append(f"read output: {exc}")
+    for line_number, line in enumerate(lines, 1):
+        try:
+            value = json.loads(line)
+            if value.get("schema") != "vibedb.rf3-diagnostic/1":
+                raise ValueError("invalid cycle schema")
+            groups = value.get("groups")
+            if not isinstance(groups, list):
+                raise ValueError("cycle has no groups")
+            matches = [group for group in groups
+                       if isinstance(group, dict) and
+                       isinstance(group.get("distribution"), str) and
+                       group["distribution"].startswith(prefix)]
+            if len(matches) != 1:
+                raise ValueError(
+                    f"expected one group distribution with prefix {prefix!r}, found {len(matches)}")
+            group = matches[0]
+            members = group.get("members")
+            if not isinstance(members, list):
+                raise ValueError("selected group has no member cuts")
+            group_id = group.get("group_id")
+            if isinstance(group_id, str):
+                group_ids.add(group_id)
+            node_process_metrics = {}
+            for node in value.get("node_metrics", []):
+                if not isinstance(node, dict) or not isinstance(node.get("node_id"), str):
+                    continue
+                node_process_metrics[node["node_id"]] = {
+                    "scope": node.get("scope"),
+                    "source": node.get("source"),
+                    "utc": node.get("utc"),
+                    "serial": node.get("serial"),
+                    "pid": node.get("pid"),
+                    "authority_available": node.get("authority_available"),
+                    "authority_error": node.get("authority_error"),
+                    "metrics": node.get("metrics"),
+                    "error": node.get("error"),
+                    "elapsed_ns": node.get("elapsed_ns"),
+                }
+            timeline_members = []
+            for member in members:
+                if not isinstance(member, dict):
+                    raise ValueError("selected group has a non-object member cut")
+                status = member.get("status") if isinstance(member.get("status"), dict) else {}
+                metrics = member.get("metrics") if isinstance(member.get("metrics"), dict) else None
+                progress = member.get("progress") if isinstance(member.get("progress"), dict) else None
+                authority = node_process_metrics.get(member.get("node_id"))
+                timeline_members.append({
+                    "member_id": member.get("member_id"),
+                    "node_id": member.get("node_id"),
+                    "term": status.get("term"),
+                    "leader_id": status.get("leader_id"),
+                    "commit": status.get("commit"),
+                    "applied": status.get("applied"),
+                    "checkpoint_applied": status.get("checkpoint_applied"),
+                    "raft_state": status.get("raft_state"),
+                    "raft_state_name": status.get("raft_state_name"),
+                    "state_applied": status.get("state_applied"),
+                    "progress": progress,
+                    "metrics": metrics,
+                    "ready_metrics": None if metrics is None else {
+                        "ready_persisted": metrics.get("ready_persisted"),
+                        "applied_entries": metrics.get("applied_entries"),
+                        "commit_advancements": metrics.get("commit_advancements"),
+                        "committed_entries": metrics.get("committed_entries"),
+                    },
+                    # These counters are process-wide on the fixed metrics
+                    # endpoint. The explicit scope keeps them from being read
+                    # as group-local authority counters.
+                    "authority_metrics": authority,
+                    "observe_error": member.get("observe_error"),
+                    "metrics_error": member.get("metrics_error"),
+                    "error": member.get("error"),
+                })
+            rows.append({
+                "sequence": value.get("sequence"),
+                "utc": value.get("utc"),
+                "elapsed_ns": value.get("elapsed_ns"),
+                "expected_cuts": value.get("expected_cuts"),
+                "valid_cuts": value.get("valid_cuts"),
+                "preflight_ready": value.get("preflight_ready"),
+                "preflight_reason": value.get("preflight_reason"),
+                "sampling_errors": value.get("sampling_errors"),
+                "latch": value.get("latch"),
+                "group_id": group_id,
+                "distribution": group.get("distribution"),
+                "shard": group.get("shard"),
+                "members": timeline_members,
+                "node_process_metrics": node_process_metrics,
+            })
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            parse_errors.append(f"line {line_number}: {exc}")
+    payload = {
+        "schema": "vibedb.rf3-diagnostic-group-timeline/1",
+        "table": table,
+        "distribution_prefix": prefix,
+        "group_ids": sorted(group_ids),
+        "terms_scope": "term, leader, commit, and applied are retained per member of this one group; no cross-group term aggregation",
+        "authority_metrics_scope": "node_process",
+        "records": rows,
+        "parse_errors": parse_errors,
+        "complete": bool(rows) and not parse_errors,
+    }
+    output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    output.write_text(json.dumps(payload, indent=2) + "\n")
+    return {
+        "schema": payload["schema"],
+        "table": table,
+        "group_ids": payload["group_ids"],
+        "records": len(rows),
+        "parse_errors": parse_errors,
+        "complete": payload["complete"],
+        "path": output.name,
+    }
+
+
+_RFC3339_NANO_RE = re.compile(
+    r"(?P<date>\d{4}-\d{2}-\d{2})T"
+    r"(?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})"
+    r"(?:\.(?P<fraction>\d{1,9}))?"
+    r"(?P<offset>Z|[+-]\d{2}:\d{2})$")
+
+
+def _parse_utc(value, name):
+    """Parse an RFC3339/RFC3339Nano instant to exact epoch nanoseconds.
+
+    ``datetime.fromisoformat`` on the supported Python versions accepts only
+    microseconds, while Go's ``time.RFC3339Nano`` emits one to nine fractional
+    digits.  Keep the comparison value as an integer so a one-nanosecond
+    ordering cannot be rounded away or changed by floating-point conversion.
+    """
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{name} is missing UTC")
+    match = _RFC3339_NANO_RE.fullmatch(value)
+    if match is None:
+        raise ValueError(f"{name} has invalid UTC")
+    try:
+        year, month, day = (int(part) for part in match.group("date").split("-"))
+        hour = int(match.group("hour"))
+        minute = int(match.group("minute"))
+        second = int(match.group("second"))
+        # Validate the civil time without converting through a platform
+        # timestamp, which may lose precision or have a limited year range.
+        datetime(year, month, day, hour, minute, second)
+        offset = match.group("offset")
+        if offset == "Z":
+            offset_seconds = 0
+        else:
+            offset_hour = int(offset[1:3])
+            offset_minute = int(offset[4:6])
+            if offset_hour > 23 or offset_minute > 59:
+                raise ValueError("timezone offset is out of range")
+            offset_seconds = offset_hour * 60 * 60 + offset_minute * 60
+            if offset[0] == "-":
+                offset_seconds = -offset_seconds
+        epoch_seconds = calendar.timegm(
+            (year, month, day, hour, minute, second)) - offset_seconds
+        fraction = match.group("fraction") or ""
+        fraction_nanoseconds = int(fraction.ljust(9, "0")) if fraction else 0
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} has invalid UTC") from exc
+    return epoch_seconds * 1_000_000_000 + fraction_nanoseconds
+
+
+def _positive_int(value, name, minimum=1):
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ValueError(f"{name} must be an integer >= {minimum}")
+    return value
+
+
+def _is_secondary_result_error(error):
+    value = str(error)
+    return value.startswith((
+        "post-CONT diagnostic latch",
+        "per-group diagnostic output",
+        "retaining stopped fixture evidence:",
+        "fixture container cleanup failed",
+        "fixture volume cleanup failed:",
+    ))
+
+
+def validate_post_cont_latch(path, expected_nodes=3, post_pause_diagnostics=None):
+    """Validate the immutable post-CONT cut and every required owner snapshot."""
+    _positive_int(expected_nodes, "expected node count")
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"could not read post-CONT latch: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError("post-CONT latch is not an object")
+    if value.get("schema") != "vibedb.rf3-diagnostic-latch/1":
+        raise ValueError("post-CONT latch has an invalid schema")
+    if value.get("event") != "post-cont":
+        raise ValueError("post-CONT latch has an invalid event")
+    cycle = value.get("cycle")
+    if not isinstance(cycle, dict):
+        raise ValueError("post-CONT latch has no cycle")
+    latch = cycle.get("latch")
+    if not isinstance(latch, dict) or latch.get("complete") is not True:
+        raise ValueError("post-CONT latch cycle is incomplete")
+    _positive_int(value.get("sequence"), "latch sequence")
+    _positive_int(cycle.get("sequence"), "cycle sequence")
+    requested = _parse_utc(value.get("requested_utc"), "latch requested")
+    armed = _parse_utc(value.get("armed_utc"), "latch armed")
+    captured = _parse_utc(value.get("captured_utc"), "latch captured")
+    cycle_utc = _parse_utc(cycle.get("utc"), "latch cycle")
+    if armed < requested:
+        raise ValueError("post-CONT latch armed before controller handoff")
+    latch_requested = _parse_utc(latch.get("requested_utc"), "cycle latch requested")
+    latch_armed = _parse_utc(latch.get("armed_utc"), "cycle latch armed")
+    latch_captured = _parse_utc(latch.get("captured_utc"), "cycle latch captured")
+    if latch_requested != requested or latch_armed != armed:
+        raise ValueError("post-CONT cycle latch timestamps do not match artifact")
+    if latch_captured < cycle_utc:
+        raise ValueError("post-CONT cycle latch capture predates its cycle")
+    if cycle_utc < requested:
+        raise ValueError("post-CONT latch cycle predates controller handoff")
+    if cycle_utc < armed:
+        raise ValueError("post-CONT latch cycle predates sidecar arm handoff")
+    if captured < cycle_utc:
+        raise ValueError("post-CONT latch capture predates its cycle")
+    if value.get("sequence") != cycle.get("sequence"):
+        raise ValueError("post-CONT latch sequence does not match its cycle")
+    if latch.get("sequence") != cycle.get("sequence"):
+        raise ValueError("post-CONT latch sequence does not match its cycle")
+    if cycle.get("preflight_ready") is not True:
+        raise ValueError("post-CONT latch cycle did not pass group preflight")
+    expected_cuts = _positive_int(cycle.get("expected_cuts"), "latch expected cuts")
+    if cycle.get("valid_cuts") != expected_cuts:
+        raise ValueError("post-CONT latch cycle has incomplete group cuts")
+    if not isinstance(post_pause_diagnostics, dict) or len(post_pause_diagnostics) != expected_nodes:
+        raise ValueError(
+            "post-CONT latch requires retained acknowledged diagnostics for every node")
+    acknowledged = {}
+    for key, snapshot in post_pause_diagnostics.items():
+        if not isinstance(key, str) or not isinstance(snapshot, dict):
+            raise ValueError("retained post-CONT diagnostics have invalid node identity")
+        node_id = snapshot.get("node_id")
+        if node_id != key:
+            raise ValueError(f"retained post-CONT diagnostic identity mismatch for {key}")
+        serial = _positive_int(snapshot.get("serial"), f"acknowledged node {node_id} serial")
+        pid = _positive_int(snapshot.get("pid"), f"acknowledged node {node_id} pid", minimum=2)
+        snapshot_utc = _parse_utc(snapshot.get("utc"), f"acknowledged node {node_id}")
+        if snapshot_utc < requested:
+            raise ValueError(
+                f"post-CONT acknowledged node {node_id} predates controller handoff")
+        acknowledged[node_id] = {
+            "serial": serial, "pid": pid, "utc": snapshot_utc,
+            "utc_text": snapshot["utc"],
+        }
+    nodes = cycle.get("node_metrics")
+    if not isinstance(nodes, list) or len(nodes) != expected_nodes:
+        raise ValueError(
+            f"post-CONT latch requires {expected_nodes} node authority snapshots")
+    authority_nodes = []
+    seen = set()
+    for index, node in enumerate(nodes):
+        if not isinstance(node, dict):
+            raise ValueError(f"post-CONT node snapshot {index} is not an object")
+        node_id = node.get("node_id")
+        if not isinstance(node_id, str) or not node_id or node_id in seen:
+            raise ValueError(f"post-CONT node snapshot {index} has duplicate identity")
+        seen.add(node_id)
+        acknowledged_snapshot = acknowledged.get(node_id)
+        if acknowledged_snapshot is None:
+            raise ValueError(f"post-CONT latch is missing expected node {node_id}")
+        if node.get("source") != "rf3-diagnostics-file":
+            raise ValueError(f"post-CONT node {node_id} lacks diagnostic-file provenance")
+        if node.get("authority_available") is not True:
+            raise ValueError(f"post-CONT node {node_id} lacks authority availability")
+        node_utc_value = node.get("utc")
+        node_utc = _parse_utc(node_utc_value, f"post-CONT node {node_id}")
+        serial = _positive_int(node.get("serial"), f"post-CONT node {node_id} serial")
+        pid = _positive_int(node.get("pid"), f"post-CONT node {node_id} pid", minimum=2)
+        if pid != acknowledged_snapshot["pid"]:
+            raise ValueError(f"post-CONT node {node_id} PID differs from acknowledged process")
+        if serial < acknowledged_snapshot["serial"]:
+            raise ValueError(f"post-CONT node {node_id} serial regressed")
+        if node_utc < acknowledged_snapshot["utc"]:
+            raise ValueError(f"post-CONT node {node_id} timestamp regressed")
+        metrics = node.get("metrics")
+        if not isinstance(metrics, dict):
+            raise ValueError(f"post-CONT node {node_id} lacks authority metrics")
+        for counter_name in REQUIRED_AUTHORITY_COUNTERS:
+            counter_value = metrics.get(counter_name)
+            if isinstance(counter_value, bool) or not isinstance(counter_value, int):
+                raise ValueError(
+                    f"post-CONT node {node_id} lacks integer {counter_name}")
+        authority_nodes.append({
+            "node_id": node_id,
+            "source": node["source"],
+            "utc": node_utc_value,
+            "serial": serial,
+            "pid": pid,
+            "acknowledged_serial": acknowledged_snapshot["serial"],
+            "acknowledged_utc": acknowledged_snapshot["utc_text"],
+        })
+    return {
+        "schema": value["schema"],
+        "event": value["event"],
+        "sequence": value["sequence"],
+        "captured_utc": value["captured_utc"],
+        "cycle_utc": cycle["utc"],
+        "authority_nodes": authority_nodes,
+        "authority_snapshot_count": len(authority_nodes),
+        "complete": True,
+    }
+
+
 def primary_result_failure(result, run_dir):
     """Retain the client failure when later qualification bookkeeping fails."""
     if not isinstance(result, dict):
         return None
-    errors = result.get("errors")
-    if not isinstance(errors, list) or not errors:
+    client_exit_code = result.get("client_exit_code")
+    client_failed = (
+        isinstance(client_exit_code, int) and
+        not isinstance(client_exit_code, bool) and client_exit_code != 0)
+    validation = result.get("validation")
+    validation_failed = isinstance(validation, dict) and validation.get("complete") is False
+    if not client_failed and not validation_failed:
         return None
+    errors = result.get("errors")
+    errors = [str(error) for error in errors] if isinstance(errors, list) else []
+    errors = [error for error in errors if not _is_secondary_result_error(error)]
+    if not errors:
+        errors = ["client exited nonzero" if client_failed else
+                  "client report is incomplete or failed"]
     failure = {
         "status": result.get("status"),
-        "client_exit_code": result.get("client_exit_code"),
-        "errors": [str(error) for error in errors],
+        "client_exit_code": client_exit_code,
+        "validation_failed": validation_failed,
+        "errors": errors,
         "client_log": "candidate/client.log",
     }
     client_log = run_dir / "client.log"
@@ -266,13 +609,14 @@ def primary_result_failure(result, run_dir):
     return failure
 
 
-def fault_qualification_complete(no_fault, pause, restart):
+def fault_qualification_complete(no_fault, pause, restart, latch_complete=True):
     """Evaluate the fault contract without treating an absent restart as a dict."""
     pause = pause if isinstance(pause, dict) else {}
     restart = restart if isinstance(restart, dict) else {}
     return no_fault or (
         pause.get("status") == "verified-signals" and
-        restart.get("status") == "verified")
+        restart.get("status") == "verified" and
+        latch_complete is True)
 
 
 def authority_proof(records):
@@ -462,6 +806,8 @@ def main(argv=None):
     parser.add_argument("--ready-timeout", type=int, default=180)
     parser.add_argument("--no-fault", action="store_true",
                         help="run the original workload without SIGSTOP/SIGKILL fault injection")
+    parser.add_argument("--prepare-only", action="store_true",
+                        help="build and retain the lab variant provenance without starting Docker")
     parser.add_argument("--laboratory-read-authority", action="store_true",
                         help="required explicit opt-in for the lab-tagged read-authority binary")
     selected = parser.parse_args(argv)
@@ -514,11 +860,60 @@ def main(argv=None):
         "source": {},
         "binary_sha256": {},
         "events": [],
+        "diagnostic_errors": [],
     }
     fixture.write_json(destination / "manifest.json", manifest)
+    if selected.prepare_only:
+        source_before = None
+        try:
+            source_before = source_snapshot(fixture, repo, destination, "before")
+            manifest["source"] = source_before
+            arch = fixture.docker_architecture()
+            manifest["docker_architecture"] = arch
+            image = fixture.ensure_image(RUNTIME)
+            manifest["runtime_image_inspection"] = image
+            binaries, metadata, _ = build_candidate(fixture, repo, destination, arch)
+            manifest["binary_sha256"] = fixture.binary_hashes(binaries)
+            manifest["build_metadata"] = metadata
+            manifest["preparation"] = {
+                "variant": "laboratory-read-authority",
+                "build_tag": LAB_BUILD_TAG,
+                "source_revision": source_before.get("revision"),
+                "workload_started": False,
+                "docker_fixture_started": False,
+            }
+            manifest["status"] = "prepared-only"
+        except BaseException as exc:
+            manifest["status"] = "incomplete-or-failed"
+            manifest["failure"] = str(exc) or exc.__class__.__name__
+        finally:
+            if source_before is not None:
+                try:
+                    source_after = source_snapshot(fixture, repo, destination, "after")
+                    manifest["source_after"] = source_after
+                    manifest["source_stable"] = (
+                        source_identity(source_before) == source_identity(source_after)
+                    )
+                    if not manifest["source_stable"]:
+                        manifest["status"] = "incomplete-or-failed"
+                        manifest["failure"] = "source changed during preparation"
+                except BaseException as exc:
+                    manifest["status"] = "incomplete-or-failed"
+                    manifest["failure"] = "could not snapshot source after preparation: " + str(exc)
+            fixture.write_json(destination / "manifest.json", manifest)
+        print(destination)
+        print(json.dumps({
+            "status": manifest.get("status"),
+            "binary_sha256": manifest.get("binary_sha256"),
+            "source_revision": manifest.get("source", {}).get("revision"),
+            "source_stable": manifest.get("source_stable"),
+            "failure": manifest.get("failure"),
+        }, sort_keys=True))
+        return 0 if manifest.get("status") == "prepared-only" else 1
     source_before = None
     original_run = fixture.run
     original_popen = subprocess.Popen
+    original_subprocess_run = subprocess.run
     original_stop = fixture.stop_processes
     captured = {}
     state = {"pause": None, "pause_error": None}
@@ -553,6 +948,20 @@ def main(argv=None):
                     manifest["client_argv"] = list(values[3:])
                     fixture.write_json(destination / "manifest.json", manifest)
         return original_popen(values, *args, **kwargs)
+
+    def captured_run(command, *args, **kwargs):
+        values = list(command) if isinstance(command, (list, tuple)) else command
+        if (isinstance(values, list) and values[:2] == ["docker", "exec"] and
+                len(values) > 3 and values[3] == "/bench/rf3-sqlbench" and
+                "-phase" in values and values[values.index("-phase") + 1] == "run"):
+            values = list(values)
+            if "-recovery-oracle" not in values:
+                values.extend(["-recovery-oracle", "/evidence/client-oracle.json"])
+            with lock:
+                captured["client"] = list(values)
+                manifest["client_argv"] = list(values[3:])
+                fixture.write_json(destination / "manifest.json", manifest)
+        return original_subprocess_run(values, *args, **kwargs)
 
     def record_event(event):
         # Keep each manifest event as an immutable checkpoint; later updates to
@@ -650,12 +1059,17 @@ def main(argv=None):
             fixture.run(["docker", "exec", container, "kill", "-STOP", pid])
             started = time.monotonic()
             pause["utc_stop_sent"] = utc_now()
+            continue_result = None
             try:
                 time.sleep(selected.pause_seconds)
             finally:
-                fixture.run(["docker", "exec", container, "kill", "-CONT", pid], check=False)
+                continue_result = fixture.run(
+                    ["docker", "exec", container, "kill", "-CONT", pid], check=False)
             elapsed = time.monotonic() - started
+            pause["continue_exit_code"] = continue_result.returncode
             pause["utc_continue_sent"] = utc_now()
+            if continue_result.returncode:
+                raise RuntimeError("SIGCONT was not delivered; post-CONT latch is invalid")
             pause["pause_seconds_observed"] = elapsed
             pause["status"] = "continued"
             after_inventory = fixture.process_inventory(container)
@@ -665,6 +1079,49 @@ def main(argv=None):
             post = all_snapshots(fixture, container, targets, fault_dir,
                                  "pause-after", current_serials(
                                      fixture, container, targets, fault_dir))
+            # Refresh each node's SIGUSR1-backed owner counters before arming
+            # the sidecar. The requested timestamp remains the exact CONT
+            # handoff; delaying the request until these cuts are retained makes
+            # the first latched cycle carry post-CONT authority evidence.
+            latch_file = getattr(args, "rf3_diagnostic_latch_file", "")
+            if not latch_file:
+                raise RuntimeError("RF3 diagnostic latch request path was not configured")
+            latch_request = fault_dir / "post-cont-latch-request.json"
+            fixture.write_json(latch_request, {
+                "schema": "vibedb.rf3-diagnostic-latch-request/1",
+                "event": "post-cont",
+                "requested_utc": pause["utc_continue_sent"],
+                "node_id": chosen["node_id"],
+                "pid": chosen["pid"],
+                "signal": "SIGCONT",
+                "source": "fault-controller",
+            })
+            # Publish into the container in two steps.  docker cp may expose a
+            # partially written destination while the sidecar is polling; a
+            # same-filesystem rename makes the request an atomic handoff.
+            latch_temporary = latch_file + ".tmp"
+            copied_latch_request = fixture.run([
+                "docker", "cp", latch_request, container + ":" + latch_temporary,
+            ], check=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            published_latch_request = None
+            if copied_latch_request.returncode == 0:
+                published_latch_request = fixture.run([
+                    "docker", "exec", container, "mv", "-f",
+                    latch_temporary, latch_file,
+                ], check=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            pause["post_cont_latch_request"] = {
+                "path": str(latch_request.relative_to(destination)),
+                "temporary_remote_path": latch_temporary,
+                "remote_path": latch_file,
+                "exit_code": copied_latch_request.returncode,
+                "publish_exit_code": None if published_latch_request is None else published_latch_request.returncode,
+                "requested_utc": pause["utc_continue_sent"],
+                "armed_after_post_pause_diagnostic": True,
+            }
+            if (copied_latch_request.returncode or
+                    published_latch_request is None or
+                    published_latch_request.returncode):
+                raise RuntimeError("post-CONT latch request was not atomically published into the container")
             pause["post_pause_diagnostics"] = post
             pause["unavailable_interval_seconds"] = elapsed
             pause["post_pause_counter_deltas"] = {
@@ -699,12 +1156,23 @@ def main(argv=None):
             "quarantine_seconds": QUARANTINE_SECONDS,
         }
         try:
-            report = json.loads((destination_run / "report.json").read_text())
+            try:
+                report = json.loads((destination_run / "report.json").read_text())
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                restart["status"] = "skipped"
+                restart["reason"] = "pre-crash client report unavailable: " + str(exc)
+                record_event(restart)
+                return []
             if report.get("status") != "complete":
-                raise fixture.RunnerError(
-                    "SIGKILL/restart requires a fully verified pre-crash workload")
+                restart["status"] = "skipped"
+                restart["reason"] = "pre-crash client report was not complete"
+                record_event(restart)
+                return []
             if "client" not in captured or "server" not in captured:
-                raise fixture.RunnerError("server/client argv was not captured")
+                restart["status"] = "skipped"
+                restart["reason"] = "server/client argv was not captured"
+                record_event(restart)
+                return []
             copied = fixture.run([
                 "docker", "cp", container + ":/evidence/client-oracle.json",
                 destination / "client-oracle.json",
@@ -836,6 +1304,9 @@ def main(argv=None):
         args.parent_arg = []
         args.candidate_arg = ["--read-authority"]
         args.rf3_diagnostic = True
+        args.rf3_diagnostic_latch_file = "/evidence/post-cont-latch.json"
+        args.rf3_diagnostic_latch_output = "/evidence/post-cont-cut.json"
+        args.rf3_diagnostic_latch_required = not selected.no_fault
         args.validator_path = VALIDATOR_PATH
         tables = fixture.table_names(4, "rf3_sql_group")
         cell = {
@@ -853,6 +1324,9 @@ def main(argv=None):
         fixture.write_json(destination / "manifest.json", manifest)
         fixture.run = logged_run
         subprocess.Popen = captured_popen
+        subprocess.run = captured_run
+        if not selected.no_fault:
+            fixture.stop_processes = stop_with_restart
         result_holder = {}
 
         def run_fixture():
@@ -875,11 +1349,43 @@ def main(argv=None):
             raise result_holder["exception"]
         result = result_holder.get("result", {})
         manifest["result"] = result
+        result_errors = result.get("errors") if isinstance(result, dict) else None
+        if isinstance(result_errors, list):
+            manifest["diagnostic_errors"].extend(str(error) for error in result_errors)
         manifest["run_wall_elapsed_seconds"] = result_holder.get("wall_elapsed_seconds")
         manifest["diagnostic_records"] = diagnostics_summary(run_dir / "diagnostics")
         manifest["authority_proof"] = authority_proof(manifest["diagnostic_records"])
         manifest["per_group_diagnostic"] = per_group_diagnostic_summary(
             diagnostic_output_path(run_dir))
+        timeline_path = run_dir / "failed-table-g0-timeline.json"
+        manifest["failed_table_g0_timeline"] = write_group_timeline(
+            diagnostic_output_path(run_dir), timeline_path, tables[0])
+        if not selected.no_fault:
+            latch_path = run_dir / "post-cont-cut.json"
+            try:
+                pause_event = state.get("pause")
+                post_pause_diagnostics = (
+                    pause_event.get("post_pause_diagnostics")
+                    if isinstance(pause_event, dict) else None)
+                latch_summary = validate_post_cont_latch(
+                    latch_path, expected_nodes=cell["physical_nodes"],
+                    post_pause_diagnostics=post_pause_diagnostics)
+                latch_summary["path"] = "candidate/post-cont-cut.json"
+                manifest["post_cont_latch"] = latch_summary
+            except ValueError as exc:
+                manifest["post_cont_latch"] = {
+                    "path": "candidate/post-cont-cut.json",
+                    "complete": False,
+                    "error": str(exc),
+                }
+                manifest["diagnostic_errors"].append(
+                    "post-CONT diagnostic latch was not retained: " + str(exc))
+        else:
+            manifest["post_cont_latch"] = {
+                "path": "candidate/post-cont-cut.json",
+                "required": False,
+                "complete": True,
+            }
         manifest["pause"] = state.get("pause")
         manifest["pause_error"] = state.get("pause_error")
         primary = primary_result_failure(result, run_dir)
@@ -889,8 +1395,14 @@ def main(argv=None):
                 primary["errors"])
         manifest["restart"] = next((event for event in reversed(manifest["events"])
                                      if event.get("event") == "sigkill-restart"), None)
+        latch_summary = manifest.get("post_cont_latch")
+        latch_complete = (
+            selected.no_fault or
+            (isinstance(latch_summary, dict) and
+             latch_summary.get("complete") is True))
         fault_complete = fault_qualification_complete(
-            selected.no_fault, state.get("pause"), manifest.get("restart"))
+            selected.no_fault, state.get("pause"), manifest.get("restart"),
+            latch_complete)
         manifest["status"] = "complete" if (
             result.get("status") == "completed" and
             result.get("client_exit_code") == 0 and
@@ -898,16 +1410,20 @@ def main(argv=None):
             manifest["per_group_diagnostic"].get("complete_shape") and
             fault_complete
         ) else "incomplete-or-failed"
+        if manifest["diagnostic_errors"] and not manifest.get("primary_failure"):
+            manifest.setdefault("failure", "diagnostic: " + "; ".join(
+                manifest["diagnostic_errors"]))
     except BaseException as exc:
         manifest["status"] = "incomplete-or-failed"
         detail = str(exc) or exc.__class__.__name__
-        if manifest.get("failure"):
-            manifest["failure"] += "; qualification finalization: " + detail
-        else:
+        manifest["diagnostic_errors"].append("qualification finalization: " + detail)
+        if not manifest.get("primary_failure") and not manifest.get("failure"):
             manifest["failure"] = detail
     finally:
         fixture.run = original_run
         subprocess.Popen = original_popen
+        subprocess.run = original_subprocess_run
+        fixture.stop_processes = original_stop
         if source_before is not None:
             try:
                 source_after = source_snapshot(fixture, repo, destination, "after")
@@ -917,10 +1433,16 @@ def main(argv=None):
                 )
                 if not manifest["source_stable"]:
                     manifest["status"] = "incomplete-or-failed"
-                    manifest["failure"] = "source changed during qualification"
+                    manifest["diagnostic_errors"].append(
+                        "source changed during qualification")
+                    if not manifest.get("primary_failure") and not manifest.get("failure"):
+                        manifest["failure"] = "diagnostic: source changed during qualification"
             except BaseException as exc:
                 manifest["status"] = "incomplete-or-failed"
-                manifest["failure"] = "could not snapshot source after qualification: " + str(exc)
+                detail = "could not snapshot source after qualification: " + str(exc)
+                manifest["diagnostic_errors"].append(detail)
+                if not manifest.get("primary_failure") and not manifest.get("failure"):
+                    manifest["failure"] = "diagnostic: " + detail
         fixture.write_json(destination / "manifest.json", manifest)
     print(destination)
     print(json.dumps({
@@ -929,6 +1451,7 @@ def main(argv=None):
         "validation": manifest.get("result", {}).get("validation"),
         "pause": manifest.get("pause"),
         "restart": manifest.get("restart"),
+        "diagnostic_errors": manifest.get("diagnostic_errors"),
         "failure": manifest.get("failure"),
     }, sort_keys=True))
     return 0 if manifest.get("status") == "complete" else 1

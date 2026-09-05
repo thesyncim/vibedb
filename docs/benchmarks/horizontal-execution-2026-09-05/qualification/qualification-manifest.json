@@ -154,6 +154,52 @@
       "workload_oracle_errors": 0,
       "workload_oracle_samples": 480000,
       "verification": "archive-provenance.json lists SHA-256 for every included raw file; the provenance file itself is covered by the archive SHA-256"
+    },
+    {
+      "archive": "archives/authority-fault-diagnostic-d898.tar.gz",
+      "archive_provenance": "archives/authority-fault-diagnostic-d898-provenance.json",
+      "binary_sha256": {
+        "candidate-vibedb": "77b158046bffc18f28c5720177b1e98f87ab4a86605fa80a9e194b0fbb2ce5a3",
+        "candidate-vibedb-gateway": "2b40ee0382befcd2eb33a4229ee5b010f0cfeecce7718a4f6bc28a510797916a",
+        "candidate-vibedb-shard": "a65a29a1a01f9cea57673bbb308c6f6a6831ee7c00715b73fe858a9fb0595abf",
+        "rf3-diagnostic": "21fcf7e5620d606824549f5a9127ff179c34b300f49e9d72d00c9b599d44254e",
+        "rf3-sqlbench": "9adc58a424cafd6100385df389431e1b0271ef1383f7f8083abed48ea6754c90"
+      },
+      "bytes": 555366,
+      "causal_proof": false,
+      "crdb_comparison": false,
+      "diagnostic_only": true,
+      "docker_architecture": "arm64",
+      "fault_injection": true,
+      "fault_mode": "process SIGSTOP/SIGCONT pause plus same-volume SIGKILL restart; no network partition",
+      "id": "authority-fault-diagnostic-d898",
+      "included_files": 99,
+      "offline_post_cont_validation": "pass",
+      "omitted_compiled_binary_bytes": 186349310,
+      "omitted_files": 6,
+      "original_manifest_sha256": "eefdcce6af86a6e473bd36378d1b008266f87d59193a0d5171656fc4e514355c",
+      "original_manifest_status": "incomplete-or-failed",
+      "quarantine_observable": false,
+      "runtime_image": "golang:1.27-bookworm@sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b",
+      "sha256": "854c6cfa022a42c39b92af500ca4d3f15257914d1e15f1162aa61fda05a530b3",
+      "source_dirty": false,
+      "source_evidence_root": "/private/tmp/vibedb-horizontal-authority-fault-diagnostic-d898-20260905T191703Z",
+      "source_patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "source_revision": "d898f062726bdd0070d402e1b41463bbd7090434",
+      "status": "workload oracle pass; offline post-CONT latch validation pass; same-volume restart recovered; no qualification claim",
+      "timed_performance_claim": false,
+      "validator_commits": [
+        "6f17929fbffadb8bc247b3f5f73030085b2bf201",
+        "662407f12f9abc98501e85d6db52cd856132be4b"
+      ],
+      "verification": "The filtered archive contains 98 retained raw files plus its manifest; the external provenance records each included-file SHA-256 and omitted-payload hashes. The derived report preserves the original manifest status and hash, records qualification_claimed=false, and records quarantine_observable=false.",
+      "workload_oracle_errors": 0,
+      "workload_oracle_samples": 480000,
+      "run_report": "authority-fault-diagnostic-d898.md",
+      "derived_report": "authority-fault-diagnostic-d898-offline-validation.json",
+      "run_report_sha256": "f3a719fb5af3a78470cece8e4fbfc60b577083a9ee469d18a47e27d6e395bf79",
+      "archive_provenance_sha256": "1337ca40dc60b9b0eed93ffff51a46cf3782827c5b53ae63b79e68e03c0d2a4b",
+      "derived_report_sha256": "a4c7051524f553ceff438becc0a36b491792ea0f8c613b61be6821861c6f977a"
     }
   ],
   "exclusions": [
@@ -162,7 +208,7 @@
     "The initial startup smoke explicitly has incomplete source provenance because untracked production Go files were not copied by its recorder."
   ],
   "format": "vibedb-authority-qualification-archive-v1",
-  "repository_head_when_archived": "2c887f4a20180f15be353a8492e27067e0a0b19d",
+  "repository_head_when_archived": "d898f062726bdd0070d402e1b41463bbd7090434",
   "runtime_image": "golang:1.27-bookworm@sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b",
   "status": "diagnostic evidence only; no fault qualification pass and no performance claim"
 }
