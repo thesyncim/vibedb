@@ -1,8 +1,10 @@
 package raftstore
 
 import (
+	"context"
 	"errors"
 	"runtime"
+	"runtime/trace"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1101,6 +1103,26 @@ func (q *NodeSubmissionSequencer) runWave(items *[MaxPersistGroupBatches]*Submis
 			at--
 		}
 		ready[at] = value
+	}
+	if trace.IsEnabled() {
+		// Trace-only classification preserves the normal durability policy. A
+		// metadata wave still goes through the same synchronous persistence.
+		name := "raft.persist.metadata"
+		logical, entries := 0, 0
+		for i := 0; i < count; i++ {
+			for j := 0; j < nodeReadySeriesCount(ready[i]); j++ {
+				batch := nodeReadySeriesBatch(&ready[i], j)
+				logical++
+				entries += len(batch.Entries)
+				if batch.MustSync || len(batch.Entries) != 0 || !canonicalEmptySnapshot(batch.Snapshot) {
+					name = "raft.persist.required"
+				}
+			}
+		}
+		ctx := context.Background()
+		region := trace.StartRegion(ctx, name)
+		defer region.End()
+		trace.Logf(ctx, "raft.persist.wave", "groups=%d logical=%d entries=%d", count, logical, entries)
 	}
 	for {
 		err = q.observeReadyPersist(ready[:count])
