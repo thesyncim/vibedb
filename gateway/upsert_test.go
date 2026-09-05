@@ -77,7 +77,7 @@ func TestReplicatedColumnUpsertRoutesConflictProgramWithoutPreimageRead(t *testi
 	// No client exists: preparing the atomic conflict must not read a preimage.
 	executor := NewExecutor(nil, NewCatalogHolder(snapshot), Options{})
 	targets, handled, err := executor.planReplicatedSQLTransaction(t.Context(), snapshot, []Query{{
-		SQL:    `INSERT INTO messages (id,n,city) VALUES (?,1,'candidate') ON CONFLICT (id) DO UPDATE SET n=?,city=EXCLUDED.city`,
+		SQL:    `INSERT INTO messages (id,n,city) VALUES (?,1,'candidate') ON CONFLICT (id) DO UPDATE SET n=messages.n+?,city=COALESCE(EXCLUDED.city,messages.city)`,
 		Params: []shardservice.Param{shardservice.StringParam("a"), shardservice.NumberParam("9007199254740993")},
 	}}, executor.profileFor(ClassInteractive))
 	if err != nil || !handled || len(targets) != 1 || len(targets[0].Batches) != 1 || len(targets[0].Batches[0].Mutations) != 1 {

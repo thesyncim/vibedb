@@ -1,12 +1,13 @@
 package driver
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
-	"unicode/utf8"
 
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/query"
 	sqlast "github.com/thesyncim/vibedb/sql"
 	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibedb/store/durable"
@@ -15,19 +16,22 @@ import (
 )
 
 const replicatedConflictAssignmentLimit = 1024
+const replicatedConflictWorkBytes = 16 << 20
 
 var errReplicatedConflictProgram = errors.New("vibedb: invalid replicated conflict assignment program")
 
-// DirectReplicatedConflictAssignments identifies the closed first version of
-// the native conflict program: bound scalar constants and EXCLUDED columns.
-// No SQL source, parameter references, or current-row preimage is replicated.
-func DirectReplicatedConflictAssignments(action *sqlast.InsertConflictUpdate) bool {
+// ReplicatedConflictAssignments identifies column assignment actions. The
+// template encoder and shared scalar compiler validate their executable grammar.
+func ReplicatedConflictAssignments(action *sqlast.InsertConflictUpdate) bool {
 	if action == nil || len(action.Assignments) == 0 || len(action.Assignments) > replicatedConflictAssignmentLimit {
 		return false
 	}
 	for _, assignment := range action.Assignments {
 		if assignment.Expr != nil {
-			return false
+			if assignment.Value.Kind != sqlast.OperandExpression {
+				return false
+			}
+			continue
 		}
 		switch assignment.Value.Kind {
 		case sqlast.OperandNull, sqlast.OperandString, sqlast.OperandNumber, sqlast.OperandBool, sqlast.OperandParam, sqlast.OperandExcluded:
@@ -38,63 +42,67 @@ func DirectReplicatedConflictAssignments(action *sqlast.InsertConflictUpdate) bo
 	return true
 }
 
-// ValidateReplicatedConflictAssignments shares local SQL name resolution with
-// a coordinator's authenticated declaration, before it creates any mutation.
+// ValidateReplicatedConflictAssignments resolves both row namespaces against
+// the authenticated declaration and compiles the same projection as local SQL.
 func ValidateReplicatedConflictAssignments(info TableInfo, action *sqlast.InsertConflictUpdate) error {
-	if !DirectReplicatedConflictAssignments(action) {
+	if !ReplicatedConflictAssignments(action) {
 		return errReplicatedConflictProgram
 	}
 	meta := &tableMeta{PrimaryKey: info.PrimaryKey, Schema: &schemaMeta{}}
 	for _, column := range info.Columns {
 		meta.Schema.Fields = append(meta.Schema.Fields, schemaFieldMeta{Path: column.Path, Types: uint16(column.Types), Required: column.Required})
 	}
-	return validateUpsertColumnAssignments(info.Name, info.Name, meta, action.Assignments)
+	if err := validateUpsertColumnAssignments(info.Name, info.Name, meta, action.Assignments); err != nil {
+		return err
+	}
+	template, _, err := encodeConflictTemplate(action, nil)
+	if err != nil {
+		return err
+	}
+	assignments, params, err := decodeConflictTemplate(template)
+	if err != nil {
+		return err
+	}
+	statement, err := prepareReplicatedConflict(assignments, params)
+	if statement != nil {
+		statement.Release()
+	}
+	return err
 }
 
-// EncodeReplicatedConflictValue retains each authored direct assignment once.
-// Constants are bound and validated now. EXCLUDED values are resolved only in
-// the conflict branch, so an insert need not evaluate an unused assignment.
-func EncodeReplicatedConflictValue(candidate []byte, action *sqlast.InsertConflictUpdate, args []any) ([]byte, error) {
-	if !DirectReplicatedConflictAssignments(action) {
+// EncodeReplicatedConflictValue replicates a template and only the parameters
+// it references. Candidate-only binds and the current row are never included in
+// the program. Dense remapping makes the template independent of INSERT arity.
+func EncodeReplicatedConflictValue(candidate []byte, action *sqlast.InsertConflictUpdate, args []any, parameterTypes []query.ParameterType) ([]byte, error) {
+	if !ReplicatedConflictAssignments(action) {
 		return nil, errReplicatedConflictProgram
 	}
-	program := binary.LittleEndian.AppendUint16(nil, uint16(len(action.Assignments)))
-	seen := make(map[string]bool, len(action.Assignments))
-	for _, assignment := range action.Assignments {
-		column := assignment.Column
-		if column == "" || len(column) > 65535 || !utf8.ValidString(column) || seen[column] {
+	template, ordinals, err := encodeConflictTemplate(action, parameterTypes)
+	if err != nil {
+		return nil, err
+	}
+	program := binary.LittleEndian.AppendUint32(nil, uint32(len(template)))
+	program = append(program, template...)
+	bindings := make([][]byte, len(ordinals))
+	for ordinal, dense := range ordinals {
+		value, err := encodeAssignmentScalar(sqlast.Operand{Kind: sqlast.OperandParam, Ordinal: ordinal}, args)
+		if err != nil {
+			return nil, err
+		}
+		value, err = vibejson.AppendCanonicalize(nil, value)
+		if err != nil {
+			return nil, err
+		}
+		if _, err = decodeConflictConstant(value); err != nil {
+			return nil, err
+		}
+		bindings[dense] = value
+	}
+	for _, value := range bindings {
+		if len(program) > replication.MaxMutationValueBytes-4-len(value) {
 			return nil, errReplicatedConflictProgram
 		}
-		seen[column] = true
-		kind := byte(0)
-		var value []byte
-		if assignment.Value.Kind == sqlast.OperandExcluded {
-			kind = 1
-			value = []byte(assignment.Value.Text)
-			if len(value) == 0 || len(value) > 65535 || !utf8.Valid(value) {
-				return nil, errReplicatedConflictProgram
-			}
-		} else {
-			var err error
-			value, err = encodeAssignmentScalar(assignment.Value, args)
-			if err != nil {
-				return nil, err
-			}
-			value, err = vibejson.AppendCanonicalize(nil, value)
-			if err != nil {
-				return nil, err
-			}
-			if _, err = decodeConflictConstant(value); err != nil {
-				return nil, err
-			}
-		}
-		if len(program)+7+len(column)+len(value) > replication.MaxMutationValueBytes {
-			return nil, errReplicatedConflictProgram
-		}
-		program = append(program, kind)
-		program = binary.LittleEndian.AppendUint16(program, uint16(len(column)))
 		program = binary.LittleEndian.AppendUint32(program, uint32(len(value)))
-		program = append(program, column...)
 		program = append(program, value...)
 	}
 	return replication.AppendConflictValue(nil, candidate, program)
@@ -131,89 +139,160 @@ func decodeConflictConstant(value []byte) (sqlast.Operand, error) {
 	}
 }
 
-func decodeReplicatedConflictAssignments(program []byte, schema *store.Schema) ([]sqlast.UpdateAssignment, error) {
-	if len(program) < 2 || len(program) > replication.MaxMutationValueBytes || schema == nil {
-		return nil, errReplicatedConflictProgram
+func openConflictProgram(program []byte) (template, bindings []byte, err error) {
+	if len(program) < 8 || len(program) > replication.MaxMutationValueBytes {
+		return nil, nil, errReplicatedConflictProgram
 	}
-	count := int(binary.LittleEndian.Uint16(program[:2]))
-	program = program[2:]
-	if count == 0 || count > replicatedConflictAssignmentLimit {
-		return nil, errReplicatedConflictProgram
+	n := uint64(binary.LittleEndian.Uint32(program[:4]))
+	if n < 4 || n > uint64(len(program)-4) {
+		return nil, nil, errReplicatedConflictProgram
 	}
-	assignments := make([]sqlast.UpdateAssignment, 0, count)
-	seen := make(map[string]bool, count)
-	fields := schema.Definition().Fields
-	declared := func(column string) bool {
-		pointer := string(appendUpdateColumnPointer(nil, column))
-		for _, field := range fields {
-			if field.Path == pointer {
-				return true
-			}
-		}
-		return false
+	return program[4 : 4+int(n) : 4+int(n)], program[4+int(n):], nil
+}
+
+func validateConflictTemplateSchema(assignments []sqlast.UpdateAssignment, schema *store.Schema) error {
+	if schema == nil {
+		return errReplicatedConflictProgram
 	}
-	for i := 0; i < count; i++ {
-		if len(program) < 7 {
-			return nil, errReplicatedConflictProgram
+	meta := &tableMeta{Schema: &schemaMeta{}}
+	for _, field := range schema.Definition().Fields {
+		meta.Schema.Fields = append(meta.Schema.Fields, schemaFieldMeta{Path: field.Path, Types: uint16(field.Types), Required: field.Required})
+	}
+	return validateUpsertColumnAssignments("", "", meta, assignments)
+}
+
+func decodeConflictBindings(bindings []byte, args []any) error {
+	for i := range args {
+		if len(bindings) < 4 {
+			return errReplicatedConflictProgram
 		}
-		kind := program[0]
-		n := int(binary.LittleEndian.Uint16(program[1:3]))
-		m := uint64(binary.LittleEndian.Uint32(program[3:7]))
-		program = program[7:]
-		if n == 0 || n > len(program) || m > uint64(len(program)-n) || m == 0 {
-			return nil, errReplicatedConflictProgram
+		n := uint64(binary.LittleEndian.Uint32(bindings[:4]))
+		bindings = bindings[4:]
+		if n == 0 || n > uint64(len(bindings)) {
+			return errReplicatedConflictProgram
 		}
-		column := string(program[:n])
-		value := program[n : n+int(m)]
-		program = program[n+int(m):]
-		if !utf8.ValidString(column) || seen[column] || !declared(column) {
-			return nil, errReplicatedConflictProgram
+		value, err := decodeConflictConstant(bindings[:int(n)])
+		if err != nil {
+			return err
 		}
-		seen[column] = true
-		var operand sqlast.Operand
-		switch kind {
-		case 0:
-			var err error
-			operand, err = decodeConflictConstant(value)
-			if err != nil {
-				return nil, err
-			}
-		case 1:
-			if len(value) > 65535 || !utf8.Valid(value) || !declared(string(value)) {
-				return nil, errReplicatedConflictProgram
-			}
-			operand = sqlast.Operand{Kind: sqlast.OperandExcluded, Text: string(value)}
+		bindings = bindings[int(n):]
+		switch value.Kind {
+		case sqlast.OperandNull:
+			args[i] = nil
+		case sqlast.OperandString:
+			args[i] = value.Text
+		case sqlast.OperandNumber:
+			args[i] = query.Number(value.Text)
+		case sqlast.OperandBool:
+			args[i] = value.Bool
 		default:
-			return nil, errReplicatedConflictProgram
+			return errReplicatedConflictProgram
 		}
-		assignments = append(assignments, sqlast.UpdateAssignment{Column: column, Value: operand})
 	}
-	if len(program) != 0 {
-		return nil, errReplicatedConflictProgram
+	if len(bindings) != 0 {
+		return errReplicatedConflictProgram
+	}
+	return nil
+}
+
+func decodeReplicatedConflictAssignments(program []byte, schema *store.Schema) ([]sqlast.UpdateAssignment, error) {
+	template, bindings, err := openConflictProgram(program)
+	if err != nil {
+		return nil, err
+	}
+	assignments, params, err := decodeConflictTemplate(template)
+	if err != nil {
+		return nil, err
+	}
+	if err = validateConflictTemplateSchema(assignments, schema); err != nil {
+		return nil, err
+	}
+	if err = decodeConflictBindings(bindings, make([]any, len(params))); err != nil {
+		return nil, err
 	}
 	return assignments, nil
 }
 
-// MaterializeConflict runs at the replicated apply/prepare point over the
-// current participant snapshot. The candidate is validated on both branches;
-// assignment evaluation happens only for an existing row. The state machine
-// independently validates and fences the returned final document.
+func prepareReplicatedConflict(assignments []sqlast.UpdateAssignment, params []query.ParameterType) (*query.DMLStatement, error) {
+	return query.PrepareParsedDMLWithParameterTypes("", &sqlast.Statement{Kind: sqlast.KindInsert, Insert: &sqlast.InsertStmt{
+		Table: "__vibedb_conflict_input", Params: len(params), OnConflictUpdate: &sqlast.InsertConflictUpdate{Assignments: assignments},
+	}}, params)
+}
+
+// One most-recent template per relation bounds retained compilation state.
+// It is protected by the validator mutex, including detached snapshot audits.
+// A changed binding does not replace the template or retain previous values.
+type replicatedConflictPlan struct {
+	template    []byte
+	statement   *query.DMLStatement
+	assignments []sqlast.UpdateAssignment
+	args        []any
+	exec        query.Exec
+}
+
+func (v *replicatedSQLMutationValidator) conflictPlan(template []byte) (*replicatedConflictPlan, error) {
+	if v.conflict != nil && bytes.Equal(v.conflict.template, template) {
+		return v.conflict, nil
+	}
+	assignments, params, err := decodeConflictTemplate(template)
+	if err != nil {
+		return nil, err
+	}
+	if err = validateConflictTemplateSchema(assignments, v.schema); err != nil {
+		return nil, err
+	}
+	statement, err := prepareReplicatedConflict(assignments, params)
+	if err != nil {
+		return nil, err
+	}
+	if v.conflict != nil {
+		v.conflict.statement.Release()
+		v.conflict.exec.Release()
+	}
+	v.conflict = &replicatedConflictPlan{
+		template: bytes.Clone(template), statement: statement, assignments: assignments, args: make([]any, len(params)),
+		exec: query.Exec{Options: query.ExecOptions{Workers: 1, ResultRows: 1,
+			MemoryBytes: replicatedConflictWorkBytes, ResultBytes: replicatedConflictWorkBytes,
+			IntermediateBytes: replicatedConflictWorkBytes, AggregateBytes: replicatedConflictWorkBytes}},
+	}
+	return v.conflict, nil
+}
+
+// MaterializeConflict evaluates against the participant's atomic snapshot.
+// Candidate, names and bindings are checked on both branches; lazy RHS runtime
+// evaluation happens only for an existing row. Every RHS sees the same preimage.
+// The state machine independently validates/fences the final canonical document.
 func (v *replicatedSQLMutationValidator) MaterializeConflict(key, candidate, program, current []byte, found bool) ([]byte, replicatedstate.MutationValidation) {
 	if validation := v.ValidatePut(key, candidate); validation != replicatedstate.MutationValidationAccept {
 		return nil, validation
 	}
-	assignments, err := decodeReplicatedConflictAssignments(program, v.schema)
+	template, bindings, err := openConflictProgram(program)
 	if err != nil {
 		return nil, replicatedstate.MutationValidationInvalid
 	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	plan, err := v.conflictPlan(template)
+	if err != nil {
+		return nil, replicatedstate.MutationValidationInvalid
+	}
+	defer clear(plan.args)
+	if err = decodeConflictBindings(bindings, plan.args); err != nil {
+		return nil, replicatedstate.MutationValidationInvalid
+	}
 	if !found {
+		// No projection will run on an insert. Still validate bindings before
+		// accepting it; the conflict branch binds once in the shared evaluator.
+		if err = plan.statement.ValidateConflictUpdateExpressionBindings(plan.args); err != nil {
+			return nil, replicatedstate.MutationValidationInvalid
+		}
 		return candidate, replicatedstate.MutationValidationAccept
 	}
-	value, err := ApplyColumnAssignmentsWithExcluded(current, candidate, assignments, nil, v.maxDocumentBytes)
+	value, err := materializeConflictColumnAssignments(plan.statement, &plan.exec, current, candidate, plan.assignments, plan.args, v.maxDocumentBytes)
 	if err == nil {
 		value, err = canonicalMutationCapturePostimage(value, v.maxDocumentBytes)
 	}
-	if errors.Is(err, durable.ErrDocumentTooLarge) {
+	if errors.Is(err, durable.ErrDocumentTooLarge) || errors.Is(err, query.ErrResultBudget) || errors.Is(err, query.ErrIntermediateBudget) || errors.Is(err, query.ErrAggregateBudget) || errors.Is(err, query.ErrWorkBudget) {
 		return nil, replicatedstate.MutationValidationTargetBound
 	}
 	if err != nil {

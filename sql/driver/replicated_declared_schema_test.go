@@ -1,6 +1,7 @@
 package driver
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/query"
+	sqlast "github.com/thesyncim/vibedb/sql"
 	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibejson"
 )
@@ -144,6 +146,62 @@ func TestReplicatedDeclaredSchemaBindReopen(t *testing.T) {
 			t.Fatalf("typed apply %d: %+v %v", i, completion, err)
 		}
 	}
+
+	action, err := sqlast.ParseStatement(`INSERT INTO employees VALUES (?) ON CONFLICT DO UPDATE SET score=employees.score+?`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := EncodeReplicatedConflictValue(valid, action.Insert.OnConflictUpdate, []any{nil, int64(3)}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	increment := testReplicatedApplyCommand(identity, epoch, 4, replication.Mutation{Kind: replication.MutationPutConflict, Key: key, Value: payload})
+	if err := claim.AdmitCommand(increment); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := claim.ApplyNormal(testReplicatedApplyMeta(5), increment); err != nil {
+		t.Fatal(err)
+	}
+	first, err := claim.LookupCompletion(increment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	witness := bytes.Clone(first.Bytes)
+	if code := completionResultCode(t, claim, increment); code != replicatedstate.ResultApplied {
+		t.Fatalf("increment code=%v", code)
+	}
+	if _, err := claim.ApplyNormal(testReplicatedApplyMeta(6), increment); err != nil {
+		t.Fatal(err)
+	}
+	retry, err := claim.LookupCompletion(increment)
+	if err != nil || !bytes.Equal(witness, retry.Bytes) {
+		t.Fatalf("retry witness changed: %v", err)
+	}
+	// A later arithmetic failure must roll back an earlier computed postimage.
+	second := bytes.Replace(valid, []byte("employee-0001"), []byte("employee-0002"), 1)
+	secondKey, err := documentKey(second, "/id", reopened.connector.db.tables["employees"].primary, 256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed := testReplicatedApplyCommand(identity, epoch, 5, replication.Mutation{Kind: replication.MutationPut, Key: []byte(secondKey), Value: second})
+	if _, err := claim.ApplyNormal(testReplicatedApplyMeta(7), seed); err != nil {
+		t.Fatal(err)
+	}
+	division, _ := sqlast.ParseStatement(`INSERT INTO employees VALUES (?) ON CONFLICT DO UPDATE SET score=employees.score/EXCLUDED.score`)
+	zero := bytes.Replace(second, []byte(`"score":92`), []byte(`"score":0`), 1)
+	invalid, err := EncodeReplicatedConflictValue(zero, division.Insert.OnConflictUpdate, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch := testReplicatedApplyCommand(identity, epoch, 6,
+		replication.Mutation{Kind: replication.MutationPutConflict, Key: key, Value: payload},
+		replication.Mutation{Kind: replication.MutationPutConflict, Key: []byte(secondKey), Value: invalid})
+	if _, err := claim.ApplyNormal(testReplicatedApplyMeta(8), batch); err != nil {
+		t.Fatal(err)
+	}
+	if code := completionResultCode(t, claim, batch); code != replicatedstate.ResultInvalidDocument {
+		t.Fatalf("division batch code=%v", code)
+	}
 	if err := claim.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -161,7 +219,7 @@ func TestReplicatedDeclaredSchemaBindReopen(t *testing.T) {
 	}
 	defer againClaim.Close()
 	value, found, err := again.connector.db.tables["employees"].collection.AppendRaw(nil, key)
-	if err != nil || !found || !strings.Contains(string(value), `"score":92`) {
+	if err != nil || !found || !strings.Contains(string(value), `"score":95`) {
 		t.Fatalf("reopen after invalid write: %s %t %v", value, found, err)
 	}
 }

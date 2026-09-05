@@ -1,9 +1,8 @@
 # SQL workload compatibility tracker
 
 This audit compares the Chat product and its shared database layer in the local
-`chat` repository with VibeDB main at `9454ced0` (2026-09-05). The implementation
-batches through null-safe comparisons are merged at `2a8723ff`; grouped
-filtering builds on main at `a2ac5fd8`. **The application
+`chat` repository with VibeDB main at `9454ced0` (2026-09-05). The read-compatibility batches through relation wildcard expansion are merged
+at `97edf271`. **The application
 cannot yet run unchanged on VibeDB.** This change implements the conditional
 expressions, Boolean tests, explicit null ordering, INSERT NULL literals, and
 single-column primary conflict targets, and computed sort keys described below. The remaining reduced
@@ -98,11 +97,27 @@ assignments still require a placement proof; copying the current or candidate
 key and whole-document EXCLUDED replacement preserve the routed owner.
 RF3 whole-document EXCLUDED replacement uses the native atomic put primitive
 and preserves its exact affected-row and retry semantics. Declared RF3 column
-upserts now replicate a bounded conflict program with bound scalar constants
-and EXCLUDED column references. Each replica validates the candidate and column
-names before selecting the insert or update branch, then patches its current
-row atomically. Untouched fields and exact retry results are preserved.
-Computed conflict assignments, global-index conflict maintenance, RETURNING, general mutation
+upserts replicate a bounded VUC2 expression template and its referenced scalar
+bindings. Current-row and EXCLUDED expressions use the same compiled projection
+as local SQL: exact arithmetic, concatenation, casts, lazy CASE and conditional
+functions, and simultaneous assignment semantics. Candidate validation, column
+resolution and binding checks precede branch selection. Runtime RHS evaluation
+runs only on conflict, at the replica's atomic apply/participant prepare point;
+it requires no coordinator preimage read. Untouched fields and exact retry
+results are preserved. The owner proof and final schema/key fences still apply.
+
+Each relation retains at most one compiled template, protected by the same
+mutex used for detached snapshot audits. Changed parameter values reuse that
+template; only referenced binds are serialized, with dense ordinals independent
+of the INSERT's candidate binds. The format bounds the full mutation to 4 MiB,
+assignments and referenced parameters to 1,024 each, expression nodes to 16,384,
+and depth to 128. Execution has deterministic 16 MiB workspace, result,
+intermediate, and exact-number budgets; document limits apply independently.
+The unreleased VUC1 grammar is replaced, and authenticated apply-contract,
+snapshot and data-chain identities change with it. Mixed apply contracts fail
+closed. See [expression format](replicated-conflict-program.md).
+
+Global-index conflict maintenance, RETURNING, general mutation
 predicates, and explicit transaction parity still need implementation. The
 bounded coordinator read path also still needs full RF3 global-index read
 integration. These are release gates for the requested distributed parity,

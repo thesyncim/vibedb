@@ -247,7 +247,7 @@ func (s *Snapshot) prepareWrite(plan *PreparedPlan, source string) error {
 			action := stmt.Insert.OnConflictUpdate
 			if !replicatedConflictActionSupported(action) {
 				return &PlanError{Table: plan.table,
-					Reason: "RF3 computed conflict assignments require a native expression program",
+					Reason: "RF3 conflict assignment shape is unsupported",
 					cause:  ErrDistributedWriteUnsupported}
 			}
 			if !action.WholeDocument() {
@@ -347,7 +347,7 @@ func (s *Snapshot) prepareWrite(plan *PreparedPlan, source string) error {
 }
 
 func replicatedConflictActionSupported(action *sqlast.InsertConflictUpdate) bool {
-	return action == nil || action.WholeDocument() || sqldriver.DirectReplicatedConflictAssignments(action)
+	return action == nil || action.WholeDocument() || sqldriver.ReplicatedConflictAssignments(action)
 }
 
 // The shard executes the complete conflict action atomically. Its current row
@@ -1100,6 +1100,18 @@ func updateMayChangeGlobalIndex(stmt *sqlast.Statement, metadata IndexMetadata) 
 	}
 	for _, path := range metadata.LocatorPaths[:metadata.LocatorCount] {
 		if overlaps(path) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasComputedConflictAssignments(statement *sqlast.Statement) bool {
+	if statement == nil || statement.Kind != sqlast.KindInsert || statement.Insert == nil || statement.Insert.OnConflictUpdate == nil {
+		return false
+	}
+	for _, assignment := range statement.Insert.OnConflictUpdate.Assignments {
+		if assignment.Expr != nil {
 			return true
 		}
 	}
