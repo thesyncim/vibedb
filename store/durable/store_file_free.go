@@ -102,8 +102,7 @@ type freeLogCommit struct {
 // its final two commits comes back fenced rather than free — which is exactly
 // what it is.
 func (c *Collection) restoreFencedExtents(state *fileStoreState, before int) error {
-	readerFloor := c.leases.Stats(state.root.Generation).MinimumGeneration
-	floor := min(readerFloor, c.committer.FallbackGeneration())
+	floor := c.effectiveRecoveryFloor(state.root.Generation)
 	fenced := c.freeReclaimed[:0]
 	kept := c.reusable[:before]
 	for _, extent := range c.reusable[before:] {
@@ -241,7 +240,7 @@ func (c *Collection) refreshReusableFor(
 	// started it did not recover the store — only restarting the process did,
 	// abandoning every pending extent. The bound now limits how much moves
 	// instead of whether anything moves.
-	oldestRecovery := c.committer.FallbackGeneration()
+	oldestRecovery := c.effectiveRecoveryFloor(state.root.Generation)
 	batch, err := c.reclaimer.AppendReusable(
 		c.freeReclaimed[:0], state.root.Generation, oldestRecovery,
 		min(c.freeSetLimit-len(c.reusable), freeReclaimBatch),
@@ -1104,8 +1103,7 @@ func (c *Collection) promoteFreeSegment(
 		c.freeImageScratch = c.freeImageScratch[:0]
 	}()
 
-	readerFloor := c.leases.Stats(state.root.Generation).MinimumGeneration
-	floor := min(readerFloor, c.committer.FallbackGeneration())
+	floor := c.effectiveRecoveryFloor(state.root.Generation)
 	safe := loaded[:0]
 	fenced := c.freeReclaimed[:0]
 	for _, extent := range loaded {

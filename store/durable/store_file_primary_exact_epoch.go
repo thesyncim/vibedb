@@ -532,11 +532,7 @@ type retiredPrimaryExactEpoch struct {
 // but including them costs one recycle deferral and keeps one floor story.
 func (c *Collection) primaryExactReclaimFloor() uint64 {
 	current := c.visibleLogicalViewNoError().generation
-	return min(
-		c.leases.Minimum(current),
-		c.readEpochs.Minimum(current),
-		c.committer.FallbackGeneration(),
-	)
+	return c.effectiveRecoveryFloor(current)
 }
 
 // recyclePrimaryExactEpochsLocked moves retired epochs the floor has passed

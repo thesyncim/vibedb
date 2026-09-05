@@ -558,12 +558,11 @@ func RecoverInlineStateRootWithFallback(
 	for i := range count {
 		candidate := candidates[i]
 		root := candidate.root
-		state := root.State
-		if root.PageSize != pageSize || root.FileEnd > fileSize {
+		if root.PageSize != pageSize {
 			continue
 		}
-		refsOK, refsErr := readStateRootRefs(
-			file, state, root.FileEnd, pageScratch,
+		refsOK, refsErr := validateInlineRecoveryCandidate(
+			file, root, fileSize, pageScratch,
 		)
 		if refsErr != nil {
 			if errors.Is(refsErr, ErrPageCatalogCorrupt) {
@@ -574,48 +573,6 @@ func RecoverInlineStateRootWithFallback(
 		}
 		if !refsOK {
 			continue
-		}
-		indexHead := root.FreeDelta.IndexHead()
-		if indexHead != (PageRef{}) {
-			buf := pageScratch[:indexHead.Length]
-			n, readErr := file.ReadAt(buf, int64(indexHead.Offset))
-			if readErr != nil && !errors.Is(readErr, io.EOF) {
-				return InlineSuperblock{}, StateRoot{}, -1, 0, readErr
-			}
-			if n != len(buf) {
-				continue
-			}
-			index, indexOpenErr := OpenFreeIndexPage(
-				buf, root.FileEnd, state.NextLogicalID,
-			)
-			indexHeader := index.Header()
-			if indexOpenErr != nil || indexHeader.StoreID != root.StoreID ||
-				indexHeader.PageSize != root.PageSize ||
-				indexHeader.Generation > root.Generation ||
-				indexHeader.LogicalID != indexHead.LogicalID ||
-				indexHeader.Generation != indexHead.Generation {
-				continue
-			}
-		}
-		externalPrev := root.FreeDelta.ExternalPrev()
-		if externalPrev != (PageRef{}) {
-			buf := pageScratch[:externalPrev.Length]
-			n, readErr := file.ReadAt(buf, int64(externalPrev.Offset))
-			if readErr != nil && !errors.Is(readErr, io.EOF) {
-				return InlineSuperblock{}, StateRoot{}, -1, 0, readErr
-			}
-			if n != len(buf) {
-				continue
-			}
-			free, freeOpenErr := OpenFreeDeltaPage(buf, root.FileEnd, state.NextLogicalID)
-			freeHeader := free.Header()
-			if freeOpenErr != nil || freeHeader.StoreID != root.StoreID ||
-				freeHeader.PageSize != root.PageSize || freeHeader.Generation > root.Generation ||
-				freeHeader.LogicalID != externalPrev.LogicalID ||
-				freeHeader.Generation != externalPrev.Generation ||
-				indexHead != free.IndexHead() {
-				continue
-			}
 		}
 		if selectedSlot < 0 {
 			selected, selectedSlot = root, candidate.slot
@@ -631,6 +588,139 @@ func RecoverInlineStateRootWithFallback(
 			errors.Join(ErrSuperblockNotFound, catalogErr)
 	}
 	return InlineSuperblock{}, StateRoot{}, -1, 0, ErrSuperblockNotFound
+}
+
+// ValidateInlineSuperblockForRecovery proves that an externally authenticated
+// complete root image belongs to file before a cold opener repairs either
+// mutable root slot. It applies the same structural, top-level page, complete
+// page-catalog, and free-log-anchor checks used by ordinary root recovery.
+func ValidateInlineSuperblockForRecovery(
+	file *os.File, root InlineSuperblock, pageScratch []byte,
+) error {
+	if file == nil {
+		return fmt.Errorf("%w: nil exact-root file", ErrInvalidWrite)
+	}
+	if err := validateInlineSuperblock(root); err != nil {
+		return fmt.Errorf("%w: %v", ErrSuperblockCorrupt, err)
+	}
+	if uint64(len(pageScratch)) < uint64(root.State.MaxPageSize) {
+		return fmt.Errorf(
+			"%w: have=%d need=%d",
+			ErrRecoveryBufferTooSmall, len(pageScratch), root.State.MaxPageSize,
+		)
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	if info.Size() < 0 {
+		return ErrSuperblockNotFound
+	}
+	ok, err := validateInlineRecoveryCandidate(
+		file, root, uint64(info.Size()), pageScratch,
+	)
+	if err != nil {
+		return errors.Join(ErrSuperblockNotFound, err)
+	}
+	if !ok {
+		return ErrSuperblockNotFound
+	}
+	return nil
+}
+
+func validateInlineRecoveryCandidate(
+	file *os.File, root InlineSuperblock, fileSize uint64, pageScratch []byte,
+) (bool, error) {
+	if root.FileEnd > fileSize {
+		return false, nil
+	}
+	state := root.State
+	refsOK, refsErr := readStateRootRefs(file, state, root.FileEnd, pageScratch)
+	if refsErr != nil || !refsOK {
+		return refsOK, refsErr
+	}
+	indexHead := root.FreeDelta.IndexHead()
+	if indexHead != (PageRef{}) {
+		buf := pageScratch[:indexHead.Length]
+		n, readErr := file.ReadAt(buf, int64(indexHead.Offset))
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return false, readErr
+		}
+		if n != len(buf) {
+			return false, nil
+		}
+		index, indexOpenErr := OpenFreeIndexPage(buf, root.FileEnd, state.NextLogicalID)
+		indexHeader := index.Header()
+		if indexOpenErr != nil || indexHeader.StoreID != root.StoreID ||
+			indexHeader.PageSize != root.PageSize ||
+			indexHeader.Generation > root.Generation ||
+			indexHeader.LogicalID != indexHead.LogicalID ||
+			indexHeader.Generation != indexHead.Generation {
+			return false, nil
+		}
+	}
+	externalPrev := root.FreeDelta.ExternalPrev()
+	if externalPrev != (PageRef{}) {
+		buf := pageScratch[:externalPrev.Length]
+		n, readErr := file.ReadAt(buf, int64(externalPrev.Offset))
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return false, readErr
+		}
+		if n != len(buf) {
+			return false, nil
+		}
+		free, freeOpenErr := OpenFreeDeltaPage(buf, root.FileEnd, state.NextLogicalID)
+		freeHeader := free.Header()
+		if freeOpenErr != nil || freeHeader.StoreID != root.StoreID ||
+			freeHeader.PageSize != root.PageSize || freeHeader.Generation > root.Generation ||
+			freeHeader.LogicalID != externalPrev.LogicalID ||
+			freeHeader.Generation != externalPrev.Generation ||
+			indexHead != free.IndexHead() {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// RewriteInlineSuperblockCopies installs one already authenticated complete
+// root image into both mutable root slots and synchronizes the file.  It is a
+// private exact-root recovery primitive: callers must authenticate the image
+// against an external group vector before invoking it.  Writing both copies
+// makes a later ordinary root selector converge on the selected group root;
+// the external vector remains the authority if power fails between the two
+// writes.
+func RewriteInlineSuperblockCopies(file *os.File, root InlineSuperblock) error {
+	if file == nil {
+		return fmt.Errorf("%w: nil exact-root file", ErrInvalidWrite)
+	}
+	encoded := make([]byte, InlineSuperblockSize)
+	if _, err := EncodeInlineSuperblock(encoded, root); err != nil {
+		return err
+	}
+	layout, err := MutableStoreLayout(root.PageSize)
+	if err != nil {
+		return err
+	}
+	for _, offset := range layout.RootOffsets {
+		written := 0
+		for written < len(encoded) {
+			n, writeErr := file.WriteAt(encoded[written:], int64(offset)+int64(written))
+			written += n
+			if writeErr != nil {
+				return writeErr
+			}
+			if n == 0 {
+				return io.ErrShortWrite
+			}
+		}
+		// Keep one complete authenticated copy durable before replacing the
+		// other. Exact-root recovery is cold-path work, so the extra barrier
+		// buys a valid ordinary fallback if the process dies during repair.
+		if err := file.Sync(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func orderedInlineSuperblocks(
