@@ -36,6 +36,7 @@ DIAGNOSTIC_COUNTERS = (
     "remote_poisoned", "remote_rejected", "remote_handshake_failures",
     "raft_proposal_batches", "raft_proposal_commands", "raft_proposal_bytes", "raft_apply_batches",
     "raft_applied_entries", "raft_commit_advancements", "raft_committed_entries", "raft_ready_persisted",
+    "raft_proposal_window_queued", "raft_late_join_used", "raft_late_join_missed", "raft_late_join_entries",
 )
 
 
@@ -197,7 +198,8 @@ def validate_diagnostics(path, trial, nodes):
                     "diagnostic counter missing or decreased")
             counters[key] = high - low
         reported = delta.get("counters")
-        require(isinstance(reported, dict) and all(is_integer(value) for value in reported.values()) and
+        require(isinstance(reported, dict) and all(is_integer(value) and 0 <= value <= UINT64_MASK
+                                                    for value in reported.values()) and
                 reported == counters, "diagnostic counter delta mismatch")
         low, high = [record["snapshot"].get("ready_wave_group_histogram") for record in (first, last)]
         require(isinstance(low, list) and isinstance(high, list) and len(low) == len(high) and len(low) >= 2 and
