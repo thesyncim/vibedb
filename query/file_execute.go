@@ -51,8 +51,9 @@ type ExecOptions struct {
 	// ResultBytes bounds logical ResultColumn/Cell storage plus every cell's
 	// retained variable-width representation, including bytes borrowed from a
 	// heap Segment and bytes copied out of durable snapshots. A string charges
-	// both its exact JSON spelling and decoded contents because Result retains
-	// both. Zero selects the conservative defaults [DefaultResultRows] and
+	// both its exact JSON spelling and decoded contents when those are separate
+	// representations; a clean string shares its decoded view with the JSON
+	// payload and is charged once. Zero selects the conservative defaults [DefaultResultRows] and
 	// [DefaultResultBytes]; -1 explicitly disables that limit. Exceeding either
 	// returns *ResultBudgetError before the rejected result storage is grown.
 	ResultRows  int
