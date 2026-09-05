@@ -164,12 +164,20 @@ ORDER BY requires LIMIT; UPDATE FROM and mutation OFFSET are unsupported.
 The durable RF3 gateway is narrower than embedded execution. It accepts whole-
 document or declared top-level UPDATE only with exact-primary-key equality;
 top-level assignments may use supported scalar right-hand sides and are
-simultaneous. RETURNING, ORDER BY/LIMIT, nested targets, primary-key moves, and
-ON CONFLICT are refused. The coordinator linearizably reads the old row,
+simultaneous. RETURNING, ORDER BY/LIMIT, nested targets, and primary-key moves
+are refused. The coordinator linearizably reads the old row,
 evaluates each right-hand side once, and retains the canonical postimage with an
 exact old-length/SHA-256 CAS. Global indexes derive from that postimage. An
 ordinary exact retry may first replan; after admission, transaction execution
 and recovery use the retained program instead of reevaluating expressions.
+
+For RF3 INSERT without global indexes, primary-key DO NOTHING and whole-document
+EXCLUDED replacement are atomic. Declared column DO UPDATE supports bound scalar
+constants and EXCLUDED columns. A bounded binary conflict program is evaluated
+against the replica's current row during apply; no coordinator preimage is used.
+Both branches validate the candidate and referenced columns, and only the update
+branch evaluates assignments. Computed conflict assignments and indexed conflict
+maintenance remain unsupported.
 
 RETURNING accepts bounded path/scalar projections but no aggregates,
 parameters, or SELECT tail. Execute a returning mutation through a query API;

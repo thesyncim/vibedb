@@ -92,8 +92,12 @@ the original conflict action atomically in the shard driver. Arbitrary shard-key
 assignments still require a placement proof; copying the current or candidate
 key and whole-document EXCLUDED replacement preserve the routed owner.
 RF3 whole-document EXCLUDED replacement uses the native atomic put primitive
-and preserves its exact affected-row and retry semantics. Global-index conflict
-maintenance, column DO UPDATE, RETURNING, general mutation
+and preserves its exact affected-row and retry semantics. Declared RF3 column
+upserts now replicate a bounded conflict program with bound scalar constants
+and EXCLUDED column references. Each replica validates the candidate and column
+names before selecting the insert or update branch, then patches its current
+row atomically. Untouched fields and exact retry results are preserved.
+Computed conflict assignments, global-index conflict maintenance, RETURNING, general mutation
 predicates, and explicit transaction parity still need implementation. The
 bounded coordinator read path also still needs full RF3 global-index read
 integration. These are release gates for the requested distributed parity,
