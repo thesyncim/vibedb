@@ -1,0 +1,16 @@
+/out/bin/after-driver.test: go1.27.1-X:simd
+	path	github.com/thesyncim/vibedb/sql/driver.test
+	mod	github.com/thesyncim/vibedb	(devel)	
+	dep	github.com/cespare/xxhash/v2	v2.3.0	h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=
+	dep	github.com/thesyncim/vibejson	v0.1.0	h1:Hk6Zp2RyiNuTBk7UiJ1I67ZJEpqIIiIE6J5gCUsAVc8=
+	dep	go.etcd.io/raft/v3	v3.7.0	h1:BGzlwx07bLv8PW6OU5HObuz1y4hlPZUXA07pM1mPUh4=
+	dep	golang.org/x/sys	v0.47.0	h1:o7XGOvZQCADBQQ4Y7VNq2dRWQR7JmOUW8Kxx4ZsNgWs=
+	dep	google.golang.org/protobuf	v1.36.11	h1:fV6ZwhNocDyBLK0dj+fg8ektcVegBBuEolpbTQyBNVE=
+	build	-buildmode=exe
+	build	-compiler=gc
+	build	-trimpath=true
+	build	CGO_ENABLED=0
+	build	GOARCH=arm64
+	build	GOEXPERIMENT=simd
+	build	GOOS=linux
+	build	GOARM64=v8.0
