@@ -50,6 +50,8 @@ func TestCoordinatorQueryMatchesGlobalSQLSemantics(t *testing.T) {
 		{`SELECT n FROM messages WHERE n < 3 UNION ALL SELECT n FROM messages WHERE n > 2 ORDER BY 1 DESC`, []string{"4", "3", "2", "1"}},
 		{`SELECT n, ROW_NUMBER() OVER (ORDER BY n DESC) AS rn FROM messages ORDER BY rn`, []string{"4|1", "3|2", "2|3", "1|4"}},
 		{`SELECT a.n, b.n FROM messages AS a CROSS JOIN messages AS b WHERE a.n = 1 AND b.n = 4`, []string{"1|4"}},
+		{`SELECT a.n,d.total FROM messages a LEFT JOIN LATERAL (SELECT SUM(a.n) AS total FROM messages b WHERE b.n=a.n GROUP BY a.n HAVING COUNT(*)>0 AND SUM(b.n)>2) d ON TRUE ORDER BY a.n`, []string{"1|null", "2|null", "3|3", "4|4"}},
+		{`SELECT a.n,d.total FROM messages a LEFT JOIN LATERAL (SELECT COUNT(*) AS total FROM messages b WHERE b.n=a.n HAVING SUM(a.n)>2) d ON TRUE ORDER BY a.n`, []string{"1|null", "2|null", "3|1", "4|1"}},
 	} {
 		t.Run(tc.sql, func(t *testing.T) {
 			result, err := executor.Query(context.Background(), Query{SQL: tc.sql, Class: ClassBatch})
@@ -163,6 +165,7 @@ func TestCoordinatorQueryPrunesNestedShardKeysWithoutCrossingLimit(t *testing.T)
 		{`WITH c(owner,n) AS (SELECT tenant_id,n FROM messages) SELECT SUM(n)+1 FROM c WHERE owner=? HAVING COUNT(*)>0`, []shardservice.Param{shardservice.StringParam(keys[0])}, 1, []string{"1.01e2"}},
 		{`SELECT 1 FROM messages WHERE tenant_id IS NOT DISTINCT FROM NULL HAVING COUNT(*)=0`, nil, 0, []string{"1"}},
 		{`SELECT 1 FROM messages WHERE tenant_id IS NOT DISTINCT FROM NULL ORDER BY COUNT(*)`, nil, 0, []string{"1"}},
+		{`SELECT d.total FROM messages a CROSS JOIN LATERAL (SELECT COUNT(*) AS total FROM messages b WHERE b.tenant_id=? GROUP BY a.n HAVING SUM(a.n)>0 AND SUM(b.n)>0) d WHERE a.tenant_id=?`, []shardservice.Param{shardservice.StringParam(keys[0]), shardservice.StringParam(keys[0])}, 1, []string{"1"}},
 		{`SELECT SUM(c.n) FROM messages AS a JOIN messages AS b ON a.tenant_id=b.tenant_id JOIN messages AS c ON b.tenant_id=c.tenant_id WHERE a.tenant_id=? AND COALESCE(c.n,0)>50`, []shardservice.Param{shardservice.StringParam(keys[0])}, 1, []string{"100"}},
 		{`WITH c(owner,n) AS (SELECT tenant_id,n FROM messages) SELECT n+1 FROM c WHERE owner IS NOT DISTINCT FROM ?`, []shardservice.Param{shardservice.StringParam(keys[0])}, 1, []string{"1.01e2"}},
 		{`SELECT n FROM messages WHERE tenant_id IS NOT DISTINCT FROM ?`, []shardservice.Param{shardservice.StringParam(keys[1])}, 1, []string{"100"}},
