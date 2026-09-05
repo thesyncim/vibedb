@@ -1009,8 +1009,8 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 
 	var pending raftmember.OutboundMessage
 	readyBlocked := false
-	var deferredRead ownerRequest
-	deferredReadPending := false
+	deferredReads := newDeferredReadIngress(owner.limits.MaxIngressItems)
+	retryDeferredReads := false
 	collector := newProposalIngressCollector(owner.limits.MaxIngressItems)
 	var asyncNotify <-chan struct{}
 	var asyncHost asyncOwnerHost
@@ -1070,16 +1070,10 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 		if collector.active() {
 			failCollected(errors.Join(ErrOwnerClosed, runErr))
 		}
-		if deferredReadPending {
-			reply := ownerReply{err: errors.Join(ErrOwnerClosed, runErr)}
-			if deferredRead.read.delivery != nil {
-				owner.settleReadDelivery(deferredRead.read.delivery, reply)
-			} else {
-				deferredRead.reply <- reply
-			}
-			owner.release(deferredRead.bytes)
-			deferredRead = ownerRequest{}
-			deferredReadPending = false
+		for _, request := range deferredReads.requests {
+			owner.settleReadDelivery(request.read.delivery,
+				ownerReply{err: errors.Join(ErrOwnerClosed, runErr)})
+			owner.release(request.bytes)
 		}
 	}()
 	for {
@@ -1141,6 +1135,7 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 				// sink: the next bounded ingress event or logical pulse retries it.
 				readyBlocked = true
 			case done:
+				retryDeferredReads = true
 				if err := owner.syncMembershipAuthority(progress.Group); err != nil {
 					return owner.stop(err)
 				}
@@ -1149,43 +1144,15 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 			}
 		}
 
-		if deferredReadPending {
-			if !readyBlocked {
-				err := handleRequest(deferredRead)
-				if !errors.Is(err, errOwnerReadDeferred) {
-					deferredRead = ownerRequest{}
-					deferredReadPending = false
-					if err != nil {
-						return owner.stop(err)
-					}
-					continue
-				}
+		if retryDeferredReads && !readyBlocked {
+			retryDeferredReads = false
+			progressed, err := deferredReads.retry(handleRequest)
+			if err != nil {
+				return owner.stop(err)
 			}
-			// A failed Ready attempt or a refusal after the idle probe requires a
-			// new asynchronous/pulse edge. Wait instead of polling ReadIndex or
-			// admitting newer ingress past this request.
-			select {
-			case <-ctx.Done():
-				return owner.stop(context.Cause(ctx))
-			case _, ok := <-asyncNotify:
-				if !ok {
-					asyncNotify = nil
-					asyncHost = nil
-					continue
-				}
-				readyBlocked = false
-				asyncHost.WakePipelined()
-			case _, ok := <-owner.pulse:
-				readyBlocked = false
-				if !ok {
-					owner.pulse = nil
-					continue
-				}
-				if err := offerTicks(); err != nil {
-					return owner.stop(err)
-				}
+			if progressed {
+				continue
 			}
-			continue
 		}
 
 		select {
@@ -1198,13 +1165,15 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 				continue
 			}
 			readyBlocked = false
+			retryDeferredReads = true
 			asyncHost.WakePipelined()
 		case request := <-owner.ingress:
 			readyBlocked = false
+			retryDeferredReads = true
 			if !proposalIngressCandidate(request) {
 				if err := handleRequest(request); err != nil {
 					if errors.Is(err, errOwnerReadDeferred) {
-						deferredRead, deferredReadPending = request, true
+						deferredReads.retain(request)
 						continue
 					}
 					return owner.stop(err)
@@ -1221,18 +1190,18 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 				// drain removed this read from ingress. Record its ownership before
 				// flushing the earlier proposal prefix so every terminal exit can
 				// settle its delivery and release its ingress charge exactly once.
-				deferredRead, deferredReadPending = barrier, true
+				deferredReads.retain(barrier)
 			}
 			if err := flushCollected(); err != nil {
 				return owner.stop(err)
 			}
-			if deferredReadPending {
+			if errors.Is(drainErr, errOwnerReadDeferred) {
 				continue
 			}
 			if barrierPresent {
 				if err := handleRequest(barrier); err != nil {
 					if errors.Is(err, errOwnerReadDeferred) {
-						deferredRead, deferredReadPending = barrier, true
+						deferredReads.retain(barrier)
 						continue
 					}
 					return owner.stop(err)
@@ -1240,6 +1209,7 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 			}
 		case _, ok := <-owner.pulse:
 			readyBlocked = false
+			retryDeferredReads = true
 			if !ok {
 				owner.pulse = nil
 				continue
