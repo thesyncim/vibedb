@@ -142,7 +142,11 @@ func (p *plan) runValidatedRawInto(e *Exec, raw []byte) error {
 	s.work.eval.bindCorrelations(e.Workspace.correlations)
 	s.batch = takeFileBatch(s.slots[:], 0, 0)
 	defer func() {
+		// This batch borrows raw. Never park its capacity as a writable scan
+		// buffer: a later durable scan could otherwise overwrite caller input.
+		s.batch.data = nil
 		s.slots[0].batch = s.batch
+		s.work.clearBorrowedViews()
 		clear(s.arena.heads)
 		e.Stats = s.stats
 		s.p, s.e = nil, nil
@@ -161,7 +165,29 @@ func (p *plan) runValidatedRawInto(e *Exec, raw []byte) error {
 		Workers: 1, RowsTotal: 1, RowsScanned: 1, CandidateRows: 1,
 		PeakBatchRows: 1, PeakBatchBytes: s.batch.bytes,
 	}
-	err := s.flush()
+	var err error
+	// One nongrouped point already satisfies every requested ordering. Let the raw
+	// ordered materializer own the one-row result when its scalar shape is
+	// supported; an unsupported shape keeps the established structural flush.
+	// LIMIT 0 deliberately stays on that path because the direct materializer
+	// receives no row budget to consume and the existing flush truncates it.
+	if !p.hasLimit || p.limit > 0 {
+		retained, handled, _, appendErr := p.appendFileRawOrderedResult(
+			&e.Result, s.batch, &s.work, false, &s.payload, &s.cells,
+		)
+		if handled {
+			s.stats.Batches++
+			s.stats.BufferedBytes = max(s.stats.BufferedBytes, retained)
+			s.batch.base += uint64(len(s.batch.ends))
+			s.batch.data, s.batch.ends, s.batch.bytes = s.batch.data[:0], s.batch.ends[:0], 0
+			err = appendErr
+			if err == nil {
+				err = s.work.checkCanceled()
+			}
+			return err
+		}
+	}
+	err = s.flush()
 	if err == nil {
 		err = s.work.checkCanceled()
 	}
