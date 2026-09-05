@@ -1,0 +1,1 @@
+Address-only pre-fix reference: /private/tmp/vibedb-go127-simd-extrema-candidate-storeio-final.test, associated with the prior extrema-layout candidate. It is not used for timing in this report.

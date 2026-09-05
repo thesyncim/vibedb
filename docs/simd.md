@@ -97,6 +97,11 @@ record durable FOR10 and FOR16 `MIN`, `MAX`, and combined `MIN`+`MAX` query
 evidence, including paired baseline/SIMD samples and the candidate nosimd
 control. Native AMD64 SIMD qualification remains a CI lane; the local report
 contains ARM64 measurements only.
+The [packed extrema layout follow-up](benchmarks/packed-extrema-simd-layout-fix-2026-09-05/README.md)
+records the source relocation that restores the pre-existing equality8 kernel
+alignment, the focused ordered wide sparse/less-than check, and fixed-candidate
+SIMD/nosimd extrema controls. Its ordered lane remains an explicitly reported
+development regression until separately resolved.
 Portable parity remains in the regular CI job.
 
 Each width follows the same evidence requirement: demonstrate that a real
@@ -109,6 +114,9 @@ architecture, fixtures, and exact revision pairs.
 - `internal/storeio/compact_stream_codec.go`: packed counters and exact stream comparisons.
 - `internal/storeio/compact_stream_codec_simd_arm64.go`: guarded vector loads, width-specific unpacking, and bounded reductions.
 - `internal/storeio/compact_stream_codec_simd_amd64.go`: guarded AVX2 loads, width-specific unpacking, and bounded reductions.
+- `internal/storeio/compact_stream_codec_simd_extrema.go`: extrema front end and scalar packed reductions.
+- `internal/storeio/compact_stream_codec_simd_extrema_arm64.go`: ARM64 extrema kernels kept after the pre-existing packed kernels.
+- `internal/storeio/compact_stream_codec_simd_extrema_amd64.go`: AMD64 extrema reductions and kernels kept after the pre-existing packed kernels.
 - `internal/storeio/compact_stream_codec_dispatch_scalar.go`: portable dispatch.
 - `internal/storeio/compact_primary_stripe.go`: compressed stripe count operations.
 - `internal/storeio/primary_graph_unified_filter.go`: durable packed equality, ordered count, and extrema integration.

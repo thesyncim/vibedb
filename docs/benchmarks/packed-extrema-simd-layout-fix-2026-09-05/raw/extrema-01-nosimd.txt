@@ -1,0 +1,7 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/query
+cpu: Apple M4 Max
+BenchmarkFilePackedIntegerExtremaCount/min-max/FOR10         	   25920	     11578 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+BenchmarkFilePackedIntegerExtremaCountWide/min-max/FOR16     	   23679	     12765 ns/op	         1.000 result-rows	     16384 rows	       0 B/op	       0 allocs/op
+PASS

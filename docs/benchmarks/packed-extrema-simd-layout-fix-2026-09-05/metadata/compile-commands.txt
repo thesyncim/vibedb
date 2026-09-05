@@ -1,0 +1,10 @@
+Baseline storeio:
+GOCACHE=/private/tmp/vibedb-go127-simd-extrema-cache-build-base-storeio GOTOOLCHAIN=go1.27.0 GOEXPERIMENT=simd go test -run '^$' -c -o /private/tmp/vibedb-go127-simd-extrema-base-storeio-layout.test ./internal/storeio
+Baseline query:
+GOCACHE=/private/tmp/vibedb-go127-simd-extrema-cache-build-base-query GOTOOLCHAIN=go1.27.0 GOEXPERIMENT=simd go test -run '^$' -c -o /private/tmp/vibedb-go127-simd-extrema-base-query-layout.test ./query
+Fixed candidate storeio:
+GOCACHE=/private/tmp/vibedb-go127-simd-extrema-cache-build-fixed-storeio GOTOOLCHAIN=go1.27.0 GOEXPERIMENT=simd go test -run '^$' -c -o /private/tmp/vibedb-go127-simd-extrema-candidate-storeio-layout-fixed.test ./internal/storeio
+Fixed candidate query:
+GOCACHE=/private/tmp/vibedb-go127-simd-extrema-cache-build-fixed-query GOTOOLCHAIN=go1.27.0 GOEXPERIMENT=simd go test -run '^$' -c -o /private/tmp/vibedb-go127-simd-extrema-candidate-query-layout-fixed.test ./query
+Fixed candidate query nosimd control:
+GOCACHE=/private/tmp/vibedb-go127-simd-extrema-cache-build-fixed-query-nosimd GOTOOLCHAIN=go1.27.0 GOEXPERIMENT=nosimd go test -run '^$' -c -o /private/tmp/vibedb-go127-simd-extrema-candidate-query-layout-fixed-nosimd.test ./query
