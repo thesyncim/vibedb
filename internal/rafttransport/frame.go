@@ -164,6 +164,9 @@ func (registry *StaticRegistry) preflightOutbound(
 		if retiredOutboundDestination(view, outbound.Message) {
 			return outboundFramePlan{}, fmt.Errorf("%w: %w", err, errRetiredOutboundDestination)
 		}
+		if retiredOutboundSource(view, outbound.Message) {
+			return outboundFramePlan{}, fmt.Errorf("%w: %w", err, errRetiredOutboundSource)
+		}
 		return outboundFramePlan{}, err
 	}
 	if size > raftmodel.MaxInboundMessageBytes {
