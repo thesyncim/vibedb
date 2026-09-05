@@ -230,6 +230,17 @@ func (r *UnifiedHoleResolver) segment(i int) []byte {
 	return r.path[s[0]:s[1]]
 }
 
+// topLevelSegment exposes the decoded member name for the flat projection
+// fast path. A path with more than one segment stays on the general LAST
+// walker, so callers cannot accidentally treat a nested pointer as a root
+// object member.
+func (r *UnifiedHoleResolver) topLevelSegment() ([]byte, bool) {
+	if r == nil || len(r.segments) != 1 {
+		return nil, false
+	}
+	return r.segment(0), true
+}
+
 // segmentIndex parses segment i as a canonical decimal array index (no sign,
 // no leading zero except "0" itself), returning -1 when it is not one.
 func (r *UnifiedHoleResolver) segmentIndex(i int) int {
@@ -416,6 +427,165 @@ func (r *UnifiedHoleResolver) resolveWalk(
 		// A non-container with Next != 1 cannot appear in a valid tape.
 		return hole, UnifiedHoleAbsent, true
 	}
+}
+
+// resolveWalkLast is the projection lane's SQL path resolver. Unlike the
+// historical resolver above, it must inspect every member with a matching key
+// because query paths use the last duplicate key. It also carries the hole
+// count through every matched subtree: an earlier container or array may
+// contain holes before a later duplicate scalar, and the later value must get
+// the later ordinal.
+func (r *UnifiedHoleResolver) resolveWalkLast(
+	src []byte, entries []vibejson.IndexEntry, i, seg, hole int,
+) (nextHole, result int, matched, ok bool) {
+	if r == nil || i < 0 || i >= len(entries) {
+		return hole, UnifiedHoleAbsent, false, false
+	}
+	e := &entries[i]
+	kind := e.Kind()
+	if kind != document.Array && kind != document.Object {
+		if e.Next != 1 {
+			return hole, UnifiedHoleAbsent, false, false
+		}
+		if seg == len(r.segments) {
+			return hole + 1, hole, true, true
+		}
+		return hole + 1, UnifiedHoleAbsent, true, true
+	}
+	if seg == len(r.segments) {
+		count, ok := compactProjectionSubtreeHoles(entries, i)
+		if !ok {
+			return hole, UnifiedHoleAbsent, false, false
+		}
+		return hole + count, UnifiedHoleContainer, true, true
+	}
+	switch kind {
+	case document.Array:
+		count := int(e.Count())
+		target := r.segmentIndex(seg)
+		if target < 0 || target >= count {
+			n, ok := compactProjectionSubtreeHoles(entries, i)
+			if !ok {
+				return hole, UnifiedHoleAbsent, false, false
+			}
+			return hole + n, UnifiedHoleAbsent, true, true
+		}
+		child := i + 1
+		var resultValue int
+		for m := 0; m < count; m++ {
+			if child < 0 || child >= len(entries) {
+				return hole, UnifiedHoleAbsent, false, false
+			}
+			value := child
+			if m == target {
+				var childMatched bool
+				next, candidate, found, childOK := r.resolveWalkLast(
+					src, entries, value, seg+1, hole,
+				)
+				if !childOK {
+					return hole, UnifiedHoleAbsent, false, false
+				}
+				hole, resultValue, childMatched = next, candidate, found
+				if !childMatched {
+					return hole, UnifiedHoleAbsent, false, false
+				}
+			} else {
+				n, childOK := compactProjectionSubtreeHoles(entries, value)
+				if !childOK {
+					return hole, UnifiedHoleAbsent, false, false
+				}
+				hole += n
+			}
+			step := int(entries[value].Next)
+			if step <= 0 || step > len(entries)-value {
+				return hole, UnifiedHoleAbsent, false, false
+			}
+			child = value + step
+		}
+		return hole, resultValue, true, true
+
+	case document.Object:
+		count := int(e.Count())
+		child := i + 1
+		foundKey := false
+		resultValue := UnifiedHoleAbsent
+		for range count {
+			if child < 0 || child+1 >= len(entries) {
+				return hole, UnifiedHoleAbsent, false, false
+			}
+			key := &entries[child]
+			value := child + 1
+			if key.Flags()&vibejson.TapeFlagKey == 0 {
+				return hole, UnifiedHoleAbsent, false, false
+			}
+			if r.keyEquals(src, key, r.segment(seg)) {
+				next, candidate, found, childOK := r.resolveWalkLast(
+					src, entries, value, seg+1, hole,
+				)
+				if !childOK || !found {
+					return hole, UnifiedHoleAbsent, false, false
+				}
+				hole, resultValue, foundKey = next, candidate, true
+			} else {
+				n, childOK := compactProjectionSubtreeHoles(entries, value)
+				if !childOK {
+					return hole, UnifiedHoleAbsent, false, false
+				}
+				hole += n
+			}
+			step := int(entries[value].Next)
+			if step <= 0 || step > len(entries)-value {
+				return hole, UnifiedHoleAbsent, false, false
+			}
+			child = value + step
+		}
+		if !foundKey {
+			resultValue = UnifiedHoleAbsent
+		}
+		return hole, resultValue, true, true
+	}
+	return hole, UnifiedHoleAbsent, false, false
+}
+
+// compactProjectionSubtreeHoles counts scalar holes in one tape subtree. It
+// is deliberately independent of path matching so a duplicate resolver can
+// continue after a matched container and retain the correct ordinal for a
+// later duplicate value.
+func compactProjectionSubtreeHoles(entries []vibejson.IndexEntry, i int) (int, bool) {
+	if i < 0 || i >= len(entries) {
+		return 0, false
+	}
+	e := &entries[i]
+	kind := e.Kind()
+	if kind != document.Array && kind != document.Object {
+		return 1, e.Next == 1
+	}
+	count := int(e.Count())
+	child := i + 1
+	total := 0
+	for range count {
+		value := child
+		if kind == document.Object {
+			if child < 0 || child+1 >= len(entries) {
+				return 0, false
+			}
+			value = child + 1
+		}
+		n, ok := compactProjectionSubtreeHoles(entries, value)
+		if !ok || n > int(^uint(0)>>1)-total {
+			return 0, false
+		}
+		total += n
+		if value < 0 || value >= len(entries) {
+			return 0, false
+		}
+		step := int(entries[value].Next)
+		if step <= 0 || step > len(entries)-value {
+			return 0, false
+		}
+		child = value + step
+	}
+	return total, true
 }
 
 // PathSpanOf resolves the resolver's path against an arbitrary rendered

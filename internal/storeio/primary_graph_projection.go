@@ -183,13 +183,13 @@ func (v *CompactPrimaryStripeView) visitResolvedProjectionRange(
 		return false, false, valueScratch, nil
 	}
 	clear(shapeSeen[:v.shapeCount])
-	for shape := 0; shape < v.shapeCount; shape++ {
-		base := shape * len(resolvers)
-		prepareUnifiedProjectionShape(
-			v, shape, resolvers, &shapeWork[shape], streamWork[base:base+len(resolvers)],
-			valueScratch,
-		)
-	}
+	// Shapes are prepared on first encounter below. A leaf can carry many
+	// shapes whose rows fall after the range limit; parsing and binding all of
+	// them here would spend the same work the projection lane is meant to
+	// avoid. Stream views are page-backed and are cleared by VisitProjected's
+	// leaf transition/defer, so each leaf starts with fresh shape metadata.
+	clear(shapeWork[:v.shapeCount])
+	clear(streamWork[:v.shapeCount*len(resolvers)])
 	for row := start; row < end; row++ {
 		if v.IsOverflow(row) {
 			return false, false, valueScratch, nil
@@ -197,6 +197,17 @@ func (v *CompactPrimaryStripeView) visitResolvedProjectionRange(
 		shape := v.rowShape(row)
 		if shape < 0 || shape >= v.shapeCount {
 			return false, false, valueScratch, nil
+		}
+		if !shapeWork[shape].prepared {
+			base := shape * len(resolvers)
+			shapeWork[shape].prepared = true
+			if !prepareUnifiedProjectionShape(
+				v, shape, resolvers, &shapeWork[shape],
+				streamWork[base:base+len(resolvers)], valueScratch,
+			) {
+				shapeWork[shape].unsupported = true
+				return false, false, valueScratch, nil
+			}
 		}
 		if shapeWork[shape].unsupported {
 			return false, false, valueScratch, nil

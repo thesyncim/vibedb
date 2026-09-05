@@ -118,6 +118,31 @@ func TestCompactIntegerGroupsBoundedResolverNeverGrows(t *testing.T) {
 	}
 }
 
+func TestCompactIntegerGroupsUseLastDuplicateMember(t *testing.T) {
+	group := &UnifiedHoleResolver{}
+	if err := group.SetPath([]byte("/g")); err != nil {
+		t.Fatal(err)
+	}
+	view := compactProjectionTestView(t, []CommonPrimaryLeafRecord{{
+		Key:   []byte("key"),
+		Value: CommonPrimaryLeafValue{Inline: []byte(`{"g":1,"g":3}`)},
+	}})
+	seen := make([]int, view.shapeCount)
+	shapes := make([]IntegerGroupShapeWorkspace, view.shapeCount)
+	callbacks := 0
+	supported, err := view.VisitResolvedIntegerGroups(group, nil, seen, shapes,
+		func(row int, key, sum int64) error {
+			callbacks++
+			if row != 0 || key != 3 || sum != 0 {
+				t.Fatalf("row=%d key=%d sum=%d, want last duplicate key 3", row, key, sum)
+			}
+			return nil
+		})
+	if err != nil || !supported || callbacks != 1 {
+		t.Fatalf("supported=%v callbacks=%d err=%v", supported, callbacks, err)
+	}
+}
+
 func TestUnifiedCanonicalIntegerBoundaries(t *testing.T) {
 	for _, raw := range []string{"9223372036854775807", "-9223372036854775808", "0", "-1"} {
 		want, _ := strconv.ParseInt(raw, 10, 64)

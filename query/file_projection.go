@@ -381,7 +381,7 @@ func (s *fileSmallScan) projectedResultInto(
 			vibejson.RawValue{Src: value.JSON}, &s.work.text,
 		)
 		cell := cellFromScalar(scalarValue)
-		add := resultCellPayloadBytes(cell)
+		add := projectedCellPayloadBytes(cell)
 		if add < 0 || rowPayload > math.MaxInt64-add {
 			return result.resultByteBudgetError(result.RowCount+1, math.MaxInt64)
 		}
@@ -399,7 +399,7 @@ func (s *fileSmallScan) projectedResultInto(
 	for field, cell := range rowCells {
 		result.Columns[field].Cells = append(
 			result.Columns[field].Cells,
-			result.ownFileCell(cell),
+			result.ownProjectedCell(cell),
 		)
 	}
 	*payload = nextPayload

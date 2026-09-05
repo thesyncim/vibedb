@@ -1,12 +1,14 @@
 package storeio
 
 import (
+	"bytes"
 	"encoding/binary"
 	"math"
 	"strconv"
 	"unsafe"
 
 	"github.com/thesyncim/vibejson"
+	"github.com/thesyncim/vibejson/document"
 )
 
 // UnifiedProjectionMaxShapes is the largest shape set admitted by the
@@ -28,6 +30,7 @@ type UnifiedProjectionField struct {
 type UnifiedProjectionShapeWorkspace struct {
 	rows        int
 	start       int
+	prepared    bool
 	unsupported bool
 }
 
@@ -35,6 +38,7 @@ type UnifiedProjectionShapeWorkspace struct {
 // selected scalar stream. It is exported as a storage-neutral type so query
 // execution can preallocate a flat stream arena without knowing its layout.
 type UnifiedProjectionStreamWorkspace struct {
+	hole int
 	view compactStreamView
 }
 
@@ -277,8 +281,30 @@ func prepareUnifiedProjectionShape(
 	meta.rows = entry.rows
 	meta.start = 0
 	meta.unsupported = false
+	var skeleton [1024]byte
+	var tape [128]vibejson.IndexEntry
+	filled, index, ok := compactProjectionTemplateIndex(
+		entry.template, skeleton[:], tape[:],
+	)
+	if !ok {
+		meta.unsupported = true
+		return false
+	}
+	for _, e := range index.Entries {
+		if e.Flags()&vibejson.TapeFlagEscaped != 0 &&
+			uint64(e.End-e.Start) > uint64(cap(keyScratch)) {
+			meta.unsupported = true
+			return false
+		}
+	}
+	if !resolveCompactProjectionFieldsLast(
+		filled, index, resolvers, keyScratch, streams,
+	) {
+		meta.unsupported = true
+		return false
+	}
 	for field := range resolvers {
-		hole := resolveCompactProjectionTemplate(&resolvers[field], entry.template, keyScratch)
+		hole := streams[field].hole
 		if hole < 0 {
 			meta.unsupported = true
 			return false
@@ -299,26 +325,10 @@ func prepareUnifiedProjectionShape(
 func resolveCompactProjectionTemplate(resolver *UnifiedHoleResolver, entry compactPrimaryTemplateView, keyScratch []byte) int {
 	var skeleton [1024]byte
 	var tape [128]vibejson.IndexEntry
-	if entry.holes < 0 || len(entry.static) > len(skeleton) ||
-		entry.holes > (len(skeleton)-len(entry.static))/4 ||
-		entry.holes >= len(entry.ends)/4 {
-		return UnifiedHoleContainer
-	}
-	filled := skeleton[:0]
-	previous := 0
-	for segment := 0; segment <= entry.holes; segment++ {
-		end := int(readUint32(entry.ends[segment*4:]))
-		if end < previous || end > len(entry.static) {
-			return UnifiedHoleContainer
-		}
-		if segment > 0 {
-			filled = append(filled, "null"...)
-		}
-		filled = append(filled, entry.static[previous:end]...)
-		previous = end
-	}
-	index, err := vibejson.BuildIndex(filled, tape[:])
-	if err != nil {
+	filled, index, ok := compactProjectionTemplateIndex(
+		entry, skeleton[:], tape[:],
+	)
+	if !ok {
 		return UnifiedHoleContainer
 	}
 	for _, e := range index.Entries {
@@ -330,11 +340,177 @@ func resolveCompactProjectionTemplate(resolver *UnifiedHoleResolver, entry compa
 	// Decoded keys cannot exceed their admitted spellings. Reuse the caller's
 	// value arena during shape preparation so keyEquals cannot allocate.
 	local.keyScratch = keyScratch[:0]
-	_, result, done := local.resolveWalk(filled, index.Entries, 0, 0, true, 0)
-	if !done {
+	_, result, matched, ok := local.resolveWalkLast(
+		filled, index.Entries, 0, 0, 0,
+	)
+	if !ok || !matched {
 		return UnifiedHoleAbsent
 	}
 	return result
+}
+
+// compactProjectionTemplateIndex fills one compact shape's holes with null
+// and builds a single bounded tape. Callers keep skeleton and tape storage on
+// their stack or in caller-owned workspace, so this helper performs no heap
+// growth while preparing a shape.
+func compactProjectionTemplateIndex(
+	entry compactPrimaryTemplateView,
+	skeleton []byte,
+	tape []vibejson.IndexEntry,
+) (filled []byte, index vibejson.Index, ok bool) {
+	if entry.holes < 0 || len(entry.static) > len(skeleton) ||
+		entry.holes > (len(skeleton)-len(entry.static))/4 ||
+		entry.holes >= len(entry.ends)/4 {
+		return nil, vibejson.Index{}, false
+	}
+	filled = skeleton[:0]
+	previous := 0
+	for segment := 0; segment <= entry.holes; segment++ {
+		end := int(readUint32(entry.ends[segment*4:]))
+		if end < previous || end > len(entry.static) {
+			return nil, vibejson.Index{}, false
+		}
+		if segment > 0 {
+			filled = append(filled, "null"...)
+		}
+		filled = append(filled, entry.static[previous:end]...)
+		previous = end
+	}
+	index, err := vibejson.BuildIndex(filled, tape)
+	if err != nil {
+		return nil, vibejson.Index{}, false
+	}
+	return filled, index, true
+}
+
+// resolveCompactProjectionFieldsLast resolves every selected path against
+// one already-built shape tape. Top-level paths use one object-member walk,
+// which both shares duplicate-key comparisons and computes every selected
+// hole ordinal from the same running count. Nested paths use the same tape and
+// the SQL-LAST walker independently; they still avoid rebuilding the shape
+// skeleton and index once per field.
+func resolveCompactProjectionFieldsLast(
+	src []byte,
+	index vibejson.Index,
+	resolvers []UnifiedHoleResolver,
+	keyScratch []byte,
+	streams []UnifiedProjectionStreamWorkspace,
+) bool {
+	if len(resolvers) == 0 || len(streams) < len(resolvers) ||
+		len(index.Entries) == 0 {
+		return false
+	}
+	for field := range resolvers {
+		streams[field].hole = UnifiedHoleAbsent
+		streams[field].view = compactStreamView{}
+	}
+	allTopLevel := true
+	for field := range resolvers {
+		if _, ok := resolvers[field].topLevelSegment(); !ok {
+			allTopLevel = false
+			break
+		}
+	}
+	if allTopLevel {
+		return resolveCompactProjectionTopLevelLast(
+			src, index.Entries, resolvers, keyScratch, streams,
+		)
+	}
+	for field := range resolvers {
+		local := resolvers[field]
+		local.keyScratch = keyScratch[:0]
+		_, result, matched, ok := local.resolveWalkLast(
+			src, index.Entries, 0, 0, 0,
+		)
+		if !ok || !matched {
+			return false
+		}
+		streams[field].hole = result
+	}
+	return true
+}
+
+// resolveCompactProjectionTopLevelLast handles the common flat-object case
+// with one pass over object members. It overwrites a field on each matching
+// member, so a duplicate container, scalar, or explicit null follows the
+// query resolver's last-member semantics. Unselected subtrees are skipped by
+// their validated hole counts rather than recursively parsed per field.
+func resolveCompactProjectionTopLevelLast(
+	src []byte,
+	entries []vibejson.IndexEntry,
+	resolvers []UnifiedHoleResolver,
+	keyScratch []byte,
+	streams []UnifiedProjectionStreamWorkspace,
+) bool {
+	if len(entries) == 0 || entries[0].Kind() != document.Object {
+		return false
+	}
+	root := &entries[0]
+	child := 1
+	hole := 0
+	for range int(root.Count()) {
+		if child < 0 || child+1 >= len(entries) {
+			return false
+		}
+		key := &entries[child]
+		value := child + 1
+		if key.Flags()&vibejson.TapeFlagKey == 0 {
+			return false
+		}
+		keyBytes, ok := compactProjectionKeyBytes(src, key, keyScratch)
+		if !ok {
+			return false
+		}
+		valueHoles, ok := compactProjectionSubtreeHoles(entries, value)
+		if !ok {
+			return false
+		}
+		candidate := hole
+		if entries[value].Kind() == document.Array ||
+			entries[value].Kind() == document.Object {
+			candidate = UnifiedHoleContainer
+		}
+		for field := range resolvers {
+			name, nameOK := resolvers[field].topLevelSegment()
+			if nameOK && bytes.Equal(keyBytes, name) {
+				streams[field].hole = candidate
+			}
+		}
+		hole += valueHoles
+		step := int(entries[value].Next)
+		if step <= 0 || step > len(entries)-value {
+			return false
+		}
+		child = value + step
+	}
+	return true
+}
+
+// compactProjectionKeyBytes returns one borrowed decoded key spelling for the
+// shared top-level walk. The key scratch is caller-owned and bounded; escaped
+// keys that cannot fit decline before vibejson is asked to append into it.
+func compactProjectionKeyBytes(
+	src []byte,
+	key *vibejson.IndexEntry,
+	scratch []byte,
+) ([]byte, bool) {
+	if key == nil || key.Start >= key.End || uint64(key.End) > uint64(len(src)) {
+		return nil, false
+	}
+	raw := src[key.Start:key.End]
+	if key.Flags()&vibejson.TapeFlagEscaped == 0 {
+		if len(raw) < 2 {
+			return nil, false
+		}
+		return raw[1 : len(raw)-1], true
+	}
+	if len(raw) > cap(scratch) {
+		return nil, false
+	}
+	scratch = scratch[:0]
+	node := vibejson.Node{Src: &src[0], Entry: key}
+	scratch, _ = node.AppendText(scratch)
+	return scratch, true
 }
 
 // VisitResolvedProjection visits selected scalar fields in physical row order.
@@ -360,13 +536,8 @@ func (v *CompactPrimaryStripeView) VisitResolvedProjection(
 		return true, limit == 0, valueScratch, nil
 	}
 	clear(shapeSeen[:v.shapeCount])
-	for shape := 0; shape < v.shapeCount; shape++ {
-		base := shape * len(resolvers)
-		prepareUnifiedProjectionShape(
-			v, shape, resolvers, &shapeWork[shape], streamWork[base:base+len(resolvers)],
-			valueScratch,
-		)
-	}
+	clear(shapeWork[:v.shapeCount])
+	clear(streamWork[:v.shapeCount*len(resolvers)])
 	for row := 0; row < v.rows; row++ {
 		if limit > 0 && row >= limit {
 			return true, true, valueScratch, nil
@@ -377,6 +548,17 @@ func (v *CompactPrimaryStripeView) VisitResolvedProjection(
 		shape := v.rowShape(row)
 		if shape < 0 || shape >= v.shapeCount {
 			return false, false, valueScratch, nil
+		}
+		if !shapeWork[shape].prepared {
+			base := shape * len(resolvers)
+			shapeWork[shape].prepared = true
+			if !prepareUnifiedProjectionShape(
+				v, shape, resolvers, &shapeWork[shape],
+				streamWork[base:base+len(resolvers)], valueScratch,
+			) {
+				shapeWork[shape].unsupported = true
+				return false, false, valueScratch, nil
+			}
 		}
 		if shapeWork[shape].unsupported {
 			return false, false, valueScratch, nil
