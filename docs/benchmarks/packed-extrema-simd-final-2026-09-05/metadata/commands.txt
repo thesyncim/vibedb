@@ -1,0 +1,10 @@
+GOCACHE=/private/tmp/gocache-final-main GOEXPERIMENT=simd go test -run '^$' -c -o /private/tmp/final-main-storeio.test ./internal/storeio
+cp /private/tmp/vibedb-go127-simd-extrema/query/file_packed_extrema_bench_test.go /private/tmp/vibedb-go127-simd-extrema-main/query/file_packed_extrema_bench_test.go
+GOCACHE=/private/tmp/gocache-final-main GOEXPERIMENT=simd go test -run '^$' -c -o /private/tmp/final-main-query.test ./query
+GOCACHE=/private/tmp/gocache-final-head GOEXPERIMENT=simd go test -run '^$' -c -o /private/tmp/final-head-storeio.test ./internal/storeio
+GOCACHE=/private/tmp/gocache-final-head GOEXPERIMENT=simd go test -run '^$' -c -o /private/tmp/final-head-query.test ./query
+GOCACHE=/private/tmp/gocache-final-head-nosimd GOEXPERIMENT=nosimd go test -run '^$' -c -o /private/tmp/final-head-nosimd-query.test ./query
+test binaries: -test.run '^$' -test.benchtime=250ms -test.count=1 -test.cpu=1 -test.benchmem
+extrema regex: ^BenchmarkFilePackedIntegerExtremaCount(Wide)?$
+equality regression regex: ^BenchmarkCompactPrimaryStripePackedEquality8$
+ordered regression regex: ^BenchmarkFilePackedOrderedCountWide/sparse/lt$

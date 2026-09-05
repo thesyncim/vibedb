@@ -1,0 +1,4 @@
+benchmark	base_samples_ns_op	candidate_samples_ns_op	paired_delta_median_pct
+BenchmarkCompactPrimaryStripePackedEquality8	514.0,511.5,529.8,551.4,527.3	514.2,540.2,515.0,516.1,543.7	0.03891
+BenchmarkFilePackedOrderedCountWide/sparse/lt	2822,2816,2800,2930,3144	2784,2834,2985,3094,2998	0.63920
+
