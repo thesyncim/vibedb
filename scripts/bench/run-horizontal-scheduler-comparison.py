@@ -6,6 +6,7 @@ The reused fixture calls both VibeDB arms `candidate` internally. `arm` and
 identical process layout, client, diagnostics and resource settings.
 """
 import argparse
+import copy
 from datetime import datetime, timezone
 import hashlib
 import importlib.util
@@ -18,6 +19,14 @@ CLIENT = REPO
 CONTROL = CLIENT / 'scripts/bench/run-fused-node-comparison.py'
 DEFAULT_WORKLOADS = 'mixed_uniform'
 ALLOWED_WORKLOADS = ('point_hit', 'point_miss', 'mixed_uniform')
+
+
+def load_fixture():
+    """Load the shared fixture module without importing the package."""
+    spec = importlib.util.spec_from_file_location('fixture', CONTROL)
+    fixture = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fixture)
+    return fixture
 
 
 def parse_workloads(raw):
@@ -39,6 +48,18 @@ def parse_workloads(raw):
     return workloads
 
 
+def candidate_args_for_arm(arm, after_args):
+    """Return the exact fixture candidate args for one recorded arm."""
+    return list(after_args) if arm == 'after' else []
+
+
+def fixture_args_for_arm(args, arm, after_args):
+    """Clone fixture Namespace so one arm/order cannot mutate another."""
+    arm_args = copy.copy(args)
+    arm_args.candidate_arg = candidate_args_for_arm(arm, after_args)
+    return arm_args
+
+
 def main():
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument('output', type=Path)
@@ -53,6 +74,9 @@ def main():
     cli.add_argument('--clients', default='8')
     cli.add_argument('--workloads', default=DEFAULT_WORKLOADS,
                      help='comma-separated matched workloads: point_hit, point_miss, mixed_uniform')
+    cli.add_argument('--after-arg', action='append', default=[],
+                     help='one exact candidate cluster-dev argv token forwarded only to the after arm; '
+                          'use --after-arg=--flag for tokens beginning with a dash')
     selected = cli.parse_args()
     try:
         workloads = parse_workloads(selected.workloads)
@@ -63,9 +87,7 @@ def main():
             1 <= selected.repetitions <= 20):
         cli.error('invalid bounded workload configuration')
     workload_csv = ','.join(workloads)
-    spec = importlib.util.spec_from_file_location('fixture', CONTROL)
-    fixture = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(fixture)
+    fixture = load_fixture()
     args = fixture.parser().parse_args([
         str(selected.output), '--candidate-ref', selected.candidate_ref,
         '--repo', str(REPO), '--client-source', str(CLIENT),
@@ -93,6 +115,11 @@ def main():
         'started_utc': datetime.now(timezone.utc).isoformat(),
         'status': 'preparing', 'runs': [],
         'arm_contract': 'before and after both use the existing candidate fused fixture; arm and revision identify source',
+        'arm_args': {
+            'before': [],
+            'after': list(selected.after_arg),
+            'crdb': [],
+        },
         'topology': 'RF3, one SQL endpoint, single Docker host; physical node counts: ' + selected.physical_nodes,
         'diagnostics': 'identical signal-acknowledged snapshots on both VibeDB arms',
         'limits': fixture.resource_limits(args.cpus, args.memory),
@@ -177,14 +204,18 @@ def main():
                             run_dir = destination / cell['id'] / order / arm
                             schema = fixture.schema_files(run_dir, cell['tables'])
                             engine = 'crdb' if arm == 'crdb' else 'candidate'
+                            candidate_args = candidate_args_for_arm(arm, selected.after_arg)
                             manifest['active_run'] = {
                                 'arm': arm, 'revision': manifest['refs'].get(arm, fixture.CRDB),
                                 'order': order, 'cell': cell, 'evidence_path': str(run_dir.relative_to(destination)),
+                                'candidate_arg': candidate_args,
                             }
                             fixture.write_json(destination / 'manifest.json', manifest)
-                            result = fixture.run_engine(args, cell, engine, order, arm_binaries[arm], run_dir, schema, arch)
+                            arm_args = fixture_args_for_arm(args, arm, selected.after_arg)
+                            result = fixture.run_engine(arm_args, cell, engine, order, arm_binaries[arm], run_dir, schema, arch)
                             result['arm'] = arm
                             result['revision'] = manifest['refs'].get(arm, fixture.CRDB)
+                            result['candidate_arg'] = candidate_args
                             manifest['runs'].append(result)
                             manifest.pop('active_run', None)
                             fixture.write_json(run_dir / 'run.json', result)
