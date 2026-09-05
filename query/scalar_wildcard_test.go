@@ -28,10 +28,10 @@ func TestScalarRelationWildcardOrdinalsAndSortAliases(t *testing.T) {
 	}{
 		{`SELECT d.*, COALESCE(d.n,0) AS score FROM (SELECT id,n FROM docs) d ORDER BY score DESC`, []string{"id", "n", "score"}, []string{`"a",3,3`, `"b",null,0`, `"c",null,0`}},
 		{`SELECT COALESCE(d.n,0) AS score,d.* FROM (SELECT id,n FROM docs) d ORDER BY score DESC LIMIT 1 OFFSET 1`, []string{"score", "id", "n"}, []string{`0,"b",null`}},
-		{`SELECT d.*,d.*,COALESCE(d.n,0) FROM (SELECT id,n FROM docs) d WHERE COALESCE(d.n,0)>0`, []string{"id", "n", "id", "n", "?column?"}, []string{`"a",3,"a",3,3`}},
+		{`SELECT d.*,d.*,COALESCE(d.n,0) FROM (SELECT id,n FROM docs) d WHERE COALESCE(d.n,0)>0`, []string{"id", "n", "id", "n", "coalesce"}, []string{`"a",3,"a",3,3`}},
 		{`SELECT d.*,9 AS marker FROM (SELECT 1 AS x,2 AS x) d`, []string{"x", "x", "marker"}, []string{`1,2,9`}},
 		{`SELECT d.*,9 AS marker FROM (SELECT 1 AS "x.y",2 AS "x/y") d`, []string{"x.y", "x/y", "marker"}, []string{`1,2,9`}},
-		{`WITH c(owner,n) AS (SELECT id,n FROM docs) SELECT c.*,COALESCE(c.n,0) FROM c WHERE COALESCE(c.n,0)>0`, []string{"owner", "n", "?column?"}, []string{`"a",3,3`}},
+		{`WITH c(owner,n) AS (SELECT id,n FROM docs) SELECT c.*,COALESCE(c.n,0) FROM c WHERE COALESCE(c.n,0)>0`, []string{"owner", "n", "coalesce"}, []string{`"a",3,3`}},
 		{`SELECT a.*,b.*,COALESCE(a.n,b.n) AS score FROM (SELECT id,n FROM docs) a JOIN (SELECT id,n FROM docs) b ON a.id=b.id WHERE a.id='a' ORDER BY score`, []string{"id", "n", "id", "n", "score"}, []string{`"a",3,"a",3,3`}},
 	} {
 		t.Run(tc.query, func(t *testing.T) {
