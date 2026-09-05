@@ -38,6 +38,7 @@ const (
 	maxManifestBytes      = 8 << 20
 	maxGroups             = 64
 	maxNodes              = 6
+	maxCaptureConcurrency = 8
 	preflightCycles       = 3
 )
 
@@ -172,12 +173,15 @@ type groupSnapshot struct {
 }
 
 type memberSnapshot struct {
-	MemberID uint64            `json:"member_id"`
-	NodeID   string            `json:"node_id"`
-	Status   *statusSnapshot   `json:"status,omitempty"`
-	Progress *progressSnapshot `json:"progress,omitempty"`
-	Metrics  *metricsSnapshot  `json:"metrics,omitempty"`
-	Error    string            `json:"error,omitempty"`
+	MemberID     uint64            `json:"member_id"`
+	NodeID       string            `json:"node_id"`
+	Status       *statusSnapshot   `json:"status,omitempty"`
+	Progress     *progressSnapshot `json:"progress,omitempty"`
+	Metrics      *metricsSnapshot  `json:"metrics,omitempty"`
+	ObserveError string            `json:"observe_error,omitempty"`
+	MetricsError string            `json:"metrics_error,omitempty"`
+	Error        string            `json:"error,omitempty"`
+	ElapsedNS    int64             `json:"elapsed_ns"`
 }
 
 type statusSnapshot struct {
@@ -490,6 +494,7 @@ func parseNodeID(value string) (rafttransport.NodeID, error) {
 func capture(ctx context.Context, cfg config, sequence uint64) cycle {
 	record := cycle{Schema: "vibedb.rf3-diagnostic/1", Sequence: sequence,
 		UTC: time.Now().UTC().Format(time.RFC3339Nano), Groups: make([]groupSnapshot, len(cfg.Groups))}
+	concurrency := make(chan struct{}, maxCaptureConcurrency)
 	var wg sync.WaitGroup
 	for index, group := range cfg.Groups {
 		record.Groups[index] = groupSnapshot{GroupID: group.ID, Distribution: group.Distribution,
@@ -499,6 +504,13 @@ func capture(ctx context.Context, cfg config, sequence uint64) cycle {
 			wg.Add(1)
 			go func(groupIndex, memberIndex int, group groupConfig, member manifestMember) {
 				defer wg.Done()
+				select {
+				case concurrency <- struct{}{}:
+					defer func() { <-concurrency }()
+				case <-ctx.Done():
+					record.Groups[groupIndex].Members[memberIndex].Error = ctx.Err().Error()
+					return
+				}
 				record.Groups[groupIndex].Members[memberIndex] = captureMember(ctx, cfg, group, member)
 			}(index, memberIndex, group, member)
 		}
@@ -536,8 +548,10 @@ func writeReadyFile(path string) error {
 	return errors.Join(err, file.Close())
 }
 
-func captureMember(ctx context.Context, cfg config, group groupConfig, member manifestMember) memberSnapshot {
-	result := memberSnapshot{MemberID: member.MemberID, NodeID: member.NodeID}
+func captureMember(ctx context.Context, cfg config, group groupConfig, member manifestMember) (result memberSnapshot) {
+	started := time.Now()
+	result = memberSnapshot{MemberID: member.MemberID, NodeID: member.NodeID}
+	defer func() { result.ElapsedNS = time.Since(started).Nanoseconds() }()
 	node, err := parseNodeID(member.NodeID)
 	if err != nil {
 		result.Error = err.Error()
@@ -577,6 +591,12 @@ func captureMember(ctx context.Context, cfg config, group groupConfig, member ma
 	}()
 	wg.Wait()
 	if observeErr != nil || metricsErr != nil {
+		if observeErr != nil {
+			result.ObserveError = observeErr.Error()
+		}
+		if metricsErr != nil {
+			result.MetricsError = metricsErr.Error()
+		}
 		result.Error = joinError(observeErr, metricsErr)
 		// Keep whichever cut arrived. This makes a transient protocol failure
 		// distinguishable from a node that was unreachable for the whole cycle.
