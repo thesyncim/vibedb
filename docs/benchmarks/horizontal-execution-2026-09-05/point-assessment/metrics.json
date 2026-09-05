@@ -6012,7 +6012,7 @@
     }
   ],
   "scope": {
-    "campaign": "GREEN-main checkpoint, baseline M to current main G, authority disabled",
+    "campaign": "Frozen a2ac5fd8 point checkpoint, baseline M to frozen G, authority disabled",
     "clients": [
       1,
       8
