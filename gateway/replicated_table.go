@@ -266,12 +266,71 @@ func (snapshot *Snapshot) resolveReplicatedTableKey(
 	replicaScratch []ReplicatedEndpoint,
 	wantRouteID bool,
 ) (ResolvedReplicatedTableKey, bool) {
-	entry, ok := snapshot.replicatedTableAtBytes(table)
+	prep, ok := snapshot.replicatedTableResolvePrepFor(table)
 	if !ok {
 		return ResolvedReplicatedTableKey{}, false
 	}
+	return snapshot.resolveReplicatedTableKeyPrepared(
+		&prep, orderedKey, scalarScratch, replicaScratch,
+		wantRouteID, ReplicatedRoute{}, false,
+	)
+}
+
+// replicatedTableResolvePrep is the per-table invariant prefix of key
+// resolution: catalog entry, profile, placement, and mapper checks. The
+// snapshot is pinned, so a prep stays valid for the whole batch. The table
+// slice aliases the caller's request and must not outlive the call.
+type replicatedTableResolvePrep struct {
+	table    []byte
+	profile  ReplicatedTableProfile
+	specName distribution.DistributionName
+	manifest *distribution.Manifest
+	mapper   *distribution.NativeMapper
+}
+
+func (snapshot *Snapshot) replicatedTableResolvePrepFor(
+	table []byte,
+) (replicatedTableResolvePrep, bool) {
+	entry, ok := snapshot.replicatedTableAtBytes(table)
+	if !ok {
+		return replicatedTableResolvePrep{}, false
+	}
 	profile, ok := snapshot.replicatedTableProfileAt(entry)
-	if !ok || len(orderedKey) == 0 || len(orderedKey) > int(profile.MaxKeyBytes) {
+	if !ok {
+		return replicatedTableResolvePrep{}, false
+	}
+	planner := snapshot.planner[entry.planner]
+	spec := snapshot.config.Distributions[planner.spec]
+	manifest := snapshot.config.Manifests[planner.manifest]
+	if entry.mapper == nil || entry.mapper.Arity() != 1 ||
+		entry.mapper.Version() != spec.MapperVersion ||
+		entry.mapper.VirtualBucketBits() != spec.EffectiveBucketBits() {
+		return replicatedTableResolvePrep{}, false
+	}
+	return replicatedTableResolvePrep{
+		table: table, profile: profile, specName: spec.Name,
+		manifest: manifest, mapper: entry.mapper,
+	}, true
+}
+
+// resolveReplicatedTableKeyPrepared binds one key against a cached prep.
+// reuseRoute skips the shard lookup when it already carries this prep's
+// route for the key's shard (same prep and equal target shard); the route
+// is a pure function of the pinned snapshot plus spec and shard, so the
+// skipped lookup would rebuild an identical value. Only value fields of a
+// reused route are read: callers must nil its Replicas before caching, as
+// they may alias recycled scratch.
+func (snapshot *Snapshot) resolveReplicatedTableKeyPrepared(
+	prep *replicatedTableResolvePrep,
+	orderedKey []byte,
+	scalarScratch []byte,
+	replicaScratch []ReplicatedEndpoint,
+	wantRouteID bool,
+	reuseRoute ReplicatedRoute,
+	reuseOK bool,
+) (ResolvedReplicatedTableKey, bool) {
+	profile := prep.profile
+	if len(orderedKey) == 0 || len(orderedKey) > int(profile.MaxKeyBytes) {
 		return ResolvedReplicatedTableKey{}, false
 	}
 	// DecodeComponent may expand a wide exact-number key by a few spelling
@@ -290,6 +349,7 @@ func (snapshot *Snapshot) resolveReplicatedTableKey(
 	var scalar distribution.Scalar
 	var canonicalStorage [replication.MaxMutationKeyBytes]byte
 	canonical := canonicalStorage[:0]
+	ok := false
 	switch component.Kind {
 	case orderedkey.KindString:
 		scalar = distribution.NewString(byteview.String(payload))
@@ -305,30 +365,28 @@ func (snapshot *Snapshot) resolveReplicatedTableKey(
 	if err != nil || !ok || !bytes.Equal(canonical, orderedKey) {
 		return ResolvedReplicatedTableKey{}, false
 	}
-	planner := snapshot.planner[entry.planner]
-	spec := snapshot.config.Distributions[planner.spec]
-	manifest := snapshot.config.Manifests[planner.manifest]
-	if entry.mapper == nil || entry.mapper.Arity() != 1 ||
-		entry.mapper.Version() != spec.MapperVersion ||
-		entry.mapper.VirtualBucketBits() != spec.EffectiveBucketBits() {
-		return ResolvedReplicatedTableKey{}, false
-	}
 	var values [1]distribution.Scalar
 	values[0] = scalar
-	point, err := entry.mapper.PointFor(values[:])
+	point, err := prep.mapper.PointFor(values[:])
 	if err != nil {
 		return ResolvedReplicatedTableKey{}, false
 	}
-	target, ok := manifest.ResolvePointTarget(point)
+	target, ok := prep.manifest.ResolvePointTarget(point)
 	if !ok {
 		return ResolvedReplicatedTableKey{}, false
 	}
-	route, ok := snapshot.ResolveReplicatedRoute(
-		spec.Name, target.Shard, replicaScratch,
-	)
-	if !ok || route.AllocationGeneration != uint64(target.AllocationGeneration) ||
+	route := reuseRoute
+	if !reuseOK || target.Shard != route.Shard {
+		route, ok = snapshot.ResolveReplicatedRoute(
+			prep.specName, target.Shard, replicaScratch,
+		)
+		if !ok {
+			return ResolvedReplicatedTableKey{}, false
+		}
+	}
+	if route.AllocationGeneration != uint64(target.AllocationGeneration) ||
 		route.Command.OwnershipEpoch != uint64(target.OwnershipEpoch) ||
-		route.Command.RoutingVersion > uint64(manifest.Version()) ||
+		route.Command.RoutingVersion > uint64(prep.manifest.Version()) ||
 		route.Command.SchemaGeneration != profile.SchemaGeneration ||
 		route.LogicalSchemaDigest != profile.LogicalSchemaDigest {
 		return ResolvedReplicatedTableKey{}, false

@@ -800,6 +800,28 @@ func TestReplicatedBatchLiteResolveMatchesFullResolve(t *testing.T) {
 	if lite.Profile != full.Profile || lite.Point != full.Point {
 		t.Fatal("lite resolve profile/point differs from full resolve")
 	}
+	prep, ok := lease.snapshot.replicatedTableResolvePrepFor([]byte("messages"))
+	if !ok {
+		t.Fatal("resolve prep failed for a resolvable table")
+	}
+	reuse := lite.Route
+	reuse.Replicas = nil
+	var replicasAgain [ServingReplicaCount]ReplicatedEndpoint
+	var scalarAgain [replication.MaxMutationKeyBytes + 16]byte
+	again, ok := lease.snapshot.resolveReplicatedTableKeyPrepared(
+		&prep, key, scalarAgain[:0], replicasAgain[:0], false, reuse, true,
+	)
+	if !ok {
+		t.Fatal("prepared reuse resolve failed for a resolvable key")
+	}
+	if replicatedRouteAuthority(again.Route) != replicatedRouteAuthority(full.Route) ||
+		again.Profile != full.Profile || again.Point != full.Point {
+		t.Fatal("prepared reuse resolve differs from full resolve")
+	}
+	prepMiss, ok := lease.snapshot.replicatedTableResolvePrepFor([]byte("no-such-table"))
+	if ok || prepMiss.mapper != nil {
+		t.Fatal("resolve prep must fail for an unknown table")
+	}
 	// The authority comparison must discriminate every coordinate it
 	// claims to cover: flipping any one of them has to break equality,
 	// and the digest has to agree.
