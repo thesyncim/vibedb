@@ -290,7 +290,7 @@ const (
 	MutationPutIfAbsent MutationKind = 8
 	// MutationPutConflict validates a candidate, then either inserts it or
 	// evaluates its deterministic conflict program against the current row.
-	// Value uses the VUC2 input grammar; it is never stored as a document.
+	// Value uses the VUC3 input grammar; it is never stored as a document.
 	MutationPutConflict MutationKind = 9
 )
 

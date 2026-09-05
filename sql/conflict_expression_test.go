@@ -115,3 +115,18 @@ func TestConflictExpressionNamespacesStayBoundAcrossParserReuse(t *testing.T) {
 		t.Fatalf("reused parser expression = %s", dumpAny(&statement))
 	}
 }
+
+func TestConflictWhereRetainsNamespacesAndParameterOrder(t *testing.T) {
+	statement, err := ParseStatement(`INSERT INTO metrics AS m VALUES (?) ON CONFLICT DO UPDATE SET n=m.n+? WHERE m.n<EXCLUDED.n AND m.n>?`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guard := statement.Insert.OnConflictUpdate.Where
+	if statement.Params() != 3 || guard == nil || guard.Kind != ExprAnd || len(guard.Kids) != 2 {
+		t.Fatalf("guard=%+v params=%d", guard, statement.Params())
+	}
+	first, second := guard.Kids[0], guard.Kids[1]
+	if first.Path.Source != 0 || first.RightPath.Source != 1 || second.Value.Kind != OperandParam || second.Value.Ordinal != 2 {
+		t.Fatalf("guard=%s", dumpAny(statement))
+	}
+}

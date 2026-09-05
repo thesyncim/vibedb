@@ -82,13 +82,6 @@ func TestReplicatedSQLMutationInputCountAcceptsComputedConflictUpdate(t *testing
 	}
 }
 
-func unsupportedPosition(err *sqlast.FeatureNotSupportedError) int {
-	if err == nil {
-		return -1
-	}
-	return err.Pos
-}
-
 func TestPostgreSQLRF3PreparesComputedUpdateAndKeepsReturningFenced(t *testing.T) {
 	const text = `UPDATE messages SET value = value || '-next' WHERE id = ?`
 	executor, _ := newSQLRF3TestExecutor(t)
@@ -164,13 +157,13 @@ func TestPostgreSQLRF3PreparesComputedConflictUpdate(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer session.Close()
-	prepared, err := session.Prepare(t.Context(), `INSERT INTO messages (id,n) VALUES (?,1) ON CONFLICT DO UPDATE SET n=messages.n+?`)
+	prepared, err := session.Prepare(t.Context(), `INSERT INTO messages (id,n) VALUES (?,1) ON CONFLICT DO UPDATE SET n=messages.n+? WHERE messages.n<?`)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer prepared.Close()
 	for i := 0; i < 2; i++ {
-		result, err := prepared.Exec(t.Context(), []any{"a", int64(i + 1)})
+		result, err := prepared.Exec(t.Context(), []any{"a", int64(i + 1), int64(10)})
 		if err != nil || result.RowsAffected != 1 {
 			t.Fatalf("result=%+v err=%v", result, err)
 		}

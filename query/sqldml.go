@@ -212,12 +212,13 @@ type DMLStatement struct {
 // (current) and source one (EXCLUDED) paths are rebased beneath the matching
 // element of one internal JSON array; the parser-owned tree remains unchanged.
 type assignmentProjection struct {
-	statement *Statement
-	tree      sqlast.SelectStmt
-	columns   []sqlast.ResultColumn
-	source    store.Segment
-	envelope  []byte
-	firstPos  int
+	statement   *Statement
+	tree        sqlast.SelectStmt
+	columns     []sqlast.ResultColumn
+	source      store.Segment
+	envelope    []byte
+	firstPos    int
+	expressions int
 }
 
 // PrepareDML parses one non-SELECT statement and lowers everything about it
@@ -506,7 +507,8 @@ func (d *DMLStatement) prepareConflictUpdateExpressions(
 		d.tree.Insert == nil || d.tree.Insert.OnConflictUpdate == nil {
 		return nil
 	}
-	assignments := d.tree.Insert.OnConflictUpdate.Assignments
+	action := d.tree.Insert.OnConflictUpdate
+	assignments := action.Assignments
 	count := 0
 	for i := range assignments {
 		switch {
@@ -526,13 +528,14 @@ func (d *DMLStatement) prepareConflictUpdateExpressions(
 			count++
 		}
 	}
-	if count == 0 {
+	if count == 0 && action.Where == nil {
 		return nil
 	}
 
 	projection := &assignmentProjection{
-		columns:  make([]sqlast.ResultColumn, 0, count),
-		firstPos: -1,
+		columns:     make([]sqlast.ResultColumn, 0, count),
+		firstPos:    -1,
+		expressions: count,
 	}
 	// The private array envelope adds exactly one container above each input.
 	// Preserve the public per-document depth boundary instead of rejecting a
@@ -559,7 +562,20 @@ func (d *DMLStatement) prepareConflictUpdateExpressions(
 			},
 		)
 	}
+	if count == 0 {
+		// A guard-only action still needs a one-row selector. This private unit
+		// output is never an assignment or a public RETURNING column.
+		projection.columns = append(projection.columns, sqlast.ResultColumn{Scalar: &sqlast.ScalarExpr{Kind: sqlast.ScalarLiteral, Value: sqlast.Operand{Kind: sqlast.OperandBool, Bool: true}}})
+	}
+	if projection.firstPos < 0 && action.Where != nil {
+		projection.firstPos = action.Where.Pos
+	}
+	guard, err := cloneConflictPredicate(action.Where)
+	if err != nil {
+		return err
+	}
 	projection.tree = sqlast.SelectStmt{
+		Where:   guard,
 		Columns: projection.columns,
 		From: []sqlast.TableRef{{
 			Name:     d.tree.Insert.Table,
@@ -934,9 +950,8 @@ func (d *DMLStatement) ValidateUpdateExpressionBindings(args []any) error {
 }
 
 // HasConflictUpdateExpressions reports whether INSERT ... ON CONFLICT DO
-// UPDATE carries at least one computed SET right-hand side. Direct literals,
-// placeholders, NULL, and bare EXCLUDED.column assignments keep the established
-// direct materialization path.
+// UPDATE carries a WHERE condition or a computed SET right-hand side.
+// Unguarded direct assignments retain the direct materialization path.
 func (d *DMLStatement) HasConflictUpdateExpressions() bool {
 	return d != nil && d.kind == DMLInsert &&
 		d.assignmentExpressions != nil
@@ -949,11 +964,12 @@ func (d *DMLStatement) ConflictUpdateExpressionCount() int {
 	if d == nil || d.kind != DMLInsert || d.assignmentExpressions == nil {
 		return 0
 	}
-	return len(d.assignmentExpressions.columns)
+	return d.assignmentExpressions.expressions
 }
 
 // FirstConflictUpdateExpressionPosition returns the authored byte position of
-// the first computed conflict SET right-hand side, or -1 when there is none.
+// the first computed conflict SET right-hand side, otherwise its WHERE
+// condition, or -1 when neither exists.
 // Distributed lanes use it for positioned fail-closed diagnostics.
 func (d *DMLStatement) FirstConflictUpdateExpressionPosition() int {
 	if d == nil || d.kind != DMLInsert || d.assignmentExpressions == nil {
@@ -1020,10 +1036,11 @@ func (d *DMLStatement) EvaluateUpdateExpressions(
 	if err := cancellationError(e.Options.Cancel); err != nil {
 		return Cursor{}, err
 	}
-	return evaluateAssignmentProjection(e, projection, args, "UPDATE")
+	return evaluateAssignmentProjection(e, projection, args, "UPDATE", false)
 }
 
-// EvaluateConflictUpdateExpressions runs every computed conflict SET
+// EvaluateConflictUpdateExpressions filters the row through the conflict WHERE
+// condition, then runs every computed conflict SET
 // right-hand side over one current document and its effective EXCLUDED
 // candidate. Both namespaces are projected together, so every assignment sees
 // the same two pre-update rows and cannot observe an earlier assignment.
@@ -1118,7 +1135,7 @@ func (d *DMLStatement) EvaluateConflictUpdateExpressions(
 	if err := cancellationError(e.Options.Cancel); err != nil {
 		return Cursor{}, err
 	}
-	return evaluateAssignmentProjection(e, projection, args, "ON CONFLICT")
+	return evaluateAssignmentProjection(e, projection, args, "ON CONFLICT", d.tree.Insert.OnConflictUpdate.Where != nil)
 }
 
 func evaluateAssignmentProjection(
@@ -1126,6 +1143,7 @@ func evaluateAssignmentProjection(
 	projection *assignmentProjection,
 	args []any,
 	clause string,
+	allowEmpty bool,
 ) (Cursor, error) {
 	cursor, _, err := projection.statement.RunIntermediateInto(
 		e, FromSegment(&projection.source), args,
@@ -1133,7 +1151,7 @@ func evaluateAssignmentProjection(
 	if err != nil {
 		return Cursor{}, err
 	}
-	if e.Result.RowCount != 1 || len(e.Result.Columns) != len(projection.columns) {
+	if (e.Result.RowCount != 1 && !(allowEmpty && e.Result.RowCount == 0)) || len(e.Result.Columns) != len(projection.columns) {
 		clearExecBorrowedViews(e)
 		return Cursor{}, fmt.Errorf(
 			"query: %s assignment projection produced %d row(s) and %d column(s), want 1 row and %d columns: %w",
@@ -1142,11 +1160,11 @@ func evaluateAssignmentProjection(
 		)
 	}
 	for i := range e.Result.Columns {
-		if len(e.Result.Columns[i].Cells) != 1 {
-			cells := len(e.Result.Columns[i].Cells)
+		if len(e.Result.Columns[i].Cells) != e.Result.RowCount {
+			rows, cells := e.Result.RowCount, len(e.Result.Columns[i].Cells)
 			clearExecBorrowedViews(e)
 			return Cursor{}, &ScalarResultShapeError{
-				Dependency: i, Rows: 1, Cells: cells,
+				Dependency: i, Rows: rows, Cells: cells,
 			}
 		}
 	}

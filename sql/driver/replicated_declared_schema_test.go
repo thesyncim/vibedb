@@ -202,6 +202,31 @@ func TestReplicatedDeclaredSchemaBindReopen(t *testing.T) {
 	if code := completionResultCode(t, claim, batch); code != replicatedstate.ResultInvalidDocument {
 		t.Fatalf("division batch code=%v", code)
 	}
+	guarded, err := sqlast.ParseStatement(`INSERT INTO employees VALUES (?) ON CONFLICT DO UPDATE SET score=employees.score/EXCLUDED.score WHERE EXCLUDED.score>employees.score`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	noUpdate, err := EncodeReplicatedConflictValue(bytes.Replace(valid, []byte(`"score":92`), []byte(`"score":0`), 1), guarded.Insert.OnConflictUpdate, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	skipped := testReplicatedApplyCommand(identity, epoch, 7, replication.Mutation{Kind: replication.MutationPutConflict, Key: key, Value: noUpdate})
+	if _, err := claim.ApplyNormal(testReplicatedApplyMeta(9), skipped); err != nil {
+		t.Fatal(err)
+	}
+	skippedResult, err := claim.LookupCompletion(skipped)
+	if err != nil {
+		t.Fatal(err)
+	}
+	skippedWitness := bytes.Clone(skippedResult.Bytes)
+	completion, err := replication.OpenCompletion(skippedWitness)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := replicatedstate.OpenMutationCompletionResult(completion.ResultCode, completion.InlineResult)
+	if err != nil || completion.ResultCode != replicatedstate.ResultApplied || rows != 0 {
+		t.Fatalf("skipped completion=%+v rows=%d err=%v", completion, rows, err)
+	}
 	if err := claim.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -218,6 +243,14 @@ func TestReplicatedDeclaredSchemaBindReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer againClaim.Close()
+	if _, err := againClaim.ApplyNormal(testReplicatedApplyMeta(10), skipped); err != nil {
+		t.Fatal(err)
+	}
+	retained, err := againClaim.LookupCompletion(skipped)
+	if err != nil || !bytes.Equal(retained.Bytes, skippedWitness) {
+		t.Fatalf("recovered zero-row retry differs: %v", err)
+	}
+
 	value, found, err := again.connector.db.tables["employees"].collection.AppendRaw(nil, key)
 	if err != nil || !found || !strings.Contains(string(value), `"score":95`) {
 		t.Fatalf("reopen after invalid write: %s %t %v", value, found, err)
