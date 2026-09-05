@@ -185,14 +185,6 @@ func (executor *DurableSQLRequestExecutor) ExecuteMode(
 		}
 	}
 	defer lease.release()
-	home, err = executor.requests.home(key)
-	if err != nil {
-		return DurableSQLRequestResult{}, err
-	}
-	if home.TopologyGeneration != lease.generation {
-		return DurableSQLRequestResult{}, fmt.Errorf("gateway: SQL catalog generation %d differs from ledger topology %d: %w",
-			lease.generation, home.TopologyGeneration, ErrDurableRequestConflict)
-	}
 	if err != nil || !handled || len(targets) == 0 {
 		if err != nil {
 			// Planning happens before the fused ledger Create. An exact retry can

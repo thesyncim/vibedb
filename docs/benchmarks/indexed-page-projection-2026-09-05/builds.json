@@ -1,0 +1,18 @@
+{
+  "baseline_commit": "0951f0da7e61027807a06dbdc2a304fcb8e5e2ce",
+  "candidate_code_commit": "88b85843c0fd6c8d81c5699a327059b01a15cff7",
+  "baseline": {
+    "vibedb": "8aa30d97fdf2c11abbdf096b63d29e1e3538f012b0693df7f8ac4af35fa2af25",
+    "vibedb-gateway": "adbc69b83b3336b4df0aa38f2237d3baad006f998a02807ebfbbd6e627ae1690",
+    "vibedb-shard": "85a72f1a344864614b62c931c10070dcc9cfb4fb0967f0df977a50e4f6a7d008"
+  },
+  "candidate": {
+    "vibedb": "6048c778aa9b8b2b35e1a9b099fa1ab478322d4e0f4d5cd0e028a77e5f4a86f9",
+    "vibedb-gateway": "f4b64bb9559aad2f13b362a187e6b8831d8bcc1566ddcc4127097497e64217a8",
+    "vibedb-shard": "9a4aab2e04bfe9fa32ee9e22699216288f4b380a39b6ed389edc850e2bc68019"
+  },
+  "local_toolchain": "go1.27.0 darwin/arm64",
+  "distributed_toolchain": "go1.27.0 linux/arm64 (cross-compiled on darwin/arm64)",
+  "distributed_process_limit": "GOMAXPROCS=2",
+  "rf3_sqlbench": "5f4170b261bd4ab4b4486c24d0b44383e0064c13695bd09a2868644c0ea1a979"
+}

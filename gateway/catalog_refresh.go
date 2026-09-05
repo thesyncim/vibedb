@@ -126,8 +126,19 @@ func (e *Executor) refreshAfterCatalogMiss(
 // immediately. The short operation deadline also bounds PG protocol callers,
 // whose backend prepare context is deliberately background-scoped.
 func (e *Executor) validateCatalogPrepare(ctx context.Context, sqlText string) (uint64, error) {
+	generation, _, err := e.prepareCatalogWithRefresh(ctx, sqlText)
+	return generation, err
+}
+
+// prepareCatalogWithRefresh returns the exact immutable physical preparation
+// associated with the validated generation. Prepared PostgreSQL reads retain it
+// as their session-local routing cache without bypassing missing-table refresh.
+func (e *Executor) prepareCatalogWithRefresh(
+	ctx context.Context,
+	sqlText string,
+) (uint64, *PreparedPlan, error) {
 	if e == nil || e.catalog == nil {
-		return 0, ErrNoCatalog
+		return 0, nil, ErrNoCatalog
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -137,31 +148,31 @@ func (e *Executor) validateCatalogPrepare(ctx context.Context, sqlText string) (
 	// missing-table error pays the bounded refresh setup below.
 	snapshot := e.catalog.Current()
 	if snapshot == nil {
-		return 0, ErrNoCatalog
+		return 0, nil, ErrNoCatalog
 	}
-	_, err := snapshot.Prepare(ctx, sqlText)
+	prepared, err := snapshot.Prepare(ctx, sqlText)
 	if err == nil {
-		return snapshot.Generation(), nil
+		return snapshot.Generation(), prepared, nil
 	}
 	if !errors.Is(err, ErrTableNotPlaced) {
-		return 0, err
+		return 0, nil, err
 	}
 	staleGeneration := snapshot.Generation()
 	profile := e.profileFor(ClassInteractive)
 	opctx, cancel := context.WithTimeout(ctx, profile.GlobalDeadline)
 	defer cancel()
 	if refreshErr := e.refreshAfterCatalogMiss(opctx, staleGeneration); refreshErr != nil {
-		return 0, preserveCatalogMiss(err, refreshErr)
+		return 0, nil, preserveCatalogMiss(err, refreshErr)
 	}
 	snapshot = e.catalog.Current()
 	if snapshot == nil {
-		return 0, err
+		return 0, nil, err
 	}
-	_, retryErr := snapshot.Prepare(opctx, sqlText)
+	prepared, retryErr := snapshot.Prepare(opctx, sqlText)
 	if retryErr != nil {
-		return 0, retryErr
+		return 0, nil, retryErr
 	}
-	return snapshot.Generation(), nil
+	return snapshot.Generation(), prepared, nil
 }
 
 // preserveCatalogMiss returns the original planner/route diagnostic when a

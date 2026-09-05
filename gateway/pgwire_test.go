@@ -8,6 +8,7 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/pgwire"
+	queryplanner "github.com/thesyncim/vibedb/planner"
 	"github.com/thesyncim/vibedb/query"
 	driver "github.com/thesyncim/vibedb/sql/driver"
 )
@@ -129,5 +130,101 @@ func TestPostgreSQLRF3MaterializesNull(t *testing.T) {
 	}
 	if n != 2 {
 		t.Fatalf("scatter NULL rows=%d", n)
+	}
+}
+
+func BenchmarkPostgreSQLRF3PreparedPointQuery(b *testing.B) {
+	executor, _ := newSQLRF3TestExecutor(b)
+	authority := serviceauthz.Authority{Generation: 1}
+	authority.Node[0] = 1
+	backend := &PostgreSQLBackend{
+		Executor: executor,
+		Authorize: func(pgwire.SessionIdentity) (serviceauthz.Authority, error) {
+			return authority, nil
+		},
+	}
+	session, err := backend.NewSession(b.Context(), pgwire.SessionIdentity{})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer session.Close()
+	statement, err := session.Prepare(b.Context(), `SELECT id FROM messages WHERE id = ?`)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer statement.Close()
+	args := []any{"a"}
+	var rows pgwire.BackendRows
+	run := func() {
+		if err := statement.QueryInto(b.Context(), args, &rows); err != nil {
+			b.Fatal(err)
+		}
+		for rows.Next() {
+			_ = rows.Cell(0)
+		}
+		if err := rows.Close(); err != nil {
+			b.Fatal(err)
+		}
+	}
+	run()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		run()
+	}
+}
+
+func TestPostgreSQLPreparedReadReusesPhysicalPlanAndResultStorage(t *testing.T) {
+	executor, transport := newSQLRF3TestExecutor(t)
+	authority := serviceauthz.Authority{Generation: 1}
+	authority.Node[0] = 1
+	backend := &PostgreSQLBackend{
+		Executor: executor,
+		Authorize: func(pgwire.SessionIdentity) (serviceauthz.Authority, error) {
+			return authority, nil
+		},
+	}
+	backendSession, err := backend.NewSession(t.Context(), pgwire.SessionIdentity{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backendSession.Close()
+	statement, err := backendSession.Prepare(t.Context(), `SELECT id FROM messages WHERE id = ?`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer statement.Close()
+	prepared := statement.(*postgresStatement)
+	session := backendSession.(*postgresSession)
+	var rows pgwire.BackendRows
+	var physical *queryplanner.Plan
+	for execution, key := range []string{"a", "z", "a"} {
+		if err := statement.QueryInto(t.Context(), []any{key}, &rows); err != nil {
+			t.Fatal(err)
+		}
+		if !rows.Next() || rows.Cell(0).IsNull() || rows.Next() {
+			t.Fatalf("point result for %q is incomplete", key)
+		}
+		if err := rows.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if prepared.execution.physical == nil {
+			t.Fatal("prepared execution did not retain its physical plan")
+		}
+		if execution == 0 {
+			physical = prepared.execution.physical
+		} else if prepared.execution.physical != physical {
+			t.Fatal("identical route shape rebuilt its physical plan")
+		}
+	}
+	if transport.queries != 3 {
+		t.Fatalf("dispatched %d queries", transport.queries)
+	}
+	if cap(session.params) < 1 || cap(session.materialized.Columns) < 1 ||
+		cap(session.materialized.Columns[0].Cells) < 1 {
+		t.Fatal("session did not retain warmed parameter and result storage")
+	}
+	if len(session.materialized.Columns[0].Cells) != 0 {
+		t.Fatal("closed rows retained response cells")
 	}
 }

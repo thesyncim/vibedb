@@ -188,6 +188,19 @@ type Explanation struct {
 	ScatterReason   ScatterReason
 }
 
+// preparedQueryExecution is the session-local physical planning cache behind
+// the pgwire prepared-statement path. PreparedPlan and planner.Plan are
+// immutable; the remaining fields certify the catalog generation and route
+// shape for which the physical tree was selected.
+type preparedQueryExecution struct {
+	generation uint64
+	prepared   *PreparedPlan
+	routeKind  distribution.RouteKind
+	targets    int
+	physical   *queryplanner.Plan
+	planning   queryplanner.OptimizerStatistics
+}
+
 // Query routes and dispatches q, retrying against a refreshed generation when a
 // shard reports the pinned generation is stale. It pins one generation per
 // attempt and never mixes generations within an attempt.
@@ -209,8 +222,9 @@ func (e *Executor) queryPreparedWithProfile(
 	q Query,
 	profile Profile,
 	preparedParams int,
+	cache *preparedQueryExecution,
 ) (*Result, error) {
-	return e.queryWithProfileValidation(ctx, q, profile, preparedParams)
+	return e.queryWithProfileValidation(ctx, q, profile, preparedParams, cache)
 }
 
 func (e *Executor) queryWithProfileValidation(
@@ -218,6 +232,7 @@ func (e *Executor) queryWithProfileValidation(
 	q Query,
 	profile Profile,
 	preparedParams int,
+	preparedCache ...*preparedQueryExecution,
 ) (*Result, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -260,18 +275,33 @@ func (e *Executor) queryWithProfileValidation(
 			nativeAttempt = &replicatedSQLAttempt{snapshot: snap}
 			attemptContext = context.WithValue(opctx, replicatedSQLSnapshotKey{}, nativeAttempt)
 		}
-		prepared, err := snap.Prepare(opctx, q.SQL)
-		if err != nil {
-			if errors.Is(err, ErrTableNotPlaced) && !refreshedMiss {
-				refreshedMiss = true
-				leases.releaseLast()
-				if refreshErr := e.refreshAfterCatalogMiss(opctx, snap.Generation()); refreshErr != nil {
-					return nil, preserveCatalogMiss(err, refreshErr)
+		var cache *preparedQueryExecution
+		if len(preparedCache) != 0 {
+			cache = preparedCache[0]
+		}
+		prepared := (*PreparedPlan)(nil)
+		if cache != nil && cache.generation == snap.Generation() {
+			prepared = cache.prepared
+		}
+		if prepared == nil {
+			prepared, err = snap.Prepare(opctx, q.SQL)
+			if err != nil {
+				if errors.Is(err, ErrTableNotPlaced) && !refreshedMiss {
+					refreshedMiss = true
+					leases.releaseLast()
+					if refreshErr := e.refreshAfterCatalogMiss(opctx, snap.Generation()); refreshErr != nil {
+						return nil, preserveCatalogMiss(err, refreshErr)
+					}
+					staleGen = 0
+					continue
 				}
-				staleGen = 0
-				continue
+				return nil, err
 			}
-			return nil, err
+			if cache != nil {
+				*cache = preparedQueryExecution{
+					generation: snap.Generation(), prepared: prepared,
+				}
+			}
 		}
 		if prepared.statement.Kind != sqlast.KindSelect {
 			// Query is the read path: it fans out and merges, so it must never
@@ -325,7 +355,7 @@ func (e *Executor) queryWithProfileValidation(
 			}
 			return nil, indexErr
 		}
-		pl, err := e.routeContext(opctx, snap, &q, bound, profile)
+		pl, err := e.routeContextCached(opctx, snap, &q, bound, profile, cache)
 		if err != nil {
 			return nil, err
 		}

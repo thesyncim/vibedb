@@ -85,9 +85,11 @@ func BenchmarkFileIndexedPage(b *testing.B) {
 			defer e.Release()
 			span := NewFileRangeSource(keys[0], nil, false)
 			span.BindPrimaryOrder("/id")
+			span.BindPrimaryPredicate("/id")
 			run := func(at int) {
 				span.Bind(keys[at&1023], nil, false)
 				span.BindPrimaryOrder("/id")
+				span.BindPrimaryPredicate("/id")
 				if err := q.RunInto(&e, FromFileRange(snap, &span)); err != nil {
 					b.Fatal(err)
 				}
