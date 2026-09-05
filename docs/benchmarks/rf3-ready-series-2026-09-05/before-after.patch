@@ -1,0 +1,4012 @@
+diff --git a/cmd/vibedb-shard/rf3_diagnostics.go b/cmd/vibedb-shard/rf3_diagnostics.go
+index a838767c..fadd21e8 100644
+--- a/cmd/vibedb-shard/rf3_diagnostics.go
++++ b/cmd/vibedb-shard/rf3_diagnostics.go
+@@ -9,6 +9,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/thesyncim/vibedb/internal/raftmember"
++	"github.com/thesyncim/vibedb/internal/raftservice"
+ 	"github.com/thesyncim/vibedb/internal/raftstore"
+ 	"github.com/thesyncim/vibedb/internal/rafttransport"
+ 	"github.com/thesyncim/vibedb/shardservice"
+@@ -36,6 +37,23 @@ type rf3DiagnosticSnapshot struct {
+ 	ReadyWaveHistogram     []uint64 `json:"ready_wave_group_histogram"`
+ 	ReadyQueueDepth        uint64   `json:"ready_queue_depth"`
+ 	ReadyQueueCapacity     uint64   `json:"ready_queue_capacity"`
++	ReadySubmissions       uint64   `json:"ready_submissions"`
++	ReadyQueueWaitNs       uint64   `json:"ready_queue_wait_ns"`
++	ReadyWavesAttempted    uint64   `json:"ready_waves_attempted"`
++	ReadyPersistAttempts   uint64   `json:"ready_persist_attempts"`
++	ReadyPersistSuccesses  uint64   `json:"ready_persist_successes"`
++	ReadyPersistFailures   uint64   `json:"ready_persist_failures"`
++	ReadyWavesFailed       uint64   `json:"ready_waves_failed"`
++	ReadyPersistDurationNs uint64   `json:"ready_persist_duration_ns"`
++	ReadyWaveDurationNs    uint64   `json:"ready_wave_duration_ns"`
++	ReadyLogicalBatches    uint64   `json:"ready_logical_batches"`
++	ReadySeriesSubmissions uint64   `json:"ready_series_submissions"`
++	ReadySingletonSeries   uint64   `json:"ready_singleton_series_submissions"`
++	ReadyMultiSeries       uint64   `json:"ready_multi_series_submissions"`
++	ReadySeriesHistogram   []uint64 `json:"ready_series_histogram"`
++	ReadyDurableLogical    uint64   `json:"ready_durable_logical_batches"`
++	ReadyDurableSeries     uint64   `json:"ready_durable_series_submissions"`
++	ReadyDurableHistogram  []uint64 `json:"ready_durable_series_histogram"`
+ 	ActiveSubmitters       int64    `json:"active_submitters"`
+ 	FailedWaves            uint64   `json:"failed_waves"`
+ 	CheckpointQueue        uint64   `json:"checkpoint_queue_submissions"`
+@@ -68,6 +86,15 @@ type rf3DiagnosticSnapshot struct {
+ 	RemoteIdle              int    `json:"remote_idle"`
+ 	RemoteWaiters           int    `json:"remote_waiters"`
+ 
++	RaftProposalBatches    uint64 `json:"raft_proposal_batches"`
++	RaftProposalCommands   uint64 `json:"raft_proposal_commands"`
++	RaftProposalBytes      uint64 `json:"raft_proposal_bytes"`
++	RaftApplyBatches       uint64 `json:"raft_apply_batches"`
++	RaftAppliedEntries     uint64 `json:"raft_applied_entries"`
++	RaftCommitAdvancements uint64 `json:"raft_commit_advancements"`
++	RaftCommittedEntries   uint64 `json:"raft_committed_entries"`
++	RaftReadyPersisted     uint64 `json:"raft_ready_persisted"`
++
+ 	// Resource counters sum the currently open collection generations. Schema
+ 	// replacement or group retirement can reset them within one process, so
+ 	// interval comparisons require an unchanged serving inventory/generation.
+@@ -314,6 +341,56 @@ func collectRF3DiagnosticResources(
+ 	return aggregateRF3DiagnosticResources(expected, providers, inventory != nil && !inventorySnapshot.usable)
+ }
+ 
++func applyRF3DiagnosticProgress(snapshot *rf3DiagnosticSnapshot, metrics raftservice.ProgressMetricsSnapshot) {
++	if snapshot == nil {
++		return
++	}
++	snapshot.RaftProposalBatches = metrics.ProposalBatches
++	snapshot.RaftProposalCommands = metrics.ProposalCommands
++	snapshot.RaftProposalBytes = metrics.ProposalBytes
++	snapshot.RaftApplyBatches = metrics.ApplyBatches
++	snapshot.RaftAppliedEntries = metrics.AppliedEntries
++	snapshot.RaftCommitAdvancements = metrics.CommitAdvancements
++	snapshot.RaftCommittedEntries = metrics.CommittedEntries
++	snapshot.RaftReadyPersisted = metrics.ReadyPersisted
++}
++
++func applyRF3DiagnosticSequencer(snapshot *rf3DiagnosticSnapshot, stats raftstore.NodeSubmissionSequencerStats) {
++	if snapshot == nil {
++		return
++	}
++	snapshot.ReadyWaves = stats.ReadyWavesSucceeded
++	snapshot.ReadyDurableWaves = stats.ReadyDurableWaves
++	snapshot.ObservedAppendBarriers = stats.ObservedAppendBarriers
++	snapshot.MultiGroupWaves = stats.MultiGroupWaves
++	copy(snapshot.ReadyWaveHistogram, stats.ReadyWaveGroupHistogram[:])
++	snapshot.ReadyQueueDepth = stats.QueueDepth
++	snapshot.ReadyQueueCapacity = stats.QueueCapacity
++	snapshot.ReadySubmissions = stats.ReadySubmissions
++	snapshot.ReadyQueueWaitNs = stats.ReadyQueueWaitNanos
++	snapshot.ReadyWavesAttempted = stats.ReadyWavesAttempted
++	snapshot.ReadyPersistAttempts = stats.ReadyPersistAttempts
++	snapshot.ReadyPersistSuccesses = stats.ReadyPersistSuccesses
++	snapshot.ReadyPersistFailures = stats.ReadyPersistFailures
++	snapshot.ReadyWavesFailed = stats.ReadyWavesFailed
++	snapshot.ReadyPersistDurationNs = stats.ReadyPersistDurationNanos
++	snapshot.ReadyWaveDurationNs = stats.ReadyWaveDurationNanos
++	snapshot.ReadyLogicalBatches = stats.ReadyLogicalBatches
++	snapshot.ReadySeriesSubmissions = stats.ReadySeriesSubmissions
++	snapshot.ReadySingletonSeries = stats.ReadySingletonSeriesSubmissions
++	snapshot.ReadyMultiSeries = stats.ReadyMultiSeriesSubmissions
++	copy(snapshot.ReadySeriesHistogram, stats.ReadySeriesHistogram[:])
++	snapshot.ReadyDurableLogical = stats.ReadyDurableLogicalBatches
++	snapshot.ReadyDurableSeries = stats.ReadyDurableSeriesSubmissions
++	copy(snapshot.ReadyDurableHistogram, stats.ReadyDurableSeriesHistogram[:])
++	snapshot.ActiveSubmitters = stats.ActiveSubmitters
++	snapshot.FailedWaves = stats.FailedWaves
++	snapshot.CheckpointQueue = stats.CheckpointQueueSubmissions
++	snapshot.CheckpointRejected = stats.CheckpointQueueRejected
++	snapshot.CheckpointQueueWaitNs = stats.CheckpointQueueWaitNanos
++	snapshot.CheckpointServiceNs = stats.CheckpointServiceNanos
++}
++
+ // emitRF3DiagnosticSnapshot writes one machine-readable line with a stable
+ // prefix and atomically replaces the bounded node-root latest snapshot.
+ // Benchmark harnesses can send SIGUSR1 at trial boundaries and parse the
+@@ -329,7 +406,7 @@ func emitRF3DiagnosticSnapshot(
+ 	serial *atomic.Uint64,
+ 	inventory *rf3AdoptedGroupInventory,
+ ) {
+-	emitRF3DiagnosticSnapshotWithResources(manifest, profile, nodeOwner, server, embedded, serial, inventory, nil, nil)
++	emitRF3DiagnosticSnapshotWithResources(manifest, profile, nodeOwner, server, embedded, serial, inventory, nil, nil, nil)
+ }
+ 
+ func emitRF3DiagnosticSnapshotWithResources(
+@@ -342,10 +419,14 @@ func emitRF3DiagnosticSnapshotWithResources(
+ 	inventory *rf3AdoptedGroupInventory,
+ 	prepared []preparedRF3Group,
+ 	schemas *rf3SchemaActivator,
++	progressMetrics *raftservice.ProgressMetrics,
+ ) {
+ 	snapshot := rf3DiagnosticSnapshot{
+ 		UTC: time.Now().UTC().Format(time.RFC3339Nano), Event: "snapshot", PID: os.Getpid(),
+-		Groups: len(manifest.groupBundles()), ReadyWaveHistogram: make([]uint64, raftstore.MaxPersistGroupBatches+1),
++		Groups:                len(manifest.groupBundles()),
++		ReadyWaveHistogram:    make([]uint64, raftstore.MaxPersistGroupBatches+1),
++		ReadySeriesHistogram:  make([]uint64, raftstore.MaxReadySeries+1),
++		ReadyDurableHistogram: make([]uint64, raftstore.MaxReadySeries+1),
+ 	}
+ 	resources := collectRF3DiagnosticResources(manifest, prepared, inventory, schemas)
+ 	// Production manifests always carry nonzero group identities. Preserve the
+@@ -382,20 +463,10 @@ func emitRF3DiagnosticSnapshotWithResources(
+ 		snapshot.NodeID = fmt.Sprintf("%x", node[:])
+ 	}
+ 	if nodeOwner != nil && nodeOwner.sequencer != nil {
+-		stats := nodeOwner.sequencer.Stats()
+-		snapshot.ReadyWaves = stats.ReadyWavesSucceeded
+-		snapshot.ReadyDurableWaves = stats.ReadyDurableWaves
+-		snapshot.ObservedAppendBarriers = stats.ObservedAppendBarriers
+-		snapshot.MultiGroupWaves = stats.MultiGroupWaves
+-		copy(snapshot.ReadyWaveHistogram, stats.ReadyWaveGroupHistogram[:])
+-		snapshot.ReadyQueueDepth = stats.QueueDepth
+-		snapshot.ReadyQueueCapacity = stats.QueueCapacity
+-		snapshot.ActiveSubmitters = stats.ActiveSubmitters
+-		snapshot.FailedWaves = stats.FailedWaves
+-		snapshot.CheckpointQueue = stats.CheckpointQueueSubmissions
+-		snapshot.CheckpointRejected = stats.CheckpointQueueRejected
+-		snapshot.CheckpointQueueWaitNs = stats.CheckpointQueueWaitNanos
+-		snapshot.CheckpointServiceNs = stats.CheckpointServiceNanos
++		applyRF3DiagnosticSequencer(&snapshot, nodeOwner.sequencer.Stats())
++	}
++	if progressMetrics != nil {
++		applyRF3DiagnosticProgress(&snapshot, progressMetrics.Snapshot())
+ 	}
+ 	if server != nil {
+ 		stats := server.Stats()
+diff --git a/cmd/vibedb-shard/rf3_diagnostics_progress_test.go b/cmd/vibedb-shard/rf3_diagnostics_progress_test.go
+new file mode 100644
+index 00000000..41230c51
+--- /dev/null
++++ b/cmd/vibedb-shard/rf3_diagnostics_progress_test.go
+@@ -0,0 +1,66 @@
++package main
++
++import (
++	"testing"
++
++	"github.com/thesyncim/vibedb/internal/raftservice"
++	"github.com/thesyncim/vibedb/internal/raftstore"
++)
++
++func TestRF3DiagnosticCanaryCountersMapExactSnapshots(t *testing.T) {
++	snapshot := rf3DiagnosticSnapshot{
++		ReadyWaveHistogram:    make([]uint64, raftstore.MaxPersistGroupBatches+1),
++		ReadySeriesHistogram:  make([]uint64, raftstore.MaxReadySeries+1),
++		ReadyDurableHistogram: make([]uint64, raftstore.MaxReadySeries+1),
++	}
++	applyRF3DiagnosticProgress(&snapshot, raftservice.ProgressMetricsSnapshot{
++		ProposalBatches:    1,
++		ProposalCommands:   2,
++		ProposalBytes:      3,
++		ApplyBatches:       4,
++		AppliedEntries:     5,
++		CommitAdvancements: 6,
++		CommittedEntries:   7,
++		ReadyPersisted:     8,
++	})
++	if snapshot.RaftProposalBatches != 1 || snapshot.RaftProposalCommands != 2 ||
++		snapshot.RaftProposalBytes != 3 || snapshot.RaftApplyBatches != 4 ||
++		snapshot.RaftAppliedEntries != 5 || snapshot.RaftCommitAdvancements != 6 ||
++		snapshot.RaftCommittedEntries != 7 || snapshot.RaftReadyPersisted != 8 {
++		t.Fatalf("progress counters were not copied exactly: %+v", snapshot)
++	}
++
++	applyRF3DiagnosticSequencer(&snapshot, raftstore.NodeSubmissionSequencerStats{
++		ReadySubmissions:                11,
++		ReadyQueueWaitNanos:             12,
++		ReadyWavesAttempted:             13,
++		ReadyPersistAttempts:            14,
++		ReadyPersistSuccesses:           15,
++		ReadyPersistFailures:            16,
++		ReadyWavesFailed:                17,
++		ReadyPersistDurationNanos:       18,
++		ReadyWaveDurationNanos:          19,
++		ReadyLogicalBatches:             20,
++		ReadySeriesSubmissions:          21,
++		ReadySingletonSeriesSubmissions: 22,
++		ReadyMultiSeriesSubmissions:     23,
++		ReadySeriesHistogram:            [raftstore.MaxReadySeries + 1]uint64{2: 24},
++		ReadyDurableLogicalBatches:      25,
++		ReadyDurableSeriesSubmissions:   26,
++		ReadyDurableSeriesHistogram:     [raftstore.MaxReadySeries + 1]uint64{2: 27},
++	})
++	if snapshot.ReadySubmissions != 11 || snapshot.ReadyQueueWaitNs != 12 ||
++		snapshot.ReadyWavesAttempted != 13 || snapshot.ReadyPersistAttempts != 14 ||
++		snapshot.ReadyPersistSuccesses != 15 || snapshot.ReadyPersistFailures != 16 ||
++		snapshot.ReadyWavesFailed != 17 || snapshot.ReadyPersistDurationNs != 18 ||
++		snapshot.ReadyWaveDurationNs != 19 || snapshot.ReadyLogicalBatches != 20 ||
++		snapshot.ReadySeriesSubmissions != 21 || snapshot.ReadySingletonSeries != 22 ||
++		snapshot.ReadyMultiSeries != 23 || snapshot.ReadySeriesHistogram[2] != 24 ||
++		snapshot.ReadyDurableLogical != 25 || snapshot.ReadyDurableSeries != 26 ||
++		snapshot.ReadyDurableHistogram[2] != 27 {
++		t.Fatalf("sequencer counters were not copied exactly: %+v", snapshot)
++	}
++
++	applyRF3DiagnosticProgress(nil, raftservice.ProgressMetricsSnapshot{})
++	applyRF3DiagnosticSequencer(nil, raftstore.NodeSubmissionSequencerStats{})
++}
+diff --git a/cmd/vibedb-shard/serve_rf3.go b/cmd/vibedb-shard/serve_rf3.go
+index c7e916f3..1329bcbe 100644
+--- a/cmd/vibedb-shard/serve_rf3.go
++++ b/cmd/vibedb-shard/serve_rf3.go
+@@ -1214,7 +1214,7 @@ func servePreparedRF3WithExecutionLanesAndGateway(
+ 			select {
+ 			case embeddedGatewayState = <-embeddedGatewayOpened:
+ 			case <-diagnostics:
+-				emitRF3DiagnosticSnapshotWithResources(manifest, profile, nodeOwner, server, nil, &diagnosticSerial, adoptedInventory, preparedSet.groups, schemaActivator)
++				emitRF3DiagnosticSnapshotWithResources(manifest, profile, nodeOwner, server, nil, &diagnosticSerial, adoptedInventory, preparedSet.groups, schemaActivator, progressMetrics)
+ 			case err := <-embeddedGatewayDone:
+ 				embeddedGatewayFinished = true
+ 				primary = fmt.Errorf("RF3 embedded gateway stopped during startup: %w", err)
+@@ -1254,7 +1254,7 @@ func servePreparedRF3WithExecutionLanesAndGateway(
+ 		for {
+ 			select {
+ 			case <-diagnostics:
+-				emitRF3DiagnosticSnapshotWithResources(manifest, profile, nodeOwner, server, embeddedGatewayState, &diagnosticSerial, adoptedInventory, preparedSet.groups, schemaActivator)
++				emitRF3DiagnosticSnapshotWithResources(manifest, profile, nodeOwner, server, embeddedGatewayState, &diagnosticSerial, adoptedInventory, preparedSet.groups, schemaActivator, progressMetrics)
+ 				continue
+ 			case <-manifest.reloadSignals:
+ 				if err := reloadPreparedRF3Groups(parent, &manifest, profile, peer, adoptedInventory, schemaActivator, nodeOwner); err != nil {
+diff --git a/integration/pgclient/cmd/rf3-sqlbench/diagnostics.go b/integration/pgclient/cmd/rf3-sqlbench/diagnostics.go
+index fb3cf83e..5a7af696 100644
+--- a/integration/pgclient/cmd/rf3-sqlbench/diagnostics.go
++++ b/integration/pgclient/cmd/rf3-sqlbench/diagnostics.go
+@@ -54,11 +54,17 @@ type diagnosticControl struct {
+ 
+ var diagnosticCounters = []string{
+ 	"ready_waves", "ready_durable_waves", "observed_append_barriers", "multi_group_waves", "failed_waves",
++	"ready_submissions", "ready_queue_wait_ns", "ready_waves_attempted", "ready_persist_attempts",
++	"ready_persist_successes", "ready_persist_failures", "ready_waves_failed", "ready_persist_duration_ns", "ready_wave_duration_ns",
++	"ready_logical_batches", "ready_series_submissions", "ready_singleton_series_submissions", "ready_multi_series_submissions",
++	"ready_durable_logical_batches", "ready_durable_series_submissions",
+ 	"checkpoint_queue_submissions", "checkpoint_queue_rejected", "checkpoint_queue_wait_ns", "checkpoint_service_ns",
+ 	"native_accepted", "native_rejected", "native_failed", "native_semantic_dispatches",
+ 	"gateway_local_calls", "gateway_remote_calls", "gateway_semantic_sql_calls", "gateway_legacy_calls",
+ 	"gateway_sql_request_encodings", "gateway_sql_request_encoded_bytes", "remote_dials", "remote_reuses",
+ 	"remote_poisoned", "remote_rejected", "remote_handshake_failures",
++	"raft_proposal_batches", "raft_proposal_commands", "raft_proposal_bytes", "raft_apply_batches",
++	"raft_applied_entries", "raft_commit_advancements", "raft_committed_entries", "raft_ready_persisted",
+ }
+ 
+ func readBounded(path string) ([]byte, error) {
+diff --git a/integration/pgclient/cmd/rf3-sqlbench/diagnostics_test.go b/integration/pgclient/cmd/rf3-sqlbench/diagnostics_test.go
+index f8f6a864..0424582e 100644
+--- a/integration/pgclient/cmd/rf3-sqlbench/diagnostics_test.go
++++ b/integration/pgclient/cmd/rf3-sqlbench/diagnostics_test.go
+@@ -99,7 +99,10 @@ func TestDiagnosticDeltasKeepUint64PrecisionAndRejectReset(t *testing.T) {
+ 	before, _ := decodeDiagnostic(diagnosticFixture(t, node, 202, 1, 1<<60))
+ 	after, _ := decodeDiagnostic(diagnosticFixture(t, node, 202, 2, (1<<60)+3))
+ 	deltas, err := diagnosticDeltas([]diagnosticRecord{before}, []diagnosticRecord{after})
+-	if err != nil || len(deltas) != 1 || deltas[0].Counters["gateway_local_calls"] != 3 || deltas[0].Histogram[1] != 3 {
++	if err != nil || len(deltas) != 1 || deltas[0].Counters["gateway_local_calls"] != 3 ||
++		deltas[0].Counters["raft_proposal_bytes"] != 3 || deltas[0].Counters["ready_queue_wait_ns"] != 3 ||
++		deltas[0].Counters["ready_logical_batches"] != 3 || deltas[0].Counters["ready_durable_logical_batches"] != 3 ||
++		deltas[0].Histogram[1] != 3 {
+ 		t.Fatalf("delta lost precision: %v %v", deltas, err)
+ 	}
+ 	reset, _ := decodeDiagnostic(diagnosticFixture(t, node, 202, 3, 1))
+diff --git a/internal/multiraft/host.go b/internal/multiraft/host.go
+index 605bc71b..e0e439b7 100644
+--- a/internal/multiraft/host.go
++++ b/internal/multiraft/host.go
+@@ -986,7 +986,10 @@ func (host *Host) finishDirectControl(group *groupState, controlErr error) {
+ 		host.purgeGroup(group)
+ 		return
+ 	}
+-	if controlErr == nil {
++	if controlErr == nil || errors.Is(controlErr, raftmodel.ErrReadyPending) {
++		// A direct control refused at the Ready boundary is still authoritative
++		// runnable evidence. Wake the group so its owner can drain that Ready and
++		// retry the retained control without waiting for an unrelated input edge.
+ 		host.wake(group)
+ 	}
+ }
+diff --git a/internal/multiraft/host_test.go b/internal/multiraft/host_test.go
+index a2ee392b..c6b24ecf 100644
+--- a/internal/multiraft/host_test.go
++++ b/internal/multiraft/host_test.go
+@@ -625,6 +625,37 @@ func TestHostSurfacesMembershipReadControlsAndOutcomes(t *testing.T) {
+ 	}
+ }
+ 
++func TestHostReadIndexReadyRefusalRewakesRuntime(t *testing.T) {
++	host, err := NewHost(testHostLimits())
++	if err != nil {
++		t.Fatal(err)
++	}
++	runtime := newFakeRuntime(94)
++	if err = host.addRuntime(runtime); err != nil {
++		t.Fatal(err)
++	}
++	if _, done, runErr := host.RunOne(); done || runErr != nil {
++		t.Fatalf("initial Ready probe = %t, %v", done, runErr)
++	}
++
++	runtime.inputErr = raftmodel.ErrReadyPending
++	context := []byte("deferred-linearizable-read")
++	if err = host.ReadIndex(runtime.identity.Group, context); !errors.Is(err, raftmodel.ErrReadyPending) ||
++		host.runnableLen() != 1 {
++		t.Fatalf("ReadIndex refusal err=%v runnable=%d", err, host.runnableLen())
++	}
++	runtime.inputErr = nil
++	runtime.ready = append(runtime.ready, fakeReady{kind: raftmember.DrivePersisted})
++	progress, done, runErr := host.RunOne()
++	if runErr != nil || !done || progress.Kind != ProgressReady ||
++		progress.ReadyKind != raftmember.DrivePersisted {
++		t.Fatalf("Ready after refusal = %+v, %t, %v", progress, done, runErr)
++	}
++	if len(runtime.readContexts) != 1 || string(runtime.readContexts[0]) != string(context) {
++		t.Fatalf("retained read contexts = %q", runtime.readContexts)
++	}
++}
++
+ func TestHostAdoptMessageTransfersExactOwnedMessageOnlyOnSuccess(t *testing.T) {
+ 	host, err := NewHost(testHostLimits())
+ 	if err != nil {
+diff --git a/internal/raftmember/runtime_node_persistence.go b/internal/raftmember/runtime_node_persistence.go
+index 002316e7..1aef54d1 100644
+--- a/internal/raftmember/runtime_node_persistence.go
++++ b/internal/raftmember/runtime_node_persistence.go
+@@ -67,6 +67,28 @@ func (p *NodeRuntimePersistence) Submit(batch raftmodel.PersistBatch) (uint64, e
+ 	return p.sequencer.TrySubmit(&p.cell)
+ }
+ 
++// SubmitSeries submits a bounded contiguous Ready prefix for this exact
++// group. The adapter validates the node incarnation before preparing the
++// caller-owned cell; the sequencer then retains the fixed series until Poll
++// or Wait reports its single shared completion.
++func (p *NodeRuntimePersistence) SubmitSeries(batches []raftmodel.PersistBatch) (uint64, error) {
++	if p == nil || p.sequencer == nil {
++		return 0, ErrRuntimeClosed
++	}
++	if len(batches) == 0 || len(batches) > raftstore.MaxReadySeries {
++		return 0, raftstore.ErrBounds
++	}
++	for _, batch := range batches {
++		if batch.NodeIncarnation != p.incarnation {
++			return 0, ErrNodePersistenceBinding
++		}
++	}
++	if err := p.cell.PrepareReadySeries(p.group, batches); err != nil {
++		return 0, err
++	}
++	return p.sequencer.TrySubmit(&p.cell)
++}
++
+ func (p *NodeRuntimePersistence) Poll() (uint64, bool, error) {
+ 	if p == nil {
+ 		return 0, false, ErrRuntimeClosed
+diff --git a/internal/raftmember/runtime_pipelined.go b/internal/raftmember/runtime_pipelined.go
+index 4b3f4535..c654eb23 100644
+--- a/internal/raftmember/runtime_pipelined.go
++++ b/internal/raftmember/runtime_pipelined.go
+@@ -180,6 +180,48 @@ func (q *pipelinedAppendRing) front() (pipelinedAppendWork, bool) {
+ 	return q.items[head%uint64(len(q.items))], true
+ }
+ 
++// copyPrefix copies the bounded contiguous prefix currently available in the
++// ring without retiring any slot. Node-wide persistence must first accept the
++// complete series; only then may popN release the copied entries. The caller
++// owns dst and must pass a capacity no larger than MaxPersistGroupBatches.
++func (q *pipelinedAppendRing) copyPrefix(
++	dst *[raftstore.MaxPersistGroupBatches]pipelinedAppendWork,
++) int {
++	if q == nil || dst == nil {
++		return 0
++	}
++	head := q.head.value.Load()
++	available := q.tail.value.Load() - head
++	if available == 0 {
++		return 0
++	}
++	if available > uint64(len(dst)) {
++		available = uint64(len(dst))
++	}
++	for index := uint64(0); index < available; index++ {
++		dst[index] = q.items[(head+index)%uint64(len(q.items))]
++	}
++	return int(available)
++}
++
++// popN retires exactly count entries after the corresponding copied series
++// has been accepted by the node submission lane. It deliberately performs no
++// copy or allocation and clears each released slot before publishing head.
++func (q *pipelinedAppendRing) popN(count int) bool {
++	if q == nil || count <= 0 || count > len(q.items) {
++		return false
++	}
++	head := q.head.value.Load()
++	if uint64(count) > q.tail.value.Load()-head {
++		return false
++	}
++	for index := 0; index < count; index++ {
++		q.items[(head+uint64(index))%uint64(len(q.items))] = pipelinedAppendWork{}
++	}
++	q.head.value.Store(head + uint64(count))
++	return true
++}
++
+ func (q *pipelinedAppendRing) pop() (pipelinedAppendWork, bool) {
+ 	head := q.head.value.Load()
+ 	work, ok := q.front()
+@@ -271,7 +313,8 @@ type pipelinedRuntime struct {
+ 	durableTerm        uint64
+ 	durableVote        uint64
+ 	nodeSubmission     bool
+-	nodeWork           pipelinedAppendWork
++	nodeWorks          [raftstore.MaxPersistGroupBatches]pipelinedAppendWork
++	nodeWorkCount      uint8
+ }
+ 
+ func newPipelinedRuntime(runtime *Runtime) (*pipelinedRuntime, error) {
+@@ -381,7 +424,6 @@ func (p *pipelinedRuntime) stopAppendWorker() {
+ 		if p.nodeSubmission {
+ 			_, _ = p.runtime.nodePersistence.Wait()
+ 			p.nodeSubmission = false
+-			p.nodeWork = pipelinedAppendWork{}
+ 		}
+ 		return
+ 	}
+@@ -497,14 +539,26 @@ func (p *pipelinedRuntime) enqueueAppend(message *pb.Message) error {
+ 	return p.submitNextNodeAppend()
+ }
+ 
+-func (p *pipelinedRuntime) submitNodeWork(work pipelinedAppendWork) error {
++func (p *pipelinedRuntime) submitNodeSeries(
++	works *[raftstore.MaxPersistGroupBatches]pipelinedAppendWork,
++	count int,
++) error {
+ 	if p.nodeSubmission || p.runtime.nodePersistence == nil {
+ 		return nil
+ 	}
+-	if _, err := p.runtime.nodePersistence.Submit(work.batch); err != nil {
++	if works == nil || count <= 0 || count > len(works) {
++		return p.runtime.fail(errors.New("raftmember: invalid node append series"))
++	}
++	var batches [raftstore.MaxPersistGroupBatches]raftmodel.PersistBatch
++	for index := 0; index < count; index++ {
++		batches[index] = works[index].batch
++	}
++	if _, err := p.runtime.nodePersistence.SubmitSeries(batches[:count]); err != nil {
+ 		return err
+ 	}
+-	p.nodeWork = work
++	copy(p.nodeWorks[:count], works[:count])
++	clear(p.nodeWorks[count:])
++	p.nodeWorkCount = uint8(count)
+ 	p.nodeSubmission = true
+ 	return nil
+ }
+@@ -513,28 +567,48 @@ func (p *pipelinedRuntime) submitNextNodeAppend() error {
+ 	if p.runtime.nodePersistence == nil || p.nodeSubmission || p.appendRetry {
+ 		return nil
+ 	}
+-	work, ok := p.appendWork.front()
+-	if !ok {
++	var works [raftstore.MaxPersistGroupBatches]pipelinedAppendWork
++	count := p.appendWork.copyPrefix(&works)
++	if count == 0 {
+ 		return nil
+ 	}
+-	if err := p.submitNodeWork(work); err != nil {
+-		if errors.Is(err, raftstore.ErrSubmissionBackpressure) {
+-			return nil
++	firstReadyID := works[0].batch.ReadyID
++	for index := 1; index < count; index++ {
++		if firstReadyID > math.MaxUint64-uint64(index) ||
++			works[index].batch.ReadyID != firstReadyID+uint64(index) {
++			return p.runtime.fail(errors.New("raftmember: unordered node append series"))
+ 		}
+-		return p.runtime.fail(err)
+ 	}
+-	if _, ok = p.appendWork.pop(); !ok {
+-		return p.runtime.fail(errors.New("raftmember: node append queue lost submitted work"))
++	for candidate := count; candidate > 0; candidate-- {
++		if err := p.submitNodeSeries(&works, candidate); err != nil {
++			if errors.Is(err, raftstore.ErrSubmissionBackpressure) {
++				return nil
++			}
++			// A bounded multi-Ready envelope can be unsupported even when a
++			// proper prefix is independently valid (for example, a snapshot or
++			// a conservative aggregate admission bound). Shrink only deterministic
++			// series-shape failures; the singleton result remains authoritative.
++			if candidate > 1 && (errors.Is(err, raftstore.ErrInvalid) ||
++				errors.Is(err, raftstore.ErrBounds) ||
++				errors.Is(err, raftstore.ErrUnsupportedSnapshot)) {
++				continue
++			}
++			return p.runtime.fail(err)
++		}
++		if !p.appendWork.popN(candidate) {
++			return p.runtime.fail(errors.New("raftmember: node append queue lost submitted series"))
++		}
++		return nil
+ 	}
+-	return nil
++	return p.runtime.fail(errors.New("raftmember: node append series has no admissible prefix"))
+ }
+ 
+ func (p *pipelinedRuntime) requestAppendRetry() error {
+ 	if p.runtime.nodePersistence != nil {
+-		if p.nodeSubmission || p.nodeWork.message == nil {
++		if p.nodeSubmission || p.nodeWorkCount == 0 || p.nodeWorks[0].message == nil {
+ 			return p.runtime.fail(errors.New("raftmember: invalid node append retry state"))
+ 		}
+-		if err := p.submitNodeWork(p.nodeWork); err != nil {
++		if err := p.submitNodeSeries(&p.nodeWorks, int(p.nodeWorkCount)); err != nil {
+ 			return err
+ 		}
+ 		p.appendRetry = false
+@@ -556,7 +630,11 @@ func (p *pipelinedRuntime) consumeAppendResult() (DriveResult, bool, error) {
+ 		if !done {
+ 			return DriveResult{}, false, nil
+ 		}
+-		result.works[0], result.count, result.err = p.nodeWork, 1, err
++		if p.nodeWorkCount == 0 || int(p.nodeWorkCount) > len(result.works) {
++			return DriveResult{}, true, p.runtime.fail(errors.New("raftmember: invalid node append completion"))
++		}
++		copy(result.works[:p.nodeWorkCount], p.nodeWorks[:p.nodeWorkCount])
++		result.count, result.err = p.nodeWorkCount, err
+ 		p.nodeSubmission = false
+ 	} else {
+ 		var ok bool
+@@ -570,6 +648,9 @@ func (p *pipelinedRuntime) consumeAppendResult() (DriveResult, bool, error) {
+ 		return DriveResult{}, true, p.runtime.fail(errors.New("raftmember: invalid pipelined append completion"))
+ 	}
+ 	firstReadyID := result.works[0].batch.ReadyID
++	if p.appendProcessedID == math.MaxUint64 || firstReadyID != p.appendProcessedID+1 {
++		return DriveResult{}, true, p.runtime.fail(errors.New("raftmember: pipelined append completion skipped Ready"))
++	}
+ 	lastReadyID := result.works[result.count-1].batch.ReadyID
+ 	for index := 0; index < int(result.count); index++ {
+ 		if result.works[index].batch.ReadyID != firstReadyID+uint64(index) {
+@@ -607,7 +688,8 @@ func (p *pipelinedRuntime) consumeAppendResult() (DriveResult, bool, error) {
+ 	p.appendProcessedID = lastReadyID
+ 	p.appendRetryReadyID = 0
+ 	if p.runtime.nodePersistence != nil {
+-		p.nodeWork = pipelinedAppendWork{}
++		clear(p.nodeWorks[:p.nodeWorkCount])
++		p.nodeWorkCount = 0
+ 		if err := p.submitNextNodeAppend(); err != nil {
+ 			return DriveResult{}, true, err
+ 		}
+@@ -707,7 +789,6 @@ func (runtime *Runtime) drivePipelinedReady(
+ 	if result, progressed, err := p.driveResponses(send); progressed || err != nil {
+ 		return result, err
+ 	}
+-
+ 	if p.applyCurrent.message != nil || p.applyQueue.len() != 0 {
+ 		if p.applyCurrent.message == nil {
+ 			next, _ := p.applyQueue.front()
+@@ -843,6 +924,7 @@ driveDirect:
+ func (p *pipelinedRuntime) quiescent() bool {
+ 	return p == nil || (p.appendOutstanding == 0 && p.appendWork.len() == 0 &&
+ 		p.appendDone.len() == 0 && p.appendCompleted.len() == 0 &&
++		!p.nodeSubmission && p.nodeWorkCount == 0 &&
+ 		p.applyQueue.len() == 0 && p.directQueue.len() == 0 &&
+ 		p.applyCurrent.message == nil && !p.appendRetry)
+ }
+diff --git a/internal/raftmember/runtime_pipelined_series_test.go b/internal/raftmember/runtime_pipelined_series_test.go
+new file mode 100644
+index 00000000..12c69911
+--- /dev/null
++++ b/internal/raftmember/runtime_pipelined_series_test.go
+@@ -0,0 +1,288 @@
++package raftmember
++
++import (
++	"os"
++	"path/filepath"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/thesyncim/vibedb/internal/raftmodel"
++	"github.com/thesyncim/vibedb/internal/raftstore"
++	raft "go.etcd.io/raft/v3"
++	pb "go.etcd.io/raft/v3/raftpb"
++)
++
++func TestPipelinedAppendRingCopiesBoundedPrefixBeforeRetirement(t *testing.T) {
++	var ring pipelinedAppendRing
++	for readyID := uint64(1); readyID <= 17; readyID++ {
++		if !ring.push(pipelinedAppendWork{batch: raftmodel.PersistBatch{ReadyID: readyID}}) {
++			t.Fatalf("push ReadyID %d failed", readyID)
++		}
++	}
++	var prefix [16]pipelinedAppendWork
++	if got := ring.copyPrefix(&prefix); got != len(prefix) {
++		t.Fatalf("copyPrefix count=%d want=%d", got, len(prefix))
++	}
++	if got := ring.len(); got != 17 {
++		t.Fatalf("copyPrefix retired entries: ring len=%d want=17", got)
++	}
++	for index, work := range prefix {
++		if got, want := work.batch.ReadyID, uint64(index+1); got != want {
++			t.Fatalf("prefix[%d] ReadyID=%d want=%d", index, got, want)
++		}
++	}
++	if ring.popN(18) {
++		t.Fatal("popN accepted more work than the ring contains")
++	}
++	if got := ring.len(); got != 17 {
++		t.Fatalf("rejected popN changed ring len=%d want=17", got)
++	}
++	if !ring.popN(len(prefix)) {
++		t.Fatal("popN rejected accepted prefix")
++	}
++	if got := ring.len(); got != 1 {
++		t.Fatalf("after popN ring len=%d want=1", got)
++	}
++	work, ok := ring.front()
++	if !ok || work.batch.ReadyID != 17 {
++		t.Fatalf("remaining work=(%+v,%v), want ReadyID 17", work, ok)
++	}
++}
++
++func TestPipelinedNodeAppendSubmitsQueuedReadyPrefixAfterFirstCompletion(t *testing.T) {
++	base, store, p := newPipelinedNodeSeriesHarness(t, 252)
++	var syncs atomic.Int32
++	entered, release := make(chan struct{}), make(chan struct{})
++	var releaseOnce sync.Once
++	releaseFirst := func() { releaseOnce.Do(func() { close(release) }) }
++	defer releaseFirst()
++	store.SetDataSyncForTesting(func(file *os.File) error {
++		if syncs.Add(1) == 1 {
++			close(entered)
++			<-release
++		}
++		return file.Sync()
++	})
++	const maxSeries = uint64(raftstore.MaxReadySeries)
++	for readyID := uint64(1); readyID <= maxSeries+1; readyID++ {
++		message := pipelinedTestAppendMessage(base.MemberID, readyID+1, readyID)
++		if readyID == 1 {
++			from := base.MemberID
++			peer := base.MemberID + 1
++			responseTerm := uint64(1)
++			message.Responses = []*pb.Message{{
++				Type: pb.MsgApp.Enum(), From: &from,
++				To: &peer, Term: &responseTerm,
++			}}
++		}
++		if err := p.enqueueAppend(message); err != nil {
++			t.Fatalf("enqueue ReadyID %d: %v", readyID, err)
++		}
++		if readyID == 1 {
++			select {
++			case <-entered:
++			case <-time.After(5 * time.Second):
++				t.Fatal("first node persistence did not enter the sync fence")
++			}
++		}
++	}
++	if got := syncs.Load(); got != 1 {
++		t.Fatalf("queued Ready submissions reached persistence before first completion: syncs=%d", got)
++	}
++	if got := p.appendWork.len(); got != raftstore.MaxReadySeries {
++		t.Fatalf("queued append ring len=%d want=%d", got, raftstore.MaxReadySeries)
++	}
++	if got := p.nodeWorkCount; got != 1 {
++		t.Fatalf("first in-flight work count=%d want=1", got)
++	}
++	releaseFirst()
++
++	result := waitPipelinedAppendResult(t, p)
++	if result.Kind != DrivePersisted || result.ReadyID != 1 {
++		t.Fatalf("first completion=%+v want DrivePersisted ReadyID 1", result)
++	}
++	if got := p.nodeWorkCount; got != uint8(raftstore.MaxReadySeries) {
++		t.Fatalf("accepted queued series count=%d want=%d", got, raftstore.MaxReadySeries)
++	}
++	if got := p.appendWork.len(); got != 0 {
++		t.Fatalf("accepted queued series remained in ring: len=%d", got)
++	}
++	if got := p.appendOutstanding; got != raftstore.MaxReadySeries {
++		t.Fatalf("outstanding after first completion=%d want=%d", got, raftstore.MaxReadySeries)
++	}
++	if got := p.appendCompleted.len(); got != 1 {
++		t.Fatalf("completed queue after first Ready=%d want=1", got)
++	}
++	if got := p.directQueue.len(); got != 1 {
++		t.Fatalf("durable-term early replication response queue len=%d want=1", got)
++	}
++	if completion, ok := p.appendCompleted.front(); !ok || completion.responseIndex != 1 {
++		t.Fatalf("node append response cursor=%+v present=%t want cursor 1", completion, ok)
++	}
++
++	result = waitPipelinedAppendResult(t, p)
++	if result.Kind != DrivePersisted || result.ReadyID != maxSeries+1 {
++		t.Fatalf("series completion=%+v want final ReadyID %d", result, maxSeries+1)
++	}
++	if p.appendOutstanding != 0 || p.nodeWorkCount != 0 || p.nodeSubmission {
++		t.Fatalf("append state after series completion outstanding=%d active=%d submitting=%t",
++			p.appendOutstanding, p.nodeWorkCount, p.nodeSubmission)
++	}
++	if got := p.appendCompleted.len(); got != raftstore.MaxReadySeries+1 {
++		t.Fatalf("completion queue len=%d want=%d", got, raftstore.MaxReadySeries+1)
++	}
++	for expected := uint64(1); expected <= maxSeries+1; expected++ {
++		completion, ok := p.appendCompleted.front()
++		if !ok || completion.message == nil || completion.message.GetIndex() != expected+1 {
++			t.Fatalf("completion %d=(%+v,%t)", expected, completion, ok)
++		}
++		p.appendCompleted.pop()
++	}
++}
++
++func TestPipelinedNodeAppendShrinksUnsupportedSeriesPrefix(t *testing.T) {
++	base, store, p := newPipelinedNodeSeriesHarness(t, 251)
++	entered, release := make(chan struct{}), make(chan struct{})
++	var releaseOnce sync.Once
++	releaseFirst := func() { releaseOnce.Do(func() { close(release) }) }
++	t.Cleanup(releaseFirst)
++	var syncs atomic.Int32
++	store.SetDataSyncForTesting(func(file *os.File) error {
++		if syncs.Add(1) == 1 {
++			close(entered)
++			<-release
++		}
++		return file.Sync()
++	})
++	if err := p.enqueueAppend(pipelinedTestAppendMessage(base.MemberID, 2, 1)); err != nil {
++		t.Fatal(err)
++	}
++	select {
++	case <-entered:
++	case <-time.After(5 * time.Second):
++		t.Fatal("first node persistence did not enter the sync fence")
++	}
++	if err := p.enqueueAppend(pipelinedTestAppendMessage(base.MemberID, 3, 2)); err != nil {
++		t.Fatal(err)
++	}
++	index, term := uint64(1), uint64(1)
++	snapshotWork := pipelinedTestAppendMessage(base.MemberID, 4, 3)
++	snapshotWork.Entries = nil
++	snapshotWork.Snapshot = &pb.Snapshot{Metadata: &pb.SnapshotMetadata{
++		Index: &index, Term: &term, ConfState: &pb.ConfState{Voters: []uint64{base.MemberID}},
++	}}
++	if err := p.enqueueAppend(snapshotWork); err != nil {
++		t.Fatal(err)
++	}
++	releaseFirst()
++	if result := waitPipelinedAppendResult(t, p); result.ReadyID != 1 {
++		t.Fatalf("first completion=%+v", result)
++	}
++	if p.nodeWorkCount != 1 || p.appendWork.len() != 1 {
++		t.Fatalf("fallback accepted=%d queued=%d want 1/1", p.nodeWorkCount, p.appendWork.len())
++	}
++	if result := waitPipelinedAppendResult(t, p); result.ReadyID != 2 {
++		t.Fatalf("prefix completion=%+v", result)
++	}
++	if p.nodeWorkCount != 1 || p.appendWork.len() != 0 {
++		t.Fatalf("snapshot singleton accepted=%d queued=%d want 1/0", p.nodeWorkCount, p.appendWork.len())
++	}
++	if result := waitPipelinedAppendResult(t, p); result.ReadyID != 3 {
++		t.Fatalf("snapshot completion=%+v", result)
++	}
++}
++
++func newPipelinedNodeSeriesHarness(t *testing.T, seed byte) (raftstore.Identity, *raftstore.NodeStore, *pipelinedRuntime) {
++	t.Helper()
++	base := testWALIdentity(seed)
++	nodeID := base.StoreID
++	nodeID[0] ^= 0xa5
++	node := raftstore.NodeIdentity{
++		ClusterID: base.ClusterID, ClusterIncarnation: base.ClusterIncarnation, NodeID: nodeID,
++	}
++	descriptor := raftstore.GroupDescriptor{
++		TopologyRecoveryEpoch: testTopologyRecoveryEpoch,
++		AllocationGeneration:  base.AllocationGeneration,
++		MemberID:              base.MemberID,
++		GroupID:               base.GroupID,
++		ShardIncarnation:      base.ShardIncarnation,
++		StoreID:               base.StoreID,
++		Distribution:          base.Distribution,
++		Shard:                 base.Shard,
++	}
++	index, term := uint64(1), uint64(1)
++	store, err := raftstore.CreateNodeStore(
++		filepath.Join(t.TempDir(), "node"), node, testWALKey(),
++		[]raftstore.NodeBootstrap{{Descriptor: descriptor, Snapshot: &pb.Snapshot{
++			Metadata: &pb.SnapshotMetadata{Index: &index, Term: &term,
++				ConfState: &pb.ConfState{Voters: []uint64{base.MemberID}}},
++		}}},
++		raftstore.NodeStoreOptions{
++			MaxWaveBytes: 1 << 20, MaxSegmentEvents: 256,
++			RecentWaves: 64, MaxEntriesPerGroup: 64, ReaderSlots: 1, MaxGroups: 8,
++		},
++	)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = store.Close() })
++	if _, err = store.BeginIncarnations([]uint64{1}); err != nil {
++		t.Fatal(err)
++	}
++	identity := RuntimeIdentity{
++		Group: GroupKey{
++			ClusterID: base.ClusterID, ClusterIncarnation: base.ClusterIncarnation,
++			TopologyRecoveryEpoch: testTopologyRecoveryEpoch,
++			ShardIncarnation:      base.ShardIncarnation, GroupID: base.GroupID,
++		},
++		Distribution: base.Distribution, Shard: base.Shard,
++		AllocationGeneration: base.AllocationGeneration, MemberID: base.MemberID,
++		StoreID: base.StoreID, NodeIncarnation: 1,
++	}
++	sequencer, err := raftstore.NewNodeSubmissionSequencer(store, 8)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = sequencer.Close() })
++	persistence, err := BindNodeRuntimePersistence(store, sequencer, identity)
++	if err != nil {
++		t.Fatal(err)
++	}
++	runtime := &Runtime{identity: identity, nodePersistence: persistence}
++	p := &pipelinedRuntime{runtime: runtime, appendTerm: 1, durableTerm: 1}
++	runtime.pipelined = p
++	return base, store, p
++}
++
++func pipelinedTestAppendMessage(memberID, entryIndex, readyID uint64) *pb.Message {
++	term, vote, commit := uint64(1), memberID, uint64(1)
++	localAppend := uint64(raft.LocalAppendThread)
++	return &pb.Message{
++		Type: pb.MsgStorageAppend.Enum(), From: &memberID, To: &localAppend,
++		Term: &term, Vote: &vote, Commit: &commit, Index: &entryIndex,
++		Entries: []*pb.Entry{{Type: pb.EntryNormal.Enum(), Term: &term, Index: &entryIndex}},
++		Context: []byte{byte(readyID)},
++	}
++}
++
++func waitPipelinedAppendResult(t *testing.T, p *pipelinedRuntime) DriveResult {
++	t.Helper()
++	deadline := time.After(5 * time.Second)
++	for {
++		result, consumed, err := p.consumeAppendResult()
++		if err != nil {
++			t.Fatalf("consume append result: %v", err)
++		}
++		if consumed {
++			return result
++		}
++		select {
++		case <-deadline:
++			t.Fatal("timed out waiting for node append completion")
++		default:
++			time.Sleep(time.Millisecond)
++		}
++	}
++}
+diff --git a/internal/raftservice/owner.go b/internal/raftservice/owner.go
+index cc55fa7a..a2fe5e0c 100644
+--- a/internal/raftservice/owner.go
++++ b/internal/raftservice/owner.go
+@@ -10,7 +10,6 @@ import (
+ 	"fmt"
+ 	"sync"
+ 	"sync/atomic"
+-	"time"
+ 
+ 	"github.com/thesyncim/vibedb/internal/executionpin"
+ 	"github.com/thesyncim/vibedb/internal/membershipgrant"
+@@ -28,19 +27,7 @@ import (
+ )
+ 
+ const (
+-	// One full closed-loop client wave shares a Ready durability boundary. The
+-	// owner still progresses prior Ready and peer acknowledgements while the
+-	// successor window is assembled.
+-	proposalIngressBatchEntries   = raftmodel.MaxProposalBatchEntries
+-	proposalIngressCoalesceWindow = 500 * time.Microsecond
+-	proposalIngressGraceWindow    = time.Millisecond
+-	proposalIngressRecoveryWindow = time.Millisecond
+-	proposalIngressRecoveryRounds = 8
+-	// A learned closed-loop cohort may transiently dip while one completion is
+-	// still being delivered. Give that cohort one unconditional recovery turn
+-	// before consulting the live pending count, avoiding a nearly-full Raft/WAL
+-	// wave followed by a singleton without imposing a persistent tail delay.
+-	proposalIngressGraceRounds = 1
++	proposalIngressBatchEntries = raftmodel.MaxProposalBatchEntries
+ )
+ 
+ var (
+@@ -245,6 +232,8 @@ type readAuthorization struct {
+ type readDelivery struct {
+ 	state          atomic.Uint32
+ 	reply          chan ownerReply
++	context        [16]byte
++	contextSet     bool
+ 	serving        ServingState
+ 	source         ReadSource
+ 	recovery       TransactionRecoverySource
+@@ -703,13 +692,10 @@ type Owner struct {
+ 	ingressBytes         int64
+ 	pendingProposalItems int
+ 	pendingProposalBytes int64
+-	pendingProposalGroup map[raftmember.GroupKey]int
+ 	pendingReadItems     int
+ 	pendingReadBytes     int64
+ 	readSequence         uint64
+ 	pendingReads         map[[16]byte]*readDelivery
+-	proposalCohort       map[raftmember.GroupKey]int
+-	proposalCohortMisses map[raftmember.GroupKey]uint8
+ 	started              bool
+ 	closed               bool
+ 	failure              error
+@@ -890,36 +876,27 @@ func newOwner(options Options, host ownerHost, allowEmpty bool) (*Owner, error)
+ 	return &Owner{
+ 		registry: options.Registry, host: host, groups: groups, members: members,
+ 		outbound: options.Outbound, pulse: options.Pulse, limits: limits,
+-		authority:            options.MembershipAuthority,
+-		metrics:              options.ProgressMetrics,
+-		ingress:              make(chan ownerRequest, limits.MaxIngressItems),
+-		ready:                make(chan struct{}),
+-		done:                 make(chan struct{}),
+-		pendingReads:         make(map[[16]byte]*readDelivery, limits.MaxPendingReadItems),
+-		pendingProposalGroup: make(map[raftmember.GroupKey]int, len(groups)),
+-		proposalCohort:       make(map[raftmember.GroupKey]int, len(groups)),
++		authority:    options.MembershipAuthority,
++		metrics:      options.ProgressMetrics,
++		ingress:      make(chan ownerRequest, limits.MaxIngressItems),
++		ready:        make(chan struct{}),
++		done:         make(chan struct{}),
++		pendingReads: make(map[[16]byte]*readDelivery, limits.MaxPendingReadItems),
+ 	}, nil
+ }
+ 
+-// proposalIngressCollector holds only bounded, already-accounted client
+-// requests. It never calls Host itself. The owner continues to drain Ready,
+-// send Raft traffic, and adopt peer messages while a successor proposal cohort
+-// is assembled, so closed-loop callers do not have to complete the preceding
+-// round before its acknowledgements can be processed.
++// proposalIngressCollector holds one bounded, already-accounted prefix of
++// same-group proposals. Run fills it only from requests already waiting in the
++// ingress channel, then immediately transfers the prefix to Host. It never
++// waits for a predicted future cohort.
+ type proposalIngressCollector struct {
+ 	requests []ownerRequest
+ 	group    raftmember.GroupKey
+ 	bytes    int64
+-	target   int
+-	known    bool
+-	rounds   int
+-	observed bool
+-	timer    *time.Timer
+-	timerC   <-chan time.Time
+ }
+ 
+ func newProposalIngressCollector(capacity int) proposalIngressCollector {
+-	capacity = min(capacity, proposalIngressBatchEntries)
++	capacity = max(1, min(capacity, proposalIngressBatchEntries))
+ 	return proposalIngressCollector{requests: make([]ownerRequest, 0, capacity)}
+ }
+ 
+@@ -927,54 +904,10 @@ func (collector *proposalIngressCollector) active() bool {
+ 	return collector != nil && len(collector.requests) != 0
+ }
+ 
+-func (collector *proposalIngressCollector) stopTimer() {
+-	if collector == nil {
+-		return
+-	}
+-	collector.timerC = nil
+-	if collector.timer == nil || collector.timer.Stop() {
+-		return
+-	}
+-	select {
+-	case <-collector.timer.C:
+-	default:
+-	}
+-}
+-
+-func (collector *proposalIngressCollector) resetTimer(window time.Duration) {
+-	collector.stopTimer()
+-	if collector.timer == nil {
+-		collector.timer = time.NewTimer(window)
+-	} else {
+-		collector.timer.Reset(window)
+-	}
+-	collector.timerC = collector.timer.C
+-}
+-
+-func (collector *proposalIngressCollector) start(owner *Owner, request ownerRequest) {
++func (collector *proposalIngressCollector) start(request ownerRequest) {
+ 	collector.group = request.group
+ 	collector.requests = append(collector.requests, request)
+ 	collector.bytes = int64(len(request.data))
+-	collector.target = owner.proposalCohort[request.group]
+-	owner.mu.Lock()
+-	collector.target = max(collector.target, owner.pendingProposalGroup[request.group])
+-	owner.mu.Unlock()
+-	collector.target = min(collector.target, cap(collector.requests))
+-	collector.known = collector.target > 1
+-	if collector.known {
+-		if owner.proposalCohort == nil {
+-			owner.proposalCohort = make(map[raftmember.GroupKey]int)
+-		}
+-		owner.proposalCohort[request.group] = max(
+-			owner.proposalCohort[request.group], collector.target,
+-		)
+-	}
+-	collector.rounds = 0
+-	if collector.known {
+-		collector.resetTimer(proposalIngressCoalesceWindow)
+-	} else {
+-		collector.stopTimer()
+-	}
+ }
+ 
+ func proposalIngressCandidate(request ownerRequest) bool {
+@@ -1005,83 +938,57 @@ func (collector *proposalIngressCollector) append(request ownerRequest) {
+ }
+ 
+ func (collector *proposalIngressCollector) full() bool {
+-	return collector.active() && (collector.known && len(collector.requests) >= collector.target ||
+-		len(collector.requests) == cap(collector.requests) ||
++	return collector.active() && (len(collector.requests) == cap(collector.requests) ||
+ 		collector.bytes == raftmodel.MaxProposalBatchBytes)
+ }
+ 
+-func (collector *proposalIngressCollector) expire(owner *Owner) bool {
+-	collector.timerC = nil
+-	if collector.known && len(collector.requests) < collector.target &&
+-		collector.rounds < proposalIngressRecoveryRounds {
+-		owner.mu.Lock()
+-		pending := owner.pendingProposalGroup[collector.group]
+-		owner.mu.Unlock()
+-		if collector.rounds < proposalIngressGraceRounds || pending >= collector.target {
+-			collector.rounds++
+-			window := proposalIngressRecoveryWindow
+-			if collector.rounds <= proposalIngressGraceRounds {
+-				window = proposalIngressGraceWindow
++// drain inspects at most one proposal batch's worth of ingress, including the
++// request that started the collector. Already queued peer messages and reads
++// retain their independent treatment and count against that budget. The first
++// other request is returned as an ordering barrier; requests beyond the fixed
++// scan remain in the channel for a later owner turn.
++func (collector *proposalIngressCollector) drain(
++	queue <-chan ownerRequest,
++	handleIndependent func(ownerRequest) error,
++) (ownerRequest, bool, error) {
++	for inspected := 1; inspected < proposalIngressBatchEntries && !collector.full(); inspected++ {
++		select {
++		case next, open := <-queue:
++			if !open {
++				return ownerRequest{}, false, nil
+ 			}
+-			collector.resetTimer(window)
+-			return false
+-		}
+-	}
+-	collector.observe(owner)
+-	return true
+-}
+-
+-const proposalCohortDecayMisses = 8
+-
+-// observe updates the learned closed-loop cohort with hysteresis. A single
+-// straggler must not permanently fragment every later wave, while a real
+-// client-count reduction converges after a bounded number of partial windows.
+-func (collector *proposalIngressCollector) observe(owner *Owner) {
+-	if collector == nil || owner == nil || collector.observed || !collector.active() {
+-		return
+-	}
+-	collector.observed = true
+-	learned := len(collector.requests)
+-	owner.mu.Lock()
+-	learned = max(learned, owner.pendingProposalGroup[collector.group])
+-	owner.mu.Unlock()
+-	learned = min(learned, cap(collector.requests))
+-	if owner.proposalCohort == nil {
+-		owner.proposalCohort = make(map[raftmember.GroupKey]int)
+-	}
+-	current := owner.proposalCohort[collector.group]
+-	if learned >= current {
+-		owner.proposalCohort[collector.group] = learned
+-		if owner.proposalCohortMisses != nil {
+-			delete(owner.proposalCohortMisses, collector.group)
++			switch {
++			case collector.accepts(next):
++				collector.append(next)
++			case next.kind == requestInbound || readIngressCandidate(next):
++				if err := handleIndependent(next); err != nil {
++					if errors.Is(err, errOwnerReadDeferred) {
++						// The callback deliberately retained this exact read and
++						// its ingress charge. Return it as the ordering barrier so
++						// the owner can retry it after flushing the collected prefix.
++						return next, true, err
++					}
++					return ownerRequest{}, false, err
++				}
++			default:
++				return next, true, nil
++			}
++		default:
++			return ownerRequest{}, false, nil
+ 		}
+-		return
+ 	}
+-	if owner.proposalCohortMisses == nil {
+-		owner.proposalCohortMisses = make(map[raftmember.GroupKey]uint8)
+-	}
+-	misses := owner.proposalCohortMisses[collector.group] + 1
+-	if misses < proposalCohortDecayMisses {
+-		owner.proposalCohortMisses[collector.group] = misses
+-		return
+-	}
+-	step := max(1, current/4)
+-	owner.proposalCohort[collector.group] = max(learned, current-step)
+-	delete(owner.proposalCohortMisses, collector.group)
++	return ownerRequest{}, false, nil
+ }
+ 
+ func (collector *proposalIngressCollector) reset() {
+-	collector.stopTimer()
+ 	clear(collector.requests)
+ 	collector.requests = collector.requests[:0]
+ 	collector.group = raftmember.GroupKey{}
+ 	collector.bytes = 0
+-	collector.target = 0
+-	collector.known = false
+-	collector.rounds = 0
+-	collector.observed = false
+ }
+ 
++var errOwnerReadDeferred = errors.New("raftservice: read deferred behind Ready")
++
+ // Run becomes the sole Host owner until ctx is canceled or a terminal lane
+ // failure occurs. It may be called exactly once.
+ func (owner *Owner) Run(ctx context.Context) (runErr error) {
+@@ -1102,6 +1009,8 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
+ 
+ 	var pending raftmember.OutboundMessage
+ 	readyBlocked := false
++	var deferredRead ownerRequest
++	deferredReadPending := false
+ 	collector := newProposalIngressCollector(owner.limits.MaxIngressItems)
+ 	var asyncNotify <-chan struct{}
+ 	var asyncHost asyncOwnerHost
+@@ -1111,6 +1020,12 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
+ 	}
+ 	handleRequest := func(request ownerRequest) error {
+ 		err := owner.handle(request)
++		if errors.Is(err, errOwnerReadDeferred) {
++			// ReadIndex is direct protocol input and cannot cross an uncaptured
++			// Ready boundary. Keep the exact request, delivery, and ingress charge
++			// alive; the event loop retries it after draining the Host.
++			return err
++		}
+ 		owner.release(request.bytes)
+ 		if request.async && err != nil {
+ 			return err
+@@ -1125,8 +1040,6 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
+ 		collector.reset()
+ 	}
+ 	flushCollected := func() error {
+-		collector.stopTimer()
+-		collector.observe(owner)
+ 		for index, request := range collector.requests {
+ 			if err := handleRequest(request); err != nil {
+ 				for _, retained := range collector.requests[index+1:] {
+@@ -1140,12 +1053,16 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
+ 		collector.reset()
+ 		return nil
+ 	}
+-	// A lone proposal has no known durability work to share. Submit it
+-	// immediately; pending concurrent requests still form the learned cohort.
+-	startCollected := func(request ownerRequest) error {
+-		collector.start(owner, request)
+-		if !collector.known {
+-			return flushCollected()
++	offerTicks := func() error {
++		for _, group := range owner.groups {
++			switch err := owner.host.RequestTick(group); err {
++			case nil:
++			case multiraft.ErrQueueFull, multiraft.ErrGroupBusy:
++				// A pulse is an offer. Existing admitted work remains owned by
++				// Host, and a later pulse may offer another tick.
++			default:
++				return err
++			}
+ 		}
+ 		return nil
+ 	}
+@@ -1153,7 +1070,17 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
+ 		if collector.active() {
+ 			failCollected(errors.Join(ErrOwnerClosed, runErr))
+ 		}
+-		collector.stopTimer()
++		if deferredReadPending {
++			reply := ownerReply{err: errors.Join(ErrOwnerClosed, runErr)}
++			if deferredRead.read.delivery != nil {
++				owner.settleReadDelivery(deferredRead.read.delivery, reply)
++			} else {
++				deferredRead.reply <- reply
++			}
++			owner.release(deferredRead.bytes)
++			deferredRead = ownerRequest{}
++			deferredReadPending = false
++		}
+ 	}()
+ 	for {
+ 		if pending.Message != nil {
+@@ -1222,55 +1149,92 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
+ 			}
+ 		}
+ 
++		if deferredReadPending {
++			if !readyBlocked {
++				err := handleRequest(deferredRead)
++				if !errors.Is(err, errOwnerReadDeferred) {
++					deferredRead = ownerRequest{}
++					deferredReadPending = false
++					if err != nil {
++						return owner.stop(err)
++					}
++					continue
++				}
++			}
++			// A failed Ready attempt or a refusal after the idle probe requires a
++			// new asynchronous/pulse edge. Wait instead of polling ReadIndex or
++			// admitting newer ingress past this request.
++			select {
++			case <-ctx.Done():
++				return owner.stop(context.Cause(ctx))
++			case _, ok := <-asyncNotify:
++				if !ok {
++					asyncNotify = nil
++					asyncHost = nil
++					continue
++				}
++				readyBlocked = false
++				asyncHost.WakePipelined()
++			case _, ok := <-owner.pulse:
++				readyBlocked = false
++				if !ok {
++					owner.pulse = nil
++					continue
++				}
++				if err := offerTicks(); err != nil {
++					return owner.stop(err)
++				}
++			}
++			continue
++		}
++
+ 		select {
+ 		case <-ctx.Done():
+ 			return owner.stop(context.Cause(ctx))
+-		case <-asyncNotify:
++		case _, ok := <-asyncNotify:
++			if !ok {
++				asyncNotify = nil
++				asyncHost = nil
++				continue
++			}
+ 			readyBlocked = false
+ 			asyncHost.WakePipelined()
+ 		case request := <-owner.ingress:
+ 			readyBlocked = false
+-			proposal := proposalIngressCandidate(request)
+-			switch {
+-			case !collector.active() && proposal:
+-				if err := startCollected(request); err != nil {
+-					return owner.stop(err)
+-				}
+-			case collector.accepts(request):
+-				collector.append(request)
+-				if collector.full() {
+-					if err := flushCollected(); err != nil {
+-						return owner.stop(err)
+-					}
+-				}
+-			case collector.active() && (request.kind == requestInbound || readIngressCandidate(request)):
+-				// Peer progress and reads are independent lanes. A read cannot require
+-				// an overlapping, not-yet-admitted proposal to precede it; a proposal
+-				// completed before the read began is already covered by ReadIndex and
+-				// the applied-publication barrier. Preserve the successor write cohort
+-				// instead of fragmenting it into singleton durability waves.
++			if !proposalIngressCandidate(request) {
+ 				if err := handleRequest(request); err != nil {
+-					return owner.stop(err)
+-				}
+-			default:
+-				// Local reads, topology changes, another group, and an oversized
+-				// singleton are ordering barriers for the collected prefix.
+-				if collector.active() {
+-					if err := flushCollected(); err != nil {
+-						return owner.stop(err)
+-					}
+-				}
+-				if proposal {
+-					if err := startCollected(request); err != nil {
+-						return owner.stop(err)
++					if errors.Is(err, errOwnerReadDeferred) {
++						deferredRead, deferredReadPending = request, true
++						continue
+ 					}
+-				} else if err := handleRequest(request); err != nil {
+ 					return owner.stop(err)
+ 				}
++				continue
++			}
++			collector.start(request)
++			barrier, barrierPresent, drainErr := collector.drain(owner.ingress, handleRequest)
++			if drainErr != nil && !errors.Is(drainErr, errOwnerReadDeferred) {
++				failCollected(errors.Join(ErrOwnerClosed, drainErr))
++				return owner.stop(drainErr)
++			}
++			if errors.Is(drainErr, errOwnerReadDeferred) {
++				// drain removed this read from ingress. Record its ownership before
++				// flushing the earlier proposal prefix so every terminal exit can
++				// settle its delivery and release its ingress charge exactly once.
++				deferredRead, deferredReadPending = barrier, true
++			}
++			if err := flushCollected(); err != nil {
++				return owner.stop(err)
++			}
++			if deferredReadPending {
++				continue
+ 			}
+-		case <-collector.timerC:
+-			if collector.expire(owner) {
+-				if err := flushCollected(); err != nil {
++			if barrierPresent {
++				if err := handleRequest(barrier); err != nil {
++					if errors.Is(err, errOwnerReadDeferred) {
++						deferredRead, deferredReadPending = barrier, true
++						continue
++					}
+ 					return owner.stop(err)
+ 				}
+ 			}
+@@ -1280,19 +1244,8 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
+ 				owner.pulse = nil
+ 				continue
+ 			}
+-			for _, group := range owner.groups {
+-				switch err := owner.host.RequestTick(group); err {
+-				case nil:
+-				case multiraft.ErrQueueFull, multiraft.ErrGroupBusy:
+-					// A timer pulse is an offer, not an admitted protocol input.
+-					// Like the bounded upstream pulse channels, omit this offer
+-					// when full or intentionally quiesced/retiring. Never accrue
+-					// catch-up debt or discard a tick/message already in Host.
+-					// Match exact sentinels: a group fault wrapping either error
+-					// remains fatal, as do missing groups and closed runtimes.
+-				default:
+-					return owner.stop(err)
+-				}
++			if err := offerTicks(); err != nil {
++				return owner.stop(err)
+ 			}
+ 		}
+ 	}
+@@ -1596,16 +1549,28 @@ func (owner *Owner) handle(request ownerRequest) error {
+ 		request.read.delivery.minimumApplied = request.read.minimumApplied
+ 		request.read.delivery.generation = member.generation
+ 		request.read.delivery.serving = serving
+-		context, contextErr := owner.nextReadContext(member.identity.NodeIncarnation)
+-		if contextErr != nil {
+-			reply.err = contextErr
+-			break
+-		}
+-		if err := owner.host.ReadIndex(request.group, context[:]); err != nil {
++		delivery := request.read.delivery
++		if !delivery.contextSet {
++			context, contextErr := owner.nextReadContext(member.identity.NodeIncarnation)
++			if contextErr != nil {
++				reply.err = contextErr
++				break
++			}
++			delivery.context = context
++			delivery.contextSet = true
++		}
++		if err := owner.host.ReadIndex(request.group, delivery.context[:]); err != nil {
++			if errors.Is(err, raftmodel.ErrReadyPending) {
++				// The event loop retains this exact request until the Host has
++				// drained the pending Ready. Returning here deliberately bypasses
++				// settlement; replying would turn ordinary async persistence into
++				// a spurious user-visible availability failure.
++				return errors.Join(errOwnerReadDeferred, err)
++			}
+ 			reply.err = err
+ 			break
+ 		}
+-		owner.pendingReads[context] = request.read.delivery
++		owner.pendingReads[delivery.context] = delivery
+ 		// The reply is settled only by the matching quorum barrier.
+ 		return nil
+ 	default:
+@@ -2989,7 +2954,7 @@ func (owner *Owner) reservePendingProposal(bytes int64) error {
+ 	return owner.reservePendingProposalForGroup(raftmember.GroupKey{}, bytes)
+ }
+ 
+-func (owner *Owner) reservePendingProposalForGroup(group raftmember.GroupKey, bytes int64) error {
++func (owner *Owner) reservePendingProposalForGroup(_ raftmember.GroupKey, bytes int64) error {
+ 	if owner == nil || bytes <= 0 || bytes > owner.limits.MaxPendingProposalBytes {
+ 		return ErrPendingProposalsFull
+ 	}
+@@ -3004,10 +2969,6 @@ func (owner *Owner) reservePendingProposalForGroup(group raftmember.GroupKey, by
+ 	}
+ 	owner.pendingProposalItems++
+ 	owner.pendingProposalBytes += bytes
+-	if owner.pendingProposalGroup == nil {
+-		owner.pendingProposalGroup = make(map[raftmember.GroupKey]int)
+-	}
+-	owner.pendingProposalGroup[group]++
+ 	return nil
+ }
+ 
+@@ -3015,14 +2976,10 @@ func (owner *Owner) releasePendingProposal(bytes int64) {
+ 	owner.releasePendingProposalForGroup(raftmember.GroupKey{}, bytes)
+ }
+ 
+-func (owner *Owner) releasePendingProposalForGroup(group raftmember.GroupKey, bytes int64) {
++func (owner *Owner) releasePendingProposalForGroup(_ raftmember.GroupKey, bytes int64) {
+ 	owner.mu.Lock()
+ 	owner.pendingProposalItems--
+ 	owner.pendingProposalBytes -= bytes
+-	owner.pendingProposalGroup[group]--
+-	if owner.pendingProposalGroup[group] == 0 {
+-		delete(owner.pendingProposalGroup, group)
+-	}
+ 	owner.mu.Unlock()
+ }
+ 
+diff --git a/internal/raftservice/owner_test.go b/internal/raftservice/owner_test.go
+index 8a83da18..f4127c42 100644
+--- a/internal/raftservice/owner_test.go
++++ b/internal/raftservice/owner_test.go
+@@ -3,6 +3,7 @@ package raftservice
+ import (
+ 	"context"
+ 	"errors"
++	"sync"
+ 	"testing"
+ 
+ 	"github.com/thesyncim/vibedb/distribution"
+@@ -502,10 +503,7 @@ func TestTransactionRecoveryOwnerRequiresExactDedicatedCapability(t *testing.T)
+ 		ID:   distributedtxn.ID{1}, MinimumApplied: 1, MaxRows: 1,
+ 		MaxBytes: replicatedstate.TransactionRecoverySummaryBytes,
+ 	}}
+-	owner := &Owner{
+-		proposalCohort:       make(map[raftmember.GroupKey]int),
+-		pendingProposalGroup: make(map[raftmember.GroupKey]int),
+-	}
++	owner := &Owner{}
+ 	for _, capability := range []serviceauthz.Capability{
+ 		serviceauthz.CapabilityDataRead,
+ 		serviceauthz.CapabilityDataWrite,
+@@ -776,7 +774,601 @@ func TestOwnerPendingProposalBudgetIsIndependentAndReclaimable(t *testing.T) {
+ 	}
+ }
+ 
+-func TestProposalIngressCollectorBuildsFixedBoundedPipelineWindows(t *testing.T) {
++type proposalPrefixOwnerHost struct {
++	ownerHost
++	firstRunEntered chan struct{}
++	releaseFirstRun chan struct{}
++	queuedAtRun     chan int
++	runs            int
++	queued          int
++	status          raftmember.RuntimeStatus
++}
++
++type deferredReadOwnerHost struct {
++	ownerHost
++	mu                sync.Mutex
++	async             chan struct{}
++	firstRunEntered   chan struct{}
++	releaseFirstRun   chan struct{}
++	secondReadAttempt chan struct{}
++	firstRun          bool
++	readyPending      bool
++	woken             bool
++	readCalls         int
++	readContexts      [][16]byte
++	readContext       []byte
++	status            raftmember.RuntimeStatus
++}
++
++func (host *deferredReadOwnerHost) AsyncNotify() <-chan struct{} { return host.async }
++
++func (host *deferredReadOwnerHost) WakePipelined() {
++	host.mu.Lock()
++	host.woken = true
++	host.mu.Unlock()
++}
++
++func (host *deferredReadOwnerHost) RunOne() (multiraft.Progress, bool, error) {
++	if !host.firstRun {
++		host.firstRun = true
++		close(host.firstRunEntered)
++		<-host.releaseFirstRun
++		return multiraft.Progress{}, false, nil
++	}
++	host.mu.Lock()
++	defer host.mu.Unlock()
++	if host.woken && host.readyPending {
++		host.woken = false
++		host.readyPending = false
++		return multiraft.Progress{Kind: multiraft.ProgressReady,
++			ReadyKind: raftmember.DrivePersisted}, true, nil
++	}
++	if host.woken && len(host.readContext) != 0 {
++		host.woken = false
++		context := append([]byte(nil), host.readContext...)
++		host.readContext = nil
++		return multiraft.Progress{Kind: multiraft.ProgressReady,
++			ReadyKind: raftmember.DriveReadStatesFinished,
++			ReadOutcomes: []raftmodel.ReadOutcome{{Barrier: raftmodel.ReadBarrier{
++				Context: context, Index: host.status.Applied,
++				Term: host.status.Term, Incarnation: 1,
++			}}}}, true, nil
++	}
++	return multiraft.Progress{}, false, nil
++}
++
++func (host *deferredReadOwnerHost) PopOutbound() (raftmember.OutboundMessage, bool) {
++	return raftmember.OutboundMessage{}, false
++}
++
++func (host *deferredReadOwnerHost) Status(raftmember.GroupKey) (raftmember.RuntimeStatus, error) {
++	return host.status, nil
++}
++
++func (host *deferredReadOwnerHost) ReadIndex(_ raftmember.GroupKey, context []byte) error {
++	host.mu.Lock()
++	defer host.mu.Unlock()
++	host.readCalls++
++	var retained [16]byte
++	copy(retained[:], context)
++	host.readContexts = append(host.readContexts, retained)
++	if host.readCalls == 2 {
++		close(host.secondReadAttempt)
++	}
++	if host.readyPending {
++		return raftmodel.ErrReadyPending
++	}
++	host.readContext = append(host.readContext[:0], context...)
++	host.woken = true
++	return nil
++}
++
++func (host *deferredReadOwnerHost) Close() error { return nil }
++
++func newDeferredReadOwnerFixture() (
++	raftmember.GroupKey,
++	CommandFence,
++	*deferredReadOwnerHost,
++	*Owner,
++	*ownerTestReadSource,
++) {
++	group := peerServerTestGroup()
++	identity := raftmember.RuntimeIdentity{Group: group, AllocationGeneration: 1,
++		MemberID: 1, StoreID: [16]byte{1}, NodeIncarnation: 1,
++		RelationManifestDigest: [32]byte{1}}
++	command := CommandFence{ReplicaSetVersion: 1, ActivePolicyGeneration: 1,
++		ProtectionEpoch: 1, OwnershipEpoch: 1, SchemaGeneration: 1,
++		RelationManifestDigest: [32]byte{1}, RoutingVersion: 1, RouteGeneration: 1}
++	host := &deferredReadOwnerHost{
++		async: make(chan struct{}, 1), firstRunEntered: make(chan struct{}),
++		releaseFirstRun: make(chan struct{}), secondReadAttempt: make(chan struct{}),
++		status: raftmember.RuntimeStatus{MemberID: 1, LeaderID: 1, Term: 2,
++			Commit: 7, Applied: 7},
++	}
++	source := &ownerTestReadSource{}
++	owner := &Owner{
++		host: host, groups: []raftmember.GroupKey{group},
++		members: map[raftmember.GroupKey]ownerMember{group: {
++			identity: identity, command: command, generation: &ownerGeneration{}, read: source,
++		}},
++		limits: Limits{MaxIngressItems: 2, MaxIngressBytes: 64,
++			MaxPendingReadItems: 2, MaxPendingReadBytes: 2},
++		ingress: make(chan ownerRequest, 2), ready: make(chan struct{}), done: make(chan struct{}),
++		pendingReads: make(map[[16]byte]*readDelivery),
++	}
++	return group, command, host, owner, source
++}
++
++func deferredLinearizablePointRequest(
++	group raftmember.GroupKey,
++	command CommandFence,
++) LinearizablePointReadRequest {
++	return LinearizablePointReadRequest{
++		Fence: ServingFence{Group: group, AllocationGeneration: 1, Command: command,
++			MemberID: 1, StoreID: [16]byte{1}, NodeIncarnation: 1, Term: 2},
++		Capability: serviceauthz.CapabilityDataRead,
++	}
++}
++
++func TestOwnerDefersLinearizableReadAcrossAsyncReadyBoundary(t *testing.T) {
++	group, command, host, owner, source := newDeferredReadOwnerFixture()
++	ctx, cancel := context.WithCancel(context.Background())
++	runDone := make(chan error, 1)
++	go func() { runDone <- owner.Run(ctx) }()
++	<-owner.ready
++	<-host.firstRunEntered
++
++	host.mu.Lock()
++	host.readyPending = true
++	host.mu.Unlock()
++	result := make(chan error, 1)
++	var cut LinearizablePointReadCut
++	go func() {
++		result <- owner.ReadLinearizablePointInto(context.Background(),
++			deferredLinearizablePointRequest(group, command), &cut)
++	}()
++	close(host.releaseFirstRun)
++	<-host.secondReadAttempt
++	select {
++	case err := <-result:
++		t.Fatalf("read settled before Ready completion: %v", err)
++	default:
++	}
++	owner.mu.Lock()
++	if owner.ingressItems != 1 || owner.pendingReadItems != 1 {
++		t.Fatalf("retained charges ingress=%d reads=%d", owner.ingressItems, owner.pendingReadItems)
++	}
++	owner.mu.Unlock()
++
++	host.async <- struct{}{}
++	if err := <-result; err != nil {
++		t.Fatal(err)
++	}
++	if cut.Source() != source || cut.minimumApplied != 7 {
++		t.Fatalf("cut source=%T applied=%d", cut.Source(), cut.minimumApplied)
++	}
++	host.mu.Lock()
++	if host.readCalls != 3 || host.readyPending || len(host.readContext) != 0 ||
++		len(host.readContexts) != 3 || host.readContexts[0] != host.readContexts[1] ||
++		host.readContexts[1] != host.readContexts[2] || owner.readSequence != 1 {
++		t.Fatalf("read calls=%d ready=%t context=%x attempts=%x sequence=%d",
++			host.readCalls, host.readyPending, host.readContext, host.readContexts, owner.readSequence)
++	}
++	host.mu.Unlock()
++	if err := cut.Close(); err != nil {
++		t.Fatal(err)
++	}
++	owner.mu.Lock()
++	if owner.ingressItems != 0 || owner.pendingReadItems != 0 {
++		t.Fatalf("released charges ingress=%d reads=%d", owner.ingressItems, owner.pendingReadItems)
++	}
++	owner.mu.Unlock()
++	cancel()
++	if err := <-runDone; !errors.Is(err, context.Canceled) {
++		t.Fatalf("owner exit=%v", err)
++	}
++}
++
++func TestOwnerStopSettlesDeferredReadAndReleasesCharges(t *testing.T) {
++	group, command, host, owner, _ := newDeferredReadOwnerFixture()
++	runCtx, stop := context.WithCancel(context.Background())
++	runDone := make(chan error, 1)
++	go func() { runDone <- owner.Run(runCtx) }()
++	<-owner.ready
++	<-host.firstRunEntered
++
++	host.mu.Lock()
++	host.readyPending = true
++	host.mu.Unlock()
++	result := make(chan error, 1)
++	go func() {
++		var cut LinearizablePointReadCut
++		result <- owner.ReadLinearizablePointInto(context.Background(),
++			deferredLinearizablePointRequest(group, command), &cut)
++	}()
++	close(host.releaseFirstRun)
++	<-host.secondReadAttempt
++	stop()
++	if err := <-runDone; !errors.Is(err, context.Canceled) {
++		t.Fatalf("owner exit=%v", err)
++	}
++	if err := <-result; !errors.Is(err, ErrOwnerClosed) || !errors.Is(err, context.Canceled) {
++		t.Fatalf("deferred read exit=%v", err)
++	}
++	owner.mu.Lock()
++	defer owner.mu.Unlock()
++	if owner.ingressItems != 0 || owner.ingressBytes != 0 ||
++		owner.pendingReadItems != 0 || owner.pendingReadBytes != 0 ||
++		len(owner.pendingReads) != 0 {
++		t.Fatalf("retained accounting ingress=%d/%d reads=%d/%d barriers=%d",
++			owner.ingressItems, owner.ingressBytes, owner.pendingReadItems,
++			owner.pendingReadBytes, len(owner.pendingReads))
++	}
++}
++
++type synchronousDeferredReadOwnerHost struct {
++	ownerHost
++	status       raftmember.RuntimeStatus
++	ready        uint8
++	readCalls    int
++	readContexts [][16]byte
++	readContext  [16]byte
++}
++
++func (host *synchronousDeferredReadOwnerHost) RunOne() (multiraft.Progress, bool, error) {
++	switch host.ready {
++	case 1:
++		host.ready = 0
++		return multiraft.Progress{Kind: multiraft.ProgressReady,
++			ReadyKind: raftmember.DrivePersisted}, true, nil
++	case 2:
++		host.ready = 0
++		context := host.readContext
++		return multiraft.Progress{Kind: multiraft.ProgressReady,
++			ReadyKind: raftmember.DriveReadStatesFinished,
++			ReadOutcomes: []raftmodel.ReadOutcome{{Barrier: raftmodel.ReadBarrier{
++				Context: context[:], Index: host.status.Applied,
++				Term: host.status.Term, Incarnation: 1,
++			}}}}, true, nil
++	default:
++		return multiraft.Progress{}, false, nil
++	}
++}
++
++func (host *synchronousDeferredReadOwnerHost) PopOutbound() (raftmember.OutboundMessage, bool) {
++	return raftmember.OutboundMessage{}, false
++}
++
++func (host *synchronousDeferredReadOwnerHost) Status(raftmember.GroupKey) (raftmember.RuntimeStatus, error) {
++	return host.status, nil
++}
++
++func (host *synchronousDeferredReadOwnerHost) ReadIndex(_ raftmember.GroupKey, context []byte) error {
++	host.readCalls++
++	var retained [16]byte
++	copy(retained[:], context)
++	host.readContexts = append(host.readContexts, retained)
++	if host.readCalls == 1 {
++		host.ready = 1
++		return raftmodel.ErrReadyPending
++	}
++	host.readContext = retained
++	host.ready = 2
++	return nil
++}
++
++func (host *synchronousDeferredReadOwnerHost) Close() error { return nil }
++
++func TestOwnerDeferredReadDrainsSynchronousHostWithoutAsyncNotifier(t *testing.T) {
++	group := peerServerTestGroup()
++	identity := raftmember.RuntimeIdentity{Group: group, AllocationGeneration: 1,
++		MemberID: 1, StoreID: [16]byte{1}, NodeIncarnation: 1,
++		RelationManifestDigest: [32]byte{1}}
++	command := CommandFence{ReplicaSetVersion: 1, ActivePolicyGeneration: 1,
++		ProtectionEpoch: 1, OwnershipEpoch: 1, SchemaGeneration: 1,
++		RelationManifestDigest: [32]byte{1}, RoutingVersion: 1, RouteGeneration: 1}
++	host := &synchronousDeferredReadOwnerHost{status: raftmember.RuntimeStatus{
++		MemberID: 1, LeaderID: 1, Term: 2, Commit: 7, Applied: 7,
++	}}
++	source := &ownerTestReadSource{}
++	owner := &Owner{
++		host: host, groups: []raftmember.GroupKey{group},
++		members: map[raftmember.GroupKey]ownerMember{group: {
++			identity: identity, command: command, generation: &ownerGeneration{}, read: source,
++		}},
++		limits: Limits{MaxIngressItems: 1, MaxIngressBytes: 1,
++			MaxPendingReadItems: 1, MaxPendingReadBytes: 1},
++		ingress: make(chan ownerRequest, 1), ready: make(chan struct{}), done: make(chan struct{}),
++		pendingReads: make(map[[16]byte]*readDelivery),
++	}
++	runCtx, stop := context.WithCancel(context.Background())
++	runDone := make(chan error, 1)
++	go func() { runDone <- owner.Run(runCtx) }()
++	<-owner.ready
++	var cut LinearizablePointReadCut
++	if err := owner.ReadLinearizablePointInto(context.Background(),
++		deferredLinearizablePointRequest(group, command), &cut); err != nil {
++		t.Fatal(err)
++	}
++	if cut.Source() != source || cut.minimumApplied != 7 || host.readCalls != 2 ||
++		len(host.readContexts) != 2 || host.readContexts[0] != host.readContexts[1] ||
++		owner.readSequence != 1 {
++		t.Fatalf("cut source=%T applied=%d calls=%d contexts=%x sequence=%d",
++			cut.Source(), cut.minimumApplied, host.readCalls, host.readContexts, owner.readSequence)
++	}
++	if err := cut.Close(); err != nil {
++		t.Fatal(err)
++	}
++	stop()
++	if err := <-runDone; !errors.Is(err, context.Canceled) {
++		t.Fatalf("owner exit=%v", err)
++	}
++}
++
++var errDeferredReadCollectorFlush = errors.New("deferred read collector flush")
++
++type deferredReadCollectorFailureHost struct {
++	ownerHost
++	firstRunEntered chan struct{}
++	releaseFirstRun chan struct{}
++	firstRun        bool
++	status          raftmember.RuntimeStatus
++}
++
++func (host *deferredReadCollectorFailureHost) RunOne() (multiraft.Progress, bool, error) {
++	if !host.firstRun {
++		host.firstRun = true
++		close(host.firstRunEntered)
++		<-host.releaseFirstRun
++	}
++	return multiraft.Progress{}, false, nil
++}
++
++func (host *deferredReadCollectorFailureHost) PopOutbound() (raftmember.OutboundMessage, bool) {
++	return raftmember.OutboundMessage{}, false
++}
++
++func (host *deferredReadCollectorFailureHost) Status(raftmember.GroupKey) (raftmember.RuntimeStatus, error) {
++	return host.status, nil
++}
++
++func (host *deferredReadCollectorFailureHost) ReadIndex(raftmember.GroupKey, []byte) error {
++	return raftmodel.ErrReadyPending
++}
++
++func (host *deferredReadCollectorFailureHost) EnqueueTrackedProposal(
++	raftmember.GroupKey, []byte, multiraft.ProposalToken,
++) error {
++	return errDeferredReadCollectorFlush
++}
++
++func (host *deferredReadCollectorFailureHost) Close() error { return nil }
++
++func TestOwnerCollectorFlushFailureSettlesDetachedDeferredRead(t *testing.T) {
++	registry, err := raftserve.NewRegistry(raftserve.Limits{
++		MaxGroups: 1, MaxOutstandingIdentities: 1,
++		MaxOutstandingAttempts: 1, MaxWaiters: 1,
++		MaxAttemptsPerIdentity:     1,
++		MaxRetainedCompletionBytes: int64(replicatedstate.MaxCompletionEnvelopeBytes),
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer registry.Close()
++	group := peerServerTestGroup()
++	identity := raftmember.RuntimeIdentity{Group: group, AllocationGeneration: 1,
++		MemberID: 1, StoreID: [16]byte{1}, NodeIncarnation: 1,
++		RelationManifestDigest: [32]byte{1}}
++	commandFence := CommandFence{ReplicaSetVersion: 1, ActivePolicyGeneration: 1,
++		ProtectionEpoch: 1, OwnershipEpoch: 1, SchemaGeneration: 1,
++		RelationManifestDigest: [32]byte{1}, RoutingVersion: 1, RouteGeneration: 1}
++	host := &deferredReadCollectorFailureHost{
++		firstRunEntered: make(chan struct{}), releaseFirstRun: make(chan struct{}),
++		status: raftmember.RuntimeStatus{MemberID: 1, LeaderID: 1, Term: 2,
++			Commit: 7, Applied: 7},
++	}
++	owner := &Owner{
++		registry: registry, host: host, groups: []raftmember.GroupKey{group},
++		members: map[raftmember.GroupKey]ownerMember{group: {
++			identity: identity, command: commandFence, generation: &ownerGeneration{},
++			read: &ownerTestReadSource{},
++		}},
++		limits: Limits{MaxIngressItems: 2, MaxIngressBytes: 1 << 20,
++			MaxPendingReadItems: 1, MaxPendingReadBytes: 1},
++		ingress: make(chan ownerRequest, 2), ready: make(chan struct{}), done: make(chan struct{}),
++		pendingReads: make(map[[16]byte]*readDelivery),
++	}
++	runDone := make(chan error, 1)
++	go func() { runDone <- owner.Run(context.Background()) }()
++	<-owner.ready
++	<-host.firstRunEntered
++
++	proposalReply := make(chan ownerReply, 1)
++	proposal := proposalPrefixCommand(t, group, 1)
++	if err := owner.publish(ownerRequest{
++		kind: requestProposal, group: group,
++		fence: ServingFence{Group: group, AllocationGeneration: 1, Command: commandFence,
++			MemberID: 1, StoreID: [16]byte{1}, NodeIncarnation: 1, Term: 2},
++		data: proposal, reply: proposalReply, bytes: int64(len(proposal)),
++		delivery: &proposalDelivery{}, async: true,
++	}); err != nil {
++		t.Fatal(err)
++	}
++	if err := owner.reservePendingRead(1); err != nil {
++		t.Fatal(err)
++	}
++	readDelivery := &readDelivery{reply: make(chan ownerReply, 1)}
++	if err := owner.publish(ownerRequest{
++		kind: requestReadLinear, group: group, reply: readDelivery.reply,
++		read: readRequest{
++			fence:    deferredLinearizablePointRequest(group, commandFence).Fence,
++			delivery: readDelivery,
++		},
++	}); err != nil {
++		owner.releasePendingRead(1)
++		t.Fatal(err)
++	}
++	close(host.releaseFirstRun)
++	if runErr := <-runDone; !errors.Is(runErr, errDeferredReadCollectorFlush) {
++		t.Fatalf("owner exit=%v", runErr)
++	}
++	if reply := <-proposalReply; !errors.Is(reply.err, errDeferredReadCollectorFlush) {
++		t.Fatalf("proposal reply=%v", reply.err)
++	}
++	if reply := <-readDelivery.reply; !errors.Is(reply.err, ErrOwnerClosed) ||
++		!errors.Is(reply.err, errDeferredReadCollectorFlush) {
++		t.Fatalf("read reply=%v", reply.err)
++	}
++	owner.releasePendingRead(1)
++	owner.mu.Lock()
++	defer owner.mu.Unlock()
++	if owner.ingressItems != 0 || owner.ingressBytes != 0 ||
++		owner.pendingReadItems != 0 || owner.pendingReadBytes != 0 ||
++		len(owner.pendingReads) != 0 {
++		t.Fatalf("retained accounting ingress=%d/%d reads=%d/%d barriers=%d",
++			owner.ingressItems, owner.ingressBytes, owner.pendingReadItems,
++			owner.pendingReadBytes, len(owner.pendingReads))
++	}
++}
++
++func (host *proposalPrefixOwnerHost) EnqueueTrackedProposal(
++	raftmember.GroupKey, []byte, multiraft.ProposalToken,
++) error {
++	host.queued++
++	return nil
++}
++
++func (host *proposalPrefixOwnerHost) RunOne() (multiraft.Progress, bool, error) {
++	host.runs++
++	if host.runs == 1 {
++		close(host.firstRunEntered)
++		<-host.releaseFirstRun
++	} else if host.runs == 2 {
++		host.queuedAtRun <- host.queued
++	}
++	return multiraft.Progress{}, false, nil
++}
++
++func (host *proposalPrefixOwnerHost) PopOutbound() (raftmember.OutboundMessage, bool) {
++	return raftmember.OutboundMessage{}, false
++}
++
++func (host *proposalPrefixOwnerHost) Status(raftmember.GroupKey) (raftmember.RuntimeStatus, error) {
++	return host.status, nil
++}
++
++func (host *proposalPrefixOwnerHost) Close() error { return nil }
++
++func proposalPrefixCommand(t *testing.T, group raftmember.GroupKey, sequence uint64) []byte {
++	t.Helper()
++	command := replication.Command{
++		Kind:                   replication.CommandMutationBatch,
++		ClusterID:              replication.ID128(group.ClusterID),
++		ClusterIncarnation:     replication.ID128(group.ClusterIncarnation),
++		TopologyRecoveryEpoch:  group.TopologyRecoveryEpoch,
++		Distribution:           "docs",
++		Shard:                  "0000-ffff",
++		AllocationGeneration:   1,
++		ShardIncarnation:       replication.ID128(group.ShardIncarnation),
++		GroupID:                replication.ID128(group.GroupID),
++		ReplicaSetVersion:      1,
++		ActivePolicyGeneration: 1,
++		ProtectionEpoch:        1,
++		OwnershipEpoch:         1,
++		SchemaGeneration:       1,
++		RoutingVersion:         1,
++		RouteGeneration:        1,
++		Tenant:                 []byte("tenant"),
++		ClientID:               replication.ID128{1},
++		ClientEpoch:            1,
++		ClientSequence:         sequence,
++		Fingerprint:            replication.Digest{byte(sequence)},
++		Batches: []replication.RelationMutationBatch{{
++			Relation: 1,
++			Mutations: []replication.Mutation{{
++				Kind: replication.MutationPut, Key: []byte{byte(sequence)}, Value: []byte("v"),
++			}},
++		}},
++	}
++	data, err := replication.AppendCommand(nil, command)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return data
++}
++
++func TestOwnerQueuesSameGroupPrefixBeforeNextHostRunOne(t *testing.T) {
++	registry, err := raftserve.NewRegistry(raftserve.Limits{
++		MaxGroups: 1, MaxOutstandingIdentities: 2,
++		MaxOutstandingAttempts: 2, MaxWaiters: 2,
++		MaxAttemptsPerIdentity:     1,
++		MaxRetainedCompletionBytes: 2 * int64(replicatedstate.MaxCompletionEnvelopeBytes),
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer registry.Close()
++
++	group := peerServerTestGroup()
++	identity := raftmember.RuntimeIdentity{Group: group, AllocationGeneration: 1,
++		MemberID: 1, StoreID: [16]byte{1}, NodeIncarnation: 1,
++		RelationManifestDigest: [32]byte{1}}
++	command := CommandFence{ReplicaSetVersion: 1, ActivePolicyGeneration: 1,
++		ProtectionEpoch: 1, OwnershipEpoch: 1, SchemaGeneration: 1,
++		RelationManifestDigest: [32]byte{1}, RoutingVersion: 1, RouteGeneration: 1}
++	host := &proposalPrefixOwnerHost{
++		firstRunEntered: make(chan struct{}), releaseFirstRun: make(chan struct{}),
++		queuedAtRun: make(chan int, 1),
++		status:      raftmember.RuntimeStatus{MemberID: 1, LeaderID: 1, Term: 2},
++	}
++	owner := &Owner{
++		registry: registry, host: host, groups: []raftmember.GroupKey{group},
++		members: map[raftmember.GroupKey]ownerMember{group: {
++			identity: identity, command: command, generation: &ownerGeneration{},
++		}},
++		limits:  Limits{MaxIngressItems: 4, MaxIngressBytes: 1 << 20},
++		ingress: make(chan ownerRequest, 4), ready: make(chan struct{}), done: make(chan struct{}),
++		pendingReads: make(map[[16]byte]*readDelivery),
++	}
++	ctx, cancel := context.WithCancel(context.Background())
++	runDone := make(chan error, 1)
++	go func() { runDone <- owner.Run(ctx) }()
++	<-owner.ready
++	<-host.firstRunEntered
++
++	replies := [2]chan ownerReply{make(chan ownerReply, 1), make(chan ownerReply, 1)}
++	for index := range replies {
++		data := proposalPrefixCommand(t, group, uint64(index+1))
++		if err := owner.publish(ownerRequest{
++			kind: requestProposal, group: group,
++			fence: ServingFence{Group: group, AllocationGeneration: 1, Command: command,
++				MemberID: 1, StoreID: [16]byte{1}, NodeIncarnation: 1, Term: 2},
++			data: data, reply: replies[index], bytes: int64(len(data)), delivery: &proposalDelivery{},
++		}); err != nil {
++			t.Fatal(err)
++		}
++	}
++	close(host.releaseFirstRun)
++	if queued := <-host.queuedAtRun; queued != len(replies) {
++		t.Fatalf("Host.RunOne saw %d queued proposals, want %d", queued, len(replies))
++	}
++	for _, reply := range replies {
++		result := <-reply
++		if result.err != nil {
++			t.Fatal(result.err)
++		}
++		result.waiter.Cancel()
++	}
++	cancel()
++	if err := <-runDone; !errors.Is(err, context.Canceled) {
++		t.Fatalf("owner shutdown=%v", err)
++	}
++	if owner.ingressItems != 0 || owner.ingressBytes != 0 {
++		t.Fatalf("ingress accounting after shutdown=%d/%d", owner.ingressItems, owner.ingressBytes)
++	}
++}
++
++func TestProposalIngressCollectorDrainsAlreadyQueuedSameGroupPrefix(t *testing.T) {
+ 	group := peerServerTestGroup()
+ 	request := func(sequence byte) ownerRequest {
+ 		return ownerRequest{
+@@ -784,21 +1376,21 @@ func TestProposalIngressCollectorBuildsFixedBoundedPipelineWindows(t *testing.T)
+ 			reply: make(chan ownerReply, 1), bytes: 1,
+ 		}
+ 	}
+-	owner := &Owner{
+-		proposalCohort:       make(map[raftmember.GroupKey]int),
+-		pendingProposalGroup: make(map[raftmember.GroupKey]int),
+-	}
+ 	collector := newProposalIngressCollector(4)
+-	collector.start(owner, request(1))
+-	if !collector.active() || collector.bytes != 1 || collector.known || collector.full() {
++	collector.start(request(1))
++	if !collector.active() || collector.bytes != 1 || collector.full() {
+ 		t.Fatalf("initial collector=%+v", collector)
+ 	}
++	queue := make(chan ownerRequest, 4)
+ 	for sequence := byte(2); sequence <= 4; sequence++ {
+-		next := request(sequence)
+-		if !collector.accepts(next) {
+-			t.Fatalf("collector refused same-group request %d", sequence)
+-		}
+-		collector.append(next)
++		queue <- request(sequence)
++	}
++	barrier, present, err := collector.drain(queue, func(ownerRequest) error {
++		t.Fatal("same-group prefix invoked independent handler")
++		return nil
++	})
++	if err != nil || present || barrier.kind != 0 || barrier.data != nil {
++		t.Fatalf("drain barrier=%+v present=%t err=%v", barrier, present, err)
+ 	}
+ 	if !collector.full() || len(collector.requests) != 4 || collector.bytes != 4 {
+ 		t.Fatalf("full collector=%+v", collector)
+@@ -809,35 +1401,62 @@ func TestProposalIngressCollectorBuildsFixedBoundedPipelineWindows(t *testing.T)
+ 		t.Fatal("collector accepted a cross-group proposal")
+ 	}
+ 	collector.reset()
+-
+-	collector.start(owner, request(7))
+-	if !collector.expire(owner) || owner.proposalCohort[group] != 1 {
+-		t.Fatalf("partial window did not expire: %+v", collector)
+-	}
+-	collector.reset()
+ }
+ 
+ func TestProposalIngressSingletonHasNoArtificialTimer(t *testing.T) {
+ 	group := peerServerTestGroup()
+-	owner := &Owner{pendingProposalGroup: map[raftmember.GroupKey]int{group: 1}}
+ 	collector := newProposalIngressCollector(16)
+ 	defer collector.reset()
+ 	request := ownerRequest{kind: requestProposal, group: group, data: []byte{1}}
+-	collector.start(owner, request)
+-	if collector.known || collector.timerC != nil {
+-		t.Fatal("lone proposal waits for an imaginary cohort")
+-	}
+-	collector.observe(owner)
+-	collector.reset()
+-	owner.pendingProposalGroup[group] = 8
+-	collector.start(owner, request)
+-	if !collector.known || collector.target != 8 || collector.timerC == nil {
+-		t.Fatal("lost concurrent durability batching")
++	collector.start(request)
++	queue := make(chan ownerRequest)
++	barrier, present, err := collector.drain(queue, func(ownerRequest) error { return nil })
++	if err != nil || present || barrier.kind != 0 || barrier.data != nil || len(collector.requests) != 1 {
++		t.Fatalf("singleton drain barrier=%+v present=%t err=%v collector=%+v",
++			barrier, present, err, collector)
+ 	}
+-	for i := 1; i < 8; i++ {
+-		collector.append(request)
++}
++
++func TestProposalIngressCollectorPreservesIndependentLanesAndOrderingBarrier(t *testing.T) {
++	group := peerServerTestGroup()
++	proposal := func(group raftmember.GroupKey, sequence byte) ownerRequest {
++		return ownerRequest{kind: requestProposal, group: group, data: []byte{sequence}}
++	}
++	collector := newProposalIngressCollector(8)
++	collector.start(proposal(group, 1))
++	queue := make(chan ownerRequest, 4)
++	queue <- ownerRequest{kind: requestReadLinear}
++	queue <- ownerRequest{kind: requestInbound}
++	queue <- proposal(group, 2)
++	other := group
++	other.GroupID[0] ^= 0xff
++	queue <- proposal(other, 3)
++	independent := make([]requestKind, 0, 2)
++	barrier, present, err := collector.drain(queue, func(request ownerRequest) error {
++		independent = append(independent, request.kind)
++		return nil
++	})
++	if err != nil || !present || barrier.group != other ||
++		len(collector.requests) != 2 || len(independent) != 2 ||
++		independent[0] != requestReadLinear || independent[1] != requestInbound {
++		t.Fatalf("collector=%+v independent=%v barrier=%+v present=%t err=%v",
++			collector, independent, barrier, present, err)
+ 	}
+-	if !collector.full() {
+-		t.Fatal("complete cohort still waiting")
++}
++
++func TestProposalIngressCollectorSplitsAtExactByteBound(t *testing.T) {
++	group := peerServerTestGroup()
++	collector := newProposalIngressCollector(4)
++	first := ownerRequest{kind: requestProposal, group: group,
++		data: make([]byte, raftmodel.MaxProposalBatchBytes-1)}
++	collector.start(first)
++	queue := make(chan ownerRequest, 1)
++	next := ownerRequest{kind: requestProposal, group: group, data: []byte{1, 2}}
++	queue <- next
++	barrier, present, err := collector.drain(queue, func(ownerRequest) error { return nil })
++	if err != nil || !present || len(barrier.data) != len(next.data) ||
++		len(collector.requests) != 1 || collector.bytes != raftmodel.MaxProposalBatchBytes-1 {
++		t.Fatalf("collector=%+v barrier bytes=%d present=%t err=%v",
++			collector, len(barrier.data), present, err)
+ 	}
+ }
+diff --git a/internal/raftstore/node_sequencer.go b/internal/raftstore/node_sequencer.go
+index e9d4a105..7dec4066 100644
+--- a/internal/raftstore/node_sequencer.go
++++ b/internal/raftstore/node_sequencer.go
+@@ -6,6 +6,7 @@ import (
+ 	"sync/atomic"
+ 	"time"
+ 
++	"github.com/thesyncim/vibedb/internal/raftmodel"
+ 	pb "go.etcd.io/raft/v3/raftpb"
+ )
+ 
+@@ -41,7 +42,13 @@ const (
+ // values reachable through it remain immutable from successful TrySubmit until
+ // Poll or Wait reports completion.
+ type Submission struct {
+-	Ready        NodeReady
++	Ready NodeReady
++	// readySeries is fixed caller-owned storage. PrepareReadySeries copies
++	// descriptors here and leaves their reachable protobuf values borrowed until
++	// completion, matching the ordinary Prepare ownership contract.
++	readySeries  [MaxReadySeries]raftmodel.PersistBatch
++	seriesGroup  uint64
++	seriesCount  uint8
+ 	kind         submissionKind
+ 	count        uint8
+ 	groups       [MaxPersistGroupBatches]uint64
+@@ -79,14 +86,18 @@ func (s *Submission) Prepare(ready NodeReady) error {
+ 	if state := s.state.Load(); state == submissionQueued || state == submissionWaiting {
+ 		return ErrSubmissionPending
+ 	}
+-	s.Ready, s.err, s.kind, s.count, s.catalog, s.snapshot = ready, nil, submissionReady, 0, descriptorCatalogCandidate{}, nil
++	clear(s.readySeries[:])
++	s.Ready, s.seriesGroup, s.seriesCount = ready, 0, 0
++	s.err, s.kind, s.count, s.catalog, s.snapshot = nil, submissionReady, 0, descriptorCatalogCandidate{}, nil
+ 	s.ticket.Store(0)
+ 	s.state.Store(submissionIdle)
+ 	return nil
+ }
+ 
+ func (s *Submission) invalidatePrepare() {
+-	s.Ready, s.err, s.kind, s.count, s.catalog, s.snapshot = NodeReady{}, nil, 0, 0, descriptorCatalogCandidate{}, nil
++	clear(s.readySeries[:])
++	s.Ready, s.seriesGroup, s.seriesCount = NodeReady{}, 0, 0
++	s.err, s.kind, s.count, s.catalog, s.snapshot = nil, 0, 0, descriptorCatalogCandidate{}, nil
+ 	s.ticket.Store(0)
+ 	s.state.Store(submissionUnprepared)
+ }
+@@ -102,12 +113,80 @@ func (s *Submission) prepareControl(kind submissionKind, count int) error {
+ 		s.invalidatePrepare()
+ 		return ErrInvalid
+ 	}
+-	s.Ready, s.err, s.kind, s.count, s.catalog, s.snapshot = NodeReady{}, nil, kind, uint8(count), descriptorCatalogCandidate{}, nil
++	clear(s.readySeries[:])
++	s.Ready, s.seriesGroup, s.seriesCount = NodeReady{}, 0, 0
++	s.err, s.kind, s.count, s.catalog, s.snapshot = nil, kind, uint8(count), descriptorCatalogCandidate{}, nil
+ 	s.ticket.Store(0)
+ 	s.state.Store(submissionIdle)
+ 	return nil
+ }
+ 
++// PrepareReadySeries copies a same-group series' fixed PersistBatch
++// descriptors into this caller-owned submission. The pointed-to Entries,
++// HardState and Snapshot values remain borrowed until completion. Unsupported
++// multi-Ready snapshots are rejected before a ticket can be published; callers
++// can submit those values as ordinary singleton Readies.
++func (s *Submission) PrepareReadySeries(group uint64, batches []raftmodel.PersistBatch) error {
++	if s == nil || s.done == nil {
++		return ErrInvalid
++	}
++	if state := s.state.Load(); state == submissionQueued || state == submissionWaiting {
++		return ErrSubmissionPending
++	}
++	if err := validateReadySeriesDescriptors(group, batches); err != nil {
++		s.invalidatePrepare()
++		return err
++	}
++	clear(s.readySeries[:])
++	copy(s.readySeries[:], batches)
++	// Keep the first logical Ready visible through the long-standing Ready
++	// field for callers which inspect a completed Submission; the fixed series
++	// storage is the authoritative value consumed by the worker.
++	s.Ready, s.err, s.kind, s.count = NodeReady{GroupID: group, Batch: batches[0]}, nil, submissionReady, 0
++	s.seriesGroup, s.seriesCount = group, uint8(len(batches))
++	s.catalog, s.snapshot = descriptorCatalogCandidate{}, nil
++	s.ticket.Store(0)
++	s.state.Store(submissionIdle)
++	return nil
++}
++
++// ReadySeriesLen reports the number of logical Readies represented by this
++// submission. Ordinary Prepare submissions report one.
++func (s *Submission) ReadySeriesLen() int {
++	if s == nil || s.kind != submissionReady {
++		return 0
++	}
++	if s.seriesCount == 0 {
++		return 1
++	}
++	return int(s.seriesCount)
++}
++
++// nodeReady returns the immutable value published to the sequencer ring. A
++// series copies its fixed descriptor array into the NodeReady envelope; the
++// pointed-to protobuf values remain borrowed under the Submission ownership
++// contract. It is called before publication by producers and after dequeue by
++// the single worker, never while a caller may prepare the cell.
++func (s *Submission) nodeReady() NodeReady {
++	if s == nil || s.seriesCount == 0 {
++		if s == nil {
++			return NodeReady{}
++		}
++		return s.Ready
++	}
++	return NodeReady{GroupID: s.seriesGroup, series: s.readySeries, seriesCount: s.seriesCount}
++}
++
++func (s *Submission) nodeReadyGroup() uint64 {
++	if s == nil {
++		return 0
++	}
++	if s.seriesCount != 0 {
++		return s.seriesGroup
++	}
++	return s.Ready.GroupID
++}
++
+ // PrepareBeginIncarnations copies caller-sorted dense log keys into fixed
+ // caller-owned Submission storage. Results are available through Incarnations
+ // after completion and remain valid until the next Prepare call.
+@@ -284,21 +363,34 @@ type submissionRingSlot struct {
+ // post-sync failures contribute no append count. These are lower-bound
+ // observations, not total device sync counts or unknown-outcome resolution.
+ type NodeSubmissionSequencerStats struct {
+-	SubmissionAttempts            uint64
+-	AcceptedSubmissions           uint64
+-	RejectedSubmissions           uint64
+-	BackpressureSubmissions       uint64
+-	ReadySubmissions              uint64
+-	ControlSubmissions            uint64
+-	ReadyQueueWaitNanos           uint64
+-	ControlQueueWaitNanos         uint64
+-	ReadyWavesAttempted           uint64
+-	ReadyPersistAttempts          uint64
+-	ReadyWavesSucceeded           uint64
+-	ReadyWavesFailed              uint64
+-	ReadyPersistSuccesses         uint64
+-	ReadyPersistFailures          uint64
+-	ReadyDurableWaves             uint64
++	SubmissionAttempts      uint64
++	AcceptedSubmissions     uint64
++	RejectedSubmissions     uint64
++	BackpressureSubmissions uint64
++	ReadySubmissions        uint64
++	ControlSubmissions      uint64
++	ReadyQueueWaitNanos     uint64
++	ControlQueueWaitNanos   uint64
++	ReadyWavesAttempted     uint64
++	ReadyPersistAttempts    uint64
++	ReadyWavesSucceeded     uint64
++	ReadyWavesFailed        uint64
++	ReadyPersistSuccesses   uint64
++	ReadyPersistFailures    uint64
++	ReadyDurableWaves       uint64
++	// ReadyLogicalBatches counts constituent logical Readies accepted by the
++	// lane, while ReadySeriesSubmissions counts their physical submission
++	// envelopes. A singleton ordinary Ready is one series of length one.
++	ReadyLogicalBatches             uint64
++	ReadySeriesSubmissions          uint64
++	ReadySingletonSeriesSubmissions uint64
++	ReadyMultiSeriesSubmissions     uint64
++	ReadySeriesHistogram            [MaxReadySeries + 1]uint64
++	// ReadyDurableLogicalBatches advances only when the engine append witness
++	// proves that the corresponding physical wave reached the log.
++	ReadyDurableLogicalBatches    uint64
++	ReadyDurableSeriesSubmissions uint64
++	ReadyDurableSeriesHistogram   [MaxReadySeries + 1]uint64
+ 	FailedWaves                   uint64
+ 	ControlWavesAttempted         uint64
+ 	ControlPersistAttempts        uint64
+@@ -330,41 +422,49 @@ type NodeSubmissionSequencerStats struct {
+ // atomic values are copied. It also keeps the hot producer and worker paths
+ // allocation-free while Stats loads a detached value.
+ type nodeSequencerCounters struct {
+-	submissionAttempts            atomic.Uint64
+-	acceptedSubmissions           atomic.Uint64
+-	rejectedSubmissions           atomic.Uint64
+-	backpressureSubmissions       atomic.Uint64
+-	readySubmissions              atomic.Uint64
+-	controlSubmissions            atomic.Uint64
+-	readyQueueWaitNanos           atomic.Uint64
+-	controlQueueWaitNanos         atomic.Uint64
+-	readyWavesAttempted           atomic.Uint64
+-	readyPersistAttempts          atomic.Uint64
+-	readyWavesSucceeded           atomic.Uint64
+-	readyWavesFailed              atomic.Uint64
+-	readyPersistSuccesses         atomic.Uint64
+-	readyPersistFailures          atomic.Uint64
+-	readyDurableWaves             atomic.Uint64
+-	failedWaves                   atomic.Uint64
+-	controlWavesAttempted         atomic.Uint64
+-	controlPersistAttempts        atomic.Uint64
+-	controlWavesSucceeded         atomic.Uint64
+-	controlWavesFailed            atomic.Uint64
+-	controlPersistSuccesses       atomic.Uint64
+-	controlPersistFailures        atomic.Uint64
+-	observedAppendBarriers        atomic.Uint64
+-	readyObservedAppendBarriers   atomic.Uint64
+-	controlObservedAppendBarriers atomic.Uint64
+-	readyPersistDurationNanos     atomic.Uint64
+-	controlPersistDurationNanos   atomic.Uint64
+-	readyWaveDurationNanos        atomic.Uint64
+-	controlWaveDurationNanos      atomic.Uint64
+-	readyWaveGroupHistogram       [MaxPersistGroupBatches + 1]atomic.Uint64
+-	multiGroupWaves               atomic.Uint64
+-	checkpointQueueSubmissions    atomic.Uint64
+-	checkpointQueueRejected       atomic.Uint64
+-	checkpointQueueWaitNanos      atomic.Uint64
+-	checkpointServiceNanos        atomic.Uint64
++	submissionAttempts              atomic.Uint64
++	acceptedSubmissions             atomic.Uint64
++	rejectedSubmissions             atomic.Uint64
++	backpressureSubmissions         atomic.Uint64
++	readySubmissions                atomic.Uint64
++	controlSubmissions              atomic.Uint64
++	readyQueueWaitNanos             atomic.Uint64
++	controlQueueWaitNanos           atomic.Uint64
++	readyWavesAttempted             atomic.Uint64
++	readyPersistAttempts            atomic.Uint64
++	readyWavesSucceeded             atomic.Uint64
++	readyWavesFailed                atomic.Uint64
++	readyPersistSuccesses           atomic.Uint64
++	readyPersistFailures            atomic.Uint64
++	readyDurableWaves               atomic.Uint64
++	readyLogicalBatches             atomic.Uint64
++	readySeriesSubmissions          atomic.Uint64
++	readySingletonSeriesSubmissions atomic.Uint64
++	readyMultiSeriesSubmissions     atomic.Uint64
++	readySeriesHistogram            [MaxReadySeries + 1]atomic.Uint64
++	readyDurableLogicalBatches      atomic.Uint64
++	readyDurableSeriesSubmissions   atomic.Uint64
++	readyDurableSeriesHistogram     [MaxReadySeries + 1]atomic.Uint64
++	failedWaves                     atomic.Uint64
++	controlWavesAttempted           atomic.Uint64
++	controlPersistAttempts          atomic.Uint64
++	controlWavesSucceeded           atomic.Uint64
++	controlWavesFailed              atomic.Uint64
++	controlPersistSuccesses         atomic.Uint64
++	controlPersistFailures          atomic.Uint64
++	observedAppendBarriers          atomic.Uint64
++	readyObservedAppendBarriers     atomic.Uint64
++	controlObservedAppendBarriers   atomic.Uint64
++	readyPersistDurationNanos       atomic.Uint64
++	controlPersistDurationNanos     atomic.Uint64
++	readyWaveDurationNanos          atomic.Uint64
++	controlWaveDurationNanos        atomic.Uint64
++	readyWaveGroupHistogram         [MaxPersistGroupBatches + 1]atomic.Uint64
++	multiGroupWaves                 atomic.Uint64
++	checkpointQueueSubmissions      atomic.Uint64
++	checkpointQueueRejected         atomic.Uint64
++	checkpointQueueWaitNanos        atomic.Uint64
++	checkpointServiceNanos          atomic.Uint64
+ }
+ 
+ // Stats returns a detached diagnostics snapshot without acquiring the node
+@@ -391,6 +491,16 @@ func (q *NodeSubmissionSequencer) Stats() NodeSubmissionSequencerStats {
+ 	result.ReadyPersistSuccesses = c.readyPersistSuccesses.Load()
+ 	result.ReadyPersistFailures = c.readyPersistFailures.Load()
+ 	result.ReadyDurableWaves = c.readyDurableWaves.Load()
++	result.ReadyLogicalBatches = c.readyLogicalBatches.Load()
++	result.ReadySeriesSubmissions = c.readySeriesSubmissions.Load()
++	result.ReadySingletonSeriesSubmissions = c.readySingletonSeriesSubmissions.Load()
++	result.ReadyMultiSeriesSubmissions = c.readyMultiSeriesSubmissions.Load()
++	for i := range result.ReadySeriesHistogram {
++		result.ReadySeriesHistogram[i] = c.readySeriesHistogram[i].Load()
++		result.ReadyDurableSeriesHistogram[i] = c.readyDurableSeriesHistogram[i].Load()
++	}
++	result.ReadyDurableLogicalBatches = c.readyDurableLogicalBatches.Load()
++	result.ReadyDurableSeriesSubmissions = c.readyDurableSeriesSubmissions.Load()
+ 	result.FailedWaves = c.failedWaves.Load()
+ 	result.ControlWavesAttempted = c.controlWavesAttempted.Load()
+ 	result.ControlPersistAttempts = c.controlPersistAttempts.Load()
+@@ -519,32 +629,54 @@ func (s *NodeStore) readyWaveAdmission(ready NodeReady) (nodeWaveAdmission, erro
+ 	if s == nil || s.bounds.maxWaveBytes == 0 {
+ 		return nodeWaveAdmission{}, nil
+ 	}
+-	batch := ready.Batch
+-	if ready.GroupID == 0 || batch.NodeIncarnation == 0 || batch.ReadyID == 0 ||
+-		uint64(len(batch.Entries)) > s.bounds.maxEntriesPerGroup {
++	count := nodeReadySeriesCount(ready)
++	if ready.GroupID == 0 || count < 1 || count > MaxReadySeries {
+ 		return nodeWaveAdmission{}, ErrBounds
+ 	}
+-	plainBytes, nonemptyEntries := 0, 0
+-	for _, entry := range batch.Entries {
+-		if entry == nil || !addAdmissionInt(&plainBytes, len(entry.GetData())) {
++	var batches [MaxReadySeries]raftmodel.PersistBatch
++	if ready.seriesCount == 0 {
++		batches[0] = ready.Batch
++	} else {
++		if err := validateReadySeriesDescriptors(ready.GroupID, ready.series[:count]); err != nil {
++			return nodeWaveAdmission{}, err
++		}
++		copy(batches[:count], ready.series[:count])
++	}
++	plainBytes, nonemptyEntries, totalEntries, readyBytes := 0, 0, 0, 0
++	for index := 0; index < count; index++ {
++		batch := batches[index]
++		if batch.NodeIncarnation == 0 || batch.ReadyID == 0 {
++			return nodeWaveAdmission{}, ErrInvalid
++		}
++		if uint64(len(batch.Entries)) > s.bounds.maxEntriesPerGroup ||
++			totalEntries > int(s.bounds.maxEntriesPerGroup)-len(batch.Entries) {
+ 			return nodeWaveAdmission{}, ErrBounds
+ 		}
+-		if len(entry.GetData()) != 0 {
+-			nonemptyEntries++
++		totalEntries += len(batch.Entries)
++		for _, entry := range batch.Entries {
++			if entry == nil || !addAdmissionInt(&plainBytes, len(entry.GetData())) {
++				return nodeWaveAdmission{}, ErrBounds
++			}
++			if len(entry.GetData()) != 0 {
++				nonemptyEntries++
++			}
+ 		}
+-	}
+-	readyBytes, err := readyPayloadSize(batch)
+-	if err != nil {
+-		return nodeWaveAdmission{}, err
+-	}
+-	if !canonicalEmptySnapshot(batch.Snapshot) {
+-		snapshotBytes, snapshotErr := snapshotPayloadSize(batch.Snapshot)
+-		if snapshotErr != nil || !addAdmissionInt(&readyBytes, snapshotBytes) {
+-			if snapshotErr != nil {
+-				return nodeWaveAdmission{}, snapshotErr
++		payloadBytes, err := readyPayloadSize(batch)
++		if err != nil || !addAdmissionInt(&readyBytes, payloadBytes) {
++			if err != nil {
++				return nodeWaveAdmission{}, err
+ 			}
+ 			return nodeWaveAdmission{}, ErrBounds
+ 		}
++		if !canonicalEmptySnapshot(batch.Snapshot) {
++			snapshotBytes, snapshotErr := snapshotPayloadSize(batch.Snapshot)
++			if snapshotErr != nil || !addAdmissionInt(&readyBytes, snapshotBytes) {
++				if snapshotErr != nil {
++					return nodeWaveAdmission{}, snapshotErr
++				}
++				return nodeWaveAdmission{}, ErrBounds
++			}
++		}
+ 	}
+ 	if uint64(readyBytes) > s.bounds.maxWaveBytes {
+ 		return nodeWaveAdmission{}, ErrBounds
+@@ -552,18 +684,23 @@ func (s *NodeStore) readyWaveAdmission(ready NodeReady) (nodeWaveAdmission, erro
+ 
+ 	// 92 covers the fixed wave header and both count varints. 169 covers the
+ 	// worst batch descriptor (identity, replacement, checkpoint, HardState and
+-	// counts). Each entry then has at most eight uint64 varints in blob form.
+-	// AEAD contributes one 16-byte tag per nonempty entry in the worst packing.
++	// counts). A series identity adds a versioned span and one ReadyID/digest
++	// pair per constituent; charge a fixed 32 bytes per constituent so the
++	// admission remains conservative without encoding or allocating. Each entry
++	// then has at most eight uint64 varints in blob form. AEAD contributes one
++	// 16-byte tag per nonempty entry in the worst packing.
+ 	frameBytes := 92 + 169
+-	if len(batch.Entries) > (int(^uint(0)>>1)-frameBytes)/80 ||
+-		!addAdmissionInt(&frameBytes, len(batch.Entries)*80) ||
++	if count > (int(^uint(0)>>1)-frameBytes)/32 ||
++		!addAdmissionInt(&frameBytes, count*32) ||
++		totalEntries > (int(^uint(0)>>1)-frameBytes)/80 ||
++		!addAdmissionInt(&frameBytes, totalEntries*80) ||
+ 		!addAdmissionInt(&frameBytes, plainBytes) ||
+ 		nonemptyEntries > (int(^uint(0)>>1)-frameBytes)/16 ||
+ 		!addAdmissionInt(&frameBytes, nonemptyEntries*16) {
+ 		return nodeWaveAdmission{}, ErrBounds
+ 	}
+ 	events := 6
+-	if !addAdmissionInt(&events, len(batch.Entries)) ||
++	if !addAdmissionInt(&events, totalEntries) ||
+ 		uint64(frameBytes) > s.bounds.maxWaveBytes ||
+ 		uint64(events) > s.bounds.maxSegmentEvents {
+ 		return nodeWaveAdmission{}, ErrBounds
+@@ -826,7 +963,7 @@ func (q *NodeSubmissionSequencer) TrySubmit(submission *Submission) (uint64, err
+ 		return q.rejectSubmission(ErrInvalid)
+ 	}
+ 	if submission.kind == submissionReady {
+-		if _, err := q.store.readyWaveAdmission(submission.Ready); err != nil {
++		if _, err := q.store.readyWaveAdmission(submission.nodeReady()); err != nil {
+ 			return q.rejectSubmission(err)
+ 		}
+ 	}
+@@ -856,6 +993,17 @@ func (q *NodeSubmissionSequencer) TrySubmit(submission *Submission) (uint64, err
+ 			q.stats.acceptedSubmissions.Add(1)
+ 			if submission.kind == submissionReady {
+ 				q.stats.readySubmissions.Add(1)
++				seriesLength := submission.ReadySeriesLen()
++				q.stats.readySeriesSubmissions.Add(1)
++				q.stats.readyLogicalBatches.Add(uint64(seriesLength))
++				if seriesLength == 1 {
++					q.stats.readySingletonSeriesSubmissions.Add(1)
++				} else if seriesLength > 1 {
++					q.stats.readyMultiSeriesSubmissions.Add(1)
++				}
++				if seriesLength >= 1 && seriesLength <= MaxReadySeries {
++					q.stats.readySeriesHistogram[seriesLength].Add(1)
++				}
+ 			} else {
+ 				q.stats.controlSubmissions.Add(1)
+ 			}
+@@ -894,7 +1042,7 @@ func (q *NodeSubmissionSequencer) pop() *Submission {
+ 
+ func submissionGroupSeen(items *[MaxPersistGroupBatches]*Submission, count int, group uint64) bool {
+ 	for i := 0; i < count; i++ {
+-		if items[i].Ready.GroupID == group {
++		if items[i].nodeReadyGroup() == group {
+ 			return true
+ 		}
+ 	}
+@@ -926,7 +1074,7 @@ func (q *NodeSubmissionSequencer) runWave(items *[MaxPersistGroupBatches]*Submis
+ 		return q.observeControlPersist(items[0])
+ 	}
+ 	for i := 0; i < count; i++ {
+-		value := items[i].Ready
++		value := items[i].nodeReady()
+ 		at := i
+ 		for at > 0 && ready[at-1].GroupID > value.GroupID {
+ 			ready[at] = ready[at-1]
+@@ -985,6 +1133,23 @@ func (q *NodeSubmissionSequencer) observeWaveResult(items *[MaxPersistGroupBatch
+ 		}
+ 		if engineDelta != 0 {
+ 			q.stats.readyDurableWaves.Add(engineDelta)
++			// One runWave call submits one physical frame. Attribute every logical
++			// Ready only when its appended group count proves that no outer item was
++			// an earlier exact retry. Mixed retry/new waves remain a lower bound
++			// because the scalar witness does not identify the appended items.
++			if engineDelta == 1 && appendedGroups == count {
++				logical := uint64(0)
++				for index := 0; index < count; index++ {
++					seriesLength := items[index].ReadySeriesLen()
++					if seriesLength < 1 || seriesLength > MaxReadySeries {
++						continue
++					}
++					logical += uint64(seriesLength)
++					q.stats.readyDurableSeriesSubmissions.Add(1)
++					q.stats.readyDurableSeriesHistogram[seriesLength].Add(1)
++				}
++				q.stats.readyDurableLogicalBatches.Add(logical)
++			}
+ 			// A production Ready wave appends at most one frame. If a test
+ 			// persistence adapter appends more, the final witness cannot tell
+ 			// us the earlier frames' group counts, so do not invent them.
+@@ -1026,11 +1191,11 @@ func (q *NodeSubmissionSequencer) run() {
+ 		for count < len(items) {
+ 			s, ok := q.peek()
+ 			if !ok || count > 0 && (items[0].kind != submissionReady || s.kind != submissionReady) ||
+-				s.kind == submissionReady && submissionGroupSeen(&items, count, s.Ready.GroupID) {
++				s.kind == submissionReady && submissionGroupSeen(&items, count, s.nodeReadyGroup()) {
+ 				break
+ 			}
+ 			if s.kind == submissionReady {
+-				next, admissionErr := q.store.readyWaveAdmission(s.Ready)
++				next, admissionErr := q.store.readyWaveAdmission(s.nodeReady())
+ 				if admissionErr != nil {
+ 					// TrySubmit performs the same immutable geometry check before
+ 					// publishing a ticket. Reaching this branch means caller-owned
+diff --git a/internal/raftstore/node_series_test.go b/internal/raftstore/node_series_test.go
+new file mode 100644
+index 00000000..be129f55
+--- /dev/null
++++ b/internal/raftstore/node_series_test.go
+@@ -0,0 +1,297 @@
++package raftstore
++
++import (
++	"bytes"
++	"errors"
++	"path/filepath"
++	"sync/atomic"
++	"testing"
++
++	"github.com/thesyncim/vibedb/internal/raftmodel"
++	"github.com/thesyncim/vibedb/internal/raftstore/seglog"
++	pb "go.etcd.io/raft/v3/raftpb"
++)
++
++func TestNodeStoreReadySeriesRetryAndReopen(t *testing.T) {
++	dir := filepath.Join(t.TempDir(), "node")
++	options := NodeStoreOptions{
++		MaxWaveBytes: 1 << 20, MaxSegmentEvents: 128,
++		RecentWaves: 32, MaxEntriesPerGroup: 32, ReaderSlots: 1, MaxGroups: 8,
++	}
++	store, err := CreateNodeStore(dir, testNodeIdentity(), testKey(), []NodeBootstrap{{
++		Descriptor: testGroupDescriptor(10), Snapshot: nodeSnapshot(10, 1, 1),
++	}}, options)
++	if err != nil {
++		t.Fatal(err)
++	}
++	incarnations, err := store.BeginIncarnations([]uint64{1})
++	if err != nil {
++		t.Fatal(err)
++	}
++	incarnation := incarnations[0].Incarnation
++	var calls atomic.Int32
++	var observed seglog.Wave
++	store.persistWaveTest = func(wave seglog.Wave) error {
++		calls.Add(1)
++		observed = wave
++		return store.engine.PersistWave(wave)
++	}
++	batches := []raftmodel.PersistBatch{
++		{NodeIncarnation: incarnation, ReadyID: 1, HardState: hard(2, 2), Entries: []*pb.Entry{typedEntry(2, 2, pb.EntryNormal, "a")}},
++		{NodeIncarnation: incarnation, ReadyID: 2, HardState: hard(2, 3), Entries: []*pb.Entry{typedEntry(3, 2, pb.EntryNormal, "b")}},
++		{NodeIncarnation: incarnation, ReadyID: 3, HardState: hard(2, 4), Entries: []*pb.Entry{typedEntry(4, 2, pb.EntryNormal, "c")}},
++	}
++	if err = store.PersistReadySeries(1, batches); err != nil {
++		t.Fatal(err)
++	}
++	if calls.Load() != 1 || len(observed.Batches) != 1 {
++		t.Fatalf("persist calls=%d batches=%d", calls.Load(), len(observed.Batches))
++	}
++	physical := observed.Batches[0]
++	if physical.ReadyID != 3 || physical.ReadySpan != 3 || len(physical.Entries) != 3 || physical.ReadyDigest == ([16]byte{}) {
++		t.Fatalf("physical series=%+v", physical)
++	}
++	if err = store.PersistReadySeries(1, batches); err != nil {
++		t.Fatalf("exact series retry: %v", err)
++	}
++	if calls.Load() != 1 {
++		t.Fatalf("exact retry reached engine %d times", calls.Load())
++	}
++	changed := append([]raftmodel.PersistBatch(nil), batches...)
++	changed[1].Entries = []*pb.Entry{typedEntry(3, 2, pb.EntryNormal, "changed")}
++	if err = store.PersistReadySeries(1, changed); !errors.Is(err, ErrRetryConflict) {
++		t.Fatalf("changed series retry=%v", err)
++	}
++	if calls.Load() != 1 {
++		t.Fatalf("conflicting retry reached engine %d times", calls.Load())
++	}
++	if summary, ok := store.engine.Summary(1); !ok || summary.ReadyID != 3 {
++		t.Fatalf("summary after series=%+v ok=%v", summary, ok)
++	}
++	if err = store.Close(); err != nil {
++		t.Fatal(err)
++	}
++	reopened, err := OpenNodeStore(dir, testNodeIdentity(), testKey(), options)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer reopened.Close()
++	if summary, ok := reopened.engine.Summary(1); !ok || summary.ReadyID != 3 {
++		t.Fatalf("reopened summary=%+v ok=%v", summary, ok)
++	}
++	entries, err := reopened.Group(1).Entries(2, 5, ^uint64(0))
++	if err != nil || len(entries) != 3 || !bytes.Equal(entries[2].GetData(), []byte("c")) {
++		t.Fatalf("reopened entries=%d err=%v", len(entries), err)
++	}
++}
++
++func TestNodeStoreReadySeriesRejectsBeforeMutation(t *testing.T) {
++	dir := filepath.Join(t.TempDir(), "node")
++	options := NodeStoreOptions{MaxWaveBytes: 1 << 20, MaxSegmentEvents: 128, RecentWaves: 32, MaxEntriesPerGroup: 32, ReaderSlots: 1, MaxGroups: 8}
++	store, err := CreateNodeStore(dir, testNodeIdentity(), testKey(), []NodeBootstrap{{
++		Descriptor: testGroupDescriptor(10), Snapshot: nodeSnapshot(10, 1, 1),
++	}}, options)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer store.Close()
++	incarnations, err := store.BeginIncarnations([]uint64{1})
++	if err != nil {
++		t.Fatal(err)
++	}
++	incarnation := incarnations[0].Incarnation
++	var calls atomic.Int32
++	store.persistWaveTest = func(seglog.Wave) error {
++		calls.Add(1)
++		return nil
++	}
++	base := raftmodel.PersistBatch{NodeIncarnation: incarnation, ReadyID: 1, Entries: []*pb.Entry{typedEntry(2, 2, pb.EntryNormal, "x")}}
++	bad := []raftmodel.PersistBatch{base, {NodeIncarnation: incarnation + 1, ReadyID: 2}}
++	if err = store.PersistReadySeries(1, bad); !errors.Is(err, ErrInvalid) {
++		t.Fatalf("incarnation mismatch=%v", err)
++	}
++	withSnapshot := []raftmodel.PersistBatch{base, {NodeIncarnation: incarnation, ReadyID: 2, Snapshot: nodeSnapshot(10, 1, 1)}}
++	if err = store.PersistReadySeries(1, withSnapshot); !errors.Is(err, ErrUnsupportedSnapshot) {
++		t.Fatalf("multi snapshot=%v", err)
++	}
++	gap := []raftmodel.PersistBatch{base, {NodeIncarnation: incarnation, ReadyID: 3}}
++	if err = store.PersistReadySeries(1, gap); !errors.Is(err, ErrInvalid) {
++		t.Fatalf("ready gap=%v", err)
++	}
++	committedThenReplaced := []raftmodel.PersistBatch{
++		{NodeIncarnation: incarnation, ReadyID: 1, HardState: hard(2, 3), Entries: []*pb.Entry{
++			typedEntry(2, 2, pb.EntryNormal, "a"), typedEntry(3, 2, pb.EntryNormal, "committed"),
++		}},
++		{NodeIncarnation: incarnation, ReadyID: 2, HardState: hard(2, 3), Entries: []*pb.Entry{
++			typedEntry(3, 2, pb.EntryNormal, "replacement"),
++		}},
++	}
++	if err = store.PersistReadySeries(1, committedThenReplaced); !errors.Is(err, ErrInvalid) {
++		t.Fatalf("replacement of intermediate committed entry=%v", err)
++	}
++	commitBeforeEntry := []raftmodel.PersistBatch{
++		{NodeIncarnation: incarnation, ReadyID: 1, HardState: hard(1, 2), Entries: []*pb.Entry{
++			typedEntry(2, 1, pb.EntryNormal, "a"),
++		}},
++		{NodeIncarnation: incarnation, ReadyID: 2, HardState: hard(2, 3)},
++		{NodeIncarnation: incarnation, ReadyID: 3, HardState: hard(2, 3), Entries: []*pb.Entry{
++			typedEntry(3, 2, pb.EntryNormal, "b"),
++		}},
++	}
++	if err = store.PersistReadySeries(1, commitBeforeEntry); !errors.Is(err, ErrInvalid) {
++		t.Fatalf("intermediate commit beyond durable last=%v", err)
++	}
++	tooMany := make([]raftmodel.PersistBatch, MaxReadySeries+1)
++	for i := range tooMany {
++		tooMany[i] = raftmodel.PersistBatch{NodeIncarnation: incarnation, ReadyID: uint64(i + 1)}
++	}
++	if err = store.PersistReadySeries(1, tooMany); !errors.Is(err, ErrBounds) {
++		t.Fatalf("series bound=%v", err)
++	}
++	if calls.Load() != 0 {
++		t.Fatalf("rejected series reached persistence %d times", calls.Load())
++	}
++	if summary, ok := store.engine.Summary(1); !ok || summary.ReadyID != 0 {
++		t.Fatalf("rejected series changed summary=%+v ok=%v", summary, ok)
++	}
++}
++
++func TestNodeStoreReadySeriesAggregatesOverlappingSuffixSafely(t *testing.T) {
++	dir := filepath.Join(t.TempDir(), "node")
++	options := NodeStoreOptions{MaxWaveBytes: 1 << 20, MaxSegmentEvents: 128, RecentWaves: 32, MaxEntriesPerGroup: 32, ReaderSlots: 1, MaxGroups: 8}
++	store, err := CreateNodeStore(dir, testNodeIdentity(), testKey(), []NodeBootstrap{{
++		Descriptor: testGroupDescriptor(10), Snapshot: nodeSnapshot(10, 1, 1),
++	}}, options)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer store.Close()
++	incarnations, err := store.BeginIncarnations([]uint64{1})
++	if err != nil {
++		t.Fatal(err)
++	}
++	incarnation := incarnations[0].Incarnation
++	batches := []raftmodel.PersistBatch{
++		{NodeIncarnation: incarnation, ReadyID: 1, HardState: hard(2, 2), Entries: []*pb.Entry{
++			typedEntry(2, 2, pb.EntryNormal, "a"), typedEntry(3, 2, pb.EntryNormal, "old"),
++		}},
++		{NodeIncarnation: incarnation, ReadyID: 2, HardState: hard(2, 4), Entries: []*pb.Entry{
++			typedEntry(3, 2, pb.EntryNormal, "new"), typedEntry(4, 2, pb.EntryNormal, "c"),
++		}},
++	}
++	if err = store.PersistReadySeries(1, batches); err != nil {
++		t.Fatal(err)
++	}
++	entries, err := store.Group(1).Entries(2, 5, ^uint64(0))
++	if err != nil || len(entries) != 3 || !bytes.Equal(entries[1].GetData(), []byte("new")) {
++		t.Fatalf("aggregated replacement entries=%d err=%v", len(entries), err)
++	}
++}
++
++func TestNodeSubmissionSequencerSeriesHistogramAndWaveFusion(t *testing.T) {
++	var observed []NodeReady
++	q := newTestSequencer(t, 16, func(ready []NodeReady) error {
++		observed = append(observed[:0], ready...)
++		return nil
++	})
++	first := new(Submission)
++	second := new(Submission)
++	if err := first.Initialize(); err != nil {
++		t.Fatal(err)
++	}
++	if err := second.Initialize(); err != nil {
++		t.Fatal(err)
++	}
++	series := []raftmodel.PersistBatch{
++		{NodeIncarnation: 1, ReadyID: 1}, {NodeIncarnation: 1, ReadyID: 2},
++	}
++	if err := first.PrepareReadySeries(1, series); err != nil {
++		t.Fatal(err)
++	}
++	if err := second.PrepareReadySeries(2, []raftmodel.PersistBatch{{NodeIncarnation: 1, ReadyID: 1}}); err != nil {
++		t.Fatal(err)
++	}
++	firstTicket, err := q.TrySubmit(first)
++	if err != nil {
++		t.Fatal(err)
++	}
++	secondTicket, err := q.TrySubmit(second)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if ticket, err := first.Wait(); err != nil || ticket != firstTicket {
++		t.Fatalf("first completion=%d err=%v", ticket, err)
++	}
++	if ticket, err := second.Wait(); err != nil || ticket != secondTicket {
++		t.Fatalf("second completion=%d err=%v", ticket, err)
++	}
++	if len(observed) != 2 || observed[0].GroupID != 1 || observed[1].GroupID != 2 || nodeReadySeriesCount(observed[0]) != 2 || nodeReadySeriesCount(observed[1]) != 1 {
++		t.Fatalf("observed fused wave=%+v", observed)
++	}
++	stats := q.Stats()
++	if stats.ReadyLogicalBatches != 3 || stats.ReadySeriesSubmissions != 2 ||
++		stats.ReadyMultiSeriesSubmissions != 1 || stats.ReadySingletonSeriesSubmissions != 1 ||
++		stats.ReadySeriesHistogram[1] != 1 || stats.ReadySeriesHistogram[2] != 1 {
++		t.Fatalf("series stats=%+v", stats)
++	}
++}
++
++func TestNodeSubmissionSequencerDurableLogicalSeriesCounters(t *testing.T) {
++	dir := filepath.Join(t.TempDir(), "node")
++	options := NodeStoreOptions{MaxWaveBytes: 1 << 20, MaxSegmentEvents: 128, RecentWaves: 32, MaxEntriesPerGroup: 32, ReaderSlots: 1, MaxGroups: 8}
++	store, err := CreateNodeStore(dir, testNodeIdentity(), testKey(), []NodeBootstrap{{
++		Descriptor: testGroupDescriptor(10), Snapshot: nodeSnapshot(10, 1, 1),
++	}}, options)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer store.Close()
++	incarnations, err := store.BeginIncarnations([]uint64{1})
++	if err != nil {
++		t.Fatal(err)
++	}
++	sequencer, err := NewNodeSubmissionSequencer(store, 8)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer sequencer.Close()
++	var cell Submission
++	if err = cell.Initialize(); err != nil {
++		t.Fatal(err)
++	}
++	incarnation := incarnations[0].Incarnation
++	batches := []raftmodel.PersistBatch{
++		{NodeIncarnation: incarnation, ReadyID: 1, HardState: hard(2, 2), Entries: []*pb.Entry{typedEntry(2, 2, pb.EntryNormal, "a")}},
++		{NodeIncarnation: incarnation, ReadyID: 2, HardState: hard(2, 3), Entries: []*pb.Entry{typedEntry(3, 2, pb.EntryNormal, "b")}},
++		{NodeIncarnation: incarnation, ReadyID: 3, HardState: hard(2, 4), Entries: []*pb.Entry{typedEntry(4, 2, pb.EntryNormal, "c")}},
++	}
++	if err = cell.PrepareReadySeries(1, batches); err != nil {
++		t.Fatal(err)
++	}
++	ticket, err := sequencer.TrySubmit(&cell)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if completed, waitErr := cell.Wait(); waitErr != nil || completed != ticket {
++		t.Fatalf("completion=%d err=%v", completed, waitErr)
++	}
++	stats := sequencer.Stats()
++	if stats.ReadyDurableLogicalBatches != 3 || stats.ReadyDurableSeriesSubmissions != 1 || stats.ReadyDurableSeriesHistogram[3] != 1 {
++		t.Fatalf("durable series stats=%+v", stats)
++	}
++}
++
++func TestNodeSubmissionSequencerDoesNotAttributeMixedRetryAsNewDurability(t *testing.T) {
++	var q NodeSubmissionSequencer
++	first := &Submission{kind: submissionReady, seriesCount: 3}
++	second := &Submission{kind: submissionReady, seriesCount: 2}
++	items := [MaxPersistGroupBatches]*Submission{first, second}
++	q.observeWaveResult(&items, 2, nil, 1, 1)
++	stats := q.Stats()
++	if stats.ReadyDurableLogicalBatches != 0 || stats.ReadyDurableSeriesSubmissions != 0 {
++		t.Fatalf("mixed duplicate/new wave attributed all series as newly durable: %+v", stats)
++	}
++	if stats.ReadyDurableWaves != 1 || stats.ReadyWaveGroupHistogram[1] != 1 {
++		t.Fatalf("physical append witness lost: %+v", stats)
++	}
++}
+diff --git a/internal/raftstore/node_store.go b/internal/raftstore/node_store.go
+index 3bd89f3e..690eda7c 100644
+--- a/internal/raftstore/node_store.go
++++ b/internal/raftstore/node_store.go
+@@ -71,8 +71,31 @@ type NodeBootstrap struct {
+ type NodeReady struct {
+ 	GroupID uint64
+ 	Batch   raftmodel.PersistBatch
++	// series and seriesCount are populated only by the submission sequencer or
++	// PersistReadySeries. They are deliberately private: a public NodeReady
++	// always describes one logical Ready, while one outer seglog batch may carry
++	// a bounded contiguous series of logical Readies.
++	series      [MaxReadySeries]raftmodel.PersistBatch
++	seriesCount uint8
+ }
+ 
++// MaxReadySeries bounds the number of contiguous Ready values represented by
++// one physical node-log batch. The bound is deliberately independent from the
++// node-wide MaxPersistGroupBatches wave bound: a wave may contain at most one
++// series for each group, and each series may contain at most sixteen logical
++// Readies.
++const MaxReadySeries = int(seglog.MaximumReadySpan)
++
++// Keep the node lane's fixed array geometry exactly aligned with the log
++// grammar. A mismatch would silently create a span the engine cannot encode or
++// replay, so make it a compile-time failure rather than a runtime branch.
++const readySeriesExpected = 16
++
++var (
++	_ [MaxReadySeries - readySeriesExpected]struct{}
++	_ [readySeriesExpected - MaxReadySeries]struct{}
++)
++
+ type GroupIncarnation struct {
+ 	GroupID, Incarnation uint64
+ }
+@@ -119,6 +142,7 @@ type NodeStore struct {
+ 	cacheValid                                bool
+ 	waveBatches                               [MaxPersistGroupBatches]seglog.ReadyBatch
+ 	waveEntryArena                            []seglog.Entry
++	seriesEntryPtrs                           [MaxReadyEntries]*pb.Entry
+ 	waveHard                                  [MaxPersistGroupBatches]seglog.HardState
+ 	waveCheckpoint                            [MaxPersistGroupBatches]seglog.Checkpoint
+ 	pageRefs                                  []pageEntryRef
+@@ -782,8 +806,326 @@ func (s *NodeStore) publishGroupCheckpointSequenced(group uint64, snapshot *pb.S
+ 
+ func (s *NodeStore) PersistWave(ready []NodeReady) error { return s.persistWave(ready, false) }
+ 
++// PersistReadySeries persists one bounded same-group series as one logical
++// node wave batch. The caller's descriptors and every value reachable through
++// them are borrowed until this call returns; this synchronous path does not
++// retain them. A multi-Ready series cannot carry a snapshot yet, so callers
++// can fall back to singleton Persist calls for that transition.
++func (s *NodeStore) PersistReadySeries(group uint64, batches []raftmodel.PersistBatch) error {
++	if len(batches) == 0 || len(batches) > MaxReadySeries {
++		// Route the invalid geometry through persistWave when a store exists so
++		// its established Closed, SequencerActive, and PersistenceUnknown
++		// precedence remains unchanged. The sentinel count is rejected before
++		// any caller data is copied or any workspace is touched.
++		if s == nil {
++			return ErrBounds
++		}
++		return s.persistWave([]NodeReady{{GroupID: group, seriesCount: uint8(MaxReadySeries + 1)}}, false)
++	}
++	var item NodeReady
++	item.GroupID, item.seriesCount = group, uint8(len(batches))
++	copy(item.series[:], batches)
++	return s.persistWave([]NodeReady{item}, false)
++}
++
+ func (s *NodeStore) persistSequencedWave(ready []NodeReady) error { return s.persistWave(ready, true) }
+ 
++// validateReadySeriesDescriptors performs the part of series admission that
++// is independent of the current durable group cursor. It intentionally does
++// no I/O and does not touch store state, allowing sequencer admission to reject
++// malformed or unsupported series before taking a ticket.
++func validateReadySeriesDescriptors(group uint64, batches []raftmodel.PersistBatch) error {
++	if group == 0 || len(batches) == 0 || len(batches) > MaxReadySeries {
++		return ErrBounds
++	}
++	incarnation, readyID := batches[0].NodeIncarnation, batches[0].ReadyID
++	if incarnation == 0 || readyID == 0 {
++		return ErrInvalid
++	}
++	var previousHard *pb.HardState
++	for i := range batches {
++		batch := batches[i]
++		if batch.NodeIncarnation != incarnation || batch.ReadyID == 0 ||
++			(i != 0 && (readyID > math.MaxUint64-uint64(i) || batch.ReadyID != readyID+uint64(i))) {
++			return ErrInvalid
++		}
++		if len(batches) > 1 && batch.Snapshot != nil {
++			return ErrUnsupportedSnapshot
++		}
++		if _, err := readyPayloadSize(batch); err != nil {
++			return err
++		}
++		if !isEmptyHardState(batch.HardState) {
++			if previousHard != nil && (batch.HardState.GetTerm() < previousHard.GetTerm() ||
++				batch.HardState.GetCommit() < previousHard.GetCommit() ||
++				batch.HardState.GetTerm() == previousHard.GetTerm() && previousHard.GetVote() != 0 &&
++					batch.HardState.GetVote() != 0 && batch.HardState.GetVote() != previousHard.GetVote()) {
++				return ErrInvalid
++			}
++			previousHard = batch.HardState
++		}
++	}
++	return nil
++}
++
++// nodeReadySeriesCount returns one for the ordinary NodeReady form. The
++// private fixed descriptors are used by Submission and PersistReadySeries.
++func nodeReadySeriesCount(item NodeReady) int {
++	if item.seriesCount == 0 {
++		return 1
++	}
++	return int(item.seriesCount)
++}
++
++// nodeReadySeriesBatch accesses one logical descriptor without allocating a
++// temporary slice. Callers must pass an index below nodeReadySeriesCount.
++func nodeReadySeriesBatch(item *NodeReady, index int) *raftmodel.PersistBatch {
++	if item.seriesCount == 0 {
++		return &item.Batch
++	}
++	return &item.series[index]
++}
++
++// aggregateReadySeries validates and folds one NodeReady's descriptors into a
++// PersistBatch. Entry pointers remain borrowed; only the fixed pointer arena
++// in NodeStore is populated. The returned digest is the normal Ready digest
++// for a singleton and a domain-separated composite over (ReadyID, digest) for
++// a multi-Ready series.
++func (s *NodeStore) aggregateReadySeries(item *NodeReady) (raftmodel.PersistBatch, [16]byte, error) {
++	count := nodeReadySeriesCount(*item)
++	if count < 1 || count > MaxReadySeries {
++		return raftmodel.PersistBatch{}, [16]byte{}, ErrBounds
++	}
++	if item.seriesCount != 0 {
++		batches := item.series[:count]
++		if err := validateReadySeriesDescriptors(item.GroupID, batches); err != nil {
++			return raftmodel.PersistBatch{}, [16]byte{}, err
++		}
++	}
++	first := nodeReadySeriesBatch(item, 0)
++	result := raftmodel.PersistBatch{NodeIncarnation: first.NodeIncarnation, ReadyID: first.ReadyID}
++	if count == 1 {
++		result = *first
++		var snapshotBytes []byte
++		if !canonicalEmptySnapshot(result.Snapshot) {
++			var err error
++			snapshotBytes, err = marshalSnapshot(result.Snapshot)
++			if err != nil {
++				return raftmodel.PersistBatch{}, [16]byte{}, err
++			}
++		}
++		digest, err := s.readyDigest.digest(result, snapshotBytes)
++		return result, digest, err
++	}
++	if first.ReadyID > math.MaxUint64-uint64(count-1) {
++		return raftmodel.PersistBatch{}, [16]byte{}, ErrBounds
++	}
++	result.ReadyID = first.ReadyID + uint64(count-1)
++	result.MustSync = false
++	entryCount := 0
++	var outputFirst, outputLast uint64
++	var previousHard *pb.HardState
++	var digestIDs [MaxReadySeries]uint64
++	var digestValues [MaxReadySeries][16]byte
++	for i := 0; i < count; i++ {
++		batch := nodeReadySeriesBatch(item, i)
++		digestIDs[i] = batch.ReadyID
++		if batch.MustSync {
++			result.MustSync = true
++		}
++		if !isEmptyHardState(batch.HardState) {
++			if previousHard != nil && (batch.HardState.GetTerm() < previousHard.GetTerm() ||
++				batch.HardState.GetCommit() < previousHard.GetCommit() ||
++				batch.HardState.GetTerm() == previousHard.GetTerm() && previousHard.GetVote() != 0 &&
++					batch.HardState.GetVote() != 0 && batch.HardState.GetVote() != previousHard.GetVote()) {
++				return raftmodel.PersistBatch{}, [16]byte{}, ErrInvalid
++			}
++			result.HardState = batch.HardState
++			previousHard = batch.HardState
++		}
++		// Apply each constituent's entry suffix to the aggregate in the same
++		// order as Raft would apply it. Consecutive appends are concatenated;
++		// an overlapping suffix replaces the already aggregated tail. A gap is
++		// unsupported because one ReadyBatch cannot encode it safely. This keeps
++		// replacement semantics correct while allowing ordinary replacement
++		// sequences to remain one physical batch.
++		if len(batch.Entries) != 0 {
++			firstIndex := batch.Entries[0].GetIndex()
++			if firstIndex == 0 {
++				return raftmodel.PersistBatch{}, [16]byte{}, ErrInvalid
++			}
++			for entryIndex, entry := range batch.Entries {
++				if entry == nil || entry.GetTerm() == 0 ||
++					uint64(entryIndex) > math.MaxUint64-firstIndex ||
++					entry.GetIndex() != firstIndex+uint64(entryIndex) {
++					return raftmodel.PersistBatch{}, [16]byte{}, ErrInvalid
++				}
++			}
++			if entryCount == 0 {
++				outputFirst = firstIndex
++			} else if firstIndex > outputLast {
++				if outputLast == math.MaxUint64 || firstIndex != outputLast+1 {
++					return raftmodel.PersistBatch{}, [16]byte{}, ErrInvalid
++				}
++			} else if firstIndex < outputFirst {
++				entryCount = 0
++				outputFirst = firstIndex
++			} else {
++				delta := firstIndex - outputFirst
++				if delta > uint64(len(s.seriesEntryPtrs)) {
++					return raftmodel.PersistBatch{}, [16]byte{}, ErrBounds
++				}
++				entryCount = int(delta)
++				if entryCount < 0 || entryCount > len(s.seriesEntryPtrs) {
++					return raftmodel.PersistBatch{}, [16]byte{}, ErrBounds
++				}
++			}
++			if len(batch.Entries) > len(s.seriesEntryPtrs)-entryCount {
++				return raftmodel.PersistBatch{}, [16]byte{}, ErrBounds
++			}
++			for _, entry := range batch.Entries {
++				s.seriesEntryPtrs[entryCount] = entry
++				entryCount++
++			}
++			if uint64(len(batch.Entries)-1) > math.MaxUint64-firstIndex {
++				return raftmodel.PersistBatch{}, [16]byte{}, ErrBounds
++			}
++			outputLast = firstIndex + uint64(len(batch.Entries)) - 1
++		}
++		canonical := batch
++		var snapshotBytes []byte
++		if !canonicalEmptySnapshot(canonical.Snapshot) {
++			return raftmodel.PersistBatch{}, [16]byte{}, ErrUnsupportedSnapshot
++		}
++		digest, err := s.readyDigest.digest(*canonical, snapshotBytes)
++		if err != nil {
++			return raftmodel.PersistBatch{}, [16]byte{}, err
++		}
++		digestValues[i] = digest
++	}
++	plainBytes := 0
++	for i := 0; i < entryCount; i++ {
++		if plainBytes > math.MaxInt-len(s.seriesEntryPtrs[i].GetData()) {
++			return raftmodel.PersistBatch{}, [16]byte{}, ErrBounds
++		}
++		plainBytes += len(s.seriesEntryPtrs[i].GetData())
++	}
++	if uint64(entryCount) > s.bounds.maxEntriesPerGroup && s.bounds.maxEntriesPerGroup != 0 ||
++		uint64(plainBytes) > s.bounds.maxWaveBytes && s.bounds.maxWaveBytes != 0 {
++		return raftmodel.PersistBatch{}, [16]byte{}, ErrBounds
++	}
++	result.Entries = s.seriesEntryPtrs[:entryCount:entryCount]
++	return result, compositeReadyDigest(digestIDs, digestValues, count), nil
++}
++
++// compositeReadyDigest is fixed-size and allocation-free. The domain marker
++// prevents a series identity from being confused with a normal Ready digest;
++// the count keeps concatenations unambiguous, followed by every
++// (ReadyID, canonical Ready digest) pair in order.
++func compositeReadyDigest(ids [MaxReadySeries]uint64, digests [MaxReadySeries][16]byte, count int) (result [16]byte) {
++	var canonical [len("vibedb/raftstore/ready-series/v1") + 8 + MaxReadySeries*24]byte
++	offset := copy(canonical[:], "vibedb/raftstore/ready-series/v1")
++	binary.LittleEndian.PutUint64(canonical[offset:offset+8], uint64(count))
++	offset += 8
++	for i := 0; i < count; i++ {
++		binary.LittleEndian.PutUint64(canonical[offset:offset+8], ids[i])
++		copy(canonical[offset+8:offset+24], digests[i][:])
++		offset += 24
++	}
++	digest := sha256.Sum256(canonical[:offset])
++	copy(result[:], digest[:len(result)])
++	return result
++}
++
++// validateReadySeriesTransitions proves that folding the logical Readies has
++// exactly the same admission semantics as persisting them one at a time. The
++// final aggregate alone is insufficient: an early Ready can commit an entry
++// which a later Ready then replaces, or contain an invalid intermediate
++// HardState that a later valid HardState would otherwise conceal.
++func validateReadySeriesTransitions(
++	state seglog.GroupSummary,
++	metadata seglog.GroupMetadata,
++	batches []raftmodel.PersistBatch,
++) error {
++	last := state.LastIndex
++	hard := metadata.Hard
++	for index := range batches {
++		batch := &batches[index]
++		if len(batch.Entries) != 0 {
++			first := batch.Entries[0].GetIndex()
++			if first <= last {
++				if first <= hard.Commit {
++					return ErrInvalid
++				}
++			} else if last == math.MaxUint64 || first != last+1 {
++				return ErrInvalid
++			}
++			last = batch.Entries[len(batch.Entries)-1].GetIndex()
++		}
++		if isEmptyHardState(batch.HardState) {
++			continue
++		}
++		next := seglog.HardState{
++			Term: batch.HardState.GetTerm(), Vote: batch.HardState.GetVote(), Commit: batch.HardState.GetCommit(),
++		}
++		if next.Term < hard.Term || next.Commit < hard.Commit || next.Commit > last ||
++			next.Term == 0 && next.Vote != 0 ||
++			next.Term == hard.Term && hard.Vote != 0 && next.Vote != hard.Vote ||
++			len(batch.Entries) != 0 && next.Term < batch.Entries[len(batch.Entries)-1].GetTerm() {
++			return ErrInvalid
++		}
++		hard = next
++	}
++	return nil
++}
++
++// preflightReadyItem resolves the current durable cursor and computes the
++// exact retry identity without publishing anything. The series cursor check
++// intentionally compares the first logical Ready against the durable cursor;
++// seglog receives the final ReadyID together with ReadySpan and performs the
++// corresponding final cursor transition atomically.
++func (s *NodeStore) preflightReadyItem(item *NodeReady) (raftmodel.PersistBatch, seglog.GroupSummary, [16]byte, bool, error) {
++	batch, digest, err := s.aggregateReadySeries(item)
++	if err != nil {
++		return raftmodel.PersistBatch{}, seglog.GroupSummary{}, [16]byte{}, false, err
++	}
++	state, ok := s.engine.Summary(item.GroupID)
++	if !ok || batch.NodeIncarnation == 0 || batch.NodeIncarnation != state.NodeIncarnation {
++		return raftmodel.PersistBatch{}, seglog.GroupSummary{}, [16]byte{}, false, ErrInvalid
++	}
++	if batch.ReadyID == state.ReadyID {
++		if digest != state.ReadyDigest {
++			return raftmodel.PersistBatch{}, seglog.GroupSummary{}, [16]byte{}, false, ErrRetryConflict
++		}
++		return batch, state, digest, true, nil
++	}
++	metadata, metadataOK := s.engine.Metadata(item.GroupID)
++	if !metadataOK {
++		return raftmodel.PersistBatch{}, seglog.GroupSummary{}, [16]byte{}, false, ErrInvalid
++	}
++	if item.seriesCount != 0 {
++		if err := validateReadySeriesTransitions(state, metadata, item.series[:item.seriesCount]); err != nil {
++			return raftmodel.PersistBatch{}, seglog.GroupSummary{}, [16]byte{}, false, err
++		}
++	}
++	if len(batch.Entries) != 0 && batch.Entries[0].GetIndex() <= state.LastIndex &&
++		batch.Entries[0].GetIndex() <= metadata.Hard.Commit {
++		// The seglog validator would reject a suffix replacement at or below
++		// the committed prefix. Reject during preflight so a multi-Ready series
++		// cannot publish an earlier checkpoint or consume a wave workspace before
++		// this deterministic failure is reported.
++		return raftmodel.PersistBatch{}, seglog.GroupSummary{}, [16]byte{}, false, ErrInvalid
++	}
++	firstID := batch.ReadyID
++	if item.seriesCount != 0 {
++		firstID = item.series[0].ReadyID
++	}
++	if state.ReadyID == math.MaxUint64 || firstID != state.ReadyID+1 {
++		return raftmodel.PersistBatch{}, seglog.GroupSummary{}, [16]byte{}, false, ErrInvalid
++	}
++	return batch, state, digest, false, nil
++}
++
+ func (s *NodeStore) persistWave(ready []NodeReady, sequenced bool) error {
+ 	if !sequenced && s.closingFlag.Load() {
+ 		return ErrClosed
+@@ -807,15 +1149,33 @@ func (s *NodeStore) persistWave(ready []NodeReady, sequenced bool) error {
+ 		return ErrInvalid
+ 	}
+ 	for i := range ready {
++		if nodeReadySeriesCount(ready[i]) > MaxReadySeries {
++			return ErrBounds
++		}
+ 		_, registered := s.descriptorForLogKey(ready[i].GroupID)
+ 		if !registered || i > 0 && ready[i-1].GroupID >= ready[i].GroupID {
+ 			return ErrInvalid
+ 		}
+ 	}
+ 	id := nodeWaveID(ready)
++	// Preflight every outer item before touching the checkpoint directory or
++	// invoking seglog. This is particularly important for a series: a bad
++	// constituent must not leave an earlier constituent's checkpoint published.
++	var states [MaxPersistGroupBatches]seglog.GroupSummary
++	var digests [MaxPersistGroupBatches][16]byte
++	duplicates := 0
+ 	totalPlain, totalEntries := 0, 0
+-	for _, item := range ready {
+-		for _, entry := range item.Batch.Entries {
++	for i := range ready {
++		item := &ready[i]
++		batch, state, digest, duplicate, err := s.preflightReadyItem(item)
++		if err != nil {
++			return err
++		}
++		states[i], digests[i] = state, digest
++		if duplicate {
++			duplicates++
++		}
++		for _, entry := range batch.Entries {
+ 			if entry == nil || totalPlain > math.MaxInt-len(entry.GetData()) {
+ 				return ErrBounds
+ 			}
+@@ -828,30 +1188,15 @@ func (s *NodeStore) persistWave(ready []NodeReady, sequenced bool) error {
+ 	}
+ 	s.plainArena = s.plainArena[:totalPlain]
+ 	s.cipherArena = s.cipherArena[:0]
+-	plainOffset, entryOffset, mappedCount, duplicateCount := 0, 0, 0, 0
+-	for _, item := range ready {
+-		batch := item.Batch
+-		state, ok := s.engine.Summary(item.GroupID)
+-		if !ok || batch.NodeIncarnation == 0 || batch.NodeIncarnation != state.NodeIncarnation {
+-			return ErrInvalid
+-		}
+-		var snapshotBytes []byte
+-		if !canonicalEmptySnapshot(batch.Snapshot) {
+-			var snapshotErr error
+-			snapshotBytes, snapshotErr = marshalSnapshot(batch.Snapshot)
+-			if snapshotErr != nil {
+-				return snapshotErr
+-			}
+-		}
+-		retryDigest, err := s.readyDigest.digest(batch, snapshotBytes)
++	plainOffset, entryOffset, mappedCount := 0, 0, 0
++	for i := range ready {
++		item := &ready[i]
++		batch, _, err := s.aggregateReadySeries(item)
+ 		if err != nil {
+ 			return err
+ 		}
++		state, retryDigest := states[i], digests[i]
+ 		if batch.NodeIncarnation == state.NodeIncarnation && batch.ReadyID == state.ReadyID {
+-			if retryDigest != state.ReadyDigest {
+-				return ErrRetryConflict
+-			}
+-			duplicateCount++
+ 			continue
+ 		}
+ 		if len(batch.Entries) > len(s.waveEntryArena)-entryOffset {
+@@ -866,6 +1211,9 @@ func (s *NodeStore) persistWave(ready []NodeReady, sequenced bool) error {
+ 		}
+ 		entryOffset += len(entries)
+ 		mapped := seglog.ReadyBatch{GroupID: item.GroupID, NodeIncarnation: batch.NodeIncarnation, ReadyID: batch.ReadyID, ReadyDigest: retryDigest, Entries: entries}
++		if item.seriesCount != 0 {
++			mapped.ReadySpan = uint64(item.seriesCount)
++		}
+ 		if len(entries) > 0 && entries[0].Index <= state.LastIndex {
+ 			mapped.ReplaceFrom = entries[0].Index
+ 		}
+@@ -889,7 +1237,7 @@ func (s *NodeStore) persistWave(ready []NodeReady, sequenced bool) error {
+ 		s.waveBatches[mappedCount] = mapped
+ 		mappedCount++
+ 	}
+-	if duplicateCount == len(ready) {
++	if duplicates == len(ready) {
+ 		return nil
+ 	}
+ 	s.plainArena = s.plainArena[:plainOffset]
+@@ -1296,8 +1644,12 @@ func nodeWaveID(ready []NodeReady) seglog.WaveID {
+ 	for i, item := range ready {
+ 		word := canonical[i*24 : i*24+24]
+ 		binary.LittleEndian.PutUint64(word[0:8], item.GroupID)
+-		binary.LittleEndian.PutUint64(word[8:16], item.Batch.NodeIncarnation)
+-		binary.LittleEndian.PutUint64(word[16:24], item.Batch.ReadyID)
++		batch := item.Batch
++		if item.seriesCount != 0 {
++			batch = item.series[item.seriesCount-1]
++		}
++		binary.LittleEndian.PutUint64(word[8:16], batch.NodeIncarnation)
++		binary.LittleEndian.PutUint64(word[16:24], batch.ReadyID)
+ 	}
+ 	digest := sha256.Sum256(canonical[:len(ready)*24])
+ 	var id seglog.WaveID
+diff --git a/internal/raftstore/seglog/engine.go b/internal/raftstore/seglog/engine.go
+index d52abb12..cbe8dd9f 100644
+--- a/internal/raftstore/seglog/engine.go
++++ b/internal/raftstore/seglog/engine.go
+@@ -42,9 +42,14 @@ type Checkpoint struct {
+ 	Index, Term uint64
+ }
+ type ReadyBatch struct {
+-	GroupID                     uint64
+-	BeginIncarnation            uint64
+-	NodeIncarnation, ReadyID    uint64
++	GroupID                  uint64
++	BeginIncarnation         uint64
++	NodeIncarnation, ReadyID uint64
++	// ReadySpan is the number of consecutive Ready messages represented by
++	// this batch. Zero and one are canonicalized to one. A span greater than
++	// one is encoded only alongside the final ReadyID and ReadyDigest using
++	// the versioned identity extension in the frame grammar.
++	ReadySpan                   uint64
+ 	ReadyDigest                 [16]byte
+ 	ReplaceFrom                 uint64
+ 	Entries                     []Entry
+@@ -52,6 +57,31 @@ type ReadyBatch struct {
+ 	TruncateIndex, TruncateTerm uint64
+ 	Checkpoint                  *Checkpoint
+ }
++
++const (
++	// MaximumReadySpan matches the fixed node submission lane. Keeping this
++	// bound small makes the composite identity an exact scalar transition and
++	// prevents malformed frames from manufacturing an unbounded logical loop.
++	MaximumReadySpan uint64 = 16
++	maxReadySpan            = MaximumReadySpan
++	readySpanVersion uint64 = 1
++)
++
++func canonicalReadySpan(span uint64) uint64 {
++	if span <= 1 {
++		return 1
++	}
++	return span
++}
++
++func checkedReadySpan(span uint64) (uint64, error) {
++	span = canonicalReadySpan(span)
++	if span > maxReadySpan {
++		return 0, ErrBounds
++	}
++	return span, nil
++}
++
+ type Wave struct {
+ 	ID      WaveID
+ 	Batches []ReadyBatch
+@@ -1067,10 +1097,22 @@ func (e *Engine) prepareWave(w Wave, validateState bool) ([]byte, [32]byte, []se
+ 		}
+ 		if flags&batchIdentity != 0 {
+ 			e.frameBuf = appendUvarint(e.frameBuf, batch.NodeIncarnation)
+-			e.frameBuf = appendUvarint(e.frameBuf, batch.ReadyID)
++			span := canonicalReadySpan(batch.ReadySpan)
++			if span > 1 {
++				// ReadyID was historically the first field after the
++				// incarnation and is always nonzero. Reserve its zero value as
++				// an unambiguous marker for the extended identity grammar:
++				// zero, version, span, final ReadyID, digest.
++				e.frameBuf = appendUvarint(e.frameBuf, 0)
++				e.frameBuf = appendUvarint(e.frameBuf, readySpanVersion)
++				e.frameBuf = appendUvarint(e.frameBuf, span)
++				e.frameBuf = appendUvarint(e.frameBuf, batch.ReadyID)
++			} else {
++				e.frameBuf = appendUvarint(e.frameBuf, batch.ReadyID)
++			}
+ 			e.frameBuf = append(e.frameBuf, batch.ReadyDigest[:]...)
+ 			if validateState {
+-				e.eventScratch = append(e.eventScratch, segmentEvent{Kind: eventReadyState, GroupID: batch.GroupID, Incarnation: batch.NodeIncarnation, ReadyID: batch.ReadyID, ReadyDigest: batch.ReadyDigest, Reference: w.ID})
++				e.eventScratch = append(e.eventScratch, segmentEvent{Kind: eventReadyState, GroupID: batch.GroupID, Incarnation: batch.NodeIncarnation, ReadyID: batch.ReadyID, ReadySpan: span, ReadyDigest: batch.ReadyDigest, Reference: w.ID})
+ 			}
+ 		}
+ 		if flags&batchBegin != 0 {
+@@ -1188,6 +1230,14 @@ func waveSize(w Wave) (int, int, error) {
+ 		if b.GroupID <= previousGroup {
+ 			return 0, 0, ErrRaftState
+ 		}
++		span, spanErr := checkedReadySpan(b.ReadySpan)
++		if spanErr != nil {
++			return 0, 0, spanErr
++		}
++		flags := batchFlags(b)
++		if span > 1 && flags&batchIdentity == 0 {
++			return 0, 0, ErrRaftState
++		}
+ 		bytes += uvarintBytes(b.GroupID-previousGroup) + 1 + uvarintBytes(uint64(len(b.Entries)))
+ 		if b.ReplaceFrom != 0 {
+ 			bytes += uvarintBytes(b.ReplaceFrom)
+@@ -1205,11 +1255,16 @@ func waveSize(w Wave) (int, int, error) {
+ 			bytes += uvarintBytes(b.Hard.Term) + uvarintBytes(b.Hard.Vote) + uvarintBytes(b.Hard.Commit)
+ 			events++
+ 		}
+-		if batchFlags(b)&batchIdentity != 0 {
+-			bytes += uvarintBytes(b.NodeIncarnation) + uvarintBytes(b.ReadyID) + 16
++		if flags&batchIdentity != 0 {
++			bytes += uvarintBytes(b.NodeIncarnation) + 16
++			if span > 1 {
++				bytes += uvarintBytes(0) + uvarintBytes(readySpanVersion) + uvarintBytes(span) + uvarintBytes(b.ReadyID)
++			} else {
++				bytes += uvarintBytes(b.ReadyID)
++			}
+ 			events++
+ 		}
+-		if batchFlags(b)&batchBegin != 0 {
++		if flags&batchBegin != 0 {
+ 			bytes += uvarintBytes(b.BeginIncarnation)
+ 			events++
+ 		}
+@@ -1391,6 +1446,13 @@ func isBlobEvent(kind uint16) bool { return kind >= eventBlobEntry && kind <= ev
+ 
+ func validateBatch(g *engineGroup, b *ReadyBatch) (byte, error) {
+ 	flags := batchFlags(b)
++	span, spanErr := checkedReadySpan(b.ReadySpan)
++	if spanErr != nil {
++		return 0, spanErr
++	}
++	if span > 1 && flags&batchIdentity == 0 {
++		return 0, ErrRaftState
++	}
+ 	if flags&batchBegin != 0 {
+ 		if b.BeginIncarnation != g.NodeIncarnation+1 || len(b.Entries) != 0 || b.ReplaceFrom != 0 || b.TruncateIndex != 0 || b.TruncateTerm != 0 {
+ 			return 0, ErrRaftState
+@@ -1413,10 +1475,10 @@ func validateBatch(g *engineGroup, b *ReadyBatch) (byte, error) {
+ 			return 0, ErrRaftState
+ 		}
+ 		if b.NodeIncarnation == g.NodeIncarnation {
+-			if b.ReadyID != g.ReadyID+1 {
++			if g.ReadyID > ^uint64(0)-span || b.ReadyID != g.ReadyID+span {
+ 				return 0, ErrRaftState
+ 			}
+-		} else if b.NodeIncarnation <= g.NodeIncarnation || b.ReadyID != 1 {
++		} else if b.NodeIncarnation <= g.NodeIncarnation || b.ReadyID != span {
+ 			return 0, ErrRaftState
+ 		}
+ 	}
+@@ -1640,11 +1702,15 @@ func (e *Engine) applyEvent(event segmentEvent, segmentID uint64) error {
+ 		if event.Incarnation == 0 || event.ReadyID == 0 || event.ReadyDigest == ([16]byte{}) {
+ 			return ErrRaftState
+ 		}
++		span := canonicalReadySpan(event.ReadySpan)
++		if span > maxReadySpan {
++			return ErrCorrupt
++		}
+ 		if event.Incarnation == g.NodeIncarnation {
+-			if event.ReadyID != g.ReadyID+1 {
++			if g.ReadyID > ^uint64(0)-span || event.ReadyID != g.ReadyID+span {
+ 				return ErrRaftState
+ 			}
+-		} else if event.Incarnation <= g.NodeIncarnation || event.ReadyID != 1 {
++		} else if event.Incarnation <= g.NodeIncarnation || event.ReadyID != span {
+ 			return ErrRaftState
+ 		}
+ 		newWave := WaveID(event.Reference)
+@@ -2711,21 +2777,35 @@ func decodeWaveFrameForEngine(frame []byte, expectedSequence uint64, engine *Eng
+ 		if err != nil || flags & ^byte(batchReplace|batchPrefix|batchCheckpoint|batchHard|batchTypes|batchIdentity|batchBlob|batchBegin) != 0 {
+ 			return id, digest, nil, ErrCorrupt
+ 		}
+-		batch := ReadyBatch{GroupID: group}
++		batch := ReadyBatch{GroupID: group, ReadySpan: 1}
+ 		if flags&batchIdentity != 0 {
+ 			batch.NodeIncarnation, err = cursor.uvarint()
+-			if err != nil {
++			if err != nil || batch.NodeIncarnation == 0 {
+ 				return id, digest, nil, ErrCorrupt
+ 			}
+ 			batch.ReadyID, err = cursor.uvarint()
+ 			if err != nil {
+ 				return id, digest, nil, ErrCorrupt
+ 			}
++			if batch.ReadyID == 0 {
++				version, versionErr := cursor.uvarint()
++				span, spanErr := cursor.uvarint()
++				batch.ReadyID, err = cursor.uvarint()
++				if versionErr != nil || spanErr != nil || err != nil || version != readySpanVersion || span <= 1 || span > maxReadySpan || batch.ReadyID == 0 {
++					return id, digest, nil, ErrCorrupt
++				}
++				batch.ReadySpan = span
++			} else {
++				batch.ReadySpan = 1
++			}
+ 			value, takeErr := cursor.take(16)
+ 			if takeErr != nil {
+ 				return id, digest, nil, ErrCorrupt
+ 			}
+ 			copy(batch.ReadyDigest[:], value)
++			if batch.ReadyDigest == ([16]byte{}) {
++				return id, digest, nil, ErrCorrupt
++			}
+ 		}
+ 		if flags&batchBegin != 0 {
+ 			batch.BeginIncarnation, err = cursor.uvarint()
+@@ -2895,7 +2975,7 @@ func (e *Engine) eventsForDecoded(batches []ReadyBatch, frameOffset, sequence ui
+ 		}
+ 		events = append(events, segmentEvent{Kind: eventWaveRef, GroupID: batch.GroupID, Index: sequence, Reference: id, Digest: digest})
+ 		if batch.NodeIncarnation != 0 {
+-			events = append(events, segmentEvent{Kind: eventReadyState, GroupID: batch.GroupID, Incarnation: batch.NodeIncarnation, ReadyID: batch.ReadyID, ReadyDigest: batch.ReadyDigest, Reference: id})
++			events = append(events, segmentEvent{Kind: eventReadyState, GroupID: batch.GroupID, Incarnation: batch.NodeIncarnation, ReadyID: batch.ReadyID, ReadySpan: canonicalReadySpan(batch.ReadySpan), ReadyDigest: batch.ReadyDigest, Reference: id})
+ 		}
+ 		if batch.BeginIncarnation != 0 {
+ 			events = append(events, segmentEvent{Kind: eventIncarnation, GroupID: batch.GroupID, Incarnation: batch.BeginIncarnation})
+diff --git a/internal/raftstore/seglog/format.go b/internal/raftstore/seglog/format.go
+index 5798c59f..6fe97d4e 100644
+--- a/internal/raftstore/seglog/format.go
++++ b/internal/raftstore/seglog/format.go
+@@ -99,6 +99,7 @@ type segmentEvent struct {
+ 	GroupID, Index, Term, Offset, Bytes uint64
+ 	Vote, Commit                        uint64
+ 	Incarnation, ReadyID                uint64
++	ReadySpan                           uint64
+ 	DataOffset, DataBytes               uint64
+ 	Reference                           [16]byte
+ 	ReadyDigest                         [16]byte
+diff --git a/internal/raftstore/seglog/ready_span_test.go b/internal/raftstore/seglog/ready_span_test.go
+new file mode 100644
+index 00000000..a7a0b502
+--- /dev/null
++++ b/internal/raftstore/seglog/ready_span_test.go
+@@ -0,0 +1,295 @@
++package seglog
++
++import (
++	"bytes"
++	"crypto/sha256"
++	"encoding/binary"
++	"errors"
++	"hash/crc32"
++	"testing"
++)
++
++func readySpanFrame(t *testing.T, span, readyID uint64) []byte {
++	t.Helper()
++	e := &Engine{
++		frameBuf:     make([]byte, 0, 1024),
++		eventScratch: make([]segmentEvent, 0, 8),
++	}
++	wave := Wave{ID: waveID(1), Batches: []ReadyBatch{{
++		GroupID:         1,
++		NodeIncarnation: 1,
++		ReadyID:         readyID,
++		ReadySpan:       span,
++		ReadyDigest:     [16]byte{2},
++	}}}
++	frame, _, _, err := e.prepareWave(wave, false)
++	if err != nil {
++		t.Fatal(err)
++	}
++	result := bytes.Clone(frame)
++	sealWaveHeader(result, 1, wave.ID)
++	return result
++}
++
++func resealUnauthenticatedFrame(frame []byte) {
++	digest := sha256.Sum256(frame[72:])
++	copy(frame[40:72], digest[:])
++	var id WaveID
++	copy(id[:], frame[16:32])
++	sealWaveHeader(frame, binary.LittleEndian.Uint64(frame[8:16]), id)
++}
++
++func readySpanIdentityOffsets(frame []byte) (version, span, digest int, err error) {
++	cursor := canonicalCursor{data: frame[72:]}
++	if _, err = cursor.uvarint(); err != nil { // batch count
++		return 0, 0, 0, err
++	}
++	if _, err = cursor.uvarint(); err != nil { // group delta
++		return 0, 0, 0, err
++	}
++	flags, err := cursor.byte()
++	if err != nil || flags&batchIdentity == 0 {
++		return 0, 0, 0, ErrCorrupt
++	}
++	if _, err = cursor.uvarint(); err != nil { // incarnation
++		return 0, 0, 0, err
++	}
++	marker := 72 + cursor.off
++	if marker >= len(frame) || frame[marker] != 0 {
++		return 0, 0, 0, ErrCorrupt
++	}
++	if _, err = cursor.uvarint(); err != nil { // reserved zero marker
++		return 0, 0, 0, err
++	}
++	version = 72 + cursor.off
++	if _, err = cursor.uvarint(); err != nil { // version
++		return 0, 0, 0, err
++	}
++	span = 72 + cursor.off
++	if _, err = cursor.uvarint(); err != nil { // span
++		return 0, 0, 0, err
++	}
++	if _, err = cursor.uvarint(); err != nil { // final ReadyID
++		return 0, 0, 0, err
++	}
++	digest = 72 + cursor.off
++	return version, span, digest, nil
++}
++
++func TestReadySpanZeroAndOneKeepLegacyBytes(t *testing.T) {
++	legacy := readySpanFrame(t, 0, 1)
++	canonical := readySpanFrame(t, 1, 1)
++	if !bytes.Equal(legacy, canonical) {
++		t.Fatalf("zero and one span encodings differ:\nzero=%x\none=%x", legacy, canonical)
++	}
++	wantPayload := []byte{1, 1, batchIdentity, 1, 1}
++	wantDigest := [16]byte{2}
++	wantPayload = append(wantPayload, wantDigest[:]...)
++	wantPayload = append(wantPayload, 0, 0)
++	if !bytes.Equal(legacy[72:], wantPayload) {
++		t.Fatalf("legacy payload=%x want=%x", legacy[72:], wantPayload)
++	}
++	_, _, batches, err := decodeWaveFrame(legacy, 1)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(batches) != 1 || batches[0].ReadySpan != 1 || batches[0].ReadyID != 1 {
++		t.Fatalf("decoded legacy batch=%+v", batches)
++	}
++}
++
++func TestReadySpanRecoversFinalStateAndEntries(t *testing.T) {
++	dir := t.TempDir()
++	e := newEngineAt(t, dir, 1)
++	if err := e.PersistWave(Wave{ID: waveID(1), Batches: []ReadyBatch{{
++		GroupID:         1,
++		NodeIncarnation: 1,
++		ReadyID:         1,
++		ReadyDigest:     [16]byte{1},
++		Entries:         []Entry{{Index: 1, Term: 1}},
++	}}}); err != nil {
++		t.Fatal(err)
++	}
++	finalDigest := [16]byte{9}
++	if err := e.PersistWave(Wave{ID: waveID(2), Batches: []ReadyBatch{{
++		GroupID:         1,
++		NodeIncarnation: 1,
++		ReadyID:         4,
++		ReadySpan:       3,
++		ReadyDigest:     finalDigest,
++		Entries:         []Entry{{Index: 2, Term: 1}, {Index: 3, Term: 1}, {Index: 4, Term: 1}},
++	}}}); err != nil {
++		t.Fatal(err)
++	}
++	if err := e.DeepVerify(); err != nil {
++		t.Fatalf("active DeepVerify=%v", err)
++	}
++	if err := e.Rotate(nil); err != nil {
++		t.Fatal(err)
++	}
++	if err := e.WaitSeal(); err != nil {
++		t.Fatal(err)
++	}
++	if err := e.Close(); err != nil {
++		t.Fatal(err)
++	}
++	e, err := openTestEngine(dir)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer e.Close()
++	state, ok := e.Group(1)
++	if !ok || e.Sequence() != 2 || len(state.Entries) != 4 || state.NodeIncarnation != 1 || state.ReadyID != 4 || state.ReadyDigest != finalDigest {
++		t.Fatalf("recovered sequence=%d state ok=%t state=%+v", e.Sequence(), ok, state)
++	}
++	for i, entry := range state.Entries {
++		if entry.Index != uint64(i+1) || entry.Term != 1 {
++			t.Fatalf("entry %d=%+v", i, entry)
++		}
++	}
++	if err := e.DeepVerify(); err != nil {
++		t.Fatalf("recovered DeepVerify=%v", err)
++	}
++}
++
++func TestReadySpanNewIncarnationStartsAtSpan(t *testing.T) {
++	g := &engineGroup{GroupState: GroupState{NodeIncarnation: 1, ReadyID: 27}}
++	valid := ReadyBatch{NodeIncarnation: 2, ReadyID: 3, ReadySpan: 3, ReadyDigest: [16]byte{1}}
++	if _, err := validateBatch(g, &valid); err != nil {
++		t.Fatalf("new-incarnation span rejected: %v", err)
++	}
++	for _, readyID := range []uint64{1, 2, 4, 5} {
++		invalid := valid
++		invalid.ReadyID = readyID
++		if _, err := validateBatch(g, &invalid); !errors.Is(err, ErrRaftState) {
++			t.Fatalf("new-incarnation final ReadyID=%d error=%v", readyID, err)
++		}
++	}
++}
++
++func TestReadySpanRejectsGapsRegressionsAndOverflow(t *testing.T) {
++	tests := []struct {
++		name        string
++		current     uint64
++		span        uint64
++		readyID     uint64
++		incarnation uint64
++	}{
++		{name: "same-incarnation gap", current: 1, span: 3, readyID: 5, incarnation: 1},
++		{name: "same-incarnation regression", current: 4, span: 3, readyID: 6, incarnation: 1},
++		{name: "overflow", current: ^uint64(0) - 1, span: 3, readyID: 1, incarnation: 1},
++	}
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			g := &engineGroup{GroupState: GroupState{NodeIncarnation: 1, ReadyID: test.current}}
++			batch := ReadyBatch{NodeIncarnation: test.incarnation, ReadyID: test.readyID, ReadySpan: test.span, ReadyDigest: [16]byte{1}}
++			if _, err := validateBatch(g, &batch); !errors.Is(err, ErrRaftState) {
++				t.Fatalf("validateBatch=%v", err)
++			}
++		})
++	}
++
++	e := newReservedEngine(t, 1)
++	if err := e.PersistWave(Wave{ID: waveID(1), Batches: []ReadyBatch{{
++		GroupID: 1, NodeIncarnation: 1, ReadyID: 1, ReadyDigest: [16]byte{1},
++	}}}); err != nil {
++		t.Fatal(err)
++	}
++	beforeOffset, beforeSequence := e.log.activeOffset, e.sequence
++	invalid := Wave{ID: waveID(2), Batches: []ReadyBatch{{
++		GroupID: 1, NodeIncarnation: 1, ReadyID: 4, ReadySpan: 2, ReadyDigest: [16]byte{2},
++	}}}
++	if err := e.PersistWave(invalid); !errors.Is(err, ErrRaftState) {
++		t.Fatalf("PersistWave gap=%v", err)
++	}
++	if e.log.activeOffset != beforeOffset || e.sequence != beforeSequence {
++		t.Fatalf("rejected gap mutated offset/sequence=%d/%d want=%d/%d", e.log.activeOffset, e.sequence, beforeOffset, beforeSequence)
++	}
++}
++
++func TestReadySpanCorruptVersionSpanAndDigestRejected(t *testing.T) {
++	valid := readySpanFrame(t, 3, 3)
++	versionOffset, spanOffset, digestOffset, err := readySpanIdentityOffsets(valid)
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, test := range []struct {
++		name   string
++		offset int
++		value  byte
++	}{
++		{name: "version", offset: versionOffset, value: 2},
++		{name: "zero span", offset: spanOffset, value: 0},
++		{name: "one span", offset: spanOffset, value: 1},
++		{name: "oversized span", offset: spanOffset, value: byte(maxReadySpan + 1)},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			bad := bytes.Clone(valid)
++			bad[test.offset] = test.value
++			resealUnauthenticatedFrame(bad)
++			if _, _, _, err := decodeWaveFrame(bad, 1); !errors.Is(err, ErrCorrupt) {
++				t.Fatalf("decode corrupted %s=%v", test.name, err)
++			}
++		})
++	}
++
++	badDigest := bytes.Clone(valid)
++	for i := 0; i < 16; i++ {
++		badDigest[digestOffset+i] = 0
++	}
++	resealUnauthenticatedFrame(badDigest)
++	if _, _, _, err := decodeWaveFrame(badDigest, 1); !errors.Is(err, ErrCorrupt) {
++		t.Fatalf("decode zero ReadyDigest=%v", err)
++	}
++
++	badFrameDigest := bytes.Clone(valid)
++	badFrameDigest[40] ^= 1
++	binary.LittleEndian.PutUint32(badFrameDigest[32:36], crc32.Checksum(badFrameDigest[40:], crcTable))
++	binary.LittleEndian.PutUint32(badFrameDigest[36:40], crc32.Checksum(badFrameDigest[:36], crcTable))
++	if _, _, _, err := decodeWaveFrame(badFrameDigest, 1); !errors.Is(err, ErrCorrupt) {
++		t.Fatalf("decode bad frame digest=%v", err)
++	}
++}
++
++func TestReadySpanTornFrameDoesNotAdvanceState(t *testing.T) {
++	dir := t.TempDir()
++	e := newEngineAt(t, dir, 1)
++	if err := e.PersistWave(Wave{ID: waveID(1), Batches: []ReadyBatch{{
++		GroupID: 1, NodeIncarnation: 1, ReadyID: 1, ReadyDigest: [16]byte{1},
++		Entries: []Entry{{Index: 1, Term: 1}},
++	}}}); err != nil {
++		t.Fatal(err)
++	}
++	firstOffset := e.log.activeOffset
++	frame, _, _, err := e.prepareWave(Wave{ID: waveID(2), Batches: []ReadyBatch{{
++		GroupID: 1, NodeIncarnation: 1, ReadyID: 4, ReadySpan: 3, ReadyDigest: [16]byte{9},
++		Entries: []Entry{{Index: 2, Term: 1}, {Index: 3, Term: 1}, {Index: 4, Term: 1}},
++	}}}, false)
++	if err != nil {
++		t.Fatal(err)
++	}
++	frame = bytes.Clone(frame)
++	sealWaveHeader(frame, 2, waveID(2))
++	cut := len(frame) - 1
++	if _, err := e.log.active.WriteAt(frame[:cut], int64(e.log.activeOffset)); err != nil {
++		t.Fatal(err)
++	}
++	if err := e.log.active.Sync(); err != nil {
++		t.Fatal(err)
++	}
++	if err := e.Close(); err != nil {
++		t.Fatal(err)
++	}
++	e, err = openTestEngine(dir)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer e.Close()
++	state, ok := e.Group(1)
++	if !ok || state.ReadyID != 1 || len(state.Entries) != 1 || e.log.activeOffset != firstOffset {
++		t.Fatalf("torn frame advanced state ok=%t state=%+v offset=%d want=%d", ok, state, e.log.activeOffset, firstOffset)
++	}
++	if err := e.DeepVerify(); err != nil {
++		t.Fatalf("DeepVerify after torn frame=%v", err)
++	}
++}
+diff --git a/scripts/bench/summarize-crdb-sql.py b/scripts/bench/summarize-crdb-sql.py
+index d0384491..6e62cc71 100755
+--- a/scripts/bench/summarize-crdb-sql.py
++++ b/scripts/bench/summarize-crdb-sql.py
+@@ -24,11 +24,18 @@ ALL_WORKLOADS = WORKLOADS + OPTIONAL_RANGE_WORKLOADS + (MIXED_WORKLOAD, UNIFORM_
+ UINT64_MASK = (1 << 64) - 1
+ DIAGNOSTIC_COUNTERS = (
+     "ready_waves", "ready_durable_waves", "observed_append_barriers", "multi_group_waves", "failed_waves",
++    "ready_submissions", "ready_queue_wait_ns", "ready_waves_attempted", "ready_persist_attempts",
++    "ready_persist_successes", "ready_persist_failures", "ready_waves_failed", "ready_persist_duration_ns",
++    "ready_wave_duration_ns",
++    "ready_logical_batches", "ready_series_submissions", "ready_singleton_series_submissions",
++    "ready_multi_series_submissions", "ready_durable_logical_batches", "ready_durable_series_submissions",
+     "checkpoint_queue_submissions", "checkpoint_queue_rejected", "checkpoint_queue_wait_ns", "checkpoint_service_ns",
+     "native_accepted", "native_rejected", "native_failed", "native_semantic_dispatches",
+     "gateway_local_calls", "gateway_remote_calls", "gateway_semantic_sql_calls", "gateway_legacy_calls",
+     "gateway_sql_request_encodings", "gateway_sql_request_encoded_bytes", "remote_dials", "remote_reuses",
+     "remote_poisoned", "remote_rejected", "remote_handshake_failures",
++    "raft_proposal_batches", "raft_proposal_commands", "raft_proposal_bytes", "raft_apply_batches",
++    "raft_applied_entries", "raft_commit_advancements", "raft_committed_entries", "raft_ready_persisted",
+ )
+ 
+ 
+diff --git a/scripts/bench/test_summarize_crdb_sql.py b/scripts/bench/test_summarize_crdb_sql.py
+index 5aeb3a56..465be669 100644
+--- a/scripts/bench/test_summarize_crdb_sql.py
++++ b/scripts/bench/test_summarize_crdb_sql.py
+@@ -119,6 +119,11 @@ class SummarizeCRDBSQLTest(unittest.TestCase):
+             value = diagnostic_report(directory)
+             _, checked = MODULE.load(write_report(directory, value), "vibedb")
+             self.assertEqual(checked, 2)
++            counters = value["results"][0]["diagnostics"]["deltas"][0]["counters"]
++            self.assertEqual(counters["ready_queue_wait_ns"], 3)
++            self.assertEqual(counters["raft_proposal_commands"], 3)
++            self.assertEqual(counters["ready_logical_batches"], 3)
++            self.assertEqual(counters["ready_durable_logical_batches"], 3)
+             value["results"][0]["diagnostics"]["deltas"][0]["counters"]["ready_waves"] = 4
+             with self.assertRaisesRegex(ValueError, "counter delta"):
+                 MODULE.load(write_report(directory, value), "vibedb")
