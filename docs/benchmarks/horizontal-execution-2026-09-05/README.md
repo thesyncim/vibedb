@@ -40,6 +40,14 @@ existing durable acknowledgement boundary. No novelty claim is established.
   the old suffix, checkpoint boundaries retain their exact term, and older terms
   use the original storage lookup. Warm reads and persistence remain allocation-free.
 
+- `8f8300cf`: serve recent persisted entry payloads from one fixed 8 MiB physical
+  node arena. Payloads up to 4 KiB use 2,048 generational slots; per-group references
+  are limited to the existing 64-entry window. Larger entries and misses use the
+  original authenticated storage path. Private staging precedes frame-buffer
+  reuse; references publish only after successful sync and namespace proof.
+  Reads return detached payloads and scalar fields. Staging and warmed persistence
+  allocate nothing.
+
 ## Matched complete SQL campaigns
 
 Each cell uses 16 independent table groups, three physical node processes, RF3,
@@ -86,6 +94,14 @@ The paired arms improved only 3–5%, with worse p95 medians, amid substantial
 storage-service variation. A separate profile is being used to choose the next
 change; these data must not be represented as a 2× CRDB result.
 
+The payload-cache campaign (`b5c3dcaa` → `8f8300cf`) verified all 144,000 measured
+operations. Before-first medians were 1,307.6 → 2,118.5 ops/s, with CRDB at 5,271.1.
+Reverse medians were 1,453.2 → 2,077.7, with CRDB at 5,377.6. That is a paired
+43–62% throughput improvement, with p95 falling 15.508 → 9.921 ms and
+13.867 → 9.941 ms. The candidate reaches only 0.39–0.40× CRDB throughput here.
+This is a measured incremental improvement, not achievement of the 2× target
+and not a main-to-final comparison.
+
 ## Mechanism evidence
 
 The sparse-completion microbenchmark at 256 registered groups fell from a median
@@ -111,6 +127,19 @@ in 3.89 seconds. Average persistence service was 0.49–0.52 ms/wave and each wa
 contained about 1.4 logical batches. This motivates removing scheduler/storage
 coupling; it does not justify weakening durability or claiming storage is the
 only remaining bottleneck.
+
+The next separate profile confirms the entry-cache mechanism: frontend accumulated
+mutex wait at `GroupView.Entries` fell from approximately 4.86 seconds in the
+recent-term diagnostic to approximately 0.01 seconds in the payload-cache
+diagnostic. These are different diagnostic runs, not normalized latency or
+throughput ratios. The deterministic held-sync test independently fails on main
+and succeeds with the payload cache.
+
+Validation includes nine integration packages (raftstore, seglog, raftmember,
+multiraft, raftservice, rafttransport, gateway, gatewayruntime, and vibedb-shard),
+repeated focused race tests, cold recovery, checkpoint and replacement tests,
+slot eviction and oversized-entry fallback, exact protobuf byte limits, and
+zero-allocation warmed persistence. No durability fault is converted to success.
 
 ## Method and retained failures
 
@@ -141,5 +170,18 @@ inventories, logs, and immutable source hashes):
 - `/private/tmp/vibedb-horizontal-yield-evidence` — bounded scheduler yield.
 - `/private/tmp/vibedb-horizontal-coordinate-evidence` — coordinate publication.
 - `/private/tmp/vibedb-horizontal-terms-evidence` — bounded recent terms.
+- `/private/tmp/vibedb-horizontal-entry-evidence` — bounded durable payload cache.
 - `/private/tmp/vibedb-horizontal-profile-targeted` — pre-health diagnostic profile.
 - `/private/tmp/vibedb-horizontal-profile-health` — post-health diagnostic profile.
+
+
+The adjacent `.tar.gz` archives retain the raw trials and control evidence from
+these campaigns, including the incomplete first campaign. `profile-terms.tar.gz`
+and `profile-entries.tar.gz` retain the relevant diagnostic traces and profiles.
+`artifacts.json` records archive hashes and sizes. Compiled binaries are excluded; the original manifests retain their hashes,
+build settings, and immutable source identities. Numeric binary CRDB WAL files
+are omitted; storage inventories and measurements remain. Profile archives keep
+the frontend trace and all CPU profiles. Each archive's `omitted-files.json`
+records hashes of omitted WAL files and other node traces, which remain in the
+original working evidence roots. The archive does not replace those explicit source identities with
+the later documentation commit.

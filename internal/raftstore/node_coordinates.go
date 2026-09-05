@@ -8,10 +8,6 @@ import (
 	pb "go.etcd.io/raft/v3/raftpb"
 )
 
-// nodeLogCoordinates is a serving copy of durable metadata. It is published
-// after the log sync and namespace proof, before Ready completion. Raft may read
-// the preceding durable cut while an unrelated wave is in flight; these reads
-// must never take the device mutex held across that wave's disk I/O.
 const nodeRecentTerms = 64
 
 type nodeTermCoordinate struct {
@@ -19,6 +15,11 @@ type nodeTermCoordinate struct {
 	payloadBytes                   uint32
 	kind                           pb.EntryType
 }
+
+// nodeLogCoordinates is a serving copy of durable metadata. It is published
+// after the log sync and namespace proof, before Ready completion. Raft may read
+// the preceding durable cut while an unrelated wave is in flight; these reads
+// must never take the device mutex held across that wave's disk I/O.
 type nodeLogCoordinates struct {
 	first, last, commit, baseTerm uint64
 	terms                         *[nodeRecentTerms]nodeTermCoordinate
