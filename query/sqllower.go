@@ -976,6 +976,15 @@ func (s *Statement) resolve(f leafForm, wantTrue bool) Predicate {
 func (s *Statement) leafForm(e *sqlast.Expr, args []any) (leafForm, error) {
 	spec := s.spec(e.Path)
 	switch e.Kind {
+	case sqlast.ExprConstant:
+		if e.Value.Kind != sqlast.OperandBool {
+			return leafForm{}, fmt.Errorf("query: a constant predicate must be Boolean")
+		}
+		predicate := neverTrue()
+		if e.Value.Bool {
+			predicate = alwaysTruePred()
+		}
+		return leafForm{pred: predicate, total: true}, nil
 	case sqlast.ExprCompare:
 		if reference, ok := s.correlation.reference(e); ok {
 			return s.correlationCompareForm(e, reference)

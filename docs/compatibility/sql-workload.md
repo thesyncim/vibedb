@@ -108,7 +108,12 @@ once before all SET expressions; FALSE and UNKNOWN skip assignments, local
 RETURNING rows, and affected-row counts. An insert ignores the condition at
 runtime while still validating candidate, declaration, and bindings. The same
 filter applies to local, durable, transactional, shard, and RF3 execution.
-Untouched fields and exact retry results are preserved. The owner proof and final schema/key fences still apply.
+Untouched fields and exact retry results are preserved. The owner proof and final schema/key fences still apply. Native RF3 profiles
+freeze placement to the primary key, so arbitrary computed key assignments can
+run at the candidate's owner: executed updates must retain the key, while skipped
+conditions and absent-row branches do not evaluate unused assignments. The
+legacy syntactic key restriction remains until those receivers authenticate the
+same placement proof.
 
 Each relation retains at most one compiled template, protected by the same
 mutex used for detached snapshot audits. Changed parameter values reuse that

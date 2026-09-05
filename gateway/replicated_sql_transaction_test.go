@@ -394,6 +394,7 @@ func TestReplicatedSQLTransactionLowersFiniteDeleteAcrossRF3Shards(t *testing.T)
 
 func replicatedSQLSplitTransactionFixture(
 	t testing.TB,
+	declarations ...ReplicatedTableDeclaration,
 ) (*Snapshot, *Executor, [2]string) {
 	t.Helper()
 	config, endpoints, descriptor, profile := testReplicatedTableInput(t)
@@ -435,7 +436,7 @@ func replicatedSQLSplitTransactionFixture(
 	}
 	snapshot, err := NewSnapshotWithReplicatedTableMetadata(
 		config, endpoints, 7, nil, nil, []ReplicatedShardDescriptor{left, right},
-		[]ReplicatedTableProfile{profile},
+		[]ReplicatedTableProfile{profile}, declarations,
 	)
 	if err != nil {
 		t.Fatal(err)

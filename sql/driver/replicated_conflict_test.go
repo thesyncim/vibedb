@@ -87,6 +87,10 @@ func TestReplicatedConflictConditionMatchesLocalAndSkipsLazyAssignments(t *testi
 		matched bool
 	}{
 		{`score=employees.score/EXCLUDED.score WHERE EXCLUDED.active`, nil, false},
+		{`id='moved' WHERE EXCLUDED.active`, nil, false},
+		{`id='moved' WHERE false`, nil, false},
+		{`score=employees.score+1 WHERE true`, nil, true},
+		{`score=employees.score/EXCLUDED.score WHERE NULL`, nil, false},
 		{`score=employees.score/EXCLUDED.score WHERE CAST(NULL AS BOOLEAN)`, nil, false},
 		{`score=employees.score/EXCLUDED.score WHERE employees.score<?`, []any{int64(90)}, false},
 		{`score=employees.score+? WHERE employees.score>?`, []any{int64(3), int64(90)}, true},
@@ -240,6 +244,8 @@ func TestReplicatedConflictExpressionsShareLocalSemantics(t *testing.T) {
 		args []any
 	}{
 		{`score=employees.score+EXCLUDED.score,name=employees.name||':'||EXCLUDED.name`, nil},
+		{`id=COALESCE(employees.id,EXCLUDED.id)`, nil},
+		{`id=CASE WHEN employees.active THEN CAST(employees.id AS TEXT) ELSE EXCLUDED.id END`, nil},
 		{`score=EXCLUDED.score,city=CAST(employees.score AS TEXT)`, nil},
 		{`score=9007199254740993+EXCLUDED.score`, nil},
 		{`score=COALESCE(NULL,employees.score,1/0)`, nil},
