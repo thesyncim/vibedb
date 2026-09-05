@@ -20,8 +20,8 @@ var (
 const durableSQLWideLoweringMaxAllocations = 1024
 
 const (
-	durableSQLMultiRowInsert64MaxAllocations = 320
-	durableSQLFiniteDelete64MaxAllocations   = 340
+	durableSQLMultiRowInsert64MaxAllocations = 190
+	durableSQLFiniteDelete64MaxAllocations   = 215
 )
 
 func TestDurableSQLRequestExecutorRetainedStateGate(t *testing.T) {
