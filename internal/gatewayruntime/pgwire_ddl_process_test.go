@@ -198,6 +198,21 @@ active BOOLEAN NOT NULL
 		}
 	}
 	checkComputedConflict(connection)
+	for _, action := range []string{
+		`score=employees.score/EXCLUDED.score WHERE EXCLUDED.active`,
+		`score=EXCLUDED.score WHERE CAST(NULL AS BOOLEAN)`,
+		`"$doc"=EXCLUDED."$doc" WHERE employees.score<EXCLUDED.score`,
+	} {
+		result := ddlWireQuery(t, connection, `INSERT INTO employees (id,name,team,city,score,active) VALUES ('employee-0007','Skipped','Changed',NULL,0,false) ON CONFLICT DO UPDATE SET `+action, true)
+		if result.code != "" || result.tag != "INSERT 0 0" {
+			t.Fatalf("conditional conflict %s: %+v", action, result)
+		}
+	}
+	acceptedCondition := ddlWireQuery(t, connection, `INSERT INTO employees (id,name,team,city,score,active) VALUES ('employee-0007','Skipped','Changed',NULL,0,false) ON CONFLICT DO UPDATE SET score=employees.score+EXCLUDED.score WHERE employees.score>EXCLUDED.score`, true)
+	if acceptedCondition.code != "" || acceptedCondition.tag != "INSERT 0 1" {
+		t.Fatalf("matched unchanged conflict: %+v", acceptedCondition)
+	}
+	checkComputedConflict(connection)
 	for _, mutation := range []struct{ sql, tag string }{
 		{`UPDATE employees SET score=505 WHERE id IS NOT DISTINCT FROM 'employee-0005'`, "UPDATE 1"},
 		{`DELETE FROM employees WHERE id IS NOT DISTINCT FROM 'employee-0006'`, "DELETE 1"},

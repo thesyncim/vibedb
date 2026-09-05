@@ -282,7 +282,7 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 		}
 		statements[index].prepared = prepared
 		statements[index].bound = bound
-		if prepared.statement.Kind == sqlast.KindInsert && sqldriver.ReplicatedConflictAssignments(prepared.statement.Insert.OnConflictUpdate) {
+		if prepared.statement.Kind == sqlast.KindInsert && sqldriver.ReplicatedConflictProgram(prepared.statement.Insert.OnConflictUpdate) {
 			statements[index].conflictArgs = args
 		}
 		if !replicated {
@@ -302,7 +302,7 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 			// lowering without binding INSERT, DELETE or indexed UPDATE twice.
 			preimageMode = replicatedSQLLinearizablePreimage
 		}
-		if hasComputedUpdateAssignments(&prepared.statement) || hasComputedConflictAssignments(&prepared.statement) {
+		if hasComputedUpdateAssignments(&prepared.statement) || hasConflictExpressions(&prepared.statement) {
 			parameterTypes, typeErr := postgresQueryParameterTypes(
 				queries[index].ParamTypes, prepared.params,
 			)
@@ -823,12 +823,12 @@ func replicatedSQLMutationInput(
 		kind := replication.MutationPutAbsent
 		if prepared.statement.Insert.OnConflictDoNothing {
 			kind = replication.MutationPutIfAbsent
-		} else if prepared.statement.Insert.OnConflictUpdate.WholeDocument() {
+		} else if action := prepared.statement.Insert.OnConflictUpdate; action.WholeDocument() && action.Where == nil {
 			// Both branches publish exactly the canonical candidate. The native
 			// put validates its schema and physical key at the replicated apply
 			// point and retains one affected row for inserts and replacements.
 			kind = replication.MutationPut
-		} else if sqldriver.ReplicatedConflictAssignments(prepared.statement.Insert.OnConflictUpdate) {
+		} else if sqldriver.ReplicatedConflictProgram(prepared.statement.Insert.OnConflictUpdate) {
 			kind = replication.MutationPutConflict
 		}
 		return bound.rowKeys[ordinal][0], document, kind, nil

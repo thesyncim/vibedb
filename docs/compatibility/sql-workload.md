@@ -95,16 +95,20 @@ On legacy shards without global indexes, a single-owner `DO UPDATE` executes
 the original conflict action atomically in the shard driver. Arbitrary shard-key
 assignments still require a placement proof; copying the current or candidate
 key and whole-document EXCLUDED replacement preserve the routed owner.
-RF3 whole-document EXCLUDED replacement uses the native atomic put primitive
-and preserves its exact affected-row and retry semantics. Declared RF3 column
-upserts replicate a bounded VUC2 expression template and its referenced scalar
-bindings. Current-row and EXCLUDED expressions use the same compiled projection
+Unconditional RF3 whole-document EXCLUDED replacement uses the native atomic
+put primitive and preserves its exact affected-row and retry semantics. Declared
+RF3 column upserts and conditional whole-document replacements replicate a
+bounded VUC3 expression template and its referenced scalar bindings. Current-row and EXCLUDED expressions use the same compiled projection
 as local SQL: exact arithmetic, concatenation, casts, lazy CASE and conditional
 functions, and simultaneous assignment semantics. Candidate validation, column
 resolution and binding checks precede branch selection. Runtime RHS evaluation
 runs only on conflict, at the replica's atomic apply/participant prepare point;
-it requires no coordinator preimage read. Untouched fields and exact retry
-results are preserved. The owner proof and final schema/key fences still apply.
+it requires no coordinator preimage read. An ON CONFLICT WHERE condition runs
+once before all SET expressions; FALSE and UNKNOWN skip assignments, local
+RETURNING rows, and affected-row counts. An insert ignores the condition at
+runtime while still validating candidate, declaration, and bindings. The same
+filter applies to local, durable, transactional, shard, and RF3 execution.
+Untouched fields and exact retry results are preserved. The owner proof and final schema/key fences still apply.
 
 Each relation retains at most one compiled template, protected by the same
 mutex used for detached snapshot audits. Changed parameter values reuse that
@@ -113,7 +117,7 @@ of the INSERT's candidate binds. The format bounds the full mutation to 4 MiB,
 assignments and referenced parameters to 1,024 each, expression nodes to 16,384,
 and depth to 128. Execution has deterministic 16 MiB workspace, result,
 intermediate, and exact-number budgets; document limits apply independently.
-The unreleased VUC1 grammar is replaced, and authenticated apply-contract,
+The unreleased VUC2 grammar is replaced, and authenticated apply-contract,
 snapshot and data-chain identities change with it. Mixed apply contracts fail
 closed. See [expression format](replicated-conflict-program.md).
 
@@ -126,8 +130,7 @@ not claims closed by local tests.
 ## Remaining work
 
 The [SQL workload gap corpus](../../internal/conformance/sql_workload.go)
-contains 33 reduced statements. The
-[driver gate](../../sql/driver/sql_workload_compatibility_test.go) verifies that
+contains 32 reduced statements. The [driver gate](../../sql/driver/sql_workload_compatibility_test.go) verifies that
 each still refuses at prepare or execution. When implementing a gap, replace
 its refusal expectation with result, metadata, and atomicity coverage and
 update this table. A parser accepting a statement does not close a gap.
@@ -138,7 +141,7 @@ update this table. A parser accepting a statement does not close a gap.
 | 1 | PostgreSQL field types, defaults, constraints | 333 timestamp/interval, 125 UUID/serial, 90 type-modifier, 389 default/constraint locations. Requires real timestamp/UUID/array semantics, value generation, casts, wire metadata, and schema validation. |
 | 1 | JSONB and JSON operations | 296 JSONB, 45 JSON-function, 312 JSON-operator locations. Includes JSONB type/casts, key existence, merge/delete, jsonb_set, typeof, array expansion and aggregation. Existing JSON path access/containment is only a subset; JSON must not be relabeled JSONB. |
 | 1 | PostgreSQL arrays and row-value predicates | 8 array-function, 33 array-syntax, 64 row-comparison locations. Includes ANY, UNNEST, array binding, constructors, aggregation and composite-key pagination. |
-| 1 | Relational mutations and queues | 36 UPDATE-FROM/DELETE-USING and 14 modifying-CTE locations. Requires atomic shared-snapshot execution, INSERT-SELECT with target columns, conflict-action WHERE, and returned-row dependencies. |
+| 1 | Relational mutations and queues | 36 UPDATE-FROM/DELETE-USING and 14 modifying-CTE locations. Requires atomic shared-snapshot execution, INSERT-SELECT with target columns and returned-row dependencies. |
 | 1 | Locking and queue concurrency | 14 locking locations, including FOR UPDATE / SKIP LOCKED. Requires a real concurrency contract; accepting and ignoring lock clauses would be incorrect. |
 | 2 | Expression, partial, ordered, and covering indexes | 205 index-related locations. Required both for schema acceptance and efficient channel/member queries; uniqueness predicates and access-path proofs must remain correct. |
 | 2 | Remaining query expressions | Computed group keys; mixed scalar/path pattern predicates; correlated scalar filtering before aggregates; derived wildcard + scalar outputs; string/date functions; DISTINCT ON; aggregate DISTINCT/FILTER and array/JSON aggregation. |

@@ -77,7 +77,7 @@ func TestReplicatedColumnUpsertRoutesConflictProgramWithoutPreimageRead(t *testi
 	// No client exists: preparing the atomic conflict must not read a preimage.
 	executor := NewExecutor(nil, NewCatalogHolder(snapshot), Options{})
 	targets, handled, err := executor.planReplicatedSQLTransaction(t.Context(), snapshot, []Query{{
-		SQL:    `INSERT INTO messages (id,n,city) VALUES (?,1,'candidate') ON CONFLICT (id) DO UPDATE SET n=messages.n+?,city=COALESCE(EXCLUDED.city,messages.city)`,
+		SQL:    `INSERT INTO messages (id,n,city) VALUES (?,1,'candidate') ON CONFLICT (id) DO UPDATE SET n=messages.n+?,city=COALESCE(EXCLUDED.city,messages.city) WHERE messages.n<EXCLUDED.n`,
 		Params: []shardservice.Param{shardservice.StringParam("a"), shardservice.NumberParam("9007199254740993")},
 	}}, executor.profileFor(ClassInteractive))
 	if err != nil || !handled || len(targets) != 1 || len(targets[0].Batches) != 1 || len(targets[0].Batches[0].Mutations) != 1 {
@@ -90,6 +90,8 @@ func TestReplicatedColumnUpsertRoutesConflictProgramWithoutPreimageRead(t *testi
 	}
 	for _, statement := range []string{
 		`INSERT INTO messages (id,n) VALUES ('a',1) ON CONFLICT DO UPDATE SET absent=1`,
+		`INSERT INTO messages (id,n) VALUES ('a',1) ON CONFLICT DO UPDATE SET n=1 WHERE messages.absent=1`,
+		`INSERT INTO messages (id,n) VALUES ('a',1) ON CONFLICT DO UPDATE SET "$doc"=EXCLUDED."$doc" WHERE EXCLUDED.absent=1`,
 		`INSERT INTO messages (id,n) VALUES ('a',1) ON CONFLICT DO UPDATE SET n=EXCLUDED.absent`,
 		`INSERT INTO messages (id,n) VALUES ('a',1) ON CONFLICT DO UPDATE SET id='another'`,
 	} {

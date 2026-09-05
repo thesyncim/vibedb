@@ -515,3 +515,66 @@ func conflictTestPath(source int, key string, pos int) *sqlast.PathExpr {
 		Pos: pos,
 	}
 }
+
+func TestDMLConflictConditionFiltersBeforeAssignmentEvaluation(t *testing.T) {
+	statement, err := PrepareDML(`INSERT INTO metrics VALUES (?) ON CONFLICT DO UPDATE SET total=metrics.total/EXCLUDED.delta WHERE EXCLUDED.enabled AND metrics.total>?`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer statement.Release()
+	var exec Exec
+	defer exec.Release()
+	current := []byte(`{"total":12}`)
+	for _, tc := range []struct {
+		candidate string
+		threshold int64
+		want      string
+	}{
+		{`{"delta":0,"enabled":false}`, 0, ""},
+		{`{"delta":0,"enabled":null}`, 0, ""},
+		{`{"delta":0,"enabled":true}`, 20, ""},
+		{`{"delta":3,"enabled":true}`, 0, "4"},
+		{`{"delta":0,"enabled":false}`, 0, ""},
+	} {
+		cursor, err := statement.EvaluateConflictUpdateExpressions(&exec, current, []byte(tc.candidate), []any{nil, tc.threshold}, 4096)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.candidate, err)
+		}
+		if tc.want == "" {
+			if cursor.Next() || exec.Result.RowCount != 0 {
+				t.Fatal("false/unknown condition produced an assignment")
+			}
+			continue
+		}
+		if !cursor.Next() || cursor.Cell(0).String() != tc.want || cursor.Next() {
+			t.Fatalf("result=%+v", exec.Result)
+		}
+	}
+}
+
+func TestDMLConflictConditionDirectAndWholeDocumentActions(t *testing.T) {
+	for _, set := range []string{`total=EXCLUDED.total`, `"$doc"=EXCLUDED."$doc"`} {
+		statement, err := PrepareDML(`INSERT INTO metrics VALUES (?) ON CONFLICT DO UPDATE SET ` + set + ` WHERE metrics.total<EXCLUDED.total`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !statement.HasConflictUpdateExpressions() || statement.ConflictUpdateExpressionCount() != 0 {
+			t.Fatal("private selector counted as an assignment")
+		}
+		var exec Exec
+		for _, tc := range []struct {
+			candidate string
+			keep      bool
+		}{{`{"total":3}`, false}, {`{"total":30}`, true}} {
+			cursor, err := statement.EvaluateConflictUpdateExpressions(&exec, []byte(`{"total":12}`), []byte(tc.candidate), []any{nil}, 4096)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cursor.Next() != tc.keep || cursor.Next() {
+				t.Fatalf("candidate=%s result=%+v", tc.candidate, exec.Result)
+			}
+		}
+		exec.Release()
+		statement.Release()
+	}
+}

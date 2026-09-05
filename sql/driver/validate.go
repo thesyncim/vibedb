@@ -52,7 +52,7 @@ func (c *conn) validateSurfaceContext(
 				return reservedDocumentPathError(statement.Insert.Columns[i])
 			}
 		}
-		if update := statement.Insert.OnConflictUpdate; update != nil && len(update.Assignments) != 0 {
+		if update := statement.Insert.OnConflictUpdate; update != nil {
 			if err := rlockContext(ctx, &c.db.mu); err != nil {
 				return err
 			}
@@ -63,12 +63,12 @@ func (c *conn) validateSurfaceContext(
 					"%w: %q", ErrTableNotFound, statement.Insert.Table,
 				)
 			}
-			err := validateUpsertColumnAssignments(
+			err := validateUpsertConflictAction(
 				statement.Insert.Table,
 				mutationTargetRelation(
 					statement.Insert.Table, statement.Insert.Alias,
 				),
-				t.meta, update.Assignments,
+				t.meta, update,
 			)
 			c.db.mu.RUnlock()
 			if err != nil {

@@ -10,7 +10,7 @@ import (
 	"github.com/thesyncim/vibejson"
 )
 
-// VUC2 templates contain only closed scalar/predicate instructions. Parameters
+// VUC3 templates contain only closed scalar/predicate instructions. Parameters
 // have dense, template-local ordinals; their values follow the template. Limits
 // are checked before descending or allocating, including for untrusted replay.
 const (
@@ -455,6 +455,9 @@ func (c *conflictProgramCodec) predicate(input *sqlast.Expr, depth int) *sqlast.
 }
 
 func encodeConflictTemplate(action *sqlast.InsertConflictUpdate, parameterTypes []query.ParameterType) ([]byte, map[int]int, error) {
+	if !ReplicatedConflictProgram(action) {
+		return nil, nil, errReplicatedConflictProgram
+	}
 	c := conflictProgramCodec{writing: true}
 	seen := make(map[string]bool, len(action.Assignments))
 	c.number(len(action.Assignments), 2)
@@ -476,6 +479,7 @@ func encodeConflictTemplate(action *sqlast.InsertConflictUpdate, parameterTypes 
 			c.operand(assignment.Value, true)
 		}
 	}
+	c.predicate(action.Where, 0)
 	if c.err != nil {
 		return nil, nil, c.err
 	}
@@ -496,11 +500,11 @@ func encodeConflictTemplate(action *sqlast.InsertConflictUpdate, parameterTypes 
 	return c.data, c.ordinals, nil
 }
 
-func decodeConflictTemplate(template []byte) ([]sqlast.UpdateAssignment, []query.ParameterType, error) {
+func decodeConflictTemplate(template []byte) (*sqlast.InsertConflictUpdate, []query.ParameterType, error) {
 	c := conflictProgramCodec{data: template}
 	count := c.number(0, 2)
 	c.params = c.number(0, 2)
-	if count == 0 || count > replicatedConflictAssignmentLimit || c.params > replicatedConflictAssignmentLimit {
+	if count > replicatedConflictAssignmentLimit || c.params > replicatedConflictAssignmentLimit {
 		return nil, nil, errReplicatedConflictProgram
 	}
 	assignments := make([]sqlast.UpdateAssignment, count)
@@ -528,6 +532,13 @@ func decodeConflictTemplate(template []byte) ([]sqlast.UpdateAssignment, []query
 			break
 		}
 	}
+	action := &sqlast.InsertConflictUpdate{Assignments: assignments, Where: c.predicate(nil, 0)}
+	if count == 0 {
+		action.Doc = sqlast.Operand{Kind: sqlast.OperandExcluded, Text: "$doc"}
+	}
+	if !ReplicatedConflictProgram(action) {
+		c.fail()
+	}
 	types := make([]query.ParameterType, c.params)
 	for i := range types {
 		types[i] = query.ParameterType(c.number(0, 1))
@@ -538,5 +549,5 @@ func decodeConflictTemplate(template []byte) ([]sqlast.UpdateAssignment, []query
 	if c.err != nil || c.offset != len(template) || c.usedParams != c.params {
 		return nil, nil, errReplicatedConflictProgram
 	}
-	return assignments, types, nil
+	return action, types, nil
 }

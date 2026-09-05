@@ -92,35 +92,38 @@ func MaterializePreparedUpdateAssignments(
 	)
 }
 
-// materializeConflictColumnAssignments evaluates the computed half of an
-// INSERT ... ON CONFLICT DO UPDATE assignment list over one immutable pair of
-// row images, then feeds those values through the same byte-preserving patcher
-// as direct EXCLUDED assignments. The current and candidate documents remain
-// distinct namespaces during evaluation and every right-hand side is collected
-// before the first target column is changed.
-func materializeConflictColumnAssignments(
+// materializeConflictUpdate applies the shared conflict selector before any
+// assignment. The false/unknown branch returns the original row and matched=false;
+// callers still own publication, key/ownership fences, affected rows and RETURNING.
+func materializeConflictUpdate(
 	statement *query.DMLStatement,
 	exec *query.Exec,
-	document []byte,
-	excluded []byte,
-	assignments []sqlast.UpdateAssignment,
+	document, excluded []byte,
 	args []any,
 	maxBytes int,
-) ([]byte, error) {
-	if statement == nil || !statement.HasConflictUpdateExpressions() {
-		return ApplyColumnAssignmentsWithExcluded(
-			document, excluded, assignments, args, maxBytes,
-		)
+) ([]byte, bool, error) {
+	if statement == nil || statement.Tree().Insert == nil || statement.Tree().Insert.OnConflictUpdate == nil {
+		return nil, false, errors.New("vibedb: expected a prepared conflict action")
 	}
-	cursor, err := statement.EvaluateConflictUpdateExpressions(
-		exec, document, excluded, args, maxBytes,
-	)
-	if err != nil {
-		return nil, err
+	action := statement.Tree().Insert.OnConflictUpdate
+	var evaluated *query.Cursor
+	if statement.HasConflictUpdateExpressions() {
+		cursor, err := statement.EvaluateConflictUpdateExpressions(exec, document, excluded, args, maxBytes)
+		if err != nil {
+			return nil, false, err
+		}
+		if exec.Result.RowCount == 0 {
+			return document, false, nil
+		}
+		if statement.ConflictUpdateExpressionCount() != 0 {
+			evaluated = &cursor
+		}
 	}
-	return applyColumnAssignments(
-		document, excluded, assignments, args, &cursor, maxBytes,
-	)
+	if action.WholeDocument() {
+		return excluded, true, nil
+	}
+	value, err := applyColumnAssignments(document, excluded, action.Assignments, args, evaluated, maxBytes)
+	return value, true, err
 }
 
 // ApplyColumnAssignmentsWithExcluded materializes the conflict branch of an
@@ -558,6 +561,13 @@ func mutationTargetRelation(table, alias string) string {
 		return alias
 	}
 	return table
+}
+
+func validateUpsertConflictAction(table, targetRelation string, meta *tableMeta, action *sqlast.InsertConflictUpdate) error {
+	if err := validateUpsertColumnAssignments(table, targetRelation, meta, action.Assignments); err != nil {
+		return err
+	}
+	return validateUpsertPredicateColumns(targetRelation, meta, action.Where)
 }
 
 // validateUpsertColumnAssignments resolves the deliberately flat conflict SET

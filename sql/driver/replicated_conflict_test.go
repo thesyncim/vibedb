@@ -38,11 +38,11 @@ func TestReplicatedConflictPreservesCurrentColumnsAndCandidateBranch(t *testing.
 			if !ok {
 				t.Fatal("bad encoded payload")
 			}
-			value, code := validator.MaterializeConflict(key, row, program, current, true)
+			value, _, code := validator.MaterializeConflict(key, row, program, current, true)
 			if code != replicatedstate.MutationValidationAccept || string(value) != tc.want {
 				t.Fatalf("value=%s code=%v", value, code)
 			}
-			value, code = validator.MaterializeConflict(key, row, program, nil, false)
+			value, _, code = validator.MaterializeConflict(key, row, program, nil, false)
 			if code != replicatedstate.MutationValidationAccept || !bytes.Equal(value, candidate) {
 				t.Fatalf("insert evaluated conflict action: %s %v", value, code)
 			}
@@ -54,15 +54,15 @@ func TestReplicatedConflictPreservesCurrentColumnsAndCandidateBranch(t *testing.
 		t.Fatal(err)
 	}
 	row, program, _ := replication.OpenConflictValue(payload)
-	value, code := validator.MaterializeConflict(key, row, program, nil, false)
+	value, _, code := validator.MaterializeConflict(key, row, program, nil, false)
 	if code != replicatedstate.MutationValidationAccept || !bytes.Equal(value, candidate) {
 		t.Fatal("unused NULL assignment affected the insert")
 	}
-	value, code = validator.MaterializeConflict(key, row, program, current, true)
+	value, _, code = validator.MaterializeConflict(key, row, program, current, true)
 	if code != replicatedstate.MutationValidationAccept || validator.ValidatePut(key, value) != replicatedstate.MutationValidationInvalid {
 		t.Fatalf("postimage bypassed schema: %s %v", value, code)
 	}
-	if _, code = validator.MaterializeConflict(key, []byte(`{"id":"employee-0001"}`), program, current, true); code != replicatedstate.MutationValidationInvalid {
+	if _, _, code = validator.MaterializeConflict(key, []byte(`{"id":"employee-0001"}`), program, current, true); code != replicatedstate.MutationValidationInvalid {
 		t.Fatal("invalid candidate skipped on conflict")
 	}
 	for _, set := range []string{`missing=1`, `score=EXCLUDED.missing`} {
@@ -72,8 +72,82 @@ func TestReplicatedConflictPreservesCurrentColumnsAndCandidateBranch(t *testing.
 			t.Fatal(err)
 		}
 		row, program, _ := replication.OpenConflictValue(payload)
-		if _, code = validator.MaterializeConflict(key, row, program, nil, false); code != replicatedstate.MutationValidationInvalid {
+		if _, _, code = validator.MaterializeConflict(key, row, program, nil, false); code != replicatedstate.MutationValidationInvalid {
 			t.Fatalf("undeclared column accepted on insert: %s", set)
+		}
+	}
+}
+
+func TestReplicatedConflictConditionMatchesLocalAndSkipsLazyAssignments(t *testing.T) {
+	v, key, current := employeeValidator(t)
+	candidate := []byte(`{"active":false,"city":null,"id":"employee-0001","name":"Candidate","score":0,"team":"Another"}`)
+	for _, tc := range []struct {
+		set     string
+		args    []any
+		matched bool
+	}{
+		{`score=employees.score/EXCLUDED.score WHERE EXCLUDED.active`, nil, false},
+		{`score=employees.score/EXCLUDED.score WHERE CAST(NULL AS BOOLEAN)`, nil, false},
+		{`score=employees.score/EXCLUDED.score WHERE employees.score<?`, []any{int64(90)}, false},
+		{`score=employees.score+? WHERE employees.score>?`, []any{int64(3), int64(90)}, true},
+		{`score=EXCLUDED.score WHERE EXCLUDED.active`, nil, false},
+		{`score=EXCLUDED.score WHERE employees.active`, nil, true},
+		{`"$doc"=EXCLUDED."$doc" WHERE EXCLUDED.active`, nil, false},
+		{`"$doc"=EXCLUDED."$doc" WHERE employees.active`, nil, true},
+		{`score=employees.score+1 WHERE employees.score IN (92,93)`, nil, true},
+		{`score=1 WHERE employees.score BETWEEN 90 AND 100`, nil, true},
+	} {
+		t.Run(tc.set, func(t *testing.T) {
+			parsed, err := sqlast.ParseStatement(`INSERT INTO employees (id) VALUES ('unused') ON CONFLICT DO UPDATE SET ` + tc.set)
+			if err != nil {
+				t.Fatal(err)
+			}
+			local, err := query.PrepareParsedDML("", parsed)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer local.Release()
+			var exec query.Exec
+			defer exec.Release()
+			want, matched, err := materializeConflictUpdate(local, &exec, current, candidate, tc.args, 4096)
+			if err != nil || matched != tc.matched {
+				t.Fatalf("local matched=%v err=%v", matched, err)
+			}
+			payload, err := EncodeReplicatedConflictValue(candidate, parsed.Insert.OnConflictUpdate, tc.args, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			row, program, _ := replication.OpenConflictValue(payload)
+			got, matched, code := v.MaterializeConflict(key, row, program, current, true)
+			if code != replicatedstate.MutationValidationAccept || matched != tc.matched {
+				t.Fatalf("replica matched=%v code=%v", matched, code)
+			}
+			want, err = canonicalMutationCapturePostimage(want, 4096)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err = canonicalMutationCapturePostimage(got, 4096)
+			if err != nil || !bytes.Equal(got, want) {
+				t.Fatalf("got=%s want=%s err=%v", got, want, err)
+			}
+			got, matched, code = v.MaterializeConflict(key, row, program, nil, false)
+			if code != replicatedstate.MutationValidationAccept || !matched || !bytes.Equal(got, candidate) {
+				t.Fatalf("insert evaluated condition: %s %v %v", got, matched, code)
+			}
+		})
+	}
+	for _, set := range []string{`score=1 WHERE employees.absent=1`, `"$doc"=EXCLUDED."$doc" WHERE EXCLUDED.absent=1`} {
+		parsed, err := sqlast.ParseStatement(`INSERT INTO employees (id) VALUES ('unused') ON CONFLICT DO UPDATE SET ` + set)
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload, err := EncodeReplicatedConflictValue(candidate, parsed.Insert.OnConflictUpdate, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		row, program, _ := replication.OpenConflictValue(payload)
+		if _, _, code := v.MaterializeConflict(key, row, program, nil, false); code != replicatedstate.MutationValidationInvalid {
+			t.Fatalf("undeclared condition accepted: %s", set)
 		}
 	}
 }
@@ -92,7 +166,7 @@ func TestReplicatedConflictBoundsMaterializedCurrentRow(t *testing.T) {
 		t.Fatal(err)
 	}
 	row, program, _ := replication.OpenConflictValue(payload)
-	value, code := validator.MaterializeConflict(key, row, program, current, true)
+	value, _, code := validator.MaterializeConflict(key, row, program, current, true)
 	if code != replicatedstate.MutationValidationAccept || len(value) <= len(payload) || !bytes.Contains(value, []byte(large)) || validator.ValidatePut(key, value) != replicatedstate.MutationValidationAccept {
 		t.Fatalf("large current row lost or incorrectly bounded: size=%d code=%v", len(value), code)
 	}
@@ -105,7 +179,7 @@ func TestReplicatedConflictBoundsMaterializedCurrentRow(t *testing.T) {
 		t.Fatal(err)
 	}
 	row, program, _ = replication.OpenConflictValue(payload)
-	if _, code = validator.MaterializeConflict(key, row, program, current, true); code != replicatedstate.MutationValidationTargetBound {
+	if _, _, code = validator.MaterializeConflict(key, row, program, current, true); code != replicatedstate.MutationValidationTargetBound {
 		t.Fatalf("expanded conflict row escaped document bound: %v", code)
 	}
 }
@@ -121,8 +195,8 @@ func FuzzReplicatedConflictProgram(f *testing.F) {
 	}
 	_, program, _ := replication.OpenConflictValue(value)
 	f.Add(program)
-	computed, _ := sqlast.ParseStatement(`INSERT INTO employees VALUES (?) ON CONFLICT DO UPDATE SET score=CASE WHEN employees.active THEN employees.score+? ELSE EXCLUDED.score END`)
-	encoded, err := EncodeReplicatedConflictValue([]byte(`{"id":"a"}`), computed.Insert.OnConflictUpdate, []any{nil, int64(2)}, nil)
+	computed, _ := sqlast.ParseStatement(`INSERT INTO employees VALUES (?) ON CONFLICT DO UPDATE SET score=CASE WHEN employees.active THEN employees.score+? ELSE EXCLUDED.score END WHERE employees.score>?`)
+	encoded, err := EncodeReplicatedConflictValue([]byte(`{"id":"a"}`), computed.Insert.OnConflictUpdate, []any{nil, int64(2), int64(0)}, nil)
 	if err != nil {
 		f.Fatal(err)
 	}
@@ -132,15 +206,14 @@ func FuzzReplicatedConflictProgram(f *testing.F) {
 	schema := declaredEmployeeSchema(f)
 	validator, key, current := employeeValidator(f)
 	f.Fuzz(func(t *testing.T, raw []byte) {
-		assignments, err := decodeReplicatedConflictAssignments(raw, schema)
+		action, err := decodeReplicatedConflictAction(raw, schema)
 		if err != nil {
 			return
 		}
-		if len(assignments) == 0 || len(assignments) > replicatedConflictAssignmentLimit {
+		if len(action.Assignments) > replicatedConflictAssignmentLimit {
 			t.Fatal("unbounded program")
 		}
-		action := &sqlast.InsertConflictUpdate{Assignments: assignments}
-		if !ReplicatedConflictAssignments(action) {
+		if !ReplicatedConflictProgram(action) {
 			t.Fatal("accepted invalid assignment")
 		}
 		template, bindings, _ := openConflictProgram(raw)
@@ -190,7 +263,7 @@ func TestReplicatedConflictExpressionsShareLocalSemantics(t *testing.T) {
 			defer local.Release()
 			var exec query.Exec
 			defer exec.Release()
-			want, err := materializeConflictColumnAssignments(local, &exec, current, candidate, parsed.Insert.OnConflictUpdate.Assignments, tc.args, v.maxDocumentBytes)
+			want, _, err := materializeConflictUpdate(local, &exec, current, candidate, tc.args, v.maxDocumentBytes)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -203,11 +276,11 @@ func TestReplicatedConflictExpressionsShareLocalSemantics(t *testing.T) {
 				t.Fatal(err)
 			}
 			row, program, _ := replication.OpenConflictValue(payload)
-			got, code := v.MaterializeConflict(key, row, program, current, true)
+			got, _, code := v.MaterializeConflict(key, row, program, current, true)
 			if code != replicatedstate.MutationValidationAccept || !bytes.Equal(got, want) {
 				t.Fatalf("replica=%s code=%v local=%s", got, code, want)
 			}
-			got, code = v.MaterializeConflict(key, row, program, nil, false)
+			got, _, code = v.MaterializeConflict(key, row, program, nil, false)
 			if code != replicatedstate.MutationValidationAccept || !bytes.Equal(got, row) {
 				t.Fatalf("insert=%s code=%v", got, code)
 			}
@@ -238,7 +311,7 @@ func TestReplicatedConflictTemplateRebindAndConcurrentAudit(t *testing.T) {
 		} else if !bytes.Equal(template, next) {
 			t.Fatal("binding changed template")
 		}
-		got, code := v.MaterializeConflict(key, row, program, current, true)
+		got, _, code := v.MaterializeConflict(key, row, program, current, true)
 		if code != replicatedstate.MutationValidationAccept || !bytes.Contains(got, []byte(`"city":"Porto"`)) {
 			t.Fatalf("value=%s code=%v", got, code)
 		}
@@ -265,7 +338,7 @@ func TestReplicatedConflictTemplateRebindAndConcurrentAudit(t *testing.T) {
 			}
 			row, program, _ := replication.OpenConflictValue(payload)
 			for j := 0; j < 10; j++ {
-				if _, code := v.MaterializeConflict(key, row, program, current, true); code != replicatedstate.MutationValidationAccept {
+				if _, _, code := v.MaterializeConflict(key, row, program, current, true); code != replicatedstate.MutationValidationAccept {
 					t.Errorf("audit=%v", code)
 				}
 			}
@@ -286,10 +359,10 @@ func TestReplicatedConflictExpressionProgramValidationAndLaziness(t *testing.T) 
 			t.Fatal(err)
 		}
 		row, program, _ := replication.OpenConflictValue(payload)
-		if _, code := v.MaterializeConflict(key, row, program, nil, false); code != replicatedstate.MutationValidationAccept {
+		if _, _, code := v.MaterializeConflict(key, row, program, nil, false); code != replicatedstate.MutationValidationAccept {
 			t.Fatalf("unused branch=%v", code)
 		}
-		if _, code := v.MaterializeConflict(key, row, program, current, true); code != replicatedstate.MutationValidationInvalid {
+		if _, _, code := v.MaterializeConflict(key, row, program, current, true); code != replicatedstate.MutationValidationInvalid {
 			t.Fatalf("division accepted=%v", code)
 		}
 	}
@@ -300,7 +373,7 @@ func TestReplicatedConflictExpressionProgramValidationAndLaziness(t *testing.T) 
 			t.Fatal(err)
 		}
 		row, program, _ := replication.OpenConflictValue(payload)
-		if _, code := v.MaterializeConflict(key, row, program, nil, false); code != replicatedstate.MutationValidationInvalid {
+		if _, _, code := v.MaterializeConflict(key, row, program, nil, false); code != replicatedstate.MutationValidationInvalid {
 			t.Fatal("undeclared computed column accepted")
 		}
 	}
@@ -311,16 +384,16 @@ func TestReplicatedConflictExpressionProgramValidationAndLaziness(t *testing.T) 
 	}
 	row, program, _ := replication.OpenConflictValue(payload)
 	for n := 0; n < len(program); n++ {
-		if _, code := v.MaterializeConflict(key, row, program[:n], current, true); code != replicatedstate.MutationValidationInvalid {
+		if _, _, code := v.MaterializeConflict(key, row, program[:n], current, true); code != replicatedstate.MutationValidationInvalid {
 			t.Fatalf("accepted truncation %d", n)
 		}
 	}
-	if _, code := v.MaterializeConflict(key, row, append(bytes.Clone(program), 0), current, true); code != replicatedstate.MutationValidationInvalid {
+	if _, _, code := v.MaterializeConflict(key, row, append(bytes.Clone(program), 0), current, true); code != replicatedstate.MutationValidationInvalid {
 		t.Fatal("accepted trailing bytes")
 	}
 	malformed := bytes.Clone(program)
 	binary.LittleEndian.PutUint32(malformed, 0xffffffff)
-	if _, code := v.MaterializeConflict(key, row, malformed, current, true); code != replicatedstate.MutationValidationInvalid {
+	if _, _, code := v.MaterializeConflict(key, row, malformed, current, true); code != replicatedstate.MutationValidationInvalid {
 		t.Fatal("accepted overflow")
 	}
 	expression := &sqlast.ScalarExpr{Kind: sqlast.ScalarNull}
@@ -342,7 +415,7 @@ func TestReplicatedConflictTemplateGolden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const want = "01000100050073636f72650104000000050073636f72650104000000"
+	const want = "01000100050073636f72650104000000050073636f726501040000ff00"
 	if hex.EncodeToString(template) != want || len(ordinals) != 1 || ordinals[1] != 0 {
 		t.Fatalf("template=%x ordinals=%v", template, ordinals)
 	}
@@ -361,13 +434,13 @@ func BenchmarkReplicatedConflictMaterialization(b *testing.B) {
 				b.Fatal(err)
 			}
 			row, program, _ := replication.OpenConflictValue(value)
-			if _, code := v.MaterializeConflict(key, row, program, current, true); code != replicatedstate.MutationValidationAccept {
+			if _, _, code := v.MaterializeConflict(key, row, program, current, true); code != replicatedstate.MutationValidationAccept {
 				b.Fatal(code)
 			}
 			b.ReportAllocs()
 			b.ResetTimer()
 			for b.Loop() {
-				if _, code := v.MaterializeConflict(key, row, program, current, true); code != replicatedstate.MutationValidationAccept {
+				if _, _, code := v.MaterializeConflict(key, row, program, current, true); code != replicatedstate.MutationValidationAccept {
 					b.Fatal(code)
 				}
 			}
@@ -392,7 +465,7 @@ func TestReplicatedConflictPreservesParameterTypes(t *testing.T) {
 	if err != nil || len(decoded) != 1 || decoded[0] != query.ParameterTypeBool {
 		t.Fatalf("types=%v err=%v", decoded, err)
 	}
-	got, code := v.MaterializeConflict(key, row, program, current, true)
+	got, _, code := v.MaterializeConflict(key, row, program, current, true)
 	if code != replicatedstate.MutationValidationAccept || !bytes.Contains(got, []byte(`"active":false`)) {
 		t.Fatalf("typed result=%s code=%v", got, code)
 	}
