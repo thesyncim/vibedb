@@ -95,7 +95,7 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 			t.Logf("development cluster process diagnostics:\n%s", process.Diagnostics())
 		}
 	})
-	if err := process.WaitReady(ctx, "VibeDB development cluster ready:"); err != nil {
+	if err := process.WaitReady(ctx, "VibeDB development RF3 physical cluster ready:"); err != nil {
 		t.Fatalf("zero-config cluster readiness: %v\n%s", err, process.Diagnostics())
 	}
 	raw, err := os.ReadFile(filepath.Join(state, "cluster.vibejson"))
