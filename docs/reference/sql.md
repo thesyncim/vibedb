@@ -201,9 +201,13 @@ explicit GROUP BY. GROUP BY accepts stored paths, not expressions or ordinals.
 HAVING requires grouping/aggregation; its aggregates must also be projected and
 its plain paths must be group keys.
 
-ORDER BY accepts a path, projection alias, or positive one-based projection
-ordinal. Aliases win name resolution. A computed sort expression must be
-projected. NULLS FIRST/LAST is supported for paths, output aliases, ordinals,
+ORDER BY accepts a path, supported scalar expression, aggregate, projection
+alias, or positive one-based projection ordinal. Aliases win name resolution
+when they are the entire sort key. Computed keys can remain hidden from the
+output, including in grouped and window queries; ordinary paths in a grouped
+sort expression must be group keys. A numeric constant starting an arithmetic
+sort expression must be parenthesized to distinguish it from an ordinal.
+NULLS FIRST/LAST is supported for paths, expressions, output aliases, ordinals,
 and set-result ordering, including distributed result merging. Without an
 explicit NULLS clause, ascending uses nulls first and descending uses nulls last.
 COLLATE is unsupported.

@@ -2,12 +2,15 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"reflect"
 	"testing"
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/shardservice"
+	sqlast "github.com/thesyncim/vibedb/sql"
 )
 
 func TestCoordinatorQueryMatchesGlobalSQLSemantics(t *testing.T) {
@@ -21,6 +24,11 @@ func TestCoordinatorQueryMatchesGlobalSQLSemantics(t *testing.T) {
 		{`SELECT GREATEST(SUM(n), 5), LEAST(MAX(n), 3), NULLIF(COUNT(*), 0) FROM messages`, []string{"10|3|4"}},
 		{`SELECT n FROM messages WHERE n=1 OR COALESCE(n,0)=4 ORDER BY n`, []string{"1", "4"}},
 		{`SELECT d.n FROM (SELECT n, CASE WHEN n>2 THEN TRUE ELSE FALSE END AS visible FROM messages) AS d WHERE d.visible ORDER BY d.n`, []string{"3", "4"}},
+		{`SELECT n FROM messages ORDER BY GREATEST(n,0) DESC LIMIT 2`, []string{"4", "3"}},
+		{`SELECT n FROM messages ORDER BY -n LIMIT 2 OFFSET 1`, []string{"3", "2"}},
+		{`SELECT n FROM messages GROUP BY n ORDER BY COALESCE(SUM(n),0) DESC LIMIT 2`, []string{"4", "3"}},
+		{`SELECT a.n FROM messages AS a JOIN messages AS b ON a.n=b.n ORDER BY -b.n LIMIT 2`, []string{"4", "3"}},
+		{`SELECT n, ROW_NUMBER() OVER (ORDER BY n) AS rn FROM messages ORDER BY -n LIMIT 2`, []string{"4|4", "3|3"}},
 		{`SELECT AVG(n) FROM messages`, []string{"2.5"}},
 		{`SELECT n FROM messages ORDER BY n DESC LIMIT 2 OFFSET 1`, []string{"3", "2"}},
 		{`SELECT DISTINCT n FROM messages ORDER BY n`, []string{"1", "2", "3", "4"}},
@@ -47,6 +55,32 @@ func TestCoordinatorQueryMatchesGlobalSQLSemantics(t *testing.T) {
 				t.Fatalf("read %d shards", result.ShardsFanned)
 			}
 		})
+	}
+}
+
+func TestCoordinatorRejectsDeclaredDomainMismatchBeforeSourceIO(t *testing.T) {
+	config, endpoints, descriptor, profile := testReplicatedTableInput(t)
+	snapshot, err := NewSnapshotWithReplicatedTableMetadata(config, endpoints, 5, nil, nil,
+		[]ReplicatedShardDescriptor{descriptor}, []ReplicatedTableProfile{profile},
+		[]ReplicatedTableDeclaration{{Table: "messages", CreateTable: `CREATE TABLE messages (id TEXT PRIMARY KEY, score INTEGER)`}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := NewClient(func(context.Context, string) (net.Conn, error) {
+		t.Error("schema analysis opened a shard connection")
+		return nil, errors.New("unexpected shard read")
+	})
+	executor := NewExecutor(client, NewCatalogHolder(snapshot), Options{})
+	for _, statement := range []string{
+		`WITH c AS (SELECT id FROM messages WHERE id=score) SELECT id FROM c LIMIT 0`,
+		`WITH c AS (SELECT id,score FROM messages ORDER BY CASE WHEN id=score THEN 1 ELSE 0 END) SELECT id FROM c LIMIT 0`,
+		`SELECT COALESCE(SUM(score),0) FROM messages WHERE id=score`,
+	} {
+		_, err := executor.Query(t.Context(), Query{SQL: statement, Class: ClassBatch})
+		var mismatch *sqlast.UndefinedOperatorError
+		if !errors.As(err, &mismatch) {
+			t.Fatalf("%s: expected schema operator mismatch, got %T %v", statement, err, err)
+		}
 	}
 }
 func joinedSQLCells(row []shardservice.Cell) string {

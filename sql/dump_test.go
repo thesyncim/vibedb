@@ -98,7 +98,9 @@ func dumpStmt(s *SelectStmt) string {
 		b.WriteString(" order")
 		for i := range s.OrderBy {
 			b.WriteByte(' ')
-			if s.OrderBy[i].Output != 0 {
+			if s.OrderBy[i].Scalar != nil {
+				dumpScalar(&b, s.OrderBy[i].Scalar)
+			} else if s.OrderBy[i].Output != 0 {
 				fmt.Fprintf(&b, "output(%d)", s.OrderBy[i].Output-1)
 			} else {
 				dumpPath(&b, s.OrderBy[i].Path)

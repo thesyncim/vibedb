@@ -39,7 +39,6 @@ var SQLWorkloadGaps = []SQLWorkloadGap{
 	{"string_functions", `SELECT lower(id) FROM compatibility_docs`},
 	{"time_arithmetic", `SELECT NOW() + INTERVAL '1 second'`},
 	{"null_safe_comparison", `SELECT id FROM compatibility_docs WHERE n IS DISTINCT FROM 0`},
-	{"computed_order_key", `SELECT id FROM compatibility_docs ORDER BY GREATEST(n, 0)`},
 	{"computed_group_key", `SELECT COALESCE(n, 0), COUNT(*) FROM compatibility_docs GROUP BY COALESCE(n, 0)`},
 	{"scalar_predicate_before_group", `SELECT COUNT(*) FROM compatibility_docs WHERE COALESCE(n, 0) > 0`},
 	{"derived_wildcard_scalar_projection", `SELECT d.*, COALESCE(d.n, 0) FROM (SELECT * FROM compatibility_docs) AS d`},

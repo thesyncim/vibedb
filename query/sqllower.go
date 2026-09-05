@@ -187,6 +187,8 @@ func (s *Statement) buildWindow(w *statementWindow, args []any) error {
 				return fmt.Errorf("query: window ORDER BY output is outside the SELECT list")
 			}
 			ordinal = w.outputs[w.outputStart[column]].ordinal
+		} else if term.Scalar != nil {
+			ordinal = w.orderInput[i]
 		} else {
 			ordinal = w.inputOrdinal(term.Path)
 		}
@@ -288,10 +290,8 @@ func (s *Statement) buildGroupBy() error {
 //
 // The engine orders nulls first ascending and last descending, which SQL
 // leaves implementation-defined and PostgreSQL answers the other way round for
-// ASC. That one is genuinely not repairable here: the plan has no nulls-first
-// or nulls-last knob, and the ordering happens inside the executor's sort. It
-// is documented as a deviation rather than papered over, and NULLS FIRST and
-// NULLS LAST are refused by the parser instead of being silently ignored.
+// ASC. Explicit NULLS FIRST/LAST overrides that historical default through the
+// shared ordered-scalar comparator in each in-memory and spill sort path.
 func (s *Statement) buildOrderBy() error {
 	if scalar := s.scalarStatement(); scalar != nil && scalar.ordered != nil {
 		return nil
@@ -585,6 +585,18 @@ func (s *Statement) fansOut(i int) bool {
 // into the clause's own filter, where it narrows the joined side before the
 // pairing rather than reading a column of the result.
 func (s *Statement) reads(i int) bool {
+	if runtime := s.scalarStatement(); runtime != nil {
+		for _, dep := range runtime.deps {
+			if dep.path != nil && dep.path.Source == i {
+				return true
+			}
+		}
+		for _, dep := range runtime.semanticDeps {
+			if dep.path != nil && dep.path.Source == i {
+				return true
+			}
+		}
+	}
 	for j := range s.tree.Columns {
 		if path := s.tree.Columns[j].Path; path != nil && path.Source == i {
 			return true
@@ -596,7 +608,7 @@ func (s *Statement) reads(i int) bool {
 		}
 	}
 	for j := range s.tree.OrderBy {
-		if s.tree.OrderBy[j].Path.Source == i {
+		if path := s.tree.OrderBy[j].Path; path != nil && path.Source == i {
 			return true
 		}
 	}

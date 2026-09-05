@@ -9,7 +9,6 @@ import (
 	"github.com/thesyncim/vibedb/query"
 	"github.com/thesyncim/vibedb/shardservice"
 	sqlast "github.com/thesyncim/vibedb/sql"
-	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibedb/store"
 )
 
@@ -122,10 +121,7 @@ func (e *Executor) queryCoordinator(ctx context.Context, snap *Snapshot, q Query
 	if err != nil {
 		return nil, err
 	}
-	resolve := snap.coordinatorPathDomain
-	if err := sqldriver.ValidateSQLPathComparisonDomains(q.SQL, prepared.statement.Select, resolve); err != nil {
-		return nil, err
-	}
+	resolve := snap.declaredSQLPathDomain
 	compiled.ProveSQLPathComparisonDomains(resolve)
 	tables := sourcePlan.tables
 	all := sourcePlan.dispatch
@@ -209,12 +205,13 @@ func (e *Executor) queryCoordinator(ctx context.Context, snap *Snapshot, q Query
 	return result, nil
 }
 
-func (snap *Snapshot) coordinatorPathDomain(table, pointer string) query.SQLPathDomain {
-	info, ok := snap.declaredTableInfo(table)
+func (snap *Snapshot) declaredSQLPathDomain(table, pointer string) query.SQLPathDomain {
+	i, ok := slices.BinarySearchFunc(snap.replicatedTableDeclarations, table,
+		func(a replicatedTableDeclaration, b string) int { return strings.Compare(a.declaration.Table, b) })
 	if !ok {
 		return query.SQLPathDomainUnknown
 	}
-	for _, column := range info.Columns {
+	for _, column := range snap.replicatedTableDeclarations[i].info.Columns {
 		if column.Path != pointer {
 			continue
 		}

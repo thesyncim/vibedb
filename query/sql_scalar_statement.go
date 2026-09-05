@@ -193,6 +193,9 @@ func selectNeedsPostScalarOrder(tree *sqlast.SelectStmt) bool {
 		return true
 	}
 	for i := range tree.OrderBy {
+		if tree.OrderBy[i].Scalar != nil {
+			return true
+		}
 		output := tree.OrderBy[i].Output - 1
 		if output < 0 || output >= len(tree.Columns) {
 			continue
@@ -222,6 +225,12 @@ func exprHasScalar(expr *sqlast.Expr) bool {
 }
 
 func (s *Statement) prepareScalar(preserveUnknownOutput bool) error {
+	if s.window() != nil {
+		// The window input already evaluates the authored scalar projections,
+		// predicates and hidden sort keys. The final window stage addresses
+		// those materialized columns by ordinal.
+		return nil
+	}
 	if !selectHasScalar(s.tree) && !selectNeedsPostScalarOrder(s.tree) {
 		return nil
 	}
@@ -231,10 +240,6 @@ func (s *Statement) prepareScalar(preserveUnknownOutput bool) error {
 		}
 	}
 	postOrder := selectNeedsPostScalarOrder(s.tree)
-	if s.window() != nil {
-		return sqlast.NewFeatureNotSupportedError(s.text, firstScalarStatementPos(s.tree),
-			"computed scalar expressions over window statements require the post-window scalar stage")
-	}
 	hasScalar := selectHasScalar(s.tree)
 	if s.tree.Distinct && hasScalar {
 		return sqlast.NewFeatureNotSupportedError(s.text, firstScalarStatementPos(s.tree),
@@ -321,7 +326,15 @@ func (s *Statement) prepareScalar(preserveUnknownOutput bool) error {
 		for i := range s.tree.OrderBy {
 			term := &s.tree.OrderBy[i]
 			var start, end, root int32
-			if term.Output != 0 {
+			if term.Scalar != nil {
+				start = int32(len(runtime.nodes))
+				var err error
+				root, err = runtime.compileExpr(s, term.Scalar)
+				if err != nil {
+					return err
+				}
+				end = int32(len(runtime.nodes))
+			} else if term.Output != 0 {
 				output := term.Output - 1
 				if output < 0 || output >= len(runtime.outputs) {
 					return fmt.Errorf("query: malformed ORDER BY output %d", term.Output)
@@ -449,6 +462,11 @@ func selectHasAggregate(tree *sqlast.SelectStmt) bool {
 			return true
 		}
 	}
+	for i := range tree.OrderBy {
+		if scalarHasAggregate(tree.OrderBy[i].Scalar) {
+			return true
+		}
+	}
 	return false
 }
 
@@ -494,6 +512,11 @@ func firstScalarStatementPos(tree *sqlast.SelectStmt) int {
 	}
 	if exprHasScalar(tree.Where) {
 		return firstScalarExprPos(tree.Where)
+	}
+	for _, term := range tree.OrderBy {
+		if term.Scalar != nil {
+			return term.Pos
+		}
 	}
 	return firstScalarExprPos(tree.Having)
 }

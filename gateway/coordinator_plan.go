@@ -135,7 +135,7 @@ func (e *Executor) explainCoordinator(ctx context.Context, snap *Snapshot, q Que
 		return nil, err
 	}
 	compiled.Release()
-	if err := sqldriver.ValidateSQLPathComparisonDomains(q.SQL, prepared.statement.Select, snap.coordinatorPathDomain); err != nil {
+	if err := sqldriver.ValidateSQLPathComparisonDomains(q.SQL, prepared.statement.Select, snap.declaredSQLPathDomain); err != nil {
 		return nil, err
 	}
 	sourcePlan, err := e.planCoordinator(ctx, snap, q, prepared, profile, args)

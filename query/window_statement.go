@@ -62,6 +62,7 @@ type statementWindow struct {
 
 	originalInput []int
 	outputStart   []int
+	orderInput    []int
 	ordinalSpec   []string
 	specData      []byte
 	viewColumns   [][]scalar
@@ -148,9 +149,17 @@ func (s *Statement) prepareWindow(
 			w.ensureInput(window.Spec.OrderBy[j].Path)
 		}
 	}
+	w.orderInput = make([]int, len(s.tree.OrderBy))
 	for i := range s.tree.OrderBy {
-		if s.tree.OrderBy[i].Output == 0 {
-			w.ensureInput(s.tree.OrderBy[i].Path)
+		term := &s.tree.OrderBy[i]
+		w.orderInput[i] = -1
+		if term.Scalar != nil {
+			w.orderInput[i] = len(w.inputColumns)
+			w.inputColumns = append(w.inputColumns, sqlast.ResultColumn{
+				Scalar: term.Scalar, Pos: term.Pos,
+			})
+		} else if term.Output == 0 {
+			w.ensureInput(term.Path)
 		}
 	}
 	if len(w.inputColumns) == 0 {
@@ -192,6 +201,11 @@ func (s *Statement) prepareWindow(
 	}
 	for i := range w.inputs {
 		w.inputs[i].ordinal = starts[w.inputs[i].column]
+	}
+	for i, column := range w.orderInput {
+		if column >= 0 {
+			w.orderInput[i] = starts[column]
+		}
 	}
 	inputColumns := len(input.Columns())
 	for i := range s.tree.Columns {

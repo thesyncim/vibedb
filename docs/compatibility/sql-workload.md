@@ -4,7 +4,7 @@ This audit compares the Chat product and its shared database layer in the local
 `chat` repository with VibeDB main at `9454ced0` (2026-09-05). **The application
 cannot yet run unchanged on VibeDB.** This change implements the conditional
 expressions, Boolean tests, explicit null ordering, INSERT NULL literals, and
-single-column primary conflict targets described below. The remaining reduced
+single-column primary conflict targets, and computed sort keys described below. The remaining reduced
 SQL cases stay executable as a gap inventory. Full-text search is excluded.
 
 ## Evidence and reproducibility
@@ -44,9 +44,10 @@ source locations, not query execution counts or a compatibility percentage.
 | NULLS FIRST/LAST | 59 | Path, alias, ordinal, set, window-output, grouped, heap, and disk-spill ordering; distributed merge and planner ordering properties use the same placement. Existing default ordering is preserved. |
 | NULL in INSERT column VALUES | — | Literal NULL reaches the existing nullable-field validator; primary-key and NOT NULL failures remain atomic. |
 | Explicit ON CONFLICT target | 58 | A single primary-key column is validated at prepare and execution, including explicit transactions. Composite and secondary unique targets remain unsupported. Secondary unique violations are never silently skipped. |
+| Computed ORDER BY | 69 GREATEST/LEAST locations include sort usage | Hidden scalar and aggregate sort keys run before OFFSET/LIMIT. Grouping, joins, derived relations, and window outputs retain their own semantic stages; distributed sorts evaluate the complete qualifying relation. |
 
 These features do not remove the existing restrictions on computed GROUP BY
-and ORDER BY expressions, mixed scalar/path pattern predicates, grouped scalar
+expressions, mixed scalar/path pattern predicates, grouped scalar
 filters, derived-table wildcard projections, or distributed mutation syntax.
 There is no general scalar-function catalog. Use explicit casts between
 different scalar domains; general PostgreSQL unknown-literal/type coercion is
@@ -85,6 +86,10 @@ source plan and fingerprint, with per-source fanout and scatter reasons.
 
 Atomic RF3 `ON CONFLICT DO NOTHING` validates candidates before deciding the
 primary-key branch, reports exact affected rows, and preserves retry results.
+On legacy shards without global indexes, a single-owner `DO UPDATE` executes
+the original conflict action atomically in the shard driver. Arbitrary shard-key
+assignments still require a placement proof; copying the current or candidate
+key and whole-document EXCLUDED replacement preserve the routed owner.
 Global-index conflict maintenance, DO UPDATE, RETURNING, general mutation
 predicates, and explicit transaction parity still need implementation. The
 bounded coordinator read path also still needs full RF3 global-index read
@@ -94,7 +99,7 @@ not claims closed by local tests.
 ## Remaining work
 
 The [SQL workload gap corpus](../../internal/conformance/sql_workload.go)
-contains 36 reduced statements. The
+contains 35 reduced statements. The
 [driver gate](../../sql/driver/sql_workload_compatibility_test.go) verifies that
 each still refuses at prepare or execution. When implementing a gap, replace
 its refusal expectation with result, metadata, and atomicity coverage and
@@ -109,7 +114,7 @@ update this table. A parser accepting a statement does not close a gap.
 | 1 | Relational mutations and queues | 36 UPDATE-FROM/DELETE-USING and 14 modifying-CTE locations. Requires atomic shared-snapshot execution, INSERT-SELECT with target columns, conflict-action WHERE, and returned-row dependencies. |
 | 1 | Locking and queue concurrency | 14 locking locations, including FOR UPDATE / SKIP LOCKED. Requires a real concurrency contract; accepting and ignoring lock clauses would be incorrect. |
 | 2 | Expression, partial, ordered, and covering indexes | 205 index-related locations. Required both for schema acceptance and efficient channel/member queries; uniqueness predicates and access-path proofs must remain correct. |
-| 2 | Remaining query expressions | Arbitrary computed sort/group keys; mixed scalar/path pattern predicates; scalar filtering before aggregates; derived wildcard + scalar outputs; IS DISTINCT FROM; string/date functions; DISTINCT ON; aggregate DISTINCT/FILTER and array/JSON aggregation. |
+| 2 | Remaining query expressions | Computed group keys; mixed scalar/path pattern predicates; scalar filtering before aggregates; derived wildcard + scalar outputs; IS DISTINCT FROM; string/date functions; DISTINCT ON; aggregate DISTINCT/FILTER and array/JSON aggregation. |
 | 2 | ALTER and migration lifecycle | 375 ALTER locations. Current ADD COLUMN is insufficient for historical migrations, type/default changes, drops, and index changes. |
 | 2 | Bulk and client/session behavior | 5 COPY and 10 session/catalog locations, plus ORM-generated connection and relation queries not established by static extraction. Requires wire/client tests and bounded bulk ingestion. |
 | 1 before application rollout | Distributed execution parity | Existing RF3 SQL mutation restrictions on ON CONFLICT, RETURNING, non-primary-key mutations, and bounded transactions still apply. Local database/sql success is not evidence that every RF3 path supports a feature. |

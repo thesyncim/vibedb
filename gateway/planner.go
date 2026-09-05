@@ -249,6 +249,9 @@ func (s *Snapshot) Prepare(ctx context.Context, sqlText string) (*PreparedPlan, 
 	if err := validatePlanPhysicalTables(s, selectStmt, make(map[*sqlast.SelectStmt]struct{})); err != nil {
 		return nil, err
 	}
+	if err := sqldriver.ValidateSQLPathComparisonDomains(sqlText, selectStmt, s.declaredSQLPathDomain); err != nil {
+		return nil, err
+	}
 	if len(selectStmt.From) == 0 || selectStmt.From[0].Kind != sqlast.RelationCollection {
 		// Relations without a physical driving table execute at the coordinator.
 		return plan, nil
@@ -821,6 +824,11 @@ func selectHasPhysicalPredicateSubquery(stmt *sqlast.SelectStmt) bool {
 			return true
 		}
 	}
+	for i := range stmt.OrderBy {
+		if scalarHasPhysicalSubquery(stmt.OrderBy[i].Scalar) {
+			return true
+		}
+	}
 	return false
 }
 
@@ -964,6 +972,11 @@ func validatePlanPhysicalTables(
 	}
 	for i := range stmt.Columns {
 		if err := validatePlanScalarPhysicalTables(snap, stmt.Columns[i].Scalar, seen); err != nil {
+			return err
+		}
+	}
+	for i := range stmt.OrderBy {
+		if err := validatePlanScalarPhysicalTables(snap, stmt.OrderBy[i].Scalar, seen); err != nil {
 			return err
 		}
 	}

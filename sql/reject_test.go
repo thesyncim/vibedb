@@ -113,7 +113,6 @@ func TestRejectsConstructsTheEngineCannotExecute(t *testing.T) {
 		{"FETCH FIRST", `SELECT a FROM t FETCH FIRST 1 ROWS ONLY`, 16, "write LIMIT"},
 		{"COLLATE", `SELECT a FROM t ORDER BY a COLLATE "C"`, 27, "COLLATE"},
 		{"GROUP BY an output position", `SELECT a FROM t GROUP BY 1`, 25, "output position"},
-		{"ORDER BY an aggregate", `SELECT team, SUM(a) FROM t GROUP BY team ORDER BY SUM(a)`, 53, "not by their reduction"},
 		{"GROUP BY an aggregate", `SELECT SUM(a) FROM t GROUP BY SUM(a)`, 33, "computed per group"},
 	})
 }
