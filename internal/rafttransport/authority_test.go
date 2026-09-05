@@ -145,7 +145,7 @@ func TestCommittedAuthoritySeparatesEnrollmentAndBoundsAdjacentGenerations(t *te
 	}
 	preRemovalSource := frameTestEncode(t, leader, group, frameTestMessage(pb.MsgHeartbeat, 1, 3))
 	preRemovalVote := frameTestEncode(t, leader, group, frameTestMessage(pb.MsgVote, 1, 3))
-	preRemovalRemaining := frameTestEncode(t, follower, group, frameTestMessage(pb.MsgHeartbeat, 2, 3))
+	preRemovalRemaining := frameTestEncode(t, follower, group, frameTestMessage(pb.MsgAppResp, 2, 3))
 	removed := &pb.ConfState{Voters: []uint64{2, 3, 4}}
 	for _, registry := range []*StaticRegistry{leader, follower, target} {
 		// Normal entries may separate configuration entries, so authority
