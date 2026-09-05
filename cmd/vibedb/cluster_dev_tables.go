@@ -496,7 +496,7 @@ func composeDevGroupManifest(paths []string) ([]byte, error) {
 			if len(source["node_log"]) != 0 && !bytes.Equal(process["node_log"], source["node_log"]) {
 				return nil, fmt.Errorf("%w: group changes shared node log", errDevCluster)
 			}
-			for _, key := range []string{"listeners", "tls", "authorization_policy"} {
+			for _, key := range []string{"listeners", "tls", "authorization_policy", "read_authority"} {
 				if !bytes.Equal(process[key], source[key]) {
 					return nil, fmt.Errorf("%w: group changes shared %s", errDevCluster, key)
 				}
@@ -508,7 +508,11 @@ func composeDevGroupManifest(paths []string) ([]byte, error) {
 		return nil, err
 	}
 	process["groups"] = raw
-	order := []string{"listeners", "tls", "authorization_policy", "replica_control", "split_control", "groups"}
+	order := []string{"listeners", "tls", "authorization_policy", "replica_control", "split_control"}
+	if len(process["read_authority"]) != 0 {
+		order = append(order, "read_authority")
+	}
+	order = append(order, "groups")
 	if len(process["node_log"]) != 0 {
 		order = append([]string{"node_log"}, order...)
 	}

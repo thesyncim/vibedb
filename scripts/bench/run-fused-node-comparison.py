@@ -90,6 +90,27 @@ def run(argv, *, cwd=None, env=None, check=True, stdout=None, stderr=None):
     return completed
 
 
+def wait_for_diagnostic_preflight(process, container, ready_file, timeout=15):
+    """Wait for every configured group/member to pass status and metrics cuts."""
+    started = time.monotonic()
+    deadline = started + timeout
+    while time.monotonic() < deadline:
+        exit_code = process.poll()
+        if exit_code is not None:
+            raise RunnerError(
+                f"per-group diagnostic preflight failed with exit code {exit_code}")
+        ready = run(["docker", "exec", container, "test", "-s", ready_file],
+                    check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if ready.returncode == 0:
+            return time.monotonic() - started
+        time.sleep(0.1)
+    exit_code = process.poll()
+    if exit_code is not None:
+        raise RunnerError(
+            f"per-group diagnostic preflight failed with exit code {exit_code}")
+    raise RunnerError("per-group diagnostic preflight did not become ready")
+
+
 def text_output(argv, *, cwd=None, env=None, check=True):
     completed = run(argv, cwd=cwd, env=env, check=check,
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -679,6 +700,8 @@ def run_engine(args, cell, engine, order, binaries, destination, schema, arch):
     volume = container + "-data"
     processes = []
     open_logs = []
+    diagnostic_process = None
+    diagnostic_log = None
     container_created = False
     result = {
         "engine": engine,
@@ -888,6 +911,32 @@ def run_engine(args, cell, engine, order, binaries, destination, schema, arch):
             result["diagnostics"] = {"mode": "signal-acknowledged-snapshots", "targets": targets,
                                      "boundaries": "after warmup/before timer; after timer/before verification",
                                      "counter_deltas_include_background_work_between_snapshots": True}
+            if getattr(args, "rf3_diagnostic", False):
+                diagnostic_ready_file = "/evidence/rf3-diagnostic-ready"
+                run(["docker", "exec", container, "rm", "-f", diagnostic_ready_file],
+                    check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                diagnostic_log = (destination / "per-group-diagnostic.log").open("wb")
+                diagnostic_process = subprocess.Popen(
+                    ["docker", "exec", container, "/bench/rf3-diagnostic",
+                     "-root", "/data/vibe",
+                     "-output", "/evidence/per-group-snapshots.jsonl",
+                     "-ready-file", diagnostic_ready_file,
+                     "-interval", "500ms",
+                     "-request-timeout", "350ms",
+                     "-max-bytes", str(8 << 20)],
+                    stdout=diagnostic_log, stderr=subprocess.STDOUT)
+                result["diagnostics"]["per_group"] = {
+                    "binary": "/bench/rf3-diagnostic",
+                    "output": "per-group-snapshots.jsonl",
+                    "interval_ms": 500,
+                    "request_timeout_ms": 350,
+                    "max_bytes": 8 << 20,
+                    "sampling_cost_excluded_from_sql_measurement": True,
+                    "preflight": "all group/member status and metrics cuts required before client launch",
+                    "ready_file": diagnostic_ready_file,
+                }
+                result["diagnostics"]["per_group_preflight_seconds"] = wait_for_diagnostic_preflight(
+                    diagnostic_process, container, diagnostic_ready_file)
         result["status"] = "measuring"
         write_json(destination / "run.json", result)
         client_log = (destination / "client.log").open("wb")
@@ -903,6 +952,24 @@ def run_engine(args, cell, engine, order, binaries, destination, schema, arch):
                                       stdout=client_log, stderr=subprocess.STDOUT, check=False)
         finally:
             client_log.close()
+        if diagnostic_process is not None:
+            diagnostic_process.terminate()
+            try:
+                diagnostic_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                diagnostic_process.kill()
+                diagnostic_process.wait(timeout=5)
+            result["diagnostics"]["per_group_exit_code"] = diagnostic_process.returncode
+            diagnostic_process = None
+            if diagnostic_log is not None:
+                diagnostic_log.close()
+                diagnostic_log = None
+            copied = run(["docker", "cp", container + ":/evidence/per-group-snapshots.jsonl",
+                          destination / "per-group-snapshots.jsonl"], check=False,
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            result["diagnostics"]["per_group_copied"] = copied.returncode == 0
+            if copied.returncode != 0:
+                result["errors"].append("per-group diagnostic output was not retained")
         result.setdefault("log_files", []).append("client.log")
         result["client_exit_code"] = measured.returncode
         result["status"] = "completed" if measured.returncode == 0 else "failed"
@@ -944,6 +1011,17 @@ def run_engine(args, cell, engine, order, binaries, destination, schema, arch):
         result["status"] = "failed"
         result["errors"].append(str(exc))
     finally:
+        if diagnostic_process is not None:
+            diagnostic_process.terminate()
+            try:
+                diagnostic_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                diagnostic_process.kill()
+                diagnostic_process.wait(timeout=5)
+            diagnostic_process = None
+        if diagnostic_log is not None:
+            diagnostic_log.close()
+            diagnostic_log = None
         if result["status"] not in {"completed", "failed"}:
             result["status"] = "incomplete"
             result["errors"].append("runner interrupted before the fixture completed")

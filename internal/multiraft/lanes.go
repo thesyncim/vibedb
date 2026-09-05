@@ -129,6 +129,13 @@ func (lane *ExecutionLane) StartReadAuthorityRound(key raftmember.GroupKey) erro
 	return lane.set.StartReadAuthorityRound(key)
 }
 
+func (lane *ExecutionLane) EnsureReadAuthorityRound(key raftmember.GroupKey) error {
+	if err := lane.accepts(key); err != nil {
+		return err
+	}
+	return lane.set.EnsureReadAuthorityRound(key)
+}
+
 func (lane *ExecutionLane) ReadAuthorityToken(
 	key raftmember.GroupKey,
 ) (raftauthority.AuthorityToken, error) {
@@ -572,6 +579,32 @@ func (set *ExecutionLanes) StartReadAuthorityRound(key raftmember.GroupKey) erro
 	return set.withGroup(key, func(host *Host) error {
 		return host.StartReadAuthorityRound(key)
 	})
+}
+
+func (set *ExecutionLanes) EnsureReadAuthorityRound(key raftmember.GroupKey) error {
+	return set.withGroup(key, func(host *Host) error {
+		return host.EnsureReadAuthorityRound(key)
+	})
+}
+
+// ReadAuthorityRoundMetrics returns one detached aggregate over all execution
+// lanes. Each lane is sampled under its owner lock, so a diagnostic cut never
+// races a Runtime mutation or retains any group state.
+func (set *ExecutionLanes) ReadAuthorityRoundMetrics() raftmember.ReadAuthorityRoundMetrics {
+	if set == nil {
+		return raftmember.ReadAuthorityRoundMetrics{}
+	}
+	var total raftmember.ReadAuthorityRoundMetrics
+	for index := range set.lanes {
+		lane := &set.lanes[index]
+		lane.mu.Lock()
+		metrics := lane.host.ReadAuthorityRoundMetrics()
+		lane.mu.Unlock()
+		total.RoundsStarted += metrics.RoundsStarted
+		total.RequestsCreated += metrics.RequestsCreated
+		total.GrantsAccepted += metrics.GrantsAccepted
+	}
+	return total
 }
 
 func (set *ExecutionLanes) ReadAuthorityToken(

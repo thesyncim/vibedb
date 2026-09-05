@@ -64,6 +64,7 @@ type prepareRF3Manifest struct {
 	AuthorizationPolicy   string                                    `json:"authorization_policy"`
 	SplitControl          prepareRF3SplitControl                    `json:"split_control"`
 	DevelopmentOnly       bool                                      `json:"development_only,omitempty"`
+	ReadAuthority         *rf3ManifestReadAuthority                 `json:"read_authority,omitempty"`
 	Members               []prepareRF3Member                        `json:"members"`
 }
 
@@ -115,9 +116,11 @@ type prepareRF3Apply struct {
 }
 
 type prepareRF3Member struct {
-	MemberID    uint64 `json:"member_id"`
-	NodeID      string `json:"node_id"`
-	PeerAddress string `json:"peer_address"`
+	MemberID      uint64 `json:"member_id"`
+	NodeID        string `json:"node_id"`
+	PeerAddress   string `json:"peer_address"`
+	StoreID       string `json:"store_id,omitempty"`
+	NativeAddress string `json:"native_address,omitempty"`
 }
 
 type persistedRF3Manifest struct {
@@ -131,6 +134,7 @@ type persistedRF3Manifest struct {
 	ReplicaControl      persistedRF3ReplicaControl `json:"replica_control"`
 	SplitControl        persistedRF3SplitControl   `json:"split_control"`
 	DevelopmentOnly     bool                       `json:"development_only,omitempty"`
+	ReadAuthority       *rf3ManifestReadAuthority  `json:"read_authority,omitempty"`
 	Members             []persistedRF3Member       `json:"members"`
 }
 
@@ -234,9 +238,11 @@ type persistedRF3ReplicaControl struct {
 	SourceChunkBytes       uint32 `json:"source_chunk_bytes"`
 }
 type persistedRF3Member struct {
-	MemberID    uint64 `json:"member_id"`
-	NodeID      string `json:"node_id"`
-	PeerAddress string `json:"peer_address"`
+	MemberID      uint64 `json:"member_id"`
+	NodeID        string `json:"node_id"`
+	PeerAddress   string `json:"peer_address"`
+	StoreID       string `json:"store_id,omitempty"`
+	NativeAddress string `json:"native_address,omitempty"`
 }
 
 func runPrepareRF3(args []string) int {
@@ -663,6 +669,22 @@ func validatePrepareRF3(input prepareRF3Manifest) (raftstore.Identity, sqldriver
 	if !found {
 		return bad()
 	}
+	if input.ReadAuthority != nil {
+		members := make([]rf3ManifestMember, len(input.Members))
+		for index, member := range input.Members {
+			members[index] = rf3ManifestMember{MemberID: member.MemberID, NodeID: nodes[index], PeerAddress: member.PeerAddress, NativeAddress: member.NativeAddress}
+			if member.StoreID == "" || !decodeRF3FixedHex(member.StoreID, members[index].StoreID[:], false) {
+				return bad()
+			}
+		}
+		var roster [rf3ManifestMembers]rf3ManifestMember
+		copy(roster[:], members)
+		if err := validateRF3ReadAuthority(input.ReadAuthority, []rf3ManifestGroup{{
+			Members: roster, MemberCount: uint8(len(members)),
+		}}, input.DevelopmentOnly); err != nil {
+			return bad()
+		}
+	}
 	if input.SplitControl.MaxRecords <= 0 || input.SplitControl.MaxRecords > 1<<20 ||
 		input.SplitControl.MaxFileBytes < int64(protocol.MaxPayloadBytes) ||
 		input.SplitControl.MaxFileBytes > 1<<40 || len(input.SplitControl.Grants) == 0 ||
@@ -831,13 +853,15 @@ func buildPreparedRF3Manifest(input prepareRF3Manifest, nodes [3]rafttransport.N
 			ChildRegistry: childRegistry,
 		},
 		DevelopmentOnly: input.DevelopmentOnly,
+		ReadAuthority:   input.ReadAuthority,
 		Members:         make([]persistedRF3Member, len(input.Members)),
 	}
 	for index, grant := range input.SplitControl.Grants {
 		m.SplitControl.Grants[index] = persistedRF3ActionGrant{NodeID: grant.NodeID, Actions: grant.Actions}
 	}
 	for i, member := range input.Members {
-		m.Members[i] = persistedRF3Member{MemberID: member.MemberID, NodeID: hex.EncodeToString(nodes[i][:]), PeerAddress: member.PeerAddress}
+		storeID := member.StoreID
+		m.Members[i] = persistedRF3Member{MemberID: member.MemberID, NodeID: hex.EncodeToString(nodes[i][:]), PeerAddress: member.PeerAddress, StoreID: storeID, NativeAddress: member.NativeAddress}
 		m.SplitControl.ChildRegistry.Members[i] = m.Members[i]
 	}
 	return m
