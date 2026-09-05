@@ -54,6 +54,15 @@ func (controller *gatewayReplicaHealthRevisionController) RunPass(
 	if err != nil || catalog == nil {
 		return gatewayReplicaHealthRevisionPass{}, errors.Join(err, errGatewayReplicaHealth)
 	}
+	if source, ok := controller.observations.(interface {
+		BeginHealthRound(context.Context) *replicacontrol.HealthRound
+	}); ok {
+		round := source.BeginHealthRound(ctx)
+		defer round.Close()
+		scoped := *controller
+		scoped.observations = round
+		controller = &scoped
+	}
 	descriptors := catalog.ReplicatedShardDescriptors()
 	slices.SortFunc(descriptors, compareHealthDescriptors)
 	var pass gatewayReplicaHealthRevisionPass
