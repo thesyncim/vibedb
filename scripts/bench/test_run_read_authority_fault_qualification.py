@@ -226,6 +226,15 @@ class FaultQualificationProvenanceTest(unittest.TestCase):
                     "authority_available": True,
                     "metrics": dict(counters),
                 })
+            acknowledged = {
+                node["node_id"]: {
+                    "node_id": node["node_id"],
+                    "utc": node["utc"],
+                    "serial": node["serial"],
+                    "pid": node["pid"],
+                }
+                for node in nodes
+            }
             cycle = {
                 "schema": "vibedb.rf3-diagnostic/1",
                 "sequence": 7,
@@ -234,33 +243,50 @@ class FaultQualificationProvenanceTest(unittest.TestCase):
                 "valid_cuts": 21,
                 "preflight_ready": True,
                 "node_metrics": nodes,
-                "latch": {"sequence": 7, "complete": True},
+                "latch": {
+                    "sequence": 7,
+                    "complete": True,
+                    "requested_utc": "2026-09-05T18:00:00Z",
+                    "armed_utc": "2026-09-05T18:00:01Z",
+                    "captured_utc": "2026-09-05T18:00:03Z",
+                },
             }
-            path.write_text(json.dumps({
-                "schema": "vibedb.rf3-diagnostic-latch/1",
-                "event": "post-cont",
-                "requested_utc": "2026-09-05T18:00:00Z",
-                "armed_utc": "2026-09-05T18:00:01Z",
-                "captured_utc": "2026-09-05T18:00:03Z",
-                "sequence": 7,
-                "cycle": cycle,
-            }))
-            summary = MODULE.validate_post_cont_latch(path)
+
+            def write_artifact():
+                path.write_text(json.dumps({
+                    "schema": "vibedb.rf3-diagnostic-latch/1",
+                    "event": "post-cont",
+                    "requested_utc": "2026-09-05T18:00:00Z",
+                    "armed_utc": "2026-09-05T18:00:01Z",
+                    "captured_utc": "2026-09-05T18:00:03Z",
+                    "sequence": 7,
+                    "cycle": cycle,
+                }))
+
+            write_artifact()
+            summary = MODULE.validate_post_cont_latch(
+                path, post_pause_diagnostics=acknowledged)
             self.assertTrue(summary["complete"])
             self.assertEqual(summary["authority_snapshot_count"], 3)
 
             nodes[1]["authority_available"] = False
-            path.write_text(json.dumps({
-                "schema": "vibedb.rf3-diagnostic-latch/1",
-                "event": "post-cont",
-                "requested_utc": "2026-09-05T18:00:00Z",
-                "armed_utc": "2026-09-05T18:00:01Z",
-                "captured_utc": "2026-09-05T18:00:03Z",
-                "sequence": 7,
-                "cycle": cycle,
-            }))
+            write_artifact()
             with self.assertRaisesRegex(ValueError, "lacks authority availability"):
-                MODULE.validate_post_cont_latch(path)
+                MODULE.validate_post_cont_latch(
+                    path, post_pause_diagnostics=acknowledged)
+
+            nodes[1]["authority_available"] = True
+            for field, value, message in (
+                    ("serial", 1, "serial regressed"),
+                    ("pid", 142, "PID differs"),
+                    ("utc", "2026-09-05T17:59:59Z", "timestamp regressed")):
+                original = nodes[1][field]
+                nodes[1][field] = value
+                write_artifact()
+                with self.assertRaisesRegex(ValueError, message):
+                    MODULE.validate_post_cont_latch(
+                        path, post_pause_diagnostics=acknowledged)
+                nodes[1][field] = original
 
 
 if __name__ == "__main__":

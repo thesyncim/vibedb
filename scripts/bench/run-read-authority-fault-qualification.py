@@ -406,8 +406,9 @@ def _is_secondary_result_error(error):
     ))
 
 
-def validate_post_cont_latch(path, expected_nodes=3):
+def validate_post_cont_latch(path, expected_nodes=3, post_pause_diagnostics=None):
     """Validate the immutable post-CONT cut and every required owner snapshot."""
+    _positive_int(expected_nodes, "expected node count")
     try:
         value = json.loads(path.read_text())
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -430,6 +431,15 @@ def validate_post_cont_latch(path, expected_nodes=3):
     armed = _parse_utc(value.get("armed_utc"), "latch armed")
     captured = _parse_utc(value.get("captured_utc"), "latch captured")
     cycle_utc = _parse_utc(cycle.get("utc"), "latch cycle")
+    if armed < requested:
+        raise ValueError("post-CONT latch armed before controller handoff")
+    latch_requested = _parse_utc(latch.get("requested_utc"), "cycle latch requested")
+    latch_armed = _parse_utc(latch.get("armed_utc"), "cycle latch armed")
+    latch_captured = _parse_utc(latch.get("captured_utc"), "cycle latch captured")
+    if latch_requested != requested or latch_armed != armed:
+        raise ValueError("post-CONT cycle latch timestamps do not match artifact")
+    if latch_captured < cycle_utc:
+        raise ValueError("post-CONT cycle latch capture predates its cycle")
     if cycle_utc < requested:
         raise ValueError("post-CONT latch cycle predates controller handoff")
     if cycle_utc < armed:
@@ -445,6 +455,25 @@ def validate_post_cont_latch(path, expected_nodes=3):
     expected_cuts = _positive_int(cycle.get("expected_cuts"), "latch expected cuts")
     if cycle.get("valid_cuts") != expected_cuts:
         raise ValueError("post-CONT latch cycle has incomplete group cuts")
+    if not isinstance(post_pause_diagnostics, dict) or len(post_pause_diagnostics) != expected_nodes:
+        raise ValueError(
+            "post-CONT latch requires retained acknowledged diagnostics for every node")
+    acknowledged = {}
+    for key, snapshot in post_pause_diagnostics.items():
+        if not isinstance(key, str) or not isinstance(snapshot, dict):
+            raise ValueError("retained post-CONT diagnostics have invalid node identity")
+        node_id = snapshot.get("node_id")
+        if node_id != key:
+            raise ValueError(f"retained post-CONT diagnostic identity mismatch for {key}")
+        serial = _positive_int(snapshot.get("serial"), f"acknowledged node {node_id} serial")
+        pid = _positive_int(snapshot.get("pid"), f"acknowledged node {node_id} pid", minimum=2)
+        snapshot_utc = _parse_utc(snapshot.get("utc"), f"acknowledged node {node_id}")
+        if requested < snapshot_utc:
+            raise ValueError(
+                f"post-CONT controller handoff predates acknowledged node {node_id}")
+        acknowledged[node_id] = {
+            "serial": serial, "pid": pid, "utc": snapshot_utc,
+        }
     nodes = cycle.get("node_metrics")
     if not isinstance(nodes, list) or len(nodes) != expected_nodes:
         raise ValueError(
@@ -458,13 +487,23 @@ def validate_post_cont_latch(path, expected_nodes=3):
         if not isinstance(node_id, str) or not node_id or node_id in seen:
             raise ValueError(f"post-CONT node snapshot {index} has duplicate identity")
         seen.add(node_id)
+        acknowledged_snapshot = acknowledged.get(node_id)
+        if acknowledged_snapshot is None:
+            raise ValueError(f"post-CONT latch is missing expected node {node_id}")
         if node.get("source") != "rf3-diagnostics-file":
             raise ValueError(f"post-CONT node {node_id} lacks diagnostic-file provenance")
         if node.get("authority_available") is not True:
             raise ValueError(f"post-CONT node {node_id} lacks authority availability")
-        _parse_utc(node.get("utc"), f"post-CONT node {node_id}")
+        node_utc_value = node.get("utc")
+        node_utc = _parse_utc(node_utc_value, f"post-CONT node {node_id}")
         serial = _positive_int(node.get("serial"), f"post-CONT node {node_id} serial")
         pid = _positive_int(node.get("pid"), f"post-CONT node {node_id} pid", minimum=2)
+        if pid != acknowledged_snapshot["pid"]:
+            raise ValueError(f"post-CONT node {node_id} PID differs from acknowledged process")
+        if serial < acknowledged_snapshot["serial"]:
+            raise ValueError(f"post-CONT node {node_id} serial regressed")
+        if node_utc < acknowledged_snapshot["utc"]:
+            raise ValueError(f"post-CONT node {node_id} timestamp regressed")
         metrics = node.get("metrics")
         if not isinstance(metrics, dict):
             raise ValueError(f"post-CONT node {node_id} lacks authority metrics")
@@ -476,9 +515,11 @@ def validate_post_cont_latch(path, expected_nodes=3):
         authority_nodes.append({
             "node_id": node_id,
             "source": node["source"],
-            "utc": node["utc"],
+            "utc": node_utc_value,
             "serial": serial,
             "pid": pid,
+            "acknowledged_serial": acknowledged_snapshot["serial"],
+            "acknowledged_utc": acknowledged_snapshot["utc"].isoformat().replace("+00:00", "Z"),
         })
     return {
         "schema": value["schema"],
@@ -1283,8 +1324,13 @@ def main(argv=None):
         if not selected.no_fault:
             latch_path = run_dir / "post-cont-cut.json"
             try:
+                pause_event = state.get("pause")
+                post_pause_diagnostics = (
+                    pause_event.get("post_pause_diagnostics")
+                    if isinstance(pause_event, dict) else None)
                 latch_summary = validate_post_cont_latch(
-                    latch_path, expected_nodes=cell["physical_nodes"])
+                    latch_path, expected_nodes=cell["physical_nodes"],
+                    post_pause_diagnostics=post_pause_diagnostics)
                 latch_summary["path"] = "candidate/post-cont-cut.json"
                 manifest["post_cont_latch"] = latch_summary
             except ValueError as exc:
