@@ -1,0 +1,2 @@
+detached baseline source commit 0951f0da7e61027807a06dbdc2a304fcb8e5e2ce
+query/file_packed_extrema_bench_test.go was copied into the worktree for baseline compatibility
