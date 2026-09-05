@@ -30,10 +30,10 @@ turn into a false regression.
 | FOR16 `MAX` | 2,315,109 | 3,345 | 692.11x | 12,340 | 3.69x |
 | FOR16 `MIN` + `MAX` | 2,477,982 | 3,409 | 726.89x | 12,520 | 3.67x |
 
-All 110 timed benchmark lines report `0 B/op` and `0 allocs/op`. The fixture
-asserts the exact result cells and query statistics on every candidate
-iteration: 16,384 rows scanned, one covering column, one worker, zero batches,
-and no token or index work.
+All 110 timed benchmark lines report `0 B/op` and `0 allocs/op`. Before and
+after each timed sub-benchmark, the fixture asserts the exact result cells.
+Candidate SIMD and nosimd runs additionally require 16,384 rows scanned, one
+covering column, one worker, zero batches, and no token or index work.
 
 The two existing lanes that previously exceeded the 3% pooled-median guard now
 pass the paired release rule against exact latest main:
@@ -65,4 +65,3 @@ Its exact native result is retained as a CI artifact for the pull-request head.
 Raw outputs are in [`raw/`](raw/). Consolidated values are in
 [`summary.tsv`](summary.tsv), and exact revisions and commands are in
 [`metadata/`](metadata/).
-

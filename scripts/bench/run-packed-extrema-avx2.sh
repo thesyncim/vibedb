@@ -31,7 +31,8 @@ if [[ $(go env GOAMD64) != v1 ]]; then
   echo "packed extrema AVX2 qualification requires GOAMD64=v1" >&2
   exit 1
 fi
-if [[ $(go env GOEXPERIMENT) != *simd* ]]; then
+goexperiment=$(go env GOEXPERIMENT)
+if [[ ",${goexperiment}," != *,simd,* ]]; then
   echo "packed extrema AVX2 qualification requires GOEXPERIMENT=simd" >&2
   exit 1
 fi

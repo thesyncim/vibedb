@@ -6,5 +6,8 @@ GOCACHE=/private/tmp/gocache-final-head GOEXPERIMENT=simd go test -run '^$' -c -
 GOCACHE=/private/tmp/gocache-final-head-nosimd GOEXPERIMENT=nosimd go test -run '^$' -c -o /private/tmp/final-head-nosimd-query.test ./query
 test binaries: -test.run '^$' -test.benchtime=250ms -test.count=1 -test.cpu=1 -test.benchmem
 extrema regex: ^BenchmarkFilePackedIntegerExtremaCount(Wide)?$
+baseline extrema environment: VIBEDB_EXPECT_EXTREMA unset
+candidate SIMD extrema environment: VIBEDB_EXPECT_EXTREMA=1
+candidate nosimd extrema environment: VIBEDB_EXPECT_EXTREMA=1
 equality regression regex: ^BenchmarkCompactPrimaryStripePackedEquality8$
 ordered regression regex: ^BenchmarkFilePackedOrderedCountWide/sparse/lt$
