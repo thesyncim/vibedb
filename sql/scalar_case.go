@@ -262,6 +262,9 @@ func scalarCaseExpressionResolution(
 	case ScalarUnary, ScalarAggregate:
 		return ScalarCastNumeric, true, false
 	case ScalarBinary:
+		if expr.Op.NullSafeComparison() {
+			return ScalarCastBoolean, true, false
+		}
 		if expr.Op.Conditional() {
 			left, lk, lt := scalarCaseExpressionResolution(expr.Left)
 			right, rk, rt := scalarCaseExpressionResolution(expr.Right)

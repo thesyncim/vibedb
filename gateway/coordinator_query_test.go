@@ -25,6 +25,8 @@ func TestCoordinatorQueryMatchesGlobalSQLSemantics(t *testing.T) {
 		{`SELECT n FROM messages WHERE n=1 OR COALESCE(n,0)=4 ORDER BY n`, []string{"1", "4"}},
 		{`SELECT d.n FROM (SELECT n, CASE WHEN n>2 THEN TRUE ELSE FALSE END AS visible FROM messages) AS d WHERE d.visible ORDER BY d.n`, []string{"3", "4"}},
 		{`SELECT n FROM messages ORDER BY GREATEST(n,0) DESC LIMIT 2`, []string{"4", "3"}},
+		{`SELECT n FROM messages WHERE n IS DISTINCT FROM NULL ORDER BY -n LIMIT 2`, []string{"4", "3"}},
+		{`SELECT n FROM messages WHERE COALESCE(n,0) IS NOT DISTINCT FROM 4`, []string{"4"}},
 		{`SELECT n FROM messages ORDER BY -n LIMIT 2 OFFSET 1`, []string{"3", "2"}},
 		{`SELECT n FROM messages GROUP BY n ORDER BY COALESCE(SUM(n),0) DESC LIMIT 2`, []string{"4", "3"}},
 		{`SELECT a.n FROM messages AS a JOIN messages AS b ON a.n=b.n ORDER BY -b.n LIMIT 2`, []string{"4", "3"}},
@@ -75,6 +77,7 @@ func TestCoordinatorRejectsDeclaredDomainMismatchBeforeSourceIO(t *testing.T) {
 		`WITH c AS (SELECT id FROM messages WHERE id=score) SELECT id FROM c LIMIT 0`,
 		`WITH c AS (SELECT id,score FROM messages ORDER BY CASE WHEN id=score THEN 1 ELSE 0 END) SELECT id FROM c LIMIT 0`,
 		`SELECT COALESCE(SUM(score),0) FROM messages WHERE id=score`,
+		`SELECT id FROM messages WHERE id IS DISTINCT FROM score LIMIT 0`,
 	} {
 		_, err := executor.Query(t.Context(), Query{SQL: statement, Class: ClassBatch})
 		var mismatch *sqlast.UndefinedOperatorError
@@ -145,6 +148,9 @@ func TestCoordinatorQueryPrunesNestedShardKeysWithoutCrossingLimit(t *testing.T)
 		want   []string
 	}{
 		{`WITH c(owner,n) AS (SELECT tenant_id,n FROM messages) SELECT SUM(n)+1 FROM c WHERE owner=?`, []shardservice.Param{shardservice.StringParam(keys[0])}, 1, []string{"1.01e2"}},
+		{`WITH c(owner,n) AS (SELECT tenant_id,n FROM messages) SELECT n+1 FROM c WHERE owner IS NOT DISTINCT FROM ?`, []shardservice.Param{shardservice.StringParam(keys[0])}, 1, []string{"1.01e2"}},
+		{`SELECT n FROM messages WHERE tenant_id IS NOT DISTINCT FROM ?`, []shardservice.Param{shardservice.StringParam(keys[1])}, 1, []string{"100"}},
+		{`WITH c(owner,n) AS (SELECT tenant_id,n FROM messages) SELECT n+1 FROM c WHERE owner IS NOT DISTINCT FROM NULL`, nil, 0, nil},
 		{`WITH unused AS (SELECT * FROM messages), c AS (SELECT tenant_id,n FROM messages) SELECT SUM(n)+1 FROM c WHERE tenant_id=?`, []shardservice.Param{shardservice.StringParam(keys[0])}, 1, []string{"1.01e2"}},
 		{`WITH c AS (SELECT tenant_id AS owner,n FROM messages) SELECT SUM(n)+1 FROM c WHERE owner=?`, []shardservice.Param{shardservice.StringParam(keys[0])}, 1, []string{"1.01e2"}},
 		{`SELECT SUM(d.n)+1 FROM (SELECT tenant_id,n FROM messages) AS d WHERE d.tenant_id=?`, []shardservice.Param{shardservice.StringParam(keys[1])}, 1, []string{"1.01e2"}},

@@ -59,9 +59,9 @@ func TestSnapshotAllowsConflictNothingWithoutGlobalIndex(t *testing.T) {
 	}
 }
 
-func TestReplicatedSQLMutationInputCountRejectsConflictUpdate(t *testing.T) {
+func TestReplicatedSQLMutationInputCountRejectsComputedConflictUpdate(t *testing.T) {
 	parsed, err := sqlast.ParseStatement(
-		`INSERT INTO messages (id, value) VALUES (?, ?) ON CONFLICT DO UPDATE SET value = EXCLUDED.value`,
+		`INSERT INTO messages (id, value) VALUES (?, ?) ON CONFLICT DO UPDATE SET value = value || EXCLUDED.value`,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -107,7 +107,7 @@ func TestPostgreSQLRF3PrepareRejectsConflictActionsAsFeatureNotSupported(t *test
 		marker string
 	}{
 		{
-			text:   `INSERT INTO messages (id, value) VALUES (?, ?) ON CONFLICT DO UPDATE SET value = EXCLUDED.value`,
+			text:   `INSERT INTO messages (id, value) VALUES (?, ?) ON CONFLICT DO UPDATE SET value = value || EXCLUDED.value`,
 			marker: "UPDATE",
 		},
 	} {

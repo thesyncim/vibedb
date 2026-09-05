@@ -305,6 +305,9 @@ func coordinatorMapPredicate(e *sqlast.Expr, base int, path func(*sqlast.PathExp
 	if e == nil {
 		return nil
 	}
+	if key, value, ok := sqlast.NullSafeEqualityPathOperand(e); ok {
+		e = &sqlast.Expr{Kind: sqlast.ExprCompare, Op: sqlast.OpEq, Path: key, Value: value, Pos: e.Pos, Column: -1}
+	}
 	if e.Kind == sqlast.ExprAnd || e.Kind == sqlast.ExprOr {
 		clone := *e
 		clone.Kids = nil
@@ -360,6 +363,9 @@ func coordinatorHasPathComparison(e *sqlast.Expr) bool {
 		return false
 	}
 	if e.RightPath != nil {
+		return true
+	}
+	if sqlast.NullSafePathComparison(e.ScalarLeft) != nil || sqlast.NullSafePathComparison(e.ScalarRight) != nil {
 		return true
 	}
 	if e.Subquery != nil {

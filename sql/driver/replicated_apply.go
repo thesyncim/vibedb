@@ -157,6 +157,11 @@ type ReplicatedApply struct {
 	walBaseSelectActive     bool
 	walBaseSelectPending    bool
 	walBasePending          raftstore.GenerationActivationIdentity
+	// readReuse owns a fixed, per-apply set of prepared-only replicated SQL
+	// slots. It is deliberately independent of catalog/session locks: closing
+	// the claim first rejects new leases, then retires idle slots.
+	readReuseMu sync.Mutex
+	readReuse   *replicatedReadReuseCache
 	// exclusiveConnector is set only by a no-copy child-stage handoff. It keeps
 	// SQL sessions fenced until raftmember atomically retires the connector or
 	// the apply claim is explicitly closed.
@@ -1611,6 +1616,12 @@ func (a *ReplicatedApply) Close() error {
 	a.closed = true
 	core.replicatedApplyClaim = nil
 	core.mu.Unlock()
+	a.readReuseMu.Lock()
+	readReuse := a.readReuse
+	a.readReuseMu.Unlock()
+	if readReuse != nil {
+		readReuse.shutdown()
+	}
 	if a.exclusiveConnector {
 		connector.exclusive = false
 	}

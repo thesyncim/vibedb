@@ -16,7 +16,12 @@ import (
 )
 
 type stmt struct {
-	conn               *conn
+	conn *conn
+	text string
+	// parser owns the arenas backing tree. Keeping it beside the AST makes the
+	// retained preparation lifetime explicit; the reuse lane can account every
+	// parser chunk before parking a statement.
+	parser             *sqlast.Parser
 	tree               *sqlast.Statement
 	query              *query.Statement
 	mutation           *query.DMLStatement
@@ -51,6 +56,10 @@ type stmt struct {
 	explain        bool
 	analyze        bool
 	closed         bool
+	// reuseRetainedBytes is populated when the binding-specific query state is
+	// detached. It lets the cache account the query helper once without
+	// rebuilding or mutating it a second time while measuring the slot.
+	reuseRetainedBytes int64
 }
 
 var (
@@ -188,11 +197,15 @@ func (s *stmt) Close() error {
 	if s.mutation != nil {
 		s.mutation.Release()
 	}
+	if s.parser != nil {
+		s.parser.Release()
+	}
 	// Both prepared forms borrow the parsed tree, whose arenas can be as large
 	// as the bounded SQL input. Keep only the scalar parameter count needed by
 	// NumInput after Close; a caller retaining a closed Stmt must not retain the
 	// parser and compiler high-water storage with it.
 	s.tree = nil
+	s.parser = nil
 	s.query = nil
 	s.mutation = nil
 	s.insertSource = nil
@@ -214,6 +227,8 @@ func (s *stmt) Close() error {
 	s.explain = false
 	s.analyze = false
 	s.conn = nil
+	s.text = ""
+	s.reuseRetainedBytes = 0
 	return nil
 }
 

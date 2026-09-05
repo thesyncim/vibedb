@@ -248,6 +248,20 @@ type replicatedSQLPointReadSource interface {
 	) (*sqldriver.ReplicatedReadSession, error)
 }
 
+type replicatedSQLDataReadReuseSource interface {
+	AcquireReplicatedDataRead(
+		context.Context, *replicatedstate.DataReadCut, string,
+		[]sqldriver.ParamType, bool, query.ExecOptions,
+	) (*sqldriver.ReplicatedReadLease, error)
+}
+
+type replicatedSQLPointReadReuseSource interface {
+	AcquireReplicatedPointRead(
+		context.Context, replication.RelationID, []byte, bool, []byte, []byte,
+		string, []sqldriver.ParamType, bool, query.ExecOptions,
+	) (*sqldriver.ReplicatedReadLease, error)
+}
+
 // replicatedSQLPointReadEligible is deliberately narrower than the wire's
 // legacy candidate-key form. The point lane may borrow one exact live row only
 // when every other part of the RF3 SQL contract is the existing read-only,
@@ -548,11 +562,23 @@ func executeFencedSQLBudget(ctx context.Context, source interface {
 	var flag query.CancelFlag
 	stop := context.AfterFunc(ctx, flag.Cancel)
 	defer stop()
-	session, err := source.NewDataReadSession(ctx, cut, query.ExecOptions{
+	options := query.ExecOptions{
 		Cancel: &flag, ResultRows: rows, ResultBytes: int64(maxBytes),
 		MemoryBytes: budget.workingBytes, IntermediateBytes: budget.workingBytes,
 		AggregateBytes: budget.workingBytes,
-	})
+	}
+	if reusable, ok := source.(replicatedSQLDataReadReuseSource); ok {
+		lease, acquireErr := reusable.AcquireReplicatedDataRead(
+			ctx, cut, req.SQL, req.ParamTypes, req.PartialAggregate, options,
+		)
+		if acquireErr == nil {
+			return executeFencedSQLLease(ctx, lease, req, budget, &flag)
+		}
+		if !errors.Is(acquireErr, sqldriver.ErrReplicatedReadReuseUnsupported) {
+			return nil, acquireErr
+		}
+	}
+	session, err := source.NewDataReadSession(ctx, cut, options)
 	if err != nil {
 		return nil, err
 	}
@@ -604,13 +630,27 @@ func executeFencedSQLPointBudget(
 	var flag query.CancelFlag
 	stop := context.AfterFunc(ctx, flag.Cancel)
 	defer stop()
+	options := query.ExecOptions{
+		Cancel: &flag, ResultRows: rows, ResultBytes: int64(maxBytes),
+		MemoryBytes: budget.workingBytes, IntermediateBytes: budget.workingBytes,
+		AggregateBytes: budget.workingBytes,
+	}
+	if reusable, ok := source.(replicatedSQLPointReadReuseSource); ok {
+		lease, acquireErr := reusable.AcquireReplicatedPointRead(
+			ctx, primary.Relation, primary.Keys[0], point.Found, point.Value,
+			primary.PrimaryPath, req.SQL, req.ParamTypes, req.PartialAggregate,
+			options,
+		)
+		if acquireErr == nil {
+			return executeFencedSQLLease(ctx, lease, req, budget, &flag)
+		}
+		if !errors.Is(acquireErr, sqldriver.ErrReplicatedReadReuseUnsupported) {
+			return nil, acquireErr
+		}
+	}
 	session, err := source.NewPointReadSession(
 		ctx, primary.Relation, primary.Keys[0], point.Found, point.Value,
-		primary.PrimaryPath, query.ExecOptions{
-			Cancel: &flag, ResultRows: rows, ResultBytes: int64(maxBytes),
-			MemoryBytes: budget.workingBytes, IntermediateBytes: budget.workingBytes,
-			AggregateBytes: budget.workingBytes,
-		},
+		primary.PrimaryPath, options,
 	)
 	if err != nil {
 		return nil, err
@@ -633,6 +673,46 @@ func executeFencedSQLPointBudget(
 	encoding := trace.StartRegion(ctx, "sql.read.encode")
 	defer encoding.End()
 	return encodeSQLReadCursor(cursor.Snapshot(), prepared.Columns(), budget.resultBytes, &flag)
+}
+
+func executeFencedSQLLease(
+	ctx context.Context,
+	lease *sqldriver.ReplicatedReadLease,
+	req *ShardRequest,
+	budget replicatedSQLBudget,
+	flag *query.CancelFlag,
+) (encoded []byte, err error) {
+	if lease == nil {
+		return nil, sqldriver.ErrReplicatedReadLeaseClosed
+	}
+	// Finish invalidates the lease on normal return. During a panic these
+	// defers close the cursor and retire its still-active execution slot.
+	defer func() { _ = lease.Abort(nil) }()
+	var cursor sqldriver.Cursor
+	defer func() { _ = cursor.Close() }()
+	if req.PrimaryKeyRead.present() {
+		err = lease.QueryCandidateKeysInto(
+			ctx, runtimeArgs(req.Params), req.PrimaryKeyRead.PrimaryPath,
+			req.PrimaryKeyRead.Keys, &cursor,
+		)
+	} else {
+		err = lease.QueryInto(ctx, runtimeArgs(req.Params), &cursor)
+	}
+	if err == nil {
+		encoding := trace.StartRegion(ctx, "sql.read.encode")
+		encoded, err = encodeSQLReadCursor(
+			cursor.Snapshot(), lease.Columns(), budget.resultBytes, flag,
+		)
+		encoding.End()
+	}
+	if closeErr := cursor.Close(); err == nil {
+		err = closeErr
+	}
+	finishErr := lease.Finish(err)
+	if err == nil {
+		err = finishErr
+	}
+	return encoded, err
 }
 
 // sqlLimit leaves native frame capacity outside SQL execution reservations.

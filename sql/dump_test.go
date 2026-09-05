@@ -571,6 +571,10 @@ func dumpScalarOp(op ScalarOp) string {
 		return "least"
 	case ScalarNullIf:
 		return "nullif"
+	case ScalarDistinct:
+		return "is distinct from"
+	case ScalarNotDistinct:
+		return "is not distinct from"
 	default:
 		return fmt.Sprintf("op(%d)", op)
 	}

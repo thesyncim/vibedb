@@ -312,7 +312,7 @@ func directSQLMutationEligible(
 	for index := range mutations {
 		switch mutations[index].Kind {
 		case replication.MutationPut, replication.MutationPutAbsentOrEqual,
-			replication.MutationDelete, replication.MutationPutAbsent, replication.MutationPutIfAbsent:
+			replication.MutationDelete, replication.MutationPutAbsent, replication.MutationPutIfAbsent, replication.MutationPutConflict:
 		default:
 			return false
 		}

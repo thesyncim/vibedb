@@ -20,6 +20,7 @@ const deterministicApplySemantics = "vibejson-strict;last-mutation-per-key-wins;
 	"validate-final-against-snapshot;delete-absent-and-put-equal-are-noops;" +
 	"strict-put-absent-conflict;put-present-missing-zero-rows;" +
 	"json-put-if-absent-validates-candidate-before-existing-zero-row-noop;" +
+	"json-conflict-vuc1-validates-candidate-and-direct-program-before-branch;bound-scalars-and-excluded-columns;canonical-current-row-patch;duplicate-conflict-key-invalid;" +
 	"json-relation-affected-rows;global-index-results-excluded;fixed-mutation-result-int64;" +
 	"mutation-validation-result-map;bytewise-changed-key-order;" +
 	"ordered-client-session-sequences;authority-class-bound-session-identity;" +
@@ -75,6 +76,7 @@ const (
 	mutationPutAbsent
 	mutationPutPresent
 	mutationPutIfAbsent
+	mutationPutConflict
 )
 
 // mutationValueDescriptor is transient batch workspace, never per-Machine
@@ -370,7 +372,7 @@ func bundleApplyContractDigest(
 	_, _ = h.Write(manifest[:])
 	_, _ = h.Write(applySemanticsDigest[:])
 	_, _ = h.Write(bundleApplySemanticsDigest[:])
-	var grammar [4 + 36*4]byte
+	var grammar [4 + 37*4]byte
 	binary.LittleEndian.PutUint16(grammar[0:2], ResultFormatMutation)
 	binary.LittleEndian.PutUint16(grammar[2:4], ResultFormatRouteGate)
 	for index, code := range [...]uint32{
@@ -395,6 +397,7 @@ func bundleApplyContractDigest(
 		uint32(replication.MutationPutAbsent),
 		uint32(replication.MutationPutPresent),
 		uint32(replication.MutationPutIfAbsent),
+		uint32(replication.MutationPutConflict),
 		replication.MutationDigestCompareBytes,
 		ResultRouteGate,
 		uint32(replication.CommandRouteGate),

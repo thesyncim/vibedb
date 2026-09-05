@@ -211,6 +211,16 @@ type MutationValidator interface {
 	ValidateDelete(key, current []byte, found bool) MutationValidation
 }
 
+// ConflictMutationValidator owns a closed deterministic conflict program under
+// the relation's authenticated validation/apply contract. It validates the
+// candidate and all referenced columns on both branches, and evaluates the
+// assignments only when found. The result must be canonical JSON owned by the
+// caller or borrowed from candidate; no input or snapshot slice is retained.
+// The machine independently validates the result's schema, key and ownership.
+type ConflictMutationValidator interface {
+	MaterializeConflict(key, candidate, program, current []byte, found bool) ([]byte, MutationValidation)
+}
+
 // DeclaredSchemaValidator is a cold construction-time contract. A typed
 // collection is admissible only when its deterministic validator authenticates
 // the exact immutable durable schema and commits it in ValidationDigest.

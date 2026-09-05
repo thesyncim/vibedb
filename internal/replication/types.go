@@ -288,6 +288,10 @@ const (
 	// MutationPutIfAbsent validates the candidate and inserts it only if absent.
 	// An existing key is a successful zero-row no-op, even if its value differs.
 	MutationPutIfAbsent MutationKind = 8
+	// MutationPutConflict validates a candidate, then either inserts it or
+	// evaluates its deterministic conflict program against the current row.
+	// Value uses the VUC1 input grammar; it is never stored as a document.
+	MutationPutConflict MutationKind = 9
 )
 
 // Mutation is one caller-owned command mutation. Key and Value are borrowed

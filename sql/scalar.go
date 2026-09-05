@@ -33,12 +33,18 @@ const (
 	ScalarGreatest
 	ScalarLeast
 	ScalarNullIf
+	ScalarDistinct
+	ScalarNotDistinct
 )
 
 // Conditional reports whether op selects among its operands. Variadic SQL
 // conditional expressions are represented by balanced binary trees, retaining
 // argument order and evaluating each argument at most once.
-func (op ScalarOp) Conditional() bool { return op >= ScalarCoalesce && op <= ScalarNullIf }
+func (op ScalarOp) Conditional() bool { return op >= ScalarCoalesce && op <= ScalarNotDistinct }
+
+// NullSafeComparison reports a total equality predicate: NULL compares equal
+// to NULL and different from a live scalar value.
+func (op ScalarOp) NullSafeComparison() bool { return op == ScalarDistinct || op == ScalarNotDistinct }
 
 // ScalarCastTarget is one closed, executable SQL conversion domain. JSON is
 // deliberately the textual json type, not jsonb: the engine preserves exact
