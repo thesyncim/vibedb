@@ -48,9 +48,11 @@ const (
 	// TxnMarkerFormat is the sole admitted decision-log grammar.
 	TxnMarkerFormat = uint32(0)
 
-	// txnMarkerFlagSealedCapacity marks Capacity as an immutable physical
-	// certificate. Every other bit in the current reserved flags word is invalid.
-	txnMarkerFlagSealedCapacity = uint32(1)
+	// Sealed capacity fixes the file geometry. Bit 0 alone additionally requires
+	// private physical backing; bit 1 explicitly selects portable allocation.
+	// Older readers reject bit 1. Every other flag remains invalid.
+	txnMarkerFlagSealedCapacity   = uint32(1)
+	txnMarkerFlagPortableCapacity = uint32(2)
 
 	txnMarkerMagic       = "VTXNMRK\x00"
 	txnMarkerRecordMagic = uint32(0x524d5456) // "VTMR", little-endian.
@@ -131,8 +133,12 @@ type TxnMarkerHeader struct {
 	Epoch        uint64
 	BaseSequence uint64
 	Capacity     uint64
-	// SealedCapacity requires an exact-size, strictly allocated marker file.
+	// SealedCapacity requires an exact-size marker; allocation is strict unless
+	// PortableCapacity is explicitly set.
 	SealedCapacity bool
+	// PortableCapacity retains the exact sealed size without requiring private
+	// physical reservation. It is valid only with SealedCapacity.
+	PortableCapacity bool
 	// RecycleCount is strictly monotonic across recycles. Open selects the
 	// semantically valid header slot with the highest count. A checksum-invalid
 	// torn publication may fall back; authenticated semantic damage fails closed.
@@ -153,6 +159,9 @@ type TxnCollectionRef struct {
 type TxnMarkerOptions struct {
 	Capacity       uint64
 	SealedCapacity bool
+	// PortableCapacity retains the exact sealed size without requiring private
+	// physical reservation. It is valid only with SealedCapacity.
+	PortableCapacity bool
 }
 
 // TxnMarkerRecoveryAnchor identifies the empty marker successor authorized by
@@ -395,6 +404,9 @@ func (d *TxnDecisions) RetirementCount() int {
 }
 
 func validateTxnMarkerHeader(h TxnMarkerHeader) error {
+	if h.PortableCapacity && !h.SealedCapacity {
+		return fmt.Errorf("%w: portable capacity requires sealed geometry", ErrTxnMarkerCorrupt)
+	}
 	if h.Format != TxnMarkerFormat {
 		return fmt.Errorf("%w: format", ErrTxnMarkerCorrupt)
 	}
@@ -467,9 +479,14 @@ func EncodeTxnMarkerHeader(dst []byte, h TxnMarkerHeader) ([]byte, error) {
 	binary.LittleEndian.PutUint64(sector[40:48], h.BaseSequence)
 	binary.LittleEndian.PutUint64(sector[48:56], h.Capacity)
 	binary.LittleEndian.PutUint64(sector[56:64], h.RecycleCount)
+	var flags uint32
 	if h.SealedCapacity {
-		binary.LittleEndian.PutUint32(sector[64:68], txnMarkerFlagSealedCapacity)
+		flags |= txnMarkerFlagSealedCapacity
 	}
+	if h.PortableCapacity {
+		flags |= txnMarkerFlagPortableCapacity
+	}
+	binary.LittleEndian.PutUint32(sector[64:68], flags)
 	checksum := PageChecksum(sector[:TxnMarkerHeaderSize-8])
 	binary.LittleEndian.PutUint32(sector[TxnMarkerHeaderSize-8:TxnMarkerHeaderSize-4], checksum)
 	binary.LittleEndian.PutUint32(sector[TxnMarkerHeaderSize-4:], ^checksum)
@@ -501,13 +518,14 @@ func DecodeTxnMarkerHeader(src []byte) (TxnMarkerHeader, error) {
 	h.Capacity = binary.LittleEndian.Uint64(src[48:56])
 	h.RecycleCount = binary.LittleEndian.Uint64(src[56:64])
 	flags := binary.LittleEndian.Uint32(src[64:68])
-	if flags&^txnMarkerFlagSealedCapacity != 0 {
+	if flags&^(txnMarkerFlagSealedCapacity|txnMarkerFlagPortableCapacity) != 0 {
 		return TxnMarkerHeader{}, fmt.Errorf("%w: header flags", ErrTxnMarkerCorrupt)
 	}
 	if !allZero(src[68 : TxnMarkerHeaderSize-8]) {
 		return TxnMarkerHeader{}, fmt.Errorf("%w: header reserved bytes", ErrTxnMarkerCorrupt)
 	}
 	h.SealedCapacity = flags&txnMarkerFlagSealedCapacity != 0
+	h.PortableCapacity = flags&txnMarkerFlagPortableCapacity != 0
 	if err := validateTxnMarkerHeader(h); err != nil {
 		return TxnMarkerHeader{}, err
 	}
@@ -931,7 +949,8 @@ func createTxnMarkerInRoot(
 		header = TxnMarkerHeader{
 			Format: TxnMarkerFormat, MarkerID: recoveryAnchor.MarkerID,
 			Epoch: recoveryAnchor.Epoch, BaseSequence: recoveryAnchor.BaseSequence,
-			Capacity: capacity, SealedCapacity: opts.SealedCapacity, RecycleCount: 1,
+			Capacity: capacity, SealedCapacity: opts.SealedCapacity,
+			PortableCapacity: opts.PortableCapacity, RecycleCount: 1,
 		}
 		if err := validateTxnMarkerHeader(header); err != nil {
 			return nil, err
@@ -958,6 +977,7 @@ func createTxnMarkerInRoot(
 		header.Epoch = 1
 		header.Capacity = capacity
 		header.SealedCapacity = opts.SealedCapacity
+		header.PortableCapacity = opts.PortableCapacity
 		header.RecycleCount = 1
 		if err := validateTxnMarkerHeader(header); err != nil {
 			return nil, err
@@ -976,8 +996,8 @@ func createTxnMarkerInRoot(
 				ErrSealedCapacityMismatch,
 			)
 		}
-		if err := StrictlyAllocateFile(file, total); err != nil {
-			return nil, fmt.Errorf("%w: strictly allocate transaction marker: %w", ErrSealedCapacityMismatch, err)
+		if err := allocateSealedFile(file, total, header.PortableCapacity); err != nil {
+			return nil, fmt.Errorf("%w: allocate sealed transaction marker: %w", ErrSealedCapacityMismatch, err)
 		}
 	} else if err := txnMarkerPreallocate(file, total); err != nil {
 		return nil, err
@@ -1137,12 +1157,13 @@ func openTxnMarkerInRoot(
 	if err != nil {
 		return nil, nil, err
 	}
-	if header.SealedCapacity != opts.SealedCapacity ||
+	if (header.PortableCapacity && !opts.PortableCapacity) ||
+		header.SealedCapacity != opts.SealedCapacity ||
 		expectedCapacity != 0 && header.Capacity != expectedCapacity {
 		return nil, nil, fmt.Errorf(
-			"%w: transaction marker expected=%d sealed=%t actual=%d sealed=%t",
+			"%w: transaction marker expected=%d sealed=%t actual=%d sealed=%t portable=%t allow-portable=%t",
 			ErrSealedCapacityMismatch, expectedCapacity, opts.SealedCapacity,
-			header.Capacity, header.SealedCapacity,
+			header.Capacity, header.SealedCapacity, header.PortableCapacity, opts.PortableCapacity,
 		)
 	}
 	if header.SealedCapacity {
@@ -1157,14 +1178,18 @@ func openTxnMarkerInRoot(
 				ErrSealedCapacityMismatch, info.Size(), total,
 			)
 		}
-		if err := StrictlyAllocateFile(file, total); err != nil {
-			return nil, nil, fmt.Errorf("%w: reprove transaction marker: %w", ErrSealedCapacityMismatch, err)
-		}
-		if err := strictAllocationDataSync(file); err != nil {
-			return nil, nil, fmt.Errorf("%w: sync transaction marker allocation: %w", ErrSealedCapacityMismatch, err)
-		}
-		if err := requireExactRegularFileSize(file, total); err != nil {
-			return nil, nil, fmt.Errorf("%w: transaction marker after allocation sync: %w", ErrSealedCapacityMismatch, err)
+		// The portable contract requires only the exact geometry checked above.
+		// Reopen does not modify that file, so there is no new durability fence.
+		if !header.PortableCapacity {
+			if err := StrictlyAllocateFile(file, total); err != nil {
+				return nil, nil, fmt.Errorf("%w: reprove transaction marker: %w", ErrSealedCapacityMismatch, err)
+			}
+			if err := strictAllocationDataSync(file); err != nil {
+				return nil, nil, fmt.Errorf("%w: sync transaction marker allocation: %w", ErrSealedCapacityMismatch, err)
+			}
+			if err := requireExactRegularFileSize(file, total); err != nil {
+				return nil, nil, fmt.Errorf("%w: transaction marker after allocation sync: %w", ErrSealedCapacityMismatch, err)
+			}
 		}
 	}
 
@@ -1220,6 +1245,9 @@ func normalizeTxnMarkerOptionCapacity(
 	opts TxnMarkerOptions,
 	creating bool,
 ) (uint64, error) {
+	if opts.PortableCapacity && !opts.SealedCapacity {
+		return 0, fmt.Errorf("%w: portable capacity requires sealed geometry", ErrSealedCapacityMismatch)
+	}
 	capacity := opts.Capacity
 	if opts.SealedCapacity && capacity == 0 {
 		return 0, fmt.Errorf("%w: sealed transaction marker requires an exact capacity", ErrSealedCapacityMismatch)

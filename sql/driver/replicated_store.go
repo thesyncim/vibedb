@@ -502,7 +502,7 @@ func (d *Database) bindReplicatedShardStoreBundleExact(
 	}
 	previousTxnOptions := core.txnLog.Options()
 	sealedTxnOptions := durable.TxnLogOptions{
-		Capacity: sidecars.TransactionMarkerBytes, SealedCapacity: true,
+		Capacity: sidecars.TransactionMarkerBytes, SealedCapacity: true, PortableCapacity: true,
 	}
 	if err := core.txnLog.ReconfigureUnminted(sealedTxnOptions); err != nil {
 		return ReplicatedShardStoreIdentity{}, fmt.Errorf(
@@ -871,7 +871,7 @@ func (d *Database) bindReplicatedShardStoreExact(
 	}
 	previousTxnOptions := core.txnLog.Options()
 	sealedTxnOptions := durable.TxnLogOptions{
-		Capacity: sidecars.TransactionMarkerBytes, SealedCapacity: true,
+		Capacity: sidecars.TransactionMarkerBytes, SealedCapacity: true, PortableCapacity: true,
 	}
 	if err := core.txnLog.ReconfigureUnminted(sealedTxnOptions); err != nil {
 		return ReplicatedShardStoreIdentity{}, fmt.Errorf(
@@ -1393,7 +1393,7 @@ func validateOpenedReplicatedCatalog(d *database) error {
 		return fmt.Errorf("%w: transaction-log membership: %v", ErrReplicatedShardStoreProfile, err)
 	}
 	if d.txnLog.Options() != (durable.TxnLogOptions{
-		Capacity: r.Sidecars.TransactionMarkerBytes, SealedCapacity: true,
+		Capacity: r.Sidecars.TransactionMarkerBytes, SealedCapacity: true, PortableCapacity: true,
 	}) {
 		return fmt.Errorf(
 			"%w: transaction-marker profile differs",

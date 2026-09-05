@@ -39,7 +39,7 @@ func TestRecoveryJournalSealedCapacityHeaderBitIsStrict(t *testing.T) {
 		uint32(0xb5c955b0); got != want {
 		t.Fatalf("recovery header checksum = %#08x, want %#08x", got, want)
 	}
-	binary.LittleEndian.PutUint32(buf[88:92], recoveryJournalFlagSealedCapacity|2)
+	binary.LittleEndian.PutUint32(buf[88:92], recoveryJournalFlagSealedCapacity|4)
 	resealSidecarHeader(buf)
 	if _, err := DecodeRecoveryJournalHeader(buf); !errors.Is(err, ErrRecoveryJournalCorrupt) {
 		t.Fatalf("unknown recovery header flag = %v, want corrupt", err)
@@ -94,7 +94,7 @@ func TestTxnMarkerSealedCapacityHeaderBitIsStrict(t *testing.T) {
 		uint32(0x939043cc); got != want {
 		t.Fatalf("marker header checksum = %#08x, want %#08x", got, want)
 	}
-	binary.LittleEndian.PutUint32(buf[64:68], txnMarkerFlagSealedCapacity|2)
+	binary.LittleEndian.PutUint32(buf[64:68], txnMarkerFlagSealedCapacity|4)
 	resealSidecarHeader(buf)
 	if _, err := DecodeTxnMarkerHeader(buf); !errors.Is(err, ErrTxnMarkerCorrupt) {
 		t.Fatalf("unknown marker header flag = %v, want corrupt", err)

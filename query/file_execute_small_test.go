@@ -204,6 +204,10 @@ func TestValidatedRawPointMatchesSegment(t *testing.T) {
 			if got := resultKey(exec.Result); got != resultKey(want) {
 				t.Fatalf("got %s want %s", got, resultKey(want))
 			}
+			if test.name == "projection and residual" &&
+				(cap(exec.file.small.arena.heads) != 0 || cap(exec.file.small.slots[0].rows) != 0) {
+				t.Fatal("direct point projection allocated the intermediate row arena")
+			}
 		})
 	}
 
@@ -228,6 +232,111 @@ func TestValidatedRawPointMatchesSegment(t *testing.T) {
 	clear(raw)
 	if got := resultKey(exec.Result); got != want {
 		t.Fatalf("result retained borrowed bytes: got %s want %s", got, want)
+	}
+}
+
+func TestValidatedRawSingleRowLimitsCancellationAndFallbackReuse(t *testing.T) {
+	raw := []byte(`{"id":"a","score":7,"text":"a\"é","nullable":null}`)
+	var docs store.Segment
+	if _, err := docs.Append(raw); err != nil {
+		t.Fatal(err)
+	}
+	base := Select(Path("/id"), Path("/score"), Path("/text"), Path("/nullable"), Path("/missing")).
+		Where(Cmp("/id", Eq, "a"))
+	want, err := base.Run(FromSegment(&docs))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer want.Release()
+	var source ValidatedRawSource
+	source.Bind(raw)
+	var exec Exec
+	defer exec.Release()
+
+	exec.Options = ExecOptions{ResultRows: 1}
+	if err := base.RunInto(&exec, FromValidatedRaw(&source)); err != nil {
+		t.Fatal(err)
+	}
+	if got := resultKey(exec.Result); got != resultKey(want) {
+		t.Fatalf("direct result = %s, want %s", got, resultKey(want))
+	}
+	if exec.file.small.docs.Len() != 0 {
+		t.Fatal("supported single row rebuilt a Segment")
+	}
+	if cap(exec.file.small.arena.heads) != 0 || cap(exec.file.small.slots[0].rows) != 0 {
+		t.Fatal("supported single row allocated the intermediate row arena")
+	}
+	if exec.file.small.batch.data != nil || exec.file.small.slots[0].batch.data != nil {
+		t.Fatal("raw source remained parked as a writable batch buffer")
+	}
+	for _, column := range exec.file.small.work.raws {
+		if len(column) != 0 {
+			t.Fatal("raw workspace retained source views")
+		}
+	}
+	// The result must survive mutation of the source after synchronous return.
+	original := append([]byte(nil), raw...)
+	clear(raw)
+	if got := resultKey(exec.Result); got != resultKey(want) {
+		t.Fatalf("source mutation changed owned point cells: %s", got)
+	}
+	copy(raw, original)
+
+	for _, direction := range []Direction{Asc, Desc, AscNullsLast, DescNullsFirst} {
+		ordered := Select(Path("/id"), Path("/nullable")).Where(Cmp("/id", Eq, "a")).OrderBy("/nullable", direction).Limit(1)
+		oracle, err := ordered.Run(FromSegment(&docs))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := ordered.RunInto(&exec, FromValidatedRaw(&source)); err != nil {
+			t.Fatal(err)
+		}
+		got, expected := resultKey(exec.Result), resultKey(oracle)
+		oracle.Release()
+		if got != expected {
+			t.Fatalf("order %v: got %s, want %s", direction, got, expected)
+		}
+	}
+	rejected := Select(Path("/id")).Where(Cmp("/score", Gt, 7))
+	if err := rejected.RunInto(&exec, FromValidatedRaw(&source)); err != nil || exec.Result.RowCount != 0 {
+		t.Fatalf("residual-rejected point: rows=%d err=%v", exec.Result.RowCount, err)
+	}
+
+	zero := Select(Path("/id"), Path("/score"), Path("/text"), Path("/nullable"), Path("/missing")).
+		Where(Cmp("/id", Eq, "a")).Limit(0)
+	exec.Options = ExecOptions{}
+	if err := zero.RunInto(&exec, FromValidatedRaw(&source)); err != nil {
+		t.Fatal(err)
+	}
+	if exec.Result.RowCount != 0 {
+		t.Fatalf("LIMIT 0 returned %d rows", exec.Result.RowCount)
+	}
+
+	exec.Options = ExecOptions{ResultBytes: 1}
+	if err := base.RunInto(&exec, FromValidatedRaw(&source)); !errors.Is(err, ErrResultBudget) {
+		t.Fatalf("result byte budget = %v, want ErrResultBudget", err)
+	}
+	if exec.Result.RowCount != 0 {
+		t.Fatal("result budget published a partial row")
+	}
+
+	var cancel CancelFlag
+	cancel.Cancel()
+	exec.Options = ExecOptions{Cancel: &cancel}
+	if err := base.RunInto(&exec, FromValidatedRaw(&source)); !errors.Is(err, ErrCanceled) {
+		t.Fatalf("canceled direct row = %v, want ErrCanceled", err)
+	}
+	cancel.Reset()
+	exec.Options = ExecOptions{}
+	nested := Select(Path("/nested/score")).Where(Cmp("/id", Eq, "a"))
+	if err := nested.RunInto(&exec, FromValidatedRaw(&source)); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.RunInto(&exec, FromValidatedRaw(&source)); err != nil {
+		t.Fatalf("direct row after structural fallback: %v", err)
+	}
+	if got := resultKey(exec.Result); got != resultKey(want) {
+		t.Fatalf("reused direct result = %s, want %s", got, resultKey(want))
 	}
 }
 

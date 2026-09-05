@@ -381,6 +381,18 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 	var documentWorkspace GlobalIndexWorkspace
 	var mutationBytes uint64
 	var mutationCount uint64
+	// One shared resolve scratch pair serves every mutation: resolved routes
+	// are consumed synchronously (preimage reads) or duplicated on new groups
+	// (appendReplicatedSQLMutation), so the shared backing never escapes the
+	// call. Per-table prep and the last route are cached across statements;
+	// the route digest is skipped everywhere here — grouping compares full
+	// routes and participant digests are computed at proposal time.
+	var txnScalar [replication.MaxMutationKeyBytes + 16]byte
+	var txnReplicas [ServingReplicaCount]ReplicatedEndpoint
+	var txnPrep replicatedTableResolvePrep
+	txnHavePrep := false
+	var txnReuse ReplicatedRoute
+	txnHaveReuse := false
 
 	for statementIndex := range statements {
 		statement := &statements[statementIndex]
@@ -388,6 +400,10 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 		if err != nil {
 			return nil, true, err
 		}
+		// The placement mapper depends only on the statement spec; building
+		// it once per statement preserves the exact first-mutation panic
+		// timing of the per-mutation build it replaces.
+		var statementMapper *distribution.NativeMapper
 		for inputOrdinal := 0; inputOrdinal < inputCount; inputOrdinal++ {
 			scalar, document, kind, inputErr := replicatedSQLMutationInput(statement, inputOrdinal)
 			if inputErr != nil {
@@ -417,12 +433,14 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 			if len(document) > int(statement.profile.MaxDocumentBytes) {
 				return nil, true, ErrTransactionByteLimit
 			}
-			mapper := distribution.NewNativeMapperWithBucketBits(
-				statement.bound.spec.Arity, statement.bound.spec.EffectiveBucketBits(),
-			)
+			if statementMapper == nil {
+				statementMapper = distribution.NewNativeMapperWithBucketBits(
+					statement.bound.spec.Arity, statement.bound.spec.EffectiveBucketBits(),
+				)
+			}
 			var tuple [1]distribution.Scalar
 			tuple[0] = scalar
-			point, pointErr := mapper.PointFor(tuple[:])
+			point, pointErr := statementMapper.PointFor(tuple[:])
 			if pointErr != nil {
 				return nil, true, ErrReplicatedSQLTransactionUnsupported
 			}
@@ -441,15 +459,28 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 			keyStart := len(keyArena)
 			keyArena = append(keyArena, key...)
 			ownedKey := keyArena[keyStart:len(keyArena):len(keyArena)]
-			var scalarScratch [replication.MaxMutationKeyBytes + 16]byte
-			var replicaScratch [ServingReplicaCount]ReplicatedEndpoint
-			resolved, resolvedOK := snapshot.ResolveReplicatedTableKey(
-				byteview.Bytes(statement.bound.table), ownedKey,
-				scalarScratch[:0], replicaScratch[:0],
+			table := byteview.Bytes(statement.bound.table)
+			if !txnHavePrep || !bytes.Equal(txnPrep.table, table) {
+				fresh, prepOK := snapshot.replicatedTableResolvePrepFor(table)
+				if !prepOK {
+					return nil, true, ErrReplicatedSQLTransactionUnsupported
+				}
+				txnPrep, txnHavePrep, txnHaveReuse = fresh, true, false
+			}
+			var txnReuseRoute ReplicatedRoute
+			if txnHaveReuse {
+				txnReuseRoute = txnReuse
+			}
+			resolved, resolvedOK := snapshot.resolveReplicatedTableKeyPrepared(
+				&txnPrep, ownedKey, txnScalar[:0], txnReplicas[:0],
+				false, txnReuseRoute, txnHaveReuse,
 			)
 			if !resolvedOK || resolved.Profile.Relation != statement.profile.Relation {
 				return nil, true, ErrReplicatedSQLTransactionUnsupported
 			}
+			// Same reuse discipline as the read paths: only value fields are
+			// read back, so the shared backing never escapes the call.
+			txnReuse, txnHaveReuse = resolved.Route, true
 			var oldDocument []byte
 			missingPartial := false
 			if kind == replication.MutationPutPresent && len(statement.bound.updateAssignments) != 0 {
@@ -964,7 +995,7 @@ func appendReplicatedSQLMutation(
 	mutation replication.Mutation,
 ) (int, error) {
 	if builders == nil || byGroup == nil || relation == 0 || bucketBits == 0 ||
-		!distributedtxn.ValidateIntentScopes([]distributedtxn.IntentScope{scope}, bucketBits) {
+		!distributedtxn.ValidateIntentScope(scope, bucketBits) {
 		return -1, ErrReplicatedSQLTransactionUnsupported
 	}
 	targetIndex := replicatedSQLTargetIndex(*builders, *byGroup, route.Group)

@@ -774,10 +774,10 @@ type Expr struct {
 	// everywhere else. WHERE and ON never carry one: the engine filters rows
 	// before it reduces them, so an aggregate in WHERE has nothing to read.
 	Agg AggKind
-	// Column is the [SelectStmt.Columns] index a HAVING leaf reads, and -1
-	// everywhere else. Binding it here is what makes a parsed HAVING
-	// executable in principle: every leaf names a value the reduction already
-	// produces, so lowering needs no second aggregation pass.
+	// Column is the [SelectStmt.Columns] index a HAVING leaf reads, or -1
+	// when the aggregate or GROUP BY key needs a hidden reduction column.
+	// It is -1 everywhere outside HAVING. Hidden dependencies are part of the
+	// same reduction and never extend the public SELECT output.
 	Column int
 	// Path is the left operand of every path-led leaf kind, and nil for boolean
 	// nodes and ExprConstant. It is nil for a COUNT(*) HAVING leaf, matching

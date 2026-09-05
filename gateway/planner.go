@@ -552,7 +552,12 @@ func selectHasAggregate(stmt *sqlast.SelectStmt) bool {
 			return true
 		}
 	}
-	return false
+	for i := range stmt.OrderBy {
+		if scalarHasAggregate(stmt.OrderBy[i].Scalar) {
+			return true
+		}
+	}
+	return exprHasAggregate(stmt.Having)
 }
 
 // joinProvesColocation accepts a newly joined physical relation only when each

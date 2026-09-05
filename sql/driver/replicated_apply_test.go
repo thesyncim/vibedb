@@ -451,7 +451,7 @@ func TestReplicatedApplyServesAuthenticatedBaseAndGlobalRelationBundle(t *testin
 			BucketBits:    distribution.DefaultVirtualBucketBits,
 		}},
 	)
-	skipReplicatedStrictAllocationUnsupported(t, database, base, err)
+	rejectReplicatedStrictAllocationUnsupported(t, database, base, err)
 	if err != nil {
 		t.Fatal(err)
 	}

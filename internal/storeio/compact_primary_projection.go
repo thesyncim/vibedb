@@ -689,13 +689,20 @@ func prepareUnifiedProjectionShape(
 			continue
 		}
 		if hole < 0 {
-			meta.unsupported = true
-			return false
+			// Keep the shape usable for a filter prefix. A container is only
+			// unsupported when this field is actually consumed; output-only
+			// containers must not force rejected rows through reconstruction.
+			streams[field].view = compactStreamView{}
+			continue
 		}
 		stream, ok := compactProjectionStreamAt(entry, hole)
 		if !ok {
-			meta.unsupported = true
-			return false
+			// A malformed/unsupported stream is handled at the first field
+			// access, where the match lane can still use an already-decoded
+			// prefix and the cursor can hand one raw row to its fallback.
+			streams[field].hole = UnifiedHoleContainer
+			streams[field].view = compactStreamView{}
+			continue
 		}
 		streams[field].view = stream
 	}

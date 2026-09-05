@@ -171,6 +171,12 @@ func (lane *ExecutionLane) ProposeConfChange(key raftmember.GroupKey, change pb.
 	}
 	return lane.set.ProposeConfChange(key, change)
 }
+func (lane *ExecutionLane) ProposeControl(key raftmember.GroupKey, data []byte) error {
+	if err := lane.accepts(key); err != nil {
+		return err
+	}
+	return lane.set.ProposeControl(key, data)
+}
 func (lane *ExecutionLane) ReadIndex(key raftmember.GroupKey, context []byte) error {
 	if err := lane.accepts(key); err != nil {
 		return err
@@ -659,6 +665,10 @@ func (set *ExecutionLanes) EnqueueTrackedProposal(
 
 func (set *ExecutionLanes) ProposeConfChange(key raftmember.GroupKey, change pb.ConfChangeI) error {
 	return set.withGroup(key, func(host *Host) error { return host.ProposeConfChange(key, change) })
+}
+
+func (set *ExecutionLanes) ProposeControl(key raftmember.GroupKey, data []byte) error {
+	return set.withGroup(key, func(host *Host) error { return host.ProposeControl(key, data) })
 }
 
 func (set *ExecutionLanes) ReadIndex(key raftmember.GroupKey, context []byte) error {

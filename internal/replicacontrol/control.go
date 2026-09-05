@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"slices"
@@ -228,7 +229,13 @@ func (service *Service) serveRequest(ctx context.Context, connection rafttranspo
 	if !validObservation(observation) ||
 		(request.ExpectedReplicaSetVersion != 0 &&
 			observation.Publication.ReplicaSetVersion != request.ExpectedReplicaSetVersion) {
-		return ErrStale
+		return fmt.Errorf("%w: member=%d leader=%d target=%d applied(status/publication/state)=%d/%d/%d replica-set(request/publication/state)=%d/%d/%d conf-state-equal=%t data-chain-equal=%t snapshot-base=%t progress-found=%t",
+			ErrStale, observation.Status.MemberID, observation.Status.LeaderID, request.TargetMember,
+			observation.Status.Applied, observation.Publication.Applied, observation.State.Applied,
+			request.ExpectedReplicaSetVersion, observation.Publication.ReplicaSetVersion, observation.State.ReplicaSetVersion,
+			proto.Equal(observation.Publication.ConfState, observation.State.ConfState),
+			observation.Publication.DataChainDigest == observation.State.DataChainDigest,
+			observation.SnapshotBase != nil, observation.ProgressFound)
 	}
 	if deadline := boundedDeadline(ctx, service.writeDeadline()); deadline.IsZero() {
 		return ErrControl

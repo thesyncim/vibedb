@@ -100,10 +100,11 @@ const (
 	recoveryJournalMagic = "VJOURNAL"
 	recoveryRecordMagic  = uint32(0x44455256) // "VRED", little-endian.
 
-	// recoveryJournalFlagSealedCapacity marks Capacity as an immutable physical
-	// certificate. It occupies the current header's reserved flags word; every
-	// other bit remains invalid.
-	recoveryJournalFlagSealedCapacity = uint32(1)
+	// Sealed capacity fixes the file geometry. Bit 0 alone additionally requires
+	// private physical backing; bit 1 explicitly selects portable allocation.
+	// Older readers reject bit 1. Every other flag remains invalid.
+	recoveryJournalFlagSealedCapacity   = uint32(1)
+	recoveryJournalFlagPortableCapacity = uint32(2)
 
 	// RecordKindPut marks a same-size inline value replacement.
 	recoveryRecordKindPut = uint16(1)
@@ -225,9 +226,13 @@ type RecoveryJournalHeader struct {
 	BaseGeneration uint64
 	BaseSequence   uint64
 	Capacity       uint64
-	// SealedCapacity requires an exact-size, strictly allocated journal file.
+	// SealedCapacity requires an exact-size journal; allocation is strict unless
+	// PortableCapacity is explicitly set.
 	// The bit is immutable across recycle and disables capacity growth.
 	SealedCapacity bool
+	// PortableCapacity retains the exact sealed size without requiring private
+	// physical reservation. It is valid only with SealedCapacity.
+	PortableCapacity bool
 	// RecycleCount is strictly monotonic across header publications (recycle or
 	// capacity growth). Recovery selects the semantically valid header slot with
 	// the highest count. A checksum-invalid torn publication may fall back; a
@@ -596,6 +601,9 @@ func RecoveryBatchRecordPaddedSizeForPayload(
 // validateRecoveryJournalHeader enforces the geometry invariants every header
 // must satisfy regardless of provenance.
 func validateRecoveryJournalHeader(h RecoveryJournalHeader) error {
+	if h.PortableCapacity && !h.SealedCapacity {
+		return fmt.Errorf("%w: portable capacity requires sealed geometry", ErrRecoveryJournalCorrupt)
+	}
 	if h.Format != RecoveryJournalFormat {
 		return fmt.Errorf("%w: format", ErrRecoveryJournalCorrupt)
 	}
@@ -651,9 +659,14 @@ func EncodeRecoveryJournalHeader(dst []byte, h RecoveryJournalHeader) ([]byte, e
 	binary.LittleEndian.PutUint64(sector[64:72], h.BaseSequence)
 	binary.LittleEndian.PutUint64(sector[72:80], h.Capacity)
 	binary.LittleEndian.PutUint64(sector[80:88], h.RecycleCount)
+	var flags uint32
 	if h.SealedCapacity {
-		binary.LittleEndian.PutUint32(sector[88:92], recoveryJournalFlagSealedCapacity)
+		flags |= recoveryJournalFlagSealedCapacity
 	}
+	if h.PortableCapacity {
+		flags |= recoveryJournalFlagPortableCapacity
+	}
+	binary.LittleEndian.PutUint32(sector[88:92], flags)
 	checksum := PageChecksum(sector[:RecoveryJournalHeaderSize-8])
 	binary.LittleEndian.PutUint32(sector[RecoveryJournalHeaderSize-8:RecoveryJournalHeaderSize-4], checksum)
 	binary.LittleEndian.PutUint32(sector[RecoveryJournalHeaderSize-4:], ^checksum)
@@ -692,13 +705,14 @@ func DecodeRecoveryJournalHeader(src []byte) (RecoveryJournalHeader, error) {
 	h.Capacity = binary.LittleEndian.Uint64(src[72:80])
 	h.RecycleCount = binary.LittleEndian.Uint64(src[80:88])
 	flags := binary.LittleEndian.Uint32(src[88:92])
-	if flags&^recoveryJournalFlagSealedCapacity != 0 {
+	if flags&^(recoveryJournalFlagSealedCapacity|recoveryJournalFlagPortableCapacity) != 0 {
 		return RecoveryJournalHeader{}, fmt.Errorf("%w: header flags", ErrRecoveryJournalCorrupt)
 	}
 	if !allZero(src[92 : RecoveryJournalHeaderSize-8]) {
 		return RecoveryJournalHeader{}, fmt.Errorf("%w: header reserved bytes", ErrRecoveryJournalCorrupt)
 	}
 	h.SealedCapacity = flags&recoveryJournalFlagSealedCapacity != 0
+	h.PortableCapacity = flags&recoveryJournalFlagPortableCapacity != 0
 	if err := validateRecoveryJournalHeader(h); err != nil {
 		return RecoveryJournalHeader{}, err
 	}
@@ -1338,7 +1352,9 @@ type RecoveryJournalPairing struct {
 // Pairing, when non-nil, is checked before either allocation proof or scan.
 type RecoveryJournalOpenOptions struct {
 	SealedCapacityBytes uint64
-	Pairing             *RecoveryJournalPairing
+	// AllowPortableCapacity also accepts the weaker, explicitly marked allocation.
+	AllowPortableCapacity bool
+	Pairing               *RecoveryJournalPairing
 }
 
 var recoveryJournalScanTail = func(journal *RecoveryJournal) error {
@@ -1441,8 +1457,8 @@ func CreateRecoveryJournal(
 				ErrSealedCapacityMismatch,
 			)
 		}
-		if err := StrictlyAllocateFile(file, total); err != nil {
-			return nil, fmt.Errorf("%w: strictly allocate recovery journal: %w", ErrSealedCapacityMismatch, err)
+		if err := allocateSealedFile(file, total, h.PortableCapacity); err != nil {
+			return nil, fmt.Errorf("%w: allocate sealed recovery journal: %w", ErrSealedCapacityMismatch, err)
 		}
 	} else if err := recoveryJournalPreallocate(file, total); err != nil {
 		return nil, err
@@ -1472,9 +1488,9 @@ func CreateRecoveryJournal(
 // OpenRecoveryJournal reads and validates the header of an existing journal
 // file, then scans the record region to re-derive the append cursor and next
 // sequence. Pairing against the store root is the caller's responsibility via
-// Pair. A bare Open of a sealed journal also re-proves its self-described
-// immutable allocation; GrowCapacity remains unavailable on the returned
-// handle.
+// Pair. A bare Open validates a sealed journal's self-described capacity and
+// re-proves physical reservation when its header selects strict allocation.
+// GrowCapacity remains unavailable on either kind of sealed handle.
 func OpenRecoveryJournal(file *os.File) (*RecoveryJournal, error) {
 	return openRecoveryJournal(file, RecoveryJournalOpenOptions{}, true, false)
 }
@@ -1548,14 +1564,15 @@ func openRecoveryJournal(
 			return nil, err
 		}
 	}
-	if (options.SealedCapacityBytes == 0 && header.SealedCapacity &&
-		!allowSelfDescribedSealed) ||
+	if (header.PortableCapacity && !options.AllowPortableCapacity && !allowSelfDescribedSealed) ||
+		(options.SealedCapacityBytes == 0 && header.SealedCapacity &&
+			!allowSelfDescribedSealed) ||
 		(options.SealedCapacityBytes != 0 &&
 			(!header.SealedCapacity || header.Capacity != options.SealedCapacityBytes)) {
 		return nil, fmt.Errorf(
-			"%w: recovery journal expected=%d actual=%d sealed=%t",
+			"%w: recovery journal expected=%d actual=%d sealed=%t portable=%t allow-portable=%t",
 			ErrSealedCapacityMismatch, options.SealedCapacityBytes,
-			header.Capacity, header.SealedCapacity,
+			header.Capacity, header.SealedCapacity, header.PortableCapacity, options.AllowPortableCapacity,
 		)
 	}
 	if header.SealedCapacity {
@@ -1563,7 +1580,10 @@ func openRecoveryJournal(
 		if err := requireExactRegularFileSize(file, total); err != nil {
 			return nil, fmt.Errorf("%w: recovery journal: %w", ErrSealedCapacityMismatch, err)
 		}
-		if !inspectionOnly {
+		// Portable files promise fixed geometry, not renewed physical backing.
+		// Their successful create/append fences already persist the selected
+		// bytes. Opening them performs no allocation repair and needs no sync.
+		if !inspectionOnly && !header.PortableCapacity {
 			if err := StrictlyAllocateFile(file, total); err != nil {
 				return nil, fmt.Errorf("%w: reprove recovery journal: %w", ErrSealedCapacityMismatch, err)
 			}

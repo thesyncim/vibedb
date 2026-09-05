@@ -2,7 +2,8 @@
 
 This audit compares the Chat product and its shared database layer in the local
 `chat` repository with VibeDB main at `9454ced0` (2026-09-05). The implementation
-batch is rebased onto main at `8e4e60f6`. **The application
+batches through null-safe comparisons are merged at `2a8723ff`; grouped
+filtering builds on main at `a2ac5fd8`. **The application
 cannot yet run unchanged on VibeDB.** This change implements the conditional
 expressions, Boolean tests, explicit null ordering, INSERT NULL literals, and
 single-column primary conflict targets, and computed sort keys described below. The remaining reduced
@@ -41,16 +42,19 @@ source locations, not query execution counts or a compatibility percentage.
 | COALESCE | 99 | Lazy, ordered argument selection; same bounded scalar stage as CASE. Works in projections, assignments, conflict assignments, scalar predicates, and aggregate outputs. |
 | GREATEST / LEAST | 69 | Ignore null inputs; exact numeric, text, and Boolean comparisons. Timestamp and PostgreSQL array types remain separate gaps. |
 | NULLIF | 12 | Exact equality of supported scalar domains; returns the first argument unless equal. JSON/JSONB comparison remains a gap. |
-| IS [NOT] TRUE/FALSE | 61 | Correct null/missing truth table and Boolean type checks. Bare Boolean filters and mixed scalar/path comparison or null-test OR trees use strict Boolean checks. Scalar WHERE/grouping remains a gap. |
+| IS [NOT] TRUE/FALSE | 61 | Correct null/missing truth table and Boolean type checks. Bare Boolean filters and mixed scalar/path comparison or null-test OR trees use strict Boolean checks. Scalar WHERE runs before grouping through a bounded relation stage. |
 | NULLS FIRST/LAST | 59 | Path, alias, ordinal, set, window-output, grouped, heap, and disk-spill ordering; distributed merge and planner ordering properties use the same placement. Existing default ordering is preserved. |
 | NULL in INSERT column VALUES | — | Literal NULL reaches the existing nullable-field validator; primary-key and NOT NULL failures remain atomic. |
 | Explicit ON CONFLICT target | 58 | A single primary-key column is validated at prepare and execution, including explicit transactions. Composite and secondary unique targets remain unsupported. Secondary unique violations are never silently skipped. |
 | Computed ORDER BY | 69 GREATEST/LEAST locations include sort usage | Hidden scalar and aggregate sort keys run before OFFSET/LIMIT. Grouping, joins, derived relations, and window outputs retain their own semantic stages; distributed sorts evaluate the complete qualifying relation. |
-| IS [NOT] DISTINCT FROM | Reduced comparison case | Total null-safe comparison over supported scalar domains, with each operand evaluated once. Uses the shared predicate/CASE stage on embedded and distributed reads and mutations. Equality against a placement key retains finite shard routing through CTE aliases. Existing scalar WHERE/grouping restrictions remain. |
+| Scalar filtering before grouping | Reduced aggregate case | Filters the input relation before COUNT/SUM/AVG, grouped outputs, HAVING, and windows. Preserves prepared parameter ranges and headers across CTEs and joins, including chained and outer joins. Embedded, durable, and distributed reads share the same bounded execution stage. |
+| Relation wildcards with computed outputs | Reduced derived and CTE cases | Expands known child output ordinals alongside scalar SELECT expressions and scalar filters. Duplicate names and typed child metadata are preserved without reconstructing documents. Computed sort aliases bind after expansion. Bare physical SELECT * retains the existing whole-document contract; inferred field expansion and numeric ORDER BY positions with wildcards remain gaps. |
+| Aggregate HAVING dependencies | Reduced grouped and global aggregate cases | HAVING can read aggregates absent from the SELECT list and combine grouped-key comparisons, null tests, and computed scalar predicates with AND/OR/NOT. Computed output runs after HAVING even without ORDER BY. Hidden reductions leave public result headers unchanged. Correlated LATERAL also supports hidden local and captured COUNT/SUM/AVG/MIN/MAX in its existing comparison, IN, BETWEEN, and null-test predicates; computed correlated predicates and post-reduction tails remain gaps. |
+| IS [NOT] DISTINCT FROM | Reduced comparison case | Total null-safe comparison over supported scalar domains, with each operand evaluated once. Uses the shared predicate/CASE stage on embedded and distributed reads and mutations. Equality against a placement key retains finite shard routing through CTE aliases. Uncorrelated scalar WHERE runs before grouping; correlated grouped statements remain a gap. |
 
 These features do not remove the existing restrictions on computed GROUP BY
-expressions, mixed scalar/path pattern predicates, grouped scalar
-filters, derived-table wildcard projections, or distributed mutation syntax.
+expressions, mixed scalar/path pattern predicates, correlated grouped scalar
+filters, inferred fields from a whole-document child projection, or distributed mutation syntax.
 There is no general scalar-function catalog. Use explicit casts between
 different scalar domains; general PostgreSQL unknown-literal/type coercion is
 not claimed. Conditional Boolean/text typed literals reuse the existing CASE
@@ -107,7 +111,7 @@ not claims closed by local tests.
 ## Remaining work
 
 The [SQL workload gap corpus](../../internal/conformance/sql_workload.go)
-contains 34 reduced statements. The
+contains 33 reduced statements. The
 [driver gate](../../sql/driver/sql_workload_compatibility_test.go) verifies that
 each still refuses at prepare or execution. When implementing a gap, replace
 its refusal expectation with result, metadata, and atomicity coverage and
@@ -122,7 +126,7 @@ update this table. A parser accepting a statement does not close a gap.
 | 1 | Relational mutations and queues | 36 UPDATE-FROM/DELETE-USING and 14 modifying-CTE locations. Requires atomic shared-snapshot execution, INSERT-SELECT with target columns, conflict-action WHERE, and returned-row dependencies. |
 | 1 | Locking and queue concurrency | 14 locking locations, including FOR UPDATE / SKIP LOCKED. Requires a real concurrency contract; accepting and ignoring lock clauses would be incorrect. |
 | 2 | Expression, partial, ordered, and covering indexes | 205 index-related locations. Required both for schema acceptance and efficient channel/member queries; uniqueness predicates and access-path proofs must remain correct. |
-| 2 | Remaining query expressions | Computed group keys; mixed scalar/path pattern predicates; scalar filtering before aggregates; derived wildcard + scalar outputs; string/date functions; DISTINCT ON; aggregate DISTINCT/FILTER and array/JSON aggregation. |
+| 2 | Remaining query expressions | Computed group keys; mixed scalar/path pattern predicates; correlated scalar filtering before aggregates; derived wildcard + scalar outputs; string/date functions; DISTINCT ON; aggregate DISTINCT/FILTER and array/JSON aggregation. |
 | 2 | ALTER and migration lifecycle | 375 ALTER locations. Current ADD COLUMN is insufficient for historical migrations, type/default changes, drops, and index changes. |
 | 2 | Bulk and client/session behavior | 5 COPY and 10 session/catalog locations, plus ORM-generated connection and relation queries not established by static extraction. Requires wire/client tests and bounded bulk ingestion. |
 | 1 before application rollout | Distributed execution parity | Existing RF3 SQL mutation restrictions on ON CONFLICT, RETURNING, non-primary-key mutations, and bounded transactions still apply. Local database/sql success is not evidence that every RF3 path supports a feature. |

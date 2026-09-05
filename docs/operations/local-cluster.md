@@ -6,21 +6,35 @@ Start three physical serving nodes, connect with psql, and verify a write
 survives a clean restart. Each node combines a SQL frontend, Raft replicas,
 and shared node storage. The launcher creates local credentials and manifests.
 
-This is a Linux development environment with loopback SQL trust authentication.
+This is a macOS/Linux development environment with loopback SQL trust authentication.
 Use the same build to reopen its data; see [compatibility](../status.md).
 
 ## Prerequisites
 
-- A Linux host or Linux VM/container with a filesystem that supports strict
-  allocation for sealed recovery journals. Use a suitable Linux data volume
-  in a container; an overlay filesystem can reject the required allocation.
-  Native macOS cannot prepare this RF3 profile.
+- A macOS or Linux host with a local writable filesystem that supports the
+  WAL's native preallocation and durability operations. A normal local
+  directory works on macOS/APFS and ordinary Linux container overlay storage.
 - Go 1.27 or later and a repository checkout.
 - `psql` for the SQL steps.
 - A short, absolute path for disposable state, with space for node files.
 - Free loopback port `7432` for the SQL listener.
 
 Run the build and launcher commands from the repository root.
+
+RF3 journals use portable fixed-capacity allocation. A normal local directory
+is sufficient on macOS/APFS and ordinary Linux filesystems; the journals do not
+require Linux's reflink-unsharing operation or an ext4-specific volume.
+Their byte limits, checksums, sync barriers, and recovery rules remain enforced.
+Portable allocation does not promise that future overwrites cannot run out of
+space: disk-full and I/O errors fail the operation, and uncertain outcomes must
+be recovered before retrying. The explicit strict allocation APIs retain their
+stronger physical-reservation requirement.
+
+Portable journals carry a distinct on-disk flag, and the build's disk grammar
+identity has changed. Use the same build for all processes and a fresh development
+root when moving from a build with the previous disk identity. Existing roots
+are not silently migrated. Native Windows RF3 still requires a separate WAL
+namespace/publication port.
 
 ## 1. Build the launcher and servers
 
@@ -41,8 +55,7 @@ Use `GOEXPERIMENT=nosimd` in all three commands for a portable build. See
 
 Choose an absent or empty root on first start. This example uses `/tmp` for
 disposable state; files there may be removed by the operating system. Confirm
-that this path is on a supported filesystem. In a container, mount the Linux
-data volume at this path before starting.
+that this path is on a supported filesystem with enough free space.
 
 ```sh
 ./bin/vibedb cluster dev \

@@ -20,9 +20,11 @@ type ProjectionFilter struct {
 // compact scalar fields; Scanned is then zero and any callback progress must
 // be discarded before falling back to the same snapshot range.
 type ProjectedRangeResult struct {
-	Scanned   int
-	Supported bool
-	Stopped   bool
+	Scanned       int
+	Matched       int
+	NativeMatched int
+	Supported     bool
+	Stopped       bool
 }
 
 // NewProjectionFilter builds a reusable direct scalar projection filter. Paths
@@ -66,12 +68,48 @@ func (s *Snapshot) FilterProjectedRangeWithScratch(
 	limit int,
 	visit func(row uint64, fields []storeio.UnifiedProjectionField) error,
 ) (result ProjectedRangeResult, scratch []byte, err error) {
+	fieldCount := 0
+	if f != nil {
+		fieldCount = f.FieldCount()
+	}
+	return s.FilterProjectedRangeWithMatchScratch(
+		f, fieldCount, lower, upper, lowerExclusive,
+		shapeSeen, shapeWork, streamWork, fields, valueScratch, nil, nil, limit,
+		nil, visit, nil,
+	)
+}
+
+// FilterProjectedRangeWithMatchScratch is the late-materializing form of
+// FilterProjectedRangeWithScratch. The first filterCount fields are decoded
+// for every row and passed to match. Remaining fields are decoded only after a
+// match, so filter-only paths never consume late output work. If a compact row
+// cannot answer the selected paths, fallback receives its inline JSON or an
+// overflow value reassembled for this snapshot; the cursor has already retained
+// the row position and continues with the next row after the callback returns.
+func (s *Snapshot) FilterProjectedRangeWithMatchScratch(
+	f *ProjectionFilter,
+	filterCount int,
+	lower, upper []byte,
+	lowerExclusive bool,
+	shapeSeen []int,
+	shapeWork []storeio.UnifiedProjectionShapeWorkspace,
+	streamWork []storeio.UnifiedProjectionStreamWorkspace,
+	fields []storeio.UnifiedProjectionField,
+	valueScratch []byte,
+	fallbackScratch *[]byte,
+	fallbackReserve func(required int64) ([]byte, error),
+	limit int,
+	match func(row uint64, fields []storeio.UnifiedProjectionField) (bool, error),
+	visit func(row uint64, fields []storeio.UnifiedProjectionField) error,
+	fallback func(row uint64, raw []byte) (bool, error),
+) (result ProjectedRangeResult, scratch []byte, err error) {
 	if s == nil || s.collection == nil || s.state == nil {
 		return ProjectedRangeResult{}, valueScratch, ErrClosed
 	}
-	if f == nil || f.inner == nil || f.FieldCount() == 0 || visit == nil {
+	if f == nil || f.inner == nil || f.FieldCount() == 0 || visit == nil ||
+		filterCount < 0 || filterCount > f.FieldCount() {
 		return ProjectedRangeResult{}, valueScratch,
-			fmt.Errorf("vibedb: nil primary projection filter")
+			fmt.Errorf("vibedb: invalid primary projection match filter")
 	}
 	if len(lower) != 0 && len(upper) != 0 && bytes.Compare(lower, upper) >= 0 {
 		return ProjectedRangeResult{Supported: true}, valueScratch, nil
@@ -83,8 +121,6 @@ func (s *Snapshot) FilterProjectedRangeWithScratch(
 		if len(lower) > storeio.CommonPrimaryLeafMaxKeyBytes || len(lower) >= cap(valueScratch) {
 			return ProjectedRangeResult{}, valueScratch, nil
 		}
-		// Reserve the fence at the end of caller-owned storage for the cursor's
-		// lifetime. Restore the full arena capacity on every return path.
 		original := valueScratch
 		defer func() { scratch = original[:len(scratch)] }()
 		fenceStart := cap(valueScratch) - len(lower) - 1
@@ -113,16 +149,23 @@ func (s *Snapshot) FilterProjectedRangeWithScratch(
 	); err != nil {
 		return ProjectedRangeResult{}, valueScratch, err
 	}
-	defer cursor.Close()
-	const maxShapes = storeio.UnifiedProjectionMaxShapes
+	var fallbackBuffer []byte
+	if fallbackScratch != nil {
+		fallbackBuffer = *fallbackScratch
+	}
+	cursor.AdoptSpliceScratch(fallbackBuffer)
+	defer func() {
+		if fallbackScratch != nil {
+			buffer := cursor.ReleaseSpliceScratch()
+			*fallbackScratch = buffer[:0]
+		}
+		cursor.Close()
+	}()
 	fieldCount := f.FieldCount()
 	if cap(fields) < fieldCount || fieldCount == 0 {
-		// Projection scratch is explicitly caller-owned. A declined attempt
-		// must not hide an unbounded durable allocation behind this wrapper;
-		// the query layer will rerun the same snapshot range generically.
 		return ProjectedRangeResult{}, valueScratch, nil
 	}
-	shapeCap := min(maxShapes, cap(shapeSeen), cap(shapeWork))
+	shapeCap := min(storeio.UnifiedProjectionMaxShapes, min(cap(shapeSeen), cap(shapeWork)))
 	if streamShapes := cap(streamWork) / fieldCount; streamShapes < shapeCap {
 		shapeCap = streamShapes
 	}
@@ -131,8 +174,7 @@ func (s *Snapshot) FilterProjectedRangeWithScratch(
 	}
 	shapeSeen = shapeSeen[:shapeCap]
 	shapeWork = shapeWork[:shapeCap]
-	streamCount := shapeCap * fieldCount
-	streamWork = streamWork[:streamCount]
+	streamWork = streamWork[:shapeCap*fieldCount]
 	fields = fields[:fieldCount]
 	defer func() {
 		clear(shapeSeen)
@@ -141,12 +183,65 @@ func (s *Snapshot) FilterProjectedRangeWithScratch(
 		clear(fields)
 	}()
 	var progress storeio.UnifiedProjectionProgress
-	supported, stopped, valueScratch, err := cursor.VisitProjected(
-		f.inner, &progress, shapeSeen, shapeWork, streamWork, fields,
-		valueScratch, limit,
+	var reserve func(required int) ([]byte, error)
+	if fallbackReserve != nil {
+		reserve = func(required int) ([]byte, error) {
+			if required < 0 {
+				return nil, storeio.ErrUnifiedProjectionFallbackUnsupported
+			}
+			buffer, reserveErr := fallbackReserve(int64(required))
+			if reserveErr == nil && fallbackScratch != nil {
+				*fallbackScratch = buffer[:0]
+			}
+			return buffer, reserveErr
+		}
+	}
+	var wrappedFallback func(uint64, []byte, storeio.PageRef) (bool, error)
+	if fallback != nil {
+		wrappedFallback = func(row uint64, raw []byte, overflow storeio.PageRef) (bool, error) {
+			if overflow != (storeio.PageRef{}) {
+				var buffer []byte
+				if fallbackScratch != nil {
+					buffer = *fallbackScratch
+				}
+				var overflowReserve func(int) ([]byte, error)
+				if fallbackReserve != nil {
+					overflowReserve = reserve
+				} else {
+					// Let the unified decoder use an already-admitted buffer, but
+					// decline before it allocates when the legacy API supplied no
+					// admission callback.
+					overflowReserve = func(int) ([]byte, error) {
+						return nil, storeio.ErrUnifiedProjectionFallbackUnsupported
+					}
+				}
+				resolved, bounded, overflowErr := s.collection.appendPrimaryOverflowValueWithReserve(
+					buffer[:0], overflow, leafBounds, overflowReserve,
+				)
+				if overflowErr != nil {
+					return false, overflowErr
+				}
+				if !bounded {
+					return false, storeio.ErrUnifiedProjectionFallbackUnsupported
+				}
+				if fallbackScratch != nil {
+					*fallbackScratch = resolved[:0]
+				}
+				// An overflow row may have admitted a larger buffer than the
+				// cursor started with. Adopt it so a later inline fallback and
+				// ReleaseSpliceScratch observe the same retained capacity.
+				cursor.AdoptSpliceScratch(resolved[:0])
+				raw = resolved
+			}
+			return fallback(row, raw)
+		}
+	}
+	supported, stopped, valueScratch, err := cursor.VisitProjectedMatchWithReserve(
+		f.inner, &progress, filterCount, shapeSeen, shapeWork, streamWork,
+		fields, valueScratch, limit, match,
 		func(row uint64, values []storeio.UnifiedProjectionField) error {
 			return visit(row, values)
-		},
+		}, wrappedFallback, reserve,
 	)
 	if err != nil {
 		return ProjectedRangeResult{}, valueScratch, err
@@ -155,6 +250,8 @@ func (s *Snapshot) FilterProjectedRangeWithScratch(
 		return ProjectedRangeResult{}, valueScratch, nil
 	}
 	return ProjectedRangeResult{
-		Scanned: progress.Scanned, Supported: true, Stopped: stopped,
+		Scanned: progress.Scanned, Matched: progress.Matched,
+		NativeMatched: progress.NativeMatched,
+		Supported:     true, Stopped: stopped,
 	}, valueScratch, nil
 }

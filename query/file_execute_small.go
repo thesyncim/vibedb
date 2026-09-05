@@ -47,6 +47,19 @@ type fileSmallScan struct {
 	projectionStream []storeio.UnifiedProjectionStreamWorkspace
 	projectionFields []storeio.UnifiedProjectionField
 	projectionValues []byte
+	// projectionOrdinals maps the storage projector's compact field order back
+	// to the plan's deduplicated valuePaths. projectionOutput maps each result
+	// column to that field order; filter-only paths therefore never need a late
+	// decode or a second scalar slot.
+	projectionOrdinals         []int
+	projectionOutput           []int
+	projectionScalars          []scalar
+	projectionSlots            [][]scalar
+	projectionFallback         []byte
+	projectionFilterCount      int
+	projectionTextReserved     int64
+	projectionLateTextReserved int64
+	projectionFallbackReserved int64
 }
 
 func (p *plan) runFileSmall(e *Exec, snapshot *durable.Snapshot, span *FileRangeSource, masks []store.Mask, opts normalizedFileOptions, stats *ExecStats, ordered bool) (bool, error) {
@@ -59,6 +72,9 @@ func (p *plan) runFileSmall(e *Exec, snapshot *durable.Snapshot, span *FileRange
 		ordered && span != nil && span.predicatePath != "" && span.predicatePath == span.orderedPath, 0
 	s.work.heapWorkParent = &e.Workspace.heapWorkBudget
 	s.work.heapWorkTextReserved = 0
+	s.projectionTextReserved = 0
+	s.projectionLateTextReserved = 0
+	s.projectionFallbackReserved = 0
 	s.work.cancel = e.Options.Cancel
 	s.work.eval.setWork(&e.Workspace.heapWorkBudget)
 	s.work.eval.bindTo(nil)
@@ -69,6 +85,9 @@ func (p *plan) runFileSmall(e *Exec, snapshot *durable.Snapshot, span *FileRange
 		s.slots[0].batch = s.batch
 		clear(s.arena.heads) // borrowed batch values must not retain old arenas
 		clear(s.cells)
+		clear(s.projectionScalars)
+		clear(s.projectionSlots)
+		s.projectionFallback = s.projectionFallback[:0]
 		*stats = s.stats
 		s.p, s.e = nil, nil
 		s.work.heapWorkParent = nil
@@ -135,6 +154,7 @@ func (p *plan) runValidatedRawInto(e *Exec, raw []byte) error {
 	s.p, s.e, s.stats, s.opts, s.ordered, s.covered, s.payload = p, e, ExecStats{}, normalizedFileOptions{}, false, false, 0
 	s.work.heapWorkParent = &e.Workspace.heapWorkBudget
 	s.work.heapWorkTextReserved = 0
+	s.projectionFallbackReserved = 0
 	s.work.cancel = e.Options.Cancel
 	s.work.eval.setWork(&e.Workspace.heapWorkBudget)
 	s.work.eval.bindTo(nil)
@@ -142,8 +162,15 @@ func (p *plan) runValidatedRawInto(e *Exec, raw []byte) error {
 	s.work.eval.bindCorrelations(e.Workspace.correlations)
 	s.batch = takeFileBatch(s.slots[:], 0, 0)
 	defer func() {
+		// This batch borrows raw. Never park its capacity as a writable scan
+		// buffer: a later durable scan could otherwise overwrite caller input.
+		s.batch.data = nil
 		s.slots[0].batch = s.batch
+		s.work.clearBorrowedViews()
 		clear(s.arena.heads)
+		clear(s.projectionScalars)
+		clear(s.projectionSlots)
+		s.projectionFallback = s.projectionFallback[:0]
 		e.Stats = s.stats
 		s.p, s.e = nil, nil
 		s.work.heapWorkParent = nil
@@ -161,7 +188,29 @@ func (p *plan) runValidatedRawInto(e *Exec, raw []byte) error {
 		Workers: 1, RowsTotal: 1, RowsScanned: 1, CandidateRows: 1,
 		PeakBatchRows: 1, PeakBatchBytes: s.batch.bytes,
 	}
-	err := s.flush()
+	var err error
+	// One nongrouped point already satisfies every requested ordering. Let the raw
+	// ordered materializer own the one-row result when its scalar shape is
+	// supported; an unsupported shape keeps the established structural flush.
+	// LIMIT 0 deliberately stays on that path because the direct materializer
+	// receives no row budget to consume and the existing flush truncates it.
+	if !p.hasLimit || p.limit > 0 {
+		retained, handled, _, appendErr := p.appendFileRawOrderedResult(
+			&e.Result, s.batch, &s.work, false, &s.payload, &s.cells,
+		)
+		if handled {
+			s.stats.Batches++
+			s.stats.BufferedBytes = max(s.stats.BufferedBytes, retained)
+			s.batch.base += uint64(len(s.batch.ends))
+			s.batch.data, s.batch.ends, s.batch.bytes = s.batch.data[:0], s.batch.ends[:0], 0
+			err = appendErr
+			if err == nil {
+				err = s.work.checkCanceled()
+			}
+			return err
+		}
+	}
+	err = s.flush()
 	if err == nil {
 		err = s.work.checkCanceled()
 	}

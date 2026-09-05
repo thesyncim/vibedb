@@ -21,6 +21,12 @@ func TestCoordinatorQueryMatchesGlobalSQLSemantics(t *testing.T) {
 		want []string
 	}{
 		{`SELECT COALESCE(SUM(n), 0) FROM messages`, []string{"10"}},
+		{`SELECT COUNT(*), SUM(n), AVG(n) FROM messages WHERE COALESCE(n,0)>1`, []string{"3|9|3"}},
+		{`SELECT n, COUNT(*) FROM messages WHERE n IS DISTINCT FROM NULL GROUP BY n ORDER BY -SUM(n) LIMIT 2`, []string{"4|1", "3|1"}},
+		{`SELECT COUNT(*), COALESCE(SUM(n),0) FROM messages WHERE COALESCE(n,0)>100`, []string{"0|0"}},
+		{`WITH c AS (SELECT n FROM messages) SELECT SUM(n) FROM c WHERE COALESCE(n,0)>2`, []string{"7"}},
+		{`SELECT n, COUNT(*), ROW_NUMBER() OVER (ORDER BY n) AS rn FROM messages WHERE COALESCE(n,0)>2 GROUP BY n ORDER BY n`, []string{"3|1|1", "4|1|2"}},
+		{`SELECT SUM(c.n) FROM messages AS a JOIN messages AS b ON a.n=b.n JOIN messages AS c ON b.n=c.n WHERE COALESCE(c.n,0)>2`, []string{"7"}},
 		{`SELECT GREATEST(SUM(n), 5), LEAST(MAX(n), 3), NULLIF(COUNT(*), 0) FROM messages`, []string{"10|3|4"}},
 		{`SELECT n FROM messages WHERE n=1 OR COALESCE(n,0)=4 ORDER BY n`, []string{"1", "4"}},
 		{`SELECT d.n FROM (SELECT n, CASE WHEN n>2 THEN TRUE ELSE FALSE END AS visible FROM messages) AS d WHERE d.visible ORDER BY d.n`, []string{"3", "4"}},
@@ -32,14 +38,21 @@ func TestCoordinatorQueryMatchesGlobalSQLSemantics(t *testing.T) {
 		{`SELECT a.n FROM messages AS a JOIN messages AS b ON a.n=b.n ORDER BY -b.n LIMIT 2`, []string{"4", "3"}},
 		{`SELECT n, ROW_NUMBER() OVER (ORDER BY n) AS rn FROM messages ORDER BY -n LIMIT 2`, []string{"4|4", "3|3"}},
 		{`SELECT AVG(n) FROM messages`, []string{"2.5"}},
+		{`SELECT d.*,COALESCE(d.n,0) AS score FROM (SELECT n FROM messages) d ORDER BY score DESC LIMIT 2`, []string{"4|4", "3|3"}},
 		{`SELECT n FROM messages ORDER BY n DESC LIMIT 2 OFFSET 1`, []string{"3", "2"}},
 		{`SELECT DISTINCT n FROM messages ORDER BY n`, []string{"1", "2", "3", "4"}},
 		{`SELECT COUNT(*) FROM messages HAVING COUNT(*) > 3`, []string{"4"}},
+		{`SELECT COALESCE(SUM(n),0) FROM messages HAVING COUNT(*)>3`, []string{"10"}},
+		{`SELECT n FROM messages GROUP BY n HAVING SUM(n)>2 ORDER BY n`, []string{"3", "4"}},
+		{`SELECT n FROM messages GROUP BY n HAVING n=1 OR COALESCE(SUM(n),0)>3 ORDER BY n`, []string{"1", "4"}},
+		{`SELECT 1 FROM messages WHERE n>100 HAVING COUNT(*)=0`, []string{"1"}},
 		{`WITH c AS (SELECT n FROM messages) SELECT SUM(n) FROM c`, []string{"10"}},
 		{`SELECT SUM(d.n) FROM (SELECT n FROM messages) AS d`, []string{"10"}},
 		{`SELECT n FROM messages WHERE n < 3 UNION ALL SELECT n FROM messages WHERE n > 2 ORDER BY 1 DESC`, []string{"4", "3", "2", "1"}},
 		{`SELECT n, ROW_NUMBER() OVER (ORDER BY n DESC) AS rn FROM messages ORDER BY rn`, []string{"4|1", "3|2", "2|3", "1|4"}},
 		{`SELECT a.n, b.n FROM messages AS a CROSS JOIN messages AS b WHERE a.n = 1 AND b.n = 4`, []string{"1|4"}},
+		{`SELECT a.n,d.total FROM messages a LEFT JOIN LATERAL (SELECT SUM(a.n) AS total FROM messages b WHERE b.n=a.n GROUP BY a.n HAVING COUNT(*)>0 AND SUM(b.n)>2) d ON TRUE ORDER BY a.n`, []string{"1|null", "2|null", "3|3", "4|4"}},
+		{`SELECT a.n,d.total FROM messages a LEFT JOIN LATERAL (SELECT COUNT(*) AS total FROM messages b WHERE b.n=a.n HAVING SUM(a.n)>2) d ON TRUE ORDER BY a.n`, []string{"1|null", "2|null", "3|1", "4|1"}},
 	} {
 		t.Run(tc.sql, func(t *testing.T) {
 			result, err := executor.Query(context.Background(), Query{SQL: tc.sql, Class: ClassBatch})
@@ -148,6 +161,14 @@ func TestCoordinatorQueryPrunesNestedShardKeysWithoutCrossingLimit(t *testing.T)
 		want   []string
 	}{
 		{`WITH c(owner,n) AS (SELECT tenant_id,n FROM messages) SELECT SUM(n)+1 FROM c WHERE owner=?`, []shardservice.Param{shardservice.StringParam(keys[0])}, 1, []string{"1.01e2"}},
+		{`WITH c(owner,n) AS (SELECT tenant_id,n FROM messages) SELECT COUNT(*), SUM(n) FROM c WHERE owner IS NOT DISTINCT FROM ? AND COALESCE(n,0)>?`, []shardservice.Param{shardservice.StringParam(keys[0]), shardservice.NumberParam("50")}, 1, []string{"1|100"}},
+		{`SELECT COUNT(*) FROM messages WHERE tenant_id IS NOT DISTINCT FROM NULL`, nil, 0, []string{"0"}},
+		{`WITH c(owner,n) AS (SELECT tenant_id,n FROM messages) SELECT c.*,COALESCE(c.n,0) AS score FROM c WHERE owner=? ORDER BY score DESC`, []shardservice.Param{shardservice.StringParam(keys[0])}, 1, []string{fmt.Sprintf("%q|100|100", keys[0])}},
+		{`WITH c(owner,n) AS (SELECT tenant_id,n FROM messages) SELECT SUM(n)+1 FROM c WHERE owner=? HAVING COUNT(*)>0`, []shardservice.Param{shardservice.StringParam(keys[0])}, 1, []string{"1.01e2"}},
+		{`SELECT 1 FROM messages WHERE tenant_id IS NOT DISTINCT FROM NULL HAVING COUNT(*)=0`, nil, 0, []string{"1"}},
+		{`SELECT 1 FROM messages WHERE tenant_id IS NOT DISTINCT FROM NULL ORDER BY COUNT(*)`, nil, 0, []string{"1"}},
+		{`SELECT d.total FROM messages a CROSS JOIN LATERAL (SELECT COUNT(*) AS total FROM messages b WHERE b.tenant_id=? GROUP BY a.n HAVING SUM(a.n)>0 AND SUM(b.n)>0) d WHERE a.tenant_id=?`, []shardservice.Param{shardservice.StringParam(keys[0]), shardservice.StringParam(keys[0])}, 1, []string{"1"}},
+		{`SELECT SUM(c.n) FROM messages AS a JOIN messages AS b ON a.tenant_id=b.tenant_id JOIN messages AS c ON b.tenant_id=c.tenant_id WHERE a.tenant_id=? AND COALESCE(c.n,0)>50`, []shardservice.Param{shardservice.StringParam(keys[0])}, 1, []string{"100"}},
 		{`WITH c(owner,n) AS (SELECT tenant_id,n FROM messages) SELECT n+1 FROM c WHERE owner IS NOT DISTINCT FROM ?`, []shardservice.Param{shardservice.StringParam(keys[0])}, 1, []string{"1.01e2"}},
 		{`SELECT n FROM messages WHERE tenant_id IS NOT DISTINCT FROM ?`, []shardservice.Param{shardservice.StringParam(keys[1])}, 1, []string{"100"}},
 		{`WITH c(owner,n) AS (SELECT tenant_id,n FROM messages) SELECT n+1 FROM c WHERE owner IS NOT DISTINCT FROM NULL`, nil, 0, nil},
