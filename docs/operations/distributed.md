@@ -154,6 +154,9 @@ thresholds and preallocated active/spare capacity; it may wait for a later
 capture and segment seal. It does not force idle checkpoints or rotations.
 An already-published seal does not block
 reclamation while its rotation completion notice awaits consumption.
+Each request retires at most 32 segments; larger backlogs drain across
+scheduled captures, so this is not a fixed retention bound for arbitrary
+write rates or slow groups.
 
 The Raft WAL is bounded, preallocated, encrypted/authenticated, digest-chained, and tied to an
 immutable placement identity. Its active limits are sealed into the format; a manifest may choose

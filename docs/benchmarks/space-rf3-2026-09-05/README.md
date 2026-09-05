@@ -1,202 +1,145 @@
-# RF3 space reclamation from main 8e4e60f6
+# Shared-node RF3 history reclamation
 
-## Follow-up qualification
+The implemented saving removes obsolete Raft history on each physical replica.
+It connects the existing authenticated dead-prefix reclamation protocol to the
+background application-checkpoint worker and fixes an admission guard that
+mistook an unread, completed seal notice for unfinished seal publication.
 
-The nine-pair `3548ad29` experiment saved 48.5% of allocated node-log space,
-but write p99 estimates remained higher: paired ratios were 1.016 for inserts
-and 1.034 for updates, with wide confidence intervals spanning 1. The raw
-baseline checkpoint indexes show every node already advancing its application
-checkpoint. The extra due-checkpoint scheduling change is therefore removed
-from the final candidate to keep checkpoint scheduling identical to main.
-That narrower candidate is being requalified; no absence-of-slowdown claim is
-made from this experiment.
+Checkpoint scheduling, document representation, foreground reads and writes,
+acknowledgement boundaries, segment geometry, and reserve capacity are unchanged.
+The comparison uses main `b2f716ec` and candidate `858a834d`. The integration
+branch was subsequently rebased onto main `3021bece`; the storage/runtime source
+and benchmark harness were byte-for-byte identical across that rebase. It was
+then rebased onto latest main `f05df25e` for the deeper format research. That
+newer main changes sidecar allocation and read paths, so the old timings must
+not be relabeled as a comparison against it.
 
-The resumed work is based on `b2f716ec`. A three-process pilot with the default
-32-MiB segments, two persistent authenticated clients, 4,096 writes of 64 KiB,
-and 2,048 linearizable full-value reads passed recovery but reclaimed no
-segments. The original candidate is therefore not qualified by the small
-fixture's saving below. The pilot was exploratory, not a timing comparison.
+## Measured RF3 result
 
-Inspection found that a checkpoint due on a busy tick discarded its due state
-and waited another complete interval. The follow-up retains it until a
-quiescent Ready drive can submit it. The integration regression covers that
-transition. The new opt-in `TestServeRF3NodeSpaceQualification` retains raw
-latencies, full process diagnostics, physical allocation including reserves,
-checkpoint indexes, and proof that initial segment files disappeared. It also
-restarts the entire cluster and crashes/restarts each replica before checking
-acknowledged values again. CI requires actual reclamation on every replica.
+The nine-pair `858a834d` comparison saved 48.6% of allocated node-log bytes,
+but **did not meet the performance requirement**: paired total-time ratio was
+1.050 (95% interval 1.008–1.104), insert p99 1.125, update p99 1.093, and read
+p99 1.164. All correctness trials passed. The complete
+[raw comparison](final-sustained/node-space-comparison/comparison.json) is
+retained; the `final-sustained` directory name identifies this narrowed
+maintenance candidate, not a qualified final implementation. The change remains
+unmerged while the regression and stronger architectural alternatives are
+investigated. The completed [Astra max format research](../format-research-2026-09-05/README.md)
+examines primary encoding, overflow geometry and a replicated recovery format
+that could eliminate duplicate redo. The incomplete body-retirement experiment
+was preserved outside the active source tree pending that architecture choice.
 
-The live qualification and matched performance comparison of this follow-up
-are pending; the older measurements below do not qualify the new scheduler.
+## Workload and accounting
 
-The first CI follow-up advanced application checkpoints through roughly index
-4,100 on all three replicas but still retained the initial segments. The
-sealer's `sealPending` flag includes a published seal with an unread completion
-notice. Reclamation checked that flag and remained blocked between ordinary
-rotations; the original fixture's explicit `WaitSeal` hid the issue. The
-maintenance guard now uses the authenticated `HasPending` publication state,
-on the same serial worker, and leaves the completion notice for its existing
-consumer. A regression reclaims before calling `WaitSeal` and verifies the
-retained entry and completion afterwards.
+The dedicated Linux CI job builds both revisions before measurement, then runs
+nine alternating pairs on one runner. Both binaries contain the exact same
+qualification test. Each fresh fixture has three independent server processes,
+production 32-MiB node segments, and two persistent authenticated clients. Every
+trial performs 1,024 inserts, 3,072 replacements, and 2,048 linearizable full-value
+reads of 64-KiB documents. The test shortens application checkpoint cadence to
+two seconds in **both test binaries**; production retains ten minutes.
 
-Measurements began on `8e4e60f6`. The final candidate was rebased onto fetched
-main `b63e96c0`; storage and Raft directories were unchanged between those
-bases. Linux storage, runtime, and three-server checks were rerun after the
-rebase. The microbenchmark tables continue to describe their original builds.
+Physical accounting includes every node-log inode, metadata, and active/spare
+allocation across all three replicas after all servers have detached. It excludes
+SQL primary files, collection journals, and gateway files. The measured saving
+is therefore a node-log retention result, not a whole-database compression ratio.
 
-The first useful architectural saving is to reclaim superseded shared-node
-Raft history. The existing production checkpoint worker advanced application
-checkpoints, but did not call either `CheckpointDescriptorCatalog` or
-`ReclaimDeadNodeLogPrefix`. Descriptor entries could therefore pin the oldest
-shared segment indefinitely, and the physical dead-prefix reclamation protocol
-had no production caller.
+Foreground timings include client command encoding, hashing, transport, durable
+RF3 acknowledgement, and full-value reads. They exclude setup, document
+construction, oracle canonicalization, and recovery. Every operation sample,
+including stalls, is retained. Each trial verifies acknowledged values after a
+full-cluster restart and after crashing/restarting each member, outside its timed
+interval. Candidate trials additionally require an old segment to disappear and
+an application checkpoint to advance on every replica.
 
-The change connects those existing operations to the checkpoint coordinator's
-serial background worker. An unchanged descriptor catalog needs no new file,
-directory scan, or durability wave. Busy maintenance is retried on a subsequent
-capture. Existing live-entry fences, sealed-summary fences, count/byte
-thresholds, reserve allocation, and checkpoint frequency stay the same.
+Reported ratios are geometric means of complete candidate/base trial pairs;
+95% bootstrap intervals resample paired trials, not individual operations. Nine
+pairs characterize this workload and runner, and cannot prove identical latency
+for every workload or storage device.
 
-## Measured space
+## Why these bytes were retained
 
-The current compact primary representation already stores the deterministic
-100,000-row competitive corpora as follows. These are complete primary-file
-sizes from `TestUnifiedSpaceCompetitiveCorpus`, excluding paired journals,
-Raft logs, and other database files. The logical documents average 248.8 bytes.
+Application checkpoints already logically truncate group history. Descriptor
+catalog entries still pinned the oldest shared segment because the production
+worker never published their checkpoint or requested physical reclamation. The
+worker now checkpoints newly registered descriptors and asks the serial sealer
+to reclaim a fully dead prefix before its normal application capture. Unchanged
+descriptor catalogs avoid an extra file, directory scan, and durability wave.
 
-| Corpus | Primary file bytes | Bytes/row | Compact payload bytes/row | Leaf extent bytes/row |
-| --- | ---: | ---: | ---: | ---: |
-| Repetitive | 1,019,904 | 10.199 | 8.956 | 9.052 |
-| High cardinality | 6,930,432 | 69.304 | 68.017 | 68.157 |
+A second blocker remained after checkpoint publication: `sealPending` includes
+an already published seal whose completion notice will be consumed by the next
+rotation. Reclamation runs on that same serial worker and now checks the
+authenticated `HasPending` publication state. It leaves the completion notice
+for the existing rotator or `WaitSeal` consumer. The new regression reclaims
+before `WaitSeal` and verifies both the retained entry and the completion.
 
-The three-replica reclamation regression uses two groups per node, eight
-128-KiB history records per primary group, 1-MiB segments, and the actual
-authenticated shared log. It deliberately leaves an entry in the second group
-live while checkpointing the first group. Reclamation must retain the entire
-shared prefix until the second group's checkpoint is durable and sealed.
+The existing live-group and sealed-summary fences still decide which segments
+may be removed. A slow group pins its shared segments; dead holes behind a live
+segment are not rewritten. Count/byte thresholds and crash-safe publication
+remain intact. Reclamation can lag a checkpoint until another scheduled capture
+and a qualifying sealed prefix. Idle nodes receive no forced rotation.
+Each request retires at most 32 segments (up to 1 GiB with default segment
+capacity). A larger backlog drains across captures; this change does not claim
+a fixed retention bound under arbitrary write rates or slow groups.
 
-On Linux/ARM64, including active and spare segment allocations:
+## Architectural space budget
 
-| Accounting | Before reclaim | After reclaim | Saved |
-| --- | ---: | ---: | ---: |
-| Apparent bytes across three node directories | 3,232,374 | 64,752 | 3,167,622 (98.00%) |
-| Allocated bytes across three node directories | 17,547,264 | 14,303,232 | 3,244,032 (18.49%) |
+The [initial investigation](initial-investigation.md) includes the full primary
+file breakdown, short microbenchmarks, and the original small storage fixture.
+Those earlier microbenchmarks do not exercise background reclamation and are not
+the final RF3 performance evidence.
 
-This measures history reclamation in a small constructed fixture. It is not a
-whole-database compression ratio, a default-geometry capacity estimate, or a
-three-node network benchmark. The test also writes and reads another entry
-after reclamation, reopens all three nodes, and checks both group checkpoints
-and the new entry.
+| Component | Existing allocation or representation | Decision |
+| --- | --- | --- |
+| Shared-node Raft history | Superseded entries retained behind descriptor and completed-seal blockers | Reclaim the authenticated dead prefix on each replica |
+| Active segment and two spares | 96 MiB per physical node, 288 MiB across RF3 | Preserve rotation headroom |
+| Ordinary compact collection journal | 2.5 MiB per collection, including 512-KiB carry allowance | Separate from the replicated SQL profile |
+| Replicated SQL sidecars | About 16 MiB per user relation and system collection, plus a 1-MiB transaction window per apply group, on every replica | Investigate eliminating redo already durable in Raft |
+| Compact primary, repetitive corpus | 10.199 bytes/row over 100,000 rows | Preserve current encoding |
+| Compact primary, high-cardinality corpus | 69.304 bytes/row over 100,000 rows | Preserve current encoding |
+| Obsolete group checkpoint certificates | Small certificates, not full streamed snapshots | Separate authenticated cleanup work remains |
 
-## Architectural priorities
+The primary corpora average 248.8 logical document bytes. Leaf slack is already
+only about 0.08/0.07 bytes per row. Additional high-cardinality compression would
+change decoding and mutation work, so this change targets retained history.
 
-1. **Reclaim certified dead shared-log history.** Implemented here. Saving is
-   proportional to the dead history, and applies independently on every RF3
-   replica. A slow group continues to pin shared segments. Sparse dead holes
-   after a live segment remain retained; this change does not rewrite them.
-2. **Keep reserve capacity distinct from live bytes.** Default node geometry
-   reserves 32 MiB for the active segment and 64 MiB for two spares: 96 MiB per
-   physical node, or 288 MiB over three nodes. This is per physical node, not
-   per Raft group. Reducing it would change rotation headroom and the largest
-   admissible wave, so it is not a free space saving under a write-latency
-   constraint.
-3. **Account for collection journals and hidden collections.** The compact
-   buffered delta journal reserves 2.5 MiB per collection, including a 512-KiB
-   carry allowance. Shrinking that allowance or sharing journals requires
-   separate checkpoint-cadence, recovery, and contention qualification. The
-   primary-file numbers above do not include this replicated overhead.
-4. **Reclaim obsolete group checkpoint certificates.** Group checkpoints use
-   new filenames and currently retain old certificates. These are compact
-   certificates, not local copies of full streamed database snapshots. Their
-   lifecycle needs its own authenticated cleanup and recovery tests; no
-   speculative deletion is added here.
-5. **Further primary compression needs a read-cost case.** Current leaf slack
-   is only about 0.08/0.07 bytes per row. High-cardinality alphabet streams
-   account for about 62.11 bytes per row. More compression there would change
-   decoding and update work, so it requires measured point, scan, projection,
-   insert, and replacement results before adoption.
+The replicated SQL journal geometry is defined in
+[replicated_sidecars.go](../../../sql/driver/replicated_sidecars.go): each user
+relation reserves 16,794,624 record bytes plus two 512-byte header sectors; the
+system journal reserves at least 16,777,216 record bytes plus headers. The
+ordinary 2.5-MiB journal figure in the initial investigation must not be used as
+the production replicated SQL budget. Latest main `f05df25e` selects portable
+sealed capacity: those exact logical sizes are not a universal physical backing
+guarantee on every filesystem. A deeper review is examining whether
+Raft can supply redo without duplicating full values in those sidecars.
 
-## Performance and correctness boundary
+## Correctness and evidence
 
-No document encoding, read algorithm, mutation encoding, foreground append
-method, or durability acknowledgement boundary changes. Maintenance runs
-before a scheduled application capture; physical reclamation can lag a
-checkpoint until a later capture and a qualifying sealed prefix. An idle
-node does not receive a new forced checkpoint or forced segment rotation.
+- Complete Linux `raftstore`, `seglog`, and `raftmember` suites pass:
+  [final maintenance run](linux-final-maintenance.txt).
+- Targeted Darwin race checks pass, including concurrent maintenance,
+  descriptor publication, and reclamation:
+  [final race run](race-final-maintenance.txt).
+- Blocking-I/O regressions prove that active appends and current reads complete
+  while descriptor and reclamation checkpoint I/O is paused.
+- The three-replica storage regression checks that a live second group pins the
+  shared prefix, then verifies continued writes, reads, and reopen recovery.
+- The real checkpoint worker integration verifies descriptor checkpoint
+  publication through the production coordinator.
+- The [final process validation](final-process-validation/go-test.jsonl) passes
+  with initial-segment removals `[3, 3, 3]` and checkpoint indexes
+  `[3752, 4052, 4063]`, including all restart/crash checks.
 
-Two blocking-I/O regressions pause descriptor checkpoint work and dead-prefix
-checkpoint work while proving that current reads and durable active appends
-still complete. These establish that maintenance does not hold the foreground
-mutex across that I/O. Device bandwidth contention and rotation backpressure
-remain possible and require sustained workload measurements.
-
-The retained evidence distinguishes apparent bytes, allocated blocks, unit
-recovery checks, race checks, and microbenchmarks. No sustained fused RF3 SQL
-p99 or network throughput claim follows from the storage regression.
-
-Six samples per arm on an Apple M4 Max, Go 1.27 with SIMD, alternate
-before/after and after/before order. The base is the clean `8e4e60f6` worktree;
-the benchmarked runtime-source hashes and all four binary hashes are in
-[environment.json](environment.json). Each benchmark uses one Go CPU and a
-200-ms target. Other work can run on this shared host.
-
-| Microbenchmark | Base median | Candidate median | Two-sided p |
-| --- | ---: | ---: | ---: |
-| Raw point read | 743.8 ns | 847.0 ns | 0.589 |
-| Primary replacement | 4.601 us | 4.786 us | 0.093 |
-| Low-cardinality full scan | 19.62 ms | 19.55 ms | 0.589 |
-| High-cardinality full scan | 28.42 ms | 28.46 ms | 0.937 |
-| Synchronous insert, one writer | 8.400 ms | 7.557 ms | 0.093 |
-| Synchronous insert, eight writers | 4.026 ms | 3.908 ms | 0.818 |
-| Synchronous insert, 64 writers | 950.4 us | 910.9 us | 0.937 |
-| Node durability wave, one group | 8.066 ms | 8.800 ms | 0.394 |
-| Node durability wave, eight groups | 8.220 ms | 9.150 ms | 0.485 |
-
-**Performance is not qualified as equivalent.** No elapsed-time difference is
-statistically significant in these short samples, but several medians are
-slower and dispersion is large. Replacement p50 remains 1.625 us in both arms;
-the candidate's mean-time samples include a large outlier. Raw point reads,
-scans, replacements, and node durability waves report zero allocations per
-operation at the benchmarks' reporting precision. These microbenchmarks do
-not activate the new background maintenance path, so they cannot establish
-the absence of device contention during sustained RF3 reclamation.
-
-Final review changed the maintenance error branches to use the atomic
-published-failure/close fence and preserve an independent engine failure when
-metadata is unavailable. This path is outside the measured microbenchmarks.
-Both the benchmarked and final source hashes are recorded, and a dedicated
-failure regression plus final race/Linux reruns cover the final code.
-
-Raw results and complete benchstat comparisons are retained in
-[read-benchmarks](read-benchmarks/comparison.txt) and
-[write-benchmarks](write-benchmarks/comparison.txt). The first write attempt
-overlapped the Linux test run and was stopped; its partial results remain in
-[interrupted-benchmarks](interrupted-benchmarks/commands.json) and are excluded
-from every table. The write selection included all writer counts and omitted
-root-level read benchmarks; the separate complete read campaign supplies the
-read/replacement rows above.
-
-Validation passed:
-
-- The complete Linux `internal/raftstore`, `internal/raftstore/seglog`, and
-  `internal/raftmember` suites on a dedicated Docker volume.
-- Darwin race tests for node maintenance, descriptor checkpoints, and all
-  `TestReclaim*` cases, including the new concurrent-I/O regression.
-- The real node checkpoint worker integration, which verifies that a normal
-  application capture publishes the descriptor checkpoint too.
-- Shared-log preparation, three-server RF3 restart, and recovery across the
-  segment entry-capacity boundary in `cmd/vibedb-shard`. The short server run
-  does not itself reach the default ten-minute checkpoint interval.
-
-An earlier Linux run used the container's overlay filesystem and skipped the
-strict-allocation worker integration. That output is retained as
-[linux-overlay-skipped.txt](linux-overlay-skipped.txt); the dedicated-volume
-rerun in [linux-volume-focused.txt](linux-volume-focused.txt) passes it.
+[Validation notes](validation-notes.md) retain exploratory failures, CI retries,
+and the earlier scheduling experiment. That extra scheduling change was removed
+before the final comparison. [sha256.json](sha256.json) inventories the evidence.
 
 ## Source map
 
-- [Node log maintenance](../../../internal/raftstore/node_catalog.go)
-- [Production checkpoint worker](../../../internal/raftmember/node_checkpoint.go)
-- [Three-replica storage regression](../../../internal/raftstore/node_maintenance_test.go)
-- [Reclamation and crash tests](../../../internal/raftstore/seglog/reclaim_test.go)
-- [Production worker integration](../../../internal/raftmember/runtime_node_persistence_test.go)
+- [Node maintenance](../../../internal/raftstore/node_catalog.go)
+- [Background checkpoint worker](../../../internal/raftmember/node_checkpoint.go)
+- [Reclamation admission](../../../internal/raftstore/seglog/reclaim.go)
+- [Multi-group storage regression](../../../internal/raftstore/node_maintenance_test.go)
+- [Reclamation, concurrency, and crash tests](../../../internal/raftstore/seglog/reclaim_test.go)
+- [RF3 process qualification](../../../cmd/vibedb-shard/node_space_process_qualification_test.go)
+- [Paired comparison runner](../../../scripts/bench/run-node-space-comparison.py)

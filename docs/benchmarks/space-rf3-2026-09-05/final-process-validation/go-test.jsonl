@@ -1,0 +1,9 @@
+{"Time":"2026-09-05T18:02:05.215441217Z","Action":"start","Package":"github.com/thesyncim/vibedb/cmd/vibedb-shard"}
+{"Time":"2026-09-05T18:02:05.224604447Z","Action":"run","Package":"github.com/thesyncim/vibedb/cmd/vibedb-shard","Test":"TestServeRF3NodeSpaceQualification"}
+{"Time":"2026-09-05T18:02:05.224664128Z","Action":"output","Package":"github.com/thesyncim/vibedb/cmd/vibedb-shard","Test":"TestServeRF3NodeSpaceQualification","Output":"=== RUN   TestServeRF3NodeSpaceQualification\n","OutputType":"frame"}
+{"Time":"2026-09-05T18:02:42.072867139Z","Action":"output","Package":"github.com/thesyncim/vibedb/cmd/vibedb-shard","Test":"TestServeRF3NodeSpaceQualification","Output":"    node_space_process_qualification_test.go:291: writes=4096 elapsed=32.909533446s allocated=306819072-\u003e580239360 initial segments removed=[3 3 3] checkpoints=[3752 4052 4063]\n"}
+{"Time":"2026-09-05T18:02:42.15561617Z","Action":"output","Package":"github.com/thesyncim/vibedb/cmd/vibedb-shard","Test":"TestServeRF3NodeSpaceQualification","Output":"--- PASS: TestServeRF3NodeSpaceQualification (36.93s)\n","OutputType":"frame"}
+{"Time":"2026-09-05T18:02:42.1556536Z","Action":"pass","Package":"github.com/thesyncim/vibedb/cmd/vibedb-shard","Test":"TestServeRF3NodeSpaceQualification","Elapsed":36.93}
+{"Time":"2026-09-05T18:02:42.155678797Z","Action":"output","Package":"github.com/thesyncim/vibedb/cmd/vibedb-shard","Output":"PASS\n","OutputType":"frame"}
+{"Time":"2026-09-05T18:02:42.157772834Z","Action":"output","Package":"github.com/thesyncim/vibedb/cmd/vibedb-shard","Output":"ok  \tgithub.com/thesyncim/vibedb/cmd/vibedb-shard\t36.942s\n"}
+{"Time":"2026-09-05T18:02:42.157788764Z","Action":"pass","Package":"github.com/thesyncim/vibedb/cmd/vibedb-shard","Elapsed":36.942}
