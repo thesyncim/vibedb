@@ -107,6 +107,10 @@ active BOOLEAN NOT NULL
 		}
 	}
 	check(connection)
+	wildcard := ddlWireQuery(t, connection, `SELECT d.*,COALESCE(d.score,0) AS chosen FROM (SELECT id,score FROM employees) d WHERE d.id='employee-0001' ORDER BY chosen DESC`, true)
+	if wildcard.code != "" || len(wildcard.rows) != 1 || len(wildcard.rows[0]) != 3 || wildcard.rows[0][0] != `"employee-0001"` || wildcard.rows[0][1] != "1" || wildcard.rows[0][2] != "1" {
+		t.Fatalf("scalar relation wildcard: %+v", wildcard)
+	}
 	for _, tc := range []struct{ sql, value string }{
 		{`SELECT COALESCE(SUM(score),0) FROM employees`, "49500"},
 		{`SELECT AVG(score) FROM employees`, "49.5"},
