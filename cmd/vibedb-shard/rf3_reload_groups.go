@@ -23,6 +23,9 @@ func validateRF3GroupAppend(current, next rf3Manifest) error {
 	if len(old) == 0 || len(all) < len(old) || len(all) > maxRF3ManifestGroups || current.DevelopmentOnly || next.DevelopmentOnly {
 		return errInvalidRF3Manifest
 	}
+	if current.ReadAuthority != nil && len(all) > len(old) {
+		return fmt.Errorf("%w: read-authority groups require a restart before append", errInvalidRF3Manifest)
+	}
 	if err := validateRF3GroupRosterUnion(all); err != nil {
 		return err
 	}
@@ -60,6 +63,9 @@ func validateRF3GroupTransition(current, next rf3Manifest) error {
 	if len(old) == 0 || len(all) == 0 || len(all) > maxRF3ManifestGroups ||
 		current.DevelopmentOnly || next.DevelopmentOnly {
 		return errInvalidRF3Manifest
+	}
+	if current.ReadAuthority != nil && len(all) > len(old) {
+		return fmt.Errorf("%w: read-authority groups require a restart before append", errInvalidRF3Manifest)
 	}
 	if err := validateRF3GroupRosterUnion(all); err != nil {
 		return err

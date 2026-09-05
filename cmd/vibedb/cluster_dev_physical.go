@@ -198,6 +198,7 @@ func initializeDevPhysicalCluster(options devClusterOptions, manifestPath string
 	cluster := devClusterManifest{
 		Format: devClusterFormat, Nodes: devClusterRF3, Replicas: devClusterRF3,
 		PhysicalNodes: uint8(physical), NodeLog: true,
+		ReadAuthority:  newDevReadAuthority(options.readAuthority),
 		ClientEndpoint: frontend[0], CatalogPath: filepath.Join(options.root, "catalog.vibejson"),
 		GatewayCertificate: credentials[physical][0], GatewayKey: credentials[physical][1],
 		Roots: roots, AuthorizationPolicy: policyPath, HotShardCapacity: filepath.Join(options.root, "hot-shard-capacity.vibejson"),
@@ -290,6 +291,10 @@ func initializeDevPhysicalCluster(options devClusterOptions, manifestPath string
 			members := make([]devPrepareMember, 3)
 			for memberIndex, member := range roleMembers[roleIndex] {
 				members[memberIndex] = devPrepareMember{MemberID: member.Member, NodeID: member.Node, PeerAddress: member.Peer}
+				if options.readAuthority {
+					members[memberIndex].StoreID = member.Store
+					members[memberIndex].NativeAddress = member.Native
+				}
 			}
 			// Split authorization is node-wide. Every group on one physical
 			// node must carry the same grant set so prepare-node-rf3 can prove
@@ -312,7 +317,7 @@ func initializeDevPhysicalCluster(options devClusterOptions, manifestPath string
 				WAL:   devPrepareWAL{KeyID: "dev-cluster-key", KeyMaterialPath: keySource, WrappedKey: "local-development-only", MaxFileBytes: raftstore.DefaultMaxFileBytes, MaxRecordBytes: raftstore.DefaultMaxRecordBytes, MaxRecords: raftstore.DefaultMaxRecords, MaxEntries: raftstore.DefaultMaxEntries, MaxLiveBytes: raftstore.DefaultMaxLiveBytes},
 				Apply: apply, Listeners: devPrepareListeners{Peer: ports[1+nodeIndex*6], Native: ports[1+nodeIndex*6+1], Snapshot: ports[1+nodeIndex*6+2], Control: ports[1+nodeIndex*6+3]},
 				TLS: devPrepareTLS{Certificate: credentials[nodeIndex][0], Key: credentials[nodeIndex][1], Roots: roots, IdentityOID: devClusterOID}, AuthorizationPolicy: policyPath,
-				SplitControl: devPrepareSplitControlProfile(sharedMembers, devIDString(gatewayNodes[0][:])), Members: members,
+				SplitControl: devPrepareSplitControlProfile(sharedMembers, devIDString(gatewayNodes[0][:])), ReadAuthority: newDevReadAuthority(options.readAuthority), Members: members,
 			}
 			_ = prep // The input is emitted below after all role groups are collected.
 			// Keep the group preparation in a sidecar inventory. The node input
@@ -401,6 +406,9 @@ func completeDevPhysicalCluster(options devClusterOptions, manifest devClusterMa
 	}
 	for _, node := range manifest.NodeManifests {
 		if _, err := os.Stat(node.ServeManifest); err == nil {
+			if err := validateDevReadAuthorityFile(node.ServeManifest, manifest.ReadAuthority); err != nil {
+				return err
+			}
 			continue
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return err
@@ -414,6 +422,15 @@ func completeDevPhysicalCluster(options devClusterOptions, manifest devClusterMa
 		var input devPrepareNodeManifest
 		if err := vibejson.Unmarshal(raw, &input); err != nil {
 			return errors.Join(errDevCluster, err)
+		}
+		if len(input.Groups) == 0 {
+			return fmt.Errorf("%w: physical node has no prepared groups", errDevCluster)
+		}
+		for _, group := range input.Groups {
+			if !devReadAuthorityEqual(group.ReadAuthority, manifest.ReadAuthority) ||
+				group.ReadAuthority != nil && !validDevReadAuthority(*group.ReadAuthority) {
+				return fmt.Errorf("%w: physical node read authority differs from cluster policy", errDevCluster)
+			}
 		}
 		if err := prepareDevPhysicalNode(options.shardBinary, input); err != nil {
 			return err

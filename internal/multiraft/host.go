@@ -290,6 +290,14 @@ type authorityRoundRuntime interface {
 	StartReadAuthorityRound() error
 }
 
+type authorityEnsureRuntime interface {
+	EnsureReadAuthorityRound() error
+}
+
+type authorityRoundMetricsRuntime interface {
+	ReadAuthorityRoundMetrics() raftmember.ReadAuthorityRoundMetrics
+}
+
 func raftauthorityGroup(group raftmember.GroupKey) raftauthority.GroupIdentity {
 	return raftauthority.GroupIdentity{
 		ClusterID: group.ClusterID, ClusterIncarnation: group.ClusterIncarnation,
@@ -1005,6 +1013,60 @@ func (host *Host) StartReadAuthorityRound(key raftmember.GroupKey) error {
 	}
 	host.wake(group)
 	return nil
+}
+
+// EnsureReadAuthorityRound offers the owner a due-threshold renewal or
+// acquisition opportunity. The Runtime decides whether a current token is
+// still outside its bounded renewal lead window, so repeated reads do not
+// create quorum traffic on every call.
+func (host *Host) EnsureReadAuthorityRound(key raftmember.GroupKey) error {
+	group, err := host.lookup(key)
+	if err != nil {
+		return err
+	}
+	runtime, ok := group.runtime.(authorityEnsureRuntime)
+	if !ok {
+		return raftauthority.ErrPolicyDisabled
+	}
+	if err := runtime.EnsureReadAuthorityRound(); err != nil {
+		return err
+	}
+	host.wake(group)
+	return nil
+}
+
+// ReadAuthorityRoundMetrics returns the detached actual protocol counters for
+// one group. Diagnostics may call the aggregate Host form below concurrently;
+// no Runtime state is mutated.
+func (host *Host) ReadAuthorityRoundMetricsFor(key raftmember.GroupKey) (raftmember.ReadAuthorityRoundMetrics, error) {
+	group, err := host.lookup(key)
+	if err != nil {
+		return raftmember.ReadAuthorityRoundMetrics{}, err
+	}
+	runtime, ok := group.runtime.(authorityRoundMetricsRuntime)
+	if !ok {
+		return raftmember.ReadAuthorityRoundMetrics{}, raftauthority.ErrPolicyDisabled
+	}
+	return runtime.ReadAuthorityRoundMetrics(), nil
+}
+
+// ReadAuthorityRoundMetrics returns the detached counters for every group on
+// this Host. The caller must already hold the lane owner when invoking the
+// method; ExecutionLanes provides that serialization for production callers.
+func (host *Host) ReadAuthorityRoundMetrics() raftmember.ReadAuthorityRoundMetrics {
+	if host == nil {
+		return raftmember.ReadAuthorityRoundMetrics{}
+	}
+	var total raftmember.ReadAuthorityRoundMetrics
+	for _, group := range host.groups {
+		if runtime, ok := group.runtime.(authorityRoundMetricsRuntime); ok {
+			metrics := runtime.ReadAuthorityRoundMetrics()
+			total.RoundsStarted += metrics.RoundsStarted
+			total.RequestsCreated += metrics.RequestsCreated
+			total.GrantsAccepted += metrics.GrantsAccepted
+		}
+	}
+	return total
 }
 
 // ReadAuthorityToken returns the current holder capability from the exact

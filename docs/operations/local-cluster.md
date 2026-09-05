@@ -73,6 +73,54 @@ To choose every SQL endpoint explicitly, replace `--pg-listen` with:
 The list must contain one distinct literal-loopback endpoint per physical
 node. The two listener flags are mutually exclusive.
 
+### Optional read-authority qualification
+
+To exercise the explicit quorum read-authority protocol on the same RF3
+topology, add `--read-authority` on the first start and every restart:
+
+```sh
+./bin/vibedb cluster dev \
+  --replicas 3 \
+  --physical-nodes 3 \
+  --read-authority \
+  --root /tmp/vibedb-read-authority \
+  --pg-listen 127.0.0.1:7432
+```
+
+This switch is disabled by default and requires Linux `CLOCK_BOOTTIME`. The
+deployment assumption is that every participant's elapsed clock rate stays
+within ±10% of real elapsed time, including across VM or container suspension
+and resume. `CLOCK_BOOTTIME` availability and one successful `Now` call at
+startup cannot prove that rate assumption or future suspend behavior; qualify
+the host and virtualization environment separately. Every RF3 voter receives
+the same persisted v1 contract: a 5 s elapsed-clock maximum grant, 100000 ppm
+clock-rate bound, 1 ms rounding margin, and the complete voter set. The
+drift-adjusted usable grant is about 4.09 s of elapsed-clock time. A promise
+can delay a follower's election edge by the configured 5 s elapsed-clock grant
+window; this is not a hard wall-clock upper bound under the ±10% deployment
+assumption (a slow clock can make 5 s about 5.56 s of real time). A restarted
+voter enters about 6.11 s of configured elapsed-clock quarantine, including
+the margin, before it may vote.
+
+Incarnation observations come from bounded, authenticated native probes run by
+the serving process outside the SQL owner. A missing or expired observation,
+membership transition, or other failed authority check falls back to the
+existing quorum-backed ReadIndex path. An explicit enable on an unsupported
+platform is refused before any policy marker is written; leaving the switch
+off keeps the ordinary ReadIndex path. The current fast path is limited to
+eligible SQL point and batch data reads; this option does not change follower,
+recovery, backup, topology, or control reads.
+
+The policy and restart marker are part of the strict manifests and each local
+member root. Reusing a root with the flag omitted or changing the policy is
+refused. New binaries also refuse an old manifest when an enabled marker is
+present. A deployment must keep all voters on the feature-aware binary and
+must not restore a pre-enrollment manifest with an old binary while the marker
+is live; an old binary cannot interpret a marker it does not know. Use a fresh
+root for a different qualification contract until an explicit drain procedure
+is available. Online group additions are refused while the authority is
+enabled; prepare any additional table groups before the initial start.
+
 ## 3. Write and read a row
 
 From another terminal:
@@ -151,4 +199,6 @@ establish resilience to host loss or multi-machine scaling.
 | Node preparation | [cluster_dev_node.go](../../cmd/vibedb/cluster_dev_node.go) |
 | Online table placement | [cluster_dev_physical_tables.go](../../cmd/vibedb/cluster_dev_physical_tables.go) |
 | Frontend composition | [serve_node.go](../../cmd/vibedb-shard/serve_node.go) |
+| Read-authority policy, marker, and incarnation cache | [rf3_read_authority.go](../../cmd/vibedb-shard/rf3_read_authority.go) |
+| Qualified elapsed clock and quorum protocol | [authority.go](../../internal/raftauthority/authority.go), [clock_linux.go](../../internal/raftauthority/clock_linux.go) |
 | Online DDL and restart | [pgwire_ddl_process_test.go](../../internal/gatewayruntime/pgwire_ddl_process_test.go) |

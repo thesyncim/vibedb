@@ -258,6 +258,10 @@ func prepareDevPhysicalTable(root, binary string, cluster devClusterManifest, ta
 		if err := vibejson.Unmarshal(raw, &prepare); err != nil || prepare.Root != base.GroupRoot || prepare.StoreID != base.Store || prepare.MemberID != base.Member {
 			return nil, raftmember.GroupKey{}, errors.Join(errDevCluster, err)
 		}
+		if !devReadAuthorityEqual(prepare.ReadAuthority, cluster.ReadAuthority) ||
+			prepare.ReadAuthority != nil && !validDevReadAuthority(*prepare.ReadAuthority) {
+			return nil, raftmember.GroupKey{}, fmt.Errorf("%w: retained group read authority differs from cluster policy", errDevCluster)
+		}
 		prepare.Root, prepare.MemberID, prepare.StoreID = member.GroupRoot, member.Member, member.Store
 		prepare.Table, prepare.CreateTable = table.Table, table.CreateTable
 		prepare.Distribution, prepare.Shard = table.Distribution, "all"
@@ -266,8 +270,13 @@ func prepareDevPhysicalTable(root, binary string, cluster devClusterManifest, ta
 		// home identity or key profile into an ordinary user table.
 		prepare.Apply = devPrepareApplyProfile(table.PrimaryKey, replication.Digest{})
 		prepare.Members = make([]devPrepareMember, len(members))
+		prepare.ReadAuthority = cloneDevReadAuthority(cluster.ReadAuthority)
 		for peerIndex, peer := range members {
 			prepare.Members[peerIndex] = devPrepareMember{MemberID: peer.Member, NodeID: peer.Node, PeerAddress: peer.Peer}
+			if cluster.ReadAuthority != nil {
+				prepare.Members[peerIndex].StoreID = peer.Store
+				prepare.Members[peerIndex].NativeAddress = peer.Native
+			}
 		}
 		raw, err = vibejson.Marshal(&prepare)
 		if err != nil {
@@ -513,7 +522,12 @@ func reconcileDevPhysicalNodeGroup(member devClusterMember, appendMissing bool) 
 	if err != nil {
 		return err
 	}
-	raw, err := orderedDevManifestObject(source, []string{"node_log", "listeners", "tls", "authorization_policy", "replica_control", "split_control", "gateway", "groups"})
+	order := []string{"node_log", "listeners", "tls", "authorization_policy", "replica_control", "split_control"}
+	if len(source["read_authority"]) != 0 {
+		order = append(order, "read_authority")
+	}
+	order = append(order, "gateway", "groups")
+	raw, err := orderedDevManifestObject(source, order)
 	if err != nil {
 		return err
 	}
