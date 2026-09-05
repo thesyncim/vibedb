@@ -1730,17 +1730,19 @@ func (r *statementScalar) executeOrdered(
 	if err := cancellationCheckpoint(options.Cancel, len(ordered.rows)); err != nil {
 		return Cursor{}, err
 	}
-	sortScratchBytes := saturatedProduct(
-		int64(len(ordered.rows)), int64(unsafe.Sizeof(statementScalarOrderRow{})),
-	)
-	if err := frame.intermediate.reserve("scalar ORDER BY sort workspace", sortScratchBytes); err != nil {
-		return Cursor{}, err
-	}
-	if err := ordered.sort(options.Cancel); err != nil {
+	if len(ordered.order) != 0 {
+		sortScratchBytes := saturatedProduct(
+			int64(len(ordered.rows)), int64(unsafe.Sizeof(statementScalarOrderRow{})),
+		)
+		if err := frame.intermediate.reserve("scalar ORDER BY sort workspace", sortScratchBytes); err != nil {
+			return Cursor{}, err
+		}
+		if err := ordered.sort(options.Cancel); err != nil {
+			frame.intermediate.release(sortScratchBytes)
+			return Cursor{}, err
+		}
 		frame.intermediate.release(sortScratchBytes)
-		return Cursor{}, err
 	}
-	frame.intermediate.release(sortScratchBytes)
 	if err := cancellationCheckpoint(options.Cancel, len(ordered.rows)+1); err != nil {
 		return Cursor{}, err
 	}
