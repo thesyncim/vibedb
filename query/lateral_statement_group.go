@@ -550,8 +550,10 @@ func (l *statementLateral) havingScalar(
 
 func (g *lateralGroupProgram) cellScalar(cell Cell) scalar {
 	// Reuse the established HAVING conversion so exact computed decimals and
-	// container/null distinctions flow through the same comparator.
-	program := havingProgram{scratch: g.scratch}
+	// container/null distinctions flow through the same comparator. Each leaf
+	// consumes its value before evaluating another leaf; retaining earlier
+	// spellings would grow this buffer on every row and every execution.
+	program := havingProgram{scratch: g.scratch[:0]}
 	value := program.cellScalar(cell)
 	g.scratch = program.scratch
 	return value
