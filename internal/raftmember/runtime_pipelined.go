@@ -180,6 +180,48 @@ func (q *pipelinedAppendRing) front() (pipelinedAppendWork, bool) {
 	return q.items[head%uint64(len(q.items))], true
 }
 
+// copyPrefix copies the bounded contiguous prefix currently available in the
+// ring without retiring any slot. Node-wide persistence must first accept the
+// complete series; only then may popN release the copied entries. The caller
+// owns dst and must pass a capacity no larger than MaxPersistGroupBatches.
+func (q *pipelinedAppendRing) copyPrefix(
+	dst *[raftstore.MaxPersistGroupBatches]pipelinedAppendWork,
+) int {
+	if q == nil || dst == nil {
+		return 0
+	}
+	head := q.head.value.Load()
+	available := q.tail.value.Load() - head
+	if available == 0 {
+		return 0
+	}
+	if available > uint64(len(dst)) {
+		available = uint64(len(dst))
+	}
+	for index := uint64(0); index < available; index++ {
+		dst[index] = q.items[(head+index)%uint64(len(q.items))]
+	}
+	return int(available)
+}
+
+// popN retires exactly count entries after the corresponding copied series
+// has been accepted by the node submission lane. It deliberately performs no
+// copy or allocation and clears each released slot before publishing head.
+func (q *pipelinedAppendRing) popN(count int) bool {
+	if q == nil || count <= 0 || count > len(q.items) {
+		return false
+	}
+	head := q.head.value.Load()
+	if uint64(count) > q.tail.value.Load()-head {
+		return false
+	}
+	for index := 0; index < count; index++ {
+		q.items[(head+uint64(index))%uint64(len(q.items))] = pipelinedAppendWork{}
+	}
+	q.head.value.Store(head + uint64(count))
+	return true
+}
+
 func (q *pipelinedAppendRing) pop() (pipelinedAppendWork, bool) {
 	head := q.head.value.Load()
 	work, ok := q.front()
@@ -271,7 +313,8 @@ type pipelinedRuntime struct {
 	durableTerm        uint64
 	durableVote        uint64
 	nodeSubmission     bool
-	nodeWork           pipelinedAppendWork
+	nodeWorks          [raftstore.MaxPersistGroupBatches]pipelinedAppendWork
+	nodeWorkCount      uint8
 }
 
 func newPipelinedRuntime(runtime *Runtime) (*pipelinedRuntime, error) {
@@ -381,7 +424,6 @@ func (p *pipelinedRuntime) stopAppendWorker() {
 		if p.nodeSubmission {
 			_, _ = p.runtime.nodePersistence.Wait()
 			p.nodeSubmission = false
-			p.nodeWork = pipelinedAppendWork{}
 		}
 		return
 	}
@@ -497,14 +539,26 @@ func (p *pipelinedRuntime) enqueueAppend(message *pb.Message) error {
 	return p.submitNextNodeAppend()
 }
 
-func (p *pipelinedRuntime) submitNodeWork(work pipelinedAppendWork) error {
+func (p *pipelinedRuntime) submitNodeSeries(
+	works *[raftstore.MaxPersistGroupBatches]pipelinedAppendWork,
+	count int,
+) error {
 	if p.nodeSubmission || p.runtime.nodePersistence == nil {
 		return nil
 	}
-	if _, err := p.runtime.nodePersistence.Submit(work.batch); err != nil {
+	if works == nil || count <= 0 || count > len(works) {
+		return p.runtime.fail(errors.New("raftmember: invalid node append series"))
+	}
+	var batches [raftstore.MaxPersistGroupBatches]raftmodel.PersistBatch
+	for index := 0; index < count; index++ {
+		batches[index] = works[index].batch
+	}
+	if _, err := p.runtime.nodePersistence.SubmitSeries(batches[:count]); err != nil {
 		return err
 	}
-	p.nodeWork = work
+	copy(p.nodeWorks[:count], works[:count])
+	clear(p.nodeWorks[count:])
+	p.nodeWorkCount = uint8(count)
 	p.nodeSubmission = true
 	return nil
 }
@@ -513,28 +567,48 @@ func (p *pipelinedRuntime) submitNextNodeAppend() error {
 	if p.runtime.nodePersistence == nil || p.nodeSubmission || p.appendRetry {
 		return nil
 	}
-	work, ok := p.appendWork.front()
-	if !ok {
+	var works [raftstore.MaxPersistGroupBatches]pipelinedAppendWork
+	count := p.appendWork.copyPrefix(&works)
+	if count == 0 {
 		return nil
 	}
-	if err := p.submitNodeWork(work); err != nil {
-		if errors.Is(err, raftstore.ErrSubmissionBackpressure) {
-			return nil
+	firstReadyID := works[0].batch.ReadyID
+	for index := 1; index < count; index++ {
+		if firstReadyID > math.MaxUint64-uint64(index) ||
+			works[index].batch.ReadyID != firstReadyID+uint64(index) {
+			return p.runtime.fail(errors.New("raftmember: unordered node append series"))
 		}
-		return p.runtime.fail(err)
 	}
-	if _, ok = p.appendWork.pop(); !ok {
-		return p.runtime.fail(errors.New("raftmember: node append queue lost submitted work"))
+	for candidate := count; candidate > 0; candidate-- {
+		if err := p.submitNodeSeries(&works, candidate); err != nil {
+			if errors.Is(err, raftstore.ErrSubmissionBackpressure) {
+				return nil
+			}
+			// A bounded multi-Ready envelope can be unsupported even when a
+			// proper prefix is independently valid (for example, a snapshot or
+			// a conservative aggregate admission bound). Shrink only deterministic
+			// series-shape failures; the singleton result remains authoritative.
+			if candidate > 1 && (errors.Is(err, raftstore.ErrInvalid) ||
+				errors.Is(err, raftstore.ErrBounds) ||
+				errors.Is(err, raftstore.ErrUnsupportedSnapshot)) {
+				continue
+			}
+			return p.runtime.fail(err)
+		}
+		if !p.appendWork.popN(candidate) {
+			return p.runtime.fail(errors.New("raftmember: node append queue lost submitted series"))
+		}
+		return nil
 	}
-	return nil
+	return p.runtime.fail(errors.New("raftmember: node append series has no admissible prefix"))
 }
 
 func (p *pipelinedRuntime) requestAppendRetry() error {
 	if p.runtime.nodePersistence != nil {
-		if p.nodeSubmission || p.nodeWork.message == nil {
+		if p.nodeSubmission || p.nodeWorkCount == 0 || p.nodeWorks[0].message == nil {
 			return p.runtime.fail(errors.New("raftmember: invalid node append retry state"))
 		}
-		if err := p.submitNodeWork(p.nodeWork); err != nil {
+		if err := p.submitNodeSeries(&p.nodeWorks, int(p.nodeWorkCount)); err != nil {
 			return err
 		}
 		p.appendRetry = false
@@ -556,7 +630,11 @@ func (p *pipelinedRuntime) consumeAppendResult() (DriveResult, bool, error) {
 		if !done {
 			return DriveResult{}, false, nil
 		}
-		result.works[0], result.count, result.err = p.nodeWork, 1, err
+		if p.nodeWorkCount == 0 || int(p.nodeWorkCount) > len(result.works) {
+			return DriveResult{}, true, p.runtime.fail(errors.New("raftmember: invalid node append completion"))
+		}
+		copy(result.works[:p.nodeWorkCount], p.nodeWorks[:p.nodeWorkCount])
+		result.count, result.err = p.nodeWorkCount, err
 		p.nodeSubmission = false
 	} else {
 		var ok bool
@@ -570,6 +648,9 @@ func (p *pipelinedRuntime) consumeAppendResult() (DriveResult, bool, error) {
 		return DriveResult{}, true, p.runtime.fail(errors.New("raftmember: invalid pipelined append completion"))
 	}
 	firstReadyID := result.works[0].batch.ReadyID
+	if p.appendProcessedID == math.MaxUint64 || firstReadyID != p.appendProcessedID+1 {
+		return DriveResult{}, true, p.runtime.fail(errors.New("raftmember: pipelined append completion skipped Ready"))
+	}
 	lastReadyID := result.works[result.count-1].batch.ReadyID
 	for index := 0; index < int(result.count); index++ {
 		if result.works[index].batch.ReadyID != firstReadyID+uint64(index) {
@@ -607,7 +688,8 @@ func (p *pipelinedRuntime) consumeAppendResult() (DriveResult, bool, error) {
 	p.appendProcessedID = lastReadyID
 	p.appendRetryReadyID = 0
 	if p.runtime.nodePersistence != nil {
-		p.nodeWork = pipelinedAppendWork{}
+		clear(p.nodeWorks[:p.nodeWorkCount])
+		p.nodeWorkCount = 0
 		if err := p.submitNextNodeAppend(); err != nil {
 			return DriveResult{}, true, err
 		}
@@ -707,7 +789,6 @@ func (runtime *Runtime) drivePipelinedReady(
 	if result, progressed, err := p.driveResponses(send); progressed || err != nil {
 		return result, err
 	}
-
 	if p.applyCurrent.message != nil || p.applyQueue.len() != 0 {
 		if p.applyCurrent.message == nil {
 			next, _ := p.applyQueue.front()
@@ -843,6 +924,7 @@ driveDirect:
 func (p *pipelinedRuntime) quiescent() bool {
 	return p == nil || (p.appendOutstanding == 0 && p.appendWork.len() == 0 &&
 		p.appendDone.len() == 0 && p.appendCompleted.len() == 0 &&
+		!p.nodeSubmission && p.nodeWorkCount == 0 &&
 		p.applyQueue.len() == 0 && p.directQueue.len() == 0 &&
 		p.applyCurrent.message == nil && !p.appendRetry)
 }

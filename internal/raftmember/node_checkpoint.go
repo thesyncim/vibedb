@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
@@ -38,8 +39,9 @@ type NodeCheckpointCoordinator struct {
 }
 
 type nodeCheckpointTask struct {
-	apply  *sqldriver.ReplicatedApply
-	result chan nodeCheckpointBuildResult
+	apply    *sqldriver.ReplicatedApply
+	result   chan nodeCheckpointBuildResult
+	queuedAt time.Time
 }
 
 type nodeCheckpointBuildResult struct {
@@ -71,7 +73,13 @@ func NewNodeCheckpointCoordinator(sequencer *raftstore.NodeSubmissionSequencer, 
 func (c *NodeCheckpointCoordinator) run() {
 	defer close(c.done)
 	for task := range c.queue {
+		dequeuedAt := time.Now()
+		if !task.queuedAt.IsZero() {
+			c.sequencer.ObserveCheckpointQueueWait(dequeuedAt.Sub(task.queuedAt))
+		}
+		serviceStarted := time.Now()
 		result := c.capture(task.apply)
+		c.sequencer.ObserveCheckpointService(time.Since(serviceStarted))
 		task.result <- result
 	}
 }
@@ -102,10 +110,13 @@ func (c *NodeCheckpointCoordinator) submit(task *nodeCheckpointTask) error {
 	if c.closing {
 		return ErrNodeCheckpointCoordinator
 	}
+	task.queuedAt = time.Now()
 	select {
 	case c.queue <- task:
+		c.sequencer.ObserveCheckpointQueueSubmission()
 		return nil
 	default:
+		c.sequencer.ObserveCheckpointQueueRejected()
 		return raftstore.ErrSubmissionBackpressure
 	}
 }

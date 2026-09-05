@@ -21,6 +21,7 @@ type ReplicatedServerTLS struct {
 	allow             map[rafttransport.NodeID]struct{}
 	generation        uint64
 	active            map[net.Conn]uint64
+	localActive       map[*replicatedLocalCall]struct{}
 	authenticated     atomic.Uint64
 	authRejected      atomic.Uint64
 	handshakeRejected atomic.Uint64
@@ -37,7 +38,7 @@ func NewReplicatedServerTLS(profile *rafttransport.PeerTLS, allowed []rafttransp
 	if profile == nil || profile.LocalIdentity().Node == (rafttransport.NodeID{}) || err != nil {
 		return nil, ErrReplicatedAuthentication
 	}
-	return &ReplicatedServerTLS{tls: profile, allow: allow, generation: 1, active: make(map[net.Conn]uint64)}, nil
+	return &ReplicatedServerTLS{tls: profile, allow: allow, generation: 1, active: make(map[net.Conn]uint64), localActive: make(map[*replicatedLocalCall]struct{})}, nil
 }
 
 func replicatedGatewayAllowlist(nodes []rafttransport.NodeID) (map[rafttransport.NodeID]struct{}, error) {
@@ -61,6 +62,17 @@ func (capability *ReplicatedServerTLS) snapshot() (*rafttransport.PeerTLS, uint6
 	capability.mu.Lock()
 	defer capability.mu.Unlock()
 	return capability.tls, capability.generation
+}
+
+// LocalIdentity returns the certificate-bound identity of the storage service
+// profile. It is used only when composing an embedded gateway so the local
+// destination NodeID remains distinct from the gateway principal.
+func (capability *ReplicatedServerTLS) LocalIdentity() rafttransport.PeerIdentity {
+	if capability == nil {
+		return rafttransport.PeerIdentity{}
+	}
+	profile, _ := capability.snapshot()
+	return profile.LocalIdentity()
 }
 
 func (capability *ReplicatedServerTLS) admit(connection rafttransport.PeerConnection, generation uint64) bool {
@@ -88,6 +100,9 @@ func (capability *ReplicatedServerTLS) release(connection net.Conn) {
 
 func (capability *ReplicatedServerTLS) closeActive() {
 	capability.mu.Lock()
+	for call := range capability.localActive {
+		call.cancel()
+	}
 	for connection := range capability.active {
 		_ = connection.Close()
 		delete(capability.active, connection)
@@ -110,6 +125,9 @@ func (capability *ReplicatedServerTLS) Rotate(profile *rafttransport.PeerTLS, al
 	}
 	capability.tls, capability.allow = profile, allow
 	capability.generation++
+	for call := range capability.localActive {
+		call.cancel()
+	}
 	for connection := range capability.active {
 		_ = connection.Close()
 		delete(capability.active, connection)
@@ -131,6 +149,11 @@ func (capability *ReplicatedServerTLS) Stats() ReplicatedServerTLSStats {
 // ServeAuthenticated is the production RF3 listener. Raw connection and TLS
 // handshake slots are both immediate hard bounds; excess sockets are closed.
 func (server *ReplicatedServer) ServeAuthenticated(ctx context.Context, listener net.Listener, capability *ReplicatedServerTLS, handshakeDeadline rafttransport.DeadlineFunc, maxConnections, maxHandshakes int) error {
+	if server != nil {
+		if local := server.local.Load(); local != nil && local.storage != capability {
+			return ErrReplicatedAuthentication
+		}
+	}
 	if server == nil || server.owner == nil || server.authorization == nil || ctx == nil || listener == nil || capability == nil || handshakeDeadline == nil ||
 		maxConnections <= 0 || maxConnections > AbsoluteMaxReplicatedConnections || maxHandshakes <= 0 || maxHandshakes > maxConnections ||
 		!server.state.CompareAndSwap(replicatedServerReady, replicatedServerRunning) {
@@ -142,7 +165,15 @@ func (server *ReplicatedServer) ServeAuthenticated(ctx context.Context, listener
 	connectionSlots := make(chan struct{}, maxConnections)
 	handshakeSlots := make(chan struct{}, maxHandshakes)
 	var workers sync.WaitGroup
-	defer func() { _ = listener.Close(); capability.closeActive(); workers.Wait() }()
+	defer func() {
+		server.state.Store(replicatedServerClosed)
+		if local := server.local.Load(); local != nil {
+			local.cancel()
+		}
+		_ = listener.Close()
+		capability.closeActive()
+		workers.Wait()
+	}()
 	for {
 		raw, err := listener.Accept()
 		if err != nil {

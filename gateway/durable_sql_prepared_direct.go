@@ -23,8 +23,10 @@ type DurableSQLDirectPlan struct {
 	Target            ReplicatedTransactionTarget
 }
 
-// PrepareDirect performs validation and linearizable preimage reads only. It
-// cannot propose a mutation or admit a request in the ledger.
+// PrepareDirect performs validation and a bounded point preimage read. An
+// eligible UPDATE may use the committed leader read because the retained
+// mutation carries an exact full-row digest guard checked atomically at apply;
+// every other shape uses the original linearizable lowering.
 func (executor *DurableSQLRequestExecutor) PrepareDirect(ctx context.Context, key requestledger.RequestKey, tenant []byte, queries []Query) (plan *DurableSQLDirectPlan, err error) {
 	defer func() {
 		if err != nil {
@@ -50,12 +52,36 @@ func (executor *DurableSQLRequestExecutor) PrepareDirect(ctx context.Context, ke
 	}
 	opctx, cancel := context.WithTimeout(ctx, profile.GlobalDeadline)
 	defer cancel()
-	lease := executor.planner.catalog.pinCurrent()
-	defer lease.release()
-	if lease.snapshot == nil || lease.generation == 0 {
-		return nil, ErrNoCatalog
+	var lease catalogLease
+	var targets []ReplicatedTransactionTarget
+	var handled bool
+	refreshedMiss := false
+	for {
+		lease = executor.planner.catalog.pinCurrent()
+		if lease.snapshot == nil || lease.generation == 0 {
+			lease.release()
+			return nil, ErrNoCatalog
+		}
+		targets, handled, err = executor.planner.planReplicatedSQLTransactionWithDataMode(
+			opctx, lease.snapshot, queries, profile, executor.data,
+			replicatedSQLCommittedLeaderPreimage,
+		)
+		if errors.Is(err, errPreparedDirectFallback) {
+			targets, handled, err = executor.planner.planReplicatedSQLTransactionWithData(
+				opctx, lease.snapshot, queries, profile, executor.data,
+			)
+		}
+		if !errors.Is(err, ErrTableNotPlaced) || refreshedMiss {
+			break
+		}
+		refreshedMiss = true
+		staleGeneration := lease.generation
+		lease.release()
+		if refreshErr := executor.planner.refreshAfterCatalogMiss(opctx, staleGeneration); refreshErr != nil {
+			return nil, preserveCatalogMiss(err, refreshErr)
+		}
 	}
-	targets, handled, err := executor.planner.planReplicatedSQLTransactionWithData(opctx, lease.snapshot, queries, profile, executor.data)
+	defer lease.release()
 	if err != nil {
 		return nil, err
 	}
@@ -74,15 +100,20 @@ func preparedDirectEligible(queries []Query, targets []ReplicatedTransactionTarg
 	// one preimage guard therefore covers the complete row read set. Do not
 	// extend this to scans, multi-key reads or a missing preimage: omitted keys
 	// need absence guards, and PutPresent is not an absence guard.
-	if len(queries) != 1 || len(targets) != 1 || len(targets[0].Batches) != 1 || len(targets[0].Batches[0].Mutations) != 1 {
-		return false
-	}
-	kind := targets[0].Batches[0].Mutations[0].Kind
-	if kind != replication.MutationPutDigestEqual {
+	if len(queries) != 1 || !preparedDirectFullRowGuard(targets) {
 		return false
 	}
 	statement, err := sqlast.ParseStatement(queries[0].SQL)
 	return err == nil && statement.Kind == sqlast.KindUpdate
+}
+
+func preparedDirectFullRowGuard(targets []ReplicatedTransactionTarget) bool {
+	if len(targets) != 1 || len(targets[0].Batches) != 1 || len(targets[0].Batches[0].Mutations) != 1 {
+		return false
+	}
+	mutation := targets[0].Batches[0].Mutations[0]
+	return mutation.Kind == replication.MutationPutDigestEqual && mutation.ExpectedValueLength != 0 &&
+		mutation.ExpectedValueDigest != (replication.Digest{})
 }
 
 // ExecutePreparedDirect replays the durable recipe without replanning SQL or

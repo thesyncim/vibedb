@@ -203,6 +203,16 @@ type ReplicatedPointResult struct {
 	Retries int
 }
 
+// replicatedReadEndpointMode keeps the public applied-bounded read contract
+// separate from the one private write-preparation lane that deliberately
+// targets the authenticated leader without requesting a ReadIndex fence.
+type replicatedReadEndpointMode uint8
+
+const (
+	replicatedReadEndpointDefault replicatedReadEndpointMode = iota
+	replicatedReadEndpointCommittedLeader
+)
+
 type ReplicatedRequestLedgerRead struct {
 	Key                   requestledger.RequestKey
 	ExpectedRangeIdentity requestledger.Digest
@@ -658,11 +668,40 @@ func (executor *ReplicatedExecutor) ReadTopologyPoint(
 	return executor.readPoint(ctx, route, read, serviceauthz.CapabilityTopology)
 }
 
+// readCommittedPoint is private to SQL write preparation. It uses the same
+// response validation and applied floor as ReadPoint, but selects the cached
+// authenticated leader and emits the existing follower-read operation. The
+// caller supplies an apply-time full-row digest guard before admitting the
+// resulting mutation.
+func (executor *ReplicatedExecutor) readCommittedPoint(
+	ctx context.Context,
+	route ReplicatedRoute,
+	read ReplicatedPointRead,
+	capability serviceauthz.Capability,
+) (ReplicatedPointResult, error) {
+	read.Linearizable = false
+	return executor.readPointWithEndpointMode(
+		ctx, route, read, capability, replicatedReadEndpointCommittedLeader,
+	)
+}
+
 func (executor *ReplicatedExecutor) readPoint(
 	ctx context.Context,
 	route ReplicatedRoute,
 	read ReplicatedPointRead,
 	capability serviceauthz.Capability,
+) (ReplicatedPointResult, error) {
+	return executor.readPointWithEndpointMode(
+		ctx, route, read, capability, replicatedReadEndpointDefault,
+	)
+}
+
+func (executor *ReplicatedExecutor) readPointWithEndpointMode(
+	ctx context.Context,
+	route ReplicatedRoute,
+	read ReplicatedPointRead,
+	capability serviceauthz.Capability,
+	endpointMode replicatedReadEndpointMode,
 ) (ReplicatedPointResult, error) {
 	if executor == nil || executor.client == nil || ctx == nil || !validReplicatedRoute(route) ||
 		read.Relation == 0 || read.Relation > replication.MaxRelationID ||
@@ -674,7 +713,14 @@ func (executor *ReplicatedExecutor) readPoint(
 	preferred := route.Replicas[0].Member
 	var joined error
 	for attempt := 0; attempt < executor.maxAttempts; attempt++ {
-		endpoint, state, err := executor.readEndpoint(ctx, route, preferred, read, capability)
+		var endpoint ReplicatedEndpoint
+		var state shardservice.ReplicatedMemberState
+		var err error
+		if endpointMode == replicatedReadEndpointCommittedLeader {
+			endpoint, state, err = executor.discoverLeader(ctx, route, preferred, capability)
+		} else {
+			endpoint, state, err = executor.readEndpoint(ctx, route, preferred, read, capability)
+		}
 		if err != nil {
 			joined = errors.Join(joined, err)
 			preferred = 0

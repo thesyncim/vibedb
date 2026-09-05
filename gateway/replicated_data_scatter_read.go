@@ -100,7 +100,17 @@ func (reader *ReplicatedDataReader) ReadScatterBatch(
 		return ReplicatedTableScatterReadResult{}, err
 	}
 	result, generation, err := reader.readScatterBatchPinned(ctx, request)
-	if err == nil || !errors.Is(err, raftservice.ErrServingFence) {
+	if err == nil {
+		return result, nil
+	}
+	if errors.Is(err, errReplicatedTableCatalogMiss) {
+		if refreshErr := reader.refreshAfterFence(ctx, generation); refreshErr != nil {
+			return ReplicatedTableScatterReadResult{}, preserveCatalogMiss(err, refreshErr)
+		}
+		result, _, err = reader.readScatterBatchPinned(ctx, request)
+		return result, err
+	}
+	if !errors.Is(err, raftservice.ErrServingFence) {
 		return result, err
 	}
 	if refreshErr := reader.refreshAfterFence(ctx, generation); refreshErr != nil {
@@ -146,7 +156,13 @@ func (reader *ReplicatedDataReader) readScatterBatchSnapshot(
 			point.Table, point.Key, scalarScratch[:0], replicas[:0],
 		)
 		if !ok {
-			return ReplicatedTableScatterReadResult{}, generation, ErrReplicatedTableRoute
+			routeErr := replicatedTableRouteError(snapshot, point.Table, point.Key)
+			if errors.Is(routeErr, errReplicatedTableCatalogMiss) &&
+				!replicatedTableBatchCatalogMissEligible(snapshot, request.Points, false) {
+				routeErr = ErrReplicatedTableRoute
+			}
+			return ReplicatedTableScatterReadResult{}, generation,
+				routeErr
 		}
 		groupIndex, exists := groupByRoute[resolved.RouteID]
 		if !exists {

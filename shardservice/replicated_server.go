@@ -57,6 +57,7 @@ type ReplicatedServer struct {
 	audit          serviceauthz.AuditSink
 	serving        func(raftservice.ServingState) bool
 	transition     func(raftservice.ServingState, *ReplicatedRequest) bool
+	local          atomic.Pointer[replicatedLocalBinding]
 
 	accepted      atomic.Uint64
 	rejected      atomic.Uint64
@@ -73,6 +74,7 @@ type ReplicatedServer struct {
 	proposalInvalidDeterministicCode    atomic.Uint32
 	proposalInvalidDeterministicApplied atomic.Uint64
 	proposalInvalidDeterministicState   atomic.Uint64
+	semanticDispatch                    atomic.Uint64
 }
 
 // BindAuthorization installs the sole production authorization gate before
@@ -86,6 +88,64 @@ func (server *ReplicatedServer) BindAuthorization(
 		return ErrReplicatedWire
 	}
 	server.authorization, server.audit = gate, audit
+	return nil
+}
+
+// BindLocalGatewayPeerTLS binds a validated gateway credential to the local
+// storage service. Storage and gateway identities are intentionally distinct:
+// storageTLS supplies the exact physical NodeID used for local endpoint
+// selection, while gatewayProfile supplies the authenticated delegate
+// principal checked by every semantic call. Both profiles must have been
+// constructed by rafttransport.NewPeerTLS and must share the same trust
+// domain. The binding must be installed before the server starts and after its
+// authorization gate has been installed. Rebinding the same two identities is
+// permitted during rotation and cancels calls admitted under the old binding.
+func (server *ReplicatedServer) BindLocalGatewayPeerTLS(
+	storageTLS *ReplicatedServerTLS,
+	gatewayProfile *rafttransport.PeerTLS,
+) error {
+	if server == nil || storageTLS == nil || gatewayProfile == nil ||
+		server.authorization == nil || server.state.Load() == replicatedServerClosed {
+		return ErrReplicatedWire
+	}
+	storageProfile, storageGeneration := storageTLS.snapshot()
+	storage := storageProfile.LocalIdentity()
+	principal := gatewayProfile.LocalIdentity()
+	if !validReplicatedPeerIdentity(storage) || !validReplicatedPeerIdentity(principal) ||
+		storage.Node == principal.Node || storage.TrustDomain != principal.TrustDomain {
+		return ErrReplicatedAuthentication
+	}
+	gatewayProof, err := storageProfile.AuthorizePeerProfile(gatewayProfile)
+	if err != nil {
+		return err
+	}
+	storageProof, err := gatewayProfile.AuthorizePeerProfile(storageProfile)
+	if err != nil {
+		return err
+	}
+	old := server.local.Load()
+	if old == nil && server.state.Load() != replicatedServerReady {
+		return ErrReplicatedWire
+	}
+	if old != nil && (old.storage != storageTLS || old.principal != principal || old.node != storage.Node) {
+		return ErrReplicatedAuthentication
+	}
+	bindingCtx, cancel := context.WithCancel(context.Background())
+	binding := &replicatedLocalBinding{
+		principal: principal, node: storage.Node, storage: storageTLS, generation: storageGeneration,
+		gatewayProof: gatewayProof, storageProof: storageProof, ctx: bindingCtx, cancel: cancel,
+	}
+	storageTLS.mu.Lock()
+	defer storageTLS.mu.Unlock()
+	_, allowed := storageTLS.allow[principal.Node]
+	if !allowed || storageTLS.generation != storageGeneration ||
+		server.state.Load() == replicatedServerClosed || !server.local.CompareAndSwap(old, binding) {
+		cancel()
+		return ErrReplicatedAuthentication
+	}
+	if old != nil {
+		old.cancel()
+	}
 	return nil
 }
 
@@ -195,6 +255,7 @@ type ReplicatedServerStats struct {
 	ProposalInvalidDeterministicCode    raftserve.OutcomeCode
 	ProposalInvalidDeterministicApplied uint64
 	ProposalInvalidDeterministicState   uint64
+	SemanticDispatch                    uint64
 }
 
 // ReplicatedDeterministicInvalidReason identifies the exact canonical-response
@@ -357,6 +418,7 @@ func (server *ReplicatedServer) Stats() ReplicatedServerStats {
 			server.proposalInvalidDeterministicCode.Load()),
 		ProposalInvalidDeterministicApplied: server.proposalInvalidDeterministicApplied.Load(),
 		ProposalInvalidDeterministicState:   server.proposalInvalidDeterministicState.Load(),
+		SemanticDispatch:                    server.semanticDispatch.Load(),
 	}
 }
 
@@ -470,6 +532,15 @@ func (server *ReplicatedServer) executeReplicatedAuthenticated(
 	request *ReplicatedRequest,
 	authenticated bool,
 ) *ReplicatedResponse {
+	return server.executeReplicatedAuthenticatedCall(ctx, request, authenticated, nil)
+}
+
+func (server *ReplicatedServer) executeReplicatedAuthenticatedCall(
+	ctx context.Context,
+	request *ReplicatedRequest,
+	authenticated bool,
+	sql *ShardRequest,
+) *ReplicatedResponse {
 	authorizedOwner, fusedProposal := server.owner.(replicatedAuthorizedOwner)
 	fusedProposal = fusedProposal && request.Operation == ReplicatedPropose
 	fusedRead := replicatedReadOperation(request.Operation)
@@ -552,7 +623,10 @@ func (server *ReplicatedServer) executeReplicatedAuthenticated(
 		}
 	}
 	if request.Operation == ReplicatedQueryLeader {
-		return server.executeReplicatedQuery(ctx, request, state)
+		return server.executeReplicatedQueryCall(ctx, request, state, sql, func(candidate raftservice.ServingState) bool {
+			return server.serving == nil || server.serving(candidate) ||
+				(authenticated && server.transition != nil && server.transition(candidate, request))
+		})
 	}
 	if request.Operation == ReplicatedReadBatchLeader {
 		batchOwner, ok := server.owner.(interface {

@@ -266,6 +266,68 @@ func (peerTLS *PeerTLS) LocalIdentity() PeerIdentity {
 	return peerTLS.identity
 }
 
+// ValidatePeerProfile proves that candidate is a credential this profile
+// would accept on a mutually authenticated service connection. It validates
+// the candidate's complete detached certificate chain against this profile's
+// roots in both TLS directions, checks the exact private identity extension
+// and trust domain, and checks the same build compatibility exchanged by the
+// service handshake. No certificate or private-key material is returned.
+//
+// Callers that retain this result across credential rotation must bind it to
+// their own generation and fail closed when either profile is replaced.
+func (peerTLS *PeerTLS) ValidatePeerProfile(candidate *PeerTLS) error {
+	_, err := peerTLS.AuthorizePeerProfile(candidate)
+	return err
+}
+
+// PeerProfileAuthorization retains the validity interval of verified chains.
+// Only AuthorizePeerProfile can create one. It is scoped to its two immutable
+// profiles; credential rotation must acquire a new authorization.
+type PeerProfileAuthorization struct {
+	now                 func() time.Time
+	notBefore, notAfter time.Time
+}
+
+// Valid checks both expiry and a clock moving before the verified interval.
+func (authorization *PeerProfileAuthorization) Valid() bool {
+	if authorization == nil || authorization.now == nil {
+		return false
+	}
+	now := authorization.now()
+	return !now.IsZero() && !now.Before(authorization.notBefore) && !now.After(authorization.notAfter)
+}
+
+// AuthorizePeerProfile verifies a detached peer credential and retains the
+// complete chain validity interval for repeated in-process service calls.
+// Callers must separately verify the reciprocal trust direction.
+func (peerTLS *PeerTLS) AuthorizePeerProfile(candidate *PeerTLS) (*PeerProfileAuthorization, error) {
+	if peerTLS == nil || candidate == nil {
+		return nil, ErrPeerAuthentication
+	}
+	if !buildgate.Compatible(peerTLS.build, candidate.build) {
+		return nil, ErrPeerBuild
+	}
+	if peerTLS.identity.TrustDomain != candidate.identity.TrustDomain {
+		return nil, ErrWrongTrustDomain
+	}
+	chain, err := parseCertificateChain(candidate.certificate.Certificate)
+	if err != nil {
+		return nil, errors.Join(ErrPeerAuthentication, err)
+	}
+	authorization := &PeerProfileAuthorization{now: peerTLS.now}
+	identity, err := peerTLS.verifyCertificateChainValidity(chain, x509.ExtKeyUsageClientAuth, authorization)
+	if err != nil {
+		return nil, err
+	}
+	if identity != candidate.identity {
+		return nil, ErrPeerAuthentication
+	}
+	if _, err := peerTLS.verifyCertificateChainValidity(chain, x509.ExtKeyUsageServerAuth, authorization); err != nil {
+		return nil, err
+	}
+	return authorization, nil
+}
+
 // NewPeerTLS validates and detaches the local current-format TLS profile.
 func NewPeerTLS(options PeerTLSOptions) (*PeerTLS, error) {
 	if !validPeerIdentityOID(options.IdentityOID) || !validPeerIdentity(options.Identity) ||
@@ -417,6 +479,14 @@ func (peerTLS *PeerTLS) verifyCertificateChain(
 	chain []*x509.Certificate,
 	usage x509.ExtKeyUsage,
 ) (PeerIdentity, error) {
+	return peerTLS.verifyCertificateChainValidity(chain, usage, nil)
+}
+
+func (peerTLS *PeerTLS) verifyCertificateChainValidity(
+	chain []*x509.Certificate,
+	usage x509.ExtKeyUsage,
+	validity *PeerProfileAuthorization,
+) (PeerIdentity, error) {
 	if peerTLS == nil || peerTLS.roots == nil || len(chain) == 0 ||
 		len(chain) > AbsoluteMaxPeerCertificateChain {
 		return PeerIdentity{}, ErrPeerAuthentication
@@ -449,8 +519,21 @@ func (peerTLS *PeerTLS) verifyCertificateChain(
 		return PeerIdentity{}, fmt.Errorf("%w: zero certificate time", ErrPeerAuthentication)
 	}
 	verifyOptions.CurrentTime = now
-	if _, err := handledPeerIdentityLeaf(chain[0], peerTLS.identityOID).Verify(verifyOptions); err != nil {
+	verified, err := handledPeerIdentityLeaf(chain[0], peerTLS.identityOID).Verify(verifyOptions)
+	if err != nil {
 		return PeerIdentity{}, errors.Join(ErrPeerAuthentication, err)
+	}
+	if validity != nil {
+		// A complete accepted chain includes its trust anchor. Expiry of any
+		// certificate, including a root omitted by the peer, ends this proof.
+		for _, certificate := range verified[0] {
+			if certificate.NotBefore.After(validity.notBefore) {
+				validity.notBefore = certificate.NotBefore
+			}
+			if validity.notAfter.IsZero() || certificate.NotAfter.Before(validity.notAfter) {
+				validity.notAfter = certificate.NotAfter
+			}
+		}
 	}
 	if identity.TrustDomain != peerTLS.identity.TrustDomain {
 		return PeerIdentity{}, ErrWrongTrustDomain

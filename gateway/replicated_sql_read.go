@@ -39,6 +39,7 @@ type ReplicatedSQLBatchReadRequest struct {
 // corresponding query. The returned observation vector contains one honest
 // ReadIndex cut per exact group; it is deliberately not a global MVCC snapshot.
 // Any lower, route, intent, admission, or shard failure returns a zero result.
+// A proven absent table gets one bounded catalog refresh before lowering again.
 func (reader *ReplicatedDataReader) ReadSQLBatch(
 	ctx context.Context,
 	request ReplicatedSQLBatchReadRequest,
@@ -47,7 +48,17 @@ func (reader *ReplicatedDataReader) ReadSQLBatch(
 		return ReplicatedTableScatterReadResult{}, err
 	}
 	result, generation, err := reader.readSQLBatchPinned(ctx, request)
-	if err == nil || !errors.Is(err, raftservice.ErrServingFence) {
+	if err == nil {
+		return result, nil
+	}
+	if errors.Is(err, ErrTableNotPlaced) {
+		if refreshErr := reader.refreshAfterFence(ctx, generation); refreshErr != nil {
+			return ReplicatedTableScatterReadResult{}, preserveCatalogMiss(err, refreshErr)
+		}
+		result, _, err = reader.readSQLBatchPinned(ctx, request)
+		return result, err
+	}
+	if !errors.Is(err, raftservice.ErrServingFence) {
 		return result, err
 	}
 	if refreshErr := reader.refreshAfterFence(ctx, generation); refreshErr != nil {

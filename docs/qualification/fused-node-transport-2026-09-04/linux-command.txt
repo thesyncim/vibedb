@@ -1,0 +1,29 @@
+Transport review Linux evidence (source checkpoint 45ec6010)
+
+Final selected race gate, image golang:1.27-bookworm, linux/arm64:
+docker run --rm --pull=never --name vibedb-fused-transport-sol-review \
+  --mount type=bind,src=/private/tmp/vibedb-fused-rf3-node,dst=/workspace,readonly \
+  --mount type=bind,src=/Users/thesyncim/go/pkg/mod,dst=/gomodcache,readonly \
+  --mount type=volume,src=vibedb-fused-transport-sol-20260904-review,dst=/fixture-tmp \
+  --workdir /workspace \
+  -e GOMODCACHE=/gomodcache -e GOCACHE=/fixture-tmp/go-build \
+  -e TMPDIR=/fixture-tmp -e GOTOOLCHAIN=local \
+  -e VIBEDB_RF3_QUORUM_QUALIFICATION=1 \
+  golang:1.27-bookworm \
+  go test -race ./shardservice ./gateway ./internal/rafttransport ./internal/raftservice \
+  -run '^(TestRF3SemanticLocalTLSQueriesAndRevocation|TestRF3SQLReadUsesAcceptedFenceWithoutPostProbe|TestReplicatedSQLNestedLengthsRejectBeforeAllocation|TestSemantic.*|TestReplicatedNodeClient.*|TestReplicatedSemanticClients.*|TestPeerProfileAuthorization.*)$' \
+  -count=1
+
+Final command output: /private/tmp/fused-transport-sol-linux-bounded-final.log
+Verbose earlier real-owner race output: /private/tmp/fused-transport-sol-linux-final.log
+Verbose output explicitly names PASS (not SKIP) for both RF3 tests, shows real
+three-voter elections and a leader stepping down when quorum is inactive.
+The verbose real-owner gate used the same image, mounts and environment, with
+go test -race ./internal/raftservice -run
+'^(TestRF3SemanticLocalTLSQueriesAndRevocation|TestRF3SQLReadUsesAcceptedFenceWithoutPostProbe)$'
+-count=1 -v.
+
+The dedicated Docker volume was created fresh for this transport review; each
+test created fresh t.TempDir store paths inside /fixture-tmp. Retained store files
+were on the Linux Docker-volume filesystem, never a macOS bind mount. Source and
+the module cache were read-only bind mounts. There were no timed benchmarks.

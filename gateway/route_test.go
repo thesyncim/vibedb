@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"bytes"
 	"errors"
 	"strings"
 	"testing"
@@ -175,6 +176,71 @@ func TestRouteCarriesShardCoordinates(t *testing.T) {
 		if c.address != w.addr {
 			t.Fatalf("call %d address = %q, want %q", i, c.address, w.addr)
 		}
+	}
+}
+
+func TestRoutePopulatesReplicatedPrimaryKeyCandidate(t *testing.T) {
+	config, endpoints, descriptor, profile := testReplicatedTableInput(t)
+	snapshot, err := NewSnapshotWithReplicatedTableMetadata(
+		config, endpoints, 5, nil, nil, []ReplicatedShardDescriptor{descriptor},
+		[]ReplicatedTableProfile{profile},
+	)
+	if err != nil {
+		t.Fatalf("NewSnapshotWithReplicatedTableMetadata: %v", err)
+	}
+	executor := newRouteExecutor(t, snapshot)
+	sql := `SELECT id, n FROM messages WHERE id = 'a' AND n > 0`
+	pl, err := routeSQL(t, executor, snapshot, sql, ClassInteractive)
+	if err != nil {
+		t.Fatalf("route: %v", err)
+	}
+	if len(pl.calls) != 1 {
+		t.Fatalf("calls = %d, want 1", len(pl.calls))
+	}
+	request := pl.calls[0].req
+	if request.SQL != sql {
+		t.Fatalf("SQL = %q, want original SQL %q", request.SQL, sql)
+	}
+	if request.PrimaryKeyRead.Relation != profile.Relation ||
+		request.PrimaryKeyRead.MaxDocumentBytes != profile.MaxDocumentBytes ||
+		string(request.PrimaryKeyRead.PrimaryPath) != profile.PrimaryKey {
+		t.Fatalf("PrimaryKeyRead metadata = %+v, want relation=%d max_document_bytes=%d path=%q",
+			request.PrimaryKeyRead, profile.Relation, profile.MaxDocumentBytes, profile.PrimaryKey)
+	}
+	wantKey, ok := appendReplicatedSQLScalarKey(nil, distribution.NewString("a"))
+	if !ok || len(request.PrimaryKeyRead.Keys) != 1 ||
+		!bytes.Equal(request.PrimaryKeyRead.Keys[0], wantKey) {
+		t.Fatalf("PrimaryKeyRead keys = %x, want %x", request.PrimaryKeyRead.Keys, wantKey)
+	}
+}
+
+func TestRouteLeavesReplicatedPrimaryKeyCandidateAbsentWhenNotExact(t *testing.T) {
+	config, endpoints, descriptor, profile := testReplicatedTableInput(t)
+	snapshot, err := NewSnapshotWithReplicatedTableMetadata(
+		config, endpoints, 5, nil, nil, []ReplicatedShardDescriptor{descriptor},
+		[]ReplicatedTableProfile{profile},
+	)
+	if err != nil {
+		t.Fatalf("NewSnapshotWithReplicatedTableMetadata: %v", err)
+	}
+	executor := newRouteExecutor(t, snapshot)
+	for _, sql := range []string{
+		`SELECT id FROM messages WHERE id IN ('a', 'b')`,
+		`SELECT id FROM messages WHERE id > 'a'`,
+	} {
+		t.Run(sql, func(t *testing.T) {
+			pl, err := routeSQL(t, executor, snapshot, sql, ClassBatch)
+			if err != nil {
+				t.Fatalf("route: %v", err)
+			}
+			if len(pl.calls) != 1 {
+				t.Fatalf("calls = %d, want 1", len(pl.calls))
+			}
+			if len(pl.calls[0].req.PrimaryKeyRead.PrimaryPath) != 0 ||
+				len(pl.calls[0].req.PrimaryKeyRead.Keys) != 0 {
+				t.Fatalf("PrimaryKeyRead = %+v, want absent", pl.calls[0].req.PrimaryKeyRead)
+			}
+		})
 	}
 }
 

@@ -1,0 +1,51 @@
+{
+  "schema": "vibedb.fused-catalog-qualification/1",
+  "source_revision": "6402842cb2a2942c0097f6df251c49ef49bc7acc",
+  "source_frozen": true,
+  "go_experiment": "simd",
+  "runtime": "Linux/ARM64",
+  "runtime_image": "golang:1.27-bookworm",
+  "runtime_image_id": "sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b",
+  "exit_code": 0,
+  "fresh_test_roots": true,
+  "reached_crash_injection": true,
+  "container_removed": true,
+  "log_bytes": 4862,
+  "pass_events": [
+    {
+      "Time": "2026-09-04T17:55:10.233472012Z",
+      "Action": "pass",
+      "Package": "github.com/thesyncim/vibedb/internal/gatewayruntime",
+      "Test": "TestFusedRF3NodeProcessQualification/default-physical3",
+      "Elapsed": 33.46
+    },
+    {
+      "Time": "2026-09-04T17:55:42.215074347Z",
+      "Action": "pass",
+      "Package": "github.com/thesyncim/vibedb/internal/gatewayruntime",
+      "Test": "TestFusedRF3NodeProcessQualification/explicit-physical6",
+      "Elapsed": 31.98
+    },
+    {
+      "Time": "2026-09-04T17:55:42.21736068Z",
+      "Action": "pass",
+      "Package": "github.com/thesyncim/vibedb/internal/gatewayruntime",
+      "Test": "TestFusedRF3NodeProcessQualification",
+      "Elapsed": 76.13
+    },
+    {
+      "Time": "2026-09-04T17:55:42.21812918Z",
+      "Action": "pass",
+      "Package": "github.com/thesyncim/vibedb/internal/gatewayruntime",
+      "Elapsed": 76.137
+    }
+  ],
+  "claims_excluded": [
+    "performance improvement",
+    "single-node failure availability",
+    "network partition safety",
+    "lost-reply exact retry across frontends",
+    "interactive PostgreSQL SERIALIZABLE parity",
+    "independent-host scale"
+  ]
+}

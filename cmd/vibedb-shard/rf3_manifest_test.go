@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibejson"
 )
 
 const canonicalRF3Manifest = `{
@@ -287,6 +288,33 @@ func TestParseRF3ManifestCanonicalMultiGroupBundles(t *testing.T) {
 		if _, err := parseRF3Manifest([]byte(invalid)); !errors.Is(err, errInvalidRF3Manifest) {
 			t.Fatalf("duplicate group %s error = %v", name, err)
 		}
+	}
+}
+
+func TestParseRF3ManifestSharedKeyRequiresExactNodeLogBinding(t *testing.T) {
+	shared := strings.ReplaceAll(multiGroupRF3Manifest(t), "/run/secrets/vibedb-wal-key-2", "/run/secrets/vibedb-wal-key")
+	node := rf3NodeLogManifest{Format: 1, Path: "/srv/node/node-log", KeyID: "production-key-1", KeyMaterialPath: "/run/secrets/vibedb-wal-key"}
+	encoded, err := vibejson.Marshal(&node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	document := strings.Replace(shared, "{\n", "{\n  \"node_log\": "+string(encoded)+",\n", 1)
+	parsed, err := parseRF3Manifest([]byte(document))
+	if err != nil || len(parsed.Groups) != 2 {
+		t.Fatalf("shared physical key refused: groups=%d err=%v", len(parsed.Groups), err)
+	}
+	for name, invalid := range map[string]string{
+		"no physical log":         shared,
+		"wrong physical key id":   strings.Replace(document, `"key_id":"production-key-1"`, `"key_id":"wrong-key"`, 1),
+		"wrong physical key path": strings.Replace(document, `"key_material_path":"/run/secrets/vibedb-wal-key"`, `"key_material_path":"/run/secrets/other-key"`, 1),
+		"node log aliases group":  strings.Replace(document, `"path":"/srv/node/node-log"`, `"path":"/srv/vibedb/member.wal"`, 1),
+		"SQL aliases shared key":  strings.Replace(document, `"path": "/srv/vibedb/member.vdb"`, `"path": "/run/secrets/vibedb-wal-key"`, 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := parseRF3Manifest([]byte(invalid)); !errors.Is(err, errInvalidRF3Manifest) {
+				t.Fatalf("invalid shared key accepted: %v", err)
+			}
+		})
 	}
 }
 

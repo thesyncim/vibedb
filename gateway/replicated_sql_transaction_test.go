@@ -75,7 +75,8 @@ func (client *replicatedSQLIndexedReadClient) DoReplicated(
 			Kind: shardservice.ReplicatedHandshake, HasState: true, State: state,
 		}, nil
 	}
-	if request.Operation != shardservice.ReplicatedReadLeader {
+	if request.Operation != shardservice.ReplicatedReadLeader &&
+		request.Operation != shardservice.ReplicatedReadFollower {
 		return nil, ErrReplicatedRoute
 	}
 	client.reads++

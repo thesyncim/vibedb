@@ -67,6 +67,28 @@ func (p *NodeRuntimePersistence) Submit(batch raftmodel.PersistBatch) (uint64, e
 	return p.sequencer.TrySubmit(&p.cell)
 }
 
+// SubmitSeries submits a bounded contiguous Ready prefix for this exact
+// group. The adapter validates the node incarnation before preparing the
+// caller-owned cell; the sequencer then retains the fixed series until Poll
+// or Wait reports its single shared completion.
+func (p *NodeRuntimePersistence) SubmitSeries(batches []raftmodel.PersistBatch) (uint64, error) {
+	if p == nil || p.sequencer == nil {
+		return 0, ErrRuntimeClosed
+	}
+	if len(batches) == 0 || len(batches) > raftstore.MaxReadySeries {
+		return 0, raftstore.ErrBounds
+	}
+	for _, batch := range batches {
+		if batch.NodeIncarnation != p.incarnation {
+			return 0, ErrNodePersistenceBinding
+		}
+	}
+	if err := p.cell.PrepareReadySeries(p.group, batches); err != nil {
+		return 0, err
+	}
+	return p.sequencer.TrySubmit(&p.cell)
+}
+
 func (p *NodeRuntimePersistence) Poll() (uint64, bool, error) {
 	if p == nil {
 		return 0, false, ErrRuntimeClosed

@@ -71,7 +71,30 @@ type NodeBootstrap struct {
 type NodeReady struct {
 	GroupID uint64
 	Batch   raftmodel.PersistBatch
+	// series and seriesCount are populated only by the submission sequencer or
+	// PersistReadySeries. They are deliberately private: a public NodeReady
+	// always describes one logical Ready, while one outer seglog batch may carry
+	// a bounded contiguous series of logical Readies.
+	series      [MaxReadySeries]raftmodel.PersistBatch
+	seriesCount uint8
 }
+
+// MaxReadySeries bounds the number of contiguous Ready values represented by
+// one physical node-log batch. The bound is deliberately independent from the
+// node-wide MaxPersistGroupBatches wave bound: a wave may contain at most one
+// series for each group, and each series may contain at most sixteen logical
+// Readies.
+const MaxReadySeries = int(seglog.MaximumReadySpan)
+
+// Keep the node lane's fixed array geometry exactly aligned with the log
+// grammar. A mismatch would silently create a span the engine cannot encode or
+// replay, so make it a compile-time failure rather than a runtime branch.
+const readySeriesExpected = 16
+
+var (
+	_ [MaxReadySeries - readySeriesExpected]struct{}
+	_ [readySeriesExpected - MaxReadySeries]struct{}
+)
 
 type GroupIncarnation struct {
 	GroupID, Incarnation uint64
@@ -119,6 +142,7 @@ type NodeStore struct {
 	cacheValid                                bool
 	waveBatches                               [MaxPersistGroupBatches]seglog.ReadyBatch
 	waveEntryArena                            []seglog.Entry
+	seriesEntryPtrs                           [MaxReadyEntries]*pb.Entry
 	waveHard                                  [MaxPersistGroupBatches]seglog.HardState
 	waveCheckpoint                            [MaxPersistGroupBatches]seglog.Checkpoint
 	pageRefs                                  []pageEntryRef
@@ -782,7 +806,325 @@ func (s *NodeStore) publishGroupCheckpointSequenced(group uint64, snapshot *pb.S
 
 func (s *NodeStore) PersistWave(ready []NodeReady) error { return s.persistWave(ready, false) }
 
+// PersistReadySeries persists one bounded same-group series as one logical
+// node wave batch. The caller's descriptors and every value reachable through
+// them are borrowed until this call returns; this synchronous path does not
+// retain them. A multi-Ready series cannot carry a snapshot yet, so callers
+// can fall back to singleton Persist calls for that transition.
+func (s *NodeStore) PersistReadySeries(group uint64, batches []raftmodel.PersistBatch) error {
+	if len(batches) == 0 || len(batches) > MaxReadySeries {
+		// Route the invalid geometry through persistWave when a store exists so
+		// its established Closed, SequencerActive, and PersistenceUnknown
+		// precedence remains unchanged. The sentinel count is rejected before
+		// any caller data is copied or any workspace is touched.
+		if s == nil {
+			return ErrBounds
+		}
+		return s.persistWave([]NodeReady{{GroupID: group, seriesCount: uint8(MaxReadySeries + 1)}}, false)
+	}
+	var item NodeReady
+	item.GroupID, item.seriesCount = group, uint8(len(batches))
+	copy(item.series[:], batches)
+	return s.persistWave([]NodeReady{item}, false)
+}
+
 func (s *NodeStore) persistSequencedWave(ready []NodeReady) error { return s.persistWave(ready, true) }
+
+// validateReadySeriesDescriptors performs the part of series admission that
+// is independent of the current durable group cursor. It intentionally does
+// no I/O and does not touch store state, allowing sequencer admission to reject
+// malformed or unsupported series before taking a ticket.
+func validateReadySeriesDescriptors(group uint64, batches []raftmodel.PersistBatch) error {
+	if group == 0 || len(batches) == 0 || len(batches) > MaxReadySeries {
+		return ErrBounds
+	}
+	incarnation, readyID := batches[0].NodeIncarnation, batches[0].ReadyID
+	if incarnation == 0 || readyID == 0 {
+		return ErrInvalid
+	}
+	var previousHard *pb.HardState
+	for i := range batches {
+		batch := batches[i]
+		if batch.NodeIncarnation != incarnation || batch.ReadyID == 0 ||
+			(i != 0 && (readyID > math.MaxUint64-uint64(i) || batch.ReadyID != readyID+uint64(i))) {
+			return ErrInvalid
+		}
+		if len(batches) > 1 && batch.Snapshot != nil {
+			return ErrUnsupportedSnapshot
+		}
+		if _, err := readyPayloadSize(batch); err != nil {
+			return err
+		}
+		if !isEmptyHardState(batch.HardState) {
+			if previousHard != nil && (batch.HardState.GetTerm() < previousHard.GetTerm() ||
+				batch.HardState.GetCommit() < previousHard.GetCommit() ||
+				batch.HardState.GetTerm() == previousHard.GetTerm() && previousHard.GetVote() != 0 &&
+					batch.HardState.GetVote() != 0 && batch.HardState.GetVote() != previousHard.GetVote()) {
+				return ErrInvalid
+			}
+			previousHard = batch.HardState
+		}
+	}
+	return nil
+}
+
+// nodeReadySeriesCount returns one for the ordinary NodeReady form. The
+// private fixed descriptors are used by Submission and PersistReadySeries.
+func nodeReadySeriesCount(item NodeReady) int {
+	if item.seriesCount == 0 {
+		return 1
+	}
+	return int(item.seriesCount)
+}
+
+// nodeReadySeriesBatch accesses one logical descriptor without allocating a
+// temporary slice. Callers must pass an index below nodeReadySeriesCount.
+func nodeReadySeriesBatch(item *NodeReady, index int) *raftmodel.PersistBatch {
+	if item.seriesCount == 0 {
+		return &item.Batch
+	}
+	return &item.series[index]
+}
+
+// aggregateReadySeries validates and folds one NodeReady's descriptors into a
+// PersistBatch. Entry pointers remain borrowed; only the fixed pointer arena
+// in NodeStore is populated. The returned digest is the normal Ready digest
+// for a singleton and a domain-separated composite over (ReadyID, digest) for
+// a multi-Ready series.
+func (s *NodeStore) aggregateReadySeries(item *NodeReady) (raftmodel.PersistBatch, [16]byte, error) {
+	count := nodeReadySeriesCount(*item)
+	if count < 1 || count > MaxReadySeries {
+		return raftmodel.PersistBatch{}, [16]byte{}, ErrBounds
+	}
+	if item.seriesCount != 0 {
+		batches := item.series[:count]
+		if err := validateReadySeriesDescriptors(item.GroupID, batches); err != nil {
+			return raftmodel.PersistBatch{}, [16]byte{}, err
+		}
+	}
+	first := nodeReadySeriesBatch(item, 0)
+	result := raftmodel.PersistBatch{NodeIncarnation: first.NodeIncarnation, ReadyID: first.ReadyID}
+	if count == 1 {
+		result = *first
+		var snapshotBytes []byte
+		if !canonicalEmptySnapshot(result.Snapshot) {
+			var err error
+			snapshotBytes, err = marshalSnapshot(result.Snapshot)
+			if err != nil {
+				return raftmodel.PersistBatch{}, [16]byte{}, err
+			}
+		}
+		digest, err := s.readyDigest.digest(result, snapshotBytes)
+		return result, digest, err
+	}
+	if first.ReadyID > math.MaxUint64-uint64(count-1) {
+		return raftmodel.PersistBatch{}, [16]byte{}, ErrBounds
+	}
+	result.ReadyID = first.ReadyID + uint64(count-1)
+	result.MustSync = false
+	entryCount := 0
+	var outputFirst, outputLast uint64
+	var previousHard *pb.HardState
+	var digestIDs [MaxReadySeries]uint64
+	var digestValues [MaxReadySeries][16]byte
+	for i := 0; i < count; i++ {
+		batch := nodeReadySeriesBatch(item, i)
+		digestIDs[i] = batch.ReadyID
+		if batch.MustSync {
+			result.MustSync = true
+		}
+		if !isEmptyHardState(batch.HardState) {
+			if previousHard != nil && (batch.HardState.GetTerm() < previousHard.GetTerm() ||
+				batch.HardState.GetCommit() < previousHard.GetCommit() ||
+				batch.HardState.GetTerm() == previousHard.GetTerm() && previousHard.GetVote() != 0 &&
+					batch.HardState.GetVote() != 0 && batch.HardState.GetVote() != previousHard.GetVote()) {
+				return raftmodel.PersistBatch{}, [16]byte{}, ErrInvalid
+			}
+			result.HardState = batch.HardState
+			previousHard = batch.HardState
+		}
+		// Apply each constituent's entry suffix to the aggregate in the same
+		// order as Raft would apply it. Consecutive appends are concatenated;
+		// an overlapping suffix replaces the already aggregated tail. A gap is
+		// unsupported because one ReadyBatch cannot encode it safely. This keeps
+		// replacement semantics correct while allowing ordinary replacement
+		// sequences to remain one physical batch.
+		if len(batch.Entries) != 0 {
+			firstIndex := batch.Entries[0].GetIndex()
+			if firstIndex == 0 {
+				return raftmodel.PersistBatch{}, [16]byte{}, ErrInvalid
+			}
+			for entryIndex, entry := range batch.Entries {
+				if entry == nil || entry.GetTerm() == 0 ||
+					uint64(entryIndex) > math.MaxUint64-firstIndex ||
+					entry.GetIndex() != firstIndex+uint64(entryIndex) {
+					return raftmodel.PersistBatch{}, [16]byte{}, ErrInvalid
+				}
+			}
+			if entryCount == 0 {
+				outputFirst = firstIndex
+			} else if firstIndex > outputLast {
+				if outputLast == math.MaxUint64 || firstIndex != outputLast+1 {
+					return raftmodel.PersistBatch{}, [16]byte{}, ErrInvalid
+				}
+			} else if firstIndex < outputFirst {
+				entryCount = 0
+				outputFirst = firstIndex
+			} else {
+				delta := firstIndex - outputFirst
+				if delta > uint64(len(s.seriesEntryPtrs)) {
+					return raftmodel.PersistBatch{}, [16]byte{}, ErrBounds
+				}
+				entryCount = int(delta)
+				if entryCount < 0 || entryCount > len(s.seriesEntryPtrs) {
+					return raftmodel.PersistBatch{}, [16]byte{}, ErrBounds
+				}
+			}
+			if len(batch.Entries) > len(s.seriesEntryPtrs)-entryCount {
+				return raftmodel.PersistBatch{}, [16]byte{}, ErrBounds
+			}
+			for _, entry := range batch.Entries {
+				s.seriesEntryPtrs[entryCount] = entry
+				entryCount++
+			}
+			if uint64(len(batch.Entries)-1) > math.MaxUint64-firstIndex {
+				return raftmodel.PersistBatch{}, [16]byte{}, ErrBounds
+			}
+			outputLast = firstIndex + uint64(len(batch.Entries)) - 1
+		}
+		canonical := batch
+		var snapshotBytes []byte
+		if !canonicalEmptySnapshot(canonical.Snapshot) {
+			return raftmodel.PersistBatch{}, [16]byte{}, ErrUnsupportedSnapshot
+		}
+		digest, err := s.readyDigest.digest(*canonical, snapshotBytes)
+		if err != nil {
+			return raftmodel.PersistBatch{}, [16]byte{}, err
+		}
+		digestValues[i] = digest
+	}
+	plainBytes := 0
+	for i := 0; i < entryCount; i++ {
+		if plainBytes > math.MaxInt-len(s.seriesEntryPtrs[i].GetData()) {
+			return raftmodel.PersistBatch{}, [16]byte{}, ErrBounds
+		}
+		plainBytes += len(s.seriesEntryPtrs[i].GetData())
+	}
+	if uint64(entryCount) > s.bounds.maxEntriesPerGroup && s.bounds.maxEntriesPerGroup != 0 ||
+		uint64(plainBytes) > s.bounds.maxWaveBytes && s.bounds.maxWaveBytes != 0 {
+		return raftmodel.PersistBatch{}, [16]byte{}, ErrBounds
+	}
+	result.Entries = s.seriesEntryPtrs[:entryCount:entryCount]
+	return result, compositeReadyDigest(digestIDs, digestValues, count), nil
+}
+
+// compositeReadyDigest is fixed-size and allocation-free. The domain marker
+// prevents a series identity from being confused with a normal Ready digest;
+// the count keeps concatenations unambiguous, followed by every
+// (ReadyID, canonical Ready digest) pair in order.
+func compositeReadyDigest(ids [MaxReadySeries]uint64, digests [MaxReadySeries][16]byte, count int) (result [16]byte) {
+	var canonical [len("vibedb/raftstore/ready-series/v1") + 8 + MaxReadySeries*24]byte
+	offset := copy(canonical[:], "vibedb/raftstore/ready-series/v1")
+	binary.LittleEndian.PutUint64(canonical[offset:offset+8], uint64(count))
+	offset += 8
+	for i := 0; i < count; i++ {
+		binary.LittleEndian.PutUint64(canonical[offset:offset+8], ids[i])
+		copy(canonical[offset+8:offset+24], digests[i][:])
+		offset += 24
+	}
+	digest := sha256.Sum256(canonical[:offset])
+	copy(result[:], digest[:len(result)])
+	return result
+}
+
+// validateReadySeriesTransitions proves that folding the logical Readies has
+// exactly the same admission semantics as persisting them one at a time. The
+// final aggregate alone is insufficient: an early Ready can commit an entry
+// which a later Ready then replaces, or contain an invalid intermediate
+// HardState that a later valid HardState would otherwise conceal.
+func validateReadySeriesTransitions(
+	state seglog.GroupSummary,
+	metadata seglog.GroupMetadata,
+	batches []raftmodel.PersistBatch,
+) error {
+	last := state.LastIndex
+	hard := metadata.Hard
+	for index := range batches {
+		batch := &batches[index]
+		if len(batch.Entries) != 0 {
+			first := batch.Entries[0].GetIndex()
+			if first <= last {
+				if first <= hard.Commit {
+					return ErrInvalid
+				}
+			} else if last == math.MaxUint64 || first != last+1 {
+				return ErrInvalid
+			}
+			last = batch.Entries[len(batch.Entries)-1].GetIndex()
+		}
+		if isEmptyHardState(batch.HardState) {
+			continue
+		}
+		next := seglog.HardState{
+			Term: batch.HardState.GetTerm(), Vote: batch.HardState.GetVote(), Commit: batch.HardState.GetCommit(),
+		}
+		if next.Term < hard.Term || next.Commit < hard.Commit || next.Commit > last ||
+			next.Term == 0 && next.Vote != 0 ||
+			next.Term == hard.Term && hard.Vote != 0 && next.Vote != hard.Vote ||
+			len(batch.Entries) != 0 && next.Term < batch.Entries[len(batch.Entries)-1].GetTerm() {
+			return ErrInvalid
+		}
+		hard = next
+	}
+	return nil
+}
+
+// preflightReadyItem resolves the current durable cursor and computes the
+// exact retry identity without publishing anything. The series cursor check
+// intentionally compares the first logical Ready against the durable cursor;
+// seglog receives the final ReadyID together with ReadySpan and performs the
+// corresponding final cursor transition atomically.
+func (s *NodeStore) preflightReadyItem(item *NodeReady) (raftmodel.PersistBatch, seglog.GroupSummary, [16]byte, bool, error) {
+	batch, digest, err := s.aggregateReadySeries(item)
+	if err != nil {
+		return raftmodel.PersistBatch{}, seglog.GroupSummary{}, [16]byte{}, false, err
+	}
+	state, ok := s.engine.Summary(item.GroupID)
+	if !ok || batch.NodeIncarnation == 0 || batch.NodeIncarnation != state.NodeIncarnation {
+		return raftmodel.PersistBatch{}, seglog.GroupSummary{}, [16]byte{}, false, ErrInvalid
+	}
+	if batch.ReadyID == state.ReadyID {
+		if digest != state.ReadyDigest {
+			return raftmodel.PersistBatch{}, seglog.GroupSummary{}, [16]byte{}, false, ErrRetryConflict
+		}
+		return batch, state, digest, true, nil
+	}
+	metadata, metadataOK := s.engine.Metadata(item.GroupID)
+	if !metadataOK {
+		return raftmodel.PersistBatch{}, seglog.GroupSummary{}, [16]byte{}, false, ErrInvalid
+	}
+	if item.seriesCount != 0 {
+		if err := validateReadySeriesTransitions(state, metadata, item.series[:item.seriesCount]); err != nil {
+			return raftmodel.PersistBatch{}, seglog.GroupSummary{}, [16]byte{}, false, err
+		}
+	}
+	if len(batch.Entries) != 0 && batch.Entries[0].GetIndex() <= state.LastIndex &&
+		batch.Entries[0].GetIndex() <= metadata.Hard.Commit {
+		// The seglog validator would reject a suffix replacement at or below
+		// the committed prefix. Reject during preflight so a multi-Ready series
+		// cannot publish an earlier checkpoint or consume a wave workspace before
+		// this deterministic failure is reported.
+		return raftmodel.PersistBatch{}, seglog.GroupSummary{}, [16]byte{}, false, ErrInvalid
+	}
+	firstID := batch.ReadyID
+	if item.seriesCount != 0 {
+		firstID = item.series[0].ReadyID
+	}
+	if state.ReadyID == math.MaxUint64 || firstID != state.ReadyID+1 {
+		return raftmodel.PersistBatch{}, seglog.GroupSummary{}, [16]byte{}, false, ErrInvalid
+	}
+	return batch, state, digest, false, nil
+}
 
 func (s *NodeStore) persistWave(ready []NodeReady, sequenced bool) error {
 	if !sequenced && s.closingFlag.Load() {
@@ -807,15 +1149,33 @@ func (s *NodeStore) persistWave(ready []NodeReady, sequenced bool) error {
 		return ErrInvalid
 	}
 	for i := range ready {
+		if nodeReadySeriesCount(ready[i]) > MaxReadySeries {
+			return ErrBounds
+		}
 		_, registered := s.descriptorForLogKey(ready[i].GroupID)
 		if !registered || i > 0 && ready[i-1].GroupID >= ready[i].GroupID {
 			return ErrInvalid
 		}
 	}
 	id := nodeWaveID(ready)
+	// Preflight every outer item before touching the checkpoint directory or
+	// invoking seglog. This is particularly important for a series: a bad
+	// constituent must not leave an earlier constituent's checkpoint published.
+	var states [MaxPersistGroupBatches]seglog.GroupSummary
+	var digests [MaxPersistGroupBatches][16]byte
+	duplicates := 0
 	totalPlain, totalEntries := 0, 0
-	for _, item := range ready {
-		for _, entry := range item.Batch.Entries {
+	for i := range ready {
+		item := &ready[i]
+		batch, state, digest, duplicate, err := s.preflightReadyItem(item)
+		if err != nil {
+			return err
+		}
+		states[i], digests[i] = state, digest
+		if duplicate {
+			duplicates++
+		}
+		for _, entry := range batch.Entries {
 			if entry == nil || totalPlain > math.MaxInt-len(entry.GetData()) {
 				return ErrBounds
 			}
@@ -828,30 +1188,15 @@ func (s *NodeStore) persistWave(ready []NodeReady, sequenced bool) error {
 	}
 	s.plainArena = s.plainArena[:totalPlain]
 	s.cipherArena = s.cipherArena[:0]
-	plainOffset, entryOffset, mappedCount, duplicateCount := 0, 0, 0, 0
-	for _, item := range ready {
-		batch := item.Batch
-		state, ok := s.engine.Summary(item.GroupID)
-		if !ok || batch.NodeIncarnation == 0 || batch.NodeIncarnation != state.NodeIncarnation {
-			return ErrInvalid
-		}
-		var snapshotBytes []byte
-		if !canonicalEmptySnapshot(batch.Snapshot) {
-			var snapshotErr error
-			snapshotBytes, snapshotErr = marshalSnapshot(batch.Snapshot)
-			if snapshotErr != nil {
-				return snapshotErr
-			}
-		}
-		retryDigest, err := s.readyDigest.digest(batch, snapshotBytes)
+	plainOffset, entryOffset, mappedCount := 0, 0, 0
+	for i := range ready {
+		item := &ready[i]
+		batch, _, err := s.aggregateReadySeries(item)
 		if err != nil {
 			return err
 		}
+		state, retryDigest := states[i], digests[i]
 		if batch.NodeIncarnation == state.NodeIncarnation && batch.ReadyID == state.ReadyID {
-			if retryDigest != state.ReadyDigest {
-				return ErrRetryConflict
-			}
-			duplicateCount++
 			continue
 		}
 		if len(batch.Entries) > len(s.waveEntryArena)-entryOffset {
@@ -866,6 +1211,9 @@ func (s *NodeStore) persistWave(ready []NodeReady, sequenced bool) error {
 		}
 		entryOffset += len(entries)
 		mapped := seglog.ReadyBatch{GroupID: item.GroupID, NodeIncarnation: batch.NodeIncarnation, ReadyID: batch.ReadyID, ReadyDigest: retryDigest, Entries: entries}
+		if item.seriesCount != 0 {
+			mapped.ReadySpan = uint64(item.seriesCount)
+		}
 		if len(entries) > 0 && entries[0].Index <= state.LastIndex {
 			mapped.ReplaceFrom = entries[0].Index
 		}
@@ -889,7 +1237,7 @@ func (s *NodeStore) persistWave(ready []NodeReady, sequenced bool) error {
 		s.waveBatches[mappedCount] = mapped
 		mappedCount++
 	}
-	if duplicateCount == len(ready) {
+	if duplicates == len(ready) {
 		return nil
 	}
 	s.plainArena = s.plainArena[:plainOffset]
@@ -1296,8 +1644,12 @@ func nodeWaveID(ready []NodeReady) seglog.WaveID {
 	for i, item := range ready {
 		word := canonical[i*24 : i*24+24]
 		binary.LittleEndian.PutUint64(word[0:8], item.GroupID)
-		binary.LittleEndian.PutUint64(word[8:16], item.Batch.NodeIncarnation)
-		binary.LittleEndian.PutUint64(word[16:24], item.Batch.ReadyID)
+		batch := item.Batch
+		if item.seriesCount != 0 {
+			batch = item.series[item.seriesCount-1]
+		}
+		binary.LittleEndian.PutUint64(word[8:16], batch.NodeIncarnation)
+		binary.LittleEndian.PutUint64(word[16:24], batch.ReadyID)
 	}
 	digest := sha256.Sum256(canonical[:len(ready)*24])
 	var id seglog.WaveID

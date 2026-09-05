@@ -57,6 +57,11 @@ func shardPeerIdentity(domain, node byte) (identity rafttransport.PeerIdentity) 
 
 func (authority *shardTLSAuthority) profile(t testing.TB, identity rafttransport.PeerIdentity) *rafttransport.PeerTLS {
 	t.Helper()
+	return authority.profileClock(t, identity, func() time.Time { return shardTLSNow })
+}
+
+func (authority *shardTLSAuthority) profileClock(t testing.TB, identity rafttransport.PeerIdentity, now func() time.Time) *rafttransport.PeerTLS {
+	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -75,7 +80,7 @@ func (authority *shardTLSAuthority) profile(t testing.TB, identity rafttransport
 	}
 	profile, err := rafttransport.NewPeerTLS(rafttransport.PeerTLSOptions{IdentityOID: shardTLSOID, Identity: identity,
 		Certificate: tls.Certificate{Certificate: [][]byte{encoded, authority.certificate.Raw}, PrivateKey: key}, Roots: authority.roots,
-		Now: func() time.Time { return shardTLSNow }})
+		Now: now})
 	if err != nil {
 		t.Fatal(err)
 	}

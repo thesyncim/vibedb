@@ -122,6 +122,91 @@ func TestRF3ReloadOnlyAppendsIndependentPreparedGroups(t *testing.T) {
 	}
 }
 
+func TestRF3ReloadAcceptsIndependentPhysicalGroupRosters(t *testing.T) {
+	base, err := parseRF3Manifest([]byte(canonicalRF3Manifest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	group := base.groupBundles()[0]
+	group.Route.Group.GroupID[0]++
+	group.WAL.Path += "-second"
+	group.SQL.Path += "-second"
+	group.Members[0] = base.Members[1]
+	group.Members[1] = base.Members[2]
+	fourth := base.Members[0]
+	fourth.MemberID, fourth.PeerAddress = 4, "member-4.internal:7400"
+	for index := range fourth.NodeID {
+		fourth.NodeID[index] = 0x41 + byte(index)
+	}
+	group.Members[2] = fourth
+	group.MemberCount = rf3ManifestMembers
+	next := base
+	next.Groups = append(base.groupBundles(), group)
+	if err := validateRF3GroupAppend(base, next); err != nil {
+		t.Fatalf("independent group roster refused: %v", err)
+	}
+}
+
+func TestRF3ReloadRejectsReorderingAndIncompletePhysicalRosters(t *testing.T) {
+	base, err := parseRF3Manifest([]byte(multiGroupRF3Manifest(t)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	third := base.Groups[1]
+	third.Route.Group.GroupID[0]++
+	third.WAL.Path += "-third"
+	third.SQL.Path += "-third"
+	for name, change := range map[string]func(*rf3Manifest){
+		"insert before retained group": func(next *rf3Manifest) { next.Groups = []rf3ManifestGroup{base.Groups[0], third, base.Groups[1]} },
+		"reorder existing":             func(next *rf3Manifest) { next.Groups = []rf3ManifestGroup{base.Groups[1], base.Groups[0]} },
+		"duplicate group member":       func(next *rf3Manifest) { next.Groups[1].Members[1] = next.Groups[1].Members[0] },
+		"duplicate member id":          func(next *rf3Manifest) { next.Groups[1].Members[1].MemberID = next.Groups[1].Members[0].MemberID },
+		"invalid peer address":         func(next *rf3Manifest) { next.Groups[1].Members[1].PeerAddress = "invalid" },
+		"gateway omits hosted nodes":   func(next *rf3Manifest) { next.Gateway = &rf3ManifestGateway{} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			next := base
+			next.Groups = append([]rf3ManifestGroup(nil), base.Groups...)
+			change(&next)
+			if err := validateRF3GroupTransition(base, next); err == nil {
+				t.Fatal("accepted invalid reload")
+			}
+		})
+	}
+}
+
+func TestRF3ReloadTransportRosterRejectsUnknownPeersBeforeEnrollment(t *testing.T) {
+	base, err := parseRF3Manifest([]byte(multiGroupRF3Manifest(t)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fourth, fifth := base.Groups[0].Members[1], base.Groups[0].Members[2]
+	fourth.NodeID[0], fifth.NodeID[0] = 0xa1, 0xb1
+	fourth.PeerAddress, fifth.PeerAddress = "member-4.internal:7400", "member-5.internal:7400"
+	base.Groups[1].Members[1], base.Groups[1].Members[2] = fourth, fifth
+	third := base.Groups[1]
+	third.Route.Group.GroupID[0]++
+	third.WAL.Path += "-third"
+	third.SQL.Path += "-third"
+	third.Members[1] = base.Groups[0].Members[1]
+	next := base
+	next.Groups = append(append([]rf3ManifestGroup(nil), base.Groups...), third)
+	if err := validateRF3GroupTransition(base, next); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateRF3ReloadTransportRoster(base, next); err != nil {
+		t.Fatalf("recombined startup peers refused: %v", err)
+	}
+	next.Groups[2].Members[2].NodeID[0] = 0xc1
+	next.Groups[2].Members[2].PeerAddress = "member-6.internal:7400"
+	if err := validateRF3GroupTransition(base, next); err != nil {
+		t.Fatalf("fixture is not an independently valid RF3 group: %v", err)
+	}
+	if err := validateRF3ReloadTransportRoster(base, next); err == nil {
+		t.Fatal("runtime accepted an unprepared physical transport peer")
+	}
+}
+
 func TestRF3GroupTransitionAcceptsExactNonPrimaryRetirement(t *testing.T) {
 	base, err := parseRF3Manifest([]byte(canonicalRF3Manifest))
 	if err != nil {

@@ -1,0 +1,140 @@
+name: fused RF3 physical-node qualification
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/**'
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - 'cmd/vibedb/**'
+      - 'cmd/vibedb-shard/**'
+      - 'cmd/vibedb-gateway/**'
+      - 'distribution/**'
+      - 'docs/distributed-feature-state.md'
+      - 'internal/buildgate/**'
+      - 'internal/featurestate/**'
+      - 'internal/gatewayruntime/**'
+      - 'internal/rf3testfixture/**'
+      - 'sql/**'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/**'
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - 'cmd/vibedb/**'
+      - 'cmd/vibedb-shard/**'
+      - 'cmd/vibedb-gateway/**'
+      - 'distribution/**'
+      - 'docs/distributed-feature-state.md'
+      - 'internal/buildgate/**'
+      - 'internal/featurestate/**'
+      - 'internal/gatewayruntime/**'
+      - 'internal/rf3testfixture/**'
+      - 'sql/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GOEXPERIMENT: simd
+
+concurrency:
+  group: fused-node-rf3-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  qualify:
+    name: Ubuntu fused RF3 physical-node qualification
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.27'
+      - name: Prepare bounded fused RF3 evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="${RUNNER_TEMP}/fused-node-rf3"
+          test_root="${RUNNER_TEMP}/fused-node-rf3-tmp"
+          mkdir -p "${evidence}" "${test_root}"
+          git rev-parse HEAD > "${evidence}/revision.txt"
+          go version > "${evidence}/go-version.txt"
+          go env GOOS GOARCH GOVERSION GOTOOLCHAIN > "${evidence}/go-env.txt"
+          uname -a > "${evidence}/uname.txt"
+          df -T -B1 "${test_root}" > "${evidence}/filesystem.txt"
+          stat -f -c 'filesystem_type=%T block_size=%S' "${test_root}" >> "${evidence}/filesystem.txt"
+          command -v fallocate > "${evidence}/fallocate-path.txt"
+          fallocate --version > "${evidence}/fallocate-version.txt"
+          preflight="${test_root}/strict-allocation-preflight"
+          fallocate -l 1048576 "${preflight}"
+          sync "${preflight}"
+          stat -c 'size=%s blocks=%b block_size=%B' "${preflight}" > "${evidence}/allocation.txt"
+          test "$(stat -c %s "${preflight}")" -eq 1048576
+          test "$(( $(stat -c %b "${preflight}") * $(stat -c %B "${preflight}") ))" -ge 1048576
+          rm -f "${preflight}"
+          test_name='TestFusedRF3NodeProcessQualification'
+          go test -list "^${test_name}$" ./internal/gatewayruntime > "${evidence}/test-list.txt"
+          grep -Fqx "${test_name}" "${evidence}/test-list.txt"
+          printf 'TMPDIR=%s VIBEDB_FUSED_RF3_PROCESS_E2E=1 go test -json -count=1 -timeout=15m -run %s ./internal/gatewayruntime\n' \
+            "${test_root}" "^${test_name}$" > "${evidence}/command.txt"
+      - name: Run fused RF3 physical-node qualification
+        shell: bash
+        env:
+          TMPDIR: ${{ runner.temp }}/fused-node-rf3-tmp
+          VIBEDB_FUSED_RF3_PROCESS_E2E: '1'
+        run: |
+          set -euo pipefail
+          go test -json -count=1 -timeout=15m \
+            -run '^TestFusedRF3NodeProcessQualification$' \
+            ./internal/gatewayruntime \
+            | tee "${RUNNER_TEMP}/fused-node-rf3/go-test.jsonl"
+      - name: Validate complete unskipped fused RF3 evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="${RUNNER_TEMP}/fused-node-rf3"
+          result="${evidence}/go-test.jsonl"
+          test_name='TestFusedRF3NodeProcessQualification'
+          test -s "${result}"
+          test "$(stat -c %s "${result}")" -le 67108864
+          # Parse the complete stream separately: a later command substitution
+          # can otherwise hide jq's parse error behind a successful wc/test.
+          jq -c . "${result}" >/dev/null
+          if jq -e 'select(.Action == "fail")' "${result}" >/dev/null; then
+            echo "fused RF3 physical-node qualification reported a failure" >&2
+            exit 1
+          fi
+          test "$(jq -r --arg test_name "${test_name}" \
+            'select(.Action == "pass" and .Test == $test_name) | .Test' \
+            "${result}" | wc -l)" -eq 1
+          for subtest in default-physical3 explicit-physical6; do
+            test "$(jq -r --arg test_name "${test_name}" --arg subtest "${subtest}" \
+              'select(.Action == "pass" and .Test == ($test_name + "/" + $subtest)) | .Test' \
+              "${result}" | wc -l)" -eq 1
+          done
+          if jq -e 'select(.Action == "skip")' "${result}" >/dev/null; then
+            echo "fused RF3 physical-node qualification emitted a skip" >&2
+            exit 1
+          fi
+          package='github.com/thesyncim/vibedb/internal/gatewayruntime'
+          test "$(jq -r --arg package "${package}" \
+            'select(.Action == "pass" and .Package == $package and (.Test == null or .Test == "")) | .Package' \
+            "${result}" | wc -l)" -eq 1
+          printf 'schema\tvibedb.fused-rf3-node-process\t1\nresult\tpass\nrevision\t%s\nruns\t1\nsubtests\tdefault-physical3,explicit-physical6\n' \
+            "$(cat "${evidence}/revision.txt")" > "${evidence}/summary.tsv"
+          test "$(stat -c %s "${evidence}/summary.tsv")" -le 65536
+      - name: Upload fused RF3 physical-node evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fused-node-rf3-${{ github.sha }}
+          path: ${{ runner.temp }}/fused-node-rf3
+          if-no-files-found: error
+          retention-days: 30

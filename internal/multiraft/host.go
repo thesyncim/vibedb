@@ -986,7 +986,10 @@ func (host *Host) finishDirectControl(group *groupState, controlErr error) {
 		host.purgeGroup(group)
 		return
 	}
-	if controlErr == nil {
+	if controlErr == nil || errors.Is(controlErr, raftmodel.ErrReadyPending) {
+		// A direct control refused at the Ready boundary is still authoritative
+		// runnable evidence. Wake the group so its owner can drain that Ready and
+		// retry the retained control without waiting for an unrelated input edge.
 		host.wake(group)
 	}
 }

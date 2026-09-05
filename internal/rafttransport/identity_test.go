@@ -203,6 +203,36 @@ func peerTLSTestBuildProfile(source *PeerTLS, profile buildgate.Profile) *PeerTL
 	return &clone
 }
 
+func TestPeerTLSValidatePeerProfileBindsBothCredentialRootsAndBuild(t *testing.T) {
+	authority := newPeerTLSTestAuthority(t, 231)
+	localIdentity := peerTLSTestIdentity(231, 21)
+	peerIdentity := peerTLSTestIdentity(231, 41)
+	local := newPeerTLSTestProfile(t, authority, localIdentity)
+	peer := newPeerTLSTestProfile(t, authority, peerIdentity)
+	if err := local.ValidatePeerProfile(peer); err != nil {
+		t.Fatalf("same authority profile rejected: %v", err)
+	}
+	if err := peer.ValidatePeerProfile(local); err != nil {
+		t.Fatalf("reverse same authority profile rejected: %v", err)
+	}
+
+	rogue := newPeerTLSTestProfile(t, newPeerTLSTestAuthority(t, 232), peerIdentity)
+	if err := local.ValidatePeerProfile(rogue); !errors.Is(err, ErrPeerAuthentication) {
+		t.Fatalf("rogue root error = %v, want ErrPeerAuthentication", err)
+	}
+
+	wrongDomain := newPeerTLSTestProfile(t, authority, peerTLSTestIdentity(233, 41))
+	if err := local.ValidatePeerProfile(wrongDomain); !errors.Is(err, ErrWrongTrustDomain) {
+		t.Fatalf("wrong domain error = %v, want ErrWrongTrustDomain", err)
+	}
+
+	mismatch := buildgate.CurrentProfile()
+	mismatch.WireGrammar[0]++
+	if err := local.ValidatePeerProfile(peerTLSTestBuildProfile(peer, mismatch)); !errors.Is(err, ErrPeerBuild) {
+		t.Fatalf("build mismatch error = %v, want ErrPeerBuild", err)
+	}
+}
+
 func TestPeerIdentityExtensionIsExactCriticalAndDuplicateClosed(t *testing.T) {
 	identity := peerTLSTestIdentity(1, 91)
 	extension, err := PeerIdentityExtension(peerTLSTestIdentityOID, identity)
@@ -1211,4 +1241,31 @@ func BenchmarkPeerTLSMutualHandshakeTCP(b *testing.B) {
 	b.StopTimer()
 	_ = listener.Close()
 	<-serverDone
+}
+
+func TestPeerProfileAuthorizationExpiresWithoutRevalidationOrAllocation(t *testing.T) {
+	authority := newPeerTLSTestAuthority(t, 234)
+	local := *newPeerTLSTestProfile(t, authority, peerTLSTestIdentity(234, 21))
+	peer := newPeerTLSTestProfile(t, authority, peerTLSTestIdentity(234, 41))
+	now := peerTLSTestNow
+	local.now = func() time.Time { return now }
+	proof, err := local.AuthorizePeerProfile(peer)
+	if err != nil || !proof.Valid() {
+		t.Fatalf("proof=%+v err=%v", proof, err)
+	}
+	if allocations := testing.AllocsPerRun(100, func() {
+		if !proof.Valid() {
+			panic("valid proof expired")
+		}
+	}); allocations != 0 {
+		t.Fatalf("cached validity check allocated %g times", allocations)
+	}
+	now = peerTLSTestNow.Add(2 * time.Hour)
+	if proof.Valid() {
+		t.Fatal("expired credential remains valid")
+	}
+	now = peerTLSTestNow.Add(-2 * time.Hour)
+	if proof.Valid() {
+		t.Fatal("credential accepted before validity interval")
+	}
 }

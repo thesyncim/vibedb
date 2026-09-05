@@ -2011,6 +2011,97 @@ func TestReplicatedCatalogAuthorityPublishUnknownRetryConflictAndRefresh(t *test
 	}
 }
 
+// The underlying fixture has applied the command and released its lock when
+// the hook runs, but the authority has not received its native completion yet.
+type catalogCompletionObserver struct {
+	client *catalogAuthorityClient
+	read   func([]byte)
+}
+
+func (observer catalogCompletionObserver) DoReplicated(
+	ctx context.Context, endpoint ReplicatedEndpoint, request *shardservice.ReplicatedRequest,
+) (*shardservice.ReplicatedResponse, error) {
+	response, err := observer.client.DoReplicated(ctx, endpoint, request)
+	if err == nil && response.Kind == shardservice.ReplicatedCompletion {
+		observer.read(request.Command)
+	}
+	return response, err
+}
+
+func TestReplicatedCatalogAppliedPublicationConvergesWithConcurrentReader(t *testing.T) {
+	for _, pending := range []bool{false, true} {
+		mode := "publish"
+		if pending {
+			mode = "pending"
+		}
+		for _, installed := range []string{"same", "divergent", "newer"} {
+			t.Run(mode+"/"+installed, func(t *testing.T) {
+				authority, client, current := newCatalogAuthorityFixture(t)
+				next := testCatalogAuthoritySnapshot(t, current.Generation()+1)
+				var pendingCommand []byte
+				beforeApplied := client.applied
+				if pending {
+					client.unknownNext = true
+					if err := authority.Publish(context.Background(), current.Generation(), next); !errors.Is(err, ErrReplicatedCatalogPending) {
+						t.Fatalf("initial publication must remain pending: %v", err)
+					}
+					pendingCommand = authority.session.PendingCommand()
+					client.holdUnknown = false
+				}
+				var observed *Snapshot
+				var readErr error
+				var retriedCommand []byte
+				reads := 0
+				authority.executor.client = catalogCompletionObserver{client: client, read: func(command []byte) {
+					reads++
+					retriedCommand = bytes.Clone(command)
+					if installed == "same" {
+						// This is the actual health-reader interleaving: a certified
+						// read installs the committed head before Publish resumes.
+						observed, readErr = authority.Read(context.Background())
+						return
+					}
+					generation := next.Generation()
+					if installed == "newer" {
+						generation++
+					}
+					observed = testCatalogAuthoritySnapshot(t, generation)
+					if installed == "divergent" {
+						observed.endpoints["ep-b"] = "127.0.0.1:7999"
+					}
+					readErr = authority.holder.PublishAfter(current.Generation(), observed)
+				}}
+				var err error
+				if pending {
+					err = authority.RetryPending(context.Background())
+				} else {
+					err = authority.Publish(context.Background(), current.Generation(), next)
+				}
+				if reads != 1 || readErr != nil || observed == nil {
+					t.Fatalf("completion/read interleaving failed: reads=%d err=%v", reads, readErr)
+				}
+				if installed == "same" && err != nil {
+					t.Fatalf("already installed exact applied publication failed: %v", err)
+				}
+				if installed != "same" && !errors.Is(err, ErrCatalogGenerationMismatch) {
+					t.Fatalf("different holder snapshot was accepted: %v", err)
+				}
+				equal, compareErr := equalCatalogSnapshots(authority.holder.Current(), observed)
+				if compareErr != nil || !equal {
+					t.Fatalf("publisher replaced the concurrently installed holder: %v", compareErr)
+				}
+				if client.applied != beforeApplied+1 || authority.session.Status().Pending {
+					t.Fatalf("publication was replayed or remained pending: applied=%d before=%d pending=%t",
+						client.applied, beforeApplied, authority.session.Status().Pending)
+				}
+				if pending && !bytes.Equal(retriedCommand, pendingCommand) {
+					t.Fatal("pending publication retry changed command bytes")
+				}
+			})
+		}
+	}
+}
+
 func TestReplicatedCatalogAuthorityAuthorizesPruneOnlyAfterRF3PublishAndDrain(t *testing.T) {
 	authority, _, current := newCatalogAuthorityFixture(t)
 	_, _, descriptor := testReplicatedCatalogInput(t)
