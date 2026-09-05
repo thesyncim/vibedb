@@ -12,10 +12,15 @@ import (
 // disabled path neither formats nor retains state. A retained trace can begin
 // or end mid-flight; consumers must report unmatched submissions explicitly.
 func (r *Runtime) traceAppendStage(stage string, batch raftmodel.PersistBatch) {
-	if !trace.IsEnabled() || len(batch.Entries) == 0 {
+	if !trace.IsEnabled() {
 		return
 	}
-	trace.Logf(context.Background(), "raft.append", "event=%s group=%x ready=%d index=%d entries=%d", stage, r.identity.Group.GroupID, batch.ReadyID, batch.Entries[len(batch.Entries)-1].GetIndex(), len(batch.Entries))
+	index := uint64(0)
+	if len(batch.Entries) != 0 {
+		index = batch.Entries[len(batch.Entries)-1].GetIndex()
+	}
+	snapshot := batch.Snapshot != nil && batch.Snapshot.GetMetadata() != nil && batch.Snapshot.GetMetadata().GetIndex() != 0
+	trace.Logf(context.Background(), "raft.append", "event=%s group=%x ready=%d index=%d entries=%d sync=%t snapshot=%t", stage, r.identity.Group.GroupID, batch.ReadyID, index, len(batch.Entries), batch.MustSync, snapshot)
 }
 func (r *Runtime) tracePeerStage(stage string, m *pb.Message) {
 	if !trace.IsEnabled() || m == nil || m.GetType() != pb.MsgApp && m.GetType() != pb.MsgAppResp {
