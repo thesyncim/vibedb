@@ -24,6 +24,17 @@ type retirementHost struct {
 	manifestDigest     [32]byte
 }
 
+type ownershipRetryHost struct {
+	retirementHost
+	proposals    int
+	admissionErr error
+}
+
+func (host *ownershipRetryHost) ProposeControl(raftmember.GroupKey, []byte) error {
+	host.proposals++
+	return host.admissionErr
+}
+
 func (host *retirementHost) Publication(raftmember.GroupKey) (raftmodel.Publication, error) {
 	return raftmodel.Publication{ReplicaSetVersion: host.state.ReplicaSetVersion}, nil
 }
@@ -212,6 +223,55 @@ func TestReplicaActionFencesOwnershipAndRetirementExactly(t *testing.T) {
 	if ownershipTransitionMatchesFence(transition, stale) {
 		t.Fatal("stale ownership fence accepted")
 	}
+
+	t.Run("exact retry before apply", func(t *testing.T) {
+		host := &ownershipRetryHost{retirementHost: retirementHost{
+			state:  replicatedstate.State{ReplicaSetVersion: fence.Command.ReplicaSetVersion},
+			status: raftmember.RuntimeStatus{MemberID: fence.MemberID, LeaderID: fence.MemberID, Term: fence.Term},
+		}}
+		member := ownerMember{identity: raftmember.RuntimeIdentity{
+			Group: group, AllocationGeneration: fence.AllocationGeneration,
+			MemberID: fence.MemberID, StoreID: fence.StoreID, NodeIncarnation: fence.NodeIncarnation,
+		}, command: fence.Command}
+		owner := &Owner{host: host, members: map[raftmember.GroupKey]ownerMember{group: member}}
+		for range 3 {
+			if err := owner.applyOwnershipTransition(fence, command); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if host.proposals != 1 {
+			t.Fatalf("exact in-flight retry queued %d ownership transitions, want one", host.proposals)
+		}
+		conflict, err := replicatedstate.AppendOwnershipTransition(nil, replicatedstate.OwnershipTransition{
+			From: binding, ExpectedReplicaSetVersion: fence.Command.ReplicaSetVersion,
+			SourceMember: 1, TargetMember: 3, ToOwnershipEpoch: 9,
+			ToRoutingVersion: 11, ToRouteGeneration: 12, ToOwnedRange: binding.OwnedRange,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := owner.applyOwnershipTransition(fence, conflict); !errors.Is(err, ErrServingFence) || host.proposals != 1 {
+			t.Fatalf("conflicting in-flight transition = %v, proposals=%d", err, host.proposals)
+		}
+		// A definite core refusal must not suppress a later successful retry.
+		owner.members[group] = member
+		host.admissionErr = raftmodel.ErrReadyPending
+		if err := owner.applyOwnershipTransition(fence, command); !errors.Is(err, host.admissionErr) {
+			t.Fatal(err)
+		}
+		host.admissionErr = nil
+		if err := owner.applyOwnershipTransition(fence, command); err != nil || host.proposals != 3 {
+			t.Fatalf("retry after core refusal = %v, proposals=%d", err, host.proposals)
+		}
+		// A successor term must be able to retry if the prior term lost its
+		// uncommitted proposal. Replacing the member also clears local state.
+		nextTerm := fence
+		nextTerm.Term++
+		host.status.Term = nextTerm.Term
+		if err := owner.applyOwnershipTransition(nextTerm, command); err != nil || host.proposals != 4 {
+			t.Fatalf("successor term retry = %v, proposals=%d", err, host.proposals)
+		}
+	})
 
 	retired := binding
 	retired.OwnershipEpoch = 9

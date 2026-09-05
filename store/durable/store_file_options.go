@@ -63,7 +63,7 @@ var (
 	// EnsurePhysicalAllocation may advance that proof before the caller retries.
 	ErrPhysicalCapacity = storeio.ErrPhysicalCapacity
 	// ErrSealedJournalCapacity reports that a recovery journal or transaction
-	// marker cannot satisfy an exact immutable physical-capacity profile.
+	// marker cannot satisfy its immutable capacity and allocation profile.
 	ErrSealedJournalCapacity = storeio.ErrSealedCapacityMismatch
 )
 
@@ -220,12 +220,16 @@ type Options struct {
 	// cooperative writer lease cannot prevent those external mutations.
 	PhysicalCapacityBytes uint64
 	// SealedRecoveryJournalBytes fixes the paired recovery journal's immutable,
-	// strictly allocated record-region capacity. It is Linux-only at create/open,
-	// requires DurabilitySync, and includes neither of the two 512-byte headers.
+	// record-region capacity. Allocation is strict unless PortableSealedCapacity
+	// is enabled. It requires DurabilitySync and excludes the two 512-byte headers.
 	// A sealed journal never grows; pressure recycles its existing region or
 	// refuses a record that cannot fit in an empty region.
 	SealedRecoveryJournalBytes uint64
-	ResidentBytes              int64
+	// PortableSealedCapacity permits an explicitly marked fixed-size journal
+	// without a private physical reservation. Write and sync failures still
+	// propagate; a disk-full filesystem may refuse an overwrite.
+	PortableSealedCapacity bool
+	ResidentBytes          int64
 	// ReadConcurrency bounds portable positional-read workers.
 	ReadConcurrency int
 	// ReadQueueDepth bounds one native asynchronous read submission.
@@ -983,6 +987,9 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 				ErrPhysicalCapacity,
 			)
 		}
+	}
+	if o.PortableSealedCapacity && o.SealedRecoveryJournalBytes == 0 {
+		return normalizedFileStoreOptions{}, fmt.Errorf("%w: portable capacity requires a sealed journal", ErrSealedJournalCapacity)
 	}
 	if o.SealedRecoveryJournalBytes != 0 &&
 		(o.SealedRecoveryJournalBytes > storeio.RecoveryJournalMaxCapacityBytes ||

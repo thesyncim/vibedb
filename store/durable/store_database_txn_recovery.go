@@ -358,7 +358,7 @@ func loadDatabaseTxnRecoveryFromLog(
 	marker, decisions, err := storeio.OpenTxnMarkerAt(
 		log.root, txnMarkerFilename,
 		storeio.TxnMarkerOptions{
-			Capacity: log.opts.Capacity, SealedCapacity: log.opts.SealedCapacity,
+			Capacity: log.opts.Capacity, SealedCapacity: log.opts.SealedCapacity, PortableCapacity: log.opts.PortableCapacity,
 		},
 	)
 	if err != nil {
@@ -765,7 +765,7 @@ func rescanTxnLogMarker(l *TxnLog) (*storeio.TxnDecisions, error) {
 	marker, decisions, err := storeio.OpenTxnMarkerAt(
 		l.root, txnMarkerFilename,
 		storeio.TxnMarkerOptions{
-			Capacity: l.opts.Capacity, SealedCapacity: l.opts.SealedCapacity,
+			Capacity: l.opts.Capacity, SealedCapacity: l.opts.SealedCapacity, PortableCapacity: l.opts.PortableCapacity,
 		},
 	)
 	if err != nil {

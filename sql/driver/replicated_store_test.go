@@ -89,7 +89,7 @@ func TestReplicatedBatchCeilingFitsConditionalJournal(t *testing.T) {
 	}
 }
 
-func skipReplicatedStrictAllocationUnsupported(
+func rejectReplicatedStrictAllocationUnsupported(
 	t testing.TB,
 	database *Database,
 	identity ReplicatedShardStoreIdentity,
@@ -121,7 +121,7 @@ func skipReplicatedStrictAllocationUnsupported(
 			identity, invalid, entries, readErr, markerErr,
 		)
 	}
-	t.Skipf("sealed replicated sidecars require strict allocation support: %v", err)
+	t.Fatalf("portable replicated sidecars unexpectedly required strict allocation: %v", err)
 }
 
 func requireReplicatedShardStoreBind(
@@ -133,7 +133,7 @@ func requireReplicatedShardStoreBind(
 	t.Helper()
 	identity, err := database.BindReplicatedShardStore(binding, userTable)
 	if userTable == "docs" {
-		skipReplicatedStrictAllocationUnsupported(t, database, identity, err)
+		rejectReplicatedStrictAllocationUnsupported(t, database, identity, err)
 	} else if errors.Is(err, storeio.ErrStrictAllocationUnsupported) {
 		t.Fatalf("strict-allocation helper only supports the canonical docs fixture: %v", err)
 	}
@@ -143,30 +143,22 @@ func requireReplicatedShardStoreBind(
 	return identity
 }
 
-func TestReplicatedShardStoreSealedBindPlatformGatePrecedesPublication(t *testing.T) {
-	_, database, binding, _ := prepareReplicatedTestRoot(t, "sealed-platform", false)
+func TestReplicatedShardStorePortableSealedBind(t *testing.T) {
+	_, database, binding, _ := prepareReplicatedTestRoot(t, "sealed-portable", false)
 	defer database.Close()
 	identity, err := database.BindReplicatedShardStore(binding, "docs")
-	if runtime.GOOS != "linux" {
-		if !errors.Is(err, storeio.ErrStrictAllocationUnsupported) {
-			t.Fatalf("non-Linux sealed bind = %+v, %v; want strict-allocation unsupported", identity, err)
-		}
-		core := database.connector.db
-		core.mu.RLock()
-		defer core.mu.RUnlock()
-		if !identity.IsZero() ||
-			core.catalog.ReplicatedShardStore != nil ||
-			core.catalog.Tables["docs"].Materialized ||
-			core.tables["docs"].collection != nil || core.tables["docs"].file != nil {
-			t.Fatalf("unsupported sealed bind published catalog or storage: %+v", identity)
-		}
-		return
-	}
 	if err != nil {
-		t.Fatalf("Linux sealed bind: %v", err)
+		t.Fatalf("portable sealed bind: %v", err)
 	}
 	if identity.Sidecars != canonicalReplicatedShardStoreSidecars() {
-		t.Fatalf("Linux sealed bind sidecars = %+v", identity.Sidecars)
+		t.Fatalf("sealed sidecars = %+v", identity.Sidecars)
+	}
+	core := database.connector.db
+	core.mu.RLock()
+	defer core.mu.RUnlock()
+	table := core.tables["docs"]
+	if table.collection == nil || !durableOptions(table).PortableSealedCapacity || !core.txnLog.Options().PortableCapacity {
+		t.Fatal("RF3 bind did not select portable journals and transaction marker")
 	}
 }
 
@@ -304,7 +296,9 @@ func prepareReplicatedTestRoot(
 	if err != nil {
 		t.Fatalf("ShardStoreIdentity: %v", err)
 	}
-	return path, database, binding, local
+	// Fault hooks compare directory identities with the opened catalog's
+	// canonical path (macOS temporary directories may have a /var alias).
+	return database.connector.db.path, database, binding, local
 }
 
 func testRuntimeExec(session *Session, statement string, values []any) error {
@@ -336,7 +330,7 @@ func TestReplicatedShardStoreBindOpenIdentityAndDirectFence(t *testing.T) {
 		boundTable.collection == nil ||
 		boundTable.collection.SealedRecoveryJournalBytes() != ReplicatedUserRecoveryJournalBytes ||
 		core.txnLog.Options() != (durable.TxnLogOptions{
-			Capacity: ReplicatedTransactionMarkerBytes, SealedCapacity: true,
+			Capacity: ReplicatedTransactionMarkerBytes, SealedCapacity: true, PortableCapacity: true,
 		}) {
 		core.mu.RUnlock()
 		t.Fatalf("bound storage did not retain exact sealed sidecar profile")
@@ -649,7 +643,7 @@ func TestBindReplicatedShardStorePublicationOutcomes(t *testing.T) {
 		identity, err := db.bindReplicatedShardStore(binding, "docs", func(*database) (bool, error) {
 			return false, injected
 		})
-		skipReplicatedStrictAllocationUnsupported(t, db, identity, err)
+		rejectReplicatedStrictAllocationUnsupported(t, db, identity, err)
 		if !errors.Is(err, injected) || !identity.IsZero() {
 			t.Fatalf("definite bind = %+v, %v", identity, err)
 		}
@@ -691,7 +685,7 @@ func TestBindReplicatedShardStorePublicationOutcomes(t *testing.T) {
 		identity, err := db.bindReplicatedShardStore(binding, "docs", func(*database) (bool, error) {
 			return false, durable.ErrCommitOutcomeUnknown
 		})
-		skipReplicatedStrictAllocationUnsupported(t, db, identity, err)
+		rejectReplicatedStrictAllocationUnsupported(t, db, identity, err)
 		if !errors.Is(err, durable.ErrCommitOutcomeUnknown) || identity.IsZero() {
 			t.Fatalf("unknown hook bind = %+v, %v", identity, err)
 		}
@@ -711,7 +705,7 @@ func TestBindReplicatedShardStorePublicationOutcomes(t *testing.T) {
 			int64(ReplicatedTransactionMarkerBytes)
 		if markerInfo.Size() != wantMarkerSize ||
 			db.connector.db.txnLog.Options() != (durable.TxnLogOptions{
-				Capacity: ReplicatedTransactionMarkerBytes, SealedCapacity: true,
+				Capacity: ReplicatedTransactionMarkerBytes, SealedCapacity: true, PortableCapacity: true,
 			}) {
 			t.Fatalf(
 				"exact retry marker = size %d options %+v; want size %d sealed profile",
@@ -739,7 +733,7 @@ func TestBindReplicatedShardStorePublicationOutcomes(t *testing.T) {
 			return syncDirectory(candidate)
 		}
 		identity, err := database.BindReplicatedShardStore(binding, "docs")
-		skipReplicatedStrictAllocationUnsupported(t, database, identity, err)
+		rejectReplicatedStrictAllocationUnsupported(t, database, identity, err)
 		if !errors.Is(err, durable.ErrCommitOutcomeUnknown) || !errors.Is(err, injected) ||
 			identity.IsZero() {
 			t.Fatalf("unknown bind = %+v, %v", identity, err)
@@ -872,7 +866,7 @@ func TestBindReplicatedShardStoreMarkerMintResidueSettlesExactly(t *testing.T) {
 		if storeio.TxnMarkerCreateFaulted() {
 			t.Fatal("marker-create fault fired before unsupported sealed user storage rolled back")
 		}
-		skipReplicatedStrictAllocationUnsupported(t, database, identity, err)
+		rejectReplicatedStrictAllocationUnsupported(t, database, identity, err)
 	}
 	if identity.IsZero() || !errors.Is(err, syscall.EIO) ||
 		!storeio.TxnMarkerCreateFaulted() {
@@ -896,7 +890,7 @@ func TestBindReplicatedShardStoreMarkerMintResidueSettlesExactly(t *testing.T) {
 		table.collection != nil &&
 		table.collection.SealedRecoveryJournalBytes() == ReplicatedUserRecoveryJournalBytes &&
 		core.txnLog.Options() == (durable.TxnLogOptions{
-			Capacity: ReplicatedTransactionMarkerBytes, SealedCapacity: true,
+			Capacity: ReplicatedTransactionMarkerBytes, SealedCapacity: true, PortableCapacity: true,
 		})
 	core.mu.RUnlock()
 	if !publishedExactly || markerInfo.Size() != wantMarkerSize {
@@ -922,7 +916,7 @@ func TestBindReplicatedShardStoreMarkerMintResidueSettlesExactly(t *testing.T) {
 	}
 	settledCore := settled.connector.db
 	if settledCore.txnLog.Options() != (durable.TxnLogOptions{
-		Capacity: ReplicatedTransactionMarkerBytes, SealedCapacity: true,
+		Capacity: ReplicatedTransactionMarkerBytes, SealedCapacity: true, PortableCapacity: true,
 	}) {
 		t.Fatalf("settled marker options = %+v", settledCore.txnLog.Options())
 	}
@@ -977,7 +971,7 @@ func TestReplicatedShardStoreSettlementMarkerMintFaultRetry(t *testing.T) {
 					return published, durable.ErrCommitOutcomeUnknown
 				},
 			)
-			skipReplicatedStrictAllocationUnsupported(t, db, identity, err)
+			rejectReplicatedStrictAllocationUnsupported(t, db, identity, err)
 			if identity.IsZero() ||
 				!errors.Is(err, durable.ErrCommitOutcomeUnknown) {
 				t.Fatalf("published unminted bind = %+v, %v", identity, err)
@@ -1049,7 +1043,7 @@ func TestReplicatedShardStoreSettlementMarkerMintFaultRetry(t *testing.T) {
 			markerOptions := settled.connector.db.txnLog.Options()
 			if err != nil || markerInfo.Size() != wantMarkerSize ||
 				markerOptions != (durable.TxnLogOptions{
-					Capacity: ReplicatedTransactionMarkerBytes, SealedCapacity: true,
+					Capacity: ReplicatedTransactionMarkerBytes, SealedCapacity: true, PortableCapacity: true,
 				}) {
 				_ = settled.Close()
 				t.Fatalf(

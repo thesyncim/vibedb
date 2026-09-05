@@ -267,32 +267,38 @@ func (s *Statement) prepareScalar(preserveUnknownOutput bool) error {
 		return sqlast.NewFeatureNotSupportedError(s.text, firstScalarExprPos(s.tree.Where),
 			"computed scalar WHERE expressions must run before grouping and cannot yet share a grouped statement")
 	}
-	for i := range s.tree.Columns {
-		column := &s.tree.Columns[i]
-		if column.Scalar == nil && column.Path != nil && len(column.Path.Segments) == 0 &&
-			(s.hasRelationBinding() || s.relationJoin() != nil) {
-			return sqlast.NewFeatureNotSupportedError(s.text, column.Pos,
-				"a relation wildcard cannot be mixed with the cold scalar output stage yet; name its columns explicitly")
-		}
-	}
-
 	runtime := new(statementScalar)
 	if err := runtime.compileWhere(s, s.tree.Where); err != nil {
 		return err
 	}
 	runtime.predicateNodes = len(runtime.nodes)
 	var outputStarts []int32
+	var authoredOutputs []int
 	if postOrder {
 		runtime.ordered = new(statementScalarOrdered)
 		if s.tree.Having != nil && !exprHasScalar(s.tree.Having) {
 			runtime.ordered.having = new(havingProgram)
 		}
 		outputStarts = make([]int32, 0, len(s.tree.Columns))
+		authoredOutputs = make([]int, 0, len(s.tree.Columns))
 	}
 	for i := range s.tree.Columns {
 		column := &s.tree.Columns[i]
 		if postOrder {
 			outputStarts = append(outputStarts, int32(len(runtime.nodes)))
+			authoredOutputs = append(authoredOutputs, len(runtime.outputs))
+		}
+		if column.Scalar == nil && column.Agg == sqlast.AggNone && column.Path != nil &&
+			len(column.Path.Segments) == 0 && s.hasRelationBinding() {
+			binding := s.relationBindingForSource(column.Path.Source)
+			// Relation identities are ordinals, not output names: a wildcard
+			// must preserve duplicate names and headers containing punctuation.
+			for _, spec := range binding.ordinalSpec {
+				root := runtime.compileDependencySpec(column.Path, sqlast.AggNone, spec, column.Pos)
+				runtime.outputs = append(runtime.outputs, root)
+				runtime.types = append(runtime.types, runtime.nodeType(root))
+			}
+			continue
 		}
 		var root int32
 		var err error
@@ -314,14 +320,8 @@ func (s *Statement) prepareScalar(preserveUnknownOutput bool) error {
 		runtime.ordered.projectionEnd = len(runtime.nodes)
 		runtime.ordered.havingEnd = runtime.ordered.projectionEnd
 		if exprHasScalar(s.tree.Having) {
-			if !exprEntirelyScalar(s.tree.Having) {
-				return sqlast.NewFeatureNotSupportedError(
-					s.text, firstScalarExprPos(s.tree.Having),
-					"a computed HAVING predicate may combine only computed scalar boolean terms",
-				)
-			}
 			runtime.predRoots = append(runtime.predRoots, -1)
-			root, err := runtime.compilePredicate(s, s.tree.Having)
+			root, err := runtime.compileFilterPredicate(s, s.tree.Having)
 			if err != nil {
 				return err
 			}
@@ -343,10 +343,10 @@ func (s *Statement) prepareScalar(preserveUnknownOutput bool) error {
 				end = int32(len(runtime.nodes))
 			} else if term.Output != 0 {
 				output := term.Output - 1
-				if output < 0 || output >= len(runtime.outputs) {
+				if output < 0 || output >= len(authoredOutputs) || authoredOutputs[output] >= len(runtime.outputs) {
 					return fmt.Errorf("query: malformed ORDER BY output %d", term.Output)
 				}
-				start, root = outputStarts[output], runtime.outputs[output]
+				start, root = outputStarts[output], runtime.outputs[authoredOutputs[output]]
 				end = int32(runtime.ordered.projectionEnd)
 				if output+1 < len(outputStarts) {
 					end = outputStarts[output+1]
@@ -716,14 +716,17 @@ func (r *statementScalar) compileDependency(
 	agg sqlast.AggKind,
 	pos int,
 ) (int32, error) {
-	spec := s.spec(path)
+	return r.compileDependencySpec(path, agg, s.spec(path), pos), nil
+}
+
+func (r *statementScalar) compileDependencySpec(path *sqlast.PathExpr, agg sqlast.AggKind, spec string, pos int) int32 {
 	for i := range r.deps {
 		dep := &r.deps[i]
 		if dep.agg == agg && dep.spec == spec {
 			r.nodes = append(r.nodes, statementScalarNode{
 				kind: statementScalarDependency, dependency: int32(i), right: -1, pos: pos,
 			})
-			return int32(len(r.nodes) - 1), nil
+			return int32(len(r.nodes) - 1)
 		}
 	}
 	r.deps = append(r.deps, statementScalarDependencySpec{path: path, agg: agg, spec: spec})
@@ -733,7 +736,7 @@ func (r *statementScalar) compileDependency(
 	r.nodes = append(r.nodes, statementScalarNode{
 		kind: statementScalarDependency, dependency: int32(len(r.deps) - 1), right: -1, pos: pos,
 	})
-	return int32(len(r.nodes) - 1), nil
+	return int32(len(r.nodes) - 1)
 }
 
 func (r *statementScalar) compileWhere(s *Statement, expr *sqlast.Expr) error {
@@ -748,26 +751,27 @@ func (r *statementScalar) compileWhere(s *Statement, expr *sqlast.Expr) error {
 		if !exprHasScalar(term) {
 			continue
 		}
-		var root int32
-		var err error
-		if exprEntirelyScalar(term) {
-			root, err = r.compilePredicate(s, term)
-		} else {
-			// WHERE retains exactly TRUE. The shared searched-CASE evaluator
-			// preserves NULL, short-circuiting, and runtime operand checks across
-			// mixed path/scalar boolean trees before this final truth selection.
-			value := &sqlast.ScalarExpr{Kind: sqlast.ScalarCase, Pos: term.Pos,
-				Whens: []sqlast.ScalarWhen{{Predicate: term, Result: &sqlast.ScalarExpr{Kind: sqlast.ScalarLiteral, Value: sqlast.Operand{Kind: sqlast.OperandBool, Bool: true}}}},
-				Else:  &sqlast.ScalarExpr{Kind: sqlast.ScalarLiteral, Value: sqlast.Operand{Kind: sqlast.OperandBool}},
-			}
-			root, err = r.compilePredicate(s, &sqlast.Expr{Kind: sqlast.ExprScalarTruth, ScalarLeft: value, Pos: term.Pos})
-		}
+		root, err := r.compileFilterPredicate(s, term)
 		if err != nil {
 			return err
 		}
 		r.predRoots = append(r.predRoots, root)
 	}
 	return nil
+}
+
+// WHERE and HAVING both retain exactly TRUE. Use the shared searched-CASE
+// evaluator for mixed path/scalar trees to preserve NULL, short-circuiting,
+// and runtime operand checks at the appropriate row or grouped stage.
+func (r *statementScalar) compileFilterPredicate(s *Statement, expr *sqlast.Expr) (int32, error) {
+	if exprEntirelyScalar(expr) {
+		return r.compilePredicate(s, expr)
+	}
+	value := &sqlast.ScalarExpr{Kind: sqlast.ScalarCase, Pos: expr.Pos,
+		Whens: []sqlast.ScalarWhen{{Predicate: expr, Result: &sqlast.ScalarExpr{Kind: sqlast.ScalarLiteral, Value: sqlast.Operand{Kind: sqlast.OperandBool, Bool: true}}}},
+		Else:  &sqlast.ScalarExpr{Kind: sqlast.ScalarLiteral, Value: sqlast.Operand{Kind: sqlast.OperandBool}},
+	}
+	return r.compilePredicate(s, &sqlast.Expr{Kind: sqlast.ExprScalarTruth, ScalarLeft: value, Pos: expr.Pos})
 }
 
 func exprEntirelyScalar(expr *sqlast.Expr) bool {

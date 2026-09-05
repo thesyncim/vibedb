@@ -12,6 +12,33 @@ import (
 // sender. Inbound removed-member traffic remains an authorization failure.
 var errRetiredOutboundDestination = errors.New("rafttransport: outbound destination was removed")
 
+// The removed local source must also drain packets emitted before its removal
+// without stopping the control service that certifies its final retirement.
+var errRetiredOutboundSource = errors.New("rafttransport: outbound source was removed")
+
+func retiredOutboundSource(view *authorityView, message *pb.Message) bool {
+	if view == nil || message == nil || view.retiredVersion == 0 ||
+		view.grant.SourceMember == 0 || message.GetFrom() != view.grant.SourceMember {
+		return false
+	}
+	if _, stillMember := view.roles[message.GetFrom()]; stillMember {
+		return false
+	}
+	if _, err := validateAuthorizedConfiguration(view, message.GetEntries()); err != nil {
+		return false
+	}
+	to := view.roles[message.GetTo()]
+	switch message.GetType() {
+	case pb.MsgApp, pb.MsgHeartbeat:
+		return to == MemberVoter || to == MemberLearner
+	case pb.MsgAppResp, pb.MsgHeartbeatResp, pb.MsgVote, pb.MsgVoteResp,
+		pb.MsgPreVote, pb.MsgPreVoteResp, pb.MsgTimeoutNow:
+		return to == MemberVoter
+	default:
+		return false
+	}
+}
+
 // retiredOutboundDestination runs only after preflight has established local
 // source identity, stable destination enrollment and ordinary message bounds.
 // The exact committed removal and current sender role are both mandatory;

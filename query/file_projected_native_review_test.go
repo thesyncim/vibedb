@@ -52,9 +52,8 @@ func TestNativeScalarComparisonReview(t *testing.T) {
 	}
 }
 
-// This scalar corpus checks exact output across both covered and residual
-// queries. Covered queries must additionally prove native execution and native
-// integer output; residual-native execution has its own later checkpoint.
+// This scalar corpus checks exact output and native execution across covered
+// and residual scalar predicates; containment remains on its raw-aware lane.
 func TestProjectedNativeReview(t *testing.T) {
 	builder, err := store.NewBuilder(store.Options{})
 	if err != nil {
@@ -148,9 +147,18 @@ func TestProjectedNativeReview(t *testing.T) {
 					if test.name == "covered" && execution.Result.RowCount != 0 && len(execution.Result.Columns[0].Cells[0].raw) != 0 {
 						t.Fatal("fixture did not exercise a native integer output")
 					}
-					nativeRequired := test.name == "covered"
+					nativeRequired := !strings.HasPrefix(test.name, "contains-")
 					if nativeRequired && (execution.file.small == nil || execution.file.small.docs.Len() != 0) {
 						t.Fatal("scalar query reconstructed a Segment")
+					}
+					if nativeRequired {
+						fields := 9 // eight unique output paths plus the residual id predicate
+						if test.name == "covered" {
+							fields = 8
+						}
+						if len(execution.file.small.projectionPaths) != fields {
+							t.Fatalf("selected %d paths, want %d unique required paths", len(execution.file.small.projectionPaths), fields)
+						}
 					}
 					if nativeRequired && (execution.Stats.ProjectedRows != uint64(execution.Result.RowCount)) {
 						t.Fatalf("native query silently fell back: %+v", execution.Stats)

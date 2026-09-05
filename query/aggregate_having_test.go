@@ -20,6 +20,12 @@ func TestAggregateHavingHiddenDependencies(t *testing.T) {
 		{`SELECT g FROM docs GROUP BY g HAVING SUM(n)>5`, nil, []string{"g"}, []string{`"b"`}},
 		{`SELECT g FROM docs GROUP BY g HAVING COUNT(*) IN (2,3) ORDER BY g`, nil, []string{"g"}, []string{`"a"`, `"b"`}},
 		{`SELECT g FROM docs GROUP BY g HAVING SUM(n) IS NULL`, nil, []string{"g"}, []string{`"c"`}},
+		{`SELECT g FROM docs GROUP BY g HAVING g='a' OR COALESCE(SUM(n),0)>5 ORDER BY g`, nil, []string{"g"}, []string{`"a"`, `"b"`}},
+		{`SELECT g FROM docs GROUP BY g HAVING g<>'a' AND COALESCE(SUM(n),0)>5`, nil, []string{"g"}, []string{`"b"`}},
+		{`SELECT g FROM docs GROUP BY g HAVING NOT (g='a' OR COALESCE(SUM(n),0)>5)`, nil, []string{"g"}, []string{`"c"`}},
+		{`SELECT g FROM docs GROUP BY g HAVING NOT (g='a' OR SUM(n)+0>5)`, nil, []string{"g"}, nil},
+		{`SELECT g FROM docs GROUP BY g HAVING SUM(n) IS NULL OR COALESCE(SUM(n),0)>5 ORDER BY g`, nil, []string{"g"}, []string{`"b"`, `"c"`}},
+		{`SELECT g FROM docs GROUP BY g HAVING g='a' OR 1/(SUM(n)-5)>0 ORDER BY g`, nil, []string{"g"}, []string{`"a"`, `"b"`}},
 		{`SELECT COUNT(*) FROM docs HAVING SUM(n)>10`, nil, []string{"count(*)"}, []string{"5"}},
 		{`SELECT COALESCE(SUM(n),0) AS total FROM docs HAVING COUNT(*)>?`, []any{int64(1)}, []string{"total"}, []string{"12"}},
 		{`SELECT 1 AS present FROM docs HAVING COUNT(*)>0`, nil, []string{"present"}, []string{"1"}},
@@ -63,7 +69,7 @@ func TestAggregateHavingHiddenDependencies(t *testing.T) {
 }
 
 func TestAggregateHavingWarmBudgetsAndReuse(t *testing.T) {
-	statement, err := PrepareStatement(`SELECT SUM(n)+1 AS total FROM docs GROUP BY g HAVING COUNT(*)>? LIMIT 1`)
+	statement, err := PrepareStatement(`SELECT SUM(n)+1 AS total FROM docs GROUP BY g HAVING g='z' OR COALESCE(COUNT(*),0)>? LIMIT 1`)
 	if err != nil {
 		t.Fatal(err)
 	}

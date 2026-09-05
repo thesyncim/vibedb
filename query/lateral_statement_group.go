@@ -24,6 +24,7 @@ const (
 	lateralHavingAuthored lateralHavingSource = iota
 	lateralHavingChild
 	lateralHavingBinding
+	lateralHavingAggregate
 )
 
 type lateralHavingNode struct {
@@ -31,6 +32,7 @@ type lateralHavingNode struct {
 	op      sqlast.CmpOp
 	negated bool
 	source  lateralHavingSource
+	agg     sqlast.AggKind
 	ordinal int
 	value   sqlast.Operand
 	list    []sqlast.Operand
@@ -102,7 +104,7 @@ func (c *lateralClone) cloneHaving(
 	expr *sqlast.Expr,
 	columns *[]sqlast.ResultColumn,
 ) (*sqlast.Expr, error) {
-	if expr == nil || (!c.group.program.active && !c.group.synthetic) {
+	if expr == nil || (!c.group.program.active && !c.group.synthetic && !c.hasCapturedHavingAggregate(expr)) {
 		return expr, nil
 	}
 	node, err := c.compileHaving(expr, columns)
@@ -112,6 +114,23 @@ func (c *lateralClone) cloneHaving(
 	c.group.program.active = true
 	c.group.program.having = node
 	return nil, nil
+}
+
+func (c *lateralClone) hasCapturedHavingAggregate(expr *sqlast.Expr) bool {
+	if expr == nil {
+		return false
+	}
+	if expr.Agg != sqlast.AggNone {
+		if _, _, outer := c.reference(expr.Path); outer {
+			return true
+		}
+	}
+	for _, kid := range expr.Kids {
+		if c.hasCapturedHavingAggregate(kid) {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *lateralClone) validateGroupTail(query *sqlast.SelectStmt) error {
@@ -211,8 +230,21 @@ func (c *lateralClone) compileHaving(
 		return node, nil
 	}
 	if expr.Agg != sqlast.AggNone {
-		return nil, sqlast.NewFeatureNotSupportedError(c.text, expr.Pos,
-			"an unprojected correlated LATERAL HAVING aggregate requires a child reduction binding")
+		if reference, binding, outer := c.reference(expr.Path); outer {
+			c.mark(reference, binding, false)
+			c.group.synthetic = true
+			node.source, node.ordinal, node.agg = lateralHavingAggregate, binding, expr.Agg
+			if (expr.Agg == sqlast.AggSum || expr.Agg == sqlast.AggAvg) && c.group.program.exact == nil {
+				c.group.program.exact = new(Workspace)
+			}
+		} else {
+			// Keep local reductions in the child engine, including COUNT(*)
+			// with its nil path. This private output never enters APPLY's schema.
+			node.source, node.ordinal = lateralHavingChild, len(*columns)
+			*columns = append(*columns, sqlast.ResultColumn{Path: expr.Path, Agg: expr.Agg, Pos: expr.Pos})
+			c.hidden++
+		}
+		return node, nil
 	}
 	if expr.Path == nil {
 		return nil, fmt.Errorf("query: correlated LATERAL HAVING leaf has no value")
@@ -280,7 +312,7 @@ func (c *lateralClone) finishColumns(
 		})
 		c.hidden++
 	}
-	if c.group.synthetic {
+	if c.group.synthetic && c.group.program.exact == nil {
 		for i := range c.projection {
 			switch c.projection[i].agg {
 			case sqlast.AggSum, sqlast.AggAvg:
@@ -484,6 +516,13 @@ func (l *statementLateral) havingScalar(
 	cancel *CancelFlag,
 ) (scalar, error) {
 	switch node.source {
+	case lateralHavingAggregate:
+		output := lateralOutput{local: -1, binding: node.ordinal, agg: node.agg}
+		cell, err := l.aggregateOutputCell(cursor, &output, cancel)
+		if err != nil {
+			return scalar{}, err
+		}
+		return l.group.cellScalar(cell), nil
 	case lateralHavingBinding:
 		if node.ordinal < 0 || node.ordinal >= len(l.slots) {
 			return scalar{}, fmt.Errorf("query: correlated LATERAL HAVING binding is out of range")
@@ -511,8 +550,10 @@ func (l *statementLateral) havingScalar(
 
 func (g *lateralGroupProgram) cellScalar(cell Cell) scalar {
 	// Reuse the established HAVING conversion so exact computed decimals and
-	// container/null distinctions flow through the same comparator.
-	program := havingProgram{scratch: g.scratch}
+	// container/null distinctions flow through the same comparator. Each leaf
+	// consumes its value before evaluating another leaf; retaining earlier
+	// spellings would grow this buffer on every row and every execution.
+	program := havingProgram{scratch: g.scratch[:0]}
 	value := program.cellScalar(cell)
 	g.scratch = program.scratch
 	return value
