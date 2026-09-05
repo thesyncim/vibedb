@@ -55,13 +55,12 @@ const (
 )
 
 type replicatedSQLBoundStatement struct {
-	prepared               *PreparedPlan
-	bound                  *BoundWritePlan
-	profile                ReplicatedTableProfile
-	assignmentExpression   *query.DMLStatement
-	updateExec             query.Exec
-	conflictArgs           []any
-	conflictParameterTypes []query.ParameterType
+	prepared             *PreparedPlan
+	bound                *BoundWritePlan
+	profile              ReplicatedTableProfile
+	assignmentExpression *query.DMLStatement
+	updateExec           query.Exec
+	conflictProgram      []byte
 }
 
 type replicatedSQLTargetBuilder struct {
@@ -282,9 +281,6 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 		}
 		statements[index].prepared = prepared
 		statements[index].bound = bound
-		if prepared.statement.Kind == sqlast.KindInsert && sqldriver.ReplicatedConflictProgram(prepared.statement.Insert.OnConflictUpdate) {
-			statements[index].conflictArgs = args
-		}
 		if !replicated {
 			preimageMode = replicatedSQLLinearizablePreimage
 			continue
@@ -302,6 +298,7 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 			// lowering without binding INSERT, DELETE or indexed UPDATE twice.
 			preimageMode = replicatedSQLLinearizablePreimage
 		}
+		var conflictParameterTypes []query.ParameterType
 		if hasComputedUpdateAssignments(&prepared.statement) || hasConflictExpressions(&prepared.statement) {
 			parameterTypes, typeErr := postgresQueryParameterTypes(
 				queries[index].ParamTypes, prepared.params,
@@ -317,7 +314,7 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 			}
 			statements[index].assignmentExpression = expression
 			if expression.HasConflictUpdateExpressions() {
-				statements[index].conflictParameterTypes = parameterTypes
+				conflictParameterTypes = parameterTypes
 				expressionErr = expression.ValidateConflictUpdateExpressionBindings(args)
 			} else if expression.HasUpdateExpressions() {
 				expressionErr = expression.ValidateUpdateExpressionBindings(args)
@@ -356,6 +353,13 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 					bound.insertDocs[row] = document
 				}
 			}
+		}
+		if prepared.statement.Kind == sqlast.KindInsert && sqldriver.ReplicatedConflictProgram(prepared.statement.Insert.OnConflictUpdate) {
+			program, encodeErr := sqldriver.EncodeReplicatedConflictProgram(prepared.statement.Insert.OnConflictUpdate, args, conflictParameterTypes)
+			if encodeErr != nil {
+				return nil, true, encodeErr
+			}
+			statements[index].conflictProgram = program
 		}
 		replicatedCount++
 	}
@@ -552,7 +556,7 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 
 			indexStart := len(statement.bound.globalIndexes)
 			if kind == replication.MutationPutConflict {
-				document, err = sqldriver.EncodeReplicatedConflictValue(document, statement.prepared.statement.Insert.OnConflictUpdate, statement.conflictArgs, statement.conflictParameterTypes)
+				document, err = replication.AppendConflictValue(nil, document, statement.conflictProgram)
 				if err != nil {
 					return nil, true, err
 				}
