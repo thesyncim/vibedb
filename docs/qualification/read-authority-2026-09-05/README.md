@@ -44,3 +44,13 @@ Standalone protocol tests additionally compare drift, delay, renewal, and
 restart deadlines against independent arbitrary-precision arithmetic. These
 are bounded deterministic tests, not a formal proof or an RF3 process-failure
 qualification of the complete SQL feature.
+
+The focused SQL owner validation log
+`vibedb-horizontal-authority-sql-owner-linux.log` was built at `e680bdf7` for
+`./internal/raftservice` with `GOEXPERIMENT=simd`, `GOOS=linux`,
+`GOARCH=arm64`, and `CGO_ENABLED=0`. It ran in the pinned image above with an
+anonymous `/tmp` volume and
+`-test.run 'Test(Owner.*Authority|OwnerLinearizablePointCut.*)' -test.count=1 -test.v`.
+All selected cases passed with no skips. These are focused fake-host SQL owner
+tests; they do not constitute production RF3 integration qualification and
+make no performance claim.

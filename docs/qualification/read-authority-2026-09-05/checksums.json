@@ -67,6 +67,10 @@
     "bytes": 10028,
     "sha256": "4593be510eb27ac5fa473a18171999a6d624f5cb318287f7816f0333b009141c"
   },
+  "vibedb-horizontal-authority-sql-owner-linux.log": {
+    "bytes": 1927,
+    "sha256": "4719a340ec5d9cdc3b2b411c46b635525f4605c405af57733b4a50b6bac35d5e"
+  },
   "vibedb-horizontal-authority-transport-race.log": {
     "bytes": 246,
     "sha256": "6c533f10a85e2c2d765078e881b3cf4f325f8441690f5b79b7838fa280bdc543"
