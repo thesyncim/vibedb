@@ -91,7 +91,7 @@ func TestFileProjectionDeclinedReplacementPreservesFilterCharge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fileProjectionFilterBytesForPlan(p) >= oldBytes {
+	if fileProjectionFilterBytesForRange(p, &span, true) >= oldBytes {
 		t.Fatal("replacement must have a smaller filter charge")
 	}
 	s.p, s.ordered = p, true
@@ -147,9 +147,10 @@ func TestFileProjectionFilterEstimateCoversRetainedCapacity(t *testing.T) {
 		for _, path := range []string{"/a", "/a~1b/~0c", "/" + strings.Repeat("long", 200), strings.Repeat("/a", 260)} {
 			columns, paths := make([]Column, count), make([]string, count)
 			for i := range columns {
-				columns[i], paths[i] = Path(path), path
+				paths[i] = path + "/" + fmt.Sprint(i)
+				columns[i] = Path(paths[i])
 			}
-			p, err := Select(columns...).compiled()
+			p, err := Select(columns...).OrderBy("/id", Asc).Limit(1).compiled()
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -157,7 +158,10 @@ func TestFileProjectionFilterEstimateCoversRetainedCapacity(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if estimate, actual := fileProjectionFilterBytesForPlan(p), ownedBytes(reflect.ValueOf(filter)); estimate < actual {
+			span := NewFileRangeSource(nil, nil, false)
+			span.BindPrimaryOrder("/id")
+			span.BindPrimaryPredicate("/id")
+			if estimate, actual := fileProjectionFilterBytesForRange(p, &span, true), ownedBytes(reflect.ValueOf(filter)); estimate < actual {
 				t.Fatalf("columns=%d path bytes=%d estimate=%d retained=%d", count, len(path), estimate, actual)
 			}
 		}
@@ -288,8 +292,8 @@ func TestFileProjectionFallsBackAfterLateUnsupportedShape(t *testing.T) {
 	if err := query.RunInto(&execution, FromFileRange(snapshot, &span)); err != nil {
 		t.Fatal(err)
 	}
-	if execution.Stats.ProjectedRows != 0 || execution.Result.RowCount != rows {
-		t.Fatalf("fallback stats=%+v rows=%d, want complete generic result", execution.Stats, execution.Result.RowCount)
+	if execution.Stats.ProjectedRows != rows-1 || execution.Result.RowCount != rows {
+		t.Fatalf("fallback stats=%+v rows=%d, want native prefix plus one fallback", execution.Stats, execution.Result.RowCount)
 	}
 	want, err := query.Run(FromSegment(&docs))
 	if err != nil {

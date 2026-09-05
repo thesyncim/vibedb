@@ -47,6 +47,19 @@ type fileSmallScan struct {
 	projectionStream []storeio.UnifiedProjectionStreamWorkspace
 	projectionFields []storeio.UnifiedProjectionField
 	projectionValues []byte
+	// projectionOrdinals maps the storage projector's compact field order back
+	// to the plan's deduplicated valuePaths. projectionOutput maps each result
+	// column to that field order; filter-only paths therefore never need a late
+	// decode or a second scalar slot.
+	projectionOrdinals         []int
+	projectionOutput           []int
+	projectionScalars          []scalar
+	projectionSlots            [][]scalar
+	projectionFallback         []byte
+	projectionFilterCount      int
+	projectionTextReserved     int64
+	projectionLateTextReserved int64
+	projectionFallbackReserved int64
 }
 
 func (p *plan) runFileSmall(e *Exec, snapshot *durable.Snapshot, span *FileRangeSource, masks []store.Mask, opts normalizedFileOptions, stats *ExecStats, ordered bool) (bool, error) {
@@ -59,6 +72,9 @@ func (p *plan) runFileSmall(e *Exec, snapshot *durable.Snapshot, span *FileRange
 		ordered && span != nil && span.predicatePath != "" && span.predicatePath == span.orderedPath, 0
 	s.work.heapWorkParent = &e.Workspace.heapWorkBudget
 	s.work.heapWorkTextReserved = 0
+	s.projectionTextReserved = 0
+	s.projectionLateTextReserved = 0
+	s.projectionFallbackReserved = 0
 	s.work.cancel = e.Options.Cancel
 	s.work.eval.setWork(&e.Workspace.heapWorkBudget)
 	s.work.eval.bindTo(nil)
@@ -69,6 +85,9 @@ func (p *plan) runFileSmall(e *Exec, snapshot *durable.Snapshot, span *FileRange
 		s.slots[0].batch = s.batch
 		clear(s.arena.heads) // borrowed batch values must not retain old arenas
 		clear(s.cells)
+		clear(s.projectionScalars)
+		clear(s.projectionSlots)
+		s.projectionFallback = s.projectionFallback[:0]
 		*stats = s.stats
 		s.p, s.e = nil, nil
 		s.work.heapWorkParent = nil
@@ -135,6 +154,7 @@ func (p *plan) runValidatedRawInto(e *Exec, raw []byte) error {
 	s.p, s.e, s.stats, s.opts, s.ordered, s.covered, s.payload = p, e, ExecStats{}, normalizedFileOptions{}, false, false, 0
 	s.work.heapWorkParent = &e.Workspace.heapWorkBudget
 	s.work.heapWorkTextReserved = 0
+	s.projectionFallbackReserved = 0
 	s.work.cancel = e.Options.Cancel
 	s.work.eval.setWork(&e.Workspace.heapWorkBudget)
 	s.work.eval.bindTo(nil)
@@ -144,6 +164,9 @@ func (p *plan) runValidatedRawInto(e *Exec, raw []byte) error {
 	defer func() {
 		s.slots[0].batch = s.batch
 		clear(s.arena.heads)
+		clear(s.projectionScalars)
+		clear(s.projectionSlots)
+		s.projectionFallback = s.projectionFallback[:0]
 		e.Stats = s.stats
 		s.p, s.e = nil, nil
 		s.work.heapWorkParent = nil

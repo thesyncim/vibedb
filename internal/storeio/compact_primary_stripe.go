@@ -1649,6 +1649,61 @@ func (v *CompactPrimaryStripeView) AppendValue(dst []byte, row int) ([]byte, boo
 	return v.appendValueOrdinal(dst, row, shape, v.shapeOrdinal(row, shape))
 }
 
+// valueLength computes one inline row's exact JSON length without appending to
+// a destination. Projection fallback uses it to reject an undersized bounded
+// scratch before AppendValue can grow that scratch behind the work budget.
+func (v *CompactPrimaryStripeView) valueLength(row int) (int, bool) {
+	if v == nil || row < 0 || row >= v.rows || v.IsOverflow(row) {
+		return 0, false
+	}
+	shape := v.rowShape(row)
+	if shape < 0 || shape >= v.shapeCount {
+		return 0, false
+	}
+	entry, ok := v.shapeEntry(shape)
+	if !ok || entry.rows < 0 {
+		return 0, false
+	}
+	ordinal := v.shapeOrdinal(row, shape)
+	if ordinal < 0 || ordinal >= entry.rows || len(entry.template.ends) < (entry.template.holes+1)*4 {
+		return 0, false
+	}
+	length := 0
+	previous := uint32(0)
+	streamRaw := entry.streamRaw
+	for hole := 0; hole < entry.template.holes; hole++ {
+		end := binary.LittleEndian.Uint32(entry.template.ends[hole*4:])
+		if end < previous || uint64(end) > uint64(len(entry.template.static)) {
+			return 0, false
+		}
+		part := int(end - previous)
+		if length > int(^uint(0)>>1)-part {
+			return 0, false
+		}
+		length += part
+		stream, admitted := admittedCompactStream(streamRaw)
+		if !admitted {
+			return 0, false
+		}
+		part, _, ok = compactProjectionValueLen(stream, ordinal)
+		if !ok || length > int(^uint(0)>>1)-part {
+			return 0, false
+		}
+		length += part
+		streamRaw = streamRaw[stream.encoded:]
+		previous = end
+	}
+	last := binary.LittleEndian.Uint32(entry.template.ends[entry.template.holes*4:])
+	if last < previous || uint64(last) > uint64(len(entry.template.static)) {
+		return 0, false
+	}
+	part := int(last - previous)
+	if length > int(^uint(0)>>1)-part {
+		return 0, false
+	}
+	return length + part, true
+}
+
 // appendValueOrdinal reconstructs a row after a sequential caller has already
 // counted this shape's ordinal. Point reads use AppendValue; ordered cursors
 // carry the monotonically increasing ordinal instead of rescanning up to one
