@@ -50,4 +50,6 @@ The limits are 4 MiB per mutation, 1,024 assignments, 1,024 referenced parameter
 intermediate, and exact-number budgets are each 16 MiB, with the relation's
 separate document bound. These limits are deterministic apply semantics, not
 node-local tunables. Global-index maintenance and RETURNING terminal payloads
-remain separate distributed parity gaps.
+remain separate distributed parity gaps. Replica-side expression failures currently
+use the existing invalid-mutation terminal result; preserving detailed SQL error
+codes and positions requires the terminal-result protocol to carry them.

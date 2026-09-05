@@ -277,13 +277,15 @@ func (v *replicatedSQLMutationValidator) MaterializeConflict(key, candidate, pro
 		return nil, replicatedstate.MutationValidationInvalid
 	}
 	defer clear(plan.args)
-	if err = decodeConflictBindings(bindings, plan.args); err == nil {
-		err = plan.statement.ValidateConflictUpdateExpressionBindings(plan.args)
-	}
-	if err != nil {
+	if err = decodeConflictBindings(bindings, plan.args); err != nil {
 		return nil, replicatedstate.MutationValidationInvalid
 	}
 	if !found {
+		// No projection will run on an insert. Still validate bindings before
+		// accepting it; the conflict branch binds once in the shared evaluator.
+		if err = plan.statement.ValidateConflictUpdateExpressionBindings(plan.args); err != nil {
+			return nil, replicatedstate.MutationValidationInvalid
+		}
 		return candidate, replicatedstate.MutationValidationAccept
 	}
 	value, err := materializeConflictColumnAssignments(plan.statement, &plan.exec, current, candidate, plan.assignments, plan.args, v.maxDocumentBytes)
