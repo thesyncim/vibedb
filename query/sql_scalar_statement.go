@@ -267,32 +267,38 @@ func (s *Statement) prepareScalar(preserveUnknownOutput bool) error {
 		return sqlast.NewFeatureNotSupportedError(s.text, firstScalarExprPos(s.tree.Where),
 			"computed scalar WHERE expressions must run before grouping and cannot yet share a grouped statement")
 	}
-	for i := range s.tree.Columns {
-		column := &s.tree.Columns[i]
-		if column.Scalar == nil && column.Path != nil && len(column.Path.Segments) == 0 &&
-			(s.hasRelationBinding() || s.relationJoin() != nil) {
-			return sqlast.NewFeatureNotSupportedError(s.text, column.Pos,
-				"a relation wildcard cannot be mixed with the cold scalar output stage yet; name its columns explicitly")
-		}
-	}
-
 	runtime := new(statementScalar)
 	if err := runtime.compileWhere(s, s.tree.Where); err != nil {
 		return err
 	}
 	runtime.predicateNodes = len(runtime.nodes)
 	var outputStarts []int32
+	var authoredOutputs []int
 	if postOrder {
 		runtime.ordered = new(statementScalarOrdered)
 		if s.tree.Having != nil && !exprHasScalar(s.tree.Having) {
 			runtime.ordered.having = new(havingProgram)
 		}
 		outputStarts = make([]int32, 0, len(s.tree.Columns))
+		authoredOutputs = make([]int, 0, len(s.tree.Columns))
 	}
 	for i := range s.tree.Columns {
 		column := &s.tree.Columns[i]
 		if postOrder {
 			outputStarts = append(outputStarts, int32(len(runtime.nodes)))
+			authoredOutputs = append(authoredOutputs, len(runtime.outputs))
+		}
+		if column.Scalar == nil && column.Agg == sqlast.AggNone && column.Path != nil &&
+			len(column.Path.Segments) == 0 && s.hasRelationBinding() {
+			binding := s.relationBindingForSource(column.Path.Source)
+			// Relation identities are ordinals, not output names: a wildcard
+			// must preserve duplicate names and headers containing punctuation.
+			for _, spec := range binding.ordinalSpec {
+				root := runtime.compileDependencySpec(column.Path, sqlast.AggNone, spec, column.Pos)
+				runtime.outputs = append(runtime.outputs, root)
+				runtime.types = append(runtime.types, runtime.nodeType(root))
+			}
+			continue
 		}
 		var root int32
 		var err error
@@ -337,10 +343,10 @@ func (s *Statement) prepareScalar(preserveUnknownOutput bool) error {
 				end = int32(len(runtime.nodes))
 			} else if term.Output != 0 {
 				output := term.Output - 1
-				if output < 0 || output >= len(runtime.outputs) {
+				if output < 0 || output >= len(authoredOutputs) || authoredOutputs[output] >= len(runtime.outputs) {
 					return fmt.Errorf("query: malformed ORDER BY output %d", term.Output)
 				}
-				start, root = outputStarts[output], runtime.outputs[output]
+				start, root = outputStarts[output], runtime.outputs[authoredOutputs[output]]
 				end = int32(runtime.ordered.projectionEnd)
 				if output+1 < len(outputStarts) {
 					end = outputStarts[output+1]
@@ -710,14 +716,17 @@ func (r *statementScalar) compileDependency(
 	agg sqlast.AggKind,
 	pos int,
 ) (int32, error) {
-	spec := s.spec(path)
+	return r.compileDependencySpec(path, agg, s.spec(path), pos), nil
+}
+
+func (r *statementScalar) compileDependencySpec(path *sqlast.PathExpr, agg sqlast.AggKind, spec string, pos int) int32 {
 	for i := range r.deps {
 		dep := &r.deps[i]
 		if dep.agg == agg && dep.spec == spec {
 			r.nodes = append(r.nodes, statementScalarNode{
 				kind: statementScalarDependency, dependency: int32(i), right: -1, pos: pos,
 			})
-			return int32(len(r.nodes) - 1), nil
+			return int32(len(r.nodes) - 1)
 		}
 	}
 	r.deps = append(r.deps, statementScalarDependencySpec{path: path, agg: agg, spec: spec})
@@ -727,7 +736,7 @@ func (r *statementScalar) compileDependency(
 	r.nodes = append(r.nodes, statementScalarNode{
 		kind: statementScalarDependency, dependency: int32(len(r.deps) - 1), right: -1, pos: pos,
 	})
-	return int32(len(r.nodes) - 1), nil
+	return int32(len(r.nodes) - 1)
 }
 
 func (r *statementScalar) compileWhere(s *Statement, expr *sqlast.Expr) error {
