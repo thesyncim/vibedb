@@ -16,6 +16,27 @@ import tempfile
 REPO = Path(__file__).resolve().parents[2]
 CLIENT = REPO
 CONTROL = CLIENT / 'scripts/bench/run-fused-node-comparison.py'
+DEFAULT_WORKLOADS = 'mixed_uniform'
+ALLOWED_WORKLOADS = ('point_hit', 'point_miss', 'mixed_uniform')
+
+
+def parse_workloads(raw):
+    """Parse the bounded workload contract shared by fixture and client."""
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError('workloads must not be empty')
+    workloads = []
+    seen = set()
+    for part in raw.split(','):
+        workload = part.strip()
+        if not workload:
+            raise ValueError('workloads must not contain empty entries')
+        if workload not in ALLOWED_WORKLOADS:
+            raise ValueError(f'unsupported workload {workload!r}')
+        if workload in seen:
+            raise ValueError(f'workloads must not repeat {workload!r}')
+        seen.add(workload)
+        workloads.append(workload)
+    return workloads
 
 
 def main():
@@ -30,11 +51,18 @@ def main():
     cli.add_argument('--warmup', type=int, default=500)
     cli.add_argument('--repetitions', type=int, default=2)
     cli.add_argument('--clients', default='8')
+    cli.add_argument('--workloads', default=DEFAULT_WORKLOADS,
+                     help='comma-separated matched workloads: point_hit, point_miss, mixed_uniform')
     selected = cli.parse_args()
+    try:
+        workloads = parse_workloads(selected.workloads)
+    except ValueError as exc:
+        cli.error(str(exc))
     if not (2 <= selected.groups <= 63 and 64 <= selected.rows <= 1000000 and
             1 <= selected.operations <= 1000000 and 0 <= selected.warmup <= 100000 and
             1 <= selected.repetitions <= 20):
         cli.error('invalid bounded workload configuration')
+    workload_csv = ','.join(workloads)
     spec = importlib.util.spec_from_file_location('fixture', CONTROL)
     fixture = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(fixture)
@@ -44,7 +72,7 @@ def main():
         '--matrix', 'all', '--clients', selected.clients,
         '--multigroup-clients', selected.clients, '--groups', str(selected.groups),
         '--physical-nodes', selected.physical_nodes, '--distributions', 'uniform',
-        '--endpoint-modes', 'single', '--multigroup-workloads', 'mixed_uniform',
+        '--endpoint-modes', 'single', '--multigroup-workloads', workload_csv,
         '--rows', str(selected.rows), '--operations', str(selected.operations),
         '--scans', '200', '--warmup', str(selected.warmup),
         '--repetitions', str(selected.repetitions), '--cpus', '12', '--memory', '24g',
@@ -61,7 +89,7 @@ def main():
         'workload_contract': {'rows_per_table': selected.rows, 'groups': selected.groups,
             'operations': selected.operations, 'scans': 200, 'warmup': selected.warmup,
             'repetitions': selected.repetitions, 'clients': selected.clients,
-            'workloads': ['mixed_uniform']},
+            'workloads': workloads},
         'started_utc': datetime.now(timezone.utc).isoformat(),
         'status': 'preparing', 'runs': [],
         'arm_contract': 'before and after both use the existing candidate fused fixture; arm and revision identify source',
