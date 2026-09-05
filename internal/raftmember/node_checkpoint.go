@@ -241,17 +241,19 @@ func (runtime *Runtime) driveNodeCheckpoint(advanceClock bool) error {
 		driver.submitted = true
 		return nil
 	}
-	if !advanceClock {
-		return nil
+	if advanceClock && driver.ticks < driver.interval {
+		driver.ticks++
 	}
-	driver.ticks++
 	if driver.ticks < driver.interval {
 		return nil
 	}
-	driver.ticks = 0
+	// A busy tick must not discard a due capture for another full interval.
+	// DriveReady retries it after the outstanding work drains, without delaying
+	// that work or admitting a second capture while one is already in flight.
 	if !runtime.walGenerationQuiescent() {
 		return nil
 	}
+	driver.ticks = 0
 	base, err := runtime.nodePersistence.stable.Snapshot()
 	if err != nil {
 		return err

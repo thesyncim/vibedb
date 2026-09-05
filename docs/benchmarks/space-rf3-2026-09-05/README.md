@@ -1,5 +1,25 @@
 # RF3 space reclamation from main 8e4e60f6
 
+## Follow-up qualification
+
+The resumed work is based on `b2f716ec`. A three-process pilot with the default
+32-MiB segments, two persistent authenticated clients, 4,096 writes of 64 KiB,
+and 2,048 linearizable full-value reads passed recovery but reclaimed no
+segments. The original candidate is therefore not qualified by the small
+fixture's saving below. The pilot was exploratory, not a timing comparison.
+
+Inspection found that a checkpoint due on a busy tick discarded its due state
+and waited another complete interval. The follow-up retains it until a
+quiescent Ready drive can submit it. The integration regression covers that
+transition. The new opt-in `TestServeRF3NodeSpaceQualification` retains raw
+latencies, full process diagnostics, physical allocation including reserves,
+checkpoint indexes, and proof that initial segment files disappeared. It also
+restarts the entire cluster and crashes/restarts each replica before checking
+acknowledged values again. CI requires actual reclamation on every replica.
+
+The live qualification and matched performance comparison of this follow-up
+are pending; the older measurements below do not qualify the new scheduler.
+
 Measurements began on `8e4e60f6`. The final candidate was rebased onto fetched
 main `b63e96c0`; storage and Raft directories were unchanged between those
 bases. Linux storage, runtime, and three-server checks were rerun after the

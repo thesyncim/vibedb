@@ -220,6 +220,23 @@ func TestAdoptNodeRuntimeDrivesWorkerFreeDurableReady(t *testing.T) {
 	if wantCheckpoint <= 1 {
 		t.Fatalf("campaign did not advance applied index: %d", wantCheckpoint)
 	}
+	// A scheduled tick can land while the append lane is busy. Remember the
+	// due capture and start it on the next quiescent Ready drive, without waiting
+	// for another interval or blocking the foreground append.
+	runtime.pipelined.appendOutstanding = 1
+	if err = runtime.driveNodeCheckpoint(true); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.nodeCheckpoint.building || runtime.nodeCheckpoint.ticks != runtime.nodeCheckpoint.interval {
+		t.Fatal("busy tick discarded or started its due checkpoint")
+	}
+	runtime.pipelined.appendOutstanding = 0
+	if err = runtime.driveNodeCheckpoint(false); err != nil {
+		t.Fatal(err)
+	}
+	if !runtime.nodeCheckpoint.building {
+		t.Fatal("quiescent Ready drive did not start the deferred checkpoint")
+	}
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		if err = runtime.Tick(); err != nil {
