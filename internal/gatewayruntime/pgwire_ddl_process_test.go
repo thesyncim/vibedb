@@ -126,6 +126,21 @@ active BOOLEAN NOT NULL
 		t.Fatalf("atomic conflict skip: %+v", ignored)
 	}
 	check(connection)
+	upserted := ddlWireQuery(t, connection, `INSERT INTO employees (id,name,team,city,score,active) VALUES ('employee-0003','Replacement','Platform',NULL,303,true) ON CONFLICT (id) DO UPDATE SET "$doc"=EXCLUDED."$doc"`, true)
+	if upserted.code != "" || upserted.tag != "INSERT 0 1" {
+		t.Fatalf("atomic replacement upsert: %+v", upserted)
+	}
+	invalidUpsert := ddlWireQuery(t, connection, `INSERT INTO employees (id,name,team,city,score,active) VALUES ('employee-0003','Invalid','Platform',NULL,'bad',true) ON CONFLICT (id) DO UPDATE SET "$doc"=EXCLUDED."$doc"`, true)
+	if invalidUpsert.code == "" {
+		t.Fatal("invalid replacement candidate was accepted")
+	}
+	checkReplacement := func(connection net.Conn) {
+		result := ddlWireQuery(t, connection, `SELECT name,score FROM employees WHERE id='employee-0003'`, true)
+		if result.code != "" || len(result.rows) != 1 || len(result.rows[0]) != 2 || result.rows[0][0] != `"Replacement"` || result.rows[0][1] != "303" {
+			t.Fatalf("replacement did not persist atomically: %+v", result)
+		}
+	}
+	checkReplacement(connection)
 	result = ddlWireQuery(t, connection, ddl, true)
 	if result.code != "42P07" {
 		t.Fatalf("duplicate table: %+v", result)
@@ -142,6 +157,7 @@ active BOOLEAN NOT NULL
 	connection = openDDLWire(t, ctx, address)
 	defer connection.Close()
 	check(connection)
+	checkReplacement(connection)
 }
 
 type ddlWireResult struct {

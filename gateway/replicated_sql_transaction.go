@@ -263,7 +263,7 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 		)
 		if replicated {
 			if insert := prepared.statement.Insert; prepared.statement.Kind == sqlast.KindInsert && insert != nil &&
-				insert.OnConflictUpdate != nil {
+				insert.OnConflictUpdate != nil && (!insert.OnConflictUpdate.WholeDocument() || len(prepared.writeGlobalIndexes) != 0) {
 				unsupported := sqlast.NewFeatureNotSupportedError(
 					queries[index].SQL,
 					replicatedSQLConflictActionPosition(insert),
@@ -701,7 +701,7 @@ func replicatedSQLMutationInputCount(
 	case sqlast.KindInsert:
 		insert := prepared.statement.Insert
 		if insert == nil || insert.Source != nil || insert.Returning != nil ||
-			insert.OnConflictUpdate != nil || len(insert.Rows) == 0 ||
+			insert.OnConflictUpdate != nil && (!insert.OnConflictUpdate.WholeDocument() || len(prepared.writeGlobalIndexes) != 0) || len(insert.Rows) == 0 ||
 			len(bound.rowKeys) != len(insert.Rows) ||
 			len(bound.globalIndexes) != len(insert.Rows)*len(prepared.writeGlobalIndexes) {
 			return 0, ErrReplicatedSQLTransactionUnsupported
@@ -776,6 +776,11 @@ func replicatedSQLMutationInput(
 		kind := replication.MutationPutAbsent
 		if prepared.statement.Insert.OnConflictDoNothing {
 			kind = replication.MutationPutIfAbsent
+		} else if prepared.statement.Insert.OnConflictUpdate.WholeDocument() {
+			// Both branches publish exactly the canonical candidate. The native
+			// put validates its schema and physical key at the replicated apply
+			// point and retains one affected row for inserts and replacements.
+			kind = replication.MutationPut
 		}
 		return bound.rowKeys[ordinal][0], document, kind, nil
 	case sqlast.KindUpdate:

@@ -243,7 +243,7 @@ func (s *Snapshot) prepareWrite(plan *PreparedPlan, source string) error {
 		}
 	}
 	if stmt.Kind == sqlast.KindInsert && stmt.Insert.OnConflictUpdate != nil {
-		if _, replicated := s.replicatedTableAtBytes(byteview.Bytes(plan.table)); replicated {
+		if _, replicated := s.replicatedTableAtBytes(byteview.Bytes(plan.table)); replicated && !stmt.Insert.OnConflictUpdate.WholeDocument() {
 			return &PlanError{Table: plan.table,
 				Reason: "RF3 ON CONFLICT DO UPDATE requires branch-aware replicated writes",
 				cause:  ErrDistributedWriteUnsupported}

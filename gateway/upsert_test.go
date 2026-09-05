@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/shardservice"
 )
 
@@ -37,5 +38,30 @@ func TestSingleShardUpsertUsesAtomicConflictAction(t *testing.T) {
 	}
 	if _, err := snapshot.Prepare(t.Context(), `INSERT INTO messages (tenant_id,n) VALUES ('a',1) ON CONFLICT DO UPDATE SET tenant_id='another'`); !errors.Is(err, ErrWriteShardKeyMove) {
 		t.Fatalf("key movement was not refused: %v", err)
+	}
+}
+
+func TestReplicatedWholeDocumentUpsertRoutesCanonicalAtomicPuts(t *testing.T) {
+	snapshot, executor, keys := replicatedSQLSplitTransactionFixture(t)
+	for _, tc := range []Query{
+		{SQL: `INSERT INTO messages VALUES (?),(?) ON CONFLICT (id) DO UPDATE SET "$doc"=EXCLUDED."$doc"`, Params: []shardservice.Param{
+			shardservice.DocumentParam(fmt.Sprintf(`{"id":%q,"n":1}`, keys[0])),
+			shardservice.DocumentParam(fmt.Sprintf(`{"id":%q,"n":2}`, keys[1])),
+		}},
+		{SQL: `INSERT INTO messages (id,n) VALUES (?,1),(?,2) ON CONFLICT (id) DO UPDATE SET "$doc"=EXCLUDED."$doc"`, Params: []shardservice.Param{shardservice.StringParam(keys[0]), shardservice.StringParam(keys[1])}},
+	} {
+		targets, handled, err := executor.planReplicatedSQLTransaction(t.Context(), snapshot, []Query{tc}, executor.profileFor(ClassInteractive))
+		if err != nil || !handled || len(targets) != 2 {
+			t.Fatalf("targets=%d handled=%v err=%v", len(targets), handled, err)
+		}
+		for _, target := range targets {
+			if len(target.Batches) != 1 || len(target.Batches[0].Mutations) != 1 {
+				t.Fatalf("unexpected participant: %+v", target)
+			}
+			mutation := target.Batches[0].Mutations[0]
+			if mutation.Kind != replication.MutationPut {
+				t.Fatalf("upsert did not retain atomic put: %+v", mutation)
+			}
+		}
 	}
 }

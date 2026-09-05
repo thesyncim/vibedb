@@ -90,7 +90,9 @@ On legacy shards without global indexes, a single-owner `DO UPDATE` executes
 the original conflict action atomically in the shard driver. Arbitrary shard-key
 assignments still require a placement proof; copying the current or candidate
 key and whole-document EXCLUDED replacement preserve the routed owner.
-Global-index conflict maintenance, DO UPDATE, RETURNING, general mutation
+RF3 whole-document EXCLUDED replacement uses the native atomic put primitive
+and preserves its exact affected-row and retry semantics. Global-index conflict
+maintenance, column DO UPDATE, RETURNING, general mutation
 predicates, and explicit transaction parity still need implementation. The
 bounded coordinator read path also still needs full RF3 global-index read
 integration. These are release gates for the requested distributed parity,
