@@ -1,46 +1,47 @@
-# Operations
+# Operator guide
 
-> [!CAUTION]
-> These are development and qualification procedures for one exact build, not
-> production runbooks. Commands, wire protocols, and disk state may break at
-> any commit. There is no supported upgrade path, SLO, or production topology;
-> use only disposable or recoverable data.
+[Documentation](../README.md) / Operations
 
-## Embedded data
+Start and inspect a development cluster, preserve its data, and recover from
+an interrupted operation. These procedures use one exact build. Cross-build
+upgrades and a production deployment lifecycle are not supported; see
+[stability and compatibility](../status.md).
 
-| Task | Guide |
-| --- | --- |
-| Choose acknowledgement and recovery semantics | [Durability](../durability.md) |
-| Inspect an offline store or database | [Verify, salvage, and repack](verification.md) |
-| Understand the files you must preserve | [On-disk format](../format.md) |
+## Start and observe
 
-Stop and close writers before copying data. Primary files, recovery journals,
-transaction logs, catalogs, and keys form one recovery unit. Writer locks do
-not make a live raw-file copy coherent.
+| Task | Procedure | Success looks like |
+| --- | --- | --- |
+| Run RF3 locally | [Local cluster](local-cluster.md) | Readiness line, successful SQL write and read, then same-build reopen. |
+| Inspect activity | [Observability](observability.md) | Identified samples with usable coverage and understood counter scope. |
+| Investigate a failure | [Troubleshooting](troubleshooting.md) | The failed phase and exact affected identities are known before recovery. |
+| Test Kubernetes restart | [Kind qualification](kubernetes.md) | The prescribed probes and evidence checks complete. |
 
-## Distributed development
+The local launcher defaults to three physical serving nodes. Each combines a
+SQL frontend with Raft and storage. The Kind helper has its own fixed test
+topology; `vibedb-operator` renders and prepares manifests rather than running
+a reconciliation controller.
 
-| Task | Guide |
-| --- | --- |
-| Start disposable RF3 locally | [Local cluster](local-cluster.md) |
-| Understand serving, failure, and retry behavior | [Distributed runtime](distributed.md) |
-| Collect and restore a certified group vector | [Backup and restore](backup-restore.md) |
-| Exercise one exact schema successor | [Schema rollouts](schema-rollouts.md) |
-| Read bounded metrics and evidence | [Observability](observability.md) |
-| Run the Kind RF3 lane | [Kubernetes qualification](kubernetes.md) |
+## Preserve and maintain data
 
-The checked-in commands expose real replication and recovery primitives, but
-they do not supply production PKI, discovery, live-capacity integration,
-upgrade orchestration, automated repair, or a general operator control plane.
+| Task | Procedure | Input required |
+| --- | --- | --- |
+| Copy an embedded database | [Embedded backup](embedded-backup.md) | Complete directory after a successful close. |
+| Check or rebuild a local store | [Verify, salvage, and repack](verification.md) | Quiescent source or complete quiescent copy. |
+| Export a running RF3 cluster | [Backup and restore](backup-restore.md) | Authenticated catalog and replica controls; configured backup repository. |
+| Install a schema successor | [Schema rollouts](schema-rollouts.md) | Sealed successor catalog and replica-local bundles. |
 
-## Before any destructive operation
+For distributed operations, retain the operation ID, canonical request, plan,
+and returned proof. After an ambiguous response, resolve the same operation
+before creating another one. A missing response does not establish rollback.
 
-1. Confirm the exact commit and build identity on every participant.
-2. Resolve exact file, group, allocation, catalog, and operation identities.
-3. Preserve the complete original state in a separate trusted location.
-4. Use a quiescent source unless the protocol explicitly certifies a live cut.
-5. Treat a lost response after send as potentially committed.
-6. Verify the resulting state before replacing the original.
+## Prepare a recovery change
 
-Use the [CLI reference](../reference/cli.md) for command syntax and
-[current status](../status.md) for known defects.
+1. Record the commit, build identities, and affected group or file paths.
+2. Preserve the complete original recovery state, including journals and keys.
+3. Choose the procedure for the failed layer. A file repair cannot grant Raft
+   membership or serving authority.
+4. Verify the result at an isolated destination before directing traffic to it.
+
+The [distributed design](distributed.md) explains quorum and retry semantics.
+Use [CLI](../reference/cli.md), [limits](../reference/limits.md), and
+[protocols](../reference/protocols.md) for exact flags and messages.

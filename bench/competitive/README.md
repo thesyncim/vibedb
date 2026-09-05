@@ -7,9 +7,10 @@
 
 ## Current result status
 
-**No competitive result is published.** [RESULTS.md](RESULTS.md) contains no
-performance, cost, storage, or scaling number. A green test, a generated coverage
-cell, or a CI artifact is not a result.
+[RESULTS.md](RESULTS.md) has no endorsed publication entries. Dated engineering
+measurements live in the [benchmark archive](../../docs/benchmarks/README.md).
+A green harness test or generated coverage cell records support for a workload,
+not a measured result.
 
 The standalone evidence scripts default to `GOEXPERIMENT=simd`, and record the
 selected experiment and amd64 level in their metadata. Set

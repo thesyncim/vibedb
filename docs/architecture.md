@@ -1,9 +1,6 @@
 # Architecture
 
-> [!CAUTION]
-> This is the architecture of one unreleased commit. APIs, commands, protocols,
-> and persisted representations may change without migration. Use the docs and
-> binary from one exact commit and only disposable or recoverable data.
+[Documentation](README.md) / [Design](design/README.md) · [Development status](status.md)
 
 VibeDB is an embedded database first. SQL and distributed execution reuse the
 same collection and publication machinery; they are not separate storage
@@ -13,34 +10,52 @@ engines.
 
 ```mermaid
 flowchart TB
-    APP[Go application] --> F[vibedb facade]
-    APP --> DS[database/sql]
-    CLIENT[PostgreSQL v3 client] --> PG[pgwire adapter]
-    DS --> SQL[SQL parser + driver runtime]
-    PG --> SQL
-    F --> Q[typed query engine]
-    SQL --> Q
-    F --> H[heap store source model]
-    Q --> H
-    F --> D[durable collection/database]
-    Q --> D
-    SQL --> D
-    D --> IO[storeio pages, journal, locks, barriers]
-
-    GCLIENT[development client] --> GW[gateway]
-    GW --> CAT[immutable catalog generation]
-    GW --> SH[static shard service]
-    GW --> RF[RF3 service]
-    RF --> MR[Multi-Raft owner/runtime]
-    MR --> WAL[authenticated Raft WAL]
-    MR --> RS[replicated state apply]
-    RS --> D
+    App[Go application] --> Native[Native API]
+    App --> Driver[database/sql driver]
+    Client[PostgreSQL client] --> Frontend[pgwire frontend]
+    Native --> Query[Query execution]
+    Driver --> Query
+    Frontend --> Coordinator[SQL coordinator]
+    Coordinator --> Query
+    Native --> Storage[Durable collections]
+    Query --> Storage
+    Storage --> Files[Pages and recovery journals]
 ```
 
-The primary ownership boundary is visible in the arrows: a higher layer owns a
-lower handle and must release it before its backing state. Borrowed bytes,
-snapshots, query results, sessions, and network reservations have explicit
-lifetimes.
+The native facade owns the database lifecycle. The SQL driver adds a catalog,
+table schemas, and SQL transactions. The query engine executes against pinned
+sources from the heap or durable store; the heap store also serves as a
+reference model. Read [storage engines](store.md) before owning those lower
+handles directly.
+
+In distributed mode, a physical node combines a frontend/coordinator, a set
+of Raft group replicas, and shared storage scheduling:
+
+```mermaid
+flowchart LR
+    Client[SQL client] --> Frontend
+    subgraph Node[One physical node]
+        Frontend[Frontend and coordinator] --> Dispatch[Authenticated dispatch]
+        Dispatch --> Local[Local replica owners]
+        Local --> Groups[Independent Raft groups]
+        Groups --> Sequencer[Node submission sequencer]
+        Sequencer --> Log[Shared node log]
+        Groups --> Apply[Replicated apply]
+        Apply --> Collections[Durable collections]
+    end
+    Dispatch --> Remote[Remote node transport]
+    Groups <--> Peers[Raft peers]
+```
+
+Local dispatch avoids a socket and wire encoding while retaining identity,
+authorization, bounds, and serving checks. Remote requests use authenticated
+transport. The local launcher defaults to three physical serving nodes, with
+RF3 replicas placed across them; six-node placement is also available.
+Physical-node count, Raft-group count, and replication factor are separate
+quantities. See the [local cluster guide](operations/local-cluster.md).
+
+Each owner retains its handles until dependent work is released. This applies
+to borrowed bytes, snapshots, query results, sessions, and network reservations.
 
 ## Embedded write path
 
@@ -98,34 +113,36 @@ release rule.
 
 ## Distributed path
 
-A gateway operation pins one immutable catalog generation for routing,
-endpoints, table metadata, and RF3 identities. It authenticates and admits the
-request before dispatch. There is no HTTP API.
+A coordinator pins one immutable catalog generation for routing, endpoints,
+table metadata, and RF3 identities. It admits and authenticates the request
+before dispatching to a local owner or remote node.
 
-```mermaid
-flowchart LR
-    C[pgwire or native request] --> A[authenticate + admit]
-    A --> P[pin catalog generation]
-    P --> R{route}
-    R -->|static| S[first configured shard endpoint]
-    R -->|RF3 read| RI[leader ReadIndex or applied-floor follower]
-    R -->|durable RF3 write| L[request ledger + sealed recipe]
-    L --> W[participant waves]
-    W --> T[terminal proof + explicit ACK]
-    S --> M[bounded all-or-nothing merge]
-    RI --> M
-```
+A read obtains a group-local cut: leader reads use quorum-backed ReadIndex;
+explicit follower reads wait for the requested applied floor. Cross-group
+results combine independent group cuts and do not provide a global timestamp.
 
-Static mode is a development routing lane without Raft failover. RF3 groups use
-leader election, a durable authenticated WAL, deterministic replicated apply,
-and exact serving fences. Cross-group observations are a vector of independent
-group cuts, not one global timestamp.
+Writes use the domain appropriate to the operation. Eligible single-participant
+SQL writes retain their request result in the data group. Coordinated writes
+use the request ledger and participant protocol. Each domain has its own
+identity and sequencing rules; after an uncertain response, recovery must use
+the original identity. [Distributed write domains](distributed-write-lane-proposal.md)
+records the protocol and its introduction.
 
-The generic Raft kernel is not inherently RF3. RF3 is a higher-level placement
-and membership policy. Ordinary Raft `MsgSnap` is refused; snapshots move
-through a separate certified, non-serving artifact pipeline. Replica
-replacement uses sequential membership changes and an RF4 intermediate, not
-joint consensus.
+RF3 is a placement and membership policy above the generic Raft kernel.
+Ordinary Raft `MsgSnap` is refused; snapshots move through a separate certified,
+non-serving artifact pipeline. Replica replacement uses sequential membership
+changes and an RF4 intermediate. The detailed [distributed design](operations/distributed.md)
+covers fences, recovery, and failure cases.
+
+## Why these boundaries exist
+
+| Choice | Benefit | Cost or constraint |
+| --- | --- | --- |
+| Immutable published generations | Readers retain a coherent view while writers prepare a successor. | Long-held views retain resources and must be released. |
+| Exact index candidates with document rechecks | Index acceleration preserves the document comparison rules. | Index maintenance and rechecks still consume work. |
+| Bounded query workspaces | Admission and allocation have explicit limits. | A query can fall back or fail when a required operator cannot fit. |
+| Shared physical-node persistence | Independent groups can share append and checkpoint scheduling. | Group identities, ordering, and acknowledgement fences must remain independent. |
+| Co-located frontend and storage | Local requests can avoid transport work. | Remote routing and quorum coordination still apply. |
 
 ## Security boundaries
 
@@ -158,9 +175,11 @@ files.
 
 ## Source map
 
-- `vibedb.go`, `vibedb_txn.go`, and `vibedb_query.go`
-- `store/engine.go`, `store/store_database_txn.go`, `store/durable/`
-- `query/`, `sql/`, `sql/driver/`, and `pgwire/`
-- `gateway/catalog.go`, `gateway/executor.go`, and `gateway/replicated_*`
-- `internal/raftservice`, `multiraft`, `raftmember`, `raftmodel`, `raftstore`
-- `internal/replicatedstate` and `replication`
+| Area | Implementation and tests |
+| --- | --- |
+| Native ownership and transactions | [Facade](../vibedb.go), [transactions](../vibedb_txn.go), [snapshot regressions](../vibedb_txn_snapshot_internal_test.go) |
+| Query and optimizer | [Query package](../query/), [planner](../planner/), [execution guide](design/query-execution.md) |
+| Physical-node provisioning | [Placement](../cmd/vibedb/cluster_dev_physical.go), [composition tests](../cmd/vibedb/cluster_dev_physical_test.go) |
+| Embedded frontend | [serve-node](../cmd/vibedb-shard/serve_node.go), [gateway runtime](../internal/gatewayruntime/) |
+| Consensus and persistence | [Replica ownership](../internal/raftmember/), [Multi-Raft](../internal/multiraft/), [node log](../internal/raftstore/) |
+| Storage and apply | [Durable store](../store/durable/), [replicated state](../internal/replicatedstate/) |

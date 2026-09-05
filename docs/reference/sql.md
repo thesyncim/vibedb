@@ -1,10 +1,6 @@
 # SQL reference
 
-> [!CAUTION]
-> Unreleased development software: this describes one commit, not a stable
-> dialect. Grammar, catalog encoding, semantics, limits, and protocol mappings
-> may break on any commit. Older development catalogs are not migration-
-> compatible unless explicitly stated otherwise.
+[Documentation](../README.md) / [Reference](README.md) · [Development status](../status.md)
 
 This is the executable surface shared by the native driver and pgwire. The
 parser can represent a few forms an execution adapter rejects; those are called
@@ -13,7 +9,7 @@ out below. PostgreSQL syntax not listed here is unsupported.
 ## Lexical rules
 
 | Rule | Behavior |
-|---|---|
+| --- | --- |
 | Keywords | Case-insensitive |
 | Identifiers | Case-sensitive; double quotes preserve otherwise reserved text |
 | Strings | Single-quoted |
@@ -40,7 +36,7 @@ parameters are not part of the SQL parser.
 ## Statement summary
 
 | Family | Implemented statements |
-|---|---|
+| --- | --- |
 | Query | SELECT, VALUES, TABLE, UNION, INTERSECT, EXCEPT, EXPLAIN `[ANALYZE]` query |
 | DML | INSERT, UPDATE, DELETE; optional RETURNING |
 | Tables | CREATE TABLE, ALTER TABLE ADD COLUMN, DROP TABLE, TRUNCATE |
@@ -70,7 +66,7 @@ other than one; a parser-only columnless declaration is not executable.
 Type spellings are grouped as follows:
 
 | Logical family | Accepted spellings |
-|---|---|
+| --- | --- |
 | Null | NULL |
 | Boolean | BOOL, BOOLEAN |
 | Exact/general number | NUMBER, DECIMAL, NUMERIC, FLOAT, REAL, DOUBLE |
@@ -245,7 +241,7 @@ is not supported. CASE is lazy and bounded to 1,024 WHEN arms.
 Aggregates behave as follows:
 
 | Aggregate | Behavior |
-|---|---|
+| --- | --- |
 | `COUNT(*)` | Counts rows |
 | `COUNT(path)` | Counts present, non-null values |
 | SUM/AVG/MIN/MAX | Consume numeric values, skip null/nonnumeric, null on empty input |
@@ -284,7 +280,7 @@ LEFT JOIN orders AS o
 ```
 
 | Join | Supported |
-|---|---|
+| --- | --- |
 | INNER / bare JOIN | Yes |
 | LEFT / RIGHT / FULL `[OUTER]` | Yes |
 | CROSS or comma | Yes |
@@ -374,7 +370,7 @@ ROLLBACK TO restores and retains the named savepoint and drops newer ones.
 ## Current limits
 
 | Boundary | Limit/default |
-|---|---:|
+| --- | ---: |
 | SQL source | 16 MiB |
 | Parameters, native parser | 65,536 |
 | Parameters, pgwire | 32,767 |
@@ -396,9 +392,9 @@ triggers, policies, sequences, materialized views, and replication are outside t
 
 ## Source map
 
-- Parser and expressions: `sql/parser.go:19-76`, `sql/lexer.go:155-300`, `sql/scalar_parse.go:90-770`, `sql/predicate.go:503-745`
-- SELECT and relations: `sql/parser.go:962-1209`, `sql/parser.go:2105-2455`, `sql/resolve.go:450-735`
-- CTE/set/window: `sql/parse_cte.go:5-135`, `sql/recursive_cte.go:25-220`, `sql/set.go:314-873`, `sql/parser.go:1320-1954`
-- DML and RF3 images: `sql/parse_dml.go:224-674`, `sql/driver/write.go:1095-1504`, `gateway/replicated_sql_transaction.go:128-565`
-- DDL/views: `sql/parse_ddl.go:5-566`, `sql/parse_drop.go:31-187`, `sql/parse_view.go:5-118`
-- Runtime transactions: `sql/driver/tx.go:89-258`, `sql/driver/savepoint.go:7-190`
+- Parser and expressions: [sql/parser.go](../../sql/parser.go), [sql/lexer.go](../../sql/lexer.go), [sql/scalar_parse.go](../../sql/scalar_parse.go), [sql/predicate.go](../../sql/predicate.go)
+- SELECT and relations: [sql/parser.go](../../sql/parser.go), [sql/parser.go](../../sql/parser.go), [sql/resolve.go](../../sql/resolve.go)
+- CTE/set/window: [sql/parse_cte.go](../../sql/parse_cte.go), [sql/recursive_cte.go](../../sql/recursive_cte.go), [sql/set.go](../../sql/set.go), [sql/parser.go](../../sql/parser.go)
+- DML and RF3 images: [sql/parse_dml.go](../../sql/parse_dml.go), [sql/driver/write.go](../../sql/driver/write.go), [gateway/replicated_sql_transaction.go](../../gateway/replicated_sql_transaction.go)
+- DDL/views: [sql/parse_ddl.go](../../sql/parse_ddl.go), [sql/parse_drop.go](../../sql/parse_drop.go), [sql/parse_view.go](../../sql/parse_view.go)
+- Runtime transactions: [sql/driver/tx.go](../../sql/driver/tx.go), [sql/driver/savepoint.go](../../sql/driver/savepoint.go)

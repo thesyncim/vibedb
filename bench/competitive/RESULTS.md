@@ -4,12 +4,16 @@
 > any commit. Never carry a result forward to a different revision without a new
 > run and review.
 
-## Status: no published results
+## Registry status: no endorsed entries
 
 **There are currently zero endorsed competitive results.**
 
-This repository does not contain a performance, cost, storage, capacity, or
-scaling number backed by a linked immutable evidence bundle. In particular:
+This registry has no admitted publication bundle. The repository separately
+retains [dated engineering benchmark reports](../../docs/benchmarks/README.md),
+including measurements with raw evidence. Those reports are scoped to their
+own methods and have not been admitted through this registry's contract.
+
+For this harness:
 
 - the generated 38-cell coverage reference records harness source shapes, not
   measurements;

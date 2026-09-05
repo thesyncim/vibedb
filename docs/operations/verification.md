@@ -1,9 +1,6 @@
 # Verify, salvage, and repack
 
-> [!CAUTION]
-> vibedb is unreleased development software. Any commit may break the Go API,
-> wire protocols, or disk format. Pin one exact commit, use the same build to
-> reopen its data, and do not use vibedb as the only copy of irreplaceable data.
+[Documentation](../README.md) / [Operations](README.md) · [Development status](../status.md)
 
 This page covers offline inspection and repair of the `store/durable` file
 format. It does not turn the development format into a compatibility promise.
@@ -18,7 +15,9 @@ format. It does not turn the development format into a compatibility promise.
 | Reclaim space and restore scan locality | `repack` | Cleanly closed store file | New clustered store file |
 | Reclaim space while serving | `(*durable.Collection).CompactOnline` | Open collection | Same-file replacement generation |
 
-The command never modifies its input:
+`verify` and `salvage` read the source. **`repack` opens its source read/write
+and can apply pending recovery rollback.** Run repack against a complete
+quiescent copy when the original must remain unchanged:
 
 ```text
 vibedb-verify verify  <store-file|database-dir>
@@ -35,7 +34,7 @@ that does not exist. Never point either command at the source path.
 materialization rollback that ordinary open may apply. A concurrent writer can
 retire and reuse an extent while the verifier reads it.
 
-Use one of these cuts:
+Prepare the input in this order:
 
 1. Stop writes and close the collection or database successfully.
 2. Copy the complete, closed database directory to a separate location.
@@ -173,11 +172,11 @@ in tests qualify their fixtures and hosts; they are not production SLAs.
 
 ## Source map
 
-- `cmd/vibedb-verify/main.go` — CLI grammar, exit status, directory checks
-- `cmd/vibedb-verify/main_test.go` — output and failure behavior
-- `store/durable/store_file_verify.go` — verify and salvage contracts
-- `store/durable/store_file_verify_test.go` — corruption and salvage cases
-- `store/durable/store_file_repack.go` — offline repack paths
-- `store/durable/store_file_repack_test.go` — capability preservation
-- `store/durable/store_file_online_compact.go` — live compaction lifecycle
-- `store/durable/store_file_online_compact_test.go` — indexes and value modes
+- [cmd/vibedb-verify/main.go](../../cmd/vibedb-verify/main.go) — CLI grammar, exit status, directory checks
+- [cmd/vibedb-verify/main_test.go](../../cmd/vibedb-verify/main_test.go) — output and failure behavior
+- [store/durable/store_file_verify.go](../../store/durable/store_file_verify.go) — verify and salvage contracts
+- [store/durable/store_file_verify_test.go](../../store/durable/store_file_verify_test.go) — corruption and salvage cases
+- [store/durable/store_file_repack.go](../../store/durable/store_file_repack.go) — offline repack paths
+- [store/durable/store_file_repack_test.go](../../store/durable/store_file_repack_test.go) — capability preservation
+- [store/durable/store_file_online_compact.go](../../store/durable/store_file_online_compact.go) — live compaction lifecycle
+- [store/durable/store_file_online_compact_test.go](../../store/durable/store_file_online_compact_test.go) — indexes and value modes

@@ -1,5 +1,7 @@
 # SIMD in compressed equality, ordered counts, and extrema
 
+[Documentation](README.md) / [Design](design/README.md) · [Development status](status.md)
+
 Development implementation: Go 1.27 SIMD can evaluate equality and integer
 ordering directly over packed column values, and reduce integer `MIN`/`MAX`
 over eligible FOR streams. A durable unindexed `COUNT(*) WHERE field = value`
@@ -112,21 +114,21 @@ architecture, fixtures, and exact revision pairs.
 
 ## Source map
 
-- `internal/storeio/compact_stream_codec.go`: packed counters and exact stream comparisons.
-- `internal/storeio/compact_stream_codec_simd_arm64.go`: guarded vector loads, width-specific unpacking, and bounded reductions.
-- `internal/storeio/compact_stream_codec_simd_amd64.go`: guarded AVX2 loads, width-specific unpacking, and bounded reductions.
-- `internal/storeio/compact_stream_codec_simd_extrema.go`: extrema front end and scalar packed reductions.
-- `internal/storeio/compact_stream_codec_simd_extrema_arm64.go`: ARM64 extrema kernels kept after the pre-existing packed kernels.
-- `internal/storeio/compact_stream_codec_simd_extrema_amd64.go`: AMD64 extrema reductions and kernels kept after the pre-existing packed kernels.
-- `scripts/bench/run-packed-extrema-avx2.sh`: same-binary AMD64 AVX2 enabled/disabled extrema speed qualification with a paired median gate.
-- `internal/storeio/compact_stream_codec_dispatch_scalar.go`: portable dispatch.
-- `internal/storeio/compact_primary_stripe.go`: compressed stripe count operations.
-- `internal/storeio/primary_graph_unified_filter.go`: durable packed equality, ordered count, and extrema integration.
-- `internal/storeio/compact_stream_codec_packed_extrema_test.go`: packed extrema oracle, safety, and dispatch tests.
-- `query/file_packed_extrema_test.go`: durable extrema correctness and fallback tests.
-- `query/file_packed_extrema_bench_test.go`: FOR10/FOR16 durable extrema benchmark fixtures.
-- `query/file_packed_order_bench_test.go`: durable ordered COUNT fixtures and benchmarks.
-- `internal/storeio/compact_stream_codec_packed_order_test.go`: ordered packed-counter oracle and dispatch tests.
-- `internal/storeio/compact_stream_codec_test.go`: all-width and exact-number oracles.
-- `.github/workflows/packed-simd.yml`: paired native base/candidate evidence lane.
-- `.github/workflows/ci.yml`: SIMD and portable parity on ARM64 and AMD64.
+- [internal/storeio/compact_stream_codec.go](../internal/storeio/compact_stream_codec.go): packed counters and exact stream comparisons.
+- [internal/storeio/compact_stream_codec_simd_arm64.go](../internal/storeio/compact_stream_codec_simd_arm64.go): guarded vector loads, width-specific unpacking, and bounded reductions.
+- [internal/storeio/compact_stream_codec_simd_amd64.go](../internal/storeio/compact_stream_codec_simd_amd64.go): guarded AVX2 loads, width-specific unpacking, and bounded reductions.
+- [internal/storeio/compact_stream_codec_simd_extrema.go](../internal/storeio/compact_stream_codec_simd_extrema.go): extrema front end and scalar packed reductions.
+- [internal/storeio/compact_stream_codec_simd_extrema_arm64.go](../internal/storeio/compact_stream_codec_simd_extrema_arm64.go): ARM64 extrema kernels kept after the pre-existing packed kernels.
+- [internal/storeio/compact_stream_codec_simd_extrema_amd64.go](../internal/storeio/compact_stream_codec_simd_extrema_amd64.go): AMD64 extrema reductions and kernels kept after the pre-existing packed kernels.
+- [scripts/bench/run-packed-extrema-avx2.sh](../scripts/bench/run-packed-extrema-avx2.sh): same-binary AMD64 AVX2 enabled/disabled extrema speed qualification with a paired median gate.
+- [internal/storeio/compact_stream_codec_dispatch_scalar.go](../internal/storeio/compact_stream_codec_dispatch_scalar.go): portable dispatch.
+- [internal/storeio/compact_primary_stripe.go](../internal/storeio/compact_primary_stripe.go): compressed stripe count operations.
+- [internal/storeio/primary_graph_unified_filter.go](../internal/storeio/primary_graph_unified_filter.go): durable packed equality, ordered count, and extrema integration.
+- [internal/storeio/compact_stream_codec_packed_extrema_test.go](../internal/storeio/compact_stream_codec_packed_extrema_test.go): packed extrema oracle, safety, and dispatch tests.
+- [query/file_packed_extrema_test.go](../query/file_packed_extrema_test.go): durable extrema correctness and fallback tests.
+- [query/file_packed_extrema_bench_test.go](../query/file_packed_extrema_bench_test.go): FOR10/FOR16 durable extrema benchmark fixtures.
+- [query/file_packed_order_bench_test.go](../query/file_packed_order_bench_test.go): durable ordered COUNT fixtures and benchmarks.
+- [internal/storeio/compact_stream_codec_packed_order_test.go](../internal/storeio/compact_stream_codec_packed_order_test.go): ordered packed-counter oracle and dispatch tests.
+- [internal/storeio/compact_stream_codec_test.go](../internal/storeio/compact_stream_codec_test.go): all-width and exact-number oracles.
+- [.github/workflows/packed-simd.yml](../.github/workflows/packed-simd.yml): paired native base/candidate evidence lane.
+- [.github/workflows/ci.yml](../.github/workflows/ci.yml): SIMD and portable parity on ARM64 and AMD64.

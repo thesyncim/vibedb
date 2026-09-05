@@ -1,5 +1,7 @@
 # RF3 external fault qualification
 
+[Performance guide](../../docs/performance.md)
+
 > **Development status:** This is a checked-in development qualification harness,
 > not a production fault-injection service or a stable release contract. RF3
 > behavior, limits, report schema, and commands can change or break at any commit.

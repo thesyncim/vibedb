@@ -1,10 +1,6 @@
 # Defaults and limits
 
-> [!CAUTION]
-> **Unreleased and unstable.** These values describe the current source tree,
-> not public compatibility contracts, capacity guarantees, SLOs, or SLAs. Any
-> default or hard limit may change at any commit. Pin one exact build and verify
-> the effective configuration of every process.
+[Documentation](../README.md) / [Reference](README.md) · [Development status](../status.md)
 
 This page is a curated operating reference. It names bounds that commonly
 explain admission failures or memory/disk planning; it is not an inventory of
@@ -79,7 +75,7 @@ returns a typed resource error rather than truncating an exact result.
 | retained prepared input / bind input / portal data | 16 MiB each per session account | hard | pgwire, `pgwire/proto.go` |
 | standalone pgwire connections | 128 | zero-value default | pgwire, `pgwire/server.go` |
 | standalone pgwire result | 100,000 rows; 64 MiB | zero default; explicit `-1` opt-out | pgwire, `pgwire/server.go` |
-| gateway development pgwire | 16 connections; 100,000 rows; 4 MiB result | fixed command configuration | `cmd/vibedb-gateway/pgwire.go` |
+| gateway development pgwire | 16 connections; 100,000 rows; 4 MiB result | fixed command configuration | `internal/gatewayruntime/pgwire.go` |
 
 The 16 MiB message bound does not imply that every 16 MiB query or result is
 executable. Parser structure, session-retention, query workspace, RF3, and
@@ -95,7 +91,7 @@ result budgets can reject it earlier.
 | targeted shards | 64 | nonpositive-value default | routing, `distribution/policy.go` |
 | shards changed by one manifest replacement | 64 | hard | routing, `distribution/manifest.go` |
 | gateway catalog file | 16 MiB | hard | catalog, `gateway/catalog.go` |
-| gateway NDJSON request line | 1 MiB | hard | gateway ingress, `cmd/vibedb-gateway/serve.go` |
+| gateway NDJSON request line | 1 MiB | hard | gateway ingress, `internal/gatewayruntime/serve.go` |
 | gateway decoded parameters | 65,536 | hard | gateway ingress, `serve_request_wire.go` |
 | gateway decode metadata account | 8 MiB | hard, also constrained by 1 MiB line | gateway ingress, `serve_request_wire.go` |
 
@@ -190,10 +186,10 @@ compatibility decoders.
 
 | Layer | Primary source families |
 | --- | --- |
-| facade and transactions | `vibedb.go`, `vibedb_txn.go`, `store/engine.go` |
+| facade and transactions | [vibedb.go](../../vibedb.go), [vibedb_txn.go](../../vibedb_txn.go), [store/engine.go](../../store/engine.go) |
 | query budgets | `query/*budget.go`, `relation_runtime.go`, `recursive_fixpoint.go`, `set_tree.go` |
-| SQL and pgwire | `sql/parser.go`, `sql/driver/`, `pgwire/proto.go`, `pgwire/server.go` |
-| routing and gateway | `distribution/bucket.go`, `policy.go`, `gateway/profile.go`, `gateway/replicated_*` |
-| shard and RF3 service | `shardservice/server.go`, `replicated_server.go`, `replicated_query.go` |
-| distributed records and exchange | `internal/replication/`, `distributedtxn/`, `exchange/` |
-| durable formats | `store/durable/store_file_options.go`, `internal/storeio/`, `internal/raftstore/types.go` |
+| SQL and pgwire | [sql/parser.go](../../sql/parser.go), [sql/driver/](../../sql/driver), [pgwire/proto.go](../../pgwire/proto.go), [pgwire/server.go](../../pgwire/server.go) |
+| routing and gateway | [distribution/bucket.go](../../distribution/bucket.go), `policy.go`, [gateway/profile.go](../../gateway/profile.go), `gateway/replicated_*` |
+| shard and RF3 service | [shardservice/server.go](../../shardservice/server.go), `replicated_server.go`, `replicated_query.go` |
+| distributed records and exchange | [internal/replication/](../../internal/replication), `distributedtxn/`, `exchange/` |
+| durable formats | [store/durable/store_file_options.go](../../store/durable/store_file_options.go), [internal/storeio/](../../internal/storeio), [internal/raftstore/types.go](../../internal/raftstore/types.go) |

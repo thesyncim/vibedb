@@ -1,22 +1,26 @@
 # Fused physical-node runtime: structural implementation contract
 
-Planned by Sol with max reasoning at the user's explicit request. Implement
-with Luna max, then independently review and fix with Sol max. Base is main
+[Documentation](README.md) / [Research records](design/research.md)
+
+**Record scope:** This page retains a dated proposal or investigation. Its
+revision-specific findings and future work are not the current operating guide.
+See [architecture](architecture.md) and [operations](operations/README.md).
+
+The original implementation baseline is
 `fff5d6892e27db30f919c3ff7081b291cf71e4a1`; the inconclusive query experiment
 `d1756055` and its evidence `97200d59` stay on their separate branch.
 
-At the user's subsequent request, main `0128e794` was merged cleanly at
-`22bd378b` before any tranche measurement. It adds lazy collection transaction
+Main `0128e794` was merged cleanly at `22bd378b` before tranche measurement. It adds lazy collection transaction
 cuts, shared conflict-clock validation, parallel disjoint collection commits
 and zero-copy transaction puts. Both parent and candidate retain these upstream
 changes; the corrected comparison baseline is recorded below.
-Sol max review then reproduced and fixed fractured read-only cuts, missing
+Independent review then reproduced and fixed fractured read-only cuts, missing
 validation for no-write transactions, and permanent handles created by rejected
 collection names. Five regression tests fail on `0128e794` and pass with the
 fix; the full root race suite passes. The reviewed fix is on main at
 `37a171521459199b8cea9fe5f3ad50ce0b325597`. The active branch includes it at merge
-`f3281140`. At the next requested refresh, main `ea8dfc0f` added striped conflict
-tracking, smaller commit allocations, and cached collection handles. Sol review
+`f3281140`. A later baseline refresh from main `ea8dfc0f` added striped conflict
+tracking, smaller commit allocations, and cached collection handles. Independent review
 then reproduced and fixed lost conflict history during quiescence/overflow,
 stale pruning boundaries, counter exhaustion, and retained finished handles.
 The corrected main and final comparison parent is

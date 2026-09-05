@@ -1,10 +1,6 @@
 # Back up and restore RF3 data
 
-> [!CAUTION]
-> This is a development-only, same-build recovery workflow. Commands, manifests,
-> disk grammar, wire grammar, and authorization rules can change or break at any
-> commit. It is not a production backup service, upgrade path, certificate
-> provisioner, or disaster-recovery guarantee.
+[Documentation](../README.md) / [Operations](README.md) · [Development status](../status.md)
 
 ## Contract at a glance
 
@@ -223,8 +219,8 @@ session identities to force progress.
 | Linearizable export and double scan | [`internal/clusterbackupservice/service.go`](../../internal/clusterbackupservice/service.go), [`internal/clusterbackup/source_export.go`](../../internal/clusterbackup/source_export.go) |
 | Certificate-last repository and crash recovery | [`internal/clusterbackup/repository.go`](../../internal/clusterbackup/repository.go), [`internal/clusterbackup/live_collect.go`](../../internal/clusterbackup/live_collect.go) |
 | Replicated backup lifecycle and resume | [`gateway/backup_operation.go`](../../gateway/backup_operation.go), [`gateway/backup_repository_coordinator.go`](../../gateway/backup_repository_coordinator.go) |
-| Gateway request grammar and runtime | [`cmd/vibedb-gateway/serve_backup.go`](../../cmd/vibedb-gateway/serve_backup.go), [`cmd/vibedb-gateway/backup_operator.go`](../../cmd/vibedb-gateway/backup_operator.go) |
+| Gateway request grammar and runtime | [`internal/gatewayruntime/serve_backup.go`](../../internal/gatewayruntime/serve_backup.go), [`internal/gatewayruntime/backup_operator.go`](../../internal/gatewayruntime/backup_operator.go) |
 | Non-serving restore admission | [`internal/clusterbackup/restore.go`](../../internal/clusterbackup/restore.go), [`internal/clusterbackup/staging_root.go`](../../internal/clusterbackup/staging_root.go) |
 | Fresh target operation and root installation | [`internal/clusterrestore/operation.go`](../../internal/clusterrestore/operation.go), [`internal/restoreservice/installer.go`](../../internal/restoreservice/installer.go) |
 | Catalog observation and serving grants | [`internal/clusterrestore/controller.go`](../../internal/clusterrestore/controller.go), [`internal/clusterrestore/serving.go`](../../internal/clusterrestore/serving.go), [`internal/clusterrestore/serving_grant.go`](../../internal/clusterrestore/serving_grant.go) |
-| Activation/adoption manifests | [`cmd/vibedb-gateway/restore_activate_manifest.go`](../../cmd/vibedb-gateway/restore_activate_manifest.go), [`cmd/vibedb-shard/adopt_restored_rf3.go`](../../cmd/vibedb-shard/adopt_restored_rf3.go) |
+| Activation/adoption manifests | [`internal/gatewayruntime/restore_activate_manifest.go`](../../internal/gatewayruntime/restore_activate_manifest.go), [`cmd/vibedb-shard/adopt_restored_rf3.go`](../../cmd/vibedb-shard/adopt_restored_rf3.go) |

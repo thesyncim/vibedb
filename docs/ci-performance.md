@@ -1,5 +1,11 @@
 # CI performance
 
+[Documentation](README.md) / [Research records](design/research.md)
+
+**Record scope:** This page retains a dated proposal or investigation. Its
+revision-specific findings and future work are not the current operating guide.
+See [architecture](architecture.md) and [operations](operations/README.md).
+
 The original target was a 5x reduction from the 27m40s historical passing
 run, or 5m32s end to end. The later same-source-era target was a 2x reduction
 from 11m08s, or 5m34s. The implementation uses Go's native caches, bounded

@@ -1,5 +1,7 @@
 # Allocation regression gate
 
+[Performance guide](../../docs/performance.md)
+
 > **Development status:** The curated benchmark set and thresholds are internal
 > development policy. They can change at any commit and are not a stable public
 > performance contract.

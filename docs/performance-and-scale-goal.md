@@ -1,9 +1,14 @@
 # Active performance and scale goal
 
-User-authorized on 2026-09-04: redesign unreleased VibeDB freely, merge/push
-validated changes, and continue until it is substantially faster than competitors
-while being space efficient, horizontally scalable, and supporting nonblocking
-schema changes. The task's active goal carries this objective across iterations.
+[Documentation](README.md) / [Research records](design/research.md)
+
+**Record scope:** This page retains a dated proposal or investigation. Its
+revision-specific findings and future work are not the current operating guide.
+See [architecture](architecture.md) and [operations](operations/README.md).
+
+Research objective recorded on 2026-09-04: improve comparative performance,
+space efficiency, horizontal scalability, and nonblocking schema changes.
+The acceptance criteria below are targets, not measured product capabilities.
 
 ## Acceptance gates
 

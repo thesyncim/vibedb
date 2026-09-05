@@ -1,10 +1,6 @@
 # Kubernetes RF3 qualification lane
 
-> [!CAUTION]
-> **Development and qualification only.** VibeDB is under active development.
-> The image, generated manifests, credentials, wire and disk formats, and
-> qualification procedure may break at any commit. This is not a production
-> deployment, and green qualification does not establish production readiness.
+[Documentation](../README.md) / [Operations](README.md) · [Development status](../status.md)
 
 This lane creates a disposable four-node Kind cluster—one control plane and three workers—then exercises a fixed RF3 topology across restart. `vibedb-operator` is only a manifest renderer and init helper. It is not a Kubernetes controller or reconciler.
 
@@ -135,11 +131,11 @@ A green job proves that the exact tested revision completed this bounded lane on
 
 | Concern | Source |
 | --- | --- |
-| complete qualification sequence | `deploy/kubernetes/qualify-kind.sh` |
-| Kind node topology and immutable node image | `deploy/kubernetes/kind-3-worker.yaml` |
-| application container | `deploy/kubernetes/Dockerfile` |
-| manifest renderer and bootstrap CLI | `cmd/vibedb-operator/` |
-| generated workloads and security context | `internal/kubeoperator/render.go` |
-| disposable authority generation | `internal/kubeoperator/bootstrap.go` |
-| qualification probes | `cmd/vibedb-kube-qualify/` |
-| CI invocation and artifact retention | `.github/workflows/ci.yml` |
+| complete qualification sequence | [deploy/kubernetes/qualify-kind.sh](../../deploy/kubernetes/qualify-kind.sh) |
+| Kind node topology and immutable node image | [deploy/kubernetes/kind-3-worker.yaml](../../deploy/kubernetes/kind-3-worker.yaml) |
+| application container | [deploy/kubernetes/Dockerfile](../../deploy/kubernetes/Dockerfile) |
+| manifest renderer and bootstrap CLI | [cmd/vibedb-operator/](../../cmd/vibedb-operator) |
+| generated workloads and security context | [internal/kubeoperator/render.go](../../internal/kubeoperator/render.go) |
+| disposable authority generation | [internal/kubeoperator/bootstrap.go](../../internal/kubeoperator/bootstrap.go) |
+| qualification probes | [cmd/vibedb-kube-qualify/](../../cmd/vibedb-kube-qualify) |
+| CI invocation and artifact retention | [.github/workflows/ci.yml](../../.github/workflows/ci.yml) |

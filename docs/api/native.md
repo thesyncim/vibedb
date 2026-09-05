@@ -1,11 +1,6 @@
 # Native Go API
 
-> [!CAUTION]
-> **This is an unreleased development contract.** Any commit may break the Go
-> API, disk format, directory layout, recovery behavior, or error surface. Pin
-> one exact commit, use disposable or independently recoverable data, and
-> reopen data only with the same build. Do not use VibeDB for irreplaceable
-> data.
+[Documentation](../README.md) / [API guides](README.md) · [Development status](../status.md)
 
 Use `github.com/thesyncim/vibedb` when an application wants VibeDB to own an
 embedded database lifecycle. It provides named JSON collections, exact indexes,
@@ -32,6 +27,12 @@ import (
 
 	"github.com/thesyncim/vibedb"
 )
+
+func main() {
+	if err := run(); err != nil {
+		panic(err)
+	}
+}
 
 func run() (err error) {
 	db, err := vibedb.Open("./data")
@@ -110,7 +111,7 @@ Important validation rules:
   zero-option reopen adopts persisted key and document limits.
 - Treat configuration values as immutable after `Open`. The facade freezes
   schema and exact-index definitions, but this development snapshot has a
-  [known shallow-copy defect](../status.md#known-defects-in-this-snapshot) for
+  [known shallow-copy defect](../status.md#known-limitations) for
   `Engine.SkipIndexes` used by later lazy collections.
 
 `Engine` is intentionally an expert escape hatch. In particular, do not enable
@@ -420,10 +421,10 @@ They remain safe to match through `errors.Is`.
 
 ## Source map
 
-- Open, profiles, options, CRUD, indexes, metrics, and lifecycle: `vibedb.go`
-- Query execution and session ownership: `vibedb_query.go`
-- Transactions, limits, conflicts, and commit outcomes: `vibedb_txn.go`
-- Facade contract tests: `vibedb_test.go`, `vibedb_txn_test.go`
-- Serializable conflict tests: `vibedb_txn_serializable_test.go`
-- Close retry and close-race tests: `vibedb_lifecycle_internal_test.go`
-- Executable profile matrix: `capability_matrix_facade_test.go`
+- Open, profiles, options, CRUD, indexes, metrics, and lifecycle: [vibedb.go](../../vibedb.go)
+- Query execution and session ownership: [vibedb_query.go](../../vibedb_query.go)
+- Transactions, limits, conflicts, and commit outcomes: [vibedb_txn.go](../../vibedb_txn.go)
+- Facade contract tests: [vibedb_test.go](../../vibedb_test.go), [vibedb_txn_test.go](../../vibedb_txn_test.go)
+- Serializable conflict tests: [vibedb_txn_serializable_test.go](../../vibedb_txn_serializable_test.go)
+- Close retry and close-race tests: [vibedb_lifecycle_internal_test.go](../../vibedb_lifecycle_internal_test.go)
+- Executable profile matrix: [capability_matrix_facade_test.go](../../capability_matrix_facade_test.go)

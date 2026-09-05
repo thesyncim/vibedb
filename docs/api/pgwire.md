@@ -1,9 +1,6 @@
 # PostgreSQL wire adapter
 
-> [!CAUTION]
-> Experimental, unreleased software: the wire protocol, SQL, catalog shims,
-> types, and limits may break on any commit. Pin and test the exact commit used
-> by every client.
+[Documentation](../README.md) / [API guides](README.md) · [Development status](../status.md)
 
 `pgwire` is a PostgreSQL v3 **client-protocol adapter** over one VibeDB SQL
 catalog. It is **not PostgreSQL compatibility and not ORM compatibility**. The
@@ -23,42 +20,62 @@ a trust boundary such as loopback or a protected Unix socket:
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
 	"net"
+	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/thesyncim/vibedb/pgwire"
 	"github.com/thesyncim/vibedb/sql/driver"
 )
 
 func main() {
-	database, err := driver.Open("app.vdb")
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer database.Close()
-
-	server, err := pgwire.NewServer(database, pgwire.Options{
-		Auth:     pgwire.Trust(),
-		Database: "app",
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer server.Close()
-
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		log.Fatal(err)
-	}
-	fmt.Println("postgres://app@127.0.0.1:" +
-		fmt.Sprint(listener.Addr().(*net.TCPAddr).Port) + "/app?sslmode=disable")
-	if err := server.Serve(listener); err != nil && !errors.Is(err, pgwire.ErrServerClosed) {
+	if err := run(); err != nil {
 		log.Fatal(err)
 	}
 }
+
+func run() (err error) {
+	database, err := driver.Open("app.vdb")
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, database.Close()) }()
+
+	server, err := pgwire.NewServer(database, pgwire.Options{
+		Auth: pgwire.Trust(), Database: "app",
+	})
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, server.Close()) }()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return err
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	fmt.Printf("postgresql://app@%s/app?sslmode=disable\n", listener.Addr())
+	served := make(chan error, 1)
+	go func() { served <- server.Serve(listener) }()
+	select {
+	case err = <-served:
+		if errors.Is(err, pgwire.ErrServerClosed) {
+			return nil
+		}
+		return err
+	case <-ctx.Done():
+		return nil // Deferred closes stop the server before closing the database.
+	}
+}
 ```
+
+Run the program, connect psql to the printed URL, and press `Ctrl-C` to stop.
 
 `NewServer` borrows the database. Close the server first; `Server.Close` stops
 listeners, cancels sessions, waits for them, and then returns. Close the
@@ -104,7 +121,7 @@ returned sessions.
 ## Protocol surface
 
 | Area | Implemented behavior |
-|---|---|
+| --- | --- |
 | Startup | Protocol 3; `user` required; nonempty configured database enforces its label, empty accepts any label |
 | Simple query | Bounded multi-statement batches; stop at first error |
 | Extended query | Parse, Bind, Describe, Execute, Close, Flush, Sync |
@@ -172,7 +189,7 @@ and reconciliation, never a blind retry.
 Accepted PostgreSQL parameter OIDs:
 
 | Family | OIDs |
-|---|---|
+| --- | --- |
 | Boolean | `bool` |
 | Integer | `int2`, `int4`, `int8` |
 | Floating point | `float4`, `float8` |
@@ -228,7 +245,7 @@ TCP and SCRAM. TLS+SCRAM has a pgx gate. Stock psql 18.4 and Java 17 with JDBC
 ## Resource bounds
 
 | Resource | Default or hard bound |
-|---|---:|
+| --- | ---: |
 | Connections | 128 |
 | Startup/auth read timeout | 10 s |
 | Socket write timeout | 30 s |
@@ -259,11 +276,11 @@ to `0A000`; unknown frontend messages map to `08P01`.
 
 ## Source map
 
-- Contract and compatibility boundary: `pgwire/doc.go:1-39`, `pgwire/server.go:40-51`
-- Server lifecycle/options: `pgwire/server.go:54-155`, `pgwire/server.go:183-400`
-- Startup/TLS/auth: `pgwire/session.go:438-744`, `pgwire/scram.go:18-528`
-- Simple/extended state machines: `pgwire/session.go:831-1102`, `pgwire/extended.go:53-394`
-- Parameters/results/errors: `pgwire/extended.go:810-1491`, `pgwire/rows.go:12-251`, `pgwire/pgerror.go:291-581`
-- Commands/discovery/gates: `pgwire/command.go:192-1670`, `pgwire/catalog_shim.go:12-145`, `integration/pgclient/pgclient_test.go:35-369`
-- Gateway RF3 writes: `gateway/pgwire_write.go:34-92`, `gateway/replicated_sql_transaction.go:128-565`
-- Zero-test compatibility ratchet: `integration/pgcompat/approved-tests.txt:1-3`
+- Contract and compatibility boundary: [pgwire/doc.go](../../pgwire/doc.go), [pgwire/server.go](../../pgwire/server.go)
+- Server lifecycle/options: [pgwire/server.go](../../pgwire/server.go), [pgwire/server.go](../../pgwire/server.go)
+- Startup/TLS/auth: [pgwire/session.go](../../pgwire/session.go), [pgwire/scram.go](../../pgwire/scram.go)
+- Simple/extended state machines: [pgwire/session.go](../../pgwire/session.go), [pgwire/extended.go](../../pgwire/extended.go)
+- Parameters/results/errors: [pgwire/extended.go](../../pgwire/extended.go), [pgwire/rows.go](../../pgwire/rows.go), [pgwire/pgerror.go](../../pgwire/pgerror.go)
+- Commands/discovery/gates: [pgwire/command.go](../../pgwire/command.go), [pgwire/catalog_shim.go](../../pgwire/catalog_shim.go), [integration/pgclient/pgclient_test.go](../../integration/pgclient/pgclient_test.go)
+- Gateway RF3 writes: [gateway/pgwire_write.go](../../gateway/pgwire_write.go), [gateway/replicated_sql_transaction.go](../../gateway/replicated_sql_transaction.go)
+- Zero-test compatibility ratchet: [integration/pgcompat/approved-tests.txt](../../integration/pgcompat/approved-tests.txt)
