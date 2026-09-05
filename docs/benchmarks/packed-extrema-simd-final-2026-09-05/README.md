@@ -4,8 +4,8 @@ This report qualifies the storage-native integer `MIN`/`MAX` path after the
 packed-kernel layout repair and the merge of latest `main`. The immutable
 baseline is `e1784046dd883ce9b050beae87b119d8855f3dea`; the measured candidate is
 `b62b38e646a3c1a1d5dccf43af5f89da6af63195`. The subsequent release commits
-`6ae83958` and `b1d42d8b` change only the AMD64 benchmark workflow and shell
-harness, so they do not change either measured Go test binary.
+through `f62ca4c3` change only the AMD64 benchmark workflow, shell harness, and
+evidence text, so they do not change either measured Go test binary.
 
 Both sides were freshly compiled with Go 1.27.0 and `GOEXPERIMENT=simd` on an
 Apple M4 Max running Darwin arm64. The baseline query test binary used the
