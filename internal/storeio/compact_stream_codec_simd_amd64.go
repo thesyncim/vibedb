@@ -20,6 +20,10 @@ var (
 	countCompactPacked8BetweenImpl  = countCompactPacked8BetweenScalar
 	countCompactPacked10BetweenImpl = countCompactPacked10BetweenScalar
 	countCompactPacked16BetweenImpl = countCompactPacked16BetweenScalar
+	countCompactPacked7ExtremaImpl  = countCompactPacked7ExtremaScalar
+	countCompactPacked8ExtremaImpl  = countCompactPacked8ExtremaScalar
+	countCompactPacked10ExtremaImpl = countCompactPacked10ExtremaScalar
+	countCompactPacked16ExtremaImpl = countCompactPacked16ExtremaScalar
 )
 
 func init() {

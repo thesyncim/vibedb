@@ -17,6 +17,10 @@ var (
 	countCompactPacked8BetweenImpl  = countCompactPacked8BetweenNEON
 	countCompactPacked10BetweenImpl = countCompactPacked10BetweenNEON
 	countCompactPacked16BetweenImpl = countCompactPacked16BetweenNEON
+	countCompactPacked7ExtremaImpl  = countCompactPacked7ExtremaScalar
+	countCompactPacked8ExtremaImpl  = countCompactPacked8ExtremaScalar
+	countCompactPacked10ExtremaImpl = countCompactPacked10ExtremaScalar
+	countCompactPacked16ExtremaImpl = countCompactPacked16ExtremaScalar
 )
 
 // The lookup indices interleave the two bytes needed by each little-endian

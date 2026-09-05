@@ -319,6 +319,81 @@ func (p *plan) runDirectFileTokenIntegerIntervalCount(
 	return stats, true, nil
 }
 
+// runDirectFileIntegerExtrema answers unfiltered MIN/MAX aggregates over one
+// named numeric path directly from durable FOR streams. The recognizer proves
+// that every output uses the same path and that no residual executor work is
+// required; the durable lane then declines the whole snapshot if any present
+// target stream is not an exact, non-wrapping FOR integer stream.
+func (p *plan) runDirectFileIntegerExtrema(
+	snapshot *durable.Snapshot,
+	e *Exec,
+) (coveringColumns int, scanned uint64, handled bool, err error) {
+	if err := e.Workspace.checkCanceled(); err != nil {
+		return 0, 0, true, err
+	}
+	path, ok := p.scalarIntegerExtremaPath()
+	if !ok || e.Options.Cancel != nil {
+		return 0, 0, false, nil
+	}
+	if p.hasLimit && p.limit == 0 {
+		return 0, 0, true, prepareResult(&e.Result, p, 0)
+	}
+	if snapshot.Len() > uint64(^uint(0)>>1) {
+		return 0, 0, true, store.ErrTooLarge
+	}
+	filter, err := e.file.tokenIntegerExtremaFilterFor(path.indexPath())
+	if err != nil {
+		return 0, 0, true, err
+	}
+	extrema, err := snapshot.FilterIntegerExtrema(filter)
+	if err != nil {
+		return 0, 0, true, err
+	}
+	if !extrema.Supported {
+		return 0, 0, false, nil
+	}
+	if extrema.Scanned != int(snapshot.Len()) {
+		return 0, 0, true, fmt.Errorf(
+			"query: durable integer extrema returned invalid progress: scanned=%d rows=%d",
+			extrema.Scanned, snapshot.Len(),
+		)
+	}
+
+	e.file.accs = resize(e.file.accs, len(p.columns))
+	resetAggs(e.file.accs)
+	for i, col := range p.columns {
+		if !extrema.Found {
+			continue
+		}
+		n, numberErr := e.file.accs[i].number(&e.Workspace.aggregateBudget)
+		if numberErr != nil {
+			return 0, 0, true, numberErr
+		}
+		if extrema.Found {
+			value := extrema.Min
+			if col.agg == aggMax {
+				value = extrema.Max
+			}
+			// An integer scalar needs no borrowed spelling: Cell.AppendJSON
+			// formats the exact int64 word on demand, and keeping num nil avoids
+			// pinning storage owned by the durable cursor in a reusable Exec.
+			n.extreme = scalar{
+				kind: kindNumber, isInt: true, ival: value,
+			}
+			n.n = 1
+		}
+	}
+	if err := prepareResult(&e.Result, p, 1); err != nil {
+		return 0, 0, true, err
+	}
+	if err := p.fillAggregateCells(
+		&e.Result, 0, e.file.accs, nil, &e.Workspace,
+	); err != nil {
+		return 0, 0, true, err
+	}
+	return 1, uint64(extrema.Scanned), true, nil
+}
+
 // runDirectFileTokenScalarCount answers the common unindexed
 // COUNT(*) WHERE field = scalar shape by scanning durable leaf tokens in
 // storage order. This is not candidate pruning: FilterEqCount visits every

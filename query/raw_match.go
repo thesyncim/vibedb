@@ -272,6 +272,44 @@ func (p *plan) scalarCountIntegerIntervalPath() (
 	return path, lower, upper, upperUnbounded, true
 }
 
+// scalarIntegerExtremaPath recognizes the deliberately narrow durable
+// aggregate lane: every output is MIN or MAX of the same named, single,
+// outer path, with no predicate or relational operators left for the generic
+// executor to evaluate. Numeric values that are absent, null, or otherwise
+// non-integer remain the generic path's concern; the storage lane engages
+// only after its complete target streams prove exact FOR integers.
+func (p *plan) scalarIntegerExtremaPath() (compiledPath, bool) {
+	if p == nil || p.where != nil || p.grouped || !p.singleRow ||
+		p.runtimeSQLPaths || len(p.joins) != 0 || len(p.marks) != 0 ||
+		len(p.columns) == 0 {
+		return compiledPath{}, false
+	}
+	var path compiledPath
+	pathSet := false
+	for _, col := range p.columns {
+		if (col.agg != aggMin && col.agg != aggMax) ||
+			col.num < 0 || col.num >= len(p.numPaths) {
+			return compiledPath{}, false
+		}
+		candidate := p.numPaths[col.num]
+		if !candidate.single || candidate.join != joinPathOuter {
+			return compiledPath{}, false
+		}
+		storagePath := candidate.indexPath()
+		if storagePath == "" || storagePath == "/" {
+			return compiledPath{}, false
+		}
+		if !pathSet {
+			path, pathSet = candidate, true
+			continue
+		}
+		if path.indexPath() != storagePath || path.join != candidate.join {
+			return compiledPath{}, false
+		}
+	}
+	return path, pathSet
+}
+
 func (p *plan) scalarCountPath() (compiledPath, scalar, bool) {
 	path, lit, ok := p.scalarCountEqualityPath()
 	if !ok || !path.single {

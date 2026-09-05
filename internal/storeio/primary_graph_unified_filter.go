@@ -67,6 +67,22 @@ type UnifiedIntegerIntervalFilter struct {
 	interval UnifiedIntegerInterval
 }
 
+// UnifiedIntegerExtremaFilter is the strict storage-native aggregate for one
+// numeric field. It accepts only compact FOR target streams; a cursor declines
+// the complete scan when any present target stream is not exact FOR.
+type UnifiedIntegerExtremaFilter struct {
+	resolver UnifiedHoleResolver
+}
+
+// UnifiedIntegerExtremaResult is one exact signed-integer stream result.
+// Found is false when every resolved row is absent (the SQL aggregate is
+// NULL), while Min and Max remain zero so an unsupported result can be
+// discarded without exposing partial progress.
+type UnifiedIntegerExtremaResult struct {
+	Min, Max int64
+	Found    bool
+}
+
 // NewUnifiedIntegerOrderFilter builds an exact ordered integer filter over a
 // unified field path. The caller proves the query literal is an int64 before
 // constructing this filter; the storage layer still validates the operation.
@@ -90,6 +106,16 @@ func NewUnifiedIntegerIntervalFilter(
 	path []byte, interval UnifiedIntegerInterval,
 ) (*UnifiedIntegerIntervalFilter, error) {
 	f := &UnifiedIntegerIntervalFilter{interval: interval}
+	if err := f.resolver.SetPath(path); err != nil {
+		return nil, err
+	}
+	return f, nil
+}
+
+// NewUnifiedIntegerExtremaFilter builds a reusable exact integer extrema scan
+// over a unified field path.
+func NewUnifiedIntegerExtremaFilter(path []byte) (*UnifiedIntegerExtremaFilter, error) {
+	f := &UnifiedIntegerExtremaFilter{}
 	if err := f.resolver.SetPath(path); err != nil {
 		return nil, err
 	}
@@ -330,6 +356,15 @@ type UnifiedFilterProgress struct {
 	Scanned  int
 }
 
+// UnifiedIntegerExtremaProgress accumulates a strict full scan. Scanned is
+// advanced only after a leaf has proved every present target stream exact, so
+// a false return from the cursor never exposes a partial aggregate.
+type UnifiedIntegerExtremaProgress struct {
+	Min, Max int64
+	Found    bool
+	Scanned  int
+}
+
 // FilterCountEq drives the filter over the cursor's remaining rows. Unified
 // leaves evaluate from tokens; every row the token lane cannot decide renders
 // into the cursor's splice scratch and evaluates there. Overflow rows stop the
@@ -467,6 +502,49 @@ func (c *PrimaryGraphCursor) FilterCountIntegerInterval(
 		}
 		if err := c.advanceLeaf(); err != nil {
 			c.Close()
+			return false, err
+		}
+		if c.done {
+			return true, nil
+		}
+	}
+}
+
+// FilterIntegerExtrema scans every compact leaf with an all-or-nothing FOR
+// extrema reduction. A false result leaves the caller with no authoritative
+// value and zeroes the result/progress before returning.
+func (c *PrimaryGraphCursor) FilterIntegerExtrema(
+	f *UnifiedIntegerExtremaFilter,
+	progress *UnifiedIntegerExtremaProgress,
+) (supported bool, err error) {
+	if c == nil || f == nil || progress == nil {
+		return false, nil
+	}
+	if c.done {
+		return true, nil
+	}
+	for {
+		if c.row == 0 {
+			result, ok := c.leaf.CountResolvedIntegerExtrema(&f.resolver)
+			if !ok {
+				*progress = UnifiedIntegerExtremaProgress{}
+				return false, nil
+			}
+			progress.Scanned += c.leaf.Len()
+			if result.Found {
+				if !progress.Found || result.Min < progress.Min {
+					progress.Min = result.Min
+				}
+				if !progress.Found || result.Max > progress.Max {
+					progress.Max = result.Max
+				}
+				progress.Found = true
+			}
+			c.row = c.leaf.Len()
+		}
+		if err := c.advanceLeaf(); err != nil {
+			c.Close()
+			*progress = UnifiedIntegerExtremaProgress{}
 			return false, err
 		}
 		if c.done {
