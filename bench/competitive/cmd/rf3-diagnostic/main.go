@@ -6,6 +6,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -224,20 +225,20 @@ type nodeMetricsSnapshot struct {
 }
 
 type nodeMetrics struct {
-	AppliedEntries                  uint64 `json:"applied_entries"`
-	ReadyPersisted                  uint64 `json:"ready_persisted"`
-	CommitAdvancements              uint64 `json:"commit_advancements"`
-	CommittedEntries                uint64 `json:"committed_entries"`
-	ReadCompletions                 uint64 `json:"read_completions"`
-	Faults                          uint64 `json:"faults"`
-	AuthorityReadHits               uint64 `json:"authority_read_hits"`
-	AuthorityReadIndexFallbacks     uint64 `json:"authority_read_index_fallbacks"`
-	AuthorityReadValidationRetries  uint64 `json:"authority_read_validation_retries"`
-	AuthorityReadValidationFailures uint64 `json:"authority_read_validation_failures"`
-	AuthorityRoundAttempts          uint64 `json:"authority_round_attempts"`
-	ReadAuthorityRoundsStarted      uint64 `json:"read_authority_rounds_started"`
-	ReadAuthorityRequestsCreated    uint64 `json:"read_authority_requests_created"`
-	ReadAuthorityGrantsAccepted     uint64 `json:"read_authority_grants_accepted"`
+	AppliedEntries                  uint64  `json:"applied_entries"`
+	ReadyPersisted                  uint64  `json:"ready_persisted"`
+	CommitAdvancements              uint64  `json:"commit_advancements"`
+	CommittedEntries                uint64  `json:"committed_entries"`
+	ReadCompletions                 uint64  `json:"read_completions"`
+	Faults                          uint64  `json:"faults"`
+	AuthorityReadHits               *uint64 `json:"authority_read_hits,omitempty"`
+	AuthorityReadIndexFallbacks     *uint64 `json:"authority_read_index_fallbacks,omitempty"`
+	AuthorityReadValidationRetries  *uint64 `json:"authority_read_validation_retries,omitempty"`
+	AuthorityReadValidationFailures *uint64 `json:"authority_read_validation_failures,omitempty"`
+	AuthorityRoundAttempts          *uint64 `json:"authority_round_attempts,omitempty"`
+	ReadAuthorityRoundsStarted      *uint64 `json:"read_authority_rounds_started,omitempty"`
+	ReadAuthorityRequestsCreated    *uint64 `json:"read_authority_requests_created,omitempty"`
+	ReadAuthorityGrantsAccepted     *uint64 `json:"read_authority_grants_accepted,omitempty"`
 }
 
 // preflightTracker gates only the initial readiness check. Once one complete
@@ -332,6 +333,7 @@ type latchTracker struct {
 	maxBytes    int64
 	request     *latchRequest
 	requestedAt time.Time
+	armedAt     time.Time
 	armedUTC    string
 	captured    bool
 }
@@ -366,7 +368,8 @@ func (tracker *latchTracker) arm() error {
 	}
 	tracker.request = &request
 	tracker.requestedAt = requestedAt
-	tracker.armedUTC = time.Now().UTC().Format(time.RFC3339Nano)
+	tracker.armedAt = time.Now().UTC()
+	tracker.armedUTC = tracker.armedAt.Format(time.RFC3339Nano)
 	return nil
 }
 
@@ -381,7 +384,7 @@ func (tracker *latchTracker) annotate(record *cycle) error {
 	if err != nil {
 		return fmt.Errorf("rf3-diagnostic: cycle has invalid UTC: %w", err)
 	}
-	if recordedAt.Before(tracker.requestedAt) {
+	if recordedAt.Before(tracker.requestedAt) || recordedAt.Before(tracker.armedAt) {
 		return nil
 	}
 	latch := &latchSnapshot{
@@ -520,6 +523,9 @@ func run(args []string) error {
 	latch := &latchTracker{requestPath: *latchFile, outputPath: *latchOutput, maxBytes: cfg.MaxBytes}
 	for {
 		sequence++
+		if err = latch.arm(); err != nil {
+			return err
+		}
 		started := time.Now()
 		record := capture(ctx, cfg, sequence)
 		record.ElapsedNS = time.Since(started).Nanoseconds()
@@ -527,9 +533,6 @@ func run(args []string) error {
 		record.PreflightReady = record.ValidCuts == expectedCuts
 		if !record.PreflightReady {
 			record.PreflightReason = fmt.Sprintf("valid status and metrics cuts %d/%d", record.ValidCuts, expectedCuts)
-		}
-		if err = latch.arm(); err != nil {
-			return err
 		}
 		if err = latch.annotate(&record); err != nil {
 			return err
@@ -813,11 +816,6 @@ func captureNodeMetrics(ctx context.Context, cfg config, node nodeConfig) (resul
 		AppliedEntries: metrics.AppliedEntries, ReadyPersisted: metrics.ReadyPersisted,
 		CommitAdvancements: metrics.CommitAdvancements, CommittedEntries: metrics.CommittedEntries,
 		ReadCompletions: metrics.ReadCompletions, Faults: metrics.Faults,
-		AuthorityReadHits:               metrics.AuthorityReadHits,
-		AuthorityReadIndexFallbacks:     metrics.AuthorityReadIndexFallbacks,
-		AuthorityReadValidationRetries:  metrics.AuthorityReadValidationRetries,
-		AuthorityReadValidationFailures: metrics.AuthorityReadValidationFailures,
-		AuthorityRoundAttempts:          metrics.AuthorityRoundAttempts,
 	}
 	return result
 }
@@ -850,6 +848,17 @@ type nodeDiagnosticRecord struct {
 	ReadAuthorityGrantsAccepted     uint64 `json:"read_authority_grants_accepted"`
 }
 
+var requiredAuthorityDiagnosticFields = [...]string{
+	"authority_read_hits",
+	"authority_read_index_fallbacks",
+	"authority_read_validation_retries",
+	"authority_read_validation_failures",
+	"authority_round_attempts",
+	"read_authority_rounds_started",
+	"read_authority_requests_created",
+	"read_authority_grants_accepted",
+}
+
 func readNodeDiagnostic(path, nodeID string) (nodeMetricsSnapshot, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -857,6 +866,16 @@ func readNodeDiagnostic(path, nodeID string) (nodeMetricsSnapshot, error) {
 	}
 	if len(raw) == 0 || len(raw) > maxManifestBytes {
 		return nodeMetricsSnapshot{}, errors.New("rf3-diagnostic: node diagnostic exceeds bound")
+	}
+	var fields map[string]json.RawMessage
+	if err = json.Unmarshal(raw, &fields); err != nil {
+		return nodeMetricsSnapshot{}, err
+	}
+	for _, field := range requiredAuthorityDiagnosticFields {
+		value, ok := fields[field]
+		if !ok || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return nodeMetricsSnapshot{}, fmt.Errorf("rf3-diagnostic: node diagnostic is missing authority counter %q", field)
+		}
 	}
 	var value nodeDiagnosticRecord
 	if err = json.Unmarshal(raw, &value); err != nil {
@@ -874,14 +893,14 @@ func readNodeDiagnostic(path, nodeID string) (nodeMetricsSnapshot, error) {
 		Metrics: &nodeMetrics{
 			AppliedEntries: value.RaftAppliedEntries, ReadyPersisted: value.RaftReadyPersisted,
 			CommitAdvancements: value.RaftCommitAdvancements, CommittedEntries: value.RaftCommittedEntries,
-			AuthorityReadHits:               value.AuthorityReadHits,
-			AuthorityReadIndexFallbacks:     value.AuthorityReadIndexFallbacks,
-			AuthorityReadValidationRetries:  value.AuthorityReadValidationRetries,
-			AuthorityReadValidationFailures: value.AuthorityReadValidationFailures,
-			AuthorityRoundAttempts:          value.AuthorityRoundAttempts,
-			ReadAuthorityRoundsStarted:      value.ReadAuthorityRoundsStarted,
-			ReadAuthorityRequestsCreated:    value.ReadAuthorityRequestsCreated,
-			ReadAuthorityGrantsAccepted:     value.ReadAuthorityGrantsAccepted,
+			AuthorityReadHits:               &value.AuthorityReadHits,
+			AuthorityReadIndexFallbacks:     &value.AuthorityReadIndexFallbacks,
+			AuthorityReadValidationRetries:  &value.AuthorityReadValidationRetries,
+			AuthorityReadValidationFailures: &value.AuthorityReadValidationFailures,
+			AuthorityRoundAttempts:          &value.AuthorityRoundAttempts,
+			ReadAuthorityRoundsStarted:      &value.ReadAuthorityRoundsStarted,
+			ReadAuthorityRequestsCreated:    &value.ReadAuthorityRequestsCreated,
+			ReadAuthorityGrantsAccepted:     &value.ReadAuthorityGrantsAccepted,
 		},
 	}, nil
 }

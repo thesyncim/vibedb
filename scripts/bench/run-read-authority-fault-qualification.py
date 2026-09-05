@@ -35,6 +35,16 @@ GOCACHE = Path(os.environ.get("VIBEDB_GO_CACHE", "/Users/thesyncim/Library/Cache
 LAB_BUILD_TAG = "vibedb_rf3_read_authority_lab"
 QUARANTINE_SECONDS = 6.11
 GRANT_SECONDS = 5.0
+REQUIRED_AUTHORITY_COUNTERS = (
+    "authority_read_hits",
+    "authority_read_index_fallbacks",
+    "authority_read_validation_retries",
+    "authority_read_validation_failures",
+    "authority_round_attempts",
+    "read_authority_rounds_started",
+    "read_authority_requests_created",
+    "read_authority_grants_accepted",
+)
 
 
 def load_fixture():
@@ -280,6 +290,12 @@ def write_group_timeline(path, output, table):
                     continue
                 node_process_metrics[node["node_id"]] = {
                     "scope": node.get("scope"),
+                    "source": node.get("source"),
+                    "utc": node.get("utc"),
+                    "serial": node.get("serial"),
+                    "pid": node.get("pid"),
+                    "authority_available": node.get("authority_available"),
+                    "authority_error": node.get("authority_error"),
                     "metrics": node.get("metrics"),
                     "error": node.get("error"),
                     "elapsed_ns": node.get("elapsed_ns"),
@@ -361,17 +377,144 @@ def write_group_timeline(path, output, table):
     }
 
 
+def _parse_utc(value, name):
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{name} is missing UTC")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"{name} has invalid UTC") from exc
+    if parsed.tzinfo is None:
+        raise ValueError(f"{name} UTC has no timezone")
+    return parsed
+
+
+def _positive_int(value, name, minimum=1):
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ValueError(f"{name} must be an integer >= {minimum}")
+    return value
+
+
+def _is_secondary_result_error(error):
+    value = str(error)
+    return value.startswith((
+        "post-CONT diagnostic latch",
+        "per-group diagnostic output",
+        "retaining stopped fixture evidence:",
+        "fixture container cleanup failed",
+        "fixture volume cleanup failed:",
+    ))
+
+
+def validate_post_cont_latch(path, expected_nodes=3):
+    """Validate the immutable post-CONT cut and every required owner snapshot."""
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"could not read post-CONT latch: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError("post-CONT latch is not an object")
+    if value.get("schema") != "vibedb.rf3-diagnostic-latch/1":
+        raise ValueError("post-CONT latch has an invalid schema")
+    if value.get("event") != "post-cont":
+        raise ValueError("post-CONT latch has an invalid event")
+    cycle = value.get("cycle")
+    if not isinstance(cycle, dict):
+        raise ValueError("post-CONT latch has no cycle")
+    latch = cycle.get("latch")
+    if not isinstance(latch, dict) or latch.get("complete") is not True:
+        raise ValueError("post-CONT latch cycle is incomplete")
+    _positive_int(value.get("sequence"), "latch sequence")
+    _positive_int(cycle.get("sequence"), "cycle sequence")
+    requested = _parse_utc(value.get("requested_utc"), "latch requested")
+    armed = _parse_utc(value.get("armed_utc"), "latch armed")
+    captured = _parse_utc(value.get("captured_utc"), "latch captured")
+    cycle_utc = _parse_utc(cycle.get("utc"), "latch cycle")
+    if cycle_utc < requested:
+        raise ValueError("post-CONT latch cycle predates controller handoff")
+    if cycle_utc < armed:
+        raise ValueError("post-CONT latch cycle predates sidecar arm handoff")
+    if captured < cycle_utc:
+        raise ValueError("post-CONT latch capture predates its cycle")
+    if value.get("sequence") != cycle.get("sequence"):
+        raise ValueError("post-CONT latch sequence does not match its cycle")
+    if latch.get("sequence") != cycle.get("sequence"):
+        raise ValueError("post-CONT latch sequence does not match its cycle")
+    if cycle.get("preflight_ready") is not True:
+        raise ValueError("post-CONT latch cycle did not pass group preflight")
+    expected_cuts = _positive_int(cycle.get("expected_cuts"), "latch expected cuts")
+    if cycle.get("valid_cuts") != expected_cuts:
+        raise ValueError("post-CONT latch cycle has incomplete group cuts")
+    nodes = cycle.get("node_metrics")
+    if not isinstance(nodes, list) or len(nodes) != expected_nodes:
+        raise ValueError(
+            f"post-CONT latch requires {expected_nodes} node authority snapshots")
+    authority_nodes = []
+    seen = set()
+    for index, node in enumerate(nodes):
+        if not isinstance(node, dict):
+            raise ValueError(f"post-CONT node snapshot {index} is not an object")
+        node_id = node.get("node_id")
+        if not isinstance(node_id, str) or not node_id or node_id in seen:
+            raise ValueError(f"post-CONT node snapshot {index} has duplicate identity")
+        seen.add(node_id)
+        if node.get("source") != "rf3-diagnostics-file":
+            raise ValueError(f"post-CONT node {node_id} lacks diagnostic-file provenance")
+        if node.get("authority_available") is not True:
+            raise ValueError(f"post-CONT node {node_id} lacks authority availability")
+        _parse_utc(node.get("utc"), f"post-CONT node {node_id}")
+        serial = _positive_int(node.get("serial"), f"post-CONT node {node_id} serial")
+        pid = _positive_int(node.get("pid"), f"post-CONT node {node_id} pid", minimum=2)
+        metrics = node.get("metrics")
+        if not isinstance(metrics, dict):
+            raise ValueError(f"post-CONT node {node_id} lacks authority metrics")
+        for counter_name in REQUIRED_AUTHORITY_COUNTERS:
+            counter_value = metrics.get(counter_name)
+            if isinstance(counter_value, bool) or not isinstance(counter_value, int):
+                raise ValueError(
+                    f"post-CONT node {node_id} lacks integer {counter_name}")
+        authority_nodes.append({
+            "node_id": node_id,
+            "source": node["source"],
+            "utc": node["utc"],
+            "serial": serial,
+            "pid": pid,
+        })
+    return {
+        "schema": value["schema"],
+        "event": value["event"],
+        "sequence": value["sequence"],
+        "captured_utc": value["captured_utc"],
+        "cycle_utc": cycle["utc"],
+        "authority_nodes": authority_nodes,
+        "authority_snapshot_count": len(authority_nodes),
+        "complete": True,
+    }
+
+
 def primary_result_failure(result, run_dir):
     """Retain the client failure when later qualification bookkeeping fails."""
     if not isinstance(result, dict):
         return None
-    errors = result.get("errors")
-    if not isinstance(errors, list) or not errors:
+    client_exit_code = result.get("client_exit_code")
+    client_failed = (
+        isinstance(client_exit_code, int) and
+        not isinstance(client_exit_code, bool) and client_exit_code != 0)
+    validation = result.get("validation")
+    validation_failed = isinstance(validation, dict) and validation.get("complete") is False
+    if not client_failed and not validation_failed:
         return None
+    errors = result.get("errors")
+    errors = [str(error) for error in errors] if isinstance(errors, list) else []
+    errors = [error for error in errors if not _is_secondary_result_error(error)]
+    if not errors:
+        errors = ["client exited nonzero" if client_failed else
+                  "client report is incomplete or failed"]
     failure = {
         "status": result.get("status"),
-        "client_exit_code": result.get("client_exit_code"),
-        "errors": [str(error) for error in errors],
+        "client_exit_code": client_exit_code,
+        "validation_failed": validation_failed,
+        "errors": errors,
         "client_log": "candidate/client.log",
     }
     client_log = run_dir / "client.log"
@@ -386,13 +529,14 @@ def primary_result_failure(result, run_dir):
     return failure
 
 
-def fault_qualification_complete(no_fault, pause, restart):
+def fault_qualification_complete(no_fault, pause, restart, latch_complete=True):
     """Evaluate the fault contract without treating an absent restart as a dict."""
     pause = pause if isinstance(pause, dict) else {}
     restart = restart if isinstance(restart, dict) else {}
     return no_fault or (
         pause.get("status") == "verified-signals" and
-        restart.get("status") == "verified")
+        restart.get("status") == "verified" and
+        latch_complete is True)
 
 
 def authority_proof(records):
@@ -636,6 +780,7 @@ def main(argv=None):
         "source": {},
         "binary_sha256": {},
         "events": [],
+        "diagnostic_errors": [],
     }
     fixture.write_json(destination / "manifest.json", manifest)
     if selected.prepare_only:
@@ -688,6 +833,7 @@ def main(argv=None):
     source_before = None
     original_run = fixture.run
     original_popen = subprocess.Popen
+    original_subprocess_run = subprocess.run
     original_stop = fixture.stop_processes
     captured = {}
     state = {"pause": None, "pause_error": None}
@@ -722,6 +868,20 @@ def main(argv=None):
                     manifest["client_argv"] = list(values[3:])
                     fixture.write_json(destination / "manifest.json", manifest)
         return original_popen(values, *args, **kwargs)
+
+    def captured_run(command, *args, **kwargs):
+        values = list(command) if isinstance(command, (list, tuple)) else command
+        if (isinstance(values, list) and values[:2] == ["docker", "exec"] and
+                len(values) > 3 and values[3] == "/bench/rf3-sqlbench" and
+                "-phase" in values and values[values.index("-phase") + 1] == "run"):
+            values = list(values)
+            if "-recovery-oracle" not in values:
+                values.extend(["-recovery-oracle", "/evidence/client-oracle.json"])
+            with lock:
+                captured["client"] = list(values)
+                manifest["client_argv"] = list(values[3:])
+                fixture.write_json(destination / "manifest.json", manifest)
+        return original_subprocess_run(values, *args, **kwargs)
 
     def record_event(event):
         # Keep each manifest event as an immutable checkpoint; later updates to
@@ -856,18 +1016,32 @@ def main(argv=None):
                 "signal": "SIGCONT",
                 "source": "fault-controller",
             })
+            # Publish into the container in two steps.  docker cp may expose a
+            # partially written destination while the sidecar is polling; a
+            # same-filesystem rename makes the request an atomic handoff.
+            latch_temporary = latch_file + ".tmp"
             copied_latch_request = fixture.run([
-                "docker", "cp", latch_request, container + ":" + latch_file,
+                "docker", "cp", latch_request, container + ":" + latch_temporary,
             ], check=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            published_latch_request = None
+            if copied_latch_request.returncode == 0:
+                published_latch_request = fixture.run([
+                    "docker", "exec", container, "mv", "-f",
+                    latch_temporary, latch_file,
+                ], check=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             pause["post_cont_latch_request"] = {
                 "path": str(latch_request.relative_to(destination)),
+                "temporary_remote_path": latch_temporary,
                 "remote_path": latch_file,
                 "exit_code": copied_latch_request.returncode,
+                "publish_exit_code": None if published_latch_request is None else published_latch_request.returncode,
                 "requested_utc": pause["utc_continue_sent"],
                 "armed_after_post_pause_diagnostic": True,
             }
-            if copied_latch_request.returncode:
-                raise RuntimeError("post-CONT latch request was not copied into the container")
+            if (copied_latch_request.returncode or
+                    published_latch_request is None or
+                    published_latch_request.returncode):
+                raise RuntimeError("post-CONT latch request was not atomically published into the container")
             pause["post_pause_diagnostics"] = post
             pause["unavailable_interval_seconds"] = elapsed
             pause["post_pause_counter_deltas"] = {
@@ -902,12 +1076,23 @@ def main(argv=None):
             "quarantine_seconds": QUARANTINE_SECONDS,
         }
         try:
-            report = json.loads((destination_run / "report.json").read_text())
+            try:
+                report = json.loads((destination_run / "report.json").read_text())
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                restart["status"] = "skipped"
+                restart["reason"] = "pre-crash client report unavailable: " + str(exc)
+                record_event(restart)
+                return []
             if report.get("status") != "complete":
-                raise fixture.RunnerError(
-                    "SIGKILL/restart requires a fully verified pre-crash workload")
+                restart["status"] = "skipped"
+                restart["reason"] = "pre-crash client report was not complete"
+                record_event(restart)
+                return []
             if "client" not in captured or "server" not in captured:
-                raise fixture.RunnerError("server/client argv was not captured")
+                restart["status"] = "skipped"
+                restart["reason"] = "server/client argv was not captured"
+                record_event(restart)
+                return []
             copied = fixture.run([
                 "docker", "cp", container + ":/evidence/client-oracle.json",
                 destination / "client-oracle.json",
@@ -1059,6 +1244,9 @@ def main(argv=None):
         fixture.write_json(destination / "manifest.json", manifest)
         fixture.run = logged_run
         subprocess.Popen = captured_popen
+        subprocess.run = captured_run
+        if not selected.no_fault:
+            fixture.stop_processes = stop_with_restart
         result_holder = {}
 
         def run_fixture():
@@ -1081,6 +1269,9 @@ def main(argv=None):
             raise result_holder["exception"]
         result = result_holder.get("result", {})
         manifest["result"] = result
+        result_errors = result.get("errors") if isinstance(result, dict) else None
+        if isinstance(result_errors, list):
+            manifest["diagnostic_errors"].extend(str(error) for error in result_errors)
         manifest["run_wall_elapsed_seconds"] = result_holder.get("wall_elapsed_seconds")
         manifest["diagnostic_records"] = diagnostics_summary(run_dir / "diagnostics")
         manifest["authority_proof"] = authority_proof(manifest["diagnostic_records"])
@@ -1091,29 +1282,25 @@ def main(argv=None):
             diagnostic_output_path(run_dir), timeline_path, tables[0])
         if not selected.no_fault:
             latch_path = run_dir / "post-cont-cut.json"
-            latch_record = None
             try:
-                latch_record = json.loads(latch_path.read_text())
-                if (latch_record.get("schema") != "vibedb.rf3-diagnostic-latch/1" or
-                        latch_record.get("event") != "post-cont" or
-                        latch_record.get("cycle", {}).get("latch", {}).get("complete") is not True):
-                    raise ValueError("post-CONT latch artifact is incomplete")
-                manifest["post_cont_latch"] = {
-                    "path": "candidate/post-cont-cut.json",
-                    "schema": latch_record.get("schema"),
-                    "sequence": latch_record.get("sequence"),
-                    "captured_utc": latch_record.get("captured_utc"),
-                    "node_id": latch_record.get("node_id"),
-                    "pid": latch_record.get("pid"),
-                    "complete": True,
-                }
-            except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                latch_summary = validate_post_cont_latch(
+                    latch_path, expected_nodes=cell["physical_nodes"])
+                latch_summary["path"] = "candidate/post-cont-cut.json"
+                manifest["post_cont_latch"] = latch_summary
+            except ValueError as exc:
                 manifest["post_cont_latch"] = {
                     "path": "candidate/post-cont-cut.json",
                     "complete": False,
                     "error": str(exc),
                 }
-                manifest["failure"] = "post-CONT diagnostic latch was not retained: " + str(exc)
+                manifest["diagnostic_errors"].append(
+                    "post-CONT diagnostic latch was not retained: " + str(exc))
+        else:
+            manifest["post_cont_latch"] = {
+                "path": "candidate/post-cont-cut.json",
+                "required": False,
+                "complete": True,
+            }
         manifest["pause"] = state.get("pause")
         manifest["pause_error"] = state.get("pause_error")
         primary = primary_result_failure(result, run_dir)
@@ -1123,8 +1310,14 @@ def main(argv=None):
                 primary["errors"])
         manifest["restart"] = next((event for event in reversed(manifest["events"])
                                      if event.get("event") == "sigkill-restart"), None)
+        latch_summary = manifest.get("post_cont_latch")
+        latch_complete = (
+            selected.no_fault or
+            (isinstance(latch_summary, dict) and
+             latch_summary.get("complete") is True))
         fault_complete = fault_qualification_complete(
-            selected.no_fault, state.get("pause"), manifest.get("restart"))
+            selected.no_fault, state.get("pause"), manifest.get("restart"),
+            latch_complete)
         manifest["status"] = "complete" if (
             result.get("status") == "completed" and
             result.get("client_exit_code") == 0 and
@@ -1132,16 +1325,20 @@ def main(argv=None):
             manifest["per_group_diagnostic"].get("complete_shape") and
             fault_complete
         ) else "incomplete-or-failed"
+        if manifest["diagnostic_errors"] and not manifest.get("primary_failure"):
+            manifest.setdefault("failure", "diagnostic: " + "; ".join(
+                manifest["diagnostic_errors"]))
     except BaseException as exc:
         manifest["status"] = "incomplete-or-failed"
         detail = str(exc) or exc.__class__.__name__
-        if manifest.get("failure"):
-            manifest["failure"] += "; qualification finalization: " + detail
-        else:
+        manifest["diagnostic_errors"].append("qualification finalization: " + detail)
+        if not manifest.get("primary_failure") and not manifest.get("failure"):
             manifest["failure"] = detail
     finally:
         fixture.run = original_run
         subprocess.Popen = original_popen
+        subprocess.run = original_subprocess_run
+        fixture.stop_processes = original_stop
         if source_before is not None:
             try:
                 source_after = source_snapshot(fixture, repo, destination, "after")
@@ -1151,10 +1348,16 @@ def main(argv=None):
                 )
                 if not manifest["source_stable"]:
                     manifest["status"] = "incomplete-or-failed"
-                    manifest["failure"] = "source changed during qualification"
+                    manifest["diagnostic_errors"].append(
+                        "source changed during qualification")
+                    if not manifest.get("primary_failure") and not manifest.get("failure"):
+                        manifest["failure"] = "diagnostic: source changed during qualification"
             except BaseException as exc:
                 manifest["status"] = "incomplete-or-failed"
-                manifest["failure"] = "could not snapshot source after qualification: " + str(exc)
+                detail = "could not snapshot source after qualification: " + str(exc)
+                manifest["diagnostic_errors"].append(detail)
+                if not manifest.get("primary_failure") and not manifest.get("failure"):
+                    manifest["failure"] = "diagnostic: " + detail
         fixture.write_json(destination / "manifest.json", manifest)
     print(destination)
     print(json.dumps({
@@ -1163,6 +1366,7 @@ def main(argv=None):
         "validation": manifest.get("result", {}).get("validation"),
         "pause": manifest.get("pause"),
         "restart": manifest.get("restart"),
+        "diagnostic_errors": manifest.get("diagnostic_errors"),
         "failure": manifest.get("failure"),
     }, sort_keys=True))
     return 0 if manifest.get("status") == "complete" else 1

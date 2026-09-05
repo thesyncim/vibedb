@@ -118,10 +118,19 @@ class FaultQualificationProvenanceTest(unittest.TestCase):
                 node_metrics.append({
                     "node_id": node_id,
                     "scope": "node_process",
-                    "metrics": {
+                    "source": "rf3-diagnostics-file" if member == 1 else "servicemetrics",
+                    "utc": "2026-09-05T18:00:00Z",
+                    "serial": member,
+                    "pid": 40 + member,
+                    "authority_available": member == 1,
+                    "authority_error": None if member == 1 else "diagnostic file unavailable",
+                    "metrics": ({
                         "authority_read_hits": 100 + member,
                         "authority_round_attempts": 10 + member,
-                    },
+                    } if member == 1 else {
+                        "applied_entries": member,
+                    }),
+                    "error": None if member == 1 else "diagnostic file unavailable",
                 })
             groups = [{"group_id": f"{group:032x}", "distribution": "system",
                        "shard": "all", "members": members} for group in range(6)]
@@ -153,6 +162,17 @@ class FaultQualificationProvenanceTest(unittest.TestCase):
             self.assertEqual(
                 payload["records"][0]["members"][0]["authority_metrics"]["metrics"]["authority_read_hits"],
                 101)
+            node_one = payload["records"][0]["node_process_metrics"]["00000000000000000000000000000001"]
+            self.assertEqual(node_one["source"], "rf3-diagnostics-file")
+            self.assertEqual(node_one["utc"], "2026-09-05T18:00:00Z")
+            self.assertEqual(node_one["serial"], 1)
+            self.assertEqual(node_one["pid"], 41)
+            self.assertTrue(node_one["authority_available"])
+            node_two = payload["records"][0]["node_process_metrics"]["00000000000000000000000000000002"]
+            self.assertEqual(node_two["source"], "servicemetrics")
+            self.assertFalse(node_two["authority_available"])
+            self.assertEqual(node_two["error"], "diagnostic file unavailable")
+            self.assertNotIn("authority_read_hits", node_two["metrics"])
 
     def test_primary_result_failure_keeps_client_error_when_restart_is_absent(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -169,10 +189,78 @@ class FaultQualificationProvenanceTest(unittest.TestCase):
             self.assertEqual(failure["client_error_tail"], "warmup: ERROR: " + error)
             self.assertEqual(failure["client_log"], "candidate/client.log")
 
+            self.assertIsNone(MODULE.primary_result_failure({
+                "status": "failed",
+                "client_exit_code": 0,
+                "validation": {"complete": True},
+                "errors": ["post-CONT diagnostic latch was not retained"],
+            }, run_dir))
+            self.assertIsNotNone(MODULE.primary_result_failure({
+                "status": "failed",
+                "client_exit_code": 0,
+                "validation": {"complete": False},
+                "errors": ["client report is incomplete or failed"],
+            }, run_dir))
+
             self.assertFalse(MODULE.fault_qualification_complete(
                 False, {"status": "verified-signals"}, None))
+            self.assertFalse(MODULE.fault_qualification_complete(
+                False, {"status": "verified-signals"}, {"status": "verified"}, False))
             self.assertTrue(MODULE.fault_qualification_complete(
                 True, None, None))
+
+    def test_post_cont_latch_requires_all_post_cont_authority_snapshots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "post-cont-cut.json"
+            counters = {
+                name: 0 for name in MODULE.REQUIRED_AUTHORITY_COUNTERS
+            }
+            nodes = []
+            for member in range(1, 4):
+                nodes.append({
+                    "node_id": f"{member:032x}",
+                    "source": "rf3-diagnostics-file",
+                    "utc": "2026-09-05T18:00:00Z",
+                    "serial": member,
+                    "pid": 40 + member,
+                    "authority_available": True,
+                    "metrics": dict(counters),
+                })
+            cycle = {
+                "schema": "vibedb.rf3-diagnostic/1",
+                "sequence": 7,
+                "utc": "2026-09-05T18:00:02Z",
+                "expected_cuts": 21,
+                "valid_cuts": 21,
+                "preflight_ready": True,
+                "node_metrics": nodes,
+                "latch": {"sequence": 7, "complete": True},
+            }
+            path.write_text(json.dumps({
+                "schema": "vibedb.rf3-diagnostic-latch/1",
+                "event": "post-cont",
+                "requested_utc": "2026-09-05T18:00:00Z",
+                "armed_utc": "2026-09-05T18:00:01Z",
+                "captured_utc": "2026-09-05T18:00:03Z",
+                "sequence": 7,
+                "cycle": cycle,
+            }))
+            summary = MODULE.validate_post_cont_latch(path)
+            self.assertTrue(summary["complete"])
+            self.assertEqual(summary["authority_snapshot_count"], 3)
+
+            nodes[1]["authority_available"] = False
+            path.write_text(json.dumps({
+                "schema": "vibedb.rf3-diagnostic-latch/1",
+                "event": "post-cont",
+                "requested_utc": "2026-09-05T18:00:00Z",
+                "armed_utc": "2026-09-05T18:00:01Z",
+                "captured_utc": "2026-09-05T18:00:03Z",
+                "sequence": 7,
+                "cycle": cycle,
+            }))
+            with self.assertRaisesRegex(ValueError, "lacks authority availability"):
+                MODULE.validate_post_cont_latch(path)
 
 
 if __name__ == "__main__":

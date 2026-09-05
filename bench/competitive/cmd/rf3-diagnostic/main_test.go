@@ -126,7 +126,14 @@ func TestLatchTrackerCapturesFirstCompletePostCONTycle(t *testing.T) {
 	if _, err := os.Stat(outputPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("pre-request artifact stat error = %v", err)
 	}
-	incomplete := cycle{Sequence: 2, UTC: requestedAt.Add(time.Millisecond).Format(time.RFC3339Nano)}
+	preArm := cycle{Sequence: 2, UTC: tracker.armedAt.Add(-time.Millisecond).Format(time.RFC3339Nano), PreflightReady: true}
+	if err := tracker.annotate(&preArm); err != nil {
+		t.Fatalf("pre-arm cycle: %v", err)
+	}
+	if preArm.Latch != nil {
+		t.Fatal("cycle captured before latch arm was labeled as post-CONT")
+	}
+	incomplete := cycle{Sequence: 3, UTC: tracker.armedAt.Add(time.Millisecond).Format(time.RFC3339Nano)}
 	if err := tracker.annotate(&incomplete); err != nil {
 		t.Fatalf("incomplete cycle: %v", err)
 	}
@@ -136,7 +143,7 @@ func TestLatchTrackerCapturesFirstCompletePostCONTycle(t *testing.T) {
 	if _, err := os.Stat(outputPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("incomplete artifact stat error = %v", err)
 	}
-	complete := cycle{Sequence: 3, UTC: requestedAt.Add(2 * time.Millisecond).Format(time.RFC3339Nano), PreflightReady: true}
+	complete := cycle{Sequence: 4, UTC: tracker.armedAt.Add(2 * time.Millisecond).Format(time.RFC3339Nano), PreflightReady: true}
 	if err := tracker.annotate(&complete); err != nil {
 		t.Fatalf("complete cycle: %v", err)
 	}
@@ -151,12 +158,12 @@ func TestLatchTrackerCapturesFirstCompletePostCONTycle(t *testing.T) {
 	if err := json.Unmarshal(raw, &artifact); err != nil {
 		t.Fatal(err)
 	}
-	if artifact.Schema != "vibedb.rf3-diagnostic-latch/1" || artifact.Sequence != 3 ||
+	if artifact.Schema != "vibedb.rf3-diagnostic-latch/1" || artifact.Sequence != 4 ||
 		artifact.NodeID != "00112233445566778899aabbccddeeff" || artifact.PID != 42 ||
 		artifact.Cycle.Latch == nil || !artifact.Cycle.Latch.Complete {
 		t.Fatalf("artifact = %+v", artifact)
 	}
-	later := cycle{Sequence: 4, UTC: requestedAt.Add(3 * time.Millisecond).Format(time.RFC3339Nano), PreflightReady: true}
+	later := cycle{Sequence: 5, UTC: tracker.armedAt.Add(3 * time.Millisecond).Format(time.RFC3339Nano), PreflightReady: true}
 	if err := tracker.annotate(&later); err != nil {
 		t.Fatalf("later cycle: %v", err)
 	}
@@ -164,7 +171,7 @@ func TestLatchTrackerCapturesFirstCompletePostCONTycle(t *testing.T) {
 	if err := json.Unmarshal(mustReadFile(t, outputPath), &retained); err != nil {
 		t.Fatal(err)
 	}
-	if retained.Sequence != 3 {
+	if retained.Sequence != 4 {
 		t.Fatalf("latch artifact was overwritten: sequence=%d", retained.Sequence)
 	}
 }
@@ -182,10 +189,40 @@ func TestReadNodeDiagnosticMapsOwnerAuthorityCounters(t *testing.T) {
 		t.Fatalf("read node diagnostic: %v", err)
 	}
 	if got.Source != "rf3-diagnostics-file" || !got.AuthorityAvailable || got.PID != 42 || got.Serial != 7 ||
-		got.Metrics == nil || got.Metrics.AuthorityReadHits != 15 ||
-		got.Metrics.AuthorityReadValidationFailures != 18 ||
-		got.Metrics.ReadAuthorityRequestsCreated != 21 || got.Metrics.ReadAuthorityGrantsAccepted != 22 {
+		got.Metrics == nil || uint64PointerValue(got.Metrics.AuthorityReadHits) != 15 ||
+		uint64PointerValue(got.Metrics.AuthorityReadValidationFailures) != 18 ||
+		uint64PointerValue(got.Metrics.ReadAuthorityRequestsCreated) != 21 ||
+		uint64PointerValue(got.Metrics.ReadAuthorityGrantsAccepted) != 22 {
 		t.Fatalf("node diagnostic = %+v", got)
+	}
+}
+
+func TestReadNodeDiagnosticRejectsMissingAuthorityCounter(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "rf3-diagnostics.json")
+	nodeID := "00112233445566778899aabbccddeeff"
+	raw := []byte(`{"event":"snapshot","utc":"2026-09-05T18:00:00Z","serial":7,"pid":42,"node_id":"` + nodeID + `","raft_applied_entries":11}`)
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readNodeDiagnostic(path, nodeID); err == nil || !strings.Contains(err.Error(), "authority counter") {
+		t.Fatalf("missing authority counter error = %v", err)
+	}
+}
+
+func TestNodeMetricsOmitsUnavailableAuthorityCounters(t *testing.T) {
+	value := nodeMetricsSnapshot{
+		NodeID: "00112233445566778899aabbccddeeff", Scope: "node_process",
+		Source: "servicemetrics", AuthorityAvailable: false,
+		Metrics: &nodeMetrics{AppliedEntries: 11},
+	}
+	raw, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "authority_read_hits") ||
+		strings.Contains(string(raw), "read_authority_rounds_started") {
+		t.Fatalf("unavailable authority counters were serialized as zero: %s", raw)
 	}
 }
 
@@ -196,6 +233,13 @@ func mustReadFile(t *testing.T, path string) []byte {
 		t.Fatal(err)
 	}
 	return raw
+}
+
+func uint64PointerValue(value *uint64) uint64 {
+	if value == nil {
+		return 0
+	}
+	return *value
 }
 
 func hex16(value [16]byte) string {

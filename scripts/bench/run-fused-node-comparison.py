@@ -90,6 +90,13 @@ def run(argv, *, cwd=None, env=None, check=True, stdout=None, stderr=None):
     return completed
 
 
+def mark_result_failed_if_errors(result):
+    """Keep evidence-control failures from being reported as a completed run."""
+    if isinstance(result, dict) and result.get("status") == "completed" and result.get("errors"):
+        result["status"] = "failed"
+    return result
+
+
 def wait_for_diagnostic_preflight(process, container, ready_file, timeout=15):
     """Wait for every configured group/member to pass status and metrics cuts."""
     started = time.monotonic()
@@ -999,6 +1006,7 @@ def run_engine(args, cell, engine, order, binaries, destination, schema, arch):
         result.setdefault("log_files", []).append("client.log")
         result["client_exit_code"] = measured.returncode
         result["status"] = "completed" if measured.returncode == 0 else "failed"
+        mark_result_failed_if_errors(result)
         copied_report = run(["docker", "cp", container + ":/evidence/report.json", destination / "report.json"], check=False)
         if copied_report.returncode:
             raise RunnerError("client report was not retained")
@@ -1083,6 +1091,7 @@ def run_engine(args, cell, engine, order, binaries, destination, schema, arch):
             except Exception as exc:
                 result["errors"].append(f"fixture volume cleanup failed: {exc}")
                 result["status"] = "failed"
+            mark_result_failed_if_errors(result)
             write_json(destination / "run.json", result)
     return result
 
