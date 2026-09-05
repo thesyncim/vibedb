@@ -41,5 +41,5 @@ func TestJSONAccessSimpleAndPreparedWire(t *testing.T) {
 	if cols[0].oid != oidText || string(rowsOf(t, msgs)[0][0]) != "92" {
 		t.Fatalf("text metadata/encoding: %+v", cols)
 	}
-	expectError(t, c.query(`SELECT * FROM documents WHERE "$doc"->>'city'`), sqlstateSyntaxError)
+	expectError(t, c.query(`SELECT * FROM documents WHERE "$doc"->>'city'`), sqlstateDatatypeMismatch)
 }

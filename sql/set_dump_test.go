@@ -135,6 +135,12 @@ func dumpSetTail(b *strings.Builder, tail *SetTail) {
 			} else {
 				b.WriteString(":asc")
 			}
+			if term.Nulls == WindowNullsFirst {
+				b.WriteString(":nulls-first")
+			}
+			if term.Nulls == WindowNullsLast {
+				b.WriteString(":nulls-last")
+			}
 		}
 	}
 	if tail.Limit != nil {

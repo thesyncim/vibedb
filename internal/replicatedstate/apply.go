@@ -1963,6 +1963,7 @@ func (m *Machine) planMutations(
 			mutation.Kind != replication.MutationPutAbsentOrEqual &&
 			mutation.Kind != replication.MutationPutAbsent &&
 			mutation.Kind != replication.MutationPutPresent &&
+			mutation.Kind != replication.MutationPutIfAbsent &&
 			mutation.Kind != replication.MutationPutDigestEqual &&
 			mutation.Kind != replication.MutationDelete &&
 			mutation.Kind != replication.MutationDeleteDigestEqual ||
@@ -2123,6 +2124,9 @@ func (m *Machine) planMutations(
 			}
 			return nil, 0, ResultIndexConflict, nil
 		}
+		if mutation.condition == mutationPutIfAbsent && found {
+			continue
+		}
 		if mutation.condition == mutationPutAbsent {
 			if found {
 				return nil, 0, ResultIndexConflict, nil
@@ -2248,6 +2252,8 @@ func finalMutationCondition(kind replication.MutationKind) mutationCondition {
 		return mutationPutAbsent
 	case replication.MutationPutPresent:
 		return mutationPutPresent
+	case replication.MutationPutIfAbsent:
+		return mutationPutIfAbsent
 	default:
 		return mutationUnconditional
 	}

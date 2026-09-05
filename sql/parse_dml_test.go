@@ -310,7 +310,7 @@ func TestRejectsMutationsTheEngineCannotExecute(t *testing.T) {
 		{"a three-value row", `INSERT INTO t VALUES ('k', ?, ?)`, -1, "one complete JSON document"},
 		{"a NULL document", `INSERT INTO t VALUES (NULL)`, -1, "not a document"},
 		{"DEFAULT VALUES", `INSERT INTO t DEFAULT VALUES`, -1, "no declared columns"},
-		{"conflict target", `INSERT INTO t VALUES (?) ON CONFLICT (id) DO NOTHING`, -1, "CONFLICT targets"},
+		{"composite conflict target", `INSERT INTO t VALUES (?) ON CONFLICT (id, tenant) DO NOTHING`, -1, "composite ON CONFLICT targets"},
 		{"conflict constraint", `INSERT INTO t VALUES (?) ON CONFLICT ON CONSTRAINT t_pkey DO UPDATE SET value = EXCLUDED.value`, -1, "ON CONSTRAINT"},
 		{"conflict update where", `INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET value = EXCLUDED.value WHERE value = 'old'`, -1, "DO UPDATE WHERE"},
 		{"nested conflict target", `INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET profile.name = EXCLUDED.name`, -1, "top-level column"},
@@ -416,10 +416,6 @@ func TestInsertConflictUpdateUnsupportedFormsArePositioned(t *testing.T) {
 		sql    string
 		marker string
 	}{
-		{
-			`INSERT INTO t VALUES (?) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`,
-			`(id)`,
-		},
 		{
 			`INSERT INTO t VALUES (?) ON CONFLICT ON CONSTRAINT t_pkey DO UPDATE SET value = EXCLUDED.value`,
 			`ON CONSTRAINT`,

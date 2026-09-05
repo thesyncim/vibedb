@@ -107,6 +107,40 @@ active BOOLEAN NOT NULL
 		}
 	}
 	check(connection)
+	for _, tc := range []struct{ sql, value string }{
+		{`SELECT COALESCE(SUM(score),0) FROM employees`, "49500"},
+		{`SELECT AVG(score) FROM employees`, "49.5"},
+		{`SELECT score FROM employees ORDER BY GREATEST(score,0) DESC LIMIT 1`, "99"},
+		{`SELECT score FROM employees GROUP BY score ORDER BY SUM(score) DESC LIMIT 1`, "99"},
+		{`WITH selected AS (SELECT id AS owner, score FROM employees) SELECT COALESCE(SUM(score),0) FROM selected WHERE owner='employee-0001'`, "1"},
+		{`SELECT COUNT(*) FROM (SELECT id FROM employees WHERE id='employee-0001' UNION ALL SELECT id FROM employees WHERE id='employee-0002') AS selected`, "2"},
+		{`SELECT selected.score FROM (SELECT score, ROW_NUMBER() OVER (ORDER BY score DESC) AS ordinal FROM employees) AS selected WHERE ordinal=1`, "99"},
+	} {
+		result := ddlWireQuery(t, connection, tc.sql, false)
+		if result.code != "" || len(result.rows) != 1 || len(result.rows[0]) != 1 || result.rows[0][0] != tc.value {
+			t.Fatalf("distributed SQL %s: %+v, want %s", tc.sql, result, tc.value)
+		}
+	}
+	ignored := ddlWireQuery(t, connection, `INSERT INTO employees (id,name,team,city,score,active) VALUES ('employee-0001','Ignored','Platform',NULL,999,false) ON CONFLICT (id) DO NOTHING`, false)
+	if ignored.code != "" || ignored.tag != "INSERT 0 0" {
+		t.Fatalf("atomic conflict skip: %+v", ignored)
+	}
+	check(connection)
+	upserted := ddlWireQuery(t, connection, `INSERT INTO employees (id,name,team,city,score,active) VALUES ('employee-0003','Replacement','Platform',NULL,303,true) ON CONFLICT (id) DO UPDATE SET "$doc"=EXCLUDED."$doc"`, true)
+	if upserted.code != "" || upserted.tag != "INSERT 0 1" {
+		t.Fatalf("atomic replacement upsert: %+v", upserted)
+	}
+	invalidUpsert := ddlWireQuery(t, connection, `INSERT INTO employees (id,name,team,city,score,active) VALUES ('employee-0003','Invalid','Platform',NULL,'bad',true) ON CONFLICT (id) DO UPDATE SET "$doc"=EXCLUDED."$doc"`, true)
+	if invalidUpsert.code == "" {
+		t.Fatal("invalid replacement candidate was accepted")
+	}
+	checkReplacement := func(connection net.Conn) {
+		result := ddlWireQuery(t, connection, `SELECT name,score FROM employees WHERE id='employee-0003'`, true)
+		if result.code != "" || len(result.rows) != 1 || len(result.rows[0]) != 2 || result.rows[0][0] != `"Replacement"` || result.rows[0][1] != "303" {
+			t.Fatalf("replacement did not persist atomically: %+v", result)
+		}
+	}
+	checkReplacement(connection)
 	result = ddlWireQuery(t, connection, ddl, true)
 	if result.code != "42P07" {
 		t.Fatalf("duplicate table: %+v", result)
@@ -123,6 +157,7 @@ active BOOLEAN NOT NULL
 	connection = openDDLWire(t, ctx, address)
 	defer connection.Close()
 	check(connection)
+	checkReplacement(connection)
 }
 
 type ddlWireResult struct {

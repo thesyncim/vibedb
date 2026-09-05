@@ -243,11 +243,13 @@ type InsertStmt struct {
 	// INSERT INTO t (a, b) VALUES (?, ?). It is nil when VALUES carries a
 	// whole JSON document.
 	Columns []*PathExpr
+	// ConflictTarget optionally names the one primary-key column. Execution
+	// validates it against the current table schema before admitting any row.
+	ConflictTarget *PathExpr
 	// OnConflictDoNothing makes an identity collision a skipped row instead of
 	// an error. It is the deliberately narrow, atomic subset of PostgreSQL's
-	// ON CONFLICT grammar supported by the storage adapter. Conflict targets
-	// remain implicit because the document-derived primary key is the only
-	// unique key in this SQL surface.
+	// ON CONFLICT grammar supported by the storage adapter. Only primary-key
+	// conflicts can be handled, whether the target is implicit or explicit.
 	OnConflictDoNothing bool
 	// OnConflictPos is the byte offset of ON in the authored ON CONFLICT clause.
 	// It is zero when no conflict action was written. Consumers should prefer the

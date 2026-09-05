@@ -93,11 +93,19 @@ func dumpInsert(s *InsertStmt) string {
 		}
 		b.WriteByte(')')
 	}
+	if s.HasConflictAction() {
+		b.WriteString(" on conflict")
+		if s.ConflictTarget != nil {
+			b.WriteString(" (")
+			dumpPath(&b, s.ConflictTarget)
+			b.WriteByte(')')
+		}
+	}
 	if s.OnConflictDoNothing {
-		b.WriteString(" on conflict do nothing")
+		b.WriteString(" do nothing")
 	}
 	if s.OnConflictUpdate != nil {
-		b.WriteString(" on conflict do update set ")
+		b.WriteString(" do update set ")
 		if s.OnConflictUpdate.WholeDocument() {
 			b.WriteString("\"$doc\"=")
 			dumpOperand(&b, s.OnConflictUpdate.Doc)

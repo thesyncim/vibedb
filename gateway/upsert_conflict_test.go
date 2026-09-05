@@ -12,15 +12,12 @@ import (
 	sqlast "github.com/thesyncim/vibedb/sql"
 )
 
-func TestSnapshotPrepareRejectsConflictUpdateBeforeBind(t *testing.T) {
+func TestSnapshotPrepareAllowsConflictUpdateWithoutGlobalIndex(t *testing.T) {
 	const text = `INSERT INTO messages (tenant_id, n) VALUES (?, ?) ON CONFLICT DO UPDATE SET n = EXCLUDED.n`
 
 	prepared, err := testSnapshot(t, 1).Prepare(context.Background(), text)
-	if !errors.Is(err, ErrDistributedWriteUnsupported) {
-		t.Fatalf("Prepare error = %v, want ErrDistributedWriteUnsupported", err)
-	}
-	if prepared != nil {
-		t.Fatal("unsupported conflict update returned a bindable plan")
+	if err != nil || prepared == nil {
+		t.Fatalf("Prepare error = %v, plan = %v", err, prepared)
 	}
 }
 
@@ -40,6 +37,10 @@ func TestSnapshotPrepareRejectsConflictNothingWithReadyGlobalIndex(t *testing.T)
 	}
 	if prepared != nil {
 		t.Fatal("indexed conflict skip returned a bindable plan")
+	}
+	prepared, err = snapshot.Prepare(context.Background(), `INSERT INTO messages (tenant_id,id,email) VALUES (?,?,?) ON CONFLICT DO UPDATE SET email=EXCLUDED.email`)
+	if !errors.Is(err, ErrDistributedWriteUnsupported) || prepared != nil {
+		t.Fatalf("indexed conflict update was not refused: %v %v", prepared, err)
 	}
 }
 
@@ -105,10 +106,6 @@ func TestPostgreSQLRF3PrepareRejectsConflictActionsAsFeatureNotSupported(t *test
 		text   string
 		marker string
 	}{
-		{
-			text:   `INSERT INTO messages (id, value) VALUES (?, ?) ON CONFLICT DO NOTHING`,
-			marker: "ON CONFLICT",
-		},
 		{
 			text:   `INSERT INTO messages (id, value) VALUES (?, ?) ON CONFLICT DO UPDATE SET value = EXCLUDED.value`,
 			marker: "UPDATE",

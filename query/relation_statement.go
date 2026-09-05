@@ -260,6 +260,9 @@ func (s *Statement) validateRelationReferences() error {
 		if err := s.validateRelationPath(s.tree.OrderBy[i].Path); err != nil {
 			return err
 		}
+		if err := s.validateScalarRelationPaths(s.tree.OrderBy[i].Scalar); err != nil {
+			return err
+		}
 	}
 	return nil
 }

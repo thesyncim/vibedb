@@ -308,7 +308,7 @@ func (s *postgresSession) prepare(
 	if err != nil {
 		return nil, err
 	}
-	local := len(tree.From) == 0
+	local := !coordinatorHasPhysicalReferences(tree)
 	var catalogGeneration uint64
 	var execution preparedQueryExecution
 	if !local {

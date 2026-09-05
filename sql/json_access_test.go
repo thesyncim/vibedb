@@ -40,7 +40,6 @@ func TestJSONAccessCompiledPathsAndEquality(t *testing.T) {
 
 func TestJSONAccessRejectsUnsupportedAndIncomplete(t *testing.T) {
 	for _, source := range []string{
-		`SELECT * FROM documents WHERE "$doc"->>'city'`,
 		`SELECT "$doc"->>? FROM documents`,
 		`SELECT "$doc"->>-1 FROM documents`,
 		`SELECT "$doc"->>0 FROM documents`,

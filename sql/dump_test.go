@@ -98,7 +98,9 @@ func dumpStmt(s *SelectStmt) string {
 		b.WriteString(" order")
 		for i := range s.OrderBy {
 			b.WriteByte(' ')
-			if s.OrderBy[i].Output != 0 {
+			if s.OrderBy[i].Scalar != nil {
+				dumpScalar(&b, s.OrderBy[i].Scalar)
+			} else if s.OrderBy[i].Output != 0 {
 				fmt.Fprintf(&b, "output(%d)", s.OrderBy[i].Output-1)
 			} else {
 				dumpPath(&b, s.OrderBy[i].Path)
@@ -107,6 +109,12 @@ func dumpStmt(s *SelectStmt) string {
 				b.WriteString(":desc")
 			} else {
 				b.WriteString(":asc")
+			}
+			if s.OrderBy[i].Nulls == WindowNullsFirst {
+				b.WriteString(":nulls-first")
+			}
+			if s.OrderBy[i].Nulls == WindowNullsLast {
+				b.WriteString(":nulls-last")
 			}
 		}
 	}
@@ -555,6 +563,14 @@ func dumpScalarOp(op ScalarOp) string {
 		return "u+"
 	case ScalarNegative:
 		return "u-"
+	case ScalarCoalesce:
+		return "coalesce"
+	case ScalarGreatest:
+		return "greatest"
+	case ScalarLeast:
+		return "least"
+	case ScalarNullIf:
+		return "nullif"
 	default:
 		return fmt.Sprintf("op(%d)", op)
 	}

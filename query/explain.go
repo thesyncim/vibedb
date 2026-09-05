@@ -317,8 +317,14 @@ func (p *plan) explainJSONAnalysis(
 			continue
 		}
 		direction := "ASC"
-		if order.dir == Desc {
+		if order.dir == Desc || order.dir == DescNullsFirst {
 			direction = "DESC"
+		}
+		if order.dir == AscNullsLast {
+			direction += " NULLS LAST"
+		}
+		if order.dir == DescNullsFirst {
+			direction += " NULLS FIRST"
 		}
 		plan.OrderBy = append(plan.OrderBy,
 			p.valuePaths[order.value].spec+" "+direction)

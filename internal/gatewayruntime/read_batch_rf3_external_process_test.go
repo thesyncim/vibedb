@@ -4,7 +4,9 @@ package gatewayruntime
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"os"
 	"runtime"
 	"slices"
@@ -369,15 +371,24 @@ func (client *durableRF3ExternalWireClient) roundTripWhileGatewayStopped(
 	if client == nil || client.connection == nil || len(request) == 0 || pid <= 0 || delay <= 0 {
 		t.Fatal("invalid delayed external gateway round trip")
 	}
-	if err := syscall.Kill(pid, syscall.SIGSTOP); err != nil {
+	process, err := fusedReadLinuxProcess(pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fusedSignalExact(process, syscall.SIGSTOP); err != nil {
 		t.Fatal(err)
 	}
 	stopped := true
 	defer func() {
 		if stopped {
-			_ = syscall.Kill(pid, syscall.SIGCONT)
+			_ = fusedSignalExact(process, syscall.SIGCONT)
 		}
 	}()
+	// Signal delivery is asynchronous. Observe the stopped process before
+	// writing, otherwise a fast gateway can finish the request first.
+	if err := waitFusedProcessState(t.Context(), process, 'T', nil); err != nil {
+		t.Fatal(err)
+	}
 	wire := append(append([]byte(nil), request...), '\n')
 	started := time.Now()
 	written, err := client.connection.Write(wire)
@@ -389,10 +400,11 @@ func (client *durableRF3ExternalWireClient) roundTripWhileGatewayStopped(
 	}
 	var probe [1]byte
 	read, readErr := client.reader.Read(probe[:])
-	if read != 0 || readErr == nil {
+	var timeout net.Error
+	if read != 0 || !errors.As(readErr, &timeout) || !timeout.Timeout() {
 		t.Fatalf("stopped gateway emitted response read=%d bytes=%q err=%v", read, probe[:read], readErr)
 	}
-	if err = syscall.Kill(pid, syscall.SIGCONT); err != nil {
+	if err = fusedSignalExact(process, syscall.SIGCONT); err != nil {
 		t.Fatal(err)
 	}
 	stopped = false
