@@ -210,8 +210,8 @@ func (a *ReplicatedApply) pointReadSessionLayoutLocked(
 	if err != nil {
 		return transactionTableLayout{}, nil, ReplicatedShardRelationIdentity{}, err
 	}
-	expectedManifest, err := ReplicatedSchemaManifest(
-		*base, a.identity.Placement, replicatedApplyLocalIndexes(table),
+	expectedManifest, err := replicatedSchemaManifestValidated(
+		*base, a.identity, replicatedApplyLocalIndexes(table),
 	)
 	if err != nil || manifest != expectedManifest {
 		return transactionTableLayout{}, nil, ReplicatedShardRelationIdentity{},
