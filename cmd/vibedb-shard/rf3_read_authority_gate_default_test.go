@@ -14,7 +14,6 @@ import (
 )
 
 func TestStandardShardRejectsEnabledReadAuthorityBeforeRuntime(t *testing.T) {
-	root := t.TempDir()
 	config := &rf3ManifestReadAuthority{
 		Enabled: true, FeatureVersion: rf3ReadAuthorityFeatureVersion,
 		PolicyVersion:        rf3ReadAuthorityPolicyVersion,
@@ -38,13 +37,6 @@ func TestStandardShardRejectsEnabledReadAuthorityBeforeRuntime(t *testing.T) {
 	}
 	if err := validateRF3ReadAuthority(config, []rf3ManifestGroup{group}, false); !errors.Is(err, errRF3ReadAuthority) {
 		t.Fatalf("standard enabled policy error = %v", err)
-	}
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(entries) != 0 {
-		t.Fatalf("standard manifest rejection wrote %d storage entries", len(entries))
 	}
 }
 

@@ -37,7 +37,7 @@ Creates or reopens one durable local development topology and supervises its chi
 | `--diagnostics-on-exit` | `false` | Print bounded child log tails after shutdown. |
 | `--pg-listen` | disabled | RF3-only PostgreSQL endpoint on the first physical node. Requires a literal loopback IP and port `1..65535`. |
 | `--pg-listens` | disabled | Comma-separated distinct loopback endpoints, one per physical node. Mutually exclusive with `--pg-listen`. |
-| `--read-authority` | `false` | Laboratory-only opt in to the qualified RF3 physical-node quorum read-authority protocol. Standard binaries reject this flag before cluster creation; the retained cluster must use the same setting. |
+| `--read-authority` | `false` | Laboratory-only experimental RF3 read-authority protocol. Standard binaries reject this flag before cluster creation; the retained cluster must use the same setting. |
 | `--table-schema` | none | Repeatable RF3-only file, each containing one `CREATE TABLE` with one primary key; retained on restart. |
 
 RF1 starts three independent single-member Raft groups and no gateway. RF3
