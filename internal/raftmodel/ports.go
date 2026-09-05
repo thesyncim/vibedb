@@ -22,6 +22,10 @@ import (
 // A nil return means that Snapshot, Entries, and HardState have reached stable
 // storage in that order. When MustSync is true, the durability barrier must
 // also be complete before Persist returns.
+// Commit-only notifications with MustSync=false are an explicit exception:
+// unchanged term/vote and already-durable entries allow the commit knowledge to
+// remain volatile. Live reads may include it; recovery uses the durable log and
+// state-machine publication. The next required persist folds the live commit.
 type PersistBatch struct {
 	NodeIncarnation   uint64
 	ReadyID           uint64

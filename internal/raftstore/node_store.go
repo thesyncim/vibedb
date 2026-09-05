@@ -115,6 +115,7 @@ const (
 )
 
 type NodeStore struct {
+	commitHints                               map[uint64]nodeCommitHint
 	pendingEntryPayloads                      [MaxPersistGroupBatches][nodeRecentTerms]nodeTermCoordinate
 	entryCacheArena                           []byte
 	entryCacheGenerations                     [nodeEntryCacheSlots]uint64
@@ -740,6 +741,9 @@ func (s *NodeStore) publishGroupCheckpointSequenced(group uint64, snapshot *pb.S
 	if !registered || validateSnapshotBase(snapshot, descriptor.MemberID) != nil {
 		return ErrInvalid
 	}
+	if err := s.flushCommitHintsLocked([]uint64{group}); err != nil {
+		return err
+	}
 	metadata, ok := s.engine.Metadata(group)
 	if !ok {
 		return ErrInvalid
@@ -1101,6 +1105,9 @@ func (s *NodeStore) preflightReadyItem(item *NodeReady) (raftmodel.PersistBatch,
 	if !ok || batch.NodeIncarnation == 0 || batch.NodeIncarnation != state.NodeIncarnation {
 		return raftmodel.PersistBatch{}, seglog.GroupSummary{}, [16]byte{}, false, ErrInvalid
 	}
+	if hint, exists := s.commitHints[item.GroupID]; exists {
+		state.ReadyID, state.ReadyDigest = hint.readyID, hint.digest
+	}
 	if batch.ReadyID == state.ReadyID {
 		if digest != state.ReadyDigest {
 			return raftmodel.PersistBatch{}, seglog.GroupSummary{}, [16]byte{}, false, ErrRetryConflict
@@ -1111,8 +1118,13 @@ func (s *NodeStore) preflightReadyItem(item *NodeReady) (raftmodel.PersistBatch,
 	if !metadataOK {
 		return raftmodel.PersistBatch{}, seglog.GroupSummary{}, [16]byte{}, false, ErrInvalid
 	}
-	if item.seriesCount != 0 {
-		if err := validateReadySeriesTransitions(state, metadata, item.series[:item.seriesCount]); err != nil {
+	metadata = s.liveNodeMetadata(item.GroupID, metadata)
+	if canonicalEmptySnapshot(batch.Snapshot) {
+		series := item.series[:item.seriesCount]
+		if item.seriesCount == 0 {
+			series = []raftmodel.PersistBatch{item.Batch}
+		}
+		if err := validateReadySeriesTransitions(state, metadata, series); err != nil {
 			return raftmodel.PersistBatch{}, seglog.GroupSummary{}, [16]byte{}, false, err
 		}
 	}
@@ -1148,6 +1160,10 @@ func (s *NodeStore) persistWave(ready []NodeReady, sequenced bool) error {
 	}
 	if s.poisoned != nil {
 		return errors.Join(ErrPersistenceUnknown, s.poisoned)
+	}
+	if err := s.engine.PublishedFailure(); err != nil {
+		s.poisonLocked(err)
+		return errors.Join(ErrPersistenceUnknown, err)
 	}
 	if err := s.proveNamespace(); err != nil {
 		s.poisonLocked(err)
@@ -1194,6 +1210,27 @@ func (s *NodeStore) persistWave(ready []NodeReady, sequenced bool) error {
 	if totalPlain > cap(s.plainArena) || totalEntries > cap(s.pageRefs) || totalEntries > (cap(s.cipherArena)-totalPlain)/s.crypto.aead.Overhead() {
 		return ErrBounds
 	}
+	// A large caller series may not fit beside earlier volatile Readies in one
+	// bounded on-disk span. Flush only previously acknowledged hints, after the
+	// entire incoming wave has passed preflight.
+	var overflowGroups [MaxPersistGroupBatches]uint64
+	overflowCount := 0
+	for i := range ready {
+		if hint, ok := s.commitHints[ready[i].GroupID]; ok {
+			durable, _ := s.engine.Summary(ready[i].GroupID)
+			if hint.readyID-durable.ReadyID+uint64(nodeReadySeriesCount(ready[i])) > seglog.MaximumReadySpan {
+				overflowGroups[overflowCount] = ready[i].GroupID
+				overflowCount++
+			}
+		}
+	}
+	if overflowCount != 0 {
+		if err := s.flushCommitHintsLocked(overflowGroups[:overflowCount]); err != nil {
+			return err
+		}
+	}
+	var deferred [MaxPersistGroupBatches]nodeCommitHint
+	var deferGroup [MaxPersistGroupBatches]bool
 	s.plainArena = s.plainArena[:totalPlain]
 	s.cipherArena = s.cipherArena[:0]
 	plainOffset, entryOffset, mappedCount := 0, 0, 0
@@ -1205,6 +1242,19 @@ func (s *NodeStore) persistWave(ready []NodeReady, sequenced bool) error {
 		}
 		state, retryDigest := states[i], digests[i]
 		if batch.NodeIncarnation == state.NodeIncarnation && batch.ReadyID == state.ReadyID {
+			continue
+		}
+		durable, _ := s.engine.Summary(item.GroupID)
+		metadata, _ := s.engine.Metadata(item.GroupID)
+		metadata = s.liveNodeMetadata(item.GroupID, metadata)
+		span := batch.ReadyID - durable.ReadyID
+		if nodeHintEligible(batch, metadata.Hard) && span < seglog.MaximumReadySpan {
+			hard := metadata.Hard
+			if !isEmptyHardState(batch.HardState) {
+				hard = seglog.HardState{Term: batch.HardState.GetTerm(), Vote: batch.HardState.GetVote(), Commit: batch.HardState.GetCommit()}
+			}
+			deferred[i] = nodeCommitHint{incarnation: batch.NodeIncarnation, readyID: batch.ReadyID, digest: retryDigest, hard: hard}
+			deferGroup[i] = true
 			continue
 		}
 		if len(batch.Entries) > len(s.waveEntryArena)-entryOffset {
@@ -1219,14 +1269,18 @@ func (s *NodeStore) persistWave(ready []NodeReady, sequenced bool) error {
 		}
 		entryOffset += len(entries)
 		mapped := seglog.ReadyBatch{GroupID: item.GroupID, NodeIncarnation: batch.NodeIncarnation, ReadyID: batch.ReadyID, ReadyDigest: retryDigest, Entries: entries}
-		if item.seriesCount != 0 {
-			mapped.ReadySpan = uint64(item.seriesCount)
+		if span > 1 {
+			mapped.ReadySpan = span
 		}
 		if len(entries) > 0 && entries[0].Index <= state.LastIndex {
 			mapped.ReplaceFrom = entries[0].Index
 		}
 		if batch.HardState != nil && !isEmptyHardState(batch.HardState) {
 			s.waveHard[mappedCount] = seglog.HardState{Term: batch.HardState.GetTerm(), Vote: batch.HardState.GetVote(), Commit: batch.HardState.GetCommit()}
+			mapped.Hard = &s.waveHard[mappedCount]
+		}
+		if mapped.Hard == nil && s.commitHints[item.GroupID].readyID != 0 {
+			s.waveHard[mappedCount] = metadata.Hard
 			mapped.Hard = &s.waveHard[mappedCount]
 		}
 		if !canonicalEmptySnapshot(batch.Snapshot) {
@@ -1246,6 +1300,14 @@ func (s *NodeStore) persistWave(ready []NodeReady, sequenced bool) error {
 		mappedCount++
 	}
 	if duplicates == len(ready) {
+		return nil
+	}
+	if mappedCount == 0 {
+		for i := range ready {
+			if deferGroup[i] {
+				s.publishCommitHintLocked(ready[i].GroupID, deferred[i])
+			}
+		}
 		return nil
 	}
 	s.plainArena = s.plainArena[:plainOffset]
@@ -1276,9 +1338,15 @@ func (s *NodeStore) persistWave(ready []NodeReady, sequenced bool) error {
 	}
 	for index := 0; index < mappedCount; index++ {
 		batch := &s.waveBatches[index]
+		delete(s.commitHints, batch.GroupID)
 		s.publishCoordinatesLocked(batch.GroupID, batch, &s.pendingEntryPayloads[index])
 	}
 
+	for i := range ready {
+		if deferGroup[i] {
+			s.publishCommitHintLocked(ready[i].GroupID, deferred[i])
+		}
+	}
 	s.cacheValid = false
 	return nil
 }
@@ -1436,6 +1504,9 @@ func (s *NodeStore) persistIncarnationsLocked(requests []GroupIncarnation) error
 	}
 	if err := s.proveNamespace(); err != nil {
 		s.poisonLocked(err)
+		return err
+	}
+	if err := s.flushAllCommitHintsLocked(); err != nil {
 		return err
 	}
 	mapped := 0
@@ -1848,6 +1919,9 @@ func (s *NodeStore) Close() error {
 	s.maintenance.Wait()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.poisoned == nil {
+		err = errors.Join(err, s.flushAllCommitHintsLocked())
+	}
 	s.closed = true
 	s.closing = false
 	if s.engine != nil {
@@ -1942,11 +2016,11 @@ func (v *GroupView) LastIndex() (uint64, error) {
 	return cut.last, err
 }
 
-// LogBounds returns one published durable coordinate cut without waiting for
-// unrelated group writes or constructing protobuf checkpoint state.
+// LogBounds returns durable log bounds and live commit knowledge without
+// waiting for unrelated disk writes. Commit-only hints are not a persisted floor.
 func (v *GroupView) LogBounds() (last, commit uint64, err error) {
 	cut, err := v.logCoordinates()
-	return cut.last, cut.commit, err
+	return cut.last, max(cut.commit, cut.liveCommit), err
 }
 
 func (v *GroupView) InitialState() (*pb.HardState, *pb.ConfState, error) {
@@ -1963,6 +2037,7 @@ func (v *GroupView) InitialState() (*pb.HardState, *pb.ConfState, error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	state = v.store.liveNodeMetadata(v.group, state)
 	term, vote, commit := state.Hard.Term, state.Hard.Vote, state.Hard.Commit
 	return &pb.HardState{Term: &term, Vote: &vote, Commit: &commit}, cloneConfState(snapshot.GetMetadata().GetConfState()), nil
 }

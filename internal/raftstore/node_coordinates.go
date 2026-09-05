@@ -22,6 +22,7 @@ type nodeTermCoordinate struct {
 // must never take the device mutex held across that wave's disk I/O.
 type nodeLogCoordinates struct {
 	first, last, commit, baseTerm uint64
+	liveCommit                    uint64
 	terms                         *[nodeRecentTerms]nodeTermCoordinate
 }
 type nodeCoordinateFailure struct{ err error }
@@ -102,6 +103,9 @@ func (v *GroupView) logCoordinates() (nodeLogCoordinates, error) {
 		return nodeLogCoordinates{}, raft.ErrUnavailable
 	}
 	cut = coordinatesFromMetadata(state, new([nodeRecentTerms]nodeTermCoordinate))
+	if hint, ok := s.commitHints[v.group]; ok {
+		cut.liveCommit = hint.hard.Commit
+	}
 	if _, term, compacted, found, err := s.engine.LookupExact(v.group, state.LastIndex); err == nil && found && !compacted {
 		cut.terms[state.LastIndex%nodeRecentTerms] = nodeTermCoordinate{index: state.LastIndex, term: term}
 	}
