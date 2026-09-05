@@ -2496,3 +2496,23 @@ func TestReplicatedCatalogReadRejectsEqualGenerationDivergence(t *testing.T) {
 		t.Fatalf("equal-generation divergent catalog = %v", err)
 	}
 }
+
+func TestReplicatedCatalogReadConvergesWhenHeadAndWitnessStraddlePublication(t *testing.T) {
+	publisher, client, current := newCatalogAuthorityFixture(t)
+	reader := newCatalogAuthorityPeer(t, publisher, NewCatalogHolder(nil), 0x91)
+	next := testCatalogAuthoritySnapshot(t, current.Generation()+1)
+	var publishErr error
+	client.onRead = func(key []byte) {
+		if !bytes.Equal(key, replicatedCatalogHeadWitnessKey) {
+			return
+		}
+		client.mu.Lock()
+		client.onRead = nil
+		client.mu.Unlock()
+		publishErr = publisher.Publish(context.Background(), current.Generation(), next)
+	}
+	observed, err := reader.Read(context.Background())
+	if publishErr != nil || err != nil || observed == nil || observed.Generation() != next.Generation() {
+		t.Fatalf("straddled publication publish=%v read=%v observed=%v", publishErr, err, observed)
+	}
+}
