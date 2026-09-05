@@ -113,6 +113,36 @@ func TestSQLLateralCorrelatedHavingUnprojectedKeysAndThreeValuedLogic(t *testing
 	}
 }
 
+func TestSQLLateralHavingHiddenAggregates(t *testing.T) {
+	db := lateralStatementDatabase(t)
+	for _, tc := range []struct {
+		name, child string
+		want        []string
+	}{
+		{"local count", `SELECT SUM(a.id) AS value FROM items i WHERE i.owner=a.id GROUP BY a.id HAVING COUNT(*)>1`, []string{"1,2", "2,null", "3,null"}},
+		{"local sum", `SELECT a.id AS value FROM items i WHERE i.owner=a.id GROUP BY a.id HAVING SUM(i.owner)>1`, []string{"1,1", "2,2", "3,null"}},
+		{"captured sum", `SELECT COUNT(*) AS value FROM items i WHERE i.owner=a.id GROUP BY a.id HAVING SUM(a.id)>1`, []string{"1,2", "2,1", "3,null"}},
+		{"captured aggregate only", `SELECT COUNT(*) AS value FROM items i WHERE i.owner=a.id HAVING SUM(a.id)>1`, []string{"1,2", "2,1", "3,null"}},
+		{"captured empty", `SELECT COUNT(*) AS value FROM items i WHERE i.owner=a.id HAVING SUM(a.id) IS NULL`, []string{"1,null", "2,null", "3,0"}},
+		{"mixed reductions", `SELECT COUNT(*) AS value FROM items i WHERE i.owner=a.id GROUP BY a.id HAVING SUM(a.id)>1 AND SUM(i.owner)>1 AND COUNT(*) IN (1,2)`, []string{"1,2", "2,1", "3,null"}},
+		{"mixed groups", `SELECT COUNT(*) AS value FROM items i WHERE i.owner=a.id GROUP BY a.id,i.active HAVING AVG(a.id)>1 AND MAX(a.id)<3 AND MIN(a.id)=2`, []string{"1,null", "2,1", "3,null"}},
+		{"unknown negation", `SELECT COUNT(*) AS value FROM items i WHERE i.owner=a.id HAVING NOT (SUM(a.id)>1)`, []string{"1,null", "2,null", "3,null"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			statement, exec, got := runLateralStatement(t, db,
+				`SELECT a.id,d.value FROM accounts a LEFT JOIN LATERAL (`+tc.child+`) d ON TRUE`)
+			defer statement.Release()
+			defer exec.Release()
+			if strings.Join(got, "\n") != strings.Join(tc.want, "\n") {
+				t.Fatalf("rows=%q want=%q", got, tc.want)
+			}
+			if columns := statement.Columns(); strings.Join(columns, ",") != "id,d.value" {
+				t.Fatalf("hidden aggregate leaked into schema: %q", columns)
+			}
+		})
+	}
+}
+
 func TestSQLLateralCorrelatedAggregateExactDecimalsNullMissingAndContainers(t *testing.T) {
 	db := &store.Database{}
 	outer, err := db.CreateCollection("lateral_exact_outer", store.Options{ChunkDocuments: 2})
@@ -311,7 +341,7 @@ func TestSQLLateralCorrelatedGroupedWarmExecutionIsAllocationFree(t *testing.T) 
 	statement, err := PrepareStatement(`
 		SELECT a.id, d.total FROM accounts a LEFT JOIN LATERAL (
 			SELECT SUM(a.id) AS total FROM items i WHERE i.owner = a.id
-			GROUP BY a.id HAVING SUM(a.id) >= ?
+			GROUP BY a.id HAVING SUM(a.id) >= ? AND COUNT(*)>0 AND AVG(a.id)>0
 		) d ON TRUE`)
 	if err != nil {
 		t.Fatal(err)
