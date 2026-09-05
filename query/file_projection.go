@@ -339,18 +339,21 @@ func (s *fileSmallScan) projectedResultInto(
 	}
 	fieldBytes := 0
 	for _, field := range fields {
-		if fieldBytes > int(^uint(0)>>1)-len(field.JSON) {
+		scratchBytes := field.ScratchBytes()
+		if fieldBytes > int(^uint(0)>>1)-scratchBytes {
 			return &WorkBudgetError{
 				Resource: "durable projected field payload",
 				Bytes:    math.MaxInt64,
 				Limit:    math.MaxInt64,
 			}
 		}
-		fieldBytes += len(field.JSON)
+		fieldBytes += scratchBytes
 	}
-	// Storage bounds its append into projectionValues, but retain this guard at
-	// the callback boundary as well: compressed stream decoding must never be
-	// followed by an unbounded query-side copy.
+	// Storage bounds its append into projectionValues for scratch-backed fields,
+	// but retain this guard at the callback boundary as well: compressed stream
+	// decoding must never be followed by an unbounded query-side copy. Borrowed
+	// dictionary bytes and native integers are admitted separately and are
+	// charged by text/result ownership below.
 	if fieldBytes > cap(s.projectionValues) {
 		return &WorkBudgetError{
 			Resource: "durable projected field payload",
@@ -377,9 +380,25 @@ func (s *fileSmallScan) projectedResultInto(
 		rowCells = rowCells[:len(fields)]
 	}
 	for field, value := range fields {
-		scalarValue := classifyRawInto(
-			vibejson.RawValue{Src: value.JSON}, &s.work.text,
-		)
+		var scalarValue scalar
+		switch value.Kind {
+		case storeio.UnifiedProjectionFieldInteger:
+			// Native compact integers retain their exact int64 value and do
+			// not need a JSON render/parse round trip. Leave num empty so
+			// mixed exact-decimal comparisons use the bounded stack spelling
+			// only when they truly need one.
+			scalarValue = scalar{
+				kind: kindNumber, isInt: true, ival: value.Integer,
+			}
+		case storeio.UnifiedProjectionFieldMissing:
+			// A missing projection has nil raw bytes, preserving cellMissing
+			// through cellFromScalar while explicit null keeps its raw JSON.
+			scalarValue = scalar{kind: kindNull}
+		default:
+			scalarValue = classifyRawInto(
+				vibejson.RawValue{Src: value.JSON}, &s.work.text,
+			)
+		}
 		cell := cellFromScalar(scalarValue)
 		add := projectedCellPayloadBytes(cell)
 		if add < 0 || rowPayload > math.MaxInt64-add {

@@ -37,8 +37,8 @@ func TestCompactProjectionPreparesOnlyVisitedShapesReview(t *testing.T) {
 				seen, shapes, streams, fields, scratch, 1,
 				func(row uint64, fields []UnifiedProjectionField) error {
 					calls++
-					if row != 0 || string(fields[0].JSON) != fmt.Sprint(start) {
-						t.Fatalf("row=%d value=%s, want %d", row, fields[0].JSON, start)
+					if row != 0 || string(fields[0].AppendJSON(nil)) != fmt.Sprint(start) {
+						t.Fatalf("row=%d value=%s, want %d", row, fields[0].AppendJSON(nil), start)
 					}
 					return nil
 				})

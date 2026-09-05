@@ -21,6 +21,12 @@ func TestCoordinatorQueryMatchesGlobalSQLSemantics(t *testing.T) {
 		want []string
 	}{
 		{`SELECT COALESCE(SUM(n), 0) FROM messages`, []string{"10"}},
+		{`SELECT COUNT(*), SUM(n), AVG(n) FROM messages WHERE COALESCE(n,0)>1`, []string{"3|9|3"}},
+		{`SELECT n, COUNT(*) FROM messages WHERE n IS DISTINCT FROM NULL GROUP BY n ORDER BY -SUM(n) LIMIT 2`, []string{"4|1", "3|1"}},
+		{`SELECT COUNT(*), COALESCE(SUM(n),0) FROM messages WHERE COALESCE(n,0)>100`, []string{"0|0"}},
+		{`WITH c AS (SELECT n FROM messages) SELECT SUM(n) FROM c WHERE COALESCE(n,0)>2`, []string{"7"}},
+		{`SELECT n, COUNT(*), ROW_NUMBER() OVER (ORDER BY n) AS rn FROM messages WHERE COALESCE(n,0)>2 GROUP BY n ORDER BY n`, []string{"3|1|1", "4|1|2"}},
+		{`SELECT SUM(c.n) FROM messages AS a JOIN messages AS b ON a.n=b.n JOIN messages AS c ON b.n=c.n WHERE COALESCE(c.n,0)>2`, []string{"7"}},
 		{`SELECT GREATEST(SUM(n), 5), LEAST(MAX(n), 3), NULLIF(COUNT(*), 0) FROM messages`, []string{"10|3|4"}},
 		{`SELECT n FROM messages WHERE n=1 OR COALESCE(n,0)=4 ORDER BY n`, []string{"1", "4"}},
 		{`SELECT d.n FROM (SELECT n, CASE WHEN n>2 THEN TRUE ELSE FALSE END AS visible FROM messages) AS d WHERE d.visible ORDER BY d.n`, []string{"3", "4"}},
@@ -148,6 +154,9 @@ func TestCoordinatorQueryPrunesNestedShardKeysWithoutCrossingLimit(t *testing.T)
 		want   []string
 	}{
 		{`WITH c(owner,n) AS (SELECT tenant_id,n FROM messages) SELECT SUM(n)+1 FROM c WHERE owner=?`, []shardservice.Param{shardservice.StringParam(keys[0])}, 1, []string{"1.01e2"}},
+		{`WITH c(owner,n) AS (SELECT tenant_id,n FROM messages) SELECT COUNT(*), SUM(n) FROM c WHERE owner IS NOT DISTINCT FROM ? AND COALESCE(n,0)>?`, []shardservice.Param{shardservice.StringParam(keys[0]), shardservice.NumberParam("50")}, 1, []string{"1|100"}},
+		{`SELECT COUNT(*) FROM messages WHERE tenant_id IS NOT DISTINCT FROM NULL`, nil, 0, []string{"0"}},
+		{`SELECT SUM(c.n) FROM messages AS a JOIN messages AS b ON a.tenant_id=b.tenant_id JOIN messages AS c ON b.tenant_id=c.tenant_id WHERE a.tenant_id=? AND COALESCE(c.n,0)>50`, []shardservice.Param{shardservice.StringParam(keys[0])}, 1, []string{"100"}},
 		{`WITH c(owner,n) AS (SELECT tenant_id,n FROM messages) SELECT n+1 FROM c WHERE owner IS NOT DISTINCT FROM ?`, []shardservice.Param{shardservice.StringParam(keys[0])}, 1, []string{"1.01e2"}},
 		{`SELECT n FROM messages WHERE tenant_id IS NOT DISTINCT FROM ?`, []shardservice.Param{shardservice.StringParam(keys[1])}, 1, []string{"100"}},
 		{`WITH c(owner,n) AS (SELECT tenant_id,n FROM messages) SELECT n+1 FROM c WHERE owner IS NOT DISTINCT FROM NULL`, nil, 0, nil},

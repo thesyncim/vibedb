@@ -13,6 +13,7 @@ See [Contributing](../../CONTRIBUTING.md) for current checks and
 
 | Record | Report |
 | --- | --- |
+| `timer-backpressure-2026-09-05` | [Timer backpressure fixture race evidence](timer-backpressure-2026-09-05/README.md) |
 | `read-authority-2026-09-05` | [Intermediate quorum read authority qualification](read-authority-2026-09-05/README.md) |
 | `wide-update-client-2026-09-04` | [Wide-key client verification](wide-update-client-2026-09-04/README.md) |
 | `sharded-clock-2026-09-04` | [Sharded transaction clock correctness review](sharded-clock-2026-09-04/README.md) |

@@ -28,6 +28,8 @@ type tickPressureHost struct {
 	busyGroup           raftmember.GroupKey
 	attempts            chan error
 	drained             chan struct{}
+	blocked             chan struct{}
+	blockedStop         <-chan struct{}
 }
 
 func (host *tickPressureHost) RequestTick(group raftmember.GroupKey) error {
@@ -67,10 +69,23 @@ func (host *tickPressureHost) PopOutbound() (raftmember.OutboundMessage, bool) {
 
 func (host *tickPressureHost) RunOne() (multiraft.Progress, bool, error) {
 	host.mu.Lock()
-	defer host.mu.Unlock()
 	if host.runBlocked {
+		blocked := host.blocked
+		blockedStop := host.blockedStop
+		host.mu.Unlock()
+		if blocked != nil {
+			// Some tests need to distinguish a blocked retry from a later pulse.
+			// Keep this test-only acknowledgement outside host.mu so the test can
+			// change runBlocked after observing the exact blocked attempt. Cancellation
+			// releases the fake Host if the test aborts before acknowledging it.
+			select {
+			case blocked <- struct{}{}:
+			case <-blockedStop:
+			}
+		}
 		return multiraft.Progress{}, false, errors.New("test retryable durable Ready pressure")
 	}
+	defer host.mu.Unlock()
 	if host.ticks == 0 && host.message == nil {
 		return multiraft.Progress{}, false, nil
 	}
@@ -100,7 +115,13 @@ func tickPressureMessage() *pb.Message {
 func TestOwnerRejectedTimerOffersPreserveBoundedMessagesAndResume(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	host := &tickPressureHost{runBlocked: true, attempts: make(chan error, 1), drained: make(chan struct{}, 2)}
+	host := &tickPressureHost{
+		runBlocked:  true,
+		attempts:    make(chan error, 1),
+		drained:     make(chan struct{}, 2),
+		blocked:     make(chan struct{}),
+		blockedStop: ctx.Done(),
+	}
 	pulse := make(chan struct{})
 	owner := newTickPressureOwner(host, pulse, nil)
 	done := make(chan error, 1)
@@ -118,9 +139,34 @@ func TestOwnerRejectedTimerOffersPreserveBoundedMessagesAndResume(t *testing.T) 
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
 	}
+	waitBlockedRun := func() {
+		select {
+		case <-host.blocked:
+		case err := <-done:
+			t.Fatalf("owner stopped on blocked Ready: %v", err)
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+	}
+	// Release the startup retry before HandleInbound waits for its owner
+	// response.
+	waitBlockedRun()
 	inbound := tickPressureMessage()
 	if err := owner.HandleInbound(ctx, rafttransport.Inbound{Group: peerServerTestGroup(), Message: inbound}); err != nil {
 		t.Fatal(err)
+	}
+	// Wait for the inbound message to be admitted and for the owner to reach
+	// the next blocked retry. Every later pulse is likewise acknowledged after
+	// its RequestTick attempt, so the resume pulse cannot race a preexisting
+	// RunOne drain.
+	for {
+		waitBlockedRun()
+		host.mu.Lock()
+		admitted := host.message == inbound
+		host.mu.Unlock()
+		if admitted {
+			break
+		}
 	}
 	for index := 0; index < 64; index++ {
 		select {
@@ -138,11 +184,13 @@ func TestOwnerRejectedTimerOffersPreserveBoundedMessagesAndResume(t *testing.T) 
 		case <-ctx.Done():
 			t.Fatal(ctx.Err())
 		}
+		waitBlockedRun()
 	}
 	rejected := tickPressureMessage()
 	if err := owner.HandleInbound(ctx, rafttransport.Inbound{Group: peerServerTestGroup(), Message: rejected}); err != multiraft.ErrQueueFull {
 		t.Fatalf("full inbound was acknowledged: %v", err)
 	}
+	waitBlockedRun()
 	host.mu.Lock()
 	preserved := host.ticks == 1 && host.appliedTicks == 0 && host.message == inbound && host.appliedMessage == nil
 	host.mu.Unlock()
