@@ -208,11 +208,7 @@ func TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry(t *tes
 	if err := owners[0].Campaign(ctx, group); err != nil {
 		t.Fatal(err)
 	}
-	leader := waitRF3Leader(t, ctx, owners, nil, group)
-	leaderState, err := owners[leader].Probe(ctx, group)
-	if err != nil {
-		t.Fatal(err)
-	}
+	leader, leaderState := waitRF3LeaderReady(t, ctx, owners, nil, group)
 
 	open := rf3Command(bases[leader], replication.CommandSessionOpen, 0, 1, nil)
 	open.NextDeadlineUnixNano = 2_000_000_000_000_000_000
@@ -474,6 +470,57 @@ func waitRF3Leader(
 	}
 	t.Fatalf("RF3 leader election: %v", context.Cause(ctx))
 	return -1
+}
+
+// waitRF3LeaderReady waits for the elected leader's initial committed entry
+// to reach every surviving voter before a test starts a latency-sensitive
+// client operation. A status-only leader observation can win the race with
+// the first heartbeat on a slow strict-allocation runner; the next voter tick
+// would then legitimately begin a new election while the client still holds
+// the leader's fence.
+func waitRF3LeaderReady(
+	t testing.TB,
+	ctx context.Context,
+	owners []*Owner,
+	removed map[int]bool,
+	group raftmember.GroupKey,
+) (int, ServingState) {
+	t.Helper()
+	for ctx.Err() == nil {
+		leader := waitRF3Leader(t, ctx, owners, removed, group)
+		leaderState, err := owners[leader].Probe(ctx, group)
+		if err != nil || leaderState.Status.MemberID != leaderState.Status.LeaderID ||
+			leaderState.Status.Commit <= 1 {
+			time.Sleep(time.Millisecond)
+			continue
+		}
+		ready := true
+		for index, owner := range owners {
+			if removed[index] {
+				continue
+			}
+			state, probeErr := owner.Probe(ctx, group)
+			if probeErr != nil || state.Status.LeaderID != leaderState.Status.MemberID ||
+				state.Status.Term != leaderState.Status.Term ||
+				state.Status.Applied < leaderState.Status.Commit {
+				ready = false
+				break
+			}
+		}
+		if !ready {
+			time.Sleep(time.Millisecond)
+			continue
+		}
+		confirmed, confirmErr := owners[leader].Probe(ctx, group)
+		if confirmErr == nil && confirmed.Status.MemberID == confirmed.Status.LeaderID &&
+			confirmed.Status.Term == leaderState.Status.Term &&
+			confirmed.Status.Commit >= leaderState.Status.Commit {
+			return leader, confirmed
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("RF3 leader readiness: %v", context.Cause(ctx))
+	return -1, ServingState{}
 }
 
 func readRF3PointAtFreshFence(
