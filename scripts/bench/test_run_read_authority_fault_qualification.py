@@ -296,6 +296,14 @@ class FaultQualificationProvenanceTest(unittest.TestCase):
                 summary["authority_nodes"][0]["acknowledged_utc"],
                 "2026-09-05T18:00:00.000000001Z")
 
+            acknowledged[nodes[1]["node_id"]]["utc"] = (
+                "2026-09-05T18:00:00.000000000Z")
+            with self.assertRaisesRegex(
+                    ValueError, "acknowledged node .* predates controller handoff"):
+                MODULE.validate_post_cont_latch(
+                    path, post_pause_diagnostics=acknowledged)
+            acknowledged[nodes[1]["node_id"]]["utc"] = nodes[1]["utc"]
+
             nodes[1]["authority_available"] = False
             write_artifact()
             with self.assertRaisesRegex(ValueError, "lacks authority availability"):

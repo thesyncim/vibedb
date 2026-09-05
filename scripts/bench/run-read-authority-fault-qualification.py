@@ -506,9 +506,9 @@ def validate_post_cont_latch(path, expected_nodes=3, post_pause_diagnostics=None
         serial = _positive_int(snapshot.get("serial"), f"acknowledged node {node_id} serial")
         pid = _positive_int(snapshot.get("pid"), f"acknowledged node {node_id} pid", minimum=2)
         snapshot_utc = _parse_utc(snapshot.get("utc"), f"acknowledged node {node_id}")
-        if requested < snapshot_utc:
+        if snapshot_utc < requested:
             raise ValueError(
-                f"post-CONT controller handoff predates acknowledged node {node_id}")
+                f"post-CONT acknowledged node {node_id} predates controller handoff")
         acknowledged[node_id] = {
             "serial": serial, "pid": pid, "utc": snapshot_utc,
             "utc_text": snapshot["utc"],
