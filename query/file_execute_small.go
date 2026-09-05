@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"slices"
 
+	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibedb/store/durable"
 )
@@ -32,6 +33,20 @@ type fileSmallScan struct {
 	ordered bool
 	covered bool
 	payload int64
+
+	// projection is the storage-native scalar projection lane used only for a
+	// certified primary range. Its scratch is retained on the Exec so a warm
+	// execution reuses the path filter, compact-shape metadata, and JSON value
+	// buffer. The storage callback borrows fields only until it returns.
+	projection       *durable.ProjectionFilter
+	projectionPlan   *plan
+	projectionFilter int64
+	projectionPaths  []string
+	projectionShapes []int
+	projectionShape  []storeio.UnifiedProjectionShapeWorkspace
+	projectionStream []storeio.UnifiedProjectionStreamWorkspace
+	projectionFields []storeio.UnifiedProjectionField
+	projectionValues []byte
 }
 
 func (p *plan) runFileSmall(e *Exec, snapshot *durable.Snapshot, span *FileRangeSource, masks []store.Mask, opts normalizedFileOptions, stats *ExecStats, ordered bool) (bool, error) {
@@ -63,6 +78,11 @@ func (p *plan) runFileSmall(e *Exec, snapshot *durable.Snapshot, span *FileRange
 	}()
 	if err := prepareResult(&e.Result, p, 0); err != nil {
 		return true, err
+	}
+	if ordered && masks == nil {
+		if handled, runErr := s.tryFileProjected(snapshot, span, opts, &s.stats); handled {
+			return true, runErr
+		}
 	}
 	var err error
 	if span != nil && masks != nil {

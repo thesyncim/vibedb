@@ -1,0 +1,197 @@
+{
+  "build_binary_sha256": {
+    "candidate-vibedb": "9837b5fb5635da9e7466048045f4e325b265497bdda6ce9850db0b70ff3f1183",
+    "candidate-vibedb-gateway": "a43f017902dc316b2ab39d1a47bb22e707c7933a2415b8d16eaeb922dd75ae54",
+    "candidate-vibedb-shard": "25c957eab3757a0dc4e25374f74d58145d696c64b3b8e4ded88b0bfe42687d8d",
+    "cockroach": "7923d5eca1fc275abebd64863fa5e5c51be3504fd57f37c5b8c4f8579bd54c3e",
+    "parent-vibedb": "dce885613d53ff14bf8fbc85d4aeca24be574f473bfcb1ee9e40cb5ddf8e1571",
+    "parent-vibedb-gateway": "3da4661cd7a4c295a771eafeea626c896f1bb1ecf55b547ded6f5bf91455d767",
+    "parent-vibedb-shard": "37bb5b8b06361994a896725aebd730aa27edae14b8af774071b4fce3ec354b32",
+    "rf3-sqlbench": "ef621ccaaa720b99cc3154692a7fcef4db68793cd424f81cb2b18567158315cc"
+  },
+  "build_environment": {
+    "CGO_ENABLED": "0",
+    "GOARCH": "arm64",
+    "GOEXPERIMENT": "simd",
+    "GOOS": "linux",
+    "note": "the benchmark executables run in Linux containers"
+  },
+  "campaign": "vibedb-projection-comparison-88011a57",
+  "docker_architecture": "arm64",
+  "excluded_binaries": [
+    {
+      "bytes": 37469160,
+      "kind": "campaign executable excluded from raw archive",
+      "path": "after-bin/candidate-vibedb",
+      "revision": "after",
+      "sha256": "9837b5fb5635da9e7466048045f4e325b265497bdda6ce9850db0b70ff3f1183"
+    },
+    {
+      "bytes": 48443390,
+      "kind": "campaign executable excluded from raw archive",
+      "path": "after-bin/candidate-vibedb-gateway",
+      "revision": "after",
+      "sha256": "a43f017902dc316b2ab39d1a47bb22e707c7933a2415b8d16eaeb922dd75ae54"
+    },
+    {
+      "bytes": 55266971,
+      "kind": "campaign executable excluded from raw archive",
+      "path": "after-bin/candidate-vibedb-shard",
+      "revision": "after",
+      "sha256": "25c957eab3757a0dc4e25374f74d58145d696c64b3b8e4ded88b0bfe42687d8d"
+    },
+    {
+      "bytes": 9671337,
+      "kind": "campaign executable excluded from raw archive",
+      "path": "after-bin/rf3-sqlbench",
+      "revision": "after",
+      "sha256": "ef621ccaaa720b99cc3154692a7fcef4db68793cd424f81cb2b18567158315cc"
+    },
+    {
+      "bytes": 37445552,
+      "kind": "campaign executable excluded from raw archive",
+      "path": "before-bin/candidate-vibedb",
+      "revision": "before",
+      "sha256": "dce885613d53ff14bf8fbc85d4aeca24be574f473bfcb1ee9e40cb5ddf8e1571"
+    },
+    {
+      "bytes": 48284262,
+      "kind": "campaign executable excluded from raw archive",
+      "path": "before-bin/candidate-vibedb-gateway",
+      "revision": "before",
+      "sha256": "3da4661cd7a4c295a771eafeea626c896f1bb1ecf55b547ded6f5bf91455d767"
+    },
+    {
+      "bytes": 55240635,
+      "kind": "campaign executable excluded from raw archive",
+      "path": "before-bin/candidate-vibedb-shard",
+      "revision": "before",
+      "sha256": "37bb5b8b06361994a896725aebd730aa27edae14b8af774071b4fce3ec354b32"
+    },
+    {
+      "bytes": 9671337,
+      "kind": "campaign executable excluded from raw archive",
+      "path": "before-bin/rf3-sqlbench",
+      "revision": "before",
+      "sha256": "ef621ccaaa720b99cc3154692a7fcef4db68793cd424f81cb2b18567158315cc"
+    },
+    {
+      "bytes": 37469160,
+      "kind": "campaign executable excluded from raw archive",
+      "path": "bin/candidate-vibedb",
+      "revision": "build-output",
+      "sha256": "9837b5fb5635da9e7466048045f4e325b265497bdda6ce9850db0b70ff3f1183"
+    },
+    {
+      "bytes": 48443390,
+      "kind": "campaign executable excluded from raw archive",
+      "path": "bin/candidate-vibedb-gateway",
+      "revision": "build-output",
+      "sha256": "a43f017902dc316b2ab39d1a47bb22e707c7933a2415b8d16eaeb922dd75ae54"
+    },
+    {
+      "bytes": 55266971,
+      "kind": "campaign executable excluded from raw archive",
+      "path": "bin/candidate-vibedb-shard",
+      "revision": "build-output",
+      "sha256": "25c957eab3757a0dc4e25374f74d58145d696c64b3b8e4ded88b0bfe42687d8d"
+    },
+    {
+      "bytes": 320657696,
+      "kind": "campaign executable excluded from raw archive",
+      "path": "bin/cockroach",
+      "revision": "crdb",
+      "sha256": "7923d5eca1fc275abebd64863fa5e5c51be3504fd57f37c5b8c4f8579bd54c3e"
+    },
+    {
+      "bytes": 37445552,
+      "kind": "campaign executable excluded from raw archive",
+      "path": "bin/parent-vibedb",
+      "revision": "build-output",
+      "sha256": "dce885613d53ff14bf8fbc85d4aeca24be574f473bfcb1ee9e40cb5ddf8e1571"
+    },
+    {
+      "bytes": 48284262,
+      "kind": "campaign executable excluded from raw archive",
+      "path": "bin/parent-vibedb-gateway",
+      "revision": "build-output",
+      "sha256": "3da4661cd7a4c295a771eafeea626c896f1bb1ecf55b547ded6f5bf91455d767"
+    },
+    {
+      "bytes": 55240635,
+      "kind": "campaign executable excluded from raw archive",
+      "path": "bin/parent-vibedb-shard",
+      "revision": "build-output",
+      "sha256": "37bb5b8b06361994a896725aebd730aa27edae14b8af774071b4fce3ec354b32"
+    },
+    {
+      "bytes": 9671337,
+      "kind": "campaign executable excluded from raw archive",
+      "path": "bin/rf3-sqlbench",
+      "revision": "build-output",
+      "sha256": "ef621ccaaa720b99cc3154692a7fcef4db68793cd424f81cb2b18567158315cc"
+    },
+    {
+      "bytes": 23172466,
+      "kind": "microbenchmark test binary excluded from validation archive",
+      "path": "/private/tmp/vibedb-projection-evidence/query-before.test",
+      "revision": "before",
+      "sha256": "5cccba5b8866d8f403715a8a6f4fc202709a420c8b3f038f15f7b6fa71d1a6eb"
+    },
+    {
+      "bytes": 23345506,
+      "kind": "microbenchmark test binary excluded from validation archive",
+      "path": "/private/tmp/vibedb-projection-evidence/query-after.test",
+      "revision": "after",
+      "sha256": "8f2bc5393834391e316998f68fee11130c05b87131e7626ce835b4ef30aee47e"
+    },
+    {
+      "bytes": 37445512,
+      "kind": "diagnostic profile executable excluded from profile archive",
+      "path": "/private/tmp/vibedb-point-range-profile/bin/candidate-vibedb",
+      "revision": "baseline-9454",
+      "sha256": "4199cf34672ad9196e2746b2d4694815a6097b7bd0136b7f585ac7e8efd819a5"
+    },
+    {
+      "bytes": 48283950,
+      "kind": "diagnostic profile executable excluded from profile archive",
+      "path": "/private/tmp/vibedb-point-range-profile/bin/candidate-vibedb-gateway",
+      "revision": "baseline-9454",
+      "sha256": "5b046ed41277c2477b7e1b9614791b60da37d04657c9371b8370532f68bf8013"
+    },
+    {
+      "bytes": 55239340,
+      "kind": "diagnostic profile executable excluded from profile archive",
+      "path": "/private/tmp/vibedb-point-range-profile/bin/candidate-vibedb-shard",
+      "revision": "baseline-9454",
+      "sha256": "c6e0632ef92e9e226b0e7b73a1ae0b0ae2c8a7883ba1b05aa8da5798e2b608e7"
+    },
+    {
+      "bytes": 9671337,
+      "kind": "diagnostic profile executable excluded from profile archive",
+      "path": "/private/tmp/vibedb-point-range-profile/bin/rf3-sqlbench",
+      "revision": "baseline-9454",
+      "sha256": "f49655b8e20a48d1946eebcb4bc672ad07c7dfc79d2e99827ab5fc87872ea339"
+    }
+  ],
+  "go_version": "go version go1.27.0 darwin/arm64",
+  "refs": {
+    "after": "88011a57321851ad98af78978207c538e35c3914",
+    "baseline_is_ancestor": true,
+    "before": "dc6304e0872386b3ac062c3351c1f381333ca9f9",
+    "before_after_patch_sha256": "198f74622333e7ba1e9b027331bee1be2c4e1c18f2a51ebddbfc6adc0f5c1a7c",
+    "client_source_revision": "88011a57321851ad98af78978207c538e35c3914",
+    "requested_after": "88011a57",
+    "requested_before": "dc6304e0"
+  },
+  "schema": "vibedb.distributed-projected-ranges/binary-provenance/1",
+  "vibedb_build_metadata": {
+    "candidate-vibedb": "/private/tmp/vibedb-projection-comparison-88011a57/bin/candidate-vibedb: go1.27.0-X:simd\n\tpath\tgithub.com/thesyncim/vibedb/cmd/vibedb\n\tmod\tgithub.com/thesyncim/vibedb\tv0.0.0-20260905131844-88011a573218\t\n\tdep\tgithub.com/cespare/xxhash/v2\tv2.3.0\th1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=\n\tdep\tgithub.com/thesyncim/vibejson\tv0.1.0\th1:Hk6Zp2RyiNuTBk7UiJ1I67ZJEpqIIiIE6J5gCUsAVc8=\n\tdep\tgo.etcd.io/raft/v3\tv3.7.0\th1:BGzlwx07bLv8PW6OU5HObuz1y4hlPZUXA07pM1mPUh4=\n\tdep\tgolang.org/x/sys\tv0.47.0\th1:o7XGOvZQCADBQQ4Y7VNq2dRWQR7JmOUW8Kxx4ZsNgWs=\n\tdep\tgoogle.golang.org/protobuf\tv1.36.11\th1:fV6ZwhNocDyBLK0dj+fg8ektcVegBBuEolpbTQyBNVE=\n\tbuild\t-buildmode=exe\n\tbuild\t-compiler=gc\n\tbuild\t-trimpath=true\n\tbuild\tCGO_ENABLED=0\n\tbuild\tGOARCH=arm64\n\tbuild\tGOEXPERIMENT=simd\n\tbuild\tGOOS=linux\n\tbuild\tGOARM64=v8.0\n\tbuild\tvcs=git\n\tbuild\tvcs.revision=88011a57321851ad98af78978207c538e35c3914\n\tbuild\tvcs.time=2026-09-05T13:18:44Z\n\tbuild\tvcs.modified=false",
+    "candidate-vibedb-gateway": "/private/tmp/vibedb-projection-comparison-88011a57/bin/candidate-vibedb-gateway: go1.27.0-X:simd\n\tpath\tgithub.com/thesyncim/vibedb/cmd/vibedb-gateway\n\tmod\tgithub.com/thesyncim/vibedb\tv0.0.0-20260905131844-88011a573218\t\n\tdep\tgithub.com/cespare/xxhash/v2\tv2.3.0\th1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=\n\tdep\tgithub.com/thesyncim/vibejson\tv0.1.0\th1:Hk6Zp2RyiNuTBk7UiJ1I67ZJEpqIIiIE6J5gCUsAVc8=\n\tdep\tgo.etcd.io/raft/v3\tv3.7.0\th1:BGzlwx07bLv8PW6OU5HObuz1y4hlPZUXA07pM1mPUh4=\n\tdep\tgolang.org/x/sys\tv0.47.0\th1:o7XGOvZQCADBQQ4Y7VNq2dRWQR7JmOUW8Kxx4ZsNgWs=\n\tdep\tgoogle.golang.org/protobuf\tv1.36.11\th1:fV6ZwhNocDyBLK0dj+fg8ektcVegBBuEolpbTQyBNVE=\n\tbuild\t-buildmode=exe\n\tbuild\t-compiler=gc\n\tbuild\t-trimpath=true\n\tbuild\tCGO_ENABLED=0\n\tbuild\tGOARCH=arm64\n\tbuild\tGOEXPERIMENT=simd\n\tbuild\tGOOS=linux\n\tbuild\tGOARM64=v8.0\n\tbuild\tvcs=git\n\tbuild\tvcs.revision=88011a57321851ad98af78978207c538e35c3914\n\tbuild\tvcs.time=2026-09-05T13:18:44Z\n\tbuild\tvcs.modified=false",
+    "candidate-vibedb-shard": "/private/tmp/vibedb-projection-comparison-88011a57/bin/candidate-vibedb-shard: go1.27.0-X:simd\n\tpath\tgithub.com/thesyncim/vibedb/cmd/vibedb-shard\n\tmod\tgithub.com/thesyncim/vibedb\tv0.0.0-20260905131844-88011a573218\t\n\tdep\tgithub.com/cespare/xxhash/v2\tv2.3.0\th1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=\n\tdep\tgithub.com/thesyncim/vibejson\tv0.1.0\th1:Hk6Zp2RyiNuTBk7UiJ1I67ZJEpqIIiIE6J5gCUsAVc8=\n\tdep\tgo.etcd.io/raft/v3\tv3.7.0\th1:BGzlwx07bLv8PW6OU5HObuz1y4hlPZUXA07pM1mPUh4=\n\tdep\tgolang.org/x/sys\tv0.47.0\th1:o7XGOvZQCADBQQ4Y7VNq2dRWQR7JmOUW8Kxx4ZsNgWs=\n\tdep\tgoogle.golang.org/protobuf\tv1.36.11\th1:fV6ZwhNocDyBLK0dj+fg8ektcVegBBuEolpbTQyBNVE=\n\tbuild\t-buildmode=exe\n\tbuild\t-compiler=gc\n\tbuild\t-trimpath=true\n\tbuild\tCGO_ENABLED=0\n\tbuild\tGOARCH=arm64\n\tbuild\tGOEXPERIMENT=simd\n\tbuild\tGOOS=linux\n\tbuild\tGOARM64=v8.0\n\tbuild\tvcs=git\n\tbuild\tvcs.revision=88011a57321851ad98af78978207c538e35c3914\n\tbuild\tvcs.time=2026-09-05T13:18:44Z\n\tbuild\tvcs.modified=false",
+    "parent-vibedb": "/private/tmp/vibedb-projection-comparison-88011a57/bin/parent-vibedb: go1.27.0-X:simd\n\tpath\tgithub.com/thesyncim/vibedb/cmd/vibedb\n\tmod\tgithub.com/thesyncim/vibedb\tv0.0.0-20260905121244-dc6304e08723\t\n\tdep\tgithub.com/cespare/xxhash/v2\tv2.3.0\th1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=\n\tdep\tgithub.com/thesyncim/vibejson\tv0.1.0\th1:Hk6Zp2RyiNuTBk7UiJ1I67ZJEpqIIiIE6J5gCUsAVc8=\n\tdep\tgo.etcd.io/raft/v3\tv3.7.0\th1:BGzlwx07bLv8PW6OU5HObuz1y4hlPZUXA07pM1mPUh4=\n\tdep\tgolang.org/x/sys\tv0.47.0\th1:o7XGOvZQCADBQQ4Y7VNq2dRWQR7JmOUW8Kxx4ZsNgWs=\n\tdep\tgoogle.golang.org/protobuf\tv1.36.11\th1:fV6ZwhNocDyBLK0dj+fg8ektcVegBBuEolpbTQyBNVE=\n\tbuild\t-buildmode=exe\n\tbuild\t-compiler=gc\n\tbuild\t-trimpath=true\n\tbuild\tCGO_ENABLED=0\n\tbuild\tGOARCH=arm64\n\tbuild\tGOEXPERIMENT=simd\n\tbuild\tGOOS=linux\n\tbuild\tGOARM64=v8.0\n\tbuild\tvcs=git\n\tbuild\tvcs.revision=dc6304e0872386b3ac062c3351c1f381333ca9f9\n\tbuild\tvcs.time=2026-09-05T12:12:44Z\n\tbuild\tvcs.modified=false",
+    "parent-vibedb-gateway": "/private/tmp/vibedb-projection-comparison-88011a57/bin/parent-vibedb-gateway: go1.27.0-X:simd\n\tpath\tgithub.com/thesyncim/vibedb/cmd/vibedb-gateway\n\tmod\tgithub.com/thesyncim/vibedb\tv0.0.0-20260905121244-dc6304e08723\t\n\tdep\tgithub.com/cespare/xxhash/v2\tv2.3.0\th1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=\n\tdep\tgithub.com/thesyncim/vibejson\tv0.1.0\th1:Hk6Zp2RyiNuTBk7UiJ1I67ZJEpqIIiIE6J5gCUsAVc8=\n\tdep\tgo.etcd.io/raft/v3\tv3.7.0\th1:BGzlwx07bLv8PW6OU5HObuz1y4hlPZUXA07pM1mPUh4=\n\tdep\tgolang.org/x/sys\tv0.47.0\th1:o7XGOvZQCADBQQ4Y7VNq2dRWQR7JmOUW8Kxx4ZsNgWs=\n\tdep\tgoogle.golang.org/protobuf\tv1.36.11\th1:fV6ZwhNocDyBLK0dj+fg8ektcVegBBuEolpbTQyBNVE=\n\tbuild\t-buildmode=exe\n\tbuild\t-compiler=gc\n\tbuild\t-trimpath=true\n\tbuild\tCGO_ENABLED=0\n\tbuild\tGOARCH=arm64\n\tbuild\tGOEXPERIMENT=simd\n\tbuild\tGOOS=linux\n\tbuild\tGOARM64=v8.0\n\tbuild\tvcs=git\n\tbuild\tvcs.revision=dc6304e0872386b3ac062c3351c1f381333ca9f9\n\tbuild\tvcs.time=2026-09-05T12:12:44Z\n\tbuild\tvcs.modified=false",
+    "parent-vibedb-shard": "/private/tmp/vibedb-projection-comparison-88011a57/bin/parent-vibedb-shard: go1.27.0-X:simd\n\tpath\tgithub.com/thesyncim/vibedb/cmd/vibedb-shard\n\tmod\tgithub.com/thesyncim/vibedb\tv0.0.0-20260905121244-dc6304e08723\t\n\tdep\tgithub.com/cespare/xxhash/v2\tv2.3.0\th1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=\n\tdep\tgithub.com/thesyncim/vibejson\tv0.1.0\th1:Hk6Zp2RyiNuTBk7UiJ1I67ZJEpqIIiIE6J5gCUsAVc8=\n\tdep\tgo.etcd.io/raft/v3\tv3.7.0\th1:BGzlwx07bLv8PW6OU5HObuz1y4hlPZUXA07pM1mPUh4=\n\tdep\tgolang.org/x/sys\tv0.47.0\th1:o7XGOvZQCADBQQ4Y7VNq2dRWQR7JmOUW8Kxx4ZsNgWs=\n\tdep\tgoogle.golang.org/protobuf\tv1.36.11\th1:fV6ZwhNocDyBLK0dj+fg8ektcVegBBuEolpbTQyBNVE=\n\tbuild\t-buildmode=exe\n\tbuild\t-compiler=gc\n\tbuild\t-trimpath=true\n\tbuild\tCGO_ENABLED=0\n\tbuild\tGOARCH=arm64\n\tbuild\tGOEXPERIMENT=simd\n\tbuild\tGOOS=linux\n\tbuild\tGOARM64=v8.0\n\tbuild\tvcs=git\n\tbuild\tvcs.revision=dc6304e0872386b3ac062c3351c1f381333ca9f9\n\tbuild\tvcs.time=2026-09-05T12:12:44Z\n\tbuild\tvcs.modified=false",
+    "rf3-sqlbench": "/private/tmp/vibedb-projection-comparison-88011a57/bin/rf3-sqlbench: go1.27.0-X:simd\n\tpath\tgithub.com/thesyncim/vibedb/integration/pgclient/cmd/rf3-sqlbench\n\tmod\tgithub.com/thesyncim/vibedb/integration/pgclient\tv0.0.0-20260905131844-88011a573218\t\n\tdep\tgithub.com/jackc/pgpassfile\tv1.0.0\th1:/6Hmqy13Ss2zCq62VdNG8tM1wchn8zjSGOBJ6icpsIM=\n\tdep\tgithub.com/jackc/pgservicefile\tv0.0.0-20240606120523-5a60cdf6a761\th1:iCEnooe7UlwOQYpKFhBabPMi4aNAfoODPEFNiAnClxo=\n\tdep\tgithub.com/jackc/pgx/v5\tv5.10.0\th1:VhSvgU2jSli8o3AqIEOTJr7rZwAEUVo4E4XhR94Zfr0=\n\tdep\tgolang.org/x/text\tv0.29.0\th1:1neNs90w9YzJ9BocxfsQNHKuAT4pkghyXc4nhZ6sJvk=\n\tbuild\t-buildmode=exe\n\tbuild\t-compiler=gc\n\tbuild\t-trimpath=true\n\tbuild\tCGO_ENABLED=0\n\tbuild\tGOARCH=arm64\n\tbuild\tGOEXPERIMENT=simd\n\tbuild\tGOOS=linux\n\tbuild\tGOARM64=v8.0\n\tbuild\tvcs=git\n\tbuild\tvcs.revision=88011a57321851ad98af78978207c538e35c3914\n\tbuild\tvcs.time=2026-09-05T13:18:44Z\n\tbuild\tvcs.modified=false"
+  }
+}

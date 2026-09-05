@@ -53,6 +53,18 @@ class DistributedReadRunnerTest(unittest.TestCase):
         self.assertEqual(MODULE.validate_options(update, FIXTURE)["workloads"],
                          ["point_hit", "update_existing"])
 
+    def test_options_allow_broader_range_workloads(self):
+        selected = self.selected(
+            "--workloads", "range_32,range_64,range_256",
+            "--clients", "1",
+            "--scans", "64",
+        )
+        got = MODULE.validate_options(selected, FIXTURE)
+        self.assertEqual(got["workloads"], ["range_32", "range_64", "range_256"])
+        args = MODULE.make_fixture_args(selected, FIXTURE, got["workloads"])
+        self.assertEqual(args.multigroup_workloads,
+                         "range_32,range_64,range_256")
+
     def test_options_reject_unbounded_workloads_clients_and_counts(self):
         for extra, message in (
                 (("--workloads", "update_uniform"), "workloads"),

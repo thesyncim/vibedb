@@ -19,7 +19,9 @@ import (
 // Cell.JSON and, when needed, Cell.TextBytes before the Segment or Exec is
 // reused if a cell must outlive that borrowing boundary. A [FromFile]
 // execution instead copies selected and computed values into Result-owned
-// backing, so its cells survive snapshot close and page eviction.
+// backing, so its cells survive snapshot close and page eviction. An
+// unescaped string shares its text view with the one owned JSON payload
+// rather than retaining a second copy.
 type Result struct {
 	Columns  []ResultColumn
 	RowCount int
@@ -210,19 +212,103 @@ func cellFromScalar(s scalar) Cell {
 // page-cache, and execution-workspace storage may be reused immediately after
 // materialization without leaving a borrowed result.
 func (r *Result) ownFileCell(cell Cell) Cell {
-	if len(cell.raw) != 0 {
-		start := len(r.fileData)
-		r.fileData = append(r.fileData, cell.raw...)
-		cell.raw = r.fileData[start:len(r.fileData):len(r.fileData)]
-	}
-	if len(cell.text) != 0 {
-		start := len(r.fileData)
-		r.fileData = append(r.fileData, cell.text...)
-		cell.text = byteview.String(
-			r.fileData[start:len(r.fileData):len(r.fileData)],
-		)
-	}
+	cell, r.fileData = ownResultCellInto(r.fileData, cell)
 	return cell
+}
+
+// ownProjectedCell owns a cell produced immediately by cellFromScalar in the
+// durable projection callback. That classifier guarantees bool/null spellings
+// are the immutable package constants and that a clean string's text is the
+// raw view between its quotes. Keeping those facts at this call site removes
+// repeated pointer checks from the narrow file range hot path; callers that
+// receive cells from any other source must use ownFileCell, whose exact
+// fallback still handles independently backed equal-length strings.
+func (r *Result) ownProjectedCell(cell Cell) Cell {
+	switch cell.kind {
+	case TypeNull, TypeBool:
+		return cell
+	case TypeString:
+		if len(cell.raw) >= 2 && len(cell.raw) == len(cell.text)+2 {
+			start := len(r.fileData)
+			r.fileData = append(r.fileData, cell.raw...)
+			cell.raw = r.fileData[start:len(r.fileData):len(r.fileData)]
+			cell.text = byteview.String(cell.raw[1 : len(cell.raw)-1])
+			return cell
+		}
+	case TypeNumber, TypeJSON:
+		// classifyRawInto retains the exact raw spelling for these projected
+		// values. Copy it directly so the ordinary ownership helper's alias
+		// checks stay off the numeric/JSON hot path. A nil raw is only possible
+		// for a computed value assembled outside the projection callback.
+		if len(cell.raw) != 0 {
+			start := len(r.fileData)
+			r.fileData = append(r.fileData, cell.raw...)
+			cell.raw = r.fileData[start:len(r.fileData):len(r.fileData)]
+			return cell
+		}
+	}
+	return r.ownFileCell(cell)
+}
+
+// resultCellOwnedBytes is the physical payload an ownership boundary will
+// append for cell. ResultBytes deliberately charges the logical JSON
+// representation (including the shared immutable primitive spellings), while
+// this helper counts only bytes that need a private copy. Keeping these two
+// measures separate lets sizing passes reserve the caller-visible budget
+// without manufacturing a duplicate "true", "false", or "null" string.
+func resultCellOwnedBytes(cell Cell) int64 {
+	var bytes int64
+	if len(cell.raw) != 0 &&
+		!staticResultBytes(cell.raw, nullBytes) &&
+		!staticResultBytes(cell.raw, trueBytes) &&
+		!staticResultBytes(cell.raw, falseBytes) {
+		bytes += int64(len(cell.raw))
+	}
+	if !cellTextAliasesRaw(cell) {
+		bytes += int64(len(cell.text))
+	}
+	return bytes
+}
+
+// ownResultCellInto copies the variable-width parts of cell into data and
+// rederives a clean string's text view from the copied JSON spelling. The
+// returned cell is independent of the source page/workspace; immutable JSON
+// primitive spellings remain shared globals.
+func ownResultCellInto(data []byte, cell Cell) (Cell, []byte) {
+	textAliasesRaw := cellTextAliasesRaw(cell)
+	if len(cell.raw) != 0 &&
+		!staticResultBytes(cell.raw, nullBytes) &&
+		!staticResultBytes(cell.raw, trueBytes) &&
+		!staticResultBytes(cell.raw, falseBytes) {
+		start := len(data)
+		data = append(data, cell.raw...)
+		cell.raw = data[start:len(data):len(data)]
+	}
+	if textAliasesRaw {
+		cell.text = byteview.String(cell.raw[1 : len(cell.raw)-1])
+	} else if len(cell.text) != 0 {
+		start := len(data)
+		data = append(data, cell.text...)
+		cell.text = byteview.String(data[start:len(data):len(data)])
+	}
+	return cell, data
+}
+func staticResultBytes(value, static []byte) bool {
+	return len(value) == len(static) && len(value) != 0 &&
+		&value[0] == &static[0]
+}
+
+func cellTextAliasesRaw(cell Cell) bool {
+	if cell.kind != TypeString || len(cell.raw) < 2 ||
+		cell.raw[0] != '"' || cell.raw[len(cell.raw)-1] != '"' ||
+		len(cell.text) != len(cell.raw)-2 {
+		return false
+	}
+	view := byteview.Bytes(cell.text)
+	if len(view) == 0 {
+		return true
+	}
+	return &view[0] == &cell.raw[1]
 }
 
 // nullCell builds a null result, the value of an aggregate over no rows and of

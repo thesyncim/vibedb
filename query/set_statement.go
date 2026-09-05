@@ -723,6 +723,7 @@ func materializeSetStatementResult(
 	}()
 
 	payload := int64(0)
+	ownedPayload := int64(0)
 	for row := 0; row < rows; row++ {
 		if err = cancellationCheckpoint(cancel, row); err != nil {
 			return err
@@ -734,13 +735,16 @@ func materializeSetStatementResult(
 			payload = saturatedBytes(
 				payload, resultCellPayloadBytes(source.Cell(row, column)),
 			)
+			ownedPayload = saturatedBytes(
+				ownedPayload, resultCellOwnedBytes(source.Cell(row, column)),
+			)
 		}
 	}
 	required, err := dst.checkResultBudget(columns, rows, payload)
 	if err != nil {
 		return err
 	}
-	if payload > int64(math.MaxInt) {
+	if payload > int64(math.MaxInt) || ownedPayload > int64(math.MaxInt) {
 		return dst.resultByteBudgetError(rows, math.MaxInt64)
 	}
 	if err = cancellationError(cancel); err != nil {
@@ -764,8 +768,8 @@ func materializeSetStatementResult(
 		dst.Columns[column].Header = names[column]
 		dst.Columns[column].Cells = resize(cells, rows)
 	}
-	if cap(dst.fileData) < int(payload) {
-		dst.fileData = make([]byte, 0, int(payload))
+	if cap(dst.fileData) < int(ownedPayload) {
+		dst.fileData = make([]byte, 0, int(ownedPayload))
 	} else {
 		dst.fileData = dst.fileData[:0]
 	}
@@ -781,10 +785,10 @@ func materializeSetStatementResult(
 			dst.Columns[column].Cells[row] = dst.ownFileCell(source.Cell(row, column))
 		}
 	}
-	if int64(len(dst.fileData)) != payload {
+	if int64(len(dst.fileData)) != ownedPayload {
 		return fmt.Errorf(
 			"query: set statement result copied %d payload bytes after sizing %d: %w",
-			len(dst.fileData), payload, errRelationSpoolSizing,
+			len(dst.fileData), ownedPayload, errRelationSpoolSizing,
 		)
 	}
 	if err = cancellationError(cancel); err != nil {
@@ -798,6 +802,7 @@ func mergeSetStatementStats(dst *ExecStats, src ExecStats) {
 	dst.Workers = max(dst.Workers, src.Workers)
 	dst.RowsTotal = saturatedSetStatementUint64(dst.RowsTotal, src.RowsTotal)
 	dst.RowsScanned = saturatedSetStatementUint64(dst.RowsScanned, src.RowsScanned)
+	dst.ProjectedRows = saturatedSetStatementUint64(dst.ProjectedRows, src.ProjectedRows)
 	dst.Batches = saturatedSetStatementUint64(dst.Batches, src.Batches)
 	dst.PeakBatchRows = max(dst.PeakBatchRows, src.PeakBatchRows)
 	dst.PeakBatchBytes = max(dst.PeakBatchBytes, src.PeakBatchBytes)
