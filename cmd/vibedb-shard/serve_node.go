@@ -84,9 +84,12 @@ func runServeNode(args []string) int {
 	}
 	stopReload := configureRF3ManifestReload(&manifest, *manifestPath, *reload)
 	defer stopReload()
-	diagnostics := make(chan os.Signal, 1)
-	signal.Notify(diagnostics, syscall.SIGUSR1)
-	defer signal.Stop(diagnostics)
+	var diagnostics chan os.Signal
+	if diagnosticSignal := rf3DiagnosticSignal(); diagnosticSignal != nil {
+		diagnostics = make(chan os.Signal, 1)
+		signal.Notify(diagnostics, diagnosticSignal)
+		defer signal.Stop(diagnostics)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	err = servePreparedRF3WithEmbeddedGatewayAndDiagnostics(ctx, manifest, *executionLanes, net.Listen, diagnostics)

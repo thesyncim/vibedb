@@ -1637,6 +1637,15 @@ func (o *primaryUnifiedOverlay) latestBucketRecordsUnorderedFromHead(
 		bit := uint64(1) << uint(slot&63)
 		if seenSlots[word]&bit != 0 {
 			other := &o.records[dst[slot]]
+			// A same-generation bucket chain is valid only for distinct final
+			// keys from one checkpoint batch. prepareBatch rejects duplicate
+			// keys, so seeing the same stable slot again at that generation
+			// cannot be a legitimate batch and must fail closed. This also keeps
+			// an older record whose generation was forged forward from being
+			// silently coalesced with the newer record below.
+			if record.generation == other.generation {
+				return 0, storeio.ErrCommonPrimaryLeafCorrupt
+			}
 			otherEnd := uint64(other.keyOffset) + uint64(other.keyLen)
 			if other.keyLen == 0 || otherEnd > uint64(used) {
 				return 0, storeio.ErrCommonPrimaryLeafCorrupt

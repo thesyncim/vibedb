@@ -133,10 +133,12 @@ func (a *ReplicatedApply) pointReadSessionLayoutLocked(
 			ErrReplicatedApplyMismatch
 	}
 	if err := validateReplicatedShardStoreIdentity(*base); err != nil {
-		return transactionTableLayout{}, nil, ReplicatedShardRelationIdentity{}, err
+		return transactionTableLayout{}, nil, ReplicatedShardRelationIdentity{},
+			fmt.Errorf("%w: invalid replicated shard store identity: %v", ErrReplicatedApplyMismatch, err)
 	}
 	if err := validateReplicatedApplyIdentity(a.identity, *base); err != nil {
-		return transactionTableLayout{}, nil, ReplicatedShardRelationIdentity{}, err
+		return transactionTableLayout{}, nil, ReplicatedShardRelationIdentity{},
+			fmt.Errorf("%w: invalid replicated apply identity: %v", ErrReplicatedApplyMismatch, err)
 	}
 	if relation == 0 || int(relation) > len(base.Relations) ||
 		int(base.RelationCount) != len(base.Relations) {
