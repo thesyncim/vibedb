@@ -243,10 +243,22 @@ func (s *Snapshot) prepareWrite(plan *PreparedPlan, source string) error {
 		}
 	}
 	if stmt.Kind == sqlast.KindInsert && stmt.Insert.OnConflictUpdate != nil {
-		if _, replicated := s.replicatedTableAtBytes(byteview.Bytes(plan.table)); replicated && !stmt.Insert.OnConflictUpdate.WholeDocument() {
-			return &PlanError{Table: plan.table,
-				Reason: "RF3 ON CONFLICT DO UPDATE requires branch-aware replicated writes",
-				cause:  ErrDistributedWriteUnsupported}
+		if _, replicated := s.replicatedTableAtBytes(byteview.Bytes(plan.table)); replicated {
+			action := stmt.Insert.OnConflictUpdate
+			if !replicatedConflictActionSupported(action) {
+				return &PlanError{Table: plan.table,
+					Reason: "RF3 computed conflict assignments require a native expression program",
+					cause:  ErrDistributedWriteUnsupported}
+			}
+			if !action.WholeDocument() {
+				info, ok := s.declaredTableInfo(plan.table)
+				if !ok {
+					return &PlanError{Table: plan.table, Reason: "RF3 column conflict assignments require an authenticated declaration", cause: ErrDistributedWriteUnsupported}
+				}
+				if err := sqldriver.ValidateReplicatedConflictAssignments(info, action); err != nil {
+					return err
+				}
+			}
 		}
 		if err := validateConflictShardKeyAssignments(stmt.Insert.OnConflictUpdate, placement.Columns); err != nil {
 			return err
@@ -332,6 +344,10 @@ func (s *Snapshot) prepareWrite(plan *PreparedPlan, source string) error {
 			cause:  ErrDistributedWriteUnsupported}
 	}
 	return nil
+}
+
+func replicatedConflictActionSupported(action *sqlast.InsertConflictUpdate) bool {
+	return action == nil || action.WholeDocument() || sqldriver.DirectReplicatedConflictAssignments(action)
 }
 
 // The shard executes the complete conflict action atomically. Its current row

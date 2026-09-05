@@ -60,6 +60,7 @@ type replicatedSQLBoundStatement struct {
 	profile          ReplicatedTableProfile
 	updateExpression *query.DMLStatement
 	updateExec       query.Exec
+	conflictArgs     []any
 }
 
 type replicatedSQLTargetBuilder struct {
@@ -263,7 +264,7 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 		)
 		if replicated {
 			if insert := prepared.statement.Insert; prepared.statement.Kind == sqlast.KindInsert && insert != nil &&
-				insert.OnConflictUpdate != nil && (!insert.OnConflictUpdate.WholeDocument() || len(prepared.writeGlobalIndexes) != 0) {
+				insert.OnConflictUpdate != nil && (!replicatedConflictActionSupported(insert.OnConflictUpdate) || len(prepared.writeGlobalIndexes) != 0) {
 				unsupported := sqlast.NewFeatureNotSupportedError(
 					queries[index].SQL,
 					replicatedSQLConflictActionPosition(insert),
@@ -280,6 +281,9 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 		}
 		statements[index].prepared = prepared
 		statements[index].bound = bound
+		if prepared.statement.Kind == sqlast.KindInsert && sqldriver.DirectReplicatedConflictAssignments(prepared.statement.Insert.OnConflictUpdate) {
+			statements[index].conflictArgs = args
+		}
 		if !replicated {
 			preimageMode = replicatedSQLLinearizablePreimage
 			continue
@@ -510,6 +514,12 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 			}
 
 			indexStart := len(statement.bound.globalIndexes)
+			if kind == replication.MutationPutConflict {
+				document, err = sqldriver.EncodeReplicatedConflictValue(document, statement.prepared.statement.Insert.OnConflictUpdate, statement.conflictArgs)
+				if err != nil {
+					return nil, true, err
+				}
+			}
 			baseMutation := replication.Mutation{Kind: kind, Key: ownedKey, Value: document}
 			if !missingPartial && len(statement.prepared.writeGlobalIndexes) != 0 &&
 				(statement.bound.kind == sqlast.KindUpdate || statement.bound.kind == sqlast.KindDelete) {
@@ -701,7 +711,7 @@ func replicatedSQLMutationInputCount(
 	case sqlast.KindInsert:
 		insert := prepared.statement.Insert
 		if insert == nil || insert.Source != nil || insert.Returning != nil ||
-			insert.OnConflictUpdate != nil && (!insert.OnConflictUpdate.WholeDocument() || len(prepared.writeGlobalIndexes) != 0) || len(insert.Rows) == 0 ||
+			insert.OnConflictUpdate != nil && (!replicatedConflictActionSupported(insert.OnConflictUpdate) || len(prepared.writeGlobalIndexes) != 0) || len(insert.Rows) == 0 ||
 			len(bound.rowKeys) != len(insert.Rows) ||
 			len(bound.globalIndexes) != len(insert.Rows)*len(prepared.writeGlobalIndexes) {
 			return 0, ErrReplicatedSQLTransactionUnsupported
@@ -781,6 +791,8 @@ func replicatedSQLMutationInput(
 			// put validates its schema and physical key at the replicated apply
 			// point and retains one affected row for inserts and replacements.
 			kind = replication.MutationPut
+		} else if sqldriver.DirectReplicatedConflictAssignments(prepared.statement.Insert.OnConflictUpdate) {
+			kind = replication.MutationPutConflict
 		}
 		return bound.rowKeys[ordinal][0], document, kind, nil
 	case sqlast.KindUpdate:
