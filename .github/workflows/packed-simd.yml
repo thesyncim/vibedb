@@ -5,6 +5,7 @@ on:
     paths:
       - 'internal/storeio/compact_stream_codec*'
       - 'internal/storeio/compact_primary_stripe.go'
+      - 'internal/storeio/primary_graph_integer_extrema_test.go'
       - 'internal/storeio/primary_graph_unified_filter.go'
       - 'store/durable/store_file_unified_read.go'
       - 'query/file_execute.go'
@@ -198,21 +199,21 @@ jobs:
           {
             printf 'VIBEDB_TEST_REQUIRE_AVX2=%q go test -v -count=1 -timeout=5m ./internal/storeio -run %q\n' \
               "${VIBEDB_TEST_REQUIRE_AVX2}" \
-              'Test(CountCompact|CompactPacked|CompactInteger(Ordered|Interval|Extrema)|CompactStream|CompactPrimaryStripe)'
+              'Test(CountCompact|CompactPacked|CompactInteger(Ordered|Interval|Extrema)|CompactStream|CompactPrimaryStripe|PrimaryGraphIntegerExtrema)'
             printf 'go test -count=1 -timeout=5m ./query -run %q\n' \
               '^TestFilePacked(EqualityCount|OrderedCount|IntegerInterval|IntegerExtrema).*$'
             printf 'VIBEDB_TEST_REQUIRE_AVX2=%q go test -v -race -gcflags=all=-d=checkptr=2 -count=1 -timeout=5m ./internal/storeio -run %q\n' \
               "${VIBEDB_TEST_REQUIRE_AVX2}" \
-              '^(TestCountCompactPacked(Equal|Less|Between)|TestCompactPacked|TestCompactInteger(Ordered|Interval|Extrema))'
+              '^(TestCountCompactPacked(Equal|Less|Between)|TestCompactPacked|TestCompactInteger(Ordered|Interval|Extrema)|TestPrimaryGraphIntegerExtrema)'
           } > "${evidence}/focused-test-commands.txt"
           go test -v -count=1 -timeout=5m ./internal/storeio \
-            -run 'Test(CountCompact|CompactPacked|CompactInteger(Ordered|Interval|Extrema)|CompactStream|CompactPrimaryStripe)' \
+            -run 'Test(CountCompact|CompactPacked|CompactInteger(Ordered|Interval|Extrema)|CompactStream|CompactPrimaryStripe|PrimaryGraphIntegerExtrema)' \
             2>&1 | tee "${evidence}/focused-storeio-tests.txt"
           go test -count=1 -timeout=5m ./query \
             -run '^TestFilePacked(EqualityCount|OrderedCount|IntegerInterval|IntegerExtrema).*$' \
             2>&1 | tee "${evidence}/focused-query-tests.txt"
           go test -v -race -gcflags=all=-d=checkptr=2 -count=1 -timeout=5m ./internal/storeio \
-            -run '^(TestCountCompactPacked(Equal|Less|Between)|TestCompactPacked|TestCompactInteger(Ordered|Interval|Extrema))' \
+            -run '^(TestCountCompactPacked(Equal|Less|Between)|TestCompactPacked|TestCompactInteger(Ordered|Interval|Extrema)|TestPrimaryGraphIntegerExtrema)' \
             2>&1 | tee "${evidence}/packed-race-checkptr-tests.txt"
 
       - name: SIMD packed-count fallback with AVX2 disabled (AMD64)
@@ -234,7 +235,7 @@ jobs:
             go env -json GOARCH GOAMD64 GOEXPERIMENT
             printf 'GODEBUG=%s\n' "${GODEBUG}"
           } > "${evidence}/environment.txt"
-          tests='Test(CountCompact|CompactPacked|CompactInteger(Ordered|Interval|Extrema))|^TestFilePacked(EqualityCount|OrderedCount|IntegerInterval|IntegerExtrema).*$'
+          tests='Test(CountCompact|CompactPacked|CompactInteger(Ordered|Interval|Extrema)|PrimaryGraphIntegerExtrema)|^TestFilePacked(EqualityCount|OrderedCount|IntegerInterval|IntegerExtrema).*$'
           printf 'GOAMD64=v1 GOEXPERIMENT=simd GODEBUG=cpu.avx2=off go test -v -count=1 -timeout=5m ./internal/storeio ./query -run %q\n' \
             "${tests}" > "${evidence}/commands.txt"
           go test -v -count=1 -timeout=5m ./internal/storeio ./query \
