@@ -52,6 +52,17 @@ type IntentScope struct {
 	End   uint32
 }
 
+// ValidateIntentScope enforces the canonical interval form for one scope.
+// It matches ValidateIntentScopes on a single-element slice exactly, without
+// allocating the slice.
+func ValidateIntentScope(scope IntentScope, bucketBits uint8) bool {
+	if 1 > MaxIntentScopes || bucketBits < 8 || bucketBits > 24 {
+		return false
+	}
+	limit := uint32(1) << bucketBits
+	return scope.Start < scope.End && scope.End <= limit
+}
+
 // ValidateIntentScopes enforces the canonical sorted interval form.
 func ValidateIntentScopes(scopes []IntentScope, bucketBits uint8) bool {
 	if len(scopes) == 0 {
