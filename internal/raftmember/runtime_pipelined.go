@@ -1,9 +1,11 @@
 package raftmember
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
+	"runtime/trace"
 	"sync"
 	"sync/atomic"
 
@@ -531,6 +533,7 @@ func (p *pipelinedRuntime) enqueueAppend(message *pb.Message) error {
 	if !p.appendWork.push(work) {
 		return p.runtime.fail(errors.New("raftmember: pipelined append ring overflow"))
 	}
+	p.runtime.traceAppendStage("submit", work.batch)
 	p.appendOutstanding++
 	if p.runtime.nodePersistence == nil {
 		signalPipelinedEdge(p.workerWake)
@@ -678,6 +681,7 @@ func (p *pipelinedRuntime) consumeAppendResult() (DriveResult, bool, error) {
 		}
 	}
 	for index := 0; index < int(result.count); index++ {
+		p.runtime.traceAppendStage("complete", result.works[index].batch)
 		if !p.appendCompleted.push(pipelinedAppendCompletion{
 			message: result.works[index].message, responseIndex: result.works[index].earlyResponses,
 		}) {
@@ -713,8 +717,12 @@ func (p *pipelinedRuntime) deliverResponse(
 	if send == nil {
 		return errors.New("raftmember: nil outbound sink")
 	}
-	return send(OutboundMessage{Group: p.runtime.identity.Group,
+	err := send(OutboundMessage{Group: p.runtime.identity.Group,
 		From: response.GetFrom(), To: response.GetTo(), Message: response})
+	if err == nil {
+		p.runtime.tracePeerStage("send", response)
+	}
+	return err
 }
 
 func (p *pipelinedRuntime) driveResponses(
@@ -826,7 +834,9 @@ func (runtime *Runtime) drivePipelinedReady(
 		if workspace != nil {
 			normalWorkspace = &workspace.normal
 		}
+		applyRegion := trace.StartRegion(context.Background(), "raft.apply.execute")
 		applied, applyErr := runtime.node.ApplyNextBatch(normalWorkspace)
+		applyRegion.End()
 		if applyErr != nil {
 			return DriveResult{}, runtime.fail(applyErr)
 		}
@@ -856,6 +866,7 @@ driveDirect:
 			From: message.GetFrom(), To: message.GetTo(), Message: message}); err != nil {
 			return DriveResult{}, err
 		}
+		runtime.tracePeerStage("send", message)
 		p.directQueue.pop()
 		return DriveResult{Kind: DriveMessage}, nil
 	}

@@ -1259,7 +1259,11 @@ func (runtime *Runtime) StepMessage(message *pb.Message) error {
 		}
 		return err
 	}
-	return runtime.node.Step(message)
+	err := runtime.node.Step(message)
+	if err == nil {
+		runtime.tracePeerStage("receive", message)
+	}
+	return err
 }
 
 // Tick advances exactly one logical Raft tick. Runtime supplies no wall-clock
