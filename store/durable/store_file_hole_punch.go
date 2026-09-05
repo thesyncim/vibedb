@@ -281,7 +281,7 @@ func (c *Collection) punchDurableFreeExtentsBatchLocked() (uint64, error) {
 		return 0, nil
 	}
 	current := c.committer.DurableGeneration()
-	fallback := c.committer.FallbackGeneration()
+	fallback := c.effectiveRecoveryFloor(state.root.Generation)
 	if current == 0 || fallback == 0 || state.root.Generation < current {
 		c.snapshotGate.Unlock()
 		return 0, nil

@@ -3268,6 +3268,16 @@ func (c *Collection) neverDurableRetirementOutput() []storeio.FreeExtent {
 		return nil
 	}
 	used := len(c.retirementAbsorbed)
+	// An exact-root bank may still select an older complete graph while this
+	// process has already published a newer in-memory root. Keep the
+	// never-durable fast path disabled across that interval: the ordinary
+	// generation fence must see every candidate until both banks advance.
+	if exactFloor := c.exactRootRecoveryFloor.Load(); exactFloor != 0 {
+		current := c.visibleLogicalViewNoError().generation
+		if exactFloor <= current {
+			return c.retirementAbsorbed[:used:used]
+		}
+	}
 	room := min(
 		cap(c.retirementAbsorbed)-used,
 		c.freeSetLimit-len(c.reusable)-used,
