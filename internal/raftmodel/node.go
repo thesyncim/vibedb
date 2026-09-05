@@ -55,7 +55,24 @@ type Node struct {
 	commitIndex        uint64
 	commitAdvancements uint64
 	committedEntries   uint64
+	observedTerm       uint64
+	currentTermCommit  bool
+	electionGate       func(ElectionInput) error
+	pendingConfChange  bool
+	pendingDurableLast uint64
 }
+
+// ElectionInput identifies one protocol edge that can begin or support a
+// leadership change. An optional read-authority owner installs a gate here so
+// the same promise applies to direct Node callers and Runtime wrappers.
+type ElectionInput uint8
+
+const (
+	ElectionMessage ElectionInput = iota + 1
+	ElectionTickInput
+	ElectionCampaign
+	ElectionTransfer
+)
 
 // CommitMetrics is the allocation-free cumulative observation produced at the
 // RawNode mutation boundary. An advancement counts one core transition of the
@@ -261,16 +278,23 @@ func newNode(id, incarnation uint64, stable StableStore, machine StateMachine, a
 		return nil, fmt.Errorf("raftmodel: construct RawNode: %w", err)
 	}
 	n := &Node{
-		id:          id,
-		incarnation: incarnation,
-		async:       async,
-		raw:         raw,
-		stable:      stable,
-		machine:     machine,
-		phase:       PhaseIdle,
-		published:   pub,
-		issuedReads: make(map[readContextKey]readIssue),
-		commitIndex: raw.BasicStatus().GetCommit(),
+		id:           id,
+		incarnation:  incarnation,
+		async:        async,
+		raw:          raw,
+		stable:       stable,
+		machine:      machine,
+		phase:        PhaseIdle,
+		published:    pub,
+		issuedReads:  make(map[readContextKey]readIssue),
+		commitIndex:  raw.BasicStatus().GetCommit(),
+		observedTerm: raw.BasicStatus().GetTerm(),
+		pendingDurableLast: func() uint64 {
+			if last > pub.Applied {
+				return last
+			}
+			return 0
+		}(),
 	}
 	return n, nil
 }
@@ -319,6 +343,64 @@ func (n *Node) BindMembershipTransitionContext() error {
 	}
 	n.membershipTransitionContext = true
 	return nil
+}
+
+// SetElectionGate installs the serialized authority check used by all Node
+// entry points that can start or assist an election. A nil gate restores the
+// ordinary RawNode behavior. It may only change while the Ready/input lane is
+// completely idle.
+func (n *Node) SetElectionGate(gate func(ElectionInput) error) error {
+	if n == nil || n.phase != PhaseIdle || n.readyID != 0 ||
+		n.pendingInputCalls != 0 || n.pendingInputUnits != 0 || n.pendingInputBytes != 0 ||
+		n.raw == nil || n.raw.HasReady() {
+		return ErrReadyPending
+	}
+	n.electionGate = gate
+	return nil
+}
+
+func (n *Node) gateElection(input ElectionInput) error {
+	if n == nil || n.electionGate == nil {
+		return nil
+	}
+	return n.electionGate(input)
+}
+
+func (n *Node) observeCurrentTerm() {
+	if n == nil || n.raw == nil {
+		return
+	}
+	term := n.raw.BasicStatus().GetTerm()
+	if term != n.observedTerm {
+		n.observedTerm = term
+		n.currentTermCommit = false
+	}
+}
+
+// CurrentTermCommitted reports the conservative local proof that at least
+// one current-term entry has reached the ordered apply path. A false result is
+// safe for authority admission; it merely keeps the ReadIndex fallback.
+func (n *Node) CurrentTermCommitted() bool {
+	n.observeCurrentTerm()
+	return n != nil && n.currentTermCommit
+}
+
+// PendingConfiguration reports whether a configuration proposal has entered
+// RawNode but has not yet reached ordered application. It is a local gate for
+// the optional authority protocol and is deliberately conservative across
+// restart/recovery.
+func (n *Node) PendingConfiguration() bool {
+	if n == nil {
+		return false
+	}
+	if n.pendingDurableLast != 0 && n.published.Applied >= n.pendingDurableLast {
+		n.pendingDurableLast = 0
+	}
+	// Ordinary committed-but-unapplied entries are a serving applied-floor
+	// concern, not a membership transition. Keeping them out of this predicate
+	// lets an already-established authority survive normal apply lag while the
+	// read owner still checks its requested publication index before serving.
+	return n.pendingConfChange || n.pendingDurableLast != 0
 }
 
 // Failure returns the terminal apply failure, if any.
@@ -437,6 +519,9 @@ func (n *Node) CaptureReady() (bool, error) {
 	n.pendingInputCalls = 0
 	n.pendingInputUnits = 0
 	n.pendingInputBytes = 0
+	if hasConfigurationEntry(n.ready.Entries) || hasConfigurationEntry(n.ready.CommittedEntries) {
+		n.pendingConfChange = true
+	}
 	n.phase = PhaseCaptured
 	return true, nil
 }
@@ -578,6 +663,9 @@ func (n *Node) ApplyNext() (Publication, bool, error) {
 		return Publication{}, false, err
 	}
 	n.entryPos++
+	if entry.GetType() == pb.EntryType_EntryConfChange || entry.GetType() == pb.EntryType_EntryConfChangeV2 {
+		n.refreshPendingConfiguration()
+	}
 	if n.entryPos == len(n.ready.CommittedEntries) {
 		n.phase = PhaseEntriesApplied
 	}
@@ -672,6 +760,9 @@ func (n *Node) ApplyNextBatch(workspace *NormalApplyBatchWorkspace) (ApplyBatchR
 					clear(witnesses)
 					return ApplyBatchResult{}, n.fail(PhaseEntriesApplied, first.GetIndex(), err)
 				}
+				for index := 0; index < applied; index++ {
+					n.recordAppliedTerm(entries[index].Meta.Term)
+				}
 				clear(entries)
 				clear(witnesses)
 				n.entryPos += applied
@@ -724,6 +815,10 @@ func (n *Node) ApplyNextBatch(workspace *NormalApplyBatchWorkspace) (ApplyBatchR
 		n.settlementCount = 1
 		result.Normal = n.pendingAppliedNormalBatch()
 		return result, nil
+	}
+	if first != nil && (first.GetType() == pb.EntryType_EntryConfChange ||
+		first.GetType() == pb.EntryType_EntryConfChangeV2) {
+		n.refreshPendingConfiguration()
 	}
 	if n.entryPos == len(n.ready.CommittedEntries) {
 		n.phase = PhaseEntriesApplied
@@ -964,6 +1059,12 @@ func (n *Node) Step(message *pb.Message) error {
 	if err := n.validateInboundMessage(message); err != nil {
 		return err
 	}
+	switch message.GetType() {
+	case pb.MsgVote, pb.MsgPreVote, pb.MsgTimeoutNow:
+		if err := n.gateElection(ElectionMessage); err != nil {
+			return err
+		}
+	}
 	// RawNode may retain entry, snapshot, or ReadIndex protobuf backing beyond
 	// Step. The transport owns its message and is free to recycle it as soon as
 	// this call returns, so the integration boundary must detach the full graph.
@@ -1075,6 +1176,9 @@ func (n *Node) validateTimeoutNow(message *pb.Message) error {
 // Tick advances the logical election clock within the bounded uncaptured-Ready
 // input window.
 func (n *Node) Tick() error {
+	if err := n.gateElection(ElectionTickInput); err != nil {
+		return err
+	}
 	if err := n.admitProtocolInput("Tick", 1, 0); err != nil {
 		return err
 	}
@@ -1086,6 +1190,9 @@ func (n *Node) Tick() error {
 
 // Campaign starts an election within the bounded uncaptured-Ready input window.
 func (n *Node) Campaign() error {
+	if err := n.gateElection(ElectionCampaign); err != nil {
+		return err
+	}
 	if err := n.admitProtocolInput("Campaign", 1, 0); err != nil {
 		return err
 	}
@@ -1114,6 +1221,9 @@ func (n *Node) TransferLeader(transferee uint64) error {
 	progress, found := n.Progress(transferee)
 	if !found || progress.Learner {
 		return ErrInvalidTransferee
+	}
+	if err := n.gateElection(ElectionTransfer); err != nil {
+		return err
 	}
 	if err := n.admitProtocolInput("TransferLeader", 1, 0); err != nil {
 		return err
@@ -1216,6 +1326,7 @@ func (n *Node) ProposeConfChange(change pb.ConfChangeI) error {
 	err = n.raw.ProposeConfChange(change)
 	n.observeCommitAdvancement()
 	if err == nil {
+		n.pendingConfChange = true
 		n.recordProtocolInput(1, int64(len(encoded)))
 	}
 	return err
@@ -1263,6 +1374,7 @@ func (n *Node) applyEntry(entry *pb.Entry) error {
 		if err := n.acceptNormalPublication(meta, len(entry.GetData()) == 0, pub); err != nil {
 			return n.fail(PhaseEntriesApplied, meta.Index, err)
 		}
+		n.recordAppliedTerm(meta.Term)
 		n.settlementCompletion = completion
 	case pb.EntryType_EntryConfChange, pb.EntryType_EntryConfChangeV2:
 		change, err := decodeConfChange(entry)
@@ -1297,10 +1409,49 @@ func (n *Node) applyEntry(entry *pb.Entry) error {
 		if err := n.acceptConfigurationPublication(meta, confState, pub); err != nil {
 			return n.fail(PhaseEntriesApplied, meta.Index, err)
 		}
+		n.recordAppliedTerm(meta.Term)
 	default:
 		return n.fail(PhaseEntriesApplied, meta.Index, fmt.Errorf("unknown committed entry type %d", entry.GetType()))
 	}
 	return nil
+}
+
+func (n *Node) recordAppliedTerm(term uint64) {
+	n.observeCurrentTerm()
+	if term != 0 && term == n.observedTerm {
+		n.currentTermCommit = true
+	}
+}
+
+func hasConfigurationEntry(entries []*pb.Entry) bool {
+	for _, entry := range entries {
+		if isConfigurationEntry(entry) {
+			return true
+		}
+	}
+	return false
+}
+
+func (n *Node) refreshPendingConfiguration() {
+	if n == nil {
+		return
+	}
+	for index := n.entryPos; index < len(n.ready.CommittedEntries); index++ {
+		if isConfigurationEntry(n.ready.CommittedEntries[index]) {
+			return
+		}
+	}
+	for _, entry := range n.ready.Entries {
+		if isConfigurationEntry(entry) && entry.GetIndex() > n.published.Applied {
+			return
+		}
+	}
+	n.pendingConfChange = false
+}
+
+func isConfigurationEntry(entry *pb.Entry) bool {
+	return entry != nil && (entry.GetType() == pb.EntryType_EntryConfChange ||
+		entry.GetType() == pb.EntryType_EntryConfChangeV2)
 }
 
 func decodeConfChange(entry *pb.Entry) (pb.ConfChangeI, error) {

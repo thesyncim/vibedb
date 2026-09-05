@@ -5,6 +5,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/thesyncim/vibedb/internal/raftauthority"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
@@ -98,6 +99,52 @@ func (lane *ExecutionLane) AdoptMessage(key raftmember.GroupKey, message *pb.Mes
 		return err
 	}
 	return lane.set.AdoptMessage(key, message)
+}
+
+func (lane *ExecutionLane) AdoptAuthorityMessage(
+	key raftmember.GroupKey,
+	message *raftauthority.Message,
+) error {
+	if err := lane.accepts(key); err != nil {
+		return err
+	}
+	return lane.set.AdoptAuthorityMessage(key, message)
+}
+
+func (lane *ExecutionLane) AdoptAuthenticatedAuthorityMessage(
+	key raftmember.GroupKey,
+	source uint64,
+	message *raftauthority.Message,
+) error {
+	if err := lane.accepts(key); err != nil {
+		return err
+	}
+	return lane.set.AdoptAuthenticatedAuthorityMessage(key, source, message)
+}
+
+func (lane *ExecutionLane) StartReadAuthorityRound(key raftmember.GroupKey) error {
+	if err := lane.accepts(key); err != nil {
+		return err
+	}
+	return lane.set.StartReadAuthorityRound(key)
+}
+
+func (lane *ExecutionLane) ReadAuthorityToken(
+	key raftmember.GroupKey,
+) (raftauthority.AuthorityToken, error) {
+	if err := lane.accepts(key); err != nil {
+		return raftauthority.AuthorityToken{}, err
+	}
+	return lane.set.ReadAuthorityToken(key)
+}
+
+func (lane *ExecutionLane) ValidateReadAuthorityToken(
+	key raftmember.GroupKey, token raftauthority.AuthorityToken,
+) error {
+	if err := lane.accepts(key); err != nil {
+		return err
+	}
+	return lane.set.ValidateReadAuthorityToken(key, token)
 }
 func (lane *ExecutionLane) EnqueueTrackedProposal(key raftmember.GroupKey, data []byte, token ProposalToken) error {
 	if err := lane.accepts(key); err != nil {
@@ -494,6 +541,73 @@ func (set *ExecutionLanes) EnqueueMessage(key raftmember.GroupKey, message *pb.M
 
 func (set *ExecutionLanes) AdoptMessage(key raftmember.GroupKey, message *pb.Message) error {
 	return set.withGroup(key, func(host *Host) error { return host.AdoptMessage(key, message) })
+}
+
+func (set *ExecutionLanes) AdoptAuthorityMessage(
+	key raftmember.GroupKey,
+	message *raftauthority.Message,
+) error {
+	return set.withGroup(key, func(host *Host) error {
+		return host.AdoptAuthorityMessage(key, message)
+	})
+}
+
+func (set *ExecutionLanes) AdoptAuthenticatedAuthorityMessage(
+	key raftmember.GroupKey,
+	source uint64,
+	message *raftauthority.Message,
+) error {
+	return set.withGroup(key, func(host *Host) error {
+		return host.AdoptAuthenticatedAuthorityMessage(key, source, message)
+	})
+}
+
+func (set *ExecutionLanes) StartReadAuthorityRound(key raftmember.GroupKey) error {
+	return set.withGroup(key, func(host *Host) error {
+		return host.StartReadAuthorityRound(key)
+	})
+}
+
+func (set *ExecutionLanes) ReadAuthorityToken(
+	key raftmember.GroupKey,
+) (raftauthority.AuthorityToken, error) {
+	lane, err := set.laneFor(key)
+	if err != nil {
+		return raftauthority.AuthorityToken{}, err
+	}
+	lane.mu.Lock()
+	defer lane.mu.Unlock()
+	lane.counters.calls++
+	if set.state.Load() != executionLanesOpen {
+		lane.counters.rejected++
+		return raftauthority.AuthorityToken{}, ErrHostClosed
+	}
+	token, err := lane.host.ReadAuthorityToken(key)
+	if err != nil {
+		lane.counters.rejected++
+	}
+	return token, err
+}
+
+func (set *ExecutionLanes) ValidateReadAuthorityToken(
+	key raftmember.GroupKey, token raftauthority.AuthorityToken,
+) error {
+	lane, err := set.laneFor(key)
+	if err != nil {
+		return err
+	}
+	lane.mu.Lock()
+	defer lane.mu.Unlock()
+	lane.counters.calls++
+	if set.state.Load() != executionLanesOpen {
+		lane.counters.rejected++
+		return ErrHostClosed
+	}
+	err = lane.host.ValidateReadAuthorityToken(key, token)
+	if err != nil {
+		lane.counters.rejected++
+	}
+	return err
 }
 
 func (set *ExecutionLanes) EnqueueProposal(key raftmember.GroupKey, data []byte) error {

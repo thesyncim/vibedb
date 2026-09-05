@@ -500,6 +500,20 @@ func (round *AuthorityRound) HasQuorum() bool {
 	return round != nil && round.complete && !round.invalidated
 }
 
+// Expired reports whether the holder deadline has elapsed. It is separate from
+// Token because an incomplete round must still be retired once its deadline is
+// reached; Token intentionally reports ErrNotQuorum before checking completion.
+func (round *AuthorityRound) Expired() (bool, error) {
+	if round == nil || round.invalidated {
+		return true, nil
+	}
+	now, err := round.clock.Now()
+	if err != nil {
+		return false, err
+	}
+	return now >= round.usableUntil, nil
+}
+
 // Token returns a serving authority only while the round is complete, current,
 // and within the holder's conservative deadline.
 func (round *AuthorityRound) Token(observation AuthorityObservation) (AuthorityToken, error) {

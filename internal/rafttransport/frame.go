@@ -10,6 +10,7 @@ import (
 	"unsafe"
 
 	"github.com/thesyncim/vibedb/internal/membershipgrant"
+	"github.com/thesyncim/vibedb/internal/raftauthority"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	pb "go.etcd.io/raft/v3/raftpb"
@@ -42,19 +43,23 @@ const (
 	// before allocating a frame buffer.
 	MaxFrameBytes = FrameHeaderBytes + raftmodel.MaxInboundMessageBytes
 
-	frameCodecFormat  uint16 = 1
-	frameKindOrdinary byte   = 1
+	frameCodecFormat   uint16 = 1
+	frameKindOrdinary  byte   = 1
+	frameKindAuthority byte   = 2
 )
 
 var frameMagic = [4]byte{'V', 'D', 'R', 'F'}
 
 // Inbound owns Message and detaches it from the caller's frame buffer.
 type Inbound struct {
-	Group   raftmember.GroupKey
-	Message *pb.Message
+	Group     raftmember.GroupKey
+	From      uint64
+	Message   *pb.Message
+	Authority *raftauthority.Message
 }
 
 type frameHeader struct {
+	kind        byte
 	group       raftmember.GroupKey
 	roster      [32]byte
 	version     uint64
@@ -64,6 +69,7 @@ type frameHeader struct {
 }
 
 type outboundFramePlan struct {
+	kind        byte
 	destination NodeID
 	roster      [32]byte
 	version     uint64
@@ -94,8 +100,9 @@ func (registry *StaticRegistry) EncodeOutbound(
 func (registry *StaticRegistry) preflightOutbound(
 	outbound raftmember.OutboundMessage,
 ) (outboundFramePlan, error) {
-	if registry == nil || outbound.Message == nil {
-		return outboundFramePlan{}, fmt.Errorf("%w: nil registry or message", ErrInvalidFrame)
+	if registry == nil || (outbound.Message == nil && outbound.Authority == nil) ||
+		(outbound.Message != nil && outbound.Authority != nil) {
+		return outboundFramePlan{}, fmt.Errorf("%w: nil registry or mixed payload", ErrInvalidFrame)
 	}
 	if err := validateFrameGroup(outbound.Group); err != nil {
 		return outboundFramePlan{}, err
@@ -104,8 +111,11 @@ func (registry *StaticRegistry) preflightOutbound(
 		outbound.Group.ClusterIncarnation != registry.trustDomain.ClusterIncarnation {
 		return outboundFramePlan{}, fmt.Errorf("%w: group trust domain differs", ErrUnauthorized)
 	}
-	if outbound.From == 0 || outbound.To == 0 || outbound.From == outbound.To ||
-		outbound.Message.GetFrom() != outbound.From || outbound.Message.GetTo() != outbound.To {
+	if outbound.From == 0 || outbound.To == 0 || outbound.From == outbound.To {
+		return outboundFramePlan{}, fmt.Errorf("%w: outer and protobuf member IDs differ", ErrInvalidFrame)
+	}
+	if outbound.Message != nil &&
+		(outbound.Message.GetFrom() != outbound.From || outbound.Message.GetTo() != outbound.To) {
 		return outboundFramePlan{}, fmt.Errorf("%w: outer and protobuf member IDs differ", ErrInvalidFrame)
 	}
 	fromNode, err := registry.Node(outbound.Group, outbound.From)
@@ -116,13 +126,20 @@ func (registry *StaticRegistry) preflightOutbound(
 	if err != nil || destination == registry.LocalNode() {
 		return outboundFramePlan{}, fmt.Errorf("%w: destination member is not remote", ErrUnauthorized)
 	}
-	size, err := raftmember.MeasureOrdinaryMessage(outbound.Message)
-	if err != nil {
-		return outboundFramePlan{}, classifyOrdinaryError(err)
-	}
 	view, ok := registry.currentAuthority(outbound.Group)
 	if !ok {
 		return outboundFramePlan{}, fmt.Errorf("%w: missing committed authority", ErrUnauthorized)
+	}
+	roster, ok := registry.rosterDigest(outbound.Group)
+	if !ok {
+		return outboundFramePlan{}, fmt.Errorf("%w: missing group roster", ErrUnauthorized)
+	}
+	if outbound.Authority != nil {
+		return registry.preflightAuthorityOutbound(outbound, view, destination, roster)
+	}
+	size, err := raftmember.MeasureOrdinaryMessage(outbound.Message)
+	if err != nil {
+		return outboundFramePlan{}, classifyOrdinaryError(err)
 	}
 	version := view.version
 	if election, electionOK := certifiedPromotionElectionAuthority(view, outbound.Message,
@@ -133,20 +150,74 @@ func (registry *StaticRegistry) preflightOutbound(
 	if err := registry.validateAuthorizedMessage(outbound.Group, view, outbound.Message); err != nil {
 		return outboundFramePlan{}, err
 	}
-	roster, ok := registry.rosterDigest(outbound.Group)
-	if !ok {
-		return outboundFramePlan{}, fmt.Errorf("%w: missing group roster", ErrUnauthorized)
-	}
 	if size > raftmodel.MaxInboundMessageBytes {
 		return outboundFramePlan{}, fmt.Errorf("%w: payload bytes %d", ErrFrameTooLarge, size)
 	}
 	return outboundFramePlan{
+		kind:        frameKindOrdinary,
 		destination: destination,
 		roster:      roster,
 		version:     version,
 		payloadSize: size,
 		frameSize:   FrameHeaderBytes + size,
 	}, nil
+}
+
+func (registry *StaticRegistry) preflightAuthorityOutbound(
+	outbound raftmember.OutboundMessage,
+	view *authorityView,
+	destination NodeID,
+	roster [32]byte,
+) (outboundFramePlan, error) {
+	message := outbound.Authority
+	if message == nil || view == nil || roster == ([32]byte{}) {
+		return outboundFramePlan{}, fmt.Errorf("%w: authority frame lacks current roster", ErrUnauthorized)
+	}
+	if err := validateAuthorityGroup(message.Request.Group); err != nil {
+		return outboundFramePlan{}, err
+	}
+	if view.version == 0 || view.roles[outbound.From] != MemberVoter ||
+		view.roles[outbound.To] != MemberVoter {
+		return outboundFramePlan{}, fmt.Errorf("%w: authority endpoints are not current voters", ErrUnauthorized)
+	}
+	request := message.Request
+	if request.Group != authorityGroup(outbound.Group) {
+		return outboundFramePlan{}, fmt.Errorf("%w: authority group differs from frame group", ErrInvalidFrame)
+	}
+	switch message.Kind {
+	case raftauthority.MessageRequest:
+		if request.Holder != outbound.From {
+			return outboundFramePlan{}, fmt.Errorf("%w: authority request route", ErrInvalidFrame)
+		}
+	case raftauthority.MessageGrant:
+		if message.Grant.Voter != outbound.From || request.Holder != outbound.To {
+			return outboundFramePlan{}, fmt.Errorf("%w: authority grant route", ErrInvalidFrame)
+		}
+	default:
+		return outboundFramePlan{}, fmt.Errorf("%w: unknown authority kind", ErrUnsupportedFrame)
+	}
+	return outboundFramePlan{
+		kind: frameKindAuthority, destination: destination, roster: roster,
+		version: view.version, payloadSize: raftauthority.CanonicalMessageBytes,
+		frameSize: FrameHeaderBytes + raftauthority.CanonicalMessageBytes,
+	}, nil
+}
+
+func authorityGroup(group raftmember.GroupKey) raftauthority.GroupIdentity {
+	return raftauthority.GroupIdentity{
+		ClusterID: group.ClusterID, ClusterIncarnation: group.ClusterIncarnation,
+		TopologyRecoveryEpoch: group.TopologyRecoveryEpoch,
+		ShardIncarnation:      group.ShardIncarnation, GroupID: group.GroupID,
+	}
+}
+
+func validateAuthorityGroup(group raftauthority.GroupIdentity) error {
+	if group.ClusterID == ([16]byte{}) || group.ClusterIncarnation == ([16]byte{}) ||
+		group.TopologyRecoveryEpoch == 0 || group.ShardIncarnation == ([16]byte{}) ||
+		group.GroupID == ([16]byte{}) {
+		return fmt.Errorf("%w: incomplete authority group lineage", ErrInvalidFrame)
+	}
+	return nil
 }
 
 func (registry *StaticRegistry) appendOutbound(
@@ -158,7 +229,10 @@ func (registry *StaticRegistry) appendOutbound(
 		len(dst) > math.MaxInt-plan.frameSize {
 		return dst, ErrFrameTooLarge
 	}
-	if messageOverlapsAppendRegion(dst, plan.frameSize, outbound.Message) {
+	if plan.kind != frameKindOrdinary && plan.kind != frameKindAuthority {
+		return dst, ErrUnsupportedFrame
+	}
+	if plan.kind == frameKindOrdinary && messageOverlapsAppendRegion(dst, plan.frameSize, outbound.Message) {
 		return dst, fmt.Errorf("%w: message aliases frame append region", ErrInvalidFrame)
 	}
 
@@ -170,17 +244,24 @@ func (registry *StaticRegistry) appendOutbound(
 	dst = slices.Grow(dst, plan.frameSize)
 	dst = append(dst, make([]byte, FrameHeaderBytes)...)
 	var err error
-	dst, err = (proto.MarshalOptions{Deterministic: true}).MarshalAppend(dst, outbound.Message)
-	if err != nil {
-		return dst[:start], fmt.Errorf("%w: marshal ordinary message: %w", ErrInvalidFrame, err)
+	if plan.kind == frameKindAuthority {
+		dst, err = raftauthority.AppendCanonical(dst, *outbound.Authority)
+		if err != nil {
+			return dst[:start], fmt.Errorf("%w: marshal authority message: %w", ErrInvalidFrame, err)
+		}
+	} else {
+		dst, err = (proto.MarshalOptions{Deterministic: true}).MarshalAppend(dst, outbound.Message)
+		if err != nil {
+			return dst[:start], fmt.Errorf("%w: marshal ordinary message: %w", ErrInvalidFrame, err)
+		}
 	}
 	if len(dst) != start+plan.frameSize {
-		return dst[:start], fmt.Errorf("%w: protobuf size changed during encode", ErrInvalidFrame)
+		return dst[:start], fmt.Errorf("%w: payload size changed during encode", ErrInvalidFrame)
 	}
 	header := dst[start : start+FrameHeaderBytes]
 	copy(header[0:4], frameMagic[:])
 	binary.BigEndian.PutUint16(header[4:6], frameCodecFormat)
-	header[6] = frameKindOrdinary
+	header[6] = plan.kind
 	header[7] = 0
 	appendGroupKey(header[8:80], outbound.Group)
 	copy(header[80:112], plan.roster[:])
@@ -218,6 +299,9 @@ func (registry *StaticRegistry) DecodeInbound(authenticated PeerIdentity, frame 
 	roster, ok := registry.rosterDigest(header.group)
 	if !ok || roster != header.roster {
 		return Inbound{}, fmt.Errorf("%w: stable enrollment digest differs", ErrUnauthorized)
+	}
+	if header.kind == frameKindAuthority {
+		return registry.decodeAuthorityInbound(header, payload)
 	}
 	if err := preflightOrdinaryPayload(payload); err != nil {
 		return Inbound{}, err
@@ -268,7 +352,43 @@ func (registry *StaticRegistry) DecodeInbound(authenticated PeerIdentity, frame 
 	if !equal {
 		return Inbound{}, fmt.Errorf("%w: noncanonical protobuf payload", ErrInvalidFrame)
 	}
-	return Inbound{Group: header.group, Message: message}, nil
+	return Inbound{Group: header.group, From: header.from, Message: message}, nil
+}
+
+func (registry *StaticRegistry) decodeAuthorityInbound(
+	header frameHeader,
+	payload []byte,
+) (Inbound, error) {
+	if len(payload) != raftauthority.CanonicalMessageBytes {
+		return Inbound{}, fmt.Errorf("%w: authority payload bytes %d", ErrUnsupportedFrame, len(payload))
+	}
+	view, ok := registry.currentAuthority(header.group)
+	if !ok || view == nil || header.version != view.version {
+		return Inbound{}, fmt.Errorf("%w: authority generation is not current", ErrUnauthorized)
+	}
+	if view.roles[header.from] != MemberVoter || view.roles[header.to] != MemberVoter {
+		return Inbound{}, fmt.Errorf("%w: authority endpoints are not current voters", ErrUnauthorized)
+	}
+	message, err := raftauthority.OpenCanonical(payload)
+	if err != nil {
+		return Inbound{}, fmt.Errorf("%w: authority payload: %w", ErrInvalidFrame, err)
+	}
+	if message.Request.Group != authorityGroup(header.group) {
+		return Inbound{}, fmt.Errorf("%w: authority group differs from frame group", ErrInvalidFrame)
+	}
+	switch message.Kind {
+	case raftauthority.MessageRequest:
+		if message.Request.Holder != header.from {
+			return Inbound{}, fmt.Errorf("%w: authority request route", ErrInvalidFrame)
+		}
+	case raftauthority.MessageGrant:
+		if message.Grant.Voter != header.from || message.Request.Holder != header.to {
+			return Inbound{}, fmt.Errorf("%w: authority grant route", ErrInvalidFrame)
+		}
+	default:
+		return Inbound{}, fmt.Errorf("%w: unknown authority kind", ErrUnsupportedFrame)
+	}
+	return Inbound{Group: header.group, From: header.from, Authority: &message}, nil
 }
 
 func (view *authorityView) promotionVersion() uint64 {
@@ -359,10 +479,11 @@ func parseFrame(frame []byte) (frameHeader, []byte, error) {
 	}
 	if !bytes.Equal(frame[0:4], frameMagic[:]) ||
 		binary.BigEndian.Uint16(frame[4:6]) != frameCodecFormat ||
-		frame[6] != frameKindOrdinary || frame[7] != 0 {
+		(frame[6] != frameKindOrdinary && frame[6] != frameKindAuthority) || frame[7] != 0 {
 		return frameHeader{}, nil, fmt.Errorf("%w: magic, format, kind, or flags", ErrUnsupportedFrame)
 	}
 	header := frameHeader{
+		kind:        frame[6],
 		group:       openGroupKey(frame[8:80]),
 		version:     binary.BigEndian.Uint64(frame[112:120]),
 		from:        binary.BigEndian.Uint64(frame[120:128]),

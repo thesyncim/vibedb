@@ -15,6 +15,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/executionpin"
 	"github.com/thesyncim/vibedb/internal/membershipgrant"
 	"github.com/thesyncim/vibedb/internal/multiraft"
+	"github.com/thesyncim/vibedb/internal/raftauthority"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftserve"
@@ -734,6 +735,17 @@ type ownerHost interface {
 	Close() error
 }
 
+// authorityInboundHost is optional so existing Host test doubles and
+// deployments that have not explicitly enabled the authority policy retain
+// the ordinary ReadIndex-only contract.
+type authorityInboundHost interface {
+	AdoptAuthorityMessage(raftmember.GroupKey, *raftauthority.Message) error
+}
+
+type authenticatedAuthorityInboundHost interface {
+	AdoptAuthenticatedAuthorityMessage(raftmember.GroupKey, uint64, *raftauthority.Message) error
+}
+
 type asyncOwnerHost interface {
 	AsyncNotify() <-chan struct{}
 	WakePipelined()
@@ -1133,7 +1145,7 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 		}
 	}()
 	for {
-		if pending.Message != nil {
+		if pending.Message != nil || pending.Authority != nil {
 			if owner.outbound == nil {
 				return owner.stop(errors.New("raftservice: outbound message has no transport"))
 			}
@@ -1162,9 +1174,15 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 			}
 		}
 
-		if pending.Message == nil {
+		if pending.Message == nil && pending.Authority == nil {
 			if outbound, ok := owner.host.PopOutbound(); ok {
-				size, err := raftmember.MeasureOrdinaryMessage(outbound.Message)
+				size := raftauthority.CanonicalMessageBytes
+				var err error
+				if (outbound.Message == nil) == (outbound.Authority == nil) {
+					err = ErrInvalidOwner
+				} else if outbound.Message != nil {
+					size, err = raftmember.MeasureOrdinaryMessage(outbound.Message)
+				}
 				if err != nil || int64(size) > owner.limits.MaxPendingOutboundBytes {
 					return owner.stop(errors.Join(ErrInvalidOwner, err))
 				}
@@ -1379,7 +1397,8 @@ func (owner *Owner) handle(request ownerRequest) error {
 			reply.waiter, reply.err = handoffProposalWaiter(request.delivery, reply.waiter)
 		}
 	case requestInbound:
-		if request.inbound.Group != request.group || request.inbound.Message == nil {
+		if request.inbound.Group != request.group ||
+			(request.inbound.Message == nil) == (request.inbound.Authority == nil) {
 			reply.err = ErrInvalidOwner
 		} else if member, found := owner.members[request.group]; found &&
 			member.generation != nil && member.generation.quiescing.Load() {
@@ -1389,8 +1408,25 @@ func (owner *Owner) handle(request ownerRequest) error {
 			// this bounded packet loss after installation; admitting it would let
 			// peer heartbeats keep quiescence permanently busy.
 			reply.err = nil
-		} else {
+		} else if request.inbound.Message != nil {
 			reply.err = owner.host.AdoptMessage(request.group, request.inbound.Message)
+		} else if authorityHost, ok := owner.host.(authenticatedAuthorityInboundHost); ok &&
+			request.inbound.From != 0 {
+			reply.err = authorityHost.AdoptAuthenticatedAuthorityMessage(
+				request.group, request.inbound.From, request.inbound.Authority,
+			)
+			if errors.Is(reply.err, raftauthority.ErrPolicyDisabled) {
+				reply.err = nil
+			}
+		} else if authorityHost, ok := owner.host.(authorityInboundHost); !ok {
+			// The authority protocol is opt-in. A correctly authenticated control
+			// frame is safely discarded when this owner still uses ReadIndex.
+			reply.err = nil
+		} else {
+			reply.err = authorityHost.AdoptAuthorityMessage(request.group, request.inbound.Authority)
+			if errors.Is(reply.err, raftauthority.ErrPolicyDisabled) {
+				reply.err = nil
+			}
 		}
 	case requestCampaign:
 		reply.err = owner.host.RequestCampaign(request.group)
@@ -3039,14 +3075,18 @@ func (owner *Owner) releasePendingProposalForGroup(_ raftmember.GroupKey, bytes 
 // HandleInbound is the authenticated rafttransport receiver callback. Inbound
 // already owns its protobuf message, so ingress transfers it without a clone.
 func (owner *Owner) HandleInbound(ctx context.Context, inbound rafttransport.Inbound) error {
-	if inbound.Message == nil {
+	if (inbound.Message == nil) == (inbound.Authority == nil) {
 		return ErrInvalidOwner
 	}
-	size, err := raftmember.MeasureOrdinaryMessage(inbound.Message)
-	if err != nil {
-		return err
+	size := raftauthority.CanonicalMessageBytes
+	if inbound.Message != nil {
+		measured, err := raftmember.MeasureOrdinaryMessage(inbound.Message)
+		if err != nil {
+			return err
+		}
+		size = measured
 	}
-	_, err = owner.enqueue(ctx, ownerRequest{
+	_, err := owner.enqueue(ctx, ownerRequest{
 		kind: requestInbound, group: inbound.Group, inbound: inbound,
 		reply: make(chan ownerReply, 1), bytes: int64(size),
 	})
@@ -3058,12 +3098,16 @@ func (owner *Owner) HandleInbound(ctx context.Context, inbound rafttransport.Inb
 // acceptance means bounded local ownership, not Raft processing. A later Host
 // refusal is a lane invariant failure and stops the Owner.
 func (owner *Owner) TryInbound(inbound rafttransport.Inbound) error {
-	if inbound.Message == nil {
+	if (inbound.Message == nil) == (inbound.Authority == nil) {
 		return ErrInvalidOwner
 	}
-	size, err := raftmember.MeasureOrdinaryMessage(inbound.Message)
-	if err != nil {
-		return err
+	size := raftauthority.CanonicalMessageBytes
+	if inbound.Message != nil {
+		measured, err := raftmember.MeasureOrdinaryMessage(inbound.Message)
+		if err != nil {
+			return err
+		}
+		size = measured
 	}
 	request := ownerRequest{
 		kind: requestInbound, group: inbound.Group, inbound: inbound,
