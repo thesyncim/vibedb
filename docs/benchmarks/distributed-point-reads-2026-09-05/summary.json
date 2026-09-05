@@ -1,0 +1,149 @@
+{
+  "operations": 1440000,
+  "errors": 0,
+  "verified_trials": 72,
+  "results": [
+    {
+      "order": "before-first",
+      "workload": "point_hit",
+      "clients": 1,
+      "ops_median": {
+        "before": 3621.7488623219865,
+        "after": 4370.145097240683,
+        "crdb": 4423.883827959522
+      },
+      "p99_ms_median": {
+        "before": 0.410417,
+        "after": 0.330708,
+        "crdb": 0.432084
+      },
+      "after_before": 1.2066394615884224,
+      "after_crdb": 0.9878525899845734
+    },
+    {
+      "order": "before-first",
+      "workload": "point_hit",
+      "clients": 8,
+      "ops_median": {
+        "before": 18780.334624452855,
+        "after": 24757.76078432586,
+        "crdb": 24284.866329302033
+      },
+      "p99_ms_median": {
+        "before": 0.827375,
+        "after": 0.553209,
+        "crdb": 0.499083
+      },
+      "after_before": 1.3182811318010341,
+      "after_crdb": 1.0194728045281942
+    },
+    {
+      "order": "before-first",
+      "workload": "point_miss",
+      "clients": 1,
+      "ops_median": {
+        "before": 3793.5484522430143,
+        "after": 4365.560820001598,
+        "crdb": 4411.533828583812
+      },
+      "p99_ms_median": {
+        "before": 0.399792,
+        "after": 0.302,
+        "crdb": 0.437583
+      },
+      "after_before": 1.150785570544214,
+      "after_crdb": 0.9895789060293861
+    },
+    {
+      "order": "before-first",
+      "workload": "point_miss",
+      "clients": 8,
+      "ops_median": {
+        "before": 19382.50096488028,
+        "after": 25652.33621649004,
+        "crdb": 24084.09322410595
+      },
+      "p99_ms_median": {
+        "before": 0.762208,
+        "after": 0.5725,
+        "crdb": 0.5145
+      },
+      "after_before": 1.3234791662319665,
+      "after_crdb": 1.0651153015308221
+    },
+    {
+      "order": "after-first",
+      "workload": "point_hit",
+      "clients": 1,
+      "ops_median": {
+        "before": 2331.740239008012,
+        "after": 3435.898505105001,
+        "crdb": 6466.223959941023
+      },
+      "p99_ms_median": {
+        "before": 2.203375,
+        "after": 0.520625,
+        "crdb": 0.388125
+      },
+      "after_before": 1.473533993034631,
+      "after_crdb": 0.5313608879603884
+    },
+    {
+      "order": "after-first",
+      "workload": "point_hit",
+      "clients": 8,
+      "ops_median": {
+        "before": 16004.622134872552,
+        "after": 17784.66110558632,
+        "crdb": 22339.51502675465
+      },
+      "p99_ms_median": {
+        "before": 0.911417,
+        "after": 0.772833,
+        "crdb": 0.664917
+      },
+      "after_before": 1.1112203059661891,
+      "after_crdb": 0.7961077527550056
+    },
+    {
+      "order": "after-first",
+      "workload": "point_miss",
+      "clients": 1,
+      "ops_median": {
+        "before": 3628.9960031506357,
+        "after": 3587.2091406686272,
+        "crdb": 4326.561192944511
+      },
+      "p99_ms_median": {
+        "before": 0.444625,
+        "after": 0.415042,
+        "crdb": 0.414042
+      },
+      "after_before": 0.9884852828590249,
+      "after_crdb": 0.8291132335117383
+    },
+    {
+      "order": "after-first",
+      "workload": "point_miss",
+      "clients": 8,
+      "ops_median": {
+        "before": 18439.965817872242,
+        "after": 18323.07451112606,
+        "crdb": 24070.783740578416
+      },
+      "p99_ms_median": {
+        "before": 0.722208,
+        "after": 0.737792,
+        "crdb": 0.510542
+      },
+      "after_before": 0.9936609802913576,
+      "after_crdb": 0.7612163653914228
+    }
+  ],
+  "metric_definitions": {
+    "ops_median": "Median operations/second across three repetitions; higher is better.",
+    "p99_ms_median": "Median of trial p99 latencies in milliseconds across three repetitions; lower is better.",
+    "after_before": "Candidate/base throughput ratio; above 1 favors candidate.",
+    "after_crdb": "Candidate/CRDB throughput ratio; above 1 favors candidate."
+  }
+}
