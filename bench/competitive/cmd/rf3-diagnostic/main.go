@@ -36,6 +36,7 @@ const (
 	defaultRequestTimeout = 350 * time.Millisecond
 	defaultMaxBytes       = 8 << 20
 	maxManifestBytes      = 8 << 20
+	maxLatchBytes         = 64 << 10
 	maxGroups             = 64
 	maxNodes              = 6
 	maxCaptureConcurrency = 8
@@ -88,8 +89,9 @@ type manifestMember struct {
 }
 
 type nodeConfig struct {
-	ID      rafttransport.NodeID
-	Address string
+	ID             rafttransport.NodeID
+	Address        string
+	DiagnosticPath string
 }
 
 type groupConfig struct {
@@ -153,16 +155,89 @@ func (opener controlOpener) OpenShardControl(
 }
 
 type cycle struct {
-	Schema          string          `json:"schema"`
-	Sequence        uint64          `json:"sequence"`
-	UTC             string          `json:"utc"`
-	ElapsedNS       int64           `json:"elapsed_ns"`
-	Groups          []groupSnapshot `json:"groups"`
-	ExpectedCuts    uint64          `json:"expected_cuts"`
-	ValidCuts       uint64          `json:"valid_cuts"`
-	PreflightReady  bool            `json:"preflight_ready"`
-	PreflightReason string          `json:"preflight_reason,omitempty"`
-	SamplingErrs    uint64          `json:"sampling_errors"`
+	Schema          string                `json:"schema"`
+	Sequence        uint64                `json:"sequence"`
+	UTC             string                `json:"utc"`
+	ElapsedNS       int64                 `json:"elapsed_ns"`
+	Groups          []groupSnapshot       `json:"groups"`
+	NodeMetrics     []nodeMetricsSnapshot `json:"node_metrics"`
+	ExpectedCuts    uint64                `json:"expected_cuts"`
+	ValidCuts       uint64                `json:"valid_cuts"`
+	PreflightReady  bool                  `json:"preflight_ready"`
+	PreflightReason string                `json:"preflight_reason,omitempty"`
+	SamplingErrs    uint64                `json:"sampling_errors"`
+	Latch           *latchSnapshot        `json:"latch,omitempty"`
+}
+
+// latchRequest is written by the fault controller after SIGCONT. It is a
+// one-shot handoff: the sidecar arms on the request and retains the first
+// complete post-CONT cycle in a separate immutable artifact. The request is
+// deliberately file-backed so the controller can record the exact UTC handoff
+// without adding a control RPC to the serving process.
+type latchRequest struct {
+	Event        string `json:"event"`
+	RequestedUTC string `json:"requested_utc"`
+	NodeID       string `json:"node_id,omitempty"`
+	PID          int    `json:"pid,omitempty"`
+}
+
+type latchSnapshot struct {
+	Event        string `json:"event"`
+	RequestedUTC string `json:"requested_utc,omitempty"`
+	ArmedUTC     string `json:"armed_utc"`
+	CapturedUTC  string `json:"captured_utc,omitempty"`
+	NodeID       string `json:"node_id,omitempty"`
+	PID          int    `json:"pid,omitempty"`
+	Sequence     uint64 `json:"sequence"`
+	Complete     bool   `json:"complete"`
+}
+
+type latchArtifact struct {
+	Schema       string `json:"schema"`
+	Event        string `json:"event"`
+	RequestedUTC string `json:"requested_utc,omitempty"`
+	ArmedUTC     string `json:"armed_utc"`
+	CapturedUTC  string `json:"captured_utc"`
+	NodeID       string `json:"node_id,omitempty"`
+	PID          int    `json:"pid,omitempty"`
+	Sequence     uint64 `json:"sequence"`
+	Cycle        cycle  `json:"cycle"`
+}
+
+// nodeMetricsSnapshot is intentionally separate from a group metrics cut.
+// The metrics endpoint exposes exact local-group counters, while the owner
+// authority counters are currently process-wide. Keeping that scope explicit
+// prevents a timeline from pretending that a process aggregate is a group
+// term or a per-group authority counter.
+type nodeMetricsSnapshot struct {
+	NodeID             string       `json:"node_id"`
+	Scope              string       `json:"scope"`
+	Source             string       `json:"source"`
+	PID                int          `json:"pid,omitempty"`
+	Serial             uint64       `json:"serial,omitempty"`
+	UTC                string       `json:"utc,omitempty"`
+	AuthorityAvailable bool         `json:"authority_available"`
+	AuthorityError     string       `json:"authority_error,omitempty"`
+	Metrics            *nodeMetrics `json:"metrics,omitempty"`
+	Error              string       `json:"error,omitempty"`
+	ElapsedNS          int64        `json:"elapsed_ns"`
+}
+
+type nodeMetrics struct {
+	AppliedEntries                  uint64 `json:"applied_entries"`
+	ReadyPersisted                  uint64 `json:"ready_persisted"`
+	CommitAdvancements              uint64 `json:"commit_advancements"`
+	CommittedEntries                uint64 `json:"committed_entries"`
+	ReadCompletions                 uint64 `json:"read_completions"`
+	Faults                          uint64 `json:"faults"`
+	AuthorityReadHits               uint64 `json:"authority_read_hits"`
+	AuthorityReadIndexFallbacks     uint64 `json:"authority_read_index_fallbacks"`
+	AuthorityReadValidationRetries  uint64 `json:"authority_read_validation_retries"`
+	AuthorityReadValidationFailures uint64 `json:"authority_read_validation_failures"`
+	AuthorityRoundAttempts          uint64 `json:"authority_round_attempts"`
+	ReadAuthorityRoundsStarted      uint64 `json:"read_authority_rounds_started"`
+	ReadAuthorityRequestsCreated    uint64 `json:"read_authority_requests_created"`
+	ReadAuthorityGrantsAccepted     uint64 `json:"read_authority_grants_accepted"`
 }
 
 // preflightTracker gates only the initial readiness check. Once one complete
@@ -251,6 +326,136 @@ func (writer *boundedWriter) Write(value []byte) (int, error) {
 	return written, err
 }
 
+type latchTracker struct {
+	requestPath string
+	outputPath  string
+	maxBytes    int64
+	request     *latchRequest
+	requestedAt time.Time
+	armedUTC    string
+	captured    bool
+}
+
+func (tracker *latchTracker) arm() error {
+	if tracker == nil || tracker.requestPath == "" || tracker.request != nil {
+		return nil
+	}
+	raw, err := os.ReadFile(tracker.requestPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("rf3-diagnostic: read latch request: %w", err)
+	}
+	if len(raw) == 0 || len(raw) > maxLatchBytes {
+		return errors.New("rf3-diagnostic: latch request exceeds bound")
+	}
+	var request latchRequest
+	if err := json.Unmarshal(raw, &request); err != nil {
+		return fmt.Errorf("rf3-diagnostic: decode latch request: %w", err)
+	}
+	if request.Event == "" {
+		request.Event = "post-cont"
+	}
+	if request.RequestedUTC == "" {
+		return errors.New("rf3-diagnostic: latch request has no requested UTC")
+	}
+	requestedAt, err := time.Parse(time.RFC3339Nano, request.RequestedUTC)
+	if err != nil {
+		return fmt.Errorf("rf3-diagnostic: latch request has invalid requested UTC: %w", err)
+	}
+	tracker.request = &request
+	tracker.requestedAt = requestedAt
+	tracker.armedUTC = time.Now().UTC().Format(time.RFC3339Nano)
+	return nil
+}
+
+func (tracker *latchTracker) annotate(record *cycle) error {
+	if tracker == nil || tracker.request == nil || tracker.captured || record == nil {
+		return nil
+	}
+	// The request is copied after SIGCONT. A request can arrive while one
+	// observation cycle is already in flight; that cycle started before the
+	// handoff and must not be mislabeled as a post-CONT cut.
+	recordedAt, err := time.Parse(time.RFC3339Nano, record.UTC)
+	if err != nil {
+		return fmt.Errorf("rf3-diagnostic: cycle has invalid UTC: %w", err)
+	}
+	if recordedAt.Before(tracker.requestedAt) {
+		return nil
+	}
+	latch := &latchSnapshot{
+		Event: tracker.request.Event, RequestedUTC: tracker.request.RequestedUTC,
+		ArmedUTC: tracker.armedUTC, Sequence: record.Sequence,
+		NodeID: tracker.request.NodeID, PID: tracker.request.PID,
+		Complete: record.PreflightReady,
+	}
+	record.Latch = latch
+	if !record.PreflightReady {
+		return nil
+	}
+	latch.CapturedUTC = time.Now().UTC().Format(time.RFC3339Nano)
+	artifact := latchArtifact{
+		Schema: "vibedb.rf3-diagnostic-latch/1", Event: latch.Event,
+		RequestedUTC: latch.RequestedUTC, ArmedUTC: latch.ArmedUTC,
+		CapturedUTC: latch.CapturedUTC, NodeID: latch.NodeID, PID: latch.PID,
+		Sequence: latch.Sequence,
+		Cycle:    *record,
+	}
+	if err := writeAtomicJSON(tracker.outputPath, artifact, tracker.maxBytes); err != nil {
+		return fmt.Errorf("rf3-diagnostic: write latch artifact: %w", err)
+	}
+	tracker.captured = true
+	return nil
+}
+
+func writeAtomicJSON(path string, value any, maxBytes int64) error {
+	if path == "" || maxBytes <= 0 {
+		return errors.New("invalid atomic JSON destination")
+	}
+	if _, err := os.Lstat(path); err == nil {
+		return errors.New("atomic JSON destination already exists")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	raw, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return err
+	}
+	raw = append(raw, '\n')
+	if int64(len(raw)) > maxBytes {
+		return io.ErrShortBuffer
+	}
+	temporary, err := os.CreateTemp(filepath.Dir(path), ".rf3-diagnostic-latch-*")
+	if err != nil {
+		return err
+	}
+	temporaryName := temporary.Name()
+	removeTemporary := true
+	defer func() {
+		if removeTemporary {
+			_ = os.Remove(temporaryName)
+		}
+	}()
+	if err = temporary.Chmod(0o600); err == nil {
+		_, err = temporary.Write(raw)
+	}
+	if err == nil {
+		err = temporary.Sync()
+	}
+	if closeErr := temporary.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	if err = os.Rename(temporaryName, path); err != nil {
+		return err
+	}
+	removeTemporary = false
+	return nil
+}
+
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -264,6 +469,8 @@ func run(args []string) error {
 	root := flags.String("root", "/data/vibe", "candidate RF3 durable root")
 	output := flags.String("output", "/evidence/per-group-snapshots.jsonl", "bounded JSONL output")
 	readyFile := flags.String("ready-file", "", "write after every expected status and metrics cut is valid")
+	latchFile := flags.String("latch-file", "", "read a one-shot post-CONT latch request")
+	latchOutput := flags.String("latch-output", "", "write the immutable post-CONT complete cycle")
 	interval := flags.Duration("interval", defaultInterval, "interval between observation cycles")
 	timeout := flags.Duration("request-timeout", defaultRequestTimeout, "per-member observation timeout")
 	maxBytes := flags.Int64("max-bytes", defaultMaxBytes, "maximum output bytes")
@@ -271,7 +478,9 @@ func run(args []string) error {
 		return err
 	}
 	if flags.NArg() != 0 || *root == "" || *output == "" || *interval <= 0 || *interval > 10*time.Second ||
-		*timeout <= 0 || *timeout > 5*time.Second || *maxBytes <= 0 || *maxBytes > 64<<20 {
+		*timeout <= 0 || *timeout > 5*time.Second || *maxBytes <= 0 || *maxBytes > 64<<20 ||
+		((*latchFile == "") != (*latchOutput == "")) ||
+		(*latchFile != "" && filepath.Clean(*latchFile) == filepath.Clean(*output)) {
 		return errors.New("rf3-diagnostic: invalid configuration")
 	}
 
@@ -283,6 +492,11 @@ func run(args []string) error {
 	}
 	if err = os.MkdirAll(filepath.Dir(*output), 0o700); err != nil {
 		return err
+	}
+	if *latchOutput != "" {
+		if err = os.MkdirAll(filepath.Dir(*latchOutput), 0o700); err != nil {
+			return err
+		}
 	}
 	file, err := os.OpenFile(*output, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
@@ -303,6 +517,7 @@ func run(args []string) error {
 	defer ticker.Stop()
 	var sequence uint64
 	preflight := preflightTracker{}
+	latch := &latchTracker{requestPath: *latchFile, outputPath: *latchOutput, maxBytes: cfg.MaxBytes}
 	for {
 		sequence++
 		started := time.Now()
@@ -312,6 +527,12 @@ func run(args []string) error {
 		record.PreflightReady = record.ValidCuts == expectedCuts
 		if !record.PreflightReady {
 			record.PreflightReason = fmt.Sprintf("valid status and metrics cuts %d/%d", record.ValidCuts, expectedCuts)
+		}
+		if err = latch.arm(); err != nil {
+			return err
+		}
+		if err = latch.annotate(&record); err != nil {
+			return err
 		}
 		line, marshalErr := json.Marshal(record)
 		if marshalErr != nil {
@@ -406,7 +627,8 @@ func loadConfig(root string, interval, timeout time.Duration, maxBytes int64) (c
 		if _, exists := addresses[node]; exists {
 			return config{}, errors.New("rf3-diagnostic: duplicate node identity")
 		}
-		nodes = append(nodes, nodeConfig{ID: node, Address: value.Listeners.Control})
+		nodes = append(nodes, nodeConfig{ID: node, Address: value.Listeners.Control,
+			DiagnosticPath: filepath.Join(root, fmt.Sprintf("node-%d", index+1), "rf3-diagnostics.json")})
 		addresses[node] = value.Listeners.Control
 	}
 
@@ -514,9 +736,25 @@ func parseNodeID(value string) (rafttransport.NodeID, error) {
 
 func capture(ctx context.Context, cfg config, sequence uint64) cycle {
 	record := cycle{Schema: "vibedb.rf3-diagnostic/1", Sequence: sequence,
-		UTC: time.Now().UTC().Format(time.RFC3339Nano), Groups: make([]groupSnapshot, len(cfg.Groups))}
+		UTC: time.Now().UTC().Format(time.RFC3339Nano), Groups: make([]groupSnapshot, len(cfg.Groups)),
+		NodeMetrics: make([]nodeMetricsSnapshot, len(cfg.Nodes))}
 	concurrency := make(chan struct{}, maxCaptureConcurrency)
 	var wg sync.WaitGroup
+	for index, node := range cfg.Nodes {
+		record.NodeMetrics[index] = nodeMetricsSnapshot{NodeID: fmt.Sprintf("%x", node.ID), Scope: "node_process"}
+		wg.Add(1)
+		go func(nodeIndex int, node nodeConfig) {
+			defer wg.Done()
+			select {
+			case concurrency <- struct{}{}:
+				defer func() { <-concurrency }()
+			case <-ctx.Done():
+				record.NodeMetrics[nodeIndex].Error = ctx.Err().Error()
+				return
+			}
+			record.NodeMetrics[nodeIndex] = captureNodeMetrics(ctx, cfg, node)
+		}(index, node)
+	}
 	for index, group := range cfg.Groups {
 		record.Groups[index] = groupSnapshot{GroupID: group.ID, Distribution: group.Distribution,
 			Shard: group.Shard, Members: make([]memberSnapshot, len(group.Members))}
@@ -550,12 +788,102 @@ func capture(ctx context.Context, cfg config, sequence uint64) cycle {
 	return record
 }
 
+func captureNodeMetrics(ctx context.Context, cfg config, node nodeConfig) (result nodeMetricsSnapshot) {
+	started := time.Now()
+	result = nodeMetricsSnapshot{NodeID: fmt.Sprintf("%x", node.ID), Scope: "node_process", Source: "servicemetrics"}
+	defer func() { result.ElapsedNS = time.Since(started).Nanoseconds() }()
+	if diagnostic, err := readNodeDiagnostic(node.DiagnosticPath, result.NodeID); err == nil {
+		return diagnostic
+	} else {
+		result.AuthorityError = err.Error()
+	}
+	metricsCtx, cancel := context.WithTimeout(ctx, cfg.RequestTimeout)
+	defer cancel()
+	opener := controlOpener{profile: cfg.Profile, addresses: nodeAddresses(cfg.Nodes), deadline: cfg.RequestTimeout}
+	client := servicemetrics.Client{Open: func(ctx context.Context) (rafttransport.PeerConnection, error) {
+		return opener.OpenShardControl(ctx, node.ID)
+	}}
+	snapshot, err := client.ReadNode(metricsCtx)
+	if err != nil {
+		result.Error = err.Error()
+		return result
+	}
+	metrics := snapshot.Metrics
+	result.Metrics = &nodeMetrics{
+		AppliedEntries: metrics.AppliedEntries, ReadyPersisted: metrics.ReadyPersisted,
+		CommitAdvancements: metrics.CommitAdvancements, CommittedEntries: metrics.CommittedEntries,
+		ReadCompletions: metrics.ReadCompletions, Faults: metrics.Faults,
+		AuthorityReadHits:               metrics.AuthorityReadHits,
+		AuthorityReadIndexFallbacks:     metrics.AuthorityReadIndexFallbacks,
+		AuthorityReadValidationRetries:  metrics.AuthorityReadValidationRetries,
+		AuthorityReadValidationFailures: metrics.AuthorityReadValidationFailures,
+		AuthorityRoundAttempts:          metrics.AuthorityRoundAttempts,
+	}
+	return result
+}
+
 func expectedValidCuts(cfg config) uint64 {
 	var total uint64
 	for _, group := range cfg.Groups {
 		total += uint64(len(group.Members))
 	}
 	return total
+}
+
+type nodeDiagnosticRecord struct {
+	UTC                             string `json:"utc"`
+	Event                           string `json:"event"`
+	Serial                          uint64 `json:"serial"`
+	PID                             int    `json:"pid"`
+	NodeID                          string `json:"node_id"`
+	RaftAppliedEntries              uint64 `json:"raft_applied_entries"`
+	RaftReadyPersisted              uint64 `json:"raft_ready_persisted"`
+	RaftCommitAdvancements          uint64 `json:"raft_commit_advancements"`
+	RaftCommittedEntries            uint64 `json:"raft_committed_entries"`
+	AuthorityReadHits               uint64 `json:"authority_read_hits"`
+	AuthorityReadIndexFallbacks     uint64 `json:"authority_read_index_fallbacks"`
+	AuthorityReadValidationRetries  uint64 `json:"authority_read_validation_retries"`
+	AuthorityReadValidationFailures uint64 `json:"authority_read_validation_failures"`
+	AuthorityRoundAttempts          uint64 `json:"authority_round_attempts"`
+	ReadAuthorityRoundsStarted      uint64 `json:"read_authority_rounds_started"`
+	ReadAuthorityRequestsCreated    uint64 `json:"read_authority_requests_created"`
+	ReadAuthorityGrantsAccepted     uint64 `json:"read_authority_grants_accepted"`
+}
+
+func readNodeDiagnostic(path, nodeID string) (nodeMetricsSnapshot, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nodeMetricsSnapshot{}, err
+	}
+	if len(raw) == 0 || len(raw) > maxManifestBytes {
+		return nodeMetricsSnapshot{}, errors.New("rf3-diagnostic: node diagnostic exceeds bound")
+	}
+	var value nodeDiagnosticRecord
+	if err = json.Unmarshal(raw, &value); err != nil {
+		return nodeMetricsSnapshot{}, err
+	}
+	if value.Event != "snapshot" || value.Serial == 0 || value.PID <= 1 || value.NodeID != nodeID {
+		return nodeMetricsSnapshot{}, errors.New("rf3-diagnostic: invalid node diagnostic identity")
+	}
+	if _, err = time.Parse(time.RFC3339Nano, value.UTC); err != nil {
+		return nodeMetricsSnapshot{}, fmt.Errorf("rf3-diagnostic: invalid node diagnostic UTC: %w", err)
+	}
+	return nodeMetricsSnapshot{
+		NodeID: nodeID, Scope: "node_process", Source: "rf3-diagnostics-file", PID: value.PID,
+		Serial: value.Serial, UTC: value.UTC, AuthorityAvailable: true,
+		Metrics: &nodeMetrics{
+			AppliedEntries: value.RaftAppliedEntries, ReadyPersisted: value.RaftReadyPersisted,
+			CommitAdvancements: value.RaftCommitAdvancements, CommittedEntries: value.RaftCommittedEntries,
+			AuthorityReadHits:               value.AuthorityReadHits,
+			AuthorityReadIndexFallbacks:     value.AuthorityReadIndexFallbacks,
+			AuthorityReadValidationRetries:  value.AuthorityReadValidationRetries,
+			AuthorityReadValidationFailures: value.AuthorityReadValidationFailures,
+			AuthorityRoundAttempts:          value.AuthorityRoundAttempts,
+			ReadAuthorityRoundsStarted:      value.ReadAuthorityRoundsStarted,
+			ReadAuthorityRequestsCreated:    value.ReadAuthorityRequestsCreated,
+			ReadAuthorityGrantsAccepted:     value.ReadAuthorityGrantsAccepted,
+		},
+	}, nil
 }
 
 func writeReadyFile(path string) error {

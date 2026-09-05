@@ -86,6 +86,74 @@ class FaultQualificationProvenanceTest(unittest.TestCase):
 
             self.assertEqual(MODULE.diagnostic_output_path(run_dir), path)
 
+    def test_group_timeline_keeps_member_terms_and_node_authority_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            path = directory / "snapshots.jsonl"
+            output = directory / "timeline.json"
+            members = []
+            node_metrics = []
+            for member in range(1, 4):
+                node_id = f"{member:032x}"
+                members.append({
+                    "member_id": member,
+                    "node_id": node_id,
+                    "status": {
+                        "term": member,
+                        "leader_id": 2,
+                        "commit": 10 + member,
+                        "applied": 9 + member,
+                        "checkpoint_applied": 8 + member,
+                        "raft_state": 0,
+                        "raft_state_name": "StateFollower",
+                    },
+                    "progress": {"match": member},
+                    "metrics": {
+                        "applied_entries": member,
+                        "ready_persisted": member + 1,
+                        "commit_advancements": member + 2,
+                        "committed_entries": member + 3,
+                    },
+                })
+                node_metrics.append({
+                    "node_id": node_id,
+                    "scope": "node_process",
+                    "metrics": {
+                        "authority_read_hits": 100 + member,
+                        "authority_round_attempts": 10 + member,
+                    },
+                })
+            groups = [{"group_id": f"{group:032x}", "distribution": "system",
+                       "shard": "all", "members": members} for group in range(6)]
+            groups.append({"group_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                           "distribution": "table-rf3_sql_group-b1c8362a213f",
+                           "shard": "all", "members": members})
+            path.write_text(json.dumps({
+                "schema": "vibedb.rf3-diagnostic/1",
+                "sequence": 4,
+                "utc": "2026-09-05T18:00:00Z",
+                "elapsed_ns": 12,
+                "groups": groups,
+                "node_metrics": node_metrics,
+                "expected_cuts": 21,
+                "valid_cuts": 21,
+                "preflight_ready": True,
+                "sampling_errors": 0,
+            }) + "\n")
+
+            summary = MODULE.write_group_timeline(path, output, "rf3_sql_group")
+            self.assertTrue(summary["complete"])
+            payload = json.loads(output.read_text())
+            self.assertEqual(payload["terms_scope"].count("cross-group"), 1)
+            self.assertEqual([member["term"] for member in payload["records"][0]["members"]], [1, 2, 3])
+            self.assertNotIn("term", payload["records"][0])
+            self.assertEqual(
+                payload["records"][0]["members"][0]["authority_metrics"]["scope"],
+                "node_process")
+            self.assertEqual(
+                payload["records"][0]["members"][0]["authority_metrics"]["metrics"]["authority_read_hits"],
+                101)
+
     def test_primary_result_failure_keeps_client_error_when_restart_is_absent(self):
         with tempfile.TemporaryDirectory() as directory:
             run_dir = Path(directory) / "candidate"

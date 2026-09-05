@@ -2,10 +2,14 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 )
@@ -93,6 +97,105 @@ func TestPreflightTrackerRejectsMissingInitialCuts(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "preflight incomplete") {
 		t.Fatalf("missing initial cuts error = %v", err)
 	}
+}
+
+func TestLatchTrackerCapturesFirstCompletePostCONTycle(t *testing.T) {
+	directory := t.TempDir()
+	requestPath := filepath.Join(directory, "latch-request.json")
+	outputPath := filepath.Join(directory, "post-cont-cut.json")
+	requested := time.Now().UTC().Add(-time.Second).Format(time.RFC3339Nano)
+	request := []byte(`{"event":"post-cont","requested_utc":"` + requested + `","node_id":"00112233445566778899aabbccddeeff","pid":42}`)
+	if err := os.WriteFile(requestPath, request, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tracker := &latchTracker{requestPath: requestPath, outputPath: outputPath, maxBytes: 8 << 20}
+	if err := tracker.arm(); err != nil {
+		t.Fatalf("arm: %v", err)
+	}
+	requestedAt, err := time.Parse(time.RFC3339Nano, requested)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := cycle{Sequence: 1, UTC: requestedAt.Add(-time.Millisecond).Format(time.RFC3339Nano), PreflightReady: true}
+	if err := tracker.annotate(&before); err != nil {
+		t.Fatalf("pre-request cycle: %v", err)
+	}
+	if before.Latch != nil {
+		t.Fatal("pre-request cycle was labeled as post-CONT")
+	}
+	if _, err := os.Stat(outputPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("pre-request artifact stat error = %v", err)
+	}
+	incomplete := cycle{Sequence: 2, UTC: requestedAt.Add(time.Millisecond).Format(time.RFC3339Nano)}
+	if err := tracker.annotate(&incomplete); err != nil {
+		t.Fatalf("incomplete cycle: %v", err)
+	}
+	if incomplete.Latch == nil || incomplete.Latch.Complete {
+		t.Fatalf("incomplete latch = %+v", incomplete.Latch)
+	}
+	if _, err := os.Stat(outputPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("incomplete artifact stat error = %v", err)
+	}
+	complete := cycle{Sequence: 3, UTC: requestedAt.Add(2 * time.Millisecond).Format(time.RFC3339Nano), PreflightReady: true}
+	if err := tracker.annotate(&complete); err != nil {
+		t.Fatalf("complete cycle: %v", err)
+	}
+	if complete.Latch == nil || !complete.Latch.Complete || complete.Latch.Sequence != complete.Sequence {
+		t.Fatalf("complete latch = %+v", complete.Latch)
+	}
+	raw, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var artifact latchArtifact
+	if err := json.Unmarshal(raw, &artifact); err != nil {
+		t.Fatal(err)
+	}
+	if artifact.Schema != "vibedb.rf3-diagnostic-latch/1" || artifact.Sequence != 3 ||
+		artifact.NodeID != "00112233445566778899aabbccddeeff" || artifact.PID != 42 ||
+		artifact.Cycle.Latch == nil || !artifact.Cycle.Latch.Complete {
+		t.Fatalf("artifact = %+v", artifact)
+	}
+	later := cycle{Sequence: 4, UTC: requestedAt.Add(3 * time.Millisecond).Format(time.RFC3339Nano), PreflightReady: true}
+	if err := tracker.annotate(&later); err != nil {
+		t.Fatalf("later cycle: %v", err)
+	}
+	var retained latchArtifact
+	if err := json.Unmarshal(mustReadFile(t, outputPath), &retained); err != nil {
+		t.Fatal(err)
+	}
+	if retained.Sequence != 3 {
+		t.Fatalf("latch artifact was overwritten: sequence=%d", retained.Sequence)
+	}
+}
+
+func TestReadNodeDiagnosticMapsOwnerAuthorityCounters(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "rf3-diagnostics.json")
+	nodeID := "00112233445566778899aabbccddeeff"
+	raw := []byte(`{"event":"snapshot","utc":"2026-09-05T18:00:00Z","serial":7,"pid":42,"node_id":"` + nodeID + `","raft_applied_entries":11,"raft_ready_persisted":12,"raft_commit_advancements":13,"raft_committed_entries":14,"authority_read_hits":15,"authority_read_index_fallbacks":16,"authority_read_validation_retries":17,"authority_read_validation_failures":18,"authority_round_attempts":19,"read_authority_rounds_started":20,"read_authority_requests_created":21,"read_authority_grants_accepted":22}`)
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readNodeDiagnostic(path, nodeID)
+	if err != nil {
+		t.Fatalf("read node diagnostic: %v", err)
+	}
+	if got.Source != "rf3-diagnostics-file" || !got.AuthorityAvailable || got.PID != 42 || got.Serial != 7 ||
+		got.Metrics == nil || got.Metrics.AuthorityReadHits != 15 ||
+		got.Metrics.AuthorityReadValidationFailures != 18 ||
+		got.Metrics.ReadAuthorityRequestsCreated != 21 || got.Metrics.ReadAuthorityGrantsAccepted != 22 {
+		t.Fatalf("node diagnostic = %+v", got)
+	}
+}
+
+func mustReadFile(t *testing.T, path string) []byte {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
 }
 
 func hex16(value [16]byte) string {

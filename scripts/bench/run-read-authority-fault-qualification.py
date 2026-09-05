@@ -31,7 +31,7 @@ VALIDATOR_PATH = ROOT / "scripts/bench/summarize-crdb-sql.py"
 RUNTIME = (
     "golang:1.27-bookworm@sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b"
 )
-GOCACHE = Path("/private/tmp/vibedb-horizontal-gocache")
+GOCACHE = Path(os.environ.get("VIBEDB_GO_CACHE", "/Users/thesyncim/Library/Caches/go-build"))
 LAB_BUILD_TAG = "vibedb_rf3_read_authority_lab"
 QUARANTINE_SECONDS = 6.11
 GRANT_SECONDS = 5.0
@@ -239,6 +239,126 @@ def diagnostic_output_path(run_dir):
     if direct.is_file():
         return direct
     return run_dir / "raw" / "per-group-snapshots.jsonl"
+
+
+def write_group_timeline(path, output, table):
+    """Retain one table group's member cuts without cross-group aggregation."""
+    prefix = f"table-{table}-"
+    rows = []
+    parse_errors = []
+    group_ids = set()
+    try:
+        lines = path.read_text().splitlines()
+    except (OSError, UnicodeDecodeError) as exc:
+        lines = []
+        parse_errors.append(f"read output: {exc}")
+    for line_number, line in enumerate(lines, 1):
+        try:
+            value = json.loads(line)
+            if value.get("schema") != "vibedb.rf3-diagnostic/1":
+                raise ValueError("invalid cycle schema")
+            groups = value.get("groups")
+            if not isinstance(groups, list):
+                raise ValueError("cycle has no groups")
+            matches = [group for group in groups
+                       if isinstance(group, dict) and
+                       isinstance(group.get("distribution"), str) and
+                       group["distribution"].startswith(prefix)]
+            if len(matches) != 1:
+                raise ValueError(
+                    f"expected one group distribution with prefix {prefix!r}, found {len(matches)}")
+            group = matches[0]
+            members = group.get("members")
+            if not isinstance(members, list):
+                raise ValueError("selected group has no member cuts")
+            group_id = group.get("group_id")
+            if isinstance(group_id, str):
+                group_ids.add(group_id)
+            node_process_metrics = {}
+            for node in value.get("node_metrics", []):
+                if not isinstance(node, dict) or not isinstance(node.get("node_id"), str):
+                    continue
+                node_process_metrics[node["node_id"]] = {
+                    "scope": node.get("scope"),
+                    "metrics": node.get("metrics"),
+                    "error": node.get("error"),
+                    "elapsed_ns": node.get("elapsed_ns"),
+                }
+            timeline_members = []
+            for member in members:
+                if not isinstance(member, dict):
+                    raise ValueError("selected group has a non-object member cut")
+                status = member.get("status") if isinstance(member.get("status"), dict) else {}
+                metrics = member.get("metrics") if isinstance(member.get("metrics"), dict) else None
+                progress = member.get("progress") if isinstance(member.get("progress"), dict) else None
+                authority = node_process_metrics.get(member.get("node_id"))
+                timeline_members.append({
+                    "member_id": member.get("member_id"),
+                    "node_id": member.get("node_id"),
+                    "term": status.get("term"),
+                    "leader_id": status.get("leader_id"),
+                    "commit": status.get("commit"),
+                    "applied": status.get("applied"),
+                    "checkpoint_applied": status.get("checkpoint_applied"),
+                    "raft_state": status.get("raft_state"),
+                    "raft_state_name": status.get("raft_state_name"),
+                    "state_applied": status.get("state_applied"),
+                    "progress": progress,
+                    "metrics": metrics,
+                    "ready_metrics": None if metrics is None else {
+                        "ready_persisted": metrics.get("ready_persisted"),
+                        "applied_entries": metrics.get("applied_entries"),
+                        "commit_advancements": metrics.get("commit_advancements"),
+                        "committed_entries": metrics.get("committed_entries"),
+                    },
+                    # These counters are process-wide on the fixed metrics
+                    # endpoint. The explicit scope keeps them from being read
+                    # as group-local authority counters.
+                    "authority_metrics": authority,
+                    "observe_error": member.get("observe_error"),
+                    "metrics_error": member.get("metrics_error"),
+                    "error": member.get("error"),
+                })
+            rows.append({
+                "sequence": value.get("sequence"),
+                "utc": value.get("utc"),
+                "elapsed_ns": value.get("elapsed_ns"),
+                "expected_cuts": value.get("expected_cuts"),
+                "valid_cuts": value.get("valid_cuts"),
+                "preflight_ready": value.get("preflight_ready"),
+                "preflight_reason": value.get("preflight_reason"),
+                "sampling_errors": value.get("sampling_errors"),
+                "latch": value.get("latch"),
+                "group_id": group_id,
+                "distribution": group.get("distribution"),
+                "shard": group.get("shard"),
+                "members": timeline_members,
+                "node_process_metrics": node_process_metrics,
+            })
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            parse_errors.append(f"line {line_number}: {exc}")
+    payload = {
+        "schema": "vibedb.rf3-diagnostic-group-timeline/1",
+        "table": table,
+        "distribution_prefix": prefix,
+        "group_ids": sorted(group_ids),
+        "terms_scope": "term, leader, commit, and applied are retained per member of this one group; no cross-group term aggregation",
+        "authority_metrics_scope": "node_process",
+        "records": rows,
+        "parse_errors": parse_errors,
+        "complete": bool(rows) and not parse_errors,
+    }
+    output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    output.write_text(json.dumps(payload, indent=2) + "\n")
+    return {
+        "schema": payload["schema"],
+        "table": table,
+        "group_ids": payload["group_ids"],
+        "records": len(rows),
+        "parse_errors": parse_errors,
+        "complete": payload["complete"],
+        "path": output.name,
+    }
 
 
 def primary_result_failure(result, run_dir):
@@ -462,6 +582,8 @@ def main(argv=None):
     parser.add_argument("--ready-timeout", type=int, default=180)
     parser.add_argument("--no-fault", action="store_true",
                         help="run the original workload without SIGSTOP/SIGKILL fault injection")
+    parser.add_argument("--prepare-only", action="store_true",
+                        help="build and retain the lab variant provenance without starting Docker")
     parser.add_argument("--laboratory-read-authority", action="store_true",
                         help="required explicit opt-in for the lab-tagged read-authority binary")
     selected = parser.parse_args(argv)
@@ -516,6 +638,53 @@ def main(argv=None):
         "events": [],
     }
     fixture.write_json(destination / "manifest.json", manifest)
+    if selected.prepare_only:
+        source_before = None
+        try:
+            source_before = source_snapshot(fixture, repo, destination, "before")
+            manifest["source"] = source_before
+            arch = fixture.docker_architecture()
+            manifest["docker_architecture"] = arch
+            image = fixture.ensure_image(RUNTIME)
+            manifest["runtime_image_inspection"] = image
+            binaries, metadata, _ = build_candidate(fixture, repo, destination, arch)
+            manifest["binary_sha256"] = fixture.binary_hashes(binaries)
+            manifest["build_metadata"] = metadata
+            manifest["preparation"] = {
+                "variant": "laboratory-read-authority",
+                "build_tag": LAB_BUILD_TAG,
+                "source_revision": source_before.get("revision"),
+                "workload_started": False,
+                "docker_fixture_started": False,
+            }
+            manifest["status"] = "prepared-only"
+        except BaseException as exc:
+            manifest["status"] = "incomplete-or-failed"
+            manifest["failure"] = str(exc) or exc.__class__.__name__
+        finally:
+            if source_before is not None:
+                try:
+                    source_after = source_snapshot(fixture, repo, destination, "after")
+                    manifest["source_after"] = source_after
+                    manifest["source_stable"] = (
+                        source_identity(source_before) == source_identity(source_after)
+                    )
+                    if not manifest["source_stable"]:
+                        manifest["status"] = "incomplete-or-failed"
+                        manifest["failure"] = "source changed during preparation"
+                except BaseException as exc:
+                    manifest["status"] = "incomplete-or-failed"
+                    manifest["failure"] = "could not snapshot source after preparation: " + str(exc)
+            fixture.write_json(destination / "manifest.json", manifest)
+        print(destination)
+        print(json.dumps({
+            "status": manifest.get("status"),
+            "binary_sha256": manifest.get("binary_sha256"),
+            "source_revision": manifest.get("source", {}).get("revision"),
+            "source_stable": manifest.get("source_stable"),
+            "failure": manifest.get("failure"),
+        }, sort_keys=True))
+        return 0 if manifest.get("status") == "prepared-only" else 1
     source_before = None
     original_run = fixture.run
     original_popen = subprocess.Popen
@@ -650,12 +819,17 @@ def main(argv=None):
             fixture.run(["docker", "exec", container, "kill", "-STOP", pid])
             started = time.monotonic()
             pause["utc_stop_sent"] = utc_now()
+            continue_result = None
             try:
                 time.sleep(selected.pause_seconds)
             finally:
-                fixture.run(["docker", "exec", container, "kill", "-CONT", pid], check=False)
+                continue_result = fixture.run(
+                    ["docker", "exec", container, "kill", "-CONT", pid], check=False)
             elapsed = time.monotonic() - started
+            pause["continue_exit_code"] = continue_result.returncode
             pause["utc_continue_sent"] = utc_now()
+            if continue_result.returncode:
+                raise RuntimeError("SIGCONT was not delivered; post-CONT latch is invalid")
             pause["pause_seconds_observed"] = elapsed
             pause["status"] = "continued"
             after_inventory = fixture.process_inventory(container)
@@ -665,6 +839,35 @@ def main(argv=None):
             post = all_snapshots(fixture, container, targets, fault_dir,
                                  "pause-after", current_serials(
                                      fixture, container, targets, fault_dir))
+            # Refresh each node's SIGUSR1-backed owner counters before arming
+            # the sidecar. The requested timestamp remains the exact CONT
+            # handoff; delaying the request until these cuts are retained makes
+            # the first latched cycle carry post-CONT authority evidence.
+            latch_file = getattr(args, "rf3_diagnostic_latch_file", "")
+            if not latch_file:
+                raise RuntimeError("RF3 diagnostic latch request path was not configured")
+            latch_request = fault_dir / "post-cont-latch-request.json"
+            fixture.write_json(latch_request, {
+                "schema": "vibedb.rf3-diagnostic-latch-request/1",
+                "event": "post-cont",
+                "requested_utc": pause["utc_continue_sent"],
+                "node_id": chosen["node_id"],
+                "pid": chosen["pid"],
+                "signal": "SIGCONT",
+                "source": "fault-controller",
+            })
+            copied_latch_request = fixture.run([
+                "docker", "cp", latch_request, container + ":" + latch_file,
+            ], check=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            pause["post_cont_latch_request"] = {
+                "path": str(latch_request.relative_to(destination)),
+                "remote_path": latch_file,
+                "exit_code": copied_latch_request.returncode,
+                "requested_utc": pause["utc_continue_sent"],
+                "armed_after_post_pause_diagnostic": True,
+            }
+            if copied_latch_request.returncode:
+                raise RuntimeError("post-CONT latch request was not copied into the container")
             pause["post_pause_diagnostics"] = post
             pause["unavailable_interval_seconds"] = elapsed
             pause["post_pause_counter_deltas"] = {
@@ -836,6 +1039,9 @@ def main(argv=None):
         args.parent_arg = []
         args.candidate_arg = ["--read-authority"]
         args.rf3_diagnostic = True
+        args.rf3_diagnostic_latch_file = "/evidence/post-cont-latch.json"
+        args.rf3_diagnostic_latch_output = "/evidence/post-cont-cut.json"
+        args.rf3_diagnostic_latch_required = not selected.no_fault
         args.validator_path = VALIDATOR_PATH
         tables = fixture.table_names(4, "rf3_sql_group")
         cell = {
@@ -880,6 +1086,34 @@ def main(argv=None):
         manifest["authority_proof"] = authority_proof(manifest["diagnostic_records"])
         manifest["per_group_diagnostic"] = per_group_diagnostic_summary(
             diagnostic_output_path(run_dir))
+        timeline_path = run_dir / "failed-table-g0-timeline.json"
+        manifest["failed_table_g0_timeline"] = write_group_timeline(
+            diagnostic_output_path(run_dir), timeline_path, tables[0])
+        if not selected.no_fault:
+            latch_path = run_dir / "post-cont-cut.json"
+            latch_record = None
+            try:
+                latch_record = json.loads(latch_path.read_text())
+                if (latch_record.get("schema") != "vibedb.rf3-diagnostic-latch/1" or
+                        latch_record.get("event") != "post-cont" or
+                        latch_record.get("cycle", {}).get("latch", {}).get("complete") is not True):
+                    raise ValueError("post-CONT latch artifact is incomplete")
+                manifest["post_cont_latch"] = {
+                    "path": "candidate/post-cont-cut.json",
+                    "schema": latch_record.get("schema"),
+                    "sequence": latch_record.get("sequence"),
+                    "captured_utc": latch_record.get("captured_utc"),
+                    "node_id": latch_record.get("node_id"),
+                    "pid": latch_record.get("pid"),
+                    "complete": True,
+                }
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                manifest["post_cont_latch"] = {
+                    "path": "candidate/post-cont-cut.json",
+                    "complete": False,
+                    "error": str(exc),
+                }
+                manifest["failure"] = "post-CONT diagnostic latch was not retained: " + str(exc)
         manifest["pause"] = state.get("pause")
         manifest["pause_error"] = state.get("pause_error")
         primary = primary_result_failure(result, run_dir)
