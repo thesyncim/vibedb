@@ -1,9 +1,6 @@
 # Transactions
 
-> [!CAUTION]
-> VibeDB is unreleased development software. Any commit may break APIs, disk
-> formats, or wire behavior. Build and operate one exact tested commit only.
-> Do not entrust irreplaceable data to VibeDB.
+[Documentation](README.md) / [Design](design/README.md) · [Development status](status.md)
 
 Use root `vibedb` for serializable application transactions over named
 collections. `store` and `store/durable` are lower-level engine primitives with
@@ -216,10 +213,10 @@ use.
 
 ## Source map
 
-- Facade transaction API: `vibedb_txn.go`, `vibedb.go`
-- Serializable anomaly tests: `vibedb_txn_serializable_test.go`
-- Profile and retry tests: `vibedb_txn_test.go`, `capability_matrix_facade_test.go`
-- Heap atomic publication: `store/store_database_txn.go`
-- Durable decision protocol: `store/durable/store_database_txn.go`
-- Durable recovery: `store/durable/store_database_txn_recovery.go`
-- Crash matrix: `store/durable/store_database_txn_crash_test.go`
+- Facade transaction API: [vibedb_txn.go](../vibedb_txn.go), [vibedb.go](../vibedb.go)
+- Serializable anomaly tests: [vibedb_txn_serializable_test.go](../vibedb_txn_serializable_test.go)
+- Profile and retry tests: [vibedb_txn_test.go](../vibedb_txn_test.go), [capability_matrix_facade_test.go](../capability_matrix_facade_test.go)
+- Heap atomic publication: [store/store_database_txn.go](../store/store_database_txn.go)
+- Durable decision protocol: [store/durable/store_database_txn.go](../store/durable/store_database_txn.go)
+- Durable recovery: [store/durable/store_database_txn_recovery.go](../store/durable/store_database_txn_recovery.go)
+- Crash matrix: [store/durable/store_database_txn_crash_test.go](../store/durable/store_database_txn_crash_test.go)

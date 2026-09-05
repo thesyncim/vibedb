@@ -1,4 +1,5 @@
 GO ?= go
+PYTHON ?= python3
 GOEXPERIMENT ?= simd
 export GOEXPERIMENT
 PACKAGES ?= ./...
@@ -8,7 +9,7 @@ BENCH ?= ^Benchmark(DocumentPointProgram|PartitionRowsOnePass|TranslateTailEntry
 BENCHTIME ?= 250ms
 COUNT ?= 1
 
-.PHONY: build test bench vet info
+.PHONY: build test bench vet info docs-check
 build:
 	$(GO) build $(PACKAGES)
 
@@ -24,3 +25,6 @@ vet:
 info:
 	$(GO) version
 	$(GO) env -json GOEXPERIMENT GOOS GOARCH GOAMD64
+
+docs-check:
+	$(PYTHON) scripts/docs/check.py

@@ -1,14 +1,15 @@
 # Performance evidence
 
-> [!CAUTION]
-> VibeDB is unreleased; APIs, commands, wire/disk formats, and results may change
-> at any commit. Use one exact source/docs pair and disposable data. This
-> repository publishes no competitive result: a benchmark command, coverage
-> table, CI artifact, or validated inventory is not a speed, cost, memory,
-> storage, or scaling claim.
+[Documentation](README.md) · [Development status](status.md)
 
-Use this page to choose the right measurement and to keep a result
-reproducible.
+Use the [benchmark archive](benchmarks/README.md) to find measured results and
+this guide to choose a harness or reproduce a comparison. Every result belongs
+to its recorded revision, workload, configuration, and hardware.
+
+There are two distinct collections: dated engineering reports under
+`docs/benchmarks`, and the formal publication registry for `bench/competitive`.
+The first contains measurements; the second has no endorsed entries. A
+coverage table describes harness support, not an executed result.
 
 ## Choose the evidence
 
@@ -97,16 +98,20 @@ promoted to a publication result.
 
 ## Current result state
 
-[`bench/competitive/RESULTS.md`](../bench/competitive/RESULTS.md) intentionally
-contains no number: there is no checked-in immutable evidence bundle or
-validated competitive summary. CI uploads claim-free raw qualification
-artifacts for limited retention; it does not publish a result registry.
+Browse [benchmark reports](benchmarks/README.md) for dated SQL comparisons,
+SIMD measurements, profiles, and retained failed experiments. Read each
+report's method and exclusions before using its numbers.
+
+[`bench/competitive/RESULTS.md`](../bench/competitive/RESULTS.md) is the separate
+publication registry for that harness and remains empty. CI also uploads raw
+qualification artifacts for limited retention. Neither a CI artifact nor an
+engineering report automatically becomes an endorsed registry entry.
 
 ## Source map
 
-- `bench/gate/main.go`
-- `bench/competitive/internal/coverage/manifest.go`
+- [bench/gate/main.go](../bench/gate/main.go)
+- [bench/competitive/internal/coverage/manifest.go](../bench/competitive/internal/coverage/manifest.go)
 - `bench/competitive/cmd/*`
-- `bench/competitive/cmd/publishcheck`
-- `bench/rf3chaos/main.go`
-- `scripts/bench/run-ci-competitive-evidence.sh`
+- [bench/competitive/cmd/publishcheck](../bench/competitive/cmd/publishcheck)
+- [bench/rf3chaos/main.go](../bench/rf3chaos/main.go)
+- [scripts/bench/run-ci-competitive-evidence.sh](../scripts/bench/run-ci-competitive-evidence.sh)

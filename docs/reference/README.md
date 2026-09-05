@@ -1,10 +1,6 @@
 # Reference
 
-> [!CAUTION]
-> This reference describes one unreleased source snapshot. APIs, commands,
-> wire/disk formats, defaults, and hard limits may change at any commit. Use the
-> matching docs and binary with disposable or recoverable data; these values are
-> not service-level objectives.
+[Documentation](../README.md) · [Development status](../status.md)
 
 Read the [stability and current-status page](../status.md) before treating a
 reference value as a contract. Reference pages answer exact lookup questions;

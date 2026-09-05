@@ -1,107 +1,95 @@
-# Stability and current status
+# Stability and compatibility
 
-> [!CAUTION]
-> **Assume breakage between commits.** VibeDB has no release, compatibility
-> promise, support window, or project license. The only qualified restart is an
-> exact same-build restart. There is no mixed-build rolling upgrade, downgrade,
-> or best-effort migration contract. Keep the matching docs and binary together,
-> and use only disposable or independently recoverable data.
+[Documentation](README.md) / Stability
 
-Runtime behavior for this rewrite was audited from `main` at commit
-`215fb05cf89359b6a3cc0ba94793a16131426163`. The documentation changes that
-follow it do not turn that snapshot into a roadmap or guarantee about a later
-commit.
+VibeDB is an unreleased development project. There is no stable Go API, SQL
+contract, wire protocol, or cross-commit disk format. Evaluate a pinned
+revision and keep the corresponding binaries, documentation, and recovery
+state together.
 
-## Maturity by surface
+## Status by interface
 
-| Surface | Current use | Do not infer |
+| Interface | Available for evaluation | Main boundary |
 | --- | --- | --- |
-| Native embedded API | Development; most direct and best-covered interface | Stable Go API or cross-commit disk compatibility |
-| Typed query API | Development; bounded in-process execution | Full SQL equivalence or fixed total RSS |
-| `database/sql` | Experimental VibeDB SQL dialect | ANSI or PostgreSQL compatibility |
-| `pgwire` | Experimental PostgreSQL v3 client adapter | PostgreSQL server, catalog, ORM, extension, or replication compatibility |
-| Static distributed mode | Development routing and integration lane | HA or Raft failover |
-| RF3 distributed mode | Development and fault-qualification lane | Production readiness, global MVCC snapshots, or elastic operation |
-| Kubernetes tools | Disposable Kind qualification | Operator, reconciler, deployment product, or production topology |
+| Native embedded Go | JSON collections, exact indexes, typed queries, serializable transactions. | API and data formats can change. |
+| Typed query engine | Plans over heap and durable sources with explicit work budgets. | Source capabilities and result lifetimes differ. |
+| `database/sql` | Embedded VibeDB SQL and transactions. | A bounded dialect; check the SQL reference. |
+| PostgreSQL wire | Selected v3 protocol flows and client discovery behavior. | Protocol access does not establish PostgreSQL SQL, catalog, extension, or ORM compatibility. |
+| RF3 runtime | Replicated groups, physical-node composition, routing, and recovery primitives. | Development and fault qualification; no production support or global MVCC snapshot contract. |
+| Kubernetes helpers | Fixed disposable Kind qualification topology. | Manifest rendering and preparation, without an operator reconciliation lifecycle. |
 
-“Implemented,” “integrated,” and “used by a development command” are different
-states. The [generated feature ledger](distributed-feature-state.md) keeps them
-separate. “Used by a development command” does not mean released or supported.
+The generated [embedded capabilities](capabilities.md) and
+[distributed ledger](distributed-feature-state.md) link individual features
+to source and tests. Their implementation, integration, and qualification
+columns answer different questions.
 
-## Compatibility rule
+## Restart and data compatibility
 
-Build identities are opaque. Compatibility requires exact wire grammar, disk
-grammar, and symmetric required-capability agreement; there is no numeric
-version ordering. The common build-adoption gate is not yet wired into every
-durable open path, so even a successful low-level open is not an upgrade
-promise.
+Use the exact writer build to reopen development state. Rolling mixed-build
+upgrades, downgrades, cross-build restore, and format migration are not
+supported workflows. A successful low-level open does not prove compatibility:
+the common build-adoption gate is not wired into every durable open path.
 
-For any evaluation:
+Build identities require matching wire/disk grammar and symmetric capability
+agreement; they are not ordered version numbers. Format-0 fixtures are
+byte-exact tests for the current grammar, not an archive of supported readers.
+The local launcher similarly rejects obsolete development manifest layouts.
 
-1. Record the full commit and dirty state.
-2. Keep all peers and data on the exact same build.
-3. Stop and close writers before copying data.
-4. Preserve a restorable copy of the complete database directory.
-5. Expect a later commit to reject or replace that image.
+Before changing builds, preserve a restorable copy and record its writer
+revision. Follow [embedded backup](operations/embedded-backup.md) or the
+[RF3 restore protocol](operations/backup-restore.md) for the applicable data.
+Use disposable or independently recoverable data during evaluation.
 
-Development format fixtures are byte-exact test oracles, not old-format
-readers. Intentional format changes replace the current format-0 fixture and
-continue to reject obsolete layouts.
+## Known limitations
 
-## Known defects in this snapshot
+- RF3 preparation uses sealed recovery journals that require Linux strict
+  allocation support. Native macOS preparation fails closed; this is separate
+  from the embedded API, whose default example can run on macOS.
+- The root facade is a JSON API. Low-level opaque-value options are not a
+  uniform alternative across direct, lazy, and transactional facade writes.
+- The competitive `mixedsuite` summary header does not describe every emitted
+  grouping field. Use raw per-run rows; see [performance methodology](performance.md#known-mixedsuite-output-defect).
+- Resource budgets cover their named caches, workspaces, or overlays. They do
+  not establish a fixed total process-memory ceiling.
+- Follower applied-floor reads and multi-group read vectors have narrower
+  semantics than a linearizable global snapshot.
 
-These are source-audit findings, not hypothetical limitations.
+## Validation evidence
 
-| Evidence | Current defect or sharp edge | Consequence |
-| --- | --- | --- |
-| [Facade validation](../vibedb.go) / [transaction validation](../vibedb_txn.go) | A first lazy `Put` and later direct or transactional writes do not apply one consistent JSON rule | Do not enable opaque values through the root facade |
-| [`mixedsuite` summaries](../bench/competitive/cmd/mixedsuite/main.go) | Summary rows contain more grouping fields than the header declares | Do not consume the current summary TSV as a stable machine-readable schema |
+Use the CI run for the exact revision under evaluation and the
+[contribution checks](../CONTRIBUTING.md#root-checks) for local changes.
+Platform-specific process, fault, psql, JDBC, and Kind lanes have additional
+prerequisites. A skipped or unexecuted lane provides no result.
 
-These defects are reasons the project must not be used for irreplaceable data.
-
-## Validation record
-
-Validation was incremental across the rewrite and its `main` merges; this is
-the complete claim, not a blanket green-build assertion.
-
-| Check | Result | Boundary |
-| --- | --- | --- |
-| `go test -p=1 -timeout=25m ./...` | **Incomplete** | An earlier run reached `store/durable` and was externally terminated; no complete serial root run finished after the final `main` merge |
-| `go build ./...`; `go vet ./...` | Passed after the final merge | Root module at the audited commit above |
-| Final-main changed packages | Passed after the final merge | `internal/multiraft`, `internal/raftmember`, `internal/raftservice`, `internal/replicatedstate`, `shardservice`, and `cmd/vibedb-shard` |
-| Focused packages | Passed before the final probe/process-test merge | `gateway`, `sql/driver`, both gateway/shard commands, `sql`, `query`, `pgwire`, conformance, feature-state, build-gate, unsafe-audit, and service-authorization suites |
-| Other focused packages and integrations | Passed during the audit | Core storage, Raft, benchmark tooling, and hermetic client modules; these do not replace the incomplete root run |
-| `go test ./store/durable -timeout=30m` | **Timed out** | `TestFileStorePointReplayDoesNotExhaustRetirementCapacity` was active; that test passed alone in 51 seconds, but the package has no complete result |
-| PostgreSQL 18.6 upstream corpus | Not run | The approval set remains empty; see [PostgreSQL compatibility status](#postgresql-compatibility-status) |
-| Live `psql` and Java/JDBC gates | Not run | Require explicit local dependencies and flags |
-| Linux fault, `/proc`, direct-I/O, and Kubernetes Kind lanes | Not run | This audit ran on Darwin |
-
-CI workflow presence does not prove branch protection or a mandatory release
-gate. Raw CI artifacts are evidence for one run, not a benchmark publication or
-support claim.
-
-A focused SIMD check on 2026-09-04 found that
-`GOEXPERIMENT=simd go test -race -gcflags=all=-d=checkptr=2 ./internal/storeio -run '^TestCompactStreamAdaptiveAlphabetSelection$' -count=1`
-fails its alphabet point allocation assertion (`1` allocation, expected `0`)
-on clean commit `ea8665045570df3b7d3a3f9aee4d8d9bc4dba0ae` as well as the
-packed-counter SIMD change. The ordinary compact-codec tests pass; this is a
-limitation of the combined instrumented validation, not a passing full-suite
-claim.
+[Qualification records](qualification/README.md) retain dated runs and their
+scope. The [earlier documentation audit](qualification/documentation-audit-215fb05.md)
+is historical; its incomplete root-suite run is not the current build status.
 
 ## PostgreSQL compatibility status
 
-The pgwire adapter supports selected PostgreSQL v3 protocol behavior and client
-shapes. The upstream PostgreSQL 18.6 harness currently has **zero approved
-byte-for-byte regression tests**. With an empty approval set, semantic
-mismatches are observational; timeout, client failure, or a future approved
-regression is what fails the lane.
+The PostgreSQL 18.6 upstream harness has an empty approved regression set.
+It records semantic differences; passing the lane does not establish upstream
+regression compatibility. The [compatibility harness](../integration/pgcompat/README.md)
+explains its failure rules and evidence.
 
-Therefore the accurate description is “PostgreSQL protocol adapter for the
-VibeDB SQL subset,” never “PostgreSQL-compatible database.”
+Test the actual statements and discovery queries emitted by your client.
+See [pgwire](api/pgwire.md) for selected client support and
+[SQL](reference/sql.md) for the executable dialect.
 
 ## Performance status
 
-No competitive result is published in this repository. Coverage tables show
-that harness shapes exist; qualification receipts validate artifact structure;
-neither establishes a win, cost claim, or scaling result. See
-[performance evidence](performance.md).
+The repository contains [dated benchmark reports](benchmarks/README.md),
+including RF3 SQL comparisons and kernel measurements. Each applies to its
+recorded revision, workload, hardware, and method. A short run or one kernel's
+speedup does not establish overall capacity or horizontal scaling.
+
+[Performance methodology](performance.md) explains evidence requirements.
+The separate [competitive harness registry](../bench/competitive/RESULTS.md)
+has no endorsed publication entries.
+
+## License and support
+
+No project license or support window is published in this checkout.
+Third-party `LICENSE-*` and `PATENTS-*` files cover incorporated work; see
+[source provenance](provenance.md). [Security](../SECURITY.md) describes the
+reporting channel limitations and trust boundaries.

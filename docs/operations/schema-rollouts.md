@@ -1,10 +1,6 @@
 # Roll out one RF3 schema generation
 
-> [!CAUTION]
-> Schema rollout is a development-only, same-build control path. Plans, bundles,
-> state files, protocol bytes, and recovery rules can change or break at any
-> commit. This is not a general DDL service, a rolling-version upgrade mechanism,
-> or a production online-schema-change guarantee.
+[Documentation](../README.md) / [Operations](README.md) · [Development status](../status.md)
 
 `vibedb-gateway schema-rollout` coordinates one exact catalog transition across
 every replica of every changed RF3 group. Each changed shard moves from schema
@@ -184,7 +180,7 @@ same-build restart cuts. They do not establish:
 | --- | --- |
 | Catalog intent, authorization, completion, and abort | [`gateway/schema_rollout.go`](../../gateway/schema_rollout.go) |
 | Fan-out, resume, and drain coordinator | [`gateway/schema_rollout_controller.go`](../../gateway/schema_rollout_controller.go) |
-| Plan construction from exact receipts | [`gateway/schema_ddl_plan.go`](../../gateway/schema_ddl_plan.go), [`cmd/vibedb-gateway/schema_rollout_admin.go`](../../cmd/vibedb-gateway/schema_rollout_admin.go) |
+| Plan construction from exact receipts | [`gateway/schema_ddl_plan.go`](../../gateway/schema_ddl_plan.go), [`internal/gatewayruntime/schema_rollout_admin.go`](../../internal/gatewayruntime/schema_rollout_admin.go) |
 | Local states, requests, authorization, and drain proof | [`internal/schemainstall/types.go`](../../internal/schemainstall/types.go) |
 | Durable local CAS journal | [`internal/schemainstall/journal.go`](../../internal/schemainstall/journal.go) |
 | Prepare/activate/drain observation | [`internal/schemainstall/installer.go`](../../internal/schemainstall/installer.go), [`internal/schemainstall/artifacts.go`](../../internal/schemainstall/artifacts.go) |

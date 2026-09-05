@@ -1,5 +1,7 @@
 # JDBC and GoLand development probes
 
+[Client guide](../../docs/api/pgwire.md)
+
 > **Development status:** VibeDB's pgwire, catalog emulation, and SQL surface are
 > incomplete and may change or break at any commit. These probes target a
 > disposable development database. They are not production, release, or driver

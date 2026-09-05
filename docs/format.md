@@ -1,12 +1,9 @@
 # Development on-disk format
 
-> [!CAUTION]
-> **Format 0 is replace-in-place development state, not a compatibility
-> promise.** A later commit may reject every file described here. There is no
-> cross-version decoder, downgrade path, or migration ladder. Same-format
-> physical generation migration exists, but it does not make different builds
-> compatible. Use the reader and docs from the exact writer commit, and keep an
-> independent restorable copy of any data you care about.
+[Documentation](README.md) · [Development status](status.md)
+
+Format 0 describes the current development grammar. Use the exact writer
+build to read its files; cross-build migration is not supported.
 
 The codecs and validators in `internal/storeio`, `store/durable`,
 `internal/raftstore`, and the replicated-state packages are authoritative. This
@@ -21,11 +18,18 @@ specification.
 | `.rjournal` | Recovery/delta records and conditional prepares | Never copy or move independently of the primary |
 | `txn.vtm` | Cross-collection decision log | Preserve with the complete database directory |
 | Database catalog | Collection identities and persisted options | Preserve the closed directory as one unit |
+| Shared node log | Descriptor catalog, segmented log, checkpoints, and node/group identities | Preserve the whole node recovery unit and its keys; never transplant one group file |
 | Raft WAL family | Authenticated consensus state and generation activation | Preserve exact identity, keys, manifest, and family |
 | Gateway/control journals | Request, catalog, or operation recovery | Preserve with matching identities and secrets |
 
 A live arbitrary file copy is not a supported backup. Stop and close the
 writer, or use a protocol that certifies an immutable cut.
+
+Physical-node serving adds a node-owned descriptor catalog and segmented log.
+Its grammar and group registration are owned by
+[NodeStore](../internal/raftstore/node_store.go) and
+[seglog](../internal/raftstore/seglog/). The collection page envelope below
+is not the node-log frame format.
 
 ## Common page envelope
 
@@ -149,10 +153,10 @@ promise to open.
 
 ## Source map
 
-- `internal/storeio/page.go`, `state_root.go`, `inline_superblock.go`,
+- [internal/storeio/page.go](../internal/storeio/page.go), `state_root.go`, `inline_superblock.go`,
   `mutable_file_layout.go`, `recovery_journal.go`, and primary/index codecs
 - `store/durable/store_file_*`, `store_database_*`, and `checkpoint_group.go`
-- `internal/raftstore`
-- `internal/replicatedstate`, `internal/distributedtxn`, and
-  `internal/requestledger`
-- `internal/storeio/testdata/format0`
+- [internal/raftstore](../internal/raftstore)
+- [internal/replicatedstate](../internal/replicatedstate), [internal/distributedtxn](../internal/distributedtxn), and
+  [internal/requestledger](../internal/requestledger)
+- [internal/storeio/testdata/format0](../internal/storeio/testdata/format0)

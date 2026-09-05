@@ -1,12 +1,9 @@
 # Low-level storage engines
 
+[Documentation](README.md) / [Design](design/README.md) · [Development status](status.md)
+
 Use the root `vibedb` package unless you need to own snapshots, descriptors, storage
 geometry, or workspaces. This maps the lower-level `store` and `store/durable` contracts.
-
-> [!CAUTION]
-> VibeDB is unreleased development software. Pin one exact Git commit: APIs,
-> disk formats, file layouts, recovery behavior, commands, and wire behavior may
-> break between any two commits. Do not store irreplaceable data in VibeDB.
 
 ## Choose one ownership layer
 
@@ -212,12 +209,15 @@ rebuilds a fresh empty output from surviving self-describing primary leaves;
 overflow values are skipped and reported, so salvage can be partial. It is not a
 backup strategy.
 
+See the [durable ownership contract](../store/durable/OWNERSHIP.md) for handle,
+lease, and storage lifetime rules.
+
 ## Source map
 
-- Heap collection and snapshots: `store/engine.go`, `store/store_builder.go`
-- Heap catalog, cuts, and transactions: `store/store_collection.go`, `store/store_database_snapshot.go`, `store/store_database_txn.go`
-- Shared schemas and indexes: `store/store_schema.go`, `store/store_index.go`, `store/store_index_exact.go`
-- Durable options and open: `store/durable/store_file_options.go`, `store/durable/store_file_open.go`
-- Durable batches and lifecycle: `store/durable/store_file_batch.go`, `store/durable/store_file_lifecycle.go`
-- Durable catalogs, cuts, and transactions: `store/durable/store_database.go`, `store/durable/store_database_snapshot.go`, `store/durable/store_database_txn.go`
-- Offline tools: `store/durable/store_file_verify.go`
+- Heap collection and snapshots: [store/engine.go](../store/engine.go), [store/store_builder.go](../store/store_builder.go)
+- Heap catalog, cuts, and transactions: [store/store_collection.go](../store/store_collection.go), [store/store_database_snapshot.go](../store/store_database_snapshot.go), [store/store_database_txn.go](../store/store_database_txn.go)
+- Shared schemas and indexes: [store/store_schema.go](../store/store_schema.go), [store/store_index.go](../store/store_index.go), [store/store_index_exact.go](../store/store_index_exact.go)
+- Durable options and open: [store/durable/store_file_options.go](../store/durable/store_file_options.go), [store/durable/store_file_open.go](../store/durable/store_file_open.go)
+- Durable batches and lifecycle: [store/durable/store_file_batch.go](../store/durable/store_file_batch.go), [store/durable/store_file_lifecycle.go](../store/durable/store_file_lifecycle.go)
+- Durable catalogs, cuts, and transactions: [store/durable/store_database.go](../store/durable/store_database.go), [store/durable/store_database_snapshot.go](../store/durable/store_database_snapshot.go), [store/durable/store_database_txn.go](../store/durable/store_database_txn.go)
+- Offline tools: [store/durable/store_file_verify.go](../store/durable/store_file_verify.go)

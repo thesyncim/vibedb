@@ -1,5 +1,11 @@
 # Research notes for the distributed redesign
 
+[Documentation](README.md) / [Research records](design/research.md)
+
+**Record scope:** This page retains a dated proposal or investigation. Its
+revision-specific findings and future work are not the current operating guide.
+See [architecture](architecture.md) and [operations](operations/README.md).
+
 Checked 2026-09-04. These are architecture inputs and hypotheses, not measured
 VibeDB advantages. The current fused-node acceptance thresholds remain in
 `fused-node-runtime-plan.md`; this note does not expand that tranche or replace
