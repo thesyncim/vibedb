@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import subprocess
 from pathlib import Path
 import tempfile
@@ -48,6 +49,28 @@ class FaultQualificationProvenanceTest(unittest.TestCase):
             self.assertEqual(
                 (destination / "source-before-files" / "untracked.txt").read_text(),
                 "new\n")
+
+    def test_per_group_diagnostic_summary_requires_complete_rf3_shape(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "snapshots.jsonl"
+            members = [{"member_id": member, "node_id": f"{member:032x}"}
+                       for member in range(1, 4)]
+            groups = [{"group_id": f"{group:032x}", "members": members}
+                      for group in range(7)]
+            path.write_text(json.dumps({"schema": "vibedb.rf3-diagnostic/1",
+                                        "sequence": 1, "elapsed_ns": 123,
+                                        "groups": groups, "sampling_errors": 0}) + "\n")
+            summary = MODULE.per_group_diagnostic_summary(path)
+            self.assertEqual(summary["records"], 1)
+            self.assertEqual(summary["max_cycle_elapsed_ns"], 123)
+            self.assertTrue(summary["complete_shape"])
+
+            path.write_text(json.dumps({"schema": "vibedb.rf3-diagnostic/1",
+                                        "sequence": 2, "groups": groups[:-1]}) + "\n")
+            summary = MODULE.per_group_diagnostic_summary(path)
+            self.assertEqual(summary["records"], 0)
+            self.assertFalse(summary["complete_shape"])
+            self.assertTrue(summary["parse_errors"])
 
 
 if __name__ == "__main__":

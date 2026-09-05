@@ -3,7 +3,9 @@
 
 This command is a correctness diagnostic for one Linux, single-host Docker
 fixture.  It retains strict SQL/oracle evidence while exercising a process
-pause beyond the configured grant and a same-root process restart.  It never
+pause beyond the configured grant and a same-root process restart.  The
+``--no-fault`` mode preserves the same setup and workload while collecting
+bounded per-group Raft cuts without injecting a pause or restart.  It never
 produces a throughput comparison or a CRDB result.
 """
 
@@ -107,6 +109,7 @@ def build_candidate(fixture, repo, destination, arch):
         ("candidate-vibedb", repo, "./cmd/vibedb"),
         ("candidate-vibedb-shard", repo, "./cmd/vibedb-shard"),
         ("candidate-vibedb-gateway", repo, "./cmd/vibedb-gateway"),
+        ("rf3-diagnostic", repo / "bench/competitive", "./cmd/rf3-diagnostic"),
         ("rf3-sqlbench", repo / "integration/pgclient", "./cmd/rf3-sqlbench"),
     )
     for name, source, package in packages:
@@ -162,6 +165,44 @@ def diagnostics_summary(path):
             "read_authority_grants_accepted": value.get("read_authority_grants_accepted"),
         })
     return records
+
+
+def per_group_diagnostic_summary(path, expected_groups=7, expected_members=3):
+    """Summarize bounded JSONL cuts without turning them into a performance claim."""
+    records = []
+    parse_errors = []
+    if not path.is_file():
+        return {"records": 0, "parse_errors": ["missing output"], "complete_shape": False}
+    try:
+        lines = path.read_text().splitlines()
+    except (OSError, UnicodeDecodeError) as exc:
+        return {"records": 0, "parse_errors": [str(exc)], "complete_shape": False}
+    for line_number, line in enumerate(lines, 1):
+        try:
+            value = json.loads(line)
+            groups = value.get("groups")
+            if value.get("schema") != "vibedb.rf3-diagnostic/1" or not isinstance(groups, list):
+                raise ValueError("invalid cycle header")
+            if len(groups) != expected_groups or any(
+                    not isinstance(group.get("members"), list) or
+                    len(group["members"]) != expected_members
+                    for group in groups):
+                raise ValueError("incomplete group/member cut")
+            records.append(value)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            parse_errors.append(f"line {line_number}: {exc}")
+    elapsed = [value.get("elapsed_ns") for value in records
+               if isinstance(value.get("elapsed_ns"), int)]
+    return {
+        "records": len(records),
+        "first_sequence": records[0].get("sequence") if records else None,
+        "last_sequence": records[-1].get("sequence") if records else None,
+        "max_cycle_elapsed_ns": max(elapsed, default=0),
+        "sampling_errors": sum(value.get("sampling_errors", 0) for value in records
+                                if isinstance(value.get("sampling_errors"), int)),
+        "parse_errors": parse_errors,
+        "complete_shape": bool(records) and not parse_errors,
+    }
 
 
 def authority_proof(records):
@@ -349,6 +390,8 @@ def main(argv=None):
     parser.add_argument("--workloads", default="point_hit,point_miss,mixed_read_update,mixed_uniform")
     parser.add_argument("--pause-seconds", type=float, default=7.0)
     parser.add_argument("--ready-timeout", type=int, default=180)
+    parser.add_argument("--no-fault", action="store_true",
+                        help="run the original workload without SIGSTOP/SIGKILL fault injection")
     selected = parser.parse_args(argv)
     repo = selected.repo.resolve()
     fixture = load_fixture()
@@ -381,12 +424,14 @@ def main(argv=None):
             "warmup": selected.warmup, "repetitions": 1,
         },
         "fault_contract": {
+            "enabled": not selected.no_fault,
+            "mode": "none" if selected.no_fault else "pause-and-restart",
             "grant_max_seconds": GRANT_SECONDS,
-            "pause_seconds": selected.pause_seconds,
-            "pause_is_process_signal": True,
-            "pause_is_not_network_partition": True,
-            "restart_quarantine_seconds": QUARANTINE_SECONDS,
-            "same_volume_restart": True,
+            "pause_seconds": selected.pause_seconds if not selected.no_fault else 0,
+            "pause_is_process_signal": not selected.no_fault,
+            "pause_is_not_network_partition": not selected.no_fault,
+            "restart_quarantine_seconds": QUARANTINE_SECONDS if not selected.no_fault else 0,
+            "same_volume_restart": not selected.no_fault,
         },
         "source": {},
         "binary_sha256": {},
@@ -712,6 +757,7 @@ def main(argv=None):
         args.ready_timeout = selected.ready_timeout
         args.parent_arg = []
         args.candidate_arg = ["--read-authority"]
+        args.rf3_diagnostic = True
         args.validator_path = VALIDATOR_PATH
         tables = fixture.table_names(4, "rf3_sql_group")
         cell = {
@@ -744,7 +790,8 @@ def main(argv=None):
 
         thread = threading.Thread(target=run_fixture, name="rf3-fault-fixture")
         thread.start()
-        do_pause()
+        if not selected.no_fault:
+            do_pause()
         thread.join()
         if "exception" in result_holder:
             raise result_holder["exception"]
@@ -753,16 +800,20 @@ def main(argv=None):
         manifest["run_wall_elapsed_seconds"] = result_holder.get("wall_elapsed_seconds")
         manifest["diagnostic_records"] = diagnostics_summary(run_dir / "diagnostics")
         manifest["authority_proof"] = authority_proof(manifest["diagnostic_records"])
+        manifest["per_group_diagnostic"] = per_group_diagnostic_summary(
+            run_dir / "per-group-snapshots.jsonl")
         manifest["pause"] = state.get("pause")
         manifest["pause_error"] = state.get("pause_error")
         manifest["restart"] = next((event for event in reversed(manifest["events"])
                                      if event.get("event") == "sigkill-restart"), None)
+        fault_complete = selected.no_fault or (
+            state.get("pause", {}).get("status") == "verified-signals" and
+            manifest.get("restart", {}).get("status") == "verified")
         manifest["status"] = "complete" if (
             result.get("status") == "completed" and
             result.get("client_exit_code") == 0 and
             result.get("validation", {}).get("complete") and
-            state.get("pause", {}).get("status") == "verified-signals" and
-            manifest.get("restart", {}).get("status") == "verified"
+            fault_complete
         ) else "incomplete-or-failed"
     except BaseException as exc:
         manifest["status"] = "incomplete-or-failed"
