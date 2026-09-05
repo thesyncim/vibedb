@@ -95,10 +95,10 @@ On legacy shards without global indexes, a single-owner `DO UPDATE` executes
 the original conflict action atomically in the shard driver. Arbitrary shard-key
 assignments still require a placement proof; copying the current or candidate
 key and whole-document EXCLUDED replacement preserve the routed owner.
-Unconditional RF3 whole-document EXCLUDED replacement uses the native atomic put primitive
-and preserves its exact affected-row and retry semantics. Declared RF3 column
-upserts and conditional whole-document replacements replicate a bounded VUC3 expression template and its referenced scalar
-bindings. Current-row and EXCLUDED expressions use the same compiled projection
+Unconditional RF3 whole-document EXCLUDED replacement uses the native atomic
+put primitive and preserves its exact affected-row and retry semantics. Declared
+RF3 column upserts and conditional whole-document replacements replicate a
+bounded VUC3 expression template and its referenced scalar bindings. Current-row and EXCLUDED expressions use the same compiled projection
 as local SQL: exact arithmetic, concatenation, casts, lazy CASE and conditional
 functions, and simultaneous assignment semantics. Candidate validation, column
 resolution and binding checks precede branch selection. Runtime RHS evaluation
@@ -108,8 +108,7 @@ once before all SET expressions; FALSE and UNKNOWN skip assignments, local
 RETURNING rows, and affected-row counts. An insert ignores the condition at
 runtime while still validating candidate, declaration, and bindings. The same
 filter applies to local, durable, transactional, shard, and RF3 execution.
-Untouched fields and exact retry
-results are preserved. The owner proof and final schema/key fences still apply.
+Untouched fields and exact retry results are preserved. The owner proof and final schema/key fences still apply.
 
 Each relation retains at most one compiled template, protected by the same
 mutex used for detached snapshot audits. Changed parameter values reuse that
@@ -118,7 +117,7 @@ of the INSERT's candidate binds. The format bounds the full mutation to 4 MiB,
 assignments and referenced parameters to 1,024 each, expression nodes to 16,384,
 and depth to 128. Execution has deterministic 16 MiB workspace, result,
 intermediate, and exact-number budgets; document limits apply independently.
-The unreleased VUC1 grammar is replaced, and authenticated apply-contract,
+The unreleased VUC2 grammar is replaced, and authenticated apply-contract,
 snapshot and data-chain identities change with it. Mixed apply contracts fail
 closed. See [expression format](replicated-conflict-program.md).
 
@@ -131,8 +130,7 @@ not claims closed by local tests.
 ## Remaining work
 
 The [SQL workload gap corpus](../../internal/conformance/sql_workload.go)
-contains 32 reduced statements. The
-[driver gate](../../sql/driver/sql_workload_compatibility_test.go) verifies that
+contains 32 reduced statements. The [driver gate](../../sql/driver/sql_workload_compatibility_test.go) verifies that
 each still refuses at prepare or execution. When implementing a gap, replace
 its refusal expectation with result, metadata, and atomicity coverage and
 update this table. A parser accepting a statement does not close a gap.
