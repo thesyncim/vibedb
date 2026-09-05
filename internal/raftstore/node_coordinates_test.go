@@ -10,13 +10,14 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftstore/seglog"
+	"go.etcd.io/raft/v3"
 	pb "go.etcd.io/raft/v3/raftpb"
 )
 
 func coordinateFixture(t *testing.T) (*NodeStore, string, NodeStoreOptions) {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), "node")
-	options := NodeStoreOptions{MaxWaveBytes: 1 << 20, MaxSegmentEvents: 64, RecentWaves: 16, MaxEntriesPerGroup: 16, ReaderSlots: 1}
+	options := NodeStoreOptions{MaxWaveBytes: 1 << 20, MaxSegmentEvents: 256, RecentWaves: 16, MaxEntriesPerGroup: 128, ReaderSlots: 1}
 	store, err := CreateNodeStore(dir, testNodeIdentity(), testKey(), []NodeBootstrap{
 		{Descriptor: testGroupDescriptor(10), Snapshot: nodeSnapshot(10, 1, 1)},
 		{Descriptor: testGroupDescriptor(20), Snapshot: nodeSnapshot(20, 1, 1)},
@@ -156,6 +157,12 @@ func TestNodeCoordinatesTrackSuffixReplacementWithoutAllocatingReads(t *testing.
 	if last, commit, err := view.LogBounds(); err != nil || last != 3 || commit != 3 {
 		t.Fatalf("replacement %d %d: %v", last, commit, err)
 	}
+	if term, err := view.Term(3); err != nil || term != 3 {
+		t.Fatalf("replacement term=%d: %v", term, err)
+	}
+	if _, err := view.Term(4); !errors.Is(err, raft.ErrUnavailable) {
+		t.Fatalf("retained replaced suffix: %v", err)
+	}
 	if allocations := testing.AllocsPerRun(1000, func() {
 		if _, err := view.FirstIndex(); err != nil {
 			panic(err)
@@ -164,6 +171,9 @@ func TestNodeCoordinatesTrackSuffixReplacementWithoutAllocatingReads(t *testing.
 			panic(err)
 		}
 		if _, _, err := view.LogBounds(); err != nil {
+			panic(err)
+		}
+		if _, err := view.Term(3); err != nil {
 			panic(err)
 		}
 	}); allocations != 0 {
@@ -200,5 +210,95 @@ func TestNodeCoordinatesObserveIndependentEngineFailure(t *testing.T) {
 	}
 	if _, err := view.LastIndex(); !errors.Is(err, ErrPersistenceUnknown) {
 		t.Fatal(err)
+	}
+}
+
+func TestNodeRecentTermsDoNotWaitForOtherGroupSync(t *testing.T) {
+	store, _, _ := coordinateFixture(t)
+	view := store.Group(1)
+	if _, err := view.FirstIndex(); err != nil {
+		t.Fatal(err)
+	}
+	if err := view.Persist(raftmodel.PersistBatch{NodeIncarnation: 1, ReadyID: 1, Entries: []*pb.Entry{typedEntry(2, 2, pb.EntryNormal, "value")}, HardState: hard(2, 2), MustSync: true}); err != nil {
+		t.Fatal(err)
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	defer unblock()
+	store.SetDataSyncForTesting(func(file *os.File) error { close(entered); <-release; return file.Sync() })
+	done := make(chan error, 1)
+	go func() {
+		done <- store.Group(2).Persist(raftmodel.PersistBatch{NodeIncarnation: 1, ReadyID: 1, Entries: []*pb.Entry{typedEntry(2, 2, pb.EntryNormal, "other")}, HardState: hard(2, 2), MustSync: true})
+	}()
+	<-entered
+	read := make(chan error, 1)
+	go func() {
+		term, err := view.Term(2)
+		if err == nil && term != 2 {
+			err = errors.New("wrong cached term")
+		}
+		read <- err
+	}()
+	select {
+	case err := <-read:
+		if err != nil {
+			t.Error(err)
+		}
+	case <-time.After(time.Second):
+		t.Error("term read blocked behind unrelated sync")
+	}
+	unblock()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	store.SetDataSyncForTesting(func(file *os.File) error { return file.Sync() })
+}
+
+func TestNodeRecentTermsRingCollisionAndReplacement(t *testing.T) {
+	store, _, _ := coordinateFixture(t)
+	view := store.Group(1)
+	if _, err := view.FirstIndex(); err != nil {
+		t.Fatal(err)
+	}
+	entries := make([]*pb.Entry, 0, 80)
+	for index := uint64(2); index <= 81; index++ {
+		term := uint64(2)
+		if index > 40 {
+			term = 3
+		}
+		entries = append(entries, typedEntry(index, term, pb.EntryNormal, "value"))
+	}
+	if err := view.Persist(raftmodel.PersistBatch{NodeIncarnation: 1, ReadyID: 1, Entries: entries, HardState: hard(3, 2), MustSync: true}); err != nil {
+		t.Fatal(err)
+	}
+	for index := uint64(2); index <= 81; index++ {
+		want := uint64(2)
+		if index > 40 {
+			want = 3
+		}
+		if term, err := view.Term(index); err != nil || term != want {
+			t.Fatalf("index=%d term=%d want=%d err=%v", index, term, want, err)
+		}
+	}
+	if err := view.Persist(raftmodel.PersistBatch{NodeIncarnation: 1, ReadyID: 2, Entries: []*pb.Entry{typedEntry(20, 4, pb.EntryNormal, "replacement"), typedEntry(21, 4, pb.EntryNormal, "replacement")}, HardState: hard(4, 21), MustSync: true}); err != nil {
+		t.Fatal(err)
+	}
+	for _, index := range []uint64{20, 21} {
+		if term, err := view.Term(index); err != nil || term != 4 {
+			t.Fatalf("replacement index=%d term=%d err=%v", index, term, err)
+		}
+	}
+	if _, err := view.Term(67); !errors.Is(err, raft.ErrUnavailable) {
+		t.Fatalf("stale ring entry remained visible: %v", err)
+	}
+	if err := store.publishGroupCheckpointSequenced(1, nodeSnapshot(10, 21, 4)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := view.Term(20); !errors.Is(err, raft.ErrCompacted) {
+		t.Fatalf("compacted term: %v", err)
+	}
+	if term, err := view.Term(21); err != nil || term != 4 {
+		t.Fatalf("checkpoint term=%d err=%v", term, err)
 	}
 }

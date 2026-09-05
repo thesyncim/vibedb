@@ -2,6 +2,8 @@ package raftstore
 
 import (
 	"errors"
+
+	"github.com/thesyncim/vibedb/internal/raftstore/seglog"
 	"go.etcd.io/raft/v3"
 )
 
@@ -9,7 +11,13 @@ import (
 // after the log sync and namespace proof, before Ready completion. Raft may read
 // the preceding durable cut while an unrelated wave is in flight; these reads
 // must never take the device mutex held across that wave's disk I/O.
-type nodeLogCoordinates struct{ first, last, commit uint64 }
+const nodeRecentTerms = 64
+
+type nodeTermCoordinate struct{ index, term uint64 }
+type nodeLogCoordinates struct {
+	first, last, commit, baseTerm uint64
+	terms                         *[nodeRecentTerms]nodeTermCoordinate
+}
 type nodeCoordinateFailure struct{ err error }
 
 // poisonLocked requires mu and makes failure visible to both the storage and
@@ -23,12 +31,12 @@ func (s *NodeStore) poisonLocked(err error) {
 // publishCoordinatesLocked requires mu. The separate lock is held only for the
 // in-memory publication, never for log writes, syncs, checkpoint I/O, or readers.
 // Only warmed groups need updates, keeping publication proportional to the wave.
-func (s *NodeStore) publishCoordinatesLocked(group uint64) {
+func (s *NodeStore) publishCoordinatesLocked(group uint64, batch *seglog.ReadyBatch) {
 	if s.coordinates == nil {
 		return
 	}
 	s.coordinateMu.RLock()
-	_, warmed := s.coordinates[group]
+	previous, warmed := s.coordinates[group]
 	s.coordinateMu.RUnlock()
 	if !warmed {
 		return
@@ -38,20 +46,31 @@ func (s *NodeStore) publishCoordinatesLocked(group uint64) {
 		return
 	}
 	s.coordinateMu.Lock()
-	s.coordinates[group] = nodeLogCoordinates{state.FirstIndex, state.LastIndex, state.Hard.Commit}
+	cut := coordinatesFromMetadata(state, previous.terms)
+	if batch != nil {
+		if batch.ReplaceFrom != 0 {
+			for index := range cut.terms {
+				if cut.terms[index].index >= batch.ReplaceFrom {
+					cut.terms[index] = nodeTermCoordinate{}
+				}
+			}
+		}
+		entries := batch.Entries
+		if len(entries) > nodeRecentTerms {
+			entries = entries[len(entries)-nodeRecentTerms:]
+		}
+		for _, entry := range entries {
+			cut.terms[entry.Index%nodeRecentTerms] = nodeTermCoordinate{entry.Index, entry.Term}
+		}
+	}
+	s.coordinates[group] = cut
 	s.coordinateMu.Unlock()
 }
 
 func (v *GroupView) logCoordinates() (nodeLogCoordinates, error) {
 	s := v.store
-	if s.closingFlag.Load() {
-		return nodeLogCoordinates{}, ErrClosed
-	}
-	if failure := s.coordinateFailure.Load(); failure != nil {
-		return nodeLogCoordinates{}, failure.err
-	}
-	if err := s.engine.PublishedFailure(); err != nil {
-		return nodeLogCoordinates{}, errors.Join(ErrPersistenceUnknown, err)
+	if err := s.coordinateReadError(); err != nil {
+		return nodeLogCoordinates{}, err
 	}
 	s.coordinateMu.RLock()
 	cut, found := s.coordinates[v.group]
@@ -70,7 +89,10 @@ func (v *GroupView) logCoordinates() (nodeLogCoordinates, error) {
 	if !ok {
 		return nodeLogCoordinates{}, raft.ErrUnavailable
 	}
-	cut = nodeLogCoordinates{state.FirstIndex, state.LastIndex, state.Hard.Commit}
+	cut = coordinatesFromMetadata(state, new([nodeRecentTerms]nodeTermCoordinate))
+	if _, term, compacted, found, err := s.engine.LookupExact(v.group, state.LastIndex); err == nil && found && !compacted {
+		cut.terms[state.LastIndex%nodeRecentTerms] = nodeTermCoordinate{state.LastIndex, term}
+	}
 	s.coordinateMu.Lock()
 	if s.coordinates == nil {
 		s.coordinates = make(map[uint64]nodeLogCoordinates)
@@ -78,4 +100,55 @@ func (v *GroupView) logCoordinates() (nodeLogCoordinates, error) {
 	s.coordinates[v.group] = cut
 	s.coordinateMu.Unlock()
 	return cut, nil
+}
+
+func coordinatesFromMetadata(state seglog.GroupMetadata, terms *[nodeRecentTerms]nodeTermCoordinate) nodeLogCoordinates {
+	baseTerm := state.TruncateTerm
+	if state.Checkpoint.Index == state.FirstIndex-1 {
+		baseTerm = state.Checkpoint.Term
+	}
+	return nodeLogCoordinates{first: state.FirstIndex, last: state.LastIndex, commit: state.Hard.Commit, baseTerm: baseTerm, terms: terms}
+}
+
+func (s *NodeStore) coordinateReadError() error {
+	if s.closingFlag.Load() {
+		return ErrClosed
+	}
+	if failure := s.coordinateFailure.Load(); failure != nil {
+		return failure.err
+	}
+	if err := s.engine.PublishedFailure(); err != nil {
+		return errors.Join(ErrPersistenceUnknown, err)
+	}
+	return nil
+}
+
+// cachedTerm covers the compacted boundary and a fixed recent-entry ring. An
+// exact index tag prevents ring collisions from returning another entry's term.
+// Historical misses keep the ordinary authenticated storage lookup.
+func (v *GroupView) cachedTerm(index uint64) (uint64, bool, error) {
+	s := v.store
+	if err := s.coordinateReadError(); err != nil {
+		return 0, true, err
+	}
+	s.coordinateMu.RLock()
+	defer s.coordinateMu.RUnlock()
+	cut, found := s.coordinates[v.group]
+	if !found {
+		return 0, false, nil
+	}
+	if index < cut.first-1 {
+		return 0, true, raft.ErrCompacted
+	}
+	if index == cut.first-1 {
+		return cut.baseTerm, true, nil
+	}
+	if index > cut.last {
+		return 0, true, raft.ErrUnavailable
+	}
+	entry := cut.terms[index%nodeRecentTerms]
+	if entry.index == index {
+		return entry.term, true, nil
+	}
+	return 0, false, nil
 }

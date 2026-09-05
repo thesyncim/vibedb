@@ -803,7 +803,7 @@ func (s *NodeStore) publishGroupCheckpointSequenced(group uint64, snapshot *pb.S
 		s.poisonLocked(err)
 		return errors.Join(ErrPersistenceUnknown, err)
 	}
-	s.publishCoordinatesLocked(group)
+	s.publishCoordinatesLocked(group, nil)
 	s.cacheValid = false
 	return nil
 }
@@ -1269,8 +1269,9 @@ func (s *NodeStore) persistWave(ready []NodeReady, sequenced bool) error {
 		s.poisonLocked(err)
 		return errors.Join(ErrPersistenceUnknown, err)
 	}
-	for _, item := range ready {
-		s.publishCoordinatesLocked(item.GroupID)
+	for index := 0; index < mappedCount; index++ {
+		batch := &s.waveBatches[index]
+		s.publishCoordinatesLocked(batch.GroupID, batch)
 	}
 	s.cacheValid = false
 	return nil
@@ -1643,8 +1644,8 @@ func (s *NodeStore) registerGroupLocked(descriptor GroupDescriptor, snapshot *pb
 	copy(s.descriptorOrder[position+1:], s.descriptorOrder[position:len(s.descriptorOrder)-1])
 	s.descriptorOrder[position] = uint32(len(s.descriptors) - 1)
 	s.nextLogKey++
-	s.publishCoordinatesLocked(nodeDescriptorGroup)
-	s.publishCoordinatesLocked(descriptor.LogKey)
+	s.publishCoordinatesLocked(nodeDescriptorGroup, nil)
+	s.publishCoordinatesLocked(descriptor.LogKey, nil)
 	return GroupIncarnation{GroupID: descriptor.LogKey, Incarnation: 1}, nil
 }
 
@@ -1861,6 +1862,9 @@ func (s *NodeStore) Close() error {
 }
 
 func (v *GroupView) Term(index uint64) (uint64, error) {
+	if term, found, err := v.cachedTerm(index); found {
+		return term, err
+	}
 	v.store.mu.Lock()
 	defer v.store.mu.Unlock()
 	if err := v.store.usable(); err != nil {
