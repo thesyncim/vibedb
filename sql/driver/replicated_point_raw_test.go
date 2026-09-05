@@ -23,6 +23,19 @@ type replicatedPointRawCase struct {
 
 type replicatedPointRawRows [][]string
 
+func replicatedPointRawKey(t *testing.T, fixture replicatedPointSessionFixture, document []byte) []byte {
+	t.Helper()
+	core := fixture.claim.database
+	core.mu.RLock()
+	table := core.tables[fixture.base.UserTable]
+	key, err := documentKey(document, table.meta.PrimaryKey, table.primary, table.collection.MaxKeyBytes())
+	core.mu.RUnlock()
+	if err != nil {
+		t.Fatalf("documentKey(%s): %v", document, err)
+	}
+	return []byte(key)
+}
+
 // runReplicatedPointRawCase executes one point session through the public
 // candidate-key path or through the same statement with its Segment source
 // forced. Keeping the source choice here makes the result comparison exercise
@@ -141,7 +154,7 @@ func assertReplicatedPointRawWrapperEmpty(
 	t.Helper()
 	var execution query.Exec
 	defer execution.Release()
-	err := prepared.statement.query.RunInto(
+	_, err := prepared.statement.query.RunInto(
 		&execution, query.FromValidatedRaw(&connection.pointSource), nil,
 	)
 	if err == nil || !strings.Contains(err.Error(), "empty source") {
@@ -153,8 +166,8 @@ func TestReplicatedPointRawMatchesForcedSegmentFallback(t *testing.T) {
 	fixture := newReplicatedPointSessionFixture(t,
 		`{"id":"a","score":10,"nullable":null,"name":"quote \" slash \\","nested":{"value":7}}`,
 	)
-	wrongKey := testReplicatedApplyKey(
-		t, fixture.claim.database, []byte(`{"id":"wrong"}`),
+	wrongKey := replicatedPointRawKey(
+		t, fixture, []byte(`{"id":"wrong"}`),
 	)
 	cases := []replicatedPointRawCase{
 		{
@@ -344,8 +357,8 @@ func TestReplicatedPointRawWrapperClearsAcrossHitMissAndError(t *testing.T) {
 	}
 	assertReplicatedPointRawWrapperEmpty(t, prepared, &session.conn)
 
-	wrongKey := testReplicatedApplyKey(
-		t, fixture.claim.database, []byte(`{"id":"wrong"}`),
+	wrongKey := replicatedPointRawKey(
+		t, fixture, []byte(`{"id":"wrong"}`),
 	)
 	cursor = Cursor{}
 	if err := prepared.QueryCandidateKeysInto(
