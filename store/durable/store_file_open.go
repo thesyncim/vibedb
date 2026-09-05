@@ -481,7 +481,7 @@ func (c *Collection) createInitialState() error {
 					return c.options.primaryUnifiedOverlayBytes
 				}
 				return 0
-			}(), c.options.SealedRecoveryJournalBytes,
+			}(), c.options.SealedRecoveryJournalBytes, c.options.PortableSealedCapacity,
 		)
 		if err := createSiblingRecoveryJournal(c.file.Name(), header); err != nil {
 			_ = tx.Abort()

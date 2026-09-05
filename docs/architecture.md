@@ -54,6 +54,13 @@ RF3 replicas placed across them; six-node placement is also available.
 Physical-node count, Raft-group count, and replication factor are separate
 quantities. See the [local cluster guide](operations/local-cluster.md).
 
+RF3 collection journals and transaction markers retain fixed file sizes through
+portable allocation on macOS and Linux. Allocation is performed at creation;
+reopen validates geometry and replays records. This avoids Linux-specific
+private-block proofs on the normal RF3 path while retaining write durability
+barriers. The stronger strict reservation mode remains a separate low-level
+contract; see [durability](durability.md) and [header flags](format.md#recovery-journal).
+
 Each owner retains its handles until dependent work is released. This applies
 to borrowed bytes, snapshots, query results, sessions, and network reservations.
 

@@ -255,7 +255,7 @@ func (c *Collection) ensureOrdinaryBufferedRecoveryJournalLocked() error {
 		c.options.MaxKeyBytes, c.options.InlineValueBytes,
 		c.options.MaxDocumentBytes, durable.root.Generation,
 		c.options.primaryUnifiedOverlayBytes,
-		c.options.SealedRecoveryJournalBytes,
+		c.options.SealedRecoveryJournalBytes, c.options.PortableSealedCapacity,
 	)
 	if err := createSiblingRecoveryJournal(c.file.Name(), header); err != nil {
 		return err
@@ -448,7 +448,7 @@ func recoveryJournalHeaderFor(
 	pageSize uint32,
 	maxKeyBytes, inlineValueBytes, maxDocumentBytes int,
 	baseGeneration uint64, deltaOverlayBytes int,
-	sealedCapacityBytes uint64,
+	sealedCapacityBytes uint64, portableCapacity bool,
 ) storeio.RecoveryJournalHeader {
 	sectorSize := uint32(storeio.RecoveryJournalMinSectorSize)
 	header := storeio.RecoveryJournalHeader{
@@ -467,6 +467,7 @@ func recoveryJournalHeaderFor(
 	if sealedCapacityBytes != 0 {
 		header.Capacity = sealedCapacityBytes
 		header.SealedCapacity = true
+		header.PortableCapacity = portableCapacity
 	}
 	return header
 }
@@ -531,7 +532,8 @@ func (c *Collection) openRecoveryJournalLocked(
 	journal, err := storeio.OpenRecoveryJournalWithOptions(
 		file,
 		storeio.RecoveryJournalOpenOptions{
-			SealedCapacityBytes: c.options.SealedRecoveryJournalBytes,
+			SealedCapacityBytes:   c.options.SealedRecoveryJournalBytes,
+			AllowPortableCapacity: c.options.PortableSealedCapacity,
 			Pairing: &storeio.RecoveryJournalPairing{
 				StoreID: c.storeID, JournalID: journalID,
 				PageSize:       uint32(c.options.PageSize),

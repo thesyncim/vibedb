@@ -601,7 +601,7 @@ func replaceCheckpointGroupMarker(
 	marker, err := storeio.CreateTxnMarkerAtRecoveryAnchor(
 		log.root, txnMarkerFilename,
 		storeio.TxnMarkerOptions{
-			Capacity: log.opts.Capacity, SealedCapacity: log.opts.SealedCapacity,
+			Capacity: log.opts.Capacity, SealedCapacity: log.opts.SealedCapacity, PortableCapacity: log.opts.PortableCapacity,
 		},
 		anchor,
 	)
