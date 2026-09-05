@@ -235,11 +235,20 @@ func (r *Result) ownProjectedCell(cell Cell) Cell {
 			cell.text = byteview.String(cell.raw[1 : len(cell.raw)-1])
 			return cell
 		}
-	case TypeNumber, TypeJSON:
+	case TypeNumber:
+		if len(cell.raw) == 0 {
+			// Native compact integers carry their complete value in word and
+			// have no borrowed bytes to retain.
+			return cell
+		}
 		// classifyRawInto retains the exact raw spelling for these projected
 		// values. Copy it directly so the ordinary ownership helper's alias
-		// checks stay off the numeric/JSON hot path. A nil raw is only possible
-		// for a computed value assembled outside the projection callback.
+		// checks stay off the numeric hot path.
+		start := len(r.fileData)
+		r.fileData = append(r.fileData, cell.raw...)
+		cell.raw = r.fileData[start:len(r.fileData):len(r.fileData)]
+		return cell
+	case TypeJSON:
 		if len(cell.raw) != 0 {
 			start := len(r.fileData)
 			r.fileData = append(r.fileData, cell.raw...)
@@ -324,9 +333,10 @@ func (c Cell) Kind() ValueType { return c.kind }
 // of [Cell.Kind]; Kind remains convenient when inspecting JSON values.
 func (c Cell) Type() ValueType { return c.kind }
 
-// Payload returns the borrowed representation bytes. For a projected core
-// value these are its exact JSON bytes. A computed numeric value may have no
-// source payload; use [Cell.AppendJSON] to encode it.
+// Payload returns the borrowed representation bytes. For a projected value
+// these are its exact JSON bytes when the source retained a spelling. Native
+// integer and computed numeric values may have no source payload; use
+// [Cell.AppendJSON] to encode them.
 func (c Cell) Payload() []byte { return c.raw }
 
 // IsNull reports whether the cell is null or absent.
@@ -388,10 +398,10 @@ func (c Cell) TextBytes() ([]byte, bool) {
 }
 
 // JSON returns the cell as JSON bytes: the exact source bytes for a projected
-// value, or a newly formatted encoding for a computed numeric aggregate. The
-// projected slice must not be modified and borrows the Segment. Call
-// [Cell.AppendJSON] with retained storage when computed values must not
-// allocate.
+// value when available, or a formatted encoding for a native or computed
+// numeric value. The projected slice must not be modified and borrows the
+// Segment. Call [Cell.AppendJSON] with retained storage when the encoding must
+// not allocate.
 func (c Cell) JSON() []byte {
 	if c.raw != nil {
 		return c.raw
