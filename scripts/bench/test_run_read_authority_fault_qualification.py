@@ -14,6 +14,30 @@ SPEC.loader.exec_module(MODULE)
 
 
 class FaultQualificationProvenanceTest(unittest.TestCase):
+    def test_parse_utc_preserves_nanosecond_order_and_rfc3339_offsets(self):
+        first = MODULE._parse_utc(
+            "2026-09-05T19:18:50.123456789Z", "timestamp")
+        next_nanosecond = MODULE._parse_utc(
+            "2026-09-05T19:18:50.123456790Z", "timestamp")
+        self.assertIsInstance(first, int)
+        self.assertEqual(next_nanosecond - first, 1)
+        self.assertEqual(first, MODULE._parse_utc(
+            "2026-09-05T20:18:50.123456789+01:00", "timestamp"))
+        self.assertEqual(first, MODULE._parse_utc(
+            "2026-09-05T19:18:50.123456789+00:00", "timestamp"))
+        self.assertEqual(first, MODULE._parse_utc(
+            "2026-09-05T19:18:50.123456789Z", "timestamp"))
+        self.assertEqual(MODULE._parse_utc(
+            "2026-09-05T19:18:50Z", "timestamp"), MODULE._parse_utc(
+                "2026-09-05T19:18:50.000000000Z", "timestamp"))
+
+        with self.assertRaisesRegex(ValueError, "has invalid UTC"):
+            MODULE._parse_utc(
+                "2026-09-05T19:18:50.1234567890Z", "timestamp")
+        with self.assertRaisesRegex(ValueError, "has invalid UTC"):
+            MODULE._parse_utc(
+                "2026-09-05 19:18:50.123456789Z", "timestamp")
+
     def test_source_snapshot_preserves_porcelain_status_prefix(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"
@@ -220,7 +244,7 @@ class FaultQualificationProvenanceTest(unittest.TestCase):
                 nodes.append({
                     "node_id": f"{member:032x}",
                     "source": "rf3-diagnostics-file",
-                    "utc": "2026-09-05T18:00:00Z",
+                    "utc": "2026-09-05T18:00:00.000000001Z",
                     "serial": member,
                     "pid": 40 + member,
                     "authority_available": True,
@@ -238,7 +262,7 @@ class FaultQualificationProvenanceTest(unittest.TestCase):
             cycle = {
                 "schema": "vibedb.rf3-diagnostic/1",
                 "sequence": 7,
-                "utc": "2026-09-05T18:00:02Z",
+                "utc": "2026-09-05T18:00:02.000000001Z",
                 "expected_cuts": 21,
                 "valid_cuts": 21,
                 "preflight_ready": True,
@@ -246,9 +270,9 @@ class FaultQualificationProvenanceTest(unittest.TestCase):
                 "latch": {
                     "sequence": 7,
                     "complete": True,
-                    "requested_utc": "2026-09-05T18:00:00Z",
-                    "armed_utc": "2026-09-05T18:00:01Z",
-                    "captured_utc": "2026-09-05T18:00:03Z",
+                    "requested_utc": "2026-09-05T18:00:00.000000001Z",
+                    "armed_utc": "2026-09-05T18:00:01.000000001Z",
+                    "captured_utc": "2026-09-05T18:00:03.000000001Z",
                 },
             }
 
@@ -256,9 +280,9 @@ class FaultQualificationProvenanceTest(unittest.TestCase):
                 path.write_text(json.dumps({
                     "schema": "vibedb.rf3-diagnostic-latch/1",
                     "event": "post-cont",
-                    "requested_utc": "2026-09-05T18:00:00Z",
-                    "armed_utc": "2026-09-05T18:00:01Z",
-                    "captured_utc": "2026-09-05T18:00:03Z",
+                    "requested_utc": "2026-09-05T18:00:00.000000001Z",
+                    "armed_utc": "2026-09-05T18:00:01.000000001Z",
+                    "captured_utc": "2026-09-05T18:00:03.000000001Z",
                     "sequence": 7,
                     "cycle": cycle,
                 }))
@@ -268,6 +292,9 @@ class FaultQualificationProvenanceTest(unittest.TestCase):
                 path, post_pause_diagnostics=acknowledged)
             self.assertTrue(summary["complete"])
             self.assertEqual(summary["authority_snapshot_count"], 3)
+            self.assertEqual(
+                summary["authority_nodes"][0]["acknowledged_utc"],
+                "2026-09-05T18:00:00.000000001Z")
 
             nodes[1]["authority_available"] = False
             write_artifact()
@@ -279,7 +306,7 @@ class FaultQualificationProvenanceTest(unittest.TestCase):
             for field, value, message in (
                     ("serial", 1, "serial regressed"),
                     ("pid", 142, "PID differs"),
-                    ("utc", "2026-09-05T17:59:59Z", "timestamp regressed")):
+                    ("utc", "2026-09-05T18:00:00.000000000Z", "timestamp regressed")):
                 original = nodes[1][field]
                 nodes[1][field] = value
                 write_artifact()

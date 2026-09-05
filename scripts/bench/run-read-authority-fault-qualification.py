@@ -12,17 +12,19 @@ The qualification requires the explicit ``--laboratory-read-authority`` opt-in
 and builds every candidate executable with the labelled laboratory build tag.
 """
 
-from datetime import datetime, timezone
 import argparse
+import calendar
 import hashlib
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
 import threading
 import time
+from datetime import datetime, timezone
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -377,16 +379,52 @@ def write_group_timeline(path, output, table):
     }
 
 
+_RFC3339_NANO_RE = re.compile(
+    r"(?P<date>\d{4}-\d{2}-\d{2})T"
+    r"(?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})"
+    r"(?:\.(?P<fraction>\d{1,9}))?"
+    r"(?P<offset>Z|[+-]\d{2}:\d{2})$")
+
+
 def _parse_utc(value, name):
+    """Parse an RFC3339/RFC3339Nano instant to exact epoch nanoseconds.
+
+    ``datetime.fromisoformat`` on the supported Python versions accepts only
+    microseconds, while Go's ``time.RFC3339Nano`` emits one to nine fractional
+    digits.  Keep the comparison value as an integer so a one-nanosecond
+    ordering cannot be rounded away or changed by floating-point conversion.
+    """
     if not isinstance(value, str) or not value:
         raise ValueError(f"{name} is missing UTC")
+    match = _RFC3339_NANO_RE.fullmatch(value)
+    if match is None:
+        raise ValueError(f"{name} has invalid UTC")
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError as exc:
+        year, month, day = (int(part) for part in match.group("date").split("-"))
+        hour = int(match.group("hour"))
+        minute = int(match.group("minute"))
+        second = int(match.group("second"))
+        # Validate the civil time without converting through a platform
+        # timestamp, which may lose precision or have a limited year range.
+        datetime(year, month, day, hour, minute, second)
+        offset = match.group("offset")
+        if offset == "Z":
+            offset_seconds = 0
+        else:
+            offset_hour = int(offset[1:3])
+            offset_minute = int(offset[4:6])
+            if offset_hour > 23 or offset_minute > 59:
+                raise ValueError("timezone offset is out of range")
+            offset_seconds = offset_hour * 60 * 60 + offset_minute * 60
+            if offset[0] == "-":
+                offset_seconds = -offset_seconds
+        epoch_seconds = calendar.timegm(
+            (year, month, day, hour, minute, second)) - offset_seconds
+        fraction = match.group("fraction") or ""
+        fraction_nanoseconds = int(fraction.ljust(9, "0")) if fraction else 0
+    except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(f"{name} has invalid UTC") from exc
-    if parsed.tzinfo is None:
-        raise ValueError(f"{name} UTC has no timezone")
-    return parsed
+    return epoch_seconds * 1_000_000_000 + fraction_nanoseconds
 
 
 def _positive_int(value, name, minimum=1):
@@ -473,6 +511,7 @@ def validate_post_cont_latch(path, expected_nodes=3, post_pause_diagnostics=None
                 f"post-CONT controller handoff predates acknowledged node {node_id}")
         acknowledged[node_id] = {
             "serial": serial, "pid": pid, "utc": snapshot_utc,
+            "utc_text": snapshot["utc"],
         }
     nodes = cycle.get("node_metrics")
     if not isinstance(nodes, list) or len(nodes) != expected_nodes:
@@ -519,7 +558,7 @@ def validate_post_cont_latch(path, expected_nodes=3, post_pause_diagnostics=None
             "serial": serial,
             "pid": pid,
             "acknowledged_serial": acknowledged_snapshot["serial"],
-            "acknowledged_utc": acknowledged_snapshot["utc"].isoformat().replace("+00:00", "Z"),
+            "acknowledged_utc": acknowledged_snapshot["utc_text"],
         })
     return {
         "schema": value["schema"],
