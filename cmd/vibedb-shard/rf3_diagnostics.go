@@ -86,14 +86,21 @@ type rf3DiagnosticSnapshot struct {
 	RemoteIdle              int    `json:"remote_idle"`
 	RemoteWaiters           int    `json:"remote_waiters"`
 
-	RaftProposalBatches    uint64 `json:"raft_proposal_batches"`
-	RaftProposalCommands   uint64 `json:"raft_proposal_commands"`
-	RaftProposalBytes      uint64 `json:"raft_proposal_bytes"`
-	RaftApplyBatches       uint64 `json:"raft_apply_batches"`
-	RaftAppliedEntries     uint64 `json:"raft_applied_entries"`
-	RaftCommitAdvancements uint64 `json:"raft_commit_advancements"`
-	RaftCommittedEntries   uint64 `json:"raft_committed_entries"`
-	RaftReadyPersisted     uint64 `json:"raft_ready_persisted"`
+	RaftProposalBatches             uint64   `json:"raft_proposal_batches"`
+	RaftProposalCommands            uint64   `json:"raft_proposal_commands"`
+	RaftProposalBytes               uint64   `json:"raft_proposal_bytes"`
+	RaftApplyBatches                uint64   `json:"raft_apply_batches"`
+	RaftAppliedEntries              uint64   `json:"raft_applied_entries"`
+	RaftCommitAdvancements          uint64   `json:"raft_commit_advancements"`
+	RaftCommittedEntries            uint64   `json:"raft_committed_entries"`
+	RaftReadyPersisted              uint64   `json:"raft_ready_persisted"`
+	RaftProposalWindowQueued        uint64   `json:"raft_proposal_window_queued"`
+	RaftLateJoinUsed                uint64   `json:"raft_late_join_used"`
+	RaftLateJoinMissed              uint64   `json:"raft_late_join_missed"`
+	RaftLateJoinEntries             uint64   `json:"raft_late_join_entries"`
+	RaftProposalQueueDepthHistogram []uint64 `json:"raft_proposal_queue_depth_histogram"`
+	RaftProposalEntriesPerReady     []uint64 `json:"raft_proposal_entries_per_ready"`
+	RaftProposalBytesPerReady       []uint64 `json:"raft_proposal_bytes_per_ready"`
 
 	// Resource counters sum the currently open collection generations. Schema
 	// replacement or group retirement can reset them within one process, so
@@ -353,6 +360,13 @@ func applyRF3DiagnosticProgress(snapshot *rf3DiagnosticSnapshot, metrics raftser
 	snapshot.RaftCommitAdvancements = metrics.CommitAdvancements
 	snapshot.RaftCommittedEntries = metrics.CommittedEntries
 	snapshot.RaftReadyPersisted = metrics.ReadyPersisted
+	snapshot.RaftProposalWindowQueued = metrics.ProposalWindowQueued
+	snapshot.RaftLateJoinUsed = metrics.LateJoinUsed
+	snapshot.RaftLateJoinMissed = metrics.LateJoinMissed
+	snapshot.RaftLateJoinEntries = metrics.LateJoinEntries
+	copy(snapshot.RaftProposalQueueDepthHistogram, metrics.ProposalQueueDepthHistogram[:])
+	copy(snapshot.RaftProposalEntriesPerReady, metrics.ProposalEntriesPerReady[:])
+	copy(snapshot.RaftProposalBytesPerReady, metrics.ProposalBytesPerReady[:])
 }
 
 func applyRF3DiagnosticSequencer(snapshot *rf3DiagnosticSnapshot, stats raftstore.NodeSubmissionSequencerStats) {
@@ -423,10 +437,13 @@ func emitRF3DiagnosticSnapshotWithResources(
 ) {
 	snapshot := rf3DiagnosticSnapshot{
 		UTC: time.Now().UTC().Format(time.RFC3339Nano), Event: "snapshot", PID: os.Getpid(),
-		Groups:                len(manifest.groupBundles()),
-		ReadyWaveHistogram:    make([]uint64, raftstore.MaxPersistGroupBatches+1),
-		ReadySeriesHistogram:  make([]uint64, raftstore.MaxReadySeries+1),
-		ReadyDurableHistogram: make([]uint64, raftstore.MaxReadySeries+1),
+		Groups:                          len(manifest.groupBundles()),
+		ReadyWaveHistogram:              make([]uint64, raftstore.MaxPersistGroupBatches+1),
+		ReadySeriesHistogram:            make([]uint64, raftstore.MaxReadySeries+1),
+		ReadyDurableHistogram:           make([]uint64, raftstore.MaxReadySeries+1),
+		RaftProposalQueueDepthHistogram: make([]uint64, raftservice.ProposalEntryHistogramBuckets),
+		RaftProposalEntriesPerReady:     make([]uint64, raftservice.ProposalEntryHistogramBuckets),
+		RaftProposalBytesPerReady:       make([]uint64, raftservice.ProposalBytesHistogramBuckets),
 	}
 	resources := collectRF3DiagnosticResources(manifest, prepared, inventory, schemas)
 	// Production manifests always carry nonzero group identities. Preserve the

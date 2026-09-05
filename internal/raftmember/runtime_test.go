@@ -469,6 +469,43 @@ func TestRuntimeBatchesNormalProposalsIntoOneReady(t *testing.T) {
 	drainRuntime(t, fixture.runtime, nil)
 }
 
+func TestRuntimeNormalProposalWindowReportsRemainingCapacity(t *testing.T) {
+	fixture := newRuntimeFixture(t, 225, nil)
+	if open, entries, bytes := fixture.runtime.NormalProposalWindow(); open || entries != 0 || bytes != 0 {
+		t.Fatalf("idle proposal window = open %t entries %d bytes %d", open, entries, bytes)
+	}
+	drainRuntime(t, fixture.runtime, nil)
+	if err := fixture.runtime.Campaign(); err != nil {
+		t.Fatal(err)
+	}
+	drainRuntime(t, fixture.runtime, nil)
+
+	command := testApplySessionOpen(fixture.base)
+	if err := fixture.runtime.Propose(command); err != nil {
+		t.Fatal(err)
+	}
+	open, entries, bytes := fixture.runtime.NormalProposalWindow()
+	wantBytes := raftmodel.MaxProposalBatchBytes - int64(len(command))
+	if !open || entries != raftmodel.MaxProposalBatchEntries-1 || bytes != wantBytes {
+		t.Fatalf("open proposal window = open %t entries %d bytes %d, want %d/%d",
+			open, entries, bytes, raftmodel.MaxProposalBatchEntries-1, wantBytes)
+	}
+	fixture.runtime.proposalBatchEntries = raftmodel.MaxProposalBatchEntries
+	if open, entries, bytes = fixture.runtime.NormalProposalWindow(); open || entries != 0 || bytes != wantBytes {
+		t.Fatalf("entry-saturated proposal window = open %t entries %d bytes %d", open, entries, bytes)
+	}
+	fixture.runtime.proposalBatchEntries = 1
+	fixture.runtime.proposalBatchBytes = raftmodel.MaxProposalBatchBytes
+	if open, entries, bytes = fixture.runtime.NormalProposalWindow(); open || entries != raftmodel.MaxProposalBatchEntries-1 || bytes != 0 {
+		t.Fatalf("byte-saturated proposal window = open %t entries %d bytes %d", open, entries, bytes)
+	}
+	fixture.runtime.proposalBatchBytes = int64(len(command))
+	drainRuntime(t, fixture.runtime, nil)
+	if open, entries, bytes = fixture.runtime.NormalProposalWindow(); open || entries != 0 || bytes != 0 {
+		t.Fatalf("captured proposal window = open %t entries %d bytes %d", open, entries, bytes)
+	}
+}
+
 func TestRuntimeMultiEntryProposalAdmissionIsAllOrNone(t *testing.T) {
 	fixture := newRuntimeFixture(t, 224, nil)
 	drainRuntime(t, fixture.runtime, nil)

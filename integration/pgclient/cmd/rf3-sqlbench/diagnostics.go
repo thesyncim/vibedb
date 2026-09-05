@@ -32,9 +32,12 @@ type diagnosticRecord struct {
 }
 
 type diagnosticDelta struct {
-	NodeID    string            `json:"node_id"`
-	Counters  map[string]uint64 `json:"counters"`
-	Histogram []uint64          `json:"ready_wave_group_histogram"`
+	NodeID                      string            `json:"node_id"`
+	Counters                    map[string]uint64 `json:"counters"`
+	Histogram                   []uint64          `json:"ready_wave_group_histogram"`
+	ProposalQueueDepthHistogram []uint64          `json:"raft_proposal_queue_depth_histogram"`
+	ProposalEntriesPerReady     []uint64          `json:"raft_proposal_entries_per_ready"`
+	ProposalBytesPerReady       []uint64          `json:"raft_proposal_bytes_per_ready"`
 }
 
 type diagnosticBracket struct {
@@ -65,6 +68,7 @@ var diagnosticCounters = []string{
 	"remote_poisoned", "remote_rejected", "remote_handshake_failures",
 	"raft_proposal_batches", "raft_proposal_commands", "raft_proposal_bytes", "raft_apply_batches",
 	"raft_applied_entries", "raft_commit_advancements", "raft_committed_entries", "raft_ready_persisted",
+	"raft_proposal_window_queued", "raft_late_join_used", "raft_late_join_missed", "raft_late_join_entries",
 }
 
 func readBounded(path string) ([]byte, error) {
@@ -245,17 +249,33 @@ func diagnosticDeltas(before, after []diagnosticRecord) ([]diagnosticDelta, erro
 			}
 			delta.Counters[key] = high - low
 		}
-		var low, high []uint64
-		key := "ready_wave_group_histogram"
-		if json.Unmarshal(a[key], &low) != nil || json.Unmarshal(b[key], &high) != nil || len(low) != len(high) || len(low) < 2 {
-			return nil, fmt.Errorf("invalid diagnostic histogram")
-		}
-		delta.Histogram = make([]uint64, len(low))
-		for index := range low {
-			if high[index] < low[index] {
-				return nil, fmt.Errorf("diagnostic histogram decreased")
+		decodeHistogram := func(key string) ([]uint64, error) {
+			var low, high []uint64
+			if json.Unmarshal(a[key], &low) != nil || json.Unmarshal(b[key], &high) != nil ||
+				len(low) != len(high) || len(low) < 2 {
+				return nil, fmt.Errorf("invalid diagnostic histogram %s", key)
 			}
-			delta.Histogram[index] = high[index] - low[index]
+			delta := make([]uint64, len(low))
+			for index := range low {
+				if high[index] < low[index] {
+					return nil, fmt.Errorf("diagnostic histogram decreased")
+				}
+				delta[index] = high[index] - low[index]
+			}
+			return delta, nil
+		}
+		var err error
+		if delta.Histogram, err = decodeHistogram("ready_wave_group_histogram"); err != nil {
+			return nil, err
+		}
+		if delta.ProposalQueueDepthHistogram, err = decodeHistogram("raft_proposal_queue_depth_histogram"); err != nil {
+			return nil, err
+		}
+		if delta.ProposalEntriesPerReady, err = decodeHistogram("raft_proposal_entries_per_ready"); err != nil {
+			return nil, err
+		}
+		if delta.ProposalBytesPerReady, err = decodeHistogram("raft_proposal_bytes_per_ready"); err != nil {
+			return nil, err
 		}
 		deltas = append(deltas, delta)
 	}

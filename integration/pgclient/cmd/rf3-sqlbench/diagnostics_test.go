@@ -13,7 +13,10 @@ import (
 func diagnosticFixture(t *testing.T, node string, pid int, serial, count uint64) []byte {
 	t.Helper()
 	value := map[string]any{"node_id": node, "pid": pid, "serial": serial, "utc": "2026-09-04T00:00:00Z", "event": "snapshot",
-		"ready_wave_group_histogram": []uint64{0, count}, "native_active": 0}
+		"ready_wave_group_histogram":          []uint64{0, count},
+		"raft_proposal_queue_depth_histogram": []uint64{0, count},
+		"raft_proposal_entries_per_ready":     []uint64{0, count},
+		"raft_proposal_bytes_per_ready":       []uint64{0, count}, "native_active": 0}
 	for _, key := range diagnosticCounters {
 		value[key] = count
 	}
