@@ -78,3 +78,61 @@ network scaling, peak per-query CPU/RSS, failure recovery, or a CockroachDB
 performance ratio. Do not publish a performance claim from this plan until the
 retained manifests, reports, oracle checks, durability/topology evidence and
 both orderings have been independently reviewed.
+
+## GREEN-main checkpoint sequencing
+
+This is a separate baseline-to-current-main checkpoint. Freeze `M` at
+`5160e0f6c8dc5b252e5c5ff75984bdd6fe49db02` and `G` at
+`a2ac5fd8d052d42046dd4c3ee9f5502dc1e48eed`; both arms keep read authority
+disabled. It is not the final-production `S` assessment and does not measure
+the read-authority gain. Use the same clean immutable client checkout at
+`150912cfbe250dcf16fd4bcfdfea52e13027ed48` for every invocation:
+
+```bash
+cd /private/tmp/vibedb-horizontal
+
+REPO=/private/tmp/vibedb-horizontal
+CLIENT_SOURCE=/private/tmp/vibedb-green-main-prep/client-harness-150912cf
+M=5160e0f6c8dc5b252e5c5ff75984bdd6fe49db02
+G=a2ac5fd8d052d42046dd4c3ee9f5502dc1e48eed
+POINT_WORKLOADS=point_hit,point_miss
+REMAINING_WORKLOADS=range_32,range_64,range_256,group_16,update_existing,mixed_read_update,mixed_uniform
+
+run_checkpoint() {
+  output="$1"
+  nodes="$2"
+  workloads="$3"
+  python3 scripts/bench/run-distributed-read-comparison.py "$output" \
+    --repo "$REPO" --client-source "$CLIENT_SOURCE" \
+    --baseline-ref "$M" --candidate-ref "$G" \
+    --workloads "$workloads" --clients 1,8 --groups 16 \
+    --physical-nodes "$nodes" --rows 8192 --operations 20000 \
+    --scans 2000 --warmup 1000 --repetitions 3 \
+    --cpus 12 --memory 24g --ready-timeout 120
+}
+
+# Run serially, only after root releases the timed window. Points are first so
+# the priority point_hit/point_miss cells complete without duplicate trials.
+run_checkpoint /private/tmp/vibedb-green-main-assessment-points-3n 3 "$POINT_WORKLOADS"
+run_checkpoint /private/tmp/vibedb-green-main-assessment-points-6n 6 "$POINT_WORKLOADS"
+run_checkpoint /private/tmp/vibedb-green-main-assessment-remaining-3n 3 "$REMAINING_WORKLOADS"
+run_checkpoint /private/tmp/vibedb-green-main-assessment-remaining-6n 6 "$REMAINING_WORKLOADS"
+```
+
+Each invocation covers C1/C8, 16 logical groups, three repetitions and both
+matched orders, with fresh fixtures and volumes for the VibeDB and CockroachDB
+arms. The runner keeps strict oracle, durability, topology and readiness
+validation; retain every failed or incomplete cell and exclude it from any
+performance summary. The known pre-fault mixed-read/update liveness failure
+and prior diagnostic authentication/protocol sampling errors remain part of
+the qualification record; a longer wait must not silently turn either into a
+pass. The point-only pair is expected to take about 10–20 minutes total; the
+remaining seven-workload N3/N6 pair is expected to take roughly 2–4 hours on
+the fixed host, depending on setup and retained failures.
+
+This is a fixed-resource single-host checkpoint: N3 and N6 are process counts
+sharing one Docker host, a 12-CPU/24-GiB ceiling and one loopback SQL frontend.
+It is a checkpoint result rather than independent-machine scaling or a
+read-authority/CRDB comparison. Do not publish a performance claim until all
+four output manifests and reports, both orderings, oracle/durability evidence,
+and retained diagnostics have been reviewed.
