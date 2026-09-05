@@ -5,6 +5,7 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/raftstore/seglog"
 	"go.etcd.io/raft/v3"
+	pb "go.etcd.io/raft/v3/raftpb"
 )
 
 // nodeLogCoordinates is a serving copy of durable metadata. It is published
@@ -13,7 +14,11 @@ import (
 // must never take the device mutex held across that wave's disk I/O.
 const nodeRecentTerms = 64
 
-type nodeTermCoordinate struct{ index, term uint64 }
+type nodeTermCoordinate struct {
+	index, term, payloadGeneration uint64
+	payloadBytes                   uint32
+	kind                           pb.EntryType
+}
 type nodeLogCoordinates struct {
 	first, last, commit, baseTerm uint64
 	terms                         *[nodeRecentTerms]nodeTermCoordinate
@@ -31,7 +36,7 @@ func (s *NodeStore) poisonLocked(err error) {
 // publishCoordinatesLocked requires mu. The separate lock is held only for the
 // in-memory publication, never for log writes, syncs, checkpoint I/O, or readers.
 // Only warmed groups need updates, keeping publication proportional to the wave.
-func (s *NodeStore) publishCoordinatesLocked(group uint64, batch *seglog.ReadyBatch) {
+func (s *NodeStore) publishCoordinatesLocked(group uint64, batch *seglog.ReadyBatch, payloads *[nodeRecentTerms]nodeTermCoordinate) {
 	if s.coordinates == nil {
 		return
 	}
@@ -55,12 +60,18 @@ func (s *NodeStore) publishCoordinatesLocked(group uint64, batch *seglog.ReadyBa
 				}
 			}
 		}
-		entries := batch.Entries
-		if len(entries) > nodeRecentTerms {
-			entries = entries[len(entries)-nodeRecentTerms:]
-		}
-		for _, entry := range entries {
-			cut.terms[entry.Index%nodeRecentTerms] = nodeTermCoordinate{entry.Index, entry.Term}
+		for index, entry := range batch.Entries {
+			if index < len(batch.Entries)-nodeRecentTerms {
+				continue
+			}
+			term := nodeTermCoordinate{index: entry.Index, term: entry.Term, kind: entry.Type}
+			if payloads != nil {
+				prepared := payloads[entry.Index%nodeRecentTerms]
+				if prepared.index == entry.Index && prepared.term == entry.Term {
+					term = prepared
+				}
+			}
+			cut.terms[entry.Index%nodeRecentTerms] = term
 		}
 	}
 	s.coordinates[group] = cut
@@ -91,11 +102,12 @@ func (v *GroupView) logCoordinates() (nodeLogCoordinates, error) {
 	}
 	cut = coordinatesFromMetadata(state, new([nodeRecentTerms]nodeTermCoordinate))
 	if _, term, compacted, found, err := s.engine.LookupExact(v.group, state.LastIndex); err == nil && found && !compacted {
-		cut.terms[state.LastIndex%nodeRecentTerms] = nodeTermCoordinate{state.LastIndex, term}
+		cut.terms[state.LastIndex%nodeRecentTerms] = nodeTermCoordinate{index: state.LastIndex, term: term}
 	}
 	s.coordinateMu.Lock()
 	if s.coordinates == nil {
 		s.coordinates = make(map[uint64]nodeLogCoordinates)
+		s.entryCacheArena = make([]byte, nodeEntryCacheSlots*nodeEntryCacheSlotBytes)
 	}
 	s.coordinates[v.group] = cut
 	s.coordinateMu.Unlock()

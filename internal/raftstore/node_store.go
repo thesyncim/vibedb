@@ -115,6 +115,10 @@ const (
 )
 
 type NodeStore struct {
+	pendingEntryPayloads                      [MaxPersistGroupBatches][nodeRecentTerms]nodeTermCoordinate
+	entryCacheArena                           []byte
+	entryCacheGenerations                     [nodeEntryCacheSlots]uint64
+	entryCacheGeneration                      uint64
 	coordinateMu                              sync.RWMutex
 	coordinates                               map[uint64]nodeLogCoordinates
 	coordinateFailure                         atomic.Pointer[nodeCoordinateFailure]
@@ -803,7 +807,7 @@ func (s *NodeStore) publishGroupCheckpointSequenced(group uint64, snapshot *pb.S
 		s.poisonLocked(err)
 		return errors.Join(ErrPersistenceUnknown, err)
 	}
-	s.publishCoordinatesLocked(group, nil)
+	s.publishCoordinatesLocked(group, nil, nil)
 	s.cacheValid = false
 	return nil
 }
@@ -1248,6 +1252,7 @@ func (s *NodeStore) persistWave(ready []NodeReady, sequenced bool) error {
 	if err := s.packWaveExtents(id, mappedCount); err != nil {
 		return err
 	}
+	s.stageEntryPayloadsLocked(mappedCount)
 	wave := seglog.Wave{ID: id, Batches: s.waveBatches[:mappedCount], Blob: s.cipherArena}
 	var persistErr error
 	if s.persistWaveTest != nil {
@@ -1271,8 +1276,9 @@ func (s *NodeStore) persistWave(ready []NodeReady, sequenced bool) error {
 	}
 	for index := 0; index < mappedCount; index++ {
 		batch := &s.waveBatches[index]
-		s.publishCoordinatesLocked(batch.GroupID, batch)
+		s.publishCoordinatesLocked(batch.GroupID, batch, &s.pendingEntryPayloads[index])
 	}
+
 	s.cacheValid = false
 	return nil
 }
@@ -1644,8 +1650,8 @@ func (s *NodeStore) registerGroupLocked(descriptor GroupDescriptor, snapshot *pb
 	copy(s.descriptorOrder[position+1:], s.descriptorOrder[position:len(s.descriptorOrder)-1])
 	s.descriptorOrder[position] = uint32(len(s.descriptors) - 1)
 	s.nextLogKey++
-	s.publishCoordinatesLocked(nodeDescriptorGroup, nil)
-	s.publishCoordinatesLocked(descriptor.LogKey, nil)
+	s.publishCoordinatesLocked(nodeDescriptorGroup, nil, nil)
+	s.publishCoordinatesLocked(descriptor.LogKey, nil, nil)
 	return GroupIncarnation{GroupID: descriptor.LogKey, Incarnation: 1}, nil
 }
 
@@ -1973,6 +1979,9 @@ func (v *GroupView) Snapshot() (*pb.Snapshot, error) {
 	return v.store.loadCheckpoint(v.group, state.Checkpoint)
 }
 func (v *GroupView) Entries(lo, hi, maxSize uint64) ([]*pb.Entry, error) {
+	if entries, found, err := v.cachedEntries(lo, hi, maxSize); found {
+		return entries, err
+	}
 	v.store.mu.Lock()
 	defer v.store.mu.Unlock()
 	if err := v.store.usable(); err != nil {

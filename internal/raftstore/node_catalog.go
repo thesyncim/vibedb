@@ -373,7 +373,7 @@ func (s *NodeStore) publishDescriptorCatalogReferenceLocked(candidate descriptor
 		s.poisonLocked(err)
 		return errors.Join(ErrPersistenceUnknown, err)
 	}
-	s.publishCoordinatesLocked(nodeDescriptorGroup, nil)
+	s.publishCoordinatesLocked(nodeDescriptorGroup, nil, nil)
 	return nil
 }
 
