@@ -20,7 +20,7 @@ const deterministicApplySemantics = "vibejson-strict;last-mutation-per-key-wins;
 	"validate-final-against-snapshot;delete-absent-and-put-equal-are-noops;" +
 	"strict-put-absent-conflict;put-present-missing-zero-rows;" +
 	"json-put-if-absent-validates-candidate-before-existing-zero-row-noop;" +
-	"json-conflict-vuc1-validates-candidate-and-direct-program-before-branch;bound-scalars-and-excluded-columns;canonical-current-row-patch;duplicate-conflict-key-invalid;" +
+	"json-conflict-vuc2-validates-candidate-template-bindings-before-branch;shared-scalar-current-excluded-simultaneous-lazy-rhs;template-nodes16384-depth128-assignments1024-params1024-work16MiB;canonical-current-row-patch;duplicate-conflict-key-invalid;" +
 	"json-relation-affected-rows;global-index-results-excluded;fixed-mutation-result-int64;" +
 	"mutation-validation-result-map;bytewise-changed-key-order;" +
 	"ordered-client-session-sequences;authority-class-bound-session-identity;" +

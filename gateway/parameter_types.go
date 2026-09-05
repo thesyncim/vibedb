@@ -222,15 +222,9 @@ func validateTypedQuery(ctx context.Context, candidate *Query) error {
 			)
 		}
 	}
-	// Distributed ON CONFLICT DO UPDATE is rejected by the catalog-pinned
-	// write planner before binding or dispatch. Do not send its deliberately
-	// unresolved bare-column namespace through query's catalog-free lowering:
-	// the live catalog is what distinguishes an undefined bare name from one
-	// ambiguous between the target row and EXCLUDED. Transport, placeholder
-	// arity, declared parameter types, and whole-document roles were all checked
-	// above; the catalog-pinned distributed feature gate remains authoritative
-	// before binding or dispatch. DO NOTHING has no conflict expression and
-	// continues through ordinary typed DML analysis below.
+	// Conflict columns require the live catalog to diagnose ambiguous bare
+	// names. Replicated mutation planning compiles and validates typed bindings
+	// immediately after catalog preparation, before routing or dispatch.
 	if parsed.Kind == sqlast.KindInsert && parsed.Insert != nil &&
 		parsed.Insert.OnConflictUpdate != nil {
 		return nil

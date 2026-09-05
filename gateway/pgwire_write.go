@@ -60,7 +60,7 @@ func (s *postgresSession) prepareWrite(
 	var compiled *query.DMLStatement
 	var resolvedParameterTypes []driver.ParamType
 	if len(parameterTypes) != 0 || postgresDMLNeedsParameterTypeAnalysis(parsed) ||
-		hasComputedUpdateAssignments(parsed) {
+		hasComputedUpdateAssignments(parsed) || hasComputedConflictAssignments(parsed) {
 		var err error
 		compiled, err = query.PrepareParsedDMLWithParameterTypes(
 			text, parsed, parameterTypes,

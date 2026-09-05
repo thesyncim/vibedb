@@ -182,6 +182,22 @@ active BOOLEAN NOT NULL
 		}
 	}
 	checkColumnUpsert(connection)
+
+	computed := ddlWireQuery(t, connection, `INSERT INTO employees (id,name,team,city,score,active) VALUES ('employee-0007','Candidate','Changed',NULL,3,false) ON CONFLICT (id) DO UPDATE SET score=employees.score+EXCLUDED.score,name=employees.name||':'||CAST(employees.score AS TEXT),city=COALESCE(EXCLUDED.city,employees.city)`, true)
+	if computed.code != "" || computed.tag != "INSERT 0 1" {
+		t.Fatalf("computed conflict: %+v", computed)
+	}
+	rejected := ddlWireQuery(t, connection, `INSERT INTO employees (id,name,team,city,score,active) VALUES ('employee-0007','Candidate','Changed',NULL,0,false) ON CONFLICT DO UPDATE SET score=employees.score/EXCLUDED.score`, true)
+	if rejected.code == "" {
+		t.Fatal("zero divisor committed")
+	}
+	checkComputedConflict := func(connection net.Conn) {
+		result := ddlWireQuery(t, connection, `SELECT name,score,city FROM employees WHERE id='employee-0007'`, true)
+		if result.code != "" || len(result.rows) != 1 || strings.Join(result.rows[0], "|") != `"Employee 7:7"|10|"Lisbon"` {
+			t.Fatalf("computed conflict persistence: %+v", result)
+		}
+	}
+	checkComputedConflict(connection)
 	for _, mutation := range []struct{ sql, tag string }{
 		{`UPDATE employees SET score=505 WHERE id IS NOT DISTINCT FROM 'employee-0005'`, "UPDATE 1"},
 		{`DELETE FROM employees WHERE id IS NOT DISTINCT FROM 'employee-0006'`, "DELETE 1"},
@@ -216,6 +232,7 @@ active BOOLEAN NOT NULL
 	check(connection)
 	checkReplacement(connection)
 	checkColumnUpsert(connection)
+	checkComputedConflict(connection)
 	checkNullSafeUpdate(connection)
 }
 

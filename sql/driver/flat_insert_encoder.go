@@ -20,7 +20,11 @@ func PrepareFlatInsertEncoder(insert *sqlast.InsertStmt) (*FlatInsertEncoder, er
 	if insert == nil || len(insert.Columns) == 0 || insert.Source != nil {
 		return nil, errors.New("vibedb: expected flat INSERT VALUES")
 	}
-	dml, err := query.PrepareParsedDML("", &sqlast.Statement{Kind: sqlast.KindInsert, Insert: insert})
+	// Field layout does not execute the conflict action. Its planner owns
+	// expression validation, so avoid compiling that projection a second time.
+	layout := *insert
+	layout.OnConflictUpdate = nil
+	dml, err := query.PrepareParsedDML("", &sqlast.Statement{Kind: sqlast.KindInsert, Insert: &layout})
 	if err != nil {
 		return nil, err
 	}
