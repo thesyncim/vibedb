@@ -35,6 +35,11 @@ on:
       - 'internal/rf3testfixture/**'
       - 'sql/**'
   workflow_dispatch:
+    inputs:
+      space_base:
+        description: 'Optional Git base for nine paired node-space performance trials'
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -47,6 +52,56 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  node-space-performance:
+    if: github.event_name == 'workflow_dispatch' && inputs.space_base != ''
+    name: Paired RF3 node-space performance
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.27'
+      - name: Build identical workload against both revisions
+        shell: bash
+        env:
+          SPACE_BASE: ${{ inputs.space_base }}
+        run: |
+          set -euo pipefail
+          base="$(git rev-parse --verify "${SPACE_BASE}^{commit}")"
+          mkdir -p "${RUNNER_TEMP}/node-space-build" "${RUNNER_TEMP}/node-space-perf-tmp"
+          git rev-parse HEAD > "${RUNNER_TEMP}/node-space-build/candidate-revision.txt"
+          printf '%s\n' "${base}" > "${RUNNER_TEMP}/node-space-build/base-revision.txt"
+          go version > "${RUNNER_TEMP}/node-space-build/go-version.txt"
+          df -T -B1 "${RUNNER_TEMP}" > "${RUNNER_TEMP}/node-space-build/filesystem.txt"
+          lscpu > "${RUNNER_TEMP}/node-space-build/cpu.txt"
+          go test -c -o "${RUNNER_TEMP}/node-space-build/candidate.test" ./cmd/vibedb-shard
+          git worktree add --detach "${RUNNER_TEMP}/node-space-base" "${base}"
+          cp cmd/vibedb-shard/node_space_process_qualification_test.go \
+            "${RUNNER_TEMP}/node-space-base/cmd/vibedb-shard/"
+          cd "${RUNNER_TEMP}/node-space-base"
+          go test -c -o "${RUNNER_TEMP}/node-space-build/base.test" ./cmd/vibedb-shard
+      - name: Run nine alternating paired trials
+        shell: bash
+        env:
+          TMPDIR: ${{ runner.temp }}/node-space-perf-tmp
+        run: |
+          set -euo pipefail
+          python3 scripts/bench/run-node-space-comparison.py \
+            --base-binary "${RUNNER_TEMP}/node-space-build/base.test" \
+            --candidate-binary "${RUNNER_TEMP}/node-space-build/candidate.test" \
+            --output "${RUNNER_TEMP}/node-space-comparison"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: node-space-comparison-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/node-space-comparison
+            ${{ runner.temp }}/node-space-build/*.txt
+          if-no-files-found: error
+          retention-days: 30
   node-space:
     name: Ubuntu RF3 node history reclamation
     runs-on: ubuntu-latest
