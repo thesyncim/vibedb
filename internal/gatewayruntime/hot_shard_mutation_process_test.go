@@ -514,6 +514,14 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	if final == nil || maximumOperations > 1 {
+		if ids, readErr := catalogAuthority.ReadOperationIDs(ctx); readErr == nil {
+			for _, id := range ids {
+				operation, operationErr := catalogAuthority.ReadOperation(ctx, id)
+				t.Logf("incomplete move state=%d revision=%d catalog=%d cursor=%v execution-revision=%d settled=%t err=%v",
+					operation.State, operation.Revision, operation.CatalogGeneration, operation.Cursor,
+					operation.ExecutionRevision, operation.ExecutionSettled, operationErr)
+			}
+		}
 		t.Fatalf("automatic write-driven move incomplete operations=%d\n%s",
 			maximumOperations, gatewayProcess.Diagnostics())
 	}
