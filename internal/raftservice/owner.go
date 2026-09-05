@@ -232,6 +232,8 @@ type readAuthorization struct {
 type readDelivery struct {
 	state          atomic.Uint32
 	reply          chan ownerReply
+	context        [16]byte
+	contextSet     bool
 	serving        ServingState
 	source         ReadSource
 	recovery       TransactionRecoverySource
@@ -960,6 +962,12 @@ func (collector *proposalIngressCollector) drain(
 				collector.append(next)
 			case next.kind == requestInbound || readIngressCandidate(next):
 				if err := handleIndependent(next); err != nil {
+					if errors.Is(err, errOwnerReadDeferred) {
+						// The callback deliberately retained this exact read and
+						// its ingress charge. Return it as the ordering barrier so
+						// the owner can retry it after flushing the collected prefix.
+						return next, true, err
+					}
 					return ownerRequest{}, false, err
 				}
 			default:
@@ -978,6 +986,8 @@ func (collector *proposalIngressCollector) reset() {
 	collector.group = raftmember.GroupKey{}
 	collector.bytes = 0
 }
+
+var errOwnerReadDeferred = errors.New("raftservice: read deferred behind Ready")
 
 // Run becomes the sole Host owner until ctx is canceled or a terminal lane
 // failure occurs. It may be called exactly once.
@@ -999,6 +1009,8 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 
 	var pending raftmember.OutboundMessage
 	readyBlocked := false
+	var deferredRead ownerRequest
+	deferredReadPending := false
 	collector := newProposalIngressCollector(owner.limits.MaxIngressItems)
 	var asyncNotify <-chan struct{}
 	var asyncHost asyncOwnerHost
@@ -1008,6 +1020,12 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 	}
 	handleRequest := func(request ownerRequest) error {
 		err := owner.handle(request)
+		if errors.Is(err, errOwnerReadDeferred) {
+			// ReadIndex is direct protocol input and cannot cross an uncaptured
+			// Ready boundary. Keep the exact request, delivery, and ingress charge
+			// alive; the event loop retries it after draining the Host.
+			return err
+		}
 		owner.release(request.bytes)
 		if request.async && err != nil {
 			return err
@@ -1035,9 +1053,33 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 		collector.reset()
 		return nil
 	}
+	offerTicks := func() error {
+		for _, group := range owner.groups {
+			switch err := owner.host.RequestTick(group); err {
+			case nil:
+			case multiraft.ErrQueueFull, multiraft.ErrGroupBusy:
+				// A pulse is an offer. Existing admitted work remains owned by
+				// Host, and a later pulse may offer another tick.
+			default:
+				return err
+			}
+		}
+		return nil
+	}
 	defer func() {
 		if collector.active() {
 			failCollected(errors.Join(ErrOwnerClosed, runErr))
+		}
+		if deferredReadPending {
+			reply := ownerReply{err: errors.Join(ErrOwnerClosed, runErr)}
+			if deferredRead.read.delivery != nil {
+				owner.settleReadDelivery(deferredRead.read.delivery, reply)
+			} else {
+				deferredRead.reply <- reply
+			}
+			owner.release(deferredRead.bytes)
+			deferredRead = ownerRequest{}
+			deferredReadPending = false
 		}
 	}()
 	for {
@@ -1107,31 +1149,92 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 			}
 		}
 
+		if deferredReadPending {
+			if !readyBlocked {
+				err := handleRequest(deferredRead)
+				if !errors.Is(err, errOwnerReadDeferred) {
+					deferredRead = ownerRequest{}
+					deferredReadPending = false
+					if err != nil {
+						return owner.stop(err)
+					}
+					continue
+				}
+			}
+			// A failed Ready attempt or a refusal after the idle probe requires a
+			// new asynchronous/pulse edge. Wait instead of polling ReadIndex or
+			// admitting newer ingress past this request.
+			select {
+			case <-ctx.Done():
+				return owner.stop(context.Cause(ctx))
+			case _, ok := <-asyncNotify:
+				if !ok {
+					asyncNotify = nil
+					asyncHost = nil
+					continue
+				}
+				readyBlocked = false
+				asyncHost.WakePipelined()
+			case _, ok := <-owner.pulse:
+				readyBlocked = false
+				if !ok {
+					owner.pulse = nil
+					continue
+				}
+				if err := offerTicks(); err != nil {
+					return owner.stop(err)
+				}
+			}
+			continue
+		}
+
 		select {
 		case <-ctx.Done():
 			return owner.stop(context.Cause(ctx))
-		case <-asyncNotify:
+		case _, ok := <-asyncNotify:
+			if !ok {
+				asyncNotify = nil
+				asyncHost = nil
+				continue
+			}
 			readyBlocked = false
 			asyncHost.WakePipelined()
 		case request := <-owner.ingress:
 			readyBlocked = false
 			if !proposalIngressCandidate(request) {
 				if err := handleRequest(request); err != nil {
+					if errors.Is(err, errOwnerReadDeferred) {
+						deferredRead, deferredReadPending = request, true
+						continue
+					}
 					return owner.stop(err)
 				}
 				continue
 			}
 			collector.start(request)
 			barrier, barrierPresent, drainErr := collector.drain(owner.ingress, handleRequest)
-			if drainErr != nil {
+			if drainErr != nil && !errors.Is(drainErr, errOwnerReadDeferred) {
 				failCollected(errors.Join(ErrOwnerClosed, drainErr))
 				return owner.stop(drainErr)
+			}
+			if errors.Is(drainErr, errOwnerReadDeferred) {
+				// drain removed this read from ingress. Record its ownership before
+				// flushing the earlier proposal prefix so every terminal exit can
+				// settle its delivery and release its ingress charge exactly once.
+				deferredRead, deferredReadPending = barrier, true
 			}
 			if err := flushCollected(); err != nil {
 				return owner.stop(err)
 			}
+			if deferredReadPending {
+				continue
+			}
 			if barrierPresent {
 				if err := handleRequest(barrier); err != nil {
+					if errors.Is(err, errOwnerReadDeferred) {
+						deferredRead, deferredReadPending = barrier, true
+						continue
+					}
 					return owner.stop(err)
 				}
 			}
@@ -1141,19 +1244,8 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 				owner.pulse = nil
 				continue
 			}
-			for _, group := range owner.groups {
-				switch err := owner.host.RequestTick(group); err {
-				case nil:
-				case multiraft.ErrQueueFull, multiraft.ErrGroupBusy:
-					// A timer pulse is an offer, not an admitted protocol input.
-					// Like the bounded upstream pulse channels, omit this offer
-					// when full or intentionally quiesced/retiring. Never accrue
-					// catch-up debt or discard a tick/message already in Host.
-					// Match exact sentinels: a group fault wrapping either error
-					// remains fatal, as do missing groups and closed runtimes.
-				default:
-					return owner.stop(err)
-				}
+			if err := offerTicks(); err != nil {
+				return owner.stop(err)
 			}
 		}
 	}
@@ -1457,16 +1549,28 @@ func (owner *Owner) handle(request ownerRequest) error {
 		request.read.delivery.minimumApplied = request.read.minimumApplied
 		request.read.delivery.generation = member.generation
 		request.read.delivery.serving = serving
-		context, contextErr := owner.nextReadContext(member.identity.NodeIncarnation)
-		if contextErr != nil {
-			reply.err = contextErr
-			break
+		delivery := request.read.delivery
+		if !delivery.contextSet {
+			context, contextErr := owner.nextReadContext(member.identity.NodeIncarnation)
+			if contextErr != nil {
+				reply.err = contextErr
+				break
+			}
+			delivery.context = context
+			delivery.contextSet = true
 		}
-		if err := owner.host.ReadIndex(request.group, context[:]); err != nil {
+		if err := owner.host.ReadIndex(request.group, delivery.context[:]); err != nil {
+			if errors.Is(err, raftmodel.ErrReadyPending) {
+				// The event loop retains this exact request until the Host has
+				// drained the pending Ready. Returning here deliberately bypasses
+				// settlement; replying would turn ordinary async persistence into
+				// a spurious user-visible availability failure.
+				return errors.Join(errOwnerReadDeferred, err)
+			}
 			reply.err = err
 			break
 		}
-		owner.pendingReads[context] = request.read.delivery
+		owner.pendingReads[delivery.context] = delivery
 		// The reply is settled only by the matching quorum barrier.
 		return nil
 	default:
