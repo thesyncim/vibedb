@@ -142,15 +142,15 @@ func (registry *StaticRegistry) preflightOutbound(
 		return outboundFramePlan{}, classifyOrdinaryError(err)
 	}
 	version := view.version
-	// The target can still be a learner after the leader commits promotion:
+	// A peer can still use the previous membership after an additive change:
 	// either its configuration append or the commit notification may have
 	// been lost during reconnect. A heartbeat tagged with the new generation
 	// is then rejected before Raft can answer and trigger append retry. Use
-	// the retained, already-authorized learner view for this exchange. This
-	// never grants voting rights, and committed removal disables the prior view.
+	// the retained, already-authorized view where both roles permit heartbeats.
+	// This never grants voting rights, and removal disables the prior view.
 	if outbound.Message.GetType() == pb.MsgHeartbeat && view.allowPrevious &&
-		view.previous != nil && view.roles[outbound.To] == MemberVoter &&
-		view.previous.roles[outbound.To] == MemberLearner &&
+		view.previous != nil &&
+		(view.previous.roles[outbound.To] == MemberVoter || view.previous.roles[outbound.To] == MemberLearner) &&
 		view.previous.roles[outbound.From] == MemberVoter {
 		view = view.previous
 		version = view.version

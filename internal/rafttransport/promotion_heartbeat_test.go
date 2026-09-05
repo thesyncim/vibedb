@@ -7,6 +7,49 @@ import (
 	pb "go.etcd.io/raft/v3/raftpb"
 )
 
+func TestAdditiveMembershipHeartbeatReachesLaggingVoter(t *testing.T) {
+	group := testGroup(34)
+	members := []Member{
+		{Group: group, ReplicaSetVersion: 5, MemberID: 1, Node: testNode(1), Role: MemberVoter},
+		{Group: group, ReplicaSetVersion: 5, MemberID: 2, Node: testNode(2), Role: MemberVoter},
+		{Group: group, ReplicaSetVersion: 5, MemberID: 3, Node: testNode(3), Role: MemberEnrolled},
+		{Group: group, ReplicaSetVersion: 5, MemberID: 4, Node: testNode(4), Role: MemberVoter},
+	}
+	open := func(local NodeID) *StaticRegistry {
+		registry, err := NewStaticRegistry(local, members, Limits{MaxGroups: 1, MaxMembers: 4})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := registry.InstallTransitionGrant(authorityTestGrant(group)); err != nil {
+			t.Fatal(err)
+		}
+		return registry
+	}
+	leader, follower := open(testNode(1)), open(testNode(2))
+	for _, change := range []struct {
+		version uint64
+		conf    *pb.ConfState
+	}{
+		{6, &pb.ConfState{Voters: []uint64{1, 2, 4}, Learners: []uint64{3}}},
+		{8, &pb.ConfState{Voters: []uint64{1, 2, 3, 4}}},
+	} {
+		if err := leader.PublishCommittedAuthority(group, change.version, change.conf); err != nil {
+			t.Fatal(err)
+		}
+		heartbeat := frameTestEncode(t, leader, group, frameTestMessage(pb.MsgHeartbeat, 1, 2))
+		if _, err := follower.DecodeInbound(testPeerIdentity(follower, testNode(1)), heartbeat); err != nil {
+			t.Fatalf("existing voter cannot catch up to membership %d: %v", change.version, err)
+		}
+		response := frameTestEncode(t, follower, group, frameTestMessage(pb.MsgHeartbeatResp, 2, 1))
+		if _, err := leader.DecodeInbound(testPeerIdentity(leader, testNode(2)), response); err != nil {
+			t.Fatalf("leader rejected catch-up response: %v", err)
+		}
+		if err := follower.PublishCommittedAuthority(group, change.version, change.conf); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestPromotionHeartbeatReachesLearnerAfterLostAppendOrCommit(t *testing.T) {
 	group := testGroup(34)
 	members := []Member{

@@ -31,7 +31,7 @@ jobs:
       - name: Verify portable sidecar recovery and strict-mode separation
         run: go test -count=1 ./internal/storeio ./store/durable ./sql/driver -run 'TestPortable|TestSealed|TestReplicatedShardStorePortableSealedBind'
       - name: Verify ownership retries, core admission, and promotion catch-up
-        run: go test -count=1 ./internal/multiraft ./internal/raftservice ./internal/rafttransport -run 'TestHostControlProposalReturnsCoreAdmission|TestReplicaActionFencesOwnershipAndRetirementExactly|TestPromotionHeartbeatReachesLearnerAfterLostAppendOrCommit'
+        run: go test -count=1 ./internal/multiraft ./internal/raftservice ./internal/rafttransport -run 'TestHostControlProposalReturnsCoreAdmission|TestReplicaActionFencesOwnershipAndRetirementExactly|TestPromotionHeartbeatReachesLearnerAfterLostAppendOrCommit|TestAdditiveMembershipHeartbeatReachesLaggingVoter'
       - name: Prepare command build cache
         run: go build -trimpath ./cmd/vibedb ./cmd/vibedb-shard ./cmd/vibedb-gateway
       - name: Create a table, write rows, restart RF3, and read them back
