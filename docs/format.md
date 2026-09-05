@@ -97,6 +97,22 @@ The synchronous lane appends and syncs the recovery record before applying and
 publishing the visible row change. Buffered lanes establish different
 acknowledgement and checkpoint boundaries; see [durability](durability.md).
 
+Recovery-journal and transaction-marker headers record the allocation mode in
+their flags word (offset 88 in `.rjournal`, offset 64 in `txn.vtm`):
+
+| Flags | Capacity contract |
+| ---: | --- |
+| `0` | Ordinary unsealed journal |
+| `1` | Immutable capacity with strict private physical reservation |
+| `3` | Immutable capacity with portable allocation |
+
+Bit 1 requires bit 0; every other bit is invalid. RF3 selects the portable
+mode. Both sealed modes require the exact recorded file size and retain their
+mode across recycle. Strict callers reject portable files. Portable reopen
+performs no allocation repair or allocation sync; append and publication
+barriers remain required. The build disk-grammar identity includes these flags,
+so prior-build roots are rejected rather than silently migrated.
+
 ## Cross-collection decisions
 
 For two or more durable participants, each collection records a conditional

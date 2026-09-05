@@ -522,9 +522,6 @@ func checkExprScoped(
 		if e.Column < -1 || e.Column >= len(s.Columns) {
 			t.Fatalf("a leaf binds output column %d of %d", e.Column, len(s.Columns))
 		}
-		if having && e.Agg != AggNone && e.Column < 0 {
-			t.Fatal("a HAVING aggregate leaf is unbound")
-		}
 		if e.Kind == ExprBetween && len(e.List) != 2 {
 			t.Fatalf("BETWEEN holds %d bounds", len(e.List))
 		}

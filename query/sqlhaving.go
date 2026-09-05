@@ -277,8 +277,7 @@ func (h *havingProgram) cellScalar(c Cell) scalar {
 // --- compilation -----------------------------------------------------------
 
 // buildHaving compiles the statement's HAVING clause, adding a hidden result
-// column for any GROUP BY key the clause tests and the SELECT list does not
-// project.
+// column for any aggregate or GROUP BY key absent from the SELECT list.
 //
 // The hidden column is why this runs after buildColumns. A grouped projection
 // must be a grouping key, which the parser has already checked, so appending
@@ -388,7 +387,7 @@ func (s *Statement) compileHaving(
 }
 
 // havingColumn answers the result column a HAVING leaf reads, materializing a
-// hidden projection for an unprojected GROUP BY key.
+// hidden reduction column for an unprojected aggregate or GROUP BY key.
 func (s *Statement) havingColumn(e *sqlast.Expr) (int, error) {
 	if scalar := s.scalarStatement(); scalar != nil {
 		// The cold scalar stage projects dependency columns rather than the
@@ -410,15 +409,13 @@ func (s *Statement) havingColumn(e *sqlast.Expr) (int, error) {
 			}
 			return int(dependency), nil
 		}
-		if e.Agg != sqlast.AggNone {
-			return 0, fmt.Errorf("query: HAVING tests an aggregate the SELECT list does not compute")
-		}
 		spec := s.spec(e.Path)
+		agg := aggKind(e.Agg)
 		physical := 0
 		grouped := len(s.tree.GroupBy) != 0
 		for i := range s.q.columns {
 			column := &s.q.columns[i]
-			if !column.cardinalityOnly && column.agg == aggNone && column.spec == spec {
+			if !column.cardinalityOnly && column.agg == agg && column.spec == spec {
 				// A statically unreachable CASE arm can already have registered
 				// this path for semantic validation only. HAVING makes it live;
 				// promote that exact column instead of appending a duplicate.
@@ -430,25 +427,20 @@ func (s *Statement) havingColumn(e *sqlast.Expr) (int, error) {
 			}
 			physical++
 		}
-		s.q.columns = append(s.q.columns, Column{agg: aggNone, spec: spec, header: spec})
+		s.q.columns = append(s.q.columns, Column{agg: agg, spec: spec, header: spec})
 		return physical, nil
 	}
 	if e.Column >= 0 {
 		return e.Column, nil
 	}
-	if e.Agg != sqlast.AggNone {
-		// The parser binds every aggregate leaf to a SELECT column or refuses
-		// the statement, so reaching here would mean the tree disagrees with
-		// the parser's own guarantee.
-		return 0, fmt.Errorf("query: HAVING tests an aggregate the SELECT list does not compute")
-	}
 	spec := s.spec(e.Path)
+	agg := aggKind(e.Agg)
 	for i := s.outputs; i < len(s.q.columns); i++ {
-		if s.q.columns[i].agg == aggNone && s.q.columns[i].spec == spec {
+		if s.q.columns[i].agg == agg && s.q.columns[i].spec == spec {
 			return i, nil
 		}
 	}
-	s.q.columns = append(s.q.columns, Column{agg: aggNone, spec: spec, header: spec})
+	s.q.columns = append(s.q.columns, Column{agg: agg, spec: spec, header: spec})
 	return len(s.q.columns) - 1, nil
 }
 

@@ -109,7 +109,7 @@ func prepareReservedReplicatedBundle(t *testing.T) (string, *Database, Replicate
 func TestBindReplicatedShardStoreBundleIdentityExactRetryAndReopen(t *testing.T) {
 	path, db, expected, globals := prepareReservedReplicatedBundle(t)
 	got, err := db.BindReplicatedShardStoreBundleIdentity(expected, globals)
-	skipReplicatedStrictAllocationUnsupported(t, db, got, err)
+	rejectReplicatedStrictAllocationUnsupported(t, db, got, err)
 	if err != nil || !got.Equal(expected) {
 		t.Fatalf("exact bind = %+v, %v", got, err)
 	}
@@ -179,7 +179,7 @@ func TestBindReplicatedShardStoreBundleIdentitySingleton(t *testing.T) {
 				assertReservedBundleUnchanged(t, db, path, before, nil)
 				return
 			}
-			skipReplicatedStrictAllocationUnsupported(t, db, got, err)
+			rejectReplicatedStrictAllocationUnsupported(t, db, got, err)
 			if err != nil || !got.Equal(expected) {
 				t.Fatalf("exact singleton = %+v, %v", got, err)
 			}

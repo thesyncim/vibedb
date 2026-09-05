@@ -188,7 +188,6 @@ func TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry(t *tes
 		}
 	}
 	stopPulses := make(chan struct{})
-	go pulseRF3(stopPulses, pulses)
 	t.Cleanup(func() {
 		close(stopPulses)
 		for _, cancel := range cancels {
@@ -205,6 +204,10 @@ func TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry(t *tes
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
+	// The first phase asserts a retry at the same stable leader. Drive its
+	// election explicitly, without concurrent timer elections racing the
+	// acknowledged write and retry on a slow sync. Periodic ticks start below
+	// before the read and leader-loss checks.
 	if err := owners[0].Campaign(ctx, group); err != nil {
 		t.Fatal(err)
 	}
@@ -255,6 +258,7 @@ func TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry(t *tes
 		t.Fatalf("stable-leader owned exact retry changed result: first=%+v retry=%+v",
 			acknowledged.Outcome, replayed.Outcome)
 	}
+	go pulseRF3(stopPulses, pulses)
 	waitRF3Applied(t, ctx, owners, nil, group, acknowledged.Outcome.AppliedIndex)
 	follower := (leader + 1) % voters
 	followerRead, followerLease, followerState, err := readRF3PointAtFreshFence(

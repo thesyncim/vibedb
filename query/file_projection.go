@@ -31,73 +31,201 @@ func resizeFileProjection[T any](s []T, n int) []T {
 	return full[:n]
 }
 
-// fileProjectionPaths proves the deliberately narrow query shape for the
-// storage-native primary projection lane. The range certificate says that the
-// complete predicate is already represented by the native primary bounds, so
-// the callback only has to classify and retain the selected scalar fields.
-// Keeping this proof separate from runFileSmall is important: a failed proof
-// must leave the ordinary raw scan as the only semantic implementation.
-func (p *plan) fileProjectionFieldCount(
+// fileProjectionPredicateEligible admits only predicates whose leaves consume
+// classified scalar cells. Raw containment and join/mark leaves require the
+// complete document or an execution binding, so admitting them here would
+// silently change either their error or NULL semantics.
+func fileProjectionPredicateEligible(p *compiledPredicate) bool {
+	if p == nil {
+		return true
+	}
+	switch p.kind {
+	case predCmp, predCmpBound, predCmpPath,
+		predCorrelationKnown, predIn, predLike, predExists,
+		predIsNull, predIsString:
+		return true
+	case predAnd, predOr, predNot:
+		for _, kid := range p.kids {
+			if !fileProjectionPredicateEligible(kid) {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+// fileProjectionBase proves the deliberately narrow query shape for the
+// storage-native primary projector. A bound predicate path certifies that the
+// range already contains the complete WHERE result; an unbound range uses the
+// existing compiled predicate over the decoded filter prefix.
+func (p *plan) fileProjectionBase(
 	span *FileRangeSource,
 	ordered bool,
-) (int, bool) {
-	if p == nil || span == nil || !ordered ||
-		span.orderedPath == "" || span.predicatePath == "" ||
-		span.predicatePath != span.orderedPath ||
+) (covered bool, ok bool) {
+	if p == nil || span == nil || !ordered || span.orderedPath == "" ||
 		!p.hasLimit || p.limit <= 0 ||
 		p.grouped || p.hasAggregate || len(p.joins) != 0 ||
 		len(p.marks) != 0 || p.requiresSQLDomainScan() ||
 		len(p.order) != 1 || p.order[0].dir != Asc ||
 		p.order[0].value < 0 || p.order[0].value >= len(p.valuePaths) ||
 		p.valuePaths[p.order[0].value].indexPath() != span.orderedPath {
-		return 0, false
+		return false, false
+	}
+	covered = span.predicatePath != ""
+	if covered && span.predicatePath != span.orderedPath {
+		return false, false
+	}
+	if !covered && !fileProjectionPredicateEligible(p.where) {
+		return false, false
 	}
 	for _, column := range p.columns {
 		// Aggregates, semantic-only columns, COUNT(*), and synthetic
 		// cardinality columns have no direct scalar field to decode.
 		if column.agg != aggNone || column.value < 0 ||
 			column.value >= len(p.valuePaths) {
-			return 0, false
+			return false, false
 		}
 		path := p.valuePaths[column.value]
 		if path.join != joinPathOuter {
-			return 0, false
+			return false, false
 		}
 		canonical := path.indexPath()
 		// The storage projection lane is scalar-only. The empty pointer and
 		// root pointer can name a whole document/container, so let the generic
 		// reader preserve its exact semantics for those paths.
 		if canonical == "" || canonical == "/" {
-			return 0, false
+			return false, false
 		}
 	}
-	return len(p.columns), len(p.columns) != 0
+	for _, ordinal := range p.filterCols {
+		if ordinal < 0 || ordinal >= len(p.valuePaths) ||
+			p.valuePaths[ordinal].join != joinPathOuter {
+			return false, false
+		}
+		canonical := p.valuePaths[ordinal].indexPath()
+		if canonical == "" || canonical == "/" {
+			return false, false
+		}
+	}
+	return covered, len(p.columns) != 0
 }
 
-func (p *plan) fileProjectionPaths(
-	dst []string,
+// fileProjectionFieldCount counts the deduplicated storage slots: residual
+// filter columns form the prefix, followed by output columns not already in
+// that prefix. Covered ranges omit filter-only columns entirely.
+func (p *plan) fileProjectionFieldCount(
 	span *FileRangeSource,
 	ordered bool,
-) ([]string, bool) {
+) (int, bool) {
+	covered, ok := p.fileProjectionBase(span, ordered)
+	if !ok {
+		return 0, false
+	}
+	count := 0
+	if !covered {
+		count = len(p.filterCols)
+	}
+	for columnIndex, column := range p.columns {
+		seen := false
+		if !covered {
+			for _, ordinal := range p.filterCols {
+				if ordinal == column.value {
+					seen = true
+					break
+				}
+			}
+		}
+		if !seen {
+			for previous := 0; previous < columnIndex; previous++ {
+				if p.columns[previous].value == column.value {
+					seen = true
+					break
+				}
+			}
+		}
+		if !seen {
+			count++
+		}
+	}
+	return count, count > 0
+}
+
+// fileProjectionSpec fills the storage path order and maps result columns to
+// those slots. It performs the same proof as fileProjectionFieldCount without
+// allocating a temporary registry.
+func (p *plan) fileProjectionSpec(
+	paths []string,
+	ordinals []int,
+	outputs []int,
+	span *FileRangeSource,
+	ordered bool,
+) (filterCount int, ok bool) {
+	covered, ok := p.fileProjectionBase(span, ordered)
+	if !ok {
+		return 0, false
+	}
 	fieldCount, ok := p.fileProjectionFieldCount(span, ordered)
-	if !ok || cap(dst) < fieldCount {
-		return nil, false
+	if !ok || cap(paths) < fieldCount || cap(ordinals) < fieldCount ||
+		cap(outputs) < len(p.columns) {
+		return 0, false
 	}
-	dst = dst[:fieldCount]
-	for i, column := range p.columns {
-		dst[i] = p.valuePaths[column.value].indexPath()
+	paths = paths[:fieldCount]
+	ordinals = ordinals[:fieldCount]
+	outputs = outputs[:len(p.columns)]
+	at := 0
+	if !covered {
+		for _, ordinal := range p.filterCols {
+			ordinals[at] = ordinal
+			paths[at] = p.valuePaths[ordinal].indexPath()
+			at++
+		}
+		filterCount = at
 	}
-	return dst, true
+	for column, planColumn := range p.columns {
+		duplicate := -1
+		for previous := 0; previous < column; previous++ {
+			if p.columns[previous].value == planColumn.value {
+				duplicate = previous
+				break
+			}
+		}
+		if duplicate >= 0 {
+			// A repeated output path shares the first output column's owned
+			// Cell. Keep the storage field unique while preserving duplicate
+			// result columns in their original order.
+			outputs[column] = -duplicate - 1
+			continue
+		}
+		field := -1
+		for candidate := 0; candidate < at; candidate++ {
+			if ordinals[candidate] == planColumn.value {
+				field = candidate
+				break
+			}
+		}
+		if field < 0 {
+			field = at
+			ordinals[at] = planColumn.value
+			paths[at] = p.valuePaths[planColumn.value].indexPath()
+			at++
+		}
+		outputs[column] = field
+	}
+	return filterCount, at == fieldCount
 }
 
 // fileProjectionMetadataBytes charges the actual caller-owned projection
 // capacities. The storage wrapper never allocates replacement shape, stream,
 // or field slices, so these bytes have to be admitted before any of them grow.
 func fileProjectionMetadataBytes(
-	shapeSeenCap, shapeWorkCap, streamCap, fieldCap, cellCap, pathCap int,
+	shapeSeenCap, shapeWorkCap, streamCap, fieldCap, cellCap, pathCap,
+	ordinalCap, outputMapCap, scalarCap, slotCap int,
 ) int64 {
 	if shapeSeenCap < 0 || shapeWorkCap < 0 || streamCap < 0 ||
-		fieldCap < 0 || cellCap < 0 || pathCap < 0 {
+		fieldCap < 0 || cellCap < 0 || pathCap < 0 || ordinalCap < 0 ||
+		outputMapCap < 0 || scalarCap < 0 || slotCap < 0 {
 		return math.MaxInt64
 	}
 	bytes := saturatedProduct(
@@ -115,8 +243,20 @@ func fileProjectionMetadataBytes(
 	bytes = saturatedBytes(bytes, saturatedProduct(
 		int64(cellCap), int64(unsafe.Sizeof(Cell{})),
 	))
-	return saturatedBytes(bytes, saturatedProduct(
+	bytes = saturatedBytes(bytes, saturatedProduct(
 		int64(pathCap), int64(unsafe.Sizeof("")),
+	))
+	bytes = saturatedBytes(bytes, saturatedProduct(
+		int64(ordinalCap), int64(unsafe.Sizeof(int(0))),
+	))
+	bytes = saturatedBytes(bytes, saturatedProduct(
+		int64(outputMapCap), int64(unsafe.Sizeof(int(0))),
+	))
+	bytes = saturatedBytes(bytes, saturatedProduct(
+		int64(scalarCap), int64(unsafe.Sizeof(scalar{})),
+	))
+	return saturatedBytes(bytes, saturatedProduct(
+		int64(slotCap), int64(unsafe.Sizeof([]scalar(nil))),
 	))
 }
 
@@ -141,31 +281,132 @@ func fileProjectionFilterPathBytes(path string) int64 {
 	return bytes
 }
 
-func fileProjectionFilterBytesForPlan(p *plan) int64 {
-	if p == nil {
-		return 0
+func fileProjectionFilterBytesForRange(
+	p *plan,
+	span *FileRangeSource,
+	ordered bool,
+) int64 {
+	fieldCount, ok := p.fileProjectionFieldCount(span, ordered)
+	if !ok {
+		return math.MaxInt64
 	}
-	count := int64(len(p.columns))
 	bytes := int64(unsafe.Sizeof(durable.ProjectionFilter{}))
 	bytes = saturatedBytes(bytes, int64(unsafe.Sizeof(storeio.UnifiedProjectionFilter{})))
 	bytes = saturatedBytes(bytes, saturatedProduct(
-		count, int64(unsafe.Sizeof(storeio.UnifiedHoleResolver{})),
+		int64(fieldCount), int64(unsafe.Sizeof(storeio.UnifiedHoleResolver{})),
 	))
 	bytes = saturatedBytes(bytes, saturatedProduct(
-		count, int64(unsafe.Sizeof("")),
+		int64(fieldCount), int64(unsafe.Sizeof("")),
 	))
 	bytes = saturatedBytes(bytes, saturatedProduct(
-		count, int64(unsafe.Sizeof([]byte(nil))),
+		int64(fieldCount), int64(unsafe.Sizeof([]byte(nil))),
 	))
-	for _, column := range p.columns {
-		if column.value < 0 || column.value >= len(p.valuePaths) {
-			return math.MaxInt64
+	covered, _ := p.fileProjectionBase(span, ordered)
+	add := func(ordinal int) {
+		if ordinal < 0 || ordinal >= len(p.valuePaths) {
+			bytes = math.MaxInt64
+			return
 		}
 		bytes = saturatedBytes(bytes, fileProjectionFilterPathBytes(
-			p.valuePaths[column.value].indexPath(),
+			p.valuePaths[ordinal].indexPath(),
 		))
 	}
+	if !covered {
+		for _, ordinal := range p.filterCols {
+			add(ordinal)
+		}
+	}
+	for source, column := range p.columns {
+		seen := false
+		if !covered {
+			for _, previous := range p.filterCols {
+				if previous == column.value {
+					seen = true
+					break
+				}
+			}
+		}
+		if !seen {
+			for previous := 0; previous < source; previous++ {
+				if p.columns[previous].value == column.value {
+					seen = true
+					break
+				}
+			}
+		}
+		if !seen {
+			add(column.value)
+		}
+	}
 	return bytes
+}
+
+func (s *fileSmallScan) projectionSpecMatches(
+	p *plan,
+	span *FileRangeSource,
+	ordered bool,
+	fieldCount, filterCount int,
+) bool {
+	if s.projection == nil || s.projectionPlan != p ||
+		len(s.projectionPaths) != fieldCount ||
+		len(s.projectionOrdinals) != fieldCount ||
+		len(s.projectionOutput) != len(p.columns) ||
+		s.projectionFilterCount != filterCount {
+		return false
+	}
+	covered, ok := p.fileProjectionBase(span, ordered)
+	if !ok {
+		return false
+	}
+	at := 0
+	check := func(ordinal int) bool {
+		if at >= fieldCount || ordinal < 0 || ordinal >= len(p.valuePaths) ||
+			s.projectionOrdinals[at] != ordinal ||
+			s.projectionPaths[at] != p.valuePaths[ordinal].indexPath() {
+			return false
+		}
+		at++
+		return true
+	}
+	if !covered {
+		for _, ordinal := range p.filterCols {
+			if !check(ordinal) {
+				return false
+			}
+		}
+	}
+	for column, planColumn := range p.columns {
+		duplicate := -1
+		for previous := 0; previous < column; previous++ {
+			if p.columns[previous].value == planColumn.value {
+				duplicate = previous
+				break
+			}
+		}
+		if duplicate >= 0 {
+			if s.projectionOutput[column] != -duplicate-1 {
+				return false
+			}
+			continue
+		}
+		field := -1
+		for candidate := 0; candidate < at; candidate++ {
+			if s.projectionOrdinals[candidate] == planColumn.value {
+				field = candidate
+				break
+			}
+		}
+		if field < 0 {
+			field = at
+			if !check(planColumn.value) {
+				return false
+			}
+		}
+		if s.projectionOutput[column] != field {
+			return false
+		}
+	}
+	return at == fieldCount
 }
 
 // ensureFileProjectionWorkspace chooses the largest compact-shape prefix that
@@ -175,10 +416,12 @@ func fileProjectionFilterBytesForPlan(p *plan) int64 {
 // paying for a 256-shape by N-field slab that it cannot use.
 func (s *fileSmallScan) ensureFileProjectionWorkspace(
 	fieldCount int,
+	scalarCount int,
+	outputCount int,
 	filterBytes int64,
 	opts normalizedFileOptions,
 ) bool {
-	if fieldCount <= 0 {
+	if fieldCount <= 0 || scalarCount < 0 || outputCount <= 0 {
 		return false
 	}
 	work := s.work.activeHeapWorkBudget()
@@ -187,7 +430,8 @@ func (s *fileSmallScan) ensureFileProjectionWorkspace(
 		return false
 	}
 	maxInt := int64(^uint(0) >> 1)
-	if int64(fieldCount) > maxInt/int64(unsafe.Sizeof(storeio.UnifiedProjectionStreamWorkspace{})) {
+	if int64(fieldCount) > maxInt/int64(unsafe.Sizeof(storeio.UnifiedProjectionStreamWorkspace{})) ||
+		int64(scalarCount) > maxInt/int64(unsafe.Sizeof(scalar{})) {
 		return false
 	}
 	perShape := int64(unsafe.Sizeof(int(0))) +
@@ -245,15 +489,23 @@ func (s *fileSmallScan) ensureFileProjectionWorkspace(
 	streamCount := int64(shapeCount) * int64(fieldCount)
 	shapeTarget := shapeCount
 	streamTarget := int(streamCount)
+	if int64(streamTarget) > maxInt || int64(outputCount) > maxInt {
+		return false
+	}
 	shapeCap := max(cap(s.projectionShapes), shapeTarget)
 	shapeWorkCap := max(cap(s.projectionShape), shapeTarget)
 	streamCap := max(cap(s.projectionStream), streamTarget)
 	fieldCap := max(cap(s.projectionFields), fieldCount)
-	cellCap := max(cap(s.cells), fieldCount)
+	cellCap := max(cap(s.cells), outputCount)
 	pathCap := max(cap(s.projectionPaths), fieldCount)
+	ordinalCap := max(cap(s.projectionOrdinals), fieldCount)
+	outputMapCap := max(cap(s.projectionOutput), outputCount)
+	scalarCap := max(cap(s.projectionScalars), scalarCount)
+	slotCap := max(cap(s.projectionSlots), scalarCount)
 	valueCap := max(cap(s.projectionValues), int(scratchCap))
 	metadata := fileProjectionMetadataBytes(
 		shapeCap, shapeWorkCap, streamCap, fieldCap, cellCap, pathCap,
+		ordinalCap, outputMapCap, scalarCap, slotCap,
 	)
 	total := saturatedBytes(metadata, int64(valueCap))
 	total = saturatedBytes(total, filterBytes)
@@ -285,10 +537,30 @@ func (s *fileSmallScan) ensureFileProjectionWorkspace(
 	} else {
 		s.projectionFields = resizeFileProjection(s.projectionFields, fieldCount)
 	}
-	if cap(s.cells) < fieldCount {
-		s.cells = make([]Cell, fieldCount)
+	if cap(s.cells) < outputCount {
+		s.cells = make([]Cell, outputCount)
 	} else {
-		s.cells = resizeFileProjection(s.cells, fieldCount)
+		s.cells = resizeFileProjection(s.cells, outputCount)
+	}
+	if cap(s.projectionOrdinals) < fieldCount {
+		s.projectionOrdinals = make([]int, fieldCount)
+	} else {
+		s.projectionOrdinals = resizeFileProjection(s.projectionOrdinals, fieldCount)
+	}
+	if cap(s.projectionOutput) < outputCount {
+		s.projectionOutput = make([]int, outputCount)
+	} else {
+		s.projectionOutput = resizeFileProjection(s.projectionOutput, outputCount)
+	}
+	if cap(s.projectionScalars) < scalarCount {
+		s.projectionScalars = make([]scalar, scalarCount)
+	} else {
+		s.projectionScalars = resizeFileProjection(s.projectionScalars, scalarCount)
+	}
+	if cap(s.projectionSlots) < scalarCount {
+		s.projectionSlots = make([][]scalar, scalarCount)
+	} else {
+		s.projectionSlots = resizeFileProjection(s.projectionSlots, scalarCount)
 	}
 	if cap(s.projectionValues) < int(scratchCap) {
 		s.projectionValues = make([]byte, 0, int(scratchCap))
@@ -325,105 +597,300 @@ func projectedTextBytes(
 	return need, nil
 }
 
-// projectedResultInto classifies one storage callback and immediately moves
-// every selected scalar into Result ownership. The callback sees borrowed
-// JSON only until it returns; no projected field is retained in a Result or
-// reusable Exec workspace.
-func (s *fileSmallScan) projectedResultInto(
-	result *Result,
+func projectedFieldScalar(field storeio.UnifiedProjectionField, text *[]byte) scalar {
+	switch field.Kind {
+	case storeio.UnifiedProjectionFieldInteger:
+		return scalar{kind: kindNumber, isInt: true, ival: field.Integer}
+	case storeio.UnifiedProjectionFieldMissing:
+		return scalar{kind: kindNull}
+	default:
+		return classifyRawInto(vibejson.RawValue{Src: field.JSON}, text)
+	}
+}
+
+// classifyProjectedFields fills the one-row scalar slots for a compact filter
+// range. Its text arena remains live while an accepted row is materialized so
+// output-only fields can use the separate late arena.
+func (s *fileSmallScan) classifyProjectedFields(
 	fields []storeio.UnifiedProjectionField,
-	payload *int64,
+	start, end int,
+	text *[]byte,
+	reserved *int64,
 ) error {
-	if err := s.work.checkCanceled(); err != nil {
+	if start < 0 || end < start || end > len(fields) || end > len(s.projectionOrdinals) {
+		return &WorkBudgetError{
+			Resource: "durable projected field range",
+			Bytes:    math.MaxInt64,
+			Limit:    math.MaxInt64,
+		}
+	}
+	need, err := projectedTextBytes(fields[start:end], s.work.cancel)
+	if err != nil {
 		return err
 	}
-	fieldBytes := 0
-	for _, field := range fields {
-		scratchBytes := field.ScratchBytes()
-		if fieldBytes > int(^uint(0)>>1)-scratchBytes {
+	if reserved == nil {
+		return &WorkBudgetError{
+			Resource: "durable projected text reservation",
+			Bytes:    math.MaxInt64,
+			Limit:    math.MaxInt64,
+		}
+	}
+	targetCap := cap(*text)
+	if targetCap < need {
+		targetCap = growCap(targetCap, need)
+	}
+	if err := s.work.activeHeapWorkBudget().admitHighWater(
+		"durable projected decoded-text workspace",
+		int64(targetCap), reserved,
+	); err != nil {
+		return err
+	}
+	*text = (*text)[:0]
+	if cap(*text) < need {
+		*text = make([]byte, 0, targetCap)
+	}
+	for field := start; field < end; field++ {
+		ordinal := s.projectionOrdinals[field]
+		if ordinal < 0 || ordinal >= len(s.projectionScalars) || ordinal >= len(s.projectionSlots) {
 			return &WorkBudgetError{
-				Resource: "durable projected field payload",
+				Resource: "durable projected scalar slots",
 				Bytes:    math.MaxInt64,
 				Limit:    math.MaxInt64,
 			}
 		}
-		fieldBytes += scratchBytes
+		s.projectionScalars[ordinal] = projectedFieldScalar(fields[field], text)
+		s.projectionSlots[ordinal] = s.projectionScalars[ordinal : ordinal+1]
 	}
-	// Storage bounds its append into projectionValues for scratch-backed fields,
-	// but retain this guard at the callback boundary as well: compressed stream
-	// decoding must never be followed by an unbounded query-side copy. Borrowed
-	// dictionary bytes and native integers are admitted separately and are
-	// charged by text/result ownership below.
-	if fieldBytes > cap(s.projectionValues) {
+	return nil
+}
+
+// prepareProjectedLateText admits the escaped-string arena for the output
+// fields of one accepted row. Native integers, dictionary values, and clean
+// JSON spellings do not need this arena, so an output-only covered projection
+// can stay on the scalar hot path without allocating or staging slots.
+func (s *fileSmallScan) prepareProjectedLateText(
+	fields []storeio.UnifiedProjectionField,
+	start, end int,
+) error {
+	if start < 0 || end < start || end > len(fields) {
 		return &WorkBudgetError{
-			Resource: "durable projected field payload",
-			Bytes:    int64(fieldBytes),
-			Limit:    int64(cap(s.projectionValues)),
+			Resource: "durable projected late field range",
+			Bytes:    math.MaxInt64,
+			Limit:    math.MaxInt64,
 		}
 	}
-	textNeed, err := projectedTextBytes(fields, s.work.cancel)
+	if start == end {
+		s.work.lateText = s.work.lateText[:0]
+		return nil
+	}
+	need, err := projectedTextBytes(fields[start:end], s.work.cancel)
 	if err != nil {
 		return err
 	}
-	if err := s.work.admitDecodedText(textNeed); err != nil {
+	s.work.lateText = s.work.lateText[:0]
+	targetCap := cap(s.work.lateText)
+	if targetCap < need {
+		targetCap = growCap(targetCap, need)
+	}
+	if err := s.work.activeHeapWorkBudget().admitHighWater(
+		"durable projected decoded-text workspace",
+		int64(targetCap), &s.projectionLateTextReserved,
+	); err != nil {
 		return err
 	}
-	s.work.text = s.work.text[:0]
-	if cap(s.work.text) < textNeed {
-		s.work.text = make([]byte, 0, growCap(cap(s.work.text), textNeed))
+	if cap(s.work.lateText) < need {
+		s.work.lateText = make([]byte, 0, targetCap)
+	}
+	return nil
+}
+
+func (s *fileSmallScan) fillProjectedFallback(raw []byte) error {
+	return s.fillProjectedFallbackRange(raw, 0, len(s.projectionOrdinals))
+}
+
+func (s *fileSmallScan) fillProjectedFallbackRange(raw []byte, start, end int) error {
+	if start < 0 || end < start || end > len(s.projectionOrdinals) ||
+		end > len(s.projectionFields) {
+		return &WorkBudgetError{
+			Resource: "durable projected fallback field range",
+			Bytes:    math.MaxInt64,
+			Limit:    math.MaxInt64,
+		}
+	}
+	root := vibejson.RawValue{Src: raw}
+	var indexed vibejson.Index
+	var err error
+	if end-start > 1 {
+		// A fallback row can carry several selected fields. Build one reusable
+		// tape for that row, then resolve every pointer against it; repeatedly
+		// parsing the complete document for each field makes wide fallback rows
+		// pay the validation and indexing cost once per column.
+		entries := int64(cap(s.work.eval.entries))
+		if err := s.work.activeHeapWorkBudget().admitContainmentTape(
+			entries, &s.work.eval.entriesReserved,
+		); err != nil {
+			return err
+		}
+		indexed, err = s.work.eval.containsTapeFrom(raw, 16)
+		if err != nil {
+			return err
+		}
+	}
+	for field := start; field < end; field++ {
+		ordinal := s.projectionOrdinals[field]
+		if ordinal < 0 || ordinal >= len(s.p.valuePaths) {
+			return &WorkBudgetError{
+				Resource: "durable projected path slots",
+				Bytes:    math.MaxInt64,
+				Limit:    math.MaxInt64,
+			}
+		}
+		var value vibejson.RawValue
+		var found bool
+		if end-start > 1 {
+			node, ok, pointerErr := indexed.PointerCompiled(
+				s.p.valuePaths[ordinal].pointer,
+			)
+			if pointerErr != nil {
+				return pointerErr
+			}
+			if ok {
+				value = node.Raw()
+				found = true
+			}
+		} else {
+			value, found, err = root.PointerCompiled(s.p.valuePaths[ordinal].pointer)
+			if err != nil {
+				return err
+			}
+		}
+		if !found {
+			s.projectionFields[field] = storeio.UnifiedProjectionField{
+				Kind: storeio.UnifiedProjectionFieldMissing,
+			}
+			continue
+		}
+		s.projectionFields[field] = storeio.UnifiedProjectionField{
+			JSON: value.Bytes(),
+			Kind: storeio.UnifiedProjectionFieldBorrowedJSON,
+		}
+	}
+	return nil
+}
+
+func (s *fileSmallScan) projectedResultFromFields(
+	result *Result,
+	payload *int64,
+	fields []storeio.UnifiedProjectionField,
+	filterCount int,
+) error {
+	fieldCount := len(s.projectionOrdinals)
+	if filterCount < 0 || filterCount > fieldCount || len(fields) < fieldCount ||
+		len(s.projectionOutput) != len(s.p.columns) {
+		return &WorkBudgetError{
+			Resource: "durable projected output fields",
+			Bytes:    math.MaxInt64,
+			Limit:    math.MaxInt64,
+		}
+	}
+	if err := s.prepareProjectedLateText(fields, filterCount, fieldCount); err != nil {
+		return err
 	}
 	rowPayload := int64(0)
-	rowCells := s.cells[:0]
-	if cap(rowCells) < len(fields) {
-		rowCells = make([]Cell, len(fields))
-	} else {
-		rowCells = rowCells[:len(fields)]
-	}
-	for field, value := range fields {
-		var scalarValue scalar
-		switch value.Kind {
-		case storeio.UnifiedProjectionFieldInteger:
-			// Native compact integers retain their exact int64 value and do
-			// not need a JSON render/parse round trip. Leave num empty so
-			// mixed exact-decimal comparisons use the bounded stack spelling
-			// only when they truly need one.
-			scalarValue = scalar{
-				kind: kindNumber, isInt: true, ival: value.Integer,
+	rowCells := s.cells[:len(s.p.columns)]
+	for column := range s.p.columns {
+		field := s.projectionOutput[column]
+		if field < 0 {
+			// Duplicate output paths point at the first result column for that
+			// path. The storage field and its owned payload are shared, while
+			// the result still receives a cell in the duplicate column.
+			source := -field - 1
+			if source < 0 || source >= column {
+				return &WorkBudgetError{
+					Resource: "durable projected output slots",
+					Bytes:    math.MaxInt64,
+					Limit:    math.MaxInt64,
+				}
 			}
-		case storeio.UnifiedProjectionFieldMissing:
-			// A missing projection has nil raw bytes, preserving cellMissing
-			// through cellFromScalar while explicit null keeps its raw JSON.
-			scalarValue = scalar{kind: kindNull}
-		default:
-			scalarValue = classifyRawInto(
-				vibejson.RawValue{Src: value.JSON}, &s.work.text,
-			)
+			cell := rowCells[source]
+			add := projectedCellPayloadBytes(cell)
+			if add < 0 || rowPayload > math.MaxInt64-add {
+				return result.resultByteBudgetError(result.RowCount+1, math.MaxInt64)
+			}
+			rowPayload += add
+			rowCells[column] = cell
+			continue
 		}
-		cell := cellFromScalar(scalarValue)
+		if field >= fieldCount {
+			return &WorkBudgetError{
+				Resource: "durable projected output slots",
+				Bytes:    math.MaxInt64,
+				Limit:    math.MaxInt64,
+			}
+		}
+		var cell Cell
+		if field < filterCount {
+			ordinal := s.projectionOrdinals[field]
+			if ordinal < 0 || ordinal >= len(s.projectionScalars) {
+				return &WorkBudgetError{
+					Resource: "durable projected output scalar",
+					Bytes:    math.MaxInt64,
+					Limit:    math.MaxInt64,
+				}
+			}
+			cell = cellFromScalar(s.projectionScalars[ordinal])
+		} else {
+			value := fields[field]
+			switch value.Kind {
+			case storeio.UnifiedProjectionFieldInteger:
+				cell = Cell{
+					kind: TypeNumber, flag: cellInteger,
+					word: uint64(value.Integer),
+				}
+			case storeio.UnifiedProjectionFieldMissing:
+				cell = Cell{kind: TypeNull, flag: cellMissing, raw: nullBytes}
+			default:
+				cell = cellFromScalar(classifyRawInto(
+					vibejson.RawValue{Src: value.JSON}, &s.work.lateText,
+				))
+			}
+		}
 		add := projectedCellPayloadBytes(cell)
 		if add < 0 || rowPayload > math.MaxInt64-add {
 			return result.resultByteBudgetError(result.RowCount+1, math.MaxInt64)
 		}
 		rowPayload += add
-		rowCells[field] = cell
+		rowCells[column] = cell
 	}
 	nextPayload := saturatedBytes(*payload, rowPayload)
 	required, err := result.checkResultBudget(
-		len(fields), result.RowCount+1, nextPayload,
+		len(s.p.columns), result.RowCount+1, nextPayload,
 	)
 	if err != nil {
 		return err
 	}
 	result.resultBytesUsed = required
-	for field, cell := range rowCells {
-		result.Columns[field].Cells = append(
-			result.Columns[field].Cells,
-			result.ownProjectedCell(cell),
+	for column, cell := range rowCells {
+		if field := s.projectionOutput[column]; field < 0 {
+			source := -field - 1
+			if source < 0 || source >= column {
+				return &WorkBudgetError{
+					Resource: "durable projected output slots",
+					Bytes:    math.MaxInt64,
+					Limit:    math.MaxInt64,
+				}
+			}
+			cell = rowCells[source]
+		} else {
+			cell = result.ownProjectedCell(cell)
+			rowCells[column] = cell
+		}
+		result.Columns[column].Cells = append(
+			result.Columns[column].Cells, cell,
 		)
 	}
 	*payload = nextPayload
 	result.RowCount++
-	s.cells = rowCells
 	return nil
 }
 
@@ -438,42 +905,104 @@ func (s *fileSmallScan) tryFileProjected(
 	span *FileRangeSource,
 	opts normalizedFileOptions,
 	stats *ExecStats,
-) (bool, error) {
+) (handled bool, err error) {
 	work := s.work.activeHeapWorkBudget()
 	mark := work.checkpoint()
 	initialStats := *stats
 	initialPayload := s.payload
+	defer func() {
+		if handled {
+			return
+		}
+		work.rollback(mark)
+		// Native projection admission is provisional until the storage cursor
+		// proves the complete range supported. A generic retry must begin with
+		// fresh per-execution high-water markers, even though the warm buffers
+		// themselves remain retained for the next attempt.
+		s.work.heapWorkTextReserved = 0
+		s.work.eval.entriesReserved = 0
+		s.projectionTextReserved = 0
+		s.projectionLateTextReserved = 0
+		s.projectionFallbackReserved = 0
+	}()
 	fieldCount, ok := s.p.fileProjectionFieldCount(span, s.ordered)
 	if !ok {
-		work.rollback(mark)
 		return false, nil
 	}
-	// Prepared compilers can refill the same plan object. Validate its path
-	// configuration as well as its identity before reusing a storage filter.
-	// Compiled path spellings own stable storage across compiler rewinds.
-	replaceFilter := s.projectionPlan != s.p || s.projection == nil ||
-		len(s.projectionPaths) != fieldCount
-	if !replaceFilter {
-		for i, column := range s.p.columns {
-			if s.projectionPaths[i] != s.p.valuePaths[column.value].indexPath() {
-				replaceFilter = true
-				break
+	covered, _ := s.p.fileProjectionBase(span, s.ordered)
+	filterCount := 0
+	scalarCount := 0
+	if !covered {
+		filterCount = len(s.p.filterCols)
+		for _, ordinal := range s.p.filterCols {
+			if ordinal < 0 || ordinal == int(^uint(0)>>1) {
+				return false, nil
+			}
+			if ordinal+1 > scalarCount {
+				scalarCount = ordinal + 1
 			}
 		}
 	}
+	// Prepared compilers can refill the same plan object. Validate its complete
+	// resolver/mapping configuration before reusing a storage filter.
+	replaceFilter := !s.projectionSpecMatches(
+		s.p, span, s.ordered, fieldCount, filterCount,
+	)
 	filterBytes := s.projectionFilter
 	if replaceFilter {
-		filterBytes = fileProjectionFilterBytesForPlan(s.p)
+		filterBytes = fileProjectionFilterBytesForRange(s.p, span, s.ordered)
 	}
-	if !s.ensureFileProjectionWorkspace(fieldCount, filterBytes, opts) {
-		work.rollback(mark)
+	// Every retained arena is live even when this execution does not happen to
+	// use the corresponding path. Admit their current capacities before sizing
+	// the shape slab so the remaining budget describes all native state that can
+	// coexist. The per-arena reservations make subsequent row growth charge only
+	// the high-water increase.
+	retained := int64(cap(s.work.text))
+	retained = saturatedBytes(retained, int64(cap(s.work.lateText)))
+	retained = saturatedBytes(retained, int64(cap(s.projectionFallback)))
+	retained = saturatedBytes(retained, saturatedProduct(
+		int64(cap(s.work.eval.entries)),
+		int64(unsafe.Sizeof(vibejson.IndexEntry{})),
+	))
+	if retained > work.remaining() {
 		return false, nil
 	}
-	paths, ok := s.p.fileProjectionPaths(s.projectionPaths[:0], span, s.ordered)
+	if err := work.admitHighWater(
+		"durable projected decoded-text workspace",
+		int64(cap(s.work.text)), &s.projectionTextReserved,
+	); err != nil {
+		return false, nil
+	}
+	if err := work.admitHighWater(
+		"durable projected decoded-text workspace",
+		int64(cap(s.work.lateText)), &s.projectionLateTextReserved,
+	); err != nil {
+		return false, nil
+	}
+	if err := work.admitHighWater(
+		"durable projected fallback workspace",
+		int64(cap(s.projectionFallback)), &s.projectionFallbackReserved,
+	); err != nil {
+		return false, nil
+	}
+	if err := work.admitContainmentTape(
+		int64(cap(s.work.eval.entries)), &s.work.eval.entriesReserved,
+	); err != nil {
+		return false, nil
+	}
+	if !s.ensureFileProjectionWorkspace(
+		fieldCount, scalarCount, len(s.p.columns), filterBytes, opts,
+	) {
+		return false, nil
+	}
+	filterCount, ok = s.p.fileProjectionSpec(
+		s.projectionPaths[:0], s.projectionOrdinals[:0],
+		s.projectionOutput[:0], span, s.ordered,
+	)
 	if !ok {
-		work.rollback(mark)
 		return false, nil
 	}
+	paths := s.projectionPaths[:fieldCount]
 	// The filter constructor is covered by the admission above. Publish its
 	// byte estimate together with the filter, so a declined replacement cannot
 	// corrupt the charge for the previous plan on a later execution.
@@ -485,21 +1014,98 @@ func (s *fileSmallScan) tryFileProjected(
 			s.projection = nil
 			s.projectionPlan = nil
 			s.projectionFilter = 0
-			work.rollback(mark)
 			return false, nil
 		}
 		s.projection = filter
 		s.projectionPlan = s.p
 		s.projectionFilter = filterBytes
 	}
-	projected, scratch, err := snapshot.FilterProjectedRangeWithScratch(
+	s.projectionFilterCount = filterCount
+	var match func(uint64, []storeio.UnifiedProjectionField) (bool, error)
+	lastFilterRow := uint64(^uint64(0))
+	lastFilterAccepted := false
+	if !covered {
+		match = func(row uint64, fields []storeio.UnifiedProjectionField) (bool, error) {
+			if err := s.classifyProjectedFields(
+				fields, 0, filterCount, &s.work.text, &s.projectionTextReserved,
+			); err != nil {
+				return false, err
+			}
+			lastFilterRow = row
+			lastFilterAccepted = true
+			if s.p.where == nil {
+				return true, nil
+			}
+			matched := s.p.where.eval(s.projectionSlots, 0, &s.work.eval)
+			if err := s.work.eval.firstError(); err != nil {
+				return false, err
+			}
+			lastFilterRow = row
+			lastFilterAccepted = matched
+			return matched, nil
+		}
+	}
+	visit := func(_ uint64, fields []storeio.UnifiedProjectionField) error {
+		return s.projectedResultFromFields(
+			&s.e.Result, &s.payload, fields, filterCount,
+		)
+	}
+	fallback := func(row uint64, raw []byte) (bool, error) {
+		preserveFilter := !covered && lastFilterRow == row && lastFilterAccepted
+		if preserveFilter {
+			if err := s.fillProjectedFallbackRange(raw, filterCount, fieldCount); err != nil {
+				return false, err
+			}
+		} else if err := s.fillProjectedFallback(raw); err != nil {
+			return false, err
+		}
+		accepted := preserveFilter || covered
+		if !covered && !preserveFilter {
+			matched, matchErr := match(row, s.projectionFields[:filterCount])
+			if matchErr != nil || !matched {
+				return false, matchErr
+			}
+			accepted = true
+		}
+		if err := s.projectedResultFromFields(
+			&s.e.Result, &s.payload, s.projectionFields, filterCount,
+		); err != nil {
+			return false, err
+		}
+		return accepted, nil
+	}
+	projected, scratch, err := snapshot.FilterProjectedRangeWithMatchScratch(
 		s.projection,
-		span.lower, span.upper, span.lowerExclusive,
+		filterCount, span.lower, span.upper, span.lowerExclusive,
 		s.projectionShapes, s.projectionShape, s.projectionStream,
-		s.projectionFields, s.projectionValues, s.p.limit,
-		func(_ uint64, fields []storeio.UnifiedProjectionField) error {
-			return s.projectedResultInto(&s.e.Result, fields, &s.payload)
+		s.projectionFields, s.projectionValues,
+		&s.projectionFallback,
+		func(required int64) ([]byte, error) {
+			if required < 0 || required > int64(^uint(0)>>1) {
+				return nil, &WorkBudgetError{
+					Resource: "durable projected fallback workspace",
+					Bytes:    math.MaxInt64,
+					Limit:    work.limit,
+				}
+			}
+			target := required
+			if current := int64(cap(s.projectionFallback)); current > target {
+				target = current
+			}
+			if err := work.admitHighWater(
+				"durable projected fallback workspace",
+				target, &s.projectionFallbackReserved,
+			); err != nil {
+				return nil, err
+			}
+			if int64(cap(s.projectionFallback)) >= required {
+				return s.projectionFallback[:0], nil
+			}
+			s.projectionFallback = make([]byte, 0, int(required))
+			return s.projectionFallback, nil
 		},
+		s.p.limit,
+		match, visit, fallback,
 	)
 	s.projectionValues = scratch
 	if err != nil {
@@ -520,15 +1126,17 @@ func (s *fileSmallScan) tryFileProjected(
 		s.work.text = s.work.text[:0]
 		s.work.lateText = s.work.lateText[:0]
 		s.work.heapWorkTextReserved = 0
+		s.projectionTextReserved = 0
+		s.projectionLateTextReserved = 0
 		work.rollback(mark)
 		return false, nil
 	}
 	s.stats.RowsScanned = uint64(projected.Scanned)
-	s.stats.ProjectedRows = uint64(projected.Scanned)
+	s.stats.ProjectedRows = uint64(projected.NativeMatched)
 	s.stats.Workers = 1
-	if projected.Scanned > 0 {
+	if projected.Matched > 0 {
 		s.stats.Batches = 1
-		s.stats.PeakBatchRows = projected.Scanned
+		s.stats.PeakBatchRows = projected.Matched
 		s.stats.PeakBatchBytes = int64(cap(s.projectionValues))
 		s.stats.BufferedBytes = max(s.stats.BufferedBytes, int64(cap(s.projectionValues)))
 	}
@@ -545,6 +1153,11 @@ func (s *fileSmallScan) releaseFileProjection() {
 	clear(s.projectionFields)
 	clear(s.projectionValues)
 	clear(s.cells)
+	clear(s.projectionOrdinals)
+	clear(s.projectionOutput)
+	clear(s.projectionScalars)
+	clear(s.projectionSlots)
+	clear(s.projectionFallback)
 	s.projection = nil
 	s.projectionPlan = nil
 	s.projectionFilter = 0
@@ -555,4 +1168,12 @@ func (s *fileSmallScan) releaseFileProjection() {
 	s.projectionFields = nil
 	s.projectionValues = nil
 	s.cells = nil
+	s.projectionOrdinals = nil
+	s.projectionOutput = nil
+	s.projectionScalars = nil
+	s.projectionSlots = nil
+	s.projectionFallback = nil
+	s.projectionTextReserved = 0
+	s.projectionLateTextReserved = 0
+	s.projectionFallbackReserved = 0
 }

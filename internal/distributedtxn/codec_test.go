@@ -217,3 +217,28 @@ func BenchmarkTargetDigestScopes(b *testing.B) {
 		b.Fatal("zero digest")
 	}
 }
+
+func TestValidateIntentScopeMatchesSingularSlice(t *testing.T) {
+	for _, test := range []struct {
+		scope IntentScope
+		bits  uint8
+	}{
+		{IntentScope{Start: 0, End: 1}, 8},
+		{IntentScope{Start: 0, End: 256}, 8},
+		{IntentScope{Start: 255, End: 256}, 8},
+		{IntentScope{Start: 0, End: 257}, 8},
+		{IntentScope{Start: 256, End: 256}, 8},
+		{IntentScope{Start: 10, End: 5}, 8},
+		{IntentScope{Start: 0, End: 1 << 24}, 24},
+		{IntentScope{Start: 0, End: (1 << 24) + 1}, 24},
+		{IntentScope{Start: 0, End: 1}, 7},
+		{IntentScope{Start: 0, End: 1}, 25},
+		{IntentScope{Start: 0, End: 0}, 0},
+		{IntentScope{Start: ^uint32(0), End: ^uint32(0)}, 24},
+	} {
+		if got := ValidateIntentScope(test.scope, test.bits); got != ValidateIntentScopes([]IntentScope{test.scope}, test.bits) {
+			t.Fatalf("scope=%+v bits=%d singular=%v plural=%v",
+				test.scope, test.bits, got, ValidateIntentScopes([]IntentScope{test.scope}, test.bits))
+		}
+	}
+}

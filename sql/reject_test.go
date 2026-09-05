@@ -166,12 +166,8 @@ func TestRejectsInvalidGroupingAndAggregation(t *testing.T) {
 			`SELECT SUM(a) FROM t WHERE SUM(a) > 1`, 30, "use HAVING"},
 		{"HAVING without grouping",
 			`SELECT a FROM t HAVING a = 1`, 23, "HAVING requires GROUP BY"},
-		{"HAVING an aggregate the SELECT list omits",
-			`SELECT team FROM t GROUP BY team HAVING SUM(a) > 1`, 40, "add it to the SELECT list"},
 		{"HAVING a path that is not a key",
 			`SELECT team, COUNT(*) FROM t GROUP BY team HAVING city = 'x'`, 50, "belongs in WHERE"},
-		{"HAVING COUNT(*) when the SELECT list omits it",
-			`SELECT team FROM t GROUP BY team HAVING COUNT(*) > 1`, 40, "HAVING tests COUNT(*)"},
 	})
 }
 

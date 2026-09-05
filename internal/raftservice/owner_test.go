@@ -433,17 +433,22 @@ func TestPointReadResponseBudgetSaturatesAcrossLiveGrowthBoundaryLeases(t *testi
 		MaxIngressItems: 1, MaxIngressBytes: 16,
 		MaxPendingReadItems: 2, MaxPendingReadBytes: charge,
 	}}
+	authorized := make(chan struct{})
 	authorize := func() {
 		request := <-owner.ingress
 		request.reply <- ownerReply{read: readAuthorization{
 			source: source, minimumApplied: request.read.minimumApplied,
 		}}
 		owner.release(request.bytes)
+		authorized <- struct{}{}
 	}
 	go authorize()
 	request := PointReadRequest{Fence: serving, Relation: 1, Key: []byte("k"),
 		MinimumApplied: 9, MaxValueBytes: maximum}
 	result, lease, err := owner.ReadPoint(context.Background(), request)
+	// The response and ingress release are separate owner operations. Wait
+	// for the fake owner to finish before testing the response-lease budget.
+	<-authorized
 	if err != nil || !result.Found || len(result.Value) != maximum || lease == nil {
 		t.Fatalf("first result found=%t bytes=%d lease=%T err=%v",
 			result.Found, len(result.Value), lease, err)
@@ -466,6 +471,7 @@ func TestPointReadResponseBudgetSaturatesAcrossLiveGrowthBoundaryLeases(t *testi
 	} else {
 		nextLease.Release()
 	}
+	<-authorized
 	if owner.pendingReadItems != 0 || owner.pendingReadBytes != 0 {
 		t.Fatalf("pending reads=%d bytes=%d", owner.pendingReadItems, owner.pendingReadBytes)
 	}

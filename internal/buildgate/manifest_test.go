@@ -71,6 +71,22 @@ func TestGeneratedManifestMatchesCurrentLedgerSemantics(t *testing.T) {
 	}
 }
 
+func TestPortableSidecarsRejectPreviousDiskGrammar(t *testing.T) {
+	current := CurrentProfile()
+	previous := current
+	previous.DiskGrammar = GrammarID{0xa7, 0xa8, 0x38, 0x0d, 0x94, 0x18, 0xd4, 0xcc, 0x0b, 0xf4, 0x39, 0x95, 0x9e, 0x54, 0xb4, 0xc4}
+	if _, err := CheckCompatibility(current, previous); !errors.Is(err, ErrDiskGrammar) {
+		t.Fatalf("pre-portable peer admission = %v, want disk grammar mismatch", err)
+	}
+	gate, err := NewCurrentDiskGate(current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gate.AuthorizeDiskAdoption(DiskIdentity{Grammar: previous.DiskGrammar, Required: previous.Required}); !errors.Is(err, ErrDiskGrammar) {
+		t.Fatalf("pre-portable disk adoption = %v, want disk grammar mismatch", err)
+	}
+}
+
 func TestBuildAt1AEB86AIsIncompatibleWithCurrentBeforeWireOrDiskAdmission(t *testing.T) {
 	current := CurrentProfile()
 	if current.WireGrammar == buildgateAt1AEB86A.WireGrammar ||

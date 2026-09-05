@@ -33,7 +33,7 @@ const (
 // by the base replicated SQL root. The user recovery journal is created with
 // the replacement user-storage incarnation at bind. TransactionMarkerBytes is
 // published by the same catalog cut before txn.vtm is minted, so every mint or
-// recovery has an authoritative expected physical profile.
+// recovery has an authoritative expected capacity profile.
 type ReplicatedShardStoreSidecarProfile struct {
 	UserRecoveryJournalBytes uint64
 	TransactionMarkerBytes   uint64

@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 package gatewayruntime
 
@@ -23,7 +23,13 @@ import (
 func TestPostgreSQLDevOnlineCreateTableAndRestart(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Minute)
 	defer cancel()
-	root := t.TempDir()
+	// Keep the persisted DDL Unix socket below both platforms' pathname bound;
+	// macOS's default test temporary directory includes a long /var prefix.
+	root, err := os.MkdirTemp("/tmp", "vdb-ddl-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
 	bin := filepath.Join(root, "bin")
 	if err := os.Mkdir(bin, 0700); err != nil {
 		t.Fatal(err)
@@ -107,6 +113,10 @@ active BOOLEAN NOT NULL
 		}
 	}
 	check(connection)
+	wildcard := ddlWireQuery(t, connection, `SELECT d.*,COALESCE(d.score,0) AS chosen FROM (SELECT id,score FROM employees) d WHERE d.id='employee-0001' ORDER BY chosen DESC`, true)
+	if wildcard.code != "" || len(wildcard.rows) != 1 || len(wildcard.rows[0]) != 3 || wildcard.rows[0][0] != `"employee-0001"` || wildcard.rows[0][1] != "1" || wildcard.rows[0][2] != "1" {
+		t.Fatalf("scalar relation wildcard: %+v", wildcard)
+	}
 	for _, tc := range []struct{ sql, value string }{
 		{`SELECT COALESCE(SUM(score),0) FROM employees`, "49500"},
 		{`SELECT AVG(score) FROM employees`, "49.5"},
@@ -114,6 +124,11 @@ active BOOLEAN NOT NULL
 		{`SELECT SUM(score) FROM employees WHERE COALESCE(score,0)>50`, "36750"},
 		{`WITH c AS (SELECT id,score FROM employees) SELECT COUNT(*) FROM c WHERE id IS NOT DISTINCT FROM 'employee-0001' AND COALESCE(score,0)>0`, "1"},
 		{`SELECT COUNT(*) FROM employees WHERE id IS NOT DISTINCT FROM NULL`, "0"},
+		{`SELECT COALESCE(SUM(score),0) FROM employees HAVING COUNT(*)>999`, "49500"},
+		{`SELECT score FROM employees GROUP BY score HAVING COUNT(*)=10 ORDER BY score DESC LIMIT 1`, "99"},
+		{`SELECT score FROM employees GROUP BY score HAVING score=99 AND COALESCE(COUNT(*),0)=10`, "99"},
+		{`SELECT 1 FROM employees WHERE id IS NOT DISTINCT FROM NULL HAVING COUNT(*)=0`, "1"},
+		{`SELECT d.total FROM employees a CROSS JOIN LATERAL (SELECT COUNT(*) AS total FROM employees b WHERE b.id='employee-0001' GROUP BY a.score HAVING SUM(a.score)>0 AND SUM(b.score)>0) d WHERE a.id='employee-0001'`, "1"},
 		{`WITH c AS (SELECT id,score FROM employees) SELECT score FROM c WHERE id IS NOT DISTINCT FROM 'employee-0001'`, "1"},
 		{`SELECT CASE WHEN city IS DISTINCT FROM NULL THEN score ELSE 0 END FROM employees WHERE id='employee-0001'`, "1"},
 		{`SELECT score FROM employees ORDER BY GREATEST(score,0) DESC LIMIT 1`, "99"},

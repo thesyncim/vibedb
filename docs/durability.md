@@ -96,6 +96,20 @@ backend, and buffered writes. It uses the ordinary filesystem sync class. On
 Darwin and storage stacks with volatile caches it does not promise sudden-power
 survival. It never weakens synchronous or asynchronous durability.
 
+## Fixed-capacity RF3 sidecars
+
+RF3 recovery journals and transaction markers use portable fixed-capacity
+allocation. Creation uses native preallocation when supported and synchronizes
+the published file. Reopen validates the exact geometry and records without
+rewriting bytes or issuing an allocation sync. Durable writes retain their
+existing acknowledgement barriers.
+
+Portable allocation does not reserve private backing for every future
+copy-on-write overwrite: disk-full errors can still occur. Such errors follow
+the existing definite-failure or outcome-unknown recovery rules. Explicit
+strict allocation remains available and rejects portable sidecars. The
+allocation mode is persisted in the [header flags](format.md#recovery-journal).
+
 ## Flush and close
 
 `Collection.Flush` waits until the current reader-visible generation is
