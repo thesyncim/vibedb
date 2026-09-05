@@ -12,6 +12,7 @@ measure horizontal multi-machine scaling, or enable profiling.
 """
 
 import argparse
+import copy
 from datetime import datetime, timezone
 import hashlib
 import importlib.util
@@ -28,10 +29,14 @@ CONTROL = REPO / "scripts" / "bench" / "run-fused-node-comparison.py"
 VALIDATOR = REPO / "scripts" / "bench" / "summarize-crdb-sql.py"
 
 DEFAULT_WORKLOADS = "point_hit,point_miss,range_64,group_16"
-# ``update_existing`` is retained as an optional control workload.  The
-# default remains the four requested reads, and the control is useful when a
-# campaign needs to separate read-path changes from write admission effects.
-ALLOWED_WORKLOADS = frozenset((*DEFAULT_WORKLOADS.split(","), "update_existing"))
+# Keep the default four-cell read matrix stable while allowing the complete
+# bounded read/write set and the two explicit mixed controls when a campaign
+# requests them.  ``mixed`` is canonicalized by the fixture to
+# ``mixed_read_update``.
+ALLOWED_WORKLOADS = frozenset({
+    "point_hit", "point_miss", "range_32", "range_64", "range_256",
+    "group_16", "update_existing", "mixed_read_update", "mixed_uniform",
+})
 ALLOWED_CLIENTS = frozenset((1, 8))
 ALLOWED_GROUPS = frozenset((4, 16))
 ALLOWED_PHYSICAL_NODES = frozenset((3, 6))
@@ -92,6 +97,9 @@ def parser():
                        help="unmeasured operations before each trial")
     value.add_argument("--repetitions", type=int, default=DEFAULT_REPETITIONS,
                        help="repetitions per workload and client count")
+    value.add_argument("--after-arg", action="append", default=[],
+                       help="one exact candidate cluster-dev argv token forwarded only to the after arm; "
+                            "use --after-arg=--flag for tokens beginning with a dash")
     value.add_argument("--cpus", default=DEFAULT_CPUS,
                        help="aggregate Docker CPU ceiling shared by the fixture")
     value.add_argument("--memory", default=DEFAULT_MEMORY,
@@ -108,7 +116,8 @@ def parse_workloads(raw, fixture):
     workloads = fixture.parse_workloads(raw, "workloads")
     if any(workload not in ALLOWED_WORKLOADS for workload in workloads):
         raise fixture.RunnerError(
-            "workloads must be a unique subset of point_hit, point_miss, range_64, group_16, update_existing")
+            "workloads must be a unique subset of point_hit, point_miss, range_32, range_64, "
+            "range_256, group_16, update_existing, mixed_read_update, mixed_uniform")
     return workloads
 
 
@@ -177,6 +186,18 @@ def make_fixture_args(selected, fixture, workloads):
     ])
 
 
+def candidate_args_for_arm(arm, after_args):
+    """Return the exact candidate argv tokens for one recorded arm."""
+    return list(after_args) if arm == "after" else []
+
+
+def fixture_args_for_arm(args, arm, after_args):
+    """Clone fixture Namespace so one arm/order cannot mutate another."""
+    arm_args = copy.copy(args)
+    arm_args.candidate_arg = candidate_args_for_arm(arm, after_args)
+    return arm_args
+
+
 def read_cells(selected, fixture, workloads, clients):
     """Create the one matched read cell for the selected topology and dataset."""
     tables = fixture.table_names(selected.groups, "rf3_sql_group")
@@ -232,16 +253,43 @@ def verify_build_metadata(binaries, arch, fixture):
     return metadata
 
 
-def resolve_refs(selected, fixture, repo, client_info):
-    """Resolve both refs and prove that the before commit is an ancestor."""
+def verify_same_revision_binaries(hashes, fixture):
+    """Require independently built same-ref server binaries to be identical."""
+    pairs = {}
+    for suffix in ("vibedb", "vibedb-shard", "vibedb-gateway"):
+        before_name = "parent-" + suffix
+        after_name = "candidate-" + suffix
+        before_hash = hashes.get(before_name)
+        after_hash = hashes.get(after_name)
+        if before_hash is None or after_hash is None or before_hash != after_hash:
+            raise fixture.RunnerError(
+                "same-ref feature toggle produced different "
+                f"{suffix} binaries: {before_hash!r} != {after_hash!r}")
+        pairs[suffix] = {
+            "before_binary": before_name,
+            "after_binary": after_name,
+            "sha256": before_hash,
+        }
+    return {
+        "verified": True,
+        "mode": "independently-built same-ref binaries with equal hashes",
+        "pairs": pairs,
+    }
+
+
+def resolve_refs(selected, fixture, repo, client_info, after_args=None):
+    """Resolve refs and prove ancestry, allowing same-ref feature toggles only."""
+    after_args = [] if after_args is None else list(after_args)
     baseline = fixture.text_output([
         "git", "rev-parse", selected.baseline_ref + "^{commit}"
     ], cwd=repo)
     candidate = fixture.text_output([
         "git", "rev-parse", selected.candidate_ref + "^{commit}"
     ], cwd=repo)
-    if baseline == candidate:
-        raise fixture.RunnerError("baseline and candidate commits must be distinct")
+    same_revision = baseline == candidate
+    if same_revision and not after_args:
+        raise fixture.RunnerError(
+            "baseline and candidate commits must be distinct unless --after-arg is provided")
     fixture.run(["git", "merge-base", "--is-ancestor", baseline, candidate], cwd=repo)
     return {
         "before": baseline,
@@ -250,7 +298,24 @@ def resolve_refs(selected, fixture, repo, client_info):
         "requested_after": selected.candidate_ref,
         "client_source_revision": client_info["revision"],
         "baseline_is_ancestor": True,
+        "same_revision": same_revision,
+        "same_revision_reason": "after-arg feature toggle" if same_revision else None,
     }
+
+
+def prepare_worktrees(repo, before, after, root, fixture):
+    """Prepare two detached trees, including duplicate detached trees for a toggle."""
+    if before != after:
+        return fixture.prepare_worktrees(repo, before, after, root)
+    parent = root / "parent"
+    candidate = root / "candidate"
+    fixture.run(["git", "worktree", "add", "--detach", parent, before], cwd=repo)
+    try:
+        fixture.run(["git", "worktree", "add", "--detach", candidate, after], cwd=repo)
+    except Exception:
+        fixture.run(["git", "worktree", "remove", "--force", parent], cwd=repo, check=False)
+        raise
+    return parent, candidate
 
 
 def retain_before_after_diff(repo, refs, destination, fixture):
@@ -274,6 +339,11 @@ def run_campaign(selected, fixture, destination, fixture_args, cells, refs, arch
             "arm and revision identify the immutable source"
         ),
         "fixture_engine": "candidate for both VibeDB arms; crdb for the oracle arm",
+        "arm_args": {
+            "before": [],
+            "after": list(selected.after_arg),
+            "crdb": [],
+        },
         "topology": {
             "replication_factor": 3,
             "physical_nodes": selected.physical_nodes,
@@ -329,8 +399,8 @@ def run_campaign(selected, fixture, destination, fixture_args, cells, refs, arch
     try:
         with tempfile.TemporaryDirectory(prefix="vibedb-distributed-read-") as temp:
             work = Path(temp)
-            parent, candidate = fixture.prepare_worktrees(
-                repo, baseline_revision, candidate_revision, work)
+            parent, candidate = prepare_worktrees(
+                repo, baseline_revision, candidate_revision, work, fixture)
             client_tree = work / "client"
             try:
                 fixture.run([
@@ -354,6 +424,9 @@ def run_campaign(selected, fixture, destination, fixture_args, cells, refs, arch
                 fixture_args.runtime_image_id = manifest["images"]["runtime"]["Id"]
                 fixture.extract_crdb_binary(binaries)
                 manifest["build_binary_sha256"] = fixture.binary_hashes(binaries)
+                if refs.get("same_revision"):
+                    manifest["same_revision_binary_identity"] = verify_same_revision_binaries(
+                        manifest["build_binary_sha256"], fixture)
                 manifest["vibedb_build_metadata"] = verify_build_metadata(
                     binaries, arch, fixture)
                 manifest["executable_formats"] = fixture.text_output([
@@ -370,7 +443,9 @@ def run_campaign(selected, fixture, destination, fixture_args, cells, refs, arch
                 manifest["planned_runs"] = [
                     {"cell": cell["id"], "order": order, "arm": arm,
                      "fixture_engine": "crdb" if arm == "crdb" else "candidate",
-                     "revision": refs.get(arm, fixture.CRDB)}
+                     "revision": refs.get(arm, fixture.CRDB),
+                     "candidate_arg": candidate_args_for_arm(
+                         arm, selected.after_arg)}
                     for order, arms in ORDER_ENGINES.items()
                     for cell in cells for arm in arms
                 ]
@@ -389,15 +464,21 @@ def run_campaign(selected, fixture, destination, fixture_args, cells, refs, arch
                                 "order": order,
                                 "cell": cell,
                                 "evidence_path": str(run_dir.relative_to(destination)),
+                                "candidate_arg": candidate_args_for_arm(
+                                    arm, selected.after_arg),
                             }
                             fixture.write_json(destination / "manifest.json", manifest)
                             print(f"{order}: {arm} starting", flush=True)
+                            arm_args = fixture_args_for_arm(
+                                fixture_args, arm, selected.after_arg)
                             result = fixture.run_engine(
-                                fixture_args, cell, fixture_engine, order,
+                                arm_args, cell, fixture_engine, order,
                                 arm_binaries[arm], run_dir, schema, arch)
                             result["arm"] = arm
                             result["revision"] = refs.get(arm, fixture.CRDB)
                             result["fixture_engine"] = fixture_engine
+                            result["candidate_arg"] = candidate_args_for_arm(
+                                arm, selected.after_arg)
                             result["dataset"] = {
                                 "rows_per_table": selected.rows,
                                 "table_count": len(cell["tables"]),
@@ -467,7 +548,8 @@ def main(argv=None):
         if client_info["dirty"]:
             raise fixture.RunnerError(
                 "shared client source must be clean so one immutable client is used by every arm")
-        destination_refs = resolve_refs(selected, fixture, repo, client_info)
+        destination_refs = resolve_refs(
+            selected, fixture, repo, client_info, selected.after_arg)
         retain_before_after_diff(repo, destination_refs, destination, fixture)
         arch = fixture.docker_architecture()
         manifest = run_campaign(
@@ -486,6 +568,11 @@ def main(argv=None):
             manifest = {}
         manifest.setdefault("schema", "vibedb.distributed-read-comparison/1")
         manifest.setdefault("profiling", False)
+        manifest.setdefault("arm_args", {
+            "before": [],
+            "after": list(selected.after_arg),
+            "crdb": [],
+        })
         manifest.setdefault("cells", cells)
         manifest["refs"] = destination_refs
         manifest["status"] = "incomplete-or-failed"

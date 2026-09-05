@@ -34,6 +34,7 @@ class DistributedReadRunnerTest(unittest.TestCase):
         self.assertEqual(selected.operations, 20000)
         self.assertEqual(selected.warmup, 1000)
         self.assertEqual(selected.repetitions, 3)
+        self.assertEqual(selected.after_arg, [])
 
     def test_options_allow_group_focus_and_write_control(self):
         selected = self.selected(
@@ -54,7 +55,7 @@ class DistributedReadRunnerTest(unittest.TestCase):
 
     def test_options_reject_unbounded_workloads_clients_and_counts(self):
         for extra, message in (
-                (("--workloads", "mixed_read_update"), "workloads"),
+                (("--workloads", "update_uniform"), "workloads"),
                 (("--clients", "4"), "clients"),
                 (("--rows", "63"), "rows"),
                 (("--scans", "0"), "scans"),
@@ -64,6 +65,20 @@ class DistributedReadRunnerTest(unittest.TestCase):
                 selected = self.selected(*extra)
                 with self.assertRaisesRegex(FIXTURE.RunnerError, message):
                     MODULE.validate_options(selected, FIXTURE)
+
+    def test_options_allow_complete_read_write_matrix_and_mixed_control(self):
+        selected = self.selected(
+            "--workloads",
+            "point_hit,point_miss,range_32,range_64,range_256,group_16,update_existing,mixed_read_update",
+            "--groups", "16", "--clients", "1,8")
+        got = MODULE.validate_options(selected, FIXTURE)
+        self.assertEqual(got["workloads"], [
+            "point_hit", "point_miss", "range_32", "range_64", "range_256",
+            "group_16", "update_existing", "mixed_read_update",
+        ])
+        mixed = self.selected("--workloads", "mixed")
+        self.assertEqual(MODULE.validate_options(mixed, FIXTURE)["workloads"],
+                         ["mixed_read_update"])
 
     def test_cells_are_same_fused_candidate_shape_for_every_arm(self):
         selected = self.selected("--workloads", "point_hit,group_16")
@@ -136,6 +151,58 @@ class DistributedReadRunnerTest(unittest.TestCase):
                 MODULE.resolve_refs(
                     selected, FIXTURE, Path("/repo"), {"revision": "client-sha"})
 
+        with patch.object(FIXTURE, "text_output", return_value="same-sha"), \
+                patch.object(FIXTURE, "run") as run:
+            refs = MODULE.resolve_refs(
+                selected, FIXTURE, Path("/repo"), {"revision": "client-sha"},
+                ["--read-authority"])
+        self.assertEqual(refs["before"], "same-sha")
+        self.assertEqual(refs["after"], "same-sha")
+        self.assertTrue(refs["same_revision"])
+        self.assertEqual(refs["same_revision_reason"], "after-arg feature toggle")
+        run.assert_called_once_with(
+            ["git", "merge-base", "--is-ancestor", "same-sha", "same-sha"],
+            cwd=Path("/repo"))
+
+    def test_duplicate_detached_worktrees_are_used_for_same_revision_toggle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            calls = []
+
+            class FakeFixture:
+                def run(self, argv, **kwargs):
+                    calls.append((list(argv), kwargs))
+                    if argv[:4] == ["git", "worktree", "add", "--detach"]:
+                        Path(argv[4]).mkdir()
+
+            before, after = MODULE.prepare_worktrees(
+                Path("/repo"), "same-sha", "same-sha", root, FakeFixture())
+
+        self.assertEqual(before, root / "parent")
+        self.assertEqual(after, root / "candidate")
+        self.assertEqual([call[0] for call in calls], [
+            ["git", "worktree", "add", "--detach", root / "parent", "same-sha"],
+            ["git", "worktree", "add", "--detach", root / "candidate", "same-sha"],
+        ])
+
+    def test_same_revision_requires_equal_server_binary_hashes(self):
+        class FakeFixture:
+            class RunnerError(RuntimeError):
+                pass
+
+        hashes = {
+            "parent-vibedb": "a", "candidate-vibedb": "a",
+            "parent-vibedb-shard": "b", "candidate-vibedb-shard": "b",
+            "parent-vibedb-gateway": "c", "candidate-vibedb-gateway": "c",
+        }
+        identity = MODULE.verify_same_revision_binaries(hashes, FakeFixture)
+        self.assertTrue(identity["verified"])
+        self.assertEqual(identity["pairs"]["vibedb-shard"]["sha256"], "b")
+
+        hashes["candidate-vibedb-gateway"] = "different"
+        with self.assertRaisesRegex(FakeFixture.RunnerError, "gateway binaries"):
+            MODULE.verify_same_revision_binaries(hashes, FakeFixture)
+
     def test_make_fixture_args_keeps_shared_client_and_oracle_contract(self):
         selected = self.selected("--groups", "16", "--physical-nodes", "6",
                                  "--workloads", "group_16", "--scans", "1000")
@@ -158,6 +225,7 @@ class DistributedReadRunnerTest(unittest.TestCase):
             output = root / "evidence"
             selected = MODULE.parser().parse_args([
                 str(output), "--baseline-ref", "base-ref", "--candidate-ref", "candidate-ref",
+                "--after-arg=--read-authority",
                 "--rows", "64", "--operations", "8", "--scans", "8", "--warmup", "0",
                 "--repetitions", "1",
             ])
@@ -199,8 +267,12 @@ class DistributedReadRunnerTest(unittest.TestCase):
                 return binaries, "go version go1.27.0 linux/amd64"
 
             def fake_run_engine(args, cell, engine, order, binaries, run_dir, schema, arch):
-                events.append((order, engine, Path(binaries).name))
-                if len([event for event in events if isinstance(event, tuple)]) == 5:
+                events.append((order, engine, Path(binaries).name,
+                               list(args.candidate_arg)))
+                # The fixture may mutate its private Namespace; no later arm or
+                # order may inherit that list.
+                args.candidate_arg.append("--fixture-mutated")
+                if len(events) - 1 == 5:
                     return {"status": "failed", "client_exit_code": 1, "errors": ["late failure"]}
                 return {"status": "completed", "client_exit_code": 0, "errors": []}
 
@@ -218,6 +290,7 @@ class DistributedReadRunnerTest(unittest.TestCase):
                     patch.object(FIXTURE, "run_engine", side_effect=fake_run_engine):
                 code = MODULE.main([
                     str(output), "--baseline-ref", "base-ref", "--candidate-ref", "candidate-ref",
+                    "--after-arg=--read-authority",
                     "--rows", "64", "--operations", "8", "--scans", "8", "--warmup", "0",
                     "--repetitions", "1",
                 ])
@@ -230,11 +303,20 @@ class DistributedReadRunnerTest(unittest.TestCase):
             self.assertIn("control_sha256", manifest)
             self.assertIn("active_run", manifest)
             self.assertFalse(manifest["profiling"])
+            self.assertEqual(manifest["arm_args"], {
+                "before": [], "after": ["--read-authority"], "crdb": [],
+            })
+            self.assertEqual([run["candidate_arg"] for run in manifest["runs"]], [
+                [], ["--read-authority"], [], [], ["--read-authority"],
+            ])
             self.assertEqual(events[0], "build")
             self.assertEqual([event[1] for event in events[1:]],
                              ["candidate", "candidate", "crdb", "crdb", "candidate"])
             self.assertEqual([event[2] for event in events[1:]],
                              ["before-bin", "after-bin", "bin", "bin", "after-bin"])
+            self.assertEqual([event[3] for event in events[1:]], [
+                [], ["--read-authority"], [], [], ["--read-authority"],
+            ])
 
 
 if __name__ == "__main__":
