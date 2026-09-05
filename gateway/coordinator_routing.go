@@ -305,6 +305,11 @@ func coordinatorMapPredicate(e *sqlast.Expr, base int, path func(*sqlast.PathExp
 	if e == nil {
 		return nil
 	}
+	if _, known := sqlast.BooleanPredicateConstant(e); known {
+		// A Boolean literal has no source paths or bind ordinals to remap.
+		// The traversal still enforces projection/evaluation boundaries.
+		return e
+	}
 	if key, value, ok := sqlast.NullSafeEqualityPathOperand(e); ok {
 		e = &sqlast.Expr{Kind: sqlast.ExprCompare, Op: sqlast.OpEq, Path: key, Value: value, Pos: e.Pos, Column: -1}
 	}

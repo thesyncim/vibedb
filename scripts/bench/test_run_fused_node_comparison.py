@@ -27,6 +27,12 @@ class Arguments:
 
 
 class FusedNodeRunnerTest(unittest.TestCase):
+    def test_latch_copy_error_cannot_leave_completed_status(self):
+        result = {"status": "completed", "errors": [
+            "post-CONT diagnostic latch output was not retained"]}
+        self.assertIs(MODULE.mark_result_failed_if_errors(result), result)
+        self.assertEqual(result["status"], "failed")
+
     def test_diagnostic_bindings_use_manifest_local_member_and_exact_ready_pid(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

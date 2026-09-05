@@ -90,6 +90,13 @@ def run(argv, *, cwd=None, env=None, check=True, stdout=None, stderr=None):
     return completed
 
 
+def mark_result_failed_if_errors(result):
+    """Keep evidence-control failures from being reported as a completed run."""
+    if isinstance(result, dict) and result.get("status") == "completed" and result.get("errors"):
+        result["status"] = "failed"
+    return result
+
+
 def wait_for_diagnostic_preflight(process, container, ready_file, timeout=15):
     """Wait for every configured group/member to pass status and metrics cuts."""
     started = time.monotonic()
@@ -913,17 +920,25 @@ def run_engine(args, cell, engine, order, binaries, destination, schema, arch):
                                      "counter_deltas_include_background_work_between_snapshots": True}
             if getattr(args, "rf3_diagnostic", False):
                 diagnostic_ready_file = "/evidence/rf3-diagnostic-ready"
+                latch_file = getattr(args, "rf3_diagnostic_latch_file", "")
+                latch_output = getattr(args, "rf3_diagnostic_latch_output", "")
+                latch_required = bool(getattr(args, "rf3_diagnostic_latch_required", False))
+                if bool(latch_file) != bool(latch_output):
+                    raise RunnerError("RF3 diagnostic latch requires both request and output paths")
                 run(["docker", "exec", container, "rm", "-f", diagnostic_ready_file],
                     check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 diagnostic_log = (destination / "per-group-diagnostic.log").open("wb")
+                diagnostic_argv = ["docker", "exec", container, "/bench/rf3-diagnostic",
+                                  "-root", "/data/vibe",
+                                  "-output", "/evidence/per-group-snapshots.jsonl",
+                                  "-ready-file", diagnostic_ready_file,
+                                  "-interval", "500ms",
+                                  "-request-timeout", "350ms",
+                                  "-max-bytes", str(8 << 20)]
+                if latch_file:
+                    diagnostic_argv.extend(["-latch-file", latch_file, "-latch-output", latch_output])
                 diagnostic_process = subprocess.Popen(
-                    ["docker", "exec", container, "/bench/rf3-diagnostic",
-                     "-root", "/data/vibe",
-                     "-output", "/evidence/per-group-snapshots.jsonl",
-                     "-ready-file", diagnostic_ready_file,
-                     "-interval", "500ms",
-                     "-request-timeout", "350ms",
-                     "-max-bytes", str(8 << 20)],
+                    diagnostic_argv,
                     stdout=diagnostic_log, stderr=subprocess.STDOUT)
                 result["diagnostics"]["per_group"] = {
                     "binary": "/bench/rf3-diagnostic",
@@ -934,6 +949,13 @@ def run_engine(args, cell, engine, order, binaries, destination, schema, arch):
                     "sampling_cost_excluded_from_sql_measurement": True,
                     "preflight": "all group/member status and metrics cuts required before client launch",
                     "ready_file": diagnostic_ready_file,
+                    "latch": {
+                        "request_file": latch_file or None,
+                        "output_file": latch_output or None,
+                        "required": latch_required,
+                        "capture": "first complete cycle whose UTC is at or after the controller post-CONT request",
+                        "output": "post-cont-cut.json",
+                    },
                 }
                 result["diagnostics"]["per_group_preflight_seconds"] = wait_for_diagnostic_preflight(
                     diagnostic_process, container, diagnostic_ready_file)
@@ -970,9 +992,21 @@ def run_engine(args, cell, engine, order, binaries, destination, schema, arch):
             result["diagnostics"]["per_group_copied"] = copied.returncode == 0
             if copied.returncode != 0:
                 result["errors"].append("per-group diagnostic output was not retained")
+            latch_output = getattr(args, "rf3_diagnostic_latch_output", "")
+            if latch_output:
+                latch_destination = destination / "post-cont-cut.json"
+                copied_latch = run(["docker", "cp", container + ":" + latch_output,
+                                    latch_destination], check=False,
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                latch_copied = copied_latch.returncode == 0 and latch_destination.is_file()
+                result["diagnostics"]["post_cont_latch_copied"] = latch_copied
+                result["diagnostics"]["post_cont_latch_path"] = "post-cont-cut.json"
+                if not latch_copied and getattr(args, "rf3_diagnostic_latch_required", False):
+                    result["errors"].append("post-CONT diagnostic latch output was not retained")
         result.setdefault("log_files", []).append("client.log")
         result["client_exit_code"] = measured.returncode
         result["status"] = "completed" if measured.returncode == 0 else "failed"
+        mark_result_failed_if_errors(result)
         copied_report = run(["docker", "cp", container + ":/evidence/report.json", destination / "report.json"], check=False)
         if copied_report.returncode:
             raise RunnerError("client report was not retained")
@@ -1057,6 +1091,7 @@ def run_engine(args, cell, engine, order, binaries, destination, schema, arch):
             except Exception as exc:
                 result["errors"].append(f"fixture volume cleanup failed: {exc}")
                 result["status"] = "failed"
+            mark_result_failed_if_errors(result)
             write_json(destination / "run.json", result)
     return result
 

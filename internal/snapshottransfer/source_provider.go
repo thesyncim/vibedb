@@ -8,6 +8,7 @@ import (
 	"slices"
 	"sync"
 
+	"github.com/thesyncim/vibedb/internal/migrationbudget"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
@@ -30,6 +31,9 @@ type RetainedSourceExportOptions struct {
 	Limits         Limits
 	ChunkBytes     uint32
 	MaxConcurrent  int
+	// Budget is process-scoped. Every group provider on one physical node must
+	// receive the same pointer; nil keeps the package usable by offline tools.
+	Budget *migrationbudget.Budget
 
 	RuntimeIdentity   raftmember.RuntimeIdentity
 	SourceNode        rafttransport.NodeID
@@ -52,8 +56,10 @@ type RetainedSourceExportProvider struct {
 	options    RetainedSourceExportOptions
 	workspaces chan sourceExportWorkspace
 
-	mu     sync.RWMutex
-	closed bool
+	mu          sync.RWMutex
+	closed      bool
+	activePlans int
+	plansIdle   *sync.Cond
 }
 
 // InstallAbandonmentExitFaultForQualification installs one deterministic
@@ -94,11 +100,17 @@ func (provider *RetainedSourceExportProvider) NewDataService(
 		return nil, ErrSourceControl
 	}
 	provider.mu.RLock()
-	defer provider.mu.RUnlock()
 	if provider.closed || provider.repository == nil {
+		provider.mu.RUnlock()
+		return nil, ErrSourceControl
+	}
+	if options.Budget != nil && options.Budget != provider.options.Budget {
+		provider.mu.RUnlock()
 		return nil, ErrSourceControl
 	}
 	options.Repository = provider.repository
+	options.Budget = provider.options.Budget
+	provider.mu.RUnlock()
 	return NewService(options)
 }
 
@@ -121,6 +133,7 @@ func OpenRetainedSourceExportProvider(
 	if err != nil {
 		return nil, err
 	}
+	options.Limits.Budget = options.Budget
 	repository, err := OpenRepository(path, options.Limits)
 	if err != nil {
 		return nil, err
@@ -129,11 +142,17 @@ func OpenRetainedSourceExportProvider(
 		repository: repository, options: options,
 		workspaces: make(chan sourceExportWorkspace, options.MaxConcurrent),
 	}
+	provider.plansIdle = sync.NewCond(&provider.mu)
 	for range options.MaxConcurrent {
-		provider.workspaces <- sourceExportWorkspace{
-			artifact: make([]byte, 0, options.ChunkBytes),
-			transfer: make([]byte, 0, options.ChunkBytes),
+		workspace := sourceExportWorkspace{}
+		// Production callers provide a node budget. Keep workspace storage lazy
+		// in that mode so idle providers across many groups retain no chunk-sized
+		// buffers; the active budget bounds how many are materialized together.
+		if options.Budget == nil {
+			workspace.artifact = make([]byte, 0, options.ChunkBytes)
+			workspace.transfer = make([]byte, 0, options.ChunkBytes)
 		}
+		provider.workspaces <- workspace
 	}
 	return provider, nil
 }
@@ -235,18 +254,66 @@ func (provider *RetainedSourceExportProvider) PinSourceExport(
 	if cause := context.Cause(ctx); cause != nil {
 		return SourceExportPlan{}, cause
 	}
-	provider.mu.RLock()
-	if provider.closed || provider.repository == nil {
-		provider.mu.RUnlock()
-		return SourceExportPlan{}, ErrSourceControl
+	repository, budget, err := provider.retainPlan()
+	if err != nil {
+		return SourceExportPlan{}, err
+	}
+	var workspace sourceExportWorkspace
+	workspaceOwned := false
+	var workspaceBuffer *migrationbudget.BufferLease
+	var activeLease *migrationbudget.Lease
+	returnWorkspace := func() {
+		if budget != nil {
+			if activeLease != nil {
+				activeLease.Release()
+				activeLease = nil
+			}
+			if workspaceBuffer != nil {
+				workspaceBuffer.Release()
+				workspaceBuffer = nil
+			}
+			workspace.artifact = nil
+			workspace.transfer = nil
+		}
+		if workspaceOwned {
+			provider.workspaces <- workspace
+			workspaceOwned = false
+		}
+		provider.releasePlan()
 	}
 	select {
-	case workspace := <-provider.workspaces:
-		cut, err := provider.options.Cut.SnapshotArtifactCut()
-		if err != nil {
-			provider.workspaces <- workspace
-			provider.mu.RUnlock()
-			return SourceExportPlan{}, err
+	case workspace = <-provider.workspaces:
+		workspaceOwned = true
+		if budget != nil {
+			// Reserve both workspaces as one atomic node-scoped credit. Taking
+			// them independently lets concurrent plans each hold one half and
+			// wait forever for the other half when the pool is tight.
+			workspaceBytes := uint64(provider.options.ChunkBytes) * 2
+			workspaceBuffer, err = budget.AcquireBuffer(ctx, workspaceBytes)
+			if err != nil {
+				returnWorkspace()
+				return SourceExportPlan{}, err
+			}
+			// Buffer reservations precede the heavyweight permit so a blocked
+			// provider never occupies the last active slot while waiting for
+			// node-scoped memory.
+			activeLease, err = budget.Acquire(ctx)
+			if err != nil {
+				returnWorkspace()
+				return SourceExportPlan{}, err
+			}
+			bytes := workspaceBuffer.Bytes()
+			chunk := int(provider.options.ChunkBytes)
+			workspace.artifact = bytes[:0:chunk]
+			workspace.transfer = bytes[chunk : chunk : 2*chunk]
+		}
+		cut, cutErr := provider.options.Cut.SnapshotArtifactCut()
+		if cutErr != nil || cut == nil {
+			returnWorkspace()
+			if cutErr != nil {
+				return SourceExportPlan{}, cutErr
+			}
+			return SourceExportPlan{}, ErrSourceControl
 		}
 		fence := cut.Fence()
 		publication := cut.Publication()
@@ -257,30 +324,55 @@ func (provider *RetainedSourceExportProvider) PinSourceExport(
 			!slices.Contains(publication.ConfState.GetLearners(), request.TargetMember) ||
 			slices.Contains(publication.ConfState.GetVoters(), request.TargetMember) {
 			_ = cut.Close()
-			provider.workspaces <- workspace
-			provider.mu.RUnlock()
+			returnWorkspace()
 			return SourceExportPlan{}, ErrStaleFence
 		}
-		released := false
+		var releaseOnce sync.Once
 		return SourceExportPlan{
-			Repository: provider.repository, Snapshot: cut, ExpectedFence: fence,
+			Repository: repository, Snapshot: cut, ExpectedFence: fence,
+			Context: ctx, Budget: budget,
+			lease: activeLease,
 			Group: request.Group, SourceMember: request.SourceMember,
 			TargetMember: request.TargetMember, TargetStore: request.TargetStore,
 			TargetIncarnation: request.TargetIncarnation, ChunkBytes: provider.options.ChunkBytes,
 			ArtifactWorkspace: workspace.artifact, TransferWorkspace: workspace.transfer,
 			Release: func() {
-				if released {
-					return
-				}
-				released = true
-				provider.workspaces <- workspace
-				provider.mu.RUnlock()
+				releaseOnce.Do(func() {
+					returnWorkspace()
+				})
 			},
 		}, nil
 	default:
-		provider.mu.RUnlock()
+		returnWorkspace()
 		return SourceExportPlan{}, ErrBound
 	}
+}
+
+// retainPlan protects repository and snapshot ownership without holding the
+// provider mutex during the potentially paced export. Close waits for the
+// reference to drain before closing the repository.
+func (provider *RetainedSourceExportProvider) retainPlan() (*Repository, *migrationbudget.Budget, error) {
+	provider.mu.Lock()
+	defer provider.mu.Unlock()
+	if provider.closed || provider.repository == nil {
+		return nil, nil, ErrSourceControl
+	}
+	if provider.plansIdle == nil {
+		provider.plansIdle = sync.NewCond(&provider.mu)
+	}
+	provider.activePlans++
+	return provider.repository, provider.options.Budget, nil
+}
+
+func (provider *RetainedSourceExportProvider) releasePlan() {
+	provider.mu.Lock()
+	if provider.activePlans > 0 {
+		provider.activePlans--
+		if provider.activePlans == 0 && provider.plansIdle != nil {
+			provider.plansIdle.Broadcast()
+		}
+	}
+	provider.mu.Unlock()
 }
 
 func (provider *RetainedSourceExportProvider) matchesRequest(request SourceControlRequest) bool {
@@ -321,12 +413,20 @@ func (provider *RetainedSourceExportProvider) Close() error {
 		return nil
 	}
 	provider.mu.Lock()
-	defer provider.mu.Unlock()
 	if provider.closed {
+		provider.mu.Unlock()
 		return nil
 	}
 	provider.closed = true
-	return provider.repository.Close()
+	for provider.activePlans != 0 {
+		if provider.plansIdle == nil {
+			provider.plansIdle = sync.NewCond(&provider.mu)
+		}
+		provider.plansIdle.Wait()
+	}
+	repository := provider.repository
+	provider.mu.Unlock()
+	return repository.Close()
 }
 
 // findPublishedSource is a bounded restart lookup over repository metadata.

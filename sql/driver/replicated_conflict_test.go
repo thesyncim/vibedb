@@ -476,3 +476,34 @@ func TestReplicatedConflictPreservesParameterTypes(t *testing.T) {
 		t.Fatalf("typed result=%s code=%v", got, code)
 	}
 }
+
+func TestReplicatedConflictProgramOwnershipAndEnvelopeBound(t *testing.T) {
+	statement, err := sqlast.ParseStatement(`INSERT INTO employees VALUES (?),(?) ON CONFLICT DO UPDATE SET score=employees.score+?,city=?`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	program, err := EncodeReplicatedConflictProgram(
+		statement.Insert.OnConflictUpdate,
+		[]any{nil, nil, int64(5), "bound"},
+		[]query.ParameterType{query.ParameterTypeUnspecified, query.ParameterTypeUnspecified, query.ParameterTypeUnspecified, query.ParameterTypeText},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	left, err := replication.AppendConflictValue(nil, []byte(`{"id":"left","score":1}`), program)
+	if err != nil {
+		t.Fatal(err)
+	}
+	right, err := replication.AppendConflictValue(nil, []byte(`{"id":"right","score":2}`), program)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leftCandidate, leftProgram, leftOK := replication.OpenConflictValue(left)
+	rightCandidate, rightProgram, rightOK := replication.OpenConflictValue(right)
+	if !leftOK || !rightOK || string(leftCandidate) != `{"id":"left","score":1}` || string(rightCandidate) != `{"id":"right","score":2}` || !bytes.Equal(leftProgram, rightProgram) {
+		t.Fatalf("candidate/program ownership left=(%s,%x,%v) right=(%s,%x,%v)", leftCandidate, leftProgram, leftOK, rightCandidate, rightProgram, rightOK)
+	}
+	if _, err := replication.AppendConflictValue(nil, bytes.Repeat([]byte{'c'}, replication.MaxMutationValueBytes-8-len(program)+1), program); err == nil {
+		t.Fatal("accepted candidate plus program beyond the combined envelope")
+	}
+}

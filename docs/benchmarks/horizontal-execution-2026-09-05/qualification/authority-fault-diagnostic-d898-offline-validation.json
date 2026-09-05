@@ -1,0 +1,146 @@
+{
+  "binary_sha256": {
+    "candidate-vibedb": "77b158046bffc18f28c5720177b1e98f87ab4a86605fa80a9e194b0fbb2ce5a3",
+    "candidate-vibedb-gateway": "2b40ee0382befcd2eb33a4229ee5b010f0cfeecce7718a4f6bc28a510797916a",
+    "candidate-vibedb-shard": "a65a29a1a01f9cea57673bbb308c6f6a6831ee7c00715b73fe858a9fb0595abf",
+    "rf3-diagnostic": "21fcf7e5620d606824549f5a9127ff179c34b300f49e9d72d00c9b599d44254e",
+    "rf3-sqlbench": "9adc58a424cafd6100385df389431e1b0271ef1383f7f8083abed48ea6754c90"
+  },
+  "created_utc": "2026-09-05T19:37:59.015028Z",
+  "fault": {
+    "limitation": "Quarantine boolean was unavailable; readiness duration is retained without inferring quarantine proof.",
+    "pause": {
+      "node_id": "7f28932b0c5441531426ecc72377a5cd",
+      "observed_seconds": 7.041228167,
+      "pid": 293,
+      "post_cont_latch_request": {
+        "armed_after_post_pause_diagnostic": true,
+        "exit_code": 0,
+        "path": "fault/post-cont-latch-request.json",
+        "publish_exit_code": 0,
+        "remote_path": "/evidence/post-cont-latch.json",
+        "requested_utc": "2026-09-05T19:18:49.254190Z",
+        "temporary_remote_path": "/evidence/post-cont-latch.json.tmp"
+      },
+      "post_pause_counter_deltas": {
+        "066f4654224ab98ee123ecb2f3336883": {
+          "authority_read_hits": 444,
+          "authority_read_index_fallbacks": 1,
+          "read_authority_rounds_started": 1
+        },
+        "7f28932b0c5441531426ecc72377a5cd": {
+          "authority_read_hits": 6516,
+          "authority_read_index_fallbacks": 1,
+          "read_authority_rounds_started": 1
+        },
+        "ecbb35deb04efeab08524715969440b0": {
+          "authority_read_hits": 3704,
+          "authority_read_index_fallbacks": 3,
+          "read_authority_rounds_started": 3
+        }
+      },
+      "requested_seconds": 7.0,
+      "utc_continue_sent": "2026-09-05T19:18:49.254190Z",
+      "utc_stop_sent": "2026-09-05T19:18:42.212920Z"
+    },
+    "restart": {
+      "quarantine_observable": false,
+      "quarantine_observation_basis": "retained enabled marker plus first acknowledged diagnostic snapshot before the configured restart fence; diagnostics have no direct boolean quarantine field",
+      "quarantine_seconds": 6.11,
+      "recovery_elapsed_seconds": 0.038506541000003836,
+      "recovery_exit_code": 0,
+      "recovery_status": "complete",
+      "restart_ready_seconds": 7.634868084000004,
+      "same_volume": true,
+      "status": "incomplete-or-failed",
+      "utc_processes_stopped": "2026-09-05T19:22:41.204058Z",
+      "utc_ready": "2026-09-05T19:22:48.839103Z",
+      "utc_recovery_complete": "2026-09-05T19:22:49.554861Z",
+      "utc_sigkill": "2026-09-05T19:22:41.168475Z",
+      "utc_started": "2026-09-05T19:22:40.457417Z"
+    }
+  },
+  "filtered_raw_archive": {
+    "manifest_path": "filtered-raw-archive-manifest.json",
+    "manifest_sha256": "1337ca40dc60b9b0eed93ffff51a46cf3782827c5b53ae63b79e68e03c0d2a4b",
+    "path": "filtered-raw-evidence-d898.tar.gz",
+    "sha256": "854c6cfa022a42c39b92af500ca4d3f15257914d1e15f1162aa61fda05a530b3"
+  },
+  "input": {
+    "manifest": {
+      "failure": "diagnostic: post-CONT diagnostic latch was not retained: latch armed has invalid UTC",
+      "path": "manifest.json",
+      "sha256": "eefdcce6af86a6e473bd36378d1b008266f87d59193a0d5171656fc4e514355c",
+      "status": "incomplete-or-failed"
+    },
+    "post_cont_latch": {
+      "path": "candidate/post-cont-cut.json",
+      "sha256": "a567d1e15de4afe0bf903edfdd75fa9e9f283e546437754a396659b450a310b8"
+    },
+    "run_directory": "/private/tmp/vibedb-horizontal-authority-fault-diagnostic-d898-20260905T191703Z"
+  },
+  "purpose": "Offline revalidation of the retained post-CONT latch with exact RFC3339Nano ordering.",
+  "qualification_claimed": false,
+  "qualification_note": "This report does not qualify the run; the original manifest and status are preserved unchanged.",
+  "schema": "vibedb.rf3-diagnostic-offline-validation/1",
+  "validation": {
+    "authority_nodes": [
+      {
+        "acknowledged_serial": 4,
+        "acknowledged_utc": "2026-09-05T19:18:49.638130296Z",
+        "node_id": "066f4654224ab98ee123ecb2f3336883",
+        "pid": 292,
+        "serial": 4,
+        "source": "rf3-diagnostics-file",
+        "utc": "2026-09-05T19:18:49.638130296Z"
+      },
+      {
+        "acknowledged_serial": 4,
+        "acknowledged_utc": "2026-09-05T19:18:49.689131338Z",
+        "node_id": "7f28932b0c5441531426ecc72377a5cd",
+        "pid": 293,
+        "serial": 4,
+        "source": "rf3-diagnostics-file",
+        "utc": "2026-09-05T19:18:49.689131338Z"
+      },
+      {
+        "acknowledged_serial": 4,
+        "acknowledged_utc": "2026-09-05T19:18:49.74182538Z",
+        "node_id": "ecbb35deb04efeab08524715969440b0",
+        "pid": 294,
+        "serial": 4,
+        "source": "rf3-diagnostics-file",
+        "utc": "2026-09-05T19:18:49.74182538Z"
+      }
+    ],
+    "authority_snapshot_count": 3,
+    "captured_utc": "2026-09-05T19:18:50.316713922Z",
+    "complete": true,
+    "cycle_utc": "2026-09-05T19:18:50.298888588Z",
+    "event": "post-cont",
+    "schema": "vibedb.rf3-diagnostic-latch/1",
+    "sequence": 22
+  },
+  "validator": {
+    "file_sha256": "abf762871f7248d06fb9d0eb8da40c572ec8336bc4206011fc62b117045fa06f",
+    "parser": "integer epoch nanoseconds; one-to-nine RFC3339 fractional digits; numeric offsets accepted",
+    "source_revision": "662407f12f9abc98501e85d6db52cd856132be4b",
+    "source_status": "clean"
+  },
+  "workload_result": {
+    "benchmark_started_utc": "2026-09-05T19:18:39.961707292Z",
+    "client_exit_code": 0,
+    "client_log": {
+      "errors_zero_and_verified": true,
+      "path": "candidate/client.log",
+      "sha256": "d4dab6c3ac12ab766dcd5a2ea7b987c9789d99ed944aee3426d3335ef726f9e7"
+    },
+    "errors": [],
+    "setup_started_utc": "2026-09-05T19:18:36.437556Z",
+    "status": "completed",
+    "validation": {
+      "complete": true,
+      "samples_checked": 480000
+    }
+  }
+}

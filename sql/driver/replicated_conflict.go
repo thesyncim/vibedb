@@ -77,6 +77,17 @@ func ValidateReplicatedConflictAction(info TableInfo, action *sqlast.InsertConfl
 // it references. Candidate-only binds and the current row are never included in
 // the program. Dense remapping makes the template independent of INSERT arity.
 func EncodeReplicatedConflictValue(candidate []byte, action *sqlast.InsertConflictUpdate, args []any, parameterTypes []query.ParameterType) ([]byte, error) {
+	program, err := EncodeReplicatedConflictProgram(action, args, parameterTypes)
+	if err != nil {
+		return nil, err
+	}
+	return replication.AppendConflictValue(nil, candidate, program)
+}
+
+// EncodeReplicatedConflictProgram encodes the immutable action and bound values
+// shared by every candidate of one INSERT. The returned bytes are owned by the
+// caller. AppendConflictValue must still bound each candidate plus this program.
+func EncodeReplicatedConflictProgram(action *sqlast.InsertConflictUpdate, args []any, parameterTypes []query.ParameterType) ([]byte, error) {
 	if !ReplicatedConflictProgram(action) {
 		return nil, errReplicatedConflictProgram
 	}
@@ -108,7 +119,7 @@ func EncodeReplicatedConflictValue(candidate []byte, action *sqlast.InsertConfli
 		program = binary.LittleEndian.AppendUint32(program, uint32(len(value)))
 		program = append(program, value...)
 	}
-	return replication.AppendConflictValue(nil, candidate, program)
+	return program, nil
 }
 
 func decodeConflictConstant(value []byte) (sqlast.Operand, error) {

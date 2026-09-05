@@ -2,6 +2,7 @@ package snapshottransfer
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"sync"
 
+	"github.com/thesyncim/vibedb/internal/migrationbudget"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/storeio"
 )
@@ -24,6 +26,9 @@ type Limits struct {
 	MaxArtifacts     int
 	MaxArtifactBytes uint64
 	MaxDiskBytes     uint64
+	// Budget paces recovery and final artifact verification for a repository
+	// owned by a physical migration node. It is optional for offline tools.
+	Budget *migrationbudget.Budget
 }
 
 type record struct {
@@ -37,6 +42,8 @@ type record struct {
 	cursorLive bool
 	tempLive   bool
 	readers    uint32
+	finishMu   sync.Mutex
+	finishing  bool
 }
 
 type repositoryFault uint8
@@ -104,17 +111,48 @@ type Repository struct {
 	diskBytes uint64
 	closed    bool
 	verify    func(*os.File, Descriptor) error
+	budget    *migrationbudget.Budget
+	budgeted  bool
 	fault     func(repositoryFault) error
+	finishes  sync.WaitGroup
 }
 
 func OpenRepository(path string, limits Limits) (*Repository, error) {
-	return openRepository(path, limits, verifyReplicatedArtifact)
+	return openRepositoryWithBudget(path, limits, verifyReplicatedArtifact, true)
+}
+
+// AttachBudget associates a node-scoped budget with an already opened
+// repository. It is idempotent for the same pointer and rejects attempts to
+// mix physical-node owners on one repository.
+func (r *Repository) AttachBudget(budget *migrationbudget.Budget) error {
+	if r == nil {
+		return ErrRepository
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return ErrRepository
+	}
+	if budget == nil {
+		return nil
+	}
+	if r.budget != nil && r.budget != budget {
+		return ErrBound
+	}
+	r.budget = budget
+	return nil
 }
 
 func openRepository(
 	path string,
 	limits Limits,
 	verify func(*os.File, Descriptor) error,
+) (*Repository, error) {
+	return openRepositoryWithBudget(path, limits, verify, false)
+}
+
+func openRepositoryWithBudget(
+	path string, limits Limits, verify func(*os.File, Descriptor) error, budgeted bool,
 ) (*Repository, error) {
 	if path == "" || limits.MaxArtifacts <= 0 || limits.MaxArtifacts > 4096 ||
 		limits.MaxArtifactBytes == 0 || limits.MaxDiskBytes < limits.MaxArtifactBytes || verify == nil {
@@ -144,7 +182,7 @@ func openRepository(
 	}
 	r := &Repository{root: root, lock: lock, limits: limits,
 		records: make(map[[sha256.Size]byte]*record, limits.MaxArtifacts),
-		verify:  verify}
+		verify:  verify, budget: limits.Budget, budgeted: budgeted}
 	if err := r.recover(); err != nil {
 		_ = r.Close()
 		return nil, err
@@ -246,9 +284,17 @@ func (r *Repository) recover() error {
 			verifyErr := error(nil)
 			if readErr == nil && descriptorErr == nil && statErr == nil && d.ArtifactBytes <= r.limits.MaxArtifactBytes &&
 				d.ArtifactHash == hash && info.Size() == int64(DescriptorBytes)+int64(d.ArtifactBytes) {
-				verifyErr = verifyFileHash(file, d)
+				if r.budget != nil {
+					verifyErr = verifyFileHashBudgeted(context.Background(), r.budget, nil, file, d)
+				} else {
+					verifyErr = verifyFileHash(file, d)
+				}
 				if verifyErr == nil {
-					verifyErr = r.verify(file, d)
+					if r.budgeted {
+						verifyErr = verifyReplicatedArtifactBudgeted(context.Background(), r.budget, nil, file, d)
+					} else {
+						verifyErr = r.verify(file, d)
+					}
 				}
 			} else {
 				verifyErr = ErrRepository
@@ -315,9 +361,18 @@ func (r *Repository) recover() error {
 			if openErr != nil {
 				return openErr
 			}
-			verifyErr := verifyFileHash(publishedFile, d)
+			var verifyErr error
+			if r.budget != nil {
+				verifyErr = verifyFileHashBudgeted(context.Background(), r.budget, nil, publishedFile, d)
+			} else {
+				verifyErr = verifyFileHash(publishedFile, d)
+			}
 			if verifyErr == nil {
-				verifyErr = r.verify(publishedFile, d)
+				if r.budgeted {
+					verifyErr = verifyReplicatedArtifactBudgeted(context.Background(), r.budget, nil, publishedFile, d)
+				} else {
+					verifyErr = r.verify(publishedFile, d)
+				}
 			}
 			if verifyErr != nil {
 				_ = publishedFile.Close()
@@ -369,7 +424,7 @@ func (r *Repository) recover() error {
 	}
 	for _, rec := range r.records {
 		if !rec.complete && rec.offset == rec.descriptor.ArtifactBytes {
-			if err := r.finish(rec); err != nil {
+			if err := r.finish(context.Background(), nil, rec); err != nil {
 				return err
 			}
 		}
@@ -463,31 +518,94 @@ func (r *Repository) truncateStage(name string, offset uint64) error {
 
 // Offset returns the exact durably acknowledged resume point.
 func (r *Repository) Offset(d Descriptor) (uint64, bool, error) {
+	return r.OffsetContext(context.Background(), d)
+}
+
+// OffsetContext is the cancellation-aware resume lookup used by live
+// migration paths. Recovery callers may continue using Offset.
+func (r *Repository) OffsetContext(ctx context.Context, d Descriptor) (uint64, bool, error) {
+	return r.offsetContext(ctx, nil, d)
+}
+
+// OffsetContextWithLease carries an already held local phase lease into a
+// staged-artifact final verification. This prevents a pressure pause from
+// waiting while the caller still owns its active permit.
+func (r *Repository) OffsetContextWithLease(
+	ctx context.Context, lease *migrationbudget.Lease, d Descriptor,
+) (uint64, bool, error) {
+	return r.offsetContext(ctx, lease, d)
+}
+
+func (r *Repository) offsetContext(
+	ctx context.Context, lease *migrationbudget.Lease, d Descriptor,
+) (uint64, bool, error) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if r.closed || !d.Valid() || d.ArtifactBytes > r.limits.MaxArtifactBytes {
+		r.mu.Unlock()
 		return 0, false, ErrDescriptor
 	}
 	rec := r.records[d.ArtifactHash]
 	if rec == nil {
+		r.mu.Unlock()
 		return 0, false, nil
 	}
 	if rec.descriptor != d {
+		r.mu.Unlock()
 		return 0, false, ErrStaleFence
 	}
-	if !rec.complete && rec.offset == d.ArtifactBytes {
-		if err := r.finish(rec); err != nil {
-			return rec.offset, false, err
-		}
+	shouldFinish := !rec.complete && rec.offset == d.ArtifactBytes
+	if !shouldFinish {
+		offset, complete := rec.offset, rec.complete
+		r.mu.Unlock()
+		return offset, complete, nil
 	}
-	return rec.offset, rec.complete, nil
+	r.mu.Unlock()
+	if err := r.finish(ctx, lease, rec); err != nil {
+		r.mu.RLock()
+		offset := rec.offset
+		r.mu.RUnlock()
+		return offset, false, err
+	}
+	r.mu.RLock()
+	offset, complete := rec.offset, rec.complete
+	r.mu.RUnlock()
+	return offset, complete, nil
 }
 
 // Append verifies, writes, fsyncs, and advances one exact contiguous chunk.
 // An exact retry is idempotent. Reordered or overlapping bytes fail closed.
 func (r *Repository) Append(d Descriptor, offset uint64, chunk []byte, digest [sha256.Size]byte) (uint64, bool, error) {
+	return r.AppendContext(context.Background(), d, offset, chunk, digest)
+}
+
+// AppendContext is the cancellation-aware contiguous append used by live
+// receiver/export paths. It preserves Append's durable cursor semantics.
+func (r *Repository) AppendContext(ctx context.Context, d Descriptor, offset uint64, chunk []byte, digest [sha256.Size]byte) (uint64, bool, error) {
+	return r.appendContext(ctx, nil, d, offset, chunk, digest)
+}
+
+// AppendContextWithLease carries an already held local phase lease into final
+// repository verification. The verifier then continues at the lease's
+// downshifted rate without waiting on a foreground pause while holding that
+// active permit.
+func (r *Repository) AppendContextWithLease(
+	ctx context.Context, lease *migrationbudget.Lease, d Descriptor, offset uint64,
+	chunk []byte, digest [sha256.Size]byte,
+) (uint64, bool, error) {
+	return r.appendContext(ctx, lease, d, offset, chunk, digest)
+}
+
+func (r *Repository) appendContext(ctx context.Context, lease *migrationbudget.Lease, d Descriptor, offset uint64, chunk []byte, digest [sha256.Size]byte) (uint64, bool, error) {
+	if ctx == nil {
+		return 0, false, migrationbudget.ErrInvalidConfig
+	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	locked := true
+	defer func() {
+		if locked {
+			r.mu.Unlock()
+		}
+	}()
 	if r.closed || !d.Valid() || d.ArtifactBytes > r.limits.MaxArtifactBytes ||
 		len(chunk) == 0 || len(chunk) > int(d.ChunkBytes) || sha256.Sum256(chunk) != digest ||
 		offset > d.ArtifactBytes || uint64(len(chunk)) > d.ArtifactBytes-offset {
@@ -498,9 +616,16 @@ func (r *Repository) Append(d Descriptor, offset uint64, chunk []byte, digest [s
 		return 0, false, err
 	}
 	if !rec.complete && rec.offset == d.ArtifactBytes {
-		if err := r.finish(rec); err != nil {
-			return rec.offset, false, err
+		r.mu.Unlock()
+		locked = false
+		finishErr := r.finish(ctx, lease, rec)
+		r.mu.RLock()
+		offset, complete := rec.offset, rec.complete
+		r.mu.RUnlock()
+		if finishErr != nil {
+			return offset, false, finishErr
 		}
+		return offset, complete, nil
 	}
 	if offset < rec.offset || rec.complete {
 		if offset <= rec.offset && uint64(len(chunk)) <= rec.offset-offset &&
@@ -548,9 +673,16 @@ func (r *Repository) Append(d Descriptor, offset uint64, chunk []byte, digest [s
 	}
 	rec.offset = next
 	if next == d.ArtifactBytes {
-		if err = r.finish(rec); err != nil {
-			return next, false, err
+		r.mu.Unlock()
+		locked = false
+		finishErr := r.finish(ctx, lease, rec)
+		r.mu.RLock()
+		offset, complete := rec.offset, rec.complete
+		r.mu.RUnlock()
+		if finishErr != nil {
+			return offset, false, finishErr
 		}
+		return offset, complete, nil
 	}
 	return rec.offset, rec.complete, nil
 }
@@ -630,56 +762,117 @@ func (r *Repository) ensure(d Descriptor) (*record, error) {
 	return rec, nil
 }
 
-func (r *Repository) finish(rec *record) error {
-	f, err := openRegular(r.root, rec.stage, os.O_RDONLY, 0)
-	fromStage := err == nil
-	if errors.Is(err, os.ErrNotExist) {
-		f, err = openRegular(r.root, rec.published, os.O_RDONLY, 0)
+func (r *Repository) finish(ctx context.Context, lease *migrationbudget.Lease, rec *record) error {
+	if r == nil || ctx == nil || rec == nil {
+		return migrationbudget.ErrInvalidConfig
 	}
-	if err != nil {
+	rec.finishMu.Lock()
+	defer rec.finishMu.Unlock()
+	// Snapshot immutable names and the verifier under a short lock. The
+	// potentially slow hash/manifest pass runs without the repository mutex, so
+	// peer chunk reads and foreground repository callers are not serialized
+	// behind a paced wait.
+	r.mu.Lock()
+	if r.closed || r.root == nil || rec.complete {
+		r.mu.Unlock()
+		return nil
+	}
+	if r.records[rec.descriptor.ArtifactHash] != rec {
+		r.mu.Unlock()
+		return ErrStaleFence
+	}
+	if rec.finishing {
+		r.mu.Unlock()
+		return ErrArtifactBusy
+	}
+	rec.finishing = true
+	r.finishes.Add(1)
+	root := r.root
+	stage, published := rec.stage, rec.published
+	descriptor := rec.descriptor
+	budget, budgeted, verify := r.budget, r.budgeted, r.verify
+	r.mu.Unlock()
+	defer r.finishes.Done()
+	clearFinishing := func(err error) error {
+		r.mu.Lock()
+		rec.finishing = false
+		r.mu.Unlock()
 		return err
 	}
-	err = verifyFileHash(f, rec.descriptor)
+
+	f, err := openRegular(root, stage, os.O_RDONLY, 0)
+	fromStage := err == nil
+	if errors.Is(err, os.ErrNotExist) {
+		f, err = openRegular(root, published, os.O_RDONLY, 0)
+	}
+	if err != nil {
+		return clearFinishing(err)
+	}
+	err = verifyFileHashBudgeted(ctx, budget, lease, f, descriptor)
 	if err == nil {
-		err = r.verify(f, rec.descriptor)
+		if budgeted {
+			err = verifyReplicatedArtifactBudgeted(ctx, budget, lease, f, descriptor)
+		} else {
+			err = verify(f, descriptor)
+		}
 	}
 	err = errors.Join(err, f.Close())
 	if err != nil {
+		return clearFinishing(err)
+	}
+
+	// Reacquire the repository lock only for the durable publication transition.
+	r.mu.Lock()
+	finishLocked := func(err error) error {
+		rec.finishing = false
+		r.mu.Unlock()
 		return err
 	}
-	_, cursor, _, _ := artifactNames(rec.descriptor.ArtifactHash)
+	if r.closed || r.root == nil {
+		return finishLocked(ErrRepository)
+	}
+	if r.records[descriptor.ArtifactHash] != rec {
+		return finishLocked(ErrStaleFence)
+	}
+	if rec.complete {
+		return finishLocked(nil)
+	}
+	if rec.offset != descriptor.ArtifactBytes {
+		return finishLocked(ErrChunk)
+	}
+	_, cursor, _, _ := artifactNames(descriptor.ArtifactHash)
 	if fromStage {
-		if err = r.root.Rename(rec.stage, rec.published); err != nil {
-			return err
+		if err = r.root.Rename(stage, published); err != nil {
+			return finishLocked(err)
 		}
 		if err = r.inject(faultAfterPublishRename); err != nil {
-			return errors.Join(ErrOutcomeUnknown, err)
+			return finishLocked(errors.Join(ErrOutcomeUnknown, err))
 		}
 	}
 	removeErr := r.root.Remove(cursor)
 	if removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-		return removeErr
+		return finishLocked(removeErr)
 	}
 	if rec.cursorLive {
 		rec.cursorLive = false
 		r.subtractDisk(cursorBytes)
 	}
 	if err = r.inject(faultAfterCursorRemove); err != nil {
-		return errors.Join(ErrOutcomeUnknown, err)
+		return finishLocked(errors.Join(ErrOutcomeUnknown, err))
 	}
 	if err = syncRoot(r.root); err != nil {
-		return errors.Join(ErrOutcomeUnknown, err)
+		return finishLocked(errors.Join(ErrOutcomeUnknown, err))
 	}
 	if err = r.inject(faultAfterPublishSync); err != nil {
-		return errors.Join(ErrOutcomeUnknown, err)
+		return finishLocked(errors.Join(ErrOutcomeUnknown, err))
 	}
-	publishedFile, err := openRegular(r.root, rec.published, os.O_RDONLY, 0)
+	publishedFile, err := openRegular(r.root, published, os.O_RDONLY, 0)
 	if err != nil {
-		return err
+		return finishLocked(err)
 	}
 	rec.file = publishedFile
 	rec.complete = true
-	return nil
+	return finishLocked(nil)
 }
 
 func (r *Repository) inject(phase repositoryFault) error {
@@ -724,6 +917,29 @@ func verifyFileHash(f *os.File, d Descriptor) error {
 	return nil
 }
 
+func verifyFileHashBudgeted(
+	ctx context.Context, budget *migrationbudget.Budget, lease *migrationbudget.Lease,
+	f *os.File, d Descriptor,
+) error {
+	if budget == nil {
+		return verifyFileHash(f, d)
+	}
+	if _, err := f.Seek(DescriptorBytes, io.SeekStart); err != nil {
+		return err
+	}
+	h := sha256.New()
+	reader := budgetedVerifierReader{ctx: ctx, budget: budget, lease: lease, reader: f}
+	if _, err := io.CopyN(h, reader, int64(d.ArtifactBytes)); err != nil {
+		return err
+	}
+	var got [sha256.Size]byte
+	copy(got[:], h.Sum(nil))
+	if got != d.ArtifactHash {
+		return ErrChunk
+	}
+	return nil
+}
+
 func verifyReplicatedArtifact(f *os.File, d Descriptor) error {
 	if _, err := f.Seek(DescriptorBytes, io.SeekStart); err != nil {
 		return err
@@ -744,8 +960,54 @@ func verifyReplicatedArtifact(f *os.File, d Descriptor) error {
 	return nil
 }
 
+func verifyReplicatedArtifactBudgeted(
+	ctx context.Context, budget *migrationbudget.Budget, lease *migrationbudget.Lease,
+	f *os.File, d Descriptor,
+) error {
+	if budget == nil {
+		return verifyReplicatedArtifact(f, d)
+	}
+	if _, err := f.Seek(DescriptorBytes, io.SeekStart); err != nil {
+		return err
+	}
+	reader := budgetedVerifierReader{ctx: ctx, budget: budget, lease: lease, reader: f}
+	manifest, err := replicatedstate.VerifySnapshotArtifact(
+		io.LimitReader(reader, int64(d.ArtifactBytes)), replicatedstate.SnapshotArtifactCallbacks{},
+	)
+	if err != nil || manifest.EncodedBytes != d.ArtifactBytes ||
+		manifest.State.Applied != d.SnapshotIndex || manifest.State.LastTerm != d.SnapshotTerm ||
+		manifest.State.ReplicaSetVersion != d.ReplicaSetVersion ||
+		manifest.State.Binding.SchemaGeneration != d.SchemaGeneration ||
+		manifest.State.LastEntryDigest != d.Lineage ||
+		manifest.State.Binding.ClusterID != d.Group.ClusterID ||
+		manifest.State.Binding.ClusterIncarnation != d.Group.ClusterIncarnation ||
+		manifest.State.Binding.TopologyRecoveryEpoch != d.Group.TopologyRecoveryEpoch ||
+		manifest.State.Binding.ShardIncarnation != d.Group.ShardIncarnation ||
+		manifest.State.Binding.GroupID != d.Group.GroupID {
+		return errors.Join(ErrDescriptor, err)
+	}
+	return nil
+}
+
 // ReadChunk returns published bytes only; staged artifacts are never served.
 func (r *Repository) ReadChunk(d Descriptor, offset uint64, dst []byte) ([]byte, bool, error) {
+	return r.readChunk(d, offset, d.ChunkBytes, dst)
+}
+
+// ReadChunkLimited is the paced variant used by a node-wide migration budget.
+// It preserves the descriptor's advertised maximum while allowing a sender to
+// issue a smaller wire/disk operation when its network burst is lower than the
+// descriptor chunk size.
+func (r *Repository) ReadChunkLimited(
+	d Descriptor, offset uint64, limit uint32, dst []byte,
+) ([]byte, bool, error) {
+	if limit == 0 || limit > d.ChunkBytes {
+		return dst[:0], false, ErrBound
+	}
+	return r.readChunk(d, offset, limit, dst)
+}
+
+func (r *Repository) readChunk(d Descriptor, offset uint64, limit uint32, dst []byte) ([]byte, bool, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	rec := r.records[d.ArtifactHash]
@@ -759,7 +1021,7 @@ func (r *Repository) ReadChunk(d Descriptor, offset uint64, dst []byte) ([]byte,
 	if remaining == 0 {
 		return dst[:0], true, nil
 	}
-	want := min(uint64(d.ChunkBytes), remaining)
+	want := min(uint64(limit), remaining)
 	if cap(dst) < int(want) {
 		return dst[:0], false, ErrBound
 	}
@@ -781,8 +1043,11 @@ func (r *Repository) OpenPublished(d Descriptor, offset uint64) (*PublishedArtif
 	if r == nil || !d.Valid() || offset > d.ArtifactBytes {
 		return nil, ErrDescriptor
 	}
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	// Opening a published view increments rec.readers. Use the write lock for
+	// that short ownership transition; streaming and verification happen after
+	// the lock is released.
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	rec := r.records[d.ArtifactHash]
 	if r.closed || rec == nil || !rec.complete || rec.descriptor != d {
 		return nil, ErrStaleFence
@@ -809,14 +1074,30 @@ func (r *Repository) releaseReader(hash [sha256.Size]byte) {
 // replicated-state certificate. This cold control operation uses one bounded
 // verifier buffer and retains no payload copy.
 func (r *Repository) Manifest(d Descriptor) (replicatedstate.SnapshotArtifactManifest, error) {
+	return r.ManifestContext(context.Background(), d)
+}
+
+// ManifestContext re-authenticates a published artifact with cancellation and
+// node-budget pacing. It is used by cold learner installation before stage
+// activation, where an unbounded full-artifact verification would otherwise
+// bypass migration controls.
+func (r *Repository) ManifestContext(ctx context.Context, d Descriptor) (replicatedstate.SnapshotArtifactManifest, error) {
+	if ctx == nil {
+		return replicatedstate.SnapshotArtifactManifest{}, migrationbudget.ErrInvalidConfig
+	}
+	r.mu.RLock()
+	budget := r.budget
+	r.mu.RUnlock()
 	a, err := r.OpenPublished(d, 0)
 	if err != nil {
 		return replicatedstate.SnapshotArtifactManifest{}, err
 	}
 	defer a.Close()
-	manifest, err := replicatedstate.VerifySnapshotArtifact(
-		a, replicatedstate.SnapshotArtifactCallbacks{},
-	)
+	var reader io.Reader = a
+	if budget != nil {
+		reader = budgetedVerifierReader{ctx: ctx, budget: budget, reader: a}
+	}
+	manifest, err := replicatedstate.VerifySnapshotArtifact(reader, replicatedstate.SnapshotArtifactCallbacks{})
 	if err != nil || manifest.EncodedBytes != d.ArtifactBytes {
 		return replicatedstate.SnapshotArtifactManifest{}, errors.Join(ErrDescriptor, err)
 	}
@@ -828,8 +1109,8 @@ func (r *Repository) Close() error {
 		return nil
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if r.closed {
+		r.mu.Unlock()
 		return nil
 	}
 	r.closed = true
@@ -840,8 +1121,16 @@ func (r *Repository) Close() error {
 			rec.file = nil
 		}
 	}
-	err := errors.Join(fileErr, storeio.UnlockWriter(r.lock), r.lock.Close(), r.root.Close())
+	lock, root := r.lock, r.root
+	r.mu.Unlock()
+	// Final artifact verification runs without r.mu so that foreground
+	// operations remain responsive. Wait before closing the directory root
+	// those verifiers may still be reading.
+	r.finishes.Wait()
+	err := errors.Join(fileErr, storeio.UnlockWriter(lock), lock.Close(), root.Close())
+	r.mu.Lock()
 	r.lock, r.root = nil, nil
+	r.mu.Unlock()
 	return err
 }
 

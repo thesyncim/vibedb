@@ -90,6 +90,7 @@ func TestCoordinatorRejectsDeclaredDomainMismatchBeforeSourceIO(t *testing.T) {
 		`WITH c AS (SELECT id FROM messages WHERE id=score) SELECT id FROM c LIMIT 0`,
 		`WITH c AS (SELECT id,score FROM messages ORDER BY CASE WHEN id=score THEN 1 ELSE 0 END) SELECT id FROM c LIMIT 0`,
 		`SELECT COALESCE(SUM(score),0) FROM messages WHERE id=score`,
+		`SELECT COALESCE(SUM(score),0) FROM messages WHERE false AND id=score`,
 		`SELECT id FROM messages WHERE id IS DISTINCT FROM score LIMIT 0`,
 	} {
 		_, err := executor.Query(t.Context(), Query{SQL: statement, Class: ClassBatch})
@@ -163,6 +164,13 @@ func TestCoordinatorQueryPrunesNestedShardKeysWithoutCrossingLimit(t *testing.T)
 		{`WITH c(owner,n) AS (SELECT tenant_id,n FROM messages) SELECT SUM(n)+1 FROM c WHERE owner=?`, []shardservice.Param{shardservice.StringParam(keys[0])}, 1, []string{"1.01e2"}},
 		{`WITH c(owner,n) AS (SELECT tenant_id,n FROM messages) SELECT COUNT(*), SUM(n) FROM c WHERE owner IS NOT DISTINCT FROM ? AND COALESCE(n,0)>?`, []shardservice.Param{shardservice.StringParam(keys[0]), shardservice.NumberParam("50")}, 1, []string{"1|100"}},
 		{`SELECT COUNT(*) FROM messages WHERE tenant_id IS NOT DISTINCT FROM NULL`, nil, 0, []string{"0"}},
+		{`SELECT COUNT(*) FROM messages WHERE false`, nil, 0, []string{"0"}},
+		{`SELECT tenant_id FROM messages WHERE NOT true`, nil, 0, nil},
+		{`WITH c(owner,n) AS (SELECT tenant_id,n FROM messages) SELECT COUNT(*) FROM c WHERE false`, nil, 0, []string{"0"}},
+		{`SELECT COUNT(*) FROM (SELECT tenant_id,n FROM messages) AS d WHERE NOT true`, nil, 0, []string{"0"}},
+		{`WITH c(owner,n) AS (SELECT tenant_id,n FROM messages) SELECT n+1 FROM c WHERE false OR owner=?`, []shardservice.Param{shardservice.StringParam(keys[0])}, 1, []string{"1.01e2"}},
+		{`WITH c AS (SELECT tenant_id,n FROM messages) SELECT n+1 FROM c WHERE false UNION ALL SELECT n+1 FROM c WHERE tenant_id=?`, []shardservice.Param{shardservice.StringParam(keys[1])}, 1, []string{"1.01e2"}},
+		{`SELECT d.n FROM (SELECT tenant_id,n FROM messages ORDER BY n LIMIT 1) AS d WHERE false`, nil, 2, nil},
 		{`WITH c(owner,n) AS (SELECT tenant_id,n FROM messages) SELECT c.*,COALESCE(c.n,0) AS score FROM c WHERE owner=? ORDER BY score DESC`, []shardservice.Param{shardservice.StringParam(keys[0])}, 1, []string{fmt.Sprintf("%q|100|100", keys[0])}},
 		{`WITH c(owner,n) AS (SELECT tenant_id,n FROM messages) SELECT SUM(n)+1 FROM c WHERE owner=? HAVING COUNT(*)>0`, []shardservice.Param{shardservice.StringParam(keys[0])}, 1, []string{"1.01e2"}},
 		{`SELECT 1 FROM messages WHERE tenant_id IS NOT DISTINCT FROM NULL HAVING COUNT(*)=0`, nil, 0, []string{"1"}},

@@ -103,6 +103,9 @@ func andExpr(kids ...*sqlast.Expr) *sqlast.Expr {
 func TestConstraintProgramBind(t *testing.T) {
 	binding := newTestBinding(t, []string{"/tenant_id"}, fullManifest(t))
 	compound := newTestBinding(t, []string{"/tenant_id", "/channel_id"}, fullManifest(t))
+	constant := func(value bool) *sqlast.Expr {
+		return &sqlast.Expr{Kind: sqlast.ExprConstant, Value: sqlast.Operand{Kind: sqlast.OperandBool, Bool: value}}
+	}
 
 	cases := []struct {
 		name    string
@@ -112,6 +115,30 @@ func TestConstraintProgramBind(t *testing.T) {
 		want    []distribution.DomainKind
 		wantLen []int // finite value count per ordinal, -1 to skip
 	}{
+		{
+			name: "false empties all key ordinals", binding: compound, where: constant(false),
+			want: []distribution.DomainKind{distribution.DomainEmpty, distribution.DomainEmpty}, wantLen: []int{-1, -1},
+		},
+		{
+			name: "true retains all owners", binding: binding, where: constant(true),
+			want: []distribution.DomainKind{distribution.DomainUnknown}, wantLen: []int{-1},
+		},
+		{
+			name: "not true empties key domain", binding: binding, where: &sqlast.Expr{Kind: sqlast.ExprNot, Kids: []*sqlast.Expr{constant(true)}},
+			want: []distribution.DomainKind{distribution.DomainEmpty}, wantLen: []int{-1},
+		},
+		{
+			name: "false contributes no disjunction owner", binding: binding, where: orExpr(constant(false), eqExpr("tenant_id", strOp("a"))),
+			want: []distribution.DomainKind{distribution.DomainFinite}, wantLen: []int{1},
+		},
+		{
+			name: "false conjunct empties finite domain", binding: binding, where: andExpr(eqExpr("tenant_id", strOp("a")), constant(false)),
+			want: []distribution.DomainKind{distribution.DomainEmpty}, wantLen: []int{-1},
+		},
+		{
+			name: "false does not bypass runtime path analysis", binding: binding, where: andExpr(constant(false), pathEqExpr("value", "other_value")),
+			want: []distribution.DomainKind{distribution.DomainUnknown}, wantLen: []int{-1},
+		},
 		{
 			name: "disjunction of key values", binding: binding,
 			where: orExpr(eqExpr("tenant_id", strOp("a")), eqExpr("tenant_id", paramOp(0))), args: []any{"b"},
