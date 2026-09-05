@@ -19,22 +19,23 @@ const (
 	readReuseMaxPathSegments   = 16
 	readReuseMaxPredicateNodes = 32
 	readReuseMaxOperandBytes   = 4 << 10
+	readReuseMaxCompilerBytes  = 64 << 10
 )
 
-// ResetReadBindingsForReuse releases all binding-specific compiler and query
-// state while retaining the immutable parsed preparation. It is deliberately
-// narrower than Statement.Release: text, tree, output/type metadata, and the
-// rendered path cache remain available for the next bind, while compiler
-// arenas, Query plans, arguments, HAVING programs, and lowering scratch are
-// dropped. The returned count includes the Statement value and the capacities
-// of owned retained slices (names, parameter metadata, and path metadata).
+// ResetReadBindingsForReuse releases binding-specific query state while
+// retaining the immutable parsed preparation and, when it fits the bounded
+// read-reuse budget, scrubbed compiler storage for the next bind. It is
+// deliberately narrower than Statement.Release: text, tree, output/type
+// metadata, and the rendered path cache remain available for the next bind.
+// The returned count includes the Statement value, owned metadata capacities,
+// and any bounded compiler storage retained by the reset.
 //
 // AST storage and the source text backing are borrowed from the SQL parser and
 // are excluded here; callers holding a parser must add
-// Parser.ReadPreparationRetainedBytes. Compiler/query backing is excluded
-// because it is released before the count is taken. A false result leaves the
-// statement unchanged, so callers can fall back to ordinary statement
-// teardown without losing a prepared plan.
+// Parser.ReadPreparationRetainedBytes. A compiler whose storage exceeds the
+// bounded budget is released while the parsed preparation remains reusable. A
+// false result leaves the statement unchanged, so callers can fall back to
+// ordinary statement teardown without losing a prepared plan.
 func (s *Statement) ResetReadBindingsForReuse() (retainedBytes int64, ok bool) {
 	if !readReuseStatementShape(s) {
 		return 0, false
@@ -44,11 +45,31 @@ func (s *Statement) ResetReadBindingsForReuse() (retainedBytes int64, ok bool) {
 		return 0, false
 	}
 
-	s.c.release()
+	compilerBytes, compilerRetained := s.c.resetReadReuse()
+	if compilerRetained {
+		// Statement already charges its embedded compiler value. The compiler
+		// budget includes that object for a complete storage decision, but only
+		// its dynamic backing and separately allocated plan/result objects belong
+		// in the additional retained-byte count.
+		compilerObjectBytes := int64(unsafe.Sizeof(s.c))
+		if compilerBytes < compilerObjectBytes {
+			compilerRetained = false
+			compilerBytes = 0
+		} else {
+			compilerBytes -= compilerObjectBytes
+		}
+		if !compilerRetained || compilerBytes < 0 || retainedBytes > maxReadReuseInt64-compilerBytes {
+			// The compiler has already been scrubbed, so this cannot be a false
+			// preflight result. Release it and retain only the immutable read
+			// preparation whose count was established above.
+			s.c.release()
+		} else {
+			retainedBytes += compilerBytes
+		}
+	}
 	s.q = Query{}
-	clear(s.args)
-	s.args = nil
-	s.stack = nil
+	s.args = dropReadReuseSlice(s.args)
+	s.stack = dropReadReuseSlice(s.stack)
 	s.having = havingProgram{}
 	s.cached = false
 	s.lowerErr = nil
@@ -67,7 +88,7 @@ func (s *Statement) ResetReadBindingsForReuse() (retainedBytes int64, ok bool) {
 
 func readReuseStatementShape(s *Statement) bool {
 	if s == nil || s.tree == nil || s.prepareMode || s.nested != nil ||
-		s.correlation != nil || s.parameterTypeHints != nil ||
+		s.correlation != nil || s.c.oneShot || s.parameterTypeHints != nil ||
 		s.preserveDocumentUnknown || s.paramBase != 0 ||
 		len(s.text) > readReuseMaxSQLBytes {
 		return false
@@ -240,6 +261,81 @@ func readReuseStatementBytes(s *Statement) (int64, bool) {
 		}
 	}
 	return total, true
+}
+
+// readReuseCompilerBytes accounts only the compiler storage the direct-read
+// reset is willing to retain. The compiler value is embedded in Statement and
+// is included here so the bounded compiler decision charges the full object;
+// ResetReadBindingsForReuse subtracts that embedded value before adding the
+// dynamic storage to the Statement count. The plan/result objects are separate
+// allocations and are charged explicitly.
+func readReuseCompilerBytes(c *compiler) (int64, bool) {
+	if c == nil || c.oneShot {
+		return 0, false
+	}
+	total := int64(unsafe.Sizeof(*c))
+	add := func(n int64) bool {
+		if n < 0 || total > maxReadReuseInt64-n {
+			return false
+		}
+		total += n
+		return true
+	}
+	for _, n := range []int64{
+		readReuseStatementSliceBytes(c.tmp),
+		readReuseChunkBytes(&c.text),
+		readReuseChunkBytes(&c.tape),
+		readReuseChunkBytes(&c.nodes),
+		readReuseChunkBytes(&c.kids),
+		readReuseChunkBytes(&c.lits),
+		readReuseChunkBytes(&c.idxs),
+		readReuseChunkBytes(&c.boxes),
+		readReuseChunkBytes(&c.nums),
+		readReuseChunkBytes(&c.strs),
+		readReuseChunkBytes(&c.tree),
+		readReuseStatementSliceBytes(c.columns),
+		readReuseStatementSliceBytes(c.groupBy),
+		readReuseStatementSliceBytes(c.orderBy),
+		readReuseStatementSliceBytes(c.headers),
+		readReuseStatementSliceBytes(c.planCols),
+		readReuseStatementSliceBytes(c.planOrder),
+		readReuseStatementSliceBytes(c.groupCols),
+		readReuseStatementSliceBytes(c.filterCols),
+		readReuseStatementSliceBytes(c.lateCols),
+		readReuseStatementSliceBytes(c.lateNums),
+	} {
+		if !add(n) {
+			return 0, false
+		}
+	}
+	if c.plan != nil && !add(int64(unsafe.Sizeof(*c.plan))) {
+		return 0, false
+	}
+	if c.result != nil && !add(int64(unsafe.Sizeof(*c.result))) {
+		return 0, false
+	}
+	return total, true
+}
+
+// readReuseChunkBytes accounts an arena's directory and every chunk's full
+// backing capacity. Keeping the unused tail is useful for the next compile,
+// but it must be charged even when no element in that tail was used.
+func readReuseChunkBytes[T any](arena *chunkArena[T]) int64 {
+	if arena == nil {
+		return 0
+	}
+	total := readReuseStatementSliceBytes(arena.chunks)
+	for _, chunk := range arena.chunks {
+		total = readReuseAdd(total, readReuseStatementSliceBytes(chunk))
+	}
+	return total
+}
+
+func readReuseAdd(a, b int64) int64 {
+	if a < 0 || b < 0 || a > maxReadReuseInt64-b {
+		return -1
+	}
+	return a + b
 }
 
 func readReuseStatementSliceBytes[T any](slice []T) int64 {

@@ -153,6 +153,135 @@ func (c *compiler) release() {
 	*c = compiler{}
 }
 
+// resetReadReuse scrubs the binding-specific state of a bounded prepared
+// read, keeping only storage that the ordinary read lowerer can refill on its
+// next bind. The caller has already established the statement shape; this
+// method is deliberately private so richer statements cannot accidentally
+// retain one of the compiler's pointer graphs.
+//
+// Every retained backing array is cleared through its full capacity, not just
+// the prefix used by the last compile. The unused tail can contain a boxed
+// argument, a string's bytes, or an error interface from a failed bind just as
+// readily as the used prefix. Path memo/registries and the graph-shaped plan
+// storage are dropped entirely. A compiler that grows beyond the bounded
+// storage budget is released while its parsed Statement remains reusable.
+func (c *compiler) resetReadReuse() (retainedBytes int64, retained bool) {
+	if c == nil {
+		return 0, false
+	}
+	if c.oneShot {
+		c.release()
+		return 0, false
+	}
+	bytes, ok := readReuseCompilerBytes(c)
+	if !ok || bytes > readReuseMaxCompilerBytes {
+		c.release()
+		return 0, false
+	}
+
+	// These are the only compiler arenas the direct read lowerer may refill.
+	// Their contents are all binding-specific, so clear every allocated
+	// element before rewinding the carving cursors.
+	c.tmp = scrubReadReuseSlice(c.tmp)
+	c.text.scrubReadReuse()
+	c.tape.scrubReadReuse()
+	c.nodes.scrubReadReuse()
+	c.kids.scrubReadReuse()
+	c.lits.scrubReadReuse()
+	c.idxs.scrubReadReuse()
+	c.boxes.scrubReadReuse()
+	c.nums.scrubReadReuse()
+	c.strs.scrubReadReuse()
+	c.tree.scrubReadReuse()
+
+	// These builder/plan slices are plain reusable storage. Keep their
+	// capacities, but remove every old string or interface in the full backing
+	// arrays before exposing them to the next lowering.
+	c.columns = scrubReadReuseSlice(c.columns)
+	c.groupBy = scrubReadReuseSlice(c.groupBy)
+	c.orderBy = scrubReadReuseSlice(c.orderBy)
+	c.headers = scrubReadReuseSlice(c.headers)
+	c.planCols = scrubReadReuseSlice(c.planCols)
+	c.planOrder = scrubReadReuseSlice(c.planOrder)
+	c.groupCols = scrubReadReuseSlice(c.groupCols)
+	c.filterCols = scrubReadReuseSlice(c.filterCols)
+	c.lateCols = scrubReadReuseSlice(c.lateCols)
+	c.lateNums = scrubReadReuseSlice(c.lateNums)
+
+	// A plan/result object is cheap to retain and avoids re-allocating the
+	// publication objects on every bind. Their fields point into the dropped
+	// graph storage, so zero the objects themselves before keeping their address.
+	if c.plan != nil {
+		*c.plan = plan{}
+	}
+	if c.result != nil {
+		*c.result = compileResult{}
+	}
+
+	// The following fields either memoize paths outside the reusable arenas or
+	// own nested/complex graphs. Drop their full backing arrays and all object
+	// references rather than widening the direct-read retention allowlist.
+	c.values.paths = dropReadReuseSlice(c.values.paths)
+	c.numbers.paths = dropReadReuseSlice(c.numbers.paths)
+	clearReadReuseChunkEntries(c.paths.entries)
+	c.paths = pathCache{}
+	c.joins = dropReadReuseSlice(c.joins)
+	c.marks = dropReadReuseSlice(c.marks)
+	c.planJoins = dropReadReuseSlice(c.planJoins)
+	c.planMarks = dropReadReuseSlice(c.planMarks)
+	c.joinRegs = dropReadReuseSlice(c.joinRegs)
+	c.joinPlans = dropReadReuseSlice(c.joinPlans)
+	c.markRegs = dropReadReuseSlice(c.markRegs)
+	c.markPlans = dropReadReuseSlice(c.markPlans)
+	c.joinAliases = dropReadReuseSlice(c.joinAliases)
+	c.leaves = dropReadReuseSlice(c.leaves)
+	c.members = dropReadReuseSlice(c.members)
+	c.counts = dropReadReuseSlice(c.counts)
+	c.oneShot = false
+
+	return bytes, true
+}
+
+// scrubReadReuseSlice clears the complete backing array while preserving its
+// allocation for a future bind.
+func scrubReadReuseSlice[T any](slice []T) []T {
+	if cap(slice) != 0 {
+		clear(slice[:cap(slice)])
+	}
+	return slice[:0]
+}
+
+// dropReadReuseSlice clears and releases a slice whose shape is outside the
+// bounded read-reuse allowlist.
+func dropReadReuseSlice[T any](slice []T) []T {
+	if cap(slice) != 0 {
+		clear(slice[:cap(slice)])
+	}
+	return nil
+}
+
+func clearReadReuseChunkEntries(entries []cachedPath) {
+	if cap(entries) != 0 {
+		clear(entries[:cap(entries)])
+	}
+}
+
+func (a *chunkArena[T]) scrubReadReuse() {
+	if a == nil {
+		return
+	}
+	for _, chunk := range a.chunks {
+		if cap(chunk) != 0 {
+			clear(chunk[:cap(chunk)])
+		}
+	}
+	if cap(a.chunks) != len(a.chunks) {
+		clear(a.chunks[len(a.chunks):cap(a.chunks)])
+	}
+	a.at = 0
+	a.used = 0
+}
+
 // outcome publishes a compile result. A reusable compiler overwrites its own,
 // which is the pointer the previous Query is still holding and precisely what
 // the invalidation rule describes; a one-shot compiler allocates, so that the
