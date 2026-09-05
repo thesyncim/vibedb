@@ -80,6 +80,11 @@ class DistributedReadRunnerTest(unittest.TestCase):
         self.assertEqual(MODULE.validate_options(mixed, FIXTURE)["workloads"],
                          ["mixed_read_update"])
 
+        mixed_controls = self.selected(
+            "--workloads", "mixed_read_update,mixed_uniform")
+        self.assertEqual(MODULE.validate_options(mixed_controls, FIXTURE)["workloads"],
+                         ["mixed_read_update", "mixed_uniform"])
+
     def test_cells_are_same_fused_candidate_shape_for_every_arm(self):
         selected = self.selected("--workloads", "point_hit,group_16")
         options = MODULE.validate_options(selected, FIXTURE)
