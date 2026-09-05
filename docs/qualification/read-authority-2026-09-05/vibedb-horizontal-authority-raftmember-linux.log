@@ -1,0 +1,686 @@
+=== RUN   TestValidateImmutableBaseApplyCapacityChecksActualCut
+--- PASS: TestValidateImmutableBaseApplyCapacityChecksActualCut (0.03s)
+=== RUN   TestValidateImmutableBaseApplyCapacityRejectsCrossBindingClaims
+=== RUN   TestValidateImmutableBaseApplyCapacityRejectsCrossBindingClaims/first_WAL_with_second_claim
+=== RUN   TestValidateImmutableBaseApplyCapacityRejectsCrossBindingClaims/second_WAL_with_first_claim
+--- PASS: TestValidateImmutableBaseApplyCapacityRejectsCrossBindingClaims (0.03s)
+    --- PASS: TestValidateImmutableBaseApplyCapacityRejectsCrossBindingClaims/first_WAL_with_second_claim (0.00s)
+    --- PASS: TestValidateImmutableBaseApplyCapacityRejectsCrossBindingClaims/second_WAL_with_first_claim (0.00s)
+=== RUN   TestImmutableBaseApplyCapacityRequalifiesAfterRestart
+--- PASS: TestImmutableBaseApplyCapacityRequalifiesAfterRestart (0.03s)
+=== RUN   TestValidateImmutableBaseApplyCapacityRejectsUnavailableInputs
+--- PASS: TestValidateImmutableBaseApplyCapacityRejectsUnavailableInputs (0.02s)
+=== RUN   TestValidateImmutableBaseApplyCapacityRejectsTornWAL
+--- PASS: TestValidateImmutableBaseApplyCapacityRejectsTornWAL (0.01s)
+=== RUN   TestValidateImmutableBaseApplyCapacityRejectsNamespacePoisonedWAL
+--- PASS: TestValidateImmutableBaseApplyCapacityRejectsNamespacePoisonedWAL (0.00s)
+=== RUN   TestImmutableBaseApplyCapacityBoundary
+=== RUN   TestImmutableBaseApplyCapacityBoundary/empty_bounded_state
+=== RUN   TestImmutableBaseApplyCapacityBoundary/nontrivial_unapplied_suffix
+=== RUN   TestImmutableBaseApplyCapacityBoundary/full_retry_rings_do_not_consume_suffix_capacity
+=== RUN   TestImmutableBaseApplyCapacityBoundary/maximum_arithmetic
+=== RUN   TestImmutableBaseApplyCapacityBoundary/unknown_WAL_format
+=== RUN   TestImmutableBaseApplyCapacityBoundary/zero_base
+=== RUN   TestImmutableBaseApplyCapacityBoundary/unknown_apply_format
+=== RUN   TestImmutableBaseApplyCapacityBoundary/zero_WAL_entries
+=== RUN   TestImmutableBaseApplyCapacityBoundary/zero_sessions
+=== RUN   TestImmutableBaseApplyCapacityBoundary/too_many_configured_sessions
+=== RUN   TestImmutableBaseApplyCapacityBoundary/zero_retry_window
+=== RUN   TestImmutableBaseApplyCapacityBoundary/retry_window_too_large
+=== RUN   TestImmutableBaseApplyCapacityBoundary/uninitialized
+=== RUN   TestImmutableBaseApplyCapacityBoundary/apply_below_base
+=== RUN   TestImmutableBaseApplyCapacityBoundary/session_count_ahead_of_apply
+=== RUN   TestImmutableBaseApplyCapacityBoundary/slot_count_ahead_of_apply
+=== RUN   TestImmutableBaseApplyCapacityBoundary/session_epoch_high-water_ahead_of_apply
+=== RUN   TestImmutableBaseApplyCapacityBoundary/apply_ahead_of_commit
+=== RUN   TestImmutableBaseApplyCapacityBoundary/checkpoint_ahead_of_apply
+=== RUN   TestImmutableBaseApplyCapacityBoundary/commit_ahead_of_last
+=== RUN   TestImmutableBaseApplyCapacityBoundary/session_capacity_exceeded
+=== RUN   TestImmutableBaseApplyCapacityBoundary/retry_ring_capacity_exceeded
+=== RUN   TestImmutableBaseApplyCapacityBoundary/last_exceeds_sealed_suffix
+--- PASS: TestImmutableBaseApplyCapacityBoundary (0.00s)
+    --- PASS: TestImmutableBaseApplyCapacityBoundary/empty_bounded_state (0.00s)
+    --- PASS: TestImmutableBaseApplyCapacityBoundary/nontrivial_unapplied_suffix (0.00s)
+    --- PASS: TestImmutableBaseApplyCapacityBoundary/full_retry_rings_do_not_consume_suffix_capacity (0.00s)
+    --- PASS: TestImmutableBaseApplyCapacityBoundary/maximum_arithmetic (0.00s)
+    --- PASS: TestImmutableBaseApplyCapacityBoundary/unknown_WAL_format (0.00s)
+    --- PASS: TestImmutableBaseApplyCapacityBoundary/zero_base (0.00s)
+    --- PASS: TestImmutableBaseApplyCapacityBoundary/unknown_apply_format (0.00s)
+    --- PASS: TestImmutableBaseApplyCapacityBoundary/zero_WAL_entries (0.00s)
+    --- PASS: TestImmutableBaseApplyCapacityBoundary/zero_sessions (0.00s)
+    --- PASS: TestImmutableBaseApplyCapacityBoundary/too_many_configured_sessions (0.00s)
+    --- PASS: TestImmutableBaseApplyCapacityBoundary/zero_retry_window (0.00s)
+    --- PASS: TestImmutableBaseApplyCapacityBoundary/retry_window_too_large (0.00s)
+    --- PASS: TestImmutableBaseApplyCapacityBoundary/uninitialized (0.00s)
+    --- PASS: TestImmutableBaseApplyCapacityBoundary/apply_below_base (0.00s)
+    --- PASS: TestImmutableBaseApplyCapacityBoundary/session_count_ahead_of_apply (0.00s)
+    --- PASS: TestImmutableBaseApplyCapacityBoundary/slot_count_ahead_of_apply (0.00s)
+    --- PASS: TestImmutableBaseApplyCapacityBoundary/session_epoch_high-water_ahead_of_apply (0.00s)
+    --- PASS: TestImmutableBaseApplyCapacityBoundary/apply_ahead_of_commit (0.00s)
+    --- PASS: TestImmutableBaseApplyCapacityBoundary/checkpoint_ahead_of_apply (0.00s)
+    --- PASS: TestImmutableBaseApplyCapacityBoundary/commit_ahead_of_last (0.00s)
+    --- PASS: TestImmutableBaseApplyCapacityBoundary/session_capacity_exceeded (0.00s)
+    --- PASS: TestImmutableBaseApplyCapacityBoundary/retry_ring_capacity_exceeded (0.00s)
+    --- PASS: TestImmutableBaseApplyCapacityBoundary/last_exceeds_sealed_suffix (0.00s)
+=== RUN   TestImmutableBaseApplyCapacityAdvancedBase
+--- PASS: TestImmutableBaseApplyCapacityAdvancedBase (0.00s)
+=== RUN   TestOpenPreparedApplyAndExactRestart
+--- PASS: TestOpenPreparedApplyAndExactRestart (0.05s)
+=== RUN   TestOpenBoundSQLWithApplyForSettlementPropagatesPlacement
+--- PASS: TestOpenBoundSQLWithApplyForSettlementPropagatesPlacement (0.04s)
+=== RUN   TestBindingFromWALMapsCompleteIdentityWithoutMintingIncarnation
+--- PASS: TestBindingFromWALMapsCompleteIdentityWithoutMintingIncarnation (0.01s)
+=== RUN   TestBindingForNewWALMatchesTheEventuallyCreatedWAL
+--- PASS: TestBindingForNewWALMatchesTheEventuallyCreatedWAL (0.00s)
+=== RUN   TestBindPreparedSQLReturnsAndRequiresFullLocalIdentity
+--- PASS: TestBindPreparedSQLReturnsAndRequiresFullLocalIdentity (0.02s)
+=== RUN   TestClosedAndPoisonedWALRejectBeforeSQLBinding
+=== RUN   TestClosedAndPoisonedWALRejectBeforeSQLBinding/nil
+=== RUN   TestClosedAndPoisonedWALRejectBeforeSQLBinding/closed
+=== RUN   TestClosedAndPoisonedWALRejectBeforeSQLBinding/poisoned_namespace
+--- PASS: TestClosedAndPoisonedWALRejectBeforeSQLBinding (0.01s)
+    --- PASS: TestClosedAndPoisonedWALRejectBeforeSQLBinding/nil (0.00s)
+    --- PASS: TestClosedAndPoisonedWALRejectBeforeSQLBinding/closed (0.01s)
+    --- PASS: TestClosedAndPoisonedWALRejectBeforeSQLBinding/poisoned_namespace (0.00s)
+=== RUN   TestRecoveredTornCurrentSlotQuarantinesBeforeSQLMutation
+--- PASS: TestRecoveredTornCurrentSlotQuarantinesBeforeSQLMutation (0.01s)
+=== RUN   TestRuntimeWALGenerationDriverRepeatedCompactionAndRestart
+raft2026/09/05 12:29:11 INFO: f8 switched to configuration voters=(f8)
+raft2026/09/05 12:29:11 INFO: f8 became follower at term 1
+raft2026/09/05 12:29:11 INFO: newRaft f8 [peers: [f8], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:29:11 INFO: f8 is starting a new election at term 1
+raft2026/09/05 12:29:11 INFO: f8 became pre-candidate at term 1
+raft2026/09/05 12:29:11 INFO: f8 received MsgPreVoteResp from f8 at term 1
+raft2026/09/05 12:29:11 INFO: f8 has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:11 INFO: f8 became candidate at term 2
+raft2026/09/05 12:29:11 INFO: f8 received MsgVoteResp from f8 at term 2
+raft2026/09/05 12:29:11 INFO: f8 has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:11 INFO: f8 became leader at term 2
+--- PASS: TestRuntimeWALGenerationDriverRepeatedCompactionAndRestart (0.08s)
+=== RUN   TestGenerationDriverMutationPreflight
+--- PASS: TestGenerationDriverMutationPreflight (0.00s)
+=== RUN   TestRuntimeWALGenerationBuildDoesNotBlockRaftProgress
+raft2026/09/05 12:29:11 INFO: fa switched to configuration voters=(fa)
+raft2026/09/05 12:29:11 INFO: fa became follower at term 1
+raft2026/09/05 12:29:11 INFO: newRaft fa [peers: [fa], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:29:11 INFO: fa is starting a new election at term 1
+raft2026/09/05 12:29:11 INFO: fa became pre-candidate at term 1
+raft2026/09/05 12:29:11 INFO: fa received MsgPreVoteResp from fa at term 1
+raft2026/09/05 12:29:11 INFO: fa has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:11 INFO: fa became candidate at term 2
+raft2026/09/05 12:29:11 INFO: fa received MsgVoteResp from fa at term 2
+raft2026/09/05 12:29:11 INFO: fa has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:11 INFO: fa became leader at term 2
+--- PASS: TestRuntimeWALGenerationBuildDoesNotBlockRaftProgress (0.04s)
+=== RUN   TestRecoveringOpenCommitsSelectedGenerationBeforeDeletingSource
+--- PASS: TestRecoveringOpenCommitsSelectedGenerationBeforeDeletingSource (0.06s)
+=== RUN   TestRuntimeWALPressureCompactsBeforePeriodicMaintenance
+raft2026/09/05 12:29:11 INFO: f6 switched to configuration voters=(f6)
+raft2026/09/05 12:29:11 INFO: f6 became follower at term 1
+raft2026/09/05 12:29:11 INFO: newRaft f6 [peers: [f6], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:29:11 INFO: f6 is starting a new election at term 1
+raft2026/09/05 12:29:11 INFO: f6 became pre-candidate at term 1
+raft2026/09/05 12:29:11 INFO: f6 received MsgPreVoteResp from f6 at term 1
+raft2026/09/05 12:29:11 INFO: f6 has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:11 INFO: f6 became candidate at term 2
+raft2026/09/05 12:29:11 INFO: f6 received MsgVoteResp from f6 at term 2
+raft2026/09/05 12:29:11 INFO: f6 has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:11 INFO: f6 became leader at term 2
+--- PASS: TestRuntimeWALPressureCompactsBeforePeriodicMaintenance (0.17s)
+=== RUN   TestRuntimeWALPressureRecoveryAfterRestart
+raft2026/09/05 12:29:11 INFO: f5 switched to configuration voters=(f5)
+raft2026/09/05 12:29:11 INFO: f5 became follower at term 1
+raft2026/09/05 12:29:11 INFO: newRaft f5 [peers: [f5], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:29:11 INFO: f5 is starting a new election at term 1
+raft2026/09/05 12:29:11 INFO: f5 became pre-candidate at term 1
+raft2026/09/05 12:29:11 INFO: f5 received MsgPreVoteResp from f5 at term 1
+raft2026/09/05 12:29:11 INFO: f5 has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:11 INFO: f5 became candidate at term 2
+raft2026/09/05 12:29:11 INFO: f5 received MsgVoteResp from f5 at term 2
+raft2026/09/05 12:29:11 INFO: f5 has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:11 INFO: f5 became leader at term 2
+raft2026/09/05 12:29:11 INFO: f5 switched to configuration voters=(f5)
+raft2026/09/05 12:29:11 INFO: f5 became follower at term 2
+raft2026/09/05 12:29:11 INFO: newRaft f5 [peers: [f5], term: 2, commit: 15, applied: 15, lastindex: 15, lastterm: 2]
+--- PASS: TestRuntimeWALPressureRecoveryAfterRestart (0.07s)
+=== RUN   TestWALGenerationActivationSurvivesEveryRestartBoundary
+--- PASS: TestWALGenerationActivationSurvivesEveryRestartBoundary (0.04s)
+=== RUN   TestWALGenerationCompletionKeepsOpenApplyLive
+--- PASS: TestWALGenerationCompletionKeepsOpenApplyLive (0.03s)
+=== RUN   TestPrepareWALGenerationRejectsCrossShardApplyBeforeBuild
+--- PASS: TestPrepareWALGenerationRejectsCrossShardApplyBeforeBuild (0.05s)
+=== RUN   TestRuntimeReadAuthorityFollowerPromiseGatesElectionEdgesUntilExpiry
+raft2026/09/05 12:29:11 INFO: a1 switched to configuration voters=(a1 a2)
+raft2026/09/05 12:29:11 INFO: a1 became follower at term 1
+raft2026/09/05 12:29:11 INFO: newRaft a1 [peers: [a1,a2], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:29:11 INFO: a1 [term: 1] received a MsgHeartbeat message with higher term from a2 [term: 2]
+raft2026/09/05 12:29:11 INFO: a1 became follower at term 2
+=== RUN   TestRuntimeReadAuthorityFollowerPromiseGatesElectionEdgesUntilExpiry/tick
+=== RUN   TestRuntimeReadAuthorityFollowerPromiseGatesElectionEdgesUntilExpiry/campaign
+=== RUN   TestRuntimeReadAuthorityFollowerPromiseGatesElectionEdgesUntilExpiry/vote
+=== RUN   TestRuntimeReadAuthorityFollowerPromiseGatesElectionEdgesUntilExpiry/pre-vote
+=== RUN   TestRuntimeReadAuthorityFollowerPromiseGatesElectionEdgesUntilExpiry/timeout-now
+--- PASS: TestRuntimeReadAuthorityFollowerPromiseGatesElectionEdgesUntilExpiry (0.02s)
+    --- PASS: TestRuntimeReadAuthorityFollowerPromiseGatesElectionEdgesUntilExpiry/tick (0.00s)
+    --- PASS: TestRuntimeReadAuthorityFollowerPromiseGatesElectionEdgesUntilExpiry/campaign (0.00s)
+    --- PASS: TestRuntimeReadAuthorityFollowerPromiseGatesElectionEdgesUntilExpiry/vote (0.00s)
+    --- PASS: TestRuntimeReadAuthorityFollowerPromiseGatesElectionEdgesUntilExpiry/pre-vote (0.00s)
+    --- PASS: TestRuntimeReadAuthorityFollowerPromiseGatesElectionEdgesUntilExpiry/timeout-now (0.00s)
+=== RUN   TestRuntimeReadAuthorityLeaderPromiseAllowsTickButBlocksTransfer
+raft2026/09/05 12:29:11 INFO: a2 switched to configuration voters=(a2 a3)
+raft2026/09/05 12:29:11 INFO: a2 became follower at term 1
+raft2026/09/05 12:29:11 INFO: newRaft a2 [peers: [a2,a3], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:29:11 INFO: a2 is starting a new election at term 1
+raft2026/09/05 12:29:11 INFO: a2 became pre-candidate at term 1
+raft2026/09/05 12:29:11 INFO: a2 [logterm: 1, index: 1] sent MsgPreVote request to a3 at term 1
+raft2026/09/05 12:29:11 INFO: a2 received MsgPreVoteResp from a2 at term 1
+raft2026/09/05 12:29:11 INFO: a2 has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:11 INFO: a2 received MsgPreVoteResp from a3 at term 1
+raft2026/09/05 12:29:11 INFO: a2 has received 2 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:11 INFO: a2 became candidate at term 2
+raft2026/09/05 12:29:11 INFO: a2 [logterm: 1, index: 1] sent MsgVote request to a3 at term 2
+raft2026/09/05 12:29:11 INFO: a2 received MsgVoteResp from a2 at term 2
+raft2026/09/05 12:29:11 INFO: a2 has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:11 INFO: a2 received MsgVoteResp from a3 at term 2
+raft2026/09/05 12:29:11 INFO: a2 has received 2 MsgVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:11 INFO: a2 became leader at term 2
+raft2026/09/05 12:29:11 INFO: a2 [term 2] starts to transfer leadership to a3
+raft2026/09/05 12:29:11 INFO: a2 sends MsgTimeoutNow to a3 immediately as a3 already has up-to-date log
+--- PASS: TestRuntimeReadAuthorityLeaderPromiseAllowsTickButBlocksTransfer (0.02s)
+=== RUN   TestRuntimeReadAuthorityClockFaultFailsClosedAfterGrant
+raft2026/09/05 12:29:11 INFO: a3 switched to configuration voters=(a3 a4)
+raft2026/09/05 12:29:11 INFO: a3 became follower at term 1
+raft2026/09/05 12:29:11 INFO: newRaft a3 [peers: [a3,a4], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:29:11 INFO: a3 [term: 1] received a MsgHeartbeat message with higher term from a4 [term: 2]
+raft2026/09/05 12:29:11 INFO: a3 became follower at term 2
+=== RUN   TestRuntimeReadAuthorityClockFaultFailsClosedAfterGrant/tick
+=== RUN   TestRuntimeReadAuthorityClockFaultFailsClosedAfterGrant/campaign
+--- PASS: TestRuntimeReadAuthorityClockFaultFailsClosedAfterGrant (0.03s)
+    --- PASS: TestRuntimeReadAuthorityClockFaultFailsClosedAfterGrant/tick (0.00s)
+    --- PASS: TestRuntimeReadAuthorityClockFaultFailsClosedAfterGrant/campaign (0.00s)
+=== RUN   TestRuntimeReadAuthorityRequiresIndependentLeaderIncarnation
+raft2026/09/05 12:29:11 INFO: a4 switched to configuration voters=(a4 a5)
+raft2026/09/05 12:29:11 INFO: a4 became follower at term 1
+raft2026/09/05 12:29:11 INFO: newRaft a4 [peers: [a4,a5], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:29:11 INFO: a4 [term: 1] received a MsgHeartbeat message with higher term from a5 [term: 2]
+raft2026/09/05 12:29:11 INFO: a4 became follower at term 2
+raft2026/09/05 12:29:11 INFO: a5 switched to configuration voters=(a5 a6)
+raft2026/09/05 12:29:11 INFO: a5 became follower at term 1
+raft2026/09/05 12:29:11 INFO: newRaft a5 [peers: [a5,a6], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:29:11 INFO: a5 [term: 1] received a MsgHeartbeat message with higher term from a6 [term: 2]
+raft2026/09/05 12:29:11 INFO: a5 became follower at term 2
+--- PASS: TestRuntimeReadAuthorityRequiresIndependentLeaderIncarnation (0.05s)
+=== RUN   TestRuntimeReadAuthorityRoundInvalidatesOnTermAndConfigChange
+=== RUN   TestRuntimeReadAuthorityRoundInvalidatesOnTermAndConfigChange/term
+raft2026/09/05 12:29:11 INFO: a6 switched to configuration voters=(a6 a7)
+raft2026/09/05 12:29:11 INFO: a6 became follower at term 1
+raft2026/09/05 12:29:11 INFO: newRaft a6 [peers: [a6,a7], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:29:11 INFO: a6 is starting a new election at term 1
+raft2026/09/05 12:29:11 INFO: a6 became pre-candidate at term 1
+raft2026/09/05 12:29:11 INFO: a6 [logterm: 1, index: 1] sent MsgPreVote request to a7 at term 1
+raft2026/09/05 12:29:11 INFO: a6 received MsgPreVoteResp from a6 at term 1
+raft2026/09/05 12:29:11 INFO: a6 has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:11 INFO: a6 received MsgPreVoteResp from a7 at term 1
+raft2026/09/05 12:29:11 INFO: a6 has received 2 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:11 INFO: a6 became candidate at term 2
+raft2026/09/05 12:29:11 INFO: a6 [logterm: 1, index: 1] sent MsgVote request to a7 at term 2
+raft2026/09/05 12:29:11 INFO: a6 received MsgVoteResp from a6 at term 2
+raft2026/09/05 12:29:11 INFO: a6 has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:11 INFO: a6 received MsgVoteResp from a7 at term 2
+raft2026/09/05 12:29:11 INFO: a6 has received 2 MsgVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:11 INFO: a6 became leader at term 2
+raft2026/09/05 12:29:11 INFO: a6 [term: 2] received a MsgHeartbeat message with higher term from a7 [term: 3]
+raft2026/09/05 12:29:11 INFO: a6 became follower at term 3
+=== RUN   TestRuntimeReadAuthorityRoundInvalidatesOnTermAndConfigChange/configuration
+raft2026/09/05 12:29:11 INFO: a7 switched to configuration voters=(a7 a8)
+raft2026/09/05 12:29:11 INFO: a7 became follower at term 1
+raft2026/09/05 12:29:11 INFO: newRaft a7 [peers: [a7,a8], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:29:11 INFO: a7 is starting a new election at term 1
+raft2026/09/05 12:29:11 INFO: a7 became pre-candidate at term 1
+raft2026/09/05 12:29:11 INFO: a7 [logterm: 1, index: 1] sent MsgPreVote request to a8 at term 1
+raft2026/09/05 12:29:11 INFO: a7 received MsgPreVoteResp from a7 at term 1
+raft2026/09/05 12:29:11 INFO: a7 has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:11 INFO: a7 received MsgPreVoteResp from a8 at term 1
+raft2026/09/05 12:29:11 INFO: a7 has received 2 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:11 INFO: a7 became candidate at term 2
+raft2026/09/05 12:29:11 INFO: a7 [logterm: 1, index: 1] sent MsgVote request to a8 at term 2
+raft2026/09/05 12:29:11 INFO: a7 received MsgVoteResp from a7 at term 2
+raft2026/09/05 12:29:11 INFO: a7 has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:11 INFO: a7 received MsgVoteResp from a8 at term 2
+raft2026/09/05 12:29:11 INFO: a7 has received 2 MsgVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:11 INFO: a7 became leader at term 2
+--- PASS: TestRuntimeReadAuthorityRoundInvalidatesOnTermAndConfigChange (0.05s)
+    --- PASS: TestRuntimeReadAuthorityRoundInvalidatesOnTermAndConfigChange/term (0.02s)
+    --- PASS: TestRuntimeReadAuthorityRoundInvalidatesOnTermAndConfigChange/configuration (0.02s)
+=== RUN   TestRuntimeReadAuthorityPolicyChecksAndDisableReenableSafety
+=== RUN   TestRuntimeReadAuthorityPolicyChecksAndDisableReenableSafety/applied-voter-set-and-disabled-fallback
+raft2026/09/05 12:29:11 INFO: a8 switched to configuration voters=(a8 a9)
+raft2026/09/05 12:29:11 INFO: a8 became follower at term 1
+raft2026/09/05 12:29:11 INFO: newRaft a8 [peers: [a8,a9], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:29:11 INFO: a8 is starting a new election at term 1
+raft2026/09/05 12:29:11 INFO: a8 became pre-candidate at term 1
+raft2026/09/05 12:29:11 INFO: a8 [logterm: 1, index: 1] sent MsgPreVote request to a9 at term 1
+raft2026/09/05 12:29:11 INFO: a8 received MsgPreVoteResp from a8 at term 1
+raft2026/09/05 12:29:11 INFO: a8 has received 1 MsgPreVoteResp votes and 0 vote rejections
+=== RUN   TestRuntimeReadAuthorityPolicyChecksAndDisableReenableSafety/disable-reenable-preserves-immutable-policy
+raft2026/09/05 12:29:12 INFO: a9 switched to configuration voters=(a9 aa)
+raft2026/09/05 12:29:12 INFO: a9 became follower at term 1
+raft2026/09/05 12:29:12 INFO: newRaft a9 [peers: [a9,aa], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:29:12 INFO: a9 [term: 1] received a MsgHeartbeat message with higher term from aa [term: 2]
+raft2026/09/05 12:29:12 INFO: a9 became follower at term 2
+raft2026/09/05 12:29:12 INFO: a9 is starting a new election at term 2
+raft2026/09/05 12:29:12 INFO: a9 became pre-candidate at term 2
+raft2026/09/05 12:29:12 INFO: a9 [logterm: 2, index: 2] sent MsgPreVote request to aa at term 2
+raft2026/09/05 12:29:12 INFO: a9 received MsgPreVoteResp from a9 at term 2
+raft2026/09/05 12:29:12 INFO: a9 has received 1 MsgPreVoteResp votes and 0 vote rejections
+=== RUN   TestRuntimeReadAuthorityPolicyChecksAndDisableReenableSafety/disabled-clock-fault-remains-closed
+raft2026/09/05 12:29:12 INFO: aa switched to configuration voters=(aa ab)
+raft2026/09/05 12:29:12 INFO: aa became follower at term 1
+raft2026/09/05 12:29:12 INFO: newRaft aa [peers: [aa,ab], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:29:12 INFO: aa [term: 1] received a MsgHeartbeat message with higher term from ab [term: 2]
+raft2026/09/05 12:29:12 INFO: aa became follower at term 2
+=== RUN   TestRuntimeReadAuthorityPolicyChecksAndDisableReenableSafety/disabled-clock-fault-remains-closed/tick
+=== RUN   TestRuntimeReadAuthorityPolicyChecksAndDisableReenableSafety/disabled-clock-fault-remains-closed/campaign
+--- PASS: TestRuntimeReadAuthorityPolicyChecksAndDisableReenableSafety (0.07s)
+    --- PASS: TestRuntimeReadAuthorityPolicyChecksAndDisableReenableSafety/applied-voter-set-and-disabled-fallback (0.02s)
+    --- PASS: TestRuntimeReadAuthorityPolicyChecksAndDisableReenableSafety/disable-reenable-preserves-immutable-policy (0.02s)
+    --- PASS: TestRuntimeReadAuthorityPolicyChecksAndDisableReenableSafety/disabled-clock-fault-remains-closed (0.02s)
+        --- PASS: TestRuntimeReadAuthorityPolicyChecksAndDisableReenableSafety/disabled-clock-fault-remains-closed/tick (0.00s)
+        --- PASS: TestRuntimeReadAuthorityPolicyChecksAndDisableReenableSafety/disabled-clock-fault-remains-closed/campaign (0.00s)
+=== RUN   TestRuntimeDoesNotEmbedReadyBatchWorkspace
+    runtime_apply_batch_test.go:254: Runtime=400B caller-owned ReadyWorkspace=11032B AppliedBatch=304B
+--- PASS: TestRuntimeDoesNotEmbedReadyBatchWorkspace (0.00s)
+=== RUN   TestRuntimeInMemoryBatchDriverAndSettlementGate
+raft2026/09/05 12:29:12 INFO: 1 switched to configuration voters=(1)
+raft2026/09/05 12:29:12 INFO: 1 became follower at term 1
+raft2026/09/05 12:29:12 INFO: newRaft 1 [peers: [1], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:29:12 INFO: 1 is starting a new election at term 1
+raft2026/09/05 12:29:12 INFO: 1 became pre-candidate at term 1
+raft2026/09/05 12:29:12 INFO: 1 received MsgPreVoteResp from 1 at term 1
+raft2026/09/05 12:29:12 INFO: 1 has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:12 INFO: 1 became candidate at term 2
+raft2026/09/05 12:29:12 INFO: 1 received MsgVoteResp from 1 at term 2
+raft2026/09/05 12:29:12 INFO: 1 has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:12 INFO: 1 became leader at term 2
+--- PASS: TestRuntimeInMemoryBatchDriverAndSettlementGate (0.00s)
+=== RUN   TestRuntimeUnclassifiedSettlementFailureIsTerminal
+--- PASS: TestRuntimeUnclassifiedSettlementFailureIsTerminal (0.00s)
+=== RUN   TestRuntimeAppliedBatchSettlementFailureIsRetryableHardGate
+raft2026/09/05 12:29:12 INFO: 1 switched to configuration voters=(1)
+raft2026/09/05 12:29:12 INFO: 1 became follower at term 1
+raft2026/09/05 12:29:12 INFO: newRaft 1 [peers: [1], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:29:12 INFO: 1 is starting a new election at term 1
+raft2026/09/05 12:29:12 INFO: 1 became pre-candidate at term 1
+raft2026/09/05 12:29:12 INFO: 1 received MsgPreVoteResp from 1 at term 1
+raft2026/09/05 12:29:12 INFO: 1 has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:12 INFO: 1 became candidate at term 2
+raft2026/09/05 12:29:12 INFO: 1 received MsgVoteResp from 1 at term 2
+raft2026/09/05 12:29:12 INFO: 1 has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:12 INFO: 1 became leader at term 2
+raft2026/09/05 12:29:12 INFO: b6 switched to configuration voters=(b6)
+raft2026/09/05 12:29:12 INFO: b6 became follower at term 1
+raft2026/09/05 12:29:12 INFO: newRaft b6 [peers: [b6], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:29:12 INFO: b6 is starting a new election at term 1
+raft2026/09/05 12:29:12 INFO: b6 became pre-candidate at term 1
+raft2026/09/05 12:29:12 INFO: b6 received MsgPreVoteResp from b6 at term 1
+raft2026/09/05 12:29:12 INFO: b6 has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:12 INFO: b6 became candidate at term 2
+raft2026/09/05 12:29:12 INFO: b6 received MsgVoteResp from b6 at term 2
+raft2026/09/05 12:29:12 INFO: b6 has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:12 INFO: b6 became leader at term 2
+--- PASS: TestRuntimeAppliedBatchSettlementFailureIsRetryableHardGate (0.02s)
+=== RUN   TestRuntimeBatchesCommittedCommandsIntoCapturedResultRanges
+raft2026/09/05 12:29:12 INFO: b7 switched to configuration voters=(b7)
+raft2026/09/05 12:29:12 INFO: b7 became follower at term 1
+raft2026/09/05 12:29:12 INFO: newRaft b7 [peers: [b7], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:29:12 INFO: b7 is starting a new election at term 1
+raft2026/09/05 12:29:12 INFO: b7 became pre-candidate at term 1
+raft2026/09/05 12:29:12 INFO: b7 received MsgPreVoteResp from b7 at term 1
+raft2026/09/05 12:29:12 INFO: b7 has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:12 INFO: b7 became candidate at term 2
+raft2026/09/05 12:29:12 INFO: b7 received MsgVoteResp from b7 at term 2
+raft2026/09/05 12:29:12 INFO: b7 has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:12 INFO: b7 became leader at term 2
+    runtime_apply_batch_test.go:667: settled 64 commands as 2 exact committed prefixes of at most 41 entries
+--- PASS: TestRuntimeBatchesCommittedCommandsIntoCapturedResultRanges (0.19s)
+=== RUN   TestRuntimeBatchSystemPrefixRespectsExactProfile
+--- PASS: TestRuntimeBatchSystemPrefixRespectsExactProfile (0.00s)
+=== RUN   TestRuntimeSnapshotStateCoversCompleteRelationBundle
+raft2026/09/05 12:29:12 INFO: fd switched to configuration voters=(fd)
+raft2026/09/05 12:29:12 INFO: fd became follower at term 1
+raft2026/09/05 12:29:12 INFO: newRaft fd [peers: [fd], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:29:12 INFO: fd is starting a new election at term 1
+raft2026/09/05 12:29:12 INFO: fd became pre-candidate at term 1
+raft2026/09/05 12:29:12 INFO: fd received MsgPreVoteResp from fd at term 1
+raft2026/09/05 12:29:12 INFO: fd has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:12 INFO: fd became candidate at term 2
+raft2026/09/05 12:29:12 INFO: fd received MsgVoteResp from fd at term 2
+raft2026/09/05 12:29:12 INFO: fd has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:12 INFO: fd became leader at term 2
+--- PASS: TestRuntimeSnapshotStateCoversCompleteRelationBundle (0.04s)
+=== RUN   TestNodeRuntimePersistenceSharesOneSequencerWithoutGroupWorkers
+--- PASS: TestNodeRuntimePersistenceSharesOneSequencerWithoutGroupWorkers (0.01s)
+=== RUN   TestAdoptNodeRuntimeDrivesWorkerFreeDurableReady
+raft2026/09/05 12:29:12 INFO: 12 switched to configuration voters=(12)
+raft2026/09/05 12:29:12 INFO: 12 became follower at term 1
+raft2026/09/05 12:29:12 INFO: newRaft 12 [peers: [12], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:29:12 INFO: 12 is starting a new election at term 1
+raft2026/09/05 12:29:12 INFO: 12 became pre-candidate at term 1
+raft2026/09/05 12:29:12 INFO: 12 received MsgPreVoteResp from 12 at term 1
+raft2026/09/05 12:29:12 INFO: 12 has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:12 INFO: 12 became candidate at term 2
+raft2026/09/05 12:29:12 INFO: 12 received MsgVoteResp from 12 at term 2
+raft2026/09/05 12:29:12 INFO: 12 has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:12 INFO: 12 became leader at term 2
+--- PASS: TestAdoptNodeRuntimeDrivesWorkerFreeDurableReady (0.03s)
+=== RUN   TestRuntimeOriginalCompletionSurvivesSettlementRetry
+raft2026/09/05 12:29:12 INFO: 1 switched to configuration voters=(1)
+raft2026/09/05 12:29:12 INFO: 1 became follower at term 1
+raft2026/09/05 12:29:12 INFO: newRaft 1 [peers: [1], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:29:12 INFO: 1 is starting a new election at term 1
+raft2026/09/05 12:29:12 INFO: 1 became pre-candidate at term 1
+raft2026/09/05 12:29:12 INFO: 1 received MsgPreVoteResp from 1 at term 1
+raft2026/09/05 12:29:12 INFO: 1 has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:12 INFO: 1 became candidate at term 2
+raft2026/09/05 12:29:12 INFO: 1 received MsgVoteResp from 1 at term 2
+raft2026/09/05 12:29:12 INFO: 1 has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:12 INFO: 1 became leader at term 2
+--- PASS: TestRuntimeOriginalCompletionSurvivesSettlementRetry (0.00s)
+=== RUN   TestPipelinedAppendRingCopiesBoundedPrefixBeforeRetirement
+--- PASS: TestPipelinedAppendRingCopiesBoundedPrefixBeforeRetirement (0.00s)
+=== RUN   TestPipelinedNodeAppendSubmitsQueuedReadyPrefixAfterFirstCompletion
+--- PASS: TestPipelinedNodeAppendSubmitsQueuedReadyPrefixAfterFirstCompletion (0.01s)
+=== RUN   TestPipelinedNodeAppendShrinksUnsupportedSeriesPrefix
+--- PASS: TestPipelinedNodeAppendShrinksUnsupportedSeriesPrefix (0.01s)
+=== RUN   TestRuntimeReplaysCommittedWALSuffixFromCheckpointCertificate
+raft2026/09/05 12:29:12 INFO: f8 switched to configuration voters=(f8)
+raft2026/09/05 12:29:12 INFO: f8 became follower at term 1
+raft2026/09/05 12:29:12 INFO: newRaft f8 [peers: [f8], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:29:12 INFO: f8 is starting a new election at term 1
+raft2026/09/05 12:29:12 INFO: f8 became pre-candidate at term 1
+raft2026/09/05 12:29:12 INFO: f8 received MsgPreVoteResp from f8 at term 1
+raft2026/09/05 12:29:12 INFO: f8 has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:12 INFO: f8 became candidate at term 2
+raft2026/09/05 12:29:12 INFO: f8 received MsgVoteResp from f8 at term 2
+raft2026/09/05 12:29:12 INFO: f8 has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:12 INFO: f8 became leader at term 2
+    runtime_replay_integration_test.go:189: single-node schedule exposed only the publication-backed commit cut
+--- SKIP: TestRuntimeReplaysCommittedWALSuffixFromCheckpointCertificate (0.03s)
+=== RUN   TestRuntimeQuiesceSQLGenerationRetainsRaftAndWAL
+raft2026/09/05 12:29:12 INFO: f9 switched to configuration voters=(f9)
+raft2026/09/05 12:29:12 INFO: f9 became follower at term 1
+raft2026/09/05 12:29:12 INFO: newRaft f9 [peers: [f9], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+--- PASS: TestRuntimeQuiesceSQLGenerationRetainsRaftAndWAL (0.02s)
+=== RUN   TestRuntimeIdentityPublishesPortableMachineManifest
+raft2026/09/05 12:29:12 INFO: d2 switched to configuration voters=(d2)
+raft2026/09/05 12:29:12 INFO: d2 became follower at term 1
+raft2026/09/05 12:29:12 INFO: newRaft d2 [peers: [d2], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+--- PASS: TestRuntimeIdentityPublishesPortableMachineManifest (0.03s)
+=== RUN   TestAdoptRuntimeOwnsExactPairAndMintsOneIncarnation
+raft2026/09/05 12:29:12 INFO: d3 switched to configuration voters=(d3)
+raft2026/09/05 12:29:12 INFO: d3 became follower at term 1
+raft2026/09/05 12:29:12 INFO: newRaft d3 [peers: [d3], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+--- PASS: TestAdoptRuntimeOwnsExactPairAndMintsOneIncarnation (0.02s)
+=== RUN   TestAdoptStagedRuntimeResumesExactPristineIncarnationOnly
+raft2026/09/05 12:29:12 INFO: d4 switched to configuration voters=(d4)
+raft2026/09/05 12:29:12 INFO: d4 became follower at term 1
+raft2026/09/05 12:29:12 INFO: newRaft d4 [peers: [d4], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:29:12 INFO: d4 switched to configuration voters=(d4)
+raft2026/09/05 12:29:12 INFO: d4 became follower at term 1
+raft2026/09/05 12:29:12 INFO: newRaft d4 [peers: [d4], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:29:12 INFO: d4 is starting a new election at term 1
+raft2026/09/05 12:29:12 INFO: d4 became pre-candidate at term 1
+raft2026/09/05 12:29:12 INFO: d4 received MsgPreVoteResp from d4 at term 1
+raft2026/09/05 12:29:12 INFO: d4 has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:12 INFO: d4 became candidate at term 2
+raft2026/09/05 12:29:12 INFO: d4 received MsgVoteResp from d4 at term 2
+raft2026/09/05 12:29:12 INFO: d4 has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:12 INFO: d4 became leader at term 2
+--- PASS: TestAdoptStagedRuntimeResumesExactPristineIncarnationOnly (0.03s)
+=== RUN   TestRuntimeCampaignProposalAndReadyOrdering
+raft2026/09/05 12:29:12 INFO: dd switched to configuration voters=(dd)
+raft2026/09/05 12:29:12 INFO: dd became follower at term 1
+raft2026/09/05 12:29:12 INFO: newRaft dd [peers: [dd], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:29:12 INFO: dd is starting a new election at term 1
+raft2026/09/05 12:29:12 INFO: dd became pre-candidate at term 1
+raft2026/09/05 12:29:12 INFO: dd received MsgPreVoteResp from dd at term 1
+raft2026/09/05 12:29:12 INFO: dd has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:12 INFO: dd became candidate at term 2
+raft2026/09/05 12:29:12 INFO: dd received MsgVoteResp from dd at term 2
+raft2026/09/05 12:29:12 INFO: dd has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:12 INFO: dd became leader at term 2
+--- PASS: TestRuntimeCampaignProposalAndReadyOrdering (0.03s)
+=== RUN   TestRuntimeBatchesNormalProposalsIntoOneReady
+raft2026/09/05 12:29:12 INFO: de switched to configuration voters=(de)
+raft2026/09/05 12:29:12 INFO: de became follower at term 1
+raft2026/09/05 12:29:12 INFO: newRaft de [peers: [de], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:29:12 INFO: de is starting a new election at term 1
+raft2026/09/05 12:29:12 INFO: de became pre-candidate at term 1
+raft2026/09/05 12:29:12 INFO: de received MsgPreVoteResp from de at term 1
+raft2026/09/05 12:29:12 INFO: de has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:12 INFO: de became candidate at term 2
+raft2026/09/05 12:29:12 INFO: de received MsgVoteResp from de at term 2
+raft2026/09/05 12:29:12 INFO: de has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:12 INFO: de became leader at term 2
+raft2026/09/05 12:29:12 INFO: de switched to configuration voters=(de) learners=(2)
+--- PASS: TestRuntimeBatchesNormalProposalsIntoOneReady (0.14s)
+=== RUN   TestRuntimeNormalProposalWindowReportsRemainingCapacity
+raft2026/09/05 12:29:12 INFO: e2 switched to configuration voters=(e2)
+raft2026/09/05 12:29:12 INFO: e2 became follower at term 1
+raft2026/09/05 12:29:12 INFO: newRaft e2 [peers: [e2], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:29:12 INFO: e2 is starting a new election at term 1
+raft2026/09/05 12:29:12 INFO: e2 became pre-candidate at term 1
+raft2026/09/05 12:29:12 INFO: e2 received MsgPreVoteResp from e2 at term 1
+raft2026/09/05 12:29:12 INFO: e2 has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:12 INFO: e2 became candidate at term 2
+raft2026/09/05 12:29:12 INFO: e2 received MsgVoteResp from e2 at term 2
+raft2026/09/05 12:29:12 INFO: e2 has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:12 INFO: e2 became leader at term 2
+--- PASS: TestRuntimeNormalProposalWindowReportsRemainingCapacity (0.04s)
+=== RUN   TestRuntimeMultiEntryProposalAdmissionIsAllOrNone
+raft2026/09/05 12:29:12 INFO: e1 switched to configuration voters=(e1)
+raft2026/09/05 12:29:12 INFO: e1 became follower at term 1
+raft2026/09/05 12:29:12 INFO: newRaft e1 [peers: [e1], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:29:12 INFO: e1 is starting a new election at term 1
+raft2026/09/05 12:29:12 INFO: e1 became pre-candidate at term 1
+raft2026/09/05 12:29:12 INFO: e1 received MsgPreVoteResp from e1 at term 1
+raft2026/09/05 12:29:12 INFO: e1 has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:12 INFO: e1 became candidate at term 2
+raft2026/09/05 12:29:12 INFO: e1 received MsgVoteResp from e1 at term 2
+raft2026/09/05 12:29:12 INFO: e1 has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:12 INFO: e1 became leader at term 2
+--- PASS: TestRuntimeMultiEntryProposalAdmissionIsAllOrNone (0.03s)
+=== RUN   TestRuntimeProposalBatchByteLimitIsExact
+raft2026/09/05 12:29:12 INFO: df switched to configuration voters=(df)
+raft2026/09/05 12:29:12 INFO: df became follower at term 1
+raft2026/09/05 12:29:12 INFO: newRaft df [peers: [df], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:29:12 INFO: df is starting a new election at term 1
+raft2026/09/05 12:29:12 INFO: df became pre-candidate at term 1
+raft2026/09/05 12:29:12 INFO: df received MsgPreVoteResp from df at term 1
+raft2026/09/05 12:29:12 INFO: df has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:12 INFO: df became candidate at term 2
+raft2026/09/05 12:29:12 INFO: df received MsgVoteResp from df at term 2
+raft2026/09/05 12:29:12 INFO: df has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:12 INFO: df became leader at term 2
+--- PASS: TestRuntimeProposalBatchByteLimitIsExact (0.03s)
+=== RUN   TestRuntimeOversizedFirstProposalOccupiesBatchAlone
+raft2026/09/05 12:29:12 INFO: e0 switched to configuration voters=(e0)
+raft2026/09/05 12:29:12 INFO: e0 became follower at term 1
+raft2026/09/05 12:29:12 INFO: newRaft e0 [peers: [e0], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:29:12 INFO: e0 is starting a new election at term 1
+raft2026/09/05 12:29:12 INFO: e0 became pre-candidate at term 1
+raft2026/09/05 12:29:12 INFO: e0 received MsgPreVoteResp from e0 at term 1
+raft2026/09/05 12:29:12 INFO: e0 has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:12 INFO: e0 became candidate at term 2
+raft2026/09/05 12:29:12 INFO: e0 received MsgVoteResp from e0 at term 2
+raft2026/09/05 12:29:12 INFO: e0 has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:12 INFO: e0 became leader at term 2
+--- PASS: TestRuntimeOversizedFirstProposalOccupiesBatchAlone (0.04s)
+=== RUN   TestRuntimeFailureClearsProposalBatchCounters
+--- PASS: TestRuntimeFailureClearsProposalBatchCounters (0.00s)
+=== RUN   TestRuntimeRestartsFromCertifiedImmutableBaseAndAppendsNormally
+raft2026/09/05 12:29:12 INFO: dc switched to configuration voters=(dc)
+raft2026/09/05 12:29:12 INFO: dc became follower at term 1
+raft2026/09/05 12:29:12 INFO: newRaft dc [peers: [dc], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:29:12 INFO: dc is starting a new election at term 1
+raft2026/09/05 12:29:12 INFO: dc became pre-candidate at term 1
+raft2026/09/05 12:29:12 INFO: dc received MsgPreVoteResp from dc at term 1
+raft2026/09/05 12:29:12 INFO: dc has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:12 INFO: dc became candidate at term 2
+raft2026/09/05 12:29:12 INFO: dc received MsgVoteResp from dc at term 2
+raft2026/09/05 12:29:12 INFO: dc has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:12 INFO: dc became leader at term 2
+raft2026/09/05 12:29:12 INFO: dc switched to configuration voters=(dc)
+raft2026/09/05 12:29:12 INFO: dc became follower at term 2
+raft2026/09/05 12:29:12 INFO: newRaft dc [peers: [dc], term: 2, commit: 4, applied: 4, lastindex: 4, lastterm: 2]
+raft2026/09/05 12:29:12 INFO: dc is starting a new election at term 2
+raft2026/09/05 12:29:12 INFO: dc became pre-candidate at term 2
+raft2026/09/05 12:29:12 INFO: dc received MsgPreVoteResp from dc at term 2
+raft2026/09/05 12:29:12 INFO: dc has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:12 INFO: dc became candidate at term 3
+raft2026/09/05 12:29:12 INFO: dc received MsgVoteResp from dc at term 3
+raft2026/09/05 12:29:12 INFO: dc has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:12 INFO: dc became leader at term 3
+--- PASS: TestRuntimeRestartsFromCertifiedImmutableBaseAndAppendsNormally (0.05s)
+=== RUN   TestRuntimeConfigurationAndReadControlPorts
+raft2026/09/05 12:29:12 INFO: de switched to configuration voters=(de)
+raft2026/09/05 12:29:12 INFO: de became follower at term 1
+raft2026/09/05 12:29:12 INFO: newRaft de [peers: [de], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:29:12 INFO: de is starting a new election at term 1
+raft2026/09/05 12:29:12 INFO: de became pre-candidate at term 1
+raft2026/09/05 12:29:12 INFO: de received MsgPreVoteResp from de at term 1
+raft2026/09/05 12:29:12 INFO: de has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:12 INFO: de became candidate at term 2
+raft2026/09/05 12:29:12 INFO: de received MsgVoteResp from de at term 2
+raft2026/09/05 12:29:12 INFO: de has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:12 INFO: de became leader at term 2
+raft2026/09/05 12:29:12 INFO: de switched to configuration voters=(de) learners=(df)
+--- PASS: TestRuntimeConfigurationAndReadControlPorts (0.03s)
+=== RUN   TestRuntimeReconstructsCanonicalDurablePromotionBeforeApply
+raft2026/09/05 12:29:12 INFO: df switched to configuration voters=(df)
+raft2026/09/05 12:29:12 INFO: df became follower at term 1
+raft2026/09/05 12:29:12 INFO: newRaft df [peers: [df], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:29:12 INFO: df is starting a new election at term 1
+raft2026/09/05 12:29:12 INFO: df became pre-candidate at term 1
+raft2026/09/05 12:29:12 INFO: df received MsgPreVoteResp from df at term 1
+raft2026/09/05 12:29:12 INFO: df has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:12 INFO: df became candidate at term 2
+raft2026/09/05 12:29:12 INFO: df received MsgVoteResp from df at term 2
+raft2026/09/05 12:29:12 INFO: df has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:12 INFO: df became leader at term 2
+--- PASS: TestRuntimeReconstructsCanonicalDurablePromotionBeforeApply (0.03s)
+=== RUN   TestRuntimeRejectsDurableUncommittedPromotionAfterRestart
+raft2026/09/05 12:29:12 INFO: e0 switched to configuration voters=(e0 e1)
+raft2026/09/05 12:29:12 INFO: e0 became follower at term 1
+raft2026/09/05 12:29:12 INFO: newRaft e0 [peers: [e0,e1], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:29:12 INFO: e0 is starting a new election at term 1
+raft2026/09/05 12:29:12 INFO: e0 became pre-candidate at term 1
+raft2026/09/05 12:29:12 INFO: e0 [logterm: 1, index: 1] sent MsgPreVote request to e1 at term 1
+raft2026/09/05 12:29:12 INFO: e0 received MsgPreVoteResp from e0 at term 1
+raft2026/09/05 12:29:12 INFO: e0 has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:12 INFO: e0 received MsgPreVoteResp from e1 at term 1
+raft2026/09/05 12:29:12 INFO: e0 has received 2 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:12 INFO: e0 became candidate at term 2
+raft2026/09/05 12:29:12 INFO: e0 [logterm: 1, index: 1] sent MsgVote request to e1 at term 2
+raft2026/09/05 12:29:12 INFO: e0 received MsgVoteResp from e0 at term 2
+raft2026/09/05 12:29:12 INFO: e0 has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:12 INFO: e0 received MsgVoteResp from e1 at term 2
+raft2026/09/05 12:29:12 INFO: e0 has received 2 MsgVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:12 INFO: e0 became leader at term 2
+raft2026/09/05 12:29:12 INFO: e0 switched to configuration voters=(e0 e1)
+raft2026/09/05 12:29:12 INFO: e0 became follower at term 2
+raft2026/09/05 12:29:12 INFO: newRaft e0 [peers: [e0,e1], term: 2, commit: 2, applied: 2, lastindex: 3, lastterm: 2]
+--- PASS: TestRuntimeRejectsDurableUncommittedPromotionAfterRestart (0.03s)
+=== RUN   TestRuntimePersistsBeforeOutboundAndRetriesSink
+raft2026/09/05 12:29:12 INFO: e7 switched to configuration voters=(e7 e8)
+raft2026/09/05 12:29:12 INFO: e7 became follower at term 1
+raft2026/09/05 12:29:12 INFO: newRaft e7 [peers: [e7,e8], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:29:12 INFO: e7 is starting a new election at term 1
+raft2026/09/05 12:29:12 INFO: e7 became pre-candidate at term 1
+raft2026/09/05 12:29:12 INFO: e7 [logterm: 1, index: 1] sent MsgPreVote request to e8 at term 1
+raft2026/09/05 12:29:12 INFO: e7 received MsgPreVoteResp from e7 at term 1
+raft2026/09/05 12:29:12 INFO: e7 has received 1 MsgPreVoteResp votes and 0 vote rejections
+--- PASS: TestRuntimePersistsBeforeOutboundAndRetriesSink (0.02s)
+=== RUN   TestRuntimeStepDetachesOrdinaryMessageAndRejectsSnapshot
+raft2026/09/05 12:29:12 INFO: f1 switched to configuration voters=(f1 f2)
+raft2026/09/05 12:29:12 INFO: f1 became follower at term 1
+raft2026/09/05 12:29:12 INFO: newRaft f1 [peers: [f1,f2], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+--- PASS: TestRuntimeStepDetachesOrdinaryMessageAndRejectsSnapshot (0.02s)
+=== RUN   TestRuntimeStepsCurrentLeaderTimeoutNow
+raft2026/09/05 12:29:13 INFO: f2 switched to configuration voters=(f2 f3)
+raft2026/09/05 12:29:13 INFO: f2 became follower at term 1
+raft2026/09/05 12:29:13 INFO: newRaft f2 [peers: [f2,f3], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:29:13 INFO: f2 [term: 1] received a MsgHeartbeat message with higher term from f3 [term: 2]
+raft2026/09/05 12:29:13 INFO: f2 became follower at term 2
+raft2026/09/05 12:29:13 INFO: f2 [term 2] received MsgTimeoutNow from f3 and starts an election to get leadership.
+raft2026/09/05 12:29:13 INFO: f2 is starting a new election at term 2
+raft2026/09/05 12:29:13 INFO: f2 became candidate at term 3
+raft2026/09/05 12:29:13 INFO: f2 [logterm: 1, index: 1] sent MsgVote request to f3 at term 3
+raft2026/09/05 12:29:13 INFO: f2 switched to configuration voters=(f2 f3)
+raft2026/09/05 12:29:13 INFO: f2 became follower at term 1
+raft2026/09/05 12:29:13 INFO: newRaft f2 [peers: [f2,f3], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:29:13 INFO: f2 [term: 1] received a MsgHeartbeat message with higher term from f3 [term: 2]
+raft2026/09/05 12:29:13 INFO: f2 became follower at term 2
+--- PASS: TestRuntimeStepsCurrentLeaderTimeoutNow (0.05s)
+=== RUN   TestRuntimeTransfersLeaderWithExactTimeoutNow
+raft2026/09/05 12:29:13 INFO: f3 switched to configuration voters=(f3 f4)
+raft2026/09/05 12:29:13 INFO: f3 became follower at term 1
+raft2026/09/05 12:29:13 INFO: newRaft f3 [peers: [f3,f4], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:29:13 INFO: f3 is starting a new election at term 1
+raft2026/09/05 12:29:13 INFO: f3 became pre-candidate at term 1
+raft2026/09/05 12:29:13 INFO: f3 [logterm: 1, index: 1] sent MsgPreVote request to f4 at term 1
+raft2026/09/05 12:29:13 INFO: f3 received MsgPreVoteResp from f3 at term 1
+raft2026/09/05 12:29:13 INFO: f3 has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:13 INFO: f3 received MsgPreVoteResp from f4 at term 1
+raft2026/09/05 12:29:13 INFO: f3 has received 2 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:13 INFO: f3 became candidate at term 2
+raft2026/09/05 12:29:13 INFO: f3 [logterm: 1, index: 1] sent MsgVote request to f4 at term 2
+raft2026/09/05 12:29:13 INFO: f3 received MsgVoteResp from f3 at term 2
+raft2026/09/05 12:29:13 INFO: f3 has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:13 INFO: f3 received MsgVoteResp from f4 at term 2
+raft2026/09/05 12:29:13 INFO: f3 has received 2 MsgVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:13 INFO: f3 became leader at term 2
+raft2026/09/05 12:29:13 INFO: f3 [term 2] starts to transfer leadership to f4
+raft2026/09/05 12:29:13 INFO: f3 sends MsgTimeoutNow to f4 immediately as f4 already has up-to-date log
+--- PASS: TestRuntimeTransfersLeaderWithExactTimeoutNow (0.03s)
+=== RUN   TestRuntimeTerminalWALCapacityFailureLatches
+raft2026/09/05 12:29:13 INFO: f6 switched to configuration voters=(f6)
+raft2026/09/05 12:29:13 INFO: f6 became follower at term 1
+raft2026/09/05 12:29:13 INFO: newRaft f6 [peers: [f6], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:29:13 INFO: f6 is starting a new election at term 1
+raft2026/09/05 12:29:13 INFO: f6 became pre-candidate at term 1
+raft2026/09/05 12:29:13 INFO: f6 received MsgPreVoteResp from f6 at term 1
+raft2026/09/05 12:29:13 INFO: f6 has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:13 INFO: f6 became candidate at term 2
+raft2026/09/05 12:29:13 INFO: f6 received MsgVoteResp from f6 at term 2
+raft2026/09/05 12:29:13 INFO: f6 has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/09/05 12:29:13 INFO: f6 became leader at term 2
+--- PASS: TestRuntimeTerminalWALCapacityFailureLatches (0.03s)
+=== RUN   TestRuntimePoisonedApplyAdmissionLatches
+raft2026/09/05 12:29:13 INFO: f7 switched to configuration voters=(f7)
+raft2026/09/05 12:29:13 INFO: f7 became follower at term 1
+raft2026/09/05 12:29:13 INFO: newRaft f7 [peers: [f7], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+--- PASS: TestRuntimePoisonedApplyAdmissionLatches (0.02s)
+=== RUN   TestCloneOrdinaryMessageRejectsGraphAmplification
+--- PASS: TestCloneOrdinaryMessageRejectsGraphAmplification (0.00s)
+=== RUN   TestMeasureOrdinaryMessageAdmitsOnlyExactTimeoutNow
+=== RUN   TestMeasureOrdinaryMessageAdmitsOnlyExactTimeoutNow/zero_term
+=== RUN   TestMeasureOrdinaryMessageAdmitsOnlyExactTimeoutNow/missing_term
+=== RUN   TestMeasureOrdinaryMessageAdmitsOnlyExactTimeoutNow/entry
+=== RUN   TestMeasureOrdinaryMessageAdmitsOnlyExactTimeoutNow/snapshot
+=== RUN   TestMeasureOrdinaryMessageAdmitsOnlyExactTimeoutNow/context
+=== RUN   TestMeasureOrdinaryMessageAdmitsOnlyExactTimeoutNow/explicit_index
+=== RUN   TestMeasureOrdinaryMessageAdmitsOnlyExactTimeoutNow/explicit_commit
+=== RUN   TestMeasureOrdinaryMessageAdmitsOnlyExactTimeoutNow/reject
+=== RUN   TestMeasureOrdinaryMessageAdmitsOnlyExactTimeoutNow/response
+--- PASS: TestMeasureOrdinaryMessageAdmitsOnlyExactTimeoutNow (0.00s)
+    --- PASS: TestMeasureOrdinaryMessageAdmitsOnlyExactTimeoutNow/zero_term (0.00s)
+    --- PASS: TestMeasureOrdinaryMessageAdmitsOnlyExactTimeoutNow/missing_term (0.00s)
+    --- PASS: TestMeasureOrdinaryMessageAdmitsOnlyExactTimeoutNow/entry (0.00s)
+    --- PASS: TestMeasureOrdinaryMessageAdmitsOnlyExactTimeoutNow/snapshot (0.00s)
+    --- PASS: TestMeasureOrdinaryMessageAdmitsOnlyExactTimeoutNow/context (0.00s)
+    --- PASS: TestMeasureOrdinaryMessageAdmitsOnlyExactTimeoutNow/explicit_index (0.00s)
+    --- PASS: TestMeasureOrdinaryMessageAdmitsOnlyExactTimeoutNow/explicit_commit (0.00s)
+    --- PASS: TestMeasureOrdinaryMessageAdmitsOnlyExactTimeoutNow/reject (0.00s)
+    --- PASS: TestMeasureOrdinaryMessageAdmitsOnlyExactTimeoutNow/response (0.00s)
+PASS

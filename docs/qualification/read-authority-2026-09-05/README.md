@@ -1,0 +1,46 @@
+# Quorum read authority qualification — 2026-09-05
+
+[Qualification index](../README.md)
+
+This record retains intermediate validation for the explicit quorum-promise
+read authority implementation. It contains no throughput claim. SQL integration,
+production policy wiring, and end-to-end qualification were not complete at
+this checkpoint.
+
+## Source and scope
+
+The protocol core was committed as `ef8f3c4b`; adversarial clock-schedule tests
+as `7ee6be2c`; authenticated transport and election gates as `e3dd0f1d`.
+The following merge `fa01b92d` incorporates main `dc6304e0`, including the
+separate fix for ordinary traffic queued to a removed voter.
+
+The logs cover intermediate working copies leading to those commits, rather
+than a benchmark of immutable release binaries. File checksums are recorded in
+[checksums.json](checksums.json). Failed precursors remain alongside subsequent
+runs. No test result establishes the broader 2× CockroachDB objective.
+
+## Validation limits and results
+
+Native package and race suites passed, but strict physical-allocation runtime
+fixtures can skip on the macOS host. These passes must not be interpreted as
+execution of every enabled-runtime case.
+
+Linux/arm64 test binaries ran in the pinned runtime image
+`sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b`
+with an anonymous Docker volume mounted at `/tmp`. This permits the actual
+strict-allocation fixtures to execute. The initial enabled-runtime Linux run
+failed because its fixture omitted the authenticated source identity. The
+corrected fixture uses `StepAuthorityMessageFrom`; later runs also align the
+policy test with the conservative immutable-per-runtime policy contract.
+
+The final runtime regression log has no skips and covers election gates,
+clock faults, independent leader incarnation, term/configuration invalidation,
+live-promise policy protection, acquisition expiry, overlapping renewal, and
+configuration-pending regressions. Full Linux package runs for raftmodel,
+raftmember, rafttransport, multiraft, and raftservice passed at the recorded
+intermediate gate checkpoint.
+
+Standalone protocol tests additionally compare drift, delay, renewal, and
+restart deadlines against independent arbitrary-precision arithmetic. These
+are bounded deterministic tests, not a formal proof or an RF3 process-failure
+qualification of the complete SQL feature.

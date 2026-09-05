@@ -1,0 +1,661 @@
+=== RUN   TestEncodeOutboundAndPreflightAllocateNothingWithCallerBuffer
+--- PASS: TestEncodeOutboundAndPreflightAllocateNothingWithCallerBuffer (0.00s)
+=== RUN   TestOrdinaryTransportWarmSendQueueRoundTripAllocatesNothing
+--- PASS: TestOrdinaryTransportWarmSendQueueRoundTripAllocatesNothing (0.00s)
+=== RUN   TestRestartedLearnerAcceptsCertifiedConfigurationReplay
+--- PASS: TestRestartedLearnerAcceptsCertifiedConfigurationReplay (0.00s)
+=== RUN   TestCommittedAuthoritySeparatesEnrollmentAndBoundsAdjacentGenerations
+--- PASS: TestCommittedAuthoritySeparatesEnrollmentAndBoundsAdjacentGenerations (0.00s)
+=== RUN   TestTransitionGrantExactCASConcurrentRefreshAndTerminalRevoke
+--- PASS: TestTransitionGrantExactCASConcurrentRefreshAndTerminalRevoke (0.00s)
+=== RUN   TestTransitionGrantRestartAcceptsOnlyExactLifecycleCuts
+=== RUN   TestTransitionGrantRestartAcceptsOnlyExactLifecycleCuts/initial-rf3
+=== RUN   TestTransitionGrantRestartAcceptsOnlyExactLifecycleCuts/target-learner
+=== RUN   TestTransitionGrantRestartAcceptsOnlyExactLifecycleCuts/promoted-rf4
+=== RUN   TestTransitionGrantRestartAcceptsOnlyExactLifecycleCuts/completed-rf3
+=== RUN   TestTransitionGrantRestartAcceptsOnlyExactLifecycleCuts/unrelated-later-rf3
+=== RUN   TestTransitionGrantRestartAcceptsOnlyExactLifecycleCuts/unrelated-later-completed-shape
+=== RUN   TestTransitionGrantRestartAcceptsOnlyExactLifecycleCuts/progressed-extra-voter
+--- PASS: TestTransitionGrantRestartAcceptsOnlyExactLifecycleCuts (0.00s)
+    --- PASS: TestTransitionGrantRestartAcceptsOnlyExactLifecycleCuts/initial-rf3 (0.00s)
+    --- PASS: TestTransitionGrantRestartAcceptsOnlyExactLifecycleCuts/target-learner (0.00s)
+    --- PASS: TestTransitionGrantRestartAcceptsOnlyExactLifecycleCuts/promoted-rf4 (0.00s)
+    --- PASS: TestTransitionGrantRestartAcceptsOnlyExactLifecycleCuts/completed-rf3 (0.00s)
+    --- PASS: TestTransitionGrantRestartAcceptsOnlyExactLifecycleCuts/unrelated-later-rf3 (0.00s)
+    --- PASS: TestTransitionGrantRestartAcceptsOnlyExactLifecycleCuts/unrelated-later-completed-shape (0.00s)
+    --- PASS: TestTransitionGrantRestartAcceptsOnlyExactLifecycleCuts/progressed-extra-voter (0.00s)
+=== RUN   TestTransitionGrantRefreshRollsBackDisappearedUntouchedAuthority
+--- PASS: TestTransitionGrantRefreshRollsBackDisappearedUntouchedAuthority (0.00s)
+=== RUN   TestCurrentTransitionGrantWarmLookupAllocationFree
+--- PASS: TestCurrentTransitionGrantWarmLookupAllocationFree (0.00s)
+=== RUN   TestLaggingAuthorityAcceptsOnlyExactGrantedAdjacentConfiguration
+--- PASS: TestLaggingAuthorityAcceptsOnlyExactGrantedAdjacentConfiguration (0.00s)
+=== RUN   TestDurablePromotionProofGrantsOnlyTargetElectionExchange
+--- PASS: TestDurablePromotionProofGrantsOnlyTargetElectionExchange (0.00s)
+=== RUN   TestLearnerWithoutCommittedPromotionWitnessCannotVote
+--- PASS: TestLearnerWithoutCommittedPromotionWitnessCannotVote (0.00s)
+=== RUN   TestPeerTLSIndependentUTCStepMatrix
+=== RUN   TestPeerTLSIndependentUTCStepMatrix/both_inside_validity
+=== RUN   TestPeerTLSIndependentUTCStepMatrix/independent_opposite_steps_inside_validity
+=== RUN   TestPeerTLSIndependentUTCStepMatrix/client_stepped_past_server_expiry
+=== RUN   TestPeerTLSIndependentUTCStepMatrix/server_stepped_before_client_validity
+=== RUN   TestPeerTLSIndependentUTCStepMatrix/both_stepped_far_forward
+=== RUN   TestPeerTLSIndependentUTCStepMatrix/opposite_unsafe_steps
+--- PASS: TestPeerTLSIndependentUTCStepMatrix (0.01s)
+    --- PASS: TestPeerTLSIndependentUTCStepMatrix/both_inside_validity (0.00s)
+    --- PASS: TestPeerTLSIndependentUTCStepMatrix/independent_opposite_steps_inside_validity (0.00s)
+    --- PASS: TestPeerTLSIndependentUTCStepMatrix/client_stepped_past_server_expiry (0.00s)
+    --- PASS: TestPeerTLSIndependentUTCStepMatrix/server_stepped_before_client_validity (0.00s)
+    --- PASS: TestPeerTLSIndependentUTCStepMatrix/both_stepped_far_forward (0.00s)
+    --- PASS: TestPeerTLSIndependentUTCStepMatrix/opposite_unsafe_steps (0.00s)
+=== RUN   TestFrameCanonicalRoundTripRF2RF3
+=== RUN   TestFrameCanonicalRoundTripRF2RF3/MsgApp/RF2
+=== RUN   TestFrameCanonicalRoundTripRF2RF3/MsgAppResp/RF2
+=== RUN   TestFrameCanonicalRoundTripRF2RF3/MsgVote/RF2
+=== RUN   TestFrameCanonicalRoundTripRF2RF3/MsgVoteResp/RF2
+=== RUN   TestFrameCanonicalRoundTripRF2RF3/MsgHeartbeat/RF2
+=== RUN   TestFrameCanonicalRoundTripRF2RF3/MsgHeartbeatResp/RF2
+=== RUN   TestFrameCanonicalRoundTripRF2RF3/MsgPreVote/RF2
+=== RUN   TestFrameCanonicalRoundTripRF2RF3/MsgPreVoteResp/RF2
+=== RUN   TestFrameCanonicalRoundTripRF2RF3/MsgTimeoutNow/RF2
+=== RUN   TestFrameCanonicalRoundTripRF2RF3/MsgApp/RF3
+=== RUN   TestFrameCanonicalRoundTripRF2RF3/MsgAppResp/RF3
+=== RUN   TestFrameCanonicalRoundTripRF2RF3/MsgVote/RF3
+=== RUN   TestFrameCanonicalRoundTripRF2RF3/MsgVoteResp/RF3
+=== RUN   TestFrameCanonicalRoundTripRF2RF3/MsgHeartbeat/RF3
+=== RUN   TestFrameCanonicalRoundTripRF2RF3/MsgHeartbeatResp/RF3
+=== RUN   TestFrameCanonicalRoundTripRF2RF3/MsgPreVote/RF3
+=== RUN   TestFrameCanonicalRoundTripRF2RF3/MsgPreVoteResp/RF3
+=== RUN   TestFrameCanonicalRoundTripRF2RF3/MsgTimeoutNow/RF3
+--- PASS: TestFrameCanonicalRoundTripRF2RF3 (0.00s)
+    --- PASS: TestFrameCanonicalRoundTripRF2RF3/MsgApp/RF2 (0.00s)
+    --- PASS: TestFrameCanonicalRoundTripRF2RF3/MsgAppResp/RF2 (0.00s)
+    --- PASS: TestFrameCanonicalRoundTripRF2RF3/MsgVote/RF2 (0.00s)
+    --- PASS: TestFrameCanonicalRoundTripRF2RF3/MsgVoteResp/RF2 (0.00s)
+    --- PASS: TestFrameCanonicalRoundTripRF2RF3/MsgHeartbeat/RF2 (0.00s)
+    --- PASS: TestFrameCanonicalRoundTripRF2RF3/MsgHeartbeatResp/RF2 (0.00s)
+    --- PASS: TestFrameCanonicalRoundTripRF2RF3/MsgPreVote/RF2 (0.00s)
+    --- PASS: TestFrameCanonicalRoundTripRF2RF3/MsgPreVoteResp/RF2 (0.00s)
+    --- PASS: TestFrameCanonicalRoundTripRF2RF3/MsgTimeoutNow/RF2 (0.00s)
+    --- PASS: TestFrameCanonicalRoundTripRF2RF3/MsgApp/RF3 (0.00s)
+    --- PASS: TestFrameCanonicalRoundTripRF2RF3/MsgAppResp/RF3 (0.00s)
+    --- PASS: TestFrameCanonicalRoundTripRF2RF3/MsgVote/RF3 (0.00s)
+    --- PASS: TestFrameCanonicalRoundTripRF2RF3/MsgVoteResp/RF3 (0.00s)
+    --- PASS: TestFrameCanonicalRoundTripRF2RF3/MsgHeartbeat/RF3 (0.00s)
+    --- PASS: TestFrameCanonicalRoundTripRF2RF3/MsgHeartbeatResp/RF3 (0.00s)
+    --- PASS: TestFrameCanonicalRoundTripRF2RF3/MsgPreVote/RF3 (0.00s)
+    --- PASS: TestFrameCanonicalRoundTripRF2RF3/MsgPreVoteResp/RF3 (0.00s)
+    --- PASS: TestFrameCanonicalRoundTripRF2RF3/MsgTimeoutNow/RF3 (0.00s)
+=== RUN   TestFrameGoldenHeartbeat
+--- PASS: TestFrameGoldenHeartbeat (0.00s)
+=== RUN   TestTimeoutNowFrameRejectsWrongPeerAndNoncanonicalPayload
+=== RUN   TestTimeoutNowFrameRejectsWrongPeerAndNoncanonicalPayload/truncated
+=== RUN   TestTimeoutNowFrameRejectsWrongPeerAndNoncanonicalPayload/trailing
+=== RUN   TestTimeoutNowFrameRejectsWrongPeerAndNoncanonicalPayload/duplicate_term
+=== RUN   TestTimeoutNowFrameRejectsWrongPeerAndNoncanonicalPayload/unexpected_index
+=== RUN   TestTimeoutNowFrameRejectsWrongPeerAndNoncanonicalPayload/unexpected_large_entry
+--- PASS: TestTimeoutNowFrameRejectsWrongPeerAndNoncanonicalPayload (0.00s)
+    --- PASS: TestTimeoutNowFrameRejectsWrongPeerAndNoncanonicalPayload/truncated (0.00s)
+    --- PASS: TestTimeoutNowFrameRejectsWrongPeerAndNoncanonicalPayload/trailing (0.00s)
+    --- PASS: TestTimeoutNowFrameRejectsWrongPeerAndNoncanonicalPayload/duplicate_term (0.00s)
+    --- PASS: TestTimeoutNowFrameRejectsWrongPeerAndNoncanonicalPayload/unexpected_index (0.00s)
+    --- PASS: TestTimeoutNowFrameRejectsWrongPeerAndNoncanonicalPayload/unexpected_large_entry (0.00s)
+=== RUN   TestFrameRejectsCrossDomainPeerAndOutboundGroup
+--- PASS: TestFrameRejectsCrossDomainPeerAndOutboundGroup (0.00s)
+=== RUN   TestEncodeOutboundRejectsInvalidAuthorityAndShape
+=== RUN   TestEncodeOutboundRejectsInvalidAuthorityAndShape/nil_registry
+=== RUN   TestEncodeOutboundRejectsInvalidAuthorityAndShape/nil_message
+=== RUN   TestEncodeOutboundRejectsInvalidAuthorityAndShape/outer_source_mismatch
+=== RUN   TestEncodeOutboundRejectsInvalidAuthorityAndShape/remote_source
+=== RUN   TestEncodeOutboundRejectsInvalidAuthorityAndShape/unsupported_type
+=== RUN   TestEncodeOutboundRejectsInvalidAuthorityAndShape/snapshot_graph
+=== RUN   TestEncodeOutboundRejectsInvalidAuthorityAndShape/invalid_term
+=== RUN   TestEncodeOutboundRejectsInvalidAuthorityAndShape/context_bound
+--- PASS: TestEncodeOutboundRejectsInvalidAuthorityAndShape (0.00s)
+    --- PASS: TestEncodeOutboundRejectsInvalidAuthorityAndShape/nil_registry (0.00s)
+    --- PASS: TestEncodeOutboundRejectsInvalidAuthorityAndShape/nil_message (0.00s)
+    --- PASS: TestEncodeOutboundRejectsInvalidAuthorityAndShape/outer_source_mismatch (0.00s)
+    --- PASS: TestEncodeOutboundRejectsInvalidAuthorityAndShape/remote_source (0.00s)
+    --- PASS: TestEncodeOutboundRejectsInvalidAuthorityAndShape/unsupported_type (0.00s)
+    --- PASS: TestEncodeOutboundRejectsInvalidAuthorityAndShape/snapshot_graph (0.00s)
+    --- PASS: TestEncodeOutboundRejectsInvalidAuthorityAndShape/invalid_term (0.00s)
+    --- PASS: TestEncodeOutboundRejectsInvalidAuthorityAndShape/context_bound (0.00s)
+=== RUN   TestStaticRoleTrafficMatrix
+=== RUN   TestStaticRoleTrafficMatrix/allows_voter_app_to_learner
+=== RUN   TestStaticRoleTrafficMatrix/allows_learner_app_response_to_voter
+=== RUN   TestStaticRoleTrafficMatrix/allows_voter_heartbeat_to_learner
+=== RUN   TestStaticRoleTrafficMatrix/allows_learner_heartbeat_response_to_voter
+=== RUN   TestStaticRoleTrafficMatrix/allows_voter_leader_transfer_to_voter
+=== RUN   TestStaticRoleTrafficMatrix/rejects_learner_app
+=== RUN   TestStaticRoleTrafficMatrix/rejects_learner_heartbeat
+=== RUN   TestStaticRoleTrafficMatrix/rejects_learner_vote_request
+=== RUN   TestStaticRoleTrafficMatrix/rejects_learner_vote_response
+=== RUN   TestStaticRoleTrafficMatrix/rejects_learner_pre-vote_request
+=== RUN   TestStaticRoleTrafficMatrix/rejects_learner_pre-vote_response
+=== RUN   TestStaticRoleTrafficMatrix/rejects_learner_vote_target
+=== RUN   TestStaticRoleTrafficMatrix/rejects_learner_vote_response_target
+=== RUN   TestStaticRoleTrafficMatrix/rejects_learner_leader-transfer_source
+=== RUN   TestStaticRoleTrafficMatrix/rejects_learner_leader-transfer_target
+--- PASS: TestStaticRoleTrafficMatrix (0.00s)
+    --- PASS: TestStaticRoleTrafficMatrix/allows_voter_app_to_learner (0.00s)
+    --- PASS: TestStaticRoleTrafficMatrix/allows_learner_app_response_to_voter (0.00s)
+    --- PASS: TestStaticRoleTrafficMatrix/allows_voter_heartbeat_to_learner (0.00s)
+    --- PASS: TestStaticRoleTrafficMatrix/allows_learner_heartbeat_response_to_voter (0.00s)
+    --- PASS: TestStaticRoleTrafficMatrix/allows_voter_leader_transfer_to_voter (0.00s)
+    --- PASS: TestStaticRoleTrafficMatrix/rejects_learner_app (0.00s)
+    --- PASS: TestStaticRoleTrafficMatrix/rejects_learner_heartbeat (0.00s)
+    --- PASS: TestStaticRoleTrafficMatrix/rejects_learner_vote_request (0.00s)
+    --- PASS: TestStaticRoleTrafficMatrix/rejects_learner_vote_response (0.00s)
+    --- PASS: TestStaticRoleTrafficMatrix/rejects_learner_pre-vote_request (0.00s)
+    --- PASS: TestStaticRoleTrafficMatrix/rejects_learner_pre-vote_response (0.00s)
+    --- PASS: TestStaticRoleTrafficMatrix/rejects_learner_vote_target (0.00s)
+    --- PASS: TestStaticRoleTrafficMatrix/rejects_learner_vote_response_target (0.00s)
+    --- PASS: TestStaticRoleTrafficMatrix/rejects_learner_leader-transfer_source (0.00s)
+    --- PASS: TestStaticRoleTrafficMatrix/rejects_learner_leader-transfer_target (0.00s)
+=== RUN   TestStaticFrameRejectsConfigurationEntry
+=== RUN   TestStaticFrameRejectsConfigurationEntry/EntryConfChange
+=== RUN   TestStaticFrameRejectsConfigurationEntry/EntryConfChangeV2
+--- PASS: TestStaticFrameRejectsConfigurationEntry (0.00s)
+    --- PASS: TestStaticFrameRejectsConfigurationEntry/EntryConfChange (0.00s)
+    --- PASS: TestStaticFrameRejectsConfigurationEntry/EntryConfChangeV2 (0.00s)
+=== RUN   TestDecodeInboundRejectsChangedStaticRoster
+=== RUN   TestDecodeInboundRejectsChangedStaticRoster/role
+=== RUN   TestDecodeInboundRejectsChangedStaticRoster/node
+=== RUN   TestDecodeInboundRejectsChangedStaticRoster/replica-set_version
+--- PASS: TestDecodeInboundRejectsChangedStaticRoster (0.00s)
+    --- PASS: TestDecodeInboundRejectsChangedStaticRoster/role (0.00s)
+    --- PASS: TestDecodeInboundRejectsChangedStaticRoster/node (0.00s)
+    --- PASS: TestDecodeInboundRejectsChangedStaticRoster/replica-set_version (0.00s)
+=== RUN   TestEncodeOutboundRejectsWritableDestinationAliasingMessage
+--- PASS: TestEncodeOutboundRejectsWritableDestinationAliasingMessage (0.00s)
+=== RUN   TestEncodeOutboundRelocatesBeforePartialCapacityCanOverwriteMessage
+--- PASS: TestEncodeOutboundRelocatesBeforePartialCapacityCanOverwriteMessage (0.00s)
+=== RUN   TestDecodeInboundRejectsForgedPeerGroupAndMember
+=== RUN   TestDecodeInboundRejectsForgedPeerGroupAndMember/authenticated_node
+=== RUN   TestDecodeInboundRejectsForgedPeerGroupAndMember/missing_authenticated_node
+=== RUN   TestDecodeInboundRejectsForgedPeerGroupAndMember/cluster
+=== RUN   TestDecodeInboundRejectsForgedPeerGroupAndMember/cluster_incarnation
+=== RUN   TestDecodeInboundRejectsForgedPeerGroupAndMember/recovery_epoch
+=== RUN   TestDecodeInboundRejectsForgedPeerGroupAndMember/shard_incarnation
+=== RUN   TestDecodeInboundRejectsForgedPeerGroupAndMember/group
+=== RUN   TestDecodeInboundRejectsForgedPeerGroupAndMember/unknown_source_member
+=== RUN   TestDecodeInboundRejectsForgedPeerGroupAndMember/unknown_destination_member
+=== RUN   TestDecodeInboundRejectsForgedPeerGroupAndMember/remote_destination_member
+=== RUN   TestDecodeInboundRejectsForgedPeerGroupAndMember/authorized_source_does_not_match_protobuf
+=== RUN   TestDecodeInboundRejectsForgedPeerGroupAndMember/roster_digest
+--- PASS: TestDecodeInboundRejectsForgedPeerGroupAndMember (0.00s)
+    --- PASS: TestDecodeInboundRejectsForgedPeerGroupAndMember/authenticated_node (0.00s)
+    --- PASS: TestDecodeInboundRejectsForgedPeerGroupAndMember/missing_authenticated_node (0.00s)
+    --- PASS: TestDecodeInboundRejectsForgedPeerGroupAndMember/cluster (0.00s)
+    --- PASS: TestDecodeInboundRejectsForgedPeerGroupAndMember/cluster_incarnation (0.00s)
+    --- PASS: TestDecodeInboundRejectsForgedPeerGroupAndMember/recovery_epoch (0.00s)
+    --- PASS: TestDecodeInboundRejectsForgedPeerGroupAndMember/shard_incarnation (0.00s)
+    --- PASS: TestDecodeInboundRejectsForgedPeerGroupAndMember/group (0.00s)
+    --- PASS: TestDecodeInboundRejectsForgedPeerGroupAndMember/unknown_source_member (0.00s)
+    --- PASS: TestDecodeInboundRejectsForgedPeerGroupAndMember/unknown_destination_member (0.00s)
+    --- PASS: TestDecodeInboundRejectsForgedPeerGroupAndMember/remote_destination_member (0.00s)
+    --- PASS: TestDecodeInboundRejectsForgedPeerGroupAndMember/authorized_source_does_not_match_protobuf (0.00s)
+    --- PASS: TestDecodeInboundRejectsForgedPeerGroupAndMember/roster_digest (0.00s)
+=== RUN   TestDecodeInboundRejectsOuterInnerMismatch
+=== RUN   TestDecodeInboundRejectsOuterInnerMismatch/from
+=== RUN   TestDecodeInboundRejectsOuterInnerMismatch/to
+--- PASS: TestDecodeInboundRejectsOuterInnerMismatch (0.00s)
+    --- PASS: TestDecodeInboundRejectsOuterInnerMismatch/from (0.00s)
+    --- PASS: TestDecodeInboundRejectsOuterInnerMismatch/to (0.00s)
+=== RUN   TestDecodeInboundClassifiesCanonicalMalformedMessage
+--- PASS: TestDecodeInboundClassifiesCanonicalMalformedMessage (0.00s)
+=== RUN   TestDecodeInboundRejectsEveryTruncationAndHeaderDamage
+=== RUN   TestDecodeInboundRejectsEveryTruncationAndHeaderDamage/magic
+=== RUN   TestDecodeInboundRejectsEveryTruncationAndHeaderDamage/format
+=== RUN   TestDecodeInboundRejectsEveryTruncationAndHeaderDamage/kind
+=== RUN   TestDecodeInboundRejectsEveryTruncationAndHeaderDamage/flags
+=== RUN   TestDecodeInboundRejectsEveryTruncationAndHeaderDamage/zero_cluster
+=== RUN   TestDecodeInboundRejectsEveryTruncationAndHeaderDamage/zero_cluster_incarnation
+=== RUN   TestDecodeInboundRejectsEveryTruncationAndHeaderDamage/zero_recovery_epoch
+=== RUN   TestDecodeInboundRejectsEveryTruncationAndHeaderDamage/zero_shard_incarnation
+=== RUN   TestDecodeInboundRejectsEveryTruncationAndHeaderDamage/zero_group
+=== RUN   TestDecodeInboundRejectsEveryTruncationAndHeaderDamage/zero_from
+=== RUN   TestDecodeInboundRejectsEveryTruncationAndHeaderDamage/zero_to
+=== RUN   TestDecodeInboundRejectsEveryTruncationAndHeaderDamage/same_peer
+=== RUN   TestDecodeInboundRejectsEveryTruncationAndHeaderDamage/short_declared_payload
+=== RUN   TestDecodeInboundRejectsEveryTruncationAndHeaderDamage/oversized_declared_payload
+--- PASS: TestDecodeInboundRejectsEveryTruncationAndHeaderDamage (0.00s)
+    --- PASS: TestDecodeInboundRejectsEveryTruncationAndHeaderDamage/magic (0.00s)
+    --- PASS: TestDecodeInboundRejectsEveryTruncationAndHeaderDamage/format (0.00s)
+    --- PASS: TestDecodeInboundRejectsEveryTruncationAndHeaderDamage/kind (0.00s)
+    --- PASS: TestDecodeInboundRejectsEveryTruncationAndHeaderDamage/flags (0.00s)
+    --- PASS: TestDecodeInboundRejectsEveryTruncationAndHeaderDamage/zero_cluster (0.00s)
+    --- PASS: TestDecodeInboundRejectsEveryTruncationAndHeaderDamage/zero_cluster_incarnation (0.00s)
+    --- PASS: TestDecodeInboundRejectsEveryTruncationAndHeaderDamage/zero_recovery_epoch (0.00s)
+    --- PASS: TestDecodeInboundRejectsEveryTruncationAndHeaderDamage/zero_shard_incarnation (0.00s)
+    --- PASS: TestDecodeInboundRejectsEveryTruncationAndHeaderDamage/zero_group (0.00s)
+    --- PASS: TestDecodeInboundRejectsEveryTruncationAndHeaderDamage/zero_from (0.00s)
+    --- PASS: TestDecodeInboundRejectsEveryTruncationAndHeaderDamage/zero_to (0.00s)
+    --- PASS: TestDecodeInboundRejectsEveryTruncationAndHeaderDamage/same_peer (0.00s)
+    --- PASS: TestDecodeInboundRejectsEveryTruncationAndHeaderDamage/short_declared_payload (0.00s)
+    --- PASS: TestDecodeInboundRejectsEveryTruncationAndHeaderDamage/oversized_declared_payload (0.00s)
+=== RUN   TestDecodeInboundRejectsHostileProtobuf
+=== RUN   TestDecodeInboundRejectsHostileProtobuf/unknown_field
+=== RUN   TestDecodeInboundRejectsHostileProtobuf/wrong_wire_type
+=== RUN   TestDecodeInboundRejectsHostileProtobuf/noncanonical_varint
+=== RUN   TestDecodeInboundRejectsHostileProtobuf/duplicate_singular
+=== RUN   TestDecodeInboundRejectsHostileProtobuf/noncanonical_field_order
+=== RUN   TestDecodeInboundRejectsHostileProtobuf/snapshot
+=== RUN   TestDecodeInboundRejectsHostileProtobuf/local_vote
+=== RUN   TestDecodeInboundRejectsHostileProtobuf/recursive_responses
+=== RUN   TestDecodeInboundRejectsHostileProtobuf/too_many_tiny_entries
+--- PASS: TestDecodeInboundRejectsHostileProtobuf (0.00s)
+    --- PASS: TestDecodeInboundRejectsHostileProtobuf/unknown_field (0.00s)
+    --- PASS: TestDecodeInboundRejectsHostileProtobuf/wrong_wire_type (0.00s)
+    --- PASS: TestDecodeInboundRejectsHostileProtobuf/noncanonical_varint (0.00s)
+    --- PASS: TestDecodeInboundRejectsHostileProtobuf/duplicate_singular (0.00s)
+    --- PASS: TestDecodeInboundRejectsHostileProtobuf/noncanonical_field_order (0.00s)
+    --- PASS: TestDecodeInboundRejectsHostileProtobuf/snapshot (0.00s)
+    --- PASS: TestDecodeInboundRejectsHostileProtobuf/local_vote (0.00s)
+    --- PASS: TestDecodeInboundRejectsHostileProtobuf/recursive_responses (0.00s)
+    --- PASS: TestDecodeInboundRejectsHostileProtobuf/too_many_tiny_entries (0.00s)
+=== RUN   TestFrameOwnershipIsDetached
+--- PASS: TestFrameOwnershipIsDetached (0.00s)
+=== RUN   TestShardControlTrafficClassHasIsolatedALPN
+--- PASS: TestShardControlTrafficClassHasIsolatedALPN (0.00s)
+=== RUN   TestGatewayControlTrafficClassHasIsolatedALPN
+--- PASS: TestGatewayControlTrafficClassHasIsolatedALPN (0.00s)
+=== RUN   TestPeerTLSValidatePeerProfileBindsBothCredentialRootsAndBuild
+--- PASS: TestPeerTLSValidatePeerProfileBindsBothCredentialRootsAndBuild (0.00s)
+=== RUN   TestPeerIdentityExtensionIsExactCriticalAndDuplicateClosed
+=== RUN   TestPeerIdentityExtensionIsExactCriticalAndDuplicateClosed/missing
+=== RUN   TestPeerIdentityExtensionIsExactCriticalAndDuplicateClosed/duplicate
+=== RUN   TestPeerIdentityExtensionIsExactCriticalAndDuplicateClosed/noncritical
+=== RUN   TestPeerIdentityExtensionIsExactCriticalAndDuplicateClosed/trailing_byte
+=== RUN   TestPeerIdentityExtensionIsExactCriticalAndDuplicateClosed/zero_cluster_ID
+=== RUN   TestPeerIdentityExtensionIsExactCriticalAndDuplicateClosed/zero_cluster_incarnation
+=== RUN   TestPeerIdentityExtensionIsExactCriticalAndDuplicateClosed/zero_node
+--- PASS: TestPeerIdentityExtensionIsExactCriticalAndDuplicateClosed (0.00s)
+    --- PASS: TestPeerIdentityExtensionIsExactCriticalAndDuplicateClosed/missing (0.00s)
+    --- PASS: TestPeerIdentityExtensionIsExactCriticalAndDuplicateClosed/duplicate (0.00s)
+    --- PASS: TestPeerIdentityExtensionIsExactCriticalAndDuplicateClosed/noncritical (0.00s)
+    --- PASS: TestPeerIdentityExtensionIsExactCriticalAndDuplicateClosed/trailing_byte (0.00s)
+    --- PASS: TestPeerIdentityExtensionIsExactCriticalAndDuplicateClosed/zero_cluster_ID (0.00s)
+    --- PASS: TestPeerIdentityExtensionIsExactCriticalAndDuplicateClosed/zero_cluster_incarnation (0.00s)
+    --- PASS: TestPeerIdentityExtensionIsExactCriticalAndDuplicateClosed/zero_node (0.00s)
+=== RUN   TestPeerIdentityOIDMustBeExactOperatorPrivateEnterpriseLeaf
+=== RUN   TestPeerIdentityOIDMustBeExactOperatorPrivateEnterpriseLeaf/nil
+=== RUN   TestPeerIdentityOIDMustBeExactOperatorPrivateEnterpriseLeaf/standard_extension
+=== RUN   TestPeerIdentityOIDMustBeExactOperatorPrivateEnterpriseLeaf/zero_PEN
+=== RUN   TestPeerIdentityOIDMustBeExactOperatorPrivateEnterpriseLeaf/missing_type_arc
+=== RUN   TestPeerIdentityOIDMustBeExactOperatorPrivateEnterpriseLeaf/wrong_VibeDB_arc
+=== RUN   TestPeerIdentityOIDMustBeExactOperatorPrivateEnterpriseLeaf/wrong_type_arc
+=== RUN   TestPeerIdentityOIDMustBeExactOperatorPrivateEnterpriseLeaf/unknown_trailing_arc
+--- PASS: TestPeerIdentityOIDMustBeExactOperatorPrivateEnterpriseLeaf (0.00s)
+    --- PASS: TestPeerIdentityOIDMustBeExactOperatorPrivateEnterpriseLeaf/nil (0.00s)
+    --- PASS: TestPeerIdentityOIDMustBeExactOperatorPrivateEnterpriseLeaf/standard_extension (0.00s)
+    --- PASS: TestPeerIdentityOIDMustBeExactOperatorPrivateEnterpriseLeaf/zero_PEN (0.00s)
+    --- PASS: TestPeerIdentityOIDMustBeExactOperatorPrivateEnterpriseLeaf/missing_type_arc (0.00s)
+    --- PASS: TestPeerIdentityOIDMustBeExactOperatorPrivateEnterpriseLeaf/wrong_VibeDB_arc (0.00s)
+    --- PASS: TestPeerIdentityOIDMustBeExactOperatorPrivateEnterpriseLeaf/wrong_type_arc (0.00s)
+    --- PASS: TestPeerIdentityOIDMustBeExactOperatorPrivateEnterpriseLeaf/unknown_trailing_arc (0.00s)
+=== RUN   TestPeerTLSPinsIdentityOIDAndRejectsCertificateAtAnotherOID
+--- PASS: TestPeerTLSPinsIdentityOIDAndRejectsCertificateAtAnotherOID (0.00s)
+=== RUN   TestPeerTLSRejectsCertificateChainBoundsBeforeCopy
+--- PASS: TestPeerTLSRejectsCertificateChainBoundsBeforeCopy (0.00s)
+=== RUN   TestPeerTLSMutualAuthenticationDerivesExactNode
+--- PASS: TestPeerTLSMutualAuthenticationDerivesExactNode (0.00s)
+=== RUN   TestPeerTLSInternalBuildPrefaceAcceptsOneGrammarWithOptionalCapabilities
+--- PASS: TestPeerTLSInternalBuildPrefaceAcceptsOneGrammarWithOptionalCapabilities (0.00s)
+=== RUN   TestPeerTLSInternalBuildPrefaceRefusesGrammarAndCapabilityMismatch
+=== RUN   TestPeerTLSInternalBuildPrefaceRefusesGrammarAndCapabilityMismatch/wire_grammar
+=== RUN   TestPeerTLSInternalBuildPrefaceRefusesGrammarAndCapabilityMismatch/disk_grammar
+=== RUN   TestPeerTLSInternalBuildPrefaceRefusesGrammarAndCapabilityMismatch/required_capability
+--- PASS: TestPeerTLSInternalBuildPrefaceRefusesGrammarAndCapabilityMismatch (0.00s)
+    --- PASS: TestPeerTLSInternalBuildPrefaceRefusesGrammarAndCapabilityMismatch/wire_grammar (0.00s)
+    --- PASS: TestPeerTLSInternalBuildPrefaceRefusesGrammarAndCapabilityMismatch/disk_grammar (0.00s)
+    --- PASS: TestPeerTLSInternalBuildPrefaceRefusesGrammarAndCapabilityMismatch/required_capability (0.00s)
+=== RUN   TestPeerTLSExternalGatewayTrafficDoesNotConsumeInternalBuildPreface
+--- PASS: TestPeerTLSExternalGatewayTrafficDoesNotConsumeInternalBuildPreface (0.00s)
+=== RUN   TestPeerTLSInternalBuildPrefaceRetainsBoundedHandshakeDeadline
+--- PASS: TestPeerTLSInternalBuildPrefaceRetainsBoundedHandshakeDeadline (1.00s)
+=== RUN   TestPeerTLSShardNativeCapabilityIsMutuallyAuthenticatedAndIsolated
+--- PASS: TestPeerTLSShardNativeCapabilityIsMutuallyAuthenticatedAndIsolated (0.01s)
+=== RUN   TestPeerTLSGatewayShardPrefaceRejectsBuildAt1AEBBeforeApplicationFrames
+=== RUN   TestPeerTLSGatewayShardPrefaceRejectsBuildAt1AEBBeforeApplicationFrames/class-5
+=== RUN   TestPeerTLSGatewayShardPrefaceRejectsBuildAt1AEBBeforeApplicationFrames/class-3
+=== RUN   TestPeerTLSGatewayShardPrefaceRejectsBuildAt1AEBBeforeApplicationFrames/class-6
+--- PASS: TestPeerTLSGatewayShardPrefaceRejectsBuildAt1AEBBeforeApplicationFrames (0.01s)
+    --- PASS: TestPeerTLSGatewayShardPrefaceRejectsBuildAt1AEBBeforeApplicationFrames/class-5 (0.00s)
+    --- PASS: TestPeerTLSGatewayShardPrefaceRejectsBuildAt1AEBBeforeApplicationFrames/class-3 (0.00s)
+    --- PASS: TestPeerTLSGatewayShardPrefaceRejectsBuildAt1AEBBeforeApplicationFrames/class-6 (0.00s)
+=== RUN   TestPeerTLSServerRejectsLocalNodeCertificate
+--- PASS: TestPeerTLSServerRejectsLocalNodeCertificate (0.00s)
+=== RUN   TestPeerTLSLocalServicesRequireExplicitOptInAndKeepExactIdentity
+=== RUN   TestPeerTLSLocalServicesRequireExplicitOptInAndKeepExactIdentity/class-3
+=== RUN   TestPeerTLSLocalServicesRequireExplicitOptInAndKeepExactIdentity/class-2
+=== RUN   TestPeerTLSLocalServicesRequireExplicitOptInAndKeepExactIdentity/class-6
+--- PASS: TestPeerTLSLocalServicesRequireExplicitOptInAndKeepExactIdentity (0.01s)
+    --- PASS: TestPeerTLSLocalServicesRequireExplicitOptInAndKeepExactIdentity/class-3 (0.00s)
+    --- PASS: TestPeerTLSLocalServicesRequireExplicitOptInAndKeepExactIdentity/class-2 (0.00s)
+    --- PASS: TestPeerTLSLocalServicesRequireExplicitOptInAndKeepExactIdentity/class-6 (0.00s)
+=== RUN   TestPeerTLSLocalGatewayControlRequiresExplicitOptInAndExactIdentity
+=== RUN   TestPeerTLSLocalGatewayControlRequiresExplicitOptInAndExactIdentity/class-7
+=== RUN   TestPeerTLSLocalGatewayControlRequiresExplicitOptInAndExactIdentity/class-4
+=== RUN   TestPeerTLSLocalGatewayControlRequiresExplicitOptInAndExactIdentity/class-1
+=== RUN   TestPeerTLSLocalGatewayControlRequiresExplicitOptInAndExactIdentity/class-5
+=== RUN   TestPeerTLSLocalGatewayControlRequiresExplicitOptInAndExactIdentity/class-3
+=== RUN   TestPeerTLSLocalGatewayControlRequiresExplicitOptInAndExactIdentity/class-2
+=== RUN   TestPeerTLSLocalGatewayControlRequiresExplicitOptInAndExactIdentity/class-6
+--- PASS: TestPeerTLSLocalGatewayControlRequiresExplicitOptInAndExactIdentity (0.01s)
+    --- PASS: TestPeerTLSLocalGatewayControlRequiresExplicitOptInAndExactIdentity/class-7 (0.00s)
+    --- PASS: TestPeerTLSLocalGatewayControlRequiresExplicitOptInAndExactIdentity/class-4 (0.00s)
+    --- PASS: TestPeerTLSLocalGatewayControlRequiresExplicitOptInAndExactIdentity/class-1 (0.00s)
+    --- PASS: TestPeerTLSLocalGatewayControlRequiresExplicitOptInAndExactIdentity/class-5 (0.00s)
+    --- PASS: TestPeerTLSLocalGatewayControlRequiresExplicitOptInAndExactIdentity/class-3 (0.00s)
+    --- PASS: TestPeerTLSLocalGatewayControlRequiresExplicitOptInAndExactIdentity/class-2 (0.00s)
+    --- PASS: TestPeerTLSLocalGatewayControlRequiresExplicitOptInAndExactIdentity/class-6 (0.00s)
+=== RUN   TestPeerTLSRechecksCertificateTimeAtHandshake
+--- PASS: TestPeerTLSRechecksCertificateTimeAtHandshake (0.00s)
+=== RUN   TestPeerTLSRejectsZeroExplicitClockWithoutWallClockFallback
+--- PASS: TestPeerTLSRejectsZeroExplicitClockWithoutWallClockFallback (0.00s)
+=== RUN   TestPeerTLSRejectsCAAndNonSigningEndpointLeaves
+=== RUN   TestPeerTLSRejectsCAAndNonSigningEndpointLeaves/CA_endpoint
+=== RUN   TestPeerTLSRejectsCAAndNonSigningEndpointLeaves/no_digital_signature
+--- PASS: TestPeerTLSRejectsCAAndNonSigningEndpointLeaves (0.00s)
+    --- PASS: TestPeerTLSRejectsCAAndNonSigningEndpointLeaves/CA_endpoint (0.00s)
+    --- PASS: TestPeerTLSRejectsCAAndNonSigningEndpointLeaves/no_digital_signature (0.00s)
+=== RUN   TestPeerTLSRejectsRogueCAWrongNodeWrongClusterAndTrafficClass
+=== RUN   TestPeerTLSRejectsRogueCAWrongNodeWrongClusterAndTrafficClass/rogue_CA
+=== RUN   TestPeerTLSRejectsRogueCAWrongNodeWrongClusterAndTrafficClass/wrong_node
+=== RUN   TestPeerTLSRejectsRogueCAWrongNodeWrongClusterAndTrafficClass/wrong_cluster_with_reused_CA
+=== RUN   TestPeerTLSRejectsRogueCAWrongNodeWrongClusterAndTrafficClass/snapshot_on_ordinary_stream
+--- PASS: TestPeerTLSRejectsRogueCAWrongNodeWrongClusterAndTrafficClass (0.00s)
+    --- PASS: TestPeerTLSRejectsRogueCAWrongNodeWrongClusterAndTrafficClass/rogue_CA (0.00s)
+    --- PASS: TestPeerTLSRejectsRogueCAWrongNodeWrongClusterAndTrafficClass/wrong_node (0.00s)
+    --- PASS: TestPeerTLSRejectsRogueCAWrongNodeWrongClusterAndTrafficClass/wrong_cluster_with_reused_CA (0.00s)
+    --- PASS: TestPeerTLSRejectsRogueCAWrongNodeWrongClusterAndTrafficClass/snapshot_on_ordinary_stream (0.00s)
+=== RUN   TestPeerTLSRejectsExpiredLocalCertificateAndSubjectOnlyIdentity
+--- PASS: TestPeerTLSRejectsExpiredLocalCertificateAndSubjectOnlyIdentity (0.00s)
+=== RUN   TestPeerTLSValidatesLocalSignerBeforeHandshake
+--- PASS: TestPeerTLSValidatesLocalSignerBeforeHandshake (0.00s)
+=== RUN   TestPeerProfileAuthorizationExpiresWithoutRevalidationOrAllocation
+--- PASS: TestPeerProfileAuthorizationExpiresWithoutRevalidationOrAllocation (0.00s)
+=== RUN   TestPreflightAcceptsCanonicalOrdinaryPayloads
+=== RUN   TestPreflightAcceptsCanonicalOrdinaryPayloads/MsgApp
+=== RUN   TestPreflightAcceptsCanonicalOrdinaryPayloads/MsgAppResp
+=== RUN   TestPreflightAcceptsCanonicalOrdinaryPayloads/MsgVote
+=== RUN   TestPreflightAcceptsCanonicalOrdinaryPayloads/MsgVoteResp
+=== RUN   TestPreflightAcceptsCanonicalOrdinaryPayloads/MsgHeartbeat
+=== RUN   TestPreflightAcceptsCanonicalOrdinaryPayloads/MsgHeartbeatResp
+=== RUN   TestPreflightAcceptsCanonicalOrdinaryPayloads/MsgPreVote
+=== RUN   TestPreflightAcceptsCanonicalOrdinaryPayloads/MsgPreVoteResp
+=== RUN   TestPreflightAcceptsCanonicalOrdinaryPayloads/MsgTimeoutNow
+--- PASS: TestPreflightAcceptsCanonicalOrdinaryPayloads (0.00s)
+    --- PASS: TestPreflightAcceptsCanonicalOrdinaryPayloads/MsgApp (0.00s)
+    --- PASS: TestPreflightAcceptsCanonicalOrdinaryPayloads/MsgAppResp (0.00s)
+    --- PASS: TestPreflightAcceptsCanonicalOrdinaryPayloads/MsgVote (0.00s)
+    --- PASS: TestPreflightAcceptsCanonicalOrdinaryPayloads/MsgVoteResp (0.00s)
+    --- PASS: TestPreflightAcceptsCanonicalOrdinaryPayloads/MsgHeartbeat (0.00s)
+    --- PASS: TestPreflightAcceptsCanonicalOrdinaryPayloads/MsgHeartbeatResp (0.00s)
+    --- PASS: TestPreflightAcceptsCanonicalOrdinaryPayloads/MsgPreVote (0.00s)
+    --- PASS: TestPreflightAcceptsCanonicalOrdinaryPayloads/MsgPreVoteResp (0.00s)
+    --- PASS: TestPreflightAcceptsCanonicalOrdinaryPayloads/MsgTimeoutNow (0.00s)
+=== RUN   TestPreflightTimeoutNowRequiresExactCanonicalFields
+--- PASS: TestPreflightTimeoutNowRequiresExactCanonicalFields (0.00s)
+=== RUN   TestPreflightRejectsMalformedAndNoncanonicalProtobuf
+=== RUN   TestPreflightRejectsMalformedAndNoncanonicalProtobuf/unknown_message_field
+=== RUN   TestPreflightRejectsMalformedAndNoncanonicalProtobuf/wrong_message_wire_type
+=== RUN   TestPreflightRejectsMalformedAndNoncanonicalProtobuf/noncanonical_tag
+=== RUN   TestPreflightRejectsMalformedAndNoncanonicalProtobuf/noncanonical_varint
+=== RUN   TestPreflightRejectsMalformedAndNoncanonicalProtobuf/noncanonical_length
+=== RUN   TestPreflightRejectsMalformedAndNoncanonicalProtobuf/duplicate_singular_message_field
+=== RUN   TestPreflightRejectsMalformedAndNoncanonicalProtobuf/invalid_boolean
+=== RUN   TestPreflightRejectsMalformedAndNoncanonicalProtobuf/malformed_tag
+=== RUN   TestPreflightRejectsMalformedAndNoncanonicalProtobuf/malformed_varint
+=== RUN   TestPreflightRejectsMalformedAndNoncanonicalProtobuf/truncated_bytes
+=== RUN   TestPreflightRejectsMalformedAndNoncanonicalProtobuf/entry_unknown_field
+=== RUN   TestPreflightRejectsMalformedAndNoncanonicalProtobuf/entry_wrong_wire_type
+=== RUN   TestPreflightRejectsMalformedAndNoncanonicalProtobuf/entry_duplicate_field
+=== RUN   TestPreflightRejectsMalformedAndNoncanonicalProtobuf/entry_noncanonical_varint
+--- PASS: TestPreflightRejectsMalformedAndNoncanonicalProtobuf (0.00s)
+    --- PASS: TestPreflightRejectsMalformedAndNoncanonicalProtobuf/unknown_message_field (0.00s)
+    --- PASS: TestPreflightRejectsMalformedAndNoncanonicalProtobuf/wrong_message_wire_type (0.00s)
+    --- PASS: TestPreflightRejectsMalformedAndNoncanonicalProtobuf/noncanonical_tag (0.00s)
+    --- PASS: TestPreflightRejectsMalformedAndNoncanonicalProtobuf/noncanonical_varint (0.00s)
+    --- PASS: TestPreflightRejectsMalformedAndNoncanonicalProtobuf/noncanonical_length (0.00s)
+    --- PASS: TestPreflightRejectsMalformedAndNoncanonicalProtobuf/duplicate_singular_message_field (0.00s)
+    --- PASS: TestPreflightRejectsMalformedAndNoncanonicalProtobuf/invalid_boolean (0.00s)
+    --- PASS: TestPreflightRejectsMalformedAndNoncanonicalProtobuf/malformed_tag (0.00s)
+    --- PASS: TestPreflightRejectsMalformedAndNoncanonicalProtobuf/malformed_varint (0.00s)
+    --- PASS: TestPreflightRejectsMalformedAndNoncanonicalProtobuf/truncated_bytes (0.00s)
+    --- PASS: TestPreflightRejectsMalformedAndNoncanonicalProtobuf/entry_unknown_field (0.00s)
+    --- PASS: TestPreflightRejectsMalformedAndNoncanonicalProtobuf/entry_wrong_wire_type (0.00s)
+    --- PASS: TestPreflightRejectsMalformedAndNoncanonicalProtobuf/entry_duplicate_field (0.00s)
+    --- PASS: TestPreflightRejectsMalformedAndNoncanonicalProtobuf/entry_noncanonical_varint (0.00s)
+=== RUN   TestPreflightRejectsGraphAmplificationFieldsBeforeTraversal
+=== RUN   TestPreflightRejectsGraphAmplificationFieldsBeforeTraversal/snapshot
+=== RUN   TestPreflightRejectsGraphAmplificationFieldsBeforeTraversal/local_vote
+=== RUN   TestPreflightRejectsGraphAmplificationFieldsBeforeTraversal/recursive_responses
+--- PASS: TestPreflightRejectsGraphAmplificationFieldsBeforeTraversal (0.00s)
+    --- PASS: TestPreflightRejectsGraphAmplificationFieldsBeforeTraversal/snapshot (0.00s)
+    --- PASS: TestPreflightRejectsGraphAmplificationFieldsBeforeTraversal/local_vote (0.00s)
+    --- PASS: TestPreflightRejectsGraphAmplificationFieldsBeforeTraversal/recursive_responses (0.00s)
+=== RUN   TestPreflightRejectsTooManyTinyEntries
+--- PASS: TestPreflightRejectsTooManyTinyEntries (0.00s)
+=== RUN   TestPreflightRejectsContextAndEntryDataAboveSemanticBounds
+--- PASS: TestPreflightRejectsContextAndEntryDataAboveSemanticBounds (0.00s)
+=== RUN   TestRaftPBDescriptorFieldInventory
+--- PASS: TestRaftPBDescriptorFieldInventory (0.00s)
+=== RUN   TestAuthorityFrameRoundTripRequestAndGrant
+=== RUN   TestAuthorityFrameRoundTripRequestAndGrant/request
+=== RUN   TestAuthorityFrameRoundTripRequestAndGrant/grant
+--- PASS: TestAuthorityFrameRoundTripRequestAndGrant (0.00s)
+    --- PASS: TestAuthorityFrameRoundTripRequestAndGrant/request (0.00s)
+    --- PASS: TestAuthorityFrameRoundTripRequestAndGrant/grant (0.00s)
+=== RUN   TestAuthorityFrameRejectsSpoofedRoutesAndGroup
+=== RUN   TestAuthorityFrameRejectsSpoofedRoutesAndGroup/request_holder_spoof
+=== RUN   TestAuthorityFrameRejectsSpoofedRoutesAndGroup/grant_voter_spoof
+=== RUN   TestAuthorityFrameRejectsSpoofedRoutesAndGroup/grant_holder_route_spoof
+=== RUN   TestAuthorityFrameRejectsSpoofedRoutesAndGroup/request_group_mismatch
+=== RUN   TestAuthorityFrameRejectsSpoofedRoutesAndGroup/grant_config_arm_mismatch
+=== RUN   TestAuthorityFrameRejectsSpoofedRoutesAndGroup/decode/request_holder_spoof
+=== RUN   TestAuthorityFrameRejectsSpoofedRoutesAndGroup/decode/grant_voter_spoof
+=== RUN   TestAuthorityFrameRejectsSpoofedRoutesAndGroup/decode/grant_holder_route_spoof
+=== RUN   TestAuthorityFrameRejectsSpoofedRoutesAndGroup/decode/request_group_mismatch
+--- PASS: TestAuthorityFrameRejectsSpoofedRoutesAndGroup (0.00s)
+    --- PASS: TestAuthorityFrameRejectsSpoofedRoutesAndGroup/request_holder_spoof (0.00s)
+    --- PASS: TestAuthorityFrameRejectsSpoofedRoutesAndGroup/grant_voter_spoof (0.00s)
+    --- PASS: TestAuthorityFrameRejectsSpoofedRoutesAndGroup/grant_holder_route_spoof (0.00s)
+    --- PASS: TestAuthorityFrameRejectsSpoofedRoutesAndGroup/request_group_mismatch (0.00s)
+    --- PASS: TestAuthorityFrameRejectsSpoofedRoutesAndGroup/grant_config_arm_mismatch (0.00s)
+    --- PASS: TestAuthorityFrameRejectsSpoofedRoutesAndGroup/decode/request_holder_spoof (0.00s)
+    --- PASS: TestAuthorityFrameRejectsSpoofedRoutesAndGroup/decode/grant_voter_spoof (0.00s)
+    --- PASS: TestAuthorityFrameRejectsSpoofedRoutesAndGroup/decode/grant_holder_route_spoof (0.00s)
+    --- PASS: TestAuthorityFrameRejectsSpoofedRoutesAndGroup/decode/request_group_mismatch (0.00s)
+=== RUN   TestAuthorityFrameRejectsRetiredGenerationAndUnsupportedUnion
+--- PASS: TestAuthorityFrameRejectsRetiredGenerationAndUnsupportedUnion (0.00s)
+=== RUN   TestStaticRegistryRF1RF2RF3
+=== RUN   TestStaticRegistryRF1RF2RF3/RF1
+=== RUN   TestStaticRegistryRF1RF2RF3/RF2
+=== RUN   TestStaticRegistryRF1RF2RF3/RF3
+--- PASS: TestStaticRegistryRF1RF2RF3 (0.00s)
+    --- PASS: TestStaticRegistryRF1RF2RF3/RF1 (0.00s)
+    --- PASS: TestStaticRegistryRF1RF2RF3/RF2 (0.00s)
+    --- PASS: TestStaticRegistryRF1RF2RF3/RF3 (0.00s)
+=== RUN   TestStaticRegistryAcceptsUnsortedMultipleGroups
+--- PASS: TestStaticRegistryAcceptsUnsortedMultipleGroups (0.00s)
+=== RUN   TestStaticRegistryDynamicGroupPublishesAtomicallyAndRollsBack
+--- PASS: TestStaticRegistryDynamicGroupPublishesAtomicallyAndRollsBack (0.00s)
+=== RUN   TestStaticRegistryRequiresOneNonemptyTrustDomain
+=== RUN   TestStaticRegistryRequiresOneNonemptyTrustDomain/cluster_ID
+=== RUN   TestStaticRegistryRequiresOneNonemptyTrustDomain/cluster_incarnation
+--- PASS: TestStaticRegistryRequiresOneNonemptyTrustDomain (0.00s)
+    --- PASS: TestStaticRegistryRequiresOneNonemptyTrustDomain/cluster_ID (0.00s)
+    --- PASS: TestStaticRegistryRequiresOneNonemptyTrustDomain/cluster_incarnation (0.00s)
+=== RUN   TestStaticRegistryValidatesLimitsBeforeMembers
+=== RUN   TestStaticRegistryValidatesLimitsBeforeMembers/zero_groups
+=== RUN   TestStaticRegistryValidatesLimitsBeforeMembers/negative_groups
+=== RUN   TestStaticRegistryValidatesLimitsBeforeMembers/absolute_group_bound
+=== RUN   TestStaticRegistryValidatesLimitsBeforeMembers/zero_members
+=== RUN   TestStaticRegistryValidatesLimitsBeforeMembers/negative_members
+=== RUN   TestStaticRegistryValidatesLimitsBeforeMembers/group_product
+--- PASS: TestStaticRegistryValidatesLimitsBeforeMembers (0.00s)
+    --- PASS: TestStaticRegistryValidatesLimitsBeforeMembers/zero_groups (0.00s)
+    --- PASS: TestStaticRegistryValidatesLimitsBeforeMembers/negative_groups (0.00s)
+    --- PASS: TestStaticRegistryValidatesLimitsBeforeMembers/absolute_group_bound (0.00s)
+    --- PASS: TestStaticRegistryValidatesLimitsBeforeMembers/zero_members (0.00s)
+    --- PASS: TestStaticRegistryValidatesLimitsBeforeMembers/negative_members (0.00s)
+    --- PASS: TestStaticRegistryValidatesLimitsBeforeMembers/group_product (0.00s)
+=== RUN   TestStaticRegistryAcceptsAbsoluteBounds
+--- PASS: TestStaticRegistryAcceptsAbsoluteBounds (0.00s)
+=== RUN   TestStaticRegistryConstructsAndDirectlyLooksUpAbsoluteGroupCount
+--- PASS: TestStaticRegistryConstructsAndDirectlyLooksUpAbsoluteGroupCount (0.01s)
+=== RUN   TestStaticRegistryEnrollmentDigestIsOrderIndependentAndExcludesDynamicAuthority
+--- PASS: TestStaticRegistryEnrollmentDigestIsOrderIndependentAndExcludesDynamicAuthority (0.00s)
+=== RUN   TestStaticRegistryValidatesIdentityCoordinates
+=== RUN   TestStaticRegistryValidatesIdentityCoordinates/node
+=== RUN   TestStaticRegistryValidatesIdentityCoordinates/member
+=== RUN   TestStaticRegistryValidatesIdentityCoordinates/local_target
+=== RUN   TestStaticRegistryValidatesIdentityCoordinates/local_thread
+=== RUN   TestStaticRegistryValidatesIdentityCoordinates/role
+=== RUN   TestStaticRegistryValidatesIdentityCoordinates/replica_set
+=== RUN   TestStaticRegistryValidatesIdentityCoordinates/cluster
+=== RUN   TestStaticRegistryValidatesIdentityCoordinates/cluster_incarnation
+=== RUN   TestStaticRegistryValidatesIdentityCoordinates/recovery_epoch
+=== RUN   TestStaticRegistryValidatesIdentityCoordinates/shard_incarnation
+=== RUN   TestStaticRegistryValidatesIdentityCoordinates/group
+--- PASS: TestStaticRegistryValidatesIdentityCoordinates (0.00s)
+    --- PASS: TestStaticRegistryValidatesIdentityCoordinates/node (0.00s)
+    --- PASS: TestStaticRegistryValidatesIdentityCoordinates/member (0.00s)
+    --- PASS: TestStaticRegistryValidatesIdentityCoordinates/local_target (0.00s)
+    --- PASS: TestStaticRegistryValidatesIdentityCoordinates/local_thread (0.00s)
+    --- PASS: TestStaticRegistryValidatesIdentityCoordinates/role (0.00s)
+    --- PASS: TestStaticRegistryValidatesIdentityCoordinates/replica_set (0.00s)
+    --- PASS: TestStaticRegistryValidatesIdentityCoordinates/cluster (0.00s)
+    --- PASS: TestStaticRegistryValidatesIdentityCoordinates/cluster_incarnation (0.00s)
+    --- PASS: TestStaticRegistryValidatesIdentityCoordinates/recovery_epoch (0.00s)
+    --- PASS: TestStaticRegistryValidatesIdentityCoordinates/shard_incarnation (0.00s)
+    --- PASS: TestStaticRegistryValidatesIdentityCoordinates/group (0.00s)
+=== RUN   TestStaticRegistryRejectsDuplicateMemberAndNode
+=== RUN   TestStaticRegistryRejectsDuplicateMemberAndNode/member
+=== RUN   TestStaticRegistryRejectsDuplicateMemberAndNode/node
+--- PASS: TestStaticRegistryRejectsDuplicateMemberAndNode (0.00s)
+    --- PASS: TestStaticRegistryRejectsDuplicateMemberAndNode/member (0.00s)
+    --- PASS: TestStaticRegistryRejectsDuplicateMemberAndNode/node (0.00s)
+=== RUN   TestStaticRegistryRejectsMixedReplicaSetVersions
+--- PASS: TestStaticRegistryRejectsMixedReplicaSetVersions (0.00s)
+=== RUN   TestStaticRegistryRequiresLocalMemberInEveryGroup
+--- PASS: TestStaticRegistryRequiresLocalMemberInEveryGroup (0.00s)
+=== RUN   TestStaticRegistryRequiresVoterButAllowsLocalLearner
+--- PASS: TestStaticRegistryRequiresVoterButAllowsLocalLearner (0.00s)
+=== RUN   TestStaticRegistryEnforcesInputBounds
+--- PASS: TestStaticRegistryEnforcesInputBounds (0.00s)
+=== RUN   TestStaticRegistryDefensivelyCopiesMembers
+--- PASS: TestStaticRegistryDefensivelyCopiesMembers (0.00s)
+=== RUN   TestStaticRegistryLookupErrors
+--- PASS: TestStaticRegistryLookupErrors (0.00s)
+=== RUN   TestStaticRegistryLookupsAllocateNothing
+--- PASS: TestStaticRegistryLookupsAllocateNothing (0.00s)
+=== RUN   TestOrdinaryReceiverReadsShortIOAndAdmitsBeforeOwnedDelivery
+--- PASS: TestOrdinaryReceiverReadsShortIOAndAdmitsBeforeOwnedDelivery (0.00s)
+=== RUN   TestOrdinaryReceiverServeTLSAuthenticatesBeforeDelivery
+--- PASS: TestOrdinaryReceiverServeTLSAuthenticatesBeforeDelivery (0.00s)
+=== RUN   TestOrdinaryReceiverRejectsStaticFrameBeforeDelivery
+--- PASS: TestOrdinaryReceiverRejectsStaticFrameBeforeDelivery (0.00s)
+=== RUN   TestOrdinaryReceiverRejectsCrossDomainConnectionBeforeRead
+--- PASS: TestOrdinaryReceiverRejectsCrossDomainConnectionBeforeRead (0.00s)
+=== RUN   TestOrdinaryReceiverRejectsWrongPeerClassAndPartialRecords
+=== RUN   TestOrdinaryReceiverRejectsWrongPeerClassAndPartialRecords/partial_header
+=== RUN   TestOrdinaryReceiverRejectsWrongPeerClassAndPartialRecords/partial_body
+=== RUN   TestOrdinaryReceiverRejectsWrongPeerClassAndPartialRecords/declared_too_large
+=== RUN   TestOrdinaryReceiverRejectsWrongPeerClassAndPartialRecords/wrong_authenticated_node
+=== RUN   TestOrdinaryReceiverRejectsWrongPeerClassAndPartialRecords/snapshot_class
+--- PASS: TestOrdinaryReceiverRejectsWrongPeerClassAndPartialRecords (0.00s)
+    --- PASS: TestOrdinaryReceiverRejectsWrongPeerClassAndPartialRecords/partial_header (0.00s)
+    --- PASS: TestOrdinaryReceiverRejectsWrongPeerClassAndPartialRecords/partial_body (0.00s)
+    --- PASS: TestOrdinaryReceiverRejectsWrongPeerClassAndPartialRecords/declared_too_large (0.00s)
+    --- PASS: TestOrdinaryReceiverRejectsWrongPeerClassAndPartialRecords/wrong_authenticated_node (0.00s)
+    --- PASS: TestOrdinaryReceiverRejectsWrongPeerClassAndPartialRecords/snapshot_class (0.00s)
+=== RUN   TestOrdinaryReceiverCancellationClosesBlockedReadWithoutLeak
+--- PASS: TestOrdinaryReceiverCancellationClosesBlockedReadWithoutLeak (0.01s)
+=== RUN   TestStreamRecordAndWriteFullRejectInvalidOrZeroProgress
+--- PASS: TestStreamRecordAndWriteFullRejectInvalidOrZeroProgress (0.00s)
+=== RUN   TestWaitAndRawDialFailureCloseContracts
+--- PASS: TestWaitAndRawDialFailureCloseContracts (0.00s)
+=== RUN   TestFrameBufferPoolClearsOnlyLiveBytes
+--- PASS: TestFrameBufferPoolClearsOnlyLiveBytes (0.00s)
+=== RUN   TestOrdinaryTransportReconnectsAfterPeerReadEOF
+--- PASS: TestOrdinaryTransportReconnectsAfterPeerReadEOF (0.00s)
+=== RUN   TestOrdinaryTransportBoundsFixedRingAndRetainedScratchGeometry
+--- PASS: TestOrdinaryTransportBoundsFixedRingAndRetainedScratchGeometry (0.00s)
+=== RUN   TestOrdinaryTransportFailsFastAtPerPeerAndGlobalBounds
+--- PASS: TestOrdinaryTransportFailsFastAtPerPeerAndGlobalBounds (0.00s)
+=== RUN   TestOrdinaryTransportReservationsBoundConcurrentPreEncodeOwnership
+--- PASS: TestOrdinaryTransportReservationsBoundConcurrentPreEncodeOwnership (0.00s)
+=== RUN   TestOrdinaryTransportCloseWaitsForInFlightEncodeReservation
+--- PASS: TestOrdinaryTransportCloseWaitsForInFlightEncodeReservation (0.03s)
+=== RUN   TestOrdinaryTransportEncodeFailureUnwindsReservationAndOwnership
+--- PASS: TestOrdinaryTransportEncodeFailureUnwindsReservationAndOwnership (0.00s)
+=== RUN   TestOrdinaryTransportReturnsBuffersOutsideGlobalQueueLock
+--- PASS: TestOrdinaryTransportReturnsBuffersOutsideGlobalQueueLock (0.00s)
+=== RUN   TestBoundedFrameBufferCacheBestFitAndHardOwnership
+--- PASS: TestBoundedFrameBufferCacheBestFitAndHardOwnership (0.00s)
+=== RUN   TestFrameBufferCapacityClassesBoundRetainedOverhead
+--- PASS: TestFrameBufferCapacityClassesBoundRetainedOverhead (0.00s)
+=== RUN   TestOrdinaryTransportReconnectUsesInjectedBackoffAndRetainsFrame
+--- PASS: TestOrdinaryTransportReconnectUsesInjectedBackoffAndRetainsFrame (0.00s)
+=== RUN   TestOrdinaryTransportHandlesPartialWritesAndRetriesFailedWrite
+--- PASS: TestOrdinaryTransportHandlesPartialWritesAndRetriesFailedWrite (0.00s)
+=== RUN   TestOrdinaryTransportCoalescesInOrderWithinHardCount
+--- PASS: TestOrdinaryTransportCoalescesInOrderWithinHardCount (0.00s)
+=== RUN   TestOrdinaryTransportCoalesceDelayIsInjectedAndWakesForNextFrame
+--- PASS: TestOrdinaryTransportCoalesceDelayIsInjectedAndWakesForNextFrame (0.00s)
+=== RUN   TestOrdinaryTransportCoalescingHonorsHardByteBound
+--- PASS: TestOrdinaryTransportCoalescingHonorsHardByteBound (0.00s)
+=== RUN   TestOrdinaryTransportPeerWritersAreIndependent
+--- PASS: TestOrdinaryTransportPeerWritersAreIndependent (0.00s)
+=== RUN   TestOrdinaryTransportConcurrentSendDrainsWithinExactBounds
+--- PASS: TestOrdinaryTransportConcurrentSendDrainsWithinExactBounds (0.00s)
+=== RUN   TestOrdinaryTransportRejectsWrongAuthenticatedDialResult
+--- PASS: TestOrdinaryTransportRejectsWrongAuthenticatedDialResult (0.00s)
+=== RUN   FuzzDecodeInbound
+=== RUN   FuzzDecodeInbound/seed#0
+=== RUN   FuzzDecodeInbound/seed#1
+=== RUN   FuzzDecodeInbound/seed#2
+=== RUN   FuzzDecodeInbound/seed#3
+=== RUN   FuzzDecodeInbound/seed#4
+=== RUN   FuzzDecodeInbound/seed#5
+=== RUN   FuzzDecodeInbound/seed#6
+=== RUN   FuzzDecodeInbound/seed#7
+=== RUN   FuzzDecodeInbound/seed#8
+=== RUN   FuzzDecodeInbound/seed#9
+=== RUN   FuzzDecodeInbound/seed#10
+=== RUN   FuzzDecodeInbound/seed#11
+--- PASS: FuzzDecodeInbound (0.00s)
+    --- PASS: FuzzDecodeInbound/seed#0 (0.00s)
+    --- PASS: FuzzDecodeInbound/seed#1 (0.00s)
+    --- PASS: FuzzDecodeInbound/seed#2 (0.00s)
+    --- PASS: FuzzDecodeInbound/seed#3 (0.00s)
+    --- PASS: FuzzDecodeInbound/seed#4 (0.00s)
+    --- PASS: FuzzDecodeInbound/seed#5 (0.00s)
+    --- PASS: FuzzDecodeInbound/seed#6 (0.00s)
+    --- PASS: FuzzDecodeInbound/seed#7 (0.00s)
+    --- PASS: FuzzDecodeInbound/seed#8 (0.00s)
+    --- PASS: FuzzDecodeInbound/seed#9 (0.00s)
+    --- PASS: FuzzDecodeInbound/seed#10 (0.00s)
+    --- PASS: FuzzDecodeInbound/seed#11 (0.00s)
+=== RUN   FuzzPreflightOrdinaryPayload
+=== RUN   FuzzPreflightOrdinaryPayload/seed#0
+=== RUN   FuzzPreflightOrdinaryPayload/seed#1
+=== RUN   FuzzPreflightOrdinaryPayload/seed#2
+=== RUN   FuzzPreflightOrdinaryPayload/seed#3
+=== RUN   FuzzPreflightOrdinaryPayload/seed#4
+=== RUN   FuzzPreflightOrdinaryPayload/seed#5
+=== RUN   FuzzPreflightOrdinaryPayload/seed#6
+=== RUN   FuzzPreflightOrdinaryPayload/seed#7
+--- PASS: FuzzPreflightOrdinaryPayload (0.00s)
+    --- PASS: FuzzPreflightOrdinaryPayload/seed#0 (0.00s)
+    --- PASS: FuzzPreflightOrdinaryPayload/seed#1 (0.00s)
+    --- PASS: FuzzPreflightOrdinaryPayload/seed#2 (0.00s)
+    --- PASS: FuzzPreflightOrdinaryPayload/seed#3 (0.00s)
+    --- PASS: FuzzPreflightOrdinaryPayload/seed#4 (0.00s)
+    --- PASS: FuzzPreflightOrdinaryPayload/seed#5 (0.00s)
+    --- PASS: FuzzPreflightOrdinaryPayload/seed#6 (0.00s)
+    --- PASS: FuzzPreflightOrdinaryPayload/seed#7 (0.00s)
+PASS
