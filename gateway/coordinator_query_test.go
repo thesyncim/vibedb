@@ -161,6 +161,7 @@ func TestCoordinatorQueryPrunesNestedShardKeysWithoutCrossingLimit(t *testing.T)
 		{`SELECT COUNT(*) FROM messages WHERE tenant_id IS NOT DISTINCT FROM NULL`, nil, 0, []string{"0"}},
 		{`WITH c(owner,n) AS (SELECT tenant_id,n FROM messages) SELECT SUM(n)+1 FROM c WHERE owner=? HAVING COUNT(*)>0`, []shardservice.Param{shardservice.StringParam(keys[0])}, 1, []string{"1.01e2"}},
 		{`SELECT 1 FROM messages WHERE tenant_id IS NOT DISTINCT FROM NULL HAVING COUNT(*)=0`, nil, 0, []string{"1"}},
+		{`SELECT 1 FROM messages WHERE tenant_id IS NOT DISTINCT FROM NULL ORDER BY COUNT(*)`, nil, 0, []string{"1"}},
 		{`SELECT SUM(c.n) FROM messages AS a JOIN messages AS b ON a.tenant_id=b.tenant_id JOIN messages AS c ON b.tenant_id=c.tenant_id WHERE a.tenant_id=? AND COALESCE(c.n,0)>50`, []shardservice.Param{shardservice.StringParam(keys[0])}, 1, []string{"100"}},
 		{`WITH c(owner,n) AS (SELECT tenant_id,n FROM messages) SELECT n+1 FROM c WHERE owner IS NOT DISTINCT FROM ?`, []shardservice.Param{shardservice.StringParam(keys[0])}, 1, []string{"1.01e2"}},
 		{`SELECT n FROM messages WHERE tenant_id IS NOT DISTINCT FROM ?`, []shardservice.Param{shardservice.StringParam(keys[1])}, 1, []string{"100"}},
