@@ -54,6 +54,18 @@ the client exited 0. The authority-hit delta was 8000, lifetime hits were
 predates frozen `M` and is smoke-only; it is not campaign `S` and had no fault
 injection or restart qualification.
 
+`/private/tmp/vibedb-horizontal-authority-diagnostic-20260905T162305Z` is the
+later clean no-fault diagnostic at `2c887f4a20180f15be353a8492e27067e0a0b19d`.
+It ran all four workloads (`point_hit,point_miss,mixed_read_update,mixed_uniform`)
+with 60,000 operations, 500 scans, warmup 1000, clients 1 and 8, and three
+physical nodes. The strict workload oracle completed 480,000 samples with zero
+errors and client/server exit 0. The separate per-group sidecar had 536
+complete 21-member cycles but 11,256 authentication/protocol sampling errors;
+those cuts are invalid for causal analysis. This was a no-fault run, so it
+provides no pause, restart, fault-qualification, or CRDB comparison result.
+Its compact repository archive is
+[`authority-diagnostic-2c887f4a.tar.gz`](qualification/archives/authority-diagnostic-2c887f4a.tar.gz).
+
 `/private/tmp/vibedb-horizontal-authority-fault-20260905T173000Z` is the first
 long qualification attempt at `e3b3e53e...`. It used 60000 operations, 500
 scans, warmup 1000, clients 1 and 8, and

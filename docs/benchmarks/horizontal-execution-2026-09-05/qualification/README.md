@@ -15,6 +15,7 @@ the runner captured it, and SHA-256 values for each retained raw file.
 | --- | --- | --- | --- |
 | [`authority-smoke-startup-failed.tar.gz`](archives/authority-smoke-startup-failed.tar.gz) | Initial short startup smoke | `bcfce760cb420c2f51d2c38f97e93d9e96031964`, dirty | Startup failed before authority proof; untracked production files were not captured, so provenance is incomplete. |
 | [`authority-smoke-success.tar.gz`](archives/authority-smoke-success.tar.gz) | Short 3-node/4-group `point_hit,point_miss` smoke | `91d1fd119b8c227c5356cd0f4cac9f0937407303`, clean | Strict oracle completed; diagnostic smoke only and predates the final assessment candidate. |
+| [`authority-diagnostic-2c887f4a.tar.gz`](archives/authority-diagnostic-2c887f4a.tar.gz) | Completed no-fault 3-node/4-group workload diagnostic | `2c887f4a20180f15be353a8492e27067e0a0b19d`, clean | Strict workload oracle checked 480,000 samples with zero errors; its 536 complete 21-member sidecar cycles contained 11,256 authentication/protocol sampling errors, so diagnostic cuts are invalid and provide no causal or fault-qualification proof. |
 | [`authority-runtime-linux-e3b3e53e.tar.gz`](archives/authority-runtime-linux-e3b3e53e.tar.gz) | Linux `internal/raftmember` runtime tests | `e3b3e53e04a268d6d5a76ffab5fa14366bec255f`, source tree blobs included | Ten tests passed with no skips; test binary omitted after recording its exact hash and build metadata. |
 | [`authority-fault-long-failed.tar.gz`](archives/authority-fault-long-failed.tar.gz) | Long 3-node/4-group authority run | `e3b3e53e04a268d6d5a76ffab5fa14366bec255f`, dirty | `mixed_read_update` failed before any fault signal; point workloads passed. |
 | [`authority-fault-retry-interrupted.tar.gz`](archives/authority-fault-retry-interrupted.tar.gz) | Retry with measuring-wait fix | `e3b3e53e04a268d6d5a76ffab5fa14366bec255f`, dirty | `mixed_uniform` was interrupted while preparing; a 7.0500745-second process pause was recorded, with no restart. |
@@ -22,9 +23,14 @@ the runner captured it, and SHA-256 values for each retained raw file.
 The two long-run archives retain manifests, control commands, client and node
 logs, reports, diagnostics, inventories, published state, fault snapshots,
 source patches, and the qualification runner snapshots. The short startup and
-success archives retain their corresponding raw files. Docker volumes and all
-compiled binaries are omitted to keep the repository artifacts compact; their
-names, sizes, and SHA-256 values remain in each archive's provenance record.
+success and no-fault diagnostic archives retain their corresponding raw files.
+The latest no-fault diagnostic's workload report is an oracle result only: it
+completed all four workloads at both client counts with 480,000 verified
+samples, while the independent per-group sidecar produced 536 complete
+21-member cycles but 11,256 authentication/protocol sampling errors. Docker
+volumes and all compiled binaries are omitted to keep the repository artifacts
+compact; their names, sizes, and SHA-256 values remain in each archive's
+provenance record.
 
 The first startup smoke has a specific provenance limitation: its recorder
 listed untracked production Go files but did not copy them. The successful
