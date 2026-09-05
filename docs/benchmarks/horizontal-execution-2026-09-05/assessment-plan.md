@@ -28,7 +28,7 @@ REPO=/private/tmp/vibedb-horizontal
 CLIENT_SOURCE="<CLEAN_IMMUTABLE_CLIENT_SOURCE>"
 M="<LATEST_MAIN_COMMIT>"
 S="<FINAL_PRODUCTION_COMMIT>"
-WORKLOADS=point_hit,point_miss,range_32,range_64,range_256,group_16,update_existing,mixed_read_update
+WORKLOADS=point_hit,point_miss,range_32,range_64,range_256,group_16,update_existing,mixed_read_update,mixed_uniform
 
 run_matrix() {
   output="$1"
@@ -61,7 +61,8 @@ run_matrix /private/tmp/vibedb-assessment-s-off-to-s-on-6n "$S" "$S" 6 --read-au
 The matrix covers C1/C8, 16 logical groups, N3/N6 physical-node fixtures,
 seven named read/write workloads (`point_hit`, `point_miss`, `range_32`,
 `range_64`, `range_256`, `group_16`, `update_existing`) and the explicit mixed
-read/update control. Every workload has three repetitions. Setup, seeding,
+read/update controls (`mixed_read_update` and `mixed_uniform`). Every workload
+has three repetitions. Setup, seeding,
 verification, readiness, topology inventories, diagnostics and teardown stay
 outside the timed operation phase; failed or incomplete oracle/durability
 validation disqualifies that cell from any later analysis.
