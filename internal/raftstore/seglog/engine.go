@@ -2221,7 +2221,7 @@ func (e *Engine) finishFrozenSeal(base metadataState, pending SegmentMeta, event
 func (e *Engine) runMetadataMaintenance() {
 	e.writeMu.Lock()
 	if e.log != nil && e.log.metadata != nil && (e.log.metadata.slot.ReclaimPhase != reclaimNone || e.log.metadata.slot.RetiredCheckpointCount != 0) {
-		if e.maintenanceBusy || e.sealPending || e.log.usable() != nil || e.log.metadata.slot.HasPending {
+		if e.maintenanceBusy || e.log.usable() != nil || e.log.metadata.slot.HasPending {
 			e.writeMu.Unlock()
 			return
 		}

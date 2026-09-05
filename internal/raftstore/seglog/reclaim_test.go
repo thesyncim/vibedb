@@ -131,6 +131,51 @@ func TestReclaimDeadSealedPrefixTwoCutRoundTrip(t *testing.T) {
 	}
 }
 
+func TestReclaimAfterSealPublicationBeforeWaitSeal(t *testing.T) {
+	oldMin, oldMax := reclaimMinSegments, reclaimMaxSegments
+	reclaimMinSegments, reclaimMaxSegments = 2, 2
+	t.Cleanup(func() { reclaimMinSegments, reclaimMaxSegments = oldMin, oldMax })
+	dir := t.TempDir()
+	engine, removed, _ := newReclaimableEngine(t, dir)
+	defer engine.Close()
+	if err := engine.PersistWave(Wave{ID: waveID(4), Batches: []ReadyBatch{
+		{GroupID: 1, Entries: []Entry{{Index: 3, Term: 1, Data: []byte("retained")}}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	published := make(chan struct{})
+	if err := engine.Rotate(func(phase RotationPhase) error {
+		if phase == RotationSealedMetadataPublished {
+			close(published)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-published:
+	case <-time.After(5 * time.Second):
+		t.Fatal("seal publication did not finish")
+	}
+	// Ordinary node traffic only consumes this completion at the next rotation.
+	// Reclamation must work in the intervening active segment, and must leave
+	// the completion available for the explicit control-plane waiter.
+	if err := engine.ReclaimDeadPrefix(); err != nil {
+		t.Fatal(err)
+	}
+	for _, segment := range removed {
+		if _, err := os.Stat(segmentPath(dir, segment.FileID)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("dead segment %d remains: %v", segment.ID, err)
+		}
+	}
+	if err := engine.WaitSeal(); err != nil {
+		t.Fatal(err)
+	}
+	if _, term, compacted, found, err := engine.LookupExact(1, 3); err != nil || term != 1 || compacted || !found {
+		t.Fatalf("retained entry: term=%d compacted=%v found=%v err=%v", term, compacted, found, err)
+	}
+}
+
 func TestReclaimAdmissionUsesCountOrTwoSegmentBytes(t *testing.T) {
 	oldMin := reclaimMinSegments
 	reclaimMinSegments = 8

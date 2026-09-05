@@ -152,6 +152,9 @@ prefix before its scheduled application capture. Live entries in any group
 continue to pin shared segments. Reclamation keeps the existing count/byte
 thresholds and preallocated active/spare capacity; it may wait for a later
 capture and segment seal. It does not force idle checkpoints or rotations.
+If the scheduled capture finds outstanding work, it remains due until a
+quiescent Ready drive can start it. An already-published seal does not block
+reclamation while its rotation completion notice awaits consumption.
 
 The Raft WAL is bounded, preallocated, encrypted/authenticated, digest-chained, and tied to an
 immutable placement identity. Its active limits are sealed into the format; a manifest may choose

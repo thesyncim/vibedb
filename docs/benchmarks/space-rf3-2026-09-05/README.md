@@ -20,6 +20,16 @@ acknowledged values again. CI requires actual reclamation on every replica.
 The live qualification and matched performance comparison of this follow-up
 are pending; the older measurements below do not qualify the new scheduler.
 
+The first CI follow-up advanced application checkpoints through roughly index
+4,100 on all three replicas but still retained the initial segments. The
+sealer's `sealPending` flag includes a published seal with an unread completion
+notice. Reclamation checked that flag and remained blocked between ordinary
+rotations; the original fixture's explicit `WaitSeal` hid the issue. The
+maintenance guard now uses the authenticated `HasPending` publication state,
+on the same serial worker, and leaves the completion notice for its existing
+consumer. A regression reclaims before calling `WaitSeal` and verifies the
+retained entry and completion afterwards.
+
 Measurements began on `8e4e60f6`. The final candidate was rebased onto fetched
 main `b63e96c0`; storage and Raft directories were unchanged between those
 bases. Linux storage, runtime, and three-server checks were rerun after the
