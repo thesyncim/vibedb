@@ -1,0 +1,4 @@
+analyze.py: PASS
+reports: 6 complete; cells: 28; workloads: 7; repetitions/report: 3
+verified operations: {'after': 120000, 'before': 120000, 'crdb': 120000}
+sample/config checks: PASS (unique client+ordinal, client/group/table/endpoint bounds, expected engine/diagnostic mode)
