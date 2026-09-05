@@ -22,6 +22,7 @@ const durableSQLWideLoweringMaxAllocations = 1024
 const (
 	durableSQLMultiRowInsert64MaxAllocations = 190
 	durableSQLFiniteDelete64MaxAllocations   = 215
+	durableSQLSingleUpdateMaxAllocations     = 28
 )
 
 func TestDurableSQLRequestExecutorRetainedStateGate(t *testing.T) {
@@ -164,6 +165,52 @@ func BenchmarkDurableSQLFiniteDeleteLowering(b *testing.B) {
 				durableSQLPerfTargets = targets
 			}
 		})
+	}
+}
+
+func TestDurableSQLSingleUpdateLoweringAllocationGate(t *testing.T) {
+	snapshot, planner, _ := replicatedSQLSplitTransactionFixture(t)
+	profile := planner.profileFor(ClassInteractive)
+	query := durableSQLSingleUpdate()
+	allocations := testing.AllocsPerRun(50, func() {
+		targets, handled, err := planner.planReplicatedSQLTransactionWithData(
+			context.Background(), snapshot, []Query{query}, profile, nil,
+		)
+		if err != nil || !handled || len(targets) == 0 {
+			panic("single update lowering changed semantics")
+		}
+		durableSQLPerfTargets = targets
+	})
+	if allocations > durableSQLSingleUpdateMaxAllocations {
+		t.Fatalf("allocations/run=%v want <=%v",
+			allocations, durableSQLSingleUpdateMaxAllocations)
+	}
+}
+
+func BenchmarkDurableSQLSingleUpdateLowering(b *testing.B) {
+	snapshot, planner, _ := replicatedSQLSplitTransactionFixture(b)
+	profile := planner.profileFor(ClassInteractive)
+	query := durableSQLSingleUpdate()
+	b.ReportAllocs()
+	for b.Loop() {
+		targets, handled, err := planner.planReplicatedSQLTransactionWithData(
+			context.Background(), snapshot, []Query{query}, profile, nil,
+		)
+		if err != nil || !handled || len(targets) == 0 {
+			b.Fatal(err)
+		}
+		durableSQLPerfTargets = targets
+	}
+}
+
+func durableSQLSingleUpdate() Query {
+	return Query{
+		SQL:   `UPDATE messages SET "$doc" = ? WHERE id = ?`,
+		Class: ClassInteractive,
+		Params: []shardservice.Param{
+			shardservice.DocumentParam(`{"id":"multi-row-1","n":2}`),
+			shardservice.StringParam("multi-row-1"),
+		},
 	}
 }
 
