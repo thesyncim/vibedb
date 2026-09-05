@@ -278,7 +278,7 @@ func collectPrimaryProjection(
 		func(row uint64, fields []storeio.UnifiedProjectionField) error {
 			values := make([][]byte, len(fields))
 			for i := range fields {
-				values[i] = bytes.Clone(fields[i].JSON)
+				values[i] = bytes.Clone(fields[i].AppendJSON(nil))
 			}
 			observed = append(observed, primaryProjectionObservedRow{row: row, values: values})
 			return nil

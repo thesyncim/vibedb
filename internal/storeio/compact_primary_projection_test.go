@@ -183,8 +183,8 @@ func TestCompactProjectionCursorBoundsPairingAndRelease(t *testing.T) {
 			ok, stopped, scratch, err := cursor.VisitProjected(f, &progress, seen, shapes, streams, fields, make([]byte, 0, 128), tc.limit,
 				func(row uint64, fields []UnifiedProjectionField) error {
 					physical := 3 + callbacks
-					if row != uint64(callbacks) || string(fields[0].JSON) != fmt.Sprintf(`"logical-%03d"`, physical) || string(fields[1].JSON) != fmt.Sprint(physical) {
-						t.Fatalf("row=%d physical=%d fields=%q/%q", row, physical, fields[0].JSON, fields[1].JSON)
+					if row != uint64(callbacks) || string(fields[0].AppendJSON(nil)) != fmt.Sprintf(`"logical-%03d"`, physical) || string(fields[1].AppendJSON(nil)) != fmt.Sprint(physical) {
+						t.Fatalf("row=%d physical=%d fields=%q/%q", row, physical, fields[0].AppendJSON(nil), fields[1].AppendJSON(nil))
 					}
 					callbacks++
 					if tc.fail {

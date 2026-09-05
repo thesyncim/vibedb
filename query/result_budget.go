@@ -223,7 +223,12 @@ func resultCellPayloadBytes(cell Cell) int64 {
 	dst := scratch[:0]
 	switch {
 	case cell.flag&cellInteger != 0:
-		dst = strconv.AppendInt(dst, int64(cell.word), 10)
+		value := int64(cell.word)
+		digits := intDigits64(value)
+		if value < 0 {
+			digits++
+		}
+		return bytes + int64(digits)
 	case cell.flag&cellNumberRaw == 0:
 		dst = strconv.AppendFloat(dst, math.Float64frombits(cell.word), 'g', -1, 64)
 	}

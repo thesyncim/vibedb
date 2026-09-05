@@ -219,29 +219,23 @@ func (v *CompactPrimaryStripeView) visitResolvedProjectionRange(
 		base := shape * len(resolvers)
 		valueScratch = valueScratch[:0]
 		for field := range resolvers {
-			startValue := len(valueScratch)
-			required, peak, ok := compactProjectionValueLen(
-				streamWork[base+field].view, ordinal,
+			stream := &streamWork[base+field]
+			if stream.hole == UnifiedHoleAbsent {
+				fields[field] = UnifiedProjectionField{
+					Kind: UnifiedProjectionFieldMissing,
+				}
+				continue
+			}
+			var ok bool
+			valueScratch, ok = compactProjectionFieldAt(
+				&stream.view, ordinal, valueScratch, &fields[field], &stream.state,
 			)
-			if !ok || peak > cap(valueScratch)-len(valueScratch) {
-				// Never let appendValue grow valueScratch: fields from this row
-				// borrow one stable backing array until the callback returns.
+			if !ok {
+				// Native and dictionary fields do not touch valueScratch. The
+				// remaining codecs are bounded by compactProjectionFieldAt and
+				// decline before appendValue can invalidate an earlier view.
 				return false, false, valueScratch, nil
 			}
-			beforeCap := cap(valueScratch)
-			valueScratch, ok = streamWork[base+field].view.appendValue(
-				valueScratch, ordinal,
-			)
-			if !ok || cap(valueScratch) != beforeCap {
-				// A reallocation would invalidate the earlier field views in
-				// this row. Treat it as bounded-scratch exhaustion and let the
-				// query layer rerun the same range through the generic reader.
-				return false, false, valueScratch, nil
-			}
-			if len(valueScratch)-startValue != required {
-				return false, false, valueScratch, nil
-			}
-			fields[field].JSON = valueScratch[startValue:]
 		}
 		if err := visit(row, fields[:len(resolvers)]); err != nil {
 			return false, false, valueScratch, err

@@ -17,11 +17,57 @@ import (
 // allocations.
 const UnifiedProjectionMaxShapes = compactStreamRestart
 
-// UnifiedProjectionField is a scalar JSON spelling borrowed for one callback.
-// The bytes are backed by the caller's projection scratch and must be copied
-// before the callback returns.
+// UnifiedProjectionField is one selected scalar borrowed for one callback.
+// JSON is either backed by the caller's projection scratch or borrowed directly
+// from a compact dictionary entry, as indicated by Kind. Integer values carry
+// their decoded int64 directly and therefore have no JSON spelling until a
+// caller asks AppendJSON to format one. Missing fields have neither.
+type UnifiedProjectionFieldKind uint8
+
+const (
+	// UnifiedProjectionFieldJSON is a value rendered into the caller's bounded
+	// projection scratch. It is the zero value so old raw-field construction
+	// remains a valid fallback representation.
+	UnifiedProjectionFieldJSON UnifiedProjectionFieldKind = iota
+	// UnifiedProjectionFieldBorrowedJSON borrows the exact bytes of a stored
+	// dictionary entry. The bytes remain valid only until the callback returns.
+	UnifiedProjectionFieldBorrowedJSON
+	// UnifiedProjectionFieldInteger carries a native compact integer without
+	// rendering its canonical JSON spelling.
+	UnifiedProjectionFieldInteger
+	// UnifiedProjectionFieldMissing represents an absent path. JSON is nil so
+	// query materialization can preserve the missing/null distinction.
+	UnifiedProjectionFieldMissing
+)
+
 type UnifiedProjectionField struct {
-	JSON []byte
+	JSON    []byte
+	Integer int64
+	Kind    UnifiedProjectionFieldKind
+}
+
+// AppendJSON appends the field's JSON representation to dst. Integer fields
+// are formatted into caller-owned storage; borrowed and scratch-backed JSON is
+// copied as-is. A missing field appends nothing, matching its nil JSON view.
+func (f UnifiedProjectionField) AppendJSON(dst []byte) []byte {
+	switch f.Kind {
+	case UnifiedProjectionFieldInteger:
+		return strconv.AppendInt(dst, f.Integer, 10)
+	case UnifiedProjectionFieldMissing:
+		return dst
+	default:
+		return append(dst, f.JSON...)
+	}
+}
+
+// ScratchBytes reports the bytes that live in the caller's projection value
+// scratch. Dictionary entries borrow page bytes and native/missing fields use
+// no value scratch at all.
+func (f UnifiedProjectionField) ScratchBytes() int {
+	if f.Kind != UnifiedProjectionFieldJSON {
+		return 0
+	}
+	return len(f.JSON)
 }
 
 // UnifiedProjectionShapeWorkspace is caller-owned metadata for one compact
@@ -37,9 +83,17 @@ type UnifiedProjectionShapeWorkspace struct {
 // UnifiedProjectionStreamWorkspace is one caller-owned slot for a shape's
 // selected scalar stream. It is exported as a storage-neutral type so query
 // execution can preallocate a flat stream arena without knowing its layout.
+type compactProjectionSequentialState struct {
+	next   int
+	cursor int
+	value  int64
+	width  int
+}
+
 type UnifiedProjectionStreamWorkspace struct {
-	hole int
-	view compactStreamView
+	hole  int
+	view  compactStreamView
+	state compactProjectionSequentialState
 }
 
 // UnifiedProjectionScratchBytes reports the fixed metadata bytes needed for a
@@ -233,6 +287,331 @@ func compactProjectionValueLen(v compactStreamView, row int) (length, peak int, 
 	return 0, 0, false
 }
 
+// compactProjectionDictionaryEntry returns the exact JSON bytes stored in one
+// dictionary stream. The entry is page-backed and remains valid for the leaf
+// callback's lifetime, so callers can publish it without copying through the
+// projection value scratch.
+func compactProjectionDictionaryEntry(
+	v *compactStreamView, row int,
+) ([]byte, bool) {
+	if v == nil || v.kind != compactStreamDictionary || row < 0 || row >= v.count {
+		return nil, false
+	}
+	id := int(compactReadBits(v.data, row*int(v.width), int(v.width)))
+	return v.dictionaryEntry(id)
+}
+
+// compactProjectionSequentialIntegerState advances one restart-coded integer
+// stream in row order. The state is deliberately narrower than the general
+// scan decoder: projection needs only the next row, its packed cursor, the
+// current value, and the packed delta width.
+func (s *compactProjectionSequentialState) seed(
+	v *compactStreamView, row int,
+) bool {
+	if s == nil || v == nil || row < 0 || row >= v.count {
+		return false
+	}
+	prefix := 0
+	packed := false
+	switch v.kind {
+	case compactStreamDelta:
+	case compactStreamDeltaPack:
+		packed = true
+	case compactStreamPrefixInt:
+		if len(v.data) < 2 || v.data[0]&2 != 0 {
+			return false
+		}
+		prefix = 2
+		packed = v.data[0]&4 != 0
+	default:
+		return false
+	}
+	blocks := (v.count + compactStreamRestart - 1) / compactStreamRestart
+	block := row / compactStreamRestart
+	if block < 0 || block >= blocks || blocks > (len(v.data)-prefix)/4 {
+		return false
+	}
+	at := prefix + block*4
+	if at < prefix || at+4 > len(v.data) {
+		return false
+	}
+	cursor := int(binary.LittleEndian.Uint32(v.data[at:]))
+	header := prefix + blocks*4
+	if cursor < header || cursor > len(v.data)-8 {
+		return false
+	}
+	value := int64(binary.LittleEndian.Uint64(v.data[cursor:]))
+	cursor += 8
+	width := 0
+	if packed {
+		if cursor >= len(v.data) {
+			return false
+		}
+		width = int(v.data[cursor])
+		if width > 64 {
+			return false
+		}
+		cursor++
+		rows := min(compactStreamRestart, v.count-block*compactStreamRestart)
+		bits := (rows - 1) * width
+		packedBytes := (bits + 7) / 8
+		if packedBytes < 0 || packedBytes > len(v.data)-cursor {
+			return false
+		}
+	}
+	s.next = block * compactStreamRestart
+	s.cursor = cursor
+	s.value = value
+	s.width = width
+	return true
+}
+
+func (s *compactProjectionSequentialState) advance(
+	v *compactStreamView,
+) bool {
+	if s == nil || v == nil || s.next < 0 || s.next+1 >= v.count {
+		return false
+	}
+	block := s.next / compactStreamRestart
+	if (s.next+1)/compactStreamRestart != block {
+		return false
+	}
+	switch v.kind {
+	case compactStreamDeltaPack,
+		compactStreamPrefixInt:
+		if v.kind == compactStreamPrefixInt && len(v.data) < 2 {
+			return false
+		}
+		packed := v.kind == compactStreamDeltaPack || v.data[0]&4 != 0
+		if packed {
+			within := s.next - block*compactStreamRestart
+			if s.width < 0 || s.width > 64 || within < 0 ||
+				(s.width != 0 && within > math.MaxInt/s.width) {
+				return false
+			}
+			bit := within * s.width
+			available := len(v.data) - s.cursor
+			if available < 0 || bit > math.MaxInt-s.width ||
+				uint64(bit+s.width) > uint64(available)*8 {
+				return false
+			}
+			u := compactReadBits(v.data[s.cursor:], bit, s.width)
+			delta := int64(u>>1) ^ -int64(u&1)
+			value, ok := unifiedCheckedIntegerAdd(s.value, delta)
+			if !ok {
+				return false
+			}
+			s.value = value
+			s.next++
+			return true
+		}
+	case compactStreamDelta:
+	default:
+		return false
+	}
+	if s.cursor < 0 || s.cursor >= len(v.data) {
+		return false
+	}
+	u, n, ok := readCompactUvarint(v.data[s.cursor:])
+	if !ok || n <= 0 || n > len(v.data)-s.cursor {
+		return false
+	}
+	delta := int64(u>>1) ^ -int64(u&1)
+	value, ok := unifiedCheckedIntegerAdd(s.value, delta)
+	if !ok {
+		return false
+	}
+	s.cursor += n
+	s.value = value
+	s.next++
+	return true
+}
+
+func (s *compactProjectionSequentialState) integerAt(
+	v *compactStreamView, row int,
+) (int64, bool) {
+	if s == nil || v == nil || row < 0 || row >= v.count {
+		return 0, false
+	}
+	block := row / compactStreamRestart
+	blockStart := block * compactStreamRestart
+	if s.next < blockStart || s.next > row || s.next < 0 {
+		if !s.seed(v, row) {
+			return 0, false
+		}
+	}
+	for s.next < row {
+		if !s.advance(v) {
+			return 0, false
+		}
+	}
+	return s.value, s.next == row
+}
+
+// compactProjectionIntegerValue recognizes only the integer streams whose
+// validated compact representation can be consumed as an int64 directly.
+// Width-64 FOR remains on the generic render path because its packed deltas
+// do not preserve signed ordering for this bounded lane.
+func compactProjectionIntegerValue(
+	v *compactStreamView, row int, state *compactProjectionSequentialState,
+) (int64, bool) {
+	if v == nil {
+		return 0, false
+	}
+	switch v.kind {
+	case compactStreamFOR:
+		if v.width == 64 {
+			return 0, false
+		}
+		return unifiedIntegerFORValue(*v, row)
+	case compactStreamDelta:
+		return state.integerAt(v, row)
+	case compactStreamDeltaPack:
+		return state.integerAt(v, row)
+	default:
+		return 0, false
+	}
+}
+
+// compactProjectionPrefixFieldAt renders a PrefixInt row after its restart
+// state has decoded the numeric component. Prefix and suffix bytes are copied
+// exactly once into bounded value scratch; the random value-length walk is no
+// longer repeated by appendValue.
+func compactProjectionPrefixFieldAt(
+	v *compactStreamView, row int, valueScratch []byte,
+	field *UnifiedProjectionField, state *compactProjectionSequentialState,
+) ([]byte, bool) {
+	var value int64
+	var ok bool
+	if len(v.data) < 2 {
+		return valueScratch, false
+	}
+	if v.data[0]&2 != 0 {
+		value, ok = v.prefixInteger(row)
+	} else {
+		value, ok = state.integerAt(v, row)
+	}
+	if !ok || value < 0 {
+		return valueScratch, false
+	}
+	prefix, prefixOK := v.dictionaryEntry(0)
+	suffix, suffixOK := v.dictionaryEntry(1)
+	if !prefixOK || !suffixOK {
+		return valueScratch, false
+	}
+	if len(prefix) == 0 && len(suffix) == 0 && v.data[0]&1 == 0 {
+		*field = UnifiedProjectionField{
+			Integer: value,
+			Kind:    UnifiedProjectionFieldInteger,
+		}
+		return valueScratch, true
+	}
+	digits := canonicalIntRenderedLen(value)
+	width := digits
+	if v.data[0]&1 != 0 {
+		width = int(v.data[1])
+		if width < digits {
+			return valueScratch, false
+		}
+	}
+	if len(prefix) > math.MaxInt-width ||
+		len(prefix)+width > math.MaxInt-len(suffix) {
+		return valueScratch, false
+	}
+	total := len(prefix) + width + len(suffix)
+	start := len(valueScratch)
+	if total > cap(valueScratch)-start {
+		return valueScratch, false
+	}
+	valueScratch = append(valueScratch, prefix...)
+	digitsStart := len(valueScratch)
+	if width == 8 && v.data[0]&1 != 0 && value < 100_000_000 {
+		valueScratch = appendFixedUint8(valueScratch, uint32(value))
+	} else if value < 1_000_000 {
+		valueScratch = appendCanonicalUint6(valueScratch, uint64(value))
+	} else {
+		valueScratch = strconv.AppendUint(valueScratch, uint64(value), 10)
+	}
+	n := len(valueScratch) - digitsStart
+	if n > width {
+		return valueScratch, false
+	}
+	if n < width {
+		gap := width - n
+		for range gap {
+			valueScratch = append(valueScratch, 0)
+		}
+		copy(valueScratch[digitsStart+gap:], valueScratch[digitsStart:digitsStart+n])
+		for at := digitsStart; at < digitsStart+gap; at++ {
+			valueScratch[at] = '0'
+		}
+	}
+	valueScratch = append(valueScratch, suffix...)
+	if len(valueScratch)-start != total {
+		return valueScratch, false
+	}
+	*field = UnifiedProjectionField{
+		JSON: valueScratch[start:],
+		Kind: UnifiedProjectionFieldJSON,
+	}
+	return valueScratch, true
+}
+
+// compactProjectionFieldAt resolves one selected stream row. Native integers
+// and dictionary entries bypass both formatting and projection scratch. The
+// remaining codecs retain the existing bounded render path, including the
+// restart peak admission that protects earlier fields in the same callback.
+func compactProjectionFieldAt(
+	v *compactStreamView, row int, valueScratch []byte,
+	field *UnifiedProjectionField, state *compactProjectionSequentialState,
+) (scratch []byte, ok bool) {
+	if v == nil || field == nil || row < 0 || row >= v.count {
+		return valueScratch, false
+	}
+	if value, native := compactProjectionIntegerValue(v, row, state); native {
+		*field = UnifiedProjectionField{
+			Integer: value,
+			Kind:    UnifiedProjectionFieldInteger,
+		}
+		return valueScratch, true
+	}
+	if value, dictionary := compactProjectionDictionaryEntry(v, row); dictionary {
+		if integer, canonical := CanonicalIntValue(value); canonical {
+			*field = UnifiedProjectionField{
+				Integer: integer,
+				Kind:    UnifiedProjectionFieldInteger,
+			}
+			return valueScratch, true
+		}
+		*field = UnifiedProjectionField{
+			JSON: value,
+			Kind: UnifiedProjectionFieldBorrowedJSON,
+		}
+		return valueScratch, true
+	}
+	if v.kind == compactStreamPrefixInt {
+		return compactProjectionPrefixFieldAt(
+			v, row, valueScratch, field, state,
+		)
+	}
+	required, peak, bounded := compactProjectionValueLen(*v, row)
+	if !bounded || peak > cap(valueScratch)-len(valueScratch) {
+		return valueScratch, false
+	}
+	start := len(valueScratch)
+	beforeCap := cap(valueScratch)
+	valueScratch, bounded = v.appendValue(valueScratch, row)
+	if !bounded || cap(valueScratch) != beforeCap ||
+		len(valueScratch)-start != required {
+		return valueScratch, false
+	}
+	*field = UnifiedProjectionField{
+		JSON: valueScratch[start:],
+		Kind: UnifiedProjectionFieldJSON,
+	}
+	return valueScratch, true
+}
+
 // compactProjectionStreamAt resolves one scalar hole in a compact shape.
 // CompactPrimaryStripe admission has already validated the enclosing stream;
 // this helper repeats only the bounded stream walk needed to reach the hole.
@@ -258,9 +637,9 @@ func compactProjectionStreamAt(
 
 // prepareUnifiedProjectionShape resolves all requested paths and records their
 // compact streams before a row callback can publish a result. A path must name
-// exactly one scalar hole in every admitted shape; absent and container paths
-// decline so the generic executor remains authoritative for NULL/structure
-// semantics.
+// exactly one scalar hole in every admitted shape. Container paths decline so
+// the generic executor remains authoritative for structure semantics; absent
+// paths are retained as explicit missing fields and require no stream.
 func prepareUnifiedProjectionShape(
 	v *CompactPrimaryStripeView,
 	shape int,
@@ -305,6 +684,10 @@ func prepareUnifiedProjectionShape(
 	}
 	for field := range resolvers {
 		hole := streams[field].hole
+		if hole == UnifiedHoleAbsent {
+			streams[field].view = compactStreamView{}
+			continue
+		}
 		if hole < 0 {
 			meta.unsupported = true
 			return false
@@ -403,6 +786,7 @@ func resolveCompactProjectionFieldsLast(
 	for field := range resolvers {
 		streams[field].hole = UnifiedHoleAbsent
 		streams[field].view = compactStreamView{}
+		streams[field].state = compactProjectionSequentialState{next: -1}
 	}
 	allTopLevel := true
 	for field := range resolvers {
@@ -570,22 +954,20 @@ func (v *CompactPrimaryStripeView) VisitResolvedProjection(
 		base := shape * len(resolvers)
 		valueScratch = valueScratch[:0]
 		for field := range resolvers {
-			start := len(valueScratch)
-			required, peak, ok := compactProjectionValueLen(
-				streamWork[base+field].view, ordinal,
+			stream := &streamWork[base+field]
+			if stream.hole == UnifiedHoleAbsent {
+				fields[field] = UnifiedProjectionField{
+					Kind: UnifiedProjectionFieldMissing,
+				}
+				continue
+			}
+			var ok bool
+			valueScratch, ok = compactProjectionFieldAt(
+				&stream.view, ordinal, valueScratch, &fields[field], &stream.state,
 			)
-			if !ok || peak > cap(valueScratch)-len(valueScratch) {
+			if !ok {
 				return false, false, valueScratch, nil
 			}
-			beforeCap := cap(valueScratch)
-			valueScratch, ok = streamWork[base+field].view.appendValue(
-				valueScratch, ordinal,
-			)
-			if !ok || cap(valueScratch) != beforeCap ||
-				len(valueScratch)-start != required {
-				return false, false, valueScratch, nil
-			}
-			fields[field].JSON = valueScratch[start:]
 		}
 		if err := visit(row, fields[:len(resolvers)]); err != nil {
 			return false, false, valueScratch, err
