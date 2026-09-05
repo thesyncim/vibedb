@@ -123,11 +123,9 @@ func (executor *ReplicatedExecutor) QuerySQL(ctx context.Context, route Replicat
 	if authority, ok := serviceauthz.FromContext(ctx); ok {
 		forwarded.Authority = authority
 	}
-	var body bytes.Buffer
-	if err := shardservice.EncodeRequest(&body, &forwarded); err != nil {
+	if size, err := shardservice.RequestFrameBytes(&forwarded); err != nil {
 		return nil, err
-	}
-	if body.Len() > shardservice.MaxReplicatedSQLRequestBytes {
+	} else if size > shardservice.MaxReplicatedSQLRequestBytes {
 		return nil, ErrResultLimit
 	}
 	preferred := route.Replicas[0].Member
@@ -142,17 +140,25 @@ func (executor *ReplicatedExecutor) QuerySQL(ctx context.Context, route Replicat
 			preferred = 0
 			continue
 		}
-		response, err := executor.doReplicated(ctx, endpoint, &shardservice.ReplicatedRequest{
-			Operation: shardservice.ReplicatedQueryLeader, Authority: forwarded.Authority,
-			Capability: serviceauthz.CapabilityDataRead, Fence: state.Fence,
-			Query: body.Bytes(), MaxValueBytes: shardservice.MaxReplicatedSQLResultBytes,
-		})
+		call := &shardservice.ReplicatedCall{
+			Request: shardservice.ReplicatedRequest{
+				Operation: shardservice.ReplicatedQueryLeader, Authority: forwarded.Authority,
+				Capability: serviceauthz.CapabilityDataRead, Fence: state.Fence,
+				MaxValueBytes: shardservice.MaxReplicatedSQLResultBytes,
+			},
+			SQL: &forwarded,
+		}
+		reply, err := executor.doReplicatedCall(ctx, endpoint, call)
 		if err != nil {
 			executor.leaderHints.invalidate(route, endpoint, state)
 			joined = errors.Join(joined, err)
 			preferred = 0
 			continue
 		}
+		if reply == nil {
+			return nil, ErrReplicatedRoute
+		}
+		response := &reply.Response
 		if validReplicatedUnauthorizedWithoutState(response) {
 			return nil, &ReplicatedRefusalError{Code: response.Refusal}
 		}
@@ -164,14 +170,11 @@ func (executor *ReplicatedExecutor) QuerySQL(ctx context.Context, route Replicat
 		case shardservice.ReplicatedQueryResult:
 			if response.Refusal != shardservice.ReplicatedRefusalNone || response.RequestDigest != ([sha256.Size]byte{}) ||
 				response.Outcome != (raftserve.Outcome{}) || len(response.Completion) != 0 ||
-				response.ReadApplied == 0 || response.ReadApplied > response.State.Applied || len(response.Value) < 5 || len(response.Value) > shardservice.MaxReplicatedSQLResultBytes {
+				response.ReadApplied == 0 || response.ReadApplied > response.State.Applied ||
+				(len(response.Value) != 0 && (len(response.Value) < 5 || len(response.Value) > shardservice.MaxReplicatedSQLResultBytes)) || reply.SQL == nil {
 				return nil, ErrReplicatedRoute
 			}
-			reader := bytes.NewReader(response.Value)
-			result, err := shardservice.DecodeResponse(reader)
-			if err != nil || reader.Len() != 0 {
-				return nil, ErrReplicatedRoute
-			}
+			result := reply.SQL
 			if result.Kind != shardservice.ResponseRows && result.Kind != shardservice.ResponseError {
 				return nil, ErrReplicatedRoute
 			}

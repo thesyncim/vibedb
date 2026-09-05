@@ -9,6 +9,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/distributedagg"
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/exchange"
+	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	vibejson "github.com/thesyncim/vibejson"
@@ -139,12 +140,16 @@ type GlobalIndexLookupRequest struct {
 }
 
 // PrimaryKeyReadRequest replaces an ordinary SQL table scan with an exact,
-// strictly ordered native-primary candidate set. PrimaryPath fences the
-// gateway descriptor against the shard's live SQL catalog before any row is
-// read. The zero value is absent; all slices borrow the request frame.
+// strictly ordered native-primary candidate set. Relation and
+// MaxDocumentBytes bind the optional live point lane to one dense physical
+// relation and its catalog-frozen value bound. PrimaryPath fences the gateway
+// descriptor against the shard's live SQL catalog before any row is read. The
+// zero value is absent; all slices borrow the request frame.
 type PrimaryKeyReadRequest struct {
-	PrimaryPath []byte
-	Keys        [][]byte
+	Relation         replication.RelationID
+	MaxDocumentBytes uint32
+	PrimaryPath      []byte
+	Keys             [][]byte
 }
 
 // DocumentScanRequest is a resumable raw base-table scan for online index
@@ -171,10 +176,19 @@ func (r PrimaryKeyReadRequest) present() bool {
 
 func (r PrimaryKeyReadRequest) canonical() bool {
 	if !r.present() {
-		return len(r.PrimaryPath) == 0 && len(r.Keys) == 0
+		return r.Relation == 0 && r.MaxDocumentBytes == 0 &&
+			len(r.PrimaryPath) == 0 && len(r.Keys) == 0
 	}
 	if len(r.PrimaryPath) == 0 || len(r.PrimaryPath) > 1<<16-1 ||
 		!utf8.Valid(r.PrimaryPath) || len(r.Keys) == 0 {
+		return false
+	}
+	// Legacy candidate envelopes carry no relation bound and continue through
+	// the ordinary snapshot path. The live point lane requires both bounds so
+	// a peer cannot widen either the physical relation or detached value.
+	if (r.Relation == 0) != (r.MaxDocumentBytes == 0) ||
+		r.Relation > replication.MaxRelationID ||
+		r.MaxDocumentBytes > replication.MaxMutationValueBytes {
 		return false
 	}
 	for i := range r.Keys {
@@ -184,6 +198,12 @@ func (r PrimaryKeyReadRequest) canonical() bool {
 		}
 	}
 	return true
+}
+
+func (r PrimaryKeyReadRequest) livePointEligible() bool {
+	return r.present() && len(r.Keys) == 1 && r.Relation != 0 &&
+		r.Relation <= replication.MaxRelationID && r.MaxDocumentBytes != 0 &&
+		r.MaxDocumentBytes <= replication.MaxMutationValueBytes
 }
 
 func (r GlobalIndexLookupRequest) present() bool {

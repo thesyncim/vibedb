@@ -15,6 +15,9 @@ import (
 func (*AuthenticatedReplicatedClient) parallelReplicatedDiscovery() {}
 
 func (executor *ReplicatedExecutor) parallelDiscovery() bool {
+	if client, ok := executor.client.(interface{ parallelReplicatedDiscoveryEnabled() bool }); ok {
+		return client.parallelReplicatedDiscoveryEnabled()
+	}
 	_, ok := executor.client.(interface{ parallelReplicatedDiscovery() })
 	return ok
 }

@@ -3,8 +3,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -22,6 +24,72 @@ import (
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibejson"
 )
+
+func TestRF3SplitChildKeyMetadataUsesNodeLog(t *testing.T) {
+	input := prepareRF3NodeTestInput(t)
+	if err := provisionRF3Node(input); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := loadRF3Manifest(filepath.Join(input.Root, "serve-rf3.vibejson"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, err := servicetls.LoadProfile(manifest.TLS.Certificate, manifest.TLS.Key, manifest.TLS.Roots, manifest.TLS.IdentityOID, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, err := openRF3NodeOwner(manifest, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = owner.Close() })
+	set, err := prepareRF3GroupSetOnNode(manifest, profile, sqldriver.ReplicatedOpenOptions{}, owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		for index := range set.groups {
+			if err := set.groups[index].close(nil); err != nil {
+				t.Error(err)
+			}
+		}
+	})
+	for index := range set.groups {
+		source := &set.groups[index]
+		if source.wal != nil || source.nodeOwner != owner {
+			t.Fatal("fixture does not exercise a node-backed source")
+		}
+		registry := manifest.Groups[index].ChildRegistry
+		key, err := loadRF3SplitChildWALKey(registry, source)
+		if err != nil {
+			t.Fatalf("split-child key from shared node log: %v", err)
+		}
+		clear(key.Material[:])
+		want := []byte(input.Groups[index].WAL.WrappedKey)
+		if !bytes.Equal(key.Wrapped, want) {
+			t.Fatalf("child wrapped metadata %q, want %q", key.Wrapped, want)
+		}
+		key.Wrapped[0]++
+		key, err = loadRF3SplitChildWALKey(registry, source)
+		if err != nil || !bytes.Equal(key.Wrapped, want) {
+			t.Fatalf("child metadata aliases retained log: %q, %v", key.Wrapped, err)
+		}
+		clear(key.Material[:])
+		wrong := registry
+		wrong.WAL.KeyID += "-other"
+		if key, err := loadRF3SplitChildWALKey(wrong, source); !errors.Is(err, raftstore.ErrKeyMismatch) || key.Material != ([32]byte{}) {
+			t.Fatalf("wrong child key ID: err=%v material retained=%t", err, key.Material != ([32]byte{}))
+		}
+		wrong = registry
+		wrong.WAL.KeyMaterialPath = filepath.Join(t.TempDir(), "wrong-key")
+		if err := os.WriteFile(wrong.WAL.KeyMaterialPath, bytes.Repeat([]byte{0x71}, 32), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if key, err := loadRF3SplitChildWALKey(wrong, source); !errors.Is(err, raftstore.ErrKeyMismatch) || key.Material != ([32]byte{}) {
+			t.Fatalf("wrong child key material: err=%v material retained=%t", err, key.Material != ([32]byte{}))
+		}
+	}
+}
 
 func prepareRF3NodeTestInput(t *testing.T) prepareRF3NodeManifest {
 	t.Helper()
@@ -166,6 +234,7 @@ func TestServeRF3NodeLogThreeServersRestart(t *testing.T) {
 	var manifests [3]rf3Manifest
 	var inputs [3]prepareRF3NodeManifest
 	var reloads [3]chan os.Signal
+	var diagnostics [3]chan os.Signal
 	var profiles []*rafttransport.PeerTLS
 	var nativeAddresses [3]string
 	for i := range 3 {
@@ -217,20 +286,24 @@ func TestServeRF3NodeLogThreeServersRestart(t *testing.T) {
 					t.Cleanup(func() { _ = listener.Close() })
 				}
 			}
+			if err := os.Remove(filepath.Join(inputs[i].Root, "rf3-diagnostics.json")); err != nil && !errors.Is(err, os.ErrNotExist) {
+				t.Fatal(err)
+			}
 			listeners := reservations[i]
 			reloads[i] = make(chan os.Signal, 1)
+			diagnostics[i] = make(chan os.Signal, 1)
 			serving := manifests[i]
 			serving.reloadPath = filepath.Join(inputs[i].Root, "serve-rf3.vibejson")
 			serving.reloadSignals = reloads[i]
 			go func() {
-				done <- servePreparedRF3WithListen(ctx, serving, func(network, address string) (net.Listener, error) {
+				done <- servePreparedRF3WithListenAndDiagnostics(ctx, serving, func(network, address string) (net.Listener, error) {
 					listener := listeners[address]
 					if network != "tcp" || listener == nil {
 						return nil, errors.New("unexpected node listener")
 					}
 					delete(listeners, address)
 					return listener, nil
-				})
+				}, diagnostics[i])
 			}()
 		}
 		// Always drain the servers, including when leader qualification fails.
@@ -256,6 +329,15 @@ func TestServeRF3NodeLogThreeServersRestart(t *testing.T) {
 		for _, bundle := range manifests[0].Groups {
 			waitRF3CommandLeader(t, nativeAddresses, nodes, profiles, bundle.Route.Group, bundle.Route.AllocationGeneration, template.Groups[0].Authority.ActivePolicyGeneration)
 		}
+		// A diagnostic signal is consumed by the serving loop and must not
+		// terminate the process. Send two snapshots and require the second
+		// serial to replace the same bounded node-root record before stopping.
+		for i := range 3 {
+			diagnostics[i] <- syscall.SIGUSR1
+			waitRF3DiagnosticSerial(t, filepath.Join(inputs[i].Root, "rf3-diagnostics.json"), 1)
+			diagnostics[i] <- syscall.SIGUSR1
+			waitRF3DiagnosticSerial(t, filepath.Join(inputs[i].Root, "rf3-diagnostics.json"), 2)
+		}
 		if restart == 0 {
 			// Preparation runs while each process owns its node log. Then the exact
 			// normal reload path authenticates SQL and commits the new descriptor.
@@ -269,6 +351,24 @@ func TestServeRF3NodeLogThreeServersRestart(t *testing.T) {
 		}
 		stop()
 	}
+}
+
+func waitRF3DiagnosticSerial(t *testing.T, path string, wanted uint64) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		raw, err := os.ReadFile(path)
+		if err == nil {
+			var record struct {
+				Serial uint64 `json:"serial"`
+			}
+			if json.Unmarshal(raw, &record) == nil && record.Serial >= wanted {
+				return
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("diagnostic snapshot %q did not reach serial %d", path, wanted)
 }
 
 func appendRF3LiveNodeTestGroup(t *testing.T, input prepareRF3NodeManifest, current rf3Manifest) rf3Manifest {

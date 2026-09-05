@@ -1,0 +1,4151 @@
+{
+  "schema": "vibedb.matched-fused-audit/1",
+  "evidence_directory": "vibedb-storage-short-7aa4f496-run2",
+  "refs": {
+    "before": "f2df4fac525fa0f73ff2e1b558f167e1e598f6c5",
+    "after": "7aa4f49602f85303d13689bce5beb1659e51cc52"
+  },
+  "source": {
+    "before": {
+      "revision": "f2df4fac525fa0f73ff2e1b558f167e1e598f6c5",
+      "status": "",
+      "dirty": false,
+      "patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "after": {
+      "revision": "7aa4f49602f85303d13689bce5beb1659e51cc52",
+      "status": "",
+      "dirty": false,
+      "patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "client": {
+      "revision": "27b89cd661b944f6c4738a8d240ffc0ffc649483",
+      "status": "",
+      "dirty": false,
+      "patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  },
+  "config": {
+    "KeySelection": "splitmix64-independent-with-replacement-v1",
+    "Rows": 1024,
+    "PayloadBytes": 256,
+    "Operations": 2000,
+    "ScanOperations": 200,
+    "Warmup": 100,
+    "Repetitions": 2,
+    "Clients": "1,8",
+    "Protocol": "extended unnamed parse/bind/execute; text parameters/results; one autocommit statement per operation",
+    "Tables": [
+      "rf3_sql_bench"
+    ],
+    "Workloads": [
+      "point_hit",
+      "point_miss",
+      "range_64",
+      "group_16",
+      "update_existing"
+    ],
+    "GroupDistribution": "uniform",
+    "SkewPercent": 80,
+    "EndpointCount": 1,
+    "EndpointRouting": "round-robin-per-client"
+  },
+  "orders": {
+    "before-first": [
+      "before",
+      "after",
+      "crdb"
+    ],
+    "after-first": [
+      "crdb",
+      "after",
+      "before"
+    ]
+  },
+  "limits": {
+    "NanoCpus": 12000000000,
+    "Memory": 25769803776,
+    "MemorySwap": 25769803776
+  },
+  "sources": [
+    {
+      "order": "before-first",
+      "arm": "before",
+      "revision": "f2df4fac525fa0f73ff2e1b558f167e1e598f6c5",
+      "report": "baseline-c1-c8/before-first/before/report.json",
+      "sha256": "88f47abc70e6c30ba25d1dd08e951230b34b9bd2650bb06785826735011c73dc",
+      "version": "PostgreSQL 16.0 (vibedb pgwire)",
+      "trials": 20,
+      "samples": 25600,
+      "sql_errors": 0,
+      "platform": "Linux eb792f8ce2b0 7.0.12-linuxkit #1 SMP PREEMPT Fri Aug 14 16:27:59 UTC 2026 aarch64 GNU/Linux",
+      "process_counts": {
+        "vibedb": 1,
+        "vibedb_shard": 3,
+        "vibedb_gateway": 0,
+        "cockroach": 0
+      },
+      "forced_shutdown": false,
+      "server_exit_codes": [
+        0
+      ]
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "revision": "7aa4f49602f85303d13689bce5beb1659e51cc52",
+      "report": "baseline-c1-c8/before-first/after/report.json",
+      "sha256": "ab1fac1c5e4e90525afa9d954b62e06ea0729e04374980668b03b09401e1ac52",
+      "version": "PostgreSQL 16.0 (vibedb pgwire)",
+      "trials": 20,
+      "samples": 25600,
+      "sql_errors": 0,
+      "platform": "Linux e13fee88fc0d 7.0.12-linuxkit #1 SMP PREEMPT Fri Aug 14 16:27:59 UTC 2026 aarch64 GNU/Linux",
+      "process_counts": {
+        "vibedb": 1,
+        "vibedb_shard": 3,
+        "vibedb_gateway": 0,
+        "cockroach": 0
+      },
+      "forced_shutdown": false,
+      "server_exit_codes": [
+        0
+      ]
+    },
+    {
+      "order": "before-first",
+      "arm": "crdb",
+      "revision": "cockroachdb/cockroach:v26.3.1@sha256:204f131510c78393adb02345f289a8dbb32e1491e26cc92b6c7751f3b97be3c5",
+      "report": "baseline-c1-c8/before-first/crdb/report.json",
+      "sha256": "c26214ea05c2396d4064b2264b481efc0e4468a09b6937f7e0d225918c41b513",
+      "version": "CockroachDB CCL v26.3.1 (aarch64-unknown-linux-gnu, built 2026/08/24 17:37:27, go1.26.6)",
+      "trials": 20,
+      "samples": 25600,
+      "sql_errors": 0,
+      "platform": "Linux 1284f13ba34e 7.0.12-linuxkit #1 SMP PREEMPT Fri Aug 14 16:27:59 UTC 2026 aarch64 GNU/Linux",
+      "process_counts": {
+        "vibedb": 0,
+        "vibedb_shard": 0,
+        "vibedb_gateway": 0,
+        "cockroach": 3
+      },
+      "forced_shutdown": true,
+      "server_exit_codes": [
+        0,
+        0,
+        137
+      ]
+    },
+    {
+      "order": "after-first",
+      "arm": "crdb",
+      "revision": "cockroachdb/cockroach:v26.3.1@sha256:204f131510c78393adb02345f289a8dbb32e1491e26cc92b6c7751f3b97be3c5",
+      "report": "baseline-c1-c8/after-first/crdb/report.json",
+      "sha256": "0886a4b735cb94475618a82eb8d9d5a80beabe746b94d40bd7b14229675d17b8",
+      "version": "CockroachDB CCL v26.3.1 (aarch64-unknown-linux-gnu, built 2026/08/24 17:37:27, go1.26.6)",
+      "trials": 20,
+      "samples": 25600,
+      "sql_errors": 0,
+      "platform": "Linux be00deec21ea 7.0.12-linuxkit #1 SMP PREEMPT Fri Aug 14 16:27:59 UTC 2026 aarch64 GNU/Linux",
+      "process_counts": {
+        "vibedb": 0,
+        "vibedb_shard": 0,
+        "vibedb_gateway": 0,
+        "cockroach": 3
+      },
+      "forced_shutdown": true,
+      "server_exit_codes": [
+        0,
+        137,
+        0
+      ]
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "revision": "7aa4f49602f85303d13689bce5beb1659e51cc52",
+      "report": "baseline-c1-c8/after-first/after/report.json",
+      "sha256": "b5848f98064fc736338b13117d2200eb24dcc6acd34b8f8c1bda91376bdae98a",
+      "version": "PostgreSQL 16.0 (vibedb pgwire)",
+      "trials": 20,
+      "samples": 25600,
+      "sql_errors": 0,
+      "platform": "Linux 60813cffc1f5 7.0.12-linuxkit #1 SMP PREEMPT Fri Aug 14 16:27:59 UTC 2026 aarch64 GNU/Linux",
+      "process_counts": {
+        "vibedb": 1,
+        "vibedb_shard": 3,
+        "vibedb_gateway": 0,
+        "cockroach": 0
+      },
+      "forced_shutdown": false,
+      "server_exit_codes": [
+        0
+      ]
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "revision": "f2df4fac525fa0f73ff2e1b558f167e1e598f6c5",
+      "report": "baseline-c1-c8/after-first/before/report.json",
+      "sha256": "631ddb98212db754e3d211773decba54d8174bbba7f5910c7df5d63d59bf3858",
+      "version": "PostgreSQL 16.0 (vibedb pgwire)",
+      "trials": 20,
+      "samples": 25600,
+      "sql_errors": 0,
+      "platform": "Linux a8e7eeac3871 7.0.12-linuxkit #1 SMP PREEMPT Fri Aug 14 16:27:59 UTC 2026 aarch64 GNU/Linux",
+      "process_counts": {
+        "vibedb": 1,
+        "vibedb_shard": 3,
+        "vibedb_gateway": 0,
+        "cockroach": 0
+      },
+      "forced_shutdown": false,
+      "server_exit_codes": [
+        0
+      ]
+    }
+  ],
+  "build_settings": {
+    "candidate-vibedb": {
+      "-buildmode": "exe",
+      "-compiler": "gc",
+      "-trimpath": "true",
+      "CGO_ENABLED": "0",
+      "GOARCH": "arm64",
+      "GOEXPERIMENT": "simd",
+      "GOOS": "linux",
+      "GOARM64": "v8.0",
+      "vcs": "git",
+      "vcs.revision": "7aa4f49602f85303d13689bce5beb1659e51cc52",
+      "vcs.time": "2026-09-04T16:23:49Z",
+      "vcs.modified": "false"
+    },
+    "candidate-vibedb-gateway": {
+      "-buildmode": "exe",
+      "-compiler": "gc",
+      "-trimpath": "true",
+      "CGO_ENABLED": "0",
+      "GOARCH": "arm64",
+      "GOEXPERIMENT": "simd",
+      "GOOS": "linux",
+      "GOARM64": "v8.0",
+      "vcs": "git",
+      "vcs.revision": "7aa4f49602f85303d13689bce5beb1659e51cc52",
+      "vcs.time": "2026-09-04T16:23:49Z",
+      "vcs.modified": "false"
+    },
+    "candidate-vibedb-shard": {
+      "-buildmode": "exe",
+      "-compiler": "gc",
+      "-trimpath": "true",
+      "CGO_ENABLED": "0",
+      "GOARCH": "arm64",
+      "GOEXPERIMENT": "simd",
+      "GOOS": "linux",
+      "GOARM64": "v8.0",
+      "vcs": "git",
+      "vcs.revision": "7aa4f49602f85303d13689bce5beb1659e51cc52",
+      "vcs.time": "2026-09-04T16:23:49Z",
+      "vcs.modified": "false"
+    },
+    "parent-vibedb": {
+      "-buildmode": "exe",
+      "-compiler": "gc",
+      "-trimpath": "true",
+      "CGO_ENABLED": "0",
+      "GOARCH": "arm64",
+      "GOEXPERIMENT": "simd",
+      "GOOS": "linux",
+      "GOARM64": "v8.0",
+      "vcs": "git",
+      "vcs.revision": "f2df4fac525fa0f73ff2e1b558f167e1e598f6c5",
+      "vcs.time": "2026-09-04T16:06:28Z",
+      "vcs.modified": "false"
+    },
+    "parent-vibedb-gateway": {
+      "-buildmode": "exe",
+      "-compiler": "gc",
+      "-trimpath": "true",
+      "CGO_ENABLED": "0",
+      "GOARCH": "arm64",
+      "GOEXPERIMENT": "simd",
+      "GOOS": "linux",
+      "GOARM64": "v8.0",
+      "vcs": "git",
+      "vcs.revision": "f2df4fac525fa0f73ff2e1b558f167e1e598f6c5",
+      "vcs.time": "2026-09-04T16:06:28Z",
+      "vcs.modified": "false"
+    },
+    "parent-vibedb-shard": {
+      "-buildmode": "exe",
+      "-compiler": "gc",
+      "-trimpath": "true",
+      "CGO_ENABLED": "0",
+      "GOARCH": "arm64",
+      "GOEXPERIMENT": "simd",
+      "GOOS": "linux",
+      "GOARM64": "v8.0",
+      "vcs": "git",
+      "vcs.revision": "f2df4fac525fa0f73ff2e1b558f167e1e598f6c5",
+      "vcs.time": "2026-09-04T16:06:28Z",
+      "vcs.modified": "false"
+    },
+    "rf3-sqlbench": {
+      "-buildmode": "exe",
+      "-compiler": "gc",
+      "-trimpath": "true",
+      "CGO_ENABLED": "0",
+      "GOARCH": "arm64",
+      "GOEXPERIMENT": "simd",
+      "GOOS": "linux",
+      "GOARM64": "v8.0",
+      "vcs": "git",
+      "vcs.revision": "27b89cd661b944f6c4738a8d240ffc0ffc649483",
+      "vcs.time": "2026-09-04T14:27:59Z",
+      "vcs.modified": "false"
+    }
+  },
+  "all_actual_binaries_elf64_aarch64": true,
+  "build_binary_sha256": {
+    "candidate-vibedb": "ba81f9515aa9ffa8bb27fa0b32ae13546466804f066f75cc19d8df9d2d99c3c5",
+    "candidate-vibedb-gateway": "daf3177958801562107b58d5a93a54dc5af161d7c22231a82c03028aff79151a",
+    "candidate-vibedb-shard": "361a5327346e74cb6dd6edeb8b837a087222a9a66cd52b451dcc00555aff5fcb",
+    "cockroach": "7923d5eca1fc275abebd64863fa5e5c51be3504fd57f37c5b8c4f8579bd54c3e",
+    "parent-vibedb": "20c8e9260b07ffeaeabd11ca41459a9898889e2637e9b7036ab0dd9029dcf4dc",
+    "parent-vibedb-gateway": "96706dcde8a50a65f360808f850947614dc524523497fd1488afc30bb2fc7a45",
+    "parent-vibedb-shard": "72c150ae9c46b2dfddbc50878d6ebdb4e4ca9a5cd6f89546325eab42c66a4e0e",
+    "rf3-sqlbench": "9b70628460529c7af78be7b2249a603b6fda730444d2b852502ae4e45b1fcf2b"
+  },
+  "fixture_binary_sha256": {
+    "before": {
+      "candidate-vibedb": "20c8e9260b07ffeaeabd11ca41459a9898889e2637e9b7036ab0dd9029dcf4dc",
+      "candidate-vibedb-gateway": "96706dcde8a50a65f360808f850947614dc524523497fd1488afc30bb2fc7a45",
+      "candidate-vibedb-shard": "72c150ae9c46b2dfddbc50878d6ebdb4e4ca9a5cd6f89546325eab42c66a4e0e",
+      "rf3-sqlbench": "9b70628460529c7af78be7b2249a603b6fda730444d2b852502ae4e45b1fcf2b"
+    },
+    "after": {
+      "candidate-vibedb": "ba81f9515aa9ffa8bb27fa0b32ae13546466804f066f75cc19d8df9d2d99c3c5",
+      "candidate-vibedb-gateway": "daf3177958801562107b58d5a93a54dc5af161d7c22231a82c03028aff79151a",
+      "candidate-vibedb-shard": "361a5327346e74cb6dd6edeb8b837a087222a9a66cd52b451dcc00555aff5fcb",
+      "rf3-sqlbench": "9b70628460529c7af78be7b2249a603b6fda730444d2b852502ae4e45b1fcf2b"
+    },
+    "crdb": {
+      "candidate-vibedb": "ba81f9515aa9ffa8bb27fa0b32ae13546466804f066f75cc19d8df9d2d99c3c5",
+      "candidate-vibedb-gateway": "daf3177958801562107b58d5a93a54dc5af161d7c22231a82c03028aff79151a",
+      "candidate-vibedb-shard": "361a5327346e74cb6dd6edeb8b837a087222a9a66cd52b451dcc00555aff5fcb",
+      "cockroach": "7923d5eca1fc275abebd64863fa5e5c51be3504fd57f37c5b8c4f8579bd54c3e",
+      "parent-vibedb": "20c8e9260b07ffeaeabd11ca41459a9898889e2637e9b7036ab0dd9029dcf4dc",
+      "parent-vibedb-gateway": "96706dcde8a50a65f360808f850947614dc524523497fd1488afc30bb2fc7a45",
+      "parent-vibedb-shard": "72c150ae9c46b2dfddbc50878d6ebdb4e4ca9a5cd6f89546325eab42c66a4e0e",
+      "rf3-sqlbench": "9b70628460529c7af78be7b2249a603b6fda730444d2b852502ae4e45b1fcf2b"
+    }
+  },
+  "control_sha256": {
+    "run-fused-node-comparison.py": "c163e48b156baf41929e3f6a036776ca792feed8afc98d1db3a2befd43c4198c",
+    "run-fused-write-comparison.py": "af2209e4c42f07fe74495e2a69c8593aeccf1801fd32807aa087e45a2e22aba4",
+    "summarize-crdb-sql.py": "9f1f3622bb1c3904a211e8a848e9c6a30d7edc79cd6ef65fa517741260ac4fb2"
+  },
+  "before_after_patch_sha256": "ab53cd94ac817f9bda6c3d571b9af1211be3274253dec7f7a48d966225055994",
+  "before_after_patch_files": [
+    "store/durable/store_file_primary_batch.go",
+    "store/durable/store_file_primary_batch_patch_test.go"
+  ],
+  "counts": {
+    "fixtures": 6,
+    "trials": 120,
+    "samples": 153600,
+    "sql_errors": 0,
+    "diagnostic_snapshots": 480,
+    "warmup_operations": 12000,
+    "summed_trial_seconds": 55.421655608,
+    "campaign_wall_seconds": 224.553504
+  },
+  "per_order": {
+    "before-first": {
+      "geomean_vs_before": 0.8842027432841811,
+      "geomean_vs_crdb": 0.4524504767068145,
+      "throughput_regressions_over_5pct": [
+        {
+          "workload": "point_hit",
+          "clients": 1,
+          "arms": {
+            "before": {
+              "ops_s": 4340.025540616289,
+              "p99_ms": 0.414563
+            },
+            "after": {
+              "ops_s": 3913.483957949088,
+              "p99_ms": 0.500688
+            },
+            "crdb": {
+              "ops_s": 7099.193540652356,
+              "p99_ms": 0.24675
+            }
+          },
+          "throughput_vs_before": 0.9017191077159811,
+          "p99_vs_before": 1.20774888255826,
+          "throughput_vs_crdb": 0.5512575386963562,
+          "p99_vs_crdb": 2.029130699088146
+        },
+        {
+          "workload": "range_64",
+          "clients": 8,
+          "arms": {
+            "before": {
+              "ops_s": 14721.910842335012,
+              "p99_ms": 1.211563
+            },
+            "after": {
+              "ops_s": 9349.218069394105,
+              "p99_ms": 3.562896
+            },
+            "crdb": {
+              "ops_s": 24008.98071024239,
+              "p99_ms": 1.5419795
+            }
+          },
+          "throughput_vs_before": 0.6350546589719221,
+          "p99_vs_before": 2.940743485893841,
+          "throughput_vs_crdb": 0.38940503898216994,
+          "p99_vs_crdb": 2.310598811462798
+        },
+        {
+          "workload": "group_16",
+          "clients": 1,
+          "arms": {
+            "before": {
+              "ops_s": 1271.9578719427973,
+              "p99_ms": 1.1933335
+            },
+            "after": {
+              "ops_s": 950.2539837558833,
+              "p99_ms": 4.5159585
+            },
+            "crdb": {
+              "ops_s": 2608.4567143145828,
+              "p99_ms": 0.569562
+            }
+          },
+          "throughput_vs_before": 0.7470797616154211,
+          "p99_vs_before": 3.7843222368265033,
+          "throughput_vs_crdb": 0.36429739414156964,
+          "p99_vs_crdb": 7.928826888029749
+        },
+        {
+          "workload": "group_16",
+          "clients": 8,
+          "arms": {
+            "before": {
+              "ops_s": 8363.926843090172,
+              "p99_ms": 2.0962915
+            },
+            "after": {
+              "ops_s": 5513.69760324964,
+              "p99_ms": 6.206375
+            },
+            "crdb": {
+              "ops_s": 17971.62397769712,
+              "p99_ms": 0.584791
+            }
+          },
+          "throughput_vs_before": 0.6592235569115196,
+          "p99_vs_before": 2.960645024797363,
+          "throughput_vs_crdb": 0.3068001873449037,
+          "p99_vs_crdb": 10.612979679919837
+        },
+        {
+          "workload": "update_existing",
+          "clients": 1,
+          "arms": {
+            "before": {
+              "ops_s": 618.7958319832273,
+              "p99_ms": 8.593167
+            },
+            "after": {
+              "ops_s": 521.7711829735024,
+              "p99_ms": 11.3209375
+            },
+            "crdb": {
+              "ops_s": 1232.5790744701944,
+              "p99_ms": 1.9354795
+            }
+          },
+          "throughput_vs_before": 0.8432041006178677,
+          "p99_vs_before": 1.317434829324276,
+          "throughput_vs_crdb": 0.42331659994940113,
+          "p99_vs_crdb": 5.849164251029267
+        }
+      ],
+      "p99_regressions_over_10pct": [
+        {
+          "workload": "point_hit",
+          "clients": 1,
+          "arms": {
+            "before": {
+              "ops_s": 4340.025540616289,
+              "p99_ms": 0.414563
+            },
+            "after": {
+              "ops_s": 3913.483957949088,
+              "p99_ms": 0.500688
+            },
+            "crdb": {
+              "ops_s": 7099.193540652356,
+              "p99_ms": 0.24675
+            }
+          },
+          "throughput_vs_before": 0.9017191077159811,
+          "p99_vs_before": 1.20774888255826,
+          "throughput_vs_crdb": 0.5512575386963562,
+          "p99_vs_crdb": 2.029130699088146
+        },
+        {
+          "workload": "range_64",
+          "clients": 1,
+          "arms": {
+            "before": {
+              "ops_s": 2588.257500556322,
+              "p99_ms": 0.5497085
+            },
+            "after": {
+              "ops_s": 2586.587547306929,
+              "p99_ms": 0.730417
+            },
+            "crdb": {
+              "ops_s": 5001.849292693339,
+              "p99_ms": 0.3141455
+            }
+          },
+          "throughput_vs_before": 0.9993547963257001,
+          "p99_vs_before": 1.3287351387144275,
+          "throughput_vs_crdb": 0.5171262459037691,
+          "p99_vs_crdb": 2.3250913987308426
+        },
+        {
+          "workload": "range_64",
+          "clients": 8,
+          "arms": {
+            "before": {
+              "ops_s": 14721.910842335012,
+              "p99_ms": 1.211563
+            },
+            "after": {
+              "ops_s": 9349.218069394105,
+              "p99_ms": 3.562896
+            },
+            "crdb": {
+              "ops_s": 24008.98071024239,
+              "p99_ms": 1.5419795
+            }
+          },
+          "throughput_vs_before": 0.6350546589719221,
+          "p99_vs_before": 2.940743485893841,
+          "throughput_vs_crdb": 0.38940503898216994,
+          "p99_vs_crdb": 2.310598811462798
+        },
+        {
+          "workload": "group_16",
+          "clients": 1,
+          "arms": {
+            "before": {
+              "ops_s": 1271.9578719427973,
+              "p99_ms": 1.1933335
+            },
+            "after": {
+              "ops_s": 950.2539837558833,
+              "p99_ms": 4.5159585
+            },
+            "crdb": {
+              "ops_s": 2608.4567143145828,
+              "p99_ms": 0.569562
+            }
+          },
+          "throughput_vs_before": 0.7470797616154211,
+          "p99_vs_before": 3.7843222368265033,
+          "throughput_vs_crdb": 0.36429739414156964,
+          "p99_vs_crdb": 7.928826888029749
+        },
+        {
+          "workload": "group_16",
+          "clients": 8,
+          "arms": {
+            "before": {
+              "ops_s": 8363.926843090172,
+              "p99_ms": 2.0962915
+            },
+            "after": {
+              "ops_s": 5513.69760324964,
+              "p99_ms": 6.206375
+            },
+            "crdb": {
+              "ops_s": 17971.62397769712,
+              "p99_ms": 0.584791
+            }
+          },
+          "throughput_vs_before": 0.6592235569115196,
+          "p99_vs_before": 2.960645024797363,
+          "throughput_vs_crdb": 0.3068001873449037,
+          "p99_vs_crdb": 10.612979679919837
+        },
+        {
+          "workload": "update_existing",
+          "clients": 1,
+          "arms": {
+            "before": {
+              "ops_s": 618.7958319832273,
+              "p99_ms": 8.593167
+            },
+            "after": {
+              "ops_s": 521.7711829735024,
+              "p99_ms": 11.3209375
+            },
+            "crdb": {
+              "ops_s": 1232.5790744701944,
+              "p99_ms": 1.9354795
+            }
+          },
+          "throughput_vs_before": 0.8432041006178677,
+          "p99_vs_before": 1.317434829324276,
+          "throughput_vs_crdb": 0.42331659994940113,
+          "p99_vs_crdb": 5.849164251029267
+        }
+      ]
+    },
+    "after-first": {
+      "geomean_vs_before": 0.8518358553747842,
+      "geomean_vs_crdb": 0.4360822842180473,
+      "throughput_regressions_over_5pct": [
+        {
+          "workload": "point_hit",
+          "clients": 1,
+          "arms": {
+            "before": {
+              "ops_s": 3969.140114752402,
+              "p99_ms": 0.3952705
+            },
+            "after": {
+              "ops_s": 3277.2766855144055,
+              "p99_ms": 0.576229
+            },
+            "crdb": {
+              "ops_s": 7957.20560819178,
+              "p99_ms": 0.2960625
+            }
+          },
+          "throughput_vs_before": 0.8256893409566229,
+          "p99_vs_before": 1.4578092723843543,
+          "throughput_vs_crdb": 0.4118627627443127,
+          "p99_vs_crdb": 1.9463086341566391
+        },
+        {
+          "workload": "point_hit",
+          "clients": 8,
+          "arms": {
+            "before": {
+              "ops_s": 19796.43845505821,
+              "p99_ms": 0.9433545
+            },
+            "after": {
+              "ops_s": 16368.808088411304,
+              "p99_ms": 0.8908745
+            },
+            "crdb": {
+              "ops_s": 40118.105479697,
+              "p99_ms": 0.4868545
+            }
+          },
+          "throughput_vs_before": 0.8268562108063883,
+          "p99_vs_before": 0.944368739429345,
+          "throughput_vs_crdb": 0.40801548060875514,
+          "p99_vs_crdb": 1.829857791188127
+        },
+        {
+          "workload": "point_miss",
+          "clients": 1,
+          "arms": {
+            "before": {
+              "ops_s": 4512.5351042025695,
+              "p99_ms": 0.3196875
+            },
+            "after": {
+              "ops_s": 3378.568002709231,
+              "p99_ms": 0.707375
+            },
+            "crdb": {
+              "ops_s": 6891.741212369882,
+              "p99_ms": 0.2292915
+            }
+          },
+          "throughput_vs_before": 0.7487073063570712,
+          "p99_vs_before": 2.2127077223851415,
+          "throughput_vs_crdb": 0.4902343106913374,
+          "p99_vs_crdb": 3.085046763617491
+        },
+        {
+          "workload": "point_miss",
+          "clients": 8,
+          "arms": {
+            "before": {
+              "ops_s": 21415.294801802138,
+              "p99_ms": 0.6748755
+            },
+            "after": {
+              "ops_s": 16059.41898049897,
+              "p99_ms": 0.837625
+            },
+            "crdb": {
+              "ops_s": 44795.04884554704,
+              "p99_ms": 0.302479
+            }
+          },
+          "throughput_vs_before": 0.7499041749893417,
+          "p99_vs_before": 1.2411548500427116,
+          "throughput_vs_crdb": 0.35850879493114773,
+          "p99_vs_crdb": 2.7692005064814413
+        },
+        {
+          "workload": "range_64",
+          "clients": 1,
+          "arms": {
+            "before": {
+              "ops_s": 2656.586087665115,
+              "p99_ms": 0.500458
+            },
+            "after": {
+              "ops_s": 2002.7728126168624,
+              "p99_ms": 0.8556875
+            },
+            "crdb": {
+              "ops_s": 4813.658890399496,
+              "p99_ms": 0.2956875
+            }
+          },
+          "throughput_vs_before": 0.7538896713778653,
+          "p99_vs_before": 1.7098088151253454,
+          "throughput_vs_crdb": 0.4160603936043852,
+          "p99_vs_crdb": 2.8938913548932574
+        },
+        {
+          "workload": "range_64",
+          "clients": 8,
+          "arms": {
+            "before": {
+              "ops_s": 13816.353592931933,
+              "p99_ms": 1.035625
+            },
+            "after": {
+              "ops_s": 12102.158943163584,
+              "p99_ms": 1.179812
+            },
+            "crdb": {
+              "ops_s": 30831.61180459281,
+              "p99_ms": 0.408187
+            }
+          },
+          "throughput_vs_before": 0.8759300246451941,
+          "p99_vs_before": 1.1392270368135184,
+          "throughput_vs_crdb": 0.39252436816685643,
+          "p99_vs_crdb": 2.8903713249074565
+        },
+        {
+          "workload": "group_16",
+          "clients": 1,
+          "arms": {
+            "before": {
+              "ops_s": 1309.1449125099646,
+              "p99_ms": 1.022792
+            },
+            "after": {
+              "ops_s": 1194.7325136113855,
+              "p99_ms": 1.042521
+            },
+            "crdb": {
+              "ops_s": 2615.236655658213,
+              "p99_ms": 0.6586665
+            }
+          },
+          "throughput_vs_before": 0.9126052449921519,
+          "p99_vs_before": 1.0192893569758075,
+          "throughput_vs_crdb": 0.4568353349692135,
+          "p99_vs_crdb": 1.5827751980706473
+        },
+        {
+          "workload": "group_16",
+          "clients": 8,
+          "arms": {
+            "before": {
+              "ops_s": 8693.99922364739,
+              "p99_ms": 2.1207085
+            },
+            "after": {
+              "ops_s": 7666.996971374978,
+              "p99_ms": 1.963083
+            },
+            "crdb": {
+              "ops_s": 14920.557700813544,
+              "p99_ms": 1.1466045
+            }
+          },
+          "throughput_vs_before": 0.8818722861765389,
+          "p99_vs_before": 0.9256731889366218,
+          "throughput_vs_crdb": 0.5138545840653754,
+          "p99_vs_crdb": 1.712083809194888
+        },
+        {
+          "workload": "update_existing",
+          "clients": 8,
+          "arms": {
+            "before": {
+              "ops_s": 2693.2641132789995,
+              "p99_ms": 14.516979
+            },
+            "after": {
+              "ops_s": 2325.406889642377,
+              "p99_ms": 19.838271
+            },
+            "crdb": {
+              "ops_s": 6125.72218776039,
+              "p99_ms": 2.1175
+            }
+          },
+          "throughput_vs_before": 0.8634158373763191,
+          "p99_vs_before": 1.3665564302324884,
+          "throughput_vs_crdb": 0.3796135081490797,
+          "p99_vs_crdb": 9.368723022432112
+        }
+      ],
+      "p99_regressions_over_10pct": [
+        {
+          "workload": "point_hit",
+          "clients": 1,
+          "arms": {
+            "before": {
+              "ops_s": 3969.140114752402,
+              "p99_ms": 0.3952705
+            },
+            "after": {
+              "ops_s": 3277.2766855144055,
+              "p99_ms": 0.576229
+            },
+            "crdb": {
+              "ops_s": 7957.20560819178,
+              "p99_ms": 0.2960625
+            }
+          },
+          "throughput_vs_before": 0.8256893409566229,
+          "p99_vs_before": 1.4578092723843543,
+          "throughput_vs_crdb": 0.4118627627443127,
+          "p99_vs_crdb": 1.9463086341566391
+        },
+        {
+          "workload": "point_miss",
+          "clients": 1,
+          "arms": {
+            "before": {
+              "ops_s": 4512.5351042025695,
+              "p99_ms": 0.3196875
+            },
+            "after": {
+              "ops_s": 3378.568002709231,
+              "p99_ms": 0.707375
+            },
+            "crdb": {
+              "ops_s": 6891.741212369882,
+              "p99_ms": 0.2292915
+            }
+          },
+          "throughput_vs_before": 0.7487073063570712,
+          "p99_vs_before": 2.2127077223851415,
+          "throughput_vs_crdb": 0.4902343106913374,
+          "p99_vs_crdb": 3.085046763617491
+        },
+        {
+          "workload": "point_miss",
+          "clients": 8,
+          "arms": {
+            "before": {
+              "ops_s": 21415.294801802138,
+              "p99_ms": 0.6748755
+            },
+            "after": {
+              "ops_s": 16059.41898049897,
+              "p99_ms": 0.837625
+            },
+            "crdb": {
+              "ops_s": 44795.04884554704,
+              "p99_ms": 0.302479
+            }
+          },
+          "throughput_vs_before": 0.7499041749893417,
+          "p99_vs_before": 1.2411548500427116,
+          "throughput_vs_crdb": 0.35850879493114773,
+          "p99_vs_crdb": 2.7692005064814413
+        },
+        {
+          "workload": "range_64",
+          "clients": 1,
+          "arms": {
+            "before": {
+              "ops_s": 2656.586087665115,
+              "p99_ms": 0.500458
+            },
+            "after": {
+              "ops_s": 2002.7728126168624,
+              "p99_ms": 0.8556875
+            },
+            "crdb": {
+              "ops_s": 4813.658890399496,
+              "p99_ms": 0.2956875
+            }
+          },
+          "throughput_vs_before": 0.7538896713778653,
+          "p99_vs_before": 1.7098088151253454,
+          "throughput_vs_crdb": 0.4160603936043852,
+          "p99_vs_crdb": 2.8938913548932574
+        },
+        {
+          "workload": "range_64",
+          "clients": 8,
+          "arms": {
+            "before": {
+              "ops_s": 13816.353592931933,
+              "p99_ms": 1.035625
+            },
+            "after": {
+              "ops_s": 12102.158943163584,
+              "p99_ms": 1.179812
+            },
+            "crdb": {
+              "ops_s": 30831.61180459281,
+              "p99_ms": 0.408187
+            }
+          },
+          "throughput_vs_before": 0.8759300246451941,
+          "p99_vs_before": 1.1392270368135184,
+          "throughput_vs_crdb": 0.39252436816685643,
+          "p99_vs_crdb": 2.8903713249074565
+        },
+        {
+          "workload": "update_existing",
+          "clients": 8,
+          "arms": {
+            "before": {
+              "ops_s": 2693.2641132789995,
+              "p99_ms": 14.516979
+            },
+            "after": {
+              "ops_s": 2325.406889642377,
+              "p99_ms": 19.838271
+            },
+            "crdb": {
+              "ops_s": 6125.72218776039,
+              "p99_ms": 2.1175
+            }
+          },
+          "throughput_vs_before": 0.8634158373763191,
+          "p99_vs_before": 1.3665564302324884,
+          "throughput_vs_crdb": 0.3796135081490797,
+          "p99_vs_crdb": 9.368723022432112
+        }
+      ]
+    }
+  },
+  "tables": {
+    "before-first": [
+      {
+        "workload": "point_hit",
+        "clients": 1,
+        "arms": {
+          "before": {
+            "ops_s": 4340.025540616289,
+            "p99_ms": 0.414563
+          },
+          "after": {
+            "ops_s": 3913.483957949088,
+            "p99_ms": 0.500688
+          },
+          "crdb": {
+            "ops_s": 7099.193540652356,
+            "p99_ms": 0.24675
+          }
+        },
+        "throughput_vs_before": 0.9017191077159811,
+        "p99_vs_before": 1.20774888255826,
+        "throughput_vs_crdb": 0.5512575386963562,
+        "p99_vs_crdb": 2.029130699088146
+      },
+      {
+        "workload": "point_hit",
+        "clients": 8,
+        "arms": {
+          "before": {
+            "ops_s": 21607.403107344824,
+            "p99_ms": 0.7905415
+          },
+          "after": {
+            "ops_s": 21132.761772537335,
+            "p99_ms": 0.702521
+          },
+          "crdb": {
+            "ops_s": 43123.47570991023,
+            "p99_ms": 0.3187295
+          }
+        },
+        "throughput_vs_before": 0.9780333928862489,
+        "p99_vs_before": 0.8886579641928981,
+        "throughput_vs_crdb": 0.49005237691638115,
+        "p99_vs_crdb": 2.2041292067411393
+      },
+      {
+        "workload": "point_miss",
+        "clients": 1,
+        "arms": {
+          "before": {
+            "ops_s": 4606.943632145923,
+            "p99_ms": 0.3559795
+          },
+          "after": {
+            "ops_s": 4412.536581971165,
+            "p99_ms": 0.358563
+          },
+          "crdb": {
+            "ops_s": 7675.445533544502,
+            "p99_ms": 0.20625
+          }
+        },
+        "throughput_vs_before": 0.957801296109151,
+        "p99_vs_before": 1.0072574403863144,
+        "throughput_vs_crdb": 0.5748899608090199,
+        "p99_vs_crdb": 1.7384872727272729
+      },
+      {
+        "workload": "point_miss",
+        "clients": 8,
+        "arms": {
+          "before": {
+            "ops_s": 21293.59628230798,
+            "p99_ms": 0.7750835
+          },
+          "after": {
+            "ops_s": 20849.119407571972,
+            "p99_ms": 0.7156245
+          },
+          "crdb": {
+            "ops_s": 42992.80904580561,
+            "p99_ms": 0.3208125
+          }
+        },
+        "throughput_vs_before": 0.9791262655286977,
+        "p99_vs_before": 0.9232869748872218,
+        "throughput_vs_crdb": 0.484944340002506,
+        "p99_vs_crdb": 2.2306627703097606
+      },
+      {
+        "workload": "range_64",
+        "clients": 1,
+        "arms": {
+          "before": {
+            "ops_s": 2588.257500556322,
+            "p99_ms": 0.5497085
+          },
+          "after": {
+            "ops_s": 2586.587547306929,
+            "p99_ms": 0.730417
+          },
+          "crdb": {
+            "ops_s": 5001.849292693339,
+            "p99_ms": 0.3141455
+          }
+        },
+        "throughput_vs_before": 0.9993547963257001,
+        "p99_vs_before": 1.3287351387144275,
+        "throughput_vs_crdb": 0.5171262459037691,
+        "p99_vs_crdb": 2.3250913987308426
+      },
+      {
+        "workload": "range_64",
+        "clients": 8,
+        "arms": {
+          "before": {
+            "ops_s": 14721.910842335012,
+            "p99_ms": 1.211563
+          },
+          "after": {
+            "ops_s": 9349.218069394105,
+            "p99_ms": 3.562896
+          },
+          "crdb": {
+            "ops_s": 24008.98071024239,
+            "p99_ms": 1.5419795
+          }
+        },
+        "throughput_vs_before": 0.6350546589719221,
+        "p99_vs_before": 2.940743485893841,
+        "throughput_vs_crdb": 0.38940503898216994,
+        "p99_vs_crdb": 2.310598811462798
+      },
+      {
+        "workload": "group_16",
+        "clients": 1,
+        "arms": {
+          "before": {
+            "ops_s": 1271.9578719427973,
+            "p99_ms": 1.1933335
+          },
+          "after": {
+            "ops_s": 950.2539837558833,
+            "p99_ms": 4.5159585
+          },
+          "crdb": {
+            "ops_s": 2608.4567143145828,
+            "p99_ms": 0.569562
+          }
+        },
+        "throughput_vs_before": 0.7470797616154211,
+        "p99_vs_before": 3.7843222368265033,
+        "throughput_vs_crdb": 0.36429739414156964,
+        "p99_vs_crdb": 7.928826888029749
+      },
+      {
+        "workload": "group_16",
+        "clients": 8,
+        "arms": {
+          "before": {
+            "ops_s": 8363.926843090172,
+            "p99_ms": 2.0962915
+          },
+          "after": {
+            "ops_s": 5513.69760324964,
+            "p99_ms": 6.206375
+          },
+          "crdb": {
+            "ops_s": 17971.62397769712,
+            "p99_ms": 0.584791
+          }
+        },
+        "throughput_vs_before": 0.6592235569115196,
+        "p99_vs_before": 2.960645024797363,
+        "throughput_vs_crdb": 0.3068001873449037,
+        "p99_vs_crdb": 10.612979679919837
+      },
+      {
+        "workload": "update_existing",
+        "clients": 1,
+        "arms": {
+          "before": {
+            "ops_s": 618.7958319832273,
+            "p99_ms": 8.593167
+          },
+          "after": {
+            "ops_s": 521.7711829735024,
+            "p99_ms": 11.3209375
+          },
+          "crdb": {
+            "ops_s": 1232.5790744701944,
+            "p99_ms": 1.9354795
+          }
+        },
+        "throughput_vs_before": 0.8432041006178677,
+        "p99_vs_before": 1.317434829324276,
+        "throughput_vs_crdb": 0.42331659994940113,
+        "p99_vs_crdb": 5.849164251029267
+      },
+      {
+        "workload": "update_existing",
+        "clients": 8,
+        "arms": {
+          "before": {
+            "ops_s": 1964.520252180713,
+            "p99_ms": 22.1569165
+          },
+          "after": {
+            "ops_s": 2632.526828985342,
+            "p99_ms": 13.4895625
+          },
+          "crdb": {
+            "ops_s": 5254.2544130133165,
+            "p99_ms": 2.795541
+          }
+        },
+        "throughput_vs_before": 1.3400354748509766,
+        "p99_vs_before": 0.6088194853286557,
+        "throughput_vs_crdb": 0.5010276667352289,
+        "p99_vs_crdb": 4.825385318977615
+      }
+    ],
+    "after-first": [
+      {
+        "workload": "point_hit",
+        "clients": 1,
+        "arms": {
+          "before": {
+            "ops_s": 3969.140114752402,
+            "p99_ms": 0.3952705
+          },
+          "after": {
+            "ops_s": 3277.2766855144055,
+            "p99_ms": 0.576229
+          },
+          "crdb": {
+            "ops_s": 7957.20560819178,
+            "p99_ms": 0.2960625
+          }
+        },
+        "throughput_vs_before": 0.8256893409566229,
+        "p99_vs_before": 1.4578092723843543,
+        "throughput_vs_crdb": 0.4118627627443127,
+        "p99_vs_crdb": 1.9463086341566391
+      },
+      {
+        "workload": "point_hit",
+        "clients": 8,
+        "arms": {
+          "before": {
+            "ops_s": 19796.43845505821,
+            "p99_ms": 0.9433545
+          },
+          "after": {
+            "ops_s": 16368.808088411304,
+            "p99_ms": 0.8908745
+          },
+          "crdb": {
+            "ops_s": 40118.105479697,
+            "p99_ms": 0.4868545
+          }
+        },
+        "throughput_vs_before": 0.8268562108063883,
+        "p99_vs_before": 0.944368739429345,
+        "throughput_vs_crdb": 0.40801548060875514,
+        "p99_vs_crdb": 1.829857791188127
+      },
+      {
+        "workload": "point_miss",
+        "clients": 1,
+        "arms": {
+          "before": {
+            "ops_s": 4512.5351042025695,
+            "p99_ms": 0.3196875
+          },
+          "after": {
+            "ops_s": 3378.568002709231,
+            "p99_ms": 0.707375
+          },
+          "crdb": {
+            "ops_s": 6891.741212369882,
+            "p99_ms": 0.2292915
+          }
+        },
+        "throughput_vs_before": 0.7487073063570712,
+        "p99_vs_before": 2.2127077223851415,
+        "throughput_vs_crdb": 0.4902343106913374,
+        "p99_vs_crdb": 3.085046763617491
+      },
+      {
+        "workload": "point_miss",
+        "clients": 8,
+        "arms": {
+          "before": {
+            "ops_s": 21415.294801802138,
+            "p99_ms": 0.6748755
+          },
+          "after": {
+            "ops_s": 16059.41898049897,
+            "p99_ms": 0.837625
+          },
+          "crdb": {
+            "ops_s": 44795.04884554704,
+            "p99_ms": 0.302479
+          }
+        },
+        "throughput_vs_before": 0.7499041749893417,
+        "p99_vs_before": 1.2411548500427116,
+        "throughput_vs_crdb": 0.35850879493114773,
+        "p99_vs_crdb": 2.7692005064814413
+      },
+      {
+        "workload": "range_64",
+        "clients": 1,
+        "arms": {
+          "before": {
+            "ops_s": 2656.586087665115,
+            "p99_ms": 0.500458
+          },
+          "after": {
+            "ops_s": 2002.7728126168624,
+            "p99_ms": 0.8556875
+          },
+          "crdb": {
+            "ops_s": 4813.658890399496,
+            "p99_ms": 0.2956875
+          }
+        },
+        "throughput_vs_before": 0.7538896713778653,
+        "p99_vs_before": 1.7098088151253454,
+        "throughput_vs_crdb": 0.4160603936043852,
+        "p99_vs_crdb": 2.8938913548932574
+      },
+      {
+        "workload": "range_64",
+        "clients": 8,
+        "arms": {
+          "before": {
+            "ops_s": 13816.353592931933,
+            "p99_ms": 1.035625
+          },
+          "after": {
+            "ops_s": 12102.158943163584,
+            "p99_ms": 1.179812
+          },
+          "crdb": {
+            "ops_s": 30831.61180459281,
+            "p99_ms": 0.408187
+          }
+        },
+        "throughput_vs_before": 0.8759300246451941,
+        "p99_vs_before": 1.1392270368135184,
+        "throughput_vs_crdb": 0.39252436816685643,
+        "p99_vs_crdb": 2.8903713249074565
+      },
+      {
+        "workload": "group_16",
+        "clients": 1,
+        "arms": {
+          "before": {
+            "ops_s": 1309.1449125099646,
+            "p99_ms": 1.022792
+          },
+          "after": {
+            "ops_s": 1194.7325136113855,
+            "p99_ms": 1.042521
+          },
+          "crdb": {
+            "ops_s": 2615.236655658213,
+            "p99_ms": 0.6586665
+          }
+        },
+        "throughput_vs_before": 0.9126052449921519,
+        "p99_vs_before": 1.0192893569758075,
+        "throughput_vs_crdb": 0.4568353349692135,
+        "p99_vs_crdb": 1.5827751980706473
+      },
+      {
+        "workload": "group_16",
+        "clients": 8,
+        "arms": {
+          "before": {
+            "ops_s": 8693.99922364739,
+            "p99_ms": 2.1207085
+          },
+          "after": {
+            "ops_s": 7666.996971374978,
+            "p99_ms": 1.963083
+          },
+          "crdb": {
+            "ops_s": 14920.557700813544,
+            "p99_ms": 1.1466045
+          }
+        },
+        "throughput_vs_before": 0.8818722861765389,
+        "p99_vs_before": 0.9256731889366218,
+        "throughput_vs_crdb": 0.5138545840653754,
+        "p99_vs_crdb": 1.712083809194888
+      },
+      {
+        "workload": "update_existing",
+        "clients": 1,
+        "arms": {
+          "before": {
+            "ops_s": 654.347579254159,
+            "p99_ms": 9.622
+          },
+          "after": {
+            "ops_s": 748.3715656759314,
+            "p99_ms": 6.7199585
+          },
+          "crdb": {
+            "ops_s": 1293.3918099057096,
+            "p99_ms": 1.1677915
+          }
+        },
+        "throughput_vs_before": 1.1436911962430474,
+        "p99_vs_before": 0.6983951881105799,
+        "throughput_vs_crdb": 0.5786116472552033,
+        "p99_vs_crdb": 5.754416349151367
+      },
+      {
+        "workload": "update_existing",
+        "clients": 8,
+        "arms": {
+          "before": {
+            "ops_s": 2693.2641132789995,
+            "p99_ms": 14.516979
+          },
+          "after": {
+            "ops_s": 2325.406889642377,
+            "p99_ms": 19.838271
+          },
+          "crdb": {
+            "ops_s": 6125.72218776039,
+            "p99_ms": 2.1175
+          }
+        },
+        "throughput_vs_before": 0.8634158373763191,
+        "p99_vs_before": 1.3665564302324884,
+        "throughput_vs_crdb": 0.3796135081490797,
+        "p99_vs_crdb": 9.368723022432112
+      }
+    ]
+  },
+  "locality": [
+    {
+      "order": "before-first",
+      "arm": "before",
+      "class": "reads",
+      "successful_operations": 17600,
+      "counters": {
+        "checkpoint_queue_rejected": 0,
+        "checkpoint_queue_submissions": 0,
+        "checkpoint_queue_wait_ns": 0,
+        "checkpoint_service_ns": 0,
+        "failed_waves": 0,
+        "gateway_legacy_calls": 1839,
+        "gateway_local_calls": 17600,
+        "gateway_remote_calls": 1839,
+        "gateway_semantic_sql_calls": 17600,
+        "gateway_sql_request_encoded_bytes": 0,
+        "gateway_sql_request_encodings": 0,
+        "multi_group_waves": 0,
+        "native_accepted": 0,
+        "native_failed": 0,
+        "native_rejected": 0,
+        "native_semantic_dispatches": 17600,
+        "observed_append_barriers": 23,
+        "ready_durable_waves": 23,
+        "ready_waves": 23,
+        "remote_dials": 0,
+        "remote_handshake_failures": 0,
+        "remote_poisoned": 0,
+        "remote_rejected": 0,
+        "remote_reuses": 1839
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "before",
+      "class": "updates",
+      "successful_operations": 8000,
+      "counters": {
+        "checkpoint_queue_rejected": 0,
+        "checkpoint_queue_submissions": 0,
+        "checkpoint_queue_wait_ns": 0,
+        "checkpoint_service_ns": 0,
+        "failed_waves": 0,
+        "gateway_legacy_calls": 23440,
+        "gateway_local_calls": 17602,
+        "gateway_remote_calls": 5838,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encoded_bytes": 0,
+        "gateway_sql_request_encodings": 0,
+        "multi_group_waves": 51,
+        "native_accepted": 0,
+        "native_failed": 5,
+        "native_rejected": 0,
+        "native_semantic_dispatches": 17602,
+        "observed_append_barriers": 31616,
+        "ready_durable_waves": 31616,
+        "ready_waves": 31616,
+        "remote_dials": 0,
+        "remote_handshake_failures": 0,
+        "remote_poisoned": 0,
+        "remote_rejected": 0,
+        "remote_reuses": 5838
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "class": "reads",
+      "successful_operations": 17600,
+      "counters": {
+        "checkpoint_queue_rejected": 0,
+        "checkpoint_queue_submissions": 0,
+        "checkpoint_queue_wait_ns": 0,
+        "checkpoint_service_ns": 0,
+        "failed_waves": 0,
+        "gateway_legacy_calls": 1970,
+        "gateway_local_calls": 17600,
+        "gateway_remote_calls": 1970,
+        "gateway_semantic_sql_calls": 17600,
+        "gateway_sql_request_encoded_bytes": 0,
+        "gateway_sql_request_encodings": 0,
+        "multi_group_waves": 0,
+        "native_accepted": 0,
+        "native_failed": 0,
+        "native_rejected": 0,
+        "native_semantic_dispatches": 17600,
+        "observed_append_barriers": 21,
+        "ready_durable_waves": 21,
+        "ready_waves": 21,
+        "remote_dials": 0,
+        "remote_handshake_failures": 0,
+        "remote_poisoned": 0,
+        "remote_rejected": 0,
+        "remote_reuses": 1970
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "class": "updates",
+      "successful_operations": 8000,
+      "counters": {
+        "checkpoint_queue_rejected": 0,
+        "checkpoint_queue_submissions": 0,
+        "checkpoint_queue_wait_ns": 0,
+        "checkpoint_service_ns": 0,
+        "failed_waves": 0,
+        "gateway_legacy_calls": 23569,
+        "gateway_local_calls": 17508,
+        "gateway_remote_calls": 6061,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encoded_bytes": 0,
+        "gateway_sql_request_encodings": 0,
+        "multi_group_waves": 51,
+        "native_accepted": 0,
+        "native_failed": 4,
+        "native_rejected": 0,
+        "native_semantic_dispatches": 17508,
+        "observed_append_barriers": 30780,
+        "ready_durable_waves": 30780,
+        "ready_waves": 30780,
+        "remote_dials": 0,
+        "remote_handshake_failures": 0,
+        "remote_poisoned": 0,
+        "remote_rejected": 0,
+        "remote_reuses": 6061
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "class": "reads",
+      "successful_operations": 17600,
+      "counters": {
+        "checkpoint_queue_rejected": 0,
+        "checkpoint_queue_submissions": 0,
+        "checkpoint_queue_wait_ns": 0,
+        "checkpoint_service_ns": 0,
+        "failed_waves": 0,
+        "gateway_legacy_calls": 2408,
+        "gateway_local_calls": 0,
+        "gateway_remote_calls": 20008,
+        "gateway_semantic_sql_calls": 17600,
+        "gateway_sql_request_encoded_bytes": 4072800,
+        "gateway_sql_request_encodings": 17600,
+        "multi_group_waves": 0,
+        "native_accepted": 7,
+        "native_failed": 0,
+        "native_rejected": 0,
+        "native_semantic_dispatches": 0,
+        "observed_append_barriers": 22,
+        "ready_durable_waves": 22,
+        "ready_waves": 22,
+        "remote_dials": 7,
+        "remote_handshake_failures": 0,
+        "remote_poisoned": 0,
+        "remote_rejected": 0,
+        "remote_reuses": 20001
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "class": "updates",
+      "successful_operations": 8000,
+      "counters": {
+        "checkpoint_queue_rejected": 0,
+        "checkpoint_queue_submissions": 0,
+        "checkpoint_queue_wait_ns": 0,
+        "checkpoint_service_ns": 0,
+        "failed_waves": 0,
+        "gateway_legacy_calls": 21162,
+        "gateway_local_calls": 0,
+        "gateway_remote_calls": 21162,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encoded_bytes": 0,
+        "gateway_sql_request_encodings": 0,
+        "multi_group_waves": 32,
+        "native_accepted": 0,
+        "native_failed": 1,
+        "native_rejected": 0,
+        "native_semantic_dispatches": 0,
+        "observed_append_barriers": 30073,
+        "ready_durable_waves": 30073,
+        "ready_waves": 30073,
+        "remote_dials": 0,
+        "remote_handshake_failures": 0,
+        "remote_poisoned": 0,
+        "remote_rejected": 0,
+        "remote_reuses": 21162
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "class": "reads",
+      "successful_operations": 17600,
+      "counters": {
+        "checkpoint_queue_rejected": 0,
+        "checkpoint_queue_submissions": 0,
+        "checkpoint_queue_wait_ns": 0,
+        "checkpoint_service_ns": 0,
+        "failed_waves": 0,
+        "gateway_legacy_calls": 1954,
+        "gateway_local_calls": 19554,
+        "gateway_remote_calls": 0,
+        "gateway_semantic_sql_calls": 17600,
+        "gateway_sql_request_encoded_bytes": 0,
+        "gateway_sql_request_encodings": 0,
+        "multi_group_waves": 0,
+        "native_accepted": 0,
+        "native_failed": 0,
+        "native_rejected": 0,
+        "native_semantic_dispatches": 19554,
+        "observed_append_barriers": 16,
+        "ready_durable_waves": 16,
+        "ready_waves": 16,
+        "remote_dials": 0,
+        "remote_handshake_failures": 0,
+        "remote_poisoned": 0,
+        "remote_rejected": 0,
+        "remote_reuses": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "class": "updates",
+      "successful_operations": 8000,
+      "counters": {
+        "checkpoint_queue_rejected": 0,
+        "checkpoint_queue_submissions": 0,
+        "checkpoint_queue_wait_ns": 0,
+        "checkpoint_service_ns": 0,
+        "failed_waves": 0,
+        "gateway_legacy_calls": 22778,
+        "gateway_local_calls": 22778,
+        "gateway_remote_calls": 0,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encoded_bytes": 0,
+        "gateway_sql_request_encodings": 0,
+        "multi_group_waves": 32,
+        "native_accepted": 0,
+        "native_failed": 4,
+        "native_rejected": 0,
+        "native_semantic_dispatches": 22778,
+        "observed_append_barriers": 30384,
+        "ready_durable_waves": 30384,
+        "ready_waves": 30384,
+        "remote_dials": 0,
+        "remote_handshake_failures": 0,
+        "remote_poisoned": 0,
+        "remote_rejected": 0,
+        "remote_reuses": 0
+      }
+    }
+  ],
+  "updates": [
+    {
+      "order": "before-first",
+      "arm": "before",
+      "clients": 1,
+      "successful_updates": 4000,
+      "counters": {
+        "checkpoint_queue_rejected": 0,
+        "checkpoint_queue_submissions": 0,
+        "checkpoint_queue_wait_ns": 0,
+        "checkpoint_service_ns": 0,
+        "failed_waves": 0,
+        "gateway_legacy_calls": 12367,
+        "gateway_local_calls": 8000,
+        "gateway_remote_calls": 4367,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encoded_bytes": 0,
+        "gateway_sql_request_encodings": 0,
+        "multi_group_waves": 11,
+        "native_accepted": 0,
+        "native_failed": 0,
+        "native_rejected": 0,
+        "native_semantic_dispatches": 8000,
+        "observed_append_barriers": 25386,
+        "ready_durable_waves": 25386,
+        "ready_waves": 25386,
+        "remote_dials": 0,
+        "remote_handshake_failures": 0,
+        "remote_poisoned": 0,
+        "remote_rejected": 0,
+        "remote_reuses": 4367
+      },
+      "cluster_barriers_per_update": 6.3465
+    },
+    {
+      "order": "before-first",
+      "arm": "before",
+      "clients": 8,
+      "successful_updates": 4000,
+      "counters": {
+        "checkpoint_queue_rejected": 0,
+        "checkpoint_queue_submissions": 0,
+        "checkpoint_queue_wait_ns": 0,
+        "checkpoint_service_ns": 0,
+        "failed_waves": 0,
+        "gateway_legacy_calls": 11073,
+        "gateway_local_calls": 9602,
+        "gateway_remote_calls": 1471,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encoded_bytes": 0,
+        "gateway_sql_request_encodings": 0,
+        "multi_group_waves": 40,
+        "native_accepted": 0,
+        "native_failed": 5,
+        "native_rejected": 0,
+        "native_semantic_dispatches": 9602,
+        "observed_append_barriers": 6230,
+        "ready_durable_waves": 6230,
+        "ready_waves": 6230,
+        "remote_dials": 0,
+        "remote_handshake_failures": 0,
+        "remote_poisoned": 0,
+        "remote_rejected": 0,
+        "remote_reuses": 1471
+      },
+      "cluster_barriers_per_update": 1.5575
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "clients": 1,
+      "successful_updates": 4000,
+      "counters": {
+        "checkpoint_queue_rejected": 0,
+        "checkpoint_queue_submissions": 0,
+        "checkpoint_queue_wait_ns": 0,
+        "checkpoint_service_ns": 0,
+        "failed_waves": 0,
+        "gateway_legacy_calls": 12911,
+        "gateway_local_calls": 8001,
+        "gateway_remote_calls": 4910,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encoded_bytes": 0,
+        "gateway_sql_request_encodings": 0,
+        "multi_group_waves": 7,
+        "native_accepted": 0,
+        "native_failed": 4,
+        "native_rejected": 0,
+        "native_semantic_dispatches": 8001,
+        "observed_append_barriers": 25292,
+        "ready_durable_waves": 25292,
+        "ready_waves": 25292,
+        "remote_dials": 0,
+        "remote_handshake_failures": 0,
+        "remote_poisoned": 0,
+        "remote_rejected": 0,
+        "remote_reuses": 4910
+      },
+      "cluster_barriers_per_update": 6.323
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "clients": 8,
+      "successful_updates": 4000,
+      "counters": {
+        "checkpoint_queue_rejected": 0,
+        "checkpoint_queue_submissions": 0,
+        "checkpoint_queue_wait_ns": 0,
+        "checkpoint_service_ns": 0,
+        "failed_waves": 0,
+        "gateway_legacy_calls": 10658,
+        "gateway_local_calls": 9507,
+        "gateway_remote_calls": 1151,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encoded_bytes": 0,
+        "gateway_sql_request_encodings": 0,
+        "multi_group_waves": 44,
+        "native_accepted": 0,
+        "native_failed": 0,
+        "native_rejected": 0,
+        "native_semantic_dispatches": 9507,
+        "observed_append_barriers": 5488,
+        "ready_durable_waves": 5488,
+        "ready_waves": 5488,
+        "remote_dials": 0,
+        "remote_handshake_failures": 0,
+        "remote_poisoned": 0,
+        "remote_rejected": 0,
+        "remote_reuses": 1151
+      },
+      "cluster_barriers_per_update": 1.372
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "clients": 1,
+      "successful_updates": 4000,
+      "counters": {
+        "checkpoint_queue_rejected": 0,
+        "checkpoint_queue_submissions": 0,
+        "checkpoint_queue_wait_ns": 0,
+        "checkpoint_service_ns": 0,
+        "failed_waves": 0,
+        "gateway_legacy_calls": 11485,
+        "gateway_local_calls": 0,
+        "gateway_remote_calls": 11485,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encoded_bytes": 0,
+        "gateway_sql_request_encodings": 0,
+        "multi_group_waves": 1,
+        "native_accepted": 0,
+        "native_failed": 0,
+        "native_rejected": 0,
+        "native_semantic_dispatches": 0,
+        "observed_append_barriers": 24255,
+        "ready_durable_waves": 24255,
+        "ready_waves": 24255,
+        "remote_dials": 0,
+        "remote_handshake_failures": 0,
+        "remote_poisoned": 0,
+        "remote_rejected": 0,
+        "remote_reuses": 11485
+      },
+      "cluster_barriers_per_update": 6.06375
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "clients": 8,
+      "successful_updates": 4000,
+      "counters": {
+        "checkpoint_queue_rejected": 0,
+        "checkpoint_queue_submissions": 0,
+        "checkpoint_queue_wait_ns": 0,
+        "checkpoint_service_ns": 0,
+        "failed_waves": 0,
+        "gateway_legacy_calls": 9677,
+        "gateway_local_calls": 0,
+        "gateway_remote_calls": 9677,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encoded_bytes": 0,
+        "gateway_sql_request_encodings": 0,
+        "multi_group_waves": 31,
+        "native_accepted": 0,
+        "native_failed": 1,
+        "native_rejected": 0,
+        "native_semantic_dispatches": 0,
+        "observed_append_barriers": 5818,
+        "ready_durable_waves": 5818,
+        "ready_waves": 5818,
+        "remote_dials": 0,
+        "remote_handshake_failures": 0,
+        "remote_poisoned": 0,
+        "remote_rejected": 0,
+        "remote_reuses": 9677
+      },
+      "cluster_barriers_per_update": 1.4545
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "clients": 1,
+      "successful_updates": 4000,
+      "counters": {
+        "checkpoint_queue_rejected": 0,
+        "checkpoint_queue_submissions": 0,
+        "checkpoint_queue_wait_ns": 0,
+        "checkpoint_service_ns": 0,
+        "failed_waves": 0,
+        "gateway_legacy_calls": 12008,
+        "gateway_local_calls": 12008,
+        "gateway_remote_calls": 0,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encoded_bytes": 0,
+        "gateway_sql_request_encodings": 0,
+        "multi_group_waves": 14,
+        "native_accepted": 0,
+        "native_failed": 0,
+        "native_rejected": 0,
+        "native_semantic_dispatches": 12008,
+        "observed_append_barriers": 24944,
+        "ready_durable_waves": 24944,
+        "ready_waves": 24944,
+        "remote_dials": 0,
+        "remote_handshake_failures": 0,
+        "remote_poisoned": 0,
+        "remote_rejected": 0,
+        "remote_reuses": 0
+      },
+      "cluster_barriers_per_update": 6.236
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "clients": 8,
+      "successful_updates": 4000,
+      "counters": {
+        "checkpoint_queue_rejected": 0,
+        "checkpoint_queue_submissions": 0,
+        "checkpoint_queue_wait_ns": 0,
+        "checkpoint_service_ns": 0,
+        "failed_waves": 0,
+        "gateway_legacy_calls": 10770,
+        "gateway_local_calls": 10770,
+        "gateway_remote_calls": 0,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encoded_bytes": 0,
+        "gateway_sql_request_encodings": 0,
+        "multi_group_waves": 18,
+        "native_accepted": 0,
+        "native_failed": 4,
+        "native_rejected": 0,
+        "native_semantic_dispatches": 10770,
+        "observed_append_barriers": 5440,
+        "ready_durable_waves": 5440,
+        "ready_waves": 5440,
+        "remote_dials": 0,
+        "remote_handshake_failures": 0,
+        "remote_poisoned": 0,
+        "remote_rejected": 0,
+        "remote_reuses": 0
+      },
+      "cluster_barriers_per_update": 1.36
+    }
+  ],
+  "health_log_evidence": {
+    "before-first/before": {
+      "path": "baseline-c1-c8/before-first/before/candidate-server.log",
+      "sha256": "b80a39b223cd6b3fe5db095a96b1804639d80e39117a4a45e0bfa2084794a847",
+      "publication_log_lines": 37,
+      "configuration_warning_lines": [
+        149,
+        159,
+        160
+      ],
+      "ineligible_replacement_log_lines": 16
+    },
+    "before-first/after": {
+      "path": "baseline-c1-c8/before-first/after/candidate-server.log",
+      "sha256": "6d562370fe88badd280bff287494d16961d4aafb595512ce0e64502db6f0d990",
+      "publication_log_lines": 23,
+      "configuration_warning_lines": [
+        133,
+        144,
+        148,
+        152
+      ],
+      "ineligible_replacement_log_lines": 10
+    },
+    "after-first/after": {
+      "path": "baseline-c1-c8/after-first/after/candidate-server.log",
+      "sha256": "8b4b8e2bc03291846e7184e5407ac12922e8dd9250467f457704bebed255f316",
+      "publication_log_lines": 6,
+      "configuration_warning_lines": [
+        223
+      ],
+      "ineligible_replacement_log_lines": 6
+    },
+    "after-first/before": {
+      "path": "baseline-c1-c8/after-first/before/candidate-server.log",
+      "sha256": "a1c2f103236926e5573fe5556f48bbc2fc4d74ce35acebf999b99d9d2050d00b",
+      "publication_log_lines": 21,
+      "configuration_warning_lines": [
+        102,
+        107,
+        108,
+        111,
+        112,
+        127,
+        134
+      ],
+      "ineligible_replacement_log_lines": 8
+    }
+  },
+  "qualification": "Short diagnostic only; do not pool localities or claim full promotion, multigroup/scaling qualification, sustained checkpoint performance or the full 2x CRDB objective.",
+  "excluded_other_campaigns": true,
+  "campaign_interpretation": [
+    "Storage-only compact-column-batch campaign; the recorded patch contains only store/durable/store_file_primary_batch.go and its patch test. The private gateway update change is excluded.",
+    "Observed after/before geomeans are 0.884203 before-first and 0.851836 after-first. After/CRDB geomeans are 0.452450 and 0.436082. This campaign does not demonstrate a reliable overall benefit, and measurement guardrails fail.",
+    "Before-first uses local semantic SQL for every before and after read trial. After-first is placement-confounded: every after read is remote (one SQL encoding per operation), every before read is local (zero SQL encodings). Keep these orders separate; the second-order losses cannot be assigned solely to source changes.",
+    "The first-order read bursts do not have an observed locality change: after range C8 repetition 1 runs at 5476 ops/s versus 13223 for repetition 2; after group C1 repetition 2 runs at 648 versus 1253 for repetition 1; after group C8 repetition 1 runs at 3203 versus 7825 for repetition 2. These three slow trials each have 200 local semantic SQL calls, no SQL encodes, zero append barriers, zero remote dials and zero native failures. Their cause is unresolved; they remain in all medians and guardrail evaluations.",
+    "Retained matching Raft transition lines show startup elections to term 2 before the first timed trial in every VibeDB fixture. No transition during timing was observed. Second-resolution bounded logs and missing per-trial leader/term gauges prevent proving continuous leader identity or attributing individual stalls to leadership.",
+    "Before-first update ratios are C1 0.843204 and C8 1.340035; after-first they are C1 1.143691 and C8 0.863416. No stable write speedup is reproduced across orderings.",
+    "Both CRDB fixtures required forced shutdown after measurement, with one process exiting 137 in each; VibeDB fixtures stopped without force and exited 0. No durability/recovery qualification is implied.",
+    "The earlier failed Docker bootstrap has an empty runs list and contributes zero trials or samples. Only the completed run2 campaign is analyzed."
+  ],
+  "per_trial_locality_and_counters": [
+    {
+      "order": "before-first",
+      "arm": "before",
+      "workload": "point_hit",
+      "clients": 1,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:28:00.780811588Z",
+      "elapsed_ns": 478426583,
+      "successful_ops_per_second": 4180.369718293851,
+      "p99_ns": 405792,
+      "counters": {
+        "gateway_local_calls": 2000,
+        "gateway_remote_calls": 308,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "before",
+      "workload": "point_hit",
+      "clients": 1,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:28:01.305549588Z",
+      "elapsed_ns": 444475917,
+      "successful_ops_per_second": 4499.681362938726,
+      "p99_ns": 423334,
+      "counters": {
+        "gateway_local_calls": 2000,
+        "gateway_remote_calls": 256,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "before",
+      "workload": "point_hit",
+      "clients": 8,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:28:01.795895255Z",
+      "elapsed_ns": 92777875,
+      "successful_ops_per_second": 21556.86363801715,
+      "p99_ns": 791292,
+      "counters": {
+        "gateway_local_calls": 2000,
+        "gateway_remote_calls": 64,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "before",
+      "workload": "point_hit",
+      "clients": 8,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:28:01.93434038Z",
+      "elapsed_ns": 92344875,
+      "successful_ops_per_second": 21657.9425766725,
+      "p99_ns": 789791,
+      "counters": {
+        "gateway_local_calls": 2000,
+        "gateway_remote_calls": 64,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "before",
+      "workload": "point_miss",
+      "clients": 1,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:28:02.074305672Z",
+      "elapsed_ns": 416385833,
+      "successful_ops_per_second": 4803.237385840646,
+      "p99_ns": 335875,
+      "counters": {
+        "gateway_local_calls": 2000,
+        "gateway_remote_calls": 335,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 8,
+        "ready_waves": 8,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "before",
+      "workload": "point_miss",
+      "clients": 1,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:28:02.540745088Z",
+      "elapsed_ns": 453447917,
+      "successful_ops_per_second": 4410.6498784512005,
+      "p99_ns": 376084,
+      "counters": {
+        "gateway_local_calls": 2000,
+        "gateway_remote_calls": 320,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "before",
+      "workload": "point_miss",
+      "clients": 8,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:28:03.053684589Z",
+      "elapsed_ns": 92464292,
+      "successful_ops_per_second": 21629.97149213017,
+      "p99_ns": 666333,
+      "counters": {
+        "gateway_local_calls": 2000,
+        "gateway_remote_calls": 64,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "before",
+      "workload": "point_miss",
+      "clients": 8,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:28:03.212167964Z",
+      "elapsed_ns": 95432500,
+      "successful_ops_per_second": 20957.221072485787,
+      "p99_ns": 883834,
+      "counters": {
+        "gateway_local_calls": 2000,
+        "gateway_remote_calls": 79,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 6,
+        "ready_waves": 6,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "before",
+      "workload": "range_64",
+      "clients": 1,
+      "repetition": 1,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:28:03.391871922Z",
+      "elapsed_ns": 78703250,
+      "successful_ops_per_second": 2541.191119807632,
+      "p99_ns": 540167,
+      "counters": {
+        "gateway_local_calls": 200,
+        "gateway_remote_calls": 14,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "before",
+      "workload": "range_64",
+      "clients": 1,
+      "repetition": 2,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:28:03.548335797Z",
+      "elapsed_ns": 75892000,
+      "successful_ops_per_second": 2635.3238813050125,
+      "p99_ns": 559250,
+      "counters": {
+        "gateway_local_calls": 200,
+        "gateway_remote_calls": 64,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "before",
+      "workload": "range_64",
+      "clients": 8,
+      "repetition": 1,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:28:03.708616256Z",
+      "elapsed_ns": 13464125,
+      "successful_ops_per_second": 14854.288711668973,
+      "p99_ns": 981917,
+      "counters": {
+        "gateway_local_calls": 200,
+        "gateway_remote_calls": 0,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "before",
+      "workload": "range_64",
+      "clients": 8,
+      "repetition": 2,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:28:03.798706714Z",
+      "elapsed_ns": 13708458,
+      "successful_ops_per_second": 14589.532973001049,
+      "p99_ns": 1441209,
+      "counters": {
+        "gateway_local_calls": 200,
+        "gateway_remote_calls": 0,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "before",
+      "workload": "group_16",
+      "clients": 1,
+      "repetition": 1,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:28:03.929282631Z",
+      "elapsed_ns": 160953501,
+      "successful_ops_per_second": 1242.5949032323317,
+      "p99_ns": 1317584,
+      "counters": {
+        "gateway_local_calls": 200,
+        "gateway_remote_calls": 128,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "before",
+      "workload": "group_16",
+      "clients": 1,
+      "repetition": 2,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:28:04.202971506Z",
+      "elapsed_ns": 153690000,
+      "successful_ops_per_second": 1301.320840653263,
+      "p99_ns": 1069083,
+      "counters": {
+        "gateway_local_calls": 200,
+        "gateway_remote_calls": 79,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 9,
+        "ready_waves": 9,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "before",
+      "workload": "group_16",
+      "clients": 8,
+      "repetition": 1,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:28:04.477090423Z",
+      "elapsed_ns": 24278125,
+      "successful_ops_per_second": 8237.868451538165,
+      "p99_ns": 2094916,
+      "counters": {
+        "gateway_local_calls": 200,
+        "gateway_remote_calls": 64,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "before",
+      "workload": "group_16",
+      "clients": 8,
+      "repetition": 2,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:28:04.622437464Z",
+      "elapsed_ns": 23557167,
+      "successful_ops_per_second": 8489.98523464218,
+      "p99_ns": 2097667,
+      "counters": {
+        "gateway_local_calls": 200,
+        "gateway_remote_calls": 0,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "before",
+      "workload": "update_existing",
+      "clients": 1,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:28:04.824893756Z",
+      "elapsed_ns": 3118117918,
+      "successful_ops_per_second": 641.4125612295077,
+      "p99_ns": 7871292,
+      "counters": {
+        "gateway_local_calls": 4000,
+        "gateway_remote_calls": 2089,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 12691,
+        "ready_waves": 12691,
+        "multi_group_waves": 6,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "before",
+      "workload": "update_existing",
+      "clients": 1,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:28:08.132099591Z",
+      "elapsed_ns": 3354696585,
+      "successful_ops_per_second": 596.1791027369469,
+      "p99_ns": 9315042,
+      "counters": {
+        "gateway_local_calls": 4000,
+        "gateway_remote_calls": 2278,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 12695,
+        "ready_waves": 12695,
+        "multi_group_waves": 5,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "before",
+      "workload": "update_existing",
+      "clients": 8,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:28:11.700681051Z",
+      "elapsed_ns": 1052688209,
+      "successful_ops_per_second": 1899.8977882538436,
+      "p99_ns": 21829083,
+      "counters": {
+        "gateway_local_calls": 4779,
+        "gateway_remote_calls": 761,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 3199,
+        "ready_waves": 3199,
+        "multi_group_waves": 21,
+        "remote_dials": 0,
+        "native_failed": 4
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "before",
+      "workload": "update_existing",
+      "clients": 8,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:28:13.094793927Z",
+      "elapsed_ns": 985637917,
+      "successful_ops_per_second": 2029.1427161075824,
+      "p99_ns": 22484750,
+      "counters": {
+        "gateway_local_calls": 4823,
+        "gateway_remote_calls": 710,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 3031,
+        "ready_waves": 3031,
+        "multi_group_waves": 19,
+        "remote_dials": 0,
+        "native_failed": 1
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "workload": "point_hit",
+      "clients": 1,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:28:27.070049669Z",
+      "elapsed_ns": 525297542,
+      "successful_ops_per_second": 3807.365997535926,
+      "p99_ns": 458167,
+      "counters": {
+        "gateway_local_calls": 2000,
+        "gateway_remote_calls": 320,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "workload": "point_hit",
+      "clients": 1,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:28:27.640985919Z",
+      "elapsed_ns": 497561709,
+      "successful_ops_per_second": 4019.6019183622507,
+      "p99_ns": 543209,
+      "counters": {
+        "gateway_local_calls": 2000,
+        "gateway_remote_calls": 362,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 6,
+        "ready_waves": 6,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "workload": "point_hit",
+      "clients": 8,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:28:28.187089461Z",
+      "elapsed_ns": 94094792,
+      "successful_ops_per_second": 21255.16149714216,
+      "p99_ns": 686125,
+      "counters": {
+        "gateway_local_calls": 2000,
+        "gateway_remote_calls": 64,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "workload": "point_hit",
+      "clients": 8,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:28:28.32866217Z",
+      "elapsed_ns": 95191125,
+      "successful_ops_per_second": 21010.362047932515,
+      "p99_ns": 718917,
+      "counters": {
+        "gateway_local_calls": 2000,
+        "gateway_remote_calls": 66,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "workload": "point_miss",
+      "clients": 1,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:28:28.473042087Z",
+      "elapsed_ns": 450467625,
+      "successful_ops_per_second": 4439.83072035421,
+      "p99_ns": 347542,
+      "counters": {
+        "gateway_local_calls": 2000,
+        "gateway_remote_calls": 256,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "workload": "point_miss",
+      "clients": 1,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:28:28.977248337Z",
+      "elapsed_ns": 456075126,
+      "successful_ops_per_second": 4385.24244358812,
+      "p99_ns": 369584,
+      "counters": {
+        "gateway_local_calls": 2000,
+        "gateway_remote_calls": 305,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 8,
+        "ready_waves": 8,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "workload": "point_miss",
+      "clients": 8,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:28:29.484779837Z",
+      "elapsed_ns": 104059333,
+      "successful_ops_per_second": 19219.80414769716,
+      "p99_ns": 784083,
+      "counters": {
+        "gateway_local_calls": 2000,
+        "gateway_remote_calls": 64,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "workload": "point_miss",
+      "clients": 8,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:28:29.64902167Z",
+      "elapsed_ns": 88974167,
+      "successful_ops_per_second": 22478.434667446785,
+      "p99_ns": 647166,
+      "counters": {
+        "gateway_local_calls": 2000,
+        "gateway_remote_calls": 54,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "workload": "range_64",
+      "clients": 1,
+      "repetition": 1,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:28:29.813311587Z",
+      "elapsed_ns": 73986750,
+      "successful_ops_per_second": 2703.1867192436484,
+      "p99_ns": 566459,
+      "counters": {
+        "gateway_local_calls": 200,
+        "gateway_remote_calls": 64,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "workload": "range_64",
+      "clients": 1,
+      "repetition": 2,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:28:29.965245379Z",
+      "elapsed_ns": 80972041,
+      "successful_ops_per_second": 2469.9883753702097,
+      "p99_ns": 894375,
+      "counters": {
+        "gateway_local_calls": 200,
+        "gateway_remote_calls": 51,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 7,
+        "ready_waves": 7,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "workload": "range_64",
+      "clients": 8,
+      "repetition": 1,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:28:30.154043879Z",
+      "elapsed_ns": 36524792,
+      "successful_ops_per_second": 5475.73275708182,
+      "p99_ns": 5691584,
+      "counters": {
+        "gateway_local_calls": 200,
+        "gateway_remote_calls": 32,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "workload": "range_64",
+      "clients": 8,
+      "repetition": 2,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:28:30.281284129Z",
+      "elapsed_ns": 15125500,
+      "successful_ops_per_second": 13222.70338170639,
+      "p99_ns": 1434208,
+      "counters": {
+        "gateway_local_calls": 200,
+        "gateway_remote_calls": 0,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "workload": "group_16",
+      "clients": 1,
+      "repetition": 1,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:28:30.418622587Z",
+      "elapsed_ns": 159642459,
+      "successful_ops_per_second": 1252.7995450132726,
+      "p99_ns": 1806792,
+      "counters": {
+        "gateway_local_calls": 200,
+        "gateway_remote_calls": 128,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "workload": "group_16",
+      "clients": 1,
+      "repetition": 2,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:28:30.698943796Z",
+      "elapsed_ns": 308780916,
+      "successful_ops_per_second": 647.708422498494,
+      "p99_ns": 7225125,
+      "counters": {
+        "gateway_local_calls": 200,
+        "gateway_remote_calls": 192,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "workload": "group_16",
+      "clients": 8,
+      "repetition": 1,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:28:31.144297588Z",
+      "elapsed_ns": 62447167,
+      "successful_ops_per_second": 3202.7073381887767,
+      "p99_ns": 10222875,
+      "counters": {
+        "gateway_local_calls": 200,
+        "gateway_remote_calls": 12,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "workload": "group_16",
+      "clients": 8,
+      "repetition": 2,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:28:31.350088338Z",
+      "elapsed_ns": 25560125,
+      "successful_ops_per_second": 7824.687868310503,
+      "p99_ns": 2189875,
+      "counters": {
+        "gateway_local_calls": 200,
+        "gateway_remote_calls": 0,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "workload": "update_existing",
+      "clients": 1,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:28:31.545137171Z",
+      "elapsed_ns": 3674138044,
+      "successful_ops_per_second": 544.3453610204091,
+      "p99_ns": 14355625,
+      "counters": {
+        "gateway_local_calls": 4000,
+        "gateway_remote_calls": 2263,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 12497,
+        "ready_waves": 12497,
+        "multi_group_waves": 2,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "workload": "update_existing",
+      "clients": 1,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:28:35.41564159Z",
+      "elapsed_ns": 4006434294,
+      "successful_ops_per_second": 499.1970049265957,
+      "p99_ns": 8286250,
+      "counters": {
+        "gateway_local_calls": 4001,
+        "gateway_remote_calls": 2647,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 12795,
+        "ready_waves": 12795,
+        "multi_group_waves": 5,
+        "remote_dials": 0,
+        "native_failed": 4
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "workload": "update_existing",
+      "clients": 8,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:28:39.5954728Z",
+      "elapsed_ns": 720462958,
+      "successful_ops_per_second": 2775.9928221042555,
+      "p99_ns": 11261667,
+      "counters": {
+        "gateway_local_calls": 4778,
+        "gateway_remote_calls": 530,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 2702,
+        "ready_waves": 2702,
+        "multi_group_waves": 19,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "workload": "update_existing",
+      "clients": 8,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:28:40.600260176Z",
+      "elapsed_ns": 803515917,
+      "successful_ops_per_second": 2489.0608358664285,
+      "p99_ns": 15717458,
+      "counters": {
+        "gateway_local_calls": 4729,
+        "gateway_remote_calls": 621,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 2786,
+        "ready_waves": 2786,
+        "multi_group_waves": 25,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "workload": "point_hit",
+      "clients": 1,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:30:51.030512375Z",
+      "elapsed_ns": 539903292,
+      "successful_ops_per_second": 3704.367114694311,
+      "p99_ns": 434041,
+      "counters": {
+        "gateway_local_calls": 2399,
+        "gateway_remote_calls": 0,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 6,
+        "ready_waves": 6,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "workload": "point_hit",
+      "clients": 1,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:30:51.616058083Z",
+      "elapsed_ns": 472376250,
+      "successful_ops_per_second": 4233.9131148104925,
+      "p99_ns": 356500,
+      "counters": {
+        "gateway_local_calls": 2320,
+        "gateway_remote_calls": 0,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "workload": "point_hit",
+      "clients": 8,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:30:52.135618208Z",
+      "elapsed_ns": 99328292,
+      "successful_ops_per_second": 20135.250085645286,
+      "p99_ns": 740000,
+      "counters": {
+        "gateway_local_calls": 2070,
+        "gateway_remote_calls": 0,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "workload": "point_hit",
+      "clients": 8,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:30:52.287667292Z",
+      "elapsed_ns": 102787458,
+      "successful_ops_per_second": 19457.626824471135,
+      "p99_ns": 1146709,
+      "counters": {
+        "gateway_local_calls": 2064,
+        "gateway_remote_calls": 0,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "workload": "point_miss",
+      "clients": 1,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:30:52.439892709Z",
+      "elapsed_ns": 445258250,
+      "successful_ops_per_second": 4491.775278728693,
+      "p99_ns": 313916,
+      "counters": {
+        "gateway_local_calls": 2335,
+        "gateway_remote_calls": 0,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 10,
+        "ready_waves": 10,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "workload": "point_miss",
+      "clients": 1,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:30:52.937686834Z",
+      "elapsed_ns": 441180208,
+      "successful_ops_per_second": 4533.294929676446,
+      "p99_ns": 325459,
+      "counters": {
+        "gateway_local_calls": 2320,
+        "gateway_remote_calls": 0,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "workload": "point_miss",
+      "clients": 8,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:30:53.432543792Z",
+      "elapsed_ns": 91546667,
+      "successful_ops_per_second": 21846.7811613502,
+      "p99_ns": 611209,
+      "counters": {
+        "gateway_local_calls": 2064,
+        "gateway_remote_calls": 0,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "workload": "point_miss",
+      "clients": 8,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:30:53.587316126Z",
+      "elapsed_ns": 95311583,
+      "successful_ops_per_second": 20983.808442254074,
+      "p99_ns": 738542,
+      "counters": {
+        "gateway_local_calls": 2064,
+        "gateway_remote_calls": 0,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "workload": "range_64",
+      "clients": 1,
+      "repetition": 1,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:30:53.758724543Z",
+      "elapsed_ns": 77039250,
+      "successful_ops_per_second": 2596.0792712805483,
+      "p99_ns": 501416,
+      "counters": {
+        "gateway_local_calls": 212,
+        "gateway_remote_calls": 0,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "workload": "range_64",
+      "clients": 1,
+      "repetition": 2,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:30:53.914152293Z",
+      "elapsed_ns": 73608083,
+      "successful_ops_per_second": 2717.0929040496812,
+      "p99_ns": 499500,
+      "counters": {
+        "gateway_local_calls": 264,
+        "gateway_remote_calls": 0,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "workload": "range_64",
+      "clients": 8,
+      "repetition": 1,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:30:54.066278959Z",
+      "elapsed_ns": 14483750,
+      "successful_ops_per_second": 13808.57857944248,
+      "p99_ns": 911166,
+      "counters": {
+        "gateway_local_calls": 200,
+        "gateway_remote_calls": 0,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "workload": "range_64",
+      "clients": 8,
+      "repetition": 2,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:30:54.158629334Z",
+      "elapsed_ns": 14467458,
+      "successful_ops_per_second": 13824.12860642139,
+      "p99_ns": 1160084,
+      "counters": {
+        "gateway_local_calls": 200,
+        "gateway_remote_calls": 0,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "workload": "group_16",
+      "clients": 1,
+      "repetition": 1,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:30:54.290667251Z",
+      "elapsed_ns": 150711542,
+      "successful_ops_per_second": 1327.0383763972104,
+      "p99_ns": 874209,
+      "counters": {
+        "gateway_local_calls": 314,
+        "gateway_remote_calls": 0,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "workload": "group_16",
+      "clients": 1,
+      "repetition": 2,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:30:54.563186918Z",
+      "elapsed_ns": 154888500,
+      "successful_ops_per_second": 1291.2514486227187,
+      "p99_ns": 1171375,
+      "counters": {
+        "gateway_local_calls": 264,
+        "gateway_remote_calls": 0,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "workload": "group_16",
+      "clients": 8,
+      "repetition": 1,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:30:54.836592668Z",
+      "elapsed_ns": 23142083,
+      "successful_ops_per_second": 8642.26439772081,
+      "p99_ns": 1786209,
+      "counters": {
+        "gateway_local_calls": 264,
+        "gateway_remote_calls": 0,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "workload": "group_16",
+      "clients": 8,
+      "repetition": 2,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:30:54.974113293Z",
+      "elapsed_ns": 22868292,
+      "successful_ops_per_second": 8745.73404957397,
+      "p99_ns": 2455208,
+      "counters": {
+        "gateway_local_calls": 200,
+        "gateway_remote_calls": 0,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "workload": "update_existing",
+      "clients": 1,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:30:55.178050043Z",
+      "elapsed_ns": 3012700085,
+      "successful_ops_per_second": 663.8563227577298,
+      "p99_ns": 10639333,
+      "counters": {
+        "gateway_local_calls": 5981,
+        "gateway_remote_calls": 0,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 12454,
+        "ready_waves": 12454,
+        "multi_group_waves": 8,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "workload": "update_existing",
+      "clients": 1,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:30:58.386411336Z",
+      "elapsed_ns": 3101550169,
+      "successful_ops_per_second": 644.8388357505883,
+      "p99_ns": 8604667,
+      "counters": {
+        "gateway_local_calls": 6027,
+        "gateway_remote_calls": 0,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 12490,
+        "ready_waves": 12490,
+        "multi_group_waves": 6,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "workload": "update_existing",
+      "clients": 8,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:31:01.680913046Z",
+      "elapsed_ns": 643711584,
+      "successful_ops_per_second": 3106.9815266832297,
+      "p99_ns": 9670833,
+      "counters": {
+        "gateway_local_calls": 5331,
+        "gateway_remote_calls": 0,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 2442,
+        "ready_waves": 2442,
+        "multi_group_waves": 5,
+        "remote_dials": 0,
+        "native_failed": 2
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "workload": "update_existing",
+      "clients": 8,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:31:02.67184713Z",
+      "elapsed_ns": 877367417,
+      "successful_ops_per_second": 2279.546699874769,
+      "p99_ns": 19363125,
+      "counters": {
+        "gateway_local_calls": 5439,
+        "gateway_remote_calls": 0,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 2998,
+        "ready_waves": 2998,
+        "multi_group_waves": 13,
+        "remote_dials": 0,
+        "native_failed": 2
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "workload": "point_hit",
+      "clients": 1,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:30:24.929019501Z",
+      "elapsed_ns": 654403167,
+      "successful_ops_per_second": 3056.2199281043518,
+      "p99_ns": 688625,
+      "counters": {
+        "gateway_local_calls": 0,
+        "gateway_remote_calls": 2448,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 2000,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "workload": "point_hit",
+      "clients": 1,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:30:25.630089335Z",
+      "elapsed_ns": 571700792,
+      "successful_ops_per_second": 3498.3334429244587,
+      "p99_ns": 463833,
+      "counters": {
+        "gateway_local_calls": 0,
+        "gateway_remote_calls": 2399,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 2000,
+        "observed_append_barriers": 7,
+        "ready_waves": 7,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "workload": "point_hit",
+      "clients": 8,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:30:26.253290294Z",
+      "elapsed_ns": 124274042,
+      "successful_ops_per_second": 16093.465439870379,
+      "p99_ns": 977291,
+      "counters": {
+        "gateway_local_calls": 0,
+        "gateway_remote_calls": 2128,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 2000,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 7,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "workload": "point_hit",
+      "clients": 8,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:30:26.432235252Z",
+      "elapsed_ns": 120162334,
+      "successful_ops_per_second": 16644.15073695223,
+      "p99_ns": 804458,
+      "counters": {
+        "gateway_local_calls": 0,
+        "gateway_remote_calls": 2064,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 2000,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "workload": "point_miss",
+      "clients": 1,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:30:26.610241836Z",
+      "elapsed_ns": 577773292,
+      "successful_ops_per_second": 3461.565336599186,
+      "p99_ns": 593625,
+      "counters": {
+        "gateway_local_calls": 0,
+        "gateway_remote_calls": 2399,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 2000,
+        "observed_append_barriers": 7,
+        "ready_waves": 7,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "workload": "point_miss",
+      "clients": 1,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:30:27.249666544Z",
+      "elapsed_ns": 606875167,
+      "successful_ops_per_second": 3295.5706688192763,
+      "p99_ns": 821125,
+      "counters": {
+        "gateway_local_calls": 0,
+        "gateway_remote_calls": 2399,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 2000,
+        "observed_append_barriers": 8,
+        "ready_waves": 8,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "workload": "point_miss",
+      "clients": 8,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:30:27.917110836Z",
+      "elapsed_ns": 120707084,
+      "successful_ops_per_second": 16569.035832230027,
+      "p99_ns": 835000,
+      "counters": {
+        "gateway_local_calls": 0,
+        "gateway_remote_calls": 2064,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 2000,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "workload": "point_miss",
+      "clients": 8,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:30:28.103585961Z",
+      "elapsed_ns": 128619000,
+      "successful_ops_per_second": 15549.80212876791,
+      "p99_ns": 840250,
+      "counters": {
+        "gateway_local_calls": 0,
+        "gateway_remote_calls": 2064,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 2000,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "workload": "range_64",
+      "clients": 1,
+      "repetition": 1,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:30:28.319831378Z",
+      "elapsed_ns": 95746042,
+      "successful_ops_per_second": 2088.859192738223,
+      "p99_ns": 724291,
+      "counters": {
+        "gateway_local_calls": 0,
+        "gateway_remote_calls": 264,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 200,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "workload": "range_64",
+      "clients": 1,
+      "repetition": 2,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:30:28.501137128Z",
+      "elapsed_ns": 104346750,
+      "successful_ops_per_second": 1916.6864324955018,
+      "p99_ns": 987084,
+      "counters": {
+        "gateway_local_calls": 0,
+        "gateway_remote_calls": 264,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 200,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "workload": "range_64",
+      "clients": 8,
+      "repetition": 1,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:30:28.68983642Z",
+      "elapsed_ns": 16663583,
+      "successful_ops_per_second": 12002.220650864823,
+      "p99_ns": 1247791,
+      "counters": {
+        "gateway_local_calls": 0,
+        "gateway_remote_calls": 200,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 200,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "workload": "range_64",
+      "clients": 8,
+      "repetition": 2,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:30:28.798022378Z",
+      "elapsed_ns": 16390625,
+      "successful_ops_per_second": 12202.097235462346,
+      "p99_ns": 1111833,
+      "counters": {
+        "gateway_local_calls": 0,
+        "gateway_remote_calls": 200,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 200,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "workload": "group_16",
+      "clients": 1,
+      "repetition": 1,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:30:28.937975712Z",
+      "elapsed_ns": 168013459,
+      "successful_ops_per_second": 1190.380825383757,
+      "p99_ns": 1039125,
+      "counters": {
+        "gateway_local_calls": 0,
+        "gateway_remote_calls": 328,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 200,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "workload": "group_16",
+      "clients": 1,
+      "repetition": 2,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:30:29.227878462Z",
+      "elapsed_ns": 166793958,
+      "successful_ops_per_second": 1199.084201839014,
+      "p99_ns": 1045917,
+      "counters": {
+        "gateway_local_calls": 0,
+        "gateway_remote_calls": 328,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 200,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "workload": "group_16",
+      "clients": 8,
+      "repetition": 1,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:30:29.521206337Z",
+      "elapsed_ns": 25969791,
+      "successful_ops_per_second": 7701.255662781422,
+      "p99_ns": 2040958,
+      "counters": {
+        "gateway_local_calls": 0,
+        "gateway_remote_calls": 200,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 200,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "workload": "group_16",
+      "clients": 8,
+      "repetition": 2,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:30:29.673505587Z",
+      "elapsed_ns": 26202916,
+      "successful_ops_per_second": 7632.738279968535,
+      "p99_ns": 1885208,
+      "counters": {
+        "gateway_local_calls": 0,
+        "gateway_remote_calls": 259,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 200,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "workload": "update_existing",
+      "clients": 1,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:30:29.870852087Z",
+      "elapsed_ns": 2636233293,
+      "successful_ops_per_second": 758.6581981612202,
+      "p99_ns": 6076625,
+      "counters": {
+        "gateway_local_calls": 0,
+        "gateway_remote_calls": 5713,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 12112,
+        "ready_waves": 12112,
+        "multi_group_waves": 1,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "workload": "update_existing",
+      "clients": 1,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:30:32.690835797Z",
+      "elapsed_ns": 2709715251,
+      "successful_ops_per_second": 738.0849331906425,
+      "p99_ns": 7363292,
+      "counters": {
+        "gateway_local_calls": 0,
+        "gateway_remote_calls": 5772,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 12143,
+        "ready_waves": 12143,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "workload": "update_existing",
+      "clients": 8,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:30:35.606229798Z",
+      "elapsed_ns": 845115459,
+      "successful_ops_per_second": 2366.5405462663534,
+      "p99_ns": 18129125,
+      "counters": {
+        "gateway_local_calls": 0,
+        "gateway_remote_calls": 4794,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 2764,
+        "ready_waves": 2764,
+        "multi_group_waves": 12,
+        "remote_dials": 0,
+        "native_failed": 1
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "workload": "update_existing",
+      "clients": 8,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:30:36.936100882Z",
+      "elapsed_ns": 875552001,
+      "successful_ops_per_second": 2284.273233018401,
+      "p99_ns": 21547417,
+      "counters": {
+        "gateway_local_calls": 0,
+        "gateway_remote_calls": 4883,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 3054,
+        "ready_waves": 3054,
+        "multi_group_waves": 19,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    }
+  ],
+  "leader_transition_log_evidence": {
+    "before-first/before": {
+      "path": "baseline-c1-c8/before-first/before/candidate-server.log",
+      "events": [
+        {
+          "line": 6,
+          "text": "raft2026/09/04 16:27:56 INFO: 1 became follower at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 9,
+          "text": "raft2026/09/04 16:27:56 INFO: 1 became follower at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 12,
+          "text": "raft2026/09/04 16:27:56 INFO: 1 became follower at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 15,
+          "text": "raft2026/09/04 16:27:57 INFO: 1 [term: 1] received a MsgVote message with higher term from 3 [term: 2]",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 16,
+          "text": "raft2026/09/04 16:27:57 INFO: 1 became follower at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 18,
+          "text": "raft2026/09/04 16:27:57 INFO: 1 is starting a new election at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 26,
+          "text": "raft2026/09/04 16:27:57 INFO: 1 became candidate at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 33,
+          "text": "raft2026/09/04 16:27:57 INFO: 1 became leader at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 35,
+          "text": "raft2026/09/04 16:27:57 INFO: 1 is starting a new election at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 43,
+          "text": "raft2026/09/04 16:27:57 INFO: 1 became candidate at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 50,
+          "text": "raft2026/09/04 16:27:57 INFO: 1 became leader at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 59,
+          "text": "raft2026/09/04 16:27:57 INFO: 1 became follower at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 63,
+          "text": "raft2026/09/04 16:27:58 INFO: 1 is starting a new election at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 71,
+          "text": "raft2026/09/04 16:27:58 INFO: 1 became candidate at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 78,
+          "text": "raft2026/09/04 16:27:58 INFO: 1 became leader at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        }
+      ],
+      "observed_transition_lines_during_timed_trials": 0,
+      "limitation": "Retained supervisor child logs have second-resolution Raft timestamps and incomplete group labeling. No per-trial leader/term gauge is recorded. Absence of a retained transition is not proof of uninterrupted leadership."
+    },
+    "before-first/after": {
+      "path": "baseline-c1-c8/before-first/after/candidate-server.log",
+      "events": [
+        {
+          "line": 6,
+          "text": "raft2026/09/04 16:28:22 INFO: 1 became follower at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 9,
+          "text": "raft2026/09/04 16:28:22 INFO: 1 became follower at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 12,
+          "text": "raft2026/09/04 16:28:22 INFO: 1 became follower at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 16,
+          "text": "raft2026/09/04 16:28:22 INFO: 1 [term: 1] received a MsgVote message with higher term from 3 [term: 2]",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 17,
+          "text": "raft2026/09/04 16:28:22 INFO: 1 became follower at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 20,
+          "text": "raft2026/09/04 16:28:22 INFO: 1 is starting a new election at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 28,
+          "text": "raft2026/09/04 16:28:22 INFO: 1 became candidate at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 35,
+          "text": "raft2026/09/04 16:28:22 INFO: 1 became leader at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 38,
+          "text": "raft2026/09/04 16:28:23 INFO: 1 [term: 1] received a MsgVote message with higher term from 2 [term: 2]",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 39,
+          "text": "raft2026/09/04 16:28:23 INFO: 1 became follower at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 47,
+          "text": "raft2026/09/04 16:28:23 INFO: 1 became follower at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 50,
+          "text": "raft2026/09/04 16:28:24 INFO: 1 is starting a new election at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 58,
+          "text": "raft2026/09/04 16:28:24 INFO: 1 became candidate at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 65,
+          "text": "raft2026/09/04 16:28:24 INFO: 1 became leader at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        }
+      ],
+      "observed_transition_lines_during_timed_trials": 0,
+      "limitation": "Retained supervisor child logs have second-resolution Raft timestamps and incomplete group labeling. No per-trial leader/term gauge is recorded. Absence of a retained transition is not proof of uninterrupted leadership."
+    },
+    "after-first/before": {
+      "path": "baseline-c1-c8/after-first/before/candidate-server.log",
+      "events": [
+        {
+          "line": 6,
+          "text": "raft2026/09/04 16:30:46 INFO: 1 became follower at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 9,
+          "text": "raft2026/09/04 16:30:46 INFO: 1 became follower at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 12,
+          "text": "raft2026/09/04 16:30:46 INFO: 1 became follower at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 14,
+          "text": "raft2026/09/04 16:30:47 INFO: 1 is starting a new election at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 23,
+          "text": "raft2026/09/04 16:30:47 INFO: 1 became candidate at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 26,
+          "text": "raft2026/09/04 16:30:47 INFO: 1 [term: 1] received a MsgVote message with higher term from 2 [term: 2]",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 27,
+          "text": "raft2026/09/04 16:30:47 INFO: 1 became follower at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 33,
+          "text": "raft2026/09/04 16:30:47 INFO: 1 became leader at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 35,
+          "text": "raft2026/09/04 16:30:47 INFO: 1 [term: 1] received a MsgVote message with higher term from 3 [term: 2]",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 36,
+          "text": "raft2026/09/04 16:30:47 INFO: 1 became follower at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 43,
+          "text": "raft2026/09/04 16:30:47 INFO: 1 became follower at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 47,
+          "text": "raft2026/09/04 16:30:48 INFO: 1 is starting a new election at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 55,
+          "text": "raft2026/09/04 16:30:48 INFO: 1 became candidate at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 62,
+          "text": "raft2026/09/04 16:30:48 INFO: 1 became leader at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        }
+      ],
+      "observed_transition_lines_during_timed_trials": 0,
+      "limitation": "Retained supervisor child logs have second-resolution Raft timestamps and incomplete group labeling. No per-trial leader/term gauge is recorded. Absence of a retained transition is not proof of uninterrupted leadership."
+    },
+    "after-first/after": {
+      "path": "baseline-c1-c8/after-first/after/candidate-server.log",
+      "events": [
+        {
+          "line": 760,
+          "text": "raft2026/09/04 16:30:20 INFO: 2 became follower at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 763,
+          "text": "raft2026/09/04 16:30:20 INFO: 2 became follower at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 766,
+          "text": "raft2026/09/04 16:30:20 INFO: 2 became follower at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 768,
+          "text": "raft2026/09/04 16:30:21 INFO: 2 is starting a new election at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 777,
+          "text": "raft2026/09/04 16:30:21 INFO: 2 became candidate at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 780,
+          "text": "raft2026/09/04 16:30:21 INFO: 2 [term: 1] received a MsgVote message with higher term from 3 [term: 2]",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 783,
+          "text": "raft2026/09/04 16:30:21 INFO: 2 became follower at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 787,
+          "text": "raft2026/09/04 16:30:21 INFO: 2 became leader at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 789,
+          "text": "raft2026/09/04 16:30:21 INFO: 2 [term: 1] received a MsgVote message with higher term from 3 [term: 2]",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 790,
+          "text": "raft2026/09/04 16:30:21 INFO: 2 became follower at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 796,
+          "text": "raft2026/09/04 16:30:22 INFO: 2 became follower at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 799,
+          "text": "raft2026/09/04 16:30:22 INFO: 2 is starting a new election at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 807,
+          "text": "raft2026/09/04 16:30:22 INFO: 2 became candidate at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 814,
+          "text": "raft2026/09/04 16:30:22 INFO: 2 became leader at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        }
+      ],
+      "observed_transition_lines_during_timed_trials": 0,
+      "limitation": "Retained supervisor child logs have second-resolution Raft timestamps and incomplete group labeling. No per-trial leader/term gauge is recorded. Absence of a retained transition is not proof of uninterrupted leadership."
+    }
+  },
+  "excluded_failed_bootstrap": {
+    "directory": "vibedb-storage-short-7aa4f496",
+    "manifest_sha256": "015ca7b5a000bd4ef896231cf15c478c25ff7814d444731915ce7af09f2cfd50",
+    "status": "incomplete-or-failed",
+    "runs": [],
+    "trials_included": 0,
+    "samples_included": 0,
+    "fatal_error": "Command '['docker', 'info', '--format', '{{.Architecture}}']' returned non-zero exit status 1."
+  },
+  "conclusion": "No reliable overall or cross-order write benefit demonstrated. Observed per-order throughput geomeans regress; multiple throughput and p99 guardrails fail. Placement confounds the second ordering, and first-order slow read bursts remain unexplained and included."
+}

@@ -1,0 +1,7 @@
+{
+  "client-count-regression-before.log": "f30f234d03532b62f919f7e54e952d0b2b34b0b7223855dd754a5e52d34ac2a5",
+  "schema-regression-before.log": "c4056419f80f55474e537de0564feea182067679ff327e951517a954852020a8",
+  "client-race.log": "3cc37851237109924cf9e0ed2708101edc3f8e9c0103005a54178486f8d7267b",
+  "python-tests.log": "38128c1dc5308c0c4ab8bc745bbf94a52f25324fa5d8fe04bf7d7f1ad066c2ae",
+  "trial-protocol.log": "6c88f35a20dc94f2385d5d082d17d76cca39ff46bc801d7523cdddd9baee916b"
+}

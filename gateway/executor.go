@@ -259,7 +259,8 @@ func (e *Executor) queryWithProfileValidation(
 	defer leases.release()
 
 	var staleGen uint64
-	for attempt := 0; ; attempt++ {
+	refreshedMiss := false
+	for attempt := 0; ; {
 		if err := opctx.Err(); err != nil {
 			return nil, err
 		}
@@ -285,6 +286,15 @@ func (e *Executor) queryWithProfileValidation(
 		if prepared == nil {
 			prepared, err = snap.Prepare(opctx, q.SQL)
 			if err != nil {
+				if errors.Is(err, ErrTableNotPlaced) && !refreshedMiss {
+					refreshedMiss = true
+					leases.releaseLast()
+					if refreshErr := e.refreshAfterCatalogMiss(opctx, snap.Generation()); refreshErr != nil {
+						return nil, preserveCatalogMiss(err, refreshErr)
+					}
+					staleGen = 0
+					continue
+				}
 				return nil, err
 			}
 			if cache != nil {
@@ -340,6 +350,7 @@ func (e *Executor) queryWithProfileValidation(
 			if isStaleErr(indexErr) && attempt < e.maxRetry {
 				staleGen = snap.Generation()
 				e.metrics.observeRetry()
+				attempt++
 				continue
 			}
 			return nil, indexErr
@@ -368,6 +379,7 @@ func (e *Executor) queryWithProfileValidation(
 		if isStaleErr(err) && attempt < e.maxRetry {
 			staleGen = snap.Generation()
 			e.metrics.observeRetry()
+			attempt++
 			continue
 		}
 		return nil, err
@@ -403,7 +415,8 @@ func (e *Executor) Exec(ctx context.Context, q Query) (*Result, error) {
 	defer leases.release()
 
 	var staleGen uint64
-	for attempt := 0; ; attempt++ {
+	refreshedMiss := false
+	for attempt := 0; ; {
 		if err := opctx.Err(); err != nil {
 			return nil, err
 		}
@@ -414,6 +427,15 @@ func (e *Executor) Exec(ctx context.Context, q Query) (*Result, error) {
 		leases.add(lease)
 		prepared, err := snap.Prepare(opctx, q.SQL)
 		if err != nil {
+			if errors.Is(err, ErrTableNotPlaced) && !refreshedMiss {
+				refreshedMiss = true
+				leases.releaseLast()
+				if refreshErr := e.refreshAfterCatalogMiss(opctx, snap.Generation()); refreshErr != nil {
+					return nil, preserveCatalogMiss(err, refreshErr)
+				}
+				staleGen = 0
+				continue
+			}
 			return nil, err
 		}
 		if prepared.statement.Kind == sqlast.KindSelect {
@@ -439,6 +461,7 @@ func (e *Executor) Exec(ctx context.Context, q Query) (*Result, error) {
 				if isStaleErr(err) && attempt < e.maxRetry {
 					staleGen = snap.Generation()
 					e.metrics.observeRetry()
+					attempt++
 					continue
 				}
 				return nil, err
@@ -483,6 +506,7 @@ func (e *Executor) Exec(ctx context.Context, q Query) (*Result, error) {
 		if isStaleErr(err) && attempt < e.maxRetry {
 			staleGen = snap.Generation()
 			e.metrics.observeRetry()
+			attempt++
 			continue
 		}
 		return nil, err
@@ -701,15 +725,34 @@ func (e *Executor) Explain(ctx context.Context, q Query) (*Explanation, error) {
 	if err != nil {
 		return nil, err
 	}
-	snap, lease, err := e.pin(ctx, 0, 0)
-	if err != nil {
-		return nil, err
+	var snap *Snapshot
+	var lease catalogLease
+	var prepared *PreparedPlan
+	refreshedMiss := false
+	for {
+		snap, lease, err = e.pin(ctx, 0, 0)
+		if err != nil {
+			return nil, err
+		}
+		prepared, err = snap.Prepare(ctx, q.SQL)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, ErrTableNotPlaced) || refreshedMiss {
+			lease.release()
+			return nil, err
+		}
+		refreshedMiss = true
+		staleGeneration := lease.generation
+		lease.release()
+		refreshCtx, cancel := context.WithTimeout(ctx, e.profileFor(q.Class).GlobalDeadline)
+		refreshErr := e.refreshAfterCatalogMiss(refreshCtx, staleGeneration)
+		cancel()
+		if refreshErr != nil {
+			return nil, preserveCatalogMiss(err, refreshErr)
+		}
 	}
 	defer lease.release()
-	prepared, err := snap.Prepare(ctx, q.SQL)
-	if err != nil {
-		return nil, err
-	}
 	if prepared.statement.Kind != sqlast.KindSelect {
 		// Explain is a read-path diagnostic: it plans a distributed SELECT and
 		// never dispatches a mutation, so it refuses non-SELECT statements.
@@ -813,22 +856,9 @@ func (e *Executor) pin(ctx context.Context, attempt int, staleGen uint64) (*Snap
 	if e == nil || e.catalog == nil {
 		return nil, catalogLease{}, ErrNoCatalog
 	}
-	if e.refresh != nil {
-		if attempt > 0 {
-			snap, err := e.refresh(ctx, staleGen)
-			if err != nil {
-				return nil, catalogLease{}, err
-			}
-			if snap == nil || snap.Generation() <= staleGen {
-				return nil, catalogLease{}, ErrStaleGeneration
-			}
-			current := e.catalog.Current()
-			if current == nil || current.Generation() < snap.Generation() {
-				if err := e.catalog.publishNewerChecked(snap); err != nil &&
-					!errors.Is(err, ErrCatalogGenerationNotNewer) {
-					return nil, catalogLease{}, err
-				}
-			}
+	if e.refresh != nil && attempt > 0 && staleGen > 0 {
+		if err := e.catalog.refreshAfter(ctx, staleGen, e.refresh); err != nil {
+			return nil, catalogLease{}, err
 		}
 	}
 	lease := e.catalog.pinCurrent()

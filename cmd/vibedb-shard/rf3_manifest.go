@@ -41,6 +41,7 @@ type rf3Manifest struct {
 	AuthorizationPolicy string
 	ReplicaControl      rf3ManifestReplicaControl
 	SplitControl        rf3ManifestSplitControl
+	Gateway             *rf3ManifestGateway
 	Route               rf3ManifestGroupRoute
 	DevelopmentOnly     bool
 	Members             [rf3ManifestMembers]rf3ManifestMember
@@ -76,6 +77,7 @@ func (manifest rf3Manifest) withGroup(group rf3ManifestGroup) rf3Manifest {
 		TLS: manifest.TLS, AuthorizationPolicy: manifest.AuthorizationPolicy,
 		ReplicaControl: manifest.ReplicaControl,
 		SplitControl:   split, Route: group.Route,
+		Gateway:         manifest.Gateway,
 		DevelopmentOnly: manifest.DevelopmentOnly, Members: group.Members,
 		MemberCount: group.MemberCount, EnrolledTarget: group.EnrolledTarget}
 }
@@ -278,11 +280,23 @@ func parseRF3Manifest(data []byte) (rf3Manifest, error) {
 		if manifest.SplitControl, err = parseRF3ManifestSplitControlMode(node, true); err != nil {
 			return rf3Manifest{}, err
 		}
-		node, err = nextRF3Field(&fields, `"groups"`)
+		key, node, present = fields.Next()
+		if !present {
+			return rf3Manifest{}, errInvalidRF3Manifest
+		}
+		if bytes.Equal(key.Raw().Bytes(), []byte(`"gateway"`)) {
+			manifest.Gateway, err = parseRF3ManifestGateway(node)
+			if err != nil {
+				return rf3Manifest{}, err
+			}
+			node, err = nextRF3Field(&fields, `"groups"`)
+		} else if !bytes.Equal(key.Raw().Bytes(), []byte(`"groups"`)) {
+			err = errInvalidRF3Manifest
+		}
 		if err != nil {
 			return rf3Manifest{}, err
 		}
-		if manifest.Groups, err = parseRF3ManifestGroups(node); err != nil {
+		if manifest.Groups, err = parseRF3ManifestGroups(node, manifest.NodeLog); err != nil {
 			return rf3Manifest{}, err
 		}
 		controlPaths := [...]string{
@@ -424,7 +438,7 @@ func parseRF3Manifest(data []byte) (rf3Manifest, error) {
 	return manifest, nil
 }
 
-func parseRF3ManifestGroups(node vibejson.Node) ([]rf3ManifestGroup, error) {
+func parseRF3ManifestGroups(node vibejson.Node, nodeLog *rf3NodeLogManifest) ([]rf3ManifestGroup, error) {
 	count, ok := node.ArrayLen()
 	if !ok || count < 1 || count > maxRF3ManifestGroups {
 		return nil, errInvalidRF3Manifest
@@ -432,6 +446,9 @@ func parseRF3ManifestGroups(node vibejson.Node) ([]rf3ManifestGroup, error) {
 	iter, _ := node.ArrayIter()
 	groups := make([]rf3ManifestGroup, 0, count)
 	paths := make(map[string]struct{}, count*5)
+	if nodeLog != nil {
+		paths[nodeLog.Path], paths[nodeLog.KeyMaterialPath] = struct{}{}, struct{}{}
+	}
 	groupKeys := make(map[raftmember.GroupKey]struct{}, count)
 	nodes := make(map[rafttransport.NodeID]string, rf3ManifestMembers)
 	addresses := make(map[string]rafttransport.NodeID, rf3ManifestMembers)
@@ -448,8 +465,15 @@ func parseRF3ManifestGroups(node vibejson.Node) ([]rf3ManifestGroup, error) {
 			return nil, errInvalidRF3Manifest
 		}
 		groupKeys[group.Route.Group] = struct{}{}
+		sharedKey := nodeLog != nil && group.WAL.KeyID == nodeLog.KeyID && group.WAL.KeyMaterialPath == nodeLog.KeyMaterialPath
+		if !sharedKey {
+			if _, duplicate := paths[group.WAL.KeyMaterialPath]; duplicate {
+				return nil, errInvalidRF3Manifest
+			}
+			paths[group.WAL.KeyMaterialPath] = struct{}{}
+		}
 		for _, path := range [...]string{
-			group.WAL.Path, group.WAL.KeyMaterialPath, group.SQL.Path,
+			group.WAL.Path, group.SQL.Path,
 			group.SQL.IdentityPath, group.SQL.ApplyIdentityPath,
 			group.Route.MemberRoot, group.Route.SplitRuntimeRoot,
 			group.Route.MembershipGrantPath,

@@ -20,6 +20,7 @@ type devNodeLogManifest struct {
 type devPrepareNodeManifest struct {
 	Root    string               `json:"root"`
 	NodeLog devNodeLogManifest   `json:"node_log"`
+	Gateway *devGatewayConfig    `json:"gateway,omitempty"`
 	Groups  []devPrepareManifest `json:"groups"`
 }
 
@@ -42,6 +43,21 @@ func prepareDevNode(binary, memberPreparation string) error {
 		return err
 	}
 	path := memberPreparation + ".node"
+	if err := writeDevFileOnce(path, raw); err != nil {
+		return err
+	}
+	return runDevCommand(binary, "prepare-node-rf3", "-manifest", path)
+}
+
+// prepareDevPhysicalNode publishes all groups assigned to one physical node
+// in one prepare-node-rf3 invocation. The input is kept beside the node root
+// so a failed process can be resumed from the exact canonical bytes.
+func prepareDevPhysicalNode(binary string, input devPrepareNodeManifest) error {
+	raw, err := vibejson.Marshal(&input)
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(filepath.Dir(input.Root), filepath.Base(input.Root)+"-prepare-node.vibejson")
 	if err := writeDevFileOnce(path, raw); err != nil {
 		return err
 	}

@@ -406,6 +406,15 @@ func (owners *ExecutionOwners) ObserveReplica(ctx context.Context, group raftmem
 	}
 	return owner.ObserveReplica(ctx, group, target)
 }
+func (owners *ExecutionOwners) ObserveReplicaHealth(
+	ctx context.Context, group raftmember.GroupKey, target uint64,
+) (ReplicaHealthObservation, error) {
+	owner, err := owners.owner(group)
+	if err != nil {
+		return ReplicaHealthObservation{}, err
+	}
+	return owner.ObserveReplicaHealth(ctx, group, target)
+}
 func (owners *ExecutionOwners) ReadPoint(ctx context.Context, request PointReadRequest) (PointReadResult, PointReadLease, error) {
 	owner, err := owners.owner(request.Fence.Group)
 	if err != nil {

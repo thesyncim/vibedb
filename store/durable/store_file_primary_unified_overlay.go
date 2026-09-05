@@ -105,6 +105,15 @@ type primaryUnifiedOverlayBucket struct {
 	rawBytes      atomic.Int64
 	rows          atomic.Int32
 	insertSlots   [4]atomic.Uint64
+	// scalarBase/shape/hole bind the conservative compact fold envelope to one
+	// immutable source leaf and one numeric column for the current pending epoch.
+	// They are writer-owned admission metadata; no durable record grammar or
+	// lock-free reader state depends on them.
+	scalarBase       storeio.PageRef
+	scalarShape      uint16
+	scalarHole       uint16
+	scalarFixedBytes uint32
+	scalarSet        bool
 }
 
 type primaryUnifiedOverlay struct {
@@ -155,6 +164,108 @@ type primaryUnifiedOverlayPrepared struct {
 	wideKeys      int32
 	dirtyAfter    uint64
 	newBucket     bool
+}
+
+// primaryUnifiedOverlayBatchMutation is the fully resolved input to one
+// checkpoint-group row-overlay preparation. The caller has already proved that
+// the key is an existing inline row and that the final leaf shape remains
+// within the compact geometry envelope. Every mutation in a batch receives the
+// same generation; the private cursors below are what make that safe.
+type primaryUnifiedOverlayBatchMutation struct {
+	bucket          storeio.BucketID
+	hash            uint64
+	key             []byte
+	value           []byte
+	rawDelta        int
+	countDelta      int
+	kind            uint8
+	stableSlot      uint8
+	fixedLeafBytes  uint32
+	reservationWide bool
+	scalarPatch     storeio.CommonPrimaryUnifiedScalarPatch
+	scalarBase      storeio.PageRef
+	scalarShape     int
+	scalarHole      int
+}
+
+type primaryUnifiedOverlayBatchRecord struct {
+	headSlot   uint32
+	bucketSlot uint32
+}
+
+type primaryUnifiedOverlayBatchHash struct {
+	slot uint32
+	head uint32
+}
+
+type primaryUnifiedOverlayBatchKey struct {
+	bucket storeio.BucketID
+	hash   uint64
+	key    []byte
+	wide   bool
+}
+
+type primaryUnifiedOverlayBatchBucket struct {
+	bucket           uint32
+	slot             uint32
+	head             uint32
+	baseReserved     uint32
+	reservedBytes    uint32
+	fixedBytes       uint32
+	wideKeys         int32
+	rawBytes         int64
+	rows             int32
+	insertSlots      [4]uint64
+	newBucket        bool
+	scalarBase       storeio.PageRef
+	scalarShape      uint16
+	scalarHole       uint16
+	scalarFixedBytes uint32
+	scalarSet        bool
+}
+
+// primaryUnifiedOverlayBatchPrepared owns a contiguous, unpublished record and
+// arena suffix. No reader can reach either suffix until publishBatch installs
+// the final count, bucket heads, and hash heads. abortBatch simply abandons
+// those private cursors; a later prepare may overwrite the suffix safely.
+type primaryUnifiedOverlayBatchPrepared struct {
+	records    []primaryUnifiedOverlayBatchRecord
+	buckets    []primaryUnifiedOverlayBatchBucket
+	hashes     []primaryUnifiedOverlayBatchHash
+	countAfter uint32
+	usedAfter  uint32
+	dirtyAfter uint64
+	generation uint64
+	live       bool
+}
+
+const (
+	primaryUnifiedOverlayMaxInt64 = int64(^uint64(0) >> 1)
+	primaryUnifiedOverlayMinInt64 = -primaryUnifiedOverlayMaxInt64 - 1
+	primaryUnifiedOverlayMaxInt32 = int64(^uint32(0) >> 1)
+	primaryUnifiedOverlayMinInt32 = -primaryUnifiedOverlayMaxInt32 - 1
+)
+
+func addPrimaryUnifiedOverlayInt64(value int64, delta int) (int64, bool) {
+	d := int64(delta)
+	if d > 0 && value > primaryUnifiedOverlayMaxInt64-d {
+		return 0, false
+	}
+	if d < 0 && value < primaryUnifiedOverlayMinInt64-d {
+		return 0, false
+	}
+	return value + d, true
+}
+
+func addPrimaryUnifiedOverlayInt32(value int32, delta int) (int32, bool) {
+	d := int64(delta)
+	if d > 0 && int64(value) > primaryUnifiedOverlayMaxInt32-d {
+		return 0, false
+	}
+	if d < 0 && int64(value) < primaryUnifiedOverlayMinInt32-d {
+		return 0, false
+	}
+	return int32(int64(value) + d), true
 }
 
 func newPrimaryUnifiedOverlay(
@@ -331,6 +442,36 @@ func (o *primaryUnifiedOverlay) pendingBucketDeltas(
 	return int(entry.rawBytes.Load()), int(entry.rows.Load())
 }
 
+// scalarColumnForBatch returns the one numeric shape/hole bound retained for a
+// pending bucket. A base-ref mismatch means the routed immutable leaf changed
+// underneath the pending epoch and the caller must re-enter the complete COW
+// path; it is never safe to reuse the old envelope against a new PageRef.
+func (o *primaryUnifiedOverlay) scalarColumnForBatch(
+	bucket storeio.BucketID, base storeio.PageRef,
+) (shape, hole int, fixedBytes uint32, bound, compatible bool) {
+	if o == nil {
+		return 0, 0, 0, false, true
+	}
+	slot, found := o.bucketSlot(bucket)
+	if !found {
+		return 0, 0, 0, false, true
+	}
+	entry := &o.buckets[slot]
+	head := entry.head.Load()
+	if head == 0 || int(head) > len(o.records) ||
+		o.records[head-1].generation <= o.folded.Load() {
+		return 0, 0, 0, false, true
+	}
+	if !entry.scalarSet {
+		return 0, 0, 0, false, true
+	}
+	if entry.scalarBase != base || entry.scalarFixedBytes == 0 {
+		return 0, 0, 0, false, false
+	}
+	return int(entry.scalarShape), int(entry.scalarHole),
+		entry.scalarFixedBytes, true, true
+}
+
 // pendingInsertSlots returns every slot claimed by an overlay-native insert
 // since the last fold. Deleted insert slots deliberately remain reserved until
 // the fold so a different key cannot claim the same stable slot while an old
@@ -364,10 +505,22 @@ func (o *primaryUnifiedOverlay) pendingInsertSlots(
 func (o *primaryUnifiedOverlay) chooseLargeUnindexedSlot(
 	bucket storeio.BucketID, hash uint64,
 ) (uint8, bool) {
+	return o.chooseLargeUnindexedSlotWithAdditional(
+		bucket, hash, [4]uint64{},
+	)
+}
+
+// chooseLargeUnindexedSlotWithAdditional is the batch form of the large
+// unindexed identity allocator. additional contains slots selected earlier in
+// the same unpublished batch; the published overlay history is still scanned
+// so collisions remain stable across retries and folds.
+func (o *primaryUnifiedOverlay) chooseLargeUnindexedSlotWithAdditional(
+	bucket storeio.BucketID, hash uint64, additional [4]uint64,
+) (uint8, bool) {
 	if o == nil {
 		return 0, false
 	}
-	var used [4]uint64
+	used := additional
 	folded := o.folded.Load()
 	bucketSlot, found := o.bucketSlot(bucket)
 	if found {
@@ -805,6 +958,428 @@ func (o *primaryUnifiedOverlay) prepareWithLeafReservation(
 	}, nil
 }
 
+// batchBucketSlot resolves a bucket against both the published directory and
+// the private bucket set being prepared. The published directory cannot be
+// touched until the whole batch is ready, so ordinary bucketSlot would return
+// the same first empty slot for two distinct new buckets in one batch.
+func (o *primaryUnifiedOverlay) batchBucketSlot(
+	bucket storeio.BucketID,
+	private []primaryUnifiedOverlayBatchBucket,
+) (slot uint32, found bool, ok bool) {
+	if o == nil {
+		return 0, false, false
+	}
+	mask := uint32(primaryUnifiedOverlayBucketTable - 1)
+	slot = primaryUnifiedOverlayBucketHash(bucket) & mask
+	for range primaryUnifiedOverlayBucketTable {
+		privateSlot := -1
+		for index := range private {
+			if private[index].slot == slot {
+				privateSlot = index
+				break
+			}
+		}
+		if privateSlot >= 0 {
+			if private[privateSlot].bucket == uint32(bucket) {
+				return slot, true, true
+			}
+			slot = (slot + 1) & mask
+			continue
+		}
+		entry := &o.buckets[slot]
+		if entry.head.Load() == 0 {
+			return slot, false, true
+		}
+		if entry.bucket.Load() == uint32(bucket) {
+			return slot, true, true
+		}
+		slot = (slot + 1) & mask
+	}
+	return 0, false, false
+}
+
+// prepareBatch reserves and fills a complete same-generation row-overlay
+// batch. Every record and arena byte is written into an unpublished suffix;
+// count, used, heads, bucket aggregates, and dirtyBytes remain unchanged until
+// publishBatch. This is intentionally a separate implementation from
+// prepare: repeatedly calling the single-record method would reread the same
+// unpublished count and arena cursor and overwrite the first record.
+func (o *primaryUnifiedOverlay) prepareBatch(
+	generation uint64,
+	mutations []primaryUnifiedOverlayBatchMutation,
+) (primaryUnifiedOverlayBatchPrepared, error) {
+	if o == nil {
+		return primaryUnifiedOverlayBatchPrepared{}, fmt.Errorf(
+			"%w: unified row overlay disabled", storeio.ErrPageCachePinned,
+		)
+	}
+	if generation == 0 || len(mutations) == 0 {
+		return primaryUnifiedOverlayBatchPrepared{}, fmt.Errorf(
+			"%w: unified row overlay batch", storeio.ErrInvalidWrite,
+		)
+	}
+	o.ensureBacking()
+	count := o.count.Load()
+	used := o.used.Load()
+	if count > uint32(len(o.records)) || used > uint32(len(o.arena)) {
+		return primaryUnifiedOverlayBatchPrepared{}, storeio.ErrCommonPrimaryLeafCorrupt
+	}
+	if uint64(count)+uint64(len(mutations)) > uint64(len(o.records)) {
+		return primaryUnifiedOverlayBatchPrepared{}, fmt.Errorf(
+			"%w: unified row overlay record pressure", storeio.ErrPageCachePinned,
+		)
+	}
+	var needed uint64
+	for index := range mutations {
+		mutation := &mutations[index]
+		if len(mutation.key) == 0 ||
+			len(mutation.key) > int(^uint16(0)) ||
+			uint64(len(mutation.key)) > uint64(^uint32(0)) ||
+			uint64(len(mutation.value)) > uint64(^uint32(0)) ||
+			mutation.kind != primaryUnifiedOverlayPut &&
+				mutation.kind != primaryUnifiedOverlayDelete ||
+			mutation.kind == primaryUnifiedOverlayPut && len(mutation.value) == 0 ||
+			mutation.kind == primaryUnifiedOverlayDelete && len(mutation.value) != 0 ||
+			int64(int32(mutation.rawDelta)) != int64(mutation.rawDelta) ||
+			mutation.countDelta < -1 || mutation.countDelta > 1 ||
+			mutation.fixedLeafBytes == 0 ||
+			mutation.fixedLeafBytes > o.maxLeafBytes {
+			return primaryUnifiedOverlayBatchPrepared{}, fmt.Errorf(
+				"%w: unified row overlay batch mutation", storeio.ErrInvalidWrite,
+			)
+		}
+		if needed > ^uint64(0)-uint64(len(mutation.key))-
+			uint64(len(mutation.value)) {
+			return primaryUnifiedOverlayBatchPrepared{}, storeio.ErrInvalidWrite
+		}
+		needed += uint64(len(mutation.key)) + uint64(len(mutation.value))
+	}
+	if uint64(used)+needed > uint64(len(o.arena)) {
+		return primaryUnifiedOverlayBatchPrepared{}, fmt.Errorf(
+			"%w: unified row overlay arena pressure", storeio.ErrPageCachePinned,
+		)
+	}
+	currentDirty := o.dirtyBytes.Load()
+	if currentDirty > o.dirtyByteLimit {
+		return primaryUnifiedOverlayBatchPrepared{}, storeio.ErrCommonPrimaryLeafCorrupt
+	}
+	if o.bucketCount.Load() > o.bucketLimit {
+		return primaryUnifiedOverlayBatchPrepared{}, storeio.ErrCommonPrimaryLeafCorrupt
+	}
+
+	prepared := primaryUnifiedOverlayBatchPrepared{
+		records:    make([]primaryUnifiedOverlayBatchRecord, len(mutations)),
+		buckets:    make([]primaryUnifiedOverlayBatchBucket, 0, len(mutations)),
+		hashes:     make([]primaryUnifiedOverlayBatchHash, 0, len(mutations)),
+		countAfter: count,
+		usedAfter:  used,
+		generation: generation,
+	}
+	keys := make([]primaryUnifiedOverlayBatchKey, 0, len(mutations))
+	for index := range mutations {
+		mutation := &mutations[index]
+		bucketSlot, bucketFound, slotOK := o.batchBucketSlot(
+			mutation.bucket, prepared.buckets,
+		)
+		if !slotOK {
+			return primaryUnifiedOverlayBatchPrepared{}, fmt.Errorf(
+				"%w: unified row overlay bucket pressure", storeio.ErrPageCachePinned,
+			)
+		}
+		bucketIndex := -1
+		for candidate := range prepared.buckets {
+			if prepared.buckets[candidate].slot == bucketSlot {
+				bucketIndex = candidate
+				break
+			}
+		}
+		if bucketIndex < 0 {
+			if !bucketFound {
+				newBuckets := 0
+				for candidate := range prepared.buckets {
+					if prepared.buckets[candidate].newBucket {
+						newBuckets++
+					}
+				}
+				if uint64(o.bucketCount.Load())+uint64(newBuckets)+1 >
+					uint64(o.bucketLimit) {
+					return primaryUnifiedOverlayBatchPrepared{}, fmt.Errorf(
+						"%w: unified row overlay bucket pressure",
+						storeio.ErrPageCachePinned,
+					)
+				}
+			}
+			bucket := primaryUnifiedOverlayBatchBucket{
+				bucket:    uint32(mutation.bucket),
+				slot:      bucketSlot,
+				newBucket: !bucketFound,
+			}
+			if bucketFound {
+				entry := &o.buckets[bucketSlot]
+				bucket.head = entry.head.Load()
+				bucket.baseReserved = entry.reservedBytes.Load()
+				bucket.fixedBytes = entry.fixedBytes.Load()
+				bucket.wideKeys = entry.wideKeys.Load()
+				bucket.rawBytes = entry.rawBytes.Load()
+				bucket.rows = entry.rows.Load()
+				for slot := range bucket.insertSlots {
+					bucket.insertSlots[slot] = entry.insertSlots[slot].Load()
+				}
+				bucket.scalarBase = entry.scalarBase
+				bucket.scalarShape = entry.scalarShape
+				bucket.scalarHole = entry.scalarHole
+				bucket.scalarFixedBytes = entry.scalarFixedBytes
+				bucket.scalarSet = entry.scalarSet
+				if bucket.head != 0 && int(bucket.head) > len(o.records) {
+					return primaryUnifiedOverlayBatchPrepared{},
+						storeio.ErrCommonPrimaryLeafCorrupt
+				}
+			}
+			bucketIndex = len(prepared.buckets)
+			prepared.buckets = append(prepared.buckets, bucket)
+		}
+		bucket := &prepared.buckets[bucketIndex]
+		fixedBytes64 := uint64(mutation.fixedLeafBytes) + uint64(o.parentBytes)
+		if fixedBytes64 > uint64(^uint32(0)) {
+			return primaryUnifiedOverlayBatchPrepared{}, storeio.ErrInvalidWrite
+		}
+		if uint32(fixedBytes64) > bucket.fixedBytes {
+			bucket.fixedBytes = uint32(fixedBytes64)
+		}
+		if mutation.scalarPatch !=
+			(storeio.CommonPrimaryUnifiedScalarPatch{}) &&
+			mutation.scalarShape >= 0 {
+			if mutation.scalarShape > int(^uint16(0)) ||
+				mutation.scalarHole < 0 ||
+				mutation.scalarHole > int(^uint16(0)) {
+				return primaryUnifiedOverlayBatchPrepared{},
+					storeio.ErrInvalidWrite
+			}
+			if bucket.scalarSet {
+				if bucket.scalarBase != mutation.scalarBase ||
+					bucket.scalarShape != uint16(mutation.scalarShape) ||
+					bucket.scalarHole != uint16(mutation.scalarHole) ||
+					bucket.scalarFixedBytes != mutation.fixedLeafBytes {
+					return primaryUnifiedOverlayBatchPrepared{},
+						storeio.ErrInvalidWrite
+				}
+			} else {
+				if mutation.fixedLeafBytes == 0 {
+					return primaryUnifiedOverlayBatchPrepared{},
+						storeio.ErrInvalidWrite
+				}
+				bucket.scalarBase = mutation.scalarBase
+				bucket.scalarShape = uint16(mutation.scalarShape)
+				bucket.scalarHole = uint16(mutation.scalarHole)
+				bucket.scalarFixedBytes = mutation.fixedLeafBytes
+				bucket.scalarSet = true
+			}
+		}
+
+		previousWide, foundKey := false, false
+		for keyIndex := range keys {
+			candidate := &keys[keyIndex]
+			if bytes.Equal(candidate.key, mutation.key) {
+				previousWide, foundKey = candidate.wide, true
+				break
+			}
+		}
+		if !foundKey {
+			var err error
+			previousWide, err = o.pendingKeyReservationWide(
+				mutation.bucket, mutation.hash, mutation.key,
+			)
+			if err != nil {
+				return primaryUnifiedOverlayBatchPrepared{}, err
+			}
+		} else {
+			// WriteBatch canonicalization removes duplicate final keys before
+			// staging. Rejecting a duplicate here keeps direct callers from
+			// creating ambiguous same-generation slot/aggregate deltas after
+			// private preparation has begun.
+			return primaryUnifiedOverlayBatchPrepared{}, storeio.ErrInvalidWrite
+		}
+		if mutation.reservationWide && !previousWide {
+			bucket.wideKeys++
+		} else if !mutation.reservationWide && previousWide {
+			bucket.wideKeys--
+		}
+		if bucket.wideKeys < 0 {
+			return primaryUnifiedOverlayBatchPrepared{},
+				storeio.ErrCommonPrimaryLeafCorrupt
+		}
+		rawBytes, rawOK := addPrimaryUnifiedOverlayInt64(
+			bucket.rawBytes, mutation.rawDelta,
+		)
+		if !rawOK {
+			return primaryUnifiedOverlayBatchPrepared{}, storeio.ErrInvalidWrite
+		}
+		bucket.rawBytes = rawBytes
+		rows, rowsOK := addPrimaryUnifiedOverlayInt32(
+			bucket.rows, mutation.countDelta,
+		)
+		if !rowsOK {
+			return primaryUnifiedOverlayBatchPrepared{}, storeio.ErrInvalidWrite
+		}
+		bucket.rows = rows
+		if mutation.countDelta > 0 {
+			bucket.insertSlots[mutation.stableSlot>>6] |=
+				uint64(1) << uint(mutation.stableSlot&63)
+		}
+
+		headSlot := uint32(mutation.hash & (primaryUnifiedOverlayTable - 1))
+		previous := o.heads[headSlot].Load()
+		for hashIndex := range prepared.hashes {
+			if prepared.hashes[hashIndex].slot == headSlot {
+				previous = prepared.hashes[hashIndex].head
+				break
+			}
+		}
+		keyOffset := prepared.usedAfter
+		valueOffset := keyOffset + uint32(len(mutation.key))
+		valueEnd := valueOffset + uint32(len(mutation.value))
+		recordIndex := prepared.countAfter
+		o.records[recordIndex] = primaryUnifiedOverlayRecord{
+			generation:     generation,
+			hash:           mutation.hash,
+			previous:       previous,
+			bucketPrevious: bucket.head,
+			bucket:         uint32(mutation.bucket),
+			keyOffset:      keyOffset,
+			valueOff:       valueOffset,
+			valueLen:       uint32(len(mutation.value)),
+			rawDelta:       int32(mutation.rawDelta),
+			keyLen:         uint16(len(mutation.key)),
+			countDelta:     int8(mutation.countDelta),
+			kind:           mutation.kind,
+			slot:           mutation.stableSlot,
+			scalarPatch:    mutation.scalarPatch,
+			reservationWide: func() uint8 {
+				if mutation.reservationWide {
+					return 1
+				}
+				return 0
+			}(),
+		}
+		copy(o.arena[keyOffset:valueOffset], mutation.key)
+		copy(o.arena[valueOffset:valueEnd], mutation.value)
+		prepared.records[index] = primaryUnifiedOverlayBatchRecord{
+			headSlot: headSlot, bucketSlot: bucket.slot,
+		}
+		prepared.countAfter++
+		prepared.usedAfter = valueEnd
+		bucket.head = recordIndex + 1
+		foundHash := false
+		for hashIndex := range prepared.hashes {
+			if prepared.hashes[hashIndex].slot == headSlot {
+				prepared.hashes[hashIndex].head = recordIndex + 1
+				foundHash = true
+				break
+			}
+		}
+		if !foundHash {
+			prepared.hashes = append(prepared.hashes, primaryUnifiedOverlayBatchHash{
+				slot: headSlot, head: recordIndex + 1,
+			})
+		}
+		keys = append(keys, primaryUnifiedOverlayBatchKey{
+			bucket: mutation.bucket, hash: mutation.hash,
+			key: mutation.key, wide: mutation.reservationWide,
+		})
+	}
+	for index := range prepared.buckets {
+		bucket := &prepared.buckets[index]
+		if bucket.wideKeys != 0 {
+			bucket.reservedBytes = uint32(uint64(o.maxLeafBytes) + uint64(o.parentBytes))
+		} else {
+			bucket.reservedBytes = bucket.fixedBytes
+		}
+		if currentDirty < uint64(bucket.baseReserved) {
+			return primaryUnifiedOverlayBatchPrepared{},
+				storeio.ErrCommonPrimaryLeafCorrupt
+		}
+		remaining := currentDirty - uint64(bucket.baseReserved)
+		if remaining > ^uint64(0)-uint64(bucket.reservedBytes) {
+			return primaryUnifiedOverlayBatchPrepared{}, storeio.ErrInvalidWrite
+		}
+		currentDirty = remaining + uint64(bucket.reservedBytes)
+	}
+	if currentDirty > o.dirtyByteLimit {
+		return primaryUnifiedOverlayBatchPrepared{}, fmt.Errorf(
+			"%w: unified row overlay dirty-byte pressure",
+			storeio.ErrPageCachePinned,
+		)
+	}
+	prepared.dirtyAfter = currentDirty
+	prepared.live = true
+	return prepared, nil
+}
+
+// abortBatch abandons a private record/arena suffix. The published prefixes
+// remain untouched, so no reader, recovery journal, or later fold can observe
+// the abandoned records. The next writer may reuse the exact suffix.
+func (o *primaryUnifiedOverlay) abortBatch(
+	prepared *primaryUnifiedOverlayBatchPrepared,
+) {
+	if prepared == nil || !prepared.live {
+		return
+	}
+	*prepared = primaryUnifiedOverlayBatchPrepared{}
+}
+
+// publishBatch installs one prepared same-generation batch. All bucket
+// aggregates and the global count/arena cursor are written before their bucket
+// heads, and the hash heads are last. This keeps both bucket-chain and hash-chain
+// readers from reaching a partially linked batch.
+func (o *primaryUnifiedOverlay) publishBatch(
+	prepared *primaryUnifiedOverlayBatchPrepared,
+) {
+	if o == nil || prepared == nil || !prepared.live ||
+		len(prepared.records) == 0 {
+		return
+	}
+	for index := range prepared.buckets {
+		state := &prepared.buckets[index]
+		bucket := &o.buckets[state.slot]
+		if state.newBucket {
+			bucket.bucket.Store(state.bucket)
+			for slot := range bucket.insertSlots {
+				bucket.insertSlots[slot].Store(0)
+			}
+			o.bucketCount.Add(1)
+		}
+		bucket.fixedBytes.Store(state.fixedBytes)
+		bucket.wideKeys.Store(state.wideKeys)
+		bucket.reservedBytes.Store(state.reservedBytes)
+		bucket.rawBytes.Store(state.rawBytes)
+		bucket.rows.Store(state.rows)
+		for slot := range bucket.insertSlots {
+			bucket.insertSlots[slot].Store(state.insertSlots[slot])
+		}
+		bucket.scalarBase = state.scalarBase
+		bucket.scalarShape = state.scalarShape
+		bucket.scalarHole = state.scalarHole
+		bucket.scalarFixedBytes = state.scalarFixedBytes
+		bucket.scalarSet = state.scalarSet
+	}
+	o.dirtyBytes.Store(prepared.dirtyAfter)
+	o.used.Store(prepared.usedAfter)
+	o.count.Store(prepared.countAfter)
+	// Count and arena usage become visible before any bucket head points at the
+	// new suffix. Bucket-chain readers validate their record keys against this
+	// published prefix, so a head cannot expose a record while the prefix still
+	// advertises the previous generation's length.
+	for index := range prepared.buckets {
+		state := &prepared.buckets[index]
+		o.buckets[state.slot].head.Store(state.head)
+	}
+	for index := range prepared.hashes {
+		hash := &prepared.hashes[index]
+		o.heads[hash.slot].Store(hash.head)
+	}
+	prepared.live = false
+}
+
 func (o *primaryUnifiedOverlay) publish(prepared primaryUnifiedOverlayPrepared) {
 	record := &o.records[prepared.index]
 	bucket := &o.buckets[prepared.bucketSlot]
@@ -1022,8 +1597,11 @@ func (o *primaryUnifiedOverlay) latestBucketRecordsUnorderedFromHead(
 		if record.bucket != uint32(bucket) {
 			return 0, storeio.ErrCommonPrimaryLeafCorrupt
 		}
+		// A checkpoint-group batch publishes several immutable records at one
+		// generation. Equal generations are valid while record indexes in the
+		// bucket chain must still decrease strictly.
 		if record.generation == 0 ||
-			newerGeneration != 0 && record.generation >= newerGeneration {
+			newerGeneration != 0 && record.generation > newerGeneration {
 			return 0, storeio.ErrCommonPrimaryLeafCorrupt
 		}
 		newerGeneration = record.generation
@@ -1271,6 +1849,11 @@ func (o *primaryUnifiedOverlay) markFolded(generation uint64, recycle bool) {
 		for slot := range bucket.insertSlots {
 			bucket.insertSlots[slot].Store(0)
 		}
+		bucket.scalarBase = storeio.PageRef{}
+		bucket.scalarShape = 0
+		bucket.scalarHole = 0
+		bucket.scalarFixedBytes = 0
+		bucket.scalarSet = false
 	}
 	o.bucketCount.Store(0)
 	o.dirtyBytes.Store(0)

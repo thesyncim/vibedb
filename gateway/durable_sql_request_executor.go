@@ -145,22 +145,46 @@ func (executor *DurableSQLRequestExecutor) ExecuteMode(
 	}
 	opctx, cancel := context.WithTimeout(ctx, profile.GlobalDeadline)
 	defer cancel()
-	lease := executor.planner.catalog.pinCurrent()
-	if lease.snapshot == nil || lease.generation == 0 {
-		return DurableSQLRequestResult{}, ErrNoCatalog
+	var lease catalogLease
+	var home DurableRequestLedgerHome
+	var targets []ReplicatedTransactionTarget
+	var handled bool
+	refreshedMiss := false
+	for {
+		lease = executor.planner.catalog.pinCurrent()
+		if lease.snapshot == nil || lease.generation == 0 {
+			lease.release()
+			return DurableSQLRequestResult{}, ErrNoCatalog
+		}
+		home, err = executor.requests.home(key)
+		if err != nil {
+			lease.release()
+			return DurableSQLRequestResult{}, err
+		}
+		if home.TopologyGeneration != lease.generation {
+			lease.release()
+			return DurableSQLRequestResult{}, fmt.Errorf("gateway: SQL catalog generation %d differs from ledger topology %d: %w",
+				lease.generation, home.TopologyGeneration, ErrDurableRequestConflict)
+		}
+		targets, handled, err = executor.planner.planReplicatedSQLTransactionWithData(
+			opctx, lease.snapshot, queries, profile, executor.data,
+		)
+		if !errors.Is(err, ErrTableNotPlaced) || refreshedMiss {
+			break
+		}
+		refreshedMiss = true
+		staleGeneration := lease.generation
+		lease.release()
+		if refreshErr := executor.planner.refreshAfterCatalogMiss(opctx, staleGeneration); refreshErr != nil {
+			// Keep the existing lowering-failure replay path intact. The
+			// request may already have a retained terminal recipe even when
+			// this process still has stale table metadata; refresh failure
+			// must never turn that recoverable identity into a new refusal.
+			err = preserveCatalogMiss(err, refreshErr)
+			break
+		}
 	}
 	defer lease.release()
-	home, err := executor.requests.home(key)
-	if err != nil {
-		return DurableSQLRequestResult{}, err
-	}
-	if home.TopologyGeneration != lease.generation {
-		return DurableSQLRequestResult{}, fmt.Errorf("gateway: SQL catalog generation %d differs from ledger topology %d: %w",
-			lease.generation, home.TopologyGeneration, ErrDurableRequestConflict)
-	}
-	targets, handled, err := executor.planner.planReplicatedSQLTransactionWithData(
-		opctx, lease.snapshot, queries, profile, executor.data,
-	)
 	if err != nil || !handled || len(targets) == 0 {
 		if err != nil {
 			// Planning happens before the fused ledger Create. An exact retry can
@@ -219,7 +243,7 @@ func (executor *DurableSQLRequestExecutor) ExecuteMode(
 	var outcome DurableRequestOutcome
 	if begin.ProgramMatches {
 		// The fused Create is the one logical admission point for a caller
-		// request. Sample its already-grouped shard participants only for the
+		// request. Sample its already-grouped shard targets only for the
 		// successful creator: request retries and transaction recovery waves must
 		// not amplify hot-shard pressure.
 		if begin.Created {

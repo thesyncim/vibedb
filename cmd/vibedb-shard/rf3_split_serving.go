@@ -11,6 +11,7 @@ import (
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftservice"
+	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/rangesplit"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
@@ -48,8 +49,12 @@ type rf3SplitServingOptions struct {
 	owners        *raftservice.ExecutionOwners
 	registrar     splitcontroller.ExecutionGroupRegistrar
 	profile       *rafttransport.PeerTLS
-	policy        *serviceauthz.Policy
-	deadline      rafttransport.DeadlineFunc
+	// topologyProfile supplies native topology sessions with the independent
+	// frontend principal in a fused node. Storage identity remains unchanged
+	// for exact physical-node admission and split data-transfer grants.
+	topologyProfile *rafttransport.PeerTLS
+	policy          *serviceauthz.Policy
+	deadline        rafttransport.DeadlineFunc
 }
 
 func newRF3SplitServingRuntime(options rf3SplitServingOptions) (*rf3SplitServingRuntime, error) {
@@ -105,10 +110,15 @@ func newRF3SplitServingRuntime(options rf3SplitServingOptions) (*rf3SplitServing
 			return closeOnError(err)
 		}
 	}
-	authority := serviceauthz.Authority{
-		Node: options.profile.LocalIdentity().Node, Generation: options.policy.Generation(),
+	topologyProfile := options.topologyProfile
+	if topologyProfile == nil {
+		topologyProfile = options.profile
 	}
-	if options.policy.Check(authority.Node, serviceauthz.CapabilityTopology) != serviceauthz.DecisionAllow {
+	authority := serviceauthz.Authority{
+		Node: topologyProfile.LocalIdentity().Node, Generation: options.policy.Generation(),
+	}
+	if options.policy.Check(authority.Node, serviceauthz.CapabilityTopology) != serviceauthz.DecisionAllow ||
+		options.policy.Check(authority.Node, serviceauthz.CapabilityDelegate) != serviceauthz.DecisionAllow {
 		return closeOnError(errRF3Serving)
 	}
 	makeSource := func(identity raftmember.RuntimeIdentity, command raftservice.CommandFence, apply *sqldriver.ReplicatedApply, registry *splitcontroller.RuntimeStoreRegistry) (splitcontroller.AdmittedSourceRuntime, error) {
@@ -163,7 +173,7 @@ func newRF3SplitServingRuntime(options rf3SplitServingOptions) (*rf3SplitServing
 					return nil, openErr
 				}
 				topologyFactory := &rf3RetainedPruneFactory{
-					tls: options.profile, authority: authority, lease: lease, source: apply,
+					tls: topologyProfile, authority: authority, lease: lease, source: apply,
 				}
 				composite, openErr := splitcontroller.NewCompositeShardActionExecutor(splitcontroller.CompositeShardActionExecutorOptions{
 					Operation: plan.OperationID(), Actions: splitcontroller.SourceSplitActionMask(),
@@ -231,18 +241,11 @@ func newRF3SplitServingRuntime(options rf3SplitServingOptions) (*rf3SplitServing
 		if openErr != nil {
 			return nil, openErr
 		}
-		key, openErr := loadRF3WALKey(
-			childRegistry.WAL.KeyID,
-			childRegistry.WAL.KeyMaterialPath,
-		)
+		key, openErr := loadRF3SplitChildWALKey(childRegistry, &options.prepared[registryIndex])
 		if openErr != nil {
 			return nil, openErr
 		}
 		defer clear(key.Material[:])
-		key.Wrapped, openErr = options.prepared[registryIndex].wal.AuthenticatedWrappedKeyMetadata(key)
-		if openErr != nil {
-			return nil, fmt.Errorf("authenticate split child WAL key metadata: %w", openErr)
-		}
 		workspace := make([]byte, rangesplit.DefaultChildArtifactChunkBytes)
 		executor, openErr := splitcontroller.NewLazyReplicatedChildExecutor(
 			splitcontroller.LazyReplicatedChildExecutorOptions{
@@ -370,6 +373,25 @@ func newRF3SplitServingRuntime(options rf3SplitServingOptions) (*rf3SplitServing
 	}
 	result.admission, result.tail, result.artifact, result.terminal = admission, tail, artifact, terminal
 	return result, nil
+}
+
+// A node-backed source has no per-group WAL handle. Authenticate the child
+// provider key against the physical log that actually retains its metadata.
+func loadRF3SplitChildWALKey(registry rf3ManifestSplitChildRegistry, source *preparedRF3Group) (raftstore.Key, error) {
+	key, err := loadRF3WALKey(registry.WAL.KeyID, registry.WAL.KeyMaterialPath)
+	if err != nil {
+		return raftstore.Key{}, err
+	}
+	if source.nodeOwner != nil {
+		key.Wrapped, err = source.nodeOwner.store.AuthenticatedWrappedKeyMetadata(key)
+	} else {
+		key.Wrapped, err = source.wal.AuthenticatedWrappedKeyMetadata(key)
+	}
+	if err != nil {
+		clear(key.Material[:])
+		return raftstore.Key{}, fmt.Errorf("authenticate split child WAL key metadata: %w", err)
+	}
+	return key, nil
 }
 
 type rf3AdmittedExecutor struct {

@@ -613,6 +613,11 @@ type CatalogHolder struct {
 	activeLeases map[uint64]uint64
 	leaseChanged chan struct{}
 	leaseWaiters uint64
+	// refresh coalesces authenticated on-demand repairs for both the SQL
+	// executor and native replicated reader. Keeping the gate beside the
+	// publication holder means callers sharing one holder cannot stampede the
+	// authority with duplicate reads.
+	refresh catalogRefreshCoordinator
 }
 
 // NewCatalogHolder returns a holder seeded with initial, which may be nil.
@@ -812,6 +817,26 @@ func (s *catalogLeaseSet) add(lease catalogLease) {
 		s.overflow = append(s.overflow, lease)
 	}
 	s.count++
+}
+
+// releaseLast drops a lease that was acquired only for pre-dispatch planning.
+// Catalog misses use this before refreshing so a stale generation does not
+// remain pinned while the authority publishes its replacement.
+func (s *catalogLeaseSet) releaseLast() {
+	if s == nil || s.count == 0 {
+		return
+	}
+	s.count--
+	if s.count < len(s.inline) {
+		s.inline[s.count].release()
+		var zero catalogLease
+		s.inline[s.count] = zero
+		return
+	}
+	last := len(s.overflow) - 1
+	s.overflow[last].release()
+	s.overflow[last] = catalogLease{}
+	s.overflow = s.overflow[:last]
 }
 
 func (s *catalogLeaseSet) release() {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -12,7 +13,9 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftservice"
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/query"
@@ -424,5 +427,180 @@ func TestReplicatedSQLBudgetHintsBoundedAndConservative(t *testing.T) {
 	workers.Wait()
 	if hints.lookup(key) != 3 {
 		t.Fatal("concurrent promotions lost largest allowance")
+	}
+}
+
+type replicatedSQLPointPathOwner struct {
+	*fakeReplicatedOwner
+	pointErr  error
+	dataErr   error
+	pointCall int
+	dataCall  int
+}
+
+func (owner *replicatedSQLPointPathOwner) ReadLinearizablePointInto(
+	context.Context,
+	raftservice.LinearizablePointReadRequest,
+	*raftservice.LinearizablePointReadCut,
+) error {
+	owner.pointCall++
+	return owner.pointErr
+}
+
+func (owner *replicatedSQLPointPathOwner) ReadLinearizableDataInto(
+	context.Context,
+	raftservice.LinearizableDataReadRequest,
+	*raftservice.LinearizableDataReadCut,
+) error {
+	owner.dataCall++
+	return owner.dataErr
+}
+
+func testReplicatedSQLPointCall(
+	state raftservice.ServingState,
+	primary PrimaryKeyReadRequest,
+) (*ReplicatedRequest, *ShardRequest) {
+	authority := serviceauthz.Authority{Generation: 1}
+	authority.Node[0] = 1
+	inner := &ShardRequest{
+		Authority: authority, SQL: "SELECT 1",
+		Distribution: distribution.DistributionName(state.Identity.Distribution),
+		Shard:        distribution.ShardID(state.Identity.Shard),
+		AllocationGeneration: distribution.ShardAllocationGeneration(
+			state.Identity.AllocationGeneration,
+		),
+		RoutingVersion: distribution.RoutingVersion(state.Command.RoutingVersion),
+		OwnershipEpoch: distribution.OwnershipEpoch(state.Command.OwnershipEpoch),
+		ReadPolicy:     ReadStrong, ExecutionMode: ExecutionReadOnly,
+		MaxRows: 1, MaxResultBytes: 4096, PrimaryKeyRead: primary,
+	}
+	request := &ReplicatedRequest{
+		Operation: ReplicatedQueryLeader, Authority: authority,
+		Capability: serviceauthz.CapabilityDataRead,
+		Fence:      replicatedWireState(state).Fence, MaxValueBytes: 4096,
+	}
+	return request, inner
+}
+
+func TestReplicatedSQLSinglePointReadRefusalsSkipDataSnapshot(t *testing.T) {
+	primary := PrimaryKeyReadRequest{
+		Relation: 1, MaxDocumentBytes: 1024,
+		PrimaryPath: []byte("/id"), Keys: [][]byte{[]byte("k")},
+	}
+	for _, test := range []struct {
+		name string
+		err  error
+		kind ReplicatedResponseKind
+		code ReplicatedRefusalCode
+	}{
+		{name: "not leader", err: raftmodel.ErrNotLeader, kind: ReplicatedNotLeader},
+		{name: "stale fence", err: raftservice.ErrServingFence, kind: ReplicatedRefusal, code: ReplicatedRefusalStaleFence},
+		{name: "intent", err: replicatedstate.ErrTransactionIntentActive, kind: ReplicatedRefusal, code: ReplicatedRefusalReadIntentActive},
+		{name: "buffer", err: replicatedstate.ErrReadBufferBound, kind: ReplicatedRefusal, code: ReplicatedRefusalReadBufferBound},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			state := testReplicatedServingState()
+			state.Identity.Distribution, state.Identity.Shard = "data", "all"
+			request, inner := testReplicatedSQLPointCall(state, primary)
+			owner := &replicatedSQLPointPathOwner{
+				fakeReplicatedOwner: &fakeReplicatedOwner{state: state},
+				pointErr:            test.err,
+				dataErr:             errors.New("data snapshot path was reached"),
+			}
+			server := &ReplicatedServer{
+				owner: owner, requestTimeout: time.Second,
+				frames: replicatedFrameByteBudget{limit: 2 << 20},
+			}
+			response := server.executeReplicatedQueryCall(
+				t.Context(), request, state, inner, nil,
+			)
+			if response.Kind != test.kind || response.Refusal != test.code {
+				t.Fatalf("response=%+v, want kind=%v refusal=%v", response, test.kind, test.code)
+			}
+			if owner.pointCall != 1 || owner.dataCall != 0 {
+				t.Fatalf("point/data calls=%d/%d, want 1/0", owner.pointCall, owner.dataCall)
+			}
+		})
+	}
+}
+
+func TestReplicatedSQLPointAdmissionIncludesCatalogFrozenDocumentBound(t *testing.T) {
+	state := testReplicatedServingState()
+	state.Identity.Distribution, state.Identity.Shard = "data", "all"
+	request, inner := testReplicatedSQLPointCall(state, PrimaryKeyReadRequest{
+		Relation: 1, MaxDocumentBytes: 3 << 20,
+		PrimaryPath: []byte("/id"), Keys: [][]byte{[]byte("k")},
+	})
+	owner := &replicatedSQLPointPathOwner{
+		fakeReplicatedOwner: &fakeReplicatedOwner{state: state},
+		pointErr:            raftmodel.ErrNotLeader,
+	}
+	server := testReplicatedServer(owner)
+	budget := replicatedSQLTiers[0]
+	charge, ok := budget.reservationBytesForPoint(inner.PrimaryKeyRead.MaxDocumentBytes)
+	if !ok || charge <= budget.reservationBytes() {
+		t.Fatalf("point reservation = %d ok=%v, base reservation = %d", charge, ok, budget.reservationBytes())
+	}
+	server.frames.limit = charge - 1
+	response, grow := server.executeReplicatedQueryTierCall(
+		t.Context(), request, state, inner, owner, budget, MaxReplicatedSQLResultBytes, nil,
+	)
+	if grow || response.Kind != ReplicatedRefusal || response.Refusal != ReplicatedRefusalAdmissionBound {
+		t.Fatalf("under-reserved point response=%+v grow=%v", response, grow)
+	}
+	if owner.pointCall != 0 || server.frames.used.Load() != 0 {
+		t.Fatalf("point call/accounting = %d/%d, want 0/0", owner.pointCall, server.frames.used.Load())
+	}
+
+	// The exact charged amount reaches the point read, and the normal refusal
+	// classification still releases the complete tier lease.
+	server.frames.limit = charge
+	response, grow = server.executeReplicatedQueryTierCall(
+		t.Context(), request, state, inner, owner, budget, MaxReplicatedSQLResultBytes, nil,
+	)
+	if grow || response.Kind != ReplicatedNotLeader {
+		t.Fatalf("exactly reserved point response=%+v grow=%v", response, grow)
+	}
+	if owner.pointCall != 1 || server.frames.used.Load() != 0 {
+		t.Fatalf("exact point call/accounting = %d/%d, want 1/0", owner.pointCall, server.frames.used.Load())
+	}
+}
+
+func TestReplicatedSQLUnsupportedPrimaryCandidatesRetainSnapshotPath(t *testing.T) {
+	state := testReplicatedServingState()
+	state.Identity.Distribution, state.Identity.Shard = "data", "all"
+	base := PrimaryKeyReadRequest{
+		PrimaryPath: []byte("/id"), Keys: [][]byte{[]byte("k")},
+	}
+	variants := []struct {
+		name    string
+		primary PrimaryKeyReadRequest
+	}{
+		{name: "absent", primary: PrimaryKeyReadRequest{}},
+		{name: "legacy single key", primary: base},
+		{name: "multiple keys", primary: PrimaryKeyReadRequest{
+			Relation: 1, MaxDocumentBytes: 1024,
+			PrimaryPath: []byte("/id"), Keys: [][]byte{[]byte("a"), []byte("b")},
+		}},
+	}
+	for _, test := range variants {
+		t.Run(test.name, func(t *testing.T) {
+			request, inner := testReplicatedSQLPointCall(state, test.primary)
+			owner := &replicatedSQLPointPathOwner{
+				fakeReplicatedOwner: &fakeReplicatedOwner{state: state},
+				pointErr:            raftmodel.ErrNotLeader,
+				dataErr:             raftmodel.ErrNotLeader,
+			}
+			server := testReplicatedServer(owner)
+			response := server.executeReplicatedQueryCall(
+				t.Context(), request, state, inner, nil,
+			)
+			if response.Kind != ReplicatedNotLeader {
+				t.Fatalf("response=%+v, want not-leader from snapshot path", response)
+			}
+			if owner.pointCall != 0 || owner.dataCall != 1 {
+				t.Fatalf("point/data calls=%d/%d, want 0/1", owner.pointCall, owner.dataCall)
+			}
+		})
 	}
 }

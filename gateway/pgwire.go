@@ -316,13 +316,12 @@ func (s *postgresSession) prepare(
 		// parses placement, constraints, ordering, and aggregate shape but never
 		// performs scalar/common-type analysis; compiled above is therefore the
 		// sole semantic prepare and already consumed the declared type hints.
-		snapshot := s.backend.Executor.catalog.Current()
-		routing, err := snapshot.Prepare(ctx, text)
-		if err != nil {
+		generation, routing, prepareErr := s.backend.Executor.prepareCatalogWithRefresh(ctx, text)
+		if prepareErr != nil {
 			compiled.Release()
-			return nil, err
+			return nil, prepareErr
 		}
-		catalogGeneration = snapshot.Generation()
+		catalogGeneration = generation
 		execution = preparedQueryExecution{
 			generation: catalogGeneration, prepared: routing,
 		}

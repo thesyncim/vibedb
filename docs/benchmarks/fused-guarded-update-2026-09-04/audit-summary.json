@@ -1,0 +1,3870 @@
+{
+  "schema": "vibedb.matched-fused-audit/1",
+  "evidence_directory": "vibedb-guarded-short-7b8efb88",
+  "refs": {
+    "before": "f2df4fac525fa0f73ff2e1b558f167e1e598f6c5",
+    "after": "7b8efb88436dba5452ef4ab46e9c3d72f242adb1"
+  },
+  "source": {
+    "before": {
+      "revision": "f2df4fac525fa0f73ff2e1b558f167e1e598f6c5",
+      "status": "",
+      "dirty": false,
+      "patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "after": {
+      "revision": "7b8efb88436dba5452ef4ab46e9c3d72f242adb1",
+      "status": "",
+      "dirty": false,
+      "patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "client": {
+      "revision": "27b89cd661b944f6c4738a8d240ffc0ffc649483",
+      "status": "",
+      "dirty": false,
+      "patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  },
+  "config": {
+    "KeySelection": "splitmix64-independent-with-replacement-v1",
+    "Rows": 1024,
+    "PayloadBytes": 256,
+    "Operations": 2000,
+    "ScanOperations": 200,
+    "Warmup": 100,
+    "Repetitions": 2,
+    "Clients": "1,8",
+    "Protocol": "extended unnamed parse/bind/execute; text parameters/results; one autocommit statement per operation",
+    "Tables": [
+      "rf3_sql_bench"
+    ],
+    "Workloads": [
+      "point_hit",
+      "point_miss",
+      "range_64",
+      "group_16",
+      "update_existing"
+    ],
+    "GroupDistribution": "uniform",
+    "SkewPercent": 80,
+    "EndpointCount": 1,
+    "EndpointRouting": "round-robin-per-client"
+  },
+  "orders": {
+    "before-first": [
+      "before",
+      "after",
+      "crdb"
+    ],
+    "after-first": [
+      "crdb",
+      "after",
+      "before"
+    ]
+  },
+  "limits": {
+    "NanoCpus": 12000000000,
+    "Memory": 25769803776,
+    "MemorySwap": 25769803776
+  },
+  "sources": [
+    {
+      "order": "before-first",
+      "arm": "before",
+      "revision": "f2df4fac525fa0f73ff2e1b558f167e1e598f6c5",
+      "report": "baseline-c1-c8/before-first/before/report.json",
+      "sha256": "9d8fc258b9584d8ea5200d8e999fcf13ebcb195d619d87234179142266b8e966",
+      "version": "PostgreSQL 16.0 (vibedb pgwire)",
+      "trials": 20,
+      "samples": 25600,
+      "sql_errors": 0,
+      "platform": "Linux c1303ef4ef34 7.0.12-linuxkit #1 SMP PREEMPT Fri Aug 14 16:27:59 UTC 2026 aarch64 GNU/Linux",
+      "process_counts": {
+        "vibedb": 1,
+        "vibedb_shard": 3,
+        "vibedb_gateway": 0,
+        "cockroach": 0
+      },
+      "forced_shutdown": false,
+      "server_exit_codes": [
+        0
+      ]
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "revision": "7b8efb88436dba5452ef4ab46e9c3d72f242adb1",
+      "report": "baseline-c1-c8/before-first/after/report.json",
+      "sha256": "80af60ba63ad5182f95379b94ac94dbe0d96954db96303a61707eb9d477c5842",
+      "version": "PostgreSQL 16.0 (vibedb pgwire)",
+      "trials": 20,
+      "samples": 25600,
+      "sql_errors": 0,
+      "platform": "Linux 8a88be86758d 7.0.12-linuxkit #1 SMP PREEMPT Fri Aug 14 16:27:59 UTC 2026 aarch64 GNU/Linux",
+      "process_counts": {
+        "vibedb": 1,
+        "vibedb_shard": 3,
+        "vibedb_gateway": 0,
+        "cockroach": 0
+      },
+      "forced_shutdown": false,
+      "server_exit_codes": [
+        0
+      ]
+    },
+    {
+      "order": "before-first",
+      "arm": "crdb",
+      "revision": "cockroachdb/cockroach:v26.3.1@sha256:204f131510c78393adb02345f289a8dbb32e1491e26cc92b6c7751f3b97be3c5",
+      "report": "baseline-c1-c8/before-first/crdb/report.json",
+      "sha256": "246c0eb21b966c3930d445527321a4600a830b16d51cd50b39e2bea5bf62812b",
+      "version": "CockroachDB CCL v26.3.1 (aarch64-unknown-linux-gnu, built 2026/08/24 17:37:27, go1.26.6)",
+      "trials": 20,
+      "samples": 25600,
+      "sql_errors": 0,
+      "platform": "Linux 3eebc154baf4 7.0.12-linuxkit #1 SMP PREEMPT Fri Aug 14 16:27:59 UTC 2026 aarch64 GNU/Linux",
+      "process_counts": {
+        "vibedb": 0,
+        "vibedb_shard": 0,
+        "vibedb_gateway": 0,
+        "cockroach": 3
+      },
+      "forced_shutdown": true,
+      "server_exit_codes": [
+        137,
+        0,
+        0
+      ]
+    },
+    {
+      "order": "after-first",
+      "arm": "crdb",
+      "revision": "cockroachdb/cockroach:v26.3.1@sha256:204f131510c78393adb02345f289a8dbb32e1491e26cc92b6c7751f3b97be3c5",
+      "report": "baseline-c1-c8/after-first/crdb/report.json",
+      "sha256": "4bf30635393b822312a0b7c3e625f328a99250009de103f3bc86f8b8bd29e54c",
+      "version": "CockroachDB CCL v26.3.1 (aarch64-unknown-linux-gnu, built 2026/08/24 17:37:27, go1.26.6)",
+      "trials": 20,
+      "samples": 25600,
+      "sql_errors": 0,
+      "platform": "Linux f6edc72a8732 7.0.12-linuxkit #1 SMP PREEMPT Fri Aug 14 16:27:59 UTC 2026 aarch64 GNU/Linux",
+      "process_counts": {
+        "vibedb": 0,
+        "vibedb_shard": 0,
+        "vibedb_gateway": 0,
+        "cockroach": 3
+      },
+      "forced_shutdown": true,
+      "server_exit_codes": [
+        0,
+        137,
+        0
+      ]
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "revision": "7b8efb88436dba5452ef4ab46e9c3d72f242adb1",
+      "report": "baseline-c1-c8/after-first/after/report.json",
+      "sha256": "c9640756bc7bb33ae764dc9bf1d6ebdf44cbcaa17d136292f1cb4c4b5d180607",
+      "version": "PostgreSQL 16.0 (vibedb pgwire)",
+      "trials": 20,
+      "samples": 25600,
+      "sql_errors": 0,
+      "platform": "Linux 4b9f9733d78b 7.0.12-linuxkit #1 SMP PREEMPT Fri Aug 14 16:27:59 UTC 2026 aarch64 GNU/Linux",
+      "process_counts": {
+        "vibedb": 1,
+        "vibedb_shard": 3,
+        "vibedb_gateway": 0,
+        "cockroach": 0
+      },
+      "forced_shutdown": false,
+      "server_exit_codes": [
+        0
+      ]
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "revision": "f2df4fac525fa0f73ff2e1b558f167e1e598f6c5",
+      "report": "baseline-c1-c8/after-first/before/report.json",
+      "sha256": "89da3e08af92eda66c7f31199b71c043ddb364c81a8cd63313a7ed9fb5688a45",
+      "version": "PostgreSQL 16.0 (vibedb pgwire)",
+      "trials": 20,
+      "samples": 25600,
+      "sql_errors": 0,
+      "platform": "Linux bff99253b453 7.0.12-linuxkit #1 SMP PREEMPT Fri Aug 14 16:27:59 UTC 2026 aarch64 GNU/Linux",
+      "process_counts": {
+        "vibedb": 1,
+        "vibedb_shard": 3,
+        "vibedb_gateway": 0,
+        "cockroach": 0
+      },
+      "forced_shutdown": false,
+      "server_exit_codes": [
+        0
+      ]
+    }
+  ],
+  "build_settings": {
+    "candidate-vibedb": {
+      "-buildmode": "exe",
+      "-compiler": "gc",
+      "-trimpath": "true",
+      "CGO_ENABLED": "0",
+      "GOARCH": "arm64",
+      "GOEXPERIMENT": "simd",
+      "GOOS": "linux",
+      "GOARM64": "v8.0",
+      "vcs": "git",
+      "vcs.revision": "7b8efb88436dba5452ef4ab46e9c3d72f242adb1",
+      "vcs.time": "2026-09-04T16:35:35Z",
+      "vcs.modified": "false"
+    },
+    "candidate-vibedb-gateway": {
+      "-buildmode": "exe",
+      "-compiler": "gc",
+      "-trimpath": "true",
+      "CGO_ENABLED": "0",
+      "GOARCH": "arm64",
+      "GOEXPERIMENT": "simd",
+      "GOOS": "linux",
+      "GOARM64": "v8.0",
+      "vcs": "git",
+      "vcs.revision": "7b8efb88436dba5452ef4ab46e9c3d72f242adb1",
+      "vcs.time": "2026-09-04T16:35:35Z",
+      "vcs.modified": "false"
+    },
+    "candidate-vibedb-shard": {
+      "-buildmode": "exe",
+      "-compiler": "gc",
+      "-trimpath": "true",
+      "CGO_ENABLED": "0",
+      "GOARCH": "arm64",
+      "GOEXPERIMENT": "simd",
+      "GOOS": "linux",
+      "GOARM64": "v8.0",
+      "vcs": "git",
+      "vcs.revision": "7b8efb88436dba5452ef4ab46e9c3d72f242adb1",
+      "vcs.time": "2026-09-04T16:35:35Z",
+      "vcs.modified": "false"
+    },
+    "parent-vibedb": {
+      "-buildmode": "exe",
+      "-compiler": "gc",
+      "-trimpath": "true",
+      "CGO_ENABLED": "0",
+      "GOARCH": "arm64",
+      "GOEXPERIMENT": "simd",
+      "GOOS": "linux",
+      "GOARM64": "v8.0",
+      "vcs": "git",
+      "vcs.revision": "f2df4fac525fa0f73ff2e1b558f167e1e598f6c5",
+      "vcs.time": "2026-09-04T16:06:28Z",
+      "vcs.modified": "false"
+    },
+    "parent-vibedb-gateway": {
+      "-buildmode": "exe",
+      "-compiler": "gc",
+      "-trimpath": "true",
+      "CGO_ENABLED": "0",
+      "GOARCH": "arm64",
+      "GOEXPERIMENT": "simd",
+      "GOOS": "linux",
+      "GOARM64": "v8.0",
+      "vcs": "git",
+      "vcs.revision": "f2df4fac525fa0f73ff2e1b558f167e1e598f6c5",
+      "vcs.time": "2026-09-04T16:06:28Z",
+      "vcs.modified": "false"
+    },
+    "parent-vibedb-shard": {
+      "-buildmode": "exe",
+      "-compiler": "gc",
+      "-trimpath": "true",
+      "CGO_ENABLED": "0",
+      "GOARCH": "arm64",
+      "GOEXPERIMENT": "simd",
+      "GOOS": "linux",
+      "GOARM64": "v8.0",
+      "vcs": "git",
+      "vcs.revision": "f2df4fac525fa0f73ff2e1b558f167e1e598f6c5",
+      "vcs.time": "2026-09-04T16:06:28Z",
+      "vcs.modified": "false"
+    },
+    "rf3-sqlbench": {
+      "-buildmode": "exe",
+      "-compiler": "gc",
+      "-trimpath": "true",
+      "CGO_ENABLED": "0",
+      "GOARCH": "arm64",
+      "GOEXPERIMENT": "simd",
+      "GOOS": "linux",
+      "GOARM64": "v8.0",
+      "vcs": "git",
+      "vcs.revision": "27b89cd661b944f6c4738a8d240ffc0ffc649483",
+      "vcs.time": "2026-09-04T14:27:59Z",
+      "vcs.modified": "false"
+    }
+  },
+  "all_actual_binaries_elf64_aarch64": true,
+  "build_binary_sha256": {
+    "candidate-vibedb": "0c8d438389cbef5b3cf2643beb492b2524fa77e39d3c751b1f8e4eb13d227b24",
+    "candidate-vibedb-gateway": "7b84f36346f8a5413bb31ddde6a472bfffd7135d526282d22b9f1d1eed2ee3df",
+    "candidate-vibedb-shard": "e127fffa7277482aedbfd53500469ca8206d849a5ef703a184111eaca97aa434",
+    "cockroach": "7923d5eca1fc275abebd64863fa5e5c51be3504fd57f37c5b8c4f8579bd54c3e",
+    "parent-vibedb": "20c8e9260b07ffeaeabd11ca41459a9898889e2637e9b7036ab0dd9029dcf4dc",
+    "parent-vibedb-gateway": "96706dcde8a50a65f360808f850947614dc524523497fd1488afc30bb2fc7a45",
+    "parent-vibedb-shard": "72c150ae9c46b2dfddbc50878d6ebdb4e4ca9a5cd6f89546325eab42c66a4e0e",
+    "rf3-sqlbench": "9b70628460529c7af78be7b2249a603b6fda730444d2b852502ae4e45b1fcf2b"
+  },
+  "fixture_binary_sha256": {
+    "before": {
+      "candidate-vibedb": "20c8e9260b07ffeaeabd11ca41459a9898889e2637e9b7036ab0dd9029dcf4dc",
+      "candidate-vibedb-gateway": "96706dcde8a50a65f360808f850947614dc524523497fd1488afc30bb2fc7a45",
+      "candidate-vibedb-shard": "72c150ae9c46b2dfddbc50878d6ebdb4e4ca9a5cd6f89546325eab42c66a4e0e",
+      "rf3-sqlbench": "9b70628460529c7af78be7b2249a603b6fda730444d2b852502ae4e45b1fcf2b"
+    },
+    "after": {
+      "candidate-vibedb": "0c8d438389cbef5b3cf2643beb492b2524fa77e39d3c751b1f8e4eb13d227b24",
+      "candidate-vibedb-gateway": "7b84f36346f8a5413bb31ddde6a472bfffd7135d526282d22b9f1d1eed2ee3df",
+      "candidate-vibedb-shard": "e127fffa7277482aedbfd53500469ca8206d849a5ef703a184111eaca97aa434",
+      "rf3-sqlbench": "9b70628460529c7af78be7b2249a603b6fda730444d2b852502ae4e45b1fcf2b"
+    },
+    "crdb": {
+      "candidate-vibedb": "0c8d438389cbef5b3cf2643beb492b2524fa77e39d3c751b1f8e4eb13d227b24",
+      "candidate-vibedb-gateway": "7b84f36346f8a5413bb31ddde6a472bfffd7135d526282d22b9f1d1eed2ee3df",
+      "candidate-vibedb-shard": "e127fffa7277482aedbfd53500469ca8206d849a5ef703a184111eaca97aa434",
+      "cockroach": "7923d5eca1fc275abebd64863fa5e5c51be3504fd57f37c5b8c4f8579bd54c3e",
+      "parent-vibedb": "20c8e9260b07ffeaeabd11ca41459a9898889e2637e9b7036ab0dd9029dcf4dc",
+      "parent-vibedb-gateway": "96706dcde8a50a65f360808f850947614dc524523497fd1488afc30bb2fc7a45",
+      "parent-vibedb-shard": "72c150ae9c46b2dfddbc50878d6ebdb4e4ca9a5cd6f89546325eab42c66a4e0e",
+      "rf3-sqlbench": "9b70628460529c7af78be7b2249a603b6fda730444d2b852502ae4e45b1fcf2b"
+    }
+  },
+  "control_sha256": {
+    "run-fused-node-comparison.py": "c163e48b156baf41929e3f6a036776ca792feed8afc98d1db3a2befd43c4198c",
+    "run-fused-write-comparison.py": "af2209e4c42f07fe74495e2a69c8593aeccf1801fd32807aa087e45a2e22aba4",
+    "summarize-crdb-sql.py": "9f1f3622bb1c3904a211e8a848e9c6a30d7edc79cd6ef65fa517741260ac4fb2"
+  },
+  "before_after_patch_sha256": "2982d13e63709169fa9ffca27ec4e30efd8d22c2735f93f3195b300a6deb4100",
+  "before_after_patch_files": [
+    "docs/guarded-point-update-plan.md",
+    "gateway/durable_sql_prepared_direct.go",
+    "gateway/durable_sql_prepared_direct_committed_test.go",
+    "gateway/durable_sql_prepared_direct_review_test.go",
+    "gateway/durable_sql_prepared_direct_test.go",
+    "gateway/replicated_native.go",
+    "gateway/replicated_sql_transaction.go",
+    "gateway/replicated_sql_transaction_test.go"
+  ],
+  "counts": {
+    "fixtures": 6,
+    "trials": 120,
+    "samples": 153600,
+    "sql_errors": 0,
+    "diagnostic_snapshots": 480,
+    "warmup_operations": 12000,
+    "summed_trial_seconds": 122.505823222,
+    "campaign_wall_seconds": 325.457816
+  },
+  "per_order": {
+    "before-first": {
+      "geomean_vs_before": 1.7905299762656368,
+      "geomean_vs_crdb": 0.577423266125907,
+      "throughput_regressions_over_5pct": [],
+      "p99_regressions_over_10pct": [],
+      "geomean_cell_p99_ratio_vs_before": 0.18861394530832667,
+      "geomean_cell_p99_ratio_vs_crdb": 1.6501852055545145
+    },
+    "after-first": {
+      "geomean_vs_before": 0.8896178841024361,
+      "geomean_vs_crdb": 0.49487665480894105,
+      "throughput_regressions_over_5pct": [
+        {
+          "workload": "range_64",
+          "clients": 1,
+          "arms": {
+            "before": {
+              "ops_s": 2387.8375358586127,
+              "p99_ms": 0.585375
+            },
+            "after": {
+              "ops_s": 1095.3978664474296,
+              "p99_ms": 4.084208
+            },
+            "crdb": {
+              "ops_s": 4174.102740153888,
+              "p99_ms": 0.51375
+            }
+          },
+          "throughput_vs_before": 0.45874053405963783,
+          "p99_vs_before": 6.9770796497971395,
+          "throughput_vs_crdb": 0.2624271453383165,
+          "p99_vs_crdb": 7.949796593673966
+        },
+        {
+          "workload": "range_64",
+          "clients": 8,
+          "arms": {
+            "before": {
+              "ops_s": 11087.237937851343,
+              "p99_ms": 1.4290415
+            },
+            "after": {
+              "ops_s": 5188.823037323677,
+              "p99_ms": 6.5985625
+            },
+            "crdb": {
+              "ops_s": 21265.244998039187,
+              "p99_ms": 1.2465415
+            }
+          },
+          "throughput_vs_before": 0.46799961058013045,
+          "p99_vs_before": 4.617474370058532,
+          "throughput_vs_crdb": 0.24400485570714683,
+          "p99_vs_crdb": 5.29349604485691
+        },
+        {
+          "workload": "group_16",
+          "clients": 1,
+          "arms": {
+            "before": {
+              "ops_s": 1209.3539900002531,
+              "p99_ms": 1.0360205
+            },
+            "after": {
+              "ops_s": 1000.7504042189669,
+              "p99_ms": 2.997229
+            },
+            "crdb": {
+              "ops_s": 1463.743946650654,
+              "p99_ms": 3.328396
+            }
+          },
+          "throughput_vs_before": 0.8275082502673659,
+          "p99_vs_before": 2.893020939257476,
+          "throughput_vs_crdb": 0.6836922581363283,
+          "p99_vs_crdb": 0.900502524339051
+        },
+        {
+          "workload": "group_16",
+          "clients": 8,
+          "arms": {
+            "before": {
+              "ops_s": 8044.922345900547,
+              "p99_ms": 1.7342915
+            },
+            "after": {
+              "ops_s": 5968.087300922427,
+              "p99_ms": 3.9994795
+            },
+            "crdb": {
+              "ops_s": 17348.39553880634,
+              "p99_ms": 0.6971875
+            }
+          },
+          "throughput_vs_before": 0.741845234089001,
+          "p99_vs_before": 2.306117224238255,
+          "throughput_vs_crdb": 0.344013790069088,
+          "p99_vs_crdb": 5.736590945764232
+        },
+        {
+          "workload": "update_existing",
+          "clients": 1,
+          "arms": {
+            "before": {
+              "ops_s": 504.44708477172117,
+              "p99_ms": 12.361771
+            },
+            "after": {
+              "ops_s": 396.417278233935,
+              "p99_ms": 23.5599585
+            },
+            "crdb": {
+              "ops_s": 1143.919576972773,
+              "p99_ms": 1.2355625
+            }
+          },
+          "throughput_vs_before": 0.7858451167644805,
+          "p99_vs_before": 1.9058724271789214,
+          "throughput_vs_crdb": 0.34654296177271415,
+          "p99_vs_crdb": 19.068204562699176
+        }
+      ],
+      "p99_regressions_over_10pct": [
+        {
+          "workload": "point_miss",
+          "clients": 1,
+          "arms": {
+            "before": {
+              "ops_s": 3807.866740991697,
+              "p99_ms": 0.409979
+            },
+            "after": {
+              "ops_s": 3931.305489606353,
+              "p99_ms": 0.5782915
+            },
+            "crdb": {
+              "ops_s": 4527.055868403256,
+              "p99_ms": 1.917187
+            }
+          },
+          "throughput_vs_before": 1.0324167721747817,
+          "p99_vs_before": 1.4105393203066499,
+          "throughput_vs_crdb": 0.8684022472629589,
+          "p99_vs_crdb": 0.30163541688943224
+        },
+        {
+          "workload": "point_miss",
+          "clients": 8,
+          "arms": {
+            "before": {
+              "ops_s": 17634.018182593285,
+              "p99_ms": 0.765125
+            },
+            "after": {
+              "ops_s": 19173.96669756303,
+              "p99_ms": 1.041583
+            },
+            "crdb": {
+              "ops_s": 38782.55039179402,
+              "p99_ms": 0.76375
+            }
+          },
+          "throughput_vs_before": 1.0873282821319672,
+          "p99_vs_before": 1.3613239666721122,
+          "throughput_vs_crdb": 0.4943967455430688,
+          "p99_vs_crdb": 1.3637747954173485
+        },
+        {
+          "workload": "range_64",
+          "clients": 1,
+          "arms": {
+            "before": {
+              "ops_s": 2387.8375358586127,
+              "p99_ms": 0.585375
+            },
+            "after": {
+              "ops_s": 1095.3978664474296,
+              "p99_ms": 4.084208
+            },
+            "crdb": {
+              "ops_s": 4174.102740153888,
+              "p99_ms": 0.51375
+            }
+          },
+          "throughput_vs_before": 0.45874053405963783,
+          "p99_vs_before": 6.9770796497971395,
+          "throughput_vs_crdb": 0.2624271453383165,
+          "p99_vs_crdb": 7.949796593673966
+        },
+        {
+          "workload": "range_64",
+          "clients": 8,
+          "arms": {
+            "before": {
+              "ops_s": 11087.237937851343,
+              "p99_ms": 1.4290415
+            },
+            "after": {
+              "ops_s": 5188.823037323677,
+              "p99_ms": 6.5985625
+            },
+            "crdb": {
+              "ops_s": 21265.244998039187,
+              "p99_ms": 1.2465415
+            }
+          },
+          "throughput_vs_before": 0.46799961058013045,
+          "p99_vs_before": 4.617474370058532,
+          "throughput_vs_crdb": 0.24400485570714683,
+          "p99_vs_crdb": 5.29349604485691
+        },
+        {
+          "workload": "group_16",
+          "clients": 1,
+          "arms": {
+            "before": {
+              "ops_s": 1209.3539900002531,
+              "p99_ms": 1.0360205
+            },
+            "after": {
+              "ops_s": 1000.7504042189669,
+              "p99_ms": 2.997229
+            },
+            "crdb": {
+              "ops_s": 1463.743946650654,
+              "p99_ms": 3.328396
+            }
+          },
+          "throughput_vs_before": 0.8275082502673659,
+          "p99_vs_before": 2.893020939257476,
+          "throughput_vs_crdb": 0.6836922581363283,
+          "p99_vs_crdb": 0.900502524339051
+        },
+        {
+          "workload": "group_16",
+          "clients": 8,
+          "arms": {
+            "before": {
+              "ops_s": 8044.922345900547,
+              "p99_ms": 1.7342915
+            },
+            "after": {
+              "ops_s": 5968.087300922427,
+              "p99_ms": 3.9994795
+            },
+            "crdb": {
+              "ops_s": 17348.39553880634,
+              "p99_ms": 0.6971875
+            }
+          },
+          "throughput_vs_before": 0.741845234089001,
+          "p99_vs_before": 2.306117224238255,
+          "throughput_vs_crdb": 0.344013790069088,
+          "p99_vs_crdb": 5.736590945764232
+        },
+        {
+          "workload": "update_existing",
+          "clients": 1,
+          "arms": {
+            "before": {
+              "ops_s": 504.44708477172117,
+              "p99_ms": 12.361771
+            },
+            "after": {
+              "ops_s": 396.417278233935,
+              "p99_ms": 23.5599585
+            },
+            "crdb": {
+              "ops_s": 1143.919576972773,
+              "p99_ms": 1.2355625
+            }
+          },
+          "throughput_vs_before": 0.7858451167644805,
+          "p99_vs_before": 1.9058724271789214,
+          "throughput_vs_crdb": 0.34654296177271415,
+          "p99_vs_crdb": 19.068204562699176
+        }
+      ],
+      "geomean_cell_p99_ratio_vs_before": 1.748993571489315,
+      "geomean_cell_p99_ratio_vs_crdb": 2.003592560059099
+    }
+  },
+  "tables": {
+    "before-first": [
+      {
+        "workload": "point_hit",
+        "clients": 1,
+        "arms": {
+          "before": {
+            "ops_s": 4174.91637302707,
+            "p99_ms": 0.418271
+          },
+          "after": {
+            "ops_s": 4376.348903315307,
+            "p99_ms": 0.366542
+          },
+          "crdb": {
+            "ops_s": 8205.453596184383,
+            "p99_ms": 0.2247295
+          }
+        },
+        "throughput_vs_before": 1.04824827907683,
+        "p99_vs_before": 0.8763265920898173,
+        "throughput_vs_crdb": 0.5333463716558403,
+        "p99_vs_crdb": 1.631036423789489
+      },
+      {
+        "workload": "point_hit",
+        "clients": 8,
+        "arms": {
+          "before": {
+            "ops_s": 11429.143094316345,
+            "p99_ms": 6.3269795
+          },
+          "after": {
+            "ops_s": 21621.65800566582,
+            "p99_ms": 0.7402085
+          },
+          "crdb": {
+            "ops_s": 44437.65110067512,
+            "p99_ms": 0.389541
+          }
+        },
+        "throughput_vs_before": 1.891800446213519,
+        "p99_vs_before": 0.11699239739910648,
+        "throughput_vs_crdb": 0.4865616761939367,
+        "p99_vs_crdb": 1.900206910184037
+      },
+      {
+        "workload": "point_miss",
+        "clients": 1,
+        "arms": {
+          "before": {
+            "ops_s": 4298.936275403961,
+            "p99_ms": 0.436729
+          },
+          "after": {
+            "ops_s": 4485.18529468898,
+            "p99_ms": 0.385646
+          },
+          "crdb": {
+            "ops_s": 6935.143355721686,
+            "p99_ms": 0.329354
+          }
+        },
+        "throughput_vs_before": 1.0433244429210613,
+        "p99_vs_before": 0.8830327273892964,
+        "throughput_vs_crdb": 0.6467328885117534,
+        "p99_vs_crdb": 1.170916399982997
+      },
+      {
+        "workload": "point_miss",
+        "clients": 8,
+        "arms": {
+          "before": {
+            "ops_s": 7360.529028826699,
+            "p99_ms": 12.7366455
+          },
+          "after": {
+            "ops_s": 22201.19167925795,
+            "p99_ms": 0.6804795
+          },
+          "crdb": {
+            "ops_s": 31716.451245086748,
+            "p99_ms": 1.2726045
+          }
+        },
+        "throughput_vs_before": 3.0162494560254345,
+        "p99_vs_before": 0.053426901141277745,
+        "throughput_vs_crdb": 0.699989778418138,
+        "p99_vs_crdb": 0.5347140450941358
+      },
+      {
+        "workload": "range_64",
+        "clients": 1,
+        "arms": {
+          "before": {
+            "ops_s": 1227.1083329470314,
+            "p99_ms": 12.3273335
+          },
+          "after": {
+            "ops_s": 2468.7974581351687,
+            "p99_ms": 0.7569375
+          },
+          "crdb": {
+            "ops_s": 4387.451881318271,
+            "p99_ms": 0.403417
+          }
+        },
+        "throughput_vs_before": 2.0118822371665335,
+        "p99_vs_before": 0.06140318179921068,
+        "throughput_vs_crdb": 0.5626950505479695,
+        "p99_vs_crdb": 1.8763153263248697
+      },
+      {
+        "workload": "range_64",
+        "clients": 8,
+        "arms": {
+          "before": {
+            "ops_s": 8369.855315596333,
+            "p99_ms": 18.1098125
+          },
+          "after": {
+            "ops_s": 15013.435470391536,
+            "p99_ms": 0.9363125
+          },
+          "crdb": {
+            "ops_s": 27042.313485674582,
+            "p99_ms": 0.542021
+          }
+        },
+        "throughput_vs_before": 1.793750895838737,
+        "p99_vs_before": 0.05170194335253333,
+        "throughput_vs_crdb": 0.555183101414188,
+        "p99_vs_crdb": 1.7274469070386573
+      },
+      {
+        "workload": "group_16",
+        "clients": 1,
+        "arms": {
+          "before": {
+            "ops_s": 1134.9115060629715,
+            "p99_ms": 4.4963125
+          },
+          "after": {
+            "ops_s": 1350.171396307487,
+            "p99_ms": 0.934104
+          },
+          "crdb": {
+            "ops_s": 2296.5044809502206,
+            "p99_ms": 1.2285
+          }
+        },
+        "throughput_vs_before": 1.1896710792819924,
+        "p99_vs_before": 0.2077489053529976,
+        "throughput_vs_crdb": 0.5879245642703161,
+        "p99_vs_crdb": 0.7603614163614164
+      },
+      {
+        "workload": "group_16",
+        "clients": 8,
+        "arms": {
+          "before": {
+            "ops_s": 7037.00074762272,
+            "p99_ms": 5.361417
+          },
+          "after": {
+            "ops_s": 8811.4877275959,
+            "p99_ms": 1.9392085
+          },
+          "crdb": {
+            "ops_s": 17045.599395633846,
+            "p99_ms": 0.6465005
+          }
+        },
+        "throughput_vs_before": 1.2521652396545002,
+        "p99_vs_before": 0.36169701032394974,
+        "throughput_vs_crdb": 0.5169362204917783,
+        "p99_vs_crdb": 2.999546790760409
+      },
+      {
+        "workload": "update_existing",
+        "clients": 1,
+        "arms": {
+          "before": {
+            "ops_s": 121.44597833869774,
+            "p99_ms": 107.9506245
+          },
+          "after": {
+            "ops_s": 629.9214702037102,
+            "p99_ms": 10.911834
+          },
+          "crdb": {
+            "ops_s": 1079.2968877755666,
+            "p99_ms": 4.1209375
+          }
+        },
+        "throughput_vs_before": 5.186845038597635,
+        "p99_vs_before": 0.10108171259352002,
+        "throughput_vs_crdb": 0.5836405879961165,
+        "p99_vs_crdb": 2.647900872070979
+      },
+      {
+        "workload": "update_existing",
+        "clients": 8,
+        "arms": {
+          "before": {
+            "ops_s": 1924.3727155751635,
+            "p99_ms": 19.5075835
+          },
+          "after": {
+            "ops_s": 3745.609725145665,
+            "p99_ms": 9.5307495
+          },
+          "crdb": {
+            "ops_s": 5917.75543425367,
+            "p99_ms": 2.4176875
+          }
+        },
+        "throughput_vs_before": 1.9464055454694822,
+        "p99_vs_before": 0.48856638240200284,
+        "throughput_vs_crdb": 0.632944326064068,
+        "p99_vs_crdb": 3.9420932192435956
+      }
+    ],
+    "after-first": [
+      {
+        "workload": "point_hit",
+        "clients": 1,
+        "arms": {
+          "before": {
+            "ops_s": 3466.5923860954726,
+            "p99_ms": 0.4991245
+          },
+          "after": {
+            "ops_s": 3913.952333478906,
+            "p99_ms": 0.4220625
+          },
+          "crdb": {
+            "ops_s": 4552.909855930229,
+            "p99_ms": 1.6627085
+          }
+        },
+        "throughput_vs_before": 1.1290489038104963,
+        "p99_vs_before": 0.8456056555027853,
+        "throughput_vs_crdb": 0.8596595270562908,
+        "p99_vs_crdb": 0.25384034543637685
+      },
+      {
+        "workload": "point_hit",
+        "clients": 8,
+        "arms": {
+          "before": {
+            "ops_s": 17087.982560778688,
+            "p99_ms": 0.867521
+          },
+          "after": {
+            "ops_s": 20242.315338541463,
+            "p99_ms": 0.7578125
+          },
+          "crdb": {
+            "ops_s": 28564.14005126892,
+            "p99_ms": 1.920542
+          }
+        },
+        "throughput_vs_before": 1.1845936327792597,
+        "p99_vs_before": 0.8735379316466114,
+        "throughput_vs_crdb": 0.7086618152063789,
+        "p99_vs_crdb": 0.3945826230303737
+      },
+      {
+        "workload": "point_miss",
+        "clients": 1,
+        "arms": {
+          "before": {
+            "ops_s": 3807.866740991697,
+            "p99_ms": 0.409979
+          },
+          "after": {
+            "ops_s": 3931.305489606353,
+            "p99_ms": 0.5782915
+          },
+          "crdb": {
+            "ops_s": 4527.055868403256,
+            "p99_ms": 1.917187
+          }
+        },
+        "throughput_vs_before": 1.0324167721747817,
+        "p99_vs_before": 1.4105393203066499,
+        "throughput_vs_crdb": 0.8684022472629589,
+        "p99_vs_crdb": 0.30163541688943224
+      },
+      {
+        "workload": "point_miss",
+        "clients": 8,
+        "arms": {
+          "before": {
+            "ops_s": 17634.018182593285,
+            "p99_ms": 0.765125
+          },
+          "after": {
+            "ops_s": 19173.96669756303,
+            "p99_ms": 1.041583
+          },
+          "crdb": {
+            "ops_s": 38782.55039179402,
+            "p99_ms": 0.76375
+          }
+        },
+        "throughput_vs_before": 1.0873282821319672,
+        "p99_vs_before": 1.3613239666721122,
+        "throughput_vs_crdb": 0.4943967455430688,
+        "p99_vs_crdb": 1.3637747954173485
+      },
+      {
+        "workload": "range_64",
+        "clients": 1,
+        "arms": {
+          "before": {
+            "ops_s": 2387.8375358586127,
+            "p99_ms": 0.585375
+          },
+          "after": {
+            "ops_s": 1095.3978664474296,
+            "p99_ms": 4.084208
+          },
+          "crdb": {
+            "ops_s": 4174.102740153888,
+            "p99_ms": 0.51375
+          }
+        },
+        "throughput_vs_before": 0.45874053405963783,
+        "p99_vs_before": 6.9770796497971395,
+        "throughput_vs_crdb": 0.2624271453383165,
+        "p99_vs_crdb": 7.949796593673966
+      },
+      {
+        "workload": "range_64",
+        "clients": 8,
+        "arms": {
+          "before": {
+            "ops_s": 11087.237937851343,
+            "p99_ms": 1.4290415
+          },
+          "after": {
+            "ops_s": 5188.823037323677,
+            "p99_ms": 6.5985625
+          },
+          "crdb": {
+            "ops_s": 21265.244998039187,
+            "p99_ms": 1.2465415
+          }
+        },
+        "throughput_vs_before": 0.46799961058013045,
+        "p99_vs_before": 4.617474370058532,
+        "throughput_vs_crdb": 0.24400485570714683,
+        "p99_vs_crdb": 5.29349604485691
+      },
+      {
+        "workload": "group_16",
+        "clients": 1,
+        "arms": {
+          "before": {
+            "ops_s": 1209.3539900002531,
+            "p99_ms": 1.0360205
+          },
+          "after": {
+            "ops_s": 1000.7504042189669,
+            "p99_ms": 2.997229
+          },
+          "crdb": {
+            "ops_s": 1463.743946650654,
+            "p99_ms": 3.328396
+          }
+        },
+        "throughput_vs_before": 0.8275082502673659,
+        "p99_vs_before": 2.893020939257476,
+        "throughput_vs_crdb": 0.6836922581363283,
+        "p99_vs_crdb": 0.900502524339051
+      },
+      {
+        "workload": "group_16",
+        "clients": 8,
+        "arms": {
+          "before": {
+            "ops_s": 8044.922345900547,
+            "p99_ms": 1.7342915
+          },
+          "after": {
+            "ops_s": 5968.087300922427,
+            "p99_ms": 3.9994795
+          },
+          "crdb": {
+            "ops_s": 17348.39553880634,
+            "p99_ms": 0.6971875
+          }
+        },
+        "throughput_vs_before": 0.741845234089001,
+        "p99_vs_before": 2.306117224238255,
+        "throughput_vs_crdb": 0.344013790069088,
+        "p99_vs_crdb": 5.736590945764232
+      },
+      {
+        "workload": "update_existing",
+        "clients": 1,
+        "arms": {
+          "before": {
+            "ops_s": 504.44708477172117,
+            "p99_ms": 12.361771
+          },
+          "after": {
+            "ops_s": 396.417278233935,
+            "p99_ms": 23.5599585
+          },
+          "crdb": {
+            "ops_s": 1143.919576972773,
+            "p99_ms": 1.2355625
+          }
+        },
+        "throughput_vs_before": 0.7858451167644805,
+        "p99_vs_before": 1.9058724271789214,
+        "throughput_vs_crdb": 0.34654296177271415,
+        "p99_vs_crdb": 19.068204562699176
+      },
+      {
+        "workload": "update_existing",
+        "clients": 8,
+        "arms": {
+          "before": {
+            "ops_s": 2005.5322692161142,
+            "p99_ms": 22.9679375
+          },
+          "after": {
+            "ops_s": 4004.3461408140392,
+            "p99_ms": 10.5877295
+          },
+          "crdb": {
+            "ops_s": 6204.757581212654,
+            "p99_ms": 1.734521
+          }
+        },
+        "throughput_vs_before": 1.9966500675549763,
+        "p99_vs_before": 0.4609786795179149,
+        "throughput_vs_crdb": 0.6453670571979755,
+        "p99_vs_crdb": 6.104122982656307
+      }
+    ]
+  },
+  "locality": [
+    {
+      "order": "before-first",
+      "arm": "before",
+      "class": "reads",
+      "successful_operations": 17600,
+      "counters": {
+        "checkpoint_queue_rejected": 0,
+        "checkpoint_queue_submissions": 0,
+        "checkpoint_queue_wait_ns": 0,
+        "checkpoint_service_ns": 0,
+        "failed_waves": 0,
+        "gateway_legacy_calls": 1017,
+        "gateway_local_calls": 17605,
+        "gateway_remote_calls": 1012,
+        "gateway_semantic_sql_calls": 17600,
+        "gateway_sql_request_encoded_bytes": 0,
+        "gateway_sql_request_encodings": 0,
+        "multi_group_waves": 0,
+        "native_accepted": 0,
+        "native_failed": 0,
+        "native_rejected": 0,
+        "native_semantic_dispatches": 17605,
+        "observed_append_barriers": 456,
+        "ready_durable_waves": 456,
+        "ready_waves": 456,
+        "remote_dials": 0,
+        "remote_handshake_failures": 0,
+        "remote_poisoned": 0,
+        "remote_rejected": 0,
+        "remote_reuses": 1012
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "before",
+      "class": "updates",
+      "successful_operations": 8000,
+      "counters": {
+        "checkpoint_queue_rejected": 0,
+        "checkpoint_queue_submissions": 0,
+        "checkpoint_queue_wait_ns": 0,
+        "checkpoint_service_ns": 0,
+        "failed_waves": 0,
+        "gateway_legacy_calls": 32186,
+        "gateway_local_calls": 17576,
+        "gateway_remote_calls": 14610,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encoded_bytes": 0,
+        "gateway_sql_request_encodings": 0,
+        "multi_group_waves": 3899,
+        "native_accepted": 7,
+        "native_failed": 0,
+        "native_rejected": 0,
+        "native_semantic_dispatches": 17576,
+        "observed_append_barriers": 38701,
+        "ready_durable_waves": 38701,
+        "ready_waves": 38701,
+        "remote_dials": 7,
+        "remote_handshake_failures": 0,
+        "remote_poisoned": 8,
+        "remote_rejected": 0,
+        "remote_reuses": 14603
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "class": "reads",
+      "successful_operations": 17600,
+      "counters": {
+        "checkpoint_queue_rejected": 0,
+        "checkpoint_queue_submissions": 0,
+        "checkpoint_queue_wait_ns": 0,
+        "checkpoint_service_ns": 0,
+        "failed_waves": 0,
+        "gateway_legacy_calls": 1919,
+        "gateway_local_calls": 17600,
+        "gateway_remote_calls": 1919,
+        "gateway_semantic_sql_calls": 17600,
+        "gateway_sql_request_encoded_bytes": 0,
+        "gateway_sql_request_encodings": 0,
+        "multi_group_waves": 0,
+        "native_accepted": 0,
+        "native_failed": 0,
+        "native_rejected": 0,
+        "native_semantic_dispatches": 17600,
+        "observed_append_barriers": 23,
+        "ready_durable_waves": 23,
+        "ready_waves": 23,
+        "remote_dials": 0,
+        "remote_handshake_failures": 0,
+        "remote_poisoned": 0,
+        "remote_rejected": 0,
+        "remote_reuses": 1919
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "class": "updates",
+      "successful_operations": 8000,
+      "counters": {
+        "checkpoint_queue_rejected": 0,
+        "checkpoint_queue_submissions": 0,
+        "checkpoint_queue_wait_ns": 0,
+        "checkpoint_service_ns": 0,
+        "failed_waves": 0,
+        "gateway_legacy_calls": 20985,
+        "gateway_local_calls": 16011,
+        "gateway_remote_calls": 4974,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encoded_bytes": 0,
+        "gateway_sql_request_encodings": 0,
+        "multi_group_waves": 23,
+        "native_accepted": 0,
+        "native_failed": 2,
+        "native_rejected": 0,
+        "native_semantic_dispatches": 16011,
+        "observed_append_barriers": 27333,
+        "ready_durable_waves": 27333,
+        "ready_waves": 27333,
+        "remote_dials": 0,
+        "remote_handshake_failures": 0,
+        "remote_poisoned": 0,
+        "remote_rejected": 0,
+        "remote_reuses": 4974
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "class": "reads",
+      "successful_operations": 17600,
+      "counters": {
+        "checkpoint_queue_rejected": 0,
+        "checkpoint_queue_submissions": 0,
+        "checkpoint_queue_wait_ns": 0,
+        "checkpoint_service_ns": 0,
+        "failed_waves": 0,
+        "gateway_legacy_calls": 2416,
+        "gateway_local_calls": 17600,
+        "gateway_remote_calls": 2416,
+        "gateway_semantic_sql_calls": 17600,
+        "gateway_sql_request_encoded_bytes": 0,
+        "gateway_sql_request_encodings": 0,
+        "multi_group_waves": 0,
+        "native_accepted": 0,
+        "native_failed": 0,
+        "native_rejected": 0,
+        "native_semantic_dispatches": 17600,
+        "observed_append_barriers": 14,
+        "ready_durable_waves": 14,
+        "ready_waves": 14,
+        "remote_dials": 0,
+        "remote_handshake_failures": 0,
+        "remote_poisoned": 0,
+        "remote_rejected": 0,
+        "remote_reuses": 2416
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "class": "updates",
+      "successful_operations": 8000,
+      "counters": {
+        "checkpoint_queue_rejected": 0,
+        "checkpoint_queue_submissions": 0,
+        "checkpoint_queue_wait_ns": 0,
+        "checkpoint_service_ns": 0,
+        "failed_waves": 0,
+        "gateway_legacy_calls": 22933,
+        "gateway_local_calls": 16003,
+        "gateway_remote_calls": 6930,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encoded_bytes": 0,
+        "gateway_sql_request_encodings": 0,
+        "multi_group_waves": 30,
+        "native_accepted": 0,
+        "native_failed": 5,
+        "native_rejected": 0,
+        "native_semantic_dispatches": 16003,
+        "observed_append_barriers": 27378,
+        "ready_durable_waves": 27378,
+        "ready_waves": 27378,
+        "remote_dials": 0,
+        "remote_handshake_failures": 0,
+        "remote_poisoned": 0,
+        "remote_rejected": 0,
+        "remote_reuses": 6930
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "class": "reads",
+      "successful_operations": 17600,
+      "counters": {
+        "checkpoint_queue_rejected": 0,
+        "checkpoint_queue_submissions": 0,
+        "checkpoint_queue_wait_ns": 0,
+        "checkpoint_service_ns": 0,
+        "failed_waves": 0,
+        "gateway_legacy_calls": 2194,
+        "gateway_local_calls": 2192,
+        "gateway_remote_calls": 17602,
+        "gateway_semantic_sql_calls": 17600,
+        "gateway_sql_request_encoded_bytes": 4072800,
+        "gateway_sql_request_encodings": 17600,
+        "multi_group_waves": 0,
+        "native_accepted": 7,
+        "native_failed": 0,
+        "native_rejected": 0,
+        "native_semantic_dispatches": 2192,
+        "observed_append_barriers": 33,
+        "ready_durable_waves": 33,
+        "ready_waves": 33,
+        "remote_dials": 7,
+        "remote_handshake_failures": 0,
+        "remote_poisoned": 0,
+        "remote_rejected": 0,
+        "remote_reuses": 17595
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "class": "updates",
+      "successful_operations": 8000,
+      "counters": {
+        "checkpoint_queue_rejected": 0,
+        "checkpoint_queue_submissions": 0,
+        "checkpoint_queue_wait_ns": 0,
+        "checkpoint_service_ns": 0,
+        "failed_waves": 0,
+        "gateway_legacy_calls": 23392,
+        "gateway_local_calls": 6866,
+        "gateway_remote_calls": 16526,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encoded_bytes": 0,
+        "gateway_sql_request_encodings": 0,
+        "multi_group_waves": 52,
+        "native_accepted": 0,
+        "native_failed": 4,
+        "native_rejected": 0,
+        "native_semantic_dispatches": 6866,
+        "observed_append_barriers": 30810,
+        "ready_durable_waves": 30810,
+        "ready_waves": 30810,
+        "remote_dials": 0,
+        "remote_handshake_failures": 0,
+        "remote_poisoned": 0,
+        "remote_rejected": 0,
+        "remote_reuses": 16526
+      }
+    }
+  ],
+  "updates": [
+    {
+      "order": "before-first",
+      "arm": "before",
+      "clients": 1,
+      "successful_updates": 4000,
+      "counters": {
+        "checkpoint_queue_rejected": 0,
+        "checkpoint_queue_submissions": 0,
+        "checkpoint_queue_wait_ns": 0,
+        "checkpoint_service_ns": 0,
+        "failed_waves": 0,
+        "gateway_legacy_calls": 21196,
+        "gateway_local_calls": 8047,
+        "gateway_remote_calls": 13149,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encoded_bytes": 0,
+        "gateway_sql_request_encodings": 0,
+        "multi_group_waves": 3868,
+        "native_accepted": 7,
+        "native_failed": 0,
+        "native_rejected": 0,
+        "native_semantic_dispatches": 8047,
+        "observed_append_barriers": 32625,
+        "ready_durable_waves": 32625,
+        "ready_waves": 32625,
+        "remote_dials": 7,
+        "remote_handshake_failures": 0,
+        "remote_poisoned": 8,
+        "remote_rejected": 0,
+        "remote_reuses": 13142
+      },
+      "cluster_barriers_per_update": 8.15625
+    },
+    {
+      "order": "before-first",
+      "arm": "before",
+      "clients": 8,
+      "successful_updates": 4000,
+      "counters": {
+        "checkpoint_queue_rejected": 0,
+        "checkpoint_queue_submissions": 0,
+        "checkpoint_queue_wait_ns": 0,
+        "checkpoint_service_ns": 0,
+        "failed_waves": 0,
+        "gateway_legacy_calls": 10990,
+        "gateway_local_calls": 9529,
+        "gateway_remote_calls": 1461,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encoded_bytes": 0,
+        "gateway_sql_request_encodings": 0,
+        "multi_group_waves": 31,
+        "native_accepted": 0,
+        "native_failed": 0,
+        "native_rejected": 0,
+        "native_semantic_dispatches": 9529,
+        "observed_append_barriers": 6076,
+        "ready_durable_waves": 6076,
+        "ready_waves": 6076,
+        "remote_dials": 0,
+        "remote_handshake_failures": 0,
+        "remote_poisoned": 0,
+        "remote_rejected": 0,
+        "remote_reuses": 1461
+      },
+      "cluster_barriers_per_update": 1.519
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "clients": 1,
+      "successful_updates": 4000,
+      "counters": {
+        "checkpoint_queue_rejected": 0,
+        "checkpoint_queue_submissions": 0,
+        "checkpoint_queue_wait_ns": 0,
+        "checkpoint_service_ns": 0,
+        "failed_waves": 0,
+        "gateway_legacy_calls": 12267,
+        "gateway_local_calls": 8001,
+        "gateway_remote_calls": 4266,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encoded_bytes": 0,
+        "gateway_sql_request_encodings": 0,
+        "multi_group_waves": 21,
+        "native_accepted": 0,
+        "native_failed": 0,
+        "native_rejected": 0,
+        "native_semantic_dispatches": 8001,
+        "observed_append_barriers": 24253,
+        "ready_durable_waves": 24253,
+        "ready_waves": 24253,
+        "remote_dials": 0,
+        "remote_handshake_failures": 0,
+        "remote_poisoned": 0,
+        "remote_rejected": 0,
+        "remote_reuses": 4266
+      },
+      "cluster_barriers_per_update": 6.06325
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "clients": 8,
+      "successful_updates": 4000,
+      "counters": {
+        "checkpoint_queue_rejected": 0,
+        "checkpoint_queue_submissions": 0,
+        "checkpoint_queue_wait_ns": 0,
+        "checkpoint_service_ns": 0,
+        "failed_waves": 0,
+        "gateway_legacy_calls": 8718,
+        "gateway_local_calls": 8010,
+        "gateway_remote_calls": 708,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encoded_bytes": 0,
+        "gateway_sql_request_encodings": 0,
+        "multi_group_waves": 2,
+        "native_accepted": 0,
+        "native_failed": 2,
+        "native_rejected": 0,
+        "native_semantic_dispatches": 8010,
+        "observed_append_barriers": 3080,
+        "ready_durable_waves": 3080,
+        "ready_waves": 3080,
+        "remote_dials": 0,
+        "remote_handshake_failures": 0,
+        "remote_poisoned": 0,
+        "remote_rejected": 0,
+        "remote_reuses": 708
+      },
+      "cluster_barriers_per_update": 0.77
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "clients": 1,
+      "successful_updates": 4000,
+      "counters": {
+        "checkpoint_queue_rejected": 0,
+        "checkpoint_queue_submissions": 0,
+        "checkpoint_queue_wait_ns": 0,
+        "checkpoint_service_ns": 0,
+        "failed_waves": 0,
+        "gateway_legacy_calls": 14296,
+        "gateway_local_calls": 8000,
+        "gateway_remote_calls": 6296,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encoded_bytes": 0,
+        "gateway_sql_request_encodings": 0,
+        "multi_group_waves": 30,
+        "native_accepted": 0,
+        "native_failed": 5,
+        "native_rejected": 0,
+        "native_semantic_dispatches": 8000,
+        "observed_append_barriers": 24332,
+        "ready_durable_waves": 24332,
+        "ready_waves": 24332,
+        "remote_dials": 0,
+        "remote_handshake_failures": 0,
+        "remote_poisoned": 0,
+        "remote_rejected": 0,
+        "remote_reuses": 6296
+      },
+      "cluster_barriers_per_update": 6.083
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "clients": 8,
+      "successful_updates": 4000,
+      "counters": {
+        "checkpoint_queue_rejected": 0,
+        "checkpoint_queue_submissions": 0,
+        "checkpoint_queue_wait_ns": 0,
+        "checkpoint_service_ns": 0,
+        "failed_waves": 0,
+        "gateway_legacy_calls": 8637,
+        "gateway_local_calls": 8003,
+        "gateway_remote_calls": 634,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encoded_bytes": 0,
+        "gateway_sql_request_encodings": 0,
+        "multi_group_waves": 0,
+        "native_accepted": 0,
+        "native_failed": 0,
+        "native_rejected": 0,
+        "native_semantic_dispatches": 8003,
+        "observed_append_barriers": 3046,
+        "ready_durable_waves": 3046,
+        "ready_waves": 3046,
+        "remote_dials": 0,
+        "remote_handshake_failures": 0,
+        "remote_poisoned": 0,
+        "remote_rejected": 0,
+        "remote_reuses": 634
+      },
+      "cluster_barriers_per_update": 0.7615
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "clients": 1,
+      "successful_updates": 4000,
+      "counters": {
+        "checkpoint_queue_rejected": 0,
+        "checkpoint_queue_submissions": 0,
+        "checkpoint_queue_wait_ns": 0,
+        "checkpoint_service_ns": 0,
+        "failed_waves": 0,
+        "gateway_legacy_calls": 13382,
+        "gateway_local_calls": 5382,
+        "gateway_remote_calls": 8000,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encoded_bytes": 0,
+        "gateway_sql_request_encodings": 0,
+        "multi_group_waves": 8,
+        "native_accepted": 0,
+        "native_failed": 4,
+        "native_rejected": 0,
+        "native_semantic_dispatches": 5382,
+        "observed_append_barriers": 24841,
+        "ready_durable_waves": 24841,
+        "ready_waves": 24841,
+        "remote_dials": 0,
+        "remote_handshake_failures": 0,
+        "remote_poisoned": 0,
+        "remote_rejected": 0,
+        "remote_reuses": 8000
+      },
+      "cluster_barriers_per_update": 6.21025
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "clients": 8,
+      "successful_updates": 4000,
+      "counters": {
+        "checkpoint_queue_rejected": 0,
+        "checkpoint_queue_submissions": 0,
+        "checkpoint_queue_wait_ns": 0,
+        "checkpoint_service_ns": 0,
+        "failed_waves": 0,
+        "gateway_legacy_calls": 10010,
+        "gateway_local_calls": 1484,
+        "gateway_remote_calls": 8526,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encoded_bytes": 0,
+        "gateway_sql_request_encodings": 0,
+        "multi_group_waves": 44,
+        "native_accepted": 0,
+        "native_failed": 0,
+        "native_rejected": 0,
+        "native_semantic_dispatches": 1484,
+        "observed_append_barriers": 5969,
+        "ready_durable_waves": 5969,
+        "ready_waves": 5969,
+        "remote_dials": 0,
+        "remote_handshake_failures": 0,
+        "remote_poisoned": 0,
+        "remote_rejected": 0,
+        "remote_reuses": 8526
+      },
+      "cluster_barriers_per_update": 1.49225
+    }
+  ],
+  "health_log_evidence": {
+    "before-first/before": {
+      "path": "baseline-c1-c8/before-first/before/candidate-server.log",
+      "sha256": "f15f5ab0721b0207dbb6f8a7ab6c2f8f6f21165be262742880663af61a4b6297",
+      "publication_log_lines": 173,
+      "configuration_warning_lines": [],
+      "ineligible_replacement_log_lines": 156
+    },
+    "before-first/after": {
+      "path": "baseline-c1-c8/before-first/after/candidate-server.log",
+      "sha256": "0f2d223564be53b0529f6a044911577a506cf4faec19bf3bf240876d46c4059f",
+      "publication_log_lines": 14,
+      "configuration_warning_lines": [
+        148,
+        158,
+        160,
+        167,
+        176
+      ],
+      "ineligible_replacement_log_lines": 0
+    },
+    "after-first/after": {
+      "path": "baseline-c1-c8/after-first/after/candidate-server.log",
+      "sha256": "23018fbc8e9656cd2cbe6782b803ce6b73a9630926a9ea291be0acc29b89c277",
+      "publication_log_lines": 13,
+      "configuration_warning_lines": [
+        151,
+        156,
+        175
+      ],
+      "ineligible_replacement_log_lines": 0
+    },
+    "after-first/before": {
+      "path": "baseline-c1-c8/after-first/before/candidate-server.log",
+      "sha256": "23796adfd70842f4b2459223bdbeeac5f390637e886500570c7985b9bcf02394",
+      "publication_log_lines": 8,
+      "configuration_warning_lines": [],
+      "ineligible_replacement_log_lines": 7
+    }
+  },
+  "qualification": "Short diagnostic only; do not pool localities or claim full promotion, multigroup/scaling qualification, sustained checkpoint performance or the full 2x CRDB objective.",
+  "excluded_other_campaigns": true,
+  "per_trial_locality_and_counters": [
+    {
+      "order": "before-first",
+      "arm": "before",
+      "workload": "point_hit",
+      "clients": 1,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:39:33.593191087Z",
+      "elapsed_ns": 472060417,
+      "successful_ops_per_second": 4236.7458231517,
+      "p99_ns": 452000,
+      "counters": {
+        "gateway_local_calls": 2000,
+        "gateway_remote_calls": 159,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 54,
+        "ready_waves": 54,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "before",
+      "workload": "point_hit",
+      "clients": 1,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:39:34.21787217Z",
+      "elapsed_ns": 486252792,
+      "successful_ops_per_second": 4113.086922902439,
+      "p99_ns": 384542,
+      "counters": {
+        "gateway_local_calls": 2000,
+        "gateway_remote_calls": 146,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 65,
+        "ready_waves": 65,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "before",
+      "workload": "point_hit",
+      "clients": 8,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:39:34.906666004Z",
+      "elapsed_ns": 168835375,
+      "successful_ops_per_second": 11845.858724808115,
+      "p99_ns": 7688084,
+      "counters": {
+        "gateway_local_calls": 2001,
+        "gateway_remote_calls": 43,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 34,
+        "ready_waves": 34,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "before",
+      "workload": "point_hit",
+      "clients": 8,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:39:35.251890712Z",
+      "elapsed_ns": 181613001,
+      "successful_ops_per_second": 11012.427463824575,
+      "p99_ns": 4965875,
+      "counters": {
+        "gateway_local_calls": 2000,
+        "gateway_remote_calls": 39,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 13,
+        "ready_waves": 13,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "before",
+      "workload": "point_miss",
+      "clients": 1,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:39:35.698933379Z",
+      "elapsed_ns": 515857709,
+      "successful_ops_per_second": 3877.038115562987,
+      "p99_ns": 382208,
+      "counters": {
+        "gateway_local_calls": 2000,
+        "gateway_remote_calls": 113,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 66,
+        "ready_waves": 66,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "before",
+      "workload": "point_miss",
+      "clients": 1,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:39:36.398840046Z",
+      "elapsed_ns": 423653917,
+      "successful_ops_per_second": 4720.834435244936,
+      "p99_ns": 491250,
+      "counters": {
+        "gateway_local_calls": 2000,
+        "gateway_remote_calls": 89,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 53,
+        "ready_waves": 53,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "before",
+      "workload": "point_miss",
+      "clients": 8,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:39:37.14995963Z",
+      "elapsed_ns": 297129542,
+      "successful_ops_per_second": 6731.0708539375055,
+      "p99_ns": 14668625,
+      "counters": {
+        "gateway_local_calls": 2000,
+        "gateway_remote_calls": 29,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 20,
+        "ready_waves": 20,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "before",
+      "workload": "point_miss",
+      "clients": 8,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:39:37.72536413Z",
+      "elapsed_ns": 250313292,
+      "successful_ops_per_second": 7989.987203715893,
+      "p99_ns": 10804666,
+      "counters": {
+        "gateway_local_calls": 2002,
+        "gateway_remote_calls": 74,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 16,
+        "ready_waves": 16,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "before",
+      "workload": "range_64",
+      "clients": 1,
+      "repetition": 1,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:39:38.208993047Z",
+      "elapsed_ns": 236106583,
+      "successful_ops_per_second": 847.0750686354221,
+      "p99_ns": 18478792,
+      "counters": {
+        "gateway_local_calls": 200,
+        "gateway_remote_calls": 124,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 32,
+        "ready_waves": 32,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "before",
+      "workload": "range_64",
+      "clients": 1,
+      "repetition": 2,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:39:38.694647089Z",
+      "elapsed_ns": 124444542,
+      "successful_ops_per_second": 1607.1415972586406,
+      "p99_ns": 6175875,
+      "counters": {
+        "gateway_local_calls": 200,
+        "gateway_remote_calls": 71,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 20,
+        "ready_waves": 20,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "before",
+      "workload": "range_64",
+      "clients": 8,
+      "repetition": 1,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:39:39.048457798Z",
+      "elapsed_ns": 54561208,
+      "successful_ops_per_second": 3665.6079902043225,
+      "p99_ns": 34361250,
+      "counters": {
+        "gateway_local_calls": 200,
+        "gateway_remote_calls": 22,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 17,
+        "ready_waves": 17,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "before",
+      "workload": "range_64",
+      "clients": 8,
+      "repetition": 2,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:39:39.314638423Z",
+      "elapsed_ns": 15297417,
+      "successful_ops_per_second": 13074.102640988343,
+      "p99_ns": 1858375,
+      "counters": {
+        "gateway_local_calls": 200,
+        "gateway_remote_calls": 2,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 9,
+        "ready_waves": 9,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "before",
+      "workload": "group_16",
+      "clients": 1,
+      "repetition": 1,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:39:39.589247006Z",
+      "elapsed_ns": 235590125,
+      "successful_ops_per_second": 848.9320169934966,
+      "p99_ns": 8138375,
+      "counters": {
+        "gateway_local_calls": 202,
+        "gateway_remote_calls": 81,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 36,
+        "ready_waves": 36,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "before",
+      "workload": "group_16",
+      "clients": 1,
+      "repetition": 2,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:39:40.103072631Z",
+      "elapsed_ns": 140756751,
+      "successful_ops_per_second": 1420.8909951324465,
+      "p99_ns": 854250,
+      "counters": {
+        "gateway_local_calls": 200,
+        "gateway_remote_calls": 4,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 3,
+        "ready_waves": 3,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "before",
+      "workload": "group_16",
+      "clients": 8,
+      "repetition": 1,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:39:40.487215882Z",
+      "elapsed_ns": 35601291,
+      "successful_ops_per_second": 5617.773804888143,
+      "p99_ns": 8624084,
+      "counters": {
+        "gateway_local_calls": 200,
+        "gateway_remote_calls": 0,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 9,
+        "ready_waves": 9,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "before",
+      "workload": "group_16",
+      "clients": 8,
+      "repetition": 2,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:39:40.78651609Z",
+      "elapsed_ns": 23651208,
+      "successful_ops_per_second": 8456.227690357297,
+      "p99_ns": 2098750,
+      "counters": {
+        "gateway_local_calls": 200,
+        "gateway_remote_calls": 16,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 9,
+        "ready_waves": 9,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "before",
+      "workload": "update_existing",
+      "clients": 1,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:39:44.8075303Z",
+      "elapsed_ns": 55579814108,
+      "successful_ops_per_second": 35.98428731902012,
+      "p99_ns": 165912333,
+      "counters": {
+        "gateway_local_calls": 4045,
+        "gateway_remote_calls": 8415,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 18283,
+        "ready_waves": 18283,
+        "multi_group_waves": 3428,
+        "remote_dials": 7,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "before",
+      "workload": "update_existing",
+      "clients": 1,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:40:41.956006216Z",
+      "elapsed_ns": 9666147254,
+      "successful_ops_per_second": 206.90766935837536,
+      "p99_ns": 49988916,
+      "counters": {
+        "gateway_local_calls": 4002,
+        "gateway_remote_calls": 4734,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 14342,
+        "ready_waves": 14342,
+        "multi_group_waves": 440,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "before",
+      "workload": "update_existing",
+      "clients": 8,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:40:51.82279797Z",
+      "elapsed_ns": 938909084,
+      "successful_ops_per_second": 2130.13169654241,
+      "p99_ns": 15165167,
+      "counters": {
+        "gateway_local_calls": 4732,
+        "gateway_remote_calls": 648,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 2948,
+        "ready_waves": 2948,
+        "multi_group_waves": 15,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "before",
+      "workload": "update_existing",
+      "clients": 8,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:40:53.093927679Z",
+      "elapsed_ns": 1163728626,
+      "successful_ops_per_second": 1718.6137346079172,
+      "p99_ns": 23850000,
+      "counters": {
+        "gateway_local_calls": 4797,
+        "gateway_remote_calls": 813,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 3128,
+        "ready_waves": 3128,
+        "multi_group_waves": 16,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "workload": "point_hit",
+      "clients": 1,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:41:08.811305256Z",
+      "elapsed_ns": 475206042,
+      "successful_ops_per_second": 4208.700696612776,
+      "p99_ns": 394542,
+      "counters": {
+        "gateway_local_calls": 2000,
+        "gateway_remote_calls": 320,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "workload": "point_hit",
+      "clients": 1,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:41:09.333441548Z",
+      "elapsed_ns": 440141125,
+      "successful_ops_per_second": 4543.997110017838,
+      "p99_ns": 338542,
+      "counters": {
+        "gateway_local_calls": 2000,
+        "gateway_remote_calls": 271,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 7,
+        "ready_waves": 7,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "workload": "point_hit",
+      "clients": 8,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:41:09.818919715Z",
+      "elapsed_ns": 92872416,
+      "successful_ops_per_second": 21534.919474906306,
+      "p99_ns": 714917,
+      "counters": {
+        "gateway_local_calls": 2000,
+        "gateway_remote_calls": 59,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "workload": "point_hit",
+      "clients": 8,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:41:09.95688509Z",
+      "elapsed_ns": 92130250,
+      "successful_ops_per_second": 21708.396536425334,
+      "p99_ns": 765500,
+      "counters": {
+        "gateway_local_calls": 2000,
+        "gateway_remote_calls": 64,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "workload": "point_miss",
+      "clients": 1,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:41:10.09520409Z",
+      "elapsed_ns": 423439667,
+      "successful_ops_per_second": 4723.223060724728,
+      "p99_ns": 340750,
+      "counters": {
+        "gateway_local_calls": 2000,
+        "gateway_remote_calls": 332,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 8,
+        "ready_waves": 8,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "workload": "point_miss",
+      "clients": 1,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:41:10.576887882Z",
+      "elapsed_ns": 470904292,
+      "successful_ops_per_second": 4247.147528653232,
+      "p99_ns": 430542,
+      "counters": {
+        "gateway_local_calls": 2000,
+        "gateway_remote_calls": 320,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "workload": "point_miss",
+      "clients": 8,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:41:11.101161007Z",
+      "elapsed_ns": 91741500,
+      "successful_ops_per_second": 21800.38477679131,
+      "p99_ns": 724500,
+      "counters": {
+        "gateway_local_calls": 2000,
+        "gateway_remote_calls": 64,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "workload": "point_miss",
+      "clients": 8,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:41:11.246304382Z",
+      "elapsed_ns": 88487750,
+      "successful_ops_per_second": 22601.998581724587,
+      "p99_ns": 636459,
+      "counters": {
+        "gateway_local_calls": 2000,
+        "gateway_remote_calls": 64,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "workload": "range_64",
+      "clients": 1,
+      "repetition": 1,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:41:11.415038215Z",
+      "elapsed_ns": 87619667,
+      "successful_ops_per_second": 2282.592559955746,
+      "p99_ns": 782625,
+      "counters": {
+        "gateway_local_calls": 200,
+        "gateway_remote_calls": 65,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 8,
+        "ready_waves": 8,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "workload": "range_64",
+      "clients": 1,
+      "repetition": 2,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:41:11.578567799Z",
+      "elapsed_ns": 75329500,
+      "successful_ops_per_second": 2655.0023563145915,
+      "p99_ns": 731250,
+      "counters": {
+        "gateway_local_calls": 200,
+        "gateway_remote_calls": 64,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "workload": "range_64",
+      "clients": 8,
+      "repetition": 1,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:41:11.730695591Z",
+      "elapsed_ns": 13918709,
+      "successful_ops_per_second": 14369.148747919078,
+      "p99_ns": 1073250,
+      "counters": {
+        "gateway_local_calls": 200,
+        "gateway_remote_calls": 0,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "workload": "range_64",
+      "clients": 8,
+      "repetition": 2,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:41:11.818634549Z",
+      "elapsed_ns": 12773250,
+      "successful_ops_per_second": 15657.722192863994,
+      "p99_ns": 799375,
+      "counters": {
+        "gateway_local_calls": 200,
+        "gateway_remote_calls": 40,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "workload": "group_16",
+      "clients": 1,
+      "repetition": 1,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:41:11.944964799Z",
+      "elapsed_ns": 149406500,
+      "successful_ops_per_second": 1338.6298454217185,
+      "p99_ns": 936542,
+      "counters": {
+        "gateway_local_calls": 200,
+        "gateway_remote_calls": 64,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "workload": "group_16",
+      "clients": 1,
+      "repetition": 2,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:41:12.206613674Z",
+      "elapsed_ns": 146873833,
+      "successful_ops_per_second": 1361.7129471932553,
+      "p99_ns": 931666,
+      "counters": {
+        "gateway_local_calls": 200,
+        "gateway_remote_calls": 128,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "workload": "group_16",
+      "clients": 8,
+      "repetition": 1,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:41:12.470409758Z",
+      "elapsed_ns": 22207875,
+      "successful_ops_per_second": 9005.814378908384,
+      "p99_ns": 2023167,
+      "counters": {
+        "gateway_local_calls": 200,
+        "gateway_remote_calls": 0,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "workload": "group_16",
+      "clients": 8,
+      "repetition": 2,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:41:12.602357883Z",
+      "elapsed_ns": 23209500,
+      "successful_ops_per_second": 8617.161076283419,
+      "p99_ns": 1855250,
+      "counters": {
+        "gateway_local_calls": 200,
+        "gateway_remote_calls": 64,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "workload": "update_existing",
+      "clients": 1,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:41:12.799015133Z",
+      "elapsed_ns": 3795739752,
+      "successful_ops_per_second": 526.9065137951534,
+      "p99_ns": 13728709,
+      "counters": {
+        "gateway_local_calls": 4001,
+        "gateway_remote_calls": 2455,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 12139,
+        "ready_waves": 12139,
+        "multi_group_waves": 10,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "workload": "update_existing",
+      "clients": 1,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:41:16.761126593Z",
+      "elapsed_ns": 2728749626,
+      "successful_ops_per_second": 732.936426612267,
+      "p99_ns": 8094959,
+      "counters": {
+        "gateway_local_calls": 4000,
+        "gateway_remote_calls": 1811,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 12114,
+        "ready_waves": 12114,
+        "multi_group_waves": 11,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "workload": "update_existing",
+      "clients": 8,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:41:19.681236011Z",
+      "elapsed_ns": 513231500,
+      "successful_ops_per_second": 3896.876945394038,
+      "p99_ns": 9669791,
+      "counters": {
+        "gateway_local_calls": 4004,
+        "gateway_remote_calls": 314,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 1529,
+        "ready_waves": 1529,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 1
+      }
+    },
+    {
+      "order": "before-first",
+      "arm": "after",
+      "workload": "update_existing",
+      "clients": 8,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:41:20.520655553Z",
+      "elapsed_ns": 556430000,
+      "successful_ops_per_second": 3594.3425048972917,
+      "p99_ns": 9391708,
+      "counters": {
+        "gateway_local_calls": 4006,
+        "gateway_remote_calls": 394,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 1551,
+        "ready_waves": 1551,
+        "multi_group_waves": 2,
+        "remote_dials": 0,
+        "native_failed": 1
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "workload": "point_hit",
+      "clients": 1,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:43:38.743252131Z",
+      "elapsed_ns": 609690542,
+      "successful_ops_per_second": 3280.352674390019,
+      "p99_ns": 533083,
+      "counters": {
+        "gateway_local_calls": 399,
+        "gateway_remote_calls": 2002,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 2000,
+        "observed_append_barriers": 10,
+        "ready_waves": 10,
+        "multi_group_waves": 0,
+        "remote_dials": 1,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "workload": "point_hit",
+      "clients": 1,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:43:39.404985131Z",
+      "elapsed_ns": 547520375,
+      "successful_ops_per_second": 3652.832097800927,
+      "p99_ns": 465166,
+      "counters": {
+        "gateway_local_calls": 335,
+        "gateway_remote_calls": 2000,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 2000,
+        "observed_append_barriers": 6,
+        "ready_waves": 6,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "workload": "point_hit",
+      "clients": 8,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:43:40.028580965Z",
+      "elapsed_ns": 114877584,
+      "successful_ops_per_second": 17409.83689211291,
+      "p99_ns": 864042,
+      "counters": {
+        "gateway_local_calls": 64,
+        "gateway_remote_calls": 2000,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 2000,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 6,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "workload": "point_hit",
+      "clients": 8,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:43:40.219534965Z",
+      "elapsed_ns": 119288125,
+      "successful_ops_per_second": 16766.128229444465,
+      "p99_ns": 871000,
+      "counters": {
+        "gateway_local_calls": 64,
+        "gateway_remote_calls": 2000,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 2000,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "workload": "point_miss",
+      "clients": 1,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:43:40.415472965Z",
+      "elapsed_ns": 534752625,
+      "successful_ops_per_second": 3740.0470918679457,
+      "p99_ns": 432583,
+      "counters": {
+        "gateway_local_calls": 335,
+        "gateway_remote_calls": 2000,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 2000,
+        "observed_append_barriers": 9,
+        "ready_waves": 9,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "workload": "point_miss",
+      "clients": 1,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:43:41.026492465Z",
+      "elapsed_ns": 516037625,
+      "successful_ops_per_second": 3875.686390115449,
+      "p99_ns": 387375,
+      "counters": {
+        "gateway_local_calls": 320,
+        "gateway_remote_calls": 2000,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 2000,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "workload": "point_miss",
+      "clients": 8,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:43:41.621336382Z",
+      "elapsed_ns": 115139917,
+      "successful_ops_per_second": 17370.17058992669,
+      "p99_ns": 791958,
+      "counters": {
+        "gateway_local_calls": 64,
+        "gateway_remote_calls": 2000,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 2000,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "workload": "point_miss",
+      "clients": 8,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:43:41.817040507Z",
+      "elapsed_ns": 111745167,
+      "successful_ops_per_second": 17897.86577525988,
+      "p99_ns": 738292,
+      "counters": {
+        "gateway_local_calls": 112,
+        "gateway_remote_calls": 2000,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 2000,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "workload": "range_64",
+      "clients": 1,
+      "repetition": 1,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:43:42.018864549Z",
+      "elapsed_ns": 83949625,
+      "successful_ops_per_second": 2382.3811005707294,
+      "p99_ns": 554750,
+      "counters": {
+        "gateway_local_calls": 64,
+        "gateway_remote_calls": 200,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 200,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "workload": "range_64",
+      "clients": 1,
+      "repetition": 2,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:43:42.189697632Z",
+      "elapsed_ns": 83566834,
+      "successful_ops_per_second": 2393.2939711464956,
+      "p99_ns": 616000,
+      "counters": {
+        "gateway_local_calls": 52,
+        "gateway_remote_calls": 200,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 200,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "workload": "range_64",
+      "clients": 8,
+      "repetition": 1,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:43:42.360110049Z",
+      "elapsed_ns": 18129375,
+      "successful_ops_per_second": 11031.819905540042,
+      "p99_ns": 1511042,
+      "counters": {
+        "gateway_local_calls": 64,
+        "gateway_remote_calls": 200,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 200,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "workload": "range_64",
+      "clients": 8,
+      "repetition": 2,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:43:42.478587799Z",
+      "elapsed_ns": 17949042,
+      "successful_ops_per_second": 11142.655970162643,
+      "p99_ns": 1347041,
+      "counters": {
+        "gateway_local_calls": 64,
+        "gateway_remote_calls": 200,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 200,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "workload": "group_16",
+      "clients": 1,
+      "repetition": 1,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:43:42.636972508Z",
+      "elapsed_ns": 168901291,
+      "successful_ops_per_second": 1184.123571915149,
+      "p99_ns": 1094791,
+      "counters": {
+        "gateway_local_calls": 127,
+        "gateway_remote_calls": 200,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 200,
+        "observed_append_barriers": 8,
+        "ready_waves": 8,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "workload": "group_16",
+      "clients": 1,
+      "repetition": 2,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:43:42.936059591Z",
+      "elapsed_ns": 161997834,
+      "successful_ops_per_second": 1234.5844080853574,
+      "p99_ns": 977250,
+      "counters": {
+        "gateway_local_calls": 128,
+        "gateway_remote_calls": 200,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 200,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "workload": "group_16",
+      "clients": 8,
+      "repetition": 1,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:43:43.23831405Z",
+      "elapsed_ns": 25389125,
+      "successful_ops_per_second": 7877.388448794514,
+      "p99_ns": 1772958,
+      "counters": {
+        "gateway_local_calls": 0,
+        "gateway_remote_calls": 200,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 200,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "workload": "group_16",
+      "clients": 8,
+      "repetition": 2,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:43:43.395021175Z",
+      "elapsed_ns": 24353250,
+      "successful_ops_per_second": 8212.45624300658,
+      "p99_ns": 1695625,
+      "counters": {
+        "gateway_local_calls": 0,
+        "gateway_remote_calls": 200,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 200,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "workload": "update_existing",
+      "clients": 1,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:43:44.100228758Z",
+      "elapsed_ns": 3605075794,
+      "successful_ops_per_second": 554.7733568677364,
+      "p99_ns": 9481875,
+      "counters": {
+        "gateway_local_calls": 2485,
+        "gateway_remote_calls": 4000,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 12420,
+        "ready_waves": 12420,
+        "multi_group_waves": 6,
+        "remote_dials": 0,
+        "native_failed": 4
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "workload": "update_existing",
+      "clients": 1,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:43:47.931656135Z",
+      "elapsed_ns": 4404114377,
+      "successful_ops_per_second": 454.12081267570585,
+      "p99_ns": 15241667,
+      "counters": {
+        "gateway_local_calls": 2897,
+        "gateway_remote_calls": 4000,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 12421,
+        "ready_waves": 12421,
+        "multi_group_waves": 2,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "workload": "update_existing",
+      "clients": 8,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:43:52.696987512Z",
+      "elapsed_ns": 939382501,
+      "successful_ops_per_second": 2129.058182232415,
+      "p99_ns": 22084750,
+      "counters": {
+        "gateway_local_calls": 676,
+        "gateway_remote_calls": 4264,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 2761,
+        "ready_waves": 2761,
+        "multi_group_waves": 16,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "before",
+      "workload": "update_existing",
+      "clients": 8,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:43:54.311057222Z",
+      "elapsed_ns": 1062695667,
+      "successful_ops_per_second": 1882.0063561998131,
+      "p99_ns": 23851125,
+      "counters": {
+        "gateway_local_calls": 808,
+        "gateway_remote_calls": 4262,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 3208,
+        "ready_waves": 3208,
+        "multi_group_waves": 28,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "workload": "point_hit",
+      "clients": 1,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:43:03.67639442Z",
+      "elapsed_ns": 530480125,
+      "successful_ops_per_second": 3770.16952331626,
+      "p99_ns": 452458,
+      "counters": {
+        "gateway_local_calls": 2000,
+        "gateway_remote_calls": 320,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "workload": "point_hit",
+      "clients": 1,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:43:04.266235379Z",
+      "elapsed_ns": 492885792,
+      "successful_ops_per_second": 4057.735143641552,
+      "p99_ns": 391667,
+      "counters": {
+        "gateway_local_calls": 2000,
+        "gateway_remote_calls": 336,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "workload": "point_hit",
+      "clients": 8,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:43:04.807107629Z",
+      "elapsed_ns": 99802208,
+      "successful_ops_per_second": 20039.636798416323,
+      "p99_ns": 723625,
+      "counters": {
+        "gateway_local_calls": 2000,
+        "gateway_remote_calls": 64,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "workload": "point_hit",
+      "clients": 8,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:43:04.961095171Z",
+      "elapsed_ns": 97823458,
+      "successful_ops_per_second": 20444.993878666606,
+      "p99_ns": 792000,
+      "counters": {
+        "gateway_local_calls": 2000,
+        "gateway_remote_calls": 64,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "workload": "point_miss",
+      "clients": 1,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:43:05.110933254Z",
+      "elapsed_ns": 516429042,
+      "successful_ops_per_second": 3872.7488916086177,
+      "p99_ns": 750333,
+      "counters": {
+        "gateway_local_calls": 2000,
+        "gateway_remote_calls": 335,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 8,
+        "ready_waves": 8,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "workload": "point_miss",
+      "clients": 1,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:43:05.690497921Z",
+      "elapsed_ns": 501270459,
+      "successful_ops_per_second": 3989.862087604089,
+      "p99_ns": 406250,
+      "counters": {
+        "gateway_local_calls": 2000,
+        "gateway_remote_calls": 320,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "workload": "point_miss",
+      "clients": 8,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:43:06.262023588Z",
+      "elapsed_ns": 103938583,
+      "successful_ops_per_second": 19242.132635192844,
+      "p99_ns": 982208,
+      "counters": {
+        "gateway_local_calls": 2000,
+        "gateway_remote_calls": 110,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "workload": "point_miss",
+      "clients": 8,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:43:06.432216296Z",
+      "elapsed_ns": 104680250,
+      "successful_ops_per_second": 19105.800759933223,
+      "p99_ns": 1100958,
+      "counters": {
+        "gateway_local_calls": 2000,
+        "gateway_remote_calls": 64,
+        "gateway_semantic_sql_calls": 2000,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "workload": "range_64",
+      "clients": 1,
+      "repetition": 1,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:43:06.616980505Z",
+      "elapsed_ns": 393398917,
+      "successful_ops_per_second": 508.38980830239547,
+      "p99_ns": 5436666,
+      "counters": {
+        "gateway_local_calls": 200,
+        "gateway_remote_calls": 230,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "workload": "range_64",
+      "clients": 1,
+      "repetition": 2,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:43:07.386081172Z",
+      "elapsed_ns": 118877375,
+      "successful_ops_per_second": 1682.4059245924636,
+      "p99_ns": 2731750,
+      "counters": {
+        "gateway_local_calls": 200,
+        "gateway_remote_calls": 126,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "workload": "range_64",
+      "clients": 8,
+      "repetition": 1,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:43:07.683491255Z",
+      "elapsed_ns": 23978375,
+      "successful_ops_per_second": 8340.848785624547,
+      "p99_ns": 4062750,
+      "counters": {
+        "gateway_local_calls": 200,
+        "gateway_remote_calls": 38,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "workload": "range_64",
+      "clients": 8,
+      "repetition": 2,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:43:07.919650755Z",
+      "elapsed_ns": 98193375,
+      "successful_ops_per_second": 2036.7972890228084,
+      "p99_ns": 9134375,
+      "counters": {
+        "gateway_local_calls": 200,
+        "gateway_remote_calls": 64,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "workload": "group_16",
+      "clients": 1,
+      "repetition": 1,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:43:08.164903506Z",
+      "elapsed_ns": 238004583,
+      "successful_ops_per_second": 840.3199529985521,
+      "p99_ns": 3952666,
+      "counters": {
+        "gateway_local_calls": 200,
+        "gateway_remote_calls": 195,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 6,
+        "ready_waves": 6,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "workload": "group_16",
+      "clients": 1,
+      "repetition": 2,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:43:08.552578631Z",
+      "elapsed_ns": 172238458,
+      "successful_ops_per_second": 1161.1808554393815,
+      "p99_ns": 2041792,
+      "counters": {
+        "gateway_local_calls": 200,
+        "gateway_remote_calls": 104,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "workload": "group_16",
+      "clients": 8,
+      "repetition": 1,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:43:08.853666423Z",
+      "elapsed_ns": 50558084,
+      "successful_ops_per_second": 3955.8461115733735,
+      "p99_ns": 5974709,
+      "counters": {
+        "gateway_local_calls": 200,
+        "gateway_remote_calls": 46,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "workload": "group_16",
+      "clients": 8,
+      "repetition": 2,
+      "operations": 200,
+      "measurement_started_utc": "2026-09-04T16:43:09.273889173Z",
+      "elapsed_ns": 25061625,
+      "successful_ops_per_second": 7980.32849027148,
+      "p99_ns": 2024250,
+      "counters": {
+        "gateway_local_calls": 200,
+        "gateway_remote_calls": 0,
+        "gateway_semantic_sql_calls": 200,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 0,
+        "ready_waves": 0,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "workload": "update_existing",
+      "clients": 1,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:43:09.554333756Z",
+      "elapsed_ns": 6221419586,
+      "successful_ops_per_second": 321.4700394907588,
+      "p99_ns": 24997667,
+      "counters": {
+        "gateway_local_calls": 4000,
+        "gateway_remote_calls": 3604,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 12170,
+        "ready_waves": 12170,
+        "multi_group_waves": 19,
+        "remote_dials": 0,
+        "native_failed": 4
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "workload": "update_existing",
+      "clients": 1,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:43:16.179568884Z",
+      "elapsed_ns": 4243000752,
+      "successful_ops_per_second": 471.36451697711124,
+      "p99_ns": 22122250,
+      "counters": {
+        "gateway_local_calls": 4000,
+        "gateway_remote_calls": 2692,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 12162,
+        "ready_waves": 12162,
+        "multi_group_waves": 11,
+        "remote_dials": 0,
+        "native_failed": 1
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "workload": "update_existing",
+      "clients": 8,
+      "repetition": 1,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:43:20.61898472Z",
+      "elapsed_ns": 502635542,
+      "successful_ops_per_second": 3979.0262185637475,
+      "p99_ns": 11952084,
+      "counters": {
+        "gateway_local_calls": 4002,
+        "gateway_remote_calls": 320,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 1524,
+        "ready_waves": 1524,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    },
+    {
+      "order": "after-first",
+      "arm": "after",
+      "workload": "update_existing",
+      "clients": 8,
+      "repetition": 2,
+      "operations": 2000,
+      "measurement_started_utc": "2026-09-04T16:43:21.43062322Z",
+      "elapsed_ns": 496319042,
+      "successful_ops_per_second": 4029.6660630643305,
+      "p99_ns": 9223375,
+      "counters": {
+        "gateway_local_calls": 4001,
+        "gateway_remote_calls": 314,
+        "gateway_semantic_sql_calls": 0,
+        "gateway_sql_request_encodings": 0,
+        "observed_append_barriers": 1522,
+        "ready_waves": 1522,
+        "multi_group_waves": 0,
+        "remote_dials": 0,
+        "native_failed": 0
+      }
+    }
+  ],
+  "leader_transition_log_evidence": {
+    "before-first/before": {
+      "path": "baseline-c1-c8/before-first/before/candidate-server.log",
+      "events": [
+        {
+          "line": 55,
+          "text": "raft2026/09/04 16:39:40 INFO: 1 [term: 2] received a MsgVote message with higher term from 2 [term: 3]",
+          "before_first_timed_trial_by_recorded_clock": false
+        },
+        {
+          "line": 56,
+          "text": "raft2026/09/04 16:39:40 INFO: 1 became follower at term 3",
+          "before_first_timed_trial_by_recorded_clock": false
+        }
+      ],
+      "limitation": "Bounded child-log tails omit some startup/history and do not identify a unique logical group for each Raft line. Timestamps have one-second resolution. Diagnostic snapshots have no leader/term gauge; absence of a transition log cannot prove continuous leadership."
+    },
+    "before-first/after": {
+      "path": "baseline-c1-c8/before-first/after/candidate-server.log",
+      "events": [
+        {
+          "line": 6,
+          "text": "raft2026/09/04 16:41:04 INFO: 1 became follower at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 9,
+          "text": "raft2026/09/04 16:41:04 INFO: 1 became follower at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 12,
+          "text": "raft2026/09/04 16:41:04 INFO: 1 became follower at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 14,
+          "text": "raft2026/09/04 16:41:04 INFO: 1 is starting a new election at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 22,
+          "text": "raft2026/09/04 16:41:04 INFO: 1 became candidate at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 29,
+          "text": "raft2026/09/04 16:41:04 INFO: 1 became leader at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 32,
+          "text": "raft2026/09/04 16:41:05 INFO: 1 [term: 1] received a MsgVote message with higher term from 2 [term: 2]",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 33,
+          "text": "raft2026/09/04 16:41:05 INFO: 1 became follower at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 35,
+          "text": "raft2026/09/04 16:41:05 INFO: 1 [term: 1] received a MsgVote message with higher term from 3 [term: 2]",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 36,
+          "text": "raft2026/09/04 16:41:05 INFO: 1 became follower at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 48,
+          "text": "raft2026/09/04 16:41:05 INFO: 1 became follower at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 52,
+          "text": "raft2026/09/04 16:41:06 INFO: 1 is starting a new election at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 60,
+          "text": "raft2026/09/04 16:41:06 INFO: 1 became candidate at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 67,
+          "text": "raft2026/09/04 16:41:06 INFO: 1 became leader at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 897,
+          "text": "raft2026/09/04 16:41:04 INFO: 3 became follower at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 900,
+          "text": "raft2026/09/04 16:41:04 INFO: 3 became follower at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 903,
+          "text": "raft2026/09/04 16:41:04 INFO: 3 became follower at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 906,
+          "text": "raft2026/09/04 16:41:04 INFO: 3 [term: 1] received a MsgVote message with higher term from 1 [term: 2]",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 907,
+          "text": "raft2026/09/04 16:41:04 INFO: 3 became follower at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 909,
+          "text": "raft2026/09/04 16:41:05 INFO: 3 is starting a new election at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 916,
+          "text": "raft2026/09/04 16:41:05 INFO: 3 [term: 1] received a MsgVote message with higher term from 2 [term: 2]",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 917,
+          "text": "raft2026/09/04 16:41:05 INFO: 3 became follower at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 921,
+          "text": "raft2026/09/04 16:41:05 INFO: 3 became candidate at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 928,
+          "text": "raft2026/09/04 16:41:05 INFO: 3 became leader at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 933,
+          "text": "raft2026/09/04 16:41:05 INFO: 3 became follower at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 937,
+          "text": "raft2026/09/04 16:41:06 INFO: 3 [term: 1] received a MsgVote message with higher term from 1 [term: 2]",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 938,
+          "text": "raft2026/09/04 16:41:06 INFO: 3 became follower at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        }
+      ],
+      "limitation": "Bounded child-log tails omit some startup/history and do not identify a unique logical group for each Raft line. Timestamps have one-second resolution. Diagnostic snapshots have no leader/term gauge; absence of a transition log cannot prove continuous leadership."
+    },
+    "after-first/before": {
+      "path": "baseline-c1-c8/after-first/before/candidate-server.log",
+      "events": [],
+      "limitation": "Bounded child-log tails omit some startup/history and do not identify a unique logical group for each Raft line. Timestamps have one-second resolution. Diagnostic snapshots have no leader/term gauge; absence of a transition log cannot prove continuous leadership."
+    },
+    "after-first/after": {
+      "path": "baseline-c1-c8/after-first/after/candidate-server.log",
+      "events": [
+        {
+          "line": 6,
+          "text": "raft2026/09/04 16:42:59 INFO: 1 became follower at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 9,
+          "text": "raft2026/09/04 16:42:59 INFO: 1 became follower at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 12,
+          "text": "raft2026/09/04 16:42:59 INFO: 1 became follower at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 14,
+          "text": "raft2026/09/04 16:42:59 INFO: 1 is starting a new election at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 23,
+          "text": "raft2026/09/04 16:42:59 INFO: 1 became candidate at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 33,
+          "text": "raft2026/09/04 16:42:59 INFO: 1 became follower at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 35,
+          "text": "raft2026/09/04 16:42:59 INFO: 1 is starting a new election at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 43,
+          "text": "raft2026/09/04 16:42:59 INFO: 1 became candidate at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 51,
+          "text": "raft2026/09/04 16:42:59 INFO: 1 became follower at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 53,
+          "text": "raft2026/09/04 16:42:59 INFO: 1 [term: 1] received a MsgVote message with higher term from 3 [term: 2]",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 54,
+          "text": "raft2026/09/04 16:42:59 INFO: 1 became follower at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 65,
+          "text": "raft2026/09/04 16:43:00 INFO: 1 became follower at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 70,
+          "text": "raft2026/09/04 16:43:01 INFO: 1 is starting a new election at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 79,
+          "text": "raft2026/09/04 16:43:01 INFO: 1 became candidate at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 87,
+          "text": "raft2026/09/04 16:43:01 INFO: 1 became leader at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 892,
+          "text": "raft2026/09/04 16:42:59 INFO: 3 became follower at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 895,
+          "text": "raft2026/09/04 16:42:59 INFO: 3 became follower at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 898,
+          "text": "raft2026/09/04 16:42:59 INFO: 3 became follower at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 902,
+          "text": "raft2026/09/04 16:42:59 INFO: 3 [term: 1] received a MsgVote message with higher term from 2 [term: 2]",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 903,
+          "text": "raft2026/09/04 16:42:59 INFO: 3 became follower at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 906,
+          "text": "raft2026/09/04 16:42:59 INFO: 3 is starting a new election at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 915,
+          "text": "raft2026/09/04 16:42:59 INFO: 3 became candidate at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 923,
+          "text": "raft2026/09/04 16:42:59 INFO: 3 became leader at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 924,
+          "text": "raft2026/09/04 16:42:59 INFO: 3 is starting a new election at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 932,
+          "text": "raft2026/09/04 16:42:59 INFO: 3 became candidate at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 939,
+          "text": "raft2026/09/04 16:42:59 INFO: 3 became leader at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 943,
+          "text": "raft2026/09/04 16:43:00 INFO: 3 became follower at term 1",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 948,
+          "text": "raft2026/09/04 16:43:01 INFO: 3 [term: 1] received a MsgVote message with higher term from 1 [term: 2]",
+          "before_first_timed_trial_by_recorded_clock": true
+        },
+        {
+          "line": 949,
+          "text": "raft2026/09/04 16:43:01 INFO: 3 became follower at term 2",
+          "before_first_timed_trial_by_recorded_clock": true
+        }
+      ],
+      "limitation": "Bounded child-log tails omit some startup/history and do not identify a unique logical group for each Raft line. Timestamps have one-second resolution. Diagnostic snapshots have no leader/term gauge; absence of a transition log cannot prove continuous leadership."
+    }
+  },
+  "c8_update_signal": [
+    {
+      "order": "before-first",
+      "before_ops_s": 1924.3727155751635,
+      "after_ops_s": 3745.609725145665,
+      "throughput_ratio": 1.9464055454694822,
+      "p99_ratio": 0.48856638240200284,
+      "before_cluster_barriers_per_update": 1.519,
+      "after_cluster_barriers_per_update": 0.77,
+      "barrier_ratio": 0.5069124423963134
+    },
+    {
+      "order": "after-first",
+      "before_ops_s": 2005.5322692161142,
+      "after_ops_s": 4004.3461408140392,
+      "throughput_ratio": 1.9966500675549763,
+      "p99_ratio": 0.4609786795179149,
+      "before_cluster_barriers_per_update": 1.49225,
+      "after_cluster_barriers_per_update": 0.7615,
+      "barrier_ratio": 0.5103032333724241
+    }
+  ],
+  "campaign_interpretation": [
+    "Guarded-update-only source comparison: before f2df4fac525fa0f73ff2e1b558f167e1e598f6c5; after 7b8efb88436dba5452ef4ab46e9c3d72f242adb1. The recorded patch contains three gateway production files, four test files and the plan document. The compact storage batch change is absent from this comparison.",
+    "Observed after/before throughput geomeans are 1.790530 before-first and 0.889618 after-first. After/CRDB are 0.577423 and 0.494877. Results remain separate by ordering. The first order has no measured cell guardrail breaches; the reverse order has five throughput losses above 5% and seven p99 increases above 10%. No full qualification passes.",
+    "C8 update is the strongest repeated signal: 1924.37 to 3745.61 ops/s (1.9464x) before-first and 2005.53 to 4004.35 (1.9967x) after-first. Corresponding p99 ratios are 0.4886 and 0.4610. Cluster append barriers per update fall from 1.519 to 0.770 and 1.49225 to 0.7615, about 49% in each order. These are recorded counter/latency improvements, not proof that source changes alone caused their full magnitude.",
+    "C1 does not show a stable gain: after/before throughput is 5.1868x then 0.7858x, and p99 ratios are 0.1011 then 1.9059. The first baseline C1 repetitions run at approximately 36.0 and 206.9 ops/s, with p99 165.9 and 50.0 ms. This severe baseline variation inflates the first-order ratio and is fully retained.",
+    "Every before-first read trial is local in both arms. Every after-first candidate read is local while every baseline read is remote (one encoding per operation). Update/control locality also differs. Leader placement therefore confounds the reverse ordering; do not pool orders or infer source-only speedup from their aggregate.",
+    "The first baseline has slow unchanged-read-path trials before UPDATE: C8 hit approximately 11846/11012 ops/s, C8 miss 6731/7990, and C8 range 3666/13074 across repetitions. The reverse-order candidate also has slow local range/group trials, including range C1 508/1682 ops/s and range C8 8341/2037. These changes in unchanged read workloads demonstrate significant campaign variability; their precise causes are unresolved and no unfavorable trial is excluded.",
+    "The before-first baseline retained Raft lines at 16:39:40 show member 1 moving from term 2 to term 3 during the read phase. The bounded logs lack sufficient group identity and history to attribute all earlier read bursts or the later slow C1 trial to that event. Other fixtures have no retained post-start transition line; missing lines do not prove no transition.",
+    "The campaign operator reported one live host snapshot during a baseline: Docker VM 330.6% CPU, WindowServer 42%, Codex renderer 38.7%, and no additional Go compilers in the top ten. The operator reports no team tests/builds/profile processing during timing. This one snapshot, without an exact trial timestamp supplied to this auditor, does not prove a quiet or exclusive host and is not used as a causal explanation for individual samples.",
+    "Both CRDB fixtures required a post-measurement forced shutdown, with one server process exiting 137 each; all VibeDB fixtures stopped without force and exited zero. This run does not qualify durability or recovery. Runtime warning/counter counts remain recorded separately from zero SQL errors.",
+    "One table with 1024 rows, two repetitions, C1/C8 and one Docker host remain diagnostic limits. No earlier campaign timings are pooled. C8 improvement is promising, but C1/read instability, placement differences, shared-host activity and failed reverse-order guardrails prevent an overall performance or promotion claim; after remains below CRDB in every throughput cell."
+  ],
+  "shared_host_observation": {
+    "source": "campaign operator message to auditor",
+    "phase": "baseline; exact trial timestamp not supplied",
+    "reported_cpu_percent": {
+      "Docker VM": 330.6,
+      "WindowServer": 42.0,
+      "Codex renderer": 38.7
+    },
+    "additional_go_compilers_in_top_ten": false,
+    "team_tests_builds_profile_processors_during_timing": "operator reports none",
+    "exclusive_host_proven": false
+  },
+  "conclusion": "Repeated approximately 2x C8 update throughput with approximately half the cluster barriers/update; no stable overall or C1 gain. Unchanged-read variability, recorded baseline term change, locality differences and shared-host activity limit causal attribution. Reverse-order guardrails fail; no promotion or full qualification.",
+  "p99_geomean_definition": "Equal-weight geometric mean of the ten median-trial-p99 cell ratios within an ordering; not a percentile of pooled samples."
+}

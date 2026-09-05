@@ -42,9 +42,14 @@ type Checkpoint struct {
 	Index, Term uint64
 }
 type ReadyBatch struct {
-	GroupID                     uint64
-	BeginIncarnation            uint64
-	NodeIncarnation, ReadyID    uint64
+	GroupID                  uint64
+	BeginIncarnation         uint64
+	NodeIncarnation, ReadyID uint64
+	// ReadySpan is the number of consecutive Ready messages represented by
+	// this batch. Zero and one are canonicalized to one. A span greater than
+	// one is encoded only alongside the final ReadyID and ReadyDigest using
+	// the versioned identity extension in the frame grammar.
+	ReadySpan                   uint64
 	ReadyDigest                 [16]byte
 	ReplaceFrom                 uint64
 	Entries                     []Entry
@@ -52,6 +57,31 @@ type ReadyBatch struct {
 	TruncateIndex, TruncateTerm uint64
 	Checkpoint                  *Checkpoint
 }
+
+const (
+	// MaximumReadySpan matches the fixed node submission lane. Keeping this
+	// bound small makes the composite identity an exact scalar transition and
+	// prevents malformed frames from manufacturing an unbounded logical loop.
+	MaximumReadySpan uint64 = 16
+	maxReadySpan            = MaximumReadySpan
+	readySpanVersion uint64 = 1
+)
+
+func canonicalReadySpan(span uint64) uint64 {
+	if span <= 1 {
+		return 1
+	}
+	return span
+}
+
+func checkedReadySpan(span uint64) (uint64, error) {
+	span = canonicalReadySpan(span)
+	if span > maxReadySpan {
+		return 0, ErrBounds
+	}
+	return span, nil
+}
+
 type Wave struct {
 	ID      WaveID
 	Batches []ReadyBatch
@@ -185,6 +215,7 @@ type Engine struct {
 	waveLimit           int
 	sealHeadroom        uint64
 	sequence            uint64
+	lastAppendGroups    int
 	frameBuf            []byte
 	eventScratch        []segmentEvent
 	syncData            func(*os.File) error
@@ -802,10 +833,29 @@ func (e *Engine) LookupExact(group, index uint64) (location EntryLocation, term 
 }
 
 func (e *Engine) Sequence() uint64 {
-	if e == nil || e.log.usable() != nil {
-		return 0
+	sequence, _ := e.AppendWitness()
+	return sequence
+}
+
+// AppendWitness returns the append sequence and the group count in its last
+// successfully applied frame. It is safe to sample during persistence and
+// background sealing. The group count is zero for a recovered sequence until
+// this handle appends a new frame; an exact retry leaves both values unchanged.
+//
+// These values witness completed PersistWave data-sync fences, not every
+// device sync. Rotation, checkpoint and sealer syncs are excluded. An unusable
+// handle returns zero values, so a post-sync failure can hide an append rather
+// than provide evidence of its durability.
+func (e *Engine) AppendWitness() (sequence uint64, groups int) {
+	if e == nil {
+		return 0, 0
 	}
-	return e.sequence
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+	if e.log == nil || e.log.usable() != nil {
+		return 0, 0
+	}
+	return e.sequence, e.lastAppendGroups
 }
 
 func (e *Engine) LogID() [16]byte { return e.log.state.LogID }
@@ -914,6 +964,7 @@ func (e *Engine) PersistWave(w Wave) error {
 		}
 	}
 	e.applySequence = 0
+	e.lastAppendGroups = len(w.Batches)
 	return nil
 }
 
@@ -1046,10 +1097,22 @@ func (e *Engine) prepareWave(w Wave, validateState bool) ([]byte, [32]byte, []se
 		}
 		if flags&batchIdentity != 0 {
 			e.frameBuf = appendUvarint(e.frameBuf, batch.NodeIncarnation)
-			e.frameBuf = appendUvarint(e.frameBuf, batch.ReadyID)
+			span := canonicalReadySpan(batch.ReadySpan)
+			if span > 1 {
+				// ReadyID was historically the first field after the
+				// incarnation and is always nonzero. Reserve its zero value as
+				// an unambiguous marker for the extended identity grammar:
+				// zero, version, span, final ReadyID, digest.
+				e.frameBuf = appendUvarint(e.frameBuf, 0)
+				e.frameBuf = appendUvarint(e.frameBuf, readySpanVersion)
+				e.frameBuf = appendUvarint(e.frameBuf, span)
+				e.frameBuf = appendUvarint(e.frameBuf, batch.ReadyID)
+			} else {
+				e.frameBuf = appendUvarint(e.frameBuf, batch.ReadyID)
+			}
 			e.frameBuf = append(e.frameBuf, batch.ReadyDigest[:]...)
 			if validateState {
-				e.eventScratch = append(e.eventScratch, segmentEvent{Kind: eventReadyState, GroupID: batch.GroupID, Incarnation: batch.NodeIncarnation, ReadyID: batch.ReadyID, ReadyDigest: batch.ReadyDigest, Reference: w.ID})
+				e.eventScratch = append(e.eventScratch, segmentEvent{Kind: eventReadyState, GroupID: batch.GroupID, Incarnation: batch.NodeIncarnation, ReadyID: batch.ReadyID, ReadySpan: span, ReadyDigest: batch.ReadyDigest, Reference: w.ID})
 			}
 		}
 		if flags&batchBegin != 0 {
@@ -1167,6 +1230,14 @@ func waveSize(w Wave) (int, int, error) {
 		if b.GroupID <= previousGroup {
 			return 0, 0, ErrRaftState
 		}
+		span, spanErr := checkedReadySpan(b.ReadySpan)
+		if spanErr != nil {
+			return 0, 0, spanErr
+		}
+		flags := batchFlags(b)
+		if span > 1 && flags&batchIdentity == 0 {
+			return 0, 0, ErrRaftState
+		}
 		bytes += uvarintBytes(b.GroupID-previousGroup) + 1 + uvarintBytes(uint64(len(b.Entries)))
 		if b.ReplaceFrom != 0 {
 			bytes += uvarintBytes(b.ReplaceFrom)
@@ -1184,11 +1255,16 @@ func waveSize(w Wave) (int, int, error) {
 			bytes += uvarintBytes(b.Hard.Term) + uvarintBytes(b.Hard.Vote) + uvarintBytes(b.Hard.Commit)
 			events++
 		}
-		if batchFlags(b)&batchIdentity != 0 {
-			bytes += uvarintBytes(b.NodeIncarnation) + uvarintBytes(b.ReadyID) + 16
+		if flags&batchIdentity != 0 {
+			bytes += uvarintBytes(b.NodeIncarnation) + 16
+			if span > 1 {
+				bytes += uvarintBytes(0) + uvarintBytes(readySpanVersion) + uvarintBytes(span) + uvarintBytes(b.ReadyID)
+			} else {
+				bytes += uvarintBytes(b.ReadyID)
+			}
 			events++
 		}
-		if batchFlags(b)&batchBegin != 0 {
+		if flags&batchBegin != 0 {
 			bytes += uvarintBytes(b.BeginIncarnation)
 			events++
 		}
@@ -1370,6 +1446,13 @@ func isBlobEvent(kind uint16) bool { return kind >= eventBlobEntry && kind <= ev
 
 func validateBatch(g *engineGroup, b *ReadyBatch) (byte, error) {
 	flags := batchFlags(b)
+	span, spanErr := checkedReadySpan(b.ReadySpan)
+	if spanErr != nil {
+		return 0, spanErr
+	}
+	if span > 1 && flags&batchIdentity == 0 {
+		return 0, ErrRaftState
+	}
 	if flags&batchBegin != 0 {
 		if b.BeginIncarnation != g.NodeIncarnation+1 || len(b.Entries) != 0 || b.ReplaceFrom != 0 || b.TruncateIndex != 0 || b.TruncateTerm != 0 {
 			return 0, ErrRaftState
@@ -1392,10 +1475,10 @@ func validateBatch(g *engineGroup, b *ReadyBatch) (byte, error) {
 			return 0, ErrRaftState
 		}
 		if b.NodeIncarnation == g.NodeIncarnation {
-			if b.ReadyID != g.ReadyID+1 {
+			if g.ReadyID > ^uint64(0)-span || b.ReadyID != g.ReadyID+span {
 				return 0, ErrRaftState
 			}
-		} else if b.NodeIncarnation <= g.NodeIncarnation || b.ReadyID != 1 {
+		} else if b.NodeIncarnation <= g.NodeIncarnation || b.ReadyID != span {
 			return 0, ErrRaftState
 		}
 	}
@@ -1619,11 +1702,15 @@ func (e *Engine) applyEvent(event segmentEvent, segmentID uint64) error {
 		if event.Incarnation == 0 || event.ReadyID == 0 || event.ReadyDigest == ([16]byte{}) {
 			return ErrRaftState
 		}
+		span := canonicalReadySpan(event.ReadySpan)
+		if span > maxReadySpan {
+			return ErrCorrupt
+		}
 		if event.Incarnation == g.NodeIncarnation {
-			if event.ReadyID != g.ReadyID+1 {
+			if g.ReadyID > ^uint64(0)-span || event.ReadyID != g.ReadyID+span {
 				return ErrRaftState
 			}
-		} else if event.Incarnation <= g.NodeIncarnation || event.ReadyID != 1 {
+		} else if event.Incarnation <= g.NodeIncarnation || event.ReadyID != span {
 			return ErrRaftState
 		}
 		newWave := WaveID(event.Reference)
@@ -2690,21 +2777,35 @@ func decodeWaveFrameForEngine(frame []byte, expectedSequence uint64, engine *Eng
 		if err != nil || flags & ^byte(batchReplace|batchPrefix|batchCheckpoint|batchHard|batchTypes|batchIdentity|batchBlob|batchBegin) != 0 {
 			return id, digest, nil, ErrCorrupt
 		}
-		batch := ReadyBatch{GroupID: group}
+		batch := ReadyBatch{GroupID: group, ReadySpan: 1}
 		if flags&batchIdentity != 0 {
 			batch.NodeIncarnation, err = cursor.uvarint()
-			if err != nil {
+			if err != nil || batch.NodeIncarnation == 0 {
 				return id, digest, nil, ErrCorrupt
 			}
 			batch.ReadyID, err = cursor.uvarint()
 			if err != nil {
 				return id, digest, nil, ErrCorrupt
 			}
+			if batch.ReadyID == 0 {
+				version, versionErr := cursor.uvarint()
+				span, spanErr := cursor.uvarint()
+				batch.ReadyID, err = cursor.uvarint()
+				if versionErr != nil || spanErr != nil || err != nil || version != readySpanVersion || span <= 1 || span > maxReadySpan || batch.ReadyID == 0 {
+					return id, digest, nil, ErrCorrupt
+				}
+				batch.ReadySpan = span
+			} else {
+				batch.ReadySpan = 1
+			}
 			value, takeErr := cursor.take(16)
 			if takeErr != nil {
 				return id, digest, nil, ErrCorrupt
 			}
 			copy(batch.ReadyDigest[:], value)
+			if batch.ReadyDigest == ([16]byte{}) {
+				return id, digest, nil, ErrCorrupt
+			}
 		}
 		if flags&batchBegin != 0 {
 			batch.BeginIncarnation, err = cursor.uvarint()
@@ -2874,7 +2975,7 @@ func (e *Engine) eventsForDecoded(batches []ReadyBatch, frameOffset, sequence ui
 		}
 		events = append(events, segmentEvent{Kind: eventWaveRef, GroupID: batch.GroupID, Index: sequence, Reference: id, Digest: digest})
 		if batch.NodeIncarnation != 0 {
-			events = append(events, segmentEvent{Kind: eventReadyState, GroupID: batch.GroupID, Incarnation: batch.NodeIncarnation, ReadyID: batch.ReadyID, ReadyDigest: batch.ReadyDigest, Reference: id})
+			events = append(events, segmentEvent{Kind: eventReadyState, GroupID: batch.GroupID, Incarnation: batch.NodeIncarnation, ReadyID: batch.ReadyID, ReadySpan: canonicalReadySpan(batch.ReadySpan), ReadyDigest: batch.ReadyDigest, Reference: id})
 		}
 		if batch.BeginIncarnation != 0 {
 			events = append(events, segmentEvent{Kind: eventIncarnation, GroupID: batch.GroupID, Incarnation: batch.BeginIncarnation})

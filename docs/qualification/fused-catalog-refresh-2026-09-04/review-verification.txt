@@ -1,0 +1,57 @@
+Catalog-miss Sol review verification record
+Worktree: /private/tmp/vibedb-fused-rf3-node
+Go experiment: simd
+This is a concise record of command stdout and exit status, not a benchmark.
+
+Command:
+GOEXPERIMENT=simd go test ./gateway -run '^TestCatalogRefreshReview' -count=1
+Exit: 0
+Stdout:
+ok  github.com/thesyncim/vibedb/gateway  0.521s
+
+Command:
+GOEXPERIMENT=simd go test -race ./gateway -run 'Test(CatalogRefreshReview|Executor|Exec|Explain|ReplicatedDataReader|ReplicatedScatterRead|ReplicatedSQLRead|DurableSQL|PrepareDirect|PreparedDirectReview|PostgreSQLBackend|GatewayExec)' -count=1
+Exit: 0
+Stdout:
+ok  github.com/thesyncim/vibedb/gateway  6.180s
+
+One additional focused Executor.Exec test was added after that combined race
+gate. No production source changed between the following checks.
+
+Command:
+GOEXPERIMENT=simd go test -race ./gateway -run '^TestCatalogRefreshReviewExecMissRefreshesOnceBeforeAdmission$' -count=1
+Exit: 0
+Stdout:
+ok  github.com/thesyncim/vibedb/gateway  1.683s
+
+git diff --check -- gateway: exit 0, empty output.
+gofmt -l on all 13 frozen gateway paths: exit 0, empty output.
+
+Frozen paths:
+gateway/catalog.go
+gateway/catalog_refresh.go
+gateway/catalog_refresh_review_test.go
+gateway/durable_sql_prepared_direct.go
+gateway/durable_sql_request_executor.go
+gateway/executor.go
+gateway/executor_test.go
+gateway/pgwire.go
+gateway/pgwire_write.go
+gateway/replicated_data_read.go
+gateway/replicated_data_read_test.go
+gateway/replicated_data_scatter_read.go
+gateway/replicated_sql_read.go
+
+Review findings addressed before freeze:
+- Native missing-table classification now checks canonical scalar keys on the
+  cold path, including every key in a batch and known mixed-group refusal.
+- Explain bounds its new catalog refresh with the operation profile deadline.
+- Missing-table planning refreshes once; prior planning leases are released.
+- Failed refresh retains exact durable request replay; changed bytes conflict.
+- Existing-table PG preparation retains Current().Prepare without refresh.
+
+Independent regressions additionally cover shared-holder coalescing and
+generation floors, waiter cancellation, whole-batch refresh before data I/O,
+native and SQL batch hot paths, PG read/write preparation and cold deadlines.
+No staging, commits, broad gateway suite, benchmark or Linux process run was
+performed by this review. The physical3/physical6 crash/restart gate is next.
