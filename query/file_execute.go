@@ -151,6 +151,11 @@ type fileWorkspace struct {
 	orderedFilterPath   string
 	orderedFilterOp     durable.IntegerOrder
 	orderedFilterNeedle int64
+	intervalFilter      *durable.IntegerIntervalFilter
+	intervalFilterPath  string
+	intervalLower       int64
+	intervalUpper       int64
+	intervalUnbounded   bool
 
 	// workers is one scan Workspace per worker goroutine, indexed by worker
 	// number. Indexing by worker rather than by batch is deliberate: nothing a
@@ -235,6 +240,11 @@ func (w *fileWorkspace) release() {
 	w.orderedFilterPath = ""
 	w.orderedFilterOp = 0
 	w.orderedFilterNeedle = 0
+	w.intervalFilter = nil
+	w.intervalFilterPath = ""
+	w.intervalLower = 0
+	w.intervalUpper = 0
+	w.intervalUnbounded = false
 	w.workers = nil
 	w.segments = nil
 	w.arenas = nil
@@ -279,6 +289,27 @@ func (w *fileWorkspace) tokenIntegerOrderFilterFor(
 	w.orderedFilterPath = strings.Clone(path)
 	w.orderedFilterNeedle = needle
 	w.orderedFilterOp = op
+	return filter, nil
+}
+
+func (w *fileWorkspace) tokenIntegerIntervalFilterFor(
+	path string, interval durable.IntegerInterval,
+) (*durable.IntegerIntervalFilter, error) {
+	if w.intervalFilter != nil && w.intervalFilterPath == path &&
+		w.intervalLower == interval.Lower &&
+		w.intervalUpper == interval.Upper &&
+		w.intervalUnbounded == interval.UpperUnbounded {
+		return w.intervalFilter, nil
+	}
+	filter, err := durable.NewIntegerIntervalFilter(path, interval)
+	if err != nil {
+		return nil, err
+	}
+	w.intervalFilter = filter
+	w.intervalFilterPath = strings.Clone(path)
+	w.intervalLower = interval.Lower
+	w.intervalUpper = interval.Upper
+	w.intervalUnbounded = interval.UpperUnbounded
 	return filter, nil
 }
 
@@ -615,6 +646,20 @@ func (p *plan) runFileInto(
 	coveringColumns, handled, directErr := p.runDirectFileAggregate(snapshot, e)
 	if handled {
 		stats.CoveringColumns = coveringColumns
+		e.Stats = stats
+		if directErr == nil {
+			directErr = e.Workspace.checkCanceled()
+		}
+		return directErr
+	}
+	intervalFilter, handled, directErr := p.runDirectFileTokenIntegerIntervalCount(snapshot, e)
+	if handled {
+		// The strict FOR interval lane is a serial full scan with no row
+		// fallback, just like the one-bound ordered lane.
+		stats.Workers = 1
+		stats.RowsScanned = intervalFilter.scanned
+		stats.TokenFilterRows = intervalFilter.token
+		stats.TokenFilterFallbackRows = intervalFilter.fallback
 		e.Stats = stats
 		if directErr == nil {
 			directErr = e.Workspace.checkCanceled()

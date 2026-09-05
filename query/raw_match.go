@@ -187,6 +187,91 @@ func (p *plan) scalarCountIntegerOrderPath() (compiledPath, scalar, Op, bool) {
 	return p.valuePaths[p.where.col], p.where.lit, p.where.op, true
 }
 
+// scalarCountIntegerIntervalPath recognizes exactly two ordered integer
+// comparisons conjoined on one path. The storage lane consumes a normalized
+// half-open interval [lower, upper); an empty interval is represented by
+// lower >= upper and remains exact without endpoint overflow.
+func (p *plan) scalarCountIntegerIntervalPath() (
+	path compiledPath,
+	lower, upper int64,
+	upperUnbounded bool,
+	ok bool,
+) {
+	if p == nil || p.where == nil || p.where.kind != predAnd ||
+		len(p.where.kids) != 2 || p.grouped || !p.singleRow {
+		return compiledPath{}, 0, 0, false, false
+	}
+	for _, col := range p.columns {
+		if col.agg != aggCount || col.value >= 0 {
+			return compiledPath{}, 0, 0, false, false
+		}
+	}
+	const maxInt64Value = int64(1<<63 - 1)
+	var pathSet, lowerSet, upperSet, empty bool
+	for _, kid := range p.where.kids {
+		if kid == nil || kid.kind != predCmp || !orderedRangeOp(kid.op) ||
+			kid.col < 0 || kid.col >= len(p.valuePaths) ||
+			kid.lit.kind != kindNumber || !kid.lit.isInt {
+			return compiledPath{}, 0, 0, false, false
+		}
+		candidate := p.valuePaths[kid.col]
+		if !candidate.single {
+			return compiledPath{}, 0, 0, false, false
+		}
+		if !pathSet {
+			path, pathSet = candidate, true
+		} else if path.indexPath() != candidate.indexPath() || path.join != candidate.join {
+			return compiledPath{}, 0, 0, false, false
+		}
+		switch kid.op {
+		case Gt:
+			if lowerSet {
+				return compiledPath{}, 0, 0, false, false
+			}
+			lowerSet = true
+			if kid.lit.ival == maxInt64Value {
+				// MaxInt64 + 1 is outside the int64 domain. Mark the
+				// interval empty without overflowing the endpoint.
+				lower, upper = maxInt64Value, maxInt64Value
+				empty = true
+			} else {
+				lower = kid.lit.ival + 1
+			}
+		case Ge:
+			if lowerSet {
+				return compiledPath{}, 0, 0, false, false
+			}
+			lowerSet = true
+			lower = kid.lit.ival
+		case Lt:
+			if upperSet {
+				return compiledPath{}, 0, 0, false, false
+			}
+			upperSet = true
+			upper = kid.lit.ival
+		case Le:
+			if upperSet {
+				return compiledPath{}, 0, 0, false, false
+			}
+			upperSet = true
+			if kid.lit.ival == maxInt64Value {
+				upperUnbounded = true
+				upper = maxInt64Value
+			} else {
+				upper = kid.lit.ival + 1
+			}
+		}
+	}
+	if !lowerSet || !upperSet {
+		return compiledPath{}, 0, 0, false, false
+	}
+	if empty {
+		upperUnbounded = false
+		upper = lower
+	}
+	return path, lower, upper, upperUnbounded, true
+}
+
 func (p *plan) scalarCountPath() (compiledPath, scalar, bool) {
 	path, lit, ok := p.scalarCountEqualityPath()
 	if !ok || !path.single {

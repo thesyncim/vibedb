@@ -49,7 +49,7 @@ printf 'round\trole\tpackage\tcommand\n' > "${commands_file}"
 # query scans for all four specialized widths. Thresholds are measured
 # separately from these full-column workloads.
 storeio_bench='^BenchmarkCompact(Stream(Packed|Spelling|Integer)|PrimaryStripePacked)Equality(7|8|10|16)$'
-query_bench='^BenchmarkFilePacked(Equality|Ordered)Count(Wide)?$'
+query_bench='^BenchmarkFilePacked(Equality|Ordered|IntegerInterval)Count(Wide)?$'
 
 record_command() {
 	local round=$1
@@ -138,7 +138,15 @@ validate_query() {
 		'BenchmarkFilePackedOrderedCountWide/half/lt' \
 		'BenchmarkFilePackedOrderedCountWide/half/le' \
 		'BenchmarkFilePackedOrderedCountWide/half/gt' \
-		'BenchmarkFilePackedOrderedCountWide/half/ge'; do
+		'BenchmarkFilePackedOrderedCountWide/half/ge' \
+		'BenchmarkFilePackedIntegerIntervalCount/empty' \
+		'BenchmarkFilePackedIntegerIntervalCount/sparse' \
+		'BenchmarkFilePackedIntegerIntervalCount/half' \
+		'BenchmarkFilePackedIntegerIntervalCount/full' \
+		'BenchmarkFilePackedIntegerIntervalCountWide/empty' \
+		'BenchmarkFilePackedIntegerIntervalCountWide/sparse' \
+		'BenchmarkFilePackedIntegerIntervalCountWide/half' \
+		'BenchmarkFilePackedIntegerIntervalCountWide/full'; do
 		if ! grep -Eq "^${expected}(-[0-9]+)?[[:space:]]" "${output}"; then
 			echo "missing packed-count query case ${expected}: ${output}" >&2
 			return 1
@@ -166,9 +174,9 @@ run_benchmark() {
 	local -a command=("${binary}" "${args[@]}")
 	if [[ ${package_name} == query ]]; then
 		if [[ ${role} == head ]]; then
-			command=(env VIBEDB_EXPECT_ORDERED=1 "${command[@]}")
+			command=(env VIBEDB_EXPECT_ORDERED=1 VIBEDB_EXPECT_INTERVAL=1 "${command[@]}")
 		else
-			command=(env VIBEDB_EXPECT_ORDERED=0 "${command[@]}")
+			command=(env VIBEDB_EXPECT_ORDERED=0 VIBEDB_EXPECT_INTERVAL=0 "${command[@]}")
 		fi
 	fi
 	record_command "${round}" "${role}" "${package_name}" "${command[@]}"

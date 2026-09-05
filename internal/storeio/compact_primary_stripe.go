@@ -1990,6 +1990,52 @@ func (v *CompactPrimaryStripeView) CountResolvedIntegerOrdered(
 	return matched, true
 }
 
+// CountResolvedIntegerInterval evaluates one normalized signed interval over
+// every resolved compact target stream. It is all-or-nothing at stripe
+// granularity: overflow, malformed data, a container target, or a non-FOR
+// target discards the local count and asks the caller to use the generic path.
+func (v *CompactPrimaryStripeView) CountResolvedIntegerInterval(
+	resolver *UnifiedHoleResolver,
+	interval UnifiedIntegerInterval,
+) (matched int, ok bool) {
+	if v == nil || resolver == nil || len(v.overflow) != 0 {
+		return 0, false
+	}
+	for shape := 0; shape < v.shapeCount; shape++ {
+		entry, found := v.shapeEntry(shape)
+		if !found {
+			return 0, false
+		}
+		hole := resolver.resolveCompactTemplate(entry.template)
+		if hole == UnifiedHoleAbsent {
+			continue
+		}
+		if hole < 0 || hole >= entry.template.holes {
+			return 0, false
+		}
+		streamRaw := entry.streamRaw
+		for at := 0; at <= hole; at++ {
+			stream, admitted := admittedCompactStream(streamRaw)
+			if !admitted {
+				return 0, false
+			}
+			if at == hole {
+				if stream.kind != compactStreamFOR {
+					return 0, false
+				}
+				count, supported := stream.countIntegerInterval(interval)
+				if !supported {
+					return 0, false
+				}
+				matched += count
+				break
+			}
+			streamRaw = streamRaw[stream.encoded:]
+		}
+	}
+	return matched, true
+}
+
 // CountResolvedNumberEqual evaluates exact JSON decimal equality over compact
 // numeric streams. scratch and ids are caller-owned reusable workspaces and
 // are returned on every path so the warmed query remains allocation-free.
