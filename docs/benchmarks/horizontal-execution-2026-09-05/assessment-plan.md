@@ -16,6 +16,10 @@ immutable refs and enables `--read-authority` only on the after arm (`S-off` to
 records that provenance, and verifies equal hashes for the independently built
 same-ref server binaries.
 
+The earlier startup and correctness smoke used `91d1fd119b8c227c5356cd0f4cac9f0937407303`.
+That revision predates `M` and is retained as diagnostic smoke evidence only;
+it is not the campaign `S`.
+
 Each output path below must be a new absolute directory. Each invocation runs
 both matched orders, with a fresh fixture and volume for every arm, and retains
 the CockroachDB oracle and VibeDB topology/durability validation. Run the two
@@ -27,7 +31,7 @@ cd /private/tmp/vibedb-horizontal
 REPO=/private/tmp/vibedb-horizontal
 CLIENT_SOURCE="<CLEAN_IMMUTABLE_CLIENT_SOURCE>"
 M="5160e0f6c8dc5b252e5c5ff75984bdd6fe49db02"
-S="91d1fd119b8c227c5356cd0f4cac9f0937407303"
+S="<FINAL_PRODUCTION_COMMIT>"
 WORKLOADS=point_hit,point_miss,range_32,range_64,range_256,group_16,update_existing,mixed_read_update,mixed_uniform
 
 run_matrix() {
