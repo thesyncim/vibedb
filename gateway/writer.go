@@ -259,8 +259,12 @@ func (s *Snapshot) prepareWrite(plan *PreparedPlan, source string) error {
 					return err
 				}
 			}
-		}
-		if err := validateConflictShardKeyAssignments(stmt.Insert.OnConflictUpdate, placement.Columns); err != nil {
+			// Authenticated native profiles freeze placement to the primary key.
+			// The candidate selects its owner; atomic apply validates that every
+			// selected postimage retains that exact key and current ownership.
+			// Computed key assignments therefore need no syntactic whitelist or
+			// coordinator preimage read. Unused branches stay lazy.
+		} else if err := validateConflictShardKeyAssignments(stmt.Insert.OnConflictUpdate, placement.Columns); err != nil {
 			return err
 		}
 	}
@@ -350,10 +354,9 @@ func replicatedConflictActionSupported(action *sqlast.InsertConflictUpdate) bool
 	return action == nil || action.WholeDocument() || sqldriver.ReplicatedConflictProgram(action)
 }
 
-// The shard executes the complete conflict action atomically. Its current row
-// and EXCLUDED row both belong to the selected owner, so copying either key is
-// safe. An arbitrary expression assigning an ancestor of a shard-key pointer
-// needs a postimage placement proof before it can be dispatched.
+// Legacy shards lack an authenticated primary-key placement profile at apply.
+// Restrict their key assignments to identity copies until they carry a postimage
+// placement proof. Native RF3 profiles enforce that proof at atomic apply.
 func validateConflictShardKeyAssignments(action *sqlast.InsertConflictUpdate, keys []string) error {
 	if action.WholeDocument() {
 		return nil // EXCLUDED is exactly the already-routed candidate document.

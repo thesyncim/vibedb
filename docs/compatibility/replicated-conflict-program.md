@@ -41,7 +41,8 @@ Template replacement releases the prior projection and workspace.
 
 Candidate, declaration and bind validation also run on the insert branch.
 On an existing row, the WHERE condition runs once through the shared SQL filter
-stage, before any assignment. Only TRUE selects the update; FALSE and UNKNOWN
+stage, before any assignment. Literal Boolean conditions use the engine's
+existing constant predicates and fold at bind time. Only TRUE selects the update; FALSE and UNKNOWN
 produce zero affected rows and skip every RHS. The absent-row branch inserts the
 candidate without evaluating the condition or assignments. Every expression sees
 the same immutable pair of current and candidate rows. The shared patcher collects all
