@@ -1,0 +1,8 @@
+=== RUN   TestPrepareRF3NodeSharedLogAndRuntime
+--- PASS: TestPrepareRF3NodeSharedLogAndRuntime (1.11s)
+=== RUN   TestServeRF3NodeLogThreeServersRestart
+--- PASS: TestServeRF3NodeLogThreeServersRestart (6.08s)
+=== RUN   TestRF3NodeRecoveryAcrossSegmentEntryCapacity
+--- PASS: TestRF3NodeRecoveryAcrossSegmentEntryCapacity (1.98s)
+PASS
+ok  	github.com/thesyncim/vibedb/cmd/vibedb-shard	9.180s

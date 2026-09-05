@@ -11,7 +11,62 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 )
+
+func TestReclaimCheckpointIODoesNotBlockActiveReadsOrAppends(t *testing.T) {
+	oldMin, oldMax := reclaimMinSegments, reclaimMaxSegments
+	reclaimMinSegments, reclaimMaxSegments = 2, 2
+	t.Cleanup(func() { reclaimMinSegments, reclaimMaxSegments, reclaimPublishHook = oldMin, oldMax, nil })
+	e, _, _ := newReclaimableEngine(t, t.TempDir())
+	defer e.Close()
+	if err := e.ReserveGroup(2, 4096); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.PersistWave(Wave{ID: waveID(4), Batches: []ReadyBatch{{GroupID: 2, Entries: []Entry{{Index: 1, Term: 1}}}}}); err != nil {
+		t.Fatal(err)
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	reclaimPublishHook = func(phase reclaimPublishPhase) error {
+		if phase == reclaimCheckpointAPublished {
+			close(entered)
+			<-release
+		}
+		return nil
+	}
+	done := make(chan error, 1)
+	go func() { done <- e.ReclaimDeadPrefix() }()
+	defer func() {
+		close(release)
+		if err := <-done; err != nil {
+			t.Error(err)
+		}
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("reclamation did not enter checkpoint I/O")
+	}
+	foreground := make(chan error, 1)
+	go func() {
+		_, term, compacted, found, err := e.LookupExact(2, 1)
+		if err == nil && (term != 1 || compacted || !found) {
+			err = ErrRaftState
+		}
+		if err == nil {
+			err = e.PersistWave(Wave{ID: waveID(5), Batches: []ReadyBatch{{GroupID: 2, Entries: []Entry{{Index: 2, Term: 1}}}}})
+		}
+		foreground <- err
+	}()
+	select {
+	case err := <-foreground:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("reclamation I/O blocked active read/append")
+	}
+}
 
 func newReclaimableEngine(t *testing.T, dir string) (*Engine, []SegmentMeta, Checkpoint) {
 	t.Helper()

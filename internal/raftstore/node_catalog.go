@@ -310,6 +310,56 @@ func (s *NodeStore) ReclaimDeadNodeLogPrefix() error {
 	return engine.ReclaimDeadPrefix()
 }
 
+// MaintainNodeLog runs on the checkpoint coordinator's cold worker, never on
+// the submission sequencer. Descriptor entries otherwise pin the first segment
+// indefinitely, even after every application group has checkpointed its rows.
+// Checkpoint that catalog before asking the sealer to reclaim a certified dead
+// prefix. The existing segment thresholds and recovery fences remain unchanged.
+// A busy sealer or submission queue simply defers this work to the next capture.
+func (q *NodeSubmissionSequencer) MaintainNodeLog() error {
+	if q == nil || q.store == nil || q.closed.Load() {
+		return ErrClosed
+	}
+	s := q.store
+	s.mu.Lock()
+	if err := s.usable(); err != nil {
+		s.mu.Unlock()
+		return err
+	}
+	metadata, ok := s.engine.Metadata(nodeDescriptorGroup)
+	through := uint64(len(s.descriptors))
+	s.mu.Unlock()
+	if !ok || metadata.Checkpoint.Index > through {
+		if failure := s.coordinateReadError(); failure != nil {
+			return failure
+		}
+		return ErrCorrupt
+	}
+	// Avoid a directory scan and catalog publication when registration has not
+	// advanced. A concurrent registration is included by this or a later pass.
+	if metadata.Checkpoint.Index < through {
+		if err := s.CheckpointDescriptorCatalog(); err != nil {
+			if errors.Is(err, ErrPersistenceUnknown) {
+				return err
+			}
+			if errors.Is(err, ErrSubmissionBackpressure) || errors.Is(err, seglog.ErrBackpressure) {
+				return nil
+			}
+			return err
+		}
+	}
+	err := s.ReclaimDeadNodeLogPrefix()
+	if errors.Is(err, seglog.ErrBounds) {
+		if failure := s.coordinateReadError(); failure != nil {
+			return failure
+		}
+		// No sufficiently large, fully sealed dead prefix yet. In particular,
+		// live entries from another group must continue to pin their segments.
+		return nil
+	}
+	return err
+}
+
 func (s *NodeStore) publishDescriptorCatalogReference(candidate descriptorCatalogCandidate) error {
 	s.mu.Lock()
 	sequencer := s.sequencer

@@ -1,0 +1,19 @@
+=== RUN   TestNodeLogMaintenanceReclaimsThreeReplicaHistory
+    node_maintenance_test.go:194: three-replica apparent node bytes: before=3232374 after=64752 reclaimed=3167622 (98.00%); preallocated blocks excluded
+    node_maintenance_test.go:196: three-replica allocated node bytes including active+two reserves per replica: before=17547264 after=14303232 reclaimed=3244032 (18.49%)
+--- PASS: TestNodeLogMaintenanceReclaimsThreeReplicaHistory (1.87s)
+=== RUN   TestNodeLogMaintenanceCatalogIODoesNotBlockReadsOrAppends
+--- PASS: TestNodeLogMaintenanceCatalogIODoesNotBlockReadsOrAppends (0.21s)
+=== RUN   TestNodeLogMaintenanceRetriesCatalogFailureAndSkipsUnchangedCatalog
+--- PASS: TestNodeLogMaintenanceRetriesCatalogFailureAndSkipsUnchangedCatalog (0.12s)
+PASS
+ok  	github.com/thesyncim/vibedb/internal/raftstore	2.198s
+=== RUN   TestReclaimCheckpointIODoesNotBlockActiveReadsOrAppends
+--- PASS: TestReclaimCheckpointIODoesNotBlockActiveReadsOrAppends (0.48s)
+PASS
+ok  	github.com/thesyncim/vibedb/internal/raftstore/seglog	0.480s
+=== RUN   TestAdoptNodeRuntimeDrivesWorkerFreeDurableReady
+    runtime_node_persistence_test.go:139: bind node runtime SQL requires strict physical allocation proof: vibedb: create recovery journal: vibedb: sealed capacity mismatch: strictly allocate recovery journal: vibedb: strict physical allocation proof is unsupported: unshare unsupported on filesystem 0x794c7630: operation not supported
+--- SKIP: TestAdoptNodeRuntimeDrivesWorkerFreeDurableReady (0.09s)
+PASS
+ok  	github.com/thesyncim/vibedb/internal/raftmember	0.096s

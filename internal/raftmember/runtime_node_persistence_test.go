@@ -120,8 +120,9 @@ func TestAdoptNodeRuntimeDrivesWorkerFreeDurableReady(t *testing.T) {
 		MaxWaveBytes: 1 << 20, MaxSegmentEvents: 256,
 		RecentWaves: 64, MaxEntriesPerGroup: 64, ReaderSlots: 1, MaxGroups: 8,
 	}
+	nodeDir := filepath.Join(t.TempDir(), "node")
 	store, err := raftstore.CreateNodeStore(
-		filepath.Join(t.TempDir(), "node"), node, testWALKey(),
+		nodeDir, node, testWALKey(),
 		[]raftstore.NodeBootstrap{{Descriptor: descriptor, Snapshot: bootstrap}}, options,
 	)
 	if err != nil {
@@ -254,6 +255,10 @@ func TestAdoptNodeRuntimeDrivesWorkerFreeDurableReady(t *testing.T) {
 	first, err := group.FirstIndex()
 	if err != nil || first < wantCheckpoint+1 {
 		t.Fatalf("checkpoint did not truncate applied prefix: first=%d err=%v", first, err)
+	}
+	catalogs, err := filepath.Glob(filepath.Join(nodeDir, "checkpoints", "descriptor-catalog-*.chk"))
+	if err != nil || len(catalogs) != 1 {
+		t.Fatalf("checkpoint worker did not release descriptor log history: catalogs=%v err=%v", catalogs, err)
 	}
 	if err = runtime.Close(); err != nil {
 		t.Fatal(err)

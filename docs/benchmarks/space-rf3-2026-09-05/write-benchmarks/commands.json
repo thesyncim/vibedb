@@ -1,0 +1,386 @@
+[
+  {
+    "trial": 1,
+    "arm": "base",
+    "package": "durable",
+    "command": [
+      "/tmp/vibedb-space-base-durable.test",
+      "-test.run=^$",
+      "-test.bench=^(BenchmarkUnifiedGetRaw|BenchmarkUnifiedPrimaryReplace|BenchmarkUnifiedScanAllBytesLowCardinality|BenchmarkUnifiedScanAllBytesHighCardinality|BenchmarkFileStorePutDurabilitySync)$/(writers=1)?$",
+      "-test.benchtime=200ms",
+      "-test.count=1",
+      "-test.cpu=1",
+      "-test.benchmem"
+    ],
+    "exit_code": 0,
+    "seconds": 3.981619119644165
+  },
+  {
+    "trial": 1,
+    "arm": "base",
+    "package": "raft",
+    "command": [
+      "/tmp/vibedb-space-base-raft.test",
+      "-test.run=^$",
+      "-test.bench=^BenchmarkNodeStorePersistDurability$",
+      "-test.benchtime=200ms",
+      "-test.count=1",
+      "-test.cpu=1",
+      "-test.benchmem"
+    ],
+    "exit_code": 0,
+    "seconds": 1.5440828800201416
+  },
+  {
+    "trial": 1,
+    "arm": "after",
+    "package": "durable",
+    "command": [
+      "/tmp/vibedb-space-after-durable.test",
+      "-test.run=^$",
+      "-test.bench=^(BenchmarkUnifiedGetRaw|BenchmarkUnifiedPrimaryReplace|BenchmarkUnifiedScanAllBytesLowCardinality|BenchmarkUnifiedScanAllBytesHighCardinality|BenchmarkFileStorePutDurabilitySync)$/(writers=1)?$",
+      "-test.benchtime=200ms",
+      "-test.count=1",
+      "-test.cpu=1",
+      "-test.benchmem"
+    ],
+    "exit_code": 0,
+    "seconds": 4.136029243469238
+  },
+  {
+    "trial": 1,
+    "arm": "after",
+    "package": "raft",
+    "command": [
+      "/tmp/vibedb-space-after-raft.test",
+      "-test.run=^$",
+      "-test.bench=^BenchmarkNodeStorePersistDurability$",
+      "-test.benchtime=200ms",
+      "-test.count=1",
+      "-test.cpu=1",
+      "-test.benchmem"
+    ],
+    "exit_code": 0,
+    "seconds": 1.5736408233642578
+  },
+  {
+    "trial": 2,
+    "arm": "after",
+    "package": "durable",
+    "command": [
+      "/tmp/vibedb-space-after-durable.test",
+      "-test.run=^$",
+      "-test.bench=^(BenchmarkUnifiedGetRaw|BenchmarkUnifiedPrimaryReplace|BenchmarkUnifiedScanAllBytesLowCardinality|BenchmarkUnifiedScanAllBytesHighCardinality|BenchmarkFileStorePutDurabilitySync)$/(writers=1)?$",
+      "-test.benchtime=200ms",
+      "-test.count=1",
+      "-test.cpu=1",
+      "-test.benchmem"
+    ],
+    "exit_code": 0,
+    "seconds": 4.42732310295105
+  },
+  {
+    "trial": 2,
+    "arm": "after",
+    "package": "raft",
+    "command": [
+      "/tmp/vibedb-space-after-raft.test",
+      "-test.run=^$",
+      "-test.bench=^BenchmarkNodeStorePersistDurability$",
+      "-test.benchtime=200ms",
+      "-test.count=1",
+      "-test.cpu=1",
+      "-test.benchmem"
+    ],
+    "exit_code": 0,
+    "seconds": 1.582648754119873
+  },
+  {
+    "trial": 2,
+    "arm": "base",
+    "package": "durable",
+    "command": [
+      "/tmp/vibedb-space-base-durable.test",
+      "-test.run=^$",
+      "-test.bench=^(BenchmarkUnifiedGetRaw|BenchmarkUnifiedPrimaryReplace|BenchmarkUnifiedScanAllBytesLowCardinality|BenchmarkUnifiedScanAllBytesHighCardinality|BenchmarkFileStorePutDurabilitySync)$/(writers=1)?$",
+      "-test.benchtime=200ms",
+      "-test.count=1",
+      "-test.cpu=1",
+      "-test.benchmem"
+    ],
+    "exit_code": 0,
+    "seconds": 3.928633689880371
+  },
+  {
+    "trial": 2,
+    "arm": "base",
+    "package": "raft",
+    "command": [
+      "/tmp/vibedb-space-base-raft.test",
+      "-test.run=^$",
+      "-test.bench=^BenchmarkNodeStorePersistDurability$",
+      "-test.benchtime=200ms",
+      "-test.count=1",
+      "-test.cpu=1",
+      "-test.benchmem"
+    ],
+    "exit_code": 0,
+    "seconds": 1.429537057876587
+  },
+  {
+    "trial": 3,
+    "arm": "base",
+    "package": "durable",
+    "command": [
+      "/tmp/vibedb-space-base-durable.test",
+      "-test.run=^$",
+      "-test.bench=^(BenchmarkUnifiedGetRaw|BenchmarkUnifiedPrimaryReplace|BenchmarkUnifiedScanAllBytesLowCardinality|BenchmarkUnifiedScanAllBytesHighCardinality|BenchmarkFileStorePutDurabilitySync)$/(writers=1)?$",
+      "-test.benchtime=200ms",
+      "-test.count=1",
+      "-test.cpu=1",
+      "-test.benchmem"
+    ],
+    "exit_code": 0,
+    "seconds": 3.8848037719726562
+  },
+  {
+    "trial": 3,
+    "arm": "base",
+    "package": "raft",
+    "command": [
+      "/tmp/vibedb-space-base-raft.test",
+      "-test.run=^$",
+      "-test.bench=^BenchmarkNodeStorePersistDurability$",
+      "-test.benchtime=200ms",
+      "-test.count=1",
+      "-test.cpu=1",
+      "-test.benchmem"
+    ],
+    "exit_code": 0,
+    "seconds": 1.4025609493255615
+  },
+  {
+    "trial": 3,
+    "arm": "after",
+    "package": "durable",
+    "command": [
+      "/tmp/vibedb-space-after-durable.test",
+      "-test.run=^$",
+      "-test.bench=^(BenchmarkUnifiedGetRaw|BenchmarkUnifiedPrimaryReplace|BenchmarkUnifiedScanAllBytesLowCardinality|BenchmarkUnifiedScanAllBytesHighCardinality|BenchmarkFileStorePutDurabilitySync)$/(writers=1)?$",
+      "-test.benchtime=200ms",
+      "-test.count=1",
+      "-test.cpu=1",
+      "-test.benchmem"
+    ],
+    "exit_code": 0,
+    "seconds": 4.019828796386719
+  },
+  {
+    "trial": 3,
+    "arm": "after",
+    "package": "raft",
+    "command": [
+      "/tmp/vibedb-space-after-raft.test",
+      "-test.run=^$",
+      "-test.bench=^BenchmarkNodeStorePersistDurability$",
+      "-test.benchtime=200ms",
+      "-test.count=1",
+      "-test.cpu=1",
+      "-test.benchmem"
+    ],
+    "exit_code": 0,
+    "seconds": 1.6524667739868164
+  },
+  {
+    "trial": 4,
+    "arm": "after",
+    "package": "durable",
+    "command": [
+      "/tmp/vibedb-space-after-durable.test",
+      "-test.run=^$",
+      "-test.bench=^(BenchmarkUnifiedGetRaw|BenchmarkUnifiedPrimaryReplace|BenchmarkUnifiedScanAllBytesLowCardinality|BenchmarkUnifiedScanAllBytesHighCardinality|BenchmarkFileStorePutDurabilitySync)$/(writers=1)?$",
+      "-test.benchtime=200ms",
+      "-test.count=1",
+      "-test.cpu=1",
+      "-test.benchmem"
+    ],
+    "exit_code": 0,
+    "seconds": 4.011516094207764
+  },
+  {
+    "trial": 4,
+    "arm": "after",
+    "package": "raft",
+    "command": [
+      "/tmp/vibedb-space-after-raft.test",
+      "-test.run=^$",
+      "-test.bench=^BenchmarkNodeStorePersistDurability$",
+      "-test.benchtime=200ms",
+      "-test.count=1",
+      "-test.cpu=1",
+      "-test.benchmem"
+    ],
+    "exit_code": 0,
+    "seconds": 2.1264922618865967
+  },
+  {
+    "trial": 4,
+    "arm": "base",
+    "package": "durable",
+    "command": [
+      "/tmp/vibedb-space-base-durable.test",
+      "-test.run=^$",
+      "-test.bench=^(BenchmarkUnifiedGetRaw|BenchmarkUnifiedPrimaryReplace|BenchmarkUnifiedScanAllBytesLowCardinality|BenchmarkUnifiedScanAllBytesHighCardinality|BenchmarkFileStorePutDurabilitySync)$/(writers=1)?$",
+      "-test.benchtime=200ms",
+      "-test.count=1",
+      "-test.cpu=1",
+      "-test.benchmem"
+    ],
+    "exit_code": 0,
+    "seconds": 4.074476957321167
+  },
+  {
+    "trial": 4,
+    "arm": "base",
+    "package": "raft",
+    "command": [
+      "/tmp/vibedb-space-base-raft.test",
+      "-test.run=^$",
+      "-test.bench=^BenchmarkNodeStorePersistDurability$",
+      "-test.benchtime=200ms",
+      "-test.count=1",
+      "-test.cpu=1",
+      "-test.benchmem"
+    ],
+    "exit_code": 0,
+    "seconds": 1.4806857109069824
+  },
+  {
+    "trial": 5,
+    "arm": "base",
+    "package": "durable",
+    "command": [
+      "/tmp/vibedb-space-base-durable.test",
+      "-test.run=^$",
+      "-test.bench=^(BenchmarkUnifiedGetRaw|BenchmarkUnifiedPrimaryReplace|BenchmarkUnifiedScanAllBytesLowCardinality|BenchmarkUnifiedScanAllBytesHighCardinality|BenchmarkFileStorePutDurabilitySync)$/(writers=1)?$",
+      "-test.benchtime=200ms",
+      "-test.count=1",
+      "-test.cpu=1",
+      "-test.benchmem"
+    ],
+    "exit_code": 0,
+    "seconds": 4.017362117767334
+  },
+  {
+    "trial": 5,
+    "arm": "base",
+    "package": "raft",
+    "command": [
+      "/tmp/vibedb-space-base-raft.test",
+      "-test.run=^$",
+      "-test.bench=^BenchmarkNodeStorePersistDurability$",
+      "-test.benchtime=200ms",
+      "-test.count=1",
+      "-test.cpu=1",
+      "-test.benchmem"
+    ],
+    "exit_code": 0,
+    "seconds": 1.5000362396240234
+  },
+  {
+    "trial": 5,
+    "arm": "after",
+    "package": "durable",
+    "command": [
+      "/tmp/vibedb-space-after-durable.test",
+      "-test.run=^$",
+      "-test.bench=^(BenchmarkUnifiedGetRaw|BenchmarkUnifiedPrimaryReplace|BenchmarkUnifiedScanAllBytesLowCardinality|BenchmarkUnifiedScanAllBytesHighCardinality|BenchmarkFileStorePutDurabilitySync)$/(writers=1)?$",
+      "-test.benchtime=200ms",
+      "-test.count=1",
+      "-test.cpu=1",
+      "-test.benchmem"
+    ],
+    "exit_code": 0,
+    "seconds": 4.5606489181518555
+  },
+  {
+    "trial": 5,
+    "arm": "after",
+    "package": "raft",
+    "command": [
+      "/tmp/vibedb-space-after-raft.test",
+      "-test.run=^$",
+      "-test.bench=^BenchmarkNodeStorePersistDurability$",
+      "-test.benchtime=200ms",
+      "-test.count=1",
+      "-test.cpu=1",
+      "-test.benchmem"
+    ],
+    "exit_code": 0,
+    "seconds": 3.490399122238159
+  },
+  {
+    "trial": 6,
+    "arm": "after",
+    "package": "durable",
+    "command": [
+      "/tmp/vibedb-space-after-durable.test",
+      "-test.run=^$",
+      "-test.bench=^(BenchmarkUnifiedGetRaw|BenchmarkUnifiedPrimaryReplace|BenchmarkUnifiedScanAllBytesLowCardinality|BenchmarkUnifiedScanAllBytesHighCardinality|BenchmarkFileStorePutDurabilitySync)$/(writers=1)?$",
+      "-test.benchtime=200ms",
+      "-test.count=1",
+      "-test.cpu=1",
+      "-test.benchmem"
+    ],
+    "exit_code": 0,
+    "seconds": 4.968068838119507
+  },
+  {
+    "trial": 6,
+    "arm": "after",
+    "package": "raft",
+    "command": [
+      "/tmp/vibedb-space-after-raft.test",
+      "-test.run=^$",
+      "-test.bench=^BenchmarkNodeStorePersistDurability$",
+      "-test.benchtime=200ms",
+      "-test.count=1",
+      "-test.cpu=1",
+      "-test.benchmem"
+    ],
+    "exit_code": 0,
+    "seconds": 1.310051679611206
+  },
+  {
+    "trial": 6,
+    "arm": "base",
+    "package": "durable",
+    "command": [
+      "/tmp/vibedb-space-base-durable.test",
+      "-test.run=^$",
+      "-test.bench=^(BenchmarkUnifiedGetRaw|BenchmarkUnifiedPrimaryReplace|BenchmarkUnifiedScanAllBytesLowCardinality|BenchmarkUnifiedScanAllBytesHighCardinality|BenchmarkFileStorePutDurabilitySync)$/(writers=1)?$",
+      "-test.benchtime=200ms",
+      "-test.count=1",
+      "-test.cpu=1",
+      "-test.benchmem"
+    ],
+    "exit_code": 0,
+    "seconds": 4.733677864074707
+  },
+  {
+    "trial": 6,
+    "arm": "base",
+    "package": "raft",
+    "command": [
+      "/tmp/vibedb-space-base-raft.test",
+      "-test.run=^$",
+      "-test.bench=^BenchmarkNodeStorePersistDurability$",
+      "-test.benchtime=200ms",
+      "-test.count=1",
+      "-test.cpu=1",
+      "-test.benchmem"
+    ],
+    "exit_code": 0,
+    "seconds": 1.6898927688598633
+  }
+]
