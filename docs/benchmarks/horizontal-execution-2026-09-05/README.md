@@ -204,9 +204,10 @@ previous profile. The diagnostic does not replace the unprofiled paired results.
 
 The next architectural investigation is deferring commit-progress persistence
 while preserving durable data, term/vote, exact Ready identities, checkpoint cuts,
-and crash recovery. No such deferral is implemented: `StableStore.Persist` also
-promises stable HardState and retry-safe Ready IDs, so merely skipping `syncData`
-on metadata waves would violate the current contract. Required evidence includes
+and crash recovery. At that diagnostic cut, no such deferral was implemented. `StableStore.Persist`
+also protects HardState and retry-safe Ready IDs, so merely skipping `syncData`
+on metadata waves would have bypassed those protections. The implementation
+below extends the existing legacy WAL commit-hint exception explicitly. Required evidence includes
 bounded pending-state ownership, sequence folding, control-boundary flushing,
 and crash/restart and retry fault tests before any throughput claim.
 
@@ -214,3 +215,74 @@ and crash/restart and retry fault tests before any throughput claim.
 all CPU profiles, verification and diagnostics. `validation/wave-regions.json`
 contains the region summary. Like the other profile archives, it is diagnostic
 rather than a comparative benchmark.
+
+## Shared-node commit-progress folding
+
+`1f6a7b89` extends the legacy per-group WAL's volatile commit-only path to the
+shared physical-node log. A hint requires unchanged term/vote, no entries or
+snapshot, `MustSync=false`, and a monotone commit within already-durable log
+bounds. All constituents of a submitted series are validated before acceptance.
+The node copies scalar state and the exact caller retry digest; it retains no
+borrowed protobuf fields. Pending state is bounded to 15 logical Readies per
+registered group. The next durable batch folds both the live commit and pending
+Ready span into the existing authenticated frame grammar. The final caller's
+retry identity remains valid after reopening. Larger incoming series flush the
+previously acknowledged pending span first. Checkpoint, incarnation and graceful
+close boundaries flush hints. `9dfde26b` ensures an exact large-series retry does
+not unnecessarily force that flush.
+
+`seglog.Engine.PersistWave` is unchanged: every frame it accepts still completes
+its original data sync before publication. Entries, snapshots, term/vote changes,
+and explicit barriers always use that path. Live `InitialState` and `LogBounds`
+may include commit knowledge; published durable coordinates retain a separate
+persisted commit. On process loss, volatile knowledge can disappear, while the
+already-durable entries remain available. Existing Raft quorum recovery and the
+state machine's durable publication establish the committed prefix. This is an
+extension of an existing recovery model, not a novel consensus claim.
+
+Matched incremental results, `0d17b442` → `06684d33`:
+
+| Order | Before ops/s | After ops/s | CRDB ops/s | After/before | Before p95 ms | After p95 ms |
+|---|---:|---:|---:|---:|---:|---:|
+| before first | 2,096.0 | 3,124.4 | 8,125.2 | 1.49× | 10.292 | 9.017 |
+| after first | 3,064.7 | 3,329.7 | 9,438.4 | 1.09× | 8.120 | 8.198 |
+
+All 144,000 operations verified. Candidate throughput is only 0.35–0.38× CRDB;
+the 2× target remains unmet. The first candidate's individual throughputs were
+1,073.5, 3,448.0, and 3,124.4 ops/s; the slow trial is retained. Per-node append
+barriers were approximately 2,200–2,500 per trial versus 3,000–3,300 before.
+Persistence service conditions varied markedly, so the paired throughput change
+must not be treated as a precise hardware-independent effect size. Reverse-order
+p95 did not improve.
+
+Validation includes the full storage, runtime, owner, transport, gateway and
+shard package suite; repeated race checks; zero-allocation warmed hint/fold
+pairs; detached-field ownership; exact retries before and after reopen; bounded
+span overflow; committed-suffix protection; invalid multi-group/series atomic
+preflight; namespace failure; ambiguous sync failure; and checkpoint/incarnation
+recovery. Linux-specific shared-node restart and segment-capacity recovery tests
+passed on a Docker volume. The first attempt on the container overlay filesystem
+failed strict-allocation qualification and is retained as an environment failure.
+
+`06684d33` adds an immutable client oracle and a read-only recovery phase to the
+SQL benchmark client. `3990ae3b` adds a driver that uses the exact benchmark
+candidate binaries, exports the client's independently tracked expected scores,
+and kills the supervisor and all three RF3 servers with SIGKILL. Two restart
+cycles each verified all 8,192 rows across 16 tables, including all four fields,
+without reseeding or resetting scores. Observed readiness times were 1.56 s and
+1.31 s. This is process-loss evidence, not a host power-loss test; the separate
+storage tests prove that a volatile hint performs no new log write or sync and
+that WAL-only recovery retains the previously durable entry bytes.
+
+The post-change frontend trace contains 2,758 metadata waves averaging 0.010 ms
+and 5,031 required waves averaging 0.706 ms. Metadata-wave regions accumulated
+27.9 ms versus 3,550.3 ms for required waves. Direct SQL write execution averaged
+2.950 ms (p50 2.362 ms); prepare averaged 0.218 ms, and quorum reads 0.527 ms.
+These are diagnostic retained-region wall times, not comparative SQL throughput.
+There were no unmatched region edges in this retained summary. The remaining
+write gap is larger than local persistence alone; the next investigation needs
+to separate proposal admission, quorum completion and response transport.
+
+`hints.tar.gz`, `hint-crash-recovery.tar.gz`, and `profile-hints.tar.gz` retain the
+campaign, restart verification, and frontend trace respectively. Their hashes
+and omitted-file inventories follow the same artifact policy as prior runs.

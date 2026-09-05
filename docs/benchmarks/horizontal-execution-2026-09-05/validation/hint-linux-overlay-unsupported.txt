@@ -1,0 +1,10 @@
+=== RUN   TestServeRF3NodeLogThreeServersRestart
+    prepare_node_rf3_linux_test.go:261: vibedb: create recovery journal: vibedb: sealed capacity mismatch: strictly allocate recovery journal: vibedb: strict physical allocation proof is unsupported: unshare unsupported on filesystem 0x794c7630: operation not supported
+--- FAIL: TestServeRF3NodeLogThreeServersRestart (0.03s)
+=== RUN   TestRF3NodeRecoveryAcrossSegmentEntryCapacity
+    rf3_node_registration_linux_test.go:149: strict physical allocation unavailable: vibedb: create recovery journal: vibedb: sealed capacity mismatch: strictly allocate recovery journal: vibedb: strict physical allocation proof is unsupported: unshare unsupported on filesystem 0x794c7630: operation not supported
+--- SKIP: TestRF3NodeRecoveryAcrossSegmentEntryCapacity (0.01s)
+=== RUN   TestRF3RecoveryTwoGroupsShareNodeLog
+    rf3_recovery_log_test.go:31: strict physical allocation unavailable: vibedb: create recovery journal: vibedb: sealed capacity mismatch: strictly allocate recovery journal: vibedb: strict physical allocation proof is unsupported: unshare unsupported on filesystem 0x794c7630: operation not supported
+--- SKIP: TestRF3RecoveryTwoGroupsShareNodeLog (0.01s)
+FAIL

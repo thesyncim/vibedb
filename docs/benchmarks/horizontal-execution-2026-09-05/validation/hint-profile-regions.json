@@ -1,0 +1,83 @@
+{
+  "pg.direct.execute": {
+    "count": 8207,
+    "total_ms": 24207.80466999988,
+    "mean_ms": 2.9496533044961617,
+    "p50_ms": 2.362048,
+    "p95_ms": 7.09088,
+    "unmatched_begin": 0,
+    "unmatched_end": 0
+  },
+  "pg.direct.prepare": {
+    "count": 8207,
+    "total_ms": 1791.4145240000041,
+    "mean_ms": 0.21827885024978677,
+    "p50_ms": 0.140224,
+    "p95_ms": 0.295808,
+    "unmatched_begin": 0,
+    "unmatched_end": 0
+  },
+  "pg.write": {
+    "count": 8207,
+    "total_ms": 26088.791692000013,
+    "mean_ms": 3.1788463131473135,
+    "p50_ms": 2.527424,
+    "p95_ms": 7.958144,
+    "unmatched_begin": 0,
+    "unmatched_end": 0
+  },
+  "raft.persist.metadata": {
+    "count": 2758,
+    "total_ms": 27.908369000000036,
+    "mean_ms": 0.010119060551124003,
+    "p50_ms": 0.009024,
+    "p95_ms": 0.01632,
+    "unmatched_begin": 0,
+    "unmatched_end": 0
+  },
+  "raft.persist.required": {
+    "count": 5031,
+    "total_ms": 3550.2816289999987,
+    "mean_ms": 0.7056811029616379,
+    "p50_ms": 0.597632,
+    "p95_ms": 1.148608,
+    "unmatched_begin": 0,
+    "unmatched_end": 0
+  },
+  "sql.read.admission": {
+    "count": 2099,
+    "total_ms": 0.5581439999999923,
+    "mean_ms": 0.0002659094807050977,
+    "p50_ms": 0.000192,
+    "p95_ms": 0.000448,
+    "unmatched_begin": 0,
+    "unmatched_end": 0
+  },
+  "sql.read.encode": {
+    "count": 2095,
+    "total_ms": 2.0380300000000133,
+    "mean_ms": 0.0009728066825775656,
+    "p50_ms": 0.000768,
+    "p95_ms": 0.001408,
+    "unmatched_begin": 0,
+    "unmatched_end": 0
+  },
+  "sql.read.execute": {
+    "count": 2099,
+    "total_ms": 118.67465000000009,
+    "mean_ms": 0.05653866126727013,
+    "p50_ms": 0.041536,
+    "p95_ms": 0.077312,
+    "unmatched_begin": 0,
+    "unmatched_end": 0
+  },
+  "sql.read.quorum": {
+    "count": 2099,
+    "total_ms": 1106.2677810000005,
+    "mean_ms": 0.5270451553120533,
+    "p50_ms": 0.143424,
+    "p95_ms": 2.592448,
+    "unmatched_begin": 0,
+    "unmatched_end": 0
+  }
+}
