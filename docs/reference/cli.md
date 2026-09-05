@@ -1,10 +1,6 @@
 # Command-line reference
 
-> [!CAUTION]
-> **Development and qualification only.** VibeDB is under active development.
-> Commands, flags, output, manifests, network protocols, and persisted state
-> may break at any commit. Only exact same-build restart behavior is qualified;
-> there is no mixed-build upgrade or downgrade contract.
+[Documentation](../README.md) / [Reference](README.md) · [Development status](../status.md)
 
 The repository builds six commands. They are not all end-user tools.
 
@@ -33,14 +29,22 @@ Creates or reopens one durable local development topology and supervises its chi
 | --- | ---: | --- |
 | `--root` | none | Required clean absolute cluster directory. It must be absent or empty initially, or contain the exact retained development manifest. |
 | `--replicas` | `3` | `1` for development-only RF1/no HA, or `3` for RF3. |
+| `--physical-nodes` | `0` resolves to `3` for RF3 | RF3 serving-process count: `3` or `6`; rejected for RF1. |
+| `--node-log` | `false` | Shared-log option for development provisioning; physical-node RF3 already requires and creates shared node logs. |
 | `--nodes` | `0` | Deprecated alias for `--replicas`; conflicting values are rejected. |
 | `--shard-binary` | sibling/PATH | Explicit `vibedb-shard` executable. |
 | `--gateway-binary` | sibling/PATH | Explicit `vibedb-gateway` executable; used only for RF3. |
 | `--diagnostics-on-exit` | `false` | Print bounded child log tails after shutdown. |
-| `--pg-listen` | disabled | RF3-only loopback PostgreSQL endpoint. Requires a literal loopback IP and port `1..65535`. |
-| `--table-schema` | none | RF3-only file containing one `CREATE TABLE` with one primary key; retained on restart. |
+| `--pg-listen` | disabled | RF3-only PostgreSQL endpoint on the first physical node. Requires a literal loopback IP and port `1..65535`. |
+| `--pg-listens` | disabled | Comma-separated distinct loopback endpoints, one per physical node. Mutually exclusive with `--pg-listen`. |
+| `--table-schema` | none | Repeatable RF3-only file, each containing one `CREATE TABLE` with one primary key; retained on restart. |
 
-RF1 starts three independent single-member Raft groups and no gateway. RF3 starts three members for each of the catalog, request-ledger, and data groups, plus one gateway. See the [local cluster tutorial](../operations/local-cluster.md).
+RF1 starts three independent single-member Raft groups and no gateway. RF3
+starts three physical serving nodes by default, or six with `--physical-nodes`.
+Each node embeds a frontend and shares node storage across its groups; each
+catalog, request-ledger, and data group still has three replicas. The current
+launcher persists format-2 topology and rejects obsolete layouts. See the
+[local cluster tutorial](../operations/local-cluster.md).
 
 ## `vibedb-shard`
 
@@ -51,6 +55,8 @@ RF1 starts three independent single-member Raft groups and no gateway. RF3 start
 | `init` | `-store`, `-distribution`, `-shard`, nonzero `-allocation-generation` | Creates a static local shard store and prints its persisted binding and log ID to stderr. |
 | `serve` | the four `init` fields plus nonzero `-epoch` and `-routing-version` | Serves a statically owned shard. This is ownership fencing, not RF3 election. |
 | `prepare-rf3` | `-manifest` | Atomically prepares an RF3 member from a canonical manifest. An exact existing preparation is verified and accepted; it is not blindly overwritten. |
+| `prepare-node-rf3` | `-manifest` | Prepares multiple group replicas under a shared physical-node log. |
+| `serve-node` | `-manifest` | Serves prepared grouped node storage with an embedded gateway; requires explicit gateway configuration and node log. |
 | `serve-rf3` | `-manifest` | Opens exactly prepared artifacts and serves one or more group members. It creates and repairs nothing. |
 | `bootstrap-rf3` | `-manifest` | Installs an authenticated snapshot into a cold learner, then reopens through the ordinary serving path. It continues serving until stopped. |
 | `adopt-restored-rf3` | `-manifest` | Validates restored state against the target identity, roster, apply state, and snapshot, then publishes or verifies `serve-rf3.vibejson`. |
@@ -77,7 +83,11 @@ Without explicit plaintext development mode, the complete TLS profile and author
 | `-reload-prepared-groups` | `false` | Allows SIGHUP to append or retire durably prepared groups from the same manifest. |
 | `-execution-lanes` | `8` | Must be a supported power of two. |
 
-A process may serve 1–64 prepared group members. A manifest can explicitly describe RF1 development-only/no-HA; otherwise this is the RF3 path.
+A process may serve 1–64 prepared group members. A manifest can explicitly
+describe RF1 development-only/no-HA; otherwise this is the RF3 path.
+`serve-node` accepts the same three flags and requires a grouped manifest,
+shared `node_log`, and embedded `gateway` configuration. The local launcher
+constructs this composed path.
 
 ## `vibedb-gateway`
 
@@ -178,11 +188,11 @@ Client runs have a two-minute whole-run bound, fifteen-second round trips, a 1 M
 
 ## Source map
 
-| Surface | Primary source |
+| Surface | Implementation |
 | --- | --- |
-| `vibedb cluster dev` | `cmd/vibedb/main.go`, `cmd/vibedb/cluster_dev.go`, `cmd/vibedb/cluster_dev_tables.go` |
-| shard commands | `cmd/vibedb-shard/main.go`, `prepare_rf3.go`, `serve_rf3.go`, `bootstrap_rf3.go`, `adopt_restored_rf3.go` |
-| gateway flags and commands | `cmd/vibedb-gateway/main.go`, `serve.go`, `restore_activate.go`, `schema_rollout_admin.go` |
-| native and durable wire boundary | `cmd/vibedb-gateway/data_wire.go`, `data_handler.go`, `data_response.go`, `durable_exec_batch_wire.go`, `exec_batch_ack_wire.go` |
-| offline utility | `cmd/vibedb-verify/main.go` |
-| Kubernetes helpers | `cmd/vibedb-operator/`, `cmd/vibedb-kube-qualify/`, `internal/kubeoperator/` |
+| Local launcher | [main.go](../../cmd/vibedb/main.go), [flags and lifecycle](../../cmd/vibedb/cluster_dev.go), [physical placement](../../cmd/vibedb/cluster_dev_physical.go) |
+| Shard commands | [command dispatch](../../cmd/vibedb-shard/main.go), [node frontend](../../cmd/vibedb-shard/serve_node.go), [RF3 serving](../../cmd/vibedb-shard/serve_rf3.go) |
+| Gateway commands | [command entry point](../../cmd/vibedb-gateway/main.go), [shared runtime](../../internal/gatewayruntime/), [serve flags](../../internal/gatewayruntime/serve.go) |
+| Native and durable messages | [native grammar](../../internal/gatewayruntime/data_wire.go), [durable batches](../../internal/gatewayruntime/durable_exec_batch_wire.go), [acknowledgement](../../internal/gatewayruntime/exec_batch_ack_wire.go) |
+| Offline utility | [vibedb-verify](../../cmd/vibedb-verify/main.go) |
+| Kubernetes helpers | [operator helper](../../cmd/vibedb-operator/), [qualification probe](../../cmd/vibedb-kube-qualify/), [renderer](../../internal/kubeoperator/) |

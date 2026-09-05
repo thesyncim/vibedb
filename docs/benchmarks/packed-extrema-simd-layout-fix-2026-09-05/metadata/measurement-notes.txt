@@ -1,0 +1,6 @@
+This is a focused development follow-up, not a replacement for the full extrema report.
+The equality8 comparison isolates source layout around the pre-existing ARM64 kernel.
+The ordered wide sparse/lt comparison remains above the +3% local guard and is reported as a miss.
+The extrema SIMD/nosimd controls retain their exact query assertions and zero allocations.
+Power, thermal state, and scheduler noise were uncontrolled; no statistical significance is claimed.
+The local arm64 host cannot qualify AMD64 AVX2 speed.

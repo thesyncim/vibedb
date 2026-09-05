@@ -1,5 +1,7 @@
 # Development format 0 golden images
 
+[Format guide](../../../../docs/format.md)
+
 > [!CAUTION]
 > These fixtures describe one unreleased development commit. They are not a
 > compatibility promise, a migration input set, or evidence that another

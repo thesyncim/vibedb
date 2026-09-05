@@ -2036,6 +2036,60 @@ func (v *CompactPrimaryStripeView) CountResolvedIntegerInterval(
 	return matched, true
 }
 
+// CountResolvedIntegerExtrema reduces one resolved path over exact signed
+// integer FOR streams. It resolves the path once per shape and validates the
+// complete target stream before publishing any result. Overflow rows,
+// malformed geometry, non-FOR targets, width-64 lanes, and signed-wrapping
+// FOR spans therefore decline the complete stripe atomically.
+func (v *CompactPrimaryStripeView) CountResolvedIntegerExtrema(
+	resolver *UnifiedHoleResolver,
+) (result UnifiedIntegerExtremaResult, ok bool) {
+	if v == nil || resolver == nil || len(v.overflow) != 0 {
+		return UnifiedIntegerExtremaResult{}, false
+	}
+	for shape := 0; shape < v.shapeCount; shape++ {
+		entry, found := v.shapeEntry(shape)
+		if !found {
+			return UnifiedIntegerExtremaResult{}, false
+		}
+		hole := resolver.resolveCompactTemplate(entry.template)
+		if hole == UnifiedHoleAbsent {
+			continue
+		}
+		if hole < 0 || hole >= entry.template.holes {
+			return UnifiedIntegerExtremaResult{}, false
+		}
+		streamRaw := entry.streamRaw
+		for at := 0; at <= hole; at++ {
+			stream, admitted := admittedCompactStream(streamRaw)
+			if !admitted {
+				return UnifiedIntegerExtremaResult{}, false
+			}
+			if at == hole {
+				if stream.kind != compactStreamFOR {
+					return UnifiedIntegerExtremaResult{}, false
+				}
+				minimum, maximum, streamFound, supported := stream.countIntegerExtrema()
+				if !supported {
+					return UnifiedIntegerExtremaResult{}, false
+				}
+				if streamFound {
+					if !result.Found || minimum < result.Min {
+						result.Min = minimum
+					}
+					if !result.Found || maximum > result.Max {
+						result.Max = maximum
+					}
+					result.Found = true
+				}
+				break
+			}
+			streamRaw = streamRaw[stream.encoded:]
+		}
+	}
+	return result, true
+}
+
 // CountResolvedNumberEqual evaluates exact JSON decimal equality over compact
 // numeric streams. scratch and ids are caller-owned reusable workspaces and
 // are returned on every path so the warmed query remains allocation-free.

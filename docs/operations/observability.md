@@ -1,10 +1,31 @@
 # Observe an RF3 development cluster
 
-> [!CAUTION]
-> The metrics surface is an unstable development protocol. Field names, counters,
-> collection cadence, and wire format can change or break at any commit. VibeDB
-> currently provides no production monitoring integration, SLOs, alert policy,
-> persistent time series, or compatibility promise for dashboards.
+[Documentation](../README.md) / [Operations](README.md) · [Development status](../status.md)
+
+## Choose an observation path
+
+| Need | Surface | Scope |
+| --- | --- | --- |
+| Routing and cached RF3 progress | Authenticated native `metrics` request | Gateway counters and independently collected member samples. |
+| Physical-node persistence and local dispatch work | SIGUSR1 node diagnostics | Detached counters from one serving process and its current group inventory. |
+| CPU, RSS, disk capacity, and network traffic | Host monitoring or a recorded profile | Operating-system measurements outside the gateway metrics response. |
+
+### Collect a physical-node diagnostic
+
+On a supported Unix host, identify the exact `vibedb-shard serve-node` PID in
+your process supervisor, then send that process `SIGUSR1`. Do not signal the
+launcher or an unrelated process. The serving process emits a bounded JSON
+diagnostic and publishes `rf3-diagnostics.json` in the directory of its serving root.
+
+The record includes PID, NodeID, group count, Ready waves, node-log append
+barriers, checkpoint activity, local/remote dispatch, and storage-overlay fold
+counters. Diagnostics use detached observations; they do not request a storage
+snapshot, flush, or checkpoint. The diagnostic file itself is written and synced.
+
+Compare samples only for the same process and compatible group/schema
+inventory. Inspect availability, coverage, failure, and overflow fields before
+using storage counters. A provider change can reset collection counters within
+one PID. Keep raw samples when deriving rates or per-operation costs.
 
 ## Read the current counter snapshot
 
@@ -55,11 +76,8 @@ or storage I/O.
 
 ## Distributed RF3 snapshot
 
-> [!WARNING]
-> A current constructor defect can panic on a nonzero-group metrics request if
-> a custom service was given a `Provider` that does not also implement
-> `GroupProvider`. Group-serving configurations must supply `GroupProvider`;
-> the constructor does not currently reject the invalid combination.
+Group-specific sampling requires a provider implementing `GroupProvider`.
+A provider without that interface returns `ErrMetrics` for a group request.
 
 The gateway fixes the group/member and unique-node sample directory from its
 startup routes. A bounded worker set periodically performs authenticated
@@ -169,14 +187,18 @@ Collection failure increments explicit fault counters and leaves the last cached
 sample; it never changes routing, membership, cleanup, acknowledgement, split,
 or move authority.
 
+The [diagnostics qualification record](../qualification/fused-diagnostics-2026-09-04/README.md)
+describes the storage-sampling checks.
+
 ## Source map
 
 | Boundary | Source |
 | --- | --- |
+| Physical-node diagnostics | [rf3_diagnostics.go](../../cmd/vibedb-shard/rf3_diagnostics.go) |
 | Gateway route/fan-out counters | [`gateway/metrics.go`](../../gateway/metrics.go) |
 | Fixed sample directory, refresh, and saturating aggregate | [`gateway/distributed_metrics.go`](../../gateway/distributed_metrics.go) |
-| Public request validation and exact response fields | [`cmd/vibedb-gateway/serve_metrics.go`](../../cmd/vibedb-gateway/serve_metrics.go) |
-| Move/split controller counters | [`cmd/vibedb-gateway/controller_metrics.go`](../../cmd/vibedb-gateway/controller_metrics.go) |
+| Public request validation and exact response fields | [`internal/gatewayruntime/serve_metrics.go`](../../internal/gatewayruntime/serve_metrics.go) |
+| Move/split controller counters | [`internal/gatewayruntime/controller_metrics.go`](../../internal/gatewayruntime/controller_metrics.go) |
 | Fixed 80/408-byte authenticated RF3 exchange | [`internal/servicemetrics/service.go`](../../internal/servicemetrics/service.go) |
 | Mapping runtime/WAL/checkpoint/service counters to node stages | [`cmd/vibedb-shard/rf3_metrics.go`](../../cmd/vibedb-shard/rf3_metrics.go) |
 | Backup requests, faults, logical bytes, and double-scan bytes | [`internal/clusterbackupservice/service.go`](../../internal/clusterbackupservice/service.go) |

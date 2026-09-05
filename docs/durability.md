@@ -1,9 +1,6 @@
 # Durability and recovery
 
-> [!CAUTION]
-> VibeDB is unreleased development software. Any commit may break APIs, disk
-> formats, or wire behavior. Build and operate one exact tested commit only.
-> Do not entrust irreplaceable data to VibeDB.
+[Documentation](README.md) / [Design](design/README.md) · [Development status](status.md)
 
 Durability asks which failures may lose a successful operation. VibeDB does not
 treat visibility, acknowledgement, and persistence as synonyms.
@@ -217,6 +214,13 @@ than allowing a later foreground append to discover the shortage.
 
 ## Platform and failure limits
 
+Sealed recovery-journal profiles require strict physical allocation. That
+path currently requires Linux: the filesystem must support allocation and
+unsharing, or be the explicitly admitted ext4 case. An ordinary container
+overlay can fail this check. This affects RF3 preparation; it is distinct from
+the default embedded profile. See [strict allocation](../internal/storeio/strict_allocation_linux.go)
+and [local-cluster prerequisites](operations/local-cluster.md#prerequisites).
+
 “Power-safe” means the strongest implemented platform barrier; Darwin uses the
 full-sync class where available. It cannot prove every filesystem, controller,
 firmware, cache, hypervisor, or power-loss condition.
@@ -239,14 +243,14 @@ The public API defines no safe live raw-file backup procedure.
 
 ## Source map
 
-- Facade profiles: `vibedb.go`
-- Durable modes and validation: `store/durable/store_file_options.go`
-- Visibility and poison state: `store/durable/store_file_durability.go`
-- Flush and close: `store/durable/store_file_lifecycle.go`
-- Recovery journal: `store/durable/store_file_journal.go`
-- Multi-collection protocol: `store/durable/store_database_txn.go`
-- Recovery crash tests: `store/durable/store_file_journal_crash_test.go`
-- Buffered crash tests: `store/durable/store_file_buffered_test.go`
-- Shared-log bootstrap: `internal/raftstore/node_store.go`, `internal/raftstore/node_sequencer.go`
-- Bootstrap crash/retry tests: `internal/raftstore/node_group_bootstrap_test.go`
-- Incarnation and replay verification: `internal/raftstore/seglog/bootstrap_test.go`, `internal/raftstore/seglog/engine_test.go`
+- Facade profiles: [vibedb.go](../vibedb.go)
+- Durable modes and validation: [store/durable/store_file_options.go](../store/durable/store_file_options.go)
+- Visibility and poison state: [store/durable/store_file_durability.go](../store/durable/store_file_durability.go)
+- Flush and close: [store/durable/store_file_lifecycle.go](../store/durable/store_file_lifecycle.go)
+- Recovery journal: [store/durable/store_file_journal.go](../store/durable/store_file_journal.go)
+- Multi-collection protocol: [store/durable/store_database_txn.go](../store/durable/store_database_txn.go)
+- Recovery crash tests: [store/durable/store_file_journal_crash_test.go](../store/durable/store_file_journal_crash_test.go)
+- Buffered crash tests: [store/durable/store_file_buffered_test.go](../store/durable/store_file_buffered_test.go)
+- Shared-log bootstrap: [internal/raftstore/node_store.go](../internal/raftstore/node_store.go), [internal/raftstore/node_sequencer.go](../internal/raftstore/node_sequencer.go)
+- Bootstrap crash/retry tests: [internal/raftstore/node_group_bootstrap_test.go](../internal/raftstore/node_group_bootstrap_test.go)
+- Incarnation and replay verification: [internal/raftstore/seglog/bootstrap_test.go](../internal/raftstore/seglog/bootstrap_test.go), [internal/raftstore/seglog/engine_test.go](../internal/raftstore/seglog/engine_test.go)

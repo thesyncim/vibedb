@@ -156,6 +156,8 @@ type fileWorkspace struct {
 	intervalLower       int64
 	intervalUpper       int64
 	intervalUnbounded   bool
+	extremaFilter       *durable.IntegerExtremaFilter
+	extremaFilterPath   string
 
 	// workers is one scan Workspace per worker goroutine, indexed by worker
 	// number. Indexing by worker rather than by batch is deliberate: nothing a
@@ -245,6 +247,8 @@ func (w *fileWorkspace) release() {
 	w.intervalLower = 0
 	w.intervalUpper = 0
 	w.intervalUnbounded = false
+	w.extremaFilter = nil
+	w.extremaFilterPath = ""
 	w.workers = nil
 	w.segments = nil
 	w.arenas = nil
@@ -310,6 +314,21 @@ func (w *fileWorkspace) tokenIntegerIntervalFilterFor(
 	w.intervalLower = interval.Lower
 	w.intervalUpper = interval.Upper
 	w.intervalUnbounded = interval.UpperUnbounded
+	return filter, nil
+}
+
+func (w *fileWorkspace) tokenIntegerExtremaFilterFor(
+	path string,
+) (*durable.IntegerExtremaFilter, error) {
+	if w.extremaFilter != nil && w.extremaFilterPath == path {
+		return w.extremaFilter, nil
+	}
+	filter, err := durable.NewIntegerExtremaFilter(path)
+	if err != nil {
+		return nil, err
+	}
+	w.extremaFilter = filter
+	w.extremaFilterPath = strings.Clone(path)
 	return filter, nil
 }
 
@@ -646,6 +665,20 @@ func (p *plan) runFileInto(
 	coveringColumns, handled, directErr := p.runDirectFileAggregate(snapshot, e)
 	if handled {
 		stats.CoveringColumns = coveringColumns
+		e.Stats = stats
+		if directErr == nil {
+			directErr = e.Workspace.checkCanceled()
+		}
+		return directErr
+	}
+	extremaColumns, extremaRows, handled, directErr :=
+		p.runDirectFileIntegerExtrema(snapshot, e)
+	if handled {
+		// The strict extrema lane performs one serial storage scan and reduces
+		// the typed column without token-filter fallback work.
+		stats.Workers = 1
+		stats.RowsScanned = extremaRows
+		stats.CoveringColumns = extremaColumns
 		e.Stats = stats
 		if directErr == nil {
 			directErr = e.Workspace.checkCanceled()

@@ -1,0 +1,9 @@
+GOEXPERIMENT=simd
+GOAMD64=v1
+GOMAXPROCS=1
+-test.cpu=1
+-test.benchtime=250ms
+-test.count=1
+-test.benchmem=true
+repetitions=5
+Darwin Marcelos-MacBook-Pro.local 25.3.0 Darwin Kernel Version 25.3.0: Wed Jan 28 20:51:28 PST 2026; root:xnu-12377.91.3~2/RELEASE_ARM64_T6041 arm64

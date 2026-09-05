@@ -1,10 +1,6 @@
 # Source and algorithm provenance
 
-> [!CAUTION]
-> VibeDB is unreleased; APIs, commands, and wire/disk formats may break at any
-> commit. Use matching source/docs and disposable data. This repository has no
-> published project license; do not infer permission to use, modify, or
-> distribute VibeDB from third-party notice files.
+[Documentation](README.md) · [Development status](status.md)
 
 ## Project license status
 
@@ -61,6 +57,6 @@ When adding or deriving code:
 
 ## Source map
 
-- `go.mod`, `go.sum`, and nested-module `go.mod` files
-- `x/vitessroute/doc.go` and golden tests
-- root `LICENSE-*`, `PATENTS-*`, and `x/vitessroute/LICENSE-VITESS`
+- Root [go.mod](../go.mod) and [go.sum](../go.sum); optional [Vitess module](../x/vitessroute/go.mod) and [benchmark module](../bench/competitive/go.mod)
+- [x/vitessroute/doc.go](../x/vitessroute/doc.go) and golden tests
+- root `LICENSE-*`, `PATENTS-*`, and [x/vitessroute/LICENSE-VITESS](../x/vitessroute/LICENSE-VITESS)

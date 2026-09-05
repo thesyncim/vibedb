@@ -1,9 +1,6 @@
 # Choose an API
 
-> [!CAUTION]
-> Every API is an unreleased development contract. APIs, SQL, wire behavior,
-> and disk data may break at any commit. Use docs and binaries from one exact
-> commit and only disposable or recoverable data.
+[Documentation](../README.md) · [Development status](../status.md)
 
 | Interface | Choose it when | Key boundary |
 | --- | --- | --- |
@@ -20,7 +17,7 @@
   sources only when you own their snapshot/lifetime contracts.
 - Use `database/sql` for local embedded SQL. `OpenCluster` adds placement
   preflight to an embedded catalog; it does not start a network or Raft cluster.
-- Use pgwire only when a protocol client is a real requirement. Test every
+- Use pgwire to connect an existing PostgreSQL protocol client. Test every
   discovery and SQL shape your client emits.
 - Treat distributed gateway protocols as internal development interfaces; see
   [protocol reference](../reference/protocols.md).

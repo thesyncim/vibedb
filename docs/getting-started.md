@@ -1,12 +1,9 @@
 # Get started with the embedded database
 
-> [!CAUTION]
-> This tutorial uses an unreleased development API and disk format. Pin one
-> exact commit and use disposable data. A later commit may not open the files
-> created here.
+[Documentation](README.md) · [Development status](status.md)
 
 In this tutorial you will create a durable database, write two JSON documents,
-read one back, and reopen the database.
+read one back, and reopen the database without rewriting it.
 
 ## Prerequisites
 
@@ -18,7 +15,7 @@ Add VibeDB at an exact commit:
 
 ```bash
 go mod init example.com/vibedb-start
-go get github.com/thesyncim/vibedb@<commit>
+go get github.com/thesyncim/vibedb@a0de0919
 ```
 
 ## Create the program
@@ -30,6 +27,7 @@ package main
 
 import (
 	"errors"
+	"flag"
 	"fmt"
 
 	"github.com/thesyncim/vibedb"
@@ -42,6 +40,9 @@ func main() {
 }
 
 func run() (err error) {
+	seed := flag.Bool("seed", false, "write the tutorial documents")
+	flag.Parse()
+
 	db, err := vibedb.Open("./data")
 	if err != nil {
 		return err
@@ -49,12 +50,14 @@ func run() (err error) {
 	defer func() { err = errors.Join(err, db.Close()) }()
 
 	users := db.Collection("users")
-	for key, doc := range map[string]string{
-		"user:1": `{"name":"Ada","active":true}`,
-		"user:2": `{"name":"Linus","active":false}`,
-	} {
-		if _, err := users.Put(key, []byte(doc)); err != nil {
-			return err
+	if *seed {
+		for key, doc := range map[string]string{
+			"user:1": `{"name":"Ada","active":true}`,
+			"user:2": `{"name":"Linus","active":false}`,
+		} {
+			if _, err := users.Put(key, []byte(doc)); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -67,14 +70,16 @@ func run() (err error) {
 }
 ```
 
-Run it twice:
+Seed the database, then reopen it without writing:
 
-```bash
-go run .
+```sh
+go run . -seed
 go run .
 ```
 
-Both runs should print the same document. `Open` creates a database directory;
+Both runs should report `found=true` and the same stored document. The second
+run only reads, so it checks that the first run's write survived close/reopen.
+`Open` creates a database directory;
 the collection is materialized only when the first valid write commits.
 
 ## Understand the defaults
@@ -111,7 +116,7 @@ metadata or a journal.
 
 `Close` stops new work on its first call. Teardown can return a retryable error
 while a snapshot is still held, or a sticky persistence error after resources
-were released. Production-style code should:
+were released. Application code should:
 
 1. release query results, sessions, transactions, and snapshots;
 2. call `Close` and inspect the error;
@@ -133,6 +138,6 @@ To explore RF3 replication, finish the embedded tutorial first and then use the
 
 ## Source map
 
-- `vibedb.go`: `Open`, `WithDurability`, `Collection`, `Put`, `Get`, `Close`
-- `vibedb_test.go`: durable profile CRUD, flush, close, and reopen cases
-- `vibedb_lifecycle_internal_test.go`: retryable and completed close behavior
+- [vibedb.go](../vibedb.go): `Open`, `WithDurability`, `Collection`, `Put`, `Get`, `Close`
+- [vibedb_test.go](../vibedb_test.go): durable profile CRUD, flush, close, and reopen cases
+- [vibedb_lifecycle_internal_test.go](../vibedb_lifecycle_internal_test.go): retryable and completed close behavior

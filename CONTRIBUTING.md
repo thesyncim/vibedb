@@ -142,11 +142,25 @@ prose.
 
 ## Documentation changes
 
-Follow [the documentation standard](docs/STYLE.md). Lead with maturity and
-failure boundaries. Keep tutorials runnable, reference tables exact, and
-implementation evidence in a compact source map. Never use “PostgreSQL
-compatible,” “production,” “shipped,” or “bounded memory” without the precise
-scope that source and tests establish.
+Follow [the documentation style](docs/STYLE.md). Keep the README concise,
+procedures runnable, and design explanations separate from dated research.
+Update the appropriate index when adding a page. Preserve historical evidence
+and regenerate generated pages through their source.
+
+After installing [the checker dependencies](docs/STYLE.md#check-a-documentation-change):
+
+```sh
+make docs-check
+python3 -m unittest discover -s scripts/docs -p 'test_*.py'
+git diff --check
+```
+
+Set `PYTHON` to the virtual environment's Python when needed. Compile complete
+Go examples and run changed procedures against disposable data. For a prose
+change, these targeted checks are sufficient; run package, process, or fault
+tests when the change depends on an unverified behavior. Record the actual
+validation in the pull request rather than adding a running test log to the
+README or status page.
 
 ## Final review
 

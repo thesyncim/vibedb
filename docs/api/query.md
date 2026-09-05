@@ -1,9 +1,6 @@
 # Query API
 
-> [!CAUTION]
-> Unreleased development software: Query/SQL behavior, catalog contracts,
-> protocol mappings, limits, and ownership may change on any commit. Pin the
-> tested commit; builds are not compatible by default.
+[Documentation](../README.md) / [API guides](README.md) · [Development status](../status.md)
 
 The `query` package executes typed queries over JSON documents. Use it when you
 already own a VibeDB snapshot or segment and want typed cells without
@@ -13,7 +10,7 @@ transaction management.
 ## Choose an entry point
 
 | Need | Entry point | Reuse model |
-|---|---|---|
+| --- | --- | --- |
 | Build a projection/filter in Go | `query.Select(...)` | Mutable while chaining; immutable and concurrent-safe after first prepare/run |
 | Execute SELECT text | `query.PrepareStatement(sql)` | `Statement` is reusable but single-consumer |
 | Run once | `Query.Run` or `Statement.Run` | Call owns transient execution state |
@@ -73,7 +70,7 @@ Paths may be dotted (`user.name`), RFC 6901 pointers (`/user/name`), or empty
 for the whole document. The builder exposes:
 
 | Area | Constructors |
-|---|---|
+| --- | --- |
 | Projection | `Path` |
 | Aggregate | `Count`, `Sum`, `Avg`, `Min`, `Max` |
 | Predicate | `Cmp`, `In`, `Like`, `ILike`, `Contains`, `Exists`, `IsNull` |
@@ -135,7 +132,7 @@ The full textual surface and its intentional restrictions are in the
 ## Select a source
 
 | Source | Constructor | Result-cell ownership |
-|---|---|---|
+| --- | --- | --- |
 | In-memory segment | `FromSegment` | Cells borrow segment/execution bytes |
 | Heap snapshot | `FromSnapshot` | Cells borrow snapshot/execution bytes |
 | Durable snapshot | `FromFile` | Variable-width cells are copied into `Result` |
@@ -204,7 +201,7 @@ are two-valued, while SQL statements use three-valued logic.
 Zero-valued `ExecOptions` select finite defaults:
 
 | Resource | Default | Disable limit |
-|---|---:|---:|
+| --- | ---: | ---: |
 | Materialized result | 100,000 rows and 64 MiB | `ResultRows = -1`, `ResultBytes = -1` |
 | Relation intermediates | 64 MiB | `IntermediateBytes = -1` |
 | Exact aggregate state | 16 MiB | No unlimited sentinel |
@@ -241,9 +238,9 @@ and cleaned up workers and spill files.
 
 ## Source map
 
-- Builder and reuse: `query/query.go:150-234`, `query/plan.go:7-107`
-- Sources, ownership, and execution: `query/exec.go:12-60`, `query/exec.go:273-410`
-- SQL statements and cursors: `query/sqlstmt.go:288-358`, `query/sqlstmt.go:986-1140`, `query/sqlstmt.go:1661-1801`
-- Predicates and value semantics: `query/predicate.go:144-220`, `query/predicate.go:1084-1100`, `query/predicate.go:1391-1414`
-- Budgets: `query/file_execute.go:22-115`, `query/result_budget.go:11-18`, `query/relation_runtime.go:10-14`
-- Join/CTE/view boundaries: `query/join.go:135-207`, `query/recursive_fixpoint.go:10-148`, `query/view_expansion.go:10-75`
+- Builder and reuse: [query/query.go](../../query/query.go), [query/plan.go](../../query/plan.go)
+- Sources, ownership, and execution: [query/exec.go](../../query/exec.go), [query/exec.go](../../query/exec.go)
+- SQL statements and cursors: [query/sqlstmt.go](../../query/sqlstmt.go), [query/sqlstmt.go](../../query/sqlstmt.go), [query/sqlstmt.go](../../query/sqlstmt.go)
+- Predicates and value semantics: [query/predicate.go](../../query/predicate.go), [query/predicate.go](../../query/predicate.go), [query/predicate.go](../../query/predicate.go)
+- Budgets: [query/file_execute.go](../../query/file_execute.go), [query/result_budget.go](../../query/result_budget.go), [query/relation_runtime.go](../../query/relation_runtime.go)
+- Join/CTE/view boundaries: [query/join.go](../../query/join.go), [query/recursive_fixpoint.go](../../query/recursive_fixpoint.go), [query/view_expansion.go](../../query/view_expansion.go)

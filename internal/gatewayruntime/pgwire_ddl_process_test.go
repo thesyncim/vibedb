@@ -51,7 +51,7 @@ func TestPostgreSQLDevOnlineCreateTableAndRestart(t *testing.T) {
 				t.Log(process.Diagnostics())
 			}
 		})
-		if err := process.WaitReady(ctx, "VibeDB development cluster ready:"); err != nil {
+		if err := process.WaitReady(ctx, "VibeDB development RF3 physical cluster ready:"); err != nil {
 			t.Fatalf("startup: %v\n%s", err, process.Diagnostics())
 		}
 		return process

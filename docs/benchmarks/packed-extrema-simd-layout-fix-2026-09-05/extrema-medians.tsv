@@ -1,0 +1,3 @@
+benchmark	candidate_simd_median_ns_op	candidate_nosimd_median_ns_op	simd_over_nosimd	allocs
+BenchmarkFilePackedIntegerExtremaCount/min-max/FOR10	3478	11601	3.34	0
+BenchmarkFilePackedIntegerExtremaCountWide/min-max/FOR16	3515	12765	3.63	0

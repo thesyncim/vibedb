@@ -1,0 +1,8 @@
+Candidate SIMD compile commands:
+GOCACHE=/private/tmp/vibedb-packed-extrema-buildcache-head GOTOOLCHAIN=go1.27.0 GOEXPERIMENT=simd go test -run ^$ -c -o /private/tmp/vibedb-go127-simd-extrema-candidate-storeio-final.test ./internal/storeio
+GOCACHE=/private/tmp/vibedb-packed-extrema-buildcache-head GOTOOLCHAIN=go1.27.0 GOEXPERIMENT=simd go test -run ^$ -c -o /private/tmp/vibedb-go127-simd-extrema-candidate-query-final.test ./query
+Baseline SIMD compile commands:
+GOCACHE=/private/tmp/vibedb-packed-extrema-buildcache-base GOTOOLCHAIN=go1.27.0 GOEXPERIMENT=simd go test -run ^$ -c -o /private/tmp/vibedb-go127-simd-extrema-base-storeio-final.test ./internal/storeio
+GOCACHE=/private/tmp/vibedb-packed-extrema-buildcache-base GOTOOLCHAIN=go1.27.0 GOEXPERIMENT=simd go test -run ^$ -c -o /private/tmp/vibedb-go127-simd-extrema-base-query-final.test ./query
+Candidate nosimd compile command:
+GOCACHE=/private/tmp/vibedb-packed-extrema-buildcache-nosimd GOTOOLCHAIN=go1.27.0 GOEXPERIMENT=nosimd go test -run ^$ -c -o /private/tmp/vibedb-go127-simd-extrema-candidate-query-nosimd-final.test ./query

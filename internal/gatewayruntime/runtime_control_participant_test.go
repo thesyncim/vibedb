@@ -44,10 +44,20 @@ func runtimeControlTLSFixture(t *testing.T, entries []serviceauthz.Entry) ([]*ra
 	return profiles, policy
 }
 
-func runtimeParticipantForTest(t *testing.T, profile *rafttransport.PeerTLS, policy *serviceauthz.Policy) *Runtime {
+func runtimeParticipantForTest(t *testing.T, profile *rafttransport.PeerTLS, policy *serviceauthz.Policy,
+	shardDials ...gateway.DialFunc,
+) *Runtime {
 	t.Helper()
+	if len(shardDials) > 1 {
+		t.Fatal("multiple shard dials")
+	}
+	var shardDial gateway.DialFunc
+	if len(shardDials) == 1 {
+		shardDial = shardDials[0]
+	}
 	runtime, err := Open(context.Background(), Config{CatalogPath: runtimeLifecycleCatalog(t),
-		DevStaticCatalog: true, DevPlaintext: true, Listener: newBlockingRuntimeListener(), Logf: func(string, ...any) {}})
+		DevStaticCatalog: true, DevPlaintext: true, Listener: newBlockingRuntimeListener(),
+		ShardDial: shardDial, Logf: func(string, ...any) {}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,7 +76,23 @@ func TestRuntimeParticipantDrainWaitsForNonControllerRead(t *testing.T) {
 		{Node: rafttransport.NodeID{11}, Capabilities: serviceauthz.AllCapabilities},
 		{Node: rafttransport.NodeID{12}, Capabilities: serviceauthz.CapabilityTopology},
 	})
-	runtimes := []*Runtime{runtimeParticipantForTest(t, profiles[0], policy), runtimeParticipantForTest(t, profiles[1], policy)}
+	startupRecoveryEntered, startupRecoveryRelease := make(chan struct{}), make(chan struct{})
+	var enterRecovery, releaseRecovery sync.Once
+	unblockStartupRecovery := func() { releaseRecovery.Do(func() { close(startupRecoveryRelease) }) }
+	t.Cleanup(unblockStartupRecovery)
+	startupRecoveryDial := func(ctx context.Context, _ string) (net.Conn, error) {
+		enterRecovery.Do(func() { close(startupRecoveryEntered) })
+		select {
+		case <-startupRecoveryRelease:
+			return nil, errors.New("startup recovery released")
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	runtimes := []*Runtime{
+		runtimeParticipantForTest(t, profiles[0], policy),
+		runtimeParticipantForTest(t, profiles[1], policy, startupRecoveryDial),
+	}
 	old := runtimes[1].holder.Current()
 	raw, err := gateway.AppendSnapshotDocument(nil, old)
 	if err != nil {
@@ -97,6 +123,12 @@ func TestRuntimeParticipantDrainWaitsForNonControllerRead(t *testing.T) {
 			t.Fatal("participant started an autonomous controller")
 		}
 	}
+	// Ready closes before the public runtime starts its immediate transaction
+	// recovery pass. Let that pass acquire and release its catalog lease before
+	// attributing the exact generation-1 lease below to the blocked read.
+	awaitRuntimeSignal(t, startupRecoveryEntered, "startup recovery catalog pin")
+	unblockStartupRecovery()
+	waitForCatalogLeaseQuiescence(t, runtimes[1].holder, 2)
 	blocked := &runtimePinnedRead{entered: make(chan struct{}), release: make(chan struct{})}
 	var release sync.Once
 	unblock := func() { release.Do(func() { close(blocked.release) }) }
@@ -119,8 +151,9 @@ func TestRuntimeParticipantDrainWaitsForNonControllerRead(t *testing.T) {
 			t.Fatal("publish new generation")
 		}
 	}
-	if runtimes[1].holder.DrainStatus(2).ActiveOlderOperations != 1 {
-		t.Fatal("read did not retain the old catalog pin")
+	if status := runtimes[1].holder.DrainStatus(2); status.CurrentGeneration != 2 ||
+		status.OldestActiveGeneration != 1 || status.ActiveOlderOperations != 1 {
+		t.Fatalf("blocked read catalog pin = %+v, want current=2 oldest=1 active=1", status)
 	}
 	digest, err := gateway.CatalogSnapshotDigest(next)
 	if err != nil {
@@ -158,6 +191,25 @@ func TestRuntimeParticipantDrainWaitsForNonControllerRead(t *testing.T) {
 		}
 		if runtime.controlTLS.Stats().Active != 0 {
 			t.Fatal("participant retained authenticated control stream")
+		}
+	}
+}
+
+func waitForCatalogLeaseQuiescence(t *testing.T, holder *gateway.CatalogHolder, generation uint64) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		status := holder.DrainStatus(generation)
+		if status.ActiveOlderOperations == 0 {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("catalog generation %d retained startup leases: %+v: %v", generation, status, ctx.Err())
+		case <-ticker.C:
 		}
 	}
 }

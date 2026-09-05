@@ -1,10 +1,6 @@
 # Development protocol reference
 
-> [!CAUTION]
-> **Unreleased and unstable.** These protocols are current implementation
-> details, not public compatibility contracts. They may change or disappear at
-> any commit. Use one exact build at every endpoint; there is no mixed-build
-> upgrade, downgrade, or rolling-compatibility promise.
+[Documentation](../README.md) / [Reference](README.md) · [Development status](../status.md)
 
 VibeDB has several unrelated client and service protocols. None is HTTP or
 REST. A listener accepting one protocol must not be probed with another.
@@ -296,14 +292,14 @@ commit acknowledgement, or apply acknowledgement.
 
 | Area | Authoritative source |
 | --- | --- |
-| gateway stream and dispatch | `cmd/vibedb-gateway/serve.go`, `serve_request_wire.go` |
-| native JSON grammar and errors | `cmd/vibedb-gateway/data_wire.go`, `data_handler.go`, `data_response.go` |
-| durable request grammar | `cmd/vibedb-gateway/durable_exec_batch_wire.go`, `durable_exec_batch.go`, `exec_batch_ack_wire.go` |
-| static shard framing and admission | `shardservice/codec.go`, `wire.go`, `server.go`, `admit.go` |
-| static mutation-image execution | `sql/driver/mutation_capture.go`, `shardservice/execute.go`, `gateway/executor.go`, `gateway/writer.go` |
-| RF3 native framing and serving | `shardservice/replicated_wire.go`, `replicated_server.go`, `replicated_query.go` |
-| RF3 routing and retry | `gateway/replicated_native.go`, `replicated_data_read.go`, `replicated_data_scatter_read.go`, `replicated_sql_read.go` |
-| pgwire base and gateway adapter | `pgwire/doc.go`, `pgwire/proto.go`, `gateway/pgwire.go`, `gateway/pgwire_write.go` |
-| TLS identity and rotation | `internal/servicetls/`, `internal/rafttransport/identity.go` |
-| declared-grammar gate | `internal/buildgate/profile.go`, `internal/buildgate/preface.go` |
-| split control | `shardcontrol/protocol.go`, `shardcontrol/service.go` |
+| gateway stream and dispatch | [internal/gatewayruntime/serve.go](../../internal/gatewayruntime/serve.go), `serve_request_wire.go` |
+| native JSON grammar and errors | [internal/gatewayruntime/data_wire.go](../../internal/gatewayruntime/data_wire.go), `data_handler.go`, `data_response.go` |
+| durable request grammar | [internal/gatewayruntime/durable_exec_batch_wire.go](../../internal/gatewayruntime/durable_exec_batch_wire.go), `durable_exec_batch.go`, `exec_batch_ack_wire.go` |
+| static shard framing and admission | [shardservice/codec.go](../../shardservice/codec.go), `wire.go`, `server.go`, `admit.go` |
+| static mutation-image execution | [sql/driver/mutation_capture.go](../../sql/driver/mutation_capture.go), [shardservice/execute.go](../../shardservice/execute.go), [gateway/executor.go](../../gateway/executor.go), [gateway/writer.go](../../gateway/writer.go) |
+| RF3 native framing and serving | [shardservice/replicated_wire.go](../../shardservice/replicated_wire.go), `replicated_server.go`, `replicated_query.go` |
+| RF3 routing and retry | [gateway/replicated_native.go](../../gateway/replicated_native.go), `replicated_data_read.go`, `replicated_data_scatter_read.go`, `replicated_sql_read.go` |
+| pgwire base and gateway adapter | [pgwire/doc.go](../../pgwire/doc.go), [pgwire/proto.go](../../pgwire/proto.go), [gateway/pgwire.go](../../gateway/pgwire.go), [gateway/pgwire_write.go](../../gateway/pgwire_write.go) |
+| TLS identity and rotation | [internal/servicetls/](../../internal/servicetls), [internal/rafttransport/identity.go](../../internal/rafttransport/identity.go) |
+| declared-grammar gate | [internal/buildgate/profile.go](../../internal/buildgate/profile.go), [internal/buildgate/preface.go](../../internal/buildgate/preface.go) |
+| split control | [shardcontrol/protocol.go](../../shardcontrol/protocol.go), [shardcontrol/service.go](../../shardcontrol/service.go) |

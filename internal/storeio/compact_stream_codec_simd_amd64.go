@@ -20,6 +20,10 @@ var (
 	countCompactPacked8BetweenImpl  = countCompactPacked8BetweenScalar
 	countCompactPacked10BetweenImpl = countCompactPacked10BetweenScalar
 	countCompactPacked16BetweenImpl = countCompactPacked16BetweenScalar
+	countCompactPacked7ExtremaImpl  = countCompactPacked7ExtremaScalar
+	countCompactPacked8ExtremaImpl  = countCompactPacked8ExtremaScalar
+	countCompactPacked10ExtremaImpl = countCompactPacked10ExtremaScalar
+	countCompactPacked16ExtremaImpl = countCompactPacked16ExtremaScalar
 )
 
 func init() {
@@ -38,6 +42,10 @@ func init() {
 	countCompactPacked8BetweenImpl = countCompactPacked8BetweenAVX2
 	countCompactPacked10BetweenImpl = countCompactPacked10BetweenAVX2
 	countCompactPacked16BetweenImpl = countCompactPacked16BetweenAVX2
+	countCompactPacked7ExtremaImpl = countCompactPacked7ExtremaAVX2
+	countCompactPacked8ExtremaImpl = countCompactPacked8ExtremaAVX2
+	countCompactPacked10ExtremaImpl = countCompactPacked10ExtremaAVX2
+	countCompactPacked16ExtremaImpl = countCompactPacked16ExtremaAVX2
 }
 
 // PermuteOrZero works on bytes while ReshapeToUint16s forms little-endian

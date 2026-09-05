@@ -1,0 +1,5 @@
+bash -n scripts/bench/run-packed-simd.sh: PASS
+shellcheck: unavailable
+actionlint: unavailable
+GOOS=linux GOARCH=amd64 GOAMD64=v1 GOEXPERIMENT=simd go test -run ^$ -c ./internal/storeio: PASS
+GOOS=linux GOARCH=amd64 GOAMD64=v1 GOEXPERIMENT=simd go test -run ^$ -c ./query: PASS
