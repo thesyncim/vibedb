@@ -89,22 +89,32 @@ func (c *compactRankContext) necessaryRankFit(
 		entry.rows < compactStreamRestart || entry.rows >= v.rows {
 		return false
 	}
-	firstRank, firstOK := v.shapeRank(c.shape, 0)
-	secondRank, secondOK := v.shapeRank(c.shape, 1)
-	thirdRank, thirdOK := v.shapeRank(c.shape, 2)
-	lastRank, lastOK := v.shapeRank(c.shape, len(parsed)-1)
-	if !firstOK || !secondOK || !thirdOK || !lastOK ||
-		secondRank <= firstRank || thirdRank <= secondRank || lastRank <= thirdRank {
+	firstParsed := parsed[0]
+	lastParsed := parsed[len(parsed)-1]
+	var endpointSpread uint64
+	if lastParsed >= firstParsed {
+		endpointSpread = lastParsed - firstParsed
+	} else {
+		endpointSpread = firstParsed - lastParsed
+	}
+	if endpointSpread < uint64(len(parsed)-1) ||
+		parsed[1] == firstParsed || lastParsed == firstParsed ||
+		(parsed[1] > firstParsed) != (lastParsed > firstParsed) {
 		return false
 	}
-	firstValue := int64(first.value)
-	valueDelta := int64(parsed[1]) - firstValue
+	firstRank, firstOK := v.shapeRank(c.shape, 0)
+	secondRank, secondOK := v.shapeRank(c.shape, 1)
+	if !firstOK || !secondOK || secondRank <= firstRank {
+		return false
+	}
+	firstSigned := int64(first.value)
+	valueDelta := int64(parsed[1]) - firstSigned
 	rankDelta := int64(secondRank - firstRank)
 	if valueDelta == 0 || valueDelta%rankDelta != 0 {
 		return false
 	}
 	step := valueDelta / rankDelta
-	base, ok := compactRankAffineBase(firstValue, step, int64(firstRank))
+	base, ok := compactRankAffineBase(firstSigned, step, int64(firstRank))
 	if !ok || !compactRankAffineDomain(base, step, leafRows) {
 		return false
 	}
@@ -119,8 +129,14 @@ func (c *compactRankContext) necessaryRankFit(
 			return false
 		}
 	}
-	return compactRankAffineValue(base, step, int64(thirdRank)) == int64(parsed[2]) &&
-		compactRankAffineValue(base, step, int64(lastRank)) == int64(parsed[len(parsed)-1])
+	thirdRank, thirdOK := v.shapeRank(c.shape, 2)
+	if !thirdOK || thirdRank <= secondRank ||
+		compactRankAffineValue(base, step, int64(thirdRank)) != int64(parsed[2]) {
+		return false
+	}
+	lastRank, lastOK := v.shapeRank(c.shape, len(parsed)-1)
+	return lastOK && lastRank > thirdRank &&
+		compactRankAffineValue(base, step, int64(lastRank)) == int64(lastParsed)
 }
 
 func (v compactStreamView) validRankAffine() bool {

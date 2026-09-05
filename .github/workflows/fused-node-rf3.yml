@@ -40,6 +40,15 @@ on:
         description: 'Optional baseline revision for paired primary-format qualification'
         required: false
         type: string
+      format_suite:
+        description: 'Benchmark suite to run against the selected baseline'
+        required: false
+        type: choice
+        options:
+          - primary
+          - query
+          - all
+        default: primary
 
 permissions:
   contents: read
@@ -57,6 +66,8 @@ jobs:
     name: Paired primary-format performance
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      FORMAT_SUITE: ${{ inputs.format_suite || 'primary' }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -70,30 +81,83 @@ jobs:
         run: |
           set -euo pipefail
           base="$(git rev-parse --verify "${FORMAT_BASE}^{commit}")"
+          suite="${FORMAT_SUITE:-primary}"
+          case "${suite}" in
+            primary)
+              selected_packages=(storeio durable)
+              ;;
+            query)
+              selected_packages=(query)
+              ;;
+            all)
+              selected_packages=(storeio durable query)
+              ;;
+            *)
+              echo "unsupported format suite: ${suite}" >&2
+              exit 2
+              ;;
+          esac
           build="${RUNNER_TEMP}/primary-format-build"
           mkdir -p "${build}"
           git rev-parse HEAD > "${build}/candidate-revision.txt"
           printf '%s\n' "${base}" > "${build}/base-revision.txt"
+          printf '%s\n' "${suite}" > "${build}/format-suite.txt"
           go version > "${build}/go-version.txt"
           go env > "${build}/go-env.txt"
           lscpu > "${build}/cpu.txt"
           df -T -B1 "${RUNNER_TEMP}" > "${build}/filesystem.txt"
-          go test -c -o "${build}/candidate-storeio.test" ./internal/storeio
-          go test -c -o "${build}/candidate-durable.test" ./store/durable
+
+          build_package() {
+            local arm="$1"
+            local package_name="$2"
+            local package_path
+            case "${package_name}" in
+              storeio) package_path=./internal/storeio ;;
+              durable) package_path=./store/durable ;;
+              query) package_path=./query ;;
+              *) echo "unsupported benchmark package: ${package_name}" >&2; exit 2 ;;
+            esac
+            go test -c -o "${build}/${arm}-${package_name}.test" "${package_path}"
+          }
+
+          for package_name in "${selected_packages[@]}"; do
+            build_package candidate "${package_name}"
+          done
           git worktree add --detach "${RUNNER_TEMP}/primary-format-base" "${base}"
-          cp internal/storeio/compact_rank_format_bench_test.go "${RUNNER_TEMP}/primary-format-base/internal/storeio/"
+          if [[ "${suite}" == primary || "${suite}" == all ]]; then
+            cp internal/storeio/compact_rank_format_bench_test.go \
+              "${RUNNER_TEMP}/primary-format-base/internal/storeio/"
+          fi
+          if [[ "${suite}" == query || "${suite}" == all ]]; then
+            test -f query/rank_affine_format_bench_test.go
+            cp query/rank_affine_format_bench_test.go \
+              "${RUNNER_TEMP}/primary-format-base/query/"
+          fi
           cd "${RUNNER_TEMP}/primary-format-base"
-          go test -c -o "${build}/base-storeio.test" ./internal/storeio
-          go test -c -o "${build}/base-durable.test" ./store/durable
+          for package_name in "${selected_packages[@]}"; do
+            build_package base "${package_name}"
+          done
       - name: Qualify the decoder and changed native paths
         run: |
-          "${RUNNER_TEMP}/primary-format-build/candidate-storeio.test" \
-            -test.run='^TestCompact' -test.count=1 -test.timeout=5m
+          set -euo pipefail
+          case "${FORMAT_SUITE:-primary}" in
+            primary|all)
+              "${RUNNER_TEMP}/primary-format-build/candidate-storeio.test" -test.run='^TestCompact' -test.count=1 -test.timeout=5m
+              ;;
+          esac
+      - name: Smoke-check the query harness outside paired timing
+        if: env.FORMAT_SUITE == 'query' || env.FORMAT_SUITE == 'all'
+        run: |
+          set -euo pipefail
+          smoke_args=(-test.run='^$' -test.bench='^BenchmarkRankAffineQueryFormat$' -test.benchtime=1x -test.count=1 -test.cpu=1 -test.timeout=8m)
+          "${RUNNER_TEMP}/primary-format-build/base-query.test" "${smoke_args[@]}"
+          env VIBEDB_EXPECT_RANK_AFFINE_QUERY=1 "${RUNNER_TEMP}/primary-format-build/candidate-query.test" "${smoke_args[@]}"
       - name: Run six alternating paired trials without overlapping builds
         run: |
           python3 scripts/bench/run-primary-format-comparison.py \
             --binaries "${RUNNER_TEMP}/primary-format-build" \
-            --output "${RUNNER_TEMP}/primary-format-comparison"
+            --output "${RUNNER_TEMP}/primary-format-comparison" \
+            --suite "${FORMAT_SUITE}"
       - uses: actions/upload-artifact@v4
         if: always()
         with:

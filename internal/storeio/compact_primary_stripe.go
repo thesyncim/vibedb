@@ -942,17 +942,28 @@ func (v *CompactPrimaryStripeView) PatchCompactPrimaryStripeReplacements(
 		patch.patchEnds = slices.Grow(
 			patch.patchEnds[:0], entry.rows,
 		)[:entry.rows]
-		for row := 0; row < entry.rows; row++ {
-			coordinate := row
-			if oldStream.kind == compactStreamRankAffine && len(ranks) != 0 {
-				coordinate = int(ranks[row])
+		if oldStream.kind == compactStreamRankAffine && len(ranks) != 0 {
+			for row := 0; row < entry.rows; row++ {
+				var decoded bool
+				patch.patchHeap, decoded = oldStream.appendValue(
+					patch.patchHeap, int(ranks[row]),
+				)
+				if !decoded || uint64(len(patch.patchHeap)) > uint64(^uint32(0)) {
+					return nil, false, corrupt("group value")
+				}
+				patch.patchEnds[row] = uint32(len(patch.patchHeap))
 			}
-			var decoded bool
-			patch.patchHeap, decoded = oldStream.appendValue(patch.patchHeap, coordinate)
-			if !decoded || uint64(len(patch.patchHeap)) > uint64(^uint32(0)) {
-				return nil, false, corrupt("group value")
+		} else {
+			for row := 0; row < entry.rows; row++ {
+				var decoded bool
+				patch.patchHeap, decoded = oldStream.appendValue(
+					patch.patchHeap, row,
+				)
+				if !decoded || uint64(len(patch.patchHeap)) > uint64(^uint32(0)) {
+					return nil, false, corrupt("group value")
+				}
+				patch.patchEnds[row] = uint32(len(patch.patchHeap))
 			}
-			patch.patchEnds[row] = uint32(len(patch.patchHeap))
 		}
 		patch.patchValues = slices.Grow(
 			patch.patchValues[:0], entry.rows,

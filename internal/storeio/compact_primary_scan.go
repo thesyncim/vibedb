@@ -280,13 +280,14 @@ func (d *CompactPrimaryScanDecoder) appendValue(
 	// targets the shape is 96 bytes and each stream view is 104 bytes, so copying
 	// either inside the row/hole loop would turn metadata into scan bandwidth.
 	meta := &d.shapes[shape]
-	if int(meta.holes) > compactPrimaryScanHoles {
+	holes := int(meta.holes)
+	if holes > compactPrimaryScanHoles {
 		return dst, false
 	}
 	start := len(dst)
 	if !d.hasRankAffine {
 		previous := uint32(0)
-		for hole := 0; hole < int(meta.holes); hole++ {
+		for hole := 0; hole < holes; hole++ {
 			end := meta.ends[hole]
 			streamAt := int(meta.first) + hole
 			stream := &d.streamView[streamAt]
@@ -307,11 +308,11 @@ func (d *CompactPrimaryScanDecoder) appendValue(
 				return dst[:start], false
 			}
 		}
-		end := meta.ends[meta.holes]
+		end := meta.ends[holes]
 		return append(dst, meta.static[previous:end]...), true
 	}
 	previous := uint32(0)
-	for hole := 0; hole < int(meta.holes); hole++ {
+	for hole := 0; hole < holes; hole++ {
 		end := meta.ends[hole]
 		streamAt := int(meta.first) + hole
 		stream := &d.streamView[streamAt]
@@ -336,7 +337,7 @@ func (d *CompactPrimaryScanDecoder) appendValue(
 			return dst[:start], false
 		}
 	}
-	end := meta.ends[meta.holes]
+	end := meta.ends[holes]
 	return append(dst, meta.static[previous:end]...), true
 }
 
