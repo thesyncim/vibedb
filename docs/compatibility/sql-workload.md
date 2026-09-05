@@ -82,7 +82,11 @@ leader observations for each group; this does not create a cluster-wide MVCC cut
 Routing computes a complete domain for every physical source occurrence. It
 unions repeated consumers, follows CTE output aliases and plain derived
 projections, propagates join-key equalities in null-preserving directions, and
-combines OR and set-branch domains. Unknown predicates widen the domain. LIMIT,
+combines OR and set-branch domains. Literal Boolean predicates, including
+structural NOT, contribute complete or empty domains without executing scalar
+expressions. False branches do not add owners to OR or repeated-consumer unions.
+Transparent CTE and derived-table mappings preserve these proofs; schema and
+operator validation still run before source I/O. Unknown predicates widen the domain. LIMIT,
 aggregation, windows, recursion, and predicates with observable evaluation
 boundaries prevent unsafe inherited pushdown. Unused CTE definitions retain
 catalog validation but generate no source scans. Necessary top-level key
