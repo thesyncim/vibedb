@@ -185,6 +185,12 @@ its rows are materialized before publication.
 
 ## SELECT order and projections
 
+Predicates support `IS DISTINCT FROM` and `IS NOT DISTINCT FROM` over the
+supported scalar domains. NULL and a missing path compare equal to each other,
+and different from a live value; the result is always Boolean. Each operand is
+evaluated once. The existing computed-predicate restrictions, including scalar
+WHERE before grouping, still apply. JSON/JSONB equality is not introduced.
+
 Clause order:
 
 ```sql

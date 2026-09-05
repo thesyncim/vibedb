@@ -102,6 +102,9 @@ func expressionContainsRuntimeSQLPathComparison(
 	if expr.Kind == sqlast.ExprCompare && expr.RightPath != nil {
 		return true
 	}
+	if sqlast.NullSafePathComparison(expr.ScalarLeft) != nil || sqlast.NullSafePathComparison(expr.ScalarRight) != nil {
+		return true
+	}
 	for _, child := range expr.Kids {
 		if expressionContainsRuntimeSQLPathComparison(child, seen) {
 			return true
