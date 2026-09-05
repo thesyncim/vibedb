@@ -194,6 +194,16 @@ func (p *ConstraintProgram) discoverResolved(where *sqlast.Expr, placementColumn
 	if where == nil {
 		return
 	}
+	if value, known := sqlast.BooleanPredicateConstant(where); known {
+		if !value {
+			// The empty membership annihilates each placement-key domain. Keep
+			// ordinary binding for sibling constraints and their argument checks.
+			for i := range p.slots {
+				p.slots[i].constraints = append(p.slots[i].constraints, shardConstraint{})
+			}
+		}
+		return
+	}
 	if where.Kind == sqlast.ExprAnd {
 		for _, kid := range where.Kids {
 			p.discoverResolved(kid, placementColumns)
