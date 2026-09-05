@@ -27,11 +27,15 @@ smoke, e3 Linux runtime tests, and both long fault attempts are in
 [`qualification/README.md`](qualification/README.md). The archive catalog is
 [`qualification/qualification-manifest.json`](qualification/qualification-manifest.json)
 and its tarball checksums are in [`qualification/SHA256SUMS`](qualification/SHA256SUMS).
-Each archive carries a per-file SHA-256 manifest plus exact source and binary
-provenance. Compiled binaries and Docker volumes are intentionally omitted;
-their hashes and sizes are recorded in the archive provenance. The initial
-startup smoke's missing untracked-source snapshot remains explicitly marked
-as incomplete.
+Each retained run has a source and runtime manifest. The d898 filtered archive
+also has a companion per-file provenance record with exact source and binary
+identity. Compiled binaries and Docker volumes are intentionally omitted; the
+d898 record retains their hashes and sizes. The initial startup smoke's missing
+untracked-source snapshot remains explicitly marked as incomplete. The later
+d898 diagnostic and its derived offline validation are
+documented in [`qualification/authority-fault-diagnostic-d898.md`](qualification/authority-fault-diagnostic-d898.md);
+that report preserves the original failed manifest and makes no qualification
+or performance claim.
 
 ## Retained runs
 
@@ -65,6 +69,21 @@ those cuts are invalid for causal analysis. This was a no-fault run, so it
 provides no pause, restart, fault-qualification, or CRDB comparison result.
 Its compact repository archive is
 [`authority-diagnostic-2c887f4a.tar.gz`](qualification/archives/authority-diagnostic-2c887f4a.tar.gz).
+
+`/private/tmp/vibedb-horizontal-authority-fault-diagnostic-d898-20260905T191703Z`
+is the later full diagnostic at clean source revision `d898f062...`. It ran
+the same 60,000-operation, four-workload matrix at clients 1 and 8, completed
+480,000 oracle samples with zero errors, paused one process, and restarted it
+from the same volume. The retained post-CONT latch was revalidated offline
+with exact integer nanosecond ordering after the original parser rejected its
+valid nine-digit fractional timestamp. The original manifest remains
+`incomplete-or-failed` with hash
+`eefdcce6af86a6e473bd36378d1b008266f87d59193a0d5171656fc4e514355c`; the
+derived report has `qualification_claimed=false`. The archive, provenance, and
+checksums are linked from [`qualification/README.md`](qualification/README.md).
+The configured 5-second grant and approximately 6.11-second restart quarantine
+are elapsed-clock settings under the ±10% clock-rate assumption, and the run
+did not expose a quarantine boolean.
 
 `/private/tmp/vibedb-horizontal-authority-fault-20260905T173000Z` is the first
 long qualification attempt at `e3b3e53e...`. It used 60000 operations, 500
