@@ -7,6 +7,7 @@ import (
 	"math"
 	"strings"
 
+	"github.com/thesyncim/vibedb/internal/raftauthority"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
@@ -115,10 +116,11 @@ func (identity RuntimeIdentity) AppliedSourceOwner() AppliedSourceOwner {
 // OutboundMessage is borrowed only for the duration of the DriveReady callback.
 // A caller retaining it must clone Message before returning.
 type OutboundMessage struct {
-	Group   GroupKey
-	From    uint64
-	To      uint64
-	Message *pb.Message
+	Group     GroupKey
+	From      uint64
+	To        uint64
+	Message   *pb.Message
+	Authority *raftauthority.Message
 }
 
 // ReadyWorkspace is zero-value scratch for one serialized DriveReady lane. A
@@ -448,6 +450,7 @@ type Runtime struct {
 	proposalBatchEntries     int
 	proposalBatchBytes       int64
 	promotionScan            durablePromotionScan
+	authority                *runtimeAuthority
 	failure                  error
 	stopping                 bool
 	closed                   bool
@@ -1026,6 +1029,7 @@ func (runtime *Runtime) ProposeConfChange(change pb.ConfChangeI) error {
 		}
 		return err
 	}
+	runtime.invalidateAuthority()
 	return runtime.node.ProposeConfChange(change)
 }
 
@@ -1266,7 +1270,9 @@ func (runtime *Runtime) TransferLeader(transferee uint64) error {
 	if err := runtime.requireEmptyInputWindow(); err != nil {
 		return err
 	}
-	return runtime.node.TransferLeader(transferee)
+	err := runtime.node.TransferLeader(transferee)
+	runtime.refreshAuthority()
+	return err
 }
 
 // StepMessage admits one ordinary, non-snapshot peer message. The message is
@@ -1287,7 +1293,12 @@ func (runtime *Runtime) StepMessage(message *pb.Message) error {
 		}
 		return err
 	}
-	return runtime.node.Step(message)
+	err := runtime.node.Step(message)
+	runtime.refreshAuthority()
+	if err == nil {
+		runtime.tracePeerStage("receive", message)
+	}
+	return err
 }
 
 // Tick advances exactly one logical Raft tick. Runtime supplies no wall-clock
@@ -1306,7 +1317,9 @@ func (runtime *Runtime) Tick() error {
 		return runtime.fail(err)
 	}
 	runtime.tickWALGeneration()
-	return runtime.node.Tick()
+	err := runtime.node.Tick()
+	runtime.refreshAuthority()
+	return err
 }
 
 // Campaign starts one local election attempt after Ready and WAL admission.
@@ -1320,7 +1333,9 @@ func (runtime *Runtime) Campaign() error {
 		}
 		return err
 	}
-	return runtime.node.Campaign()
+	err := runtime.node.Campaign()
+	runtime.refreshAuthority()
+	return err
 }
 
 // DriveReady performs at most one explicit Ready lifecycle operation. Message
@@ -1338,6 +1353,7 @@ func (runtime *Runtime) DriveReady(
 	if err := runtime.checkUsable(); err != nil {
 		return DriveResult{}, err
 	}
+	defer runtime.refreshAuthority()
 	if err := runtime.driveNodeCheckpoint(false); err != nil {
 		return DriveResult{}, runtime.fail(err)
 	}

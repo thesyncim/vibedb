@@ -126,8 +126,8 @@ func NewService(options ServiceOptions) (*Service, error) {
 	}, nil
 }
 
-// Serve handles exactly one request on one mutually authenticated shard-control
-// stream. Independent operations are bounded; exact-operation retries are
+// Serve handles one full observation or a bounded sequence of health observations
+// on one mutually authenticated shard-control stream. Independent operations are bounded; exact-operation retries are
 // striped so a local cut cannot be reordered within the same durable move.
 func (service *Service) Serve(ctx context.Context, connection rafttransport.PeerConnection) error {
 	if service == nil || ctx == nil || connection == nil ||
@@ -140,15 +140,38 @@ func (service *Service) Serve(ctx context.Context, connection rafttransport.Peer
 	defer connection.Close()
 	stop := context.AfterFunc(ctx, func() { _ = connection.Close() })
 	defer stop()
-	if deadline := boundedDeadline(ctx, service.readDeadline()); deadline.IsZero() {
-		return ErrControl
-	} else if err := connection.SetReadDeadline(deadline); err != nil {
-		return err
+	for index := 0; index < 256; index++ {
+		if deadline := boundedDeadline(ctx, service.readDeadline()); deadline.IsZero() {
+			return ErrControl
+		} else if err := connection.SetReadDeadline(deadline); err != nil {
+			if index > 0 && errors.Is(err, io.ErrClosedPipe) {
+				return nil
+			}
+			return err
+		}
+		request, err := ReadRequest(connection)
+		if err != nil {
+			if index > 0 && errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
+		if index > 0 && !request.HealthOnly {
+			return ErrControl
+		}
+		if err := service.serveRequest(ctx, connection, request); err != nil {
+			return err
+		}
+		if !request.HealthOnly {
+			return nil
+		}
 	}
-	request, err := ReadRequest(connection)
-	if err != nil {
-		return err
-	}
+	return nil
+}
+
+// Admission is held only while observing and replying, never during idle reads.
+func (service *Service) serveRequest(ctx context.Context, connection rafttransport.PeerConnection, request Request) error {
+	var err error
 	peer := connection.PeerIdentity()
 	wantDomain := rafttransport.TrustDomain{
 		ClusterID: request.Group.ClusterID, ClusterIncarnation: request.Group.ClusterIncarnation,

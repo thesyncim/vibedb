@@ -19,6 +19,7 @@ is separate from this engineering archive.
 
 | Date | Report |
 | --- | --- |
+| 2026-09-05 | [Distributed projected-range comparison](distributed-projected-ranges-2026-09-05/README.md) |
 | 2026-09-05 | [Distributed integer GROUP BY comparison](distributed-integer-groups-2026-09-05/README.md) |
 | 2026-09-05 | [RF3 Ready-series comparison](rf3-ready-series-2026-09-05/README.md) |
 | 2026-09-05 | [Prepared indexed point and ordered-page reads](indexed-page-projection-2026-09-05/README.md) |

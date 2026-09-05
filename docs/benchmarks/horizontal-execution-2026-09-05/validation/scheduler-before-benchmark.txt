@@ -1,0 +1,26 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/internal/multiraft
+cpu: Apple M4 Max
+BenchmarkHostSparseAppendCompletion/groups=1-16         	 7262695	        71.95 ns/op	       0 B/op	       0 allocs/op
+BenchmarkHostSparseAppendCompletion/groups=1-16         	 8558600	        70.26 ns/op	       0 B/op	       0 allocs/op
+BenchmarkHostSparseAppendCompletion/groups=1-16         	 8551754	        69.77 ns/op	       0 B/op	       0 allocs/op
+BenchmarkHostSparseAppendCompletion/groups=1-16         	 8556514	        70.16 ns/op	       0 B/op	       0 allocs/op
+BenchmarkHostSparseAppendCompletion/groups=1-16         	 8544938	        70.21 ns/op	       0 B/op	       0 allocs/op
+BenchmarkHostSparseAppendCompletion/groups=16-16        	  694761	       875.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkHostSparseAppendCompletion/groups=16-16        	  691273	       879.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkHostSparseAppendCompletion/groups=16-16        	  700245	       875.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkHostSparseAppendCompletion/groups=16-16        	  698512	       877.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkHostSparseAppendCompletion/groups=16-16        	  686610	       878.2 ns/op	       0 B/op	       0 allocs/op
+BenchmarkHostSparseAppendCompletion/groups=64-16        	  173502	      3473 ns/op	       0 B/op	       0 allocs/op
+BenchmarkHostSparseAppendCompletion/groups=64-16        	  173832	      3468 ns/op	       0 B/op	       0 allocs/op
+BenchmarkHostSparseAppendCompletion/groups=64-16        	  173724	      3470 ns/op	       0 B/op	       0 allocs/op
+BenchmarkHostSparseAppendCompletion/groups=64-16        	  170940	      3472 ns/op	       0 B/op	       0 allocs/op
+BenchmarkHostSparseAppendCompletion/groups=64-16        	  173626	      3454 ns/op	       0 B/op	       0 allocs/op
+BenchmarkHostSparseAppendCompletion/groups=256-16       	   41476	     14364 ns/op	       0 B/op	       0 allocs/op
+BenchmarkHostSparseAppendCompletion/groups=256-16       	   41696	     14295 ns/op	       0 B/op	       0 allocs/op
+BenchmarkHostSparseAppendCompletion/groups=256-16       	   41704	     14434 ns/op	       0 B/op	       0 allocs/op
+BenchmarkHostSparseAppendCompletion/groups=256-16       	   41716	     14396 ns/op	       0 B/op	       0 allocs/op
+BenchmarkHostSparseAppendCompletion/groups=256-16       	   41406	     14406 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/thesyncim/vibedb/internal/multiraft	12.476s

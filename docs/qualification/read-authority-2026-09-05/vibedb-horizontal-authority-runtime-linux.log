@@ -1,0 +1,116 @@
+=== RUN   TestRuntimeReadAuthorityFollowerPromiseGatesElectionEdgesUntilExpiry
+raft2026/09/05 12:17:30 INFO: a1 switched to configuration voters=(a1 a2)
+raft2026/09/05 12:17:30 INFO: a1 became follower at term 1
+raft2026/09/05 12:17:30 INFO: newRaft a1 [peers: [a1,a2], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:17:30 INFO: a1 [term: 1] received a MsgHeartbeat message with higher term from a2 [term: 2]
+raft2026/09/05 12:17:30 INFO: a1 became follower at term 2
+    read_authority_test.go:162: StepAuthorityMessage(request): raftauthority: invalid authority request
+--- FAIL: TestRuntimeReadAuthorityFollowerPromiseGatesElectionEdgesUntilExpiry (0.04s)
+=== RUN   TestRuntimeReadAuthorityLeaderPromiseAllowsTickButBlocksTransfer
+raft2026/09/05 12:17:30 INFO: a2 switched to configuration voters=(a2 a3)
+raft2026/09/05 12:17:30 INFO: a2 became follower at term 1
+raft2026/09/05 12:17:30 INFO: newRaft a2 [peers: [a2,a3], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:17:30 INFO: a2 is starting a new election at term 1
+raft2026/09/05 12:17:30 INFO: a2 became pre-candidate at term 1
+raft2026/09/05 12:17:30 INFO: a2 [logterm: 1, index: 1] sent MsgPreVote request to a3 at term 1
+raft2026/09/05 12:17:30 INFO: a2 received MsgPreVoteResp from a2 at term 1
+raft2026/09/05 12:17:30 INFO: a2 has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/05 12:17:30 INFO: a2 received MsgPreVoteResp from a3 at term 1
+raft2026/09/05 12:17:30 INFO: a2 has received 2 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/05 12:17:30 INFO: a2 became candidate at term 2
+raft2026/09/05 12:17:30 INFO: a2 [logterm: 1, index: 1] sent MsgVote request to a3 at term 2
+raft2026/09/05 12:17:30 INFO: a2 received MsgVoteResp from a2 at term 2
+raft2026/09/05 12:17:30 INFO: a2 has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/09/05 12:17:30 INFO: a2 received MsgVoteResp from a3 at term 2
+raft2026/09/05 12:17:30 INFO: a2 has received 2 MsgVoteResp votes and 0 vote rejections
+raft2026/09/05 12:17:30 INFO: a2 became leader at term 2
+raft2026/09/05 12:17:30 INFO: a2 [term 2] starts to transfer leadership to a3
+raft2026/09/05 12:17:30 INFO: a2 sends MsgTimeoutNow to a3 immediately as a3 already has up-to-date log
+--- PASS: TestRuntimeReadAuthorityLeaderPromiseAllowsTickButBlocksTransfer (0.03s)
+=== RUN   TestRuntimeReadAuthorityClockFaultFailsClosedAfterGrant
+raft2026/09/05 12:17:30 INFO: a3 switched to configuration voters=(a3 a4)
+raft2026/09/05 12:17:30 INFO: a3 became follower at term 1
+raft2026/09/05 12:17:30 INFO: newRaft a3 [peers: [a3,a4], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:17:30 INFO: a3 [term: 1] received a MsgHeartbeat message with higher term from a4 [term: 2]
+raft2026/09/05 12:17:30 INFO: a3 became follower at term 2
+    read_authority_test.go:274: StepAuthorityMessage(request): raftauthority: invalid authority request
+--- FAIL: TestRuntimeReadAuthorityClockFaultFailsClosedAfterGrant (0.03s)
+=== RUN   TestRuntimeReadAuthorityRequiresIndependentLeaderIncarnation
+raft2026/09/05 12:17:30 INFO: a4 switched to configuration voters=(a4 a5)
+raft2026/09/05 12:17:30 INFO: a4 became follower at term 1
+raft2026/09/05 12:17:30 INFO: newRaft a4 [peers: [a4,a5], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:17:30 INFO: a4 [term: 1] received a MsgHeartbeat message with higher term from a5 [term: 2]
+raft2026/09/05 12:17:30 INFO: a4 became follower at term 2
+    read_authority_test.go:319: mismatched incarnation response = {Group:{ClusterID:[0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0] ClusterIncarnation:[0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0] TopologyRecoveryEpoch:0 ShardIncarnation:[0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0] GroupID:[0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0]} From:0 To:0 Message:<nil> Authority:<nil>} produced=false err=raftauthority: invalid authority request, want dropped
+--- FAIL: TestRuntimeReadAuthorityRequiresIndependentLeaderIncarnation (0.03s)
+=== RUN   TestRuntimeReadAuthorityRoundInvalidatesOnTermAndConfigChange
+=== RUN   TestRuntimeReadAuthorityRoundInvalidatesOnTermAndConfigChange/term
+raft2026/09/05 12:17:30 INFO: a6 switched to configuration voters=(a6 a7)
+raft2026/09/05 12:17:30 INFO: a6 became follower at term 1
+raft2026/09/05 12:17:30 INFO: newRaft a6 [peers: [a6,a7], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:17:30 INFO: a6 is starting a new election at term 1
+raft2026/09/05 12:17:30 INFO: a6 became pre-candidate at term 1
+raft2026/09/05 12:17:30 INFO: a6 [logterm: 1, index: 1] sent MsgPreVote request to a7 at term 1
+raft2026/09/05 12:17:30 INFO: a6 received MsgPreVoteResp from a6 at term 1
+raft2026/09/05 12:17:30 INFO: a6 has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/05 12:17:30 INFO: a6 received MsgPreVoteResp from a7 at term 1
+raft2026/09/05 12:17:30 INFO: a6 has received 2 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/05 12:17:30 INFO: a6 became candidate at term 2
+raft2026/09/05 12:17:30 INFO: a6 [logterm: 1, index: 1] sent MsgVote request to a7 at term 2
+raft2026/09/05 12:17:30 INFO: a6 received MsgVoteResp from a6 at term 2
+raft2026/09/05 12:17:30 INFO: a6 has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/09/05 12:17:30 INFO: a6 received MsgVoteResp from a7 at term 2
+raft2026/09/05 12:17:30 INFO: a6 has received 2 MsgVoteResp votes and 0 vote rejections
+raft2026/09/05 12:17:30 INFO: a6 became leader at term 2
+    read_authority_test.go:371: StepAuthorityMessage(grant) produced=false err=raftauthority: invalid authority grant, want accepted no response
+=== RUN   TestRuntimeReadAuthorityRoundInvalidatesOnTermAndConfigChange/configuration
+raft2026/09/05 12:17:30 INFO: a7 switched to configuration voters=(a7 a8)
+raft2026/09/05 12:17:30 INFO: a7 became follower at term 1
+raft2026/09/05 12:17:30 INFO: newRaft a7 [peers: [a7,a8], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:17:30 INFO: a7 is starting a new election at term 1
+raft2026/09/05 12:17:30 INFO: a7 became pre-candidate at term 1
+raft2026/09/05 12:17:30 INFO: a7 [logterm: 1, index: 1] sent MsgPreVote request to a8 at term 1
+raft2026/09/05 12:17:30 INFO: a7 received MsgPreVoteResp from a7 at term 1
+raft2026/09/05 12:17:30 INFO: a7 has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/05 12:17:30 INFO: a7 received MsgPreVoteResp from a8 at term 1
+raft2026/09/05 12:17:30 INFO: a7 has received 2 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/05 12:17:30 INFO: a7 became candidate at term 2
+raft2026/09/05 12:17:30 INFO: a7 [logterm: 1, index: 1] sent MsgVote request to a8 at term 2
+raft2026/09/05 12:17:30 INFO: a7 received MsgVoteResp from a7 at term 2
+raft2026/09/05 12:17:30 INFO: a7 has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/09/05 12:17:30 INFO: a7 received MsgVoteResp from a8 at term 2
+raft2026/09/05 12:17:30 INFO: a7 has received 2 MsgVoteResp votes and 0 vote rejections
+raft2026/09/05 12:17:30 INFO: a7 became leader at term 2
+    read_authority_test.go:392: StepAuthorityMessage(grant) produced=false err=raftauthority: invalid authority grant, want accepted no response
+--- FAIL: TestRuntimeReadAuthorityRoundInvalidatesOnTermAndConfigChange (0.06s)
+    --- FAIL: TestRuntimeReadAuthorityRoundInvalidatesOnTermAndConfigChange/term (0.03s)
+    --- FAIL: TestRuntimeReadAuthorityRoundInvalidatesOnTermAndConfigChange/configuration (0.03s)
+=== RUN   TestRuntimeReadAuthorityPolicyChecksAndDisableReenableSafety
+=== RUN   TestRuntimeReadAuthorityPolicyChecksAndDisableReenableSafety/applied-voter-set-and-disabled-fallback
+raft2026/09/05 12:17:30 INFO: a8 switched to configuration voters=(a8 a9)
+raft2026/09/05 12:17:30 INFO: a8 became follower at term 1
+raft2026/09/05 12:17:30 INFO: newRaft a8 [peers: [a8,a9], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:17:30 INFO: a8 is starting a new election at term 1
+raft2026/09/05 12:17:30 INFO: a8 became pre-candidate at term 1
+raft2026/09/05 12:17:30 INFO: a8 [logterm: 1, index: 1] sent MsgPreVote request to a9 at term 1
+raft2026/09/05 12:17:30 INFO: a8 received MsgPreVoteResp from a8 at term 1
+raft2026/09/05 12:17:30 INFO: a8 has received 1 MsgPreVoteResp votes and 0 vote rejections
+=== RUN   TestRuntimeReadAuthorityPolicyChecksAndDisableReenableSafety/disable-reenable-enters-fresh-quarantine
+raft2026/09/05 12:17:30 INFO: a9 switched to configuration voters=(a9 aa)
+raft2026/09/05 12:17:30 INFO: a9 became follower at term 1
+raft2026/09/05 12:17:30 INFO: newRaft a9 [peers: [a9,aa], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:17:30 INFO: a9 [term: 1] received a MsgHeartbeat message with higher term from aa [term: 2]
+raft2026/09/05 12:17:30 INFO: a9 became follower at term 2
+    read_authority_test.go:440: StepAuthorityMessage(request): raftauthority: invalid authority request
+=== RUN   TestRuntimeReadAuthorityPolicyChecksAndDisableReenableSafety/disabled-clock-fault-remains-closed
+raft2026/09/05 12:17:30 INFO: aa switched to configuration voters=(aa ab)
+raft2026/09/05 12:17:30 INFO: aa became follower at term 1
+raft2026/09/05 12:17:30 INFO: newRaft aa [peers: [aa,ab], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 12:17:30 INFO: aa [term: 1] received a MsgHeartbeat message with higher term from ab [term: 2]
+raft2026/09/05 12:17:30 INFO: aa became follower at term 2
+    read_authority_test.go:498: StepAuthorityMessage(request): raftauthority: invalid authority request
+--- FAIL: TestRuntimeReadAuthorityPolicyChecksAndDisableReenableSafety (0.08s)
+    --- PASS: TestRuntimeReadAuthorityPolicyChecksAndDisableReenableSafety/applied-voter-set-and-disabled-fallback (0.02s)
+    --- FAIL: TestRuntimeReadAuthorityPolicyChecksAndDisableReenableSafety/disable-reenable-enters-fresh-quarantine (0.03s)
+    --- FAIL: TestRuntimeReadAuthorityPolicyChecksAndDisableReenableSafety/disabled-clock-fault-remains-closed (0.03s)
+FAIL

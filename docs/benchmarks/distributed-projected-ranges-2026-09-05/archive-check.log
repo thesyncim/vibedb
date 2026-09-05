@@ -1,0 +1,4 @@
+raw-trials.tar.gz: PASS retained=4258 omitted=47
+profile-diagnostic.tar.gz: PASS members=522 no bin/src/cache
+validation-logs.tar.gz: PASS members=32 no test binaries
+archive omissions: PASS exact path/size/SHA-256 entries=47

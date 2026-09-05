@@ -1,0 +1,119 @@
+{
+  "pg.direct.execute": {
+    "count": 7254,
+    "total_ms": 24483.963144999896,
+    "mean_ms": 3.3752361655638268,
+    "p50_ms": 2.60304,
+    "p95_ms": 8.377664,
+    "unmatched_begin": 0,
+    "unmatched_end": 2
+  },
+  "pg.direct.prepare": {
+    "count": 7254,
+    "total_ms": 1625.2792679999989,
+    "mean_ms": 0.22405283540115797,
+    "p50_ms": 0.112576,
+    "p95_ms": 0.284673,
+    "unmatched_begin": 0,
+    "unmatched_end": 0
+  },
+  "pg.write": {
+    "count": 7254,
+    "total_ms": 26191.193215000007,
+    "mean_ms": 3.6105863268541496,
+    "p50_ms": 2.748832,
+    "p95_ms": 9.181056,
+    "unmatched_begin": 0,
+    "unmatched_end": 2
+  },
+  "raft.persist.metadata": {
+    "count": 2275,
+    "total_ms": 22.491465000000062,
+    "mean_ms": 0.009886358241758242,
+    "p50_ms": 0.008832,
+    "p95_ms": 0.017152,
+    "unmatched_begin": 0,
+    "unmatched_end": 0
+  },
+  "raft.persist.required": {
+    "count": 4414,
+    "total_ms": 3518.940176999999,
+    "mean_ms": 0.7972225140462166,
+    "p50_ms": 0.628096,
+    "p95_ms": 1.789376,
+    "unmatched_begin": 0,
+    "unmatched_end": 0
+  },
+  "raft.proposal.admission": {
+    "count": 3681,
+    "total_ms": 201.63805000000033,
+    "mean_ms": 0.054778063026351534,
+    "p50_ms": 0.044736,
+    "p95_ms": 0.099456,
+    "unmatched_begin": 0,
+    "unmatched_end": 0
+  },
+  "raft.proposal.commit": {
+    "count": 3681,
+    "total_ms": 11871.675957000009,
+    "mean_ms": 3.225122509372453,
+    "p50_ms": 2.447936,
+    "p95_ms": 8.164608,
+    "unmatched_begin": 0,
+    "unmatched_end": 1
+  },
+  "raft.proposal.discovery": {
+    "count": 7299,
+    "total_ms": 3.5686940000001863,
+    "mean_ms": 0.0004889291683792301,
+    "p50_ms": 0.000448,
+    "p95_ms": 0.000704,
+    "unmatched_begin": 0,
+    "unmatched_end": 0
+  },
+  "raft.proposal.roundtrip": {
+    "count": 7299,
+    "total_ms": 25001.54475100007,
+    "mean_ms": 3.425338368406631,
+    "p50_ms": 2.594368,
+    "p95_ms": 8.817024,
+    "unmatched_begin": 0,
+    "unmatched_end": 2
+  },
+  "sql.read.admission": {
+    "count": 3714,
+    "total_ms": 0.9897869999999994,
+    "mean_ms": 0.0002665016155088853,
+    "p50_ms": 0.000256,
+    "p95_ms": 0.000512,
+    "unmatched_begin": 0,
+    "unmatched_end": 0
+  },
+  "sql.read.encode": {
+    "count": 3715,
+    "total_ms": 3.344279000000072,
+    "mean_ms": 0.0009002096904441453,
+    "p50_ms": 0.000704,
+    "p95_ms": 0.001344,
+    "unmatched_begin": 0,
+    "unmatched_end": 0
+  },
+  "sql.read.execute": {
+    "count": 3715,
+    "total_ms": 177.53460599999988,
+    "mean_ms": 0.04778858842530283,
+    "p50_ms": 0.040192,
+    "p95_ms": 0.081152,
+    "unmatched_begin": 0,
+    "unmatched_end": 0
+  },
+  "sql.read.quorum": {
+    "count": 3714,
+    "total_ms": 2637.6674229999985,
+    "mean_ms": 0.7101958597199785,
+    "p50_ms": 0.149184,
+    "p95_ms": 4.276225,
+    "unmatched_begin": 0,
+    "unmatched_end": 1
+  }
+}

@@ -20,6 +20,7 @@ import (
 )
 
 type config struct {
+	recoveryOracle                               string
 	diagnosticTargets                            string
 	diagnostics                                  *diagnosticControl
 	engine, url, output, phase                   string
@@ -104,7 +105,7 @@ func main() {
 	flag.StringVar(&c.engine, "engine", "", "vibedb or cockroachdb")
 	flag.StringVar(&c.url, "url", "", "PostgreSQL URL for a dedicated benchmark database")
 	flag.StringVar(&c.output, "output", "", "new JSON evidence file")
-	flag.StringVar(&c.phase, "phase", "all", "setup, run, or all; setup creates a new table and never drops existing data")
+	flag.StringVar(&c.phase, "phase", "all", "setup, run, all, or recovery; recovery verifies a saved oracle without writing SQL")
 	flag.IntVar(&c.rows, "rows", 8192, "initial rows")
 	flag.IntVar(&c.operations, "operations", 2000, "measured point/update operations per trial")
 	flag.IntVar(&c.scans, "scans", 200, "measured range/group operations per trial")
@@ -121,6 +122,7 @@ func main() {
 	flag.BoolVar(&c.verifyEveryTrial, "verify-every-trial", true, "verify every row after each trial; false verifies before and after the full run (each operation is always checked)")
 	flag.StringVar(&c.urls, "urls", "", "comma-separated PostgreSQL URLs; clients use endpoint client index modulo this list")
 	flag.StringVar(&c.diagnosticTargets, "diagnostic-targets", "", "ready candidate PID/node/snapshot bindings for untimed acknowledged diagnostic brackets")
+	flag.StringVar(&c.recoveryOracle, "recovery-oracle", "", "export final expected rows to a new file; phase recovery reads this file")
 	flag.Parse()
 	if err := run(c); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -131,7 +133,7 @@ func run(c config) (runErr error) {
 	if c.seedBatch < 1 || c.seedBatch > 1024 {
 		return fmt.Errorf("invalid seed batch")
 	}
-	if (c.engine != "vibedb" && c.engine != "cockroachdb") || c.url == "" || c.rows < 64 || c.rows > 1000000 || c.operations < 1 || c.operations > 1000000 || c.scans < 1 || c.scans > 100000 || c.warmup < 0 || c.warmup > 100000 || c.repetitions < 1 || c.repetitions > 20 || (c.phase != "all" && c.phase != "setup" && c.phase != "run") {
+	if (c.engine != "vibedb" && c.engine != "cockroachdb") || c.url == "" || c.rows < 64 || c.rows > 1000000 || c.operations < 1 || c.operations > 1000000 || c.scans < 1 || c.scans > 100000 || c.warmup < 0 || c.warmup > 100000 || c.repetitions < 1 || c.repetitions > 20 || (c.phase != "all" && c.phase != "setup" && c.phase != "run" && c.phase != "recovery") {
 		return fmt.Errorf("invalid benchmark configuration")
 	}
 	tables, err := parseTables(c.tables)
@@ -229,6 +231,13 @@ func run(c config) (runErr error) {
 	if len(v.Rows) > 0 {
 		r.Version = string(v.Rows[0][0])
 	}
+	if c.phase == "recovery" {
+		scores, err := readRecoveryOracle(c, tables)
+		if err != nil {
+			return err
+		}
+		return verify(ctx, admin, c, tables, scores)
+	}
 	if c.phase != "run" {
 		if err = setup(ctx, admin, c, tables); err != nil {
 			return err
@@ -309,6 +318,9 @@ func run(c config) (runErr error) {
 		if err := writeReport(c.output, r); err != nil {
 			return err
 		}
+	}
+	if c.recoveryOracle != "" {
+		return writeRecoveryOracle(c, tables, scores)
 	}
 	return nil
 }

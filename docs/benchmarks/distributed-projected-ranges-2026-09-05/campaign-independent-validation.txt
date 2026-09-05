@@ -1,0 +1,1 @@
+PASS: six matched workload configurations (engine identity and untimed diagnostic mode are expected differences); 360,000 unique per-trial samples; valid client/group/table/endpoint mapping.

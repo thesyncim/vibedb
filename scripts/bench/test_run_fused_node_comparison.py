@@ -191,7 +191,6 @@ class FusedNodeRunnerTest(unittest.TestCase):
     def test_client_report_requires_seed_and_per_trial_verification_controls(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            validator = root / "validator.py"
             report_path = root / "report.json"
             report_path.write_text("{}")
             config = {
@@ -206,13 +205,16 @@ class FusedNodeRunnerTest(unittest.TestCase):
             }
 
             class Args:
-                validator_path = validator
                 rows, operations, scans, warmup, repetitions = 64, 20, 10, 2, 1
                 skew_percent = 80
 
             cell = {"clients": "1", "tables": ["rf3_sql_bench"], "workloads": "point_hit",
                     "group_distribution": "uniform", "physical_nodes": 3, "endpoint_mode": "single"}
-            for field, invalid in ((None, None), ("SeedBatch", 32), ("VerifyEveryTrial", False)):
+            for index, (field, invalid) in enumerate(((None, None), ("SeedBatch", 32), ("VerifyEveryTrial", False))):
+                # A fresh path prevents SourceFileLoader from reusing a same-second
+                # .pyc when each fake validator variant is written in place.
+                validator = root / f"validator-{index}.py"
+                Args.validator_path = validator
                 candidate = dict(config)
                 if field is not None:
                     candidate[field] = invalid

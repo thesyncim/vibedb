@@ -51,8 +51,9 @@ type ExecOptions struct {
 	// ResultBytes bounds logical ResultColumn/Cell storage plus every cell's
 	// retained variable-width representation, including bytes borrowed from a
 	// heap Segment and bytes copied out of durable snapshots. A string charges
-	// both its exact JSON spelling and decoded contents because Result retains
-	// both. Zero selects the conservative defaults [DefaultResultRows] and
+	// both its exact JSON spelling and decoded contents when those are separate
+	// representations; a clean string shares its decoded view with the JSON
+	// payload and is charged once. Zero selects the conservative defaults [DefaultResultRows] and
 	// [DefaultResultBytes]; -1 explicitly disables that limit. Exceeding either
 	// returns *ResultBudgetError before the rejected result storage is grown.
 	ResultRows  int
@@ -230,6 +231,7 @@ func (w *fileWorkspace) release() {
 	// dropping them is what makes the pool unreachable.
 	w.stopPool()
 	if w.small != nil {
+		w.small.releaseFileProjection()
 		w.small.work.Release()
 	}
 	w.small = nil
@@ -454,9 +456,14 @@ func clearTail[T any](s []T, n int) {
 // caller-owned final Result. CoveringColumns counts distinct typed columns
 // reduced without admitting JSON.
 type ExecStats struct {
-	Workers              int
-	RowsTotal            uint64
-	RowsScanned          uint64
+	Workers     int
+	RowsTotal   uint64
+	RowsScanned uint64
+	// ProjectedRows counts rows delivered by the storage-native scalar
+	// projection lane. It is separate from RowsScanned so benchmark and
+	// diagnostic callers can tell a projected primary-range read from the raw
+	// JSON small-page lane while both report the same bounded scan count.
+	ProjectedRows        uint64
 	Batches              uint64
 	PeakBatchRows        int
 	PeakBatchBytes       int64

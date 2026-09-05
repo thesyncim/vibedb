@@ -1,0 +1,114 @@
+{
+  "scheduler-incomplete.tar.gz": {
+    "sha256": "9f264f82ca3cd7436ba2819cc166102ff8759edfe5adcd5c8e3f66900c9d82ae",
+    "bytes": 2167003,
+    "files": 3009,
+    "source": "/private/tmp/vibedb-horizontal-evidence",
+    "excluded": "compiled executables; numeric binary CRDB WAL files; non-frontend execution traces. Source/build identities and all CPU profiles retained; omitted-files.json records other omitted file hashes."
+  },
+  "isolation.tar.gz": {
+    "sha256": "1feeaa5756622065b95741e5f175f3a96b2f8db5052161f4a81ad0ebb4861650",
+    "bytes": 5516851,
+    "files": 5216,
+    "source": "/private/tmp/vibedb-horizontal-execution-evidence",
+    "excluded": "compiled executables; numeric binary CRDB WAL files; non-frontend execution traces. Source/build identities and all CPU profiles retained; omitted-files.json records other omitted file hashes."
+  },
+  "targeted.tar.gz": {
+    "sha256": "6c0a0e912bdc55079ab004601523172996f86632e7e3ee5c1c02b249ede6502a",
+    "bytes": 5809358,
+    "files": 5219,
+    "source": "/private/tmp/vibedb-horizontal-targeted-evidence",
+    "excluded": "compiled executables; numeric binary CRDB WAL files; non-frontend execution traces. Source/build identities and all CPU profiles retained; omitted-files.json records other omitted file hashes."
+  },
+  "health.tar.gz": {
+    "sha256": "030f8ac70c54792bbeb12e845b4a9de6ab13e07c2d9c8ab35056cf9b2cda5e04",
+    "bytes": 6305082,
+    "files": 5223,
+    "source": "/private/tmp/vibedb-horizontal-health-evidence",
+    "excluded": "compiled executables; numeric binary CRDB WAL files; non-frontend execution traces. Source/build identities and all CPU profiles retained; omitted-files.json records other omitted file hashes."
+  },
+  "yield.tar.gz": {
+    "sha256": "b8feb9ada33bb0c3a353f281ab02c5ac41206bf49b7a5a950b8939e615524b40",
+    "bytes": 5572987,
+    "files": 5217,
+    "source": "/private/tmp/vibedb-horizontal-yield-evidence",
+    "excluded": "compiled executables; numeric binary CRDB WAL files; non-frontend execution traces. Source/build identities and all CPU profiles retained; omitted-files.json records other omitted file hashes."
+  },
+  "coordinates.tar.gz": {
+    "sha256": "b2def2a36f5aefe33df4e0c1c465a5f77f6a50d484770a9598272328079faf1d",
+    "bytes": 6082552,
+    "files": 5225,
+    "source": "/private/tmp/vibedb-horizontal-coordinate-evidence",
+    "excluded": "compiled executables; numeric binary CRDB WAL files; non-frontend execution traces. Source/build identities and all CPU profiles retained; omitted-files.json records other omitted file hashes."
+  },
+  "terms.tar.gz": {
+    "sha256": "edb8e827d6791e53857d7964ae92e0e274c251db18ab0367f3f50086dbc2a406",
+    "bytes": 6076338,
+    "files": 5232,
+    "source": "/private/tmp/vibedb-horizontal-terms-evidence",
+    "excluded": "compiled executables; numeric binary CRDB WAL files; non-frontend execution traces. Source/build identities and all CPU profiles retained; omitted-files.json records other omitted file hashes."
+  },
+  "entries.tar.gz": {
+    "sha256": "646831844a5521380855ece59eb9cff795cea901be3dab64a99cdfedf0e0633e",
+    "bytes": 6135629,
+    "files": 5223,
+    "source": "/private/tmp/vibedb-horizontal-entry-evidence",
+    "excluded": "compiled executables; numeric binary CRDB WAL files; non-frontend execution traces. Source/build identities and all CPU profiles retained; omitted-files.json records other omitted file hashes."
+  },
+  "profile-terms.tar.gz": {
+    "sha256": "190669b313f611b0f182699849871dec7d4b66c43836a2165506c51909333ae6",
+    "bytes": 12073066,
+    "files": 1198,
+    "source": "/private/tmp/vibedb-horizontal-profile-terms",
+    "excluded": "compiled executables; numeric binary CRDB WAL files; non-frontend execution traces. Source/build identities and all CPU profiles retained; omitted-files.json records other omitted file hashes."
+  },
+  "profile-entries.tar.gz": {
+    "sha256": "06211b122787d6799a446f4489439cf4ced66aa2de46adef418c12f5c1dc1789",
+    "bytes": 11604915,
+    "files": 1198,
+    "source": "/private/tmp/vibedb-horizontal-profile-entry",
+    "excluded": "compiled executables; numeric binary CRDB WAL files; non-frontend execution traces. Source/build identities and all CPU profiles retained; omitted-files.json records other omitted file hashes."
+  },
+  "profile-waves.tar.gz": {
+    "sha256": "a7129e77d616b6543d6468700213efa78c8c6c729a372fc1d18184150a972a46",
+    "bytes": 11337240,
+    "files": 1198,
+    "source": "/private/tmp/vibedb-horizontal-profile-waves",
+    "excluded": "compiled executables; numeric binary CRDB WAL files; non-frontend execution traces. Source/build identities and all CPU profiles retained; omitted-files.json records other omitted file hashes."
+  },
+  "hints.tar.gz": {
+    "sha256": "058b040ed213e80fb5f280ef3ac8cf1f360865d9903f642c809b3d8031d83ae9",
+    "bytes": 5334938,
+    "files": 5215,
+    "source": "/private/tmp/vibedb-horizontal-hint-evidence",
+    "excluded": "compiled executables; numeric binary CRDB WAL files; non-frontend execution traces. Source/build identities and all CPU profiles retained; omitted-files.json records other omitted file hashes."
+  },
+  "hint-crash-recovery.tar.gz": {
+    "sha256": "1753c68d6db632273384da3dd63bd1393c2d74104972c3b96585e7e9135bd17f",
+    "bytes": 566194,
+    "files": 1224,
+    "source": "/private/tmp/vibedb-horizontal-hint-crash-evidence",
+    "excluded": "compiled executables; numeric binary CRDB WAL files; non-frontend execution traces. Source/build identities and all CPU profiles retained; omitted-files.json records other omitted file hashes."
+  },
+  "profile-hints.tar.gz": {
+    "sha256": "fe83d1c8a82f032324ea832688378cca5cbf0b2ca0c6e0a5a86d18faf6da0451",
+    "bytes": 12607603,
+    "files": 1198,
+    "source": "/private/tmp/vibedb-horizontal-profile-hints",
+    "excluded": "compiled executables; numeric binary CRDB WAL files; non-frontend execution traces. Source/build identities and all CPU profiles retained; omitted-files.json records other omitted file hashes."
+  },
+  "profile-proposals.tar.gz": {
+    "sha256": "660a7f35d9933073e9458215cd9311c136758430c3c95a18212a554e487ee69c",
+    "bytes": 12226857,
+    "files": 1198,
+    "source": "/private/tmp/vibedb-horizontal-profile-proposals",
+    "excluded": "compiled executables; numeric binary CRDB WAL files; non-frontend execution traces. Source/build identities and all CPU profiles retained; omitted-files.json records other omitted file hashes."
+  },
+  "profile-peers.tar.gz": {
+    "sha256": "b3f073fae8a2567bdd83d512347bde135c61b3c6c536312d39b69588058f7430",
+    "bytes": 10485902,
+    "files": 1198,
+    "source": "/private/tmp/vibedb-horizontal-profile-peers",
+    "excluded": "compiled executables; numeric binary CRDB WAL files; non-frontend execution traces. Source/build identities and all CPU profiles retained; omitted-files.json records other omitted file hashes."
+  }
+}

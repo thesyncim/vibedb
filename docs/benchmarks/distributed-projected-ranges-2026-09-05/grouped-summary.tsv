@@ -1,0 +1,5 @@
+order	clients	before_ops_per_sec	after_ops_per_sec	crdb_ops_per_sec	candidate_over_baseline	candidate_over_crdb
+before-first	1	1185.768759	1210.962296	566.375624	1.021247	2.138090
+before-first	8	8832.631542	8154.539350	3252.259470	0.923229	2.507346
+after-first	1	1170.578505	1183.183297	479.942694	1.010768	2.465260
+after-first	8	8688.169620	8793.605290	2645.803917	1.012136	3.323604

@@ -53,13 +53,10 @@ func TestResultByteBudgetIncludesBorrowedHeapPayload(t *testing.T) {
 	if _, err := segment.Append([]byte(`{"s":"payload"}`)); err != nil {
 		t.Fatal(err)
 	}
-	cell := cellFromScalar(scalar{
-		kind: kindString,
-		raw:  []byte(`"payload"`),
-		sval: "payload",
-	})
+	// A clean extracted string's text view aliases the bytes between the
+	// quotes. ResultBytes charges the one retained JSON spelling once.
 	required := resultColumnBytes + resultCellBytes +
-		resultCellPayloadBytes(cell)
+		int64(len([]byte(`"payload"`)))
 	exec := Exec{Options: ExecOptions{
 		ResultRows: -1, ResultBytes: required - 1,
 	}}

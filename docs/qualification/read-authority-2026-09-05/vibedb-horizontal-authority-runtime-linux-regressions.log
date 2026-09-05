@@ -1,0 +1,11 @@
+=== RUN   TestRuntimeReadAuthorityNoQuorumExpiresAndAllocatesNewNonce
+--- PASS: TestRuntimeReadAuthorityNoQuorumExpiresAndAllocatesNewNonce (0.03s)
+=== RUN   TestRuntimeReadAuthorityRenewalRetainsOldTokenUntilQuorum
+--- PASS: TestRuntimeReadAuthorityRenewalRetainsOldTokenUntilQuorum (0.03s)
+=== RUN   TestRuntimeReadAuthorityConfigurationPendingDoesNotLatch
+=== RUN   TestRuntimeReadAuthorityConfigurationPendingDoesNotLatch/ordinary-normal-apply-lag
+=== RUN   TestRuntimeReadAuthorityConfigurationPendingDoesNotLatch/rejected-stale-config-append
+--- PASS: TestRuntimeReadAuthorityConfigurationPendingDoesNotLatch (0.05s)
+    --- PASS: TestRuntimeReadAuthorityConfigurationPendingDoesNotLatch/ordinary-normal-apply-lag (0.03s)
+    --- PASS: TestRuntimeReadAuthorityConfigurationPendingDoesNotLatch/rejected-stale-config-append (0.03s)
+PASS

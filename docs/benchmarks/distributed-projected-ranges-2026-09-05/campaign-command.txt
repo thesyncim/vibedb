@@ -1,0 +1,5 @@
+python3 scripts/bench/run-distributed-read-comparison.py /private/tmp/vibedb-projection-comparison-88011a57 \
+  --baseline-ref dc6304e0 --candidate-ref 88011a57 \
+  --workloads point_hit,point_miss,range_32,range_64,range_256,group_16,update_existing \
+  --clients 1,8 --groups 4 --physical-nodes 3 --rows 8192 \
+  --operations 2000 --scans 1000 --warmup 500 --repetitions 3

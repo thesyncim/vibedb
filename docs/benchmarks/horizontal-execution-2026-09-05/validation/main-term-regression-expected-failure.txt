@@ -1,0 +1,5 @@
+--- FAIL: TestNodeRecentTermsDoNotWaitForOtherGroupSync (1.11s)
+    node_terms_regression_test.go:36: term read blocked behind unrelated sync
+FAIL
+FAIL	github.com/thesyncim/vibedb/internal/raftstore	1.442s
+FAIL

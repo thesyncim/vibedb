@@ -13,7 +13,9 @@ package multiraft
 import (
 	"errors"
 	"fmt"
+	"sync/atomic"
 
+	"github.com/thesyncim/vibedb/internal/raftauthority"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
@@ -265,9 +267,42 @@ type schemaTransitionObserver interface {
 	ObserveSchemaTransition([]byte) (uint64, bool, error)
 }
 
+// authorityRuntime is intentionally optional: an unconfigured runtime keeps
+// the ordinary ReadIndex path and rejects custom authority frames at the Host
+// boundary without changing the owner-facing Runtime contract.
+type authorityRuntime interface {
+	StepAuthorityMessage(*raftauthority.Message) (raftmember.OutboundMessage, bool, error)
+}
+
+type authenticatedAuthorityRuntime interface {
+	StepAuthorityMessageFrom(uint64, *raftauthority.Message) (raftmember.OutboundMessage, bool, error)
+}
+
+type authorityOutboundRuntime interface {
+	DrainAuthorityOutbound() (raftmember.OutboundMessage, bool)
+}
+
+type authorityOutboundPendingRuntime interface {
+	AuthorityOutboundPending() bool
+}
+
+type authorityRoundRuntime interface {
+	StartReadAuthorityRound() error
+}
+
+func raftauthorityGroup(group raftmember.GroupKey) raftauthority.GroupIdentity {
+	return raftauthority.GroupIdentity{
+		ClusterID: group.ClusterID, ClusterIncarnation: group.ClusterIncarnation,
+		TopologyRecoveryEpoch: group.TopologyRecoveryEpoch,
+		ShardIncarnation:      group.ShardIncarnation, GroupID: group.GroupID,
+	}
+}
+
 type queuedMessage struct {
-	message *pb.Message
-	size    int64
+	message         *pb.Message
+	authority       *raftauthority.Message
+	authoritySource uint64
+	size            int64
 }
 
 type messageQueue struct {
@@ -393,6 +428,11 @@ const (
 )
 
 type groupState struct {
+	// Append workers only touch these completion-list fields. queued owns next:
+	// one producer links the group, then the owner detaches it before clearing
+	// queued. Repeated worker edges coalesce into one bounded list entry.
+	asyncQueued            atomic.Bool
+	asyncNext              *groupState
 	key                    raftmember.GroupKey
 	memberID               uint64
 	sourceOwner            raftmember.AppliedSourceOwner
@@ -485,6 +525,7 @@ type Host struct {
 	settle      raftmember.ResultSettlementSink
 	serving     ServingSinks
 	asyncNotify chan struct{}
+	asyncReady  atomic.Pointer[groupState]
 	closed      bool
 }
 
@@ -635,15 +676,25 @@ func (host *Host) addRuntime(runtime memberRuntime) error {
 	host.groups[key] = group
 	host.order = append(host.order, group)
 	if pipelined, ok := runtime.(pipelinedRuntime); ok && pipelined.Pipelined() {
-		pipelined.SetPipelinedWake(host.signalAsync)
+		pipelined.SetPipelinedWake(func() { host.signalAsync(group) })
 	}
 	host.wake(group)
 	return nil
 }
 
-func (host *Host) signalAsync() {
-	if host == nil {
+// signalAsync is the sole worker-side entry point. The intrusive MPSC list
+// retains at most one entry per Runtime and does not allocate on completion.
+// It never reads scheduler-owned group state, including retirement/close state.
+func (host *Host) signalAsync(group *groupState) {
+	if !group.asyncQueued.CompareAndSwap(false, true) {
 		return
+	}
+	for {
+		head := host.asyncReady.Load()
+		group.asyncNext = head
+		if host.asyncReady.CompareAndSwap(head, group) {
+			break
+		}
 	}
 	select {
 	case host.asyncNotify <- struct{}{}:
@@ -652,8 +703,7 @@ func (host *Host) signalAsync() {
 }
 
 // AsyncNotify wakes the serialized scheduler when a local append lane finishes.
-// The channel is edge-triggered and coalesced; WakePipelined re-establishes the
-// runnable set from authoritative Runtime ownership.
+// The edge is coalesced; WakePipelined drains the exact completed-group set.
 func (host *Host) AsyncNotify() <-chan struct{} {
 	if host == nil {
 		return nil
@@ -661,19 +711,23 @@ func (host *Host) AsyncNotify() <-chan struct{} {
 	return host.asyncNotify
 }
 
-// WakePipelined makes every live pipelined group runnable after a coalesced
-// append completion signal. Group count is strictly bounded by Host limits.
+// WakePipelined makes only signalled groups runnable. Detaching one finite list
+// bounds each owner turn even while append workers keep completing more work.
 func (host *Host) WakePipelined() {
 	if host == nil || host.closed {
 		return
 	}
-	for _, group := range host.order {
-		if group == nil || group.runtime == nil || group.failure != nil || group.retiring {
-			continue
-		}
-		if runtime, ok := group.runtime.(pipelinedRuntime); ok && runtime.Pipelined() {
+	for group := host.asyncReady.Swap(nil); group != nil; {
+		next := group.asyncNext
+		group.asyncNext = nil
+		// Read next before releasing producer ownership. A completion before
+		// this release is covered by the wake below; one after it queues a new
+		// edge, so a racing append completion cannot be lost.
+		group.asyncQueued.Store(false)
+		if group.runtime != nil && group.failure == nil && !group.retiring {
 			host.wake(group)
 		}
+		group = next
 	}
 }
 
@@ -869,6 +923,126 @@ func (host *Host) enqueueProposal(
 	host.chargeInput(group, int64(len(data)))
 	host.wake(group)
 	return nil
+}
+
+// AdoptAuthorityMessage validates and takes ownership of one detached read
+// authority control record. Authority traffic shares the ordinary message
+// input queue so it cannot bypass Ready ordering or the Host's bounded input
+// accounting. A runtime must opt in by implementing authorityRuntime.
+func (host *Host) AdoptAuthorityMessage(
+	key raftmember.GroupKey,
+	message *raftauthority.Message,
+) error {
+	return host.adoptAuthorityMessage(key, 0, message)
+}
+
+// AdoptAuthenticatedAuthorityMessage additionally carries the transport's
+// authenticated source member. Runtime uses it to resolve the leader's
+// incarnation through an explicit configured source; it never substitutes a
+// follower's local boot counter.
+func (host *Host) AdoptAuthenticatedAuthorityMessage(
+	key raftmember.GroupKey,
+	source uint64,
+	message *raftauthority.Message,
+) error {
+	return host.adoptAuthorityMessage(key, source, message)
+}
+
+func (host *Host) adoptAuthorityMessage(
+	key raftmember.GroupKey,
+	source uint64,
+	message *raftauthority.Message,
+) error {
+	group, err := host.lookup(key)
+	if err != nil {
+		return err
+	}
+	if message == nil {
+		return errors.New("multiraft: nil authority message")
+	}
+	if _, ok := group.runtime.(authorityRuntime); !ok {
+		return raftauthority.ErrPolicyDisabled
+	}
+	if source != 0 {
+		switch message.Kind {
+		case raftauthority.MessageRequest:
+			if message.Request.Holder != source {
+				return raftauthority.ErrInvalidRequest
+			}
+		case raftauthority.MessageGrant:
+			if message.Grant.Voter != source {
+				return raftauthority.ErrInvalidGrant
+			}
+		default:
+			return raftauthority.ErrInvalidWire
+		}
+	}
+	size := raftauthority.CanonicalMessageBytes
+	if err := host.admitInput(group, int64(size)); err != nil {
+		return err
+	}
+	owned := *message
+	group.messages.push(queuedMessage{authority: &owned, authoritySource: source, size: int64(size)})
+	host.chargeInput(group, int64(size))
+	host.wake(group)
+	return nil
+}
+
+// StartReadAuthorityRound starts the explicitly configured holder protocol
+// for one group. Requests are emitted by subsequent bounded RunOne turns so
+// the Host's ordinary outbox limits still apply.
+func (host *Host) StartReadAuthorityRound(key raftmember.GroupKey) error {
+	group, err := host.lookup(key)
+	if err != nil {
+		return err
+	}
+	runtime, ok := group.runtime.(authorityRoundRuntime)
+	if !ok {
+		return raftauthority.ErrPolicyDisabled
+	}
+	if err := runtime.StartReadAuthorityRound(); err != nil {
+		return err
+	}
+	host.wake(group)
+	return nil
+}
+
+// ReadAuthorityToken returns the current holder capability from the exact
+// serialized Runtime owner. A missing or disabled runtime is a normal signal
+// for the ReadIndex fallback.
+func (host *Host) ReadAuthorityToken(
+	key raftmember.GroupKey,
+) (raftauthority.AuthorityToken, error) {
+	group, err := host.lookup(key)
+	if err != nil {
+		return raftauthority.AuthorityToken{}, err
+	}
+	provider, ok := group.runtime.(interface {
+		ReadAuthorityToken() (raftauthority.AuthorityToken, error)
+	})
+	if !ok {
+		return raftauthority.AuthorityToken{}, raftauthority.ErrPolicyDisabled
+	}
+	return provider.ReadAuthorityToken()
+}
+
+// ValidateReadAuthorityToken performs the serialized final revalidation used
+// after a source has captured an immutable data cut. It never extends a token
+// or changes the quorum protocol.
+func (host *Host) ValidateReadAuthorityToken(
+	key raftmember.GroupKey, token raftauthority.AuthorityToken,
+) error {
+	group, err := host.lookup(key)
+	if err != nil {
+		return err
+	}
+	provider, ok := group.runtime.(interface {
+		ValidateReadAuthorityToken(raftauthority.AuthorityToken) error
+	})
+	if !ok {
+		return raftauthority.ErrPolicyDisabled
+	}
+	return provider.ValidateReadAuthorityToken(token)
 }
 
 // ProposeConfChange synchronously admits one caller-authorized membership
@@ -1265,6 +1439,14 @@ func (host *Host) RunOne() (Progress, bool, error) {
 			group.schemaQuiesced {
 			continue
 		}
+		if err := host.drainAuthorityOutbound(group); err != nil {
+			if errors.Is(err, ErrOutboxFull) {
+				blockedOutbox = true
+				host.wake(group)
+				continue
+			}
+			return Progress{Group: group.key, Kind: ProgressMessage}, true, err
+		}
 		lateJoinQueued := 0
 		lateJoinMissed := false
 		if !group.lateJoinUsed {
@@ -1548,7 +1730,46 @@ func (host *Host) runInputBounded(
 			host.releaseInput(group, item.size)
 			group.nextClass = (class + 1) % inputClassCount
 			progress.Kind = ProgressMessage
-			return progress, true, group.runtime.StepMessage(item.message)
+			if item.authority != nil {
+				runtime, ok := group.runtime.(authorityRuntime)
+				if !ok {
+					return progress, true, raftauthority.ErrPolicyDisabled
+				}
+				var outbound raftmember.OutboundMessage
+				var produced bool
+				var err error
+				if item.authoritySource != 0 {
+					if authenticated, ok := group.runtime.(authenticatedAuthorityRuntime); ok {
+						outbound, produced, err = authenticated.StepAuthorityMessageFrom(
+							item.authoritySource, item.authority,
+						)
+					} else {
+						err = raftauthority.ErrPolicyDisabled
+					}
+				} else {
+					outbound, produced, err = runtime.StepAuthorityMessage(item.authority)
+				}
+				if errors.Is(err, raftauthority.ErrPolicyDisabled) {
+					err = nil
+				}
+				if err != nil {
+					return progress, true, err
+				}
+				if produced {
+					if err := host.enqueueOutbound(group, outbound); err != nil {
+						return progress, true, err
+					}
+				}
+				return progress, true, nil
+			}
+			stepErr := group.runtime.StepMessage(item.message)
+			if errors.Is(stepErr, raftmember.ErrAuthorityElectionBlocked) {
+				// A voter promise intentionally refuses election-bearing
+				// messages. The refusal is a benign protocol drop; returning it
+				// would put the whole Host into a Ready retry state.
+				stepErr = nil
+			}
+			return progress, true, stepErr
 		case inputProposal:
 			item, ok := group.proposals.peek()
 			if !ok {
@@ -1663,7 +1884,11 @@ func (host *Host) runInputBounded(
 			host.releaseInput(group, 0)
 			group.nextClass = (class + 1) % inputClassCount
 			progress.Kind = ProgressTick
-			return progress, true, group.runtime.Tick()
+			tickErr := group.runtime.Tick()
+			if errors.Is(tickErr, raftmember.ErrAuthorityElectionBlocked) {
+				tickErr = nil
+			}
+			return progress, true, tickErr
 		case inputCampaign:
 			if group.campaigns == 0 {
 				continue
@@ -1703,15 +1928,55 @@ func (host *Host) enqueueReadyOutbound(outbound raftmember.OutboundMessage) erro
 	return host.enqueueOutbound(host.readyGroup, outbound)
 }
 
+func (host *Host) drainAuthorityOutbound(group *groupState) error {
+	producer, ok := group.runtime.(authorityOutboundRuntime)
+	if !ok {
+		return nil
+	}
+	if pending, ok := group.runtime.(authorityOutboundPendingRuntime); ok && !pending.AuthorityOutboundPending() {
+		return nil
+	}
+	const authorityBytes = raftauthority.CanonicalMessageBytes
+	if host.outbox.len() >= host.limits.MaxOutboxItems ||
+		int64(authorityBytes) > host.limits.MaxOutboxBytes-host.outboxBytes {
+		return ErrOutboxFull
+	}
+	outbound, ok := producer.DrainAuthorityOutbound()
+	if !ok {
+		return nil
+	}
+	if err := host.enqueueOutbound(group, outbound); err != nil {
+		return err
+	}
+	host.wake(group)
+	return nil
+}
+
 func (host *Host) enqueueOutbound(group *groupState, outbound raftmember.OutboundMessage) error {
-	if outbound.Group != group.key || outbound.Message == nil || outbound.From != group.memberID ||
+	if outbound.Group != group.key || outbound.From != group.memberID ||
 		outbound.To == 0 || outbound.To == group.memberID ||
-		outbound.From != outbound.Message.GetFrom() || outbound.To != outbound.Message.GetTo() {
+		(outbound.Message == nil && outbound.Authority == nil) ||
+		(outbound.Message != nil && outbound.Authority != nil) {
 		return errors.New("multiraft: runtime returned a mismatched outbound message")
 	}
-	size, err := raftmember.MeasureOrdinaryMessage(outbound.Message)
-	if err != nil {
-		return err
+	var (
+		size  int
+		owned raftmember.OutboundMessage
+	)
+	if outbound.Authority != nil {
+		if outbound.Authority.Request.Group != raftauthorityGroup(group.key) {
+			return errors.New("multiraft: runtime returned an authority group mismatch")
+		}
+		size = raftauthority.CanonicalMessageBytes
+	} else {
+		if outbound.From != outbound.Message.GetFrom() || outbound.To != outbound.Message.GetTo() {
+			return errors.New("multiraft: runtime returned a mismatched outbound message")
+		}
+		var err error
+		size, err = raftmember.MeasureOrdinaryMessage(outbound.Message)
+		if err != nil {
+			return err
+		}
 	}
 	messageBytes := int64(size)
 	if messageBytes > host.limits.MaxOutboxBytes {
@@ -1721,15 +1986,24 @@ func (host *Host) enqueueOutbound(group *groupState, outbound raftmember.Outboun
 		messageBytes > host.limits.MaxOutboxBytes-host.outboxBytes {
 		return ErrOutboxFull
 	}
-	owned, _, err := raftmember.CloneOrdinaryMessage(outbound.Message)
-	if err != nil {
-		return err
+	if outbound.Authority != nil {
+		copyOfAuthority := *outbound.Authority
+		owned = raftmember.OutboundMessage{
+			Group: group.key, From: outbound.From, To: outbound.To,
+			Authority: &copyOfAuthority,
+		}
+	} else {
+		cloned, _, err := raftmember.CloneOrdinaryMessage(outbound.Message)
+		if err != nil {
+			return err
+		}
+		owned = raftmember.OutboundMessage{
+			Group: group.key, From: outbound.From, To: outbound.To, Message: cloned,
+		}
 	}
 	host.outbox.push(outboundItem{
-		message: raftmember.OutboundMessage{
-			Group: group.key, From: outbound.From, To: outbound.To, Message: owned,
-		},
-		size: messageBytes,
+		message: owned,
+		size:    messageBytes,
 	})
 	host.outboxBytes += messageBytes
 	return nil

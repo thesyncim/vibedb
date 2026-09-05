@@ -277,7 +277,24 @@ func (authority *ReplicatedCatalogAuthority) Read(ctx context.Context) (*Snapsho
 	return authority.publishReadCatalogCut(ctx, cut.snapshot, cut.head)
 }
 
+// Separate linearizable point reads can straddle an atomic catalog update.
+// Retry only when a fresh head proves forward progress; a stable head with a
+// missing or malformed witness remains a hard conflict, not a bootstrap retry.
+var errCatalogReadAdvanced = errors.New("gateway: catalog advanced during certified read")
+
 func (authority *ReplicatedCatalogAuthority) readCatalogCut(ctx context.Context) (replicatedCatalogCut, error) {
+	for attempt := 0; ; attempt++ {
+		cut, err := authority.readCatalogCutOnce(ctx)
+		if !errors.Is(err, errCatalogReadAdvanced) {
+			return cut, err
+		}
+		if authority == nil || authority.executor == nil || attempt+1 >= authority.executor.maxAttempts {
+			return replicatedCatalogCut{}, ErrReplicatedCatalogConflict
+		}
+	}
+}
+
+func (authority *ReplicatedCatalogAuthority) readCatalogCutOnce(ctx context.Context) (replicatedCatalogCut, error) {
 	result, err := authority.readRaw(ctx, replicatedCatalogHeadKey, uint32(maxReplicatedCatalogBytes))
 	if err != nil {
 		return replicatedCatalogCut{}, err
@@ -343,6 +360,20 @@ func (authority *ReplicatedCatalogAuthority) readCatalogCut(ctx context.Context)
 	}
 	if !witnessResult.Found || len(witnessResult.Value) > maxReplicatedCatalogHeadWitnessBytes ||
 		validateReplicatedCatalogHeadWitness(witnessResult.Value, snapshot.Generation(), result.Value) != nil {
+		latest, readErr := authority.readRaw(ctx, replicatedCatalogHeadKey, uint32(maxReplicatedCatalogBytes))
+		if readErr != nil {
+			return replicatedCatalogCut{}, readErr
+		}
+		if latest.Found && !bytes.Equal(latest.Value, result.Value) {
+			payload, openErr := openTypedControlPlaneDocument(latest.Value,
+				replicatedCatalogHeadDocumentID[:], maxReplicatedCatalogBytes)
+			if openErr == nil {
+				advanced, decodeErr := OpenSnapshotDocument(payload)
+				if decodeErr == nil && advanced.Generation() > snapshot.Generation() {
+					return replicatedCatalogCut{}, errCatalogReadAdvanced
+				}
+			}
+		}
 		return replicatedCatalogCut{}, ErrReplicatedCatalogConflict
 	}
 	return replicatedCatalogCut{

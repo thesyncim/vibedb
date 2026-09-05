@@ -1,0 +1,27 @@
+=== RUN   TestReadAuthorityPolicyRequiresEveryVoterCapability
+--- PASS: TestReadAuthorityPolicyRequiresEveryVoterCapability (0.00s)
+=== RUN   TestReadAuthorityRoundPairsExactGrantsAndExpiresConservatively
+--- PASS: TestReadAuthorityRoundPairsExactGrantsAndExpiresConservatively (0.00s)
+=== RUN   TestReadAuthorityPromiseRejectsHigherTermUntilLocalExpiry
+--- PASS: TestReadAuthorityPromiseRejectsHigherTermUntilLocalExpiry (0.00s)
+=== RUN   TestReadAuthorityClockRollbackPermanentlyFailsClosed
+--- PASS: TestReadAuthorityClockRollbackPermanentlyFailsClosed (0.00s)
+=== RUN   TestReadAuthorityPromiseAllowsOnlyMonotoneSameHolderRenewal
+--- PASS: TestReadAuthorityPromiseAllowsOnlyMonotoneSameHolderRenewal (0.00s)
+=== RUN   TestReadAuthorityRenewalRequiresFreshObservation
+--- PASS: TestReadAuthorityRenewalRequiresFreshObservation (0.00s)
+=== RUN   TestQualifiedElapsedClockIsExplicitAndMonotonic
+--- PASS: TestQualifiedElapsedClockIsExplicitAndMonotonic (0.00s)
+=== RUN   TestReadAuthorityRejectsUnrepresentableDriftAndDeadlines
+--- PASS: TestReadAuthorityRejectsUnrepresentableDriftAndDeadlines (0.00s)
+=== RUN   TestReadAuthorityDetachesPolicySlices
+--- PASS: TestReadAuthorityDetachesPolicySlices (0.00s)
+=== RUN   TestReadAuthorityRestartQuarantineIsExplicitAndBounded
+--- PASS: TestReadAuthorityRestartQuarantineIsExplicitAndBounded (0.00s)
+=== RUN   TestReadAuthorityFinalValidationAndInvalidation
+--- PASS: TestReadAuthorityFinalValidationAndInvalidation (0.00s)
+=== RUN   TestAuthorityWireRoundTripRequestAndGrant
+--- PASS: TestAuthorityWireRoundTripRequestAndGrant (0.00s)
+=== RUN   TestAuthorityWireRejectsReservedAndTruncatedBytes
+--- PASS: TestAuthorityWireRejectsReservedAndTruncatedBytes (0.00s)
+PASS

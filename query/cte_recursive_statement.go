@@ -444,9 +444,7 @@ func (t *RecursiveCTEStatementTerm) ownResult(
 			}
 			cell := cursor.Cell(column)
 			payload = saturatedBytes(payload, resultCellPayloadBytes(cell))
-			copyBytes = saturatedBytes(
-				copyBytes, int64(len(cell.raw))+int64(len(cell.text)),
-			)
+			copyBytes = saturatedBytes(copyBytes, resultCellOwnedBytes(cell))
 			if payload == math.MaxInt64 || copyBytes == math.MaxInt64 {
 				return ErrRecursiveSize
 			}
@@ -524,17 +522,7 @@ func (t *RecursiveCTEStatementTerm) ownResult(
 }
 
 func ownRecursiveStatementCell(cell Cell, data []byte) (Cell, []byte) {
-	if len(cell.raw) != 0 {
-		start := len(data)
-		data = append(data, cell.raw...)
-		cell.raw = data[start:len(data):len(data)]
-	}
-	if len(cell.text) != 0 {
-		start := len(data)
-		data = append(data, cell.text...)
-		cell.text = byteview.String(data[start:len(data):len(data)])
-	}
-	return cell, data
+	return ownResultCellInto(data, cell)
 }
 
 // Release drops adapter-owned result arenas and schema copies. It does not

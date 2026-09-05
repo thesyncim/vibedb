@@ -272,8 +272,11 @@ func newGatewayReplicaRemoteClients(
 		options.Drainer == nil {
 		return gatewayReplicaMoveControls{}, errGatewayReplicaControl
 	}
+	// Reserve at least half the shared admission budget for move and backup controls.
+	healthConnections := cap(options.Opener.slots) / 2
 	observations, err := replicacontrol.NewClient(replicacontrol.ClientOptions{
-		Opener: options.Opener, ReadDeadline: options.ReadDeadline,
+		MaxHealthRoundConnections: healthConnections,
+		Opener:                    options.Opener, ReadDeadline: options.ReadDeadline,
 		WriteDeadline: options.WriteDeadline,
 	})
 	if err != nil {
