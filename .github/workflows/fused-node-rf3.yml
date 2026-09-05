@@ -36,8 +36,8 @@ on:
       - 'sql/**'
   workflow_dispatch:
     inputs:
-      space_base:
-        description: 'Optional Git base for nine paired node-space performance trials'
+      format_base:
+        description: 'Optional baseline revision for paired primary-format qualification'
         required: false
         type: string
 
@@ -52,11 +52,11 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  node-space-performance:
-    if: github.event_name == 'workflow_dispatch' && inputs.space_base != ''
-    name: Paired RF3 node-space performance
+  primary-format-performance:
+    if: github.event_name == 'workflow_dispatch' && inputs.format_base != ''
+    name: Paired primary-format performance
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
         with:
@@ -64,78 +64,43 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: '1.27'
-      - name: Build identical workload against both revisions
-        shell: bash
+      - name: Build the identical benchmark source against both revisions
         env:
-          SPACE_BASE: ${{ inputs.space_base }}
+          FORMAT_BASE: ${{ inputs.format_base }}
         run: |
           set -euo pipefail
-          base="$(git rev-parse --verify "${SPACE_BASE}^{commit}")"
-          mkdir -p "${RUNNER_TEMP}/node-space-build" "${RUNNER_TEMP}/node-space-perf-tmp"
-          git rev-parse HEAD > "${RUNNER_TEMP}/node-space-build/candidate-revision.txt"
-          printf '%s\n' "${base}" > "${RUNNER_TEMP}/node-space-build/base-revision.txt"
-          go version > "${RUNNER_TEMP}/node-space-build/go-version.txt"
-          df -T -B1 "${RUNNER_TEMP}" > "${RUNNER_TEMP}/node-space-build/filesystem.txt"
-          lscpu > "${RUNNER_TEMP}/node-space-build/cpu.txt"
-          go test -c -o "${RUNNER_TEMP}/node-space-build/candidate.test" ./cmd/vibedb-shard
-          git worktree add --detach "${RUNNER_TEMP}/node-space-base" "${base}"
-          cp cmd/vibedb-shard/node_space_process_qualification_test.go \
-            "${RUNNER_TEMP}/node-space-base/cmd/vibedb-shard/"
-          cd "${RUNNER_TEMP}/node-space-base"
-          go test -c -o "${RUNNER_TEMP}/node-space-build/base.test" ./cmd/vibedb-shard
-      - name: Run nine alternating paired trials
-        shell: bash
-        env:
-          TMPDIR: ${{ runner.temp }}/node-space-perf-tmp
+          base="$(git rev-parse --verify "${FORMAT_BASE}^{commit}")"
+          build="${RUNNER_TEMP}/primary-format-build"
+          mkdir -p "${build}"
+          git rev-parse HEAD > "${build}/candidate-revision.txt"
+          printf '%s\n' "${base}" > "${build}/base-revision.txt"
+          go version > "${build}/go-version.txt"
+          go env > "${build}/go-env.txt"
+          lscpu > "${build}/cpu.txt"
+          df -T -B1 "${RUNNER_TEMP}" > "${build}/filesystem.txt"
+          go test -c -o "${build}/candidate-storeio.test" ./internal/storeio
+          go test -c -o "${build}/candidate-durable.test" ./store/durable
+          git worktree add --detach "${RUNNER_TEMP}/primary-format-base" "${base}"
+          cp internal/storeio/compact_rank_format_bench_test.go "${RUNNER_TEMP}/primary-format-base/internal/storeio/"
+          cd "${RUNNER_TEMP}/primary-format-base"
+          go test -c -o "${build}/base-storeio.test" ./internal/storeio
+          go test -c -o "${build}/base-durable.test" ./store/durable
+      - name: Qualify the decoder and changed native paths
         run: |
-          set -euo pipefail
-          python3 scripts/bench/run-node-space-comparison.py \
-            --base-binary "${RUNNER_TEMP}/node-space-build/base.test" \
-            --candidate-binary "${RUNNER_TEMP}/node-space-build/candidate.test" \
-            --output "${RUNNER_TEMP}/node-space-comparison"
+          "${RUNNER_TEMP}/primary-format-build/candidate-storeio.test" \
+            -test.run='^TestCompact' -test.count=1 -test.timeout=5m
+      - name: Run six alternating paired trials without overlapping builds
+        run: |
+          python3 scripts/bench/run-primary-format-comparison.py \
+            --binaries "${RUNNER_TEMP}/primary-format-build" \
+            --output "${RUNNER_TEMP}/primary-format-comparison"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: node-space-comparison-${{ github.sha }}
+          name: primary-format-${{ github.sha }}
           path: |
-            ${{ runner.temp }}/node-space-comparison
-            ${{ runner.temp }}/node-space-build/*.txt
-          if-no-files-found: error
-          retention-days: 30
-  node-space:
-    name: Ubuntu RF3 node history reclamation
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
-        with:
-          go-version: '1.27'
-      - name: Exercise reclamation during concurrent reads and writes
-        shell: bash
-        env:
-          VIBEDB_NODE_SPACE_E2E: '1'
-          VIBEDB_NODE_SPACE_EXPECT_RECLAIM: '1'
-          VIBEDB_NODE_SPACE_EVIDENCE: ${{ runner.temp }}/node-space/samples.json.gz
-          TMPDIR: ${{ runner.temp }}/node-space-tmp
-        run: |
-          set -euo pipefail
-          evidence="${RUNNER_TEMP}/node-space"
-          mkdir -p "${evidence}" "${TMPDIR}"
-          git rev-parse HEAD > "${evidence}/revision.txt"
-          go version > "${evidence}/go-version.txt"
-          df -T -B1 "${TMPDIR}" > "${evidence}/filesystem.txt"
-          go test -json -count=1 -timeout=10m \
-            -run '^TestServeRF3NodeSpaceQualification$' ./cmd/vibedb-shard \
-            | tee "${evidence}/go-test.jsonl"
-          jq -e -s 'any(.[]; .Action == "pass" and .Test == "TestServeRF3NodeSpaceQualification") and
-            all(.[]; .Action != "fail" and .Action != "skip")' "${evidence}/go-test.jsonl"
-          test -s "${VIBEDB_NODE_SPACE_EVIDENCE}"
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: node-space-${{ github.sha }}
-          path: ${{ runner.temp }}/node-space
+            ${{ runner.temp }}/primary-format-comparison
+            ${{ runner.temp }}/primary-format-build/*.txt
           if-no-files-found: error
           retention-days: 30
   qualify:

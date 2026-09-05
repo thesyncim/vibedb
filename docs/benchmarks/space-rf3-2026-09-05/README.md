@@ -1,6 +1,6 @@
 # Shared-node RF3 history reclamation
 
-The implemented saving removes obsolete Raft history on each physical replica.
+This rejected experiment removed obsolete Raft history on each physical replica. The production change has been removed from the shipping candidate because it failed the latency requirement; its exact source is retained in [rejected-maintenance.patch.txt](rejected-maintenance.patch.txt).
 It connects the existing authenticated dead-prefix reclamation protocol to the
 background application-checkpoint worker and fixes an admission guard that
 mistook an unread, completed seal notice for unfinished seal publication.
@@ -139,7 +139,7 @@ before the final comparison. [sha256.json](sha256.json) inventories the evidence
 - [Node maintenance](../../../internal/raftstore/node_catalog.go)
 - [Background checkpoint worker](../../../internal/raftmember/node_checkpoint.go)
 - [Reclamation admission](../../../internal/raftstore/seglog/reclaim.go)
-- [Multi-group storage regression](../../../internal/raftstore/node_maintenance_test.go)
+- [Multi-group storage regression](https://github.com/thesyncim/vibedb/blob/837c68bfe14d6197159561e675c1386b982a1fa1/internal/raftstore/node_maintenance_test.go)
 - [Reclamation, concurrency, and crash tests](../../../internal/raftstore/seglog/reclaim_test.go)
 - [RF3 process qualification](../../../cmd/vibedb-shard/node_space_process_qualification_test.go)
 - [Paired comparison runner](../../../scripts/bench/run-node-space-comparison.py)

@@ -110,7 +110,7 @@ func (d *CompactPrimaryScanDecoder) prepare(
 		streamRaw := entry.streamRaw
 		for hole := 0; hole < entry.template.holes; hole++ {
 			stream, admitted := admittedCompactStream(streamRaw)
-			if !admitted || stream.count != entry.rows {
+			if !admitted || !stream.matchesShapeRows(entry.rows, v.rows) {
 				return
 			}
 			d.streamView[streamCount+hole] = stream
@@ -291,10 +291,11 @@ func (d *CompactPrimaryScanDecoder) appendValue(
 		} else {
 			dst = append(dst, meta.static[previous:end]...)
 			state := &d.streams[streamAt]
-			if ordinal != state.next {
-				state.seek(stream, ordinal)
+			coordinate := stream.shapeCoordinate(row, ordinal)
+			if stream.kind != compactStreamRankAffine && coordinate != state.next {
+				state.seek(stream, coordinate)
 			}
-			dst, ok = state.appendValue(dst, stream, ordinal)
+			dst, ok = state.appendValue(dst, stream, coordinate)
 		}
 		previous = end
 		if !ok {

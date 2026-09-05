@@ -90,9 +90,6 @@ func (c *NodeCheckpointCoordinator) capture(apply *sqldriver.ReplicatedApply) (r
 			result = nodeCheckpointBuildResult{err: fmt.Errorf("%w: %v", ErrNodeCheckpointPanic, recovered)}
 		}
 	}()
-	if err := c.sequencer.MaintainNodeLog(); err != nil {
-		return nodeCheckpointBuildResult{err: fmt.Errorf("node log maintenance: %w", err)}
-	}
 	preparation, err := apply.CaptureWALBase(sqldriver.WALBaseCaptureOptions{Workspace: c.workspace})
 	if err != nil {
 		return nodeCheckpointBuildResult{err: err}

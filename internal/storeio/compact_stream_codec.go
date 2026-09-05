@@ -29,6 +29,7 @@ const (
 	compactStreamPrefixInt
 	compactStreamDeltaPack
 	compactStreamAlphabet
+	compactStreamRankAffine
 	compactStreamKindLimit
 	compactDictionaryHashThreshold = 16
 	compactDictionaryScanPreferred = 128
@@ -145,6 +146,10 @@ func encodeCompactScalarStream(values [][]byte) compactStreamEncoding {
 }
 
 func (s *compactStreamScratch) encode(values [][]byte) compactStreamEncoding {
+	return s.encodeShape(values, nil, 0)
+}
+
+func (s *compactStreamScratch) encodeShape(values [][]byte, ranks []uint16, leafRows int) compactStreamEncoding {
 	if len(values) == 0 {
 		return compactStreamEncoding{kind: compactStreamDictionary}
 	}
@@ -184,7 +189,7 @@ func (s *compactStreamScratch) encode(values [][]byte) compactStreamEncoding {
 		s.candidates[n] = s.encodeDate(n, s.dates)
 		n++
 	}
-	if numeric, ok := s.encodePrefixInt(n, values); ok {
+	if numeric, ok := s.encodePrefixIntShape(n, values, ranks, leafRows); ok {
 		s.candidates[n] = numeric
 		n++
 	}
@@ -834,6 +839,10 @@ func (s *compactStreamScratch) encodePrefixInt(
 	slot int,
 	values [][]byte,
 ) (compactStreamEncoding, bool) {
+	return s.encodePrefixIntShape(slot, values, nil, 0)
+}
+
+func (s *compactStreamScratch) encodePrefixIntShape(slot int, values [][]byte, ranks []uint16, leafRows int) (compactStreamEncoding, bool) {
 	first, ok := parseCompactPrefixInt(values[0])
 	if !ok {
 		return compactStreamEncoding{}, false
@@ -885,6 +894,9 @@ func (s *compactStreamScratch) encodePrefixInt(
 			kind: compactStreamPrefixInt, count: len(values), data: data,
 			dict: dictionary,
 		}, true
+	}
+	if affine, ok := s.encodeRankAffineParsed(slot, first, allCanonical, fixedWidth, ranks, leafRows); ok {
+		return affine, true
 	}
 	restarts := (len(values) + compactStreamRestart - 1) / compactStreamRestart
 	if fixedWidth {
@@ -1373,6 +1385,10 @@ func (v compactStreamView) validate() error {
 				return corrupt("date range")
 			}
 		}
+	case compactStreamRankAffine:
+		if !v.validRankAffine() {
+			return corrupt("rank-affine data")
+		}
 	case compactStreamPrefixInt:
 		if v.width != 0 || v.dictCount != 2 || len(v.data) < 2 ||
 			v.data[0] > 7 || v.data[0]&6 == 6 ||
@@ -1598,7 +1614,7 @@ func (v compactStreamView) appendValue(dst []byte, row int) ([]byte, bool) {
 		base := int32(binary.LittleEndian.Uint32(v.data))
 		value := base + int32(compactReadBits(v.data[4:], row*int(v.width), int(v.width)))
 		return appendCompactDate(dst, value), true
-	case compactStreamPrefixInt:
+	case compactStreamPrefixInt, compactStreamRankAffine:
 		value, ok := v.prefixInteger(row)
 		if !ok || value < 0 {
 			return dst, false
@@ -1651,6 +1667,9 @@ func (v compactStreamView) appendAlphabetValue(dst []byte, row int) ([]byte, boo
 }
 
 func (v compactStreamView) prefixInteger(row int) (int64, bool) {
+	if v.kind == compactStreamRankAffine {
+		return v.rankAffineInteger(row)
+	}
 	if v.kind != compactStreamPrefixInt || row < 0 || row >= v.count || len(v.data) < 2 {
 		return 0, false
 	}

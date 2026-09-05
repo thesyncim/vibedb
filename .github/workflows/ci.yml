@@ -285,7 +285,7 @@ jobs:
         env:
           GOAMD64: v1
         run: |
-          GOEXPERIMENT=nosimd go test -count=1 -timeout=5m ./internal/storeio -run 'Test(CountCompact|CompactPacked|CompactInteger(Ordered|Interval|Extrema)|CompactStream|CompactPrimaryStripe|PrimaryGraphIntegerExtrema)'
+          GOEXPERIMENT=nosimd go test -count=1 -timeout=5m ./internal/storeio -run 'Test(CountCompact|CompactPacked|CompactInteger(Ordered|Interval|Extrema)|CompactStream|CompactPrimaryStripe|CompactRankAffine|PrimaryGraphIntegerExtrema)'
           GOEXPERIMENT=nosimd go test -count=1 -timeout=5m ./query -run '^TestFilePacked(EqualityCount|OrderedCount|IntegerInterval|IntegerExtrema).*$'
       - name: SIMD packed-count fallback with AVX2 disabled (AMD64)
         if: matrix.runner == 'ubuntu-latest'

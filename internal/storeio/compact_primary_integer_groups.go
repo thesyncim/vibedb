@@ -147,6 +147,11 @@ func unifiedCompactIntegerValue(v compactStreamView, row int) (int64, bool) {
 		return 0, false
 	}
 	switch v.kind {
+	case compactStreamRankAffine:
+		if v.rankAffineIsNumber() {
+			return v.rankAffineInteger(row)
+		}
+		return 0, false
 	case compactStreamFOR:
 		return unifiedIntegerFORValue(v, row)
 	case compactStreamDelta:
@@ -244,6 +249,9 @@ func unifiedFrontIntegerValue(v compactStreamView, row int) (int64, bool) {
 }
 
 func unifiedCompactIntegerStreamExact(v compactStreamView) bool {
+	if v.kind == compactStreamRankAffine {
+		return v.rankAffineIsNumber()
+	}
 	if v.count < 0 {
 		return false
 	}
@@ -264,7 +272,7 @@ func unifiedCompactIntegerStreamExact(v compactStreamView) bool {
 // stream's envelope; this helper repeats the bounded stream walk needed to
 // reach the target hole.
 func compactIntegerStreamAt(
-	entry compactPrimaryShapeView, hole int,
+	entry compactPrimaryShapeView, hole, leafRows int,
 ) (compactStreamView, bool) {
 	if hole < 0 || hole >= entry.template.holes {
 		return compactStreamView{}, false
@@ -272,7 +280,7 @@ func compactIntegerStreamAt(
 	raw := entry.streamRaw
 	for at := 0; at <= hole; at++ {
 		stream, admitted := admittedCompactStream(raw)
-		if !admitted || stream.count != entry.rows {
+		if !admitted || !stream.matchesShapeRows(entry.rows, leafRows) {
 			return compactStreamView{}, false
 		}
 		if at == hole {
@@ -358,7 +366,7 @@ func (v *CompactPrimaryStripeView) VisitResolvedIntegerGroups(
 			// neither has SQL's all-integer semantics required by this lane.
 			return false, nil
 		}
-		groupStream, ok := compactIntegerStreamAt(entry, groupHole)
+		groupStream, ok := compactIntegerStreamAt(entry, groupHole, v.rows)
 		if !ok {
 			return false, nil
 		}
@@ -371,7 +379,7 @@ func (v *CompactPrimaryStripeView) VisitResolvedIntegerGroups(
 			if sumHole == groupHole {
 				sumStream = groupStream
 			} else {
-				sumStream, ok = compactIntegerStreamAt(entry, sumHole)
+				sumStream, ok = compactIntegerStreamAt(entry, sumHole, v.rows)
 				if !ok {
 					return false, nil
 				}
@@ -397,13 +405,13 @@ func (v *CompactPrimaryStripeView) VisitResolvedIntegerGroups(
 		if ordinal >= entry.rows {
 			return false, nil
 		}
-		group, ok := unifiedCompactIntegerValue(entry.group, ordinal)
+		group, ok := unifiedCompactIntegerValue(entry.group, entry.group.shapeCoordinate(row, ordinal))
 		if !ok {
 			return false, nil
 		}
 		var sum int64
 		if sumResolver != nil {
-			sum, ok = unifiedCompactIntegerValue(entry.sum, ordinal)
+			sum, ok = unifiedCompactIntegerValue(entry.sum, entry.sum.shapeCoordinate(row, ordinal))
 			if !ok {
 				return false, nil
 			}

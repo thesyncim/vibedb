@@ -146,18 +146,6 @@ condition, not permission to discard a group's live recovery state. See
 
 ## WAL generations and snapshots
 
-On the shared-node path, the background checkpoint worker also checkpoints new
-descriptor registrations and requests reclamation of a fully dead, sealed log
-prefix before its scheduled application capture. Live entries in any group
-continue to pin shared segments. Reclamation keeps the existing count/byte
-thresholds and preallocated active/spare capacity; it may wait for a later
-capture and segment seal. It does not force idle checkpoints or rotations.
-An already-published seal does not block
-reclamation while its rotation completion notice awaits consumption.
-Each request retires at most 32 segments; larger backlogs drain across
-scheduled captures, so this is not a fixed retention bound for arbitrary
-write rates or slow groups.
-
 The Raft WAL is bounded, preallocated, encrypted/authenticated, digest-chained, and tied to an
 immutable placement identity. Its active limits are sealed into the format; a manifest may choose
 smaller values than the constructor defaults. See [defaults and limits](../reference/limits.md)

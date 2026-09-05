@@ -71,12 +71,8 @@ func (e *Engine) ReclaimDeadPrefix() error {
 
 func (e *Engine) reclaimDeadPrefix() error {
 	e.writeMu.Lock()
-	// This worker serializes sealing and reclamation. HasPending identifies a
-	// frozen segment whose publication is unfinished. sealPending additionally
-	// includes a completed seal whose result the rotator has not consumed yet;
-	// that unread completion must not pin an otherwise reclaimable prefix.
 	if e.log != nil && e.log.metadata != nil && (e.log.metadata.slot.ReclaimPhase != reclaimNone || e.log.metadata.slot.RetiredCheckpointCount != 0) {
-		if e.maintenanceBusy || e.log.usable() != nil || e.log.metadata.slot.HasPending {
+		if e.maintenanceBusy || e.sealPending || e.log.usable() != nil || e.log.metadata.slot.HasPending {
 			e.writeMu.Unlock()
 			return ErrBounds
 		}
@@ -89,7 +85,7 @@ func (e *Engine) reclaimDeadPrefix() error {
 		}()
 		return e.resumeReclaim()
 	}
-	if e.maintenanceBusy || e.log == nil || e.log.usable() != nil || e.log.metadata == nil || e.log.metadata.needsHealing || e.log.metadata.slot.HasPending || e.log.metadata.slot.ReclaimPhase != reclaimNone {
+	if e.maintenanceBusy || e.sealPending || e.log == nil || e.log.usable() != nil || e.log.metadata == nil || e.log.metadata.needsHealing || e.log.metadata.slot.HasPending || e.log.metadata.slot.ReclaimPhase != reclaimNone {
 		e.writeMu.Unlock()
 		return ErrBounds
 	}

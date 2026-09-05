@@ -11,62 +11,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
-	"time"
 )
-
-func TestReclaimCheckpointIODoesNotBlockActiveReadsOrAppends(t *testing.T) {
-	oldMin, oldMax := reclaimMinSegments, reclaimMaxSegments
-	reclaimMinSegments, reclaimMaxSegments = 2, 2
-	t.Cleanup(func() { reclaimMinSegments, reclaimMaxSegments, reclaimPublishHook = oldMin, oldMax, nil })
-	e, _, _ := newReclaimableEngine(t, t.TempDir())
-	defer e.Close()
-	if err := e.ReserveGroup(2, 4096); err != nil {
-		t.Fatal(err)
-	}
-	if err := e.PersistWave(Wave{ID: waveID(4), Batches: []ReadyBatch{{GroupID: 2, Entries: []Entry{{Index: 1, Term: 1}}}}}); err != nil {
-		t.Fatal(err)
-	}
-	entered, release := make(chan struct{}), make(chan struct{})
-	reclaimPublishHook = func(phase reclaimPublishPhase) error {
-		if phase == reclaimCheckpointAPublished {
-			close(entered)
-			<-release
-		}
-		return nil
-	}
-	done := make(chan error, 1)
-	go func() { done <- e.ReclaimDeadPrefix() }()
-	defer func() {
-		close(release)
-		if err := <-done; err != nil {
-			t.Error(err)
-		}
-	}()
-	select {
-	case <-entered:
-	case <-time.After(5 * time.Second):
-		t.Fatal("reclamation did not enter checkpoint I/O")
-	}
-	foreground := make(chan error, 1)
-	go func() {
-		_, term, compacted, found, err := e.LookupExact(2, 1)
-		if err == nil && (term != 1 || compacted || !found) {
-			err = ErrRaftState
-		}
-		if err == nil {
-			err = e.PersistWave(Wave{ID: waveID(5), Batches: []ReadyBatch{{GroupID: 2, Entries: []Entry{{Index: 2, Term: 1}}}}})
-		}
-		foreground <- err
-	}()
-	select {
-	case err := <-foreground:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("reclamation I/O blocked active read/append")
-	}
-}
 
 func newReclaimableEngine(t *testing.T, dir string) (*Engine, []SegmentMeta, Checkpoint) {
 	t.Helper()
@@ -128,51 +73,6 @@ func TestReclaimDeadSealedPrefixTwoCutRoundTrip(t *testing.T) {
 	metadata, ok := engine.Metadata(1)
 	if !ok || metadata.Checkpoint != checkpoint || metadata.FirstIndex != 3 || metadata.LastIndex != 2 {
 		t.Fatalf("metadata=%+v ok=%v", metadata, ok)
-	}
-}
-
-func TestReclaimAfterSealPublicationBeforeWaitSeal(t *testing.T) {
-	oldMin, oldMax := reclaimMinSegments, reclaimMaxSegments
-	reclaimMinSegments, reclaimMaxSegments = 2, 2
-	t.Cleanup(func() { reclaimMinSegments, reclaimMaxSegments = oldMin, oldMax })
-	dir := t.TempDir()
-	engine, removed, _ := newReclaimableEngine(t, dir)
-	defer engine.Close()
-	if err := engine.PersistWave(Wave{ID: waveID(4), Batches: []ReadyBatch{
-		{GroupID: 1, Entries: []Entry{{Index: 3, Term: 1, Data: []byte("retained")}}},
-	}}); err != nil {
-		t.Fatal(err)
-	}
-	published := make(chan struct{})
-	if err := engine.Rotate(func(phase RotationPhase) error {
-		if phase == RotationSealedMetadataPublished {
-			close(published)
-		}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-published:
-	case <-time.After(5 * time.Second):
-		t.Fatal("seal publication did not finish")
-	}
-	// Ordinary node traffic only consumes this completion at the next rotation.
-	// Reclamation must work in the intervening active segment, and must leave
-	// the completion available for the explicit control-plane waiter.
-	if err := engine.ReclaimDeadPrefix(); err != nil {
-		t.Fatal(err)
-	}
-	for _, segment := range removed {
-		if _, err := os.Stat(segmentPath(dir, segment.FileID)); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("dead segment %d remains: %v", segment.ID, err)
-		}
-	}
-	if err := engine.WaitSeal(); err != nil {
-		t.Fatal(err)
-	}
-	if _, term, compacted, found, err := engine.LookupExact(1, 3); err != nil || term != 1 || compacted || !found {
-		t.Fatalf("retained entry: term=%d compacted=%v found=%v err=%v", term, compacted, found, err)
 	}
 }
 

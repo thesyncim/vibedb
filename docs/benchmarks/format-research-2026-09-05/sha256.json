@@ -6,5 +6,12 @@
   "prefix-overflow-before.txt": "73a4542975b71e5914c960be8b698b5fd1b9f53c9d8934982a9bb1946cbac422",
   "primary-boundary-census.json": "78ddf1c7f0311687aa30a1952327124b4ce631517484d47287f614e6319877ec",
   "primary-boundary-census.txt": "e03c7e1105f86b3194b4cecaf01c38126b73e03445275953fc85c984659f4097",
-  "primary-boundary-census_test.go.txt": "6b54195221b41384b0f9aa433f23c9a5779705418831f39f203198824c7f170f"
+  "primary-boundary-census_test.go.txt": "6b54195221b41384b0f9aa433f23c9a5779705418831f39f203198824c7f170f",
+  "rank-affine/actual-repacked.txt": "2d8a753975098aa35fd8be3f5d3bbd7c2721b6bad4e6bd9564f5bf81cca4f315",
+  "rank-affine/actual.txt": "6b12e513596498dbd172835812e191007cc20851dada4bfb87fb5d9f1d518144",
+  "rank-affine/census.txt": "ab1269cb515faf895f2f37730c269117af36f4cb23131660ff1a27a78dfa6244",
+  "rank-affine/correctness.txt": "ef96f48dd8e96c0c172ddc4d34fd17643d0cd479713106c60ae45e856b43d63a",
+  "rank-affine/research_test.go.txt": "240bd482532aba07c57a9909b08fca50c1d2cf426509d8bf1a73c4b1af65edad",
+  "rank-affine/results.md": "ec4a880cb30b3f1f236963b593f810af202cd2a38a8944e9d1f101ce5659d073",
+  "rank-affine/validation-notes.md": "5f8598dc1644b02275af9e0bd751161fac6b65115f8cf2721607723467090d5b"
 }
