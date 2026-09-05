@@ -1138,3 +1138,72 @@ func BenchmarkNodeSubmissionSequencer(b *testing.B) {
 		})
 	}
 }
+
+func TestNodeSubmissionCompletionWakesOnlyItsOwner(t *testing.T) {
+	q := newTestSequencer(t, 8, func([]NodeReady) error { return nil })
+	first, idle := preparedSubmission(t, 1, 1), preparedSubmission(t, 2, 1)
+	var firstWake, idleWake atomic.Int32
+	q.SetWakeFor(first, func() { firstWake.Add(1) })
+	q.SetWakeFor(idle, func() { idleWake.Add(1) })
+	if _, err := q.TrySubmit(first); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if firstWake.Load() != 1 || idleWake.Load() != 0 {
+		t.Fatalf("completion woke active/idle=%d/%d, want 1/0", firstWake.Load(), idleWake.Load())
+	}
+}
+
+func TestNodeSubmissionCapacityRetryWakeSurvivesIdleRace(t *testing.T) {
+	q := newTestSequencer(t, 8, func([]NodeReady) error { return nil })
+	rejected := preparedSubmission(t, 1, 1)
+	wake := make(chan struct{}, 1)
+	q.SetWakeFor(rejected, func() {
+		select {
+		case wake <- struct{}{}:
+		default:
+		}
+	})
+	// Model the worker draining its last wave just before a producer publishes
+	// a capacity rejection. No accepted cell remains to produce a future wake.
+	q.rejectSubmission(ErrSubmissionBackpressure)
+	select {
+	case <-wake:
+	case <-time.After(5 * time.Second):
+		t.Fatal("lost capacity retry wake on idle sequencer")
+	}
+	if _, err := q.TrySubmit(rejected); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rejected.Wait(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNodeSubmissionUnregisteredOwnerNotWokenByCompletion(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	q := newTestSequencer(t, 8, func([]NodeReady) error { close(entered); <-release; return nil })
+	cell := preparedSubmission(t, 1, 1)
+	var calls atomic.Int32
+	q.SetWakeFor(cell, func() { calls.Add(1) })
+	if _, err := q.TrySubmit(cell); err != nil {
+		t.Fatal(err)
+	}
+	<-entered
+	q.SetWakeFor(cell, nil)
+	close(release)
+	if _, err := cell.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 0 {
+		t.Fatal("unregistered owner was woken")
+	}
+}

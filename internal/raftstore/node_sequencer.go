@@ -64,6 +64,7 @@ type Submission struct {
 	ticket   atomic.Uint64
 	err      error
 	done     chan struct{}
+	wake     atomic.Pointer[nodeSequencerWake]
 }
 
 // Initialize allocates the cold-path wait edge. The Submission itself remains
@@ -588,6 +589,7 @@ type NodeSubmissionSequencer struct {
 	wakeMu           sync.Mutex
 	ownerWakes       atomic.Pointer[nodeSequencerWakeSet]
 	maintenanceOwner atomic.Bool
+	capacityWaiters  atomic.Bool
 	stats            nodeSequencerCounters
 
 	persist func([]NodeReady) error
@@ -772,7 +774,8 @@ func (q *NodeSubmissionSequencer) ReleaseMaintenanceLane() {
 
 // SetWakeFor registers the execution owner of one caller-reserved submission
 // cell. Registration is cold-path and publishes one immutable callback vector;
-// durability completion only performs an atomic load and bounded iteration.
+// ordinary completion loads only that cell's callback. The vector is retained
+// for capacity-pressure and fatal-failure broadcasts.
 // Passing nil removes owner without disturbing any other execution lane.
 func (q *NodeSubmissionSequencer) SetWakeFor(owner *Submission, wake func()) {
 	if q == nil || owner == nil {
@@ -780,6 +783,11 @@ func (q *NodeSubmissionSequencer) SetWakeFor(owner *Submission, wake func()) {
 	}
 	q.wakeMu.Lock()
 	defer q.wakeMu.Unlock()
+	if wake == nil {
+		owner.wake.Store(nil)
+	} else {
+		owner.wake.Store(&nodeSequencerWake{owner: owner, fn: wake})
+	}
 	current := q.ownerWakes.Load()
 	count := 0
 	if current != nil {
@@ -931,6 +939,11 @@ func (q *NodeSubmissionSequencer) rejectSubmission(err error) (uint64, error) {
 	q.stats.rejectedSubmissions.Add(1)
 	if errors.Is(err, ErrSubmissionBackpressure) {
 		q.stats.backpressureSubmissions.Add(1)
+		// A refused cell has no completion of its own. Preserve the capacity
+		// retry edge for every registered owner, including a rejection racing
+		// with the worker's last completion or an idle ring.
+		q.capacityWaiters.Store(true)
+		q.signal()
 	}
 	return 0, err
 }
@@ -1050,6 +1063,7 @@ func submissionGroupSeen(items *[MaxPersistGroupBatches]*Submission, count int, 
 }
 
 func (q *NodeSubmissionSequencer) complete(s *Submission, err error) {
+	wake := s.wake.Load()
 	s.err = err
 	previous := s.state.Swap(submissionComplete)
 	if q.completeHookTest != nil {
@@ -1061,6 +1075,11 @@ func (q *NodeSubmissionSequencer) complete(s *Submission, err error) {
 		// Submission reuse. If completion displaced Queued, Wait observes
 		// Complete directly and no notification is needed.
 		s.done <- struct{}{}
+	}
+	// Capture the callback before publishing completion: the owner can reuse
+	// or unregister this cell as soon as Complete becomes visible.
+	if wake != nil && wake.fn != nil {
+		wake.fn()
 	}
 }
 
@@ -1215,6 +1234,9 @@ func (q *NodeSubmissionSequencer) run() {
 			count++
 		}
 		if count == 0 {
+			if q.capacityWaiters.Swap(false) {
+				q.notifyOwner()
+			}
 			if q.closed.Load() && q.head.value.Load() == q.tail.value.Load() {
 				return
 			}
@@ -1249,7 +1271,9 @@ func (q *NodeSubmissionSequencer) run() {
 			q.complete(items[i], completionErr)
 			items[i] = nil
 		}
-		q.notifyOwner()
+		if q.capacityWaiters.Swap(false) {
+			q.notifyOwner()
+		}
 		if fatal {
 			failure := &sequencerFailure{err: completionErr}
 			q.fatal.CompareAndSwap(nil, failure)
