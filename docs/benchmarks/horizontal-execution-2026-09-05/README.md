@@ -336,3 +336,24 @@ parser to separate empty hint candidates, explicit syncs, and snapshots.
 report, and build identities. Parsed summaries are under `validation/`; archive
 hashes and omitted-file inventories follow the policy above. The parser's three
 focused tests and targeted raftmember tests passed.
+
+## Current assessment status
+
+The latest completed pre-authority comparison is the
+[distributed projected-range campaign](../distributed-projected-ranges-2026-09-05/README.md).
+Its candidate/CRDB medians span 2.14–3.32× for `group_16`, 0.47–0.55× for
+point reads, 0.56–0.92× for ranges, and 0.21–0.84× for `update_existing`.
+The [older matched commit-progress campaign](#shared-node-commit-progress-folding)
+reported 0.35–0.38× candidate/CRDB throughput. The separate
+[prepared-read reuse microbenchmark](../distributed-read-preparation-2026-09-05/README.md)
+measured 15–59% lower bytes per operation from prepared reuse across its five
+local workloads; that is allocation evidence, not a measured final integrated
+throughput gain.
+
+The authority-enabled matrix remains [plan-only](assessment-plan.md). The
+[qualification record](read-authority-fault-qualification.md) retains a strict
+pre-fault `mixed_read_update` failure and an interrupted retry, so it establishes
+no qualification pass, fault-recovery result, or CRDB comparison. All retained
+fixture evidence uses a shared single-host Docker resource ceiling; it does not
+measure independent-machine scaling, peak per-query CPU/RSS, or a final
+performance claim.

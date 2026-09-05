@@ -1,0 +1,135 @@
+{
+  "archives": [
+    {
+      "archive": "archives/authority-smoke-startup-failed.tar.gz",
+      "binary_sha256": {
+        "candidate-vibedb": "f32f377e8cf891f21b7a48f45dde15acf1e62817bcefbdc2bec3edce41e43677",
+        "candidate-vibedb-gateway": "2f5c355b09b871bdd5e8e5ee48af4c1ee0f19cdb4443ad30f8ef7bdc79fe93e3",
+        "candidate-vibedb-shard": "1d26b2a3d0b7f851ade1ab5d7e9d5d71295120ef328250c976cb0a07814f6231",
+        "rf3-sqlbench": "e224a0edc50face31ccb23dac9e12e6227eb69831a7a132712c11af6fa7acc87"
+      },
+      "bytes": 81216,
+      "diagnostic_only": true,
+      "docker_architecture": "arm64",
+      "id": "authority-smoke-startup-failed",
+      "included_files": 99,
+      "omitted_compiled_binary_bytes": 151270485,
+      "omitted_files": 4,
+      "runtime_image": "golang:1.27-bookworm@sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b",
+      "sha256": "15474038a4481be1356ff1ccf5b3f68425e7aea6e251e77bcd390217ec7ce920",
+      "source_dirty": true,
+      "source_evidence_root": "/private/tmp/vibedb-horizontal-authority-smoke-20260905T145118Z",
+      "source_patch_sha256": "9ff963cd832f3dddf9653f4ebc9f12c22046d8fc537d32c5934d8e70c6d28c78",
+      "source_revision": "bcfce760cb420c2f51d2c38f97e93d9e96031964",
+      "status": "incomplete-or-failed",
+      "timed_performance_claim": false,
+      "verification": "archive-provenance.json lists SHA-256 for every included raw file; the provenance file itself is covered by the archive SHA-256"
+    },
+    {
+      "archive": "archives/authority-smoke-success.tar.gz",
+      "binary_sha256": {
+        "candidate-vibedb": "3dfe5cc90ee543e0d8aa81fcb0e88b987bccc539d097fdc028889d272935a2fb",
+        "candidate-vibedb-gateway": "8586cd0f94ce044e942e3ee46625f835b30598a0d14d442c3cd835f363924c5c",
+        "candidate-vibedb-shard": "e2f94cd0dd317f6e5e6c8a184db7a0bd993cb05b2309d518353aaf0f448cd69e",
+        "rf3-sqlbench": "fea75b96b155df163c32c00f602952248c9990dde4331fa77a0497ebf97d0017"
+      },
+      "bytes": 473925,
+      "diagnostic_only": true,
+      "docker_architecture": "arm64",
+      "id": "authority-smoke-success",
+      "included_files": 598,
+      "omitted_compiled_binary_bytes": 151270989,
+      "omitted_files": 4,
+      "runtime_image": "golang:1.27-bookworm@sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b",
+      "sha256": "fdd4ffcf24cce27967db2e5524646d08ad6f3a550b9c53e6ec9b55290e459ccf",
+      "source_dirty": false,
+      "source_evidence_root": "/private/tmp/vibedb-horizontal-authority-smoke-20260905T150902Z",
+      "source_patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "source_revision": "91d1fd119b8c227c5356cd0f4cac9f0937407303",
+      "status": "complete",
+      "timed_performance_claim": false,
+      "verification": "archive-provenance.json lists SHA-256 for every included raw file; the provenance file itself is covered by the archive SHA-256"
+    },
+    {
+      "archive": "archives/authority-runtime-linux-e3b3e53e.tar.gz",
+      "binary_sha256": {
+        "runtime.test": "82de5a651b0ca828e6a517e370b13a6db3786cafef7494d3b05b2f84d9034931"
+      },
+      "bytes": 5073,
+      "diagnostic_only": true,
+      "docker_architecture": "arm64",
+      "id": "authority-runtime-linux-e3b3e53e",
+      "included_files": 4,
+      "omitted_compiled_binary_bytes": 34206744,
+      "omitted_files": 1,
+      "runtime_image": "golang:1.27-bookworm@sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b",
+      "sha256": "f30b65bc8a03abe05f1927b83374afe0b22b6b6f79ae7b2b5ed63a614bfde652",
+      "source_dirty": "not recorded with standalone test binary",
+      "source_evidence_root": "/private/tmp/vibedb-horizontal-authority-runtime-linux-e3b3e53e",
+      "source_patch_sha256": null,
+      "source_revision": "e3b3e53e04a268d6d5a76ffab5fa14366bec255f",
+      "status": "complete test run; diagnostic only",
+      "timed_performance_claim": false,
+      "verification": "archive-provenance.json lists SHA-256 for every included file; the provenance file itself is covered by the archive SHA-256"
+    },
+    {
+      "archive": "archives/authority-fault-long-failed.tar.gz",
+      "binary_sha256": {
+        "candidate-vibedb": "303ae167475a8d6ee360b4798b22de92fcffdabc1abcecac8db78fe80a37448f",
+        "candidate-vibedb-gateway": "76deb96af94f2d186baaad71d39c97feb96afa346ceb9910ecf15cba84ab9187",
+        "candidate-vibedb-shard": "651d3969ec78aad4b9d640f3cbeb628da9d1e504d789967c4a4a478f17cfc860",
+        "rf3-sqlbench": "8f0557bef96e26648a7c6a6ebb3041244b5c820bead492728658b6982150e631"
+      },
+      "bytes": 6326612,
+      "diagnostic_only": true,
+      "docker_architecture": "arm64",
+      "id": "authority-fault-long-failed",
+      "included_files": 603,
+      "omitted_compiled_binary_bytes": 151498653,
+      "omitted_files": 4,
+      "runtime_image": "golang:1.27-bookworm@sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b",
+      "sha256": "310e1e7539867705bd9639852acb9de147cdb29c2a42358099b745f20148e5b1",
+      "source_dirty": true,
+      "source_evidence_root": "/private/tmp/vibedb-horizontal-authority-fault-20260905T173000Z",
+      "source_patch_sha256": "54d9fd02b60f92dd7b44749644f52422d64f33eb6513b1f4f9a8f77f0a8d020b",
+      "source_revision": "e3b3e53e04a268d6d5a76ffab5fa14366bec255f",
+      "status": "incomplete-or-failed",
+      "timed_performance_claim": false,
+      "verification": "archive-provenance.json lists SHA-256 for every included raw file; the provenance file itself is covered by the archive SHA-256"
+    },
+    {
+      "archive": "archives/authority-fault-retry-interrupted.tar.gz",
+      "binary_sha256": {
+        "candidate-vibedb": "303ae167475a8d6ee360b4798b22de92fcffdabc1abcecac8db78fe80a37448f",
+        "candidate-vibedb-gateway": "76deb96af94f2d186baaad71d39c97feb96afa346ceb9910ecf15cba84ab9187",
+        "candidate-vibedb-shard": "651d3969ec78aad4b9d640f3cbeb628da9d1e504d789967c4a4a478f17cfc860",
+        "rf3-sqlbench": "8f0557bef96e26648a7c6a6ebb3041244b5c820bead492728658b6982150e631"
+      },
+      "bytes": 4351723,
+      "diagnostic_only": true,
+      "docker_architecture": "arm64",
+      "id": "authority-fault-retry-interrupted",
+      "included_files": 638,
+      "omitted_compiled_binary_bytes": 151498653,
+      "omitted_files": 4,
+      "runtime_image": "golang:1.27-bookworm@sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b",
+      "sha256": "2f269412d12e13fbe662de16f647b7019f1560b374c309532fe0bd1f2310ee76",
+      "source_dirty": true,
+      "source_evidence_root": "/private/tmp/vibedb-horizontal-authority-fault-20260905T181500Z",
+      "source_patch_sha256": "54d9fd02b60f92dd7b44749644f52422d64f33eb6513b1f4f9a8f77f0a8d020b",
+      "source_revision": "e3b3e53e04a268d6d5a76ffab5fa14366bec255f",
+      "status": "incomplete-or-failed",
+      "timed_performance_claim": false,
+      "verification": "archive-provenance.json lists SHA-256 for every included raw file; the provenance file itself is covered by the archive SHA-256"
+    }
+  ],
+  "exclusions": [
+    "Compiled binaries and runtime.test are omitted from compressed archives; their exact SHA-256 values and build metadata are retained.",
+    "Docker volumes and database/WAL contents are omitted; published diagnostic snapshots, manifests, inventories, reports, logs, diagnostics, source patches, and control commands are retained where present.",
+    "The initial startup smoke explicitly has incomplete source provenance because untracked production Go files were not copied by its recorder."
+  ],
+  "format": "vibedb-authority-qualification-archive-v1",
+  "repository_head_when_archived": "9f509a81ef02283de2eeb66f33f26b9b8ae3a1ae",
+  "runtime_image": "golang:1.27-bookworm@sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b",
+  "status": "diagnostic evidence only; no fault qualification pass and no performance claim"
+}

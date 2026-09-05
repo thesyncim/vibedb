@@ -20,6 +20,19 @@ plan. The runner recorded the same source revision and patch hash
 after each run. The first two runs below predate the final runner provenance
 fix; their raw source records are retained and their limitations are stated.
 
+## Repository archive
+
+Compact repository copies of the initial startup failure, successful short
+smoke, e3 Linux runtime tests, and both long fault attempts are in
+[`qualification/README.md`](qualification/README.md). The archive catalog is
+[`qualification/qualification-manifest.json`](qualification/qualification-manifest.json)
+and its tarball checksums are in [`qualification/SHA256SUMS`](qualification/SHA256SUMS).
+Each archive carries a per-file SHA-256 manifest plus exact source and binary
+provenance. Compiled binaries and Docker volumes are intentionally omitted;
+their hashes and sizes are recorded in the archive provenance. The initial
+startup smoke's missing untracked-source snapshot remains explicitly marked
+as incomplete.
+
 ## Retained runs
 
 `/private/tmp/vibedb-horizontal-authority-smoke-20260905T145118Z` is the failed
