@@ -74,5 +74,17 @@
   "vibedb-horizontal-authority-transport-race.log": {
     "bytes": 246,
     "sha256": "6c533f10a85e2c2d765078e881b3cf4f325f8441690f5b79b7838fa280bdc543"
+  },
+  "vibedb-horizontal-authority-sql-shardservice-linux.log": {
+    "bytes": 172,
+    "sha256": "968db34b25eb7b9a087401141f8a8e3b4404e48e9d45e863ff5c06abad5a8700"
+  },
+  "vibedb-horizontal-authority-sql-shardservice-linux-with-fixtures.log": {
+    "bytes": 172,
+    "sha256": "968db34b25eb7b9a087401141f8a8e3b4404e48e9d45e863ff5c06abad5a8700"
+  },
+  "vibedb-horizontal-authority-sql-shardservice-linux-workdir.log": {
+    "bytes": 5,
+    "sha256": "c26de83abdc9496cd1301470918ec39ecca1cf389ef0ae1c6504da1800d1c431"
   }
 }

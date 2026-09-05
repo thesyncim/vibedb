@@ -808,8 +808,15 @@ func trial(ctx context.Context, c config, workload string, clients, rep, count i
 		return nil
 	}
 	for i := 0; i < c.warmup; i++ {
-		if e := operation(connections[i%clients], i%clients, i); e != nil {
-			return out, fmt.Errorf("%s warmup: %w", workload, e)
+		client := i % clients
+		group := groupFor(c, len(tables), i)
+		if e := operation(connections[client], client, i); e != nil {
+			// Keep the established workload prefix for existing consumers while
+			// retaining the exact first failing warmup location. This is the
+			// boundary needed to correlate a client error with per-group Raft
+			// snapshots collected by the diagnostic sidecar.
+			return out, fmt.Errorf("%s warmup: %w (ordinal=%d client=%d group=%d table=%s operation=%s)",
+				workload, e, i, client, group, tables[group], operationFor(workload, i))
 		}
 	}
 	var beforeCompleted time.Time

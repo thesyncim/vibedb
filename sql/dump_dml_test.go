@@ -112,6 +112,10 @@ func dumpInsert(s *InsertStmt) string {
 		} else {
 			dumpAssignments(&b, s.OnConflictUpdate.Assignments)
 		}
+		if s.OnConflictUpdate.Where != nil {
+			b.WriteString(" where ")
+			dumpExpr(&b, s.OnConflictUpdate.Where)
+		}
 	}
 	if s.Returning != nil {
 		b.WriteString(" returning ")

@@ -285,6 +285,9 @@ type InsertConflictUpdate struct {
 	// Computed right-hand sides carry OperandExpression plus Expr; their paths
 	// use virtual Source 0 for the current row and Source 1 for EXCLUDED.
 	Assignments []UpdateAssignment
+	// Where selects the existing-row branch before evaluating any SET value.
+	// It uses the same current (0) and EXCLUDED (1) namespaces as Expr.
+	Where *Expr
 	// Pos is the byte offset of UPDATE and SetPos is the first assignment.
 	Pos    int
 	SetPos int

@@ -1,11 +1,14 @@
 package driver
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
 
 	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	"github.com/thesyncim/vibedb/query"
 	"github.com/thesyncim/vibedb/store"
 )
 
@@ -26,6 +29,15 @@ func TestReplicatedSchemaManifestSeparatesSourceChildAndLocalIdentities(t *testi
 			digest, err := ReplicatedSchemaManifest(source, placement, indexes)
 			if err != nil {
 				t.Fatal(err)
+			}
+			apply := ReplicatedApplyIdentity{
+				ValidationProfile: uint8(replicatedstate.ValidationDeterministicMutation),
+				ValidationDigest:  replicatedApplyProfileDigest(source, placement),
+				Placement:         placement,
+			}
+			validatedDigest, err := replicatedSchemaManifestValidated(source, apply, indexes)
+			if err != nil || validatedDigest != digest {
+				t.Fatalf("validated helper differs from public manifest: got=%x want=%x err=%v", validatedDigest, digest, err)
 			}
 			if digest == source.RelationManifestDigest {
 				t.Fatal("machine and replica-local SQL domains conflated")
@@ -56,6 +68,14 @@ func TestReplicatedSchemaManifestSeparatesSourceChildAndLocalIdentities(t *testi
 			if err != nil || childDigest == digest || childDigest == child.RelationManifestDigest {
 				t.Fatalf("child serving domain not distinct: %v", err)
 			}
+			childApply := ReplicatedApplyIdentity{
+				ValidationProfile: uint8(replicatedstate.ValidationDeterministicMutation),
+				ValidationDigest:  replicatedApplyProfileDigest(child, placement),
+				Placement:         placement,
+			}
+			if validated, validateErr := replicatedSchemaManifestValidated(child, childApply, indexes); validateErr != nil || validated != childDigest {
+				t.Fatalf("child validated helper differs: got=%x want=%x err=%v", validated, childDigest, validateErr)
+			}
 			logicalSource, err := ReplicatedRelationManifestDigest(source)
 			if err != nil {
 				t.Fatal(err)
@@ -75,6 +95,14 @@ func TestReplicatedSchemaManifestSeparatesSourceChildAndLocalIdentities(t *testi
 			if err != nil || otherDigest != childDigest {
 				t.Fatalf("replica-local identity changed serving schema: %v", err)
 			}
+			otherApply := ReplicatedApplyIdentity{
+				ValidationProfile: uint8(replicatedstate.ValidationDeterministicMutation),
+				ValidationDigest:  replicatedApplyProfileDigest(other, placement),
+				Placement:         placement,
+			}
+			if validated, validateErr := replicatedSchemaManifestValidated(other, otherApply, indexes); validateErr != nil || validated != otherDigest {
+				t.Fatalf("replica-local validated helper differs: got=%x want=%x err=%v", validated, otherDigest, validateErr)
+			}
 			if shape.local {
 				if _, err := ReplicatedSchemaManifest(source, placement, nil); err == nil {
 					t.Fatal("missing exact local indexes accepted")
@@ -82,6 +110,82 @@ func TestReplicatedSchemaManifestSeparatesSourceChildAndLocalIdentities(t *testi
 				if _, err := ReplicatedSchemaManifest(source, placement, []store.IndexDefinition{{Name: "by_email", Paths: []string{"/other"}}}); err == nil {
 					t.Fatal("foreign local index accepted")
 				}
+			}
+		})
+	}
+}
+
+func TestReplicatedSchemaManifestRejectsMalformedAndOversizedIndexes(t *testing.T) {
+	source, _, _ := childSchemaIdentity(t, true, false)
+	placement := testReplicatedApplyOptions().Placement
+	malformed := source
+	malformed.Relations = nil
+	malformed.RelationCount = 0
+	if _, err := ReplicatedSchemaManifest(malformed, placement, nil); err == nil {
+		t.Fatal("malformed relation manifest accepted")
+	}
+	apply := ReplicatedApplyIdentity{
+		ValidationProfile: uint8(replicatedstate.ValidationDeterministicMutation),
+		ValidationDigest:  replicatedApplyProfileDigest(source, placement), Placement: placement,
+	}
+	for _, test := range []struct {
+		name    string
+		indexes []store.IndexDefinition
+	}{
+		{"missing", nil},
+		{"foreign", []store.IndexDefinition{{Name: "by_email", Paths: []string{"/other"}}}},
+		{"malformed", []store.IndexDefinition{{Name: "by_email"}}},
+		{"oversized", make([]store.IndexDefinition, 4097)},
+		{"unique", []store.IndexDefinition{{Name: "by_email", Paths: []string{"/email"}, Unique: true}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, publicErr := ReplicatedSchemaManifest(source, placement, test.indexes)
+			_, helperErr := replicatedSchemaManifestValidated(source, apply, test.indexes)
+			if publicErr == nil || helperErr == nil || publicErr.Error() != helperErr.Error() {
+				t.Fatalf("index rejection differs: public=%v helper=%v", publicErr, helperErr)
+			}
+		})
+	}
+}
+
+func TestReplicatedSchemaManifestPointValidationGuards(t *testing.T) {
+	fixture := newReplicatedPointSessionFixture(t, `{"id":"a","value":10}`)
+	claim, core := fixture.claim, fixture.claim.database
+	base := core.catalog.ReplicatedShardStore
+	for _, test := range []struct {
+		name       string
+		mutate     func()
+		validApply bool
+	}{
+		{"base", func() { base.RelationManifestDigest[0] ^= 1 }, false},
+		{"apply", func() { claim.identity.ValidationDigest[0] ^= 1 }, false},
+		{"placement", func() { claim.identity.Placement.Format++ }, false},
+		{"live manifest", func() {
+			claim.identity.Placement.Range.Start = distribution.KeyspacePoint{1}
+			claim.identity.ValidationDigest = replicatedApplyProfileDigest(*base, claim.identity.Placement)
+		}, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			core.mu.Lock()
+			oldBase, oldApply := base.Clone(), claim.identity
+			test.mutate()
+			validationErr := validateReplicatedApplyIdentity(claim.identity, *base)
+			core.mu.Unlock()
+			defer func() {
+				core.mu.Lock()
+				*base, claim.identity = oldBase, oldApply
+				core.mu.Unlock()
+			}()
+			if test.validApply && validationErr != nil {
+				t.Fatalf("live-manifest test did not preserve valid apply identity: %v", validationErr)
+			}
+			reader, err := claim.NewPointReadSession(context.Background(), 1, fixture.key, true, fixture.raw,
+				[]byte(fixture.base.UserPrimaryKey), query.ExecOptions{})
+			if reader != nil {
+				_ = reader.Close()
+			}
+			if !errors.Is(err, ErrReplicatedApplyMismatch) {
+				t.Fatalf("corrupted %s admitted: %v", test.name, err)
 			}
 		})
 	}

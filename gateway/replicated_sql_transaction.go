@@ -55,15 +55,16 @@ const (
 )
 
 type replicatedSQLBoundStatement struct {
-	prepared         *PreparedPlan
-	bound            *BoundWritePlan
-	profile          ReplicatedTableProfile
-	updateExpression *query.DMLStatement
+	prepared             *PreparedPlan
+	bound                *BoundWritePlan
+	profile              ReplicatedTableProfile
+	assignmentExpression *query.DMLStatement
 	// updateExec is allocated only for computed SET expressions. A plain
 	// full-document UPDATE never touches it, so keeping the ~6KB query.Exec
 	// inline would tax every single-statement write lowering.
-	updateExec   *query.Exec
-	conflictArgs []any
+	updateExec             *query.Exec
+	conflictArgs           []any
+	conflictParameterTypes []query.ParameterType
 }
 
 type replicatedSQLMutationIdentity struct {
@@ -236,8 +237,8 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 			stopExpressionCancel()
 		}
 		for index := range statements {
-			if statements[index].updateExpression != nil {
-				statements[index].updateExpression.Release()
+			if statements[index].assignmentExpression != nil {
+				statements[index].assignmentExpression.Release()
 			}
 		}
 	}()
@@ -280,7 +281,7 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 		}
 		statements[index].prepared = prepared
 		statements[index].bound = bound
-		if prepared.statement.Kind == sqlast.KindInsert && sqldriver.DirectReplicatedConflictAssignments(prepared.statement.Insert.OnConflictUpdate) {
+		if prepared.statement.Kind == sqlast.KindInsert && sqldriver.ReplicatedConflictProgram(prepared.statement.Insert.OnConflictUpdate) {
 			statements[index].conflictArgs = args
 		}
 		if !replicated {
@@ -300,7 +301,7 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 			// lowering without binding INSERT, DELETE or indexed UPDATE twice.
 			preimageMode = replicatedSQLLinearizablePreimage
 		}
-		if hasComputedUpdateAssignments(&prepared.statement) {
+		if hasComputedUpdateAssignments(&prepared.statement) || hasConflictExpressions(&prepared.statement) {
 			parameterTypes, typeErr := postgresQueryParameterTypes(
 				queries[index].ParamTypes, prepared.params,
 			)
@@ -313,19 +314,29 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 			if expressionErr != nil {
 				return nil, true, expressionErr
 			}
-			statements[index].updateExpression = expression
-			if !expression.HasUpdateExpressions() {
+			statements[index].assignmentExpression = expression
+			if expression.HasConflictUpdateExpressions() {
+				statements[index].conflictParameterTypes = parameterTypes
+				expressionErr = expression.ValidateConflictUpdateExpressionBindings(args)
+			} else if expression.HasUpdateExpressions() {
+				expressionErr = expression.ValidateUpdateExpressionBindings(args)
+			} else {
 				return nil, true, ErrReplicatedSQLTransactionUnsupported
 			}
-			if expressionErr = expression.ValidateUpdateExpressionBindings(args); expressionErr != nil {
+			if expressionErr != nil {
 				return nil, true, expressionErr
 			}
 			if ctx != nil && ctx.Done() != nil && stopExpressionCancel == nil {
 				stopExpressionCancel = context.AfterFunc(ctx, expressionCancel.Cancel)
 			}
-			updateExec := &query.Exec{}
-			updateExec.Options.Cancel = &expressionCancel
-			statements[index].updateExec = updateExec
+			// The conflict lane (EncodeReplicatedConflictValue) never takes an
+			// evaluator; only computed UPDATE assignments materialize through
+			// updateExec, so conflict-only statements skip it entirely.
+			if expression.HasUpdateExpressions() {
+				updateExec := &query.Exec{}
+				updateExec.Options.Cancel = &expressionCancel
+				statements[index].updateExec = updateExec
+			}
 		}
 		if prepared.statement.Kind == sqlast.KindInsert && len(prepared.statement.Insert.Columns) != 0 {
 			insert := prepared.statement.Insert
@@ -511,9 +522,9 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 					// presence before schema validation and never publishes this value.
 					document = []byte("{}")
 					missingPartial = true
-				} else if statement.updateExpression != nil {
+				} else if statement.assignmentExpression != nil {
 					document, err = sqldriver.MaterializePreparedUpdateAssignments(
-						statement.updateExpression, statement.updateExec,
+						statement.assignmentExpression, statement.updateExec,
 						oldDocument, statement.bound.updateArgs,
 						int(statement.profile.MaxDocumentBytes),
 					)
@@ -550,7 +561,7 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 
 			indexStart := len(statement.bound.globalIndexes)
 			if kind == replication.MutationPutConflict {
-				document, err = sqldriver.EncodeReplicatedConflictValue(document, statement.prepared.statement.Insert.OnConflictUpdate, statement.conflictArgs)
+				document, err = sqldriver.EncodeReplicatedConflictValue(document, statement.prepared.statement.Insert.OnConflictUpdate, statement.conflictArgs, statement.conflictParameterTypes)
 				if err != nil {
 					return nil, true, err
 				}
@@ -818,12 +829,12 @@ func replicatedSQLMutationInput(
 		kind := replication.MutationPutAbsent
 		if prepared.statement.Insert.OnConflictDoNothing {
 			kind = replication.MutationPutIfAbsent
-		} else if prepared.statement.Insert.OnConflictUpdate.WholeDocument() {
+		} else if action := prepared.statement.Insert.OnConflictUpdate; action.WholeDocument() && action.Where == nil {
 			// Both branches publish exactly the canonical candidate. The native
 			// put validates its schema and physical key at the replicated apply
 			// point and retains one affected row for inserts and replacements.
 			kind = replication.MutationPut
-		} else if sqldriver.DirectReplicatedConflictAssignments(prepared.statement.Insert.OnConflictUpdate) {
+		} else if sqldriver.ReplicatedConflictProgram(prepared.statement.Insert.OnConflictUpdate) {
 			kind = replication.MutationPutConflict
 		}
 		return bound.rowKeys[ordinal][0], document, kind, nil

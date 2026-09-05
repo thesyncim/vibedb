@@ -33,6 +33,18 @@ func ReplicatedSchemaManifest(identity ReplicatedShardStoreIdentity, placement R
 	if err := validateReplicatedPlacementProfile(placement, identity); err != nil {
 		return [32]byte{}, err
 	}
+	apply := ReplicatedApplyIdentity{ValidationProfile: uint8(replicatedstate.ValidationDeterministicMutation),
+		ValidationDigest: replicatedApplyProfileDigest(identity, placement), Placement: placement}
+	return replicatedSchemaManifestValidated(identity, apply, indexes)
+}
+
+// replicatedSchemaManifestValidated builds the serving manifest after the
+// caller has authenticated the shard-store identity and apply profile. It is
+// intentionally private: callers must prove that identity and apply refer to
+// the same live catalog state before using this bounded construction path.
+func replicatedSchemaManifestValidated(identity ReplicatedShardStoreIdentity,
+	apply ReplicatedApplyIdentity, indexes []store.IndexDefinition,
+) ([32]byte, error) {
 	if err := rejectReplicatedLocalUniqueIndexes(indexes); err != nil {
 		return [32]byte{}, err
 	}
@@ -50,8 +62,6 @@ func ReplicatedSchemaManifest(identity ReplicatedShardStoreIdentity, placement R
 	if replicatedLocalIndexDigest(meta) != identity.Relations[0].LocalIndexDigest {
 		return [32]byte{}, ErrReplicatedShardStoreIdentityMismatch
 	}
-	apply := ReplicatedApplyIdentity{ValidationProfile: uint8(replicatedstate.ValidationDeterministicMutation),
-		ValidationDigest: replicatedApplyProfileDigest(identity, placement), Placement: placement}
 	relations, err := replicatedRelationSchemas(identity, apply, indexes)
 	if err != nil {
 		return [32]byte{}, err

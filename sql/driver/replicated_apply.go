@@ -1248,6 +1248,7 @@ func replicatedStateCollectionLimits(limits ReplicatedShardStoreLimits) replicat
 }
 
 type replicatedSQLMutationValidator struct {
+	conflict *replicatedConflictPlan
 	// Machine apply is serial, but detached snapshot audits may share this
 	// validator concurrently. The mutex gives the reusable owned scratch one
 	// caller at a time; request-backed placement Scalars remain stack-local.

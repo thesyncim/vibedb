@@ -1,0 +1,48 @@
+{
+  "scope": "Startup-inclusive diagnostic; no comparative latency claim; regions may nest.",
+  "regions": {
+    "sql.read.admission": {
+      "count": 43424,
+      "median_us": 0.128,
+      "p95_us": 0.192,
+      "p99_us": 0.32
+    },
+    "sql.read.encode": {
+      "count": 43429,
+      "median_us": 0.32,
+      "p95_us": 0.448,
+      "p99_us": 1.088
+    },
+    "sql.read.execute": {
+      "count": 43429,
+      "median_us": 17.792,
+      "p95_us": 33.344,
+      "p99_us": 59.75808000000008
+    },
+    "sql.read.quorum": {
+      "count": 43424,
+      "median_us": 156.4475,
+      "p95_us": 253.8783999999999,
+      "p99_us": 312.0345599999996
+    }
+  },
+  "traces": [
+    {
+      "trace": "multigroup-3n-uniform/profile/candidate/raw/shard-276-1788633883796572627.trace",
+      "counts": {}
+    },
+    {
+      "trace": "multigroup-3n-uniform/profile/candidate/raw/shard-277-1788633883795920502.trace",
+      "counts": {
+        "sql.read.admission": 43424,
+        "sql.read.encode": 43429,
+        "sql.read.execute": 43429,
+        "sql.read.quorum": 43424
+      }
+    },
+    {
+      "trace": "multigroup-3n-uniform/profile/candidate/raw/shard-278-1788633883795918502.trace",
+      "counts": {}
+    }
+  ]
+}
