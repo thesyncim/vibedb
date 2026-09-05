@@ -2078,9 +2078,10 @@ func (v *CompactPrimaryStripeView) CountResolvedIntegerEqual(
 }
 
 // CountResolvedIntegerOrdered evaluates one exact signed-integer ordering
-// over FOR streams after resolving the path once per shape. It is all-or-
-// nothing at stripe granularity: an overflow bitmap, malformed stream, absent
-// target container, or non-FOR target returns ok=false and discards any local
+// over eligible compact streams, including RankAffine, FOR, and validated
+// bare PrefixInt, after resolving the path once per shape. It is all-or-nothing
+// at stripe granularity: an overflow bitmap, malformed stream, absent target
+// container, or unsupported target returns ok=false and discards any local
 // count so the caller can run the authoritative generic executor.
 func (v *CompactPrimaryStripeView) CountResolvedIntegerOrdered(
 	resolver *UnifiedHoleResolver,
@@ -2114,7 +2115,7 @@ func (v *CompactPrimaryStripeView) CountResolvedIntegerOrdered(
 				var supported bool
 				if stream.kind == compactStreamRankAffine {
 					count, supported = v.rankAffineShapeOrdered(stream, shape, needle, op)
-				} else if stream.kind == compactStreamFOR {
+				} else if stream.kind == compactStreamFOR || stream.kind == compactStreamPrefixInt {
 					count, supported = stream.countIntegerOrdered(needle, op)
 				}
 				if !supported {
@@ -2131,7 +2132,7 @@ func (v *CompactPrimaryStripeView) CountResolvedIntegerOrdered(
 
 // CountResolvedIntegerInterval evaluates one normalized signed interval over
 // every resolved compact target stream. It is all-or-nothing at stripe
-// granularity: overflow, malformed data, a container target, or a non-FOR
+// granularity: overflow, malformed data, a container target, or an unsupported
 // target discards the local count and asks the caller to use the generic path.
 func (v *CompactPrimaryStripeView) CountResolvedIntegerInterval(
 	resolver *UnifiedHoleResolver,
@@ -2163,7 +2164,7 @@ func (v *CompactPrimaryStripeView) CountResolvedIntegerInterval(
 				var supported bool
 				if stream.kind == compactStreamRankAffine {
 					count, supported = v.rankAffineShapeInterval(stream, shape, interval)
-				} else if stream.kind == compactStreamFOR {
+				} else if stream.kind == compactStreamFOR || stream.kind == compactStreamPrefixInt {
 					count, supported = stream.countIntegerInterval(interval)
 				}
 				if !supported {
@@ -2178,11 +2179,12 @@ func (v *CompactPrimaryStripeView) CountResolvedIntegerInterval(
 	return matched, true
 }
 
-// CountResolvedIntegerExtrema reduces one resolved path over exact signed
-// integer FOR streams. It resolves the path once per shape and validates the
-// complete target stream before publishing any result. Overflow rows,
-// malformed geometry, non-FOR targets, width-64 lanes, and signed-wrapping
-// FOR spans therefore decline the complete stripe atomically.
+// CountResolvedIntegerExtrema reduces one resolved path over eligible compact
+// streams, including RankAffine, FOR, and validated bare PrefixInt. It
+// resolves the path once per shape and validates the complete target stream
+// before publishing any result. Overflow rows, malformed geometry,
+// unsupported targets, width-64 lanes, and signed-wrapping FOR spans therefore
+// decline the complete stripe atomically.
 func (v *CompactPrimaryStripeView) CountResolvedIntegerExtrema(
 	resolver *UnifiedHoleResolver,
 ) (result UnifiedIntegerExtremaResult, ok bool) {
@@ -2212,7 +2214,7 @@ func (v *CompactPrimaryStripeView) CountResolvedIntegerExtrema(
 				var streamFound, supported bool
 				if stream.kind == compactStreamRankAffine {
 					minimum, maximum, streamFound, supported = v.rankAffineShapeExtrema(stream, shape)
-				} else if stream.kind == compactStreamFOR {
+				} else if stream.kind == compactStreamFOR || stream.kind == compactStreamPrefixInt {
 					minimum, maximum, streamFound, supported = stream.countIntegerExtrema()
 				}
 				if !supported {

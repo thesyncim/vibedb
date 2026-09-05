@@ -405,3 +405,181 @@ func TestCompactPrefixIntegerSpellingArithmeticOverflowFallback(t *testing.T) {
 		t.Fatalf("underflow endpoint count=%d supported=%v want=1,true", got, supported)
 	}
 }
+
+func prefixIntegerOrderedExpected(
+	count int, first, step, needle int64, op UnifiedIntegerOrder,
+) int {
+	matched := 0
+	for row := 0; row < count; row++ {
+		value := first + step*int64(row)
+		match := false
+		switch op {
+		case UnifiedIntegerLess:
+			match = value < needle
+		case UnifiedIntegerLessEqual:
+			match = value <= needle
+		case UnifiedIntegerGreater:
+			match = value > needle
+		case UnifiedIntegerGreaterEqual:
+			match = value >= needle
+		}
+		if match {
+			matched++
+		}
+	}
+	return matched
+}
+
+func TestCompactBarePrefixIntegerOrderedIntervalExtrema(t *testing.T) {
+	fixtures := []struct {
+		name  string
+		count int
+		first int64
+		step  int64
+	}{
+		{name: "empty", count: 0, first: 7, step: math.MinInt64},
+		{name: "singleton-min-step", count: 1, first: math.MaxInt64, step: math.MinInt64},
+		{name: "ascending", count: 64, first: 10, step: 3},
+		{name: "descending", count: 64, first: 199, step: -3},
+		{name: "constant", count: 64, first: 7, step: 0},
+		{name: "maximum-endpoint", count: 64, first: math.MaxInt64 - 63, step: 1},
+	}
+	needles := []int64{math.MinInt64, -1, 0, 1, 7, 10, 100, math.MaxInt64 - 1, math.MaxInt64}
+	intervals := []UnifiedIntegerInterval{
+		{Lower: math.MinInt64, Upper: -1},
+		{Lower: -1, Upper: 0},
+		{Lower: 0, Upper: 1},
+		{Lower: 10, Upper: 100},
+		{Lower: 100, Upper: 10},
+		{Lower: 1, UpperUnbounded: true},
+		{Lower: math.MaxInt64, Upper: math.MaxInt64, UpperUnbounded: true},
+	}
+	for _, fixture := range fixtures {
+		fixture := fixture
+		t.Run(fixture.name, func(t *testing.T) {
+			view := barePrefixIntegerDescriptor(t, fixture.count, fixture.first, fixture.step)
+			for _, needle := range needles {
+				for op := UnifiedIntegerLess; op <= UnifiedIntegerGreaterEqual; op++ {
+					want := prefixIntegerOrderedExpected(
+						fixture.count, fixture.first, fixture.step, needle, op,
+					)
+					got, supported := view.countIntegerOrdered(needle, op)
+					if !supported || got != want {
+						t.Fatalf("needle=%d op=%d got=%d supported=%v want=%d",
+							needle, op, got, supported, want)
+					}
+				}
+			}
+			for _, interval := range intervals {
+				want := 0
+				for row := 0; row < fixture.count; row++ {
+					value := fixture.first + fixture.step*int64(row)
+					if value >= interval.Lower &&
+						(interval.UpperUnbounded || value < interval.Upper) {
+						want++
+					}
+				}
+				got, supported := view.countIntegerInterval(interval)
+				if !supported || got != want {
+					t.Fatalf("interval=%+v got=%d supported=%v want=%d",
+						interval, got, supported, want)
+				}
+			}
+			minimum, maximum := fixture.first, fixture.first
+			if fixture.count == 0 {
+				minimum, maximum = 0, 0
+			}
+			for row := 1; row < fixture.count; row++ {
+				value := fixture.first + fixture.step*int64(row)
+				minimum = min(minimum, value)
+				maximum = max(maximum, value)
+			}
+			gotMin, gotMax, found, supported := view.countIntegerExtrema()
+			if !supported || found != (fixture.count != 0) || gotMin != minimum || gotMax != maximum {
+				t.Fatalf("extrema=(%d,%d,%v,%v) want=(%d,%d,%v,true)",
+					gotMin, gotMax, found, supported, minimum, maximum, fixture.count != 0)
+			}
+		})
+	}
+
+	mode2 := barePrefixIntegerDescriptor(t, 64, 9, 1)
+	mode2.data[1] = 9 // mode 2 ignores the historical width byte.
+	if got, supported := mode2.countIntegerOrdered(42, UnifiedIntegerOrder(99)); supported || got != 0 {
+		t.Fatalf("invalid op result=%d supported=%v", got, supported)
+	}
+	if got, supported := mode2.countIntegerOrdered(42, UnifiedIntegerGreaterEqual); !supported || got != 31 {
+		t.Fatalf("mode2 width ordered count=%d supported=%v", got, supported)
+	}
+	if got, supported := mode2.countIntegerInterval(UnifiedIntegerInterval{Lower: 42, Upper: 43}); !supported || got != 1 {
+		t.Fatalf("mode2 width interval count=%d supported=%v", got, supported)
+	}
+	if gotMin, gotMax, found, supported := mode2.countIntegerExtrema(); !supported || !found || gotMin != 9 || gotMax != 72 {
+		t.Fatalf("mode2 width extrema=(%d,%d,%v,%v)", gotMin, gotMax, found, supported)
+	}
+
+	inactive := prefixIntegerSpellingValues(64, 100, 1, "", "", 3)
+	encoded, ok := encodeCompactPrefixInt(inactive)
+	if !ok {
+		t.Fatal("inactive-padding fixture rejected")
+	}
+	inactiveView := compactCodecRoundTrip(t, encoded, inactive)
+	if inactiveView.data[0] != 3 {
+		t.Fatalf("inactive-padding flags=%d want mode3", inactiveView.data[0])
+	}
+	if got, supported := inactiveView.countIntegerOrdered(130, UnifiedIntegerGreaterEqual); !supported || got != 34 {
+		t.Fatalf("inactive-padding ordered count=%d supported=%v", got, supported)
+	}
+	if gotMin, gotMax, found, supported := inactiveView.countIntegerExtrema(); !supported || !found || gotMin != 100 || gotMax != 163 {
+		t.Fatalf("inactive-padding extrema=(%d,%d,%v,%v)", gotMin, gotMax, found, supported)
+	}
+}
+
+func TestCompactPrefixIntegerOrderedIntervalExtremaDeclines(t *testing.T) {
+	active := prefixIntegerSpellingValues(64, 1, 1, "", "", 3)
+	encoded, ok := encodeCompactPrefixInt(active)
+	if !ok {
+		t.Fatal("active-padding fixture rejected")
+	}
+	activeView := compactCodecRoundTrip(t, encoded, active)
+	affixed := prefixIntegerSpellingValues(64, 100, 1, "id:", ":end", 0)
+	encoded, ok = encodeCompactPrefixInt(affixed)
+	if !ok {
+		t.Fatal("affixed fixture rejected")
+	}
+	affixedView := compactCodecRoundTrip(t, encoded, affixed)
+	overflow := barePrefixIntegerDescriptor(t, 64, math.MaxInt64, 1)
+	for _, test := range []struct {
+		name string
+		view compactStreamView
+	}{
+		{name: "active-padding", view: activeView},
+		{name: "affixed", view: affixedView},
+		{name: "overflow", view: overflow},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got, supported := test.view.countIntegerOrdered(100, UnifiedIntegerGreaterEqual); supported || got != 0 {
+				t.Fatalf("ordered count=%d supported=%v", got, supported)
+			}
+			if got, supported := test.view.countIntegerInterval(
+				UnifiedIntegerInterval{Lower: 1, Upper: 2},
+			); supported || got != 0 {
+				t.Fatalf("interval count=%d supported=%v", got, supported)
+			}
+			if minimum, maximum, found, supported := test.view.countIntegerExtrema(); supported || found || minimum != 0 || maximum != 0 {
+				t.Fatalf("extrema=(%d,%d,%v,%v)", minimum, maximum, found, supported)
+			}
+		})
+	}
+
+	malformed := barePrefixIntegerDescriptor(t, 0, 7, 0)
+	malformed.data = malformed.data[:17]
+	if got, supported := malformed.countIntegerOrdered(0, UnifiedIntegerGreaterEqual); supported || got != 0 {
+		t.Fatalf("malformed empty ordered count=%d supported=%v", got, supported)
+	}
+	if got, supported := malformed.countIntegerInterval(UnifiedIntegerInterval{Lower: 0, Upper: 1}); supported || got != 0 {
+		t.Fatalf("malformed empty interval count=%d supported=%v", got, supported)
+	}
+	if minimum, maximum, found, supported := malformed.countIntegerExtrema(); supported || found || minimum != 0 || maximum != 0 {
+		t.Fatalf("malformed empty extrema=(%d,%d,%v,%v)", minimum, maximum, found, supported)
+	}
+}

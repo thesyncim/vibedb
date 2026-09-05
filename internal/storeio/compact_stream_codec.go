@@ -2070,14 +2070,84 @@ func (v compactStreamView) countIntegerLess(needle int64) (matched int, supporte
 	return countCompactPackedLess(v.data[8:], v.count, int(v.width), delta), true
 }
 
-// countIntegerOrdered derives every ordered predicate from the one exclusive
-// less-than scan. The boundary checks avoid overflowing MinInt64/MaxInt64 and
-// complements are taken only after a complete exact scan.
+func prefixIntegerOrderedMatch(
+	first, step int64, row int, needle int64, op UnifiedIntegerOrder,
+) bool {
+	value := first + step*int64(row)
+	switch op {
+	case UnifiedIntegerLess:
+		return value < needle
+	case UnifiedIntegerLessEqual:
+		return value <= needle
+	case UnifiedIntegerGreater:
+		return value > needle
+	default:
+		return value >= needle
+	}
+}
+
+// countPrefixIntegerOrdered uses the checked arithmetic descriptor to find
+// the one predicate boundary over ordinary shape ordinals. The domain proof
+// makes the sequence monotone and keeps every endpoint/interior value inside
+// the nonnegative signed range, so the binary search needs no signed division
+// or ceiling arithmetic.
+func countPrefixIntegerOrdered(
+	first, step int64, count int, needle int64, op UnifiedIntegerOrder,
+) int {
+	if count <= 0 {
+		return 0
+	}
+	if step == 0 {
+		if prefixIntegerOrderedMatch(first, 0, 0, needle, op) {
+			return count
+		}
+		return 0
+	}
+	firstMatch := prefixIntegerOrderedMatch(first, step, 0, needle, op)
+	lastMatch := prefixIntegerOrderedMatch(first, step, count-1, needle, op)
+	if firstMatch == lastMatch {
+		if firstMatch {
+			return count
+		}
+		return 0
+	}
+	lo, hi := 0, count
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if prefixIntegerOrderedMatch(first, step, mid, needle, op) == firstMatch {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	if firstMatch {
+		return lo
+	}
+	return count - lo
+}
+
+func (v compactStreamView) countPrefixIntegerOrdered(
+	needle int64, op UnifiedIntegerOrder,
+) (matched int, supported bool) {
+	first, step, supported := v.barePrefixIntegerArithmetic()
+	if !supported {
+		return 0, false
+	}
+	return countPrefixIntegerOrdered(first, step, v.count, needle, op), true
+}
+
+// countIntegerOrdered uses the exact less-than scan for FOR streams and a
+// checked monotone ordinal boundary for bare PrefixInt streams. The FOR
+// boundary checks avoid overflowing MinInt64/MaxInt64; complements are taken
+// only after a complete exact scan.
 func (v compactStreamView) countIntegerOrdered(
 	needle int64, op UnifiedIntegerOrder,
 ) (matched int, supported bool) {
 	if !validUnifiedIntegerOrder(op) {
 		return 0, false
+	}
+	if v.kind == compactStreamPrefixInt {
+		return v.countPrefixIntegerOrdered(needle, op)
 	}
 	const maxInt64Value = int64(1<<63 - 1)
 	switch op {
@@ -2116,6 +2186,25 @@ func (v compactStreamView) countIntegerOrdered(
 func (v compactStreamView) countIntegerInterval(
 	interval UnifiedIntegerInterval,
 ) (matched int, supported bool) {
+	if v.kind == compactStreamPrefixInt {
+		first, step, supported := v.barePrefixIntegerArithmetic()
+		if !supported {
+			return 0, false
+		}
+		if v.count == 0 || !interval.UpperUnbounded && interval.Upper <= interval.Lower {
+			return 0, true
+		}
+		matched = countPrefixIntegerOrdered(
+			first, step, v.count, interval.Lower, UnifiedIntegerGreaterEqual,
+		)
+		if interval.UpperUnbounded {
+			return matched, true
+		}
+		upper := countPrefixIntegerOrdered(
+			first, step, v.count, interval.Upper, UnifiedIntegerGreaterEqual,
+		)
+		return matched - upper, true
+	}
 	if !v.validIntegerFORData() {
 		return 0, false
 	}

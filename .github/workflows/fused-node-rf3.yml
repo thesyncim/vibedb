@@ -166,6 +166,8 @@ jobs:
             cp "${build}/base-durable.test" "${diagnostic_build}/original-base-durable.test"
             cp "${build}/candidate-query.test" "${diagnostic_build}/original-candidate-query.test"
             cp "${build}/base-query.test" "${diagnostic_build}/original-base-query.test"
+            cp "${build}/candidate-storeio.test" "${diagnostic_build}/original-candidate-storeio.test"
+            cp "${build}/base-storeio.test" "${diagnostic_build}/original-base-storeio.test"
             cd "${repo}"
             git worktree add --detach "${diagnostics}/stabilized-candidate" "${candidate}"
             git worktree add --detach "${diagnostics}/stabilized-base" "${base}"
@@ -298,25 +300,32 @@ jobs:
           diagnostics="${RUNNER_TEMP}/format-diagnostics"
           build="${diagnostics}/build"
           profiles="${diagnostics}/profiles"
+          repo="${GITHUB_WORKSPACE}"
           mkdir -p "${profiles}"
+          storeio_bench_source="${repo}/internal/storeio/compact_rank_format_bench_test.go"
+          query_bench_source="${repo}/query/rank_affine_format_bench_test.go"
+          test -f "${storeio_bench_source}"
+          test -f "${query_bench_source}"
+          grep -Fq 'for _, name := range []string{"low", "high", "late-miss", "negative", "unrelated", "single"} {' "${storeio_bench_source}"
+          grep -Fq 'name: "rank-affine-sparse"' "${query_bench_source}"
+          grep -Fq 'name: "projection-mixed"' "${query_bench_source}"
+          sha256sum "${storeio_bench_source}" "${query_bench_source}" \
+            > "${profiles}/profile-source-sha256.txt"
           run_profile() {
             local arm="$1"
-            local suite="$2"
-            local pattern="$3"
+            local label="$2"
+            local suite="$3"
+            local pattern="$4"
+            local expected="$5"
             local binary="${build}/original-${arm}-${suite}.test"
-            local profile="${profiles}/${arm}-${suite}.pprof"
-            local log="${profiles}/${arm}-${suite}.log"
-            local expected
-            if [[ "${suite}" == query ]]; then
-              expected='^BenchmarkRankAffineQueryFormat/ordinary-fixed-shape/numeric-eq(-[0-9]+)?[[:space:]]'
-            else
-              expected='^BenchmarkFileStoreBatchWrite/update/batch=100(-[0-9]+)?[[:space:]]'
-            fi
+            local profile="${profiles}/${arm}-${label}.pprof"
+            local log="${profiles}/${arm}-${label}.log"
             local command=("${binary}" -test.run='^$' "-test.bench=${pattern}" \
               -test.benchtime=5s -test.count=1 -test.cpu=1 -test.timeout=15m \
               "-test.cpuprofile=${profile}")
             {
-              printf 'arm=%s suite=%s pattern=%s\n' "${arm}" "${suite}" "${pattern}"
+              printf 'arm=%s label=%s suite=%s pattern=%s expected=%s\n' \
+                "${arm}" "${label}" "${suite}" "${pattern}" "${expected}"
               printf 'binary_sha256='; sha256sum "${binary}"
               printf 'command='; printf '%q ' "${command[@]}"; printf '\n'
               if [[ "${suite}" == query && "${arm}" == candidate ]]; then
@@ -325,11 +334,25 @@ jobs:
                 env -u VIBEDB_EXPECT_RANK_AFFINE_QUERY GOMAXPROCS=1 "${command[@]}"
               fi
             } > "${log}" 2>&1
+            test -s "${profile}"
             test "$(grep -Ec "${expected}" "${log}")" -eq 1
           }
           for arm in base candidate; do
-            run_profile "${arm}" query '^BenchmarkRankAffineQueryFormat$/ordinary-fixed-shape/numeric-eq$'
-            run_profile "${arm}" durable '^BenchmarkFileStoreBatchWrite$/update/batch=100$'
+            run_profile "${arm}" query-ordinary-numeric-eq query \
+              '^BenchmarkRankAffineQueryFormat$/ordinary-fixed-shape/numeric-eq$' \
+              '^BenchmarkRankAffineQueryFormat/ordinary-fixed-shape/numeric-eq(-[0-9]+)?[[:space:]]'
+            run_profile "${arm}" durable-update-batch100 durable \
+              '^BenchmarkFileStoreBatchWrite$/update/batch=100$' \
+              '^BenchmarkFileStoreBatchWrite/update/batch=100(-[0-9]+)?[[:space:]]'
+            run_profile "${arm}" storeio-single-point storeio \
+              '^BenchmarkCompactRankFormat$/single/Point$' \
+              '^BenchmarkCompactRankFormat/single/Point(-[0-9]+)?[[:space:]]'
+            run_profile "${arm}" storeio-unrelated-point storeio \
+              '^BenchmarkCompactRankFormat$/unrelated/Point$' \
+              '^BenchmarkCompactRankFormat/unrelated/Point(-[0-9]+)?[[:space:]]'
+            run_profile "${arm}" query-sparse-projection-mixed query \
+              '^BenchmarkRankAffineQueryFormat$/rank-affine-sparse/projection-mixed$' \
+              '^BenchmarkRankAffineQueryFormat/rank-affine-sparse/projection-mixed(-[0-9]+)?[[:space:]]'
           done
           for arm in base candidate; do
             binary="${build}/original-${arm}-query.test"
@@ -348,7 +371,20 @@ jobs:
           {
             printf 'candidate_revision='; cat "${diagnostics}/candidate-revision.txt"
             printf 'base_revision='; cat "${diagnostics}/base-revision.txt"
-            printf 'patterns=^BenchmarkRankAffineQueryFormat$/ordinary-fixed-shape/numeric-eq$,^BenchmarkFileStoreBatchWrite$/update/batch=100$\n'
+            printf 'profile_cpu=1\nprofile_gomaxprocs=1\nprofile_benchtime=5s\n'
+            printf 'profile_labels= query-ordinary-numeric-eq durable-update-batch100 storeio-single-point storeio-unrelated-point query-sparse-projection-mixed\n'
+            printf '%s\n' \
+              'pattern.query-ordinary-numeric-eq=^BenchmarkRankAffineQueryFormat$/ordinary-fixed-shape/numeric-eq$' \
+              'pattern.durable-update-batch100=^BenchmarkFileStoreBatchWrite$/update/batch=100$' \
+              'pattern.storeio-single-point=^BenchmarkCompactRankFormat$/single/Point$' \
+              'pattern.storeio-unrelated-point=^BenchmarkCompactRankFormat$/unrelated/Point$' \
+              'pattern.query-sparse-projection-mixed=^BenchmarkRankAffineQueryFormat$/rank-affine-sparse/projection-mixed$'
+            printf 'profile_source_files=%s,%s\n' "${storeio_bench_source}" "${query_bench_source}"
+            cat "${profiles}/profile-source-sha256.txt"
+            for log in "${profiles}"/*.log; do
+              printf 'log=%s\n' "${log##*/}"
+              grep '^command=' "${log}"
+            done
             cat "${diagnostics}/binary-sha256.txt"
           } > "${profiles}/metadata.txt"
       - uses: actions/upload-artifact@v4

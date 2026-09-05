@@ -459,6 +459,20 @@ func assertRankAffineQueryBenchNative(
 		return
 	}
 	if !fixture.sparse {
+		switch name {
+		case "ordered-half", "interval-middle":
+			if stats.Workers != 1 || stats.RowsTotal != rows ||
+				stats.RowsScanned != rows || stats.TokenFilterRows != rows ||
+				stats.TokenFilterFallbackRows != 0 || stats.Batches != 0 {
+				tb.Fatalf("ordinary %s query did not use native token lane: %+v", name, stats)
+			}
+		case "min-max":
+			if stats.Workers != 1 || stats.RowsTotal != rows ||
+				stats.RowsScanned != rows || stats.CoveringColumns != 1 ||
+				stats.Batches != 0 {
+				tb.Fatalf("ordinary extrema query did not use native covering lane: %+v", stats)
+			}
+		}
 		return
 	}
 	switch name {
@@ -497,6 +511,67 @@ func assertRankAffineQueryBenchDiskProof(tb testing.TB, fixture rankAffineQueryB
 			fixture.disk.scoreRankLeaves != fixture.disk.primaryLeaves ||
 			fixture.disk.nameRankLeaves != fixture.disk.primaryLeaves) {
 		tb.Fatalf("sparse fixture has no persisted score/name rank-domain proof: %+v", fixture.disk)
+	}
+}
+
+func TestRankAffineQueryOrdinaryDecimalHeapOracle(t *testing.T) {
+	fixture := rankAffineQueryBenchSnapshot(t, false)
+	const rows = uint64(rankAffineQueryBenchRows)
+	cases := []struct {
+		name          string
+		query         *Query
+		wantTokenRows uint64
+	}{
+		{
+			name: "fractional-ordered",
+			query: Select(Count()).Where(
+				Cmp("score", Lt, Number("10000.5")),
+			),
+		},
+		{
+			name: "fractional-interval",
+			query: Select(Count()).Where(And(
+				Cmp("score", Ge, Number("10000.5")),
+				Cmp("score", Lt, Number("10014.5")),
+			)),
+		},
+		{
+			name:          "negative-zero-ordered",
+			query:         Select(Count()).Where(Cmp("score", Ge, Number("-0"))),
+			wantTokenRows: rows,
+		},
+		{
+			name: "negative-zero-interval",
+			query: Select(Count()).Where(And(
+				Cmp("score", Ge, Number("-0")),
+				Cmp("score", Lt, Number("10007")),
+			)),
+			wantTokenRows: rows,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			oracle := Exec{Options: ExecOptions{Workers: 1}}
+			defer oracle.Release()
+			if err := tc.query.RunInto(&oracle, FromSnapshot(fixture.heap)); err != nil {
+				t.Fatalf("heap oracle: %v", err)
+			}
+			file := Exec{Options: ExecOptions{Workers: 1}}
+			defer file.Release()
+			if err := tc.query.RunInto(&file, FromFile(fixture.snapshot)); err != nil {
+				t.Fatalf("file query: %v", err)
+			}
+			if got, want := resultKey(file.Result), resultKey(oracle.Result); got != want {
+				t.Fatalf("file result differs from heap oracle: got %d bytes, want %d bytes", len(got), len(want))
+			}
+			stats := file.Stats
+			if stats.Workers != 1 || stats.RowsTotal != rows || stats.RowsScanned != rows ||
+				stats.TokenFilterRows != tc.wantTokenRows ||
+				stats.TokenFilterFallbackRows != 0 ||
+				tc.wantTokenRows != 0 && stats.Batches != 0 {
+				t.Fatalf("predicate stats=%+v want token rows=%d", stats, tc.wantTokenRows)
+			}
+		})
 	}
 }
 
