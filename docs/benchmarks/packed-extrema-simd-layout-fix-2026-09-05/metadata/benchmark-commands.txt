@@ -1,0 +1,11 @@
+Environment for every command: GOMAXPROCS=1
+Paired storeio lane:
+GOTOOLCHAIN=go1.27.0 GOEXPERIMENT=simd <binary> -test.run '^$' -test.bench '^BenchmarkCompactPrimaryStripePackedEquality8$' -test.benchtime 2s -test.count 1 -test.benchmem
+Paired query lane (baseline):
+GOTOOLCHAIN=go1.27.0 GOEXPERIMENT=simd VIBEDB_EXPECT_ORDERED=0 <binary> -test.run '^$' -test.bench '^BenchmarkFilePackedOrderedCountWide/sparse/lt$' -test.benchtime 2s -test.count 1 -test.benchmem
+Paired query lane (fixed candidate):
+GOTOOLCHAIN=go1.27.0 GOEXPERIMENT=simd VIBEDB_EXPECT_ORDERED=1 <binary> -test.run '^$' -test.bench '^BenchmarkFilePackedOrderedCountWide/sparse/lt$' -test.benchtime 2s -test.count 1 -test.benchmem
+Extrema SIMD control:
+GOTOOLCHAIN=go1.27.0 GOEXPERIMENT=simd VIBEDB_EXPECT_EXTREMA=1 <binary> -test.run '^$' -test.bench '^BenchmarkFilePackedIntegerExtremaCount(Wide)?/min-max/(FOR10|FOR16)$' -test.benchtime 250ms -test.count 1 -test.benchmem
+Extrema nosimd control:
+GOTOOLCHAIN=go1.27.0 GOEXPERIMENT=nosimd VIBEDB_EXPECT_EXTREMA=1 <binary> -test.run '^$' -test.bench '^BenchmarkFilePackedIntegerExtremaCount(Wide)?/min-max/(FOR10|FOR16)$' -test.benchtime 250ms -test.count 1 -test.benchmem

@@ -49,6 +49,7 @@ type rf3SplitServingOptions struct {
 	owners        *raftservice.ExecutionOwners
 	registrar     splitcontroller.ExecutionGroupRegistrar
 	profile       *rafttransport.PeerTLS
+	registry      *rafttransport.StaticRegistry
 	// topologyProfile supplies native topology sessions with the independent
 	// frontend principal in a fused node. Storage identity remains unchanged
 	// for exact physical-node admission and split data-transfer grants.
@@ -70,7 +71,7 @@ func newRF3SplitServingRuntime(options rf3SplitServingOptions) (*rf3SplitServing
 	}
 	observation, err := newRF3SplitObservationRuntime(
 		options.prepared, options.identities, options.commands, options.owners,
-		options.policy, options.deadline, maxOperations,
+		options.registry, options.policy, options.deadline, maxOperations,
 	)
 	if err != nil {
 		return nil, err

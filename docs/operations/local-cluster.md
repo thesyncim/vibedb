@@ -1,63 +1,87 @@
-# Local RF3 cluster
+# Run a local RF3 cluster
 
-> [!CAUTION]
-> **Development and qualification only.** VibeDB is under active development.
-> Commands, manifests, wire and disk formats, and persisted state may break at
-> any commit. This workflow is not a production deployment and provides no
-> upgrade or support contract.
+[Documentation](../README.md) / [Operations](README.md) / Local cluster
 
-This page starts the smallest useful distributed VibeDB environment: three replicas each for the catalog, request ledger, and data group, plus one gateway and its loopback PostgreSQL endpoint. The command creates disposable local PKI and authority material for you. Do not hand-write manifests for this tutorial.
+Start three physical serving nodes, connect with psql, and verify a write
+survives a clean restart. Each node combines a SQL frontend, Raft replicas,
+and shared node storage. The launcher creates local credentials and manifests.
+
+This is a Linux development environment with loopback SQL trust authentication.
+Use the same build to reopen its data; see [compatibility](../status.md).
 
 ## Prerequisites
 
-- Go 1.27, as declared by `go.mod`
-- a local checkout of this repository
-- `psql` if you want to run the SQL examples
-- a free loopback TCP port; this page uses `127.0.0.1:7432`
+- A Linux host or Linux VM/container with a filesystem that supports strict
+  allocation for sealed recovery journals. Use a suitable Linux data volume
+  in a container; an overlay filesystem can reject the required allocation.
+  Native macOS cannot prepare this RF3 profile.
+- Go 1.27 or later and a repository checkout.
+- `psql` for the SQL steps.
+- A short, absolute path for disposable state, with space for node files.
+- Free loopback port `7432` for the SQL listener.
 
-Run all commands from the repository root.
+Run the build and launcher commands from the repository root.
 
-## Build the three processes
+## 1. Build the launcher and servers
 
-The launcher resolves `vibedb-shard` and `vibedb-gateway` beside its own executable, so keep these binaries together:
+Keep the binaries together: the launcher resolves companion executables beside
+itself, then on `PATH`.
 
-```bash
+```sh
 mkdir -p ./bin
 GOEXPERIMENT=simd go build -o ./bin/vibedb ./cmd/vibedb
 GOEXPERIMENT=simd go build -o ./bin/vibedb-shard ./cmd/vibedb-shard
 GOEXPERIMENT=simd go build -o ./bin/vibedb-gateway ./cmd/vibedb-gateway
 ```
 
-These Go 1.27 builds enable the JSON SIMD kernels on arm64 and supported amd64
-CPUs. The amd64 build keeps runtime CPU fallback. Use `GOEXPERIMENT=nosimd`
-for a portable build of all three processes.
+Use `GOEXPERIMENT=nosimd` in all three commands for a portable build. See
+[SIMD](../simd.md) for CPU support and fallback behavior.
 
-## Start RF3 with PostgreSQL
+## 2. Start the cluster
 
-The root must be a clean absolute path. It may be absent or empty on the first run.
+Choose an absent or empty root on first start. This example uses `/tmp` for
+disposable state; files there may be removed by the operating system. Confirm
+that this path is on a supported filesystem. In a container, mount the Linux
+data volume at this path before starting.
 
-```bash
+```sh
 ./bin/vibedb cluster dev \
   --replicas 3 \
-  --root "$PWD/.vibedb-dev" \
+  --physical-nodes 3 \
+  --root /tmp/vibedb-dev \
   --pg-listen 127.0.0.1:7432
 ```
 
-Wait for:
+Wait for the readiness line:
 
 ```text
-VibeDB development cluster ready: <gateway-address>
+VibeDB development RF3 physical cluster ready: <gateway-address> (3 nodes)
 ```
 
-The launcher has now started nine shard processes and one gateway. The PostgreSQL endpoint is intentionally limited to loopback, trust authentication, user `local`, database `vibedb`, and no TLS.
+There are three serving processes plus the supervisor. Catalog, request-ledger,
+and initial data groups each have three replicas. `--pg-listen` assigns the
+first node's SQL endpoint; the other nodes keep SQL disabled. SQL uses user
+`local`, database `vibedb`, trust authentication, and no TLS. Internal service
+traffic uses the generated identities and TLS.
 
-Connect from another terminal:
+To choose every SQL endpoint explicitly, replace `--pg-listen` with:
 
-```bash
+```text
+--pg-listens 127.0.0.1:7432,127.0.0.1:7532,127.0.0.1:7632
+```
+
+The list must contain one distinct literal-loopback endpoint per physical
+node. The two listener flags are mutually exclusive.
+
+## 3. Write and read a row
+
+From another terminal:
+
+```sh
 psql 'postgresql://local@127.0.0.1:7432/vibedb?sslmode=disable'
 ```
 
-Create a table, write one row, and read it back:
+In psql:
 
 ```sql
 CREATE TABLE employees (
@@ -70,51 +94,61 @@ CREATE TABLE employees (
 );
 
 INSERT INTO employees (id, name, team, city, score, active)
-VALUES ('employee-0001', 'Employee 1', 'Platform', 'Lisbon', 1, true);
+VALUES ('employee-0001', 'Ada', 'Platform', 'Lisbon', 1, true);
 
 SELECT id, name, team, city, score, active
 FROM employees
 WHERE id = 'employee-0001';
 ```
 
-Online `CREATE TABLE` provisions an additional replicated group on the same three data processes. Development table names must be lower-case identifiers, each declaration must have one primary key, and the launcher retains at most 63 additional tables.
+Expect one row with ID `employee-0001` and score `1`. Online `CREATE TABLE`
+provisions a replicated group on the existing physical nodes. Development
+tables require lower-case identifiers and one primary key. See the
+[SQL reference](../reference/sql.md) for supported statements.
 
-## Stop and restart
+## 4. Stop and verify a restart
 
-Press `Ctrl-C` in the launcher terminal. The supervisor asks children to stop in reverse order, waits up to ten seconds, and then kills any process that remains.
+Exit psql with `\q`, then press `Ctrl-C` in the launcher terminal. The supervisor
+stops its children, waits up to ten seconds, and kills any that remain.
 
-Run the same start command to reopen the cluster. The topology count must match the retained `cluster.vibejson`; switching an existing root between RF1 and RF3 is rejected. A root with unrelated or noncanonical contents is also rejected.
+Run the same launcher command with the same build and root. After readiness,
+reconnect and run only the `SELECT` from step 3. The row should still be present.
+Do not repeat the `CREATE TABLE` or `INSERT` to test persistence.
 
-Add `--diagnostics-on-exit` when debugging. It prints a bounded tail from each child after shutdown.
+The retained `cluster.vibejson` records the topology. Changing replication
+factor, physical-node count, or retained frontend configuration is not a
+restart operation. The current launcher uses manifest format 2 and rejects
+older development layouts.
 
-## RF1 is different
+For startup or shutdown failures, add `--diagnostics-on-exit` to print bounded
+child-log tails, then follow [troubleshooting](troubleshooting.md).
 
-For a faster failure-free development loop:
+## Other development topologies
 
-```bash
-./bin/vibedb cluster dev \
-  --replicas 1 \
-  --root "$PWD/.vibedb-rf1"
-```
+| Configuration | Serving layout | SQL |
+| --- | --- | --- |
+| `--replicas 3 --physical-nodes 3` | Three nodes, each hosting catalog, ledger, and data replicas. | One native frontend per node; SQL listeners are optional. |
+| `--replicas 3 --physical-nodes 6` | Six nodes; each group still has three replicas, with placement spread across subsets. | One native frontend per node; SQL listeners are optional. |
+| `--replicas 1` | Three independent single-member Raft groups; no HA. | No gateway or SQL listener. |
 
-RF1 starts three independent single-member Raft groups. It has no gateway, accepts no `--pg-listen`, and provides no replication or high availability. Its readiness line explicitly reports `development RF1 ready (no HA)`.
+Use a fresh root for each topology. RF1 rejects physical-node and PostgreSQL
+listener flags. Six local processes share one host and therefore do not
+establish resilience to host loss or multi-machine scaling.
 
-## What this command does not provide
+## Next steps
 
-- production PKI, secret rotation, or user authentication
-- mixed-version or rolling-upgrade compatibility
-- backups, monitoring, capacity planning, or failure-domain placement
-- a stable network, manifest, or disk-format contract
-- a production PostgreSQL service
-
-Use the [CLI reference](../reference/cli.md) for the complete launcher surface. The Kubernetes path is a [qualification lane](kubernetes.md), not a deployment guide.
+- [Observe node and gateway activity](observability.md).
+- [Understand routing, quorum, and retries](distributed.md).
+- [Look up launcher flags](../reference/cli.md#cluster-dev).
+- [Run the separate Kind qualification topology](kubernetes.md).
 
 ## Source map
 
 | Behavior | Source |
 | --- | --- |
-| launcher flags, root validation, RF1/RF3 topology, lifecycle | `cmd/vibedb/cluster_dev.go` |
-| retained table groups | `cmd/vibedb/cluster_dev_tables.go` |
-| online development DDL supervisor | `cmd/vibedb/cluster_dev_ddl.go` |
-| pgwire identity and resource bounds | `cmd/vibedb-gateway/pgwire.go` |
-| end-to-end online DDL and restart test | `cmd/vibedb-gateway/pgwire_ddl_process_test.go` |
+| Flags, root validation, lifecycle | [cluster_dev.go](../../cmd/vibedb/cluster_dev.go) |
+| Node placement and SQL ports | [cluster_dev_physical.go](../../cmd/vibedb/cluster_dev_physical.go), [port tests](../../cmd/vibedb/cluster_dev_ports_test.go) |
+| Node preparation | [cluster_dev_node.go](../../cmd/vibedb/cluster_dev_node.go) |
+| Online table placement | [cluster_dev_physical_tables.go](../../cmd/vibedb/cluster_dev_physical_tables.go) |
+| Frontend composition | [serve_node.go](../../cmd/vibedb-shard/serve_node.go) |
+| Online DDL and restart | [pgwire_ddl_process_test.go](../../internal/gatewayruntime/pgwire_ddl_process_test.go) |

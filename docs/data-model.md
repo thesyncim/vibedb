@@ -1,13 +1,10 @@
 # Data model
 
+[Documentation](README.md) / [Design](design/README.md) · [Development status](status.md)
+
 VibeDB stores keyed JSON values in named collections. This page defines the
 application-visible model of the root `vibedb` package and calls out the places
 where the two low-level storage packages deliberately differ.
-
-> [!CAUTION]
-> VibeDB is unreleased development software. Pin one exact Git commit: APIs,
-> disk formats, file layouts, recovery behavior, commands, and wire behavior may
-> break between any two commits. Do not store irreplaceable data in VibeDB.
 
 ## Keep the API layers separate
 
@@ -181,10 +178,10 @@ reports a durable generation of zero.
 
 ## Source map
 
-- Facade model and bounds: `vibedb.go` (`Open`, `Collection`, `Put`, `Get`, `Range`, `Metrics`)
-- Transaction cuts and overlays: `vibedb_txn.go`
-- Query result lifetimes: `vibedb_query.go`
-- Collection-name codec: `internal/collectionname/collectionname.go`
-- Schemas and exact indexes: `store/store_schema.go`, `store/store_index_exact.go`
-- Heap snapshot behavior: `store/engine.go`
-- Durable opaque mode and limits: `store/durable/store_file_options.go`
+- Facade model and bounds: [vibedb.go](../vibedb.go) (`Open`, `Collection`, `Put`, `Get`, `Range`, `Metrics`)
+- Transaction cuts and overlays: [vibedb_txn.go](../vibedb_txn.go)
+- Query result lifetimes: [vibedb_query.go](../vibedb_query.go)
+- Collection-name codec: [internal/collectionname/collectionname.go](../internal/collectionname/collectionname.go)
+- Schemas and exact indexes: [store/store_schema.go](../store/store_schema.go), [store/store_index_exact.go](../store/store_index_exact.go)
+- Heap snapshot behavior: [store/engine.go](../store/engine.go)
+- Durable opaque mode and limits: [store/durable/store_file_options.go](../store/durable/store_file_options.go)

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the packed-count SIMD qualification against precompiled base and head
+# Run the packed SIMD qualification against precompiled base and head
 # test binaries. Each output file is a raw go test benchmark result; this lane
 # records evidence and deliberately makes no time-based pass/fail claim.
 set -euo pipefail
@@ -49,7 +49,7 @@ printf 'round\trole\tpackage\tcommand\n' > "${commands_file}"
 # query scans for all four specialized widths. Thresholds are measured
 # separately from these full-column workloads.
 storeio_bench='^BenchmarkCompact(Stream(Packed|Spelling|Integer)|PrimaryStripePacked)Equality(7|8|10|16)$'
-query_bench='^BenchmarkFilePacked(Equality|Ordered|IntegerInterval)Count(Wide)?$'
+query_bench='^BenchmarkFilePacked(Equality|Ordered|IntegerInterval|IntegerExtrema)Count(Wide)?$'
 
 record_command() {
 	local round=$1
@@ -146,7 +146,13 @@ validate_query() {
 		'BenchmarkFilePackedIntegerIntervalCountWide/empty' \
 		'BenchmarkFilePackedIntegerIntervalCountWide/sparse' \
 		'BenchmarkFilePackedIntegerIntervalCountWide/half' \
-		'BenchmarkFilePackedIntegerIntervalCountWide/full'; do
+		'BenchmarkFilePackedIntegerIntervalCountWide/full' \
+		'BenchmarkFilePackedIntegerExtremaCount/min/FOR10' \
+		'BenchmarkFilePackedIntegerExtremaCount/max/FOR10' \
+		'BenchmarkFilePackedIntegerExtremaCount/min-max/FOR10' \
+		'BenchmarkFilePackedIntegerExtremaCountWide/min/FOR16' \
+		'BenchmarkFilePackedIntegerExtremaCountWide/max/FOR16' \
+		'BenchmarkFilePackedIntegerExtremaCountWide/min-max/FOR16'; do
 		if ! grep -Eq "^${expected}(-[0-9]+)?[[:space:]]" "${output}"; then
 			echo "missing packed-count query case ${expected}: ${output}" >&2
 			return 1
@@ -174,9 +180,9 @@ run_benchmark() {
 	local -a command=("${binary}" "${args[@]}")
 	if [[ ${package_name} == query ]]; then
 		if [[ ${role} == head ]]; then
-			command=(env VIBEDB_EXPECT_ORDERED=1 VIBEDB_EXPECT_INTERVAL=1 "${command[@]}")
+			command=(env VIBEDB_EXPECT_ORDERED=1 VIBEDB_EXPECT_INTERVAL=1 VIBEDB_EXPECT_EXTREMA=1 "${command[@]}")
 		else
-			command=(env VIBEDB_EXPECT_ORDERED=0 VIBEDB_EXPECT_INTERVAL=0 "${command[@]}")
+			command=(env VIBEDB_EXPECT_ORDERED=0 VIBEDB_EXPECT_INTERVAL=0 VIBEDB_EXPECT_EXTREMA=0 "${command[@]}")
 		fi
 	fi
 	record_command "${round}" "${role}" "${package_name}" "${command[@]}"

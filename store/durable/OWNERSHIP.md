@@ -1,5 +1,7 @@
 # Durable ownership and lifetime rules
 
+[Storage guide](../../docs/store.md)
+
 This is a contributor reference for `store/durable`. These rules are part of
 the current implementation contract, but the project is unreleased: pin an
 exact commit and expect API and disk-format breaks.

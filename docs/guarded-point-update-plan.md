@@ -1,5 +1,11 @@
 # Guarded point-update preparation and compact batch application
 
+[Documentation](README.md) / [Research records](design/research.md)
+
+**Record scope:** This page retains a dated proposal or investigation. Its
+revision-specific findings and future work are not the current operating guide.
+See [architecture](architecture.md) and [operations](operations/README.md).
+
 This experiment follows the SIMD write profile at `0383eb86`. It targets two
 separate costs: the quorum read before a conditional UPDATE proposal, and
 reconstructing unchanged compressed columns during application. It does not

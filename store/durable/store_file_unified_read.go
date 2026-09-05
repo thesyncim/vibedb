@@ -49,6 +49,12 @@ type IntegerIntervalFilter struct {
 	inner *storeio.UnifiedIntegerIntervalFilter
 }
 
+// IntegerExtremaFilter is reusable state for one strict FOR integer MIN/MAX
+// scan. Unsupported leaves decline the complete scan atomically.
+type IntegerExtremaFilter struct {
+	inner *storeio.UnifiedIntegerExtremaFilter
+}
+
 // NewIntegerOrderFilter builds an exact integer ordering over a unified field
 // path. The query layer is responsible for restricting its literal to int64.
 func NewIntegerOrderFilter(
@@ -72,6 +78,16 @@ func NewIntegerIntervalFilter(
 		return nil, err
 	}
 	return &IntegerIntervalFilter{inner: inner}, nil
+}
+
+// NewIntegerExtremaFilter builds an exact integer MIN/MAX scan over a unified
+// field path. The query layer restricts admission to one named numeric path.
+func NewIntegerExtremaFilter(path string) (*IntegerExtremaFilter, error) {
+	inner, err := storeio.NewUnifiedIntegerExtremaFilter([]byte(path))
+	if err != nil {
+		return nil, err
+	}
+	return &IntegerExtremaFilter{inner: inner}, nil
 }
 
 // NewEqFilter builds an equality filter over a "/a/b" field path and the
@@ -119,6 +135,16 @@ type FilterIntegerOrderResult struct {
 type FilterIntegerIntervalResult struct {
 	Matched   int
 	Scanned   int
+	Supported bool
+}
+
+// FilterIntegerExtremaResult reports one strict integer MIN/MAX scan. Found
+// is false when every resolved target is absent, which maps to SQL NULL.
+// Min and Max are zero when Supported is false and must be discarded.
+type FilterIntegerExtremaResult struct {
+	Min, Max  int64
+	Scanned   int
+	Found     bool
 	Supported bool
 }
 
@@ -285,6 +311,52 @@ func (s *Snapshot) FilterIntegerIntervalCount(
 			Matched: progress.Matched, Scanned: progress.Scanned, Supported: true,
 		}, nil
 	}
+}
+
+// FilterIntegerExtrema scans a snapshot using the strict FOR integer extrema
+// lane. It never renders or falls back per row: unsupported compact leaves
+// decline atomically, allowing the query executor to run the generic path.
+func (s *Snapshot) FilterIntegerExtrema(
+	f *IntegerExtremaFilter,
+) (FilterIntegerExtremaResult, error) {
+	if s == nil || s.collection == nil || s.state == nil {
+		return FilterIntegerExtremaResult{}, ErrClosed
+	}
+	if f == nil || f.inner == nil {
+		return FilterIntegerExtremaResult{}, fmt.Errorf("vibedb: nil unified integer extrema filter")
+	}
+	state := s.state
+	catalogBounds := storeio.GlobalTabletCatalogBounds{
+		StoreID:                state.root.StoreID,
+		SelectedRootGeneration: state.root.Generation,
+		FileEnd:                state.fileEnd,
+		NextLogicalID:          state.root.NextLogicalID,
+	}
+	leafBounds := storeio.CommonPrimaryLeafBounds{
+		FileEnd:           state.fileEnd,
+		NextLogicalID:     state.root.NextLogicalID,
+		AllocationQuantum: state.root.PageSize,
+	}
+	var cursor storeio.PrimaryGraphCursor
+	if err := storeio.InitPrimaryGraphCursor(
+		&cursor, s.collection.cache, state.root.PrimaryRoot,
+		catalogBounds, leafBounds, nil, nil,
+	); err != nil {
+		return FilterIntegerExtremaResult{}, err
+	}
+	defer cursor.Close()
+	var progress storeio.UnifiedIntegerExtremaProgress
+	supported, err := cursor.FilterIntegerExtrema(f.inner, &progress)
+	if err != nil {
+		return FilterIntegerExtremaResult{}, err
+	}
+	if !supported {
+		return FilterIntegerExtremaResult{}, nil
+	}
+	return FilterIntegerExtremaResult{
+		Min: progress.Min, Max: progress.Max, Found: progress.Found,
+		Scanned: progress.Scanned, Supported: true,
+	}, nil
 }
 
 // fieldProbeKey identifies one (leaf epoch, template) resolution. Pages are

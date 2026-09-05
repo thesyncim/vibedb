@@ -1,14 +1,11 @@
-> [!CAUTION]
-> **Unreleased development and qualification software only.** Distributed VibeDB has no
-> compatibility promise, production support boundary, or production SLA. Run every component
-> and artifact from the **exact same build and source revision**. Formats, protocols, commands,
-> fences, and recovery may break at any time. Qualification is not a rolling-upgrade, failover,
-> or production-readiness guarantee.
-
 # Distributed internals and operation
 
-This page explains the boundaries to preserve while bringing up, observing, or recovering the
-current distributed path. It is not a wire-format specification or a supported internal API.
+[Documentation](../README.md) / [Operations](README.md) · [Development status](../status.md)
+
+This design guide explains routing fences, consensus, persistence, and recovery.
+For commands, use the [operator guide](README.md) or
+[troubleshooting](troubleshooting.md). Physical-node composition is shown in
+[architecture](../architecture.md#system-map).
 
 ## Start with the deployment model
 
@@ -77,6 +74,21 @@ The current profile uses pre-vote, quorum checking, safe ReadIndex, heartbeat ti
 election tick 10. Proposal forwarding is disabled. Ticks are logical inputs supplied by the
 owner; the consensus core does not sample wall-clock time or run an autonomous ticker.
 
+Physical-node serving uses a shared `NodeStore` and submission sequencer. Each
+group retains its own log identity, incarnation, commit position, and apply
+state. The sequencer admits bounded immutable submissions, persists node-log
+waves, and returns completion to the submitting groups. A wave can share
+physical persistence across groups; it does not share consensus authority.
+Contiguous Ready values from one group can form a bounded series, with at
+most one series per group in a wave.
+
+The older per-group WAL path remains in the repository. Its dual-slot protocol
+below explains that storage lane; do not interpret its two durability phases
+as the physical-node log's barrier count. Use [node diagnostics](observability.md)
+for shared append waves and persistence observations.
+
+### Per-group WAL persistence
+
 Ready processing is an ordered durability protocol:
 
 1. Capture one Ready and assign its `(node incarnation, Ready ID)`.
@@ -117,6 +129,20 @@ settlement remains a hard fence. After a read request's complete serving fence i
 successful response preserves that exact fence and advances only the monotonic applied/commit
 watermarks to the returned data cut; it does not pair the result with a later status probe. Failure
 paths may probe again to return refreshed refusal state.
+
+### Shared node log
+
+The node store owns its descriptor catalog, segmented log, and checkpoint
+inventory. Group registration and persistence go through the node owner;
+shared files do not permit independent group writers. Recovery validates the
+node and group identities before exposing each group's retained log.
+
+Node segment size, maximum wave bytes, group capacity, and Ready-series span
+are independent bounds. Capacity pressure is an admission or maintenance
+condition, not permission to discard a group's live recovery state. See
+[NodeStore](../../internal/raftstore/node_store.go),
+[submission sequencing](../../internal/raftstore/node_sequencer.go), and
+[series tests](../../internal/raftstore/node_series_test.go).
 
 ## WAL generations and snapshots
 

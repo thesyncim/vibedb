@@ -174,11 +174,25 @@ const (
 // CommittedEntries are deltas from counters recorded at the RawNode mutation
 // authority, not deductions from Ready persistence or application.
 type Progress struct {
-	Group              raftmember.GroupKey
-	Kind               ProgressKind
-	ReadyKind          raftmember.DriveKind
-	ProposalCount      int
-	ProposalBytes      int64
+	Group         raftmember.GroupKey
+	Kind          ProgressKind
+	ReadyKind     raftmember.DriveKind
+	ProposalCount int
+	ProposalBytes int64
+	// CapturedProposalCount and CapturedProposalBytes describe the normal
+	// proposal prefix carried by a captured Ready. They are separate from the
+	// input-side ProposalCount/ProposalBytes fields so diagnostics do not count
+	// one proposal twice.
+	CapturedProposalCount int
+	CapturedProposalBytes int64
+	// LateJoinQueued records the queued proposal depth observed while an open
+	// normal-proposal window was waiting for its one late-join opportunity.
+	// LateJoinUsed and LateJoinMissed are mutually exclusive for one Host turn;
+	// LateJoinEntries is the prefix admitted by a used opportunity.
+	LateJoinQueued     int
+	LateJoinUsed       bool
+	LateJoinMissed     bool
+	LateJoinEntries    int
 	AppliedCount       int
 	AppliedFirst       uint64
 	AppliedLast        uint64
@@ -218,6 +232,14 @@ type memberRuntime interface {
 
 type proposalBatchRuntime interface {
 	ProposeBatch([][]byte) error
+}
+
+// proposalWindowRuntime is intentionally optional. The narrow query lets the
+// Host inspect the current uncaptured normal-proposal window without exposing
+// Runtime internals through the broader owner-facing API. Test and recovery
+// runtimes that do not implement it retain the original Ready-first behavior.
+type proposalWindowRuntime interface {
+	NormalProposalWindow() (open bool, remainingEntries int, remainingBytes int64)
 }
 
 type pipelinedRuntime interface {
@@ -385,6 +407,7 @@ type groupState struct {
 	items                  int
 	bytes                  int64
 	nextClass              inputClass
+	lateJoinUsed           bool
 	failure                error
 	retiring               bool
 	schemaQuiescing        bool
@@ -1192,6 +1215,34 @@ func (host *Host) popRunnable() *groupState {
 	return group
 }
 
+func (host *Host) nextInputClass(group *groupState) (inputClass, bool) {
+	if group == nil {
+		return 0, false
+	}
+	for checked := inputClass(0); checked < inputClassCount; checked++ {
+		class := (group.nextClass + checked) % inputClassCount
+		switch class {
+		case inputMessage:
+			if group.messages.len() != 0 {
+				return class, true
+			}
+		case inputProposal:
+			if group.proposals.len() != 0 {
+				return class, true
+			}
+		case inputTick:
+			if group.ticks != 0 {
+				return class, true
+			}
+		case inputCampaign:
+			if group.campaigns != 0 {
+				return class, true
+			}
+		}
+	}
+	return 0, false
+}
+
 // RunOne performs at most one Ready lifecycle operation, consumes one queued
 // non-proposal input, or admits one bounded prefix of currently queued normal
 // proposals. It never waits for a proposal to join a batch: the group's next
@@ -1213,6 +1264,49 @@ func (host *Host) RunOne() (Progress, bool, error) {
 		if group == nil || group.runtime == nil || group.failure != nil || group.retiring ||
 			group.schemaQuiesced {
 			continue
+		}
+		lateJoinQueued := 0
+		lateJoinMissed := false
+		if !group.lateJoinUsed {
+			if windowRuntime, ok := group.runtime.(proposalWindowRuntime); ok {
+				windowOpen, remainingEntries, remainingBytes := windowRuntime.NormalProposalWindow()
+				if windowOpen && group.proposals.len() != 0 {
+					lateJoinQueued = group.proposals.len()
+					if next, present := host.nextInputClass(group); present && next == inputProposal {
+						remainingEntries = min(remainingEntries, raftmodel.MaxProposalBatchEntries)
+						remainingBytes = min(remainingBytes, raftmodel.MaxProposalBatchBytes)
+						progress, consumed, inputErr := host.runInputBounded(
+							group, remainingEntries, remainingBytes, true,
+						)
+						if consumed {
+							group.lateJoinUsed = true
+							progress.LateJoinQueued = lateJoinQueued
+							progress.LateJoinUsed = true
+							progress.LateJoinEntries = progress.ProposalCount
+							if errors.Is(inputErr, raftmember.ErrRuntimeFailed) || errors.Is(inputErr, raftmember.ErrRuntimeClosed) {
+								group.failure = inputErr
+								progress.Kind = ProgressFault
+								host.purgeGroup(group)
+							} else {
+								if progress.Kind != ProgressProposal {
+									host.observeTrackedLeadership(group)
+								}
+								host.wake(group)
+							}
+							return progress, true, inputErr
+						}
+						// A queued proposal that cannot fit the remaining bounded
+						// window still consumes this one opportunity. Capture the
+						// existing Ready in this Host turn without retrying the same
+						// prefix indefinitely.
+						group.lateJoinUsed = true
+						lateJoinMissed = true
+					}
+					// A message, tick, or campaign is the next input class. Ready
+					// capture therefore wins and closes the normal-proposal window.
+					lateJoinMissed = true
+				}
+			}
 		}
 		host.readyGroup = group
 		ready, err := group.runtime.DriveReady(&host.ready, host.readySend, host.settle)
@@ -1243,15 +1337,33 @@ func (host *Host) RunOne() (Progress, bool, error) {
 		host.refreshTrackedPending(group)
 		host.observeTrackedLeadership(group)
 		if ready.Progressed() {
+			// Only the capture step closes the current normal-proposal window. A
+			// pipelined Runtime may first drain a retained outbound message or
+			// apply step while the Ready remains uncaptured; keep the marker through
+			// those lifecycle turns so the next proposal cannot join twice.
+			if ready.Kind == raftmember.DriveCaptured ||
+				ready.Kind == raftmember.DriveReadStatesFinished {
+				group.lateJoinUsed = false
+			}
 			host.wake(group)
 			progress := Progress{
 				Group: group.key, Kind: ProgressReady, ReadyKind: ready.Kind,
+				CapturedProposalCount: ready.ProposalCount,
+				CapturedProposalBytes: ready.ProposalBytes,
+				LateJoinQueued:        lateJoinQueued, LateJoinMissed: lateJoinMissed,
 				AppliedCount: ready.Applied.Len(), AppliedFirst: ready.Applied.FirstIndex(),
 				AppliedLast:  ready.Applied.LastIndex(),
 				ReadOutcomes: ready.ReadOutcomes,
 			}
 			host.observeCommitProgress(group, &progress)
 			return progress, true, nil
+		}
+		if group.lateJoinUsed {
+			// A late-join admission owns the next lifecycle turn even when an
+			// asynchronous Runtime has not exposed CaptureReady yet. Do not
+			// consume another proposal through the ordinary input path.
+			host.wake(group)
+			return Progress{}, false, nil
 		}
 
 		progress, consumed, inputErr := host.runInput(group)
@@ -1408,6 +1520,17 @@ func (host *Host) purgeGroup(group *groupState) {
 }
 
 func (host *Host) runInput(group *groupState) (result Progress, consumed bool, resultErr error) {
+	return host.runInputBounded(
+		group, raftmodel.MaxProposalBatchEntries, raftmodel.MaxProposalBatchBytes, false,
+	)
+}
+
+func (host *Host) runInputBounded(
+	group *groupState,
+	proposalLimit int,
+	proposalBytesLimit int64,
+	enforceProposalCapacity bool,
+) (result Progress, consumed bool, resultErr error) {
 	defer func() {
 		if consumed {
 			host.observeCommitProgress(group, &result)
@@ -1441,10 +1564,11 @@ func (host *Host) runInput(group *groupState) (result Progress, consumed bool, r
 				var commands [raftmodel.MaxProposalBatchEntries][]byte
 				batchEntries := 0
 				batchBytes := int64(0)
-				for batchEntries < len(available) && batchEntries < len(commands) {
+				for batchEntries < len(available) && batchEntries < len(commands) &&
+					batchEntries < proposalLimit {
 					candidate := available[batchEntries]
 					candidateBytes := int64(len(candidate.data))
-					if !candidate.tracked || candidateBytes > raftmodel.MaxProposalBatchBytes-batchBytes {
+					if !candidate.tracked || candidateBytes > proposalBytesLimit-batchBytes {
 						break
 					}
 					commands[batchEntries] = candidate.data
@@ -1472,10 +1596,13 @@ func (host *Host) runInput(group *groupState) (result Progress, consumed bool, r
 			trackedChecked := false
 			trackedLeaderTerm := uint64(0)
 			var trackedLeadershipErr error
-			for batchEntries < raftmodel.MaxProposalBatchEntries {
+			for batchEntries < proposalLimit {
 				dataBytes := int64(len(item.data))
-				if batchEntries != 0 && (batchBytes >= raftmodel.MaxProposalBatchBytes ||
-					dataBytes > raftmodel.MaxProposalBatchBytes-batchBytes) {
+				if batchEntries != 0 && (batchBytes >= proposalBytesLimit ||
+					dataBytes > proposalBytesLimit-batchBytes) {
+					break
+				}
+				if batchEntries == 0 && enforceProposalCapacity && dataBytes > proposalBytesLimit {
 					break
 				}
 				consumed, popped := group.proposals.pop()
@@ -1499,7 +1626,7 @@ func (host *Host) runInput(group *groupState) (result Progress, consumed bool, r
 							host.refreshTrackedPending(group)
 							return progress, true, trackedLeadershipErr
 						}
-						if batchBytes >= raftmodel.MaxProposalBatchBytes {
+						if batchBytes >= proposalBytesLimit {
 							break
 						}
 						item, ok = group.proposals.peek()
@@ -1518,7 +1645,7 @@ func (host *Host) runInput(group *groupState) (result Progress, consumed bool, r
 				if consumed.tracked {
 					group.trackedLeaderTerm = trackedLeaderTerm
 				}
-				if batchBytes >= raftmodel.MaxProposalBatchBytes {
+				if batchBytes >= proposalBytesLimit {
 					break
 				}
 				item, ok = group.proposals.peek()

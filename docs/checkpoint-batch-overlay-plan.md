@@ -1,5 +1,11 @@
 # Stage row overlays for checkpoint-group batches
 
+[Documentation](README.md) / [Research records](design/research.md)
+
+**Record scope:** This page retains a dated proposal or investigation. Its
+revision-specific findings and future work are not the current operating guide.
+See [architecture](architecture.md) and [operations](operations/README.md).
+
 The next storage experiment targets repeated compressed-leaf reconstruction
 in RF3 apply. `ApplyNormalBatch` already combines committed commands into one
 checkpoint-group transaction. However, `commitTransitionLocked` stages each

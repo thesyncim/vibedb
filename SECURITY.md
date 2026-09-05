@@ -76,20 +76,20 @@ The Kubernetes qualification script creates disposable credentials and leaves
 its private temporary directory for inspection. Remove that directory safely
 after collecting required evidence.
 
-## Current security-relevant gaps
+## Security qualification
 
-The parser treats `SELECT 1 GARBAGE` as a valid select-list expression with an
-implicit alias. The authorization test now records that grammar and separately
-proves that an actually unconsumed tail such as `SELECT 1 AS value GARBAGE`
-fails closed. That focused test passes; it is not a production-qualification
-claim. The complete external process gate still does not combine every
-certificate-rotation and confused-deputy fault, and explicit plaintext mode is
-for loopback development only. Other known sharp edges are listed in [current
-status](docs/status.md).
+Authentication and authorization tests cover specific traffic classes and
+failure scenarios. Read their exact scope before treating one passing test as
+coverage for certificate rotation, confused-deputy resistance, or external
+process failure. Development plaintext remains a separate loopback-only mode.
+
+The [feature ledger](docs/distributed-feature-state.md) links qualification
+evidence, and [current limitations](docs/status.md#known-limitations) records
+behavior that matters when evaluating a build.
 
 ## Source map
 
-- `internal/servicetls` and `internal/rafttransport/identity.go`
-- `internal/serviceauthz` and `gateway/client_tls.go`
-- `pgwire/server.go`, `session.go`, and `scram.go`
-- `cmd/vibedb-gateway/serve.go` and `cmd/vibedb-shard/*.go`
+- [internal/servicetls](internal/servicetls) and [internal/rafttransport/identity.go](internal/rafttransport/identity.go)
+- [internal/serviceauthz](internal/serviceauthz) and [gateway/client_tls.go](gateway/client_tls.go)
+- [pgwire/server.go](pgwire/server.go), `session.go`, and `scram.go`
+- [internal/gatewayruntime/serve.go](internal/gatewayruntime/serve.go) and `cmd/vibedb-shard/*.go`

@@ -1,5 +1,7 @@
 # PostgreSQL upstream regression frontier
 
+[Client guide](../../docs/api/pgwire.md)
+
 > **Development status:** VibeDB's SQL and pgwire behavior is incomplete and can
 > change or break at any commit. This harness is a development compatibility
 > probe, not PostgreSQL certification, a supported-version promise, or a stable

@@ -1,0 +1,12 @@
+GOEXPERIMENT=simd for paired base/fixed binaries
+GOTOOLCHAIN=go1.27.0
+GOOS=darwin
+GOARCH=arm64
+GOMAXPROCS=1
+-test.run='^$'
+-test.count=1
+-test.benchmem=true
+paired -test.benchtime=2s, repetitions=5
+extrema controls -test.benchtime=250ms, repetitions=5
+Darwin arm64, Apple M4 Max, 16 cores
+Power and thermal state uncontrolled

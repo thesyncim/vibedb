@@ -1,14 +1,11 @@
 # SQL API
 
-> [!CAUTION]
-> Unreleased development software: SQL, catalog, protocol, types, limits, and
-> transactions may break on any commit. No old-image migration reader exists.
-> Pin the catalog commit and test recovery.
+[Documentation](../README.md) / [API guides](README.md) · [Development status](../status.md)
 
 VibeDB exposes one bounded SQL implementation through two Go APIs:
 
 | API | Use it for |
-|---|---|
+| --- | --- |
 | `database/sql` driver name `vibedb` | Conventional Go applications and connection pooling |
 | `sql/driver` typed runtime | Protocol adapters, explicit ownership, typed cells, and allocation reuse |
 
@@ -49,7 +46,7 @@ func main() {
 	connector, err := (vibedriver.Driver{}).OpenConnector(path)
 	must(err)
 	db := sql.OpenDB(connector)
-	defer db.Close()
+	defer func() { must(db.Close()) }()
 
 	_, err = db.ExecContext(ctx, `CREATE TABLE counters (
 		id STRING PRIMARY KEY,
@@ -112,10 +109,16 @@ move. `ON CONFLICT` remains fenced. For example:
 UPDATE users SET visits = visits + 1, name = name || '!' WHERE id = ?;
 ```
 
-The coordinator linearizably reads the old row and evaluates every right-hand
-side once against that same image. It retains the canonical postimage plus the
-old value's exact length and SHA-256 check in the durable program; global-index
-changes derive from that postimage, and recovery replays it without reevaluation.
+The coordinator evaluates assignments from one complete preimage and retains
+the canonical postimage with the old row's length and SHA-256 guard. Eligible
+single-participant updates without maintained global indexes can prepare from
+an authenticated committed leader read; atomic replicated guard validation
+establishes whether the replacement can commit. Missing rows, evaluation
+errors, and ineligible shapes fall back to linearizable preparation. Indexed
+and coordinated writes retain their linearizable lowering. Recovery replays
+the retained recipe and identity without reevaluating assignments. See
+[guarded preparation](../guarded-point-update-plan.md#private-committed-preimages)
+and its [implementation](../../gateway/durable_sql_prepared_direct.go).
 The RF3 pgwire backend is autocommit-only: send each write in its own Query or
 Execute/Sync cycle, not an explicit or multi-statement transaction.
 
@@ -145,7 +148,7 @@ distinction in predicates with `IS MISSING`. Authored comparisons such as
 ## Transactions and savepoints
 
 | Isolation | Read cut | Commit validation |
-|---|---|---|
+| --- | --- | --- |
 | Read Committed (default) | One coherent cut per statement | Write conflicts |
 | Repeatable Read / Snapshot | Cut captured at BEGIN | Write conflicts |
 | Serializable | Cut captured at BEGIN | Write and exact/relation-coarse read dependencies |
@@ -244,7 +247,7 @@ forms, and `*bool`, `*int64`, `*float64`, `*string`, `*[]byte`, or
 string/bytes must contain one valid JSON value.
 
 | Boundary | Current limit |
-|---|---:|
+| --- | ---: |
 | SQL text | 16 MiB |
 | Parameters | 65,536 |
 | One parameter | 4 MiB |
@@ -266,6 +269,6 @@ and `1e0` compare as the same number. Do not round through `float64`.
 
 ## Source map
 
-- Native/typed adapters and values: `sql/driver/driver.go:22-79`, `sql/driver/driver.go:308-419`, `sql/driver/runtime.go:22-242`
-- Transactions and embedded mutations: `sql/driver/tx.go:89-184`, `sql/driver/savepoint.go:7-190`, `sql/driver/column_update.go:23-112`
-- RF3 postimages and replay: `gateway/replicated_sql_transaction.go:128-565`, `gateway/durable_sql_request_executor.go:103-157`
+- Native/typed adapters and values: [sql/driver/driver.go](../../sql/driver/driver.go), [sql/driver/driver.go](../../sql/driver/driver.go), [sql/driver/runtime.go](../../sql/driver/runtime.go)
+- Transactions and embedded mutations: [sql/driver/tx.go](../../sql/driver/tx.go), [sql/driver/savepoint.go](../../sql/driver/savepoint.go), [sql/driver/column_update.go](../../sql/driver/column_update.go)
+- RF3 postimages and replay: [gateway/replicated_sql_transaction.go](../../gateway/replicated_sql_transaction.go), [gateway/durable_sql_request_executor.go](../../gateway/durable_sql_request_executor.go)

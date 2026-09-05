@@ -1,7 +1,12 @@
 # Storage and runtime redesign target
 
-This is the implementation direction for the active performance goal. Breaking
-formats and interfaces is authorized. The target is a compact engine that shares
+[Documentation](README.md) / [Research records](design/research.md)
+
+**Record scope:** This page retains a dated proposal or investigation. Its
+revision-specific findings and future work are not the current operating guide.
+See [architecture](architecture.md) and [operations](operations/README.md).
+
+This proposal explores a compact engine that shares
 durable work across ranges, serves versioned reads without group-wide exclusion,
 and publishes new schema generations without stopping ordinary traffic. CRDB
 is a comparison baseline; copying its components is not an acceptance criterion.

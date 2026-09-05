@@ -1,81 +1,73 @@
 # VibeDB documentation
 
-> [!CAUTION]
-> VibeDB is an unreleased development project. There is one current source,
-> wire, and disk grammar—not a compatibility ladder. Different commits may be
-> incompatible and may corrupt or refuse older development data. Use an exact
-> commit and disposable or recoverable data.
+Store JSON in a Go application, query it through native or SQL interfaces, or
+evaluate a replicated cluster. Start with the tutorial for the interface you
+want; use the design guides to understand its behavior.
 
-The documentation is organized by intent: start, build, understand, operate,
-and look up exact contracts. The embedded API is the shortest path. SQL,
-pgwire, and distributed pages are explicit about their narrower experimental
-boundaries.
+VibeDB is under development. Keep documentation, binaries, and data on the
+same revision; [stability and compatibility](status.md) explains the boundaries.
 
-## Start
+## Get started
 
-1. [Read the stability contract](status.md).
-2. [Run the embedded database](getting-started.md).
-3. Choose an [API](api/README.md).
+- [Embedded database tutorial](getting-started.md): write JSON, read it, close, and reopen.
+- [Local RF3 cluster](operations/local-cluster.md): start physical nodes and connect with psql.
+- [Choose an API](api/README.md): native Go, typed queries, `database/sql`, or PostgreSQL wire.
 
-To explore replication locally, use the generated [RF3 development
-cluster](operations/local-cluster.md). Do not begin with hand-authored cluster
-manifests.
-
-## Build
+## Build an application
 
 | Task | Guide |
 | --- | --- |
-| Store and retrieve JSON | [Native API](api/native.md) |
-| Build reusable typed queries | [Typed query API](api/query.md) |
-| Use `database/sql` | [SQL API](api/sql.md) |
-| Connect pgx, lib/pq, psql, or JDBC | [PostgreSQL wire adapter](api/pgwire.md) |
-| Group writes atomically | [Transactions](transactions.md) |
-| Choose acknowledgement semantics | [Durability](durability.md) |
+| Store documents and maintain indexes | [Native API](api/native.md) |
+| Understand keys, JSON values, and index definitions | [Data model](data-model.md) |
+| Execute reusable typed plans | [Query API](api/query.md) |
+| Use Go's SQL connection pool | [SQL API](api/sql.md) |
+| Connect a PostgreSQL client | [PostgreSQL wire adapter](api/pgwire.md) |
+| Commit related changes together | [Transactions](transactions.md) |
+| Choose when writes become durable | [Durability and recovery](durability.md) |
 
-## Understand
+## Understand the design
 
-- [Architecture](architecture.md): layers, ownership, and publication paths.
-- [Data model](data-model.md): collections, keys, JSON, schemas, and indexes.
-- [Storage layers](store.md): facade versus heap source model versus durable
-  engine.
-- [On-disk format](format.md): the current development image and recovery
-  families.
+The [design guide](design/README.md) follows a request through the system:
 
-## Operate and qualify
+1. [Architecture](architecture.md): embedded layers and distributed physical nodes.
+2. [Query execution](design/query-execution.md): access paths, operators, and materialization.
+3. [Storage](store.md) and [on-disk format](format.md): ownership, generations, and recovery records.
+4. [Distributed internals](operations/distributed.md): routing, Raft, retries, and membership.
 
-- [Operations home](operations/README.md)
-- [Verify, salvage, and repack](operations/verification.md)
-- [Distributed runtime](operations/distributed.md)
-- [Backup and restore](operations/backup-restore.md)
-- [Schema rollouts](operations/schema-rollouts.md)
-- [Observability](operations/observability.md)
-- [Kubernetes qualification lane](operations/kubernetes.md)
+## Operate and diagnose
 
-No operations page is a production runbook. Every distributed procedure is a
-development or qualification workflow for one exact build.
+The [operator guide](operations/README.md) covers deployment, observation,
+maintenance, and recovery for development clusters.
 
-## Reference
+| Task | Guide |
+| --- | --- |
+| Start, stop, and reopen a cluster | [Local cluster](operations/local-cluster.md) |
+| Diagnose startup, requests, and recovery failures | [Troubleshooting](operations/troubleshooting.md) |
+| Collect counters and node diagnostics | [Observability](operations/observability.md) |
+| Back up an embedded database | [Embedded backup](operations/embedded-backup.md) |
+| Verify, salvage, or repack files | [Offline verification](operations/verification.md) |
+| Export and restore RF3 group cuts | [Distributed backup and restore](operations/backup-restore.md) |
+| Install an RF3 schema generation | [Schema rollouts](operations/schema-rollouts.md) |
+| Exercise the Kubernetes test topology | [Kind qualification](operations/kubernetes.md) |
 
-- [Reference index](reference/README.md)
-- [CLI](reference/cli.md)
-- [SQL dialect](reference/sql.md)
-- [Wire and service protocols](reference/protocols.md)
-- [Defaults and limits](reference/limits.md)
-- [Executable embedded capabilities](capabilities.md)
-- [Generated distributed feature ledger](distributed-feature-state.md)
+## Look up exact behavior
 
-Generated reference pages report checked-in evidence; they do not imply a
-release, support tier, production readiness, or performance result.
+[Reference index](reference/README.md) · [SQL](reference/sql.md) ·
+[CLI](reference/cli.md) · [Protocols](reference/protocols.md) ·
+[Defaults and limits](reference/limits.md)
 
-## Contribute
+The generated [embedded capability matrix](capabilities.md) and
+[distributed feature ledger](distributed-feature-state.md) link individual
+capabilities to their implementation and tests.
 
-- [Contribution workflow](../CONTRIBUTING.md)
-- [Documentation standard](STYLE.md)
-- [Performance evidence](performance.md)
-- [Source and algorithm provenance](provenance.md)
-- [Unsafe-code boundary](../UNSAFE.md)
-- [Security policy](../SECURITY.md)
+## Contribute and investigate
 
-When prose and code disagree, tests and the referenced codec or implementation
-are authoritative. Open a documentation issue or change the docs in the same
-commit as the contract.
+- [Contributing](../CONTRIBUTING.md) and [documentation style](STYLE.md).
+- [Performance methodology](performance.md), [benchmark archive](benchmarks/README.md),
+  and [qualification records](qualification/README.md).
+- [Research and proposals](design/research.md): dated investigations and planned work.
+- [Source provenance](provenance.md), [unsafe-code boundary](../UNSAFE.md),
+  and [security](../SECURITY.md).
+
+Research records describe their recorded revisions. Current guides describe
+the source beside them. Update both code and its guide when a contract changes.

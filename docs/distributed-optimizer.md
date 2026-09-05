@@ -1,10 +1,16 @@
 # Distributed optimizer and statistics
 
-This work starts from `origin/main` at `09e60689`. The objective is to reduce
-real data movement, coordination, and storage work. A cost estimate is never a
-proof that a row or shard can be omitted.
+[Documentation](README.md) / [Design](design/README.md) · [Development status](status.md)
 
-## Execution changes
+The gateway uses distribution locality, index costs, and published statistics
+to reduce data movement and coordination. Runtime bounds and exact predicates
+remain authoritative: a cost estimate cannot prove that a row may be omitted.
+
+The implementation notes and measurements below record work that began from
+`09e60689`. For the overall execution model, see
+[query execution](design/query-execution.md).
+
+## Planning and execution
 
 - **Preserve grouping locality.** A single-table GROUP BY containing every
   distribution-key path produces disjoint groups on the source shards. The
@@ -131,10 +137,10 @@ comparison requires equivalent datasets, routing/locality, consistency,
 durability, hardware, client concurrency, and independently checked results.
 The local Docker daemon was unavailable during this run.
 
-## Validation on this branch
+## Recorded validation
 
-The complete planner, gateway, query, in-memory store, and durable store suites
-passed on Go 1.27 / darwin-arm64. The durable suite needed a 30-minute timeout
+During the recorded implementation, the planner, gateway, query, in-memory
+store, and durable store suites passed on Go 1.27 / darwin-arm64. The durable suite needed a 30-minute timeout
 and completed in 798 seconds. The planner, gateway, query, and in-memory store
 suites also passed with SIMD enabled; focused race tests cover statistics,
 local grouping, index selection/update dependencies, and Bloom correctness.

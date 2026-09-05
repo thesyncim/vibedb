@@ -1016,6 +1016,7 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 	splitRuntime, splitRuntimeErr := newRF3SplitServingRuntime(rf3SplitServingOptions{
 		manifest: manifest, prepared: preparedSet.groups, identities: identities, commands: commands,
 		owners: peer.Owners(), registrar: peer, profile: profile, policy: policy, deadline: deadline,
+		registry:        transportRegistry,
 		topologyProfile: frontendProfile,
 		childPreparer:   childPreparer,
 		inventory:       adoptedInventory,

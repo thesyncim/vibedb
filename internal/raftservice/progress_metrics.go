@@ -7,11 +7,24 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/multiraft"
 	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/raftmodel"
 )
 
 var ErrProgressMetricsGroups = errors.New("raftservice: invalid progress metrics group directory")
 
 const AbsoluteMaxProgressMetricsGroups = 1 << 14
+
+const (
+	// ProposalEntryHistogramBuckets has one slot for every normal proposal
+	// batch size and a final overflow slot. Keeping the shape fixed makes the
+	// diagnostics cut safe to expose without labels or an allocation on the
+	// owner lane.
+	ProposalEntryHistogramBuckets = raftmodel.MaxProposalBatchEntries + 1
+	// ProposalBytesHistogramBuckets has a zero bucket, sixteen equal-width
+	// buckets through the normal one-megabyte batching target, and one overflow
+	// bucket for a valid oversized single proposal.
+	ProposalBytesHistogramBuckets = 18
+)
 
 // ProgressMetrics is the bounded process-incarnation counter seam for shipped
 // RF3 owner loops. It observes already-produced fixed-width progress after a
@@ -36,6 +49,7 @@ type ProgressMetrics struct {
 	snapshotsFinished   atomic.Uint64
 	readCompletions     atomic.Uint64
 	faults              atomic.Uint64
+	scheduler           progressMetricsSchedulerCounters
 	groups              atomic.Pointer[progressMetricsGroupTable]
 }
 
@@ -50,6 +64,17 @@ type progressMetricsCounters struct {
 	commitAdvancements, committedEntries             atomic.Uint64
 	readyPersisted, snapshotsFinished                atomic.Uint64
 	readCompletions, faults                          atomic.Uint64
+	scheduler                                        progressMetricsSchedulerCounters
+}
+
+type progressMetricsSchedulerCounters struct {
+	proposalWindowQueued atomic.Uint64
+	lateJoinUsed         atomic.Uint64
+	lateJoinMissed       atomic.Uint64
+	lateJoinEntries      atomic.Uint64
+	proposalQueueDepth   [ProposalEntryHistogramBuckets]atomic.Uint64
+	proposalEntriesReady [ProposalEntryHistogramBuckets]atomic.Uint64
+	proposalBytesReady   [ProposalBytesHistogramBuckets]atomic.Uint64
 }
 
 type progressMetricsGroupTable struct {
@@ -71,6 +96,79 @@ type ProgressMetricsSnapshot struct {
 	SnapshotsFinished  uint64
 	ReadCompletions    uint64
 	Faults             uint64
+
+	// ProposalWindowQueued is the cumulative number of queued proposals
+	// observed while an open normal-proposal window had room. The depth
+	// histogram below preserves the per-observation queue shape. LateJoinEntries
+	// is the cumulative number admitted by the one-turn opportunity.
+	ProposalWindowQueued uint64
+	LateJoinUsed         uint64
+	LateJoinMissed       uint64
+	LateJoinEntries      uint64
+	// These fixed histograms are indexed by capped proposal entry count. The
+	// final entry bucket is overflow.
+	ProposalQueueDepthHistogram [ProposalEntryHistogramBuckets]uint64
+	ProposalEntriesPerReady     [ProposalEntryHistogramBuckets]uint64
+	ProposalBytesPerReady       [ProposalBytesHistogramBuckets]uint64
+}
+
+func proposalEntryHistogramBucket(value int) int {
+	if value <= 0 {
+		return 0
+	}
+	if value >= ProposalEntryHistogramBuckets {
+		return ProposalEntryHistogramBuckets - 1
+	}
+	return value
+}
+
+func proposalBytesHistogramBucket(value int64) int {
+	if value <= 0 {
+		return 0
+	}
+	const normalBucketWidth = raftmodel.MaxProposalBatchBytes / (ProposalBytesHistogramBuckets - 2)
+	bucket := int((value + normalBucketWidth - 1) / normalBucketWidth)
+	if bucket >= ProposalBytesHistogramBuckets-1 {
+		return ProposalBytesHistogramBuckets - 1
+	}
+	return bucket
+}
+
+func (counters *progressMetricsSchedulerCounters) observe(progress multiraft.Progress) {
+	if progress.LateJoinQueued > 0 {
+		counters.proposalWindowQueued.Add(uint64(progress.LateJoinQueued))
+		counters.proposalQueueDepth[proposalEntryHistogramBucket(progress.LateJoinQueued)].Add(1)
+	}
+	if progress.LateJoinUsed {
+		counters.lateJoinUsed.Add(1)
+		if progress.LateJoinEntries > 0 {
+			counters.lateJoinEntries.Add(uint64(progress.LateJoinEntries))
+		}
+	}
+	if progress.LateJoinMissed {
+		counters.lateJoinMissed.Add(1)
+	}
+	if progress.CapturedProposalCount > 0 {
+		counters.proposalEntriesReady[proposalEntryHistogramBucket(progress.CapturedProposalCount)].Add(1)
+		counters.proposalBytesReady[proposalBytesHistogramBucket(progress.CapturedProposalBytes)].Add(1)
+	}
+}
+
+func (counters *progressMetricsSchedulerCounters) snapshot(snapshot *ProgressMetricsSnapshot) {
+	if counters == nil || snapshot == nil {
+		return
+	}
+	snapshot.ProposalWindowQueued = counters.proposalWindowQueued.Load()
+	snapshot.LateJoinUsed = counters.lateJoinUsed.Load()
+	snapshot.LateJoinMissed = counters.lateJoinMissed.Load()
+	snapshot.LateJoinEntries = counters.lateJoinEntries.Load()
+	for index := range counters.proposalQueueDepth {
+		snapshot.ProposalQueueDepthHistogram[index] = counters.proposalQueueDepth[index].Load()
+		snapshot.ProposalEntriesPerReady[index] = counters.proposalEntriesReady[index].Load()
+	}
+	for index := range counters.proposalBytesReady {
+		snapshot.ProposalBytesPerReady[index] = counters.proposalBytesReady[index].Load()
+	}
 }
 
 func (metrics *ProgressMetrics) observeProgress(progress multiraft.Progress, done bool, err error) {
@@ -87,6 +185,7 @@ func (metrics *ProgressMetrics) observeProgress(progress multiraft.Progress, don
 		metrics.proposalCommands.Add(uint64(progress.ProposalCount))
 		metrics.proposalBytes.Add(uint64(progress.ProposalBytes))
 	}
+	metrics.scheduler.observe(progress)
 	if progress.AppliedCount > 0 {
 		metrics.applyBatches.Add(1)
 		metrics.appliedEntries.Add(uint64(progress.AppliedCount))
@@ -121,6 +220,7 @@ func (counters *progressMetricsCounters) observe(progress multiraft.Progress, do
 		counters.proposalCommands.Add(uint64(progress.ProposalCount))
 		counters.proposalBytes.Add(uint64(progress.ProposalBytes))
 	}
+	counters.scheduler.observe(progress)
 	if progress.AppliedCount > 0 {
 		counters.applyBatches.Add(1)
 		counters.appliedEntries.Add(uint64(progress.AppliedCount))
@@ -225,21 +325,23 @@ func (metrics *ProgressMetrics) GroupProgressMetrics(group raftmember.GroupKey) 
 		return raftmember.RuntimeIdentity{}, ProgressMetricsSnapshot{}, false
 	}
 	c := &slot.counters
-	return slot.identity, ProgressMetricsSnapshot{
+	snapshot := ProgressMetricsSnapshot{
 		ProposalBatches: c.proposalBatches.Load(), ProposalCommands: c.proposalCommands.Load(),
 		ProposalBytes: c.proposalBytes.Load(), ApplyBatches: c.applyBatches.Load(),
 		AppliedEntries: c.appliedEntries.Load(), ReadyPersisted: c.readyPersisted.Load(),
 		CommitAdvancements: c.commitAdvancements.Load(), CommittedEntries: c.committedEntries.Load(),
 		SnapshotsFinished: c.snapshotsFinished.Load(), ReadCompletions: c.readCompletions.Load(),
 		Faults: c.faults.Load(),
-	}, true
+	}
+	c.scheduler.snapshot(&snapshot)
+	return slot.identity, snapshot, true
 }
 
 func (metrics *ProgressMetrics) Snapshot() ProgressMetricsSnapshot {
 	if metrics == nil {
 		return ProgressMetricsSnapshot{}
 	}
-	return ProgressMetricsSnapshot{
+	snapshot := ProgressMetricsSnapshot{
 		ProposalBatches:    metrics.proposalBatches.Load(),
 		ProposalCommands:   metrics.proposalCommands.Load(),
 		ProposalBytes:      metrics.proposalBytes.Load(),
@@ -252,4 +354,6 @@ func (metrics *ProgressMetrics) Snapshot() ProgressMetricsSnapshot {
 		ReadCompletions:    metrics.readCompletions.Load(),
 		Faults:             metrics.faults.Load(),
 	}
+	metrics.scheduler.snapshot(&snapshot)
+	return snapshot
 }

@@ -863,6 +863,8 @@ driveDirect:
 	if err := runtime.reservePipelinedReady(); err != nil {
 		return DriveResult{}, err
 	}
+	proposalCount := runtime.proposalBatchEntries
+	proposalBytes := runtime.proposalBatchBytes
 	ready, captured, err := runtime.node.CapturePipelinedReady()
 	if err != nil {
 		return DriveResult{}, runtime.fail(err)
@@ -914,7 +916,8 @@ driveDirect:
 	}
 	runtime.proposalBatchEntries = 0
 	runtime.proposalBatchBytes = 0
-	result := DriveResult{Kind: DriveCaptured, ReadOutcomes: ready.ReadOutcomes}
+	result := DriveResult{Kind: DriveCaptured, ReadOutcomes: ready.ReadOutcomes,
+		ProposalCount: proposalCount, ProposalBytes: proposalBytes}
 	if len(ready.ReadOutcomes) != 0 {
 		result.Kind = DriveReadStatesFinished
 	}

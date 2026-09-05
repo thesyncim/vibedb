@@ -262,8 +262,8 @@ jobs:
         env:
           GOAMD64: v1
         run: |
-          GOEXPERIMENT=nosimd go test -count=1 -timeout=5m ./internal/storeio -run 'Test(CountCompact|CompactPacked|CompactInteger(Ordered|Interval)|CompactStream|CompactPrimaryStripe)'
-          GOEXPERIMENT=nosimd go test -count=1 -timeout=5m ./query -run '^TestFilePacked(EqualityCount|OrderedCount|IntegerInterval).*$'
+          GOEXPERIMENT=nosimd go test -count=1 -timeout=5m ./internal/storeio -run 'Test(CountCompact|CompactPacked|CompactInteger(Ordered|Interval|Extrema)|CompactStream|CompactPrimaryStripe|PrimaryGraphIntegerExtrema)'
+          GOEXPERIMENT=nosimd go test -count=1 -timeout=5m ./query -run '^TestFilePacked(EqualityCount|OrderedCount|IntegerInterval|IntegerExtrema).*$'
       - name: SIMD packed-count fallback with AVX2 disabled (AMD64)
         if: matrix.runner == 'ubuntu-latest'
         shell: bash
@@ -283,7 +283,7 @@ jobs:
             go env -json GOARCH GOAMD64 GOEXPERIMENT
             printf 'GODEBUG=%s\n' "${GODEBUG}"
           } > "${evidence}/environment.txt"
-          tests='Test(CountCompact|CompactPacked|CompactInteger(Ordered|Interval))|^TestFilePacked(EqualityCount|OrderedCount|IntegerInterval).*$'
+          tests='Test(CountCompact|CompactPacked|CompactInteger(Ordered|Interval|Extrema)|PrimaryGraphIntegerExtrema)|^TestFilePacked(EqualityCount|OrderedCount|IntegerInterval|IntegerExtrema).*$'
           printf 'GOAMD64=v1 GOEXPERIMENT=simd GODEBUG=cpu.avx2=off go test -v -count=1 -timeout=5m ./internal/storeio ./query -run %q\n' \
             "${tests}" > "${evidence}/commands.txt"
           go test -v -count=1 -timeout=5m ./internal/storeio ./query \

@@ -1011,6 +1011,8 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 	readyBlocked := false
 	var deferredRead ownerRequest
 	deferredReadPending := false
+	var ingressBarrier ownerRequest
+	ingressBarrierPending := false
 	collector := newProposalIngressCollector(owner.limits.MaxIngressItems)
 	var asyncNotify <-chan struct{}
 	var asyncHost asyncOwnerHost
@@ -1053,6 +1055,48 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 		collector.reset()
 		return nil
 	}
+	// admitIngressTurn performs one nonblocking, bounded admission quantum after
+	// Host admits a proposal prefix. It exposes already-waiting proposals to the
+	// Runtime's one late-join opportunity without letting a continuously full
+	// ingress channel postpone the next Host turn.
+	admitIngressTurn := func() error {
+		if ingressBarrierPending {
+			return nil
+		}
+		select {
+		case request := <-owner.ingress:
+			readyBlocked = false
+			if !proposalIngressCandidate(request) {
+				// This quantum exists only to make an already-admitted proposal
+				// window visible to newly queued proposals. Retain the first other
+				// request as an exact ordering barrier until Host has drained Ready;
+				// campaign, membership, and schema controls must not be attempted
+				// between capture and its durability boundary.
+				ingressBarrier, ingressBarrierPending = request, true
+				return nil
+			}
+			collector.start(request)
+			barrier, barrierPresent, drainErr := collector.drain(owner.ingress, handleRequest)
+			if drainErr != nil && !errors.Is(drainErr, errOwnerReadDeferred) {
+				failCollected(errors.Join(ErrOwnerClosed, drainErr))
+				return drainErr
+			}
+			if errors.Is(drainErr, errOwnerReadDeferred) {
+				deferredRead, deferredReadPending = barrier, true
+			}
+			if err := flushCollected(); err != nil {
+				return err
+			}
+			if deferredReadPending {
+				return nil
+			}
+			if barrierPresent {
+				ingressBarrier, ingressBarrierPending = barrier, true
+			}
+		default:
+		}
+		return nil
+	}
 	offerTicks := func() error {
 		for _, group := range owner.groups {
 			switch err := owner.host.RequestTick(group); err {
@@ -1080,6 +1124,12 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 			owner.release(deferredRead.bytes)
 			deferredRead = ownerRequest{}
 			deferredReadPending = false
+		}
+		if ingressBarrierPending {
+			ingressBarrier.reply <- ownerReply{err: errors.Join(ErrOwnerClosed, runErr)}
+			owner.release(ingressBarrier.bytes)
+			ingressBarrier = ownerRequest{}
+			ingressBarrierPending = false
 		}
 	}()
 	for {
@@ -1145,7 +1195,14 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 					return owner.stop(err)
 				}
 				owner.finishReadOutcomes(progress.ReadOutcomes)
-				continue
+				if !deferredReadPending {
+					if progress.Kind == multiraft.ProgressProposal {
+						if err := admitIngressTurn(); err != nil {
+							return owner.stop(err)
+						}
+					}
+					continue
+				}
 			}
 		}
 
@@ -1156,6 +1213,9 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 					deferredRead = ownerRequest{}
 					deferredReadPending = false
 					if err != nil {
+						return owner.stop(err)
+					}
+					if err := admitIngressTurn(); err != nil {
 						return owner.stop(err)
 					}
 					continue
@@ -1184,6 +1244,21 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 				if err := offerTicks(); err != nil {
 					return owner.stop(err)
 				}
+			}
+			continue
+		}
+
+		if ingressBarrierPending {
+			request := ingressBarrier
+			ingressBarrier = ownerRequest{}
+			ingressBarrierPending = false
+			readyBlocked = false
+			if err := handleRequest(request); err != nil {
+				if errors.Is(err, errOwnerReadDeferred) {
+					deferredRead, deferredReadPending = request, true
+					continue
+				}
+				return owner.stop(err)
 			}
 			continue
 		}

@@ -1,7 +1,12 @@
 # Durable SQL write domains and prepared single-participant updates
 
-Implemented after explicit approval on 2026-09-04 to change the write protocol.
-The earlier automatic-review block is superseded by that approval. This change
+[Documentation](README.md) / [Research records](design/research.md)
+
+**Record scope:** This page retains a dated proposal or investigation. Its
+revision-specific findings and future work are not the current operating guide.
+See [architecture](architecture.md) and [operations](operations/README.md).
+
+Implemented on 2026-09-04. This protocol change
 fixes a correctness defect exposed by the CockroachDB comparison and removes
 unnecessary coordination for exact primary-key updates. It is not evidence of
 performance or feature parity with CockroachDB.
