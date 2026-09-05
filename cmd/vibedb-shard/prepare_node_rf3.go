@@ -70,6 +70,7 @@ type persistedRF3NodeRuntime struct {
 	GatewaySeeds        []nodecontrol.BootstrapGatewaySeed `json:"bootstrap_gateway_seeds,omitempty"`
 	ReplicaControl      persistedRF3ReplicaControl         `json:"replica_control"`
 	SplitControl        persistedRF3NodeSplitControl       `json:"split_control"`
+	ReadAuthority       *rf3ManifestReadAuthority          `json:"read_authority,omitempty"`
 	Gateway             *rf3ManifestGateway                `json:"gateway,omitempty"`
 	Groups              []persistedRF3NodeGroup            `json:"groups"`
 }
@@ -140,6 +141,7 @@ func provisionRF3Node(input prepareRF3NodeManifest) (resultErr error) {
 	var firstTLS rf3ManifestTLS
 	var firstPolicy string
 	var firstGatewaySeeds []nodecontrol.BootstrapGatewaySeed
+	var firstReadAuthority *rf3ManifestReadAuthority
 	var firstReplica persistedRF3ReplicaControl
 	var firstSplit persistedRF3NodeSplitControl
 	unionNodes := make(map[rafttransport.NodeID]string, rf3ManifestMembers*len(input.Groups))
@@ -173,6 +175,7 @@ func provisionRF3Node(input prepareRF3NodeManifest) (resultErr error) {
 		if i == 0 {
 			identity = current
 			firstListeners, firstTLS, firstPolicy = group.Listeners, group.TLS, group.AuthorizationPolicy
+			firstReadAuthority = group.ReadAuthority
 			firstReplica = prepared.ReplicaControl
 			firstSplit = persistedRF3NodeSplitControl{
 				MaxRecords:    prepared.SplitControl.MaxRecords,
@@ -181,6 +184,7 @@ func provisionRF3Node(input prepareRF3NodeManifest) (resultErr error) {
 				MaxOperations: prepared.SplitControl.ChildRegistry.MaxOperations,
 			}
 		} else if current != identity || group.Listeners != firstListeners || group.TLS != firstTLS || group.AuthorizationPolicy != firstPolicy ||
+			!rf3ReadAuthorityManifestEqual(group.ReadAuthority, firstReadAuthority) ||
 			prepared.ReplicaControl.MaxActionRecords != firstReplica.MaxActionRecords ||
 			prepared.ReplicaControl.MaxSourceRecords != firstReplica.MaxSourceRecords ||
 			prepared.ReplicaControl.MaxSourceArtifacts != firstReplica.MaxSourceArtifacts ||
@@ -290,7 +294,7 @@ func provisionRF3Node(input prepareRF3NodeManifest) (resultErr error) {
 		}
 		return 0
 	}(), Gateway: nodeGateway, Listeners: firstListeners, TLS: firstTLS, AuthorizationPolicy: firstPolicy,
-		GatewaySeeds: firstGatewaySeeds, ReplicaControl: nodeReplica,
+		GatewaySeeds: firstGatewaySeeds, ReadAuthority: firstReadAuthority, ReplicaControl: nodeReplica,
 		SplitControl: nodeSplit}
 	runtime.NodeLog.KeyMaterialPath = filepath.Join(input.Root, "node-key")
 	for _, manifest := range manifests {

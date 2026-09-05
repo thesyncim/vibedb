@@ -1,6 +1,17 @@
 package storeio
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
+
+// ErrUnifiedProjectionFallbackUnsupported asks the cursor to decline the
+// native range when a caller's bounded reconstruction scratch cannot hold a
+// fallback row. It is kept separate from storage/callback errors so the query
+// can retry the immutable range through its generic reader.
+var ErrUnifiedProjectionFallbackUnsupported = errors.New(
+	"storeio: bounded projection fallback unsupported",
+)
 
 // UnifiedProjectionFilter is reusable state for a set of direct scalar paths.
 // Resolvers are kept separate from per-leaf stream views so the filter can be
@@ -29,7 +40,9 @@ func NewUnifiedProjectionFilter(paths [][]byte) (*UnifiedProjectionFilter, error
 // UnifiedProjectionProgress reports rows delivered by a successful projected
 // scan. A declined or failed scan resets it to zero.
 type UnifiedProjectionProgress struct {
-	Scanned int
+	Scanned       int
+	Matched       int
+	NativeMatched int
 }
 
 // VisitProjected walks the cursor's bounded primary range in lexical order,
@@ -47,8 +60,62 @@ func (c *PrimaryGraphCursor) VisitProjected(
 	limit int,
 	visit func(row uint64, fields []UnifiedProjectionField) error,
 ) (supported, stopped bool, scratch []byte, err error) {
-	// Page-backed streams must disappear before any cursor lease is released,
-	// including error paths and movement to the next leaf.
+	fieldCount := 0
+	if f != nil {
+		fieldCount = len(f.resolvers)
+	}
+	return c.VisitProjectedMatch(
+		f, progress, fieldCount, shapeSeen, shapeWork, streamWork,
+		fields, valueScratch, limit, nil, visit, nil,
+	)
+}
+
+// VisitProjectedMatch walks one bounded range with a filter prefix. The prefix
+// is decoded for every row and passed to match; the remaining fields are decoded
+// only when match accepts the row. A row that cannot be answered by the compact
+// scalar streams is reconstructed through the same cursor and handed to
+// fallback, which lets the caller preserve progress without rescanning the
+// prefix. fallback receives either inline JSON or an overflow reference (never
+// both) and reports whether the row was accepted after its generic recheck.
+func (c *PrimaryGraphCursor) VisitProjectedMatch(
+	f *UnifiedProjectionFilter,
+	progress *UnifiedProjectionProgress,
+	filterCount int,
+	shapeSeen []int,
+	shapeWork []UnifiedProjectionShapeWorkspace,
+	streamWork []UnifiedProjectionStreamWorkspace,
+	fields []UnifiedProjectionField,
+	valueScratch []byte,
+	limit int,
+	match func(row uint64, fields []UnifiedProjectionField) (bool, error),
+	visit func(row uint64, fields []UnifiedProjectionField) error,
+	fallback func(row uint64, raw []byte, overflow PageRef) (bool, error),
+) (supported, stopped bool, scratch []byte, err error) {
+	return c.VisitProjectedMatchWithReserve(
+		f, progress, filterCount, shapeSeen, shapeWork, streamWork,
+		fields, valueScratch, limit, match, visit, fallback, nil,
+	)
+}
+
+// VisitProjectedMatchWithReserve is VisitProjectedMatch with one optional
+// callback for lazily growing the caller-owned fallback reconstruction buffer.
+// The ordinary entry point remains a thin wrapper for storage callers that do
+// not need generic row reconstruction.
+func (c *PrimaryGraphCursor) VisitProjectedMatchWithReserve(
+	f *UnifiedProjectionFilter,
+	progress *UnifiedProjectionProgress,
+	filterCount int,
+	shapeSeen []int,
+	shapeWork []UnifiedProjectionShapeWorkspace,
+	streamWork []UnifiedProjectionStreamWorkspace,
+	fields []UnifiedProjectionField,
+	valueScratch []byte,
+	limit int,
+	match func(row uint64, fields []UnifiedProjectionField) (bool, error),
+	visit func(row uint64, fields []UnifiedProjectionField) error,
+	fallback func(row uint64, raw []byte, overflow PageRef) (bool, error),
+	reserveFallback func(required int) ([]byte, error),
+) (supported, stopped bool, scratch []byte, err error) {
 	clearViews := func() {
 		clear(streamWork)
 		clear(fields)
@@ -60,7 +127,9 @@ func (c *PrimaryGraphCursor) VisitProjected(
 		}
 	}()
 	if c == nil || f == nil || progress == nil || visit == nil ||
-		len(f.resolvers) == 0 || len(c.prefix) != 0 {
+		len(f.resolvers) == 0 || len(c.prefix) != 0 || filterCount < 0 ||
+		filterCount > len(f.resolvers) ||
+		(match == nil && filterCount != 0 && filterCount != len(f.resolvers)) {
 		return false, false, valueScratch, nil
 	}
 	if c.done {
@@ -69,84 +138,258 @@ func (c *PrimaryGraphCursor) VisitProjected(
 	if limit == 0 {
 		return true, true, valueScratch, nil
 	}
+	fieldCount := len(f.resolvers)
 	if len(shapeSeen) == 0 || len(shapeWork) == 0 ||
-		len(streamWork) < len(f.resolvers) ||
-		len(fields) < len(f.resolvers) {
+		len(streamWork) < fieldCount || len(fields) < fieldCount {
 		return false, false, valueScratch, nil
 	}
-	remaining := limit
+
+	// A fallback row is still one evaluated row. Keep the cursor's physical row
+	// ordinal moving before the callback so a callback that takes a slow overflow
+	// path cannot leave the cursor positioned on the same row.
+	fallbackRow := func(row int, ordinal uint64, ref PageRef) (bool, bool, error) {
+		if fallback == nil {
+			return false, false, nil
+		}
+		if ref != (PageRef{}) {
+			accepted, fallbackErr := fallback(ordinal, nil, ref)
+			if fallbackErr == ErrUnifiedProjectionFallbackUnsupported {
+				return false, false, nil
+			}
+			return accepted, true, fallbackErr
+		}
+		required, ok := c.leaf.valueLength(row)
+		if !ok {
+			return false, false, nil
+		}
+		if required > cap(c.spliceScratch) {
+			if reserveFallback == nil {
+				return false, false, nil
+			}
+			buffer, reserveErr := reserveFallback(required)
+			if reserveErr != nil {
+				return false, false, reserveErr
+			}
+			if cap(buffer) < required {
+				return false, false, ErrUnifiedProjectionFallbackUnsupported
+			}
+			c.spliceScratch = buffer[:0]
+		}
+		dst := c.spliceScratch[:0:cap(c.spliceScratch)]
+		dst, ok = c.leaf.AppendValue(dst, row)
+		if !ok || len(dst) != required || cap(dst) != cap(c.spliceScratch) {
+			return false, false, nil
+		}
+		c.spliceScratch = dst
+		accepted, fallbackErr := fallback(ordinal, c.spliceScratch, PageRef{})
+		if fallbackErr == ErrUnifiedProjectionFallbackUnsupported {
+			return false, false, nil
+		}
+		return accepted, true, fallbackErr
+	}
+
 	for {
 		leafLimit := c.leaf.Len()
 		if len(c.upper) != 0 {
 			leafLimit, err = c.upperRankFromCurrent(c.upper)
 			if err != nil {
-				*progress = UnifiedProjectionProgress{}
-				clearViews()
 				c.Close()
 				return false, false, valueScratch, err
 			}
 		}
 		if leafLimit < c.row || leafLimit > c.leaf.Len() {
-			*progress = UnifiedProjectionProgress{}
-			clearViews()
 			c.Close()
 			return false, false, valueScratch, ErrCommonPrimaryLeafCorrupt
 		}
-		end := leafLimit
-		stopsAtLimit := false
-		if remaining > 0 && end-c.row > remaining {
-			end = c.row + remaining
-			stopsAtLimit = true
-		}
-		before := progress.Scanned
-		if before < 0 || before > int(^uint(0)>>1)-(end-c.row) {
-			clearViews()
-			c.Close()
-			return false, false, valueScratch, ErrCommonPrimaryLeafCorrupt
-		}
-		ok, localStopped, valueScratch, scanErr := c.leaf.visitResolvedProjectionRange(
-			c.row, end, stopsAtLimit, f.resolvers, shapeSeen, shapeWork,
-			streamWork, fields, valueScratch,
-			func(row int, values []UnifiedProjectionField) error {
-				if row < c.row || before < 0 || before > int(^uint(0)>>1)-(row-c.row) {
-					return fmt.Errorf("%w: projected row ordinal", ErrCommonPrimaryLeafCorrupt)
+		shapeCount := c.leaf.ShapeCount()
+		if shapeCount > len(shapeSeen) || shapeCount > len(shapeWork) ||
+			(shapeCount > 0 && fieldCount > len(streamWork)/shapeCount) {
+			// The caller deliberately admits only a bounded shape slab. Consume
+			// this leaf through the same cursor so rows already delivered from
+			// earlier leaves are not visited again by the generic retry.
+			for c.row < leafLimit {
+				row := c.row
+				ordinal := uint64(progress.Scanned)
+				ref, overflow := c.leaf.OverflowRef(row)
+				var accepted, handled bool
+				if overflow {
+					accepted, handled, err = fallbackRow(row, ordinal, ref)
+				} else {
+					accepted, handled, err = fallbackRow(row, ordinal, PageRef{})
 				}
-				return visit(uint64(before+row-c.row), values)
-			},
-		)
-		if scanErr != nil {
-			*progress = UnifiedProjectionProgress{}
+				if err != nil {
+					return false, false, valueScratch, err
+				}
+				if !handled {
+					c.Close()
+					return false, false, valueScratch, nil
+				}
+				c.row++
+				progress.Scanned++
+				if accepted {
+					progress.Matched++
+					if limit > 0 && progress.Matched >= limit {
+						return true, true, valueScratch, nil
+					}
+				}
+			}
+			if leafLimit < c.leaf.Len() {
+				c.Close()
+				return true, false, valueScratch, nil
+			}
 			clearViews()
+			if err := c.advanceLeaf(); err != nil {
+				c.Close()
+				return false, false, valueScratch, err
+			}
+			if c.done {
+				return true, false, valueScratch, nil
+			}
+			continue
+		}
+		clear(shapeSeen[:shapeCount])
+		clear(shapeWork[:shapeCount])
+		clear(streamWork[:shapeCount*fieldCount])
+
+		for c.row < leafLimit {
+			row := c.row
+			ordinal := uint64(progress.Scanned)
+			var accepted bool
+			var handled bool
+			shape := -1
+			if ref, overflow := c.leaf.OverflowRef(row); overflow {
+				accepted, handled, err = fallbackRow(row, ordinal, ref)
+				if !handled && err == nil {
+					c.Close()
+					return false, false, valueScratch, nil
+				}
+			} else {
+				shape = c.leaf.rowShape(row)
+				if shape < 0 || shape >= shapeCount {
+					// A malformed shape cannot be reconstructed as an inline row;
+					// let the complete caller-owned fallback decide the range.
+					accepted, handled, err = false, false, nil
+					if fallback != nil {
+						accepted, handled, err = fallbackRow(row, ordinal, PageRef{})
+					}
+					if !handled && err == nil {
+						c.Close()
+						return false, false, valueScratch, nil
+					}
+				} else {
+					meta := &shapeWork[shape]
+					base := shape * fieldCount
+					if !meta.prepared {
+						meta.prepared = true
+						if !prepareUnifiedProjectionShape(
+							&c.leaf, shape, f.resolvers, meta,
+							streamWork[base:base+fieldCount], valueScratch,
+						) {
+							meta.unsupported = true
+						}
+					}
+					if meta.unsupported {
+						accepted, handled, err = fallbackRow(row, ordinal, PageRef{})
+						if !handled && err == nil {
+							c.Close()
+							return false, false, valueScratch, nil
+						}
+					} else {
+						rowOrdinal := c.leaf.shapeOrdinal(row, shape)
+						if rowOrdinal < 0 || rowOrdinal >= meta.rows {
+							accepted, handled, err = fallbackRow(row, ordinal, PageRef{})
+							if !handled && err == nil {
+								c.Close()
+								return false, false, valueScratch, nil
+							}
+						} else {
+							valueScratch = valueScratch[:0]
+							for field := 0; field < filterCount; field++ {
+								stream := &streamWork[base+field]
+								if stream.hole == UnifiedHoleAbsent {
+									fields[field] = UnifiedProjectionField{Kind: UnifiedProjectionFieldMissing}
+									continue
+								}
+								var fieldOK bool
+								valueScratch, fieldOK = compactProjectionFieldAt(
+									&stream.view, rowOrdinal, valueScratch,
+									&fields[field], &stream.state,
+								)
+								if !fieldOK {
+									accepted, handled, err = fallbackRow(row, ordinal, PageRef{})
+									if !handled && err == nil {
+										c.Close()
+										return false, false, valueScratch, nil
+									}
+									break
+								}
+							}
+							if !handled && err == nil {
+								if match == nil {
+									accepted = true
+								} else {
+									accepted, err = match(ordinal, fields[:filterCount])
+								}
+								if err == nil && accepted {
+									for field := filterCount; field < fieldCount; field++ {
+										stream := &streamWork[base+field]
+										if stream.hole == UnifiedHoleAbsent {
+											fields[field] = UnifiedProjectionField{Kind: UnifiedProjectionFieldMissing}
+											continue
+										}
+										var fieldOK bool
+										valueScratch, fieldOK = compactProjectionFieldAt(
+											&stream.view, rowOrdinal, valueScratch,
+											&fields[field], &stream.state,
+										)
+										if !fieldOK {
+											accepted, handled, err = fallbackRow(row, ordinal, PageRef{})
+											if !handled && err == nil {
+												c.Close()
+												return false, false, valueScratch, nil
+											}
+											break
+										}
+									}
+								}
+								if err == nil && !handled && accepted {
+									err = visit(ordinal, fields[:fieldCount])
+								}
+							}
+						}
+					}
+				}
+			}
+			if err != nil {
+				return false, false, valueScratch, err
+			}
+			if shape >= 0 && shape < shapeCount {
+				shapeSeen[shape]++
+			}
+			c.row++
+			progress.Scanned++
+			if accepted {
+				progress.Matched++
+				if !handled {
+					progress.NativeMatched++
+				}
+				if limit > 0 && progress.Matched >= limit {
+					return true, true, valueScratch, nil
+				}
+			}
+		}
+		for shape := 0; shape < shapeCount; shape++ {
+			if shapeSeen[shape] > shapeWork[shape].rows {
+				c.Close()
+				return false, false, valueScratch, nil
+			}
+		}
+		if leafLimit < c.leaf.Len() {
 			c.Close()
-			return false, false, valueScratch, scanErr
-		}
-		if !ok {
-			*progress = UnifiedProjectionProgress{}
-			clearViews()
-			c.Close()
-			return false, false, valueScratch, nil
-		}
-		delivered := end - c.row
-		progress.Scanned += delivered
-		c.row = end
-		if remaining > 0 {
-			remaining -= delivered
-		}
-		if localStopped || remaining == 0 && limit > 0 {
-			return true, true, valueScratch, nil
-		}
-		if end < leafLimit {
 			return true, false, valueScratch, nil
 		}
 		clearViews()
-		if leafLimit < c.leaf.Len() {
-			// The upper fence is inside this leaf. No later leaf belongs to
-			// the range, even if its selected fields would be unsupported.
-			c.Close()
-			return true, false, valueScratch, nil
-		}
 		if err := c.advanceLeaf(); err != nil {
-			*progress = UnifiedProjectionProgress{}
 			c.Close()
 			return false, false, valueScratch, err
 		}

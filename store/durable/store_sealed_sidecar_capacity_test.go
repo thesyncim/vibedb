@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 package durable
 
@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/storeio"
@@ -21,6 +22,7 @@ func requireSealedSidecarEnvironment(t *testing.T, err error) {
 
 func TestSealedRecoveryJournalCreateAndExactOpen(t *testing.T) {
 	options := sealedSyncJournalOptions(t)
+	options.PortableSealedCapacity = runtime.GOOS != "linux"
 	path := filepath.Join(t.TempDir(), "sealed.vjc")
 	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
@@ -66,7 +68,7 @@ func TestSealedRecoveryJournalCreateAndExactOpen(t *testing.T) {
 func TestSealedTxnLogCreateRecoveryAndExactMismatch(t *testing.T) {
 	const capacity = uint64(64 * storeio.TxnMarkerMinSectorSize)
 	dir := t.TempDir()
-	options := TxnLogOptions{Capacity: capacity, SealedCapacity: true}
+	options := TxnLogOptions{Capacity: capacity, SealedCapacity: true, PortableCapacity: runtime.GOOS != "linux"}
 	log, err := NewTxnLog(dir, options)
 	if err != nil {
 		t.Fatal(err)
@@ -111,7 +113,7 @@ func TestSealedTxnLogCreateRecoveryAndExactMismatch(t *testing.T) {
 	}
 	if _, _, err := OpenCollectionsWithTransactions(dir, TxnLogOptions{
 		Capacity:       capacity + storeio.TxnMarkerMinSectorSize,
-		SealedCapacity: true,
+		SealedCapacity: true, PortableCapacity: runtime.GOOS != "linux",
 	}, nil); !errors.Is(err, ErrSealedJournalCapacity) {
 		t.Fatalf("wrong sealed marker recovery = %v, want mismatch", err)
 	}
@@ -120,7 +122,7 @@ func TestSealedTxnLogCreateRecoveryAndExactMismatch(t *testing.T) {
 func TestSealedTxnLogRetainsDischargedWindowUntilPressureRecycle(t *testing.T) {
 	const capacity = uint64(64 * storeio.TxnMarkerMinSectorSize)
 	dir := t.TempDir()
-	options := TxnLogOptions{Capacity: capacity, SealedCapacity: true}
+	options := TxnLogOptions{Capacity: capacity, SealedCapacity: true, PortableCapacity: runtime.GOOS != "linux"}
 	log, err := NewTxnLog(dir, options)
 	if err != nil {
 		t.Fatal(err)

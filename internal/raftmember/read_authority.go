@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sync/atomic"
 
 	"github.com/thesyncim/vibedb/internal/raftauthority"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
@@ -49,6 +50,19 @@ type ReadAuthorityOptions struct {
 	LeaderIncarnation func(memberID uint64) (uint64, bool, error)
 }
 
+// ReadAuthorityRoundMetrics is a detached protocol counter cut. Started is
+// incremented only after a new holder request has been admitted, so it measures
+// actual quorum rounds rather than per-read Ensure calls. RequestsCreated is
+// incremented when each remote request is appended to the bounded outbound
+// queue; it does not claim that transport sent the request. GrantsAccepted
+// includes the local self-grant and each distinct accepted remote grant; replayed
+// or duplicate grants are excluded.
+type ReadAuthorityRoundMetrics struct {
+	RoundsStarted   uint64
+	RequestsCreated uint64
+	GrantsAccepted  uint64
+}
+
 type runtimeAuthority struct {
 	policy  raftauthority.ReadAuthorityPolicy
 	clock   *raftauthority.CheckedClock
@@ -65,6 +79,12 @@ type runtimeAuthority struct {
 	disabled          bool
 	leaderIncarnation func(uint64) (uint64, bool, error)
 	outbound          []OutboundMessage
+	// These counters are read by diagnostics outside the serialized owner. The
+	// protocol state itself remains single-owner; only the detached counters are
+	// atomic.
+	roundsStarted   atomic.Uint64
+	requestsCreated atomic.Uint64
+	grantsAccepted  atomic.Uint64
 }
 
 func authorityGroupKey(group GroupKey) raftauthority.GroupIdentity {
@@ -139,6 +159,20 @@ func (runtime *Runtime) ConfigureReadAuthority(options ReadAuthorityOptions) err
 // not itself authorize a read.
 func (runtime *Runtime) ReadAuthorityEnabled() bool {
 	return runtime != nil && runtime.authority != nil && !runtime.authority.disabled
+}
+
+// ReadAuthorityRoundMetrics returns the actual protocol-round counters for
+// this Runtime. It has no side effects and never enters the Owner or transport.
+func (runtime *Runtime) ReadAuthorityRoundMetrics() ReadAuthorityRoundMetrics {
+	if runtime == nil || runtime.authority == nil {
+		return ReadAuthorityRoundMetrics{}
+	}
+	state := runtime.authority
+	return ReadAuthorityRoundMetrics{
+		RoundsStarted:   state.roundsStarted.Load(),
+		RequestsCreated: state.requestsCreated.Load(),
+		GrantsAccepted:  state.grantsAccepted.Load(),
+	}
 }
 
 func (runtime *Runtime) authorityElectionGate(input raftmodel.ElectionInput) error {
@@ -329,6 +363,7 @@ func (runtime *Runtime) StartReadAuthorityRound() error {
 	if err := round.AddGrant(selfGrant); err != nil {
 		return err
 	}
+	state.grantsAccepted.Add(1)
 	if state.round == nil {
 		state.round = round
 	} else {
@@ -345,7 +380,55 @@ func (runtime *Runtime) StartReadAuthorityRound() error {
 			Authority: &raftauthority.Message{Kind: raftauthority.MessageRequest, Request: requestCopy},
 		})
 	}
+	state.roundsStarted.Add(1)
+	state.requestsCreated.Add(uint64(len(state.outbound)))
 	return nil
+}
+
+// EnsureReadAuthorityRound offers one bounded renewal/acquisition opportunity
+// for a read owner. A usable token is reused until its conservative renewal
+// lead window; repeated reads outside that window do not emit quorum traffic.
+// Once due, StartReadAuthorityRound retains the existing token and permits at
+// most one newer candidate, so a slow or partitioned quorum cannot create an
+// unbounded stream of rounds.
+func (runtime *Runtime) EnsureReadAuthorityRound() error {
+	if err := runtime.requireEmptyInputWindow(); err != nil {
+		return err
+	}
+	state := runtime.authority
+	if state == nil || state.disabled {
+		return raftauthority.ErrPolicyDisabled
+	}
+	token, err := runtime.ReadAuthorityToken()
+	if err == nil {
+		now, nowErr := state.clock.Now()
+		if nowErr != nil {
+			return nowErr
+		}
+		usable, usableErr := state.policy.UsableDuration()
+		if usableErr != nil {
+			return usableErr
+		}
+		// A quarter of the conservative serving window gives the quorum a
+		// bounded renewal lead without turning every read into a round. Keep
+		// at least the configured rounding margin so a sub-millisecond policy
+		// cannot schedule a renewal after its usable deadline.
+		lead := usable / 4
+		if lead < state.policy.RoundingMargin {
+			lead = state.policy.RoundingMargin
+		}
+		if token.ExpiresAt > now && token.ExpiresAt-now > lead {
+			return nil
+		}
+	} else if errors.Is(err, raftauthority.ErrClockFault) ||
+		errors.Is(err, raftauthority.ErrClockUnavailable) ||
+		errors.Is(err, raftauthority.ErrClockRollback) ||
+		errors.Is(err, raftauthority.ErrDeadlineOverflow) {
+		// A clock fault is permanent for this owner. Do not turn it into an
+		// apparently successful fallback or keep retrying rounds.
+		return err
+	}
+	return runtime.StartReadAuthorityRound()
 }
 
 // DrainAuthorityOutbound transfers one detached request to the Host. The
@@ -485,6 +568,15 @@ func (runtime *Runtime) StepAuthorityMessageFrom(
 	}
 	observation, err := runtime.ReadAuthorityObservation()
 	if err != nil {
+		// A topology cache miss or a just-published voter-set change only
+		// invalidates this authority record.  Treat it as a protocol drop so a
+		// stale authority request cannot stall the Host's ordinary Raft lane;
+		// the caller will keep using the quorum-backed ReadIndex path.  Clock
+		// faults and ownership failures remain visible and fail closed.
+		if errors.Is(err, ErrAuthorityLeaderIncarnationUnavailable) ||
+			errors.Is(err, ErrAuthorityConfigurationMismatch) {
+			return OutboundMessage{}, false, nil
+		}
 		return OutboundMessage{}, false, err
 	}
 	switch message.Kind {
@@ -529,6 +621,7 @@ func (runtime *Runtime) StepAuthorityMessageFrom(
 			}
 			return OutboundMessage{}, false, err
 		}
+		state.grantsAccepted.Add(1)
 		return OutboundMessage{}, false, nil
 	default:
 		return OutboundMessage{}, false, nil

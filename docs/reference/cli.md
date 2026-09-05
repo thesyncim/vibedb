@@ -37,6 +37,9 @@ Creates or reopens one durable local development topology and supervises its chi
 | `--diagnostics-on-exit` | `false` | Print bounded child log tails after shutdown. |
 | `--pg-listen` | disabled | RF3-only PostgreSQL endpoint on the first physical node. Requires a literal loopback IP and port `1..65535`. |
 | `--pg-listens` | disabled | Comma-separated distinct loopback endpoints, one per physical node. Mutually exclusive with `--pg-listen`. |
+| `--tls-ca-certificate` | disabled | Absolute PEM CA certificate used to sign this local cluster's leaf identities; must be paired with `--tls-ca-key`. The CA is local provisioning input. |
+| `--tls-ca-key` | disabled | Absolute PEM CA private key paired with `--tls-ca-certificate`; it is read only during local provisioning and is never transmitted. |
+| `--read-authority` | `false` | Laboratory-only experimental RF3 read-authority protocol. Standard binaries reject this flag before cluster creation; the retained cluster must use the same setting. |
 | `--table-schema` | none | Repeatable RF3-only file, each containing one `CREATE TABLE` with one primary key; retained on restart. |
 
 RF1 starts three independent single-member Raft groups and no gateway. RF3
@@ -45,6 +48,41 @@ Each node embeds a frontend and shares node storage across its groups; each
 catalog, request-ledger, and data group still has three replicas. The current
 launcher persists format-2 topology and rejects obsolete layouts. See the
 [local cluster tutorial](../operations/local-cluster.md).
+
+`--read-authority` is an explicit experimental qualification switch available
+only in a binary built with the laboratory tag below. A normal `go build`
+cannot enable it, and `vibedb-shard` also rejects an enabled read-authority
+section in a standard manifest before preparing, serving, reloading, or
+adopting any artifact. Build and label the qualification binaries explicitly:
+
+```sh
+go build -tags=vibedb_rf3_read_authority_lab -o ./bin/vibedb ./cmd/vibedb
+go build -tags=vibedb_rf3_read_authority_lab -o ./bin/vibedb-shard ./cmd/vibedb-shard
+go build -tags=vibedb_rf3_read_authority_lab -o ./bin/vibedb-gateway ./cmd/vibedb-gateway
+```
+
+Use those tagged binaries only for a separately labelled laboratory
+qualification. The tag is not part of the standard development build. The
+switch uses
+Linux `CLOCK_BOOTTIME`, a fixed v1 policy (5 s maximum grant, 100000 ppm rate
+bound, and 1 ms margin), and an authenticated asynchronous incarnation cache.
+Deployment assumes every participant's elapsed clock rate stays within ±10% of
+real elapsed time, including VM or container suspension and resume. Linux
+`CLOCK_BOOTTIME` availability and one successful startup `Now` call cannot
+prove that rate assumption or future suspend behavior, so qualify the host and
+virtualization environment separately. The holder's usable interval is about
+4.09 s of elapsed-clock time; a promise can delay a follower's election edge
+by the configured 5 s elapsed-clock grant window. These configured durations
+are not hard wall-clock upper bounds under the ±10% assumption (a slow clock
+can make 5 s about 5.56 s of real time). A restarted voter remains in about
+6.11 s of configured elapsed-clock quarantine, including the margin. An
+explicit enable on an unsupported platform or an unsupported
+topology is refused before the local policy marker is written. With the feature
+disabled, linearizable reads keep using the ordinary ReadIndex path. The
+launcher rejects a forgotten, changed, or downgraded setting on an existing
+root.
+An old binary cannot interpret the marker, so deployments must not restore a
+pre-enrollment manifest with an old binary while an authority marker is live.
 
 ### Online cluster control
 

@@ -1,0 +1,30 @@
+{
+  "vibedb-horizontal-ci-hot-failed.log": {
+    "bytes": 130364,
+    "sha256": "5972fd2ec42cec3a44ef04adfe325a6bb348f256838350e9bc2c723017c06618"
+  },
+  "vibedb-horizontal-ci-process-failed.log": {
+    "bytes": 1493097,
+    "sha256": "0a8afd074ec6cda32d6331f39d66e62c4a2cb0055c0b4b700dc533a5d465d138"
+  },
+  "vibedb-horizontal-ci-race-failed.log": {
+    "bytes": 355282,
+    "sha256": "3a585ce3604eda206e3489a0a53f92d4d971a19402952c0f3d824498e2a005d1"
+  },
+  "vibedb-horizontal-safe-checkpoint-race.log": {
+    "bytes": 355,
+    "sha256": "d9c332ade032a4ac01166b38d3ecd4da0cf7ac4285c291dd16ef7a9d483b37b2"
+  },
+  "vibedb-horizontal-safe-checkpoint-rf3-ready-race-repeat.log": {
+    "bytes": 29259,
+    "sha256": "b3cde2de0d5533e84f3d48d37f143a859d94b28f665c6ed49ad5e77573be549c"
+  },
+  "vibedb-horizontal-safe-checkpoint-transaction-race.log": {
+    "bytes": 30664,
+    "sha256": "3ec3281a2c82c2a2512f6fafe5a668acb66fa792fc51f1243ad1ca6646916769"
+  },
+  "vibedb-horizontal-safe-checkpoint-transaction-role-refresh-race.log": {
+    "bytes": 5332,
+    "sha256": "87f43d11d0cc7f4ab6171c73b5d94b1b524d6c46b545209b5f1810d8356f50ba"
+  }
+}

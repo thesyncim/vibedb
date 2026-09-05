@@ -453,7 +453,9 @@ func (s *stmt) queryRowsCandidates(
 				return nil, keyErr
 			}
 			s.conn.tx.trackSerializablePointReads(state, keys)
-			source, err = s.conn.pointTransactionSource(ctx, state, keys)
+			source, err = s.conn.pointTransactionSource(
+				ctx, state, keys, s.views == nil && !s.query.RequiresCatalog(),
+			)
 			if !candidateRead && errors.Is(err, errPointMaterializationTooLarge) {
 				source, err = s.conn.tx.querySource(s.query.Collection())
 			}
@@ -480,6 +482,10 @@ func (s *stmt) queryRowsCandidates(
 		if err != nil {
 			return nil, err
 		}
+		// A validated point source borrows the session document for synchronous
+		// execution. Result cells use executor-owned storage. Clear this wrapper
+		// on errors and panics too, before the caller can retire the transaction.
+		defer s.conn.pointSource.Bind(nil)
 		cursor, err := s.query.RunInto(&s.conn.exec, source, args)
 		if err != nil {
 			return nil, err
@@ -1040,13 +1046,30 @@ func (c *conn) pointTransactionSource(
 	ctx context.Context,
 	state *txTable,
 	keys []string,
+	validatedRaw bool,
 ) (query.Source, error) {
 	c.pointDocs.Reset()
+	c.pointSource.Bind(nil)
 	limit, err := driverQueryMemory(c.exec.Options)
 	if err != nil {
 		return query.Source{}, err
 	}
 	budget := pointMaterializationBudget{limit: limit}
+	if validatedRaw && state.pointBacked && len(keys) == 1 {
+		if err := contextCheckpoint(ctx); err != nil {
+			return query.Source{}, err
+		}
+		key := keys[0]
+		if !state.Keep(byteview.Bytes(key)) ||
+			!state.pointFound || key != state.pointKey {
+			return query.FromSnapshot(store.Snapshot{}), nil
+		}
+		if err := budget.add(key, state.pointDocument); err != nil {
+			return query.Source{}, err
+		}
+		c.pointSource.Bind(state.pointDocument)
+		return query.FromValidatedRaw(&c.pointSource), nil
+	}
 	document := c.pointRaw[:0]
 	for _, key := range keys {
 		if err := contextCheckpoint(ctx); err != nil {

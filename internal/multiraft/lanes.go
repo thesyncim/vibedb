@@ -129,6 +129,13 @@ func (lane *ExecutionLane) StartReadAuthorityRound(key raftmember.GroupKey) erro
 	return lane.set.StartReadAuthorityRound(key)
 }
 
+func (lane *ExecutionLane) EnsureReadAuthorityRound(key raftmember.GroupKey) error {
+	if err := lane.accepts(key); err != nil {
+		return err
+	}
+	return lane.set.EnsureReadAuthorityRound(key)
+}
+
 func (lane *ExecutionLane) ReadAuthorityToken(
 	key raftmember.GroupKey,
 ) (raftauthority.AuthorityToken, error) {
@@ -163,6 +170,12 @@ func (lane *ExecutionLane) ProposeConfChange(key raftmember.GroupKey, change pb.
 		return err
 	}
 	return lane.set.ProposeConfChange(key, change)
+}
+func (lane *ExecutionLane) ProposeControl(key raftmember.GroupKey, data []byte) error {
+	if err := lane.accepts(key); err != nil {
+		return err
+	}
+	return lane.set.ProposeControl(key, data)
 }
 func (lane *ExecutionLane) ReadIndex(key raftmember.GroupKey, context []byte) error {
 	if err := lane.accepts(key); err != nil {
@@ -568,6 +581,32 @@ func (set *ExecutionLanes) StartReadAuthorityRound(key raftmember.GroupKey) erro
 	})
 }
 
+func (set *ExecutionLanes) EnsureReadAuthorityRound(key raftmember.GroupKey) error {
+	return set.withGroup(key, func(host *Host) error {
+		return host.EnsureReadAuthorityRound(key)
+	})
+}
+
+// ReadAuthorityRoundMetrics returns one detached aggregate over all execution
+// lanes. Each lane is sampled under its owner lock, so a diagnostic cut never
+// races a Runtime mutation or retains any group state.
+func (set *ExecutionLanes) ReadAuthorityRoundMetrics() raftmember.ReadAuthorityRoundMetrics {
+	if set == nil {
+		return raftmember.ReadAuthorityRoundMetrics{}
+	}
+	var total raftmember.ReadAuthorityRoundMetrics
+	for index := range set.lanes {
+		lane := &set.lanes[index]
+		lane.mu.Lock()
+		metrics := lane.host.ReadAuthorityRoundMetrics()
+		lane.mu.Unlock()
+		total.RoundsStarted += metrics.RoundsStarted
+		total.RequestsCreated += metrics.RequestsCreated
+		total.GrantsAccepted += metrics.GrantsAccepted
+	}
+	return total
+}
+
 func (set *ExecutionLanes) ReadAuthorityToken(
 	key raftmember.GroupKey,
 ) (raftauthority.AuthorityToken, error) {
@@ -626,6 +665,10 @@ func (set *ExecutionLanes) EnqueueTrackedProposal(
 
 func (set *ExecutionLanes) ProposeConfChange(key raftmember.GroupKey, change pb.ConfChangeI) error {
 	return set.withGroup(key, func(host *Host) error { return host.ProposeConfChange(key, change) })
+}
+
+func (set *ExecutionLanes) ProposeControl(key raftmember.GroupKey, data []byte) error {
+	return set.withGroup(key, func(host *Host) error { return host.ProposeControl(key, data) })
 }
 
 func (set *ExecutionLanes) ReadIndex(key raftmember.GroupKey, context []byte) error {

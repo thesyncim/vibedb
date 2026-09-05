@@ -6,21 +6,35 @@ Start three physical serving nodes, connect with psql, and verify a write
 survives a clean restart. Each node combines a SQL frontend, Raft replicas,
 and shared node storage. The launcher creates local credentials and manifests.
 
-This is a Linux development environment with loopback SQL trust authentication.
+This is a macOS/Linux development environment with loopback SQL trust authentication.
 Use the same build to reopen its data; see [compatibility](../status.md).
 
 ## Prerequisites
 
-- A Linux host or Linux VM/container with a filesystem that supports strict
-  allocation for sealed recovery journals. Use a suitable Linux data volume
-  in a container; an overlay filesystem can reject the required allocation.
-  Native macOS cannot prepare this RF3 profile.
+- A macOS or Linux host with a local writable filesystem that supports the
+  WAL's native preallocation and durability operations. A normal local
+  directory works on macOS/APFS and ordinary Linux container overlay storage.
 - Go 1.27 or later and a repository checkout.
 - `psql` for the SQL steps.
 - A short, absolute path for disposable state, with space for node files.
 - Free loopback port `7432` for the SQL listener.
 
 Run the build and launcher commands from the repository root.
+
+RF3 journals use portable fixed-capacity allocation. A normal local directory
+is sufficient on macOS/APFS and ordinary Linux filesystems; the journals do not
+require Linux's reflink-unsharing operation or an ext4-specific volume.
+Their byte limits, checksums, sync barriers, and recovery rules remain enforced.
+Portable allocation does not promise that future overwrites cannot run out of
+space: disk-full and I/O errors fail the operation, and uncertain outcomes must
+be recovered before retrying. The explicit strict allocation APIs retain their
+stronger physical-reservation requirement.
+
+Portable journals carry a distinct on-disk flag, and the build's disk grammar
+identity has changed. Use the same build for all processes and a fresh development
+root when moving from a build with the previous disk identity. Existing roots
+are not silently migrated. Native Windows RF3 still requires a separate WAL
+namespace/publication port.
 
 ## 1. Build the launcher and servers
 
@@ -41,8 +55,7 @@ Use `GOEXPERIMENT=nosimd` in all three commands for a portable build. See
 
 Choose an absent or empty root on first start. This example uses `/tmp` for
 disposable state; files there may be removed by the operating system. Confirm
-that this path is on a supported filesystem. In a container, mount the Linux
-data volume at this path before starting.
+that this path is on a supported filesystem with enough free space.
 
 ```sh
 ./bin/vibedb cluster dev \
@@ -72,6 +85,68 @@ To choose every SQL endpoint explicitly, replace `--pg-listen` with:
 
 The list must contain one distinct literal-loopback endpoint per physical
 node. The two listener flags are mutually exclusive.
+
+### Optional read-authority qualification
+
+The standard binaries cannot enable read authority. To exercise the explicit
+quorum protocol, build a separately labelled laboratory variant with the
+required compile-time tag, keeping the launcher, shard, and gateway variants
+together:
+
+```sh
+GOEXPERIMENT=simd go build -tags=vibedb_rf3_read_authority_lab -o ./bin/vibedb ./cmd/vibedb
+GOEXPERIMENT=simd go build -tags=vibedb_rf3_read_authority_lab -o ./bin/vibedb-shard ./cmd/vibedb-shard
+GOEXPERIMENT=simd go build -tags=vibedb_rf3_read_authority_lab -o ./bin/vibedb-gateway ./cmd/vibedb-gateway
+```
+
+Run the laboratory binary with `--read-authority` on the first start and
+every restart:
+
+```sh
+./bin/vibedb cluster dev \
+  --replicas 3 \
+  --physical-nodes 3 \
+  --read-authority \
+  --root /tmp/vibedb-read-authority \
+  --pg-listen 127.0.0.1:7432
+```
+
+This is a laboratory qualification variant; a normal build rejects the switch
+before creating a cluster, and a standard shard binary rejects an enabled
+manifest before preparing, serving, reloading, or adopting any artifact. The
+switch is disabled by default and requires Linux `CLOCK_BOOTTIME`. The
+deployment assumption is that every participant's elapsed clock rate stays
+within ±10% of real elapsed time, including across VM or container suspension
+and resume. `CLOCK_BOOTTIME` availability and one successful `Now` call at
+startup cannot prove that rate assumption or future suspend behavior; qualify
+the host and virtualization environment separately. Every RF3 voter receives
+the same persisted v1 contract: a 5 s elapsed-clock maximum grant, 100000 ppm
+clock-rate bound, 1 ms rounding margin, and the complete voter set. The
+drift-adjusted usable grant is about 4.09 s of elapsed-clock time. A promise
+can delay a follower's election edge by the configured 5 s elapsed-clock grant
+window; this is not a hard wall-clock upper bound under the ±10% deployment
+assumption (a slow clock can make 5 s about 5.56 s of real time). A restarted
+voter enters about 6.11 s of configured elapsed-clock quarantine, including
+the margin, before it may vote.
+
+Incarnation observations come from bounded, authenticated native probes run by
+the serving process outside the SQL owner. A missing or expired observation,
+membership transition, or other failed authority check falls back to the
+existing quorum-backed ReadIndex path. An explicit enable on an unsupported
+platform is refused before any policy marker is written; leaving the switch
+off keeps the ordinary ReadIndex path. The current fast path is limited to
+eligible SQL point and batch data reads; this option does not change follower,
+recovery, backup, topology, or control reads.
+
+The policy and restart marker are part of the strict manifests and each local
+member root. Reusing a root with the flag omitted or changing the policy is
+refused. New binaries also refuse an old manifest when an enabled marker is
+present. A deployment must keep all voters on the feature-aware binary and
+must not restore a pre-enrollment manifest with an old binary while the marker
+is live; an old binary cannot interpret a marker it does not know. Use a fresh
+root for a different qualification contract until an explicit drain procedure
+is available. Online group additions are refused while the authority is
+enabled; prepare any additional table groups before the initial start.
 
 ## 3. Write and read a row
 
@@ -151,4 +226,6 @@ establish resilience to host loss or multi-machine scaling.
 | Node preparation | [cluster_dev_node.go](../../cmd/vibedb/cluster_dev_node.go) |
 | Online table placement | [cluster_dev_physical_tables.go](../../cmd/vibedb/cluster_dev_physical_tables.go) |
 | Frontend composition | [serve_node.go](../../cmd/vibedb-shard/serve_node.go) |
+| Read-authority policy, marker, and incarnation cache | [rf3_read_authority.go](../../cmd/vibedb-shard/rf3_read_authority.go) |
+| Qualified elapsed clock and quorum protocol | [authority.go](../../internal/raftauthority/authority.go), [clock_linux.go](../../internal/raftauthority/clock_linux.go) |
 | Online DDL and restart | [pgwire_ddl_process_test.go](../../internal/gatewayruntime/pgwire_ddl_process_test.go) |

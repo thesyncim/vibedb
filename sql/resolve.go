@@ -282,6 +282,9 @@ func (p *Parser) validate() error {
 	grouped := len(p.out.GroupBy) > 0
 	aggregates, projections := 0, 0
 	firstProjection := -1
+	if _, hasAggregate := predicateScalarDependencyKinds(p.out.Having); hasAggregate {
+		aggregates++
+	}
 	for i := range p.out.OrderBy {
 		if _, hasAggregate := scalarDependencyKinds(p.out.OrderBy[i].Scalar); hasAggregate {
 			aggregates++
@@ -694,16 +697,9 @@ func (p *Parser) validateHaving(grouped, hasAggregate bool) error {
 	return p.bindHaving(p.out.Having)
 }
 
-// bindHaving resolves every HAVING leaf to a value the reduction already
-// produces, recording which output column that is.
-//
-// This is what makes a parsed HAVING executable in principle rather than in
-// hope. A leaf that tests an aggregate must test one the SELECT list computes,
-// because the plan's reductions are exactly its output columns and there is no
-// hidden column to add one to; a leaf that tests a plain path must test a
-// GROUP BY key, because that is the only per-row value that survives grouping.
-// Anything else would need a second aggregation pass, and rejecting it here is
-// the difference between an error with a position and a failure at lowering.
+// bindHaving resolves a HAVING leaf to its selected output when available.
+// A missing aggregate or grouping key retains Column=-1 so the lowerer can
+// add that dependency to the same reduction without exposing another output.
 func (p *Parser) bindHaving(e *Expr) error {
 	if e.Subquery != nil || e.Kind == ExprExists {
 		return p.errAt(e.Pos, "subqueries are not supported in HAVING; put the uncorrelated condition in WHERE")
@@ -727,20 +723,7 @@ func (p *Parser) bindHaving(e *Expr) error {
 		return nil
 	}
 	if e.Agg != AggNone {
-		column := p.aggregateColumn(e.Agg, e.Path)
-		if column < 0 {
-			// A nil path is COUNT(*), which has no spec to quote; spelling it
-			// back as the author wrote it is what makes the message a fix
-			// rather than a puzzle.
-			argument := "*"
-			if e.Path != nil {
-				argument = e.Path.Spec()
-			}
-			return p.errfAt(e.Pos,
-				"HAVING tests %s(%s), which the SELECT list does not compute: add it to the SELECT list",
-				e.Agg, argument)
-		}
-		e.Column = column
+		e.Column = p.aggregateColumn(e.Agg, e.Path)
 		return nil
 	}
 	if !p.isGroupKey(e.Path) {

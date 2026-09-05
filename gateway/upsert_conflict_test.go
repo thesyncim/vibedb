@@ -3,9 +3,9 @@ package gateway
 import (
 	"context"
 	"errors"
-	"strings"
 	"testing"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/pgwire"
 	"github.com/thesyncim/vibedb/shardservice"
@@ -59,9 +59,9 @@ func TestSnapshotAllowsConflictNothingWithoutGlobalIndex(t *testing.T) {
 	}
 }
 
-func TestReplicatedSQLMutationInputCountRejectsComputedConflictUpdate(t *testing.T) {
+func TestReplicatedSQLMutationInputCountAcceptsComputedConflictUpdate(t *testing.T) {
 	parsed, err := sqlast.ParseStatement(
-		`INSERT INTO messages (id, value) VALUES (?, ?) ON CONFLICT DO UPDATE SET value = value || EXCLUDED.value`,
+		`INSERT INTO messages (id, value) VALUES (?, ?) ON CONFLICT DO UPDATE SET value = messages.value || EXCLUDED.value`,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -72,71 +72,14 @@ func TestReplicatedSQLMutationInputCountRejectsComputedConflictUpdate(t *testing
 
 	statement := replicatedSQLBoundStatement{
 		prepared: &PreparedPlan{statement: *parsed},
-		bound:    &BoundWritePlan{},
+		bound:    &BoundWritePlan{rowKeys: make([][]distribution.Scalar, 1), insertDoc: []byte(`{"id":"a","value":"b"}`)},
 		profile:  ReplicatedTableProfile{Relation: 1},
 	}
+	statement.bound.rowKeys[0] = make([]distribution.Scalar, 1)
 	count, err := replicatedSQLMutationInputCount(&statement)
-	if !errors.Is(err, ErrReplicatedSQLTransactionUnsupported) {
-		t.Fatalf("input count = %d, error = %v, want ErrReplicatedSQLTransactionUnsupported", count, err)
+	if err != nil || count != 1 {
+		t.Fatalf("input count = %d, error = %v, want 1", count, err)
 	}
-}
-
-func TestPostgreSQLRF3PrepareRejectsConflictActionsAsFeatureNotSupported(t *testing.T) {
-	executor, _ := newSQLRF3TestExecutor(t)
-	authority := serviceauthz.Authority{Generation: 1}
-	authority.Node[0] = 1
-	dispatches := 0
-	backend := &PostgreSQLBackend{
-		Executor: executor,
-		Authorize: func(pgwire.SessionIdentity) (serviceauthz.Authority, error) {
-			return authority, nil
-		},
-		Write: func(context.Context, serviceauthz.Authority, Query) (*Result, error) {
-			dispatches++
-			return nil, nil
-		},
-	}
-	session, err := backend.NewSession(context.Background(), pgwire.SessionIdentity{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer session.Close()
-
-	for _, test := range []struct {
-		text   string
-		marker string
-	}{
-		{
-			text:   `INSERT INTO messages (id, value) VALUES (?, ?) ON CONFLICT DO UPDATE SET value = value || EXCLUDED.value`,
-			marker: "UPDATE",
-		},
-	} {
-		prepared, err := session.Prepare(context.Background(), test.text)
-		var unsupported *sqlast.FeatureNotSupportedError
-		wantPosition := strings.Index(test.text, test.marker)
-		if !errors.As(err, &unsupported) || unsupported.Pos != wantPosition {
-			t.Fatalf(
-				"Prepare(%q) error = %T %v at %d, want *sql.FeatureNotSupportedError at %d",
-				test.text, err, err, unsupportedPosition(unsupported), wantPosition,
-			)
-		}
-		if prepared != nil {
-			t.Fatalf("RF3 conflict action returned a prepared statement for %q", test.text)
-		}
-	}
-	if dispatches != 0 {
-		t.Fatalf("write dispatches = %d, want 0", dispatches)
-	}
-	if len(session.(*postgresSession).statements) != 0 {
-		t.Fatal("RF3 session retained a refused conflict statement")
-	}
-}
-
-func unsupportedPosition(err *sqlast.FeatureNotSupportedError) int {
-	if err == nil {
-		return -1
-	}
-	return err.Pos
 }
 
 func TestPostgreSQLRF3PreparesComputedUpdateAndKeepsReturningFenced(t *testing.T) {
@@ -188,5 +131,44 @@ func TestPostgreSQLRF3PreparesComputedUpdateAndKeepsReturningFenced(t *testing.T
 	}
 	if dispatches != 1 || len(session.(*postgresSession).statements) != 0 {
 		t.Fatalf("RETURNING dispatches=%d retained=%d", dispatches, len(session.(*postgresSession).statements))
+	}
+}
+
+func TestPostgreSQLRF3PreparesComputedConflictUpdate(t *testing.T) {
+	config, endpoints, descriptor, profile := testReplicatedTableInput(t)
+	snapshot, err := NewSnapshotWithReplicatedTableMetadata(config, endpoints, 5, nil, nil,
+		[]ReplicatedShardDescriptor{descriptor}, []ReplicatedTableProfile{profile},
+		[]ReplicatedTableDeclaration{{Table: "messages", CreateTable: `CREATE TABLE messages (id TEXT PRIMARY KEY,n INTEGER,city TEXT)`}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority := serviceauthz.Authority{Generation: 1}
+	authority.Node[0] = 1
+	dispatches := 0
+	backend := &PostgreSQLBackend{Executor: NewExecutor(nil, NewCatalogHolder(snapshot), Options{}),
+		Authorize: func(pgwire.SessionIdentity) (serviceauthz.Authority, error) { return authority, nil },
+		Write: func(context.Context, serviceauthz.Authority, Query) (*Result, error) {
+			dispatches++
+			return &Result{Kind: shardservice.ResponseCompletion, RowsAffected: 1}, nil
+		},
+	}
+	session, err := backend.NewSession(t.Context(), pgwire.SessionIdentity{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	prepared, err := session.Prepare(t.Context(), `INSERT INTO messages (id,n) VALUES (?,1) ON CONFLICT DO UPDATE SET n=messages.n+? WHERE messages.n<?`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prepared.Close()
+	for i := 0; i < 2; i++ {
+		result, err := prepared.Exec(t.Context(), []any{"a", int64(i + 1), int64(10)})
+		if err != nil || result.RowsAffected != 1 {
+			t.Fatalf("result=%+v err=%v", result, err)
+		}
+	}
+	if dispatches != 2 {
+		t.Fatalf("dispatches=%d", dispatches)
 	}
 }

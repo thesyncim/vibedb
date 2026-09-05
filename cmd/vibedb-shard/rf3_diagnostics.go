@@ -102,6 +102,22 @@ type rf3DiagnosticSnapshot struct {
 	RaftProposalEntriesPerReady     []uint64 `json:"raft_proposal_entries_per_ready"`
 	RaftProposalBytesPerReady       []uint64 `json:"raft_proposal_bytes_per_ready"`
 
+	// Owner-side authority counters prove that the SQL read actually used the
+	// fast path. They are separate from the Runtime's protocol-round counters.
+	AuthorityReadHits               uint64 `json:"authority_read_hits"`
+	AuthorityReadIndexFallbacks     uint64 `json:"authority_read_index_fallbacks"`
+	AuthorityReadValidationRetries  uint64 `json:"authority_read_validation_retries"`
+	AuthorityReadValidationFailures uint64 `json:"authority_read_validation_failures"`
+	AuthorityRoundAttempts          uint64 `json:"authority_round_attempts"`
+
+	// These counters come from Runtime authority state, rather than the owner
+	// per-read Ensure offer counter. RequestsCreated counts requests appended to
+	// the bounded outbound queue. GrantsAccepted includes the local self-grant
+	// and excludes duplicate or replayed grants.
+	ReadAuthorityRoundsStarted   uint64 `json:"read_authority_rounds_started"`
+	ReadAuthorityRequestsCreated uint64 `json:"read_authority_requests_created"`
+	ReadAuthorityGrantsAccepted  uint64 `json:"read_authority_grants_accepted"`
+
 	// Resource counters sum the currently open collection generations. Schema
 	// replacement or group retirement can reset them within one process, so
 	// interval comparisons require an unchanged serving inventory/generation.
@@ -367,6 +383,11 @@ func applyRF3DiagnosticProgress(snapshot *rf3DiagnosticSnapshot, metrics raftser
 	copy(snapshot.RaftProposalQueueDepthHistogram, metrics.ProposalQueueDepthHistogram[:])
 	copy(snapshot.RaftProposalEntriesPerReady, metrics.ProposalEntriesPerReady[:])
 	copy(snapshot.RaftProposalBytesPerReady, metrics.ProposalBytesPerReady[:])
+	snapshot.AuthorityReadHits = metrics.AuthorityReadHits
+	snapshot.AuthorityReadIndexFallbacks = metrics.AuthorityReadIndexFallbacks
+	snapshot.AuthorityReadValidationRetries = metrics.AuthorityReadValidationRetries
+	snapshot.AuthorityReadValidationFailures = metrics.AuthorityReadValidationFailures
+	snapshot.AuthorityRoundAttempts = metrics.AuthorityRoundAttempts
 }
 
 func applyRF3DiagnosticSequencer(snapshot *rf3DiagnosticSnapshot, stats raftstore.NodeSubmissionSequencerStats) {
@@ -434,6 +455,7 @@ func emitRF3DiagnosticSnapshotWithResources(
 	prepared []preparedRF3Group,
 	schemas *rf3SchemaActivator,
 	progressMetrics *raftservice.ProgressMetrics,
+	authorityRoundMetrics ...func() raftmember.ReadAuthorityRoundMetrics,
 ) {
 	snapshot := rf3DiagnosticSnapshot{
 		UTC: time.Now().UTC().Format(time.RFC3339Nano), Event: "snapshot", PID: os.Getpid(),
@@ -484,6 +506,12 @@ func emitRF3DiagnosticSnapshotWithResources(
 	}
 	if progressMetrics != nil {
 		applyRF3DiagnosticProgress(&snapshot, progressMetrics.Snapshot())
+	}
+	if len(authorityRoundMetrics) != 0 && authorityRoundMetrics[0] != nil {
+		metrics := authorityRoundMetrics[0]()
+		snapshot.ReadAuthorityRoundsStarted = metrics.RoundsStarted
+		snapshot.ReadAuthorityRequestsCreated = metrics.RequestsCreated
+		snapshot.ReadAuthorityGrantsAccepted = metrics.GrantsAccepted
 	}
 	if server != nil {
 		stats := server.Stats()

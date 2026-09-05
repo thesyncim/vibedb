@@ -876,10 +876,10 @@ func (c *conn) insertLocked(
 		)
 	}
 	conflictUpdate := tree.OnConflictUpdate
-	if conflictUpdate != nil && len(conflictUpdate.Assignments) != 0 {
-		if err := validateUpsertColumnAssignments(
+	if conflictUpdate != nil {
+		if err := validateUpsertConflictAction(
 			tree.Table, mutationTargetRelation(tree.Table, tree.Alias),
-			t.meta, conflictUpdate.Assignments,
+			t.meta, conflictUpdate,
 		); err != nil {
 			return nil, err
 		}
@@ -987,14 +987,13 @@ func (c *conn) insertLocked(
 			}
 			finalDocument := candidate.document
 			if found && conflictUpdate != nil {
-				if !conflictUpdate.WholeDocument() {
-					finalDocument, err = materializeConflictColumnAssignments(
-						statement, &c.exec, scratch, candidate.document,
-						conflictUpdate.Assignments, args, limits.MaxDocumentBytes,
-					)
-					if err != nil {
-						return nil, err
-					}
+				var matched bool
+				finalDocument, matched, err = materializeConflictUpdate(statement, &c.exec, scratch, candidate.document, args, limits.MaxDocumentBytes)
+				if err != nil {
+					return nil, err
+				}
+				if !matched {
+					continue
 				}
 				if err := validateDocument(
 					t.schema, finalDocument, limits.MaxDocumentBytes,

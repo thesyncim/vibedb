@@ -159,6 +159,27 @@ func (owners *ExecutionOwners) GroupProgressMetrics(group raftmember.GroupKey) (
 	return owners.metrics.GroupProgressMetrics(group)
 }
 
+// EnsureReadAuthorityRound offers one bounded due-threshold renewal or
+// acquisition opportunity to the exact serialized execution lane. A usable
+// token is reused until its conservative renewal lead window, so this method
+// may be called for every read without starting a quorum round per read.
+func (owners *ExecutionOwners) EnsureReadAuthorityRound(group raftmember.GroupKey) error {
+	if owners == nil || owners.lanes == nil {
+		return ErrOwnerClosed
+	}
+	return owners.lanes.EnsureReadAuthorityRound(group)
+}
+
+// ReadAuthorityRoundMetrics returns actual protocol rounds started across all
+// groups. It is intentionally separate from ProgressMetrics.AuthorityRoundAttempts,
+// which counts owner-side per-read offers and cannot prove quorum amortization.
+func (owners *ExecutionOwners) ReadAuthorityRoundMetrics() raftmember.ReadAuthorityRoundMetrics {
+	if owners == nil || owners.lanes == nil {
+		return raftmember.ReadAuthorityRoundMetrics{}
+	}
+	return owners.lanes.ReadAuthorityRoundMetrics()
+}
+
 func (owners *ExecutionOwners) owner(group raftmember.GroupKey) (*Owner, error) {
 	if owners == nil || group == (raftmember.GroupKey{}) {
 		return nil, ErrExecutionGroup

@@ -15,6 +15,29 @@ env:
   GOEXPERIMENT: simd
 
 jobs:
+  portable-rf3:
+    name: Native RF3 SQL and restart (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.27'
+      - name: Verify portable sidecar recovery and strict-mode separation
+        run: go test -count=1 ./internal/storeio ./store/durable ./sql/driver -run 'TestPortable|TestSealed|TestReplicatedShardStorePortableSealedBind'
+      - name: Verify ownership retries, core admission, and promotion catch-up
+        run: go test -count=1 ./internal/multiraft ./internal/raftservice ./internal/rafttransport -run 'TestHostControlProposalReturnsCoreAdmission|TestReplicaActionFencesOwnershipAndRetirementExactly|TestPromotionHeartbeatReachesLearnerAfterLostAppendOrCommit|TestAdditiveMembershipHeartbeatReachesLaggingVoter|TestTransportDiscardsOnlyCommittedRemovedSource'
+      - name: Prepare command build cache
+        run: go build -trimpath ./cmd/vibedb ./cmd/vibedb-shard ./cmd/vibedb-gateway
+      - name: Create a table, write rows, restart RF3, and read them back
+        run: go test -count=1 -timeout=5m ./internal/gatewayruntime -run '^TestPostgreSQLDevOnlineCreateTableAndRestart$'
+      - name: Replace an RF3 replica with live ownership retries
+        run: go test -count=3 -timeout=5m ./cmd/vibedb-shard -run '^TestServeRF3ShippedCompositionThreeProcesses$'
   repository-contracts:
     if: ${{ !cancelled() }}
     name: repository contracts
@@ -207,6 +230,36 @@ jobs:
           name: unit-timings-${{ matrix.runner }}-${{ matrix.shard }}
           path: ${{ runner.temp }}/unit-tests.txt
           retention-days: 7
+      - name: Save Go build cache
+        if: ${{ always() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.go.outputs.cache-path }}
+          key: ${{ steps.go.outputs.cache-key }}
+  rf3-read-authority-lab:
+    name: RF3 read-authority standard gate and laboratory protocol
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-go-ci
+        id: go
+        with:
+          scope: rf3-read-authority-lab
+      - name: Standard build denial and resume checks
+        run: |
+          set -euo pipefail
+          go test -count=1 -timeout=5m \
+            -run '^(TestStandardClusterDevRejectsReadAuthorityBeforeCreatingRoot|TestDefaultResumeAcceptsOpaqueArtifactButRejectsEnabledSection|TestStandardPhysicalManifestRejectsEnabledSectionBeforeRewrite|TestDevClusterManifestResumeIsCanonicalAndDoesNotReprovision)$' \
+            ./cmd/vibedb
+          go test -count=1 -timeout=5m \
+            -run '^(TestStandardShardRejectsEnabledReadAuthorityBeforeRuntime|TestStandardOmittedPolicyStillRefusesEnrolledMarker)$' \
+            ./cmd/vibedb-shard
+      - name: Explicit laboratory protocol and reconciliation checks
+        run: |
+          set -euo pipefail
+          go test -tags=vibedb_rf3_read_authority_lab -count=1 -timeout=10m \
+            -run '^TestRF3ReadAuthority|^TestDev(ReadAuthority|PhysicalReadAuthority)' \
+            ./cmd/vibedb ./cmd/vibedb-shard
       - name: Save Go build cache
         if: ${{ always() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4

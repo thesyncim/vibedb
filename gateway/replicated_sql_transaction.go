@@ -55,12 +55,13 @@ const (
 )
 
 type replicatedSQLBoundStatement struct {
-	prepared         *PreparedPlan
-	bound            *BoundWritePlan
-	profile          ReplicatedTableProfile
-	updateExpression *query.DMLStatement
-	updateExec       query.Exec
-	conflictArgs     []any
+	prepared               *PreparedPlan
+	bound                  *BoundWritePlan
+	profile                ReplicatedTableProfile
+	assignmentExpression   *query.DMLStatement
+	updateExec             query.Exec
+	conflictArgs           []any
+	conflictParameterTypes []query.ParameterType
 }
 
 type replicatedSQLTargetBuilder struct {
@@ -237,8 +238,8 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 			stopExpressionCancel()
 		}
 		for index := range statements {
-			if statements[index].updateExpression != nil {
-				statements[index].updateExpression.Release()
+			if statements[index].assignmentExpression != nil {
+				statements[index].assignmentExpression.Release()
 			}
 		}
 	}()
@@ -281,7 +282,7 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 		}
 		statements[index].prepared = prepared
 		statements[index].bound = bound
-		if prepared.statement.Kind == sqlast.KindInsert && sqldriver.DirectReplicatedConflictAssignments(prepared.statement.Insert.OnConflictUpdate) {
+		if prepared.statement.Kind == sqlast.KindInsert && sqldriver.ReplicatedConflictProgram(prepared.statement.Insert.OnConflictUpdate) {
 			statements[index].conflictArgs = args
 		}
 		if !replicated {
@@ -301,7 +302,7 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 			// lowering without binding INSERT, DELETE or indexed UPDATE twice.
 			preimageMode = replicatedSQLLinearizablePreimage
 		}
-		if hasComputedUpdateAssignments(&prepared.statement) {
+		if hasComputedUpdateAssignments(&prepared.statement) || hasConflictExpressions(&prepared.statement) {
 			parameterTypes, typeErr := postgresQueryParameterTypes(
 				queries[index].ParamTypes, prepared.params,
 			)
@@ -314,11 +315,16 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 			if expressionErr != nil {
 				return nil, true, expressionErr
 			}
-			statements[index].updateExpression = expression
-			if !expression.HasUpdateExpressions() {
+			statements[index].assignmentExpression = expression
+			if expression.HasConflictUpdateExpressions() {
+				statements[index].conflictParameterTypes = parameterTypes
+				expressionErr = expression.ValidateConflictUpdateExpressionBindings(args)
+			} else if expression.HasUpdateExpressions() {
+				expressionErr = expression.ValidateUpdateExpressionBindings(args)
+			} else {
 				return nil, true, ErrReplicatedSQLTransactionUnsupported
 			}
-			if expressionErr = expression.ValidateUpdateExpressionBindings(args); expressionErr != nil {
+			if expressionErr != nil {
 				return nil, true, expressionErr
 			}
 			if ctx != nil && ctx.Done() != nil && stopExpressionCancel == nil {
@@ -381,6 +387,18 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 	var documentWorkspace GlobalIndexWorkspace
 	var mutationBytes uint64
 	var mutationCount uint64
+	// One shared resolve scratch pair serves every mutation: resolved routes
+	// are consumed synchronously (preimage reads) or duplicated on new groups
+	// (appendReplicatedSQLMutation), so the shared backing never escapes the
+	// call. Per-table prep and the last route are cached across statements;
+	// the route digest is skipped everywhere here — grouping compares full
+	// routes and participant digests are computed at proposal time.
+	var txnScalar [replication.MaxMutationKeyBytes + 16]byte
+	var txnReplicas [ServingReplicaCount]ReplicatedEndpoint
+	var txnPrep replicatedTableResolvePrep
+	txnHavePrep := false
+	var txnReuse ReplicatedRoute
+	txnHaveReuse := false
 
 	for statementIndex := range statements {
 		statement := &statements[statementIndex]
@@ -388,6 +406,10 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 		if err != nil {
 			return nil, true, err
 		}
+		// The placement mapper depends only on the statement spec; building
+		// it once per statement preserves the exact first-mutation panic
+		// timing of the per-mutation build it replaces.
+		var statementMapper *distribution.NativeMapper
 		for inputOrdinal := 0; inputOrdinal < inputCount; inputOrdinal++ {
 			scalar, document, kind, inputErr := replicatedSQLMutationInput(statement, inputOrdinal)
 			if inputErr != nil {
@@ -417,12 +439,14 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 			if len(document) > int(statement.profile.MaxDocumentBytes) {
 				return nil, true, ErrTransactionByteLimit
 			}
-			mapper := distribution.NewNativeMapperWithBucketBits(
-				statement.bound.spec.Arity, statement.bound.spec.EffectiveBucketBits(),
-			)
+			if statementMapper == nil {
+				statementMapper = distribution.NewNativeMapperWithBucketBits(
+					statement.bound.spec.Arity, statement.bound.spec.EffectiveBucketBits(),
+				)
+			}
 			var tuple [1]distribution.Scalar
 			tuple[0] = scalar
-			point, pointErr := mapper.PointFor(tuple[:])
+			point, pointErr := statementMapper.PointFor(tuple[:])
 			if pointErr != nil {
 				return nil, true, ErrReplicatedSQLTransactionUnsupported
 			}
@@ -441,15 +465,28 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 			keyStart := len(keyArena)
 			keyArena = append(keyArena, key...)
 			ownedKey := keyArena[keyStart:len(keyArena):len(keyArena)]
-			var scalarScratch [replication.MaxMutationKeyBytes + 16]byte
-			var replicaScratch [ServingReplicaCount]ReplicatedEndpoint
-			resolved, resolvedOK := snapshot.ResolveReplicatedTableKey(
-				byteview.Bytes(statement.bound.table), ownedKey,
-				scalarScratch[:0], replicaScratch[:0],
+			table := byteview.Bytes(statement.bound.table)
+			if !txnHavePrep || !bytes.Equal(txnPrep.table, table) {
+				fresh, prepOK := snapshot.replicatedTableResolvePrepFor(table)
+				if !prepOK {
+					return nil, true, ErrReplicatedSQLTransactionUnsupported
+				}
+				txnPrep, txnHavePrep, txnHaveReuse = fresh, true, false
+			}
+			var txnReuseRoute ReplicatedRoute
+			if txnHaveReuse {
+				txnReuseRoute = txnReuse
+			}
+			resolved, resolvedOK := snapshot.resolveReplicatedTableKeyPrepared(
+				&txnPrep, ownedKey, txnScalar[:0], txnReplicas[:0],
+				false, txnReuseRoute, txnHaveReuse,
 			)
 			if !resolvedOK || resolved.Profile.Relation != statement.profile.Relation {
 				return nil, true, ErrReplicatedSQLTransactionUnsupported
 			}
+			// Same reuse discipline as the read paths: only value fields are
+			// read back, so the shared backing never escapes the call.
+			txnReuse, txnHaveReuse = resolved.Route, true
 			var oldDocument []byte
 			missingPartial := false
 			if kind == replication.MutationPutPresent && len(statement.bound.updateAssignments) != 0 {
@@ -476,9 +513,9 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 					// presence before schema validation and never publishes this value.
 					document = []byte("{}")
 					missingPartial = true
-				} else if statement.updateExpression != nil {
+				} else if statement.assignmentExpression != nil {
 					document, err = sqldriver.MaterializePreparedUpdateAssignments(
-						statement.updateExpression, &statement.updateExec,
+						statement.assignmentExpression, &statement.updateExec,
 						oldDocument, statement.bound.updateArgs,
 						int(statement.profile.MaxDocumentBytes),
 					)
@@ -515,7 +552,7 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 
 			indexStart := len(statement.bound.globalIndexes)
 			if kind == replication.MutationPutConflict {
-				document, err = sqldriver.EncodeReplicatedConflictValue(document, statement.prepared.statement.Insert.OnConflictUpdate, statement.conflictArgs)
+				document, err = sqldriver.EncodeReplicatedConflictValue(document, statement.prepared.statement.Insert.OnConflictUpdate, statement.conflictArgs, statement.conflictParameterTypes)
 				if err != nil {
 					return nil, true, err
 				}
@@ -786,12 +823,12 @@ func replicatedSQLMutationInput(
 		kind := replication.MutationPutAbsent
 		if prepared.statement.Insert.OnConflictDoNothing {
 			kind = replication.MutationPutIfAbsent
-		} else if prepared.statement.Insert.OnConflictUpdate.WholeDocument() {
+		} else if action := prepared.statement.Insert.OnConflictUpdate; action.WholeDocument() && action.Where == nil {
 			// Both branches publish exactly the canonical candidate. The native
 			// put validates its schema and physical key at the replicated apply
 			// point and retains one affected row for inserts and replacements.
 			kind = replication.MutationPut
-		} else if sqldriver.DirectReplicatedConflictAssignments(prepared.statement.Insert.OnConflictUpdate) {
+		} else if sqldriver.ReplicatedConflictProgram(prepared.statement.Insert.OnConflictUpdate) {
 			kind = replication.MutationPutConflict
 		}
 		return bound.rowKeys[ordinal][0], document, kind, nil
@@ -964,7 +1001,7 @@ func appendReplicatedSQLMutation(
 	mutation replication.Mutation,
 ) (int, error) {
 	if builders == nil || byGroup == nil || relation == 0 || bucketBits == 0 ||
-		!distributedtxn.ValidateIntentScopes([]distributedtxn.IntentScope{scope}, bucketBits) {
+		!distributedtxn.ValidateIntentScope(scope, bucketBits) {
 		return -1, ErrReplicatedSQLTransactionUnsupported
 	}
 	targetIndex := replicatedSQLTargetIndex(*builders, *byGroup, route.Group)

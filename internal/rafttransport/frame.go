@@ -143,6 +143,19 @@ func (registry *StaticRegistry) preflightOutbound(
 		return outboundFramePlan{}, classifyOrdinaryError(err)
 	}
 	version := view.version
+	// A peer can still use the previous membership after an additive change:
+	// either its configuration append or the commit notification may have
+	// been lost during reconnect. A heartbeat tagged with the new generation
+	// is then rejected before Raft can answer and trigger append retry. Use
+	// the retained, already-authorized view where both roles permit heartbeats.
+	// This never grants voting rights, and removal disables the prior view.
+	if outbound.Message.GetType() == pb.MsgHeartbeat && view.allowPrevious &&
+		view.previous != nil &&
+		(view.previous.roles[outbound.To] == MemberVoter || view.previous.roles[outbound.To] == MemberLearner) &&
+		view.previous.roles[outbound.From] == MemberVoter {
+		view = view.previous
+		version = view.version
+	}
 	if election, electionOK := certifiedPromotionElectionAuthority(view, outbound.Message,
 		view.promotionVersion()); electionOK {
 		view = election
@@ -151,6 +164,9 @@ func (registry *StaticRegistry) preflightOutbound(
 	if err := registry.validateAuthorizedMessage(outbound.Group, view, outbound.Message); err != nil {
 		if retiredOutboundDestination(view, outbound.Message) {
 			return outboundFramePlan{}, fmt.Errorf("%w: %w", err, errRetiredOutboundDestination)
+		}
+		if retiredOutboundSource(view, outbound.Message) {
+			return outboundFramePlan{}, fmt.Errorf("%w: %w", err, errRetiredOutboundSource)
 		}
 		return outboundFramePlan{}, err
 	}

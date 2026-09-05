@@ -51,6 +51,7 @@ type rf3Manifest struct {
 	Gateway             *rf3ManifestGateway
 	Route               rf3ManifestGroupRoute
 	DevelopmentOnly     bool
+	ReadAuthority       *rf3ManifestReadAuthority
 	Members             [rf3ManifestMembers]rf3ManifestMember
 	MemberCount         uint8
 	EnrolledTarget      *rf3ManifestEnrolledTarget
@@ -65,6 +66,28 @@ type rf3ManifestGroup struct {
 	Members        [rf3ManifestMembers]rf3ManifestMember
 	MemberCount    uint8
 	EnrolledTarget *rf3ManifestEnrolledTarget
+}
+
+// rf3ManifestReadAuthority is the persisted, all-voter feature contract.
+// The section is part of the strict startup manifest so a feature-aware
+// binary cannot silently ignore an enabled authority policy. The restart
+// marker is derived from the member root and is checked before Raft starts;
+// deployment must keep older binaries from restoring pre-enrollment files.
+type rf3ManifestReadAuthority struct {
+	Enabled              bool                         `json:"enabled"`
+	FeatureVersion       uint32                       `json:"feature_version"`
+	PolicyVersion        uint32                       `json:"policy_version"`
+	MaxGrantMillis       uint64                       `json:"max_grant_millis"`
+	ClockRatePPM         uint32                       `json:"clock_rate_ppm"`
+	RoundingMarginMillis uint64                       `json:"rounding_margin_millis"`
+	Voters               []uint64                     `json:"voters"`
+	Capabilities         []rf3ManifestVoterCapability `json:"capabilities"`
+}
+
+type rf3ManifestVoterCapability struct {
+	MemberID      uint64 `json:"member_id"`
+	PolicyVersion uint32 `json:"policy_version"`
+	Enabled       bool   `json:"enabled"`
 }
 
 func (manifest rf3Manifest) groupBundles() []rf3ManifestGroup {
@@ -89,7 +112,7 @@ func (manifest rf3Manifest) withGroup(group rf3ManifestGroup) rf3Manifest {
 		ReplicaControl: manifest.ReplicaControl,
 		SplitControl:   split, Route: group.Route,
 		Gateway:         manifest.Gateway,
-		DevelopmentOnly: manifest.DevelopmentOnly, Members: group.Members,
+		DevelopmentOnly: manifest.DevelopmentOnly, ReadAuthority: manifest.ReadAuthority, Members: group.Members,
 		MemberCount: group.MemberCount, EnrolledTarget: group.EnrolledTarget}
 }
 
@@ -221,9 +244,11 @@ type rf3ManifestTLS struct {
 }
 
 type rf3ManifestMember struct {
-	MemberID    uint64
-	NodeID      rafttransport.NodeID
-	PeerAddress string
+	MemberID      uint64
+	NodeID        rafttransport.NodeID
+	PeerAddress   string
+	StoreID       [16]byte
+	NativeAddress string
 }
 
 // rf3ManifestEnrolledTarget is the one replacement identity provisioning has
@@ -363,6 +388,16 @@ func parseRF3Manifest(data []byte) (rf3Manifest, error) {
 		if !present {
 			return rf3Manifest{}, errInvalidRF3Manifest
 		}
+		if bytes.Equal(key.Raw().Bytes(), []byte(`"read_authority"`)) {
+			manifest.ReadAuthority, err = parseRF3ManifestReadAuthority(node)
+			if err != nil {
+				return rf3Manifest{}, err
+			}
+			key, node, present = fields.Next()
+			if !present {
+				return rf3Manifest{}, errInvalidRF3Manifest
+			}
+		}
 		if bytes.Equal(key.Raw().Bytes(), []byte(`"gateway"`)) {
 			manifest.Gateway, err = parseRF3ManifestGateway(node)
 			if err != nil {
@@ -380,6 +415,9 @@ func parseRF3Manifest(data []byte) (rf3Manifest, error) {
 		}
 		if len(manifest.Groups) == 0 && (manifest.NodeIncarnation == 0 || len(manifest.GatewaySeeds) == 0) {
 			return rf3Manifest{}, errInvalidRF3Manifest
+		}
+		if err := validateRF3ReadAuthority(manifest.ReadAuthority, manifest.Groups, false); err != nil {
+			return rf3Manifest{}, err
 		}
 		controlPaths := [...]string{
 			manifest.ReplicaControl.ActionJournalPath, manifest.ReplicaControl.SourceJournalPath,
@@ -468,6 +506,16 @@ func parseRF3Manifest(data []byte) (rf3Manifest, error) {
 	if !present {
 		return rf3Manifest{}, errInvalidRF3Manifest
 	}
+	if bytes.Equal(key.Raw().Bytes(), []byte(`"read_authority"`)) {
+		manifest.ReadAuthority, err = parseRF3ManifestReadAuthority(node)
+		if err != nil {
+			return rf3Manifest{}, err
+		}
+		key, node, present = fields.Next()
+		if !present {
+			return rf3Manifest{}, errInvalidRF3Manifest
+		}
+	}
 	if bytes.Equal(key.Raw().Bytes(), []byte(`"development_only"`)) {
 		development, ok := node.Bool()
 		if !ok || !development {
@@ -482,6 +530,9 @@ func parseRF3Manifest(data []byte) (rf3Manifest, error) {
 		return rf3Manifest{}, err
 	}
 	if manifest.Members, manifest.MemberCount, err = parseRF3ManifestMembers(node, manifest.DevelopmentOnly); err != nil {
+		return rf3Manifest{}, err
+	}
+	if err := validateRF3ReadAuthority(manifest.ReadAuthority, []rf3ManifestGroup{{Members: manifest.Members, MemberCount: manifest.MemberCount}}, manifest.DevelopmentOnly); err != nil {
 		return rf3Manifest{}, err
 	}
 	key, node, present = fields.Next()
@@ -534,6 +585,8 @@ func parseRF3ManifestGroups(node vibejson.Node, nodeLog *rf3NodeLogManifest) ([]
 	groupKeys := make(map[raftmember.GroupKey]struct{}, count)
 	nodes := make(map[rafttransport.NodeID]string, rf3ManifestMembers)
 	addresses := make(map[string]rafttransport.NodeID, rf3ManifestMembers)
+	nativeAddresses := make(map[rafttransport.NodeID]string, rf3ManifestMembers)
+	nativeOwners := make(map[string]rafttransport.NodeID, rf3ManifestMembers)
 	for index := 0; index < count; index++ {
 		value, present := iter.Next()
 		if !present {
@@ -572,6 +625,15 @@ func parseRF3ManifestGroups(node vibejson.Node, nodeLog *rf3NodeLogManifest) ([]
 			}
 			if node, found := addresses[member.PeerAddress]; found && node != member.NodeID {
 				return nil, errInvalidRF3Manifest
+			}
+			if member.NativeAddress != "" {
+				if address, found := nativeAddresses[member.NodeID]; found && address != member.NativeAddress {
+					return nil, errInvalidRF3Manifest
+				}
+				if node, found := nativeOwners[member.NativeAddress]; found && node != member.NodeID {
+					return nil, errInvalidRF3Manifest
+				}
+				nativeAddresses[member.NodeID], nativeOwners[member.NativeAddress] = member.NativeAddress, member.NodeID
 			}
 			nodes[member.NodeID], addresses[member.PeerAddress] = member.PeerAddress, member.NodeID
 		}
@@ -1292,8 +1354,161 @@ func parseRF3ManifestMember(node vibejson.Node) (rf3ManifestMember, error) {
 	if result.PeerAddress, err = rf3ManifestString(value, maxRF3ManifestStringBytes); err != nil {
 		return rf3ManifestMember{}, err
 	}
+	key, value, present := fields.Next()
+	if present {
+		if !bytes.Equal(key.Raw().Bytes(), []byte(`"store_id"`)) {
+			return rf3ManifestMember{}, errInvalidRF3Manifest
+		}
+		encoded, fieldErr := rf3ManifestString(value, maxRF3ManifestStringBytes)
+		if fieldErr != nil || !decodeRF3FixedHex(encoded, result.StoreID[:], false) {
+			return rf3ManifestMember{}, errInvalidRF3Manifest
+		}
+		key, value, present = fields.Next()
+	}
+	if present {
+		if !bytes.Equal(key.Raw().Bytes(), []byte(`"native_address"`)) {
+			return rf3ManifestMember{}, errInvalidRF3Manifest
+		}
+		if result.NativeAddress, err = rf3ManifestString(value, maxRF3ManifestStringBytes); err != nil {
+			return rf3ManifestMember{}, err
+		}
+	}
 	if _, _, extra := fields.Next(); extra {
 		return rf3ManifestMember{}, errInvalidRF3Manifest
+	}
+	return result, nil
+}
+
+func parseRF3ManifestReadAuthority(node vibejson.Node) (*rf3ManifestReadAuthority, error) {
+	fields, ok := node.ObjectIter()
+	if !ok {
+		return nil, errInvalidRF3Manifest
+	}
+	result := new(rf3ManifestReadAuthority)
+	value, err := nextRF3Field(&fields, `"enabled"`)
+	if err != nil {
+		return nil, err
+	}
+	if result.Enabled, ok = value.Bool(); !ok || !result.Enabled {
+		return nil, errInvalidRF3Manifest
+	}
+	value, err = nextRF3Field(&fields, `"feature_version"`)
+	if err != nil {
+		return nil, err
+	}
+	feature, err := rf3ManifestPositiveUint64(value)
+	if err != nil || feature > math.MaxUint32 {
+		return nil, errInvalidRF3Manifest
+	}
+	result.FeatureVersion = uint32(feature)
+	value, err = nextRF3Field(&fields, `"policy_version"`)
+	if err != nil {
+		return nil, err
+	}
+	policyVersion, err := rf3ManifestPositiveUint64(value)
+	if err != nil || policyVersion > math.MaxUint32 {
+		return nil, errInvalidRF3Manifest
+	}
+	result.PolicyVersion = uint32(policyVersion)
+	value, err = nextRF3Field(&fields, `"max_grant_millis"`)
+	if err != nil {
+		return nil, err
+	}
+	if result.MaxGrantMillis, err = rf3ManifestPositiveUint64(value); err != nil {
+		return nil, err
+	}
+	value, err = nextRF3Field(&fields, `"clock_rate_ppm"`)
+	if err != nil {
+		return nil, err
+	}
+	clockRate, err := rf3ManifestPositiveUint64(value)
+	if err != nil || clockRate > math.MaxUint32 {
+		return nil, errInvalidRF3Manifest
+	}
+	result.ClockRatePPM = uint32(clockRate)
+	value, err = nextRF3Field(&fields, `"rounding_margin_millis"`)
+	if err != nil {
+		return nil, err
+	}
+	if result.RoundingMarginMillis, err = rf3ManifestPositiveUint64(value); err != nil {
+		return nil, err
+	}
+	value, err = nextRF3Field(&fields, `"voters"`)
+	if err != nil {
+		return nil, err
+	}
+	count, ok := value.ArrayLen()
+	if !ok || count == 0 || count > rf3ManifestMembers {
+		return nil, errInvalidRF3Manifest
+	}
+	iter, _ := value.ArrayIter()
+	result.Voters = make([]uint64, count)
+	for index := range result.Voters {
+		voter, present := iter.Next()
+		if !present {
+			return nil, errInvalidRF3Manifest
+		}
+		result.Voters[index], err = rf3ManifestPositiveUint64(voter)
+		if err != nil || index > 0 && result.Voters[index-1] >= result.Voters[index] {
+			return nil, errInvalidRF3Manifest
+		}
+	}
+	if _, extra := iter.Next(); extra {
+		return nil, errInvalidRF3Manifest
+	}
+	value, err = nextRF3Field(&fields, `"capabilities"`)
+	if err != nil {
+		return nil, err
+	}
+	capCount, ok := value.ArrayLen()
+	if !ok || capCount != count {
+		return nil, errInvalidRF3Manifest
+	}
+	capIter, _ := value.ArrayIter()
+	result.Capabilities = make([]rf3ManifestVoterCapability, capCount)
+	for index := range result.Capabilities {
+		capNode, present := capIter.Next()
+		if !present {
+			return nil, errInvalidRF3Manifest
+		}
+		capFields, ok := capNode.ObjectIter()
+		if !ok {
+			return nil, errInvalidRF3Manifest
+		}
+		memberValue, fieldErr := nextRF3Field(&capFields, `"member_id"`)
+		if fieldErr != nil {
+			return nil, fieldErr
+		}
+		memberID, fieldErr := rf3ManifestPositiveUint64(memberValue)
+		if fieldErr != nil {
+			return nil, fieldErr
+		}
+		versionValue, fieldErr := nextRF3Field(&capFields, `"policy_version"`)
+		if fieldErr != nil {
+			return nil, fieldErr
+		}
+		version, fieldErr := rf3ManifestPositiveUint64(versionValue)
+		if fieldErr != nil || version > math.MaxUint32 {
+			return nil, errInvalidRF3Manifest
+		}
+		enabledValue, fieldErr := nextRF3Field(&capFields, `"enabled"`)
+		if fieldErr != nil {
+			return nil, fieldErr
+		}
+		enabled, ok := enabledValue.Bool()
+		if !ok || !enabled || memberID != result.Voters[index] || uint32(version) != result.PolicyVersion {
+			return nil, errInvalidRF3Manifest
+		}
+		if _, _, extra := capFields.Next(); extra {
+			return nil, errInvalidRF3Manifest
+		}
+		result.Capabilities[index] = rf3ManifestVoterCapability{MemberID: memberID, PolicyVersion: uint32(version), Enabled: enabled}
+	}
+	if _, extra := capIter.Next(); extra {
+		return nil, errInvalidRF3Manifest
+	}
+	if _, _, extra := fields.Next(); extra {
+		return nil, errInvalidRF3Manifest
 	}
 	return result, nil
 }

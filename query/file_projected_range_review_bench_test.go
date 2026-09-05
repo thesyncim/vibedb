@@ -53,23 +53,23 @@ func BenchmarkProjectedRangeReview(b *testing.B) {
 		b.Fatal(err)
 	}
 	defer snapshot.Close()
-	for _, scenario := range []string{"covered-narrow", "filtered-narrow", "covered-wide"} {
+	for _, scenario := range []string{"covered-narrow", "filtered-narrow", "covered-wide", "filtered-wide"} {
 		for _, rows := range []int{32, 256} {
 			b.Run(fmt.Sprintf("%s/rows=%d", scenario, rows), func(b *testing.B) {
 				columns := []Column{Path("/id"), Path("/bucket")}
-				if scenario == "covered-wide" {
+				if strings.HasSuffix(scenario, "-wide") {
 					for field := range 12 {
 						columns = append(columns, Path(fmt.Sprintf("/field%d", field)))
 					}
 				}
 				predicate := And(Cmp("/id", Ge, "01024"), Cmp("/id", Lt, "04096"))
-				if scenario == "filtered-narrow" {
+				if strings.HasPrefix(scenario, "filtered-") {
 					predicate = And(predicate, Cmp("/bucket", Eq, 5))
 				}
 				q := Select(columns...).Where(predicate).OrderBy("/id", Asc).Limit(rows)
 				span := NewFileRangeSource([]byte("01024"), []byte("04096"), false)
 				span.BindPrimaryOrder("/id")
-				if scenario != "filtered-narrow" {
+				if !strings.HasPrefix(scenario, "filtered-") {
 					span.BindPrimaryPredicate("/id")
 				}
 				var exec Exec
@@ -82,7 +82,7 @@ func BenchmarkProjectedRangeReview(b *testing.B) {
 						b.Fatalf("rows=%d want=%d", exec.Result.RowCount, rows)
 					}
 					last := 1024 + rows - 1
-					if scenario == "filtered-narrow" {
+					if strings.HasPrefix(scenario, "filtered-") {
 						last = 1029 + (rows-1)*8
 					}
 					value, ok := exec.Result.Columns[1].Cells[rows-1].Int64()

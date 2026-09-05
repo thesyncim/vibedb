@@ -41,6 +41,8 @@ func FuzzParseStatement(f *testing.F) {
 		`INSERT INTO t (id, n) VALUES (?, ?) ON CONFLICT DO UPDATE SET n = t.n + EXCLUDED.n + ?`,
 		`INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET state = CASE WHEN t.ready = TRUE THEN EXCLUDED.state ELSE t.state END`,
 		`INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET "$doc" = EXCLUDED."$doc" RETURNING id`,
+		`INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET n=t.n+? WHERE t.n>EXCLUDED.n AND EXCLUDED.n<?`,
+		`INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET "$doc"=EXCLUDED."$doc" WHERE t.n IN (?,?)`,
 		`INSERT INTO t VALUES (`,
 		`UPDATE t SET "$doc" = ?`,
 		`UPDATE t SET "$doc" = ? WHERE a = 1 AND NOT b IS NULL`,
@@ -251,6 +253,10 @@ func checkInsert(t *testing.T, s *InsertStmt) {
 		t.Fatal("INSERT carries two ON CONFLICT actions")
 	}
 	if update := s.OnConflictUpdate; update != nil {
+		if update.Where != nil {
+			scope := SelectStmt{From: []TableRef{mutationTargetRef(s.Table, s.Alias, s.Pos), {Name: "excluded", Alias: "excluded"}}}
+			seen += checkExpr(t, &scope, update.Where, false)
+		}
 		if len(update.Assignments) == 0 {
 			if !update.WholeDocument() {
 				t.Fatal("whole-document conflict update has an invalid source")

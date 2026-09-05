@@ -6,13 +6,13 @@ import (
 )
 
 // AppendConflictValue encodes a candidate row and a deterministic conflict
-// program. This value is command input, never a stored JSON document. VUC1
+// program. This value is command input, never a stored JSON document. VUC3
 // fixes the payload grammar independently of the surrounding command envelope.
 func AppendConflictValue(dst, candidate, program []byte) ([]byte, error) {
 	if len(candidate) == 0 || len(program) == 0 || len(candidate) > MaxMutationValueBytes-8 || len(program) > MaxMutationValueBytes-8-len(candidate) {
 		return nil, semantic("conflict value length")
 	}
-	dst = append(dst, "VUC1"...)
+	dst = append(dst, "VUC3"...)
 	dst = binary.LittleEndian.AppendUint32(dst, uint32(len(candidate)))
 	dst = append(dst, candidate...)
 	return append(dst, program...), nil
@@ -21,7 +21,7 @@ func AppendConflictValue(dst, candidate, program []byte) ([]byte, error) {
 // OpenConflictValue lends capacity-clamped candidate/program slices from one
 // bounded payload. The relation validator owns the program's closed grammar.
 func OpenConflictValue(value []byte) (candidate, program []byte, ok bool) {
-	if len(value) < 10 || len(value) > MaxMutationValueBytes || !bytes.Equal(value[:4], []byte("VUC1")) {
+	if len(value) < 10 || len(value) > MaxMutationValueBytes || !bytes.Equal(value[:4], []byte("VUC3")) {
 		return nil, nil, false
 	}
 	n := uint64(binary.LittleEndian.Uint32(value[4:8]))

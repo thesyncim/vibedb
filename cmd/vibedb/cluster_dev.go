@@ -24,6 +24,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -41,6 +42,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/rf3qualification"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibedb/store/durable"
 	"github.com/thesyncim/vibejson"
@@ -101,6 +103,7 @@ type devClusterManifest struct {
 	DurableAckKey       string             `json:"durable_ack_key"`
 	GatewayNode         string             `json:"gateway_node"`
 	GatewayControl      string             `json:"gateway_control"`
+	ReadAuthority       *devReadAuthority  `json:"read_authority,omitempty"`
 	Members             []devClusterMember `json:"members"`
 	LedgerMembers       []devClusterMember `json:"ledger_members"`
 	DataMembers         []devClusterMember `json:"data_members"`
@@ -118,6 +121,115 @@ type devClusterMember struct {
 	Snapshot      string `json:"snapshot"`
 	Control       string `json:"control"`
 	ServeManifest string `json:"serve_manifest"`
+}
+
+// devReadAuthority is copied verbatim into every RF3 member preparation. The
+// flag is opt-in; an absent section is the durable default-off contract.
+type devReadAuthority struct {
+	Enabled              bool                         `json:"enabled"`
+	FeatureVersion       uint32                       `json:"feature_version"`
+	PolicyVersion        uint32                       `json:"policy_version"`
+	MaxGrantMillis       uint64                       `json:"max_grant_millis"`
+	ClockRatePPM         uint32                       `json:"clock_rate_ppm"`
+	RoundingMarginMillis uint64                       `json:"rounding_margin_millis"`
+	Voters               []uint64                     `json:"voters"`
+	Capabilities         []devReadAuthorityCapability `json:"capabilities"`
+}
+
+type devReadAuthorityCapability struct {
+	MemberID      uint64 `json:"member_id"`
+	PolicyVersion uint32 `json:"policy_version"`
+	Enabled       bool   `json:"enabled"`
+}
+
+func newDevReadAuthority(enabled bool) *devReadAuthority {
+	if !enabled {
+		return nil
+	}
+	return &devReadAuthority{
+		Enabled: true, FeatureVersion: 1, PolicyVersion: 1,
+		MaxGrantMillis: 5000, ClockRatePPM: 100000, RoundingMarginMillis: 1,
+		Voters: []uint64{1, 2, 3},
+		Capabilities: []devReadAuthorityCapability{
+			{MemberID: 1, PolicyVersion: 1, Enabled: true},
+			{MemberID: 2, PolicyVersion: 1, Enabled: true},
+			{MemberID: 3, PolicyVersion: 1, Enabled: true},
+		},
+	}
+}
+
+func validDevReadAuthority(config devReadAuthority) bool {
+	want := newDevReadAuthority(true)
+	if want == nil || config.Enabled != want.Enabled || config.FeatureVersion != want.FeatureVersion ||
+		config.PolicyVersion != want.PolicyVersion || config.MaxGrantMillis != want.MaxGrantMillis ||
+		config.ClockRatePPM != want.ClockRatePPM || config.RoundingMarginMillis != want.RoundingMarginMillis ||
+		!slices.Equal(config.Voters, want.Voters) || !slices.Equal(config.Capabilities, want.Capabilities) {
+		return false
+	}
+	return true
+}
+
+func devReadAuthorityEqual(left, right *devReadAuthority) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	leftRaw, leftErr := vibejson.Marshal(left)
+	rightRaw, rightErr := vibejson.Marshal(right)
+	return leftErr == nil && rightErr == nil && bytes.Equal(leftRaw, rightRaw)
+}
+
+func cloneDevReadAuthority(config *devReadAuthority) *devReadAuthority {
+	if config == nil {
+		return nil
+	}
+	clone := *config
+	clone.Voters = slices.Clone(config.Voters)
+	clone.Capabilities = slices.Clone(config.Capabilities)
+	return &clone
+}
+
+// validateDevReadAuthorityRaw keeps a cluster-level opt-in from being lost
+// when an old prepared member or serve manifest is reused. The shard parser
+// performs the complete strict grammar check; this launcher check binds every
+// generated child artifact back to the cluster's immutable feature section.
+func validateDevReadAuthorityRaw(raw []byte, expected *devReadAuthority) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		// Before the read-authority section was introduced, restart validation
+		// retained opaque child artifacts as-is. Preserve that default-off
+		// resume contract, while enabled clusters still require a structured
+		// artifact below and therefore never accept an opaque replacement.
+		if expected == nil {
+			return nil
+		}
+		return errors.Join(errDevCluster, err)
+	}
+	encoded, present := fields["read_authority"]
+	if !present {
+		if expected == nil {
+			return nil
+		}
+		return fmt.Errorf("%w: prepared artifact omits enabled read authority", errDevCluster)
+	}
+	if len(encoded) == 0 || bytes.Equal(bytes.TrimSpace(encoded), []byte("null")) {
+		return fmt.Errorf("%w: invalid read authority section", errDevCluster)
+	}
+	var actual devReadAuthority
+	if err := vibejson.Unmarshal(encoded, &actual); err != nil {
+		return errors.Join(errDevCluster, err)
+	}
+	if expected == nil || !validDevReadAuthority(actual) || !devReadAuthorityEqual(&actual, expected) {
+		return fmt.Errorf("%w: prepared artifact read authority differs from cluster policy", errDevCluster)
+	}
+	return nil
+}
+
+func validateDevReadAuthorityFile(path string, expected *devReadAuthority) error {
+	raw, err := readDevFile(path, 4<<20)
+	if err != nil {
+		return err
+	}
+	return validateDevReadAuthorityRaw(raw, expected)
 }
 
 // devPhysicalNode is the supervisor inventory for one serving process. The
@@ -334,6 +446,7 @@ type devPrepareManifest struct {
 	AuthorizationPolicy   string                 `json:"authorization_policy"`
 	SplitControl          devPrepareSplitControl `json:"split_control"`
 	DevelopmentOnly       bool                   `json:"development_only,omitempty"`
+	ReadAuthority         *devReadAuthority      `json:"read_authority,omitempty"`
 	Members               []devPrepareMember     `json:"members"`
 }
 type devPrepareAuthority struct {
@@ -391,9 +504,11 @@ type devPrepareActionGrant struct {
 	Actions uint16 `json:"actions"`
 }
 type devPrepareMember struct {
-	MemberID    uint64 `json:"member_id"`
-	NodeID      string `json:"node_id"`
-	PeerAddress string `json:"peer_address"`
+	MemberID      uint64 `json:"member_id"`
+	NodeID        string `json:"node_id"`
+	PeerAddress   string `json:"peer_address"`
+	StoreID       string `json:"store_id,omitempty"`
+	NativeAddress string `json:"native_address,omitempty"`
 }
 type devPolicy struct {
 	Generation uint64         `json:"generation"`
@@ -413,6 +528,7 @@ type devClusterOptions struct {
 	pgListens                        []string
 	tlsCACertificate                 string
 	tlsCAKey                         string
+	readAuthority                    bool
 }
 
 func runClusterDev(args []string) int {
@@ -429,6 +545,7 @@ func runClusterDev(args []string) int {
 	pgListens := fs.String("pg-listens", "", "comma-separated PostgreSQL loopback endpoints, one per physical node (RF3 only)")
 	tlsCACertificate := fs.String("tls-ca-certificate", "", "optional PEM CA certificate used to sign this local cluster's leaf identities")
 	tlsCAKey := fs.String("tls-ca-key", "", "optional PEM CA private key paired with --tls-ca-certificate (never transmitted)")
+	readAuthority := fs.Bool("read-authority", false, "explicitly enable quorum read authority on every RF3 physical-node voter")
 	var tableSchemas []string
 	fs.Func("table-schema", "CREATE TABLE file to provision as an additional RF3 group; repeatable and retained on restart", func(path string) error {
 		tableSchemas = append(tableSchemas, path)
@@ -450,6 +567,11 @@ func runClusterDev(args []string) int {
 			}
 		}
 	}
+	if *readAuthority && !rf3qualification.ReadAuthorityEnabled {
+		fmt.Fprintf(os.Stderr, "cluster dev: --read-authority requires the explicitly tagged laboratory build %q\n",
+			rf3qualification.ReadAuthorityLabBuildTag)
+		return 2
+	}
 	replicasSet, nodesSet := false, false
 	fs.Visit(func(f *flag.Flag) {
 		replicasSet = replicasSet || f.Name == "replicas"
@@ -463,7 +585,7 @@ func runClusterDev(args []string) int {
 		}
 		*replicas = *nodes
 	}
-	if *replicas != devClusterRF1 && *replicas != devClusterRF3 || *nodeLog && *replicas != devClusterRF3 {
+	if *replicas != devClusterRF1 && *replicas != devClusterRF3 || *nodeLog && *replicas != devClusterRF3 || *readAuthority && *replicas != devClusterRF3 {
 		usage()
 		return 2
 	}
@@ -518,7 +640,7 @@ func runClusterDev(args []string) int {
 		return 1
 	}
 	defer unlock()
-	manifest, err := ensureDevCluster(devClusterOptions{root: abs, replicas: *replicas, shardBinary: shard, gatewayBinary: gw, nodeLog: *nodeLog, physicalNodes: *physicalNodes, pgListen: *pgListen, pgListens: listeners, tlsCACertificate: *tlsCACertificate, tlsCAKey: *tlsCAKey})
+	manifest, err := ensureDevCluster(devClusterOptions{root: abs, replicas: *replicas, shardBinary: shard, gatewayBinary: gw, nodeLog: *nodeLog, physicalNodes: *physicalNodes, pgListen: *pgListen, pgListens: listeners, tlsCACertificate: *tlsCACertificate, tlsCAKey: *tlsCAKey, readAuthority: *readAuthority})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cluster dev: %v\n", err)
 		return 1
@@ -568,6 +690,9 @@ func resolveDevBinary(explicit, name string) (string, error) {
 }
 
 func ensureDevCluster(options devClusterOptions) (devClusterManifest, error) {
+	if options.readAuthority && !rf3qualification.ReadAuthorityEnabled {
+		return devClusterManifest{}, fmt.Errorf("%w: read authority requires the explicitly tagged laboratory build %q", errDevCluster, rf3qualification.ReadAuthorityLabBuildTag)
+	}
 	if options.replicas != devClusterRF1 && options.replicas != devClusterRF3 {
 		return devClusterManifest{}, errDevCluster
 	}
@@ -577,6 +702,9 @@ func ensureDevCluster(options devClusterOptions) (devClusterManifest, error) {
 	}
 	if options.replicas == devClusterRF1 && options.physicalNodes != 0 {
 		return devClusterManifest{}, fmt.Errorf("%w: RF1 does not support physical-node composition", errDevCluster)
+	}
+	if options.readAuthority && (options.replicas != devClusterRF3 || options.physicalNodes == 0) {
+		return devClusterManifest{}, fmt.Errorf("%w: read authority requires RF3 physical-node serving", errDevCluster)
 	}
 	manifestPath := filepath.Join(options.root, "cluster.vibejson")
 	if raw, err := readDevFile(manifestPath, 1<<20); err == nil {
@@ -590,6 +718,9 @@ func ensureDevCluster(options devClusterOptions) (devClusterManifest, error) {
 			options.physicalNodes == 0 && m.NodeLog != options.nodeLog ||
 			options.physicalNodes != 0 && !m.NodeLog ||
 			options.physicalNodes != 0 && m.PhysicalNodes != uint8(options.physicalNodes) {
+			return m, errDevCluster
+		}
+		if (m.ReadAuthority != nil) != options.readAuthority || options.readAuthority && !validDevReadAuthority(*m.ReadAuthority) {
 			return m, errDevCluster
 		}
 		if m.PhysicalNodes != 0 {
@@ -618,6 +749,9 @@ func ensureDevCluster(options devClusterOptions) (devClusterManifest, error) {
 }
 
 func initializeDevCluster(options devClusterOptions, manifestPath string) (devClusterManifest, error) {
+	if options.readAuthority && !rf3qualification.ReadAuthorityEnabled {
+		return devClusterManifest{}, fmt.Errorf("%w: read authority requires the explicitly tagged laboratory build %q", errDevCluster, rf3qualification.ReadAuthorityLabBuildTag)
+	}
 	if options.replicas == devClusterRF3 && options.physicalNodes != 0 {
 		return initializeDevPhysicalCluster(options, manifestPath)
 	}
@@ -685,7 +819,7 @@ func initializeDevCluster(options devClusterOptions, manifestPath string) (devCl
 		return devClusterManifest{}, err
 	}
 	clear(keyMaterial)
-	m := devClusterManifest{Format: devClusterFormat, Nodes: uint8(options.replicas), NodeLog: options.nodeLog, ClientEndpoint: ports[0], CatalogPath: filepath.Join(options.root, "catalog.vibejson"), GatewayCertificate: credentials[gatewayIndex][0], GatewayKey: credentials[gatewayIndex][1], Roots: roots, AuthorizationPolicy: policyPath, HotShardCapacity: filepath.Join(options.root, "hot-shard-capacity.vibejson"), ReplicaControl: filepath.Join(options.root, "replica-control.vibejson"), DurableAckKey: durableAckKeyPath, GatewayNode: hex.EncodeToString(nodes[gatewayIndex][:]), GatewayControl: ports[1+options.replicas*12], Members: make([]devClusterMember, options.replicas), LedgerMembers: make([]devClusterMember, options.replicas), DataMembers: make([]devClusterMember, options.replicas)}
+	m := devClusterManifest{Format: devClusterFormat, Nodes: uint8(options.replicas), NodeLog: options.nodeLog, ReadAuthority: newDevReadAuthority(options.readAuthority), ClientEndpoint: ports[0], CatalogPath: filepath.Join(options.root, "catalog.vibejson"), GatewayCertificate: credentials[gatewayIndex][0], GatewayKey: credentials[gatewayIndex][1], Roots: roots, AuthorizationPolicy: policyPath, HotShardCapacity: filepath.Join(options.root, "hot-shard-capacity.vibejson"), ReplicaControl: filepath.Join(options.root, "replica-control.vibejson"), DurableAckKey: durableAckKeyPath, GatewayNode: hex.EncodeToString(nodes[gatewayIndex][:]), GatewayControl: ports[1+options.replicas*12], Members: make([]devClusterMember, options.replicas), LedgerMembers: make([]devClusterMember, options.replicas), DataMembers: make([]devClusterMember, options.replicas)}
 	m.ClientCertificate, m.ClientKey = credentials[clientIndex][0], credentials[clientIndex][1]
 	m.ClientNode = hex.EncodeToString(nodes[clientIndex][:])
 	catalogPrepareMembers := make([]devPrepareMember, options.replicas)
@@ -698,6 +832,11 @@ func initializeDevCluster(options devClusterOptions, manifestPath string) (devCl
 		catalogPrepareMembers[i] = devPrepareMember{MemberID: uint64(i + 1), NodeID: hex.EncodeToString(nodes[i][:]), PeerAddress: ports[catalogBase]}
 		ledgerPrepareMembers[i] = devPrepareMember{MemberID: uint64(i + 1), NodeID: hex.EncodeToString(nodes[options.replicas+i][:]), PeerAddress: ports[ledgerBase]}
 		dataPrepareMembers[i] = devPrepareMember{MemberID: uint64(i + 1), NodeID: hex.EncodeToString(nodes[options.replicas*2+i][:]), PeerAddress: ports[dataBase]}
+		if options.readAuthority {
+			catalogPrepareMembers[i].NativeAddress = ports[catalogBase+1]
+			ledgerPrepareMembers[i].NativeAddress = ports[ledgerBase+1]
+			dataPrepareMembers[i].NativeAddress = ports[dataBase+1]
+		}
 	}
 	authority := devPrepareAuthority{ActivePolicyGeneration: 1, ProtectionEpoch: 1, OwnershipEpoch: 1, SchemaGeneration: 1, RoutingVersion: 1, RouteGeneration: 1}
 	ledgerGroup := raftmember.GroupKey{
@@ -729,7 +868,15 @@ func initializeDevCluster(options devClusterOptions, manifestPath string) (devCl
 				memberRoot = filepath.Join(memberRoot, "group-0")
 			}
 			identityIndex := roleIndex*options.replicas + i
-			prep := devPrepareManifest{Root: memberRoot, Distribution: role.distribution, Shard: role.shard, ClusterID: hex.EncodeToString(clusterID[:]), ClusterIncarnation: hex.EncodeToString(clusterIncarnation[:]), TopologyRecoveryEpoch: 1, AllocationGeneration: 1, ShardIncarnation: hex.EncodeToString(role.shardIncarnation[:]), GroupID: hex.EncodeToString(role.groupID[:]), MemberID: uint64(i + 1), StoreID: hex.EncodeToString(stores[identityIndex][:]), Table: role.table, CreateTable: role.createTable, Authority: authority, WAL: devPrepareWAL{KeyID: "dev-cluster-key", KeyMaterialPath: keySource, WrappedKey: "local-development-only", MaxFileBytes: raftstore.DefaultMaxFileBytes, MaxRecordBytes: raftstore.DefaultMaxRecordBytes, MaxRecords: raftstore.DefaultMaxRecords, MaxEntries: raftstore.DefaultMaxEntries, MaxLiveBytes: raftstore.DefaultMaxLiveBytes}, Apply: apply, Listeners: devPrepareListeners{Peer: ports[base], Native: ports[base+1], Snapshot: ports[base+2], Control: ports[base+3]}, TLS: devPrepareTLS{Certificate: credentials[identityIndex][0], Key: credentials[identityIndex][1], Roots: roots, IdentityOID: devClusterOID}, AuthorizationPolicy: policyPath, SplitControl: splitControl, DevelopmentOnly: options.replicas == devClusterRF1, Members: role.prepareMembers}
+			members := make([]devPrepareMember, len(role.prepareMembers))
+			copy(members, role.prepareMembers)
+			if options.readAuthority {
+				for memberIndex := range members {
+					storeIndex := roleIndex*options.replicas + memberIndex
+					members[memberIndex].StoreID = hex.EncodeToString(stores[storeIndex][:])
+				}
+			}
+			prep := devPrepareManifest{Root: memberRoot, Distribution: role.distribution, Shard: role.shard, ClusterID: hex.EncodeToString(clusterID[:]), ClusterIncarnation: hex.EncodeToString(clusterIncarnation[:]), TopologyRecoveryEpoch: 1, AllocationGeneration: 1, ShardIncarnation: hex.EncodeToString(role.shardIncarnation[:]), GroupID: hex.EncodeToString(role.groupID[:]), MemberID: uint64(i + 1), StoreID: hex.EncodeToString(stores[identityIndex][:]), Table: role.table, CreateTable: role.createTable, Authority: authority, WAL: devPrepareWAL{KeyID: "dev-cluster-key", KeyMaterialPath: keySource, WrappedKey: "local-development-only", MaxFileBytes: raftstore.DefaultMaxFileBytes, MaxRecordBytes: raftstore.DefaultMaxRecordBytes, MaxRecords: raftstore.DefaultMaxRecords, MaxEntries: raftstore.DefaultMaxEntries, MaxLiveBytes: raftstore.DefaultMaxLiveBytes}, Apply: apply, Listeners: devPrepareListeners{Peer: ports[base], Native: ports[base+1], Snapshot: ports[base+2], Control: ports[base+3]}, TLS: devPrepareTLS{Certificate: credentials[identityIndex][0], Key: credentials[identityIndex][1], Roots: roots, IdentityOID: devClusterOID}, AuthorizationPolicy: policyPath, SplitControl: splitControl, DevelopmentOnly: options.replicas == devClusterRF1, ReadAuthority: newDevReadAuthority(options.readAuthority), Members: members}
 			prepPath := filepath.Join(options.root, fmt.Sprintf("prepare-%s-member-%d.vibejson", role.name, i+1))
 			raw, e := vibejson.Marshal(&prep)
 			if e != nil {
@@ -804,11 +951,29 @@ func completeDevCluster(options devClusterOptions, manifest devClusterManifest) 
 	}{{"catalog", manifest.Members}, {"ledger", manifest.LedgerMembers}, {"data", manifest.DataMembers}} {
 		for index, member := range role.members {
 			if _, err := os.Stat(member.ServeManifest); err == nil {
+				if err := validateDevReadAuthorityFile(member.ServeManifest, manifest.ReadAuthority); err != nil {
+					return err
+				}
+				preparePath := filepath.Join(options.root, fmt.Sprintf("prepare-%s-member-%d.vibejson", role.name, index+1))
+				if _, prepareErr := os.Stat(preparePath); prepareErr == nil {
+					if err := validateDevReadAuthorityFile(preparePath, manifest.ReadAuthority); err != nil {
+						return err
+					}
+				} else if !errors.Is(prepareErr, os.ErrNotExist) {
+					return prepareErr
+				}
 				continue
 			} else if !errors.Is(err, os.ErrNotExist) {
 				return err
 			}
 			preparePath := filepath.Join(options.root, fmt.Sprintf("prepare-%s-member-%d.vibejson", role.name, index+1))
+			if _, prepareErr := os.Stat(preparePath); prepareErr == nil {
+				if err := validateDevReadAuthorityFile(preparePath, manifest.ReadAuthority); err != nil {
+					return err
+				}
+			} else if !errors.Is(prepareErr, os.ErrNotExist) {
+				return prepareErr
+			}
 			if manifest.NodeLog {
 				if err := prepareDevNode(options.shardBinary, preparePath); err != nil {
 					return err
@@ -2171,6 +2336,9 @@ func validDevManifest(m devClusterManifest, root string) bool {
 		return false
 	}
 	if _, err := decodeDev16(m.ClientNode); err != nil || m.ClientNode == m.GatewayNode {
+		return false
+	}
+	if m.ReadAuthority != nil && (m.Nodes != devClusterRF3 || !validDevReadAuthority(*m.ReadAuthority)) {
 		return false
 	}
 	paths := []string{m.CatalogPath, m.GatewayCertificate, m.GatewayKey, m.ClientCertificate, m.ClientKey, m.Roots, m.AuthorizationPolicy, m.HotShardCapacity, m.ReplicaControl, m.DurableAckKey}

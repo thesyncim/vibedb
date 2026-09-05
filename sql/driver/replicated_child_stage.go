@@ -182,6 +182,7 @@ func expectedTxnLogOptions(
 ) (result durable.TxnLogOptions) {
 	result.Capacity = expected.Sidecars.TransactionMarkerBytes
 	result.SealedCapacity = true
+	result.PortableCapacity = true
 	return result
 }
 

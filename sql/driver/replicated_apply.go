@@ -434,6 +434,7 @@ func replicatedApplyDurableOptions(limits ReplicatedShardStoreLimits) durable.Op
 		MaxBatchDocuments:          limits.MaxBatchDocuments,
 		MaxBatchBytes:              limits.MaxBatchBytes,
 		SealedRecoveryJournalBytes: sidecars.SystemRecoveryJournalBytes,
+		PortableSealedCapacity:     true,
 	}
 	// Large configured retry windows can retain more cleanup keys than the
 	// default 64 MiB cache admits. Derive only the exact dirty-transaction
@@ -611,7 +612,7 @@ func (d *Database) openReplicatedApplyWithSchemaAudit(
 	}
 	wantTxnOptions := durable.TxnLogOptions{
 		Capacity:       expected.Sidecars.TransactionMarkerBytes,
-		SealedCapacity: true,
+		SealedCapacity: true, PortableCapacity: true,
 	}
 	if core.txnLog == nil || core.txnLog.Options() != wantTxnOptions {
 		return nil, ReplicatedApplyIdentity{}, fmt.Errorf(
@@ -1247,6 +1248,7 @@ func replicatedStateCollectionLimits(limits ReplicatedShardStoreLimits) replicat
 }
 
 type replicatedSQLMutationValidator struct {
+	conflict *replicatedConflictPlan
 	// Machine apply is serial, but detached snapshot audits may share this
 	// validator concurrently. The mutex gives the reusable owned scratch one
 	// caller at a time; request-backed placement Scalars remain stack-local.

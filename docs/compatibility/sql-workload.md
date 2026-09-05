@@ -1,9 +1,8 @@
 # SQL workload compatibility tracker
 
 This audit compares the Chat product and its shared database layer in the local
-`chat` repository with VibeDB main at `9454ced0` (2026-09-05). The implementation
-batches through null-safe comparisons are merged at `2a8723ff`; grouped
-filtering builds on main at `a2ac5fd8`. **The application
+`chat` repository with VibeDB main at `9454ced0` (2026-09-05). The read-compatibility batches through relation wildcard expansion are merged
+at `97edf271`. **The application
 cannot yet run unchanged on VibeDB.** This change implements the conditional
 expressions, Boolean tests, explicit null ordering, INSERT NULL literals, and
 single-column primary conflict targets, and computed sort keys described below. The remaining reduced
@@ -48,11 +47,13 @@ source locations, not query execution counts or a compatibility percentage.
 | Explicit ON CONFLICT target | 58 | A single primary-key column is validated at prepare and execution, including explicit transactions. Composite and secondary unique targets remain unsupported. Secondary unique violations are never silently skipped. |
 | Computed ORDER BY | 69 GREATEST/LEAST locations include sort usage | Hidden scalar and aggregate sort keys run before OFFSET/LIMIT. Grouping, joins, derived relations, and window outputs retain their own semantic stages; distributed sorts evaluate the complete qualifying relation. |
 | Scalar filtering before grouping | Reduced aggregate case | Filters the input relation before COUNT/SUM/AVG, grouped outputs, HAVING, and windows. Preserves prepared parameter ranges and headers across CTEs and joins, including chained and outer joins. Embedded, durable, and distributed reads share the same bounded execution stage. |
+| Relation wildcards with computed outputs | Reduced derived and CTE cases | Expands known child output ordinals alongside scalar SELECT expressions and scalar filters. Duplicate names and typed child metadata are preserved without reconstructing documents. Computed sort aliases bind after expansion. Bare physical SELECT * retains the existing whole-document contract; inferred field expansion and numeric ORDER BY positions with wildcards remain gaps. |
+| Aggregate HAVING dependencies | Reduced grouped and global aggregate cases | HAVING can read aggregates absent from the SELECT list and combine grouped-key comparisons, null tests, and computed scalar predicates with AND/OR/NOT. Computed output runs after HAVING even without ORDER BY. Hidden reductions leave public result headers unchanged. Correlated LATERAL also supports hidden local and captured COUNT/SUM/AVG/MIN/MAX in its existing comparison, IN, BETWEEN, and null-test predicates; computed correlated predicates and post-reduction tails remain gaps. |
 | IS [NOT] DISTINCT FROM | Reduced comparison case | Total null-safe comparison over supported scalar domains, with each operand evaluated once. Uses the shared predicate/CASE stage on embedded and distributed reads and mutations. Equality against a placement key retains finite shard routing through CTE aliases. Uncorrelated scalar WHERE runs before grouping; correlated grouped statements remain a gap. |
 
 These features do not remove the existing restrictions on computed GROUP BY
 expressions, mixed scalar/path pattern predicates, correlated grouped scalar
-filters, derived-table wildcard projections, or distributed mutation syntax.
+filters, inferred fields from a whole-document child projection, or distributed mutation syntax.
 There is no general scalar-function catalog. Use explicit casts between
 different scalar domains; general PostgreSQL unknown-literal/type coercion is
 not claimed. Conditional Boolean/text typed literals reuse the existing CASE
@@ -94,13 +95,33 @@ On legacy shards without global indexes, a single-owner `DO UPDATE` executes
 the original conflict action atomically in the shard driver. Arbitrary shard-key
 assignments still require a placement proof; copying the current or candidate
 key and whole-document EXCLUDED replacement preserve the routed owner.
-RF3 whole-document EXCLUDED replacement uses the native atomic put primitive
-and preserves its exact affected-row and retry semantics. Declared RF3 column
-upserts now replicate a bounded conflict program with bound scalar constants
-and EXCLUDED column references. Each replica validates the candidate and column
-names before selecting the insert or update branch, then patches its current
-row atomically. Untouched fields and exact retry results are preserved.
-Computed conflict assignments, global-index conflict maintenance, RETURNING, general mutation
+Unconditional RF3 whole-document EXCLUDED replacement uses the native atomic
+put primitive and preserves its exact affected-row and retry semantics. Declared
+RF3 column upserts and conditional whole-document replacements replicate a
+bounded VUC3 expression template and its referenced scalar bindings. Current-row and EXCLUDED expressions use the same compiled projection
+as local SQL: exact arithmetic, concatenation, casts, lazy CASE and conditional
+functions, and simultaneous assignment semantics. Candidate validation, column
+resolution and binding checks precede branch selection. Runtime RHS evaluation
+runs only on conflict, at the replica's atomic apply/participant prepare point;
+it requires no coordinator preimage read. An ON CONFLICT WHERE condition runs
+once before all SET expressions; FALSE and UNKNOWN skip assignments, local
+RETURNING rows, and affected-row counts. An insert ignores the condition at
+runtime while still validating candidate, declaration, and bindings. The same
+filter applies to local, durable, transactional, shard, and RF3 execution.
+Untouched fields and exact retry results are preserved. The owner proof and final schema/key fences still apply.
+
+Each relation retains at most one compiled template, protected by the same
+mutex used for detached snapshot audits. Changed parameter values reuse that
+template; only referenced binds are serialized, with dense ordinals independent
+of the INSERT's candidate binds. The format bounds the full mutation to 4 MiB,
+assignments and referenced parameters to 1,024 each, expression nodes to 16,384,
+and depth to 128. Execution has deterministic 16 MiB workspace, result,
+intermediate, and exact-number budgets; document limits apply independently.
+The unreleased VUC2 grammar is replaced, and authenticated apply-contract,
+snapshot and data-chain identities change with it. Mixed apply contracts fail
+closed. See [expression format](replicated-conflict-program.md).
+
+Global-index conflict maintenance, RETURNING, general mutation
 predicates, and explicit transaction parity still need implementation. The
 bounded coordinator read path also still needs full RF3 global-index read
 integration. These are release gates for the requested distributed parity,
@@ -109,8 +130,7 @@ not claims closed by local tests.
 ## Remaining work
 
 The [SQL workload gap corpus](../../internal/conformance/sql_workload.go)
-contains 33 reduced statements. The
-[driver gate](../../sql/driver/sql_workload_compatibility_test.go) verifies that
+contains 32 reduced statements. The [driver gate](../../sql/driver/sql_workload_compatibility_test.go) verifies that
 each still refuses at prepare or execution. When implementing a gap, replace
 its refusal expectation with result, metadata, and atomicity coverage and
 update this table. A parser accepting a statement does not close a gap.
@@ -121,7 +141,7 @@ update this table. A parser accepting a statement does not close a gap.
 | 1 | PostgreSQL field types, defaults, constraints | 333 timestamp/interval, 125 UUID/serial, 90 type-modifier, 389 default/constraint locations. Requires real timestamp/UUID/array semantics, value generation, casts, wire metadata, and schema validation. |
 | 1 | JSONB and JSON operations | 296 JSONB, 45 JSON-function, 312 JSON-operator locations. Includes JSONB type/casts, key existence, merge/delete, jsonb_set, typeof, array expansion and aggregation. Existing JSON path access/containment is only a subset; JSON must not be relabeled JSONB. |
 | 1 | PostgreSQL arrays and row-value predicates | 8 array-function, 33 array-syntax, 64 row-comparison locations. Includes ANY, UNNEST, array binding, constructors, aggregation and composite-key pagination. |
-| 1 | Relational mutations and queues | 36 UPDATE-FROM/DELETE-USING and 14 modifying-CTE locations. Requires atomic shared-snapshot execution, INSERT-SELECT with target columns, conflict-action WHERE, and returned-row dependencies. |
+| 1 | Relational mutations and queues | 36 UPDATE-FROM/DELETE-USING and 14 modifying-CTE locations. Requires atomic shared-snapshot execution, INSERT-SELECT with target columns and returned-row dependencies. |
 | 1 | Locking and queue concurrency | 14 locking locations, including FOR UPDATE / SKIP LOCKED. Requires a real concurrency contract; accepting and ignoring lock clauses would be incorrect. |
 | 2 | Expression, partial, ordered, and covering indexes | 205 index-related locations. Required both for schema acceptance and efficient channel/member queries; uniqueness predicates and access-path proofs must remain correct. |
 | 2 | Remaining query expressions | Computed group keys; mixed scalar/path pattern predicates; correlated scalar filtering before aggregates; derived wildcard + scalar outputs; string/date functions; DISTINCT ON; aggregate DISTINCT/FILTER and array/JSON aggregation. |

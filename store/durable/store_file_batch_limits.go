@@ -56,7 +56,7 @@ func (c *Collection) MaxBatchBytes() int {
 	return c.options.MaxBatchBytes
 }
 
-// SealedRecoveryJournalBytes returns the immutable strictly allocated record
+// SealedRecoveryJournalBytes returns the immutable sealed record
 // region of the paired recovery journal. Zero denotes the ordinary elastic
 // journal geometry.
 func (c *Collection) SealedRecoveryJournalBytes() uint64 {

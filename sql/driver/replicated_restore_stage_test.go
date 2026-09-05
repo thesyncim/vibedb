@@ -221,7 +221,7 @@ func openRestoreBundleRoot(
 			BucketBits:    distribution.DefaultVirtualBucketBits,
 		}},
 	)
-	skipReplicatedStrictAllocationUnsupported(t, database, identity, err)
+	rejectReplicatedStrictAllocationUnsupported(t, database, identity, err)
 	if err != nil {
 		t.Fatal(err)
 	}

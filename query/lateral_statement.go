@@ -187,11 +187,11 @@ func prepareStatementLateral(
 	if err != nil {
 		return nil, nil, err
 	}
-	clone.OrderBy, err = cloner.cloneOrderBy(ref.Query.OrderBy)
+	clone.Having, err = cloner.cloneHaving(ref.Query.Having, &clone.Columns)
 	if err != nil {
 		return nil, nil, err
 	}
-	clone.Having, err = cloner.cloneHaving(ref.Query.Having, &clone.Columns)
+	clone.OrderBy, err = cloner.cloneOrderBy(ref.Query.OrderBy)
 	if err != nil {
 		return nil, nil, err
 	}
