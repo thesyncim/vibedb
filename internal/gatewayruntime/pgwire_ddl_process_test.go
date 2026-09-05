@@ -116,6 +116,7 @@ active BOOLEAN NOT NULL
 		{`SELECT COUNT(*) FROM employees WHERE id IS NOT DISTINCT FROM NULL`, "0"},
 		{`SELECT COALESCE(SUM(score),0) FROM employees HAVING COUNT(*)>999`, "49500"},
 		{`SELECT score FROM employees GROUP BY score HAVING COUNT(*)=10 ORDER BY score DESC LIMIT 1`, "99"},
+		{`SELECT score FROM employees GROUP BY score HAVING score=99 AND COALESCE(COUNT(*),0)=10`, "99"},
 		{`SELECT 1 FROM employees WHERE id IS NOT DISTINCT FROM NULL HAVING COUNT(*)=0`, "1"},
 		{`WITH c AS (SELECT id,score FROM employees) SELECT score FROM c WHERE id IS NOT DISTINCT FROM 'employee-0001'`, "1"},
 		{`SELECT CASE WHEN city IS DISTINCT FROM NULL THEN score ELSE 0 END FROM employees WHERE id='employee-0001'`, "1"},

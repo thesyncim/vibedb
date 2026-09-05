@@ -43,6 +43,7 @@ func TestCoordinatorQueryMatchesGlobalSQLSemantics(t *testing.T) {
 		{`SELECT COUNT(*) FROM messages HAVING COUNT(*) > 3`, []string{"4"}},
 		{`SELECT COALESCE(SUM(n),0) FROM messages HAVING COUNT(*)>3`, []string{"10"}},
 		{`SELECT n FROM messages GROUP BY n HAVING SUM(n)>2 ORDER BY n`, []string{"3", "4"}},
+		{`SELECT n FROM messages GROUP BY n HAVING n=1 OR COALESCE(SUM(n),0)>3 ORDER BY n`, []string{"1", "4"}},
 		{`SELECT 1 FROM messages WHERE n>100 HAVING COUNT(*)=0`, []string{"1"}},
 		{`WITH c AS (SELECT n FROM messages) SELECT SUM(n) FROM c`, []string{"10"}},
 		{`SELECT SUM(d.n) FROM (SELECT n FROM messages) AS d`, []string{"10"}},
