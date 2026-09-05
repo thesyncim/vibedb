@@ -68,6 +68,24 @@ func TestCompactPackedExtremaZeroWidthAndDispatch(t *testing.T) {
 	if !supported || found || minimum != 0 || maximum != 0 {
 		t.Fatalf("empty extrema=(%d,%d,%t,%t), want (0,0,false,true)", minimum, maximum, found, supported)
 	}
+	for _, tc := range []struct {
+		name         string
+		data         []byte
+		count, width int
+	}{
+		{name: "empty-width0-trailing", data: []byte{0}, count: 0, width: 0},
+		{name: "empty-width7-trailing", data: []byte{0}, count: 0, width: 7},
+		{name: "zero-width-trailing", data: []byte{0}, count: 37, width: 0},
+		{name: "short", data: nil, count: 1, width: 7},
+		{name: "trailing", data: []byte{0, 0}, count: 1, width: 7},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			minimum, maximum, found, supported := countCompactPackedExtrema(tc.data, tc.count, tc.width)
+			if supported || found || minimum != 0 || maximum != 0 {
+				t.Fatalf("malformed extrema=(%d,%d,%t,%t), want (0,0,false,false)", minimum, maximum, found, supported)
+			}
+		})
+	}
 	for width, fn := range map[int]func([]byte, int) (uint64, uint64, bool, bool){
 		7: countCompactPacked7ExtremaImpl, 8: countCompactPacked8ExtremaImpl,
 		10: countCompactPacked10ExtremaImpl, 16: countCompactPacked16ExtremaImpl,
@@ -95,6 +113,9 @@ func TestCompactIntegerExtremaFORStrictAdmission(t *testing.T) {
 		{name: "width8", values: compactOrderedFORFixture(-128, 255)},
 		{name: "width10", values: compactOrderedFORFixture(-512, 1023)},
 		{name: "width16", values: compactOrderedFORFixture(-32768, 65535)},
+		{name: "width56-signed", values: []int64{-7, (int64(1) << 56) - 8}},
+		{name: "width57-signed", values: []int64{-8, (int64(1) << 57) - 9}},
+		{name: "width61-signed", values: []int64{-11, (int64(1) << 61) - 12}},
 	}
 	for _, fixture := range fixtures {
 		fixture := fixture

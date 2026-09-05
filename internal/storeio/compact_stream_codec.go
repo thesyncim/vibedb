@@ -2529,15 +2529,15 @@ func countCompactPackedExtrema(
 	if count < 0 || width < 0 || width > 64 {
 		return 0, 0, false, false
 	}
+	packedBytes := (uint64(count)*uint64(width) + 7) / 8
+	if uint64(len(data)) != packedBytes {
+		return 0, 0, false, false
+	}
 	if count == 0 {
 		return 0, 0, false, true
 	}
 	if width == 0 {
 		return 0, 0, true, true
-	}
-	packedBytes := (uint64(count)*uint64(width) + 7) / 8
-	if uint64(len(data)) != packedBytes {
-		return 0, 0, false, false
 	}
 	if width == 7 {
 		return countCompactPacked7ExtremaImpl(data, count)
