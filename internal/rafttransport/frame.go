@@ -131,6 +131,9 @@ func (registry *StaticRegistry) preflightOutbound(
 		version = election.version
 	}
 	if err := registry.validateAuthorizedMessage(outbound.Group, view, outbound.Message); err != nil {
+		if retiredOutboundDestination(view, outbound.Message) {
+			return outboundFramePlan{}, fmt.Errorf("%w: %w", err, errRetiredOutboundDestination)
+		}
 		return outboundFramePlan{}, err
 	}
 	roster, ok := registry.rosterDigest(outbound.Group)
