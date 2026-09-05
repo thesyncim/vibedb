@@ -503,12 +503,34 @@ func (s *Statement) buildGeneralizedWhere(args []any) error {
 	if s.tree.Where == nil {
 		return nil
 	}
-	pred, err := s.lowerNode(s.tree.Where, true, args)
-	if err != nil {
-		return err
+	conjuncts := []*sqlast.Expr{s.tree.Where}
+	if s.tree.Where.Kind == sqlast.ExprAnd {
+		conjuncts = s.tree.Where.Kids
 	}
-	s.q.where = pred
-	s.q.hasWhere = true
+	base := len(s.stack)
+	defer func() { s.stack = s.stack[:base] }()
+	for _, conjunct := range conjuncts {
+		// Scalar predicates consume the completed join through the shared
+		// scalar row stage, just as they do for the storage-aware join path.
+		if scalar := s.scalarStatement(); scalar != nil && scalar.ownsWhere(conjunct) {
+			continue
+		}
+		pred, err := s.lowerNode(conjunct, true, args)
+		if err != nil {
+			return err
+		}
+		s.stack = append(s.stack, pred)
+	}
+	outer := s.stack[base:]
+	switch len(outer) {
+	case 0:
+	case 1:
+		s.q.where, s.q.hasWhere = outer[0], true
+	default:
+		kids := s.c.operands(len(outer))
+		kids = append(kids, outer...)
+		s.q.where, s.q.hasWhere = Predicate{kind: predAnd, kids: kids}, true
+	}
 	return nil
 }
 

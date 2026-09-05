@@ -110,6 +110,10 @@ active BOOLEAN NOT NULL
 	for _, tc := range []struct{ sql, value string }{
 		{`SELECT COALESCE(SUM(score),0) FROM employees`, "49500"},
 		{`SELECT AVG(score) FROM employees`, "49.5"},
+		{`SELECT COUNT(*) FROM employees WHERE COALESCE(score,0)>50`, "490"},
+		{`SELECT SUM(score) FROM employees WHERE COALESCE(score,0)>50`, "36750"},
+		{`WITH c AS (SELECT id,score FROM employees) SELECT COUNT(*) FROM c WHERE id IS NOT DISTINCT FROM 'employee-0001' AND COALESCE(score,0)>0`, "1"},
+		{`SELECT COUNT(*) FROM employees WHERE id IS NOT DISTINCT FROM NULL`, "0"},
 		{`WITH c AS (SELECT id,score FROM employees) SELECT score FROM c WHERE id IS NOT DISTINCT FROM 'employee-0001'`, "1"},
 		{`SELECT CASE WHEN city IS DISTINCT FROM NULL THEN score ELSE 0 END FROM employees WHERE id='employee-0001'`, "1"},
 		{`SELECT score FROM employees ORDER BY GREATEST(score,0) DESC LIMIT 1`, "99"},

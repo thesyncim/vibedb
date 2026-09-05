@@ -464,6 +464,11 @@ func prepareTreeInCorrelationContext(
 			preserveDocumentUnknown,
 		)
 	}
+	staged, err := stageGroupedScalarPredicate(src, tree, correlation)
+	if err != nil {
+		return nil, err
+	}
+	tree = staged
 	s := &Statement{
 		text: src, tree: tree, params: tree.Params, paramBase: argBase,
 		subqueryLimit: subqueryLimit, parameterTypeHints: parameterTypes,
