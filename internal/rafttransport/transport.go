@@ -450,6 +450,9 @@ func (transport *OrdinaryTransport) Send(outbound raftmember.OutboundMessage) er
 	}
 	plan, err := transport.registry.preflightOutbound(outbound)
 	if err != nil {
+		if errors.Is(err, errRetiredOutboundDestination) {
+			return nil // Committed removal canceled this queued ordinary packet.
+		}
 		return err
 	}
 	wireBytes := plan.frameSize + StreamRecordHeaderBytes
