@@ -82,7 +82,6 @@ func TestReplicatedPointReadSessionCandidatePreservesQuerySemantics(t *testing.T
 	); err != nil {
 		t.Fatal(err)
 	}
-	defer cursor.Close()
 	if !cursor.Next() {
 		t.Fatal("point hit returned no row")
 	}
@@ -95,6 +94,9 @@ func TestReplicatedPointReadSessionCandidatePreservesQuerySemantics(t *testing.T
 	}
 	if cursor.Next() {
 		t.Fatal("point hit returned more than one row")
+	}
+	if err := cursor.Close(); err != nil {
+		t.Fatal(err)
 	}
 
 	residual, err := session.Prepare(ctx,
