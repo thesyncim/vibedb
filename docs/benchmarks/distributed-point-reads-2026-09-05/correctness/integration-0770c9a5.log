@@ -1,0 +1,234 @@
+=== RUN   TestFileSmallIndexedPages
+=== RUN   TestFileSmallIndexedPages/primary/1/residual=false
+=== RUN   TestFileSmallIndexedPages/primary/1/residual=true
+=== RUN   TestFileSmallIndexedPages/secondary/1
+=== RUN   TestFileSmallIndexedPages/primary/32/residual=false
+=== RUN   TestFileSmallIndexedPages/primary/32/residual=true
+=== RUN   TestFileSmallIndexedPages/secondary/32
+=== RUN   TestFileSmallIndexedPages/primary/64/residual=false
+=== RUN   TestFileSmallIndexedPages/primary/64/residual=true
+=== RUN   TestFileSmallIndexedPages/secondary/64
+=== RUN   TestFileSmallIndexedPages/primary/256/residual=false
+=== RUN   TestFileSmallIndexedPages/primary/256/residual=true
+=== RUN   TestFileSmallIndexedPages/secondary/256
+--- PASS: TestFileSmallIndexedPages (0.15s)
+    --- PASS: TestFileSmallIndexedPages/primary/1/residual=false (0.01s)
+    --- PASS: TestFileSmallIndexedPages/primary/1/residual=true (0.01s)
+    --- PASS: TestFileSmallIndexedPages/secondary/1 (0.00s)
+    --- PASS: TestFileSmallIndexedPages/primary/32/residual=false (0.01s)
+    --- PASS: TestFileSmallIndexedPages/primary/32/residual=true (0.00s)
+    --- PASS: TestFileSmallIndexedPages/secondary/32 (0.00s)
+    --- PASS: TestFileSmallIndexedPages/primary/64/residual=false (0.01s)
+    --- PASS: TestFileSmallIndexedPages/primary/64/residual=true (0.00s)
+    --- PASS: TestFileSmallIndexedPages/secondary/64 (0.00s)
+    --- PASS: TestFileSmallIndexedPages/primary/256/residual=false (0.01s)
+    --- PASS: TestFileSmallIndexedPages/primary/256/residual=true (0.00s)
+    --- PASS: TestFileSmallIndexedPages/secondary/256 (0.01s)
+=== RUN   TestValidatedRawPointMatchesSegment
+=== RUN   TestValidatedRawPointMatchesSegment/projection_and_residual
+=== RUN   TestValidatedRawPointMatchesSegment/escaped_unrelated_key_falls_back
+=== RUN   TestValidatedRawPointMatchesSegment/nested_pointer_falls_back
+=== RUN   TestValidatedRawPointMatchesSegment/array_root_preserves_pointer_semantics
+--- PASS: TestValidatedRawPointMatchesSegment (0.00s)
+    --- PASS: TestValidatedRawPointMatchesSegment/projection_and_residual (0.00s)
+    --- PASS: TestValidatedRawPointMatchesSegment/escaped_unrelated_key_falls_back (0.00s)
+    --- PASS: TestValidatedRawPointMatchesSegment/nested_pointer_falls_back (0.00s)
+    --- PASS: TestValidatedRawPointMatchesSegment/array_root_preserves_pointer_semantics (0.00s)
+=== RUN   TestValidatedRawSingleRowLimitsCancellationAndFallbackReuse
+--- PASS: TestValidatedRawSingleRowLimitsCancellationAndFallbackReuse (0.00s)
+=== RUN   TestFileProjectionMatchesGenericOnOneSnapshot
+--- PASS: TestFileProjectionMatchesGenericOnOneSnapshot (0.07s)
+=== RUN   TestFileProjectionBorrowsLargeDictionaryReview
+--- PASS: TestFileProjectionBorrowsLargeDictionaryReview (0.01s)
+=== RUN   TestFileProjectionDuplicateReview
+=== RUN   TestFileProjectionDuplicateReview/scalar
+=== RUN   TestFileProjectionDuplicateReview/escaped-scalar-key
+=== RUN   TestFileProjectionDuplicateReview/container-then-scalar
+=== RUN   TestFileProjectionDuplicateReview/scalar-then-container
+=== RUN   TestFileProjectionDuplicateReview/ancestor
+=== RUN   TestFileProjectionDuplicateReview/ancestor-removes-field
+=== RUN   TestFileProjectionDuplicateReview/ancestor-changes-type
+=== RUN   TestFileProjectionDuplicateReview/ancestor-restores-type
+=== RUN   TestFileProjectionDuplicateReview/nested-duplicates
+=== RUN   TestFileProjectionDuplicateReview/escaped-slash
+=== RUN   TestFileProjectionDuplicateReview/scalar-then-null
+=== RUN   TestFileProjectionDuplicateReview/null-then-scalar
+--- PASS: TestFileProjectionDuplicateReview (0.01s)
+    --- PASS: TestFileProjectionDuplicateReview/scalar (0.00s)
+    --- PASS: TestFileProjectionDuplicateReview/escaped-scalar-key (0.00s)
+    --- PASS: TestFileProjectionDuplicateReview/container-then-scalar (0.00s)
+    --- PASS: TestFileProjectionDuplicateReview/scalar-then-container (0.00s)
+    --- PASS: TestFileProjectionDuplicateReview/ancestor (0.00s)
+    --- PASS: TestFileProjectionDuplicateReview/ancestor-removes-field (0.00s)
+    --- PASS: TestFileProjectionDuplicateReview/ancestor-changes-type (0.00s)
+    --- PASS: TestFileProjectionDuplicateReview/ancestor-restores-type (0.00s)
+    --- PASS: TestFileProjectionDuplicateReview/nested-duplicates (0.00s)
+    --- PASS: TestFileProjectionDuplicateReview/escaped-slash (0.00s)
+    --- PASS: TestFileProjectionDuplicateReview/scalar-then-null (0.00s)
+    --- PASS: TestFileProjectionDuplicateReview/null-then-scalar (0.00s)
+=== RUN   TestFileProjectionCancellationResetAndEmptyRange
+--- PASS: TestFileProjectionCancellationResetAndEmptyRange (0.05s)
+=== RUN   TestFileProjectionResultBudgetRollbackAndReuse
+=== RUN   TestFileProjectionResultBudgetRollbackAndReuse/rows
+=== RUN   TestFileProjectionResultBudgetRollbackAndReuse/bytes
+--- PASS: TestFileProjectionResultBudgetRollbackAndReuse (0.06s)
+    --- PASS: TestFileProjectionResultBudgetRollbackAndReuse/rows (0.00s)
+    --- PASS: TestFileProjectionResultBudgetRollbackAndReuse/bytes (0.00s)
+=== RUN   TestFileProjectionDeduplicatedPathsFitTightMemory
+--- PASS: TestFileProjectionDeduplicatedPathsFitTightMemory (0.07s)
+=== RUN   TestFileProjectionEligibilityGuards
+=== RUN   TestFileProjectionEligibilityGuards/filtered_source
+=== RUN   TestFileProjectionEligibilityGuards/uncertified_range
+=== RUN   TestFileProjectionEligibilityGuards/wrong_certificate
+--- PASS: TestFileProjectionEligibilityGuards (0.06s)
+    --- PASS: TestFileProjectionEligibilityGuards/filtered_source (0.00s)
+    --- PASS: TestFileProjectionEligibilityGuards/uncertified_range (0.00s)
+    --- PASS: TestFileProjectionEligibilityGuards/wrong_certificate (0.00s)
+=== RUN   TestFileProjectionCandidateMaskDoesNotEnterNativeLane
+--- PASS: TestFileProjectionCandidateMaskDoesNotEnterNativeLane (0.01s)
+=== RUN   TestFileProjectionNativeLaneReportsProjectedRows
+--- PASS: TestFileProjectionNativeLaneReportsProjectedRows (0.05s)
+=== RUN   TestFileProjectionRecompiledPlanUsesCurrentPaths
+--- PASS: TestFileProjectionRecompiledPlanUsesCurrentPaths (0.05s)
+=== RUN   TestFileProjectionDeclinedReplacementPreservesFilterCharge
+--- PASS: TestFileProjectionDeclinedReplacementPreservesFilterCharge (0.05s)
+=== RUN   TestFileProjectionFilterEstimateCoversRetainedCapacity
+--- PASS: TestFileProjectionFilterEstimateCoversRetainedCapacity (0.01s)
+=== RUN   TestFileProjectionPreservesWideIntegerSpelling
+--- PASS: TestFileProjectionPreservesWideIntegerSpelling (0.01s)
+=== RUN   TestFileProjectionFallsBackAfterLateUnsupportedShape
+--- PASS: TestFileProjectionFallsBackAfterLateUnsupportedShape (0.01s)
+PASS
+ok  	github.com/thesyncim/vibedb/query	0.689s
+=== RUN   TestReplicatedPointBatchReadUsesCoherentCutAndActivationFences
+=== RUN   TestReplicatedPointBatchReadUsesCoherentCutAndActivationFences/closed
+=== RUN   TestReplicatedPointBatchReadUsesCoherentCutAndActivationFences/foreign-claim
+=== RUN   TestReplicatedPointBatchReadUsesCoherentCutAndActivationFences/closed-database
+=== RUN   TestReplicatedPointBatchReadUsesCoherentCutAndActivationFences/activation
+=== RUN   TestReplicatedPointBatchReadUsesCoherentCutAndActivationFences/wal-active
+=== RUN   TestReplicatedPointBatchReadUsesCoherentCutAndActivationFences/wal-pending
+--- PASS: TestReplicatedPointBatchReadUsesCoherentCutAndActivationFences (0.03s)
+    --- PASS: TestReplicatedPointBatchReadUsesCoherentCutAndActivationFences/closed (0.00s)
+    --- PASS: TestReplicatedPointBatchReadUsesCoherentCutAndActivationFences/foreign-claim (0.00s)
+    --- PASS: TestReplicatedPointBatchReadUsesCoherentCutAndActivationFences/closed-database (0.00s)
+    --- PASS: TestReplicatedPointBatchReadUsesCoherentCutAndActivationFences/activation (0.00s)
+    --- PASS: TestReplicatedPointBatchReadUsesCoherentCutAndActivationFences/wal-active (0.00s)
+    --- PASS: TestReplicatedPointBatchReadUsesCoherentCutAndActivationFences/wal-pending (0.00s)
+=== RUN   TestReplicatedPointBatchReadRejectsAbsentOwner
+--- PASS: TestReplicatedPointBatchReadRejectsAbsentOwner (0.00s)
+=== RUN   TestReplicatedPointRawMatchesForcedSegmentFallback
+=== RUN   TestReplicatedPointRawMatchesForcedSegmentFallback/full_predicate_with_null_missing_nested_and_escaped_scalar
+=== RUN   TestReplicatedPointRawMatchesForcedSegmentFallback/residual_predicate_rejects_row
+=== RUN   TestReplicatedPointRawMatchesForcedSegmentFallback/aggregate_fallback
+=== RUN   TestReplicatedPointRawMatchesForcedSegmentFallback/point_miss
+=== RUN   TestReplicatedPointRawMatchesForcedSegmentFallback/wrong_candidate_key
+--- PASS: TestReplicatedPointRawMatchesForcedSegmentFallback (0.05s)
+    --- PASS: TestReplicatedPointRawMatchesForcedSegmentFallback/full_predicate_with_null_missing_nested_and_escaped_scalar (0.00s)
+    --- PASS: TestReplicatedPointRawMatchesForcedSegmentFallback/residual_predicate_rejects_row (0.00s)
+    --- PASS: TestReplicatedPointRawMatchesForcedSegmentFallback/aggregate_fallback (0.00s)
+    --- PASS: TestReplicatedPointRawMatchesForcedSegmentFallback/point_miss (0.00s)
+    --- PASS: TestReplicatedPointRawMatchesForcedSegmentFallback/wrong_candidate_key (0.00s)
+=== RUN   TestReplicatedPointRawAlternatesFreshOwnedDocuments
+=== RUN   TestReplicatedPointRawAlternatesFreshOwnedDocuments/11
+=== RUN   TestReplicatedPointRawAlternatesFreshOwnedDocuments/22
+=== RUN   TestReplicatedPointRawAlternatesFreshOwnedDocuments/33
+=== RUN   TestReplicatedPointRawAlternatesFreshOwnedDocuments/44
+--- PASS: TestReplicatedPointRawAlternatesFreshOwnedDocuments (0.05s)
+    --- PASS: TestReplicatedPointRawAlternatesFreshOwnedDocuments/11 (0.00s)
+    --- PASS: TestReplicatedPointRawAlternatesFreshOwnedDocuments/22 (0.00s)
+    --- PASS: TestReplicatedPointRawAlternatesFreshOwnedDocuments/33 (0.00s)
+    --- PASS: TestReplicatedPointRawAlternatesFreshOwnedDocuments/44 (0.00s)
+=== RUN   TestReplicatedPointRawBudgetAndCancellationMatchFallback
+--- PASS: TestReplicatedPointRawBudgetAndCancellationMatchFallback (0.04s)
+=== RUN   TestReplicatedPointRawWrapperClearsAcrossHitMissAndError
+--- PASS: TestReplicatedPointRawWrapperClearsAcrossHitMissAndError (0.04s)
+=== RUN   TestReplicatedPointRawPanicClearsBorrowedWrapper
+--- PASS: TestReplicatedPointRawPanicClearsBorrowedWrapper (0.04s)
+=== RUN   TestReplicatedPointReadSessionCandidatePreservesQuerySemantics
+--- PASS: TestReplicatedPointReadSessionCandidatePreservesQuerySemantics (0.04s)
+=== RUN   TestReplicatedPointReadSessionMissAndWrongKeyAreBounded
+--- PASS: TestReplicatedPointReadSessionMissAndWrongKeyAreBounded (0.04s)
+=== RUN   TestReplicatedPointReadSessionRejectsStaleIdentityAndPath
+--- PASS: TestReplicatedPointReadSessionRejectsStaleIdentityAndPath (0.04s)
+=== RUN   TestReplicatedReadReuseDataCutMutationAndParameterKey
+--- PASS: TestReplicatedReadReuseDataCutMutationAndParameterKey (0.07s)
+=== RUN   TestReplicatedReadReusePointAlternatesHitsMissesAndUpdates
+--- PASS: TestReplicatedReadReusePointAlternatesHitsMissesAndUpdates (0.06s)
+=== RUN   TestReplicatedReadReuseBudgetCancellationRollbackAndReuse
+--- PASS: TestReplicatedReadReuseBudgetCancellationRollbackAndReuse (0.05s)
+=== RUN   TestReplicatedReadReuseLeasesAreExclusiveAndStaleHandlesClose
+--- PASS: TestReplicatedReadReuseLeasesAreExclusiveAndStaleHandlesClose (0.05s)
+=== RUN   TestReplicatedReadReuseConcurrentIndependentLeases
+--- PASS: TestReplicatedReadReuseConcurrentIndependentLeases (0.05s)
+=== RUN   TestReplicatedReadReuseUnsupportedShapesAreNeverRetained
+--- PASS: TestReplicatedReadReuseUnsupportedShapesAreNeverRetained (0.05s)
+=== RUN   TestReplicatedReadReuseRejectsForeignAndClosedCuts
+--- PASS: TestReplicatedReadReuseRejectsForeignAndClosedCuts (0.10s)
+=== RUN   TestReplicatedReadReuseLayoutReplacementDoesNotReuseStaleSlot
+--- PASS: TestReplicatedReadReuseLayoutReplacementDoesNotReuseStaleSlot (0.05s)
+=== RUN   TestReplicatedReadReuseApplyCloseRejectsAndRetiresLeases
+--- PASS: TestReplicatedReadReuseApplyCloseRejectsAndRetiresLeases (0.05s)
+=== RUN   TestReplicatedReadReuseIdleStateDropsRequestReferences
+--- PASS: TestReplicatedReadReuseIdleStateDropsRequestReferences (0.05s)
+=== RUN   TestReplicatedReadReuseLayoutTokensOutliveEpochs
+--- PASS: TestReplicatedReadReuseLayoutTokensOutliveEpochs (0.02s)
+=== RUN   TestReplicatedReadReusePreparationOwnsSourceAndAccountsObjects
+--- PASS: TestReplicatedReadReusePreparationOwnsSourceAndAccountsObjects (0.00s)
+=== RUN   TestReplicatedReadReusePublicationBetweenLookupAndAttach
+=== RUN   TestReplicatedReadReusePublicationBetweenLookupAndAttach/cold
+=== RUN   TestReplicatedReadReusePublicationBetweenLookupAndAttach/hit
+--- PASS: TestReplicatedReadReusePublicationBetweenLookupAndAttach (0.11s)
+    --- PASS: TestReplicatedReadReusePublicationBetweenLookupAndAttach/cold (0.06s)
+    --- PASS: TestReplicatedReadReusePublicationBetweenLookupAndAttach/hit (0.05s)
+=== RUN   TestReplicatedReadReuseAcquirePanicRetiresReservation
+=== RUN   TestReplicatedReadReuseAcquirePanicRetiresReservation/cold
+=== RUN   TestReplicatedReadReuseAcquirePanicRetiresReservation/hit
+--- PASS: TestReplicatedReadReuseAcquirePanicRetiresReservation (0.12s)
+    --- PASS: TestReplicatedReadReuseAcquirePanicRetiresReservation/cold (0.06s)
+    --- PASS: TestReplicatedReadReuseAcquirePanicRetiresReservation/hit (0.06s)
+=== RUN   TestReplicatedReadReuseResetDeclinePreservesSuccessfulRead
+--- PASS: TestReplicatedReadReuseResetDeclinePreservesSuccessfulRead (0.00s)
+=== RUN   TestReplicatedReadReuseAbortClosesUnpublishedRows
+--- PASS: TestReplicatedReadReuseAbortClosesUnpublishedRows (0.00s)
+=== RUN   TestReplicatedReadReuseQueryPanicStopsContextWatcher
+--- PASS: TestReplicatedReadReuseQueryPanicStopsContextWatcher (0.00s)
+=== RUN   TestReplicatedSchemaManifestMatchesLiveBundleMachine
+--- PASS: TestReplicatedSchemaManifestMatchesLiveBundleMachine (0.06s)
+=== RUN   TestReplicatedSchemaManifestSeparatesSourceChildAndLocalIdentities
+=== RUN   TestReplicatedSchemaManifestSeparatesSourceChildAndLocalIdentities/singleton
+=== RUN   TestReplicatedSchemaManifestSeparatesSourceChildAndLocalIdentities/local
+=== RUN   TestReplicatedSchemaManifestSeparatesSourceChildAndLocalIdentities/base-local-global
+--- PASS: TestReplicatedSchemaManifestSeparatesSourceChildAndLocalIdentities (0.00s)
+    --- PASS: TestReplicatedSchemaManifestSeparatesSourceChildAndLocalIdentities/singleton (0.00s)
+    --- PASS: TestReplicatedSchemaManifestSeparatesSourceChildAndLocalIdentities/local (0.00s)
+    --- PASS: TestReplicatedSchemaManifestSeparatesSourceChildAndLocalIdentities/base-local-global (0.00s)
+=== RUN   TestReplicatedSchemaManifestRejectsMalformedAndOversizedIndexes
+=== RUN   TestReplicatedSchemaManifestRejectsMalformedAndOversizedIndexes/missing
+=== RUN   TestReplicatedSchemaManifestRejectsMalformedAndOversizedIndexes/foreign
+=== RUN   TestReplicatedSchemaManifestRejectsMalformedAndOversizedIndexes/malformed
+=== RUN   TestReplicatedSchemaManifestRejectsMalformedAndOversizedIndexes/oversized
+=== RUN   TestReplicatedSchemaManifestRejectsMalformedAndOversizedIndexes/unique
+--- PASS: TestReplicatedSchemaManifestRejectsMalformedAndOversizedIndexes (0.00s)
+    --- PASS: TestReplicatedSchemaManifestRejectsMalformedAndOversizedIndexes/missing (0.00s)
+    --- PASS: TestReplicatedSchemaManifestRejectsMalformedAndOversizedIndexes/foreign (0.00s)
+    --- PASS: TestReplicatedSchemaManifestRejectsMalformedAndOversizedIndexes/malformed (0.00s)
+    --- PASS: TestReplicatedSchemaManifestRejectsMalformedAndOversizedIndexes/oversized (0.00s)
+    --- PASS: TestReplicatedSchemaManifestRejectsMalformedAndOversizedIndexes/unique (0.00s)
+=== RUN   TestReplicatedSchemaManifestPointValidationGuards
+=== RUN   TestReplicatedSchemaManifestPointValidationGuards/base
+=== RUN   TestReplicatedSchemaManifestPointValidationGuards/apply
+=== RUN   TestReplicatedSchemaManifestPointValidationGuards/placement
+=== RUN   TestReplicatedSchemaManifestPointValidationGuards/live_manifest
+--- PASS: TestReplicatedSchemaManifestPointValidationGuards (0.05s)
+    --- PASS: TestReplicatedSchemaManifestPointValidationGuards/base (0.00s)
+    --- PASS: TestReplicatedSchemaManifestPointValidationGuards/apply (0.00s)
+    --- PASS: TestReplicatedSchemaManifestPointValidationGuards/placement (0.00s)
+    --- PASS: TestReplicatedSchemaManifestPointValidationGuards/live_manifest (0.00s)
+=== RUN   TestReplicatedSchemaManifestRejectsLocalUniqueIndex
+--- PASS: TestReplicatedSchemaManifestRejectsLocalUniqueIndex (0.00s)
+PASS
+ok  	github.com/thesyncim/vibedb/sql/driver	1.348s
+=== RUN   TestReplicatedPointReadWirePreservesFoundEmptyAndMiss
+--- PASS: TestReplicatedPointReadWirePreservesFoundEmptyAndMiss (0.00s)
+PASS
+ok  	github.com/thesyncim/vibedb/shardservice	0.004s
