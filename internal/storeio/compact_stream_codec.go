@@ -812,11 +812,11 @@ func parseCompactPrefixInt(src []byte) (compactPrefixIntValue, bool) {
 	}
 	var value uint64
 	for _, digit := range src[start:end] {
-		next := value*10 + uint64(digit-'0')
-		if next < value || next > uint64(^uint64(0)>>1) {
+		n := uint64(digit - '0')
+		if value > (uint64(1<<63-1)-n)/10 {
 			return compactPrefixIntValue{}, false
 		}
-		value = next
+		value = value*10 + n
 	}
 	width := end - start
 	return compactPrefixIntValue{

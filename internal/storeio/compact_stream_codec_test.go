@@ -685,3 +685,27 @@ func TestCompactStreamPlannerEstimateExact(t *testing.T) {
 		})
 	}
 }
+
+// A post-multiply comparison does not detect every uint64 wrap. The compact
+// numeric candidate must decline rather than change the original spelling.
+func TestCompactPrefixIntOverflowDeclinesWithoutChangingValues(t *testing.T) {
+	for _, raw := range []string{
+		"9223372036854775808", "18446744073709551616",
+		"46000000000000000000", `"ticket:46000000000000000000"`,
+	} {
+		if _, ok := parseCompactPrefixInt([]byte(raw)); ok {
+			t.Errorf("accepted overflowing numeric spelling %q", raw)
+		}
+	}
+	for _, raw := range []string{"9223372036854775807", `"ticket:00000000000000000000"`} {
+		if _, ok := parseCompactPrefixInt([]byte(raw)); !ok {
+			t.Errorf("rejected bounded numeric spelling %q", raw)
+		}
+	}
+	values := make([][]byte, 128)
+	for row := range values {
+		values[row] = append([]byte(`"ticket:46000000000000000`), leftPadDecimal(row, 3)...)
+		values[row] = append(values[row], '"')
+	}
+	compactCodecRoundTrip(t, encodeCompactScalarStream(values), values)
+}
