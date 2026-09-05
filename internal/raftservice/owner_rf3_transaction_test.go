@@ -448,6 +448,18 @@ func submitRF3TransactionAtCurrentLeader(
 	return -1, Result{}, replication.CompletionView{}, replicatedstate.TransactionCompletionResult{}
 }
 
+func selectRF3Follower(t testing.TB, leader int, removed map[int]bool, voters int) int {
+	t.Helper()
+	for offset := 1; offset < voters; offset++ {
+		candidate := (leader + offset) % voters
+		if !removed[candidate] {
+			return candidate
+		}
+	}
+	t.Fatalf("RF3 follower selection: leader=%d removed=%v", leader, removed)
+	return -1
+}
+
 func TestRF3TransactionSurvivesLeaderLossAndPublishesRelationBundleAtomically(t *testing.T) {
 	cluster := newTransactionRF3Cluster(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -582,7 +594,7 @@ func TestRF3TransactionSurvivesLeaderLossAndPublishesRelationBundleAtomically(t 
 	if !appliedResult.AffectedRowsValid || appliedResult.AffectedRows != 1 {
 		t.Fatalf("apply result=%+v", appliedResult)
 	}
-	_, appliedRetry, _, retryResult := submitRF3TransactionAtCurrentLeader(
+	newLeader, appliedRetry, _, retryResult := submitRF3TransactionAtCurrentLeader(
 		t, ctx, cluster, removed, cluster.group, apply,
 	)
 	if !bytes.Equal(appliedRetry.Completion, applied.Completion) || retryResult != appliedResult {
@@ -590,10 +602,8 @@ func TestRF3TransactionSurvivesLeaderLossAndPublishesRelationBundleAtomically(t 
 	}
 	waitRF3Applied(t, ctx, cluster.owners[:], removed, cluster.group, applied.Outcome.AppliedIndex)
 
-	follower = (newLeader + 1) % len(cluster.owners)
-	if follower == leader {
-		follower = (follower + 1) % len(cluster.owners)
-	}
+	newLeader = waitRF3Leader(t, ctx, cluster.owners[:], removed, cluster.group)
+	follower = selectRF3Follower(t, newLeader, removed, len(cluster.owners))
 	if _, lease, _, readErr := readRF3PointAtFreshFence(
 		t, ctx, cluster.owners[follower], cluster.reads[follower], cluster.group,
 		PointReadRequest{Relation: 2, Key: globalKey, MinimumApplied: applied.Outcome.AppliedIndex,
@@ -628,6 +638,8 @@ func TestRF3TransactionSurvivesLeaderLossAndPublishesRelationBundleAtomically(t 
 	waitRF3Applied(t, ctx, cluster.owners[:], removed, cluster.group,
 		max(released.Outcome.AppliedIndex, retired.Outcome.AppliedIndex))
 
+	newLeader = waitRF3Leader(t, ctx, cluster.owners[:], removed, cluster.group)
+	follower = selectRF3Follower(t, newLeader, removed, len(cluster.owners))
 	baseRead, baseLease, _, err := readRF3PointAtFreshFence(
 		t, ctx, cluster.owners[follower], cluster.reads[follower], cluster.group,
 		PointReadRequest{Relation: 1, Key: baseKey, MinimumApplied: released.Outcome.AppliedIndex,
