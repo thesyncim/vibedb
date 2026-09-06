@@ -1234,17 +1234,22 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 			}
 			// Service both sources once. A permanently ready async channel
 			// must not compete with a pending tick for the fairness turn.
-			select {
-			case _, ok := <-owner.pulse:
-				if !ok {
-					owner.pulse = nil
-				} else {
-					readyBlocked = false
-					if err := offerTicks(); err != nil {
-						return owner.stop(err)
+			// A control barrier must drain a finite prefix of Host work. Keep
+			// the pulse pending until that barrier runs: adding fresh timer work
+			// here can prevent the drain forever while peer ingress is fenced.
+			if !ingressBarrierPending {
+				select {
+				case _, ok := <-owner.pulse:
+					if !ok {
+						owner.pulse = nil
+					} else {
+						readyBlocked = false
+						if err := offerTicks(); err != nil {
+							return owner.stop(err)
+						}
 					}
+				default:
 				}
-			default:
 			}
 		}
 		busyTurns++

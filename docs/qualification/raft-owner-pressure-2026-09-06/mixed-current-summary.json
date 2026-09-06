@@ -1,0 +1,147 @@
+{
+  "revision": "856b27a6",
+  "report_sha256": "fc546d063f9f5e94a6d160ca87c492f0b70217eb620e35f7659aa10671a25898",
+  "raw_artifact_directory": "/private/tmp/vibedb-control-current-qualification",
+  "manifest": {
+    "revision": "856b27a6",
+    "baseline": "ba6c4888",
+    "profiled": false,
+    "control_drain_fix": true,
+    "concurrent_host_activity_not_excluded": true,
+    "throughput_claim": false,
+    "binary_sha256": {
+      "candidate-vibedb": "18ead42480a0a604f08a0ce4d5d3709112b02a2a4969666a21f5596576fa61dc",
+      "candidate-vibedb-gateway": "f03e21d199c4736f84af61a4a0b60b9b73a5df7080e33baaaf7be362b43e3b85",
+      "candidate-vibedb-shard": "7c47f0b620919af37b362997de9dd312a64e94b69911aab1b517ccf888b7ca6c",
+      "rf3-sqlbench": "4eeaf94af8bf0e768fa15e5b5de0b948725451db89fd69b36f2b5151c5ecc437"
+    },
+    "cell": {
+      "id": "multigroup-3n-uniform",
+      "kind": "multigroup",
+      "physical_nodes": 3,
+      "tables": [
+        "rf3_sql_group",
+        "rf3_sql_group_01",
+        "rf3_sql_group_02",
+        "rf3_sql_group_03"
+      ],
+      "workloads": "mixed_uniform",
+      "group_distribution": "uniform",
+      "clients": "8",
+      "groups": 4,
+      "endpoint_mode": "single"
+    }
+  },
+  "validation": {
+    "samples_checked": 48000,
+    "complete": true
+  },
+  "status": "completed",
+  "results": [
+    {
+      "engine": "vibedb",
+      "workload": "mixed_uniform",
+      "clients": 8,
+      "repetition": 1,
+      "operations": 8000,
+      "errors": 0,
+      "elapsed_ns": 2753077793,
+      "measurement_started_utc": "2026-09-06T13:24:55.832210928Z",
+      "successful_ops_per_second": 2905.838701812521,
+      "p50_ns": 1728334,
+      "p95_ns": 9300667,
+      "p99_ns": 20570959,
+      "verified": true
+    },
+    {
+      "engine": "vibedb",
+      "workload": "mixed_uniform",
+      "clients": 8,
+      "repetition": 2,
+      "operations": 8000,
+      "errors": 0,
+      "elapsed_ns": 2674289834,
+      "measurement_started_utc": "2026-09-06T13:25:03.353094501Z",
+      "successful_ops_per_second": 2991.448383152325,
+      "p50_ns": 1662958,
+      "p95_ns": 8982916,
+      "p99_ns": 22416500,
+      "verified": true
+    },
+    {
+      "engine": "vibedb",
+      "workload": "mixed_uniform",
+      "clients": 8,
+      "repetition": 3,
+      "operations": 8000,
+      "errors": 0,
+      "elapsed_ns": 2927695668,
+      "measurement_started_utc": "2026-09-06T13:25:11.172471505Z",
+      "successful_ops_per_second": 2732.524451718388,
+      "p50_ns": 1824500,
+      "p95_ns": 9760083,
+      "p99_ns": 23423000,
+      "verified": true
+    },
+    {
+      "engine": "vibedb",
+      "workload": "mixed_uniform",
+      "clients": 8,
+      "repetition": 4,
+      "operations": 8000,
+      "errors": 0,
+      "elapsed_ns": 2435076168,
+      "measurement_started_utc": "2026-09-06T13:25:19.186744675Z",
+      "successful_ops_per_second": 3285.3181781868598,
+      "p50_ns": 1683666,
+      "p95_ns": 6617125,
+      "p99_ns": 17804416,
+      "verified": true
+    },
+    {
+      "engine": "vibedb",
+      "workload": "mixed_uniform",
+      "clients": 8,
+      "repetition": 5,
+      "operations": 8000,
+      "errors": 0,
+      "elapsed_ns": 2872941960,
+      "measurement_started_utc": "2026-09-06T13:25:26.299830679Z",
+      "successful_ops_per_second": 2784.602025165869,
+      "p50_ns": 1856833,
+      "p95_ns": 10694917,
+      "p99_ns": 20597666,
+      "verified": true
+    },
+    {
+      "engine": "vibedb",
+      "workload": "mixed_uniform",
+      "clients": 8,
+      "repetition": 6,
+      "operations": 8000,
+      "errors": 0,
+      "elapsed_ns": 2726242667,
+      "measurement_started_utc": "2026-09-06T13:25:34.455340377Z",
+      "successful_ops_per_second": 2934.4416389768135,
+      "p50_ns": 1710291,
+      "p95_ns": 9363584,
+      "p99_ns": 19987000,
+      "verified": true
+    }
+  ],
+  "comparative_speedup_claim": false,
+  "runtime_image": "sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b",
+  "trial_controls": {
+    "groups": 4,
+    "physical_nodes": 3,
+    "clients": 8,
+    "rows_per_table": 8192,
+    "operations_per_trial": 8000,
+    "warmup_per_trial": 8000,
+    "repetitions": 6,
+    "distribution": "uniform",
+    "endpoint_mode": "single",
+    "cpu_limit": 12,
+    "memory_gib": 24
+  }
+}
