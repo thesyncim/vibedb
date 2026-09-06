@@ -625,6 +625,7 @@ func (authority *ReplicatedCatalogAuthority) ListScalingIntents(ctx context.Cont
 	if authority == nil || ctx == nil {
 		return nil, ErrInvalidScalingMetadata
 	}
+retryCut:
 	for attempt := 0; attempt < authority.executor.maxAttempts; attempt++ {
 		directoryResult, err := authority.readRaw(ctx, scalingIntentDirectoryKey, maxScalingIntentDirectoryBytes)
 		if err != nil {
@@ -643,6 +644,9 @@ func (authority *ReplicatedCatalogAuthority) ListScalingIntents(ctx context.Cont
 			copy(id[:], entry.ID)
 			intents[index], err = authority.readScalingIntentDirectoryEntry(ctx, id, entry)
 			if err != nil {
+				if errors.Is(err, ErrReplicatedCatalogConflict) {
+					continue retryCut
+				}
 				return nil, err
 			}
 		}
@@ -708,6 +712,7 @@ func (authority *ReplicatedCatalogAuthority) ListEnrollmentIntents(ctx context.C
 	if authority == nil || ctx == nil || invalidGroupKey(groupKey) {
 		return nil, ErrInvalidScalingMetadata
 	}
+retryCut:
 	for attempt := 0; attempt < authority.executor.maxAttempts; attempt++ {
 		directoryResult, err := authority.readRaw(ctx, enrollmentDirectoryKey, maxEnrollmentDirectoryBytes)
 		if err != nil {
@@ -726,6 +731,9 @@ func (authority *ReplicatedCatalogAuthority) ListEnrollmentIntents(ctx context.C
 			copy(id[:], entry.ID)
 			intent, readErr := authority.readEnrollmentDirectoryEntry(ctx, id, entry)
 			if readErr != nil {
+				if errors.Is(readErr, ErrReplicatedCatalogConflict) {
+					continue retryCut
+				}
 				return nil, readErr
 			}
 			if intent.Group == groupKey {

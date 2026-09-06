@@ -1002,3 +1002,46 @@ func TestReplicatedScalingCompletedMoveRetentionAndSafeRetire(t *testing.T) {
 		t.Fatal("shared replicated fixture did not apply completed-history mutations")
 	}
 }
+
+func TestEnrollmentDirectoryRetriesConcurrentPreparationClaim(t *testing.T) {
+	ctx := t.Context()
+	authority, client, current := newCatalogAuthorityFixture(t)
+	peer := newCatalogAuthorityPeer(t, authority, NewCatalogHolder(current), 0x95)
+	joining := scalingTestNodeRecord([16]byte{0x41}, 1, NodeJoining, 1)
+	if err := authority.PutNode(ctx, joining, 0); err != nil {
+		t.Fatal(err)
+	}
+	active := joining
+	active.Lifecycle = NodeActive
+	active.Revision = 2
+	if err := authority.PutNode(ctx, active, 1); err != nil {
+		t.Fatal(err)
+	}
+	intent := scalingTestEnrollmentIntent(3, active.NodeID[0], active.Revision)
+	if err := authority.SubmitEnrollmentIntent(ctx, intent); err != nil {
+		t.Fatal(err)
+	}
+	var transitionErr error
+	client.mu.Lock()
+	client.onRead = func(key []byte) {
+		if !bytes.Equal(key, enrollmentIntentKey(intent.IntentID)) {
+			return
+		}
+		client.mu.Lock()
+		if client.onRead == nil {
+			client.mu.Unlock()
+			return
+		}
+		client.onRead = nil
+		client.mu.Unlock()
+		_, transitionErr = peer.ClaimEnrollmentPreparation(ctx, intent.IntentID, intent.Revision)
+	}
+	client.mu.Unlock()
+	rows, err := authority.ListEnrollmentIntents(ctx, intent.Group)
+	if transitionErr != nil {
+		t.Fatalf("concurrent claim: %v", transitionErr)
+	}
+	if err != nil || len(rows) != 1 || rows[0].PreparationClaim == ([32]byte{}) || rows[0].Revision != intent.Revision+1 {
+		t.Fatalf("directory cut: rows=%+v err=%v", rows, err)
+	}
+}
