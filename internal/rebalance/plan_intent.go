@@ -3,6 +3,7 @@ package rebalance
 import (
 	"bytes"
 	"errors"
+	"fmt"
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
@@ -247,7 +248,7 @@ func OpenReplicaMoveIntent(
 	var plan *Plan
 	if certificate == nil {
 		if catalog.Generation() != intent.SourceGeneration {
-			return nil, ErrPlanIntent
+			return nil, fmt.Errorf("%w: unbound source head %d observed %d", ErrPlanIntent, intent.SourceGeneration, catalog.Generation())
 		}
 		plan, err = PlanReplicaMove(catalog, publication, request)
 	} else {
@@ -256,12 +257,17 @@ func OpenReplicaMoveIntent(
 	if err == nil && len(intent.FailureAuthority) != 0 {
 		err = restoreFailedReplicaAuthorization(plan, intent.FailureAuthority)
 	}
-	if err != nil || plan == nil || plan.catalogGeneration != intent.SourceGeneration ||
-		[32]byte(plan.OperationID()) != intent.Operation {
-		return nil, errors.Join(err, ErrPlanIntent)
+	if err != nil || plan == nil {
+		return nil, fmt.Errorf("reconstruct source plan: %w", errors.Join(ErrPlanIntent, err))
+	}
+	if plan.catalogGeneration != intent.SourceGeneration {
+		return nil, fmt.Errorf("%w: source generation reconstructed %d persisted %d", ErrPlanIntent, plan.catalogGeneration, intent.SourceGeneration)
+	}
+	if [32]byte(plan.OperationID()) != intent.Operation {
+		return nil, fmt.Errorf("%w: reconstructed operation identity differs", ErrPlanIntent)
 	}
 	if err = restoreTransitionIntent(plan, intent.Transition); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("restore durable transition (present=%t reconstructed=%t): %w", len(intent.Transition) != 0, plan.transitionReady, err)
 	}
 	return plan, nil
 }
@@ -287,7 +293,7 @@ func persistedTransition(catalog *gateway.Snapshot, plan *Plan) ([]byte, error) 
 		return nil, nil
 	}
 	transition, ok := plan.TransitionIntent()
-	if !ok {
+	if !ok || transition.Key.OperationID != [32]byte(plan.operation) {
 		return nil, ErrPlanIntent
 	}
 	encoded, err := gateway.AppendGroupTransitionIntent(nil, transition)

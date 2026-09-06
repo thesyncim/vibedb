@@ -317,3 +317,56 @@ func cloneFailedReplicaCut(cut FailedReplicaPlanningCut) FailedReplicaPlanningCu
 	clone.Candidates = append([]ReplacementCandidate(nil), cut.Candidates...)
 	return clone
 }
+
+func failedReplicaEnrolledTestCut(t testing.TB) FailedReplicaPlanningCut {
+	t.Helper()
+	cut := failedReplicaTestCut(t, 1)
+	descriptor := cut.Catalog.ReplicatedShardDescriptors()[0]
+	descriptor.LogicalSchemaDigest = [32]byte{99}
+	descriptor.RequestLedgerRanges = []gateway.DurableRequestLedgerRangeDescriptor{{Identity: [32]byte{98}}}
+	target := cut.Candidates[0]
+	descriptor.EnrolledTarget = &gateway.ReplicatedReplicaDescriptor{Member: target.Member, Node: target.Node, StoreID: target.StoreID, NodeIncarnation: target.NodeIncarnation, Endpoint: target.Endpoint, NativeEndpoint: target.Endpoint + "-native", ControlEndpoint: target.Endpoint + "-control"}
+	endpoints := make(map[distribution.EndpointID]string)
+	for _, replica := range descriptor.Replicas {
+		for _, endpoint := range []distribution.EndpointID{replica.Endpoint, replica.NativeEndpoint, replica.ControlEndpoint} {
+			address, err := cut.Catalog.Address(endpoint)
+			if err != nil {
+				t.Fatal(err)
+			}
+			endpoints[endpoint] = address
+		}
+	}
+	endpoints[target.Endpoint], _ = cut.Catalog.Address(target.Endpoint)
+	endpoints[descriptor.EnrolledTarget.NativeEndpoint] = "127.0.1.1:9000"
+	endpoints[descriptor.EnrolledTarget.ControlEndpoint] = "127.0.1.1:9001"
+	manifest, _ := cut.Catalog.Manifest("data")
+	config := distribution.ClusterConfig{Distributions: []distribution.DistributionSpec{{Name: "data", Arity: 1, MapperVersion: 1}}, Placements: []distribution.TablePlacement{{Table: "docs", Distribution: "data", Columns: []string{"/id"}}}, Manifests: []*distribution.Manifest{manifest}}
+	var err error
+	cut.Catalog, err = gateway.NewSnapshotWithReplicatedMetadata(config, endpoints, 9, nil, nil, []gateway.ReplicatedShardDescriptor{descriptor})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cut
+}
+
+func TestFailedReplicaPlanTransitionUsesAuthorizedOperationIdentity(t *testing.T) {
+	cut := failedReplicaEnrolledTestCut(t)
+	planned, err := PlanFailedReplicaReplacement(cut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transition, found := planned.Plan.TransitionIntent()
+	if !found {
+		t.Fatal("enrolled RF3 plan has no durable transition")
+	}
+	if transition.Key.OperationID != [32]byte(planned.Operation) {
+		t.Fatal("failure authorization changed operation without updating transition ownership")
+	}
+	recovered, err := OpenReplicaMoveIntent(planned.Intent, cut.Catalog, cut.Publication, nil)
+	if err != nil {
+		t.Fatalf("recover authorized transition: %v", err)
+	}
+	if recovered.OperationID() != planned.Operation {
+		t.Fatal("recovery changed authorized operation")
+	}
+}
