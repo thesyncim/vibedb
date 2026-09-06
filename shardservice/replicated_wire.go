@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync"
 
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/executionpin"
@@ -62,9 +63,35 @@ const (
 	MaxReplicatedTransactionReadBytes = replicatedstate.MaxTransactionRecoveryReadBytes
 	MaxReplicatedTransactionScanItems = replicatedstate.MaxTransactionRecoveryScanRows
 	MaxReplicatedTransactionScanBytes = replicatedstate.MaxTransactionRecoveryScanBytes
+
+	// Small native requests are common on the authenticated gateway-to-shard
+	// stream. Coalesce only this bounded size so a TLS writer receives one
+	// Write, while large payloads retain the zero-copy scatter path.
+	replicatedBorrowedCoalesceBytes = 4 << 10
 )
 
 var ErrReplicatedWire = errors.New("shardservice: invalid replicated native frame")
+
+type replicatedBorrowedScratch struct {
+	bytes [replicatedBorrowedCoalesceBytes]byte
+}
+
+var replicatedBorrowedScratchPool = sync.Pool{
+	New: func() any { return new(replicatedBorrowedScratch) },
+}
+
+func releaseReplicatedBorrowedScratch(scratch *replicatedBorrowedScratch, used int) {
+	if scratch == nil {
+		return
+	}
+	if used > len(scratch.bytes) {
+		used = len(scratch.bytes)
+	}
+	if used > 0 {
+		clear(scratch.bytes[:used])
+	}
+	replicatedBorrowedScratchPool.Put(scratch)
+}
 
 // DecodeReplicatedSQLRequest validates the complete nested frame length against
 // its admitted outer payload before the general SQL decoder allocates a body.
@@ -426,30 +453,46 @@ func ValidateReplicatedResponse(response *ReplicatedResponse) error {
 }
 
 // EncodeReplicatedRequestBorrowed emits the fixed request prefix and borrows
-// the immutable command or point key as a second buffer, avoiding a payload-sized
-// userspace copy on every retry. A TLS stream may encode the two writes as
-// separate record sequences; this function does not claim writev.
+// the immutable command or point key as a second buffer. Small payload-bearing
+// frames use a bounded cleared scratch so a TLS stream sees one Write; larger
+// frames retain the scatter/writev path without a payload-sized userspace copy.
 func EncodeReplicatedRequestBorrowed(w io.Writer, request *ReplicatedRequest) error {
 	if w == nil || !validReplicatedRequest(request) {
 		return ErrReplicatedWire
 	}
-	payloadHint := 0
-	if request.Operation == ReplicatedMembership {
-		payloadHint = 65
+	var payload []byte
+	switch request.Operation {
+	case ReplicatedPropose:
+		payload = request.Command
+	case ReplicatedReadLeader, ReplicatedReadFollower:
+		payload = request.Key
+	case ReplicatedReadBatchLeader:
+		payload = request.BatchRead
+	case ReplicatedQueryLeader:
+		payload = request.Query
 	}
-	e := newFrameEncoder(payloadHint)
+	var scratch *replicatedBorrowedScratch
+	var e encbuf
+	if len(payload) != 0 {
+		scratch = replicatedBorrowedScratchPool.Get().(*replicatedBorrowedScratch)
+		e = encbuf{b: scratch.bytes[:5]}
+	} else {
+		payloadHint := 0
+		if request.Operation == ReplicatedMembership {
+			payloadHint = 65
+		}
+		e = newFrameEncoder(payloadHint)
+	}
 	e.u8(replicatedWireVersion)
 	e.u8(uint8(request.Operation))
 	e.b = append(e.b, request.Authority.Node[:]...)
 	e.u64(request.Authority.Generation)
 	e.u64(uint64(request.Capability))
 	encodeReplicatedFence(&e, request.Fence)
-	var payload []byte
 	tag := byte(tagReplicatedRequest)
 	switch request.Operation {
 	case ReplicatedProbe:
 	case ReplicatedPropose:
-		payload = request.Command
 		e.u32(uint32(len(payload)))
 	case ReplicatedMembership:
 		e.u32(0)
@@ -459,16 +502,13 @@ func EncodeReplicatedRequestBorrowed(w io.Writer, request *ReplicatedRequest) er
 		e.u8(uint8(request.Relation))
 		e.u64(request.MinimumApplied)
 		e.u32(request.MaxValueBytes)
-		payload = request.Key
 		e.u32(uint32(len(payload)))
 	case ReplicatedReadBatchLeader:
 		e.u64(request.MinimumApplied)
 		e.u32(request.MaxValueBytes)
-		payload = request.BatchRead
 		e.u32(uint32(len(payload)))
 	case ReplicatedQueryLeader:
 		e.u32(request.MaxValueBytes)
-		payload = request.Query
 		e.u32(uint32(len(payload)))
 	case ReplicatedTransactionRead:
 		encodeReplicatedTransactionRead(&e, request.TransactionRead)
@@ -484,15 +524,26 @@ func EncodeReplicatedRequestBorrowed(w io.Writer, request *ReplicatedRequest) er
 		tag = tagReplicatedExecutionPinRead
 	}
 	if e.err != nil || len(e.b)+len(payload)-5 > maxFrameBody {
+		releaseReplicatedBorrowedScratch(scratch, len(e.b))
 		return errFrameTooLarge
 	}
 	e.b[0] = tag
 	binary.BigEndian.PutUint32(e.b[1:5], uint32(len(e.b)+len(payload)-1))
+	if scratch != nil && len(e.b)+len(payload) <= replicatedBorrowedCoalesceBytes {
+		e.b = append(e.b, payload...)
+		written, err := w.Write(e.b)
+		releaseReplicatedBorrowedScratch(scratch, len(e.b))
+		if err == nil && written != len(e.b) {
+			return io.ErrShortWrite
+		}
+		return err
+	}
 	buffers := net.Buffers{e.b}
 	if len(payload) != 0 {
 		buffers = append(buffers, payload)
 	}
 	written, err := buffers.WriteTo(w)
+	releaseReplicatedBorrowedScratch(scratch, len(e.b))
 	if err == nil && written != int64(len(e.b)+len(payload)) {
 		return io.ErrShortWrite
 	}
