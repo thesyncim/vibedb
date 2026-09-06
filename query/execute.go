@@ -641,6 +641,14 @@ func (p *plan) runSnapshotInto(e *Exec, snapshot store.Snapshot, catalog store.D
 	if err := e.Workspace.checkCanceled(); err != nil {
 		return err
 	}
+	// An empty physical input cannot contribute a projected row. Binding has
+	// already validated SQL arguments; keep aggregates, joins, marks and domain
+	// scans on their ordinary paths, where empty-input semantics can differ.
+	if snapshot.Len() == 0 && !p.grouped && !p.hasAggregate && len(p.joins) == 0 &&
+		len(p.marks) == 0 && !p.requiresSQLDomainScan() {
+		e.Stats = ExecStats{}
+		return prepareResult(&e.Result, p, 0)
+	}
 	e.Workspace.joinPairBudget.configure(-1)
 	if p.fanOutJoin >= 0 {
 		pairBytes, err := normalizeJoinPairBytes(e.Options)

@@ -43,6 +43,8 @@ func replicatedSQLReservationBytes(maximum uint32) int64 {
 type replicatedSQLLease struct {
 	budget *replicatedFrameByteBudget
 	bytes  int64
+	point  sqldriver.ReplicatedReadLease
+	cursor sqldriver.Cursor
 }
 
 func (l *replicatedSQLLease) Release() {
@@ -444,7 +446,7 @@ func (server *ReplicatedServer) executeReplicatedPointQueryTierCall(
 	}
 	execution := trace.StartRegion(ctx, "sql.read.execute")
 	encoded, err := executeFencedSQLPointBudget(
-		ctx, source, primary, inner, budget, point,
+		ctx, source, primary, inner, budget, point, lease,
 	)
 	execution.End()
 	if err != nil {
@@ -572,7 +574,7 @@ func executeFencedSQLBudget(ctx context.Context, source interface {
 			ctx, cut, req.SQL, req.ParamTypes, req.PartialAggregate, options,
 		)
 		if acquireErr == nil {
-			return executeFencedSQLLease(ctx, lease, req, budget, &flag)
+			return executeFencedSQLLease(ctx, lease, req, budget, &flag, nil)
 		}
 		if !errors.Is(acquireErr, sqldriver.ErrReplicatedReadReuseUnsupported) {
 			return nil, acquireErr
@@ -612,6 +614,7 @@ func executeFencedSQLPointBudget(
 	req *ShardRequest,
 	budget replicatedSQLBudget,
 	point replicatedstate.PointReadResult,
+	frame *replicatedSQLLease,
 ) ([]byte, error) {
 	maxBytes := budget.resultBytes
 	if req.ExecutionMode != ExecutionReadOnly || req.ReadPolicy != ReadStrong ||
@@ -635,6 +638,19 @@ func executeFencedSQLPointBudget(
 		MemoryBytes: budget.workingBytes, IntermediateBytes: budget.workingBytes,
 		AggregateBytes: budget.workingBytes,
 	}
+	if reusable, ok := source.(interface {
+		AcquireReplicatedPointReadInto(context.Context, replication.RelationID, []byte, bool,
+			[]byte, []byte, string, []sqldriver.ParamType, bool, query.ExecOptions, *sqldriver.ReplicatedReadLease) error
+	}); ok {
+		err := reusable.AcquireReplicatedPointReadInto(ctx, primary.Relation, primary.Keys[0],
+			point.Found, point.Value, primary.PrimaryPath, req.SQL, req.ParamTypes, req.PartialAggregate, options, &frame.point)
+		if err == nil {
+			return executeFencedSQLLease(ctx, &frame.point, req, budget, &flag, &frame.cursor)
+		}
+		if !errors.Is(err, sqldriver.ErrReplicatedReadReuseUnsupported) {
+			return nil, err
+		}
+	}
 	if reusable, ok := source.(replicatedSQLPointReadReuseSource); ok {
 		lease, acquireErr := reusable.AcquireReplicatedPointRead(
 			ctx, primary.Relation, primary.Keys[0], point.Found, point.Value,
@@ -642,7 +658,7 @@ func executeFencedSQLPointBudget(
 			options,
 		)
 		if acquireErr == nil {
-			return executeFencedSQLLease(ctx, lease, req, budget, &flag)
+			return executeFencedSQLLease(ctx, lease, req, budget, &flag, &frame.cursor)
 		}
 		if !errors.Is(acquireErr, sqldriver.ErrReplicatedReadReuseUnsupported) {
 			return nil, acquireErr
@@ -681,6 +697,7 @@ func executeFencedSQLLease(
 	req *ShardRequest,
 	budget replicatedSQLBudget,
 	flag *query.CancelFlag,
+	cursor *sqldriver.Cursor,
 ) (encoded []byte, err error) {
 	if lease == nil {
 		return nil, sqldriver.ErrReplicatedReadLeaseClosed
@@ -688,15 +705,17 @@ func executeFencedSQLLease(
 	// Finish invalidates the lease on normal return. During a panic these
 	// defers close the cursor and retire its still-active execution slot.
 	defer func() { _ = lease.Abort(nil) }()
-	var cursor sqldriver.Cursor
+	if cursor == nil {
+		cursor = &sqldriver.Cursor{}
+	}
 	defer func() { _ = cursor.Close() }()
 	if req.PrimaryKeyRead.present() {
 		err = lease.QueryCandidateKeysInto(
 			ctx, runtimeArgs(req.Params), req.PrimaryKeyRead.PrimaryPath,
-			req.PrimaryKeyRead.Keys, &cursor,
+			req.PrimaryKeyRead.Keys, cursor,
 		)
 	} else {
-		err = lease.QueryInto(ctx, runtimeArgs(req.Params), &cursor)
+		err = lease.QueryInto(ctx, runtimeArgs(req.Params), cursor)
 	}
 	if err == nil {
 		encoding := trace.StartRegion(ctx, "sql.read.encode")

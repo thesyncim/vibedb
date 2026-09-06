@@ -317,6 +317,9 @@ func (s *stmt) queryRowsCandidates(
 	if err := contextCheckpoint(ctx); err != nil {
 		return nil, err
 	}
+	if s.conn.pointRead != nil {
+		return s.queryPointExecution(ctx, args, primaryPath, candidateKeys)
+	}
 	if s.explain {
 		if candidateRead {
 			return nil, errors.New("vibedb: candidate keys cannot execute EXPLAIN")
