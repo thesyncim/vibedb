@@ -301,6 +301,7 @@ type devGatewayConfig struct {
 	ControllerIntervalMillis    uint64                `json:"controller_interval_millis"`
 	SchemaRolloutPlan           string                `json:"schema_rollout_plan"`
 	SchemaRolloutOnce           bool                  `json:"schema_rollout_once"`
+	InitialNodeDirectoryPath    string                `json:"initial_node_directory"`
 }
 
 type devGatewayTLS struct {
@@ -526,6 +527,8 @@ type devClusterOptions struct {
 	physicalNodes                    int
 	pgListen                         string
 	pgListens                        []string
+	tlsCACertificate                 string
+	tlsCAKey                         string
 	readAuthority                    bool
 }
 
@@ -541,6 +544,8 @@ func runClusterDev(args []string) int {
 	diagnosticsOnExit := fs.Bool("diagnostics-on-exit", false, "print bounded shard and gateway log tails when the development cluster stops")
 	pgListen := fs.String("pg-listen", "", "optional loopback PostgreSQL endpoint with durable auto-commit writes (RF3 only)")
 	pgListens := fs.String("pg-listens", "", "comma-separated PostgreSQL loopback endpoints, one per physical node (RF3 only)")
+	tlsCACertificate := fs.String("tls-ca-certificate", "", "optional PEM CA certificate used to sign this local cluster's leaf identities")
+	tlsCAKey := fs.String("tls-ca-key", "", "optional PEM CA private key paired with --tls-ca-certificate (never transmitted)")
 	readAuthority := fs.Bool("read-authority", false, "explicitly enable quorum read authority on every RF3 physical-node voter")
 	var tableSchemas []string
 	fs.Func("table-schema", "CREATE TABLE file to provision as an additional RF3 group; repeatable and retained on restart", func(path string) error {
@@ -550,6 +555,18 @@ func runClusterDev(args []string) int {
 	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || *root == "" {
 		usage()
 		return 2
+	}
+	if (*tlsCACertificate == "") != (*tlsCAKey == "") {
+		usage()
+		return 2
+	}
+	if *tlsCACertificate != "" {
+		for _, path := range []string{*tlsCACertificate, *tlsCAKey} {
+			if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+				usage()
+				return 2
+			}
+		}
 	}
 	if *readAuthority && !rf3qualification.ReadAuthorityEnabled {
 		fmt.Fprintf(os.Stderr, "cluster dev: --read-authority requires the explicitly tagged laboratory build %q\n",
@@ -624,7 +641,7 @@ func runClusterDev(args []string) int {
 		return 1
 	}
 	defer unlock()
-	manifest, err := ensureDevCluster(devClusterOptions{root: abs, replicas: *replicas, shardBinary: shard, gatewayBinary: gw, nodeLog: *nodeLog, physicalNodes: *physicalNodes, pgListen: *pgListen, pgListens: listeners, readAuthority: *readAuthority})
+	manifest, err := ensureDevCluster(devClusterOptions{root: abs, replicas: *replicas, shardBinary: shard, gatewayBinary: gw, nodeLog: *nodeLog, physicalNodes: *physicalNodes, pgListen: *pgListen, pgListens: listeners, tlsCACertificate: *tlsCACertificate, tlsCAKey: *tlsCAKey, readAuthority: *readAuthority})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cluster dev: %v\n", err)
 		return 1
@@ -773,7 +790,7 @@ func initializeDevCluster(options devClusterOptions, manifestPath string) (devCl
 	if err != nil {
 		return devClusterManifest{}, err
 	}
-	credentials, roots, err := writeDevCredentials(options.root, rafttransport.TrustDomain{ClusterID: clusterID, ClusterIncarnation: clusterIncarnation}, nodes)
+	credentials, roots, err := writeDevCredentialsWithCA(options.root, rafttransport.TrustDomain{ClusterID: clusterID, ClusterIncarnation: clusterIncarnation}, nodes, options.tlsCACertificate, options.tlsCAKey)
 	if err != nil {
 		return devClusterManifest{}, err
 	}
@@ -2008,19 +2025,78 @@ func reserveDevPortsUsing(count int, pgAddresses []string, listen func(string, s
 	return addresses, nil
 }
 func writeDevCredentials(root string, domain rafttransport.TrustDomain, nodes []rafttransport.NodeID) ([][2]string, string, error) {
-	caKey, err := ecdsa.GenerateKey(elliptic.P256(), cryptorand.Reader)
-	if err != nil {
-		return nil, "", err
+	return writeDevCredentialsWithCA(root, domain, nodes, "", "")
+}
+
+// writeDevCredentialsWithCA is the explicit local-development PKI seam used
+// by process qualification fixtures. With no CA paths it preserves the
+// historical self-generated CA behavior. When both paths are supplied, the
+// caller owns a CA that is read locally and used only to mint this cluster's
+// leaves; neither the certificate nor private key enters a manifest or wire
+// request. The CA key is never copied into the cluster root.
+func writeDevCredentialsWithCA(root string, domain rafttransport.TrustDomain, nodes []rafttransport.NodeID, caCertificatePath, caKeyPath string) ([][2]string, string, error) {
+	if (caCertificatePath == "") != (caKeyPath == "") {
+		return nil, "", errDevCluster
 	}
+	var (
+		caKey  *ecdsa.PrivateKey
+		caCert *x509.Certificate
+		caDER  []byte
+		err    error
+	)
 	now := time.Now().UTC()
-	ca := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "VibeDB local development CA"}, NotBefore: now.Add(-time.Minute), NotAfter: now.Add(30 * 24 * time.Hour), IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageCRLSign}
-	caDER, err := x509.CreateCertificate(cryptorand.Reader, ca, ca, &caKey.PublicKey, caKey)
-	if err != nil {
-		return nil, "", err
-	}
-	caCert, err := x509.ParseCertificate(caDER)
-	if err != nil {
-		return nil, "", err
+	if caCertificatePath == "" {
+		caKey, err = ecdsa.GenerateKey(elliptic.P256(), cryptorand.Reader)
+		if err != nil {
+			return nil, "", err
+		}
+		ca := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "VibeDB local development CA"}, NotBefore: now.Add(-time.Minute), NotAfter: now.Add(30 * 24 * time.Hour), IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageCRLSign}
+		caDER, err = x509.CreateCertificate(cryptorand.Reader, ca, ca, &caKey.PublicKey, caKey)
+		if err != nil {
+			return nil, "", err
+		}
+		caCert, err = x509.ParseCertificate(caDER)
+		if err != nil {
+			return nil, "", err
+		}
+	} else {
+		certificatePEM, readErr := os.ReadFile(caCertificatePath)
+		if readErr != nil || len(certificatePEM) == 0 || len(certificatePEM) > 1<<20 {
+			return nil, "", errors.Join(errDevCluster, readErr)
+		}
+		block, rest := pem.Decode(certificatePEM)
+		if block == nil || block.Type != "CERTIFICATE" || len(bytes.TrimSpace(rest)) != 0 {
+			return nil, "", errDevCluster
+		}
+		caDER = append([]byte(nil), block.Bytes...)
+		caCert, err = x509.ParseCertificate(caDER)
+		if err != nil || !caCert.IsCA || !caCert.BasicConstraintsValid {
+			return nil, "", errors.Join(errDevCluster, err)
+		}
+		keyPEM, readErr := os.ReadFile(caKeyPath)
+		if readErr != nil || len(keyPEM) == 0 || len(keyPEM) > 1<<20 {
+			return nil, "", errors.Join(errDevCluster, readErr)
+		}
+		keyBlock, keyRest := pem.Decode(keyPEM)
+		if keyBlock == nil || len(bytes.TrimSpace(keyRest)) != 0 {
+			return nil, "", errDevCluster
+		}
+		if caKey, err = x509.ParseECPrivateKey(keyBlock.Bytes); err != nil {
+			parsed, parseErr := x509.ParsePKCS8PrivateKey(keyBlock.Bytes)
+			if parseErr != nil {
+				return nil, "", errors.Join(errDevCluster, err, parseErr)
+			}
+			var ok bool
+			caKey, ok = parsed.(*ecdsa.PrivateKey)
+			if !ok {
+				return nil, "", errDevCluster
+			}
+		}
+		caPublic, ok := caCert.PublicKey.(*ecdsa.PublicKey)
+		if !ok || caKey.PublicKey.X == nil || caKey.PublicKey.Y == nil || caPublic.X == nil || caPublic.Y == nil ||
+			caKey.PublicKey.X.Cmp(caPublic.X) != 0 || caKey.PublicKey.Y.Cmp(caPublic.Y) != 0 {
+			return nil, "", errDevCluster
+		}
 	}
 	roots := filepath.Join(root, "roots.pem")
 	if err = writeDevExclusive(roots, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER}), 0o600); err != nil {

@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"sort"
 
 	"github.com/thesyncim/vibedb/internal/membershipgrant"
@@ -133,7 +134,7 @@ func (authority *ReplicatedCatalogAuthority) ReadMembershipGrant(ctx context.Con
 		return membershipgrant.Grant{}, false, authorizeErr
 	}
 	if !authorized {
-		return membershipgrant.Grant{}, false, ErrReplicatedCatalogConflict
+		return membershipgrant.Grant{}, false, fmt.Errorf("%w: membership grant group=%x source-head=%d current-head=%d", ErrReplicatedCatalogConflict, group.GroupID, grant.CatalogGeneration, currentCatalog.Generation())
 	}
 	return grant, true, nil
 }
@@ -146,6 +147,9 @@ func (authority *ReplicatedCatalogAuthority) catalogAuthorizesMembershipGrant(
 	}
 	if current.Generation() == grant.CatalogGeneration {
 		return replicatedCatalogCertifiesInitialGrant(current, grant), nil
+	}
+	if authorized, err := authority.ownedMembershipGrantAuthorization(ctx, current, grant); authorized || err != nil {
+		return authorized, err
 	}
 	if grant.CatalogGeneration == ^uint64(0) ||
 		(current.Generation() != grant.CatalogGeneration+1 &&
@@ -597,6 +601,10 @@ func (authority *ReplicatedCatalogAuthority) PublishReplicaReplacement(
 	next *Snapshot,
 	expected membershipgrant.Grant,
 ) error {
+	return authority.publishReplicaReplacement(ctx, expectedGeneration, next, expected, nil)
+}
+
+func (authority *ReplicatedCatalogAuthority) publishReplicaReplacement(ctx context.Context, expectedGeneration uint64, next *Snapshot, expected membershipgrant.Grant, publication *groupTransitionPublication) error {
 	if authority == nil || authority.session == nil || ctx == nil || next == nil ||
 		!expected.Valid() || expected.CatalogGeneration != expectedGeneration ||
 		expectedGeneration == ^uint64(0) || authority.session.bundle.maxMutations < 4 {
@@ -772,6 +780,14 @@ func (authority *ReplicatedCatalogAuthority) PublishReplicaReplacement(
 				Key: receiptPageKey[:], Value: receiptPageBytes})
 		}
 	}
+	extra, err := authority.groupTransitionMutations(ctx, publication, cut.snapshot, next)
+	if err != nil {
+		return err
+	}
+	mutations = append(mutations, extra...)
+	if len(mutations) > authority.session.bundle.maxMutations {
+		return ErrReplicatedCatalog
+	}
 	result, err := authority.session.MutateBatch(ctx, mutations)
 	if err != nil {
 		if errors.Is(err, ErrNativeCommandPending) || authority.session.Status().Pending {
@@ -788,7 +804,7 @@ func (authority *ReplicatedCatalogAuthority) PublishReplicaReplacement(
 	if result.Completion.ResultCode != replicatedstate.ResultApplied {
 		return ErrReplicatedCatalog
 	}
-	if err = authority.observePublishedCatalog(certified); err != nil {
+	if err = authority.observePublishedCatalog(ctx, certified); err != nil {
 		return err
 	}
 	return authority.holder.publishReplicaReplacementAfter(
@@ -808,6 +824,10 @@ func (authority *ReplicatedCatalogAuthority) PublishReplicaReplacementPostRemove
 	expected membershipgrant.Grant,
 	observedReplicaSetVersion uint64,
 ) error {
+	return authority.publishReplicaReplacementPostRemove(ctx, expectedGeneration, next, expected, observedReplicaSetVersion, nil)
+}
+
+func (authority *ReplicatedCatalogAuthority) publishReplicaReplacementPostRemove(ctx context.Context, expectedGeneration uint64, next *Snapshot, expected membershipgrant.Grant, observedReplicaSetVersion uint64, publication *groupTransitionPublication) error {
 	if authority == nil || authority.session == nil || ctx == nil || next == nil ||
 		!expected.Valid() || expected.CatalogGeneration == ^uint64(0) ||
 		expectedGeneration != expected.CatalogGeneration+1 ||
@@ -857,7 +877,7 @@ func (authority *ReplicatedCatalogAuthority) PublishReplicaReplacementPostRemove
 		return ErrReplicatedCatalogConflict
 	}
 	receipt, err := openReplicaReplacementReceipt(receiptResult.Value)
-	if err != nil || receipt.Grant != expected ||
+	if err != nil || !found || receipt.Grant != expected ||
 		receipt.NewGeneration != expectedGeneration ||
 		receipt.PublishedReplicaSetVersion != publishedReplicaSetVersion ||
 		receipt.NewHeadBytes != uint64(len(cut.head)) ||
@@ -903,6 +923,14 @@ func (authority *ReplicatedCatalogAuthority) PublishReplicaReplacementPostRemove
 			ExpectedValueLength: uint64(len(receiptResult.Value)),
 			ExpectedValueDigest: replication.Digest(receiptDigest)},
 	}
+	extra, err := authority.groupTransitionMutations(ctx, publication, cut.snapshot, next)
+	if err != nil {
+		return err
+	}
+	mutations = append(mutations, extra...)
+	if len(mutations) > authority.session.bundle.maxMutations {
+		return ErrReplicatedCatalog
+	}
 	result, err := authority.session.MutateBatch(ctx, mutations)
 	if err != nil {
 		if errors.Is(err, ErrNativeCommandPending) || authority.session.Status().Pending {
@@ -919,7 +947,7 @@ func (authority *ReplicatedCatalogAuthority) PublishReplicaReplacementPostRemove
 	if result.Completion.ResultCode != replicatedstate.ResultApplied {
 		return ErrReplicatedCatalog
 	}
-	if err = authority.observePublishedCatalog(next); err != nil {
+	if err = authority.observePublishedCatalog(ctx, next); err != nil {
 		return err
 	}
 	return authority.holder.publishReplicaReplacementPostRemoveAfter(
@@ -955,6 +983,34 @@ func (authority *ReplicatedCatalogAuthority) FinalizeReplicaReplacement(
 	if err != nil {
 		return err
 	}
+	if err = authority.validateReplicaGrantSettlement(ctx, expected, cut); err != nil {
+		return err
+	}
+	return authority.finalizeReplicaGrantAtCut(ctx, expected, cut)
+}
+
+// validateReplicaGrantSettlement proves that a retained grant has completed
+// its source-removal transition. A catalog age alone is insufficient: an
+// unrelated head can advance without ever applying the membership change.
+// Reusing the exact finalization witnesses keeps successor enrollment from
+// revoking a grant which could still authorize an in-flight move.
+func (authority *ReplicatedCatalogAuthority) validateReplicaGrantSettlement(
+	ctx context.Context, expected membershipgrant.Grant, cut replicatedCatalogCut,
+) error {
+	if authority == nil || ctx == nil || !expected.Valid() || cut.snapshot == nil {
+		return ErrReplicatedCatalog
+	}
+	owned, ownedRaw, ownedErr := authority.readTransitionRecord(ctx, GroupTransitionKey{Group: expected.Group})
+	if ownedErr != nil {
+		return ownedErr
+	}
+	if ownedRaw.Found && owned.Grant == expected && owned.Receipt.Phase == TransitionPhasePostRemove && ownedReceiptMatchesCurrent(cut.snapshot, owned) {
+		authorized, err := authority.ownedMembershipGrantAuthorization(ctx, cut.snapshot, expected)
+		if err != nil || !authorized {
+			return errors.Join(err, ErrGroupTransition)
+		}
+		return nil
+	}
 	if expected.CatalogGeneration > ^uint64(0)-2 ||
 		cut.snapshot.Generation() != expected.CatalogGeneration+2 {
 		return ErrCatalogGenerationMismatch
@@ -971,13 +1027,17 @@ func (authority *ReplicatedCatalogAuthority) FinalizeReplicaReplacement(
 	}
 	receipt, err := openReplicaReplacementReceipt(receiptResult.Value)
 	postVersion, found := replicaSetVersionForGroup(cut.snapshot, expected.Group)
-	if err != nil || receipt.Grant != expected ||
+	if err != nil || !found || receipt.Grant != expected ||
 		receipt.PostRemoveGeneration != cut.snapshot.Generation() ||
 		receipt.PostRemoveReplicaSetVersion != postVersion ||
 		receipt.PostRemoveHeadBytes != uint64(len(cut.head)) ||
 		receipt.PostRemoveHeadDigest != sha256.Sum256(cut.head) {
 		return errors.Join(err, ErrReplicatedCatalogConflict)
 	}
+	return nil
+}
+
+func (authority *ReplicatedCatalogAuthority) finalizeReplicaGrantAtCut(ctx context.Context, expected membershipgrant.Grant, cut replicatedCatalogCut) error {
 	recordKey, pageKey := replicatedMembershipGrantKeys(expected.Group)
 	record, err := authority.readRaw(ctx, recordKey[:], maxReplicatedMembershipGrantBytes)
 	if err != nil {

@@ -37,6 +37,8 @@ Creates or reopens one durable local development topology and supervises its chi
 | `--diagnostics-on-exit` | `false` | Print bounded child log tails after shutdown. |
 | `--pg-listen` | disabled | RF3-only PostgreSQL endpoint on the first physical node. Requires a literal loopback IP and port `1..65535`. |
 | `--pg-listens` | disabled | Comma-separated distinct loopback endpoints, one per physical node. Mutually exclusive with `--pg-listen`. |
+| `--tls-ca-certificate` | disabled | Absolute PEM CA certificate used to sign this local cluster's leaf identities; must be paired with `--tls-ca-key`. The CA is local provisioning input. |
+| `--tls-ca-key` | disabled | Absolute PEM CA private key paired with `--tls-ca-certificate`; it is read only during local provisioning and is never transmitted. |
 | `--read-authority` | `false` | Laboratory-only experimental RF3 read-authority protocol. Standard binaries reject this flag before cluster creation; the retained cluster must use the same setting. |
 | `--table-schema` | none | Repeatable RF3-only file, each containing one `CREATE TABLE` with one primary key; retained on restart. |
 
@@ -81,6 +83,37 @@ launcher rejects a forgotten, changed, or downgraded setting on an existing
 root.
 An old binary cannot interpret the marker, so deployments must not restore a
 pre-enrollment manifest with an old binary while an authority marker is live.
+
+### Online cluster control
+
+The `nodes`, `join`, `rebalance`, `decommission`, and `status` commands use
+the authenticated gateway-client listener. They send one canonical,
+newline-delimited control envelope and return one bounded response. The
+profile is a local file containing the endpoint, expected server node ID, and
+the client certificate, key, roots, and identity OID paths:
+
+```json
+{"format":1,"address":"127.0.0.1:17400","server_node":"<32 hex characters>","certificate":"/path/client-cert.pem","key":"/path/client-key.pem","roots":"/path/roots.pem","identity_oid":"1.3.6.1.4.1.32473.1.1"}
+```
+
+```text
+vibedb cluster nodes --profile <auth-client.vibejson> [--json] [--wait duration]
+vibedb cluster join --profile <auth-client.vibejson> --node-file <public-node.vibejson> [--json] [--request-id <64 hex characters>] [--wait duration]
+vibedb cluster rebalance --profile <auth-client.vibejson> [--max-moves n] [--max-migration-bytes n] [--desired-node-count n] [--hysteresis-ppm n] [--json] [--request-id <64 hex characters>] [--wait duration]
+vibedb cluster decommission --profile <auth-client.vibejson> --node <32 hex characters> --incarnation n [--json] [--request-id <64 hex characters>] [--wait duration]
+vibedb cluster status --profile <auth-client.vibejson> --operation <64 hex characters> [--json] [--wait duration]
+```
+
+Mutating requests use the same request ID when retried after an ambiguous
+response. The server returns an operation ID before a long wait completes;
+`status --operation` resolves that durable operation later. Cancelling
+`--wait` only ends the client wait and never rolls back the operation. A join
+descriptor contains public node identity, roles, listener addresses, and
+capacity facts. Private keys, certificate paths, WAL paths, and process roots
+are rejected by the descriptor decoder and never enter the request envelope.
+`--json` emits the canonical response, including directory and catalog
+revisions, blockers, safe-to-stop, retirement evidence, and migration-budget
+counters.
 
 ## `vibedb-shard`
 

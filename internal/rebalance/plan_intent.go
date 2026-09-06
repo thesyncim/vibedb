@@ -3,6 +3,7 @@ package rebalance
 import (
 	"bytes"
 	"errors"
+	"fmt"
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
@@ -23,6 +24,7 @@ const MaxPlanIntentBytes = 2 * replicatedstate.MaxSnapshotBaseCertificateBytes
 var ErrPlanIntent = errors.New("rebalance: invalid persisted replica move intent")
 
 type ReplicaMoveIntentIdentity struct {
+	TransitionKey    gateway.GroupTransitionKey
 	Operation        OperationID
 	SourceGeneration uint64
 	Request          MoveRequest
@@ -36,8 +38,16 @@ func InspectReplicaMoveIntent(raw []byte) (ReplicaMoveIntentIdentity, error) {
 	if err != nil || len(intent.Certificate) != 0 {
 		return ReplicaMoveIntentIdentity{}, errors.Join(err, ErrPlanIntent)
 	}
+	var key gateway.GroupTransitionKey
+	if len(intent.Transition) != 0 {
+		transition, err := gateway.OpenGroupTransitionIntent(intent.Transition)
+		if err != nil {
+			return ReplicaMoveIntentIdentity{}, err
+		}
+		key = transition.Key
+	}
 	return ReplicaMoveIntentIdentity{Operation: OperationID(intent.Operation),
-		SourceGeneration: intent.SourceGeneration, Request: request}, nil
+		SourceGeneration: intent.SourceGeneration, Request: request, TransitionKey: key}, nil
 }
 
 type persistedPlanIntent struct {
@@ -46,6 +56,7 @@ type persistedPlanIntent struct {
 	Request          persistedMoveRequest `json:"request"`
 	Certificate      []byte               `json:"certificate"`
 	FailureAuthority []byte               `json:"failure_authority,omitempty"`
+	Transition       []byte               `json:"transition,omitempty"`
 }
 
 type persistedMoveRequest struct {
@@ -72,17 +83,22 @@ type persistedMoveRequest struct {
 // an unbound plan has one canonical empty certificate.
 func AppendPlanIntent(dst []byte, catalog *gateway.Snapshot, plan *Plan) ([]byte, error) {
 	if catalog == nil || plan == nil || plan.operation == (OperationID{}) ||
-		(catalog.Generation() != plan.catalogGeneration &&
-			catalog.Generation() != plan.nextCatalogGeneration &&
-			catalog.Generation() != plan.postRemoveGeneration) {
+		!intentCatalogCompatible(catalog, plan) {
 		return dst, ErrPlanIntent
 	}
-	if _, err := plan.catalogStage(catalog); err != nil {
-		return dst, errors.Join(err, ErrPlanIntent)
+	if !plan.transitionReady {
+		if _, err := plan.catalogStage(catalog); err != nil {
+			return dst, errors.Join(err, ErrPlanIntent)
+		}
+	}
+	transition, err := persistedTransition(catalog, plan)
+	if err != nil {
+		return dst, err
 	}
 	intent := persistedPlanIntent{
 		Operation: [32]byte(plan.operation), SourceGeneration: plan.catalogGeneration,
 		Request: persistMoveRequest(plan.request), FailureAuthority: bytes.Clone(plan.failureAuthorization),
+		Transition: transition,
 	}
 	if plan.baseBound {
 		if plan.certificate.Digest == ([32]byte{}) {
@@ -119,18 +135,39 @@ func AppendPlanIntent(dst []byte, catalog *gateway.Snapshot, plan *Plan) ([]byte
 // runtime observer instead of rewriting the operation identity or intent.
 func AppendReplicaMoveIntent(dst []byte, catalog *gateway.Snapshot, plan *Plan) ([]byte, error) {
 	if catalog == nil || plan == nil || plan.operation == (OperationID{}) ||
-		(catalog.Generation() != plan.catalogGeneration &&
-			catalog.Generation() != plan.nextCatalogGeneration &&
-			catalog.Generation() != plan.postRemoveGeneration) {
+		!intentCatalogCompatible(catalog, plan) {
 		return dst, ErrPlanIntent
 	}
-	if _, err := plan.catalogStage(catalog); err != nil {
-		return dst, errors.Join(err, ErrPlanIntent)
+	if !plan.transitionReady {
+		if _, err := plan.catalogStage(catalog); err != nil {
+			return dst, errors.Join(err, ErrPlanIntent)
+		}
+	}
+	transition, err := persistedTransition(catalog, plan)
+	if err != nil {
+		return dst, err
 	}
 	return appendPersistedPlanIntent(dst, persistedPlanIntent{
 		Operation: [32]byte(plan.operation), SourceGeneration: plan.catalogGeneration,
 		Request: persistMoveRequest(plan.request), FailureAuthority: bytes.Clone(plan.failureAuthorization),
+		Transition: transition,
 	})
+}
+
+func intentCatalogCompatible(catalog *gateway.Snapshot, plan *Plan) bool {
+	if catalog == nil || plan == nil {
+		return false
+	}
+	if plan.transitionReady {
+		manifest, ok := catalog.Manifest(plan.request.Distribution)
+		if !ok || catalog.Generation() < plan.catalogGeneration {
+			return false
+		}
+		return manifest.Equal(plan.sourceManifest) || manifest.Equal(plan.targetManifest)
+	}
+	return catalog.Generation() == plan.catalogGeneration ||
+		catalog.Generation() == plan.nextCatalogGeneration ||
+		catalog.Generation() == plan.postRemoveGeneration
 }
 
 // OpenPlanIntent validates canonical uniqueness and reconstructs the immutable
@@ -155,7 +192,8 @@ func OpenPlanIntent(
 	request := openMoveRequest(intent.Request)
 	if err != nil || !bytes.Equal(raw, canonical) || intent.Operation == ([32]byte{}) ||
 		intent.SourceGeneration == 0 || invalidMoveRequest(request) ||
-		len(intent.Certificate) == 0 && intent.Certificate != nil {
+		len(intent.Certificate) == 0 && intent.Certificate != nil ||
+		len(intent.Transition) > gateway.MaxGroupTransitionIntentBytes {
 		return nil, errors.Join(err, ErrPlanIntent)
 	}
 	var plan *Plan
@@ -182,6 +220,9 @@ func OpenPlanIntent(
 		[32]byte(plan.OperationID()) != intent.Operation {
 		return nil, errors.Join(err, ErrPlanIntent)
 	}
+	if err = restoreTransitionIntent(plan, intent.Transition); err != nil {
+		return nil, err
+	}
 	return plan, nil
 }
 
@@ -205,9 +246,11 @@ func OpenReplicaMoveIntent(
 		return nil, errors.Join(err, ErrPlanIntent)
 	}
 	var plan *Plan
-	if certificate == nil {
+	if len(intent.Transition) != 0 {
+		plan, err = recoverOwnedReplicaMove(intent, request, catalog, publication, certificate)
+	} else if certificate == nil {
 		if catalog.Generation() != intent.SourceGeneration {
-			return nil, ErrPlanIntent
+			return nil, fmt.Errorf("%w: unbound source head %d observed %d", ErrPlanIntent, intent.SourceGeneration, catalog.Generation())
 		}
 		plan, err = PlanReplicaMove(catalog, publication, request)
 	} else {
@@ -216,9 +259,17 @@ func OpenReplicaMoveIntent(
 	if err == nil && len(intent.FailureAuthority) != 0 {
 		err = restoreFailedReplicaAuthorization(plan, intent.FailureAuthority)
 	}
-	if err != nil || plan == nil || plan.catalogGeneration != intent.SourceGeneration ||
-		[32]byte(plan.OperationID()) != intent.Operation {
-		return nil, errors.Join(err, ErrPlanIntent)
+	if err != nil || plan == nil {
+		return nil, fmt.Errorf("reconstruct source plan: %w", errors.Join(ErrPlanIntent, err))
+	}
+	if plan.catalogGeneration != intent.SourceGeneration {
+		return nil, fmt.Errorf("%w: source generation reconstructed %d persisted %d", ErrPlanIntent, plan.catalogGeneration, intent.SourceGeneration)
+	}
+	if [32]byte(plan.OperationID()) != intent.Operation {
+		return nil, fmt.Errorf("%w: reconstructed operation identity differs", ErrPlanIntent)
+	}
+	if err = restoreTransitionIntent(plan, intent.Transition); err != nil {
+		return nil, fmt.Errorf("restore durable transition (present=%t reconstructed=%t): %w", len(intent.Transition) != 0, plan.transitionReady, err)
 	}
 	return plan, nil
 }
@@ -236,6 +287,44 @@ func appendPersistedPlanIntent(dst []byte, intent persistedPlanIntent) ([]byte, 
 	return dst, nil
 }
 
+func persistedTransition(catalog *gateway.Snapshot, plan *Plan) ([]byte, error) {
+	if catalog == nil || plan == nil {
+		return nil, ErrPlanIntent
+	}
+	if !plan.TransitionRequired(catalog) {
+		return nil, nil
+	}
+	transition, ok := plan.TransitionIntent()
+	if !ok || transition.Key.OperationID != [32]byte(plan.operation) {
+		return nil, ErrPlanIntent
+	}
+	encoded, err := gateway.AppendGroupTransitionIntent(nil, transition)
+	if err != nil {
+		return nil, errors.Join(err, ErrPlanIntent)
+	}
+	return encoded, nil
+}
+
+func restoreTransitionIntent(plan *Plan, raw []byte) error {
+	if plan == nil {
+		return ErrPlanIntent
+	}
+	if len(raw) == 0 {
+		if plan.transitionReady {
+			return ErrPlanIntent
+		}
+		return nil
+	}
+	transition, err := gateway.OpenGroupTransitionIntent(raw)
+	if err != nil {
+		return errors.Join(err, ErrPlanIntent)
+	}
+	if err = plan.bindTransitionIntent(transition); err != nil {
+		return errors.Join(err, ErrPlanIntent)
+	}
+	return nil
+}
+
 func openPersistedPlanIntent(raw []byte) (persistedPlanIntent, MoveRequest, error) {
 	if len(raw) == 0 || len(raw) > MaxPlanIntentBytes {
 		return persistedPlanIntent{}, MoveRequest{}, ErrPlanIntent
@@ -251,12 +340,18 @@ func openPersistedPlanIntent(raw []byte) (persistedPlanIntent, MoveRequest, erro
 	request := openMoveRequest(intent.Request)
 	if err != nil || !bytes.Equal(raw, canonical) || intent.Operation == ([32]byte{}) ||
 		intent.SourceGeneration == 0 || invalidMoveRequest(request) ||
-		len(intent.Certificate) == 0 && intent.Certificate != nil {
+		len(intent.Certificate) == 0 && intent.Certificate != nil ||
+		len(intent.Transition) > gateway.MaxGroupTransitionIntentBytes {
 		return persistedPlanIntent{}, MoveRequest{}, errors.Join(err, ErrPlanIntent)
 	}
 	if len(intent.FailureAuthority) != 0 {
 		if _, authorizationErr := openFailureAuthorization(intent.FailureAuthority); authorizationErr != nil {
 			return persistedPlanIntent{}, MoveRequest{}, errors.Join(authorizationErr, ErrPlanIntent)
+		}
+	}
+	if len(intent.Transition) != 0 {
+		if _, transitionErr := gateway.OpenGroupTransitionIntent(intent.Transition); transitionErr != nil {
+			return persistedPlanIntent{}, MoveRequest{}, errors.Join(transitionErr, ErrPlanIntent)
 		}
 	}
 	return intent, request, nil

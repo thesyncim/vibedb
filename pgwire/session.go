@@ -13,6 +13,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/query"
 	sqlast "github.com/thesyncim/vibedb/sql"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
@@ -37,8 +38,12 @@ import (
 type session struct {
 	server *Server
 	conn   net.Conn
-	r      *reader
-	w      *writer
+	// baseContext carries the immutable accepted-socket token and its dynamic
+	// continuation provider. It is captured after pgwire admission and reused
+	// for every backend operation, including an idle session's next query.
+	baseContext context.Context
+	r           *reader
+	w           *writer
 
 	// pid and secret are the backend key a cancel request names this session
 	// by. See session.cancel.
@@ -206,8 +211,9 @@ func (p *prepared) release() {
 // after invalidation returns 55000; silently reading overwritten result storage
 // is never an option.
 type portal struct {
-	name string
-	stmt *prepared
+	session *session
+	name    string
+	stmt    *prepared
 	// args are the bound parameters, copied out of the Bind message because the
 	// message's buffer is reused by the next one.
 	args []any
@@ -284,16 +290,31 @@ func (p *portal) resetForBind(name string, stmt *prepared) {
 	p.invalidated = false
 }
 
+func (p *portal) operationContext() context.Context {
+	if p != nil && p.session != nil {
+		return p.session.operationContext()
+	}
+	return context.Background()
+}
+
 func newSession(s *Server, conn net.Conn) *session {
 	session := &session{
-		server:     s,
-		params:     map[string]string{},
-		statements: map[string]*prepared{},
-		portals:    map[string]*portal{},
+		server:      s,
+		baseContext: serviceauthz.FrontendConnectionContextFromConn(context.Background(), conn),
+		params:      map[string]string{},
+		statements:  map[string]*prepared{},
+		portals:     map[string]*portal{},
 	}
 	session.setTransport(conn)
 	session.bindCancellationCheck()
 	return session
+}
+
+func (s *session) operationContext() context.Context {
+	if s != nil && s.baseContext != nil {
+		return s.baseContext
+	}
+	return context.Background()
 }
 
 // setTransport installs one protocol transport. It is called once for the raw
@@ -604,7 +625,7 @@ func (s *session) negotiate(body []byte) error {
 	if err := s.server.opts.Auth.authenticate(s, s.user); err != nil {
 		return err
 	}
-	runtime, err := s.server.backend.NewSession(context.Background(), SessionIdentity{User: s.user, Database: s.database})
+	runtime, err := s.server.backend.NewSession(s.operationContext(), SessionIdentity{User: s.user, Database: s.database})
 	if err != nil {
 		return fatal(sqlstateInternalError,
 			"could not open this connection's SQL session: "+err.Error())
@@ -858,7 +879,7 @@ func (s *session) simpleQuery(sql string) error {
 		return s.flush()
 	}
 	if implicit {
-		if err := s.sql.Begin(context.Background(), sqldriver.TxOptions{}); err != nil {
+		if err := s.sql.Begin(s.operationContext(), sqldriver.TxOptions{}); err != nil {
 			s.w.errorResponse(asPGError(err))
 			s.w.readyForQuery(s.transactionStatus())
 			return s.flush()
@@ -916,10 +937,10 @@ func (s *session) simpleQuery(sql string) error {
 			failed = true
 		}
 		if failed {
-			if err := s.sql.Rollback(context.Background()); err != nil {
+			if err := s.sql.Rollback(s.operationContext()); err != nil {
 				s.reportTransactionCompletionError(err)
 			}
-		} else if err := s.sql.Commit(context.Background()); err != nil {
+		} else if err := s.sql.Commit(s.operationContext()); err != nil {
 			s.reportTransactionCompletionError(err)
 		}
 		// A cancel racing with the indivisible commit/rollback step cannot
@@ -1094,7 +1115,7 @@ func (s *session) runSimple(text string) error {
 		s.w.emptyQueryResponse()
 		return nil
 	}
-	p := &portal{stmt: stmt}
+	p := &portal{session: s, stmt: stmt}
 	defer p.release()
 	if stmt.runtime != nil && stmt.runtime.NumParams() != 0 {
 		return newError(sqlstateSyntaxError,
@@ -1263,10 +1284,10 @@ func (s *session) prepare(
 	if typed, ok := s.sql.(BackendSessionParameterPreparer); ok &&
 		len(parameterTypes) != 0 {
 		runtime, err = typed.PrepareWithParameterTypes(
-			context.Background(), lowered, parameterTypes,
+			s.operationContext(), lowered, parameterTypes,
 		)
 	} else {
-		runtime, err = s.sql.Prepare(context.Background(), lowered)
+		runtime, err = s.sql.Prepare(s.operationContext(), lowered)
 	}
 	if err != nil {
 		// The catalog shim engages only here, behind the front end's own
@@ -1640,13 +1661,13 @@ func (s *session) executeTransaction(stmt *prepared) error {
 	tag := stmt.tag
 	switch stmt.kind {
 	case kindBegin:
-		err = s.sql.Begin(context.Background(), stmt.txOptions)
+		err = s.sql.Begin(s.operationContext(), stmt.txOptions)
 		if err == nil {
 			s.transactionIsolation = stmt.txOptions.Isolation
 		}
 	case kindCommit:
 		s.closeRuntimePortals()
-		err = s.sql.Commit(context.Background())
+		err = s.sql.Commit(s.operationContext())
 		if errors.Is(err, sqldriver.ErrTransactionFailed) {
 			// PostgreSQL treats COMMIT in an aborted transaction as a rollback
 			// and reports ROLLBACK rather than returning another transaction
@@ -1657,7 +1678,7 @@ func (s *session) executeTransaction(stmt *prepared) error {
 		s.implicitExtended = false
 	case kindRollback:
 		s.closeRuntimePortals()
-		err = s.sql.Rollback(context.Background())
+		err = s.sql.Rollback(s.operationContext())
 		s.implicitExtended = false
 	}
 	pendingCancel := s.takeCancel()
@@ -1672,7 +1693,7 @@ func (s *session) executeTransaction(stmt *prepared) error {
 }
 
 func (s *session) cancelSuccessfulBegin(stmt *prepared) error {
-	rollbackErr := s.sql.Rollback(context.Background())
+	rollbackErr := s.sql.Rollback(s.operationContext())
 	if rollbackErr == nil {
 		return queryCanceled()
 	}
@@ -1690,13 +1711,13 @@ func (s *session) executeSavepoint(stmt *prepared) error {
 	var err error
 	switch stmt.kind {
 	case kindSavepoint:
-		err = s.sql.Savepoint(context.Background(), name)
+		err = s.sql.Savepoint(s.operationContext(), name)
 	case kindReleaseSavepoint:
-		err = s.sql.ReleaseSavepoint(context.Background(), name)
+		err = s.sql.ReleaseSavepoint(s.operationContext(), name)
 	case kindRollbackToSavepoint:
 		// ROLLBACK TO recovers SessionFailedTransaction to SessionInTransaction
 		// at the runtime; ReadyForQuery then reports T rather than E.
-		err = s.sql.RollbackTo(context.Background(), name)
+		err = s.sql.RollbackTo(s.operationContext(), name)
 	default:
 		return newError(sqlstateInternalError, "invalid savepoint command kind")
 	}
@@ -1718,7 +1739,7 @@ func (s *session) executeRuntimeExec(p *portal) error {
 		return queryCanceled()
 	}
 	s.invalidateRuntimePortals(p)
-	result, err := p.stmt.runtime.Exec(context.Background(), p.args)
+	result, err := p.stmt.runtime.Exec(p.operationContext(), p.args)
 	if err != nil {
 		_ = s.takeCancel()
 		if errors.Is(err, query.ErrCanceled) && !errors.Is(err, durable.ErrCommitOutcomeUnknown) {
@@ -1854,7 +1875,7 @@ func (s *session) executeRuntimeQuery(p *portal, limit int32) error {
 
 func (s *session) startRuntime(p *portal) error {
 	s.invalidateRuntimePortals(p)
-	if err := p.stmt.runtime.QueryInto(context.Background(), p.args, &p.runtime); err != nil {
+	if err := p.stmt.runtime.QueryInto(p.operationContext(), p.args, &p.runtime); err != nil {
 		return err
 	}
 	p.runtimeOpen = true

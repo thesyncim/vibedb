@@ -2306,6 +2306,7 @@ func (a *ReplicatedApply) DurabilityStats() (durable.CheckpointGroupStats, error
 // reported separately so benchmark tooling can account for every physical
 // byte without acquiring a collection or database capability.
 type ReplicatedApplyResourceStats struct {
+	Publication   raftmodel.Publication
 	System        durable.Stats
 	Capture       durable.Stats
 	Relations     [replication.MaxRelationsPerBundle]durable.Stats
@@ -2332,6 +2333,7 @@ func (a *ReplicatedApply) ResourceStats() (ReplicatedApplyResourceStats, error) 
 		return ReplicatedApplyResourceStats{}, ErrReplicatedApplyMismatch
 	}
 	result := ReplicatedApplyResourceStats{
+		Publication:   a.machine.Published(),
 		System:        a.database.replicatedApplyCollection.Stats(),
 		Capture:       a.database.replicatedCaptureCollection.Stats(),
 		RelationCount: identity.RelationCount,

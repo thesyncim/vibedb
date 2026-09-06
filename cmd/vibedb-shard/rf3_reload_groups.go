@@ -285,6 +285,9 @@ func reloadPreparedRF3Groups(ctx context.Context, current *rf3Manifest, profile 
 		if err != nil {
 			return err
 		}
+		if len(set.groups) != 1 {
+			return closePreparedRF3Groups(set.groups, errInvalidRF3Manifest)
+		}
 		item := &set.groups[0]
 		if item.restoreOperation != ([32]byte{}) {
 			return item.close(errInvalidRF3Manifest)
@@ -315,7 +318,7 @@ func reloadPreparedRF3Groups(ctx context.Context, current *rf3Manifest, profile 
 		inventory.publishNativeChild(identity)
 		inventory.mu.Unlock()
 		schemas.mu.Lock()
-		schemas.groups[identity.Group] = &rf3SchemaGeneration{identity: identity, path: item.manifest.SQL.Path,
+		schemas.groups[identity.Group] = &rf3SchemaGeneration{manifest: item.manifest, identity: identity, path: item.manifest.SQL.Path,
 			wal: item.recoveryLog(), base: item.base.Clone(), applyID: item.applyIdentity, apply: item.apply}
 		schemas.mu.Unlock()
 		current.Groups = append(current.groupBundles(), bundle)

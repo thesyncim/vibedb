@@ -162,8 +162,9 @@ func initializeDevPhysicalCluster(options devClusterOptions, manifestPath string
 		}
 	}
 	identities := append(append(append([]rafttransport.NodeID{}, storageNodes...), gatewayNodes...), clientNode)
-	credentials, roots, err := writeDevCredentials(options.root,
-		rafttransport.TrustDomain{ClusterID: clusterID, ClusterIncarnation: clusterIncarnation}, identities)
+	credentials, roots, err := writeDevCredentialsWithCA(options.root,
+		rafttransport.TrustDomain{ClusterID: clusterID, ClusterIncarnation: clusterIncarnation}, identities,
+		options.tlsCACertificate, options.tlsCAKey)
 	if err != nil {
 		return devClusterManifest{}, err
 	}
@@ -241,7 +242,8 @@ func initializeDevPhysicalCluster(options devClusterOptions, manifestPath string
 		nodeManifestPath := filepath.Join(nodeRoot, "serve-rf3.vibejson")
 		gatewayBase := filepath.Join(nodeRoot, "gateway")
 		gatewayConfig := devGatewayConfig{
-			CatalogPath: filepath.Join(options.root, "catalog.vibejson"), CatalogRouteSeedPath: filepath.Join(gatewayBase, "catalog-route-seed"),
+			InitialNodeDirectoryPath: filepath.Join(options.root, "initial-node-directory.vibejson"),
+			CatalogPath:              filepath.Join(options.root, "catalog.vibejson"), CatalogRouteSeedPath: filepath.Join(gatewayBase, "catalog-route-seed"),
 			CatalogBootstrapIfMissing: nodeIndex == 0, CatalogRelation: 1, CatalogAttempts: 8,
 			CatalogAttemptTimeoutMillis: 5000, CatalogSessionLeaseMillis: uint64((24 * time.Hour) / time.Millisecond),
 			CatalogSessionJournal: filepath.Join(gatewayBase, "catalog-session"), CatalogClientID: devIDString(gatewayNodes[nodeIndex][:]),
@@ -459,11 +461,16 @@ func completeDevPhysicalCluster(options devClusterOptions, manifest devClusterMa
 	// group identities. This prevents a partial physical inventory from becoming
 	// a routable fresh cluster.
 	if _, err := os.Stat(manifest.CatalogPath); errors.Is(err, os.ErrNotExist) {
-		return writeDevPhysicalCatalog(manifest)
+		if err := writeDevPhysicalCatalog(manifest); err != nil {
+			return err
+		}
 	} else if err != nil {
 		return err
 	}
-	return validateDevPhysicalCatalog(manifest)
+	if err := validateDevPhysicalCatalog(manifest); err != nil {
+		return err
+	}
+	return writeDevInitialNodeDirectory(manifest)
 }
 
 func writeDevPhysicalCatalog(cluster devClusterManifest) error {

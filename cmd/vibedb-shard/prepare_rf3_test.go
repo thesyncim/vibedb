@@ -84,7 +84,7 @@ func TestPrepareRF3PublishesCompleteRestartableMemberAndReopensExactly(t *testin
 			Peer: "127.0.0.1:21001", Native: "127.0.0.1:22001",
 			Snapshot: "127.0.0.1:22501", Control: "127.0.0.1:23001",
 		},
-		TLS:                 rf3ManifestTLS{Certificate: credentials[0].Certificate, Key: credentials[0].Key, Roots: roots, IdentityOID: "1.3.6.1.4.1.32473.1.1"},
+		TLS:                 rf3ManifestTLS{PeerKeys: rf3CommandPeerKeys(credentials[0]), Certificate: credentials[0].Certificate, Key: credentials[0].Key, Roots: roots, IdentityOID: "1.3.6.1.4.1.32473.1.1"},
 		AuthorizationPolicy: policy,
 		SplitControl: prepareRF3SplitControl{
 			MaxRecords: 4096, MaxFileBytes: 64 << 20,
@@ -357,4 +357,12 @@ func idString(raw []byte) string {
 		result[index*2], result[index*2+1] = digits[value>>4], digits[value&15]
 	}
 	return string(result)
+}
+
+func rf3CommandPeerKeys(credential rf3testfixture.Credential) []rf3ManifestPeerKey {
+	pins := make([]rf3ManifestPeerKey, len(credential.PeerKeys))
+	for i, pin := range credential.PeerKeys {
+		pins[i] = rf3ManifestPeerKey{NodeID: pin.NodeID, KeyDigest: pin.KeyDigest}
+	}
+	return pins
 }

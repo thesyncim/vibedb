@@ -36,7 +36,7 @@ func prepareRF3FaultNodeMember(t testing.TB, fixture *rf3FaultFixture, member in
 		WAL:       prepareRF3WAL{KeyID: "rf3-command-key", KeyMaterialPath: keySource, WrappedKey: "explicit-test-wrapped-key", MaxFileBytes: geometry.MaxFileBytes, MaxRecordBytes: geometry.MaxRecordBytes, MaxRecords: geometry.MaxRecords, MaxEntries: geometry.MaxEntries, MaxLiveBytes: geometry.MaxLiveBytes},
 		Apply:     prepareRF3Apply{MaxSessions: 32, RetryWindow: 8, MaxCollections: 16, MaxDocuments: 1024, MaxBytes: 384 << 20, ShardKey: gateway.ReplicatedCatalogPrimaryKey},
 		Listeners: rf3ManifestListeners{Peer: fixture.peerAddresses[member], Native: fixture.nativeAddresses[member], Snapshot: fixture.snapshotAddresses[member], Control: fixture.controlAddresses[member]},
-		TLS:       rf3ManifestTLS{Certificate: fixture.credentials[member].Certificate, Key: fixture.credentials[member].Key, Roots: fixture.roots, IdentityOID: rf3CommandIdentityOID.String()}, AuthorizationPolicy: policy,
+		TLS:       rf3ManifestTLS{PeerKeys: rf3CommandPeerKeys(fixture.credentials[member]), Certificate: fixture.credentials[member].Certificate, Key: fixture.credentials[member].Key, Roots: fixture.roots, IdentityOID: rf3CommandIdentityOID.String()}, AuthorizationPolicy: policy,
 		SplitControl: prepareRF3SplitControl{MaxRecords: 4096, MaxFileBytes: 64 << 20, MaxChildOperations: 8, StageCheckpointBytes: 32 << 20},
 	}
 	for i, node := range fixture.nodes {

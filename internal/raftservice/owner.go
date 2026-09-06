@@ -175,7 +175,7 @@ type ownerRequest struct {
 	step                [32]byte
 	sourceMember        uint64
 	install             ExecutionGroup
-	publish             func()
+	registryChange      func(func(func()) error) error
 	database            *sqldriver.Database
 	apply               *sqldriver.ReplicatedApply
 	schemaSQL           sqldriver.ReplicatedShardStoreIdentity
@@ -1666,11 +1666,11 @@ func (owner *Owner) handle(request ownerRequest) error {
 	case requestReplicaRetirement:
 		reply.err = owner.retireReplica(request)
 	case requestInstallExecutionGroup:
-		reply.err = owner.installExecutionGroupNow(request.install, request.publish)
+		reply.err = request.registryChange(func(publish func()) error { return owner.installExecutionGroupNow(request.install, publish) })
 	case requestRemoveExecutionGroup:
-		reply.err = owner.removeExecutionGroupNow(
-			request.group, request.install.Identity, request.publish,
-		)
+		reply.err = request.registryChange(func(withdraw func()) error {
+			return owner.removeExecutionGroupNow(request.group, request.install.Identity, withdraw)
+		})
 	case requestObserveSchemaTransition:
 		_, reply.committed, reply.err = owner.host.ObserveSchemaTransition(
 			request.group, request.data,
@@ -2008,14 +2008,14 @@ func validExecutionGroup(group ExecutionGroup) bool {
 // enqueued it waits for the serialized owner even if a caller would otherwise
 // abandon its context; returning outcome-unknown here could leak an adopted
 // Runtime whose ownership the caller still believes it retains.
-func (owner *Owner) installExecutionGroup(group ExecutionGroup, publish func()) error {
-	if owner == nil || publish == nil || !validExecutionGroup(group) {
+func (owner *Owner) installExecutionGroup(group ExecutionGroup, change func(func(func()) error) error) error {
+	if owner == nil || change == nil || !validExecutionGroup(group) {
 		return ErrInvalidOwner
 	}
 	reply := make(chan ownerReply, 1)
 	if err := owner.publish(ownerRequest{
 		kind: requestInstallExecutionGroup, group: group.Identity.Group,
-		install: group, publish: publish, reply: reply,
+		install: group, registryChange: change, reply: reply,
 	}); err != nil {
 		return err
 	}
@@ -2044,15 +2044,15 @@ func (owner *Owner) installExecutionGroupNow(group ExecutionGroup, publish func(
 	return nil
 }
 
-func (owner *Owner) removeExecutionGroup(identity raftmember.RuntimeIdentity, withdraw func()) error {
+func (owner *Owner) removeExecutionGroup(identity raftmember.RuntimeIdentity, change func(func(func()) error) error) error {
 	group := identity.Group
-	if owner == nil || group == (raftmember.GroupKey{}) || withdraw == nil {
+	if owner == nil || group == (raftmember.GroupKey{}) || change == nil {
 		return ErrInvalidOwner
 	}
 	reply := make(chan ownerReply, 1)
 	if err := owner.publish(ownerRequest{
 		kind: requestRemoveExecutionGroup, group: group,
-		install: ExecutionGroup{Identity: identity}, publish: withdraw, reply: reply,
+		install: ExecutionGroup{Identity: identity}, registryChange: change, reply: reply,
 	}); err != nil {
 		return err
 	}

@@ -1,7 +1,6 @@
 package pgwire
 
 import (
-	"context"
 	"strconv"
 	"strings"
 
@@ -339,7 +338,7 @@ func (s *session) catalogShim(
 	if !ok {
 		return s.discoveryShim(text, check)
 	}
-	tables, err := s.sql.Tables(context.Background())
+	tables, err := s.sql.Tables(s.operationContext())
 	if err != nil {
 		return nil, false, nil
 	}

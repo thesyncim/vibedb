@@ -11,7 +11,9 @@ import (
 
 func testRF3AdoptedInventory(t *testing.T) *rf3AdoptedGroupInventory {
 	t.Helper()
-	manifest := rf3Manifest{Digest: [32]byte{1}, ReplicaControl: rf3ManifestReplicaControl{SourceDataRoot: t.TempDir()}, Groups: []rf3ManifestGroup{{}, {}}}
+	// An explicit node log selects the grouped grammar.  In-memory fixtures
+	// without it intentionally retain the legacy single-group fallback.
+	manifest := rf3Manifest{NodeLog: &rf3NodeLogManifest{}, Digest: [32]byte{1}, ReplicaControl: rf3ManifestReplicaControl{SourceDataRoot: t.TempDir()}, Groups: []rf3ManifestGroup{{}, {}}}
 	inventory, err := openRF3AdoptedGroupInventory(manifest)
 	if err != nil {
 		t.Fatal(err)

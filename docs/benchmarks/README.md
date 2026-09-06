@@ -14,6 +14,7 @@ is separate from this engineering archive.
 
 - [RF3 SQL comparison](crdb-sql-method.md).
 - [Physical-node SQL comparison](fused-node-sql-method.md).
+- [Online scale in and out qualification and evidence](seamless-scale-in-out-method.md).
 
 ## Reports
 

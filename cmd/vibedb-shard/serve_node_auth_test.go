@@ -65,7 +65,7 @@ func TestRF3EmbeddedGatewayBindsBeforeNativeAdmissionWithIndependentRights(t *te
 		CatalogPath: filepath.Join(root, "absent-catalog"), CatalogRouteSeedPath: filepath.Join(root, "absent-route-seed"),
 		CatalogSessionJournal: filepath.Join(root, "absent-session"), DurableAckKeyPath: filepath.Join(root, "absent-ack-key"),
 		CatalogClientID: strings.Repeat("a", 32), CatalogRetryHome: strings.Repeat("b", 16),
-		TLS:                 rf3ManifestTLS{Certificate: credentials[1].Certificate, Key: credentials[1].Key, Roots: roots, IdentityOID: rf3CommandIdentityOID.String()},
+		TLS:                 rf3ManifestTLS{PeerKeys: rf3CommandPeerKeys(credentials[1]), Certificate: credentials[1].Certificate, Key: credentials[1].Key, Roots: roots, IdentityOID: rf3CommandIdentityOID.String()},
 		AuthorizationPolicy: policyPath,
 	}
 	for index, member := range group.Members {

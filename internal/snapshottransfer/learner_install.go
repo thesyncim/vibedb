@@ -57,6 +57,19 @@ type LearnerInstallSettlement struct {
 	runtime  *raftmember.Runtime
 }
 
+// NodeLearnerInstallFunc is the physical-node adoption hook. It is called
+// after the streamed artifact has activated the SQL apply image but before a
+// child WAL or a standalone multiraft Host is created. The callback must
+// durably publish the node-log checkpoint, adopt the supplied database/apply,
+// and publish the runtime into its shared node owner. On error it retains no
+// caller-owned handles; the caller is free to retry from the durable cursor.
+// Returning the exact runtime identity is the only result exposed to the
+// bootstrap journal.
+type NodeLearnerInstallFunc func(
+	context.Context, Descriptor, replicatedstate.SnapshotArtifactManifest, *pb.Snapshot,
+	*sqldriver.Database, *sqldriver.ReplicatedApply,
+) (raftmember.RuntimeIdentity, error)
+
 // Close retries cleanup of the exact retained owner. It is monotonic: a
 // successfully closed component is cleared, while the first component whose
 // Close fails and every dependent owner remain reachable for the next call.
@@ -132,6 +145,11 @@ type LearnerInstallPlan struct {
 	Authority   sqldriver.ReplicatedAuthorityProfile
 	Host        *multiraft.Host
 	Settlement  *LearnerInstallSettlement
+	// NodeInstall selects the node-wide durability/adoption path. It is
+	// mutually exclusive with the legacy child-WAL Host path and is used by a
+	// running empty physical node so a new group can be adopted without a
+	// process restart.
+	NodeInstall NodeLearnerInstallFunc
 }
 
 // InstallPublishedLearner streams one already authenticated repository object
@@ -159,7 +177,8 @@ func InstallPublishedLearner(plan LearnerInstallPlan) (raftmember.RuntimeIdentit
 	// BuildSnapshotBase authenticates the independently retained static
 	// bootstrap against State.BootstrapDigest. Current membership is checked
 	// separately above because it legitimately advances beyond that bootstrap.
-	if _, err = replicatedstate.BuildSnapshotBase(manifest, plan.StaticBootstrap); err != nil {
+	var snapshotBase *pb.Snapshot
+	if snapshotBase, err = replicatedstate.BuildSnapshotBase(manifest, plan.StaticBootstrap); err != nil {
 		return raftmember.RuntimeIdentity{}, errors.Join(ErrLearnerInstall, err)
 	}
 	cursor, err := plan.Cursor.Load()
@@ -216,6 +235,20 @@ func InstallPublishedLearner(plan LearnerInstallPlan) (raftmember.RuntimeIdentit
 	if err = learnerInstallFault(learnerInstallAfterActivation); err != nil {
 		return raftmember.RuntimeIdentity{}, err
 	}
+	if plan.NodeInstall != nil {
+		identity, installErr := plan.NodeInstall(ctx, plan.Descriptor, manifest, snapshotBase,
+			plan.Database, activation.Apply)
+		if installErr != nil {
+			return raftmember.RuntimeIdentity{}, errors.Join(installErr, plan.Settlement.settleLocked())
+		}
+		if !runtimeMatchesDescriptor(identity, plan.Descriptor) {
+			return raftmember.RuntimeIdentity{}, errors.Join(ErrLearnerInstall, plan.Settlement.settleLocked())
+		}
+		// NodeInstall owns the SQL/apply pair after a successful adoption and
+		// has already published it into the shared execution owner.
+		plan.Settlement.apply, plan.Settlement.database = nil, nil
+		return identity, nil
+	}
 	wal, err := raftmember.OpenOrCreateStagedChildWAL(
 		plan.WALPath, plan.WALIdentity, plan.WALKey,
 		plan.Descriptor.Group.TopologyRecoveryEpoch, plan.Authority,
@@ -262,9 +295,9 @@ func validateLearnerInstallPlan(plan LearnerInstallPlan) error {
 	b := plan.SQLIdentity.Binding
 	w := plan.WALIdentity
 	conf := plan.ExpectedConfState
-	if plan.Repository == nil || plan.Cursor == nil || plan.Database == nil || plan.Host == nil ||
+	if plan.Repository == nil || plan.Cursor == nil || plan.Database == nil ||
 		plan.Settlement == nil ||
-		!d.Valid() || plan.WALPath == "" || plan.StaticBootstrap == nil || conf == nil ||
+		!d.Valid() || plan.StaticBootstrap == nil || conf == nil ||
 		d.Group.ClusterID != b.ClusterID || d.Group.ClusterIncarnation != b.ClusterIncarnation ||
 		d.Group.TopologyRecoveryEpoch != b.TopologyRecoveryEpoch ||
 		d.Group.ShardIncarnation != b.ShardIncarnation || d.Group.GroupID != b.GroupID ||
@@ -273,11 +306,16 @@ func validateLearnerInstallPlan(plan LearnerInstallPlan) error {
 		!exactLearnerConfState(conf, d.SourceMember, d.TargetMember) {
 		return ErrLearnerInstall
 	}
-	if w.ClusterID != b.ClusterID || w.ClusterIncarnation != b.ClusterIncarnation ||
-		w.Distribution != b.Distribution || w.Shard != b.Shard ||
-		w.AllocationGeneration != b.AllocationGeneration ||
-		w.ShardIncarnation != b.ShardIncarnation || w.GroupID != b.GroupID ||
-		w.MemberID != b.MemberID || w.StoreID != b.StoreID {
+	if plan.NodeInstall == nil {
+		if plan.Host == nil || plan.WALPath == "" ||
+			w.ClusterID != b.ClusterID || w.ClusterIncarnation != b.ClusterIncarnation ||
+			w.Distribution != b.Distribution || w.Shard != b.Shard ||
+			w.AllocationGeneration != b.AllocationGeneration ||
+			w.ShardIncarnation != b.ShardIncarnation || w.GroupID != b.GroupID ||
+			w.MemberID != b.MemberID || w.StoreID != b.StoreID {
+			return ErrLearnerInstall
+		}
+	} else if plan.Host != nil {
 		return ErrLearnerInstall
 	}
 	meta := plan.StaticBootstrap.GetMetadata()

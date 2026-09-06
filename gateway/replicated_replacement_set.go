@@ -330,7 +330,7 @@ func (authority *ReplicatedCatalogAuthority) PublishReplicaReplacementSet(ctx co
 	if result.Completion.ResultCode != replicatedstate.ResultApplied {
 		return ErrReplicatedCatalog
 	}
-	if err := authority.observePublishedCatalog(certified); err != nil {
+	if err := authority.observePublishedCatalog(ctx, certified); err != nil {
 		return err
 	}
 	return authority.holder.publishReplicaReplacementSetAfter(expectedGeneration, certified, ordered, postRemove)

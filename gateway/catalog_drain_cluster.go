@@ -227,9 +227,54 @@ type ClusterCatalogDrainCollector interface {
 // is monotonic and acknowledgements are idempotent, so coordinator crashes do
 // not weaken the fence or require a second local journal.
 type ClusterCatalogDrainCoordinator struct {
+	mu        sync.RWMutex
 	trust     rafttransport.TrustDomain
 	members   []ClusterCatalogDrainMember
 	collector ClusterCatalogDrainCollector
+}
+
+// Members returns the current future-fence roster. A returned slice is a
+// detached cut; certificates already in flight retain the immutable roster
+// captured by their own ClusterCatalogDrainFence.
+func (coordinator *ClusterCatalogDrainCoordinator) Members() []ClusterCatalogDrainMember {
+	if coordinator == nil {
+		return nil
+	}
+	coordinator.mu.RLock()
+	defer coordinator.mu.RUnlock()
+	return slices.Clone(coordinator.members)
+}
+
+// UpdateMembers installs a complete authenticated gateway roster for future
+// drain fences. It never mutates an existing fence or removes a participant
+// from an outstanding obligation. The caller must retain historical endpoint
+// addresses in its member-aware opener until those fences settle.
+func (coordinator *ClusterCatalogDrainCoordinator) UpdateMembers(
+	members []ClusterCatalogDrainMember,
+) error {
+	if coordinator == nil {
+		return ErrClusterCatalogDrainFence
+	}
+	// An empty current roster is a valid directory state. It means no new
+	// cluster drain fence can be certified, while already-created fences retain
+	// their immutable member set and continue to settle through historical
+	// endpoints.
+	if len(members) == 0 {
+		coordinator.mu.Lock()
+		coordinator.members = nil
+		coordinator.mu.Unlock()
+		return nil
+	}
+	validation, err := NewClusterCatalogDrainFence(
+		[sha256.Size]byte{1}, 1, [sha256.Size]byte{1}, coordinator.trust, members,
+	)
+	if err != nil {
+		return err
+	}
+	coordinator.mu.Lock()
+	coordinator.members = slices.Clone(validation.members)
+	coordinator.mu.Unlock()
+	return nil
 }
 
 func NewClusterCatalogDrainCoordinator(
@@ -258,9 +303,12 @@ func (coordinator *ClusterCatalogDrainCoordinator) CertifyClusterCatalogDrain(
 	if coordinator == nil || coordinator.collector == nil || ctx == nil || !request.Valid() {
 		return ClusterCatalogDrainCertificate{}, ErrClusterCatalogDrainFence
 	}
+	coordinator.mu.RLock()
+	members := slices.Clone(coordinator.members)
+	coordinator.mu.RUnlock()
 	fence, err := NewClusterCatalogDrainFence(
 		request.fenceOperation(), request.Generation, request.CatalogDigest,
-		coordinator.trust, coordinator.members,
+		coordinator.trust, members,
 	)
 	if err != nil {
 		return ClusterCatalogDrainCertificate{}, err

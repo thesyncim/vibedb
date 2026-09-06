@@ -413,7 +413,7 @@ func newRestoredRF3ProcessFixture(t *testing.T) ([2]*rf3FaultFixture, gateway.Re
 				GlobalIndexes:       restoreRF3GlobalRelations(schemas[ordinal]),
 				WAL:                 prepareRF3WAL{"rf3-command-key", keyPath, "restore-process-wrapped-key", restoreRF3TargetWALBytes, raftstore.DefaultMaxRecordBytes, 4096, 16384, raftstore.DefaultMaxLiveBytes},
 				Listeners:           rf3ManifestListeners{Peer: fixture.peerAddresses[member], Native: fixture.nativeAddresses[member], Snapshot: fixture.snapshotAddresses[member], Control: fixture.controlAddresses[member]},
-				TLS:                 rf3ManifestTLS{Certificate: fixture.credentials[member].Certificate, Key: fixture.credentials[member].Key, Roots: roots, IdentityOID: rf3testfixture.ProcessIdentityOID},
+				TLS:                 rf3ManifestTLS{PeerKeys: rf3CommandPeerKeys(fixture.credentials[member]), Certificate: fixture.credentials[member].Certificate, Key: fixture.credentials[member].Key, Roots: roots, IdentityOID: rf3testfixture.ProcessIdentityOID},
 				AuthorizationPolicy: policyPath, SplitControl: prepareRF3SplitControl{MaxRecords: 4096, MaxFileBytes: 64 << 20, MaxChildOperations: 8, StageCheckpointBytes: 32 << 20}}
 			for index, node := range fixture.nodes {
 				input.Members = append(input.Members, prepareRF3Member{MemberID: uint64(index + 1), NodeID: idString(node[:]), PeerAddress: fixture.peerAddresses[index]})

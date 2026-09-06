@@ -308,7 +308,8 @@ func (m *Machine) PointReadBatchInto(
 		direct := cap(dst)-len(dst) >= maximum
 		readDst := dst
 		if !direct {
-			scratch = slices.Grow(scratch[:0], maximum)
+			// AppendRaw grows to the actual document size. The schema maximum
+			// is an admission bound, not a scratch allocation requirement.
 			readDst = scratch[:0]
 		}
 		value, found, readErr := snapshot.AppendRaw(readDst, key)
@@ -319,8 +320,11 @@ func (m *Machine) PointReadBatchInto(
 		if direct {
 			valueBytes -= start
 			dst = value
-		} else if valueBytes <= maxResultBytes-len(dst) {
-			dst = append(dst, value...)
+		} else {
+			scratch = value[:0]
+			if valueBytes <= maxResultBytes-len(dst) {
+				dst = append(dst, value...)
+			}
 		}
 		if valueBytes > maxResultBytes-start || len(dst) > maxResultBytes ||
 			len(dst)-start > replication.MaxMutationValueBytes {

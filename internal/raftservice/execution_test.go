@@ -142,6 +142,10 @@ func TestAuthenticatedExecutionPeerTwoGroupsProgressWithTransportPerPeer(t *test
 		}
 		addresses[member] = listeners[member].Addr().String()
 	}
+	for member := range nodes {
+		registries[member] = pinnedPeerTestRegistry(t, nodes[member], members, rafttransport.Limits{MaxGroups: 2, MaxMembers: len(members)}, profiles)
+	}
+
 	deadline := func() time.Time { return time.Now().Add(5 * time.Second) }
 	peers := make([]*AuthenticatedExecutionPeerRuntime, voters)
 	owners := make([]*ExecutionOwners, voters)
@@ -321,10 +325,9 @@ func TestExecutionOwnersInstallAndRemoveDynamicGroupAtomically(t *testing.T) {
 		t.Fatal(err)
 	}
 	var installedGeneration *ownerGeneration
-	if err = transportRegistry.InstallGroup(
-		executionTestRoster(dynamicIdentity.Group, local),
-		func(publish func()) error {
-			return owners.installGroup(dynamicGroup, func() {
+	if err = owners.installGroup(dynamicGroup, func(install func(func()) error) error {
+		return transportRegistry.InstallGroup(executionTestRoster(dynamicIdentity.Group, local), func(publish func()) error {
+			return install(func() {
 				installedGeneration = owners.owners[lane].members[dynamicIdentity.Group].generation
 				if _, routeErr := owners.owner(dynamicIdentity.Group); !errors.Is(routeErr, ErrExecutionGroup) {
 					t.Fatalf("owner visible before atomic transport commit: %v", routeErr)
@@ -337,8 +340,8 @@ func TestExecutionOwnersInstallAndRemoveDynamicGroupAtomically(t *testing.T) {
 					t.Fatalf("owner gate opened before commit returned: %v", routeErr)
 				}
 			})
-		},
-	); err != nil {
+		})
+	}); err != nil {
 		t.Fatalf("install dynamic group: %v", err)
 	}
 	if installedGeneration == nil || !installedGeneration.acquire() {
@@ -359,8 +362,8 @@ func TestExecutionOwnersInstallAndRemoveDynamicGroupAtomically(t *testing.T) {
 
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		err = transportRegistry.RemoveGroup(dynamicIdentity.Group, func(withdraw func()) error {
-			return owners.removeGroup(dynamicIdentity, withdraw)
+		err = owners.removeGroup(dynamicIdentity, func(remove func(func()) error) error {
+			return transportRegistry.RemoveGroup(dynamicIdentity.Group, remove)
 		})
 		if err == nil || time.Now().After(deadline) {
 			break

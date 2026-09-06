@@ -15,6 +15,12 @@ func (runtime *Runtime) runServe() {
 	// Every exit, including partial optional-service startup, cancels and joins
 	// all users before publishing drain completion or releasing their transport.
 	defer runtime.finishDrain()
+	// A durable NodeDraining cut may have been restored before Serve starts.
+	// Close only the public listener now; optional controls and their contexts
+	// remain live for the final decommission acknowledgement.
+	if runtime.frontend != nil && runtime.frontend.isDraining() {
+		runtime.BeginFrontendDrain()
+	}
 	logf := runtime.config.Logf
 	if logf == nil {
 		logf = func(string, ...any) {}
@@ -51,13 +57,16 @@ func (runtime *Runtime) runServe() {
 			defer close(writerDone)
 			writer.Run(runtime.ctx)
 		}()
-		pg, err := startGatewayPostgreSQL(runtime.ctx, runtime.config.PGListenAddress,
-			runtime.exec, runtime.config.InternalAuthority, writer.Write, logf, runtime.pgDDL)
+		pg, err := startGatewayPostgreSQLWithFrontend(runtime.ctx, runtime.config.PGListenAddress,
+			runtime.exec, runtime.config.InternalAuthority, writer.Write, logf, runtime.frontend, runtime.pgDDL)
 		if err != nil {
 			runtime.setServeError(err)
 			return
 		}
 		runtime.pg = pg
+		if runtime.frontend != nil {
+			runtime.frontend.bindPG(pg)
+		}
 	}
 
 	if runtime.ctx.Err() != nil {
@@ -67,12 +76,13 @@ func (runtime *Runtime) runServe() {
 	logf("vibedb-gateway serving catalog generation %d on %s",
 		runtime.holder.Current().Generation(), runtime.listener.Addr())
 	var err error
+	frontendListener := &frontendAdmissionListener{Listener: runtime.listener, frontend: runtime.frontend}
 	if runtime.clientTLS != nil {
-		err = serveAuthenticatedGatewayDurableData(runtime.servingContext, runtime.listener,
+		err = serveAuthenticatedGatewayDurableData(runtime.servingContext, frontendListener,
 			runtime.exec, runtime.data, runtime.durable, runtime.clientTLS,
 			gatewayClientTLSLimits(runtime.config), logf)
 	} else {
-		err = serveGatewayDurableData(runtime.servingContext, runtime.listener,
+		err = serveGatewayDurableData(runtime.servingContext, frontendListener,
 			runtime.exec, runtime.data, runtime.durable, logf)
 	}
 	runtime.setServeError(nonCanceledError(err, context.Cause(runtime.ctx)))
@@ -122,7 +132,7 @@ func (runtime *Runtime) waitOptionalServices() {
 	}
 	// PostgreSQL sessions can retain reply leases and native write outboxes.
 	// Join sessions before closing writers, then stop every controller/observer
-	// before a binding-changing catalog session is retired.
+	// before a live catalog session rollover or terminal seed handoff is retired.
 	if runtime.pg != nil {
 		runtime.setDrainError(runtime.pg.Close())
 	}
@@ -138,6 +148,9 @@ func (runtime *Runtime) waitOptionalServices() {
 	if runtime.replicaControllersDone != nil {
 		<-runtime.replicaControllersDone
 	}
+	if runtime.scalingDone != nil {
+		<-runtime.scalingDone
+	}
 	if runtime.splitControllerDone != nil {
 		<-runtime.splitControllerDone
 	}
@@ -146,6 +159,9 @@ func (runtime *Runtime) waitOptionalServices() {
 	}
 	if runtime.metricsDone != nil {
 		<-runtime.metricsDone
+	}
+	if runtime.controlDirectoryDone != nil {
+		<-runtime.controlDirectoryDone
 	}
 	if runtime.routeSeedDone != nil {
 		<-runtime.routeSeedDone

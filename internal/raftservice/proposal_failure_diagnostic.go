@@ -37,6 +37,7 @@ var proposalFailureCauses = [...]struct {
 	{raftstore.ErrPersistenceDefinite, "wal-persistence-refused"},
 	{replicatedstate.ErrAdmissionBound, "state-admission-bound"},
 	{replicatedstate.ErrRetryRetired, "retry-retired"},
+	{replicatedstate.ErrStaleCommand, "stale-command"},
 }
 
 func (reason ProposalFailureReason) String() string {

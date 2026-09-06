@@ -141,7 +141,11 @@ func decodeGroupDescriptor(data []byte) (GroupDescriptor, error) {
 }
 
 func canonicalInitialDescriptors(bootstraps []NodeBootstrap) ([]NodeBootstrap, []GroupDescriptor, []uint32, error) {
-	if len(bootstraps) == 0 || uint64(len(bootstraps)) > uint64(math.MaxUint32) {
+	// An empty node log is a valid capacity reservation.  It contains only the
+	// descriptor group until the controller commits the first group enrollment;
+	// no Raft or SQL authority is implied by the reservation.  Dynamic nodes
+	// use this form while they wait for an exact replicated enrollment intent.
+	if uint64(len(bootstraps)) > uint64(math.MaxUint32) {
 		return nil, nil, nil, ErrInvalid
 	}
 	boots := slices.Clone(bootstraps)

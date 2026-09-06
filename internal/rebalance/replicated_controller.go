@@ -73,7 +73,11 @@ type ReplicatedMoveExecution struct {
 	PublicationReplicaSet uint64
 	LeaderTerm            uint64
 	SnapshotBaseDigest    [32]byte
-	Proof                 [32]byte
+	// TransitionReceiptDigest is the predecessor receipt observed immediately
+	// before a receipt-aware publication. It is zero only for the first
+	// publication of an operation.
+	TransitionReceiptDigest [32]byte
+	Proof                   [32]byte
 }
 
 // OpenReplicatedMoveExecution verifies the already-journaled execution cut.
@@ -183,7 +187,7 @@ func ExecuteReplicatedMoveStep(
 		(record.State == gateway.ReplicatedOperationPlanned && record.Cursor[3] == replicaMoveCursorReady ||
 			record.State == gateway.ReplicatedOperationRunning && record.Cursor[3] == replicaMoveCursorExecuting) &&
 		sameReplicaMoveAction(record.Cursor, replicaMoveActionCursor(action, record.Cursor[3], plan, cut)) {
-		if record.CatalogGeneration != cut.Catalog.Generation() ||
+		if (!plan.transitionReady && record.CatalogGeneration != cut.Catalog.Generation()) ||
 			record.Cursor[4] != cut.Publication.ReplicaSetVersion ||
 			record.Cursor[5] > cut.Publication.Applied || record.Cursor[6] > cut.LeaderStatus.Term ||
 			record.Proof != replicaMoveActionProof(operation, record.IntentDigest, plan.baseDigest, record.Cursor) {
@@ -216,11 +220,17 @@ func ExecuteReplicatedMoveStep(
 		// Reconcile has authenticated its successor above. Verify the old
 		// witness before publishing the replacement; an executing action must
 		// retain its original external idempotency tuple instead.
+		// A partition can hide completion of AddLearner after its immutable
+		// intent was admitted. Reconcile has authenticated the exact learner
+		// roster; do not strand that already-applied transition at its old step.
+		learnerObserved := ActionKind(record.Cursor[0]) == ActionAddLearner &&
+			record.Cursor[1] == plan.TargetMember() && action.Kind == ActionCreateSnapshotBase &&
+			cut.Publication.ReplicaSetVersion > record.Cursor[4]
 		refreshPlanned := record.State == gateway.ReplicatedOperationPlanned &&
 			record.Cursor[3] == replicaMoveCursorReady &&
-			(sameReplicaMoveAction(record.Cursor, wanted) || passiveReplicaMoveAction(ActionKind(record.Cursor[0]))) &&
+			(sameReplicaMoveAction(record.Cursor, wanted) || passiveReplicaMoveAction(ActionKind(record.Cursor[0])) || learnerObserved) &&
 			record.CatalogGeneration == cut.Catalog.Generation() &&
-			record.Cursor[4] == cut.Publication.ReplicaSetVersion &&
+			(record.Cursor[4] == cut.Publication.ReplicaSetVersion || learnerObserved) &&
 			record.Cursor[5] <= cut.Publication.Applied && record.Cursor[6] <= cut.LeaderStatus.Term &&
 			record.Proof == replicaMoveActionProof(operation, record.IntentDigest, plan.baseDigest, record.Cursor)
 		if record.State != gateway.ReplicatedOperationRunning && !refreshPlanned {
@@ -445,6 +455,11 @@ func replicaMoveExecution(
 	}
 	if plan != nil && plan.baseBound {
 		execution.SnapshotBaseDigest = plan.baseDigest
+	}
+	if cut.TransitionReceiptFound {
+		if digest, err := cut.TransitionReceipt.ReceiptDigest(); err == nil {
+			execution.TransitionReceiptDigest = digest
+		}
 	}
 	return execution
 }

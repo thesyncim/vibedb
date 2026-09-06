@@ -208,3 +208,41 @@ func (n *Node) FinishPipelinedApply() error {
 	n.phase = PhaseIdle
 	return nil
 }
+
+// SendPipelinedSnapshotBaseProbe abandons an in-band snapshot send and probes
+// whether the peer already retains the immutable base. A fresh leader can lose
+// its progress knowledge even when the peer has that base after a restart.
+// Only an ordinary AppendEntries response can advance Match; this never reports
+// snapshot installation or sends the snapshot's data over ordinary transport.
+// A peer genuinely behind the base still requires certified out-of-band repair.
+func (n *Node) SendPipelinedSnapshotBaseProbe(message *pb.Message, send func(*pb.Message) error) error {
+	if n == nil || !n.async || send == nil {
+		return errors.New("raftmodel: invalid snapshot base probe")
+	}
+	if err := n.requirePhase("SendPipelinedSnapshotBaseProbe", PhaseIdle); err != nil {
+		return err
+	}
+	if message == nil || message.GetType() != pb.MsgSnap || message.GetFrom() != n.id || message.GetTo() == raft.None || message.GetTo() == n.id || raft.IsLocalMsgTarget(message.GetTo()) || message.GetTerm() == 0 || message.GetTerm() == math.MaxUint64 {
+		return errors.New("raftmodel: invalid snapshot base probe identity")
+	}
+	if err := validateSnapshotEnvelope(message.GetSnapshot()); err != nil {
+		return err
+	}
+	metadata := message.GetSnapshot().GetMetadata()
+	if metadata.GetTerm() > message.GetTerm() {
+		return errors.New("raftmodel: snapshot base term exceeds leader term")
+	}
+	index, logTerm := metadata.GetIndex(), metadata.GetTerm()
+	from, to, term := message.GetFrom(), message.GetTo(), message.GetTerm()
+	probe := &pb.Message{Type: pb.MsgApp.Enum(), From: &from, To: &to, Term: &term, Index: &index, LogTerm: &logTerm, Commit: &index}
+	if err := send(probe); err != nil {
+		return err
+	}
+	status := n.raw.BasicStatus()
+	if status.RaftState == raft.StateLeader && status.GetTerm() == term {
+		// No snapshot was transferred. Clear its pause without asserting that
+		// the peer installed anything; its append response is the sole proof.
+		n.raw.ReportSnapshot(to, raft.SnapshotFailure)
+	}
+	return nil
+}

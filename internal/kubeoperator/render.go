@@ -280,6 +280,7 @@ spec:
             - -catalog=/var/lib/vibedb/catalog-genesis.vibejson
             - -catalog-route-seed=/var/lib/vibedb/catalog-route-seed.vibejson
             - -catalog-bootstrap-if-missing
+            - -initial-node-directory=/etc/vibedb/initial-node-directory.vibejson
             - -catalog-relation=1
             - -catalog-session-journal=/var/lib/vibedb/catalog-session
             - -catalog-client-id=21000000000000000000000000000000

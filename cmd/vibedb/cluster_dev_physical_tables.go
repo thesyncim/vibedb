@@ -530,7 +530,11 @@ func reconcileDevPhysicalNodeGroup(member devClusterMember, appendMissing bool) 
 	if err != nil {
 		return err
 	}
-	order := []string{"node_log", "listeners", "tls", "authorization_policy", "replica_control", "split_control"}
+	order := []string{"node_log"}
+	if len(source["node_incarnation"]) != 0 {
+		order = append(order, "node_incarnation")
+	}
+	order = append(order, "listeners", "tls", "authorization_policy", "replica_control", "split_control")
 	if len(source["read_authority"]) != 0 {
 		order = append(order, "read_authority")
 	}

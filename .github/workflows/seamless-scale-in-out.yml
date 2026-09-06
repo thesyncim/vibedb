@@ -1,0 +1,140 @@
+name: seamless physical-node scale qualification
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/seamless-scale-in-out.yml'
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - 'cmd/vibedb/**'
+      - 'cmd/vibedb-shard/**'
+      - 'gateway/**'
+      - 'internal/clustercontrol/**'
+      - 'internal/gatewayruntime/**'
+      - 'internal/nodecontrol/**'
+      - 'internal/raftstore/**'
+      - 'internal/rafttransport/**'
+      - 'internal/rf3testfixture/**'
+      - 'internal/servicetls/**'
+      - 'internal/replication/**'
+      - 'docs/benchmarks/seamless-scale-in-out-method.md'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/seamless-scale-in-out.yml'
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - 'cmd/vibedb/**'
+      - 'cmd/vibedb-shard/**'
+      - 'gateway/**'
+      - 'internal/clustercontrol/**'
+      - 'internal/gatewayruntime/**'
+      - 'internal/nodecontrol/**'
+      - 'internal/raftstore/**'
+      - 'internal/rafttransport/**'
+      - 'internal/rf3testfixture/**'
+      - 'internal/servicetls/**'
+      - 'internal/replication/**'
+      - 'docs/benchmarks/seamless-scale-in-out-method.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GOEXPERIMENT: simd
+
+concurrency:
+  group: seamless-scale-in-out-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  qualify:
+    name: Ubuntu seamless 3-to-4-to-3 scale qualification
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.27'
+      - name: Prepare strict scale evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="${RUNNER_TEMP}/seamless-scale-in-out"
+          test_root="${RUNNER_TEMP}/seamless-scale-in-out-tmp"
+          mkdir -p "${evidence}" "${test_root}"
+          git rev-parse HEAD > "${evidence}/revision.txt"
+          go version > "${evidence}/go-version.txt"
+          go env GOOS GOARCH GOVERSION GOTOOLCHAIN > "${evidence}/go-env.txt"
+          uname -a > "${evidence}/uname.txt"
+          df -T -B1 "${test_root}" > "${evidence}/filesystem.txt"
+          stat -f -c 'filesystem_type=%T block_size=%S' "${test_root}" >> "${evidence}/filesystem.txt"
+          test_name='TestSeamlessScaleInOutProcessQualification'
+          go test -list "^${test_name}$" ./internal/gatewayruntime > "${evidence}/test-list.txt"
+          grep -Fqx "${test_name}" "${evidence}/test-list.txt"
+          printf 'TMPDIR=%s VIBEDB_SEAMLESS_SCALE_E2E=1 VIBEDB_SEAMLESS_SCALE_EVIDENCE=%s go test -json -count=1 -timeout=35m -run %s ./internal/gatewayruntime\n' \
+            "${test_root}" "${evidence}/qualification.tsv" "^${test_name}$" > "${evidence}/command.txt"
+      - name: Run strict seamless scale qualification
+        shell: bash
+        env:
+          TMPDIR: ${{ runner.temp }}/seamless-scale-in-out-tmp
+          VIBEDB_SEAMLESS_SCALE_E2E: '1'
+          VIBEDB_SEAMLESS_SCALE_EVIDENCE: ${{ runner.temp }}/seamless-scale-in-out/qualification.tsv
+        run: |
+          set -euo pipefail
+          go test -json -count=1 -timeout=35m \
+            -run '^TestSeamlessScaleInOutProcessQualification$' \
+            ./internal/gatewayruntime \
+            | tee "${RUNNER_TEMP}/seamless-scale-in-out/go-test.jsonl"
+      - name: Validate complete unskipped strict evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="${RUNNER_TEMP}/seamless-scale-in-out"
+          result="${evidence}/go-test.jsonl"
+          test_name='TestSeamlessScaleInOutProcessQualification'
+          test -s "${result}"
+          test "$(stat -c %s "${result}")" -le 67108864
+          jq -c . "${result}" >/dev/null
+          if jq -e 'select(.Action == "fail")' "${result}" >/dev/null; then
+            echo "seamless scale qualification reported a failure" >&2
+            exit 1
+          fi
+          test "$(jq -r --arg test_name "${test_name}" \
+            'select(.Action == "pass" and .Test == $test_name) | .Test' "${result}" | wc -l)" -eq 1
+          if jq -e 'select(.Action == "skip")' "${result}" >/dev/null; then
+            echo "seamless scale qualification emitted a skip" >&2
+            exit 1
+          fi
+          qualification="${evidence}/qualification.tsv"
+          test -s "${qualification}"
+          test "$(stat -c %s "${qualification}")" -le 65536
+          grep -Fqx $'schema\tvibedb.seamless-scale-in-out\t1' "${qualification}"
+          grep -Fqx $'result\tpass' "${qualification}"
+          grep -Fqx $'phase\tterminal_post_stop_verified' "${qualification}"
+          for marker in empty_target_at_enrollment controller_restarted target_restarted duplicate_operation_stable post_restart_operation_recovered safe_to_stop node_stopped acknowledged_data_intact no_skipped_success survivor_session_stable retiring_session_blocked retiring_session_released; do
+            grep -Fqx "$(printf 'marker\t%s\t1' "${marker}")" "${qualification}"
+          done
+          for field in physical_before physical_peak physical_after application_groups_moved internal_groups_moved cycles baseline_windows during_windows after_windows retiring_references_after; do
+            grep -Eq "^topology[[:space:]]${field}[[:space:]][0-9]+$" "${qualification}"
+          done
+          test "$(awk -F '\t' '$1 == "topology" && $2 == "cycles" {print $3}' "${qualification}")" -ge 3
+          test "$(awk -F '\t' '$1 == "topology" && $2 == "baseline_windows" {print $3}' "${qualification}")" -ge 5
+          test "$(awk -F '\t' '$1 == "topology" && $2 == "during_windows" {print $3}' "${qualification}")" -ge 3
+          test "$(awk -F '\t' '$1 == "topology" && $2 == "after_windows" {print $3}' "${qualification}")" -ge 3
+          printf 'schema\tvibedb.seamless-scale-in-out-ci\t1\nresult\tpass\nrevision\t%s\nqualification\t%s\n' \
+            "$(cat "${evidence}/revision.txt")" "${qualification}" > "${evidence}/summary.tsv"
+          test "$(stat -c %s "${evidence}/summary.tsv")" -le 65536
+      - name: Upload seamless scale evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: seamless-scale-in-out-${{ github.sha }}
+          path: ${{ runner.temp }}/seamless-scale-in-out
+          if-no-files-found: error
+          retention-days: 30

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -218,6 +219,7 @@ type PeerTLSOptions struct {
 type PeerTLS struct {
 	identityOID         asn1.ObjectIdentifier
 	identity            PeerIdentity
+	localKeyDigest      [sha256.Size]byte
 	certificate         tls.Certificate
 	roots               *x509.CertPool
 	now                 func() time.Time
@@ -264,6 +266,23 @@ func (peerTLS *PeerTLS) LocalIdentity() PeerIdentity {
 		return PeerIdentity{}
 	}
 	return peerTLS.identity
+}
+
+// LocalPeerKeyDigest is the SHA-256 digest of the local leaf's
+// SubjectPublicKeyInfo.  It is the credential binding published in a
+// PhysicalPeer directory record; the certificate identity extension alone is
+// deliberately insufficient to identify a physical incarnation.
+func (peerTLS *PeerTLS) LocalPeerKeyDigest() [sha256.Size]byte {
+	if peerTLS == nil {
+		return [sha256.Size]byte{}
+	}
+	return peerTLS.localKeyDigest
+}
+
+// LocalServiceKeyDigest is an explicit service-directory spelling for
+// LocalPeerKeyDigest.  Both names return the same immutable leaf binding.
+func (peerTLS *PeerTLS) LocalServiceKeyDigest() [sha256.Size]byte {
+	return peerTLS.LocalPeerKeyDigest()
 }
 
 // ValidatePeerProfile proves that candidate is a credential this profile
@@ -354,7 +373,8 @@ func NewPeerTLS(options PeerTLSOptions) (*PeerTLS, error) {
 	peerTLS := &PeerTLS{
 		identityOID: slices.Clone(options.IdentityOID),
 		identity:    options.Identity, certificate: certificate,
-		roots: options.Roots.Clone(), now: options.Now,
+		localKeyDigest: sha256.Sum256(chain[0].RawSubjectPublicKeyInfo),
+		roots:          options.Roots.Clone(), now: options.Now,
 		build: buildgate.CurrentProfile(),
 	}
 	for _, usage := range []x509.ExtKeyUsage{
@@ -623,12 +643,38 @@ type DeadlineFunc func() time.Time
 type PeerConnection interface {
 	net.Conn
 	PeerIdentity() PeerIdentity
+	// PeerKeyDigest is the verified leaf SPKI digest from this authenticated
+	// stream.  Implementations must return the same immutable value for the
+	// connection lifetime; callers should still recheck it against their
+	// current directory before every pooled request.
+	PeerKeyDigest() [sha256.Size]byte
 	TrafficClass() TrafficClass
+}
+
+// PeerBinding is the complete certificate binding carried by an authenticated
+// stream. Identity and key digest are separate fields so a new certificate
+// incarnation cannot silently reuse a logical NodeID.
+type PeerBinding struct {
+	Identity         PeerIdentity
+	ServiceKeyDigest [sha256.Size]byte
+}
+
+// Binding returns the immutable binding presented by this connection. It is a
+// small adapter for service gates that need to carry both values together.
+func Binding(connection PeerConnection) PeerBinding {
+	if connection == nil {
+		return PeerBinding{}
+	}
+	return PeerBinding{
+		Identity:         connection.PeerIdentity(),
+		ServiceKeyDigest: connection.PeerKeyDigest(),
+	}
 }
 
 type authenticatedPeerConnection struct {
 	net.Conn
 	identity     PeerIdentity
+	keyDigest    [sha256.Size]byte
 	class        TrafficClass
 	capabilities buildgate.CapabilitySet
 }
@@ -638,6 +684,13 @@ func (connection *authenticatedPeerConnection) PeerIdentity() PeerIdentity {
 		return PeerIdentity{}
 	}
 	return connection.identity
+}
+
+func (connection *authenticatedPeerConnection) PeerKeyDigest() [sha256.Size]byte {
+	if connection == nil {
+		return [sha256.Size]byte{}
+	}
+	return connection.keyDigest
 }
 
 func (connection *authenticatedPeerConnection) TrafficClass() TrafficClass {
@@ -761,6 +814,11 @@ func (peerTLS *PeerTLS) handshake(
 		_ = connection.Close()
 		return nil, errors.Join(ErrPeerAuthentication, err)
 	}
+	keyDigest := sha256.Sum256(state.PeerCertificates[0].RawSubjectPublicKeyInfo)
+	if keyDigest == ([sha256.Size]byte{}) {
+		_ = connection.Close()
+		return nil, ErrPeerAuthentication
+	}
 	capabilities := buildgate.CapabilitySet{}
 	if internalBuildPrefaceRequired(class) {
 		capabilities, err = exchangeBuildPreface(connection, role, peerTLS.build)
@@ -774,7 +832,8 @@ func (peerTLS *PeerTLS) handshake(
 		return nil, errors.Join(ErrPeerAuthentication, err)
 	}
 	return &authenticatedPeerConnection{
-		Conn: connection, identity: identity, class: class, capabilities: capabilities,
+		Conn: connection, identity: identity, keyDigest: keyDigest,
+		class: class, capabilities: capabilities,
 	}, nil
 }
 

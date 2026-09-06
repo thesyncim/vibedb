@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"github.com/thesyncim/vibejson"
 	"net"
 	"os"
 	"os/exec"
@@ -1398,7 +1399,7 @@ func rf3CommandManifestDocument(
 			*path = filepath.Join(dataRoot, *path)
 		}
 	}
-	return []byte(fmt.Sprintf(`{"wal":{"path":%q,"key_id":"rf3-command-key","key_material_path":%q,"max_file_bytes":%d,"max_record_bytes":%d,"max_records":%d,"max_entries":%d,"max_live_bytes":%d},"sql":{"path":%q,"identity_path":%q,"apply_identity_path":%q},"route":{"cluster_id":"%x","cluster_incarnation":"%x","topology_recovery_epoch":%d,"shard_incarnation":"%x","group_id":"%x","distribution":%q,"shard":%q,"allocation_generation":%d,"member_id":%d,"store_id":"%x","member_root":%q,"split_runtime_root":%q,"membership_grant_path":%q},"listeners":{"peer":%q,"native":%q,"snapshot":%q,"control":%q},"tls":{"certificate":%q,"key":%q,"roots":%q,"identity_oid":"1.3.6.1.4.1.32473.1.1"},"authorization_policy":%q,"replica_control":{"action_journal_path":%q,"max_action_records":4096,"source_data_root":%q,"source_journal_path":%q,"max_source_records":4096,"source_repository_path":%q,"max_source_artifacts":8,"max_source_concurrent":2,"max_source_artifact_bytes":1073741824,"max_source_disk_bytes":4294967296,"source_chunk_bytes":1048576},"split_control":{"journal_path":%q,"max_records":4096,"max_file_bytes":67108864,"grants":[{"node_id":"%x","actions":65535},{"node_id":"%x","actions":65535},{"node_id":"%x","actions":65535}],"child_registry":{"root":%q,"max_operations":8,"stage_checkpoint_bytes":33554432,"table":"controlplane","create_table":"CREATE TABLE controlplane (PRIMARY KEY (id))","wal":{"key_id":"rf3-command-key","key_material_path":%q,"max_file_bytes":%d,"max_record_bytes":%d,"max_records":%d,"max_entries":%d,"max_live_bytes":%d},"apply":{"max_sessions":32,"retry_window":8,"max_collections":16,"max_documents":1024,"max_bytes":402653184,"request_ledger_capacity_bytes":0,"request_ledger_cleanup_reserve_bytes":0,"request_ledger_range_start":"","request_ledger_range_end":"","request_ledger_range_identity":"","format":0,"shard_key":"/id","tuple_version":1,"mapper_version":1},"static_bootstrap_path":%q,"replica_set_version":1,"members":[{"member_id":1,"node_id":"%x","peer_address":%q},{"member_id":2,"node_id":"%x","peer_address":%q},{"member_id":3,"node_id":"%x","peer_address":%q}]}},"members":[{"member_id":1,"node_id":"%x","peer_address":%q},{"member_id":2,"node_id":"%x","peer_address":%q},{"member_id":3,"node_id":"%x","peer_address":%q}]}`,
+	return []byte(fmt.Sprintf(`{"wal":{"path":%q,"key_id":"rf3-command-key","key_material_path":%q,"max_file_bytes":%d,"max_record_bytes":%d,"max_records":%d,"max_entries":%d,"max_live_bytes":%d},"sql":{"path":%q,"identity_path":%q,"apply_identity_path":%q},"route":{"cluster_id":"%x","cluster_incarnation":"%x","topology_recovery_epoch":%d,"shard_incarnation":"%x","group_id":"%x","distribution":%q,"shard":%q,"allocation_generation":%d,"member_id":%d,"store_id":"%x","member_root":%q,"split_runtime_root":%q,"membership_grant_path":%q},"listeners":{"peer":%q,"native":%q,"snapshot":%q,"control":%q},"tls":{"certificate":%q,"key":%q,"roots":%q,"identity_oid":"1.3.6.1.4.1.32473.1.1"%s},"authorization_policy":%q,"replica_control":{"action_journal_path":%q,"max_action_records":4096,"source_data_root":%q,"source_journal_path":%q,"max_source_records":4096,"source_repository_path":%q,"max_source_artifacts":8,"max_source_concurrent":2,"max_source_artifact_bytes":1073741824,"max_source_disk_bytes":4294967296,"source_chunk_bytes":1048576,"migration_budget":{"max_active":2,"cpu":{"bytes_per_second":67108864,"burst_bytes":4194304},"disk_read":{"bytes_per_second":67108864,"burst_bytes":4194304},"disk_write":{"bytes_per_second":67108864,"burst_bytes":4194304},"network_send":{"bytes_per_second":33554432,"burst_bytes":2097152},"network_receive":{"bytes_per_second":33554432,"burst_bytes":2097152}}},"split_control":{"journal_path":%q,"max_records":4096,"max_file_bytes":67108864,"grants":[{"node_id":"%x","actions":65535},{"node_id":"%x","actions":65535},{"node_id":"%x","actions":65535}],"child_registry":{"root":%q,"max_operations":8,"stage_checkpoint_bytes":33554432,"table":"controlplane","create_table":"CREATE TABLE controlplane (PRIMARY KEY (id))","wal":{"key_id":"rf3-command-key","key_material_path":%q,"max_file_bytes":%d,"max_record_bytes":%d,"max_records":%d,"max_entries":%d,"max_live_bytes":%d},"apply":{"max_sessions":32,"retry_window":8,"max_collections":16,"max_documents":1024,"max_bytes":402653184,"request_ledger_capacity_bytes":0,"request_ledger_cleanup_reserve_bytes":0,"request_ledger_range_start":"","request_ledger_range_end":"","request_ledger_range_identity":"","format":0,"shard_key":"/id","tuple_version":1,"mapper_version":1},"static_bootstrap_path":%q,"replica_set_version":1,"members":[{"member_id":1,"node_id":"%x","peer_address":%q},{"member_id":2,"node_id":"%x","peer_address":%q},{"member_id":3,"node_id":"%x","peer_address":%q}]}},"members":[{"member_id":1,"node_id":"%x","peer_address":%q},{"member_id":2,"node_id":"%x","peer_address":%q},{"member_id":3,"node_id":"%x","peer_address":%q}]}`,
 		walPath, keyPath,
 		options.MaxFileBytes, options.MaxRecordBytes, options.MaxRecords,
 		options.MaxEntries, options.MaxLiveBytes,
@@ -1408,7 +1409,7 @@ func rf3CommandManifestDocument(
 		identity.AllocationGeneration, identity.MemberID, identity.StoreID,
 		dataRoot, filepath.Join(dataRoot, "split-runtime"), filepath.Join(dataRoot, "membership-grant"),
 		peerAddress, nativeAddress, snapshotAddress, controlAddress,
-		credential.Certificate, credential.Key, roots, policyPath,
+		credential.Certificate, credential.Key, roots, rf3CommandPeerKeysJSON(credential), policyPath,
 		filepath.Join(dataRoot, "replica-actions"), dataRoot,
 		filepath.Join(dataRoot, "source-exports"), filepath.Join(dataRoot, "source-artifacts"),
 		filepath.Join(dataRoot, "split-control.journal"), nodes[0], nodes[1], nodes[2],
@@ -1457,3 +1458,15 @@ func rf3CommandEnrollTarget(
 		node, store, incarnation, peer, native, snapshot, control,
 	)
 }
+
+func rf3CommandPeerKeysJSON(credential rf3testfixture.Credential) []byte {
+	if len(credential.PeerKeys) == 0 {
+		return nil
+	}
+	encoded, err := vibejson.Marshal(&credential.PeerKeys)
+	if err != nil {
+		panic(err)
+	}
+	return append([]byte(`,"peer_keys":`), encoded...)
+}
+

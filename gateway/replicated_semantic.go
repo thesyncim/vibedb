@@ -77,6 +77,20 @@ func NewReplicatedNodeClient(
 	}, nil
 }
 
+// BindServiceDirectoryGate installs the same committed service-identity
+// fence used by authenticated native receives on the embedded local server.
+// The client does not copy the cut: every local call resolves the server's
+// atomic gate at dispatch time, while remote calls are checked by their
+// destination receiver.
+func (client *ReplicatedNodeClient) BindServiceDirectoryGate(
+	directory *serviceauthz.ServiceDirectoryGate,
+) error {
+	if client == nil || client.localServer == nil || directory == nil {
+		return ErrReplicatedRoute
+	}
+	return client.localServer.BindServiceDirectoryGate(directory)
+}
+
 // DoReplicated routes legacy native calls for compatibility. Query calls are
 // admitted before the server decodes their SQL frame at the compatibility
 // boundary; production QuerySQL calls DoReplicatedCall directly and never
@@ -91,6 +105,9 @@ func (client *ReplicatedNodeClient) DoReplicated(
 	}
 	client.legacyCalls.Add(1)
 	if endpoint.Node == client.localNode {
+		// The semantic local path attaches the envelope once in
+		// ReplicatedExecutor.doReplicatedCall. Keeping the source request
+		// unchanged here avoids a duplicate setter on retries.
 		call := &shardservice.ReplicatedCall{Request: *request}
 
 		reply, err := client.doReplicatedCall(ctx, endpoint, call)
@@ -110,8 +127,12 @@ func (client *ReplicatedNodeClient) DoReplicated(
 	if client.remote == nil {
 		return nil, ErrReplicatedDial
 	}
+	forwarded := *request
+	if err := attachFrontendContinuation(ctx, &forwarded); err != nil {
+		return nil, err
+	}
 	client.remoteCalls.Add(1)
-	return client.remote.DoReplicated(ctx, endpoint, request)
+	return client.remote.DoReplicated(ctx, endpoint, &forwarded)
 }
 
 // DoReplicatedCall sends a semantic call through the local dispatcher or the
@@ -132,9 +153,24 @@ func (client *ReplicatedNodeClient) DoReplicatedCall(
 }
 
 func (client *ReplicatedNodeClient) doReplicatedCall(ctx context.Context, endpoint ReplicatedEndpoint, call *shardservice.ReplicatedCall) (*shardservice.ReplicatedReply, error) {
+	forwarded := *call
+	forwarded.Request = call.Request
+	if call.SQL != nil {
+		inner := *call.SQL
+		forwarded.SQL = &inner
+	}
+	if authority, ok := serviceauthz.FromContext(ctx); ok {
+		forwarded.Request.Authority = authority
+		if forwarded.SQL != nil {
+			forwarded.SQL.Authority = authority
+		}
+	}
+	if err := attachFrontendContinuation(ctx, &forwarded.Request); err != nil {
+		return nil, err
+	}
 	if endpoint.Node == client.localNode {
 		client.localCalls.Add(1)
-		lease, err := client.localServer.DispatchReplicated(ctx, *call)
+		lease, err := client.localServer.DispatchReplicated(ctx, forwarded)
 		if err != nil {
 			return nil, err
 		}
@@ -158,12 +194,12 @@ func (client *ReplicatedNodeClient) doReplicatedCall(ctx context.Context, endpoi
 	client.remoteCalls.Add(1)
 	switch client.remote.(type) {
 	case *AuthenticatedReplicatedClient, TCPReplicatedClient:
-		return doRemoteReplicatedCallMeasured(ctx, client.remote, endpoint, call, client)
+		return doRemoteReplicatedCallMeasured(ctx, client.remote, endpoint, &forwarded, client)
 	}
 	if semantic, ok := client.remote.(ReplicatedCallRoundTripper); ok {
-		return semantic.DoReplicatedCall(ctx, endpoint, call)
+		return semantic.DoReplicatedCall(ctx, endpoint, &forwarded)
 	}
-	return doRemoteReplicatedCallMeasured(ctx, client.remote, endpoint, call, client)
+	return doRemoteReplicatedCallMeasured(ctx, client.remote, endpoint, &forwarded, client)
 }
 
 // DoReplicatedCall implements the semantic boundary for the simple TCP
@@ -283,6 +319,9 @@ func (executor *ReplicatedExecutor) doReplicatedCall(
 		if forwarded.SQL != nil {
 			forwarded.SQL.Authority = authority
 		}
+	}
+	if err := attachFrontendContinuation(attemptCtx, &forwarded.Request); err != nil {
+		return nil, err
 	}
 	var (
 		reply *shardservice.ReplicatedReply

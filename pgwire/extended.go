@@ -1,7 +1,6 @@
 package pgwire
 
 import (
-	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -140,9 +139,9 @@ func (s *session) finishExtendedBatch() error {
 		var err error
 		switch s.sql.State() {
 		case sqldriver.SessionFailedTransaction:
-			err = s.sql.Rollback(context.Background())
+			err = s.sql.Rollback(s.operationContext())
 		case sqldriver.SessionInTransaction:
-			err = s.sql.Commit(context.Background())
+			err = s.sql.Commit(s.operationContext())
 		}
 		if err != nil {
 			s.reportTransactionCompletionError(err)
@@ -390,7 +389,7 @@ func (s *session) handleBind() error {
 		old.resetForBind(m.portal, stmt)
 		p = old
 	} else {
-		p = &portal{name: m.portal, stmt: stmt}
+		p = &portal{session: s, name: m.portal, stmt: stmt}
 	}
 	p.retainedBytes = portalCharge(p, m, stmt)
 	if p.retainedBytes > maxPortalBytes-s.portalBytes {
@@ -770,7 +769,7 @@ func (s *session) beforeExtendedExecute(stmt *prepared) error {
 			withHint("send Sync after DDL before executing another catalog command")
 	}
 	if s.sql.State() == sqldriver.SessionIdle {
-		if err := s.sql.Begin(context.Background(), sqldriver.TxOptions{}); err != nil {
+		if err := s.sql.Begin(s.operationContext(), sqldriver.TxOptions{}); err != nil {
 			return asPGErrorIn(err, stmt.sql)
 		}
 		s.transactionIsolation = sqldriver.IsolationDefault

@@ -317,6 +317,15 @@ func devHotProcessTreeRSS(t testing.TB, root int) uint64 {
 	for _, candidate := range processes {
 		if _, found := descendants[candidate.pid]; found {
 			total += candidate.rss
+			if status, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", candidate.pid)); err == nil {
+				var memory []string
+				for _, line := range strings.Split(string(status), "\n") {
+					if strings.HasPrefix(line, "Rss") || strings.HasPrefix(line, "Name:") {
+						memory = append(memory, strings.Join(strings.Fields(line), " "))
+					}
+				}
+				t.Logf("split process memory pid=%d rss=%d %s", candidate.pid, candidate.rss, strings.Join(memory, "; "))
+			}
 		}
 	}
 	return total

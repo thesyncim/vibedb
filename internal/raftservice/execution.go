@@ -75,7 +75,7 @@ type ExecutionGroup struct {
 
 func NewExecutionOwners(options ExecutionOptions) (*ExecutionOwners, error) {
 	if options.Lanes == nil || options.Registry == nil || options.Lanes.Count() == 0 ||
-		len(options.Members) == 0 || len(options.CommandFences) != len(options.Members) ||
+		len(options.CommandFences) != len(options.Members) ||
 		(len(options.ReadSources) != 0 && len(options.ReadSources) != len(options.Members)) ||
 		(len(options.TransactionRecoverySources) != 0 && len(options.TransactionRecoverySources) != len(options.Members)) {
 		return nil, ErrInvalidOwner
@@ -195,11 +195,12 @@ func (owners *ExecutionOwners) owner(group raftmember.GroupKey) (*Owner, error) 
 	return route.owner, nil
 }
 
-// installGroup runs the final transport publication on the owning lane. The
-// callback must not fail: it is invoked only after Host ownership and serving
-// metadata have been installed, before that lane may execute the Runtime.
-func (owners *ExecutionOwners) installGroup(group ExecutionGroup, publish func()) error {
-	if owners == nil || publish == nil || group.Runtime == nil ||
+// installGroup runs the entire registry transaction on the owning lane.
+// Acquiring the registry lock before enqueueing would deadlock with that
+// lane publishing committed membership. The final publication remains a
+// no-fail handoff after Host ownership and serving metadata are installed.
+func (owners *ExecutionOwners) installGroup(group ExecutionGroup, change func(func(func()) error) error) error {
+	if owners == nil || change == nil || group.Runtime == nil ||
 		group.Identity != group.Runtime.Identity() || owners.state.Load() != executionOwnersRunning {
 		return ErrInvalidOwner
 	}
@@ -209,25 +210,29 @@ func (owners *ExecutionOwners) installGroup(group ExecutionGroup, publish func()
 	}
 	owner := owners.owners[laneIndex]
 	ready := new(atomic.Bool)
-	return owner.installExecutionGroup(group, func() {
-		current := owners.byGroup.Load()
-		next := &executionOwnerGroups{values: make(map[raftmember.GroupKey]executionOwnerRoute, len(current.values)+1)}
-		for key, value := range current.values {
-			next.values[key] = value
-		}
-		next.values[group.Identity.Group] = executionOwnerRoute{owner: owner, ready: ready}
-		owners.byGroup.Store(next)
-		publish()
-		ready.Store(true)
+	return owner.installExecutionGroup(group, func(install func(func()) error) error {
+		return change(func(publish func()) error {
+			return install(func() {
+				current := owners.byGroup.Load()
+				next := &executionOwnerGroups{values: make(map[raftmember.GroupKey]executionOwnerRoute, len(current.values)+1)}
+				for key, value := range current.values {
+					next.values[key] = value
+				}
+				next.values[group.Identity.Group] = executionOwnerRoute{owner: owner, ready: ready}
+				owners.byGroup.Store(next)
+				publish()
+				ready.Store(true)
+			})
+		})
 	})
 }
 
 func (owners *ExecutionOwners) removeGroup(
 	identity raftmember.RuntimeIdentity,
-	withdraw func(),
+	change func(func(func()) error) error,
 ) error {
 	group := identity.Group
-	if owners == nil || group == (raftmember.GroupKey{}) || withdraw == nil ||
+	if owners == nil || group == (raftmember.GroupKey{}) || change == nil ||
 		owners.state.Load() != executionOwnersRunning {
 		return ErrInvalidOwner
 	}
@@ -236,19 +241,23 @@ func (owners *ExecutionOwners) removeGroup(
 		return err
 	}
 	route := owners.byGroup.Load().values[group]
-	return owner.removeExecutionGroup(identity, func() {
-		if route.ready != nil {
-			route.ready.Store(false)
-		}
-		withdraw()
-		current := owners.byGroup.Load()
-		next := &executionOwnerGroups{values: make(map[raftmember.GroupKey]executionOwnerRoute, len(current.values)-1)}
-		for key, value := range current.values {
-			if key != group {
-				next.values[key] = value
-			}
-		}
-		owners.byGroup.Store(next)
+	return owner.removeExecutionGroup(identity, func(remove func(func()) error) error {
+		return change(func(withdraw func()) error {
+			return remove(func() {
+				if route.ready != nil {
+					route.ready.Store(false)
+				}
+				withdraw()
+				current := owners.byGroup.Load()
+				next := &executionOwnerGroups{values: make(map[raftmember.GroupKey]executionOwnerRoute, len(current.values)-1)}
+				for key, value := range current.values {
+					if key != group {
+						next.values[key] = value
+					}
+				}
+				owners.byGroup.Store(next)
+			})
+		})
 	})
 }
 

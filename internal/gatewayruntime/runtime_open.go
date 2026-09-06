@@ -141,12 +141,17 @@ func (runtime *Runtime) open() error {
 			config.CatalogBootstrapIfMissing, config.CatalogRelation, config.CatalogAttempts,
 			config.CatalogAttemptTimeout, config.TLSHandshakeTimeout, config.MaxShardConnections,
 			config.MaxShardHandshakes, config.CatalogSessionJournal, clientID, retryHome,
-			config.CatalogSessionLease, config.Transport,
+			config.CatalogSessionLease, runtime, config.Transport,
 		)
 		if err != nil {
 			return fmt.Errorf("open replicated catalog: %w", err)
 		}
 		runtime.routeSeedControl = runtime.authority.ReplicatedCatalogRouteSeedControl()
+		if len(config.InitialNodeDirectory) != 0 {
+			if err = runtime.authority.BootstrapNodeDirectory(runtime.ctx, config.InitialNodeDirectory); err != nil {
+				return fmt.Errorf("bootstrap physical-node directory: %w", err)
+			}
+		}
 	}
 	tableCatalogs := config.TableCatalogs
 	if config.TableCatalogsPath != "" {
@@ -223,6 +228,9 @@ func (runtime *Runtime) open() error {
 		if err != nil {
 			return fmt.Errorf("listen gateway %q: %w", config.ListenAddress, err)
 		}
+	}
+	if err = runtime.restoreFrontendDrainFromDirectory(runtime.ctx); err != nil {
+		return fmt.Errorf("restore frontend admission lifecycle: %w", err)
 	}
 	return nil
 }

@@ -78,6 +78,15 @@ func TestNodeStoreRegistrationRetryOfInitialGroup(t *testing.T) {
 				t.Fatalf("reopen=%t snapshot=%t retry=%+v syncs=%d err=%v", reopen, withSnapshot, got, syncs, err)
 			}
 		}
+		// A controller-directed install must still match its exact committed
+		// incarnation; the ordinary descriptor retry above grants no bypass.
+		if _, err := store.registerGroupLockedAt(descriptor, snapshot, 1); !errors.Is(err, ErrRetryConflict) {
+			t.Fatalf("dynamic install accepted initial incarnation zero: %v", err)
+		}
+		if _, err := store.registerGroupLockedAt(descriptor, snapshot, 0); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("dynamic install accepted zero request: %v", err)
+		}
+
 		conflict := proto.Clone(snapshot).(*pb.Snapshot)
 		conflict.Data = append(conflict.Data, 'x')
 		if _, err := store.RegisterGroupWithSnapshot(descriptor, conflict); !errors.Is(err, ErrRetryConflict) {

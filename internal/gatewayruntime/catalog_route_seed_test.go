@@ -139,7 +139,7 @@ func TestRecoverReplicatedCatalogRouteSeedStartupChangedWithoutJournal(t *testin
 			},
 		},
 	)
-	if !errors.Is(err, gateway.ErrReplicatedCatalogRouteRestartRequired) || settlements != 0 {
+	if err != nil || settlements != 0 {
 		t.Fatalf("journal-free changed recovery settlements=%d err=%v", settlements, err)
 	}
 	assertPromotedCatalogRouteSeedState(t, recovered, 2)
@@ -170,7 +170,7 @@ func TestRecoverReplicatedCatalogRouteSeedStartupSettlesExactOldBinding(t *testi
 			},
 		},
 	)
-	if !errors.Is(err, gateway.ErrReplicatedCatalogRouteRestartRequired) ||
+	if err != nil ||
 		journalChecks != 1 || settlements != 1 {
 		t.Fatalf("changed recovery checks=%d settlements=%d err=%v",
 			journalChecks, settlements, err)

@@ -39,6 +39,7 @@ type testConnection struct {
 func (connection *testConnection) PeerIdentity() rafttransport.PeerIdentity {
 	return connection.identity
 }
+func (*testConnection) PeerKeyDigest() [32]byte { return [32]byte{} }
 func (*testConnection) TrafficClass() rafttransport.TrafficClass {
 	return rafttransport.TrafficSnapshot
 }

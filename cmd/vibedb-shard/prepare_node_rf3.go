@@ -8,9 +8,12 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"time"
 
+	"github.com/thesyncim/vibedb/internal/nodecontrol"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/servicetls"
 	"github.com/thesyncim/vibejson"
 	pb "go.etcd.io/raft/v3/raftpb"
 )
@@ -18,10 +21,28 @@ import (
 // Fresh preparation publishes the shared log and every initial SQL root in one
 // directory rename. It does not read or migrate any legacy range log.
 type prepareRF3NodeManifest struct {
-	Root    string               `json:"root"`
-	NodeLog rf3NodeLogManifest   `json:"node_log"`
-	Gateway *rf3ManifestGateway  `json:"gateway,omitempty"`
-	Groups  []prepareRF3Manifest `json:"groups"`
+	Root    string              `json:"root"`
+	NodeLog rf3NodeLogManifest  `json:"node_log"`
+	Gateway *rf3ManifestGateway `json:"gateway,omitempty"`
+	// Services is required when Groups is empty.  Keeping the physical-node
+	// listeners and control budgets outside a group makes an empty-capacity
+	// node an explicit, restartable manifest kind instead of relying on a
+	// missing group to imply a legacy single-group route.
+	Services *prepareRF3NodeServices `json:"services,omitempty"`
+	Groups   []prepareRF3Manifest    `json:"groups"`
+}
+
+type prepareRF3NodeServices struct {
+	// NodeIncarnation is the replicated physical-node lifecycle incarnation.
+	// Empty nodes must carry it explicitly; it is never inferred from a group
+	// roster because a cold node has no group roster to consult.
+	NodeIncarnation     uint64                             `json:"node_incarnation"`
+	Listeners           rf3ManifestListeners               `json:"listeners"`
+	TLS                 rf3ManifestTLS                     `json:"tls"`
+	AuthorizationPolicy string                             `json:"authorization_policy"`
+	GatewaySeeds        []nodecontrol.BootstrapGatewaySeed `json:"bootstrap_gateway_seeds"`
+	ReplicaControl      persistedRF3ReplicaControl         `json:"replica_control"`
+	SplitControl        persistedRF3NodeSplitControl       `json:"split_control"`
 }
 
 type persistedRF3NodeGroup struct {
@@ -41,15 +62,17 @@ type persistedRF3NodeSplitControl struct {
 }
 
 type persistedRF3NodeRuntime struct {
-	NodeLog             rf3NodeLogManifest           `json:"node_log"`
-	Listeners           rf3ManifestListeners         `json:"listeners"`
-	TLS                 rf3ManifestTLS               `json:"tls"`
-	AuthorizationPolicy string                       `json:"authorization_policy"`
-	ReplicaControl      persistedRF3ReplicaControl   `json:"replica_control"`
-	SplitControl        persistedRF3NodeSplitControl `json:"split_control"`
-	ReadAuthority       *rf3ManifestReadAuthority    `json:"read_authority,omitempty"`
-	Gateway             *rf3ManifestGateway          `json:"gateway,omitempty"`
-	Groups              []persistedRF3NodeGroup      `json:"groups"`
+	NodeLog             rf3NodeLogManifest                 `json:"node_log"`
+	NodeIncarnation     uint64                             `json:"node_incarnation,omitempty"`
+	Listeners           rf3ManifestListeners               `json:"listeners"`
+	TLS                 rf3ManifestTLS                     `json:"tls"`
+	AuthorizationPolicy string                             `json:"authorization_policy"`
+	GatewaySeeds        []nodecontrol.BootstrapGatewaySeed `json:"bootstrap_gateway_seeds,omitempty"`
+	ReplicaControl      persistedRF3ReplicaControl         `json:"replica_control"`
+	SplitControl        persistedRF3NodeSplitControl       `json:"split_control"`
+	ReadAuthority       *rf3ManifestReadAuthority          `json:"read_authority,omitempty"`
+	Gateway             *rf3ManifestGateway                `json:"gateway,omitempty"`
+	Groups              []persistedRF3NodeGroup            `json:"groups"`
 }
 
 func runPrepareNodeRF3(args []string) int {
@@ -81,7 +104,7 @@ func runPrepareNodeRF3(args []string) int {
 }
 
 func provisionRF3Node(input prepareRF3NodeManifest) (resultErr error) {
-	if !filepath.IsAbs(input.Root) || filepath.Clean(input.Root) != input.Root || input.Root == "/" || len(input.Groups) == 0 || len(input.Groups) > maxRF3ManifestGroups || input.NodeLog.Path != filepath.Join(input.Root, "node-log") {
+	if !filepath.IsAbs(input.Root) || filepath.Clean(input.Root) != input.Root || input.Root == "/" || len(input.Groups) > maxRF3ManifestGroups || input.NodeLog.Path != filepath.Join(input.Root, "node-log") || len(input.Groups) == 0 && input.Services == nil {
 		return errPrepareRF3
 	}
 	configRaw, err := vibejson.Marshal(&input.NodeLog)
@@ -103,16 +126,24 @@ func provisionRF3Node(input prepareRF3NodeManifest) (resultErr error) {
 		return err
 	}
 	defer clear(key.Material[:])
-	key.Wrapped = []byte(input.Groups[0].WAL.WrappedKey)
+	if len(input.Groups) != 0 {
+		key.Wrapped = []byte(input.Groups[0].WAL.WrappedKey)
+	} else {
+		if input.NodeLog.WrappedKey == "" || len(input.NodeLog.WrappedKey) > raftstore.MaxWrappedKeyBytes {
+			return errPrepareRF3
+		}
+		key.Wrapped = []byte(input.NodeLog.WrappedKey)
+	}
 	boots := make([]raftstore.NodeBootstrap, len(input.Groups))
 	manifests := make([]persistedRF3Manifest, len(input.Groups))
 	var identity raftstore.NodeIdentity
 	var firstListeners rf3ManifestListeners
 	var firstTLS rf3ManifestTLS
 	var firstPolicy string
+	var firstGatewaySeeds []nodecontrol.BootstrapGatewaySeed
 	var firstReadAuthority *rf3ManifestReadAuthority
 	var firstReplica persistedRF3ReplicaControl
-	var firstSplit persistedRF3SplitControl
+	var firstSplit persistedRF3NodeSplitControl
 	unionNodes := make(map[rafttransport.NodeID]string, rf3ManifestMembers*len(input.Groups))
 	unionAddresses := make(map[string]rafttransport.NodeID, rf3ManifestMembers*len(input.Groups))
 	for i, group := range input.Groups {
@@ -146,11 +177,13 @@ func provisionRF3Node(input prepareRF3NodeManifest) (resultErr error) {
 			firstListeners, firstTLS, firstPolicy = group.Listeners, group.TLS, group.AuthorizationPolicy
 			firstReadAuthority = group.ReadAuthority
 			firstReplica = prepared.ReplicaControl
-			firstSplit = persistedRF3SplitControl{
-				MaxRecords:   prepared.SplitControl.MaxRecords,
-				MaxFileBytes: prepared.SplitControl.MaxFileBytes,
+			firstSplit = persistedRF3NodeSplitControl{
+				MaxRecords:    prepared.SplitControl.MaxRecords,
+				MaxFileBytes:  prepared.SplitControl.MaxFileBytes,
+				Grants:        slices.Clone(prepared.SplitControl.Grants),
+				MaxOperations: prepared.SplitControl.ChildRegistry.MaxOperations,
 			}
-		} else if current != identity || group.Listeners != firstListeners || group.TLS != firstTLS || group.AuthorizationPolicy != firstPolicy ||
+		} else if current != identity || group.Listeners != firstListeners || !group.TLS.equal(firstTLS) || group.AuthorizationPolicy != firstPolicy ||
 			!rf3ReadAuthorityManifestEqual(group.ReadAuthority, firstReadAuthority) ||
 			prepared.ReplicaControl.MaxActionRecords != firstReplica.MaxActionRecords ||
 			prepared.ReplicaControl.MaxSourceRecords != firstReplica.MaxSourceRecords ||
@@ -159,8 +192,10 @@ func provisionRF3Node(input prepareRF3NodeManifest) (resultErr error) {
 			prepared.ReplicaControl.MaxSourceArtifactBytes != firstReplica.MaxSourceArtifactBytes ||
 			prepared.ReplicaControl.MaxSourceDiskBytes != firstReplica.MaxSourceDiskBytes ||
 			prepared.ReplicaControl.SourceChunkBytes != firstReplica.SourceChunkBytes ||
+			prepared.ReplicaControl.Migration != firstReplica.Migration ||
 			prepared.SplitControl.MaxRecords != firstSplit.MaxRecords || prepared.SplitControl.MaxFileBytes != firstSplit.MaxFileBytes ||
-			!slices.Equal(prepared.SplitControl.Grants, manifests[0].SplitControl.Grants) {
+			!slices.Equal(prepared.SplitControl.Grants, firstSplit.Grants) ||
+			prepared.SplitControl.ChildRegistry.MaxOperations != firstSplit.MaxOperations {
 			return errPrepareRF3
 		}
 		index, term := uint64(1), uint64(1)
@@ -170,6 +205,56 @@ func provisionRF3Node(input prepareRF3NodeManifest) (resultErr error) {
 		}
 		boots[i] = raftstore.NodeBootstrap{Descriptor: raftstore.GroupDescriptor{TopologyRecoveryEpoch: group.TopologyRecoveryEpoch, AllocationGeneration: member.AllocationGeneration, MemberID: member.MemberID, GroupID: member.GroupID, ShardIncarnation: member.ShardIncarnation, StoreID: member.StoreID, Distribution: member.Distribution, Shard: member.Shard}, Snapshot: &pb.Snapshot{Data: []byte("vibedb-rf3-bootstrap"), Metadata: &pb.SnapshotMetadata{Index: &index, Term: &term, ConfState: &pb.ConfState{Voters: voters}}}}
 		manifests[i] = prepared
+	}
+	if len(input.Groups) == 0 {
+		// A node log with no group descriptors is valid and is the only
+		// representation of a cold capacity node.  The TLS trust domain is the
+		// replicated identity source for the physical node; no group/member or
+		// Raft snapshot is invented here.
+		profile, profileErr := servicetls.LoadProfile(
+			input.Services.TLS.Certificate, input.Services.TLS.Key,
+			input.Services.TLS.Roots, input.Services.TLS.IdentityOID, time.Now,
+		)
+		if profileErr != nil {
+			return errors.Join(errPrepareRF3, profileErr)
+		}
+		local := profile.LocalIdentity()
+		identity = raftstore.NodeIdentity{
+			ClusterID:          local.TrustDomain.ClusterID,
+			ClusterIncarnation: local.TrustDomain.ClusterIncarnation,
+			NodeID:             [16]byte(local.Node),
+		}
+		if identity.ClusterID == ([16]byte{}) || identity.ClusterIncarnation == ([16]byte{}) || identity.NodeID == ([16]byte{}) {
+			return errPrepareRF3
+		}
+		firstListeners = input.Services.Listeners
+		firstTLS, firstPolicy = input.Services.TLS, input.Services.AuthorizationPolicy
+		firstGatewaySeeds = slices.Clone(input.Services.GatewaySeeds)
+		if len(firstGatewaySeeds) == 0 || len(firstGatewaySeeds) > nodecontrol.MaxBootstrapGatewaySeeds {
+			return errPrepareRF3
+		}
+		seenGatewaySeeds := make(map[rafttransport.NodeID]struct{}, len(firstGatewaySeeds))
+		for _, seed := range firstGatewaySeeds {
+			if !seed.Valid() {
+				return errPrepareRF3
+			}
+			if _, found := seenGatewaySeeds[seed.NodeID]; found {
+				return errPrepareRF3
+			}
+			seenGatewaySeeds[seed.NodeID] = struct{}{}
+		}
+		firstReplica, firstSplit = input.Services.ReplicaControl, input.Services.SplitControl
+		if input.Services.NodeIncarnation == 0 || firstReplica.SourceDataRoot != input.Root ||
+			firstReplica.ActionJournalPath == "" || firstReplica.SourceJournalPath == "" ||
+			firstReplica.SourceRepositoryPath == "" || firstSplit.JournalPath == "" {
+			return errPrepareRF3
+		}
+		// The empty node has no group-specific child template.  Its process
+		// level split registry is still bounded and is populated on first
+		// enrollment from the exact group preparation document.
+		if firstSplit.MaxRecords <= 0 || firstSplit.MaxFileBytes <= 0 || firstSplit.MaxOperations <= 0 || len(firstSplit.Grants) == 0 {
+			return errPrepareRF3
+		}
 	}
 	// These controls belong to the physical node. Keeping them under the node
 	// root makes every group independent of which group happened to be first in
@@ -185,7 +270,13 @@ func provisionRF3Node(input prepareRF3NodeManifest) (resultErr error) {
 	nodeReplica.SourceJournalPath = nodeSourceJournal
 	nodeReplica.SourceRepositoryPath = nodeSourceRepository
 	nodeSplit := persistedRF3NodeSplitControl{JournalPath: nodeSplitJournal, MaxRecords: firstSplit.MaxRecords, MaxFileBytes: firstSplit.MaxFileBytes,
-		Grants: manifests[0].SplitControl.Grants}
+		MaxOperations: firstSplit.MaxOperations,
+		Grants: func() []persistedRF3ActionGrant {
+			if len(manifests) == 0 {
+				return slices.Clone(firstSplit.Grants)
+			}
+			return slices.Clone(manifests[0].SplitControl.Grants)
+		}()}
 	var nodeGateway *rf3ManifestGateway
 	if input.Gateway != nil {
 		gatewayCopy := *input.Gateway
@@ -197,8 +288,16 @@ func provisionRF3Node(input prepareRF3NodeManifest) (resultErr error) {
 		}
 		nodeGateway = &gatewayCopy
 	}
-	runtime := persistedRF3NodeRuntime{NodeLog: input.NodeLog, Gateway: nodeGateway, Listeners: firstListeners, TLS: firstTLS, AuthorizationPolicy: firstPolicy, ReadAuthority: firstReadAuthority, ReplicaControl: nodeReplica,
-		SplitControl: nodeSplit}
+	runtime := persistedRF3NodeRuntime{NodeLog: input.NodeLog, NodeIncarnation: func() uint64 {
+		if input.Services != nil {
+			return input.Services.NodeIncarnation
+		}
+		// A newly prepared physical node starts at incarnation one. Group
+		// runtime incarnations advance independently inside its node log.
+		return 1
+	}(), Gateway: nodeGateway, Listeners: firstListeners, TLS: firstTLS, AuthorizationPolicy: firstPolicy,
+		GatewaySeeds: firstGatewaySeeds, ReadAuthority: firstReadAuthority, ReplicaControl: nodeReplica,
+		SplitControl: nodeSplit, Groups: make([]persistedRF3NodeGroup, 0, len(manifests))}
 	runtime.NodeLog.KeyMaterialPath = filepath.Join(input.Root, "node-key")
 	for _, manifest := range manifests {
 		manifest.WAL.KeyMaterialPath = runtime.NodeLog.KeyMaterialPath
