@@ -426,6 +426,20 @@ func (d *deccur) end() error {
 	return nil
 }
 
+// maxPooledFrameBuffer bounds recycled encoder arenas. Larger frames keep
+// freshly allocated arenas instead of pinning megabytes per pooled buffer.
+const maxPooledFrameBuffer = 64 << 10
+
+// frameEncoderPool recycles frame body arenas across messages. Every encoder
+// output flows straight into writeEncodedFrame's single Write and is dead
+// afterwards, so the frame takes ownership and recycles on all paths; a
+// missed recycle only loses the saving to the collector.
+//
+// Read buffers are deliberately NOT pooled: decoded parameters, keys, and
+// cells alias the frame body zero-copy, so a reused read arena would corrupt
+// live requests and responses.
+var frameEncoderPool = sync.Pool{New: func() any { return []byte(nil) }}
+
 // newFrameEncoder reserves the wire header in the same arena as the body. This
 // keeps the single-Write contract without copying a completed multi-megabyte
 // body into a second whole-frame allocation.
@@ -433,6 +447,10 @@ func newFrameEncoder(payloadHint int) encbuf {
 	capacity := 5 + 256
 	if payloadHint > 0 && payloadHint <= maxFrameBody-256 {
 		capacity += payloadHint
+	}
+	if buf, _ := frameEncoderPool.Get().([]byte); cap(buf) >= capacity &&
+		cap(buf) <= maxPooledFrameBuffer {
+		return encbuf{b: buf[:5]}
 	}
 	return encbuf{b: make([]byte, 5, capacity)}
 }
@@ -445,7 +463,10 @@ func writeEncodedFrame(w io.Writer, tag byte, frame []byte) error {
 	binary.BigEndian.PutUint32(frame[1:5], uint32(len(frame)-1))
 	n, err := w.Write(frame)
 	if err == nil && n != len(frame) {
-		return io.ErrShortWrite
+		err = io.ErrShortWrite
+	}
+	if cap(frame) <= maxPooledFrameBuffer {
+		frameEncoderPool.Put(frame)
 	}
 	return err
 }

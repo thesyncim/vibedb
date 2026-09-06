@@ -680,6 +680,21 @@ func (p *Prepared) pinLayout(before *catalogLayoutIdentity) {
 	}
 }
 
+// ReusableForParse reports whether the preparation may serve a repeated
+// parse of the same statement text: the session is usable and the
+// catalog/layout generation the plan was lowered against still governs.
+// It structurally satisfies the unnamed-parse reuse contract without
+// importing the protocol package: backends query it through an optional
+// interface, so preparations from backends without generation tracking keep
+// the ordinary close-and-prepare behavior.
+func (p *Prepared) ReusableForParse() bool {
+	if p == nil || p.session == nil || p.session.live() != nil ||
+		p.session.state == SessionFailedTransaction {
+		return false
+	}
+	return p.LayoutCurrent()
+}
+
 // LayoutCurrent reports whether the catalog/layout generation the statement
 // was lowered against still governs execution: the published generation when
 // autocommitting, or the transaction's begin generation inside a transaction.

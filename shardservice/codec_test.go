@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"slices"
 	"testing"
@@ -1484,5 +1485,22 @@ func TestReuseDistributionTypes(t *testing.T) {
 	}
 	if req.Distribution != "d" {
 		t.Fatal("distribution type mismatch")
+	}
+}
+
+// TestFrameEncoderArenaRecycled proves encoder arenas return to the pool:
+// repeated small encodes must reuse backing arrays instead of allocating.
+func TestFrameEncoderArenaRecycled(t *testing.T) {
+	seen := make(map[string]struct{})
+	for i := range 8 {
+		e := newFrameEncoder(0)
+		e.u8(byte(i))
+		seen[fmt.Sprintf("%p", e.b)] = struct{}{}
+		if err := writeEncodedFrame(io.Discard, tagRequest, e.b); err != nil {
+			t.Fatalf("writeEncodedFrame: %v", err)
+		}
+	}
+	if len(seen) == 8 {
+		t.Fatalf("8 encodes used 8 distinct arenas, want recycling")
 	}
 }
