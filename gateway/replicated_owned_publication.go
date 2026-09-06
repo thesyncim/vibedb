@@ -252,7 +252,7 @@ func (authority *ReplicatedCatalogAuthority) publishOwnedGroupTransition(ctx con
 // prepareOwnedGroupRead replays authenticated, atomically retained head events.
 // Missing history or any unrelated change that cannot be reconstructed is denied.
 func (authority *ReplicatedCatalogAuthority) prepareOwnedGroupRead(ctx context.Context, current, next *Snapshot, nextRaw []byte) (*Snapshot, func() error, bool, error) {
-	if current == nil || next == nil || next.Generation() <= current.Generation() {
+	if authority == nil || ctx == nil || current == nil || next == nil || next.Generation() <= current.Generation() {
 		return nil, nil, false, nil
 	}
 	certified := current

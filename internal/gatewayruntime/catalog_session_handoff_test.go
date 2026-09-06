@@ -19,7 +19,7 @@ func TestCatalogSessionHandoffPersistsEveryCrashPhase(t *testing.T) {
 	nextRoute := catalogRouteSeedRoute(t, nextSnapshot)
 	nextPath := catalogSessionJournalPath(base, nextSnapshot.Generation())
 	handoff, err := catalogSessionHandoffFromRoutes(
-		oldRoute, nextRoute, oldSnapshot, nextSnapshot, base, nextPath, 1,
+		oldRoute, nextRoute, oldSnapshot, nextSnapshot, base, nextPath, 1, 1,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -93,7 +93,7 @@ func TestCatalogSessionHandoffEvidenceRetainsExactBinding(t *testing.T) {
 	nextRoute := catalogRouteSeedRoute(t, nextSnapshot)
 	handoff, err := catalogSessionHandoffFromRoutes(
 		oldRoute, nextRoute, oldSnapshot, nextSnapshot, base,
-		catalogSessionJournalPath(base, nextSnapshot.Generation()), 1,
+		catalogSessionJournalPath(base, nextSnapshot.Generation()), 1, 1,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -138,7 +138,7 @@ func TestCatalogSessionHandoffRejectsAddressOnlyBindingRollover(t *testing.T) {
 	nextRoute := catalogRouteSeedRoute(t, nextSnapshot)
 	if _, err := catalogSessionHandoffFromRoutes(
 		oldRoute, nextRoute, oldSnapshot, nextSnapshot, base,
-		catalogSessionJournalPath(base, nextSnapshot.Generation()), 1,
+		catalogSessionJournalPath(base, nextSnapshot.Generation()), 1, 1,
 	); !errors.Is(err, gateway.ErrReplicatedCatalog) {
 		t.Fatalf("address-only route entered exact-binding handoff: %v", err)
 	}
@@ -207,4 +207,45 @@ func catalogSessionHandoffSnapshot(
 		t.Fatal(err)
 	}
 	return snapshot
+}
+
+func TestCatalogSessionHandoffAfterUnrelatedHeadAdvance(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "catalog-session")
+	initial := catalogSessionHandoffSnapshot(t, 1, "127.0.0.1:7101", 1)
+	old := catalogSessionHandoffSnapshot(t, 3, "127.0.0.1:7101", 1)
+	next := catalogSessionHandoffSnapshot(t, 4, "127.0.0.1:7199", 2)
+	oldRoute, nextRoute := catalogRouteSeedRoute(t, old), catalogRouteSeedRoute(t, next)
+	if !sameReplicatedCatalogRoute(catalogRouteSeedRoute(t, initial), oldRoute) {
+		t.Fatal("unrelated head changed catalog session route")
+	}
+	handoff, err := catalogSessionHandoffFromRoutes(oldRoute, nextRoute, old, next, base, catalogSessionJournalPath(base, 4), 1, 1)
+	if err != nil || !catalogSessionHandoffPathsValid(handoff, base) {
+		t.Fatalf("session head 1 at catalog head 3: %+v %v", handoff, err)
+	}
+	path := catalogSessionHandoffPath(base)
+	if err = storeCatalogSessionHandoff(path, handoff); err != nil {
+		t.Fatal(err)
+	}
+	reopened, found, err := loadCatalogSessionHandoff(path)
+	if err != nil || !found || reopened.OldSessionGeneration != 1 || reopened.OldGeneration != 3 {
+		t.Fatalf("reopen=%+v found=%t err=%v", reopened, found, err)
+	}
+	if err = validateCatalogSessionHandoffEvidence(reopened, oldRoute, nextRoute, old, next, 1); err != nil {
+		t.Fatal(err)
+	}
+	tampered := reopened
+	tampered.OldSessionGeneration = 2
+	if catalogSessionHandoffPathsValid(tampered, base) {
+		t.Fatal("different session generation accepted for base journal")
+	}
+	for _, bad := range []string{base + ".catalog-session-2", base + ".catalog-session-00000000000000000001", filepath.Join(filepath.Dir(base), "other")} {
+		if catalogSessionJournalGeneration(base, bad) != 0 {
+			t.Fatalf("noncanonical journal %q accepted", bad)
+		}
+	}
+	for _, generation := range []uint64{1, 2, 99} {
+		if got := catalogSessionJournalGeneration(base, catalogSessionJournalPath(base, generation)); got != generation {
+			t.Fatalf("generation=%d got=%d", generation, got)
+		}
+	}
 }

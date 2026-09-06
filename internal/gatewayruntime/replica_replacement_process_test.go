@@ -474,24 +474,15 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 	sourceReady := false
 	var sourceRestarted time.Time
 	groupCompletion := make(map[raftmember.GroupKey]time.Duration, 2)
-	routeRestarts := 0
 	for {
 		if err = ctx.Err(); err != nil {
 			t.Fatalf("replacement timeout: %v\ngateway:\n%s\ntarget:\n%s",
 				err, gatewayProcess.Diagnostics(), coldTarget.Diagnostics())
 		}
 		if gatewayProcess.PID() == 0 {
-			if routeRestarts >= 2 || !strings.Contains(gatewayProcess.Diagnostics(), gateway.ErrReplicatedCatalogRouteRestartRequired.Error()) {
-				t.Fatalf("unexpected controller exit: %v\n%s", gatewayProcess.WaitError(), gatewayProcess.Diagnostics())
-			}
-			routeRestarts++
-			if err = gatewayProcess.Start(); err != nil {
-				t.Fatal(err)
-			}
-			if err = gatewayProcess.WaitReady(ctx, "vibedb-gateway serving catalog generation"); err != nil {
-				t.Fatalf("catalog self-move supervisor restart: %v\n%s", err, gatewayProcess.Diagnostics())
-			}
+			t.Fatalf("controller exited during live catalog session handoff: %v\n%s", gatewayProcess.WaitError(), gatewayProcess.Diagnostics())
 		}
+
 		if measurements.failoverMillis == 0 &&
 			strings.Contains(gatewayProcess.Diagnostics(), "revision controller published") {
 			measurements.failoverMillis = uint64(time.Since(started).Milliseconds())
@@ -548,8 +539,18 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 	if !restartedSource {
 		t.Fatal("retired source was not reopened for cleanup")
 	}
-	if routeRestarts != 2 {
-		t.Fatalf("catalog self-move route handoffs=%d want=2", routeRestarts)
+	handoff, found, handoffErr := loadCatalogSessionHandoff(catalogSessionHandoffPath(filepath.Join(root, "gateway-session")))
+	if handoffErr != nil || !found || handoff.Phase != catalogSessionHandoffComplete || !catalogSessionHandoffPathsValid(handoff, filepath.Join(root, "gateway-session")) {
+		t.Fatalf("live catalog handoff not durably complete: %+v found=%t err=%v", handoff, found, handoffErr)
+	}
+	settled, settleErr := catalogAuthority.Read(ctx)
+	if settleErr != nil {
+		t.Fatal(settleErr)
+	}
+	settledRoute := catalogRouteSeedRoute(t, settled)
+	binding, bindingErr := gateway.NativeSessionJournalBinding(settledRoute, string(settledRoute.Distribution), string(settledRoute.Shard), []byte{replicatedCatalogControllerTenant}, 1, serviceauthz.CapabilityTopology)
+	if bindingErr != nil || binding != handoff.NextBinding || handoff.NextGeneration > settled.Generation() {
+		t.Fatalf("live handoff differs from final catalog route: binding=%x handoff=%+v err=%v", binding, handoff, bindingErr)
 	}
 	if measurements.admissionMillis == 0 {
 		t.Fatal("two-group move set was never atomically discoverable")

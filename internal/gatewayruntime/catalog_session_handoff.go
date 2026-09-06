@@ -8,6 +8,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/replication"
@@ -35,18 +37,19 @@ const (
 // complete. CurrentJournalPath is retained in the complete record as the
 // durable pointer for the next process start.
 type catalogSessionHandoff struct {
-	Format             uint8                      `json:"format"`
-	Phase              catalogSessionHandoffPhase `json:"phase"`
-	Transition         [32]byte                   `json:"transition"`
-	OldGeneration      uint64                     `json:"old_generation"`
-	NextGeneration     uint64                     `json:"next_generation"`
-	OldSnapshotDigest  [32]byte                   `json:"old_snapshot_digest"`
-	NextSnapshotDigest [32]byte                   `json:"next_snapshot_digest"`
-	OldBinding         replication.Digest         `json:"old_binding"`
-	NextBinding        replication.Digest         `json:"next_binding"`
-	OldJournalPath     string                     `json:"old_journal_path"`
-	NextJournalPath    string                     `json:"next_journal_path"`
-	CurrentJournalPath string                     `json:"current_journal_path"`
+	Format               uint8                      `json:"format"`
+	Phase                catalogSessionHandoffPhase `json:"phase"`
+	Transition           [32]byte                   `json:"transition"`
+	OldSessionGeneration uint64                     `json:"old_session_generation"`
+	OldGeneration        uint64                     `json:"old_generation"`
+	NextGeneration       uint64                     `json:"next_generation"`
+	OldSnapshotDigest    [32]byte                   `json:"old_snapshot_digest"`
+	NextSnapshotDigest   [32]byte                   `json:"next_snapshot_digest"`
+	OldBinding           replication.Digest         `json:"old_binding"`
+	NextBinding          replication.Digest         `json:"next_binding"`
+	OldJournalPath       string                     `json:"old_journal_path"`
+	NextJournalPath      string                     `json:"next_journal_path"`
+	CurrentJournalPath   string                     `json:"current_journal_path"`
 }
 
 func catalogSessionHandoffPath(journalPath string) string {
@@ -55,7 +58,7 @@ func catalogSessionHandoffPath(journalPath string) string {
 
 func (handoff catalogSessionHandoff) valid() bool {
 	if handoff.Format != catalogSessionHandoffFormat || handoff.Transition == ([32]byte{}) ||
-		handoff.OldGeneration == 0 || handoff.NextGeneration <= handoff.OldGeneration ||
+		handoff.OldSessionGeneration == 0 || handoff.OldSessionGeneration > handoff.OldGeneration || handoff.OldGeneration == 0 || handoff.NextGeneration <= handoff.OldGeneration ||
 		handoff.OldSnapshotDigest == ([32]byte{}) || handoff.NextSnapshotDigest == ([32]byte{}) ||
 		handoff.OldBinding == (replication.Digest{}) || handoff.NextBinding == (replication.Digest{}) ||
 		handoff.OldBinding == handoff.NextBinding || handoff.Phase < catalogSessionHandoffPrepared ||
@@ -101,7 +104,7 @@ func catalogSessionHandoffPathsValid(handoff catalogSessionHandoff, base string)
 	if !handoff.valid() || base == "" || filepath.Clean(base) != base {
 		return false
 	}
-	if handoff.OldJournalPath != catalogSessionJournalPath(base, handoff.OldGeneration) ||
+	if handoff.OldJournalPath != catalogSessionJournalPath(base, handoff.OldSessionGeneration) ||
 		handoff.NextJournalPath != catalogSessionJournalPath(base, handoff.NextGeneration) {
 		return false
 	}
@@ -138,6 +141,7 @@ func catalogSessionHandoffFromRoutes(
 	oldSnapshot, nextSnapshot *gateway.Snapshot,
 	oldJournalPath, nextJournalPath string,
 	relation replication.RelationID,
+	oldSessionGeneration uint64,
 ) (catalogSessionHandoff, error) {
 	if oldSnapshot == nil || nextSnapshot == nil || oldJournalPath == "" || nextJournalPath == "" ||
 		oldJournalPath == nextJournalPath || !gatewayCatalogRoutePairValid(oldRoute, nextRoute) ||
@@ -170,7 +174,8 @@ func catalogSessionHandoffFromRoutes(
 	transition := sha256.Sum256(append(append([]byte("vibedb/catalog-session-handoff/1\x00"), oldDigest[:]...), nextDigest[:]...))
 	handoff := catalogSessionHandoff{
 		Format: catalogSessionHandoffFormat, Phase: catalogSessionHandoffPrepared,
-		Transition: transition, OldGeneration: oldSnapshot.Generation(), NextGeneration: nextSnapshot.Generation(),
+		OldSessionGeneration: oldSessionGeneration,
+		Transition:           transition, OldGeneration: oldSnapshot.Generation(), NextGeneration: nextSnapshot.Generation(),
 		OldSnapshotDigest: oldDigest, NextSnapshotDigest: nextDigest,
 		OldBinding: oldBinding, NextBinding: nextBinding,
 		OldJournalPath: oldJournalPath, NextJournalPath: nextJournalPath,
@@ -332,7 +337,7 @@ func validateCatalogSessionHandoffEvidence(
 	}
 	expected, err := catalogSessionHandoffFromRoutes(
 		oldRoute, nextRoute, oldSnapshot, nextSnapshot,
-		handoff.OldJournalPath, handoff.NextJournalPath, relation,
+		handoff.OldJournalPath, handoff.NextJournalPath, relation, handoff.OldSessionGeneration,
 	)
 	if err != nil || expected.Transition != handoff.Transition ||
 		expected.OldSnapshotDigest != handoff.OldSnapshotDigest ||
@@ -341,4 +346,24 @@ func validateCatalogSessionHandoffEvidence(
 		return errors.Join(err, gateway.ErrReplicatedCatalogConflict)
 	}
 	return nil
+}
+
+// Decode only the canonical configured journal family. The session creation
+// generation is independent of subsequent catalog heads with unchanged routes.
+func catalogSessionJournalGeneration(base, path string) uint64 {
+	if base == "" || filepath.Clean(base) != base {
+		return 0
+	}
+	if path == base {
+		return 1
+	}
+	suffix, found := strings.CutPrefix(path, base+".catalog-session-")
+	if !found {
+		return 0
+	}
+	generation, err := strconv.ParseUint(suffix, 10, 64)
+	if err != nil || generation <= 1 || catalogSessionJournalPath(base, generation) != path {
+		return 0
+	}
+	return generation
 }

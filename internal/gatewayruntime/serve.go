@@ -566,6 +566,7 @@ func newReplicatedCatalogGateway(
 			nextPath := catalogSessionJournalPath(journalPath, pending.Generation())
 			handoff, err = catalogSessionHandoffFromRoutes(
 				route, pendingRoute, active, pending, currentJournalPath, nextPath, relation,
+				catalogSessionJournalGeneration(journalPath, currentJournalPath),
 			)
 			if err != nil {
 				return err
@@ -730,6 +731,7 @@ func newReplicatedCatalogGateway(
 		handoff, handoffErr := catalogSessionHandoffFromRoutes(
 			oldRoute, nextRoute, oldSnapshot, nextSnapshot,
 			currentJournalPath, nextPath, relation,
+			catalogSessionJournalGeneration(journalPath, currentJournalPath),
 		)
 		if handoffErr != nil {
 			return gateway.ReplicatedCatalogSessionRolloverResult{}, handoffErr
