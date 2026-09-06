@@ -117,8 +117,8 @@ func (runtime *AuthenticatedExecutionPeerRuntime) RegisterExecutionGroup(
 	if !found {
 		return ErrInvalidOwner
 	}
-	return runtime.registry.InstallGroup(roster, func(publish func()) error {
-		return runtime.owners.installGroup(group, publish)
+	return runtime.owners.installGroup(group, func(install func(func()) error) error {
+		return runtime.registry.InstallGroup(roster, install)
 	})
 }
 
@@ -132,8 +132,8 @@ func (runtime *AuthenticatedExecutionPeerRuntime) UnregisterExecutionGroup(
 		identity.Group == (raftmember.GroupKey{}) {
 		return ErrInvalidOwner
 	}
-	return runtime.registry.RemoveGroup(identity.Group, func(withdraw func()) error {
-		return runtime.owners.removeGroup(identity, withdraw)
+	return runtime.owners.removeGroup(identity, func(remove func(func()) error) error {
+		return runtime.registry.RemoveGroup(identity.Group, remove)
 	})
 }
 
