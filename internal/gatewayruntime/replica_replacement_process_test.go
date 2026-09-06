@@ -358,6 +358,28 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 	if err = catalogAuthority.Publish(ctx, 0, snapshot); err != nil {
 		t.Fatalf("publish immutable catalog genesis through RF3: %v", err)
 	}
+	var directory []gateway.NodeRecord
+	for member := 0; member < 4; member++ {
+		credential := credentials[member]
+		peerProfile, err := servicetls.LoadProfile(credential.Certificate, credential.Key, roots, rf3testfixture.ProcessIdentityOID, time.Now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		address := listeners[member]
+		directory = append(directory, gateway.NodeRecord{NodeID: nodes[member], Incarnation: 1,
+			ServiceKeyDigest: replication.Digest(peerProfile.LocalServiceKeyDigest()),
+			DataEndpoint:     distribution.EndpointID(address.Peer), NativeEndpoint: distribution.EndpointID(address.Native), ControlEndpoint: distribution.EndpointID(address.Control),
+			DataAddress: address.Peer, NativeAddress: address.Native, ControlAddress: address.Control,
+			Roles:         gateway.NodeRoleStorage | gateway.NodeRoleControl | gateway.NodeRoleCatalog,
+			FailureDomain: fmt.Sprintf("member-%d", member), Lifecycle: gateway.NodeActive, Revision: 1, CatalogGeneration: snapshot.Generation()})
+	}
+	directory[0].Roles |= gateway.NodeRoleGateway
+	directory[0].GatewayEndpoint, directory[0].GatewayAddress = "gateway-control", gatewayControl
+	directory[0].Gateway = gateway.GatewayIdentity{NodeID: profile.LocalIdentity().Node, Incarnation: 1,
+		ServiceKeyDigest: replication.Digest(profile.LocalServiceKeyDigest()), ServiceID: [16]byte{1}, SessionID: [16]byte{2}, SessionRevision: 1, ParticipantDigest: replication.Digest{3}}
+	if err := catalogAuthority.BootstrapNodeDirectory(ctx, directory); err != nil {
+		t.Fatalf("bootstrap physical directory: %v", err)
+	}
 	replicaProcessPublishAbandonment(t, ctx, catalogAuthority, snapshot.Generation(), firstAbandonment)
 	gatewayProcess := replicaProcessGateway(gatewayBinary, catalogPath, gatewayNative,
 		replicaManifestPath, credentials[4], roots, policyPath, ackPath,
@@ -1055,8 +1077,8 @@ func replicaProcessCatalogAuthority(t *testing.T, profile *rafttransport.PeerTLS
 		t.Fatal(err)
 	}
 	session, err := gateway.NewNativeSession(gateway.NativeSessionOptions{Executor: executor,
-		CatalogBootstrap: snapshot,
-		Route:            route, Distribution: string(route.Distribution), Shard: string(route.Shard),
+		CatalogBootstrap: snapshot, MaxMutations: 6,
+		Route: route, Distribution: string(route.Distribution), Shard: string(route.Shard),
 		Tenant: []byte{1}, ClientID: replication.ID128{0xc1}, RetryHome: replication.RetryHome{0xd1},
 		Resolver: gateway.BaseRelationResolver{Relation: 1}, Journal: journal,
 		ProposalCapability: serviceauthz.CapabilityTopology})

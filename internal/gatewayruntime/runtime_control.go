@@ -65,7 +65,8 @@ func (runtime *Runtime) openReplicaControl() error {
 		return err
 	}
 	if config.ControlParticipantOnly {
-		return nil
+		runtime.clusterControlBackend, err = newScalingOperatorBackend(runtime.authority, runtime.authority, runtime.authority)
+		return err
 	}
 
 	handshakeDeadline := servicetls.FixedDeadline(config.TLSHandshakeTimeout)

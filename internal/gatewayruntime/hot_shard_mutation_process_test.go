@@ -341,6 +341,36 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 	if err = catalogAuthority.Publish(ctx, 0, built.Snapshot); err != nil {
 		t.Fatalf("publish immutable catalog genesis through RF3: %v", err)
 	}
+	// The new provisioning path requires an authenticated physical directory,
+	// including the prepared target and the distinct gateway principal.
+	var directory []gateway.NodeRecord
+	for group := range routes {
+		count := 3
+		if group == 0 {
+			count = 4
+		}
+		for member := 0; member < count; member++ {
+			credential := credentials[credentialOffset[group]+member]
+			peerProfile, err := servicetls.LoadProfile(credential.Certificate, credential.Key, roots, rf3testfixture.ProcessIdentityOID, time.Now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			address := listeners[group][member]
+			directory = append(directory, gateway.NodeRecord{NodeID: groupNodes[group][member], Incarnation: 1,
+				ServiceKeyDigest: replication.Digest(peerProfile.LocalServiceKeyDigest()),
+				DataEndpoint:     distribution.EndpointID(address.Peer), NativeEndpoint: distribution.EndpointID(address.Native), ControlEndpoint: distribution.EndpointID(address.Control),
+				DataAddress: address.Peer, NativeAddress: address.Native, ControlAddress: address.Control,
+				Roles:         gateway.NodeRoleStorage | gateway.NodeRoleControl | gateway.NodeRoleCatalog,
+				FailureDomain: fmt.Sprintf("group-%d-member-%d", group, member), Lifecycle: gateway.NodeActive, Revision: 1, CatalogGeneration: built.Snapshot.Generation()})
+		}
+	}
+	directory[0].Roles |= gateway.NodeRoleGateway
+	directory[0].GatewayEndpoint, directory[0].GatewayAddress = "gateway-control", gatewayAddresses.Addresses[1]
+	directory[0].Gateway = gateway.GatewayIdentity{NodeID: profile.LocalIdentity().Node, Incarnation: 1,
+		ServiceKeyDigest: replication.Digest(profile.LocalServiceKeyDigest()), ServiceID: [16]byte{1}, SessionID: [16]byte{2}, SessionRevision: 1, ParticipantDigest: replication.Digest{3}}
+	if err := catalogAuthority.BootstrapNodeDirectory(ctx, directory); err != nil {
+		t.Fatalf("bootstrap physical directory: %v", err)
+	}
 	grant, err := gateway.BuildReplicaReplacementMembershipGrant(built.Snapshot,
 		routes[0].Group, [16]byte{0x41}, 2, 1, 4)
 	if err != nil {
@@ -1092,8 +1122,8 @@ func hotMutationCatalogAuthority(t *testing.T, profile *rafttransport.PeerTLS,
 		t.Fatal(err)
 	}
 	session, err := gateway.NewNativeSession(gateway.NativeSessionOptions{Executor: executor,
-		CatalogBootstrap: snapshot,
-		Route:            route, Distribution: string(route.Distribution), Shard: string(route.Shard),
+		CatalogBootstrap: snapshot, MaxMutations: 12,
+		Route: route, Distribution: string(route.Distribution), Shard: string(route.Shard),
 		Tenant: []byte{1}, ClientID: replication.ID128{0xa1}, RetryHome: replication.RetryHome{0xb1},
 		Resolver: gateway.BaseRelationResolver{Relation: 1}, Journal: journal,
 		ProposalCapability: serviceauthz.CapabilityTopology})

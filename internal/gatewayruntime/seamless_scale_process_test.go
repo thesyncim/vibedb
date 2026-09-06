@@ -116,6 +116,8 @@ type seamlessScaleWorkload struct {
 	mu           sync.Mutex
 	historyMu    sync.Mutex
 	history      map[string][]seamlessScaleWindow
+	sequence     uint64
+	seedRows     []seamlessScaleAck
 	seed         map[string]seamlessScaleAck
 	acknowledged map[string]seamlessScaleAck
 	sqlRequests  uint64
@@ -200,6 +202,7 @@ func (workload *seamlessScaleWorkload) Seed(t *testing.T, ctx context.Context) e
 			key := seamlessScaleAckKey(row)
 			workload.mu.Lock()
 			workload.seed[key] = row
+			workload.seedRows = append(workload.seedRows, row)
 			workload.acknowledged[key] = row
 			workload.mu.Unlock()
 		}
@@ -342,6 +345,18 @@ func calibrateSeamlessScaleRate(t *testing.T, workload *seamlessScaleWorkload, c
 	t.Helper()
 	for _, candidate := range []int{seamlessScaleOfferedRate, 1_000} {
 		probe := workload.Window(ctx, "calibration", 2*time.Second, candidate)
+		t.Logf("scale calibration rate=%d scheduled=%d completed=%d errors=%d missed=%d writes=%d reads=%d p99=%s", candidate, probe.Scheduled, probe.Completed, probe.Errors, probe.Missed, probe.AcknowledgedWrites, probe.VerifiedReads, time.Duration(probe.P99NS))
+		if probe.Errors != 0 {
+			workload.historyMu.Lock()
+			windows := workload.history["calibration"]
+			for _, sample := range windows[len(windows)-1].samples {
+				if sample.Err != nil {
+					t.Logf("calibration first operation error: %v", sample.Err)
+					break
+				}
+			}
+			workload.historyMu.Unlock()
+		}
 		if probe.Scheduled >= uint64(candidate)*2 && probe.Started == probe.Scheduled &&
 			probe.Completed == probe.Started && probe.Errors == 0 && probe.Missed == 0 {
 			return candidate
@@ -385,7 +400,10 @@ func (workload *seamlessScaleWorkload) HistoryEvidence(phase string) seamlessSca
 
 func (workload *seamlessScaleWorkload) doJob(ctx context.Context, worker int, connection net.Conn, scheduled time.Time) seamlessScaleSample {
 	sample := seamlessScaleSample{Scheduled: scheduled, Started: time.Now()}
-	sequence := uint64(scheduled.UnixNano())
+	workload.mu.Lock()
+	sequence := workload.sequence
+	workload.sequence++
+	workload.mu.Unlock()
 	if sequence%5 == 0 {
 		table := seamlessScaleTables[sequence%uint64(len(seamlessScaleTables))]
 		rowIndex := int(sequence % 1_000_000)
@@ -412,14 +430,9 @@ func (workload *seamlessScaleWorkload) doJob(ctx context.Context, worker int, co
 		}
 	} else {
 		workload.mu.Lock()
-		keys := make([]string, 0, len(workload.seed))
-		for key := range workload.seed {
-			keys = append(keys, key)
-		}
-		sort.Strings(keys)
 		var row seamlessScaleAck
-		if len(keys) != 0 {
-			row = workload.seed[keys[sequence%uint64(len(keys))]]
+		if len(workload.seedRows) != 0 {
+			row = workload.seedRows[sequence%uint64(len(workload.seedRows))]
 		}
 		workload.mu.Unlock()
 		if row.ID == "" {
@@ -448,9 +461,8 @@ func (workload *seamlessScaleWorkload) doJob(ctx context.Context, worker int, co
 					workload.mu.Lock()
 					workload.sqlRequests++
 					workload.mu.Unlock()
-					if result.code != "" || len(result.rows) != 1 || len(result.rows[0]) != 3 ||
-						result.rows[0][0] != row.ID || result.rows[0][1] != strconv.Itoa(row.Value) || result.rows[0][2] != row.Marker {
-						err = fmt.Errorf("unexpected SQL read result: %+v", result)
+					if !seamlessScaleSQLMatches(result, row) {
+						err = fmt.Errorf("unexpected SQL read result: code=%s rows=%d columns=%v key=%s worker=%d sequence=%d", result.code, len(result.rows), result.columns, row.ID, worker, sequence)
 					}
 				}
 				if err != nil {
@@ -636,8 +648,7 @@ func (workload *seamlessScaleWorkload) VerifyAllAcknowledgements(ctx context.Con
 		if err != nil {
 			return err
 		}
-		if result.code != "" || len(result.rows) != 1 || len(result.rows[0]) != 3 ||
-			result.rows[0][0] != row.ID || result.rows[0][1] != strconv.Itoa(row.Value) || result.rows[0][2] != row.Marker {
+		if !seamlessScaleSQLMatches(result, row) {
 			return fmt.Errorf("acknowledged row mismatch %s/%s: %+v", row.Table, row.ID, result)
 		}
 	}
@@ -662,8 +673,7 @@ func (workload *seamlessScaleWorkload) VerifyExactPG(ctx context.Context, addres
 		if err != nil {
 			return err
 		}
-		if result.code != "" || len(result.rows) != 1 || len(result.rows[0]) != 3 || result.rows[0][0] != row.ID ||
-			result.rows[0][1] != strconv.Itoa(row.Value) || result.rows[0][2] != row.Marker {
+		if !seamlessScaleSQLMatches(result, row) {
 			return fmt.Errorf("post-stop row mismatch %s/%s: %+v", row.Table, row.ID, result)
 		}
 	}
@@ -820,7 +830,6 @@ func TestSeamlessScaleInOutProcessQualification(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	profilePath := writeSeamlessScaleOperatorProfile(t, root, cluster)
 	// cluster dev is used only to emit the canonical RF3 inventory. Stop its
 	// supervisor before starting the same shipped node manifests directly; the
 	// direct process set lets this fixture restart one controller owner without
@@ -832,6 +841,7 @@ func TestSeamlessScaleInOutProcessQualification(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reissue initial cluster credentials under fixture CA: %v", err)
 	}
+	profilePath := writeSeamlessScaleOperatorProfile(t, root, cluster, caCertificate, caKey, domain)
 	gatewaySeeds := seamlessScaleInitialGatewaySeeds(t, cluster)
 	if len(cluster.NodeManifests) == 0 {
 		t.Fatal("initial cluster has no source node manifest")
@@ -860,6 +870,19 @@ func TestSeamlessScaleInOutProcessQualification(t *testing.T) {
 	}
 
 	physical := startSeamlessScalePhysicalCluster(t, ctx, shardBinary, cluster)
+	t.Cleanup(func() {
+		if !t.Failed() {
+			return
+		}
+		for index, node := range physical.nodes {
+			diagnostic := node.diagnostic.String()
+			if len(diagnostic) > 32<<10 {
+				diagnostic = diagnostic[len(diagnostic)-(32<<10):]
+			}
+			t.Logf("physical node %d final diagnostics:\n%s", index, diagnostic)
+		}
+	})
+
 	const survivorIndex = 1
 	clusterProfile, err := servicetls.LoadProfile(cluster.ClientCertificate, cluster.ClientKey, cluster.Roots, fusedNodeProcessOID, time.Now)
 	if err != nil {
@@ -1414,19 +1437,19 @@ func buildSeamlessScaleEmptyPreparation(sourceManifest, targetRoot, targetCertif
 	if err := vibejson.Unmarshal(raw, &source); err != nil {
 		return nil, err
 	}
-	if source.NodeLog.KeyID == "" || source.NodeLog.WrappedKey == "" || source.NodeLog.KeyMaterialPath == "" || len(grantNodes) == 0 {
+	if source.NodeLog.KeyID == "" || len(grantNodes) == 0 {
 		return nil, errors.New("scale fixture: source node-log key or initial grants are incomplete")
 	}
-	material, err := os.ReadFile(source.NodeLog.KeyMaterialPath)
+	material, err := os.ReadFile(targetNodeKey)
 	if err != nil || len(material) != 32 {
-		return nil, errors.New("scale fixture: source node-log key material is not a 32-byte key")
+		return nil, errors.New("scale fixture: target node-log key material is not a 32-byte key")
 	}
-	wrapped, err := hex.DecodeString(source.NodeLog.WrappedKey)
-	if err != nil || len(wrapped) == 0 {
-		return nil, errors.New("scale fixture: source node-log wrapped key is not hex")
-	}
-	var key raftstore.Key
-	key.ID, key.Wrapped = source.NodeLog.KeyID, wrapped
+	defer clear(material)
+	// A serving manifest may omit wrapped metadata: its existing node log
+	// owns that header. This fresh fixture node has its own key and provider
+	// metadata, so it neither reads nor copies another node's secret.
+	key := raftstore.Key{ID: source.NodeLog.KeyID, Wrapped: []byte("seamless-scale-fixture-key")}
+	defer clear(key.Material[:])
 	copy(key.Material[:], material)
 	options := rf3testfixture.EmptyNodeOptions{Root: targetRoot, NodeIncarnation: 1, Key: key,
 		NodeStore: source.NodeLog.Options, Listeners: rf3testfixture.ProcessListeners{
@@ -1518,27 +1541,14 @@ func writeSeamlessScaleTargetPreparation(t *testing.T, root string, cluster seam
 	if err := mintSeamlessScaleTargetCredential(caCertificate, caKey, targetCertificate, targetKey, domain, nodeID, int64(100+index)); err != nil {
 		t.Fatalf("target %d credential: %v", index, err)
 	}
-	// The node-log key material is local preparation input. It is copied from
-	// an already prepared node only as opaque key bytes; prepare-node-rf3 then
-	// publishes a fresh target-owned node-key under targetRoot.
-	var sourceFields map[string]json.RawMessage
-	raw, err := os.ReadFile(sourceManifest)
-	if err != nil || json.Unmarshal(raw, &sourceFields) != nil {
-		t.Fatalf("target %d source manifest: %v", index, err)
+	var keyMaterial [32]byte
+	if _, err := io.ReadFull(cryptorand.Reader, keyMaterial[:]); err != nil {
+		t.Fatalf("target %d generate node key: %v", index, err)
 	}
-	var nodeLog struct {
-		KeyMaterialPath string `json:"key_material_path"`
-	}
-	if err := json.Unmarshal(sourceFields["node_log"], &nodeLog); err != nil || nodeLog.KeyMaterialPath == "" {
-		t.Fatalf("target %d source node key: %v", index, err)
-	}
-	keyMaterial, err := os.ReadFile(nodeLog.KeyMaterialPath)
-	if err != nil {
-		t.Fatalf("target %d copy node key: %v", index, err)
-	}
-	if err := os.WriteFile(targetNodeKey, keyMaterial, 0o600); err != nil {
+	if err := os.WriteFile(targetNodeKey, keyMaterial[:], 0o600); err != nil {
 		t.Fatalf("target %d target node key: %v", index, err)
 	}
+	clear(keyMaterial[:])
 	listenerNames := []string{"peer", "native", "snapshot", "control"}
 	listenerValues := make(map[string]string, len(listenerNames))
 	for i, name := range listenerNames {
@@ -1677,7 +1687,7 @@ func validateSeamlessScaleManifestPaths(cluster seamlessScaleClusterManifest) er
 	return nil
 }
 
-func writeSeamlessScaleOperatorProfile(t *testing.T, root string, cluster seamlessScaleClusterManifest) string {
+func writeSeamlessScaleOperatorProfile(t *testing.T, root string, cluster seamlessScaleClusterManifest, caCertificate, caKey string, domain rafttransport.TrustDomain) string {
 	t.Helper()
 	if len(cluster.NodeManifests) < 2 {
 		t.Fatal("operator profile requires a surviving second frontend")
@@ -1685,9 +1695,44 @@ func writeSeamlessScaleOperatorProfile(t *testing.T, root string, cluster seamle
 	// The retiring frontend is node zero. All operator polls use the
 	// authenticated survivor so draining and stopping node zero cannot strand
 	// the operation-status client.
+	var operator rafttransport.NodeID
+	if _, err := cryptorand.Read(operator[:]); err != nil {
+		t.Fatal(err)
+	}
+	certificate, key := filepath.Join(root, "operator-cert.pem"), filepath.Join(root, "operator-key.pem")
+	if err := mintSeamlessScaleTargetCredential(caCertificate, caKey, certificate, key, domain, operator, 90); err != nil {
+		t.Fatal(err)
+	}
+	var policy struct {
+		Generation uint64 `json:"generation"`
+		Principals []struct {
+			Node         string   `json:"node"`
+			Capabilities []string `json:"capabilities"`
+		} `json:"principals"`
+	}
+	rawPolicy, err := os.ReadFile(cluster.AuthorizationPolicy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(rawPolicy, &policy); err != nil {
+		t.Fatal(err)
+	}
+	principal := struct {
+		Node         string   `json:"node"`
+		Capabilities []string `json:"capabilities"`
+	}{hex.EncodeToString(operator[:]), []string{"membership", "topology"}}
+	policy.Principals = append(policy.Principals, principal)
+	sort.Slice(policy.Principals, func(i, j int) bool { return policy.Principals[i].Node < policy.Principals[j].Node })
+	rawPolicy, err = vibejson.Marshal(&policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cluster.AuthorizationPolicy, rawPolicy, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	survivor := cluster.NodeManifests[1]
 	profile := clustercontrol.Profile{Format: clustercontrol.Format, Address: survivor.FrontendListen,
-		ServerNode: survivor.GatewayNode, Certificate: cluster.ClientCertificate, Key: cluster.ClientKey,
+		ServerNode: survivor.GatewayNode, Certificate: certificate, Key: key,
 		Roots: cluster.Roots, IdentityOID: fusedNodeProcessOID}
 	raw, err := vibejson.Marshal(&profile)
 	if err != nil {
@@ -1867,7 +1912,14 @@ func startSeamlessScalePhysicalCluster(t *testing.T, ctx context.Context, binary
 		if node.ServeManifest == "" {
 			t.Fatalf("physical node %d has no serve manifest", index+1)
 		}
-		physical.nodes = append(physical.nodes, startSeamlessScaleNode(t, ctx, binary, node.ServeManifest))
+		physical.nodes = append(physical.nodes, launchSeamlessScaleNode(t, binary, node.ServeManifest, waitSeamlessScaleManifestGateway))
+	}
+	// Start every voter before waiting for a gateway: opening the replicated
+	// catalog requires a quorum of those same processes.
+	for _, process := range physical.nodes {
+		if err := process.ready(ctx, process.manifest); err != nil {
+			t.Fatalf("physical node readiness: %v\n%s", err, process.diagnostic.String())
+		}
 	}
 	t.Cleanup(func() {
 		for index := len(physical.nodes) - 1; index >= 0; index-- {
@@ -1891,10 +1943,6 @@ func (physical *seamlessScalePhysicalCluster) StopAt(ctx context.Context, index 
 	return physical.nodes[index].StopContext(ctx)
 }
 
-func startSeamlessScaleNode(t *testing.T, ctx context.Context, binary, manifest string) *seamlessScaleNodeProcess {
-	return startSeamlessScaleNodeReady(t, ctx, binary, manifest, waitSeamlessScaleManifestGateway)
-}
-
 func startSeamlessScaleEmptyNode(t *testing.T, ctx context.Context, binary, manifest string, clientProfile *rafttransport.PeerTLS, target rafttransport.NodeID) *seamlessScaleNodeProcess {
 	t.Helper()
 	ready := func(readyCtx context.Context, readyManifest string) error {
@@ -1905,6 +1953,15 @@ func startSeamlessScaleEmptyNode(t *testing.T, ctx context.Context, binary, mani
 
 func startSeamlessScaleNodeReady(t *testing.T, ctx context.Context, binary, manifest string, ready func(context.Context, string) error) *seamlessScaleNodeProcess {
 	t.Helper()
+	process := launchSeamlessScaleNode(t, binary, manifest, ready)
+	if err := ready(ctx, manifest); err != nil {
+		t.Fatalf("node readiness: %v\n%s", err, process.diagnostic.String())
+	}
+	return process
+}
+
+func launchSeamlessScaleNode(t *testing.T, binary, manifest string, ready func(context.Context, string) error) *seamlessScaleNodeProcess {
+	t.Helper()
 	process := &seamlessScaleNodeProcess{command: exec.Command(binary, "serve-node", "-manifest", manifest, "-reload-prepared-groups"), diagnostic: new(rf3testfixture.ProcessDiagnostic), exited: make(chan struct{}), manifest: manifest, ready: ready}
 	process.command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	process.command.WaitDelay = 2 * time.Second
@@ -1913,10 +1970,6 @@ func startSeamlessScaleNodeReady(t *testing.T, ctx context.Context, binary, mani
 		t.Fatalf("start empty target: %v", err)
 	}
 	go func() { _ = process.command.Wait(); close(process.exited) }()
-	if err := ready(ctx, manifest); err != nil {
-		process.Stop(t)
-		t.Fatalf("node readiness: %v\n%s", err, process.diagnostic.String())
-	}
 	t.Cleanup(func() { process.Stop(t) })
 	return process
 }
@@ -2147,3 +2200,63 @@ var _ = bufio.ErrInvalidUnreadByte
 var _ = io.EOF
 var _ = sort.Strings
 var _ = sync.Once{}
+
+func TestSeamlessScalePreparationDoesNotReadSourceKey(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source.json")
+	// An existing serving manifest intentionally omits wrapped-key metadata.
+	// Its key path is inaccessible: fresh preparation must use only the target key.
+	if err := os.WriteFile(source, []byte(`{"node_log":{"key_id":"fixture-key","key_material_path":"/missing/source-key","options":{"MaxGroups":64}}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	targetKey := filepath.Join(root, "target-key")
+	if err := os.WriteFile(targetKey, bytes.Repeat([]byte{7}, 32), 0600); err != nil {
+		t.Fatal(err)
+	}
+	seed := nodecontrol.BootstrapGatewaySeed{NodeID: rafttransport.NodeID{1}, Incarnation: 1, ControlAddress: "127.0.0.1:9000", SPKIPinDigest: replication.Digest{2}}
+	raw, err := buildSeamlessScaleEmptyPreparation(source, filepath.Join(root, "target"), "/cert", "/key", targetKey, "/policy", "/roots",
+		map[string]string{"peer": "127.0.0.1:9001", "native": "127.0.0.1:9002", "snapshot": "127.0.0.1:9003", "control": "127.0.0.1:9004"},
+		[]rafttransport.NodeID{{1}}, []nodecontrol.BootstrapGatewaySeed{seed})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result struct {
+		NodeLog seamlessScaleNodeLogInput `json:"node_log"`
+	}
+	if err := vibejson.Unmarshal(raw, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.NodeLog.KeyMaterialPath != targetKey || result.NodeLog.WrappedKey == "" {
+		t.Fatal("fresh preparation lost its own key provider")
+	}
+}
+
+func seamlessScaleSQLMatches(result fusedPGResult, row seamlessScaleAck) bool {
+	if result.code != "" || len(result.rows) != 1 || len(result.rows[0]) != 3 || len(result.columns) != 3 || !fusedPGNumericOID(result.columns[1]) {
+		return false
+	}
+	id, idErr := fusedPGCellText(result.rows[0][0], result.columns[0])
+	marker, markerErr := fusedPGCellText(result.rows[0][2], result.columns[2])
+	return idErr == nil && markerErr == nil && id == row.ID && marker == row.Marker && result.rows[0][1] == strconv.Itoa(row.Value)
+}
+
+func TestSeamlessScaleSQLOracleUsesDeclaredColumnTypes(t *testing.T) {
+	row := seamlessScaleAck{ID: "quoted-id", Value: 7, Marker: "marker"}
+	result := fusedPGResult{columns: []uint32{114, 114, 114}, rows: [][]string{{`"quoted-id"`, "7", `"marker"`}}}
+	if !seamlessScaleSQLMatches(result, row) {
+		t.Fatal("canonical JSON columns rejected")
+	}
+	result.rows[0][0] = row.ID
+	if seamlessScaleSQLMatches(result, row) {
+		t.Fatal("invalid unquoted JSON accepted")
+	}
+	result.columns = []uint32{25, 23, 25}
+	result.rows[0][2] = row.Marker
+	if !seamlessScaleSQLMatches(result, row) {
+		t.Fatal("PostgreSQL text columns rejected")
+	}
+	result.rows[0][1] = "8"
+	if seamlessScaleSQLMatches(result, row) {
+		t.Fatal("wrong numeric value accepted")
+	}
+}

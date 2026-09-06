@@ -144,3 +144,20 @@ func TestProfileIsCanonicalAndBounded(t *testing.T) {
 		t.Fatalf("relative profile accepted: %v", err)
 	}
 }
+
+func TestNodesResponseRoundTrip(t *testing.T) {
+	response := Response{Format: Format, Op: OpNodes, OK: true, RequestID: testRequestID, CatalogGeneration: 1, DirectoryRevision: 1,
+		Nodes: []NodeStatus{
+			{NodeID: "11111111111111111111111111111111", Incarnation: 1, Lifecycle: "active", Revision: 1, CatalogGeneration: 1},
+			{NodeID: "22222222222222222222222222222222", Incarnation: 1, Lifecycle: "active", Revision: 1, CatalogGeneration: 1},
+			{NodeID: "33333333333333333333333333333333", Incarnation: 1, Lifecycle: "active", Revision: 1, CatalogGeneration: 1},
+		}}
+	raw, err := EncodeResponse(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := DecodeResponse(raw)
+	if err != nil {
+		t.Fatalf("nodes response: %v; encoded=%s decoded=%+v", err, raw, decoded)
+	}
+}

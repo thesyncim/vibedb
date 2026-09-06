@@ -34,18 +34,25 @@ var (
 // either represented by a durable ScalingIntent or returns an error before
 // the operation ID is exposed.
 type ScalingOperatorBackend struct {
-	controller *ScalingController
-	directory  gateway.DirectoryReader
-	writer     gateway.DirectoryWriter
-	catalog    scalingCatalogReader
+	directory gateway.DirectoryReader
+	writer    gateway.DirectoryWriter
+	catalog   scalingCatalogReader
 }
 
 func NewScalingOperatorBackend(controller *ScalingController) (*ScalingOperatorBackend, error) {
 	if controller == nil || controller.directory == nil || controller.writer == nil || controller.catalog == nil {
 		return nil, errClusterControlUnavailable
 	}
-	return &ScalingOperatorBackend{controller: controller, directory: controller.directory,
-		writer: controller.writer, catalog: controller.catalog}, nil
+	return newScalingOperatorBackend(controller.directory, controller.writer, controller.catalog)
+}
+
+// Participants expose the same durable operator API without starting another
+// autonomous reconciliation loop. The active controller discovers these intents.
+func newScalingOperatorBackend(directory gateway.DirectoryReader, writer gateway.DirectoryWriter, catalog scalingCatalogReader) (*ScalingOperatorBackend, error) {
+	if directory == nil || writer == nil || catalog == nil {
+		return nil, errClusterControlUnavailable
+	}
+	return &ScalingOperatorBackend{directory: directory, writer: writer, catalog: catalog}, nil
 }
 
 // ExecuteClusterControl implements the wire operation contract.  Mutating

@@ -485,7 +485,11 @@ func DecodeResponse(line []byte) (Response, error) {
 	}
 	canonical, err := vibejson.Marshal(&response)
 	if err != nil || !bytes.Equal(canonical, raw) {
-		return Response{}, errors.Join(ErrInvalidResponse, ErrNonCanonical, err)
+		offset := 0
+		for offset < len(raw) && offset < len(canonical) && raw[offset] == canonical[offset] {
+			offset++
+		}
+		return Response{}, errors.Join(ErrInvalidResponse, ErrNonCanonical, fmt.Errorf("response differs at byte %d (received %d, canonical %d)", offset, len(raw), len(canonical)), err)
 	}
 	if !response.Valid() {
 		return Response{}, ErrInvalidResponse
