@@ -155,3 +155,19 @@ func TestPreparationSourceClientRejectsReplySubstitution(t *testing.T) {
 		})
 	}
 }
+
+func TestPreparationSourceErrorRepliesAreBoundedAndExplicit(t *testing.T) {
+	var wire bytes.Buffer
+	nonce := [16]byte{1}
+	if err := writePreparationSourceFrame(&wire, preparationSourceErrorMagic, nonce, []byte("source command changed")); err != nil {
+		t.Fatal(err)
+	}
+	if _, got, err := readPreparationSourceFrame(bytes.NewReader(wire.Bytes()), preparationSourceReplyMagic, MaxPayloadBytes); !errors.Is(err, ErrControl) || got != nonce {
+		t.Fatalf("source rejection lost identity: nonce=%x err=%v", got, err)
+	}
+	raw := append([]byte(nil), wire.Bytes()[:32]...)
+	binary.BigEndian.PutUint32(raw[24:28], maxPreparationSourceErrorBytes+1)
+	if _, _, err := readPreparationSourceFrame(bytes.NewReader(raw), preparationSourceReplyMagic, MaxPayloadBytes); !errors.Is(err, ErrBound) {
+		t.Fatalf("error body allocated before bound: %v", err)
+	}
+}

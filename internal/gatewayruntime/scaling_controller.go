@@ -228,7 +228,8 @@ func (controller *ScalingController) advance(ctx context.Context, intent gateway
 
 	resumed, resumeErr := controller.resumeEnrollments(ctx, intent)
 	if resumeErr != nil {
-		return advanced, false, 0, true, resumeErr
+		recordErr := controller.recordBlocker(ctx, intent, scalingBlockerFromError(resumeErr))
+		return advanced, false, 0, true, errors.Join(resumeErr, recordErr)
 	}
 	if synchronized, syncErr := controller.reconcileIntentProgress(ctx, intent); syncErr != nil {
 		return advanced, false, 0, true, syncErr
@@ -301,7 +302,8 @@ func (controller *ScalingController) advance(ctx context.Context, intent gateway
 		return advanced, false, 0, true, nil
 	}
 	if err = controller.admitMoves(ctx, intent, plan); err != nil {
-		return advanced, false, len(plan.Moves), true, err
+		recordErr := controller.recordBlocker(ctx, intent, scalingBlockerFromError(err))
+		return advanced, false, len(plan.Moves), true, errors.Join(err, recordErr)
 	}
 	return true, false, len(plan.Moves), false, nil
 }
@@ -760,7 +762,10 @@ func (controller *ScalingController) plan(ctx context.Context, intent gateway.Sc
 		if err != nil {
 			return scaling.PlacementPlan{}, err
 		}
-		nodes = slices.Clone(initialDirectory.Nodes)
+		nodes, err = scalingPlacementNodes(initialDirectory, snapshot.Generation())
+		if err != nil {
+			return scaling.PlacementPlan{}, err
+		}
 	} else {
 		nodes, err = controller.directory.ListNodes(ctx)
 		if err != nil {
@@ -1142,3 +1147,18 @@ type clusterControlBackend interface {
 
 var _ gateway.DirectoryReader = (*gateway.ReplicatedCatalogAuthority)(nil)
 var _ gateway.DirectoryWriter = (*gateway.ReplicatedCatalogAuthority)(nil)
+
+// scalingPlacementNodes binds unchanged directory rows to the catalog cut
+// being planned. A row's CatalogGeneration records its last mutation, not the
+// freshness of a new complete directory observation. The caller rechecks both
+// directory digest/revision and catalog digest before admitting the plan.
+func scalingPlacementNodes(cut gateway.NodeDirectoryCut, generation uint64) ([]gateway.NodeRecord, error) {
+	if !cut.Valid() || generation == 0 || cut.CatalogGeneration > generation {
+		return nil, gateway.ErrScalingRevision
+	}
+	nodes := slices.Clone(cut.Nodes)
+	for index := range nodes {
+		nodes[index].CatalogGeneration = generation
+	}
+	return nodes, nil
+}

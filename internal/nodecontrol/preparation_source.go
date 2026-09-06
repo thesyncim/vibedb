@@ -6,16 +6,22 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibejson"
 	"io"
+	"strings"
 )
 
 const maxPreparationSourceRequestBytes = 64 << 10
 
 var preparationSourceRequestMagic = [8]byte{'V', 'D', 'P', 'R', 'E', 'P', 'Q', 1}
+var preparationSourceErrorMagic = [8]byte{'V', 'D', 'P', 'R', 'E', 'P', 'E', 1}
+
+const maxPreparationSourceErrorBytes = 1024
+
 var preparationSourceReplyMagic = [8]byte{'V', 'D', 'P', 'R', 'E', 'P', 'R', 1}
 
 func PreparationSourceRequestDiscriminator() [8]byte { return preparationSourceRequestMagic }
@@ -88,7 +94,17 @@ func (service *PreparationSourceService) Serve(ctx context.Context, connection r
 	}
 	payload, err := service.source(ctx, intent, request.Voters)
 	if err != nil {
-		return err
+		if deadlineErr := connection.SetWriteDeadline(nodeInfoBoundedDeadline(ctx, service.write())); deadlineErr != nil {
+			return errors.Join(err, deadlineErr)
+		}
+		detail := strings.NewReplacer("\x00", "", "\r", " ", "\n", " ").Replace(err.Error())
+		if len(detail) > maxPreparationSourceErrorBytes {
+			detail = detail[:maxPreparationSourceErrorBytes]
+		}
+		if detail == "" {
+			detail = ErrControl.Error()
+		}
+		return errors.Join(err, writePreparationSourceFrame(connection, preparationSourceErrorMagic, nonce, []byte(detail)))
 	}
 	if len(payload) == 0 || len(payload) > MaxPayloadBytes {
 		return ErrBound
@@ -143,11 +159,11 @@ func (client *PreparationSourceClient) Read(ctx context.Context, intent gateway.
 		return nil, err
 	}
 	payload, replyNonce, err := readPreparationSourceFrame(connection, preparationSourceReplyMagic, MaxPayloadBytes)
+	if replyNonce != ([16]byte{}) && replyNonce != nonce {
+		return nil, ErrConflict
+	}
 	if err != nil {
 		return nil, err
-	}
-	if replyNonce != nonce {
-		return nil, ErrConflict
 	}
 	if _, err = OpenPreparationSpec(payload); err != nil {
 		return nil, err
@@ -173,10 +189,17 @@ func readPreparationSourceFrame(reader io.Reader, magic [8]byte, maximum int) ([
 	}
 	copy(nonce[:], header[8:24])
 	n := binary.BigEndian.Uint32(header[24:28])
-	if !bytes.Equal(header[:8], magic[:]) || nonce == ([16]byte{}) || binary.BigEndian.Uint32(header[28:]) != 0 || n == 0 || uint64(n) > uint64(maximum) {
+	errorReply := magic == preparationSourceReplyMagic && bytes.Equal(header[:8], preparationSourceErrorMagic[:])
+	if errorReply {
+		maximum = min(maximum, maxPreparationSourceErrorBytes)
+	}
+	if (!bytes.Equal(header[:8], magic[:]) && !errorReply) || nonce == ([16]byte{}) || binary.BigEndian.Uint32(header[28:]) != 0 || n == 0 || uint64(n) > uint64(maximum) {
 		return nil, nonce, ErrBound
 	}
 	payload := make([]byte, int(n))
 	_, err := io.ReadFull(reader, payload)
+	if err == nil && errorReply {
+		return nil, nonce, fmt.Errorf("%w: source preparation: %s", ErrControl, payload)
+	}
 	return payload, nonce, err
 }

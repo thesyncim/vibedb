@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/nodecontrol"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
@@ -52,7 +53,7 @@ func newRF3PreparationSource(schemas *rf3SchemaActivator, registry *rafttranspor
 				return nil, nodecontrol.ErrConflict
 			}
 			if err = spec.ValidateAgainst(intent); err != nil {
-				return nil, err
+				return nil, fmt.Errorf("preparation source payload binding: %w", err)
 			}
 			return raw, nil
 		}
@@ -80,35 +81,35 @@ func newRF3PreparationSource(schemas *rf3SchemaActivator, registry *rafttranspor
 		state := schemas.groups[intent.Group]
 		schemas.mu.RUnlock()
 		if state == nil {
-			return nil, nodecontrol.ErrStale
+			return nil, fmt.Errorf("preparation source group is not hosted: %w", nodecontrol.ErrStale)
 		}
 		state.mu.Lock()
 		defer state.mu.Unlock()
 		if state.apply == nil || state.identity.MemberID != intent.Source.Member || state.identity.StoreID != intent.Source.StoreID || state.identity.NodeIncarnation < intent.Source.NodeIncarnation {
-			return nil, nodecontrol.ErrStale
+			return nil, fmt.Errorf("preparation source runtime binding differs from catalog: %w", nodecontrol.ErrStale)
 		}
 		publication := state.apply.Published()
 		profile, err := state.apply.CapacityQualificationProfile()
 		if err != nil {
 			return nil, err
 		}
-		if commandFenceFromPublication(profile.Binding.Authority, state.identity, publication.ReplicaSetVersion) != intent.ExpectedCommand {
-			return nil, nodecontrol.ErrStale
+		if actual := commandFenceFromPublication(profile.Binding.Authority, state.identity, publication.ReplicaSetVersion); actual != intent.ExpectedCommand {
+			return nil, fmt.Errorf("preparation source command got=%+v want=%+v: %w", actual, intent.ExpectedCommand, nodecontrol.ErrStale)
 		}
 		if publication.ConfState == nil || len(publication.ConfState.Voters) != 3 || len(publication.ConfState.Learners) != 0 || len(publication.ConfState.VotersOutgoing) != 0 {
-			return nil, nodecontrol.ErrStale
+			return nil, fmt.Errorf("preparation source membership is not stable RF3: %w", nodecontrol.ErrStale)
 		}
 		for _, voter := range voters {
 			if !slices.Contains(publication.ConfState.Voters, voter.MemberID) {
-				return nil, nodecontrol.ErrStale
+				return nil, fmt.Errorf("preparation source voter %d absent: %w", voter.MemberID, nodecontrol.ErrStale)
 			}
 			node, err := registry.Node(intent.Group, voter.MemberID)
 			if err != nil || node != voter.Node {
-				return nil, nodecontrol.ErrStale
+				return nil, fmt.Errorf("preparation source voter %d physical identity mismatch: %w", voter.MemberID, nodecontrol.ErrStale)
 			}
 			peer, err := registry.PhysicalPeer(node)
 			if err != nil || peer.Endpoint != voter.PeerAddress {
-				return nil, nodecontrol.ErrStale
+				return nil, fmt.Errorf("preparation source voter %d peer endpoint %q differs from %q: %w", voter.MemberID, peer.Endpoint, voter.PeerAddress, nodecontrol.ErrStale)
 			}
 		}
 		template := state.manifest.SplitControl.ChildRegistry
