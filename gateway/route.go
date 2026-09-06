@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"slices"
 	"sync"
 
 	"github.com/thesyncim/vibedb/autosplit"
@@ -127,6 +128,12 @@ func (e *Executor) routeContextCached(
 	}
 
 	calls := make([]shardCall, len(route.Targets))
+	ownedCalls := true
+	defer func() {
+		if ownedCalls {
+			releaseShardCalls(calls)
+		}
+	}()
 	partialAggregate := len(route.Targets) > 1 && len(bound.groupKeys) != 0
 	for i := range route.Targets {
 		t := route.Targets[i]
@@ -168,9 +175,18 @@ func (e *Executor) routeContextCached(
 
 	var physical *queryplanner.Plan
 	var planning queryplanner.OptimizerStatistics
+	maxAggregateBytes := p.withDefaults().MaxAggregateBytes
+	// For a nonaggregate, nongrouped shape, memory admission depends on the
+	// exact target partition estimates, target count, and effective aggregate
+	// memory cap. Bound predicates and LIMIT/OFFSET can change rows, CPU, and
+	// network work without changing that admission decision, so this cache
+	// reuses only after the generation, route kind, exact targets, and cap all
+	// match. Aggregate and grouped shapes remain per-query because their memory
+	// admission also depends on grouping state.
 	cacheable := cache != nil && len(bound.aggregates) == 0 && len(bound.groupKeys) == 0
 	if cacheable && cache.generation == snap.Generation() && cache.physical != nil &&
-		cache.routeKind == route.Kind && cache.targets == len(route.Targets) {
+		cache.routeKind == route.Kind && cache.maxAggregateBytes == maxAggregateBytes &&
+		slices.Equal(cache.targets, route.Targets) {
 		physical, planning = cache.physical, cache.planning
 	} else {
 		physical, planning, err = optimizeDistributedPlan(ctx, snap, bound, route, p)
@@ -179,11 +195,13 @@ func (e *Executor) routeContextCached(
 		}
 		if cacheable {
 			cache.routeKind = route.Kind
-			cache.targets = len(route.Targets)
+			cache.targets = slices.Clone(route.Targets)
+			cache.maxAggregateBytes = maxAggregateBytes
 			cache.physical = physical
 			cache.planning = planning
 		}
 	}
+	ownedCalls = false
 	return &plan{
 		kind:         route.Kind,
 		distribution: route.Distribution,
