@@ -47,12 +47,7 @@ func (runtime *Runtime) openCatalogDrainService(manifest gatewayReplicaControlMa
 	}
 	if runtime.serviceDirectory != nil {
 		if cut, found := runtime.serviceDirectory.Cut(); found {
-			for _, binding := range cut.Bindings {
-				if binding.Roles&serviceauthz.ServiceRoleStorage != 0 &&
-					binding.Lifecycle == serviceauthz.ServiceJoining {
-					nodes = append(nodes, binding.Principal)
-				}
-			}
+			nodes = appendBootstrapControlNodes(nodes, cut)
 		}
 	}
 	runtime.controlRosterMu.Lock()

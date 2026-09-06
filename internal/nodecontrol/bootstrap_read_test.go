@@ -3,6 +3,7 @@ package nodecontrol
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"net"
 	"testing"
@@ -325,5 +326,22 @@ func TestBootstrapStableReadAcceptsIndependentlyDecodedPreparedProofs(t *testing
 		if sameBootstrapReadIntent(altered, intent) {
 			t.Fatal("altered proof accepted")
 		}
+	}
+}
+
+func TestBootstrapReadFailureReplyIsBoundedAndNonceBound(t *testing.T) {
+	var wire bytes.Buffer
+	nonce := [bootstrapReadNonceBytes]byte{9}
+	if err := writeBootstrapReadFailure(&wire, nonce, errors.New("directory changed\nduring scan")); err != nil {
+		t.Fatal(err)
+	}
+	reply, err := ReadBootstrapReadReply(bytes.NewReader(wire.Bytes()))
+	if !errors.Is(err, ErrBootstrapRead) || reply.Nonce != nonce || err.Error() != "nodecontrol: invalid bootstrap enrollment read: gateway bootstrap read: directory changed during scan" {
+		t.Fatalf("error reply: nonce=%x err=%v", reply.Nonce, err)
+	}
+	raw := bytes.Clone(wire.Bytes()[:bootstrapReadResponseHeader])
+	binary.BigEndian.PutUint32(raw[28:32], maxBootstrapReadErrorBytes+1)
+	if _, err := ReadBootstrapReadReply(bytes.NewReader(raw)); !errors.Is(err, ErrBootstrapReadBound) {
+		t.Fatalf("unbounded error: %v", err)
 	}
 }

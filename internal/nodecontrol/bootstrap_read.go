@@ -12,10 +12,12 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"net"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/thesyncim/vibedb/gateway"
@@ -44,6 +46,8 @@ const (
 	bootstrapReadMaxConcurrency   = 64
 	bootstrapReadNonceBytes       = 16
 	bootstrapReadResponseSuccess  = 1
+	bootstrapReadResponseFailure  = 2
+	maxBootstrapReadErrorBytes    = 1024
 	bootstrapReadOperationReadOwn = 1
 )
 
@@ -215,7 +219,7 @@ func AppendBootstrapReadReply(dst []byte, reply BootstrapReadReply) ([]byte, err
 
 func OpenBootstrapReadReply(raw []byte) (BootstrapReadReply, error) {
 	if len(raw) < bootstrapReadResponseHeader || !bytes.Equal(raw[:8], bootstrapReadResponseMagic[:]) ||
-		raw[8] != bootstrapReadVersion || raw[9] != bootstrapReadResponseSuccess || raw[10] != 0 || raw[11] != 0 {
+		raw[8] != bootstrapReadVersion || (raw[9] != bootstrapReadResponseSuccess && raw[9] != bootstrapReadResponseFailure) || raw[10] != 0 || raw[11] != 0 {
 		return BootstrapReadReply{}, ErrBootstrapRead
 	}
 	payloadBytes := int(binary.BigEndian.Uint32(raw[28:32]))
@@ -224,6 +228,14 @@ func OpenBootstrapReadReply(raw []byte) (BootstrapReadReply, error) {
 	}
 	if sha256.Sum256(raw[64:]) != [sha256.Size]byte(raw[32:64]) {
 		return BootstrapReadReply{}, ErrBootstrapRead
+	}
+	if raw[9] == bootstrapReadResponseFailure {
+		var reply BootstrapReadReply
+		copy(reply.Nonce[:], raw[12:28])
+		if payloadBytes > maxBootstrapReadErrorBytes {
+			return reply, ErrBootstrapReadBound
+		}
+		return reply, fmt.Errorf("%w: gateway bootstrap read: %s", ErrBootstrapRead, raw[64:])
 	}
 	var reply BootstrapReadReply
 	if err := vibejson.Unmarshal(raw[64:], &reply); err != nil {
@@ -253,6 +265,9 @@ func ReadBootstrapReadReply(reader io.Reader) (BootstrapReadReply, error) {
 		return BootstrapReadReply{}, errors.Join(ErrBootstrapRead, err)
 	}
 	payloadBytes := int(binary.BigEndian.Uint32(header[28:32]))
+	if header[9] == bootstrapReadResponseFailure && payloadBytes > maxBootstrapReadErrorBytes {
+		return BootstrapReadReply{}, ErrBootstrapReadBound
+	}
 	if payloadBytes == 0 || payloadBytes > MaxBootstrapReadReplyBytes {
 		return BootstrapReadReply{}, ErrBootstrapRead
 	}
@@ -338,15 +353,21 @@ func (service *BootstrapReadService) Serve(ctx context.Context, connection raftt
 	if peer.TrustDomain != service.trustDomain || peer.Node != request.PhysicalNode {
 		return ErrBootstrapReadUnauthorized
 	}
+	fail := func(failure error) error {
+		if deadlineErr := connection.SetWriteDeadline(bootstrapReadBoundedDeadline(ctx, service.writeDeadline())); deadlineErr != nil {
+			return errors.Join(failure, deadlineErr)
+		}
+		return errors.Join(failure, writeBootstrapReadFailure(connection, request.Nonce, failure))
+	}
 	record, err := service.authority.ReadNode(ctx, request.PhysicalNode, request.Incarnation)
 	if err != nil {
-		return errors.Join(ErrBootstrapReadStale, err)
+		return fail(errors.Join(ErrBootstrapReadStale, err))
 	}
 	if record.Lifecycle == gateway.NodeDecommissioned {
-		return ErrBootstrapReadRetired
+		return fail(ErrBootstrapReadRetired)
 	}
 	if record.Lifecycle != gateway.NodeJoining && record.Lifecycle != gateway.NodeActive && record.Lifecycle != gateway.NodeDraining {
-		return ErrBootstrapReadStale
+		return fail(ErrBootstrapReadStale)
 	}
 	if record.ServiceKeyDigest != replication.Digest(connection.PeerKeyDigest()) || !service.authorize(peer, record) ||
 		service.authorizeAuthenticated != nil && !service.authorizeAuthenticated(rafttransport.Binding(connection), record) {
@@ -354,7 +375,7 @@ func (service *BootstrapReadService) Serve(ctx context.Context, connection raftt
 	}
 	reply, err := service.readStable(ctx, request, record)
 	if err != nil {
-		return err
+		return fail(err)
 	}
 	if deadline := bootstrapReadBoundedDeadline(ctx, service.writeDeadline()); deadline.IsZero() {
 		return ErrBootstrapRead
@@ -369,28 +390,28 @@ func (service *BootstrapReadService) readStable(
 ) (BootstrapReadReply, error) {
 	before, err := service.authority.ReadNodeDirectoryCut(ctx)
 	if err != nil || !before.Valid() {
-		return BootstrapReadReply{}, errors.Join(ErrBootstrapReadStale, err)
+		return BootstrapReadReply{}, fmt.Errorf("bootstrap initial directory cut: %w", errors.Join(ErrBootstrapReadStale, err))
 	}
 	intent, err := service.authority.ReadEnrollmentIntent(ctx, request.IntentID)
 	if err != nil {
-		return BootstrapReadReply{}, errors.Join(ErrBootstrapReadStale, err)
+		return BootstrapReadReply{}, fmt.Errorf("bootstrap enrollment lookup: %w", errors.Join(ErrBootstrapReadStale, err))
 	}
 	if !intent.Valid() || intent.State == gateway.EnrollmentCancelled || intent.IntentID != request.IntentID ||
 		intent.Target.Node != request.PhysicalNode || intent.Target.NodeIncarnation != request.Incarnation {
-		return BootstrapReadReply{}, ErrBootstrapReadStale
+		return BootstrapReadReply{}, fmt.Errorf("bootstrap requested target binding: %w", ErrBootstrapReadStale)
 	}
 	evidence, err := service.authority.ScanNodeReferences(ctx, request.PhysicalNode, request.Incarnation)
 	if err != nil {
-		return BootstrapReadReply{}, errors.Join(ErrBootstrapReadStale, err)
+		return BootstrapReadReply{}, fmt.Errorf("bootstrap reference scan: %w", errors.Join(ErrBootstrapReadStale, err))
 	}
 	after, err := service.authority.ReadNodeDirectoryCut(ctx)
 	if err != nil || !after.Valid() || before.Revision != after.Revision || before.Digest != after.Digest ||
 		evidence.DirectoryCutRevision != after.Revision || evidence.DirectoryCutDigest != after.Digest {
-		return BootstrapReadReply{}, ErrBootstrapReadStale
+		return BootstrapReadReply{}, fmt.Errorf("bootstrap directory cut changed during scan: %w", ErrBootstrapReadStale)
 	}
 	final, err := service.authority.ReadNode(ctx, request.PhysicalNode, request.Incarnation)
 	if err != nil || final != initial || final.Lifecycle == gateway.NodeDecommissioned {
-		return BootstrapReadReply{}, ErrBootstrapReadStale
+		return BootstrapReadReply{}, fmt.Errorf("bootstrap physical node changed during scan: %w", ErrBootstrapReadStale)
 	}
 	// The reference scan and the directory cut fence cover the global
 	// enrollment directory, but the requested row is a separate bounded read.
@@ -404,11 +425,11 @@ func (service *BootstrapReadService) readStable(
 		finalIntent.State == gateway.EnrollmentCancelled ||
 		finalIntent.Target.Node != request.PhysicalNode ||
 		finalIntent.Target.NodeIncarnation != request.Incarnation {
-		return BootstrapReadReply{}, ErrBootstrapReadStale
+		return BootstrapReadReply{}, fmt.Errorf("bootstrap enrollment changed during scan: %w", ErrBootstrapReadStale)
 	}
 	finalCut, err := service.authority.ReadNodeDirectoryCut(ctx)
 	if err != nil || !finalCut.Valid() || finalCut.Revision != after.Revision || finalCut.Digest != after.Digest {
-		return BootstrapReadReply{}, ErrBootstrapReadStale
+		return BootstrapReadReply{}, fmt.Errorf("bootstrap final directory cut changed: %w", ErrBootstrapReadStale)
 	}
 	// Catalog publication and enrollment-directory updates do not necessarily
 	// advance the physical-node directory cut. Repeating the bounded reference
@@ -416,7 +437,7 @@ func (service *BootstrapReadService) readStable(
 	// in the reply describe the same observed cut as the row re-read.
 	verification, err := service.authority.ScanNodeReferences(ctx, request.PhysicalNode, request.Incarnation)
 	if err != nil || verification != evidence {
-		return BootstrapReadReply{}, ErrBootstrapReadStale
+		return BootstrapReadReply{}, fmt.Errorf("bootstrap reference scan changed: %w", ErrBootstrapReadStale)
 	}
 	reply := BootstrapReadReply{
 		Nonce: request.Nonce, Operation: request.Operation, PhysicalNode: request.PhysicalNode,
@@ -427,7 +448,7 @@ func (service *BootstrapReadService) readStable(
 		EnrollmentDirectoryDigest: evidence.EnrollmentDirectoryDigest,
 	}
 	if !reply.valid() {
-		return BootstrapReadReply{}, ErrBootstrapReadStale
+		return BootstrapReadReply{}, fmt.Errorf("bootstrap reply witness invalid: %w", ErrBootstrapReadStale)
 	}
 	return reply, nil
 }
@@ -551,6 +572,9 @@ func (client *BootstrapReadClient) readOne(
 		return gateway.GroupEnrollmentIntent{}, errors.Join(ErrBootstrapReadOutcomeUnknown, err)
 	}
 	reply, err := ReadBootstrapReadReply(connection)
+	if reply.Nonce != ([bootstrapReadNonceBytes]byte{}) && reply.Nonce != nonce {
+		return gateway.GroupEnrollmentIntent{}, ErrBootstrapReadConflict
+	}
 	if err != nil {
 		return gateway.GroupEnrollmentIntent{}, errors.Join(ErrBootstrapReadOutcomeUnknown, err)
 	}
@@ -604,4 +628,26 @@ func sameBootstrapReadIntent(left, right gateway.GroupEnrollmentIntent) bool {
 	left.Proof, right.Proof = nil, nil
 	left.Receipt, right.Receipt = nil, nil
 	return left == right
+}
+
+func writeBootstrapReadFailure(writer io.Writer, nonce [bootstrapReadNonceBytes]byte, failure error) error {
+	detail := strings.NewReplacer("\x00", "", "\r", " ", "\n", " ").Replace(failure.Error())
+	if len(detail) > maxBootstrapReadErrorBytes {
+		detail = detail[:maxBootstrapReadErrorBytes]
+	}
+	if detail == "" {
+		detail = ErrBootstrapRead.Error()
+	}
+	var header [bootstrapReadResponseHeader]byte
+	copy(header[:8], bootstrapReadResponseMagic[:])
+	header[8] = bootstrapReadVersion
+	header[9] = bootstrapReadResponseFailure
+	copy(header[12:28], nonce[:])
+	binary.BigEndian.PutUint32(header[28:32], uint32(len(detail)))
+	digest := sha256.Sum256([]byte(detail))
+	copy(header[32:64], digest[:])
+	if err := bootstrapReadWriteFull(writer, header[:]); err != nil {
+		return err
+	}
+	return bootstrapReadWriteFull(writer, []byte(detail))
 }

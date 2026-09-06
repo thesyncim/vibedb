@@ -304,7 +304,7 @@ func (runtime *Runtime) applyLiveControlDirectory(
 		}
 	}
 	if runtime.controlAuthorizer != nil {
-		if err := runtime.controlAuthorizer.Replace(controlDirectoryGatewayNodes(directory)); err != nil {
+		if err := runtime.controlAuthorizer.Replace(appendBootstrapControlNodes(controlDirectoryGatewayNodes(directory), serviceCut)); err != nil {
 			return fmt.Errorf("update gateway control authorization: %w", err)
 		}
 	}

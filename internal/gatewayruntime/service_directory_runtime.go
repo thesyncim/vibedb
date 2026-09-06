@@ -221,3 +221,21 @@ func serviceLifecycle(state gateway.NodeLifecycle) (serviceauthz.ServiceLifecycl
 		return 0, false
 	}
 }
+
+// appendBootstrapControlNodes projects physical storage identities into the
+// shared listener roster. Certificate-bound and request-level checks still
+// authorize each bootstrap read against the committed directory and intent.
+func appendBootstrapControlNodes(nodes []rafttransport.NodeID, cut serviceauthz.ServiceDirectoryCut) []rafttransport.NodeID {
+	for _, binding := range cut.Bindings {
+		if binding.Roles&serviceauthz.ServiceRoleStorage == 0 || binding.Principal != binding.PhysicalNode {
+			continue
+		}
+		switch binding.Lifecycle {
+		case serviceauthz.ServiceJoining, serviceauthz.ServiceActive, serviceauthz.ServiceDraining:
+			if !slices.Contains(nodes, binding.Principal) {
+				nodes = append(nodes, binding.Principal)
+			}
+		}
+	}
+	return nodes
+}
