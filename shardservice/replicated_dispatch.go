@@ -162,9 +162,19 @@ func (server *ReplicatedServer) DispatchReplicated(ctx context.Context, call Rep
 	}
 	// SubmitOwned may outlive a canceled call. Its bytes become private only
 	// after grammar, size, authentication and shared admission have succeeded.
-	owned := cloneReplicatedCall(call)
+	// A semantic SQL read is different: executeReplicatedAuthenticatedCall runs
+	// synchronously and the result does not retain the request. Keep its caller
+	// owned SQL plan and parameter slices borrowed for this call instead of
+	// cloning the complete ShardRequest on every point read. Retention-sensitive
+	// legacy calls and all proposals keep the defensive deep clone.
+	request := &call.Request
+	semanticSQL := call.SQL
+	if semanticSQL == nil || call.Request.Operation != ReplicatedQueryLeader {
+		owned := cloneReplicatedCall(call)
+		request, semanticSQL = &owned.Request, owned.SQL
+	}
 	server.semanticDispatch.Add(1)
-	response := server.executeReplicatedAuthenticatedCall(requestCtx, &owned.Request, true, owned.SQL)
+	response := server.executeReplicatedAuthenticatedCall(requestCtx, request, true, semanticSQL)
 	reply, replyErr := semanticReplyFromExecutedResponse(response)
 	if replyErr != nil {
 		if response != nil && response.readLease != nil {
