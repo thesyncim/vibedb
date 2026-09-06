@@ -189,10 +189,15 @@ func Reconcile(plan *Plan, observed Observation) (Action, error) {
 		} else if catalog == catalogTargetPostRemove {
 			drainGeneration = plan.postRemoveGeneration
 		}
-		if observed.DrainedCatalogGeneration != drainGeneration {
-			return Action{
-				Kind: ActionAwaitCatalogDrain, CatalogGeneration: drainGeneration,
-			}, nil
+		drained := observed.DrainedCatalogGeneration == drainGeneration
+		if plan.transitionReady {
+			// A complete drain of a newer head also excludes readers of this receipt's
+			// placement. The current head still has to match the owned group receipt.
+			drained = observed.DrainedCatalogGeneration >= drainGeneration
+			drainGeneration = observed.Catalog.Generation()
+		}
+		if !drained {
+			return Action{Kind: ActionAwaitCatalogDrain, CatalogGeneration: drainGeneration}, nil
 		}
 		if catalog == catalogTargetPreRemove && membership == membershipVoter {
 			return Action{Kind: ActionRemoveSource, Member: plan.request.RetiringMember}, nil

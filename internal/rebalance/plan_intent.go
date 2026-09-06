@@ -246,7 +246,9 @@ func OpenReplicaMoveIntent(
 		return nil, errors.Join(err, ErrPlanIntent)
 	}
 	var plan *Plan
-	if certificate == nil {
+	if len(intent.Transition) != 0 {
+		plan, err = recoverOwnedReplicaMove(intent, request, catalog, publication, certificate)
+	} else if certificate == nil {
 		if catalog.Generation() != intent.SourceGeneration {
 			return nil, fmt.Errorf("%w: unbound source head %d observed %d", ErrPlanIntent, intent.SourceGeneration, catalog.Generation())
 		}

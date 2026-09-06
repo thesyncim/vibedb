@@ -99,7 +99,7 @@ func (observer gatewayReplicaMoveObserver) ObserveReplicaMove(
 	}
 	catalog, err := observer.authority.Read(ctx)
 	if err != nil || catalog == nil || catalog.Generation() < sourceGeneration ||
-		catalog.Generation() > sourceGeneration+2 {
+		(!transitionKey.Valid() && catalog.Generation() > sourceGeneration+2) {
 		return rebalance.ReplicatedMoveCut{}, errors.Join(err, errGatewayReplicaControl)
 	}
 	route, err := resolveGatewayReplicaMoveRoute(catalog, request)
@@ -171,7 +171,7 @@ func (observer gatewayReplicaMoveObserver) ObserveReplicaMove(
 			cut.DrainedCatalogGeneration = catalog.Generation()
 		}
 	}
-	if catalog.Generation() == sourceGeneration+2 {
+	if (!transitionKey.Valid() && catalog.Generation() == sourceGeneration+2) || (cut.TransitionReceiptFound && cut.TransitionReceipt.Phase >= gateway.TransitionPhasePostRemove) {
 		_, grantFound, grantErr := observer.authority.ReadMembershipGrant(ctx, request.Group)
 		if grantErr != nil {
 			return rebalance.ReplicatedMoveCut{}, grantErr

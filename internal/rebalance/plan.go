@@ -303,6 +303,10 @@ func bindCertificate(
 ) (*Plan, error) {
 	state := certificate.Manifest.State
 	binding := state.Binding
+	sourceRouteGeneration := plan.catalogGeneration
+	if plan.transitionReady {
+		sourceRouteGeneration = plan.transition.SourceDescriptor.Command.RouteGeneration
+	}
 	if binding.ClusterID != plan.request.Group.ClusterID ||
 		binding.ClusterIncarnation != plan.request.Group.ClusterIncarnation ||
 		binding.TopologyRecoveryEpoch != plan.request.Group.TopologyRecoveryEpoch ||
@@ -310,7 +314,7 @@ func bindCertificate(
 		binding.GroupID != plan.request.Group.GroupID ||
 		binding.Distribution != string(plan.request.Distribution) ||
 		binding.Shard != string(plan.request.Shard) ||
-		binding.RouteGeneration != plan.catalogGeneration ||
+		binding.RouteGeneration != sourceRouteGeneration ||
 		binding.RoutingVersion != uint64(plan.sourceManifest.Version()) ||
 		!proto.Equal(state.ConfState, plan.learnerConf) ||
 		state.ReplicaSetVersion == 0 || state.ReplicaSetVersion > state.Applied ||

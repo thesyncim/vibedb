@@ -494,7 +494,7 @@ func (executor *Executor) executeReceiptPublication(
 		return ErrExecutionFence
 	}
 	next, err := plan.CatalogSnapshotAtHead(cut.Catalog, phase, target, cut.Command)
-	if err != nil {
+	if err != nil || next == nil || next.Generation() != execution.Action.CatalogGeneration {
 		return errors.Join(err, ErrExecutionFence)
 	}
 	receipt, err := publisher.PublishGroupTransition(ctx, lease, intent, phase, next, execution.TransitionReceiptDigest)
@@ -643,6 +643,14 @@ func validateGrant(plan *rebalance.Plan, grant membershipgrant.Grant) error {
 
 func validExecutionAction(plan *rebalance.Plan, execution rebalance.ReplicatedMoveExecution) bool {
 	action := execution.Action
+	if _, owned := plan.TransitionKey(); owned {
+		switch action.Kind {
+		case rebalance.ActionPublishCatalog, rebalance.ActionAwaitCatalogDrain:
+			return action.Member == 0 && action.CatalogGeneration > plan.CatalogGeneration() && action.ReplicaSetVersion == 0
+		case rebalance.ActionRefreshCatalogFence:
+			return action.Member == 0 && action.CatalogGeneration > plan.CatalogGeneration() && action.ReplicaSetVersion == execution.PublicationReplicaSet
+		}
+	}
 	switch action.Kind {
 	case rebalance.ActionAddLearner, rebalance.ActionAwaitSnapshotInstall,
 		rebalance.ActionAwaitCatchUp,
