@@ -73,8 +73,8 @@ func contextCancellationError(ctx context.Context) error {
 // contextCancelScope bridges one request context into the query executor's
 // cooperative cancellation flag. It reuses a flag installed by the typed
 // runtime, or owns a local flag when the connection has none. It exists only
-// when ctx has a Done channel: context.Background and every legacy Stmt method
-// retain the allocation-free nil-flag path.
+// when ctx has a Done channel that its installed flag does not already observe.
+// Background contexts and directly bound request channels need no watcher.
 //
 // The watcher is joined before finish returns. That makes restoring the
 // connection's prior flag race-free and prevents a canceled request from
@@ -96,6 +96,9 @@ func (c *conn) beginContextCancellation(
 		return nil, err
 	}
 	if ctx.Done() == nil {
+		return nil, nil
+	}
+	if c.exec.Options.Cancel.ObservesDone(ctx.Done()) {
 		return nil, nil
 	}
 	scope := &contextCancelScope{

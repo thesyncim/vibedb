@@ -108,6 +108,19 @@ func TestCancelFlagStopsAndRecoversEveryScanBackend(t *testing.T) {
 			if exec.Result.RowCount == 0 {
 				t.Fatal("RunInto after Reset returned no rows")
 			}
+			done := make(chan struct{})
+			cancel.BindDone(done)
+			close(done)
+			if err := query.RunInto(&exec, test.source); !errors.Is(err, ErrCanceled) {
+				t.Fatalf("bound channel did not cancel backend: %v", err)
+			}
+			if exec.Result.RowCount != 0 {
+				t.Fatal("channel cancellation exposed partial rows")
+			}
+			cancel.BindDone(nil)
+			if err := query.RunInto(&exec, test.source); err != nil {
+				t.Fatalf("backend could not recover after channel detach: %v", err)
+			}
 		})
 	}
 }
@@ -698,5 +711,44 @@ func BenchmarkCancellationProbeOverhead(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+func TestCancelFlagBoundChannelLifetime(t *testing.T) {
+	var flag CancelFlag
+	done := make(chan struct{})
+	flag.BindDone(done)
+	if flag.Canceled() || !flag.ObservesDone(done) || flag.ObservesDone(nil) {
+		t.Fatal("open channel binding did not preserve admission")
+	}
+	if allocs := testing.AllocsPerRun(1000, func() {
+		if flag.Canceled() {
+			panic("open channel canceled")
+		}
+	}); allocs != 0 {
+		t.Fatalf("channel checkpoint allocated: %v", allocs)
+	}
+	var workers sync.WaitGroup
+	for range 8 {
+		workers.Go(func() {
+			<-done
+			if !flag.Canceled() || !errors.Is(cancellationCheckpoint(&flag, 256), ErrCanceled) {
+				t.Error("worker missed channel cancellation")
+			}
+		})
+	}
+	close(done)
+	workers.Wait()
+	flag.Reset()
+	if !flag.Canceled() || !flag.Take() || !flag.Take() {
+		t.Fatal("reset or take resurrected a closed context")
+	}
+	flag.BindDone(nil)
+	if flag.Canceled() || flag.Take() {
+		t.Fatal("detached channel poisoned reuse")
+	}
+	flag.Cancel()
+	if !flag.Take() || flag.Canceled() {
+		t.Fatal("explicit cancellation stopped working")
 	}
 }

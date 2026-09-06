@@ -162,8 +162,9 @@ func (c *compiler) release() {
 // Every retained backing array is cleared through its full capacity, not just
 // the prefix used by the last compile. The unused tail can contain a boxed
 // argument, a string's bytes, or an error interface from a failed bind just as
-// readily as the used prefix. Path memo/registries and the graph-shaped plan
-// storage are dropped entirely. A compiler that grows beyond the bounded
+// readily as the used prefix. Successful path compilations own immutable
+// metadata and can survive a bind; errors and graph-shaped plan storage are
+// dropped entirely. A compiler that grows beyond the bounded
 // storage budget is released while its parsed Statement remains reusable.
 func (c *compiler) resetReadReuse() (retainedBytes int64, retained bool) {
 	if c == nil {
@@ -218,13 +219,23 @@ func (c *compiler) resetReadReuse() (retainedBytes int64, retained bool) {
 		*c.result = compileResult{}
 	}
 
-	// The following fields either memoize paths outside the reusable arenas or
-	// own nested/complex graphs. Drop their full backing arrays and all object
-	// references rather than widening the direct-read retention allowlist.
-	c.values.paths = dropReadReuseSlice(c.values.paths)
-	c.numbers.paths = dropReadReuseSlice(c.numbers.paths)
-	clearReadReuseChunkEntries(c.paths.entries)
-	c.paths = pathCache{}
+	// Registries are rebuilt on every bind. Their backing arrays are reusable;
+	// their entries must be cleared before the compiler arenas are refilled.
+	c.values.paths = scrubReadReuseSlice(c.values.paths)
+	c.numbers.paths = scrubReadReuseSlice(c.numbers.paths)
+	// compilePath copies the spelling before compiling it. Successful entries
+	// therefore own only immutable path metadata, never arguments or arena
+	// bytes. Do not retain error interfaces or stale cache-capacity entries.
+	n := 0
+	for _, entry := range c.paths.entries {
+		if entry.err == nil {
+			c.paths.entries[n] = entry
+			n++
+		}
+	}
+	clear(c.paths.entries[n:cap(c.paths.entries)])
+	c.paths.entries = c.paths.entries[:n]
+	// Nested/complex graphs are outside the direct-read retention allowlist.
 	c.joins = dropReadReuseSlice(c.joins)
 	c.marks = dropReadReuseSlice(c.marks)
 	c.planJoins = dropReadReuseSlice(c.planJoins)
@@ -258,12 +269,6 @@ func dropReadReuseSlice[T any](slice []T) []T {
 		clear(slice[:cap(slice)])
 	}
 	return nil
-}
-
-func clearReadReuseChunkEntries(entries []cachedPath) {
-	if cap(entries) != 0 {
-		clear(entries[:cap(entries)])
-	}
 }
 
 func (a *chunkArena[T]) scrubReadReuse() {

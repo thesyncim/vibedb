@@ -69,7 +69,7 @@ func (s *Statement) ResetReadBindingsForReuse() (retainedBytes int64, ok bool) {
 	}
 	s.q = Query{}
 	s.args = dropReadReuseSlice(s.args)
-	s.stack = dropReadReuseSlice(s.stack)
+	s.stack = scrubReadReuseSlice(s.stack)
 	s.having = havingProgram{}
 	s.cached = false
 	s.lowerErr = nil
@@ -255,6 +255,7 @@ func readReuseStatementBytes(s *Statement) (int64, bool) {
 		readReuseStatementSliceBytes(s.paramTypeTargetDefaults),
 		readReuseStatementSliceBytes(s.specBuf),
 		readReuseStatementSliceBytes(s.specs),
+		readReuseStatementSliceBytes(s.stack),
 	} {
 		if !add(n) {
 			return 0, false
@@ -303,9 +304,33 @@ func readReuseCompilerBytes(c *compiler) (int64, bool) {
 		readReuseStatementSliceBytes(c.filterCols),
 		readReuseStatementSliceBytes(c.lateCols),
 		readReuseStatementSliceBytes(c.lateNums),
+		readReuseStatementSliceBytes(c.values.paths),
+		readReuseStatementSliceBytes(c.numbers.paths),
+		readReuseStatementSliceBytes(c.paths.entries),
 	} {
 		if !add(n) {
 			return 0, false
+		}
+	}
+	for _, entry := range c.paths.entries {
+		if entry.err != nil {
+			continue // reset drops failed compilations and their error graphs.
+		}
+		p := entry.path
+		// Count aliases separately: conservative accounting also covers dotted
+		// paths with separately rendered pointers and decoded escape tokens.
+		for _, text := range []string{entry.spec, p.spec, p.name, p.key.Key, p.pointer.String()} {
+			if !add(int64(len(text))) {
+				return 0, false
+			}
+		}
+		if !add(readReuseStatementSliceBytes(p.pointer.Tokens)) {
+			return 0, false
+		}
+		for _, token := range p.pointer.Tokens {
+			if !add(int64(len(token.Text))) {
+				return 0, false
+			}
 		}
 	}
 	if c.plan != nil && !add(int64(unsafe.Sizeof(*c.plan))) {

@@ -1,0 +1,16 @@
+raft2026/09/06 15:23:16 INFO: f4 switched to configuration voters=(f4)
+raft2026/09/06 15:23:16 INFO: f4 became follower at term 1
+raft2026/09/06 15:23:16 INFO: newRaft f4 [peers: [f4], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/06 15:23:16 INFO: f4 is starting a new election at term 1
+raft2026/09/06 15:23:16 INFO: f4 became pre-candidate at term 1
+raft2026/09/06 15:23:16 INFO: f4 received MsgPreVoteResp from f4 at term 1
+raft2026/09/06 15:23:16 INFO: f4 has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/06 15:23:16 INFO: f4 became candidate at term 2
+raft2026/09/06 15:23:16 INFO: f4 received MsgVoteResp from f4 at term 2
+raft2026/09/06 15:23:16 INFO: f4 has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/09/06 15:23:16 INFO: f4 became leader at term 2
+--- FAIL: TestPipelinedRuntimeWALPressureCompactsBeforePeriodicMaintenance (6.61s)
+    generation_pressure_test.go:293: pipelined drain: raftstore: preallocated WAL has insufficient Ready headroom ready=true quiescent=true admission=0 outstanding=0 applied=15
+FAIL
+FAIL	github.com/thesyncim/vibedb/internal/raftmember	7.038s
+FAIL
