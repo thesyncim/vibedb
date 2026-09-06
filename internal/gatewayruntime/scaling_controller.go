@@ -1106,6 +1106,9 @@ func scalingEnrollmentID(parent [32]byte, intent gateway.GroupEnrollmentIntent) 
 	copyOf.State = gateway.EnrollmentReserved
 	copyOf.Revision = 0
 	copyOf.PreparationClaim = [32]byte{}
+	// The source payload contains this intent ID; its digest is certified only
+	// after the ID is assigned. It cannot participate in that ID derivation.
+	copyOf.ExpectedManifestDigest = replication.Digest{}
 	copyOf.Proof = nil
 	copyOf.Receipt = nil
 	copyOf.MoveOperationID = [32]byte{}

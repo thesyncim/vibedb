@@ -223,7 +223,16 @@ func (authority *bootstrapReadTestAuthority) ReadEnrollmentIntent(_ context.Cont
 	if authority.onIntentRead != nil {
 		authority.onIntentRead(authority.intentReads, authority)
 	}
-	return authority.intent, nil
+	copyOf := authority.intent
+	if copyOf.Proof != nil {
+		proof := *copyOf.Proof
+		copyOf.Proof = &proof
+	}
+	if copyOf.Receipt != nil {
+		receipt := *copyOf.Receipt
+		copyOf.Receipt = &receipt
+	}
+	return copyOf, nil
 }
 
 func (authority *bootstrapReadTestAuthority) ScanNodeReferences(_ context.Context, node rafttransport.NodeID, incarnation uint64) (gateway.NodeReferenceEvidence, error) {
@@ -298,4 +307,23 @@ func (opener *bootstrapReadTestOpener) OpenBootstrapGatewayControl(_ context.Con
 	server := &bootstrapReadTestConn{Conn: right, identity: rafttransport.PeerIdentity{TrustDomain: opener.domain, Node: opener.target.NodeID}, key: [32]byte(opener.target.ServiceKeyDigest), class: rafttransport.TrafficGatewayControl}
 	go func() { _ = opener.service.Serve(context.Background(), server) }()
 	return client, nil
+}
+
+func TestBootstrapStableReadAcceptsIndependentlyDecodedPreparedProofs(t *testing.T) {
+	for _, phase := range []gateway.EnrollmentState{gateway.EnrollmentPrepared, gateway.EnrollmentEnrolled} {
+		intent := testIntent([]byte(`{"schema":"orders"}`), phase)
+		node := bootstrapReadTestNode(intent.Target.Node, intent.Target.NodeIncarnation, gateway.NodeActive, replication.Digest{0xa1})
+		authority := &bootstrapReadTestAuthority{intent: intent, node: node, cut: bootstrapReadTestCut(node), evidence: bootstrapReadTestEvidence(node)}
+		service := &BootstrapReadService{authority: authority}
+		request := BootstrapReadRequest{Nonce: [bootstrapReadNonceBytes]byte{1}, Operation: OpReadOwnEnrollment, PhysicalNode: node.NodeID, Incarnation: node.Incarnation, IntentID: intent.IntentID}
+		reply, err := service.readStable(t.Context(), request, node)
+		if err != nil || !sameBootstrapReadIntent(reply.Intent, intent) {
+			t.Fatalf("phase %d stable proof: %v", phase, err)
+		}
+		altered := reply.Intent
+		altered.Proof.ManifestDigest[0] ^= 1
+		if sameBootstrapReadIntent(altered, intent) {
+			t.Fatal("altered proof accepted")
+		}
+	}
 }

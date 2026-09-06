@@ -29,7 +29,7 @@ func serviceDirectoryBinding(peer AuthenticatedPeer, roles ServiceRoleMask, life
 		binding.SessionRevision = 15
 		binding.ParticipantDigest = [32]byte{16}
 	}
-	if lifecycle == ServiceDraining {
+	if lifecycle == ServiceDraining && roles&ServiceRoleGateway != 0 {
 		binding.DrainFenceDigest = [32]byte{17}
 		binding.DrainFence = ServiceFence{Action: ServiceActionGatewayCatalogRead,
 			Operation: ServiceOperationCatalogRead, Group: serviceDirectoryGroup(12),
@@ -385,5 +385,27 @@ func TestServiceDirectoryCatalogAndNodeRevisionsAdvanceIndependently(t *testing.
 	conflict.Bindings[0].SessionRevision++
 	if err := gate.ApplyCommittedCut(conflict); !errors.Is(err, ErrServiceDirectoryStale) {
 		t.Fatalf("same cut conflict: %v", err)
+	}
+}
+
+func TestBootstrapPeerRemainsReadableAcrossEnrollmentLifecycle(t *testing.T) {
+	peer := serviceDirectoryPeer(3, 4)
+	for _, state := range []ServiceLifecycle{ServiceJoining, ServiceActive, ServiceDraining, ServiceDecommissioned} {
+		gate, err := NewServiceDirectoryGate(serviceDirectoryCut(1, serviceDirectoryBinding(peer, ServiceRoleStorage, state)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		allowed := gate.CheckBootstrapPeer(peer) == DecisionAllow
+		if allowed != (state != ServiceDecommissioned) {
+			t.Fatalf("lifecycle %d allowed=%t", state, allowed)
+		}
+		forged := peer
+		forged.KeyDigest[0] ^= 1
+		if gate.CheckBootstrapPeer(forged) == DecisionAllow {
+			t.Fatal("substituted certificate admitted")
+		}
+		if gate.CheckGatewayPeer(peer) == DecisionAllow {
+			t.Fatal("storage bootstrap identity admitted as gateway")
+		}
 	}
 }

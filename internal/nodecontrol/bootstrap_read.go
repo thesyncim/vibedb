@@ -400,7 +400,7 @@ func (service *BootstrapReadService) readStable(
 	// mixed metadata cut.  The final cut below also detects a concurrent row
 	// mutation that advanced the directory revision after the first scan.
 	finalIntent, err := service.authority.ReadEnrollmentIntent(ctx, request.IntentID)
-	if err != nil || finalIntent != intent || !finalIntent.Valid() ||
+	if err != nil || !sameBootstrapReadIntent(finalIntent, intent) || !finalIntent.Valid() ||
 		finalIntent.State == gateway.EnrollmentCancelled ||
 		finalIntent.Target.Node != request.PhysicalNode ||
 		finalIntent.Target.NodeIncarnation != request.Incarnation {
@@ -588,3 +588,20 @@ func bootstrapReadWriteFull(writer io.Writer, data []byte) error {
 }
 
 var _ IntentReader = (*BootstrapReadClient)(nil)
+
+// Directory reads decode independent proof and receipt allocations. Compare
+// their values before comparing the remaining immutable and recovery fields.
+func sameBootstrapReadIntent(left, right gateway.GroupEnrollmentIntent) bool {
+	if (left.Proof == nil) != (right.Proof == nil) || (left.Receipt == nil) != (right.Receipt == nil) {
+		return false
+	}
+	if left.Proof != nil && *left.Proof != *right.Proof {
+		return false
+	}
+	if left.Receipt != nil && *left.Receipt != *right.Receipt {
+		return false
+	}
+	left.Proof, right.Proof = nil, nil
+	left.Receipt, right.Receipt = nil, nil
+	return left == right
+}

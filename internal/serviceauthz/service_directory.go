@@ -666,13 +666,15 @@ func (gate *ServiceDirectoryGate) CheckGatewayPeer(peer AuthenticatedPeer) Decis
 // CheckBootstrapPeer admits only the target physical storage identity during
 // the empty-node enrollment read. It is intentionally narrower than
 // CheckGatewayPeer and never accepts a gateway, controller, or decommissioned
-// binding on this listener.
+// binding on this listener. Activation precedes replica preparation; draining
+// nodes may still need to resolve an already committed enrollment on restart.
+// The protocol rechecks the exact requested target and rejects cancelled intents.
 func (gate *ServiceDirectoryGate) CheckBootstrapPeer(peer AuthenticatedPeer) DecisionCode {
 	_, binding, ok := gate.lookup(peer)
 	if !ok || binding.Roles&ServiceRoleStorage == 0 || binding.PhysicalNode != peer.Identity.Node {
 		return DecisionDenyNoPrincipal
 	}
-	if binding.Lifecycle != ServiceJoining {
+	if binding.Lifecycle != ServiceJoining && binding.Lifecycle != ServiceActive && binding.Lifecycle != ServiceDraining {
 		return DecisionDenyCapability
 	}
 	return DecisionAllow
