@@ -447,6 +447,14 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	baselineHealth := make(map[raftmember.GroupKey]uint64, len(groups))
+	for _, group := range groups {
+		revision, readErr := catalogAuthority.ReadReplicaHealthRevision(ctx, group, 1)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		baselineHealth[group] = revision
+	}
 	started := time.Now()
 	if err = voters[0].Kill(ctx); err != nil {
 		t.Fatal(err)
@@ -483,9 +491,16 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 			t.Fatalf("controller exited during live catalog session handoff: %v\n%s", gatewayProcess.WaitError(), gatewayProcess.Diagnostics())
 		}
 
-		if measurements.failoverMillis == 0 &&
-			strings.Contains(gatewayProcess.Diagnostics(), "revision controller published") {
-			measurements.failoverMillis = uint64(time.Since(started).Milliseconds())
+		if measurements.failoverMillis == 0 {
+			// A controller restart discards its log buffer. Read the committed
+			// health revision so failover evidence survives that restart.
+			for _, group := range groups {
+				status, readErr := catalogAuthority.ReadReplicaHealthRevisionStatus(ctx, group, 1)
+				if readErr == nil && status.Revision > baselineHealth[group] && !status.Healthy && status.SuspectNode == nodes[0] {
+					measurements.failoverMillis = uint64(time.Since(started).Milliseconds())
+					break
+				}
+			}
 		}
 		if measurements.admissionMillis == 0 {
 			// Observe the atomic directory cut before reading the catalog head.
