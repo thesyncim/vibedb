@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"math"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/thesyncim/vibedb/autosplit"
 	"github.com/thesyncim/vibedb/internal/raftmember"
@@ -71,6 +73,20 @@ type CapacitySourceDirectory struct {
 type CapacityProvider struct {
 	directory CapacitySourceDirectory
 	revision  atomic.Uint64
+	mu        sync.Mutex
+	rounds    []capacityRoundCut
+}
+
+const maxCapacityRounds = 4
+const capacityRoundLifetime = 30 * time.Second
+
+type capacityRoundCut struct {
+	operation, round [32]byte
+	catalog          uint64
+	created          time.Time
+	samples          []CapacitySourceSample
+	node             NodeCapacity
+	revision         uint64
 }
 
 func NewCapacityProvider(directory CapacitySourceDirectory) (*CapacityProvider, error) {
@@ -84,6 +100,11 @@ func (provider *CapacityProvider) ObserveReplicaCapacity(ctx context.Context, re
 	if provider == nil || ctx == nil || !validCapacityRequest(request) {
 		return CapacityObservation{}, ErrCapacityUnavailable
 	}
+	if err := context.Cause(ctx); err != nil {
+		return CapacityObservation{}, err
+	}
+	provider.mu.Lock()
+	defer provider.mu.Unlock()
 	if err := context.Cause(ctx); err != nil {
 		return CapacityObservation{}, err
 	}
@@ -115,6 +136,27 @@ func (provider *CapacityProvider) ObserveReplicaCapacity(ctx context.Context, re
 	if sourceIndex < 0 {
 		return CapacityObservation{}, ErrCapacityStale
 	}
+	if request.Round != ([32]byte{}) {
+		for _, cut := range provider.rounds {
+			if cut.round != request.Round || cut.operation != request.Operation || cut.catalog != request.ExpectedCatalogGeneration {
+				continue
+			}
+			if time.Since(cut.created) >= capacityRoundLifetime || len(cut.samples) != len(sources) || cut.revision < request.MinimumSourceRevision {
+				return CapacityObservation{}, ErrCapacityStale
+			}
+			for i, candidate := range sources {
+				if candidate.Identity() != cut.samples[i].Identity {
+					return CapacityObservation{}, ErrCapacityStale
+				}
+			}
+			sample := cut.samples[sourceIndex]
+			return NewCapacityObservation(CapacityObservation{Request: request, Identity: sample.Identity,
+				CatalogGeneration: cut.catalog, Applied: sample.Applied, SourceRevision: cut.revision,
+				Demand: sample.Demand, MigrationBytes: sample.MigrationBytes, KnownEmpty: sample.KnownEmpty,
+				Node: cut.node, DemandKind: sample.DemandKind})
+		}
+	}
+
 	samples := make([]CapacitySourceSample, len(sources))
 	for index, candidate := range sources {
 		if requestSource, ok := candidate.(CapacityRequestSource); ok {
@@ -174,7 +216,21 @@ func (provider *CapacityProvider) ObserveReplicaCapacity(ctx context.Context, re
 		MigrationBytes: sample.MigrationBytes, KnownEmpty: sample.KnownEmpty, Node: node,
 		DemandKind: sample.DemandKind,
 	}
-	return NewCapacityObservation(observation)
+	validated, err := NewCapacityObservation(observation)
+	if err != nil {
+		return CapacityObservation{}, err
+	}
+	if request.Round != ([32]byte{}) {
+		cut := capacityRoundCut{operation: request.Operation, round: request.Round, catalog: request.ExpectedCatalogGeneration,
+			created: time.Now(), samples: samples, node: node, revision: revision}
+		if len(provider.rounds) == maxCapacityRounds {
+			copy(provider.rounds, provider.rounds[1:])
+			provider.rounds[len(provider.rounds)-1] = cut
+		} else {
+			provider.rounds = append(provider.rounds, cut)
+		}
+	}
+	return validated, nil
 }
 
 // AddCapacity saturates at MaxUint64 and reports whether any component would

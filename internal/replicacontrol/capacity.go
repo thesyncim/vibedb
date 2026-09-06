@@ -35,7 +35,7 @@ const (
 	// authenticated capacity round has no attacker-controlled allocation before
 	// its bounds and identity have been checked.
 	CapacityRequestBytes         = 224
-	CapacityObservationBytes     = 536
+	CapacityObservationBytes     = 568
 	capacityPayloadBytes         = CapacityObservationBytes - 32
 	AbsoluteMaxCapacityObservers = 256
 )
@@ -52,8 +52,8 @@ const (
 )
 
 var (
-	capacityRequestMagic  = [8]byte{'V', 'B', 'C', 'A', 'P', 'R', 0, 0}
-	capacityResponseMagic = [8]byte{'V', 'B', 'C', 'A', 'P', 'S', 0, 0}
+	capacityRequestMagic  = [8]byte{'V', 'B', 'C', 'A', 'P', 'R', 0, 1}
+	capacityResponseMagic = [8]byte{'V', 'B', 'C', 'A', 'P', 'S', 0, 1}
 )
 
 // CapacityRequest asks one exact local member for a detached storage cut.
@@ -63,6 +63,9 @@ var (
 // MinimumApplied and MinimumSourceRevision make retries monotonic without
 // requiring an in-flight request to predict the next apply index exactly.
 type CapacityRequest struct {
+	// Round binds every group reply on one node to the same bounded snapshot.
+	// Zero requests a fresh standalone observation.
+	Round                     [32]byte
 	Operation                 [32]byte
 	Step                      [32]byte
 	Group                     raftmember.GroupKey
@@ -292,12 +295,12 @@ func AppendCapacityRequest(dst []byte, request CapacityRequest) ([]byte, error) 
 	binary.BigEndian.PutUint64(b[168:176], request.ExpectedCatalogGeneration)
 	binary.BigEndian.PutUint64(b[176:184], request.MinimumApplied)
 	binary.BigEndian.PutUint64(b[184:192], request.MinimumSourceRevision)
+	copy(b[192:224], request.Round[:])
 	return dst, nil
 }
 
 func OpenCapacityRequest(raw []byte) (CapacityRequest, error) {
-	if len(raw) != CapacityRequestBytes || !bytes.Equal(raw[:8], capacityRequestMagic[:]) ||
-		!allZero(raw[192:]) {
+	if len(raw) != CapacityRequestBytes || !bytes.Equal(raw[:8], capacityRequestMagic[:]) {
 		return CapacityRequest{}, ErrControl
 	}
 	var request CapacityRequest
@@ -308,6 +311,7 @@ func OpenCapacityRequest(raw []byte) (CapacityRequest, error) {
 	request.ExpectedCatalogGeneration = binary.BigEndian.Uint64(raw[168:176])
 	request.MinimumApplied = binary.BigEndian.Uint64(raw[176:184])
 	request.MinimumSourceRevision = binary.BigEndian.Uint64(raw[184:192])
+	copy(request.Round[:], raw[192:224])
 	if !validCapacityRequest(request) {
 		return CapacityRequest{}, ErrControl
 	}
@@ -414,7 +418,8 @@ func encodeCapacityObservationPayload(b []byte, observation CapacityObservation)
 	binary.BigEndian.PutUint32(b[488:492], observation.Node.MaxReceives)
 	binary.BigEndian.PutUint32(b[492:496], observation.Node.ActiveReceives)
 	b[496] = byte(observation.DemandKind)
-	// b[497:504] is canonical zero padding; the final digest follows it.
+	// b[497:504] is canonical zero padding.
+	copy(b[504:536], observation.Request.Round[:])
 }
 
 func decodeCapacityObservationPayload(b []byte, observation *CapacityObservation) {
@@ -426,6 +431,7 @@ func decodeCapacityObservationPayload(b []byte, observation *CapacityObservation
 	observation.Request.ExpectedCatalogGeneration = binary.BigEndian.Uint64(b[200:208])
 	observation.Request.MinimumApplied = binary.BigEndian.Uint64(b[208:216])
 	observation.Request.MinimumSourceRevision = binary.BigEndian.Uint64(b[216:224])
+	copy(observation.Request.Round[:], b[504:536])
 	observation.CatalogGeneration = binary.BigEndian.Uint64(b[176:184])
 	observation.Applied = binary.BigEndian.Uint64(b[184:192])
 	observation.SourceRevision = binary.BigEndian.Uint64(b[192:200])

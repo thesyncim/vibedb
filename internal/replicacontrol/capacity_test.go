@@ -27,6 +27,7 @@ func capacityTestRequest() CapacityRequest {
 
 func capacityTestObservation(knownEmpty bool) CapacityObservation {
 	request := capacityTestRequest()
+	request.Round = [32]byte{98}
 	identity := raftmember.RuntimeIdentity{
 		Group: request.Group, AllocationGeneration: 12, MemberID: request.TargetMember,
 		StoreID: [16]byte{13}, NodeIncarnation: 14,
@@ -46,8 +47,9 @@ func capacityTestObservation(knownEmpty bool) CapacityObservation {
 	return observation
 }
 
-func TestCapacityRequestRoundTripAndCanonicalPadding(t *testing.T) {
+func TestCapacityRequestRoundTripAndVersion(t *testing.T) {
 	want := capacityTestRequest()
+	want.Round = [32]byte{99}
 	raw, err := AppendCapacityRequest(nil, want)
 	if err != nil || len(raw) != CapacityRequestBytes {
 		t.Fatalf("AppendCapacityRequest len=%d err=%v", len(raw), err)
@@ -57,9 +59,9 @@ func TestCapacityRequestRoundTripAndCanonicalPadding(t *testing.T) {
 		t.Fatalf("OpenCapacityRequest got=%+v err=%v want=%+v", got, err, want)
 	}
 	mutated := bytes.Clone(raw)
-	mutated[192] = 1
+	mutated[7] = 0
 	if _, err := OpenCapacityRequest(mutated); !errors.Is(err, ErrControl) {
-		t.Fatalf("noncanonical request padding err=%v", err)
+		t.Fatalf("old request version err=%v", err)
 	}
 	zero := want
 	zero.ExpectedCatalogGeneration = 0
@@ -100,6 +102,7 @@ func TestCapacityObservationRejectsStaleIdentityAndMutation(t *testing.T) {
 	for _, mutate := range []func([]byte){
 		func(raw []byte) { raw[239]++ },        // member identity
 		func(raw []byte) { raw[415]++ },        // node capacity
+		func(raw []byte) { raw[504]++ },        // round identity
 		func(raw []byte) { raw[497] = 1 },      // canonical padding
 		func(raw []byte) { raw[len(raw)-1]++ }, // digest
 	} {

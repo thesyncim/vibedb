@@ -10,7 +10,6 @@ import (
 	"github.com/thesyncim/vibedb/autosplit"
 	"github.com/thesyncim/vibedb/internal/migrationbudget"
 	"github.com/thesyncim/vibedb/internal/raftmember"
-	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replicacontrol"
@@ -18,7 +17,6 @@ import (
 	"github.com/thesyncim/vibedb/internal/snapshottransfer"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibedb/store/durable"
-	"google.golang.org/protobuf/proto"
 )
 
 // rf3CapacityDirectory is the runtime-owned inventory used by the capacity
@@ -172,10 +170,6 @@ func (source *rf3LiveCapacitySource) observe(ctx context.Context) (replicacontro
 		return replicacontrol.CapacitySourceSample{}, replicacontrol.ErrCapacityUnavailable
 	}
 	identity := source.state.identity
-	before := source.state.apply.Published()
-	if before.Applied == 0 || before.ConfState == nil {
-		return replicacontrol.CapacitySourceSample{}, replicacontrol.ErrCapacityStale
-	}
 	resources, err := source.state.apply.ResourceStats()
 	if err != nil {
 		return replicacontrol.CapacitySourceSample{}, errors.Join(replicacontrol.ErrCapacityUnavailable, err)
@@ -184,8 +178,10 @@ func (source *rf3LiveCapacitySource) observe(ctx context.Context) (replicacontro
 	if err != nil {
 		return replicacontrol.CapacitySourceSample{}, err
 	}
-	after := source.state.apply.Published()
-	if !rf3CapacityPublicationEqual(before, after) {
+	// ResourceStats captures its publication under the same database lock
+	// that excludes apply, so ongoing writes cannot invalidate this cut.
+	after := resources.Publication
+	if after.Applied == 0 || after.ConfState == nil {
 		return replicacontrol.CapacitySourceSample{}, replicacontrol.ErrCapacityStale
 	}
 	sqlBytes, err := rf3CapacityResourceBytes(resources)
@@ -203,11 +199,6 @@ func (source *rf3LiveCapacitySource) observe(ctx context.Context) (replicacontro
 	}
 	return replicacontrol.CapacitySourceSample{Identity: identity, Applied: after.Applied,
 		Demand: demand, MigrationBytes: liveBytes, KnownEmpty: liveBytes == 0, DemandKind: kind}, nil
-}
-
-func rf3CapacityPublicationEqual(left, right raftmodel.Publication) bool {
-	return left.Applied == right.Applied && left.DataChainDigest == right.DataChainDigest &&
-		left.ReplicaSetVersion == right.ReplicaSetVersion && proto.Equal(left.ConfState, right.ConfState)
 }
 
 func rf3CapacityResourceBytes(resources sqldriver.ReplicatedApplyResourceStats) (uint64, error) {

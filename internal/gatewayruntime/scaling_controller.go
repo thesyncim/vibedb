@@ -9,6 +9,7 @@ package gatewayruntime
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -813,6 +814,10 @@ func (controller *ScalingController) plan(ctx context.Context, intent gateway.Sc
 }
 
 func (controller *ScalingController) collectCapacity(ctx context.Context, intent gateway.ScalingIntent, snapshot *gateway.Snapshot, nodes []gateway.NodeRecord) ([]scaling.ReplicaDemand, []raftmember.GroupKey, error) {
+	var round [32]byte
+	if _, err := rand.Read(round[:]); err != nil {
+		return nil, nil, err
+	}
 	nodeByID := make(map[rafttransport.NodeID]int, len(nodes))
 	for index := range nodes {
 		nodeByID[nodes[index].NodeID] = index
@@ -832,7 +837,7 @@ func (controller *ScalingController) collectCapacity(ctx context.Context, intent
 			if !found || nodes[nodeIndex].Incarnation != replica.NodeIncarnation {
 				return nil, nil, fmt.Errorf("capacity node identity missing for %x", replica.Node)
 			}
-			request := replicacontrol.CapacityRequest{Operation: intent.ID,
+			request := replicacontrol.CapacityRequest{Operation: intent.ID, Round: round,
 				Step: scalingCapacityStep(intent.ID, route.Group, uint8(ordinal)), Group: route.Group,
 				TargetMember: replica.Member, ExpectedCatalogGeneration: snapshot.Generation(),
 				MinimumApplied: 1}

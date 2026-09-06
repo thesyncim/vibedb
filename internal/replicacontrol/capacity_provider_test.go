@@ -177,3 +177,55 @@ func TestCapacityProviderNodeCutIncludesMultiGroupBudgetAndCancellation(t *testi
 		t.Fatalf("saturated vector=(%d,%v)", vector[autosplit.ResourceLiveBytes], overflowed)
 	}
 }
+
+func TestCapacityRoundKeepsOneNodeCutAcrossChangingGroups(t *testing.T) {
+	request := capacityTestRequest()
+	request.Round = [32]byte{91}
+	firstIdentity := capacityProviderIdentity(request.Group, byte(request.TargetMember), 14)
+	otherGroup := request.Group
+	otherGroup.GroupID[0]++
+	otherIdentity := capacityProviderIdentity(otherGroup, 9, 14)
+	first := &capacityProviderSource{identity: firstIdentity, sample: capacityProviderSample(firstIdentity, 64, 128, false)}
+	other := &capacityProviderSource{identity: otherIdentity, sample: capacityProviderSample(otherIdentity, 96, 192, false)}
+	nodeCalls := 0
+	provider, err := NewCapacityProvider(CapacitySourceDirectory{
+		Sources: func(context.Context) ([]CapacitySource, error) { return []CapacitySource{first, other}, nil },
+		Node: func(context.Context) (NodeCapacity, error) {
+			nodeCalls++
+			result := capacityProviderNode(14)
+			result.Revision = uint64(nodeCalls)
+			return result, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial, err := provider.ObserveReplicaCapacity(t.Context(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other.sample.Demand[autosplit.ResourceLiveBytes] = 512
+	secondRequest := request
+	secondRequest.Group = otherGroup
+	secondRequest.TargetMember = 9
+	secondRequest.Step[0]++
+	second, err := provider.ObserveReplicaCapacity(t.Context(), secondRequest)
+	if err != nil || second.Node != initial.Node || second.SourceRevision != initial.SourceRevision || second.Demand[autosplit.ResourceLiveBytes] != 96 || nodeCalls != 1 {
+		t.Fatalf("second=%+v calls=%d err=%v", second, nodeCalls, err)
+	}
+	secondRequest.Round[0]++
+	fresh, err := provider.ObserveReplicaCapacity(t.Context(), secondRequest)
+	if err != nil || fresh.SourceRevision <= initial.SourceRevision || fresh.Demand[autosplit.ResourceLiveBytes] != 512 || nodeCalls != 2 {
+		t.Fatalf("fresh=%+v calls=%d err=%v", fresh, nodeCalls, err)
+	}
+	// A changed member identity cannot reuse the old snapshot.
+	other.identity.StoreID[0]++
+	if _, err := provider.ObserveReplicaCapacity(t.Context(), request); !errors.Is(err, ErrCapacityStale) {
+		t.Fatalf("changed inventory err=%v", err)
+	}
+	other.identity = otherIdentity
+	provider.rounds[0].created = provider.rounds[0].created.Add(-capacityRoundLifetime)
+	if _, err := provider.ObserveReplicaCapacity(t.Context(), request); !errors.Is(err, ErrCapacityStale) {
+		t.Fatalf("expired round err=%v", err)
+	}
+}

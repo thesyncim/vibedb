@@ -234,22 +234,42 @@ func (backend *ScalingOperatorBackend) nodesResponse(ctx context.Context, respon
 }
 
 func (backend *ScalingOperatorBackend) observeResponse(ctx context.Context, response clustercontrol.Response, operation [32]byte, waitMillis uint64) clustercontrol.Response {
-	if waitMillis != 0 {
-		waitContext, cancel := context.WithTimeout(ctx, time.Duration(waitMillis)*time.Millisecond)
-		defer cancel()
-		for {
-			observed := backend.observeOnce(waitContext, response, operation)
-			if observed.Error == "" && (observed.State == "complete" || observed.State == "decommissioned" || observed.SafeToStop || len(observed.Blockers) != 0) {
-				return observed
+	return observeClusterControlStatus(ctx, time.Duration(waitMillis)*time.Millisecond, func(readContext context.Context) clustercontrol.Response {
+		return backend.observeOnce(readContext, response, operation)
+	})
+}
+
+func observeClusterControlStatus(ctx context.Context, wait time.Duration, observe func(context.Context) clustercontrol.Response) clustercontrol.Response {
+	deadline := time.Now().Add(wait)
+	// The optional long-poll budget must not cancel the initial authoritative
+	// read. Every successful response is backed by a completed observation.
+	last := observe(ctx)
+	terminal := func(value clustercontrol.Response) bool {
+		return value.State == "complete" || value.State == "decommissioned" || value.SafeToStop || len(value.Blockers) != 0
+	}
+	if wait == 0 || !last.OK || last.Error != "" || terminal(last) {
+		return last
+	}
+	waitContext, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	for {
+		select {
+		case <-waitContext.Done():
+			return last
+		case <-time.After(25 * time.Millisecond):
+		}
+		observed := observe(waitContext)
+		if !observed.OK || observed.Error != "" {
+			if waitContext.Err() != nil {
+				return last
 			}
-			select {
-			case <-waitContext.Done():
-				return observed
-			case <-time.After(25 * time.Millisecond):
-			}
+			return observed
+		}
+		last = observed
+		if terminal(last) {
+			return last
 		}
 	}
-	return backend.observeOnce(ctx, response, operation)
 }
 
 func (backend *ScalingOperatorBackend) observeOnce(ctx context.Context, response clustercontrol.Response, operation [32]byte) clustercontrol.Response {
