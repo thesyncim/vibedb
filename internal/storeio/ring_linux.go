@@ -245,8 +245,11 @@ func Open(config Config) (*Ring, error) {
 	}
 	params, fd, single, err := setupRing(entries, config.SingleIssuer)
 	if err != nil {
+		// Kernel ring allocation can fail under locked-memory or host resource
+		// limits before any I/O is submitted. Treat it as unavailable so callers
+		// can select the existing portable device path.
 		if errors.Is(err, syscall.ENOSYS) || errors.Is(err, syscall.EPERM) ||
-			errors.Is(err, syscall.EACCES) {
+			errors.Is(err, syscall.EACCES) || errors.Is(err, syscall.ENOMEM) {
 			return nil, fmt.Errorf("%w: %v", ErrUnavailable, err)
 		}
 		return nil, err
