@@ -2,8 +2,9 @@ package gateway
 
 import (
 	"context"
-	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"testing"
+
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 )
 
 func TestCatalogServiceFencesIncludeDurableSQLScopes(t *testing.T) {
@@ -52,6 +53,8 @@ func TestCatalogServiceFencesExcludeUnprovenSQLRoles(t *testing.T) {
 				config.Placements = nil
 			}
 			descriptors := snapshot.ReplicatedShardDescriptors()
+			// Keep the data group distinct from the fixture catalog route.
+			descriptors[0].Group.GroupID[0] ^= 0x40
 			if !test.ledger {
 				descriptors[0].RequestLedgerRanges = nil
 			}
@@ -64,14 +67,26 @@ func TestCatalogServiceFencesExcludeUnprovenSQLRoles(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			pin, recovery := false, false
+			pin, recovery, topologyRead, topologyWrite := false, false, false, false
 			for _, fence := range fences {
+				if fence.Group != descriptors[0].Group {
+					continue
+				}
+				if fence.Action == serviceauthz.ServiceActionGatewayCatalogRead {
+					topologyRead = true
+				}
+				if fence.Action == serviceauthz.ServiceActionGatewayCatalogWrite {
+					topologyWrite = true
+				}
 				if fence.Action == serviceauthz.ServiceActionGatewayExecutionPin {
 					pin = true
 				}
 				if fence.Action == serviceauthz.ServiceActionGatewayTransactionRecovery {
 					recovery = true
 				}
+			}
+			if topologyRead != test.placed || topologyWrite != test.placed {
+				t.Fatalf("topology read=%t write=%t placed=%t", topologyRead, topologyWrite, test.placed)
 			}
 			if pin != test.ledger || recovery != (test.ledger || test.placed) {
 				t.Fatalf("pin=%t recovery=%t", pin, recovery)

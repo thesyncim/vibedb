@@ -41,9 +41,11 @@ func (authority *ReplicatedCatalogAuthority) CatalogServiceFences(ctx context.Co
 	for _, descriptor := range snapshot.replicatedDescriptors() {
 		ledger := len(descriptor.RequestLedgerRanges) != 0
 		participant := ledger
+		placed := false
 		for _, placement := range snapshot.config.Placements {
 			if placement.Distribution == descriptor.Distribution {
 				participant = true
+				placed = true
 				break
 			}
 		}
@@ -59,6 +61,13 @@ func (authority *ReplicatedCatalogAuthority) CatalogServiceFences(ctx context.Co
 		if ledger {
 			appendScope(serviceauthz.ServiceActionGatewayRequestLedger, serviceauthz.ServiceOperationRequestLedger)
 			appendScope(serviceauthz.ServiceActionGatewayExecutionPin, serviceauthz.ServiceOperationExecutionPin)
+		}
+		// Native capture/prune sessions operate on the table's source group.
+		// They retain the exact topology capability and relation manifest;
+		// ledger-only and unplaced groups do not receive these scopes.
+		if placed {
+			appendScope(serviceauthz.ServiceActionGatewayCatalogRead, serviceauthz.ServiceOperationCatalogRead)
+			appendScope(serviceauthz.ServiceActionGatewayCatalogWrite, serviceauthz.ServiceOperationCatalogWrite)
 		}
 		if participant {
 			appendScope(serviceauthz.ServiceActionGatewayTransactionRecovery, serviceauthz.ServiceOperationTransactionRecovery)
