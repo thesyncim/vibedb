@@ -107,7 +107,11 @@ func TestBeginPinnedReadScopesSnapshotLeases(t *testing.T) {
 		}
 	})
 	t.Logf("begin/rollback allocs: full=%.1f pinned=%.1f", full, pinned)
-	if pinned >= full {
-		t.Fatalf("pinned begin allocs = %.1f, want strictly fewer than full %.1f", pinned, full)
+	// Warm shells make every per-table lease free, so a scoped pin costs
+	// exactly what a full begin costs: the scope machinery itself must add
+	// nothing. The table-count assertion above (exactly 1 scoped lease) is
+	// what proves pinning still scopes; this proves it costs nothing extra.
+	if pinned > full {
+		t.Fatalf("pinned begin allocs = %.1f, want parity with full %.1f", pinned, full)
 	}
 }

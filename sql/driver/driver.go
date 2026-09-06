@@ -282,11 +282,22 @@ type conn struct {
 	joinCatalog    []durable.NamedCollection
 	joinSnapshot   durable.DatabaseSnapshot
 	insertSnapshot durable.Snapshot
-	rowset         rows
-	open           bool
-	tx             *tx
-	closed         bool
-	owner          *dbConnector
+	// tableSpare retains transaction table shells across transactions on
+	// this connection, each carrying its closed snapshot objects. Each
+	// begin resets and rebinds them instead of allocating; the list is
+	// bounded so one wide transaction cannot pin unbounded
+	// per-connection memory. Use is strictly sequential: a connection
+	// holds one open transaction at a time.
+	tableSpare []*txTable
+	// pinnedNames is scratch space for one statement's executable closure
+	// during a scoped begin. It is consumed synchronously before the next
+	// begin and never retained, so scope resolution allocates nothing.
+	pinnedNames []string
+	rowset      rows
+	open        bool
+	tx          *tx
+	closed      bool
+	owner       *dbConnector
 	// directWritesFenced is immutable for this connection. Bind holds the
 	// connector lock and requires refs==0, so Connect either precedes bind and
 	// makes it return Busy, or observes the durable replicated binding here.

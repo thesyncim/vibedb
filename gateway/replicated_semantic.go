@@ -272,16 +272,14 @@ func (executor *ReplicatedExecutor) doReplicatedCall(
 ) (*shardservice.ReplicatedReply, error) {
 	attemptCtx, cancel := context.WithTimeout(ctx, executor.attemptTimeout)
 	defer cancel()
-	forwarded := *call
-	forwarded.Request = call.Request
-	if call.SQL != nil {
-		inner := *call.SQL
-		forwarded.SQL = &inner
-	}
+	// Attempts are sequential and no transport mutates the call (the server
+	// deep-clones before executing, the wire path copies the envelope to
+	// attach the encoded body), so stamping the same authority in place is
+	// exact and saves two struct copies per attempt.
 	if authority, ok := serviceauthz.FromContext(ctx); ok {
-		forwarded.Request.Authority = authority
-		if forwarded.SQL != nil {
-			forwarded.SQL.Authority = authority
+		call.Request.Authority = authority
+		if call.SQL != nil {
+			call.SQL.Authority = authority
 		}
 	}
 	var (
@@ -289,9 +287,9 @@ func (executor *ReplicatedExecutor) doReplicatedCall(
 		err   error
 	)
 	if semantic, ok := executor.client.(ReplicatedCallRoundTripper); ok {
-		reply, err = semantic.DoReplicatedCall(attemptCtx, endpoint, &forwarded)
+		reply, err = semantic.DoReplicatedCall(attemptCtx, endpoint, call)
 	} else {
-		reply, err = doRemoteReplicatedCall(attemptCtx, executor.client, endpoint, &forwarded)
+		reply, err = doRemoteReplicatedCall(attemptCtx, executor.client, endpoint, call)
 	}
 	if err == nil {
 		err = shardservice.ValidateReplicatedReply(reply)

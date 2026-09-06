@@ -119,11 +119,13 @@ func (executor *ReplicatedExecutor) QuerySQL(ctx context.Context, route Replicat
 	if executor == nil || executor.client == nil || ctx == nil || req == nil || !validReplicatedRoute(route) {
 		return nil, ErrReplicatedRoute
 	}
-	forwarded := *req
+	// The shell is plan-owned, used synchronously, and scrubbed on release,
+	// so stamping the authority in place (as the route stage already does
+	// for the other per-dispatch fields) saves a ~1KB struct copy per query.
 	if authority, ok := serviceauthz.FromContext(ctx); ok {
-		forwarded.Authority = authority
+		req.Authority = authority
 	}
-	if size, err := shardservice.RequestFrameBytes(&forwarded); err != nil {
+	if size, err := shardservice.RequestFrameBytes(req); err != nil {
 		return nil, err
 	} else if size > shardservice.MaxReplicatedSQLRequestBytes {
 		return nil, ErrResultLimit
@@ -142,11 +144,11 @@ func (executor *ReplicatedExecutor) QuerySQL(ctx context.Context, route Replicat
 		}
 		call := &shardservice.ReplicatedCall{
 			Request: shardservice.ReplicatedRequest{
-				Operation: shardservice.ReplicatedQueryLeader, Authority: forwarded.Authority,
+				Operation: shardservice.ReplicatedQueryLeader, Authority: req.Authority,
 				Capability: serviceauthz.CapabilityDataRead, Fence: state.Fence,
 				MaxValueBytes: shardservice.MaxReplicatedSQLResultBytes,
 			},
-			SQL: &forwarded,
+			SQL: req,
 		}
 		reply, err := executor.doReplicatedCall(ctx, endpoint, call)
 		if err != nil {

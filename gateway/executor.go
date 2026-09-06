@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/replication"
@@ -257,7 +258,7 @@ func (e *Executor) queryWithProfileValidation(
 			return nil, err
 		}
 	}
-	opctx, cancel := context.WithTimeout(ctx, profile.GlobalDeadline)
+	opctx, cancel := tightenTimeout(ctx, profile.GlobalDeadline)
 	defer cancel()
 	args, err := queryRuntimeArgs(q.Params)
 	if err != nil {
@@ -475,7 +476,7 @@ func (e *Executor) Exec(ctx context.Context, q Query) (*Result, error) {
 		return nil, err
 	}
 	profile := e.profileFor(q.Class)
-	opctx, cancel := context.WithTimeout(ctx, profile.GlobalDeadline)
+	opctx, cancel := tightenTimeout(ctx, profile.GlobalDeadline)
 	defer cancel()
 	args, err := queryRuntimeArgs(q.Params)
 	if err != nil {
@@ -815,7 +816,7 @@ func (e *Executor) Explain(ctx context.Context, q Query) (*Explanation, error) {
 		refreshedMiss = true
 		staleGeneration := lease.generation
 		lease.release()
-		refreshCtx, cancel := context.WithTimeout(ctx, e.profileFor(q.Class).GlobalDeadline)
+		refreshCtx, cancel := tightenTimeout(ctx, e.profileFor(q.Class).GlobalDeadline)
 		refreshErr := e.refreshAfterCatalogMiss(refreshCtx, staleGeneration)
 		cancel()
 		if refreshErr != nil {
@@ -984,10 +985,24 @@ func (e *Executor) dispatch(ctx context.Context, pl *plan, p Profile) (*Result, 
 	}
 }
 
+// tightenTimeout returns a context expiring after d, reusing ctx unchanged
+// when ctx already expires at or before that instant. Per-request and
+// per-shard fences nest (global over per-shard over transport), and arming a
+// runtime timer at every level costs ~1KB plus timer-heap churn each even
+// when an outer fence is already tighter. Inheriting the tighter parent
+// keeps the exact same cancellation instant with no timer, no propagation
+// linkage, and a no-op deferred cancel.
+func tightenTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	if deadline, ok := ctx.Deadline(); ok && !deadline.After(time.Now().Add(d)) {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, d)
+}
+
 // single performs a single-shard route: one round-trip, streamed through
 // unchanged. The shard already applied the statement's own ORDER BY and LIMIT.
 func (e *Executor) single(ctx context.Context, call shardCall, p Profile) (*Result, error) {
-	opctx, cancel := context.WithTimeout(ctx, p.PerShardDeadline)
+	opctx, cancel := tightenTimeout(ctx, p.PerShardDeadline)
 	defer cancel()
 	resp, err := e.client.Do(opctx, call.address, call.req)
 	if err != nil {
@@ -1012,7 +1027,7 @@ func (e *Executor) captureIndexedMutation(
 	req := *baseCall.req
 	req.ExecutionMode = shardservice.ExecutionReadOnly
 	req.MutationImageCapture = true
-	captureCtx, cancel := context.WithTimeout(ctx, p.PerShardDeadline)
+	captureCtx, cancel := tightenTimeout(ctx, p.PerShardDeadline)
 	defer cancel()
 	resp, err := e.client.Do(captureCtx, baseCall.address, &req)
 	if err != nil {
@@ -1057,7 +1072,7 @@ func (e *Executor) fanout(ctx context.Context, pl *plan, p Profile) (*Result, er
 	if len(pl.aggregates) != 0 && len(pl.groupKeys) != 0 {
 		return e.fanoutGroupedBatches(ctx, pl, p)
 	}
-	opctx, cancel := context.WithTimeout(ctx, p.GlobalDeadline)
+	opctx, cancel := tightenTimeout(ctx, p.GlobalDeadline)
 	defer cancel()
 
 	results := make([]*shardservice.ShardResponse, len(pl.calls))
@@ -1089,7 +1104,7 @@ func (e *Executor) fanout(ctx context.Context, pl *plan, p Profile) (*Result, er
 				default:
 				}
 
-				sctx, sc := context.WithTimeout(opctx, p.PerShardDeadline)
+				sctx, sc := tightenTimeout(opctx, p.PerShardDeadline)
 				resp, err := e.client.Do(sctx, pl.calls[i].address, pl.calls[i].req)
 				sc()
 				if err != nil {
@@ -1173,7 +1188,7 @@ func (e *Executor) fanoutGroupedBatches(
 	pl *plan,
 	p Profile,
 ) (*Result, error) {
-	opctx, cancel := context.WithTimeout(ctx, p.GlobalDeadline)
+	opctx, cancel := tightenTimeout(ctx, p.GlobalDeadline)
 	defer cancel()
 
 	var merger *groupedAggregateMerger
@@ -1223,7 +1238,7 @@ func (e *Executor) fanoutGroupedBatches(
 			for i := range jobs {
 				req := *pl.calls[i].req
 				req.RowBatch = distributedRowBatch(&req)
-				sctx, stop := context.WithTimeout(opctx, p.PerShardDeadline)
+				sctx, stop := tightenTimeout(opctx, p.PerShardDeadline)
 				err := e.client.DoBatches(
 					sctx, pl.calls[i].address, &req,
 					func(batch *shardservice.ShardResponse) error {

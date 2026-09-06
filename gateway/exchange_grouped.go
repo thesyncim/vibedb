@@ -180,7 +180,7 @@ func (e *Executor) fanoutRepartitionGrouped(
 				req.PartialAggregate = true
 				req.Repartition = repartition
 				req.Repartition.Producer = uint16(producer)
-				sourceCtx, stop := context.WithTimeout(ctx, profile.PerShardDeadline)
+				sourceCtx, stop := tightenTimeout(ctx, profile.PerShardDeadline)
 				defer stop()
 				resp, err := e.client.Do(sourceCtx, pl.calls[producer].address, &req)
 				if err != nil {

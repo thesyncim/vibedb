@@ -1351,16 +1351,19 @@ func roundTripReplicated(
 			return nil, err
 		}
 	}
-	cancelDone := make(chan struct{})
-	stop := context.AfterFunc(ctx, func() {
-		_ = conn.SetDeadline(time.Now())
-		close(cancelDone)
-	})
-	defer func() {
-		if !stop() {
-			<-cancelDone
-		}
-	}()
+	// Uncancellable contexts need no trip arm: the callback could never fire.
+	if ctx.Done() != nil {
+		cancelDone := make(chan struct{})
+		stop := context.AfterFunc(ctx, func() {
+			_ = conn.SetDeadline(time.Now())
+			close(cancelDone)
+		})
+		defer func() {
+			if !stop() {
+				<-cancelDone
+			}
+		}()
+	}
 	if err := enc.EncodeReplicatedRequestBorrowed(conn, request); err != nil {
 		if request.Operation == ReplicatedPropose {
 			return nil, &raftservice.UnknownOutcomeError{

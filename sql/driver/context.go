@@ -79,6 +79,13 @@ func contextCancellationError(ctx context.Context) error {
 // The watcher is joined before finish returns. That makes restoring the
 // connection's prior flag race-free and prevents a canceled request from
 // poisoning the next statement on the pooled connection.
+//
+// A joined watcher goroutine is used instead of context.AfterFunc: AfterFunc
+// on a context without its own AfterFunc method still spawns a propagation
+// goroutine (no stdlib context type implements the AfterFunc fast path), so
+// it costs the same goroutine plus an arm allocation — and a leaked
+// propagation arm panics the process ("missing cancel error") if Done ever
+// closes while Err reports nil, which contract-loose contexts can do.
 type contextCancelScope struct {
 	conn     *conn
 	ctx      context.Context
