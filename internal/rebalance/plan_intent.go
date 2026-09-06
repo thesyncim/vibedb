@@ -23,6 +23,7 @@ const MaxPlanIntentBytes = 2 * replicatedstate.MaxSnapshotBaseCertificateBytes
 var ErrPlanIntent = errors.New("rebalance: invalid persisted replica move intent")
 
 type ReplicaMoveIntentIdentity struct {
+	TransitionKey    gateway.GroupTransitionKey
 	Operation        OperationID
 	SourceGeneration uint64
 	Request          MoveRequest
@@ -36,8 +37,16 @@ func InspectReplicaMoveIntent(raw []byte) (ReplicaMoveIntentIdentity, error) {
 	if err != nil || len(intent.Certificate) != 0 {
 		return ReplicaMoveIntentIdentity{}, errors.Join(err, ErrPlanIntent)
 	}
+	var key gateway.GroupTransitionKey
+	if len(intent.Transition) != 0 {
+		transition, err := gateway.OpenGroupTransitionIntent(intent.Transition)
+		if err != nil {
+			return ReplicaMoveIntentIdentity{}, err
+		}
+		key = transition.Key
+	}
 	return ReplicaMoveIntentIdentity{Operation: OperationID(intent.Operation),
-		SourceGeneration: intent.SourceGeneration, Request: request}, nil
+		SourceGeneration: intent.SourceGeneration, Request: request, TransitionKey: key}, nil
 }
 
 type persistedPlanIntent struct {

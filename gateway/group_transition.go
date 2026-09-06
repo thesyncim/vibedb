@@ -292,7 +292,7 @@ func (receipt GroupPublicationReceipt) ValidateSuccessor(intent GroupTransitionI
 		return ErrGroupTransition
 	}
 	if prior == nil {
-		if receipt.PredecessorReceiptDigest != ([32]byte{}) || receipt.Phase != TransitionPhaseLearner {
+		if receipt.PredecessorReceiptDigest != ([32]byte{}) || receipt.Phase != TransitionPhasePreRemove {
 			return ErrGroupTransition
 		}
 		if receipt.PredecessorHeadGeneration != intent.SourceHeadGeneration ||

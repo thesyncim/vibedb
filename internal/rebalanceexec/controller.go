@@ -3,6 +3,7 @@ package rebalanceexec
 import (
 	"context"
 	"errors"
+	"sync"
 
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/rebalance"
@@ -21,6 +22,7 @@ type MoveDirectory interface {
 // reconciler. It intentionally has no process-local queue or progress cursor:
 // every restart rediscovers work and resumes from the replicated record.
 type Controller struct {
+	passMu            sync.Mutex
 	directory         MoveDirectory
 	journal           rebalance.ReplicatedOperationJournal
 	observer          rebalance.ReplicatedMoveObserver
@@ -185,6 +187,11 @@ func (controller *Controller) RunPass(ctx context.Context) (ControllerPass, erro
 	if controller == nil || ctx == nil {
 		return ControllerPass{}, ErrControllerConfig
 	}
+	// Scaling and ordinary move scheduling share this controller. Serialize
+	// scans so they cannot race the local abandonment cursor or dispatch the
+	// same pending step concurrently from this process.
+	controller.passMu.Lock()
+	defer controller.passMu.Unlock()
 	ids, err := controller.directory.ReadOperationIDs(ctx)
 	if err != nil {
 		return ControllerPass{}, err

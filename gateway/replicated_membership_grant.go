@@ -597,6 +597,10 @@ func (authority *ReplicatedCatalogAuthority) PublishReplicaReplacement(
 	next *Snapshot,
 	expected membershipgrant.Grant,
 ) error {
+	return authority.publishReplicaReplacement(ctx, expectedGeneration, next, expected, nil)
+}
+
+func (authority *ReplicatedCatalogAuthority) publishReplicaReplacement(ctx context.Context, expectedGeneration uint64, next *Snapshot, expected membershipgrant.Grant, publication *groupTransitionPublication) error {
 	if authority == nil || authority.session == nil || ctx == nil || next == nil ||
 		!expected.Valid() || expected.CatalogGeneration != expectedGeneration ||
 		expectedGeneration == ^uint64(0) || authority.session.bundle.maxMutations < 4 {
@@ -772,6 +776,14 @@ func (authority *ReplicatedCatalogAuthority) PublishReplicaReplacement(
 				Key: receiptPageKey[:], Value: receiptPageBytes})
 		}
 	}
+	extra, err := authority.groupTransitionMutations(ctx, publication, cut.snapshot, next)
+	if err != nil {
+		return err
+	}
+	mutations = append(mutations, extra...)
+	if len(mutations) > authority.session.bundle.maxMutations {
+		return ErrReplicatedCatalog
+	}
 	result, err := authority.session.MutateBatch(ctx, mutations)
 	if err != nil {
 		if errors.Is(err, ErrNativeCommandPending) || authority.session.Status().Pending {
@@ -808,6 +820,10 @@ func (authority *ReplicatedCatalogAuthority) PublishReplicaReplacementPostRemove
 	expected membershipgrant.Grant,
 	observedReplicaSetVersion uint64,
 ) error {
+	return authority.publishReplicaReplacementPostRemove(ctx, expectedGeneration, next, expected, observedReplicaSetVersion, nil)
+}
+
+func (authority *ReplicatedCatalogAuthority) publishReplicaReplacementPostRemove(ctx context.Context, expectedGeneration uint64, next *Snapshot, expected membershipgrant.Grant, observedReplicaSetVersion uint64, publication *groupTransitionPublication) error {
 	if authority == nil || authority.session == nil || ctx == nil || next == nil ||
 		!expected.Valid() || expected.CatalogGeneration == ^uint64(0) ||
 		expectedGeneration != expected.CatalogGeneration+1 ||
@@ -902,6 +918,14 @@ func (authority *ReplicatedCatalogAuthority) PublishReplicaReplacementPostRemove
 			Key: receiptKey[:], Value: updatedReceipt,
 			ExpectedValueLength: uint64(len(receiptResult.Value)),
 			ExpectedValueDigest: replication.Digest(receiptDigest)},
+	}
+	extra, err := authority.groupTransitionMutations(ctx, publication, cut.snapshot, next)
+	if err != nil {
+		return err
+	}
+	mutations = append(mutations, extra...)
+	if len(mutations) > authority.session.bundle.maxMutations {
+		return ErrReplicatedCatalog
 	}
 	result, err := authority.session.MutateBatch(ctx, mutations)
 	if err != nil {

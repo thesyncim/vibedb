@@ -334,8 +334,8 @@ func runGatewayHotShardLiveChild(t testing.TB, fixture gatewayHotShardLiveFixtur
 	if !targetFound || maximumOperations > 1 {
 		t.Fatalf("final route=%+v max_operations=%d", route, maximumOperations)
 	}
-	if restarts != 2 {
-		t.Fatalf("catalog self-move handoffs=%d, want exactly two durable route-seed restarts", restarts)
+	if restarts != 0 {
+		t.Fatalf("catalog self-move restarted %d times; certified session rollover must stay live\n%s", restarts, diagnostic.String())
 	}
 	finalConnection := gatewayHotShardDialGateway(t, fixture.clientProfile, fixture.gatewayNode,
 		gatewayAddress, diagnostic, gatewayExited)

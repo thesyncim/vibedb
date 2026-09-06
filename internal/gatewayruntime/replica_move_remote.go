@@ -80,17 +80,22 @@ func (observer gatewayReplicaMoveObserver) ObserveReplicaMove(
 	}
 	var request rebalance.MoveRequest
 	var sourceGeneration uint64
+	var transitionKey gateway.GroupTransitionKey
 	if initial != nil {
 		if initial.OperationID() != operation {
 			return rebalance.ReplicatedMoveCut{}, errGatewayReplicaControl
 		}
 		request, sourceGeneration = initial.Request(), initial.CatalogGeneration()
+		if intent, ok := initial.TransitionIntent(); ok {
+			transitionKey = intent.Key
+		}
 	} else {
 		identity, err := rebalance.InspectReplicaMoveIntent(record.Intent)
 		if err != nil || identity.Operation != operation {
 			return rebalance.ReplicatedMoveCut{}, errors.Join(err, errGatewayReplicaControl)
 		}
 		request, sourceGeneration = identity.Request, identity.SourceGeneration
+		transitionKey = identity.TransitionKey
 	}
 	catalog, err := observer.authority.Read(ctx)
 	if err != nil || catalog == nil || catalog.Generation() < sourceGeneration ||
@@ -138,6 +143,17 @@ func (observer gatewayReplicaMoveObserver) ObserveReplicaMove(
 		TargetStatus: target.Status, TargetState: target.State,
 		TargetProgress: leader.Progress, ProgressFound: leader.ProgressFound,
 	}}
+	if transitionKey.Valid() {
+		reader, ok := observer.authority.(gateway.GroupTransitionReceiptReader)
+		if !ok {
+			return rebalance.ReplicatedMoveCut{}, gateway.ErrGroupTransition
+		}
+		receipt, found, err := reader.ReadGroupPublicationReceipt(ctx, transitionKey)
+		if err != nil {
+			return rebalance.ReplicatedMoveCut{}, err
+		}
+		cut.TransitionReceipt, cut.TransitionReceiptFound = receipt, found
+	}
 	if target.SnapshotBase != nil {
 		cut.SnapshotBase = target.SnapshotBase
 	} else {

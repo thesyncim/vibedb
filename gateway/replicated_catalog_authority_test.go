@@ -1862,8 +1862,15 @@ func newLiveCatalogRolloverSession(
 func newCatalogAuthorityFixture(t *testing.T) (
 	*ReplicatedCatalogAuthority, *catalogAuthorityClient, *Snapshot,
 ) {
+	return newCatalogAuthorityFixtureWithDescriptor(t, nil)
+}
+
+func newCatalogAuthorityFixtureWithDescriptor(t *testing.T, prepare func(*ReplicatedShardDescriptor)) (*ReplicatedCatalogAuthority, *catalogAuthorityClient, *Snapshot) {
 	t.Helper()
 	config, endpoints, descriptor := testReplicatedCatalogInput(t)
+	if prepare != nil {
+		prepare(&descriptor)
+	}
 	genesis, err := NewSnapshotWithReplicatedMetadata(
 		config, endpoints, 1, nil, nil, []ReplicatedShardDescriptor{descriptor},
 	)
