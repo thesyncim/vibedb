@@ -537,7 +537,7 @@ func (server *ReplicatedServer) executeReplicatedAuthenticated(
 	request *ReplicatedRequest,
 	authenticated bool,
 ) *ReplicatedResponse {
-	return server.executeReplicatedAuthenticatedCall(ctx, request, authenticated, nil)
+	return server.executeReplicatedAuthenticatedCallValidated(ctx, request, authenticated, nil, false)
 }
 
 func (server *ReplicatedServer) executeReplicatedAuthenticatedCall(
@@ -545,6 +545,21 @@ func (server *ReplicatedServer) executeReplicatedAuthenticatedCall(
 	request *ReplicatedRequest,
 	authenticated bool,
 	sql *ShardRequest,
+) *ReplicatedResponse {
+	return server.executeReplicatedAuthenticatedCallValidated(ctx, request, authenticated, sql, false)
+}
+
+// executeReplicatedAuthenticatedCallValidated is the internal semantic
+// dispatch path. DispatchReplicated has already run the complete call grammar
+// and frame-size check before admission, so a typed SQL read can skip repeating
+// that immutable validation while legacy/direct callers retain the checked
+// wrapper above.
+func (server *ReplicatedServer) executeReplicatedAuthenticatedCallValidated(
+	ctx context.Context,
+	request *ReplicatedRequest,
+	authenticated bool,
+	sql *ShardRequest,
+	semanticValidated bool,
 ) *ReplicatedResponse {
 	authorizedOwner, fusedProposal := server.owner.(replicatedAuthorizedOwner)
 	fusedProposal = fusedProposal && request.Operation == ReplicatedPropose
@@ -628,10 +643,10 @@ func (server *ReplicatedServer) executeReplicatedAuthenticatedCall(
 		}
 	}
 	if request.Operation == ReplicatedQueryLeader {
-		return server.executeReplicatedQueryCall(ctx, request, state, sql, func(candidate raftservice.ServingState) bool {
+		return server.executeReplicatedQueryCallValidated(ctx, request, state, sql, func(candidate raftservice.ServingState) bool {
 			return server.serving == nil || server.serving(candidate) ||
 				(authenticated && server.transition != nil && server.transition(candidate, request))
-		})
+		}, semanticValidated)
 	}
 	if request.Operation == ReplicatedReadBatchLeader {
 		batchOwner, ok := server.owner.(interface {
