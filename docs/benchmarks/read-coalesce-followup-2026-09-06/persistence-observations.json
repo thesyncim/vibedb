@@ -1,0 +1,266 @@
+[
+  {
+    "arm": "1-baseline",
+    "repetition": 1,
+    "ops_s": 736.1004195847842,
+    "nodes": [
+      {
+        "node": "2926557c64064e2a09ee65a752b2e4ed",
+        "proposals": 3948,
+        "persist_ns": 6073654110
+      },
+      {
+        "node": "a866580d2fe88254ae1763ac55f0d76b",
+        "proposals": 2022,
+        "persist_ns": 6179360595
+      },
+      {
+        "node": "c9dbfae7e45ae4a28b0a6441bdbcd733",
+        "proposals": 2053,
+        "persist_ns": 6132860413
+      }
+    ]
+  },
+  {
+    "arm": "1-baseline",
+    "repetition": 2,
+    "ops_s": 1077.3525670874972,
+    "nodes": [
+      {
+        "node": "2926557c64064e2a09ee65a752b2e4ed",
+        "proposals": 3948,
+        "persist_ns": 2936946630
+      },
+      {
+        "node": "a866580d2fe88254ae1763ac55f0d76b",
+        "proposals": 2022,
+        "persist_ns": 2928088414
+      },
+      {
+        "node": "c9dbfae7e45ae4a28b0a6441bdbcd733",
+        "proposals": 2043,
+        "persist_ns": 2896103111
+      }
+    ]
+  },
+  {
+    "arm": "1-baseline",
+    "repetition": 3,
+    "ops_s": 1026.6942424231622,
+    "nodes": [
+      {
+        "node": "2926557c64064e2a09ee65a752b2e4ed",
+        "proposals": 3948,
+        "persist_ns": 3238872885
+      },
+      {
+        "node": "a866580d2fe88254ae1763ac55f0d76b",
+        "proposals": 2022,
+        "persist_ns": 3208996646
+      },
+      {
+        "node": "c9dbfae7e45ae4a28b0a6441bdbcd733",
+        "proposals": 2054,
+        "persist_ns": 3183045067
+      }
+    ]
+  },
+  {
+    "arm": "2-scheduler",
+    "repetition": 1,
+    "ops_s": 968.4509691320202,
+    "nodes": [
+      {
+        "node": "4c18a5c409c94ba702fc41b8bbf6ba17",
+        "proposals": 5970,
+        "persist_ns": 3522999775
+      },
+      {
+        "node": "709baa19b64bbbd10730d886b0bfd097",
+        "proposals": 23,
+        "persist_ns": 3355737723
+      },
+      {
+        "node": "e424de24ce9301e9d99f30ac82df07ff",
+        "proposals": 2030,
+        "persist_ns": 3573172741
+      }
+    ]
+  },
+  {
+    "arm": "2-scheduler",
+    "repetition": 2,
+    "ops_s": 1037.561829027579,
+    "nodes": [
+      {
+        "node": "4c18a5c409c94ba702fc41b8bbf6ba17",
+        "proposals": 5970,
+        "persist_ns": 3178071720
+      },
+      {
+        "node": "709baa19b64bbbd10730d886b0bfd097",
+        "proposals": 22,
+        "persist_ns": 3034287400
+      },
+      {
+        "node": "e424de24ce9301e9d99f30ac82df07ff",
+        "proposals": 2030,
+        "persist_ns": 3128908620
+      }
+    ]
+  },
+  {
+    "arm": "2-scheduler",
+    "repetition": 3,
+    "ops_s": 1046.1391381457197,
+    "nodes": [
+      {
+        "node": "4c18a5c409c94ba702fc41b8bbf6ba17",
+        "proposals": 5970,
+        "persist_ns": 3166172175
+      },
+      {
+        "node": "709baa19b64bbbd10730d886b0bfd097",
+        "proposals": 22,
+        "persist_ns": 2973200500
+      },
+      {
+        "node": "e424de24ce9301e9d99f30ac82df07ff",
+        "proposals": 2030,
+        "persist_ns": 3136213796
+      }
+    ]
+  },
+  {
+    "arm": "3-scheduler",
+    "repetition": 1,
+    "ops_s": 1022.1600950817818,
+    "nodes": [
+      {
+        "node": "31827e5a974ff47f6fabd75c7da218c8",
+        "proposals": 1995,
+        "persist_ns": 3134769755
+      },
+      {
+        "node": "91cbaf9af7f223ec178e5c50745d3433",
+        "proposals": 3999,
+        "persist_ns": 3066396892
+      },
+      {
+        "node": "fb039386976dd2e486c8ef0e60e41fbc",
+        "proposals": 2030,
+        "persist_ns": 3161514104
+      }
+    ]
+  },
+  {
+    "arm": "3-scheduler",
+    "repetition": 2,
+    "ops_s": 1032.8959882754407,
+    "nodes": [
+      {
+        "node": "31827e5a974ff47f6fabd75c7da218c8",
+        "proposals": 1995,
+        "persist_ns": 3064525155
+      },
+      {
+        "node": "91cbaf9af7f223ec178e5c50745d3433",
+        "proposals": 3990,
+        "persist_ns": 3021866169
+      },
+      {
+        "node": "fb039386976dd2e486c8ef0e60e41fbc",
+        "proposals": 2030,
+        "persist_ns": 3137179440
+      }
+    ]
+  },
+  {
+    "arm": "3-scheduler",
+    "repetition": 3,
+    "ops_s": 901.5153412704716,
+    "nodes": [
+      {
+        "node": "31827e5a974ff47f6fabd75c7da218c8",
+        "proposals": 1995,
+        "persist_ns": 3777210821
+      },
+      {
+        "node": "91cbaf9af7f223ec178e5c50745d3433",
+        "proposals": 3996,
+        "persist_ns": 3784631379
+      },
+      {
+        "node": "fb039386976dd2e486c8ef0e60e41fbc",
+        "proposals": 2030,
+        "persist_ns": 3855777114
+      }
+    ]
+  },
+  {
+    "arm": "4-baseline",
+    "repetition": 1,
+    "ops_s": 692.600527986507,
+    "nodes": [
+      {
+        "node": "701c52c7dded814f90557483508c62fd",
+        "proposals": 2044,
+        "persist_ns": 5330144542
+      },
+      {
+        "node": "9e312fb4a2b55311c457d32062d69a29",
+        "proposals": 2030,
+        "persist_ns": 5366062914
+      },
+      {
+        "node": "a23c5366099a9c91b6aa536d47b4cf05",
+        "proposals": 3948,
+        "persist_ns": 5324244883
+      }
+    ]
+  },
+  {
+    "arm": "4-baseline",
+    "repetition": 2,
+    "ops_s": 639.5787837486164,
+    "nodes": [
+      {
+        "node": "701c52c7dded814f90557483508c62fd",
+        "proposals": 2040,
+        "persist_ns": 6555295933
+      },
+      {
+        "node": "9e312fb4a2b55311c457d32062d69a29",
+        "proposals": 2030,
+        "persist_ns": 6682301860
+      },
+      {
+        "node": "a23c5366099a9c91b6aa536d47b4cf05",
+        "proposals": 3948,
+        "persist_ns": 6587342294
+      }
+    ]
+  },
+  {
+    "arm": "4-baseline",
+    "repetition": 3,
+    "ops_s": 475.287823983547,
+    "nodes": [
+      {
+        "node": "701c52c7dded814f90557483508c62fd",
+        "proposals": 2044,
+        "persist_ns": 11312759286
+      },
+      {
+        "node": "9e312fb4a2b55311c457d32062d69a29",
+        "proposals": 2030,
+        "persist_ns": 11466781396
+      },
+      {
+        "node": "a23c5366099a9c91b6aa536d47b4cf05",
+        "proposals": 3948,
+        "persist_ns": 11386998584
+      }
+    ]
+  }
+]

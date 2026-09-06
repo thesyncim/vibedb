@@ -45,3 +45,7 @@ Single-client mixed traffic improved in both pairs, but this does not establish 
 ## Retained evidence
 
 [Summary](summary.json), [build metadata](build.json), [summarizer](summarize.py), [raw evidence archive](evidence.tar.gz), and [checksums](SHA256SUMS). The archive contains manifests, frozen hashes, controller sources and commands, client reports with per-operation samples, diagnostics, container event logs and topology snapshots. Binaries and published database volumes are omitted. Internal arm label `scheduler` means the PR 194 candidate, not an owner-fairness-only build.
+
+## Follow-up
+
+The [solo-read optimization and update follow-up](../read-coalesce-followup-2026-09-06/README.md) retains a separate longer-warmup campaign. It did not reproduce the update slowdown, but run-order variation prevents declaring the original signal resolved. The measurements above remain unchanged.
