@@ -112,7 +112,7 @@ func (runtime *Runtime) maintainWALAdmission(err error) error {
 			return errors.Join(err, result.err)
 		}
 	}
-	if buildErr := runtime.prepareWALGenerationBuild(driver); buildErr != nil {
+	if buildErr := runtime.prepareWALGenerationBuildMode(driver, runtime.pipelined != nil); buildErr != nil {
 		return errors.Join(err, buildErr)
 	}
 	if !driver.building {
@@ -122,7 +122,7 @@ func (runtime *Runtime) maintainWALAdmission(err error) error {
 	result := <-driver.result
 	driver.building, driver.ticks = false, 0
 	driver.builder = nil
-	if publishErr := runtime.publishBuiltWALGeneration(driver, result); publishErr != nil {
+	if publishErr := runtime.publishBuiltWALGenerationMode(driver, result, runtime.pipelined != nil); publishErr != nil {
 		return errors.Join(err, publishErr)
 	}
 	return runtime.wal.ReserveReady()
@@ -163,7 +163,11 @@ func (runtime *Runtime) tickWALGeneration() {
 }
 
 func (runtime *Runtime) prepareWALGenerationBuild(driver *walGenerationDriver) error {
-	if !runtime.walGenerationQuiescent() {
+	return runtime.prepareWALGenerationBuildMode(driver, false)
+}
+
+func (runtime *Runtime) prepareWALGenerationBuildMode(driver *walGenerationDriver, pressure bool) error {
+	if !runtime.walGenerationBuildWindow(pressure) {
 		return nil
 	}
 	_, err := runtime.WALRetentionInput()
@@ -236,6 +240,10 @@ func (runtime *Runtime) publishBuiltWALGeneration(
 	driver *walGenerationDriver,
 	result walGenerationBuildResult,
 ) error {
+	return runtime.publishBuiltWALGenerationMode(driver, result, false)
+}
+
+func (runtime *Runtime) publishBuiltWALGenerationMode(driver *walGenerationDriver, result walGenerationBuildResult, pressure bool) error {
 	if result.err != nil {
 		return result.err
 	}
@@ -243,7 +251,7 @@ func (runtime *Runtime) publishBuiltWALGeneration(
 		return ErrWALUnavailable
 	}
 	closeBuilder := func() error { return result.builder.Close() }
-	if !runtime.walGenerationQuiescent() {
+	if !runtime.walGenerationBuildWindow(pressure) {
 		return errors.Join(raftstore.ErrGenerationSource, closeBuilder())
 	}
 	checkpoint, err := runtime.WALRetentionInput()
@@ -343,4 +351,15 @@ func OpenBoundSQLWithApplyRecoveringGeneration(
 		return nil, nil, errors.Join(err, apply.Close(), database.Close())
 	}
 	return database, apply, nil
+}
+
+// Hard-pressure maintenance holds the exclusive owner lane throughout build and
+// publication. An uncaptured Ready has not consumed WAL credit or changed the
+// durable cut; all captured append and apply work must still be settled.
+func (runtime *Runtime) walGenerationBuildWindow(pressure bool) bool {
+	if !pressure {
+		return runtime.walGenerationQuiescent()
+	}
+	return runtime != nil && runtime.node != nil && runtime.node.Phase() == raftmodel.PhaseIdle &&
+		runtime.pipelined != nil && runtime.pipelined.quiescent()
 }

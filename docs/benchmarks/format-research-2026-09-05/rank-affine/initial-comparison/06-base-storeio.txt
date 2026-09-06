@@ -1,0 +1,30 @@
+goos: linux
+goarch: amd64
+pkg: github.com/thesyncim/vibedb/internal/storeio
+cpu: AMD EPYC 7763 64-Core Processor                
+BenchmarkCompactRankFormat/low/Build   	      15	  14363993 ns/op	     36864 leaf-B	     36661 payload-B	       0 B/op	       0 allocs/op
+BenchmarkCompactRankFormat/low/Point   	  291230	       821.8 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactRankFormat/low/Scan    	     300	    798108 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactRankFormat/low/Patch-id         	     628	    381147 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactRankFormat/low/Patch-score      	    1441	    166028 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactRankFormat/high/Build           	     127	   1872762 ns/op	     36864 leaf-B	     35627 payload-B	       0 B/op	       0 allocs/op
+BenchmarkCompactRankFormat/high/Point           	  156914	      1525 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactRankFormat/high/Scan            	    1183	    200769 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactRankFormat/high/Patch-id        	    4632	     51491 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactRankFormat/high/Patch-score     	    8866	     27091 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactRankFormat/late-miss/Build      	      57	   4039374 ns/op	     16384 leaf-B	     13516 payload-B	       0 B/op	       0 allocs/op
+BenchmarkCompactRankFormat/late-miss/Point      	  255477	       932.5 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactRankFormat/late-miss/Scan       	     746	    319637 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactRankFormat/late-miss/Patch-id   	     451	    517474 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactRankFormat/late-miss/Patch-score         	    1167	    226811 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactRankFormat/negative/Build                	      57	   4080178 ns/op	     16384 leaf-B	     13518 payload-B	       0 B/op	       0 allocs/op
+BenchmarkCompactRankFormat/negative/Point                	  257233	       933.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactRankFormat/negative/Scan                 	     744	    320908 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactRankFormat/negative/Patch-id             	     457	    523252 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactRankFormat/negative/Patch-score          	    1171	    204186 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactRankFormat/unrelated/Build               	     470	    508910 ns/op	      4096 leaf-B	      3642 payload-B	       0 B/op	       0 allocs/op
+BenchmarkCompactRankFormat/unrelated/Point               	  281355	       855.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactRankFormat/unrelated/Scan                	    5236	     45568 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactRankFormat/unrelated/Patch-id            	    7411	     32289 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompactRankFormat/unrelated/Patch-score         	    9837	     24253 ns/op	       0 B/op	       0 allocs/op
+PASS

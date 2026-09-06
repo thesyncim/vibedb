@@ -1,0 +1,126 @@
+package durable
+
+import (
+	"bytes"
+	"fmt"
+	"github.com/thesyncim/vibedb/internal/rf3bench"
+	"github.com/thesyncim/vibedb/internal/storeio"
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+// Exploratory physical census. This deliberately reports no latency claims.
+func TestFormatResearchPrimaryBoundary(t *testing.T) {
+	if os.Getenv("VIBEDB_FORMAT_RESEARCH") != "1" {
+		t.Skip("opt-in format research")
+	}
+	const rows = 256
+	for _, width := range []int{512, 513, 1024, 4096} {
+		for _, inline := range []int{512, 4096} {
+			for _, high := range []bool{false, true} {
+				t.Run(fmt.Sprintf("bytes%d-inline%d-high%t", width, inline, high), func(t *testing.T) {
+					dir := t.TempDir()
+					path := filepath.Join(dir, "primary.vibe")
+					file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0600)
+					if err != nil {
+						t.Fatal(err)
+					}
+					opts := Options{Backend: BackendPortable, Durability: DurabilityBufferedVisible,
+						ResidentBytes: 64 << 20, InlineValueBytes: inline, MaxDocumentBytes: 4096, MaxBatchDocuments: 64}
+					c, err := Create(file, opts)
+					if err != nil {
+						file.Close()
+						t.Fatal(err)
+					}
+					closed := false
+					defer func() {
+						if !closed {
+							c.Close()
+							file.Close()
+						}
+					}()
+					values := make([][]byte, rows)
+					for i := range rows {
+						v := fmt.Appendf(nil, `{"id":%d,"payload":"`, i)
+						padding := width - len(v) - 2
+						if high {
+							v = appendWideJSONSafePattern(v, padding, i*19)
+						} else {
+							v = append(v, bytes.Repeat([]byte("a"), padding)...)
+						}
+						v = append(v, '"', '}')
+						if len(v) != width {
+							t.Fatal("bad fixture")
+						}
+						values[i] = v
+					}
+					for start := 0; start < rows; start += 64 {
+						err = c.Update(func(batch *WriteBatch) error {
+							for i := start; i < start+64; i++ {
+								if err := batch.Put(fmt.Appendf(nil, "row:%08d", i), values[i]); err != nil {
+									return err
+								}
+							}
+							return nil
+						})
+						if err != nil {
+							t.Fatal(err)
+						}
+					}
+					if err = c.Flush(); err != nil {
+						t.Fatal(err)
+					}
+					router := c.primaryRouter.Load()
+					leaves, leafBytes, overflowRows, overflowBytes := 0, 0, 0, 0
+					for rank := 0; rank < router.Len(); rank++ {
+						route, ok := router.RouteAtRank(rank)
+						if !ok {
+							t.Fatal("missing route")
+						}
+						lease, err := router.AcquireLeaf(c.cache, route)
+						if err != nil {
+							t.Fatal(err)
+						}
+						view, ok := storeio.AdmittedCompactPrimaryStripe(lease.Page(), c.state.Load().root.StoreID, route.Bucket)
+						if !ok {
+							lease.Release()
+							t.Fatal("not compact")
+						}
+						leaves++
+						leafBytes += len(lease.Page())
+						for row := 0; row < view.Len(); row++ {
+							if ref, ok := view.OverflowRef(row); ok {
+								overflowRows++
+								overflowBytes += int(ref.Length)
+							}
+						}
+						lease.Release()
+					}
+					for i := range rows {
+						got, found, err := c.AppendRaw(nil, fmt.Appendf(nil, "row:%08d", i))
+						if err != nil || !found || !bytes.Equal(got, values[i]) {
+							t.Fatalf("read %d %v %t", i, err, found)
+						}
+					}
+					if err = c.Close(); err != nil {
+						t.Fatal(err)
+					}
+					if err = file.Close(); err != nil {
+						t.Fatal(err)
+					}
+					closed = true
+					footprint, err := rf3bench.MeasureFootprint(dir)
+					if err != nil {
+						t.Fatal(err)
+					}
+					primary, err := os.Stat(path)
+					if err != nil {
+						t.Fatal(err)
+					}
+					t.Logf("CENSUS rows=%d doc_bytes=%d inline=%d high=%t leaves=%d live_leaf_bytes=%d overflow_rows=%d live_overflow_bytes=%d primary_apparent=%d all_apparent=%d all_allocated=%d files=%d", rows, width, inline, high, leaves, leafBytes, overflowRows, overflowBytes, primary.Size(), footprint.ApparentBytes, footprint.AllocatedBytes, footprint.Files)
+				})
+			}
+		}
+	}
+}

@@ -1,0 +1,25 @@
+=== RUN   TestNodeLogMaintenanceReclaimsThreeReplicaHistory
+    node_maintenance_test.go:194: three-replica apparent node bytes: before=3232374 after=64752 reclaimed=3167622 (98.00%); preallocated blocks excluded
+    node_maintenance_test.go:196: three-replica allocated node bytes including active+two reserves per replica: before=17547264 after=14303232 reclaimed=3244032 (18.49%)
+--- PASS: TestNodeLogMaintenanceReclaimsThreeReplicaHistory (2.34s)
+=== RUN   TestNodeLogMaintenanceCatalogIODoesNotBlockReadsOrAppends
+--- PASS: TestNodeLogMaintenanceCatalogIODoesNotBlockReadsOrAppends (0.18s)
+=== RUN   TestNodeLogMaintenanceRetriesCatalogFailureAndSkipsUnchangedCatalog
+--- PASS: TestNodeLogMaintenanceRetriesCatalogFailureAndSkipsUnchangedCatalog (0.13s)
+PASS
+ok  	github.com/thesyncim/vibedb/internal/raftstore	2.664s
+=== RUN   TestAdoptNodeRuntimeDrivesWorkerFreeDurableReady
+raft2026/09/05 15:52:43 INFO: 12 switched to configuration voters=(12)
+raft2026/09/05 15:52:43 INFO: 12 became follower at term 1
+raft2026/09/05 15:52:43 INFO: newRaft 12 [peers: [12], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/09/05 15:52:43 INFO: 12 is starting a new election at term 1
+raft2026/09/05 15:52:43 INFO: 12 became pre-candidate at term 1
+raft2026/09/05 15:52:43 INFO: 12 received MsgPreVoteResp from 12 at term 1
+raft2026/09/05 15:52:43 INFO: 12 has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/09/05 15:52:43 INFO: 12 became candidate at term 2
+raft2026/09/05 15:52:43 INFO: 12 received MsgVoteResp from 12 at term 2
+raft2026/09/05 15:52:43 INFO: 12 has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/09/05 15:52:43 INFO: 12 became leader at term 2
+--- PASS: TestAdoptNodeRuntimeDrivesWorkerFreeDurableReady (0.85s)
+PASS
+ok  	github.com/thesyncim/vibedb/internal/raftmember	0.853s

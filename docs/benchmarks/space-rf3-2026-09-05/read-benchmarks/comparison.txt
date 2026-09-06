@@ -1,0 +1,66 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/store/durable
+cpu: Apple M4 Max
+                                   │ /tmp/vibedb-space-benchmark-reads/base.txt │ /tmp/vibedb-space-benchmark-reads/after.txt │
+                                   │                   sec/op                   │        sec/op          vs base              │
+UnifiedGetRaw                                                      743.8n ± 26%           847.0n ±  15%       ~ (p=0.589 n=6)
+UnifiedPrimaryReplace                                              4.601µ ±  5%           4.786µ ± 136%       ~ (p=0.093 n=6)
+UnifiedScanAllBytesLowCardinality                                  19.62m ±  1%           19.55m ±   1%       ~ (p=0.589 n=6)
+UnifiedScanAllBytesHighCardinality                                 28.42m ±  2%           28.46m ±   1%       ~ (p=0.937 n=6)
+geomean                                                            209.0µ                 217.9µ         +4.25%
+
+              │ /tmp/vibedb-space-benchmark-reads/base.txt │ /tmp/vibedb-space-benchmark-reads/after.txt │
+              │             p50-batch16-sec/op             │     p50-batch16-sec/op      vs base         │
+UnifiedGetRaw                                 666.6n ± 16%                  701.8n ± 8%  ~ (p=0.567 n=6)
+
+                      │ /tmp/vibedb-space-benchmark-reads/base.txt │ /tmp/vibedb-space-benchmark-reads/after.txt │
+                      │                 p50-sec/op                 │      p50-sec/op        vs base              │
+UnifiedGetRaw                                         687.5n ± 27%            791.5n ± 16%       ~ (p=0.595 n=6)
+UnifiedPrimaryReplace                                 1.625µ ±  3%            1.625µ ±  3%       ~ (p=1.000 n=6)
+geomean                                               1.057µ                  1.134µ        +7.30%
+
+                      │ /tmp/vibedb-space-benchmark-reads/base.txt │ /tmp/vibedb-space-benchmark-reads/after.txt │
+                      │                 p99-sec/op                 │      p99-sec/op        vs base              │
+UnifiedGetRaw                                         1.000µ ± 29%            1.084µ ± 12%       ~ (p=0.574 n=6)
+UnifiedPrimaryReplace                                 2.605µ ± 12%            2.583µ ± 21%       ~ (p=0.866 n=6)
+geomean                                               1.614µ                  1.673µ        +3.67%
+
+                                   │ /tmp/vibedb-space-benchmark-reads/base.txt │ /tmp/vibedb-space-benchmark-reads/after.txt │
+                                   │                    B/op                    │        B/op          vs base                │
+UnifiedGetRaw                                                     0.000 ±  0%             0.000 ±  0%       ~ (p=1.000 n=6) ¹
+UnifiedPrimaryReplace                                             508.5 ± 12%             556.0 ± 13%       ~ (p=0.290 n=6)
+UnifiedScanAllBytesLowCardinality                                 0.000 ±  0%             0.000 ±  0%       ~ (p=1.000 n=6) ¹
+UnifiedScanAllBytesHighCardinality                                0.000 ±  0%             0.000 ±  0%       ~ (p=1.000 n=6) ¹
+geomean                                                                       ²                        +2.26%               ²
+¹ all samples are equal
+² summaries must be >0 to compute geomean
+
+                                   │ /tmp/vibedb-space-benchmark-reads/base.txt │ /tmp/vibedb-space-benchmark-reads/after.txt │
+                                   │                 allocs/op                  │      allocs/op       vs base                │
+UnifiedGetRaw                                                      0.000 ± 0%              0.000 ± 0%       ~ (p=1.000 n=6) ¹
+UnifiedPrimaryReplace                                              0.000 ± 0%              0.000 ± 0%       ~ (p=1.000 n=6) ¹
+UnifiedScanAllBytesLowCardinality                                  0.000 ± 0%              0.000 ± 0%       ~ (p=1.000 n=6) ¹
+UnifiedScanAllBytesHighCardinality                                 0.000 ± 0%              0.000 ± 0%       ~ (p=1.000 n=6) ¹
+geomean                                                                       ²                        +0.00%               ²
+¹ all samples are equal
+² summaries must be >0 to compute geomean
+
+                                   │ /tmp/vibedb-space-benchmark-reads/base.txt │ /tmp/vibedb-space-benchmark-reads/after.txt │
+                                   │                    B/s                     │          B/s           vs base              │
+UnifiedScanAllBytesLowCardinality                                  1.181Gi ± 1%            1.186Gi ± 1%       ~ (p=0.589 n=6)
+UnifiedScanAllBytesHighCardinality                                 835.0Mi ± 2%            833.8Mi ± 1%       ~ (p=0.937 n=6)
+geomean                                                           1004.8Mi                1006.1Mi       +0.13%
+
+                                   │ /tmp/vibedb-space-benchmark-reads/base.txt │ /tmp/vibedb-space-benchmark-reads/after.txt │
+                                   │                 bytes/doc                  │      bytes/doc       vs base                │
+UnifiedScanAllBytesLowCardinality                                    248.8 ± 0%            248.8 ± 0%       ~ (p=1.000 n=6) ¹
+UnifiedScanAllBytesHighCardinality                                   248.8 ± 0%            248.8 ± 0%       ~ (p=1.000 n=6) ¹
+geomean                                                              248.8                 248.8       +0.00%
+¹ all samples are equal
+
+                                   │ /tmp/vibedb-space-benchmark-reads/base.txt │ /tmp/vibedb-space-benchmark-reads/after.txt │
+                                   │                  sec/doc                   │        sec/doc         vs base              │
+UnifiedScanAllBytesLowCardinality                                   196.2n ± 1%             195.5n ± 1%       ~ (p=0.589 n=6)
+UnifiedScanAllBytesHighCardinality                                  284.2n ± 2%             284.5n ± 1%       ~ (p=0.900 n=6)
+geomean                                                             236.1n                  235.8n       -0.13%

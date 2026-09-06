@@ -155,7 +155,21 @@ func (grants *DynamicShardActionGrants) resolve(
 				candidate.Actions&sourceSplitActionMask() == 0 {
 				continue
 			}
-			sealed := candidate.Target
+			source := candidate.Target
+			if target.Member == 0 {
+				// Only artifact recovery follows the leader; other actions
+				// retain their exact destination and all authority fields.
+				source.Member = 0
+				if source == target {
+					grant, found = candidate, true
+					grant.Target, grant.Actions = target, candidate.Actions&actionBit(ActionBuildArtifacts)
+					break
+				}
+			}
+			if target.Member == 0 {
+				continue
+			}
+			sealed := source
 			sealed.Authority.OwnershipEpoch = uint64(candidate.Plan.children[candidate.Plan.retained].OwnershipEpoch)
 			sealed.Authority.RoutingVersion = uint64(candidate.Plan.targetManifest.Version())
 			sealed.Authority.RouteGeneration = candidate.Plan.next

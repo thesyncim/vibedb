@@ -172,3 +172,206 @@ func TestRunFileCompactDataSkippingReopenAndMutation(t *testing.T) {
 		t.Fatalf("mutated outlier result/stats = %+v / %+v", execution.Result, execution.Stats)
 	}
 }
+
+func dataSkippingIntegerSnapshot(
+	tb testing.TB,
+	name string,
+	rows int,
+	field string,
+	skipIndexes []string,
+	value func(int) int64,
+) *durable.Snapshot {
+	tb.Helper()
+	file, err := os.CreateTemp(tb.TempDir(), "query-file-skip-admission-"+name+"-*")
+	if err != nil {
+		tb.Fatal(err)
+	}
+	tb.Cleanup(func() { _ = file.Close() })
+	source := &store.Collection{}
+	padding := strings.Repeat("x", 512)
+	for row := range rows {
+		doc := fmt.Appendf(nil,
+			`{"id":%d,%q:%d,"padding":%q}`,
+			row, field, value(row), padding,
+		)
+		if _, err := source.Put(fmt.Sprintf("row-%07d", row), doc); err != nil {
+			tb.Fatalf("source row %d: %v", row, err)
+		}
+	}
+	options := durable.Options{
+		SkipIndexes:      skipIndexes,
+		Collection:       store.Options{ChunkDocuments: 64},
+		Durability:       durable.DurabilityAsyncVisible,
+		InlineValueBytes: 2048,
+		MaxDocumentBytes: 2048,
+	}
+	if _, err := durable.CreateFromPrimary(source, file, options); err != nil {
+		tb.Fatalf("CreateFromPrimary %s: %v", name, err)
+	}
+	collection, err := durable.Open(file, durable.Options{
+		Durability: durable.DurabilityAsyncVisible,
+	})
+	if err != nil {
+		tb.Fatalf("Open %s: %v", name, err)
+	}
+	tb.Cleanup(func() { _ = collection.Close() })
+	snapshot, err := collection.Snapshot()
+	if err != nil {
+		tb.Fatalf("Snapshot %s: %v", name, err)
+	}
+	tb.Cleanup(func() { _ = snapshot.Close() })
+	return snapshot
+}
+
+func runDataSkippingIntegerCount(
+	t testing.TB,
+	snapshot *durable.Snapshot,
+	query *Query,
+) (int64, ExecStats) {
+	t.Helper()
+	var execution Exec
+	execution.Options.Workers = 1
+	if err := query.RunInto(&execution, FromFile(snapshot)); err != nil {
+		t.Fatal(err)
+	}
+	column, ok := execution.Result.Column("count(*)")
+	if !ok || len(column.Cells) != 1 {
+		t.Fatalf("integer skip result = %+v", execution.Result)
+	}
+	count, ok := column.Cells[0].Int64()
+	if !ok {
+		t.Fatalf("integer skip count is not int64: %+v", execution.Result)
+	}
+	stats := execution.Stats
+	execution.Release()
+	return count, stats
+}
+
+func TestRunFileCompactIntegerSkipAdmission(t *testing.T) {
+	const prefixRows = 8192
+	prefixValue := func(row int) int64 { return int64(row) }
+	prefixInterval := func() *Query {
+		return Select(Count()).Where(And(
+			Cmp("score", Ge, int64(prefixRows-64)),
+			Cmp("score", Lt, int64(prefixRows)),
+		))
+	}
+	assertPrefixNative := func(t *testing.T, snapshot *durable.Snapshot) {
+		t.Helper()
+		count, stats := runDataSkippingIntegerCount(t, snapshot, prefixInterval())
+		if count != 64 || stats.RowsScanned != prefixRows ||
+			stats.TokenFilterRows != prefixRows || stats.TokenFilterFallbackRows != 0 ||
+			stats.DataSkippedRows != 0 || stats.DataSkippedStripes != 0 ||
+			stats.Batches != 0 {
+			t.Fatalf("prefix native count/stats = %d/%+v", count, stats)
+		}
+		count, stats = runDataSkippingIntegerCount(t, snapshot,
+			Select(Count()).Where(Cmp("score", Ge, int64(prefixRows-64))))
+		if count != 64 || stats.RowsScanned != prefixRows ||
+			stats.TokenFilterRows != prefixRows || stats.TokenFilterFallbackRows != 0 ||
+			stats.DataSkippedRows != 0 || stats.DataSkippedStripes != 0 ||
+			stats.Batches != 0 {
+			t.Fatalf("prefix ordered native count/stats = %d/%+v", count, stats)
+		}
+	}
+
+	t.Run("prefix-matching-skip-selective", func(t *testing.T) {
+		snapshot := dataSkippingIntegerSnapshot(
+			t, "prefix-matching", prefixRows, "score", []string{"/score"}, prefixValue,
+		)
+		count, stats := runDataSkippingIntegerCount(t, snapshot, prefixInterval())
+		if count != 64 || stats.DataSkippedRows == 0 ||
+			stats.DataSkippedStripes == 0 || stats.RowsScanned >= prefixRows ||
+			stats.RowsScanned+stats.DataSkippedRows != prefixRows {
+			t.Fatalf("prefix selective count/stats = %d/%+v", count, stats)
+		}
+		count, stats = runDataSkippingIntegerCount(t, snapshot,
+			Select(Count()).Where(Cmp("score", Ge, int64(prefixRows-64))))
+		if count != 64 || stats.DataSkippedRows == 0 ||
+			stats.DataSkippedStripes == 0 || stats.RowsScanned >= prefixRows ||
+			stats.RowsScanned+stats.DataSkippedRows != prefixRows {
+			t.Fatalf("prefix ordered selective count/stats = %d/%+v", count, stats)
+		}
+	})
+
+	t.Run("prefix-matching-skip-impossible", func(t *testing.T) {
+		snapshot := dataSkippingIntegerSnapshot(
+			t, "prefix-impossible", prefixRows, "score", []string{"/score"}, prefixValue,
+		)
+		query := Select(Count()).Where(And(
+			Cmp("score", Ge, int64(10)), Cmp("score", Lt, int64(10)),
+		))
+		count, stats := runDataSkippingIntegerCount(t, snapshot, query)
+		if count != 0 || stats.RowsScanned != 0 ||
+			stats.DataSkippedRows != prefixRows || stats.DataSkippedStripes == 0 {
+			t.Fatalf("prefix impossible count/stats = %d/%+v", count, stats)
+		}
+	})
+
+	t.Run("prefix-no-skip-native", func(t *testing.T) {
+		snapshot := dataSkippingIntegerSnapshot(
+			t, "prefix-none", prefixRows, "score", nil, prefixValue,
+		)
+		assertPrefixNative(t, snapshot)
+	})
+
+	t.Run("prefix-unrelated-skip-native", func(t *testing.T) {
+		snapshot := dataSkippingIntegerSnapshot(
+			t, "prefix-unrelated", prefixRows, "score", []string{"/other"}, prefixValue,
+		)
+		assertPrefixNative(t, snapshot)
+	})
+
+	t.Run("for-matching-skip-stays-native", func(t *testing.T) {
+		const rows = filePackedCountTestRows
+		snapshot := dataSkippingIntegerSnapshot(
+			t, "for-matching", rows, "n", []string{"/n"},
+			func(row int) int64 { return int64(filePackedCountNumber(row)) },
+		)
+		cases := []struct {
+			name  string
+			query *Query
+			want  int64
+		}{
+			{
+				name:  "all",
+				query: Select(Count()).Where(Cmp("n", Ge, int64(-1<<63))),
+				want:  rows,
+			},
+			{
+				name: "selective",
+				query: Select(Count()).Where(And(
+					Cmp("n", Ge, int64(-100)), Cmp("n", Lt, int64(100)),
+				)),
+				want: func() int64 {
+					var want int64
+					for row := range rows {
+						value := int64(filePackedCountNumber(row))
+						if value >= -100 && value < 100 {
+							want++
+						}
+					}
+					return want
+				}(),
+			},
+			{
+				name: "empty",
+				query: Select(Count()).Where(And(
+					Cmp("n", Ge, int64(10)), Cmp("n", Lt, int64(10)),
+				)),
+				want: 0,
+			},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				count, stats := runDataSkippingIntegerCount(t, snapshot, tc.query)
+				if count != tc.want || stats.RowsScanned != rows ||
+					stats.TokenFilterRows != rows || stats.TokenFilterFallbackRows != 0 ||
+					stats.DataSkippedRows != 0 || stats.DataSkippedStripes != 0 ||
+					stats.Batches != 0 {
+					t.Fatalf("FOR native count/stats = %d/%+v want %d", count, stats, tc.want)
+				}
+			})
+		}
+	})
+}

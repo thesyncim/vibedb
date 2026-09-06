@@ -1,0 +1,86 @@
+goos: linux
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/store/durable
+BenchmarkUnifiedPartitionedScanAllBytes/workers=1-4        	      10	  32899204 ns/op	 756.28 MB/s	      22 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytes/workers=1-4        	      10	  33009010 ns/op	 753.77 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytes/workers=1-4        	      10	  32805923 ns/op	 758.43 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytes/workers=1-4        	      10	  32836198 ns/op	 757.74 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytes/workers=1-4        	      10	  32823634 ns/op	 758.03 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytes/workers=4-4        	      42	   8349980 ns/op	2979.79 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytes/workers=4-4        	      42	   8534103 ns/op	2915.50 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytes/workers=4-4        	      36	   8459270 ns/op	2941.29 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytes/workers=4-4        	      42	   8465015 ns/op	2939.29 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytes/workers=4-4        	      38	   8503237 ns/op	2926.08 MB/s	       2 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytesMillion/workers=1-4 	       1	 329900111 ns/op	 760.22 MB/s	     112 B/op	       1 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytesMillion/workers=1-4 	       1	 330107235 ns/op	 759.74 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytesMillion/workers=1-4 	       1	 330372067 ns/op	 759.13 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytesMillion/workers=1-4 	       1	 330346906 ns/op	 759.19 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytesMillion/workers=1-4 	       1	 330119300 ns/op	 759.71 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytesMillion/workers=4-4 	       4	  83329023 ns/op	3009.70 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytesMillion/workers=4-4 	       4	  83821322 ns/op	2992.03 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytesMillion/workers=4-4 	       4	  85842244 ns/op	2921.59 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytesMillion/workers=4-4 	       4	  83132203 ns/op	3016.83 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytesMillion/workers=4-4 	       4	  83158686 ns/op	3015.87 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytesHighCardinality/workers=1-4         	       7	  48383836 ns/op	 514.25 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytesHighCardinality/workers=1-4         	       7	  48426054 ns/op	 513.80 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytesHighCardinality/workers=1-4         	       7	  48458961 ns/op	 513.45 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytesHighCardinality/workers=1-4         	       7	  48398829 ns/op	 514.09 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytesHighCardinality/workers=1-4         	       7	  48400230 ns/op	 514.07 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytesHighCardinality/workers=4-4         	      28	  12220192 ns/op	2036.07 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytesHighCardinality/workers=4-4         	      28	  12234267 ns/op	2033.73 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytesHighCardinality/workers=4-4         	      28	  12344726 ns/op	2015.53 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytesHighCardinality/workers=4-4         	      28	  12182334 ns/op	2042.40 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytesHighCardinality/workers=4-4         	      28	  12236633 ns/op	2033.33 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/store/durable
+BenchmarkUnifiedGetRawHighCardinalityAllBytes-4   	  108742	      3157 ns/op	       0 B/op	       0 allocs/op
+BenchmarkUnifiedGetRawHighCardinalityAllBytes-4   	  111669	      3138 ns/op	       0 B/op	       0 allocs/op
+BenchmarkUnifiedGetRawHighCardinalityAllBytes-4   	   93044	      3747 ns/op	       0 B/op	       0 allocs/op
+BenchmarkUnifiedGetRawHighCardinalityAllBytes-4   	  112255	      3152 ns/op	       0 B/op	       0 allocs/op
+BenchmarkUnifiedGetRawHighCardinalityAllBytes-4   	  109417	      3093 ns/op	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/store/durable
+BenchmarkUnifiedPartitionedScanAllBytes/workers=1-4        	      10	  32825392 ns/op	 757.98 MB/s	      22 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytes/workers=1-4        	      10	  32832734 ns/op	 757.82 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytes/workers=1-4        	      10	  32874446 ns/op	 756.85 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytes/workers=1-4        	      10	  32823590 ns/op	 758.03 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytes/workers=1-4        	      10	  32815962 ns/op	 758.20 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytes/workers=4-4        	      43	   8358703 ns/op	2976.68 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytes/workers=4-4        	      42	   8366063 ns/op	2974.06 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytes/workers=4-4        	      42	   8368864 ns/op	2973.06 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytes/workers=4-4        	      42	   8435870 ns/op	2949.45 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytes/workers=4-4        	      42	   8357432 ns/op	2977.13 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytesMillion/workers=1-4 	       1	 330179189 ns/op	 759.57 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytesMillion/workers=1-4 	       1	 330529657 ns/op	 758.77 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytesMillion/workers=1-4 	       1	 330461200 ns/op	 758.93 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytesMillion/workers=1-4 	       1	 329961905 ns/op	 760.07 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytesMillion/workers=1-4 	       1	 329938160 ns/op	 760.13 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytesMillion/workers=4-4 	       4	  83896941 ns/op	2989.33 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytesMillion/workers=4-4 	       4	  83644850 ns/op	2998.34 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytesMillion/workers=4-4 	       4	  83197062 ns/op	3014.48 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytesMillion/workers=4-4 	       4	  85931008 ns/op	2918.57 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytesMillion/workers=4-4 	       4	  83610713 ns/op	2999.56 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytesHighCardinality/workers=1-4         	       7	  48276269 ns/op	 515.39 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytesHighCardinality/workers=1-4         	       7	  48512245 ns/op	 512.88 MB/s	      16 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytesHighCardinality/workers=1-4         	       7	  48534350 ns/op	 512.65 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytesHighCardinality/workers=1-4         	       7	  48492712 ns/op	 513.09 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytesHighCardinality/workers=1-4         	       7	  48378116 ns/op	 514.31 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytesHighCardinality/workers=4-4         	      28	  12365109 ns/op	2012.21 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytesHighCardinality/workers=4-4         	      28	  12232068 ns/op	2034.09 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytesHighCardinality/workers=4-4         	      28	  12334571 ns/op	2017.19 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytesHighCardinality/workers=4-4         	      28	  12158717 ns/op	2046.36 MB/s	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPartitionedScanAllBytesHighCardinality/workers=4-4         	      28	  12215504 ns/op	2036.85 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/store/durable
+BenchmarkUnifiedGetRawHighCardinalityAllBytes-4   	  109189	      3115 ns/op	       0 B/op	       0 allocs/op
+BenchmarkUnifiedGetRawHighCardinalityAllBytes-4   	  109498	      3081 ns/op	       0 B/op	       0 allocs/op
+BenchmarkUnifiedGetRawHighCardinalityAllBytes-4   	  113235	      3087 ns/op	       0 B/op	       0 allocs/op
+BenchmarkUnifiedGetRawHighCardinalityAllBytes-4   	  108600	      3219 ns/op	       0 B/op	       0 allocs/op
+BenchmarkUnifiedGetRawHighCardinalityAllBytes-4   	  108922	      3168 ns/op	       0 B/op	       0 allocs/op
+PASS

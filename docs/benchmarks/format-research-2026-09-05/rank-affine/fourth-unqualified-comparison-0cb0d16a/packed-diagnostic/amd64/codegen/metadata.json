@@ -1,0 +1,359 @@
+{
+  "purpose": "Immutable amd64 Go codegen evidence for packed-scan regression diagnosis.",
+  "candidate": {
+    "commit": {
+      "sha": "0cb0d16a9a58944d79feeeecd063ff8aa239f5da",
+      "parents": [
+        "714d8e2e22703072a6776e82fc55078137eaeec5",
+        "02b75683f227470d6d198274f532bf39d5fa417d"
+      ],
+      "author": "thesyncim",
+      "author_email": "thesyncim@gmail.com",
+      "author_date": "2026-09-06T00:23:06+02:00",
+      "committer": "thesyncim",
+      "committer_email": "thesyncim@gmail.com",
+      "commit_date": "2026-09-06T00:23:06+02:00",
+      "subject": "Merge remote-tracking branch 'origin/main' into codex/space-savings-rf3"
+    },
+    "worktree": "/private/tmp/vibedb-rf3-packed-candidate-0cb0d16",
+    "status_short": ""
+  },
+  "base": {
+    "commit": {
+      "sha": "02b75683f227470d6d198274f532bf39d5fa417d",
+      "parents": [
+        "df8a66893633cfe7d26849098888f6bf3fd69081",
+        "fc94b067a7590b9444de2dca43af21639c04eba9"
+      ],
+      "author": "Marcelo Pires",
+      "author_email": "thesyncim@gmail.com",
+      "author_date": "2026-09-05T23:45:02+02:00",
+      "committer": "GitHub",
+      "committer_email": "noreply@github.com",
+      "commit_date": "2026-09-05T23:45:02+02:00",
+      "subject": "Merge pull request #192 from thesyncim/codex/catalog-recovery-next"
+    },
+    "worktree": "/private/tmp/vibedb-rf3-main-baseline-02b75683",
+    "status_short": "?? query/rank_affine_format_bench_test.go",
+    "status_note": "The only untracked file is query/rank_affine_format_bench_test.go; the durable package build does not use it."
+  },
+  "environment": {
+    "GOOS": "linux",
+    "GOARCH": "amd64",
+    "GOEXPERIMENT": "simd",
+    "GOTOOLCHAIN": "go1.27.1",
+    "go_version": "go1.27.1",
+    "host_go_target": "darwin/arm64",
+    "CODEX_AGENT_ID": "space-rf3-packed-codegen",
+    "wrapper": "/Users/thesyncim/.codex/bin/project-env",
+    "GOCACHE": "/var/folders/x3/kqy4mlzx43n21g8wpjj2hp580000gn/C/codex-projects/95786445379e5235/go-build",
+    "GOTMPDIR": "/var/folders/x3/kqy4mlzx43n21g8wpjj2hp580000gn/C/codex-projects/95786445379e5235/tmp/space-rf3-packed-codegen_",
+    "GOROOT": "/Users/thesyncim/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.27.1.darwin-arm64",
+    "GOTOOLDIR": "/Users/thesyncim/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.27.1.darwin-arm64/pkg/tool/darwin_arm64",
+    "GOENV": "/Users/thesyncim/Library/Application Support/go/env"
+  },
+  "binaries": {
+    "candidate": {
+      "path": "/private/tmp/vibedb-rf3-packed-codegen-0cb0/candidate-durable.test",
+      "sha256": "e1fd285c123d8c4f97e14c9653642d5ecc3fa6399e011a063394b6b46b9c395a",
+      "bytes": 30615847
+    },
+    "base": {
+      "path": "/private/tmp/vibedb-rf3-packed-codegen-0cb0/base-durable.test",
+      "sha256": "6ea913dd837c0e5f230233a18a7385d3cc75b6970dbc57e6f99851b8cc6694b1",
+      "bytes": 30561461
+    }
+  },
+  "source_hashes": {
+    "candidate": {
+      "store/durable/store_file_parallel_scan_bench_test.go": {
+        "path": "/private/tmp/vibedb-rf3-packed-candidate-0cb0d16/store/durable/store_file_parallel_scan_bench_test.go",
+        "sha256": "a2acda8b12afb0f8499a9fe732b7c42496db9b687b7aa3576f2a4ecf2fd0e345",
+        "bytes": 4352
+      },
+      "store/durable/store_file_unified_bench_test.go": {
+        "path": "/private/tmp/vibedb-rf3-packed-candidate-0cb0d16/store/durable/store_file_unified_bench_test.go",
+        "sha256": "caa6c2e820057d27801c005cc2e7dd94e9d0f65cf29e403b274211c27c01cdb0",
+        "bytes": 18562
+      },
+      "internal/storeio/primary_graph_cursor.go": {
+        "path": "/private/tmp/vibedb-rf3-packed-candidate-0cb0d16/internal/storeio/primary_graph_cursor.go",
+        "sha256": "facabc644f086636222cdcf762b297cc6590fc0c6effe211fb457f6fb3c8eb30",
+        "bytes": 23962
+      },
+      "internal/storeio/compact_primary_scan.go": {
+        "path": "/private/tmp/vibedb-rf3-packed-candidate-0cb0d16/internal/storeio/compact_primary_scan.go",
+        "sha256": "4d709a7c5595ec6eaf989103134ba190863b49c1d8f6f1fabba14957dab72c57",
+        "bytes": 27314
+      }
+    },
+    "base": {
+      "store/durable/store_file_parallel_scan_bench_test.go": {
+        "path": "/private/tmp/vibedb-rf3-main-baseline-02b75683/store/durable/store_file_parallel_scan_bench_test.go",
+        "sha256": "a2acda8b12afb0f8499a9fe732b7c42496db9b687b7aa3576f2a4ecf2fd0e345",
+        "bytes": 4352
+      },
+      "store/durable/store_file_unified_bench_test.go": {
+        "path": "/private/tmp/vibedb-rf3-main-baseline-02b75683/store/durable/store_file_unified_bench_test.go",
+        "sha256": "caa6c2e820057d27801c005cc2e7dd94e9d0f65cf29e403b274211c27c01cdb0",
+        "bytes": 18562
+      },
+      "internal/storeio/primary_graph_cursor.go": {
+        "path": "/private/tmp/vibedb-rf3-main-baseline-02b75683/internal/storeio/primary_graph_cursor.go",
+        "sha256": "facabc644f086636222cdcf762b297cc6590fc0c6effe211fb457f6fb3c8eb30",
+        "bytes": 23962
+      },
+      "internal/storeio/compact_primary_scan.go": {
+        "path": "/private/tmp/vibedb-rf3-main-baseline-02b75683/internal/storeio/compact_primary_scan.go",
+        "sha256": "a1dd7bdd60d425ed4dc8999a42f84761afee67e9586e51650892d46a89eaac43",
+        "bytes": 24425
+      }
+    }
+  },
+  "build_commands": [
+    "cd /private/tmp/vibedb-rf3-packed-candidate-0cb0d16 && GOOS=linux GOARCH=amd64 GOEXPERIMENT=simd GOTOOLCHAIN=go1.27.1 CODEX_AGENT_ID=space-rf3-packed-codegen /Users/thesyncim/.codex/bin/project-env go test -c -o /private/tmp/vibedb-rf3-packed-codegen-0cb0/candidate-durable.test ./store/durable",
+    "cd /private/tmp/vibedb-rf3-main-baseline-02b75683 && GOOS=linux GOARCH=amd64 GOEXPERIMENT=simd GOTOOLCHAIN=go1.27.1 CODEX_AGENT_ID=space-rf3-packed-codegen /Users/thesyncim/.codex/bin/project-env go test -c -o /private/tmp/vibedb-rf3-packed-codegen-0cb0/base-durable.test ./store/durable"
+  ],
+  "symbol_selection": {
+    "nm_command": "go tool nm -size -sort address <binary>",
+    "exact_symbols": {
+      "benchmark": "github.com/thesyncim/vibedb/store/durable.benchmarkUnifiedPartitionedScanAllBytes",
+      "callback_parent": "github.com/thesyncim/vibedb/store/durable.benchmarkUnifiedPartitionedScanAllBytes.func1",
+      "callback": "github.com/thesyncim/vibedb/store/durable.benchmarkUnifiedPartitionedScanAllBytes.func1.1.1",
+      "visit_current_leaf": "github.com/thesyncim/vibedb/internal/storeio.(*PrimaryGraphCursor).visitCurrentLeafInlineUntil",
+      "decoder": "github.com/thesyncim/vibedb/internal/storeio.(*CompactPrimaryScanDecoder).appendValue"
+    },
+    "objdump_patterns": {
+      "benchmark": "benchmarkUnifiedPartitionedScanAllBytes$",
+      "callback_parent": "benchmarkUnifiedPartitionedScanAllBytes.func1$",
+      "callback": "benchmarkUnifiedPartitionedScanAllBytes.func1.1.1",
+      "visit_current_leaf": "PrimaryGraphCursor.*visitCurrentLeafInlineUntil",
+      "decoder": "CompactPrimaryScanDecoder.*appendValue"
+    },
+    "objdump_command": "go tool objdump -s <pattern> <binary>"
+  },
+  "symbols": {
+    "candidate": {
+      "benchmark": {
+        "name": "github.com/thesyncim/vibedb/store/durable.benchmarkUnifiedPartitionedScanAllBytes",
+        "type": "T",
+        "address_hex": "0xad02a0",
+        "size": 838,
+        "size_hex": "0x346",
+        "alignment_mod_16": 0,
+        "pc_end_exclusive_hex": "0xad05e6",
+        "instruction_count": 148,
+        "first_instruction_pc_hex": "0xad02a0",
+        "last_instruction_pc_hex": "0xad05e1",
+        "objdump": {
+          "path": "/private/tmp/vibedb-rf3-packed-codegen-0cb0/candidate-benchmarkUnifiedPartitionedScanAllBytes.objdump",
+          "sha256": "d6a265864005b7356b64258225e9bc7010f2b40c29d6af04f3172edee502020a",
+          "lines": 149,
+          "instructions": 148
+        }
+      },
+      "callback_parent": {
+        "name": "github.com/thesyncim/vibedb/store/durable.benchmarkUnifiedPartitionedScanAllBytes.func1",
+        "type": "t",
+        "address_hex": "0xc46740",
+        "size": 1554,
+        "size_hex": "0x612",
+        "alignment_mod_16": 0,
+        "pc_end_exclusive_hex": "0xc46d52",
+        "instruction_count": 326,
+        "first_instruction_pc_hex": "0xc46740",
+        "last_instruction_pc_hex": "0xc46d4d",
+        "objdump": {
+          "path": "/private/tmp/vibedb-rf3-packed-codegen-0cb0/candidate-packed-callback-parent.objdump",
+          "sha256": "6610b57e60b8568308cfcd7988ae27e1321d67b431b6b26dc1f3699d29ce2047",
+          "lines": 327,
+          "instructions": 326
+        }
+      },
+      "callback": {
+        "name": "github.com/thesyncim/vibedb/store/durable.benchmarkUnifiedPartitionedScanAllBytes.func1.1.1",
+        "type": "t",
+        "address_hex": "0xc472e0",
+        "size": 54,
+        "size_hex": "0x36",
+        "alignment_mod_16": 0,
+        "pc_end_exclusive_hex": "0xc47316",
+        "instruction_count": 18,
+        "first_instruction_pc_hex": "0xc472e0",
+        "last_instruction_pc_hex": "0xc47315",
+        "objdump": {
+          "path": "/private/tmp/vibedb-rf3-packed-codegen-0cb0/candidate-packed-callback.objdump",
+          "sha256": "e5c97577064e4c59216d4237425792f4cdc329523e679a08e218eabf996e6241",
+          "lines": 19,
+          "instructions": 18
+        }
+      },
+      "visit_current_leaf": {
+        "name": "github.com/thesyncim/vibedb/internal/storeio.(*PrimaryGraphCursor).visitCurrentLeafInlineUntil",
+        "type": "T",
+        "address_hex": "0x7a9960",
+        "size": 2398,
+        "size_hex": "0x95e",
+        "alignment_mod_16": 0,
+        "pc_end_exclusive_hex": "0x7aa2be",
+        "instruction_count": 463,
+        "first_instruction_pc_hex": "0x7a9960",
+        "last_instruction_pc_hex": "0x7aa2b9",
+        "objdump": {
+          "path": "/private/tmp/vibedb-rf3-packed-codegen-0cb0/candidate-visitCurrentLeafInlineUntil.objdump",
+          "sha256": "9734dc0ccdd44d7b6ec3f81e03562d5f1218e82d7011f1e3602ab2454e982a8b",
+          "lines": 464,
+          "instructions": 463
+        }
+      },
+      "decoder": {
+        "name": "github.com/thesyncim/vibedb/internal/storeio.(*CompactPrimaryScanDecoder).appendValue",
+        "type": "T",
+        "address_hex": "0x6edee0",
+        "size": 2199,
+        "size_hex": "0x897",
+        "alignment_mod_16": 0,
+        "pc_end_exclusive_hex": "0x6ee777",
+        "instruction_count": 452,
+        "first_instruction_pc_hex": "0x6edee0",
+        "last_instruction_pc_hex": "0x6ee772",
+        "objdump": {
+          "path": "/private/tmp/vibedb-rf3-packed-codegen-0cb0/candidate-CompactPrimaryScanDecoder.appendValue.objdump",
+          "sha256": "fdf04cce8e33583144a30d6482d7b6fee75dc4713ebda104b50184f746c92acb",
+          "lines": 453,
+          "instructions": 452
+        }
+      }
+    },
+    "base": {
+      "benchmark": {
+        "name": "github.com/thesyncim/vibedb/store/durable.benchmarkUnifiedPartitionedScanAllBytes",
+        "type": "T",
+        "address_hex": "0xacb480",
+        "size": 838,
+        "size_hex": "0x346",
+        "alignment_mod_16": 0,
+        "pc_end_exclusive_hex": "0xacb7c6",
+        "instruction_count": 148,
+        "first_instruction_pc_hex": "0xacb480",
+        "last_instruction_pc_hex": "0xacb7c1",
+        "objdump": {
+          "path": "/private/tmp/vibedb-rf3-packed-codegen-0cb0/base-benchmarkUnifiedPartitionedScanAllBytes.objdump",
+          "sha256": "cc624c32d1f8a2415b2aab292cbff1abb623fc72cb2f4c35559a723465f47117",
+          "lines": 149,
+          "instructions": 148
+        }
+      },
+      "callback_parent": {
+        "name": "github.com/thesyncim/vibedb/store/durable.benchmarkUnifiedPartitionedScanAllBytes.func1",
+        "type": "t",
+        "address_hex": "0xc41920",
+        "size": 1554,
+        "size_hex": "0x612",
+        "alignment_mod_16": 0,
+        "pc_end_exclusive_hex": "0xc41f32",
+        "instruction_count": 326,
+        "first_instruction_pc_hex": "0xc41920",
+        "last_instruction_pc_hex": "0xc41f2d",
+        "objdump": {
+          "path": "/private/tmp/vibedb-rf3-packed-codegen-0cb0/base-packed-callback-parent.objdump",
+          "sha256": "2c39b4365df4c4ff277a9303db3f780458b4488233f281d0f8715465a91c926e",
+          "lines": 327,
+          "instructions": 326
+        }
+      },
+      "callback": {
+        "name": "github.com/thesyncim/vibedb/store/durable.benchmarkUnifiedPartitionedScanAllBytes.func1.1.1",
+        "type": "t",
+        "address_hex": "0xc424c0",
+        "size": 54,
+        "size_hex": "0x36",
+        "alignment_mod_16": 0,
+        "pc_end_exclusive_hex": "0xc424f6",
+        "instruction_count": 18,
+        "first_instruction_pc_hex": "0xc424c0",
+        "last_instruction_pc_hex": "0xc424f5",
+        "objdump": {
+          "path": "/private/tmp/vibedb-rf3-packed-codegen-0cb0/base-packed-callback.objdump",
+          "sha256": "da70425c0530a903d77657f711a98b661fae156bea8fae0662b66ce464af7e4b",
+          "lines": 19,
+          "instructions": 18
+        }
+      },
+      "visit_current_leaf": {
+        "name": "github.com/thesyncim/vibedb/internal/storeio.(*PrimaryGraphCursor).visitCurrentLeafInlineUntil",
+        "type": "T",
+        "address_hex": "0x7a4ba0",
+        "size": 2398,
+        "size_hex": "0x95e",
+        "alignment_mod_16": 0,
+        "pc_end_exclusive_hex": "0x7a54fe",
+        "instruction_count": 463,
+        "first_instruction_pc_hex": "0x7a4ba0",
+        "last_instruction_pc_hex": "0x7a54f9",
+        "objdump": {
+          "path": "/private/tmp/vibedb-rf3-packed-codegen-0cb0/base-visitCurrentLeafInlineUntil.objdump",
+          "sha256": "1d706856a1a3bdc0999ab12d14bb8ef9dd756a4de94c43f58118d97240173dd0",
+          "lines": 464,
+          "instructions": 463
+        }
+      },
+      "decoder": {
+        "name": "github.com/thesyncim/vibedb/internal/storeio.(*CompactPrimaryScanDecoder).appendValue",
+        "type": "T",
+        "address_hex": "0x6eda60",
+        "size": 1253,
+        "size_hex": "0x4e5",
+        "alignment_mod_16": 0,
+        "pc_end_exclusive_hex": "0x6edf45",
+        "instruction_count": 274,
+        "first_instruction_pc_hex": "0x6eda60",
+        "last_instruction_pc_hex": "0x6edf40",
+        "objdump": {
+          "path": "/private/tmp/vibedb-rf3-packed-codegen-0cb0/base-CompactPrimaryScanDecoder.appendValue.objdump",
+          "sha256": "58b81cf7df109524eca0c263827af55e76b28672262bf1b98fd337c74bec6677",
+          "lines": 275,
+          "instructions": 274
+        }
+      }
+    }
+  },
+  "captured_files": {
+    "go-version.txt": {
+      "path": "/private/tmp/vibedb-rf3-packed-codegen-0cb0/go-version.txt",
+      "sha256": "c528ba02b39880f1357f51dee70e41c1ef03e3a70c7a03055c080532b9635f58",
+      "bytes": 33
+    },
+    "go-env.txt": {
+      "path": "/private/tmp/vibedb-rf3-packed-codegen-0cb0/go-env.txt",
+      "sha256": "72bba3a50da20f235613afeb32bc0db289062e7a8ddc2f5efe4865c3ed8efed2",
+      "bytes": 466
+    },
+    "objdump-help.txt": {
+      "path": "/private/tmp/vibedb-rf3-packed-codegen-0cb0/objdump-help.txt",
+      "sha256": "0d058e3eb779de86d3ddee418133ae423c59bfb434719f51b9fc9ad84e075dca",
+      "bytes": 233
+    },
+    "nm-help.txt": {
+      "path": "/private/tmp/vibedb-rf3-packed-codegen-0cb0/nm-help.txt",
+      "sha256": "f4058f4fd141c697ca3a132a09cdd42e6ec602f4421ce6b3fc72a4555e64f0a1",
+      "bytes": 371
+    },
+    "candidate.nm": {
+      "path": "/private/tmp/vibedb-rf3-packed-codegen-0cb0/candidate.nm",
+      "sha256": "ebea440e7eafa671a0c11ee119d5f28f1ccaed7b8d3f1f700a95c159b7c7d3fb",
+      "bytes": 1706324
+    },
+    "base.nm": {
+      "path": "/private/tmp/vibedb-rf3-packed-codegen-0cb0/base.nm",
+      "sha256": "a1751d578d7338528de50293635c357be21f7fe8fa7196c3c966c51f29005ab1",
+      "bytes": 1704592
+    }
+  },
+  "notes": [
+    "The nested callback symbol is the compiler-emitted func1.1.1 and contains the inlined touchUnifiedScanAllBytes XOR loop (source lines 482-483).",
+    "The callback starts at an address aligned to 16 bytes in both binaries; its loop PCs are shown with relative offsets in normalized-instruction-summary.txt.",
+    "The benchmark and callback-parent symbol sizes are unchanged between base and candidate; visitCurrentLeafInlineUntil is also unchanged in size. CompactPrimaryScanDecoder.appendValue grows in the candidate.",
+    "No benchmarks, timings, source edits, pushes, or PR mutations were performed for this evidence task."
+  ]
+}

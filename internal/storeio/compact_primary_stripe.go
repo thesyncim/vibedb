@@ -340,7 +340,7 @@ func buildPreparedCompactPrimaryStripePayloadRows(
 				canonical := builder.canonicalOf(rowIndex)
 				values[ordinal] = canonical[span.Start:span.End]
 			}
-			stream := scratch.stream.encode(values)
+			stream := scratch.stream.encodeShape(values, shapeRows, rowCount)
 			payload, err = stream.appendBinary(payload)
 			if err != nil {
 				return nil, err
@@ -580,7 +580,7 @@ func (v *CompactPrimaryStripeView) PatchStableCanonicalReplacementScalarPatch(
 				fmt.Errorf("%w: compact patch source stream", ErrCommonPrimaryLeafCorrupt)
 		}
 		out = out[:0]
-		out, admitted = stream.appendValue(out, ordinal)
+		out, admitted = stream.appendValue(out, stream.shapeCoordinate(rank, ordinal))
 		if !admitted {
 			return CommonPrimaryUnifiedScalarPatch{}, out, false,
 				fmt.Errorf("%w: compact patch source value", ErrCommonPrimaryLeafCorrupt)
@@ -727,7 +727,7 @@ func (v *CompactPrimaryStripeView) PatchCompactPrimaryStripeReplacements(
 				return nil, false, nil
 			}
 			patch.patchHeap, decoded = oldStream.appendValue(
-				patch.patchHeap, ordinal,
+				patch.patchHeap, oldStream.shapeCoordinate(rank, ordinal),
 			)
 			oldValue := patch.patchHeap[baseBytes:]
 			newValue := replacement.Value[start:end:end]
@@ -787,7 +787,7 @@ func (v *CompactPrimaryStripeView) PatchCompactPrimaryStripeReplacements(
 				return nil, false, corrupt("source stream")
 			}
 			start := len(patch.patchHeap)
-			patch.patchHeap, admitted = stream.appendValue(patch.patchHeap, ordinal)
+			patch.patchHeap, admitted = stream.appendValue(patch.patchHeap, stream.shapeCoordinate(rank, ordinal))
 			if !admitted {
 				return nil, false, corrupt("source value")
 			}
@@ -860,7 +860,15 @@ func (v *CompactPrimaryStripeView) PatchCompactPrimaryStripeReplacements(
 			)
 		}
 	}
+	slices.SortFunc(patch.patchGroups, func(a, b compactPrimaryStreamPatch) int {
+		if a.shape != b.shape {
+			return int(a.shape) - int(b.shape)
+		}
+		return int(a.hole) - int(b.hole)
+	})
 	patch.patchStreams = patch.patchStreams[:0]
+	rankShape := -1
+	shapeRanks := patch.shapeOrder[:0]
 	for groupIndex := range patch.patchGroups {
 		group := &patch.patchGroups[groupIndex]
 		shape := int(group.shape)
@@ -894,21 +902,72 @@ func (v *CompactPrimaryStripeView) PatchCompactPrimaryStripeReplacements(
 		if group.offset < 0 || group.offset+group.oldBytes > len(v.payload) {
 			return nil, false, corrupt("group bounds")
 		}
+		if !oldStream.matchesShapeRows(entry.rows, v.rows) {
+			return nil, false, corrupt("group row coordinates")
+		}
+		// The rank candidate is only possible for a long sparse shape. Keep
+		// this context local so ordinary streams never scan the leaf to build a
+		// map that their planner cannot use. An existing rank-affine stream
+		// resolves immediately because its physical coordinates are required
+		// for decoding; a newly planned candidate resolves only after the
+		// prefix parser rejects the local ordinal-affine form and its exact
+		// witness checks pass.
+		var rankContext compactRankContext
+		var ranks []uint16
+		rankCandidateEligible := entry.rows >= compactStreamRestart && entry.rows < v.rows
+		rankContextNeeded := entry.rows < v.rows &&
+			(oldStream.kind == compactStreamRankAffine || rankCandidateEligible)
+		if rankContextNeeded {
+			rankContext = compactRankContext{
+				shape: shape, shapeRows: entry.rows, storage: shapeRanks,
+			}
+			if rankShape == shape {
+				rankContext.ranks = shapeRanks
+				rankContext.resolved = true
+			}
+			if oldStream.kind == compactStreamRankAffine && !rankContext.resolved {
+				rankContext.resolve(v)
+				ranks = rankContext.ranks
+				if len(ranks) != entry.rows {
+					return nil, false, corrupt("group rank map")
+				}
+				shapeRanks = ranks
+				patch.shapeOrder = shapeRanks
+				rankShape = shape
+			} else {
+				ranks = rankContext.ranks
+			}
+		}
 		patch.patchHeap = patch.patchHeap[:0]
 		patch.patchEnds = slices.Grow(
-			patch.patchEnds[:0], oldStream.count,
-		)[:oldStream.count]
-		for row := 0; row < oldStream.count; row++ {
-			var decoded bool
-			patch.patchHeap, decoded = oldStream.appendValue(patch.patchHeap, row)
-			if !decoded || uint64(len(patch.patchHeap)) > uint64(^uint32(0)) {
-				return nil, false, corrupt("group value")
+			patch.patchEnds[:0], entry.rows,
+		)[:entry.rows]
+		if oldStream.kind == compactStreamRankAffine && len(ranks) != 0 {
+			for row := 0; row < entry.rows; row++ {
+				var decoded bool
+				patch.patchHeap, decoded = oldStream.appendValue(
+					patch.patchHeap, int(ranks[row]),
+				)
+				if !decoded || uint64(len(patch.patchHeap)) > uint64(^uint32(0)) {
+					return nil, false, corrupt("group value")
+				}
+				patch.patchEnds[row] = uint32(len(patch.patchHeap))
 			}
-			patch.patchEnds[row] = uint32(len(patch.patchHeap))
+		} else {
+			for row := 0; row < entry.rows; row++ {
+				var decoded bool
+				patch.patchHeap, decoded = oldStream.appendValue(
+					patch.patchHeap, row,
+				)
+				if !decoded || uint64(len(patch.patchHeap)) > uint64(^uint32(0)) {
+					return nil, false, corrupt("group value")
+				}
+				patch.patchEnds[row] = uint32(len(patch.patchHeap))
+			}
 		}
 		patch.patchValues = slices.Grow(
-			patch.patchValues[:0], oldStream.count,
-		)[:oldStream.count]
+			patch.patchValues[:0], entry.rows,
+		)[:entry.rows]
 		start := uint32(0)
 		for row, end := range patch.patchEnds {
 			patch.patchValues[row] = patch.patchHeap[start:end:end]
@@ -918,12 +977,23 @@ func (v *CompactPrimaryStripeView) PatchCompactPrimaryStripeReplacements(
 			if modification.shape != group.shape || modification.hole != group.hole {
 				continue
 			}
-			if int(modification.ordinal) >= oldStream.count {
+			if int(modification.ordinal) >= entry.rows {
 				return nil, false, corrupt("group ordinal")
 			}
 			patch.patchValues[modification.ordinal] = modification.value
 		}
-		encoded := patch.stream.encode(patch.patchValues)
+		var rankContextPtr *compactRankContext
+		if rankCandidateEligible {
+			rankContextPtr = &rankContext
+		}
+		encoded := patch.stream.encodeShapeWithRankContext(
+			patch.patchValues, ranks, v.rows, rankContextPtr, v,
+		)
+		if rankCandidateEligible && len(rankContext.ranks) != 0 {
+			shapeRanks = rankContext.ranks
+			patch.shapeOrder = shapeRanks
+			rankShape = shape
+		}
 		group.newStart = len(patch.patchStreams)
 		patch.patchStreams, err = encoded.appendBinary(patch.patchStreams)
 		if err != nil {
@@ -1214,7 +1284,7 @@ func openCompactPrimaryStripePayload(
 	shapeDir := payload[compactPrimaryHeaderBytes : compactPrimaryHeaderBytes+4*shapeCount]
 	cursor := compactPrimaryHeaderBytes + 4*shapeCount
 	key, err := openCompactStream(payload[cursor : cursor+keyBytes])
-	if err != nil || key.encoded != keyBytes || key.count != rows {
+	if err != nil || key.encoded != keyBytes || key.count != rows || key.kind == compactStreamRankAffine {
 		return corrupt("key stream")
 	}
 	cursor += keyBytes
@@ -1322,7 +1392,7 @@ func (v *CompactPrimaryStripeView) validate(
 		streamRaw := entry.streamRaw
 		for range entry.template.holes {
 			stream, err := openCompactStream(streamRaw)
-			if err != nil || stream.count != entry.rows {
+			if err != nil || !stream.matchesShapeRows(entry.rows, v.rows) {
 				return corrupt("shape stream")
 			}
 			streamRaw = streamRaw[stream.encoded:]
@@ -1643,10 +1713,45 @@ func (v *CompactPrimaryStripeView) AppendValue(dst []byte, row int) ([]byte, boo
 		return dst, false
 	}
 	if v.shapeCount == 1 && len(v.overflow) == 0 {
-		return v.appendValueOrdinal(dst, row, 0, row)
+		return v.appendValueSingleShape(dst, row)
 	}
 	shape := v.rowShape(row)
 	return v.appendValueOrdinal(dst, row, shape, v.shapeOrdinal(row, shape))
+}
+
+// appendValueSingleShape renders a shape-identical row without carrying a
+// shape ordinal through the general multi-shape path. A rank-affine stream
+// uses the physical row directly; ordinary streams see the same value because
+// the one shape makes its ordinal equal to that row.
+func (v *CompactPrimaryStripeView) appendValueSingleShape(
+	dst []byte,
+	row int,
+) ([]byte, bool) {
+	if v == nil || row < 0 || row >= v.rows || v.IsOverflow(row) {
+		return dst, false
+	}
+	entry, ok := v.shapeEntry(0)
+	if !ok || row < 0 || row >= entry.rows {
+		return dst, false
+	}
+	start := len(dst)
+	streamRaw := entry.streamRaw
+	previous := uint32(0)
+	for hole := 0; hole < entry.template.holes; hole++ {
+		end := binary.LittleEndian.Uint32(entry.template.ends[hole*4:])
+		dst = append(dst, entry.template.static[previous:end]...)
+		previous = end
+		stream, admitted := admittedCompactStream(streamRaw)
+		if !admitted {
+			return dst[:start], false
+		}
+		dst, ok = stream.appendValue(dst, row)
+		if !ok {
+			return dst[:start], false
+		}
+		streamRaw = streamRaw[stream.encoded:]
+	}
+	return append(dst, entry.template.static[previous:]...), true
 }
 
 // valueLength computes one inline row's exact JSON length without appending to
@@ -1685,7 +1790,7 @@ func (v *CompactPrimaryStripeView) valueLength(row int) (int, bool) {
 		if !admitted {
 			return 0, false
 		}
-		part, _, ok = compactProjectionValueLen(stream, ordinal)
+		part, _, ok = compactProjectionValueLen(stream, stream.shapeCoordinate(row, ordinal))
 		if !ok || length > int(^uint(0)>>1)-part {
 			return 0, false
 		}
@@ -1731,7 +1836,7 @@ func (v *CompactPrimaryStripeView) appendValueOrdinal(
 		if !admitted {
 			return dst[:start], false
 		}
-		dst, ok = stream.appendValue(dst, ordinal)
+		dst, ok = stream.appendValue(dst, stream.shapeCoordinate(row, ordinal))
 		if !ok {
 			return dst[:start], false
 		}
@@ -1940,7 +2045,11 @@ func (v *CompactPrimaryStripeView) CountResolvedSpellingEqual(
 			}
 			if at == hole {
 				var count int
-				count, scratch, ok = stream.countSpellingEqual(needle, scratch)
+				if stream.kind == compactStreamRankAffine {
+					count, ok = v.rankAffineShapeSpelling(stream, shape, needle), true
+				} else {
+					count, scratch, ok = stream.countSpellingEqual(needle, scratch)
+				}
 				if !ok {
 					return 0, scratch, false
 				}
@@ -1983,7 +2092,14 @@ func (v *CompactPrimaryStripeView) CountResolvedIntegerEqual(
 				return 0, false
 			}
 			if at == hole {
-				count, supported := stream.countIntegerEqual(needle)
+				var count int
+				var supported bool
+				if stream.kind == compactStreamRankAffine {
+					count = v.rankAffineShapeEqual(stream, shape, needle)
+					supported = stream.rankAffineIsNumber()
+				} else {
+					count, supported = stream.countIntegerEqual(needle)
+				}
 				if !supported {
 					return 0, false
 				}
@@ -1997,14 +2113,24 @@ func (v *CompactPrimaryStripeView) CountResolvedIntegerEqual(
 }
 
 // CountResolvedIntegerOrdered evaluates one exact signed-integer ordering
-// over FOR streams after resolving the path once per shape. It is all-or-
-// nothing at stripe granularity: an overflow bitmap, malformed stream, absent
-// target container, or non-FOR target returns ok=false and discards any local
+// over eligible compact streams, including RankAffine, FOR, and validated
+// bare PrefixInt, after resolving the path once per shape. It is all-or-nothing
+// at stripe granularity: an overflow bitmap, malformed stream, absent target
+// container, or unsupported target returns ok=false and discards any local
 // count so the caller can run the authoritative generic executor.
 func (v *CompactPrimaryStripeView) CountResolvedIntegerOrdered(
 	resolver *UnifiedHoleResolver,
 	needle int64,
 	op UnifiedIntegerOrder,
+) (matched int, ok bool) {
+	return v.countResolvedIntegerOrdered(resolver, needle, op, true)
+}
+
+func (v *CompactPrimaryStripeView) countResolvedIntegerOrdered(
+	resolver *UnifiedHoleResolver,
+	needle int64,
+	op UnifiedIntegerOrder,
+	allowPrefix bool,
 ) (matched int, ok bool) {
 	if v == nil || resolver == nil || !validUnifiedIntegerOrder(op) ||
 		len(v.overflow) != 0 {
@@ -2029,10 +2155,14 @@ func (v *CompactPrimaryStripeView) CountResolvedIntegerOrdered(
 				return 0, false
 			}
 			if at == hole {
-				if stream.kind != compactStreamFOR {
-					return 0, false
+				var count int
+				var supported bool
+				if stream.kind == compactStreamRankAffine {
+					count, supported = v.rankAffineShapeOrdered(stream, shape, needle, op)
+				} else if stream.kind == compactStreamFOR ||
+					(stream.kind == compactStreamPrefixInt && allowPrefix) {
+					count, supported = stream.countIntegerOrdered(needle, op)
 				}
-				count, supported := stream.countIntegerOrdered(needle, op)
 				if !supported {
 					return 0, false
 				}
@@ -2047,11 +2177,19 @@ func (v *CompactPrimaryStripeView) CountResolvedIntegerOrdered(
 
 // CountResolvedIntegerInterval evaluates one normalized signed interval over
 // every resolved compact target stream. It is all-or-nothing at stripe
-// granularity: overflow, malformed data, a container target, or a non-FOR
+// granularity: overflow, malformed data, a container target, or an unsupported
 // target discards the local count and asks the caller to use the generic path.
 func (v *CompactPrimaryStripeView) CountResolvedIntegerInterval(
 	resolver *UnifiedHoleResolver,
 	interval UnifiedIntegerInterval,
+) (matched int, ok bool) {
+	return v.countResolvedIntegerInterval(resolver, interval, true)
+}
+
+func (v *CompactPrimaryStripeView) countResolvedIntegerInterval(
+	resolver *UnifiedHoleResolver,
+	interval UnifiedIntegerInterval,
+	allowPrefix bool,
 ) (matched int, ok bool) {
 	if v == nil || resolver == nil || len(v.overflow) != 0 {
 		return 0, false
@@ -2075,10 +2213,14 @@ func (v *CompactPrimaryStripeView) CountResolvedIntegerInterval(
 				return 0, false
 			}
 			if at == hole {
-				if stream.kind != compactStreamFOR {
-					return 0, false
+				var count int
+				var supported bool
+				if stream.kind == compactStreamRankAffine {
+					count, supported = v.rankAffineShapeInterval(stream, shape, interval)
+				} else if stream.kind == compactStreamFOR ||
+					(stream.kind == compactStreamPrefixInt && allowPrefix) {
+					count, supported = stream.countIntegerInterval(interval)
 				}
-				count, supported := stream.countIntegerInterval(interval)
 				if !supported {
 					return 0, false
 				}
@@ -2091,11 +2233,12 @@ func (v *CompactPrimaryStripeView) CountResolvedIntegerInterval(
 	return matched, true
 }
 
-// CountResolvedIntegerExtrema reduces one resolved path over exact signed
-// integer FOR streams. It resolves the path once per shape and validates the
-// complete target stream before publishing any result. Overflow rows,
-// malformed geometry, non-FOR targets, width-64 lanes, and signed-wrapping
-// FOR spans therefore decline the complete stripe atomically.
+// CountResolvedIntegerExtrema reduces one resolved path over eligible compact
+// streams, including RankAffine, FOR, and validated bare PrefixInt. It
+// resolves the path once per shape and validates the complete target stream
+// before publishing any result. Overflow rows, malformed geometry,
+// unsupported targets, width-64 lanes, and signed-wrapping FOR spans therefore
+// decline the complete stripe atomically.
 func (v *CompactPrimaryStripeView) CountResolvedIntegerExtrema(
 	resolver *UnifiedHoleResolver,
 ) (result UnifiedIntegerExtremaResult, ok bool) {
@@ -2121,10 +2264,13 @@ func (v *CompactPrimaryStripeView) CountResolvedIntegerExtrema(
 				return UnifiedIntegerExtremaResult{}, false
 			}
 			if at == hole {
-				if stream.kind != compactStreamFOR {
-					return UnifiedIntegerExtremaResult{}, false
+				var minimum, maximum int64
+				var streamFound, supported bool
+				if stream.kind == compactStreamRankAffine {
+					minimum, maximum, streamFound, supported = v.rankAffineShapeExtrema(stream, shape)
+				} else if stream.kind == compactStreamFOR || stream.kind == compactStreamPrefixInt {
+					minimum, maximum, streamFound, supported = stream.countIntegerExtrema()
 				}
-				minimum, maximum, streamFound, supported := stream.countIntegerExtrema()
 				if !supported {
 					return UnifiedIntegerExtremaResult{}, false
 				}
@@ -2179,9 +2325,16 @@ func (v *CompactPrimaryStripeView) CountResolvedNumberEqual(
 			}
 			if at == hole {
 				var count int
-				count, scratch, ids, ok = stream.countNumberEqual(
-					needle, needleInt, needleIsInt, scratch, ids,
-				)
+				if stream.kind == compactStreamRankAffine {
+					ok = stream.rankAffineIsNumber()
+					if needleIsInt {
+						count = v.rankAffineShapeEqual(stream, shape, needleInt)
+					}
+				} else {
+					count, scratch, ids, ok = stream.countNumberEqual(
+						needle, needleInt, needleIsInt, scratch, ids,
+					)
+				}
 				if !ok {
 					return 0, scratch, ids, false
 				}
@@ -2224,7 +2377,7 @@ func (v *CompactPrimaryStripeView) AppendResolvedHole(
 			return dst, false, false
 		}
 		if at == hole {
-			out, ok = stream.appendValue(dst, ordinal)
+			out, ok = stream.appendValue(dst, stream.shapeCoordinate(row, ordinal))
 			return out, ok, ok
 		}
 		streamRaw = streamRaw[stream.encoded:]
