@@ -9,7 +9,7 @@ import (
 )
 
 // CatalogServiceFences grants the registered gateway sessions only the exact
-// catalog and ledger groups in the already published authenticated catalog cut.
+// catalog and durable SQL groups in the published authenticated catalog cut.
 // Receivers derive the same scope from the decoded request and serving fence.
 func (authority *ReplicatedCatalogAuthority) CatalogServiceFences(ctx context.Context) ([]serviceauthz.ServiceFence, uint64, error) {
 	if authority == nil || ctx == nil {
@@ -39,17 +39,30 @@ func (authority *ReplicatedCatalogAuthority) CatalogServiceFences(ctx context.Co
 	write.Operation = serviceauthz.ServiceOperationCatalogWrite
 	fences := []serviceauthz.ServiceFence{read, point, write}
 	for _, descriptor := range snapshot.replicatedDescriptors() {
-		if len(descriptor.RequestLedgerRanges) == 0 {
-			continue
+		ledger := len(descriptor.RequestLedgerRanges) != 0
+		participant := ledger
+		for _, placement := range snapshot.config.Placements {
+			if placement.Distribution == descriptor.Distribution {
+				participant = true
+				break
+			}
 		}
 		digest := descriptor.Command.RelationManifestDigest
 		var relation [16]byte
 		copy(relation[:], digest[:16])
-		fences = append(fences, serviceauthz.ServiceFence{
-			Action:    serviceauthz.ServiceActionGatewayRequestLedger,
-			Operation: serviceauthz.ServiceOperationRequestLedger,
-			Group:     descriptor.Group, Relation: relation, IntentID: digest, FenceDigest: digest,
-		})
+		appendScope := func(action serviceauthz.ServiceAction, operation serviceauthz.ServiceOperation) {
+			fences = append(fences, serviceauthz.ServiceFence{
+				Action: action, Operation: operation,
+				Group: descriptor.Group, Relation: relation, IntentID: digest, FenceDigest: digest,
+			})
+		}
+		if ledger {
+			appendScope(serviceauthz.ServiceActionGatewayRequestLedger, serviceauthz.ServiceOperationRequestLedger)
+			appendScope(serviceauthz.ServiceActionGatewayExecutionPin, serviceauthz.ServiceOperationExecutionPin)
+		}
+		if participant {
+			appendScope(serviceauthz.ServiceActionGatewayTransactionRecovery, serviceauthz.ServiceOperationTransactionRecovery)
+		}
 	}
 	slices.SortFunc(fences, serviceauthz.CompareServiceFences)
 	fences = slices.Compact(fences)
