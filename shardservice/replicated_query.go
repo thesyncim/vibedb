@@ -43,6 +43,9 @@ func replicatedSQLReservationBytes(maximum uint32) int64 {
 type replicatedSQLLease struct {
 	budget *replicatedFrameByteBudget
 	bytes  int64
+	point  sqldriver.ReplicatedReadLease
+	cursor sqldriver.Cursor
+	cancel query.CancelFlag
 }
 
 func (l *replicatedSQLLease) Release() {
@@ -444,7 +447,7 @@ func (server *ReplicatedServer) executeReplicatedPointQueryTierCall(
 	}
 	execution := trace.StartRegion(ctx, "sql.read.execute")
 	encoded, err := executeFencedSQLPointBudget(
-		ctx, source, primary, inner, budget, point,
+		ctx, source, primary, inner, budget, point, lease,
 	)
 	execution.End()
 	if err != nil {
@@ -544,7 +547,13 @@ func replicatedSemanticSQLResultValid(response *ShardResponse) bool {
 
 func executeFencedSQLBudget(ctx context.Context, source interface {
 	NewDataReadSession(context.Context, *replicatedstate.DataReadCut, query.ExecOptions) (*sqldriver.ReplicatedReadSession, error)
-}, cut *replicatedstate.DataReadCut, req *ShardRequest, budget replicatedSQLBudget) ([]byte, error) {
+}, cut *replicatedstate.DataReadCut, req *ShardRequest, budget replicatedSQLBudget) (encoded []byte, err error) {
+	defer func() {
+		err = replicatedSQLContextError(ctx, err)
+		if err != nil {
+			encoded = nil
+		}
+	}()
 	maxBytes := budget.resultBytes
 	if req.ExecutionMode != ExecutionReadOnly || req.ReadPolicy != ReadStrong ||
 		req.Transaction.Operation != 0 || req.Exchange.Operation != 0 || req.Repartition.present() ||
@@ -560,8 +569,7 @@ func executeFencedSQLBudget(ctx context.Context, source interface {
 		maxBytes = int(req.MaxResultBytes)
 	}
 	var flag query.CancelFlag
-	stop := context.AfterFunc(ctx, flag.Cancel)
-	defer stop()
+	flag.BindDone(ctx.Done())
 	options := query.ExecOptions{
 		Cancel: &flag, ResultRows: rows, ResultBytes: int64(maxBytes),
 		MemoryBytes: budget.workingBytes, IntermediateBytes: budget.workingBytes,
@@ -572,7 +580,7 @@ func executeFencedSQLBudget(ctx context.Context, source interface {
 			ctx, cut, req.SQL, req.ParamTypes, req.PartialAggregate, options,
 		)
 		if acquireErr == nil {
-			return executeFencedSQLLease(ctx, lease, req, budget, &flag)
+			return executeFencedSQLLease(ctx, lease, req, budget, &flag, nil)
 		}
 		if !errors.Is(acquireErr, sqldriver.ErrReplicatedReadReuseUnsupported) {
 			return nil, acquireErr
@@ -612,7 +620,14 @@ func executeFencedSQLPointBudget(
 	req *ShardRequest,
 	budget replicatedSQLBudget,
 	point replicatedstate.PointReadResult,
-) ([]byte, error) {
+	frame *replicatedSQLLease,
+) (encoded []byte, err error) {
+	defer func() {
+		err = replicatedSQLContextError(ctx, err)
+		if err != nil {
+			encoded = nil
+		}
+	}()
 	maxBytes := budget.resultBytes
 	if req.ExecutionMode != ExecutionReadOnly || req.ReadPolicy != ReadStrong ||
 		req.Transaction.Operation != 0 || req.Exchange.Operation != 0 || req.Repartition.present() ||
@@ -627,13 +642,27 @@ func executeFencedSQLPointBudget(
 	if req.MaxResultBytes > 0 && req.MaxResultBytes < uint64(maxBytes) {
 		maxBytes = int(req.MaxResultBytes)
 	}
-	var flag query.CancelFlag
-	stop := context.AfterFunc(ctx, flag.Cancel)
-	defer stop()
+	flag := &frame.cancel
+	flag.Reset()
+	flag.BindDone(ctx.Done())
+	defer flag.BindDone(nil)
 	options := query.ExecOptions{
-		Cancel: &flag, ResultRows: rows, ResultBytes: int64(maxBytes),
+		Cancel: flag, ResultRows: rows, ResultBytes: int64(maxBytes),
 		MemoryBytes: budget.workingBytes, IntermediateBytes: budget.workingBytes,
 		AggregateBytes: budget.workingBytes,
+	}
+	if reusable, ok := source.(interface {
+		AcquireReplicatedPointReadInto(context.Context, replication.RelationID, []byte, bool,
+			[]byte, []byte, string, []sqldriver.ParamType, bool, query.ExecOptions, *sqldriver.ReplicatedReadLease) error
+	}); ok {
+		err := reusable.AcquireReplicatedPointReadInto(ctx, primary.Relation, primary.Keys[0],
+			point.Found, point.Value, primary.PrimaryPath, req.SQL, req.ParamTypes, req.PartialAggregate, options, &frame.point)
+		if err == nil {
+			return executeFencedSQLLease(ctx, &frame.point, req, budget, flag, &frame.cursor)
+		}
+		if !errors.Is(err, sqldriver.ErrReplicatedReadReuseUnsupported) {
+			return nil, err
+		}
 	}
 	if reusable, ok := source.(replicatedSQLPointReadReuseSource); ok {
 		lease, acquireErr := reusable.AcquireReplicatedPointRead(
@@ -642,7 +671,7 @@ func executeFencedSQLPointBudget(
 			options,
 		)
 		if acquireErr == nil {
-			return executeFencedSQLLease(ctx, lease, req, budget, &flag)
+			return executeFencedSQLLease(ctx, lease, req, budget, flag, &frame.cursor)
 		}
 		if !errors.Is(acquireErr, sqldriver.ErrReplicatedReadReuseUnsupported) {
 			return nil, acquireErr
@@ -672,7 +701,7 @@ func executeFencedSQLPointBudget(
 	}
 	encoding := trace.StartRegion(ctx, "sql.read.encode")
 	defer encoding.End()
-	return encodeSQLReadCursor(cursor.Snapshot(), prepared.Columns(), budget.resultBytes, &flag)
+	return encodeSQLReadCursor(cursor.Snapshot(), prepared.Columns(), budget.resultBytes, flag)
 }
 
 func executeFencedSQLLease(
@@ -681,6 +710,7 @@ func executeFencedSQLLease(
 	req *ShardRequest,
 	budget replicatedSQLBudget,
 	flag *query.CancelFlag,
+	cursor *sqldriver.Cursor,
 ) (encoded []byte, err error) {
 	if lease == nil {
 		return nil, sqldriver.ErrReplicatedReadLeaseClosed
@@ -688,15 +718,17 @@ func executeFencedSQLLease(
 	// Finish invalidates the lease on normal return. During a panic these
 	// defers close the cursor and retire its still-active execution slot.
 	defer func() { _ = lease.Abort(nil) }()
-	var cursor sqldriver.Cursor
+	if cursor == nil {
+		cursor = &sqldriver.Cursor{}
+	}
 	defer func() { _ = cursor.Close() }()
 	if req.PrimaryKeyRead.present() {
 		err = lease.QueryCandidateKeysInto(
 			ctx, runtimeArgs(req.Params), req.PrimaryKeyRead.PrimaryPath,
-			req.PrimaryKeyRead.Keys, &cursor,
+			req.PrimaryKeyRead.Keys, cursor,
 		)
 	} else {
-		err = lease.QueryInto(ctx, runtimeArgs(req.Params), &cursor)
+		err = lease.QueryInto(ctx, runtimeArgs(req.Params), cursor)
 	}
 	if err == nil {
 		encoding := trace.StartRegion(ctx, "sql.read.encode")
@@ -713,6 +745,14 @@ func executeFencedSQLLease(
 		err = finishErr
 	}
 	return encoded, err
+}
+
+// Preserve context errors for both query execution and result encoding.
+func replicatedSQLContextError(ctx context.Context, err error) error {
+	if contextErr := ctx.Err(); contextErr != nil && (err == nil || errors.Is(err, query.ErrCanceled)) {
+		return contextErr
+	}
+	return err
 }
 
 // sqlLimit leaves native frame capacity outside SQL execution reservations.

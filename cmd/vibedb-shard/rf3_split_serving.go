@@ -184,6 +184,14 @@ func newRF3SplitServingRuntime(options rf3SplitServingOptions) (*rf3SplitServing
 					PruneLimits:        rangesplit.RetainedPruneLimits{},
 					ArtifactChunkBytes: rangesplit.DefaultChildArtifactChunkBytes,
 					RecoverArtifacts: func(ctx context.Context, plan *splitcontroller.Plan, observed splitcontroller.Observation) (bool, error) {
+						// The durable action witness predates a possible election.
+						// Leadership transfer must use the current local serving fence;
+						// the admitted plan and immutable artifact proof stay unchanged.
+						serving, err := options.owners.Probe(ctx, identity.Group)
+						if err != nil {
+							return false, err
+						}
+						observed.SourceStatus, observed.SourceServing = serving.Status, serving
 						return splitcontroller.RecoverSourceArtifactOwner(ctx, plan, observed, opener, options.deadline, options.owners)
 					},
 				})
@@ -337,7 +345,7 @@ func newRF3SplitServingRuntime(options rf3SplitServingOptions) (*rf3SplitServing
 		options.manifest.SplitControl.JournalPath,
 		protocol.JournalLimits{MaxRecords: options.manifest.SplitControl.MaxRecords,
 			MaxFileBytes: options.manifest.SplitControl.MaxFileBytes},
-		options.manifest.SplitControl.Grants, remote,
+		options.manifest.SplitControl.Grants, rf3LeaderSplitActions{owners: options.owners, next: remote},
 	)
 	if err != nil {
 		return closeOnError(err)
@@ -503,4 +511,31 @@ func (runtime *rf3SplitServingRuntime) Close() error {
 		result = errors.Join(result, runtime.observation.Close())
 	}
 	return result
+}
+
+// Source actions are group-scoped and must execute on the current local leader.
+// Return an error before action execution so the journal never caches a
+// follower's refusal as the terminal result of a replayable step.
+type rf3LeaderSplitActions struct {
+	owners interface {
+		Probe(context.Context, raftmember.GroupKey) (raftservice.ServingState, error)
+	}
+	next protocol.ActionExecutor
+}
+
+func (actions rf3LeaderSplitActions) ExecuteAction(ctx context.Context, peer rafttransport.PeerIdentity, request protocol.Request) (protocol.Response, error) {
+	target, err := splitcontroller.OpenRemoteActionTarget(request)
+	if err != nil {
+		return protocol.Response{}, err
+	}
+	if target.Member == 0 {
+		state, err := actions.owners.Probe(ctx, target.Group)
+		if err != nil {
+			return protocol.Response{}, err
+		}
+		if state.Status.MemberID == 0 || state.Status.LeaderID != state.Status.MemberID {
+			return protocol.Response{}, splitcontroller.ErrShardControlNotLeader
+		}
+	}
+	return actions.next.ExecuteAction(ctx, peer, request)
 }

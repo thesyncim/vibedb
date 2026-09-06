@@ -1,0 +1,34 @@
+=== RUN   TestUnifiedCompetitiveSpaceBreakdown
+    unified_space_breakdown_test.go:117: leaves=409 physical=66.93 B/doc structural=5.18 keys=12.00 rows=41.77 templates=2.07 dictionary=4.19 slack=1.71
+    unified_space_breakdown_test.go:121: independent-leaf DEFLATE feasibility bound: fastest=31.03 B/doc densest=27.42 B/doc
+    unified_space_breakdown_test.go:123: templated row tags=1.00 B/doc
+    unified_space_breakdown_test.go:126: hole[0] values=100000 bytes=1.00 B/doc average=1.00 B/value
+    unified_space_breakdown_test.go:126: hole[1] values=100000 bytes=2.19 B/doc average=2.19 B/value
+    unified_space_breakdown_test.go:126: hole[2] values=100000 bytes=3.92 B/doc average=3.92 B/value
+    unified_space_breakdown_test.go:126: hole[3] values=100000 bytes=12.89 B/doc average=12.89 B/value
+    unified_space_breakdown_test.go:126: hole[4] values=100000 bytes=1.00 B/doc average=1.00 B/value
+    unified_space_breakdown_test.go:126: hole[5] values=100000 bytes=11.83 B/doc average=11.83 B/value
+    unified_space_breakdown_test.go:126: hole[6] values=100000 bytes=1.00 B/doc average=1.00 B/value
+    unified_space_breakdown_test.go:126: hole[7] values=100000 bytes=1.00 B/doc average=1.00 B/value
+    unified_space_breakdown_test.go:126: hole[8] values=100000 bytes=2.94 B/doc average=2.94 B/value
+    unified_space_breakdown_test.go:126: hole[9] values=100000 bytes=1.00 B/doc average=1.00 B/value
+    unified_space_breakdown_test.go:126: hole[10] values=100000 bytes=1.00 B/doc average=1.00 B/value
+    unified_space_breakdown_test.go:126: hole[11] values=66724 bytes=0.67 B/doc average=1.00 B/value
+    unified_space_breakdown_test.go:126: hole[12] values=33479 bytes=0.33 B/doc average=1.00 B/value
+--- PASS: TestUnifiedCompetitiveSpaceBreakdown (3.70s)
+PASS
+ok  	github.com/thesyncim/vibedb/internal/storeio	4.034s
+=== RUN   TestUnifiedSpaceCompetitiveCorpus
+=== RUN   TestUnifiedSpaceCompetitiveCorpus/low
+    store_file_unified_space_test.go:146: [low] raw=248.8 B/doc unified=1019904 bytes 10.20 B/doc (gate ≤ 10.3)
+    store_file_unified_space_test.go:148: [low] census: leaves=25 rows=100000 shapes/leaf=3.00 dict/leaf=0.0 trivial=0 (0.0000%) leavesByExtent=map[20480:1 36864:24] rowsByExtent=map[20480:1696 36864:98304]
+    store_file_unified_space_test.go:155: [low] compact payload=8.96 B/doc leaf extents=9.05 B/doc extent slack=0.10 B/doc
+=== RUN   TestUnifiedSpaceCompetitiveCorpus/high
+    store_file_unified_space_test.go:146: [high] raw=248.8 B/doc unified=6930432 bytes 69.30 B/doc (gate ≤ 70.0)
+    store_file_unified_space_test.go:148: [high] census: leaves=104 rows=100000 shapes/leaf=3.00 dict/leaf=0.0 trivial=0 (0.0000%) leavesByExtent=map[65536:104] rowsByExtent=map[65536:100000]
+    store_file_unified_space_test.go:155: [high] compact payload=68.02 B/doc leaf extents=68.16 B/doc extent slack=0.14 B/doc
+--- PASS: TestUnifiedSpaceCompetitiveCorpus (1.81s)
+    --- PASS: TestUnifiedSpaceCompetitiveCorpus/low (0.46s)
+    --- PASS: TestUnifiedSpaceCompetitiveCorpus/high (1.35s)
+PASS
+ok  	github.com/thesyncim/vibedb/store/durable	2.200s

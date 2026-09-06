@@ -1,0 +1,8 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/store/durable
+cpu: Apple M4 Max
+BenchmarkFileStorePutDurabilitySync/writers=1         	      31	   8051910 ns/op	         0 devB/put	         1.000 maxgroup	  338613 B/op	       2 allocs/op
+BenchmarkFileStorePutDurabilitySync/writers=8         	      61	   4311368 ns/op	         0 devB/put	         1.000 maxgroup	  173204 B/op	       8 allocs/op
+BenchmarkFileStorePutDurabilitySync/writers=64        	     301	    962264 ns/op	       911.7 devB/put	         8.000 maxgroup	       150.5 puts/fsync	   36411 B/op	       8 allocs/op
+PASS

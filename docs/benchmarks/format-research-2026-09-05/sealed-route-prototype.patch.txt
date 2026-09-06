@@ -1,0 +1,369 @@
+diff --git a/internal/raftstore/seglog/engine_sealed_index.go b/internal/raftstore/seglog/engine_sealed_index.go
+index 68437184..1f1ca228 100644
+--- a/internal/raftstore/seglog/engine_sealed_index.go
++++ b/internal/raftstore/seglog/engine_sealed_index.go
+@@ -15,6 +15,7 @@ type pendingRouteBlock struct {
+ 	extentOffset, extentBytes uint64
+ 	payload                   []byte
+ 	entries                   uint32
++	encoding                  routeEncoding
+ }
+ 
+ func readUnpublishedSealed(path string, fileID fileID, capacity uint64, logID [16]byte, previousID uint64, previousHash, key [32]byte) (SegmentMeta, segmentFooter, error) {
+@@ -204,7 +205,7 @@ func (e *Engine) applySealedRoute(group *engineGroup, segment SegmentMeta, heade
+ 		}
+ 		group.clipSealedSuffix(run.First - 1)
+ 		descriptorBase := segment.IndexOffset + uint64(header.DescriptorOffset) + run.DescriptorOrdinal*sealedRouteDescriptorBytes
+-		group.addSealedRun(sealedRunRef{SegmentID: segment.ID, GroupID: run.GroupID, First: run.First, Last: run.Last, RouteFirst: run.First, RouteLast: run.Last, DescriptorBase: descriptorBase, DescriptorCount: run.DescriptorCount, BlockEntries: run.BlockEntries, ExtentOffset: run.ExtentOffset, ExtentBytes: run.ExtentBytes, Inline: run.Inline})
++		group.addSealedRun(sealedRunRef{SegmentID: segment.ID, GroupID: run.GroupID, First: run.First, Last: run.Last, RouteFirst: run.First, RouteLast: run.Last, DescriptorBase: descriptorBase, DescriptorCount: run.DescriptorCount, BlockEntries: run.BlockEntries, ExtentOffset: run.ExtentOffset, ExtentBytes: run.ExtentBytes, Inline: run.Inline, RouteRuns: header.RouteRuns})
+ 	}
+ 	return nil
+ }
+@@ -248,7 +249,7 @@ func verifySealedRuns(file *os.File, segment SegmentMeta, header sealedIndexHead
+ 		if run.First != active[0].Index || run.Last != active[len(active)-1].Index {
+ 			return ErrCorrupt
+ 		}
+-		ref := sealedRunRef{SegmentID: segment.ID, GroupID: run.GroupID, First: run.First, Last: run.Last, RouteFirst: run.First, RouteLast: run.Last, DescriptorBase: segment.IndexOffset + uint64(header.DescriptorOffset) + run.DescriptorOrdinal*sealedRouteDescriptorBytes, DescriptorCount: run.DescriptorCount, BlockEntries: run.BlockEntries, ExtentOffset: run.ExtentOffset, ExtentBytes: run.ExtentBytes, Inline: run.Inline}
++		ref := sealedRunRef{SegmentID: segment.ID, GroupID: run.GroupID, First: run.First, Last: run.Last, RouteFirst: run.First, RouteLast: run.Last, DescriptorBase: segment.IndexOffset + uint64(header.DescriptorOffset) + run.DescriptorOrdinal*sealedRouteDescriptorBytes, DescriptorCount: run.DescriptorCount, BlockEntries: run.BlockEntries, ExtentOffset: run.ExtentOffset, ExtentBytes: run.ExtentBytes, Inline: run.Inline, RouteRuns: header.RouteRuns}
+ 		for j := range active {
+ 			route, routeErr := router.Point(ref, active[j].Index)
+ 			if routeErr != nil {
+@@ -284,6 +285,7 @@ func (e *Engine) marshalEngineSealedIndex(dataBytes uint64) ([]byte, int, error)
+ 	runs := make([]sealedGroupRun, 0, len(groups))
+ 	blocks := make([]pendingRouteBlock, 0)
+ 	descriptorBase := uint64(0)
++	routeRuns := false
+ 	for _, groupID := range groups {
+ 		group := e.groups[groupID]
+ 		if group == nil {
+@@ -342,7 +344,7 @@ func (e *Engine) marshalEngineSealedIndex(dataBytes uint64) ([]byte, int, error)
+ 		}
+ 		for first := 0; first < len(routes); first += sealedDefaultBlockEntries {
+ 			last := min(first+sealedDefaultBlockEntries, len(routes))
+-			payload, err := appendRoutePayload(nil, routes[first:last])
++			payload, encoding, err := appendBestRoutePayload(nil, routes[first:last])
+ 			if err != nil {
+ 				return nil, 0, err
+ 			}
+@@ -355,7 +357,8 @@ func (e *Engine) marshalEngineSealedIndex(dataBytes uint64) ([]byte, int, error)
+ 					blockMax = end
+ 				}
+ 			}
+-			blocks = append(blocks, pendingRouteBlock{groupID: groupID, ordinal: uint32((first) / sealedDefaultBlockEntries), extentOffset: blockMin, extentBytes: blockMax - blockMin, payload: payload, entries: uint32(last - first)})
++			blocks = append(blocks, pendingRouteBlock{groupID: groupID, ordinal: uint32((first) / sealedDefaultBlockEntries), extentOffset: blockMin, extentBytes: blockMax - blockMin, payload: payload, entries: uint32(last - first), encoding: encoding})
++			routeRuns = routeRuns || encoding == routeEncodingRuns
+ 			run.DescriptorCount++
+ 		}
+ 		descriptorBase += uint64(run.DescriptorCount)
+@@ -375,6 +378,7 @@ func (e *Engine) marshalEngineSealedIndex(dataBytes uint64) ([]byte, int, error)
+ 		return nil, 0, ErrBounds
+ 	}
+ 	header := sealedIndexHeader{TotalBytes: uint32(total), Runs: uint32(len(runs)), DirectoryBytes: uint32(len(directory)), DescriptorOffset: uint32(sealedIndexHeaderBytes + len(directory)), DescriptorBytes: uint32(descriptorBytes), RoutePayloadOffset: uint32(uint64(sealedIndexHeaderBytes+len(directory)) + descriptorBytes), RoutePayloadBytes: uint32(routeBytes), DataBytes: uint32(dataBytes), LastSequence: e.sequence, RetryBytes: retryBytes, RetryCount: retryCount}
++	header.RouteRuns = routeRuns
+ 	headerBytes, err := marshalSealedIndexHeader(header)
+ 	if err != nil {
+ 		return nil, 0, err
+@@ -386,7 +390,7 @@ func (e *Engine) marshalEngineSealedIndex(dataBytes uint64) ([]byte, int, error)
+ 	for i := range blocks {
+ 		block := &blocks[i]
+ 		payloadOffset := dataBytes + routeCursor
+-		descriptor := routeDescriptor{PayloadOffset: uint32(payloadOffset), PayloadBytes: uint32(len(block.payload)), Entries: block.entries, ExtentOffset: uint32(block.extentOffset), ExtentBytes: uint32(block.extentBytes)}
++		descriptor := routeDescriptor{PayloadOffset: uint32(payloadOffset), PayloadBytes: uint32(len(block.payload)), Entries: block.entries, ExtentOffset: uint32(block.extentOffset), ExtentBytes: uint32(block.extentBytes), Encoding: block.encoding}
+ 		if _, err = marshalRouteDescriptor(index[descriptorCursor:descriptorCursor+sealedRouteDescriptorBytes], descriptor, e.authKey, e.log.state.LogID, e.log.state.ActiveID, block.groupID, block.ordinal, block.payload); err != nil {
+ 			return nil, 0, err
+ 		}
+diff --git a/internal/raftstore/seglog/lazy_reader.go b/internal/raftstore/seglog/lazy_reader.go
+index 6d89d766..355bb781 100644
+--- a/internal/raftstore/seglog/lazy_reader.go
++++ b/internal/raftstore/seglog/lazy_reader.go
+@@ -15,6 +15,7 @@ type sealedRunRef struct {
+ 	DescriptorCount, BlockEntries   uint32
+ 	ExtentOffset, ExtentBytes       uint64
+ 	Inline                          routeEntry
++	RouteRuns                       bool
+ }
+ 
+ type routeCacheSlot struct {
+@@ -197,7 +198,10 @@ func (r *LazyRouteReader) Point(run sealedRunRef, index uint64) (routeEntry, err
+ 	if uint64(descriptor.Entries) != expected || index-first >= expected || uint64(descriptor.ExtentOffset) < run.ExtentOffset || descriptorExtentEnd < uint64(descriptor.ExtentOffset) || runExtentEnd < run.ExtentOffset || descriptorExtentEnd > runExtentEnd {
+ 		return routeEntry{}, ErrCorrupt
+ 	}
+-	decoded, err := decodeRoutePayload(payload, descriptor.Entries, r.decode[:0])
++	if descriptor.Encoding == routeEncodingRuns && !run.RouteRuns {
++		return routeEntry{}, ErrCorrupt
++	}
++	decoded, err := decodeRoutePayloadEncoding(payload, descriptor.Entries, r.decode[:0], descriptor.Encoding)
+ 	if err != nil {
+ 		return routeEntry{}, err
+ 	}
+diff --git a/internal/raftstore/seglog/sealed_index.go b/internal/raftstore/seglog/sealed_index.go
+index d573ae6e..4bfdf84c 100644
+--- a/internal/raftstore/seglog/sealed_index.go
++++ b/internal/raftstore/seglog/sealed_index.go
+@@ -24,6 +24,9 @@ const (
+ 	sealedDefaultBlockEntries  = 256
+ 	sealedMaxBlockRouteBytes   = 16 << 10
+ 	sealedMaxSegmentBytes      = uint64(^uint32(0))
++	// The index version changes independently of the wave/segment grammar.
++	// Older readers reject run-capable indexes during metadata open.
++	sealedIndexRouteRunsVersion uint16 = 2
+ )
+ 
+ type sealedRetryState struct {
+@@ -160,6 +163,7 @@ type sealedIndexHeader struct {
+ 	DataBytes                             uint32
+ 	LastSequence                          uint64
+ 	RetryBytes, RetryCount                uint32
++	RouteRuns                            bool
+ }
+ 
+ func marshalSealedIndexHeader(h sealedIndexHeader) ([sealedIndexHeaderBytes]byte, error) {
+@@ -170,7 +174,11 @@ func marshalSealedIndexHeader(h sealedIndexHeader) ([sealedIndexHeaderBytes]byte
+ 		return b, ErrCorrupt
+ 	}
+ 	copy(b[:8], sealedIndexMagic[:])
+-	binary.LittleEndian.PutUint16(b[8:10], canonicalFormatMarker)
++	version := canonicalFormatMarker
++	if h.RouteRuns {
++		version = sealedIndexRouteRunsVersion
++	}
++	binary.LittleEndian.PutUint16(b[8:10], version)
+ 	binary.LittleEndian.PutUint16(b[10:12], sealedIndexHeaderBytes)
+ 	binary.LittleEndian.PutUint32(b[12:16], h.TotalBytes)
+ 	binary.LittleEndian.PutUint32(b[16:20], h.Runs)
+@@ -188,10 +196,15 @@ func marshalSealedIndexHeader(h sealedIndexHeader) ([sealedIndexHeaderBytes]byte
+ }
+ 
+ func unmarshalSealedIndexHeader(b []byte) (sealedIndexHeader, error) {
+-	if len(b) != sealedIndexHeaderBytes || string(b[:8]) != string(sealedIndexMagic[:]) || binary.LittleEndian.Uint16(b[8:10]) != canonicalFormatMarker || binary.LittleEndian.Uint16(b[10:12]) != sealedIndexHeaderBytes || !validCRC(b) {
++	if len(b) != sealedIndexHeaderBytes || string(b[:8]) != string(sealedIndexMagic[:]) || binary.LittleEndian.Uint16(b[10:12]) != sealedIndexHeaderBytes || !validCRC(b) {
++		return sealedIndexHeader{}, ErrCorrupt
++	}
++	version := binary.LittleEndian.Uint16(b[8:10])
++	if version != canonicalFormatMarker && version != sealedIndexRouteRunsVersion {
+ 		return sealedIndexHeader{}, ErrCorrupt
+ 	}
+ 	h := sealedIndexHeader{TotalBytes: binary.LittleEndian.Uint32(b[12:16]), Runs: binary.LittleEndian.Uint32(b[16:20]), DirectoryBytes: binary.LittleEndian.Uint32(b[20:24]), DescriptorOffset: binary.LittleEndian.Uint32(b[24:28]), DescriptorBytes: binary.LittleEndian.Uint32(b[28:32]), RoutePayloadOffset: binary.LittleEndian.Uint32(b[32:36]), RoutePayloadBytes: binary.LittleEndian.Uint32(b[36:40]), DataBytes: binary.LittleEndian.Uint32(b[40:44]), LastSequence: binary.LittleEndian.Uint64(b[44:52]), RetryBytes: binary.LittleEndian.Uint32(b[52:56]), RetryCount: binary.LittleEndian.Uint32(b[56:60])}
++	h.RouteRuns = version == sealedIndexRouteRunsVersion
+ 	if h.RetryBytes > h.DirectoryBytes || (h.RetryCount == 0) != (h.RetryBytes == 0) {
+ 		return sealedIndexHeader{}, ErrCorrupt
+ 	}
+@@ -264,6 +277,7 @@ type routeDescriptor struct {
+ 	PayloadOffset, ExtentOffset uint32
+ 	PayloadBytes, Entries       uint32
+ 	ExtentBytes                 uint32
++	Encoding                    routeEncoding
+ 	Tag                         [sealedRouteTagBytes]byte
+ }
+ 
+@@ -673,7 +687,7 @@ func applySignedDelta(previous, encoded uint64) (uint64, bool) {
+ }
+ 
+ func marshalRouteDescriptor(dst []byte, descriptor routeDescriptor, key [32]byte, logID [16]byte, segmentID, groupID uint64, ordinal uint32, payload []byte) ([]byte, error) {
+-	if len(dst) < sealedRouteDescriptorBytes || descriptor.Entries == 0 || descriptor.PayloadBytes != uint32(len(payload)) || descriptor.PayloadBytes > sealedMaxBlockRouteBytes || uint64(descriptor.PayloadOffset)+uint64(descriptor.PayloadBytes) > sealedMaxSegmentBytes || uint64(descriptor.ExtentOffset)+uint64(descriptor.ExtentBytes) > sealedMaxSegmentBytes {
++	if len(dst) < sealedRouteDescriptorBytes || descriptor.Encoding > routeEncodingRuns || descriptor.Entries == 0 || descriptor.PayloadBytes != uint32(len(payload)) || descriptor.PayloadBytes > sealedMaxBlockRouteBytes || uint64(descriptor.PayloadOffset)+uint64(descriptor.PayloadBytes) > sealedMaxSegmentBytes || uint64(descriptor.ExtentOffset)+uint64(descriptor.ExtentBytes) > sealedMaxSegmentBytes {
+ 		return nil, ErrCorrupt
+ 	}
+ 	b := dst[:sealedRouteDescriptorBytes]
+@@ -683,6 +697,7 @@ func marshalRouteDescriptor(dst []byte, descriptor routeDescriptor, key [32]byte
+ 	binary.LittleEndian.PutUint32(b[8:12], descriptor.Entries)
+ 	binary.LittleEndian.PutUint32(b[12:16], descriptor.ExtentOffset)
+ 	binary.LittleEndian.PutUint32(b[16:20], descriptor.ExtentBytes)
++	binary.LittleEndian.PutUint32(b[20:24], uint32(descriptor.Encoding))
+ 	workspace := newRouteAuthWorkspace(key)
+ 	tag := workspace.tag(logID, segmentID, groupID, ordinal, b[:24], payload)
+ 	copy(b[24:40], tag[:])
+@@ -694,8 +709,9 @@ func (w *routeAuthWorkspace) unmarshalRouteDescriptor(src, payload []byte, logID
+ 		return routeDescriptor{}, ErrCorrupt
+ 	}
+ 	d := routeDescriptor{PayloadOffset: binary.LittleEndian.Uint32(src[0:4]), PayloadBytes: binary.LittleEndian.Uint32(src[4:8]), Entries: binary.LittleEndian.Uint32(src[8:12]), ExtentOffset: binary.LittleEndian.Uint32(src[12:16]), ExtentBytes: binary.LittleEndian.Uint32(src[16:20])}
++	d.Encoding = routeEncoding(binary.LittleEndian.Uint32(src[20:24]))
+ 	copy(d.Tag[:], src[24:40])
+-	if !allZero(src[20:24]) || d.Entries == 0 || d.PayloadBytes != uint32(len(payload)) || d.PayloadBytes > sealedMaxBlockRouteBytes || uint64(d.PayloadOffset)+uint64(d.PayloadBytes) > sealedMaxSegmentBytes || uint64(d.ExtentOffset)+uint64(d.ExtentBytes) > sealedMaxSegmentBytes {
++	if d.Encoding > routeEncodingRuns || d.Entries == 0 || d.PayloadBytes != uint32(len(payload)) || d.PayloadBytes > sealedMaxBlockRouteBytes || uint64(d.PayloadOffset)+uint64(d.PayloadBytes) > sealedMaxSegmentBytes || uint64(d.ExtentOffset)+uint64(d.ExtentBytes) > sealedMaxSegmentBytes {
+ 		return routeDescriptor{}, ErrCorrupt
+ 	}
+ 	want := w.tag(logID, segmentID, groupID, ordinal, src[:24], payload)
+diff --git a/internal/raftstore/seglog/sealed_route_runs.go b/internal/raftstore/seglog/sealed_route_runs.go
+new file mode 100644
+index 00000000..97083c29
+--- /dev/null
++++ b/internal/raftstore/seglog/sealed_route_runs.go
+@@ -0,0 +1,177 @@
++package seglog
++
++// routeEncoding is authenticated as part of the fixed route descriptor.
++// The zero value retains the original per-entry payload byte for byte.
++type routeEncoding uint32
++
++const (
++	routeEncodingEntries routeEncoding = iota
++	routeEncodingRuns
++	sealedRouteMaxRuns = 16
++)
++
++type routeExtentRun struct {
++	first routeEntry
++	count uint32
++}
++
++type routeRunPlan struct {
++	runs                     [sealedRouteMaxRuns]routeExtentRun
++	count, bytes, entryBytes int
++}
++
++// appendBestRoutePayload proves a bounded run representation before allocating
++// its payload. Irregular blocks retain the exact original encoding. This runs
++// only while sealing; active wave encoding and the decoded route cache stay
++// unchanged.
++func appendBestRoutePayload(dst []byte, entries []routeEntry) ([]byte, routeEncoding, error) {
++	var plan routeRunPlan
++	if !plan.build(entries) || plan.bytes >= plan.entryBytes {
++		payload, err := appendRoutePayload(dst, entries)
++		return payload, routeEncodingEntries, err
++	}
++	dst = appendUvarint(dst, entries[0].Term)
++	dst = append(dst, byte(entries[0].Type))
++	dst = appendUvarint(dst, uint64(plan.count))
++	previousExtent := uint64(0)
++	for i := 0; i < plan.count; i++ {
++		run := &plan.runs[i]
++		dst = appendUvarint(dst, uint64(run.count))
++		dst = appendUvarint(dst, run.first.ExtentOffset-previousExtent)
++		dst = appendUvarint(dst, run.first.ExtentBytes)
++		dst = appendUvarint(dst, run.first.ExtentID)
++		dst = append(dst, run.first.BatchID[:]...)
++		dst = appendUvarint(dst, run.first.DataOffset)
++		dst = appendUvarint(dst, run.first.DataBytes)
++		previousExtent = run.first.ExtentOffset
++	}
++	return dst, routeEncodingRuns, nil
++}
++
++func (p *routeRunPlan) build(entries []routeEntry) bool {
++	if len(entries) < 2 || len(entries) > sealedDefaultBlockEntries {
++		return false
++	}
++	*p = routeRunPlan{}
++	first := entries[0]
++	previousExtent, previousDataEnd := uint64(0), uint64(0)
++	for i := range entries {
++		entry := entries[i]
++		if !validRouteEntry(entry) || entry.Term != first.Term || entry.Type != first.Type || entry.DataBytes == 0 {
++			return false
++		}
++		if i == 0 || entry.ExtentOffset != previousExtent {
++			if p.count == sealedRouteMaxRuns {
++				return false
++			}
++			if i != 0 && (entry.ExtentOffset <= previousExtent || p.runs[p.count-1].first.ExtentBytes > entry.ExtentOffset-previousExtent) {
++				return false
++			}
++			p.runs[p.count] = routeExtentRun{first: entry, count: 1}
++			p.count++
++			p.entryBytes += uvarintBytes(entry.ExtentOffset-previousExtent) + uvarintBytes(entry.ExtentBytes) + uvarintBytes(entry.ExtentID) + len(entry.BatchID)
++			previousExtent = entry.ExtentOffset
++		} else {
++			run := &p.runs[p.count-1]
++			if entry.ExtentBytes != run.first.ExtentBytes || entry.ExtentID != run.first.ExtentID || entry.BatchID != run.first.BatchID || entry.DataBytes != run.first.DataBytes || entry.DataOffset != previousDataEnd {
++				return false
++			}
++			run.count++
++		}
++		// One flags byte and the zero term delta, except for the first term.
++		p.entryBytes += 2 + uvarintBytes(entry.DataOffset) + uvarintBytes(entry.DataBytes)
++		previousDataEnd = entry.DataOffset + entry.DataBytes // validRouteEntry bounded both.
++	}
++	firstTerm, deltaOK := signedDelta(0, first.Term)
++	if !deltaOK {
++		firstTerm = first.Term
++	}
++	p.entryBytes += uvarintBytes(firstTerm) - 1
++	p.bytes = uvarintBytes(first.Term) + 1 + uvarintBytes(uint64(p.count))
++	previousExtent = 0
++	for i := 0; i < p.count; i++ {
++		run := &p.runs[i]
++		p.bytes += uvarintBytes(uint64(run.count)) + uvarintBytes(run.first.ExtentOffset-previousExtent) + uvarintBytes(run.first.ExtentBytes) + uvarintBytes(run.first.ExtentID) + len(run.first.BatchID) + uvarintBytes(run.first.DataOffset) + uvarintBytes(run.first.DataBytes)
++		previousExtent = run.first.ExtentOffset
++	}
++	return p.bytes <= sealedMaxBlockRouteBytes
++}
++
++func decodeRoutePayloadEncoding(src []byte, count uint32, dst []routeEntry, encoding routeEncoding) ([]routeEntry, error) {
++	switch encoding {
++	case routeEncodingEntries:
++		return decodeRoutePayload(src, count, dst)
++	case routeEncodingRuns:
++		return decodeRouteRuns(src, count, dst)
++	default:
++		return nil, ErrCorrupt
++	}
++}
++
++// decodeRouteRuns expands each extent into the existing decoded-cache layout.
++// It validates the entire run before multiplication or writing any entry, so
++// a bad count/stride cannot overflow or manufacture an out-of-extent route.
++func decodeRouteRuns(src []byte, count uint32, dst []routeEntry) ([]routeEntry, error) {
++	if count < 2 || count > sealedDefaultBlockEntries || cap(dst) < int(count) || len(src) > sealedMaxBlockRouteBytes {
++		return nil, ErrCorrupt
++	}
++	cursor := canonicalCursor{data: src}
++	term, err := cursor.uvarint()
++	if err != nil || term == 0 {
++		return nil, ErrCorrupt
++	}
++	kind, err := cursor.byte()
++	if err != nil || kind > 2 {
++		return nil, ErrCorrupt
++	}
++	runs, err := cursor.uvarint()
++	if err != nil || runs == 0 || runs > sealedRouteMaxRuns || runs > uint64(count) {
++		return nil, ErrCorrupt
++	}
++	dst = dst[:count]
++	written := 0
++	previousExtent, previousExtentBytes := uint64(0), uint64(0)
++	for i := uint64(0); i < runs; i++ {
++		entries, err := cursor.uvarint()
++		if err != nil || entries == 0 || entries > uint64(len(dst)-written) {
++			return nil, ErrCorrupt
++		}
++		delta, err := cursor.uvarint()
++		if err != nil || delta > sealedMaxSegmentBytes-previousExtent || i != 0 && delta < previousExtentBytes {
++			return nil, ErrCorrupt
++		}
++		extentOffset := previousExtent + delta
++		extentBytes, err := cursor.uvarint()
++		if err != nil || extentBytes > sealedMaxSegmentBytes-extentOffset {
++			return nil, ErrCorrupt
++		}
++		extentID, err := cursor.uvarint()
++		if err != nil {
++			return nil, ErrCorrupt
++		}
++		batch, err := cursor.take(16)
++		if err != nil {
++			return nil, ErrCorrupt
++		}
++		dataOffset, err := cursor.uvarint()
++		if err != nil || dataOffset > extentBytes {
++			return nil, ErrCorrupt
++		}
++		dataBytes, err := cursor.uvarint()
++		if err != nil || dataBytes == 0 || entries > (extentBytes-dataOffset)/dataBytes {
++			return nil, ErrCorrupt
++		}
++		entry := routeEntry{Term: term, Type: uint16(kind), ExtentOffset: extentOffset, ExtentBytes: extentBytes, ExtentID: extentID, DataOffset: dataOffset, DataBytes: dataBytes}
++		copy(entry.BatchID[:], batch)
++		for j := uint64(0); j < entries; j++ {
++			dst[written] = entry
++			written++
++			entry.DataOffset += dataBytes
++		}
++		previousExtent, previousExtentBytes = extentOffset, extentBytes
++	}
++	if written != len(dst) || !cursor.empty() {
++		return nil, ErrCorrupt
++	}
++	return dst, nil
++}

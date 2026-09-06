@@ -35,22 +35,28 @@ const (
 	IntegerGreaterEqual = storeio.UnifiedIntegerGreaterEqual
 )
 
-// IntegerOrderFilter is reusable state for one strict FOR ordered COUNT.
-// Unsupported leaves decline the whole scan so callers can use the generic
-// executor without exposing a partial result.
+// IntegerOrderFilter is reusable state for one strict compact integer ordered
+// COUNT. Unsupported leaves decline the whole scan so callers can use the
+// generic executor without exposing a partial result.
 type IntegerOrderFilter struct {
 	inner *storeio.UnifiedIntegerOrderFilter
+	// path is retained only so Snapshot can make the per-scan PrefixInt
+	// admission decision without compiling a second skip filter.
+	path string
 }
 
-// IntegerIntervalFilter is reusable state for one strict FOR interval COUNT.
-// Unsupported leaves decline the whole scan so callers can use the generic
-// executor without exposing a partial result.
+// IntegerIntervalFilter is reusable state for one strict compact integer
+// interval COUNT. Unsupported leaves decline the whole scan so callers can
+// use the generic executor without exposing a partial result.
 type IntegerIntervalFilter struct {
 	inner *storeio.UnifiedIntegerIntervalFilter
+	// path is retained only so Snapshot can make the per-scan PrefixInt
+	// admission decision without compiling a second skip filter.
+	path string
 }
 
-// IntegerExtremaFilter is reusable state for one strict FOR integer MIN/MAX
-// scan. Unsupported leaves decline the complete scan atomically.
+// IntegerExtremaFilter is reusable state for one strict compact integer
+// MIN/MAX scan. Unsupported leaves decline the complete scan atomically.
 type IntegerExtremaFilter struct {
 	inner *storeio.UnifiedIntegerExtremaFilter
 }
@@ -64,7 +70,7 @@ func NewIntegerOrderFilter(
 	if err != nil {
 		return nil, err
 	}
-	return &IntegerOrderFilter{inner: inner}, nil
+	return &IntegerOrderFilter{inner: inner, path: path}, nil
 }
 
 // NewIntegerIntervalFilter builds an exact normalized signed interval over a
@@ -77,7 +83,7 @@ func NewIntegerIntervalFilter(
 	if err != nil {
 		return nil, err
 	}
-	return &IntegerIntervalFilter{inner: inner}, nil
+	return &IntegerIntervalFilter{inner: inner, path: path}, nil
 }
 
 // NewIntegerExtremaFilter builds an exact integer MIN/MAX scan over a unified
@@ -121,8 +127,9 @@ type FilterEqResult struct {
 }
 
 // FilterIntegerOrderResult reports a strict ordered scan. Supported is false
-// when any present target stream cannot answer exactly from compact FOR data;
-// Matched and Scanned are then deliberately zero and must be discarded.
+// when any present target stream cannot answer exactly from an eligible
+// compact integer stream; Matched and Scanned are then deliberately zero and
+// must be discarded.
 type FilterIntegerOrderResult struct {
 	Matched   int
 	Scanned   int
@@ -130,8 +137,9 @@ type FilterIntegerOrderResult struct {
 }
 
 // FilterIntegerIntervalResult reports one strict interval scan. Supported is
-// false when any present target stream cannot answer exactly from compact FOR
-// data; Matched and Scanned are then deliberately zero and must be discarded.
+// false when any present target stream cannot answer exactly from an eligible
+// compact integer stream; Matched and Scanned are then deliberately zero and
+// must be discarded.
 type FilterIntegerIntervalResult struct {
 	Matched   int
 	Scanned   int
@@ -218,7 +226,8 @@ func (s *Snapshot) FilterEqCount(f *EqFilter) (FilterEqResult, error) {
 	}
 }
 
-// FilterIntegerOrderCount scans a snapshot using the strict FOR ordering lane.
+// FilterIntegerOrderCount scans a snapshot using the strict compact integer
+// ordering lane.
 // It never renders or falls back per row: unsupported compact leaves decline
 // atomically, allowing the query executor to run the original predicate.
 func (s *Snapshot) FilterIntegerOrderCount(
@@ -251,8 +260,11 @@ func (s *Snapshot) FilterIntegerOrderCount(
 	}
 	defer cursor.Close()
 	var progress storeio.UnifiedFilterProgress
+	allowPrefix := !s.hasDataSkippingPath(f.path)
 	for {
-		supported, err := cursor.FilterCountIntegerOrdered(f.inner, &progress)
+		supported, err := cursor.FilterCountIntegerOrdered(
+			f.inner, &progress, allowPrefix,
+		)
 		if err != nil {
 			return FilterIntegerOrderResult{}, err
 		}
@@ -265,10 +277,10 @@ func (s *Snapshot) FilterIntegerOrderCount(
 	}
 }
 
-// FilterIntegerIntervalCount scans a snapshot using the strict FOR interval
-// lane. It never renders or falls back per row: unsupported compact leaves
-// decline atomically, allowing the query executor to run the original
-// predicate.
+// FilterIntegerIntervalCount scans a snapshot using the strict compact
+// integer interval lane. It never renders or falls back per row: unsupported
+// compact leaves decline atomically, allowing the query executor to run the
+// original predicate.
 func (s *Snapshot) FilterIntegerIntervalCount(
 	f *IntegerIntervalFilter,
 ) (FilterIntegerIntervalResult, error) {
@@ -299,8 +311,11 @@ func (s *Snapshot) FilterIntegerIntervalCount(
 	}
 	defer cursor.Close()
 	var progress storeio.UnifiedFilterProgress
+	allowPrefix := !s.hasDataSkippingPath(f.path)
 	for {
-		supported, err := cursor.FilterCountIntegerInterval(f.inner, &progress)
+		supported, err := cursor.FilterCountIntegerInterval(
+			f.inner, &progress, allowPrefix,
+		)
 		if err != nil {
 			return FilterIntegerIntervalResult{}, err
 		}
@@ -313,9 +328,10 @@ func (s *Snapshot) FilterIntegerIntervalCount(
 	}
 }
 
-// FilterIntegerExtrema scans a snapshot using the strict FOR integer extrema
-// lane. It never renders or falls back per row: unsupported compact leaves
-// decline atomically, allowing the query executor to run the generic path.
+// FilterIntegerExtrema scans a snapshot using the strict compact integer
+// extrema lane. It never renders or falls back per row: unsupported compact
+// leaves decline atomically, allowing the query executor to run the generic
+// path.
 func (s *Snapshot) FilterIntegerExtrema(
 	f *IntegerExtremaFilter,
 ) (FilterIntegerExtremaResult, error) {

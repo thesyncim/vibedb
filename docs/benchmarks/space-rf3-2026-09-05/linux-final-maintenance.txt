@@ -1,0 +1,8 @@
+go: downloading go.etcd.io/raft/v3 v3.7.0
+go: downloading google.golang.org/protobuf v1.36.11
+go: downloading golang.org/x/sys v0.47.0
+go: downloading github.com/cespare/xxhash/v2 v2.3.0
+go: downloading github.com/thesyncim/vibejson v0.1.0
+ok  	github.com/thesyncim/vibedb/internal/raftstore	16.256s
+ok  	github.com/thesyncim/vibedb/internal/raftstore/seglog	15.983s
+ok  	github.com/thesyncim/vibedb/internal/raftmember	15.668s

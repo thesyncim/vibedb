@@ -1,0 +1,52 @@
+=== RUN   TestFormatResearchPrimaryBoundary
+=== RUN   TestFormatResearchPrimaryBoundary/bytes512-inline512-highfalse
+    format_research_boundary_test.go:121: CENSUS rows=256 doc_bytes=512 inline=512 high=false leaves=1 live_leaf_bytes=4096 overflow_rows=0 live_overflow_bytes=0 primary_apparent=212992 all_apparent=2835456 all_allocated=2838528 files=2
+=== RUN   TestFormatResearchPrimaryBoundary/bytes512-inline512-hightrue
+    format_research_boundary_test.go:121: CENSUS rows=256 doc_bytes=512 inline=512 high=true leaves=4 live_leaf_bytes=135168 overflow_rows=0 live_overflow_bytes=0 primary_apparent=520192 all_apparent=3142656 all_allocated=2973696 files=2
+=== RUN   TestFormatResearchPrimaryBoundary/bytes512-inline4096-highfalse
+    format_research_boundary_test.go:121: CENSUS rows=256 doc_bytes=512 inline=4096 high=false leaves=1 live_leaf_bytes=4096 overflow_rows=0 live_overflow_bytes=0 primary_apparent=212992 all_apparent=2835456 all_allocated=2838528 files=2
+=== RUN   TestFormatResearchPrimaryBoundary/bytes512-inline4096-hightrue
+    format_research_boundary_test.go:121: CENSUS rows=256 doc_bytes=512 inline=4096 high=true leaves=4 live_leaf_bytes=135168 overflow_rows=0 live_overflow_bytes=0 primary_apparent=520192 all_apparent=3142656 all_allocated=2973696 files=2
+=== RUN   TestFormatResearchPrimaryBoundary/bytes513-inline512-highfalse
+    format_research_boundary_test.go:121: CENSUS rows=256 doc_bytes=513 inline=512 high=false leaves=1 live_leaf_bytes=12288 overflow_rows=256 live_overflow_bytes=1048576 primary_apparent=1269760 all_apparent=3892224 all_allocated=3895296 files=2
+=== RUN   TestFormatResearchPrimaryBoundary/bytes513-inline512-hightrue
+    format_research_boundary_test.go:121: CENSUS rows=256 doc_bytes=513 inline=512 high=true leaves=1 live_leaf_bytes=12288 overflow_rows=256 live_overflow_bytes=1048576 primary_apparent=1269760 all_apparent=3892224 all_allocated=3895296 files=2
+=== RUN   TestFormatResearchPrimaryBoundary/bytes513-inline4096-highfalse
+    format_research_boundary_test.go:121: CENSUS rows=256 doc_bytes=513 inline=4096 high=false leaves=1 live_leaf_bytes=4096 overflow_rows=0 live_overflow_bytes=0 primary_apparent=212992 all_apparent=2835456 all_allocated=2838528 files=2
+=== RUN   TestFormatResearchPrimaryBoundary/bytes513-inline4096-hightrue
+    format_research_boundary_test.go:121: CENSUS rows=256 doc_bytes=513 inline=4096 high=true leaves=4 live_leaf_bytes=135168 overflow_rows=0 live_overflow_bytes=0 primary_apparent=520192 all_apparent=3142656 all_allocated=2973696 files=2
+=== RUN   TestFormatResearchPrimaryBoundary/bytes1024-inline512-highfalse
+    format_research_boundary_test.go:121: CENSUS rows=256 doc_bytes=1024 inline=512 high=false leaves=1 live_leaf_bytes=12288 overflow_rows=256 live_overflow_bytes=1048576 primary_apparent=1269760 all_apparent=3892224 all_allocated=3895296 files=2
+=== RUN   TestFormatResearchPrimaryBoundary/bytes1024-inline512-hightrue
+    format_research_boundary_test.go:121: CENSUS rows=256 doc_bytes=1024 inline=512 high=true leaves=1 live_leaf_bytes=12288 overflow_rows=256 live_overflow_bytes=1048576 primary_apparent=1269760 all_apparent=3892224 all_allocated=3895296 files=2
+=== RUN   TestFormatResearchPrimaryBoundary/bytes1024-inline4096-highfalse
+    format_research_boundary_test.go:121: CENSUS rows=256 doc_bytes=1024 inline=4096 high=false leaves=1 live_leaf_bytes=4096 overflow_rows=0 live_overflow_bytes=0 primary_apparent=212992 all_apparent=2835456 all_allocated=2838528 files=2
+=== RUN   TestFormatResearchPrimaryBoundary/bytes1024-inline4096-hightrue
+    format_research_boundary_test.go:121: CENSUS rows=256 doc_bytes=1024 inline=4096 high=true leaves=11 live_leaf_bytes=274432 overflow_rows=0 live_overflow_bytes=0 primary_apparent=659456 all_apparent=3281920 all_allocated=3129344 files=2
+=== RUN   TestFormatResearchPrimaryBoundary/bytes4096-inline512-highfalse
+    format_research_boundary_test.go:121: CENSUS rows=256 doc_bytes=4096 inline=512 high=false leaves=1 live_leaf_bytes=12288 overflow_rows=256 live_overflow_bytes=2097152 primary_apparent=2318336 all_apparent=4940800 all_allocated=4943872 files=2
+=== RUN   TestFormatResearchPrimaryBoundary/bytes4096-inline512-hightrue
+    format_research_boundary_test.go:121: CENSUS rows=256 doc_bytes=4096 inline=512 high=true leaves=1 live_leaf_bytes=12288 overflow_rows=256 live_overflow_bytes=2097152 primary_apparent=2318336 all_apparent=4940800 all_allocated=4943872 files=2
+=== RUN   TestFormatResearchPrimaryBoundary/bytes4096-inline4096-highfalse
+    format_research_boundary_test.go:121: CENSUS rows=256 doc_bytes=4096 inline=4096 high=false leaves=1 live_leaf_bytes=8192 overflow_rows=0 live_overflow_bytes=0 primary_apparent=217088 all_apparent=2839552 all_allocated=2842624 files=2
+=== RUN   TestFormatResearchPrimaryBoundary/bytes4096-inline4096-hightrue
+    format_research_boundary_test.go:121: CENSUS rows=256 doc_bytes=4096 inline=4096 high=true leaves=24 live_leaf_bytes=1105920 overflow_rows=0 live_overflow_bytes=0 primary_apparent=1503232 all_apparent=4125696 all_allocated=3977216 files=2
+--- PASS: TestFormatResearchPrimaryBoundary (3.22s)
+    --- PASS: TestFormatResearchPrimaryBoundary/bytes512-inline512-highfalse (0.49s)
+    --- PASS: TestFormatResearchPrimaryBoundary/bytes512-inline512-hightrue (0.20s)
+    --- PASS: TestFormatResearchPrimaryBoundary/bytes512-inline4096-highfalse (0.07s)
+    --- PASS: TestFormatResearchPrimaryBoundary/bytes512-inline4096-hightrue (0.22s)
+    --- PASS: TestFormatResearchPrimaryBoundary/bytes513-inline512-highfalse (0.09s)
+    --- PASS: TestFormatResearchPrimaryBoundary/bytes513-inline512-hightrue (0.14s)
+    --- PASS: TestFormatResearchPrimaryBoundary/bytes513-inline4096-highfalse (0.10s)
+    --- PASS: TestFormatResearchPrimaryBoundary/bytes513-inline4096-hightrue (0.15s)
+    --- PASS: TestFormatResearchPrimaryBoundary/bytes1024-inline512-highfalse (0.17s)
+    --- PASS: TestFormatResearchPrimaryBoundary/bytes1024-inline512-hightrue (0.11s)
+    --- PASS: TestFormatResearchPrimaryBoundary/bytes1024-inline4096-highfalse (0.09s)
+    --- PASS: TestFormatResearchPrimaryBoundary/bytes1024-inline4096-hightrue (0.53s)
+    --- PASS: TestFormatResearchPrimaryBoundary/bytes4096-inline512-highfalse (0.13s)
+    --- PASS: TestFormatResearchPrimaryBoundary/bytes4096-inline512-hightrue (0.10s)
+    --- PASS: TestFormatResearchPrimaryBoundary/bytes4096-inline4096-highfalse (0.09s)
+    --- PASS: TestFormatResearchPrimaryBoundary/bytes4096-inline4096-hightrue (0.54s)
+PASS
+ok  	github.com/thesyncim/vibedb/store/durable	3.606s

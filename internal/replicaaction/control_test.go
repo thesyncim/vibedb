@@ -21,10 +21,10 @@ type memoryJournal struct {
 	publishUnknown bool
 }
 
-func (journal *memoryJournal) ReadReplicaAction(_ context.Context, operation [32]byte) (Record, error) {
+func (journal *memoryJournal) ReadReplicaAction(_ context.Context, operation [32]byte, kind Kind) (Record, error) {
 	journal.mu.Lock()
 	defer journal.mu.Unlock()
-	record, found := journal.records[operation]
+	record, found := journal.records[replicaActionJournalKey(operation, kind)]
 	if !found {
 		return Record{}, ErrMissing
 	}
@@ -35,11 +35,11 @@ func (journal *memoryJournal) ReadReplicaAction(_ context.Context, operation [32
 func (journal *memoryJournal) PublishReplicaAction(_ context.Context, expected uint64, record Record) error {
 	journal.mu.Lock()
 	defer journal.mu.Unlock()
-	current, found := journal.records[record.Request.Operation]
+	current, found := journal.records[replicaActionJournalKey(record.Request.Operation, record.Request.Kind)]
 	if (!found && expected != 0) || (found && current.Revision != expected) {
 		return ErrConflict
 	}
-	journal.records[record.Request.Operation] = Record{Request: cloneRequest(record.Request), Revision: record.Revision, State: record.State}
+	journal.records[replicaActionJournalKey(record.Request.Operation, record.Request.Kind)] = Record{Request: cloneRequest(record.Request), Revision: record.Revision, State: record.State}
 	if journal.publishUnknown {
 		journal.publishUnknown = false
 		return errors.New("lost acknowledgement")

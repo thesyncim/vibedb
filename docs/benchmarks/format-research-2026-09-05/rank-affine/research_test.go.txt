@@ -1,0 +1,1519 @@
+package storeio
+
+import (
+	"bytes"
+	"encoding/binary"
+	"fmt"
+	"math"
+	"math/bits"
+	"os"
+	"slices"
+	"strconv"
+	"testing"
+
+	"github.com/thesyncim/vibedb/internal/benchcorpus"
+	"github.com/thesyncim/vibejson"
+)
+
+// This opt-in experiment has no production emitter or reader. VRA1 and 0xfe
+// are private research tags, deliberately rejected by production admission.
+// The modeled stream has precisely the existing PrefixInt wire size, but its
+// count is the FULL leaf row count and its coordinate is physical row rank.
+// Everything else in the original VCS1 payload is retained byte-for-byte,
+// except section lengths/directories adjusted for the actual smaller streams.
+// This proves representation size and exact reconstruction, not native query,
+// patch, allocation, persistence, or latency equivalence.
+const rankAffineResearchKind = byte(0xfe)
+const rankAffineResearchMagic = "VRA1"
+
+func rankAffineResearchEnabled(t *testing.T) {
+	t.Helper()
+	if os.Getenv("VIBEDB_RANK_AFFINE_RESEARCH") != "1" {
+		t.Skip("opt in with VIBEDB_RANK_AFFINE_RESEARCH=1")
+	}
+}
+
+// Nonnegative prefix magnitudes make every subtraction below representable.
+// Check multiplication bounds before evaluating, including extrapolation to
+// physical rows that belong to other shapes or overflow values.
+func rankAffineResearchAt(base, step int64, row int) (int64, bool) {
+	if base < 0 || row < 0 || step == math.MinInt64 {
+		return 0, false
+	}
+	if step > 0 && int64(row) > (math.MaxInt64-base)/step ||
+		step < 0 && int64(row) > base/(-step) {
+		return 0, false
+	}
+	return base + step*int64(row), true
+}
+
+// Candidate admission is deliberately conservative and does not assume that
+// a field called id matches a key, a shape ordinal, or a stable posting slot.
+// Parsing and exact re-rendering happen here only for a correctness proof;
+// a production planner must fuse admission into its existing candidate pass.
+func rankAffineResearchCandidate(values [][]byte, ranks []int, leafRows int) ([]byte, bool) {
+	if len(values) < 2 || len(values) != len(ranks) ||
+		leafRows < 2 || leafRows > CompactPrimaryStripeMaxRows {
+		return nil, false
+	}
+	parsed := make([]compactPrefixIntValue, len(values))
+	allCanonical, fixedWidth := true, true
+	for i, value := range values {
+		if ranks[i] < 0 || ranks[i] >= leafRows || i > 0 && ranks[i] <= ranks[i-1] {
+			return nil, false
+		}
+		p, ok := parseCompactPrefixInt(value)
+		if !ok || i > 0 && (!bytes.Equal(p.prefix, parsed[0].prefix) ||
+			!bytes.Equal(p.suffix, parsed[0].suffix)) {
+			return nil, false
+		}
+		parsed[i] = p
+		allCanonical = allCanonical && p.canonical
+		fixedWidth = fixedWidth && p.width == parsed[0].width
+	}
+	if !allCanonical && (!fixedWidth || parsed[0].width > math.MaxUint8) {
+		return nil, false
+	}
+	v0, v1 := int64(parsed[0].value), int64(parsed[1].value)
+	distance := int64(ranks[1] - ranks[0])
+	difference := v1 - v0
+	if difference == 0 || difference%distance != 0 {
+		return nil, false // Existing dictionaries already represent constants.
+	}
+	step := difference / distance
+	// Evaluate v0-step*r0 without overflowing before checking the result.
+	base, ok := rankAffineResearchAt(v0, -step, ranks[0])
+	if !ok {
+		return nil, false
+	}
+	if _, ok := rankAffineResearchAt(base, step, leafRows-1); !ok {
+		return nil, false
+	}
+	for i, p := range parsed {
+		got, ok := rankAffineResearchAt(base, step, ranks[i])
+		if !ok || uint64(got) != p.value {
+			return nil, false
+		}
+	}
+	data := make([]byte, 18)
+	data[0] = 2 // Exact affine descriptor, not a restarted delta stream.
+	if !allCanonical {
+		data[0], data[1] = 3, byte(parsed[0].width)
+	}
+	binary.LittleEndian.PutUint64(data[2:], uint64(base))
+	binary.LittleEndian.PutUint64(data[10:], uint64(step))
+	encoded := compactStreamEncoding{
+		kind: compactStreamPrefixInt, count: leafRows, data: data,
+		dict: [][]byte{parsed[0].prefix, parsed[0].suffix},
+	}
+	raw, err := encoded.appendBinary(nil)
+	if err != nil {
+		return nil, false
+	}
+	raw[0] = rankAffineResearchKind
+	view, err := rankAffineResearchOpenStream(raw, leafRows)
+	if err != nil {
+		return nil, false
+	}
+	var scratch []byte
+	for i, original := range values {
+		scratch, ok = view.appendValue(scratch[:0], ranks[i])
+		if !ok || !bytes.Equal(scratch, original) {
+			return nil, false
+		}
+	}
+	return raw, true
+}
+
+// Decode an actual serialized descriptor, using the existing production
+// prefix renderer only after independently proving its entire rank domain.
+func rankAffineResearchOpenStream(raw []byte, leafRows int) (compactStreamView, error) {
+	bad := func() (compactStreamView, error) {
+		return compactStreamView{}, fmt.Errorf("invalid research rank-affine stream")
+	}
+	if len(raw) < compactStreamHeader || raw[0] != rankAffineResearchKind ||
+		leafRows < 2 || leafRows > CompactPrimaryStripeMaxRows {
+		return bad()
+	}
+	copyRaw := bytes.Clone(raw)
+	copyRaw[0] = compactStreamPrefixInt
+	v, err := openCompactStream(copyRaw)
+	if err != nil || v.encoded != len(raw) || v.count != leafRows ||
+		len(v.data) != 18 || v.data[0] != 2 && v.data[0] != 3 {
+		return bad()
+	}
+	base := int64(binary.LittleEndian.Uint64(v.data[2:]))
+	step := int64(binary.LittleEndian.Uint64(v.data[10:]))
+	last, ok := rankAffineResearchAt(base, step, leafRows-1)
+	if !ok || step == 0 {
+		return bad()
+	}
+	for id := range 2 {
+		affix, ok := v.dictionaryEntry(id)
+		if !ok {
+			return bad()
+		}
+		for _, c := range affix {
+			if c >= '0' && c <= '9' {
+				return bad()
+			}
+		}
+	}
+	if v.data[0]&1 != 0 && (len(strconv.FormatInt(base, 10)) > int(v.data[1]) ||
+		len(strconv.FormatInt(last, 10)) > int(v.data[1])) {
+		return bad()
+	}
+	return v, nil
+}
+
+type rankAffineResearchStream struct {
+	view compactStreamView
+	rank bool
+}
+
+type rankAffineResearchPayload struct {
+	layout  CompactPrimaryStripeView
+	streams [][]rankAffineResearchStream
+}
+
+func rankAffineResearchExtent(payloadBytes int) int {
+	return (PageHeaderSize + payloadBytes + PageTrailerSize + int(physicalPageQuantum) - 1) &^
+		(int(physicalPageQuantum) - 1)
+}
+
+func rankAffineResearchOpenPayload(payload []byte) (rankAffineResearchPayload, error) {
+	bad := func() (rankAffineResearchPayload, error) {
+		return rankAffineResearchPayload{}, fmt.Errorf("invalid research rank-affine payload")
+	}
+	if len(payload) < compactPrimaryHeaderBytes || string(payload[:4]) != rankAffineResearchMagic {
+		return bad()
+	}
+	header := PageHeader{Generation: 1, PageSize: uint32(rankAffineResearchExtent(len(payload)))}
+	layout, err := openCompactPrimaryStripePayload(payload, header, unifiedTestStoreID(), 0,
+		CommonPrimaryLeafBounds{}, false, false)
+	if err != nil {
+		return bad()
+	}
+	out := rankAffineResearchPayload{layout: layout, streams: make([][]rankAffineResearchStream, layout.shapeCount)}
+	// Validate the unchanged production row maps/templates/slots/references by
+	// adapting only codec headers in a separate validation copy. This copy is
+	// NEVER used for reconstruction: interpreting rank data as shape ordinals
+	// would silently corrupt values. The real model below retains full counts.
+	validationCopy := bytes.Clone(payload)
+	copy(validationCopy, compactPrimaryMagic)
+	for shape := range layout.shapeCount {
+		entry, ok := layout.shapeEntry(shape)
+		if !ok {
+			return bad()
+		}
+		start := layout.shapeStart
+		if shape > 0 {
+			start += int(binary.LittleEndian.Uint32(layout.shapeDir[(shape-1)*4:]))
+		}
+		start += compactPrimaryShapeHeader + int(binary.LittleEndian.Uint32(payload[start+8:]))
+		raw := entry.streamRaw
+		out.streams[shape] = make([]rankAffineResearchStream, entry.template.holes)
+		for hole := range entry.template.holes {
+			bounds, ok := admittedCompactStream(raw)
+			if !ok {
+				return bad()
+			}
+			encoded := raw[:bounds.encoded]
+			rank := encoded[0] == rankAffineResearchKind
+			var stream compactStreamView
+			if rank {
+				stream, err = rankAffineResearchOpenStream(encoded, layout.rows)
+				validationCopy[start] = compactStreamPrefixInt
+				binary.LittleEndian.PutUint32(validationCopy[start+4:], uint32(entry.rows))
+			} else {
+				stream, err = openCompactStream(encoded)
+				if stream.count != entry.rows {
+					return bad()
+				}
+			}
+			if err != nil {
+				return bad()
+			}
+			out.streams[shape][hole] = rankAffineResearchStream{stream, rank}
+			start += bounds.encoded
+			raw = raw[bounds.encoded:]
+		}
+		if len(raw) != 0 {
+			return bad()
+		}
+	}
+	if _, err := openCompactPrimaryStripePayload(validationCopy, header, unifiedTestStoreID(), 0,
+		CommonPrimaryLeafBounds{}, true, false); err != nil {
+		return bad()
+	}
+	return out, nil
+}
+
+func (p *rankAffineResearchPayload) appendValue(dst []byte, row int) ([]byte, bool) {
+	if row < 0 || row >= p.layout.rows || p.layout.IsOverflow(row) {
+		return dst, false
+	}
+	shape := p.layout.rowShape(row)
+	entry, ok := p.layout.shapeEntry(shape)
+	if !ok {
+		return dst, false
+	}
+	ordinal := p.layout.shapeOrdinal(row, shape)
+	previous := uint32(0)
+	for hole, stream := range p.streams[shape] {
+		end := binary.LittleEndian.Uint32(entry.template.ends[hole*4:])
+		dst = append(dst, entry.template.static[previous:end]...)
+		coordinate := ordinal
+		if stream.rank {
+			coordinate = row
+		}
+		dst, ok = stream.view.appendValue(dst, coordinate)
+		if !ok {
+			return dst, false
+		}
+		previous = end
+	}
+	return append(dst, entry.template.static[previous:]...), true
+}
+
+type rankAffineResearchAttribution struct {
+	streams, values, eligible, replaced int
+	oldBytes, newBytes                  int
+}
+
+func rankAffineResearchKindName(kind uint8) string {
+	switch kind {
+	case compactStreamDictionary:
+		return "dictionary"
+	case compactStreamFront:
+		return "front"
+	case compactStreamFOR:
+		return "for"
+	case compactStreamDelta:
+		return "delta"
+	case compactStreamDate:
+		return "date"
+	case compactStreamPrefixInt:
+		return "prefix-int"
+	case compactStreamDeltaPack:
+		return "delta-pack"
+	case compactStreamAlphabet:
+		return "alphabet"
+	case rankAffineResearchKind:
+		return "rank-affine"
+	}
+	return fmt.Sprintf("unknown-%d", kind)
+}
+
+func rankAffineResearchAttribute(stats map[string]*rankAffineResearchAttribution, path string,
+	old compactStreamView, newRaw []byte, eligible, replaced bool) {
+	if stats == nil {
+		return
+	}
+	key := fmt.Sprintf("path=%s old=%s new=%s", path, rankAffineResearchKindName(old.kind),
+		rankAffineResearchKindName(newRaw[0]))
+	s := stats[key]
+	if s == nil {
+		s = new(rankAffineResearchAttribution)
+		stats[key] = s
+	}
+	s.streams++
+	s.values += old.count
+	s.oldBytes += old.encoded
+	s.newBytes += len(newRaw)
+	if eligible {
+		s.eligible++
+	}
+	if replaced {
+		s.replaced++
+	}
+}
+
+func rankAffineResearchPaths(t *testing.T, builder *UnifiedPrimaryLeafBuilder, shape int) []string {
+	t.Helper()
+	plan := builder.shapes[shape]
+	row := builder.rows[plan.firstRow]
+	paths := make([]string, plan.holes)
+	for hole := range paths {
+		paths[hole] = fmt.Sprintf("shape-%d/hole-%d", shape, hole)
+	}
+	// Paths identify measured bytes only; they never participate in admission.
+	for _, path := range []string{"/id", "/name", "/country", "/score", "/active", "/profile/tier",
+		"/profile/region", "/profile/joined", "/tags/0", "/tags/1", "/tags/2", "/tags/3", "/note",
+		"/sequence", "/timestamp", "/reverse", "/label", "/optional"} {
+		var resolver UnifiedHoleResolver
+		if err := resolver.SetPath([]byte(path)); err != nil {
+			t.Fatal(err)
+		}
+		start, end, found, err := resolver.PathSpanOf(builder.canonicalOf(plan.firstRow))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if found {
+			for hole, span := range builder.spans[row.spanStart:row.spanEnd] {
+				if span.Start == start && span.End == end {
+					paths[hole] = path
+				}
+			}
+		}
+	}
+	return paths
+}
+
+func rankAffineResearchRewrite(t *testing.T, records []CommonPrimaryLeafRecord,
+	builder *UnifiedPrimaryLeafBuilder, stats map[string]*rankAffineResearchAttribution) (oldRaw, newRaw []byte, replacements int) {
+	t.Helper()
+	borrowed, err := rankAffineResearchLegacyPayload(records, builder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldRaw = bytes.Clone(borrowed)
+	header := PageHeader{Generation: 1, PageSize: uint32(rankAffineResearchExtent(len(oldRaw)))}
+	old, err := openCompactPrimaryStripePayload(oldRaw, header, unifiedTestStoreID(), 0,
+		CommonPrimaryLeafBounds{}, true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newRaw = bytes.Clone(oldRaw[:old.shapeStart])
+	copy(newRaw, rankAffineResearchMagic)
+	keyStart := compactPrimaryHeaderBytes + 4*old.shapeCount
+	rankAffineResearchAttribute(stats, "$key", old.key, oldRaw[keyStart:keyStart+old.key.encoded], false, false)
+	shapeRows := make([][]int, old.shapeCount)
+	for row := range records {
+		if !old.IsOverflow(row) {
+			shapeRows[old.rowShape(row)] = append(shapeRows[old.rowShape(row)], row)
+		}
+	}
+	for shape := range old.shapeCount {
+		entry, ok := old.shapeEntry(shape)
+		if !ok {
+			t.Fatal("old shape entry")
+		}
+		paths := rankAffineResearchPaths(t, builder, shape)
+		oldStart := old.shapeStart
+		if shape > 0 {
+			oldStart += int(binary.LittleEndian.Uint32(old.shapeDir[(shape-1)*4:]))
+		}
+		templateBytes := int(binary.LittleEndian.Uint32(oldRaw[oldStart+8:]))
+		newStart := len(newRaw)
+		newRaw = append(newRaw, oldRaw[oldStart:oldStart+compactPrimaryShapeHeader+templateBytes]...)
+		streamStart := len(newRaw)
+		streamRaw := entry.streamRaw
+		values := make([][]byte, len(shapeRows[shape]))
+		for hole := range entry.template.holes {
+			stream, err := openCompactStream(streamRaw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for ordinal, rowIndex := range shapeRows[shape] {
+				row := builder.rows[rowIndex]
+				span := builder.spans[int(row.spanStart)+hole]
+				values[ordinal] = builder.canonicalOf(rowIndex)[span.Start:span.End]
+			}
+			candidate, eligible := rankAffineResearchCandidate(values, shapeRows[shape], len(records))
+			selected := streamRaw[:stream.encoded]
+			replaced := eligible && len(candidate) < len(selected)
+			// Retain the existing small-dictionary fast-scan preference.
+			if replaced && stream.kind == compactStreamDictionary &&
+				stream.dictCount <= compactDictionaryScanPreferred &&
+				len(selected) <= len(candidate)+len(candidate)/4 {
+				replaced = false
+			}
+			if replaced {
+				selected = candidate
+				replacements++
+			}
+			rankAffineResearchAttribute(stats, paths[hole], stream, selected, eligible, replaced)
+			newRaw = append(newRaw, selected...)
+			streamRaw = streamRaw[stream.encoded:]
+		}
+		binary.LittleEndian.PutUint32(newRaw[newStart+12:], uint32(len(newRaw)-streamStart))
+		binary.LittleEndian.PutUint32(newRaw[compactPrimaryHeaderBytes+shape*4:], uint32(len(newRaw)-old.shapeStart))
+	}
+	binary.LittleEndian.PutUint32(newRaw[24:], uint32(len(newRaw)-old.shapeStart))
+	newRaw = append(newRaw, old.summaryRaw...)
+	model, err := rankAffineResearchOpenPayload(newRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var oldValue, newValue, key []byte
+	for row := range records {
+		key, ok := model.layout.AppendKey(key[:0], row)
+		if !ok || !bytes.Equal(key, records[row].Key) {
+			t.Fatalf("key row %d mismatch", row)
+		}
+		if len(records) <= CommonPrimaryLeafWideSlots {
+			oldSlot, a := old.PostingSlot(row)
+			newSlot, b := model.layout.PostingSlot(row)
+			if !a || !b || oldSlot != newSlot {
+				t.Fatalf("posting slot row %d mismatch", row)
+			}
+		}
+		if old.IsOverflow(row) {
+			a, aOK := old.OverflowRef(row)
+			b, bOK := model.layout.OverflowRef(row)
+			if !aOK || !bOK || a != b || a != records[row].Value.Overflow {
+				t.Fatalf("overflow reference row %d mismatch", row)
+			}
+			continue
+		}
+		oldValue, ok = old.AppendValue(oldValue[:0], row)
+		if !ok || !bytes.Equal(oldValue, builder.canonicalOf(row)) {
+			t.Fatalf("original payload row %d mismatch", row)
+		}
+		newValue, ok = model.appendValue(newValue[:0], row)
+		if !ok || !bytes.Equal(newValue, oldValue) {
+			t.Fatalf("modeled payload row %d mismatch: got %s want %s", row, newValue, oldValue)
+		}
+	}
+	return oldRaw, newRaw, replacements
+}
+
+func TestCompactRankAffineResearchAdmission(t *testing.T) {
+	rankAffineResearchEnabled(t)
+	tests := []struct {
+		name   string
+		values []string
+		ranks  []int
+		rows   int
+		want   bool
+	}{
+		{"gaps", []string{"43", "49", "58", "70"}, []int{2, 4, 7, 11}, 12, true},
+		{"descending", []string{"186", "172", "151", "123"}, []int{2, 4, 7, 11}, 12, true},
+		{"padding", []string{"ticket:00043!", "ticket:00049!", "ticket:00058!"}, []int{2, 4, 7}, 12, true},
+		{"canonical-digit-boundary", []string{"9", "11", "14"}, []int{0, 2, 5}, 6, true},
+		{"20-digit-leading-zeros", []string{"id:00000000000000000009", "id:00000000000000000011"}, []int{0, 2}, 3, true},
+		{"signed-affix-exact", []string{"-5", "-7", "-11"}, []int{0, 1, 3}, 4, true},
+		{"escaped-affix-exact", []string{`"a\\b:0005!"`, `"a\\b:0007!"`, `"a\\b:0011!"`}, []int{0, 1, 3}, 4, true},
+		{"shuffled-values", []string{"43", "58", "49"}, []int{2, 4, 7}, 12, false},
+		{"almost-affine", []string{"43", "49", "58", "71"}, []int{2, 4, 7, 11}, 12, false},
+		{"ordinal-is-not-rank", []string{"100", "101", "102"}, []int{0, 1, 3}, 4, false},
+		{"nonintegral-step", []string{"10", "11"}, []int{0, 2}, 3, false},
+		{"affix-mismatch", []string{"a10", "b12"}, []int{0, 2}, 3, false},
+		{"padding-mismatch", []string{"a09", "a011"}, []int{0, 2}, 3, false},
+		{"20-digit-overflow", []string{"ticket:46000000000000000000", "ticket:46000000000000000002"}, []int{0, 2}, 3, false},
+		{"uint64-boundary", []string{"18446744073709551615", "18446744073709551616"}, []int{0, 1}, 2, false},
+		{"full-domain-overflow", []string{"9223372036854775806", "9223372036854775807"}, []int{0, 1}, 3, false},
+		{"multiplication-overflow", []string{"0", "9223372036854775807"}, []int{0, 1}, 4096, false},
+		{"negative-extrapolated-base", []string{"0", "1"}, []int{1, 2}, 3, false},
+		{"negative-extrapolated-end", []string{"2", "1"}, []int{0, 1}, 4, false},
+		{"fixed-width-full-domain", []string{"a08", "a09"}, []int{0, 1}, 100, false},
+		{"empty", nil, nil, 2, false},
+		{"single", []string{"123"}, []int{1}, 4, false},
+		{"constant", []string{"123", "123"}, []int{0, 2}, 3, false},
+		{"duplicate-rank", []string{"1", "2"}, []int{0, 0}, 2, false},
+		{"shuffled-ranks", []string{"2", "1"}, []int{1, 0}, 2, false},
+		{"rank-outside-leaf", []string{"1", "2"}, []int{0, 2}, 2, false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			values := make([][]byte, len(test.values))
+			for i, s := range test.values {
+				values[i] = []byte(s)
+			}
+			raw, ok := rankAffineResearchCandidate(values, test.ranks, test.rows)
+			if ok != test.want {
+				t.Fatalf("admitted=%v want=%v", ok, test.want)
+			}
+			if ok {
+				view, err := rankAffineResearchOpenStream(raw, test.rows)
+				if err != nil || view.count != test.rows {
+					t.Fatalf("full row domain: count=%d err=%v", view.count, err)
+				}
+				for i, row := range test.ranks {
+					got, valid := view.appendValue(nil, row)
+					if !valid || !bytes.Equal(got, values[i]) {
+						t.Fatalf("rank=%d got=%q want=%q", row, got, values[i])
+					}
+				}
+				if _, err := openCompactStream(raw); err == nil {
+					t.Fatal("production reader admitted a private research stream")
+				}
+				actualRaw := bytes.Clone(raw)
+				actualRaw[0] = compactStreamRankAffine
+				actual, err := openCompactStream(actualRaw)
+				if err != nil || !actual.matchesShapeRows(len(values), test.rows) {
+					t.Fatalf("actual-kind admission: %v", err)
+				}
+				for i, row := range test.ranks {
+					got, valid := actual.appendValue(nil, row)
+					if !valid || !bytes.Equal(got, values[i]) {
+						t.Fatalf("actual-kind rank=%d got=%q want=%q", row, got, values[i])
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestCompactRankAffineResearchMalformed(t *testing.T) {
+	rankAffineResearchEnabled(t)
+	raw, ok := rankAffineResearchCandidate([][]byte{[]byte("n:0012"), []byte("n:0018")}, []int{1, 4}, 8)
+	if !ok {
+		t.Fatal("valid malformed-test seed declined")
+	}
+	dataAt := compactStreamHeader + 4 + len("n:")
+	mutations := map[string]func([]byte) []byte{
+		"wrong-domain":      func(b []byte) []byte { binary.LittleEndian.PutUint32(b[4:], 2); return b },
+		"zero-domain":       func(b []byte) []byte { binary.LittleEndian.PutUint32(b[4:], 0); return b },
+		"unsupported-flags": func(b []byte) []byte { b[dataAt] = 7; return b },
+		"zero-width":        func(b []byte) []byte { b[dataAt+1] = 0; return b },
+		"narrow-width":      func(b []byte) []byte { b[dataAt+1] = 1; return b },
+		"negative-base":     func(b []byte) []byte { binary.LittleEndian.PutUint64(b[dataAt+2:], 1<<63); return b },
+		"endpoint-overflow": func(b []byte) []byte { binary.LittleEndian.PutUint64(b[dataAt+2:], math.MaxInt64); return b },
+		"minimum-step":      func(b []byte) []byte { binary.LittleEndian.PutUint64(b[dataAt+10:], 1<<63); return b },
+		"zero-step":         func(b []byte) []byte { clear(b[dataAt+10:]); return b },
+		"digit-affix":       func(b []byte) []byte { b[compactStreamHeader+4] = '1'; return b },
+		"bad-directory": func(b []byte) []byte {
+			binary.LittleEndian.PutUint16(b[compactStreamHeader:], math.MaxUint16)
+			return b
+		},
+		"trailing-byte": func(b []byte) []byte { return append(b, 0) },
+		"truncated":     func(b []byte) []byte { return b[:len(b)-1] },
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			if _, err := rankAffineResearchOpenStream(mutate(bytes.Clone(raw)), 8); err == nil {
+				t.Fatal("malformed descriptor admitted")
+			}
+			actualRaw := mutate(bytes.Clone(raw))
+			actualRaw[0] = compactStreamRankAffine
+			actual, err := openCompactStream(actualRaw)
+			// Self-delimiting streams allow a following stream. Exact enclosing
+			// length and full-leaf count are contextual admission requirements.
+			if err == nil && actual.encoded == len(actualRaw) && actual.matchesShapeRows(2, 8) {
+				t.Fatal("actual-kind malformed descriptor/domain admitted")
+			}
+		})
+	}
+}
+
+func TestCompactRankAffineResearchMixedPayloads(t *testing.T) {
+	rankAffineResearchEnabled(t)
+	for _, mode := range []string{"mixed", "overflow", "replacement", "delete", "insert", "shuffled"} {
+		t.Run(mode, func(t *testing.T) {
+			records := make([]CommonPrimaryLeafRecord, 192)
+			for row := range records {
+				sequence := row
+				if mode == "shuffled" {
+					sequence = row * 37 % len(records)
+				}
+				optional := ""
+				if row%5 < 2 {
+					optional = `,"optional":"yes"`
+				}
+				body := fmt.Appendf(nil, `{"id":%d,"sequence":%d,"timestamp":%d,"reverse":%d,"label":"event:%06d"%s}`,
+					row*17%101, sequence+100, 1700000000000+sequence*50, 9000-sequence*3, sequence+700, optional)
+				records[row] = CommonPrimaryLeafRecord{Key: fmt.Appendf(nil, "key:%04d", row),
+					Slot: uint8(row * 37), Value: CommonPrimaryLeafValue{Inline: body}}
+				if mode == "overflow" && row%7 == 0 {
+					records[row].Value = CommonPrimaryLeafValue{Overflow: PageRef{
+						Offset: uint64((row + 20) * 4096), Length: 4096, Generation: 1,
+						LogicalID: PrimaryFirstDynamicLogicalID + uint64(row) + 100, Kind: PageOverflow}}
+				}
+			}
+			if mode == "replacement" {
+				records[95].Value.Inline = []byte(`{"id":8,"sequence":999999,"timestamp":3,"reverse":100,"label":"event:000001","optional":"yes"}`)
+			}
+			if mode == "delete" {
+				records = append(records[:95], records[96:]...)
+			}
+			if mode == "insert" {
+				records = slices.Insert(records, 96, CommonPrimaryLeafRecord{Key: []byte("key:0095a"),
+					Value: CommonPrimaryLeafValue{Inline: []byte(`{"id":8,"sequence":999999,"timestamp":3,"reverse":100,"label":"event:000001"}`)}})
+				// The inserted row needs a new distinct posting slot; identity slots
+				// here keep this fixture focused on rank changes after insertion.
+				for row := range records {
+					records[row].Slot = uint8(row)
+				}
+			}
+			oldRaw, newRaw, replaced := rankAffineResearchRewrite(t, records, NewUnifiedPrimaryLeafBuilder(), nil)
+			if (mode == "mixed" || mode == "overflow") && replaced == 0 {
+				t.Fatal("expected affine fields across interspersed shapes")
+			}
+			if mode == "shuffled" && replaced != 0 {
+				t.Fatal("shuffled fields incorrectly admitted by name")
+			}
+			t.Logf("mode=%s rows=%d old_payload=%d new_payload=%d old_extent=%d new_extent=%d replaced=%d all_rows_exact=true",
+				mode, len(records), len(oldRaw), len(newRaw), rankAffineResearchExtent(len(oldRaw)), rankAffineResearchExtent(len(newRaw)), replaced)
+		})
+	}
+}
+
+// Frozen VCS1 writer and leaf planner from 837c68bf. These local functions
+// keep the before side deterministic after the production rank emitter lands.
+// The scalar-only legacy encode(values) has no physical-rank context.
+func rankAffineResearchLegacyPayload(records []CommonPrimaryLeafRecord, builder *UnifiedPrimaryLeafBuilder) ([]byte, error) {
+	if err := prepareCompactPrimaryStripe(records, builder); err != nil {
+		return nil, err
+	}
+	return rankAffineResearchLegacyPayloadRows(len(records), builder)
+}
+
+func rankAffineResearchLegacyPayloadRows(
+	rowCount int,
+	builder *UnifiedPrimaryLeafBuilder,
+) ([]byte, error) {
+	shapeCount := 0
+	for row := range rowCount {
+		shape := int(builder.rows[row].shape)
+		if shape >= 0 {
+			shapeCount = max(shapeCount, shape+1)
+		}
+	}
+	if shapeCount > rowCount ||
+		shapeCount > len(builder.shapes) || shapeCount > int(^uint16(0)) {
+		return nil, fmt.Errorf("%w: compact stripe shapes", ErrInvalidWrite)
+	}
+	overflowCount := 0
+	for row := range rowCount {
+		if _, overflow := builder.overflowAt(row); overflow {
+			overflowCount++
+		}
+	}
+	hasOverflow := overflowCount != 0
+	shapeWidth := 0
+	if hasOverflow {
+		shapeWidth = bits.Len(uint(shapeCount))
+	} else if shapeCount != 0 {
+		shapeWidth = bits.Len(uint(shapeCount - 1))
+	}
+	shapeCodeBytes := (rowCount*shapeWidth + 7) / 8
+	restarts := (rowCount + compactStreamRestart - 1) / compactStreamRestart
+	rankBytes64 := uint64(restarts) * uint64(shapeCount) * 2
+	if rankBytes64 > uint64(^uint32(0)) {
+		return nil, fmt.Errorf("%w: compact stripe rank checkpoints", ErrInvalidWrite)
+	}
+	rankBytes := int(rankBytes64)
+
+	scratch := &builder.compact
+	scratch.counts = slices.Grow(scratch.counts[:0], shapeCount)[:shapeCount]
+	clear(scratch.counts)
+	counts := scratch.counts
+	scratch.shapeCodes = slices.Grow(scratch.shapeCodes[:0], shapeCodeBytes)[:shapeCodeBytes]
+	clear(scratch.shapeCodes)
+	shapeCodes := scratch.shapeCodes
+	for row := range rowCount {
+		shape := int(builder.rows[row].shape)
+		if shape < 0 {
+			if _, overflow := builder.overflowAt(row); !overflow {
+				return nil, fmt.Errorf("%w: compact stripe row shape", ErrInvalidWrite)
+			}
+			compactPutBits(shapeCodes, row*shapeWidth, shapeWidth, uint64(shapeCount))
+			continue
+		}
+		if shape >= shapeCount {
+			return nil, fmt.Errorf("%w: compact stripe row shape", ErrInvalidWrite)
+		}
+		compactPutBits(shapeCodes, row*shapeWidth, shapeWidth, uint64(shape))
+		counts[shape]++
+	}
+	scratch.shapeEnds = slices.Grow(scratch.shapeEnds[:0], shapeCount)[:shapeCount]
+	shapeEnds := scratch.shapeEnds
+	rowsWithShape := uint16(0)
+	for shape := range shapeCount {
+		rowsWithShape += counts[shape]
+		shapeEnds[shape] = rowsWithShape
+	}
+	scratch.shapeOrder = slices.Grow(
+		scratch.shapeOrder[:0], int(rowsWithShape),
+	)[:rowsWithShape]
+	shapeOrder := scratch.shapeOrder
+	for shape := range shapeCount {
+		if shape == 0 {
+			counts[shape] = 0
+		} else {
+			counts[shape] = shapeEnds[shape-1]
+		}
+	}
+	for row := range rowCount {
+		shape := int(builder.rows[row].shape)
+		if shape >= 0 {
+			shapeOrder[counts[shape]] = uint16(row)
+			counts[shape]++
+		}
+	}
+
+	scratch.streamValues = slices.Grow(
+		scratch.streamValues[:0], rowCount,
+	)[:rowCount]
+	keys := scratch.streamValues
+	for row := range rowCount {
+		keys[row] = builder.keyAt(row)
+	}
+
+	headerBytes := compactPrimaryHeaderBytes + 4*shapeCount
+	scratch.payload = slices.Grow(scratch.payload[:0], headerBytes)[:headerBytes]
+	clear(scratch.payload)
+	payload := scratch.payload
+	copy(payload, compactPrimaryMagic)
+	binary.LittleEndian.PutUint32(payload[4:], uint32(rowCount))
+	binary.LittleEndian.PutUint16(payload[8:], uint16(shapeCount))
+	payload[10] = byte(shapeWidth)
+	if hasOverflow {
+		payload[11] = compactPrimaryHasOverflow
+	}
+	keyStart := len(payload)
+	keyEncoding := scratch.stream.encode(keys)
+	var err error
+	payload, err = keyEncoding.appendBinary(payload)
+	if err != nil {
+		return nil, err
+	}
+	binary.LittleEndian.PutUint32(payload[12:], uint32(len(payload)-keyStart))
+
+	slotStart := len(payload)
+	if rowCount <= CommonPrimaryLeafWideSlots {
+		anyNonZero := false
+		for row := range rowCount {
+			anyNonZero = anyNonZero || builder.slotAt(row) != 0
+		}
+		writeSlots := false
+		if anyNonZero {
+			for row := range rowCount {
+				if builder.slotAt(row) != uint8(row) {
+					writeSlots = true
+					break
+				}
+			}
+		}
+		if writeSlots {
+			var used [4]uint64
+			for row := range rowCount {
+				slot := builder.slotAt(row)
+				bit := uint64(1) << uint(slot&63)
+				if used[slot>>6]&bit != 0 {
+					return nil, fmt.Errorf("%w: compact stripe duplicate slot", ErrInvalidWrite)
+				}
+				used[slot>>6] |= bit
+				payload = append(payload, slot)
+			}
+		}
+	}
+	binary.LittleEndian.PutUint32(payload[16:], uint32(shapeCodeBytes))
+	binary.LittleEndian.PutUint32(payload[20:], uint32(rankBytes))
+	binary.LittleEndian.PutUint32(payload[28:], uint32(len(payload)-slotStart))
+	if hasOverflow {
+		bitmapBytes := (rowCount + 7) / 8
+		scratch.overflow = slices.Grow(scratch.overflow[:0], bitmapBytes)[:bitmapBytes]
+		clear(scratch.overflow)
+		for row := range rowCount {
+			if _, overflow := builder.overflowAt(row); overflow {
+				scratch.overflow[row>>3] |= byte(1) << uint(row&7)
+			}
+		}
+		payload = append(payload, scratch.overflow...)
+		for row := range rowCount {
+			if ref, overflow := builder.overflowAt(row); overflow {
+				start := len(payload)
+				payload = append(payload, make([]byte, PageRefSize)...)
+				encodePageRef(payload[start:], ref)
+			}
+		}
+	}
+	payload = append(payload, shapeCodes...)
+
+	clear(scratch.counts)
+	for block := 0; block < restarts; block++ {
+		for shape := range shapeCount {
+			var encoded [2]byte
+			binary.LittleEndian.PutUint16(encoded[:], counts[shape])
+			payload = append(payload, encoded[:]...)
+		}
+		first := block * compactStreamRestart
+		last := min(first+compactStreamRestart, rowCount)
+		for row := first; row < last; row++ {
+			shape := int(compactReadBits(shapeCodes, row*shapeWidth, shapeWidth))
+			if shape < shapeCount {
+				counts[shape]++
+			}
+		}
+	}
+
+	shapeDataStart := len(payload)
+	for shape := range shapeCount {
+		shapeStart := uint16(0)
+		if shape != 0 {
+			shapeStart = shapeEnds[shape-1]
+		}
+		shapeRows := shapeOrder[shapeStart:shapeEnds[shape]]
+		entryStart := len(payload)
+		payload = append(payload, make([]byte, compactPrimaryShapeHeader)...)
+		plan := &builder.shapes[shape]
+		binary.LittleEndian.PutUint32(payload[entryStart:], uint32(len(shapeRows)))
+		binary.LittleEndian.PutUint16(payload[entryStart+4:], uint16(plan.holes))
+
+		templateStart := len(payload)
+		payload = appendCompactPrimaryTemplate(payload, builder, plan)
+		templateBytes := len(payload) - templateStart
+		if templateBytes != plan.entryBytes {
+			return nil, fmt.Errorf("%w: compact stripe template drift", ErrInvalidWrite)
+		}
+		binary.LittleEndian.PutUint32(payload[entryStart+8:], uint32(templateBytes))
+
+		streamsStart := len(payload)
+		for _, encodedRow := range shapeRows {
+			rowIndex := int(encodedRow)
+			row := &builder.rows[rowIndex]
+			if int(row.spanEnd-row.spanStart) != plan.holes {
+				return nil, fmt.Errorf("%w: compact stripe hole count", ErrInvalidWrite)
+			}
+		}
+		scratch.streamValues = slices.Grow(
+			scratch.streamValues[:0], len(shapeRows),
+		)[:len(shapeRows)]
+		for hole := range plan.holes {
+			values := scratch.streamValues
+			for ordinal, encodedRow := range shapeRows {
+				rowIndex := int(encodedRow)
+				row := &builder.rows[rowIndex]
+				span := builder.spans[int(row.spanStart)+hole]
+				canonical := builder.canonicalOf(rowIndex)
+				values[ordinal] = canonical[span.Start:span.End]
+			}
+			stream := scratch.stream.encode(values)
+			payload, err = stream.appendBinary(payload)
+			if err != nil {
+				return nil, err
+			}
+		}
+		binary.LittleEndian.PutUint32(
+			payload[entryStart+12:], uint32(len(payload)-streamsStart),
+		)
+		binary.LittleEndian.PutUint32(
+			payload[compactPrimaryHeaderBytes+shape*4:], uint32(len(payload)-shapeDataStart),
+		)
+	}
+	shapeBytes := len(payload) - shapeDataStart
+	binary.LittleEndian.PutUint32(payload[24:], uint32(shapeBytes))
+	summaryStart := len(payload)
+	payload, err = appendPreparedCompactPrimarySummaries(payload, builder, rowCount)
+	if err != nil {
+		return nil, err
+	}
+	binary.LittleEndian.PutUint16(
+		payload[32:], uint16(len(builder.compactSummaryPointers)),
+	)
+	binary.LittleEndian.PutUint32(payload[36:], uint32(len(payload)-summaryStart))
+	scratch.payload = payload
+	return payload, nil
+}
+
+func rankAffineResearchLegacyPlans(
+	storeID [16]byte,
+	records []PrimaryGraphRecord,
+	maxRows, maxExtent int,
+	summaries []vibejson.CompiledPointer,
+) ([]primaryLeafPlan, error) {
+	if storeID == ([16]byte{}) || maxRows < 1 ||
+		maxRows > CompactPrimaryStripeMaxRows ||
+		maxExtent < int(physicalPageQuantum) || maxExtent > CommonPrimaryLeafMaxExtentBytes {
+		return nil, fmt.Errorf("%w: compact primary plan geometry", ErrInvalidWrite)
+	}
+	var plans []primaryLeafPlan
+	builder := NewUnifiedPrimaryLeafBuilder()
+	if err := builder.SetCompactPrimarySummaries(summaries); err != nil {
+		return nil, err
+	}
+	countHint := 0
+	for first := 0; first < len(records); {
+		hi := min(maxRows, len(records)-first)
+		window := records[first : first+hi]
+		placed := maxRows <= CommonPrimaryLeafWideSlots
+		if err := prepareCompactPrimaryGraphStripe(window, placed, builder); err != nil {
+			return nil, err
+		}
+		builtCount := 0
+		var builtPayload []byte
+		fits := func(count int) (int, bool, error) {
+			// A failed larger probe may have reused the builder's payload backing
+			// array before returning. Invalidate the preceding borrowed result so
+			// final selection rebuilds it rather than retaining mutated scratch.
+			builtCount = 0
+			payload, err := rankAffineResearchLegacyPayloadRows(count, builder)
+			if err == ErrCommonPrimaryLeafFull {
+				return maxExtent + int(physicalPageQuantum), false, nil
+			}
+			if err != nil {
+				return 0, false, err
+			}
+			builtCount, builtPayload = count, payload
+			need := PageHeaderSize + len(payload) + PageTrailerSize
+			quantum := int(physicalPageQuantum)
+			extent := (need + quantum - 1) &^ (quantum - 1)
+			return extent, extent <= maxExtent, nil
+		}
+		count, extent := 0, 0
+		if countHint == 0 {
+			// Prove the common complete-window case before paying a search. The
+			// first oversized window establishes the exact hint used below.
+			candidate, fullWindowFits, err := fits(hi)
+			if err != nil {
+				return nil, err
+			}
+			if fullWindowFits {
+				count, extent = hi, candidate
+			}
+			for lo, high := 1, hi-1; count != hi && lo <= high; {
+				mid := (lo + high) / 2
+				candidate, ok, err := fits(mid)
+				if err != nil {
+					return nil, err
+				}
+				if ok {
+					count, extent = mid, candidate
+					lo = mid + 1
+				} else {
+					high = mid - 1
+				}
+			}
+		} else {
+			// Neighbouring ordered leaves normally have similar encoded density.
+			// Probe the preceding exact count, expand until one fitting and one
+			// failing bound are proved, then binary-search only that bracket. A
+			// phase change merely expands farther; it cannot change the selected
+			// largest prefix.
+			probe := min(countHint, hi)
+			candidate, ok, err := fits(probe)
+			if err != nil {
+				return nil, err
+			}
+			step := max(countHint/8, 1)
+			failed := hi + 1
+			if ok {
+				count, extent = probe, candidate
+				for count < hi {
+					next := min(hi, count+step)
+					candidate, ok, err = fits(next)
+					if err != nil {
+						return nil, err
+					}
+					if !ok {
+						failed = next
+						break
+					}
+					count, extent = next, candidate
+					step = min(step*2, hi)
+				}
+			} else {
+				failed = probe
+				for count == 0 {
+					next := max(1, failed-step)
+					candidate, ok, err = fits(next)
+					if err != nil {
+						return nil, err
+					}
+					if ok {
+						count, extent = next, candidate
+						break
+					}
+					if next == 1 {
+						break
+					}
+					failed = next
+					step = min(step*2, hi)
+				}
+			}
+			for lo, high := count+1, failed-1; count != 0 && lo <= high; {
+				mid := (lo + high) / 2
+				candidate, ok, err = fits(mid)
+				if err != nil {
+					return nil, err
+				}
+				if ok {
+					count, extent = mid, candidate
+					lo = mid + 1
+				} else {
+					high = mid - 1
+				}
+			}
+		}
+		if count == 0 {
+			return nil, fmt.Errorf("%w: compact primary record exceeds extent", ErrInvalidWrite)
+		}
+		if builtCount != count {
+			var err error
+			builtPayload, err = rankAffineResearchLegacyPayloadRows(count, builder)
+			if err != nil {
+				return nil, err
+			}
+		}
+		need := PageHeaderSize + len(builtPayload) + PageTrailerSize
+		plannedExtent := (need + int(physicalPageQuantum) - 1) &^ (int(physicalPageQuantum) - 1)
+		if plannedExtent != extent || plannedExtent > maxExtent {
+			return nil, fmt.Errorf("%w: compact primary plan drift", ErrInvalidWrite)
+		}
+		plan := primaryLeafPlan{
+			first: first, last: first + count,
+			class:  CommonPrimaryLeafCompact,
+			extent: extent,
+		}
+		if len(builtPayload) <= count*primaryLeafPlanRecordBytes {
+			plan.payload = append([]byte(nil), builtPayload...)
+		}
+		plans = append(plans, plan)
+		countHint = count
+		first += count
+	}
+	return plans, nil
+}
+
+func rankAffineResearchActualView(t *testing.T, records []CommonPrimaryLeafRecord) CompactPrimaryStripeView {
+	t.Helper()
+	_, payload, replaced := rankAffineResearchRewrite(t, records, NewUnifiedPrimaryLeafBuilder(), nil)
+	if replaced == 0 {
+		t.Fatal("actual-kind fixture needs selected rank-affine streams")
+	}
+	model, err := rankAffineResearchOpenPayload(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for shape := range model.layout.shapeCount {
+		entry := model.layout.shapeStart
+		if shape > 0 {
+			entry += int(binary.LittleEndian.Uint32(model.layout.shapeDir[(shape-1)*4:]))
+		}
+		cursor := entry + compactPrimaryShapeHeader + int(binary.LittleEndian.Uint32(payload[entry+8:]))
+		for _, stream := range model.streams[shape] {
+			if stream.rank {
+				payload[cursor] = compactStreamRankAffine
+			}
+			cursor += stream.view.encoded
+		}
+	}
+	copy(payload, compactPrimaryMagic)
+	extent := rankAffineResearchExtent(len(payload))
+	page, err := encodeCompactPrimaryStripePayload(make([]byte, extent), CommonPrimaryLeafHeader{
+		StoreID: unifiedTestStoreID(), Generation: 1, Bucket: 0, PageSize: uint32(extent),
+	}, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logicalID, _ := CommonPrimaryLeafLogicalID(0)
+	view, err := OpenCompactPrimaryStripe(page, unifiedTestStoreID(), 0, PageRef{
+		Offset: 4096, Length: uint32(extent), LogicalID: logicalID, Generation: 1, Kind: PagePrimaryLeaf,
+	}, 1, unifiedTestBounds())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return view
+}
+
+func rankAffineResearchActualFixture() ([]CommonPrimaryLeafRecord, [][2]int64, [][]byte) {
+	const rows = 512
+	records := make([]CommonPrimaryLeafRecord, rows)
+	numbers := make([][2]int64, rows)
+	labels := make([][]byte, rows)
+	for row := range records {
+		shape := 0
+		extra := ""
+		if row%5 < 2 {
+			shape, extra = 1, `,"optional":"yes"`
+		}
+		if row%64 < 2 {
+			shape, extra = 2, `,"rare":{"enabled":true}`
+		}
+		numbers[row] = [2]int64{int64(100 + shape*1000 + row*(shape+2)), int64(10000 + shape*1000 - row*(shape+2))}
+		labels[row] = fmt.Appendf(nil, `"event:%08d"`, 100+shape*1000+row*(shape+2))
+		records[row] = CommonPrimaryLeafRecord{Key: fmt.Appendf(nil, "row:%04d", row), Value: CommonPrimaryLeafValue{
+			Inline: fmt.Appendf(nil, `{"sequence":%d,"reverse":%d,"label":%s%s}`,
+				numbers[row][0], numbers[row][1], labels[row], extra),
+		}}
+	}
+	return records, numbers, labels
+}
+
+func TestCompactRankAffineResearchActualConsumers(t *testing.T) {
+	rankAffineResearchEnabled(t)
+	records, numbers, labels := rankAffineResearchActualFixture()
+	view := rankAffineResearchActualView(t, records)
+	var scan CompactPrimaryScanDecoder
+	for _, stride := range []int{1, 31, 1} {
+		for row := 0; row < len(records); row += stride {
+			canonical, err := vibejson.AppendCanonicalize(nil, records[row].Value.Inline)
+			if err != nil {
+				t.Fatal(err)
+			}
+			point, ok := view.AppendValue(nil, row)
+			if !ok || !bytes.Equal(point, canonical) {
+				t.Fatalf("actual point rank=%d mismatch", row)
+			}
+			shape := view.rowShape(row)
+			sequential, ok := scan.appendValue(nil, &view, 0, row, shape, view.shapeOrdinal(row, shape))
+			if !ok || !bytes.Equal(sequential, canonical) {
+				t.Fatalf("actual scan rank=%d mismatch", row)
+			}
+			if size, ok := view.valueLength(row); !ok || size != len(canonical) {
+				t.Fatalf("actual valueLength rank=%d size=%d", row, size)
+			}
+		}
+	}
+	resolvers := make([]*UnifiedHoleResolver, 3)
+	for i, path := range []string{"/sequence", "/reverse", "/label"} {
+		resolvers[i] = new(UnifiedHoleResolver)
+		if err := resolvers[i].SetPath([]byte(path)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for field := range 2 {
+		resolver := resolvers[field]
+		minimum, maximum := int64(math.MaxInt64), int64(math.MinInt64)
+		for row := range records {
+			minimum = min(minimum, numbers[row][field])
+			maximum = max(maximum, numbers[row][field])
+		}
+		extrema, ok := view.CountResolvedIntegerExtrema(resolver)
+		if !ok || !extrema.Found || extrema.Min != minimum || extrema.Max != maximum {
+			t.Fatalf("actual extrema field=%d got=%+v supported=%v want=%d,%d", field, extrema, ok, minimum, maximum)
+		}
+		for _, needle := range []int64{math.MinInt64, -1, 0, 99, 100, 101, 105, 140, 1000, 1100, 2000, 5000, 9000, 10000, 12000, math.MaxInt64} {
+			wantEqual := 0
+			for row := range records {
+				if numbers[row][field] == needle {
+					wantEqual++
+				}
+			}
+			if got, ok := view.CountResolvedIntegerEqual(resolver, needle); !ok || got != wantEqual {
+				t.Fatalf("actual equal field=%d needle=%d got=%d supported=%v want=%d", field, needle, got, ok, wantEqual)
+			}
+			if got, _, _, ok := view.CountResolvedNumberEqual(resolver, strconv.AppendInt(nil, needle, 10), needle, true, nil, nil); !ok || got != wantEqual {
+				t.Fatalf("actual number equal field=%d needle=%d got=%d supported=%v want=%d", field, needle, got, ok, wantEqual)
+			}
+			for _, op := range []UnifiedIntegerOrder{UnifiedIntegerLess, UnifiedIntegerLessEqual, UnifiedIntegerGreater, UnifiedIntegerGreaterEqual} {
+				want := 0
+				for row := range records {
+					value := numbers[row][field]
+					if op == UnifiedIntegerLess && value < needle || op == UnifiedIntegerLessEqual && value <= needle ||
+						op == UnifiedIntegerGreater && value > needle || op == UnifiedIntegerGreaterEqual && value >= needle {
+						want++
+					}
+				}
+				if got, ok := view.CountResolvedIntegerOrdered(resolver, needle, op); !ok || got != want {
+					t.Fatalf("actual ordered field=%d needle=%d op=%d got=%d supported=%v want=%d", field, needle, op, got, ok, want)
+				}
+			}
+		}
+		for _, interval := range []UnifiedIntegerInterval{{Lower: 100, Upper: 100}, {Lower: 100, Upper: 2000},
+			{Lower: 9000, Upper: 11000}, {Lower: -1, UpperUnbounded: true}, {Lower: math.MaxInt64, UpperUnbounded: true}} {
+			want := 0
+			for row := range records {
+				value := numbers[row][field]
+				if value >= interval.Lower && (interval.UpperUnbounded || value < interval.Upper) {
+					want++
+				}
+			}
+			if got, ok := view.CountResolvedIntegerInterval(resolver, interval); !ok || got != want {
+				t.Fatalf("actual interval field=%d interval=%+v got=%d supported=%v want=%d", field, interval, got, ok, want)
+			}
+		}
+	}
+	for _, row := range []int{0, 1, 63, 64, 65, 73, 129, 511} {
+		want := 0
+		for _, label := range labels {
+			if bytes.Equal(label, labels[row]) {
+				want++
+			}
+		}
+		if got, _, ok := view.CountResolvedSpellingEqual(resolvers[2], labels[row], nil); !ok || got != want {
+			t.Fatalf("actual spelling row=%d got=%d supported=%v want=%d", row, got, ok, want)
+		}
+		got, found, ok := view.AppendResolvedHole(nil, row, resolvers[2])
+		if !ok || !found || !bytes.Equal(got, labels[row]) {
+			t.Fatalf("actual resolved label row=%d got=%q", row, got)
+		}
+	}
+	filter, err := NewUnifiedProjectionFilter([][]byte{[]byte("/sequence"), []byte("/reverse"), []byte("/label")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	callbacks := 0
+	supported, stopped, _, err := view.VisitResolvedProjection(filter.resolvers,
+		make([]int, 128), make([]UnifiedProjectionShapeWorkspace, view.shapeCount),
+		make([]UnifiedProjectionStreamWorkspace, view.shapeCount*3), make([]UnifiedProjectionField, 3),
+		make([]byte, 0, 256), -1, func(row int, fields []UnifiedProjectionField) error {
+			callbacks++
+			if fields[0].Kind != UnifiedProjectionFieldInteger || fields[0].Integer != numbers[row][0] ||
+				fields[1].Kind != UnifiedProjectionFieldInteger || fields[1].Integer != numbers[row][1] ||
+				!bytes.Equal(fields[2].AppendJSON(nil), labels[row]) {
+				t.Fatalf("actual native projection row=%d fields=%+v", row, fields)
+			}
+			return nil
+		})
+	if err != nil || !supported || stopped || callbacks != len(records) {
+		t.Fatalf("actual projection supported=%v callbacks=%d err=%v", supported, callbacks, err)
+	}
+	callbacks = 0
+	supported, err = view.VisitResolvedIntegerGroups(resolvers[0], resolvers[1], make([]int, 128),
+		make([]IntegerGroupShapeWorkspace, view.shapeCount), func(row int, group, sum int64) error {
+			callbacks++
+			if group != numbers[row][0] || sum != numbers[row][1] {
+				t.Fatalf("actual native groups row=%d got=%d,%d", row, group, sum)
+			}
+			return nil
+		})
+	if err != nil || !supported || callbacks != len(records) {
+		t.Fatalf("actual groups supported=%v callbacks=%d err=%v", supported, callbacks, err)
+	}
+	// Reject an otherwise valid descriptor with a different full-leaf count.
+	malformed := bytes.Clone(view.page)
+	entry, _ := view.shapeEntry(0)
+	firstStream := view.shapeStart + compactPrimaryShapeHeader +
+		int(binary.LittleEndian.Uint32(view.payload[view.shapeStart+8:]))
+	if entry.rows == view.rows {
+		t.Fatal("wrong-domain fixture must have multiple shapes")
+	}
+	binary.LittleEndian.PutUint32(malformed[PageHeaderSize+firstStream+4:], uint32(entry.rows))
+	if _, err := SealPage(malformed); err != nil {
+		t.Fatal(err)
+	}
+	logicalID, _ := CommonPrimaryLeafLogicalID(0)
+	if _, err := OpenCompactPrimaryStripe(malformed, unifiedTestStoreID(), 0, PageRef{
+		Offset: 4096, Length: uint32(len(malformed)), LogicalID: logicalID, Generation: 1, Kind: PagePrimaryLeaf,
+	}, 1, unifiedTestBounds()); err == nil {
+		t.Fatal("actual page admitted shape count in place of full-leaf count with a valid checksum")
+	}
+}
+
+func TestCompactRankAffineResearchActualPatch(t *testing.T) {
+	rankAffineResearchEnabled(t)
+	records, _, _ := rankAffineResearchActualFixture()
+	view := rankAffineResearchActualView(t, records)
+	wanted := make([][]byte, len(records))
+	for row := range records {
+		var ok bool
+		wanted[row], ok = view.AppendValue(nil, row)
+		if !ok {
+			t.Fatal("actual patch original row")
+		}
+	}
+	var replacements []CommonPrimaryUnifiedReplacement
+	for i, row := range []int{73, 65, 80} {
+		var resolver UnifiedHoleResolver
+		path, replacement := "/sequence", []byte("777777")
+		if i == 2 {
+			path, replacement = "/reverse", []byte("88888888")
+		}
+		if err := resolver.SetPath([]byte(path)); err != nil {
+			t.Fatal(err)
+		}
+		start, end, found, err := resolver.PathSpanOf(wanted[row])
+		if err != nil || !found {
+			t.Fatal("actual patch target")
+		}
+		updated := append(bytes.Clone(wanted[row][:start]), replacement...)
+		updated = append(updated, wanted[row][end:]...)
+		certificate := unifiedScalarCanonicalIndex(t, updated)
+		patch, _, resolved, err := view.PatchStableCanonicalReplacementScalarPatch(records[row].Key, uint8(row),
+			certificate, make([]byte, 0, len(updated)))
+		if err != nil || !resolved || !patch.valid() || patch.exact() {
+			t.Fatalf("actual scalar certificate rank=%d resolved=%v err=%v", row, resolved, err)
+		}
+		replacements = append(replacements, CommonPrimaryUnifiedReplacement{Key: records[row].Key,
+			Value: updated, ScalarPatch: patch})
+		wanted[row] = updated
+	}
+	page, ok, err := view.PatchCompactPrimaryStripeReplacements(make([]byte, CommonPrimaryLeafMaxExtentBytes),
+		2, replacements, NewUnifiedPrimaryLeafBuilder())
+	if err != nil || !ok {
+		t.Fatalf("actual patch accepted=%v err=%v", ok, err)
+	}
+	logicalID, _ := CommonPrimaryLeafLogicalID(0)
+	patched, err := OpenCompactPrimaryStripe(page, unifiedTestStoreID(), 0, PageRef{
+		Offset: 4096, Length: uint32(len(page)), LogicalID: logicalID, Generation: 2, Kind: PagePrimaryLeaf,
+	}, 2, unifiedTestBounds())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for row := range records {
+		got, ok := patched.AppendValue(nil, row)
+		if !ok || !bytes.Equal(got, wanted[row]) {
+			t.Fatalf("actual patched rank=%d got=%s want=%s", row, got, wanted[row])
+		}
+		old, ok := view.AppendValue(nil, row)
+		canonical, err := vibejson.AppendCanonicalize(nil, records[row].Value.Inline)
+		if err != nil || !ok || !bytes.Equal(old, canonical) {
+			t.Fatalf("actual old snapshot changed at rank=%d", row)
+		}
+	}
+}
+
+type rankAffineResearchGraphTotals struct {
+	leafPayload, leafBytes, graphBytes, pages, rankStreams int
+	kinds                                                  map[PageKind]int
+}
+
+// Build both complete graphs into the same existing in-memory page sink.
+// Every extent has real framing/checksums; no durable file, sidecar, or
+// background task is created. Frozen plans retain all legacy payloads so a
+// production rebuild cannot silently change the before side.
+func rankAffineResearchGraphCensus(t *testing.T, plan *PrimaryGraphPlan) rankAffineResearchGraphTotals {
+	t.Helper()
+	sink := &incrementalPrimaryTestSink{next: 16 << 10}
+	if _, err := BuildPlannedPrimaryGraphToSink(sink, plan, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.pages) != plan.PageCount() {
+		t.Fatalf("graph page count=%d planned=%d", len(sink.pages), plan.PageCount())
+	}
+	total := rankAffineResearchGraphTotals{pages: len(sink.pages), kinds: make(map[PageKind]int)}
+	leaf := 0
+	var key, value, canonical []byte
+	for i, page := range sink.pages {
+		header, payload, err := OpenPage(page)
+		if err != nil || header.Kind != sink.refs[i].Kind || header.PageSize != uint32(len(page)) {
+			t.Fatalf("graph page %d framing/checksum err=%v", i, err)
+		}
+		total.graphBytes += len(page)
+		total.kinds[header.Kind] += len(page)
+		if header.Kind != PagePrimaryLeaf {
+			continue
+		}
+		leafPlan := plan.leaves[leaf]
+		bucket, ok := MakeTabletLocalIdentityBucket(uint32(leaf/TabletLocalIdentityLocalCount), uint32(leaf%TabletLocalIdentityLocalCount))
+		if !ok {
+			t.Fatal("graph census bucket")
+		}
+		view, err := OpenCompactPrimaryStripe(page, testStoreID, BucketID(bucket), sink.refs[i], 7,
+			CommonPrimaryLeafBounds{FileEnd: sink.next, NextLogicalID: PrimaryFirstDynamicLogicalID + 1<<20, AllocationQuantum: 4096})
+		if err != nil || view.rows != leafPlan.last-leafPlan.first {
+			t.Fatalf("graph census leaf=%d rows=%d err=%v", leaf, view.rows, err)
+		}
+		for shape := range view.shapeCount {
+			entry, _ := view.shapeEntry(shape)
+			raw := entry.streamRaw
+			for range entry.template.holes {
+				stream, err := openCompactStream(raw)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if stream.kind == compactStreamRankAffine {
+					total.rankStreams++
+				}
+				raw = raw[stream.encoded:]
+			}
+		}
+		for row := range view.rows {
+			original := plan.records[leafPlan.first+row]
+			key, ok = view.AppendKey(key[:0], row)
+			if !ok || string(key) != original.Key {
+				t.Fatalf("graph census leaf=%d row=%d key mismatch", leaf, row)
+			}
+			value, ok = view.AppendValue(value[:0], row)
+			canonical, err = vibejson.AppendCanonicalize(canonical[:0], original.valueBytes())
+			if !ok || err != nil || !bytes.Equal(value, canonical) {
+				t.Fatalf("graph census leaf=%d row=%d value mismatch", leaf, row)
+			}
+		}
+		total.leafPayload += len(payload)
+		total.leafBytes += len(page)
+		leaf++
+	}
+	if leaf != len(plan.leaves) || uint64(total.graphBytes+16<<10) != sink.next {
+		t.Fatal("graph census totals drift")
+	}
+	return total
+}
+
+func TestCompactRankAffineResearchCensus(t *testing.T) {
+	rankAffineResearchEnabled(t)
+	const rows = 100_000
+	for _, high := range []bool{false, true} {
+		name := "low"
+		if high {
+			name = "high"
+		}
+		t.Run(name, func(t *testing.T) {
+			corpus := benchcorpus.Corpus(rows, high)
+			graph := make([]PrimaryGraphRecord, rows)
+			for i, doc := range corpus {
+				graph[i] = BorrowPrimaryGraphRecord([]byte(doc.Key), doc.JSON)
+			}
+			plans, err := rankAffineResearchLegacyPlans(unifiedTestStoreID(), graph,
+				CompactPrimaryStripeMaxRows, CommonPrimaryLeafMaxExtentBytes, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			builder := NewUnifiedPrimaryLeafBuilder()
+			stats := make(map[string]*rankAffineResearchAttribution)
+			oldPayload, newPayload, oldExtent, newExtent, replaced := 0, 0, 0, 0, 0
+			cuts := make([]string, 0, len(plans))
+			for planIndex, plan := range plans {
+				records := make([]CommonPrimaryLeafRecord, plan.last-plan.first)
+				for i := range records {
+					doc := corpus[plan.first+i]
+					records[i] = CommonPrimaryLeafRecord{Key: []byte(doc.Key), Value: CommonPrimaryLeafValue{Inline: doc.JSON}}
+				}
+				oldRaw, newRaw, count := rankAffineResearchRewrite(t, records, builder, stats)
+				plans[planIndex].payload = oldRaw
+				if rankAffineResearchExtent(len(oldRaw)) != plan.extent {
+					t.Fatal("original leaf cut/extent drift")
+				}
+				oldPayload += len(oldRaw)
+				newPayload += len(newRaw)
+				oldExtent += rankAffineResearchExtent(len(oldRaw))
+				newExtent += rankAffineResearchExtent(len(newRaw))
+				replaced += count
+				cuts = append(cuts, fmt.Sprintf("%d:%d:%d:%d", plan.first, plan.last,
+					rankAffineResearchExtent(len(oldRaw)), rankAffineResearchExtent(len(newRaw))))
+			}
+			keys := make([]string, 0, len(stats))
+			for key := range stats {
+				keys = append(keys, key)
+			}
+			slices.Sort(keys)
+			streamSaved := 0
+			for _, key := range keys {
+				s := stats[key]
+				streamSaved += s.oldBytes - s.newBytes
+				t.Logf("%s streams=%d values=%d eligible=%d replaced=%d old_bytes=%d new_bytes=%d saved_bytes=%d",
+					key, s.streams, s.values, s.eligible, s.replaced, s.oldBytes, s.newBytes, s.oldBytes-s.newBytes)
+			}
+			if streamSaved != oldPayload-newPayload || replaced == 0 {
+				t.Fatal("stream attribution does not reconcile to exact payload")
+			}
+			t.Logf("CENSUS corpus=%s rows=%d leaves=%d old_payload=%d new_payload=%d payload_saved=%d payload_saved_pct=%.6f old_extent=%d new_extent=%d extent_saved=%d extent_saved_pct=%.6f payload_saved_per_row=%.6f replaced_streams=%d all_rows_exact=true repacked=false",
+				name, rows, len(plans), oldPayload, newPayload, oldPayload-newPayload,
+				100*float64(oldPayload-newPayload)/float64(oldPayload), oldExtent, newExtent, oldExtent-newExtent,
+				100*float64(oldExtent-newExtent)/float64(oldExtent), float64(oldPayload-newPayload)/rows, replaced)
+			t.Logf("FIXED_CUTS first:last:old_extent:new_extent=%v", cuts)
+			oldPages, err := primaryGraphPageCountForLeaves(len(plans))
+			if err != nil {
+				t.Fatal(err)
+			}
+			oldPlan := PrimaryGraphPlan{storeID: testStoreID, records: graph, leaves: plans, pages: oldPages}
+			oldGraph := rankAffineResearchGraphCensus(t, &oldPlan)
+			if oldGraph.leafPayload != oldPayload || oldGraph.leafBytes != oldExtent || oldGraph.rankStreams != 0 {
+				t.Fatal("frozen complete graph differs from fixed-cut legacy bytes")
+			}
+			productionPlan, err := PlanPrimaryGraph(testStoreID, graph, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			production := rankAffineResearchGraphCensus(t, &productionPlan)
+			if production.rankStreams == 0 {
+				t.Fatal("production census did not exercise the rank-affine emitter")
+			}
+			t.Logf("PRODUCTION_REPACKED corpus=%s rows=%d old_leaves=%d new_leaves=%d old_payload=%d new_payload=%d old_leaf_extent=%d new_leaf_extent=%d leaf_extent_saved=%d old_graph_pages=%d new_graph_pages=%d old_graph_extent=%d new_graph_extent=%d graph_extent_saved=%d graph_extent_saved_pct=%.6f prefix_bytes=%d old_primary_with_prefix=%d new_primary_with_prefix=%d primary_saved_pct=%.6f rank_streams=%d all_rows_exact=true repacked=true",
+				name, rows, len(plans), len(productionPlan.leaves), oldGraph.leafPayload, production.leafPayload,
+				oldGraph.leafBytes, production.leafBytes, oldGraph.leafBytes-production.leafBytes, oldGraph.pages, production.pages,
+				oldGraph.graphBytes, production.graphBytes, oldGraph.graphBytes-production.graphBytes,
+				100*float64(oldGraph.graphBytes-production.graphBytes)/float64(oldGraph.graphBytes), 16<<10,
+				oldGraph.graphBytes+16<<10, production.graphBytes+16<<10,
+				100*float64(oldGraph.graphBytes-production.graphBytes)/float64(oldGraph.graphBytes+16<<10), production.rankStreams)
+			kinds := make([]int, 0, len(oldGraph.kinds))
+			for kind := range oldGraph.kinds {
+				kinds = append(kinds, int(kind))
+			}
+			slices.Sort(kinds)
+			for _, kind := range kinds {
+				t.Logf("GRAPH_KIND corpus=%s kind=%d old_bytes=%d new_bytes=%d", name, kind,
+					oldGraph.kinds[PageKind(kind)], production.kinds[PageKind(kind)])
+			}
+			productionCuts := make([]string, 0, len(productionPlan.leaves))
+			for _, plan := range productionPlan.leaves {
+				productionCuts = append(productionCuts, fmt.Sprintf("%d:%d:%d", plan.first, plan.last, plan.extent))
+			}
+			t.Logf("PRODUCTION_CUTS first:last:extent=%v", productionCuts)
+		})
+	}
+}

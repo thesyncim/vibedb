@@ -228,3 +228,58 @@ func TestBoundPlanAdmissionRollsBackAllPreparedExecutorsBeforeVisibility(t *test
 		t.Fatal("failed activation remained visible")
 	}
 }
+
+func TestSourceActionGrantSurvivesLeaderChangeWithoutChangingChildScope(t *testing.T) {
+	plan, catalog, _, _ := testPlan(t)
+	state := testSourceState(plan)
+	observed := Observation{Catalog: catalog, SourceState: state}
+	observed.SourceStatus.MemberID = 1
+	action := Action{Kind: ActionBuildArtifacts}
+	first, err := remoteActionTarget(plan, observed, action)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observed.SourceStatus.MemberID = 2
+	second, err := remoteActionTarget(plan, observed, action)
+	if err != nil || first != second || first.Member != 0 {
+		t.Fatalf("source target changed on election: %v", err)
+	}
+	admission, err := NewPlanAdmission(catalog, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	local := first
+	local.Member = 2
+	grant := ShardActionGrant{Operation: plan.OperationID(), PlanDigest: admission.PlanDigest, Target: local, Plan: plan, Observer: &testPlanObserver{}, Executor: new(recordingShardActionExecutor), Actions: sourceSplitActionMask()}
+	grants, _ := NewDynamicShardActionGrants(1)
+	if err := grants.Install([]ShardActionGrant{grant}); err != nil {
+		t.Fatal(err)
+	}
+	resolved, ok := grants.resolve(plan.OperationID(), admission.PlanDigest, first)
+	if !ok || resolved.Actions != actionBit(ActionBuildArtifacts) {
+		t.Fatal("group grant must authorize only artifact recovery")
+	}
+	for _, kind := range []ActionKind{ActionStartCapture, ActionCatchUpTail, ActionSealSource, ActionCertifyCutover} {
+		target, err := remoteActionTarget(plan, observed, Action{Kind: kind})
+		if err != nil || target.Member != 2 {
+			t.Fatalf("action %d lost its exact evidence owner: target=%+v err=%v", kind, target, err)
+		}
+	}
+	changed := first
+	changed.Authority.ProtectionEpoch++
+	if _, ok := grants.resolve(plan.OperationID(), admission.PlanDigest, changed); ok {
+		t.Fatal("changed authority accepted")
+	}
+	changed = first
+	changed.Member = 3
+	if _, ok := grants.resolve(plan.OperationID(), admission.PlanDigest, changed); ok {
+		t.Fatal("another exact member accepted")
+	}
+	grant.Actions = childSplitActionMask()
+	if err := grants.Install([]ShardActionGrant{grant}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := grants.resolve(plan.OperationID(), admission.PlanDigest, first); ok {
+		t.Fatal("child grant became group-scoped")
+	}
+}

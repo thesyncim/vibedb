@@ -1,4 +1,5 @@
 disk checkpoint-group=format=0;certificate=current;recovery=current
+disk primary-stripe=class=6;format=VCS1;rank-affine=physical-leaf;shape-ordinal=ordinary
 disk replicated-apply=format=0;catalog=current;global-index-put=absent-or-equal+digest-equal;settlement=current;sql-param-types=count-bit31+u8-vector;transaction-prepare-conflicts=normalize-invalid-document+target-bound-to-index-conflict
 disk request-ledger=$REQUEST_LEDGER_SEMANTICS
 disk sealed-sidecars=format=0;capacity=strict-bit0+portable-bit1;portable-requires-sealed

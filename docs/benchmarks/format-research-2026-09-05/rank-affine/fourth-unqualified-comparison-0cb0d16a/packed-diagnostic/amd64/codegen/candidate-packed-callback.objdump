@@ -1,0 +1,19 @@
+TEXT github.com/thesyncim/vibedb/store/durable.benchmarkUnifiedPartitionedScanAllBytes.func1.1.1(SB) /private/tmp/vibedb-rf3-packed-candidate-0cb0d16/store/durable/store_file_parallel_scan_bench_test.go
+  store_file_parallel_scan_bench_test.go:62	0xc472e0		48897c2420		MOVQ DI, 0x20(SP)	
+  store_file_parallel_scan_bench_test.go:62	0xc472e5		488b4a08		MOVQ 0x8(DX), CX	
+  store_file_parallel_scan_bench_test.go:63	0xc472e9		48ff4160		INCQ 0x60(CX)		
+  store_file_parallel_scan_bench_test.go:64	0xc472ed		48017168		ADDQ SI, 0x68(CX)	
+  store_file_unified_bench_test.go:482		0xc472f1		31d2			XORL DX, DX		
+  store_file_unified_bench_test.go:482		0xc472f3		4531c0			XORL R8, R8		
+  store_file_unified_bench_test.go:482		0xc472f6		eb0b			JMP 0xc47303		
+  store_file_unified_bench_test.go:482		0xc472f8		460fb60c07		MOVZX 0(DI)(R8*1), R9	
+  store_file_unified_bench_test.go:483		0xc472fd		4431ca			XORL R9, DX		
+  store_file_unified_bench_test.go:482		0xc47300		49ffc0			INCQ R8			
+  store_file_unified_bench_test.go:482		0xc47303		4c39c6			CMPQ SI, R8		
+  store_file_unified_bench_test.go:482		0xc47306		7ff0			JG 0xc472f8		
+  store_file_parallel_scan_bench_test.go:65	0xc47308		0fb67170		MOVZX 0x70(CX), SI	
+  store_file_parallel_scan_bench_test.go:65	0xc4730c		31f2			XORL SI, DX		
+  store_file_parallel_scan_bench_test.go:65	0xc4730e		885170			MOVB DL, 0x70(CX)	
+  store_file_parallel_scan_bench_test.go:66	0xc47311		31c0			XORL AX, AX		
+  store_file_parallel_scan_bench_test.go:66	0xc47313		31db			XORL BX, BX		
+  store_file_parallel_scan_bench_test.go:66	0xc47315		c3			RET			

@@ -1,0 +1,704 @@
+diff --git a/.github/workflows/fused-node-rf3.yml b/.github/workflows/fused-node-rf3.yml
+index 4561c589..3d953539 100644
+--- a/.github/workflows/fused-node-rf3.yml
++++ b/.github/workflows/fused-node-rf3.yml
+@@ -35,6 +35,11 @@ on:
+       - 'internal/rf3testfixture/**'
+       - 'sql/**'
+   workflow_dispatch:
++    inputs:
++      space_base:
++        description: 'Optional Git base for nine paired node-space performance trials'
++        required: false
++        type: string
+ 
+ permissions:
+   contents: read
+@@ -47,6 +52,92 @@ concurrency:
+   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+ 
+ jobs:
++  node-space-performance:
++    if: github.event_name == 'workflow_dispatch' && inputs.space_base != ''
++    name: Paired RF3 node-space performance
++    runs-on: ubuntu-latest
++    timeout-minutes: 50
++    steps:
++      - uses: actions/checkout@v6
++        with:
++          fetch-depth: 0
++      - uses: actions/setup-go@v6
++        with:
++          go-version: '1.27'
++      - name: Build identical workload against both revisions
++        shell: bash
++        env:
++          SPACE_BASE: ${{ inputs.space_base }}
++        run: |
++          set -euo pipefail
++          base="$(git rev-parse --verify "${SPACE_BASE}^{commit}")"
++          mkdir -p "${RUNNER_TEMP}/node-space-build" "${RUNNER_TEMP}/node-space-perf-tmp"
++          git rev-parse HEAD > "${RUNNER_TEMP}/node-space-build/candidate-revision.txt"
++          printf '%s\n' "${base}" > "${RUNNER_TEMP}/node-space-build/base-revision.txt"
++          go version > "${RUNNER_TEMP}/node-space-build/go-version.txt"
++          df -T -B1 "${RUNNER_TEMP}" > "${RUNNER_TEMP}/node-space-build/filesystem.txt"
++          lscpu > "${RUNNER_TEMP}/node-space-build/cpu.txt"
++          go test -c -o "${RUNNER_TEMP}/node-space-build/candidate.test" ./cmd/vibedb-shard
++          git worktree add --detach "${RUNNER_TEMP}/node-space-base" "${base}"
++          cp cmd/vibedb-shard/node_space_process_qualification_test.go \
++            "${RUNNER_TEMP}/node-space-base/cmd/vibedb-shard/"
++          cd "${RUNNER_TEMP}/node-space-base"
++          go test -c -o "${RUNNER_TEMP}/node-space-build/base.test" ./cmd/vibedb-shard
++      - name: Run nine alternating paired trials
++        shell: bash
++        env:
++          TMPDIR: ${{ runner.temp }}/node-space-perf-tmp
++        run: |
++          set -euo pipefail
++          python3 scripts/bench/run-node-space-comparison.py \
++            --base-binary "${RUNNER_TEMP}/node-space-build/base.test" \
++            --candidate-binary "${RUNNER_TEMP}/node-space-build/candidate.test" \
++            --output "${RUNNER_TEMP}/node-space-comparison"
++      - uses: actions/upload-artifact@v4
++        if: always()
++        with:
++          name: node-space-comparison-${{ github.sha }}
++          path: |
++            ${{ runner.temp }}/node-space-comparison
++            ${{ runner.temp }}/node-space-build/*.txt
++          if-no-files-found: error
++          retention-days: 30
++  node-space:
++    name: Ubuntu RF3 node history reclamation
++    runs-on: ubuntu-latest
++    timeout-minutes: 15
++    steps:
++      - uses: actions/checkout@v6
++      - uses: actions/setup-go@v6
++        with:
++          go-version: '1.27'
++      - name: Exercise reclamation during concurrent reads and writes
++        shell: bash
++        env:
++          VIBEDB_NODE_SPACE_E2E: '1'
++          VIBEDB_NODE_SPACE_EXPECT_RECLAIM: '1'
++          VIBEDB_NODE_SPACE_EVIDENCE: ${{ runner.temp }}/node-space/samples.json.gz
++          TMPDIR: ${{ runner.temp }}/node-space-tmp
++        run: |
++          set -euo pipefail
++          evidence="${RUNNER_TEMP}/node-space"
++          mkdir -p "${evidence}" "${TMPDIR}"
++          git rev-parse HEAD > "${evidence}/revision.txt"
++          go version > "${evidence}/go-version.txt"
++          df -T -B1 "${TMPDIR}" > "${evidence}/filesystem.txt"
++          go test -json -count=1 -timeout=10m \
++            -run '^TestServeRF3NodeSpaceQualification$' ./cmd/vibedb-shard \
++            | tee "${evidence}/go-test.jsonl"
++          jq -e -s 'any(.[]; .Action == "pass" and .Test == "TestServeRF3NodeSpaceQualification") and
++            all(.[]; .Action != "fail" and .Action != "skip")' "${evidence}/go-test.jsonl"
++          test -s "${VIBEDB_NODE_SPACE_EVIDENCE}"
++      - uses: actions/upload-artifact@v4
++        if: always()
++        with:
++          name: node-space-${{ github.sha }}
++          path: ${{ runner.temp }}/node-space
++          if-no-files-found: error
++          retention-days: 30
+   qualify:
+     name: Ubuntu fused RF3 physical-node qualification
+     runs-on: ubuntu-latest
+diff --git a/docs/operations/distributed.md b/docs/operations/distributed.md
+index 7a632713..7e9f426d 100644
+--- a/docs/operations/distributed.md
++++ b/docs/operations/distributed.md
+@@ -146,6 +146,18 @@ condition, not permission to discard a group's live recovery state. See
+ 
+ ## WAL generations and snapshots
+ 
++On the shared-node path, the background checkpoint worker also checkpoints new
++descriptor registrations and requests reclamation of a fully dead, sealed log
++prefix before its scheduled application capture. Live entries in any group
++continue to pin shared segments. Reclamation keeps the existing count/byte
++thresholds and preallocated active/spare capacity; it may wait for a later
++capture and segment seal. It does not force idle checkpoints or rotations.
++An already-published seal does not block
++reclamation while its rotation completion notice awaits consumption.
++Each request retires at most 32 segments; larger backlogs drain across
++scheduled captures, so this is not a fixed retention bound for arbitrary
++write rates or slow groups.
++
+ The Raft WAL is bounded, preallocated, encrypted/authenticated, digest-chained, and tied to an
+ immutable placement identity. Its active limits are sealed into the format; a manifest may choose
+ smaller values than the constructor defaults. See [defaults and limits](../reference/limits.md)
+diff --git a/internal/raftmember/node_checkpoint.go b/internal/raftmember/node_checkpoint.go
+index a0357f38..08eff484 100644
+--- a/internal/raftmember/node_checkpoint.go
++++ b/internal/raftmember/node_checkpoint.go
+@@ -90,6 +90,9 @@ func (c *NodeCheckpointCoordinator) capture(apply *sqldriver.ReplicatedApply) (r
+ 			result = nodeCheckpointBuildResult{err: fmt.Errorf("%w: %v", ErrNodeCheckpointPanic, recovered)}
+ 		}
+ 	}()
++	if err := c.sequencer.MaintainNodeLog(); err != nil {
++		return nodeCheckpointBuildResult{err: fmt.Errorf("node log maintenance: %w", err)}
++	}
+ 	preparation, err := apply.CaptureWALBase(sqldriver.WALBaseCaptureOptions{Workspace: c.workspace})
+ 	if err != nil {
+ 		return nodeCheckpointBuildResult{err: err}
+diff --git a/internal/raftmember/runtime_node_persistence_test.go b/internal/raftmember/runtime_node_persistence_test.go
+index 88322d0e..9fbe5a8d 100644
+--- a/internal/raftmember/runtime_node_persistence_test.go
++++ b/internal/raftmember/runtime_node_persistence_test.go
+@@ -120,8 +120,9 @@ func TestAdoptNodeRuntimeDrivesWorkerFreeDurableReady(t *testing.T) {
+ 		MaxWaveBytes: 1 << 20, MaxSegmentEvents: 256,
+ 		RecentWaves: 64, MaxEntriesPerGroup: 64, ReaderSlots: 1, MaxGroups: 8,
+ 	}
++	nodeDir := filepath.Join(t.TempDir(), "node")
+ 	store, err := raftstore.CreateNodeStore(
+-		filepath.Join(t.TempDir(), "node"), node, testWALKey(),
++		nodeDir, node, testWALKey(),
+ 		[]raftstore.NodeBootstrap{{Descriptor: descriptor, Snapshot: bootstrap}}, options,
+ 	)
+ 	if err != nil {
+@@ -255,6 +256,10 @@ func TestAdoptNodeRuntimeDrivesWorkerFreeDurableReady(t *testing.T) {
+ 	if err != nil || first < wantCheckpoint+1 {
+ 		t.Fatalf("checkpoint did not truncate applied prefix: first=%d err=%v", first, err)
+ 	}
++	catalogs, err := filepath.Glob(filepath.Join(nodeDir, "checkpoints", "descriptor-catalog-*.chk"))
++	if err != nil || len(catalogs) != 1 {
++		t.Fatalf("checkpoint worker did not release descriptor log history: catalogs=%v err=%v", catalogs, err)
++	}
+ 	if err = runtime.Close(); err != nil {
+ 		t.Fatal(err)
+ 	}
+diff --git a/internal/raftstore/node_catalog.go b/internal/raftstore/node_catalog.go
+index f59257e9..d6b24fec 100644
+--- a/internal/raftstore/node_catalog.go
++++ b/internal/raftstore/node_catalog.go
+@@ -310,6 +310,56 @@ func (s *NodeStore) ReclaimDeadNodeLogPrefix() error {
+ 	return engine.ReclaimDeadPrefix()
+ }
+ 
++// MaintainNodeLog runs on the checkpoint coordinator's cold worker, never on
++// the submission sequencer. Descriptor entries otherwise pin the first segment
++// indefinitely, even after every application group has checkpointed its rows.
++// Checkpoint that catalog before asking the sealer to reclaim a certified dead
++// prefix. The existing segment thresholds and recovery fences remain unchanged.
++// A busy sealer or submission queue simply defers this work to the next capture.
++func (q *NodeSubmissionSequencer) MaintainNodeLog() error {
++	if q == nil || q.store == nil || q.closed.Load() {
++		return ErrClosed
++	}
++	s := q.store
++	s.mu.Lock()
++	if err := s.usable(); err != nil {
++		s.mu.Unlock()
++		return err
++	}
++	metadata, ok := s.engine.Metadata(nodeDescriptorGroup)
++	through := uint64(len(s.descriptors))
++	s.mu.Unlock()
++	if !ok || metadata.Checkpoint.Index > through {
++		if failure := s.coordinateReadError(); failure != nil {
++			return failure
++		}
++		return ErrCorrupt
++	}
++	// Avoid a directory scan and catalog publication when registration has not
++	// advanced. A concurrent registration is included by this or a later pass.
++	if metadata.Checkpoint.Index < through {
++		if err := s.CheckpointDescriptorCatalog(); err != nil {
++			if errors.Is(err, ErrPersistenceUnknown) {
++				return err
++			}
++			if errors.Is(err, ErrSubmissionBackpressure) || errors.Is(err, seglog.ErrBackpressure) {
++				return nil
++			}
++			return err
++		}
++	}
++	err := s.ReclaimDeadNodeLogPrefix()
++	if errors.Is(err, seglog.ErrBounds) {
++		if failure := s.coordinateReadError(); failure != nil {
++			return failure
++		}
++		// No sufficiently large, fully sealed dead prefix yet. In particular,
++		// live entries from another group must continue to pin their segments.
++		return nil
++	}
++	return err
++}
++
+ func (s *NodeStore) publishDescriptorCatalogReference(candidate descriptorCatalogCandidate) error {
+ 	s.mu.Lock()
+ 	sequencer := s.sequencer
+diff --git a/internal/raftstore/node_maintenance_test.go b/internal/raftstore/node_maintenance_test.go
+new file mode 100644
+index 00000000..7b925521
+--- /dev/null
++++ b/internal/raftstore/node_maintenance_test.go
+@@ -0,0 +1,305 @@
++package raftstore
++
++import (
++	"bytes"
++	"errors"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/thesyncim/vibedb/internal/raftmodel"
++	"github.com/thesyncim/vibedb/internal/raftstore/seglog"
++	"github.com/thesyncim/vibedb/internal/rf3bench"
++	pb "go.etcd.io/raft/v3/raftpb"
++)
++
++func submitNodeMaintenanceReady(t testing.TB, q *NodeSubmissionSequencer, group, incarnation, id, index uint64, data []byte) {
++	t.Helper()
++	var submission Submission
++	if err := submission.Initialize(); err != nil {
++		t.Fatal(err)
++	}
++	if err := submission.Prepare(NodeReady{GroupID: group, Batch: raftmodel.PersistBatch{
++		NodeIncarnation: incarnation, ReadyID: id,
++		Entries: []*pb.Entry{typedEntry(index, 2, pb.EntryNormal, string(data))}, HardState: hard(2, index),
++	}}); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := q.TrySubmit(&submission); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := submission.Wait(); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func submitNodeMaintenanceCheckpoint(t testing.TB, q *NodeSubmissionSequencer, group, member, index uint64) {
++	t.Helper()
++	var submission Submission
++	if err := submission.Initialize(); err != nil {
++		t.Fatal(err)
++	}
++	if err := submission.PrepareCheckpoint(group, nodeSnapshot(member, index, 2)); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := q.TrySubmit(&submission); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := submission.Wait(); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func nodeLogFileBytes(t testing.TB, dir string) int64 {
++	t.Helper()
++	footprint, err := rf3bench.MeasureFootprint(dir)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return int64(footprint.ApparentBytes)
++}
++
++func nodeLogAllocatedBytes(t testing.TB, dir string) int64 {
++	t.Helper()
++	footprint, err := rf3bench.MeasureFootprint(dir)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return int64(footprint.AllocatedBytes)
++}
++
++// This is a three-replica storage/recovery test, not a network throughput test.
++// A slow group pins the oldest shared segment until its own checkpoint becomes
++// durable; a newer checkpoint in another group cannot authorize its deletion.
++func TestNodeLogMaintenanceReclaimsThreeReplicaHistory(t *testing.T) {
++	var totalBefore, totalAfter int64
++	var allocatedBefore, allocatedAfter int64
++	for replica := byte(1); replica <= 3; replica++ {
++		dir := filepath.Join(t.TempDir(), "node")
++		identity := testNodeIdentity()
++		identity.NodeID[15] = replica
++		options := NodeStoreOptions{SegmentBytes: 1 << 20, MaxWaveBytes: 512 << 10,
++			MaxSegmentEvents: 512, RecentWaves: 128, MaxEntriesPerGroup: 64, ReaderSlots: 1, MaxGroups: 8}
++		store, err := CreateNodeStore(dir, identity, testKey(), []NodeBootstrap{
++			{Descriptor: testGroupDescriptor(1), Snapshot: nodeSnapshot(1, 1, 1)},
++			{Descriptor: testGroupDescriptor(2), Snapshot: nodeSnapshot(2, 1, 1)},
++		}, options)
++		if err != nil {
++			t.Fatal(err)
++		}
++		t.Cleanup(func() { _ = store.Close() })
++		incarnations, err := store.BeginIncarnations([]uint64{1, 2})
++		if err != nil {
++			t.Fatal(err)
++		}
++		q, err := NewNodeSubmissionSequencer(store, 8)
++		if err != nil {
++			t.Fatal(err)
++		}
++		seal := func() {
++			t.Helper()
++			if err := store.engine.Rotate(nil); err != nil {
++				t.Fatal(err)
++			}
++			if err := store.engine.WaitSeal(); err != nil {
++				t.Fatal(err)
++			}
++		}
++		payload := bytes.Repeat([]byte{replica}, 128<<10)
++		for index := uint64(2); index <= 9; index++ {
++			submitNodeMaintenanceReady(t, q, 1, incarnations[0].Incarnation, index-1, index, payload)
++			if index == 2 {
++				submitNodeMaintenanceReady(t, q, 2, incarnations[1].Incarnation, 1, 2, []byte("retained slow-group row"))
++			}
++			seal()
++		}
++		submitNodeMaintenanceCheckpoint(t, q, 1, 1, 9)
++		if err := q.MaintainNodeLog(); err != nil {
++			t.Fatal(err)
++		}
++		seal()
++		pinned := nodeLogFileBytes(t, dir)
++		if err := q.MaintainNodeLog(); err != nil {
++			t.Fatal(err)
++		}
++		if got := nodeLogFileBytes(t, dir); got != pinned {
++			t.Fatalf("replica %d: slow group did not pin history: %d -> %d", replica, pinned, got)
++		}
++		entries, err := store.Group(2).Entries(2, 3, 1<<20)
++		if err != nil || len(entries) != 1 || string(entries[0].Data) != "retained slow-group row" {
++			t.Fatalf("slow-group read after maintenance: %v, %v", entries, err)
++		}
++		submitNodeMaintenanceCheckpoint(t, q, 2, 2, 2)
++		seal()
++		before := nodeLogFileBytes(t, dir)
++		allocatedBefore += nodeLogAllocatedBytes(t, dir)
++		if err := q.MaintainNodeLog(); err != nil {
++			t.Fatal(err)
++		}
++		after := nodeLogFileBytes(t, dir)
++		allocatedAfter += nodeLogAllocatedBytes(t, dir)
++		if before-after < 8*int64(len(payload)) {
++			t.Fatalf("replica %d retained dead row history: before=%d after=%d", replica, before, after)
++		}
++		totalBefore += before
++		totalAfter += after
++		// The same current generation still accepts and serves the next write.
++		submitNodeMaintenanceReady(t, q, 1, incarnations[0].Incarnation, 9, 10, []byte("new row after reclaim"))
++		if err := store.Close(); err != nil {
++			t.Fatal(err)
++		}
++		store, err = OpenNodeStore(dir, identity, testKey(), options)
++		if err != nil {
++			t.Fatal(err)
++		}
++		for group, index := range map[uint64]uint64{1: 9, 2: 2} {
++			snapshot, err := store.Group(group).Snapshot()
++			if err != nil || snapshot.GetMetadata().GetIndex() != index {
++				t.Fatalf("reopened group %d checkpoint: %v, %v", group, snapshot, err)
++			}
++		}
++		entries, err = store.Group(1).Entries(10, 11, 1<<20)
++		if err != nil || len(entries) != 1 || string(entries[0].Data) != "new row after reclaim" {
++			t.Fatalf("reopened next row: %v, %v", entries, err)
++		}
++		if err := store.Close(); err != nil {
++			t.Fatal(err)
++		}
++	}
++	t.Logf("three-replica apparent node bytes: before=%d after=%d reclaimed=%d (%.2f%%); preallocated blocks excluded",
++		totalBefore, totalAfter, totalBefore-totalAfter, 100*float64(totalBefore-totalAfter)/float64(totalBefore))
++	t.Logf("three-replica allocated node bytes including active+two reserves per replica: before=%d after=%d reclaimed=%d (%.2f%%)",
++		allocatedBefore, allocatedAfter, allocatedBefore-allocatedAfter, 100*float64(allocatedBefore-allocatedAfter)/float64(allocatedBefore))
++}
++
++func TestNodeLogMaintenanceCatalogIODoesNotBlockReadsOrAppends(t *testing.T) {
++	_, store, _ := createDescriptorCatalogTestStore(t, 8)
++	defer store.Close()
++	incarnations, err := store.BeginIncarnations([]uint64{1})
++	if err != nil {
++		t.Fatal(err)
++	}
++	q, err := NewNodeSubmissionSequencer(store, 8)
++	if err != nil {
++		t.Fatal(err)
++	}
++	submitNodeMaintenanceReady(t, q, 1, incarnations[0].Incarnation, 1, 2, []byte("existing row"))
++	entered, release := make(chan struct{}), make(chan struct{})
++	store.descriptorCheckpointHookTest = func(phase DescriptorCheckpointPhase) error {
++		if phase == DescriptorCheckpointTempWritten {
++			close(entered)
++			<-release
++		}
++		return nil
++	}
++	done := make(chan error, 1)
++	go func() { done <- q.MaintainNodeLog() }()
++	defer func() {
++		close(release)
++		if err := <-done; err != nil {
++			t.Error(err)
++		}
++	}()
++	select {
++	case <-entered:
++	case <-time.After(5 * time.Second):
++		t.Fatal("maintenance did not enter catalog I/O")
++	}
++	foreground := make(chan error, 1)
++	go func() {
++		entries, err := store.Group(1).Entries(2, 3, 1<<20)
++		if err == nil && (len(entries) != 1 || string(entries[0].Data) != "existing row") {
++			err = ErrCorrupt
++		}
++		if err == nil {
++			var submission Submission
++			err = submission.Initialize()
++			if err == nil {
++				err = submission.Prepare(NodeReady{GroupID: 1, Batch: raftmodel.PersistBatch{
++					NodeIncarnation: incarnations[0].Incarnation, ReadyID: 2,
++					Entries: []*pb.Entry{typedEntry(3, 2, pb.EntryNormal, "new row")}, HardState: hard(2, 3),
++				}})
++			}
++			if err == nil {
++				_, err = q.TrySubmit(&submission)
++			}
++			if err == nil {
++				_, err = submission.Wait()
++			}
++		}
++		foreground <- err
++	}()
++	select {
++	case err := <-foreground:
++		if err != nil {
++			t.Fatal(err)
++		}
++	case <-time.After(5 * time.Second):
++		t.Fatal("catalog I/O blocked foreground read/append")
++	}
++}
++
++func TestNodeLogMaintenanceRetriesCatalogFailureAndSkipsUnchangedCatalog(t *testing.T) {
++	dir, store, _ := createDescriptorCatalogTestStore(t, 8)
++	defer store.Close()
++	q, err := NewNodeSubmissionSequencer(store, 8)
++	if err != nil {
++		t.Fatal(err)
++	}
++	injected := errors.New("catalog I/O failure")
++	store.descriptorCheckpointHookTest = func(DescriptorCheckpointPhase) error { return injected }
++	if err := q.MaintainNodeLog(); !errors.Is(err, injected) {
++		t.Fatalf("maintenance lost catalog error: %v", err)
++	}
++	store.descriptorCheckpointHookTest = nil
++	if err := q.MaintainNodeLog(); err != nil {
++		t.Fatal(err)
++	}
++	sequence, _ := store.engine.AppendWitness()
++	store.descriptorCheckpointHookTest = func(DescriptorCheckpointPhase) error { return injected }
++	if err := q.MaintainNodeLog(); err != nil {
++		t.Fatalf("unchanged catalog was republished: %v", err)
++	}
++	if got, _ := store.engine.AppendWitness(); got != sequence {
++		t.Fatalf("unchanged maintenance appended %d waves", got-sequence)
++	}
++	entries, err := os.ReadDir(filepath.Join(dir, nodeCheckpointDir))
++	if err != nil {
++		t.Fatal(err)
++	}
++	catalogs := 0
++	for _, entry := range entries {
++		if strings.HasPrefix(entry.Name(), "descriptor-catalog-") {
++			catalogs++
++		}
++	}
++	if catalogs != 1 {
++		t.Fatalf("catalog files=%d, want one", catalogs)
++	}
++}
++
++func TestNodeLogMaintenanceDoesNotHidePublishedEngineFailure(t *testing.T) {
++	_, store, _ := createDescriptorCatalogTestStore(t, 8)
++	defer store.Close()
++	q, err := NewNodeSubmissionSequencer(store, 8)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := q.MaintainNodeLog(); err != nil {
++		t.Fatal(err)
++	}
++	injected := errors.New("independent engine failure")
++	store.engine.SetDataSyncForTesting(func(*os.File) error { return injected })
++	// Model a failure published independently of NodeStore's own poison box.
++	err = store.engine.PersistWave(seglog.Wave{ID: seglog.WaveID{9, 8, 7}, Batches: []seglog.ReadyBatch{
++		{GroupID: 1, Hard: &seglog.HardState{Term: 2, Commit: 1}},
++	}})
++	if !errors.Is(err, injected) {
++		t.Fatalf("engine failure=%v", err)
++	}
++	if err := q.MaintainNodeLog(); !errors.Is(err, ErrPersistenceUnknown) || !errors.Is(err, injected) {
++		t.Fatalf("maintenance treated a poisoned engine as below-threshold: %v", err)
++	}
++}
+diff --git a/internal/raftstore/seglog/engine.go b/internal/raftstore/seglog/engine.go
+index 07980495..36896209 100644
+--- a/internal/raftstore/seglog/engine.go
++++ b/internal/raftstore/seglog/engine.go
+@@ -2221,7 +2221,7 @@ func (e *Engine) finishFrozenSeal(base metadataState, pending SegmentMeta, event
+ func (e *Engine) runMetadataMaintenance() {
+ 	e.writeMu.Lock()
+ 	if e.log != nil && e.log.metadata != nil && (e.log.metadata.slot.ReclaimPhase != reclaimNone || e.log.metadata.slot.RetiredCheckpointCount != 0) {
+-		if e.maintenanceBusy || e.sealPending || e.log.usable() != nil || e.log.metadata.slot.HasPending {
++		if e.maintenanceBusy || e.log.usable() != nil || e.log.metadata.slot.HasPending {
+ 			e.writeMu.Unlock()
+ 			return
+ 		}
+diff --git a/internal/raftstore/seglog/reclaim.go b/internal/raftstore/seglog/reclaim.go
+index 31800133..6098a3ed 100644
+--- a/internal/raftstore/seglog/reclaim.go
++++ b/internal/raftstore/seglog/reclaim.go
+@@ -71,8 +71,12 @@ func (e *Engine) ReclaimDeadPrefix() error {
+ 
+ func (e *Engine) reclaimDeadPrefix() error {
+ 	e.writeMu.Lock()
++	// This worker serializes sealing and reclamation. HasPending identifies a
++	// frozen segment whose publication is unfinished. sealPending additionally
++	// includes a completed seal whose result the rotator has not consumed yet;
++	// that unread completion must not pin an otherwise reclaimable prefix.
+ 	if e.log != nil && e.log.metadata != nil && (e.log.metadata.slot.ReclaimPhase != reclaimNone || e.log.metadata.slot.RetiredCheckpointCount != 0) {
+-		if e.maintenanceBusy || e.sealPending || e.log.usable() != nil || e.log.metadata.slot.HasPending {
++		if e.maintenanceBusy || e.log.usable() != nil || e.log.metadata.slot.HasPending {
+ 			e.writeMu.Unlock()
+ 			return ErrBounds
+ 		}
+@@ -85,7 +89,7 @@ func (e *Engine) reclaimDeadPrefix() error {
+ 		}()
+ 		return e.resumeReclaim()
+ 	}
+-	if e.maintenanceBusy || e.sealPending || e.log == nil || e.log.usable() != nil || e.log.metadata == nil || e.log.metadata.needsHealing || e.log.metadata.slot.HasPending || e.log.metadata.slot.ReclaimPhase != reclaimNone {
++	if e.maintenanceBusy || e.log == nil || e.log.usable() != nil || e.log.metadata == nil || e.log.metadata.needsHealing || e.log.metadata.slot.HasPending || e.log.metadata.slot.ReclaimPhase != reclaimNone {
+ 		e.writeMu.Unlock()
+ 		return ErrBounds
+ 	}
+diff --git a/internal/raftstore/seglog/reclaim_test.go b/internal/raftstore/seglog/reclaim_test.go
+index bd0a7800..c7270ecf 100644
+--- a/internal/raftstore/seglog/reclaim_test.go
++++ b/internal/raftstore/seglog/reclaim_test.go
+@@ -11,8 +11,63 @@ import (
+ 	"strings"
+ 	"syscall"
+ 	"testing"
++	"time"
+ )
+ 
++func TestReclaimCheckpointIODoesNotBlockActiveReadsOrAppends(t *testing.T) {
++	oldMin, oldMax := reclaimMinSegments, reclaimMaxSegments
++	reclaimMinSegments, reclaimMaxSegments = 2, 2
++	t.Cleanup(func() { reclaimMinSegments, reclaimMaxSegments, reclaimPublishHook = oldMin, oldMax, nil })
++	e, _, _ := newReclaimableEngine(t, t.TempDir())
++	defer e.Close()
++	if err := e.ReserveGroup(2, 4096); err != nil {
++		t.Fatal(err)
++	}
++	if err := e.PersistWave(Wave{ID: waveID(4), Batches: []ReadyBatch{{GroupID: 2, Entries: []Entry{{Index: 1, Term: 1}}}}}); err != nil {
++		t.Fatal(err)
++	}
++	entered, release := make(chan struct{}), make(chan struct{})
++	reclaimPublishHook = func(phase reclaimPublishPhase) error {
++		if phase == reclaimCheckpointAPublished {
++			close(entered)
++			<-release
++		}
++		return nil
++	}
++	done := make(chan error, 1)
++	go func() { done <- e.ReclaimDeadPrefix() }()
++	defer func() {
++		close(release)
++		if err := <-done; err != nil {
++			t.Error(err)
++		}
++	}()
++	select {
++	case <-entered:
++	case <-time.After(5 * time.Second):
++		t.Fatal("reclamation did not enter checkpoint I/O")
++	}
++	foreground := make(chan error, 1)
++	go func() {
++		_, term, compacted, found, err := e.LookupExact(2, 1)
++		if err == nil && (term != 1 || compacted || !found) {
++			err = ErrRaftState
++		}
++		if err == nil {
++			err = e.PersistWave(Wave{ID: waveID(5), Batches: []ReadyBatch{{GroupID: 2, Entries: []Entry{{Index: 2, Term: 1}}}}})
++		}
++		foreground <- err
++	}()
++	select {
++	case err := <-foreground:
++		if err != nil {
++			t.Fatal(err)
++		}
++	case <-time.After(5 * time.Second):
++		t.Fatal("reclamation I/O blocked active read/append")
++	}
++}
++
+ func newReclaimableEngine(t *testing.T, dir string) (*Engine, []SegmentMeta, Checkpoint) {
+ 	t.Helper()
+ 	engine := newEngineAt(t, dir, 1)
+@@ -76,6 +131,51 @@ func TestReclaimDeadSealedPrefixTwoCutRoundTrip(t *testing.T) {
+ 	}
+ }
+ 
++func TestReclaimAfterSealPublicationBeforeWaitSeal(t *testing.T) {
++	oldMin, oldMax := reclaimMinSegments, reclaimMaxSegments
++	reclaimMinSegments, reclaimMaxSegments = 2, 2
++	t.Cleanup(func() { reclaimMinSegments, reclaimMaxSegments = oldMin, oldMax })
++	dir := t.TempDir()
++	engine, removed, _ := newReclaimableEngine(t, dir)
++	defer engine.Close()
++	if err := engine.PersistWave(Wave{ID: waveID(4), Batches: []ReadyBatch{
++		{GroupID: 1, Entries: []Entry{{Index: 3, Term: 1, Data: []byte("retained")}}},
++	}}); err != nil {
++		t.Fatal(err)
++	}
++	published := make(chan struct{})
++	if err := engine.Rotate(func(phase RotationPhase) error {
++		if phase == RotationSealedMetadataPublished {
++			close(published)
++		}
++		return nil
++	}); err != nil {
++		t.Fatal(err)
++	}
++	select {
++	case <-published:
++	case <-time.After(5 * time.Second):
++		t.Fatal("seal publication did not finish")
++	}
++	// Ordinary node traffic only consumes this completion at the next rotation.
++	// Reclamation must work in the intervening active segment, and must leave
++	// the completion available for the explicit control-plane waiter.
++	if err := engine.ReclaimDeadPrefix(); err != nil {
++		t.Fatal(err)
++	}
++	for _, segment := range removed {
++		if _, err := os.Stat(segmentPath(dir, segment.FileID)); !errors.Is(err, os.ErrNotExist) {
++			t.Fatalf("dead segment %d remains: %v", segment.ID, err)
++		}
++	}
++	if err := engine.WaitSeal(); err != nil {
++		t.Fatal(err)
++	}
++	if _, term, compacted, found, err := engine.LookupExact(1, 3); err != nil || term != 1 || compacted || !found {
++		t.Fatalf("retained entry: term=%d compacted=%v found=%v err=%v", term, compacted, found, err)
++	}
++}
++
+ func TestReclaimAdmissionUsesCountOrTwoSegmentBytes(t *testing.T) {
+ 	oldMin := reclaimMinSegments
+ 	reclaimMinSegments = 8

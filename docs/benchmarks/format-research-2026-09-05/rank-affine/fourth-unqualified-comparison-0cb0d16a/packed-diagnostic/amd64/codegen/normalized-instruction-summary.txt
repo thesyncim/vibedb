@@ -1,0 +1,47 @@
+RF3 packed-scan amd64 codegen evidence
+
+Revisions
+candidate: 0cb0d16a9a58944d79feeeecd063ff8aa239f5da
+base:      02b75683f227470d6d198274f532bf39d5fa417d
+target: GOOS=linux GOARCH=amd64 GOEXPERIMENT=simd GOTOOLCHAIN=go1.27.1
+toolchain: go1.27.1 darwin/arm64 host, emitting linux/amd64 test binaries
+
+Exact symbol sizes, starts, and 16-byte alignment
+benchmarkUnifiedPartitionedScanAllBytes: candidate start 0xad02a0, size 838 (0x346), alignment mod16 0; base start 0xacb480, size 838 (0x346), alignment mod16 0
+benchmarkUnifiedPartitionedScanAllBytes.func1: candidate start 0xc46740, size 1554 (0x612), alignment mod16 0; base start 0xc41920, size 1554 (0x612), alignment mod16 0
+benchmarkUnifiedPartitionedScanAllBytes.func1.1.1: candidate start 0xc472e0, size 54 (0x36), alignment mod16 0; base start 0xc424c0, size 54 (0x36), alignment mod16 0
+(*PrimaryGraphCursor).visitCurrentLeafInlineUntil: candidate start 0x7a9960, size 2398 (0x95e), alignment mod16 0; base start 0x7a4ba0, size 2398 (0x95e), alignment mod16 0
+(*CompactPrimaryScanDecoder).appendValue: candidate start 0x6edee0, size 2199 (0x897), alignment mod16 0; base start 0x6eda60, size 1253 (0x4e5), alignment mod16 0
+
+Nested callback raw PCs normalized to function-relative offsets
+The loop below is the inlined touchUnifiedScanAllBytes byte-XOR loop.
++0x0 candidate=0xc472e0 base=0xc424c0 bytes=48897c2420 op=MOVQ DI, 0x20(SP)
++0x5 candidate=0xc472e5 base=0xc424c5 bytes=488b4a08 op=MOVQ 0x8(DX), CX
++0x9 candidate=0xc472e9 base=0xc424c9 bytes=48ff4160 op=INCQ 0x60(CX)
++0xd candidate=0xc472ed base=0xc424cd bytes=48017168 op=ADDQ SI, 0x68(CX)
++0x11 candidate=0xc472f1 base=0xc424d1 bytes=31d2 op=XORL DX, DX
++0x13 candidate=0xc472f3 base=0xc424d3 bytes=4531c0 op=XORL R8, R8
++0x16 candidate=0xc472f6 base=0xc424d6 bytes=eb0b op=JMP +0x23
++0x18 candidate=0xc472f8 base=0xc424d8 bytes=460fb60c07 op=MOVZX 0(DI)(R8*1), R9
++0x1d candidate=0xc472fd base=0xc424dd bytes=4431ca op=XORL R9, DX
++0x20 candidate=0xc47300 base=0xc424e0 bytes=49ffc0 op=INCQ R8
++0x23 candidate=0xc47303 base=0xc424e3 bytes=4c39c6 op=CMPQ SI, R8
++0x26 candidate=0xc47306 base=0xc424e6 bytes=7ff0 op=JG +0x18
++0x28 candidate=0xc47308 base=0xc424e8 bytes=0fb67170 op=MOVZX 0x70(CX), SI
++0x2c candidate=0xc4730c base=0xc424ec bytes=31f2 op=XORL SI, DX
++0x2e candidate=0xc4730e base=0xc424ee bytes=885170 op=MOVB DL, 0x70(CX)
++0x31 candidate=0xc47311 base=0xc424f1 bytes=31c0 op=XORL AX, AX
++0x33 candidate=0xc47313 base=0xc424f3 bytes=31db op=XORL BX, BX
++0x35 candidate=0xc47315 base=0xc424f5 bytes=c3 op=RET
+
+Loop alignment rows (source lines 482-483)
++0x11 candidate=0xc472f1 base=0xc424d1 bytes_equal=True op=XORL DX, DX
++0x13 candidate=0xc472f3 base=0xc424d3 bytes_equal=True op=XORL R8, R8
++0x16 candidate=0xc472f6 base=0xc424d6 bytes_equal=True op=JMP +0x23
++0x18 candidate=0xc472f8 base=0xc424d8 bytes_equal=True op=MOVZX 0(DI)(R8*1), R9
++0x1d candidate=0xc472fd base=0xc424dd bytes_equal=True op=XORL R9, DX
++0x20 candidate=0xc47300 base=0xc424e0 bytes_equal=True op=INCQ R8
++0x23 candidate=0xc47303 base=0xc424e3 bytes_equal=True op=CMPQ SI, R8
++0x26 candidate=0xc47306 base=0xc424e6 bytes_equal=True op=JG +0x18
+
+Raw objdump files are paired by arm and function in this directory; metadata.json records SHA-256 hashes and exact symbol selection commands.

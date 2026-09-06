@@ -60,6 +60,19 @@ type DataSkippingFilter struct {
 	alwaysFalse    bool
 }
 
+// hasDataSkippingPath reports whether path is one of the collection's
+// persisted skip-index paths. The catalog is normalized and sorted when the
+// collection opens, so this is a bounded, allocation-free admission check
+// used before a native integer scan. A nil or closed snapshot simply has no
+// matching path.
+func (s *Snapshot) hasDataSkippingPath(path string) bool {
+	if s == nil || s.collection == nil || s.state == nil || path == "" {
+		return false
+	}
+	_, found := slices.BinarySearch(s.collection.options.SkipIndexes, path)
+	return found
+}
+
 // DataSkippingMetrics is the detached physical work avoided by one completed
 // scan.
 type DataSkippingMetrics struct {

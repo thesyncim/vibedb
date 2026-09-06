@@ -1,0 +1,2 @@
+Filesystem     Type    1B-blocks        Used   Available Use% Mounted on
+/dev/root      ext4 154894188544 64726081536 90151329792  42% /

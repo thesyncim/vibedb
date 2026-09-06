@@ -1,0 +1,31 @@
+{
+  "started_unix_seconds": 1788681128.2054489,
+  "platform": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
+  "suite": "all",
+  "selected_suites": [
+    "primary",
+    "query"
+  ],
+  "selected_binary_suites": [
+    "storeio",
+    "durable",
+    "query"
+  ],
+  "benchmark_patterns": {
+    "storeio": "^BenchmarkCompactRankFormat$",
+    "durable": "^(BenchmarkUnifiedGetRaw|BenchmarkUnifiedPrimaryReplace|BenchmarkUnifiedScanAllBytesLowCardinality|BenchmarkUnifiedScanAllBytesHighCardinality|BenchmarkFileStoreBatchWrite)$",
+    "query": "^BenchmarkRankAffineQueryFormat$"
+  },
+  "runs_per_arm": 6,
+  "benchtime": "200ms",
+  "gomaxprocs": 1,
+  "order": "base/candidate odd pairs; candidate/base even pairs",
+  "binary_sha256": {
+    "base-storeio": "4430221d953a8523cb1df676429aab97c03cf180f870a9c5a4066f5b8292a2fa",
+    "base-durable": "be9a52bb24417920705b8af30162b89706d36c0a7acaa083fa6b7f940de0fef2",
+    "base-query": "9905bb883fb66b8a96393faa8b0708cec5182dfefb996cf54cbe046264a9d4d2",
+    "candidate-storeio": "9e2b20f42ef20d563633b055e32097c4843497b0f324c46215fa9ceff7d11c4e",
+    "candidate-durable": "687eda8374afdbaebe466930df280bc694d5195dc8ccbfdedd73a275a88ffeba",
+    "candidate-query": "1c72fc5d349959d8d728d4df8cc39474c15473edd09eef63819a146883f3f08e"
+  }
+}

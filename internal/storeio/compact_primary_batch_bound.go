@@ -129,10 +129,10 @@ func (v *CompactPrimaryStripeView) ConservativeScalarReplacementBatchPayload(
 				)
 			}
 			if hole == changedStream.hole {
-				if !compactIntegerStream(stream) {
+				if !stream.matchesShapeRows(entry.rows, v.rows) || !compactIntegerStream(stream) {
 					return 0, false, nil
 				}
-				bound, boundOK := conservativeIntegerStreamBytes(stream.count)
+				bound, boundOK := conservativeIntegerStreamBytes(entry.rows)
 				if !boundOK || bound < stream.encoded ||
 					payload > int(^uint(0)>>1)-bound+stream.encoded {
 					return 0, false, nil
@@ -216,6 +216,8 @@ func (v *CompactPrimaryStripeView) ScalarReplacementColumn(
 // have no constant-time whole-stream integer proof.
 func compactIntegerStream(stream compactStreamView) bool {
 	switch stream.kind {
+	case compactStreamRankAffine:
+		return stream.rankAffineIsNumber()
 	case compactStreamFOR, compactStreamDelta, compactStreamDeltaPack:
 		return true
 	case compactStreamDictionary:

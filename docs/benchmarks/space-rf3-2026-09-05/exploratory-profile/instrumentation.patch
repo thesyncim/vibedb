@@ -1,0 +1,61 @@
+diff --git a/cmd/vibedb-shard/node_space_process_qualification_test.go b/cmd/vibedb-shard/node_space_process_qualification_test.go
+index 1a0167a3..c03ddd0e 100644
+--- a/cmd/vibedb-shard/node_space_process_qualification_test.go
++++ b/cmd/vibedb-shard/node_space_process_qualification_test.go
+@@ -217,6 +217,7 @@ func TestServeRF3NodeSpaceQualification(t *testing.T) {
+ 	}
+ 	ready.Wait()
+ 	started := time.Now()
++	fmt.Printf("PROFILE_WORKLOAD_START %d\n", started.UnixNano())
+ 	for range workers {
+ 		start <- started
+ 	}
+diff --git a/cmd/vibedb-shard/serve_rf3_fault_process_test.go b/cmd/vibedb-shard/serve_rf3_fault_process_test.go
+index 3e2ecfce..525ec0e8 100644
+--- a/cmd/vibedb-shard/serve_rf3_fault_process_test.go
++++ b/cmd/vibedb-shard/serve_rf3_fault_process_test.go
+@@ -695,6 +695,10 @@ func (fixture *rf3FaultFixture) start(t testing.TB, member int) {
+ 	}
+ 	diagnostic := &rf3CommandDiagnostic{maximum: rf3CommandDiagnosticBytes}
+ 	command := exec.Command(executable, "-test.run=^TestServeRF3CommandProcessHelper$", "-test.v")
++	if dir := os.Getenv("VIBEDB_NODE_PROFILE_DIR"); dir != "" {
++		command.Args = append(command.Args, fmt.Sprintf("-test.cpuprofile=%s/member-%d-%d.cpu", dir, member, time.Now().UnixNano()))
++	}
++
+ 	command.Env = append(os.Environ(), rf3CommandHelperEnvironment+"=1", rf3CommandManifestEnvironment+"="+fixture.manifestPaths[member])
+ 	files := make([]*os.File, 4)
+ 	for lane := range files {
+diff --git a/internal/raftstore/node_catalog.go b/internal/raftstore/node_catalog.go
+index d6b24fec..9906d387 100644
+--- a/internal/raftstore/node_catalog.go
++++ b/internal/raftstore/node_catalog.go
+@@ -8,9 +8,11 @@ import (
+ 	"encoding/binary"
+ 	"encoding/hex"
+ 	"errors"
++	"fmt"
+ 	"io"
+ 	"os"
+ 	"path/filepath"
++	"time"
+ 
+ 	"github.com/thesyncim/vibedb/internal/raftstore/seglog"
+ )
+@@ -317,6 +319,17 @@ func (s *NodeStore) ReclaimDeadNodeLogPrefix() error {
+ // prefix. The existing segment thresholds and recovery fences remain unchanged.
+ // A busy sealer or submission queue simply defers this work to the next capture.
+ func (q *NodeSubmissionSequencer) MaintainNodeLog() error {
++	started := time.Now()
++	defer func() {
++		if dir := os.Getenv("VIBEDB_NODE_PROFILE_DIR"); dir != "" {
++			file, err := os.OpenFile(fmt.Sprintf("%s/maintenance-%d.log", dir, os.Getpid()), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
++			if err == nil {
++				fmt.Fprintf(file, "%d %d\n", started.UnixNano(), time.Since(started).Nanoseconds())
++				file.Close()
++			}
++		}
++	}()
++
+ 	if q == nil || q.store == nil || q.closed.Load() {
+ 		return ErrClosed
+ 	}

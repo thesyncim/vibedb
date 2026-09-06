@@ -77,7 +77,7 @@ func OpenFileJournal(path string, maxRecords int) (*FileJournal, error) {
 	return journal, nil
 }
 
-func (journal *FileJournal) ReadReplicaAction(ctx context.Context, operation [32]byte) (Record, error) {
+func (journal *FileJournal) ReadReplicaAction(ctx context.Context, operation [32]byte, kind Kind) (Record, error) {
 	if journal == nil || ctx == nil || operation == ([32]byte{}) {
 		return Record{}, ErrControl
 	}
@@ -89,7 +89,7 @@ func (journal *FileJournal) ReadReplicaAction(ctx context.Context, operation [32
 	if journal.closed {
 		return Record{}, ErrControl
 	}
-	record, ok := journal.records[operation]
+	record, ok := journal.records[replicaActionJournalKey(operation, kind)]
 	if !ok {
 		return Record{}, ErrMissing
 	}
@@ -109,7 +109,7 @@ func (journal *FileJournal) PublishReplicaAction(ctx context.Context, expected u
 	if journal.closed {
 		return ErrControl
 	}
-	operation := record.Request.Operation
+	operation := replicaActionJournalKey(record.Request.Operation, record.Request.Kind)
 	current, found := journal.records[operation]
 	if expected == 0 && found || expected != 0 && (!found || current.Revision != expected) {
 		return ErrConflict
@@ -231,7 +231,7 @@ func (journal *FileJournal) recover() error {
 			return errors.Join(readErr, closeErr)
 		}
 		record, decodeErr := openReplicaActionJournalRecord(raw)
-		if decodeErr != nil || record.Request.Operation != operation {
+		if decodeErr != nil || replicaActionJournalKey(record.Request.Operation, record.Request.Kind) != operation {
 			return errors.Join(ErrControl, decodeErr)
 		}
 		if _, duplicate := journal.records[operation]; duplicate {

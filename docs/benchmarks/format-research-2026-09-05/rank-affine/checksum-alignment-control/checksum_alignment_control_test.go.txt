@@ -1,0 +1,68 @@
+package checksumalignmentcontrol
+
+import (
+	"fmt"
+	"testing"
+)
+
+var benchmarkSink byte
+
+func scalarXOR(data []byte) byte {
+	var sink byte
+	for _, value := range data {
+		sink ^= value
+	}
+	return sink
+}
+
+func diagnosticData(offset, length int) []byte {
+	data := make([]byte, offset+length+64)
+	for i := range data {
+		data[i] = byte((i*131 + offset*17 + length*7) ^ (i >> 3))
+	}
+	return data[offset : offset+length]
+}
+
+func TestXorAlignmentOracle(t *testing.T) {
+	lengths := []int{0, 1, 2, 3, 7, 8, 9, 15, 16, 17, 31, 32, 63, 64, 65, 127, 128, 129, 255, 256, 257, 1023, 1024, 1025}
+	for _, length := range lengths {
+		for offset := 0; offset < 64; offset++ {
+			data := diagnosticData(offset, length)
+			want := scalarXOR(data)
+			if got := xorAt24(data); got != want {
+				t.Fatalf("xorAt24 length=%d offset=%d got=%d want=%d", length, offset, got, want)
+			}
+			if got := xorAt56(data); got != want {
+				t.Fatalf("xorAt56 length=%d offset=%d got=%d want=%d", length, offset, got, want)
+			}
+		}
+	}
+}
+
+func BenchmarkXorAlignment(b *testing.B) {
+	for _, tc := range []struct {
+		name string
+		fn   func([]byte) byte
+	}{
+		{name: "offset24", fn: xorAt24},
+		{name: "offset56", fn: xorAt56},
+	} {
+		tc := tc
+		b.Run(tc.name, func(b *testing.B) {
+			for _, length := range []int{249, 4096} {
+				length := length
+				b.Run(fmt.Sprintf("bytes=%d", length), func(b *testing.B) {
+					data := diagnosticData(17, length)
+					var sink byte
+					b.SetBytes(int64(len(data)))
+					b.ResetTimer()
+					for b.Loop() {
+						sink ^= tc.fn(data)
+					}
+					b.StopTimer()
+					benchmarkSink ^= sink
+				})
+			}
+		})
+	}
+}

@@ -1,0 +1,15 @@
+{
+  "platform": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
+  "runs_per_arm": 9,
+  "gomaxprocs_per_process": 2,
+  "checkpoint_interval_seconds": 2,
+  "workers": 2,
+  "writes_per_worker": 2048,
+  "document_bytes": 65536,
+  "order": "base/candidate on odd pairs; candidate/base on even pairs",
+  "binary_sha256": {
+    "base": "6e34a8576bec7b2286fdf84e2c52e7e8cdbfd85fe68d00f767a4fe24c1b61e01",
+    "candidate": "faade880e403696a69894798db101cd0961d217bf3d680fa8d7bf4b87440c451"
+  },
+  "started_unix_seconds": 1788631462.0213294
+}

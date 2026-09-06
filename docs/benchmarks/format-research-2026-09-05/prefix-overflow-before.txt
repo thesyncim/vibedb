@@ -1,0 +1,7 @@
+--- FAIL: TestCompactPrefixIntOverflowDeclinesWithoutChangingValues (0.00s)
+    compact_stream_codec_test.go:697: accepted overflowing numeric spelling "46000000000000000000"
+    compact_stream_codec_test.go:697: accepted overflowing numeric spelling "\"ticket:46000000000000000000\""
+    compact_stream_codec_test.go:710: row 0 got="\"ticket:09106511852580896768\"" ok=true want="\"ticket:46000000000000000000\""
+FAIL
+FAIL	github.com/thesyncim/vibedb/internal/storeio	0.347s
+FAIL

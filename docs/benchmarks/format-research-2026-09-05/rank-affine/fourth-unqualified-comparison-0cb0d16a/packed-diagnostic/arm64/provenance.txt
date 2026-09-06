@@ -1,0 +1,52 @@
+base=02b75683f227470d6d198274f532bf39d5fa417d merge=38d3b3b1d373215b6942bbe9ce84fdcf71038e9e pr_head=0cb0d16a9a58944d79feeeecd063ff8aa239f5da runner=ubuntu-24.04-arm
+go version go1.27.1 linux/arm64
+Linux runnervmfx5wp 6.17.0-1022-azure #22-Ubuntu SMP Mon Jul 27 17:12:01 UTC 2026 aarch64 aarch64 aarch64 GNU/Linux
+Architecture:                            aarch64
+CPU op-mode(s):                          32-bit, 64-bit
+Byte Order:                              Little Endian
+CPU(s):                                  4
+On-line CPU(s) list:                     0-3
+Vendor ID:                               ARM
+Model name:                              Neoverse-N2
+Model:                                   0
+Thread(s) per core:                      1
+Core(s) per socket:                      4
+Socket(s):                               1
+Stepping:                                r0p0
+BogoMIPS:                                2000.00
+Flags:                                   fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 asimddp sha512 sve asimdfhm uscat ilrcpc flagm sb paca pacg dcpodp sve2 sveaes svebitperm svesha3 svesm4 flagm2 frint svei8mm svebf16 i8mm bf16
+L1d cache:                               256 KiB (4 instances)
+L1i cache:                               256 KiB (4 instances)
+L2 cache:                                4 MiB (4 instances)
+L3 cache:                                128 MiB (1 instance)
+NUMA node(s):                            1
+NUMA node0 CPU(s):                       0-3
+Vulnerability Gather data sampling:      Not affected
+Vulnerability Ghostwrite:                Not affected
+Vulnerability Indirect target selection: Not affected
+Vulnerability Itlb multihit:             Not affected
+Vulnerability L1tf:                      Not affected
+Vulnerability Mds:                       Not affected
+Vulnerability Meltdown:                  Not affected
+Vulnerability Mmio stale data:           Not affected
+Vulnerability Old microcode:             Not affected
+Vulnerability Reg file data sampling:    Not affected
+Vulnerability Retbleed:                  Not affected
+Vulnerability Spec rstack overflow:      Not affected
+Vulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl
+Vulnerability Spectre v1:                Mitigation; __user pointer sanitization
+Vulnerability Spectre v2:                Mitigation; CSV2, BHB
+Vulnerability Srbds:                     Not affected
+Vulnerability Tsa:                       Not affected
+Vulnerability Tsx async abort:           Not affected
+Vulnerability Vmscape:                   Not affected
+               total        used        free      shared  buff/cache   available
+Mem:     16722046976  1477816320 11465314304    47345664  4100677632 15244230656
+Swap:     3221221376           0  3221221376
+Filesystem     Type 1K-blocks     Used Available Use% Mounted on
+/dev/root      ext4 151263856 40186996 111060476  27% /
+4272df18dc68c51c4a114ebd8fea61469af8503ebbf7dadbcde6bef525f07e9b  go.mod
+e7788c363bd4bc5087b26a46f1cb6415e1b51067b656e02c8b22ba930092dfc9  go.sum
+944a0abe86025705a1c6230619497f5ca42099377dd29dd688d12a25f30d5e73  internal/benchcorpus/corpus.go
+a2acda8b12afb0f8499a9fe732b7c42496db9b687b7aa3576f2a4ecf2fd0e345  store/durable/store_file_parallel_scan_bench_test.go
+8d674e02bcc766c1c0612b36ca44d74e652d39d842ad132d11ca31020dfc4078  store/durable/store_file_high_cardinality_point_bench_test.go

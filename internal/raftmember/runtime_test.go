@@ -44,6 +44,10 @@ func newRuntimeFixtureWithOptions(
 	voters []uint64,
 	options raftstore.Options,
 ) runtimeFixture {
+	return newRuntimeFixtureWithPipeline(t, seed, voters, options, false)
+}
+
+func newRuntimeFixtureWithPipeline(t testing.TB, seed byte, voters []uint64, options raftstore.Options, pipelined bool) runtimeFixture {
 	t.Helper()
 	identity := testWALIdentity(seed)
 	if len(voters) == 0 {
@@ -84,7 +88,7 @@ func newRuntimeFixtureWithOptions(
 	if _, err := apply.InstallSnapshot(bootstrap); err != nil {
 		t.Fatalf("initialize runtime apply: %v", err)
 	}
-	runtime, err := AdoptRuntime(wal, database, apply)
+	runtime, err := adoptRuntime(wal, database, apply, 0, pipelined)
 	if err != nil {
 		if runtime != nil {
 			_ = runtime.Close()

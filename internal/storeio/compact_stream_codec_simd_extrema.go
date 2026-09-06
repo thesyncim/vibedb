@@ -2,14 +2,31 @@ package storeio
 
 import "encoding/binary"
 
-// countIntegerExtrema scans one signed integer FOR stream and returns its
-// exact extrema. A width-64 stream, or a sub-64 stream whose base plus the
-// maximum representable delta would cross MaxInt64, is declined: unsigned
-// lane ordering is then no longer signed ordering and the native aggregate
-// must leave the complete query to the generic executor.
+// countIntegerExtrema returns exact extrema for a checked bare PrefixInt or
+// signed integer FOR stream. A width-64 stream, or a sub-64 stream whose base
+// plus the maximum representable delta would cross MaxInt64, is declined:
+// unsigned lane ordering is then no longer signed ordering and the native
+// aggregate must leave the complete query to the generic executor.
 func (v compactStreamView) countIntegerExtrema() (
 	minimum, maximum int64, found, supported bool,
 ) {
+	if v.kind == compactStreamPrefixInt {
+		first, step, supported := v.barePrefixIntegerArithmetic()
+		if !supported {
+			return 0, 0, false, false
+		}
+		if v.count == 0 {
+			return 0, 0, false, true
+		}
+		last := first
+		if v.count > 1 {
+			last += step * int64(v.count-1)
+		}
+		if last < first {
+			return last, first, true, true
+		}
+		return first, last, true, true
+	}
 	if !v.validIntegerFORData() || v.width == 64 || v.dictCount != 0 ||
 		len(v.dictDir) != 0 || len(v.dictData) != 0 {
 		return 0, 0, false, false

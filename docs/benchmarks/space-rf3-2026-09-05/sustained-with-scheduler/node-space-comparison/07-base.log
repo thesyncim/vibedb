@@ -1,0 +1,4 @@
+=== RUN   TestServeRF3NodeSpaceQualification
+    node_space_process_qualification_test.go:291: writes=4096 elapsed=36.989371406s allocated=306819072->1126711296 initial segments removed=[0 0 0] checkpoints=[3974 4000 4009]
+--- PASS: TestServeRF3NodeSpaceQualification (41.31s)
+PASS

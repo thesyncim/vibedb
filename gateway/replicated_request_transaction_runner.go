@@ -231,9 +231,30 @@ func (runner *DurableRequestDistributedRunner) RunTyped(
 	}
 	if head.NextStepOrdinal != 0 {
 		stage = "manifest recovery"
-		descriptor, err = runner.recoverManifestDescriptor(ctx, execution, coordinatorRoute)
+		var recovered replicatedstate.TransactionRecoveryRecord
+		descriptor, recovered, err = runner.recoverManifestDescriptor(ctx, execution, coordinatorRoute)
 		if err != nil {
 			return DurableRequestTerminalResult{}, err
+		}
+		if distributedtxn.CoordinatorState(recovered.State) == distributedtxn.CoordinatorRetired {
+			// Retirement deletes the manifest before the ledger can record its
+			// completion. Only the authenticated final pending ordinal may use
+			// the tombstone to replay that exact retirement command. The normal
+			// staged-wave path still verifies retained command bytes and settles
+			// the native completion; a tombstone alone never completes a request.
+			if state.branch == durableDistributedUndecided || finalWaves == 0 ||
+				head.NextStepOrdinal != finalWaves-1 || recovered.Revision < 3 ||
+				recovered.PayloadCount != execution.Recipe.TargetCount || len(recovered.Payload) != 0 ||
+				recovered.AffectedRowsValid != (state.branch == durableDistributedCommitted) ||
+				recovered.AffectedRows != state.affected {
+				return DurableRequestTerminalResult{}, ErrDurableRequestConflict
+			}
+			stage = "retirement response recovery"
+			progress.ordinal = head.NextStepOrdinal
+			if err = progress.retire(ctx, coordinator, coordinatorRoute, recovered.Revision-2); err != nil {
+				return DurableRequestTerminalResult{}, err
+			}
+			return runner.completeTerminal(ctx, progress.execution, authority, progress.state)
 		}
 	}
 	manifestCommands := uint64(1)
@@ -368,9 +389,9 @@ func (runner *DurableRequestDistributedRunner) recoverManifestDescriptor(
 	ctx context.Context,
 	execution DurableRequestTypedExecutionContext,
 	route ReplicatedRoute,
-) (distributedtxn.ManifestDescriptor, error) {
+) (distributedtxn.ManifestDescriptor, replicatedstate.TransactionRecoveryRecord, error) {
 	if runner.recovery == nil {
-		return distributedtxn.ManifestDescriptor{}, ErrDurableRequestUnresolved
+		return distributedtxn.ManifestDescriptor{}, replicatedstate.TransactionRecoveryRecord{}, ErrDurableRequestUnresolved
 	}
 	result, err := runner.recovery.ReadTransactionRecovery(ctx, route,
 		replicatedstate.TransactionRecoveryReadRequest{
@@ -379,16 +400,23 @@ func (runner *DurableRequestDistributedRunner) recoverManifestDescriptor(
 			MaxBytes: uint32(replicatedstate.TransactionRecoverySummaryBytes + distributedtxn.MaxCoordinatorRecordBytes),
 		})
 	if err != nil || len(result.Records) != 1 {
-		return distributedtxn.ManifestDescriptor{}, errors.Join(err, ErrDurableRequestUnresolved)
+		return distributedtxn.ManifestDescriptor{}, replicatedstate.TransactionRecoveryRecord{}, errors.Join(err, ErrDurableRequestUnresolved)
 	}
 	record := result.Records[0]
+	if record.ID != execution.Recipe.Identity.ID || record.Role != distributedtxn.ReplicatedRoleCoordinator ||
+		record.PayloadKind != distributedtxn.ReplicatedPayloadManifestCoordinator {
+		return distributedtxn.ManifestDescriptor{}, replicatedstate.TransactionRecoveryRecord{}, ErrDurableRequestConflict
+	}
+	if distributedtxn.CoordinatorState(record.State) == distributedtxn.CoordinatorRetired {
+		return distributedtxn.ManifestDescriptor{}, record, nil
+	}
 	manifest, openErr := distributedtxn.OpenManifestCoordinator(record.Payload)
 	if openErr != nil || record.ID != execution.Recipe.Identity.ID ||
 		record.PayloadKind != distributedtxn.ReplicatedPayloadManifestCoordinator ||
 		manifest.Manifest.TargetCount != execution.Recipe.TargetCount {
-		return distributedtxn.ManifestDescriptor{}, errors.Join(openErr, ErrDurableRequestConflict)
+		return distributedtxn.ManifestDescriptor{}, replicatedstate.TransactionRecoveryRecord{}, errors.Join(openErr, ErrDurableRequestConflict)
 	}
-	return manifest.Manifest, nil
+	return manifest.Manifest, record, nil
 }
 
 func (progress *durableDistributedProgress) prepare(
