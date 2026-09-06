@@ -1,0 +1,4 @@
+linux
+amd64
+go1.27.1
+local

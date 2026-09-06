@@ -1,0 +1,52 @@
+Compiler proof for the final local scan refinement
+
+Source and revisions
+====================
+Remote paired comparison:
+  base revision:      47cedea615c9642eb3afc3b178d8da414f47e457
+  candidate revision: 4627a3918ded255d1aa8cf21e2b9eed82d6d2730
+
+SHA-256 of source files at candidate revision 4627a391:
+  internal/storeio/compact_primary_scan.go   c4ba91a64fe554a49069533eed8433e0f9997e67707fbad14b5d7dc4c1f467da
+  internal/storeio/compact_primary_stripe.go d83c455cecc53d12dceb870cba901933ffbdcdea8b3096c265755c49047d569a
+  internal/storeio/compact_stream_rank_affine.go da4ac097daa49911a1ad68d7d3964c21012a059a74090fa9ca0cdfdeda7d98e2
+
+SHA-256 of source files at base revision 47cedea:
+  internal/storeio/compact_primary_scan.go   a1dd7bdd60d425ed4dc8999a42f84761afee67e9586e51650892d46a89eaac43
+  internal/storeio/compact_primary_stripe.go 99adf1478384d513ffc3d0e0f72cceafadd0daac79a16cfa609dfe836e408afb
+  internal/storeio/compact_stream_rank_affine.go absent at this revision
+
+The local post-CI scan refinement used for the final dump has Git blob hash
+b0d45cd0fdde48e77135e6d74fdb8b99f8868ccf. The working-tree SHA-256 values at
+that dump were:
+  internal/storeio/compact_primary_scan.go   4d709a7c5595ec6eaf989103134ba190863b49c1d8f6f1fabba14957dab72c57
+  internal/storeio/compact_primary_stripe.go c867434b14b5fe46769c002c9c7b1248c386aeff06c5f6e11a48fa724edb1aa6
+  internal/storeio/compact_stream_rank_affine.go eff5c7548538a43e881d0c956edc2255cc94fa31254cc8e2f469f6b89656e2cf
+The base revision predates compact_stream_rank_affine.go, so that path has no
+base blob.
+
+Commands
+========
+  GOOS=linux GOARCH=amd64 GOEXPERIMENT=simd CODEX_AGENT_ID=space-rf3-scan \
+    scripts/project-env go test -c ./internal/storeio \
+    -o /private/tmp/vibedb-rf3-amd64-codegen-holes/candidate-storeio.test
+  go tool objdump -s \
+    'github.com/thesyncim/vibedb/internal/storeio.(*CompactPrimaryScanDecoder).appendValue' \
+    /private/tmp/vibedb-rf3-amd64-codegen-holes/candidate-storeio.test
+
+Reference dumps
+===============
+  4627 candidate:
+    /private/tmp/vibedb-rf3-amd64-codegen-4627/candidate-CompactPrimaryScanDecoder.appendValue.objdump
+  4627 base:
+    /private/tmp/vibedb-rf3-amd64-codegen-4627/base-CompactPrimaryScanDecoder.appendValue.objdump
+  post-refinement candidate binary:
+    /private/tmp/vibedb-rf3-amd64-codegen-holes/candidate-storeio.test
+
+Observed counts from the dump review
+=====================================
+  4627 candidate: meta.holes reloads and ends[hole] bounds checks remained in
+                 both loops, plus a final ends[holes] bounds check.
+  post-refinement: one meta.holes load remains; both loop bounds checks and
+                   the final ends[holes] check are absent.
+  helper/signature changes: none.

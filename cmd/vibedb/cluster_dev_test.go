@@ -1006,3 +1006,28 @@ func TestDevSupervisorObservesChildExit(t *testing.T) {
 		t.Fatal("supervisor did not observe child exit")
 	}
 }
+
+func TestDevChildrenShareShutdownDeadline(t *testing.T) {
+	var children []*devChild
+	t.Cleanup(func() { stopDevChildrenWithin(children, 0) })
+	for i := 0; i < 4; i++ {
+		child, err := startDevChild("/bin/sh", []string{"-c", "trap '' TERM; echo READY; exec sleep 30"}, "READY")
+		if err != nil {
+			t.Fatal(err)
+		}
+		children = append(children, child)
+		if err = waitDevReady(t.Context(), child); err != nil {
+			t.Fatal(err)
+		}
+	}
+	started := time.Now()
+	stopDevChildrenWithin(children, 400*time.Millisecond)
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("shutdown budget multiplied by child count: %s", elapsed)
+	}
+	for _, child := range children {
+		if child.command.ProcessState == nil {
+			t.Fatal("child was not reaped before shutdown returned")
+		}
+	}
+}

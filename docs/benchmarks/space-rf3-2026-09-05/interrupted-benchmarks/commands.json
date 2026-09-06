@@ -1,0 +1,98 @@
+[
+  {
+    "trial": 1,
+    "arm": "base",
+    "package": "durable",
+    "command": [
+      "/tmp/vibedb-space-base-durable.test",
+      "-test.run=^$",
+      "-test.bench=^(BenchmarkUnifiedGetRaw|BenchmarkUnifiedPrimaryReplace|BenchmarkUnifiedScanAllBytesLowCardinality|BenchmarkUnifiedScanAllBytesHighCardinality|BenchmarkFileStorePutDurabilitySync)$/(writers=1)?$",
+      "-test.benchtime=200ms",
+      "-test.count=1",
+      "-test.cpu=1",
+      "-test.benchmem"
+    ],
+    "exit_code": 0,
+    "seconds": 17.44001793861389
+  },
+  {
+    "trial": 1,
+    "arm": "base",
+    "package": "raft",
+    "command": [
+      "/tmp/vibedb-space-base-raft.test",
+      "-test.run=^$",
+      "-test.bench=^BenchmarkNodeStorePersistDurability$",
+      "-test.benchtime=200ms",
+      "-test.count=1",
+      "-test.cpu=1",
+      "-test.benchmem"
+    ],
+    "exit_code": 0,
+    "seconds": 3.386740207672119
+  },
+  {
+    "trial": 1,
+    "arm": "after",
+    "package": "durable",
+    "command": [
+      "/tmp/vibedb-space-after-durable.test",
+      "-test.run=^$",
+      "-test.bench=^(BenchmarkUnifiedGetRaw|BenchmarkUnifiedPrimaryReplace|BenchmarkUnifiedScanAllBytesLowCardinality|BenchmarkUnifiedScanAllBytesHighCardinality|BenchmarkFileStorePutDurabilitySync)$/(writers=1)?$",
+      "-test.benchtime=200ms",
+      "-test.count=1",
+      "-test.cpu=1",
+      "-test.benchmem"
+    ],
+    "exit_code": 0,
+    "seconds": 5.7759010791778564
+  },
+  {
+    "trial": 1,
+    "arm": "after",
+    "package": "raft",
+    "command": [
+      "/tmp/vibedb-space-after-raft.test",
+      "-test.run=^$",
+      "-test.bench=^BenchmarkNodeStorePersistDurability$",
+      "-test.benchtime=200ms",
+      "-test.count=1",
+      "-test.cpu=1",
+      "-test.benchmem"
+    ],
+    "exit_code": 0,
+    "seconds": 3.715693950653076
+  },
+  {
+    "trial": 2,
+    "arm": "after",
+    "package": "durable",
+    "command": [
+      "/tmp/vibedb-space-after-durable.test",
+      "-test.run=^$",
+      "-test.bench=^(BenchmarkUnifiedGetRaw|BenchmarkUnifiedPrimaryReplace|BenchmarkUnifiedScanAllBytesLowCardinality|BenchmarkUnifiedScanAllBytesHighCardinality|BenchmarkFileStorePutDurabilitySync)$/(writers=1)?$",
+      "-test.benchtime=200ms",
+      "-test.count=1",
+      "-test.cpu=1",
+      "-test.benchmem"
+    ],
+    "exit_code": 0,
+    "seconds": 4.923638105392456
+  },
+  {
+    "trial": 2,
+    "arm": "after",
+    "package": "raft",
+    "command": [
+      "/tmp/vibedb-space-after-raft.test",
+      "-test.run=^$",
+      "-test.bench=^BenchmarkNodeStorePersistDurability$",
+      "-test.benchtime=200ms",
+      "-test.count=1",
+      "-test.cpu=1",
+      "-test.benchmem"
+    ],
+    "exit_code": -15,
+    "seconds": 0.8525161743164062
+  }
+]

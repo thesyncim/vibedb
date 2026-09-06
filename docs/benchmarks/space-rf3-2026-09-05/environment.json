@@ -1,0 +1,51 @@
+{
+  "base": "8e4e60f6bf5baa1eb2489e4a84a7eaec065ec51f",
+  "branch": "codex/space-savings-rf3",
+  "binaries": {
+    "base-durable": {
+      "sha256": "5cd99dfa9ced4c65108ca597a8856d3e9cbada47efac4f23dd56becc2afa1018",
+      "build": "/tmp/vibedb-space-base-durable.test: go1.27.0-X:simd\n\tpath\tgithub.com/thesyncim/vibedb/store/durable.test\n\tmod\tgithub.com/thesyncim/vibedb\t(devel)\t\n\tdep\tgithub.com/cespare/xxhash/v2\tv2.3.0\th1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=\n\tdep\tgithub.com/thesyncim/vibejson\tv0.1.0\th1:Hk6Zp2RyiNuTBk7UiJ1I67ZJEpqIIiIE6J5gCUsAVc8=\n\tdep\tgo.etcd.io/raft/v3\tv3.7.0\th1:BGzlwx07bLv8PW6OU5HObuz1y4hlPZUXA07pM1mPUh4=\n\tdep\tgolang.org/x/sys\tv0.47.0\th1:o7XGOvZQCADBQQ4Y7VNq2dRWQR7JmOUW8Kxx4ZsNgWs=\n\tdep\tgoogle.golang.org/protobuf\tv1.36.11\th1:fV6ZwhNocDyBLK0dj+fg8ektcVegBBuEolpbTQyBNVE=\n\tbuild\t-buildmode=exe\n\tbuild\t-compiler=gc\n\tbuild\tCGO_ENABLED=1\n\tbuild\tCGO_CFLAGS=\n\tbuild\tCGO_CPPFLAGS=\n\tbuild\tCGO_CXXFLAGS=\n\tbuild\tCGO_LDFLAGS=\n\tbuild\tGOARCH=arm64\n\tbuild\tGOEXPERIMENT=simd\n\tbuild\tGOOS=darwin\n\tbuild\tGOARM64=v8.0\n"
+    },
+    "base-raft": {
+      "sha256": "9bd1c70c385f7132bbcf271fd0317c99ba6abe72f3e7eedc1c628ce4b80316f7",
+      "build": "/tmp/vibedb-space-base-raft.test: go1.27.0-X:simd\n\tpath\tgithub.com/thesyncim/vibedb/internal/raftstore.test\n\tmod\tgithub.com/thesyncim/vibedb\t(devel)\t\n\tdep\tgithub.com/thesyncim/vibejson\tv0.1.0\th1:Hk6Zp2RyiNuTBk7UiJ1I67ZJEpqIIiIE6J5gCUsAVc8=\n\tdep\tgo.etcd.io/raft/v3\tv3.7.0\th1:BGzlwx07bLv8PW6OU5HObuz1y4hlPZUXA07pM1mPUh4=\n\tdep\tgolang.org/x/sys\tv0.47.0\th1:o7XGOvZQCADBQQ4Y7VNq2dRWQR7JmOUW8Kxx4ZsNgWs=\n\tdep\tgoogle.golang.org/protobuf\tv1.36.11\th1:fV6ZwhNocDyBLK0dj+fg8ektcVegBBuEolpbTQyBNVE=\n\tbuild\t-buildmode=exe\n\tbuild\t-compiler=gc\n\tbuild\tCGO_ENABLED=1\n\tbuild\tCGO_CFLAGS=\n\tbuild\tCGO_CPPFLAGS=\n\tbuild\tCGO_CXXFLAGS=\n\tbuild\tCGO_LDFLAGS=\n\tbuild\tGOARCH=arm64\n\tbuild\tGOEXPERIMENT=simd\n\tbuild\tGOOS=darwin\n\tbuild\tGOARM64=v8.0\n"
+    },
+    "after-durable": {
+      "sha256": "c1df7d7ad95f7d2c35e6d9d469ee08d1be1fc1afad5492553012d7841343f6b9",
+      "build": "/tmp/vibedb-space-after-durable.test: go1.27.0-X:simd\n\tpath\tgithub.com/thesyncim/vibedb/store/durable.test\n\tmod\tgithub.com/thesyncim/vibedb\t(devel)\t\n\tdep\tgithub.com/cespare/xxhash/v2\tv2.3.0\th1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=\n\tdep\tgithub.com/thesyncim/vibejson\tv0.1.0\th1:Hk6Zp2RyiNuTBk7UiJ1I67ZJEpqIIiIE6J5gCUsAVc8=\n\tdep\tgo.etcd.io/raft/v3\tv3.7.0\th1:BGzlwx07bLv8PW6OU5HObuz1y4hlPZUXA07pM1mPUh4=\n\tdep\tgolang.org/x/sys\tv0.47.0\th1:o7XGOvZQCADBQQ4Y7VNq2dRWQR7JmOUW8Kxx4ZsNgWs=\n\tdep\tgoogle.golang.org/protobuf\tv1.36.11\th1:fV6ZwhNocDyBLK0dj+fg8ektcVegBBuEolpbTQyBNVE=\n\tbuild\t-buildmode=exe\n\tbuild\t-compiler=gc\n\tbuild\tCGO_ENABLED=1\n\tbuild\tCGO_CFLAGS=\n\tbuild\tCGO_CPPFLAGS=\n\tbuild\tCGO_CXXFLAGS=\n\tbuild\tCGO_LDFLAGS=\n\tbuild\tGOARCH=arm64\n\tbuild\tGOEXPERIMENT=simd\n\tbuild\tGOOS=darwin\n\tbuild\tGOARM64=v8.0\n"
+    },
+    "after-raft": {
+      "sha256": "2ca22c2a56bcd8739f4861b3fe03bff687d5a6699643c21931a193b4875f5bdd",
+      "build": "/tmp/vibedb-space-after-raft.test: go1.27.0-X:simd\n\tpath\tgithub.com/thesyncim/vibedb/internal/raftstore.test\n\tmod\tgithub.com/thesyncim/vibedb\t(devel)\t\n\tdep\tgithub.com/thesyncim/vibejson\tv0.1.0\th1:Hk6Zp2RyiNuTBk7UiJ1I67ZJEpqIIiIE6J5gCUsAVc8=\n\tdep\tgo.etcd.io/raft/v3\tv3.7.0\th1:BGzlwx07bLv8PW6OU5HObuz1y4hlPZUXA07pM1mPUh4=\n\tdep\tgolang.org/x/sys\tv0.47.0\th1:o7XGOvZQCADBQQ4Y7VNq2dRWQR7JmOUW8Kxx4ZsNgWs=\n\tdep\tgoogle.golang.org/protobuf\tv1.36.11\th1:fV6ZwhNocDyBLK0dj+fg8ektcVegBBuEolpbTQyBNVE=\n\tbuild\t-buildmode=exe\n\tbuild\t-compiler=gc\n\tbuild\tCGO_ENABLED=1\n\tbuild\tCGO_CFLAGS=\n\tbuild\tCGO_CPPFLAGS=\n\tbuild\tCGO_CXXFLAGS=\n\tbuild\tCGO_LDFLAGS=\n\tbuild\tGOARCH=arm64\n\tbuild\tGOEXPERIMENT=simd\n\tbuild\tGOOS=darwin\n\tbuild\tGOARM64=v8.0\n"
+    }
+  },
+  "benchmarks": {
+    "host": "Apple M4 Max, darwin/arm64",
+    "goexperiment": "simd",
+    "cpu": 1,
+    "benchtime": "200ms",
+    "samples_per_arm": 6,
+    "order": "base/after on odd trials, after/base on even trials",
+    "notes": "Shared host. Initial interrupted write benchmark attempt overlapped Linux tests; retained separately and excluded. Completed comparisons began after those tests finished. Write regex selected all writers and excluded root read benchmarks; reads and replacements measured in a separate complete campaign."
+  },
+  "tests": {
+    "linux": "golang:1.27-bookworm, GOEXPERIMENT=simd, --cpus=4, TMPDIR on dedicated Docker volume",
+    "darwin_race": "go test -race ./internal/raftstore ./internal/raftstore/seglog -run Test(NodeLogMaintenance|Reclaim|DescriptorCatalog) -count=1 -timeout=5m",
+    "rf3_server_raw_sha256": "223989c35c6bf242a4ff886eeda61dbfbd6d762a4fccd8abaf32845a99ad26fb",
+    "rf3_server_command": "GOEXPERIMENT=simd TMPDIR=/scratch go test -count=1 -v -timeout=5m ./cmd/vibedb-shard -run '^(TestPrepareRF3NodeSharedLogAndRuntime|TestServeRF3NodeLogThreeServersRestart|TestRF3NodeRecoveryAcrossSegmentEntryCapacity)$'",
+    "windows_compile": "CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go test -run '^$' -exec=true ./internal/raftstore ./internal/raftmember",
+    "portable_footprint_helper": "The final storage fixture reuses internal/rf3bench.MeasureFootprint to keep Windows test compilation supported. Focused node maintenance tests were rerun after this test-only change.",
+    "linux_rebase_raw_sha256": "ebe561a574e5d69e52ac38589461016c1a59afe3ce4ab6f6f479c5bde311e7e5"
+  },
+  "benchmarked_runtime_source_sha256": {
+    "internal/raftmember/node_checkpoint.go": "13cf3bb80b37b2ceda840409ed73f9f14d63351d1928bfc8439d4cd140d28475",
+    "internal/raftstore/node_catalog.go": "75bb799ca061b6ff153d80694ed43a824ea6de2001d5aed0f4e7333fdcfbda68"
+  },
+  "final_runtime_source_sha256": {
+    "internal/raftmember/node_checkpoint.go": "13cf3bb80b37b2ceda840409ed73f9f14d63351d1928bfc8439d4cd140d28475",
+    "internal/raftstore/node_catalog.go": "7fe75b31ba27b25ead803805585e0f37e7fd47d4f4b9d0a0e0734a6b32723e57"
+  },
+  "post_benchmark_change": "MaintainNodeLog uses coordinateReadError (atomic published failure and close fences), preserving independently published engine failure when metadata is unavailable or reclamation reports ErrBounds. These error branches and maintenance itself are not exercised by the microbenchmarks. Final focused race and Linux tests cover the updated source.",
+  "final_parent": "b63e96c07a94404d0049481e2f98417490ddf032",
+  "rebase_note": "Rebased onto the fetched main tip after measurement. There were no changes to internal/raftstore, internal/raftmember, store/durable, or internal/storeio between the benchmark base and this parent. SQL and gateway changes remain outside the original microbenchmark qualification. Linux storage/runtime/server checks rerun after rebase."
+}

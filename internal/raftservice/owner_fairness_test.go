@@ -140,3 +140,93 @@ func TestOwnerServicesAsyncAndTickInSameBusyQuantum(t *testing.T) {
 		t.Fatalf("wake at %d, tick at %d; both must run at %d", host.wakeAt, host.tickAt, ownerProgressQuantum)
 	}
 }
+
+// New timer work must not replenish the Ready drain needed by a queued control.
+// Otherwise the control blocks peer ingress while timers continue elections.
+type controlDrainTickHost struct {
+	*alwaysRunnableReadHost
+	work, controlAt, ticksAfterControl int
+	asyncAt                            int
+	pulse                              chan struct{}
+	cancel                             context.CancelFunc
+}
+
+func (h *controlDrainTickHost) RunOne() (multiraft.Progress, bool, error) {
+	h.turns++
+	if h.turns == 1 {
+		close(h.firstRunEntered)
+		<-h.releaseFirstRun
+	}
+	if h.turns >= 1024 {
+		h.cancel()
+	}
+	if h.work == 0 {
+		return multiraft.Progress{}, false, nil
+	}
+	h.work--
+	return multiraft.Progress{Kind: multiraft.ProgressReady, ReadyKind: raftmember.DrivePersisted}, true, nil
+}
+func (h *controlDrainTickHost) WakePipelined() { h.asyncAt = h.turns }
+
+func (h *controlDrainTickHost) RequestTick(raftmember.GroupKey) error {
+	if h.controlAt != 0 {
+		h.ticksAfterControl++
+		h.cancel()
+		return nil
+	}
+	h.work += 2 * ownerProgressQuantum
+	select {
+	case h.pulse <- struct{}{}:
+	default:
+	}
+	return nil
+}
+func (h *controlDrainTickHost) RequestCampaign(raftmember.GroupKey) error {
+	if h.work != 0 {
+		return errors.New("campaign crossed pending Ready")
+	}
+	h.controlAt = h.turns
+	return nil
+}
+func TestOwnerControlDrainStopsNewTicksThenResumesThem(t *testing.T) {
+	group, _, base, owner, _ := newDeferredReadOwnerFixture()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	pulse := make(chan struct{}, 1)
+	pulse <- struct{}{}
+	host := &controlDrainTickHost{alwaysRunnableReadHost: &alwaysRunnableReadHost{deferredReadOwnerHost: base}, work: 4 * ownerProgressQuantum, pulse: pulse, cancel: cancel}
+	base.async = make(chan struct{}, 1)
+	base.async <- struct{}{}
+	owner.host, owner.pulse = host, pulse
+	done := make(chan error, 1)
+	go func() { done <- owner.Run(ctx) }()
+	<-host.firstRunEntered
+	reply := make(chan ownerReply, 1)
+	if err := owner.publish(ownerRequest{kind: requestCampaign, group: group, reply: reply}); err != nil {
+		t.Fatal(err)
+	}
+	close(host.releaseFirstRun)
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run: %v", err)
+	}
+	if host.controlAt == 0 || host.controlAt > 4*ownerProgressQuantum+1 {
+		t.Fatalf("control starved: admitted at %d after %d turns", host.controlAt, host.turns)
+	}
+	if host.asyncAt != ownerProgressQuantum {
+		t.Fatalf("async completion starved at control barrier: %d", host.asyncAt)
+	}
+	if host.ticksAfterControl == 0 {
+		t.Fatal("ticks did not resume after control")
+	}
+	select {
+	case r := <-reply:
+		if r.err != nil {
+			t.Fatal(r.err)
+		}
+	default:
+		t.Fatal("control completion lost")
+	}
+	if owner.ingressItems != 0 {
+		t.Fatal("control ingress charge leaked")
+	}
+}

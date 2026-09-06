@@ -46,13 +46,22 @@ func TestPostgreSQLDevOnlineCreateTableAndRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	args := []string{"cluster", "dev", "--root", filepath.Join(root, "state"), "--pg-listen", address, "--diagnostics-on-exit"}
+	// The supervisor gives all children a shared ten-second grace period;
+	// allow it to reap them and drain diagnostics before starting another owner.
+	stopCluster := func(process *rf3testfixture.ExternalProcess) error {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		return process.Stop(stopCtx)
+	}
 	start := func() *rf3testfixture.ExternalProcess {
 		process := &rf3testfixture.ExternalProcess{Binary: filepath.Join(bin, "vibedb"), Args: args}
 		if err := process.Start(); err != nil {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() {
-			replicaProcessStop(t, process)
+			if err := stopCluster(process); err != nil {
+				t.Errorf("cluster cleanup: %v", err)
+			}
 			if t.Failed() {
 				t.Log(process.Diagnostics())
 			}
@@ -263,7 +272,9 @@ active BOOLEAN NOT NULL
 	if err := connection.Close(); err != nil {
 		t.Fatal(err)
 	}
-	replicaProcessStop(t, process)
+	if err := stopCluster(process); err != nil {
+		t.Fatalf("cluster shutdown before restart: %v\n%s", err, process.Diagnostics())
+	}
 	start()
 	connection = openDDLWire(t, ctx, address)
 	defer connection.Close()

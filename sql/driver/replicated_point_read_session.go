@@ -4,10 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
+	"unsafe"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/query"
+	"github.com/thesyncim/vibejson"
 )
 
 // NewPointReadSession builds a read-only SQL session over one exact point
@@ -53,6 +57,10 @@ func (a *ReplicatedApply) newPointReadSessionInto(
 	if err := contextCheckpoint(ctx); err != nil {
 		return nil, err
 	}
+	reader := reuse
+	if reader == nil {
+		reader = &ReplicatedReadSession{}
+	}
 
 	a.database.mu.RLock()
 	defer a.database.mu.RUnlock()
@@ -74,7 +82,7 @@ func (a *ReplicatedApply) newPointReadSessionInto(
 		)
 	}
 	layout, _, _, err := a.pointReadSessionLayoutLocked(
-		relation, primaryPath, key, found, raw,
+		relation, primaryPath, key, found, raw, &reader.pointProof,
 	)
 	if err != nil {
 		return nil, err
@@ -102,11 +110,8 @@ func (a *ReplicatedApply) newPointReadSessionInto(
 	}
 	state.filterSource = query.NewFileFilterSource(state)
 
-	reader := reuse
 	var prepared map[*Prepared]struct{}
-	if reader == nil {
-		reader = &ReplicatedReadSession{}
-	} else {
+	if reuse != nil {
 		if reader.session.current != nil || reader.conn.open {
 			return nil, ErrCursorOpen
 		}
@@ -115,11 +120,11 @@ func (a *ReplicatedApply) newPointReadSessionInto(
 		}
 		prepared = reader.session.prepared
 	}
-	result := reader.conn.exec.Result
-	reader.conn = conn{
-		db: a.database, directWritesFenced: true,
-		exec: query.Exec{Options: options, Result: result},
-	}
+	// Reuse readers have already passed resetForReadReuse. Bind the fresh
+	// identity/options in place so the large, scrubbed Exec need not be copied.
+	reader.conn.db = a.database
+	reader.conn.directWritesFenced = true
+	reader.conn.exec.Options = options
 	transaction := &tx{
 		conn:        &reader.conn,
 		readOnly:    true,
@@ -160,19 +165,23 @@ func (a *ReplicatedApply) pointReadSessionLayoutLocked(
 	primaryPath, key []byte,
 	found bool,
 	raw []byte,
+	proof *replicatedPointSessionProof,
 ) (transactionTableLayout, *table, ReplicatedShardRelationIdentity, error) {
 	base := a.database.catalog.ReplicatedShardStore
 	if base == nil {
 		return transactionTableLayout{}, nil, ReplicatedShardRelationIdentity{},
 			ErrReplicatedApplyMismatch
 	}
-	if err := validateReplicatedShardStoreIdentity(*base); err != nil {
-		return transactionTableLayout{}, nil, ReplicatedShardRelationIdentity{},
-			fmt.Errorf("%w: invalid replicated shard store identity: %v", ErrReplicatedApplyMismatch, err)
-	}
-	if err := validateReplicatedApplyIdentity(a.identity, *base); err != nil {
-		return transactionTableLayout{}, nil, ReplicatedShardRelationIdentity{},
-			fmt.Errorf("%w: invalid replicated apply identity: %v", ErrReplicatedApplyMismatch, err)
+	warmProof := proof.valid && proof.base.Equal(*base) && proof.apply == a.identity
+	if !warmProof {
+		if err := validateReplicatedShardStoreIdentity(*base); err != nil {
+			return transactionTableLayout{}, nil, ReplicatedShardRelationIdentity{},
+				fmt.Errorf("%w: invalid replicated shard store identity: %v", ErrReplicatedApplyMismatch, err)
+		}
+		if err := validateReplicatedApplyIdentity(a.identity, *base); err != nil {
+			return transactionTableLayout{}, nil, ReplicatedShardRelationIdentity{},
+				fmt.Errorf("%w: invalid replicated apply identity: %v", ErrReplicatedApplyMismatch, err)
+		}
 	}
 	if relation == 0 || int(relation) > len(base.Relations) ||
 		int(base.RelationCount) != len(base.Relations) {
@@ -211,12 +220,23 @@ func (a *ReplicatedApply) pointReadSessionLayoutLocked(
 	if err != nil {
 		return transactionTableLayout{}, nil, ReplicatedShardRelationIdentity{}, err
 	}
-	expectedManifest, err := replicatedSchemaManifestValidated(
-		*base, a.identity, replicatedApplyLocalIndexes(table),
-	)
+	expectedManifest := proof.manifest
+	if !warmProof {
+		expectedManifest, err = replicatedSchemaManifestValidated(
+			*base, a.identity, replicatedApplyLocalIndexes(table),
+		)
+	}
 	if err != nil || manifest != expectedManifest {
 		return transactionTableLayout{}, nil, ReplicatedShardRelationIdentity{},
 			fmt.Errorf("%w: live relation manifest differs from the apply claim", ErrReplicatedApplyMismatch)
+	}
+	if !warmProof {
+		proof.base = base.Clone()
+		proof.apply = a.identity
+		proof.apply.Storage = strings.Clone(a.identity.Storage)
+		proof.apply.CaptureStorage = strings.Clone(a.identity.CaptureStorage)
+		proof.apply.Placement = ownedReplicatedPlacementProfile(a.identity.Placement)
+		proof.manifest, proof.valid = expectedManifest, true
 	}
 	if len(primaryPath) == 0 || string(primaryPath) != base.UserPrimaryKey {
 		return transactionTableLayout{}, nil, ReplicatedShardRelationIdentity{},
@@ -238,9 +258,25 @@ func (a *ReplicatedApply) pointReadSessionLayoutLocked(
 	// Re-run the same exact key, schema, and owned-range proof used by apply.
 	// This protects the constructor if a caller supplies bytes that did not come
 	// directly from PointReadInto, and keeps malformed or stale keys fail-closed.
-	validator := newReplicatedSQLMutationValidator(
-		*base, table, a.identity.Placement,
-	)
+	validator := &proof.validator
+	if validator.placement.mapper == nil {
+		validator.placement.mapper = distribution.NewNativeMapper(1)
+	}
+	validator.primaryKey, validator.primary = base.UserPrimaryKey, table.primary
+	validator.maxKeyBytes = base.UserLimits.MaxKeyBytes
+	validator.schema, validator.maxDocumentBytes = table.schema, base.UserLimits.MaxDocumentBytes
+	validator.placement.target = a.identity.Placement.Range
+	defer func() {
+		// The slot owns scratch, but the schema and compiled primary pointer
+		// belong to this live catalog check and must not survive it.
+		validator.primaryKey, validator.primary, validator.schema = "", vibejson.CompiledPointer{}, nil
+		clear(validator.keyScratch[:cap(validator.keyScratch)])
+		clear(validator.decodeScratch[:cap(validator.decodeScratch)])
+		clear(validator.schemaTape[:cap(validator.schemaTape)])
+		if proof.validatorBytes() > replicatedReadReuseResultBytes {
+			validator.keyScratch, validator.decodeScratch, validator.schemaTape = nil, nil, nil
+		}
+	}()
 	var validation replicatedstate.MutationValidation
 	if found {
 		validation = validator.ValidatePutOwnership(
@@ -256,6 +292,40 @@ func (a *ReplicatedApply) pointReadSessionLayoutLocked(
 			fmt.Errorf("%w: point key or value failed the live relation proof", ErrReplicatedApplyMismatch)
 	}
 	return layout, table, descriptor, nil
+}
+
+// Memoize only independently owned identity values and their validated digest.
+// Every read still compares the complete live base/apply identities, opened
+// relation metadata, layout, and machine manifest. No catalog pointer or row is
+// retained, and even in-place descriptor mutations force full revalidation.
+type replicatedPointSessionProof struct {
+	base      ReplicatedShardStoreIdentity
+	apply     ReplicatedApplyIdentity
+	manifest  [32]byte
+	valid     bool
+	validator replicatedSQLMutationValidator
+}
+
+func (p *replicatedPointSessionProof) validatorBytes() int64 {
+	v := &p.validator
+	return int64(cap(v.keyScratch)) + int64(cap(v.decodeScratch)) +
+		int64(cap(v.schemaTape))*int64(unsafe.Sizeof(vibejson.IndexEntry{})) + int64(unsafe.Sizeof(distribution.NativeMapper{}))
+}
+
+func (p *replicatedPointSessionProof) retainedBytes() int64 {
+	if p == nil || !p.valid {
+		return 0
+	}
+	n := int64(cap(p.base.Relations)) * int64(unsafe.Sizeof(ReplicatedShardRelationIdentity{}))
+	for _, s := range []string{p.base.Binding.Distribution, p.base.Binding.Shard,
+		p.base.UserTable, p.base.UserStorage, p.base.UserPrimaryKey,
+		p.apply.Storage, p.apply.CaptureStorage, p.apply.Placement.ShardKey} {
+		n += int64(len(s))
+	}
+	for _, r := range p.base.Relations {
+		n += int64(len(r.Table)) + int64(len(r.Storage))
+	}
+	return n + p.validatorBytes()
 }
 
 var _ interface {

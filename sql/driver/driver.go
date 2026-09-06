@@ -268,6 +268,7 @@ type conn struct {
 	args           []any
 	pointDocs      store.Segment
 	pointSource    query.ValidatedRawSource
+	pointRead      *replicatedPointExecution
 	pointRaw       []byte
 	pointKeyRaw    []byte
 	pointKeyEnds   []int

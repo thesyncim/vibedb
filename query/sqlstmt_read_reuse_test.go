@@ -7,7 +7,41 @@ import (
 	"unsafe"
 
 	sqlast "github.com/thesyncim/vibedb/sql"
+	"github.com/thesyncim/vibejson/x/byteview"
 )
+
+func TestReadReuseKeepsOwnedPathsAndDropsErrors(t *testing.T) {
+	var c compiler
+	input := []byte("/a~1b/~0key")
+	first, err := c.compilePath(byteview.String(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	clear(input)
+	if _, err := c.compilePath("/bad~2escape"); err == nil {
+		t.Fatal("expected invalid pointer")
+	}
+	if _, ok := c.resetReadReuse(); !ok {
+		t.Fatal("bounded compiler not retained")
+	}
+	if len(c.paths.entries) != 1 || c.paths.entries[0].err != nil {
+		t.Fatal("reset lost valid path or retained error")
+	}
+	second, err := c.compilePath("/a~1b/~0key")
+	if err != nil || &first.pointer.Tokens[0] != &second.pointer.Tokens[0] ||
+		second.pointer.Tokens[0].Text != "a/b" || second.pointer.Tokens[1].Text != "~key" {
+		t.Fatal("owned escaped path was recompiled or corrupted")
+	}
+	for _, entry := range c.paths.entries[len(c.paths.entries):cap(c.paths.entries)] {
+		if entry.spec != "" || entry.err != nil || entry.path.pointer.Tokens != nil {
+			t.Fatal("path cache tail retained state")
+		}
+	}
+	count, ok := readReuseCompilerBytes(&c)
+	if !ok || count <= int64(unsafe.Sizeof(c))+readReuseStatementSliceBytes(c.paths.entries) {
+		t.Fatal("path backing omitted from retained bytes")
+	}
+}
 
 func TestStatementResetReadBindingsForReuseRebindsLikeFresh(t *testing.T) {
 	const source = `SELECT id, score FROM docs WHERE id = ? ORDER BY id`
@@ -27,7 +61,7 @@ func TestStatementResetReadBindingsForReuseRebindsLikeFresh(t *testing.T) {
 	if statement.c.plan == nil || statement.c.result == nil || statement.q.built != nil ||
 		statement.c.plan.where != nil || statement.c.plan.columns != nil ||
 		statement.c.result.plan != nil || statement.c.result.err != nil ||
-		statement.args != nil || statement.stack != nil || statement.having.active {
+		statement.args != nil || len(statement.stack) != 0 || statement.having.active {
 		t.Fatal("binding/compiler state survived reset")
 	}
 	if statement.tree == nil || statement.params != 1 || len(statement.names) != 2 {

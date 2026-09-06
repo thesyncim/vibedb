@@ -2,7 +2,7 @@
 set -euo pipefail
 
 lane=${1:?usage: storage-race.sh all|storeio|durable-heavy|durable-rest}
-selected='Primary|BufferedInplace|Committer|PageCache|WriteTransaction'
+selected='Primary|CompactRankAffine|BufferedInplace|Committer|PageCache|WriteTransaction'
 heavy='^TestFilePrimaryAdvancedRepackAmplification$'
 case "$lane" in
   all)

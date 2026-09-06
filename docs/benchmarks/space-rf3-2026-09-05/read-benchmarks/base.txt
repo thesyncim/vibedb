@@ -1,0 +1,54 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/store/durable
+cpu: Apple M4 Max
+BenchmarkUnifiedGetRaw                      	  261333	       934.2 ns/op	       770.8 p50-batch16-ns/op	       875.0 p50-ns/op	      1292 p99-ns/op	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPrimaryReplace              	   53100	      4716 ns/op	      1667 p50-ns/op	      2917 p99-ns/op	     503 B/op	       0 allocs/op
+BenchmarkUnifiedScanAllBytesLowCardinality  	      12	  19727899 ns/op	1261.22 MB/s	       248.8 bytes/doc	       197.3 ns/doc	       0 B/op	       0 allocs/op
+BenchmarkUnifiedScanAllBytesHighCardinality 	       8	  28639984 ns/op	 868.76 MB/s	       248.8 bytes/doc	       286.4 ns/doc	       0 B/op	       0 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/store/durable
+cpu: Apple M4 Max
+BenchmarkUnifiedGetRaw                      	  311594	       781.2 ns/op	       687.5 p50-batch16-ns/op	       708.0 p50-ns/op	      1083 p99-ns/op	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPrimaryReplace              	   54633	      4390 ns/op	      1625 p50-ns/op	      2584 p99-ns/op	     489 B/op	       0 allocs/op
+BenchmarkUnifiedScanAllBytesLowCardinality  	      12	  19439743 ns/op	1279.91 MB/s	       248.8 bytes/doc	       194.4 ns/doc	       0 B/op	       0 allocs/op
+BenchmarkUnifiedScanAllBytesHighCardinality 	       8	  28376505 ns/op	 876.82 MB/s	       248.8 bytes/doc	       283.8 ns/doc	       0 B/op	       0 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/store/durable
+cpu: Apple M4 Max
+BenchmarkUnifiedGetRaw                      	  326056	       730.3 ns/op	       653.6 p50-batch16-ns/op	       667.0 p50-ns/op	      1000 p99-ns/op	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPrimaryReplace              	   49635	      4511 ns/op	      1625 p50-ns/op	      2542 p99-ns/op	     538 B/op	       0 allocs/op
+BenchmarkUnifiedScanAllBytesLowCardinality  	      12	  19633198 ns/op	1267.30 MB/s	       248.8 bytes/doc	       196.3 ns/doc	       0 B/op	       0 allocs/op
+BenchmarkUnifiedScanAllBytesHighCardinality 	       8	  28456766 ns/op	 874.35 MB/s	       248.8 bytes/doc	       284.6 ns/doc	       0 B/op	       0 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/store/durable
+cpu: Apple M4 Max
+BenchmarkUnifiedGetRaw                      	  324685	       723.6 ns/op	       656.2 p50-batch16-ns/op	       667.0 p50-ns/op	       959.0 p99-ns/op	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPrimaryReplace              	   46617	      4595 ns/op	      1625 p50-ns/op	      2750 p99-ns/op	     572 B/op	       0 allocs/op
+BenchmarkUnifiedScanAllBytesLowCardinality  	      12	  19549448 ns/op	1272.73 MB/s	       248.8 bytes/doc	       195.5 ns/doc	       0 B/op	       0 allocs/op
+BenchmarkUnifiedScanAllBytesHighCardinality 	       8	  28327864 ns/op	 878.33 MB/s	       248.8 bytes/doc	       283.3 ns/doc	       0 B/op	       0 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/store/durable
+cpu: Apple M4 Max
+BenchmarkUnifiedGetRaw                      	  331327	       715.5 ns/op	       645.8 p50-batch16-ns/op	       667.0 p50-ns/op	       917.0 p99-ns/op	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPrimaryReplace              	   51927	      4616 ns/op	      1625 p50-ns/op	      2500 p99-ns/op	     514 B/op	       0 allocs/op
+BenchmarkUnifiedScanAllBytesLowCardinality  	      12	  19614885 ns/op	1268.48 MB/s	       248.8 bytes/doc	       196.1 ns/doc	       0 B/op	       0 allocs/op
+BenchmarkUnifiedScanAllBytesHighCardinality 	       8	  28362089 ns/op	 877.27 MB/s	       248.8 bytes/doc	       283.6 ns/doc	       0 B/op	       0 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/store/durable
+cpu: Apple M4 Max
+BenchmarkUnifiedGetRaw                      	  315177	       757.2 ns/op	       677.1 p50-batch16-ns/op	       708.0 p50-ns/op	      1000 p99-ns/op	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPrimaryReplace              	   53020	      4608 ns/op	      1625 p50-ns/op	      2625 p99-ns/op	     503 B/op	       0 allocs/op
+BenchmarkUnifiedScanAllBytesLowCardinality  	      12	  19757073 ns/op	1259.35 MB/s	       248.8 bytes/doc	       197.6 ns/doc	       0 B/op	       0 allocs/op
+BenchmarkUnifiedScanAllBytesHighCardinality 	       8	  28983688 ns/op	 858.45 MB/s	       248.8 bytes/doc	       289.8 ns/doc	       0 B/op	       0 allocs/op
+PASS

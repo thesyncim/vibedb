@@ -1,0 +1,22 @@
+=== RUN   TestCompactCompetitiveSpaceBreakdown
+=== RUN   TestCompactCompetitiveSpaceBreakdown/low
+    unified_space_breakdown_test.go:271: leaves=25 extent=9.052 payload=8.956 page-frame=0.018 slack=0.078 header=0.010 shape-dir=0.003 keys=0.009 slots=0.000 shape-codes=0.250 ranks=0.094 shape-headers=0.012 templates=0.124 streams=8.454 stream-headers=0.314 dictionaries=0.681 stream-data=7.459 B/doc
+    unified_space_breakdown_test.go:282: codec[dictionary]=3.938 B/doc
+    unified_space_breakdown_test.go:282: codec[for]=1.265 B/doc
+    unified_space_breakdown_test.go:282: codec[date]=1.512 B/doc
+    unified_space_breakdown_test.go:282: codec[prefix-int]=0.864 B/doc
+    unified_space_breakdown_test.go:282: codec[delta-pack]=0.854 B/doc
+    unified_space_breakdown_test.go:282: codec[alphabet]=0.020 B/doc
+=== RUN   TestCompactCompetitiveSpaceBreakdown/high
+    unified_space_breakdown_test.go:271: leaves=104 extent=68.157 payload=68.017 page-frame=0.075 slack=0.066 header=0.042 shape-dir=0.012 keys=0.040 slots=0.000 shape-codes=0.250 ranks=0.099 shape-headers=0.050 templates=0.515 streams=67.010 stream-headers=0.605 dictionaries=0.617 stream-data=65.787 B/doc
+    unified_space_breakdown_test.go:282: codec[dictionary]=0.204 B/doc
+    unified_space_breakdown_test.go:282: codec[for]=1.314 B/doc
+    unified_space_breakdown_test.go:282: codec[date]=1.551 B/doc
+    unified_space_breakdown_test.go:282: codec[prefix-int]=0.936 B/doc
+    unified_space_breakdown_test.go:282: codec[delta-pack]=0.895 B/doc
+    unified_space_breakdown_test.go:282: codec[alphabet]=62.109 B/doc
+--- PASS: TestCompactCompetitiveSpaceBreakdown (1.90s)
+    --- PASS: TestCompactCompetitiveSpaceBreakdown/low (0.39s)
+    --- PASS: TestCompactCompetitiveSpaceBreakdown/high (1.52s)
+PASS
+ok  	github.com/thesyncim/vibedb/internal/storeio	2.143s

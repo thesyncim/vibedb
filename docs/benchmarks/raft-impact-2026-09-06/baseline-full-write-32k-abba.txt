@@ -1,0 +1,11 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/internal/rafttransport
+cpu: Apple M4 Max
+BenchmarkOrdinaryTransportFullWritePathSingleton32KiB-16    	  693384	      1549 ns/op	21264.17 MB/s	       0 B/op	       0 allocs/op
+BenchmarkOrdinaryTransportFullWritePathSingleton32KiB-16    	  836936	      1492 ns/op	22082.90 MB/s	       0 B/op	       0 allocs/op
+BenchmarkOrdinaryTransportFullWritePathSingleton32KiB-16    	  877611	      1566 ns/op	21034.52 MB/s	       0 B/op	       0 allocs/op
+BenchmarkOrdinaryTransportFullWritePathSingleton32KiB-16    	  747860	      1622 ns/op	20312.40 MB/s	       0 B/op	       0 allocs/op
+BenchmarkOrdinaryTransportFullWritePathSingleton32KiB-16    	  761757	      1625 ns/op	20267.60 MB/s	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/thesyncim/vibedb/internal/rafttransport	6.581s

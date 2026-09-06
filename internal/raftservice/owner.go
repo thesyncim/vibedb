@@ -1011,8 +1011,9 @@ func (collector *proposalIngressCollector) full() bool {
 // drain inspects at most one proposal batch's worth of ingress, including the
 // request that started the collector. Already queued peer messages and reads
 // retain their independent treatment and count against that budget. The first
-// other request is returned as an ordering barrier; requests beyond the fixed
-// scan remain in the channel for a later owner turn.
+// other request is returned as a boundary; the caller keeps control requests
+// behind the Ready drain but may admit another ordinary proposal immediately.
+// Requests beyond the fixed scan remain in the channel for a later owner turn.
 func (collector *proposalIngressCollector) drain(
 	queue <-chan ownerRequest,
 	handleIndependent func(ownerRequest) error,
@@ -1142,13 +1143,19 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 				}
 				return nil
 			}
-			if !proposalIngressCandidate(request) {
+			if request.kind != requestProposal {
 				// Retain the first control request as an exact ordering barrier
 				// until Host has drained Ready;
 				// campaign, membership, and schema controls must not be attempted
 				// between capture and its durability boundary.
 				ingressBarrier, ingressBarrierPending = request, true
 				return nil
+			}
+			if !proposalIngressCandidate(request) {
+				// An ordinary proposal that is too large for this coalescing turn
+				// still belongs to the bounded Host proposal queue. It is not a
+				// control barrier merely because it cannot share the prefix.
+				return handleRequest(request)
 			}
 			collector.start(request)
 			barrier, barrierPresent, drainErr := collector.drain(owner.ingress, handleRequest)
@@ -1166,7 +1173,17 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 				return nil
 			}
 			if barrierPresent {
-				ingressBarrier, ingressBarrierPending = barrier, true
+				if barrier.kind == requestProposal {
+					// Host enqueue is a bounded per-group queue admission. An
+					// ordinary proposal does not need the global Ready drain that
+					// protects controls, and retaining it here prevents unrelated
+					// groups from sharing the next append wave.
+					if err := handleRequest(barrier); err != nil {
+						return err
+					}
+				} else {
+					ingressBarrier, ingressBarrierPending = barrier, true
+				}
 			}
 		default:
 		}
@@ -1234,17 +1251,22 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 			}
 			// Service both sources once. A permanently ready async channel
 			// must not compete with a pending tick for the fairness turn.
-			select {
-			case _, ok := <-owner.pulse:
-				if !ok {
-					owner.pulse = nil
-				} else {
-					readyBlocked = false
-					if err := offerTicks(); err != nil {
-						return owner.stop(err)
+			// A control barrier must drain a finite prefix of Host work. Keep
+			// the pulse pending until that barrier runs: adding fresh timer work
+			// here can prevent the drain forever while peer ingress is fenced.
+			if !ingressBarrierPending {
+				select {
+				case _, ok := <-owner.pulse:
+					if !ok {
+						owner.pulse = nil
+					} else {
+						readyBlocked = false
+						if err := offerTicks(); err != nil {
+							return owner.stop(err)
+						}
 					}
+				default:
 				}
-			default:
 			}
 		}
 		busyTurns++

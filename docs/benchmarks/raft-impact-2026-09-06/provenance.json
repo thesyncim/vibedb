@@ -1,0 +1,18 @@
+{
+  "baseline_revision": "400add9228c9deb5ab48fb8e3251983e2cd94a32",
+  "candidate_source_sha256": {
+    "internal/raftstore/node_store.go": "6045916a2af9cef80f7af418b58086839a7fdf5194d5217e3fc5bcbc6feb0946",
+    "internal/raftstore/node_sequencer.go": "2aaac2d5cb37dd535b8c54017fe13da36ebfa01f99832b5349129afd89d84dd0",
+    "internal/raftstore/node_persist_bench_test.go": "fec6060683ea42bc78d3e8a0cf92aa5de3c0f3d55b6bc61fcd8b22f2cd44ed50",
+    "internal/rafttransport/stream.go": "a783ca2a30700271c4be31f5b4945f62213af42bde96482dfb4d0d69da7cdfda",
+    "internal/rafttransport/transport.go": "65b3a7878e95e6fe3f03f0110efd7b1690ea85f8277d6f5255de021fab9feb88",
+    "internal/rafttransport/alloc_test.go": "c4277c775aacf71f90fe0c5e2e8003d0baf15c8edbb8b5227eb90433ec888a4a"
+  },
+  "linux_binary_sha256": {
+    "shard-baseline.test": "fbd944c35be6ea4c3835e63657288eb9ed36ba073944ca18d2e1b6b2ea0eedae",
+    "shard-candidate.test": "1b59cbfe4d0179eedd0842fa35da14da0e2357cdec78567db439ee9838d39a92"
+  },
+  "runtime_image": "sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b",
+  "implementation_model": "gpt-5.6-luna / max",
+  "review_model": "gpt-6-astra / high"
+}

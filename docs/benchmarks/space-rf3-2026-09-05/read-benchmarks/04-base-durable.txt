@@ -1,0 +1,9 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/store/durable
+cpu: Apple M4 Max
+BenchmarkUnifiedGetRaw                      	  324685	       723.6 ns/op	       656.2 p50-batch16-ns/op	       667.0 p50-ns/op	       959.0 p99-ns/op	       0 B/op	       0 allocs/op
+BenchmarkUnifiedPrimaryReplace              	   46617	      4595 ns/op	      1625 p50-ns/op	      2750 p99-ns/op	     572 B/op	       0 allocs/op
+BenchmarkUnifiedScanAllBytesLowCardinality  	      12	  19549448 ns/op	1272.73 MB/s	       248.8 bytes/doc	       195.5 ns/doc	       0 B/op	       0 allocs/op
+BenchmarkUnifiedScanAllBytesHighCardinality 	       8	  28327864 ns/op	 878.33 MB/s	       248.8 bytes/doc	       283.3 ns/doc	       0 B/op	       0 allocs/op
+PASS

@@ -842,14 +842,26 @@ func (fixture *rf3FaultFixture) waitMemberLeader(t testing.TB, member int, leade
 func (fixture *rf3FaultFixture) waitCaughtUp(t testing.TB, member int, applied uint64, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
+	var lastState shardservice.ReplicatedMemberState
+	var lastSuccessfulState shardservice.ReplicatedMemberState
+	var lastErr error
+	lastSuccessful := false
+	attempts := 0
 	for time.Now().Before(deadline) {
 		state, err := fixture.tryProbe(member, time.Second)
+		attempts++
+		lastState, lastErr = state, err
+		if err == nil {
+			lastSuccessfulState = state
+			lastSuccessful = true
+		}
 		if err == nil && state.Applied >= applied && state.LeaderID != 0 {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("member %d did not catch up through %d", member+1, applied)
+	t.Fatalf("member %d did not catch up through target applied=%d: attempts=%d last_state=%+v last_error=%v last_successful=%t last_successful_state=%+v",
+		member+1, applied, attempts, lastState, lastErr, lastSuccessful, lastSuccessfulState)
 }
 
 func (fixture *rf3FaultFixture) waitAllApplied(t testing.TB, applied uint64, timeout time.Duration) {

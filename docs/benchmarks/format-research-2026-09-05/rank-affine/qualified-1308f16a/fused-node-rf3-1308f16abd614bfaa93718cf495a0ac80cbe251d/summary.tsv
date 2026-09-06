@@ -1,0 +1,5 @@
+schema	vibedb.fused-rf3-node-process	1
+result	pass
+revision	1308f16abd614bfaa93718cf495a0ac80cbe251d
+runs	1
+subtests	default-physical3,explicit-physical6

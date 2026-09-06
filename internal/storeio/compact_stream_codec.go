@@ -29,6 +29,7 @@ const (
 	compactStreamPrefixInt
 	compactStreamDeltaPack
 	compactStreamAlphabet
+	compactStreamRankAffine
 	compactStreamKindLimit
 	compactDictionaryHashThreshold = 16
 	compactDictionaryScanPreferred = 128
@@ -145,6 +146,20 @@ func encodeCompactScalarStream(values [][]byte) compactStreamEncoding {
 }
 
 func (s *compactStreamScratch) encode(values [][]byte) compactStreamEncoding {
+	return s.encodeShape(values, nil, 0)
+}
+
+func (s *compactStreamScratch) encodeShape(values [][]byte, ranks []uint16, leafRows int) compactStreamEncoding {
+	return s.encodeShapeWithRankContext(values, ranks, leafRows, nil, nil)
+}
+
+func (s *compactStreamScratch) encodeShapeWithRankContext(
+	values [][]byte,
+	ranks []uint16,
+	leafRows int,
+	rankContext *compactRankContext,
+	rankView *CompactPrimaryStripeView,
+) compactStreamEncoding {
 	if len(values) == 0 {
 		return compactStreamEncoding{kind: compactStreamDictionary}
 	}
@@ -156,14 +171,28 @@ func (s *compactStreamScratch) encode(values [][]byte) compactStreamEncoding {
 		frontBytes,
 	)
 	alphabet, hasAlphabet := s.measureAlphabet(2, values, alphabetLimit)
-	s.integers = slices.Grow(s.integers[:0], len(values))[:len(values)]
-	allIntegers := true
-	for i := range values {
-		s.integers[i], allIntegers = CanonicalIntValue(values[i])
-		if !allIntegers {
-			break
+	// Reserve the last backing slot for the prefix candidate so constructing
+	// the ordinary numeric alternatives below cannot overwrite its bytes.
+	numeric, hasPrefix := s.encodePrefixIntShapeWithRankContext(
+		7, values, ranks, leafRows, rankContext, rankView,
+	)
+	rankNumber := hasPrefix && numeric.kind == compactStreamRankAffine &&
+		numeric.data[0] == 2 && len(numeric.dict[0]) == 0 && len(numeric.dict[1]) == 0
+	allIntegers := !rankNumber
+	if allIntegers {
+		s.integers = slices.Grow(s.integers[:0], len(values))[:len(values)]
+		for i := range values {
+			s.integers[i], allIntegers = CanonicalIntValue(values[i])
+			if !allIntegers {
+				break
+			}
 		}
 	}
+	// A bare rank descriptor is exactly 34 bytes and proves at least 64
+	// distinct integers. FOR and varint delta need at least 68/87 bytes.
+	// Packed delta needs at least 41 bytes: its only smaller 64-row case,
+	// constant -1 deltas, already selected the local-affine prefix form.
+	// Dictionary/front/alphabet choices and their tie policy still compete.
 	if allIntegers {
 		s.candidates[n] = s.encodeFOR(n, s.integers)
 		n++
@@ -172,19 +201,21 @@ func (s *compactStreamScratch) encode(values [][]byte) compactStreamEncoding {
 		s.candidates[n] = s.encodeDeltaPack(n, s.integers)
 		n++
 	}
-	s.dates = slices.Grow(s.dates[:0], len(values))[:len(values)]
-	allDates := true
-	for i := range values {
-		s.dates[i], allDates = compactDateOrdinal(values[i])
-		if !allDates {
-			break
+	allDates := !rankNumber
+	if allDates {
+		s.dates = slices.Grow(s.dates[:0], len(values))[:len(values)]
+		for i := range values {
+			s.dates[i], allDates = compactDateOrdinal(values[i])
+			if !allDates {
+				break
+			}
 		}
 	}
 	if allDates {
 		s.candidates[n] = s.encodeDate(n, s.dates)
 		n++
 	}
-	if numeric, ok := s.encodePrefixInt(n, values); ok {
+	if hasPrefix {
 		s.candidates[n] = numeric
 		n++
 	}
@@ -810,15 +841,24 @@ func parseCompactPrefixInt(src []byte) (compactPrefixIntValue, bool) {
 			return compactPrefixIntValue{}, false
 		}
 	}
-	var value uint64
-	for _, digit := range src[start:end] {
-		next := value*10 + uint64(digit-'0')
-		if next < value || next > uint64(^uint64(0)>>1) {
-			return compactPrefixIntValue{}, false
-		}
-		value = next
-	}
 	width := end - start
+	var value uint64
+	if width <= 18 {
+		for _, digit := range src[start:end] {
+			value = value*10 + uint64(digit-'0')
+		}
+	} else {
+		const maxInt64Prefix = uint64(1<<63-1) / 10
+		const maxInt64Remainder = uint64(1<<63-1) % 10
+		for _, digit := range src[start:end] {
+			n := uint64(digit - '0')
+			if value >= maxInt64Prefix &&
+				(value != maxInt64Prefix || n > maxInt64Remainder) {
+				return compactPrefixIntValue{}, false
+			}
+			value = value*10 + n
+		}
+	}
 	return compactPrefixIntValue{
 		prefix: src[:start], suffix: src[end:], value: value, width: width,
 		canonical: width == 1 || src[start] != '0',
@@ -833,6 +873,21 @@ func encodeCompactPrefixInt(values [][]byte) (compactStreamEncoding, bool) {
 func (s *compactStreamScratch) encodePrefixInt(
 	slot int,
 	values [][]byte,
+) (compactStreamEncoding, bool) {
+	return s.encodePrefixIntShape(slot, values, nil, 0)
+}
+
+func (s *compactStreamScratch) encodePrefixIntShape(slot int, values [][]byte, ranks []uint16, leafRows int) (compactStreamEncoding, bool) {
+	return s.encodePrefixIntShapeWithRankContext(slot, values, ranks, leafRows, nil, nil)
+}
+
+func (s *compactStreamScratch) encodePrefixIntShapeWithRankContext(
+	slot int,
+	values [][]byte,
+	ranks []uint16,
+	leafRows int,
+	rankContext *compactRankContext,
+	rankView *CompactPrimaryStripeView,
 ) (compactStreamEncoding, bool) {
 	first, ok := parseCompactPrefixInt(values[0])
 	if !ok {
@@ -885,6 +940,11 @@ func (s *compactStreamScratch) encodePrefixInt(
 			kind: compactStreamPrefixInt, count: len(values), data: data,
 			dict: dictionary,
 		}, true
+	}
+	if affine, ok := s.encodeRankAffineParsed(
+		slot, first, allCanonical, fixedWidth, ranks, leafRows, rankContext, rankView,
+	); ok {
+		return affine, true
 	}
 	restarts := (len(values) + compactStreamRestart - 1) / compactStreamRestart
 	if fixedWidth {
@@ -1373,6 +1433,10 @@ func (v compactStreamView) validate() error {
 				return corrupt("date range")
 			}
 		}
+	case compactStreamRankAffine:
+		if !v.validRankAffine() {
+			return corrupt("rank-affine data")
+		}
 	case compactStreamPrefixInt:
 		if v.width != 0 || v.dictCount != 2 || len(v.data) < 2 ||
 			v.data[0] > 7 || v.data[0]&6 == 6 ||
@@ -1598,7 +1662,7 @@ func (v compactStreamView) appendValue(dst []byte, row int) ([]byte, bool) {
 		base := int32(binary.LittleEndian.Uint32(v.data))
 		value := base + int32(compactReadBits(v.data[4:], row*int(v.width), int(v.width)))
 		return appendCompactDate(dst, value), true
-	case compactStreamPrefixInt:
+	case compactStreamPrefixInt, compactStreamRankAffine:
 		value, ok := v.prefixInteger(row)
 		if !ok || value < 0 {
 			return dst, false
@@ -1651,7 +1715,10 @@ func (v compactStreamView) appendAlphabetValue(dst []byte, row int) ([]byte, boo
 }
 
 func (v compactStreamView) prefixInteger(row int) (int64, bool) {
-	if v.kind != compactStreamPrefixInt || row < 0 || row >= v.count || len(v.data) < 2 {
+	if v.kind != compactStreamPrefixInt {
+		return v.rankAffineInteger(row)
+	}
+	if row < 0 || row >= v.count || len(v.data) < 2 {
 		return 0, false
 	}
 	if v.data[0]&2 == 0 {
@@ -1760,9 +1827,134 @@ func (v compactStreamView) packedDeltaIntegerAt(row, prefix int) (int64, bool) {
 	return value, true
 }
 
-// countIntegerEqual performs a complete scan of an integer stream without
-// formatting each value back into JSON. FOR compares the packed offsets and
-// delta streams consume every restart and varint in row order.
+// prefixIntegerArithmeticDomain admits the exact linear PrefixInt descriptor
+// whose rows can be evaluated as nonnegative signed integers. It deliberately
+// does not inspect dictionary affixes or fixed-width padding: spelling
+// equality has already checked those, while numeric equality applies stricter
+// bare/no-padding admission below. PrefixInt admission validates the binary
+// layout but leaves these signed-domain checks to the operation using values
+// as numbers.
+func (v compactStreamView) prefixIntegerArithmeticDomain() (first, step int64, supported bool) {
+	if v.kind != compactStreamPrefixInt || v.count < 0 || len(v.data) != 18 ||
+		(v.data[0] != 2 && v.data[0] != 3) ||
+		v.data[0] == 3 && v.data[1] == 0 {
+		return 0, 0, false
+	}
+	const maxInt64Value = uint64(1<<63 - 1)
+	firstBits := binary.LittleEndian.Uint64(v.data[2:])
+	if firstBits > maxInt64Value {
+		return 0, 0, false
+	}
+	first = int64(firstBits)
+	step = int64(binary.LittleEndian.Uint64(v.data[10:]))
+	if v.count > 1 {
+		steps := uint64(v.count - 1)
+		if step > 0 {
+			if uint64(step) > (maxInt64Value-uint64(first))/steps {
+				return 0, 0, false
+			}
+		} else if step < 0 {
+			if step == -1<<63 || uint64(-step) > uint64(first)/steps {
+				return 0, 0, false
+			}
+		}
+	}
+	if v.data[0] == 3 {
+		width := int(v.data[1])
+		if width <= 0 || width > 19 {
+			return 0, 0, false
+		}
+	}
+	return first, step, true
+}
+
+// barePrefixIntegerArithmetic adds the numeric lane's stricter admission to
+// the shared arithmetic-domain proof: both dictionary entries must be empty,
+// and fixed-width endpoints must already have their declared canonical width.
+// Monotonicity then proves that no row relies on zero padding.
+func (v compactStreamView) barePrefixIntegerArithmetic() (first, step int64, supported bool) {
+	if v.kind != compactStreamPrefixInt || v.dictCount != 2 || len(v.dictDir) != 4 {
+		return 0, 0, false
+	}
+	prefix, prefixOK := v.dictionaryEntry(0)
+	suffix, suffixOK := v.dictionaryEntry(1)
+	if !prefixOK || !suffixOK || len(prefix) != 0 || len(suffix) != 0 {
+		return 0, 0, false
+	}
+	first, step, supported = v.prefixIntegerArithmeticDomain()
+	if !supported {
+		return 0, 0, false
+	}
+	if v.data[0] == 3 && v.count > 0 {
+		width := int(v.data[1])
+		last := first
+		if v.count > 1 {
+			last += step * int64(v.count-1)
+		}
+		if canonicalIntRenderedLen(first) != width ||
+			canonicalIntRenderedLen(last) != width {
+			return 0, 0, false
+		}
+	}
+	return first, step, true
+}
+
+func countPrefixIntegerArithmetic(first, step int64, count int, needle int64) int {
+	if count <= 0 || needle < 0 {
+		return 0
+	}
+	if step == 0 {
+		if needle == first {
+			return count
+		}
+		return 0
+	}
+	if step > 0 {
+		if needle < first {
+			return 0
+		}
+		difference := uint64(needle - first)
+		stepMagnitude := uint64(step)
+		if difference%stepMagnitude != 0 {
+			return 0
+		}
+		row := difference / stepMagnitude
+		if row < uint64(count) {
+			return 1
+		}
+		return 0
+	}
+	if needle > first {
+		return 0
+	}
+	difference := uint64(first - needle)
+	stepMagnitude := uint64(-step)
+	if difference%stepMagnitude != 0 {
+		return 0
+	}
+	row := difference / stepMagnitude
+	if row < uint64(count) {
+		return 1
+	}
+	return 0
+}
+
+// countBarePrefixIntegerEqual answers a valid bare arithmetic PrefixInt with
+// the same exact arithmetic used by its encoder. A nonzero step has at most
+// one match, so the quotient check avoids reconstructing every row; a zero
+// step is the valid constant-stream case.
+func (v compactStreamView) countBarePrefixIntegerEqual(needle int64) (matched int, supported bool) {
+	first, step, supported := v.barePrefixIntegerArithmetic()
+	if !supported {
+		return 0, false
+	}
+	return countPrefixIntegerArithmetic(first, step, v.count, needle), true
+}
+
+// countIntegerEqual answers exact integer equality without formatting values
+// back into JSON. FOR compares packed offsets, delta streams consume every
+// restart and varint in row order, and a bare arithmetic PrefixInt uses its
+// checked first/step descriptor directly.
 func (v compactStreamView) countIntegerEqual(needle int64) (matched int, supported bool) {
 	switch v.kind {
 	case compactStreamFOR:
@@ -1822,6 +2014,8 @@ func (v compactStreamView) countIntegerEqual(needle int64) (matched int, support
 			}
 		}
 		return matched, true
+	case compactStreamPrefixInt:
+		return v.countBarePrefixIntegerEqual(needle)
 	default:
 		return 0, false
 	}
@@ -1876,14 +2070,84 @@ func (v compactStreamView) countIntegerLess(needle int64) (matched int, supporte
 	return countCompactPackedLess(v.data[8:], v.count, int(v.width), delta), true
 }
 
-// countIntegerOrdered derives every ordered predicate from the one exclusive
-// less-than scan. The boundary checks avoid overflowing MinInt64/MaxInt64 and
-// complements are taken only after a complete exact scan.
+func prefixIntegerOrderedMatch(
+	first, step int64, row int, needle int64, op UnifiedIntegerOrder,
+) bool {
+	value := first + step*int64(row)
+	switch op {
+	case UnifiedIntegerLess:
+		return value < needle
+	case UnifiedIntegerLessEqual:
+		return value <= needle
+	case UnifiedIntegerGreater:
+		return value > needle
+	default:
+		return value >= needle
+	}
+}
+
+// countPrefixIntegerOrdered uses the checked arithmetic descriptor to find
+// the one predicate boundary over ordinary shape ordinals. The domain proof
+// makes the sequence monotone and keeps every endpoint/interior value inside
+// the nonnegative signed range, so the binary search needs no signed division
+// or ceiling arithmetic.
+func countPrefixIntegerOrdered(
+	first, step int64, count int, needle int64, op UnifiedIntegerOrder,
+) int {
+	if count <= 0 {
+		return 0
+	}
+	if step == 0 {
+		if prefixIntegerOrderedMatch(first, 0, 0, needle, op) {
+			return count
+		}
+		return 0
+	}
+	firstMatch := prefixIntegerOrderedMatch(first, step, 0, needle, op)
+	lastMatch := prefixIntegerOrderedMatch(first, step, count-1, needle, op)
+	if firstMatch == lastMatch {
+		if firstMatch {
+			return count
+		}
+		return 0
+	}
+	lo, hi := 0, count
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if prefixIntegerOrderedMatch(first, step, mid, needle, op) == firstMatch {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	if firstMatch {
+		return lo
+	}
+	return count - lo
+}
+
+func (v compactStreamView) countPrefixIntegerOrdered(
+	needle int64, op UnifiedIntegerOrder,
+) (matched int, supported bool) {
+	first, step, supported := v.barePrefixIntegerArithmetic()
+	if !supported {
+		return 0, false
+	}
+	return countPrefixIntegerOrdered(first, step, v.count, needle, op), true
+}
+
+// countIntegerOrdered uses the exact less-than scan for FOR streams and a
+// checked monotone ordinal boundary for bare PrefixInt streams. The FOR
+// boundary checks avoid overflowing MinInt64/MaxInt64; complements are taken
+// only after a complete exact scan.
 func (v compactStreamView) countIntegerOrdered(
 	needle int64, op UnifiedIntegerOrder,
 ) (matched int, supported bool) {
 	if !validUnifiedIntegerOrder(op) {
 		return 0, false
+	}
+	if v.kind == compactStreamPrefixInt {
+		return v.countPrefixIntegerOrdered(needle, op)
 	}
 	const maxInt64Value = int64(1<<63 - 1)
 	switch op {
@@ -1922,6 +2186,25 @@ func (v compactStreamView) countIntegerOrdered(
 func (v compactStreamView) countIntegerInterval(
 	interval UnifiedIntegerInterval,
 ) (matched int, supported bool) {
+	if v.kind == compactStreamPrefixInt {
+		first, step, supported := v.barePrefixIntegerArithmetic()
+		if !supported {
+			return 0, false
+		}
+		if v.count == 0 || !interval.UpperUnbounded && interval.Upper <= interval.Lower {
+			return 0, true
+		}
+		matched = countPrefixIntegerOrdered(
+			first, step, v.count, interval.Lower, UnifiedIntegerGreaterEqual,
+		)
+		if interval.UpperUnbounded {
+			return matched, true
+		}
+		upper := countPrefixIntegerOrdered(
+			first, step, v.count, interval.Upper, UnifiedIntegerGreaterEqual,
+		)
+		return matched - upper, true
+	}
 	if !v.validIntegerFORData() {
 		return 0, false
 	}
@@ -2062,6 +2345,13 @@ func (v compactStreamView) countNumberEqual(
 		}
 		_, supported = v.countIntegerEqual(0)
 		return 0, scratch, ids, supported
+	case compactStreamPrefixInt:
+		if !needleIsInt {
+			_, _, supported = v.barePrefixIntegerArithmetic()
+			return 0, scratch, ids, supported
+		}
+		matched, supported = v.countBarePrefixIntegerEqual(needleInt)
+		return matched, scratch, ids, supported
 	default:
 		return 0, scratch, ids, false
 	}
@@ -2223,6 +2513,11 @@ func (v compactStreamView) countPrefixIntegerEqual(needle []byte) (matched int, 
 	}
 	want := int64(parsed.value)
 	if v.data[0]&2 != 0 {
+		if v.count >= compactStreamRestart {
+			if first, delta, ok := v.prefixIntegerArithmeticDomain(); ok {
+				return countPrefixIntegerArithmetic(first, delta, v.count, want), true
+			}
+		}
 		first := int64(binary.LittleEndian.Uint64(v.data[2:]))
 		delta := int64(binary.LittleEndian.Uint64(v.data[10:]))
 		for row := 0; row < v.count; row++ {

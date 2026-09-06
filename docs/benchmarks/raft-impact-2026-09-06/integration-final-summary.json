@@ -1,0 +1,25 @@
+{
+  "command": "CODEX_AGENT_ID=raft-main scripts/project-env go test -json -count=1 -p=1 -timeout=10m ./internal/raftmember ./internal/multiraft ./internal/raftservice",
+  "exit_code": 0,
+  "packages": [
+    {
+      "Time": "2026-09-06T19:14:56.633071+02:00",
+      "Action": "pass",
+      "Package": "github.com/thesyncim/vibedb/internal/raftmember",
+      "Elapsed": 100.291
+    },
+    {
+      "Time": "2026-09-06T19:15:02.113909+02:00",
+      "Action": "pass",
+      "Package": "github.com/thesyncim/vibedb/internal/multiraft",
+      "Elapsed": 4.212
+    },
+    {
+      "Time": "2026-09-06T19:16:32.039163+02:00",
+      "Action": "pass",
+      "Package": "github.com/thesyncim/vibedb/internal/raftservice",
+      "Elapsed": 84.245
+    }
+  ],
+  "failures": []
+}
