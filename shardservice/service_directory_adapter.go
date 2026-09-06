@@ -93,6 +93,8 @@ func FrontendContinuationScopeForReplicatedRequestWithProtocol(
 		case serviceauthz.CapabilityDataWrite:
 			scope.Action, scope.Operation = serviceauthz.FrontendActionForwardedData,
 				serviceauthz.ServiceOperationForwardedWrite
+		case serviceauthz.CapabilityRequestLedger:
+			scope.Action, scope.Operation = serviceauthz.FrontendActionGatewayRequestLedger, serviceauthz.ServiceOperationRequestLedger
 		case serviceauthz.CapabilityTopology:
 			// A probe has no relation ordinal. Catalog probes are scoped to
 			// the committed relation manifest carried by the serving fence.
@@ -106,11 +108,18 @@ func FrontendContinuationScopeForReplicatedRequestWithProtocol(
 		case serviceauthz.CapabilityDataWrite:
 			scope.Action, scope.Operation = serviceauthz.FrontendActionForwardedData,
 				serviceauthz.ServiceOperationForwardedWrite
+		case serviceauthz.CapabilityRequestLedger:
+			scope.Action, scope.Operation = serviceauthz.FrontendActionGatewayRequestLedger, serviceauthz.ServiceOperationRequestLedger
 		case serviceauthz.CapabilityTopology:
 			scope.Action, scope.Operation = serviceauthz.FrontendActionGatewayCatalog, serviceauthz.ServiceOperationCatalogWrite
 		default:
 			return serviceauthz.FrontendContinuationScopeRecord{}, false
 		}
+	case ReplicatedRequestLedgerRead:
+		if request.Capability != serviceauthz.CapabilityRequestLedger {
+			return serviceauthz.FrontendContinuationScopeRecord{}, false
+		}
+		scope.Action, scope.Operation = serviceauthz.FrontendActionGatewayRequestLedger, serviceauthz.ServiceOperationRequestLedger
 	case ReplicatedReadLeader, ReplicatedReadFollower, ReplicatedReadBatchLeader, ReplicatedQueryLeader:
 		if request.Capability == serviceauthz.CapabilityDataRead {
 			scope.Action, scope.Operation = serviceauthz.FrontendActionForwardedData,
@@ -124,7 +133,7 @@ func FrontendContinuationScopeForReplicatedRequestWithProtocol(
 		return serviceauthz.FrontendContinuationScopeRecord{}, false
 	}
 	if scope.Action != serviceauthz.FrontendActionForwardedData {
-		if scope.Action != serviceauthz.FrontendActionGatewayCatalog ||
+		if (scope.Action != serviceauthz.FrontendActionGatewayCatalog && scope.Action != serviceauthz.FrontendActionGatewayRequestLedger) ||
 			request.Fence.Command.RelationManifestDigest == ([32]byte{}) {
 			return serviceauthz.FrontendContinuationScopeRecord{}, false
 		}

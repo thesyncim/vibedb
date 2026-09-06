@@ -344,3 +344,46 @@ func TestServiceDirectoryContinuationGrantRejectsMutationAndRollback(t *testing.
 		t.Fatalf("retired active grant transition error=%v", err)
 	}
 }
+
+func TestServiceDirectoryCatalogAndNodeRevisionsAdvanceIndependently(t *testing.T) {
+	peer := serviceDirectoryPeer(20, 21)
+	cut := serviceDirectoryCut(1, serviceDirectoryBinding(peer, ServiceRoleGateway, ServiceActive))
+	cut.CatalogGeneration = 3
+	gate, err := NewServiceDirectoryGate(cut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	advanced := cut
+	advanced.CatalogGeneration++
+	if err := gate.ApplyCommittedCut(advanced); err != nil {
+		t.Fatal(err)
+	}
+	if err := gate.ApplyCommittedCut(cut); !errors.Is(err, ErrServiceDirectoryStale) {
+		t.Fatalf("catalog rollback: %v", err)
+	}
+	changedSession := advanced
+	changedSession.CatalogGeneration++
+	changedSession.Bindings = append([]ServiceBinding(nil), advanced.Bindings...)
+	changedSession.Bindings[0].SessionID[0] ^= 0x80
+	changedSession.Bindings[0].SessionRevision++
+	if err := gate.ApplyCommittedCut(changedSession); !errors.Is(err, ErrInvalidServiceDirectory) {
+		t.Fatalf("catalog advance changed session: %v", err)
+	}
+
+	advanced.Revision++
+	if err := gate.ApplyCommittedCut(advanced); err != nil {
+		t.Fatal(err)
+	}
+	rollback := advanced
+	rollback.Revision--
+	rollback.CatalogGeneration++
+	if err := gate.ApplyCommittedCut(rollback); !errors.Is(err, ErrServiceDirectoryStale) {
+		t.Fatalf("node rollback: %v", err)
+	}
+	conflict := advanced
+	conflict.Bindings = append([]ServiceBinding(nil), advanced.Bindings...)
+	conflict.Bindings[0].SessionRevision++
+	if err := gate.ApplyCommittedCut(conflict); !errors.Is(err, ErrServiceDirectoryStale) {
+		t.Fatalf("same cut conflict: %v", err)
+	}
+}

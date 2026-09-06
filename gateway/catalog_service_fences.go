@@ -1,26 +1,31 @@
 package gateway
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
+	"slices"
+
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 )
 
 // CatalogServiceFences grants the registered gateway sessions only the exact
-// catalog group and relation owned by this authenticated catalog authority.
+// catalog and ledger groups in the already published authenticated catalog cut.
 // Receivers derive the same scope from the decoded request and serving fence.
-func (authority *ReplicatedCatalogAuthority) CatalogServiceFences(ctx context.Context) ([]serviceauthz.ServiceFence, error) {
+func (authority *ReplicatedCatalogAuthority) CatalogServiceFences(ctx context.Context) ([]serviceauthz.ServiceFence, uint64, error) {
 	if authority == nil || ctx == nil {
-		return nil, ErrReplicatedCatalog
+		return nil, 0, ErrReplicatedCatalog
 	}
 	ctx, err := authority.authorizedContext(ctx)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	route, err := authority.executor.catalogOperationalRoute(ctx, authority.route, authority.holder.Current())
+	snapshot := authority.holder.Current()
+	if snapshot == nil {
+		return nil, 0, ErrReplicatedCatalog
+	}
+	route, err := authority.executor.catalogOperationalRoute(ctx, authority.route, snapshot)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	digest := route.Command.RelationManifestDigest
 	var manifest, relation [16]byte
@@ -32,8 +37,21 @@ func (authority *ReplicatedCatalogAuthority) CatalogServiceFences(ctx context.Co
 	write := read
 	write.Action = serviceauthz.ServiceActionGatewayCatalogWrite
 	write.Operation = serviceauthz.ServiceOperationCatalogWrite
-	if bytes.Compare(read.Relation[:], point.Relation[:]) < 0 {
-		return []serviceauthz.ServiceFence{read, point, write}, nil
+	fences := []serviceauthz.ServiceFence{read, point, write}
+	for _, descriptor := range snapshot.replicatedDescriptors() {
+		if len(descriptor.RequestLedgerRanges) == 0 {
+			continue
+		}
+		digest := descriptor.Command.RelationManifestDigest
+		var relation [16]byte
+		copy(relation[:], digest[:16])
+		fences = append(fences, serviceauthz.ServiceFence{
+			Action:    serviceauthz.ServiceActionGatewayRequestLedger,
+			Operation: serviceauthz.ServiceOperationRequestLedger,
+			Group:     descriptor.Group, Relation: relation, IntentID: digest, FenceDigest: digest,
+		})
 	}
-	return []serviceauthz.ServiceFence{point, read, write}, nil
+	slices.SortFunc(fences, serviceauthz.CompareServiceFences)
+	fences = slices.Compact(fences)
+	return fences, snapshot.Generation(), nil
 }

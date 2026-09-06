@@ -53,7 +53,7 @@ func TestFrontendContinuationNativeEnvelopeRoundTripKeepsInnerQuery(t *testing.T
 	}
 }
 
-func TestFrontendContinuationUnsupportedInternalReadFailsClosed(t *testing.T) {
+func TestFrontendContinuationLedgerReadRejectsForgedForwarding(t *testing.T) {
 	request := &ReplicatedRequest{
 		Operation:  ReplicatedRequestLedgerRead,
 		Authority:  serviceauthz.Authority{Node: rafttransport.NodeID{9}, Generation: 3},
@@ -61,8 +61,8 @@ func TestFrontendContinuationUnsupportedInternalReadFailsClosed(t *testing.T) {
 		RequestLedgerRead: testReplicatedRequestLedgerRead(),
 	}
 	scope, ok := FrontendContinuationScopeForReplicatedRequest(request)
-	if ok || scope != (serviceauthz.FrontendContinuationScopeRecord{}) {
-		t.Fatalf("unsupported internal scope=%+v ok=%v", scope, ok)
+	if !ok || scope.Action != serviceauthz.FrontendActionGatewayRequestLedger || scope.Operation != serviceauthz.ServiceOperationRequestLedger || scope.FenceDigest != request.Fence.Command.RelationManifestDigest {
+		t.Fatalf("ledger scope=%+v ok=%v", scope, ok)
 	}
 	envelope := serviceauthz.FrontendContinuationEnvelope{GrantDigest: [32]byte{3},
 		ConnToken: serviceauthz.FrontendConnToken{4}, Scope: serviceauthz.FrontendContinuationScopeRecord{
@@ -136,5 +136,35 @@ func TestCatalogScopeBindsGroupRelationAndManifest(t *testing.T) {
 	changed.Fence.Command.RelationManifestDigest = [32]byte{}
 	if _, ok = FrontendContinuationScopeForReplicatedRequest(&changed); ok {
 		t.Fatal("missing manifest admitted")
+	}
+}
+
+func TestLedgerScopeBindsGroupAndManifest(t *testing.T) {
+	for _, operation := range []ReplicatedOperation{ReplicatedProbe, ReplicatedPropose, ReplicatedRequestLedgerRead} {
+		request := ReplicatedRequest{Operation: operation, Capability: serviceauthz.CapabilityRequestLedger, Fence: testReplicatedFence()}
+		scope, ok := FrontendContinuationScopeForReplicatedRequest(&request)
+		if !ok {
+			t.Fatalf("operation %v unsupported", operation)
+		}
+		changed := request
+		changed.Fence.Group.GroupID[0] ^= 0x80
+		other, ok := FrontendContinuationScopeForReplicatedRequest(&changed)
+		if !ok || other.Group == scope.Group {
+			t.Fatal("ledger group not fenced")
+		}
+		changed = request
+		changed.Fence.Command.RelationManifestDigest[0] ^= 0x80
+		other, ok = FrontendContinuationScopeForReplicatedRequest(&changed)
+		if !ok || other.FenceDigest == scope.FenceDigest {
+			t.Fatal("ledger manifest not fenced")
+		}
+		changed.Fence.Command.RelationManifestDigest = [32]byte{}
+		if _, ok := FrontendContinuationScopeForReplicatedRequest(&changed); ok {
+			t.Fatal("missing manifest admitted")
+		}
+	}
+	request := ReplicatedRequest{Operation: ReplicatedRequestLedgerRead, Capability: serviceauthz.CapabilityDataRead, Fence: testReplicatedFence()}
+	if _, ok := FrontendContinuationScopeForReplicatedRequest(&request); ok {
+		t.Fatal("wrong ledger capability admitted")
 	}
 }

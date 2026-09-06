@@ -151,6 +151,8 @@ func (binding ServiceBinding) Valid() bool {
 // PolicyGeneration is copied from the existing operator policy and never
 // rotated by this gate.
 type ServiceDirectoryCut struct {
+	// CatalogGeneration fences grants derived from the committed catalog.
+	CatalogGeneration  uint64
 	Revision           uint64
 	TrustDomain        rafttransport.TrustDomain
 	PolicyGeneration   uint64
@@ -343,7 +345,7 @@ func sameServiceBinding(left, right ServiceBinding) bool {
 }
 
 func sameDirectoryCut(left, right ServiceDirectoryCut) bool {
-	if left.Revision != right.Revision || left.TrustDomain != right.TrustDomain ||
+	if left.CatalogGeneration != right.CatalogGeneration || left.Revision != right.Revision || left.TrustDomain != right.TrustDomain ||
 		left.PolicyGeneration != right.PolicyGeneration || len(left.Bindings) != len(right.Bindings) {
 		return false
 	}
@@ -533,14 +535,30 @@ func (gate *ServiceDirectoryGate) ApplyCommittedCut(cut ServiceDirectoryCut) err
 		}
 		if next.cut.TrustDomain != prior.cut.TrustDomain ||
 			next.cut.PolicyGeneration != prior.cut.PolicyGeneration ||
-			next.cut.Revision < prior.cut.Revision {
+			next.cut.Revision < prior.cut.Revision || next.cut.CatalogGeneration < prior.cut.CatalogGeneration {
 			return ErrServiceDirectoryStale
 		}
-		if next.cut.Revision == prior.cut.Revision {
+		if next.cut.Revision == prior.cut.Revision && next.cut.CatalogGeneration == prior.cut.CatalogGeneration {
 			if sameDirectoryCut(prior.cut, next.cut) {
 				return nil
 			}
 			return ErrServiceDirectoryStale
+		}
+		if next.cut.Revision == prior.cut.Revision {
+			// A catalog-only advance may change internal resource grants, but
+			// cannot change principals, sessions, lifecycle, or drain grants.
+			priorDirectory, nextDirectory := prior.cut, next.cut
+			priorDirectory.CatalogGeneration = nextDirectory.CatalogGeneration
+			priorDirectory.Bindings = slices.Clone(prior.cut.Bindings)
+			for index := range priorDirectory.Bindings {
+				if index >= len(nextDirectory.Bindings) {
+					return ErrInvalidServiceDirectory
+				}
+				priorDirectory.Bindings[index].InternalFences = nextDirectory.Bindings[index].InternalFences
+			}
+			if !sameDirectoryCut(priorDirectory, nextDirectory) {
+				return ErrInvalidServiceDirectory
+			}
 		}
 		for principal, priorBinding := range prior.bindings {
 			nextBinding, found := next.bindings[principal]
@@ -759,4 +777,9 @@ func validInternalRequest(request ServiceRequest) bool {
 		return request.SessionID == ([16]byte{}) && request.SessionRevision == 0
 	}
 	return request.SessionID != ([16]byte{}) && request.SessionRevision != 0
+}
+
+// CompareServiceFences returns the canonical ordering used by directory cuts.
+func CompareServiceFences(left, right ServiceFence) int {
+	return compareServiceFences(left, right)
 }

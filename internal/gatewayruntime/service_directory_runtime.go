@@ -101,11 +101,12 @@ func runtimeServiceDirectoryCut(
 	})
 
 	var catalogFences []serviceauthz.ServiceFence
+	var catalogGeneration uint64
 	if owner, ok := reader.(interface {
-		CatalogServiceFences(context.Context) ([]serviceauthz.ServiceFence, error)
+		CatalogServiceFences(context.Context) ([]serviceauthz.ServiceFence, uint64, error)
 	}); ok {
 		var err error
-		catalogFences, err = owner.CatalogServiceFences(ctx)
+		catalogFences, catalogGeneration, err = owner.CatalogServiceFences(ctx)
 		if err != nil {
 			return serviceauthz.ServiceDirectoryCut{}, err
 		}
@@ -187,7 +188,7 @@ func runtimeServiceDirectoryCut(
 	}
 	bindings = merged
 	return serviceauthz.ServiceDirectoryCut{
-		Revision: snapshot.Revision, TrustDomain: profile.LocalIdentity().TrustDomain,
+		CatalogGeneration: catalogGeneration, Revision: snapshot.Revision, TrustDomain: profile.LocalIdentity().TrustDomain,
 		PolicyGeneration: policyGeneration, Bindings: bindings,
 	}, nil
 }

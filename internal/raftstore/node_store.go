@@ -1618,12 +1618,18 @@ func (s *NodeStore) registerGroupSequencedAt(
 }
 
 func (s *NodeStore) registerGroupLocked(descriptor GroupDescriptor, snapshot *pb.Snapshot) (GroupIncarnation, error) {
-	return s.registerGroupLockedAt(descriptor, snapshot, 1)
+	return s.registerGroupLockedMode(descriptor, snapshot, 1, false)
 }
 
 func (s *NodeStore) registerGroupLockedAt(
 	descriptor GroupDescriptor, snapshot *pb.Snapshot, incarnation uint64,
 ) (GroupIncarnation, error) {
+	return s.registerGroupLockedMode(descriptor, snapshot, incarnation, true)
+}
+
+// Ordinary descriptor retries preserve the existing incarnation. Dynamic installs
+// must additionally match the incarnation committed by their controller.
+func (s *NodeStore) registerGroupLockedMode(descriptor GroupDescriptor, snapshot *pb.Snapshot, incarnation uint64, exactIncarnation bool) (GroupIncarnation, error) {
 	if descriptor.LogKey != 0 || validateGroupDescriptor(descriptor, true) != nil {
 		return GroupIncarnation{}, ErrBounds
 	}
@@ -1678,7 +1684,7 @@ func (s *NodeStore) registerGroupLockedAt(
 				return GroupIncarnation{}, ErrRetryConflict
 			}
 		}
-		if state.NodeIncarnation != incarnation {
+		if exactIncarnation && state.NodeIncarnation != incarnation {
 			return GroupIncarnation{}, ErrRetryConflict
 		}
 		return GroupIncarnation{GroupID: existing.LogKey, Incarnation: state.NodeIncarnation}, nil
