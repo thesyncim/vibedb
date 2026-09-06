@@ -890,3 +890,83 @@ func TestNamedValueAcceptsRawNumberWithoutAllocation(t *testing.T) {
 		t.Fatal("invalid raw JSON number was accepted")
 	}
 }
+
+func TestExecutionCancellationReusesOnlyMatchingChannel(t *testing.T) {
+	connection := directTestConn(t)
+	c := connection.(*conn)
+	var flag query.CancelFlag
+	c.exec.Options.Cancel = &flag
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	flag.BindDone(ctx.Done())
+	linked := ctx
+	if linked.Done() != ctx.Done() {
+		t.Fatal("shared cancellation lost the context signal")
+	}
+	scope, err := c.beginContextCancellation(linked)
+	if err != nil || scope != nil {
+		t.Fatalf("already bridged execution started another scope: %v, %v", scope, err)
+	}
+	otherCtx, cancelOther := context.WithCancel(context.Background())
+	defer cancelOther()
+	other, err := c.beginContextCancellation(otherCtx)
+	if err != nil || other == nil {
+		t.Fatalf("unrelated flag disabled cancellation: %v, %v", other, err)
+	}
+	if err := other.finish(nil); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	if _, err := c.beginContextCancellation(linked); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled shared context was admitted: %v", err)
+	}
+}
+
+func TestExecutionCancellationStillInterruptsCatalogWait(t *testing.T) {
+	var mu sync.RWMutex
+	mu.Lock()
+	defer mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	var flag query.CancelFlag
+	flag.BindDone(ctx.Done())
+	if err := rlockContext(ctx, &mu); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("shared cancellation lost deadline during catalog wait: %v", err)
+	}
+}
+
+func TestExecutionCancellationInterruptsQueryAndAllowsReuse(t *testing.T) {
+	database, session := openRuntimeSession(t)
+	defer database.Close()
+	defer session.Close()
+	create := runtimePrepare(t, session, `CREATE TABLE docs (id STRING PRIMARY KEY)`)
+	if _, err := create.Exec(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	defer create.Close()
+	prepared := runtimePrepare(t, session, `SELECT id FROM docs`)
+	defer prepared.Close()
+	var flag query.CancelFlag
+	if err := session.SetCancelFlag(&flag); err != nil {
+		t.Fatal(err)
+	}
+	base, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	flag.BindDone(base.Done())
+	// Deliver the external signal after admission, before query execution.
+	ctx := &cancelOnNthErrContext{Context: base, cancel: flag.Cancel, at: 4}
+	var cursor Cursor
+	if err := prepared.QueryInto(ctx, nil, &cursor); !errors.Is(err, query.ErrCanceled) {
+		t.Fatalf("shared signal did not cancel the executor: %v", err)
+	}
+	if session.current != nil || session.conn.open {
+		t.Fatal("canceled query published a cursor")
+	}
+	flag.Reset()
+	if err := prepared.QueryInto(base, nil, &cursor); err != nil {
+		t.Fatalf("shared cancellation poisoned reuse: %v", err)
+	}
+	if err := cursor.Close(); err != nil {
+		t.Fatal(err)
+	}
+}

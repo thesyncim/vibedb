@@ -15,6 +15,7 @@ import (
 	sqlast "github.com/thesyncim/vibedb/sql"
 	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibedb/store/durable"
+	"github.com/thesyncim/vibejson/x/byteview"
 )
 
 // The reuse lane is intentionally small and private to one apply claim. It is
@@ -160,6 +161,13 @@ type replicatedReadReuseKey struct {
 	allocationGen    uint64
 	layoutToken      *catalogLayoutIdentity
 	manifestDigest   [32]byte
+}
+
+func (k replicatedReadReuseKey) owned() replicatedReadReuseKey {
+	k.sql = strings.Clone(k.sql)
+	k.primaryPath = strings.Clone(k.primaryPath)
+	k.paramTypes = append([]ParamType(nil), k.paramTypes...)
+	return k
 }
 
 func (k replicatedReadReuseKey) equal(other replicatedReadReuseKey) bool {
@@ -366,13 +374,38 @@ func (a *ReplicatedApply) AcquireReplicatedPointRead(
 	partialAggregate bool,
 	options query.ExecOptions,
 ) (*ReplicatedReadLease, error) {
+	return a.acquireReplicatedPointRead(ctx, relation, keyBytes, found, raw, primaryPath,
+		text, parameterTypes, partialAggregate, options, nil)
+}
+
+// AcquireReplicatedPointReadInto uses caller-owned lease storage. dst must be
+// zero or finished, must not be copied while active, and must remain alive until
+// Finish. The allocating API remains available for independently retained handles.
+func (a *ReplicatedApply) AcquireReplicatedPointReadInto(ctx context.Context,
+	relation replication.RelationID, keyBytes []byte, found bool, raw, primaryPath []byte,
+	text string, parameterTypes []ParamType, partialAggregate bool, options query.ExecOptions,
+	dst *ReplicatedReadLease,
+) error {
+	if dst == nil || dst.cache != nil || dst.slot != nil {
+		return ErrReplicatedReadLeaseClosed
+	}
+	_, err := a.acquireReplicatedPointRead(ctx, relation, keyBytes, found, raw, primaryPath,
+		text, parameterTypes, partialAggregate, options, dst)
+	return err
+}
+
+func (a *ReplicatedApply) acquireReplicatedPointRead(ctx context.Context,
+	relation replication.RelationID, keyBytes []byte, found bool, raw, primaryPath []byte,
+	text string, parameterTypes []ParamType, partialAggregate bool, options query.ExecOptions,
+	dst *ReplicatedReadLease,
+) (*ReplicatedReadLease, error) {
 	if partialAggregate || !replicatedReadReuseTextBound(text) ||
 		!replicatedReadReuseParamTypesBound(parameterTypes) ||
 		len(primaryPath) > replicatedReadReuseMaxPath {
 		return nil, ErrReplicatedReadReuseUnsupported
 	}
 	key, err := a.readReuseKey(
-		relation, string(primaryPath), text, parameterTypes, [32]byte{},
+		relation, byteview.String(primaryPath), text, parameterTypes, [32]byte{},
 	)
 	if err != nil {
 		return nil, err
@@ -381,7 +414,7 @@ func (a *ReplicatedApply) AcquireReplicatedPointRead(
 	if cache == nil {
 		return nil, ErrReplicatedApplyClosed
 	}
-	slot, lease, err := cache.reserve(key)
+	slot, lease, err := cache.reserveInto(key, dst)
 	if err != nil {
 		return nil, err
 	}
@@ -397,16 +430,10 @@ func (a *ReplicatedApply) AcquireReplicatedPointRead(
 		}
 	}()
 	if lease != nil {
-		reader, constructErr := a.newPointReadSessionInto(
-			ctx, relation, keyBytes, found, raw, primaryPath, options, slot.reader,
-		)
+		constructErr := a.bindPointExecution(ctx, relation, keyBytes, found, raw, primaryPath, options, slot.reader)
 		if constructErr != nil {
 			_ = cache.finish(lease, constructErr)
 			return nil, constructErr
-		}
-		if reader != slot.reader {
-			_ = cache.finish(lease, ErrReplicatedReadLeaseClosed)
-			return nil, ErrReplicatedReadReuseUnsupported
 		}
 		if _, bindErr := a.bindReplicatedReadReuseKey(key, slot.prepared); bindErr != nil {
 			_ = cache.finish(lease, bindErr)
@@ -437,7 +464,7 @@ func (a *ReplicatedApply) AcquireReplicatedPointRead(
 			cache.cancelReservation(slot)
 			return nil, err
 		}
-		return cache.leaseFor(slot), nil
+		return cache.leaseForInto(slot, dst), nil
 	}
 	_, bindErr := a.bindReplicatedReadReuseKey(key, prepared)
 	if bindErr != nil && !errors.Is(bindErr, ErrReplicatedReadReuseUnsupported) {
@@ -450,7 +477,7 @@ func (a *ReplicatedApply) AcquireReplicatedPointRead(
 		cache.cancelReservation(slot)
 		return nil, err
 	}
-	lease = cache.leaseFor(slot)
+	lease = cache.leaseForInto(slot, dst)
 	return lease, nil
 }
 
@@ -484,6 +511,11 @@ func prepareReplicatedRead(
 func (c *replicatedReadReuseCache) reserve(
 	key replicatedReadReuseKey,
 ) (*replicatedReadReuseSlot, *ReplicatedReadLease, error) {
+	return c.reserveInto(key, nil)
+}
+
+func (c *replicatedReadReuseCache) reserveInto(key replicatedReadReuseKey, dst *ReplicatedReadLease,
+) (*replicatedReadReuseSlot, *ReplicatedReadLease, error) {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
@@ -498,9 +530,11 @@ func (c *replicatedReadReuseCache) reserve(
 				c.nextGen++
 			}
 			slot.active, slot.generation = true, c.nextGen
-			lease := &ReplicatedReadLease{
-				cache: c, slot: slot, generation: slot.generation,
+			lease := dst
+			if lease == nil {
+				lease = &ReplicatedReadLease{}
 			}
+			*lease = ReplicatedReadLease{cache: c, slot: slot, generation: slot.generation}
 			slot.lease = lease
 			c.mu.Unlock()
 			return slot, lease, nil
@@ -514,7 +548,7 @@ func (c *replicatedReadReuseCache) reserve(
 			if c.nextGen == 0 {
 				c.nextGen++
 			}
-			slot.active, slot.generation, slot.key = true, c.nextGen, key
+			slot.active, slot.generation, slot.key = true, c.nextGen, key.owned()
 			c.mu.Unlock()
 			return slot, nil, nil
 		}
@@ -536,7 +570,7 @@ func (c *replicatedReadReuseCache) reserve(
 		if c.nextGen == 0 {
 			c.nextGen++
 		}
-		slot.active, slot.generation, slot.key = true, c.nextGen, key
+		slot.active, slot.generation, slot.key = true, c.nextGen, key.owned()
 		c.mu.Unlock()
 		closeReplicatedReadSlot(oldReader)
 		return slot, nil, nil
@@ -548,6 +582,10 @@ func (c *replicatedReadReuseCache) reserve(
 func (c *replicatedReadReuseCache) leaseFor(
 	slot *replicatedReadReuseSlot,
 ) *ReplicatedReadLease {
+	return c.leaseForInto(slot, nil)
+}
+
+func (c *replicatedReadReuseCache) leaseForInto(slot *replicatedReadReuseSlot, dst *ReplicatedReadLease) *ReplicatedReadLease {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.nextGen++
@@ -555,7 +593,11 @@ func (c *replicatedReadReuseCache) leaseFor(
 		c.nextGen++
 	}
 	slot.active, slot.generation = true, c.nextGen
-	lease := &ReplicatedReadLease{cache: c, slot: slot, generation: slot.generation}
+	lease := dst
+	if lease == nil {
+		lease = &ReplicatedReadLease{}
+	}
+	*lease = ReplicatedReadLease{cache: c, slot: slot, generation: slot.generation}
 	slot.lease = lease
 	return lease
 }
@@ -572,7 +614,7 @@ func (c *replicatedReadReuseCache) install(
 	if c.closed || slot == nil || !slot.active || slot.reader != nil {
 		return ErrReplicatedReadReuseUnsupported
 	}
-	slot.key = key
+	slot.key = key.owned()
 	slot.reader, slot.prepared = reader, prepared
 	slot.cacheable = cacheable
 	return nil
@@ -714,7 +756,16 @@ func retainedReplicatedReadSlotBytes(
 		retained += value
 		return true
 	}
-	if !add(slot.reader.conn.exec.Result.ReuseCapacityBytes()) {
+	if !add(slot.reader.conn.exec.ReadReuseCapacityBytes()) {
+		return 0, false
+	}
+	if !add(slot.reader.pointProof.retainedBytes()) {
+		return 0, false
+	}
+	if !add(int64(cap(slot.reader.pointExecution.key)) + int64(cap(slot.reader.pointExecution.raw))) {
+		return 0, false
+	}
+	if !add(int64(cap(slot.reader.conn.args)) * int64(unsafe.Sizeof(any(nil)))) {
 		return 0, false
 	}
 	if !add(int64(len(slot.key.sql))) || !add(int64(len(slot.key.primaryPath))) {
@@ -849,9 +900,8 @@ func (a *ReplicatedApply) readReuseKey(
 		}
 	}
 	return replicatedReadReuseKey{
-		sql:        strings.Clone(text),
-		paramTypes: append([]ParamType(nil), parameterTypes...),
-		relation:   relation, primaryPath: strings.Clone(primaryPath),
+		sql: text, paramTypes: parameterTypes,
+		relation: relation, primaryPath: primaryPath,
 		schemaGeneration: uint64(base.Binding.Authority.SchemaGeneration),
 		allocationGen:    uint64(base.Binding.AllocationGeneration),
 		layoutToken:      layoutIdentityToken(a.database.layoutEpoch),
@@ -903,8 +953,14 @@ func (a *ReplicatedApply) bindReplicatedReadReuseKey(
 		return key, ErrReplicatedReadReuseUnsupported
 	}
 	connection := prepared.session.conn
-	if connection.db != a.database || connection.tx == nil ||
-		key.layoutToken == nil || layoutIdentityToken(connection.tx.layoutEpoch) != key.layoutToken {
+	if connection.db != a.database || key.layoutToken == nil {
+		return key, ErrReplicatedReadReuseUnsupported
+	}
+	if connection.pointRead != nil {
+		if connection.pointRead.layout != key.layoutToken {
+			return key, ErrReplicatedReadReuseUnsupported
+		}
+	} else if connection.tx == nil || layoutIdentityToken(connection.tx.layoutEpoch) != key.layoutToken {
 		return key, ErrReplicatedReadReuseUnsupported
 	}
 	a.database.mu.RLock()
@@ -971,6 +1027,11 @@ func replicatedReadReuseParamTypesBound(types []ParamType) bool {
 	return true
 }
 
+func replicatedReadPathBound(path *sqlast.PathExpr) bool {
+	var scratch [replicatedReadReuseMaxPath]byte
+	return len(path.AppendPointer(scratch[:0])) <= len(scratch)
+}
+
 func (s *stmt) replicatedReadReuseEligible() bool {
 	if s == nil || s.closed || s.parser == nil || s.tree == nil ||
 		s.tree.Kind != sqlast.KindSelect || s.tree.Select == nil ||
@@ -992,14 +1053,14 @@ func (s *stmt) replicatedReadReuseEligible() bool {
 		column := &selectTree.Columns[i]
 		if column.Path == nil || column.Scalar != nil || column.Window != nil ||
 			column.Agg != sqlast.AggNone || len(column.Path.Segments) == 0 ||
-			len(column.Path.AppendPointer(nil)) > replicatedReadReuseMaxPath {
+			!replicatedReadPathBound(column.Path) {
 			return false
 		}
 	}
 	for i := range selectTree.OrderBy {
 		term := &selectTree.OrderBy[i]
 		if term.Scalar != nil || term.Path == nil || term.Output != 0 ||
-			len(term.Path.AppendPointer(nil)) > replicatedReadReuseMaxPath {
+			!replicatedReadPathBound(term.Path) {
 			return false
 		}
 	}
@@ -1124,6 +1185,7 @@ func (reader *ReplicatedReadSession) resetForReadReuse() error {
 		reader.conn.tx = nil
 	}
 	reader.session.state = SessionIdle
+	reader.pointExecution.reset()
 	return reader.conn.resetForReadReuse()
 }
 
@@ -1135,17 +1197,19 @@ func (c *conn) resetForReadReuse() error {
 		return ErrCursorOpen
 	}
 	var err error
-	// Preserve only bounded, scrubbed result arrays. The executor, snapshots,
-	// cancellation pointers and all source-specific scratch are still released.
-	result := c.exec.Result
-	c.exec.Result = query.Result{}
-	result.ResetForReuse(replicatedReadReuseResultBytes)
-	c.exec.Release()
-	c.exec = query.Exec{Result: result}
+	// Preserve bounded, scrubbed result/scalar arrays. Snapshots, plans and
+	// cancellation pointers are released by the executor reset.
+	c.exec.ResetReadForReuse(replicatedReadReuseResultBytes)
 	err = errors.Join(err, c.joinSnapshot.Close(), c.insertSnapshot.Close())
-	c.args = nil
+	clear(c.args[:cap(c.args)])
+	if cap(c.args) > replicatedReadReuseMaxParams {
+		c.args = nil
+	} else {
+		c.args = c.args[:0]
+	}
 	c.pointDocs = store.Segment{}
 	c.pointSource = query.ValidatedRawSource{}
+	c.pointRead = nil
 	c.pointRaw = nil
 	c.pointKeyRaw = nil
 	c.pointKeyEnds = nil

@@ -878,7 +878,12 @@ func assertReplicatedReadReuseIdleState(t *testing.T, claim *ReplicatedApply) {
 			reader.conn.open || reader.conn.tx != nil {
 			t.Fatalf("idle slot %d retains live session state", i)
 		}
-		if reader.conn.args != nil || reader.conn.pointRaw != nil ||
+		for _, arg := range reader.conn.args[:cap(reader.conn.args)] {
+			if arg != nil {
+				t.Fatalf("idle slot %d retains argument backing", i)
+			}
+		}
+		if len(reader.conn.args) != 0 || reader.conn.pointRaw != nil ||
 			reader.conn.pointKeyRaw != nil || reader.conn.pointKeys != nil ||
 			reader.conn.matchKeys != nil || reader.conn.joinCatalog != nil ||
 			reader.conn.insertSeeds != nil || reader.conn.insertKeyRaw != nil ||

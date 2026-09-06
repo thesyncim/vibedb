@@ -23,10 +23,23 @@ var ErrCanceled = errors.New("query: execution canceled")
 //
 // CancelFlag is deliberately smaller than a context: execution needs only one
 // monotonic bit, not values, deadlines, or a newly allocated cancellation
-// tree. Callers that own a context can bridge its Done channel by calling
-// Cancel from their existing cancellation goroutine.
+// tree. A caller can bind an existing context Done channel before execution;
+// checkpoints observe it directly without a watcher goroutine or callback.
 type CancelFlag struct {
 	canceled atomic.Bool
+	done     <-chan struct{}
+}
+
+// BindDone binds a cancellation channel without starting a watcher. It must
+// only be called while no execution or concurrent flag operation is running.
+// Reset and Take clear the explicit signal only; a closed bound channel remains
+// canceled until BindDone replaces it. BindDone(nil) removes the binding.
+func (f *CancelFlag) BindDone(done <-chan struct{}) { f.done = done }
+
+// ObservesDone reports whether f directly observes this non-nil channel.
+// Its binding must remain unchanged throughout the caller's execution.
+func (f *CancelFlag) ObservesDone(done <-chan struct{}) bool {
+	return f != nil && done != nil && f.done == done
 }
 
 // Cancel asks every execution using f to stop at its next cooperative
@@ -39,22 +52,42 @@ func (f *CancelFlag) Cancel() {
 	}
 }
 
-// Canceled reports whether Cancel has been called since the last Reset.
+// Canceled reports an explicit cancellation or a closed bound channel.
 func (f *CancelFlag) Canceled() bool {
-	return f != nil && f.canceled.Load()
+	if f == nil {
+		return false
+	}
+	if f.canceled.Load() {
+		return true
+	}
+	return f.doneCanceled()
 }
 
-// Take reports and atomically consumes a pending cancellation.
+func (f *CancelFlag) doneCanceled() bool {
+	if f.done == nil {
+		return false
+	}
+	select {
+	case <-f.done:
+		return true
+	default:
+		return false
+	}
+}
+
+// Take atomically consumes an explicit cancellation and also reports whether
+// the bound channel is closed. Channel cancellation cannot be consumed.
 //
 // If Cancel races with Take, the request is either returned by this call or
 // remains armed for the next call; it cannot be lost between a separate load
 // and reset. Like Reset, Take must not clear a flag while an execution using it
 // is still running. Calling it on nil returns false.
 func (f *CancelFlag) Take() bool {
-	return f != nil && f.canceled.Swap(false)
+	return f != nil && (f.canceled.Swap(false) || f.doneCanceled())
 }
 
-// Reset clears f for reuse. It must be called only after every execution using
+// Reset clears the explicit signal; it does not replace the bound channel.
+// It must be called only after every execution using
 // f has returned; resetting a flag still in use can let that execution continue.
 // Calling it on nil is a no-op.
 func (f *CancelFlag) Reset() {
@@ -67,7 +100,7 @@ func (f *CancelFlag) Reset() {
 // Keep it small enough to inline: the overwhelmingly common default is one
 // pointer comparison and no atomic operation.
 func cancellationError(flag *CancelFlag) error {
-	if flag != nil && flag.canceled.Load() {
+	if flag.Canceled() {
 		return ErrCanceled
 	}
 	return nil
@@ -79,7 +112,7 @@ const cancellationCheckMask = 255
 // number of loop iterations. Callers still check once before entering a long
 // operation and once after it returns.
 func cancellationCheckpoint(flag *CancelFlag, at int) error {
-	if flag != nil && at&cancellationCheckMask == 0 && flag.canceled.Load() {
+	if flag != nil && at&cancellationCheckMask == 0 && flag.Canceled() {
 		return ErrCanceled
 	}
 	return nil

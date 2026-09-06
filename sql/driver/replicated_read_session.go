@@ -16,8 +16,10 @@ import (
 // Close returns. Only SELECT preparation is exposed; writes remain canonical
 // replicated commands, not direct SQL mutations on a replica.
 type ReplicatedReadSession struct {
-	session Session
-	conn    conn
+	session        Session
+	conn           conn
+	pointProof     replicatedPointSessionProof
+	pointExecution replicatedPointExecution
 }
 
 func (a *ReplicatedApply) NewDataReadSession(
@@ -99,9 +101,10 @@ func (a *ReplicatedApply) newDataReadSessionInto(
 		transaction.tables[name] = state
 	}
 	// Only the reuse lane supplies a reader, after scrubbing and charging its
-	// bounded result arrays. Preserve those arrays across the fresh cut bind.
-	result := reader.conn.exec.Result
-	reader.conn = conn{db: a.database, directWritesFenced: true, exec: query.Exec{Options: options, Result: result}}
+	// bounded result/scalar arrays. Preserve those across the fresh cut bind.
+	reader.conn.db = a.database
+	reader.conn.directWritesFenced = true
+	reader.conn.exec.Options = options
 	transaction.conn = &reader.conn
 	reader.conn.tx = transaction
 	reader.session = Session{
