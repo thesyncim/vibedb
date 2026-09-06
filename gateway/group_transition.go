@@ -640,6 +640,7 @@ func (writer *digestWriter) bytes(value []byte) {
 func (writer *digestWriter) string(value string) { writer.bytes([]byte(value)) }
 
 func (writer *digestWriter) u64(value uint64) {
+	writer.ensure()
 	var raw [8]byte
 	binary.BigEndian.PutUint64(raw[:], value)
 	_, _ = writer.h.Write(raw[:])

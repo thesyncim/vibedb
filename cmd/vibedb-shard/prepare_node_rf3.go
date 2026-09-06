@@ -183,7 +183,7 @@ func provisionRF3Node(input prepareRF3NodeManifest) (resultErr error) {
 				Grants:        slices.Clone(prepared.SplitControl.Grants),
 				MaxOperations: prepared.SplitControl.ChildRegistry.MaxOperations,
 			}
-		} else if current != identity || group.Listeners != firstListeners || group.TLS != firstTLS || group.AuthorizationPolicy != firstPolicy ||
+		} else if current != identity || group.Listeners != firstListeners || !group.TLS.equal(firstTLS) || group.AuthorizationPolicy != firstPolicy ||
 			!rf3ReadAuthorityManifestEqual(group.ReadAuthority, firstReadAuthority) ||
 			prepared.ReplicaControl.MaxActionRecords != firstReplica.MaxActionRecords ||
 			prepared.ReplicaControl.MaxSourceRecords != firstReplica.MaxSourceRecords ||

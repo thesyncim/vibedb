@@ -1300,7 +1300,19 @@ func loadSeamlessScaleCA(certificatePath, keyPath string) (*x509.Certificate, *e
 }
 
 func writeSeamlessScaleLeaf(certificatePath, keyPath string, ca *x509.Certificate, caKey *ecdsa.PrivateKey, identity rafttransport.PeerIdentity, serial int64) error {
-	key, err := ecdsa.GenerateKey(elliptic.P256(), cryptorand.Reader)
+	// Reissuing the fixture CA must preserve the SPKI already pinned by
+	// initial provisioning. New target paths receive newly generated keys.
+	var key *ecdsa.PrivateKey
+	raw, err := os.ReadFile(keyPath)
+	if err == nil {
+		block, _ := pem.Decode(raw)
+		if block == nil {
+			return errors.New("scale fixture: invalid existing private key")
+		}
+		key, err = x509.ParseECPrivateKey(block.Bytes)
+	} else if errors.Is(err, os.ErrNotExist) {
+		key, err = ecdsa.GenerateKey(elliptic.P256(), cryptorand.Reader)
+	}
 	if err != nil {
 		return err
 	}

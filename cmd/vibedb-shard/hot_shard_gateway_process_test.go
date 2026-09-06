@@ -141,6 +141,7 @@ func runGatewayHotShardLiveChild(t testing.TB, fixture gatewayHotShardLiveFixtur
 
 	gatewayAddresses := rf3CommandUnusedAddresses(t, 2)
 	gatewayAddress, gatewayControlAddress := gatewayAddresses[0], gatewayAddresses[1]
+	bootstrapHotShardNodeDirectory(t, authority, fixture, states, links, snapshot.Generation(), gatewayControlAddress)
 	capacityPath := gatewayHotShardLiveCapacity(t, fixture.root)
 	manifestPath := gatewayHotShardLiveManifest(
 		t, fixture, links, gatewayControlAddress,
@@ -524,7 +525,7 @@ func gatewayHotShardLiveAuthority(
 		Shard: string(gateway.ReplicatedCatalogShard), Tenant: []byte{1}, ClientID: clientID,
 		RetryHome: retryHome, Resolver: gateway.BaseRelationResolver{Relation: 1}, Journal: journal,
 		ProposalCapability: serviceauthz.CapabilityTopology, MaxRelationBatches: 1,
-		MaxMutations: 4, InitialCommandBytes: 4 << 10, MaxCommandBytes: replication.MaxCommandBytes,
+		MaxMutations: rf3CommandMembers + 3, InitialCommandBytes: 4 << 10, MaxCommandBytes: replication.MaxCommandBytes,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -862,4 +863,40 @@ func (link *gatewayHotShardNetworkLink) close() {
 	_ = link.listener.Close()
 	link.partition()
 	link.wg.Wait()
+}
+
+func bootstrapHotShardNodeDirectory(t testing.TB, authority *gateway.ReplicatedCatalogAuthority, fixture gatewayHotShardLiveFixture, states []shardservice.ReplicatedMemberState, links []*gatewayHotShardNetworkLink, generation uint64, gatewayControl string) {
+	t.Helper()
+	records := make([]gateway.NodeRecord, rf3CommandMembers+1)
+	for index := range records {
+		profile, err := servicetls.LoadProfile(fixture.credentials[index].Certificate, fixture.credentials[index].Key, fixture.roots, rf3testfixture.ProcessIdentityOID, time.Now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		prefix := fmt.Sprintf("member-%d", index+1)
+		incarnation := fixture.targetIncarnation
+		peer, native := fixture.targetListeners.Peer, fixture.targetListeners.Native
+		if index < rf3CommandMembers {
+			incarnation = states[index].Fence.NodeIncarnation
+			peer, native = fixture.peerAddresses[index], fixture.nativeAddresses[index]
+		} else {
+			prefix = "target"
+		}
+		records[index] = gateway.NodeRecord{NodeID: profile.LocalIdentity().Node, Incarnation: incarnation,
+			ServiceKeyDigest: replication.Digest(profile.LocalServiceKeyDigest()),
+			DataEndpoint:     distribution.EndpointID(prefix), NativeEndpoint: distribution.EndpointID(prefix + "-native"), ControlEndpoint: distribution.EndpointID(prefix + "-control"),
+			DataAddress: peer, NativeAddress: native, ControlAddress: links[index].address(),
+			Roles:         gateway.NodeRoleStorage | gateway.NodeRoleControl | gateway.NodeRoleCatalog,
+			FailureDomain: prefix, Lifecycle: gateway.NodeActive, Revision: 1, CatalogGeneration: generation}
+	}
+	frontend, err := servicetls.LoadProfile(fixture.credentials[5].Certificate, fixture.credentials[5].Key, fixture.roots, rf3testfixture.ProcessIdentityOID, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	records[0].Roles |= gateway.NodeRoleGateway
+	records[0].GatewayEndpoint, records[0].GatewayAddress = "gateway-control", gatewayControl
+	records[0].Gateway = gateway.GatewayIdentity{NodeID: frontend.LocalIdentity().Node, Incarnation: fixture.targetIncarnation, ServiceKeyDigest: replication.Digest(frontend.LocalServiceKeyDigest()), ServiceID: [16]byte{1}, SessionID: [16]byte{2}, SessionRevision: 1, ParticipantDigest: replication.Digest{3}}
+	if err := authority.BootstrapNodeDirectory(t.Context(), records); err != nil {
+		t.Fatalf("bootstrap hot-shard directory: %v", err)
+	}
 }

@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/thesyncim/vibedb/internal/migrationbudget"
@@ -241,10 +242,11 @@ type rf3ManifestListeners struct {
 }
 
 type rf3ManifestTLS struct {
-	Certificate string `json:"certificate"`
-	Key         string `json:"key"`
-	Roots       string `json:"roots"`
-	IdentityOID string `json:"identity_oid"`
+	Certificate string               `json:"certificate"`
+	Key         string               `json:"key"`
+	Roots       string               `json:"roots"`
+	IdentityOID string               `json:"identity_oid"`
+	PeerKeys    []rf3ManifestPeerKey `json:"peer_keys,omitempty"`
 }
 
 type rf3ManifestMember struct {
@@ -1296,8 +1298,28 @@ func parseRF3ManifestTLS(node vibejson.Node) (rf3ManifestTLS, error) {
 			return rf3ManifestTLS{}, err
 		}
 	}
-	if _, _, extra := fields.Next(); extra {
-		return rf3ManifestTLS{}, errInvalidRF3Manifest
+	if key, node, extra := fields.Next(); extra {
+		if !bytes.Equal(key.Raw().Bytes(), []byte(`"peer_keys"`)) {
+			return rf3ManifestTLS{}, errInvalidRF3Manifest
+		}
+		if err := vibejson.Unmarshal(node.Raw().Bytes(), &result.PeerKeys); err != nil {
+			return rf3ManifestTLS{}, errInvalidRF3Manifest
+		}
+		if len(result.PeerKeys) == 0 || len(result.PeerKeys) > 256 {
+			return rf3ManifestTLS{}, errInvalidRF3Manifest
+		}
+		seen := make(map[rafttransport.NodeID]bool, len(result.PeerKeys))
+		for _, pin := range result.PeerKeys {
+			var nodeID rafttransport.NodeID
+			var digest [32]byte
+			if !decodeRF3FixedHex(pin.NodeID, nodeID[:], false) || !decodeRF3FixedHex(pin.KeyDigest, digest[:], false) || seen[nodeID] {
+				return rf3ManifestTLS{}, errInvalidRF3Manifest
+			}
+			seen[nodeID] = true
+		}
+		if _, _, extra := fields.Next(); extra {
+			return rf3ManifestTLS{}, errInvalidRF3Manifest
+		}
 	}
 	return result, nil
 }
@@ -1663,4 +1685,13 @@ func rf3ManifestNodeID(node vibejson.Node) (rafttransport.NodeID, error) {
 		return rafttransport.NodeID{}, errInvalidRF3Manifest
 	}
 	return result, nil
+}
+
+type rf3ManifestPeerKey struct {
+	NodeID    string `json:"node_id"`
+	KeyDigest string `json:"key_digest"`
+}
+
+func (profile rf3ManifestTLS) equal(other rf3ManifestTLS) bool {
+	return profile.Certificate == other.Certificate && profile.Key == other.Key && profile.Roots == other.Roots && profile.IdentityOID == other.IdentityOID && slices.Equal(profile.PeerKeys, other.PeerKeys)
 }

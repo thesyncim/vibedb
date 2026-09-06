@@ -142,6 +142,10 @@ func TestAuthenticatedExecutionPeerTwoGroupsProgressWithTransportPerPeer(t *test
 		}
 		addresses[member] = listeners[member].Addr().String()
 	}
+	for member := range nodes {
+		registries[member] = pinnedPeerTestRegistry(t, nodes[member], members, rafttransport.Limits{MaxGroups: 2, MaxMembers: len(members)}, profiles)
+	}
+
 	deadline := func() time.Time { return time.Now().Add(5 * time.Second) }
 	peers := make([]*AuthenticatedExecutionPeerRuntime, voters)
 	owners := make([]*ExecutionOwners, voters)

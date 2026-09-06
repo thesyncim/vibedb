@@ -418,7 +418,7 @@ func combineColdRF3MemberManifests(members []rf3Manifest) (rf3Manifest, error) {
 	combined.Groups = make([]rf3ManifestGroup, 0, len(members))
 	for _, member := range members {
 		bundles := member.groupBundles()
-		if len(bundles) != 1 || member.Listeners != combined.Listeners || member.TLS != combined.TLS ||
+		if len(bundles) != 1 || member.Listeners != combined.Listeners || !member.TLS.equal(combined.TLS) ||
 			member.AuthorizationPolicy != combined.AuthorizationPolicy || member.DevelopmentOnly != combined.DevelopmentOnly ||
 			member.ReplicaControl.Migration != combined.ReplicaControl.Migration {
 			return rf3Manifest{}, errInvalidBootstrapRF3Manifest

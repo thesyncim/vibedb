@@ -87,6 +87,10 @@ func TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry(t *tes
 		listeners[index] = listener
 		addresses[nodes[index]] = listener.Addr().String()
 	}
+	for index := range voters {
+		registries[nodes[index]] = pinnedPeerTestRegistry(t, nodes[index], members, rafttransport.Limits{MaxGroups: 1, MaxMembers: voters}, peerTLS)
+	}
+
 	t.Cleanup(func() {
 		for _, listener := range listeners {
 			_ = listener.Close()

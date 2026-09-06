@@ -467,7 +467,7 @@ func processMemberManifest(
 		ledgerEnd = fmt.Sprintf("%x", options.Apply.RequestLedgerRangeEnd)
 		ledgerIdentity = fmt.Sprintf("%x", options.Apply.RequestLedgerRangeIdentity)
 	}
-	document := []byte(fmt.Sprintf(`{"wal":{"path":%q,"key_id":%q,"key_material_path":%q,"max_file_bytes":%d,"max_record_bytes":%d,"max_records":%d,"max_entries":%d,"max_live_bytes":%d},"sql":{"path":%q,"identity_path":%q,"apply_identity_path":%q},"route":{"cluster_id":"%x","cluster_incarnation":"%x","topology_recovery_epoch":%d,"shard_incarnation":"%x","group_id":"%x","distribution":%q,"shard":%q,"allocation_generation":%d,"member_id":%d,"store_id":"%x","member_root":%q,"split_runtime_root":%q,"membership_grant_path":%q},"listeners":{"peer":%q,"native":%q,"snapshot":%q,"control":%q},"tls":{"certificate":%q,"key":%q,"roots":%q,"identity_oid":%q},"authorization_policy":%q,"replica_control":{"action_journal_path":%q,"max_action_records":4096,"source_data_root":%q,"source_journal_path":%q,"max_source_records":4096,"source_repository_path":%q,"max_source_artifacts":8,"max_source_concurrent":2,"max_source_artifact_bytes":1073741824,"max_source_disk_bytes":4294967296,"source_chunk_bytes":1048576,"migration_budget":{"max_active":2,"cpu":{"bytes_per_second":67108864,"burst_bytes":4194304},"disk_read":{"bytes_per_second":67108864,"burst_bytes":4194304},"disk_write":{"bytes_per_second":67108864,"burst_bytes":4194304},"network_send":{"bytes_per_second":33554432,"burst_bytes":2097152},"network_receive":{"bytes_per_second":33554432,"burst_bytes":2097152}}},"split_control":{"journal_path":%q,"max_records":4096,"max_file_bytes":67108864,"grants":[{"node_id":"%x","actions":65535},{"node_id":"%x","actions":65535},{"node_id":"%x","actions":65535}],"child_registry":{"root":%q,"max_operations":8,"stage_checkpoint_bytes":33554432,"table":%q,"create_table":%q,"wal":{"key_id":%q,"key_material_path":%q,"max_file_bytes":%d,"max_record_bytes":%d,"max_records":%d,"max_entries":%d,"max_live_bytes":%d},"apply":{"max_sessions":%d,"retry_window":%d,"max_collections":%d,"max_documents":%d,"max_bytes":%d,"request_ledger_capacity_bytes":%d,"request_ledger_cleanup_reserve_bytes":%d,"request_ledger_range_start":%q,"request_ledger_range_end":%q,"request_ledger_range_identity":%q,"format":%d,"shard_key":%q,"tuple_version":%d,"mapper_version":%d},"static_bootstrap_path":%q,"replica_set_version":1,"members":[{"member_id":1,"node_id":"%x","peer_address":%q},{"member_id":2,"node_id":"%x","peer_address":%q},{"member_id":3,"node_id":"%x","peer_address":%q}]}},"members":[{"member_id":1,"node_id":"%x","peer_address":%q},{"member_id":2,"node_id":"%x","peer_address":%q},{"member_id":3,"node_id":"%x","peer_address":%q}]}`,
+	document := []byte(fmt.Sprintf(`{"wal":{"path":%q,"key_id":%q,"key_material_path":%q,"max_file_bytes":%d,"max_record_bytes":%d,"max_records":%d,"max_entries":%d,"max_live_bytes":%d},"sql":{"path":%q,"identity_path":%q,"apply_identity_path":%q},"route":{"cluster_id":"%x","cluster_incarnation":"%x","topology_recovery_epoch":%d,"shard_incarnation":"%x","group_id":"%x","distribution":%q,"shard":%q,"allocation_generation":%d,"member_id":%d,"store_id":"%x","member_root":%q,"split_runtime_root":%q,"membership_grant_path":%q},"listeners":{"peer":%q,"native":%q,"snapshot":%q,"control":%q},"tls":{"certificate":%q,"key":%q,"roots":%q,"identity_oid":%q%s},"authorization_policy":%q,"replica_control":{"action_journal_path":%q,"max_action_records":4096,"source_data_root":%q,"source_journal_path":%q,"max_source_records":4096,"source_repository_path":%q,"max_source_artifacts":8,"max_source_concurrent":2,"max_source_artifact_bytes":1073741824,"max_source_disk_bytes":4294967296,"source_chunk_bytes":1048576,"migration_budget":{"max_active":2,"cpu":{"bytes_per_second":67108864,"burst_bytes":4194304},"disk_read":{"bytes_per_second":67108864,"burst_bytes":4194304},"disk_write":{"bytes_per_second":67108864,"burst_bytes":4194304},"network_send":{"bytes_per_second":33554432,"burst_bytes":2097152},"network_receive":{"bytes_per_second":33554432,"burst_bytes":2097152}}},"split_control":{"journal_path":%q,"max_records":4096,"max_file_bytes":67108864,"grants":[{"node_id":"%x","actions":65535},{"node_id":"%x","actions":65535},{"node_id":"%x","actions":65535}],"child_registry":{"root":%q,"max_operations":8,"stage_checkpoint_bytes":33554432,"table":%q,"create_table":%q,"wal":{"key_id":%q,"key_material_path":%q,"max_file_bytes":%d,"max_record_bytes":%d,"max_records":%d,"max_entries":%d,"max_live_bytes":%d},"apply":{"max_sessions":%d,"retry_window":%d,"max_collections":%d,"max_documents":%d,"max_bytes":%d,"request_ledger_capacity_bytes":%d,"request_ledger_cleanup_reserve_bytes":%d,"request_ledger_range_start":%q,"request_ledger_range_end":%q,"request_ledger_range_identity":%q,"format":%d,"shard_key":%q,"tuple_version":%d,"mapper_version":%d},"static_bootstrap_path":%q,"replica_set_version":1,"members":[{"member_id":1,"node_id":"%x","peer_address":%q},{"member_id":2,"node_id":"%x","peer_address":%q},{"member_id":3,"node_id":"%x","peer_address":%q}]}},"members":[{"member_id":1,"node_id":"%x","peer_address":%q},{"member_id":2,"node_id":"%x","peer_address":%q},{"member_id":3,"node_id":"%x","peer_address":%q}]}`,
 		prepared.WALPath, options.Key.ID, keyPath, options.WAL.MaxFileBytes,
 		options.WAL.MaxRecordBytes, options.WAL.MaxRecords, options.WAL.MaxEntries,
 		options.WAL.MaxLiveBytes, prepared.SQLPath, basePath, applyPath,
@@ -478,7 +478,7 @@ func processMemberManifest(
 		dataRoot, filepath.Join(dataRoot, "split-runtime"), filepath.Join(dataRoot, "membership-grant"),
 		options.Listeners.Peer, options.Listeners.Native, options.Listeners.Snapshot,
 		options.Listeners.Control, options.Credential.Certificate, options.Credential.Key,
-		options.Roots, ProcessIdentityOID, options.AuthorizationPolicy,
+		options.Roots, ProcessIdentityOID, credentialPeerKeysJSON(options.Credential), options.AuthorizationPolicy,
 		filepath.Join(controlRoot, "replica-actions"), controlRoot,
 		filepath.Join(controlRoot, "source-exports"), filepath.Join(controlRoot, "source-artifacts"),
 		filepath.Join(controlRoot, "split-control.journal"), options.Nodes[0], options.Nodes[1],
@@ -524,4 +524,15 @@ func processMemberManifest(
 		options.Target.MemberID, options.Target.NodeID, options.Target.StoreID,
 		options.Target.NodeIncarnation, options.Target.Listeners.Peer, options.Target.Listeners.Native,
 		options.Target.Listeners.Snapshot, options.Target.Listeners.Control)
+}
+
+func credentialPeerKeysJSON(credential Credential) []byte {
+	if len(credential.PeerKeys) == 0 {
+		return nil
+	}
+	encoded, err := vibejson.Marshal(&credential.PeerKeys)
+	if err != nil {
+		panic(err)
+	}
+	return append([]byte(`,"peer_keys":`), encoded...)
 }

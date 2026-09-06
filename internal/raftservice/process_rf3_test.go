@@ -57,6 +57,7 @@ const (
 	processRootEnvironment     = "VIBEDB_RF3_PROCESS_ROOT"
 	processPeersEnvironment    = "VIBEDB_RF3_PROCESS_PEERS"
 	processRosterEnvironment   = "VIBEDB_RF3_PROCESS_ROSTER"
+	processPeerKeysEnvironment = "VIBEDB_RF3_PROCESS_PEER_KEYS"
 	processCAEnvironment       = "VIBEDB_RF3_PROCESS_CA"
 	processCertEnvironment     = "VIBEDB_RF3_PROCESS_CERT"
 	processKeyEnvironment      = "VIBEDB_RF3_PROCESS_CERT_KEY"
@@ -581,6 +582,7 @@ func startProcessRF3ClusterForRole(
 			processPeersEnvironment + "=" + strings.Join(cluster.peerAddresses[:], ","),
 			processRosterEnvironment + "=" + roster,
 			processCAEnvironment + "=" + caPath,
+			processPeerKeysEnvironment + "=" + processCredentialPins(t, credentials[:]),
 			processCertEnvironment + "=" + credentials[index].certificate,
 			processKeyEnvironment + "=" + credentials[index].key,
 			processWALIDEnvironment + "=rf3-process-test-key",
@@ -1520,6 +1522,24 @@ func buildProcessPeer(
 	if err != nil {
 		return nil, nil, err
 	}
+	keys := strings.Split(os.Getenv(processPeerKeysEnvironment), ",")
+	if len(keys) != len(nodes) {
+		return nil, nil, errors.New("missing explicit process key pins")
+	}
+	peers := make([]rafttransport.PhysicalPeer, len(nodes))
+	for index, node := range nodes {
+		key, err := hex.DecodeString(keys[index])
+		if err != nil || len(key) != 32 {
+			return nil, nil, errors.New("invalid process key pin")
+		}
+		var digest [32]byte
+		copy(digest[:], key)
+		peers[index] = rafttransport.PhysicalPeer{NodeID: node, TrustDomain: registry.TrustDomain(), Incarnation: 1, Revision: 1, ServiceKeyDigest: digest, Endpoint: addresses[index], State: rafttransport.PeerEnrolled}
+	}
+	registry, err = rafttransport.NewStaticRegistryWithDirectory(nodes[member-1], members, peers, 1, rafttransport.Limits{MaxGroups: 1, MaxMembers: processVoters})
+	if err != nil {
+		return nil, nil, err
+	}
 	peerTLS, err := loadProcessPeerTLS(registry, nodes[member-1])
 	if err != nil {
 		return nil, nil, err
@@ -1975,4 +1995,26 @@ func processRoleRoute(
 	}
 	route.Replicas = append([]gateway.ReplicatedEndpoint(nil), route.Replicas...)
 	return route, nil
+}
+
+func processCredentialPins(t testing.TB, credentials []processCredential) string {
+	t.Helper()
+	pins := make([]string, len(credentials))
+	for index, credential := range credentials {
+		raw, err := os.ReadFile(credential.certificate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		block, _ := pem.Decode(raw)
+		if block == nil {
+			t.Fatal("invalid process certificate")
+		}
+		leaf, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		digest := sha256.Sum256(leaf.RawSubjectPublicKeyInfo)
+		pins[index] = hex.EncodeToString(digest[:])
+	}
+	return strings.Join(pins, ",")
 }
