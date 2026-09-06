@@ -1223,6 +1223,41 @@ func (q *NodeSubmissionSequencer) failAccepted(err error) {
 	}
 }
 
+func (q *NodeSubmissionSequencer) finishWave(items *[MaxPersistGroupBatches]*Submission, ready *[MaxPersistGroupBatches]NodeReady, count int) error {
+	q.observeSubmissionQueueWait(items, count)
+	readyWave := items[0].kind == submissionReady
+	if readyWave {
+		q.stats.readyWavesAttempted.Add(1)
+	} else {
+		q.stats.controlWavesAttempted.Add(1)
+	}
+	started := time.Now()
+	engineBefore, _ := q.engineAppendWitness()
+	err := q.runWave(items, ready, count)
+	engineAfter, appendedGroups := q.engineAppendWitness()
+	engineDelta := q.observeEngineSequence(engineBefore, engineAfter, readyWave)
+	waveDuration := sequencerDurationNanos(time.Since(started))
+	if readyWave {
+		q.stats.readyWaveDurationNanos.Add(waveDuration)
+	} else {
+		q.stats.controlWaveDurationNanos.Add(waveDuration)
+	}
+	q.observeWaveResult(items, count, err, engineDelta, appendedGroups)
+	fatal := errors.Is(err, ErrPersistenceUnknown) || errors.Is(err, ErrSubmissionPanic)
+	completionErr := err
+	if fatal {
+		completionErr = errors.Join(ErrPersistenceUnknown, err)
+	}
+	for i := 0; i < count; i++ {
+		q.complete(items[i], completionErr)
+		items[i] = nil
+	}
+	if fatal {
+		return completionErr
+	}
+	return nil
+}
+
 func (q *NodeSubmissionSequencer) run() {
 	defer close(q.done)
 	var items [MaxPersistGroupBatches]*Submission
@@ -1275,34 +1310,29 @@ func (q *NodeSubmissionSequencer) run() {
 			<-q.wake
 			continue
 		}
-		q.observeSubmissionQueueWait(&items, count)
-		readyWave := items[0].kind == submissionReady
-		if readyWave {
-			q.stats.readyWavesAttempted.Add(1)
-		} else {
-			q.stats.controlWavesAttempted.Add(1)
+		// Only independent groups were collected. Complete hint candidates
+		// separately before an unrelated group's durable append can delay
+		// their acknowledgement. Both subsets still use the same persistence
+		// validation; this classification grants no durability exemption.
+		prefix := partitionHintCandidates(&items, count)
+		if prefix == 0 || prefix == count {
+			prefix = count
 		}
-		started := time.Now()
-		engineBefore, _ := q.engineAppendWitness()
-		err := q.runWave(&items, &ready, count)
-		engineAfter, appendedGroups := q.engineAppendWitness()
-		engineDelta := q.observeEngineSequence(engineBefore, engineAfter, readyWave)
-		waveDuration := sequencerDurationNanos(time.Since(started))
-		if readyWave {
-			q.stats.readyWaveDurationNanos.Add(waveDuration)
-		} else {
-			q.stats.controlWaveDurationNanos.Add(waveDuration)
+		completionErr := q.finishWave(&items, &ready, prefix)
+		if prefix < count {
+			if completionErr != nil {
+				for i := prefix; i < count; i++ {
+					q.complete(items[i], completionErr)
+					items[i] = nil
+				}
+			} else {
+				remaining := count - prefix
+				copy(items[:remaining], items[prefix:count])
+				clear(items[remaining:count])
+				completionErr = q.finishWave(&items, &ready, remaining)
+			}
 		}
-		q.observeWaveResult(&items, count, err, engineDelta, appendedGroups)
-		fatal := errors.Is(err, ErrPersistenceUnknown) || errors.Is(err, ErrSubmissionPanic)
-		completionErr := err
-		if fatal {
-			completionErr = errors.Join(ErrPersistenceUnknown, err)
-		}
-		for i := 0; i < count; i++ {
-			q.complete(items[i], completionErr)
-			items[i] = nil
-		}
+		fatal := completionErr != nil
 		if q.capacityWaiters.Swap(false) {
 			q.notifyOwner()
 		}
