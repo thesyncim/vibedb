@@ -19,3 +19,9 @@ Go commands use the project environment wrapper. Process qualification uses Linu
 Earlier RF3 mixed-load qualification on `16bc587f` and `8f52fc5b` lost leader availability. The control-fix run also returned two outcome-unknown writes and subsequently failed its final oracle comparison; unknown writes may have committed, so that comparison alone does not establish corruption. A pending-tick-budget experiment also failed sustained qualification and is excluded. A commit-hint scheduling experiment passed storage tests but failed RF3 setup and is excluded.
 
 No end-to-end speedup or CockroachDB lead is claimed. Sustained mixed-load availability and matched performance qualification remain unresolved.
+
+## Current-main follow-up
+
+The current-main build (`856b27a6`, whose production code matches this PR head) completed six eight-client mixed-uniform RF3 trials: 48,000 measured operations, zero errors, all six final verification checks passed. Each trial also had 8,000 warmup operations; the fixture uses four 8,192-row tables on three physical shard processes. Successful throughput ranged from 2,732.5 to 3,285.3 ops/s (median 2920.1). `mixed-current-summary.json` records each trial, immutable binary hashes, report hash, topology, controls, and raw artifact location. These rates do not isolate this PR from the other main changes and are not a CRDB comparison.
+
+Repeating the three-process WAL-pressure/restart test after other local tests and builds finished passed all three runs (2.40s, 2.12s, 1.95s); see `linux-pressure-repeat.log`. The earlier failed trial remains retained. The repeated run does not prove that the earlier leader loss cannot recur.
