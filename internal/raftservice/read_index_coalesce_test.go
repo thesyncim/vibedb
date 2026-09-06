@@ -10,9 +10,10 @@ import (
 
 type countingReadIndexHost struct {
 	ownerHost
-	calls    int
-	contexts [][16]byte
-	status   raftmember.RuntimeStatus
+	onReadIndex func()
+	calls       int
+	contexts    [][16]byte
+	status      raftmember.RuntimeStatus
 }
 
 func (host *countingReadIndexHost) Status(raftmember.GroupKey) (raftmember.RuntimeStatus, error) {
@@ -21,6 +22,9 @@ func (host *countingReadIndexHost) Status(raftmember.GroupKey) (raftmember.Runti
 
 func (host *countingReadIndexHost) ReadIndex(_ raftmember.GroupKey, context []byte) error {
 	host.calls++
+	if host.onReadIndex != nil {
+		host.onReadIndex()
+	}
 	var retained [16]byte
 	copy(retained[:], context)
 	host.contexts = append(host.contexts, retained)
@@ -50,7 +54,8 @@ func newSharedBarrierFixture(t *testing.T) *sharedBarrierFixture {
 		MemberID: 1, LeaderID: 1, Term: 2, Commit: 7, Applied: 7,
 	}}
 	owner := &Owner{
-		host: host,
+		host:    host,
+		started: true, ingress: make(chan ownerRequest, 16), done: make(chan struct{}),
 		members: map[raftmember.GroupKey]ownerMember{group: {
 			identity:   raftmember.RuntimeIdentity{Group: group, AllocationGeneration: 1, MemberID: 1, StoreID: [16]byte{1}, NodeIncarnation: 1},
 			command:    command,
@@ -64,7 +69,7 @@ func newSharedBarrierFixture(t *testing.T) *sharedBarrierFixture {
 	return &sharedBarrierFixture{group: group, fence: fence, host: host, owner: owner, generation: generation}
 }
 
-func (fixture *sharedBarrierFixture) read(t *testing.T, force bool) *readDelivery {
+func (fixture *sharedBarrierFixture) queue(t *testing.T, force bool) ownerRequest {
 	t.Helper()
 	delivery := &readDelivery{reply: make(chan ownerReply, 1)}
 	request := ownerRequest{
@@ -76,10 +81,24 @@ func (fixture *sharedBarrierFixture) read(t *testing.T, force bool) *readDeliver
 			delivery: delivery, forceReadIndex: force,
 		},
 	}
-	if err := fixture.owner.handle(request); err != nil {
-		t.Fatalf("handle linear read: %v", err)
+	if err := fixture.owner.publish(request); err != nil {
+		t.Fatal(err)
 	}
-	return delivery
+	return <-fixture.owner.ingress
+}
+
+func (fixture *sharedBarrierFixture) admit(t *testing.T, request ownerRequest) *readDelivery {
+	t.Helper()
+	if err := fixture.owner.handle(request); err != nil {
+		t.Fatal(err)
+	}
+	fixture.owner.release(request.bytes)
+	return request.read.delivery
+}
+
+func (fixture *sharedBarrierFixture) read(t *testing.T, force bool) *readDelivery {
+	t.Helper()
+	return fixture.admit(t, fixture.queue(t, force))
 }
 
 func (fixture *sharedBarrierFixture) settleAll(t *testing.T, err error) {
@@ -99,6 +118,9 @@ func settleDeliveryReply(t *testing.T, delivery *readDelivery, wantMinimum uint6
 	t.Helper()
 	select {
 	case reply := <-delivery.reply:
+		if reply.read.generation != nil {
+			defer reply.read.generation.release()
+		}
 		if reply.err != nil {
 			t.Fatalf("waiter settled with error: %v", reply.err)
 		}
@@ -112,9 +134,10 @@ func settleDeliveryReply(t *testing.T, delivery *readDelivery, wantMinimum uint6
 
 func TestSharedReadBarrierCoalescesConcurrentReads(t *testing.T) {
 	fixture := newSharedBarrierFixture(t)
-	primary := fixture.read(t, false)
-	waiterOne := fixture.read(t, false)
-	waiterTwo := fixture.read(t, false)
+	requests := []ownerRequest{fixture.queue(t, false), fixture.queue(t, false), fixture.queue(t, false)}
+	primary := fixture.admit(t, requests[0])
+	waiterOne := fixture.admit(t, requests[1])
+	waiterTwo := fixture.admit(t, requests[2])
 	if fixture.host.calls != 1 {
 		t.Fatalf("ReadIndex calls=%d want 1 shared round", fixture.host.calls)
 	}
@@ -147,11 +170,12 @@ func TestSharedReadBarrierCoalescesConcurrentReads(t *testing.T) {
 
 func TestSharedReadBarrierRejectsNewGeneration(t *testing.T) {
 	fixture := newSharedBarrierFixture(t)
-	primary := fixture.read(t, false)
+	a, b := fixture.queue(t, false), fixture.queue(t, false)
+	primary := fixture.admit(t, a)
 	member := fixture.owner.members[fixture.group]
 	member.generation = &ownerGeneration{}
 	fixture.owner.members[fixture.group] = member
-	other := fixture.read(t, false)
+	other := fixture.admit(t, b)
 	if fixture.host.calls != 2 {
 		t.Fatalf("ReadIndex calls=%d want separate round per generation", fixture.host.calls)
 	}
@@ -162,8 +186,9 @@ func TestSharedReadBarrierRejectsNewGeneration(t *testing.T) {
 
 func TestSharedReadBarrierForceReadIndexStaysSolo(t *testing.T) {
 	fixture := newSharedBarrierFixture(t)
-	primary := fixture.read(t, false)
-	forced := fixture.read(t, true)
+	a, b := fixture.queue(t, false), fixture.queue(t, true)
+	primary := fixture.admit(t, a)
+	forced := fixture.admit(t, b)
 	if fixture.host.calls != 2 {
 		t.Fatalf("ReadIndex calls=%d want forced retry solo", fixture.host.calls)
 	}
@@ -174,8 +199,9 @@ func TestSharedReadBarrierForceReadIndexStaysSolo(t *testing.T) {
 
 func TestSharedReadBarrierErrorFansOut(t *testing.T) {
 	fixture := newSharedBarrierFixture(t)
-	primary := fixture.read(t, false)
-	waiter := fixture.read(t, false)
+	a, b := fixture.queue(t, false), fixture.queue(t, false)
+	primary := fixture.admit(t, a)
+	waiter := fixture.admit(t, b)
 	if fixture.host.calls != 1 {
 		t.Fatalf("ReadIndex calls=%d want 1", fixture.host.calls)
 	}
@@ -195,3 +221,92 @@ func TestSharedReadBarrierErrorFansOut(t *testing.T) {
 }
 
 var errTestSharedBarrier = errors.New("test barrier failure")
+
+func TestSharedReadBarrierCutoffPrecedesProtocolCall(t *testing.T) {
+	f := newSharedBarrierFixture(t)
+	var late ownerRequest
+	f.host.onReadIndex = func() { f.host.onReadIndex = nil; late = f.queue(t, false) }
+	first := f.read(t, false)
+	second := f.admit(t, late)
+	if f.host.calls != 2 {
+		t.Fatal("read published during ReadIndex joined the earlier proof")
+	}
+	f.settleAll(t, nil)
+	settleDeliveryReply(t, first, 9)
+	settleDeliveryReply(t, second, 9)
+}
+
+func TestSharedReadBarrierKeepsIndividualFloors(t *testing.T) {
+	f := newSharedBarrierFixture(t)
+	a, b := f.queue(t, false), f.queue(t, false)
+	b.read.minimumApplied = 15
+	first, second := f.admit(t, a), f.admit(t, b)
+	if f.host.calls != 1 {
+		t.Fatal("pre-issue reads did not share")
+	}
+	f.settleAll(t, nil)
+	settleDeliveryReply(t, first, 9)
+	settleDeliveryReply(t, second, 15)
+	if f.generation.pins.Load() != 0 {
+		t.Fatal("generation pins leaked")
+	}
+}
+
+func TestSharedReadBarrierRetainsCanceledWaiterBudget(t *testing.T) {
+	for _, stop := range []bool{false, true} {
+		t.Run(map[bool]string{false: "completion", true: "close"}[stop], func(t *testing.T) {
+			f := newSharedBarrierFixture(t)
+			f.owner.limits.MaxPendingReadItems = 2
+			a, b, c := f.queue(t, false), f.queue(t, false), f.queue(t, false)
+			first, abandoned := f.admit(t, a), f.admit(t, b)
+			if !abandoned.state.CompareAndSwap(readDeliveryPending, readDeliveryAbandoned) {
+				t.Fatal("cancel failed")
+			}
+			rejected := c.read.delivery
+			if err := f.owner.handle(c); !errors.Is(err, ErrIngressFull) {
+				t.Fatal(err)
+			}
+			f.owner.release(c.bytes)
+			reply := <-rejected.reply
+			if !errors.Is(reply.err, ErrIngressFull) {
+				t.Fatalf("retained waiter escaped bound: %v", reply.err)
+			}
+			if f.host.calls != 1 || f.owner.sharedReadWaiterCount != 1 {
+				t.Fatal("unexpected retained state")
+			}
+			if stop {
+				f.owner.stop(errTestSharedBarrier)
+				if reply := <-first.reply; !errors.Is(reply.err, ErrOwnerClosed) {
+					t.Fatal(reply.err)
+				}
+			} else {
+				f.settleAll(t, nil)
+				settleDeliveryReply(t, first, 9)
+				// Settlement releases retained capacity, so a subsequent read proceeds.
+				next := f.read(t, false)
+				f.settleAll(t, nil)
+				settleDeliveryReply(t, next, 9)
+			}
+			select {
+			case <-abandoned.reply:
+				t.Fatal("abandoned delivery was replied to")
+			default:
+			}
+			if len(f.owner.pendingReads) != 0 || len(f.owner.sharedBarrierWaiters) != 0 || len(f.owner.inflightBarrier) != 0 || f.owner.sharedReadWaiterCount != 0 || f.generation.pins.Load() != 0 {
+				t.Fatal("barrier retained state after settlement")
+			}
+		})
+	}
+}
+
+func TestSharedReadBarrierAdmissionSequenceDoesNotWrap(t *testing.T) {
+	f := newSharedBarrierFixture(t)
+	f.owner.readAdmissionSequence = ^uint64(0)
+	d := &readDelivery{reply: make(chan ownerReply, 1)}
+	if err := f.owner.publish(ownerRequest{reply: d.reply, read: readRequest{delivery: d}}); !errors.Is(err, ErrIngressFull) {
+		t.Fatal(err)
+	}
+	if len(f.owner.ingress) != 0 || f.owner.ingressItems != 0 || d.admission != 0 {
+		t.Fatal("overflow admitted a read")
+	}
+}
