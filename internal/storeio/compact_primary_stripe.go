@@ -1713,10 +1713,45 @@ func (v *CompactPrimaryStripeView) AppendValue(dst []byte, row int) ([]byte, boo
 		return dst, false
 	}
 	if v.shapeCount == 1 && len(v.overflow) == 0 {
-		return v.appendValueOrdinal(dst, row, 0, row)
+		return v.appendValueSingleShape(dst, row)
 	}
 	shape := v.rowShape(row)
 	return v.appendValueOrdinal(dst, row, shape, v.shapeOrdinal(row, shape))
+}
+
+// appendValueSingleShape renders a shape-identical row without carrying a
+// shape ordinal through the general multi-shape path. A rank-affine stream
+// uses the physical row directly; ordinary streams see the same value because
+// the one shape makes its ordinal equal to that row.
+func (v *CompactPrimaryStripeView) appendValueSingleShape(
+	dst []byte,
+	row int,
+) ([]byte, bool) {
+	if v == nil || row < 0 || row >= v.rows || v.IsOverflow(row) {
+		return dst, false
+	}
+	entry, ok := v.shapeEntry(0)
+	if !ok || row < 0 || row >= entry.rows {
+		return dst, false
+	}
+	start := len(dst)
+	streamRaw := entry.streamRaw
+	previous := uint32(0)
+	for hole := 0; hole < entry.template.holes; hole++ {
+		end := binary.LittleEndian.Uint32(entry.template.ends[hole*4:])
+		dst = append(dst, entry.template.static[previous:end]...)
+		previous = end
+		stream, admitted := admittedCompactStream(streamRaw)
+		if !admitted {
+			return dst[:start], false
+		}
+		dst, ok = stream.appendValue(dst, row)
+		if !ok {
+			return dst[:start], false
+		}
+		streamRaw = streamRaw[stream.encoded:]
+	}
+	return append(dst, entry.template.static[previous:]...), true
 }
 
 // valueLength computes one inline row's exact JSON length without appending to
