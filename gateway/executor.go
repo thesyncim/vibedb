@@ -196,15 +196,17 @@ type Explanation struct {
 
 // preparedQueryExecution is the session-local physical planning cache behind
 // the pgwire prepared-statement path. PreparedPlan and planner.Plan are
-// immutable; the remaining fields certify the catalog generation and route
-// shape for which the physical tree was selected.
+// immutable; the remaining fields certify the catalog generation, exact route
+// targets, and effective optimizer memory cap for which the physical tree was
+// selected.
 type preparedQueryExecution struct {
-	generation uint64
-	prepared   *PreparedPlan
-	routeKind  distribution.RouteKind
-	targets    int
-	physical   *queryplanner.Plan
-	planning   queryplanner.OptimizerStatistics
+	generation        uint64
+	prepared          *PreparedPlan
+	routeKind         distribution.RouteKind
+	targets           []distribution.Target
+	maxAggregateBytes uint64
+	physical          *queryplanner.Plan
+	planning          queryplanner.OptimizerStatistics
 }
 
 // Query routes and dispatches q, retrying against a refreshed generation when a
@@ -351,6 +353,7 @@ func (e *Executor) queryWithProfileValidation(
 				cache.generation = snap.Generation()
 				cache.routeKind = entry.routeKind
 				cache.targets = entry.targets
+				cache.maxAggregateBytes = entry.maxAggregateBytes
 				cache.physical = entry.physical
 				cache.planning = entry.planning
 			}
