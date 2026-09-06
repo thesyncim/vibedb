@@ -891,14 +891,17 @@ func hotMutationWaitSplitRevision(
 ) {
 	t.Helper()
 	deadline := time.Now().Add(30 * time.Second)
+	var last gateway.ReplicatedOperationRecord
+	var lastErr error
 	for time.Now().Before(deadline) {
 		record, err := authority.ReadOperation(ctx, operation)
+		last, lastErr = record, err
 		if err == nil && record.Revision >= revision && record.Cursor[0] >= uint64(splitcontroller.ActionBuildArtifacts) {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatal("split operation did not reach capture/artifact execution")
+	t.Fatalf("split operation did not reach capture/artifact execution: state=%d revision=%d cursor=%v settled=%t error=%v", last.State, last.Revision, last.Cursor, last.ExecutionSettled, lastErr)
 }
 
 func hotMutationWaitSplitComplete(
