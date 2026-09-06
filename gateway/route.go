@@ -28,7 +28,25 @@ type shardCall struct {
 	pressureSource autosplit.SourceIdentity
 	address        string
 	req            *shardservice.ShardRequest
+	// pkScratch stages one point-read key without allocating (see
+	// pkPointScratch): populateReplicatedPrimaryKeyRead borrows it and the
+	// request borrows it further until that plan's dispatch joins, when
+	// releaseShardCalls returns it to the pool.
+	pkScratch *pkPointScratch
 }
+
+// pkPointScratch is the pooled staging for one replicated point-read key:
+// the encoded key bytes plus their single-element wrapper. One plan borrows
+// at most one (single-target reads only); dispatch is synchronous, so the
+// borrow never outlives the pool Get/Put pair in route/release. The server
+// deep-clones keys before executing, so pooled bytes never escape the
+// gateway.
+type pkPointScratch struct {
+	key  [replication.MaxMutationKeyBytes]byte
+	keys [1][]byte
+}
+
+var pkPointScratchPool = sync.Pool{New: func() any { return &pkPointScratch{} }}
 
 // plan is the routed result for one pinned generation: the physical route kind,
 // the calls to dispatch, and the scatter classification for admission and
@@ -81,6 +99,14 @@ func releaseShardCalls(calls []shardCall) {
 		if req := calls[i].req; req != nil {
 			*req = shardservice.ShardRequest{}
 			shardRequestPool.Put(req)
+		}
+		if scratch := calls[i].pkScratch; scratch != nil {
+			calls[i].pkScratch = nil
+			// Scrub like the shells above so pooled memory retains no
+			// caller key bytes.
+			clear(scratch.key[:])
+			scratch.keys[0] = nil
+			pkPointScratchPool.Put(scratch)
 		}
 	}
 }
@@ -263,11 +289,6 @@ func populateReplicatedPrimaryKeyRead(
 	if !ok {
 		return
 	}
-	var keyStorage [replication.MaxMutationKeyBytes]byte
-	key, ok := appendReplicatedSQLScalarKey(keyStorage[:0], scalar)
-	if !ok || len(key) == 0 || len(key) > int(profile.MaxKeyBytes) {
-		return
-	}
 	var values [1]distribution.Scalar
 	values[0] = scalar
 	point, err := mapper.PointFor(values[:])
@@ -282,11 +303,24 @@ func populateReplicatedPrimaryKeyRead(
 		resolved.Role != target.Role {
 		return
 	}
+	// All routing checks passed: borrow pooled staging (returned by
+	// releaseShardCalls after dispatch joins) and encode the key straight
+	// into it. Encoding into a stack temporary would escape through the
+	// non-inlined scalar encoder, so the pooled buffer is what makes the
+	// escaping key bytes allocation-free on the point-read path.
+	scratch := pkPointScratchPool.Get().(*pkPointScratch)
+	key, ok := appendReplicatedSQLScalarKey(scratch.key[:0], scalar)
+	if !ok || len(key) == 0 || len(key) > int(profile.MaxKeyBytes) {
+		pkPointScratchPool.Put(scratch)
+		return
+	}
+	scratch.keys[0] = key
+	calls[0].pkScratch = scratch
 	calls[0].req.PrimaryKeyRead = shardservice.PrimaryKeyReadRequest{
 		Relation:         profile.Relation,
 		MaxDocumentBytes: profile.MaxDocumentBytes,
 		PrimaryPath:      byteview.Bytes(profile.PrimaryKey),
-		Keys:             [][]byte{key},
+		Keys:             scratch.keys[:],
 	}
 }
 
