@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 
+	queryplanner "github.com/thesyncim/vibedb/planner"
 	"github.com/thesyncim/vibedb/shardservice"
+	"github.com/thesyncim/vibejson/x/byteview"
 )
 
 // TestReleaseShardCallsScrubsShells proves routed shells retain no caller
@@ -77,6 +80,27 @@ func TestExecutorPlanCacheReusesPhysicalPlan(t *testing.T) {
 	}
 	if again.generation != entry.generation {
 		t.Fatalf("entry generation changed without a catalog refresh")
+	}
+}
+
+func TestExecutorPhysicalPlanCacheOwnsReplacementSQL(t *testing.T) {
+	const text = `SELECT n FROM messages WHERE tenant_id = 'a1'`
+	backing := []byte(text)
+	borrowed := byteview.String(backing)
+	owned := strings.Clone(text)
+	oldPhysical := &queryplanner.Plan{}
+	newPhysical := &queryplanner.Plan{}
+	e := &Executor{
+		planCache: map[string]executorPlanEntry{
+			owned: {generation: 1, physical: oldPhysical},
+		},
+		planOrder: []string{owned},
+	}
+	e.publishPhysical(borrowed, 1, &BoundPlan{}, &preparedQueryExecution{physical: newPhysical})
+	clear(backing)
+	entry, ok := e.cachedPhysical(text, 1)
+	if !ok || entry.physical != newPhysical || len(e.planOrder) != 1 || e.planOrder[0] != text {
+		t.Fatal("replaced physical plan retained borrowed SQL key storage")
 	}
 }
 
