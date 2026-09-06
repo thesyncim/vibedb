@@ -569,7 +569,7 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 			profile, policy, gate, controlTLS, nativeTLS, nodeOwner, adoptedInventory, migrationBudget)
 	}
 	nativeTLS, err = shardservice.NewReplicatedServerTLS(
-		profile, policy.NodesWith(serviceauthz.CapabilityDelegate),
+		profile, rf3NativePeerNodes(policy),
 	)
 	if err != nil {
 		return closePrepared(fmt.Errorf("%w: native TLS authority: %v", errRF3Serving, err))

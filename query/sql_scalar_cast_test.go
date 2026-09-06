@@ -224,6 +224,14 @@ func TestSQLScalarOutputsAreLazyAfterWhereOffsetAndLimit(t *testing.T) {
 			FromSegment(badFirst), 0,
 		},
 		{
+			"Boolean false", `SELECT CAST(v AS NUMERIC), 10 / z FROM docs WHERE false`,
+			FromSegment(badFirst), 0,
+		},
+		{
+			"negated Boolean", `SELECT CAST(v AS NUMERIC), 10 / z FROM docs WHERE NOT true`,
+			FromSegment(badFirst), 0,
+		},
+		{
 			"offset", `SELECT CAST(v AS NUMERIC), 10 / z FROM docs WHERE id + 0 >= 1 ORDER BY id OFFSET 1 LIMIT 1`,
 			FromSegment(badFirst), 1,
 		},
@@ -255,6 +263,42 @@ func TestSQLScalarOutputsAreLazyAfterWhereOffsetAndLimit(t *testing.T) {
 			}
 			if statement.nested.frame.intermediate.used != 0 {
 				t.Fatalf("statement retained %d intermediate bytes", statement.nested.frame.intermediate.used)
+			}
+		})
+	}
+}
+
+func TestSQLBooleanConstantFiltersComposeWithPathsAndGrouping(t *testing.T) {
+	segment := mustSegment(t, `{"n":1}`, `{"n":2}`, `{"n":null}`)
+	for _, tc := range []struct {
+		text string
+		want string
+	}{
+		{`SELECT COUNT(*) FROM docs WHERE true`, "3"},
+		{`SELECT COUNT(*) FROM docs WHERE false`, "0"},
+		{`SELECT COUNT(*) FROM docs WHERE NOT false`, "3"},
+		{`SELECT COUNT(*) FROM docs WHERE n=1 AND true`, "1"},
+		{`SELECT COUNT(*) FROM docs WHERE n=1 OR false`, "1"},
+		{`SELECT COUNT(*) FROM docs WHERE NOT (n=1 OR false)`, "1"},
+		{`SELECT COUNT(*) FROM docs WHERE n=1 OR true`, "3"},
+	} {
+		t.Run(tc.text, func(t *testing.T) {
+			statement, err := PrepareStatement(tc.text)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer statement.Release()
+			var exec Exec
+			defer exec.Release()
+			cursor, err := statement.RunInto(&exec, FromSegment(segment), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !cursor.Next() || string(cursor.Cell(0).JSON()) != tc.want {
+				t.Fatalf("want COUNT %s, result=%+v", tc.want, exec.Result)
+			}
+			if cursor.Next() {
+				t.Fatal("extra aggregate row")
 			}
 		})
 	}

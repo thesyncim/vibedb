@@ -227,6 +227,23 @@ func TestReplicatedDeclaredSchemaBindReopen(t *testing.T) {
 	if err != nil || completion.ResultCode != replicatedstate.ResultApplied || rows != 0 {
 		t.Fatalf("skipped completion=%+v rows=%d err=%v", completion, rows, err)
 	}
+	keyMove, err := sqlast.ParseStatement(`INSERT INTO employees VALUES (?) ON CONFLICT DO UPDATE SET id='moved'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	moveValue, err := EncodeReplicatedConflictValue(second, keyMove.Insert.OnConflictUpdate, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	moving := testReplicatedApplyCommand(identity, epoch, 8,
+		replication.Mutation{Kind: replication.MutationPutConflict, Key: key, Value: payload},
+		replication.Mutation{Kind: replication.MutationPutConflict, Key: []byte(secondKey), Value: moveValue})
+	if _, err := claim.ApplyNormal(testReplicatedApplyMeta(10), moving); err != nil {
+		t.Fatal(err)
+	}
+	if code := completionResultCode(t, claim, moving); code != replicatedstate.ResultInvalidDocument {
+		t.Fatalf("key move batch code=%v", code)
+	}
 	if err := claim.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -243,7 +260,7 @@ func TestReplicatedDeclaredSchemaBindReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer againClaim.Close()
-	if _, err := againClaim.ApplyNormal(testReplicatedApplyMeta(10), skipped); err != nil {
+	if _, err := againClaim.ApplyNormal(testReplicatedApplyMeta(11), skipped); err != nil {
 		t.Fatal(err)
 	}
 	retained, err := againClaim.LookupCompletion(skipped)

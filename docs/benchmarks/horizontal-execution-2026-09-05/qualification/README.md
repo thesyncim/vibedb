@@ -6,10 +6,11 @@ not establish a fault-qualification pass, a throughput result, or a comparison
 with CockroachDB.
 
 The archive catalog is [`qualification-manifest.json`](qualification-manifest.json)
-and the archive checksums are in [`SHA256SUMS`](SHA256SUMS). Every tarball also
-contains `archive-provenance.json`, which records the source revision and patch
-identity, build metadata and binary SHA-256 values, exact redacted argv where
-the runner captured it, and SHA-256 values for each retained raw file.
+and the archive checksums are in [`SHA256SUMS`](SHA256SUMS). Each run archive
+retains its run manifest and raw evidence. The d898 filtered archive has a
+[companion provenance record](archives/authority-fault-diagnostic-d898-provenance.json)
+with source and build identity, binary SHA-256 values, and a SHA-256 for every
+retained raw file.
 
 | Archive | Evidence | Source identity | Outcome |
 | --- | --- | --- | --- |
@@ -19,6 +20,50 @@ the runner captured it, and SHA-256 values for each retained raw file.
 | [`authority-runtime-linux-e3b3e53e.tar.gz`](archives/authority-runtime-linux-e3b3e53e.tar.gz) | Linux `internal/raftmember` runtime tests | `e3b3e53e04a268d6d5a76ffab5fa14366bec255f`, source tree blobs included | Ten tests passed with no skips; test binary omitted after recording its exact hash and build metadata. |
 | [`authority-fault-long-failed.tar.gz`](archives/authority-fault-long-failed.tar.gz) | Long 3-node/4-group authority run | `e3b3e53e04a268d6d5a76ffab5fa14366bec255f`, dirty | `mixed_read_update` failed before any fault signal; point workloads passed. |
 | [`authority-fault-retry-interrupted.tar.gz`](archives/authority-fault-retry-interrupted.tar.gz) | Retry with measuring-wait fix | `e3b3e53e04a268d6d5a76ffab5fa14366bec255f`, dirty | `mixed_uniform` was interrupted while preparing; a 7.0500745-second process pause was recorded, with no restart. |
+| [`authority-fault-diagnostic-d898.tar.gz`](archives/authority-fault-diagnostic-d898.tar.gz) | Full no-network-fault 3-node/4-group diagnostic with pause and same-volume restart | `d898f062726bdd0070d402e1b41463bbd7090434`, clean | Strict oracle completed 480,000 samples with zero errors; post-CONT latch validation passed offline with exact timestamp ordering; restart recovered; diagnostic only, with no qualification claim and no observable quarantine boolean. |
+
+## d898 fault diagnostic and derived validation
+
+The d898 run used 60,000 operations, 500 scans, warmup 1000, clients 1 and 8,
+and all four workloads (`point_hit,point_miss,mixed_read_update,mixed_uniform`)
+on three physical nodes hosting four RF3 groups. The strict client oracle
+completed 480,000 samples with zero errors and exit status 0. The run was a
+diagnostic workload with a process pause and same-volume restart; it was not a
+network partition and it makes no throughput or qualification claim.
+
+The selected node was `7f28932b0c5441531426ecc72377a5cd`, PID 293. Its
+SIGSTOP/SIGCONT interval was 7.041228167 seconds. The configured read-authority
+grant of 5 seconds and restart quarantine of about 6.11 seconds are elapsed
+clock settings, not hard wall-clock upper bounds; the deployment assumes clock
+rates within ±10%, including virtual-machine suspension effects. The run
+recorded restart readiness after 7.634868084 seconds, recovered on the same
+volume with exit status 0, and did not expose a quarantine boolean.
+
+The original run manifest remains retained and unchanged with status
+`incomplete-or-failed`, failure `diagnostic: post-CONT diagnostic latch was not
+retained: latch armed has invalid UTC`, and SHA-256
+`eefdcce6af86a6e473bd36378d1b008266f87d59193a0d5171656fc4e514355c`. The
+[derived offline report](authority-fault-diagnostic-d898-offline-validation.json)
+validates the retained post-CONT latch using integer epoch nanoseconds and
+records `qualification_claimed=false`; it does not rewrite or reclassify the
+original manifest.
+
+The filtered archive is 555,366 bytes and contains 98 retained raw files plus
+its embedded manifest. It retains the client oracle and logs, 48 per-node
+workload diagnostic snapshots, per-group snapshots and the failed-table
+timeline, pre/post pause and restart state, recovery records, control commands,
+and source manifests. The [provenance record](archives/authority-fault-diagnostic-d898-provenance.json)
+records every included-file checksum and the hashes of omitted payloads:
+compiled binaries (186,349,310 bytes), the 486-file published data tree
+(`abbe874fcd926482d4a1a17145adc18625200b2444c008252f1814b4aab262f1`), the
+70,019,644-byte full SQL report
+(`4d313ef2365dd03c147bf310683730a7a75dc875041434a004ebdb0713d7d3aa`), and
+the zero-byte historical source patch payloads. Docker volumes and database/WAL
+contents are omitted. The archive SHA-256 is
+`854c6cfa022a42c39b92af500ca4d3f15257914d1e15f1162aa61fda05a530b3`.
+
+The [human-readable run report](authority-fault-diagnostic-d898.md) links these
+artifacts and records the exact binary and validator revisions.
 
 The two long-run archives retain manifests, control commands, client and node
 logs, reports, diagnostics, inventories, published state, fault snapshots,

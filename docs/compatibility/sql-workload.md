@@ -1,12 +1,15 @@
 # SQL workload compatibility tracker
 
 This audit compares the Chat product and its shared database layer in the local
-`chat` repository with VibeDB main at `9454ced0` (2026-09-05). The read-compatibility batches through relation wildcard expansion are merged
-at `97edf271`. **The application
-cannot yet run unchanged on VibeDB.** This change implements the conditional
-expressions, Boolean tests, explicit null ordering, INSERT NULL literals, and
-single-column primary conflict targets, and computed sort keys described below. The remaining reduced
-SQL cases stay executable as a gap inventory. Full-text search is excluded.
+`chat` repository with VibeDB main at `9454ced0` (2026-09-05). The read-
+compatibility batches through relation wildcard expansion are merged at
+`97edf271`. **The application cannot yet run unchanged on VibeDB.** The
+implemented surface below is cumulative across those read batches and the
+merged RF3 mutation and routing work, including conditional expressions,
+Boolean tests, explicit null ordering, INSERT NULL literals, single-column
+primary conflict targets, computed sort keys, bounded conflict programs, and
+literal predicate routing. The remaining reduced SQL cases stay executable as a
+gap inventory. Full-text search is excluded.
 
 ## Evidence and reproducibility
 
@@ -82,7 +85,11 @@ leader observations for each group; this does not create a cluster-wide MVCC cut
 Routing computes a complete domain for every physical source occurrence. It
 unions repeated consumers, follows CTE output aliases and plain derived
 projections, propagates join-key equalities in null-preserving directions, and
-combines OR and set-branch domains. Unknown predicates widen the domain. LIMIT,
+combines OR and set-branch domains. Literal Boolean predicates, including
+structural NOT, contribute complete or empty domains without executing scalar
+expressions. False branches do not add owners to OR or repeated-consumer unions.
+Transparent CTE and derived-table mappings preserve these proofs; schema and
+operator validation still run before source I/O. Unknown predicates widen the domain. LIMIT,
 aggregation, windows, recursion, and predicates with observable evaluation
 boundaries prevent unsafe inherited pushdown. Unused CTE definitions retain
 catalog validation but generate no source scans. Necessary top-level key
@@ -108,12 +115,19 @@ once before all SET expressions; FALSE and UNKNOWN skip assignments, local
 RETURNING rows, and affected-row counts. An insert ignores the condition at
 runtime while still validating candidate, declaration, and bindings. The same
 filter applies to local, durable, transactional, shard, and RF3 execution.
-Untouched fields and exact retry results are preserved. The owner proof and final schema/key fences still apply.
+Untouched fields and exact retry results are preserved. The owner proof and final schema/key fences still apply. Native RF3 profiles
+freeze placement to the primary key, so arbitrary computed key assignments can
+run at the candidate's owner: executed updates must retain the key, while skipped
+conditions and absent-row branches do not evaluate unused assignments. The
+legacy syntactic key restriction remains until those receivers authenticate the
+same placement proof.
 
 Each relation retains at most one compiled template, protected by the same
-mutex used for detached snapshot audits. Changed parameter values reuse that
-template; only referenced binds are serialized, with dense ordinals independent
-of the INSERT's candidate binds. The format bounds the full mutation to 4 MiB,
+mutex used for detached snapshot audits. The coordinator encodes the immutable
+program once per bound INSERT and appends each candidate row to that program;
+changed parameter values reuse the template while only referenced binds are
+serialized, with dense ordinals independent of the INSERT's candidate binds.
+The format bounds the full mutation to 4 MiB,
 assignments and referenced parameters to 1,024 each, expression nodes to 16,384,
 and depth to 128. Execution has deterministic 16 MiB workspace, result,
 intermediate, and exact-number budgets; document limits apply independently.
@@ -144,7 +158,7 @@ update this table. A parser accepting a statement does not close a gap.
 | 1 | Relational mutations and queues | 36 UPDATE-FROM/DELETE-USING and 14 modifying-CTE locations. Requires atomic shared-snapshot execution, INSERT-SELECT with target columns and returned-row dependencies. |
 | 1 | Locking and queue concurrency | 14 locking locations, including FOR UPDATE / SKIP LOCKED. Requires a real concurrency contract; accepting and ignoring lock clauses would be incorrect. |
 | 2 | Expression, partial, ordered, and covering indexes | 205 index-related locations. Required both for schema acceptance and efficient channel/member queries; uniqueness predicates and access-path proofs must remain correct. |
-| 2 | Remaining query expressions | Computed group keys; mixed scalar/path pattern predicates; correlated scalar filtering before aggregates; derived wildcard + scalar outputs; string/date functions; DISTINCT ON; aggregate DISTINCT/FILTER and array/JSON aggregation. |
+| 2 | Remaining query expressions | Computed group keys; mixed scalar/path pattern predicates; correlated scalar filtering before aggregates; inferred fields from whole-document child projections and numeric ORDER BY positions with wildcards; string/date functions; DISTINCT ON; aggregate DISTINCT/FILTER and array/JSON aggregation. |
 | 2 | ALTER and migration lifecycle | 375 ALTER locations. Current ADD COLUMN is insufficient for historical migrations, type/default changes, drops, and index changes. |
 | 2 | Bulk and client/session behavior | 5 COPY and 10 session/catalog locations, plus ORM-generated connection and relation queries not established by static extraction. Requires wire/client tests and bounded bulk ingestion. |
 | 1 before application rollout | Distributed execution parity | Existing RF3 SQL mutation restrictions on ON CONFLICT, RETURNING, non-primary-key mutations, and bounded transactions still apply. Local database/sql success is not evidence that every RF3 path supports a feature. |

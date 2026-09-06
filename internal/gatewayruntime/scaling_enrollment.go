@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"slices"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/nodecontrol"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
@@ -25,8 +26,8 @@ var (
 // draft intent is being built and again for every Prepare/Adopt retry; it must
 // read the source's retained catalog or an exact durable payload.
 type ScalingEnrollmentOptions struct {
-	Catalog      scalingCatalogReader
-	Source       nodecontrol.PayloadProvider
+	Catalog       scalingCatalogReader
+	Source        nodecontrol.PayloadProvider
 	ControlOpener nodecontrol.StreamOpener
 	ReadDeadline  rafttransport.DeadlineFunc
 	WriteDeadline rafttransport.DeadlineFunc
@@ -104,7 +105,7 @@ func (runtime *ScalingEnrollmentRuntime) BuildEnrollment(
 	if move.ExpectedCatalogGeneration == 0 || snapshot.Generation() != move.ExpectedCatalogGeneration ||
 		parent.CatalogGeneration == 0 || parent.CatalogGeneration > snapshot.Generation() ||
 		move.Group != membership.Serving.Group || move.Distribution != membership.Serving.Distribution ||
-		move.Shard != membership.Serving.Shard || move.AllocationGeneration != membership.Serving.AllocationGeneration ||
+		move.Shard != membership.Serving.Shard || uint64(move.AllocationGeneration) != membership.Serving.AllocationGeneration ||
 		membership.HasEnrolledTarget || len(membership.Serving.Replicas) != gateway.ServingReplicaCount {
 		return gateway.GroupEnrollmentIntent{}, gateway.ErrScalingIdentity
 	}
@@ -116,8 +117,8 @@ func (runtime *ScalingEnrollmentRuntime) BuildEnrollment(
 	for _, replica := range membership.Serving.Replicas {
 		if replica.Member == move.Source.Member && replica.Node == move.Source.Node &&
 			replica.NodeIncarnation == move.Source.NodeIncarnation && replica.StoreID == move.Source.StoreID {
-			if replica.Endpoint != move.Source.Endpoint || replica.NativeEndpoint != move.Source.NativeEndpoint ||
-				replica.ControlEndpoint != move.Source.ControlEndpoint {
+			if replica.Endpoint != string(move.Source.Endpoint) || replica.NativeEndpoint != string(move.Source.NativeEndpoint) ||
+				replica.ControlEndpoint != string(move.Source.ControlEndpoint) {
 				return gateway.GroupEnrollmentIntent{}, gateway.ErrScalingIdentity
 			}
 			source, foundSource = replica, true
@@ -191,8 +192,8 @@ func (runtime *ScalingEnrollmentRuntime) BuildEnrollment(
 func endpointIdentity(replica gateway.ReplicatedEndpoint) gateway.ReplicaIdentity {
 	return gateway.ReplicaIdentity{Member: replica.Member, Node: replica.Node,
 		NodeIncarnation: replica.NodeIncarnation, StoreID: replica.StoreID,
-		Endpoint: replica.Endpoint, NativeEndpoint: replica.NativeEndpoint,
-		ControlEndpoint: replica.ControlEndpoint}
+		Endpoint: distribution.EndpointID(replica.Endpoint), NativeEndpoint: distribution.EndpointID(replica.NativeEndpoint),
+		ControlEndpoint: distribution.EndpointID(replica.ControlEndpoint)}
 }
 
 func validateDraftPreparation(

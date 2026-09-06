@@ -108,7 +108,7 @@ func (c *Collection) retryRetirementAfterPressure() error {
 	}
 	absorbed, err := c.reclaimer.AppendReusable(
 		c.retirementAbsorbed[:0], current,
-		c.committer.FallbackGeneration(), cap(c.retirementAbsorbed),
+		c.effectiveRecoveryFloor(current), cap(c.retirementAbsorbed),
 	)
 	if err != nil {
 		return err

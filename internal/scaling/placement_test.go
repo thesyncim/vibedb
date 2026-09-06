@@ -125,6 +125,7 @@ func placementNode(number int, lifecycle gateway.NodeLifecycle) gateway.NodeReco
 	}
 	return gateway.NodeRecord{
 		NodeID:            rafttransport.NodeID{byte(number)},
+		ServiceKeyDigest:  replication.Digest{byte(number)},
 		Incarnation:       1,
 		DataEndpoint:      distribution.EndpointID("node-data-" + string(rune('0'+number))),
 		NativeEndpoint:    distribution.EndpointID("node-native-" + string(rune('0'+number))),

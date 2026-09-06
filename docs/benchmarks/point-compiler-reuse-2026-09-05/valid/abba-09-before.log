@@ -1,0 +1,10 @@
+goos: linux
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/sql/driver
+BenchmarkReplicatedPointReadCPU/point_hit         	    5000	     10399 ns/op	   20101 B/op	     131 allocs/op
+BenchmarkReplicatedPointReadCPU/point_hit         	    5000	     12111 ns/op	   20101 B/op	     131 allocs/op
+BenchmarkReplicatedPointReadCPU/point_hit         	    5000	     13245 ns/op	   20101 B/op	     131 allocs/op
+BenchmarkReplicatedPointReadCPU/point_miss        	    5000	      9140 ns/op	   11560 B/op	     110 allocs/op
+BenchmarkReplicatedPointReadCPU/point_miss        	    5000	      9249 ns/op	   11560 B/op	     110 allocs/op
+BenchmarkReplicatedPointReadCPU/point_miss        	    5000	      9493 ns/op	   11560 B/op	     110 allocs/op
+PASS

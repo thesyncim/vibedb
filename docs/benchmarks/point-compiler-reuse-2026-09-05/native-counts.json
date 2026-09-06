@@ -1,0 +1,28 @@
+{
+  "suite": "Test(ReplicatedPointRaw|ReplicatedPointReadSession|ReplicatedReadReuse)",
+  "runtime": "golang:1.27-bookworm@sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b",
+  "scratch_volume": "vibedb-point-validation-luna-371de0af",
+  "environment": {
+    "TMPDIR": "/testtmp",
+    "GOEXPERIMENT": "simd",
+    "GOOS": "linux",
+    "GOARCH": "arm64",
+    "CGO_ENABLED": "0"
+  },
+  "before": {
+    "log": "native/native-before.log",
+    "sha256": "9d745cc746ee9c9ca125377250a141c1d05d42533168c7892b15b44d3b3fe093",
+    "started": 38,
+    "passed": 38,
+    "skipped": 0,
+    "failed": 0
+  },
+  "after": {
+    "log": "native/native-after.log",
+    "sha256": "72fbb02a1b5dc23df5d1eeaedafde8fdf3425a798a0c1f018cd67df20d516b7f",
+    "started": 38,
+    "passed": 38,
+    "skipped": 0,
+    "failed": 0
+  }
+}

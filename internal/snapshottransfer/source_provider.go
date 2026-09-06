@@ -259,6 +259,7 @@ func (provider *RetainedSourceExportProvider) PinSourceExport(
 		return SourceExportPlan{}, err
 	}
 	var workspace sourceExportWorkspace
+	workspaceOwned := false
 	var workspaceBuffer *migrationbudget.BufferLease
 	var activeLease *migrationbudget.Lease
 	returnWorkspace := func() {
@@ -274,11 +275,15 @@ func (provider *RetainedSourceExportProvider) PinSourceExport(
 			workspace.artifact = nil
 			workspace.transfer = nil
 		}
-		provider.workspaces <- workspace
+		if workspaceOwned {
+			provider.workspaces <- workspace
+			workspaceOwned = false
+		}
 		provider.releasePlan()
 	}
 	select {
 	case workspace = <-provider.workspaces:
+		workspaceOwned = true
 		if budget != nil {
 			// Reserve both workspaces as one atomic node-scoped credit. Taking
 			// them independently lets concurrent plans each hold one half and

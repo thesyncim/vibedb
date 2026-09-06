@@ -777,6 +777,10 @@ func (r *Repository) finish(ctx context.Context, lease *migrationbudget.Lease, r
 		r.mu.Unlock()
 		return nil
 	}
+	if r.records[rec.descriptor.ArtifactHash] != rec {
+		r.mu.Unlock()
+		return ErrStaleFence
+	}
 	if rec.finishing {
 		r.mu.Unlock()
 		return ErrArtifactBusy
@@ -826,6 +830,9 @@ func (r *Repository) finish(ctx context.Context, lease *migrationbudget.Lease, r
 	}
 	if r.closed || r.root == nil {
 		return finishLocked(ErrRepository)
+	}
+	if r.records[descriptor.ArtifactHash] != rec {
+		return finishLocked(ErrStaleFence)
 	}
 	if rec.complete {
 		return finishLocked(nil)
@@ -1036,8 +1043,11 @@ func (r *Repository) OpenPublished(d Descriptor, offset uint64) (*PublishedArtif
 	if r == nil || !d.Valid() || offset > d.ArtifactBytes {
 		return nil, ErrDescriptor
 	}
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	// Opening a published view increments rec.readers. Use the write lock for
+	// that short ownership transition; streaming and verification happen after
+	// the lock is released.
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	rec := r.records[d.ArtifactHash]
 	if r.closed || rec == nil || !rec.complete || rec.descriptor != d {
 		return nil, ErrStaleFence
@@ -1075,14 +1085,17 @@ func (r *Repository) ManifestContext(ctx context.Context, d Descriptor) (replica
 	if ctx == nil {
 		return replicatedstate.SnapshotArtifactManifest{}, migrationbudget.ErrInvalidConfig
 	}
+	r.mu.RLock()
+	budget := r.budget
+	r.mu.RUnlock()
 	a, err := r.OpenPublished(d, 0)
 	if err != nil {
 		return replicatedstate.SnapshotArtifactManifest{}, err
 	}
 	defer a.Close()
 	var reader io.Reader = a
-	if r.budget != nil {
-		reader = budgetedVerifierReader{ctx: ctx, budget: r.budget, reader: a}
+	if budget != nil {
+		reader = budgetedVerifierReader{ctx: ctx, budget: budget, reader: a}
 	}
 	manifest, err := replicatedstate.VerifySnapshotArtifact(reader, replicatedstate.SnapshotArtifactCallbacks{})
 	if err != nil || manifest.EncodedBytes != d.ArtifactBytes {

@@ -79,6 +79,7 @@ func testIntent(payload []byte, state gateway.EnrollmentState) gateway.GroupEnro
 		SnapshotSourceMember: 1, Target: target, ExpectedRosterDigest: replication.Digest{13},
 		ExpectedDescriptorDigest: replication.Digest{14}, ExpectedManifestDigest: replication.Digest(sha256.Sum256(payload)),
 		ExpectedCommand: command, TargetNodeRevision: 15, State: state, Revision: 1,
+		ExpectedCatalogHeadDigest: replication.Digest{15},
 	}
 	if state == gateway.EnrollmentReserved {
 		intent.PreparationClaim = gateway.EnrollmentPreparationClaim(intent)
@@ -88,7 +89,6 @@ func testIntent(payload []byte, state gateway.EnrollmentState) gateway.GroupEnro
 		intent.Proof = &proof
 	}
 	if state >= gateway.EnrollmentEnrolled {
-		intent.ExpectedCatalogHeadDigest = replication.Digest{15}
 		intent.Receipt = &gateway.CertifiedEnrollmentReceipt{
 			IntentID: intent.IntentID, IntentDigest: intent.Digest(),
 			BaseCatalogGeneration:            intent.CatalogGeneration,
@@ -102,7 +102,7 @@ func testIntent(payload []byte, state gateway.EnrollmentState) gateway.GroupEnro
 			Target:                           intent.Target,
 			InitialReplicaSetVersion:         intent.ExpectedCommand.ReplicaSetVersion,
 			GrantDigest:                      replication.Digest{18},
-			TransitionID:                     [32]byte{19},
+			TransitionID:                     gateway.EnrollmentTransitionDigest(intent),
 		}
 	}
 	return intent

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"reflect"
 	"sync"
 	"testing"
 
@@ -652,11 +653,11 @@ func TestReplicatedScalingPublishEnrollmentReceiptPersistsCatalogCut(t *testing.
 	}
 	restarted := newCatalogAuthorityPeer(t, authority, NewCatalogHolder(published), 0xc2)
 	readBack, err := restarted.ReadEnrollmentIntent(ctx, intent.IntentID)
-	if err != nil || readBack != enrolled {
+	if err != nil || !reflect.DeepEqual(readBack, enrolled) {
 		t.Fatalf("enrollment receipt did not survive authority reopen: %+v err=%v", readBack, err)
 	}
 	retry, err := authority.PublishEnrollmentReceipt(ctx, prepared)
-	if err != nil || retry != enrolled {
+	if err != nil || !reflect.DeepEqual(retry, enrolled) {
 		t.Fatalf("applied publication retry=%+v err=%v", retry, err)
 	}
 	evidence, err := restarted.ScanNodeReferences(ctx, target.NodeID, target.Incarnation)

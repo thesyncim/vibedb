@@ -137,7 +137,10 @@ func consumeBudgetBytes(
 	ctx context.Context, budget *migrationbudget.Budget, lease *migrationbudget.Lease,
 	requested uint64, costForBytes func(uint64) migrationbudget.Cost,
 ) (uint64, error) {
-	if requested == 0 {
+	if requested == 0 || costForBytes == nil {
+		if requested != 0 && costForBytes == nil {
+			return 0, migrationbudget.ErrInvalidConfig
+		}
 		return 0, nil
 	}
 	if budget == nil {
@@ -175,7 +178,67 @@ func consumeBudgetBytes(
 		}
 	}
 	if result == 0 {
-		return 0, migrationbudget.ErrInvalidConfig
+		// A valid resource may charge more than one token per byte while its
+		// configured burst is one token (for example, a second hash pass). The
+		// initial reservation above can then return a partial cost whose byte
+		// quotient is zero. Complete the one-byte reservation with bounded
+		// follow-up reservations before allowing the caller to issue the byte;
+		// otherwise a legal small-burst configuration would fail or bypass its
+		// accounting boundary.
+		target := costForBytes(1)
+		if target == (migrationbudget.Cost{}) {
+			return 0, migrationbudget.ErrInvalidConfig
+		}
+		for !costCovers(granted, target) {
+			missing := costDifference(target, granted)
+			var next migrationbudget.Cost
+			if lease != nil {
+				next, err = lease.ConsumeChunk(ctx, missing)
+			} else {
+				next, err = budget.ConsumeChunk(ctx, missing)
+			}
+			if err != nil {
+				return 0, err
+			}
+			if next == (migrationbudget.Cost{}) {
+				return 0, migrationbudget.ErrInvalidConfig
+			}
+			granted = addCost(granted, next)
+		}
+		return 1, nil
 	}
 	return result, nil
+}
+
+func costCovers(granted, target migrationbudget.Cost) bool {
+	return granted.CPU >= target.CPU && granted.DiskRead >= target.DiskRead &&
+		granted.DiskWrite >= target.DiskWrite && granted.NetworkSend >= target.NetworkSend &&
+		granted.NetworkReceive >= target.NetworkReceive
+}
+
+func costDifference(target, granted migrationbudget.Cost) migrationbudget.Cost {
+	return migrationbudget.Cost{
+		CPU:            costDeficit(target.CPU, granted.CPU),
+		DiskRead:       costDeficit(target.DiskRead, granted.DiskRead),
+		DiskWrite:      costDeficit(target.DiskWrite, granted.DiskWrite),
+		NetworkSend:    costDeficit(target.NetworkSend, granted.NetworkSend),
+		NetworkReceive: costDeficit(target.NetworkReceive, granted.NetworkReceive),
+	}
+}
+
+func addCost(left, right migrationbudget.Cost) migrationbudget.Cost {
+	return migrationbudget.Cost{
+		CPU:            left.CPU + right.CPU,
+		DiskRead:       left.DiskRead + right.DiskRead,
+		DiskWrite:      left.DiskWrite + right.DiskWrite,
+		NetworkSend:    left.NetworkSend + right.NetworkSend,
+		NetworkReceive: left.NetworkReceive + right.NetworkReceive,
+	}
+}
+
+func costDeficit(target, granted uint64) uint64 {
+	if granted >= target {
+		return 0
+	}
+	return target - granted
 }

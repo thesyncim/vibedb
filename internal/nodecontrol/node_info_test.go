@@ -67,7 +67,7 @@ func TestNodeInfoServiceAndClientBindPhysicalIdentityAndReadinessFacts(t *testin
 		Authorize: func(identity rafttransport.PeerIdentity, got NodeInfoRequest) bool {
 			return identity.Node == caller && got.NodeID == target
 		},
-		ReadDeadline: func() time.Time { return time.Now().Add(time.Second) },
+		ReadDeadline:  func() time.Time { return time.Now().Add(time.Second) },
 		WriteDeadline: func() time.Time { return time.Now().Add(time.Second) }, MaxConcurrent: 2,
 	})
 	if err != nil {
@@ -76,7 +76,7 @@ func TestNodeInfoServiceAndClientBindPhysicalIdentityAndReadinessFacts(t *testin
 	opener := &nodeInfoTestOpener{service: service, domain: domain, target: target, caller: caller}
 	client, err := NewNodeInfoClient(NodeInfoClientOptions{
 		Opener: opener, TrustDomain: domain,
-		ReadDeadline: func() time.Time { return time.Now().Add(time.Second) },
+		ReadDeadline:  func() time.Time { return time.Now().Add(time.Second) },
 		WriteDeadline: func() time.Time { return time.Now().Add(time.Second) },
 	})
 	if err != nil {
@@ -110,8 +110,8 @@ func TestNodeInfoServiceRejectsStaleInventoryAndUnauthorizedCaller(t *testing.T)
 			return observation, nil
 		}),
 		TrustDomain: domain, LocalNode: target, Incarnation: request.Incarnation,
-		Authorize: func(rafttransport.PeerIdentity, NodeInfoRequest) bool { return false },
-		ReadDeadline: func() time.Time { return time.Now().Add(time.Second) },
+		Authorize:     func(rafttransport.PeerIdentity, NodeInfoRequest) bool { return false },
+		ReadDeadline:  func() time.Time { return time.Now().Add(time.Second) },
 		WriteDeadline: func() time.Time { return time.Now().Add(time.Second) }, MaxConcurrent: 1,
 	})
 	if err != nil {
@@ -120,12 +120,12 @@ func TestNodeInfoServiceRejectsStaleInventoryAndUnauthorizedCaller(t *testing.T)
 	left, right := net.Pipe()
 	server := &nodeInfoTestConn{Conn: right, identity: rafttransport.PeerIdentity{TrustDomain: domain, Node: rafttransport.NodeID{0x44}}, class: rafttransport.TrafficShardControl}
 	client := &nodeInfoTestConn{Conn: left, identity: rafttransport.PeerIdentity{TrustDomain: domain, Node: rafttransport.NodeID{0x44}}, class: rafttransport.TrafficShardControl}
+	if err := client.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
 	done := make(chan error, 1)
 	go func() { done <- service.Serve(context.Background(), server) }()
 	if err := WriteNodeInfoRequest(client, request); err != nil {
-		t.Fatal(err)
-	}
-	if err := client.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	var one [1]byte
@@ -145,7 +145,7 @@ func testNodeInfoObservation(request NodeInfoRequest) NodeInfoObservation {
 		declared[index] = 200 + uint64(index)
 	}
 	facts := NodeInfoStoreFacts{
-		Identity: NodeInfoStoreIdentity{ClusterID: [16]byte{1}, ClusterIncarnation: [16]byte{2}, NodeID: [16]byte(request.NodeID)},
+		Identity:      NodeInfoStoreIdentity{ClusterID: [16]byte{1}, ClusterIncarnation: [16]byte{2}, NodeID: [16]byte(request.NodeID)},
 		SPKIPinDigest: replication.Digest{0xa1}, Endpoints: NodeInfoEndpoints{
 			Peer: "127.0.0.1:21001", Native: "127.0.0.1:21002", Snapshot: "127.0.0.1:21003", Control: "127.0.0.1:21004",
 		}, Readiness: NodeInfoReadiness{NodeJournalReady: true, PhysicalStoreReady: true, BoundListenersReady: true},
@@ -167,9 +167,13 @@ type nodeInfoTestConn struct {
 	class    rafttransport.TrafficClass
 }
 
-func (connection *nodeInfoTestConn) PeerIdentity() rafttransport.PeerIdentity { return connection.identity }
-func (connection *nodeInfoTestConn) PeerKeyDigest() [32]byte                  { return [32]byte{0xa1} }
-func (connection *nodeInfoTestConn) TrafficClass() rafttransport.TrafficClass { return connection.class }
+func (connection *nodeInfoTestConn) PeerIdentity() rafttransport.PeerIdentity {
+	return connection.identity
+}
+func (connection *nodeInfoTestConn) PeerKeyDigest() [32]byte { return [32]byte{0xa1} }
+func (connection *nodeInfoTestConn) TrafficClass() rafttransport.TrafficClass {
+	return connection.class
+}
 
 type nodeInfoTestOpener struct {
 	service *NodeInfoService
@@ -190,4 +194,3 @@ func (opener *nodeInfoTestOpener) OpenShardControl(_ context.Context, node raftt
 	go func() { _ = opener.service.Serve(context.Background(), server) }()
 	return client, nil
 }
-

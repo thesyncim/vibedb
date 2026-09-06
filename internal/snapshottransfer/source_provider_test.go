@@ -198,6 +198,43 @@ func TestRetainedSourceProviderReservesBothWorkspacesAtomically(t *testing.T) {
 	}
 }
 
+func TestRetainedSourceProviderSaturationReleasesPlan(t *testing.T) {
+	cut, fixture := sourceExportFixture(t, sourceExportLimits())
+	root := t.TempDir()
+	node := rafttransport.NodeID{47}
+	options := retainedSourceOptions(fixture, root, filepath.Join(root, "artifacts"), node,
+		&retainedTestCut{cut: cut})
+	options.MaxConcurrent = 1
+	provider, err := OpenRetainedSourceExportProvider(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer provider.Close()
+	request := retainedSourceRequest(fixture, node)
+	first, err := provider.PinSourceExport(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = provider.PinSourceExport(context.Background(), request); !errors.Is(err, ErrBound) {
+		t.Fatalf("saturated pin error = %v, want ErrBound", err)
+	}
+	released := make(chan struct{})
+	go func() {
+		first.Release()
+		close(released)
+	}()
+	select {
+	case <-released:
+	case <-time.After(time.Second):
+		t.Fatal("saturated plan release blocked returning its workspace")
+	}
+	second, err := provider.PinSourceExport(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second.Release()
+}
+
 func TestRetainedSourceProviderRepositoryPathCannotEscapeOrTraverseSymlink(t *testing.T) {
 	cut, fixture := sourceExportFixture(t, sourceExportLimits())
 	root := t.TempDir()

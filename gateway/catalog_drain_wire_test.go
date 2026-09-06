@@ -41,20 +41,28 @@ func (verifier catalogDrainVerifier) VerifyClusterCatalogDigest(
 }
 
 type catalogDrainWireOpener struct {
-	t             testing.TB
-	trust         rafttransport.TrustDomain
-	controller    rafttransport.NodeID
-	members       map[rafttransport.NodeID]ClusterCatalogDrainMember
-	holder        *CatalogHolder
-	verifier      catalogDrainVerifier
-	dropFirstRead atomic.Bool
-	clientActive  atomic.Int64
-	clientMaximum atomic.Int64
+	t              testing.TB
+	trust          rafttransport.TrustDomain
+	controller     rafttransport.NodeID
+	members        map[rafttransport.NodeID]ClusterCatalogDrainMember
+	holder         *CatalogHolder
+	verifier       catalogDrainVerifier
+	dropFirstRead  atomic.Bool
+	clientActive   atomic.Int64
+	clientMaximum  atomic.Int64
+	barrierCount   atomic.Int64
+	barrierReady   chan struct{}
+	barrierRelease chan struct{}
+	barrierN       int64
+	barrierOnce    sync.Once
 }
 
 func (opener *catalogDrainWireOpener) OpenGatewayControl(
-	_ context.Context, node rafttransport.NodeID,
+	ctx context.Context, node rafttransport.NodeID,
 ) (rafttransport.PeerConnection, error) {
+	if ctx == nil {
+		return nil, ErrClusterCatalogDrainAuth
+	}
 	member, found := opener.members[node]
 	if !found {
 		return nil, ErrClusterCatalogDrainAuth
@@ -74,9 +82,6 @@ func (opener *catalogDrainWireOpener) OpenGatewayControl(
 	if err != nil {
 		return nil, err
 	}
-	go func() {
-		_ = service.Serve(context.Background(), server)
-	}()
 	client := rafttransport.PeerConnection(&catalogDrainWirePeer{
 		Conn: clientRaw, identity: rafttransport.PeerIdentity{TrustDomain: opener.trust, Node: node},
 	})
@@ -87,6 +92,22 @@ func (opener *catalogDrainWireOpener) OpenGatewayControl(
 			break
 		}
 	}
+	if opener.barrierN > 0 && opener.barrierCount.Add(1) <= opener.barrierN {
+		if opener.barrierCount.Load() == opener.barrierN {
+			opener.barrierOnce.Do(func() { close(opener.barrierReady) })
+		}
+		select {
+		case <-opener.barrierRelease:
+		case <-ctx.Done():
+			_ = clientRaw.Close()
+			_ = serverRaw.Close()
+			opener.clientActive.Add(-1)
+			return nil, ctx.Err()
+		}
+	}
+	go func() {
+		_ = service.Serve(context.Background(), server)
+	}()
 	client = &catalogDrainTrackedPeer{PeerConnection: client, closed: func() { opener.clientActive.Add(-1) }}
 	if opener.dropFirstRead.CompareAndSwap(true, false) {
 		client = &catalogDrainDropReadPeer{PeerConnection: client}
@@ -170,9 +191,10 @@ func TestClusterCatalogDrainWireBoundedRosterAndExactCertificate(t *testing.T) {
 	}
 	opener := &catalogDrainWireOpener{
 		t: t, trust: clusterDrainTrust(), controller: members[0].Node,
-		members:  make(map[rafttransport.NodeID]ClusterCatalogDrainMember, len(members)),
-		holder:   NewCatalogHolder(testSnapshot(t, request.Generation)),
-		verifier: catalogDrainVerifier{generation: request.Generation, digest: request.CatalogDigest},
+		members:      make(map[rafttransport.NodeID]ClusterCatalogDrainMember, len(members)),
+		holder:       NewCatalogHolder(testSnapshot(t, request.Generation)),
+		verifier:     catalogDrainVerifier{generation: request.Generation, digest: request.CatalogDigest},
+		barrierReady: make(chan struct{}), barrierRelease: make(chan struct{}), barrierN: 7,
 	}
 	for _, member := range members {
 		opener.members[member.Node] = member
@@ -188,12 +210,54 @@ func TestClusterCatalogDrainWireBoundedRosterAndExactCertificate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	certificate, err := coordinator.CertifyClusterCatalogDrain(context.Background(), request)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result := make(chan struct {
+		certificate ClusterCatalogDrainCertificate
+		err         error
+	}, 1)
+	go func() {
+		certificate, err := coordinator.CertifyClusterCatalogDrain(ctx, request)
+		result <- struct {
+			certificate ClusterCatalogDrainCertificate
+			err         error
+		}{certificate: certificate, err: err}
+	}()
+	select {
+	case <-opener.barrierReady:
+	case <-ctx.Done():
+		close(opener.barrierRelease)
+		<-result
+		t.Fatalf("initial stream barrier: %v", ctx.Err())
+	}
+	if got := opener.clientMaximum.Load(); got != 7 {
+		close(opener.barrierRelease)
+		<-result
+		t.Fatalf("initial active gateway streams=%d, want exactly 7", got)
+	}
+	close(opener.barrierRelease)
+	completed := <-result
+	certificate, err := completed.certificate, completed.err
 	if err != nil || !certificate.ValidFor(request) {
 		t.Fatalf("certificate=%+v err=%v", certificate, err)
 	}
-	if maximum := opener.clientMaximum.Load(); maximum > 7 || maximum < 2 {
-		t.Fatalf("active gateway streams=%d, want 2..7", maximum)
+	if maximum := opener.clientMaximum.Load(); maximum != 7 {
+		t.Fatalf("active gateway streams=%d, want exactly 7", maximum)
+	}
+	if active := opener.clientActive.Load(); active != 0 {
+		t.Fatalf("gateway streams leaked after certificate: %d", active)
+	}
+	wantFence, err := NewClusterCatalogDrainFence(
+		request.fenceOperation(), request.Generation, request.CatalogDigest,
+		clusterDrainTrust(), members,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if certificate.Request != request || certificate.FenceDigest != wantFence.Digest() ||
+		certificate.RosterDigest != wantFence.RosterDigest() ||
+		certificate.Proof != clusterCatalogDrainCertificateProof(wantFence.Digest(), wantFence.RosterDigest()) {
+		t.Fatalf("certificate does not match exact fence: %+v", certificate)
 	}
 }
 

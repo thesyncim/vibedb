@@ -393,7 +393,7 @@ func (r *Receiver) Receive(ctx context.Context, source rafttransport.NodeID, d D
 		return err
 	}
 	for {
-		offset, complete, err := r.Repository.Offset(d)
+		offset, complete, err := r.Repository.OffsetContext(ctx, d)
 		if err != nil {
 			return err
 		}
@@ -526,11 +526,12 @@ func (r *Receiver) receiveOne(ctx context.Context, conn rafttransport.PeerConnec
 		defer lease.Release()
 		baseOffset := offset
 		for position := 0; position < len(chunk); {
-			// Append validates the caller's digest with another SHA-256 pass;
-			// charge this per-part hash before entering the repository lock.
+			// The part digest and Repository.AppendContext's validation each do a
+			// SHA-256 pass after the response hash above; reserve both before
+			// entering the repository lock.
 			count, budgetErr := consumeBudgetBytes(ctx, r.Budget, lease,
 				uint64(len(chunk)-position), func(bytes uint64) migrationbudget.Cost {
-					return migrationbudget.Cost{CPU: bytes, DiskWrite: bytes}
+					return migrationbudget.Cost{CPU: bytes * 2, DiskWrite: bytes}
 				})
 			if budgetErr != nil {
 				return budgetErr

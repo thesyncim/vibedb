@@ -1,12 +1,14 @@
 package gateway
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/shardservice"
+	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 )
 
 func TestSingleShardUpsertUsesAtomicConflictAction(t *testing.T) {
@@ -66,6 +68,125 @@ func TestReplicatedWholeDocumentUpsertRoutesCanonicalAtomicPuts(t *testing.T) {
 	}
 }
 
+func TestReplicatedConflictUpsertReusesProgramAcrossOwnersAndBinds(t *testing.T) {
+	snapshot, executor, keys := replicatedSQLSplitTransactionFixture(t, ReplicatedTableDeclaration{
+		Table: "messages", CreateTable: `CREATE TABLE messages (id TEXT PRIMARY KEY,n INTEGER,city TEXT)`,
+	})
+	documents := []string{
+		fmt.Sprintf(`{"city":"left","id":%q,"n":1}`, keys[0]),
+		fmt.Sprintf(`{"city":"right","id":%q,"n":2}`, keys[1]),
+	}
+	wantByShard := map[string]string{"left": documents[0], "right": documents[1]}
+
+	plan := func(q Query) []replication.Mutation {
+		targets, handled, err := executor.planReplicatedSQLTransaction(
+			t.Context(), snapshot, []Query{q}, executor.profileFor(ClassInteractive),
+		)
+		if err != nil || !handled || len(targets) != 2 {
+			t.Fatalf("targets=%d handled=%v err=%v", len(targets), handled, err)
+		}
+		mutations := make([]replication.Mutation, 0, len(targets))
+		for _, target := range targets {
+			if len(target.Batches) != 1 || len(target.Batches[0].Mutations) != 1 {
+				t.Fatalf("unexpected participant: %+v", target)
+			}
+			mutation := target.Batches[0].Mutations[0]
+			want, ok := wantByShard[string(target.Route.Shard)]
+			if !ok {
+				t.Fatalf("unexpected owner %q", target.Route.Shard)
+			}
+			if mutation.Kind == replication.MutationPut {
+				if string(mutation.Value) != want {
+					t.Fatalf("direct candidate=%s want=%s", mutation.Value, want)
+				}
+			} else {
+				candidate, program, framed := replication.OpenConflictValue(mutation.Value)
+				if mutation.Kind != replication.MutationPutConflict || !framed || string(candidate) != want || len(program) == 0 {
+					t.Fatalf("conflict mutation=%+v candidate=%s program=%x", mutation, candidate, program)
+				}
+			}
+			mutations = append(mutations, mutation)
+		}
+		return mutations
+	}
+
+	// The native whole-document branch must keep each distinct candidate on its
+	// owner, even when one INSERT spans both sides of a split.
+	direct := Query{
+		SQL: `INSERT INTO messages VALUES (?),(?) ON CONFLICT (id) DO UPDATE SET "$doc"=EXCLUDED."$doc"`,
+		Params: []shardservice.Param{
+			shardservice.DocumentParam(documents[0]), shardservice.DocumentParam(documents[1]),
+		},
+	}
+	directMutations := plan(direct)
+	if len(directMutations) != 2 {
+		t.Fatalf("direct mutations=%d", len(directMutations))
+	}
+
+	// Computed assignments use one encoded program for all candidate rows. The
+	// final text bind is typed and is intentionally rebound between statements.
+	computed := func(city string) Query {
+		return Query{
+			SQL: `INSERT INTO messages VALUES (?),(?) ON CONFLICT (id) DO UPDATE SET n=messages.n+?,city=?`,
+			Params: []shardservice.Param{
+				shardservice.DocumentParam(documents[0]), shardservice.DocumentParam(documents[1]),
+				shardservice.NumberParam("5"), shardservice.StringParam(city),
+			},
+			ParamTypes: []sqldriver.ParamType{
+				sqldriver.ParamTypeUnspecified, sqldriver.ParamTypeUnspecified,
+				sqldriver.ParamTypeUnspecified, sqldriver.ParamTypeText,
+			},
+		}
+	}
+	first := plan(computed("bound-one"))
+	second := plan(computed("bound-two"))
+	var firstProgram, secondProgram []byte
+	for i, mutation := range first {
+		_, program, ok := replication.OpenConflictValue(mutation.Value)
+		if !ok {
+			t.Fatalf("first mutation %d was not framed", i)
+		}
+		if i == 0 {
+			firstProgram = program
+		} else if !bytes.Equal(firstProgram, program) {
+			t.Fatal("candidate rows did not share one conflict program")
+		}
+	}
+	for i, mutation := range second {
+		_, program, ok := replication.OpenConflictValue(mutation.Value)
+		if !ok {
+			t.Fatalf("second mutation %d was not framed", i)
+		}
+		if i == 0 {
+			secondProgram = program
+		} else if !bytes.Equal(secondProgram, program) {
+			t.Fatal("rebound candidate rows did not share one conflict program")
+		}
+	}
+	if bytes.Equal(firstProgram, secondProgram) {
+		t.Fatal("statement rebind did not change encoded conflict bindings")
+	}
+
+	// A whole-document condition uses the same reusable program path and retains
+	// the candidate documents independently of the condition binding.
+	guarded := Query{
+		SQL: `INSERT INTO messages VALUES (?),(?) ON CONFLICT (id) DO UPDATE SET "$doc"=EXCLUDED."$doc" WHERE EXCLUDED.city=?`,
+		Params: []shardservice.Param{
+			shardservice.DocumentParam(documents[0]), shardservice.DocumentParam(documents[1]),
+			shardservice.StringParam("allowed"),
+		},
+		ParamTypes: []sqldriver.ParamType{
+			sqldriver.ParamTypeUnspecified, sqldriver.ParamTypeUnspecified, sqldriver.ParamTypeText,
+		},
+	}
+	guardedMutations := plan(guarded)
+	for _, mutation := range guardedMutations {
+		if mutation.Kind != replication.MutationPutConflict {
+			t.Fatalf("guarded mutation kind=%v", mutation.Kind)
+		}
+	}
+}
+
 func TestReplicatedColumnUpsertRoutesConflictProgramWithoutPreimageRead(t *testing.T) {
 	config, endpoints, descriptor, profile := testReplicatedTableInput(t)
 	snapshot, err := NewSnapshotWithReplicatedTableMetadata(config, endpoints, 5, nil, nil,
@@ -93,10 +214,40 @@ func TestReplicatedColumnUpsertRoutesConflictProgramWithoutPreimageRead(t *testi
 		`INSERT INTO messages (id,n) VALUES ('a',1) ON CONFLICT DO UPDATE SET n=1 WHERE messages.absent=1`,
 		`INSERT INTO messages (id,n) VALUES ('a',1) ON CONFLICT DO UPDATE SET "$doc"=EXCLUDED."$doc" WHERE EXCLUDED.absent=1`,
 		`INSERT INTO messages (id,n) VALUES ('a',1) ON CONFLICT DO UPDATE SET n=EXCLUDED.absent`,
-		`INSERT INTO messages (id,n) VALUES ('a',1) ON CONFLICT DO UPDATE SET id='another'`,
 	} {
 		if _, err := snapshot.Prepare(t.Context(), statement); err == nil {
 			t.Fatalf("invalid conflict action accepted: %s", statement)
+		}
+	}
+}
+
+func TestReplicatedConflictKeyExpressionsRouteOnlyToCandidateOwner(t *testing.T) {
+	snapshot, executor, keys := replicatedSQLSplitTransactionFixture(t, ReplicatedTableDeclaration{
+		Table: "messages", CreateTable: `CREATE TABLE messages (id TEXT PRIMARY KEY,n INTEGER)`,
+	})
+	for _, action := range []string{
+		`id=COALESCE(messages.id,EXCLUDED.id),n=messages.n+EXCLUDED.n`,
+		`id=CASE WHEN messages.n>0 THEN CAST(messages.id AS TEXT) ELSE EXCLUDED.id END`,
+		`id='moved' WHERE false`,
+		`id='moved'`, // Whether this branch executes is known only at atomic apply.
+	} {
+		for ordinal, key := range keys {
+			targets, handled, err := executor.planReplicatedSQLTransaction(t.Context(), snapshot, []Query{{
+				SQL:    `INSERT INTO messages (id,n) VALUES (?,1) ON CONFLICT DO UPDATE SET ` + action,
+				Params: []shardservice.Param{shardservice.StringParam(key)},
+			}}, executor.profileFor(ClassInteractive))
+			if err != nil || !handled || len(targets) != 1 || len(targets[0].Batches) != 1 || len(targets[0].Batches[0].Mutations) != 1 {
+				t.Fatalf("action=%s targets=%+v handled=%v err=%v", action, targets, handled, err)
+			}
+			wantOwner := [2]string{"left", "right"}[ordinal]
+			if string(targets[0].Route.Shard) != wantOwner {
+				t.Fatalf("key %s owner=%s want=%s", key, targets[0].Route.Shard, wantOwner)
+			}
+			mutation := targets[0].Batches[0].Mutations[0]
+			candidate, _, ok := replication.OpenConflictValue(mutation.Value)
+			if !ok || mutation.Kind != replication.MutationPutConflict || string(candidate) != fmt.Sprintf(`{"id":%q,"n":1}`, key) {
+				t.Fatalf("wrong owner input: %+v candidate=%s", mutation, candidate)
+			}
 		}
 	}
 }

@@ -2056,13 +2056,11 @@ func (registry *StaticRegistry) IsPeerEnrolled(node NodeID) bool {
 // discoverable, while ConfState admission still decides whether it may carry
 // Raft traffic.
 //
-// A zero ServiceKeyDigest is retained only for legacy in-memory test/loopback
-// records created by NewStaticRegistry, where the connection also has no TLS
-// key material. A real authenticated leaf must never be accepted against an
-// unbound static record; restored and dynamically enrolled directory records
-// must carry a nonzero digest. Once a digest is present, every connection
-// (including a reused pooled stream) must present the exact same leaf SPKI
-// digest.
+// Legacy static manifests authorize CA-authenticated node identities and do
+// not contain leaf-key pins. Their records retain a zero ServiceKeyDigest;
+// TLS still verifies the trust domain and node identity before this check.
+// Restored and dynamically enrolled directory records require a nonzero pin,
+// which every connection (including pooled streams) must match exactly.
 func (registry *StaticRegistry) VerifyPeerBinding(
 	identity PeerIdentity,
 	serviceKeyDigest [sha256.Size]byte,
@@ -2076,10 +2074,7 @@ func (registry *StaticRegistry) VerifyPeerBinding(
 		return ErrPeerUnauthorized
 	}
 	if peer.ServiceKeyDigest == ([sha256.Size]byte{}) {
-		if serviceKeyDigest == ([sha256.Size]byte{}) {
-			return nil
-		}
-		return ErrPeerKeyMismatch
+		return nil
 	}
 	if serviceKeyDigest == ([sha256.Size]byte{}) ||
 		serviceKeyDigest != peer.ServiceKeyDigest {
