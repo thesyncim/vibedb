@@ -95,6 +95,10 @@ func FrontendContinuationScopeForReplicatedRequestWithProtocol(
 				serviceauthz.ServiceOperationForwardedWrite
 		case serviceauthz.CapabilityRequestLedger:
 			scope.Action, scope.Operation = serviceauthz.FrontendActionGatewayRequestLedger, serviceauthz.ServiceOperationRequestLedger
+		case serviceauthz.CapabilityExecutionPin:
+			scope.Action, scope.Operation = serviceauthz.FrontendActionGatewayExecutionPin, serviceauthz.ServiceOperationExecutionPin
+		case serviceauthz.CapabilityTransactionRecovery:
+			scope.Action, scope.Operation = serviceauthz.FrontendActionGatewayTransactionRecovery, serviceauthz.ServiceOperationTransactionRecovery
 		case serviceauthz.CapabilityTopology:
 			// A probe has no relation ordinal. Catalog probes are scoped to
 			// the committed relation manifest carried by the serving fence.
@@ -110,11 +114,25 @@ func FrontendContinuationScopeForReplicatedRequestWithProtocol(
 				serviceauthz.ServiceOperationForwardedWrite
 		case serviceauthz.CapabilityRequestLedger:
 			scope.Action, scope.Operation = serviceauthz.FrontendActionGatewayRequestLedger, serviceauthz.ServiceOperationRequestLedger
+		case serviceauthz.CapabilityExecutionPin:
+			scope.Action, scope.Operation = serviceauthz.FrontendActionGatewayExecutionPin, serviceauthz.ServiceOperationExecutionPin
+		case serviceauthz.CapabilityTransactionRecovery:
+			scope.Action, scope.Operation = serviceauthz.FrontendActionGatewayTransactionRecovery, serviceauthz.ServiceOperationTransactionRecovery
 		case serviceauthz.CapabilityTopology:
 			scope.Action, scope.Operation = serviceauthz.FrontendActionGatewayCatalog, serviceauthz.ServiceOperationCatalogWrite
 		default:
 			return serviceauthz.FrontendContinuationScopeRecord{}, false
 		}
+	case ReplicatedExecutionPinRead:
+		if request.Capability != serviceauthz.CapabilityExecutionPin {
+			return serviceauthz.FrontendContinuationScopeRecord{}, false
+		}
+		scope.Action, scope.Operation = serviceauthz.FrontendActionGatewayExecutionPin, serviceauthz.ServiceOperationExecutionPin
+	case ReplicatedTransactionRead:
+		if request.Capability != serviceauthz.CapabilityTransactionRecovery {
+			return serviceauthz.FrontendContinuationScopeRecord{}, false
+		}
+		scope.Action, scope.Operation = serviceauthz.FrontendActionGatewayTransactionRecovery, serviceauthz.ServiceOperationTransactionRecovery
 	case ReplicatedRequestLedgerRead:
 		if request.Capability != serviceauthz.CapabilityRequestLedger {
 			return serviceauthz.FrontendContinuationScopeRecord{}, false
@@ -133,7 +151,7 @@ func FrontendContinuationScopeForReplicatedRequestWithProtocol(
 		return serviceauthz.FrontendContinuationScopeRecord{}, false
 	}
 	if scope.Action != serviceauthz.FrontendActionForwardedData {
-		if (scope.Action != serviceauthz.FrontendActionGatewayCatalog && scope.Action != serviceauthz.FrontendActionGatewayRequestLedger) ||
+		if (scope.Action != serviceauthz.FrontendActionGatewayCatalog && scope.Action != serviceauthz.FrontendActionGatewayRequestLedger && scope.Action != serviceauthz.FrontendActionGatewayExecutionPin && scope.Action != serviceauthz.FrontendActionGatewayTransactionRecovery) ||
 			request.Fence.Command.RelationManifestDigest == ([32]byte{}) {
 			return serviceauthz.FrontendContinuationScopeRecord{}, false
 		}

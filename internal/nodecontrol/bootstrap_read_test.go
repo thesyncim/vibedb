@@ -87,11 +87,13 @@ func TestBootstrapReadServiceRequiresExactCommittedIdentityAndStableCut(t *testi
 
 	wrongClient, wrongServer := net.Pipe()
 	wrongServerConn := &bootstrapReadTestConn{Conn: wrongServer, identity: rafttransport.PeerIdentity{TrustDomain: domain, Node: node.NodeID}, key: [32]byte{0xff}, class: rafttransport.TrafficGatewayControl}
-	go func() { serverDone <- service.Serve(context.Background(), wrongServerConn) }()
-	if err := WriteBootstrapReadRequest(wrongClient, request); err != nil {
+	// Set the bound before the server can reject and close the pipe. Setting
+	// a deadline after the request races the expected authorization refusal.
+	if err := wrongClient.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	if err := wrongClient.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+	go func() { serverDone <- service.Serve(context.Background(), wrongServerConn) }()
+	if err := WriteBootstrapReadRequest(wrongClient, request); err != nil {
 		t.Fatal(err)
 	}
 	var one [1]byte

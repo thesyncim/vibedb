@@ -168,3 +168,47 @@ func TestLedgerScopeBindsGroupAndManifest(t *testing.T) {
 		t.Fatal("wrong ledger capability admitted")
 	}
 }
+
+func TestDurableSQLInternalScopesBindGroupManifestAndCapability(t *testing.T) {
+	for _, test := range []struct {
+		capability serviceauthz.Capability
+		operation  ReplicatedOperation
+		action     serviceauthz.FrontendContinuationAction
+		service    serviceauthz.ServiceOperation
+	}{
+		{serviceauthz.CapabilityExecutionPin, ReplicatedProbe, serviceauthz.FrontendActionGatewayExecutionPin, serviceauthz.ServiceOperationExecutionPin},
+		{serviceauthz.CapabilityExecutionPin, ReplicatedPropose, serviceauthz.FrontendActionGatewayExecutionPin, serviceauthz.ServiceOperationExecutionPin},
+		{serviceauthz.CapabilityExecutionPin, ReplicatedExecutionPinRead, serviceauthz.FrontendActionGatewayExecutionPin, serviceauthz.ServiceOperationExecutionPin},
+		{serviceauthz.CapabilityTransactionRecovery, ReplicatedProbe, serviceauthz.FrontendActionGatewayTransactionRecovery, serviceauthz.ServiceOperationTransactionRecovery},
+		{serviceauthz.CapabilityTransactionRecovery, ReplicatedPropose, serviceauthz.FrontendActionGatewayTransactionRecovery, serviceauthz.ServiceOperationTransactionRecovery},
+		{serviceauthz.CapabilityTransactionRecovery, ReplicatedTransactionRead, serviceauthz.FrontendActionGatewayTransactionRecovery, serviceauthz.ServiceOperationTransactionRecovery},
+	} {
+		request := ReplicatedRequest{Operation: test.operation, Capability: test.capability, Fence: testReplicatedFence()}
+		scope, ok := FrontendContinuationScopeForReplicatedRequest(&request)
+		if !ok || scope.Action != test.action || scope.Operation != test.service {
+			t.Fatalf("operation=%v capability=%v scope=%+v ok=%t", test.operation, test.capability, scope, ok)
+		}
+		changed := request
+		changed.Fence.Group.GroupID[0] ^= 0x80
+		other, ok := FrontendContinuationScopeForReplicatedRequest(&changed)
+		if !ok || scope.Group == other.Group {
+			t.Fatal("group not fenced")
+		}
+		changed = request
+		changed.Fence.Command.RelationManifestDigest[0] ^= 0x80
+		other, ok = FrontendContinuationScopeForReplicatedRequest(&changed)
+		if !ok || scope.FenceDigest == other.FenceDigest || scope.IntentID == other.IntentID {
+			t.Fatal("manifest not fenced")
+		}
+		changed.Fence.Command.RelationManifestDigest = [32]byte{}
+		if _, ok = FrontendContinuationScopeForReplicatedRequest(&changed); ok {
+			t.Fatal("missing manifest accepted")
+		}
+	}
+	for _, operation := range []ReplicatedOperation{ReplicatedExecutionPinRead, ReplicatedTransactionRead} {
+		request := ReplicatedRequest{Operation: operation, Capability: serviceauthz.CapabilityDataRead, Fence: testReplicatedFence()}
+		if _, ok := FrontendContinuationScopeForReplicatedRequest(&request); ok {
+			t.Fatal("wrong capability accepted")
+		}
+	}
+}
