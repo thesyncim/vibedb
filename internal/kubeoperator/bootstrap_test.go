@@ -293,6 +293,27 @@ func verifyBootstrapProvisioning(t *testing.T, bundle []byte) {
 			t.Fatal("invalid generated directory record")
 		}
 	}
+	catalogPath := filepath.Join(t.TempDir(), "catalog.vibejson")
+	if err := os.WriteFile(catalogPath, documents["cluster.vibejson"], 0600); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := gateway.LoadSnapshot(catalogPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, descriptor := range snapshot.ReplicatedShardDescriptors() {
+		for _, replica := range descriptor.Replicas {
+			found := false
+			for _, record := range directory {
+				if record.NodeID == replica.Node {
+					found = record.Incarnation == replica.NodeIncarnation && record.DataEndpoint == replica.Endpoint && record.NativeEndpoint == replica.NativeEndpoint && record.ControlEndpoint == replica.ControlEndpoint
+				}
+			}
+			if !found {
+				t.Fatal("directory and serving catalog identify different physical endpoints")
+			}
+		}
+	}
 	for _, role := range []string{"catalog", "ledger", "data"} {
 		for member := 0; member < 3; member++ {
 			var manifest bootstrapPrepare

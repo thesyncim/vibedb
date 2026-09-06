@@ -856,8 +856,9 @@ func bootstrapNodeDirectory(roles [3]bootstrapRole, state bootstrapState, certs 
 			if err != nil {
 				return nil, err
 			}
+			prefix := fmt.Sprintf("%s-member-%d", roles[ri].name, mi+1)
 			record := gateway.NodeRecord{NodeID: roles[ri].nodes[mi], Incarnation: 1, ServiceKeyDigest: replication.Digest(pin),
-				DataEndpoint: distribution.EndpointID(host + ":7411"), NativeEndpoint: distribution.EndpointID(host + ":7511"), ControlEndpoint: distribution.EndpointID(host + ":7711"),
+				DataEndpoint: distribution.EndpointID(prefix), NativeEndpoint: distribution.EndpointID(prefix + "-native"), ControlEndpoint: distribution.EndpointID(prefix + "-control"),
 				DataAddress: host + ":7411", NativeAddress: host + ":7511", ControlAddress: host + ":7711",
 				FailureDomain: host, Roles: gateway.NodeRoleStorage | gateway.NodeRoleControl, Lifecycle: gateway.NodeActive, Revision: 1, CatalogGeneration: 1}
 			if ri == 0 {
