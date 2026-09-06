@@ -218,7 +218,11 @@ func (tracker *replicatedCatalogRouteSeedTracker) observe(
 		return nil
 	}
 	if tracker.activeExists && receipt.snapshot.Generation() < tracker.active.Generation() {
-		return tracker.terminateLocked(ErrStaleGeneration)
+		// Attestation runs outside the publication lock. A read of the prior
+		// authenticated head can arrive after a newer receipt was installed.
+		// Reject the stale observation without treating that ordering as a
+		// durability failure or shutting down the already newer authority.
+		return ErrStaleGeneration
 	}
 	expected := uint64(0)
 	if tracker.activeExists {

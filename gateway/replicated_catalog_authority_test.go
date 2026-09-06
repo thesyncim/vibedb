@@ -2799,3 +2799,41 @@ func TestReplicatedCatalogReadConvergesWhenHeadAndWitnessStraddlePublication(t *
 		t.Fatalf("straddled publication publish=%v read=%v observed=%v", publishErr, err, observed)
 	}
 }
+
+func TestRouteSeedRejectsDelayedReceiptWithoutSealingAuthority(t *testing.T) {
+	authority, _, genesis, current, descriptor := newRouteSeedCatalogAuthorityFixture(t)
+	path := filepath.Join(t.TempDir(), "catalog-route.vibejson")
+	if err := SaveSnapshot(path, current); err != nil {
+		t.Fatal(err)
+	}
+	control, err := authority.InstallReplicatedCatalogRouteSeed(t.Context(), path, genesis)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old, err := authority.ReadAttested(t.Context(), genesis)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, err := NewSnapshotWithReplicatedMetadata(current.config, current.endpoints, current.Generation()+1, nil, nil, []ReplicatedShardDescriptor{descriptor})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := authority.Publish(t.Context(), current.Generation(), next); err != nil {
+		t.Fatal(err)
+	}
+	// A concurrent reader may finish attesting the old head after publication.
+	authority.mu.Lock()
+	err = authority.observeCatalogReceiptLocked(t.Context(), old)
+	authority.mu.Unlock()
+	if !errors.Is(err, ErrStaleGeneration) {
+		t.Fatalf("old receipt accepted: %v", err)
+	}
+	select {
+	case <-control.ShutdownRequired():
+		t.Fatalf("delayed valid read sealed serving authority: %v", control.TerminalError())
+	default:
+	}
+	if got, err := authority.Read(t.Context()); err != nil || got.Generation() != next.Generation() {
+		t.Fatalf("fresh read after stale receipt: %v", err)
+	}
+}
