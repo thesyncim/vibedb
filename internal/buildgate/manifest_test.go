@@ -46,6 +46,18 @@ var buildgateBeforeMutationImagesAndPostimages = Profile{
 	},
 }
 
+// buildgateBeforePrimaryRankAffine freezes the disk identity immediately
+// before the primary-stripe physical-rank grammar was admitted. The wire
+// grammar is intentionally unchanged by that disk-only addition.
+var buildgateBeforePrimaryRankAffineDisk = GrammarID{
+	0x60, 0x33, 0x21, 0x03, 0x4f, 0x46, 0xef, 0x54,
+	0xb8, 0xb1, 0xe5, 0xc8, 0xc0, 0x6e, 0x35, 0x0b,
+}
+
+var buildgateBeforePrimaryRankAffineWire = GrammarID{
+	0x4c, 0x17, 0xf8, 0x6e, 0x78, 0x19, 0x93, 0x02,
+	0x41, 0x95, 0x88, 0x90, 0xe6, 0x68, 0xbc, 0x2d,
+}
 
 func TestGeneratedManifestMatchesCurrentLedgerSemantics(t *testing.T) {
 	semantics := requestledger.SemanticsDigest()
@@ -85,6 +97,32 @@ func TestPortableSidecarsRejectPreviousDiskGrammar(t *testing.T) {
 	}
 	if _, err := gate.AuthorizeDiskAdoption(DiskIdentity{Grammar: previous.DiskGrammar, Required: previous.Required}); !errors.Is(err, ErrDiskGrammar) {
 		t.Fatalf("pre-portable disk adoption = %v, want disk grammar mismatch", err)
+	}
+}
+
+func TestPreRankAffineDiskGrammarIsRejected(t *testing.T) {
+	current := CurrentProfile()
+	if current.WireGrammar != buildgateBeforePrimaryRankAffineWire {
+		t.Fatalf("disk-only rank grammar changed wire identity: got %x want %x",
+			current.WireGrammar, buildgateBeforePrimaryRankAffineWire)
+	}
+	if current.DiskGrammar == buildgateBeforePrimaryRankAffineDisk {
+		t.Fatal("current manifest retained the pre-rank-affine disk grammar")
+	}
+	legacy := current
+	legacy.DiskGrammar = buildgateBeforePrimaryRankAffineDisk
+	if _, err := CheckCompatibility(current, legacy); !errors.Is(err, ErrDiskGrammar) {
+		t.Fatalf("pre-rank-affine/current peer compatibility = %v, want ErrDiskGrammar", err)
+	}
+	gate, err := NewCurrentDiskGate(current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gate.AuthorizeDiskAdoption(DiskIdentity{
+		Grammar:  buildgateBeforePrimaryRankAffineDisk,
+		Required: current.Required,
+	}); !errors.Is(err, ErrDiskGrammar) {
+		t.Fatalf("pre-rank-affine disk adoption = %v, want ErrDiskGrammar", err)
 	}
 }
 

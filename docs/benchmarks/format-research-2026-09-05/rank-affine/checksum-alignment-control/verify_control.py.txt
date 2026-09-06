@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+"""Verify control symbol sizes and exact loop bytes in go tool objdump output."""
+import json
+from pathlib import Path
+import re
+import sys
+
+
+EXPECTED = ["460fb60c07", "4431ca", "49ffc0", "4c39c6", "7ff0"]
+TARGETS = {"xorAt24": 24, "xorAt56": 56}
+
+
+def parse_nm(path):
+    symbols = {}
+    priority = {}
+    for line in path.read_text().splitlines():
+        fields = line.split()
+        if len(fields) < 4:
+            continue
+        address, size, kind, name = fields[:4]
+        if kind.lower() not in ("t", "l"):
+            continue
+        for suffix in TARGETS:
+            if name.endswith("." + suffix + ".abi0"):
+                rank = 2
+            elif name.endswith("." + suffix):
+                rank = 1
+            else:
+                continue
+            if rank > priority.get(suffix, 0):
+                priority[suffix] = rank
+                symbols[suffix] = {
+                    "name": name,
+                    "address": int(address, 16),
+                    "size": int(size),
+                }
+    return symbols
+
+
+def parse_objdump(path):
+    rows = []
+    address_re = re.compile(r"\b(0x[0-9a-f]+)\s+([0-9a-f]+)\s+([A-Z][A-Z0-9.]*)\b")
+    for line in path.read_text().splitlines():
+        match = address_re.search(line)
+        if not match:
+            continue
+        rows.append({
+            "address": int(match.group(1), 16),
+            "bytes": match.group(2),
+            "op": match.group(3),
+        })
+    return rows
+
+
+def main():
+    if len(sys.argv) != 4:
+        raise SystemExit("usage: verify_control.py NM OBJDUMP OUTPUT_JSON")
+    nm_path, objdump_path, output_path = map(Path, sys.argv[1:])
+    symbols = parse_nm(nm_path)
+    rows = parse_objdump(objdump_path)
+    report = {"expected_loop_bytes": EXPECTED, "symbols": {}}
+    for suffix, expected_mod in TARGETS.items():
+        if suffix not in symbols:
+            raise SystemExit(f"missing assembly symbol {suffix}")
+        symbol = symbols[suffix]
+        if symbol["size"] <= 0:
+            raise SystemExit(f"empty assembly symbol {suffix}")
+        start = symbol["address"]
+        end = start + symbol["size"]
+        symbol_rows = [row for row in rows if start <= row["address"] < end]
+        if not symbol_rows:
+            raise SystemExit(f"no objdump rows for {symbol['name']}")
+        matches = []
+        for index in range(len(symbol_rows) - len(EXPECTED) + 1):
+            if [row["bytes"] for row in symbol_rows[index : index + len(EXPECTED)]] == EXPECTED:
+                matches.append(index)
+        if len(matches) != 1:
+            raise SystemExit(f"expected one exact loop for {suffix}, found {len(matches)}")
+        loop_index = matches[0]
+        loop_address = symbol_rows[loop_index]["address"]
+        actual_mod = loop_address % 64
+        if actual_mod != expected_mod:
+            raise SystemExit(f"{suffix} loop address mod64={actual_mod}, want {expected_mod}")
+        entry_jumps = [
+            row for row in symbol_rows[:loop_index]
+            if row["op"] == "JMP" and len(row["bytes"]) == 4
+        ]
+        if len(entry_jumps) != 1:
+            raise SystemExit(f"expected one two-byte entry JMP for {suffix}, found {len(entry_jumps)}")
+        loop_jump = symbol_rows[loop_index + len(EXPECTED) - 1]
+        if loop_jump["op"] != "JG" or len(loop_jump["bytes"]) != 4:
+            raise SystemExit(f"{suffix} loop back edge is not a two-byte JG")
+        report["symbols"][suffix] = {
+            **symbol,
+            "loop_address": loop_address,
+            "loop_address_mod64": actual_mod,
+            "loop_bytes": EXPECTED,
+            "entry_jump_bytes": entry_jumps[0]["bytes"],
+            "entry_jump_width": len(entry_jumps[0]["bytes"]) // 2,
+            "loop_back_jump_bytes": loop_jump["bytes"],
+            "loop_back_jump_width": len(loop_jump["bytes"]) // 2,
+        }
+    output_path.write_text(json.dumps(report, indent=2) + "\n")
+
+
+if __name__ == "__main__":
+    main()

@@ -51,20 +51,21 @@ type compactStreamSequentialState struct {
 // bounded random-rank decoding. The on-disk representation and point-read
 // restart bound are unchanged.
 type CompactPrimaryScanDecoder struct {
-	bucket     BucketID
-	generation uint64
-	lastRow    int
-	prepared   bool
-	supported  bool
-	shapes     [compactPrimaryScanShapes]compactPrimaryScanShape
-	streamView [compactPrimaryScanStreams]compactStreamView
-	streamPlan [compactPrimaryScanStreams]compactPrimaryScanStream
-	streams    [compactPrimaryScanStreams]compactStreamSequentialState
-	dictionary [compactPrimaryScanDictionaryBounds]uint16
-	fragments  [compactPrimaryScanDictionaryFragmentBytes]byte
-	key        compactStreamView
-	keyState   compactStreamSequentialState
-	keyPrior   [CommonPrimaryLeafMaxKeyBytes]byte
+	bucket        BucketID
+	generation    uint64
+	lastRow       int
+	prepared      bool
+	supported     bool
+	hasRankAffine bool
+	shapes        [compactPrimaryScanShapes]compactPrimaryScanShape
+	streamView    [compactPrimaryScanStreams]compactStreamView
+	streamPlan    [compactPrimaryScanStreams]compactPrimaryScanStream
+	streams       [compactPrimaryScanStreams]compactStreamSequentialState
+	dictionary    [compactPrimaryScanDictionaryBounds]uint16
+	fragments     [compactPrimaryScanDictionaryFragmentBytes]byte
+	key           compactStreamView
+	keyState      compactStreamSequentialState
+	keyPrior      [CommonPrimaryLeafMaxKeyBytes]byte
 }
 
 func (d *CompactPrimaryScanDecoder) prepare(
@@ -82,6 +83,7 @@ func (d *CompactPrimaryScanDecoder) prepare(
 	d.lastRow = -1
 	d.prepared = true
 	d.supported = false
+	d.hasRankAffine = false
 	d.key = v.key
 	d.keyState = compactStreamSequentialState{}
 	if v.shapeCount > len(d.shapes) {
@@ -110,8 +112,11 @@ func (d *CompactPrimaryScanDecoder) prepare(
 		streamRaw := entry.streamRaw
 		for hole := 0; hole < entry.template.holes; hole++ {
 			stream, admitted := admittedCompactStream(streamRaw)
-			if !admitted || stream.count != entry.rows {
+			if !admitted || !stream.matchesShapeRows(entry.rows, v.rows) {
 				return
+			}
+			if stream.kind == compactStreamRankAffine {
+				d.hasRankAffine = true
 			}
 			d.streamView[streamCount+hole] = stream
 			prefixStart := uint32(0)
@@ -275,12 +280,50 @@ func (d *CompactPrimaryScanDecoder) appendValue(
 	// targets the shape is 96 bytes and each stream view is 104 bytes, so copying
 	// either inside the row/hole loop would turn metadata into scan bandwidth.
 	meta := &d.shapes[shape]
-	if int(meta.holes) > compactPrimaryScanHoles {
+	holes := int(meta.holes)
+	if holes > compactPrimaryScanHoles {
 		return dst, false
 	}
 	start := len(dst)
+	if !d.hasRankAffine {
+		previous := uint32(0)
+		for hole := 0; hole < holes; hole++ {
+			end := meta.ends[hole]
+			streamAt := int(meta.first) + hole
+			stream := &d.streamView[streamAt]
+			var ok bool
+			plan := d.streamPlan[streamAt]
+			if plan.dictionaryCount != 0 {
+				dst, ok = d.appendDictionaryFragment(dst, streamAt, ordinal)
+			} else {
+				dst = append(dst, meta.static[previous:end]...)
+				state := &d.streams[streamAt]
+				if ordinal != state.next {
+					state.seek(stream, ordinal)
+				}
+				dst, ok = state.appendValue(dst, stream, ordinal)
+			}
+			previous = end
+			if !ok {
+				return dst[:start], false
+			}
+		}
+		end := meta.ends[holes]
+		return append(dst, meta.static[previous:end]...), true
+	}
+	return d.appendRankAffineValue(dst, meta, row, ordinal)
+}
+
+// Keep the rank-aware renderer out of the legacy scan loop's frame and
+// instruction footprint. Most leaves need only the original stream codecs.
+func (d *CompactPrimaryScanDecoder) appendRankAffineValue(
+	dst []byte, meta *compactPrimaryScanShape, row, ordinal int,
+) ([]byte, bool) {
+	start := len(dst)
+	holes := int(meta.holes)
+
 	previous := uint32(0)
-	for hole := 0; hole < int(meta.holes); hole++ {
+	for hole := 0; hole < holes; hole++ {
 		end := meta.ends[hole]
 		streamAt := int(meta.first) + hole
 		stream := &d.streamView[streamAt]
@@ -291,17 +334,21 @@ func (d *CompactPrimaryScanDecoder) appendValue(
 		} else {
 			dst = append(dst, meta.static[previous:end]...)
 			state := &d.streams[streamAt]
-			if ordinal != state.next {
-				state.seek(stream, ordinal)
+			if stream.kind == compactStreamRankAffine {
+				dst, ok = state.appendRankAffine(dst, stream, row)
+			} else {
+				if ordinal != state.next {
+					state.seek(stream, ordinal)
+				}
+				dst, ok = state.appendValue(dst, stream, ordinal)
 			}
-			dst, ok = state.appendValue(dst, stream, ordinal)
 		}
 		previous = end
 		if !ok {
 			return dst[:start], false
 		}
 	}
-	end := meta.ends[meta.holes]
+	end := meta.ends[holes]
 	return append(dst, meta.static[previous:end]...), true
 }
 
@@ -630,6 +677,69 @@ func (s *compactStreamSequentialState) appendValue(
 			}
 		}
 	}
+	return append(dst, suffixValue...), true
+}
+
+// appendRankAffine evaluates the admitted physical-rank arithmetic directly.
+// Rank-affine streams are complete leaf domains, so the row is already the
+// physical rank. Keeping this path pointer-based avoids copying the 104-byte
+// stream view and renders the shared prefix/suffix without the generic
+// random-rank decoder.
+func (s *compactStreamSequentialState) appendRankAffine(
+	dst []byte,
+	v *compactStreamView,
+	row int,
+) ([]byte, bool) {
+	if v.kind != compactStreamRankAffine || row < 0 || row >= v.count ||
+		len(v.data) != 18 {
+		return v.appendValue(dst, row)
+	}
+	base := int64(binary.LittleEndian.Uint64(v.data[2:]))
+	step := int64(binary.LittleEndian.Uint64(v.data[10:]))
+	value := base + step*int64(row)
+	if value < 0 {
+		return dst, false
+	}
+	// Physical ranks contain shape gaps, so this stream cannot use the
+	// ordinal-style next-row synchronization. Retain the last rank only for
+	// diagnostics; every admitted rank is independently arithmetic.
+	prefixValue, prefixOK := v.dictionaryEntry(0)
+	suffixValue, suffixOK := v.dictionaryEntry(1)
+	if !prefixOK || !suffixOK {
+		return dst, false
+	}
+	start := len(dst)
+	dst = append(dst, prefixValue...)
+	digits := len(dst)
+	width := 0
+	if v.data[0]&1 != 0 {
+		width = int(v.data[1])
+	}
+	if width == 8 && value < 100_000_000 {
+		dst = appendFixedUint8(dst, uint32(value))
+	} else if value < 1_000_000 {
+		dst = appendCanonicalUint6(dst, uint64(value))
+	} else {
+		dst = strconv.AppendUint(dst, uint64(value), 10)
+	}
+	if width != 0 {
+		n := len(dst) - digits
+		if n > width {
+			return dst[:start], false
+		}
+		if n < width {
+			gap := width - n
+			for range gap {
+				dst = append(dst, 0)
+			}
+			copy(dst[digits+gap:], dst[digits:digits+n])
+			for at := digits; at < digits+gap; at++ {
+				dst[at] = '0'
+			}
+		}
+	}
+	s.value = value
+	s.next = row + 1
 	return append(dst, suffixValue...), true
 }
 

@@ -1,0 +1,15 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/internal/raftservice
+cpu: Apple M4 Max
+BenchmarkOwnerReadBarrier/solo         	  100000	      1403 ns/op	    2896 B/op	       3 allocs/op
+BenchmarkOwnerReadBarrier/solo         	  100000	      1425 ns/op	    2896 B/op	       3 allocs/op
+BenchmarkOwnerReadBarrier/solo         	  100000	      1457 ns/op	    2896 B/op	       3 allocs/op
+BenchmarkOwnerReadBarrier/solo         	  100000	      1446 ns/op	    2896 B/op	       3 allocs/op
+BenchmarkOwnerReadBarrier/solo         	  100000	      1463 ns/op	    2896 B/op	       3 allocs/op
+BenchmarkOwnerReadBarrier/batch8       	  100000	     12143 ns/op	   23288 B/op	      28 allocs/op
+BenchmarkOwnerReadBarrier/batch8       	  100000	     12076 ns/op	   23288 B/op	      28 allocs/op
+BenchmarkOwnerReadBarrier/batch8       	  100000	     11981 ns/op	   23288 B/op	      28 allocs/op
+BenchmarkOwnerReadBarrier/batch8       	  100000	     11964 ns/op	   23288 B/op	      28 allocs/op
+BenchmarkOwnerReadBarrier/batch8       	  100000	     12140 ns/op	   23288 B/op	      28 allocs/op
+PASS

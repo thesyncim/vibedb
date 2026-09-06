@@ -1,0 +1,11 @@
+package checksumalignmentcontrol
+
+// These declarations are copied to RUNNER_TEMP by the diagnostic workflow.
+// The package is deliberately independent of the repository's production
+// packages.
+
+//go:noescape
+func xorAt24(data []byte) (ret byte)
+
+//go:noescape
+func xorAt56(data []byte) (ret byte)

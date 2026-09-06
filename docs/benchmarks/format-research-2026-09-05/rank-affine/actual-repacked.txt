@@ -1,0 +1,161 @@
+=== RUN   TestCompactRankAffineResearchAdmission
+=== RUN   TestCompactRankAffineResearchAdmission/gaps
+=== RUN   TestCompactRankAffineResearchAdmission/descending
+=== RUN   TestCompactRankAffineResearchAdmission/padding
+=== RUN   TestCompactRankAffineResearchAdmission/canonical-digit-boundary
+=== RUN   TestCompactRankAffineResearchAdmission/20-digit-leading-zeros
+=== RUN   TestCompactRankAffineResearchAdmission/signed-affix-exact
+=== RUN   TestCompactRankAffineResearchAdmission/escaped-affix-exact
+=== RUN   TestCompactRankAffineResearchAdmission/shuffled-values
+=== RUN   TestCompactRankAffineResearchAdmission/almost-affine
+=== RUN   TestCompactRankAffineResearchAdmission/ordinal-is-not-rank
+=== RUN   TestCompactRankAffineResearchAdmission/nonintegral-step
+=== RUN   TestCompactRankAffineResearchAdmission/affix-mismatch
+=== RUN   TestCompactRankAffineResearchAdmission/padding-mismatch
+=== RUN   TestCompactRankAffineResearchAdmission/20-digit-overflow
+=== RUN   TestCompactRankAffineResearchAdmission/uint64-boundary
+=== RUN   TestCompactRankAffineResearchAdmission/full-domain-overflow
+=== RUN   TestCompactRankAffineResearchAdmission/multiplication-overflow
+=== RUN   TestCompactRankAffineResearchAdmission/negative-extrapolated-base
+=== RUN   TestCompactRankAffineResearchAdmission/negative-extrapolated-end
+=== RUN   TestCompactRankAffineResearchAdmission/fixed-width-full-domain
+=== RUN   TestCompactRankAffineResearchAdmission/empty
+=== RUN   TestCompactRankAffineResearchAdmission/single
+=== RUN   TestCompactRankAffineResearchAdmission/constant
+=== RUN   TestCompactRankAffineResearchAdmission/duplicate-rank
+=== RUN   TestCompactRankAffineResearchAdmission/shuffled-ranks
+=== RUN   TestCompactRankAffineResearchAdmission/rank-outside-leaf
+--- PASS: TestCompactRankAffineResearchAdmission (0.00s)
+    --- PASS: TestCompactRankAffineResearchAdmission/gaps (0.00s)
+    --- PASS: TestCompactRankAffineResearchAdmission/descending (0.00s)
+    --- PASS: TestCompactRankAffineResearchAdmission/padding (0.00s)
+    --- PASS: TestCompactRankAffineResearchAdmission/canonical-digit-boundary (0.00s)
+    --- PASS: TestCompactRankAffineResearchAdmission/20-digit-leading-zeros (0.00s)
+    --- PASS: TestCompactRankAffineResearchAdmission/signed-affix-exact (0.00s)
+    --- PASS: TestCompactRankAffineResearchAdmission/escaped-affix-exact (0.00s)
+    --- PASS: TestCompactRankAffineResearchAdmission/shuffled-values (0.00s)
+    --- PASS: TestCompactRankAffineResearchAdmission/almost-affine (0.00s)
+    --- PASS: TestCompactRankAffineResearchAdmission/ordinal-is-not-rank (0.00s)
+    --- PASS: TestCompactRankAffineResearchAdmission/nonintegral-step (0.00s)
+    --- PASS: TestCompactRankAffineResearchAdmission/affix-mismatch (0.00s)
+    --- PASS: TestCompactRankAffineResearchAdmission/padding-mismatch (0.00s)
+    --- PASS: TestCompactRankAffineResearchAdmission/20-digit-overflow (0.00s)
+    --- PASS: TestCompactRankAffineResearchAdmission/uint64-boundary (0.00s)
+    --- PASS: TestCompactRankAffineResearchAdmission/full-domain-overflow (0.00s)
+    --- PASS: TestCompactRankAffineResearchAdmission/multiplication-overflow (0.00s)
+    --- PASS: TestCompactRankAffineResearchAdmission/negative-extrapolated-base (0.00s)
+    --- PASS: TestCompactRankAffineResearchAdmission/negative-extrapolated-end (0.00s)
+    --- PASS: TestCompactRankAffineResearchAdmission/fixed-width-full-domain (0.00s)
+    --- PASS: TestCompactRankAffineResearchAdmission/empty (0.00s)
+    --- PASS: TestCompactRankAffineResearchAdmission/single (0.00s)
+    --- PASS: TestCompactRankAffineResearchAdmission/constant (0.00s)
+    --- PASS: TestCompactRankAffineResearchAdmission/duplicate-rank (0.00s)
+    --- PASS: TestCompactRankAffineResearchAdmission/shuffled-ranks (0.00s)
+    --- PASS: TestCompactRankAffineResearchAdmission/rank-outside-leaf (0.00s)
+=== RUN   TestCompactRankAffineResearchMalformed
+=== RUN   TestCompactRankAffineResearchMalformed/wrong-domain
+=== RUN   TestCompactRankAffineResearchMalformed/zero-domain
+=== RUN   TestCompactRankAffineResearchMalformed/minimum-step
+=== RUN   TestCompactRankAffineResearchMalformed/bad-directory
+=== RUN   TestCompactRankAffineResearchMalformed/trailing-byte
+=== RUN   TestCompactRankAffineResearchMalformed/truncated
+=== RUN   TestCompactRankAffineResearchMalformed/unsupported-flags
+=== RUN   TestCompactRankAffineResearchMalformed/zero-width
+=== RUN   TestCompactRankAffineResearchMalformed/narrow-width
+=== RUN   TestCompactRankAffineResearchMalformed/negative-base
+=== RUN   TestCompactRankAffineResearchMalformed/endpoint-overflow
+=== RUN   TestCompactRankAffineResearchMalformed/zero-step
+=== RUN   TestCompactRankAffineResearchMalformed/digit-affix
+--- PASS: TestCompactRankAffineResearchMalformed (0.00s)
+    --- PASS: TestCompactRankAffineResearchMalformed/wrong-domain (0.00s)
+    --- PASS: TestCompactRankAffineResearchMalformed/zero-domain (0.00s)
+    --- PASS: TestCompactRankAffineResearchMalformed/minimum-step (0.00s)
+    --- PASS: TestCompactRankAffineResearchMalformed/bad-directory (0.00s)
+    --- PASS: TestCompactRankAffineResearchMalformed/trailing-byte (0.00s)
+    --- PASS: TestCompactRankAffineResearchMalformed/truncated (0.00s)
+    --- PASS: TestCompactRankAffineResearchMalformed/unsupported-flags (0.00s)
+    --- PASS: TestCompactRankAffineResearchMalformed/zero-width (0.00s)
+    --- PASS: TestCompactRankAffineResearchMalformed/narrow-width (0.00s)
+    --- PASS: TestCompactRankAffineResearchMalformed/negative-base (0.00s)
+    --- PASS: TestCompactRankAffineResearchMalformed/endpoint-overflow (0.00s)
+    --- PASS: TestCompactRankAffineResearchMalformed/zero-step (0.00s)
+    --- PASS: TestCompactRankAffineResearchMalformed/digit-affix (0.00s)
+=== RUN   TestCompactRankAffineResearchMixedPayloads
+=== RUN   TestCompactRankAffineResearchMixedPayloads/mixed
+    compact_rank_affine_research_test.go:637: mode=mixed rows=192 old_payload=1587 new_payload=1046 old_extent=4096 new_extent=4096 replaced=8 all_rows_exact=true
+=== RUN   TestCompactRankAffineResearchMixedPayloads/overflow
+    compact_rank_affine_research_test.go:637: mode=overflow rows=192 old_payload=2454 new_payload=1965 old_extent=4096 new_extent=4096 replaced=8 all_rows_exact=true
+=== RUN   TestCompactRankAffineResearchMixedPayloads/replacement
+    compact_rank_affine_research_test.go:637: mode=replacement rows=192 old_payload=1726 new_payload=1420 old_extent=4096 new_extent=4096 replaced=4 all_rows_exact=true
+=== RUN   TestCompactRankAffineResearchMixedPayloads/delete
+    compact_rank_affine_research_test.go:637: mode=delete rows=191 old_payload=1660 new_payload=1660 old_extent=4096 new_extent=4096 replaced=0 all_rows_exact=true
+=== RUN   TestCompactRankAffineResearchMixedPayloads/insert
+    compact_rank_affine_research_test.go:637: mode=insert rows=193 old_payload=1928 new_payload=1928 old_extent=4096 new_extent=4096 replaced=0 all_rows_exact=true
+=== RUN   TestCompactRankAffineResearchMixedPayloads/shuffled
+    compact_rank_affine_research_test.go:637: mode=shuffled rows=192 old_payload=1965 new_payload=1965 old_extent=4096 new_extent=4096 replaced=0 all_rows_exact=true
+--- PASS: TestCompactRankAffineResearchMixedPayloads (0.00s)
+    --- PASS: TestCompactRankAffineResearchMixedPayloads/mixed (0.00s)
+    --- PASS: TestCompactRankAffineResearchMixedPayloads/overflow (0.00s)
+    --- PASS: TestCompactRankAffineResearchMixedPayloads/replacement (0.00s)
+    --- PASS: TestCompactRankAffineResearchMixedPayloads/delete (0.00s)
+    --- PASS: TestCompactRankAffineResearchMixedPayloads/insert (0.00s)
+    --- PASS: TestCompactRankAffineResearchMixedPayloads/shuffled (0.00s)
+=== RUN   TestCompactRankAffineResearchActualConsumers
+--- PASS: TestCompactRankAffineResearchActualConsumers (0.00s)
+=== RUN   TestCompactRankAffineResearchActualPatch
+--- PASS: TestCompactRankAffineResearchActualPatch (0.00s)
+=== RUN   TestCompactRankAffineResearchCensus
+=== RUN   TestCompactRankAffineResearchCensus/low
+    compact_rank_affine_research_test.go:1468: path=$key old=prefix-int new=prefix-int streams=25 values=100000 eligible=0 replaced=0 old_bytes=950 new_bytes=950 saved_bytes=0
+    compact_rank_affine_research_test.go:1468: path=/active old=dictionary new=dictionary streams=75 values=100000 eligible=0 replaced=0 old_bytes=14410 new_bytes=14410 saved_bytes=0
+    compact_rank_affine_research_test.go:1468: path=/country old=alphabet new=alphabet streams=3 values=1696 eligible=0 replaced=0 old_bytes=1954 new_bytes=1954 saved_bytes=0
+    compact_rank_affine_research_test.go:1468: path=/country old=dictionary new=dictionary streams=72 values=98304 eligible=0 replaced=0 old_bytes=130108 new_bytes=130108 saved_bytes=0
+    compact_rank_affine_research_test.go:1468: path=/id old=delta-pack new=rank-affine streams=75 values=100000 eligible=75 replaced=75 old_bytes=85440 new_bytes=2550 saved_bytes=82890
+    compact_rank_affine_research_test.go:1468: path=/name old=prefix-int new=rank-affine streams=75 values=100000 eligible=75 replaced=75 old_bytes=86415 new_bytes=3075 saved_bytes=83340
+    compact_rank_affine_research_test.go:1468: path=/note old=dictionary new=dictionary streams=75 values=100000 eligible=0 replaced=0 old_bytes=45875 new_bytes=45875 saved_bytes=0
+    compact_rank_affine_research_test.go:1468: path=/profile/joined old=date new=date streams=75 values=100000 eligible=0 replaced=0 old_bytes=151219 new_bytes=151219 saved_bytes=0
+    compact_rank_affine_research_test.go:1468: path=/profile/region old=dictionary new=dictionary streams=75 values=100000 eligible=0 replaced=0 old_bytes=43604 new_bytes=43604 saved_bytes=0
+    compact_rank_affine_research_test.go:1468: path=/profile/tier old=dictionary new=dictionary streams=75 values=100000 eligible=0 replaced=0 old_bytes=28700 new_bytes=28700 saved_bytes=0
+    compact_rank_affine_research_test.go:1468: path=/score old=for new=for streams=75 values=100000 eligible=0 replaced=0 old_bytes=126525 new_bytes=126525 saved_bytes=0
+    compact_rank_affine_research_test.go:1468: path=/tags/0 old=dictionary new=dictionary streams=75 values=100000 eligible=0 replaced=0 old_bytes=43679 new_bytes=43679 saved_bytes=0
+    compact_rank_affine_research_test.go:1468: path=/tags/1 old=dictionary new=dictionary streams=75 values=100000 eligible=0 replaced=0 old_bytes=43679 new_bytes=43679 saved_bytes=0
+    compact_rank_affine_research_test.go:1468: path=/tags/2 old=dictionary new=dictionary streams=50 values=66724 eligible=0 replaced=0 old_bytes=29143 new_bytes=29143 saved_bytes=0
+    compact_rank_affine_research_test.go:1468: path=/tags/3 old=dictionary new=dictionary streams=25 values=33479 eligible=0 replaced=0 old_bytes=14615 new_bytes=14615 saved_bytes=0
+    compact_rank_affine_research_test.go:1474: CENSUS corpus=low rows=100000 leaves=25 old_payload=895569 new_payload=729339 payload_saved=166230 payload_saved_pct=18.561384 old_extent=905216 new_extent=802816 extent_saved=102400 extent_saved_pct=11.312217 payload_saved_per_row=1.662300 replaced_streams=150 all_rows_exact=true repacked=false
+    compact_rank_affine_research_test.go:1478: FIXED_CUTS first:last:old_extent:new_extent=[0:4096:36864:32768 4096:8192:36864:32768 8192:12288:36864:32768 12288:16384:36864:32768 16384:20480:36864:32768 20480:24576:36864:32768 24576:28672:36864:32768 28672:32768:36864:32768 32768:36864:36864:32768 36864:40960:36864:32768 40960:45056:36864:32768 45056:49152:36864:32768 49152:53248:36864:32768 53248:57344:36864:32768 57344:61440:36864:32768 61440:65536:36864:32768 65536:69632:36864:32768 69632:73728:36864:32768 73728:77824:36864:32768 77824:81920:36864:32768 81920:86016:36864:32768 86016:90112:36864:32768 90112:94208:36864:32768 94208:98304:36864:32768 98304:100000:20480:16384]
+    compact_rank_affine_research_test.go:1496: PRODUCTION_REPACKED corpus=low rows=100000 old_leaves=25 new_leaves=25 old_payload=895569 new_payload=729339 old_leaf_extent=905216 new_leaf_extent=802816 leaf_extent_saved=102400 old_graph_pages=30 new_graph_pages=30 old_graph_extent=1003520 new_graph_extent=901120 graph_extent_saved=102400 graph_extent_saved_pct=10.204082 prefix_bytes=16384 old_primary_with_prefix=1019904 new_primary_with_prefix=917504 primary_saved_pct=10.040161 rank_streams=150 all_rows_exact=true repacked=true
+    compact_rank_affine_research_test.go:1509: GRAPH_KIND corpus=low kind=7 old_bytes=73728 new_bytes=73728
+    compact_rank_affine_research_test.go:1509: GRAPH_KIND corpus=low kind=8 old_bytes=8192 new_bytes=8192
+    compact_rank_affine_research_test.go:1509: GRAPH_KIND corpus=low kind=9 old_bytes=8192 new_bytes=8192
+    compact_rank_affine_research_test.go:1509: GRAPH_KIND corpus=low kind=10 old_bytes=8192 new_bytes=8192
+    compact_rank_affine_research_test.go:1509: GRAPH_KIND corpus=low kind=11 old_bytes=905216 new_bytes=802816
+    compact_rank_affine_research_test.go:1516: PRODUCTION_CUTS first:last:extent=[0:4096:32768 4096:8192:32768 8192:12288:32768 12288:16384:32768 16384:20480:32768 20480:24576:32768 24576:28672:32768 28672:32768:32768 32768:36864:32768 36864:40960:32768 40960:45056:32768 45056:49152:32768 49152:53248:32768 53248:57344:32768 57344:61440:32768 61440:65536:32768 65536:69632:32768 69632:73728:32768 73728:77824:32768 77824:81920:32768 81920:86016:32768 86016:90112:32768 90112:94208:32768 94208:98304:32768 98304:100000:16384]
+=== RUN   TestCompactRankAffineResearchCensus/high
+    compact_rank_affine_research_test.go:1468: path=$key old=prefix-int new=prefix-int streams=104 values=100000 eligible=0 replaced=0 old_bytes=3952 new_bytes=3952 saved_bytes=0
+    compact_rank_affine_research_test.go:1468: path=/active old=dictionary new=dictionary streams=312 values=100000 eligible=0 replaced=0 old_bytes=20430 new_bytes=20430 saved_bytes=0
+    compact_rank_affine_research_test.go:1468: path=/country old=alphabet new=alphabet streams=312 values=100000 eligible=0 replaced=0 old_bytes=120228 new_bytes=120228 saved_bytes=0
+    compact_rank_affine_research_test.go:1468: path=/id old=delta-pack new=rank-affine streams=312 values=100000 eligible=312 replaced=312 old_bytes=89550 new_bytes=10608 saved_bytes=78942
+    compact_rank_affine_research_test.go:1468: path=/name old=prefix-int new=rank-affine streams=312 values=100000 eligible=312 replaced=312 old_bytes=93606 new_bytes=12792 saved_bytes=80814
+    compact_rank_affine_research_test.go:1468: path=/note old=alphabet new=alphabet streams=312 values=100000 eligible=0 replaced=0 old_bytes=3956682 new_bytes=3956682 saved_bytes=0
+    compact_rank_affine_research_test.go:1468: path=/profile/joined old=date new=date streams=312 values=100000 eligible=0 replaced=0 old_bytes=155067 new_bytes=155067 saved_bytes=0
+    compact_rank_affine_research_test.go:1468: path=/profile/region old=alphabet new=alphabet streams=312 values=100000 eligible=0 replaced=0 old_bytes=663110 new_bytes=663110 saved_bytes=0
+    compact_rank_affine_research_test.go:1468: path=/profile/tier old=alphabet new=alphabet streams=312 values=100000 eligible=0 replaced=0 old_bytes=390652 new_bytes=390652 saved_bytes=0
+    compact_rank_affine_research_test.go:1468: path=/score old=for new=for streams=312 values=100000 eligible=0 replaced=0 old_bytes=131359 new_bytes=131359 saved_bytes=0
+    compact_rank_affine_research_test.go:1468: path=/tags/0 old=alphabet new=alphabet streams=312 values=100000 eligible=0 replaced=0 old_bytes=359817 new_bytes=359817 saved_bytes=0
+    compact_rank_affine_research_test.go:1468: path=/tags/1 old=alphabet new=alphabet streams=312 values=100000 eligible=0 replaced=0 old_bytes=359831 new_bytes=359831 saved_bytes=0
+    compact_rank_affine_research_test.go:1468: path=/tags/2 old=alphabet new=alphabet streams=208 values=66724 eligible=0 replaced=0 old_bytes=240161 new_bytes=240161 saved_bytes=0
+    compact_rank_affine_research_test.go:1468: path=/tags/3 old=alphabet new=alphabet streams=104 values=33479 eligible=0 replaced=0 old_bytes=120459 new_bytes=120459 saved_bytes=0
+    compact_rank_affine_research_test.go:1474: CENSUS corpus=high rows=100000 leaves=104 old_payload=6801696 new_payload=6641940 payload_saved=159756 payload_saved_pct=2.348767 old_extent=6815744 new_extent=6811648 extent_saved=4096 extent_saved_pct=0.060096 payload_saved_per_row=1.597560 replaced_streams=624 all_rows_exact=true repacked=false
+    compact_rank_affine_research_test.go:1478: FIXED_CUTS first:last:old_extent:new_extent=[0:962:65536:65536 962:1923:65536:65536 1923:2883:65536:65536 2883:3845:65536:65536 3845:4805:65536:65536 4805:5769:65536:65536 5769:6733:65536:65536 6733:7695:65536:65536 7695:8657:65536:65536 8657:9617:65536:65536 9617:10580:65536:65536 10580:11541:65536:65536 11541:12503:65536:65536 12503:13465:65536:65536 13465:14426:65536:65536 14426:15387:65536:65536 15387:16346:65536:65536 16346:17305:65536:65536 17305:18267:65536:65536 18267:19230:65536:65536 19230:20192:65536:65536 20192:21153:65536:65536 21153:22115:65536:65536 22115:23077:65536:65536 23077:24039:65536:65536 24039:24998:65536:65536 24998:25961:65536:65536 25961:26924:65536:65536 26924:27885:65536:65536 27885:28849:65536:65536 28849:29814:65536:65536 29814:30776:65536:65536 30776:31738:65536:65536 31738:32701:65536:65536 32701:33661:65536:65536 33661:34625:65536:65536 34625:35587:65536:65536 35587:36551:65536:65536 36551:37514:65536:65536 37514:38475:65536:65536 38475:39437:65536:65536 39437:40395:65536:65536 40395:41354:65536:65536 41354:42316:65536:65536 42316:43277:65536:65536 43277:44238:65536:65536 44238:45197:65536:65536 45197:46162:65536:65536 46162:47123:65536:65536 47123:48084:65536:65536 48084:49046:65536:65536 49046:50008:65536:65536 50008:50970:65536:65536 50970:51936:65536:65536 51936:52900:65536:65536 52900:53860:65536:65536 53860:54822:65536:65536 54822:55782:65536:65536 55782:56743:65536:65536 56743:57702:65536:65536 57702:58663:65536:65536 58663:59625:65536:65536 59625:60587:65536:65536 60587:61551:65536:65536 61551:62512:65536:65536 62512:63473:65536:65536 63473:64436:65536:65536 64436:65397:65536:65536 65397:66356:65536:65536 66356:67318:65536:65536 67318:68277:65536:65536 68277:69242:65536:65536 69242:70203:65536:65536 70203:71166:65536:65536 71166:72127:65536:65536 72127:73091:65536:65536 73091:74054:65536:65536 74054:75018:65536:65536 75018:75982:65536:65536 75982:76945:65536:65536 76945:77908:65536:65536 77908:78871:65536:65536 78871:79831:65536:65536 79831:80791:65536:65536 80791:81752:65536:65536 81752:82710:65536:65536 82710:83673:65536:65536 83673:84636:65536:65536 84636:85597:65536:65536 85597:86560:65536:65536 86560:87521:65536:65536 87521:88484:65536:65536 88484:89449:65536:65536 89449:90414:65536:65536 90414:91377:65536:65536 91377:92339:65536:65536 92339:93301:65536:65536 93301:94265:65536:65536 94265:95228:65536:65536 95228:96190:65536:65536 96190:97153:65536:65536 97153:98118:65536:65536 98118:99081:65536:65536 99081:100000:65536:61440]
+    compact_rank_affine_research_test.go:1496: PRODUCTION_REPACKED corpus=high rows=100000 old_leaves=104 new_leaves=102 old_payload=6801696 new_payload=6638962 old_leaf_extent=6815744 new_leaf_extent=6651904 leaf_extent_saved=163840 old_graph_pages=109 new_graph_pages=107 old_graph_extent=6914048 new_graph_extent=6750208 graph_extent_saved=163840 graph_extent_saved_pct=2.369668 prefix_bytes=16384 old_primary_with_prefix=6930432 new_primary_with_prefix=6766592 primary_saved_pct=2.364066 rank_streams=612 all_rows_exact=true repacked=true
+    compact_rank_affine_research_test.go:1509: GRAPH_KIND corpus=high kind=7 old_bytes=73728 new_bytes=73728
+    compact_rank_affine_research_test.go:1509: GRAPH_KIND corpus=high kind=8 old_bytes=8192 new_bytes=8192
+    compact_rank_affine_research_test.go:1509: GRAPH_KIND corpus=high kind=9 old_bytes=8192 new_bytes=8192
+    compact_rank_affine_research_test.go:1509: GRAPH_KIND corpus=high kind=10 old_bytes=8192 new_bytes=8192
+    compact_rank_affine_research_test.go:1509: GRAPH_KIND corpus=high kind=11 old_bytes=6815744 new_bytes=6651904
+    compact_rank_affine_research_test.go:1516: PRODUCTION_CUTS first:last:extent=[0:985:65536 985:1969:65536 1969:2955:65536 2955:3940:65536 3940:4925:65536 4925:5913:65536 5913:6899:65536 6899:7886:65536 7886:8871:65536 8871:9855:65536 9855:10842:65536 10842:11827:65536 11827:12812:65536 12812:13798:65536 13798:14783:65536 14783:15767:65536 15767:16750:65536 16750:17737:65536 17737:18724:65536 18724:19712:65536 19712:20697:65536 20697:21683:65536 21683:22670:65536 22670:23654:65536 23654:24637:65536 24637:25621:65536 25621:26608:65536 26608:27594:65536 27594:28581:65536 28581:29570:65536 29570:30557:65536 30557:31543:65536 31543:32530:65536 32530:33514:65536 33514:34500:65536 34500:35486:65536 35486:36474:65536 36474:37462:65536 37462:38446:65536 38446:39430:65536 39430:40412:65536 40412:41395:65536 41395:42380:65536 42380:43365:65536 43365:44350:65536 44350:45333:65536 45333:46323:65536 46323:47307:65536 47307:48292:65536 48292:49277:65536 49277:50265:65536 50265:51251:65536 51251:52239:65536 52239:53227:65536 53227:54210:65536 54210:55195:65536 55195:56179:65536 56179:57162:65536 57162:58145:65536 58145:59131:65536 59131:60116:65536 60116:61102:65536 61102:62091:65536 62091:63076:65536 63076:64060:65536 64060:65047:65536 65047:66030:65536 66030:67016:65536 67016:68000:65536 68000:68987:65536 68987:69973:65536 69973:70960:65536 70960:71943:65536 71943:72931:65536 72931:73918:65536 73918:74904:65536 74904:75893:65536 75893:76880:65536 76880:77867:65536 77867:78853:65536 78853:79838:65536 79838:80823:65536 80823:81808:65536 81808:82789:65536 82789:83776:65536 83776:84762:65536 84762:85749:65536 85749:86735:65536 86735:87720:65536 87720:88708:65536 88708:89696:65536 89696:90684:65536 90684:91667:65536 91667:92655:65536 92655:93641:65536 93641:94629:65536 94629:95615:65536 95615:96602:65536 96602:97589:65536 97589:98574:65536 98574:99559:65536 99559:100000:32768]
+--- PASS: TestCompactRankAffineResearchCensus (4.01s)
+    --- PASS: TestCompactRankAffineResearchCensus/low (0.84s)
+    --- PASS: TestCompactRankAffineResearchCensus/high (3.17s)
+PASS
+ok  	github.com/thesyncim/vibedb/internal/storeio	4.363s

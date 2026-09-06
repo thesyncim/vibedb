@@ -1,0 +1,7 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/internal/raftstore
+cpu: Apple M4 Max
+BenchmarkNodeStorePersistDurability/groups=1         	      28	   8750122 ns/op	   0.00 MB/s	       0 B/op	       0 allocs/op
+BenchmarkNodeStorePersistDurability/groups=8         	      28	   8791109 ns/op	   0.00 MB/s	       0 B/op	       0 allocs/op
+PASS

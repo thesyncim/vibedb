@@ -1,0 +1,111 @@
+{
+  "note": "Offline source-derived grammar model; no database/timing measurement.",
+  "routes": [
+    {
+      "entries": 64,
+      "command_bytes": 512,
+      "extents": 1,
+      "old_payload": 437,
+      "proposed_payload": 29,
+      "payload_saved": 408,
+      "old_metadata_read": 477,
+      "proposed_metadata_read": 69,
+      "old_varints": 195,
+      "proposed_varints": 8
+    },
+    {
+      "entries": 256,
+      "command_bytes": 300,
+      "extents": 3,
+      "old_payload": 1708,
+      "proposed_payload": 82,
+      "payload_saved": 1626,
+      "old_metadata_read": 1748,
+      "proposed_metadata_read": 122,
+      "old_varints": 777,
+      "proposed_varints": 20
+    },
+    {
+      "entries": 256,
+      "command_bytes": 512,
+      "extents": 4,
+      "old_payload": 1751,
+      "proposed_payload": 110,
+      "payload_saved": 1641,
+      "old_metadata_read": 1791,
+      "proposed_metadata_read": 150,
+      "old_varints": 780,
+      "proposed_varints": 26
+    },
+    {
+      "entries": 256,
+      "command_bytes": 1024,
+      "extents": 8,
+      "old_payload": 1839,
+      "proposed_payload": 218,
+      "payload_saved": 1621,
+      "old_metadata_read": 1879,
+      "proposed_metadata_read": 258,
+      "old_varints": 792,
+      "proposed_varints": 50
+    },
+    {
+      "entries": 256,
+      "command_bytes": 65536,
+      "extents": 256,
+      "old_payload": 7552,
+      "proposed_payload": null,
+      "payload_saved": null,
+      "old_metadata_read": 7592,
+      "proposed_metadata_read": null,
+      "old_varints": 1536,
+      "proposed_varints": null
+    }
+  ],
+  "overflow": [
+    {
+      "document_bytes": 65536,
+      "pieces": 2,
+      "last_body": 132,
+      "last_extent": 4096,
+      "full_chain": 69632,
+      "first_chunk_only_new_bytes": 65536,
+      "first_chunk_only_saved": 4096,
+      "rf3_saved_per_checkpointed_version": 12288,
+      "last_chunk_changed_saved": 0
+    },
+    {
+      "document_bytes": 131072,
+      "pieces": 3,
+      "last_body": 264,
+      "last_extent": 4096,
+      "full_chain": 135168,
+      "first_chunk_only_new_bytes": 65536,
+      "first_chunk_only_saved": 69632,
+      "rf3_saved_per_checkpointed_version": 208896,
+      "last_chunk_changed_saved": 0
+    },
+    {
+      "document_bytes": 1048576,
+      "pieces": 17,
+      "last_body": 2112,
+      "last_extent": 4096,
+      "full_chain": 1052672,
+      "first_chunk_only_new_bytes": 65536,
+      "first_chunk_only_saved": 987136,
+      "rf3_saved_per_checkpointed_version": 2961408,
+      "last_chunk_changed_saved": 0
+    },
+    {
+      "document_bytes": 4194304,
+      "pieces": 65,
+      "last_body": 8448,
+      "last_extent": 12288,
+      "full_chain": 4206592,
+      "first_chunk_only_new_bytes": 65536,
+      "first_chunk_only_saved": 4141056,
+      "rf3_saved_per_checkpointed_version": 12423168,
+      "last_chunk_changed_saved": 0
+    }
+  ]
+}

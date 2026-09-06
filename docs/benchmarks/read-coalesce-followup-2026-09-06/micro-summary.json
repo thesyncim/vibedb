@@ -1,0 +1,26 @@
+{
+  "before/solo": {
+    "ns_op": 1519.0,
+    "bytes": 2896.0,
+    "allocs": 3.0,
+    "samples": 10
+  },
+  "before/batch8": {
+    "ns_op": 12109.0,
+    "bytes": 23288.0,
+    "allocs": 28.0,
+    "samples": 10
+  },
+  "after/solo": {
+    "ns_op": 1455.0,
+    "bytes": 2896.0,
+    "allocs": 3.0,
+    "samples": 10
+  },
+  "after/batch8": {
+    "ns_op": 11972.5,
+    "bytes": 23288.0,
+    "allocs": 28.0,
+    "samples": 10
+  }
+}

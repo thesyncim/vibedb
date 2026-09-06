@@ -1,0 +1,90 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/store/durable
+cpu: Apple M4 Max
+BenchmarkFileStorePutDurabilitySync/writers=1         	      31	   8051910 ns/op	         0 devB/put	         1.000 maxgroup	  338613 B/op	       2 allocs/op
+BenchmarkFileStorePutDurabilitySync/writers=8         	      61	   4311368 ns/op	         0 devB/put	         1.000 maxgroup	  173204 B/op	       8 allocs/op
+BenchmarkFileStorePutDurabilitySync/writers=64        	     301	    962264 ns/op	       911.7 devB/put	         8.000 maxgroup	       150.5 puts/fsync	   36411 B/op	       8 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/internal/raftstore
+cpu: Apple M4 Max
+BenchmarkNodeStorePersistDurability/groups=1         	      30	   8100017 ns/op	   0.00 MB/s	       0 B/op	       0 allocs/op
+BenchmarkNodeStorePersistDurability/groups=8         	      30	   8238086 ns/op	   0.00 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/store/durable
+cpu: Apple M4 Max
+BenchmarkFileStorePutDurabilitySync/writers=1         	      30	   8892847 ns/op	         0 devB/put	         1.000 maxgroup	  349889 B/op	       2 allocs/op
+BenchmarkFileStorePutDurabilitySync/writers=8         	      64	   4167094 ns/op	         0 devB/put	         1.000 maxgroup	  165104 B/op	       8 allocs/op
+BenchmarkFileStorePutDurabilitySync/writers=64        	     302	    973136 ns/op	       908.7 devB/put	         8.000 maxgroup	       151.0 puts/fsync	   36300 B/op	       8 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/internal/raftstore
+cpu: Apple M4 Max
+BenchmarkNodeStorePersistDurability/groups=1         	      26	   8157446 ns/op	   0.00 MB/s	       0 B/op	       0 allocs/op
+BenchmarkNodeStorePersistDurability/groups=8         	      25	   8964397 ns/op	   0.00 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/store/durable
+cpu: Apple M4 Max
+BenchmarkFileStorePutDurabilitySync/writers=1         	      34	   7108903 ns/op	         0 devB/put	         1.000 maxgroup	  308767 B/op	       2 allocs/op
+BenchmarkFileStorePutDurabilitySync/writers=8         	      73	   3885840 ns/op	         0 devB/put	         1.000 maxgroup	  145062 B/op	       7 allocs/op
+BenchmarkFileStorePutDurabilitySync/writers=64        	     444	    724280 ns/op	       618.1 devB/put	         8.000 maxgroup	       222.0 puts/fsync	   24802 B/op	       8 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/internal/raftstore
+cpu: Apple M4 Max
+BenchmarkNodeStorePersistDurability/groups=1         	      37	   6564860 ns/op	   0.00 MB/s	       0 B/op	       0 allocs/op
+BenchmarkNodeStorePersistDurability/groups=8         	      30	   7897864 ns/op	   0.00 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/store/durable
+cpu: Apple M4 Max
+BenchmarkFileStorePutDurabilitySync/writers=1         	      25	   9499705 ns/op	         0 devB/put	         1.000 maxgroup	  419796 B/op	       2 allocs/op
+BenchmarkFileStorePutDurabilitySync/writers=8         	      55	   4517093 ns/op	         0 devB/put	         1.000 maxgroup	  192011 B/op	       8 allocs/op
+BenchmarkFileStorePutDurabilitySync/writers=64        	     364	    938620 ns/op	       753.9 devB/put	         8.000 maxgroup	       182.0 puts/fsync	   30181 B/op	       8 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/internal/raftstore
+cpu: Apple M4 Max
+BenchmarkNodeStorePersistDurability/groups=1         	      30	   8031936 ns/op	   0.00 MB/s	       0 B/op	       0 allocs/op
+BenchmarkNodeStorePersistDurability/groups=8         	      28	   8201588 ns/op	   0.00 MB/s	       1 B/op	       0 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/store/durable
+cpu: Apple M4 Max
+BenchmarkFileStorePutDurabilitySync/writers=1         	      30	   8052104 ns/op	         0 devB/put	         1.000 maxgroup	  349889 B/op	       2 allocs/op
+BenchmarkFileStorePutDurabilitySync/writers=8         	      73	   3529839 ns/op	         0 devB/put	         1.000 maxgroup	  145062 B/op	       7 allocs/op
+BenchmarkFileStorePutDurabilitySync/writers=64        	     781	    769781 ns/op	      1065 devB/put	         8.000 maxgroup	       130.2 puts/fsync	   14539 B/op	       8 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/internal/raftstore
+cpu: Apple M4 Max
+BenchmarkNodeStorePersistDurability/groups=1         	      61	   5126518 ns/op	   0.00 MB/s	       4 B/op	       0 allocs/op
+BenchmarkNodeStorePersistDurability/groups=8         	      60	   6566644 ns/op	   0.00 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/store/durable
+cpu: Apple M4 Max
+BenchmarkFileStorePutDurabilitySync/writers=1         	      28	   8746958 ns/op	         0 devB/put	         1.000 maxgroup	  374856 B/op	       2 allocs/op
+BenchmarkFileStorePutDurabilitySync/writers=8         	     104	   2178852 ns/op	         0 devB/put	         1.000 maxgroup	  102114 B/op	       7 allocs/op
+BenchmarkFileStorePutDurabilitySync/writers=64        	     992	   1065384 ns/op	      1007 devB/put	         8.000 maxgroup	       124.0 puts/fsync	   11649 B/op	       8 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/internal/raftstore
+cpu: Apple M4 Max
+BenchmarkNodeStorePersistDurability/groups=1         	      24	   9667590 ns/op	   0.00 MB/s	       0 B/op	       0 allocs/op
+BenchmarkNodeStorePersistDurability/groups=8         	      27	   9037716 ns/op	   0.00 MB/s	       0 B/op	       0 allocs/op
+PASS

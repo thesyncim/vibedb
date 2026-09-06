@@ -240,7 +240,7 @@ func compactProjectionValueLen(v compactStreamView, row int) (length, peak int, 
 			return 0, 0, false
 		}
 		return 12, 12, true // quoted YYYY-MM-DD
-	case compactStreamPrefixInt:
+	case compactStreamPrefixInt, compactStreamRankAffine:
 		if len(v.data) < 2 {
 			return 0, 0, false
 		}
@@ -317,7 +317,7 @@ func (s *compactProjectionSequentialState) seed(
 	case compactStreamDelta:
 	case compactStreamDeltaPack:
 		packed = true
-	case compactStreamPrefixInt:
+	case compactStreamPrefixInt, compactStreamRankAffine:
 		if len(v.data) < 2 || v.data[0]&2 != 0 {
 			return false
 		}
@@ -459,6 +459,11 @@ func compactProjectionIntegerValue(
 		return 0, false
 	}
 	switch v.kind {
+	case compactStreamRankAffine:
+		if v.rankAffineIsNumber() {
+			return v.rankAffineInteger(row)
+		}
+		return 0, false
 	case compactStreamFOR:
 		if v.width == 64 {
 			return 0, false
@@ -589,7 +594,7 @@ func compactProjectionFieldAt(
 		}
 		return valueScratch, true
 	}
-	if v.kind == compactStreamPrefixInt {
+	if v.kind == compactStreamPrefixInt || v.kind == compactStreamRankAffine {
 		return compactProjectionPrefixFieldAt(
 			v, row, valueScratch, field, state,
 		)
@@ -616,7 +621,7 @@ func compactProjectionFieldAt(
 // CompactPrimaryStripe admission has already validated the enclosing stream;
 // this helper repeats only the bounded stream walk needed to reach the hole.
 func compactProjectionStreamAt(
-	entry compactPrimaryShapeView, hole int,
+	entry compactPrimaryShapeView, hole, leafRows int,
 ) (compactStreamView, bool) {
 	if hole < 0 || hole >= entry.template.holes {
 		return compactStreamView{}, false
@@ -624,7 +629,7 @@ func compactProjectionStreamAt(
 	streamRaw := entry.streamRaw
 	for at := 0; at <= hole; at++ {
 		stream, admitted := admittedCompactStream(streamRaw)
-		if !admitted || stream.count != entry.rows {
+		if !admitted || !stream.matchesShapeRows(entry.rows, leafRows) {
 			return compactStreamView{}, false
 		}
 		if at == hole {
@@ -695,7 +700,7 @@ func prepareUnifiedProjectionShape(
 			streams[field].view = compactStreamView{}
 			continue
 		}
-		stream, ok := compactProjectionStreamAt(entry, hole)
+		stream, ok := compactProjectionStreamAt(entry, hole, v.rows)
 		if !ok {
 			// A malformed/unsupported stream is handled at the first field
 			// access, where the match lane can still use an already-decoded
@@ -970,7 +975,7 @@ func (v *CompactPrimaryStripeView) VisitResolvedProjection(
 			}
 			var ok bool
 			valueScratch, ok = compactProjectionFieldAt(
-				&stream.view, ordinal, valueScratch, &fields[field], &stream.state,
+				&stream.view, stream.view.shapeCoordinate(row, ordinal), valueScratch, &fields[field], &stream.state,
 			)
 			if !ok {
 				return false, false, valueScratch, nil

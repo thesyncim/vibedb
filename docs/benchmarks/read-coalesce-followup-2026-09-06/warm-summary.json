@@ -1,0 +1,71 @@
+{
+  "arms": {
+    "1-baseline": {
+      "trials": 3,
+      "operations": 24000,
+      "errors": 0,
+      "all_verified": true,
+      "cells": [
+        {
+          "workload": "update_existing",
+          "clients": 1,
+          "ops_s": 1026.6942424231622,
+          "p99_ms": 7.005292
+        }
+      ]
+    },
+    "2-scheduler": {
+      "trials": 3,
+      "operations": 24000,
+      "errors": 0,
+      "all_verified": true,
+      "cells": [
+        {
+          "workload": "update_existing",
+          "clients": 1,
+          "ops_s": 1037.561829027579,
+          "p99_ms": 4.899334
+        }
+      ]
+    },
+    "3-scheduler": {
+      "trials": 3,
+      "operations": 24000,
+      "errors": 0,
+      "all_verified": true,
+      "cells": [
+        {
+          "workload": "update_existing",
+          "clients": 1,
+          "ops_s": 1022.1600950817818,
+          "p99_ms": 7.921625
+        }
+      ]
+    },
+    "4-baseline": {
+      "trials": 3,
+      "operations": 24000,
+      "errors": 0,
+      "all_verified": true,
+      "cells": [
+        {
+          "workload": "update_existing",
+          "clients": 1,
+          "ops_s": 639.5787837486164,
+          "p99_ms": 13.171334
+        }
+      ]
+    }
+  },
+  "comparison": [
+    {
+      "workload": "update_existing",
+      "clients": 1,
+      "baseline_ops_s": 714.3504737856456,
+      "candidate_ops_s": 1027.5280416786113,
+      "change_percent": 43.84088474573345,
+      "baseline_p99_ms": 9.2333125,
+      "candidate_p99_ms": 5.6289795
+    }
+  ]
+}

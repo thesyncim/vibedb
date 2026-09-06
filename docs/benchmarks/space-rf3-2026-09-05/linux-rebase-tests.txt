@@ -1,0 +1,11 @@
+ok  	github.com/thesyncim/vibedb/internal/raftstore	4.489s
+ok  	github.com/thesyncim/vibedb/internal/raftstore/seglog	3.965s
+ok  	github.com/thesyncim/vibedb/internal/raftmember	3.816s
+=== RUN   TestPrepareRF3NodeSharedLogAndRuntime
+--- PASS: TestPrepareRF3NodeSharedLogAndRuntime (0.11s)
+=== RUN   TestServeRF3NodeLogThreeServersRestart
+--- PASS: TestServeRF3NodeLogThreeServersRestart (2.61s)
+=== RUN   TestRF3NodeRecoveryAcrossSegmentEntryCapacity
+--- PASS: TestRF3NodeRecoveryAcrossSegmentEntryCapacity (0.16s)
+PASS
+ok  	github.com/thesyncim/vibedb/cmd/vibedb-shard	2.884s

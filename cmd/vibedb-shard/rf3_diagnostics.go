@@ -104,6 +104,7 @@ type rf3DiagnosticSnapshot struct {
 
 	// Owner-side authority counters prove that the SQL read actually used the
 	// fast path. They are separate from the Runtime's protocol-round counters.
+	ReadIndexShared                 uint64 `json:"read_index_shared"`
 	AuthorityReadHits               uint64 `json:"authority_read_hits"`
 	AuthorityReadIndexFallbacks     uint64 `json:"authority_read_index_fallbacks"`
 	AuthorityReadValidationRetries  uint64 `json:"authority_read_validation_retries"`
@@ -383,6 +384,7 @@ func applyRF3DiagnosticProgress(snapshot *rf3DiagnosticSnapshot, metrics raftser
 	copy(snapshot.RaftProposalQueueDepthHistogram, metrics.ProposalQueueDepthHistogram[:])
 	copy(snapshot.RaftProposalEntriesPerReady, metrics.ProposalEntriesPerReady[:])
 	copy(snapshot.RaftProposalBytesPerReady, metrics.ProposalBytesPerReady[:])
+	snapshot.ReadIndexShared = metrics.ReadIndexShared
 	snapshot.AuthorityReadHits = metrics.AuthorityReadHits
 	snapshot.AuthorityReadIndexFallbacks = metrics.AuthorityReadIndexFallbacks
 	snapshot.AuthorityReadValidationRetries = metrics.AuthorityReadValidationRetries
