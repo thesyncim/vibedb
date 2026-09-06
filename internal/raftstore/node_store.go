@@ -1864,7 +1864,13 @@ func (v *GroupView) CapacityProfile() (CapacityProfile, error) {
 
 func (s *NodeStore) rebuildDescriptors(limit int) error {
 	metadata, ok := s.engine.Metadata(nodeDescriptorGroup)
-	if !ok || metadata.LastIndex == 0 || metadata.LastIndex > uint64(limit) || metadata.Hard.Term != 1 || metadata.Hard.Vote != 0 || metadata.Hard.Commit != metadata.LastIndex {
+	if !ok || metadata.LastIndex > uint64(limit) || metadata.Hard.Term != 1 || metadata.Hard.Vote != 0 || metadata.Hard.Commit != metadata.LastIndex {
+		return ErrCorrupt
+	}
+	// A prepared capacity node has a durable descriptor-group hard state but
+	// no descriptors until its first enrollment. Accept only that exact genesis
+	// state; an absent or partially truncated descriptor catalog is corruption.
+	if metadata.LastIndex == 0 && metadata != (seglog.GroupMetadata{Hard: seglog.HardState{Term: 1}, FirstIndex: 1}) {
 		return ErrCorrupt
 	}
 	descriptors := make([]GroupDescriptor, 0, limit)
