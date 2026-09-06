@@ -162,11 +162,16 @@ type bootstrapListeners struct {
 	Snapshot string `json:"snapshot"`
 	Control  string `json:"control"`
 }
+type bootstrapPeerKey struct {
+	NodeID    string `json:"node_id"`
+	KeyDigest string `json:"key_digest"`
+}
 type bootstrapTLS struct {
-	Certificate string `json:"certificate"`
-	Key         string `json:"key"`
-	Roots       string `json:"roots"`
-	IdentityOID string `json:"identity_oid"`
+	Certificate string             `json:"certificate"`
+	Key         string             `json:"key"`
+	Roots       string             `json:"roots"`
+	IdentityOID string             `json:"identity_oid"`
+	PeerKeys    []bootstrapPeerKey `json:"peer_keys"`
 }
 type bootstrapMember struct {
 	MemberID    uint64 `json:"member_id"`
@@ -526,6 +531,22 @@ func buildBootstrap(c BootstrapConfig, random io.Reader) ([]byte, bootstrapState
 	shardSecret := map[string][]byte{"cluster-roots.pem": roots, "wal-key-source": walKey[:]}
 	gatewaySecret := map[string][]byte{"cluster-roots.pem": roots, "gateway-cert.pem": certs[9].cert, "gateway-key.pem": certs[9].key, "durable-ack-key": []byte(hex.EncodeToString(ack[:]))}
 	clientSecret := map[string][]byte{"cluster-roots.pem": roots, "client-cert.pem": certs[10].cert, "client-key.pem": certs[10].key}
+	var peerKeys [3][]bootstrapPeerKey
+	for ri := range roles {
+		for mi := 0; mi < 3; mi++ {
+			block, _ := pem.Decode(certs[ri*3+mi].cert)
+			if block == nil {
+				return nil, state, errors.New("bootstrap: missing peer certificate")
+			}
+			certificate, err := x509.ParseCertificate(block.Bytes)
+			if err != nil {
+				return nil, state, err
+			}
+			digest := sha256.Sum256(certificate.RawSubjectPublicKeyInfo)
+			peerKeys[ri] = append(peerKeys[ri], bootstrapPeerKey{state.ShardNodeIDs[ri*3+mi], hex.EncodeToString(digest[:])})
+		}
+		sort.Slice(peerKeys[ri], func(i, j int) bool { return peerKeys[ri][i].NodeID < peerKeys[ri][j].NodeID })
+	}
 	for ri := range roles {
 		members := make([]bootstrapMember, 3)
 		grants := make([]bootstrapGrant, 3)
@@ -547,7 +568,7 @@ func buildBootstrap(c BootstrapConfig, random io.Reader) ([]byte, bootstrapState
 				apply.RequestLedgerRangeEnd = z
 				apply.RequestLedgerRangeIdentity = hex.EncodeToString(ledgerIdentity[:])
 			}
-			p := bootstrapPrepare{Root: "/var/lib/vibedb/member", Distribution: string(roles[ri].distribution), Shard: string(roles[ri].shard), ClusterID: hex.EncodeToString(cluster[:]), ClusterIncarnation: hex.EncodeToString(incarnation[:]), TopologyRecoveryEpoch: 1, AllocationGeneration: 1, ShardIncarnation: hex.EncodeToString(roles[ri].group.ShardIncarnation[:]), GroupID: hex.EncodeToString(roles[ri].group.GroupID[:]), MemberID: uint64(mi + 1), StoreID: hex.EncodeToString(roles[ri].stores[mi][:]), Table: roles[ri].table, CreateTable: roles[ri].create, Authority: bootstrapAuthority{1, 1, 1, 1, 1, 1}, WAL: bootstrapWAL{"kubernetes-test-key", "/run/secrets/vibedb/wal-key-source", "development-only", raftstore.DefaultMaxFileBytes, raftstore.DefaultMaxRecordBytes, raftstore.DefaultMaxRecords, raftstore.DefaultMaxEntries, raftstore.DefaultMaxLiveBytes}, Apply: apply, Listeners: bootstrapListeners{"0.0.0.0:7411", "0.0.0.0:7511", "0.0.0.0:7611", "0.0.0.0:7711"}, TLS: bootstrapTLS{"/run/secrets/vibedb/" + certName, "/run/secrets/vibedb/" + keyName, "/run/secrets/vibedb/cluster-roots.pem", bootstrapOID}, AuthorizationPolicy: "/bootstrap/authorization-policy.vibejson", SplitControl: bootstrapSplit{4096, 64 << 20, grants, 8, 32 << 20}, Members: members}
+			p := bootstrapPrepare{Root: "/var/lib/vibedb/member", Distribution: string(roles[ri].distribution), Shard: string(roles[ri].shard), ClusterID: hex.EncodeToString(cluster[:]), ClusterIncarnation: hex.EncodeToString(incarnation[:]), TopologyRecoveryEpoch: 1, AllocationGeneration: 1, ShardIncarnation: hex.EncodeToString(roles[ri].group.ShardIncarnation[:]), GroupID: hex.EncodeToString(roles[ri].group.GroupID[:]), MemberID: uint64(mi + 1), StoreID: hex.EncodeToString(roles[ri].stores[mi][:]), Table: roles[ri].table, CreateTable: roles[ri].create, Authority: bootstrapAuthority{1, 1, 1, 1, 1, 1}, WAL: bootstrapWAL{"kubernetes-test-key", "/run/secrets/vibedb/wal-key-source", "development-only", raftstore.DefaultMaxFileBytes, raftstore.DefaultMaxRecordBytes, raftstore.DefaultMaxRecords, raftstore.DefaultMaxEntries, raftstore.DefaultMaxLiveBytes}, Apply: apply, Listeners: bootstrapListeners{"0.0.0.0:7411", "0.0.0.0:7511", "0.0.0.0:7611", "0.0.0.0:7711"}, TLS: bootstrapTLS{"/run/secrets/vibedb/" + certName, "/run/secrets/vibedb/" + keyName, "/run/secrets/vibedb/cluster-roots.pem", bootstrapOID, peerKeys[ri]}, AuthorizationPolicy: "/bootstrap/authorization-policy.vibejson", SplitControl: bootstrapSplit{4096, 64 << 20, grants, 8, 32 << 20}, Members: members}
 			raw, e := vibejson.Marshal(&p)
 			if e != nil {
 				return nil, state, e
@@ -559,7 +580,11 @@ func buildBootstrap(c BootstrapConfig, random io.Reader) ([]byte, bootstrapState
 	if err != nil {
 		return nil, state, err
 	}
-	gatewayConfig := map[string][]byte{"cluster.vibejson": catalogRaw, "authorization-policy.vibejson": policyRaw, "replica-control.vibejson": controlRaw}
+	directoryRaw, err := bootstrapNodeDirectory(roles, state, certs, random)
+	if err != nil {
+		return nil, state, err
+	}
+	gatewayConfig := map[string][]byte{"cluster.vibejson": catalogRaw, "authorization-policy.vibejson": policyRaw, "replica-control.vibejson": controlRaw, "initial-node-directory.vibejson": directoryRaw}
 	manifests["authorization-policy.vibejson"] = policyRaw
 	var out bytes.Buffer
 	appendConfigMap(&out, c.Namespace, c.ManifestConfigMap, manifests)
@@ -809,4 +834,66 @@ func bootstrapReplicaControl(roles [3]bootstrapRole, state bootstrapState) ([]by
 	sort.Slice(m.ShardEndpoints, func(i, j int) bool { return m.ShardEndpoints[i].Node < m.ShardEndpoints[j].Node })
 	sort.Slice(m.Candidates, func(i, j int) bool { return m.Candidates[i].Node < m.Candidates[j].Node })
 	return vibejson.Marshal(&m)
+}
+
+func bootstrapNodeDirectory(roles [3]bootstrapRole, state bootstrapState, certs []bootstrapCert, random io.Reader) ([]byte, error) {
+	records := make([]gateway.NodeRecord, 0, 9)
+	certificateDigest := func(index int) ([32]byte, error) {
+		block, _ := pem.Decode(certs[index].cert)
+		if block == nil {
+			return [32]byte{}, errors.New("bootstrap: missing service certificate")
+		}
+		certificate, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return [32]byte{}, err
+		}
+		return sha256.Sum256(certificate.RawSubjectPublicKeyInfo), nil
+	}
+	for ri := range roles {
+		for mi := 0; mi < 3; mi++ {
+			host := fmt.Sprintf("vibedb-%s-%d.vibedb-%s-peer", roles[ri].name, mi, roles[ri].name)
+			pin, err := certificateDigest(ri*3 + mi)
+			if err != nil {
+				return nil, err
+			}
+			record := gateway.NodeRecord{NodeID: roles[ri].nodes[mi], Incarnation: 1, ServiceKeyDigest: replication.Digest(pin),
+				DataEndpoint: distribution.EndpointID(host + ":7411"), NativeEndpoint: distribution.EndpointID(host + ":7511"), ControlEndpoint: distribution.EndpointID(host + ":7711"),
+				DataAddress: host + ":7411", NativeAddress: host + ":7511", ControlAddress: host + ":7711",
+				FailureDomain: host, Roles: gateway.NodeRoleStorage | gateway.NodeRoleControl, Lifecycle: gateway.NodeActive, Revision: 1, CatalogGeneration: 1}
+			if ri == 0 {
+				record.Roles |= gateway.NodeRoleCatalog
+			}
+			records = append(records, record)
+		}
+	}
+	gatewayPin, err := certificateDigest(9)
+	if err != nil {
+		return nil, err
+	}
+	var gatewayNode rafttransport.NodeID
+	rawNode, err := hex.DecodeString(state.GatewayNodeID)
+	if err != nil || len(rawNode) != len(gatewayNode) {
+		return nil, errors.New("bootstrap: invalid gateway identity")
+	}
+	copy(gatewayNode[:], rawNode)
+	serviceID, err := readBootstrap16(random)
+	if err != nil {
+		return nil, err
+	}
+	sessionID, err := readBootstrap16(random)
+	if err != nil {
+		return nil, err
+	}
+	records[0].Roles |= gateway.NodeRoleGateway
+	records[0].GatewayEndpoint = "vibedb-gateway-0.vibedb-gateway-peer:7401"
+	records[0].GatewayAddress = string(records[0].GatewayEndpoint)
+	records[0].Gateway = gateway.GatewayIdentity{NodeID: gatewayNode, Incarnation: 1, ServiceKeyDigest: replication.Digest(gatewayPin),
+		ServiceID: serviceID, SessionID: sessionID, SessionRevision: 1, ParticipantDigest: replication.Digest(sha256.Sum256(sessionID[:]))}
+	sort.Slice(records, func(i, j int) bool { return bytes.Compare(records[i].NodeID[:], records[j].NodeID[:]) < 0 })
+	for _, record := range records {
+		if !record.Valid() {
+			return nil, errors.New("bootstrap: invalid initial physical directory")
+		}
+	}
+	return vibejson.Marshal(&records)
 }

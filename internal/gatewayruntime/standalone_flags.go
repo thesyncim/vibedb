@@ -16,6 +16,7 @@ import (
 // no gateway assembly of its own.
 func runServe(args []string) (exitCode int) {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	initialDirectory := fs.String("initial-node-directory", "", "canonical trusted initial physical-node directory for first bootstrap")
 	catalog := fs.String("catalog", "", "path to the persisted catalog generation")
 	var tableCatalogs repeatedFlag
 	fs.Var(&tableCatalogs, "register-table-catalog", "authenticated provisioned single-table catalog to register before serving (repeatable)")
@@ -120,7 +121,7 @@ func runServe(args []string) (exitCode int) {
 		*maxNativeScatterConcurrency, *hotShardCapacity, *hotShardInterval,
 		*replicaControlManifestPath, *backupRepositoryPath, *backupMaxBackups,
 		*backupMaxArtifacts, *backupMaxArtifactBytes, *backupMaxDiskBytes,
-		*controllerInterval, *schemaRolloutPlan, *schemaRolloutOnce,
+		*controllerInterval, *schemaRolloutPlan, *schemaRolloutOnce, *initialDirectory,
 	)
 	if !handled {
 		return 2
