@@ -409,7 +409,7 @@ func RF3CapacityNodeFromOwner(
 		return replicacontrol.NodeCapacity{}, errors.Join(replicacontrol.ErrCapacityUnavailable, err)
 	}
 	metrics := budget.Metrics()
-	if metrics.ActiveCapacity <= 0 || metrics.Active > metrics.ActiveCapacity || metrics.ActiveCapacity > math.MaxUint32 || metrics.Active > math.MaxUint32 {
+	if metrics.ActiveCapacity <= 0 || metrics.Active > metrics.ActiveCapacity || uint64(metrics.ActiveCapacity) > math.MaxUint32 || uint64(metrics.Active) > math.MaxUint32 {
 		return replicacontrol.NodeCapacity{}, replicacontrol.ErrCapacityUnavailable
 	}
 	reportRevision := revision.Add(1)
@@ -451,7 +451,7 @@ func RF3CapacityNodeFromPhysical(
 	}
 	metrics := budget.Metrics()
 	if metrics.ActiveCapacity <= 0 || metrics.Active > metrics.ActiveCapacity ||
-		metrics.ActiveCapacity > math.MaxUint32 || metrics.Active > math.MaxUint32 {
+		uint64(metrics.ActiveCapacity) > math.MaxUint32 || uint64(metrics.Active) > math.MaxUint32 {
 		return replicacontrol.NodeCapacity{}, replicacontrol.ErrCapacityUnavailable
 	}
 	reportRevision := revision.Add(1)

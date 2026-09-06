@@ -1469,3 +1469,11 @@ func rf3CommandPeerKeysJSON(credential rf3testfixture.Credential) []byte {
 	}
 	return append([]byte(`,"peer_keys":`), encoded...)
 }
+
+func rf3CommandPeerKeys(credential rf3testfixture.Credential) []rf3ManifestPeerKey {
+	pins := make([]rf3ManifestPeerKey, len(credential.PeerKeys))
+	for i, pin := range credential.PeerKeys {
+		pins[i] = rf3ManifestPeerKey{NodeID: pin.NodeID, KeyDigest: pin.KeyDigest}
+	}
+	return pins
+}

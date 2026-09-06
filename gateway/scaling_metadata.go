@@ -1057,9 +1057,6 @@ func cloneScalingIntent(intent ScalingIntent) ScalingIntent {
 	intent.Request.Targets = slices.Clone(intent.Request.Targets)
 	intent.OutstandingMoves = slices.Clone(intent.OutstandingMoves)
 	intent.Blockers = slices.Clone(intent.Blockers)
-	if intent.Evidence.Digest != (replication.Digest{}) {
-		intent.Evidence.Digest = intent.Evidence.Digest
-	}
 	return intent
 }
 

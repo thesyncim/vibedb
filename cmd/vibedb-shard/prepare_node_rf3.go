@@ -295,7 +295,7 @@ func provisionRF3Node(input prepareRF3NodeManifest) (resultErr error) {
 		return 0
 	}(), Gateway: nodeGateway, Listeners: firstListeners, TLS: firstTLS, AuthorizationPolicy: firstPolicy,
 		GatewaySeeds: firstGatewaySeeds, ReadAuthority: firstReadAuthority, ReplicaControl: nodeReplica,
-		SplitControl: nodeSplit}
+		SplitControl: nodeSplit, Groups: make([]persistedRF3NodeGroup, 0, len(manifests))}
 	runtime.NodeLog.KeyMaterialPath = filepath.Join(input.Root, "node-key")
 	for _, manifest := range manifests {
 		manifest.WAL.KeyMaterialPath = runtime.NodeLog.KeyMaterialPath
