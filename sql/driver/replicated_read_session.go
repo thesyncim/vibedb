@@ -98,7 +98,10 @@ func (a *ReplicatedApply) newDataReadSessionInto(
 		state.filterSource = query.NewFileFilterSource(state)
 		transaction.tables[name] = state
 	}
-	reader.conn = conn{db: a.database, directWritesFenced: true, exec: query.Exec{Options: options}}
+	// Only the reuse lane supplies a reader, after scrubbing and charging its
+	// bounded result arrays. Preserve those arrays across the fresh cut bind.
+	result := reader.conn.exec.Result
+	reader.conn = conn{db: a.database, directWritesFenced: true, exec: query.Exec{Options: options, Result: result}}
 	transaction.conn = &reader.conn
 	reader.conn.tx = transaction
 	reader.session = Session{

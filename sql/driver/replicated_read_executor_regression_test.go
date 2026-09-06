@@ -312,6 +312,7 @@ func TestReplicatedReadReusePointAlternatesHitsMissesAndUpdates(t *testing.T) {
 	paramTypes := []ParamType{ParamTypeText}
 	options := replicatedReadReuseOptions()
 	primaryPath := []byte(f.base.UserPrimaryKey)
+	var resultBacking *query.ResultColumn
 	for iteration, row := range []int{0, 1, 0, 1} {
 		document := f.rows[row].doc
 		key := testReplicatedApplyKey(t, f.database, document)
@@ -322,6 +323,11 @@ func TestReplicatedReadReusePointAlternatesHitsMissesAndUpdates(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		result := &lease.slot.reader.conn.exec.Result
+		if resultBacking != nil && (cap(result.Columns) == 0 || &result.Columns[:1][0] != resultBacking) {
+			_ = lease.Abort(errors.New("point result backing lost"))
+			t.Fatal("fresh point bind discarded retained result arrays")
+		}
 		var cursor Cursor
 		if err := lease.QueryCandidateKeysInto(
 			ctx, []any{f.rows[row].id}, primaryPath, [][]byte{key}, &cursor,
@@ -329,6 +335,7 @@ func TestReplicatedReadReusePointAlternatesHitsMissesAndUpdates(t *testing.T) {
 			_ = lease.Abort(err)
 			t.Fatal(err)
 		}
+		resultBacking = &result.Columns[0]
 		if !cursor.Next() || cursor.Cell(0).String() != fmt.Sprintf(`"%s"`, f.rows[row].id) {
 			_ = cursor.Close()
 			_ = lease.Abort(errors.New("point result mismatch"))

@@ -22,12 +22,13 @@ import (
 // prepared-statement cache. A request that cannot acquire a slot continues on
 // the ordinary constructor/prepare path.
 const (
-	replicatedReadReuseSlotCount = 8
-	replicatedReadReuseMaxBytes  = 2 << 20
-	replicatedReadReuseMaxSQL    = 64 << 10
-	replicatedReadReuseMaxParams = 32
-	replicatedReadReuseMaxPath   = 256
-	replicatedReadReuseMaxLimit  = 256
+	replicatedReadReuseSlotCount   = 8
+	replicatedReadReuseMaxBytes    = 2 << 20
+	replicatedReadReuseMaxSQL      = 64 << 10
+	replicatedReadReuseMaxParams   = 32
+	replicatedReadReuseMaxPath     = 256
+	replicatedReadReuseMaxLimit    = 256
+	replicatedReadReuseResultBytes = 128 << 10
 )
 
 var (
@@ -698,7 +699,7 @@ func retainedReplicatedReadSlotBytes(
 	// The private map is created once with exactly one Prepared and never
 	// grows. 1 KiB conservatively covers its header and single runtime group.
 	// Charge the entire fixed cache per slot too, so even one parked slot
-	// includes its control storage. No Exec workspace survives detachment.
+	// includes its control storage. Only scrubbed result arrays survive Exec detachment and are charged below.
 	const fixed = int64(unsafe.Sizeof(ReplicatedReadSession{})) +
 		int64(unsafe.Sizeof(Prepared{})) + int64(unsafe.Sizeof(replicatedReadReuseCache{})) +
 		int64(unsafe.Sizeof(catalogLayoutIdentity{})) + 1024
@@ -712,6 +713,9 @@ func retainedReplicatedReadSlotBytes(
 		}
 		retained += value
 		return true
+	}
+	if !add(slot.reader.conn.exec.Result.ReuseCapacityBytes()) {
+		return 0, false
 	}
 	if !add(int64(len(slot.key.sql))) || !add(int64(len(slot.key.primaryPath))) {
 		return 0, false
@@ -1131,8 +1135,13 @@ func (c *conn) resetForReadReuse() error {
 		return ErrCursorOpen
 	}
 	var err error
+	// Preserve only bounded, scrubbed result arrays. The executor, snapshots,
+	// cancellation pointers and all source-specific scratch are still released.
+	result := c.exec.Result
+	c.exec.Result = query.Result{}
+	result.ResetForReuse(replicatedReadReuseResultBytes)
 	c.exec.Release()
-	c.exec = query.Exec{}
+	c.exec = query.Exec{Result: result}
 	err = errors.Join(err, c.joinSnapshot.Close(), c.insertSnapshot.Close())
 	c.args = nil
 	c.pointDocs = store.Segment{}
