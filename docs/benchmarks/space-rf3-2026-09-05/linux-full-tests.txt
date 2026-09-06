@@ -1,0 +1,3 @@
+ok  	github.com/thesyncim/vibedb/internal/raftstore	59.677s
+ok  	github.com/thesyncim/vibedb/internal/raftstore/seglog	55.315s
+ok  	github.com/thesyncim/vibedb/internal/raftmember	68.339s

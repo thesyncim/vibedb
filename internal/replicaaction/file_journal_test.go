@@ -57,12 +57,12 @@ func TestFileJournalPersistsCASAndDetachedBytesAcrossRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	request.Command[0] ^= 0xff
-	got, err := journal.ReadReplicaAction(context.Background(), running.Request.Operation)
+	got, err := journal.ReadReplicaAction(context.Background(), running.Request.Operation, running.Request.Kind)
 	if err != nil || !equalRecord(got, running) {
 		t.Fatalf("record=%+v err=%v", got, err)
 	}
 	got.Request.Command[0] ^= 0xff
-	again, err := journal.ReadReplicaAction(context.Background(), running.Request.Operation)
+	again, err := journal.ReadReplicaAction(context.Background(), running.Request.Operation, running.Request.Kind)
 	if err != nil || !equalRecord(again, running) {
 		t.Fatalf("read aliased journal bytes: %+v %v", again, err)
 	}
@@ -81,7 +81,7 @@ func TestFileJournalPersistsCASAndDetachedBytesAcrossRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = journal.Close() })
-	got, err = journal.ReadReplicaAction(context.Background(), complete.Request.Operation)
+	got, err = journal.ReadReplicaAction(context.Background(), complete.Request.Operation, complete.Request.Kind)
 	if err != nil || !equalRecord(got, complete) {
 		t.Fatalf("recovered=%+v err=%v", got, err)
 	}
@@ -119,7 +119,7 @@ func TestFileJournalFailsClosedAtRetentionBound(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer journal.Close()
-	if _, err = journal.ReadReplicaAction(context.Background(), first.Request.Operation); err != nil {
+	if _, err = journal.ReadReplicaAction(context.Background(), first.Request.Operation, first.Request.Kind); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -223,5 +223,45 @@ func TestFileJournalRejectsSymlinksAndSecondWriter(t *testing.T) {
 	}
 	if _, err = OpenFileJournal(linkedPath+string(os.PathSeparator), 1); !errors.Is(err, ErrControl) {
 		t.Fatalf("root symlink err=%v", err)
+	}
+}
+
+func TestFileJournalSeparatesMoveActionsAcrossRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "actions")
+	journal, err := OpenFileJournal(path, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownership := actionFixture(t, OwnershipTransition)
+	retirement := actionFixture(t, SourceRetirement)
+	retirement.Operation = ownership.Operation
+	for _, request := range []Request{ownership, retirement} {
+		if err := journal.PublishReplicaAction(t.Context(), 0, Record{Request: request, Revision: 1, State: Running}); err != nil {
+			t.Fatalf("publish kind %d for shared move: %v", request.Kind, err)
+		}
+	}
+	if err := journal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	journal, err = OpenFileJournal(path, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer journal.Close()
+	for _, request := range []Request{ownership, retirement} {
+		record, err := journal.ReadReplicaAction(t.Context(), request.Operation, request.Kind)
+		if err != nil || !equalRequest(record.Request, request) {
+			t.Fatalf("recover kind %d: %v", request.Kind, err)
+		}
+		changed := record
+		changed.Request.Step[0] ^= 1
+		changed.Revision, changed.State = 2, Complete
+		if err := journal.PublishReplicaAction(t.Context(), 1, changed); !errors.Is(err, ErrConflict) {
+			t.Fatalf("changed action accepted: %v", err)
+		}
+		record.Revision, record.State = 2, Complete
+		if err := journal.PublishReplicaAction(t.Context(), 1, record); err != nil {
+			t.Fatal(err)
+		}
 	}
 }

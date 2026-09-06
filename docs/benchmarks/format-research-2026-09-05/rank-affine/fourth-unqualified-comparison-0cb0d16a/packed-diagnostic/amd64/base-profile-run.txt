@@ -1,0 +1,6 @@
+goos: linux
+goarch: amd64
+pkg: github.com/thesyncim/vibedb/store/durable
+cpu: AMD EPYC 7763 64-Core Processor                
+BenchmarkUnifiedPartitionedScanAllBytes/workers=1-4         	     175	  34196253 ns/op	 727.60 MB/s	       0 B/op	       0 allocs/op
+PASS

@@ -1,0 +1,84 @@
+File: packed-read-head.test
+Build ID: 1b3af87dac01989100c1af1954bbbf5154f9f01d
+Type: cpu
+Time: 2026-09-05 22:28:46 UTC
+Duration: 6.64s, Total samples = 6.71s (101.02%)
+Showing nodes accounting for 6.08s, 90.61% of 6.71s total
+Dropped 147 nodes (cum <= 0.03s)
+      flat  flat%   sum%        cum   cum%
+     2.15s 32.04% 32.04%      2.15s 32.04%  github.com/thesyncim/vibedb/store/durable.touchUnifiedScanAllBytes (inline)
+     0.91s 13.56% 45.60%      1.03s 15.35%  github.com/thesyncim/vibedb/internal/storeio.(*CompactPrimaryScanDecoder).appendDictionaryFragment
+     0.67s  9.99% 55.59%      2.93s 43.67%  github.com/thesyncim/vibedb/internal/storeio.(*CompactPrimaryScanDecoder).appendValue
+     0.33s  4.92% 60.51%      5.97s 88.97%  github.com/thesyncim/vibedb/internal/storeio.(*PrimaryGraphCursor).visitCurrentLeafInlineUntil
+     0.33s  4.92% 65.42%      0.33s  4.92%  runtime.memmove
+     0.29s  4.32% 69.75%      0.29s  4.32%  github.com/thesyncim/vibedb/internal/storeio.appendCompactDate
+     0.25s  3.73% 73.47%      0.32s  4.77%  github.com/thesyncim/vibedb/internal/storeio.appendCanonicalUint6
+     0.21s  3.13% 76.60%      0.60s  8.94%  github.com/thesyncim/vibedb/internal/storeio.(*compactStreamSequentialState).appendRankAffine
+     0.18s  2.68% 79.28%      0.56s  8.35%  github.com/thesyncim/vibedb/internal/storeio.(*compactStreamSequentialState).appendValue
+     0.10s  1.49% 80.77%      0.20s  2.98%  github.com/thesyncim/vibedb/internal/storeio.(*compactStreamSequentialState).appendArithmeticPrefixKey
+     0.08s  1.19% 81.97%      0.10s  1.49%  github.com/thesyncim/vibedb/internal/storeio.(*PrimaryGraphCursor).sequentialShapeOrdinal
+     0.07s  1.04% 83.01%      0.10s  1.49%  github.com/thesyncim/vibedb/internal/storeio.(*compactStreamView).dictionaryEntry (inline)
+     0.07s  1.04% 84.05%      0.07s  1.04%  github.com/thesyncim/vibedb/internal/storeio.appendCanonicalUint6.func1 (inline)
+     0.06s  0.89% 84.95%      0.06s  0.89%  encoding/binary.littleEndian.Uint16 (inline)
+     0.05s  0.75% 85.69%      0.37s  5.51%  github.com/thesyncim/vibedb/internal/storeio.(*CompactPrimaryScanDecoder).appendKey
+     0.05s  0.75% 86.44%      0.10s  1.49%  github.com/thesyncim/vibedb/internal/storeio.(*CompactPrimaryScanDecoder).prepare
+     0.05s  0.75% 87.18%      0.08s  1.19%  github.com/thesyncim/vibedb/internal/storeio.(*compactStreamScratch).measureAlphabet
+     0.05s  0.75% 87.93%      2.19s 32.64%  github.com/thesyncim/vibedb/store/durable.benchmarkUnifiedPartitionedScanAllBytes.func1.1.1
+     0.04s   0.6% 88.52%      0.07s  1.04%  github.com/thesyncim/vibedb/internal/storeio.appendFixedUint8
+     0.03s  0.45% 88.97%      0.10s  1.49%  github.com/thesyncim/vibedb/internal/storeio.appendCanonicalObject
+     0.02s   0.3% 89.27%      0.07s  1.04%  github.com/thesyncim/vibejson.(*TapeBuilder).stringFast
+     0.02s   0.3% 89.57%      0.04s   0.6%  github.com/thesyncim/vibejson.scanJSONStringFastFrom
+     0.02s   0.3% 89.87%      0.05s  0.75%  runtime.scanObject
+     0.01s  0.15% 90.01%      0.09s  1.34%  github.com/thesyncim/vibedb/internal/storeio.AppendCanonicalInt
+     0.01s  0.15% 90.16%      0.10s  1.49%  github.com/thesyncim/vibedb/internal/storeio.appendCanonicalEntry
+     0.01s  0.15% 90.31%      0.10s  1.49%  github.com/thesyncim/vibejson.(*TapeBuilder).WalkFast
+     0.01s  0.15% 90.46%      0.05s  0.75%  github.com/thesyncim/vibejson/x/scanner.validUTF8NoLineSeparatorGeneric
+     0.01s  0.15% 90.61%      0.06s  0.89%  github.com/thesyncim/vibejson/x/scanner.validUTF8NoLineSeparatorRuntime
+         0     0% 90.61%      0.04s   0.6%  fmt.Sprintf
+         0     0% 90.61%      0.05s  0.75%  github.com/thesyncim/vibedb/internal/benchcorpus.Corpus
+         0     0% 90.61%      0.05s  0.75%  github.com/thesyncim/vibedb/internal/benchcorpus.Generate
+         0     0% 90.61%         6s 89.42%  github.com/thesyncim/vibedb/internal/storeio.(*PrimaryGraphCursor).VisitInlineDecoded
+         0     0% 90.61%      0.10s  1.49%  github.com/thesyncim/vibedb/internal/storeio.(*UnifiedPrimaryLeafBuilder).extractPrimaryGraph (inline)
+         0     0% 90.61%      0.10s  1.49%  github.com/thesyncim/vibedb/internal/storeio.(*UnifiedPrimaryLeafBuilder).extractRows
+         0     0% 90.61%      0.16s  2.38%  github.com/thesyncim/vibedb/internal/storeio.(*compactStreamScratch).encodeShape (inline)
+         0     0% 90.61%      0.16s  2.38%  github.com/thesyncim/vibedb/internal/storeio.(*compactStreamScratch).encodeShapeWithRankContext
+         0     0% 90.61%      0.10s  1.49%  github.com/thesyncim/vibedb/internal/storeio.AppendCanonicalIndexed
+         0     0% 90.61%      0.05s  0.75%  github.com/thesyncim/vibedb/internal/storeio.IndexIsCanonical
+         0     0% 90.61%      0.26s  3.87%  github.com/thesyncim/vibedb/internal/storeio.PlanPrimaryGraphSummarized (inline)
+         0     0% 90.61%      0.16s  2.38%  github.com/thesyncim/vibedb/internal/storeio.buildPreparedCompactPrimaryGraphStripePayload
+         0     0% 90.61%      0.16s  2.38%  github.com/thesyncim/vibedb/internal/storeio.buildPreparedCompactPrimaryStripePayloadRows
+         0     0% 90.61%      0.05s  0.75%  github.com/thesyncim/vibedb/internal/storeio.canonicalCheckEntry
+         0     0% 90.61%      0.05s  0.75%  github.com/thesyncim/vibedb/internal/storeio.canonicalCheckObject
+         0     0% 90.61%      0.26s  3.87%  github.com/thesyncim/vibedb/internal/storeio.planCompactPrimaryLeavesSummarized
+         0     0% 90.61%      0.16s  2.38%  github.com/thesyncim/vibedb/internal/storeio.planCompactPrimaryLeavesSummarized.func1 (inline)
+         0     0% 90.61%      0.26s  3.87%  github.com/thesyncim/vibedb/internal/storeio.planPrimaryGraph
+         0     0% 90.61%      0.10s  1.49%  github.com/thesyncim/vibedb/internal/storeio.prepareCompactPrimaryGraphStripe
+         0     0% 90.61%      0.06s  0.89%  github.com/thesyncim/vibedb/store.(*Builder).Append
+         0     0% 90.61%      0.04s   0.6%  github.com/thesyncim/vibedb/store.(*Builder).Build (inline)
+         0     0% 90.61%      0.04s   0.6%  github.com/thesyncim/vibedb/store.(*Builder).build
+         0     0% 90.61%      0.04s   0.6%  github.com/thesyncim/vibedb/store.(*Builder).compactDocuments
+         0     0% 90.61%      0.04s   0.6%  github.com/thesyncim/vibedb/store.storeChunkEach
+         0     0% 90.61%      0.04s   0.6%  github.com/thesyncim/vibedb/store.storeChunkVector.Each (inline)
+         0     0% 90.61%         6s 89.42%  github.com/thesyncim/vibedb/store/durable.(*Snapshot).RangeBoundsRawBuffer
+         0     0% 90.61%         6s 89.42%  github.com/thesyncim/vibedb/store/durable.(*Snapshot).rangePrimaryGraphBuffer
+         0     0% 90.61%      0.61s  9.09%  github.com/thesyncim/vibedb/store/durable.BenchmarkUnifiedPartitionedScanAllBytes
+         0     0% 90.61%      0.45s  6.71%  github.com/thesyncim/vibedb/store/durable.CreateFromPrimary
+         0     0% 90.61%      0.61s  9.09%  github.com/thesyncim/vibedb/store/durable.benchmarkUnifiedPartitionedScanAllBytes
+         0     0% 90.61%      6.01s 89.57%  github.com/thesyncim/vibedb/store/durable.benchmarkUnifiedPartitionedScanAllBytes.func1.1
+         0     0% 90.61%      0.16s  2.38%  github.com/thesyncim/vibedb/store/durable.canonicalizePrimaryBulkRecords
+         0     0% 90.61%      0.45s  6.71%  github.com/thesyncim/vibedb/store/durable.createFromPrimaryGraphRecords
+         0     0% 90.61%      0.10s  1.49%  github.com/thesyncim/vibedb/store/durable.unifiedBenchSource
+         0     0% 90.61%      0.55s  8.20%  github.com/thesyncim/vibedb/store/durable.unifiedBenchStore (inline)
+         0     0% 90.61%      0.55s  8.20%  github.com/thesyncim/vibedb/store/durable.unifiedBenchStoreWith
+         0     0% 90.61%      0.06s  0.89%  github.com/thesyncim/vibedb/store/durable.unifiedCompetitiveCorpus
+         0     0% 90.61%      0.11s  1.64%  github.com/thesyncim/vibejson.(*TapeBuilder).parseFast
+         0     0% 90.61%      0.08s  1.19%  github.com/thesyncim/vibejson.BuildIndexOptions (inline)
+         0     0% 90.61%      0.11s  1.64%  github.com/thesyncim/vibejson.buildIndexOptions
+         0     0% 90.61%      0.06s  0.89%  github.com/thesyncim/vibejson/x/scanner.ValidUTF8NoLineSeparator (inline)
+         0     0% 90.61%      0.06s  0.89%  github.com/thesyncim/vibejson/x/scanner.validUTF8NoLineSeparatorFast (inline)
+         0     0% 90.61%      0.05s  0.75%  runtime.gcBgMarkWorker
+         0     0% 90.61%      0.05s  0.75%  runtime.gcBgMarkWorker.func2
+         0     0% 90.61%      0.05s  0.75%  runtime.gcDrain
+         0     0% 90.61%      0.07s  1.04%  runtime.systemstack
+         0     0% 90.61%      0.64s  9.54%  testing.(*B).run1.func1
+         0     0% 90.61%      0.64s  9.54%  testing.(*B).runN

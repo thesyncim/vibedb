@@ -166,6 +166,9 @@ func (distributedRunnerPayloads) Cleanup(context.Context, DurableRequestLedgerHo
 type distributedRunnerWaves struct {
 	ledger               *distributedRunnerLedger
 	fault                distributedtxn.ReplicatedOperation
+	retireBeforeAdvance  bool
+	retiredRecord        *replicatedstate.TransactionRecoveryRecord
+	retirementCommand    []byte
 	prepareConflict      bool
 	manifestPayload      []byte
 	decisionSettled      bool
@@ -189,6 +192,9 @@ func (waves *distributedRunnerWaves) ReadTransactionRecovery(_ context.Context, 
 			ID: read.ID, Role: distributedtxn.ReplicatedRoleTarget,
 			State: uint8(distributedtxn.TargetPrepared),
 		}}}, nil
+	}
+	if waves.retiredRecord != nil {
+		return ReplicatedTransactionRecoveryResult{Complete: true, Records: []replicatedstate.TransactionRecoveryRecord{*waves.retiredRecord}}, nil
 	}
 	if len(waves.manifestPayload) == 0 {
 		return ReplicatedTransactionRecoveryResult{}, ErrDurableRequestUnresolved
@@ -259,6 +265,20 @@ func (waves *distributedRunnerWaves) RunStagedWave(_ context.Context, wave Durab
 	transition, cursor, err := wave.Settle(observation)
 	if err != nil {
 		return DurableRequestWaveResult{}, err
+	}
+	if control.Operation == distributedtxn.ReplicatedRetireCoordinator && waves.retireBeforeAdvance {
+		if waves.retiredRecord == nil {
+			waves.fault = distributedtxn.ReplicatedOperationInvalid
+			waves.retirementCommand = bytes.Clone(wave.Command)
+			waves.retiredRecord = &replicatedstate.TransactionRecoveryRecord{ID: control.ID, Role: control.Role,
+				State: uint8(distributedtxn.CoordinatorRetired), Revision: control.ExpectedRevision + 1,
+				PayloadKind: distributedtxn.ReplicatedPayloadManifestCoordinator, PayloadCount: 3,
+				AffectedRows: max(int64(0), affected), AffectedRowsValid: affected >= 0}
+			return DurableRequestWaveResult{}, errLifecycleRunnerFault
+		}
+		if !bytes.Equal(waves.retirementCommand, wave.Command) {
+			return DurableRequestWaveResult{}, errors.New("retirement retry changed exact command")
+		}
 	}
 	waves.ledger.head.NextStepOrdinal = wave.Ordinal + 1
 	waves.ledger.head.Revision++
@@ -503,7 +523,7 @@ func testDurableRequestDistributedRunnerResumesProtocolCuts(t *testing.T, stable
 			execution, release := bindTypedExecutionPin(t, execution, route)
 			head.NextStepOrdinal, head.Revision = 0, 1
 			ledger := &distributedRunnerLedger{head: head}
-			waves := &distributedRunnerWaves{ledger: ledger, fault: fault, prepareConflict: aborted, wantMembershipStable: stable}
+			waves := &distributedRunnerWaves{ledger: ledger, fault: fault, prepareConflict: aborted, wantMembershipStable: stable, retireBeforeAdvance: fault == distributedtxn.ReplicatedRetireCoordinator}
 			terminal := &distributedRunnerTerminal{}
 			authority := DurableRequestTerminalAuthority{CommitCursor: commitCursor, AbortCursor: abortCursor, AckToken: requestledger.AckToken{1}, Release: release}
 			runner, err := newDurableRequestDistributedRunner(ledger, distributedRunnerResolver{base: route}, waves, distributedRunnerPayloads{}, terminal, distributedRunnerAuthority{value: authority})
@@ -512,6 +532,28 @@ func testDurableRequestDistributedRunnerResumesProtocolCuts(t *testing.T, stable
 			}
 			if _, err = runner.RunTyped(context.Background(), execution); !errors.Is(err, errLifecycleRunnerFault) {
 				t.Fatalf("first run err=%v", err)
+			}
+			if waves.retiredRecord != nil {
+				original := *waves.retiredRecord
+				for name, corrupt := range map[string]func(*replicatedstate.TransactionRecoveryRecord){
+					"request": func(record *replicatedstate.TransactionRecoveryRecord) { record.ID[0]++ },
+					"role": func(record *replicatedstate.TransactionRecoveryRecord) {
+						record.Role = distributedtxn.ReplicatedRoleTarget
+					},
+					"revision": func(record *replicatedstate.TransactionRecoveryRecord) { record.Revision = 1 },
+					"targets":  func(record *replicatedstate.TransactionRecoveryRecord) { record.PayloadCount++ },
+					"rows":     func(record *replicatedstate.TransactionRecoveryRecord) { record.AffectedRows++ },
+					"outcome": func(record *replicatedstate.TransactionRecoveryRecord) {
+						record.AffectedRowsValid = !record.AffectedRowsValid
+					},
+				} {
+					*waves.retiredRecord = original
+					corrupt(waves.retiredRecord)
+					if _, err := runner.RunTyped(context.Background(), execution); !errors.Is(err, ErrDurableRequestConflict) {
+						t.Fatalf("retirement %s corruption accepted: %v", name, err)
+					}
+				}
+				*waves.retiredRecord = original
 			}
 			if err = execution.Targets.Reset(); err != nil {
 				t.Fatal(err)

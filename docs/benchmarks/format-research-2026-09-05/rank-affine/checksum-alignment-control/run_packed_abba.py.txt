@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""Run original and stabilized packed durable cases in separate ABBA blocks."""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import subprocess
+import time
+
+
+PACKED_PATTERN = (
+    r"^BenchmarkUnifiedPartitionedScanAllBytes(Million|HighCardinality)?$"
+    r"/workers=(1|4)$|^BenchmarkUnifiedGetRawHighCardinalityAllBytes$"
+)
+CASES = [
+    "BenchmarkUnifiedPartitionedScanAllBytes/workers=1",
+    "BenchmarkUnifiedPartitionedScanAllBytes/workers=4",
+    "BenchmarkUnifiedPartitionedScanAllBytesMillion/workers=1",
+    "BenchmarkUnifiedPartitionedScanAllBytesMillion/workers=4",
+    "BenchmarkUnifiedPartitionedScanAllBytesHighCardinality/workers=1",
+    "BenchmarkUnifiedPartitionedScanAllBytesHighCardinality/workers=4",
+    "BenchmarkUnifiedGetRawHighCardinalityAllBytes",
+]
+EXPECTED_PREFIXES = [
+    "BenchmarkUnifiedPartitionedScanAllBytes/workers=1-",
+    "BenchmarkUnifiedPartitionedScanAllBytes/workers=4-",
+    "BenchmarkUnifiedPartitionedScanAllBytesMillion/workers=1-",
+    "BenchmarkUnifiedPartitionedScanAllBytesMillion/workers=4-",
+    "BenchmarkUnifiedPartitionedScanAllBytesHighCardinality/workers=1-",
+    "BenchmarkUnifiedPartitionedScanAllBytesHighCardinality/workers=4-",
+    "BenchmarkUnifiedGetRawHighCardinalityAllBytes-",
+]
+
+
+def sha256(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--original-base", required=True, type=Path)
+    parser.add_argument("--original-candidate", required=True, type=Path)
+    parser.add_argument("--stabilized-base", required=True, type=Path)
+    parser.add_argument("--stabilized-candidate", required=True, type=Path)
+    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--runs", type=int, default=6)
+    parser.add_argument("--benchtime", default="200ms")
+    parser.add_argument("--gomaxprocs", type=int, default=4)
+    args = parser.parse_args()
+    if not 3 <= args.runs <= 30:
+        parser.error("runs must be 3..30")
+    args.output.mkdir(parents=True, exist_ok=False)
+    for variant in ("original", "stabilized"):
+        (args.output / variant).mkdir()
+    binaries = {
+        "original-base": args.original_base.resolve(),
+        "original-candidate": args.original_candidate.resolve(),
+        "stabilized-base": args.stabilized_base.resolve(),
+        "stabilized-candidate": args.stabilized_candidate.resolve(),
+    }
+    metadata = {
+        "purpose": "diagnostic packed durable comparison; no qualification gate",
+        "runs": args.runs,
+        "benchtime": args.benchtime,
+        "gomaxprocs": args.gomaxprocs,
+        "packed_cases": CASES,
+        "benchmark_regexp": PACKED_PATTERN,
+        "order": "each variant is base/candidate/candidate/base per block (ABBA)",
+        "variants": ["original", "stabilized"],
+        "platform": platform.platform(),
+        "binary_sha256": {name: sha256(path) for name, path in binaries.items()},
+        "started_unix_seconds": time.time(),
+    }
+    (args.output / "environment.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    env = dict(os.environ, GOMAXPROCS=str(args.gomaxprocs))
+    rows = []
+    for block in range(1, args.runs + 1):
+        for variant in ("original", "stabilized"):
+            order = ("base", "candidate", "candidate", "base")
+            block_dir = args.output / variant
+            for position, arm in enumerate(order, 1):
+                name = f"{variant}-{arm}"
+                binary = binaries[name]
+                log = block_dir / f"block-{block:02d}-{position:02d}-{arm}.txt"
+                command = [
+                    str(binary),
+                    "-test.run=^$",
+                    f"-test.bench={PACKED_PATTERN}",
+                    f"-test.benchtime={args.benchtime}",
+                    "-test.count=1",
+                    f"-test.cpu={args.gomaxprocs}",
+                    "-test.timeout=15m",
+                ]
+                started = time.monotonic()
+                with log.open("w") as stream:
+                    result = subprocess.run(command, env=env, stdout=stream, stderr=subprocess.STDOUT)
+                output = log.read_text()
+                missing = [
+                    prefix for prefix in EXPECTED_PREFIXES
+                    if not any(line.startswith(prefix) for line in output.splitlines())
+                ]
+                if missing:
+                    raise RuntimeError(f"{log} omitted expected benchmark cases: {missing}")
+                row = {
+                    "block": block,
+                    "variant": variant,
+                    "position": position,
+                    "arm": arm,
+                    "binary": name,
+                    "binary_sha256": sha256(binary),
+                    "log": str(log.relative_to(args.output)),
+                    "command": command,
+                    "returncode": result.returncode,
+                    "elapsed_seconds": time.monotonic() - started,
+                }
+                rows.append(row)
+                (args.output / "runs.json").write_text(json.dumps(rows, indent=2) + "\n")
+                if result.returncode:
+                    raise RuntimeError(f"{log} failed with {result.returncode}")
+                print(f"completed {variant} ABBA block {block}/{args.runs} {arm} {position}/4", flush=True)
+
+
+if __name__ == "__main__":
+    main()

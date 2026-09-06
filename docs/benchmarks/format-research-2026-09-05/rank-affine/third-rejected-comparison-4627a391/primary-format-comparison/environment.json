@@ -1,0 +1,14 @@
+{
+  "started_unix_seconds": 1788644397.99299,
+  "platform": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
+  "runs_per_arm": 6,
+  "benchtime": "200ms",
+  "gomaxprocs": 1,
+  "order": "base/candidate odd pairs; candidate/base even pairs",
+  "binary_sha256": {
+    "base-storeio": "022a2f4ef0349a884540489fd229e9834a38d318c90f80d04a9c16e790af76ad",
+    "base-durable": "5887f9c6c0334b50e66ff6ced10105cc73ae0b9d14381493a84692e0c1068307",
+    "candidate-storeio": "45d26f7d88d37f4868dce7f3e50d153afd939209ba5763960294343ef61b62d0",
+    "candidate-durable": "3de3b66611d337c55b3593bb668b95c50dacebec8c405ee7b44aed681b42b519"
+  }
+}

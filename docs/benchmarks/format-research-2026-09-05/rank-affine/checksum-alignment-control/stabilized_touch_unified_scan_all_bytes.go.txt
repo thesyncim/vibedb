@@ -1,0 +1,12 @@
+func touchUnifiedScanAllBytes(value []byte) byte {
+	var sink uint64
+	for len(value) >= 8 {
+		sink ^= binary.LittleEndian.Uint64(value[:8])
+		value = value[8:]
+	}
+	for _, b := range value {
+		sink ^= uint64(b)
+	}
+	return byte(sink) ^ byte(sink>>8) ^ byte(sink>>16) ^ byte(sink>>24) ^
+		byte(sink>>32) ^ byte(sink>>40) ^ byte(sink>>48) ^ byte(sink>>56)
+}

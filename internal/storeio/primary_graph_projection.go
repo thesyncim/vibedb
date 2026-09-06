@@ -312,7 +312,7 @@ func (c *PrimaryGraphCursor) VisitProjectedMatchWithReserve(
 								}
 								var fieldOK bool
 								valueScratch, fieldOK = compactProjectionFieldAt(
-									&stream.view, rowOrdinal, valueScratch,
+									&stream.view, stream.view.shapeCoordinate(row, rowOrdinal), valueScratch,
 									&fields[field], &stream.state,
 								)
 								if !fieldOK {
@@ -339,7 +339,7 @@ func (c *PrimaryGraphCursor) VisitProjectedMatchWithReserve(
 										}
 										var fieldOK bool
 										valueScratch, fieldOK = compactProjectionFieldAt(
-											&stream.view, rowOrdinal, valueScratch,
+											&stream.view, stream.view.shapeCoordinate(row, rowOrdinal), valueScratch,
 											&fields[field], &stream.state,
 										)
 										if !fieldOK {
@@ -471,7 +471,7 @@ func (v *CompactPrimaryStripeView) visitResolvedProjectionRange(
 			}
 			var ok bool
 			valueScratch, ok = compactProjectionFieldAt(
-				&stream.view, ordinal, valueScratch, &fields[field], &stream.state,
+				&stream.view, stream.view.shapeCoordinate(row, ordinal), valueScratch, &fields[field], &stream.state,
 			)
 			if !ok {
 				// Native and dictionary fields do not touch valueScratch. The

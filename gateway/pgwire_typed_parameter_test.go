@@ -4,6 +4,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"unsafe"
 
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/pgwire"
@@ -360,5 +361,37 @@ func TestPostgresParameterTypeConversionsPreserveExactStringDomains(t *testing.T
 		[]sqldriver.ParamType{sqldriver.ParamTypeInvalid}, 1,
 	); err == nil || !strings.Contains(err.Error(), "invalid parameter type hint") {
 		t.Fatalf("invalid type = %v", err)
+	}
+}
+
+func TestPostgreSQLReadCacheOwnsBorrowedRequestSQL(t *testing.T) {
+	session, _ := newTypedPostgreSQLSession(t)
+	const original = "SELECT id FROM messages WHERE id = 'first'"
+	const next = "SELECT id FROM messages WHERE id = 'other'"
+	buffer := []byte(original)
+	borrowed := unsafe.String(unsafe.SliceData(buffer), len(buffer))
+	first, err := session.Prepare(t.Context(), borrowed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	compiled := first.(*postgresStatement).compiled
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// The wire reader reuses its request storage after a simple query completes.
+	copy(buffer, next)
+	s := session.(*postgresSession)
+	if s.readCache.text != original || compiled.SQL() != original {
+		t.Fatal("reused request storage changed the cached SQL identity")
+	}
+	second, err := session.Prepare(t.Context(), borrowed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.(*postgresStatement).compiled == compiled {
+		t.Fatal("changed SQL reused routing compiled for the previous key")
+	}
+	if err := second.Close(); err != nil {
+		t.Fatal(err)
 	}
 }

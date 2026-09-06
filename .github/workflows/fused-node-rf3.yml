@@ -35,6 +35,25 @@ on:
       - 'internal/rf3testfixture/**'
       - 'sql/**'
   workflow_dispatch:
+    inputs:
+      format_base:
+        description: 'Optional baseline revision for paired primary-format qualification'
+        required: false
+        type: string
+      format_suite:
+        description: 'Benchmark suite to run against the selected baseline'
+        required: false
+        type: choice
+        options:
+          - primary
+          - query
+          - all
+        default: primary
+      format_diagnostics:
+        description: 'Run checksum-alignment, stabilized-sink, ABBA, and profile diagnostics after all-suite timing'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -47,6 +66,336 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  primary-format-performance:
+    if: github.event_name == 'workflow_dispatch' && inputs.format_base != ''
+    name: Paired primary-format performance
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      FORMAT_SUITE: ${{ inputs.format_suite || 'primary' }}
+      FORMAT_DIAGNOSTICS: ${{ inputs.format_diagnostics || false }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.27'
+      - name: Build the identical benchmark source against both revisions
+        env:
+          FORMAT_BASE: ${{ inputs.format_base }}
+        run: |
+          set -euo pipefail
+          base="$(git rev-parse --verify "${FORMAT_BASE}^{commit}")"
+          suite="${FORMAT_SUITE:-primary}"
+          case "${suite}" in
+            primary)
+              selected_packages=(storeio durable)
+              ;;
+            query)
+              selected_packages=(query)
+              ;;
+            all)
+              selected_packages=(storeio durable query)
+              ;;
+            *)
+              echo "unsupported format suite: ${suite}" >&2
+              exit 2
+              ;;
+          esac
+          build="${RUNNER_TEMP}/primary-format-build"
+          mkdir -p "${build}"
+          git rev-parse HEAD > "${build}/candidate-revision.txt"
+          printf '%s\n' "${base}" > "${build}/base-revision.txt"
+          printf '%s\n' "${suite}" > "${build}/format-suite.txt"
+          go version > "${build}/go-version.txt"
+          go env > "${build}/go-env.txt"
+          lscpu > "${build}/cpu.txt"
+          df -T -B1 "${RUNNER_TEMP}" > "${build}/filesystem.txt"
+
+          build_package() {
+            local arm="$1"
+            local package_name="$2"
+            local package_path
+            case "${package_name}" in
+              storeio) package_path=./internal/storeio ;;
+              durable) package_path=./store/durable ;;
+              query) package_path=./query ;;
+              *) echo "unsupported benchmark package: ${package_name}" >&2; exit 2 ;;
+            esac
+            go test -c -o "${build}/${arm}-${package_name}.test" "${package_path}"
+          }
+
+          for package_name in "${selected_packages[@]}"; do
+            build_package candidate "${package_name}"
+          done
+          git worktree add --detach "${RUNNER_TEMP}/primary-format-base" "${base}"
+          if [[ "${suite}" == primary || "${suite}" == all ]]; then
+            cp internal/storeio/compact_rank_format_bench_test.go \
+              "${RUNNER_TEMP}/primary-format-base/internal/storeio/"
+          fi
+          if [[ "${suite}" == query || "${suite}" == all ]]; then
+            test -f query/rank_affine_format_bench_test.go
+            cp query/rank_affine_format_bench_test.go \
+              "${RUNNER_TEMP}/primary-format-base/query/"
+          fi
+          cd "${RUNNER_TEMP}/primary-format-base"
+          for package_name in "${selected_packages[@]}"; do
+            build_package base "${package_name}"
+          done
+          if [[ "${FORMAT_DIAGNOSTICS}" == "true" ]]; then
+            test "${suite}" = all
+            repo="${GITHUB_WORKSPACE}"
+            candidate="$(git -C "${repo}" rev-parse HEAD)"
+            diagnostics="${RUNNER_TEMP}/format-diagnostics"
+            diagnostic_build="${diagnostics}/build"
+            mkdir -p "${diagnostic_build}"
+            control_source="${diagnostics}/control-source"
+            mkdir -p "${control_source}"
+            control_docs="${repo}/docs/benchmarks/format-research-2026-09-05/rank-affine/checksum-alignment-control"
+            cp "${control_docs}/checksum_alignment_control.go.txt" "${control_source}/checksum_alignment_control.go"
+            cp "${control_docs}/checksum_alignment_control_test.go.txt" "${control_source}/checksum_alignment_control_test.go"
+            cp "${control_docs}/checksum_alignment_control_amd64.s.txt" "${control_source}/checksum_alignment_control_amd64.s"
+            cat > "${control_source}/go.mod" <<'EOF'
+          module checksum-alignment-control
+
+          go 1.27
+          EOF
+            go -C "${control_source}" test -c -o "${diagnostic_build}/checksum-alignment-control.test" .
+            cp "${build}/candidate-durable.test" "${diagnostic_build}/original-candidate-durable.test"
+            cp "${build}/base-durable.test" "${diagnostic_build}/original-base-durable.test"
+            cp "${build}/candidate-query.test" "${diagnostic_build}/original-candidate-query.test"
+            cp "${build}/base-query.test" "${diagnostic_build}/original-base-query.test"
+            cp "${build}/candidate-storeio.test" "${diagnostic_build}/original-candidate-storeio.test"
+            cp "${build}/base-storeio.test" "${diagnostic_build}/original-base-storeio.test"
+            cd "${repo}"
+            git worktree add --detach "${diagnostics}/stabilized-candidate" "${candidate}"
+            git worktree add --detach "${diagnostics}/stabilized-base" "${base}"
+            for arm in candidate base; do
+              stabilized="${diagnostics}/stabilized-${arm}"
+              source="${stabilized}/store/durable/store_file_unified_bench_test.go"
+              replacement="${control_docs}/stabilized_touch_unified_scan_all_bytes.go.txt"
+              test_source="${stabilized}/store/durable/diagnostic_stabilized_touch_test.go"
+              python3 - "${source}" "${replacement}" "${test_source}" \
+                "${control_docs}/stabilized_touch_unified_scan_all_bytes_test.go.txt" <<'PY'
+          from pathlib import Path
+          import sys
+
+          source, replacement, test_source, test_fixture = map(Path, sys.argv[1:])
+          text = source.read_text()
+          old = """func touchUnifiedScanAllBytes(value []byte) byte {
+          \tvar sink byte
+          \tfor _, b := range value {
+          \t\tsink ^= b
+          \t}
+          \treturn sink
+          }
+          """
+          if text.count(old) != 1:
+              raise SystemExit(f"expected one canonical touch helper in {source}")
+          if text.count('"encoding/binary"') != 0:
+              raise SystemExit(f"encoding/binary already present in {source}")
+          text = text.replace('import (\n', 'import (\n\t"encoding/binary"\n', 1)
+          source.write_text(text.replace(old, replacement.read_text(), 1))
+          test_source.write_text(test_fixture.read_text())
+          PY
+              gofmt -w "${source}" "${test_source}"
+              cd "${stabilized}"
+              go test -c -o "${diagnostic_build}/stabilized-${arm}-durable.test" ./store/durable
+              expected_revision="${candidate}"
+              if [[ "${arm}" == base ]]; then expected_revision="${base}"; fi
+              test "$(git rev-parse HEAD)" = "${expected_revision}"
+              printf '%s\n' "${expected_revision}" > "${diagnostics}/stabilized-${arm}-revision.txt"
+            done
+            cd "${repo}"
+            printf '%s\n' "${candidate}" > "${diagnostics}/candidate-revision.txt"
+            printf '%s\n' "${base}" > "${diagnostics}/base-revision.txt"
+            go version > "${diagnostics}/go-version.txt"
+            go env > "${diagnostics}/go-env.txt"
+            lscpu > "${diagnostics}/cpu.txt"
+            sha256sum "${diagnostic_build}"/*.test > "${diagnostics}/binary-sha256.txt"
+            sha256sum \
+              "${control_docs}/checksum_alignment_control.go.txt" \
+              "${control_docs}/checksum_alignment_control_test.go.txt" \
+              "${control_docs}/checksum_alignment_control_amd64.s.txt" \
+              "${control_docs}/stabilized_touch_unified_scan_all_bytes.go.txt" \
+              "${control_docs}/stabilized_touch_unified_scan_all_bytes_test.go.txt" \
+              "${control_docs}/run_control_pairs.py.txt" \
+              "${control_docs}/run_packed_abba.py.txt" \
+              "${control_docs}/verify_control.py.txt" > "${diagnostics}/frozen-source-sha256.txt"
+          fi
+      - name: Qualify the decoder and changed native paths
+        run: |
+          set -euo pipefail
+          case "${FORMAT_SUITE:-primary}" in
+            primary|all)
+              "${RUNNER_TEMP}/primary-format-build/candidate-storeio.test" -test.run='^TestCompact' -test.count=1 -test.timeout=5m
+              ;;
+          esac
+      - name: Smoke-check the query harness outside paired timing
+        if: env.FORMAT_SUITE == 'query' || env.FORMAT_SUITE == 'all'
+        run: |
+          set -euo pipefail
+          smoke_args=(-test.run='^$' -test.bench='^BenchmarkRankAffineQueryFormat$' -test.benchtime=1x -test.count=1 -test.cpu=1 -test.timeout=8m)
+          "${RUNNER_TEMP}/primary-format-build/base-query.test" "${smoke_args[@]}"
+          env VIBEDB_EXPECT_RANK_AFFINE_QUERY=1 "${RUNNER_TEMP}/primary-format-build/candidate-query.test" "${smoke_args[@]}"
+      - name: Run six alternating paired trials without overlapping builds
+        run: |
+          python3 scripts/bench/run-primary-format-comparison.py \
+            --binaries "${RUNNER_TEMP}/primary-format-build" \
+            --output "${RUNNER_TEMP}/primary-format-comparison" \
+            --suite "${FORMAT_SUITE}"
+      - name: Validate control oracle and stabilized durable probes
+        if: inputs.format_diagnostics == true
+        run: |
+          set -euo pipefail
+          test "${FORMAT_SUITE}" = all
+          diagnostics="${RUNNER_TEMP}/format-diagnostics"
+          build="${diagnostics}/build"
+          control_docs="${GITHUB_WORKSPACE}/docs/benchmarks/format-research-2026-09-05/rank-affine/checksum-alignment-control"
+          "${build}/checksum-alignment-control.test" \
+            -test.run='^TestXorAlignmentOracle$' -test.count=1 -test.timeout=5m
+          for arm in base candidate; do
+            "${build}/stabilized-${arm}-durable.test" \
+              -test.run='^TestDiagnosticStabilizedTouchUnifiedScanAllBytes$' \
+              -test.count=1 -test.timeout=5m
+          done
+          go tool nm -size -sort address "${build}/checksum-alignment-control.test" \
+            > "${diagnostics}/control-nm.txt"
+          go tool objdump -s 'xorAt24|xorAt56' "${build}/checksum-alignment-control.test" \
+            > "${diagnostics}/control-objdump.txt"
+          python3 "${control_docs}/verify_control.py.txt" \
+            "${diagnostics}/control-nm.txt" "${diagnostics}/control-objdump.txt" \
+            "${diagnostics}/control-verification.json"
+      - name: Run six alternating checksum control pairs
+        if: inputs.format_diagnostics == true
+        run: |
+          set -euo pipefail
+          test "${FORMAT_SUITE}" = all
+          diagnostics="${RUNNER_TEMP}/format-diagnostics"
+          control_docs="${GITHUB_WORKSPACE}/docs/benchmarks/format-research-2026-09-05/rank-affine/checksum-alignment-control"
+          python3 "${control_docs}/run_control_pairs.py.txt" \
+            --binary "${diagnostics}/build/checksum-alignment-control.test" \
+            --output "${diagnostics}/control-pairs" \
+            --runs 6 --benchtime 200ms
+      - name: Run original and stabilized packed durable ABBA blocks
+        if: inputs.format_diagnostics == true
+        run: |
+          set -euo pipefail
+          test "${FORMAT_SUITE}" = all
+          diagnostics="${RUNNER_TEMP}/format-diagnostics"
+          control_docs="${GITHUB_WORKSPACE}/docs/benchmarks/format-research-2026-09-05/rank-affine/checksum-alignment-control"
+          python3 "${control_docs}/run_packed_abba.py.txt" \
+            --original-base "${diagnostics}/build/original-base-durable.test" \
+            --original-candidate "${diagnostics}/build/original-candidate-durable.test" \
+            --stabilized-base "${diagnostics}/build/stabilized-base-durable.test" \
+            --stabilized-candidate "${diagnostics}/build/stabilized-candidate-durable.test" \
+            --output "${diagnostics}/packed-abba" \
+            --runs 6 --benchtime 200ms --gomaxprocs 4
+      - name: Run post-timing profiles and spelling-equality disassembly
+        if: inputs.format_diagnostics == true
+        run: |
+          set -euo pipefail
+          test "${FORMAT_SUITE}" = all
+          diagnostics="${RUNNER_TEMP}/format-diagnostics"
+          build="${diagnostics}/build"
+          profiles="${diagnostics}/profiles"
+          repo="${GITHUB_WORKSPACE}"
+          mkdir -p "${profiles}"
+          storeio_bench_source="${repo}/internal/storeio/compact_rank_format_bench_test.go"
+          query_bench_source="${repo}/query/rank_affine_format_bench_test.go"
+          test -f "${storeio_bench_source}"
+          test -f "${query_bench_source}"
+          grep -Fq 'for _, name := range []string{"low", "high", "late-miss", "negative", "unrelated", "single"} {' "${storeio_bench_source}"
+          grep -Fq 'name: "rank-affine-sparse"' "${query_bench_source}"
+          grep -Fq 'name: "projection-mixed"' "${query_bench_source}"
+          sha256sum "${storeio_bench_source}" "${query_bench_source}" \
+            > "${profiles}/profile-source-sha256.txt"
+          run_profile() {
+            local arm="$1"
+            local label="$2"
+            local suite="$3"
+            local pattern="$4"
+            local expected="$5"
+            local binary="${build}/original-${arm}-${suite}.test"
+            local profile="${profiles}/${arm}-${label}.pprof"
+            local log="${profiles}/${arm}-${label}.log"
+            local command=("${binary}" -test.run='^$' "-test.bench=${pattern}" \
+              -test.benchtime=5s -test.count=1 -test.cpu=1 -test.timeout=15m \
+              "-test.cpuprofile=${profile}")
+            {
+              printf 'arm=%s label=%s suite=%s pattern=%s expected=%s\n' \
+                "${arm}" "${label}" "${suite}" "${pattern}" "${expected}"
+              printf 'binary_sha256='; sha256sum "${binary}"
+              printf 'command='; printf '%q ' "${command[@]}"; printf '\n'
+              if [[ "${suite}" == query && "${arm}" == candidate ]]; then
+                VIBEDB_EXPECT_RANK_AFFINE_QUERY=1 GOMAXPROCS=1 "${command[@]}"
+              else
+                env -u VIBEDB_EXPECT_RANK_AFFINE_QUERY GOMAXPROCS=1 "${command[@]}"
+              fi
+            } > "${log}" 2>&1
+            test -s "${profile}"
+            test "$(grep -Ec "${expected}" "${log}")" -eq 1
+          }
+          for arm in base candidate; do
+            run_profile "${arm}" query-ordinary-numeric-eq query \
+              '^BenchmarkRankAffineQueryFormat$/ordinary-fixed-shape/numeric-eq$' \
+              '^BenchmarkRankAffineQueryFormat/ordinary-fixed-shape/numeric-eq(-[0-9]+)?[[:space:]]'
+            run_profile "${arm}" durable-update-batch100 durable \
+              '^BenchmarkFileStoreBatchWrite$/update/batch=100$' \
+              '^BenchmarkFileStoreBatchWrite/update/batch=100(-[0-9]+)?[[:space:]]'
+            run_profile "${arm}" storeio-single-point storeio \
+              '^BenchmarkCompactRankFormat$/single/Point$' \
+              '^BenchmarkCompactRankFormat/single/Point(-[0-9]+)?[[:space:]]'
+            run_profile "${arm}" storeio-unrelated-point storeio \
+              '^BenchmarkCompactRankFormat$/unrelated/Point$' \
+              '^BenchmarkCompactRankFormat/unrelated/Point(-[0-9]+)?[[:space:]]'
+            run_profile "${arm}" query-sparse-projection-mixed query \
+              '^BenchmarkRankAffineQueryFormat$/rank-affine-sparse/projection-mixed$' \
+              '^BenchmarkRankAffineQueryFormat/rank-affine-sparse/projection-mixed(-[0-9]+)?[[:space:]]'
+          done
+          for arm in base candidate; do
+            binary="${build}/original-${arm}-query.test"
+            go tool nm -size -sort address "${binary}" \
+              | grep 'countPrefixIntegerEqual' \
+              > "${profiles}/${arm}-query-countPrefixIntegerEqual.nm" || true
+            if go tool objdump -s 'countPrefixIntegerEqual' "${binary}" \
+              > "${profiles}/${arm}-query-countPrefixIntegerEqual.objdump"; then
+              printf 'objdump_status=present\n' \
+                > "${profiles}/${arm}-query-countPrefixIntegerEqual.status"
+            else
+              printf 'objdump_status=absent-or-inlined\n' \
+                > "${profiles}/${arm}-query-countPrefixIntegerEqual.status"
+            fi
+          done
+          {
+            printf 'candidate_revision='; cat "${diagnostics}/candidate-revision.txt"
+            printf 'base_revision='; cat "${diagnostics}/base-revision.txt"
+            printf 'profile_cpu=1\nprofile_gomaxprocs=1\nprofile_benchtime=5s\n'
+            printf 'profile_labels= query-ordinary-numeric-eq durable-update-batch100 storeio-single-point storeio-unrelated-point query-sparse-projection-mixed\n'
+            printf '%s\n' \
+              'pattern.query-ordinary-numeric-eq=^BenchmarkRankAffineQueryFormat$/ordinary-fixed-shape/numeric-eq$' \
+              'pattern.durable-update-batch100=^BenchmarkFileStoreBatchWrite$/update/batch=100$' \
+              'pattern.storeio-single-point=^BenchmarkCompactRankFormat$/single/Point$' \
+              'pattern.storeio-unrelated-point=^BenchmarkCompactRankFormat$/unrelated/Point$' \
+              'pattern.query-sparse-projection-mixed=^BenchmarkRankAffineQueryFormat$/rank-affine-sparse/projection-mixed$'
+            printf 'profile_source_files=%s,%s\n' "${storeio_bench_source}" "${query_bench_source}"
+            cat "${profiles}/profile-source-sha256.txt"
+            for log in "${profiles}"/*.log; do
+              printf 'log=%s\n' "${log##*/}"
+              grep '^command=' "${log}"
+            done
+            cat "${diagnostics}/binary-sha256.txt"
+          } > "${profiles}/metadata.txt"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: primary-format-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/primary-format-comparison
+            ${{ runner.temp }}/primary-format-build/*.txt
+          if-no-files-found: error
+          retention-days: 30
   qualify:
     name: Ubuntu fused RF3 physical-node qualification
     runs-on: ubuntu-latest

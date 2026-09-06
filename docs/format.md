@@ -66,6 +66,17 @@ contains:
 - exact-index catalogs, term leaves, posting structures, and build state;
 - free/retired extent state and snapshot/reclamation metadata.
 
+Compact scalar streams can encode a nonzero arithmetic sequence by physical
+leaf rank when that sequence remains exact across JSON-shape gaps. The bounded
+descriptor stores the base, step and exact prefix/suffix/decimal-width spelling;
+its count names the complete leaf domain. Other streams continue to use the
+ordinal within their shape. Readers validate the complete arithmetic domain,
+and native predicates intersect derived ranks with the existing shape table.
+Scalar replacement can retain unaffected descriptors and replans a changed
+column when the sequence no longer holds. The encoder requires at least 64
+values and uses the descriptor only when the complete encoding wins the
+existing size/scan preference policy.
+
 Overflow values are not transparently compressed or deduplicated. Exact-indexed
 open rebuilds a resident epoch by scanning persisted exact leaves/live rows; an
 indexed open is not metadata-only and its total memory is data-dependent.

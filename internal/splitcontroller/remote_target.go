@@ -103,13 +103,20 @@ func remoteActionTarget(plan *Plan, observed Observation, action Action) (ShardA
 		return ShardActionTarget{}, ErrRemoteExecution
 	}
 	binding := observed.SourceState.Binding
+	member := observed.SourceStatus.MemberID
+	// Artifact recovery may transfer leadership back to the durable artifact
+	// owner. Its pending witness must reach the current leader after election.
+	// Other actions retain the member owning their captured local evidence.
+	if action.Kind == ActionBuildArtifacts {
+		member = 0
+	}
 	result := ShardActionTarget{
 		Group: raftmember.GroupKey{
 			ClusterID: [16]byte(binding.ClusterID), ClusterIncarnation: [16]byte(binding.ClusterIncarnation),
 			TopologyRecoveryEpoch: binding.TopologyRecoveryEpoch,
 			ShardIncarnation:      [16]byte(binding.ShardIncarnation), GroupID: [16]byte(binding.GroupID),
 		},
-		Allocation: binding.AllocationGeneration, Member: observed.SourceStatus.MemberID,
+		Allocation: binding.AllocationGeneration, Member: member,
 		Authority: sqldriver.ReplicatedAuthorityProfile{
 			ActivePolicyGeneration: binding.ActivePolicyGeneration,
 			ProtectionEpoch:        binding.ProtectionEpoch, OwnershipEpoch: binding.OwnershipEpoch,

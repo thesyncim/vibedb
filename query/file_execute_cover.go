@@ -180,10 +180,10 @@ func durableIntegerOrder(op Op) (durable.IntegerOrder, bool) {
 }
 
 // runDirectFileTokenIntegerOrderCount answers the narrow unindexed integer
-// COUNT shape from durable FOR streams. Eligibility is intentionally strict:
+// COUNT shape from eligible compact integer streams. Eligibility is strict:
 // only a plain integer literal and one ordered comparison can enter, and the
 // durable lane declines the whole snapshot if any present target stream is
-// not exact FOR. The generic executor remains authoritative for every other
+// not exact. The generic executor remains authoritative for every other
 // numeric domain and for mixed or mutable storage.
 func (p *plan) runDirectFileTokenIntegerOrderCount(
 	snapshot *durable.Snapshot,
@@ -255,7 +255,7 @@ func (p *plan) runDirectFileTokenIntegerOrderCount(
 // COUNT(*) shape formed by two ordered int64 comparisons on one path. The
 // recognizer has already proved that the comparisons are the complete WHERE
 // predicate; the durable lane then admits the snapshot only when every
-// resolved target stream is exact FOR.
+// resolved target stream is an eligible compact integer stream.
 func (p *plan) runDirectFileTokenIntegerIntervalCount(
 	snapshot *durable.Snapshot,
 	e *Exec,
@@ -320,10 +320,11 @@ func (p *plan) runDirectFileTokenIntegerIntervalCount(
 }
 
 // runDirectFileIntegerExtrema answers unfiltered MIN/MAX aggregates over one
-// named numeric path directly from durable FOR streams. The recognizer proves
+// named numeric path directly from eligible compact integer streams. The
+// recognizer proves
 // that every output uses the same path and that no residual executor work is
 // required; the durable lane then declines the whole snapshot if any present
-// target stream is not an exact, non-wrapping FOR integer stream.
+// target stream is not an exact, non-wrapping compact integer stream.
 func (p *plan) runDirectFileIntegerExtrema(
 	snapshot *durable.Snapshot,
 	e *Exec,
