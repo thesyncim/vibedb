@@ -2,7 +2,9 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"reflect"
+	"sync"
 	"testing"
 
 	"github.com/thesyncim/vibedb/shardservice"
@@ -75,5 +77,51 @@ func TestExecutorPlanCacheReusesPhysicalPlan(t *testing.T) {
 	}
 	if again.generation != entry.generation {
 		t.Fatalf("entry generation changed without a catalog refresh")
+	}
+}
+
+// TestExecutorSharedPlanConcurrentReads hammers one point read from 8
+// goroutines at once: the shared physical plan, the pooled route shells,
+// and the pooled connections (each with its owned frame arena) must serve
+// correct rows and columns under -race with no cross-query contamination.
+func TestExecutorSharedPlanConcurrentReads(t *testing.T) {
+	c := newE2ECluster(t)
+	holder := NewCatalogHolder(c.snapshot(t, 1))
+	client := NewClientWithOptions(c.dialer.dial, ClientOptions{})
+	t.Cleanup(func() { _ = client.Close() })
+	e := NewExecutor(client, holder, Options{})
+
+	key := c.shards[0].keys[0]
+	read := Query{
+		SQL: `SELECT n FROM messages WHERE tenant_id = ?`, Params: stringParams(key), Class: ClassInteractive,
+	}
+	if res, err := e.Query(context.Background(), read); err != nil || len(res.Rows) != 1 {
+		t.Fatalf("prime Query = %d rows, %v; want 1 row", len(res.Rows), err)
+	}
+
+	const workers, perWorker = 8, 25
+	errs := make(chan error, workers*perWorker)
+	var wg sync.WaitGroup
+	for g := 0; g < workers; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < perWorker; i++ {
+				res, err := e.Query(context.Background(), read)
+				if err != nil {
+					errs <- err
+					return
+				}
+				if len(res.Rows) != 1 || len(res.Columns) != 1 || res.Columns[0].Name != "n" {
+					errs <- errors.New("wrong rows or columns under concurrency")
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
 	}
 }
