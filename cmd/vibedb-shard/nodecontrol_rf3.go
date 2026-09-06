@@ -229,10 +229,16 @@ func prepareRF3ManifestFromSpec(
 	manifest.Apply = prepareRF3Apply{MaxSessions: spec.Apply.MaxSessions, RetryWindow: spec.Apply.RetryWindow,
 		MaxCollections: spec.Apply.MaxCollections, MaxDocuments: spec.Apply.MaxDocuments, MaxBytes: spec.Apply.MaxBytes,
 		ShardKey: spec.Apply.ShardKey, RequestLedgerCapacityBytes: spec.Apply.RequestLedgerCapacityBytes,
-		RequestLedgerCleanupReserveBytes: spec.Apply.RequestLedgerCleanupReserveBytes,
-		RequestLedgerRangeStart:          hex.EncodeToString(spec.Apply.RequestLedgerRangeStart[:]),
-		RequestLedgerRangeEnd:            hex.EncodeToString(spec.Apply.RequestLedgerRangeEnd[:]),
-		RequestLedgerRangeIdentity:       hex.EncodeToString(spec.Apply.RequestLedgerRangeIdentity[:])}
+		RequestLedgerCleanupReserveBytes: spec.Apply.RequestLedgerCleanupReserveBytes}
+	// Zero fixed-width wire fields represent an absent ledger profile. Encoding
+	// them as nonempty hex strings would accidentally enable ledger validation.
+	if spec.Apply.RequestLedgerCapacityBytes != 0 || spec.Apply.RequestLedgerCleanupReserveBytes != 0 ||
+		spec.Apply.RequestLedgerRangeStart != ([32]byte{}) || spec.Apply.RequestLedgerRangeEnd != ([32]byte{}) ||
+		spec.Apply.RequestLedgerRangeIdentity != ([32]byte{}) {
+		manifest.Apply.RequestLedgerRangeStart = hex.EncodeToString(spec.Apply.RequestLedgerRangeStart[:])
+		manifest.Apply.RequestLedgerRangeEnd = hex.EncodeToString(spec.Apply.RequestLedgerRangeEnd[:])
+		manifest.Apply.RequestLedgerRangeIdentity = hex.EncodeToString(spec.Apply.RequestLedgerRangeIdentity[:])
+	}
 	manifest.GlobalIndexes = make([]sqldriver.ReplicatedGlobalIndexRelation, len(spec.GlobalIndexes))
 	for index, relation := range spec.GlobalIndexes {
 		manifest.GlobalIndexes[index] = sqldriver.ReplicatedGlobalIndexRelation{Relation: relation.Relation, Table: relation.Table,
