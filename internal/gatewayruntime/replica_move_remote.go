@@ -177,6 +177,18 @@ func (observer gatewayReplicaMoveObserver) ObserveReplicaMove(
 			return rebalance.ReplicatedMoveCut{}, grantErr
 		}
 		cut.RetiringReplicaRetired = !grantFound
+		if !grantFound && transitionKey.Valid() {
+			reader, ok := observer.authority.(interface {
+				DistributionTransitionReleased(context.Context, gateway.GroupTransitionKey) (bool, error)
+			})
+			if !ok {
+				return rebalance.ReplicatedMoveCut{}, gateway.ErrGroupTransition
+			}
+			cut.RetiringReplicaRetired, grantErr = reader.DistributionTransitionReleased(ctx, transitionKey)
+			if grantErr != nil {
+				return rebalance.ReplicatedMoveCut{}, grantErr
+			}
+		}
 	}
 	return cut, nil
 }

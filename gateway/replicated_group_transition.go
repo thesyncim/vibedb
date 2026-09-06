@@ -8,10 +8,11 @@ import (
 	"errors"
 
 	"github.com/thesyncim/vibedb/internal/membershipgrant"
+	"github.com/thesyncim/vibedb/internal/raftservice"
 	vibejson "github.com/thesyncim/vibejson"
 )
 
-const maxGroupTransitionRecordBytes = MaxGroupTransitionIntentBytes + MaxGroupPublicationReceiptBytes + 1024
+const maxGroupTransitionRecordBytes = MaxGroupTransitionIntentBytes + 2*MaxGroupPublicationReceiptBytes + maxReplicatedMembershipGrantBytes + 1024
 
 type distributionTransitionOwnerRecord struct {
 	Key      GroupTransitionKey
@@ -20,11 +21,15 @@ type distributionTransitionOwnerRecord struct {
 }
 
 type groupTransitionRecord struct {
-	Intent  GroupTransitionIntent
-	Receipt GroupPublicationReceipt
+	Intent   GroupTransitionIntent
+	Receipt  GroupPublicationReceipt
+	Grant    membershipgrant.Grant
+	Command  raftservice.CommandFence
+	Previous *GroupPublicationReceipt
 }
 
 type groupTransitionPublication struct {
+	grant       membershipgrant.Grant
 	lease       GroupTransitionOwnerLease
 	intent      GroupTransitionIntent
 	phase       TransitionPhase
@@ -129,7 +134,7 @@ func (authority *ReplicatedCatalogAuthority) readTransitionRecord(ctx context.Co
 	}
 	var record groupTransitionRecord
 	if err = decodeTransitionDocument(result.Value, id, &record, maxGroupTransitionRecordBytes); err != nil ||
-		!record.Intent.Valid() || !record.Receipt.Valid() || record.Intent.Key != record.Receipt.Key || record.Intent.Key.Group != key.Group {
+		!validOwnedTransitionRecord(record) || record.Intent.Key != record.Receipt.Key || record.Intent.Key.Group != key.Group {
 		return groupTransitionRecord{}, result, errors.Join(err, ErrGroupTransition)
 	}
 	return record, result, nil
@@ -248,15 +253,7 @@ func (authority *ReplicatedCatalogAuthority) PublishGroupTransition(ctx context.
 		return GroupPublicationReceipt{}, errors.Join(err, ErrGroupTransition)
 	}
 	publication := &groupTransitionPublication{lease: lease, intent: intent, phase: phase, predecessor: predecessor}
-	if phase == TransitionPhasePreRemove {
-		err = authority.publishReplicaReplacement(ctx, next.Generation()-1, next, grant, publication)
-	} else {
-		version, found := replicaSetVersionForGroup(next, intent.Key.Group)
-		if !found {
-			return GroupPublicationReceipt{}, ErrGroupTransition
-		}
-		err = authority.publishReplicaReplacementPostRemove(ctx, next.Generation()-1, next, grant, version, publication)
-	}
+	err = authority.publishOwnedGroupTransition(ctx, publication, next, grant)
 	if err != nil {
 		return GroupPublicationReceipt{}, err
 	}
@@ -332,20 +329,68 @@ func (authority *ReplicatedCatalogAuthority) groupTransitionMutations(ctx contex
 	}
 	receipt := GroupPublicationReceipt{Key: intent.Key, Phase: publication.phase, PredecessorReceiptDigest: publication.predecessor,
 		PredecessorHeadGeneration: current.Generation(), PredecessorHeadDigest: currentDigest,
-		PredecessorGroupGeneration: current.Generation(), PredecessorGroupHeadDigest: currentDigest,
+		PredecessorGroupGeneration: intent.SourceHeadGeneration, PredecessorGroupHeadDigest: intent.SourceHeadDigest,
 		PredecessorGroupDigest: DigestReplicatedShardDescriptor(before), PredecessorRosterDigest: DigestReplicaRoster(before.Replicas),
 		PredecessorRouteDigest:  DigestRouteFor(current, intent.Key.Distribution, intent.Key.Shard),
 		CommittedHeadGeneration: next.Generation(), CommittedHeadDigest: nextDigest, CommittedGroupGeneration: next.Generation(),
 		CommittedGroupDigest: DigestReplicatedShardDescriptor(after), CommittedRosterDigest: DigestReplicaRoster(after.Replicas),
 		CommittedRouteDigest: DigestRouteFor(next, intent.Key.Distribution, intent.Key.Shard), CommittedCommandFenceDigest: DigestCommandFence(after.Command),
 		CommittedDistributionVersion: manifest.Version(), SourceRouteDigest: intent.SourceRouteDigest, SourceRosterDigest: intent.SourceRosterDigest}
+	if priorReceipt != nil {
+		receipt.PredecessorGroupGeneration = priorReceipt.CommittedGroupGeneration
+		receipt.PredecessorGroupHeadDigest = priorReceipt.CommittedHeadDigest
+	}
 	if err = receipt.ValidateSuccessor(intent, priorReceipt); err != nil {
 		return nil, err
 	}
 	receiptID := transitionDocumentID("move-rec/", intent.Key.Group)
-	raw, err := encodeTransitionDocument(receiptID, groupTransitionRecord{Intent: intent, Receipt: receipt}, maxGroupTransitionRecordBytes)
+	raw, err := encodeTransitionDocument(receiptID, groupTransitionRecord{Intent: intent, Receipt: receipt, Grant: publication.grant, Command: after.Command, Previous: priorReceipt}, maxGroupTransitionRecordBytes)
 	if err != nil {
 		return nil, err
 	}
 	return []NativeMutation{scalingDirectoryMutation(owner, fixedControlPlaneKey(id), owner.Value), scalingDirectoryMutation(priorRaw, fixedControlPlaneKey(receiptID), raw)}, nil
+}
+
+// ReleaseCompletedDistributionTransition resolves the exact retained owner
+// revision, including a prior successful release whose response was lost.
+func (authority *ReplicatedCatalogAuthority) ReleaseCompletedDistributionTransition(ctx context.Context, receipt GroupPublicationReceipt) error {
+	if authority == nil || ctx == nil || !receipt.Valid() || receipt.Phase != TransitionPhasePostRemove {
+		return ErrGroupTransition
+	}
+	ctx, err := authority.authorizedContext(ctx)
+	if err != nil {
+		return err
+	}
+	id := transitionDocumentID("move-own/", receipt.Key.Distribution)
+	raw, err := authority.readRaw(ctx, fixedControlPlaneKey(id), 8192)
+	if err != nil || !raw.Found {
+		return errors.Join(err, ErrTransitionOwnerStale)
+	}
+	var record distributionTransitionOwnerRecord
+	if err = decodeTransitionDocument(raw.Value, id, &record, 8192); err != nil || record.Key != receipt.Key || record.Revision == 0 {
+		return errors.Join(err, ErrTransitionOwnerStale)
+	}
+	return authority.ReleaseDistributionTransition(ctx, ownerLease(record, raw.Value), receipt)
+}
+
+// DistributionTransitionReleased observes the exact retained owner tombstone.
+// An absent grant alone does not prove that retirement finished its cleanup.
+func (authority *ReplicatedCatalogAuthority) DistributionTransitionReleased(ctx context.Context, key GroupTransitionKey) (bool, error) {
+	if authority == nil || ctx == nil || !key.Valid() {
+		return false, ErrGroupTransition
+	}
+	ctx, err := authority.authorizedContext(ctx)
+	if err != nil {
+		return false, err
+	}
+	id := transitionDocumentID("move-own/", key.Distribution)
+	raw, err := authority.readRaw(ctx, fixedControlPlaneKey(id), 8192)
+	if err != nil || !raw.Found {
+		return false, errors.Join(err, ErrTransitionOwnerStale)
+	}
+	var record distributionTransitionOwnerRecord
+	if err = decodeTransitionDocument(raw.Value, id, &record, 8192); err != nil || record.Key != key || record.Revision == 0 {
+		return false, errors.Join(err, ErrTransitionOwnerStale)
+	}
+	return record.Released, nil
 }

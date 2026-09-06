@@ -287,6 +287,7 @@ func OpenGroupPublicationReceipt(raw []byte) (GroupPublicationReceipt, error) {
 // It does not compare the live catalog; the authority does that in its CAS.
 func (receipt GroupPublicationReceipt) ValidateSuccessor(intent GroupTransitionIntent, prior *GroupPublicationReceipt) error {
 	if !intent.Valid() || !receipt.Valid() || receipt.Key != intent.Key ||
+		receipt.PredecessorHeadGeneration == ^uint64(0) || receipt.CommittedHeadGeneration != receipt.PredecessorHeadGeneration+1 || receipt.CommittedGroupGeneration != receipt.CommittedHeadGeneration ||
 		receipt.SourceRouteDigest != intent.SourceRouteDigest ||
 		receipt.SourceRosterDigest != intent.SourceRosterDigest {
 		return ErrGroupTransition
@@ -295,8 +296,9 @@ func (receipt GroupPublicationReceipt) ValidateSuccessor(intent GroupTransitionI
 		if receipt.PredecessorReceiptDigest != ([32]byte{}) || receipt.Phase != TransitionPhasePreRemove {
 			return ErrGroupTransition
 		}
-		if receipt.PredecessorHeadGeneration != intent.SourceHeadGeneration ||
-			receipt.PredecessorHeadDigest != intent.SourceHeadDigest ||
+		if receipt.PredecessorHeadGeneration < intent.SourceHeadGeneration ||
+			(receipt.PredecessorHeadGeneration == intent.SourceHeadGeneration && receipt.PredecessorHeadDigest != intent.SourceHeadDigest) ||
+			receipt.PredecessorGroupGeneration != intent.SourceHeadGeneration || receipt.PredecessorGroupHeadDigest != intent.SourceHeadDigest ||
 			receipt.PredecessorGroupDigest != intent.SourceGroupDigest ||
 			receipt.PredecessorRosterDigest != intent.SourceRosterDigest ||
 			receipt.PredecessorRouteDigest != intent.SourceRouteDigest {
@@ -309,8 +311,8 @@ func (receipt GroupPublicationReceipt) ValidateSuccessor(intent GroupTransitionI
 	}
 	digest, err := prior.ReceiptDigest()
 	if err != nil || digest != receipt.PredecessorReceiptDigest ||
-		receipt.PredecessorHeadGeneration != prior.CommittedHeadGeneration ||
-		receipt.PredecessorHeadDigest != prior.CommittedHeadDigest ||
+		receipt.PredecessorHeadGeneration < prior.CommittedHeadGeneration ||
+		(receipt.PredecessorHeadGeneration == prior.CommittedHeadGeneration && receipt.PredecessorHeadDigest != prior.CommittedHeadDigest) ||
 		receipt.PredecessorGroupDigest != prior.CommittedGroupDigest ||
 		receipt.PredecessorGroupGeneration != prior.CommittedGroupGeneration ||
 		receipt.PredecessorGroupHeadDigest != prior.CommittedHeadDigest ||

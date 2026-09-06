@@ -190,6 +190,15 @@ func (executor *Executor) ExecuteReplicaMove(
 		!validExecutionAction(plan, execution) {
 		return ErrExecutionFence
 	}
+	if key, owned := plan.TransitionKey(); owned && execution.Action.Kind == rebalance.ActionAddLearner {
+		owner, ok := executor.options.Catalog.(gateway.DistributionTransitionOwner)
+		if !ok {
+			return ErrExecutionFence
+		}
+		if _, err := executor.acquireTransitionOwner(ctx, owner, key); err != nil {
+			return err
+		}
+	}
 	switch execution.Action.Kind {
 	case rebalance.ActionAwaitLeader, rebalance.ActionAwaitSnapshotInstall,
 		rebalance.ActionAwaitCatchUp:
@@ -479,7 +488,7 @@ func (executor *Executor) executeReceiptPublication(
 	if !ok || intent.Key.OperationID != [32]byte(operation) {
 		return ErrExecutionFence
 	}
-	lease, err := owner.AcquireDistributionTransition(ctx, intent.Key)
+	lease, err := executor.acquireTransitionOwner(ctx, owner, intent.Key)
 	if err != nil || !lease.Valid() || lease.Distribution != intent.Key.Distribution || lease.OperationID != intent.Key.OperationID {
 		return errors.Join(err, ErrExecutionFence)
 	}
@@ -498,6 +507,12 @@ func (executor *Executor) executeReceiptPublication(
 		return errors.Join(err, ErrExecutionFence)
 	}
 	receipt, err := publisher.PublishGroupTransition(ctx, lease, intent, phase, next, execution.TransitionReceiptDigest)
+	if errors.Is(err, gateway.ErrReplicatedCatalogPending) {
+		if err = executor.options.Catalog.RetryPending(ctx); err != nil {
+			return err
+		}
+		receipt, err = publisher.PublishGroupTransition(ctx, lease, intent, phase, next, execution.TransitionReceiptDigest)
+	}
 	if err != nil {
 		return err
 	}
@@ -562,6 +577,9 @@ func (executor *Executor) executeRetirement(
 		}
 	}
 	if !found {
+		if _, owned := plan.TransitionKey(); owned {
+			return executor.releaseReceiptOwner(ctx, plan)
+		}
 		return nil
 	}
 	err = executor.options.Catalog.FinalizeReplicaReplacement(ctx, grant)
@@ -599,7 +617,19 @@ func (executor *Executor) releaseReceiptOwner(ctx context.Context, plan *rebalan
 	if err != nil || !found || !receipt.Valid() || receipt.Key != key {
 		return errors.Join(err, ErrExecutionFence)
 	}
-	lease, err := owner.AcquireDistributionTransition(ctx, key)
+	if releaser, ok := executor.options.Catalog.(interface {
+		ReleaseCompletedDistributionTransition(context.Context, gateway.GroupPublicationReceipt) error
+	}); ok {
+		err := releaser.ReleaseCompletedDistributionTransition(ctx, receipt)
+		if errors.Is(err, gateway.ErrReplicatedCatalogPending) {
+			if err = executor.options.Catalog.RetryPending(ctx); err != nil {
+				return err
+			}
+			err = releaser.ReleaseCompletedDistributionTransition(ctx, receipt)
+		}
+		return err
+	}
+	lease, err := executor.acquireTransitionOwner(ctx, owner, key)
 	if err != nil || !lease.Valid() {
 		return errors.Join(err, ErrExecutionFence)
 	}
@@ -682,4 +712,15 @@ func validExecutionAction(plan *rebalance.Plan, execution rebalance.ReplicatedMo
 	default:
 		return false
 	}
+}
+
+func (executor *Executor) acquireTransitionOwner(ctx context.Context, owner gateway.DistributionTransitionOwner, key gateway.GroupTransitionKey) (gateway.GroupTransitionOwnerLease, error) {
+	lease, err := owner.AcquireDistributionTransition(ctx, key)
+	if errors.Is(err, gateway.ErrReplicatedCatalogPending) {
+		if err = executor.options.Catalog.RetryPending(ctx); err != nil {
+			return gateway.GroupTransitionOwnerLease{}, err
+		}
+		return owner.AcquireDistributionTransition(ctx, key)
+	}
+	return lease, err
 }

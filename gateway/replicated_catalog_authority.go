@@ -92,6 +92,7 @@ type ReplicatedCatalogAuthority struct {
 	scratch                            []byte
 	pendingCatalog                     *Snapshot
 	pendingExpected                    uint64
+	pendingOwned                       bool
 	pendingGrant                       membershipgrant.Grant
 	pendingReplacementSet              []membershipgrant.Grant
 	pendingReplacementSetPostRemove    bool
@@ -559,6 +560,9 @@ func (authority *ReplicatedCatalogAuthority) publishCertifiedReplicaReplacementR
 func (authority *ReplicatedCatalogAuthority) prepareCertifiedReplicaReplacementRead(
 	ctx context.Context, current, next *Snapshot, nextRaw []byte,
 ) (*Snapshot, func() error, error) {
+	if certified, publish, handled, err := authority.prepareOwnedGroupRead(ctx, current, next, nextRaw); handled || err != nil {
+		return certified, publish, err
+	}
 	if authority == nil || ctx == nil || current == nil || next == nil ||
 		current.Generation() == ^uint64(0) ||
 		next.Generation() != current.Generation()+1 {
@@ -1033,6 +1037,7 @@ func (authority *ReplicatedCatalogAuthority) RetryPending(ctx context.Context) e
 		authority.pendingReplacementSet = nil
 		authority.pendingReplacementSetPostRemove = false
 		authority.pendingExpected = 0
+		authority.pendingOwned = false
 		authority.pendingGrant = membershipgrant.Grant{}
 		authority.pendingPostRemoveReplicaSetVersion = 0
 		return ErrReplicatedCatalogConflict
@@ -1042,12 +1047,14 @@ func (authority *ReplicatedCatalogAuthority) RetryPending(ctx context.Context) e
 		authority.pendingReplacementSet = nil
 		authority.pendingReplacementSetPostRemove = false
 		authority.pendingExpected = 0
+		authority.pendingOwned = false
 		authority.pendingGrant = membershipgrant.Grant{}
 		authority.pendingPostRemoveReplicaSetVersion = 0
 		return ErrReplicatedCatalog
 	}
 	if authority.pendingCatalog != nil {
 		published := authority.pendingCatalog
+		owned := authority.pendingOwned
 		expected := authority.pendingExpected
 		grant := authority.pendingGrant
 		set, setPostRemove := authority.pendingReplacementSet, authority.pendingReplacementSetPostRemove
@@ -1059,12 +1066,19 @@ func (authority *ReplicatedCatalogAuthority) RetryPending(ctx context.Context) e
 		authority.pendingReplacementSet = nil
 		authority.pendingReplacementSetPostRemove = false
 		authority.pendingExpected = 0
+		authority.pendingOwned = false
 		authority.pendingGrant = membershipgrant.Grant{}
 		authority.pendingPostRemoveReplicaSetVersion = 0
 		if err = authority.observePublishedCatalog(ctx, published); err != nil {
 			return err
 		}
-		if len(set) != 0 {
+		if owned {
+			raw, encodeErr := appendReplicatedCatalogDocument(nil, published, maxReplicatedCatalogBytes)
+			if encodeErr != nil {
+				return encodeErr
+			}
+			_, err = authority.publishReadCatalogCut(ctx, published, raw)
+		} else if len(set) != 0 {
 			err = authority.holder.publishReplicaReplacementSetAfter(expected, published, set, setPostRemove)
 		} else if postRemoveReplicaSetVersion != 0 && grant.Valid() {
 			err = authority.holder.publishReplicaReplacementPostRemoveAfter(

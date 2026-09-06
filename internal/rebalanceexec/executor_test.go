@@ -804,3 +804,32 @@ func testExecution(kind rebalance.ActionKind) rebalance.ReplicatedMoveExecution 
 		LeaderTerm: 12, Proof: [32]byte{0x91},
 	}
 }
+
+type pendingTransitionOwner struct {
+	*executorFixture
+	calls []gateway.GroupTransitionKey
+	lease gateway.GroupTransitionOwnerLease
+}
+
+func (owner *pendingTransitionOwner) AcquireDistributionTransition(_ context.Context, key gateway.GroupTransitionKey) (gateway.GroupTransitionOwnerLease, error) {
+	owner.calls = append(owner.calls, key)
+	if owner.retries == 0 {
+		return gateway.GroupTransitionOwnerLease{}, gateway.ErrReplicatedCatalogPending
+	}
+	return owner.lease, nil
+}
+
+func (*pendingTransitionOwner) ReleaseDistributionTransition(context.Context, gateway.GroupTransitionOwnerLease, gateway.GroupPublicationReceipt) error {
+	return nil
+}
+
+func TestOwnerAcquisitionSettlesPendingBeforeRetry(t *testing.T) {
+	_, fixture := newExecutorFixture(t)
+	owner := &pendingTransitionOwner{executorFixture: fixture, lease: gateway.GroupTransitionOwnerLease{Distribution: "data", OperationID: [32]byte{1}, Revision: 2, FenceDigest: [32]byte{3}}}
+	executor := &Executor{options: Options{Catalog: owner}}
+	key := gateway.GroupTransitionKey{Distribution: "data", OperationID: owner.lease.OperationID}
+	lease, err := executor.acquireTransitionOwner(t.Context(), owner, key)
+	if err != nil || lease != owner.lease || fixture.retries != 1 || len(owner.calls) != 2 || owner.calls[0] != key || owner.calls[1] != key {
+		t.Fatalf("lease=%+v calls=%+v retries=%d err=%v", lease, owner.calls, fixture.retries, err)
+	}
+}
