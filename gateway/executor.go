@@ -98,6 +98,12 @@ type Executor struct {
 	metrics           Metrics
 	internalAuthority serviceauthz.Authority
 	pressure          PressureObserver
+	// planMu guards the shared physical-plan cache; see plan_cache.go.
+	// Entries are immutable once published, so concurrent queries copy
+	// entries into per-call working state instead of locking around use.
+	planMu    sync.RWMutex
+	planCache map[string]executorPlanEntry
+	planOrder []string
 }
 
 // NewExecutor returns an executor that dispatches through client and pins
@@ -276,8 +282,15 @@ func (e *Executor) queryWithProfileValidation(
 			attemptContext = context.WithValue(opctx, replicatedSQLSnapshotKey{}, nativeAttempt)
 		}
 		var cache *preparedQueryExecution
+		shared := false
 		if len(preparedCache) != 0 {
 			cache = preparedCache[0]
+		} else if len(q.SQL) <= maxCachedSQLBytes {
+			// The plain path carries no session cache. Plan against a
+			// per-call working copy backed by the shared physical-plan
+			// cache instead of re-optimizing every identical query.
+			shared = true
+			cache = &preparedQueryExecution{}
 		}
 		prepared := (*PreparedPlan)(nil)
 		if cache != nil && cache.generation == snap.Generation() {
@@ -328,6 +341,19 @@ func (e *Executor) queryWithProfileValidation(
 		bound, err := prepared.Bind(args)
 		if err != nil {
 			return nil, err
+		}
+		if shared {
+			// Preload the working copy with the shared physical plan for
+			// this generation. routeContextCached still re-routes every
+			// query from its own bound parameters and revalidates the
+			// cached route shape before reuse.
+			if entry, ok := e.cachedPhysical(q.SQL, snap.Generation()); ok {
+				cache.generation = snap.Generation()
+				cache.routeKind = entry.routeKind
+				cache.targets = entry.targets
+				cache.physical = entry.physical
+				cache.planning = entry.planning
+			}
 		}
 		if useGlobalIndexRead(bound) {
 			if nativeAttempt != nil {
@@ -392,6 +418,9 @@ func (e *Executor) queryWithProfileValidation(
 		}
 		if err != nil {
 			return nil, err
+		}
+		if shared {
+			e.publishPhysical(q.SQL, snap.Generation(), bound, cache)
 		}
 		e.observePressureCalls(pl.calls)
 		e.metrics.observeRoute(pl.kind, len(pl.calls), pl.scatter)

@@ -289,6 +289,11 @@ func (s *Session) prepare(
 	if err := s.ready(ctx); err != nil {
 		return nil, s.fail(err)
 	}
+	// Capture the published layout generation before parsing so a reuse
+	// stamp can prove the lowered plan was built entirely within one
+	// generation. A transaction pins its own begin layout, so preparations
+	// made under a transaction are never stamped reusable.
+	layoutBefore := pinnedLayoutToken(s.conn)
 	var statement *stmt
 	var err error
 	if partialAggregate && len(parameterTypes) != 0 {
@@ -308,11 +313,24 @@ func (s *Session) prepare(
 		return nil, s.fail(err)
 	}
 	prepared := &Prepared{session: s, statement: statement}
+	prepared.pinLayout(layoutBefore)
 	if s.prepared == nil {
 		s.prepared = make(map[*Prepared]struct{})
 	}
 	s.prepared[prepared] = struct{}{}
 	return prepared, nil
+}
+
+// pinnedLayoutToken reports the database's currently published layout
+// generation, or nil when the connection cannot pin one: a transaction
+// observes its begin layout instead of the published generation.
+func pinnedLayoutToken(conn *conn) *catalogLayoutIdentity {
+	if conn == nil || conn.db == nil || conn.tx != nil {
+		return nil
+	}
+	conn.db.mu.RLock()
+	defer conn.db.mu.RUnlock()
+	return layoutIdentityToken(conn.db.layoutEpoch)
 }
 
 // Begin starts a transaction at the requested isolation level. Read Committed
@@ -336,6 +354,33 @@ func (s *Session) Begin(ctx context.Context, options TxOptions) error {
 	if _, err := s.conn.BeginTx(ctx, sqldriver.TxOptions{
 		ReadOnly: options.ReadOnly, Isolation: isolation,
 	}); err != nil {
+		return err
+	}
+	s.state = SessionInTransaction
+	return nil
+}
+
+// BeginPinnedRead begins a read-only Repeatable Read transaction for one
+// prepared SELECT, leasing snapshots only for the statement's executable
+// closure instead of every table in the database. The isolation guarantee
+// matches Begin with a read-only Repeatable Read: a single statement
+// observes exactly one coherent cut. A nil or unscoped statement falls back
+// to full materialization.
+func (s *Session) BeginPinnedRead(ctx context.Context, p *Prepared) error {
+	if s != nil && s.conn != nil {
+		ctx = withCooperativeCancellation(ctx, s.conn.exec.Options.Cancel)
+	}
+	if err := s.ready(ctx); err != nil {
+		return s.fail(err)
+	}
+	if s.state != SessionIdle || s.conn.tx != nil {
+		return ErrTransactionActive
+	}
+	var scope *stmt
+	if p != nil {
+		scope = p.statement
+	}
+	if err := s.conn.beginPinnedReadTx(ctx, scope); err != nil {
 		return err
 	}
 	s.state = SessionInTransaction
@@ -608,7 +653,51 @@ func (t ParamType) String() string {
 type Prepared struct {
 	session   *Session
 	statement *stmt
-	closed    bool
+	// layout is the catalog/layout generation the statement was lowered
+	// against, or nil when the preparation is not provably reusable (made
+	// under a transaction, or straddling a DDL publish).
+	layout *catalogLayoutIdentity
+	closed bool
+}
+
+// pinLayout stamps the preparation reusable only when the published layout
+// generation is unchanged since the capture taken before parsing. A DDL
+// publish anywhere inside the preparation leaves the stamp empty, so the
+// statement is never reused across a generation boundary.
+func (p *Prepared) pinLayout(before *catalogLayoutIdentity) {
+	if p == nil || before == nil || p.session == nil || p.session.conn == nil {
+		return
+	}
+	conn := p.session.conn
+	if conn.tx != nil || conn.db == nil {
+		return
+	}
+	conn.db.mu.RLock()
+	after := layoutIdentityToken(conn.db.layoutEpoch)
+	conn.db.mu.RUnlock()
+	if after == before {
+		p.layout = before
+	}
+}
+
+// LayoutCurrent reports whether the catalog/layout generation the statement
+// was lowered against still governs execution: the published generation when
+// autocommitting, or the transaction's begin generation inside a transaction.
+// A reused statement must pass this check on every use; DDL anywhere in
+// between fails it and forces a fresh preparation.
+func (p *Prepared) LayoutCurrent() bool {
+	if p == nil || p.closed || p.statement == nil || p.layout == nil ||
+		p.session == nil || p.session.conn == nil || p.session.conn.db == nil {
+		return false
+	}
+	conn := p.session.conn
+	db := conn.db
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if conn.tx != nil {
+		return layoutIdentityToken(conn.tx.layoutEpoch) == p.layout
+	}
+	return layoutIdentityToken(db.layoutEpoch) == p.layout
 }
 
 // Kind reports the parsed statement kind. Call it before Close; sql.Kind has no

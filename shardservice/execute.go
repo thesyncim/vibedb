@@ -77,6 +77,10 @@ type shardConn struct {
 	server          *Server
 	nc              net.Conn
 	sess            *sqldriver.Session
+	// stmtCache reuses lowered preparations across requests on this
+	// connection; see stmt_cache.go. Entries die with the session.
+	stmtCache map[shardStmtKey]*sqldriver.Prepared
+	stmtOrder []shardStmtKey
 	writeCancel     context.CancelFunc
 	writeToken      uint64
 	responseBatched bool
@@ -515,20 +519,21 @@ func (c *shardConn) executeRepartition(req *ShardRequest) *ShardResponse {
 
 	ctx, cancel := c.server.requestContext(req)
 	defer cancel()
-	prep, err := prepareShardSQL(
-		ctx, c.sess, req.SQL, req.ParamTypes, req.PartialAggregate,
+	prep, release, err := c.prepareCached(
+		ctx, req.SQL, req.ParamTypes, req.PartialAggregate,
 	)
 	if err != nil {
 		return classifyError(err)
 	}
-	defer prep.Close()
+	defer release()
 	if prep.Kind() != sqlast.KindSelect || !prep.ReturnsRows() {
 		return NewErrorResponse(ErrorReadOnly,
 			"shardservice: repartition producer requires a row-returning SELECT")
 	}
-	if err := c.sess.Begin(ctx, sqldriver.TxOptions{
-		ReadOnly: true, Isolation: sqldriver.IsolationRepeatableRead,
-	}); err != nil {
+	// A single SELECT observes exactly one statement cut. BeginPinnedRead
+	// keeps the Repeatable Read guarantee while leasing snapshots only for
+	// this statement's closure instead of every table in the database.
+	if err := c.sess.BeginPinnedRead(ctx, prep); err != nil {
 		return classifyError(err)
 	}
 	defer c.sess.Rollback(context.Background())
@@ -922,11 +927,11 @@ func (c *shardConn) executeMutationCapture(req *ShardRequest) *ShardResponse {
 	}
 	ctx, cancel := c.server.requestContext(req)
 	defer cancel()
-	prep, err := prepareShardSQL(ctx, c.sess, req.SQL, req.ParamTypes, false)
+	prep, release, err := c.prepareCached(ctx, req.SQL, req.ParamTypes, false)
 	if err != nil {
 		return classifyError(err)
 	}
-	defer prep.Close()
+	defer release()
 	if prep.Kind() != sqlast.KindUpdate && prep.Kind() != sqlast.KindDelete {
 		return NewErrorResponse(ErrorMalformedRequest,
 			"shardservice: mutation capture requires UPDATE or DELETE")
@@ -1440,22 +1445,22 @@ func (c *shardConn) executeTargetStatements(
 			}
 			continue
 		}
-		prep, err := prepareShardSQL(
-			ctx, c.sess, mutation.SQL, mutation.ParamTypes, false,
+		prep, release, err := c.prepareCached(
+			ctx, mutation.SQL, mutation.ParamTypes, false,
 		)
 		if err != nil {
 			return 0, classifyError(err)
 		}
 		if prep.Kind() == sqlast.KindSelect || prep.ReturnsRows() ||
 			(guardPending && prep.Kind() != sqlast.KindUpdate && prep.Kind() != sqlast.KindDelete) {
-			_ = prep.Close()
+			release()
 			return 0, NewErrorResponse(ErrorMalformedRequest,
 				"shardservice: a distributed participant mutation must be non-row-returning DML")
 		}
 		result, execErr := prep.Exec(ctx, runtimeArgs(mutation.Params))
-		closeErr := prep.Close()
-		if execErr != nil || closeErr != nil {
-			return 0, classifyError(errors.Join(execErr, closeErr))
+		release()
+		if execErr != nil {
+			return 0, classifyError(execErr)
 		}
 		if result.RowsAffected < 0 || result.RowsAffected > math.MaxInt64-rowsAffected {
 			return 0, NewErrorResponse(ErrorResourceLimit,
@@ -1533,13 +1538,13 @@ func (c *shardConn) execute(
 	ctx, cancel := c.server.requestContext(req)
 	defer cancel()
 
-	prep, err := prepareShardSQL(
-		ctx, c.sess, req.SQL, req.ParamTypes, req.PartialAggregate,
+	prep, release, err := c.prepareCached(
+		ctx, req.SQL, req.ParamTypes, req.PartialAggregate,
 	)
 	if err != nil {
 		return write(classifyError(err))
 	}
-	defer prep.Close()
+	defer release()
 	if req.ExecutionMode == ExecutionReadOnly && prep.Kind() != sqlast.KindSelect {
 		return write(NewErrorResponse(
 			ErrorReadOnly,
@@ -1574,10 +1579,9 @@ func (c *shardConn) executeQuery(
 	// it read-only would reject the DML, and the RETURNING rows are exactly the
 	// rows the statement publishes, so autocommit is the correct cut.
 	if prep.Kind() == sqlast.KindSelect {
-		if err := c.sess.Begin(ctx, sqldriver.TxOptions{
-			ReadOnly:  true,
-			Isolation: sqldriver.IsolationRepeatableRead,
-		}); err != nil {
+		// Same single-statement closure pin as executeRepartition: the
+		// SELECT observes one coherent cut leased only for its own tables.
+		if err := c.sess.BeginPinnedRead(ctx, prep); err != nil {
 			return classifyError(err)
 		}
 		// Release the snapshot unconditionally; a canceled request context must
@@ -1620,9 +1624,9 @@ func (c *shardConn) executeQueryBatches(
 	write func(*ShardResponse) error,
 ) error {
 	if prep.Kind() == sqlast.KindSelect {
-		if err := c.sess.Begin(ctx, sqldriver.TxOptions{
-			ReadOnly: true, Isolation: sqldriver.IsolationRepeatableRead,
-		}); err != nil {
+		// Same single-statement closure pin: the batch cursor reads one
+		// coherent cut leased only for its own tables.
+		if err := c.sess.BeginPinnedRead(ctx, prep); err != nil {
 			return write(classifyError(err))
 		}
 		defer c.sess.Rollback(context.Background())
