@@ -645,6 +645,17 @@ func TestReplicatedScalingPublishEnrollmentReceiptPersistsCatalogCut(t *testing.
 	if published.Generation() != current.Generation()+1 {
 		t.Fatalf("published catalog generation=%d", published.Generation())
 	}
+	grant, err := BuildReplicaReplacementMembershipGrant(published, intent.Group,
+		EnrollmentTransitionID(prepared), intent.CatalogGeneration,
+		intent.Source.Member, intent.Target.Member)
+	if err != nil {
+		t.Fatalf("derive enrolled membership grant: %v", err)
+	}
+	storedGrant, found, err := authority.ReadMembershipGrant(ctx, intent.Group)
+	if err != nil || !found || storedGrant != grant || enrolled.Receipt.GrantDigest != EnrollmentGrantDigest(storedGrant) {
+		t.Fatalf("enrollment membership grant=%+v found=%v err=%v receipt=%x want=%+v",
+			storedGrant, found, err, enrolled.Receipt.GrantDigest, grant)
+	}
 	if published.endpoints[target.DataEndpoint] != target.DataAddress ||
 		published.endpoints[target.NativeEndpoint] != target.NativeAddress ||
 		published.endpoints[target.ControlEndpoint] != target.ControlAddress {
@@ -653,10 +664,16 @@ func TestReplicatedScalingPublishEnrollmentReceiptPersistsCatalogCut(t *testing.
 	if _, exists := current.endpoints[target.DataEndpoint]; exists {
 		t.Fatal("publication mutated prior catalog")
 	}
-	conflicting := *current
-	conflicting.endpoints = cloneEndpoints(current.endpoints)
-	conflicting.endpoints[target.DataEndpoint] = "conflicting.example:1"
-	if _, _, err := enrollmentCatalogWithTarget(&conflicting, prepared, active); !errors.Is(err, ErrReplicatedCatalogConflict) {
+	conflictingEndpoints := cloneEndpoints(current.endpoints)
+	conflictingEndpoints[target.DataEndpoint] = "conflicting.example:1"
+	conflicting, err := NewSnapshotWithReplicatedTableMetadata(
+		cloneConfig(current.config), conflictingEndpoints, current.Generation(),
+		current.indexDescriptors(), current.statistics.Descriptors(),
+		current.replicatedDescriptors(), current.replicatedTableProfiles(), current.ReplicatedTableDeclarations())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := enrollmentCatalogWithTarget(conflicting, prepared, active); !errors.Is(err, ErrReplicatedCatalogConflict) {
 		t.Fatalf("conflicting endpoint accepted: %v", err)
 	}
 	publishedDescriptor := published.ReplicatedShardDescriptors()[0]
@@ -680,6 +697,97 @@ func TestReplicatedScalingPublishEnrollmentReceiptPersistsCatalogCut(t *testing.
 	}
 	if evidence.EnrolledTargets != 1 || evidence.LearnerReplicas != 1 {
 		t.Fatalf("published target references=%+v", evidence)
+	}
+}
+
+func TestReplicatedScalingEnrollmentRejectsUnsettledPriorGrant(t *testing.T) {
+	ctx := context.Background()
+	authority, _, current := newCatalogAuthorityFixture(t)
+	descriptor := current.ReplicatedShardDescriptors()[0]
+	priorGrant, _, _, _ := testCertifiedReplicaReplacement(t, current, descriptor)
+	if err := authority.PublishMembershipGrant(ctx, priorGrant); err != nil {
+		t.Fatalf("publish prior grant: %v", err)
+	}
+	// Advancing an unrelated head does not prove that the prior membership
+	// transition reached its post-remove fence. The retained active grant must
+	// therefore still block a successor enrollment.
+	for range 3 {
+		current = advanceUnrelatedGroupTestHead(t, authority, current)
+	}
+	targetNode := scalingTestNodeRecord([16]byte{0x73}, 1, NodeJoining, 1)
+	targetNode.DataEndpoint = "settled-successor-node"
+	targetNode.NativeEndpoint = "settled-successor-node-native"
+	targetNode.ControlEndpoint = "settled-successor-node-control"
+	if err := authority.PutNode(ctx, targetNode, 0); err != nil {
+		t.Fatal(err)
+	}
+	targetNode.Lifecycle = NodeActive
+	targetNode.Revision = 2
+	if err := authority.PutNode(ctx, targetNode, 1); err != nil {
+		t.Fatal(err)
+	}
+	head, err := authority.readRaw(ctx, replicatedCatalogHeadKey, maxReplicatedCatalogBytes)
+	if err != nil || !head.Found {
+		t.Fatalf("read successor head: %v", err)
+	}
+	currentDescriptor := current.ReplicatedShardDescriptors()[0]
+	source := currentDescriptor.Replicas[0]
+	intent := GroupEnrollmentIntent{
+		IntentID: [32]byte{0xd1, 0x01}, Group: currentDescriptor.Group,
+		Distribution: currentDescriptor.Distribution, Shard: currentDescriptor.Shard,
+		AllocationGeneration: currentDescriptor.AllocationGeneration,
+		CatalogGeneration: current.Generation(), ExpectedCatalogHeadDigest: scalingDigest(head.Value),
+		ReplicaOrdinal: 0,
+		Source: ReplicaIdentity{Member: source.Member, Node: source.Node, StoreID: source.StoreID,
+			NodeIncarnation: source.NodeIncarnation, Endpoint: source.Endpoint,
+			NativeEndpoint: source.NativeEndpoint, ControlEndpoint: source.ControlEndpoint},
+		SnapshotSourceMember: source.Member,
+		Target: ReplicaIdentity{Member: 5, Node: targetNode.NodeID, StoreID: [16]byte{15},
+			NodeIncarnation: targetNode.Incarnation, Endpoint: targetNode.DataEndpoint,
+			NativeEndpoint: targetNode.NativeEndpoint, ControlEndpoint: targetNode.ControlEndpoint},
+		ExpectedRosterDigest: replication.Digest(replicatedCatalogInitialRosterDigest(current, 0)),
+		ExpectedDescriptorDigest: replication.Digest(replicatedCatalogInitialDescriptorDigest(current, 0)),
+		ExpectedManifestDigest: replication.Digest(currentDescriptor.Command.RelationManifestDigest),
+		ExpectedCommand: currentDescriptor.Command, TargetNodeRevision: targetNode.Revision,
+		State: EnrollmentReserved, Revision: 1,
+	}
+	if !intent.Valid() {
+		t.Fatal("successor enrollment fixture is invalid")
+	}
+	if err := authority.SubmitEnrollmentIntent(ctx, intent); err != nil {
+		t.Fatalf("reserve successor enrollment: %v", err)
+	}
+	reserved, err := authority.ReadEnrollmentIntent(ctx, intent.IntentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := authority.ClaimEnrollmentPreparation(ctx, reserved.IntentID, reserved.Revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared := claimed
+	prepared.State = EnrollmentPrepared
+	prepared.Revision++
+	prepared.PreparationClaim = [32]byte{}
+	proof := scalingTestPreparedProof(prepared, targetNode.Revision)
+	prepared.Proof = &proof
+	if err := authority.PutEnrollmentIntent(ctx, prepared, claimed.Revision); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := authority.PublishEnrollmentReceipt(ctx, prepared); !errors.Is(err, ErrReplicatedCatalogConflict) {
+		t.Fatalf("unsettled prior grant accepted: %v", err)
+	}
+	priorKey, _ := replicatedMembershipGrantKeys(priorGrant.Group)
+	clientRows, ok := authority.executor.client.(*catalogAuthorityClient)
+	if !ok {
+		t.Fatal("catalog fixture client type changed")
+	}
+	clientRows.mu.Lock()
+	priorRaw := bytes.Clone(clientRows.rows[string(priorKey[:])])
+	clientRows.mu.Unlock()
+	stored, openErr := openReplicatedMembershipGrant(priorRaw)
+	if openErr != nil || stored != priorGrant {
+		t.Fatalf("unsettled prior grant mutated: %+v err=%v", stored, openErr)
 	}
 }
 

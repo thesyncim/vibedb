@@ -1991,7 +1991,7 @@ func enrollmentReceiptMatchesCatalog(intent GroupEnrollmentIntent, cut replicate
 // row.  A generic PutEnrollmentIntent cannot manufacture this transition.
 func (authority *ReplicatedCatalogAuthority) PublishEnrollmentReceipt(ctx context.Context, intent GroupEnrollmentIntent) (GroupEnrollmentIntent, error) {
 	if authority == nil || authority.session == nil || ctx == nil || !intent.Valid() ||
-		intent.State != EnrollmentPrepared || intent.Proof == nil || authority.session.bundle.maxMutations < 5 {
+		intent.State != EnrollmentPrepared || intent.Proof == nil || authority.session.bundle.maxMutations < 7 {
 		return GroupEnrollmentIntent{}, ErrInvalidScalingMetadata
 	}
 	ctx, err := authority.authorizedContext(ctx)
@@ -2110,18 +2110,99 @@ func (authority *ReplicatedCatalogAuthority) PublishEnrollmentReceipt(ctx contex
 	if err != nil {
 		return GroupEnrollmentIntent{}, err
 	}
+	// The receipt and its membership grant form one authorization boundary.
+	// Publishing the enrolled target without the grant leaves the move saga
+	// unable to authenticate its first membership step; publishing them in
+	// separate catalog CAS operations also lets an unrelated head advance in
+	// between the two operations. Keep the exact grant derived above adjacent
+	// to the G+1 cut and retain its bounded page witness in the same batch.
+	grantKey, grantPageKey := replicatedMembershipGrantKeys(grant.Group)
+	grantResult, err := authority.readRaw(ctx, grantKey[:], maxReplicatedMembershipGrantBytes)
+	if err != nil {
+		return GroupEnrollmentIntent{}, err
+	}
+	grantPageResult, err := authority.readRaw(ctx, grantPageKey[:], maxReplicatedMembershipGrantPageBytes)
+	if err != nil {
+		return GroupEnrollmentIntent{}, err
+	}
+	var grantGroups []raftmember.GroupKey
+	if grantPageResult.Found {
+		grantGroups, err = openReplicatedMembershipGrantPage(grantPageKey.bucket(), grantPageResult.Value)
+		if err != nil {
+			return GroupEnrollmentIntent{}, err
+		}
+	}
+	grantPosition, grantFound := findReplicatedMembershipGrantGroup(grantGroups, grant.Group)
+	grantBytes, err := appendReplicatedMembershipGrant(nil, grant)
+	if err != nil {
+		return GroupEnrollmentIntent{}, err
+	}
+	replaceSettledGrant := false
+	if grantResult.Found {
+		stored, openErr := openReplicatedMembershipGrant(grantResult.Value)
+		if openErr != nil || !grantFound {
+			return GroupEnrollmentIntent{}, errors.Join(openErr, ErrReplicatedCatalogConflict)
+		}
+		if stored != grant {
+			// A previous replacement may be replaced only after its exact
+			// source-removal receipt proves settlement. An unrelated catalog
+			// advance does not revoke an active grant or prove that transition.
+			if settleErr := authority.validateReplicaGrantSettlement(ctx, stored, cut); settleErr != nil {
+				return GroupEnrollmentIntent{}, errors.Join(settleErr, ErrReplicatedCatalogConflict)
+			}
+			replaceSettledGrant = true
+		}
+	} else if grantFound || len(grantGroups) >= maxReplicatedMembershipGrantsPerPage {
+		return GroupEnrollmentIntent{}, ErrReplicatedCatalogConflict
+	} else {
+		grantGroups = append(grantGroups, raftmember.GroupKey{})
+		copy(grantGroups[grantPosition+1:], grantGroups[grantPosition:])
+		grantGroups[grantPosition] = grant.Group
+	}
+	grantPageBytes, err := appendReplicatedMembershipGrantPage(nil, grantPageKey.bucket(), grantGroups)
+	if err != nil {
+		return GroupEnrollmentIntent{}, err
+	}
 	headDigest := sha256.Sum256(cut.head)
 	witnessDigest := sha256.Sum256(cut.witness)
-	mutations := []NativeMutation{
-		{Kind: replication.MutationPutDigestEqual, Key: replicatedCatalogHeadKey, Value: nextHead,
+	mutations := make([]NativeMutation, 0, 7)
+	mutations = append(mutations,
+		NativeMutation{Kind: replication.MutationPutDigestEqual, Key: replicatedCatalogHeadKey, Value: nextHead,
 			ExpectedValueLength: uint64(len(cut.head)), ExpectedValueDigest: replication.Digest(headDigest)},
-		{Kind: replication.MutationPutDigestEqual, Key: replicatedCatalogHeadWitnessKey, Value: nextWitness,
+		NativeMutation{Kind: replication.MutationPutDigestEqual, Key: replicatedCatalogHeadWitnessKey, Value: nextWitness,
 			ExpectedValueLength: uint64(len(cut.witness)), ExpectedValueDigest: replication.Digest(witnessDigest)},
-		{Kind: replication.MutationPutDigestEqual, Key: targetKey, Value: targetResult.Value,
+		NativeMutation{Kind: replication.MutationPutDigestEqual, Key: targetKey, Value: targetResult.Value,
 			ExpectedValueLength: uint64(len(targetResult.Value)), ExpectedValueDigest: scalingDigest(targetResult.Value)},
-		{Kind: replication.MutationPutDigestEqual, Key: rowKey, Value: recordBytes,
+		NativeMutation{Kind: replication.MutationPutDigestEqual, Key: rowKey, Value: recordBytes,
 			ExpectedValueLength: uint64(len(rowResult.Value)), ExpectedValueDigest: scalingDigest(rowResult.Value)},
 		scalingDirectoryMutation(directoryResult, enrollmentDirectoryKey, directoryBytes),
+	)
+	if !grantResult.Found {
+		mutations = append(mutations, NativeMutation{Kind: replication.MutationPutAbsentOrEqual,
+			Key: grantKey[:], Value: grantBytes})
+	} else {
+		grantDigest := sha256.Sum256(grantResult.Value)
+		if replaceSettledGrant {
+			mutations = append(mutations, NativeMutation{Kind: replication.MutationPutDigestEqual,
+				Key: grantKey[:], Value: grantBytes,
+				ExpectedValueLength: uint64(len(grantResult.Value)), ExpectedValueDigest: replication.Digest(grantDigest)})
+		} else {
+			// Even an exact replay fences the grant row. This prevents a
+			// concurrent finalization from turning a successful receipt CAS into
+			// a publication with no matching grant.
+			mutations = append(mutations, NativeMutation{Kind: replication.MutationPutDigestEqual,
+				Key: grantKey[:], Value: grantResult.Value,
+				ExpectedValueLength: uint64(len(grantResult.Value)), ExpectedValueDigest: replication.Digest(grantDigest)})
+		}
+	}
+	if !grantPageResult.Found {
+		mutations = append(mutations, NativeMutation{Kind: replication.MutationPutAbsentOrEqual,
+			Key: grantPageKey[:], Value: grantPageBytes})
+	} else {
+		grantPageDigest := sha256.Sum256(grantPageResult.Value)
+		mutations = append(mutations, NativeMutation{Kind: replication.MutationPutDigestEqual,
+			Key: grantPageKey[:], Value: grantPageBytes,
+			ExpectedValueLength: uint64(len(grantPageResult.Value)), ExpectedValueDigest: replication.Digest(grantPageDigest)})
 	}
 	result, err := authority.session.MutateBatch(ctx, mutations)
 	if err != nil {

@@ -983,6 +983,23 @@ func (authority *ReplicatedCatalogAuthority) FinalizeReplicaReplacement(
 	if err != nil {
 		return err
 	}
+	if err = authority.validateReplicaGrantSettlement(ctx, expected, cut); err != nil {
+		return err
+	}
+	return authority.finalizeReplicaGrantAtCut(ctx, expected, cut)
+}
+
+// validateReplicaGrantSettlement proves that a retained grant has completed
+// its source-removal transition. A catalog age alone is insufficient: an
+// unrelated head can advance without ever applying the membership change.
+// Reusing the exact finalization witnesses keeps successor enrollment from
+// revoking a grant which could still authorize an in-flight move.
+func (authority *ReplicatedCatalogAuthority) validateReplicaGrantSettlement(
+	ctx context.Context, expected membershipgrant.Grant, cut replicatedCatalogCut,
+) error {
+	if authority == nil || ctx == nil || !expected.Valid() || cut.snapshot == nil {
+		return ErrReplicatedCatalog
+	}
 	owned, ownedRaw, ownedErr := authority.readTransitionRecord(ctx, GroupTransitionKey{Group: expected.Group})
 	if ownedErr != nil {
 		return ownedErr
@@ -992,7 +1009,7 @@ func (authority *ReplicatedCatalogAuthority) FinalizeReplicaReplacement(
 		if err != nil || !authorized {
 			return errors.Join(err, ErrGroupTransition)
 		}
-		return authority.finalizeReplicaGrantAtCut(ctx, expected, cut)
+		return nil
 	}
 	if expected.CatalogGeneration > ^uint64(0)-2 ||
 		cut.snapshot.Generation() != expected.CatalogGeneration+2 {
@@ -1017,7 +1034,7 @@ func (authority *ReplicatedCatalogAuthority) FinalizeReplicaReplacement(
 		receipt.PostRemoveHeadDigest != sha256.Sum256(cut.head) {
 		return errors.Join(err, ErrReplicatedCatalogConflict)
 	}
-	return authority.finalizeReplicaGrantAtCut(ctx, expected, cut)
+	return nil
 }
 
 func (authority *ReplicatedCatalogAuthority) finalizeReplicaGrantAtCut(ctx context.Context, expected membershipgrant.Grant, cut replicatedCatalogCut) error {
