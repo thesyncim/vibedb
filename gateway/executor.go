@@ -422,6 +422,10 @@ func (e *Executor) queryWithProfileValidation(
 		if shared {
 			e.publishPhysical(q.SQL, snap.Generation(), bound, cache)
 		}
+		// The routed shells were borrowed for this dispatch alone; the
+		// dispatch below joins every fan-out worker before returning, so
+		// they are dead on every exit after this point.
+		defer releaseShardCalls(pl.calls)
 		e.observePressureCalls(pl.calls)
 		e.metrics.observeRoute(pl.kind, len(pl.calls), pl.scatter)
 

@@ -2,8 +2,24 @@ package gateway
 
 import (
 	"context"
+	"reflect"
 	"testing"
+
+	"github.com/thesyncim/vibedb/shardservice"
 )
+
+// TestReleaseShardCallsScrubsShells proves routed shells retain no caller
+// data once released: a reborrowed shell is fully zero.
+func TestReleaseShardCallsScrubsShells(t *testing.T) {
+	req := shardRequestPool.Get().(*shardservice.ShardRequest)
+	*req = shardservice.ShardRequest{SQL: "SELECT 1", MaxRows: 7}
+	releaseShardCalls([]shardCall{{req: req}})
+	again := shardRequestPool.Get().(*shardservice.ShardRequest)
+	if !reflect.DeepEqual(*again, shardservice.ShardRequest{}) {
+		t.Fatalf("reborrowed shell = %+v, want zero value", again)
+	}
+	shardRequestPool.Put(again)
+}
 
 // TestExecutorPlanCacheReusesPhysicalPlan proves the plain Query path shares
 // physical planning across identical statements: the second identical point

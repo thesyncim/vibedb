@@ -74,13 +74,13 @@ const pgOIDJSON = 114
 
 // shardConn is one served connection: the socket and the single Session it owns.
 type shardConn struct {
-	server          *Server
-	nc              net.Conn
-	sess            *sqldriver.Session
+	server *Server
+	nc     net.Conn
+	sess   *sqldriver.Session
 	// stmtCache reuses lowered preparations across requests on this
 	// connection; see stmt_cache.go. Entries die with the session.
-	stmtCache map[shardStmtKey]*sqldriver.Prepared
-	stmtOrder []shardStmtKey
+	stmtCache       map[shardStmtKey]*cachedStmt
+	stmtOrder       []shardStmtKey
 	writeCancel     context.CancelFunc
 	writeToken      uint64
 	responseBatched bool
@@ -114,21 +114,27 @@ func (c *shardConn) releaseWriteAdmission() {
 func (c *shardConn) loop() error {
 	for {
 		setDeadline(c.nc.SetReadDeadline, c.server.opts.IdleTimeout)
-		req, err := DecodeRequest(c.nc)
-		if err != nil {
-			if errors.Is(err, io.EOF) {
+		// The descriptor shell is pooled; the handler below uses it
+		// strictly synchronously, so each iteration releases its shell
+		// after the handler returns. A missed release only loses the
+		// saving to the collector.
+		req := borrowShardRequest()
+		if derr := decodeBorrowedRequest(c.nc, req); derr != nil {
+			releaseShardRequest(req)
+			if errors.Is(derr, io.EOF) {
 				return nil
 			}
-			if isFramingError(err) {
-				return err
+			if isFramingError(derr) {
+				return derr
 			}
 			if werr := c.writeResponse(
-				NewErrorResponse(ErrorMalformedRequest, err.Error())); werr != nil {
+				NewErrorResponse(ErrorMalformedRequest, derr.Error())); werr != nil {
 				return werr
 			}
 			continue
 		}
 		if c.authorization != nil && !c.authorize(req) {
+			releaseShardRequest(req)
 			if werr := c.writeResponse(NewErrorResponse(ErrorUnauthorized, "authorization denied")); werr != nil {
 				return werr
 			}
@@ -136,6 +142,7 @@ func (c *shardConn) loop() error {
 		}
 		c.responseBatched = req.RowBatch.present()
 		werr := c.handle(req, c.writeRequestResponse)
+		releaseShardRequest(req)
 		c.responseBatched = false
 		if werr != nil {
 			if errors.Is(werr, errRowBatchTerminated) {
@@ -519,7 +526,7 @@ func (c *shardConn) executeRepartition(req *ShardRequest) *ShardResponse {
 
 	ctx, cancel := c.server.requestContext(req)
 	defer cancel()
-	prep, release, err := c.prepareCached(
+	prep, columns, release, err := c.prepareCached(
 		ctx, req.SQL, req.ParamTypes, req.PartialAggregate,
 	)
 	if err != nil {
@@ -543,13 +550,16 @@ func (c *shardConn) executeRepartition(req *ShardRequest) *ShardResponse {
 		return classifyError(err)
 	}
 	defer cursor.Close()
-	columns := len(prep.Columns())
-	if columns == 0 || columns > int(exchange.MaxBlockColumns) ||
-		!exchange.ValidBlockLimits(uint32(columns), req.Repartition.BlockRows, req.Repartition.BlockBytes) {
+	if columns == nil {
+		columns = responseColumns(prep)
+	}
+	ncolumns := len(columns)
+	if ncolumns == 0 || ncolumns > int(exchange.MaxBlockColumns) ||
+		!exchange.ValidBlockLimits(uint32(ncolumns), req.Repartition.BlockRows, req.Repartition.BlockBytes) {
 		return NewErrorResponse(ErrorResourceLimit, errBadRepartition.Error())
 	}
 	for _, ordinal := range req.Repartition.KeyColumns {
-		if int(ordinal) >= columns {
+		if int(ordinal) >= ncolumns {
 			return NewErrorResponse(ErrorMalformedRequest, errBadRepartition.Error())
 		}
 	}
@@ -563,14 +573,14 @@ func (c *shardConn) executeRepartition(req *ShardRequest) *ShardResponse {
 		columns: req.Repartition.KeyColumns, partitions: uint32(len(req.Repartition.Targets)),
 	}
 	producer, err := exchange.NewProducer(
-		partitioner, uint32(len(req.Repartition.Targets)), uint32(columns),
+		partitioner, uint32(len(req.Repartition.Targets)), uint32(ncolumns),
 		req.Repartition.BlockRows, req.Repartition.BlockBytes, req.Repartition.MaxMemory,
 		req.Repartition.Producer, sink,
 	)
 	if err != nil {
 		return repartitionError(err)
 	}
-	row := make([]Cell, columns)
+	row := make([]Cell, ncolumns)
 	arena := make([]byte, 0, min(int(req.Repartition.BlockBytes), 64<<10))
 	var produced int64
 	for cursor.Next() {
@@ -927,7 +937,7 @@ func (c *shardConn) executeMutationCapture(req *ShardRequest) *ShardResponse {
 	}
 	ctx, cancel := c.server.requestContext(req)
 	defer cancel()
-	prep, release, err := c.prepareCached(ctx, req.SQL, req.ParamTypes, false)
+	prep, _, release, err := c.prepareCached(ctx, req.SQL, req.ParamTypes, false)
 	if err != nil {
 		return classifyError(err)
 	}
@@ -1445,7 +1455,7 @@ func (c *shardConn) executeTargetStatements(
 			}
 			continue
 		}
-		prep, release, err := c.prepareCached(
+		prep, _, release, err := c.prepareCached(
 			ctx, mutation.SQL, mutation.ParamTypes, false,
 		)
 		if err != nil {
@@ -1538,7 +1548,7 @@ func (c *shardConn) execute(
 	ctx, cancel := c.server.requestContext(req)
 	defer cancel()
 
-	prep, release, err := c.prepareCached(
+	prep, columns, release, err := c.prepareCached(
 		ctx, req.SQL, req.ParamTypes, req.PartialAggregate,
 	)
 	if err != nil {
@@ -1554,10 +1564,13 @@ func (c *shardConn) execute(
 
 	args := runtimeArgs(req.Params)
 	if prep.ReturnsRows() {
-		if req.RowBatch.present() {
-			return c.executeQueryBatches(ctx, prep, args, req.PrimaryKeyRead, req.RowBatch, write)
+		if columns == nil {
+			columns = responseColumns(prep)
 		}
-		return write(c.executeQuery(ctx, prep, args, req.PrimaryKeyRead))
+		if req.RowBatch.present() {
+			return c.executeQueryBatches(ctx, prep, columns, args, req.PrimaryKeyRead, req.RowBatch, write)
+		}
+		return write(c.executeQuery(ctx, prep, columns, args, req.PrimaryKeyRead))
 	}
 	return write(c.executeExec(ctx, prep, args))
 }
@@ -1568,6 +1581,7 @@ func (c *shardConn) execute(
 func (c *shardConn) executeQuery(
 	ctx context.Context,
 	prep *sqldriver.Prepared,
+	columns []Column,
 	args []any,
 	primaryRead PrimaryKeyReadRequest,
 ) *ShardResponse {
@@ -1606,9 +1620,8 @@ func (c *shardConn) executeQuery(
 	}
 	defer cur.Close()
 
-	cols := responseColumns(prep)
-	rows := collectRows(&cur, len(cols))
-	return RowsResponse(cols, rows)
+	rows := collectRows(&cur, len(columns))
+	return RowsResponse(columns, rows)
 }
 
 // executeQueryBatches consumes a materialized SQL cursor into independently
@@ -1618,6 +1631,7 @@ func (c *shardConn) executeQuery(
 func (c *shardConn) executeQueryBatches(
 	ctx context.Context,
 	prep *sqldriver.Prepared,
+	columns []Column,
 	args []any,
 	primaryRead PrimaryKeyReadRequest,
 	limits RowBatchRequest,
@@ -1648,12 +1662,11 @@ func (c *shardConn) executeQueryBatches(
 	}
 	defer cur.Close()
 
-	cols := responseColumns(prep)
-	if len(cols) == 0 {
+	if len(columns) == 0 {
 		return write(NewErrorResponse(ErrorMalformedRequest,
 			"shardservice: a row batch requires at least one result column"))
 	}
-	return streamCursorBatches(&cur, cols, limits, write)
+	return streamCursorBatches(&cur, columns, limits, write)
 }
 
 // streamCursorBatches packs cell JSON into one pre-sized arena per frame. The

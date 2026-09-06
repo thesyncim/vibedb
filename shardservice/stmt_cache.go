@@ -46,10 +46,20 @@ func shardStmtCacheKey(
 	return shardStmtKey{sql: sqlText, params: signature, partial: partialAggregate}, true
 }
 
+// cachedStmt is one cache entry: the borrowed preparation plus the wire
+// columns built once for it. Column names are constants of the lowered plan,
+// so cloning them per response is pure recomputation.
+type cachedStmt struct {
+	prep    *sqldriver.Prepared
+	columns []Column
+}
+
 // prepareCached returns a prepared statement for one request, reusing the
 // connection's cached preparation when the SQL text, parameter types, and
 // lowering mode match and the catalog/layout generation the cached plan was
-// lowered against still governs execution.
+// lowered against still governs execution. Columns are the entry's cached
+// wire columns (nil unless the statement returns rows); they borrow the
+// entry's lifetime and must not be retained past the request.
 //
 // The returned release must run when the request finishes: it is a no-op for
 // a cache hit and closes a freshly prepared statement that could not be
@@ -60,14 +70,14 @@ func (c *shardConn) prepareCached(
 	sqlText string,
 	parameterTypes []sqldriver.ParamType,
 	partialAggregate bool,
-) (*sqldriver.Prepared, func(), error) {
+) (*sqldriver.Prepared, []Column, func(), error) {
 	// A served connection is driven by one loop goroutine, so the cache
 	// needs no lock; entries live until session teardown closes them.
 	key, cacheable := shardStmtCacheKey(sqlText, parameterTypes, partialAggregate)
 	if cacheable {
-		if prep, hit := c.stmtCache[key]; hit {
-			if prep.LayoutCurrent() {
-				return prep, func() {}, nil
+		if entry, hit := c.stmtCache[key]; hit {
+			if entry.prep.LayoutCurrent() {
+				return entry.prep, entry.columns, func() {}, nil
 			}
 			// A generation boundary retired this entry. Drop it before a
 			// fresh preparation replaces the slot below.
@@ -76,40 +86,45 @@ func (c *shardConn) prepareCached(
 	}
 	prep, err := prepareShardSQL(ctx, c.sess, sqlText, parameterTypes, partialAggregate)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if cacheable && prep.LayoutCurrent() {
-		c.storeStmt(key, prep)
-		return prep, func() {}, nil
+		entry := c.storeStmt(key, prep)
+		return entry.prep, entry.columns, func() {}, nil
 	}
-	return prep, func() { _ = prep.Close() }, nil
+	return prep, nil, func() { _ = prep.Close() }, nil
 }
 
 // storeStmt inserts a preparation, evicting the oldest entry when the cache
 // is full. A replaced entry is closed so its compiler arenas are released;
 // entries otherwise live until session teardown closes them.
-func (c *shardConn) storeStmt(key shardStmtKey, prep *sqldriver.Prepared) {
+func (c *shardConn) storeStmt(key shardStmtKey, prep *sqldriver.Prepared) *cachedStmt {
+	entry := &cachedStmt{prep: prep}
+	if prep.ReturnsRows() {
+		entry.columns = responseColumns(prep)
+	}
 	if c.stmtCache == nil {
-		c.stmtCache = make(map[shardStmtKey]*sqldriver.Prepared, shardStmtCacheMax)
+		c.stmtCache = make(map[shardStmtKey]*cachedStmt, shardStmtCacheMax)
 	}
 	if _, exists := c.stmtCache[key]; !exists {
 		for len(c.stmtOrder) >= shardStmtCacheMax {
 			c.evictStmt(c.stmtOrder[0])
 		}
 		c.stmtOrder = append(c.stmtOrder, key)
-	} else if old := c.stmtCache[key]; old != prep {
-		_ = old.Close()
+	} else if old := c.stmtCache[key]; old.prep != prep {
+		_ = old.prep.Close()
 	}
-	c.stmtCache[key] = prep
+	c.stmtCache[key] = entry
+	return entry
 }
 
 func (c *shardConn) evictStmt(key shardStmtKey) {
-	prep, ok := c.stmtCache[key]
+	entry, ok := c.stmtCache[key]
 	if !ok {
 		return
 	}
 	delete(c.stmtCache, key)
-	_ = prep.Close()
+	_ = entry.prep.Close()
 	for index, queued := range c.stmtOrder {
 		if queued == key {
 			c.stmtOrder = append(c.stmtOrder[:index], c.stmtOrder[index+1:]...)

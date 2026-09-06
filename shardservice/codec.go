@@ -1681,16 +1681,33 @@ func EncodeRequest(w io.Writer, req *ShardRequest) error {
 // DecodeRequest reads one framed request. A malformed or oversized frame yields
 // a typed error, never a panic or an out-of-memory allocation.
 func DecodeRequest(r io.Reader) (*ShardRequest, error) {
+	req := &ShardRequest{}
+	if err := decodeBorrowedRequest(r, req); err != nil {
+		return nil, err
+	}
+	return req, nil
+}
+
+// decodeBorrowedRequest fills a zeroed shell from one framed request. The
+// shell must be zero on entry: absent optional lanes leave their fields
+// untouched, so a reused shell would otherwise serve stale values.
+// DecodeRequest allocates a fresh shell per call; the connection loop
+// borrows zeroed shells from the request pool instead.
+func decodeBorrowedRequest(r io.Reader, req *ShardRequest) error {
 	body, err := readFrame(r, tagRequest)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	d := deccur{b: body}
 	if d.u8() != wireVersion {
-		return nil, errBadVersion
+		return errBadVersion
 	}
+	return decodeRequestFields(&d, req)
+}
 
-	req := &ShardRequest{}
+// decodeRequestFields fills a request shell from one decoded frame.
+func decodeRequestFields(d *deccur, req *ShardRequest) error {
+	var err error
 	req.SQL = d.str()
 	req.Distribution = distribution.DistributionName(d.str())
 	req.Shard = distribution.ShardID(d.str())
@@ -1703,7 +1720,7 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 	req.ExecutionMode = mode
 	deadline := d.u64()
 	if deadline > math.MaxInt64 {
-		return nil, errNegativeDuration
+		return errNegativeDuration
 	}
 	req.Deadline = time.Duration(deadline)
 	req.MaxResultBytes = d.u64()
@@ -1719,14 +1736,14 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 				break
 			}
 			if !kind.valid() {
-				return nil, errBadEnum
+				return errBadEnum
 			}
 			p := Param{Kind: kind}
 			switch kind {
 			case ParamBool:
 				marker := d.u8()
 				if marker > 1 {
-					return nil, errBadEnum
+					return errBadEnum
 				}
 				p.Bool = marker == 1
 			case ParamNumber, ParamString, ParamDocument:
@@ -1734,14 +1751,14 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 			case ParamNull:
 			}
 			if !d.bad() && !p.Valid() {
-				return nil, errBadParam
+				return errBadParam
 			}
 			req.Params[i] = p
 		}
 	}
 	req.HasMinPosition, req.MinPosition, err = d.position()
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if len(d.b) != 0 && d.b[0] == accessScopeMarker {
 		d.u8()
@@ -1754,14 +1771,14 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 			}
 		}
 		if d.bad() || !distributedtxn.ValidateIntentScopes(req.AccessScopes, req.BucketBits) {
-			return nil, errBadTransaction
+			return errBadTransaction
 		}
 	}
 	if len(d.b) != 0 && d.b[0] == readFenceMarker {
 		d.u8()
 		req.ReadFenceID = distributedtxn.ID(d.fixed16())
 		if d.bad() || req.ReadFenceID.IsZero() {
-			return nil, errBadTransaction
+			return errBadTransaction
 		}
 	}
 	if len(d.b) != 0 && d.b[0] == globalIndexLookupMarker {
@@ -1779,11 +1796,11 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 		req.GlobalIndexLookup.LocatorCount = d.u8()
 		unique := d.u8()
 		if unique > 1 {
-			return nil, errBadEnum
+			return errBadEnum
 		}
 		req.GlobalIndexLookup.Unique = unique == 1
 		if d.bad() || !req.GlobalIndexLookup.canonical() {
-			return nil, errBadGlobalIndexLookup
+			return errBadGlobalIndexLookup
 		}
 	}
 	if len(d.b) != 0 && (d.b[0] == primaryKeyReadMarker || d.b[0] == primaryKeyReadExtendedMarker) {
@@ -1800,12 +1817,12 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 			for i := range req.PrimaryKeyRead.Keys {
 				req.PrimaryKeyRead.Keys[i] = d.slice()
 				if len(req.PrimaryKeyRead.Keys[i]) == 0 {
-					return nil, errBadPrimaryKeyRead
+					return errBadPrimaryKeyRead
 				}
 			}
 		}
 		if d.bad() || !req.PrimaryKeyRead.canonical() {
-			return nil, errBadPrimaryKeyRead
+			return errBadPrimaryKeyRead
 		}
 	}
 	if len(d.b) != 0 && d.b[0] == mutationCaptureMarker {
@@ -1817,7 +1834,7 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 		req.DocumentScan.Relation = d.slice()
 		req.DocumentScan.After = d.slice()
 		if d.bad() || !req.DocumentScan.canonical() {
-			return nil, errBadDocumentScan
+			return errBadDocumentScan
 		}
 	}
 	if len(d.b) != 0 && d.b[0] == partialAggregateMarker {
@@ -1829,28 +1846,28 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 		req.RowBatch.BatchRows = d.u32()
 		req.RowBatch.BatchBytes = d.u32()
 		if d.bad() || !req.RowBatch.canonical() {
-			return nil, errBadRowBatch
+			return errBadRowBatch
 		}
 	}
 	if len(d.b) != 0 && d.b[0] == repartitionMarker {
 		d.u8()
-		req.Repartition, err = decodeRepartitionRequest(&d)
+		req.Repartition, err = decodeRepartitionRequest(d)
 		if err != nil {
-			return nil, err
+			return err
 		}
 	}
 	if len(d.b) != 0 && d.b[0] == exchangeMarker {
 		d.u8()
-		req.Exchange, err = decodeExchangeRequest(&d)
+		req.Exchange, err = decodeExchangeRequest(d)
 		if err != nil {
-			return nil, err
+			return err
 		}
 	}
 	if len(d.b) != 0 && d.b[0] == transactionMarker {
 		d.u8()
-		req.Transaction, err = decodeTransactionRequest(&d)
+		req.Transaction, err = decodeTransactionRequest(d)
 		if err != nil {
-			return nil, err
+			return err
 		}
 	}
 	if len(d.b) != 0 && d.b[0] == authorityMarker {
@@ -1858,14 +1875,14 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 		req.Authority.Node = d.fixed16()
 		req.Authority.Generation = d.u64()
 		if d.bad() || !req.Authority.Valid() {
-			return nil, errBadPresence
+			return errBadPresence
 		}
 	}
 	if len(d.b) != 0 && d.b[0] == parameterTypesMarker {
 		d.u8()
 		count := d.count(1, maxParams)
 		if count == 0 || count != len(req.Params) {
-			return nil, errBadParameterTypes
+			return errBadParameterTypes
 		}
 		req.ParamTypes = make([]sqldriver.ParamType, count)
 		for index := range req.ParamTypes {
@@ -1873,7 +1890,7 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 		}
 		if d.bad() || req.SQL == "" ||
 			!validSQLParameterTypes(req.Params, req.ParamTypes) {
-			return nil, errBadParameterTypes
+			return errBadParameterTypes
 		}
 	}
 	if len(d.b) != 0 && d.b[0] == mutationImageMarker {
@@ -1881,60 +1898,60 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 		req.MutationImageCapture = true
 	}
 	if req.MutationCapture && req.MutationImageCapture {
-		return nil, errBadMutationCapture
+		return errBadMutationCapture
 	}
 	mutationCapture := req.mutationCapturePresent()
 	if req.Transaction.Operation != TransactionNone &&
 		(len(req.ParamTypes) != 0 || !req.ReadFenceID.IsZero() || req.GlobalIndexLookup.present() || req.PrimaryKeyRead.present() || mutationCapture || req.DocumentScan.present()) {
 		if req.GlobalIndexLookup.present() {
-			return nil, errBadGlobalIndexLookup
+			return errBadGlobalIndexLookup
 		}
-		return nil, errBadTransaction
+		return errBadTransaction
 	}
 	if err := d.end(); err != nil {
-		return nil, err
+		return err
 	}
 	if !policy.valid() {
-		return nil, errBadEnum
+		return errBadEnum
 	}
 	if !mode.valid() {
-		return nil, errBadEnum
+		return errBadEnum
 	}
 	if err := validateExchangeRequest(req); err != nil {
-		return nil, err
+		return err
 	}
 	if err := validateRepartitionRequest(req); err != nil {
-		return nil, err
+		return err
 	}
 	if req.GlobalIndexLookup.present() &&
 		(req.SQL != "" || len(req.Params) != 0 || req.PrimaryKeyRead.present() || mutationCapture || req.DocumentScan.present() || req.ExecutionMode != ExecutionReadOnly) {
-		return nil, errBadGlobalIndexLookup
+		return errBadGlobalIndexLookup
 	}
 	if req.PrimaryKeyRead.present() && (req.SQL == "" || mutationCapture || req.DocumentScan.present() || req.ExecutionMode != ExecutionReadOnly) {
-		return nil, errBadPrimaryKeyRead
+		return errBadPrimaryKeyRead
 	}
 	if mutationCapture && (req.SQL == "" || req.ExecutionMode != ExecutionReadOnly || req.DocumentScan.present() ||
 		!req.ReadFenceID.IsZero()) {
-		return nil, errBadMutationCapture
+		return errBadMutationCapture
 	}
 	if req.DocumentScan.present() && (req.SQL != "" || len(req.Params) != 0 ||
 		req.ExecutionMode != ExecutionReadOnly || !req.ReadFenceID.IsZero() ||
 		req.MaxRows == 0 || req.MaxResultBytes == 0 || mutationCapture) {
-		return nil, errBadDocumentScan
+		return errBadDocumentScan
 	}
 	if req.PartialAggregate && (req.SQL == "" || req.ExecutionMode != ExecutionReadOnly ||
 		mutationCapture || req.DocumentScan.present() || req.GlobalIndexLookup.present() ||
 		req.Transaction.Operation != TransactionNone) {
-		return nil, errBadPartialAggregate
+		return errBadPartialAggregate
 	}
 	if !req.RowBatch.canonical() || (req.RowBatch.present() &&
 		(req.SQL == "" || req.ExecutionMode != ExecutionReadOnly || mutationCapture ||
 			req.DocumentScan.present() || req.GlobalIndexLookup.present() ||
 			req.Transaction.Operation != TransactionNone || req.MaxRows == 0 ||
 			req.MaxResultBytes == 0)) {
-		return nil, errBadRowBatch
+		return errBadRowBatch
 	}
-	return req, nil
+	return nil
 }
 
 // EncodeResponse writes resp as one framed message. It is deterministic: equal

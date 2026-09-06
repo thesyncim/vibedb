@@ -29,12 +29,12 @@ func TestShardStmtCacheReusesAndInvalidates(t *testing.T) {
 	ctx := context.Background()
 
 	const pointRead = `SELECT name FROM docs WHERE id = ?`
-	first, release, err := c.prepareCached(ctx, pointRead, nil, false)
+	first, _, release, err := c.prepareCached(ctx, pointRead, nil, false)
 	if err != nil {
 		t.Fatalf("prepareCached: %v", err)
 	}
 	release()
-	second, release, err := c.prepareCached(ctx, pointRead, nil, false)
+	second, _, release, err := c.prepareCached(ctx, pointRead, nil, false)
 	if err != nil {
 		t.Fatalf("prepareCached: %v", err)
 	}
@@ -55,7 +55,7 @@ func TestShardStmtCacheReusesAndInvalidates(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
-	txFirst, release, err := c.prepareCached(ctx, txRead, nil, false)
+	txFirst, _, release, err := c.prepareCached(ctx, txRead, nil, false)
 	if err != nil {
 		t.Fatalf("prepareCached in transaction: %v", err)
 	}
@@ -63,7 +63,7 @@ func TestShardStmtCacheReusesAndInvalidates(t *testing.T) {
 	if txFirst.LayoutCurrent() {
 		t.Fatalf("in-transaction prepare claims a reusable layout, want unstamped")
 	}
-	txSecond, release, err := c.prepareCached(ctx, txRead, nil, false)
+	txSecond, _, release, err := c.prepareCached(ctx, txRead, nil, false)
 	if err != nil {
 		t.Fatalf("prepareCached in transaction: %v", err)
 	}
@@ -81,7 +81,7 @@ func TestShardStmtCacheReusesAndInvalidates(t *testing.T) {
 	// Any DDL publish retires the entry: the next identical request must
 	// lower a fresh plan instead of serving the pre-DDL one.
 	exec(t, conn, ownedRequest(`CREATE TABLE retired (id STRING PRIMARY KEY)`))
-	third, release, err := c.prepareCached(ctx, pointRead, nil, false)
+	third, _, release, err := c.prepareCached(ctx, pointRead, nil, false)
 	if err != nil {
 		t.Fatalf("prepareCached after DDL: %v", err)
 	}
@@ -96,7 +96,7 @@ func TestShardStmtCacheReusesAndInvalidates(t *testing.T) {
 	// Sixteen further distinct statements evict the oldest entry first.
 	for i := range shardStmtCacheMax {
 		stmt := fmt.Sprintf(`SELECT n FROM docs WHERE n > %d`, i)
-		if _, release, err := c.prepareCached(ctx, stmt, nil, false); err != nil {
+		if _, _, release, err := c.prepareCached(ctx, stmt, nil, false); err != nil {
 			t.Fatalf("prepareCached %q: %v", stmt, err)
 		} else {
 			release()
@@ -105,7 +105,7 @@ func TestShardStmtCacheReusesAndInvalidates(t *testing.T) {
 	if got := len(c.stmtCache); got != shardStmtCacheMax {
 		t.Fatalf("cache entries = %d, want bound %d", got, shardStmtCacheMax)
 	}
-	fourth, release, err := c.prepareCached(ctx, pointRead, nil, false)
+	fourth, _, release, err := c.prepareCached(ctx, pointRead, nil, false)
 	if err != nil {
 		t.Fatalf("prepareCached after eviction: %v", err)
 	}
@@ -130,10 +130,16 @@ func TestShardStmtCacheEndToEndInvalidation(t *testing.T) {
 	const pointRead = `SELECT n FROM docs WHERE id = ?`
 	read := ownedRequest(pointRead, StringParam("a"))
 	read.ExecutionMode = ExecutionReadOnly
-	for range 3 {
+	// Repeated reads exercise the cached preparation and its cached wire
+	// columns; every response must carry the same column descriptor.
+	for i := range 3 {
 		got := exec(t, conn, read)
 		if len(got.Rows) != 1 || cellText(t, got, 0, 0) != "7" {
 			t.Fatalf("point read rows = %+v, want one row with n = 7", got.Rows)
+		}
+		if len(got.Columns) != 1 || got.Columns[0].Name != "n" ||
+			got.Columns[0].TypeOID != pgOIDJSON {
+			t.Fatalf("point read %d columns = %+v, want one JSON n", i, got.Columns)
 		}
 	}
 
