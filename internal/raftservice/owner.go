@@ -1826,7 +1826,11 @@ func (owner *Owner) handle(request ownerRequest) error {
 			owner.metrics.observeAuthorityReadIndexFallback(request.group)
 		}
 		owner.pendingReads[delivery.context] = delivery
-		owner.setSharedReadBarrier(request.group, delivery.context, delivery.generation, cutoff, status.Term)
+		// No later admitted read can use this proof when the primary is
+		// already the newest admission. Avoid map churn on serial reads.
+		if cutoff > delivery.admission {
+			owner.setSharedReadBarrier(request.group, delivery.context, delivery.generation, cutoff, status.Term)
+		}
 		// The reply is settled only by the matching quorum barrier.
 		return nil
 	default:
@@ -2136,9 +2140,6 @@ func (owner *Owner) syncCommandFenceFromSnapshot(
 // completed or superseded barrier is dropped lazily so a later read issues a
 // fresh round instead of joining a dead one.
 func (owner *Owner) sharedReadBarrierFor(group raftmember.GroupKey, generation *ownerGeneration, admission, term uint64) ([16]byte, bool) {
-	if owner.inflightBarrier == nil {
-		owner.inflightBarrier = make(map[raftmember.GroupKey]sharedReadBarrier)
-	}
 	shared, ok := owner.inflightBarrier[group]
 	if !ok || shared.generation != generation || shared.term != term || admission == 0 || admission > shared.cutoff {
 		return [16]byte{}, false

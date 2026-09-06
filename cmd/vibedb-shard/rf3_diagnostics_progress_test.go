@@ -35,6 +35,7 @@ func TestRF3DiagnosticCanaryCountersMapExactSnapshots(t *testing.T) {
 		AuthorityReadValidationRetries:  18,
 		AuthorityReadValidationFailures: 19,
 		AuthorityRoundAttempts:          20,
+		ReadIndexShared:                 21,
 		ProposalQueueDepthHistogram:     [raftservice.ProposalEntryHistogramBuckets]uint64{2: 13},
 		ProposalEntriesPerReady:         [raftservice.ProposalEntryHistogramBuckets]uint64{2: 14},
 		ProposalBytesPerReady:           [raftservice.ProposalBytesHistogramBuckets]uint64{1: 15},
@@ -52,7 +53,7 @@ func TestRF3DiagnosticCanaryCountersMapExactSnapshots(t *testing.T) {
 		snapshot.AuthorityReadIndexFallbacks != 17 ||
 		snapshot.AuthorityReadValidationRetries != 18 ||
 		snapshot.AuthorityReadValidationFailures != 19 ||
-		snapshot.AuthorityRoundAttempts != 20 {
+		snapshot.AuthorityRoundAttempts != 20 || snapshot.ReadIndexShared != 21 {
 		t.Fatalf("progress counters were not copied exactly: %+v", snapshot)
 	}
 	raw, err := json.Marshal(snapshot)
@@ -66,7 +67,7 @@ func TestRF3DiagnosticCanaryCountersMapExactSnapshots(t *testing.T) {
 	for _, key := range []string{
 		"authority_read_hits", "authority_read_index_fallbacks",
 		"authority_read_validation_retries", "authority_read_validation_failures",
-		"authority_round_attempts",
+		"authority_round_attempts", "read_index_shared",
 	} {
 		if _, ok := encoded[key]; !ok {
 			t.Fatalf("diagnostic JSON omitted %q: %s", key, raw)

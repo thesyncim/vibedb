@@ -41,7 +41,7 @@ type sharedBarrierFixture struct {
 	generation *ownerGeneration
 }
 
-func newSharedBarrierFixture(t *testing.T) *sharedBarrierFixture {
+func newSharedBarrierFixture(t testing.TB) *sharedBarrierFixture {
 	t.Helper()
 	group := peerServerTestGroup()
 	command := CommandFence{ReplicaSetVersion: 1, ActivePolicyGeneration: 1,
@@ -308,5 +308,17 @@ func TestSharedReadBarrierAdmissionSequenceDoesNotWrap(t *testing.T) {
 	}
 	if len(f.owner.ingress) != 0 || f.owner.ingressItems != 0 || d.admission != 0 {
 		t.Fatal("overflow admitted a read")
+	}
+}
+
+func TestSharedReadBarrierSoloDoesNotAllocateSharingMaps(t *testing.T) {
+	f := newSharedBarrierFixture(t)
+	for range 3 {
+		d := f.read(t, false)
+		if f.owner.inflightBarrier != nil || f.owner.sharedBarrierWaiters != nil {
+			t.Fatal("solo read created unused sharing state")
+		}
+		f.settleAll(t, nil)
+		settleDeliveryReply(t, d, 9)
 	}
 }
