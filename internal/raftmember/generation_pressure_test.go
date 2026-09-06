@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
@@ -116,5 +117,89 @@ func TestRuntimeWALPressureRecoveryAfterRestart(t *testing.T) {
 	completion, err := replication.OpenCompletion(lookup.Bytes)
 	if err != nil || completion.ResultCode != replicatedstate.ResultApplied {
 		t.Fatalf("recovered completion=%+v err=%v", completion, err)
+	}
+}
+
+func TestPipelinedWALPressureDrainsUncapturedReady(t *testing.T) {
+	options := testWALOptions()
+	options.MaxRecords = 16
+	options.MaxFileBytes = 256 << 20
+	options.MaxLiveBytes = 2 * raftstore.MinimumReadyLiveBytes
+	fixture := newRuntimeFixtureWithPipeline(t, 243, nil, options, true)
+	drain := func() {
+		t.Helper()
+		var workspace ReadyWorkspace
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if fixture.runtime.walGenerationQuiescent() {
+				return
+			}
+			result, err := fixture.runtime.DriveReady(&workspace, func(OutboundMessage) error { return nil }, settleTestApplied)
+			if err != nil && !errors.Is(err, raftstore.ErrFull) {
+				t.Fatalf("pipelined pressure drain: %v", err)
+			}
+			if fixture.runtime.walGenerationQuiescent() {
+				return
+			}
+			if !result.Progressed() {
+				time.Sleep(100 * time.Microsecond)
+			}
+		}
+		t.Fatal("pipelined pressure drain stalled")
+	}
+	drain()
+	if err := fixture.runtime.Campaign(); err != nil {
+		t.Fatal(err)
+	}
+	drain()
+	open := testApplySessionOpen(fixture.base)
+	if err := fixture.runtime.Propose(open); err != nil {
+		t.Fatal(err)
+	}
+	drain()
+	lookup, err := fixture.apply.LookupCompletion(open)
+	if err != nil {
+		t.Fatal(err)
+	}
+	completion, err := replication.OpenCompletion(lookup.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, document := generationDriverMutation(t, 2)
+	command := testApplyCommand(fixture.base, completion.ClientEpoch, 2, key, document)
+	// Fill the WAL with maintenance disabled, stopping at the settled cut
+	// before an idle DriveReady can run admission maintenance.
+	for i := 0; ; i++ {
+		if err := fixture.wal.ReserveReady(); errors.Is(err, raftstore.ErrFull) {
+			break
+		} else if err != nil || i == 50 {
+			t.Fatalf("fill WAL: i=%d err=%v", i, err)
+		}
+		if err := fixture.runtime.Propose(command); err != nil {
+			t.Fatal(err)
+		}
+		drain()
+	}
+	if err := fixture.runtime.ConfigureWALGeneration(WALGenerationDriverOptions{IntervalTicks: 12000, Key: fixture.walKey}); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.runtime.Propose(command); err != nil {
+		t.Fatal(err)
+	}
+	ready, err := fixture.runtime.node.HasReady()
+	if err != nil || !ready || !fixture.runtime.pipelined.quiescent() {
+		t.Fatalf("expected uncaptured Ready at settled full WAL: ready=%t err=%v", ready, err)
+	}
+	fixture.runtime.pipelined.admission = 0
+	drain()
+	for i := 0; i < 50; i++ {
+		if err := fixture.runtime.Propose(command); err != nil {
+			t.Fatalf("proposal %d: %v", i, err)
+		}
+		drain()
+	}
+	info, err := fixture.wal.GenerationInfo()
+	if err != nil || info.Generation < 2 {
+		t.Fatalf("generation=%+v err=%v", info, err)
 	}
 }
