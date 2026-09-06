@@ -50,10 +50,10 @@ type UnifiedEqFilter struct {
 }
 
 // UnifiedIntegerOrderFilter is the strict storage-native predicate for one
-// signed integer ordering over compact FOR streams. Unlike UnifiedEqFilter it
-// never renders a row: if any present target stream in the snapshot cannot
-// answer exactly, the cursor declines the complete scan and the query layer
-// uses its generic executor.
+// signed integer ordering over eligible compact integer streams. Unlike
+// UnifiedEqFilter it never renders a row: if any present target stream in the
+// snapshot cannot answer exactly, the cursor declines the complete scan and
+// the query layer uses its generic executor.
 type UnifiedIntegerOrderFilter struct {
 	resolver UnifiedHoleResolver
 	needle   int64
@@ -61,15 +61,16 @@ type UnifiedIntegerOrderFilter struct {
 }
 
 // UnifiedIntegerIntervalFilter is the reusable state of one normalized
-// integer interval predicate over compact FOR streams.
+// integer interval predicate over eligible compact integer streams.
 type UnifiedIntegerIntervalFilter struct {
 	resolver UnifiedHoleResolver
 	interval UnifiedIntegerInterval
 }
 
 // UnifiedIntegerExtremaFilter is the strict storage-native aggregate for one
-// numeric field. It accepts only compact FOR target streams; a cursor declines
-// the complete scan when any present target stream is not exact FOR.
+// numeric field. It accepts only eligible compact integer target streams; a
+// cursor declines the complete scan when any present target stream is not
+// exact.
 type UnifiedIntegerExtremaFilter struct {
 	resolver UnifiedHoleResolver
 }
@@ -442,10 +443,14 @@ func (c *PrimaryGraphCursor) FilterCountEq(
 }
 
 // FilterCountIntegerOrdered scans every compact leaf with an all-or-nothing
-// FOR ordering counter. A false result means no count is authoritative: the
-// caller must discard progress and execute the original predicate generically.
+// compact integer ordering counter. allowPrefix controls the newly admitted
+// PrefixInt lane when a persisted skip index needs the generic executor to
+// apply stripe pruning; FOR and RankAffine remain eligible either way. A
+// false result means no count is authoritative: the caller must discard
+// progress and execute the original predicate generically.
 func (c *PrimaryGraphCursor) FilterCountIntegerOrdered(
 	f *UnifiedIntegerOrderFilter, progress *UnifiedFilterProgress,
+	allowPrefix bool,
 ) (supported bool, err error) {
 	if c == nil || f == nil || progress == nil {
 		return false, nil
@@ -455,8 +460,8 @@ func (c *PrimaryGraphCursor) FilterCountIntegerOrdered(
 	}
 	for {
 		if c.row == 0 {
-			matched, ok := c.leaf.CountResolvedIntegerOrdered(
-				&f.resolver, f.needle, f.op,
+			matched, ok := c.leaf.countResolvedIntegerOrdered(
+				&f.resolver, f.needle, f.op, allowPrefix,
 			)
 			if !ok {
 				return false, nil
@@ -476,11 +481,15 @@ func (c *PrimaryGraphCursor) FilterCountIntegerOrdered(
 }
 
 // FilterCountIntegerInterval scans every compact leaf with an all-or-nothing
-// FOR interval counter. A false result means no count is authoritative: the
-// caller must discard progress and execute the original predicate generically.
+// compact integer interval counter. allowPrefix controls the newly admitted
+// PrefixInt lane when a persisted skip index needs the generic executor to
+// apply stripe pruning; FOR and RankAffine remain eligible either way. A
+// false result means no count is authoritative: the caller must discard
+// progress and execute the original predicate generically.
 func (c *PrimaryGraphCursor) FilterCountIntegerInterval(
 	f *UnifiedIntegerIntervalFilter,
 	progress *UnifiedFilterProgress,
+	allowPrefix bool,
 ) (supported bool, err error) {
 	if c == nil || f == nil || progress == nil {
 		return false, nil
@@ -490,8 +499,8 @@ func (c *PrimaryGraphCursor) FilterCountIntegerInterval(
 	}
 	for {
 		if c.row == 0 {
-			matched, ok := c.leaf.CountResolvedIntegerInterval(
-				&f.resolver, f.interval,
+			matched, ok := c.leaf.countResolvedIntegerInterval(
+				&f.resolver, f.interval, allowPrefix,
 			)
 			if !ok {
 				return false, nil
@@ -510,9 +519,9 @@ func (c *PrimaryGraphCursor) FilterCountIntegerInterval(
 	}
 }
 
-// FilterIntegerExtrema scans every compact leaf with an all-or-nothing FOR
-// extrema reduction. A false result leaves the caller with no authoritative
-// value and zeroes the result/progress before returning.
+// FilterIntegerExtrema scans every compact leaf with an all-or-nothing compact
+// integer extrema reduction. A false result leaves the caller with no
+// authoritative value and zeroes the result/progress before returning.
 func (c *PrimaryGraphCursor) FilterIntegerExtrema(
 	f *UnifiedIntegerExtremaFilter,
 	progress *UnifiedIntegerExtremaProgress,

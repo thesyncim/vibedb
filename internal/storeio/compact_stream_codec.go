@@ -1715,10 +1715,10 @@ func (v compactStreamView) appendAlphabetValue(dst []byte, row int) ([]byte, boo
 }
 
 func (v compactStreamView) prefixInteger(row int) (int64, bool) {
-	if v.kind == compactStreamRankAffine {
+	if v.kind != compactStreamPrefixInt {
 		return v.rankAffineInteger(row)
 	}
-	if v.kind != compactStreamPrefixInt || row < 0 || row >= v.count || len(v.data) < 2 {
+	if row < 0 || row >= v.count || len(v.data) < 2 {
 		return 0, false
 	}
 	if v.data[0]&2 == 0 {

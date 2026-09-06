@@ -194,12 +194,12 @@ func (v compactStreamView) rankAffineInteger(rank int) (int64, bool) {
 // Numeric fast paths accept only the bare canonical nonnegative-integer
 // spelling. Affixed strings retain their exact bytes without a numeric cast.
 func (v compactStreamView) rankAffineIsNumber() bool {
-	if v.kind != compactStreamRankAffine || len(v.data) != 18 || v.data[0] != 2 {
+	if v.kind != compactStreamRankAffine || len(v.data) != 18 || v.data[0] != 2 ||
+		v.dictCount != 2 || len(v.dictDir) != 4 ||
+		binary.LittleEndian.Uint32(v.dictDir) != 0 {
 		return false
 	}
-	prefix, pOK := v.dictionaryEntry(0)
-	suffix, sOK := v.dictionaryEntry(1)
-	return pOK && sOK && len(prefix) == 0 && len(suffix) == 0
+	return true
 }
 
 func (v compactStreamView) rankAffineFindInteger(value int64) (int, bool) {

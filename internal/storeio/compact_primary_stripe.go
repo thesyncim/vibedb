@@ -2088,6 +2088,15 @@ func (v *CompactPrimaryStripeView) CountResolvedIntegerOrdered(
 	needle int64,
 	op UnifiedIntegerOrder,
 ) (matched int, ok bool) {
+	return v.countResolvedIntegerOrdered(resolver, needle, op, true)
+}
+
+func (v *CompactPrimaryStripeView) countResolvedIntegerOrdered(
+	resolver *UnifiedHoleResolver,
+	needle int64,
+	op UnifiedIntegerOrder,
+	allowPrefix bool,
+) (matched int, ok bool) {
 	if v == nil || resolver == nil || !validUnifiedIntegerOrder(op) ||
 		len(v.overflow) != 0 {
 		return 0, false
@@ -2115,7 +2124,8 @@ func (v *CompactPrimaryStripeView) CountResolvedIntegerOrdered(
 				var supported bool
 				if stream.kind == compactStreamRankAffine {
 					count, supported = v.rankAffineShapeOrdered(stream, shape, needle, op)
-				} else if stream.kind == compactStreamFOR || stream.kind == compactStreamPrefixInt {
+				} else if stream.kind == compactStreamFOR ||
+					(stream.kind == compactStreamPrefixInt && allowPrefix) {
 					count, supported = stream.countIntegerOrdered(needle, op)
 				}
 				if !supported {
@@ -2137,6 +2147,14 @@ func (v *CompactPrimaryStripeView) CountResolvedIntegerOrdered(
 func (v *CompactPrimaryStripeView) CountResolvedIntegerInterval(
 	resolver *UnifiedHoleResolver,
 	interval UnifiedIntegerInterval,
+) (matched int, ok bool) {
+	return v.countResolvedIntegerInterval(resolver, interval, true)
+}
+
+func (v *CompactPrimaryStripeView) countResolvedIntegerInterval(
+	resolver *UnifiedHoleResolver,
+	interval UnifiedIntegerInterval,
+	allowPrefix bool,
 ) (matched int, ok bool) {
 	if v == nil || resolver == nil || len(v.overflow) != 0 {
 		return 0, false
@@ -2164,7 +2182,8 @@ func (v *CompactPrimaryStripeView) CountResolvedIntegerInterval(
 				var supported bool
 				if stream.kind == compactStreamRankAffine {
 					count, supported = v.rankAffineShapeInterval(stream, shape, interval)
-				} else if stream.kind == compactStreamFOR || stream.kind == compactStreamPrefixInt {
+				} else if stream.kind == compactStreamFOR ||
+					(stream.kind == compactStreamPrefixInt && allowPrefix) {
 					count, supported = stream.countIntegerInterval(interval)
 				}
 				if !supported {
