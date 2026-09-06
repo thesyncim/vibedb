@@ -54,6 +54,7 @@ type ProgressMetrics struct {
 	authorityReadValidationRetries  atomic.Uint64
 	authorityReadValidationFailures atomic.Uint64
 	authorityRoundAttempts          atomic.Uint64
+	readIndexShared                 atomic.Uint64
 	scheduler                       progressMetricsSchedulerCounters
 	groups                          atomic.Pointer[progressMetricsGroupTable]
 }
@@ -73,6 +74,7 @@ type progressMetricsCounters struct {
 	authorityReadValidationRetries                   atomic.Uint64
 	authorityReadValidationFailures                  atomic.Uint64
 	authorityRoundAttempts                           atomic.Uint64
+	readIndexShared                                  atomic.Uint64
 	scheduler                                        progressMetricsSchedulerCounters
 }
 
@@ -115,6 +117,9 @@ type ProgressMetricsSnapshot struct {
 	AuthorityReadValidationRetries  uint64
 	AuthorityReadValidationFailures uint64
 	AuthorityRoundAttempts          uint64
+	// ReadIndexShared counts linearizable reads that joined another read's
+	// in-flight quorum barrier instead of issuing their own ReadIndex round.
+	ReadIndexShared uint64
 
 	// ProposalWindowQueued is the cumulative number of queued proposals
 	// observed while an open normal-proposal window had room. The depth
@@ -313,6 +318,16 @@ func (metrics *ProgressMetrics) observeAuthorityRoundAttempt(group raftmember.Gr
 	}
 }
 
+func (metrics *ProgressMetrics) observeReadIndexShared(group raftmember.GroupKey) {
+	if metrics == nil {
+		return
+	}
+	metrics.readIndexShared.Add(1)
+	if counters := metrics.group(group); counters != nil {
+		counters.counters.readIndexShared.Add(1)
+	}
+}
+
 // ConfigureGroups publishes a bounded immutable open-addressed directory for
 // zero-allocation per-group counter updates. It must run before owner lanes;
 // repeated configuration is rejected so no hot-path counter can be orphaned.
@@ -405,6 +420,7 @@ func (metrics *ProgressMetrics) GroupProgressMetrics(group raftmember.GroupKey) 
 		AuthorityReadValidationRetries:  c.authorityReadValidationRetries.Load(),
 		AuthorityReadValidationFailures: c.authorityReadValidationFailures.Load(),
 		AuthorityRoundAttempts:          c.authorityRoundAttempts.Load(),
+		ReadIndexShared:                 c.readIndexShared.Load(),
 	}
 	c.scheduler.snapshot(&snapshot)
 	return slot.identity, snapshot, true
@@ -431,6 +447,7 @@ func (metrics *ProgressMetrics) Snapshot() ProgressMetricsSnapshot {
 		AuthorityReadValidationRetries:  metrics.authorityReadValidationRetries.Load(),
 		AuthorityReadValidationFailures: metrics.authorityReadValidationFailures.Load(),
 		AuthorityRoundAttempts:          metrics.authorityRoundAttempts.Load(),
+		ReadIndexShared:                 metrics.readIndexShared.Load(),
 	}
 	metrics.scheduler.snapshot(&snapshot)
 	return snapshot

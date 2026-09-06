@@ -261,6 +261,16 @@ type ownerGeneration struct {
 	quiescing        atomic.Bool
 }
 
+// sharedReadBarrier identifies the one pending quorum barrier new reads of a
+// group may join. Generation pins the serving membership the barrier was
+// issued under; a changed generation forces a fresh barrier instead of
+// sharing, so an attached waiter is indistinguishable from a second request
+// admitted in the same owner turn.
+type sharedReadBarrier struct {
+	context    [16]byte
+	generation *ownerGeneration
+}
+
 func (generation *ownerGeneration) acquire() bool {
 	if generation == nil || generation.transitionFenced.Load() || generation.quiescing.Load() {
 		return false
@@ -715,6 +725,15 @@ type Owner struct {
 	pendingReadBytes     int64
 	readSequence         uint64
 	pendingReads         map[[16]byte]*readDelivery
+	// sharedBarrierWaiters attaches concurrent linearizable reads to one
+	// in-flight quorum barrier per group instead of issuing a ReadIndex
+	// round each. inflightBarrier maps a group to the barrier same-generation
+	// reads may join. Both maps are owned by the serialized owner lane:
+	// handle registers, finishReadOutcomes and drain settle and remove. A
+	// lone read never waits for company, so single-client latency is
+	// unchanged by sharing.
+	sharedBarrierWaiters map[[16]byte][]*readDelivery
+	inflightBarrier      map[raftmember.GroupKey]sharedReadBarrier
 	started              bool
 	closed               bool
 	failure              error
@@ -1707,6 +1726,22 @@ func (owner *Owner) handle(request ownerRequest) error {
 		request.read.delivery.serving = serving
 		delivery := request.read.delivery
 		if !delivery.contextSet {
+			// Join the group's in-flight barrier when it was issued under the
+			// same serving generation: the quorum proof (leadership plus
+			// commit index) does not depend on which concurrent request
+			// triggered it, and every waiter keeps its own floor, source,
+			// fence, and generation pin, validated exactly as with a private
+			// barrier. Retried (forceReadIndex) reads always take a fresh
+			// barrier so a fallback never reuses the proof it rejected.
+			if !request.read.forceReadIndex {
+				if shared, ok := owner.sharedReadBarrierFor(request.group, delivery.generation); ok {
+					delivery.context = shared
+					delivery.contextSet = true
+					owner.sharedBarrierWaiters[shared] = append(owner.sharedBarrierWaiters[shared], delivery)
+					owner.metrics.observeReadIndexShared(request.group)
+					return nil
+				}
+			}
 			context, contextErr := owner.nextReadContext(member.identity.NodeIncarnation)
 			if contextErr != nil {
 				reply.err = contextErr
@@ -1730,6 +1765,7 @@ func (owner *Owner) handle(request ownerRequest) error {
 			owner.metrics.observeAuthorityReadIndexFallback(request.group)
 		}
 		owner.pendingReads[delivery.context] = delivery
+		owner.setSharedReadBarrier(request.group, delivery.context, delivery.generation)
 		// The reply is settled only by the matching quorum barrier.
 		return nil
 	default:
@@ -2034,6 +2070,35 @@ func (owner *Owner) syncCommandFenceFromSnapshot(
 	return nil
 }
 
+// sharedReadBarrierFor returns the group's pending barrier context when a new
+// read may join it: same serving generation and barrier still pending. A
+// completed or superseded barrier is dropped lazily so a later read issues a
+// fresh round instead of joining a dead one.
+func (owner *Owner) sharedReadBarrierFor(group raftmember.GroupKey, generation *ownerGeneration) ([16]byte, bool) {
+	if owner.inflightBarrier == nil {
+		owner.inflightBarrier = make(map[raftmember.GroupKey]sharedReadBarrier)
+	}
+	shared, ok := owner.inflightBarrier[group]
+	if !ok || shared.generation != generation {
+		return [16]byte{}, false
+	}
+	if _, pending := owner.pendingReads[shared.context]; !pending {
+		delete(owner.inflightBarrier, group)
+		return [16]byte{}, false
+	}
+	if owner.sharedBarrierWaiters == nil {
+		owner.sharedBarrierWaiters = make(map[[16]byte][]*readDelivery)
+	}
+	return shared.context, true
+}
+
+func (owner *Owner) setSharedReadBarrier(group raftmember.GroupKey, context [16]byte, generation *ownerGeneration) {
+	if owner.inflightBarrier == nil {
+		owner.inflightBarrier = make(map[raftmember.GroupKey]sharedReadBarrier)
+	}
+	owner.inflightBarrier[group] = sharedReadBarrier{context: context, generation: generation}
+}
+
 func (owner *Owner) nextReadContext(incarnation uint64) ([16]byte, error) {
 	if owner.readSequence == ^uint64(0) || len(owner.pendingReads) >= owner.limits.MaxPendingReadItems {
 		return [16]byte{}, ErrIngressFull
@@ -2058,32 +2123,44 @@ func (owner *Owner) finishReadOutcomes(outcomes []raftmodel.ReadOutcome) {
 			continue
 		}
 		delete(owner.pendingReads, key)
-		if delivery.state.Load() != readDeliveryPending {
-			continue
+		owner.settleReadBarrierDelivery(delivery, outcome)
+		for _, waiter := range owner.sharedBarrierWaiters[key] {
+			owner.settleReadBarrierDelivery(waiter, outcome)
 		}
-		reply := ownerReply{err: outcome.Err}
-		if outcome.Err == nil {
-			if !delivery.generation.acquire() {
-				reply.err = ErrServingFence
-				if !owner.settleReadDelivery(delivery, reply) && reply.read.generation != nil {
-					reply.read.generation.release()
-				}
-				continue
+		delete(owner.sharedBarrierWaiters, key)
+	}
+}
+
+// settleReadBarrierDelivery settles one waiter of a completed quorum barrier:
+// the primary first, then every read that joined it. Each waiter keeps its
+// own applied floor, source, and generation pin, so sharing the barrier
+// changes how many ReadIndex rounds run, never what any waiter observes.
+func (owner *Owner) settleReadBarrierDelivery(delivery *readDelivery, outcome raftmodel.ReadOutcome) {
+	if delivery.state.Load() != readDeliveryPending {
+		return
+	}
+	reply := ownerReply{err: outcome.Err}
+	if outcome.Err == nil {
+		if !delivery.generation.acquire() {
+			reply.err = ErrServingFence
+			if !owner.settleReadDelivery(delivery, reply) && reply.read.generation != nil {
+				reply.read.generation.release()
 			}
-			reply.read.minimumApplied = max(delivery.minimumApplied, outcome.Barrier.Index)
-			// Source was authenticated at admission and remains bound to the
-			// immutable owner member for this allocation.
-			reply.read.source = delivery.source
-			reply.read.recovery = delivery.recovery
-			reply.read.requestLedger = delivery.requestLedger
-			reply.read.generation = delivery.generation
-			reply.read.executionPin = delivery.executionPin
-			reply.read.routeGate = delivery.routeGate
-			reply.read.state = delivery.serving
+			return
 		}
-		if !owner.settleReadDelivery(delivery, reply) && reply.read.generation != nil {
-			reply.read.generation.release()
-		}
+		reply.read.minimumApplied = max(delivery.minimumApplied, outcome.Barrier.Index)
+		// Source was authenticated at admission and remains bound to the
+		// immutable owner member for this allocation.
+		reply.read.source = delivery.source
+		reply.read.recovery = delivery.recovery
+		reply.read.requestLedger = delivery.requestLedger
+		reply.read.generation = delivery.generation
+		reply.read.executionPin = delivery.executionPin
+		reply.read.routeGate = delivery.routeGate
+		reply.read.state = delivery.serving
+	}
+	if !owner.settleReadDelivery(delivery, reply) && reply.read.generation != nil {
+		reply.read.generation.release()
 	}
 }
 
@@ -2495,9 +2572,14 @@ func (owner *Owner) stop(cause error) error {
 		close(owner.done)
 	}
 	owner.mu.Unlock()
+	closedErr := ownerReply{err: errors.Join(ErrOwnerClosed, cause)}
 	for key, delivery := range owner.pendingReads {
 		delete(owner.pendingReads, key)
-		owner.settleReadDelivery(delivery, ownerReply{err: errors.Join(ErrOwnerClosed, cause)})
+		owner.settleReadDelivery(delivery, closedErr)
+		for _, waiter := range owner.sharedBarrierWaiters[key] {
+			owner.settleReadDelivery(waiter, closedErr)
+		}
+		delete(owner.sharedBarrierWaiters, key)
 	}
 	for {
 		select {
