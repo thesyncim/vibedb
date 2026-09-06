@@ -156,6 +156,14 @@ func (registry *StaticRegistry) preflightOutbound(
 		view = view.previous
 		version = view.version
 	}
+	// A surviving voter may have the removal entry but not its commit.
+	// Send only its heartbeat under the exact retired version; validate both
+	// endpoints below against the CURRENT roster, so the removed source can
+	// neither send nor receive this catch-up traffic.
+	if outbound.Message.GetType() == pb.MsgHeartbeat && view.retiredVersion != 0 &&
+		view.roles[outbound.From] == MemberVoter && view.roles[outbound.To] == MemberVoter {
+		version = view.retiredVersion
+	}
 	if election, electionOK := certifiedPromotionElectionAuthority(view, outbound.Message,
 		view.promotionVersion()); electionOK {
 		view = election
@@ -344,6 +352,14 @@ func (registry *StaticRegistry) DecodeInbound(authenticated PeerIdentity, frame 
 		if currentOK {
 			view, ok = certifiedPromotionElectionAuthority(current, message, header.version)
 		}
+	}
+	// Removal catch-up heartbeats and their responses can carry the exact
+	// retired version before or after both survivors apply removal. This
+	// admits no old-view append or voting traffic and never restores a
+	// removed member's authority.
+	if !ok && currentOK && current.retiredVersion != 0 && header.version == current.retiredVersion &&
+		(message.GetType() == pb.MsgHeartbeat || message.GetType() == pb.MsgHeartbeatResp) && current.roles[header.from] == MemberVoter && current.roles[header.to] == MemberVoter {
+		view, ok = current, true
 	}
 	if !ok {
 		view, ok = registry.prospectiveAuthority(header.group, header.version, message)
