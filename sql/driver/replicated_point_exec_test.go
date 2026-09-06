@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/thesyncim/vibedb/query"
 )
 
 func TestReplicatedPointIntoZeroAllocationAndLiveIdentity(t *testing.T) {
