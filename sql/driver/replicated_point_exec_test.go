@@ -56,6 +56,19 @@ func TestReplicatedPointIntoZeroAllocationAndLiveIdentity(t *testing.T) {
 			t.Fatalf("found=%v: %.0f allocations, want zero", found, allocations)
 		}
 	}
+	// A real cancellable request must remain allocation-free with its existing
+	// channel bound into the executor; no watcher is required for warm hits/misses.
+	requestCtx, cancelRequest := context.WithCancel(context.Background())
+	defer cancelRequest()
+	var flag query.CancelFlag
+	flag.BindDone(requestCtx.Done())
+	ctx, options.Cancel = requestCtx, &flag
+	for _, found := range []bool{true, false} {
+		run(found)
+		if allocations := testing.AllocsPerRun(100, func() { run(found) }); allocations != 0 {
+			t.Fatalf("cancellable found=%v: %.0f allocations, want zero", found, allocations)
+		}
+	}
 	if err := acquire(true); err != nil {
 		t.Fatal(err)
 	}

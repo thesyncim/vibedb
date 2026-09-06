@@ -1,6 +1,10 @@
 package driver
 
-import "testing"
+import (
+	"context"
+	"github.com/thesyncim/vibedb/query"
+	"testing"
+)
 
 // This benchmark is a diagnostic CPU loop for the replicated point-read
 // caller. Every timed iteration includes cache Acquire, candidate-key SQL
@@ -201,4 +205,35 @@ func replicatedPointIntoLoop(t testing.TB, f *replicatedReadExecutorBenchFixture
 		run(i)
 	}
 	return run
+}
+
+// Compare the original callback plus driver watcher with direct observation
+// of the request context channel at existing executor checkpoints.
+func BenchmarkReplicatedPointReadCancellation(b *testing.B) {
+	f := newReplicatedReadExecutorBenchFixture(b)
+	for _, shared := range []bool{false, true} {
+		name := "duplicate"
+		if shared {
+			name = "direct"
+		}
+		b.Run(name, func(b *testing.B) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var flag query.CancelFlag
+			f.ctx, f.options.Cancel = ctx, &flag
+			run := replicatedPointIntoLoop(b, f, true)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if shared {
+					flag.BindDone(ctx.Done())
+					run(i)
+				} else {
+					stop := context.AfterFunc(ctx, flag.Cancel)
+					run(i)
+					stop()
+				}
+			}
+		})
+	}
 }

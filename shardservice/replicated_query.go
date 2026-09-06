@@ -45,6 +45,7 @@ type replicatedSQLLease struct {
 	bytes  int64
 	point  sqldriver.ReplicatedReadLease
 	cursor sqldriver.Cursor
+	cancel query.CancelFlag
 }
 
 func (l *replicatedSQLLease) Release() {
@@ -546,7 +547,13 @@ func replicatedSemanticSQLResultValid(response *ShardResponse) bool {
 
 func executeFencedSQLBudget(ctx context.Context, source interface {
 	NewDataReadSession(context.Context, *replicatedstate.DataReadCut, query.ExecOptions) (*sqldriver.ReplicatedReadSession, error)
-}, cut *replicatedstate.DataReadCut, req *ShardRequest, budget replicatedSQLBudget) ([]byte, error) {
+}, cut *replicatedstate.DataReadCut, req *ShardRequest, budget replicatedSQLBudget) (encoded []byte, err error) {
+	defer func() {
+		err = replicatedSQLContextError(ctx, err)
+		if err != nil {
+			encoded = nil
+		}
+	}()
 	maxBytes := budget.resultBytes
 	if req.ExecutionMode != ExecutionReadOnly || req.ReadPolicy != ReadStrong ||
 		req.Transaction.Operation != 0 || req.Exchange.Operation != 0 || req.Repartition.present() ||
@@ -562,8 +569,7 @@ func executeFencedSQLBudget(ctx context.Context, source interface {
 		maxBytes = int(req.MaxResultBytes)
 	}
 	var flag query.CancelFlag
-	stop := context.AfterFunc(ctx, flag.Cancel)
-	defer stop()
+	flag.BindDone(ctx.Done())
 	options := query.ExecOptions{
 		Cancel: &flag, ResultRows: rows, ResultBytes: int64(maxBytes),
 		MemoryBytes: budget.workingBytes, IntermediateBytes: budget.workingBytes,
@@ -615,7 +621,13 @@ func executeFencedSQLPointBudget(
 	budget replicatedSQLBudget,
 	point replicatedstate.PointReadResult,
 	frame *replicatedSQLLease,
-) ([]byte, error) {
+) (encoded []byte, err error) {
+	defer func() {
+		err = replicatedSQLContextError(ctx, err)
+		if err != nil {
+			encoded = nil
+		}
+	}()
 	maxBytes := budget.resultBytes
 	if req.ExecutionMode != ExecutionReadOnly || req.ReadPolicy != ReadStrong ||
 		req.Transaction.Operation != 0 || req.Exchange.Operation != 0 || req.Repartition.present() ||
@@ -630,11 +642,12 @@ func executeFencedSQLPointBudget(
 	if req.MaxResultBytes > 0 && req.MaxResultBytes < uint64(maxBytes) {
 		maxBytes = int(req.MaxResultBytes)
 	}
-	var flag query.CancelFlag
-	stop := context.AfterFunc(ctx, flag.Cancel)
-	defer stop()
+	flag := &frame.cancel
+	flag.Reset()
+	flag.BindDone(ctx.Done())
+	defer flag.BindDone(nil)
 	options := query.ExecOptions{
-		Cancel: &flag, ResultRows: rows, ResultBytes: int64(maxBytes),
+		Cancel: flag, ResultRows: rows, ResultBytes: int64(maxBytes),
 		MemoryBytes: budget.workingBytes, IntermediateBytes: budget.workingBytes,
 		AggregateBytes: budget.workingBytes,
 	}
@@ -645,7 +658,7 @@ func executeFencedSQLPointBudget(
 		err := reusable.AcquireReplicatedPointReadInto(ctx, primary.Relation, primary.Keys[0],
 			point.Found, point.Value, primary.PrimaryPath, req.SQL, req.ParamTypes, req.PartialAggregate, options, &frame.point)
 		if err == nil {
-			return executeFencedSQLLease(ctx, &frame.point, req, budget, &flag, &frame.cursor)
+			return executeFencedSQLLease(ctx, &frame.point, req, budget, flag, &frame.cursor)
 		}
 		if !errors.Is(err, sqldriver.ErrReplicatedReadReuseUnsupported) {
 			return nil, err
@@ -658,7 +671,7 @@ func executeFencedSQLPointBudget(
 			options,
 		)
 		if acquireErr == nil {
-			return executeFencedSQLLease(ctx, lease, req, budget, &flag, &frame.cursor)
+			return executeFencedSQLLease(ctx, lease, req, budget, flag, &frame.cursor)
 		}
 		if !errors.Is(acquireErr, sqldriver.ErrReplicatedReadReuseUnsupported) {
 			return nil, acquireErr
@@ -688,7 +701,7 @@ func executeFencedSQLPointBudget(
 	}
 	encoding := trace.StartRegion(ctx, "sql.read.encode")
 	defer encoding.End()
-	return encodeSQLReadCursor(cursor.Snapshot(), prepared.Columns(), budget.resultBytes, &flag)
+	return encodeSQLReadCursor(cursor.Snapshot(), prepared.Columns(), budget.resultBytes, flag)
 }
 
 func executeFencedSQLLease(
@@ -732,6 +745,14 @@ func executeFencedSQLLease(
 		err = finishErr
 	}
 	return encoded, err
+}
+
+// Preserve context errors for both query execution and result encoding.
+func replicatedSQLContextError(ctx context.Context, err error) error {
+	if contextErr := ctx.Err(); contextErr != nil && (err == nil || errors.Is(err, query.ErrCanceled)) {
+		return contextErr
+	}
+	return err
 }
 
 // sqlLimit leaves native frame capacity outside SQL execution reservations.
