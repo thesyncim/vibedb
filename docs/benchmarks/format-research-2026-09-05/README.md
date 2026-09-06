@@ -1,5 +1,8 @@
 # Astra max storage-format research
 
+Latest implementation evidence: [qualified primary/query comparison at 1308f16a](rank-affine/qualified-1308f16a/README.md). The estimates and unimplemented-design notes below describe the initial investigation; the dated qualification records the later implemented rank-affine format and its remaining measured regressions.
+
+
 Research baseline: latest fetched main `f05df25e8bebc13d9bfe11a2038bab43805f6c3d`.
 The task worktree was rebased onto that revision before the final source review.
 Two independent researchers used `gpt-6-astra` with reasoning effort `max`:

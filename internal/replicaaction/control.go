@@ -7,6 +7,7 @@ package replicaaction
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -77,7 +78,7 @@ type Record struct {
 // Journal durably publishes before returning nil. Publish may have committed
 // when it returns an error; the service always resolves with an exact read.
 type Journal interface {
-	ReadReplicaAction(context.Context, [32]byte) (Record, error)
+	ReadReplicaAction(context.Context, [32]byte, Kind) (Record, error)
 	PublishReplicaAction(context.Context, uint64, Record) error
 }
 
@@ -235,7 +236,7 @@ func (service *Service) Execute(ctx context.Context, request Request) (Record, e
 }
 
 func (service *Service) loadOrCreate(ctx context.Context, request Request) (Record, error) {
-	record, err := service.journal.ReadReplicaAction(ctx, request.Operation)
+	record, err := service.journal.ReadReplicaAction(ctx, request.Operation, request.Kind)
 	if err == nil {
 		if !validRecord(record) || !equalRequest(record.Request, request) {
 			return Record{}, ErrConflict
@@ -257,7 +258,7 @@ func (service *Service) publishExact(ctx context.Context, expected uint64, next 
 	if err == nil {
 		return nil
 	}
-	observed, readErr := service.journal.ReadReplicaAction(ctx, next.Request.Operation)
+	observed, readErr := service.journal.ReadReplicaAction(ctx, next.Request.Operation, next.Request.Kind)
 	if readErr == nil && validRecord(observed) && equalRecord(observed, next) {
 		return nil
 	}
@@ -539,4 +540,13 @@ func writeFull(writer io.Writer, raw []byte) error {
 		raw = raw[n:]
 	}
 	return nil
+}
+
+// Each move can run both actions on the same physical node. Keep their durable
+// records separate while preserving the full original operation in the record.
+func replicaActionJournalKey(operation [32]byte, kind Kind) [32]byte {
+	var input [33]byte
+	copy(input[:32], operation[:])
+	input[32] = byte(kind)
+	return sha256.Sum256(input[:])
 }
