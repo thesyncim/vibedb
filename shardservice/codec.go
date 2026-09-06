@@ -426,15 +426,47 @@ func (d *deccur) end() error {
 	return nil
 }
 
+// maxFrameArenaBytes caps the encoder arena a FrameEncoder retains between
+// messages. Larger frames keep freshly allocated arenas instead of pinning
+// megabytes per connection.
+const maxFrameArenaBytes = 64 << 10
+
+// FrameEncoder owns one reusable wire-frame arena for a connection. Every
+// encoder output flows straight into a single Write and is dead afterwards,
+// so the arena is simply resliced for the next message: steady-state encodes
+// allocate nothing, deterministically, with no pool to drain under GC
+// pressure. A FrameEncoder must serve one writer at a time; connections
+// already serialize their writes, so each conn holds one.
+//
+// Read buffers are deliberately NOT owned or reused: decoded parameters,
+// keys, and cells alias the frame body zero-copy, so a reused read arena
+// would corrupt live requests and responses. Encodes whose bytes outlive the
+// Write (nested envelopes) likewise keep fresh arenas.
+type FrameEncoder struct {
+	arena []byte
+}
+
 // newFrameEncoder reserves the wire header in the same arena as the body. This
 // keeps the single-Write contract without copying a completed multi-megabyte
 // body into a second whole-frame allocation.
-func newFrameEncoder(payloadHint int) encbuf {
+func newFrameEncoder(arena []byte, payloadHint int) encbuf {
 	capacity := 5 + 256
 	if payloadHint > 0 && payloadHint <= maxFrameBody-256 {
 		capacity += payloadHint
 	}
+	if cap(arena) >= capacity {
+		return encbuf{b: arena[:5]}
+	}
 	return encbuf{b: make([]byte, 5, capacity)}
+}
+
+// keepFrameArena returns the backing array worth retaining for the next
+// encode, or nil when the frame outgrew the retention bound.
+func keepFrameArena(frame []byte) []byte {
+	if cap(frame) > maxFrameArenaBytes {
+		return nil
+	}
+	return frame
 }
 
 func writeEncodedFrame(w io.Writer, tag byte, frame []byte) error {
@@ -445,7 +477,7 @@ func writeEncodedFrame(w io.Writer, tag byte, frame []byte) error {
 	binary.BigEndian.PutUint32(frame[1:5], uint32(len(frame)-1))
 	n, err := w.Write(frame)
 	if err == nil && n != len(frame) {
-		return io.ErrShortWrite
+		err = io.ErrShortWrite
 	}
 	return err
 }
@@ -1547,12 +1579,22 @@ func decodeTransactionReply(d *deccur) (TransactionReply, error) {
 
 // EncodeRequest writes req as one framed message. It is deterministic: equal
 // requests encode to identical bytes.
+// EncodeRequest emits one request frame with a fresh arena. Connections
+// making repeated requests should hold a FrameEncoder and call its method
+// instead, reusing one arena across the connection's lifetime.
 func EncodeRequest(w io.Writer, req *ShardRequest) error {
+	return (&FrameEncoder{}).EncodeRequest(w, req)
+}
+
+// EncodeRequest encodes one request frame into the encoder's owned arena,
+// writes it, and retains the arena for the next call.
+func (f *FrameEncoder) EncodeRequest(w io.Writer, req *ShardRequest) error {
 	if err := ValidateRequest(req); err != nil {
 		return err
 	}
 
-	e := newFrameEncoder(len(req.Exchange.Batch.Data))
+	e := newFrameEncoder(f.arena, len(req.Exchange.Batch.Data))
+	defer func() { f.arena = keepFrameArena(e.b) }()
 	e.u8(wireVersion)
 	e.str(req.SQL)
 	e.str(string(req.Distribution))
@@ -1681,16 +1723,33 @@ func EncodeRequest(w io.Writer, req *ShardRequest) error {
 // DecodeRequest reads one framed request. A malformed or oversized frame yields
 // a typed error, never a panic or an out-of-memory allocation.
 func DecodeRequest(r io.Reader) (*ShardRequest, error) {
+	req := &ShardRequest{}
+	if err := decodeBorrowedRequest(r, req); err != nil {
+		return nil, err
+	}
+	return req, nil
+}
+
+// decodeBorrowedRequest fills a zeroed shell from one framed request. The
+// shell must be zero on entry: absent optional lanes leave their fields
+// untouched, so a reused shell would otherwise serve stale values.
+// DecodeRequest allocates a fresh shell per call; the connection loop
+// borrows zeroed shells from the request pool instead.
+func decodeBorrowedRequest(r io.Reader, req *ShardRequest) error {
 	body, err := readFrame(r, tagRequest)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	d := deccur{b: body}
 	if d.u8() != wireVersion {
-		return nil, errBadVersion
+		return errBadVersion
 	}
+	return decodeRequestFields(&d, req)
+}
 
-	req := &ShardRequest{}
+// decodeRequestFields fills a request shell from one decoded frame.
+func decodeRequestFields(d *deccur, req *ShardRequest) error {
+	var err error
 	req.SQL = d.str()
 	req.Distribution = distribution.DistributionName(d.str())
 	req.Shard = distribution.ShardID(d.str())
@@ -1703,7 +1762,7 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 	req.ExecutionMode = mode
 	deadline := d.u64()
 	if deadline > math.MaxInt64 {
-		return nil, errNegativeDuration
+		return errNegativeDuration
 	}
 	req.Deadline = time.Duration(deadline)
 	req.MaxResultBytes = d.u64()
@@ -1719,14 +1778,14 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 				break
 			}
 			if !kind.valid() {
-				return nil, errBadEnum
+				return errBadEnum
 			}
 			p := Param{Kind: kind}
 			switch kind {
 			case ParamBool:
 				marker := d.u8()
 				if marker > 1 {
-					return nil, errBadEnum
+					return errBadEnum
 				}
 				p.Bool = marker == 1
 			case ParamNumber, ParamString, ParamDocument:
@@ -1734,14 +1793,14 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 			case ParamNull:
 			}
 			if !d.bad() && !p.Valid() {
-				return nil, errBadParam
+				return errBadParam
 			}
 			req.Params[i] = p
 		}
 	}
 	req.HasMinPosition, req.MinPosition, err = d.position()
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if len(d.b) != 0 && d.b[0] == accessScopeMarker {
 		d.u8()
@@ -1754,14 +1813,14 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 			}
 		}
 		if d.bad() || !distributedtxn.ValidateIntentScopes(req.AccessScopes, req.BucketBits) {
-			return nil, errBadTransaction
+			return errBadTransaction
 		}
 	}
 	if len(d.b) != 0 && d.b[0] == readFenceMarker {
 		d.u8()
 		req.ReadFenceID = distributedtxn.ID(d.fixed16())
 		if d.bad() || req.ReadFenceID.IsZero() {
-			return nil, errBadTransaction
+			return errBadTransaction
 		}
 	}
 	if len(d.b) != 0 && d.b[0] == globalIndexLookupMarker {
@@ -1779,11 +1838,11 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 		req.GlobalIndexLookup.LocatorCount = d.u8()
 		unique := d.u8()
 		if unique > 1 {
-			return nil, errBadEnum
+			return errBadEnum
 		}
 		req.GlobalIndexLookup.Unique = unique == 1
 		if d.bad() || !req.GlobalIndexLookup.canonical() {
-			return nil, errBadGlobalIndexLookup
+			return errBadGlobalIndexLookup
 		}
 	}
 	if len(d.b) != 0 && (d.b[0] == primaryKeyReadMarker || d.b[0] == primaryKeyReadExtendedMarker) {
@@ -1800,12 +1859,12 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 			for i := range req.PrimaryKeyRead.Keys {
 				req.PrimaryKeyRead.Keys[i] = d.slice()
 				if len(req.PrimaryKeyRead.Keys[i]) == 0 {
-					return nil, errBadPrimaryKeyRead
+					return errBadPrimaryKeyRead
 				}
 			}
 		}
 		if d.bad() || !req.PrimaryKeyRead.canonical() {
-			return nil, errBadPrimaryKeyRead
+			return errBadPrimaryKeyRead
 		}
 	}
 	if len(d.b) != 0 && d.b[0] == mutationCaptureMarker {
@@ -1817,7 +1876,7 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 		req.DocumentScan.Relation = d.slice()
 		req.DocumentScan.After = d.slice()
 		if d.bad() || !req.DocumentScan.canonical() {
-			return nil, errBadDocumentScan
+			return errBadDocumentScan
 		}
 	}
 	if len(d.b) != 0 && d.b[0] == partialAggregateMarker {
@@ -1829,28 +1888,28 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 		req.RowBatch.BatchRows = d.u32()
 		req.RowBatch.BatchBytes = d.u32()
 		if d.bad() || !req.RowBatch.canonical() {
-			return nil, errBadRowBatch
+			return errBadRowBatch
 		}
 	}
 	if len(d.b) != 0 && d.b[0] == repartitionMarker {
 		d.u8()
-		req.Repartition, err = decodeRepartitionRequest(&d)
+		req.Repartition, err = decodeRepartitionRequest(d)
 		if err != nil {
-			return nil, err
+			return err
 		}
 	}
 	if len(d.b) != 0 && d.b[0] == exchangeMarker {
 		d.u8()
-		req.Exchange, err = decodeExchangeRequest(&d)
+		req.Exchange, err = decodeExchangeRequest(d)
 		if err != nil {
-			return nil, err
+			return err
 		}
 	}
 	if len(d.b) != 0 && d.b[0] == transactionMarker {
 		d.u8()
-		req.Transaction, err = decodeTransactionRequest(&d)
+		req.Transaction, err = decodeTransactionRequest(d)
 		if err != nil {
-			return nil, err
+			return err
 		}
 	}
 	if len(d.b) != 0 && d.b[0] == authorityMarker {
@@ -1858,14 +1917,14 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 		req.Authority.Node = d.fixed16()
 		req.Authority.Generation = d.u64()
 		if d.bad() || !req.Authority.Valid() {
-			return nil, errBadPresence
+			return errBadPresence
 		}
 	}
 	if len(d.b) != 0 && d.b[0] == parameterTypesMarker {
 		d.u8()
 		count := d.count(1, maxParams)
 		if count == 0 || count != len(req.Params) {
-			return nil, errBadParameterTypes
+			return errBadParameterTypes
 		}
 		req.ParamTypes = make([]sqldriver.ParamType, count)
 		for index := range req.ParamTypes {
@@ -1873,7 +1932,7 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 		}
 		if d.bad() || req.SQL == "" ||
 			!validSQLParameterTypes(req.Params, req.ParamTypes) {
-			return nil, errBadParameterTypes
+			return errBadParameterTypes
 		}
 	}
 	if len(d.b) != 0 && d.b[0] == mutationImageMarker {
@@ -1881,65 +1940,73 @@ func DecodeRequest(r io.Reader) (*ShardRequest, error) {
 		req.MutationImageCapture = true
 	}
 	if req.MutationCapture && req.MutationImageCapture {
-		return nil, errBadMutationCapture
+		return errBadMutationCapture
 	}
 	mutationCapture := req.mutationCapturePresent()
 	if req.Transaction.Operation != TransactionNone &&
 		(len(req.ParamTypes) != 0 || !req.ReadFenceID.IsZero() || req.GlobalIndexLookup.present() || req.PrimaryKeyRead.present() || mutationCapture || req.DocumentScan.present()) {
 		if req.GlobalIndexLookup.present() {
-			return nil, errBadGlobalIndexLookup
+			return errBadGlobalIndexLookup
 		}
-		return nil, errBadTransaction
+		return errBadTransaction
 	}
 	if err := d.end(); err != nil {
-		return nil, err
+		return err
 	}
 	if !policy.valid() {
-		return nil, errBadEnum
+		return errBadEnum
 	}
 	if !mode.valid() {
-		return nil, errBadEnum
+		return errBadEnum
 	}
 	if err := validateExchangeRequest(req); err != nil {
-		return nil, err
+		return err
 	}
 	if err := validateRepartitionRequest(req); err != nil {
-		return nil, err
+		return err
 	}
 	if req.GlobalIndexLookup.present() &&
 		(req.SQL != "" || len(req.Params) != 0 || req.PrimaryKeyRead.present() || mutationCapture || req.DocumentScan.present() || req.ExecutionMode != ExecutionReadOnly) {
-		return nil, errBadGlobalIndexLookup
+		return errBadGlobalIndexLookup
 	}
 	if req.PrimaryKeyRead.present() && (req.SQL == "" || mutationCapture || req.DocumentScan.present() || req.ExecutionMode != ExecutionReadOnly) {
-		return nil, errBadPrimaryKeyRead
+		return errBadPrimaryKeyRead
 	}
 	if mutationCapture && (req.SQL == "" || req.ExecutionMode != ExecutionReadOnly || req.DocumentScan.present() ||
 		!req.ReadFenceID.IsZero()) {
-		return nil, errBadMutationCapture
+		return errBadMutationCapture
 	}
 	if req.DocumentScan.present() && (req.SQL != "" || len(req.Params) != 0 ||
 		req.ExecutionMode != ExecutionReadOnly || !req.ReadFenceID.IsZero() ||
 		req.MaxRows == 0 || req.MaxResultBytes == 0 || mutationCapture) {
-		return nil, errBadDocumentScan
+		return errBadDocumentScan
 	}
 	if req.PartialAggregate && (req.SQL == "" || req.ExecutionMode != ExecutionReadOnly ||
 		mutationCapture || req.DocumentScan.present() || req.GlobalIndexLookup.present() ||
 		req.Transaction.Operation != TransactionNone) {
-		return nil, errBadPartialAggregate
+		return errBadPartialAggregate
 	}
 	if !req.RowBatch.canonical() || (req.RowBatch.present() &&
 		(req.SQL == "" || req.ExecutionMode != ExecutionReadOnly || mutationCapture ||
 			req.DocumentScan.present() || req.GlobalIndexLookup.present() ||
 			req.Transaction.Operation != TransactionNone || req.MaxRows == 0 ||
 			req.MaxResultBytes == 0)) {
-		return nil, errBadRowBatch
+		return errBadRowBatch
 	}
-	return req, nil
+	return nil
 }
 
 // EncodeResponse writes resp as one framed message. It is deterministic: equal
-// responses encode to identical bytes.
+// responses encode to identical bytes. A fresh arena backs the frame;
+// connections writing repeated responses should hold a FrameEncoder and call
+// its method instead.
 func EncodeResponse(w io.Writer, resp *ShardResponse) error {
+	return (&FrameEncoder{}).EncodeResponse(w, resp)
+}
+
+// EncodeResponse writes resp as one framed message into the encoder's owned
+// arena, retaining it for the next call.
+func (f *FrameEncoder) EncodeResponse(w io.Writer, resp *ShardResponse) error {
 	if resp == nil {
 		return errors.New("shardservice: EncodeResponse requires a non-nil response")
 	}
@@ -1969,7 +2036,8 @@ func EncodeResponse(w io.Writer, resp *ShardResponse) error {
 		return errBadExchange
 	}
 
-	e := newFrameEncoder(len(resp.Exchange.Batch.Data))
+	e := newFrameEncoder(f.arena, len(resp.Exchange.Batch.Data))
+	defer func() { f.arena = keepFrameArena(e.b) }()
 	e.u8(wireVersion)
 	e.u8(uint8(resp.Kind))
 	switch resp.Kind {

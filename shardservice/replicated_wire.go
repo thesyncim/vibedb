@@ -304,8 +304,16 @@ type ReplicatedResponse struct {
 	sqlResult *ShardResponse
 }
 
-// EncodeReplicatedRequest emits one canonical native request frame.
+// EncodeReplicatedRequest emits one canonical native request frame with a
+// fresh arena. Holders of a persistent native stream should use the
+// FrameEncoder method to reuse one arena across the stream's lifetime.
 func EncodeReplicatedRequest(w io.Writer, request *ReplicatedRequest) error {
+	return (&FrameEncoder{}).EncodeReplicatedRequest(w, request)
+}
+
+// EncodeReplicatedRequest emits one canonical native request frame into the
+// encoder's owned arena, retaining it for the next call.
+func (f *FrameEncoder) EncodeReplicatedRequest(w io.Writer, request *ReplicatedRequest) error {
 	if w == nil || !validReplicatedRequest(request) {
 		return ErrReplicatedWire
 	}
@@ -313,7 +321,8 @@ func EncodeReplicatedRequest(w io.Writer, request *ReplicatedRequest) error {
 	if request.Operation == ReplicatedMembership {
 		payloadHint += 65
 	}
-	e := newFrameEncoder(payloadHint)
+	e := newFrameEncoder(f.arena, payloadHint)
+	defer func() { f.arena = keepFrameArena(e.b) }()
 	e.u8(replicatedWireVersion)
 	e.u8(uint8(request.Operation))
 	e.b = append(e.b, request.Authority.Node[:]...)
@@ -467,6 +476,13 @@ func ValidateReplicatedResponse(response *ReplicatedResponse) error {
 // frames use a bounded cleared scratch so a TLS stream sees one Write; larger
 // frames retain the scatter/writev path without a payload-sized userspace copy.
 func EncodeReplicatedRequestBorrowed(w io.Writer, request *ReplicatedRequest) error {
+	return (&FrameEncoder{}).EncodeReplicatedRequestBorrowed(w, request)
+}
+
+// EncodeReplicatedRequestBorrowed emits the fixed request prefix into the
+// encoder's owned arena and borrows the immutable payload as a second write
+// buffer, retaining the arena for the next call.
+func (f *FrameEncoder) EncodeReplicatedRequestBorrowed(w io.Writer, request *ReplicatedRequest) error {
 	if w == nil || !validReplicatedRequest(request) {
 		return ErrReplicatedWire
 	}
@@ -491,7 +507,8 @@ func EncodeReplicatedRequestBorrowed(w io.Writer, request *ReplicatedRequest) er
 		if request.Operation == ReplicatedMembership {
 			payloadHint = 65
 		}
-		e = newFrameEncoder(payloadHint)
+		e = newFrameEncoder(f.arena, payloadHint)
+		defer func() { f.arena = keepFrameArena(e.b) }()
 	}
 	e.u8(replicatedWireVersion)
 	e.u8(uint8(request.Operation))
@@ -825,6 +842,14 @@ func validContinuationBodySize(size, base int) bool {
 
 // EncodeReplicatedResponse emits one canonical typed native response.
 func EncodeReplicatedResponse(w io.Writer, response *ReplicatedResponse) error {
+	return (&FrameEncoder{}).EncodeReplicatedResponse(w, response)
+}
+
+// EncodeReplicatedResponse emits one canonical native response frame into
+// the encoder's owned arena, retaining it for the next call. The nested SQL
+// envelope keeps a fresh arena on purpose: its bytes are retained by the
+// caller past the Write, so they must never alias a reused array.
+func (f *FrameEncoder) EncodeReplicatedResponse(w io.Writer, response *ReplicatedResponse) error {
 	if w == nil || !validReplicatedResponse(response) {
 		return ErrReplicatedWire
 	}
@@ -847,7 +872,8 @@ func EncodeReplicatedResponse(w io.Writer, response *ReplicatedResponse) error {
 		response.Kind == ReplicatedExecutionPinReadResult || response.Kind == ReplicatedRouteGateReadResult {
 		bodyHint = replicatedReadResponseFixedBodyBytes + len(response.Value)
 	}
-	e := encbuf{b: make([]byte, 5, 5+bodyHint)}
+	e := newFrameEncoder(f.arena, bodyHint)
+	defer func() { f.arena = keepFrameArena(e.b) }()
 	e.u8(replicatedWireVersion)
 	e.u8(uint8(response.Kind))
 	e.u8(uint8(response.Refusal))

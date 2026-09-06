@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"slices"
 	"testing"
@@ -1484,5 +1485,47 @@ func TestReuseDistributionTypes(t *testing.T) {
 	}
 	if req.Distribution != "d" {
 		t.Fatal("distribution type mismatch")
+	}
+}
+
+// TestFrameEncoderArenaReused proves one encoder reuses its arena across
+// messages: repeated small encodes keep the same backing array instead of
+// allocating, and one oversize frame drops the arena instead of pinning
+// megabytes on the connection.
+func TestFrameEncoderArenaReused(t *testing.T) {
+	var enc FrameEncoder
+	seen := make(map[string]struct{})
+	for i := range 8 {
+		e := newFrameEncoder(enc.arena, 0)
+		e.u8(byte(i))
+		seen[fmt.Sprintf("%p", e.b)] = struct{}{}
+		if err := writeEncodedFrame(io.Discard, tagRequest, e.b); err != nil {
+			t.Fatalf("writeEncodedFrame: %v", err)
+		}
+		enc.arena = keepFrameArena(e.b)
+	}
+	if len(seen) != 1 {
+		t.Fatalf("%d distinct arenas across 8 owned encodes, want 1", len(seen))
+	}
+	enc.arena = keepFrameArena(make([]byte, 5, maxFrameArenaBytes+1))
+	if enc.arena != nil {
+		t.Fatalf("oversize frame retained, want it dropped")
+	}
+}
+
+// BenchmarkFrameEncoderOwned measures a point-read-shaped response encoded
+// through one reused FrameEncoder: the steady-state cost of the owned-arena
+// path every connection now uses.
+func BenchmarkFrameEncoderOwned(b *testing.B) {
+	resp := RowsResponse(
+		[]Column{{Name: "id", TypeOID: 23}, {Name: "score", TypeOID: 701}},
+		[][]Cell{{{Bytes: []byte("7")}, {Bytes: []byte("9.5")}}},
+	)
+	var enc FrameEncoder
+	b.ReportAllocs()
+	for b.Loop() {
+		if err := enc.EncodeResponse(io.Discard, resp); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

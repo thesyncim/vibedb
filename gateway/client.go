@@ -216,6 +216,10 @@ type ClientOptions struct {
 type idleShardConn struct {
 	conn       net.Conn
 	returnedAt time.Time
+	// enc owns the connection's wire-frame arena. It travels with the
+	// connection through take and put, so every request a pooled
+	// connection encodes reuses one arena with no pool traffic.
+	enc shardservice.FrameEncoder
 }
 
 // Client is a thin shard client: one synchronous request/response round-trip
@@ -296,19 +300,20 @@ func (c *Client) Do(ctx context.Context, address string, req *shardservice.Shard
 	if req != nil && (req.RowBatch.BatchRows != 0 || req.RowBatch.BatchBytes != 0) {
 		return nil, fmt.Errorf("%w: a row-batch request requires DoBatches", ErrMalformedRequest)
 	}
-	conn, err := c.take(address)
+	bundle, err := c.take(address)
 	if err != nil {
 		return nil, err
 	}
+	conn, enc := bundle.conn, bundle.enc
 	if conn == nil {
 		conn, err = c.dial(ctx, address)
 		if err != nil {
 			return nil, err
 		}
 	}
-	resp, err := RoundTrip(ctx, conn, forwardedShardRequest(ctx, req))
+	resp, err := roundTrip(ctx, conn, forwardedShardRequest(ctx, req), &enc)
 	if ctx.Err() == nil && roundTripKeepsStream(err) {
-		c.put(address, conn)
+		c.put(address, conn, enc)
 	} else {
 		_ = conn.Close()
 	}
@@ -335,19 +340,20 @@ func (c *Client) DoBatches(
 	if err := validateBatchCall(req, consume); err != nil {
 		return err
 	}
-	conn, err := c.take(address)
+	bundle, err := c.take(address)
 	if err != nil {
 		return err
 	}
+	conn, enc := bundle.conn, bundle.enc
 	if conn == nil {
 		conn, err = c.dial(ctx, address)
 		if err != nil {
 			return err
 		}
 	}
-	err = RoundTripBatches(ctx, conn, forwardedShardRequest(ctx, req), consume)
+	err = roundTripBatches(ctx, conn, forwardedShardRequest(ctx, req), consume, &enc)
 	if ctx.Err() == nil && roundTripKeepsStream(err) {
-		c.put(address, conn)
+		c.put(address, conn, enc)
 	} else {
 		_ = conn.Close()
 	}
@@ -380,19 +386,19 @@ func roundTripKeepsStream(err error) bool {
 }
 
 // take removes one connection from address's idle stack. Expired connections
-// are closed outside the mutex and the search continues. A nil connection with
+// are closed outside the mutex and the search continues. A zero bundle with
 // a nil error tells Do to dial.
-func (c *Client) take(address string) (net.Conn, error) {
+func (c *Client) take(address string) (idleShardConn, error) {
 	for {
 		c.mu.Lock()
 		if c.closed {
 			c.mu.Unlock()
-			return nil, ErrClientClosed
+			return idleShardConn{}, ErrClientClosed
 		}
 		list := c.idle[address]
 		if len(list) == 0 {
 			c.mu.Unlock()
-			return nil, nil
+			return idleShardConn{}, nil
 		}
 		last := len(list) - 1
 		idle := list[last]
@@ -412,7 +418,7 @@ func (c *Client) take(address string) (net.Conn, error) {
 			_ = idle.conn.Close()
 			continue
 		}
-		return idle.conn, nil
+		return idle, nil
 	}
 }
 
@@ -421,7 +427,7 @@ func (c *Client) take(address string) (net.Conn, error) {
 // endpoints serving current traffic rather than letting removed catalog
 // endpoints occupy the pool until process exit. Closing happens outside the
 // mutex because arbitrary net.Conn implementations may block in Close.
-func (c *Client) put(address string, conn net.Conn) {
+func (c *Client) put(address string, conn net.Conn, enc shardservice.FrameEncoder) {
 	c.mu.Lock()
 	if c.closed || c.maxIdle == 0 || c.maxPerAddr == 0 {
 		c.mu.Unlock()
@@ -437,6 +443,7 @@ func (c *Client) put(address string, conn net.Conn) {
 	c.idle[address] = append(c.idle[address], idleShardConn{
 		conn:       conn,
 		returnedAt: c.now(),
+		enc:        enc,
 	})
 	c.nidle++
 	c.mu.Unlock()
@@ -524,7 +531,19 @@ func (c *Client) Close() error {
 // blocking I/O and surfaces as ctx.Err(). On a ctx deadline or cancellation the
 // connection's I/O deadline is tripped, so the connection must be discarded
 // rather than reused.
+//
+// The request encodes with a fresh arena. Callers holding a persistent
+// connection (Client.Do) route through the same exchange with the
+// connection's owned encoder instead.
 func RoundTrip(ctx context.Context, conn net.Conn, req *shardservice.ShardRequest) (*shardservice.ShardResponse, error) {
+	var enc shardservice.FrameEncoder
+	return roundTrip(ctx, conn, req, &enc)
+}
+
+// roundTrip is RoundTrip with an explicit encoder. enc must be exclusively
+// held for the call; Do passes its checked-out connection's encoder so
+// repeated requests reuse one arena.
+func roundTrip(ctx context.Context, conn net.Conn, req *shardservice.ShardRequest, enc *shardservice.FrameEncoder) (*shardservice.ShardResponse, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -551,7 +570,7 @@ func RoundTrip(ctx context.Context, conn net.Conn, req *shardservice.ShardReques
 		}
 	}()
 
-	if err := shardservice.EncodeRequest(conn, req); err != nil {
+	if err := enc.EncodeRequest(conn, req); err != nil {
 		return nil, firstErr(ctx, err)
 	}
 	resp, err := shardservice.DecodeResponse(conn)
@@ -578,6 +597,19 @@ func RoundTripBatches(
 	req *shardservice.ShardRequest,
 	consume func(*shardservice.ShardResponse) error,
 ) error {
+	var enc shardservice.FrameEncoder
+	return roundTripBatches(ctx, conn, req, consume, &enc)
+}
+
+// roundTripBatches is RoundTripBatches with an explicit encoder, owned by the
+// checked-out connection exactly like roundTrip.
+func roundTripBatches(
+	ctx context.Context,
+	conn net.Conn,
+	req *shardservice.ShardRequest,
+	consume func(*shardservice.ShardResponse) error,
+	enc *shardservice.FrameEncoder,
+) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -599,7 +631,7 @@ func RoundTripBatches(
 		}
 	}()
 
-	if err := shardservice.EncodeRequest(conn, req); err != nil {
+	if err := enc.EncodeRequest(conn, req); err != nil {
 		return firstErr(ctx, err)
 	}
 	var (

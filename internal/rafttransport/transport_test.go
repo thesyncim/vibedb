@@ -273,7 +273,7 @@ func TestOrdinaryTransportReservationsBoundConcurrentPreEncodeOwnership(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	ownedSize, _, _ := frameBufferCapacity(plan.frameSize, options.RetainedFrameBytes)
+	ownedSize, _, _ := framedFrameCapacity(plan.frameSize, options.RetainedFrameBytes)
 	wantReservedBytes := int64(options.Queue.GlobalFrames * ownedSize)
 	stats, err := transport.Stats(fixture.remote[0].Node)
 	if err != nil {
@@ -567,6 +567,136 @@ func TestFrameBufferCapacityClassesBoundRetainedOverhead(t *testing.T) {
 	}
 }
 
+func TestFramedFrameCapacityChargesStreamPrefix(t *testing.T) {
+	capacity, class, cacheable := framedFrameCapacity(252, 256)
+	if capacity != 256 || class != 8 || !cacheable {
+		t.Fatalf("framed capacity at retained boundary = %d/%d/%v, want 256/8/true",
+			capacity, class, cacheable)
+	}
+	capacity, class, cacheable = framedFrameCapacity(253, 256)
+	if capacity != 257 || class != 0 || cacheable {
+		t.Fatalf("framed capacity over retained boundary = %d/%d/%v, want 257/0/false",
+			capacity, class, cacheable)
+	}
+	cache := newBoundedFrameBufferCache(1, 256, 256)
+	buffer, err := cache.getFramed(252)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !buffer.framed || len(buffer.bytes) != 252 || len(buffer.record) != 256 ||
+		cap(buffer.record) != 256 || buffer.ownedCapacity() != 256 {
+		t.Fatalf("framed storage = framed %v, body %d, record %d/%d, owned %d",
+			buffer.framed, len(buffer.bytes), len(buffer.record), cap(buffer.record),
+			buffer.ownedCapacity())
+	}
+	if &buffer.record[StreamRecordHeaderBytes] != &buffer.bytes[0] {
+		t.Fatal("framed body does not follow reserved record prefix")
+	}
+	cache.put(buffer)
+	ownedFrames, ownedBytes, freeFrames, closed := cache.stats()
+	if ownedFrames != 1 || ownedBytes != 256 || freeFrames != 1 || closed {
+		t.Fatalf("framed cache after return = %d/%d free %d closed %v",
+			ownedFrames, ownedBytes, freeFrames, closed)
+	}
+	cache.close()
+}
+
+func TestFramedFrameCacheReusesAndEvictsByReservedCapacity(t *testing.T) {
+	cache := newBoundedFrameBufferCache(2, 512, 256)
+	first, err := cache.getFramed(252)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache.put(first)
+	reused, err := cache.getFramed(252)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reused != first {
+		t.Fatal("framed cache did not reuse the retained record")
+	}
+	cache.put(reused)
+	activeFirst, err := cache.getFramed(252)
+	if err != nil {
+		t.Fatal(err)
+	}
+	activeSecond, err := cache.getFramed(252)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache.put(activeFirst)
+	cache.put(activeSecond)
+	third, err := cache.getFramed(124)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if activeFirst.ownedCapacity() != 0 && activeSecond.ownedCapacity() != 0 {
+		t.Fatal("different framed size did not evict a retained class")
+	}
+	if third.ownedCapacity() != 128 {
+		t.Fatalf("evicted-class replacement capacity = %d, want 128", third.ownedCapacity())
+	}
+	cache.put(third)
+	uncached, err := cache.getFramed(253)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uncached.ownedCapacity() != 257 {
+		t.Fatalf("over-retain framed capacity = %d, want 257", uncached.ownedCapacity())
+	}
+	cache.put(uncached)
+	ownedFrames, ownedBytes, freeFrames, closed := cache.stats()
+	if ownedFrames != 1 || ownedBytes != 128 || freeFrames != 1 || closed {
+		t.Fatalf("framed cache ownership after eviction = %d/%d free %d closed %v",
+			ownedFrames, ownedBytes, freeFrames, closed)
+	}
+	cache.close()
+}
+
+func TestOrdinaryTransportSingletonBatchUsesReservedRecord(t *testing.T) {
+	fixture := newTransportTestFixture(t)
+	dialer := ordinaryDialFunc(func(context.Context, NodeID) (PeerConnection, error) {
+		return nil, io.ErrClosedPipe
+	})
+	transport, err := NewOrdinaryTransport(transportTestOptions(fixture, dialer))
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport.state.Store(transportRunning)
+	if err := transport.Send(fixture.outbound(0, 1)); err != nil {
+		t.Fatal(err)
+	}
+	peer := transport.byNode[fixture.remote[0].Node]
+	transport.mu.Lock()
+	storage := peer.queue[peer.head].buffer
+	transport.mu.Unlock()
+	batch, frames := transport.buildPeerBatch(peer)
+	if frames != 1 || storage == nil || peer.directFrame != storage {
+		t.Fatalf("singleton batch = frames %d, storage %p, direct %p",
+			frames, storage, peer.directFrame)
+	}
+	if len(batch) != StreamRecordHeaderBytes+len(storage.bytes) ||
+		&batch[0] != &storage.record[0] ||
+		&batch[StreamRecordHeaderBytes] != &storage.bytes[0] {
+		t.Fatal("singleton batch did not use the owned framed record")
+	}
+	if got := binary.BigEndian.Uint32(batch[:StreamRecordHeaderBytes]); got != uint32(len(storage.bytes)) {
+		t.Fatalf("singleton record length = %d, want %d", got, len(storage.bytes))
+	}
+	if len(peer.writeBuffer) != 0 {
+		t.Fatalf("singleton batch allocated scratch of %d bytes", len(peer.writeBuffer))
+	}
+	transport.releasePeerBatch(peer)
+	if peer.directFrame != nil {
+		t.Fatal("singleton direct frame retained after release")
+	}
+	transport.commitPeerBatch(peer, frames)
+	transport.state.Store(transportReady)
+	if err := transport.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestOrdinaryTransportReconnectUsesInjectedBackoffAndRetainsFrame(t *testing.T) {
 	fixture := newTransportTestFixture(t)
 	connection := newTransportTestConnection(fixture.registry, fixture.remote[0].Node)
@@ -629,6 +759,11 @@ func TestOrdinaryTransportReconnectUsesInjectedBackoffAndRetainsFrame(t *testing
 
 func TestOrdinaryTransportHandlesPartialWritesAndRetriesFailedWrite(t *testing.T) {
 	fixture := newTransportTestFixture(t)
+	outbound := fixture.outbound(0, 17)
+	expected, _, err := fixture.registry.EncodeOutbound(nil, outbound)
+	if err != nil {
+		t.Fatal(err)
+	}
 	failed := newTransportTestConnection(fixture.registry, fixture.remote[0].Node)
 	failed.maxWrite = 3
 	failed.failAfter = 17
@@ -650,7 +785,7 @@ func TestOrdinaryTransportHandlesPartialWritesAndRetriesFailedWrite(t *testing.T
 	}
 	cancel, done := runTransportTest(t, transport)
 	defer stopTransportTest(t, transport, cancel, done)
-	if err := transport.Send(fixture.outbound(0, 17)); err != nil {
+	if err := transport.Send(outbound); err != nil {
 		t.Fatal(err)
 	}
 	transportTestEventually(t, func() bool {
@@ -666,6 +801,8 @@ func TestOrdinaryTransportHandlesPartialWritesAndRetriesFailedWrite(t *testing.T
 	}
 	if records := transportTestRecords(t, succeeded.writtenBytes()); len(records) != 1 {
 		t.Fatalf("successful records = %d", len(records))
+	} else if !bytes.Equal(records[0], expected) {
+		t.Fatal("successful retry record differs from the original frame")
 	}
 }
 

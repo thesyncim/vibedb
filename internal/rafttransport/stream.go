@@ -326,8 +326,20 @@ type frameBufferPool struct {
 }
 
 type pooledFrameBuffer struct {
-	bytes []byte
-	next  *pooledFrameBuffer
+	bytes  []byte
+	record []byte
+	framed bool
+	next   *pooledFrameBuffer
+}
+
+func (buffer *pooledFrameBuffer) ownedCapacity() int {
+	if buffer == nil {
+		return 0
+	}
+	if buffer.framed {
+		return cap(buffer.record)
+	}
+	return cap(buffer.bytes)
 }
 
 func (pool *frameBufferPool) get(size int) *pooledFrameBuffer {

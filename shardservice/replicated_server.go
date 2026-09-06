@@ -466,8 +466,11 @@ func (server *ReplicatedServer) serveReplicatedConn(
 	}
 	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stop()
+	// One encoder serves the whole stream: every response on this
+	// connection reuses a single arena.
+	var enc FrameEncoder
 	for {
-		err := server.serveReplicatedRequestAuthorized(ctx, conn, peer, authenticated, directoryPeer)
+		err := server.serveReplicatedRequestAuthorized(ctx, conn, peer, authenticated, directoryPeer, &enc)
 		if err != nil {
 			if errors.Is(err, errFrameBudget) {
 				server.frameRejected.Add(1)
@@ -485,7 +488,9 @@ func (server *ReplicatedServer) serveReplicatedRequest(
 	conn net.Conn,
 
 ) error {
-	return server.serveReplicatedRequestAuthorized(ctx, conn, rafttransport.NodeID{}, false, serviceauthz.AuthenticatedPeer{})
+	var enc FrameEncoder
+	return server.serveReplicatedRequestAuthorized(ctx, conn, rafttransport.NodeID{}, false,
+		serviceauthz.AuthenticatedPeer{}, &enc)
 }
 
 func (server *ReplicatedServer) serveReplicatedRequestAuthorized(
@@ -494,6 +499,7 @@ func (server *ReplicatedServer) serveReplicatedRequestAuthorized(
 	peer rafttransport.NodeID,
 	authenticated bool,
 	directoryPeer serviceauthz.AuthenticatedPeer,
+	enc *FrameEncoder,
 ) error {
 	requestCtx, cancel := context.WithTimeout(ctx, server.requestTimeout)
 	defer cancel()
@@ -510,12 +516,12 @@ func (server *ReplicatedServer) serveReplicatedRequestAuthorized(
 		directory := server.directory.Load()
 		if directory != nil {
 			if !server.authorizeReplicatedPeerWithDirectory(directory, directoryPeer, request) {
-				return EncodeReplicatedResponse(conn, &ReplicatedResponse{
+				return enc.EncodeReplicatedResponse(conn, &ReplicatedResponse{
 					Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalUnauthorized,
 				})
 			}
 		} else if !server.authorizeReplicated(peer, request) {
-			return EncodeReplicatedResponse(conn, &ReplicatedResponse{
+			return enc.EncodeReplicatedResponse(conn, &ReplicatedResponse{
 				Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalUnauthorized,
 			})
 		}
@@ -524,7 +530,7 @@ func (server *ReplicatedServer) serveReplicatedRequestAuthorized(
 	if response.readLease != nil {
 		defer response.readLease.Release()
 	}
-	return EncodeReplicatedResponse(conn, response)
+	return enc.EncodeReplicatedResponse(conn, response)
 }
 
 func (server *ReplicatedServer) authorizeReplicated(
@@ -1404,11 +1410,25 @@ func replicatedWireState(state raftservice.ServingState) ReplicatedMemberState {
 
 // RoundTripReplicated performs one exact request/response exchange. Any
 // Propose transport error is outcome-unknown because the peer may have admitted
-// the complete frame before the connection failed.
+// the complete frame before the connection failed. The request prefix encodes
+// with a fresh arena; holders of a persistent native stream should use the
+// same exchange with the stream's owned encoder instead.
 func RoundTripReplicated(
 	ctx context.Context,
 	conn net.Conn,
 	request *ReplicatedRequest,
+) (*ReplicatedResponse, error) {
+	var enc FrameEncoder
+	return roundTripReplicated(ctx, conn, request, &enc)
+}
+
+// roundTripReplicated is RoundTripReplicated with an explicit encoder for the
+// request prefix. enc must be exclusively held for the call.
+func roundTripReplicated(
+	ctx context.Context,
+	conn net.Conn,
+	request *ReplicatedRequest,
+	enc *FrameEncoder,
 ) (*ReplicatedResponse, error) {
 	if ctx == nil || conn == nil || request == nil {
 		return nil, ErrReplicatedWire
@@ -1428,7 +1448,7 @@ func RoundTripReplicated(
 			<-cancelDone
 		}
 	}()
-	if err := EncodeReplicatedRequestBorrowed(conn, request); err != nil {
+	if err := enc.EncodeReplicatedRequestBorrowed(conn, request); err != nil {
 		if request.Operation == ReplicatedPropose {
 			return nil, &raftservice.UnknownOutcomeError{
 				Command: append([]byte(nil), request.Command...), Cause: err,

@@ -200,6 +200,171 @@ func TestNodeSubmissionSequencerFusesFIFOAndCompletesInTicketOrder(t *testing.T)
 	}
 }
 
+func TestNodeSubmissionSequencerCompletesLeadingCommitOnlyBeforeDurableWave(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	durableEntered, durableRelease := make(chan struct{}), make(chan struct{})
+	var durableReleaseOnce sync.Once
+	var durableEnteredOnce sync.Once
+	var calls atomic.Int32
+	var wavesMu sync.Mutex
+	var waves [][]uint64
+	q := newTestSequencer(t, 8, func(ready []NodeReady) error {
+		ids := make([]uint64, len(ready))
+		for index := range ready {
+			ids[index] = ready[index].GroupID
+		}
+		wavesMu.Lock()
+		waves = append(waves, ids)
+		wavesMu.Unlock()
+		call := calls.Add(1)
+		if call == 1 {
+			close(entered)
+			<-release
+		}
+		if call > 1 {
+			for _, item := range ready {
+				if item.GroupID == 3 {
+					durableEnteredOnce.Do(func() { close(durableEntered) })
+					<-durableRelease
+					break
+				}
+			}
+		}
+		return nil
+	})
+	defer durableReleaseOnce.Do(func() { close(durableRelease) })
+
+	first := preparedSubmission(t, 1, 1)
+	first.Ready.Batch.Entries = []*pb.Entry{typedEntry(2, 2, pb.EntryNormal, "first")}
+	first.Ready.Batch.MustSync = true
+	if _, err := q.TrySubmit(first); err != nil {
+		t.Fatal(err)
+	}
+	<-entered
+
+	hint := preparedSubmission(t, 2, 1)
+	durable := preparedSubmission(t, 3, 1)
+	durable.Ready.Batch.Entries = []*pb.Entry{typedEntry(2, 2, pb.EntryNormal, "durable")}
+	durable.Ready.Batch.MustSync = true
+	for _, submission := range []*Submission{hint, durable} {
+		if _, err := q.TrySubmit(submission); err != nil {
+			t.Fatal(err)
+		}
+	}
+	close(release)
+	<-durableEntered
+	if _, done, err := hint.Poll(); !done || err != nil {
+		t.Fatalf("commit-only completion done=%v err=%v", done, err)
+	}
+	if _, done, _ := durable.Poll(); done {
+		t.Fatal("durable completion overtook its blocked persistence")
+	}
+	durableReleaseOnce.Do(func() { close(durableRelease) })
+	for _, submission := range []*Submission{first, hint, durable} {
+		if _, err := submission.Wait(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wavesMu.Lock()
+	defer wavesMu.Unlock()
+	if fmt.Sprint(waves) != "[[1] [2] [3]]" {
+		t.Fatalf("FIFO metadata boundary waves=%v want [[1] [2] [3]]", waves)
+	}
+}
+
+func TestNodeSubmissionSequencerKeepsDurableHintDurableInOneWave(t *testing.T) {
+	claimed, releaseClaim := make(chan struct{}), make(chan struct{})
+	var claimCalls atomic.Int32
+	var waves [][]uint64
+	q := newTestSequencer(t, 8, func(ready []NodeReady) error {
+		ids := make([]uint64, len(ready))
+		for index := range ready {
+			ids[index] = ready[index].GroupID
+		}
+		waves = append(waves, ids)
+		return nil
+	})
+	q.claimedHookTest = func() {
+		if claimCalls.Add(1) == 1 {
+			close(claimed)
+			<-releaseClaim
+		}
+	}
+	first := preparedSubmission(t, 1, 1)
+	first.Ready.Batch.Entries = []*pb.Entry{typedEntry(2, 2, pb.EntryNormal, "durable-first")}
+	first.Ready.Batch.MustSync = true
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := q.TrySubmit(first)
+		firstDone <- err
+	}()
+	<-claimed
+
+	hint := preparedSubmission(t, 2, 1)
+	durable := preparedSubmission(t, 3, 1)
+	durable.Ready.Batch.Entries = []*pb.Entry{typedEntry(2, 2, pb.EntryNormal, "durable-last")}
+	durable.Ready.Batch.MustSync = true
+	for _, submission := range []*Submission{hint, durable} {
+		if _, err := q.TrySubmit(submission); err != nil {
+			t.Fatal(err)
+		}
+	}
+	close(releaseClaim)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	for _, submission := range []*Submission{first, hint, durable} {
+		if _, err := submission.Wait(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if fmt.Sprint(waves) != "[[1 2 3]]" {
+		t.Fatalf("durable/hint/durable waves=%v want [[1 2 3]]", waves)
+	}
+}
+
+func TestNodeSubmissionSequencerHintBoundaryPreservesFatalFailure(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	var waves [][]uint64
+	q := newTestSequencer(t, 8, func(ready []NodeReady) error {
+		ids := make([]uint64, len(ready))
+		for index := range ready {
+			ids[index] = ready[index].GroupID
+		}
+		waves = append(waves, ids)
+		close(entered)
+		<-release
+		return ErrPersistenceUnknown
+	})
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	hint := preparedSubmission(t, 1, 1)
+	if _, err := q.TrySubmit(hint); err != nil {
+		t.Fatal(err)
+	}
+	<-entered
+	durable := preparedSubmission(t, 2, 1)
+	durable.Ready.Batch.Entries = []*pb.Entry{typedEntry(2, 2, pb.EntryNormal, "durable")}
+	durable.Ready.Batch.MustSync = true
+	if _, err := q.TrySubmit(durable); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	for _, submission := range []*Submission{hint, durable} {
+		if _, err := submission.Wait(); !errors.Is(err, ErrPersistenceUnknown) {
+			t.Fatalf("fatal completion=%v", err)
+		}
+	}
+	if fmt.Sprint(waves) != "[[1]]" {
+		t.Fatalf("fatal metadata boundary waves=%v want [[1]]", waves)
+	}
+}
+
 func TestNodeSubmissionSequencerSplitsWaveBeforeArenaCapacity(t *testing.T) {
 	store := &NodeStore{bounds: nodeStoreBounds{
 		maxWaveBytes: 1024, maxSegmentEvents: 64, maxEntriesPerGroup: 8,

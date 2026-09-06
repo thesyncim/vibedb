@@ -89,6 +89,11 @@ type session struct {
 
 	statements map[string]*prepared
 	portals    map[string]*portal
+	// simpleCache reuses lowered preparations across identical simple-query
+	// texts; see simple_cache.go. It shares the prepared-input byte budget
+	// with the named tables and dies with the session.
+	simpleCache map[string]*prepared
+	simpleOrder []string
 	// statementBytes and portalBytes account input retained by the two object
 	// tables. statementBytes includes statement/query names, parameter OIDs,
 	// numbered-parameter metadata, and a conservative parser/AST/lowered-plan
@@ -433,6 +438,7 @@ func (s *session) release() {
 	s.statements = nil
 	s.statementBytes = 0
 	s.statementBindBytes = 0
+	s.clearSimpleCache()
 	if s.sql != nil {
 		_ = s.sql.Close()
 		s.sql = nil
@@ -1096,13 +1102,14 @@ func (s *session) destroyUnnamed() {
 // throughout, as the protocol requires: the simple query message has no place
 // to request a format, so every column is text.
 func (s *session) runSimple(text string) error {
-	stmt, err := s.prepare("", text, nil)
+	stmt, release, err := s.prepareSimple(text)
 	if err != nil {
 		return err
 	}
-	// A simple-query statement is not retained, so its plan is released as soon
-	// as the rows are gone.
-	defer stmt.release()
+	// An uncached simple-query statement is not retained, so its plan is
+	// released as soon as the rows are gone; a borrowed cache hit runs
+	// under a no-op release instead.
+	defer release()
 
 	if stmt.kind == kindEmpty {
 		s.w.emptyQueryResponse()
@@ -1938,6 +1945,7 @@ func (s *session) discardAll() {
 	}
 	s.statementBytes = 0
 	s.statementBindBytes = 0
+	s.clearSimpleCache()
 }
 
 // applySet assigns or resets a run-time parameter, announcing the change when

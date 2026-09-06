@@ -1,0 +1,22 @@
+=== RUN   TestServeRF3NodeLogThreeServersRestart
+--- PASS: TestServeRF3NodeLogThreeServersRestart (3.12s)
+=== RUN   TestServeRF3ShippedNodeFaultHarness
+    serve_rf3_fault_process_test.go:342: RF3 qualification: cuts=1/1/1 asymmetric_loops=2 rejected_connections=11 waiter_waves=4 waiter_calls=256 waiter_completions=256 waiter_refusals=0 wal_growth_bytes=0 waiter_rss_growth_bytes=48685056 ack_outcome=4
+--- PASS: TestServeRF3ShippedNodeFaultHarness (4.85s)
+=== RUN   TestServeRF3WALPressureBeforeMaintenance
+--- PASS: TestServeRF3WALPressureBeforeMaintenance (2.39s)
+=== RUN   TestServeRF3NodeLogThreeServersRestart
+--- PASS: TestServeRF3NodeLogThreeServersRestart (2.64s)
+=== RUN   TestServeRF3ShippedNodeFaultHarness
+    serve_rf3_fault_process_test.go:342: RF3 qualification: cuts=1/1/1 asymmetric_loops=2 rejected_connections=10 waiter_waves=4 waiter_calls=256 waiter_completions=256 waiter_refusals=0 wal_growth_bytes=0 waiter_rss_growth_bytes=55971840 ack_outcome=4
+--- PASS: TestServeRF3ShippedNodeFaultHarness (5.38s)
+=== RUN   TestServeRF3WALPressureBeforeMaintenance
+--- PASS: TestServeRF3WALPressureBeforeMaintenance (4.88s)
+=== RUN   TestServeRF3NodeLogThreeServersRestart
+--- PASS: TestServeRF3NodeLogThreeServersRestart (2.91s)
+=== RUN   TestServeRF3ShippedNodeFaultHarness
+    serve_rf3_fault_process_test.go:342: RF3 qualification: cuts=1/1/1 asymmetric_loops=2 rejected_connections=10 waiter_waves=4 waiter_calls=256 waiter_completions=256 waiter_refusals=0 wal_growth_bytes=0 waiter_rss_growth_bytes=54665216 ack_outcome=4
+--- PASS: TestServeRF3ShippedNodeFaultHarness (5.86s)
+=== RUN   TestServeRF3WALPressureBeforeMaintenance
+--- PASS: TestServeRF3WALPressureBeforeMaintenance (2.49s)
+PASS

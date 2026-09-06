@@ -118,6 +118,118 @@ func BenchmarkOrdinaryTransportWarmSendQueueRoundTrip(b *testing.B) {
 	}
 }
 
+// BenchmarkOrdinaryTransportFullWritePathSingleton includes preflight, encode,
+// queue publication, stream framing, write, and queue commit. Keeping the
+// connection writer allocation-free makes the framing cost visible.
+func BenchmarkOrdinaryTransportFullWritePathSingleton(b *testing.B) {
+	fixture := newTransportTestFixture(b)
+	connection := newTransportBenchmarkConnection(fixture.registry, fixture.remote[0].Node)
+	dialer := ordinaryDialFunc(func(context.Context, NodeID) (PeerConnection, error) {
+		return connection, nil
+	})
+	transport, err := NewOrdinaryTransport(transportTestOptions(fixture, dialer))
+	if err != nil {
+		b.Fatal(err)
+	}
+	transport.state.Store(transportRunning)
+	peer := transport.byNode[fixture.remote[0].Node]
+	outbound := fixture.outbound(0, 1)
+	planned, err := fixture.registry.preflightOutbound(outbound)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.SetBytes(int64(planned.frameSize + StreamRecordHeaderBytes))
+	b.ResetTimer()
+	for b.Loop() {
+		if err := transport.Send(outbound); err != nil {
+			b.Fatal(err)
+		}
+		batch, frames := transport.buildPeerBatch(peer)
+		if frames != 1 || writeFull(connection, batch) != nil {
+			b.Fatal("singleton write failed")
+		}
+		transport.releasePeerBatch(peer)
+		transport.commitPeerBatch(peer, frames)
+	}
+}
+
+func BenchmarkOrdinaryTransportFullWritePathSingleton32KiB(b *testing.B) {
+	fixture := newTransportTestFixture(b)
+	connection := newTransportBenchmarkConnection(fixture.registry, fixture.remote[0].Node)
+	dialer := ordinaryDialFunc(func(context.Context, NodeID) (PeerConnection, error) {
+		return connection, nil
+	})
+	transport, err := NewOrdinaryTransport(transportTestOptions(fixture, dialer))
+	if err != nil {
+		b.Fatal(err)
+	}
+	transport.state.Store(transportRunning)
+	peer := transport.byNode[fixture.remote[0].Node]
+	outbound := fixture.outbound(0, 1)
+	outbound.Message.Type = pb.MsgApp.Enum()
+	outbound.Message.Context = nil
+	outbound.Message.Entries = []*pb.Entry{{
+		Type: pb.EntryNormal.Enum(), Term: frameU64(5), Index: frameU64(2),
+		Data: make([]byte, 32<<10),
+	}}
+	planned, err := fixture.registry.preflightOutbound(outbound)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.SetBytes(int64(planned.frameSize + StreamRecordHeaderBytes))
+	b.ResetTimer()
+	for b.Loop() {
+		if err := transport.Send(outbound); err != nil {
+			b.Fatal(err)
+		}
+		batch, frames := transport.buildPeerBatch(peer)
+		if frames != 1 || writeFull(connection, batch) != nil {
+			b.Fatal("singleton write failed")
+		}
+		transport.releasePeerBatch(peer)
+		transport.commitPeerBatch(peer, frames)
+	}
+}
+
+// BenchmarkOrdinaryTransportFullWritePathCoalesced4 covers the multi-frame
+// path, which remains a contiguous TLS-friendly write.
+func BenchmarkOrdinaryTransportFullWritePathCoalesced4(b *testing.B) {
+	fixture := newTransportTestFixture(b)
+	connection := newTransportBenchmarkConnection(fixture.registry, fixture.remote[0].Node)
+	dialer := ordinaryDialFunc(func(context.Context, NodeID) (PeerConnection, error) {
+		return connection, nil
+	})
+	transport, err := NewOrdinaryTransport(transportTestOptions(fixture, dialer))
+	if err != nil {
+		b.Fatal(err)
+	}
+	transport.state.Store(transportRunning)
+	peer := transport.byNode[fixture.remote[0].Node]
+	outbound := fixture.outbound(0, 1)
+	planned, err := fixture.registry.preflightOutbound(outbound)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.SetBytes(int64(4 * (planned.frameSize + StreamRecordHeaderBytes)))
+	b.ResetTimer()
+	for b.Loop() {
+		for range 4 {
+			if err := transport.Send(outbound); err != nil {
+				b.Fatal(err)
+			}
+		}
+		batch, frames := transport.buildPeerBatch(peer)
+		if frames != 4 || writeFull(connection, batch) != nil {
+			b.Fatal("coalesced write failed")
+		}
+		transport.releasePeerBatch(peer)
+		transport.commitPeerBatch(peer, frames)
+	}
+}
+
 func BenchmarkOrdinaryTransportFrameReturnWithConcurrentStats(b *testing.B) {
 	fixture := newTransportTestFixture(b)
 	dialer := ordinaryDialFunc(func(context.Context, NodeID) (PeerConnection, error) {
@@ -274,4 +386,21 @@ func BenchmarkFrameBufferPoolHeartbeatAfterRetained64KiB(b *testing.B) {
 		buffer.bytes[len(buffer.bytes)-1] = 1
 		pool.put(buffer)
 	}
+}
+
+type transportBenchmarkConnection struct {
+	*transportTestConnection
+}
+
+func newTransportBenchmarkConnection(
+	registry *StaticRegistry,
+	node NodeID,
+) *transportBenchmarkConnection {
+	return &transportBenchmarkConnection{
+		transportTestConnection: newTransportTestConnection(registry, node),
+	}
+}
+
+func (connection *transportBenchmarkConnection) Write(buffer []byte) (int, error) {
+	return len(buffer), nil
 }

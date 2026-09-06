@@ -150,24 +150,28 @@ type NodeStore struct {
 	cacheValid                                bool
 	waveBatches                               [MaxPersistGroupBatches]seglog.ReadyBatch
 	waveEntryArena                            []seglog.Entry
-	seriesEntryPtrs                           [MaxReadyEntries]*pb.Entry
-	waveHard                                  [MaxPersistGroupBatches]seglog.HardState
-	waveCheckpoint                            [MaxPersistGroupBatches]seglog.Checkpoint
-	pageRefs                                  []pageEntryRef
-	persistWaveTest                           func(seglog.Wave) error
-	namespaceProofTest                        func() error
-	checkpointHookTest                        func(CheckpointPhase) error
-	checkpointLeaveTempTest                   bool
-	descriptorCheckpointHookTest              func(DescriptorCheckpointPhase) error
-	descriptorCheckpointLeaveTempTest         bool
-	sequencer                                 *NodeSubmissionSequencer
-	closing                                   bool
-	closeDone                                 chan struct{}
-	closeErr                                  error
-	closeInit                                 sync.Once
-	closingFlag                               atomic.Bool
-	closed                                    bool
-	poisoned                                  error
+	// aggregateReadySeriesInto uses this fixed scratch row while preflighting one
+	// logical series. The aggregate is copied into seriesEntryArena before the
+	// next group is preflighted, so cached batches never alias this row.
+	seriesEntryPtrs                   [MaxReadyEntries]*pb.Entry
+	seriesEntryArena                  []*pb.Entry
+	waveHard                          [MaxPersistGroupBatches]seglog.HardState
+	waveCheckpoint                    [MaxPersistGroupBatches]seglog.Checkpoint
+	pageRefs                          []pageEntryRef
+	persistWaveTest                   func(seglog.Wave) error
+	namespaceProofTest                func() error
+	checkpointHookTest                func(CheckpointPhase) error
+	checkpointLeaveTempTest           bool
+	descriptorCheckpointHookTest      func(DescriptorCheckpointPhase) error
+	descriptorCheckpointLeaveTempTest bool
+	sequencer                         *NodeSubmissionSequencer
+	closing                           bool
+	closeDone                         chan struct{}
+	closeErr                          error
+	closeInit                         sync.Once
+	closingFlag                       atomic.Bool
+	closed                            bool
+	poisoned                          error
 }
 
 type GroupView struct {
@@ -385,6 +389,7 @@ func OpenNodeStore(dir string, expected NodeIdentity, key Key, options NodeStore
 		store.readyDigest = newReadyDigestWorkspace()
 		store.pageRefs = make([]pageEntryRef, 0, options.MaxSegmentEvents)
 		store.waveEntryArena = make([]seglog.Entry, options.MaxSegmentEvents)
+		store.seriesEntryArena = make([]*pb.Entry, options.MaxSegmentEvents)
 		if err = store.rebuildDescriptors(options.MaxGroups); err == nil {
 			ids := engine.GroupIDs()
 			if len(ids) != len(store.descriptors)+1 || ids[len(ids)-1] != nodeDescriptorGroup {
@@ -466,6 +471,7 @@ func (s *NodeStore) reserve(options NodeStoreOptions, bootstraps []NodeBootstrap
 	s.readyDigest = newReadyDigestWorkspace()
 	s.pageRefs = make([]pageEntryRef, 0, options.MaxSegmentEvents)
 	s.waveEntryArena = make([]seglog.Entry, options.MaxSegmentEvents)
+	s.seriesEntryArena = make([]*pb.Entry, options.MaxSegmentEvents)
 	return nil
 }
 
@@ -898,14 +904,20 @@ func nodeReadySeriesBatch(item *NodeReady, index int) *raftmodel.PersistBatch {
 	return &item.series[index]
 }
 
-// aggregateReadySeries validates and folds one NodeReady's descriptors into a
-// PersistBatch. Entry pointers remain borrowed; only the fixed pointer arena
-// in NodeStore is populated. The returned digest is the normal Ready digest
-// for a singleton and a domain-separated composite over (ReadyID, digest) for
-// a multi-Ready series.
-func (s *NodeStore) aggregateReadySeries(item *NodeReady) (raftmodel.PersistBatch, [16]byte, error) {
+// aggregateReadySeriesInto validates and folds one NodeReady's descriptors
+// into a PersistBatch. Entry pointers remain borrowed; only the caller's
+// supplied pointer row is populated. The returned digest is the normal Ready
+// digest for a singleton and a domain-separated composite over (ReadyID,
+// digest) for a multi-Ready series. It is the allocation-free aggregate path
+// used by wave preflight. A caller that retains a multi-series result across
+// another aggregation must copy its pointers into stable storage first;
+// persistWave does this in seriesEntryArena before preflighting the next item.
+func (s *NodeStore) aggregateReadySeriesInto(item *NodeReady, entryPtrs []*pb.Entry) (raftmodel.PersistBatch, [16]byte, error) {
 	count := nodeReadySeriesCount(*item)
 	if count < 1 || count > MaxReadySeries {
+		return raftmodel.PersistBatch{}, [16]byte{}, ErrBounds
+	}
+	if len(entryPtrs) < MaxReadyEntries {
 		return raftmodel.PersistBatch{}, [16]byte{}, ErrBounds
 	}
 	if item.seriesCount != 0 {
@@ -984,19 +996,19 @@ func (s *NodeStore) aggregateReadySeries(item *NodeReady) (raftmodel.PersistBatc
 				outputFirst = firstIndex
 			} else {
 				delta := firstIndex - outputFirst
-				if delta > uint64(len(s.seriesEntryPtrs)) {
+				if delta > uint64(len(entryPtrs)) {
 					return raftmodel.PersistBatch{}, [16]byte{}, ErrBounds
 				}
 				entryCount = int(delta)
-				if entryCount < 0 || entryCount > len(s.seriesEntryPtrs) {
+				if entryCount < 0 || entryCount > len(entryPtrs) {
 					return raftmodel.PersistBatch{}, [16]byte{}, ErrBounds
 				}
 			}
-			if len(batch.Entries) > len(s.seriesEntryPtrs)-entryCount {
+			if len(batch.Entries) > len(entryPtrs)-entryCount {
 				return raftmodel.PersistBatch{}, [16]byte{}, ErrBounds
 			}
 			for _, entry := range batch.Entries {
-				s.seriesEntryPtrs[entryCount] = entry
+				entryPtrs[entryCount] = entry
 				entryCount++
 			}
 			if uint64(len(batch.Entries)-1) > math.MaxUint64-firstIndex {
@@ -1017,16 +1029,16 @@ func (s *NodeStore) aggregateReadySeries(item *NodeReady) (raftmodel.PersistBatc
 	}
 	plainBytes := 0
 	for i := 0; i < entryCount; i++ {
-		if plainBytes > math.MaxInt-len(s.seriesEntryPtrs[i].GetData()) {
+		if plainBytes > math.MaxInt-len(entryPtrs[i].GetData()) {
 			return raftmodel.PersistBatch{}, [16]byte{}, ErrBounds
 		}
-		plainBytes += len(s.seriesEntryPtrs[i].GetData())
+		plainBytes += len(entryPtrs[i].GetData())
 	}
 	if uint64(entryCount) > s.bounds.maxEntriesPerGroup && s.bounds.maxEntriesPerGroup != 0 ||
 		uint64(plainBytes) > s.bounds.maxWaveBytes && s.bounds.maxWaveBytes != 0 {
 		return raftmodel.PersistBatch{}, [16]byte{}, ErrBounds
 	}
-	result.Entries = s.seriesEntryPtrs[:entryCount:entryCount]
+	result.Entries = entryPtrs[:entryCount:entryCount]
 	return result, compositeReadyDigest(digestIDs, digestValues, count), nil
 }
 
@@ -1096,8 +1108,8 @@ func validateReadySeriesTransitions(
 // intentionally compares the first logical Ready against the durable cursor;
 // seglog receives the final ReadyID together with ReadySpan and performs the
 // corresponding final cursor transition atomically.
-func (s *NodeStore) preflightReadyItem(item *NodeReady) (raftmodel.PersistBatch, seglog.GroupSummary, [16]byte, bool, error) {
-	batch, digest, err := s.aggregateReadySeries(item)
+func (s *NodeStore) preflightReadyItem(item *NodeReady, entryPtrs []*pb.Entry) (raftmodel.PersistBatch, seglog.GroupSummary, [16]byte, bool, error) {
+	batch, digest, err := s.aggregateReadySeriesInto(item, entryPtrs)
 	if err != nil {
 		return raftmodel.PersistBatch{}, seglog.GroupSummary{}, [16]byte{}, false, err
 	}
@@ -1185,16 +1197,45 @@ func (s *NodeStore) persistWave(ready []NodeReady, sequenced bool) error {
 	// Preflight every outer item before touching the checkpoint directory or
 	// invoking seglog. This is particularly important for a series: a bad
 	// constituent must not leave an earlier constituent's checkpoint published.
+	var batches [MaxPersistGroupBatches]raftmodel.PersistBatch
 	var states [MaxPersistGroupBatches]seglog.GroupSummary
 	var digests [MaxPersistGroupBatches][16]byte
+	preflightEntryCount := 0
+	seriesScratchUsed := false
+	defer func() {
+		// The aggregate scratch and stable preflight arena borrow every protobuf
+		// entry in the caller's Ready. Drop those roots on every success and
+		// failure path once mapping has copied their data into the node wave.
+		if seriesScratchUsed {
+			// Aggregation can replace a long suffix with a shorter one, and a
+			// later group can use fewer entries than an earlier group. Clear the
+			// whole fixed row so no overwritten suffix retains caller-owned roots.
+			clear(s.seriesEntryPtrs[:])
+		}
+		if preflightEntryCount != 0 {
+			clear(s.seriesEntryArena[:preflightEntryCount])
+		}
+	}()
 	duplicates := 0
 	totalPlain, totalEntries := 0, 0
 	for i := range ready {
 		item := &ready[i]
-		batch, state, digest, duplicate, err := s.preflightReadyItem(item)
+		if item.seriesCount > 1 {
+			seriesScratchUsed = true
+		}
+		batch, state, digest, duplicate, err := s.preflightReadyItem(item, s.seriesEntryPtrs[:])
 		if err != nil {
 			return err
 		}
+		if item.seriesCount > 1 {
+			if len(batch.Entries) > len(s.seriesEntryArena)-preflightEntryCount {
+				return ErrBounds
+			}
+			copy(s.seriesEntryArena[preflightEntryCount:], batch.Entries)
+			batch.Entries = s.seriesEntryArena[preflightEntryCount : preflightEntryCount+len(batch.Entries) : preflightEntryCount+len(batch.Entries)]
+			preflightEntryCount += len(batch.Entries)
+		}
+		batches[i] = batch
 		states[i], digests[i] = state, digest
 		if duplicate {
 			duplicates++
@@ -1240,10 +1281,7 @@ func (s *NodeStore) persistWave(ready []NodeReady, sequenced bool) error {
 	plainOffset, entryOffset, mappedCount := 0, 0, 0
 	for i := range ready {
 		item := &ready[i]
-		batch, _, err := s.aggregateReadySeries(item)
-		if err != nil {
-			return err
-		}
+		batch := batches[i]
 		state, retryDigest := states[i], digests[i]
 		if batch.NodeIncarnation == state.NodeIncarnation && batch.ReadyID == state.ReadyID {
 			continue

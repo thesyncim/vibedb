@@ -158,3 +158,60 @@ func BenchmarkNodeStorePersistDurability(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkNodeStorePersistReadySeriesHotPath keeps one uncommitted entry in
+// place while varying the number of logical Readies folded into each physical
+// wave. The sync hook is disabled, so this measures preflight, digest, wave
+// mapping, namespace checks, and page-cache writes without platform fsync
+// latency; it is not a pure CPU benchmark.
+func BenchmarkNodeStorePersistReadySeriesHotPath(b *testing.B) {
+	for _, payloadBytes := range []int{20, 32 << 10} {
+		for _, seriesLength := range []int{1, 4, 16} {
+			b.Run(fmt.Sprintf("payload=%d/series=%d", payloadBytes, seriesLength), func(b *testing.B) {
+				options := NodeStoreOptions{
+					SegmentBytes: 512 << 20, MaxWaveBytes: 1 << 20,
+					MaxSegmentEvents: 1 << 16, RecentWaves: 1 << 15,
+					MaxEntriesPerGroup: raftmodel.MaxMessageEntries,
+					ReaderSlots:        1, MaxGroups: 8,
+				}
+				store, err := CreateNodeStore(filepath.Join(b.TempDir(), "node"), testNodeIdentity(), testKey(), []NodeBootstrap{{
+					Descriptor: testGroupDescriptor(1), Snapshot: nodeSnapshot(1, 1, 1),
+				}}, options)
+				if err != nil {
+					b.Fatal(err)
+				}
+				b.Cleanup(func() { _ = store.Close() })
+				store.SetDataSyncForTesting(func(*os.File) error { return nil })
+				if _, err = store.BeginIncarnations([]uint64{1}); err != nil {
+					b.Fatal(err)
+				}
+				entries := make([]pb.Entry, seriesLength)
+				entryPointers := make([]*pb.Entry, seriesLength)
+				hardStates := make([]pb.HardState, seriesLength)
+				batches := make([]raftmodel.PersistBatch, seriesLength)
+				payload := string(make([]byte, payloadBytes))
+				for index := range batches {
+					entries[index] = *typedEntry(2, 2, pb.EntryNormal, payload)
+					entryPointers[index] = &entries[index]
+					hardStates[index] = *hard(2, 1)
+					batches[index] = raftmodel.PersistBatch{
+						NodeIncarnation: 1, HardState: &hardStates[index],
+						Entries: entryPointers[index : index+1], MustSync: true,
+					}
+				}
+				b.ReportAllocs()
+				b.SetBytes(int64(payloadBytes * seriesLength))
+				b.ResetTimer()
+				for iteration := 0; iteration < b.N; iteration++ {
+					firstReadyID := uint64(iteration*seriesLength + 1)
+					for index := range batches {
+						batches[index].ReadyID = firstReadyID + uint64(index)
+					}
+					if err = store.PersistReadySeries(1, batches); err != nil {
+						b.Fatalf("iteration=%d: %v", iteration, err)
+					}
+				}
+			})
+		}
+	}
+}
