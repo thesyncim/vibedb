@@ -1,0 +1,24 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/internal/raftstore
+cpu: Apple M4 Max
+BenchmarkNodeStorePersistReadySeriesHotPath/payload=20/series=1         	    5743	     31842 ns/op	   0.63 MB/s	       0 B/op	       0 allocs/op
+BenchmarkNodeStorePersistReadySeriesHotPath/payload=20/series=1         	    4760	     31773 ns/op	   0.63 MB/s	       1 B/op	       0 allocs/op
+BenchmarkNodeStorePersistReadySeriesHotPath/payload=20/series=1         	    5571	     31050 ns/op	   0.64 MB/s	       0 B/op	       0 allocs/op
+BenchmarkNodeStorePersistReadySeriesHotPath/payload=20/series=4         	    5391	     31985 ns/op	   2.50 MB/s	       0 B/op	       0 allocs/op
+BenchmarkNodeStorePersistReadySeriesHotPath/payload=20/series=4         	    5014	     32996 ns/op	   2.42 MB/s	       0 B/op	       0 allocs/op
+BenchmarkNodeStorePersistReadySeriesHotPath/payload=20/series=4         	    4837	     32101 ns/op	   2.49 MB/s	       0 B/op	       0 allocs/op
+BenchmarkNodeStorePersistReadySeriesHotPath/payload=20/series=16        	    5473	     32537 ns/op	   9.83 MB/s	       0 B/op	       0 allocs/op
+BenchmarkNodeStorePersistReadySeriesHotPath/payload=20/series=16        	    5515	     33652 ns/op	   9.51 MB/s	       0 B/op	       0 allocs/op
+BenchmarkNodeStorePersistReadySeriesHotPath/payload=20/series=16        	    4737	     33175 ns/op	   9.65 MB/s	       0 B/op	       0 allocs/op
+BenchmarkNodeStorePersistReadySeriesHotPath/payload=32768/series=1      	    2271	     80363 ns/op	 407.75 MB/s	       0 B/op	       0 allocs/op
+BenchmarkNodeStorePersistReadySeriesHotPath/payload=32768/series=1      	    1968	     79906 ns/op	 410.08 MB/s	       0 B/op	       0 allocs/op
+BenchmarkNodeStorePersistReadySeriesHotPath/payload=32768/series=1      	    2108	     79389 ns/op	 412.75 MB/s	       0 B/op	       0 allocs/op
+BenchmarkNodeStorePersistReadySeriesHotPath/payload=32768/series=4      	    1388	    113549 ns/op	1154.32 MB/s	       0 B/op	       0 allocs/op
+BenchmarkNodeStorePersistReadySeriesHotPath/payload=32768/series=4      	    1626	    114322 ns/op	1146.52 MB/s	       0 B/op	       0 allocs/op
+BenchmarkNodeStorePersistReadySeriesHotPath/payload=32768/series=4      	    1438	    110884 ns/op	1182.06 MB/s	       0 B/op	       0 allocs/op
+BenchmarkNodeStorePersistReadySeriesHotPath/payload=32768/series=16     	     703	    245850 ns/op	2132.55 MB/s	       0 B/op	       0 allocs/op
+BenchmarkNodeStorePersistReadySeriesHotPath/payload=32768/series=16     	     717	    236662 ns/op	2215.34 MB/s	       0 B/op	       0 allocs/op
+BenchmarkNodeStorePersistReadySeriesHotPath/payload=32768/series=16     	     723	    242301 ns/op	2163.79 MB/s	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/thesyncim/vibedb/internal/raftstore	14.126s

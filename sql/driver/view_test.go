@@ -480,7 +480,7 @@ func TestPreparedViewAndTransactionReleaseCatalogGenerations(t *testing.T) {
 		t.Fatal("closed statement retained view generation or plan storage")
 	}
 	transaction, err := connection.beginTx(
-		context.Background(), sqldriver.TxOptions{},
+		context.Background(), sqldriver.TxOptions{}, nil,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -504,7 +504,7 @@ func TestTransactionWithoutViewsHasNoViewCatalogSidecar(t *testing.T) {
 	connection := raw.(*conn)
 	defer connection.Close()
 	transaction, err := connection.beginTx(
-		context.Background(), sqldriver.TxOptions{},
+		context.Background(), sqldriver.TxOptions{}, nil,
 	)
 	if err != nil {
 		t.Fatal(err)

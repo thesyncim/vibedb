@@ -132,7 +132,7 @@ func TestTransactionDeclaredColumnUpdateStopsAtProspectiveByteBound(t *testing.T
 	transaction, err := connection.beginTx(
 		context.Background(), sqldriver.TxOptions{
 			Isolation: sqldriver.IsolationLevel(stdsql.LevelRepeatableRead),
-		},
+		}, nil,
 	)
 	if err != nil {
 		t.Fatal(err)

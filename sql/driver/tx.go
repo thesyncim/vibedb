@@ -126,6 +126,7 @@ var (
 func (c *conn) beginTx(
 	ctx context.Context,
 	options sqldriver.TxOptions,
+	scope *stmt,
 ) (*tx, error) {
 	isolation, err := runtimeIsolationLevel(options.Isolation)
 	if err != nil {
@@ -152,37 +153,29 @@ func (c *conn) beginTx(
 		}
 		return transaction, nil
 	}
-	transaction.tables = make(map[string]*txTable, len(transaction.layoutEpoch.tables))
-	for name, layout := range transaction.layoutEpoch.tables {
-		if err := contextCheckpoint(ctx); err != nil {
-			transaction.releaseSnapshots()
-			return nil, err
-		}
-		if layout.limitsErr != nil {
-			transaction.releaseSnapshots()
-			return nil, layout.limitsErr
-		}
-		state := c.borrowTable()
-		if state == nil {
-			state = &txTable{}
-		}
-		resetTableState(state, name, layout, true)
-		if layout.incarnation.collection != nil {
-			var err error
-			if state.snapshot != nil {
-				err = layout.incarnation.collection.SnapshotInto(state.snapshot)
-			} else {
-				state.snapshot, err = layout.incarnation.collection.Snapshot()
-			}
-			if err != nil {
+	if names, ok := pinnedReadTables(scope, transaction.layoutEpoch); ok {
+		// A single-statement read pin leases only its executable closure:
+		// the driving collection plus the physical dependencies the join
+		// executor trusts. Read-only closures stage no pending mutations.
+		// Each table reuses the connection's retained shell when one is
+		// available instead of allocating.
+		transaction.tables = make(map[string]*txTable, len(names))
+		for _, name := range names {
+			if err := transaction.materializeTable(
+				ctx, name, transaction.layoutEpoch.tables[name], !options.ReadOnly,
+			); err != nil {
 				transaction.releaseSnapshots()
 				return nil, err
 			}
 		}
-		if !options.ReadOnly {
-			state.conflicts = &layout.incarnation.conflicts
+	} else {
+		transaction.tables = make(map[string]*txTable, len(transaction.layoutEpoch.tables))
+		for name, layout := range transaction.layoutEpoch.tables {
+			if err := transaction.materializeTable(ctx, name, layout, true); err != nil {
+				transaction.releaseSnapshots()
+				return nil, err
+			}
 		}
-		transaction.tables[name] = state
 	}
 	// Snapshot() itself is synchronous. A cancellation that arrived while the
 	// final table was being captured must still be observed before the
@@ -198,6 +191,84 @@ func (c *conn) beginTx(
 		}
 	}
 	return transaction, nil
+}
+
+// materializeTable leases one table's snapshot into the transaction. The
+// caller holds the database lock and releases every leased snapshot on error.
+// The shell comes from the connection's spare list when one is available,
+// carrying its closed snapshot objects, which are rebound here with
+// SnapshotInto instead of allocating.
+func (transaction *tx) materializeTable(
+	ctx context.Context,
+	name string,
+	layout transactionTableLayout,
+	allocatePending bool,
+) error {
+	if err := contextCheckpoint(ctx); err != nil {
+		return err
+	}
+	if layout.limitsErr != nil {
+		return layout.limitsErr
+	}
+	state := transaction.conn.borrowTable()
+	if state == nil {
+		state = &txTable{}
+	}
+	resetTableState(state, name, layout, allocatePending)
+	if layout.incarnation.collection != nil {
+		var err error
+		if state.snapshot != nil {
+			err = layout.incarnation.collection.SnapshotInto(state.snapshot)
+		} else {
+			state.snapshot, err = layout.incarnation.collection.Snapshot()
+		}
+		if err != nil {
+			return err
+		}
+	}
+	if transaction.readOnly {
+		transaction.tables[name] = state
+		return nil
+	}
+	state.conflicts = &layout.incarnation.conflicts
+	transaction.tables[name] = state
+	return nil
+}
+
+// pinnedReadTables resolves one prepared statement's executable closure —
+// its driving collection plus the physical dependencies the join executor
+// trusts — against the pinned layout epoch. It reports false when there is
+// no statement to scope to, or when a closure name is already gone from the
+// epoch; the caller then falls back to full materialization, preserving
+// legacy behavior across a concurrent DDL publish.
+func pinnedReadTables(scope *stmt, epoch *catalogLayoutEpoch) ([]string, bool) {
+	if scope == nil || scope.query == nil || epoch == nil {
+		return nil, false
+	}
+	var names []string
+	seen := make(map[string]struct{}, len(scope.dependencies)+1)
+	add := func(name string) bool {
+		if name == "" {
+			return true
+		}
+		if _, ok := epoch.tables[name]; !ok {
+			return false
+		}
+		if _, dup := seen[name]; !dup {
+			seen[name] = struct{}{}
+			names = append(names, name)
+		}
+		return true
+	}
+	if !add(scope.query.Collection()) {
+		return nil, false
+	}
+	for i := range scope.dependencies {
+		if !add(scope.dependencies[i].name) {
+			return nil, false
+		}
+	}
+	return names, true
 }
 
 func newTransactionTableState(

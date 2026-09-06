@@ -188,6 +188,133 @@ func TestNodeStoreReadySeriesAggregatesOverlappingSuffixSafely(t *testing.T) {
 	}
 }
 
+func TestNodeStoreMultiGroupSeriesRetainsDistinctEntries(t *testing.T) {
+	store, dir, options := coordinateFixture(t)
+	series := func(group uint64, first, second string) NodeReady {
+		return NodeReady{GroupID: group, seriesCount: 2, series: [MaxReadySeries]raftmodel.PersistBatch{
+			{NodeIncarnation: 1, ReadyID: 1, HardState: hard(2, 2), Entries: []*pb.Entry{typedEntry(2, 2, pb.EntryNormal, first)}, MustSync: true},
+			{NodeIncarnation: 1, ReadyID: 2, HardState: hard(2, 3), Entries: []*pb.Entry{typedEntry(3, 2, pb.EntryNormal, second)}, MustSync: true},
+		}}
+	}
+	if err := store.PersistWave([]NodeReady{
+		series(1, "group-one-first", "group-one-second"),
+		series(2, "group-two-first", "group-two-second"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenNodeStore(dir, testNodeIdentity(), testKey(), options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	for group, want := range map[uint64][]string{
+		1: {"group-one-first", "group-one-second"},
+		2: {"group-two-first", "group-two-second"},
+	} {
+		entries, err := reopened.Group(group).Entries(2, 4, ^uint64(0))
+		if err != nil || len(entries) != len(want) {
+			t.Fatalf("group=%d entries=%d err=%v", group, len(entries), err)
+		}
+		for index := range want {
+			if got := string(entries[index].GetData()); got != want[index] {
+				t.Fatalf("group=%d entry=%d data=%q want=%q", group, index, got, want[index])
+			}
+		}
+	}
+}
+
+func assertNodeSeriesScratchCleared(t *testing.T, store *NodeStore) {
+	t.Helper()
+	for index, entry := range store.seriesEntryPtrs {
+		if entry != nil {
+			t.Fatalf("scratch pointer %d retained %p", index, entry)
+		}
+	}
+	for index, entry := range store.seriesEntryArena {
+		if entry != nil {
+			t.Fatalf("arena pointer %d retained %p", index, entry)
+		}
+	}
+}
+
+func TestNodeStoreSeriesScratchClearsAfterFailedPreflight(t *testing.T) {
+	store, _, _ := coordinateFixture(t)
+	valid := NodeReady{GroupID: 1, seriesCount: 2, series: [MaxReadySeries]raftmodel.PersistBatch{
+		{NodeIncarnation: 1, ReadyID: 1, Entries: []*pb.Entry{typedEntry(2, 2, pb.EntryNormal, "retained")}, HardState: hard(2, 2), MustSync: true},
+		{NodeIncarnation: 1, ReadyID: 2, Entries: []*pb.Entry{typedEntry(3, 2, pb.EntryNormal, "retained")}, HardState: hard(2, 3), MustSync: true},
+	}}
+	invalid := NodeReady{GroupID: 2, seriesCount: 2, series: [MaxReadySeries]raftmodel.PersistBatch{
+		{NodeIncarnation: 2, ReadyID: 1}, {NodeIncarnation: 2, ReadyID: 2},
+	}}
+	if err := store.PersistWave([]NodeReady{valid, invalid}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("invalid preflight=%v", err)
+	}
+	assertNodeSeriesScratchCleared(t, store)
+}
+
+func TestNodeStoreSeriesScratchClearsAfterMultiGroupSuccess(t *testing.T) {
+	store, _, _ := coordinateFixture(t)
+	long := NodeReady{GroupID: 1, seriesCount: 2, series: [MaxReadySeries]raftmodel.PersistBatch{
+		{NodeIncarnation: 1, ReadyID: 1, Entries: []*pb.Entry{
+			typedEntry(2, 2, pb.EntryNormal, "long-2"),
+			typedEntry(3, 2, pb.EntryNormal, "long-3"),
+			typedEntry(4, 2, pb.EntryNormal, "long-4"),
+		}, HardState: hard(2, 2), MustSync: true},
+		{NodeIncarnation: 1, ReadyID: 2, HardState: hard(2, 2), MustSync: true},
+	}}
+	short := NodeReady{GroupID: 2, seriesCount: 2, series: [MaxReadySeries]raftmodel.PersistBatch{
+		{NodeIncarnation: 1, ReadyID: 1, Entries: []*pb.Entry{typedEntry(2, 2, pb.EntryNormal, "short-2")}, HardState: hard(2, 2), MustSync: true},
+		{NodeIncarnation: 1, ReadyID: 2, HardState: hard(2, 2), MustSync: true},
+	}}
+	if err := store.PersistWave([]NodeReady{long, short}); err != nil {
+		t.Fatal(err)
+	}
+	assertNodeSeriesScratchCleared(t, store)
+}
+
+func TestNodeStoreSeriesScratchClearsAfterSuffixReplacement(t *testing.T) {
+	store, _, _ := coordinateFixture(t)
+	ready := NodeReady{GroupID: 1, seriesCount: 2, series: [MaxReadySeries]raftmodel.PersistBatch{
+		{NodeIncarnation: 1, ReadyID: 1, Entries: []*pb.Entry{
+			typedEntry(2, 2, pb.EntryNormal, "long-2"),
+			typedEntry(3, 2, pb.EntryNormal, "long-3"),
+			typedEntry(4, 2, pb.EntryNormal, "long-4"),
+		}, HardState: hard(2, 2), MustSync: true},
+		{NodeIncarnation: 1, ReadyID: 2, Entries: []*pb.Entry{typedEntry(3, 2, pb.EntryNormal, "replacement-3")}, HardState: hard(2, 3), MustSync: true},
+	}}
+	if err := store.PersistWave([]NodeReady{ready}); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := store.Group(1).Entries(2, 4, ^uint64(0))
+	if err != nil || len(entries) != 2 || string(entries[0].GetData()) != "long-2" || string(entries[1].GetData()) != "replacement-3" {
+		t.Fatalf("replacement entries=%d err=%v", len(entries), err)
+	}
+	assertNodeSeriesScratchCleared(t, store)
+}
+
+func TestNodeStoreSeriesScratchClearsAfterPersistenceFailure(t *testing.T) {
+	store, _, _ := coordinateFixture(t)
+	injected := errors.New("injected persistence failure")
+	store.persistWaveTest = func(seglog.Wave) error {
+		return injected
+	}
+	ready := NodeReady{GroupID: 1, seriesCount: 2, series: [MaxReadySeries]raftmodel.PersistBatch{
+		{NodeIncarnation: 1, ReadyID: 1, Entries: []*pb.Entry{
+			typedEntry(2, 2, pb.EntryNormal, "long-2"),
+			typedEntry(3, 2, pb.EntryNormal, "long-3"),
+			typedEntry(4, 2, pb.EntryNormal, "long-4"),
+		}, HardState: hard(2, 2), MustSync: true},
+		{NodeIncarnation: 1, ReadyID: 2, Entries: []*pb.Entry{typedEntry(3, 2, pb.EntryNormal, "replacement-3")}, HardState: hard(2, 3), MustSync: true},
+	}}
+	if err := store.PersistWave([]NodeReady{ready}); !errors.Is(err, ErrInvalid) || !errors.Is(err, injected) {
+		t.Fatalf("persistence failure=%v", err)
+	}
+	assertNodeSeriesScratchCleared(t, store)
+}
+
 func TestNodeSubmissionSequencerSeriesHistogramAndWaveFusion(t *testing.T) {
 	var observed []NodeReady
 	q := newTestSequencer(t, 16, func(ready []NodeReady) error {

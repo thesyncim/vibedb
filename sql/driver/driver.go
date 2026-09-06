@@ -793,12 +793,32 @@ func (c *conn) BeginTx(ctx context.Context, options sqldriver.TxOptions) (sqldri
 			return nil, err
 		}
 	}
-	transaction, err := c.beginTx(ctx, options)
+	transaction, err := c.beginTx(ctx, options, nil)
 	if err != nil {
 		return nil, err
 	}
 	c.tx = transaction
 	return transaction, nil
+}
+
+// beginPinnedReadTx opens the read-only Repeatable Read transaction behind
+// Session.BeginPinnedRead: snapshot leases cover only the prepared
+// statement's executable closure instead of every table in the database.
+func (c *conn) beginPinnedReadTx(ctx context.Context, scope *stmt) error {
+	if err := c.usable(ctx); err != nil {
+		return err
+	}
+	if c.tx != nil {
+		return errors.New("vibedb: this connection already has an open transaction")
+	}
+	transaction, err := c.beginTx(ctx, sqldriver.TxOptions{
+		ReadOnly: true, Isolation: sqldriver.IsolationLevel(stdsql.LevelRepeatableRead),
+	}, scope)
+	if err != nil {
+		return err
+	}
+	c.tx = transaction
+	return nil
 }
 
 func (c *conn) Close() error {

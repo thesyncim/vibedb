@@ -1,0 +1,5 @@
+--- FAIL: TestNodeSubmissionSequencerCompletesLeadingCommitOnlyBeforeDurableWave (0.00s)
+    node_sequencer_test.go:257: commit-only completion done=false err=<nil>
+FAIL
+FAIL	github.com/thesyncim/vibedb/internal/raftstore	0.247s
+FAIL

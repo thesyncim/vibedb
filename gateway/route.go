@@ -64,6 +64,26 @@ func newRouterPool() *routerPool {
 	return &routerPool{pool: sync.Pool{New: func() any { return distribution.NewRouter() }}}
 }
 
+// shardRequestPool recycles the ~1KB request descriptor shells built once
+// per routed target. Only the shell is reused: SQL text, parameters, and
+// scopes are per-query values assigned at construction, and release scrubs
+// the shell so pooled memory retains no caller data. Dispatch uses each
+// request strictly synchronously, and the bound query path releases every
+// routed shell after its dispatch joins; requests built for any other flow
+// are simply collected. A missed release only loses the saving.
+var shardRequestPool = sync.Pool{New: func() any { return &shardservice.ShardRequest{} }}
+
+// releaseShardCalls recycles one routed plan's request shells after their
+// dispatch has joined. Calls must be the slice value owned by that plan.
+func releaseShardCalls(calls []shardCall) {
+	for i := range calls {
+		if req := calls[i].req; req != nil {
+			*req = shardservice.ShardRequest{}
+			shardRequestPool.Put(req)
+		}
+	}
+}
+
 func (rp *routerPool) get() *distribution.Router { return rp.pool.Get().(*distribution.Router) }
 
 func (rp *routerPool) put(r *distribution.Router) { rp.pool.Put(r) }
@@ -115,29 +135,33 @@ func (e *Executor) routeContextCached(
 		if err != nil {
 			return nil, err
 		}
+		// Borrow the descriptor shell; every field below is assigned, so
+		// no stale pooled value can survive construction.
+		req := shardRequestPool.Get().(*shardservice.ShardRequest)
+		*req = shardservice.ShardRequest{
+			SQL:                  q.SQL,
+			Params:               q.Params,
+			ParamTypes:           q.ParamTypes,
+			PartialAggregate:     partialAggregate,
+			Distribution:         route.Distribution,
+			Shard:                t.Shard,
+			AllocationGeneration: t.AllocationGeneration,
+			RoutingVersion:       route.RoutingVersion,
+			OwnershipEpoch:       t.OwnershipEpoch,
+			ReadPolicy:           p.ReadPolicy,
+			ExecutionMode:        shardservice.ExecutionReadOnly,
+			Deadline:             p.PerShardDeadline,
+			MaxRows:              p.PerShardRows,
+			MaxResultBytes:       p.PerShardBytes,
+			BucketBits:           bucketBits,
+			AccessScopes:         accessScopes,
+		}
 		calls[i] = shardCall{
 			target: t, pressureSource: pressureSourceForTarget(
 				bound.manifest, bound.spec.EffectiveBucketBits(), t,
 			),
 			address: addr,
-			req: &shardservice.ShardRequest{
-				SQL:                  q.SQL,
-				Params:               q.Params,
-				ParamTypes:           q.ParamTypes,
-				PartialAggregate:     partialAggregate,
-				Distribution:         route.Distribution,
-				Shard:                t.Shard,
-				AllocationGeneration: t.AllocationGeneration,
-				RoutingVersion:       route.RoutingVersion,
-				OwnershipEpoch:       t.OwnershipEpoch,
-				ReadPolicy:           p.ReadPolicy,
-				ExecutionMode:        shardservice.ExecutionReadOnly,
-				Deadline:             p.PerShardDeadline,
-				MaxRows:              p.PerShardRows,
-				MaxResultBytes:       p.PerShardBytes,
-				BucketBits:           bucketBits,
-				AccessScopes:         accessScopes,
-			},
+			req:     req,
 		}
 	}
 	populateReplicatedPrimaryKeyRead(snap, bound, route, mapper, calls)

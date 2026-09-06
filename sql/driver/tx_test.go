@@ -1182,7 +1182,7 @@ func TestTransactionOversizedValuesNeverEnterPendingState(t *testing.T) {
 
 	connection := &conn{db: database}
 	rolledBack, err := connection.beginTx(
-		context.Background(), sqldriver.TxOptions{},
+		context.Background(), sqldriver.TxOptions{}, nil,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -1390,7 +1390,7 @@ func beginRawDocsTransaction(
 
 	connection := &conn{db: database}
 	transaction, err := connection.beginTx(
-		context.Background(), sqldriver.TxOptions{},
+		context.Background(), sqldriver.TxOptions{}, nil,
 	)
 	if err != nil {
 		_ = database.close()
