@@ -100,6 +100,16 @@ func runtimeServiceDirectoryCut(
 		return bytes.Compare(left.NodeID[:], right.NodeID[:])
 	})
 
+	var catalogFences []serviceauthz.ServiceFence
+	if owner, ok := reader.(interface {
+		CatalogServiceFences(context.Context) ([]serviceauthz.ServiceFence, error)
+	}); ok {
+		var err error
+		catalogFences, err = owner.CatalogServiceFences(ctx)
+		if err != nil {
+			return serviceauthz.ServiceDirectoryCut{}, err
+		}
+	}
 	bindings := make([]serviceauthz.ServiceBinding, 0, len(records)*2)
 	for _, record := range records {
 		roles := serviceRoleMask(record)
@@ -139,6 +149,10 @@ func runtimeServiceDirectoryCut(
 				GatewayIncarnation: record.Gateway.Incarnation,
 				SessionID:          record.Gateway.SessionID, SessionRevision: record.Gateway.SessionRevision,
 				ParticipantDigest: [32]byte(record.Gateway.ParticipantDigest),
+			}
+			for _, fence := range catalogFences {
+				fence.SessionID, fence.SessionRevision = gatewayBinding.SessionID, gatewayBinding.SessionRevision
+				gatewayBinding.InternalFences = append(gatewayBinding.InternalFences, fence)
 			}
 			bindings = append(bindings, gatewayBinding)
 		}

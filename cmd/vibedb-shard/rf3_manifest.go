@@ -106,7 +106,7 @@ func (manifest rf3Manifest) groupBundles() []rf3ManifestGroup {
 func (manifest rf3Manifest) withGroup(group rf3ManifestGroup) rf3Manifest {
 	split := manifest.SplitControl
 	split.ChildRegistry = group.ChildRegistry
-	return rf3Manifest{NodeLog: manifest.NodeLog, NodeIncarnation: manifest.NodeIncarnation, Digest: manifest.Digest, WAL: group.WAL, SQL: group.SQL, Listeners: manifest.Listeners,
+	selected := rf3Manifest{NodeLog: manifest.NodeLog, NodeIncarnation: manifest.NodeIncarnation, Digest: manifest.Digest, WAL: group.WAL, SQL: group.SQL, Listeners: manifest.Listeners,
 		TLS: manifest.TLS, AuthorizationPolicy: manifest.AuthorizationPolicy,
 		GatewaySeeds:   append([]nodecontrol.BootstrapGatewaySeed(nil), manifest.GatewaySeeds...),
 		ReplicaControl: manifest.ReplicaControl,
@@ -114,6 +114,10 @@ func (manifest rf3Manifest) withGroup(group rf3ManifestGroup) rf3Manifest {
 		Gateway:         manifest.Gateway,
 		DevelopmentOnly: manifest.DevelopmentOnly, ReadAuthority: manifest.ReadAuthority, Members: group.Members,
 		MemberCount: group.MemberCount, EnrolledTarget: group.EnrolledTarget}
+	if manifest.NodeLog != nil {
+		selected.Groups = []rf3ManifestGroup{group}
+	}
+	return selected
 }
 
 type rf3ManifestSplitControl struct {

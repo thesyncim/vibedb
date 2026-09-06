@@ -247,6 +247,7 @@ func (s *Submission) PrepareRegisterGroup(descriptor GroupDescriptor) error {
 		return ErrInvalid
 	}
 	s.descriptor = descriptor
+	s.registerIncarnation = 1
 	return nil
 }
 

@@ -301,6 +301,7 @@ type devGatewayConfig struct {
 	ControllerIntervalMillis    uint64                `json:"controller_interval_millis"`
 	SchemaRolloutPlan           string                `json:"schema_rollout_plan"`
 	SchemaRolloutOnce           bool                  `json:"schema_rollout_once"`
+	InitialNodeDirectoryPath    string                `json:"initial_node_directory"`
 }
 
 type devGatewayTLS struct {

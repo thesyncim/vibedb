@@ -578,8 +578,7 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 	base := first.base
 	members, remoteNodes, dial := preparedSet.members, preparedSet.remoteNodes, preparedSet.dial
 	nativeConfigured := preparedSet.nativeConfigured
-	transportRegistry, err := rafttransport.NewStaticRegistry(
-		profile.LocalIdentity().Node, members,
+	transportRegistry, err := newRF3ProvisionedRegistry(manifest, profile, members,
 		rafttransport.Limits{MaxGroups: maxRF3ManifestGroups, MaxMembers: maxRF3ManifestGroups * rf3ManifestMembers},
 	)
 	if err != nil {

@@ -285,6 +285,9 @@ func reloadPreparedRF3Groups(ctx context.Context, current *rf3Manifest, profile 
 		if err != nil {
 			return err
 		}
+		if len(set.groups) != 1 {
+			return closePreparedRF3Groups(set.groups, errInvalidRF3Manifest)
+		}
 		item := &set.groups[0]
 		if item.restoreOperation != ([32]byte{}) {
 			return item.close(errInvalidRF3Manifest)

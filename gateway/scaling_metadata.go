@@ -167,7 +167,7 @@ func (record NodeRecord) Valid() bool {
 			record.GatewayEndpoint == record.DataEndpoint || record.GatewayEndpoint == record.NativeEndpoint ||
 			record.GatewayEndpoint == record.ControlEndpoint || record.GatewayAddress == record.DataAddress ||
 			record.GatewayAddress == record.NativeAddress || record.GatewayAddress == record.ControlAddress ||
-			record.Gateway.NodeID != record.NodeID || record.Gateway.Incarnation != record.Incarnation ||
+			record.Gateway.NodeID == (rafttransport.NodeID{}) || record.Gateway.Incarnation == 0 ||
 			record.Gateway.ServiceKeyDigest == (replication.Digest{}) || record.Gateway.ServiceID == ([16]byte{}) ||
 			record.Gateway.SessionID == ([16]byte{}) || record.Gateway.SessionRevision == 0 ||
 			record.Gateway.ParticipantDigest == (replication.Digest{}) {

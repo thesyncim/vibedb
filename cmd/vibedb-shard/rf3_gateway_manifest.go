@@ -57,6 +57,7 @@ type rf3ManifestGateway struct {
 	ControllerIntervalMillis    uint64                   `json:"controller_interval_millis"`
 	SchemaRolloutPlan           string                   `json:"schema_rollout_plan"`
 	SchemaRolloutOnce           bool                     `json:"schema_rollout_once"`
+	InitialNodeDirectoryPath    string                   `json:"initial_node_directory"`
 }
 
 type rf3ManifestGatewayPeer struct {
@@ -342,6 +343,13 @@ func parseRF3ManifestGateway(node vibejson.Node) (*rf3ManifestGateway, error) {
 	}
 	if result.SchemaRolloutOnce, ok = value.Bool(); !ok {
 		return nil, errInvalidRF3Manifest
+	}
+	value, err = nextRF3Field(&fields, `"initial_node_directory"`)
+	if err != nil {
+		return nil, err
+	}
+	if result.InitialNodeDirectoryPath, err = rf3ManifestOptionalAbsolutePath(value); err != nil {
+		return nil, err
 	}
 	if _, _, extra := fields.Next(); extra {
 		return nil, errInvalidRF3Manifest

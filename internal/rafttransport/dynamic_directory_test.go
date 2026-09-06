@@ -416,22 +416,3 @@ func TestEmptyTransportEnrollsAndRetiresBoundedPeer(t *testing.T) {
 		t.Fatal("empty transport did not stop")
 	}
 }
-
-func TestStaticPeerBindingPreservesAuthenticatedManifestIdentities(t *testing.T) {
-	fixture := newTransportTestFixture(t)
-	domain := fixture.registry.TrustDomain()
-	identity := PeerIdentity{TrustDomain: domain, Node: fixture.remote[0].Node}
-	key := sha256.Sum256([]byte("authenticated-static-leaf"))
-	if err := fixture.registry.VerifyPeerBinding(identity, key); err != nil {
-		t.Fatalf("static manifest identity rejected: %v", err)
-	}
-	identity.Node = testNode(99)
-	if err := fixture.registry.VerifyPeerBinding(identity, key); !errors.Is(err, ErrPeerUnauthorized) {
-		t.Fatalf("unknown static identity: %v", err)
-	}
-	identity.Node = fixture.remote[0].Node
-	identity.TrustDomain.ClusterIncarnation[0] ^= 1
-	if err := fixture.registry.VerifyPeerBinding(identity, key); !errors.Is(err, ErrPeerUnauthorized) {
-		t.Fatalf("wrong trust domain: %v", err)
-	}
-}

@@ -107,3 +107,34 @@ func mustReplicatedRequestFrameBytes(t *testing.T, request *ReplicatedRequest) i
 	}
 	return bytes
 }
+
+func TestCatalogScopeBindsGroupRelationAndManifest(t *testing.T) {
+	request := &ReplicatedRequest{Operation: ReplicatedReadLeader, Capability: serviceauthz.CapabilityTopology, Fence: testReplicatedFence(), Relation: 1}
+	scope, ok := FrontendContinuationScopeForReplicatedRequest(request)
+	if !ok || scope.Action != serviceauthz.FrontendActionGatewayCatalog || scope.Operation != serviceauthz.ServiceOperationCatalogRead {
+		t.Fatalf("catalog scope=%+v ok=%t", scope, ok)
+	}
+	changed := *request
+	changed.Relation = 2
+	other, ok := FrontendContinuationScopeForReplicatedRequest(&changed)
+	if !ok || scope.Relation == other.Relation {
+		t.Fatal("catalog read relation is not fenced")
+	}
+	changed = *request
+	changed.Fence.Group.GroupID[0] ^= 1
+	other, ok = FrontendContinuationScopeForReplicatedRequest(&changed)
+	if !ok || scope.Group == other.Group {
+		t.Fatal("catalog group is not fenced")
+	}
+	changed = *request
+	changed.Fence.Command.RelationManifestDigest[0] ^= 0x80
+	other, ok = FrontendContinuationScopeForReplicatedRequest(&changed)
+	if !ok || scope.FenceDigest == other.FenceDigest {
+		t.Fatal("catalog manifest is not fenced")
+	}
+	changed = *request
+	changed.Fence.Command.RelationManifestDigest = [32]byte{}
+	if _, ok = FrontendContinuationScopeForReplicatedRequest(&changed); ok {
+		t.Fatal("missing manifest admitted")
+	}
+}

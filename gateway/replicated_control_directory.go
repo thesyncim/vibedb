@@ -157,7 +157,7 @@ func (directory *ReplicatedControlDirectory) applyLocked(snapshot ReplicatedCont
 			return ErrReplicatedControlDirectory
 		}
 		if record.Gateway.NodeID != (rafttransport.NodeID{}) {
-			if record.Gateway.NodeID != record.NodeID || record.Gateway.Incarnation == 0 ||
+			if record.Gateway.Incarnation == 0 ||
 				record.Gateway.SessionID == ([16]byte{}) || record.Gateway.SessionRevision == 0 ||
 				record.Gateway.ParticipantDigest == (replication.Digest{}) || record.GatewayAddress == "" {
 				return ErrReplicatedControlDirectory

@@ -147,6 +147,11 @@ func (runtime *Runtime) open() error {
 			return fmt.Errorf("open replicated catalog: %w", err)
 		}
 		runtime.routeSeedControl = runtime.authority.ReplicatedCatalogRouteSeedControl()
+		if len(config.InitialNodeDirectory) != 0 {
+			if err = runtime.authority.BootstrapNodeDirectory(runtime.ctx, config.InitialNodeDirectory); err != nil {
+				return fmt.Errorf("bootstrap physical-node directory: %w", err)
+			}
+		}
 	}
 	tableCatalogs := config.TableCatalogs
 	if config.TableCatalogsPath != "" {

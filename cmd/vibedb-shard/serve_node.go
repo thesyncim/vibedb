@@ -207,6 +207,10 @@ func prepareRF3EmbeddedGateway(
 			return nil, fmt.Errorf("%w: embedded gateway DDL owner identity", errRF3Serving)
 		}
 	}
+	initialNodes, err := loadRF3InitialNodeDirectory(encoded.InitialNodeDirectoryPath)
+	if err != nil {
+		return nil, err
+	}
 	config := gatewayruntime.Config{
 		CatalogPath: encoded.CatalogPath, CatalogRouteSeedPath: encoded.CatalogRouteSeedPath,
 		CatalogBootstrapIfMissing: encoded.CatalogBootstrapIfMissing,
@@ -217,8 +221,9 @@ func prepareRF3EmbeddedGateway(
 		CatalogSessionJournal:     encoded.CatalogSessionJournal, CatalogClientID: clientID,
 		CatalogRetryHome: retryHome, DurableAckKeyPath: encoded.DurableAckKeyPath,
 		Transport: client, RequireServiceDirectoryBinding: true,
-		ListenAddress:  encoded.ListenAddress,
-		TLSCertificate: encoded.TLS.Certificate, TLSKey: encoded.TLS.Key,
+		InitialNodeDirectory: initialNodes,
+		ListenAddress:        encoded.ListenAddress,
+		TLSCertificate:       encoded.TLS.Certificate, TLSKey: encoded.TLS.Key,
 		TLSRoots: encoded.TLS.Roots, TLSIdentityOID: encoded.TLS.IdentityOID,
 		TLSHandshakeTimeout: handshakeTimeout, TLSProfile: frontendProfile,
 		AuthorizationPolicy: encoded.AuthorizationPolicy, InternalAuthority: serviceauthz.Authority{

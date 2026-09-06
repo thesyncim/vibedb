@@ -106,6 +106,8 @@ func FrontendContinuationScopeForReplicatedRequestWithProtocol(
 		case serviceauthz.CapabilityDataWrite:
 			scope.Action, scope.Operation = serviceauthz.FrontendActionForwardedData,
 				serviceauthz.ServiceOperationForwardedWrite
+		case serviceauthz.CapabilityTopology:
+			scope.Action, scope.Operation = serviceauthz.FrontendActionGatewayCatalog, serviceauthz.ServiceOperationCatalogWrite
 		default:
 			return serviceauthz.FrontendContinuationScopeRecord{}, false
 		}
@@ -113,6 +115,8 @@ func FrontendContinuationScopeForReplicatedRequestWithProtocol(
 		if request.Capability == serviceauthz.CapabilityDataRead {
 			scope.Action, scope.Operation = serviceauthz.FrontendActionForwardedData,
 				serviceauthz.ServiceOperationForwardedRead
+		} else if request.Capability == serviceauthz.CapabilityTopology && request.Operation == ReplicatedReadLeader {
+			scope.Action, scope.Operation = serviceauthz.FrontendActionGatewayCatalog, serviceauthz.ServiceOperationCatalogRead
 		} else {
 			return serviceauthz.FrontendContinuationScopeRecord{}, false
 		}
@@ -120,11 +124,13 @@ func FrontendContinuationScopeForReplicatedRequestWithProtocol(
 		return serviceauthz.FrontendContinuationScopeRecord{}, false
 	}
 	if scope.Action != serviceauthz.FrontendActionForwardedData {
-		if request.Operation != ReplicatedProbe || scope.Action != serviceauthz.FrontendActionGatewayCatalog ||
+		if scope.Action != serviceauthz.FrontendActionGatewayCatalog ||
 			request.Fence.Command.RelationManifestDigest == ([32]byte{}) {
 			return serviceauthz.FrontendContinuationScopeRecord{}, false
 		}
-		copy(scope.Relation[:], request.Fence.Command.RelationManifestDigest[:len(scope.Relation)])
+		if request.Operation != ReplicatedReadLeader {
+			copy(scope.Relation[:], request.Fence.Command.RelationManifestDigest[:len(scope.Relation)])
+		}
 		scope.IntentID = request.Fence.Command.RelationManifestDigest
 		scope.FenceDigest = request.Fence.Command.RelationManifestDigest
 	}
