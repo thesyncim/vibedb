@@ -106,6 +106,11 @@ func TestScalingEnrollmentIDIsStableAcrossDurableRecoveryPhases(t *testing.T) {
 	parent[0] = 1
 	row := gateway.GroupEnrollmentIntent{IntentID: [32]byte{2}, State: gateway.EnrollmentReserved, Revision: 1}
 	reserved := scalingEnrollmentID(parent, row)
+	row.PreparationClaim = [32]byte{9}
+	if got := scalingEnrollmentID(parent, row); got != reserved {
+		t.Fatalf("preparation claim changed enrollment owner: reserved=%x claimed=%x", reserved, got)
+	}
+	row.PreparationClaim = [32]byte{}
 	row.State = gateway.EnrollmentPrepared
 	row.Revision = 2
 	row.Proof = &gateway.PreparedReplicaProof{IntentID: row.IntentID}

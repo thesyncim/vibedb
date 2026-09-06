@@ -1100,11 +1100,12 @@ func blockersFromEvidence(evidence gateway.NodeReferenceEvidence) []gateway.Scal
 func scalingEnrollmentID(parent [32]byte, intent gateway.GroupEnrollmentIntent) [32]byte {
 	copyOf := intent
 	copyOf.IntentID = [32]byte{}
-	// Enrollment state, revision, proof, receipt, and move operation are
+	// Enrollment state, revision, preparation claim, proof, receipt, and move operation are
 	// recovery fields. Ownership must remain stable across Reserved ->
 	// Prepared -> Enrolled -> Moving so a restart can rediscover the same row.
 	copyOf.State = gateway.EnrollmentReserved
 	copyOf.Revision = 0
+	copyOf.PreparationClaim = [32]byte{}
 	copyOf.Proof = nil
 	copyOf.Receipt = nil
 	copyOf.MoveOperationID = [32]byte{}
