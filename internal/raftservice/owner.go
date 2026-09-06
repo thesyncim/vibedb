@@ -243,6 +243,8 @@ type readAuthorization struct {
 }
 
 type readDelivery struct {
+	// Assigned under owner.mu before publication; zero means not shareable.
+	admission      uint64
 	state          atomic.Uint32
 	reply          chan ownerReply
 	context        [16]byte
@@ -261,6 +263,16 @@ type ownerGeneration struct {
 	pins             atomic.Int64
 	transitionFenced atomic.Bool
 	quiescing        atomic.Bool
+}
+
+// sharedReadBarrier freezes eligibility before ReadIndex is invoked. Only
+// requests published at or before cutoff can share this proof. A matching
+// serving generation alone says nothing about when a read was invoked.
+type sharedReadBarrier struct {
+	context    [16]byte
+	generation *ownerGeneration
+	cutoff     uint64
+	term       uint64
 }
 
 func (generation *ownerGeneration) acquire() bool {
@@ -708,18 +720,28 @@ type Owner struct {
 	ready   chan struct{}
 	done    chan struct{}
 
-	mu                   sync.Mutex
-	ingressItems         int
-	ingressBytes         int64
-	pendingProposalItems int
-	pendingProposalBytes int64
-	pendingReadItems     int
-	pendingReadBytes     int64
-	readSequence         uint64
-	pendingReads         map[[16]byte]*readDelivery
-	started              bool
-	closed               bool
-	failure              error
+	mu                    sync.Mutex
+	ingressItems          int
+	ingressBytes          int64
+	pendingProposalItems  int
+	pendingProposalBytes  int64
+	pendingReadItems      int
+	pendingReadBytes      int64
+	readSequence          uint64
+	readAdmissionSequence uint64 // guarded by mu, including owner-lane snapshots
+	pendingReads          map[[16]byte]*readDelivery
+	// sharedBarrierWaiters attaches concurrent linearizable reads to one
+	// in-flight quorum barrier per group instead of issuing a ReadIndex
+	// round each. inflightBarrier maps a group to the barrier same-generation
+	// reads may join. Both maps are owned by the serialized owner lane:
+	// handle registers, finishReadOutcomes and drain settle and remove. A
+	// lone read never waits for company; sharing adds no batching timer.
+	sharedBarrierWaiters  map[[16]byte][]*readDelivery
+	sharedReadWaiterCount int // includes abandoned deliveries until their barrier settles
+	inflightBarrier       map[raftmember.GroupKey]sharedReadBarrier
+	started               bool
+	closed                bool
+	failure               error
 }
 
 // ownerHost is the complete narrow capability used by one serialized owner.
@@ -1758,7 +1780,24 @@ func (owner *Owner) handle(request ownerRequest) error {
 		request.read.delivery.generation = member.generation
 		request.read.delivery.serving = serving
 		delivery := request.read.delivery
+		if len(owner.pendingReads)+owner.sharedReadWaiterCount >= owner.limits.MaxPendingReadItems {
+			reply.err = ErrIngressFull
+			break
+		}
 		if !delivery.contextSet {
+			// The batch was frozen before the quorum round began. Requests
+			// published later must issue another round, even if local leadership
+			// and serving generation still appear unchanged.
+			if !request.read.forceReadIndex {
+				if shared, ok := owner.sharedReadBarrierFor(request.group, delivery.generation, delivery.admission, status.Term); ok {
+					delivery.context = shared
+					delivery.contextSet = true
+					owner.sharedBarrierWaiters[shared] = append(owner.sharedBarrierWaiters[shared], delivery)
+					owner.sharedReadWaiterCount++
+					owner.metrics.observeReadIndexShared(request.group)
+					return nil
+				}
+			}
 			context, contextErr := owner.nextReadContext(member.identity.NodeIncarnation)
 			if contextErr != nil {
 				reply.err = contextErr
@@ -1767,6 +1806,11 @@ func (owner *Owner) handle(request ownerRequest) error {
 			delivery.context = context
 			delivery.contextSet = true
 		}
+		// publish uses this same mutex: every eligible read has already been
+		// invoked and published before the protocol can produce this proof.
+		owner.mu.Lock()
+		cutoff := owner.readAdmissionSequence
+		owner.mu.Unlock()
 		if err := owner.host.ReadIndex(request.group, delivery.context[:]); err != nil {
 			if errors.Is(err, raftmodel.ErrReadyPending) {
 				// The event loop retains this exact request until the Host has
@@ -1782,6 +1826,7 @@ func (owner *Owner) handle(request ownerRequest) error {
 			owner.metrics.observeAuthorityReadIndexFallback(request.group)
 		}
 		owner.pendingReads[delivery.context] = delivery
+		owner.setSharedReadBarrier(request.group, delivery.context, delivery.generation, cutoff, status.Term)
 		// The reply is settled only by the matching quorum barrier.
 		return nil
 	default:
@@ -2086,6 +2131,35 @@ func (owner *Owner) syncCommandFenceFromSnapshot(
 	return nil
 }
 
+// sharedReadBarrierFor returns the group's pending barrier context when a new
+// read may join it: pre-issue admission, same generation/term, and still pending. A
+// completed or superseded barrier is dropped lazily so a later read issues a
+// fresh round instead of joining a dead one.
+func (owner *Owner) sharedReadBarrierFor(group raftmember.GroupKey, generation *ownerGeneration, admission, term uint64) ([16]byte, bool) {
+	if owner.inflightBarrier == nil {
+		owner.inflightBarrier = make(map[raftmember.GroupKey]sharedReadBarrier)
+	}
+	shared, ok := owner.inflightBarrier[group]
+	if !ok || shared.generation != generation || shared.term != term || admission == 0 || admission > shared.cutoff {
+		return [16]byte{}, false
+	}
+	if _, pending := owner.pendingReads[shared.context]; !pending {
+		delete(owner.inflightBarrier, group)
+		return [16]byte{}, false
+	}
+	if owner.sharedBarrierWaiters == nil {
+		owner.sharedBarrierWaiters = make(map[[16]byte][]*readDelivery)
+	}
+	return shared.context, true
+}
+
+func (owner *Owner) setSharedReadBarrier(group raftmember.GroupKey, context [16]byte, generation *ownerGeneration, cutoff, term uint64) {
+	if owner.inflightBarrier == nil {
+		owner.inflightBarrier = make(map[raftmember.GroupKey]sharedReadBarrier)
+	}
+	owner.inflightBarrier[group] = sharedReadBarrier{context: context, generation: generation, cutoff: cutoff, term: term}
+}
+
 func (owner *Owner) nextReadContext(incarnation uint64) ([16]byte, error) {
 	if owner.readSequence == ^uint64(0) || len(owner.pendingReads) >= owner.limits.MaxPendingReadItems {
 		return [16]byte{}, ErrIngressFull
@@ -2110,32 +2184,49 @@ func (owner *Owner) finishReadOutcomes(outcomes []raftmodel.ReadOutcome) {
 			continue
 		}
 		delete(owner.pendingReads, key)
-		if delivery.state.Load() != readDeliveryPending {
-			continue
+		owner.settleReadBarrierDelivery(delivery, outcome)
+		for _, waiter := range owner.sharedBarrierWaiters[key] {
+			owner.settleReadBarrierDelivery(waiter, outcome)
 		}
-		reply := ownerReply{err: outcome.Err}
-		if outcome.Err == nil {
-			if !delivery.generation.acquire() {
-				reply.err = ErrServingFence
-				if !owner.settleReadDelivery(delivery, reply) && reply.read.generation != nil {
-					reply.read.generation.release()
-				}
-				continue
+		owner.sharedReadWaiterCount -= len(owner.sharedBarrierWaiters[key])
+		delete(owner.sharedBarrierWaiters, key)
+		group := delivery.serving.Identity.Group
+		if shared, ok := owner.inflightBarrier[group]; ok && shared.context == key {
+			delete(owner.inflightBarrier, group)
+		}
+	}
+}
+
+// settleReadBarrierDelivery settles one waiter of a completed quorum barrier:
+// the primary first, then every read that joined it. Each waiter keeps its
+// own applied floor, source, and generation pin, so sharing the barrier
+// changes how many ReadIndex rounds run, never what any waiter observes.
+func (owner *Owner) settleReadBarrierDelivery(delivery *readDelivery, outcome raftmodel.ReadOutcome) {
+	if delivery.state.Load() != readDeliveryPending {
+		return
+	}
+	reply := ownerReply{err: outcome.Err}
+	if outcome.Err == nil {
+		if !delivery.generation.acquire() {
+			reply.err = ErrServingFence
+			if !owner.settleReadDelivery(delivery, reply) && reply.read.generation != nil {
+				reply.read.generation.release()
 			}
-			reply.read.minimumApplied = max(delivery.minimumApplied, outcome.Barrier.Index)
-			// Source was authenticated at admission and remains bound to the
-			// immutable owner member for this allocation.
-			reply.read.source = delivery.source
-			reply.read.recovery = delivery.recovery
-			reply.read.requestLedger = delivery.requestLedger
-			reply.read.generation = delivery.generation
-			reply.read.executionPin = delivery.executionPin
-			reply.read.routeGate = delivery.routeGate
-			reply.read.state = delivery.serving
+			return
 		}
-		if !owner.settleReadDelivery(delivery, reply) && reply.read.generation != nil {
-			reply.read.generation.release()
-		}
+		reply.read.minimumApplied = max(delivery.minimumApplied, outcome.Barrier.Index)
+		// Source was authenticated at admission and remains bound to the
+		// immutable owner member for this allocation.
+		reply.read.source = delivery.source
+		reply.read.recovery = delivery.recovery
+		reply.read.requestLedger = delivery.requestLedger
+		reply.read.generation = delivery.generation
+		reply.read.executionPin = delivery.executionPin
+		reply.read.routeGate = delivery.routeGate
+		reply.read.state = delivery.serving
+	}
+	if !owner.settleReadDelivery(delivery, reply) && reply.read.generation != nil {
+		reply.read.generation.release()
 	}
 }
 
@@ -2547,9 +2638,19 @@ func (owner *Owner) stop(cause error) error {
 		close(owner.done)
 	}
 	owner.mu.Unlock()
+	closedErr := ownerReply{err: errors.Join(ErrOwnerClosed, cause)}
 	for key, delivery := range owner.pendingReads {
 		delete(owner.pendingReads, key)
-		owner.settleReadDelivery(delivery, ownerReply{err: errors.Join(ErrOwnerClosed, cause)})
+		owner.settleReadDelivery(delivery, closedErr)
+		for _, waiter := range owner.sharedBarrierWaiters[key] {
+			owner.settleReadDelivery(waiter, closedErr)
+		}
+		owner.sharedReadWaiterCount -= len(owner.sharedBarrierWaiters[key])
+		delete(owner.sharedBarrierWaiters, key)
+		group := delivery.serving.Identity.Group
+		if shared, ok := owner.inflightBarrier[group]; ok && shared.context == key {
+			delete(owner.inflightBarrier, group)
+		}
 	}
 	for {
 		select {
@@ -3066,6 +3167,13 @@ func (owner *Owner) publish(request ownerRequest) error {
 	if owner.ingressItems == owner.limits.MaxIngressItems ||
 		bytes > owner.limits.MaxIngressBytes-owner.ingressBytes {
 		return ErrIngressFull
+	}
+	if request.read.delivery != nil {
+		if owner.readAdmissionSequence == ^uint64(0) {
+			return ErrIngressFull
+		}
+		owner.readAdmissionSequence++
+		request.read.delivery.admission = owner.readAdmissionSequence
 	}
 	owner.ingressItems++
 	owner.ingressBytes += bytes
