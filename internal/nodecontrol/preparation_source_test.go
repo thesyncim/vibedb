@@ -56,7 +56,7 @@ func TestPreparationSourceServiceAuthorizesBeforeExport(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			calls := 0
 			deadline := func() time.Time { return time.Now().Add(time.Second) }
-			service, err := NewPreparationSourceService(func(_ context.Context, got gateway.GroupEnrollmentIntent, _ [3]PreparationMember) ([]byte, error) {
+			service, err := NewPreparationSourceService(func(_ context.Context, got gateway.GroupEnrollmentIntent, _ [3]PreparationMember, _ PreparationMember) ([]byte, error) {
 				calls++
 				if got.Digest() != intent.Digest() {
 					t.Error("intent changed")
@@ -102,7 +102,27 @@ func (f preparationSourceOpenerFunc) OpenShardControl(c context.Context, n raftt
 func TestPreparationSourceClientRejectsReplySubstitution(t *testing.T) {
 	intent := testIntent([]byte("payload"), gateway.EnrollmentReserved)
 	domain := rafttransport.TrustDomain{ClusterID: intent.Group.ClusterID, ClusterIncarnation: intent.Group.ClusterIncarnation}
-	spec := PreparationSpec{Kind: PreparationSpecKind, Group: intent.Group, Distribution: intent.Distribution, Shard: intent.Shard, AllocationGeneration: intent.AllocationGeneration, ReplicaOrdinal: intent.ReplicaOrdinal, SourceCommand: intent.ExpectedCommand, LogicalSchemaDigest: intent.ExpectedCommand.RelationManifestDigest, InitialVoters: [3]PreparationMember{{MemberID: 1, Node: intent.Source.Node, PeerAddress: string(intent.Source.Endpoint)}, {MemberID: 2, Node: rafttransport.NodeID{7}, PeerAddress: "peer2"}, {MemberID: 3, Node: rafttransport.NodeID{8}, PeerAddress: "peer3"}}, Target: PreparationMember{MemberID: intent.Target.Member, Node: intent.Target.Node, PeerAddress: string(intent.Target.Endpoint), NativeAddress: string(intent.Target.NativeEndpoint), ControlAddress: string(intent.Target.ControlEndpoint)}, TargetNodeIncarnation: intent.Target.NodeIncarnation, TargetStoreID: intent.Target.StoreID, Table: "orders", CreateTable: "CREATE TABLE orders (id TEXT PRIMARY KEY)", Apply: PreparationApplyProfile{MaxSessions: 16, RetryWindow: 8, MaxCollections: 1, MaxDocuments: 1, MaxBytes: 1024, ShardKey: "id"}, Log: PreparationLogProfile{MaxFileBytes: 4096, MaxRecordBytes: 1024, MaxRecords: 4, MaxEntries: 4, MaxLiveBytes: 4096}}
+	spec := PreparationSpec{Kind: PreparationSpecKind, Group: intent.Group, Distribution: intent.Distribution, Shard: intent.Shard, AllocationGeneration: intent.AllocationGeneration, ReplicaOrdinal: intent.ReplicaOrdinal, SourceCommand: intent.ExpectedCommand, LogicalSchemaDigest: intent.ExpectedCommand.RelationManifestDigest, InitialVoters: [3]PreparationMember{{MemberID: 1, Node: intent.Source.Node, PeerEndpoint: intent.Source.Endpoint, PeerAddress: "127.0.0.1:1001"}, {MemberID: 2, Node: rafttransport.NodeID{7}, PeerEndpoint: "peer2", PeerAddress: "127.0.0.1:1002"}, {MemberID: 3, Node: rafttransport.NodeID{8}, PeerEndpoint: "peer3", PeerAddress: "127.0.0.1:1003"}}, Target: PreparationMember{MemberID: intent.Target.Member, Node: intent.Target.Node, PeerEndpoint: intent.Target.Endpoint, NativeEndpoint: intent.Target.NativeEndpoint, ControlEndpoint: intent.Target.ControlEndpoint, PeerAddress: "127.0.0.1:1004", NativeAddress: "127.0.0.1:2004", ControlAddress: "127.0.0.1:3004"}, TargetNodeIncarnation: intent.Target.NodeIncarnation, TargetStoreID: intent.Target.StoreID, Table: "orders", CreateTable: "CREATE TABLE orders (id TEXT PRIMARY KEY)", Apply: PreparationApplyProfile{MaxSessions: 16, RetryWindow: 8, MaxCollections: 1, MaxDocuments: 1, MaxBytes: 1024, ShardKey: "id"}, Log: PreparationLogProfile{MaxFileBytes: 4096, MaxRecordBytes: 1024, MaxRecords: 4, MaxEntries: 4, MaxLiveBytes: 4096}}
+
+	if err := spec.ValidateAgainst(intent); err != nil {
+		t.Fatalf("distinct endpoint identities and addresses: %v", err)
+	}
+	for _, field := range []string{"source", "target-peer", "target-native", "target-control"} {
+		altered := spec
+		switch field {
+		case "source":
+			altered.InitialVoters[0].PeerEndpoint = "substituted"
+		case "target-peer":
+			altered.Target.PeerEndpoint = "substituted"
+		case "target-native":
+			altered.Target.NativeEndpoint = "substituted"
+		case "target-control":
+			altered.Target.ControlEndpoint = "substituted"
+		}
+		if err := altered.ValidateAgainst(intent); !errors.Is(err, ErrStale) {
+			t.Fatalf("%s endpoint substitution: %v", field, err)
+		}
+	}
 	payload, err := AppendPreparationSpec(nil, spec)
 	if err != nil {
 		t.Fatal(err)
@@ -143,7 +163,7 @@ func TestPreparationSourceClientRejectsReplySubstitution(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			got, err := client.Read(t.Context(), intent, spec.InitialVoters)
+			got, err := client.Read(t.Context(), intent, spec.InitialVoters, spec.Target)
 			<-done
 			if name == "valid" {
 				if err != nil || !bytes.Equal(got, payload) {

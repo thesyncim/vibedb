@@ -31,12 +31,15 @@ const MaxSourceBootstrapBytes = 1 << 20
 // or filesystem paths. The target is separate from InitialVoters so preparing
 // a learner can never be mistaken for creating a new genesis voter set.
 type PreparationMember struct {
-	MemberID        uint64               `json:"member_id"`
-	Node            rafttransport.NodeID `json:"node"`
-	PeerAddress     string               `json:"peer_address"`
-	NativeAddress   string               `json:"native_address,omitempty"`
-	ControlAddress  string               `json:"control_address,omitempty"`
-	SnapshotAddress string               `json:"snapshot_address,omitempty"`
+	PeerEndpoint    distribution.EndpointID `json:"peer_endpoint"`
+	NativeEndpoint  distribution.EndpointID `json:"native_endpoint,omitempty"`
+	ControlEndpoint distribution.EndpointID `json:"control_endpoint,omitempty"`
+	MemberID        uint64                  `json:"member_id"`
+	Node            rafttransport.NodeID    `json:"node"`
+	PeerAddress     string                  `json:"peer_address"`
+	NativeAddress   string                  `json:"native_address,omitempty"`
+	ControlAddress  string                  `json:"control_address,omitempty"`
+	SnapshotAddress string                  `json:"snapshot_address,omitempty"`
 }
 
 // PreparationApplyProfile contains only portable schema/apply limits. The
@@ -106,8 +109,8 @@ type PreparationSpec struct {
 	Table                 string                                 `json:"table"`
 	CreateTable           string                                 `json:"create_table"`
 	SchemaStatements      []string                               `json:"schema_statements,omitempty"`
-	GlobalIndexes         []PreparationGlobalIndex          `json:"global_indexes,omitempty"`
-	Apply PreparationApplyProfile `json:"apply"`
+	GlobalIndexes         []PreparationGlobalIndex               `json:"global_indexes,omitempty"`
+	Apply                 PreparationApplyProfile                `json:"apply"`
 	// SourceBootstrap is a bounded, canonical protobuf envelope. It is not a
 	// data snapshot; the receiver compares its digest to the streamed artifact
 	// certificate before activation.
@@ -124,9 +127,9 @@ func (spec PreparationSpec) ValidateAgainst(intent gateway.GroupEnrollmentIntent
 		spec.SourceCommand != intent.ExpectedCommand || spec.Target.MemberID != intent.Target.Member ||
 		spec.Target.Node != intent.Target.Node || spec.TargetNodeIncarnation != intent.Target.NodeIncarnation ||
 		spec.TargetStoreID != intent.Target.StoreID || spec.LogicalSchemaDigest != intent.ExpectedCommand.RelationManifestDigest ||
-		spec.LogicalSchemaDigest == (replication.Digest{}) || spec.Target.PeerAddress != string(intent.Target.Endpoint) ||
-		spec.Target.NativeAddress != string(intent.Target.NativeEndpoint) ||
-		spec.Target.ControlAddress != string(intent.Target.ControlEndpoint) ||
+		spec.LogicalSchemaDigest == (replication.Digest{}) || spec.Target.PeerEndpoint != intent.Target.Endpoint ||
+		spec.Target.NativeEndpoint != intent.Target.NativeEndpoint ||
+		spec.Target.ControlEndpoint != intent.Target.ControlEndpoint ||
 		spec.Table == "" || spec.CreateTable == "" || spec.Apply.ShardKey == "" {
 		return ErrStale
 	}
@@ -138,7 +141,7 @@ func (spec PreparationSpec) ValidateAgainst(intent gateway.GroupEnrollmentIntent
 	seenIDs := [4]uint64{}
 	seenNodes := [4]rafttransport.NodeID{}
 	for index, member := range append(append([]PreparationMember(nil), spec.InitialVoters[:]...), spec.Target) {
-		if member.MemberID == 0 || member.Node == (rafttransport.NodeID{}) || member.PeerAddress == "" {
+		if member.MemberID == 0 || member.Node == (rafttransport.NodeID{}) || member.PeerAddress == "" || member.PeerEndpoint == "" {
 			return ErrControl
 		}
 		for prior := 0; prior < index; prior++ {
@@ -156,7 +159,7 @@ func (spec PreparationSpec) ValidateAgainst(intent gateway.GroupEnrollmentIntent
 	sourceFound := false
 	for _, member := range spec.InitialVoters {
 		if member.MemberID == intent.Source.Member {
-			if member.Node != intent.Source.Node || member.PeerAddress != string(intent.Source.Endpoint) {
+			if member.Node != intent.Source.Node || member.PeerEndpoint != intent.Source.Endpoint {
 				return ErrStale
 			}
 			sourceFound = true
@@ -231,7 +234,7 @@ func (spec PreparationSpec) ValidateShape() error {
 		return ErrControl
 	}
 	if spec.Target.MemberID == 0 || spec.Target.Node == (rafttransport.NodeID{}) || spec.Target.PeerAddress == "" ||
-		spec.Target.NativeAddress == "" || spec.Target.ControlAddress == "" {
+		spec.Target.NativeAddress == "" || spec.Target.ControlAddress == "" || spec.Target.PeerEndpoint == "" || spec.Target.NativeEndpoint == "" || spec.Target.ControlEndpoint == "" {
 		return ErrControl
 	}
 	if len(spec.SourceBootstrap) > MaxSourceBootstrapBytes ||
@@ -240,7 +243,7 @@ func (spec PreparationSpec) ValidateShape() error {
 		return ErrControl
 	}
 	for index, member := range spec.InitialVoters {
-		if member.MemberID == 0 || member.Node == (rafttransport.NodeID{}) || member.PeerAddress == "" ||
+		if member.MemberID == 0 || member.Node == (rafttransport.NodeID{}) || member.PeerAddress == "" || member.PeerEndpoint == "" ||
 			index > 0 && member.MemberID <= spec.InitialVoters[index-1].MemberID {
 			return ErrControl
 		}

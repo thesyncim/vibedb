@@ -29,7 +29,7 @@ func newRF3PreparationSource(schemas *rf3SchemaActivator, registry *rafttranspor
 		return nil, err
 	}
 	var mu sync.Mutex
-	provider := func(ctx context.Context, intent gateway.GroupEnrollmentIntent, voters [3]nodecontrol.PreparationMember) ([]byte, error) {
+	provider := func(ctx context.Context, intent gateway.GroupEnrollmentIntent, voters [3]nodecontrol.PreparationMember, target nodecontrol.PreparationMember) ([]byte, error) {
 		mu.Lock()
 		defer mu.Unlock()
 		if err := context.Cause(ctx); err != nil {
@@ -50,6 +50,9 @@ func newRF3PreparationSource(schemas *rf3SchemaActivator, registry *rafttranspor
 				return nil, nodecontrol.ErrConflict
 			}
 			if voters != ([3]nodecontrol.PreparationMember{}) && spec.InitialVoters != voters {
+				return nil, nodecontrol.ErrConflict
+			}
+			if target != (nodecontrol.PreparationMember{}) && spec.Target != target {
 				return nil, nodecontrol.ErrConflict
 			}
 			if err = spec.ValidateAgainst(intent); err != nil {
@@ -132,7 +135,7 @@ func newRF3PreparationSource(schemas *rf3SchemaActivator, registry *rafttranspor
 			indexes[i] = nodecontrol.PreparationGlobalIndex{Relation: uint16(index.Relation), Table: index.Table, IndexID: index.IndexID, Incarnation: index.Incarnation, LocatorCount: index.LocatorCount, Unique: index.Unique, KeyEncoding: uint8(index.KeyEncoding), KeyArity: index.KeyArity, TupleVersion: uint32(index.TupleVersion), MapperVersion: uint32(index.MapperVersion), BucketBits: index.BucketBits}
 		}
 		exported, err := nodecontrol.ExportPreparationSpec(nodecontrol.PreparationExportInput{
-			Intent: intent, InitialVoters: voters, Target: nodecontrol.PreparationMember{MemberID: intent.Target.Member, Node: intent.Target.Node, PeerAddress: string(intent.Target.Endpoint), NativeAddress: string(intent.Target.NativeEndpoint), ControlAddress: string(intent.Target.ControlEndpoint)},
+			Intent: intent, InitialVoters: voters, Target: target,
 			Log:   nodecontrol.PreparationLogProfile{MaxFileBytes: wal.MaxFileBytes, MaxRecordBytes: wal.MaxRecordBytes, MaxRecords: wal.MaxRecords, MaxEntries: wal.MaxEntries, MaxLiveBytes: wal.MaxLiveBytes},
 			Table: template.Table, CreateTable: template.CreateTable, SchemaStatements: template.SchemaStatements, GlobalIndexes: indexes, SourceBootstrap: bootstrap,
 			Apply: nodecontrol.PreparationApplyProfile{MaxSessions: apply.MaxSessions, RetryWindow: apply.RetryWindow, MaxCollections: apply.TxnLimits.MaxCollections, MaxDocuments: apply.TxnLimits.MaxDocuments, MaxBytes: apply.TxnLimits.MaxBytes, ShardKey: apply.Placement.ShardKey, RequestLedgerCapacityBytes: apply.RequestLedgerCapacityBytes, RequestLedgerCleanupReserveBytes: apply.RequestLedgerCleanupReserveBytes, RequestLedgerRangeStart: apply.RequestLedgerRangeStart, RequestLedgerRangeEnd: apply.RequestLedgerRangeEnd, RequestLedgerRangeIdentity: apply.RequestLedgerRangeIdentity},

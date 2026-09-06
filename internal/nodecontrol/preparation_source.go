@@ -36,9 +36,10 @@ func validPreparationSourceIntent(intent gateway.GroupEnrollmentIntent) bool {
 type PreparationSourceRequest struct {
 	Intent gateway.GroupEnrollmentIntent
 	Voters [3]PreparationMember
+	Target PreparationMember
 }
 
-type PreparationSourceProvider func(context.Context, gateway.GroupEnrollmentIntent, [3]PreparationMember) ([]byte, error)
+type PreparationSourceProvider func(context.Context, gateway.GroupEnrollmentIntent, [3]PreparationMember, PreparationMember) ([]byte, error)
 
 type PreparationSourceService struct {
 	source      PreparationSourceProvider
@@ -92,7 +93,7 @@ func (service *PreparationSourceService) Serve(ctx context.Context, connection r
 	if peer.TrustDomain != domain || intent.Source.Node != service.local || !service.authorize(peer, intent) {
 		return ErrUnauthorized
 	}
-	payload, err := service.source(ctx, intent, request.Voters)
+	payload, err := service.source(ctx, intent, request.Voters, request.Target)
 	if err != nil {
 		if deadlineErr := connection.SetWriteDeadline(nodeInfoBoundedDeadline(ctx, service.write())); deadlineErr != nil {
 			return errors.Join(err, deadlineErr)
@@ -123,7 +124,7 @@ func NewPreparationSourceClient(options ClientOptions) (*PreparationSourceClient
 	}
 	return &PreparationSourceClient{options: options}, nil
 }
-func (client *PreparationSourceClient) Read(ctx context.Context, intent gateway.GroupEnrollmentIntent, voters [3]PreparationMember) ([]byte, error) {
+func (client *PreparationSourceClient) Read(ctx context.Context, intent gateway.GroupEnrollmentIntent, voters [3]PreparationMember, target PreparationMember) ([]byte, error) {
 	if client == nil || ctx == nil || !validPreparationSourceIntent(intent) {
 		return nil, ErrControl
 	}
@@ -131,7 +132,7 @@ func (client *PreparationSourceClient) Read(ctx context.Context, intent gateway.
 	if _, err := rand.Read(nonce[:]); err != nil {
 		return nil, err
 	}
-	raw, err := vibejson.Marshal(&PreparationSourceRequest{Intent: intent, Voters: voters})
+	raw, err := vibejson.Marshal(&PreparationSourceRequest{Intent: intent, Voters: voters, Target: target})
 	if err != nil || len(raw) > maxPreparationSourceRequestBytes {
 		return nil, errors.Join(ErrBound, err)
 	}

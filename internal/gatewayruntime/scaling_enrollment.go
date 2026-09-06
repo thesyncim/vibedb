@@ -207,7 +207,7 @@ func validateDraftPreparation(
 		spec.AllocationGeneration != intent.AllocationGeneration ||
 		spec.ReplicaOrdinal != intent.ReplicaOrdinal || spec.SourceCommand != intent.ExpectedCommand ||
 		spec.Target.MemberID != intent.Target.Member || spec.Target.Node != intent.Target.Node ||
-		spec.Target.PeerAddress != string(intent.Target.Endpoint) ||
+		spec.Target.PeerEndpoint != intent.Target.Endpoint ||
 		spec.TargetNodeIncarnation != intent.Target.NodeIncarnation ||
 		spec.TargetStoreID != intent.Target.StoreID ||
 		spec.LogicalSchemaDigest != intent.ExpectedCommand.RelationManifestDigest {
@@ -219,7 +219,7 @@ func validateDraftPreparation(
 	for _, replica := range serving {
 		found := false
 		for _, member := range spec.InitialVoters {
-			if member.MemberID == replica.Member && member.Node == replica.Node && member.PeerAddress == string(replica.Endpoint) {
+			if member.MemberID == replica.Member && member.Node == replica.Node && member.PeerEndpoint == distribution.EndpointID(replica.Endpoint) && member.PeerAddress == replica.DataAddress {
 				found = true
 				break
 			}
@@ -306,6 +306,7 @@ func (runtime *Runtime) openScalingEnrollment(opener nodecontrol.StreamOpener, r
 	}
 	source := func(ctx context.Context, intent gateway.GroupEnrollmentIntent) ([]byte, error) {
 		var voters [3]nodecontrol.PreparationMember
+		var target nodecontrol.PreparationMember
 		if intent.ExpectedManifestDigest == (replication.Digest{}) {
 			snapshot, err := runtime.authority.Read(ctx)
 			if err != nil {
@@ -317,11 +318,19 @@ func (runtime *Runtime) openScalingEnrollment(opener nodecontrol.StreamOpener, r
 				return nil, errScalingEnrollmentDrift
 			}
 			for i, member := range route.Replicas {
-				voters[i] = nodecontrol.PreparationMember{MemberID: member.Member, Node: member.Node, PeerAddress: member.Endpoint, NativeAddress: member.NativeEndpoint, ControlAddress: member.ControlEndpoint}
+				voters[i] = nodecontrol.PreparationMember{MemberID: member.Member, Node: member.Node, PeerEndpoint: distribution.EndpointID(member.Endpoint), NativeEndpoint: distribution.EndpointID(member.NativeEndpoint), ControlEndpoint: distribution.EndpointID(member.ControlEndpoint), PeerAddress: member.DataAddress, NativeAddress: member.Address, ControlAddress: member.ControlAddress}
 			}
+			node, err := runtime.authority.ReadNode(ctx, intent.Target.Node, intent.Target.NodeIncarnation)
+			if err != nil {
+				return nil, err
+			}
+			if node.Revision != intent.TargetNodeRevision || node.DataEndpoint != intent.Target.Endpoint || node.NativeEndpoint != intent.Target.NativeEndpoint || node.ControlEndpoint != intent.Target.ControlEndpoint {
+				return nil, errScalingEnrollmentDrift
+			}
+			target = nodecontrol.PreparationMember{MemberID: intent.Target.Member, Node: node.NodeID, PeerEndpoint: node.DataEndpoint, NativeEndpoint: node.NativeEndpoint, ControlEndpoint: node.ControlEndpoint, PeerAddress: node.DataAddress, NativeAddress: node.NativeAddress, ControlAddress: node.ControlAddress}
 		}
 		slices.SortFunc(voters[:], func(a, b nodecontrol.PreparationMember) int { return cmp.Compare(a.MemberID, b.MemberID) })
-		return client.Read(ctx, intent, voters)
+		return client.Read(ctx, intent, voters, target)
 	}
 	enrollment, err := NewScalingEnrollmentRuntime(ScalingEnrollmentOptions{Catalog: runtime.authority, Source: source, ControlOpener: opener, ReadDeadline: read, WriteDeadline: write})
 	if err != nil {

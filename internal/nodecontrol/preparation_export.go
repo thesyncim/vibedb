@@ -17,16 +17,16 @@ import (
 // intent may be a draft while an enrollment is being built, so its manifest
 // digest is intentionally allowed to be zero here.
 type PreparationExportInput struct {
-	Intent        gateway.GroupEnrollmentIntent
-	InitialVoters [3]PreparationMember
-	Target        PreparationMember
-	Log           PreparationLogProfile
-	Table         string
-	CreateTable   string
+	Intent           gateway.GroupEnrollmentIntent
+	InitialVoters    [3]PreparationMember
+	Target           PreparationMember
+	Log              PreparationLogProfile
+	Table            string
+	CreateTable      string
 	SchemaStatements []string
-	GlobalIndexes []PreparationGlobalIndex
-	Apply         PreparationApplyProfile
-	SourceBootstrap []byte
+	GlobalIndexes    []PreparationGlobalIndex
+	Apply            PreparationApplyProfile
+	SourceBootstrap  []byte
 }
 
 // PreparationPayload is the immutable canonical byte image and its digest.
@@ -54,13 +54,13 @@ func ExportPreparationSpec(input PreparationExportInput) (PreparationPayload, er
 	// A draft can still carry a zero ExpectedManifestDigest, but all other
 	// immutable command and identity fields must already be present.
 	spec := PreparationSpec{
-		Kind:                  PreparationSpecKind,
-		Group:                 intent.Group,
-		Distribution:          intent.Distribution,
-		Shard:                 intent.Shard,
-		AllocationGeneration:  intent.AllocationGeneration,
-		ReplicaOrdinal:        intent.ReplicaOrdinal,
-		SourceCommand:         intent.ExpectedCommand,
+		Kind:                 PreparationSpecKind,
+		Group:                intent.Group,
+		Distribution:         intent.Distribution,
+		Shard:                intent.Shard,
+		AllocationGeneration: intent.AllocationGeneration,
+		ReplicaOrdinal:       intent.ReplicaOrdinal,
+		SourceCommand:        intent.ExpectedCommand,
 		// RelationManifestDigest is the exact machine validation digest used by
 		// the Raft command. It is deliberately copied from the certified fence;
 		// a portable logical schema digest is already retained in the catalog
@@ -82,7 +82,8 @@ func ExportPreparationSpec(input PreparationExportInput) (PreparationPayload, er
 	// useful for its endpoint addresses, but reject any attempted identity
 	// substitution before bytes are committed.
 	if spec.Target.MemberID != intent.Target.Member || spec.Target.Node != intent.Target.Node ||
-		spec.Target.PeerAddress != string(intent.Target.Endpoint) ||
+		spec.Target.PeerEndpoint != intent.Target.Endpoint ||
+		spec.Target.NativeEndpoint != intent.Target.NativeEndpoint || spec.Target.ControlEndpoint != intent.Target.ControlEndpoint ||
 		spec.TargetNodeIncarnation != intent.Target.NodeIncarnation ||
 		spec.TargetStoreID != intent.Target.StoreID {
 		return PreparationPayload{}, ErrConflict
