@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"slices"
 	"strings"
 
 	"github.com/thesyncim/vibedb/distribution"
@@ -14,14 +15,17 @@ const executorPlanCacheMax = 128
 
 // executorPlanEntry is one cached physical planning outcome. The prepared
 // statement itself stays in the snapshot's own plan cache; only the
-// distribution-dependent physical selection is shared here. Plans are
-// immutable, so entries are safe for concurrent reads once published.
+// distribution-dependent physical selection is shared here. The target
+// identities and effective optimizer memory cap certify that the cost context
+// used to admit the plan is unchanged. Plans are immutable, so entries are
+// safe for concurrent reads once published.
 type executorPlanEntry struct {
-	generation uint64
-	routeKind  distribution.RouteKind
-	targets    int
-	physical   *queryplanner.Plan
-	planning   queryplanner.OptimizerStatistics
+	generation        uint64
+	routeKind         distribution.RouteKind
+	targets           []distribution.Target
+	maxAggregateBytes uint64
+	physical          *queryplanner.Plan
+	planning          queryplanner.OptimizerStatistics
 }
 
 // cachedPhysical returns the physical plan cached for sqlText at generation,
@@ -55,27 +59,57 @@ func (e *Executor) publishPhysical(
 		len(sqlText) > maxCachedSQLBytes {
 		return
 	}
-	entry := executorPlanEntry{
-		generation: generation,
-		routeKind:  cache.routeKind,
-		targets:    cache.targets,
-		physical:   cache.physical,
-		planning:   cache.planning,
-	}
-	// The key must be owned: ingress SQL may alias a much larger caller
-	// buffer, and the entry outlives the request.
-	key := strings.Clone(sqlText)
+	// Keep the lock across lookup and publication. On a warm hit the existing
+	// immutable entry already owns its key and target slice, so publishing the
+	// same physical plan must not clone either one again. The request SQL is
+	// used only for the lookup while the lock is held; it is never retained.
 	e.planMu.Lock()
 	defer e.planMu.Unlock()
 	if e.planCache == nil {
 		e.planCache = make(map[string]executorPlanEntry, executorPlanCacheMax)
 	}
-	if _, exists := e.planCache[key]; !exists {
-		for len(e.planOrder) >= executorPlanCacheMax {
-			delete(e.planCache, e.planOrder[0])
-			e.planOrder = append(e.planOrder[:0], e.planOrder[1:]...)
+	if existing, exists := e.planCache[sqlText]; exists {
+		if existing.generation == generation && existing.routeKind == cache.routeKind &&
+			existing.maxAggregateBytes == cache.maxAggregateBytes &&
+			existing.physical == cache.physical && slices.Equal(existing.targets, cache.targets) {
+			return
 		}
-		e.planOrder = append(e.planOrder, key)
+		// A replacement is a cold publication. Re-own the request SQL before
+		// replacing the old map key; ingress SQL may alias a reused message
+		// buffer, and a map assignment must never make that alias observable.
+		key := strings.Clone(sqlText)
+		delete(e.planCache, sqlText)
+		for i := range e.planOrder {
+			if e.planOrder[i] == sqlText {
+				e.planOrder[i] = key
+				break
+			}
+		}
+		e.planCache[key] = executorPlanEntry{
+			generation:        generation,
+			routeKind:         cache.routeKind,
+			targets:           slices.Clone(cache.targets),
+			maxAggregateBytes: cache.maxAggregateBytes,
+			physical:          cache.physical,
+			planning:          cache.planning,
+		}
+		return
 	}
+	// New entries own both the SQL key and target slice. Ingress SQL may alias
+	// a much larger caller buffer, and the entry outlives the request.
+	key := strings.Clone(sqlText)
+	entry := executorPlanEntry{
+		generation:        generation,
+		routeKind:         cache.routeKind,
+		targets:           slices.Clone(cache.targets),
+		maxAggregateBytes: cache.maxAggregateBytes,
+		physical:          cache.physical,
+		planning:          cache.planning,
+	}
+	for len(e.planOrder) >= executorPlanCacheMax {
+		delete(e.planCache, e.planOrder[0])
+		e.planOrder = append(e.planOrder[:0], e.planOrder[1:]...)
+	}
+	e.planOrder = append(e.planOrder, key)
 	e.planCache[key] = entry
 }

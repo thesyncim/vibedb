@@ -12,8 +12,7 @@ const simpleCacheMaxEntries = 16
 // Only runtime statements with no wire parameters are ever stored, so a hit
 // skips protocol classification, parameter rewriting, semantic compilation,
 // and RowDescription construction exactly like the unnamed-Parse fast path.
-// The text may alias the reused message buffer; it is only compared here,
-// and storing clones.
+// The text may alias the reused message buffer; it is only compared here.
 func (s *session) cachedSimple(text string) *prepared {
 	stmt, ok := s.simpleCache[text]
 	if !ok || stmt == nil || stmt.runtime == nil || stmt.wireParams != 0 {
@@ -37,17 +36,34 @@ func (s *session) prepareSimple(text string) (stmt *prepared, release func(), er
 	if hit := s.cachedSimple(text); hit != nil {
 		return hit, func() {}, nil
 	}
-	prepared, err := s.prepare("", text, nil)
+	ownedText, ownsText := simpleCacheInput(text)
+	prepared, err := s.prepare("", ownedText, nil)
 	if err != nil {
 		return nil, nil, err
 	}
-	if prepared.runtime == nil || prepared.wireParams != 0 {
+	if prepared.runtime == nil || prepared.wireParams != 0 || !ownsText {
 		return prepared, prepared.release, nil
 	}
-	if s.storeSimple(text, prepared) {
+	reuser, ok := prepared.runtime.(BackendStatementParseReuser)
+	if !ok || !reuser.ReusableForParse() {
+		return prepared, prepared.release, nil
+	}
+	if s.storeSimple(ownedText, prepared) {
 		return prepared, func() {}, nil
 	}
 	return prepared, prepared.release, nil
+}
+
+// simpleCacheInput owns a bounded source before handing it to any backend
+// compiler. Whether the preparation is a runtime statement, has wire
+// parameters, and is reusable is known only after compilation; those checks
+// decide whether this owned source enters the cache. Inputs too large even for
+// the prepared-input budget stay on the ordinary borrowed path.
+func simpleCacheInput(text string) (string, bool) {
+	if preparedInputCharge("", text, 0) > maxPreparedInputBytes {
+		return text, false
+	}
+	return strings.Clone(text), true
 }
 
 // storeSimple records a freshly prepared simple statement, evicting the
@@ -94,11 +110,11 @@ func (s *session) storeSimple(text string, stmt *prepared) bool {
 		s.statementBytes+charge > maxPreparedInputBytes {
 		return false
 	}
-	// The key and the entry's SQL must be owned: simple text aliases the
-	// session's reused message buffer, which the next message overwrites.
-	// The Parse path owns its text the same way before preparing.
-	key := strings.Clone(text)
-	stmt.sql = key
+	// prepareSimple owns text before compiling and passes this same allocation
+	// here, so the map key and every backend compiler that retained SQL share one
+	// stable source rather than borrowing the reader's message buffer.
+	key := text
+	stmt.sql = text
 	stmt.retainedBytes = charge
 	s.simpleCache[key] = stmt
 	s.simpleOrder = append(s.simpleOrder, key)
