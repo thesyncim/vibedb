@@ -9,6 +9,7 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/clusterbackup"
 	"github.com/thesyncim/vibedb/internal/hotshard"
+	"github.com/thesyncim/vibedb/internal/nodecontrol"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/rebalance"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
@@ -91,6 +92,17 @@ func (runtime *Runtime) openReplicaControl() error {
 	runtime.controlHandshakeDeadline = handshakeDeadline
 	runtime.controlReadDeadline = readDeadline
 	runtime.controlWriteDeadline = writeDeadline
+	if runtime.config.ScalingReadiness == nil {
+		infoClient, infoErr := nodecontrol.NewNodeInfoClient(nodecontrol.NodeInfoClientOptions{Opener: shardOpener, TrustDomain: profile.LocalIdentity().TrustDomain, ReadDeadline: readDeadline, WriteDeadline: writeDeadline})
+		if infoErr != nil {
+			return infoErr
+		}
+		runtime.config.ScalingReadiness = scalingNodeReadiness{client: infoClient, domain: profile.LocalIdentity().TrustDomain}
+	}
+
+	if err := runtime.openScalingEnrollment(shardOpener, readDeadline, writeDeadline); err != nil {
+		return err
+	}
 	if config.PGDDLSocket != "" {
 		schemaDeadline := servicetls.FixedDeadline(2 * time.Minute)
 		runtime.schemaDDL, err = newGatewaySchemaDDLRuntime(

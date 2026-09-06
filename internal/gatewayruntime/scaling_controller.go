@@ -55,7 +55,7 @@ type scalingCapacityReader interface {
 // the target's durable state through authenticated control; returning nil is
 // the only point at which Joining can become Active.
 type ScalingNodeReadiness interface {
-	VerifyNode(context.Context, gateway.NodeRecord) error
+	VerifyNode(context.Context, gateway.NodeRecord) (gateway.NodeRecord, error)
 }
 
 // ScalingEnrollmentBuilder supplies the immutable public preparation material
@@ -615,11 +615,12 @@ func (controller *ScalingController) activateJoiningTargets(ctx context.Context,
 			return changed, controller.recordBlocker(ctx, intent, gateway.ScalingBlocker{
 				Code: "target_not_verified", Detail: "empty physical target has no authenticated readiness verifier", Node: node.NodeID, Revision: node.Revision})
 		}
-		if err = controller.readiness.VerifyNode(ctx, node); err != nil {
+		verified, verifyErr := controller.readiness.VerifyNode(ctx, node)
+		if verifyErr != nil {
 			return changed, controller.recordBlocker(ctx, intent, gateway.ScalingBlocker{
-				Code: "target_not_ready", Detail: boundedScalingError(err), Node: node.NodeID, Revision: node.Revision})
+				Code: "target_not_ready", Detail: boundedScalingError(verifyErr), Node: node.NodeID, Revision: node.Revision})
 		}
-		next := node
+		next := verified
 		next.Lifecycle = gateway.NodeActive
 		next.Revision++
 		if snapshot, readErr := controller.catalog.Read(ctx); readErr == nil && snapshot != nil {
@@ -834,7 +835,7 @@ func (controller *ScalingController) collectCapacity(ctx context.Context, intent
 		groups = append(groups, route.Group)
 		for ordinal, replica := range route.Replicas {
 			nodeIndex, found := nodeByID[replica.Node]
-			if !found || nodes[nodeIndex].Incarnation != replica.NodeIncarnation {
+			if !found {
 				return nil, nil, fmt.Errorf("capacity node identity missing for %x", replica.Node)
 			}
 			request := replicacontrol.CapacityRequest{Operation: intent.ID, Round: round,
@@ -848,8 +849,8 @@ func (controller *ScalingController) collectCapacity(ctx context.Context, intent
 			if observation.CatalogGeneration != snapshot.Generation() || observation.Request != request ||
 				observation.Identity.Group != route.Group || observation.Identity.MemberID != replica.Member ||
 				observation.Identity.StoreID != replica.StoreID || observation.Identity.AllocationGeneration != route.AllocationGeneration ||
-				observation.Identity.NodeIncarnation != replica.NodeIncarnation || observation.Node.NodeID != replica.Node ||
-				observation.Node.NodeIncarnation != replica.NodeIncarnation || observation.Applied == 0 || observation.SourceRevision == 0 ||
+				observation.Identity.NodeIncarnation < replica.NodeIncarnation || observation.Node.NodeID != replica.Node ||
+				observation.Node.NodeIncarnation != nodes[nodeIndex].Incarnation || observation.Applied == 0 || observation.SourceRevision == 0 ||
 				observation.Node.Revision == 0 {
 				return nil, nil, errors.New("capacity observation crossed catalog or node revision fence")
 			}

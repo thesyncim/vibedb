@@ -141,3 +141,21 @@ func TestCapacityObservationRejectsSyntheticZeroAndSaturatingInvalidNode(t *test
 		t.Fatalf("maximum representable bounded observation rejected: %v", err)
 	}
 }
+
+func TestCapacityWireSeparatesPhysicalAndGroupIncarnations(t *testing.T) {
+	want := capacityTestObservation(false)
+	want.Node.NodeIncarnation = 1
+	want.Identity.NodeIncarnation = 9
+	want, err := NewCapacityObservation(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := AppendCapacityObservation(nil, want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := OpenCapacityObservation(raw)
+	if err != nil || got.Node.NodeIncarnation != 1 || got.Identity.NodeIncarnation != 9 {
+		t.Fatalf("physical/group incarnation roundtrip: %+v %v", got, err)
+	}
+}

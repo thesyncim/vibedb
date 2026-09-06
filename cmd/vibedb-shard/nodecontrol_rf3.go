@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
@@ -287,6 +288,7 @@ func rf3ReservationValidationView(input prepareRF3Manifest) prepareRF3Manifest {
 // receipt after a crash. The proof is a reservation proof; AppliedIndex is
 // intentionally zero until the later certified snapshot installation.
 type rf3NodeControlPreparer struct {
+	mu       sync.Mutex
 	NodeRoot string
 	Template rf3NodePreparationTemplate
 }
@@ -297,6 +299,8 @@ func (preparer *rf3NodeControlPreparer) Prepare(
 	if preparer == nil || ctx == nil {
 		return gateway.PreparedReplicaProof{}, nodecontrol.ErrControl
 	}
+	preparer.mu.Lock()
+	defer preparer.mu.Unlock()
 	manifest, err := validateRF3EnrollmentPayload(ctx, intent, payload, preparer.NodeRoot, preparer.Template)
 	if err != nil {
 		return gateway.PreparedReplicaProof{}, err
@@ -327,6 +331,8 @@ func (preparer *rf3NodeControlPreparer) ObservePrepared(
 	if preparer == nil || ctx == nil {
 		return gateway.PreparedReplicaProof{}, false, nodecontrol.ErrControl
 	}
+	preparer.mu.Lock()
+	defer preparer.mu.Unlock()
 	manifest, err := validateRF3EnrollmentPayload(ctx, intent, payload, preparer.NodeRoot, preparer.Template)
 	if err != nil {
 		return gateway.PreparedReplicaProof{}, false, err

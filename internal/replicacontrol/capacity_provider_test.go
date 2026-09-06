@@ -229,3 +229,31 @@ func TestCapacityRoundKeepsOneNodeCutAcrossChangingGroups(t *testing.T) {
 		t.Fatalf("expired round err=%v", err)
 	}
 }
+
+func TestCapacityRoundRetainsDifferentGroupRuntimeIncarnations(t *testing.T) {
+	first := capacityProviderIdentity(capacityTestGroup(), 8, 2)
+	second := first
+	second.Group.GroupID[0]++
+	second.MemberID = 9
+	second.NodeIncarnation = 3
+	sources := []CapacitySource{&capacityProviderSource{identity: first, sample: capacityProviderSample(first, 64, 64, false)}, &capacityProviderSource{identity: second, sample: capacityProviderSample(second, 64, 64, false)}}
+	provider, err := NewCapacityProvider(CapacitySourceDirectory{Sources: func(context.Context) ([]CapacitySource, error) { return sources, nil }, Node: func(context.Context) (NodeCapacity, error) { return capacityProviderNode(1), nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := capacityTestRequest()
+	request.Round = [32]byte{1}
+	a, err := provider.ObserveReplicaCapacity(t.Context(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Group = second.Group
+	request.TargetMember = second.MemberID
+	b, err := provider.ObserveReplicaCapacity(t.Context(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Node != b.Node || a.Node.NodeIncarnation != 1 || a.Identity.NodeIncarnation != 2 || b.Identity.NodeIncarnation != 3 || a.SourceRevision != b.SourceRevision {
+		t.Fatalf("physical cut crossed group runtime identity: %+v %+v", a, b)
+	}
+}

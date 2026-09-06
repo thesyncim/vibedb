@@ -483,7 +483,7 @@ func validCapacityObservation(observation CapacityObservation) bool {
 		observation.Identity.AllocationGeneration == 0 || observation.Identity.StoreID == ([16]byte{}) ||
 		observation.Identity.NodeIncarnation == 0 ||
 		observation.Node.NodeID == (rafttransport.NodeID{}) || observation.Node.NodeIncarnation == 0 ||
-		observation.Node.Revision == 0 || observation.Node.NodeIncarnation != observation.Identity.NodeIncarnation ||
+		observation.Node.Revision == 0 ||
 		observation.Node.MaxReceives == 0 || observation.Node.ActiveReceives > observation.Node.MaxReceives ||
 		(observation.DemandKind != CapacityDemandMeasured && observation.DemandKind != CapacityDemandConservative) ||
 		observation.Node.Capacity[autosplit.ResourceLiveBytes] == 0 ||

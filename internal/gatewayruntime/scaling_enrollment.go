@@ -1,6 +1,7 @@
 package gatewayruntime
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -215,9 +216,15 @@ func validateDraftPreparation(
 	if len(serving) != gateway.ServingReplicaCount {
 		return nodecontrol.ErrControl
 	}
-	for ordinal, replica := range serving {
-		member := spec.InitialVoters[ordinal]
-		if member.MemberID != replica.Member || member.Node != replica.Node || member.PeerAddress != string(replica.Endpoint) {
+	for _, replica := range serving {
+		found := false
+		for _, member := range spec.InitialVoters {
+			if member.MemberID == replica.Member && member.Node == replica.Node && member.PeerAddress == string(replica.Endpoint) {
+				found = true
+				break
+			}
+		}
+		if !found {
 			return nodecontrol.ErrConflict
 		}
 	}
@@ -284,4 +291,43 @@ func allocateEnrollmentIdentity(
 		return member, store, nil
 	}
 	return 0, [16]byte{}, fmt.Errorf("%w: no collision-free target identity", gateway.ErrScalingIdentity)
+}
+
+func (runtime *Runtime) openScalingEnrollment(opener nodecontrol.StreamOpener, read, write rafttransport.DeadlineFunc) error {
+	if runtime.config.ScalingProvisioner != nil && runtime.config.ScalingEnrollment != nil {
+		return nil
+	}
+	if runtime.config.ScalingProvisioner != nil || runtime.config.ScalingEnrollment != nil {
+		return errScalingEnrollmentUnavailable
+	}
+	client, err := nodecontrol.NewPreparationSourceClient(nodecontrol.ClientOptions{Opener: opener, ReadDeadline: read, WriteDeadline: write})
+	if err != nil {
+		return err
+	}
+	source := func(ctx context.Context, intent gateway.GroupEnrollmentIntent) ([]byte, error) {
+		var voters [3]nodecontrol.PreparationMember
+		if intent.ExpectedManifestDigest == (replication.Digest{}) {
+			snapshot, err := runtime.authority.Read(ctx)
+			if err != nil {
+				return nil, err
+			}
+			var endpoints [gateway.ServingReplicaCount]gateway.ReplicatedEndpoint
+			route, found := snapshot.ResolveReplicatedRoute(intent.Distribution, intent.Shard, endpoints[:0])
+			if !found || route.Group != intent.Group || len(route.Replicas) != len(voters) {
+				return nil, errScalingEnrollmentDrift
+			}
+			for i, member := range route.Replicas {
+				voters[i] = nodecontrol.PreparationMember{MemberID: member.Member, Node: member.Node, PeerAddress: member.Endpoint, NativeAddress: member.NativeEndpoint, ControlAddress: member.ControlEndpoint}
+			}
+		}
+		slices.SortFunc(voters[:], func(a, b nodecontrol.PreparationMember) int { return cmp.Compare(a.MemberID, b.MemberID) })
+		return client.Read(ctx, intent, voters)
+	}
+	enrollment, err := NewScalingEnrollmentRuntime(ScalingEnrollmentOptions{Catalog: runtime.authority, Source: source, ControlOpener: opener, ReadDeadline: read, WriteDeadline: write})
+	if err != nil {
+		return err
+	}
+	runtime.config.ScalingEnrollment = enrollment
+	runtime.config.ScalingProvisioner = enrollment.Provisioner()
+	return nil
 }

@@ -1836,10 +1836,16 @@ func runSeamlessScaleCLI(t *testing.T, ctx context.Context, binary, operation, p
 func pollSeamlessScaleStatus(ctx context.Context, binary, profile, operationID string, predicate func(clustercontrol.Response) bool) (bool, error) {
 	deadline := time.NewTimer(10 * time.Minute)
 	defer deadline.Stop()
+	var prior string
 	for {
 		response, err := runSeamlessScaleCLIForPoll(ctx, binary, profile, operationID)
 		if err != nil {
 			return false, err
+		}
+		state := fmt.Sprintf("state=%s phase=%s blockers=%+v", response.State, response.Phase, response.Blockers)
+		if state != prior {
+			fmt.Printf("scale operation %s: %s\n", operationID, state)
+			prior = state
 		}
 		if predicate(response) {
 			return true, nil

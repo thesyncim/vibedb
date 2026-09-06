@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"slices"
 	"sync/atomic"
@@ -182,7 +183,7 @@ func (source *rf3LiveCapacitySource) observe(ctx context.Context) (replicacontro
 	// that excludes apply, so ongoing writes cannot invalidate this cut.
 	after := resources.Publication
 	if after.Applied == 0 || after.ConfState == nil {
-		return replicacontrol.CapacitySourceSample{}, replicacontrol.ErrCapacityStale
+		return replicacontrol.CapacitySourceSample{}, fmt.Errorf("group %x apply publication index=%d configuration=%t: %w", identity.Group.GroupID, after.Applied, after.ConfState != nil, replicacontrol.ErrCapacityStale)
 	}
 	sqlBytes, err := rf3CapacityResourceBytes(resources)
 	if err != nil {
@@ -211,7 +212,7 @@ func rf3CapacityResourceBytes(resources sqldriver.ReplicatedApplyResourceStats) 
 	var total uint64
 	for _, item := range stats {
 		if item.PhysicalCapacityBytes != 0 && item.PhysicalHighWaterBytes > item.PhysicalCapacityBytes {
-			return 0, replicacontrol.ErrCapacityStale
+			return 0, fmt.Errorf("SQL high-water %d exceeds capacity %d: %w", item.PhysicalHighWaterBytes, item.PhysicalCapacityBytes, replicacontrol.ErrCapacityStale)
 		}
 		var overflow bool
 		total, overflow = replicacontrol.AddCapacity(total, item.PhysicalHighWaterBytes)
@@ -368,6 +369,7 @@ func RF3CapacityNodeFromSamples(template replicacontrol.NodeCapacity, samples []
 func RF3CapacityNodeFromOwner(
 	ctx context.Context,
 	owner *rf3NodeOwner,
+	nodeIncarnation uint64,
 	budget *migrationbudget.Budget,
 	revision *atomic.Uint64,
 	request replicacontrol.CapacityRequest,
@@ -386,13 +388,12 @@ func RF3CapacityNodeFromOwner(
 	if nodeIdentity.NodeID == ([16]byte{}) {
 		return replicacontrol.NodeCapacity{}, replicacontrol.ErrCapacityStale
 	}
-	nodeIncarnation := samples[0].Identity.NodeIncarnation
 	if nodeIncarnation == 0 {
 		return replicacontrol.NodeCapacity{}, replicacontrol.ErrCapacityStale
 	}
 	for _, sample := range samples {
-		if sample.Identity.NodeIncarnation != nodeIncarnation || sample.Identity.Group == (raftmember.GroupKey{}) {
-			return replicacontrol.NodeCapacity{}, replicacontrol.ErrCapacityStale
+		if sample.Identity.NodeIncarnation == 0 || sample.Identity.Group == (raftmember.GroupKey{}) {
+			return replicacontrol.NodeCapacity{}, fmt.Errorf("group %x has invalid runtime identity: %w", sample.Identity.Group.GroupID, replicacontrol.ErrCapacityStale)
 		}
 	}
 	physicalCapacity, err := owner.store.CapacityReservationBytes()

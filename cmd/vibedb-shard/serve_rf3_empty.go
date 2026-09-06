@@ -317,7 +317,12 @@ func servePreparedRF3EmptyNode(
 	if err != nil {
 		return errors.Join(err, lanes.Close(), servingRegistry.Close())
 	}
+	nodeInfo, err := newRF3EmptyNodeInfo(nodeOwner.store, profile, manifest, policy, migrationBudget, &servingGroups, preparer, deadline)
+	if err != nil {
+		return errors.Join(err, lanes.Close(), servingRegistry.Close())
+	}
 	controlMux, err := shardcontrol.New(
+		shardcontrol.Route{Discriminator: nodecontrol.NodeInfoRequestDiscriminator(), Handler: nodeInfo},
 		shardcontrol.Route{Discriminator: nodecontrol.RequestDiscriminator(), Handler: controlService},
 		shardcontrol.Route{Discriminator: snapshottransfer.BootstrapRequestDiscriminator(), Handler: receivers},
 		shardcontrol.Route{Discriminator: replicacontrol.CapacityRequestDiscriminator(), Handler: capacityControl},

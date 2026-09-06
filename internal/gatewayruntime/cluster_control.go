@@ -273,6 +273,7 @@ func observeClusterControlStatus(ctx context.Context, wait time.Duration, observ
 }
 
 func (backend *ScalingOperatorBackend) observeOnce(ctx context.Context, response clustercontrol.Response, operation [32]byte) clustercontrol.Response {
+	response.OperationID = hex.EncodeToString(operation[:])
 	intent, err := backend.directory.ReadScalingIntent(ctx, operation)
 	if err != nil {
 		response.Error = boundedClusterControlError(err)
@@ -548,6 +549,8 @@ func (backend *ScalingOperatorBackend) nodeStatus(ctx context.Context, node gate
 	return status
 }
 
+// Capacity and receive limits are refreshed from authenticated readiness;
+// retries compare the stable public identity, not the initial capacity hints.
 func samePublicNodeRecord(left, right gateway.NodeRecord) bool {
 	return left.NodeID == right.NodeID && left.Incarnation == right.Incarnation &&
 		left.ServiceKeyDigest == right.ServiceKeyDigest &&
@@ -555,9 +558,7 @@ func samePublicNodeRecord(left, right gateway.NodeRecord) bool {
 		left.ControlEndpoint == right.ControlEndpoint && left.GatewayEndpoint == right.GatewayEndpoint &&
 		left.DataAddress == right.DataAddress && left.NativeAddress == right.NativeAddress &&
 		left.ControlAddress == right.ControlAddress && left.GatewayAddress == right.GatewayAddress &&
-		left.FailureDomain == right.FailureDomain && left.Roles == right.Roles &&
-		left.Capacity == right.Capacity && left.MigrationCapacity == right.MigrationCapacity &&
-		left.MaxReceives == right.MaxReceives
+		left.FailureDomain == right.FailureDomain && left.Roles == right.Roles
 }
 
 func scalingNodeRecordFromDescriptor(descriptor clustercontrol.NodeDescriptor, generation uint64) (gateway.NodeRecord, error) {
@@ -658,7 +659,7 @@ func scalingStateName(state gateway.ScalingIntentState) string {
 func clusterBlockers(blockers []gateway.ScalingBlocker) []clustercontrol.Blocker {
 	result := make([]clustercontrol.Blocker, 0, len(blockers))
 	for _, blocker := range blockers {
-		item := clustercontrol.Blocker{Code: blocker.Code, Detail: blocker.Detail, Revision: blocker.Revision}
+		item := clustercontrol.Blocker{Code: blocker.Code, Detail: boundedClusterControlError(errors.New(blocker.Detail)), Revision: blocker.Revision}
 		if blocker.Node != (rafttransport.NodeID{}) {
 			item.NodeID = nodeIDHex(blocker.Node)
 		}
@@ -702,6 +703,10 @@ func (backend *ScalingOperatorBackend) clusterBlockers(ctx context.Context, inte
 			matched = node.Incarnation
 		}
 		result[index].NodeIncarnation = matched
+		if matched == 0 {
+			result[index].NodeID = ""
+			result[index].Revision = 0
+		}
 	}
 	return result
 }
@@ -734,7 +739,7 @@ func boundedClusterControlError(err error) string {
 	if err == nil {
 		return ""
 	}
-	message := strings.ReplaceAll(strings.ReplaceAll(err.Error(), "\x00", ""), "\n", " ")
+	message := strings.NewReplacer("\x00", "", "\r", " ", "\n", " ").Replace(err.Error())
 	if len(message) > clustercontrol.MaxErrorBytes {
 		message = message[:clustercontrol.MaxErrorBytes]
 	}

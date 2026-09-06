@@ -3,6 +3,7 @@ package replicacontrol
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"sync"
 	"sync/atomic"
@@ -165,7 +166,7 @@ func (provider *CapacityProvider) ObserveReplicaCapacity(ctx context.Context, re
 			samples[index], err = candidate.ObserveCapacity(ctx)
 		}
 		if err != nil {
-			return CapacityObservation{}, errors.Join(ErrCapacityUnavailable, err)
+			return CapacityObservation{}, fmt.Errorf("source %x member %d: %w", candidate.Identity().Group.GroupID, candidate.Identity().MemberID, errors.Join(ErrCapacityUnavailable, err))
 		}
 		if samples[index].Identity != candidate.Identity() ||
 			samples[index].Applied == 0 ||
@@ -184,10 +185,9 @@ func (provider *CapacityProvider) ObserveReplicaCapacity(ctx context.Context, re
 		node, err = provider.directory.Node(ctx)
 	}
 	if err != nil {
-		return CapacityObservation{}, errors.Join(ErrCapacityUnavailable, err)
+		return CapacityObservation{}, fmt.Errorf("node aggregate: %w", errors.Join(ErrCapacityUnavailable, err))
 	}
-	if node.NodeID == ([16]byte{}) || node.NodeIncarnation == 0 ||
-		node.NodeIncarnation != sample.Identity.NodeIncarnation {
+	if node.NodeID == ([16]byte{}) || node.NodeIncarnation == 0 {
 		return CapacityObservation{}, ErrCapacityStale
 	}
 	// A controller may retry with a persisted source-revision floor after a

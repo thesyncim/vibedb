@@ -24,6 +24,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/gatewayruntime"
 	"github.com/thesyncim/vibedb/internal/kubeoperator"
 	"github.com/thesyncim/vibedb/internal/multiraft"
+	"github.com/thesyncim/vibedb/internal/nodecontrol"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftserve"
@@ -871,7 +872,7 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 	var capacityRevision atomic.Uint64
 	capacityDirectory, err := newRF3CapacitySourceDirectory(schemaActivator, nil, nil,
 		func(ctx context.Context, request replicacontrol.CapacityRequest, samples []replicacontrol.CapacitySourceSample) (replicacontrol.NodeCapacity, error) {
-			return RF3CapacityNodeFromOwner(ctx, nodeOwner, migrationBudget, &capacityRevision, request, samples)
+			return RF3CapacityNodeFromOwner(ctx, nodeOwner, manifest.NodeIncarnation, migrationBudget, &capacityRevision, request, samples)
 		})
 	if err != nil {
 		return err
@@ -1083,11 +1084,15 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 			return err
 		}
 	}
+	preparationSource, err := newRF3PreparationSource(schemaActivator, transportRegistry, policy, manifest.ReplicaControl.SourceDataRoot, deadline)
+	if err != nil {
+		return err
+	}
 	controlMux, err := newRF3ControlMux(
 		membershipControl, observationControl, metricsControl, backupControl, sourceControl, actionControl,
 		splitRuntime.action, schemaControl, splitRuntime.observation.service,
 		splitRuntime.admission, splitRuntime.tail, splitRuntime.terminal, childPrepareControl,
-		restoreServingControl, schemaBuildControl, capacityControl,
+		restoreServingControl, schemaBuildControl, capacityControl, preparationSource,
 	)
 	if err != nil {
 		return err
@@ -1385,6 +1390,9 @@ func newRF3ControlMux(
 			Discriminator: replicacontrol.CapacityRequestDiscriminator(),
 			Handler:       capacity[0],
 		})
+	}
+	if len(capacity) > 1 && capacity[1] != nil {
+		routes = append(routes, shardcontrol.Route{Discriminator: nodecontrol.PreparationSourceRequestDiscriminator(), Handler: capacity[1]})
 	}
 	if backup != nil {
 		routes = append(routes, shardcontrol.Route{

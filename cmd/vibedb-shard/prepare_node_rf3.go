@@ -292,7 +292,9 @@ func provisionRF3Node(input prepareRF3NodeManifest) (resultErr error) {
 		if input.Services != nil {
 			return input.Services.NodeIncarnation
 		}
-		return 0
+		// A newly prepared physical node starts at incarnation one. Group
+		// runtime incarnations advance independently inside its node log.
+		return 1
 	}(), Gateway: nodeGateway, Listeners: firstListeners, TLS: firstTLS, AuthorizationPolicy: firstPolicy,
 		GatewaySeeds: firstGatewaySeeds, ReadAuthority: firstReadAuthority, ReplicaControl: nodeReplica,
 		SplitControl: nodeSplit, Groups: make([]persistedRF3NodeGroup, 0, len(manifests))}

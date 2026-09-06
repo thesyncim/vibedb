@@ -514,7 +514,11 @@ func composeDevGroupManifest(paths []string) ([]byte, error) {
 	}
 	order = append(order, "groups")
 	if len(process["node_log"]) != 0 {
-		order = append([]string{"node_log"}, order...)
+		prefix := []string{"node_log"}
+		if len(process["node_incarnation"]) != 0 {
+			prefix = append(prefix, "node_incarnation")
+		}
+		order = append(prefix, order...)
 	}
 	return orderedDevManifestObject(process, order)
 }
