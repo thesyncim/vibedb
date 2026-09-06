@@ -31,6 +31,8 @@ import (
 
 const (
 	proposalIngressBatchEntries = raftmodel.MaxProposalBatchEntries
+	// Bound protocol work before servicing already-admitted client work.
+	ownerProgressQuantum = 16
 )
 
 var (
@@ -1120,9 +1122,9 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 		return nil
 	}
 	// admitIngressTurn performs one nonblocking, bounded admission quantum after
-	// Host admits a proposal prefix. It exposes already-waiting proposals to the
-	// Runtime's one late-join opportunity without letting a continuously full
-	// ingress channel postpone the next Host turn.
+	// Host admits a proposal prefix or reaches its progress quantum. It exposes
+	// queued reads and peer traffic without waiting for the Host to become idle,
+	// and queued proposals to the Runtime's bounded late-join opportunity.
 	admitIngressTurn := func() error {
 		if ingressBarrierPending {
 			return nil
@@ -1130,10 +1132,19 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 		select {
 		case request := <-owner.ingress:
 			readyBlocked = false
+			if readIngressCandidate(request) || request.kind == requestReadAuthorityValidate || request.kind == requestInbound {
+				if err := handleRequest(request); err != nil {
+					if errors.Is(err, errOwnerReadDeferred) {
+						deferredReads.retain(request)
+						return nil
+					}
+					return err
+				}
+				return nil
+			}
 			if !proposalIngressCandidate(request) {
-				// This quantum exists only to make an already-admitted proposal
-				// window visible to newly queued proposals. Retain the first other
-				// request as an exact ordering barrier until Host has drained Ready;
+				// Retain the first control request as an exact ordering barrier
+				// until Host has drained Ready;
 				// campaign, membership, and schema controls must not be attempted
 				// between capture and its durability boundary.
 				ingressBarrier, ingressBarrierPending = request, true
@@ -1195,7 +1206,48 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 			ingressBarrierPending = false
 		}
 	}()
+	busyTurns := 0
 	for {
+		if cause := context.Cause(ctx); cause != nil {
+			return owner.stop(cause)
+		}
+		// A continuously runnable Host or outbound queue must not starve SQL
+		// admission, authority validation, deferred reads, ticks, or async
+		// completions. Control requests retain their existing Ready barrier.
+		if busyTurns == ownerProgressQuantum {
+			busyTurns = 0
+			if _, err := deferredReads.retry(handleRequest); err != nil {
+				return owner.stop(err)
+			}
+			if err := admitIngressTurn(); err != nil {
+				return owner.stop(err)
+			}
+			select {
+			case _, ok := <-asyncNotify:
+				if !ok {
+					asyncNotify, asyncHost = nil, nil
+				} else {
+					readyBlocked = false
+					asyncHost.WakePipelined()
+				}
+			default:
+			}
+			// Service both sources once. A permanently ready async channel
+			// must not compete with a pending tick for the fairness turn.
+			select {
+			case _, ok := <-owner.pulse:
+				if !ok {
+					owner.pulse = nil
+				} else {
+					readyBlocked = false
+					if err := offerTicks(); err != nil {
+						return owner.stop(err)
+					}
+				}
+			default:
+			}
+		}
+		busyTurns++
 		if pending.Message != nil || pending.Authority != nil {
 			if owner.outbound == nil {
 				return owner.stop(errors.New("raftservice: outbound message has no transport"))

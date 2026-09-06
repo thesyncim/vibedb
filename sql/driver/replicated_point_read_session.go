@@ -115,9 +115,10 @@ func (a *ReplicatedApply) newPointReadSessionInto(
 		}
 		prepared = reader.session.prepared
 	}
+	result := reader.conn.exec.Result
 	reader.conn = conn{
 		db: a.database, directWritesFenced: true,
-		exec: query.Exec{Options: options},
+		exec: query.Exec{Options: options, Result: result},
 	}
 	transaction := &tx{
 		conn:        &reader.conn,
