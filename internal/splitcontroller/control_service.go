@@ -28,7 +28,7 @@ func (service *ControlService) Metrics() ControlMetrics {
 }
 
 type controlActionDispatcher struct {
-	remote *RemoteActionService
+	remote shardcontrol.ActionExecutor
 }
 
 // OpenShardControlService opens the shard-local durable result boundary. A
@@ -38,7 +38,7 @@ func OpenShardControlService(
 	path string,
 	limits shardcontrol.JournalLimits,
 	grants []shardcontrol.ActionGrant,
-	remote *RemoteActionService,
+	remote shardcontrol.ActionExecutor,
 ) (*ControlService, error) {
 	if remote == nil {
 		return nil, ErrRemoteExecution
@@ -68,7 +68,7 @@ func OpenControlService(
 	limits shardcontrol.JournalLimits,
 	grants []shardcontrol.ActionGrant,
 	controller *ControllerService,
-	remote *RemoteActionService,
+	remote shardcontrol.ActionExecutor,
 ) (*ControlService, error) {
 	if controller == nil {
 		return nil, ErrRemoteExecution
