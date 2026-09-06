@@ -1446,3 +1446,129 @@ func assertRawDocument(
 		t.Fatalf("raw document after failed oversized statement = (%s, %v)", got, found)
 	}
 }
+
+// TestConnTableSpareBoundedAcrossTransactions proves the connection retains
+// one table shell (with its snapshot objects) across sequential transactions
+// instead of allocating per begin: repeated begins never grow the spare list,
+// and a clean close reports no outstanding leases.
+func TestConnTableSpareBoundedAcrossTransactions(t *testing.T) {
+	connection := directTestConn(t)
+	c := connection.(*conn)
+	directExec(t, connection, `CREATE TABLE docs (id STRING PRIMARY KEY)`, nil)
+	directExec(t, connection, `INSERT INTO docs VALUES (?)`,
+		[]sqldriver.NamedValue{{Ordinal: 1, Value: `{"id":"a"}`}})
+	for i := 0; i < 4; i++ {
+		transaction, err := connection.(sqldriver.ConnBeginTx).BeginTx(
+			context.Background(), sqldriver.TxOptions{
+				Isolation: sqldriver.IsolationLevel(stdsql.LevelRepeatableRead),
+			})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := transaction.Rollback(); err != nil {
+			t.Fatal(err)
+		}
+		if got := len(c.tableSpare); got != 1 {
+			t.Fatalf("spares after %d begins = %d, want 1", i+1, got)
+		}
+	}
+}
+
+// TestReboundSnapshotSeesCommittedWrites proves a rebound spare pins the
+// current generation instead of the stale one: a second transaction on the
+// same pooled connection observes rows committed after the first began. A
+// clean close reports no outstanding leases.
+func TestReboundSnapshotSeesCommittedWrites(t *testing.T) {
+	db := openTestDB(t)
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec(`CREATE TABLE docs (PRIMARY KEY (id))`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO docs VALUES (?)`, `{"id":"a"}`); err != nil {
+		t.Fatal(err)
+	}
+	first, err := db.BeginTx(context.Background(), &stdsql.TxOptions{
+		Isolation: stdsql.LevelRepeatableRead,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var count int64
+	if err := first.QueryRow(`SELECT COUNT(*) FROM docs`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("first count = %d, want 1", count)
+	}
+	if err := first.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO docs VALUES (?)`, `{"id":"b"}`); err != nil {
+		t.Fatal(err)
+	}
+	second, err := db.BeginTx(context.Background(), &stdsql.TxOptions{
+		Isolation: stdsql.LevelRepeatableRead,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Rollback()
+	if err := second.QueryRow(`SELECT COUNT(*) FROM docs`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("second count = %d, want 2 (rebound lease pinned current generation)", count)
+	}
+}
+
+// TestReusedTableShellShowsNoPriorTransactionResidue proves reused shells
+// carry no state across transactions: a rolled-back write leaves no staged
+// mutation, revision, or read-set residue visible to the next transaction on
+// the same pooled connection.
+func TestReusedTableShellShowsNoPriorTransactionResidue(t *testing.T) {
+	db := openTestDB(t)
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec(`CREATE TABLE docs (PRIMARY KEY (id))`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO docs VALUES (?)`, `{"id":"a","n":1}`); err != nil {
+		t.Fatal(err)
+	}
+	staged, err := db.BeginTx(context.Background(), &stdsql.TxOptions{
+		Isolation: stdsql.LevelRepeatableRead,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := staged.Exec(`UPDATE docs SET "$doc" = ? WHERE id = ?`,
+		`{"id":"a","n":999}`, "a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := staged.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO docs VALUES (?)`, `{"id":"b","n":2}`); err != nil {
+		t.Fatal(err)
+	}
+	clean, err := db.BeginTx(context.Background(), &stdsql.TxOptions{
+		Isolation: stdsql.LevelRepeatableRead,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clean.Rollback()
+	var n int64
+	if err := clean.QueryRow(`SELECT n FROM docs WHERE id = ?`, "a").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("reused shell served staged n = %d, want 1 (rolled back)", n)
+	}
+	var count int64
+	if err := clean.QueryRow(`SELECT COUNT(*) FROM docs`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("reused shell count = %d, want 2", count)
+	}
+}

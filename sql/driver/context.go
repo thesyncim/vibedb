@@ -74,19 +74,21 @@ func contextCancellationError(ctx context.Context) error {
 // cooperative cancellation flag. It reuses a flag installed by the typed
 // runtime, or owns a local flag when the connection has none. It exists only
 // when ctx has a Done channel that its installed flag does not already observe.
-// Background contexts and directly bound request channels need no watcher.
+// Background contexts and directly bound request channels need no bridge.
 //
-// The watcher is joined before finish returns. That makes restoring the
-// connection's prior flag race-free and prevents a canceled request from
-// poisoning the next statement on the pooled connection.
+// The bridge is an AfterFunc rather than a watcher goroutine: no per-statement
+// goroutine or channels. finish stops the arm and joins an in-flight Cancel
+// before restoring the connection's prior flag. That keeps the restore
+// race-free and prevents a canceled request from poisoning the next statement
+// on the pooled connection.
 type contextCancelScope struct {
 	conn     *conn
 	ctx      context.Context
 	previous *query.CancelFlag
 	local    query.CancelFlag
 	flag     *query.CancelFlag
-	stop     chan struct{}
-	stopped  chan struct{}
+	stop     func() bool
+	wg       sync.WaitGroup
 }
 
 func (c *conn) beginContextCancellation(
@@ -103,21 +105,18 @@ func (c *conn) beginContextCancellation(
 	}
 	scope := &contextCancelScope{
 		conn: c, ctx: ctx, previous: c.exec.Options.Cancel,
-		stop: make(chan struct{}), stopped: make(chan struct{}),
 	}
 	scope.flag = scope.previous
 	if scope.flag == nil {
 		scope.flag = &scope.local
 	}
 	c.exec.Options.Cancel = scope.flag
-	go func() {
-		defer close(scope.stopped)
-		select {
-		case <-ctx.Done():
-			scope.flag.Cancel()
-		case <-scope.stop:
-		}
-	}()
+	flag := scope.flag
+	scope.wg.Add(1)
+	scope.stop = context.AfterFunc(ctx, func() {
+		flag.Cancel()
+		scope.wg.Done()
+	})
 	return scope, nil
 }
 
@@ -125,8 +124,15 @@ func (s *contextCancelScope) finish(err error) error {
 	if s == nil {
 		return err
 	}
-	close(s.stop)
-	<-s.stopped
+	if s.stop() {
+		// Stopped before the bridge fired: balance the wait the callback
+		// will never release.
+		s.wg.Done()
+	}
+	// Otherwise the bridge fired or is firing; joining it makes restoring
+	// the connection's prior flag race-free, exactly like the watcher join
+	// before.
+	s.wg.Wait()
 	s.conn.exec.Options.Cancel = s.previous
 	contextErr := s.ctx.Err()
 	if contextErr != nil && s.previous != nil {

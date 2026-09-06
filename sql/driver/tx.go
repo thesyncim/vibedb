@@ -158,18 +158,26 @@ func (c *conn) beginTx(
 			transaction.releaseSnapshots()
 			return nil, err
 		}
-		state, err := newTransactionTableState(name, layout, true)
-		if err != nil {
+		if layout.limitsErr != nil {
 			transaction.releaseSnapshots()
-			return nil, err
+			return nil, layout.limitsErr
 		}
+		state := c.borrowTable()
+		if state == nil {
+			state = &txTable{}
+		}
+		resetTableState(state, name, layout, true)
 		if layout.incarnation.collection != nil {
-			snapshot, err := layout.incarnation.collection.Snapshot()
+			var err error
+			if state.snapshot != nil {
+				err = layout.incarnation.collection.SnapshotInto(state.snapshot)
+			} else {
+				state.snapshot, err = layout.incarnation.collection.Snapshot()
+			}
 			if err != nil {
 				transaction.releaseSnapshots()
 				return nil, err
 			}
-			state.snapshot = snapshot
 		}
 		if !options.ReadOnly {
 			state.conflicts = &layout.incarnation.conflicts
@@ -200,20 +208,66 @@ func newTransactionTableState(
 	if layout.limitsErr != nil {
 		return nil, layout.limitsErr
 	}
-	state := &txTable{
-		name:          name,
-		incarnation:   layout.incarnation,
-		primaryKey:    layout.primaryKey,
-		primary:       layout.primary,
-		schema:        layout.schema,
-		uniqueIndexes: layout.uniqueIndexes,
-		limits:        layout.limits,
+	state := &txTable{}
+	resetTableState(state, name, layout, allocatePending)
+	return state, nil
+}
+
+// resetTableState prepares a table shell for one transaction: a fresh shell
+// from newTransactionTableState or a retained shell from the connection's
+// spare list. Reset is total — every field a fresh shell would zero is
+// zeroed here, so a reused shell is indistinguishable from a new one —
+// except the retained buffers below, which restart empty, and the snapshot
+// objects, which the caller rebinds with SnapshotInto. The overlay source
+// captures the shell pointer itself, so rebinding it to the same shell is
+// free and always current.
+func resetTableState(
+	state *txTable,
+	name string,
+	layout transactionTableLayout,
+	allocatePending bool,
+) {
+	snapshot := state.snapshot
+	refreshSnapshot := state.refreshSnapshot
+	pending := state.pending
+	order := state.order[:0]
+	serialReadOrder := state.serialReadOrder[:0]
+	serialReadChunks := state.serialReadChunks[:0]
+	keyChunks := state.keyChunks[:0]
+	existenceScratch := state.existenceScratch[:0]
+	serialReadArena := state.serialReadArena[:0]
+	keyChunk := state.keyChunk[:0]
+	validationTape := state.validationTape[:0]
+	*state = txTable{
+		name:             name,
+		incarnation:      layout.incarnation,
+		primaryKey:       layout.primaryKey,
+		primary:          layout.primary,
+		schema:           layout.schema,
+		uniqueIndexes:    layout.uniqueIndexes,
+		limits:           layout.limits,
+		snapshot:         snapshot,
+		refreshSnapshot:  refreshSnapshot,
+		pending:          pending,
+		order:            order,
+		serialReadOrder:  serialReadOrder,
+		serialReadChunks: serialReadChunks,
+		keyChunks:        keyChunks,
+		existenceScratch: existenceScratch,
+		serialReadArena:  serialReadArena,
+		keyChunk:         keyChunk,
+		validationTape:   validationTape,
 	}
 	if allocatePending {
-		state.pending = make(map[string]*txMutation)
+		if state.pending == nil {
+			state.pending = make(map[string]*txMutation)
+		} else {
+			clear(state.pending)
+		}
+	} else {
+		state.pending = nil
 	}
 	state.overlaySource = query.NewFileOverlaySource(state)
-	return state, nil
 }
 
 func (t *tx) tableLayoutAtBegin(
@@ -2554,19 +2608,48 @@ func (t *tx) finish() {
 	t.savepoints = nil
 }
 
+// maxConnTableSpare bounds the transaction table shells one connection
+// retains across transactions. Point reads need one; wide multi-table
+// transactions borrow up to the bound and allocate the rest.
+const maxConnTableSpare = 8
+
+// borrowTable pops a reusable table shell, or nil when the connection
+// holds no spare.
+func (c *conn) borrowTable() *txTable {
+	if c == nil || len(c.tableSpare) == 0 {
+		return nil
+	}
+	spare := c.tableSpare[len(c.tableSpare)-1]
+	c.tableSpare = c.tableSpare[:len(c.tableSpare)-1]
+	return spare
+}
+
+// keepTable retains a table shell for the connection's next transaction.
+// Shells from borrowed-snapshot transactions are never kept: their
+// snapshots belong to another cut and rebinding them would corrupt it.
+func (c *conn) keepTable(spare *txTable) {
+	if c == nil || spare == nil || len(c.tableSpare) >= maxConnTableSpare {
+		return
+	}
+	c.tableSpare = append(c.tableSpare, spare)
+}
+
 func (t *tx) releaseSnapshots() {
 	for _, table := range t.tables {
-		if table.snapshot != nil {
-			if !t.borrowedSnapshots {
-				_ = table.snapshot.Close()
-			}
-			table.snapshot = nil
+		// Leases are closed but their objects stay attached to the shell:
+		// the next transaction rebinds them with SnapshotInto. Shells from
+		// borrowed-snapshot transactions are dropped instead: their
+		// snapshots belong to another cut.
+		if table.snapshot != nil && !t.borrowedSnapshots {
+			_ = table.snapshot.Close()
 		}
 		if table.refreshSnapshot != nil {
 			_ = table.refreshSnapshot.Close()
-			table.refreshSnapshot = nil
 		}
 		table.refreshCaptured = false
+		if !t.borrowedSnapshots {
+			t.conn.keepTable(table)
+		}
 	}
 	clear(t.refreshStates)
 	t.refreshStates = t.refreshStates[:0]

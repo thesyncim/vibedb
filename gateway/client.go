@@ -536,20 +536,23 @@ func RoundTrip(ctx context.Context, conn net.Conn, req *shardservice.ShardReques
 	}
 	// AfterFunc trips the socket's I/O deadline once ctx is done, unblocking a
 	// blocked Encode or Decode; stop cancels it on the fast path so a healthy
-	// round-trip pays nothing after it returns.
-	callbackDone := make(chan struct{})
-	stop := context.AfterFunc(ctx, func() {
-		_ = conn.SetDeadline(tripped)
-		close(callbackDone)
-	})
-	defer func() {
-		// If the callback won the race with the fast path, wait until it has
-		// finished mutating the connection before RoundTrip returns. This is
-		// required when callers pool a connection after a canceled exchange.
-		if !stop() {
-			<-callbackDone
-		}
-	}()
+	// round-trip pays nothing after it returns. A context that can never be
+	// done needs no trip arm at all.
+	if ctx.Done() != nil {
+		callbackDone := make(chan struct{})
+		stop := context.AfterFunc(ctx, func() {
+			_ = conn.SetDeadline(tripped)
+			close(callbackDone)
+		})
+		defer func() {
+			// If the callback won the race with the fast path, wait until it has
+			// finished mutating the connection before RoundTrip returns. This is
+			// required when callers pool a connection after a canceled exchange.
+			if !stop() {
+				<-callbackDone
+			}
+		}()
+	}
 
 	if err := shardservice.EncodeRequest(conn, req); err != nil {
 		return nil, firstErr(ctx, err)
@@ -588,16 +591,19 @@ func RoundTripBatches(
 		return err
 	}
 
-	callbackDone := make(chan struct{})
-	stop := context.AfterFunc(ctx, func() {
-		_ = conn.SetDeadline(tripped)
-		close(callbackDone)
-	})
-	defer func() {
-		if !stop() {
-			<-callbackDone
-		}
-	}()
+	// Same uncancellable-context fast path as RoundTrip above.
+	if ctx.Done() != nil {
+		callbackDone := make(chan struct{})
+		stop := context.AfterFunc(ctx, func() {
+			_ = conn.SetDeadline(tripped)
+			close(callbackDone)
+		})
+		defer func() {
+			if !stop() {
+				<-callbackDone
+			}
+		}()
+	}
 
 	if err := shardservice.EncodeRequest(conn, req); err != nil {
 		return firstErr(ctx, err)
