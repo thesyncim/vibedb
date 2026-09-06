@@ -226,3 +226,36 @@ func BenchmarkPointReadBatchIntoFourMisses(b *testing.B) {
 		scratch = result.Data[:0]
 	}
 }
+
+func TestPointReadBatchMissesDoNotAllocateMaximumDocumentScratch(t *testing.T) {
+	fixture := newRelationBundleFixtureWithCollectionOptions(t, true, false,
+		durable.Options{MaxDocumentBytes: 64 << 10},
+		durable.Options{MaxDocumentBytes: 64 << 10})
+	packed, err := AppendPointReadBatch(nil, []PointRead{
+		{Relation: 1, Key: []byte("missing-a")},
+		{Relation: 2, Key: []byte("missing-b")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const maximum = 1024
+	dst := make([]byte, 0, maximum)
+	if allocations := testing.AllocsPerRun(10, func() {
+		result, readErr := fixture.machine.PointReadBatchInto(packed, 2, maximum, dst)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		values, openErr := OpenPointReadBatchValue(result.Data)
+		if openErr != nil {
+			t.Fatal(openErr)
+		}
+		for i := 0; i < 2; i++ {
+			raw, found, ok := values.Lookup(i)
+			if !ok || found || len(raw) != 0 {
+				t.Fatalf("miss %d: value=%x found=%t valid=%t", i, raw, found, ok)
+			}
+		}
+	}); allocations != 0 {
+		t.Fatalf("warmed missing-point batch allocations=%v", allocations)
+	}
+}
