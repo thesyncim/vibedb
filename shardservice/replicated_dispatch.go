@@ -174,7 +174,7 @@ func (server *ReplicatedServer) DispatchReplicated(ctx context.Context, call Rep
 		request, semanticSQL = &owned.Request, owned.SQL
 	}
 	server.semanticDispatch.Add(1)
-	response := server.executeReplicatedAuthenticatedCall(requestCtx, request, true, semanticSQL)
+	response := server.executeReplicatedAuthenticatedCallValidated(requestCtx, request, true, semanticSQL, true)
 	reply, replyErr := semanticReplyFromExecutedResponse(response)
 	if replyErr != nil {
 		if response != nil && response.readLease != nil {
@@ -237,28 +237,6 @@ func validReplicatedPeerIdentity(identity rafttransport.PeerIdentity) bool {
 		identity.TrustDomain.ClusterIncarnation != ([16]byte{})
 }
 
-func validReplicatedSemanticCall(call *ReplicatedCall) bool {
-	if call == nil {
-		return false
-	}
-	request := &call.Request
-	if call.SQL == nil {
-		// Legacy native callers already carry a SQL frame. Admit those bytes
-		// before decoding them; production semantic SQL always uses SQL below.
-		return validReplicatedRequest(request)
-	}
-	if request.Operation != ReplicatedQueryLeader || len(request.Query) != 0 ||
-		ValidateRequest(call.SQL) != nil || call.SQL.Authority != request.Authority {
-		return false
-	}
-	// Reuse the complete native request grammar while substituting a bounded
-	// marker for the wire-only SQL payload. The marker is never executed or
-	// transmitted; it only selects the existing QueryLeader field checks.
-	wireRequest := *request
-	wireRequest.Query = []byte{1}
-	return validReplicatedRequest(&wireRequest)
-}
-
 // ValidateReplicatedCall validates the transport-neutral semantic envelope
 // without taking a local admission reservation or retaining caller buffers.
 func ValidateReplicatedCall(call *ReplicatedCall) error {
@@ -271,17 +249,28 @@ func ValidateReplicatedCall(call *ReplicatedCall) error {
 // local dispatch uses this same value for the shared byte budget without
 // actually encoding the inner frame.
 func ReplicatedCallFrameBytes(call *ReplicatedCall) (int, error) {
-	if !validReplicatedSemanticCall(call) {
+	if call == nil {
 		return 0, ErrReplicatedWire
 	}
 	if call.SQL == nil {
 		return ReplicatedRequestFrameBytes(&call.Request)
+	}
+	if call.Request.Operation != ReplicatedQueryLeader || len(call.Request.Query) != 0 ||
+		call.SQL.Authority != call.Request.Authority {
+		return 0, ErrReplicatedWire
 	}
 	inner, err := RequestFrameBytes(call.SQL)
 	if err != nil {
 		return 0, err
 	}
 	if inner > MaxReplicatedSQLRequestBytes {
+		return 0, ErrReplicatedWire
+	}
+	wireRequest := call.Request
+	var marker [1]byte
+	marker[0] = 1
+	wireRequest.Query = marker[:]
+	if !validReplicatedRequest(&wireRequest) {
 		return 0, ErrReplicatedWire
 	}
 	// QueryLeader contributes max-value bytes, the four-byte payload length,
