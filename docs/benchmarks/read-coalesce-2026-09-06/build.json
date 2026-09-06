@@ -1,0 +1,23 @@
+{
+  "baseline": "38409c7aa9bcfce6b5dd9288990ef93e94dc957a",
+  "candidate": "e8cf5617cdd24d16d4d3c0ca65894d9907aaa174",
+  "merge": "5f9ac3c0634cdf6615693a5ceb4f392298a9e0de",
+  "candidate_merge_tree_identical": true,
+  "go_version": "go version go1.27.0 darwin/arm64",
+  "server_environment": {
+    "GOOS": "linux",
+    "GOARCH": "arm64",
+    "CGO_ENABLED": "0",
+    "GOEXPERIMENT": "simd"
+  },
+  "server_build_flags": [
+    "-mod=readonly",
+    "-trimpath"
+  ],
+  "packages": [
+    "./cmd/vibedb",
+    "./cmd/vibedb-shard",
+    "./cmd/vibedb-gateway"
+  ],
+  "client": "same frozen rf3-sqlbench from impact-matrix-final/before-bin in both arms; hashes in manifest"
+}

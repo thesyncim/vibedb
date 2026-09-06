@@ -1,0 +1,302 @@
+{
+  "arms": {
+    "1-baseline": {
+      "trials": 24,
+      "operations": 75000,
+      "errors": 0,
+      "all_verified": true,
+      "cells": [
+        {
+          "workload": "mixed_uniform",
+          "clients": 1,
+          "ops_s": 599.860434701674,
+          "p99_ms": 10.564625
+        },
+        {
+          "workload": "mixed_uniform",
+          "clients": 8,
+          "ops_s": 893.6381201391597,
+          "p99_ms": 48.454125
+        },
+        {
+          "workload": "point_hit",
+          "clients": 1,
+          "ops_s": 3710.939320679604,
+          "p99_ms": 0.404208
+        },
+        {
+          "workload": "point_hit",
+          "clients": 8,
+          "ops_s": 18675.934599211523,
+          "p99_ms": 0.707292
+        },
+        {
+          "workload": "range_32",
+          "clients": 1,
+          "ops_s": 3643.480586107193,
+          "p99_ms": 0.401333
+        },
+        {
+          "workload": "range_32",
+          "clients": 8,
+          "ops_s": 17805.263406793576,
+          "p99_ms": 0.826875
+        },
+        {
+          "workload": "update_existing",
+          "clients": 1,
+          "ops_s": 751.8250961133484,
+          "p99_ms": 5.671958
+        },
+        {
+          "workload": "update_existing",
+          "clients": 8,
+          "ops_s": 1067.1500022376933,
+          "p99_ms": 37.195083
+        }
+      ]
+    },
+    "2-scheduler": {
+      "trials": 24,
+      "operations": 75000,
+      "errors": 0,
+      "all_verified": true,
+      "cells": [
+        {
+          "workload": "mixed_uniform",
+          "clients": 1,
+          "ops_s": 1274.3476048959494,
+          "p99_ms": 5.090042
+        },
+        {
+          "workload": "mixed_uniform",
+          "clients": 8,
+          "ops_s": 830.4442591051104,
+          "p99_ms": 47.9775
+        },
+        {
+          "workload": "point_hit",
+          "clients": 1,
+          "ops_s": 4232.043656188037,
+          "p99_ms": 0.327375
+        },
+        {
+          "workload": "point_hit",
+          "clients": 8,
+          "ops_s": 17862.13667995349,
+          "p99_ms": 0.679167
+        },
+        {
+          "workload": "range_32",
+          "clients": 1,
+          "ops_s": 3803.103186160745,
+          "p99_ms": 0.392083
+        },
+        {
+          "workload": "range_32",
+          "clients": 8,
+          "ops_s": 19983.513601278944,
+          "p99_ms": 0.642292
+        },
+        {
+          "workload": "update_existing",
+          "clients": 1,
+          "ops_s": 629.2787965155784,
+          "p99_ms": 6.778667
+        },
+        {
+          "workload": "update_existing",
+          "clients": 8,
+          "ops_s": 1061.396408374446,
+          "p99_ms": 34.004417
+        }
+      ]
+    },
+    "3-scheduler": {
+      "trials": 24,
+      "operations": 75000,
+      "errors": 0,
+      "all_verified": true,
+      "cells": [
+        {
+          "workload": "mixed_uniform",
+          "clients": 1,
+          "ops_s": 1248.0807338196262,
+          "p99_ms": 4.678667
+        },
+        {
+          "workload": "mixed_uniform",
+          "clients": 8,
+          "ops_s": 2128.2118148693,
+          "p99_ms": 20.376125
+        },
+        {
+          "workload": "point_hit",
+          "clients": 1,
+          "ops_s": 3792.1307180374206,
+          "p99_ms": 0.38875
+        },
+        {
+          "workload": "point_hit",
+          "clients": 8,
+          "ops_s": 20172.41524690855,
+          "p99_ms": 0.679334
+        },
+        {
+          "workload": "range_32",
+          "clients": 1,
+          "ops_s": 3760.0487302315437,
+          "p99_ms": 0.39525
+        },
+        {
+          "workload": "range_32",
+          "clients": 8,
+          "ops_s": 19051.06638344081,
+          "p99_ms": 0.715167
+        },
+        {
+          "workload": "update_existing",
+          "clients": 1,
+          "ops_s": 499.76289611484833,
+          "p99_ms": 9.945084
+        },
+        {
+          "workload": "update_existing",
+          "clients": 8,
+          "ops_s": 1268.4143701156424,
+          "p99_ms": 20.054458
+        }
+      ]
+    },
+    "4-baseline": {
+      "trials": 24,
+      "operations": 75000,
+      "errors": 0,
+      "all_verified": true,
+      "cells": [
+        {
+          "workload": "mixed_uniform",
+          "clients": 1,
+          "ops_s": 607.5766245339776,
+          "p99_ms": 8.909875
+        },
+        {
+          "workload": "mixed_uniform",
+          "clients": 8,
+          "ops_s": 897.2224736594744,
+          "p99_ms": 48.71425
+        },
+        {
+          "workload": "point_hit",
+          "clients": 1,
+          "ops_s": 3636.498487645281,
+          "p99_ms": 0.403875
+        },
+        {
+          "workload": "point_hit",
+          "clients": 8,
+          "ops_s": 18890.215606451035,
+          "p99_ms": 0.688333
+        },
+        {
+          "workload": "range_32",
+          "clients": 1,
+          "ops_s": 3544.6998382560555,
+          "p99_ms": 0.413708
+        },
+        {
+          "workload": "range_32",
+          "clients": 8,
+          "ops_s": 17639.925445207904,
+          "p99_ms": 0.673541
+        },
+        {
+          "workload": "update_existing",
+          "clients": 1,
+          "ops_s": 521.7245162505722,
+          "p99_ms": 10.284542
+        },
+        {
+          "workload": "update_existing",
+          "clients": 8,
+          "ops_s": 1179.9233670982044,
+          "p99_ms": 19.440041
+        }
+      ]
+    }
+  },
+  "comparison": [
+    {
+      "workload": "mixed_uniform",
+      "clients": 1,
+      "baseline_ops_s": 603.7185296178258,
+      "candidate_ops_s": 1261.2141693577878,
+      "change_percent": 108.90764611054409,
+      "baseline_p99_ms": 9.6338125,
+      "candidate_p99_ms": 4.884354500000001
+    },
+    {
+      "workload": "mixed_uniform",
+      "clients": 8,
+      "baseline_ops_s": 895.430296899317,
+      "candidate_ops_s": 1473.193887118623,
+      "change_percent": 64.52356953075827,
+      "baseline_p99_ms": 48.5841875,
+      "candidate_p99_ms": 33.483583
+    },
+    {
+      "workload": "point_hit",
+      "clients": 1,
+      "baseline_ops_s": 3649.1768234508418,
+      "candidate_ops_s": 3952.180239318627,
+      "change_percent": 8.303336081731727,
+      "baseline_p99_ms": 0.4040415,
+      "candidate_p99_ms": 0.3610415
+    },
+    {
+      "workload": "point_hit",
+      "clients": 8,
+      "baseline_ops_s": 18783.07510283128,
+      "candidate_ops_s": 19627.911613490025,
+      "change_percent": 4.497860472971205,
+      "baseline_p99_ms": 0.696979,
+      "candidate_p99_ms": 0.6792505
+    },
+    {
+      "workload": "range_32",
+      "clients": 1,
+      "baseline_ops_s": 3588.9905257335977,
+      "candidate_ops_s": 3773.8364288879993,
+      "change_percent": 5.150359183983033,
+      "baseline_p99_ms": 0.4077915,
+      "candidate_p99_ms": 0.39366650000000003
+    },
+    {
+      "workload": "range_32",
+      "clients": 8,
+      "baseline_ops_s": 17722.594426000738,
+      "candidate_ops_s": 19283.85103520224,
+      "change_percent": 8.809413405697452,
+      "baseline_p99_ms": 0.7166035,
+      "candidate_p99_ms": 0.679917
+    },
+    {
+      "workload": "update_existing",
+      "clients": 1,
+      "baseline_ops_s": 748.6133392424431,
+      "candidate_ops_s": 564.5208463152134,
+      "change_percent": -24.591131800232358,
+      "baseline_p99_ms": 6.4417915,
+      "candidate_p99_ms": 8.3618755
+    },
+    {
+      "workload": "update_existing",
+      "clients": 8,
+      "baseline_ops_s": 1167.1447423693244,
+      "candidate_ops_s": 1164.9053892450443,
+      "change_percent": -0.19186593084712378,
+      "baseline_p99_ms": 20.445645499999998,
+      "candidate_p99_ms": 27.0294375
+    }
+  ]
+}
