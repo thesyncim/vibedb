@@ -2,6 +2,7 @@ package rafttransport
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"math"
 	"math/bits"
@@ -72,6 +73,7 @@ type boundedFrameBufferCache struct {
 	maxBytes   int64
 	retain     int
 	free       [bits.UintSize]*pooledFrameBuffer
+	freeFramed [bits.UintSize]*pooledFrameBuffer
 	freeFrames int
 
 	ownedFrames int
@@ -104,26 +106,82 @@ func frameBufferCapacity(size, retain int) (capacity int, class int, cacheable b
 	return capacity, class, true
 }
 
+// framedFrameCapacity reserves the stream record header in the owned buffer.
+// The prefix is charged to the same bounded cache as the frame body. A frame
+// whose prefix would exceed the retained size is still valid, but is released
+// after use instead of being warmed in the cache.
+func framedFrameCapacity(frameSize, retain int) (capacity, class int, cacheable bool) {
+	if frameSize <= 0 || retain <= 0 ||
+		frameSize > int(^uint(0)>>1)-StreamRecordHeaderBytes {
+		return 0, 0, false
+	}
+	storageSize := frameSize + StreamRecordHeaderBytes
+	if storageSize > retain {
+		return storageSize, 0, false
+	}
+	return frameBufferCapacity(storageSize, retain)
+}
+
 func (cache *boundedFrameBufferCache) get(size int) (*pooledFrameBuffer, error) {
 	if cache == nil || size <= 0 || int64(size) > cache.maxBytes {
 		return nil, ErrInvalidTransport
+	}
+	capacity, class, cacheable := frameBufferCapacity(size, cache.retain)
+	return cache.getStorage(size, capacity, class, cacheable, false)
+}
+
+func (cache *boundedFrameBufferCache) getFramed(frameSize int) (*pooledFrameBuffer, error) {
+	if cache == nil || frameSize <= 0 ||
+		frameSize > int(^uint(0)>>1)-StreamRecordHeaderBytes {
+		return nil, ErrInvalidTransport
+	}
+	storageSize := frameSize + StreamRecordHeaderBytes
+	if int64(storageSize) > cache.maxBytes {
+		return nil, ErrInvalidTransport
+	}
+	capacity, class, cacheable := framedFrameCapacity(frameSize, cache.retain)
+	return cache.getStorage(storageSize, capacity, class, cacheable, true)
+}
+
+func (cache *boundedFrameBufferCache) getStorage(
+	size, capacity, class int,
+	cacheable, framed bool,
+) (*pooledFrameBuffer, error) {
+	if cache == nil || size <= 0 || capacity < size {
+		return nil, ErrInvalidTransport
+	}
+	if int64(capacity) > cache.maxBytes {
+		return nil, ErrBackpressure
 	}
 	cache.mu.Lock()
 	defer cache.mu.Unlock()
 	if cache.closed {
 		return nil, ErrTransportClosed
 	}
-	capacity, class, cacheable := frameBufferCapacity(size, cache.retain)
-	if int64(capacity) > cache.maxBytes {
-		return nil, ErrBackpressure
-	}
-	if cacheable && cache.free[class] != nil {
-		buffer := cache.free[class]
-		cache.free[class] = buffer.next
-		buffer.next = nil
-		cache.freeFrames--
-		buffer.bytes = buffer.bytes[:size]
-		return buffer, nil
+	if cacheable {
+		var buffer *pooledFrameBuffer
+		if framed {
+			buffer = cache.freeFramed[class]
+			if buffer != nil {
+				cache.freeFramed[class] = buffer.next
+			}
+		} else {
+			buffer = cache.free[class]
+			if buffer != nil {
+				cache.free[class] = buffer.next
+			}
+		}
+		if buffer != nil {
+			buffer.next = nil
+			cache.freeFrames--
+			if framed {
+				buffer.record = buffer.record[:size]
+				buffer.bytes = buffer.record[StreamRecordHeaderBytes:size]
+			} else {
+				buffer.bytes = buffer.bytes[:size]
+			}
+			return buffer, nil
+		}
 	}
 	for cache.freeFrames != 0 &&
 		(cache.ownedFrames == cache.maxFrames ||
@@ -134,7 +192,13 @@ func (cache *boundedFrameBufferCache) get(size int) (*pooledFrameBuffer, error) 
 		int64(capacity) > cache.maxBytes-cache.ownedBytes {
 		return nil, ErrBackpressure
 	}
-	buffer := &pooledFrameBuffer{bytes: make([]byte, size, capacity)}
+	buffer := &pooledFrameBuffer{framed: framed}
+	if framed {
+		buffer.record = make([]byte, size, capacity)
+		buffer.bytes = buffer.record[StreamRecordHeaderBytes:size]
+	} else {
+		buffer.bytes = make([]byte, size, capacity)
+	}
 	cache.ownedFrames++
 	cache.ownedBytes += int64(capacity)
 	return buffer, nil
@@ -143,34 +207,51 @@ func (cache *boundedFrameBufferCache) get(size int) (*pooledFrameBuffer, error) 
 func (cache *boundedFrameBufferCache) evictFree() {
 	for class := len(cache.free) - 1; class >= 0; class-- {
 		buffer := cache.free[class]
-		if buffer == nil {
-			continue
+		if buffer != nil {
+			cache.free[class] = buffer.next
+			cache.releaseEvicted(buffer)
+			return
 		}
-		cache.free[class] = buffer.next
-		buffer.next = nil
-		cache.freeFrames--
-		cache.ownedFrames--
-		cache.ownedBytes -= int64(cap(buffer.bytes))
-		buffer.bytes = nil
-		return
+		buffer = cache.freeFramed[class]
+		if buffer != nil {
+			cache.freeFramed[class] = buffer.next
+			cache.releaseEvicted(buffer)
+			return
+		}
 	}
+}
+
+func (cache *boundedFrameBufferCache) releaseEvicted(buffer *pooledFrameBuffer) {
+	buffer.next = nil
+	cache.freeFrames--
+	cache.ownedFrames--
+	cache.ownedBytes -= int64(buffer.ownedCapacity())
+	buffer.bytes = nil
+	buffer.record = nil
 }
 
 func (cache *boundedFrameBufferCache) put(buffer *pooledFrameBuffer) {
 	if cache == nil || buffer == nil {
 		return
 	}
-	capacity := cap(buffer.bytes)
+	capacity := buffer.ownedCapacity()
 	cacheable := capacity <= cache.retain
 	if cacheable {
-		clear(buffer.bytes)
-		buffer.bytes = buffer.bytes[:0]
+		if buffer.framed {
+			clear(buffer.record)
+			buffer.record = buffer.record[:0]
+			buffer.bytes = nil
+		} else {
+			clear(buffer.bytes)
+			buffer.bytes = buffer.bytes[:0]
+		}
 	}
 	cache.mu.Lock()
 	if cache.closed || !cacheable {
 		cache.ownedFrames--
 		cache.ownedBytes -= int64(capacity)
 		buffer.bytes = nil
+		buffer.record = nil
 		cache.mu.Unlock()
 		return
 	}
@@ -182,8 +263,13 @@ func (cache *boundedFrameBufferCache) put(buffer *pooledFrameBuffer) {
 		cache.mu.Unlock()
 		return
 	}
-	buffer.next = cache.free[class]
-	cache.free[class] = buffer
+	if buffer.framed {
+		buffer.next = cache.freeFramed[class]
+		cache.freeFramed[class] = buffer
+	} else {
+		buffer.next = cache.free[class]
+		cache.free[class] = buffer
+	}
 	cache.freeFrames++
 	cache.mu.Unlock()
 }
@@ -229,6 +315,7 @@ type ordinaryPeer struct {
 	wake           chan struct{}
 
 	writeBuffer   []byte
+	directFrame   *pooledFrameBuffer
 	batchFrames   []*pooledFrameBuffer
 	releaseFrames []*pooledFrameBuffer
 	connection    PeerConnection
@@ -322,7 +409,7 @@ func validateOrdinaryTransportOptions(options OrdinaryTransportOptions, retain i
 	peers := len(options.Peers)
 	queue := options.Queue
 	coalesce := options.Coalesce
-	minimumOwnedBytes, _, _ := frameBufferCapacity(FrameHeaderBytes, retain)
+	minimumOwnedBytes, _, _ := framedFrameCapacity(FrameHeaderBytes, retain)
 	if options.Registry == nil || options.Dialer == nil || options.Wait == nil ||
 		options.Backoff == nil || options.WriteDeadline == nil ||
 		peers == 0 || peers > AbsoluteMaxTransportPeers ||
@@ -459,12 +546,12 @@ func (transport *OrdinaryTransport) Send(outbound raftmember.OutboundMessage) er
 	if wireBytes > transport.coalesce.MaxBytes {
 		return ErrFrameTooLarge
 	}
-	ownedSize, _, _ := frameBufferCapacity(plan.frameSize, transport.frames.retain)
+	ownedSize, _, _ := framedFrameCapacity(plan.frameSize, transport.frames.retain)
 	peer, err := transport.reserveOutbound(plan, ownedSize)
 	if err != nil {
 		return err
 	}
-	storage, err := transport.frames.get(plan.frameSize)
+	storage, err := transport.frames.getFramed(plan.frameSize)
 	if err != nil {
 		transport.unwindReservation(peer, ownedSize)
 		if !errors.Is(err, ErrTransportClosed) && !errors.Is(err, ErrBackpressure) {
@@ -482,6 +569,15 @@ func (transport *OrdinaryTransport) Send(outbound raftmember.OutboundMessage) er
 		return err
 	}
 	storage.bytes = frame
+	if len(storage.record) < StreamRecordHeaderBytes+plan.frameSize {
+		transport.unwindReservation(peer, ownedSize)
+		transport.frames.put(storage)
+		transport.cancel(ErrInvalidTransport)
+		return ErrInvalidTransport
+	}
+	binary.BigEndian.PutUint32(
+		storage.record[:StreamRecordHeaderBytes], uint32(plan.frameSize),
+	)
 	if err := transport.publishReservation(peer, storage, plan.frameSize, ownedSize); err != nil {
 		transport.frames.put(storage)
 		return err
@@ -527,7 +623,9 @@ func (transport *OrdinaryTransport) publishReservation(
 	frameSize int,
 	ownedSize int,
 ) error {
-	if storage == nil || len(storage.bytes) != frameSize || cap(storage.bytes) != ownedSize {
+	if storage == nil || len(storage.bytes) != frameSize ||
+		storage.ownedCapacity() != ownedSize || !storage.framed ||
+		len(storage.record) != frameSize+StreamRecordHeaderBytes {
 		transport.unwindReservation(peer, ownedSize)
 		transport.cancel(ErrInvalidTransport)
 		return ErrInvalidTransport
@@ -775,6 +873,15 @@ func (transport *OrdinaryTransport) buildPeerBatch(peer *ordinaryPeer) ([]byte, 
 		frames++
 	}
 	transport.mu.Unlock()
+	if frames == 1 {
+		frame := peer.batchFrames[0]
+		if frame != nil && frame.framed &&
+			len(frame.record) == StreamRecordHeaderBytes+len(frame.bytes) {
+			peer.batchFrames[0] = nil
+			peer.directFrame = frame
+			return frame.record, 1
+		}
+	}
 
 	if cap(peer.writeBuffer) < wireBytes {
 		peer.writeBuffer = make([]byte, 0, wireBytes)
@@ -798,6 +905,10 @@ func (transport *OrdinaryTransport) buildPeerBatch(peer *ordinaryPeer) ([]byte, 
 }
 
 func (transport *OrdinaryTransport) releasePeerBatch(peer *ordinaryPeer) {
+	if peer.directFrame != nil {
+		peer.directFrame = nil
+		return
+	}
 	if cap(peer.writeBuffer) > transport.coalesce.RetainedBytes {
 		peer.writeBuffer = nil
 		return
@@ -819,7 +930,7 @@ func (transport *OrdinaryTransport) commitPeerBatch(peer *ordinaryPeer, frames i
 		peer.queue[peer.head] = outboundFrame{}
 		peer.head = (peer.head + 1) % len(peer.queue)
 		peer.count--
-		frameBytes := int64(cap(frame.bytes))
+		frameBytes := int64(frame.ownedCapacity())
 		peer.bytes -= frameBytes
 		transport.globalFrames--
 		transport.globalBytes -= frameBytes
@@ -872,7 +983,7 @@ func (transport *OrdinaryTransport) drainQueues() {
 			peer.queue[peer.head] = outboundFrame{}
 			peer.head = (peer.head + 1) % len(peer.queue)
 			peer.count--
-			frameBytes := int64(cap(frame.bytes))
+			frameBytes := int64(frame.ownedCapacity())
 			peer.bytes -= frameBytes
 			transport.globalFrames--
 			transport.globalBytes -= frameBytes
@@ -880,6 +991,7 @@ func (transport *OrdinaryTransport) drainQueues() {
 		}
 		clear(peer.writeBuffer)
 		peer.writeBuffer = nil
+		peer.directFrame = nil
 	}
 	transport.mu.Unlock()
 	for _, connection := range connections {
