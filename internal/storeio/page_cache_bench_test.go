@@ -87,4 +87,43 @@ func BenchmarkPageCacheWarmAcquire(b *testing.B) {
 	}
 }
 
+// BenchmarkPageCacheParallelAcquire hammers one resident frame from all
+// threads. The pin path is the hottest shared-memory operation in the read
+// path, so this measures the contention ceiling directly: a frame-lock pin
+// serializes here, while the lock-free pin scales.
+func BenchmarkPageCacheParallelAcquire(b *testing.B) {
+	file, storeID, refs := newPageCacheFixture(b, 1)
+	cache, err := NewPageCache(file, PageCacheOptions{
+		PageSize: pageCacheTestPageSize, ResidentBytes: 2 * pageCacheTestPageSize,
+		StoreID: storeID, PrefetchQueue: 4,
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	ref := refs[0]
+	lease, err := cache.Acquire(ref)
+	if err != nil {
+		b.Fatal(err)
+	}
+	lease.Release()
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		var local uint64
+		for pb.Next() {
+			l, acquireErr := cache.Acquire(ref)
+			if acquireErr != nil {
+				b.Error(acquireErr)
+				return
+			}
+			local += uint64(l.Payload()[0])
+			l.Release()
+		}
+		_ = local
+	})
+	if err := cache.Close(); err != nil {
+		b.Fatal(err)
+	}
+}
+
 var sink uint64

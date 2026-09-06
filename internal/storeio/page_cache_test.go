@@ -326,7 +326,7 @@ func TestPageCacheDemandWaitsForSpeculativeAdmission(t *testing.T) {
 	frame := &cache.frames[frameIndex]
 	frame.lock.Lock()
 	cache.beginExtentLocked(frameIndex, 1, key, cacheKeyHash(key))
-	frame.flags |= pageCacheFramePrefetched
+	frame.flags.Or(pageCacheFramePrefetched)
 	cache.activeLoads++
 	frame.lock.Unlock()
 	page := cache.extentBytes(frameIndex, refs[0].Length)
@@ -401,7 +401,7 @@ func TestPageCacheSpanAwareReservationEvictsOneColdWindow(t *testing.T) {
 		frame := &cache.frames[index]
 		frame.lock.Lock()
 		cache.beginExtentLocked(index, reservedSpan, key, cacheKeyHash(key))
-		frame.state = pageCacheReady
+		frame.state.Store(pageCacheReady)
 		frame.lock.Unlock()
 		return key
 	}
@@ -449,7 +449,7 @@ func TestPageCacheSpanAwareReservationEvictsOneColdWindow(t *testing.T) {
 	residentSlots := 0
 	for index := 0; index < len(cache.frames); {
 		frame := &cache.frames[index]
-		if frame.state == pageCacheReady {
+		if frame.state.Load() == pageCacheReady {
 			extentSpan := int(frame.reservationSpan)
 			residentSlots += extentSpan
 			index += extentSpan
@@ -464,8 +464,8 @@ func TestPageCacheSpanAwareReservationEvictsOneColdWindow(t *testing.T) {
 	hotKeys := make([]pageCacheKey, 0, 3)
 	for index := range 3 {
 		frame := &cache.frames[index]
-		frame.referenced = true
-		frame.hits = 100
+		frame.referenced.Store(true)
+		frame.hits.Store(100)
 		hotKeys = append(hotKeys, frame.key)
 	}
 	// The next two windows each expose one cold frame to the old frame-at-a-
@@ -473,8 +473,8 @@ func TestPageCacheSpanAwareReservationEvictsOneColdWindow(t *testing.T) {
 	// cold. A linear clock walk evicts five frames before it coalesces a span;
 	// window scoring chooses the three-frame cold window directly.
 	for _, index := range []int{5, 6, 9, 10} {
-		cache.frames[index].referenced = true
-		cache.frames[index].hits = 10
+		cache.frames[index].referenced.Store(true)
+		cache.frames[index].hits.Store(10)
 	}
 	cache.hand = 0
 
@@ -496,7 +496,7 @@ func TestPageCacheSpanAwareReservationEvictsOneColdWindow(t *testing.T) {
 	}
 	for _, key := range hotKeys {
 		index, ok := cache.lookupLocked(cacheKeyHash(key), key)
-		if !ok || cache.frames[index].state != pageCacheReady {
+		if !ok || cache.frames[index].state.Load() != pageCacheReady {
 			t.Fatalf("hot single-frame extent %+v was evicted", key)
 		}
 	}
@@ -540,14 +540,14 @@ func TestPageCacheExactSpanEvictionSlidesWithinZone(t *testing.T) {
 		frame := &cache.frames[index]
 		frame.lock.Lock()
 		cache.beginExtentLocked(index, span, key, cacheKeyHash(key))
-		frame.state = pageCacheReady
+		frame.state.Store(pageCacheReady)
 		frame.lock.Unlock()
 	}
 	if starts != [len(spans)]int{0, 3, 8, 11} {
 		t.Fatalf("initial exact placement = %v, want [0 3 8 11]", starts)
 	}
-	cache.frames[starts[3]].referenced = true
-	cache.frames[starts[3]].hits = 100
+	cache.frames[starts[3]].referenced.Store(true)
+	cache.frames[starts[3]].hits.Store(100)
 	cache.hand = 0
 
 	before := cache.evictions
@@ -563,7 +563,7 @@ func TestPageCacheExactSpanEvictionSlidesWithinZone(t *testing.T) {
 	}
 	for _, keyIndex := range []int{0, 2, 3} {
 		if resident, ok := cache.lookupLocked(cacheKeyHash(keys[keyIndex]), keys[keyIndex]); !ok ||
-			cache.frames[resident].state != pageCacheReady {
+			cache.frames[resident].state.Load() != pageCacheReady {
 			t.Fatalf("extent %d was unexpectedly evicted", keyIndex)
 		}
 	}
@@ -622,7 +622,7 @@ func TestPageCacheSegregatedZonesRecycleLargeChurnWithoutEviction(t *testing.T) 
 		frame := &cache.frames[index]
 		frame.lock.Lock()
 		cache.beginExtentLocked(index, span, key, cacheKeyHash(key))
-		frame.state = pageCacheReady
+		frame.state.Store(pageCacheReady)
 		frame.lock.Unlock()
 		cache.mu.Unlock()
 		return admittedExtent{ref: ref, index: index}
@@ -732,7 +732,7 @@ func TestPageCacheSegregatedZonesRecycleLargeChurnWithoutEviction(t *testing.T) 
 			t.Fatal(validateErr)
 		}
 		index, ok := cache.lookupLocked(cacheKeyHash(key), key)
-		if !ok || cache.frames[index].state != pageCacheReady {
+		if !ok || cache.frames[index].state.Load() != pageCacheReady {
 			t.Fatalf("long-lived single-frame extent %+v was evicted", extent.ref)
 		}
 	}
@@ -785,7 +785,7 @@ func TestPageCacheFiveFrameResidencyHasNoReservationSlackOrChurnEvictions(t *tes
 		frame := &cache.frames[index]
 		frame.lock.Lock()
 		cache.beginExtentLocked(index, span, key, cacheKeyHash(key))
-		frame.state = pageCacheReady
+		frame.state.Store(pageCacheReady)
 		frame.lock.Unlock()
 		cache.mu.Unlock()
 		return ref
@@ -991,7 +991,7 @@ func TestPageCacheNonPowerOfTwoDocumentExtentDemandAndEviction(t *testing.T) {
 			cache.mu.Lock()
 			for i := range cache.frames {
 				frame := &cache.frames[i]
-				if frame.state == pageCacheReady {
+				if frame.state.Load() == pageCacheReady {
 					ready++
 					if int(frame.reservationSpan) != test.logicalPages ||
 						frame.key.length != length {
@@ -1319,8 +1319,13 @@ func TestPageCacheFrameControlIsPointerFree(t *testing.T) {
 	if !visit(frameType) {
 		t.Fatalf("pageCacheFrame contains GC-visible pointer-bearing state: %v", frameType)
 	}
-	if frameType.Size() > 64 {
-		t.Fatalf("pageCacheFrame is %d bytes, want at most one cache line", frameType.Size())
+	// Two lines: the lock-free pin discipline needs epoch plus a full-key
+	// shadow (40 bytes) that no single-line layout can absorb beside the
+	// 32-byte key. The first line carries the entire fast path
+	// (epoch/pins/state/shadow/flags/hits/referenced); the key and
+	// lock-held fields live on the second line.
+	if frameType.Size() > 128 {
+		t.Fatalf("pageCacheFrame is %d bytes, want at most two cache lines", frameType.Size())
 	}
 	loadType := reflect.TypeFor[pageCacheRingLoad]()
 	if !visit(loadType) {
@@ -1842,7 +1847,7 @@ func TestPageCacheDoomedExtentReleasedOnLastUnpin(t *testing.T) {
 	if ok {
 		frame := &cache.frames[index]
 		frame.lock.Lock()
-		ok = frame.flags&pageCacheFrameDoomed != 0 && !frame.referenced
+		ok = frame.flags.Load()&pageCacheFrameDoomed != 0 && !frame.referenced.Load()
 		frame.lock.Unlock()
 	}
 	cache.mu.Unlock()
