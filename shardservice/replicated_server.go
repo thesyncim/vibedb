@@ -1321,6 +1321,20 @@ func RoundTripReplicated(
 	return roundTripReplicated(ctx, conn, request, &enc)
 }
 
+// RoundTripReplicated performs one exact request/response exchange using this
+// encoder's owned request arena. The encoder must be exclusively held for the
+// call; persistent authenticated streams keep one alongside their connection.
+func (f *FrameEncoder) RoundTripReplicated(
+	ctx context.Context,
+	conn net.Conn,
+	request *ReplicatedRequest,
+) (*ReplicatedResponse, error) {
+	if f == nil {
+		return nil, ErrReplicatedWire
+	}
+	return roundTripReplicated(ctx, conn, request, f)
+}
+
 // roundTripReplicated is RoundTripReplicated with an explicit encoder for the
 // request prefix. enc must be exclusively held for the call.
 func roundTripReplicated(

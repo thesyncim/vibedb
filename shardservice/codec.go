@@ -431,12 +431,13 @@ func (d *deccur) end() error {
 // megabytes per connection.
 const maxFrameArenaBytes = 64 << 10
 
-// FrameEncoder owns one reusable wire-frame arena for a connection. Every
-// encoder output flows straight into a single Write and is dead afterwards,
-// so the arena is simply resliced for the next message: steady-state encodes
-// allocate nothing, deterministically, with no pool to drain under GC
-// pressure. A FrameEncoder must serve one writer at a time; connections
-// already serialize their writes, so each conn holds one.
+// FrameEncoder owns one reusable wire-frame arena for a connection. Owned
+// frames and small borrowed frames flow through one Write; large borrowed
+// payloads retain the zero-copy scatter path. The arena is dead after each
+// write and is simply resliced for the next message, avoiding repeated arena
+// allocation for the owned and small-frame paths. A FrameEncoder must serve
+// one writer at a time; connections already serialize their writes, so each
+// conn holds one.
 //
 // Read buffers are deliberately NOT owned or reused: decoded parameters,
 // keys, and cells alias the frame body zero-copy, so a reused read arena
