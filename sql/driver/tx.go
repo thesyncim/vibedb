@@ -99,8 +99,14 @@ type txTable struct {
 // dirty set is every table with a non-empty overlay; COMMIT validates each
 // target and publishes through Collection.Update or UpdateCollections.
 type tx struct {
-	borrowedSnapshots    bool
-	conn                 *conn
+	borrowedSnapshots bool
+	conn              *conn
+	// shellsKept reports that this transaction's table shells were already
+	// retained by releaseSnapshots. Commit releases read leases before the
+	// write fence and finish releases again; without this guard every shell
+	// would be kept twice, and the next multi-table transaction would
+	// borrow the same shell for two tables, aliasing their leases.
+	shellsKept           bool
 	tables               map[string]*txTable
 	views                map[string]*viewMeta
 	layoutEpoch          *catalogLayoutEpoch
@@ -153,12 +159,14 @@ func (c *conn) beginTx(
 		}
 		return transaction, nil
 	}
-	if names, ok := pinnedReadTables(scope, transaction.layoutEpoch); ok {
+	if names, ok := pinnedReadTables(c.pinnedNames[:0], scope, transaction.layoutEpoch); ok {
 		// A single-statement read pin leases only its executable closure:
 		// the driving collection plus the physical dependencies the join
 		// executor trusts. Read-only closures stage no pending mutations.
 		// Each table reuses the connection's retained shell when one is
-		// available instead of allocating.
+		// available instead of allocating. The closure scratch is consumed
+		// synchronously below and dead before the next begin.
+		c.pinnedNames = names[:0]
 		transaction.tables = make(map[string]*txTable, len(names))
 		for _, name := range names {
 			if err := transaction.materializeTable(
@@ -237,16 +245,26 @@ func (transaction *tx) materializeTable(
 
 // pinnedReadTables resolves one prepared statement's executable closure —
 // its driving collection plus the physical dependencies the join executor
-// trusts — against the pinned layout epoch. It reports false when there is
-// no statement to scope to, or when a closure name is already gone from the
-// epoch; the caller then falls back to full materialization, preserving
-// legacy behavior across a concurrent DDL publish.
-func pinnedReadTables(scope *stmt, epoch *catalogLayoutEpoch) ([]string, bool) {
+// trusts — against the pinned layout epoch, appending deduped names to buf.
+// It reports false when there is no statement to scope to, or when a closure
+// name is already gone from the epoch; the caller then falls back to full
+// materialization, preserving legacy behavior across a concurrent DDL
+// publish. Closures are tiny, so dedup is a linear scan and callers pass a
+// reused buffer: scope resolution allocates nothing on the hottest begin
+// path.
+func pinnedReadTables(buf []string, scope *stmt, epoch *catalogLayoutEpoch) ([]string, bool) {
+	names := buf
 	if scope == nil || scope.query == nil || epoch == nil {
-		return nil, false
+		return names, false
 	}
-	var names []string
-	seen := make(map[string]struct{}, len(scope.dependencies)+1)
+	contains := func(name string) bool {
+		for _, existing := range names {
+			if existing == name {
+				return true
+			}
+		}
+		return false
+	}
 	add := func(name string) bool {
 		if name == "" {
 			return true
@@ -254,18 +272,17 @@ func pinnedReadTables(scope *stmt, epoch *catalogLayoutEpoch) ([]string, bool) {
 		if _, ok := epoch.tables[name]; !ok {
 			return false
 		}
-		if _, dup := seen[name]; !dup {
-			seen[name] = struct{}{}
+		if !contains(name) {
 			names = append(names, name)
 		}
 		return true
 	}
 	if !add(scope.query.Collection()) {
-		return nil, false
+		return names, false
 	}
 	for i := range scope.dependencies {
 		if !add(scope.dependencies[i].name) {
-			return nil, false
+			return names, false
 		}
 	}
 	return names, true
@@ -2706,6 +2723,10 @@ func (c *conn) keepTable(spare *txTable) {
 }
 
 func (t *tx) releaseSnapshots() {
+	if t.shellsKept {
+		return
+	}
+	t.shellsKept = true
 	for _, table := range t.tables {
 		// Leases are closed but their objects stay attached to the shell:
 		// the next transaction rebinds them with SnapshotInto. Shells from
