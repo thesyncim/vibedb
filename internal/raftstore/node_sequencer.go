@@ -1065,6 +1065,34 @@ func submissionGroupSeen(items *[MaxPersistGroupBatches]*Submission, count int, 
 	return false
 }
 
+// submissionHintCandidate identifies the syntactic shape of the volatile
+// commit-only path. NodeStore still performs the authoritative term/vote,
+// cursor, span, namespace, and poisoned-engine checks under its mutex. The
+// sequencer uses this conservative shape only to keep an unrelated durable
+// Ready from holding a completion that can otherwise be published in memory.
+// Keeping the classification at a FIFO boundary preserves ticket order and
+// lets all required Readies after the boundary retain their normal batching.
+func submissionHintCandidate(s *Submission) bool {
+	if s == nil || s.kind != submissionReady {
+		return false
+	}
+	ready := s.nodeReady()
+	seriesCount := nodeReadySeriesCount(ready)
+	if seriesCount < 1 || seriesCount > MaxReadySeries {
+		// TrySubmit normally rejects this shape. Keep the scheduler classifier
+		// defensive if caller-owned memory is mutated after acceptance so a
+		// malformed value cannot make the ring worker index past the fixed array.
+		return false
+	}
+	for index := 0; index < seriesCount; index++ {
+		batch := nodeReadySeriesBatch(&ready, index)
+		if batch.MustSync || len(batch.Entries) != 0 || !canonicalEmptySnapshot(batch.Snapshot) {
+			return false
+		}
+	}
+	return true
+}
+
 func (q *NodeSubmissionSequencer) complete(s *Submission, err error) {
 	wake := s.wake.Load()
 	s.err = err
@@ -1242,6 +1270,8 @@ func (q *NodeSubmissionSequencer) run() {
 				continue
 			}
 			if !ok || count > 0 && (items[0].kind != submissionReady || s.kind != submissionReady) ||
+				count > 0 && items[0].kind == submissionReady &&
+					submissionHintCandidate(items[0]) && !submissionHintCandidate(s) ||
 				s.kind == submissionReady && submissionGroupSeen(&items, count, s.nodeReadyGroup()) {
 				break
 			}
