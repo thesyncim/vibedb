@@ -3,6 +3,7 @@ package raftmember
 import (
 	"bytes"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -286,14 +287,115 @@ func TestPipelinedRuntimeWALPressureCompactsBeforePeriodicMaintenance(t *testing
 	key, document := generationDriverMutation(t, 2)
 	command = testApplyCommand(fixture.base, completion.ClientEpoch, 2, key, document)
 	overlapping = command
+	normalWake := func() {
+		select {
+		case wake <- struct{}{}:
+		default:
+		}
+	}
+	attempts := 0
 	for index := range 50 {
+		attempts = index + 1
+		if !owner.pipelined.quiescent() {
+			t.Fatalf("pressure attempt %d started with pending owner work: %+v", index, owner.pipelined)
+		}
+		completionPublished := make(chan struct{}, 1)
+		releaseCompletion := make(chan struct{})
+		var releaseOnce sync.Once
+		releaseHeld := func() { releaseOnce.Do(func() { close(releaseCompletion) }) }
+		t.Cleanup(releaseHeld)
+		// The worker publishes the exact append result before invoking this
+		// callback. Holding the callback lets the owner retain that result while
+		// the WAL's current image is already at its bounded record limit.
+		owner.SetPipelinedWake(func() {
+			completionPublished <- struct{}{}
+			<-releaseCompletion
+			normalWake()
+		})
+		beforeOutstanding := owner.pipelined.appendOutstanding
 		if err := owner.Propose(command); err != nil {
 			t.Fatalf("proposal %d: %v", index, err)
 		}
+		var workspace ReadyWorkspace
+		deadline := time.NewTimer(5 * time.Second)
+		for owner.pipelined.appendOutstanding == beforeOutstanding {
+			result, err := owner.DriveReady(&workspace, func(OutboundMessage) error { return nil }, settleTestApplied)
+			if err != nil {
+				deadline.Stop()
+				t.Fatalf("capture pressure proposal %d: %v", index, err)
+			}
+			if result.Progressed() {
+				continue
+			}
+			select {
+			case <-wake:
+			case <-deadline.C:
+				t.Fatal("pressure proposal capture stalled")
+			}
+		}
+		select {
+		case <-completionPublished:
+		case <-deadline.C:
+			deadline.Stop()
+			t.Fatal("pressure append completion was not published")
+		}
+		deadline.Stop()
+		held, ok := owner.pipelined.appendDone.pop()
+		if !ok || held.err != nil || held.count != 1 || len(held.works[0].batch.Entries) == 0 {
+			t.Fatalf("held append result=%+v ok=%v work=%+v", held, ok, owner.pipelined)
+		}
+		if owner.pipelined.appendWork.len() != 0 || owner.pipelined.appendOutstanding != 1 {
+			t.Fatalf("held append left producer work: %+v", owner.pipelined)
+		}
+		if err := fixture.wal.ReserveReady(); errors.Is(err, raftstore.ErrFull) {
+			t.Logf("held required append at full WAL boundary: attempt=%d ready=%d", index, held.works[0].batch.ReadyID)
+			// Queue a real Ready before checking the full admission result. The
+			// held append is required, so DriveReady must refuse this uncaptured
+			// Ready without consuming or reordering its completion.
+			if err := owner.Propose(command); err != nil {
+				t.Fatalf("queue pressure overlap: %v", err)
+			}
+			ready, readyErr := owner.node.HasReady()
+			if readyErr != nil || !ready {
+				t.Fatalf("queued pressure Ready: ready=%v err=%v", ready, readyErr)
+			}
+			owner.pipelined.admission = 0
+			result, driveErr := owner.DriveReady(&workspace, func(OutboundMessage) error { return nil }, settleTestApplied)
+			if !errors.Is(driveErr, raftstore.ErrFull) || owner.pipelined.quiescent() {
+				t.Fatalf("held full admission result=%+v err=%v state=%+v", result, driveErr, owner.pipelined)
+			}
+			if err := owner.Propose(overlapping); err != nil {
+				t.Fatalf("overlapping proposal: %v", err)
+			}
+			if owner.Failure() != nil {
+				t.Fatal("overlapping proposal failed runtime")
+			}
+			injected = true
+			if !owner.pipelined.appendDone.push(held) {
+				t.Fatal("restoring held append completion")
+			}
+			releaseHeld()
+			owner.SetPipelinedWake(normalWake)
+			drain()
+			break
+		} else if err != nil {
+			t.Fatalf("pressure WAL admission %d: %v", index, err)
+		}
+		if !owner.pipelined.appendDone.push(held) {
+			t.Fatal("restoring non-full append completion")
+		}
+		releaseHeld()
+		owner.SetPipelinedWake(normalWake)
 		drain()
 	}
 	if !injected {
 		t.Fatal("did not exercise overlapping WAL pressure")
+	}
+	for index := attempts; index < 50; index++ {
+		if err := owner.Propose(command); err != nil {
+			t.Fatalf("post-pressure proposal %d: %v", index, err)
+		}
+		drain()
 	}
 	info, err := fixture.wal.GenerationInfo()
 	if err != nil || info.Generation < 2 {

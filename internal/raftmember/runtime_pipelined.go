@@ -304,19 +304,24 @@ type pipelinedRuntime struct {
 	appendRetryReadyID uint64
 	appendReadyID      uint64
 	appendProcessedID  uint64
-	applyCurrent       pipelinedApplyTask
-	applyResponseIndex int
-	applyFinished      bool
-	applyReadyID       uint64
-	admission          int
-	appendTerm         uint64
-	appendVote         uint64
-	appendCommit       uint64
-	durableTerm        uint64
-	durableVote        uint64
-	nodeSubmission     bool
-	nodeWorks          [raftstore.MaxPersistGroupBatches]pipelinedAppendWork
-	nodeWorkCount      uint8
+	// lastRequiredAppendReadyID is the latest append whose entries, term/vote,
+	// snapshot, or response work must complete before a dependent apply. A
+	// response-free metadata append still persists through the same FIFO lane,
+	// but does not raise this apply watermark after earlier required appends.
+	lastRequiredAppendReadyID uint64
+	applyCurrent              pipelinedApplyTask
+	applyResponseIndex        int
+	applyFinished             bool
+	applyReadyID              uint64
+	admission                 int
+	appendTerm                uint64
+	appendVote                uint64
+	appendCommit              uint64
+	durableTerm               uint64
+	durableVote               uint64
+	nodeSubmission            bool
+	nodeWorks                 [raftstore.MaxPersistGroupBatches]pipelinedAppendWork
+	nodeWorkCount             uint8
 }
 
 func newPipelinedRuntime(runtime *Runtime) (*pipelinedRuntime, error) {
@@ -506,6 +511,7 @@ func (p *pipelinedRuntime) enqueueAppend(message *pb.Message) error {
 	if p.appendReadyID == math.MaxUint64 {
 		return p.runtime.fail(errors.New("raftmember: pipelined append Ready ID exhausted"))
 	}
+	priorTerm, priorVote, priorCommit := p.appendTerm, p.appendVote, p.appendCommit
 	p.appendReadyID++
 	var hard *pb.HardState
 	mustSync := len(message.GetEntries()) != 0
@@ -513,6 +519,14 @@ func (p *pipelinedRuntime) enqueueAppend(message *pb.Message) error {
 		hard = &pb.HardState{Term: message.Term, Vote: message.Vote, Commit: message.Commit}
 		mustSync = mustSync || message.GetTerm() != p.appendTerm || message.GetVote() != p.appendVote
 		p.appendTerm, p.appendVote, p.appendCommit = message.GetTerm(), message.GetVote(), message.GetCommit()
+	}
+	metadataOnly := message.Term != nil && message.Vote != nil && message.Commit != nil &&
+		len(message.GetEntries()) == 0 && message.GetSnapshot() == nil &&
+		len(message.GetResponses()) == 0 && !mustSync &&
+		message.GetTerm() == priorTerm && message.GetVote() == priorVote &&
+		message.GetCommit() >= priorCommit
+	if !metadataOnly {
+		p.lastRequiredAppendReadyID = p.appendReadyID
 	}
 	earlyResponses := 0
 	for _, response := range message.GetResponses() {
@@ -912,7 +926,7 @@ driveDirect:
 			}
 		case pb.MsgStorageApply:
 			if !p.applyQueue.push(pipelinedApplyTask{
-				message: message, requiredAppendReadyID: p.appendReadyID,
+				message: message, requiredAppendReadyID: p.lastRequiredAppendReadyID,
 			}) {
 				return DriveResult{}, runtime.fail(errors.New("raftmember: pipelined apply ring overflow"))
 			}
