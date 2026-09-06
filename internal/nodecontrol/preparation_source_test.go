@@ -7,6 +7,7 @@ import (
 	"errors"
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibejson"
 	"net"
 	"testing"
@@ -104,6 +105,22 @@ func TestPreparationSourceClientRejectsReplySubstitution(t *testing.T) {
 	domain := rafttransport.TrustDomain{ClusterID: intent.Group.ClusterID, ClusterIncarnation: intent.Group.ClusterIncarnation}
 	spec := PreparationSpec{Kind: PreparationSpecKind, Group: intent.Group, Distribution: intent.Distribution, Shard: intent.Shard, AllocationGeneration: intent.AllocationGeneration, ReplicaOrdinal: intent.ReplicaOrdinal, SourceCommand: intent.ExpectedCommand, LogicalSchemaDigest: intent.ExpectedCommand.RelationManifestDigest, InitialVoters: [3]PreparationMember{{MemberID: 1, Node: intent.Source.Node, PeerEndpoint: intent.Source.Endpoint, PeerAddress: "127.0.0.1:1001"}, {MemberID: 2, Node: rafttransport.NodeID{7}, PeerEndpoint: "peer2", PeerAddress: "127.0.0.1:1002"}, {MemberID: 3, Node: rafttransport.NodeID{8}, PeerEndpoint: "peer3", PeerAddress: "127.0.0.1:1003"}}, Target: PreparationMember{MemberID: intent.Target.Member, Node: intent.Target.Node, PeerEndpoint: intent.Target.Endpoint, NativeEndpoint: intent.Target.NativeEndpoint, ControlEndpoint: intent.Target.ControlEndpoint, PeerAddress: "127.0.0.1:1004", NativeAddress: "127.0.0.1:2004", ControlAddress: "127.0.0.1:3004"}, TargetNodeIncarnation: intent.Target.NodeIncarnation, TargetStoreID: intent.Target.StoreID, Table: "orders", CreateTable: "CREATE TABLE orders (id TEXT PRIMARY KEY)", Apply: PreparationApplyProfile{MaxSessions: 16, RetryWindow: 8, MaxCollections: 1, MaxDocuments: 1, MaxBytes: 1024, ShardKey: "id"}, Log: PreparationLogProfile{MaxFileBytes: 4096, MaxRecordBytes: 1024, MaxRecords: 4, MaxEntries: 4, MaxLiveBytes: 4096}}
 
+	exported, exportErr := ExportPreparationSpec(PreparationExportInput{Intent: intent, InitialVoters: spec.InitialVoters, Target: spec.Target, Log: spec.Log, Table: spec.Table, CreateTable: spec.CreateTable, Apply: spec.Apply, SourceBootstrap: []byte("source-certified-bootstrap")})
+	if exportErr != nil {
+		t.Fatalf("export bootstrap: %v", exportErr)
+	}
+	canonical, canonicalErr := vibejson.AppendCanonicalize(nil, exported.Bytes)
+	if canonicalErr != nil || !bytes.Equal(canonical, exported.Bytes) {
+		t.Fatalf("export is not canonical JSON: %v", canonicalErr)
+	}
+	if exported.Spec.SourceBootstrapDigest == (replication.Digest{}) {
+		t.Fatal("source bootstrap digest omitted")
+	}
+	corrupted := exported.Spec
+	corrupted.SourceBootstrap = []byte("substituted-bootstrap")
+	if err := corrupted.ValidateShape(); !errors.Is(err, ErrControl) {
+		t.Fatalf("bootstrap substitution: %v", err)
+	}
 	if err := spec.ValidateAgainst(intent); err != nil {
 		t.Fatalf("distinct endpoint identities and addresses: %v", err)
 	}
@@ -189,5 +206,20 @@ func TestPreparationSourceErrorRepliesAreBoundedAndExplicit(t *testing.T) {
 	binary.BigEndian.PutUint32(raw[24:28], maxPreparationSourceErrorBytes+1)
 	if _, _, err := readPreparationSourceFrame(bytes.NewReader(raw), preparationSourceReplyMagic, MaxPayloadBytes); !errors.Is(err, ErrBound) {
 		t.Fatalf("error body allocated before bound: %v", err)
+	}
+}
+
+func TestNodeControlErrorResponsePreservesBoundedDiagnostics(t *testing.T) {
+	var wire bytes.Buffer
+	if err := writeResponseError(&wire, errors.New("preparation failed\ninvalid schema")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadResponse(bytes.NewReader(wire.Bytes())); !errors.Is(err, ErrControl) || err.Error() != "nodecontrol: invalid control request: remote node: preparation failed invalid schema" {
+		t.Fatalf("error reply: %v", err)
+	}
+	header := bytes.Clone(wire.Bytes()[:responseHeaderBytes])
+	binary.BigEndian.PutUint32(header[116:120], maxPreparationSourceErrorBytes+1)
+	if _, err := ReadResponse(bytes.NewReader(header)); !errors.Is(err, ErrBound) {
+		t.Fatalf("oversized error: %v", err)
 	}
 }

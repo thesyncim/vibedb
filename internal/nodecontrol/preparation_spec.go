@@ -192,7 +192,7 @@ func AppendPreparationSpec(dst []byte, spec PreparationSpec) ([]byte, error) {
 	if err != nil {
 		return dst, errors.Join(ErrControl, err)
 	}
-	return append(dst, raw...), nil
+	return vibejson.AppendCanonicalize(dst, raw)
 }
 
 // OpenPreparationSpec accepts only one canonical bounded document.

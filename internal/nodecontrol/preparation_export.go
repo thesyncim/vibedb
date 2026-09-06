@@ -78,6 +78,9 @@ func ExportPreparationSpec(input PreparationExportInput) (PreparationPayload, er
 		Apply:                 input.Apply,
 		SourceBootstrap:       append([]byte(nil), input.SourceBootstrap...),
 	}
+	if len(spec.SourceBootstrap) != 0 {
+		spec.SourceBootstrapDigest = sha256.Sum256(spec.SourceBootstrap)
+	}
 	// The intent is the authority for target identity. Keep the explicit input
 	// useful for its endpoint addresses, but reject any attempted identity
 	// substitution before bytes are committed.

@@ -20,6 +20,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -65,8 +66,9 @@ const (
 )
 
 var (
-	requestMagic  = [8]byte{'V', 'D', 'N', 'C', 'T', 'R', 'L', 0}
-	responseMagic = [8]byte{'V', 'D', 'N', 'C', 'R', 'E', 'S', 0}
+	requestMagic       = [8]byte{'V', 'D', 'N', 'C', 'T', 'R', 'L', 0}
+	responseErrorMagic = [8]byte{'V', 'D', 'N', 'C', 'E', 'R', 'R', 0}
+	responseMagic      = [8]byte{'V', 'D', 'N', 'C', 'R', 'E', 'S', 0}
 )
 
 // Phase identifies the side effect requested from a physical node.
@@ -373,7 +375,10 @@ func (service *Service) Serve(ctx context.Context, connection rafttransport.Peer
 	}
 	record, err := service.executeHeld(ctx, request)
 	if err != nil {
-		return err
+		if deadlineErr := connection.SetWriteDeadline(nodeInfoBoundedDeadline(ctx, service.writeDeadline())); deadlineErr != nil {
+			return errors.Join(err, deadlineErr)
+		}
+		return errors.Join(err, writeResponseError(connection, err))
 	}
 	if deadline := service.writeDeadline(); deadline.IsZero() {
 		return ErrControl
@@ -844,6 +849,17 @@ func ReadResponse(reader io.Reader) (Record, error) {
 	if _, err := io.ReadFull(reader, header[:]); err != nil {
 		return Record{}, err
 	}
+	if bytes.Equal(header[:8], responseErrorMagic[:]) {
+		size := int(binary.BigEndian.Uint32(header[116:120]))
+		if header[8] != responseVersion || !allZero(header[9:116]) || !allZero(header[120:]) || size == 0 || size > maxPreparationSourceErrorBytes {
+			return Record{}, ErrBound
+		}
+		detail := make([]byte, size)
+		if _, err := io.ReadFull(reader, detail); err != nil {
+			return Record{}, err
+		}
+		return Record{}, fmt.Errorf("%w: remote node: %s", ErrControl, detail)
+	}
 	proofBytes := int(binary.BigEndian.Uint32(header[116:120]))
 	if proofBytes == 0 || proofBytes > MaxProofBytes {
 		return Record{}, ErrControl
@@ -1208,4 +1224,24 @@ func proofMatchesRequest(proof gateway.PreparedReplicaProof, request Request) bo
 	return proof.Valid() && proof.IntentID == request.IntentID && proof.Group == request.Group &&
 		proof.TargetMember == request.TargetMember && proof.TargetNode == request.TargetNode &&
 		proof.TargetNodeIncarnation == request.TargetNodeIncarnation && proof.TargetStoreID == request.TargetStoreID
+}
+
+// Error replies are diagnostic only: callers retain the unknown-outcome fence
+// and must retry the durable intent before inferring whether a write occurred.
+func writeResponseError(writer io.Writer, failure error) error {
+	detail := strings.NewReplacer("\x00", "", "\r", " ", "\n", " ").Replace(failure.Error())
+	if len(detail) > maxPreparationSourceErrorBytes {
+		detail = detail[:maxPreparationSourceErrorBytes]
+	}
+	if detail == "" {
+		detail = ErrControl.Error()
+	}
+	var header [responseHeaderBytes]byte
+	copy(header[:8], responseErrorMagic[:])
+	header[8] = responseVersion
+	binary.BigEndian.PutUint32(header[116:120], uint32(len(detail)))
+	if err := writeFull(writer, header[:]); err != nil {
+		return err
+	}
+	return writeFull(writer, []byte(detail))
 }
