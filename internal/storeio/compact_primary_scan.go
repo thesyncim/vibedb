@@ -311,6 +311,17 @@ func (d *CompactPrimaryScanDecoder) appendValue(
 		end := meta.ends[holes]
 		return append(dst, meta.static[previous:end]...), true
 	}
+	return d.appendRankAffineValue(dst, meta, row, ordinal)
+}
+
+// Keep the rank-aware renderer out of the legacy scan loop's frame and
+// instruction footprint. Most leaves need only the original stream codecs.
+func (d *CompactPrimaryScanDecoder) appendRankAffineValue(
+	dst []byte, meta *compactPrimaryScanShape, row, ordinal int,
+) ([]byte, bool) {
+	start := len(dst)
+	holes := int(meta.holes)
+
 	previous := uint32(0)
 	for hole := 0; hole < holes; hole++ {
 		end := meta.ends[hole]
