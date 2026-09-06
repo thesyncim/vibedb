@@ -8,6 +8,7 @@ import (
 	"errors"
 	"slices"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/membershipgrant"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
@@ -1878,7 +1879,7 @@ func enrollmentReplicaMatchesCatalog(identity ReplicaIdentity, replica Replicate
 // exact target outside the serving RF3.  Rebuilding through the persisted
 // catalog image retains tables, schemas, request-ledger topology, and lineage
 // metadata instead of silently dropping unrelated control-plane state.
-func enrollmentCatalogWithTarget(current *Snapshot, intent GroupEnrollmentIntent) (*Snapshot, int, error) {
+func enrollmentCatalogWithTarget(current *Snapshot, intent GroupEnrollmentIntent, node NodeRecord) (*Snapshot, int, error) {
 	if current == nil || !intent.Valid() || current.Generation() == ^uint64(0) {
 		return nil, -1, ErrReplicatedCatalogConflict
 	}
@@ -1917,8 +1918,25 @@ func enrollmentCatalogWithTarget(current *Snapshot, intent GroupEnrollmentIntent
 		Endpoint: intent.Target.Endpoint, NativeEndpoint: intent.Target.NativeEndpoint,
 		ControlEndpoint: intent.Target.ControlEndpoint}
 	nextDescriptors[matched].EnrolledTarget = &target
+	if node.NodeID != intent.Target.Node || node.Incarnation != intent.Target.NodeIncarnation ||
+		node.DataEndpoint != intent.Target.Endpoint || node.NativeEndpoint != intent.Target.NativeEndpoint ||
+		node.ControlEndpoint != intent.Target.ControlEndpoint {
+		return nil, -1, ErrScalingIdentity
+	}
+	endpoints := cloneEndpoints(current.endpoints)
+	for _, binding := range []struct {
+		id      distribution.EndpointID
+		address string
+	}{
+		{node.DataEndpoint, node.DataAddress}, {node.NativeEndpoint, node.NativeAddress}, {node.ControlEndpoint, node.ControlAddress},
+	} {
+		if prior, exists := endpoints[binding.id]; exists && prior != binding.address {
+			return nil, -1, ErrReplicatedCatalogConflict
+		}
+		endpoints[binding.id] = binding.address
+	}
 	next, err := NewSnapshotWithReplicatedTableMetadata(
-		current.config, current.endpoints, current.Generation()+1,
+		current.config, endpoints, current.Generation()+1,
 		current.indexDescriptors(), current.statistics.Descriptors(), nextDescriptors,
 		current.replicatedTableProfiles(), current.ReplicatedTableDeclarations(),
 	)
@@ -2016,7 +2034,16 @@ func (authority *ReplicatedCatalogAuthority) PublishEnrollmentReceipt(ctx contex
 		intent.ExpectedCatalogHeadDigest == (replication.Digest{}) {
 		return GroupEnrollmentIntent{}, ErrReplicatedCatalogConflict
 	}
-	certified, shardIndex, err := enrollmentCatalogWithTarget(cut.snapshot, intent)
+	targetKey := scalingNodeKey(intent.Target.Node, intent.Target.NodeIncarnation)
+	targetResult, err := authority.readRaw(ctx, targetKey, maxScalingNodeRecordBytes)
+	if err != nil || !targetResult.Found {
+		return GroupEnrollmentIntent{}, errors.Join(err, ErrScalingIdentity)
+	}
+	target, err := openScalingNodeRecord(targetResult.Value, intent.Target.Node, intent.Target.NodeIncarnation)
+	if err != nil || (target.Lifecycle != NodeActive && target.Lifecycle != NodeDraining) {
+		return GroupEnrollmentIntent{}, errors.Join(err, ErrScalingIdentity)
+	}
+	certified, shardIndex, err := enrollmentCatalogWithTarget(cut.snapshot, intent, target)
 	if err != nil {
 		return GroupEnrollmentIntent{}, err
 	}
@@ -2082,15 +2109,6 @@ func (authority *ReplicatedCatalogAuthority) PublishEnrollmentReceipt(ctx contex
 	directoryBytes, err := appendScalingIDDirectory(nil, enrollmentDirectoryDocumentID[:], entries, maxEnrollmentDirectoryBytes)
 	if err != nil {
 		return GroupEnrollmentIntent{}, err
-	}
-	targetKey := scalingNodeKey(intent.Target.Node, intent.Target.NodeIncarnation)
-	targetResult, err := authority.readRaw(ctx, targetKey, maxScalingNodeRecordBytes)
-	if err != nil || !targetResult.Found {
-		return GroupEnrollmentIntent{}, errors.Join(err, ErrScalingIdentity)
-	}
-	target, err := openScalingNodeRecord(targetResult.Value, intent.Target.Node, intent.Target.NodeIncarnation)
-	if err != nil || (target.Lifecycle != NodeActive && target.Lifecycle != NodeDraining) {
-		return GroupEnrollmentIntent{}, errors.Join(err, ErrScalingIdentity)
 	}
 	headDigest := sha256.Sum256(cut.head)
 	witnessDigest := sha256.Sum256(cut.witness)

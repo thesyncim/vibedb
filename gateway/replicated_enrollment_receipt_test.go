@@ -27,6 +27,8 @@ func TestPublishEnrollmentReceiptUsesAnExactPreparedRowAndAllowsUnrelatedHead(t 
 		Endpoint: "ep-b", NativeEndpoint: "ep-b-native", ControlEndpoint: "ep-b-control",
 	}
 	targetNode := scalingTestNodeRecord(target.Node, target.NodeIncarnation, NodeJoining, 1)
+	targetNode.DataEndpoint, targetNode.NativeEndpoint, targetNode.ControlEndpoint = target.Endpoint, target.NativeEndpoint, target.ControlEndpoint
+	targetNode.DataAddress, targetNode.NativeAddress, targetNode.ControlAddress = current.endpoints[target.Endpoint], current.endpoints[target.NativeEndpoint], current.endpoints[target.ControlEndpoint]
 	if err := authority.PutNode(ctx, targetNode, 0); err != nil {
 		t.Fatal(err)
 	}

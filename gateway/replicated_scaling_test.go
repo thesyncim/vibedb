@@ -562,9 +562,9 @@ func TestReplicatedScalingPublishEnrollmentReceiptPersistsCatalogCut(t *testing.
 	ctx := context.Background()
 	authority, client, current := newCatalogAuthorityFixture(t)
 	target := scalingTestNodeRecord([16]byte{0x72}, 1, NodeJoining, 1)
-	target.DataEndpoint = "ep-b"
-	target.NativeEndpoint = "ep-b-native"
-	target.ControlEndpoint = "ep-b-control"
+	target.DataEndpoint = "enrolled-new-node"
+	target.NativeEndpoint = "enrolled-new-node-native"
+	target.ControlEndpoint = "enrolled-new-node-control"
 	if err := authority.PutNode(ctx, target, 0); err != nil {
 		t.Fatal(err)
 	}
@@ -594,7 +594,7 @@ func TestReplicatedScalingPublishEnrollmentReceiptPersistsCatalogCut(t *testing.
 			NativeEndpoint: sourceDescriptor.NativeEndpoint, ControlEndpoint: sourceDescriptor.ControlEndpoint,
 		},
 		SnapshotSourceMember:     sourceDescriptor.Member,
-		Target:                   ReplicaIdentity{Member: 4, Node: target.NodeID, StoreID: [16]byte{14}, NodeIncarnation: 1, Endpoint: "ep-b", NativeEndpoint: "ep-b-native", ControlEndpoint: "ep-b-control"},
+		Target:                   ReplicaIdentity{Member: 4, Node: target.NodeID, StoreID: [16]byte{14}, NodeIncarnation: 1, Endpoint: "enrolled-new-node", NativeEndpoint: "enrolled-new-node-native", ControlEndpoint: "enrolled-new-node-control"},
 		ExpectedRosterDigest:     replication.Digest(replicatedCatalogInitialRosterDigest(current, 0)),
 		ExpectedDescriptorDigest: replication.Digest(replicatedCatalogInitialDescriptorDigest(current, 0)),
 		ExpectedManifestDigest:   replication.Digest{0xc3},
@@ -644,6 +644,20 @@ func TestReplicatedScalingPublishEnrollmentReceiptPersistsCatalogCut(t *testing.
 	}
 	if published.Generation() != current.Generation()+1 {
 		t.Fatalf("published catalog generation=%d", published.Generation())
+	}
+	if published.endpoints[target.DataEndpoint] != target.DataAddress ||
+		published.endpoints[target.NativeEndpoint] != target.NativeAddress ||
+		published.endpoints[target.ControlEndpoint] != target.ControlAddress {
+		t.Fatal("enrollment publication omitted committed node addresses")
+	}
+	if _, exists := current.endpoints[target.DataEndpoint]; exists {
+		t.Fatal("publication mutated prior catalog")
+	}
+	conflicting := *current
+	conflicting.endpoints = cloneEndpoints(current.endpoints)
+	conflicting.endpoints[target.DataEndpoint] = "conflicting.example:1"
+	if _, _, err := enrollmentCatalogWithTarget(&conflicting, prepared, active); !errors.Is(err, ErrReplicatedCatalogConflict) {
+		t.Fatalf("conflicting endpoint accepted: %v", err)
 	}
 	publishedDescriptor := published.ReplicatedShardDescriptors()[0]
 	if publishedDescriptor.EnrolledTarget == nil ||
