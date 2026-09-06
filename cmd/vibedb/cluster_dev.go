@@ -1887,18 +1887,45 @@ func waitDevReady(ctx context.Context, child *devChild) error {
 	}
 }
 func stopDevChildren(children []*devChild) {
+	stopDevChildrenWithin(children, 10*time.Second)
+}
+
+// All children share one shutdown deadline. Waiting a fresh grace period per
+// child can outlive the supervisor's own stop budget and leave writers orphaned.
+func stopDevChildrenWithin(children []*devChild, grace time.Duration) {
+	live := make([]*devChild, 0, len(children))
 	for i := len(children) - 1; i >= 0; i-- {
-		if children[i] != nil && children[i].command.Process != nil {
-			_ = children[i].command.Process.Signal(syscall.SIGTERM)
+		child := children[i]
+		if child == nil || child.command == nil || child.command.Process == nil {
+			continue
 		}
+		live = append(live, child)
+		_ = child.command.Process.Signal(syscall.SIGTERM)
 	}
-	for i := len(children) - 1; i >= 0; i-- {
-		select {
-		case <-children[i].done:
-		case <-time.After(10 * time.Second):
-			_ = children[i].command.Process.Kill()
-			<-children[i].done
+	if len(live) == 0 {
+		return
+	}
+	done := make(chan struct{})
+	go func() {
+		for _, child := range live {
+			<-child.done
 		}
+		close(done)
+	}()
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return
+	case <-timer.C:
+		for _, child := range live {
+			select {
+			case <-child.done:
+			default:
+				_ = child.command.Process.Kill()
+			}
+		}
+		<-done
 	}
 }
 
