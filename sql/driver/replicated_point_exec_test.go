@@ -3,6 +3,8 @@ package driver
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -91,4 +93,16 @@ func TestReplicatedPointIntoZeroAllocationAndLiveIdentity(t *testing.T) {
 	}
 	run(true)
 	assertReplicatedReadReuseIdleState(t, f.claim)
+
+	// Direct execution must retain the original candidate materialization
+	// admission, even when the projection would otherwise fit the result cap.
+	options.MemoryBytes = 64 << 10
+	f.rows[0].doc = []byte(fmt.Sprintf(`{"id":%q,"score":1,"payload":%q}`, f.rows[0].id, strings.Repeat("x", 8192)))
+	if err := acquire(true); err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.QueryCandidateKeysInto(ctx, args, path, keys, &cursor); !errors.Is(err, errPointMaterializationTooLarge) {
+		t.Fatalf("direct point skipped materialization admission: %v", err)
+	}
+	_ = lease.Abort(errors.New("expected bounded refusal"))
 }

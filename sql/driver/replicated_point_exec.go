@@ -100,6 +100,16 @@ func (s *stmt) queryPointExecution(ctx context.Context, args []any, path []byte,
 	source := query.FromSnapshot(store.Snapshot{})
 	if found {
 		if len(keys) <= 1 {
+			if keys != nil {
+				limit, err := driverQueryMemory(s.conn.exec.Options)
+				if err != nil {
+					return nil, err
+				}
+				budget := pointMaterializationBudget{limit: limit}
+				if err := budget.add(string(p.key), p.raw); err != nil {
+					return nil, err
+				}
+			}
 			s.conn.pointSource.Bind(p.raw)
 			defer s.conn.pointSource.Bind(nil)
 			source = query.FromValidatedRaw(&s.conn.pointSource)
@@ -113,6 +123,9 @@ func (s *stmt) queryPointExecution(ctx context.Context, args []any, path []byte,
 			}
 			budget := pointMaterializationBudget{limit: limit}
 			for _, key := range keys {
+				if err := contextCheckpoint(ctx); err != nil {
+					return nil, err
+				}
 				if !bytes.Equal(key, p.key) {
 					continue
 				}
