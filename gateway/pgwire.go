@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
@@ -283,6 +284,10 @@ func (s *postgresSession) prepare(
 	if cached := s.takeCachedRead(text, parameterTypes); cached != nil {
 		return cached, nil
 	}
+	// Wire request storage may be reused after this call. The compiled tree and
+	// retained routing must share an owned, immutable SQL identity. Cache hits
+	// above already own their text and need no additional copy.
+	text = strings.Clone(text)
 	var parser sqlast.Parser
 	var parsed sqlast.Statement
 	err := parser.ParseStatement(&parsed, text)
