@@ -355,6 +355,7 @@ type rf3ReadAuthorityProbeConnection struct {
 	mu      sync.Mutex
 	address string
 	conn    rafttransport.PeerConnection
+	encoder shardservice.FrameEncoder
 }
 
 type rf3ReadAuthorityProbeResult uint8
@@ -557,7 +558,7 @@ func (cache *rf3ReadAuthorityIncarnationCache) probeResult(
 			return rf3ReadAuthorityProbeTransportFailure
 		}
 	}
-	response, err := shardservice.RoundTripReplicated(ctx, entry.conn, &shardservice.ReplicatedRequest{
+	response, err := entry.encoder.RoundTripReplicated(ctx, entry.conn, &shardservice.ReplicatedRequest{
 		Operation: shardservice.ReplicatedProbe, Authority: cache.authority,
 		Capability: serviceauthz.CapabilityDataRead,
 		Fence:      shardservice.ReplicatedFence{Group: target.key.group, AllocationGeneration: target.allocation},
