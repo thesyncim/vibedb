@@ -129,6 +129,24 @@ func (runtime *ScalingEnrollmentRuntime) BuildEnrollment(
 	if !foundSource || move.ReplicaOrdinal >= gateway.ServingReplicaCount {
 		return gateway.GroupEnrollmentIntent{}, gateway.ErrScalingIdentity
 	}
+	// The retiring source cannot also provide the snapshot base. The move
+	// planner requires a distinct current voter for that certificate, and the
+	// enrollment row must retain that choice across every retry and restart.
+	// Pick the lowest numbered remaining voter so the immutable intent is
+	// deterministic even if a catalog adapter returns the roster in another
+	// valid order.
+	var snapshotSourceMember uint64
+	for _, replica := range membership.Serving.Replicas {
+		if replica.Member == 0 || replica.Member == source.Member {
+			continue
+		}
+		if snapshotSourceMember == 0 || replica.Member < snapshotSourceMember {
+			snapshotSourceMember = replica.Member
+		}
+	}
+	if snapshotSourceMember == 0 {
+		return gateway.GroupEnrollmentIntent{}, gateway.ErrScalingIdentity
+	}
 	rosterDigest, descriptorDigest, ok := gateway.ReplicatedInitialMembershipDigests(snapshot, move.Group)
 	if !ok {
 		return gateway.GroupEnrollmentIntent{}, gateway.ErrReplicatedCatalogConflict
@@ -153,7 +171,7 @@ func (runtime *ScalingEnrollmentRuntime) BuildEnrollment(
 		Group: move.Group, Distribution: move.Distribution, Shard: move.Shard,
 		AllocationGeneration: move.AllocationGeneration, CatalogGeneration: snapshot.Generation(),
 		ExpectedCatalogHeadDigest: headDigest, ReplicaOrdinal: move.ReplicaOrdinal,
-		Source: endpointIdentity(source), SnapshotSourceMember: source.Member,
+		Source: endpointIdentity(source), SnapshotSourceMember: snapshotSourceMember,
 		Target: targetIdentity, ExpectedRosterDigest: rosterDigest,
 		ExpectedDescriptorDigest: descriptorDigest, ExpectedCommand: membership.Serving.Command,
 		TargetNodeRevision: move.TargetNodeRevision, State: gateway.EnrollmentReserved, Revision: 1,
