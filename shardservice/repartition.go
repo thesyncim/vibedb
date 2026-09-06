@@ -44,6 +44,10 @@ type repartitionPeerSink struct {
 	server  *Server
 	request RepartitionRequest
 	conns   []net.Conn
+	// encs owns one frame arena per peer slot, parallel to conns. Arena
+	// bytes never cross slots, and a redialed slot simply keeps growing
+	// the arena it already owns.
+	encs []FrameEncoder
 }
 
 func newRepartitionPeerSink(server *Server, request RepartitionRequest) (*repartitionPeerSink, error) {
@@ -59,6 +63,7 @@ func newRepartitionPeerSink(server *Server, request RepartitionRequest) (*repart
 	}
 	return &repartitionPeerSink{
 		server: server, request: request, conns: make([]net.Conn, len(request.Targets)),
+		encs: make([]FrameEncoder, len(request.Targets)),
 	}, nil
 }
 
@@ -114,7 +119,7 @@ func (s *repartitionPeerSink) Push(ctx context.Context, partition uint32, batch 
 			Batch: batch,
 		},
 	}
-	if err := roundTripExchangePeer(ctx, conn, req); err != nil {
+	if err := roundTripExchangePeer(ctx, conn, &s.encs[partition], req); err != nil {
 		_ = conn.Close()
 		s.conns[partition] = nil
 		return err
@@ -122,7 +127,7 @@ func (s *repartitionPeerSink) Push(ctx context.Context, partition uint32, batch 
 	return nil
 }
 
-func roundTripExchangePeer(ctx context.Context, conn net.Conn, req *ShardRequest) error {
+func roundTripExchangePeer(ctx context.Context, conn net.Conn, enc *FrameEncoder, req *ShardRequest) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -141,7 +146,7 @@ func roundTripExchangePeer(ctx context.Context, conn net.Conn, req *ShardRequest
 			<-callbackDone
 		}
 	}()
-	if err := EncodeRequest(conn, req); err != nil {
+	if err := enc.EncodeRequest(conn, req); err != nil {
 		return firstContextError(ctx, err)
 	}
 	resp, err := DecodeResponse(conn)

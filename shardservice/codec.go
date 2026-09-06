@@ -426,33 +426,47 @@ func (d *deccur) end() error {
 	return nil
 }
 
-// maxPooledFrameBuffer bounds recycled encoder arenas. Larger frames keep
-// freshly allocated arenas instead of pinning megabytes per pooled buffer.
-const maxPooledFrameBuffer = 64 << 10
+// maxFrameArenaBytes caps the encoder arena a FrameEncoder retains between
+// messages. Larger frames keep freshly allocated arenas instead of pinning
+// megabytes per connection.
+const maxFrameArenaBytes = 64 << 10
 
-// frameEncoderPool recycles frame body arenas across messages. Every encoder
-// output flows straight into writeEncodedFrame's single Write and is dead
-// afterwards, so the frame takes ownership and recycles on all paths; a
-// missed recycle only loses the saving to the collector.
+// FrameEncoder owns one reusable wire-frame arena for a connection. Every
+// encoder output flows straight into a single Write and is dead afterwards,
+// so the arena is simply resliced for the next message: steady-state encodes
+// allocate nothing, deterministically, with no pool to drain under GC
+// pressure. A FrameEncoder must serve one writer at a time; connections
+// already serialize their writes, so each conn holds one.
 //
-// Read buffers are deliberately NOT pooled: decoded parameters, keys, and
-// cells alias the frame body zero-copy, so a reused read arena would corrupt
-// live requests and responses.
-var frameEncoderPool = sync.Pool{New: func() any { return []byte(nil) }}
+// Read buffers are deliberately NOT owned or reused: decoded parameters,
+// keys, and cells alias the frame body zero-copy, so a reused read arena
+// would corrupt live requests and responses. Encodes whose bytes outlive the
+// Write (nested envelopes) likewise keep fresh arenas.
+type FrameEncoder struct {
+	arena []byte
+}
 
 // newFrameEncoder reserves the wire header in the same arena as the body. This
 // keeps the single-Write contract without copying a completed multi-megabyte
 // body into a second whole-frame allocation.
-func newFrameEncoder(payloadHint int) encbuf {
+func newFrameEncoder(arena []byte, payloadHint int) encbuf {
 	capacity := 5 + 256
 	if payloadHint > 0 && payloadHint <= maxFrameBody-256 {
 		capacity += payloadHint
 	}
-	if buf, _ := frameEncoderPool.Get().([]byte); cap(buf) >= capacity &&
-		cap(buf) <= maxPooledFrameBuffer {
-		return encbuf{b: buf[:5]}
+	if cap(arena) >= capacity {
+		return encbuf{b: arena[:5]}
 	}
 	return encbuf{b: make([]byte, 5, capacity)}
+}
+
+// keepFrameArena returns the backing array worth retaining for the next
+// encode, or nil when the frame outgrew the retention bound.
+func keepFrameArena(frame []byte) []byte {
+	if cap(frame) > maxFrameArenaBytes {
+		return nil
+	}
+	return frame
 }
 
 func writeEncodedFrame(w io.Writer, tag byte, frame []byte) error {
@@ -464,9 +478,6 @@ func writeEncodedFrame(w io.Writer, tag byte, frame []byte) error {
 	n, err := w.Write(frame)
 	if err == nil && n != len(frame) {
 		err = io.ErrShortWrite
-	}
-	if cap(frame) <= maxPooledFrameBuffer {
-		frameEncoderPool.Put(frame)
 	}
 	return err
 }
@@ -1568,12 +1579,22 @@ func decodeTransactionReply(d *deccur) (TransactionReply, error) {
 
 // EncodeRequest writes req as one framed message. It is deterministic: equal
 // requests encode to identical bytes.
+// EncodeRequest emits one request frame with a fresh arena. Connections
+// making repeated requests should hold a FrameEncoder and call its method
+// instead, reusing one arena across the connection's lifetime.
 func EncodeRequest(w io.Writer, req *ShardRequest) error {
+	return (&FrameEncoder{}).EncodeRequest(w, req)
+}
+
+// EncodeRequest encodes one request frame into the encoder's owned arena,
+// writes it, and retains the arena for the next call.
+func (f *FrameEncoder) EncodeRequest(w io.Writer, req *ShardRequest) error {
 	if err := ValidateRequest(req); err != nil {
 		return err
 	}
 
-	e := newFrameEncoder(len(req.Exchange.Batch.Data))
+	e := newFrameEncoder(f.arena, len(req.Exchange.Batch.Data))
+	defer func() { f.arena = keepFrameArena(e.b) }()
 	e.u8(wireVersion)
 	e.str(req.SQL)
 	e.str(string(req.Distribution))
@@ -1976,8 +1997,16 @@ func decodeRequestFields(d *deccur, req *ShardRequest) error {
 }
 
 // EncodeResponse writes resp as one framed message. It is deterministic: equal
-// responses encode to identical bytes.
+// responses encode to identical bytes. A fresh arena backs the frame;
+// connections writing repeated responses should hold a FrameEncoder and call
+// its method instead.
 func EncodeResponse(w io.Writer, resp *ShardResponse) error {
+	return (&FrameEncoder{}).EncodeResponse(w, resp)
+}
+
+// EncodeResponse writes resp as one framed message into the encoder's owned
+// arena, retaining it for the next call.
+func (f *FrameEncoder) EncodeResponse(w io.Writer, resp *ShardResponse) error {
 	if resp == nil {
 		return errors.New("shardservice: EncodeResponse requires a non-nil response")
 	}
@@ -2007,7 +2036,8 @@ func EncodeResponse(w io.Writer, resp *ShardResponse) error {
 		return errBadExchange
 	}
 
-	e := newFrameEncoder(len(resp.Exchange.Batch.Data))
+	e := newFrameEncoder(f.arena, len(resp.Exchange.Batch.Data))
+	defer func() { f.arena = keepFrameArena(e.b) }()
 	e.u8(wireVersion)
 	e.u8(uint8(resp.Kind))
 	switch resp.Kind {

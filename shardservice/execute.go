@@ -79,8 +79,17 @@ type shardConn struct {
 	sess   *sqldriver.Session
 	// stmtCache reuses lowered preparations across requests on this
 	// connection; see stmt_cache.go. Entries die with the session.
-	stmtCache       map[shardStmtKey]*cachedStmt
-	stmtOrder       []shardStmtKey
+	stmtCache map[shardStmtKey]*cachedStmt
+	stmtOrder []shardStmtKey
+	// enc owns the connection's wire-frame arena: every response encodes
+	// into it and dies in the socket Write, so steady-state responses
+	// allocate no frame memory.
+	enc FrameEncoder
+	// reqShell owns the connection's request descriptor shell. The loop
+	// below serves strictly sequentially and the handler uses each
+	// request synchronously, so one shell scrubbed per iteration replaces
+	// the pool with zero borrow/return traffic.
+	reqShell        ShardRequest
 	writeCancel     context.CancelFunc
 	writeToken      uint64
 	responseBatched bool
@@ -114,13 +123,12 @@ func (c *shardConn) releaseWriteAdmission() {
 func (c *shardConn) loop() error {
 	for {
 		setDeadline(c.nc.SetReadDeadline, c.server.opts.IdleTimeout)
-		// The descriptor shell is pooled; the handler below uses it
-		// strictly synchronously, so each iteration releases its shell
-		// after the handler returns. A missed release only loses the
-		// saving to the collector.
-		req := borrowShardRequest()
+		// The owned shell is scrubbed before every fill; the handler
+		// below uses it strictly synchronously, so no borrow, no
+		// release, and no residue can ever cross iterations.
+		req := &c.reqShell
+		*req = ShardRequest{}
 		if derr := decodeBorrowedRequest(c.nc, req); derr != nil {
-			releaseShardRequest(req)
 			if errors.Is(derr, io.EOF) {
 				return nil
 			}
@@ -134,7 +142,6 @@ func (c *shardConn) loop() error {
 			continue
 		}
 		if c.authorization != nil && !c.authorize(req) {
-			releaseShardRequest(req)
 			if werr := c.writeResponse(NewErrorResponse(ErrorUnauthorized, "authorization denied")); werr != nil {
 				return werr
 			}
@@ -142,7 +149,6 @@ func (c *shardConn) loop() error {
 		}
 		c.responseBatched = req.RowBatch.present()
 		werr := c.handle(req, c.writeRequestResponse)
-		releaseShardRequest(req)
 		c.responseBatched = false
 		if werr != nil {
 			if errors.Is(werr, errRowBatchTerminated) {
@@ -255,7 +261,7 @@ func (c *shardConn) writeResponseFrame(resp *ShardResponse, batched bool) error 
 		c.releaseWriteAdmission()
 	}
 	setDeadline(c.nc.SetWriteDeadline, c.server.opts.WriteTimeout)
-	err := EncodeResponse(c.nc, resp)
+	err := c.enc.EncodeResponse(c.nc, resp)
 	if err == nil {
 		return nil
 	}
@@ -267,7 +273,7 @@ func (c *shardConn) writeResponseFrame(resp *ShardResponse, batched bool) error 
 	// including when the rejected row batch itself was nonterminal.
 	c.releaseWriteAdmission()
 	setDeadline(c.nc.SetWriteDeadline, c.server.opts.WriteTimeout)
-	if writeErr := EncodeResponse(c.nc, NewErrorResponse(ErrorResourceLimit, err.Error())); writeErr != nil {
+	if writeErr := c.enc.EncodeResponse(c.nc, NewErrorResponse(ErrorResourceLimit, err.Error())); writeErr != nil {
 		return writeErr
 	}
 	if batched {

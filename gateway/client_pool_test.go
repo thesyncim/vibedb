@@ -92,10 +92,10 @@ func TestClientIdlePoolBounds(t *testing.T) {
 	secondEndpoint := newTrackedPipe(t)
 	newestEndpoint := newTrackedPipe(t)
 
-	client.put("shard-a", first)
-	client.put("shard-a", newerAtFirstEndpoint)
-	client.put("shard-b", secondEndpoint)
-	client.put("shard-c", newestEndpoint)
+	client.put("shard-a", first, shardservice.FrameEncoder{})
+	client.put("shard-a", newerAtFirstEndpoint, shardservice.FrameEncoder{})
+	client.put("shard-b", secondEndpoint, shardservice.FrameEncoder{})
+	client.put("shard-c", newestEndpoint, shardservice.FrameEncoder{})
 
 	client.mu.Lock()
 	if client.nidle != 2 || len(client.idle) != 2 {
@@ -124,12 +124,12 @@ func TestClientExpiresIdleConnection(t *testing.T) {
 	now := time.Unix(100, 0)
 	client.now = func() time.Time { return now }
 	idle := newTrackedPipe(t)
-	client.put("shard-a", idle)
+	client.put("shard-a", idle, shardservice.FrameEncoder{})
 
 	now = now.Add(time.Minute)
 	got, err := client.take("shard-a")
-	if err != nil || got != nil {
-		t.Fatalf("take expired = (%v, %v), want (nil, nil)", got, err)
+	if err != nil || got.conn != nil {
+		t.Fatalf("take expired = (%v, %v), want (nil, nil)", got.conn, err)
 	}
 	if idle.closes.Load() != 1 {
 		t.Fatal("expired idle connection was not closed")
