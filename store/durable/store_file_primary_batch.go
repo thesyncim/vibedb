@@ -610,8 +610,9 @@ func (c *Collection) reservePrimaryUnifiedOverlayRetentionLocked(
 	if count > cap(c.primaryPendingParents) {
 		return ErrCheckpointGroupPressure
 	}
-	if c.anyActiveReaders() && len(c.primaryVolatileRetired)+count >
-		cap(c.primaryVolatileRetired) {
+	if err := c.reservePrimaryVolatileRetiredCapacityLocked(
+		len(c.primaryVolatileRetired) + count,
+	); err != nil {
 		return ErrCheckpointGroupPressure
 	}
 	return nil
@@ -1198,8 +1199,7 @@ func (c *Collection) ensurePrimaryBatchCapacity(conditional bool) (bool, error) 
 	volatileNeeded := len(c.primaryVolatileRetired) + volatileRetirements
 	if volatileNeeded > c.options.MaxRetiredExtents {
 		c.retirementPressureCheckpoints.Add(1)
-		if err := c.checkpointBufferedLocked(); err != nil &&
-			!errors.Is(err, storeio.ErrRetiredExtentCapacity) {
+		if err := c.checkpointBufferedLocked(); err != nil {
 			return false, err
 		}
 		c.clearPrimaryVolatileRetiredLocked()
@@ -1214,15 +1214,14 @@ func (c *Collection) ensurePrimaryBatchCapacity(conditional bool) (bool, error) 
 		c.automaticCheckpoints.Add(1)
 		return true, nil
 	}
-	if volatileNeeded > cap(c.primaryVolatileRetired) {
-		grown := slices.Grow(
-			c.primaryVolatileRetired,
-			volatileNeeded-len(c.primaryVolatileRetired),
+	if err := c.reservePrimaryVolatileRetiredCapacityLocked(
+		volatileNeeded,
+	); err != nil {
+		return false, c.absorbRetirementPressure(
+			primaryVolatileRetiredCapacityError(
+				c.options.MaxRetiredExtents,
+			),
 		)
-		// slices.Grow may over-allocate geometrically. Hide that spare backing
-		// capacity so the single-mutation lane, which treats cap as its logical
-		// retirement bound, cannot silently exceed the exact admitted high-water.
-		c.primaryVolatileRetired = grown[:len(grown):volatileNeeded]
 	}
 	if liveLeaves > math.MaxInt-c.batchPrimaryOverflowPages {
 		return false, storeio.ErrInvalidWrite

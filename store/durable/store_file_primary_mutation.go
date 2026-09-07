@@ -373,6 +373,41 @@ func (c *Collection) clearPrimaryVolatileRetiredLocked() {
 	c.snapshotGate.Unlock()
 }
 
+// reservePrimaryVolatileRetiredCapacityLocked reserves the complete number of
+// memory-only references a publish will retire. The slice starts at the
+// bounded fold window so ordinary mutations do not reserve the configured
+// maximum, but that window is not the retirement policy: a held reader may
+// retain up to MaxRetiredExtents. Callers invoke this before their point of no
+// return because retirePrimaryVolatileRefLocked cannot report an allocation or
+// capacity error after publication.
+func (c *Collection) reservePrimaryVolatileRetiredCapacityLocked(
+	required int,
+) error {
+	if required < 0 || required > c.options.MaxRetiredExtents {
+		return storeio.ErrRetiredExtentCapacity
+	}
+	if required <= cap(c.primaryVolatileRetired) {
+		return nil
+	}
+	grown := slices.Grow(
+		c.primaryVolatileRetired,
+		required-len(c.primaryVolatileRetired),
+	)
+	// Keep geometric spare capacity for the next bounded reservation, but clamp
+	// it to the configured policy so append sites can never turn an allocation
+	// optimization into an unbounded retirement table.
+	capacity := min(cap(grown), c.options.MaxRetiredExtents)
+	c.primaryVolatileRetired = grown[:len(grown):capacity]
+	return nil
+}
+
+func primaryVolatileRetiredCapacityError(capacity int) error {
+	return fmt.Errorf(
+		"%w: buffered primary volatile-reference capacity %d",
+		storeio.ErrRetiredExtentCapacity, capacity,
+	)
+}
+
 // retirePrimaryVolatileRefLocked runs while snapshotGate is held and a reader
 // fence is raised. A selected route can race from the router to PageCache
 // without holding that gate, so an active generation lease or epoch reader
@@ -428,31 +463,6 @@ func (c *Collection) ensureBufferedPrimaryMutationCapacity(
 		)
 	}
 	c.clearPrimaryVolatileRetiredLocked()
-	if len(c.primaryVolatileRetired) == cap(c.primaryVolatileRetired) {
-		// A full volatile-reference table is the retirement-pressure situation the
-		// retirement table has: a held snapshot pins the frames a checkpoint would
-		// otherwise drop. Force one checkpoint and count it as a retirement-pressure
-		// checkpoint — the same response reserveFileRetirements' retry makes — then
-		// re-clear. A checkpoint that runs while no reader has arrived drains the
-		// table and lets the mutation proceed; a genuinely reader-pinned table stays
-		// full, and the error is routed through the shared diagnostic so it names the
-		// pinning snapshot and generation rather than surfacing a bare capacity
-		// number an operator cannot act on. materializePrimaryParentsLocked fails
-		// closed if it cannot fit the fold, so a failed checkpoint publishes nothing.
-		c.retirementPressureCheckpoints.Add(1)
-		if err := c.checkpointBufferedLocked(); err != nil &&
-			!errors.Is(err, storeio.ErrRetiredExtentCapacity) {
-			return err
-		}
-		c.clearPrimaryVolatileRetiredLocked()
-		if len(c.primaryVolatileRetired) == cap(c.primaryVolatileRetired) {
-			return c.absorbRetirementPressure(fmt.Errorf(
-				"%w: buffered primary volatile-reference capacity %d",
-				storeio.ErrRetiredExtentCapacity,
-				cap(c.primaryVolatileRetired),
-			))
-		}
-	}
 	if c.primaryPendingParentIndex(resident.Bucket) < 0 &&
 		len(c.primaryPendingParents) == cap(c.primaryPendingParents) {
 		if err := c.checkpointBufferedLocked(); err != nil {
@@ -1475,6 +1485,31 @@ func (c *Collection) cowBufferedPrimaryMutation(
 			"prepare buffered compact exact index: %w", err,
 		)
 	}
+	volatileRetirements := 0
+	if pending.volatileRef != (storeio.PageRef{}) {
+		volatileRetirements++
+	}
+	if oldOverflowVolatile {
+		for _, ref := range c.overflowRetireScratch {
+			if ref != (storeio.PageRef{}) {
+				volatileRetirements++
+			}
+		}
+	}
+	if err := c.reservePrimaryVolatileRetiredCapacityLocked(
+		len(c.primaryVolatileRetired) + volatileRetirements,
+	); err != nil {
+		// The leaf and any new overflow chain are still unreferenced, so return
+		// them before surfacing bounded retirement pressure. This reservation is
+		// the last fallible step before the journal fence and router publish.
+		c.unwindPrimaryExactPrepared(&preparedExact)
+		c.unadmitPrimaryMutationFrames()
+		return storeio.PageRef{}, false, false, c.absorbRetirementPressure(
+			primaryVolatileRetiredCapacityError(
+				c.options.MaxRetiredExtents,
+			),
+		)
+	}
 
 	// Point of no return: every fallible prepare step above has succeeded, the
 	// dirty frame is admitted, and nothing is reader-visible or committed to the
@@ -2032,19 +2067,24 @@ func (c *Collection) materializePrimaryParentsOnceLocked() (err error) {
 		return nil
 	}
 	c.clearPrimaryVolatileRetiredLocked()
-	if c.anyActiveReaders() &&
-		len(c.primaryVolatileRetired)+
-			len(c.primaryPendingParents) >
-			cap(c.primaryVolatileRetired) {
-		// An active reader pins the volatile frames this materialize would retire, so
-		// the table cannot drain. Name the pinning snapshot and generation through
-		// the shared retirement diagnostic rather than surfacing a bare capacity
-		// number an operator cannot act on.
-		return c.absorbRetirementPressure(fmt.Errorf(
-			"%w: buffered primary volatile-reference capacity %d",
-			storeio.ErrRetiredExtentCapacity,
-			cap(c.primaryVolatileRetired),
-		))
+	pendingRetirements := 0
+	for index := range c.primaryPendingParents {
+		if c.primaryPendingParents[index].volatileRef != (storeio.PageRef{}) {
+			pendingRetirements++
+		}
+	}
+	if err := c.reservePrimaryVolatileRetiredCapacityLocked(
+		len(c.primaryVolatileRetired) + pendingRetirements,
+	); err != nil {
+		// An active reader may keep the existing entries pinned, but the configured
+		// maximum is still the hard bound. Reserve before staging so every later
+		// retirePrimaryVolatileRefLocked call is infallible and publication remains
+		// failure-atomic.
+		return c.absorbRetirementPressure(
+			primaryVolatileRetiredCapacityError(
+				c.options.MaxRetiredExtents,
+			),
+		)
 	}
 	// The base is the previous primary checkpoint, not necessarily the durable
 	// one. A flush-less materialize (Snapshot, snapshot-contended mutation) leaves
@@ -2911,6 +2951,29 @@ func (c *Collection) materializePrimaryParentsOnceLocked() (err error) {
 	}
 	if exactActive {
 		nextState.root.ExactIndexRoot = exactRoot
+	}
+	volatileRetirements := 0
+	for index := range c.primaryPendingParents {
+		if c.primaryPendingParents[index].volatileRef != (storeio.PageRef{}) {
+			volatileRetirements++
+		}
+	}
+	for _, ref := range c.primaryCheckpointVolatileOverflow {
+		if ref != (storeio.PageRef{}) {
+			volatileRetirements++
+		}
+	}
+	if err := c.reservePrimaryVolatileRetiredCapacityLocked(
+		len(c.primaryVolatileRetired) + volatileRetirements,
+	); err != nil {
+		// All volatile leaf and overflow references that will be retired are
+		// known before PublishInline. Reserve their complete count against the
+		// configured limit while the transaction can still abort atomically.
+		return c.absorbRetirementPressure(
+			primaryVolatileRetiredCapacityError(
+				c.options.MaxRetiredExtents,
+			),
+		)
 	}
 	if err := c.reserveFileRetirements(); err != nil {
 		return fmt.Errorf(
