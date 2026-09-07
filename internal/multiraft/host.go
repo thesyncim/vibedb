@@ -1042,7 +1042,9 @@ func (host *Host) EnsureReadAuthorityRound(key raftmember.GroupKey) error {
 	if err := runtime.EnsureReadAuthorityRound(); err != nil {
 		return err
 	}
-	host.wake(group)
+	if pending, ok := runtime.(authorityOutboundPendingRuntime); !ok || pending.AuthorityOutboundPending() {
+		host.wake(group)
+	}
 	return nil
 }
 
