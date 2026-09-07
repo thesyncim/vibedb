@@ -230,7 +230,14 @@ func TestThreeRealHostsOrderLearnerCatchUpBeforePromotion(t *testing.T) {
 	if !ok {
 		t.Fatalf("elected replacement leader %d has no host", replacementLeader)
 	}
-	if err = hosts[replacementLeaderIndex].TransferLeader(group, target); err != nil {
+	guard, err := hosts[replacementLeaderIndex].PrepareLeaderTransfer(group, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = hosts[replacementLeaderIndex].CheckLeaderTransferReady(group, guard); err != nil {
+		t.Fatal(err)
+	}
+	if err = hosts[replacementLeaderIndex].TransferLeader(group, guard); err != nil {
 		t.Fatal(err)
 	}
 	cluster.driveUntilConvergedIdle(func() bool {

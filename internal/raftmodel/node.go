@@ -1204,11 +1204,13 @@ func (n *Node) Campaign() error {
 	return err
 }
 
-// TransferLeader starts an explicit handoff to one configured voter. Nil means
-// the request entered RawNode's bounded input window, not that the transferee
-// has already become leader; callers must observe Status after draining Ready.
-func (n *Node) TransferLeader(transferee uint64) error {
-	if transferee == raft.None || transferee == n.id || raft.IsLocalMsgTarget(transferee) {
+// ValidateLeaderTransferTarget checks the current leader role, pending handoff,
+// and replication tracker for one configured voter. It deliberately performs no
+// protocol mutation, so callers can validate an authorized control before
+// revoking any higher-level serving capability.
+func (n *Node) ValidateLeaderTransferTarget(transferee uint64) error {
+	if n == nil || n.raw == nil || transferee == raft.None || transferee == n.id ||
+		raft.IsLocalMsgTarget(transferee) {
 		return ErrInvalidTransferee
 	}
 	status := n.raw.BasicStatus()
@@ -1221,6 +1223,30 @@ func (n *Node) TransferLeader(transferee uint64) error {
 	progress, found := n.Progress(transferee)
 	if !found || progress.Learner {
 		return ErrInvalidTransferee
+	}
+	return nil
+}
+
+// CheckLeaderTransferReady performs the read-only final readiness check used
+// immediately before a transfer admission. It includes the election gate but
+// does not reserve input or call RawNode.
+func (n *Node) CheckLeaderTransferReady(transferee uint64) error {
+	if err := n.ValidateLeaderTransferTarget(transferee); err != nil {
+		return err
+	}
+	if n.phase != PhaseIdle || n.readyID != 0 || n.pendingInputCalls != 0 ||
+		n.pendingInputUnits != 0 || n.pendingInputBytes != 0 || n.raw.HasReady() {
+		return ErrReadyPending
+	}
+	return n.gateElection(ElectionTransfer)
+}
+
+// TransferLeader starts an explicit handoff to one configured voter. Nil means
+// the request entered RawNode's bounded input window, not that the transferee
+// has already become leader; callers must observe Status after draining Ready.
+func (n *Node) TransferLeader(transferee uint64) error {
+	if err := n.ValidateLeaderTransferTarget(transferee); err != nil {
+		return err
 	}
 	if err := n.gateElection(ElectionTransfer); err != nil {
 		return err

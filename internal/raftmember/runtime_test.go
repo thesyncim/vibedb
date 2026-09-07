@@ -1181,7 +1181,14 @@ func TestRuntimeTransfersLeaderWithExactTimeoutNow(t *testing.T) {
 	}
 	drainRuntime(t, fixture.runtime, nil)
 
-	if err := fixture.runtime.TransferLeader(peer); err != nil {
+	guard, err := fixture.runtime.PrepareLeaderTransfer(peer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.runtime.CheckLeaderTransferReady(guard); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.runtime.TransferLeader(guard); err != nil {
 		t.Fatal(err)
 	}
 	var timeoutNow *pb.Message
