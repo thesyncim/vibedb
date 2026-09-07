@@ -2,6 +2,7 @@ package raftmember
 
 import (
 	"errors"
+	"reflect"
 	"testing"
 	"time"
 
@@ -712,4 +713,259 @@ func TestRuntimeReadAuthorityPolicyChecksAndDisableReenableSafety(t *testing.T) 
 			})
 		}
 	})
+}
+
+func TestRuntimeReadAuthorityEvidenceRetainsStartupQuarantineThroughReady(t *testing.T) {
+	fixture := newReadAuthorityFollowerFixture(t, 174)
+	fixture.configure(t, func(memberID uint64) (uint64, bool, error) {
+		if memberID == fixture.peer {
+			return 103, true, nil
+		}
+		return 0, false, nil
+	})
+	runtime := fixture.fixture.runtime
+	quarantine, err := fixture.policy.QuarantineDuration()
+	if err != nil {
+		t.Fatalf("QuarantineDuration: %v", err)
+	}
+	fixture.clock.now = 0
+	// The fixture has already drained its startup Ready. This edge is therefore
+	// the configured member's first post-configuration election attempt, while
+	// the persisted restart quarantine is still active.
+	if err := runtime.Tick(); !errors.Is(err, ErrAuthorityElectionBlocked) {
+		t.Fatalf("post-ready tick during startup quarantine = %v, want ErrAuthorityElectionBlocked", err)
+	}
+	evidence := runtime.ReadAuthorityEvidence()
+	if evidence.Status != ReadAuthorityEvidenceConfigured {
+		t.Fatalf("evidence status = %v, want configured", evidence.Status)
+	}
+	if evidence.Identity.NodeIncarnation != runtime.identity.NodeIncarnation {
+		t.Fatalf("node incarnation = %d, runtime = %d", evidence.Identity.NodeIncarnation, runtime.identity.NodeIncarnation)
+	}
+	if evidence.PolicyDigest != fixture.policy.PolicyDigest() {
+		t.Fatalf("policy digest = %x, want %x", evidence.PolicyDigest, fixture.policy.PolicyDigest())
+	}
+	if !evidence.Promise.QuarantineConfigured || evidence.Promise.QuarantineAt != 0 ||
+		evidence.Promise.QuarantineUntil != quarantine {
+		t.Fatalf("quarantine evidence = %+v, want entry 0/deadline %s", evidence.Promise, quarantine)
+	}
+	if !evidence.QuarantineKnown || !evidence.QuarantineActive {
+		t.Fatalf("quarantine classification = known=%t active=%t, want active", evidence.QuarantineKnown, evidence.QuarantineActive)
+	}
+	blocked := evidence.Gate.BlockedByReason[ReadAuthorityGateTick][ReadAuthorityGateQuarantine]
+	if blocked == 0 {
+		t.Fatalf("gate quarantine count = %d, want post-ready blocked edge", blocked)
+	}
+	blockedTime := evidence.Gate.BlockedTime[ReadAuthorityGateTick][ReadAuthorityGateQuarantine]
+	if !blockedTime.Available || blockedTime.First != 0 || blockedTime.Last != 0 {
+		t.Fatalf("quarantine blocked time = %+v, want current sample at startup", blockedTime)
+	}
+	if evidence.Gate.QuarantineExpiredAvailable {
+		t.Fatal("quarantine was marked expired before the deadline")
+	}
+
+	fixture.clock.now = quarantine
+	if err := runtime.Tick(); err != nil {
+		t.Fatalf("post-ready tick at quarantine deadline = %v", err)
+	}
+	drainRuntime(t, runtime, nil)
+	evidence = runtime.ReadAuthorityEvidence()
+	if !evidence.Gate.QuarantineExpiredAvailable || evidence.Gate.FirstQuarantineExpiredAt != quarantine {
+		t.Fatalf("quarantine expiry evidence = available=%t at=%s, want exact deadline %s",
+			evidence.Gate.QuarantineExpiredAvailable, evidence.Gate.FirstQuarantineExpiredAt, quarantine)
+	}
+	if evidence.Gate.Allowed[ReadAuthorityGateTick] == 0 {
+		t.Fatal("gate did not retain the allowed post-quarantine tick")
+	}
+}
+
+func TestRuntimeReadAuthorityEvidenceHolderIsDetachedAndExact(t *testing.T) {
+	fixture := newReadAuthorityLeaderFixture(t, 175)
+	runtime := fixture.fixture.runtime
+	_ = startReadAuthorityRoundWithQuorum(t, fixture)
+	round := runtime.authority.round
+	if round == nil {
+		t.Fatal("quorum round missing")
+	}
+	beforeRound := round.Evidence()
+	beforePromise := runtime.authority.promise.Evidence()
+	beforeMetrics := runtime.ReadAuthorityRoundMetrics()
+	beforeNonce := runtime.authority.nonce
+	beforeOutbound := len(runtime.authority.outbound)
+
+	evidence := runtime.ReadAuthorityEvidence()
+	if !evidence.Holder.Available {
+		t.Fatalf("holder evidence unavailable: %+v", evidence)
+	}
+	if evidence.Holder.Request.Nonce != beforeRound.Request.Nonce ||
+		evidence.Holder.Request.PolicyDigest != fixture.policy.PolicyDigest() ||
+		evidence.Holder.ExpiresAt != beforeRound.ExpiresAt {
+		t.Fatalf("holder evidence = %+v, round = %+v", evidence.Holder, beforeRound)
+	}
+	if !reflect.DeepEqual(evidence.Holder.AcceptedVoters, beforeRound.AcceptedVoters) {
+		t.Fatalf("accepted voters = %v, round = %v", evidence.Holder.AcceptedVoters, beforeRound.AcceptedVoters)
+	}
+	if evidence.Identity.NodeIncarnation != runtime.identity.NodeIncarnation ||
+		evidence.Observation.Group != beforeRound.Request.Group ||
+		evidence.Observation.Config != beforeRound.Request.Config {
+		t.Fatalf("identity/observation evidence = %+v, round = %+v", evidence, beforeRound)
+	}
+	if after := runtime.ReadAuthorityEvidence(); !reflect.DeepEqual(after.Holder, evidence.Holder) {
+		t.Fatalf("repeated evidence changed holder cut: first=%+v second=%+v", evidence.Holder, after.Holder)
+	}
+	if len(evidence.Holder.AcceptedVoters) == 0 {
+		t.Fatal("holder evidence omitted accepted voters")
+	}
+	evidence.Holder.AcceptedVoters[0] = 999
+	if after := runtime.ReadAuthorityEvidence(); after.Holder.AcceptedVoters[0] == 999 {
+		t.Fatal("mutating detached accepted voters changed the owner round")
+	}
+	if afterRound := round.Evidence(); !reflect.DeepEqual(afterRound, beforeRound) {
+		t.Fatalf("evidence changed round: before=%+v after=%+v", beforeRound, afterRound)
+	}
+	if afterPromise := runtime.authority.promise.Evidence(); !reflect.DeepEqual(afterPromise, beforePromise) {
+		t.Fatalf("evidence changed promise: before=%+v after=%+v", beforePromise, afterPromise)
+	}
+	if afterMetrics := runtime.ReadAuthorityRoundMetrics(); afterMetrics != beforeMetrics {
+		t.Fatalf("evidence changed round metrics: before=%+v after=%+v", beforeMetrics, afterMetrics)
+	}
+	if runtime.authority.nonce != beforeNonce || len(runtime.authority.outbound) != beforeOutbound {
+		t.Fatalf("evidence changed nonce/outbound: nonce %d->%d outbound %d->%d",
+			beforeNonce, runtime.authority.nonce, beforeOutbound, len(runtime.authority.outbound))
+	}
+	fixture.clock.now = beforeRound.ExpiresAt
+	expired := runtime.ReadAuthorityEvidence()
+	if expired.Holder.Available {
+		t.Fatalf("fresh evidence retained expired holder: %+v", expired.Holder)
+	}
+	if afterRound := round.Evidence(); !reflect.DeepEqual(afterRound, beforeRound) {
+		t.Fatalf("expired evidence changed round: before=%+v after=%+v", beforeRound, afterRound)
+	}
+}
+
+func TestRuntimeReadAuthorityEvidenceDisabledRetainsFencing(t *testing.T) {
+	fixture := newReadAuthorityLeaderFixture(t, 176)
+	runtime := fixture.fixture.runtime
+	_ = startReadAuthorityRoundWithQuorum(t, fixture)
+	before := runtime.ReadAuthorityEvidence()
+	if !before.Holder.Available || !before.Promise.HasRecord {
+		t.Fatalf("pre-disable evidence = %+v, want valid holder and promise", before)
+	}
+	if err := runtime.ConfigureReadAuthority(ReadAuthorityOptions{}); err != nil {
+		t.Fatalf("disable authority: %v", err)
+	}
+	evidence := runtime.ReadAuthorityEvidence()
+	if evidence.Status != ReadAuthorityEvidenceDisabled {
+		t.Fatalf("disabled evidence status = %v, want disabled", evidence.Status)
+	}
+	if evidence.Holder.Available {
+		t.Fatal("disabled authority exposed a serving holder")
+	}
+	if !reflect.DeepEqual(evidence.Promise, before.Promise) {
+		t.Fatalf("disabled evidence changed retained promise: before=%+v after=%+v", before.Promise, evidence.Promise)
+	}
+}
+
+func TestRuntimeReadAuthorityEvidenceRetainsFencingWhenSQLQuiesced(t *testing.T) {
+	fixture := newReadAuthorityLeaderFixture(t, 181)
+	runtime := fixture.fixture.runtime
+	_ = startReadAuthorityRoundWithQuorum(t, fixture)
+	before := runtime.ReadAuthorityEvidence()
+	if !before.Holder.Available || !before.Promise.HasRecord {
+		t.Fatalf("pre-quiesce evidence = %+v, want holder and promise", before)
+	}
+	beforeRound := runtime.authority.round.Evidence()
+	if err := runtime.QuiesceSQLGeneration(); err != nil {
+		t.Fatalf("QuiesceSQLGeneration: %v", err)
+	}
+	after := runtime.ReadAuthorityEvidence()
+	if after.Status != ReadAuthorityEvidenceConfigured || after.Identity != before.Identity ||
+		after.PolicyVersion != before.PolicyVersion || after.PolicyDigest != before.PolicyDigest {
+		t.Fatalf("quiesced identity/policy evidence = %+v, before = %+v", after, before)
+	}
+	if !reflect.DeepEqual(after.Promise, before.Promise) || !reflect.DeepEqual(after.Gate, before.Gate) {
+		t.Fatalf("quiesced fencing evidence changed: promise before=%+v after=%+v gate before=%+v after=%+v",
+			before.Promise, after.Promise, before.Gate, after.Gate)
+	}
+	if after.ObservationAvailable || after.Holder.Available {
+		t.Fatalf("quiesced evidence claimed serving state: observation=%t holder=%+v", after.ObservationAvailable, after.Holder)
+	}
+	if after.PromiseActive != before.PromiseActive || !after.PromiseKnown {
+		t.Fatalf("quiesced promise classification = known=%t active=%t, before known=%t active=%t",
+			after.PromiseKnown, after.PromiseActive, before.PromiseKnown, before.PromiseActive)
+	}
+	if afterRound := runtime.authority.round.Evidence(); !reflect.DeepEqual(afterRound, beforeRound) {
+		t.Fatalf("quiesced evidence changed round: before=%+v after=%+v", beforeRound, afterRound)
+	}
+}
+
+func TestRuntimeReadAuthorityEvidenceClockFaultIsExplicit(t *testing.T) {
+	fixture := newReadAuthorityFollowerFixture(t, 177)
+	fixture.configure(t, func(memberID uint64) (uint64, bool, error) {
+		if memberID == fixture.peer {
+			return 105, true, nil
+		}
+		return 0, false, nil
+	})
+	fixture.clock.err = errors.New("diagnostic clock fault")
+	if err := fixture.fixture.runtime.Tick(); !errors.Is(err, raftauthority.ErrClockFault) {
+		t.Fatalf("clock-fault tick = %v, want ErrClockFault", err)
+	}
+	evidence := fixture.fixture.runtime.ReadAuthorityEvidence()
+	if !evidence.Clock.Faulted || evidence.Holder.Available {
+		t.Fatalf("clock-fault evidence = %+v, want faulted/no holder", evidence)
+	}
+	if evidence.QuarantineKnown || evidence.PromiseKnown {
+		t.Fatalf("clock-fault state was classified as current: quarantine=%t promise=%t", evidence.QuarantineKnown, evidence.PromiseKnown)
+	}
+	if evidence.Gate.BlockedByReason[ReadAuthorityGateTick][ReadAuthorityGateClockFault] == 0 {
+		t.Fatal("clock-fault gate edge was not counted")
+	}
+	if evidence.Gate.BlockedTime[ReadAuthorityGateTick][ReadAuthorityGateClockFault].Available {
+		t.Fatal("clock-fault edge borrowed stale checked-clock time")
+	}
+}
+
+func TestRuntimeReadAuthorityEvidenceLatchesClockFaultIntroducedBeforeSnapshot(t *testing.T) {
+	fixture := newReadAuthorityLeaderFixture(t, 178)
+	runtime := fixture.fixture.runtime
+	_ = startReadAuthorityRoundWithQuorum(t, fixture)
+	roundBefore := runtime.authority.round.Evidence()
+	nonceBefore := runtime.authority.nonce
+	fixture.clock.err = errors.New("snapshot-only elapsed clock fault")
+	evidence := runtime.ReadAuthorityEvidence()
+	if !evidence.Clock.Faulted || evidence.Holder.Available {
+		t.Fatalf("snapshot-only clock fault evidence = %+v, want faulted/no holder", evidence)
+	}
+	if after := runtime.authority.round.Evidence(); !reflect.DeepEqual(after, roundBefore) || runtime.authority.nonce != nonceBefore {
+		t.Fatalf("snapshot-only clock fault changed round/nonce: before=%+v after=%+v nonce=%d", roundBefore, after, runtime.authority.nonce)
+	}
+}
+
+func TestRuntimeReadAuthorityEvidenceKeepsGroupAndBootIdentityDistinct(t *testing.T) {
+	left := newReadAuthorityFollowerFixture(t, 179)
+	right := newReadAuthorityFollowerFixture(t, 180)
+	configure := func(fixture *readAuthorityFollowerFixture) {
+		fixture.configure(t, func(memberID uint64) (uint64, bool, error) {
+			if memberID == fixture.peer {
+				return 106, true, nil
+			}
+			return 0, false, nil
+		})
+		fixture.clock.now = 0
+	}
+	configure(&left)
+	configure(&right)
+	leftEvidence := left.fixture.runtime.ReadAuthorityEvidence()
+	rightEvidence := right.fixture.runtime.ReadAuthorityEvidence()
+	if leftEvidence.Identity.Group == rightEvidence.Identity.Group {
+		t.Fatalf("distinct fixtures collapsed group identity: left=%+v right=%+v", leftEvidence.Identity.Group, rightEvidence.Identity.Group)
+	}
+	if leftEvidence.Identity.NodeIncarnation == 0 || rightEvidence.Identity.NodeIncarnation == 0 {
+		t.Fatalf("missing boot incarnation: left=%d right=%d", leftEvidence.Identity.NodeIncarnation, rightEvidence.Identity.NodeIncarnation)
+	}
+	if leftEvidence.Identity.NodeIncarnation == rightEvidence.Identity.NodeIncarnation &&
+		leftEvidence.Identity.Group == rightEvidence.Identity.Group {
+		t.Fatal("group and boot identity were not separated")
+	}
 }

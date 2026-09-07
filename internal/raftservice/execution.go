@@ -180,6 +180,16 @@ func (owners *ExecutionOwners) ReadAuthorityRoundMetrics() raftmember.ReadAuthor
 	return owners.lanes.ReadAuthorityRoundMetrics()
 }
 
+// ReadAuthorityEvidence returns one detached authority record for every live
+// group. ExecutionLanes takes each owner lock before reading its Runtime, so a
+// diagnostic snapshot cannot race a protocol mutation.
+func (owners *ExecutionOwners) ReadAuthorityEvidence() []raftmember.ReadAuthorityEvidence {
+	if owners == nil || owners.lanes == nil {
+		return nil
+	}
+	return owners.lanes.ReadAuthorityEvidence()
+}
+
 func (owners *ExecutionOwners) owner(group raftmember.GroupKey) (*Owner, error) {
 	if owners == nil || group == (raftmember.GroupKey{}) {
 		return nil, ErrExecutionGroup

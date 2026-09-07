@@ -1,7 +1,9 @@
 package multiraft
 
 import (
+	"bytes"
 	"errors"
+	"slices"
 	"sync"
 	"sync/atomic"
 
@@ -605,6 +607,53 @@ func (set *ExecutionLanes) ReadAuthorityRoundMetrics() raftmember.ReadAuthorityR
 		total.GrantsAccepted += metrics.GrantsAccepted
 	}
 	return total
+}
+
+// ReadAuthorityEvidence returns detached per-group authority records. Every
+// Host is sampled while its lane.mu is held, so a snapshot cannot race a
+// Runtime mutation. Records are sorted by complete GroupKey identity to make
+// SIGUSR1 output stable even when groups are distributed across lanes.
+func (set *ExecutionLanes) ReadAuthorityEvidence() []raftmember.ReadAuthorityEvidence {
+	if set == nil {
+		return nil
+	}
+	var result []raftmember.ReadAuthorityEvidence
+	for index := range set.lanes {
+		lane := &set.lanes[index]
+		lane.mu.Lock()
+		if set.state.Load() == executionLanesOpen {
+			result = append(result, lane.host.ReadAuthorityEvidence()...)
+		}
+		lane.mu.Unlock()
+	}
+	if len(result) > 1 {
+		slices.SortFunc(result, func(left, right raftmember.ReadAuthorityEvidence) int {
+			return compareAuthorityGroupKeys(left.Identity.Group, right.Identity.Group)
+		})
+	}
+	return result
+}
+
+func compareAuthorityGroupKeys(left, right raftmember.GroupKey) int {
+	if comparison := bytes.Compare(left.ClusterID[:], right.ClusterID[:]); comparison != 0 {
+		return comparison
+	}
+	if comparison := bytes.Compare(left.ClusterIncarnation[:], right.ClusterIncarnation[:]); comparison != 0 {
+		return comparison
+	}
+	if left.TopologyRecoveryEpoch < right.TopologyRecoveryEpoch {
+		return -1
+	}
+	if left.TopologyRecoveryEpoch > right.TopologyRecoveryEpoch {
+		return 1
+	}
+	if comparison := bytes.Compare(left.ShardIncarnation[:], right.ShardIncarnation[:]); comparison != 0 {
+		return comparison
+	}
+	if comparison := bytes.Compare(left.GroupID[:], right.GroupID[:]); comparison != 0 {
+		return comparison
+	}
+	return 0
 }
 
 func (set *ExecutionLanes) ReadAuthorityToken(

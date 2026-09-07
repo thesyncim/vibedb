@@ -72,6 +72,16 @@ type CheckedClock struct {
 	fault       error
 }
 
+// CheckedClockEvidence is a detached view of the last checked elapsed-clock
+// sample. This metadata accessor deliberately does not call the source clock;
+// Runtime diagnostics take their required fresh sample separately before
+// classifying authority state.
+type CheckedClockEvidence struct {
+	Sample      time.Duration
+	Initialized bool
+	Faulted     bool
+}
+
 // NewCheckedClock returns a rollback-detecting elapsed clock wrapper.  It does
 // not infer qualification from the source; the deployment policy decides
 // whether the source is suitable for authority use.
@@ -108,6 +118,19 @@ func (clock *CheckedClock) Now() (time.Duration, error) {
 
 // Faulted reports whether the clock has permanently disabled this owner.
 func (clock *CheckedClock) Faulted() bool { return clock != nil && clock.fault != nil }
+
+// Evidence returns the last locally accepted sample and the permanent fault
+// bit without advancing or otherwise changing the checked clock.
+func (clock *CheckedClock) Evidence() CheckedClockEvidence {
+	if clock == nil {
+		return CheckedClockEvidence{}
+	}
+	return CheckedClockEvidence{
+		Sample:      clock.last,
+		Initialized: clock.initialized,
+		Faulted:     clock.fault != nil,
+	}
+}
 
 // GroupIdentity is the complete group/incarnation identity carried by every
 // request and grant.  It mirrors raftmember.GroupKey without importing that
@@ -390,6 +413,18 @@ type AuthorityRound struct {
 	invalidated bool
 }
 
+// AuthorityRoundEvidence is a detached cut of one bounded holder round. The
+// accepted voter list is copied and sorted so callers cannot retain or reorder
+// owner state and repeated diagnostics have deterministic output.
+type AuthorityRoundEvidence struct {
+	Request        AuthorityRequest
+	HasRound       bool
+	ExpiresAt      time.Duration
+	Complete       bool
+	Invalidated    bool
+	AcceptedVoters []uint64
+}
+
 // NewAuthorityRound starts a round at the current holder elapsed time. Call it
 // at the exact outbound-send boundary. It requires a current-term commit and a
 // stable, applied configuration; callers should continue ReadIndex otherwise.
@@ -454,6 +489,41 @@ func (round *AuthorityRound) Request() AuthorityRequest {
 		return AuthorityRequest{}
 	}
 	return round.request
+}
+
+// Evidence returns the current bounded round state without consulting the
+// clock and without retiring, invalidating, or promoting a round.
+func (round *AuthorityRound) Evidence() AuthorityRoundEvidence {
+	if round == nil {
+		return AuthorityRoundEvidence{}
+	}
+	result := AuthorityRoundEvidence{
+		Request:     round.request,
+		HasRound:    true,
+		ExpiresAt:   round.usableUntil,
+		Complete:    round.complete,
+		Invalidated: round.invalidated,
+	}
+	if len(round.grants) != 0 {
+		result.AcceptedVoters = make([]uint64, 0, len(round.grants))
+		for _, grant := range round.grants {
+			result.AcceptedVoters = append(result.AcceptedVoters, grant.Voter)
+		}
+		slices.Sort(result.AcceptedVoters)
+	}
+	return result
+}
+
+// ValidAt classifies this detached round cut against a checked-clock sample
+// and an exact observation. It returns only validity metadata; diagnostics
+// must never obtain an AuthorityToken or otherwise create a new capability.
+func (evidence AuthorityRoundEvidence) ValidAt(now time.Duration, observation AuthorityObservation) bool {
+	if !evidence.HasRound || evidence.Invalidated || !evidence.Complete ||
+		now < evidence.Request.StartAt || now >= evidence.ExpiresAt {
+		return false
+	}
+	request := evidence.Request
+	return observation.validFor(request.Group, request.Holder, request.HolderIncarnation, request.Term, request.Config)
 }
 
 // AddGrant accepts one exact, non-duplicate grant. Late, stale, or replayed
@@ -602,8 +672,26 @@ type PromiseBook struct {
 	group          GroupIdentity
 	localMember    uint64
 	record         *promiseRecord
+	quarantineAt   time.Duration
 	quarantineTill time.Duration
 	quarantineErr  error
+}
+
+// PromiseBookEvidence is a detached view of the one retained promise and the
+// restart quarantine that protects it. HasRecord remains true after local
+// expiry because that prior request is useful evidence of which holder was
+// protected; callers use their checked-clock sample to classify it as active.
+type PromiseBookEvidence struct {
+	Group                GroupIdentity
+	LocalMember          uint64
+	HasRecord            bool
+	Request              AuthorityRequest
+	GrantedAt            time.Duration
+	PromiseUntil         time.Duration
+	QuarantineConfigured bool
+	QuarantineAt         time.Duration
+	QuarantineUntil      time.Duration
+	QuarantineError      bool
 }
 
 // NewPromiseBook constructs a voter promise owner. A disabled policy is
@@ -647,6 +735,7 @@ func (book *PromiseBook) EnterRestartQuarantine() error {
 		book.quarantineErr = ErrDeadlineOverflow
 		return ErrDeadlineOverflow
 	}
+	book.quarantineAt = now
 	book.quarantineTill = quarantineTill
 	book.quarantineErr = nil
 	return nil
@@ -751,6 +840,30 @@ func (book *PromiseBook) PromiseUntil() (time.Duration, bool, error) {
 		return 0, false, err
 	}
 	return book.record.promiseUntil, true, nil
+}
+
+// Evidence returns the retained promise and restart-quarantine records without
+// consulting the clock. It is intentionally read-only; in particular it does
+// not clear an expired promise or renew a quarantine.
+func (book *PromiseBook) Evidence() PromiseBookEvidence {
+	if book == nil {
+		return PromiseBookEvidence{}
+	}
+	result := PromiseBookEvidence{
+		Group:                book.group,
+		LocalMember:          book.localMember,
+		QuarantineConfigured: book.quarantineTill != 0 || book.quarantineErr != nil,
+		QuarantineAt:         book.quarantineAt,
+		QuarantineUntil:      book.quarantineTill,
+		QuarantineError:      book.quarantineErr != nil,
+	}
+	if book.record != nil {
+		result.HasRecord = true
+		result.Request = book.record.request
+		result.GrantedAt = book.record.grant.GrantedAt
+		result.PromiseUntil = book.record.promiseUntil
+	}
+	return result
 }
 
 func multiplyDivideFloor(value, numerator, denominator uint64) (uint64, bool) {
