@@ -2,6 +2,7 @@ package durable
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"slices"
 	"sort"
@@ -136,16 +137,24 @@ func (c *Collection) preparePrimaryBatchTopology(
 		currentLeaves, currentLeaves[sourceIndex].localID, len(floors),
 	)
 	if !ok {
-		c.primaryMacroSplitRequired.Add(1)
-		return ErrPrimaryMacroSplitRequired
+		// A batch topology can need more identities than the current tablet can
+		// provide even though the triggering leaf itself is still splittable. Use
+		// the same bounded content-equivalent spill as the single-write path,
+		// then let the caller re-plan the untouched logical batch against the new
+		// generation. Keeping this one structural publication separate preserves
+		// the batch's journal and content-atomicity contract.
+		return c.structuralSplitPrimaryMacroTablet(state, &path, currentLeaves)
 	}
 	finalLeafCount := len(currentLeaves) - 1 + len(floors)
 	if finalLeafCount > storeio.TabletLocalIdentityLocalCount ||
 		(finalLeafCount+storeio.SegmentedTabletRouterRowsPerPage-1)/
 			storeio.SegmentedTabletRouterRowsPerPage >
 			storeio.SegmentedTabletRouterMaxPages {
-		c.primaryMacroSplitRequired.Add(1)
-		return ErrPrimaryMacroSplitRequired
+		// The K-way replacement may exhaust either the local-ID namespace or
+		// the bounded anchor-page geometry. Spill two trailing leaves and retry
+		// the exact batch plan after that publication, as structuralSplitPrimaryLeaf
+		// does when a single split reaches the same bound.
+		return c.structuralSplitPrimaryMacroTablet(state, &path, currentLeaves)
 	}
 
 	// Build the identity/fence-only final tablet now. This validates every
@@ -170,6 +179,12 @@ func (c *Collection) preparePrimaryBatchTopology(
 		}
 	}
 	_, anchorPages, err := storeio.PlanSegmentedTabletRouterAnchors(geometry)
+	if errors.Is(err, storeio.ErrSegmentedTabletRouterNoSpace) {
+		// Byte-packed fences can exhaust the anchor geometry before the simple
+		// leaf-count bound. The macro spill frees bounded routing space without
+		// touching the pending logical batch; the outer stage loop then re-plans.
+		return c.structuralSplitPrimaryMacroTablet(state, &path, currentLeaves)
+	}
 	if err != nil {
 		return err
 	}
