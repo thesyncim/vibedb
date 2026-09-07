@@ -446,9 +446,13 @@ type groupState struct {
 	// Append workers only touch these completion-list fields. queued owns next:
 	// one producer links the group, then the owner detaches it before clearing
 	// queued. Repeated worker edges coalesce into one bounded list entry.
-	asyncQueued            atomic.Bool
-	asyncNext              *groupState
-	key                    raftmember.GroupKey
+	asyncQueued atomic.Bool
+	asyncNext   *groupState
+	key         raftmember.GroupKey
+	// identity is the immutable full RuntimeIdentity captured at Add. Direct
+	// point admission reads this detached value under the lane lock instead of
+	// calling Runtime.Identity (which would clone labels per read).
+	identity               raftmember.RuntimeIdentity
 	memberID               uint64
 	sourceOwner            raftmember.AppliedSourceOwner
 	sourceToken            raftmember.AppliedSourceToken
@@ -681,7 +685,7 @@ func (host *Host) addRuntime(runtime memberRuntime) error {
 		}
 	}
 	group := &groupState{
-		key: key, memberID: identity.MemberID, runtime: runtime,
+		key: key, identity: identity, memberID: identity.MemberID, runtime: runtime,
 		sourceOwner: owner, sourceToken: sourceToken,
 		sourceClaimed: host.serving.ClaimSource != nil,
 	}
@@ -1182,6 +1186,111 @@ func (host *Host) tryValidateReadAuthorityToken(
 	return provider.ValidateReadAuthorityToken(token)
 }
 
+// PointReadAdmission is the detached result of one warm point-read attempt.
+// Identity and Status come from the same Runtime turn that supplied Token;
+// callers must keep using the serving permit and final token validation before
+// exposing source bytes.
+type PointReadAdmission struct {
+	Identity              raftmember.RuntimeIdentity
+	Status                raftmember.RuntimeStatus
+	Token                 raftauthority.AuthorityToken
+	AuthorityRoundAttempt bool
+}
+
+// pointReadAdmissionCheck is invoked while the owning execution lane holds
+// its lock. It must be pure, nonblocking, and safe for concurrent callers.
+type pointReadAdmissionCheck func(
+	raftmember.RuntimeIdentity, raftmember.RuntimeStatus, raftauthority.AuthorityToken,
+) bool
+
+// tryReadPointAdmission obtains one fresh Runtime status and authority token
+// under the lane lock, then invokes the caller's typed concurrent authorization
+// predicate before releasing that lock. A missing/expired/unsupported token is
+// an ordinary fallback result; no caller is allowed to infer authority from
+// this detached status alone.
+func (host *Host) tryReadPointAdmission(
+	key raftmember.GroupKey,
+	expected raftmember.RuntimeIdentity,
+	term uint64,
+	authorize pointReadAdmissionCheck,
+) (admitted, authorized bool, result PointReadAdmission, err error) {
+	group, err := host.lookup(key)
+	if err != nil {
+		return false, false, PointReadAdmission{}, err
+	}
+	if group.runtime == nil || group.identity != expected || group.memberID != expected.MemberID {
+		return false, false, PointReadAdmission{}, raftmodel.ErrNotLeader
+	}
+	status, err := group.runtime.Status()
+	if err != nil {
+		return false, false, PointReadAdmission{}, err
+	}
+	if status.MemberID != expected.MemberID || status.LeaderID != expected.MemberID ||
+		status.Term != term {
+		return false, false, PointReadAdmission{Identity: group.identity, Status: status}, raftmodel.ErrNotLeader
+	}
+	provider, ok := group.runtime.(interface {
+		ReadAuthorityToken() (raftauthority.AuthorityToken, error)
+	})
+	if !ok {
+		return false, false, PointReadAdmission{}, nil
+	}
+	token, tokenErr := provider.ReadAuthorityToken()
+	if tokenErr != nil || token.Group != raftauthorityGroup(key) ||
+		token.Term != status.Term || token.Holder != expected.MemberID ||
+		token.HolderIncarnation != expected.NodeIncarnation {
+		// The serialized Owner performs the legacy authorization before offering
+		// its bounded acquisition/renewal. Let that path handle a token miss so a
+		// concurrent caller cannot start protocol work before its serving gate.
+		return false, false, PointReadAdmission{}, nil
+	}
+	result = PointReadAdmission{Identity: group.identity, Status: status, Token: token}
+	if authorize == nil {
+		result.AuthorityRoundAttempt = host.offerPointReadAuthority(group)
+		return true, true, result, nil
+	}
+	if !authorize(group.identity, status, token) {
+		return true, false, result, nil
+	}
+	result.AuthorityRoundAttempt = host.offerPointReadAuthority(group)
+	return true, true, result, nil
+}
+
+// offerPointReadAuthority gives a warm read the same bounded renewal
+// opportunity as the serialized Owner path. A pending authority packet is
+// signaled through the existing coalesced async edge so an idle Owner wakes
+// immediately; no per-read notification is emitted when there is no packet.
+func (host *Host) offerPointReadAuthority(group *groupState) bool {
+	if host == nil || group == nil {
+		return false
+	}
+	ensure, ok := group.runtime.(authorityEnsureRuntime)
+	if !ok {
+		return false
+	}
+	if err := ensure.EnsureReadAuthorityRound(); err != nil {
+		// Renewal is advisory for a read that already holds a valid token. Do
+		// not wake the serialized owner for an Ensure failure; the unchanged
+		// token still goes through the cut's final validation before use.
+		return true
+	}
+	pending, pendingOK := group.runtime.(authorityOutboundPendingRuntime)
+	if !pendingOK {
+		// Preserve the established optional-interface behavior. Without a
+		// non-destructive pending probe the serialized Owner must receive a
+		// conservative wake after a successful Ensure. Signal the coalesced
+		// async edge as well so a sleeping scheduler observes that wake.
+		host.wake(group)
+		host.signalAsync(group)
+		return true
+	}
+	if pending.AuthorityOutboundPending() {
+		host.wake(group)
+		host.signalAsync(group)
+	}
+	return true
+}
+
 // ProposeControl synchronously admits one bounded, caller-authorized control
 // command to the local core. Unlike EnqueueProposal, success means admission
 // has occurred, so a caller can suppress in-flight retries without retaining
@@ -1526,6 +1635,10 @@ func (host *Host) InstallSQLGeneration(
 	if err = runtime.InstallSQLGeneration(database, apply, expectedSQL, expectedApply); err != nil {
 		return err
 	}
+	// Runtime.InstallSQLGeneration refreshes the manifest digest as part of the
+	// same serialized lane turn. Keep the detached admission identity aligned
+	// before making the resumed group runnable.
+	group.identity = group.runtime.Identity()
 	group.schemaQuiesced = false
 	group.schemaQuiescing = false
 	group.schemaTransitionFenced = false

@@ -77,6 +77,7 @@ func (server *ReplicatedServer) executeReplicatedQueryCallValidated(
 	authorize raftservice.ProposalAuthorization,
 	semanticValidated bool,
 	fusedPoint bool,
+	concurrentAuthorize ...raftservice.ConcurrentReadAuthorization,
 ) *ReplicatedResponse {
 	wireState := replicatedWireState(state)
 	refuse := func(code ReplicatedRefusalCode) *ReplicatedResponse {
@@ -136,10 +137,14 @@ func (server *ReplicatedServer) executeReplicatedQueryCallValidated(
 		maximum = int(inner.MaxResultBytes)
 	}
 	key := sha256.Sum256([]byte(inner.SQL))
+	var directAuthorize raftservice.ConcurrentReadAuthorization
+	if len(concurrentAuthorize) != 0 {
+		directAuthorize = concurrentAuthorize[0]
+	}
 	for tier := server.sqlHints.lookup(key); tier < len(replicatedSQLTiers); tier++ {
 		budget := replicatedSQLTiers[tier]
 		budget.resultBytes = min(budget.resultBytes, int(request.MaxValueBytes))
-		response, grow := server.executeReplicatedQueryTierCall(ctx, request, state, inner, owner, budget, maximum, authorize, fusedPoint)
+		response, grow := server.executeReplicatedQueryTierCall(ctx, request, state, inner, owner, budget, maximum, authorize, fusedPoint, directAuthorize)
 		if !grow {
 			if response.Kind == ReplicatedQueryResult {
 				server.sqlHints.record(key, tier)
@@ -308,7 +313,8 @@ func (server *ReplicatedServer) executeReplicatedQueryTier(ctx context.Context, 
 
 func (server *ReplicatedServer) executeReplicatedQueryTierCall(ctx context.Context, request *ReplicatedRequest, state raftservice.ServingState,
 	inner *ShardRequest, owner any, budget replicatedSQLBudget, maximum int,
-	authorize raftservice.ProposalAuthorization, fusedPoint bool) (*ReplicatedResponse, bool) {
+	authorize raftservice.ProposalAuthorization, fusedPoint bool,
+	concurrentAuthorize ...raftservice.ConcurrentReadAuthorization) (*ReplicatedResponse, bool) {
 	wireState := replicatedWireState(state)
 	refuse := func(code ReplicatedRefusalCode) (*ReplicatedResponse, bool) {
 		return server.fusedPointRefusalResponse(ctx, request, fusedPoint, &wireState,
@@ -339,9 +345,13 @@ func (server *ReplicatedServer) executeReplicatedQueryTierCall(ctx context.Conte
 	}()
 	if pointRead {
 		if pointOwner, ok := owner.(replicatedSQLPointReadOwner); ok {
+			var directAuthorize raftservice.ConcurrentReadAuthorization
+			if len(concurrentAuthorize) != 0 {
+				directAuthorize = concurrentAuthorize[0]
+			}
 			return server.executeReplicatedPointQueryTierCall(
 				ctx, request, state, inner, pointOwner, budget, maximum,
-				authorize, fusedPoint, lease, &retained,
+				authorize, directAuthorize, fusedPoint, lease, &retained,
 			)
 		}
 	}
@@ -414,6 +424,7 @@ func (server *ReplicatedServer) executeReplicatedPointQueryTierCall(
 	budget replicatedSQLBudget,
 	maximum int,
 	authorize raftservice.ProposalAuthorization,
+	concurrentAuthorize raftservice.ConcurrentReadAuthorization,
 	fusedPoint bool,
 	lease *replicatedSQLLease,
 	retained *bool,
@@ -451,8 +462,17 @@ func (server *ReplicatedServer) executeReplicatedPointQueryTierCall(
 	if fusedPoint {
 		pointFence = replicatedServingFence(request.Fence)
 	}
+	// The concurrent predicate is the complete native SQL authorization for
+	// this point attempt. Leave the legacy field empty so a queued fallback
+	// normalizes exactly this predicate instead of trusting two callbacks to
+	// remain equivalent.
+	pointAuthorize := authorize
+	if concurrentAuthorize != nil {
+		pointAuthorize = nil
+	}
 	err := owner.ReadLinearizablePointInto(ctx, raftservice.LinearizablePointReadRequest{
-		Fence: pointFence, Capability: request.Capability, Authorize: authorize,
+		Fence: pointFence, Capability: request.Capability, Authorize: pointAuthorize,
+		ConcurrentAuthorize: concurrentAuthorize,
 	}, &cut)
 	quorum.End()
 	if err != nil {

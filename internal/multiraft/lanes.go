@@ -186,6 +186,38 @@ func (lane *ExecutionLane) TryValidateReadAuthorityToken(
 	}
 	return true, err
 }
+
+// TryReadPointAdmission is the one-lock warm point-read admission edge. Busy
+// means no Runtime state was observed and callers must use the serialized
+// Owner path. The callback runs before the lane unlocks, after the Host has
+// obtained a fresh leader status and exact authority token.
+func (lane *ExecutionLane) TryReadPointAdmission(
+	key raftmember.GroupKey,
+	expected raftmember.RuntimeIdentity,
+	term uint64,
+	authorize func(raftmember.RuntimeIdentity, raftmember.RuntimeStatus, raftauthority.AuthorityToken) bool,
+) (attempted, admitted, authorized bool, result PointReadAdmission, err error) {
+	if err := lane.accepts(key); err != nil {
+		return false, false, false, PointReadAdmission{}, err
+	}
+	entry := &lane.set.lanes[lane.index]
+	if !entry.mu.TryLock() {
+		return false, false, false, PointReadAdmission{}, nil
+	}
+	defer entry.mu.Unlock()
+	entry.counters.calls++
+	if lane.set.state.Load() != executionLanesOpen || entry.host == nil {
+		entry.counters.rejected++
+		return true, false, false, PointReadAdmission{}, ErrHostClosed
+	}
+	admitted, authorized, result, err = entry.host.tryReadPointAdmission(
+		key, expected, term, authorize,
+	)
+	if err != nil {
+		entry.counters.rejected++
+	}
+	return true, admitted, authorized, result, err
+}
 func (lane *ExecutionLane) EnqueueTrackedProposal(key raftmember.GroupKey, data []byte, token ProposalToken) error {
 	if err := lane.accepts(key); err != nil {
 		return err
