@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 
 MODULE_PATH = Path(__file__).with_name("run-read-authority-restart-qualification.py")
@@ -78,6 +79,24 @@ def snapshot(node, values):
     return {"event": "snapshot", "pid": 100 + node, "node_id": f"{node:032x}",
             "serial": node, "read_authority_evidence_available": True,
             "read_authority_evidence": values}
+
+
+class _Completed:
+    def __init__(self, returncode):
+        self.returncode = returncode
+        self.stdout = b""
+
+
+class _StartupCopyFixture:
+    def __init__(self, records):
+        self.records = iter(records)
+
+    def run(self, argv, **kwargs):
+        record = next(self.records)
+        if record is None:
+            return _Completed(1)
+        Path(argv[-1]).write_text(json.dumps(record), encoding="utf-8")
+        return _Completed(0)
 
 
 class RestartQualificationContractTest(unittest.TestCase):
@@ -187,6 +206,20 @@ class RestartQualificationContractTest(unittest.TestCase):
         new_target["serve_argv"][-1] = "-reload-prepared-groups-old"
         with self.assertRaisesRegex(MODULE.RunnerError, "prepared serve-node argv"):
             MODULE.validate_selected_restart(old_target, new_target, old, new, GROUPS)
+
+    def test_startup_wait_rejects_stale_supervisor_pid(self):
+        stale = {"event": "read_authority_startup", "pid": 101, "serial": 1}
+        fresh = {"event": "read_authority_startup", "pid": 202, "serial": 1}
+        target = {"node_number": 2, "path": "/data/vibe/node-2/rf3-diagnostics.json"}
+        fixture = _StartupCopyFixture([stale, fresh])
+        with tempfile.TemporaryDirectory() as root, mock.patch.object(
+                MODULE, "validate_startup_value", side_effect=lambda value, *args: value) as validate:
+            observed, value = MODULE.wait_for_startup(
+                fixture, "container", target, Path(root), "initial", [], 1,
+                disallowed_pids={101})
+        self.assertEqual(observed["pid"], 202)
+        self.assertEqual(value["pid"], 202)
+        self.assertEqual(validate.call_count, 1)
 
 
 if __name__ == "__main__":

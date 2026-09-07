@@ -829,11 +829,7 @@ def validate_startup_policy(startup, target, expected_groups, policy_rows, conte
             raise RunnerError(context + " " + group_id + " policy does not match marker")
 
 
-def copy_startup(fixture, container, target, destination, label, expected_groups,
-                 policy_timing=None):
-    local = destination / (label + "-node" + str(target["node_number"]) + ".json")
-    copy_from_container(fixture, container, target["path"], local)
-    value = parse_json(local)
+def validate_startup_value(value, target, expected_groups, label, policy_timing=None):
     if value.get("event") != "read_authority_startup":
         raise RunnerError("startup diagnostic is not a read_authority_startup event")
     if _int(value.get("pid"), "startup pid", 2) != target["pid"]:
@@ -849,6 +845,52 @@ def copy_startup(fixture, container, target, destination, label, expected_groups
             raise RunnerError(label + " startup " + group_id + " has the wrong policy quarantine duration")
         clock_sample(group, label + " startup " + group_id)
     return value
+
+
+def copy_startup(fixture, container, target, destination, label, expected_groups,
+                 policy_timing=None):
+    local = destination / (label + "-node" + str(target["node_number"]) + ".json")
+    copy_from_container(fixture, container, target["path"], local)
+    return validate_startup_value(
+        parse_json(local), target, expected_groups, label, policy_timing)
+
+
+def wait_for_startup(fixture, container, target, destination, label, expected_groups,
+                     timeout, policy_timing=None, disallowed_pids=()):
+    """Wait for this boot's startup cut before the service-ready marker.
+
+    The diagnostic path is installed before startup evidence is emitted, so a
+    SIGUSR1 can be queued immediately after this function returns.  The
+    previous supervisor's diagnostic file may still be present while the
+    independent process is initializing; reject its PID rather than treating
+    that stale record as evidence for the new boot.
+    """
+    destination.mkdir(mode=0o700, parents=True, exist_ok=True)
+    local = destination / (label + "-node" + str(target["node_number"]) + ".json")
+    deadline = time.monotonic() + timeout
+    disallowed = set(disallowed_pids)
+    last = None
+    while time.monotonic() < deadline:
+        copied = fixture.run(["docker", "cp", container + ":" + target["path"], local],
+                             check=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        if copied.returncode == 0:
+            try:
+                value = parse_json(local)
+            except RunnerError:
+                value = None
+            if value is not None:
+                pid = _int(value.get("pid"), label + " startup pid", 2)
+                last = value
+                if value.get("event") != "read_authority_startup" or pid in disallowed:
+                    time.sleep(0.05)
+                    continue
+                observed = dict(target)
+                observed["pid"] = pid
+                return observed, validate_startup_value(
+                    value, observed, expected_groups, label, policy_timing)
+        time.sleep(0.05)
+    raise RunnerError("did not capture a fresh startup event before the ready marker for " +
+                      label + ": " + repr(last))
 
 
 def copy_policy_markers(fixture, container, targets, expected_groups, destination, label):
@@ -1238,7 +1280,8 @@ def re_match_serve_manifest(path):
     return path.endswith("/serve-rf3.vibejson") and "/node-" in path
 
 
-def launch_independent(fixture, container, targets, destination, logs, processes, timeout):
+def launch_independent(fixture, container, targets, destination, logs, processes, timeout,
+                       on_startup=None):
     for target in targets:
         log_path = destination / ("serve-node-" + str(target["node_number"]) + ".log")
         log = log_path.open("wb")
@@ -1248,6 +1291,13 @@ def launch_independent(fixture, container, targets, destination, logs, processes
         processes.append(process)
         target["launcher_argv"] = command
         target["log"] = log_path.name
+    if on_startup is not None:
+        # Startup evidence is emitted before the RF3 ready marker. Capture it
+        # (and the first quarantined tick) while the short boot quarantine is
+        # still observable; waiting for all ready markers here loses that
+        # window on slower Docker hosts.
+        for target in targets:
+            on_startup(target)
     for target, process in zip(targets, processes[-len(targets):]):
         fixture.wait_for_marker(process, destination / target["log"], ["vibedb-shard RF3 ready"], timeout)
     fixture.wait_for_tcp_ports(container, [5432], timeout)
@@ -1397,8 +1447,9 @@ def main(argv=None):
             "quarantine_ns": policy_timing["quarantine_ns"],
             "policy_version": policy_timing["policy_version"],
         }
+        prepared_ready_targets = serve_targets(fixture, destination, ready_inventory)
         manifest["policy_before"] = copy_policy_markers(
-            fixture, container, serve_targets(fixture, destination, ready_inventory),
+            fixture, container, prepared_ready_targets,
             expected_groups, destination / "policy", "before")
         stop_record = stop_supervisor_cleanly(
             fixture, container, supervisor, destination, selected.ready_timeout)
@@ -1415,6 +1466,7 @@ def main(argv=None):
             prepared_targets.append({
                 "node_id": node_id, "node_number": node_number(manifest_path),
                 "manifest_path": manifest_path,
+                "manifest_local_path": str(local_manifest),
                 "path": "/data/vibe/node-" + str(node_number(manifest_path)) + "/rf3-diagnostics.json",
                 "executable": "/bench/candidate-vibedb-shard",
                 "serve_argv": ["/bench/candidate-vibedb-shard", "serve-node", "-manifest",
@@ -1424,42 +1476,45 @@ def main(argv=None):
             # Ensure the retained manifest used for launch remains a canonical
             # prepared node manifest, rather than a synthetic runner fixture.
             manifest_node_id(manifest_value, manifest_path)
+        startup_before = {}
+        early_snapshots = {}
+        early_quarantine = {}
+        stale_pids = {target["pid"] for target in prepared_ready_targets}
+
+        def capture_initial_startup(target):
+            observed, startup = wait_for_startup(
+                fixture, container, target, destination / "startup", "initial",
+                expected_groups, selected.ready_timeout, policy_timing,
+                disallowed_pids=stale_pids)
+            target.update(observed)
+            startup_before[target["node_id"]] = startup
+            value, proof = poll_quarantine(
+                fixture, container, target, expected_groups, destination / "snapshots",
+                DEFAULT_QUARANTINE_WAIT,
+                startup_quarantine=startup_quarantine_map(startup, expected_groups),
+                policy_timing=policy_timing,
+                prior_serial=startup.get("serial", 0))
+            early_snapshots[target["node_id"]] = value
+            early_quarantine[target["node_id"]] = proof
+
         launch_independent(fixture, container, prepared_targets, destination, logs, processes,
-                           selected.ready_timeout)
+                           selected.ready_timeout, on_startup=capture_initial_startup)
         independent_inventory = fixture.process_inventory(container)
         fixture.save_inventory(destination, independent_inventory, "independent-ready")
         targets = serve_targets(fixture, destination, independent_inventory)
-        # Match target PID/path data to our retained manifest list and retain
-        # every startup event before sending a SIGUSR1 snapshot.
+        # Match target PID/path data to our retained manifest list. Startup
+        # events and the first quarantine cuts were captured before the ready
+        # marker by launch_independent's startup callback.
         by_node = {target["node_id"]: target for target in targets}
         for expected in prepared_targets:
             observed = by_node.get(expected["node_id"])
-            if observed is None or observed["manifest_path"] != expected["manifest_path"]:
+            if observed is None or observed["manifest_path"] != expected["manifest_path"] or \
+                    observed["pid"] != expected.get("pid"):
                 raise RunnerError("independent server did not use the prepared manifest")
-        startup_before = {}
-        for target in targets:
-            startup_before[target["node_id"]] = copy_startup(
-                fixture, container, target, destination / "startup", "initial", expected_groups,
-                policy_timing)
         manifest["events"].append({"event": "independent-startup-captured", "utc": utc_now(),
                                    "targets": [{k: v for k, v in target.items() if k not in {"log"}}
                                                for target in targets],
                                    "startup_files": sorted(startup_before)})
-        # The first same-boot snapshots prove that every group actually blocked
-        # a tick during quarantine. Capture these immediately after startup so
-        # the short local quarantine window cannot be consumed by marker copies.
-        early_snapshots = {}
-        early_quarantine = {}
-        for target in targets:
-            value, proof = poll_quarantine(
-                fixture, container, target, expected_groups, destination / "snapshots",
-                DEFAULT_QUARANTINE_WAIT,
-                startup_quarantine=startup_quarantine_map(
-                    startup_before[target["node_id"]], expected_groups),
-                policy_timing=policy_timing,
-                prior_serial=startup_before[target["node_id"]].get("serial", 0))
-            early_snapshots[target["node_id"]] = value
-            early_quarantine[target["node_id"]] = proof
         validate_snapshot_runtime_bindings(
             early_snapshots, targets, expected_groups, "initial quarantine snapshots")
         write_json(destination / "initial-quarantine.json", early_snapshots)
@@ -1563,12 +1618,14 @@ def main(argv=None):
         restart_argv = ["docker", "exec", container, *fault_target["serve_argv"]]
         restarted = subprocess.Popen(restart_argv, stdout=restart_log, stderr=subprocess.STDOUT)
         processes.append(restarted)
-        fixture.wait_for_marker(restarted, restart_log_path, ["vibedb-shard RF3 ready"], selected.ready_timeout)
-        fixture.wait_for_tcp_ports(container, [5432], selected.ready_timeout)
-        # The original holder's usable window is bounded by its own checked
-        # clock. Capture it at the first control point after the new voter is
-        # ready, before inventory, marker copies, or any all-node diagnostic
-        # work can manufacture a late positive result.
+        # Startup evidence is emitted after SIGUSR1 registration and before the
+        # RF3 ready marker. Use it to identify the replacement PID, then take
+        # the overlap and quarantine cuts before gateway recovery/ready checks
+        # consume the original holder's short remaining window.
+        post_fault_target, startup_after = wait_for_startup(
+            fixture, container, fault_target, destination / "startup", "restart",
+            expected_groups, selected.ready_timeout, policy_timing,
+            disallowed_pids={fault_target["pid"]})
         try:
             holder_after_restart = target_snapshot(
                 fixture, container, holder_target,
@@ -1587,17 +1644,6 @@ def main(argv=None):
                     "sampled after its local expiry" in str(exc):
                 raise MissedWindowError("original holder overlap was missed: " + str(exc)) from exc
             raise
-        post_inventory = fixture.process_inventory(container)
-        fixture.save_inventory(destination, post_inventory, "post-restart-ready")
-        post_targets = serve_targets(fixture, destination, post_inventory)
-        post_by_node = {target["node_id"]: target for target in post_targets}
-        post_fault_target = post_by_node[fault_target["node_id"]]
-        # Copy startup before any signal can replace its one compact startup cut.
-        startup_after = copy_startup(
-            fixture, container, post_fault_target, destination / "startup", "restart", expected_groups,
-            policy_timing)
-        # Capture the restarted voter's blocked quarantine tick before marker
-        # copies and all-node cuts can consume its short pre-deadline window.
         restart_quarantine_snapshot, restart_quarantine = poll_quarantine(
             fixture, container, post_fault_target, expected_groups,
             destination / "snapshots", DEFAULT_QUARANTINE_WAIT,
@@ -1605,6 +1651,16 @@ def main(argv=None):
             policy_timing=policy_timing,
             prior_serial=startup_after.get("serial", 0),
             label="quarantine-restart")
+        fixture.wait_for_marker(restarted, restart_log_path, ["vibedb-shard RF3 ready"], selected.ready_timeout)
+        fixture.wait_for_tcp_ports(container, [5432], selected.ready_timeout)
+        post_inventory = fixture.process_inventory(container)
+        fixture.save_inventory(destination, post_inventory, "post-restart-ready")
+        post_targets = serve_targets(fixture, destination, post_inventory)
+        post_by_node = {target["node_id"]: target for target in post_targets}
+        observed_post_fault = post_by_node[fault_target["node_id"]]
+        if observed_post_fault["pid"] != post_fault_target["pid"]:
+            raise RunnerError("post-restart inventory changed the PID identified by startup evidence")
+        post_fault_target = observed_post_fault
         restart_manifest = copy_manifest_and_compare(
             fixture, container, post_fault_target, destination / "published" / "restart",
             fault_target["manifest_sha256"])
