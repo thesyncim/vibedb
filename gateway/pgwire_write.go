@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"unsafe"
 
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/pgwire"
@@ -29,6 +30,22 @@ type postgresWriteStatement struct {
 	compiled   *query.DMLStatement
 	paramTypes []driver.ParamType
 	closed     bool
+}
+
+// RetainedBytes accounts the one backend-owned allocation that an ordinary
+// distributed VALUES write keeps after prepare: the statement wrapper and its
+// owned SQL clone. Catalog validation and parsing use temporary storage, and
+// this narrow shape has no compiled semantic plan, document map, or parameter
+// type sidecar. Any future path that adds one of those fields must return
+// false, preserving pgwire's conservative prepared-shape charge.
+func (p *postgresWriteStatement) RetainedBytes() (bytes int, ok bool) {
+	if p == nil || p.closed || p.compiled != nil || p.documents != nil || p.paramTypes != nil {
+		return 0, false
+	}
+	if len(p.text) > int(^uint(0)>>1)-int(unsafe.Sizeof(*p)) {
+		return 0, false
+	}
+	return int(unsafe.Sizeof(*p)) + len(p.text), true
 }
 
 func (s *postgresSession) prepareWrite(

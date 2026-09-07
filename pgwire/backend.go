@@ -98,6 +98,17 @@ type BackendStatementParseReuser interface {
 	ReusableForParse() bool
 }
 
+// BackendStatementRetainedBytes is the optional ownership contract for a
+// prepared backend statement. The returned count covers only storage owned by
+// that statement; pgwire still charges its fixed preparation allowance and
+// its own parameter metadata separately. Implementations must return false
+// when the statement has an ownership graph they cannot account exactly (for
+// example, a compiled plan or a lazily growing sidecar). A true result must
+// remain an upper bound until Close; pgwire does not poll the value again.
+type BackendStatementRetainedBytes interface {
+	RetainedBytes() (bytes int, ok bool)
+}
+
 // BackendStatementParamTyper is the optional analyzed SQL-input contract of a
 // prepared statement. Keeping it separate from BackendStatement preserves
 // compatibility for external backends whose schemaless parameters are all

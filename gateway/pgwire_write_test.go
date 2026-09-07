@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"unsafe"
 
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/pgwire"
@@ -81,6 +82,59 @@ func TestPostgreSQLWriteUsesDurableCallbackAndDocumentParameters(t *testing.T) {
 	s.SetCancelFlag(&flag)
 	if _, err = p.Exec(t.Context(), []any{&doc, &id}); !errors.Is(err, query.ErrCanceled) || writes != 1 {
 		t.Fatal("canceled write dispatched")
+	}
+}
+
+func TestPostgreSQLWriteRetainedBytesOnlyClaimsOwnedOrdinaryShape(t *testing.T) {
+	executor, _ := newSQLRF3TestExecutor(t)
+	authority := serviceauthz.Authority{Generation: 1}
+	authority.Node[0] = 1
+	backend := &PostgreSQLBackend{
+		Executor: executor,
+		Authorize: func(pgwire.SessionIdentity) (serviceauthz.Authority, error) {
+			return authority, nil
+		},
+		Write: func(context.Context, serviceauthz.Authority, Query) (*Result, error) {
+			return &Result{Kind: shardservice.ResponseCompletion}, nil
+		},
+	}
+	session, err := backend.NewSession(t.Context(), pgwire.SessionIdentity{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	const source = `INSERT INTO messages (id, n) VALUES ('a', 1)`
+	statement, err := session.Prepare(t.Context(), source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared := statement.(*postgresWriteStatement)
+	retained, ok := prepared.RetainedBytes()
+	want := int(unsafe.Sizeof(*prepared)) + len(prepared.text)
+	if !ok || retained != want {
+		t.Fatalf("ordinary write retained bytes = (%d, %v), want (%d, true)", retained, ok, want)
+	}
+	prepared.documents = map[int]int{0: 1}
+	if _, ok := prepared.RetainedBytes(); ok {
+		t.Fatal("document sidecar was reported as exact ordinary storage")
+	}
+	prepared.documents = nil
+	prepared.paramTypes = []driver.ParamType{driver.ParamTypeText}
+	if _, ok := prepared.RetainedBytes(); ok {
+		t.Fatal("parameter-type sidecar was reported as exact ordinary storage")
+	}
+	prepared.paramTypes = nil
+	prepared.compiled = new(query.DMLStatement)
+	if _, ok := prepared.RetainedBytes(); ok {
+		t.Fatal("compiled DML plan was reported as exact ordinary storage")
+	}
+	prepared.compiled.Release()
+	prepared.compiled = nil
+	if err := statement.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := prepared.RetainedBytes(); ok {
+		t.Fatal("closed write statement was reported as retained")
 	}
 }
 

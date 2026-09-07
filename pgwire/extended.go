@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"unicode/utf8"
+	"unsafe"
 
 	"github.com/thesyncim/vibedb/internal/pginput"
 	"github.com/thesyncim/vibedb/query"
@@ -298,12 +299,24 @@ func preparedDerivedCharge(stmt *prepared) int {
 		return 0
 	}
 	charge := preparedPlanFixedBytes
+	if retained, ok := preparedBackendRetainedBytes(stmt); ok {
+		// A backend-owned statement can replace the generic SQL-derived
+		// estimate only when it accounts its complete reachable representation.
+		// Unknown or compiled shapes stay on the conservative multiplier path.
+		charge = preparedChargeAdd(charge, retained)
+		charge = preparedChargeMul(charge, cap(stmt.paramKinds), int(unsafe.Sizeof(sqldriver.ParamKind(0))))
+		charge = preparedChargeMul(charge, cap(stmt.paramTypes), int(unsafe.Sizeof(sqldriver.ParamType(0))))
+		charge = preparedChargeMul(charge, cap(stmt.paramTypePositions), int(unsafe.Sizeof(int(0))))
+		charge = preparedChargeMul(charge, cap(stmt.paramPositions), int(unsafe.Sizeof(int(0))))
+		charge = preparedChargeMul(charge, cap(stmt.paramOrder), int(unsafe.Sizeof(int(0))))
+		return charge
+	}
 	charge = preparedChargeMul(charge, len(stmt.sql), preparedPlanByteMultiplier)
-	charge = preparedChargeMul(charge, cap(stmt.paramKinds), 8)
-	charge = preparedChargeMul(charge, cap(stmt.paramTypes), 8)
-	charge = preparedChargeMul(charge, cap(stmt.paramTypePositions), 8)
-	charge = preparedChargeMul(charge, cap(stmt.paramPositions), 8)
-	charge = preparedChargeMul(charge, cap(stmt.paramOrder), 8)
+	charge = preparedChargeMul(charge, cap(stmt.paramKinds), int(unsafe.Sizeof(sqldriver.ParamKind(0))))
+	charge = preparedChargeMul(charge, cap(stmt.paramTypes), int(unsafe.Sizeof(sqldriver.ParamType(0))))
+	charge = preparedChargeMul(charge, cap(stmt.paramTypePositions), int(unsafe.Sizeof(int(0))))
+	charge = preparedChargeMul(charge, cap(stmt.paramPositions), int(unsafe.Sizeof(int(0))))
+	charge = preparedChargeMul(charge, cap(stmt.paramOrder), int(unsafe.Sizeof(int(0))))
 	if stmt.paramOrder != nil {
 		// rewriteNumberedParameters preserves byte length.
 		charge = preparedChargeAdd(charge, len(stmt.sql))
@@ -311,8 +324,19 @@ func preparedDerivedCharge(stmt *prepared) int {
 	return charge
 }
 
+func preparedBackendRetainedBytes(stmt *prepared) (int, bool) {
+	if stmt == nil || stmt.runtime == nil {
+		return 0, false
+	}
+	reporter, ok := stmt.runtime.(BackendStatementRetainedBytes)
+	if !ok {
+		return 0, false
+	}
+	return reporter.RetainedBytes()
+}
+
 func preparedChargeMul(total, n, multiplier int) int {
-	if total > maxPreparedInputBytes ||
+	if total < 0 || n < 0 || multiplier <= 0 || total > maxPreparedInputBytes ||
 		n > (maxPreparedInputBytes-total)/multiplier {
 		return maxPreparedInputBytes + 1
 	}
@@ -320,7 +344,7 @@ func preparedChargeMul(total, n, multiplier int) int {
 }
 
 func preparedChargeAdd(total, n int) int {
-	if total > maxPreparedInputBytes || n > maxPreparedInputBytes-total {
+	if total < 0 || n < 0 || total > maxPreparedInputBytes || n > maxPreparedInputBytes-total {
 		return maxPreparedInputBytes + 1
 	}
 	return total + n
@@ -332,7 +356,8 @@ func preparedChargeAdd(total, n int) int {
 // through a tiny SQL string carrying tens of thousands of copied OIDs.
 func preparedInputCharge(name, query string, oidCount int) int {
 	total := len(name) + len(query)
-	if oidCount > (maxPreparedInputBytes-total)/4 {
+	if total < 0 || total > maxPreparedInputBytes || oidCount < 0 ||
+		oidCount > (maxPreparedInputBytes-total)/4 {
 		return maxPreparedInputBytes + 1
 	}
 	return total + 4*oidCount
