@@ -1847,6 +1847,14 @@ type recoveryStorage struct {
 	commitFloor uint64
 }
 
+// Snapshot is intentionally unavailable through the RawNode recovery view.
+// NewNode has already consumed the durable snapshot before wrapping the store;
+// this method only prevents Raft from advertising a snapshot that the
+// immutable-base WAL runtime cannot transfer and acknowledge.
+func (s recoveryStorage) Snapshot() (*pb.Snapshot, error) {
+	return nil, raft.ErrSnapshotTemporarilyUnavailable
+}
+
 func (s recoveryStorage) InitialState() (*pb.HardState, *pb.ConfState, error) {
 	hardState, _, err := s.StableStore.InitialState()
 	if err == nil && hardState != nil && hardState.GetCommit() < s.commitFloor {
