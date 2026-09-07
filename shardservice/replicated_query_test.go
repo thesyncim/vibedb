@@ -524,6 +524,92 @@ func TestReplicatedSQLSinglePointReadRefusalsSkipDataSnapshot(t *testing.T) {
 	}
 }
 
+func TestReplicatedSQLFusedPointRefusalEnvelopeUsesWitness(t *testing.T) {
+	primary := PrimaryKeyReadRequest{
+		Relation: 1, MaxDocumentBytes: 1024,
+		PrimaryPath: []byte("/id"), Keys: [][]byte{[]byte("k")},
+	}
+	baseState := testReplicatedServingState()
+	baseState.Identity.Distribution, baseState.Identity.Shard = "data", "all"
+	changedState := baseState
+	changedState.Command.SchemaGeneration++
+	tests := []struct {
+		name       string
+		ownerState raftservice.ServingState
+		pointErr   error
+		probeErr   error
+		cancel     bool
+		wantKind   ReplicatedResponseKind
+		wantCode   ReplicatedRefusalCode
+		wantState  bool
+		wantFence  ReplicatedFence
+	}{
+		{name: "changed fence", ownerState: changedState,
+			pointErr: raftservice.ErrServingAuthorization,
+			wantKind: ReplicatedRefusal, wantCode: ReplicatedRefusalStaleFence,
+			wantState: true, wantFence: replicatedWireState(changedState).Fence},
+		{name: "not leader witness", ownerState: baseState,
+			pointErr: raftmodel.ErrNotLeader,
+			wantKind: ReplicatedNotLeader, wantState: true,
+			wantFence: replicatedWireState(baseState).Fence},
+		{name: "refresh unavailable", ownerState: baseState,
+			pointErr: raftservice.ErrServingAuthorization, probeErr: errors.New("probe unavailable"),
+			wantKind: ReplicatedRefusal, wantCode: ReplicatedRefusalUnavailable},
+		{name: "canceled before witness", ownerState: baseState,
+			pointErr: raftservice.ErrServingAuthorization, cancel: true,
+			wantKind: ReplicatedRefusal, wantCode: ReplicatedRefusalUnavailable},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request, inner := testReplicatedSQLPointCall(baseState, primary)
+			owner := &replicatedSQLPointPathOwner{
+				fakeReplicatedOwner: &fakeReplicatedOwner{
+					state: baseState, probeErr: test.probeErr,
+				},
+				pointErr: test.pointErr,
+			}
+			if test.ownerState != (raftservice.ServingState{}) {
+				owner.state = test.ownerState
+			}
+			server := &ReplicatedServer{
+				owner: owner, requestTimeout: time.Second,
+				frames: replicatedFrameByteBudget{limit: 2 << 20},
+			}
+			callCtx := t.Context()
+			if test.cancel {
+				var cancel context.CancelFunc
+				callCtx, cancel = context.WithCancel(callCtx)
+				cancel()
+			}
+			response := server.executeReplicatedAuthenticatedCallValidated(
+				callCtx, request, true, inner, true,
+			)
+			if response.Kind != test.wantKind || response.Refusal != test.wantCode ||
+				response.HasState != test.wantState ||
+				(test.wantState && response.State.Fence != test.wantFence) ||
+				!validReplicatedResponse(response) {
+				t.Fatalf("response=%+v, want kind=%v code=%v state=%t", response,
+					test.wantKind, test.wantCode, test.wantState)
+			}
+			var frame bytes.Buffer
+			if err := EncodeReplicatedResponse(&frame, response); err != nil {
+				t.Fatalf("encode response=%+v: %v", response, err)
+			}
+			decoded, err := DecodeReplicatedResponse(&frame)
+			if err != nil || !validReplicatedResponse(decoded) {
+				t.Fatalf("decoded=%+v err=%v", decoded, err)
+			}
+			wantPointCalls := 1
+			if test.cancel {
+				wantPointCalls = 0
+			}
+			if owner.pointCall != wantPointCalls || owner.dataCall != 0 {
+				t.Fatalf("point/data calls=%d/%d, want %d/0", owner.pointCall, owner.dataCall, wantPointCalls)
+			}
+		})
+	}
+}
+
 func TestReplicatedSQLPointAdmissionIncludesCatalogFrozenDocumentBound(t *testing.T) {
 	state := testReplicatedServingState()
 	state.Identity.Distribution, state.Identity.Shard = "data", "all"
@@ -543,7 +629,7 @@ func TestReplicatedSQLPointAdmissionIncludesCatalogFrozenDocumentBound(t *testin
 	}
 	server.frames.limit = charge - 1
 	response, grow := server.executeReplicatedQueryTierCall(
-		t.Context(), request, state, inner, owner, budget, MaxReplicatedSQLResultBytes, nil,
+		t.Context(), request, state, inner, owner, budget, MaxReplicatedSQLResultBytes, nil, false,
 	)
 	if grow || response.Kind != ReplicatedRefusal || response.Refusal != ReplicatedRefusalAdmissionBound {
 		t.Fatalf("under-reserved point response=%+v grow=%v", response, grow)
@@ -556,7 +642,7 @@ func TestReplicatedSQLPointAdmissionIncludesCatalogFrozenDocumentBound(t *testin
 	// classification still releases the complete tier lease.
 	server.frames.limit = charge
 	response, grow = server.executeReplicatedQueryTierCall(
-		t.Context(), request, state, inner, owner, budget, MaxReplicatedSQLResultBytes, nil,
+		t.Context(), request, state, inner, owner, budget, MaxReplicatedSQLResultBytes, nil, false,
 	)
 	if grow || response.Kind != ReplicatedNotLeader {
 		t.Fatalf("exactly reserved point response=%+v grow=%v", response, grow)

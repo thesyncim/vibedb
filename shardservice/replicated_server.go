@@ -563,9 +563,31 @@ func (server *ReplicatedServer) executeReplicatedAuthenticatedCallValidated(
 ) *ReplicatedResponse {
 	authorizedOwner, fusedProposal := server.owner.(replicatedAuthorizedOwner)
 	fusedProposal = fusedProposal && request.Operation == ReplicatedPropose
-	fusedRead := replicatedReadOperation(request.Operation)
+	// QueryLeader normally starts with a status probe so the SQL identity can
+	// be checked before taking a read cut. A canonical single-key request can
+	// establish that same identity from the serialized point cut, avoiding the
+	// duplicate owner-lane barrier. Decode a remote nested SQL frame once here;
+	// local semantic callers already supplied the typed request.
+	query := sql
+	queryValidated := semanticValidated
+	if request.Operation == ReplicatedQueryLeader {
+		if query == nil {
+			decoded, decodeErr := DecodeReplicatedSQLRequest(request.Query)
+			if decodeErr == nil {
+				query, queryValidated = decoded, true
+			}
+		} else if !queryValidated && ValidateRequest(query) == nil {
+			queryValidated = true
+		}
+	}
+	fusedPoint := request.Operation == ReplicatedQueryLeader && query != nil &&
+		queryValidated && replicatedSQLPointReadEligible(query)
+	if fusedPoint {
+		_, fusedPoint = server.owner.(replicatedSQLPointReadOwner)
+	}
+	fusedRead := replicatedReadOperation(request.Operation) || fusedPoint
 	var readAuthorize raftservice.ProposalAuthorization
-	if fusedRead {
+	if fusedRead || request.Operation == ReplicatedQueryLeader {
 		readAuthorize = func(candidate raftservice.ServingState) bool {
 			return server.serving == nil || server.serving(candidate) ||
 				(authenticated && server.transition != nil && server.transition(candidate, request))
@@ -643,10 +665,7 @@ func (server *ReplicatedServer) executeReplicatedAuthenticatedCallValidated(
 		}
 	}
 	if request.Operation == ReplicatedQueryLeader {
-		return server.executeReplicatedQueryCallValidated(ctx, request, state, sql, func(candidate raftservice.ServingState) bool {
-			return server.serving == nil || server.serving(candidate) ||
-				(authenticated && server.transition != nil && server.transition(candidate, request))
-		}, semanticValidated)
+		return server.executeReplicatedQueryCallValidated(ctx, request, state, query, readAuthorize, queryValidated, fusedPoint)
 	}
 	if request.Operation == ReplicatedReadBatchLeader {
 		batchOwner, ok := server.owner.(interface {
@@ -1306,6 +1325,18 @@ func replicatedCompletionInvalidReasons(
 
 func membershipRefusal(state ReplicatedMemberState, code ReplicatedRefusalCode) *ReplicatedResponse {
 	return &ReplicatedResponse{Kind: ReplicatedRefusal, Refusal: code, HasState: true, State: state}
+}
+
+func replicatedServingFence(fence ReplicatedFence) raftservice.ServingFence {
+	return raftservice.ServingFence{
+		Group:                fence.Group,
+		AllocationGeneration: fence.AllocationGeneration,
+		Command:              fence.Command,
+		MemberID:             fence.MemberID,
+		StoreID:              fence.StoreID,
+		NodeIncarnation:      fence.NodeIncarnation,
+		Term:                 fence.Term,
+	}
 }
 
 func replicatedWireState(state raftservice.ServingState) ReplicatedMemberState {

@@ -66,7 +66,7 @@ func (server *ReplicatedServer) executeReplicatedQueryCall(
 	semantic *ShardRequest,
 	authorize raftservice.ProposalAuthorization,
 ) *ReplicatedResponse {
-	return server.executeReplicatedQueryCallValidated(ctx, request, state, semantic, authorize, false)
+	return server.executeReplicatedQueryCallValidated(ctx, request, state, semantic, authorize, false, false)
 }
 
 func (server *ReplicatedServer) executeReplicatedQueryCallValidated(
@@ -76,12 +76,14 @@ func (server *ReplicatedServer) executeReplicatedQueryCallValidated(
 	semantic *ShardRequest,
 	authorize raftservice.ProposalAuthorization,
 	semanticValidated bool,
+	fusedPoint bool,
 ) *ReplicatedResponse {
 	wireState := replicatedWireState(state)
 	refuse := func(code ReplicatedRefusalCode) *ReplicatedResponse {
-		return &ReplicatedResponse{Kind: ReplicatedRefusal, Refusal: code, HasState: true, State: wireState}
+		return server.fusedPointRefusalResponse(ctx, request, fusedPoint, &wireState,
+			ReplicatedRefusal, code)
 	}
-	if request.Fence != wireState.Fence {
+	if !fusedPoint && request.Fence != wireState.Fence {
 		return refuse(ReplicatedRefusalStaleFence)
 	}
 	inner := semantic
@@ -97,11 +99,14 @@ func (server *ReplicatedServer) executeReplicatedQueryCallValidated(
 			return refuse(ReplicatedRefusalStaleFence)
 		}
 	}
-	if inner.Authority != request.Authority ||
-		string(inner.Distribution) != state.Identity.Distribution || string(inner.Shard) != state.Identity.Shard ||
-		uint64(inner.AllocationGeneration) != request.Fence.AllocationGeneration ||
-		uint64(inner.RoutingVersion) != request.Fence.Command.RoutingVersion ||
-		uint64(inner.OwnershipEpoch) != request.Fence.Command.OwnershipEpoch {
+	if inner.Authority != request.Authority {
+		return refuse(ReplicatedRefusalStaleFence)
+	}
+	// A fused point call has no status probe to populate state. Its exact
+	// owner fence and the SQL allocation identity are checked immediately after
+	// ReadLinearizablePointInto returns the serialized owner cut. Until then,
+	// caller supplied Distribution and Shard names are only untrusted inputs.
+	if !fusedPoint && !replicatedSQLRequestMatchesState(request, inner, state) {
 		return refuse(ReplicatedRefusalStaleFence)
 	}
 	owner := any(server.owner)
@@ -134,7 +139,7 @@ func (server *ReplicatedServer) executeReplicatedQueryCallValidated(
 	for tier := server.sqlHints.lookup(key); tier < len(replicatedSQLTiers); tier++ {
 		budget := replicatedSQLTiers[tier]
 		budget.resultBytes = min(budget.resultBytes, int(request.MaxValueBytes))
-		response, grow := server.executeReplicatedQueryTierCall(ctx, request, state, inner, owner, budget, maximum, authorize)
+		response, grow := server.executeReplicatedQueryTierCall(ctx, request, state, inner, owner, budget, maximum, authorize, fusedPoint)
 		if !grow {
 			if response.Kind == ReplicatedQueryResult {
 				server.sqlHints.record(key, tier)
@@ -298,15 +303,16 @@ func replicatedSQLPointReadEligible(req *ShardRequest) bool {
 
 func (server *ReplicatedServer) executeReplicatedQueryTier(ctx context.Context, request *ReplicatedRequest, state raftservice.ServingState,
 	inner *ShardRequest, owner any, budget replicatedSQLBudget, maximum int) (*ReplicatedResponse, bool) {
-	return server.executeReplicatedQueryTierCall(ctx, request, state, inner, owner, budget, maximum, nil)
+	return server.executeReplicatedQueryTierCall(ctx, request, state, inner, owner, budget, maximum, nil, false)
 }
 
 func (server *ReplicatedServer) executeReplicatedQueryTierCall(ctx context.Context, request *ReplicatedRequest, state raftservice.ServingState,
 	inner *ShardRequest, owner any, budget replicatedSQLBudget, maximum int,
-	authorize raftservice.ProposalAuthorization) (*ReplicatedResponse, bool) {
+	authorize raftservice.ProposalAuthorization, fusedPoint bool) (*ReplicatedResponse, bool) {
 	wireState := replicatedWireState(state)
 	refuse := func(code ReplicatedRefusalCode) (*ReplicatedResponse, bool) {
-		return &ReplicatedResponse{Kind: ReplicatedRefusal, Refusal: code, HasState: true, State: wireState}, false
+		return server.fusedPointRefusalResponse(ctx, request, fusedPoint, &wireState,
+			ReplicatedRefusal, code), false
 	}
 	charge, chargeOK := budget.reservationBytesChecked(0)
 	pointRead := replicatedSQLPointReadEligible(inner)
@@ -335,7 +341,7 @@ func (server *ReplicatedServer) executeReplicatedQueryTierCall(ctx context.Conte
 		if pointOwner, ok := owner.(replicatedSQLPointReadOwner); ok {
 			return server.executeReplicatedPointQueryTierCall(
 				ctx, request, state, inner, pointOwner, budget, maximum,
-				authorize, lease, &retained,
+				authorize, fusedPoint, lease, &retained,
 			)
 		}
 	}
@@ -408,20 +414,20 @@ func (server *ReplicatedServer) executeReplicatedPointQueryTierCall(
 	budget replicatedSQLBudget,
 	maximum int,
 	authorize raftservice.ProposalAuthorization,
+	fusedPoint bool,
 	lease *replicatedSQLLease,
 	retained *bool,
 ) (*ReplicatedResponse, bool) {
 	wireState := replicatedWireState(state)
 	refuse := func(code ReplicatedRefusalCode) (*ReplicatedResponse, bool) {
-		return &ReplicatedResponse{
-			Kind: ReplicatedRefusal, Refusal: code,
-			HasState: true, State: wireState,
-		}, false
+		return server.fusedPointRefusalResponse(ctx, request, fusedPoint, &wireState,
+			ReplicatedRefusal, code), false
 	}
 	pointRefuse := func(err error) (*ReplicatedResponse, bool) {
 		switch {
 		case errors.Is(err, raftmodel.ErrNotLeader), errors.Is(err, raftmodel.ErrReadLeadershipLost):
-			return &ReplicatedResponse{Kind: ReplicatedNotLeader, HasState: true, State: wireState}, false
+			return server.fusedPointRefusalResponse(ctx, request, fusedPoint, &wireState,
+				ReplicatedNotLeader, ReplicatedRefusalNone), false
 		case errors.Is(err, raftservice.ErrServingFence):
 			return refuse(ReplicatedRefusalStaleFence)
 		case errors.Is(err, raftservice.ErrServingAuthorization):
@@ -441,17 +447,32 @@ func (server *ReplicatedServer) executeReplicatedPointQueryTierCall(
 	primary := inner.PrimaryKeyRead
 	var cut raftservice.LinearizablePointReadCut
 	quorum := trace.StartRegion(ctx, "sql.read.quorum")
+	pointFence := state.Fence()
+	if fusedPoint {
+		pointFence = replicatedServingFence(request.Fence)
+	}
 	err := owner.ReadLinearizablePointInto(ctx, raftservice.LinearizablePointReadRequest{
-		Fence: state.Fence(), Capability: request.Capability, Authorize: authorize,
+		Fence: pointFence, Capability: request.Capability, Authorize: authorize,
 	}, &cut)
 	quorum.End()
 	if err != nil {
 		return pointRefuse(err)
 	}
 	defer cut.Close()
+	cutState := cut.State()
+	wireState = replicatedWireState(cutState)
+	if !replicatedSQLRequestMatchesState(request, inner, cutState) ||
+		cutState.Status.MemberID != cutState.Identity.MemberID ||
+		cutState.Status.LeaderID != cutState.Identity.MemberID {
+		return refuse(ReplicatedRefusalStaleFence)
+	}
 	point, err := cut.PointReadInto(
 		ctx, primary.Relation, primary.Keys[0], int(primary.MaxDocumentBytes), nil,
 	)
+	// Authority-backed cuts can replace their admission with a fresh ReadIndex
+	// cut after a final validation race. Carry the final serialized witness into
+	// both the result and any refusal emitted below.
+	wireState = replicatedWireState(cut.State())
 	if err != nil {
 		return pointRefuse(err)
 	}
@@ -493,6 +514,62 @@ func (server *ReplicatedServer) executeReplicatedPointQueryTierCall(
 	}
 	*retained = true
 	return response, false
+}
+
+func replicatedSQLRequestMatchesState(
+	request *ReplicatedRequest,
+	inner *ShardRequest,
+	state raftservice.ServingState,
+) bool {
+	if request == nil || inner == nil {
+		return false
+	}
+	wireState := replicatedWireState(state)
+	return request.Fence == wireState.Fence &&
+		inner.Authority == request.Authority &&
+		string(inner.Distribution) == state.Identity.Distribution &&
+		string(inner.Shard) == state.Identity.Shard &&
+		uint64(inner.AllocationGeneration) == request.Fence.AllocationGeneration &&
+		uint64(inner.RoutingVersion) == request.Fence.Command.RoutingVersion &&
+		uint64(inner.OwnershipEpoch) == request.Fence.Command.OwnershipEpoch
+}
+
+// fusedPointRefusalResponse performs the one bounded status refresh that a
+// fused point call may need after failing before it has an accepted cut. A
+// response with a state must carry an actual owner witness; if that witness is
+// unavailable, it returns the grammar's no-state unavailable form. kind is
+// normally ReplicatedRefusal; retaining ReplicatedNotLeader lets a refreshed
+// leader hint drive the gateway's existing retry path.
+func (server *ReplicatedServer) fusedPointRefusalResponse(
+	ctx context.Context,
+	request *ReplicatedRequest,
+	fusedPoint bool,
+	wireState *ReplicatedMemberState,
+	kind ReplicatedResponseKind,
+	code ReplicatedRefusalCode,
+) *ReplicatedResponse {
+	if wireState == nil || !validReplicatedMemberState(*wireState) {
+		if !fusedPoint || wireState == nil || server == nil || server.owner == nil ||
+			request == nil || ctx == nil || context.Cause(ctx) != nil {
+			return &ReplicatedResponse{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalUnavailable}
+		}
+		refreshed, err := server.owner.Probe(ctx, request.Fence.Group)
+		if err != nil {
+			*wireState = ReplicatedMemberState{}
+			return &ReplicatedResponse{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalUnavailable}
+		}
+		candidate := replicatedWireState(refreshed)
+		if !validReplicatedMemberState(candidate) {
+			*wireState = ReplicatedMemberState{}
+			return &ReplicatedResponse{Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalUnavailable}
+		}
+		*wireState = candidate
+	}
+	if kind == ReplicatedRefusal && code != ReplicatedRefusalNone &&
+		request != nil && wireState.Fence != request.Fence {
+		code = ReplicatedRefusalStaleFence
+	}
+	return &ReplicatedResponse{Kind: kind, Refusal: code, HasState: true, State: *wireState}
 }
 
 // These are the response shapes admitted by the RF3 SQL wire budget.

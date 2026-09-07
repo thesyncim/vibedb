@@ -162,6 +162,12 @@ func (executor *ReplicatedExecutor) QuerySQL(ctx context.Context, route Replicat
 		if validReplicatedUnauthorizedWithoutState(response) {
 			return nil, &ReplicatedRefusalError{Code: response.Refusal}
 		}
+		if validReplicatedUnavailableWithoutState(response) {
+			executor.leaderHints.invalidate(route, endpoint, state)
+			joined = errors.Join(joined, &ReplicatedRefusalError{Code: response.Refusal})
+			preferred = 0
+			continue
+		}
 		if !validReplicatedResponseState(response) || response.State.Fence.Group != route.Group ||
 			response.State.Fence.AllocationGeneration != route.AllocationGeneration || response.State.Fence.Command != route.Command {
 			return nil, ErrStaleGeneration

@@ -22,6 +22,7 @@ import (
 
 type fakeReplicatedOwner struct {
 	state                raftservice.ServingState
+	probeErr             error
 	result               raftservice.Result
 	err                  error
 	blockSubmit          bool
@@ -206,7 +207,7 @@ func (owner *fakeReplicatedOwner) Probe(
 	raftmember.GroupKey,
 ) (raftservice.ServingState, error) {
 	owner.probeCalls.Add(1)
-	return owner.state, nil
+	return owner.state, owner.probeErr
 }
 
 func (owner *fakeReplicatedOwner) SubmitOwned(
