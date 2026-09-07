@@ -993,8 +993,28 @@ func (e *Executor) dispatch(ctx context.Context, pl *plan, p Profile) (*Result, 
 // keeps the exact same cancellation instant with no timer, no propagation
 // linkage, and a no-op deferred cancel.
 func tightenTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	if d <= 0 {
+		// Preserve WithTimeout's already-expired semantics exactly: a
+		// non-positive fence must report done even when the parent is live.
+		return context.WithTimeout(ctx, d)
+	}
 	if deadline, ok := ctx.Deadline(); ok && !deadline.After(time.Now().Add(d)) {
 		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, d)
+}
+
+// tightenTimeoutSignal is tightenTimeout for fences whose cancel doubles as
+// a fail-fast signal (fanout aborts sibling shards through it). A no-op
+// cancel would silently drop that signal, so an already-tighter parent is
+// inherited through WithCancel: explicit cancellation still propagates,
+// only the redundant timer is skipped.
+func tightenTimeoutSignal(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	if d <= 0 {
+		return context.WithTimeout(ctx, d)
+	}
+	if deadline, ok := ctx.Deadline(); ok && !deadline.After(time.Now().Add(d)) {
+		return context.WithCancel(ctx)
 	}
 	return context.WithTimeout(ctx, d)
 }
@@ -1072,7 +1092,7 @@ func (e *Executor) fanout(ctx context.Context, pl *plan, p Profile) (*Result, er
 	if len(pl.aggregates) != 0 && len(pl.groupKeys) != 0 {
 		return e.fanoutGroupedBatches(ctx, pl, p)
 	}
-	opctx, cancel := tightenTimeout(ctx, p.GlobalDeadline)
+	opctx, cancel := tightenTimeoutSignal(ctx, p.GlobalDeadline)
 	defer cancel()
 
 	results := make([]*shardservice.ShardResponse, len(pl.calls))
@@ -1188,7 +1208,7 @@ func (e *Executor) fanoutGroupedBatches(
 	pl *plan,
 	p Profile,
 ) (*Result, error) {
-	opctx, cancel := tightenTimeout(ctx, p.GlobalDeadline)
+	opctx, cancel := tightenTimeoutSignal(ctx, p.GlobalDeadline)
 	defer cancel()
 
 	var merger *groupedAggregateMerger
