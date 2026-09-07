@@ -667,7 +667,12 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 		readSources = append(readSources, item.apply)
 		recoverySources = append(recoverySources, item.apply)
 	}
-	readAuthorityCache, authorityErr := configureRF3ReadAuthorities(
+	var diagnosticSerial atomic.Uint64
+	startupAuthorityExpected := make([]raftmember.GroupKey, 0, len(identities))
+	for _, identity := range identities {
+		startupAuthorityExpected = append(startupAuthorityExpected, identity.Group)
+	}
+	readAuthorityCache, startupAuthorityEvidence, authorityErr := configureRF3ReadAuthorities(
 		manifest, preparedSet.groups, runtimes, frontendProfile, frontendPolicy,
 		profile.LocalIdentity().Node,
 	)
@@ -677,6 +682,10 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 	if readAuthorityCache != nil {
 		defer func() { resultErr = errors.Join(resultErr, readAuthorityCache.Close()) }()
 	}
+	// Capture the configured state immediately after each marker and Configure
+	// call, before lanes or serving eligibility can advance. Later SIGUSR1
+	// snapshots obtain a fresh detached cut from the same owner lanes.
+	emitRF3AuthorityStartupEvidence(manifest, &diagnosticSerial, startupAuthorityEvidence, startupAuthorityExpected)
 	restoreGates := make(map[raftmember.GroupKey]*shardservice.RestoreServingGate)
 	restoreOperations := make(map[raftmember.GroupKey][32]byte)
 	restoreGateList := make([]*shardservice.RestoreServingGate, 0, len(preparedSet.groups))
@@ -1177,7 +1186,6 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 		stopEmbeddedGateway     context.CancelCauseFunc
 		embeddedGatewayFinished bool
 	)
-	var diagnosticSerial atomic.Uint64
 	if embeddedGateway != nil {
 		gatewayCtx, stopGateway := context.WithCancelCause(context.Background())
 		stopEmbeddedGateway = stopGateway
@@ -1228,7 +1236,10 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 			select {
 			case embeddedGatewayState = <-embeddedGatewayOpened:
 			case <-diagnostics:
-				emitRF3DiagnosticSnapshotWithResources(manifest, profile, nodeOwner, server, nil, &diagnosticSerial, adoptedInventory, preparedSet.groups, schemaActivator, progressMetrics, peer.Owners().ReadAuthorityRoundMetrics)
+				emitRF3DiagnosticSnapshotWithResources(manifest, profile, nodeOwner, server, nil, &diagnosticSerial, adoptedInventory, preparedSet.groups, schemaActivator, progressMetrics, rf3AuthorityDiagnostics{
+					RoundMetrics: peer.Owners().ReadAuthorityRoundMetrics,
+					Evidence:     peer.Owners().ReadAuthorityEvidence,
+				})
 			case err := <-embeddedGatewayDone:
 				embeddedGatewayFinished = true
 				primary = fmt.Errorf("RF3 embedded gateway stopped during startup: %w", err)
@@ -1268,7 +1279,10 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 		for {
 			select {
 			case <-diagnostics:
-				emitRF3DiagnosticSnapshotWithResources(manifest, profile, nodeOwner, server, embeddedGatewayState, &diagnosticSerial, adoptedInventory, preparedSet.groups, schemaActivator, progressMetrics, peer.Owners().ReadAuthorityRoundMetrics)
+				emitRF3DiagnosticSnapshotWithResources(manifest, profile, nodeOwner, server, embeddedGatewayState, &diagnosticSerial, adoptedInventory, preparedSet.groups, schemaActivator, progressMetrics, rf3AuthorityDiagnostics{
+					RoundMetrics: peer.Owners().ReadAuthorityRoundMetrics,
+					Evidence:     peer.Owners().ReadAuthorityEvidence,
+				})
 				continue
 			case <-manifest.reloadSignals:
 				if err := reloadPreparedRF3Groups(parent, &manifest, profile, peer, adoptedInventory, schemaActivator, nodeOwner); err != nil {

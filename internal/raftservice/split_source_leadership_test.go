@@ -21,8 +21,20 @@ func (host *splitLeadershipHost) Publication(raftmember.GroupKey) (raftmodel.Pub
 func (host *splitLeadershipHost) Status(raftmember.GroupKey) (raftmember.RuntimeStatus, error) {
 	return host.status, nil
 }
-func (host *splitLeadershipHost) TransferLeader(_ raftmember.GroupKey, target uint64) error {
+func (host *splitLeadershipHost) PrepareLeaderTransfer(_ raftmember.GroupKey, target uint64) (raftmember.LeaderTransferGuard, error) {
 	host.target = target
+	return raftmember.LeaderTransferGuard{}, nil
+}
+func (*splitLeadershipHost) CheckLeaderTransferReady(raftmember.GroupKey, raftmember.LeaderTransferGuard) error {
+	return nil
+}
+func (host *splitLeadershipHost) Progress(raftmember.GroupKey, uint64) (raftmodel.MemberProgress, bool, error) {
+	return raftmodel.MemberProgress{RecentActive: true, Match: host.status.Commit}, true, nil
+}
+func (*splitLeadershipHost) TransferLeader(raftmember.GroupKey, raftmember.LeaderTransferGuard) error {
+	return nil
+}
+func (*splitLeadershipHost) CancelLeaderTransfer(raftmember.GroupKey, raftmember.LeaderTransferGuard) error {
 	return nil
 }
 
@@ -52,7 +64,7 @@ func TestSplitSourceLeadershipRequiresExactLeaderAndExistingVoter(t *testing.T) 
 			if test.mutate != nil {
 				test.mutate(host, &attempt)
 			}
-			err := owner.transferSplitSourceLeadership(attempt, test.target)
+			_, err := owner.prepareLeaderTransferAdmission(attempt, test.target)
 			if (err == nil) != test.valid || test.valid && host.target != 2 || !test.valid && host.target != 0 {
 				t.Fatalf("target=%d err=%v", host.target, err)
 			}

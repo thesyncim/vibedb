@@ -74,7 +74,14 @@ func TestThreeRealHostsTransferLeaderThroughAuthenticatedTransportAndContinueApp
 	}
 	cluster.driveUntil(func() bool { return cluster.allAppliedWithLeader(group, voters[0], 2) })
 
-	if err := hosts[0].TransferLeader(group, voters[1]); err != nil {
+	guard, err := hosts[0].PrepareLeaderTransfer(group, voters[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := hosts[0].CheckLeaderTransferReady(group, guard); err != nil {
+		t.Fatal(err)
+	}
+	if err := hosts[0].TransferLeader(group, guard); err != nil {
 		t.Fatal(err)
 	}
 	cluster.duplicateTimeoutNow = true

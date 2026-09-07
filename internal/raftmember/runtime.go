@@ -47,6 +47,18 @@ var (
 	// errOutboundRejected marks an error returned by the caller's Ready message
 	// sink. Only this class is retryable at the same message position.
 	errOutboundRejected = errors.New("raftmember: outbound sink rejected message")
+	// ErrLeaderTransferAlreadyPrepared reports that a transfer guard is already
+	// retained for this Runtime. The owner must either retry that guard or
+	// cancel it before preparing a different target.
+	ErrLeaderTransferAlreadyPrepared = errors.New("raftmember: leader transfer is already prepared")
+	// ErrLeaderTransferInProgress reports a guard that has already been
+	// consumed by RawNode. Its cancellation window has ended; callers must
+	// observe the ordinary Raft status until the handoff settles.
+	ErrLeaderTransferInProgress = errors.New("raftmember: leader transfer is in progress")
+	// ErrLeaderTransferGuard reports an unknown, stale, or foreign guard. Guard
+	// identity includes the Runtime incarnation and a monotonic local sequence,
+	// preventing an old request from cancelling or admitting a successor.
+	ErrLeaderTransferGuard = errors.New("raftmember: invalid leader transfer guard")
 )
 
 // GroupKey is the portable logical identity used to select one local member.
@@ -425,6 +437,37 @@ type RuntimeStatus struct {
 	RaftState         raft.StateType
 }
 
+// LeaderTransferGuard is an opaque, single-use preparation capability for a
+// leadership handoff. It binds the target to this exact Runtime incarnation,
+// current Raft term, and a monotonic owner sequence. A guard does not imply
+// that RawNode accepted the transfer or that leadership has moved.
+//
+// The fields intentionally remain private. Callers may retain and pass the
+// value between PrepareLeaderTransfer, CheckLeaderTransferReady,
+// TransferLeader, and CancelLeaderTransfer, but cannot manufacture a valid
+// capability for another Runtime or term.
+type LeaderTransferGuard struct {
+	group           GroupKey
+	instance        *Runtime
+	memberID        uint64
+	nodeIncarnation uint64
+	term            uint64
+	target          uint64
+	sequence        uint64
+}
+
+type leaderTransferPhase uint8
+
+const (
+	leaderTransferDraining leaderTransferPhase = iota + 1
+	leaderTransferRaftPending
+)
+
+type leaderTransferState struct {
+	guard LeaderTransferGuard
+	phase leaderTransferPhase
+}
+
 // Progressed reports whether DriveReady performed one lifecycle operation.
 func (result DriveResult) Progressed() bool { return result.Kind != DriveIdle }
 
@@ -451,6 +494,8 @@ type Runtime struct {
 	proposalBatchBytes       int64
 	promotionScan            durablePromotionScan
 	authority                *runtimeAuthority
+	leaderTransfer           *leaderTransferState
+	leaderTransferSequence   uint64
 	failure                  error
 	stopping                 bool
 	closed                   bool
@@ -569,7 +614,10 @@ func AdoptNodeRuntime(
 		stable: group, database: database, apply: apply, nodePersistence: persistence,
 		identity: identity,
 	}
-	runtime.node, err = raftmodel.NewPipelinedNode(identity.MemberID, incarnation, group, apply)
+	runtime.node, err = raftmodel.NewPipelinedNodeWithOptions(
+		identity.MemberID, incarnation, group, apply,
+		raftmodel.NodeOptions{ElectionGate: runtime.authorityElectionGate},
+	)
 	if err != nil {
 		return runtime.abortAdoption(fmt.Errorf("raftmember: construct node: %w", err))
 	}
@@ -693,9 +741,15 @@ func adoptRuntime(
 	}
 	runtime.identity.NodeIncarnation = incarnation
 	if pipelined {
-		runtime.node, err = raftmodel.NewPipelinedNode(sealed.MemberID, incarnation, wal, apply)
+		runtime.node, err = raftmodel.NewPipelinedNodeWithOptions(
+			sealed.MemberID, incarnation, wal, apply,
+			raftmodel.NodeOptions{ElectionGate: runtime.authorityElectionGate},
+		)
 	} else {
-		runtime.node, err = raftmodel.NewNode(sealed.MemberID, incarnation, wal, apply)
+		runtime.node, err = raftmodel.NewNodeWithOptions(
+			sealed.MemberID, incarnation, wal, apply,
+			raftmodel.NodeOptions{ElectionGate: runtime.authorityElectionGate},
+		)
 	}
 	if err != nil {
 		return runtime.abortAdoption(fmt.Errorf("raftmember: construct node: %w", err))
@@ -769,6 +823,24 @@ func (runtime *Runtime) checkUsable() error {
 	return nil
 }
 
+// checkLeaderTransferUsable is the narrower lifecycle fence used by
+// pre-admission cancellation. Cancellation only releases the in-memory guard;
+// it does not inspect or mutate SQL state, so it remains valid while a Runtime
+// is temporarily quiesced for a schema-generation swap.
+func (runtime *Runtime) checkLeaderTransferUsable() error {
+	if runtime == nil || runtime.closed || runtime.stopping || runtime.node == nil ||
+		runtime.stableStore() == nil {
+		return ErrRuntimeClosed
+	}
+	if runtime.failure != nil {
+		return runtime.failure
+	}
+	if runtime.node.Phase() == raftmodel.PhaseFailed {
+		return runtime.fail(runtime.node.Failure())
+	}
+	return nil
+}
+
 // QuiesceSQLGeneration fences every later Runtime operation, proves the Raft
 // node has no pending Ready/read/settlement work, and releases only the SQL
 // generation. WAL, RawNode, member incarnation, and replication progress stay
@@ -777,6 +849,14 @@ func (runtime *Runtime) QuiesceSQLGeneration() error {
 	if runtime == nil || runtime.closed || runtime.stopping || runtime.failure != nil ||
 		runtime.node == nil || runtime.stableStore() == nil || runtime.database == nil ||
 		runtime.schemaGenerationQuiesced {
+		return ErrSchemaGenerationSwap
+	}
+	runtime.refreshLeaderTransfer()
+	if runtime.leaderTransfer != nil &&
+		runtime.leaderTransfer.phase == leaderTransferRaftPending {
+		// Once RawNode accepted the handoff, protocol status owns its terminal
+		// edge. Do not remove SQL handles underneath that admitted lifecycle;
+		// Host will retry quiescence after the transfer settles or times out.
 		return ErrSchemaGenerationSwap
 	}
 	if runtime.apply != nil {
@@ -836,6 +916,13 @@ func (runtime *Runtime) InstallSQLGeneration(
 	if runtime == nil || runtime.closed || runtime.stopping || runtime.failure != nil ||
 		!runtime.schemaGenerationQuiesced || runtime.node == nil || runtime.stableStore() == nil ||
 		runtime.apply != nil || runtime.database != nil || database == nil || apply == nil {
+		return ErrSchemaGenerationSwap
+	}
+	runtime.refreshLeaderTransfer()
+	if runtime.leaderTransfer != nil {
+		// A quiesced SQL generation cannot be installed underneath either a
+		// pre-admission guard or an admitted RawNode handoff. The owner must
+		// cancel the former; the latter must first settle at a protocol edge.
 		return ErrSchemaGenerationSwap
 	}
 	if _, err := database.RequireReplicatedShardStore(expectedSQL); err != nil {
@@ -1206,6 +1293,7 @@ func (runtime *Runtime) Status() (RuntimeStatus, error) {
 	if err := runtime.checkUsable(); err != nil {
 		return RuntimeStatus{}, err
 	}
+	runtime.refreshLeaderTransfer()
 	status := runtime.node.Status()
 	publishedApplied := runtime.node.PublishedApplied()
 	checkpointApplied := runtime.apply.CheckpointAppliedIndex()
@@ -1263,16 +1351,172 @@ func (runtime *Runtime) Progress(memberID uint64) (raftmodel.MemberProgress, boo
 	return progress, found, nil
 }
 
-// TransferLeader starts an explicit handoff to one configured voter. The
-// caller must drain Ready and observe Status before treating the handoff as
-// complete.
-func (runtime *Runtime) TransferLeader(transferee uint64) error {
+// PrepareLeaderTransfer reserves one explicit handoff to a configured voter.
+// Preparation is deliberately separate from RawNode admission: it revokes
+// local read-authority rounds while preserving the durable promise/quarantine,
+// then lets the owner retry readiness after that bounded election gate ends.
+// No Raft input is attempted by this method.
+func (runtime *Runtime) PrepareLeaderTransfer(
+	transferee uint64,
+) (LeaderTransferGuard, error) {
+	// Validate the target before observing or changing any existing lifecycle.
+	// An invalid request must remain side-effect free, including when a stale
+	// guard is being refreshed by a term/role observation.
+	if err := runtime.checkUsable(); err != nil {
+		return LeaderTransferGuard{}, err
+	}
+	if err := runtime.node.ValidateLeaderTransferTarget(transferee); err != nil {
+		return LeaderTransferGuard{}, err
+	}
+	// Preparation does not enter RawNode or reserve a protocol input. It may
+	// therefore cross a captured Ready window; only the result-settlement fence
+	// remains hard. The owner retains the guard until CheckLeaderTransferReady
+	// observes an empty window immediately before admission.
+	if _, pending := runtime.pendingAppliedResults(); pending {
+		return LeaderTransferGuard{}, ErrResultSettlementPending
+	}
+	runtime.refreshLeaderTransfer()
+	if runtime.leaderTransfer != nil {
+		return LeaderTransferGuard{}, ErrLeaderTransferAlreadyPrepared
+	}
+	status := runtime.node.Status()
+	if runtime.leaderTransferSequence == math.MaxUint64 {
+		return LeaderTransferGuard{}, ErrLeaderTransferGuard
+	}
+	runtime.leaderTransferSequence++
+	guard := LeaderTransferGuard{
+		group: runtime.identity.Group, instance: runtime,
+		memberID:        runtime.identity.MemberID,
+		nodeIncarnation: runtime.identity.NodeIncarnation, term: status.GetTerm(),
+		target: transferee, sequence: runtime.leaderTransferSequence,
+	}
+	// The preparation owns the throughput-only read optimization for the
+	// entire pre-admission wait. PromiseBook and CheckedClock remain untouched:
+	// the normal election gate must still enforce the exact quarantine/promise
+	// expiry before RawNode can accept the transfer.
+	runtime.invalidateAuthority()
+	runtime.leaderTransfer = &leaderTransferState{
+		guard: guard, phase: leaderTransferDraining,
+	}
+	return guard, nil
+}
+
+// CheckLeaderTransferReady performs the read-only final admission check for a
+// prepared guard. It is safe to retry while the authority promise or a Ready
+// boundary is still active; it admits no Raft input and does not release or
+// renew the authority promise.
+func (runtime *Runtime) CheckLeaderTransferReady(guard LeaderTransferGuard) error {
+	if err := runtime.checkUsable(); err != nil {
+		return err
+	}
+	runtime.refreshLeaderTransfer()
+	state := runtime.leaderTransfer
+	if state == nil || state.phase != leaderTransferDraining || !runtime.matchesLeaderTransfer(state, guard) {
+		return ErrLeaderTransferGuard
+	}
 	if err := runtime.requireEmptyInputWindow(); err != nil {
 		return err
 	}
-	err := runtime.node.TransferLeader(transferee)
+	status := runtime.node.Status()
+	if status.GetTerm() != guard.term || status.ID != guard.memberID ||
+		status.Lead != guard.memberID || status.RaftState != raft.StateLeader {
+		return ErrLeaderTransferGuard
+	}
+	return runtime.node.CheckLeaderTransferReady(guard.target)
+}
+
+// TransferLeader consumes a matching prepared guard at the synchronous
+// RawNode admission boundary. A nil error means only that RawNode accepted the
+// request; leadership completion remains observable through Runtime.Status.
+func (runtime *Runtime) TransferLeader(guard LeaderTransferGuard) error {
+	if err := runtime.checkUsable(); err != nil {
+		return err
+	}
+	runtime.refreshLeaderTransfer()
+	state := runtime.leaderTransfer
+	if state == nil || !runtime.matchesLeaderTransfer(state, guard) {
+		return ErrLeaderTransferGuard
+	}
+	if state.phase != leaderTransferDraining {
+		return ErrLeaderTransferInProgress
+	}
+	if err := runtime.requireEmptyInputWindow(); err != nil {
+		return err
+	}
+	if err := runtime.node.CheckLeaderTransferReady(guard.target); err != nil {
+		return err
+	}
+	if err := runtime.node.TransferLeader(guard.target); err != nil {
+		return err
+	}
+	// Keep the same guard until RawNode's status proves that the transfer has
+	// either changed term/role or genuinely timed out with this leader still in
+	// place. A caller cannot cancel or replay a consumed guard.
+	state.phase = leaderTransferRaftPending
 	runtime.refreshAuthority()
-	return err
+	return nil
+}
+
+// CancelLeaderTransfer releases only a matching pre-admission guard. It does
+// not require an empty Ready window because cancellation itself performs no
+// Raft operation. A consumed guard remains owned by the protocol until status
+// observes its terminal edge.
+func (runtime *Runtime) CancelLeaderTransfer(guard LeaderTransferGuard) error {
+	if err := runtime.checkLeaderTransferUsable(); err != nil {
+		return err
+	}
+	runtime.refreshLeaderTransfer()
+	state := runtime.leaderTransfer
+	if state == nil || !runtime.matchesLeaderTransfer(state, guard) {
+		return ErrLeaderTransferGuard
+	}
+	if state.phase != leaderTransferDraining {
+		return ErrLeaderTransferInProgress
+	}
+	runtime.leaderTransfer = nil
+	return nil
+}
+
+func (runtime *Runtime) matchesLeaderTransfer(
+	state *leaderTransferState, guard LeaderTransferGuard,
+) bool {
+	return state != nil && state.guard == guard &&
+		guard.group == runtime.identity.Group && guard.instance == runtime &&
+		guard.memberID == runtime.identity.MemberID &&
+		guard.nodeIncarnation == runtime.identity.NodeIncarnation && guard.term != 0 &&
+		guard.target != 0 && guard.sequence != 0
+}
+
+// LeaderTransferPending reports whether this Runtime retains a finite
+// preparation or an admitted RawNode handoff. It is a serialized owner query
+// used by Host removal and diagnostics; it never performs a new transfer.
+func (runtime *Runtime) LeaderTransferPending() bool {
+	if runtime == nil || runtime.node == nil || runtime.closed || runtime.stopping {
+		return false
+	}
+	runtime.refreshLeaderTransfer()
+	return runtime.leaderTransfer != nil
+}
+
+// refreshLeaderTransfer observes the only protocol edges that can settle a
+// finite handoff guard. A pre-admission drain survives Ready and promise
+// retries; once RawNode accepted the request, a same-term local-leader status
+// with no LeadTransferee is the genuine timeout edge that permits a fresh
+// preparation. No old token or guard is revived.
+func (runtime *Runtime) refreshLeaderTransfer() {
+	if runtime == nil || runtime.leaderTransfer == nil || runtime.node == nil {
+		return
+	}
+	state := runtime.leaderTransfer
+	status := runtime.node.Status()
+	if status.GetTerm() != state.guard.term || status.ID != state.guard.memberID ||
+		status.Lead != state.guard.memberID || status.RaftState != raft.StateLeader {
+		runtime.leaderTransfer = nil
+		return
+	}
+	if state.phase == leaderTransferRaftPending && status.LeadTransferee == raft.None {
+		runtime.leaderTransfer = nil
+	}
 }
 
 // StepMessage admits one ordinary, non-snapshot peer message. The message is

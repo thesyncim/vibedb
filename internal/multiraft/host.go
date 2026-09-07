@@ -219,7 +219,10 @@ type memberRuntime interface {
 	SnapshotAuthorizationFence() (replicatedstate.SnapshotFence, error)
 	Status() (raftmember.RuntimeStatus, error)
 	Progress(uint64) (raftmodel.MemberProgress, bool, error)
-	TransferLeader(uint64) error
+	PrepareLeaderTransfer(uint64) (raftmember.LeaderTransferGuard, error)
+	CheckLeaderTransferReady(raftmember.LeaderTransferGuard) error
+	TransferLeader(raftmember.LeaderTransferGuard) error
+	CancelLeaderTransfer(raftmember.LeaderTransferGuard) error
 	StepMessage(*pb.Message) error
 	Tick() error
 	Campaign() error
@@ -296,6 +299,10 @@ type authorityEnsureRuntime interface {
 
 type authorityRoundMetricsRuntime interface {
 	ReadAuthorityRoundMetrics() raftmember.ReadAuthorityRoundMetrics
+}
+
+type authorityEvidenceRuntime interface {
+	ReadAuthorityEvidence() raftmember.ReadAuthorityEvidence
 }
 
 func raftauthorityGroup(group raftmember.GroupKey) raftauthority.GroupIdentity {
@@ -772,6 +779,10 @@ func (host *Host) Remove(key raftmember.GroupKey) error {
 	if group.runtime != nil && group.runtime.HasPendingResultSettlement() {
 		return errors.Join(ErrGroupBusy, raftmember.ErrResultSettlementPending)
 	}
+	if transferRuntime, ok := group.runtime.(interface{ LeaderTransferPending() bool }); ok &&
+		transferRuntime.LeaderTransferPending() {
+		return ErrGroupBusy
+	}
 	if !group.retiring {
 		if group.runnable || group.items != 0 || group.messages.len() != 0 ||
 			group.proposals.len() != 0 || group.ticks != 0 || group.campaigns != 0 ||
@@ -1069,6 +1080,26 @@ func (host *Host) ReadAuthorityRoundMetrics() raftmember.ReadAuthorityRoundMetri
 	return total
 }
 
+// ReadAuthorityEvidence returns one detached per-group authority record in
+// this Host's deterministic insertion order. The caller must already hold the
+// lane owner; ExecutionLanes provides that serialization for concurrent
+// diagnostic snapshots.
+func (host *Host) ReadAuthorityEvidence() []raftmember.ReadAuthorityEvidence {
+	if host == nil || len(host.order) == 0 {
+		return nil
+	}
+	result := make([]raftmember.ReadAuthorityEvidence, 0, len(host.order))
+	for _, group := range host.order {
+		if group == nil || group.runtime == nil {
+			continue
+		}
+		if runtime, ok := group.runtime.(authorityEvidenceRuntime); ok {
+			result = append(result, runtime.ReadAuthorityEvidence())
+		}
+	}
+	return result
+}
+
 // ReadAuthorityToken returns the current holder capability from the exact
 // serialized Runtime owner. A missing or disabled runtime is a normal signal
 // for the ReadIndex fallback.
@@ -1235,18 +1266,85 @@ func (host *Host) Progress(
 	return group.runtime.Progress(memberID)
 }
 
-// TransferLeader synchronously admits an authorized leadership handoff. Like
-// configuration control it is not queued behind stale topology intent.
-func (host *Host) TransferLeader(key raftmember.GroupKey, transferee uint64) error {
+// PrepareLeaderTransfer reserves an authorized leadership handoff without
+// entering RawNode. The returned guard is the only capability accepted by the
+// readiness, admission, and cancellation methods below.
+func (host *Host) PrepareLeaderTransfer(
+	key raftmember.GroupKey, transferee uint64,
+) (raftmember.LeaderTransferGuard, error) {
+	group, err := host.lookup(key)
+	if err != nil {
+		return raftmember.LeaderTransferGuard{}, err
+	}
+	if group.schemaQuiescing || group.schemaQuiesced {
+		// Do not let a retained transfer prepare after schema quiescence has
+		// fenced scheduling.  Preparation revokes authority and would leave an
+		// admitted handoff unable to observe the protocol edges needed to settle.
+		return raftmember.LeaderTransferGuard{}, ErrGroupBusy
+	}
+	guard, err := group.runtime.PrepareLeaderTransfer(transferee)
+	host.finishDirectControl(group, err)
+	if err == nil {
+		host.wake(group)
+	}
+	return guard, err
+}
+
+// CheckLeaderTransferReady performs the final admission check for a retained
+// handoff guard. It does not reserve a protocol input or call RawNode input.
+func (host *Host) CheckLeaderTransferReady(
+	key raftmember.GroupKey, guard raftmember.LeaderTransferGuard,
+) error {
 	group, err := host.lookup(key)
 	if err != nil {
 		return err
 	}
-	err = group.runtime.TransferLeader(transferee)
+	if group.schemaQuiescing || group.schemaQuiesced {
+		// Schema quiescence owns the group's scheduling fence. Do not probe the
+		// Runtime with a stale guard after SQL handles have been removed.
+		return ErrGroupBusy
+	}
+	err = group.runtime.CheckLeaderTransferReady(guard)
+	host.finishDirectControl(group, err)
+	return err
+}
+
+// TransferLeader synchronously consumes a prepared guard at the RawNode
+// admission boundary. A nil result means only that the local core accepted
+// the request; the owner must observe the later Raft status for completion.
+func (host *Host) TransferLeader(
+	key raftmember.GroupKey, guard raftmember.LeaderTransferGuard,
+) error {
+	group, err := host.lookup(key)
+	if err != nil {
+		return err
+	}
+	if group.schemaQuiescing || group.schemaQuiesced {
+		// Keep a retained pre-admission guard from crossing into RawNode while
+		// schema replacement has fenced the group. Cancellation remains allowed
+		// through its separate narrow lifecycle path.
+		return ErrGroupBusy
+	}
+	err = group.runtime.TransferLeader(guard)
 	host.finishDirectControl(group, err)
 	if err == nil {
 		host.observeTrackedLeadership(group)
 	}
+	return err
+}
+
+// CancelLeaderTransfer releases one matching pre-admission guard. It does not
+// cross the Ready boundary and can therefore settle a queued request while
+// ordinary protocol work remains pending.
+func (host *Host) CancelLeaderTransfer(
+	key raftmember.GroupKey, guard raftmember.LeaderTransferGuard,
+) error {
+	group, err := host.lookup(key)
+	if err != nil {
+		return err
+	}
+	err = group.runtime.CancelLeaderTransfer(guard)
+	host.finishDirectControl(group, err)
 	return err
 }
 
@@ -1316,6 +1414,13 @@ func (host *Host) QuiesceSQLGeneration(key raftmember.GroupKey) error {
 	}
 	runtime, ok := group.runtime.(schemaGenerationRuntime)
 	if !ok || group.schemaQuiesced || group.retiring {
+		return ErrGroupBusy
+	}
+	if transferRuntime, ok := group.runtime.(interface{ LeaderTransferPending() bool }); ok &&
+		transferRuntime.LeaderTransferPending() {
+		// A schema-generation swap cannot strand either phase of the transfer
+		// guard. The owner must cancel a pre-admission request first; an admitted
+		// RawNode handoff remains protocol-owned until its status edge settles.
 		return ErrGroupBusy
 	}
 	// Latch the intent before checking idleness. Owner-level generation

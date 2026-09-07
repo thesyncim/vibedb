@@ -383,6 +383,50 @@ func TestReadAuthorityRestartQuarantineIsExplicitAndBounded(t *testing.T) {
 	}
 }
 
+func TestReadAuthorityDetachedEvidenceClassifiesWithoutMintingToken(t *testing.T) {
+	policy := authorityTestPolicy(true)
+	clockSource := &manualClock{now: 100 * time.Millisecond}
+	clock := NewCheckedClock(clockSource)
+	config := authorityTestConfig()
+	observation := authorityTestObservation(5, 1, config)
+	round, request, err := NewAuthorityRound(clock, authorityTestGroup(), 1, 22, 5, config, observation, policy, 41)
+	if err != nil {
+		t.Fatalf("NewAuthorityRound: %v", err)
+	}
+	for _, member := range policy.Voters[:2] {
+		memberClock := NewCheckedClock(&manualClock{})
+		book, bookErr := NewPromiseBook(memberClock, authorityTestGroup(), member, policy)
+		if bookErr != nil {
+			t.Fatalf("NewPromiseBook(%d): %v", member, bookErr)
+		}
+		grant, grantErr := book.Grant(request, observation)
+		if grantErr != nil {
+			t.Fatalf("Grant(%d): %v", member, grantErr)
+		}
+		if grantErr := round.AddGrant(grant); grantErr != nil {
+			t.Fatalf("AddGrant(%d): %v", member, grantErr)
+		}
+	}
+	before := round.Evidence()
+	if !before.ValidAt(before.Request.StartAt, observation) {
+		t.Fatal("complete round was not valid at its start sample")
+	}
+	if before.ValidAt(before.Request.StartAt-time.Nanosecond, observation) {
+		t.Fatal("round was valid before its holder start sample")
+	}
+	if before.ValidAt(before.ExpiresAt, observation) {
+		t.Fatal("round remained valid at its exact holder deadline")
+	}
+	if before.ValidAt(before.Request.StartAt, AuthorityObservation{}) {
+		t.Fatal("round was valid against an incomplete observation")
+	}
+	after := round.Evidence()
+	if after.Request != before.Request || after.ExpiresAt != before.ExpiresAt ||
+		after.Complete != before.Complete || after.Invalidated != before.Invalidated {
+		t.Fatalf("evidence classification changed round metadata: before=%+v after=%+v", before, after)
+	}
+}
+
 func TestReadAuthorityFinalValidationAndInvalidation(t *testing.T) {
 	policy := authorityTestPolicy(true)
 	holderClock := &manualClock{}

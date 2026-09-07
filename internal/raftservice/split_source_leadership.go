@@ -3,6 +3,8 @@ package raftservice
 import (
 	"context"
 	"errors"
+
+	"github.com/thesyncim/vibedb/internal/raftmember"
 )
 
 // TransferSplitSourceLeadership is an internal admitted-split capability, not
@@ -13,7 +15,11 @@ func (owner *Owner) TransferSplitSourceLeadership(ctx context.Context, fence Ser
 		return ErrInvalidOwner
 	}
 	_, err := owner.enqueue(ctx, ownerRequest{kind: requestSplitSourceLeadership,
-		group: fence.Group, fence: fence, targetMember: target, reply: make(chan ownerReply, 1)})
+		group: fence.Group, fence: fence, targetMember: target, reply: make(chan ownerReply, 1),
+		transferDelivery: &transferDelivery{}})
+	if errors.Is(err, errOwnerTransferCanceled) {
+		return context.Cause(ctx)
+	}
 	return err
 }
 
@@ -33,7 +39,11 @@ func (owner *Owner) TransferSchemaLeadership(ctx context.Context, fence ServingF
 		return ErrInvalidOwner
 	}
 	_, err := owner.enqueue(ctx, ownerRequest{kind: requestSchemaLeadershipTransfer,
-		group: fence.Group, fence: fence, reply: make(chan ownerReply, 1)})
+		group: fence.Group, fence: fence, reply: make(chan ownerReply, 1),
+		transferDelivery: &transferDelivery{}})
+	if errors.Is(err, errOwnerTransferCanceled) {
+		return context.Cause(ctx)
+	}
 	return err
 }
 
@@ -45,39 +55,30 @@ func (owners *ExecutionOwners) TransferSchemaLeadership(ctx context.Context, fen
 	return owner.TransferSchemaLeadership(ctx, fence)
 }
 
-func (owner *Owner) transferSchemaLeadership(fence ServingFence) error {
+func (owner *Owner) schemaLeadershipTarget(fence ServingFence) (uint64, error) {
 	member, found := owner.members[fence.Group]
 	if !found || !servingFenceMatchesIdentity(fence, member) {
-		return ErrServingFence
+		return 0, ErrServingFence
 	}
 	publication, err := owner.host.Publication(fence.Group)
 	if err != nil || publication.ReplicaSetVersion != fence.Command.ReplicaSetVersion ||
 		publication.ConfState == nil || len(publication.ConfState.GetVotersOutgoing()) != 0 {
-		return errors.Join(ErrServingFence, err)
+		return 0, errors.Join(ErrServingFence, err)
 	}
-	target := uint64(0)
 	for _, voter := range publication.ConfState.GetVoters() {
 		if voter != fence.MemberID {
-			target = voter
-			break
+			return voter, nil
 		}
 	}
-	if target == 0 {
-		return ErrServingFence
-	}
-	status, err := owner.host.Status(fence.Group)
-	if err != nil {
-		return err
-	}
-	if status.MemberID != fence.MemberID || status.LeaderID != fence.MemberID || status.Term != fence.Term {
-		return &NotLeaderError{Status: status}
-	}
-	return owner.host.TransferLeader(fence.Group, target)
+	return 0, ErrServingFence
 }
 
-func (owner *Owner) transferSplitSourceLeadership(fence ServingFence, target uint64) error {
+func (owner *Owner) validateLeaderTransferAdmission(fence ServingFence, target uint64) error {
+	if target == 0 || target == fence.MemberID {
+		return ErrServingFence
+	}
 	member, found := owner.members[fence.Group]
-	if !found || !servingFenceMatchesIdentity(fence, member) || target == fence.MemberID {
+	if !found || !servingFenceMatchesIdentity(fence, member) {
 		return ErrServingFence
 	}
 	publication, err := owner.host.Publication(fence.Group)
@@ -93,5 +94,21 @@ func (owner *Owner) transferSplitSourceLeadership(fence ServingFence, target uin
 	if status.MemberID != fence.MemberID || status.LeaderID != fence.MemberID || status.Term != fence.Term {
 		return &NotLeaderError{Status: status}
 	}
-	return owner.host.TransferLeader(fence.Group, target)
+	progress, found, err := owner.host.Progress(fence.Group, target)
+	if err != nil {
+		return err
+	}
+	if !caughtUp(progress, found, status.Commit, false) {
+		return ErrMembershipNotCaughtUp
+	}
+	return nil
+}
+
+func (owner *Owner) prepareLeaderTransferAdmission(
+	fence ServingFence, target uint64,
+) (raftmember.LeaderTransferGuard, error) {
+	if err := owner.validateLeaderTransferAdmission(fence, target); err != nil {
+		return raftmember.LeaderTransferGuard{}, err
+	}
+	return owner.host.PrepareLeaderTransfer(fence.Group, target)
 }

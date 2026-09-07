@@ -36,6 +36,10 @@ func (n *Node) CapturePipelinedReady() (PipelinedReady, bool, error) {
 	if !n.raw.HasReady() {
 		return PipelinedReady{}, false, nil
 	}
+	// Reading this recovered Ready crosses the construction boundary even
+	// before the asynchronous storage response is applied. Keep the
+	// first-install proof monotone across pipelined capture.
+	n.closeElectionGatePristine()
 	ready := n.raw.Ready()
 	if len(ready.Messages) > MaxPipelinedReadyMessages {
 		return PipelinedReady{}, false, n.fail(
@@ -153,6 +157,9 @@ func (n *Node) StepPipelinedResponse(message *pb.Message) error {
 			return fmt.Errorf("raftmodel: unexpected nested local response %s", message.GetType())
 		}
 	}
+	// A storage response is still an input to RawNode and must close the
+	// construction-era proof before the response is consumed.
+	n.closeElectionGatePristine()
 	// Async-storage responses are created by RawNode and ownership is returned
 	// to that same RawNode after the corresponding local work completes. Raft
 	// consumes these messages synchronously: storage-append responses read the

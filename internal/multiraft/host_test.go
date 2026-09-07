@@ -39,6 +39,7 @@ type fakeRuntime struct {
 	status              raftmember.RuntimeStatus
 	progress            map[uint64]raftmodel.MemberProgress
 	transfers           []uint64
+	preparedTransfer    uint64
 	inputErr            error
 	proposalErrs        []error
 	failure             error
@@ -248,9 +249,27 @@ func (runtime *fakeRuntime) Progress(memberID uint64) (raftmodel.MemberProgress,
 	return progress, found, runtime.inputErr
 }
 
-func (runtime *fakeRuntime) TransferLeader(memberID uint64) error {
-	runtime.transfers = append(runtime.transfers, memberID)
+func (runtime *fakeRuntime) PrepareLeaderTransfer(memberID uint64) (raftmember.LeaderTransferGuard, error) {
+	runtime.preparedTransfer = memberID
+	return raftmember.LeaderTransferGuard{}, runtime.inputErr
+}
+
+func (runtime *fakeRuntime) CheckLeaderTransferReady(raftmember.LeaderTransferGuard) error {
 	return runtime.inputErr
+}
+
+func (runtime *fakeRuntime) TransferLeader(raftmember.LeaderTransferGuard) error {
+	runtime.transfers = append(runtime.transfers, runtime.preparedTransfer)
+	return runtime.inputErr
+}
+
+func (runtime *fakeRuntime) CancelLeaderTransfer(raftmember.LeaderTransferGuard) error {
+	runtime.preparedTransfer = 0
+	return runtime.inputErr
+}
+
+func (runtime *fakeRuntime) LeaderTransferPending() bool {
+	return runtime.preparedTransfer != 0
 }
 
 func (runtime *fakeRuntime) StepMessage(message *pb.Message) error {
@@ -820,7 +839,14 @@ func TestHostSurfacesMembershipReadControlsAndOutcomes(t *testing.T) {
 	if err != nil || !found || memberProgress.Match != 9 || !memberProgress.RecentActive {
 		t.Fatalf("Progress = %+v, %t, %v", memberProgress, found, err)
 	}
-	if err := host.TransferLeader(runtime.identity.Group, 99); err != nil {
+	guard, err := host.PrepareLeaderTransfer(runtime.identity.Group, 99)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := host.CheckLeaderTransferReady(runtime.identity.Group, guard); err != nil {
+		t.Fatal(err)
+	}
+	if err := host.TransferLeader(runtime.identity.Group, guard); err != nil {
 		t.Fatal(err)
 	}
 	if !slices.Equal(runtime.transfers, []uint64{99}) {
@@ -1014,6 +1040,73 @@ func TestHostSchemaQuiescenceRefusalRewakesUncountedRuntimeReady(t *testing.T) {
 	}
 	if err = host.QuiesceSQLGeneration(runtime.identity.Group); err != nil {
 		t.Fatalf("retry quiesce: %v", err)
+	}
+}
+
+func TestHostSchemaQuiescenceFencesLeaderTransferLifecycle(t *testing.T) {
+	host, err := NewHost(testHostLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := newFakeRuntime(95)
+	if err := host.addRuntime(runtime); err != nil {
+		t.Fatal(err)
+	}
+	key := runtime.identity.Group
+
+	guard, err := host.PrepareLeaderTransfer(key, 99)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.preparedTransfer != 99 {
+		t.Fatalf("prepared transfer = %d, want 99", runtime.preparedTransfer)
+	}
+	if err := host.QuiesceSQLGeneration(key); !errors.Is(err, ErrGroupBusy) {
+		t.Fatalf("quiesce admitted prepared transfer: %v", err)
+	}
+	if group := host.groups[key]; group.schemaQuiescing || group.schemaQuiesced {
+		t.Fatalf("quiesce latched with a pending transfer: quiescing=%v quiesced=%v",
+			group.schemaQuiescing, group.schemaQuiesced)
+	}
+	if err := host.CancelLeaderTransfer(key, guard); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := host.RequestTick(key); err != nil {
+		t.Fatal(err)
+	}
+	if err := host.QuiesceSQLGeneration(key); !errors.Is(err, ErrGroupBusy) {
+		t.Fatalf("quiesce with queued tick = %v", err)
+	}
+	if !host.groups[key].schemaQuiescing || host.groups[key].schemaQuiesced {
+		t.Fatalf("quiesce did not retain its admission fence: quiescing=%v quiesced=%v",
+			host.groups[key].schemaQuiescing, host.groups[key].schemaQuiesced)
+	}
+	if _, err := host.PrepareLeaderTransfer(key, 99); !errors.Is(err, ErrGroupBusy) {
+		t.Fatalf("transfer prepared during unfinished quiesce: %v", err)
+	}
+	if runtime.preparedTransfer != 0 {
+		t.Fatalf("unfinished quiesce changed transfer state to %d", runtime.preparedTransfer)
+	}
+
+	if _, done, err := host.RunOne(); err != nil || !done {
+		t.Fatalf("drain queued tick = done %v err %v", done, err)
+	}
+	if err := host.QuiesceSQLGeneration(key); err != nil {
+		t.Fatalf("quiesce after draining tick: %v", err)
+	}
+	if !host.groups[key].schemaQuiesced {
+		t.Fatal("group did not enter quiesced state")
+	}
+	if err := host.CheckLeaderTransferReady(key, guard); !errors.Is(err, ErrGroupBusy) {
+		t.Fatalf("stale readiness probe crossed quiesced fence: %v", err)
+	}
+	if err := host.TransferLeader(key, guard); !errors.Is(err, ErrGroupBusy) {
+		t.Fatalf("stale transfer crossed quiesced fence: %v", err)
+	}
+	if runtime.preparedTransfer != 0 || len(runtime.transfers) != 0 {
+		t.Fatalf("quiesced stale guard changed runtime: prepared=%d transfers=%v",
+			runtime.preparedTransfer, runtime.transfers)
 	}
 }
 

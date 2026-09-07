@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"sync/atomic"
+	"time"
 
 	"github.com/thesyncim/vibedb/internal/raftauthority"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
@@ -34,6 +35,11 @@ var (
 	// published stable voter set. A stale/shrunk policy can never form a
 	// self-only quorum after membership changes.
 	ErrAuthorityConfigurationMismatch = errors.New("raftmember: authority voter set differs from applied configuration")
+	// ErrAuthorityTransferPending reports that an explicit leader-transfer
+	// preparation currently owns the local authority optimization. ReadIndex
+	// remains available while the finite transfer guard drains readiness and
+	// election promises.
+	ErrAuthorityTransferPending = errors.New("raftmember: leader transfer is pending")
 )
 
 // ReadAuthorityOptions is the explicit per-member feature contract. An
@@ -63,6 +69,110 @@ type ReadAuthorityRoundMetrics struct {
 	GrantsAccepted  uint64
 }
 
+// ReadAuthorityGateInputCount and the input indexes below are the fixed
+// serialized election edges instrumented by the authority gate. Keeping the
+// indexes explicit makes the diagnostic shape stable across process boots and
+// avoids maps or labels on the election hot path.
+const (
+	ReadAuthorityGateMessage = iota
+	ReadAuthorityGateTick
+	ReadAuthorityGateCampaign
+	ReadAuthorityGateTransfer
+)
+
+const ReadAuthorityGateInputCount = ReadAuthorityGateTransfer + 1
+
+// ReadAuthorityGateReason indexes ReadAuthorityGateMetrics.BlockedByReason.
+const (
+	ReadAuthorityGateQuarantine = iota
+	ReadAuthorityGateLivePromise
+	ReadAuthorityGateClockFault
+)
+
+const ReadAuthorityGateReasonCount = ReadAuthorityGateClockFault + 1
+
+// ReadAuthorityGateBlockTime retains timestamps only for blocked edges whose
+// gate invocation obtained a current, accepted elapsed-clock sample. A clock
+// fault is still counted, but it cannot borrow the last good sample as its
+// event time.
+type ReadAuthorityGateBlockTime struct {
+	First     time.Duration
+	Last      time.Duration
+	Available bool
+}
+
+// ReadAuthorityGateMetrics is a bounded detached cut of actual election-gate
+// edges. BlockedByReason is indexed by fixed input and reason; BlockedTime has
+// matching indexes and is populated only when that edge obtained a fresh
+// accepted sample. Allowed is kept separate because a leader tick may be
+// allowed while a live promise still protects the group. All local timestamps
+// use the checked elapsed clock of this Runtime's boot incarnation.
+type ReadAuthorityGateMetrics struct {
+	BlockedByReason            [ReadAuthorityGateInputCount][ReadAuthorityGateReasonCount]uint64
+	BlockedTime                [ReadAuthorityGateInputCount][ReadAuthorityGateReasonCount]ReadAuthorityGateBlockTime
+	Allowed                    [ReadAuthorityGateInputCount]uint64
+	AllowedWhileLivePromise    [ReadAuthorityGateInputCount]uint64
+	FirstQuarantineExpiredAt   time.Duration
+	QuarantineExpiredAvailable bool
+}
+
+// ReadAuthorityEvidenceStatus identifies whether a per-group evidence cut is
+// usable. Disabled and unavailable are explicit states so a missing record is
+// never interpreted as proof that no authority existed.
+type ReadAuthorityEvidenceStatus uint8
+
+const (
+	ReadAuthorityEvidenceUnavailable ReadAuthorityEvidenceStatus = iota
+	ReadAuthorityEvidenceDisabled
+	ReadAuthorityEvidenceConfigured
+)
+
+// ReadAuthorityEvidenceError is a bounded reason for an unavailable current
+// observation. It deliberately avoids retaining arbitrary resolver or clock
+// error text in the diagnostic record.
+type ReadAuthorityEvidenceError uint8
+
+const (
+	ReadAuthorityEvidenceErrorNone ReadAuthorityEvidenceError = iota
+	ReadAuthorityEvidenceErrorUnavailable
+	ReadAuthorityEvidenceErrorLeaderIncarnation
+	ReadAuthorityEvidenceErrorConfiguration
+	ReadAuthorityEvidenceErrorClockFault
+)
+
+// ReadAuthorityHolderEvidence describes the one valid serving token, if the
+// current checked-clock sample and exact observation validate one. Request and
+// accepted voters are copied from the bounded round, so this record remains
+// detached from owner state.
+type ReadAuthorityHolderEvidence struct {
+	Available      bool
+	Request        raftauthority.AuthorityRequest
+	ExpiresAt      time.Duration
+	AcceptedVoters []uint64
+}
+
+// ReadAuthorityEvidence is one detached per-group authority proof. It is read
+// only through Runtime owner serialization and then copied by Host and
+// ExecutionLanes. No field is populated by starting, renewing, invalidating,
+// or otherwise changing an authority round or PromiseBook.
+type ReadAuthorityEvidence struct {
+	Identity             RuntimeIdentity
+	Status               ReadAuthorityEvidenceStatus
+	PolicyVersion        uint32
+	PolicyDigest         [32]byte
+	Clock                raftauthority.CheckedClockEvidence
+	Observation          raftauthority.AuthorityObservation
+	ObservationAvailable bool
+	ObservationError     ReadAuthorityEvidenceError
+	Promise              raftauthority.PromiseBookEvidence
+	PromiseKnown         bool
+	PromiseActive        bool
+	QuarantineKnown      bool
+	QuarantineActive     bool
+	Holder               ReadAuthorityHolderEvidence
+	Gate                 ReadAuthorityGateMetrics
+}
+
 type runtimeAuthority struct {
 	policy  raftauthority.ReadAuthorityPolicy
 	clock   *raftauthority.CheckedClock
@@ -85,6 +195,7 @@ type runtimeAuthority struct {
 	roundsStarted   atomic.Uint64
 	requestsCreated atomic.Uint64
 	grantsAccepted  atomic.Uint64
+	gate            ReadAuthorityGateMetrics
 }
 
 func authorityGroupKey(group GroupKey) raftauthority.GroupIdentity {
@@ -132,6 +243,9 @@ func (runtime *Runtime) ConfigureReadAuthority(options ReadAuthorityOptions) err
 		runtime.authority.disabled = false
 		return nil
 	}
+	if err := runtime.node.CheckElectionGateActivation(); err != nil {
+		return err
+	}
 	book, err := raftauthority.NewPromiseBook(
 		options.Clock, authorityGroupKey(runtime.identity.Group), runtime.identity.MemberID,
 		options.Policy,
@@ -146,9 +260,6 @@ func (runtime *Runtime) ConfigureReadAuthority(options ReadAuthorityOptions) err
 		policy: cloneAuthorityPolicy(options.Policy), clock: options.Clock, promise: book,
 		leaderIncarnation: options.LeaderIncarnation,
 		outbound:          make([]OutboundMessage, 0, len(options.Policy.Voters)),
-	}
-	if err := runtime.node.SetElectionGate(runtime.authorityElectionGate); err != nil {
-		return err
 	}
 	runtime.authority = state
 	return nil
@@ -175,6 +286,183 @@ func (runtime *Runtime) ReadAuthorityRoundMetrics() ReadAuthorityRoundMetrics {
 	}
 }
 
+func authorityGateInputIndex(input raftmodel.ElectionInput) (int, bool) {
+	index := int(input) - 1
+	return index, index >= 0 && index < ReadAuthorityGateInputCount
+}
+
+func authorityGateErrorIsClockFault(err error) bool {
+	return errors.Is(err, raftauthority.ErrClockUnavailable) ||
+		errors.Is(err, raftauthority.ErrClockFault) ||
+		errors.Is(err, raftauthority.ErrClockRollback)
+}
+
+func (state *runtimeAuthority) recordGateBlocked(
+	input raftmodel.ElectionInput,
+	reason int,
+	sample time.Duration,
+	timestampAvailable bool,
+) {
+	if state == nil || reason < 0 || reason >= ReadAuthorityGateReasonCount {
+		return
+	}
+	index, ok := authorityGateInputIndex(input)
+	if !ok {
+		return
+	}
+	state.gate.BlockedByReason[index][reason]++
+	if !timestampAvailable || sample < 0 {
+		return
+	}
+	blocked := &state.gate.BlockedTime[index][reason]
+	if !blocked.Available {
+		blocked.First = sample
+		blocked.Available = true
+	}
+	blocked.Last = sample
+}
+
+func (state *runtimeAuthority) recordGateAllowed(input raftmodel.ElectionInput, livePromise bool) {
+	if state == nil {
+		return
+	}
+	index, ok := authorityGateInputIndex(input)
+	if !ok {
+		return
+	}
+	state.gate.Allowed[index]++
+	if livePromise {
+		state.gate.AllowedWhileLivePromise[index]++
+	}
+}
+
+func (state *runtimeAuthority) observeQuarantineExpired() {
+	if state == nil || state.promise == nil || state.gate.QuarantineExpiredAvailable {
+		return
+	}
+	if !state.promise.Evidence().QuarantineConfigured {
+		return
+	}
+	clock := state.clock.Evidence()
+	if !clock.Initialized || clock.Faulted {
+		return
+	}
+	state.gate.FirstQuarantineExpiredAt = clock.Sample
+	state.gate.QuarantineExpiredAvailable = true
+}
+
+// ReadAuthorityEvidence returns the detached per-group authority proof used by
+// diagnostics. It takes one fresh checked-clock sample to classify the current
+// holder and promise state, but never enters a round, clears an expired round,
+// renews a promise, or invalidates any state. Callers outside Runtime's
+// serialized owner must use Host/ExecutionLanes, which take the lane lock
+// before invoking it.
+func (runtime *Runtime) ReadAuthorityEvidence() ReadAuthorityEvidence {
+	result := ReadAuthorityEvidence{}
+	if runtime == nil {
+		return result
+	}
+	result.Identity = runtime.Identity()
+	state := runtime.authority
+	if state == nil {
+		if runtime.closed || runtime.stopping || runtime.node == nil || runtime.stableStore() == nil ||
+			runtime.apply == nil || runtime.database == nil || runtime.failure != nil ||
+			runtime.node.Phase() == raftmodel.PhaseFailed {
+			result.Status = ReadAuthorityEvidenceUnavailable
+			return result
+		}
+		result.Status = ReadAuthorityEvidenceDisabled
+		return result
+	}
+	if state.disabled {
+		result.Status = ReadAuthorityEvidenceDisabled
+	} else {
+		result.Status = ReadAuthorityEvidenceConfigured
+	}
+	result.PolicyVersion = state.policy.PolicyVersion
+	result.PolicyDigest = state.policy.PolicyDigest()
+	if state.promise != nil {
+		result.Promise = state.promise.Evidence()
+	}
+	var now time.Duration
+	var clockErr error
+	if state.clock != nil {
+		now, clockErr = state.clock.Now()
+		result.Clock = state.clock.Evidence()
+	} else {
+		clockErr = raftauthority.ErrClockUnavailable
+		result.Clock.Faulted = true
+	}
+	clockUsable := clockErr == nil && now >= 0
+	if clockUsable {
+		result.PromiseKnown = result.Promise.HasRecord
+		if result.PromiseKnown {
+			result.PromiseActive = now < result.Promise.PromiseUntil
+		}
+		result.QuarantineKnown = result.Promise.QuarantineConfigured
+		if result.QuarantineKnown {
+			result.QuarantineActive = result.Promise.QuarantineError ||
+				(result.Promise.QuarantineUntil != 0 && now < result.Promise.QuarantineUntil)
+		}
+	}
+	servingUsable := !runtime.closed && !runtime.stopping && runtime.node != nil &&
+		runtime.stableStore() != nil && runtime.apply != nil && runtime.database != nil &&
+		runtime.failure == nil && runtime.node.Phase() != raftmodel.PhaseFailed
+	var observation raftauthority.AuthorityObservation
+	if servingUsable {
+		var observationErr error
+		observation, observationErr = runtime.readAuthorityObservation()
+		result.Observation = observation
+		if observationErr == nil {
+			result.ObservationAvailable = true
+		} else {
+			result.ObservationError = readAuthorityEvidenceError(observationErr)
+		}
+	} else {
+		result.ObservationError = ReadAuthorityEvidenceErrorUnavailable
+	}
+	result.Gate = state.gate
+	// A disabled state may retain a live promise for fencing, but it must never
+	// expose a serving holder. A failed or faulted clock likewise cannot support
+	// a current capability classification.
+	if state.disabled || !servingUsable || !result.ObservationAvailable || !clockUsable {
+		return result
+	}
+	for _, round := range [2]*raftauthority.AuthorityRound{state.renewal, state.round} {
+		if round == nil {
+			continue
+		}
+		roundEvidence := round.Evidence()
+		if !roundEvidence.ValidAt(now, observation) {
+			continue
+		}
+		result.Holder = ReadAuthorityHolderEvidence{
+			Available:      true,
+			Request:        roundEvidence.Request,
+			ExpiresAt:      roundEvidence.ExpiresAt,
+			AcceptedVoters: roundEvidence.AcceptedVoters,
+		}
+		break
+	}
+	return result
+}
+
+func readAuthorityEvidenceError(err error) ReadAuthorityEvidenceError {
+	if err == nil {
+		return ReadAuthorityEvidenceErrorNone
+	}
+	if errors.Is(err, ErrAuthorityLeaderIncarnationUnavailable) {
+		return ReadAuthorityEvidenceErrorLeaderIncarnation
+	}
+	if errors.Is(err, ErrAuthorityConfigurationMismatch) {
+		return ReadAuthorityEvidenceErrorConfiguration
+	}
+	if authorityGateErrorIsClockFault(err) {
+		return ReadAuthorityEvidenceErrorClockFault
+	}
+	return ReadAuthorityEvidenceErrorUnavailable
+}
+
 func (runtime *Runtime) authorityElectionGate(input raftmodel.ElectionInput) error {
 	state := runtime.authority
 	if state == nil || state.promise == nil {
@@ -182,50 +470,72 @@ func (runtime *Runtime) authorityElectionGate(input raftmodel.ElectionInput) err
 	}
 	quarantined, err := state.promise.ElectionQuarantined()
 	if err != nil {
+		clock := state.clock.Evidence()
+		if authorityGateErrorIsClockFault(err) {
+			state.recordGateBlocked(input, ReadAuthorityGateClockFault, 0, false)
+		} else {
+			state.recordGateBlocked(input, ReadAuthorityGateQuarantine, clock.Sample,
+				clock.Initialized && !clock.Faulted)
+		}
 		return err
 	}
 	if quarantined {
+		clock := state.clock.Evidence()
+		state.recordGateBlocked(input, ReadAuthorityGateQuarantine, clock.Sample,
+			clock.Initialized && !clock.Faulted)
 		return ErrAuthorityElectionBlocked
 	}
+	state.observeQuarantineExpired()
 	until, held, err := state.promise.PromiseUntil()
 	if err != nil {
+		state.recordGateBlocked(input, ReadAuthorityGateClockFault, 0, false)
 		return err
 	}
 	if !held {
+		state.recordGateAllowed(input, false)
 		return nil
 	}
 	now, err := state.clock.Now()
 	if err != nil {
+		state.recordGateBlocked(input, ReadAuthorityGateClockFault, 0, false)
 		return err
 	}
 	if now >= until {
+		state.recordGateAllowed(input, false)
 		return nil
 	}
 	// A current leader must continue logical ticks to send ordinary
 	// heartbeats and renew the authority. Ticks on followers remain election
 	// edges and are refused for the duration of the voter promise.
 	if input == raftmodel.ElectionTickInput && runtime.node.Status().RaftState == raft.StateLeader {
+		state.recordGateAllowed(input, true)
 		return nil
 	}
+	state.recordGateBlocked(input, ReadAuthorityGateLivePromise, now, true)
 	return ErrAuthorityElectionBlocked
 }
 
-// ReadAuthorityObservation returns a fresh serialized observation for holder
-// admission, grant validation, and final token revalidation. Config digest is
-// deterministic over the published ConfState and the pending/applied flags
-// are deliberately conservative.
-func (runtime *Runtime) ReadAuthorityObservation() (raftauthority.AuthorityObservation, error) {
+// readAuthorityObservation builds the current local observation and returns a
+// partially populated value when a resolver or configuration check prevents a
+// complete authority proof. The public protocol method keeps its historical
+// all-or-nothing contract; diagnostics use the partial value so an unknown
+// state remains visible alongside the current term/leader/configuration.
+func (runtime *Runtime) readAuthorityObservation() (raftauthority.AuthorityObservation, error) {
 	if err := runtime.checkUsable(); err != nil {
 		return raftauthority.AuthorityObservation{}, err
 	}
 	status := runtime.node.Status()
 	publication := runtime.node.Published()
+	observation := raftauthority.AuthorityObservation{
+		Group: authorityGroupKey(runtime.identity.Group), Term: status.GetTerm(),
+		Leader: status.Lead, CurrentTermCommitted: runtime.node.CurrentTermCommitted(),
+	}
 	if publication.ConfState == nil {
-		return raftauthority.AuthorityObservation{}, errors.New("raftmember: authority observation has nil ConfState")
+		return observation, errors.New("raftmember: authority observation has nil ConfState")
 	}
 	encoded, err := (proto.MarshalOptions{Deterministic: true}).Marshal(publication.ConfState)
 	if err != nil {
-		return raftauthority.AuthorityObservation{}, fmt.Errorf("raftmember: encode authority ConfState: %w", err)
+		return observation, fmt.Errorf("raftmember: encode authority ConfState: %w", err)
 	}
 	config := raftauthority.ConfigIdentity{
 		AppliedVersion: publication.ReplicaSetVersion,
@@ -234,30 +544,38 @@ func (runtime *Runtime) ReadAuthorityObservation() (raftauthority.AuthorityObser
 			len(publication.ConfState.GetLearnersNext()) != 0 || publication.ConfState.GetAutoLeave(),
 		Pending: runtime.node.PendingConfiguration(),
 	}
+	observation.Config = config
+	observation.Stable = !config.Joint && !config.Pending
 	if runtime.authority != nil && !runtime.authorityVotersMatch(runtime.authority.policy.Voters) {
-		return raftauthority.AuthorityObservation{}, ErrAuthorityConfigurationMismatch
+		return observation, ErrAuthorityConfigurationMismatch
 	}
-	leaderIncarnation := uint64(0)
 	if status.Lead == runtime.identity.MemberID {
-		leaderIncarnation = runtime.identity.NodeIncarnation
+		observation.LeaderIncarnation = runtime.identity.NodeIncarnation
 	} else if runtime.authority != nil && runtime.authority.leaderIncarnation != nil && status.Lead != 0 {
 		var found bool
-		leaderIncarnation, found, err = runtime.authority.leaderIncarnation(status.Lead)
+		observation.LeaderIncarnation, found, err = runtime.authority.leaderIncarnation(status.Lead)
 		if err != nil {
-			return raftauthority.AuthorityObservation{}, err
+			return observation, err
 		}
-		if !found || leaderIncarnation == 0 {
-			return raftauthority.AuthorityObservation{}, ErrAuthorityLeaderIncarnationUnavailable
+		if !found || observation.LeaderIncarnation == 0 {
+			return observation, ErrAuthorityLeaderIncarnationUnavailable
 		}
 	} else if runtime.authority != nil && !runtime.authority.disabled && status.Lead != 0 {
-		return raftauthority.AuthorityObservation{}, ErrAuthorityLeaderIncarnationUnavailable
+		return observation, ErrAuthorityLeaderIncarnationUnavailable
 	}
-	return raftauthority.AuthorityObservation{
-		Group: authorityGroupKey(runtime.identity.Group), Term: status.GetTerm(),
-		Leader: status.Lead, LeaderIncarnation: leaderIncarnation,
-		Config: config, CurrentTermCommitted: runtime.node.CurrentTermCommitted(),
-		Stable: !config.Joint && !config.Pending,
-	}, nil
+	return observation, nil
+}
+
+// ReadAuthorityObservation returns a fresh serialized observation for holder
+// admission, grant validation, and final token revalidation. Config digest is
+// deterministic over the published ConfState and the pending/applied flags
+// are deliberately conservative.
+func (runtime *Runtime) ReadAuthorityObservation() (raftauthority.AuthorityObservation, error) {
+	observation, err := runtime.readAuthorityObservation()
+	if err != nil {
+		return raftauthority.AuthorityObservation{}, err
+	}
+	return observation, nil
 }
 
 func (runtime *Runtime) authorityVotersMatch(expected []uint64) bool {
@@ -283,12 +601,27 @@ func (runtime *Runtime) authorityVotersMatch(expected []uint64) bool {
 // request is retained in a bounded Runtime outbound list until Host transfers
 // ownership to the authenticated transport.
 func (runtime *Runtime) StartReadAuthorityRound() error {
-	if err := runtime.requireEmptyInputWindow(); err != nil {
-		return err
+	if runtime == nil {
+		return ErrRuntimeClosed
 	}
 	state := runtime.authority
 	if state == nil || state.disabled {
+		// Preserve the disabled-policy ordering: ordinary callers still observe
+		// the existing Ready/settlement error before the opt-in feature reports
+		// that it is disabled.
+		if err := runtime.requireEmptyInputWindow(); err != nil {
+			return err
+		}
 		return raftauthority.ErrPolicyDisabled
+	}
+	if err := runtime.checkUsable(); err != nil {
+		return err
+	}
+	if runtime.transferPending() {
+		return ErrAuthorityTransferPending
+	}
+	if err := runtime.requireEmptyInputWindow(); err != nil {
+		return err
 	}
 	status := runtime.node.Status()
 	if status.RaftState != raft.StateLeader || status.Lead != runtime.identity.MemberID {
@@ -392,12 +725,26 @@ func (runtime *Runtime) StartReadAuthorityRound() error {
 // most one newer candidate, so a slow or partitioned quorum cannot create an
 // unbounded stream of rounds.
 func (runtime *Runtime) EnsureReadAuthorityRound() error {
-	if err := runtime.requireEmptyInputWindow(); err != nil {
-		return err
+	if runtime == nil {
+		return ErrRuntimeClosed
 	}
 	state := runtime.authority
 	if state == nil || state.disabled {
+		// Keep the existing disabled-policy path unchanged while enabled
+		// transfers can be checked before any Ready-window retry.
+		if err := runtime.requireEmptyInputWindow(); err != nil {
+			return err
+		}
 		return raftauthority.ErrPolicyDisabled
+	}
+	if err := runtime.checkUsable(); err != nil {
+		return err
+	}
+	if runtime.transferPending() {
+		return ErrAuthorityTransferPending
+	}
+	if err := runtime.requireEmptyInputWindow(); err != nil {
+		return err
 	}
 	token, err := runtime.ReadAuthorityToken()
 	if err == nil {
@@ -462,6 +809,9 @@ func (runtime *Runtime) ReadAuthorityToken() (raftauthority.AuthorityToken, erro
 	if state == nil || state.disabled {
 		return raftauthority.AuthorityToken{}, raftauthority.ErrPolicyDisabled
 	}
+	if runtime.transferPending() {
+		return raftauthority.AuthorityToken{}, ErrAuthorityTransferPending
+	}
 	observation, err := runtime.ReadAuthorityObservation()
 	if err != nil {
 		return raftauthority.AuthorityToken{}, err
@@ -506,6 +856,9 @@ func (runtime *Runtime) ValidateReadAuthorityToken(token raftauthority.Authority
 	state := runtime.authority
 	if state == nil || state.disabled {
 		return raftauthority.ErrPolicyDisabled
+	}
+	if runtime.transferPending() {
+		return ErrAuthorityTransferPending
 	}
 	observation, err := runtime.ReadAuthorityObservation()
 	if err != nil {
@@ -647,6 +1000,7 @@ func cloneAuthorityPolicy(policy raftauthority.ReadAuthorityPolicy) raftauthorit
 }
 
 func (runtime *Runtime) refreshAuthority() {
+	runtime.refreshLeaderTransfer()
 	state := runtime.authority
 	if state == nil || (state.round == nil && state.renewal == nil) {
 		return
@@ -672,6 +1026,14 @@ func (runtime *Runtime) refreshAuthority() {
 		}
 		state.outbound = state.outbound[:0]
 	}
+}
+
+func (runtime *Runtime) transferPending() bool {
+	if runtime == nil {
+		return false
+	}
+	runtime.refreshLeaderTransfer()
+	return runtime.leaderTransfer != nil
 }
 
 // invalidateAuthority is called before topology-changing operations and after
