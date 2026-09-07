@@ -1,7 +1,6 @@
 package gateway
 
 import (
-	"bytes"
 	"context"
 	"sync/atomic"
 
@@ -225,19 +224,17 @@ func semanticCallToWire(call *shardservice.ReplicatedCall) (*shardservice.Replic
 	if call.SQL == nil {
 		return &request, nil
 	}
-	if size, err := shardservice.RequestFrameBytes(call.SQL); err != nil {
-		return nil, err
-	} else if size > shardservice.MaxReplicatedSQLRequestBytes {
-		return nil, ErrResultLimit
-	}
-	var body bytes.Buffer
-	if err := shardservice.EncodeRequest(&body, call.SQL); err != nil {
+	// One exact allocation replaces the buffer growth chain plus the
+	// discarded one-shot encoder arena; the bound check below is the same
+	// limit the two-pass version enforced after encoding.
+	query, err := shardservice.EncodeRequestBytes(call.SQL)
+	if err != nil {
 		return nil, err
 	}
-	if body.Len() > shardservice.MaxReplicatedSQLRequestBytes {
+	if len(query) > shardservice.MaxReplicatedSQLRequestBytes {
 		return nil, ErrResultLimit
 	}
-	request.Query = body.Bytes()
+	request.Query = query
 	return &request, nil
 }
 
@@ -270,7 +267,7 @@ func (executor *ReplicatedExecutor) doReplicatedCall(
 	endpoint ReplicatedEndpoint,
 	call *shardservice.ReplicatedCall,
 ) (*shardservice.ReplicatedReply, error) {
-	attemptCtx, cancel := context.WithTimeout(ctx, executor.attemptTimeout)
+	attemptCtx, cancel := tightenTimeout(ctx, executor.attemptTimeout)
 	defer cancel()
 	// Attempts are sequential and no transport mutates the call (the server
 	// deep-clones before executing, the wire path copies the envelope to
