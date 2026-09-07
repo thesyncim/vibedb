@@ -932,6 +932,13 @@ func (m *Machine) AdmitCommand(data []byte) error {
 	case plan.release:
 		return m.checkTransitionCapacity(m.hypotheticalState(command, plan), nil, plan)
 	case plan.resultCode == ResultStaleFence:
+		// A catalog write can lose admission to the membership change it is
+		// coordinating. Commit only its already-planned failure completion so
+		// an exact unknown retry can settle. The mutation plan remains empty;
+		// mutableBindingMatchesState still prevents stale data changes.
+		if m.catalogMutationCanSettleStale(command) {
+			return m.checkTransitionCapacity(m.hypotheticalState(command, plan), nil, plan)
+		}
 		return ErrStaleCommand
 	case plan.resultCode == ResultSessionRetired:
 		return m.checkTransitionCapacity(m.hypotheticalState(command, plan), nil, plan)
@@ -3197,4 +3204,13 @@ func (m *Machine) openedBundleImageCurrent() bool {
 		}
 	}
 	return true
+}
+
+func (m *Machine) catalogMutationCanSettleStale(command replication.CommandView) bool {
+	b := m.binding
+	return command.Kind() == replication.CommandMutationBatch && command.AuthorityClass == replication.CommandAuthorityTopology &&
+		bytes.Equal(command.Distribution, []byte("catalog")) && bytes.Equal(command.Shard, []byte("controlplane")) &&
+		command.ActivePolicyGeneration == b.ActivePolicyGeneration && command.ProtectionEpoch == b.ProtectionEpoch &&
+		command.SchemaGeneration == b.SchemaGeneration && command.ReplicaSetVersion <= m.state.ReplicaSetVersion &&
+		command.OwnershipEpoch <= b.OwnershipEpoch && command.RoutingVersion <= b.RoutingVersion && command.RouteGeneration <= b.RouteGeneration
 }
