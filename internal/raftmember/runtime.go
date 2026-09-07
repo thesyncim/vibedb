@@ -569,7 +569,10 @@ func AdoptNodeRuntime(
 		stable: group, database: database, apply: apply, nodePersistence: persistence,
 		identity: identity,
 	}
-	runtime.node, err = raftmodel.NewPipelinedNode(identity.MemberID, incarnation, group, apply)
+	runtime.node, err = raftmodel.NewPipelinedNodeWithOptions(
+		identity.MemberID, incarnation, group, apply,
+		raftmodel.NodeOptions{ElectionGate: runtime.authorityElectionGate},
+	)
 	if err != nil {
 		return runtime.abortAdoption(fmt.Errorf("raftmember: construct node: %w", err))
 	}
@@ -693,9 +696,15 @@ func adoptRuntime(
 	}
 	runtime.identity.NodeIncarnation = incarnation
 	if pipelined {
-		runtime.node, err = raftmodel.NewPipelinedNode(sealed.MemberID, incarnation, wal, apply)
+		runtime.node, err = raftmodel.NewPipelinedNodeWithOptions(
+			sealed.MemberID, incarnation, wal, apply,
+			raftmodel.NodeOptions{ElectionGate: runtime.authorityElectionGate},
+		)
 	} else {
-		runtime.node, err = raftmodel.NewNode(sealed.MemberID, incarnation, wal, apply)
+		runtime.node, err = raftmodel.NewNodeWithOptions(
+			sealed.MemberID, incarnation, wal, apply,
+			raftmodel.NodeOptions{ElectionGate: runtime.authorityElectionGate},
+		)
 	}
 	if err != nil {
 		return runtime.abortAdoption(fmt.Errorf("raftmember: construct node: %w", err))

@@ -132,6 +132,9 @@ func (runtime *Runtime) ConfigureReadAuthority(options ReadAuthorityOptions) err
 		runtime.authority.disabled = false
 		return nil
 	}
+	if err := runtime.node.CheckElectionGateActivation(); err != nil {
+		return err
+	}
 	book, err := raftauthority.NewPromiseBook(
 		options.Clock, authorityGroupKey(runtime.identity.Group), runtime.identity.MemberID,
 		options.Policy,
@@ -146,9 +149,6 @@ func (runtime *Runtime) ConfigureReadAuthority(options ReadAuthorityOptions) err
 		policy: cloneAuthorityPolicy(options.Policy), clock: options.Clock, promise: book,
 		leaderIncarnation: options.LeaderIncarnation,
 		outbound:          make([]OutboundMessage, 0, len(options.Policy.Voters)),
-	}
-	if err := runtime.node.SetElectionGate(runtime.authorityElectionGate); err != nil {
-		return err
 	}
 	runtime.authority = state
 	return nil

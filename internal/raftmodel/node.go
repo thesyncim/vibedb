@@ -51,6 +51,11 @@ type Node struct {
 	pendingInputCalls int
 	pendingInputUnits int
 	pendingInputBytes int64
+	// electionGatePristine is a monotone construction-era proof. It remains
+	// true only until protocol input or Ready capture crosses this Node. A
+	// Runtime may use that proof to activate its constructor-bound election
+	// gate while a recovered RawNode still has committed Ready work pending.
+	electionGatePristine bool
 
 	commitIndex        uint64
 	commitAdvancements uint64
@@ -73,6 +78,15 @@ const (
 	ElectionCampaign
 	ElectionTransfer
 )
+
+// NodeOptions contains construction-time hooks for a Node owner. The
+// election gate is bound before RawNode recovery can expose Ready work, so a
+// Runtime can configure authority before replaying a committed suffix.
+// Existing NewNode and NewPipelinedNode callers retain their ordinary
+// ungated behavior by passing zero options.
+type NodeOptions struct {
+	ElectionGate func(ElectionInput) error
+}
 
 // CommitMetrics is the allocation-free cumulative observation produced at the
 // RawNode mutation boundary. An advancement counts one core transition of the
@@ -123,7 +137,19 @@ type MemberProgress struct {
 // member boot counter allocated by StableStore; it fences ReadIndex results and
 // Ready retries across restarts.
 func NewNode(id, incarnation uint64, stable StableStore, machine StateMachine) (*Node, error) {
-	return newNode(id, incarnation, stable, machine, false)
+	return NewNodeWithOptions(id, incarnation, stable, machine, NodeOptions{})
+}
+
+// NewNodeWithOptions constructs a synchronous Node with its owner hooks bound
+// before RawNode recovery. The options are deliberately narrow so the
+// existing constructor contract remains unchanged for standalone callers.
+func NewNodeWithOptions(
+	id, incarnation uint64,
+	stable StableStore,
+	machine StateMachine,
+	options NodeOptions,
+) (*Node, error) {
+	return newNode(id, incarnation, stable, machine, false, options)
 }
 
 // NewPipelinedNode constructs a Node around upstream Raft's ordered
@@ -131,10 +157,28 @@ func NewNode(id, incarnation uint64, stable StableStore, machine StateMachine) (
 // local target reliably and in order and must never call the synchronous Ready
 // lifecycle methods.
 func NewPipelinedNode(id, incarnation uint64, stable StableStore, machine StateMachine) (*Node, error) {
-	return newNode(id, incarnation, stable, machine, true)
+	return NewPipelinedNodeWithOptions(id, incarnation, stable, machine, NodeOptions{})
 }
 
-func newNode(id, incarnation uint64, stable StableStore, machine StateMachine, async bool) (*Node, error) {
+// NewPipelinedNodeWithOptions constructs an asynchronous Node with its owner
+// hooks bound before RawNode recovery. The caller still owns the same ordered
+// MsgStorageAppend/MsgStorageApply lifecycle as NewPipelinedNode.
+func NewPipelinedNodeWithOptions(
+	id, incarnation uint64,
+	stable StableStore,
+	machine StateMachine,
+	options NodeOptions,
+) (*Node, error) {
+	return newNode(id, incarnation, stable, machine, true, options)
+}
+
+func newNode(
+	id, incarnation uint64,
+	stable StableStore,
+	machine StateMachine,
+	async bool,
+	options NodeOptions,
+) (*Node, error) {
 	if id == raft.None {
 		return nil, errors.New("raftmodel: member ID must be non-zero")
 	}
@@ -278,17 +322,19 @@ func newNode(id, incarnation uint64, stable StableStore, machine StateMachine, a
 		return nil, fmt.Errorf("raftmodel: construct RawNode: %w", err)
 	}
 	n := &Node{
-		id:           id,
-		incarnation:  incarnation,
-		async:        async,
-		raw:          raw,
-		stable:       stable,
-		machine:      machine,
-		phase:        PhaseIdle,
-		published:    pub,
-		issuedReads:  make(map[readContextKey]readIssue),
-		commitIndex:  raw.BasicStatus().GetCommit(),
-		observedTerm: raw.BasicStatus().GetTerm(),
+		id:                   id,
+		incarnation:          incarnation,
+		async:                async,
+		raw:                  raw,
+		stable:               stable,
+		machine:              machine,
+		phase:                PhaseIdle,
+		electionGate:         options.ElectionGate,
+		electionGatePristine: true,
+		published:            pub,
+		issuedReads:          make(map[readContextKey]readIssue),
+		commitIndex:          raw.BasicStatus().GetCommit(),
+		observedTerm:         raw.BasicStatus().GetTerm(),
 		pendingDurableLast: func() uint64 {
 			if last > pub.Applied {
 				return last
@@ -357,6 +403,29 @@ func (n *Node) SetElectionGate(gate func(ElectionInput) error) error {
 	}
 	n.electionGate = gate
 	return nil
+}
+
+// CheckElectionGateActivation validates the one first-install boundary for a
+// constructor-bound election gate. A recovered RawNode may have committed
+// Ready work before any protocol input or Ready capture; that is the only
+// pending-Ready state this check permits. Once the construction proof closes,
+// activation retains SetElectionGate's complete-idle/no-Ready contract.
+func (n *Node) CheckElectionGateActivation() error {
+	if n == nil || n.phase != PhaseIdle || n.readyID != 0 ||
+		n.pendingInputCalls != 0 || n.pendingInputUnits != 0 || n.pendingInputBytes != 0 ||
+		n.raw == nil {
+		return ErrReadyPending
+	}
+	if !n.electionGatePristine && n.raw.HasReady() {
+		return ErrReadyPending
+	}
+	return nil
+}
+
+func (n *Node) closeElectionGatePristine() {
+	if n != nil {
+		n.electionGatePristine = false
+	}
 }
 
 func (n *Node) gateElection(input ElectionInput) error {
@@ -509,6 +578,7 @@ func (n *Node) CaptureReady() (bool, error) {
 	if n.readySeq == math.MaxUint64 {
 		return false, errors.New("raftmodel: Ready ID exhausted")
 	}
+	n.closeElectionGatePristine()
 	n.readySeq++
 	n.readyID = n.readySeq
 	n.ready = n.raw.Ready()
@@ -1691,6 +1761,10 @@ func (n *Node) admitProtocolInput(operation string, units int, inputBytes int64)
 		n.pendingInputUnits > MaxPendingInputUnits-units || n.pendingInputBytes > MaxPendingInputBytes-inputBytes) {
 		return errors.Join(ErrReadyPending, ErrAdmissionBound)
 	}
+	// Close the construction-era proof before any caller-owned input reaches
+	// RawNode. This remains monotone even when recordProtocolInput later clears
+	// the bounded counters after a quiet input produces no Ready.
+	n.closeElectionGatePristine()
 	return nil
 }
 
