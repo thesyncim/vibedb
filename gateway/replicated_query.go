@@ -115,6 +115,21 @@ func (transport *ReplicatedSQLTransport) DoBatches(ctx context.Context, address 
 	}
 }
 
+// replicatedCallPool recycles the ~750 B per-query call shell. QuerySQL
+// owns the shell for exactly its duration (attempts are sequential, the
+// envelope encoder only reads, and the reply never aliases the call), so a
+// full scrub on release is sufficient discipline.
+var replicatedCallPool = sync.Pool{New: func() any { return &shardservice.ReplicatedCall{} }}
+
+func getReplicatedCall() *shardservice.ReplicatedCall {
+	return replicatedCallPool.Get().(*shardservice.ReplicatedCall)
+}
+
+func putReplicatedCall(call *shardservice.ReplicatedCall) {
+	*call = shardservice.ReplicatedCall{}
+	replicatedCallPool.Put(call)
+}
+
 func (executor *ReplicatedExecutor) QuerySQL(ctx context.Context, route ReplicatedRoute, req *shardservice.ShardRequest) (*shardservice.ShardResponse, error) {
 	if executor == nil || executor.client == nil || ctx == nil || req == nil || !validReplicatedRoute(route) {
 		return nil, ErrReplicatedRoute
@@ -130,18 +145,19 @@ func (executor *ReplicatedExecutor) QuerySQL(ctx context.Context, route Replicat
 	} else if size > shardservice.MaxReplicatedSQLRequestBytes {
 		return nil, ErrResultLimit
 	}
-	// The call shell is built once: attempts are sequential and restamp only
-	// the per-attempt fence in place, saving a ~750 B struct alloc per
-	// retry. (The envelope copy in semanticCallToWire stays: callers retain
-	// the envelope by pinned contract.)
-	call := &shardservice.ReplicatedCall{
-		Request: shardservice.ReplicatedRequest{
-			Operation: shardservice.ReplicatedQueryLeader, Authority: req.Authority,
-			Capability: serviceauthz.CapabilityDataRead,
-			MaxValueBytes: shardservice.MaxReplicatedSQLResultBytes,
-		},
-		SQL: req,
-	}
+	// The call shell comes from a pool and is built once: attempts are
+	// sequential and restamp only the per-attempt fence in place. The pool
+	// saves the ~750 B shell alloc per query; the full scrub on release
+	// (not field reasoning) keeps pooled shells exact across shapes. (The
+	// envelope copy in semanticCallToWire stays: callers retain the
+	// envelope by pinned contract.)
+	call := getReplicatedCall()
+	call.Request.Operation = shardservice.ReplicatedQueryLeader
+	call.Request.Authority = req.Authority
+	call.Request.Capability = serviceauthz.CapabilityDataRead
+	call.Request.MaxValueBytes = shardservice.MaxReplicatedSQLResultBytes
+	call.SQL = req
+	defer putReplicatedCall(call)
 	preferred := route.Replicas[0].Member
 	var joined error
 	for attempt := 0; attempt < executor.maxAttempts; attempt++ {
