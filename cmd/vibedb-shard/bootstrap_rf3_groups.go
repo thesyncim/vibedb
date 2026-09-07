@@ -360,7 +360,8 @@ func combineColdRF3MemberManifests(members []rf3Manifest) (rf3Manifest, error) {
 	for _, member := range members {
 		bundles := member.groupBundles()
 		if len(bundles) != 1 || member.Listeners != combined.Listeners || member.TLS != combined.TLS ||
-			member.AuthorizationPolicy != combined.AuthorizationPolicy || member.DevelopmentOnly != combined.DevelopmentOnly {
+			member.AuthorizationPolicy != combined.AuthorizationPolicy || member.DevelopmentOnly != combined.DevelopmentOnly ||
+			!rf3ReadAuthorityManifestEqual(member.ReadAuthority, combined.ReadAuthority) {
 			return rf3Manifest{}, errInvalidBootstrapRF3Manifest
 		}
 		combined.Groups = append(combined.Groups, bundles[0])

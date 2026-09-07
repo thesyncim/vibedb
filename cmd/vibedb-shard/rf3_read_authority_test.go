@@ -109,6 +109,33 @@ func TestRF3ReadAuthorityPolicyAndMarkerAreImmutable(t *testing.T) {
 	}
 }
 
+func TestRF3ReadAuthorityMarkerPreflightDistinguishesCreatedState(t *testing.T) {
+	root := t.TempDir()
+	policy := testRF3ReadAuthorityPolicy()
+	preexisting, err := inspectRF3ReadAuthorityState(root, policy)
+	if err != nil || preexisting {
+		t.Fatalf("absent marker preflight = present=%t err=%v", preexisting, err)
+	}
+	if _, err := os.Stat(rf3ReadAuthorityMarkerPath(root)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("absent marker preflight created state: %v", err)
+	}
+	if err := ensureRF3ReadAuthorityState(root, policy); err != nil {
+		t.Fatalf("create marker: %v", err)
+	}
+	preexisting, err = inspectRF3ReadAuthorityState(root, policy)
+	if err != nil || !preexisting {
+		t.Fatalf("existing marker preflight = present=%t err=%v", preexisting, err)
+	}
+	changed := policy
+	changed.Voters = append([]uint64(nil), policy.Voters...)
+	changed.Voters[2] = 4
+	changed.Capabilities = append([]raftauthority.VoterCapability(nil), policy.Capabilities...)
+	changed.Capabilities[2].MemberID = 4
+	if _, err := inspectRF3ReadAuthorityState(root, changed); !errors.Is(err, errRF3ReadAuthorityDowngrade) {
+		t.Fatalf("changed marker preflight = %v, want downgrade", err)
+	}
+}
+
 func TestRF3ReadAuthorityIncarnationCacheIsMonotonicBoundedAndExpiring(t *testing.T) {
 	group := raftmember.GroupKey{GroupID: [16]byte{1}, TopologyRecoveryEpoch: 1}
 	target := rf3ReadAuthorityProbeTarget{

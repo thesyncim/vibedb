@@ -54,6 +54,21 @@ func runBootstrapRF3(args []string) int {
 			return 2
 		}
 	}
+	// Cold bootstrap provisions a non-participating enrolled target. Reject
+	// authority state for each member that still needs a WAL before opening any
+	// control service or snapshot target; a stale marker must never be converted
+	// into a fresh target's authority configuration.
+	for _, member := range members {
+		if _, statErr := os.Stat(member.WAL.Path); errors.Is(statErr, os.ErrNotExist) {
+			if err := validateColdRF3ReadAuthority(member); err != nil {
+				fmt.Fprintf(os.Stderr, "error RF3 cold authority preflight: %v\n", err)
+				return 2
+			}
+		} else if statErr != nil {
+			fmt.Fprintf(os.Stderr, "error RF3 member WAL preflight: %v\n", statErr)
+			return 2
+		}
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	if len(members) == 1 {
@@ -67,6 +82,20 @@ func runBootstrapRF3(args []string) int {
 		return 1
 	}
 	return 0
+}
+
+func validateColdRF3ReadAuthority(member rf3Manifest) error {
+	if member.ReadAuthority != nil {
+		return errors.Join(errRF3ReadAuthority, errors.New("cold target cannot carry read authority policy"))
+	}
+	_, err := os.Lstat(rf3ReadAuthorityMarkerPath(member.Route.MemberRoot))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return errors.Join(errRF3ReadAuthorityState, err)
+	}
+	return errRF3ReadAuthorityDowngrade
 }
 
 // bootstrapPreparedRF3 owns the non-serving cold target until one exact

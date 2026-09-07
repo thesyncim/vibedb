@@ -422,6 +422,21 @@ func (n *Node) CheckElectionGateActivation() error {
 	return nil
 }
 
+// CheckElectionGatePristineActivation validates the startup-only boundary for
+// restoring a retained authority policy. A recovered RawNode may expose
+// committed Ready work while the construction-era proof is still intact, but
+// a Node that has ever accepted protocol input or captured Ready must not
+// install a restored policy after its counters happen to drain.
+func (n *Node) CheckElectionGatePristineActivation() error {
+	if err := n.CheckElectionGateActivation(); err != nil {
+		return err
+	}
+	if !n.electionGatePristine {
+		return ErrReadyPending
+	}
+	return nil
+}
+
 func (n *Node) closeElectionGatePristine() {
 	if n != nil {
 		n.electionGatePristine = false

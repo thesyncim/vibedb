@@ -277,35 +277,52 @@ func syncRF3ReadAuthorityState(path string) error {
 	return errors.Join(syncErr, closeErr, dirSyncErr, dirCloseErr)
 }
 
-func ensureRF3ReadAuthorityState(memberRoot string, policy raftauthority.ReadAuthorityPolicy) error {
+// inspectRF3ReadAuthorityState validates and repairs an existing marker without
+// creating one. The returned bit is the durable pre-startup fact used to
+// distinguish a previously qualified policy from a marker that this startup
+// may create after its publication/roster preflight.
+func inspectRF3ReadAuthorityState(memberRoot string, policy raftauthority.ReadAuthorityPolicy) (bool, error) {
 	if !rf3qualification.ReadAuthorityEnabled {
-		return errors.Join(errRF3ReadAuthorityState, errRF3ReadAuthority)
+		return false, errors.Join(errRF3ReadAuthorityState, errRF3ReadAuthority)
 	}
 	if !policy.Enabled {
-		return errors.Join(errRF3ReadAuthorityState, errRF3ReadAuthority)
+		return false, errors.Join(errRF3ReadAuthorityState, errRF3ReadAuthority)
 	}
 	if err := policy.Validate(); err != nil {
-		return errors.Join(errRF3ReadAuthorityState, err)
+		return false, errors.Join(errRF3ReadAuthorityState, err)
 	}
 	path := rf3ReadAuthorityMarkerPath(memberRoot)
 	want := rf3ReadAuthorityStateFor(policy)
 	got, err := readRF3ReadAuthorityState(path)
-	if err == nil {
-		if got.PolicyVersion != want.PolicyVersion || got.PolicyDigest != want.PolicyDigest ||
-			!slices.Equal(got.Voters, want.Voters) {
-			return errors.Join(errRF3ReadAuthorityState, errRF3ReadAuthorityDowngrade)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
 		}
-		// A previous process may have written the marker and died before its
-		// file or containing directory reached stable storage. Repair both
-		// fences before Runtime can enter a new quarantine or make a grant.
-		if err := syncRF3ReadAuthorityState(path); err != nil {
-			return errors.Join(errRF3ReadAuthorityState, err)
-		}
-		return nil
+		return false, err
 	}
-	if !errors.Is(err, os.ErrNotExist) {
+	if got.PolicyVersion != want.PolicyVersion || got.PolicyDigest != want.PolicyDigest ||
+		!slices.Equal(got.Voters, want.Voters) {
+		return false, errors.Join(errRF3ReadAuthorityState, errRF3ReadAuthorityDowngrade)
+	}
+	// A previous process may have written the marker and died before its file
+	// or containing directory reached stable storage. Repair both fences before
+	// Runtime can enter a new quarantine or make a grant.
+	if err := syncRF3ReadAuthorityState(path); err != nil {
+		return false, errors.Join(errRF3ReadAuthorityState, err)
+	}
+	return true, nil
+}
+
+func ensureRF3ReadAuthorityState(memberRoot string, policy raftauthority.ReadAuthorityPolicy) error {
+	exists, err := inspectRF3ReadAuthorityState(memberRoot, policy)
+	if err != nil {
 		return err
 	}
+	if exists {
+		return nil
+	}
+	path := rf3ReadAuthorityMarkerPath(memberRoot)
+	want := rf3ReadAuthorityStateFor(policy)
 	if err := writeRF3ReadAuthorityState(path, want); err != nil {
 		if errors.Is(err, os.ErrExist) {
 			return ensureRF3ReadAuthorityState(memberRoot, policy)
@@ -313,6 +330,39 @@ func ensureRF3ReadAuthorityState(memberRoot string, policy raftauthority.ReadAut
 		return err
 	}
 	return nil
+}
+
+// preflightRF3ReadAuthorityRoster obtains one read-only publication cut before
+// a marker can be created. It returns whether the current non-joint voter set
+// is the exact persisted policy roster. A changed set is restorable only when
+// the caller has already found the exact durable marker and the local runtime
+// remains an enrolled voter in the retained policy. Pending replay is allowed
+// here so RestoreReadAuthority can install quarantine before that replay; its
+// startup-pristine Node check and authority observation keep it fail-closed.
+func preflightRF3ReadAuthorityRoster(
+	runtime *raftmember.Runtime, policy raftauthority.ReadAuthorityPolicy,
+) (bool, error) {
+	if runtime == nil || !policy.Enabled {
+		return false, errRF3ReadAuthority
+	}
+	publication, err := runtime.Publication()
+	if err != nil || publication.ConfState == nil || publication.ReplicaSetVersion == 0 {
+		return false, errors.Join(errRF3ReadAuthority, err)
+	}
+	confState := publication.ConfState
+	if len(confState.GetVoters()) == 0 || len(confState.GetVotersOutgoing()) != 0 ||
+		len(confState.GetLearnersNext()) != 0 || confState.GetAutoLeave() {
+		return false, errRF3ReadAuthority
+	}
+	observation, err := runtime.ReadAuthorityObservation()
+	if err != nil || observation.Config.Joint {
+		return false, errors.Join(errRF3ReadAuthority, err)
+	}
+	identity := runtime.Identity()
+	if !slices.Contains(policy.Voters, identity.MemberID) {
+		return false, errRF3ReadAuthority
+	}
+	return slices.Equal(confState.GetVoters(), policy.Voters), nil
 }
 
 func ensureRF3ReadAuthorityDisabled(memberRoot string) error {
@@ -814,21 +864,58 @@ func configureRF3ReadAuthorities(
 			return nil, nil, err
 		}
 	}
+	// Inspect every marker and publication before creating any missing marker.
+	// A changed membership cut may use RestoreReadAuthority only when the
+	// exact policy marker was already durable before this startup. This keeps a
+	// failed cold/mismatched configuration from laundering a newly-created
+	// marker into a later restore.
+	preexisting := make([]bool, len(runtimes))
+	exactRoster := make([]bool, len(runtimes))
 	for index, runtime := range runtimes {
+		exactRoster[index], err = preflightRF3ReadAuthorityRoster(runtime, policy)
+		if err != nil {
+			_ = cache.Close()
+			return nil, nil, err
+		}
+	}
+	for index := range runtimes {
 		item := &prepared[index]
+		preexisting[index], err = inspectRF3ReadAuthorityState(item.manifest.Route.MemberRoot, policy)
+		if err != nil {
+			_ = cache.Close()
+			return nil, nil, err
+		}
+		if !exactRoster[index] && !preexisting[index] {
+			_ = cache.Close()
+			return nil, nil, errRF3ReadAuthority
+		}
+	}
+	for index, item := range prepared {
+		if preexisting[index] {
+			continue
+		}
 		if err := ensureRF3ReadAuthorityState(item.manifest.Route.MemberRoot, policy); err != nil {
 			_ = cache.Close()
 			return nil, nil, err
 		}
+	}
+	for index, runtime := range runtimes {
 		group := runtime.Identity().Group
-		if err := runtime.ConfigureReadAuthority(raftmember.ReadAuthorityOptions{
+		options := raftmember.ReadAuthorityOptions{
 			Policy: policy, Clock: clocks[index],
 			LeaderIncarnation: func(memberID uint64) (uint64, bool, error) {
 				return cache.Lookup(group, memberID)
 			},
-		}); err != nil {
+		}
+		var configureErr error
+		if exactRoster[index] {
+			configureErr = runtime.ConfigureReadAuthority(options)
+		} else {
+			configureErr = runtime.RestoreReadAuthority(options)
+		}
+		if configureErr != nil {
 			_ = cache.Close()
-			return nil, nil, err
+			return nil, nil, configureErr
 		}
 	}
 	startup := make([]raftmember.ReadAuthorityEvidence, 0, len(runtimes))
