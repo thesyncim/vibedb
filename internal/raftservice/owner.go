@@ -115,6 +115,10 @@ type Options struct {
 	Pulse                      <-chan struct{}
 	Limits                     Limits
 	ProgressMetrics            *ProgressMetrics
+	// pointReadSlots is supplied only by ExecutionOwners. The map is detached
+	// during construction and thereafter each slot is stable, while its value
+	// is published by the serialized Owner.
+	pointReadSlots map[raftmember.GroupKey]*pointReadViewSlot
 }
 
 type requestKind uint8
@@ -196,6 +200,7 @@ type ownerRequest struct {
 	step                [32]byte
 	sourceMember        uint64
 	install             ExecutionGroup
+	pointReadSlot       *pointReadViewSlot
 	publish             func()
 	database            *sqldriver.Database
 	apply               *sqldriver.ReplicatedApply
@@ -843,6 +848,7 @@ type ownerMember struct {
 	retiring          bool
 	generation        *ownerGeneration
 	permit            *servingFencePermit
+	pointReadSlot     *pointReadViewSlot
 	ownershipProposal *ownershipProposal
 }
 
@@ -979,7 +985,7 @@ func newOwner(options Options, host ownerHost, allowEmpty bool) (*Owner, error) 
 			recovery = options.TransactionRecoverySources[index]
 		}
 		members[group] = ownerMember{identity: identity, command: options.CommandFences[index],
-			read: source, recovery: recovery, generation: &ownerGeneration{}}
+			read: source, recovery: recovery, generation: &ownerGeneration{}, pointReadSlot: options.pointReadSlots[group]}
 	}
 	return &Owner{
 		registry: options.Registry, host: host, groups: groups, members: members,
@@ -1780,7 +1786,7 @@ func (owner *Owner) handle(request ownerRequest) error {
 	case requestReplicaRetirement:
 		reply.err = owner.retireReplica(request)
 	case requestInstallExecutionGroup:
-		reply.err = owner.installExecutionGroupNow(request.install, request.publish)
+		reply.err = owner.installExecutionGroupNow(request.install, request.pointReadSlot, request.publish)
 	case requestRemoveExecutionGroup:
 		reply.err = owner.removeExecutionGroupNow(
 			request.group, request.install.Identity, request.publish,
@@ -2135,14 +2141,17 @@ func validExecutionGroup(group ExecutionGroup) bool {
 // enqueued it waits for the serialized owner even if a caller would otherwise
 // abandon its context; returning outcome-unknown here could leak an adopted
 // Runtime whose ownership the caller still believes it retains.
-func (owner *Owner) installExecutionGroup(group ExecutionGroup, publish func()) error {
+func (owner *Owner) installExecutionGroup(group ExecutionGroup, pointReadSlot *pointReadViewSlot, publish func()) error {
 	if owner == nil || publish == nil || !validExecutionGroup(group) {
+		return ErrInvalidOwner
+	}
+	if pointReadSlot == nil {
 		return ErrInvalidOwner
 	}
 	reply := make(chan ownerReply, 1)
 	if err := owner.publish(ownerRequest{
 		kind: requestInstallExecutionGroup, group: group.Identity.Group,
-		install: group, publish: publish, reply: reply,
+		install: group, pointReadSlot: pointReadSlot, publish: publish, reply: reply,
 	}); err != nil {
 		return err
 	}
@@ -2150,8 +2159,8 @@ func (owner *Owner) installExecutionGroup(group ExecutionGroup, publish func()) 
 	return result.err
 }
 
-func (owner *Owner) installExecutionGroupNow(group ExecutionGroup, publish func()) error {
-	if !validExecutionGroup(group) || publish == nil || len(owner.groups) >= multiraft.AbsoluteMaxGroups {
+func (owner *Owner) installExecutionGroupNow(group ExecutionGroup, pointReadSlot *pointReadViewSlot, publish func()) error {
+	if !validExecutionGroup(group) || pointReadSlot == nil || publish == nil || len(owner.groups) >= multiraft.AbsoluteMaxGroups {
 		return ErrInvalidOwner
 	}
 	key := group.Identity.Group
@@ -2165,7 +2174,7 @@ func (owner *Owner) installExecutionGroupNow(group ExecutionGroup, publish func(
 	// owner metadata before transport enrollment so an authenticated frame can
 	// never resolve a group without a serving owner.
 	owner.storeOwnerMember(key, ownerMember{identity: group.Identity, command: group.Command,
-		read: group.Read, recovery: group.Recovery, generation: &ownerGeneration{}})
+		read: group.Read, recovery: group.Recovery, generation: &ownerGeneration{}, pointReadSlot: pointReadSlot})
 	owner.groups = append(owner.groups, key)
 	publish()
 	return nil

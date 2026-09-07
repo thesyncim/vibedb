@@ -432,17 +432,19 @@ func TestReplicatedSQLBudgetHintsBoundedAndConservative(t *testing.T) {
 
 type replicatedSQLPointPathOwner struct {
 	*fakeReplicatedOwner
-	pointErr  error
-	dataErr   error
-	pointCall int
-	dataCall  int
+	pointErr     error
+	dataErr      error
+	pointRequest *raftservice.LinearizablePointReadRequest
+	pointCall    int
+	dataCall     int
 }
 
 func (owner *replicatedSQLPointPathOwner) ReadLinearizablePointInto(
-	context.Context,
-	raftservice.LinearizablePointReadRequest,
-	*raftservice.LinearizablePointReadCut,
+	_ context.Context,
+	request raftservice.LinearizablePointReadRequest,
+	_ *raftservice.LinearizablePointReadCut,
 ) error {
+	owner.pointRequest = &request
 	owner.pointCall++
 	return owner.pointErr
 }

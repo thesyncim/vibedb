@@ -20,6 +20,7 @@ var (
 	_ pgwire.BackendStatementParamTypePositioner = (*postgresStatement)(nil)
 	_ pgwire.BackendStatementParamTyper          = (*postgresWriteStatement)(nil)
 	_ pgwire.BackendStatementParamTypePositioner = (*postgresWriteStatement)(nil)
+	_ pgwire.BackendStatementRetainedBytes       = (*postgresWriteStatement)(nil)
 )
 
 func TestPostgreSQLStatementParseReuseFollowsCatalogGeneration(t *testing.T) {

@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 	"unicode/utf8"
+	"unsafe"
 
 	"github.com/thesyncim/vibedb/internal/conformance"
 	"github.com/thesyncim/vibedb/query"
@@ -1647,6 +1648,58 @@ func TestRepeatedNumberedParameterCopiesWireValueOnce(t *testing.T) {
 	if got := boundLiteralCharge(charges, stmt); got <= maxPreparedBindBytes {
 		t.Fatalf("execution charge for repeated $1 = %d, want over %d",
 			got, maxPreparedBindBytes)
+	}
+}
+
+type retainedBytesBackendStatement struct {
+	BackendStatement
+	bytes int
+	ok    bool
+}
+
+func (s *retainedBytesBackendStatement) RetainedBytes() (int, bool) {
+	return s.bytes, s.ok
+}
+
+func TestPreparedDerivedChargeUsesOwnedBackendBytes(t *testing.T) {
+	const sqlText = "INSERT INTO messages VALUES (1)"
+	const backendBytes = 300
+	largeSQL := strings.Repeat(sqlText, maxPreparedInputBytes/(preparedPlanByteMultiplier*len(sqlText))+1)
+	stmt := &prepared{
+		sql:        largeSQL,
+		runtime:    &retainedBytesBackendStatement{bytes: backendBytes, ok: true},
+		paramKinds: make([]sqldriver.ParamKind, 3, 4),
+		paramTypes: make([]sqldriver.ParamType, 2, 4),
+		paramOrder: make([]int, 2, 8),
+	}
+	want := preparedPlanFixedBytes + backendBytes +
+		int(unsafe.Sizeof(sqldriver.ParamKind(0)))*4 +
+		int(unsafe.Sizeof(sqldriver.ParamType(0)))*4 +
+		int(unsafe.Sizeof(int(0)))*8
+	if got := preparedDerivedCharge(stmt); got != want {
+		t.Fatalf("owned backend derived charge = %d, want %d", got, want)
+	}
+	for _, test := range []struct {
+		name  string
+		bytes int
+	}{
+		{name: "negative", bytes: -1},
+		{name: "overflows", bytes: maxPreparedInputBytes},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := preparedDerivedCharge(&prepared{
+				sql:     largeSQL,
+				runtime: &retainedBytesBackendStatement{bytes: test.bytes, ok: true},
+			}); got != maxPreparedInputBytes+1 {
+				t.Fatalf("owned backend charge = %d, want over-budget sentinel", got)
+			}
+		})
+	}
+	if got := preparedDerivedCharge(&prepared{
+		sql:     stmt.sql,
+		runtime: &retainedBytesBackendStatement{bytes: 0, ok: false},
+	}); got <= maxPreparedInputBytes {
+		t.Fatalf("unknown backend shape charge = %d, want over %d", got, maxPreparedInputBytes)
 	}
 }
 

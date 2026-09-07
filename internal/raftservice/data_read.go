@@ -18,6 +18,13 @@ type DataReadSource interface {
 	DataReadCutInto([]replication.RelationID, uint64, *replicatedstate.DataReadCut) error
 }
 
+// ConcurrentReadAuthorization is the narrow authorization contract used by
+// the warm ExecutionOwners point-read admission. Implementations must be
+// immutable or internally atomic, pure, and nonblocking: the callback runs
+// while the owning execution lane holds its lock. Legacy ProposalAuthorization
+// remains serialized and is used whenever this contract is unavailable.
+type ConcurrentReadAuthorization func(ServingState) bool
+
 type LinearizableDataReadRequest struct {
 	Fence      ServingFence
 	Capability serviceauthz.Capability
@@ -47,6 +54,13 @@ type LinearizablePointReadRequest struct {
 	// Authorize runs on the serialized owner cut immediately before the read
 	// is admitted, exactly as it does for LinearizableDataReadRequest.
 	Authorize ProposalAuthorization
+	// ConcurrentAuthorize is an optional pure, nonblocking authorization check
+	// for the ExecutionOwners point-admission path. It is evaluated while the
+	// owning execution lane holds its one lock, against the same detached
+	// identity/status cut and authority token that will back this read. A
+	// caller that cannot provide that concurrency contract must leave this nil;
+	// Authorize then retains the serialized Owner path.
+	ConcurrentAuthorize ConcurrentReadAuthorization
 }
 
 // LinearizablePointReadCut pins the authorized owner generation and live read
@@ -312,6 +326,11 @@ func (owner *Owner) readLinearizablePointInto(
 	dst *LinearizablePointReadCut,
 	forceReadIndex bool,
 ) error {
+	var err error
+	request, err = normalizePointReadRequest(request)
+	if err != nil {
+		return err
+	}
 	if owner == nil || ctx == nil || dst == nil ||
 		request.Capability != serviceauthz.CapabilityDataRead {
 		return ErrInvalidOwner
@@ -382,9 +401,19 @@ func (owners *ExecutionOwners) ReadLinearizableDataInto(
 func (owners *ExecutionOwners) ReadLinearizablePointInto(
 	ctx context.Context, request LinearizablePointReadRequest, dst *LinearizablePointReadCut,
 ) error {
-	owner, err := owners.owner(request.Fence.Group)
+	if request.Authorize != nil && request.ConcurrentAuthorize != nil {
+		return ErrInvalidOwner
+	}
+	route, err := owners.ownerRoute(request.Fence.Group)
 	if err != nil {
 		return err
 	}
-	return owner.ReadLinearizablePointInto(ctx, request, dst)
+	if route.point != nil {
+		if attempted, directErr := route.owner.tryReadLinearizablePointInto(
+			ctx, request, dst, route.point,
+		); attempted {
+			return directErr
+		}
+	}
+	return route.owner.ReadLinearizablePointInto(ctx, request, dst)
 }

@@ -1095,7 +1095,13 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 			err = server.BindServingAuthority(authorities.serving)
 		}
 		if err == nil {
+			err = server.BindConcurrentServingAuthority(authorities.serving)
+		}
+		if err == nil {
 			err = server.BindTransitionalServingAuthority(authorities.transitional)
+		}
+		if err == nil {
+			err = server.BindConcurrentTransitionalServingAuthority(authorities.transitional)
 		}
 		if err != nil {
 			return err

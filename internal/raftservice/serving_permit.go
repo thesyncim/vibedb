@@ -52,6 +52,9 @@ func (owner *Owner) ensureServingFencePermit(
 	}
 	fence := group.Fence()
 	if member.permit != nil && member.permit.valid(fence, member.generation) {
+		if member.pointReadSlot != nil && member.pointReadSlot.value.Load() == nil {
+			owner.publishPointReadView(key, member, member.permit)
+		}
 		return member.permit
 	}
 	if member.permit != nil {
@@ -59,6 +62,7 @@ func (owner *Owner) ensureServingFencePermit(
 	}
 	member.permit = &servingFencePermit{fence: fence, generation: member.generation}
 	owner.members[key] = member
+	owner.publishPointReadView(key, member, member.permit)
 	return member.permit
 }
 
@@ -78,6 +82,9 @@ func (owner *Owner) revokeServingFencePermit(group raftmember.GroupKey) {
 		member.permit = nil
 		owner.members[group] = member
 	}
+	if member.pointReadSlot != nil {
+		member.pointReadSlot.value.Store(nil)
+	}
 }
 
 // revokeAllServingFencePermits is the first shutdown/failure action. Runtime
@@ -88,12 +95,14 @@ func (owner *Owner) revokeAllServingFencePermits() {
 		return
 	}
 	for group, member := range owner.members {
-		if member.permit == nil {
-			continue
+		if member.permit != nil {
+			member.permit.revoke()
+			member.permit = nil
+			owner.members[group] = member
 		}
-		member.permit.revoke()
-		member.permit = nil
-		owner.members[group] = member
+		if member.pointReadSlot != nil {
+			member.pointReadSlot.value.Store(nil)
+		}
 	}
 }
 
@@ -106,6 +115,12 @@ func (owner *Owner) storeOwnerMember(group raftmember.GroupKey, next ownerMember
 		return
 	}
 	if current, found := owner.members[group]; found {
+		if current.pointReadSlot != nil {
+			// A live route owns exactly one slot. Even a stale assembled member
+			// carrying another pointer must not replace it while the group stays
+			// installed; remove/reinstall is the boundary for a fresh slot.
+			next.pointReadSlot = current.pointReadSlot
+		}
 		sameEpoch := current.identity == next.identity &&
 			current.command == next.command &&
 			current.generation == next.generation && current.retiring == next.retiring
@@ -115,6 +130,9 @@ func (owner *Owner) storeOwnerMember(group raftmember.GroupKey, next ownerMember
 			next.permit = current.permit
 		} else {
 			current.permit.revoke()
+			if current.pointReadSlot != nil {
+				current.pointReadSlot.value.Store(nil)
+			}
 			if next.permit != nil {
 				next.permit.revoke()
 			}
@@ -122,4 +140,17 @@ func (owner *Owner) storeOwnerMember(group raftmember.GroupKey, next ownerMember
 		}
 	}
 	owner.members[group] = next
+}
+
+func (owner *Owner) publishPointReadView(
+	group raftmember.GroupKey, member ownerMember, permit *servingFencePermit,
+) {
+	if owner == nil || member.pointReadSlot == nil || permit == nil ||
+		member.read == nil || member.generation == nil {
+		return
+	}
+	member.pointReadSlot.value.Store(&pointReadView{
+		owner: owner, group: group, identity: member.identity, command: member.command,
+		source: member.read, generation: member.generation, permit: permit,
+	})
 }

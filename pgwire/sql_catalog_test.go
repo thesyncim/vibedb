@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/thesyncim/vibedb/internal/conformance"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
@@ -830,7 +831,10 @@ func TestPreparedDerivedChargeIncludesRetainedCapacities(t *testing.T) {
 	}
 	want := preparedPlanFixedBytes +
 		preparedPlanByteMultiplier*len(stmt.sql) +
-		8*4 + 8*4 + 8*4 + 8*8 + len(stmt.sql)
+		int(unsafe.Sizeof(sqldriver.ParamKind(0)))*4 +
+		int(unsafe.Sizeof(sqldriver.ParamType(0)))*4 +
+		int(unsafe.Sizeof(int(0)))*4 +
+		int(unsafe.Sizeof(int(0)))*8 + len(stmt.sql)
 	if got := preparedDerivedCharge(stmt); got != want {
 		t.Fatalf("prepared derived charge = %d, want %d", got, want)
 	}

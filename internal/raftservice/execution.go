@@ -60,6 +60,7 @@ type executionOwnerGroups struct {
 type executionOwnerRoute struct {
 	owner *Owner
 	ready *atomic.Bool
+	point *pointReadViewSlot
 }
 
 // ExecutionGroup is the complete serving metadata installed with one adopted
@@ -122,19 +123,23 @@ func NewExecutionOwners(options ExecutionOptions) (*ExecutionOwners, error) {
 		}
 		result.ticks[lane] = make(chan struct{}, 1)
 		item := metadata[lane]
+		pointSlots := make(map[raftmember.GroupKey]*pointReadViewSlot, len(item.members))
+		for _, member := range item.members {
+			pointSlots[member.Group] = &pointReadViewSlot{}
+		}
 		owner, err := newOwner(Options{
 			Registry: options.Registry, Members: item.members, CommandFences: item.commands,
 			ReadSources: item.reads, TransactionRecoverySources: item.recoveries,
 			MembershipAuthority: options.MembershipAuthority, Outbound: options.Outbound,
 			Pulse: result.ticks[lane], Limits: options.Limits,
-			ProgressMetrics: options.ProgressMetrics,
+			ProgressMetrics: options.ProgressMetrics, pointReadSlots: pointSlots,
 		}, view, true)
 		if err != nil {
 			return nil, err
 		}
 		result.owners[lane] = owner
 		for _, member := range item.members {
-			groups.values[member.Group] = executionOwnerRoute{owner: owner}
+			groups.values[member.Group] = executionOwnerRoute{owner: owner, point: pointSlots[member.Group]}
 		}
 	}
 	result.byGroup.Store(groups)
@@ -191,18 +196,26 @@ func (owners *ExecutionOwners) ReadAuthorityEvidence() []raftmember.ReadAuthorit
 }
 
 func (owners *ExecutionOwners) owner(group raftmember.GroupKey) (*Owner, error) {
+	route, err := owners.ownerRoute(group)
+	if err != nil {
+		return nil, err
+	}
+	return route.owner, nil
+}
+
+func (owners *ExecutionOwners) ownerRoute(group raftmember.GroupKey) (executionOwnerRoute, error) {
 	if owners == nil || group == (raftmember.GroupKey{}) {
-		return nil, ErrExecutionGroup
+		return executionOwnerRoute{}, ErrExecutionGroup
 	}
 	groups := owners.byGroup.Load()
 	if groups == nil {
-		return nil, ErrExecutionGroup
+		return executionOwnerRoute{}, ErrExecutionGroup
 	}
 	route, found := groups.values[group]
 	if !found || route.owner == nil || route.ready != nil && !route.ready.Load() {
-		return nil, ErrExecutionGroup
+		return executionOwnerRoute{}, ErrExecutionGroup
 	}
-	return route.owner, nil
+	return route, nil
 }
 
 // installGroup runs the final transport publication on the owning lane. The
@@ -219,13 +232,14 @@ func (owners *ExecutionOwners) installGroup(group ExecutionGroup, publish func()
 	}
 	owner := owners.owners[laneIndex]
 	ready := new(atomic.Bool)
-	return owner.installExecutionGroup(group, func() {
+	point := &pointReadViewSlot{}
+	return owner.installExecutionGroup(group, point, func() {
 		current := owners.byGroup.Load()
 		next := &executionOwnerGroups{values: make(map[raftmember.GroupKey]executionOwnerRoute, len(current.values)+1)}
 		for key, value := range current.values {
 			next.values[key] = value
 		}
-		next.values[group.Identity.Group] = executionOwnerRoute{owner: owner, ready: ready}
+		next.values[group.Identity.Group] = executionOwnerRoute{owner: owner, ready: ready, point: point}
 		owners.byGroup.Store(next)
 		publish()
 		ready.Store(true)

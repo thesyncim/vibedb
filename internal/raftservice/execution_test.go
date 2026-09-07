@@ -321,25 +321,41 @@ func TestExecutionOwnersInstallAndRemoveDynamicGroupAtomically(t *testing.T) {
 		t.Fatal(err)
 	}
 	var installedGeneration *ownerGeneration
+	var initialPointSlot *pointReadViewSlot
+	var initialPointViewReady bool
+	var ownerHiddenBeforeCommit bool
+	var transportPresentDuringCommit bool
+	var ownerHiddenAfterCommit bool
 	if err = transportRegistry.InstallGroup(
 		executionTestRoster(dynamicIdentity.Group, local),
 		func(publish func()) error {
 			return owners.installGroup(dynamicGroup, func() {
+				initialPointSlot = owners.byGroup.Load().values[dynamicIdentity.Group].point
 				installedGeneration = owners.owners[lane].members[dynamicIdentity.Group].generation
-				if _, routeErr := owners.owner(dynamicIdentity.Group); !errors.Is(routeErr, ErrExecutionGroup) {
-					t.Fatalf("owner visible before atomic transport commit: %v", routeErr)
+				if initialPointSlot != nil {
+					member := owners.owners[lane].members[dynamicIdentity.Group]
+					initialPointViewReady = owners.owners[lane].ensureServingFencePermit(ServingState{
+						Identity: member.identity, Command: member.command,
+						Status: raftmember.RuntimeStatus{Term: 1},
+					}) != nil && initialPointSlot.value.Load() != nil
 				}
+				_, routeErr := owners.owner(dynamicIdentity.Group)
+				ownerHiddenBeforeCommit = errors.Is(routeErr, ErrExecutionGroup)
 				publish()
-				if _, ok := transportRegistry.ReplicaSetVersion(dynamicIdentity.Group); !ok {
-					t.Fatal("transport absent during commit")
-				}
-				if _, routeErr := owners.owner(dynamicIdentity.Group); !errors.Is(routeErr, ErrExecutionGroup) {
-					t.Fatalf("owner gate opened before commit returned: %v", routeErr)
-				}
+				_, transportPresentDuringCommit = transportRegistry.ReplicaSetVersion(dynamicIdentity.Group)
+				_, routeErr = owners.owner(dynamicIdentity.Group)
+				ownerHiddenAfterCommit = errors.Is(routeErr, ErrExecutionGroup)
 			})
 		},
 	); err != nil {
 		t.Fatalf("install dynamic group: %v", err)
+	}
+	if initialPointSlot == nil || !initialPointViewReady {
+		t.Fatal("dynamic owner did not publish an initial point-read view")
+	}
+	if !ownerHiddenBeforeCommit || !transportPresentDuringCommit || !ownerHiddenAfterCommit {
+		t.Fatalf("dynamic commit ordering hidden-before=%v transport=%v hidden-after=%v",
+			ownerHiddenBeforeCommit, transportPresentDuringCommit, ownerHiddenAfterCommit)
 	}
 	if installedGeneration == nil || !installedGeneration.acquire() {
 		t.Error("adopted group cannot pin its read generation")
@@ -357,19 +373,22 @@ func TestExecutionOwnersInstallAndRemoveDynamicGroupAtomically(t *testing.T) {
 		t.Fatalf("dynamic transport member=%d err=%v", member, lookupErr)
 	}
 
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		err = transportRegistry.RemoveGroup(dynamicIdentity.Group, func(withdraw func()) error {
-			return owners.removeGroup(dynamicIdentity, withdraw)
-		})
-		if err == nil || time.Now().After(deadline) {
-			break
+	removeDynamicGroup := func(identity raftmember.RuntimeIdentity) error {
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			removeErr := transportRegistry.RemoveGroup(identity.Group, func(withdraw func()) error {
+				return owners.removeGroup(identity, withdraw)
+			})
+			if removeErr == nil || time.Now().After(deadline) {
+				return removeErr
+			}
+			if !errors.Is(removeErr, multiraft.ErrGroupBusy) {
+				return removeErr
+			}
+			time.Sleep(time.Millisecond)
 		}
-		if !errors.Is(err, multiraft.ErrGroupBusy) {
-			t.Fatalf("remove dynamic group: %v", err)
-		}
-		time.Sleep(time.Millisecond)
 	}
+	err = removeDynamicGroup(dynamicIdentity)
 	if err != nil {
 		t.Fatalf("remove dynamic group did not quiesce: %v", err)
 	}
@@ -378,6 +397,42 @@ func TestExecutionOwnersInstallAndRemoveDynamicGroupAtomically(t *testing.T) {
 	}
 	if _, err = transportRegistry.LocalMember(dynamicIdentity.Group); !errors.Is(err, rafttransport.ErrGroupNotFound) {
 		t.Fatalf("removed transport route: %v", err)
+	}
+	if initialPointSlot == nil || initialPointSlot.value.Load() != nil {
+		t.Fatal("removed dynamic owner left its point-read view published")
+	}
+
+	// Reinstall the same group with a fresh Runtime. The route slot belongs to
+	// the installed owner epoch, so a new group incarnation must never reuse a
+	// revoked slot from the removed route.
+	replacementRuntime, replacementBase, replacementRead := newRF3RuntimeForTestGroup(t, 1, 1, false)
+	replacementIdentity := replacementRuntime.Identity()
+	replacementGroup := ExecutionGroup{Runtime: replacementRuntime, Identity: replacementIdentity,
+		Command: rf3CommandFence(replacementIdentity, replacementBase), Read: replacementRead,
+		Recovery: replacementRead}
+	var replacementPointSlot *pointReadViewSlot
+	if err = transportRegistry.InstallGroup(
+		executionTestRoster(replacementIdentity.Group, local),
+		func(publish func()) error {
+			return owners.installGroup(replacementGroup, func() {
+				replacementPointSlot = owners.byGroup.Load().values[replacementIdentity.Group].point
+				publish()
+			})
+		},
+	); err != nil {
+		t.Fatalf("reinstall dynamic group: %v", err)
+	}
+	if replacementPointSlot == nil || replacementPointSlot == initialPointSlot {
+		t.Fatalf("reinstall reused point-read route slot old=%p new=%p", initialPointSlot, replacementPointSlot)
+	}
+	if initialPointSlot.value.Load() != nil {
+		t.Fatal("reinstall resurrected removed point-read view")
+	}
+	if err = removeDynamicGroup(replacementIdentity); err != nil {
+		t.Fatalf("remove reinstalled dynamic group: %v", err)
+	}
+	if replacementPointSlot.value.Load() != nil {
+		t.Fatal("removed reinstalled owner left its point-read view published")
 	}
 	cancel()
 	if err = <-done; !errors.Is(err, context.Canceled) {

@@ -48,16 +48,18 @@ func replicatedRequestDigest(command []byte) [sha256.Size]byte {
 // connection admission; connection authentication remains an explicit outer
 // listener capability.
 type ReplicatedServer struct {
-	owner          replicatedOwner
-	state          atomic.Uint32
-	requestTimeout time.Duration
-	frames         replicatedFrameByteBudget
-	sqlHints       replicatedSQLBudgetHints
-	authorization  *serviceauthz.Gate
-	audit          serviceauthz.AuditSink
-	serving        func(raftservice.ServingState) bool
-	transition     func(raftservice.ServingState, *ReplicatedRequest) bool
-	local          atomic.Pointer[replicatedLocalBinding]
+	owner                replicatedOwner
+	state                atomic.Uint32
+	requestTimeout       time.Duration
+	frames               replicatedFrameByteBudget
+	sqlHints             replicatedSQLBudgetHints
+	authorization        *serviceauthz.Gate
+	audit                serviceauthz.AuditSink
+	serving              func(raftservice.ServingState) bool
+	transition           func(raftservice.ServingState, *ReplicatedRequest) bool
+	concurrentServing    raftservice.ConcurrentReadAuthorization
+	concurrentTransition func(raftservice.ServingState, *ReplicatedRequest) bool
+	local                atomic.Pointer[replicatedLocalBinding]
 
 	accepted      atomic.Uint64
 	rejected      atomic.Uint64
@@ -160,6 +162,24 @@ func (server *ReplicatedServer) BindServingAuthority(
 		return ErrReplicatedWire
 	}
 	server.serving = serving
+	// A legacy rebind has no concurrency contract. Disable the warm callback
+	// until the caller explicitly installs the matching concurrent predicate.
+	server.concurrentServing = nil
+	return nil
+}
+
+// BindConcurrentServingAuthority opts the warm ExecutionOwners point-read
+// lane into the same serving predicate. The callback must be immutable after
+// binding, pure, nonblocking, and safe for concurrent calls; callers that
+// cannot provide that contract retain the serialized Owner admission.
+func (server *ReplicatedServer) BindConcurrentServingAuthority(
+	serving raftservice.ConcurrentReadAuthorization,
+) error {
+	if server == nil || serving == nil || server.state.Load() != replicatedServerReady {
+		return ErrReplicatedWire
+	}
+	server.serving = serving
+	server.concurrentServing = serving
 	return nil
 }
 
@@ -173,6 +193,22 @@ func (server *ReplicatedServer) BindTransitionalServingAuthority(
 		return ErrReplicatedWire
 	}
 	server.transition = transition
+	server.concurrentTransition = nil
+	return nil
+}
+
+// BindConcurrentTransitionalServingAuthority supplies the matching concurrent
+// contract for the narrow transitional exception. Without this binding an
+// authenticated request whose serialized predicate includes transition remains
+// on the legacy Owner path.
+func (server *ReplicatedServer) BindConcurrentTransitionalServingAuthority(
+	transition func(raftservice.ServingState, *ReplicatedRequest) bool,
+) error {
+	if server == nil || transition == nil || server.state.Load() != replicatedServerReady {
+		return ErrReplicatedWire
+	}
+	server.transition = transition
+	server.concurrentTransition = transition
 	return nil
 }
 
@@ -593,6 +629,15 @@ func (server *ReplicatedServer) executeReplicatedAuthenticatedCallValidated(
 				(authenticated && server.transition != nil && server.transition(candidate, request))
 		}
 	}
+	var concurrentReadAuthorize raftservice.ConcurrentReadAuthorization
+	if fusedPoint && server.serving != nil && server.concurrentServing != nil &&
+		(!authenticated || server.transition == nil || server.concurrentTransition != nil) {
+		concurrentReadAuthorize = func(candidate raftservice.ServingState) bool {
+			return server.concurrentServing(candidate) ||
+				(authenticated && server.concurrentTransition != nil &&
+					server.concurrentTransition(candidate, request))
+		}
+	}
 	var state raftservice.ServingState
 	var wireState ReplicatedMemberState
 	if !fusedProposal && !fusedRead {
@@ -665,7 +710,7 @@ func (server *ReplicatedServer) executeReplicatedAuthenticatedCallValidated(
 		}
 	}
 	if request.Operation == ReplicatedQueryLeader {
-		return server.executeReplicatedQueryCallValidated(ctx, request, state, query, readAuthorize, queryValidated, fusedPoint)
+		return server.executeReplicatedQueryCallValidated(ctx, request, state, query, readAuthorize, queryValidated, fusedPoint, concurrentReadAuthorize)
 	}
 	if request.Operation == ReplicatedReadBatchLeader {
 		batchOwner, ok := server.owner.(interface {
