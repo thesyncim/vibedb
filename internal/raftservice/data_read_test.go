@@ -128,6 +128,15 @@ func TestLinearizablePointReadCutUsesOneLeaderBarrierAndPinsGeneration(t *testin
 		Fence: testLinearizablePointSnapshotFence(serving, minimumApplied), Found: true,
 		Value: []byte("value"),
 	}}
+	acceptedState := ServingState{Identity: raftmember.RuntimeIdentity{
+		Group: serving.Group, AllocationGeneration: serving.AllocationGeneration,
+		MemberID: serving.MemberID, StoreID: serving.StoreID,
+		NodeIncarnation: serving.NodeIncarnation,
+	}, Command: serving.Command, Status: raftmember.RuntimeStatus{
+		MemberID: serving.MemberID, LeaderID: serving.MemberID, Term: serving.Term,
+		Commit: minimumApplied, Applied: minimumApplied,
+		CheckpointApplied: minimumApplied,
+	}}
 	generation := &ownerGeneration{}
 	generation.pins.Store(1)
 	owner := &Owner{started: true, ingress: make(chan ownerRequest, 1), limits: Limits{
@@ -141,6 +150,7 @@ func TestLinearizablePointReadCutUsesOneLeaderBarrierAndPinsGeneration(t *testin
 		owner.release(request.bytes)
 		request.reply <- ownerReply{read: readAuthorization{
 			source: source, minimumApplied: minimumApplied, generation: generation,
+			state: acceptedState,
 		}}
 	}()
 
@@ -159,6 +169,9 @@ func TestLinearizablePointReadCutUsesOneLeaderBarrierAndPinsGeneration(t *testin
 	if cut.Source() != source {
 		t.Fatal("cut did not retain the authenticated live source")
 	}
+	if cut.State() != acceptedState {
+		t.Fatalf("cut state=%+v, want accepted state=%+v", cut.State(), acceptedState)
+	}
 	if owner.pendingReadItems != 1 || owner.pendingReadBytes != 1 || generation.pins.Load() != 1 {
 		t.Fatalf("retained cut accounting items=%d bytes=%d pins=%d",
 			owner.pendingReadItems, owner.pendingReadBytes, generation.pins.Load())
@@ -173,7 +186,7 @@ func TestLinearizablePointReadCutUsesOneLeaderBarrierAndPinsGeneration(t *testin
 		t.Fatalf("source call=%+v", source)
 	}
 
-	if err := cut.Close(); err != nil || cut.Source() != nil || generation.pins.Load() != 0 ||
+	if err := cut.Close(); err != nil || cut.Source() != nil || cut.State() != (ServingState{}) || generation.pins.Load() != 0 ||
 		owner.pendingReadItems != 0 || owner.pendingReadBytes != 0 {
 		t.Fatalf("close err=%v source=%v pins=%d pending=%d/%d", err, cut.Source(),
 			generation.pins.Load(), owner.pendingReadItems, owner.pendingReadBytes)

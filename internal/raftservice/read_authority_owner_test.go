@@ -290,9 +290,15 @@ func TestOwnerLinearizablePointCutAuthorityPathSkipsReadIndex(t *testing.T) {
 	if cut.Source() != fixture.source {
 		t.Fatal("point cut did not retain the authority-selected source")
 	}
+	if got := cut.State().Fence(); got != fixture.fence {
+		t.Fatalf("point cut state fence=%+v, want=%+v", got, fixture.fence)
+	}
 	result, err := cut.PointReadInto(t.Context(), 1, []byte("key"), 64, nil)
 	if err != nil || !result.Found || string(result.Value) != "value" {
 		t.Fatalf("point cut result=%+v err=%v", result, err)
+	}
+	if got := cut.State().Fence(); got != fixture.fence {
+		t.Fatalf("post-read state fence=%+v, want=%+v", got, fixture.fence)
 	}
 	if err := cut.Close(); err != nil {
 		t.Fatalf("point cut close: %v", err)
@@ -327,6 +333,9 @@ func TestOwnerLinearizablePointCutRetriesAfterAuthorityValidation(t *testing.T) 
 	result, err := cut.PointReadInto(t.Context(), 1, []byte("key"), 64, nil)
 	if err != nil || !result.Found || string(result.Value) != "value" {
 		t.Fatalf("point cut result=%+v err=%v", result, err)
+	}
+	if got := cut.State().Fence(); got != fixture.fence {
+		t.Fatalf("post-fallback state fence=%+v, want=%+v", got, fixture.fence)
 	}
 	if err := cut.Close(); err != nil {
 		t.Fatalf("point cut close: %v", err)
