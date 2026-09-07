@@ -155,6 +155,37 @@ func (lane *ExecutionLane) ValidateReadAuthorityToken(
 	}
 	return lane.set.ValidateReadAuthorityToken(key, token)
 }
+
+// TryValidateReadAuthorityToken is the opt-in concurrent validation edge used
+// by raftservice's immutable serving permit. It takes exactly one nonblocking
+// lane lock. Busy means that no Runtime observation was attempted; callers
+// must retain the exact token and use the ordinary queued validator.
+func (lane *ExecutionLane) TryValidateReadAuthorityToken(
+	key raftmember.GroupKey,
+	memberID, nodeIncarnation, term uint64,
+	token raftauthority.AuthorityToken,
+) (bool, error) {
+	if err := lane.accepts(key); err != nil {
+		return false, err
+	}
+	entry := &lane.set.lanes[lane.index]
+	if !entry.mu.TryLock() {
+		return false, nil
+	}
+	defer entry.mu.Unlock()
+	entry.counters.calls++
+	if lane.set.state.Load() != executionLanesOpen || entry.host == nil {
+		entry.counters.rejected++
+		return true, ErrHostClosed
+	}
+	err := entry.host.tryValidateReadAuthorityToken(
+		key, memberID, nodeIncarnation, term, token,
+	)
+	if err != nil {
+		entry.counters.rejected++
+	}
+	return true, err
+}
 func (lane *ExecutionLane) EnqueueTrackedProposal(key raftmember.GroupKey, data []byte, token ProposalToken) error {
 	if err := lane.accepts(key); err != nil {
 		return err

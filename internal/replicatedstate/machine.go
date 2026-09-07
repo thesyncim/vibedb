@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"unicode/utf8"
 
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
@@ -92,7 +93,14 @@ type Machine struct {
 	// after every transition authority and the local membership witness have
 	// been validated during source recovery.
 	legacySchemaSourceCommand [sha256.Size]byte
-	poison                    error
+	poison                    atomic.Pointer[machinePoison]
+}
+
+// machinePoison is published independently of mu so a reader can fail closed
+// while it still holds RLock. The pointer is immutable after publication and
+// the first published error remains the machine's failure cause.
+type machinePoison struct {
+	err error
 }
 
 // SessionCapacityState is the constant-size durable apply cut exposed to the
@@ -1864,7 +1872,7 @@ func (m *Machine) CheckpointAppliedIndex() uint64 {
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if m.poison != nil {
+	if m.poisonError() != nil {
 		return 0
 	}
 	if m.checkpointGroup != nil {
@@ -1930,8 +1938,8 @@ func (m *Machine) ObserveSchemaTransition(command []byte) (uint64, bool, error) 
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if m.poison != nil {
-		return 0, false, fmt.Errorf("%w: %v", ErrApplyPoisoned, m.poison)
+	if poison := m.poisonError(); poison != nil {
+		return 0, false, fmt.Errorf("%w: %v", ErrApplyPoisoned, poison)
 	}
 	state := m.state
 	if !m.schemaTransitioned || state.LastKind != RecordSchema ||
@@ -2026,15 +2034,26 @@ func (m *Machine) fail(err error) error {
 	if err == nil {
 		return nil
 	}
-	if m.poison == nil {
-		m.poison = err
+	if m.poison.Load() == nil {
+		m.poison.CompareAndSwap(nil, &machinePoison{err: err})
 	}
 	return err
 }
 
+func (m *Machine) poisonError() error {
+	if m == nil {
+		return nil
+	}
+	poison := m.poison.Load()
+	if poison == nil {
+		return nil
+	}
+	return poison.err
+}
+
 func (m *Machine) checkUsable() error {
-	if m.poison != nil {
-		return fmt.Errorf("%w: %v", ErrApplyPoisoned, m.poison)
+	if poison := m.poisonError(); poison != nil {
+		return fmt.Errorf("%w: %v", ErrApplyPoisoned, poison)
 	}
 	if m.schemaTransitioned {
 		return ErrSchemaTransitionPending

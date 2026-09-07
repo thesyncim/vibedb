@@ -188,6 +188,7 @@ type ownerRequest struct {
 	authorize           ProposalAuthorization
 	authorityToken      raftauthority.AuthorityToken
 	authorityGeneration *ownerGeneration
+	authorityPermit     *servingFencePermit
 	membership          MembershipRequest
 	read                readRequest
 	targetMember        uint64
@@ -250,16 +251,17 @@ type readRequest struct {
 }
 
 type readAuthorization struct {
-	source         ReadSource
-	recovery       TransactionRecoverySource
-	requestLedger  RequestLedgerSource
-	executionPin   ExecutionPinSource
-	routeGate      RouteGateSource
-	minimumApplied uint64
-	generation     *ownerGeneration
-	authorityToken raftauthority.AuthorityToken
-	authorityFast  bool
-	state          ServingState
+	source          ReadSource
+	recovery        TransactionRecoverySource
+	requestLedger   RequestLedgerSource
+	executionPin    ExecutionPinSource
+	routeGate       RouteGateSource
+	minimumApplied  uint64
+	generation      *ownerGeneration
+	authorityToken  raftauthority.AuthorityToken
+	authorityFast   bool
+	authorityPermit *servingFencePermit
+	state           ServingState
 }
 
 type readDelivery struct {
@@ -840,6 +842,7 @@ type ownerMember struct {
 	recovery          TransactionRecoverySource
 	retiring          bool
 	generation        *ownerGeneration
+	permit            *servingFencePermit
 	ownershipProposal *ownershipProposal
 }
 
@@ -1794,6 +1797,8 @@ func (owner *Owner) handle(request ownerRequest) error {
 		member, found := owner.members[request.group]
 		if !found || request.authorityGeneration == nil ||
 			member.generation != request.authorityGeneration ||
+			member.permit != request.authorityPermit ||
+			!request.authorityPermit.valid(request.fence, request.authorityGeneration) ||
 			member.generation.transitionFenced.Load() || member.generation.quiescing.Load() ||
 			!servingFenceMatchesIdentity(request.fence, member) {
 			reply.err = ErrServingFence
@@ -2011,6 +2016,10 @@ func (owner *Owner) quiesceSchemaGeneration(request ownerRequest) error {
 		transition.ToSchemaGeneration != member.command.SchemaGeneration+1 {
 		return errors.Join(openErr, err, ErrServingFence)
 	}
+	// Revoke before crossing (or retrying) the generation's quiescing edge. A
+	// failed quiesce may resume the in-memory generation, but it must not revive
+	// a permit which was observed before this transition began.
+	owner.revokeServingFencePermit(request.group)
 	if !member.generation.quiescing.Load() {
 		if !member.generation.quiesce() {
 			return ErrServingFence
@@ -2027,7 +2036,7 @@ func (owner *Owner) quiesceSchemaGeneration(request ownerRequest) error {
 		}
 		return err
 	}
-	owner.members[request.group] = member
+	owner.storeOwnerMember(request.group, member)
 	return nil
 }
 
@@ -2063,11 +2072,14 @@ func (owner *Owner) fenceCommittedSchemaGeneration(request ownerRequest) error {
 		transition.ToSchemaGeneration != member.command.SchemaGeneration+1 {
 		return errors.Join(openErr, err, ErrServingFence)
 	}
+	// The committed schema fence changes serving eligibility even if the Host
+	// rejects the corresponding direct control; the old permit stays revoked.
+	owner.revokeServingFencePermit(request.group)
 	member.generation.transitionFenced.Store(true)
 	if err = owner.host.FenceCommittedSchemaGeneration(request.group); err != nil {
 		return err
 	}
-	owner.members[request.group] = member
+	owner.storeOwnerMember(request.group, member)
 	return nil
 }
 
@@ -2090,6 +2102,10 @@ func (owner *Owner) installSchemaGeneration(request ownerRequest) error {
 		manifestErr != nil || manifest == ([32]byte{}) {
 		return errors.Join(manifestErr, ErrServingFence)
 	}
+	// Generation replacement is a one-way serving boundary. Revoke before the
+	// Host closes the old SQL handles so a concurrent cut cannot pass the old
+	// permit while installation is in progress or fails.
+	owner.revokeServingFencePermit(request.group)
 	if err := owner.host.InstallSQLGeneration(
 		request.group, request.database, request.apply, request.schemaSQL, request.schemaApply,
 	); err != nil {
@@ -2101,7 +2117,7 @@ func (owner *Owner) installSchemaGeneration(request ownerRequest) error {
 	member.command.SchemaGeneration = binding.Authority.SchemaGeneration
 	member.command.RelationManifestDigest = manifest
 	member.generation = &ownerGeneration{}
-	owner.members[request.group] = member
+	owner.storeOwnerMember(request.group, member)
 	return nil
 }
 
@@ -2148,8 +2164,8 @@ func (owner *Owner) installExecutionGroupNow(group ExecutionGroup, publish func(
 	// All following operations are in-memory no-fail publications. Publish the
 	// owner metadata before transport enrollment so an authenticated frame can
 	// never resolve a group without a serving owner.
-	owner.members[key] = ownerMember{identity: group.Identity, command: group.Command,
-		read: group.Read, recovery: group.Recovery, generation: &ownerGeneration{}}
+	owner.storeOwnerMember(key, ownerMember{identity: group.Identity, command: group.Command,
+		read: group.Read, recovery: group.Recovery, generation: &ownerGeneration{}})
 	owner.groups = append(owner.groups, key)
 	publish()
 	return nil
@@ -2187,6 +2203,7 @@ func (owner *Owner) removeExecutionGroupNow(
 	if pending := owner.pendingTransfers[group]; pending != nil {
 		return multiraft.ErrGroupBusy
 	}
+	owner.revokeServingFencePermit(group)
 	if err := owner.host.Remove(group); err != nil {
 		return err
 	}
@@ -2225,14 +2242,19 @@ func (owner *Owner) syncCommandFenceFromState(
 		binding.RoutingVersion == 0 || binding.RouteGeneration == 0 {
 		return ErrServingFence
 	}
-	member.command.ReplicaSetVersion = observation.Publication.ReplicaSetVersion
-	member.command.ActivePolicyGeneration = binding.ActivePolicyGeneration
-	member.command.ProtectionEpoch = binding.ProtectionEpoch
-	member.command.OwnershipEpoch = binding.OwnershipEpoch
-	member.command.SchemaGeneration = binding.SchemaGeneration
-	member.command.RoutingVersion = binding.RoutingVersion
-	member.command.RouteGeneration = binding.RouteGeneration
-	owner.members[group] = member
+	nextCommand := member.command
+	nextCommand.ReplicaSetVersion = observation.Publication.ReplicaSetVersion
+	nextCommand.ActivePolicyGeneration = binding.ActivePolicyGeneration
+	nextCommand.ProtectionEpoch = binding.ProtectionEpoch
+	nextCommand.OwnershipEpoch = binding.OwnershipEpoch
+	nextCommand.SchemaGeneration = binding.SchemaGeneration
+	nextCommand.RoutingVersion = binding.RoutingVersion
+	nextCommand.RouteGeneration = binding.RouteGeneration
+	if nextCommand != member.command {
+		owner.revokeServingFencePermit(group)
+	}
+	member.command = nextCommand
+	owner.storeOwnerMember(group, member)
 	return nil
 }
 
@@ -2260,14 +2282,19 @@ func (owner *Owner) syncCommandFenceFromSnapshot(
 		binding.RoutingVersion == 0 || binding.RouteGeneration == 0 {
 		return ErrServingFence
 	}
-	member.command.ReplicaSetVersion = publication.ReplicaSetVersion
-	member.command.ActivePolicyGeneration = binding.ActivePolicyGeneration
-	member.command.ProtectionEpoch = binding.ProtectionEpoch
-	member.command.OwnershipEpoch = binding.OwnershipEpoch
-	member.command.SchemaGeneration = binding.SchemaGeneration
-	member.command.RoutingVersion = binding.RoutingVersion
-	member.command.RouteGeneration = binding.RouteGeneration
-	owner.members[group] = member
+	nextCommand := member.command
+	nextCommand.ReplicaSetVersion = publication.ReplicaSetVersion
+	nextCommand.ActivePolicyGeneration = binding.ActivePolicyGeneration
+	nextCommand.ProtectionEpoch = binding.ProtectionEpoch
+	nextCommand.OwnershipEpoch = binding.OwnershipEpoch
+	nextCommand.SchemaGeneration = binding.SchemaGeneration
+	nextCommand.RoutingVersion = binding.RoutingVersion
+	nextCommand.RouteGeneration = binding.RouteGeneration
+	if nextCommand != member.command {
+		owner.revokeServingFencePermit(group)
+	}
+	member.command = nextCommand
+	owner.storeOwnerMember(group, member)
 	return nil
 }
 
@@ -2433,7 +2460,7 @@ func (owner *Owner) applyOwnershipTransition(fence ServingFence, command []byte)
 		return err
 	}
 	member.ownershipProposal = &ownershipProposal{command: fence.Command, term: status.Term, digest: digest}
-	owner.members[fence.Group] = member
+	owner.storeOwnerMember(fence.Group, member)
 	return nil
 }
 
@@ -2545,8 +2572,9 @@ func (owner *Owner) retireReplica(request ownerRequest) error {
 	if pending := owner.pendingTransfers[request.group]; pending != nil {
 		return multiraft.ErrGroupBusy
 	}
+	owner.revokeServingFencePermit(request.group)
 	member.retiring = true
-	owner.members[request.group] = member
+	owner.storeOwnerMember(request.group, member)
 	if err = owner.host.Remove(request.group); err != nil {
 		return err
 	}
@@ -2686,9 +2714,9 @@ func (owner *Owner) applyMembership(request MembershipRequest) error {
 		return ErrInvalidOwner
 	}
 	// Publication metadata is the next serving fence after a successful
-	// serialized control read. Keep this existing owner cut in sync without
-	// making transfer target validation mutate authority state.
-	owner.members[request.Fence.Group] = admission.member
+	// serialized control read. Publish it through the serving-permit boundary;
+	// a changed replica-set fence revokes the old epoch before publication.
+	owner.storeOwnerMember(request.Fence.Group, admission.member)
 	authority := admission.authority
 	authorizationDigest := authority.Digest()
 	context := append([]byte(nil), authorizationDigest[:]...)
@@ -3119,6 +3147,10 @@ func (owner *Owner) stop(cause error) error {
 	if cause == nil {
 		cause = ErrOwnerClosed
 	}
+	// Invalidate all serving capabilities before transfer cleanup or Host.Close;
+	// those paths may release lower-level Runtime state but must never leave a
+	// caller with a usable permit during shutdown.
+	owner.revokeAllServingFencePermits()
 	// Resolve retained pre-admission transfers while the Host is still live so
 	// their exact guards can be canceled. A dispatched transfer is already
 	// synchronous and therefore cannot remain in this collection.
@@ -3244,7 +3276,7 @@ func (owner *Owner) ReadPoint(
 				return PointReadResult{}, nil, cause
 			}
 			if validationErr := owner.validateReadAuthority(
-				ctx, request.Fence, reply.read.generation, reply.read.authorityToken,
+				ctx, request.Fence, reply.read.generation, reply.read.authorityPermit, reply.read.authorityToken,
 			); validationErr != nil {
 				retry := attempt == 0 && readAuthorityFallback(validationErr)
 				owner.recordAuthorityValidation(request.Fence.Group, validationErr, retry)
@@ -3331,7 +3363,7 @@ func (owner *Owner) ReadPointBatch(
 				return PointReadBatchResult{}, nil, cause
 			}
 			if validationErr := owner.validateReadAuthority(
-				ctx, request.Fence, reply.read.generation, reply.read.authorityToken,
+				ctx, request.Fence, reply.read.generation, reply.read.authorityPermit, reply.read.authorityToken,
 			); validationErr != nil {
 				retry := attempt == 0 && readAuthorityFallback(validationErr)
 				owner.recordAuthorityValidation(request.Fence.Group, validationErr, retry)

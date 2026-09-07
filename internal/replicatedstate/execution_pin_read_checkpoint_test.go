@@ -46,10 +46,10 @@ func TestExecutionPinReadsCertifyCheckpointPressure(t *testing.T) {
 				}
 			}
 			after := machine.Published()
-			if machine.poison != nil || machine.applyCut.Len() != 0 ||
+			if machine.poison.Load() != nil || machine.applyCut.Len() != 0 ||
 				after.Applied != before.Applied || after.DataChainDigest != before.DataChainDigest ||
 				after.ReplicaSetVersion != before.ReplicaSetVersion || !proto.Equal(after.ConfState, before.ConfState) {
-				t.Fatalf("read changed logical publication, retained leases, or poisoned machine: before=%+v after=%+v cut=%d poison=%v", before, after, machine.applyCut.Len(), machine.poison)
+				t.Fatalf("read changed logical publication, retained leases, or poisoned machine: before=%+v after=%+v cut=%d poison=%v", before, after, machine.applyCut.Len(), machine.poisonError())
 			}
 			// Subsequent replicated work must still settle after read pressure.
 			applySessionOpen(t, machine, 2, executionPinSessionPrototype(fixture.binding, id128(0xd0)))

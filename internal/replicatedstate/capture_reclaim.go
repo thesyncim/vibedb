@@ -68,7 +68,7 @@ func (m *Machine) ReclaimRetiredTransitionCapture(header [32]byte, sourceSchema 
 		// the owning group may certify that cut, then retry this bounded scan.
 		if errors.Is(err, durable.ErrCheckpointGroupPressure) && m.checkpointGroup != nil {
 			if err = m.checkpointGroup.Checkpoint(); err != nil {
-				m.poison = err
+				m.fail(err)
 				return false, err
 			}
 			keys = keys[:0]
@@ -103,7 +103,7 @@ func (m *Machine) ReclaimRetiredTransitionCapture(header [32]byte, sourceSchema 
 		err = durable.UpdateCollections(m.txnLog, members, m.options.TxnLimits, write)
 	}
 	if err != nil {
-		m.poison = err
+		m.fail(err)
 		return false, err
 	}
 	done := target.Collection.Len() == 0
@@ -112,7 +112,7 @@ func (m *Machine) ReclaimRetiredTransitionCapture(header [32]byte, sourceSchema 
 		// durably record cleanup completion (or the journal may be removed),
 		// certify header absence so a crash cannot resurrect a retired stream.
 		if err := m.checkpointGroup.Checkpoint(); err != nil {
-			m.poison = err
+			m.fail(err)
 			return false, err
 		}
 	}

@@ -185,18 +185,18 @@ func (m *Machine) FinishTransitionCapture(capture FinishingTransitionCapture, ex
 			err = durable.UpdateCollections(m.txnLog, members, m.options.TxnLimits, write)
 		}
 		if err != nil {
-			m.poison = err
+			m.fail(err)
 		}
 		return err
 	})
 	if finishErr != nil {
 		if published {
-			m.poison = finishErr
+			m.fail(finishErr)
 		}
 		return errors.Join(ErrTransitionCapture, finishErr)
 	}
 	if !published || !capture.CaptureStopped() {
-		m.poison = ErrTransitionCapture
+		m.fail(ErrTransitionCapture)
 		return ErrTransitionCapture
 	}
 	m.capture, m.captureBuffer, m.captureChanges = nil, nil, nil
@@ -252,13 +252,13 @@ func (m *Machine) beginTransitionCapture(capture TransitionCapture) error {
 	}
 	if err := capture.Begin(cloneState(m.state), publish); err != nil {
 		if published {
-			m.poison = err
+			m.fail(err)
 		}
 		return fmt.Errorf("%w: begin: %w", ErrTransitionCapture, err)
 	}
 	if empty != published || (empty && target.Collection.Len() != 1) {
 		if published {
-			m.poison = ErrTransitionCapture
+			m.fail(ErrTransitionCapture)
 		}
 		return fmt.Errorf("%w: noncanonical header publication", ErrTransitionCapture)
 	}

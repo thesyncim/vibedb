@@ -25,10 +25,11 @@ type PointReadResult struct {
 	Value []byte
 }
 
-// PointReadInto reads the hidden intent and selected row under the machine
-// publication lock. Every collection is exclusively mutated by this machine,
-// so both live reads belong to the same completed applied state. No detached
-// snapshot escapes and no physical checkpoint is needed to materialize one.
+// PointReadInto reads the hidden intent and selected row under the machine's
+// publication read lock. Every collection is exclusively mutated by this
+// machine, so independent live reads can share the lock while both still
+// belong to the same completed applied state. No detached snapshot escapes and
+// no physical checkpoint is needed to materialize one.
 // The minimum is an applied-index contract, never a wall-clock staleness claim.
 func (m *Machine) PointReadInto(
 	relation replication.RelationID,
@@ -41,8 +42,8 @@ func (m *Machine) PointReadInto(
 		len(key) == 0 || minimumApplied == 0 || maxValueBytes < 0 {
 		return PointReadResult{}, ErrInvalidCollection
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	if err := m.checkUsable(); err != nil {
 		return PointReadResult{}, err
 	}
