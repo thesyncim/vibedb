@@ -274,9 +274,10 @@ func (executor *ReplicatedExecutor) doReplicatedCall(
 	attemptCtx, cancel := tightenTimeout(ctx, executor.attemptTimeout)
 	defer cancel()
 	// Attempts are sequential and no transport mutates the call (the server
-	// deep-clones before executing, the wire path copies the envelope to
-	// attach the encoded body), so stamping the same authority in place is
-	// exact and saves two struct copies per attempt.
+	// only borrows the request for synchronous SQL reads and clones
+	// everything else before executing, the wire path copies the envelope
+	// to attach the encoded body), so stamping the same authority in place
+	// is exact and saves two struct copies per attempt.
 	if authority, ok := serviceauthz.FromContext(ctx); ok {
 		call.Request.Authority = authority
 		if call.SQL != nil {
