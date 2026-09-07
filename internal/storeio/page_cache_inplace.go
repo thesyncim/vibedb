@@ -69,10 +69,20 @@ func (c *PageCache) ReplaceLeasedCanonicalDirty(
 	frame := &c.frames[index]
 	frame.lock.Lock()
 	defer frame.lock.Unlock()
-	if frame.state != pageCacheReady || frame.key != fromKey ||
-		lease.key != fromKey || frame.pins != 1 ||
-		frame.flags&(pageCacheFrameWritePinned|
+	if frame.state.Load() != uint32(pageCacheReady) || frame.key != fromKey ||
+		lease.key != fromKey || frame.pins.Load() != 1 ||
+		frame.flags.Load()&(pageCacheFrameWritePinned|
 			pageCacheFrameBufferedOwned) == 0 {
+		return 0, ErrCanonicalPageBusy
+	}
+	// Exclude lock-free validators before touching bytes: a reader that
+	// validated just before this exclusion announced first, so the drain
+	// below observes it (it aborts on the exclusive state). The caller's
+	// own lease pin keeps continuity, so pins must settle back to exactly
+	// one; anything else is a genuinely active reader and stays busy.
+	frame.state.Store(pageCacheExclusive)
+	if !drainFramePins(frame) || frame.pins.Load() != 1 {
+		frame.state.Store(pageCacheReady)
 		return 0, ErrCanonicalPageBusy
 	}
 	page := c.extentBytes(index, from.Length)
@@ -82,9 +92,9 @@ func (c *PageCache) ReplaceLeasedCanonicalDirty(
 	}
 
 	previousDirty = frame.dirty
-	frame.state = pageCacheExclusive
+	frame.state.Store(pageCacheExclusive)
 	copy(target, after)
-	frame.flags |= pageCacheFrameNeedsReseal
+	frame.flags.Or(pageCacheFrameNeedsReseal)
 
 	if previousDirty == 0 {
 		c.dirtyBytes += uint64(frame.key.length)
@@ -94,10 +104,10 @@ func (c *PageCache) ReplaceLeasedCanonicalDirty(
 		c.removeDirtyFrameLocked(index, previousDirty)
 	}
 	frame.dirty = dirtyGeneration
-	frame.referenced = true
+	frame.referenced.Store(true)
 	if previousDirty != dirtyGeneration {
 		c.recordDirtyFrameLocked(index, dirtyGeneration)
 	}
-	frame.state = pageCacheReady
+	frame.state.Store(pageCacheReady)
 	return previousDirty, nil
 }

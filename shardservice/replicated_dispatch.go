@@ -133,8 +133,11 @@ func (server *ReplicatedServer) DispatchReplicated(ctx context.Context, call Rep
 	}()
 	requestCtx, cancel := context.WithTimeout(ctx, server.requestTimeout)
 	defer cancel()
-	stop := context.AfterFunc(binding.ctx, cancel)
-	defer stop()
+	// A binding context that can never be done needs no arm.
+	if binding.ctx.Done() != nil {
+		stop := context.AfterFunc(binding.ctx, cancel)
+		defer stop()
+	}
 	active := &replicatedLocalCall{cancel: cancel}
 	binding.storage.mu.Lock()
 	_, allowed := binding.storage.allow[binding.principal.Node]

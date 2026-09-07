@@ -166,8 +166,11 @@ func (e *Executor) queryCoordinator(ctx context.Context, snap *Snapshot, q Query
 	}
 	input = nil
 	var cancel query.CancelFlag
-	stop := context.AfterFunc(ctx, cancel.Cancel)
-	defer stop()
+	// An uncancellable context can never arm the cooperative flag.
+	if ctx.Done() != nil {
+		stop := context.AfterFunc(ctx, cancel.Cancel)
+		defer stop()
+	}
 	var exec query.Exec
 	defer exec.Release()
 	exec.Options.Cancel = &cancel

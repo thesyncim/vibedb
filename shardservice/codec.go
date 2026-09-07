@@ -1587,6 +1587,39 @@ func EncodeRequest(w io.Writer, req *ShardRequest) error {
 	return (&FrameEncoder{}).EncodeRequest(w, req)
 }
 
+// EncodeRequestBytes encodes req as one framed message and returns the
+// bytes, allocating the frame once at its measured size. It is the
+// single-owner counterpart to EncodeRequest for paths that retain the
+// encoded query (the replicated envelope carries it): one exact allocation
+// replaces the buffer growth chain plus the discarded one-shot encoder
+// arena. RequestFrameBytes is test-verified byte-exact, so the allocation
+// never regrows; the bound check below stays as insurance.
+func EncodeRequestBytes(req *ShardRequest) ([]byte, error) {
+	size, err := RequestFrameBytes(req)
+	if err != nil {
+		return nil, err
+	}
+	e := encbuf{b: make([]byte, 5, size)}
+	if err := encodeRequestBody(&e, req); err != nil {
+		return nil, err
+	}
+	if len(e.b) != size {
+		// The size grammar drifted from the field grammar; the codec tests
+		// pin them equal, so this is unreachable without a codec bug.
+		return nil, errFrameTooLarge
+	}
+	stampFrame(e.b, tagRequest)
+	return e.b, nil
+}
+
+// stampFrame writes the frame tag and length prefix. writeEncodedFrame
+// applies the same stamp before writing; the bytes variant stamps the
+// retained slice directly.
+func stampFrame(frame []byte, tag byte) {
+	frame[0] = tag
+	binary.BigEndian.PutUint32(frame[1:5], uint32(len(frame)-1))
+}
+
 // EncodeRequest encodes one request frame into the encoder's owned arena,
 // writes it, and retains the arena for the next call.
 func (f *FrameEncoder) EncodeRequest(w io.Writer, req *ShardRequest) error {
@@ -1596,6 +1629,17 @@ func (f *FrameEncoder) EncodeRequest(w io.Writer, req *ShardRequest) error {
 
 	e := newFrameEncoder(f.arena, len(req.Exchange.Batch.Data))
 	defer func() { f.arena = keepFrameArena(e.b) }()
+	if err := encodeRequestBody(&e, req); err != nil {
+		return err
+	}
+	return writeEncodedFrame(w, tagRequest, e.b)
+}
+
+// encodeRequestBody writes the request body (after the 5-byte header the
+// caller reserved). Splitting body from framing lets the streaming encoder
+// and the single-alloc bytes variant share one grammar: any drift between
+// them breaks wire determinism, which the codec tests pin byte-exact.
+func encodeRequestBody(e *encbuf, req *ShardRequest) error {
 	e.u8(wireVersion)
 	e.str(req.SQL)
 	e.str(string(req.Distribution))
@@ -1690,15 +1734,15 @@ func (f *FrameEncoder) EncodeRequest(w io.Writer, req *ShardRequest) error {
 	}
 	if req.Repartition.present() {
 		e.u8(repartitionMarker)
-		encodeRepartitionRequest(&e, req.Repartition)
+		encodeRepartitionRequest(e, req.Repartition)
 	}
 	if req.Exchange.present() {
 		e.u8(exchangeMarker)
-		encodeExchangeRequest(&e, req.Exchange)
+		encodeExchangeRequest(e, req.Exchange)
 	}
 	if req.Transaction.Operation != TransactionNone {
 		e.u8(transactionMarker)
-		encodeTransactionRequest(&e, req.Transaction)
+		encodeTransactionRequest(e, req.Transaction)
 	}
 	if req.Authority.Valid() {
 		e.u8(authorityMarker)
@@ -1715,10 +1759,7 @@ func (f *FrameEncoder) EncodeRequest(w io.Writer, req *ShardRequest) error {
 	if req.MutationImageCapture {
 		e.u8(mutationImageMarker)
 	}
-	if e.err != nil {
-		return e.err
-	}
-	return writeEncodedFrame(w, tagRequest, e.b)
+	return e.err
 }
 
 // DecodeRequest reads one framed request. A malformed or oversized frame yields

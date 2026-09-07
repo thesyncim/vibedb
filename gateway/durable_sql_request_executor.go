@@ -143,7 +143,7 @@ func (executor *DurableSQLRequestExecutor) ExecuteMode(
 	if err != nil {
 		return DurableSQLRequestResult{}, err
 	}
-	opctx, cancel := context.WithTimeout(ctx, profile.GlobalDeadline)
+	opctx, cancel := tightenTimeout(ctx, profile.GlobalDeadline)
 	defer cancel()
 	var lease catalogLease
 	var home DurableRequestLedgerHome
@@ -364,7 +364,7 @@ func (executor *DurableSQLRequestExecutor) ReplayRequestWithTenant(
 	if err = validateQueryBatchAdmission(queries, profile); err != nil {
 		return DurableSQLRequestResult{}, false, err
 	}
-	opctx, cancel := context.WithTimeout(ctx, profile.GlobalDeadline)
+	opctx, cancel := tightenTimeout(ctx, profile.GlobalDeadline)
 	defer cancel()
 	lease := executor.planner.catalog.pinCurrent()
 	if lease.snapshot == nil || lease.generation == 0 {

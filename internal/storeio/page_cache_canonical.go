@@ -69,20 +69,33 @@ func (c *PageCache) ReplaceCanonicalDirty(
 	frame := &c.frames[index]
 	frame.lock.Lock()
 	defer frame.lock.Unlock()
-	if frame.state != pageCacheReady || frame.dirty != 0 || frame.pins != 0 {
+	if frame.state.Load() != uint32(pageCacheReady) || frame.dirty != 0 || frame.pins.Load() != 0 {
+		return ErrCanonicalPageBusy
+	}
+	// Lock-free pins announce before validating, so a reader can validate
+	// against this ready frame after the check above and read torn bytes
+	// during the copy below. Exclude new validators with the exclusive
+	// state first, then drain: the drain observes every pre-exclusion
+	// announcement (they abort on the exclusive state, or finish a bounded
+	// read), and key/dirty cannot move under c.mu plus the frame lock.
+	frame.state.Store(pageCacheExclusive)
+	if !drainFramePins(frame) || frame.pins.Load() != 0 {
+		frame.state.Store(pageCacheReady)
 		return ErrCanonicalPageBusy
 	}
 	page := c.extentBytes(index, ref.Length)
 	if !bytes.Equal(page, before) {
+		frame.state.Store(pageCacheReady)
 		return ErrCanonicalPageChanged
 	}
 	copy(page, after)
 	frame.payloadLength = afterHeader.PayloadLength
 	frame.dirty = dirtyGeneration
-	frame.referenced = true
+	frame.referenced.Store(true)
 	c.dirtyBytes += uint64(frame.key.length)
 	c.dirtyReservedBytes += uint64(frame.reservationSpan) * uint64(c.options.PageSize)
 	c.recordDirtyFrameLocked(index, dirtyGeneration)
+	frame.state.Store(pageCacheReady)
 	return nil
 }
 
@@ -132,19 +145,28 @@ func (c *PageCache) RestoreCanonicalDirty(
 	frame := &c.frames[index]
 	frame.lock.Lock()
 	defer frame.lock.Unlock()
-	if frame.state != pageCacheReady || frame.dirty != dirtyGeneration || frame.pins != 0 {
+	if frame.state.Load() != uint32(pageCacheReady) || frame.dirty != dirtyGeneration || frame.pins.Load() != 0 {
+		return ErrCanonicalPageChanged
+	}
+	// Same lock-free exclusion as the replace path: new validators must see
+	// the exclusive state before this rollback copy becomes visible.
+	frame.state.Store(pageCacheExclusive)
+	if !drainFramePins(frame) || frame.pins.Load() != 0 {
+		frame.state.Store(pageCacheReady)
 		return ErrCanonicalPageChanged
 	}
 	if !bytes.Equal(c.extentBytes(index, ref.Length), after) {
+		frame.state.Store(pageCacheReady)
 		return ErrCanonicalPageChanged
 	}
 	copy(c.extentBytes(index, ref.Length), before)
 	frame.payloadLength = header.PayloadLength
 	frame.dirty = 0
-	frame.referenced = true
+	frame.referenced.Store(true)
 	c.dirtyBytes -= uint64(frame.key.length)
 	c.dirtyReservedBytes -= uint64(frame.reservationSpan) * uint64(c.options.PageSize)
 	c.removeDirtyFrameLocked(index, dirtyGeneration)
+	frame.state.Store(pageCacheReady)
 	return nil
 }
 

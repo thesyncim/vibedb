@@ -771,7 +771,13 @@ func TestRF3IsolatedLeaderCannotCompleteTransactionRecoveryRead(t *testing.T) {
 			},
 		},
 	)
-	if !errors.Is(err, context.DeadlineExceeded) || lease != nil || len(result.Records) != 0 {
+	// An isolated leader either exhausts the read deadline or observes its
+	// genuine quorum-loss stepdown first; both prove the read cannot
+	// complete. Faster store paths park the read in the ReadIndex wait
+	// sooner, so the stepdown increasingly wins this race — assert
+	// non-completion, not which loss surfaces first.
+	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, raftmodel.ErrReadLeadershipLost) ||
+		lease != nil || len(result.Records) != 0 {
 		t.Fatalf("isolated leader recovery result=%+v lease=%T err=%v", result, lease, err)
 	}
 }

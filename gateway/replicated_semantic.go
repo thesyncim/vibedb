@@ -1,7 +1,6 @@
 package gateway
 
 import (
-	"bytes"
 	"context"
 	"sync/atomic"
 
@@ -221,23 +220,25 @@ func semanticCallToWire(call *shardservice.ReplicatedCall) (*shardservice.Replic
 	if err := shardservice.ValidateReplicatedCall(call); err != nil {
 		return nil, err
 	}
+	// The copy is load-bearing: callers retain (and the fused path lends)
+	// the envelope, and a pinned test rejects any mutation of it, so the
+	// encoded query stamps a private copy even though attempts are
+	// sequential.
 	request := call.Request
 	if call.SQL == nil {
 		return &request, nil
 	}
-	if size, err := shardservice.RequestFrameBytes(call.SQL); err != nil {
-		return nil, err
-	} else if size > shardservice.MaxReplicatedSQLRequestBytes {
-		return nil, ErrResultLimit
-	}
-	var body bytes.Buffer
-	if err := shardservice.EncodeRequest(&body, call.SQL); err != nil {
+	// One exact allocation replaces the buffer growth chain plus the
+	// discarded one-shot encoder arena; the bound check below is the same
+	// limit the two-pass version enforced after encoding.
+	query, err := shardservice.EncodeRequestBytes(call.SQL)
+	if err != nil {
 		return nil, err
 	}
-	if body.Len() > shardservice.MaxReplicatedSQLRequestBytes {
+	if len(query) > shardservice.MaxReplicatedSQLRequestBytes {
 		return nil, ErrResultLimit
 	}
-	request.Query = body.Bytes()
+	request.Query = query
 	return &request, nil
 }
 
@@ -270,18 +271,17 @@ func (executor *ReplicatedExecutor) doReplicatedCall(
 	endpoint ReplicatedEndpoint,
 	call *shardservice.ReplicatedCall,
 ) (*shardservice.ReplicatedReply, error) {
-	attemptCtx, cancel := context.WithTimeout(ctx, executor.attemptTimeout)
+	attemptCtx, cancel := tightenTimeout(ctx, executor.attemptTimeout)
 	defer cancel()
-	forwarded := *call
-	forwarded.Request = call.Request
-	if call.SQL != nil {
-		inner := *call.SQL
-		forwarded.SQL = &inner
-	}
+	// Attempts are sequential and no transport mutates the call (the server
+	// only borrows the request for synchronous SQL reads and clones
+	// everything else before executing, the wire path copies the envelope
+	// to attach the encoded body), so stamping the same authority in place
+	// is exact and saves two struct copies per attempt.
 	if authority, ok := serviceauthz.FromContext(ctx); ok {
-		forwarded.Request.Authority = authority
-		if forwarded.SQL != nil {
-			forwarded.SQL.Authority = authority
+		call.Request.Authority = authority
+		if call.SQL != nil {
+			call.SQL.Authority = authority
 		}
 	}
 	var (
@@ -289,9 +289,9 @@ func (executor *ReplicatedExecutor) doReplicatedCall(
 		err   error
 	)
 	if semantic, ok := executor.client.(ReplicatedCallRoundTripper); ok {
-		reply, err = semantic.DoReplicatedCall(attemptCtx, endpoint, &forwarded)
+		reply, err = semantic.DoReplicatedCall(attemptCtx, endpoint, call)
 	} else {
-		reply, err = doRemoteReplicatedCall(attemptCtx, executor.client, endpoint, &forwarded)
+		reply, err = doRemoteReplicatedCall(attemptCtx, executor.client, endpoint, call)
 	}
 	if err == nil {
 		err = shardservice.ValidateReplicatedReply(reply)
