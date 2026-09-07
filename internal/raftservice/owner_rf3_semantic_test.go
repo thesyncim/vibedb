@@ -12,6 +12,7 @@ import (
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/orderedkey"
+	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replication"
@@ -25,6 +26,7 @@ type semanticRF3Owner struct {
 	serving      atomic.Bool
 	revokeAtRead atomic.Bool
 	transitional atomic.Bool
+	probes       atomic.Uint64
 }
 
 func (owner *semanticRF3Owner) SubmitOwnedAuthorized(ctx context.Context, fence raftservice.ServingFence, command []byte, authorize raftservice.ProposalAuthorization) (raftservice.Result, error) {
@@ -40,6 +42,18 @@ func (owner *semanticRF3Owner) ReadLinearizableDataInto(ctx context.Context, req
 		owner.serving.Store(false)
 	}
 	return owner.Owner.ReadLinearizableDataInto(ctx, request, cut)
+}
+
+func (owner *semanticRF3Owner) ReadLinearizablePointInto(ctx context.Context, request raftservice.LinearizablePointReadRequest, cut *raftservice.LinearizablePointReadCut) error {
+	if owner.revokeAtRead.Swap(false) {
+		owner.serving.Store(false)
+	}
+	return owner.Owner.ReadLinearizablePointInto(ctx, request, cut)
+}
+
+func (owner *semanticRF3Owner) Probe(ctx context.Context, group raftmember.GroupKey) (raftservice.ServingState, error) {
+	owner.probes.Add(1)
+	return owner.Owner.Probe(ctx, group)
 }
 
 // This uses the production SQL apply source, authenticated RF3 replication and
@@ -182,7 +196,40 @@ func TestRF3SemanticLocalTLSQueriesAndRevocation(t *testing.T) {
 				RoutingVersion:       distribution.RoutingVersion(route.Command.RoutingVersion), OwnershipEpoch: distribution.OwnershipEpoch(route.Command.OwnershipEpoch),
 				MaxRows: 20, MaxResultBytes: 4096}}
 	}
+	makePointCall := func(sql, id string) shardservice.ReplicatedCall {
+		call := makeCall(sql)
+		key, ok := orderedkey.AppendJSONString(nil, []byte(`"`+id+`"`), orderedkey.Ascending)
+		if !ok {
+			t.Fatal("point key encoding")
+		}
+		call.SQL.PrimaryKeyRead = shardservice.PrimaryKeyReadRequest{
+			Relation: 1, MaxDocumentBytes: uint32(cluster.groups[0].bases[leader].UserLimits.MaxDocumentBytes),
+			PrimaryPath: []byte("/id"), Keys: [][]byte{key},
+		}
+		return call
+	}
 	endpoint := route.Replicas[leader]
+	pointProbes := owners[leader].probes.Load()
+	for _, test := range []struct {
+		name, sql, id string
+		rows          int
+	}{
+		{name: "hit", sql: `SELECT id, value FROM docs WHERE id = 'a'`, id: "a", rows: 1},
+		{name: "miss", sql: `SELECT id FROM docs WHERE id = 'missing'`, id: "missing"},
+	} {
+		call := makePointCall(test.sql, test.id)
+		direct, err := local.DoReplicatedCall(ctx, endpoint, &call)
+		if err != nil || direct.Response.Kind != shardservice.ReplicatedQueryResult || direct.SQL == nil || len(direct.SQL.Rows) != test.rows {
+			t.Fatalf("local point %s: response=%+v sql=%+v err=%v", test.name, direct.Response, direct.SQL, err)
+		}
+		wire, err := remote.DoReplicatedCall(ctx, endpoint, &call)
+		if err != nil || wire.Response.Kind != shardservice.ReplicatedQueryResult || !reflect.DeepEqual(direct.SQL, wire.SQL) {
+			t.Fatalf("remote point %s: direct=%+v remote=%+v err=%v", test.name, direct, wire, err)
+		}
+	}
+	if got := owners[leader].probes.Load(); got != pointProbes {
+		t.Fatalf("fused local/remote point reads added owner probes: before=%d after=%d", pointProbes, got)
+	}
 	var retained *shardservice.ShardResponse
 	for _, sql := range []string{
 		`SELECT id, value FROM docs WHERE id = 'a'`,
@@ -229,7 +276,7 @@ func TestRF3SemanticLocalTLSQueriesAndRevocation(t *testing.T) {
 		}
 		// Revoke after Probe but before the serialized read admission. A gate
 		// checked only before Probe incorrectly returns successful rows here.
-		call = makeCall(`SELECT id FROM docs`)
+		call = makePointCall(`SELECT id FROM docs WHERE id = 'a'`, "a")
 		owners[leader].serving.Store(true)
 		owners[leader].revokeAtRead.Store(true)
 		reply, err = transport.DoReplicatedCall(ctx, endpoint, &call)

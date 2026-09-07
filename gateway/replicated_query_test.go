@@ -20,6 +20,8 @@ type sqlRF3TestTransport struct {
 	mu              sync.Mutex
 	routes          map[raftmember.GroupKey]ReplicatedRoute
 	queries         int
+	probes          int
+	noStateOnce     bool
 	fail            bool
 	sqlError        bool
 	sqlErrorMessage string
@@ -35,6 +37,7 @@ func (c *sqlRF3TestTransport) DoReplicated(ctx context.Context, endpoint Replica
 	route := c.routes[req.Fence.Group]
 	state := shardservice.ReplicatedMemberState{Fence: shardservice.ReplicatedFence{Group: route.Group, AllocationGeneration: route.AllocationGeneration, Command: route.Command, MemberID: endpoint.Member, StoreID: endpoint.StoreID, NodeIncarnation: endpoint.NodeIncarnation, Term: 3}, LeaderID: 2, Applied: 20, Commit: 20, CheckpointApplied: 1}
 	if req.Operation == shardservice.ReplicatedProbe {
+		c.probes++
 		return &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedHandshake, HasState: true, State: state}, nil
 	}
 	if req.Operation != shardservice.ReplicatedQueryLeader || req.Capability != serviceauthz.CapabilityDataRead || endpoint.Member != 2 {
@@ -49,6 +52,10 @@ func (c *sqlRF3TestTransport) DoReplicated(ctx context.Context, endpoint Replica
 	}
 	if inner.Transaction.Operation != 0 || !inner.ReadFenceID.IsZero() {
 		return nil, errors.New("RF3 must not use legacy read fences")
+	}
+	if c.noStateOnce {
+		c.noStateOnce = false
+		return &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedRefusal, Refusal: shardservice.ReplicatedRefusalUnavailable}, nil
 	}
 	c.lastParams = append(c.lastParams[:0], inner.Params...)
 	c.lastTypes = append(c.lastTypes[:0], inner.ParamTypes...)
@@ -87,6 +94,27 @@ func (c *sqlRF3TestTransport) DoReplicated(ctx context.Context, endpoint Replica
 		return nil, err
 	}
 	return &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedQueryResult, HasState: true, State: state, ReadApplied: 20, Value: encoded.Bytes()}, nil
+}
+
+func TestRF3SQLRetriesNoStateUnavailableAfterRefreshingLeaderHint(t *testing.T) {
+	executor, client := newSQLRF3TestExecutor(t)
+	ctx, err := serviceauthz.WithAuthority(t.Context(), serviceauthz.Authority{
+		Node: [16]byte{0x71}, Generation: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	query := Query{SQL: `SELECT id FROM messages WHERE id = 'a'`, Class: ClassBatch}
+	result, err := executor.Query(ctx, query)
+	if err != nil || result == nil || len(result.Rows) != 1 || client.queries != 1 {
+		t.Fatalf("priming result=%+v err=%v queries=%d probes=%d", result, err, client.queries, client.probes)
+	}
+	primingProbes := client.probes
+	client.noStateOnce = true
+	result, err = executor.Query(ctx, query)
+	if err != nil || result == nil || len(result.Rows) != 1 || client.queries != 2 || client.probes-primingProbes < 2 {
+		t.Fatalf("retry result=%+v err=%v queries=%d probes=%d priming=%d", result, err, client.queries, client.probes, primingProbes)
+	}
 }
 
 func newSQLRF3TestExecutor(t testing.TB) (*Executor, *sqlRF3TestTransport) {

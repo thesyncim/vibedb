@@ -57,6 +57,7 @@ type LinearizablePointReadCut struct {
 	source         ReadSource
 	fence          ServingFence
 	minimumApplied uint64
+	state          ServingState
 	generation     *ownerGeneration
 	owner          *Owner
 	request        LinearizablePointReadRequest
@@ -73,6 +74,17 @@ func (cut *LinearizablePointReadCut) Source() ReadSource {
 		return nil
 	}
 	return cut.source
+}
+
+// State returns the serialized serving state that admitted this cut. It is
+// valid only while the cut is open. Point SQL uses this identity after the
+// read admission to bind Distribution and Shard names to the actual owner;
+// those names cannot be inferred from the caller's requested fence.
+func (cut *LinearizablePointReadCut) State() ServingState {
+	if cut == nil || cut.owner == nil || cut.released.Load() {
+		return ServingState{}
+	}
+	return cut.state
 }
 
 // PointReadInto reads one exact point against the cut's quorum-applied floor.
@@ -177,6 +189,7 @@ func (cut *LinearizablePointReadCut) Close() error {
 	cut.source = nil
 	cut.fence = ServingFence{}
 	cut.minimumApplied = 0
+	cut.state = ServingState{}
 	cut.request = LinearizablePointReadRequest{}
 	cut.authorityToken = raftauthority.AuthorityToken{}
 	cut.authorityFast = false
@@ -343,6 +356,7 @@ func (owner *Owner) readLinearizablePointInto(
 	dst.source = source
 	dst.fence = request.Fence
 	dst.minimumApplied = reply.read.minimumApplied
+	dst.state = reply.read.state
 	dst.generation, dst.owner = reply.read.generation, owner
 	dst.request = request
 	dst.authorityToken = reply.read.authorityToken
