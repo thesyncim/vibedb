@@ -136,16 +136,20 @@ func roundTripExchangePeer(ctx context.Context, conn net.Conn, enc *FrameEncoder
 	} else {
 		_ = conn.SetDeadline(time.Time{})
 	}
-	callbackDone := make(chan struct{})
-	stop := context.AfterFunc(ctx, func() {
-		_ = conn.SetDeadline(time.Now())
-		close(callbackDone)
-	})
-	defer func() {
-		if !stop() {
-			<-callbackDone
-		}
-	}()
+	// A context that can never be done (notably the Background default
+	// above) needs no trip arm at all.
+	if ctx.Done() != nil {
+		callbackDone := make(chan struct{})
+		stop := context.AfterFunc(ctx, func() {
+			_ = conn.SetDeadline(time.Now())
+			close(callbackDone)
+		})
+		defer func() {
+			if !stop() {
+				<-callbackDone
+			}
+		}()
+	}
 	if err := enc.EncodeRequest(conn, req); err != nil {
 		return firstContextError(ctx, err)
 	}

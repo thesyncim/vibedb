@@ -50,7 +50,7 @@ func (executor *DurableSQLRequestExecutor) PrepareDirect(ctx context.Context, ke
 	if err = validateTypedQueries(ctx, queries); err != nil {
 		return nil, err
 	}
-	opctx, cancel := context.WithTimeout(ctx, profile.GlobalDeadline)
+	opctx, cancel := tightenTimeout(ctx, profile.GlobalDeadline)
 	defer cancel()
 	var lease catalogLease
 	var targets []ReplicatedTransactionTarget
@@ -132,7 +132,7 @@ func (executor *DurableSQLRequestExecutor) ExecutePreparedDirect(ctx context.Con
 	if err = validateQueryBatchAdmission(queries, profile); err != nil {
 		return DurableSQLRequestResult{}, err
 	}
-	opctx, cancel := context.WithTimeout(ctx, profile.GlobalDeadline)
+	opctx, cancel := tightenTimeout(ctx, profile.GlobalDeadline)
 	defer cancel()
 	ledgerKey, err := NewDurableRequestLedgerKey(key, plan.RequestDigest)
 	if err != nil {

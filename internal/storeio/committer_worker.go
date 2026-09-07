@@ -298,9 +298,9 @@ func (c *Committer) lockFrameWrites(writes []Write) (int, error) {
 		}
 		frame := &cache.frames[write.frameIndex]
 		frame.lock.Lock()
-		if frame.state != pageCacheReady ||
+		if frame.state.Load() != uint32(pageCacheReady) ||
 			frame.dirty == 0 ||
-			frame.flags&pageCacheFrameWritePinned == 0 ||
+			frame.flags.Load()&pageCacheFrameWritePinned == 0 ||
 			frame.key.offset != uint64(write.Offset) ||
 			frame.key.length != write.Length ||
 			frame.key.kind != write.kind {
@@ -311,7 +311,7 @@ func (c *Committer) lockFrameWrites(writes []Write) (int, error) {
 				ErrInvalidWrite,
 			)
 		}
-		if frame.flags&pageCacheFrameNeedsReseal != 0 {
+		if frame.flags.Load()&pageCacheFrameNeedsReseal != 0 {
 			page := cache.extentBytes(int(write.frameIndex), write.Length)
 			_, err := sealPage(page, false)
 			if err != nil {
@@ -322,7 +322,7 @@ func (c *Committer) lockFrameWrites(writes []Write) (int, error) {
 					ErrInvalidWrite, err,
 				)
 			}
-			frame.flags &^= pageCacheFrameNeedsReseal
+			frame.flags.And(^uint32(pageCacheFrameNeedsReseal))
 		}
 	}
 	return len(writes), nil
@@ -419,9 +419,9 @@ func (c *Committer) prewriteStillCurrent(write Write) bool {
 	}
 	frame := &cache.frames[write.frameIndex]
 	frame.lock.Lock()
-	current := frame.state == pageCacheReady && frame.dirty != 0 &&
-		frame.flags&pageCacheFrameWritePinned != 0 &&
-		frame.flags&pageCacheFrameNeedsReseal == 0 &&
+	current := frame.state.Load() == uint32(pageCacheReady) && frame.dirty != 0 &&
+		frame.flags.Load()&pageCacheFrameWritePinned != 0 &&
+		frame.flags.Load()&pageCacheFrameNeedsReseal == 0 &&
 		frame.key.offset == uint64(write.Offset) &&
 		frame.key.length == write.Length && frame.key.kind == write.kind
 	frame.lock.Unlock()
@@ -461,9 +461,9 @@ func (c *Committer) prewriteOldestSealed() (bool, error) {
 			}
 			frame := &cache.frames[write.frameIndex]
 			frame.lock.Lock()
-			if frame.state != pageCacheReady || frame.dirty == 0 ||
-				frame.flags&pageCacheFrameWritePinned == 0 ||
-				frame.flags&pageCacheFrameNeedsReseal != 0 ||
+			if frame.state.Load() != uint32(pageCacheReady) || frame.dirty == 0 ||
+				frame.flags.Load()&pageCacheFrameWritePinned == 0 ||
+				frame.flags.Load()&pageCacheFrameNeedsReseal != 0 ||
 				frame.key.offset != uint64(write.Offset) ||
 				frame.key.length != write.Length || frame.key.kind != write.kind {
 				frame.lock.Unlock()

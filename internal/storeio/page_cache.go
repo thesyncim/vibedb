@@ -134,7 +134,7 @@ type pageCacheKey struct {
 }
 
 const (
-	pageCacheEmpty uint8 = iota
+	pageCacheEmpty = iota
 	pageCacheLoading
 	pageCacheReady
 	pageCacheTail
@@ -148,7 +148,7 @@ const (
 )
 
 const (
-	pageCacheFramePrefetched uint8 = 1 << iota
+	pageCacheFramePrefetched = 1 << iota
 	pageCacheFrameDoomed
 	pageCacheFrameWritePinned
 	pageCacheFrameNeedsReseal
@@ -156,22 +156,37 @@ const (
 )
 
 type pageCacheFrame struct {
+	// The pin fast path (tryPinFrameReady) runs without frame.lock, so every
+	// field it touches is atomic: pins and epoch form the Add-first seqlock
+	// pair, state gates readiness, and referenced/hits/flags carry per-hit
+	// accounting. All other fields change only under identities the fast
+	// path has already refused (non-ready) or drained (reset paths bump
+	// epoch, then spin until pins reach zero before mutating).
+	//
+	// Layout packs the whole fast path into the first cache line
+	// (epoch+pins+state+shadow+flags+hits+referenced = 60 bytes); key and
+	// the lock-held fields live on the second line.
+	epoch atomic.Uint64
+	pins  atomic.Uint32
+	state atomic.Uint32
+	// keyShadow mirrors key in four atomic words so the lock-free pin path
+	// can compare the full identity without racing mutators. Same epoch
+	// proves the key did not change, but only the word compare proves the
+	// frame holds the wanted key (stale hints collide). Words: offset,
+	// logicalID, generation, length<<8|kind.
+	keyShadow     [4]atomic.Uint64
+	flags         atomic.Uint32
+	hits          atomic.Uint32
+	referenced    atomic.Bool
 	key           pageCacheKey
 	dirty         uint64
 	lock          sync.Mutex
-	hits          uint32
 	payloadLength uint32
-	pins          uint32
 	// reservationSpan is the exact number of owned allocation-quantum slots.
 	// key.length remains the exact logical extent length exposed to readers and
 	// used for I/O/accounting. The byte fits in the frame's existing cache-line
 	// tail; MaxPageSize bounds it far below 255.
 	reservationSpan uint8
-	state           uint8
-	referenced      bool
-	// flags shares the former prefetched byte with the doomed bit so the frame
-	// control record remains one cache line.
-	flags uint8
 }
 
 type pageCacheDirtyFrame struct {
@@ -371,6 +386,10 @@ type PageLease struct {
 	key           pageCacheKey
 	payloadLength uint32
 	page          []byte
+	// epoch records the frame identity generation this lease validated.
+	// Release refuses to complete against a recycled frame, which keeps a
+	// double release from corrupting a new incarnation's pin count.
+	epoch uint64
 }
 
 // Header returns the immutable identity of the leased page.
@@ -409,7 +428,7 @@ func (l *PageLease) Release() {
 		return
 	}
 	cache := l.cache
-	cache.release(l.frame, l.key)
+	cache.release(l.frame, l.key, l.epoch)
 	l.cache = nil
 	l.page = nil
 	l.payloadLength = 0
@@ -502,12 +521,16 @@ func (c *PageCache) Invalidate(ref PageRef) bool {
 	frame := &c.frames[index]
 	frame.lock.Lock()
 	defer frame.lock.Unlock()
-	if frame.state == pageCacheLoading || frame.dirty != 0 ||
-		frame.pins != 0 || frame.flags&pageCacheFrameWritePinned != 0 {
+	// Drain transients so a busy report implies a genuine holder (which the
+	// caller can retry against), not an aborting announcement.
+	drainFramePins(frame)
+	if frame.state.Load() == uint32(pageCacheLoading) || frame.dirty != 0 ||
+		frame.pins.Load() != 0 || frame.flags.Load()&pageCacheFrameWritePinned != 0 {
 		return false
 	}
-	c.resetExtentLocked(index)
-	return true
+	// A transient fast pin can still be validating (it aborts lock-free);
+	// reset reports it and false stays on the historical busy path.
+	return c.resetExtentLocked(index)
 }
 
 // reserveDirtyFrame reserves the cache extent before encoding and returns its
@@ -558,7 +581,7 @@ func (c *PageCache) reserveDirtyFrame(
 	frame.lock.Lock()
 	c.beginExtentLocked(index, reservedSpan, key, hash)
 	frame.dirty = dirtyGeneration
-	frame.flags |= pageCacheFrameWritePinned
+	frame.flags.Or(pageCacheFrameWritePinned)
 	c.dirtyBytes += uint64(frame.key.length)
 	c.dirtyReservedBytes +=
 		uint64(frame.reservationSpan) * uint64(c.options.PageSize)
@@ -599,7 +622,7 @@ func (c *PageCache) sealDirtyFrame(
 	frame.lock.Lock()
 	defer frame.lock.Unlock()
 	exact := c.extentBytes(index, ref.Length)
-	if frame.state != pageCacheLoading ||
+	if frame.state.Load() != uint32(pageCacheLoading) ||
 		frame.key != key || frame.dirty != dirtyGeneration ||
 		&page[0] != &exact[0] {
 		return fmt.Errorf(
@@ -608,8 +631,8 @@ func (c *PageCache) sealDirtyFrame(
 		)
 	}
 	frame.payloadLength = header.PayloadLength
-	frame.state = pageCacheReady
-	frame.referenced = true
+	frame.state.Store(pageCacheReady)
+	frame.referenced.Store(true)
 	c.cond.Broadcast()
 	return nil
 }
@@ -628,16 +651,18 @@ func (c *PageCache) releaseFrameWrite(write Write, generation uint64) {
 	frame.lock.Lock()
 	available := false
 	reset := false
-	if frame.state == pageCacheReady &&
-		frame.flags&pageCacheFrameWritePinned != 0 &&
+	if frame.state.Load() == uint32(pageCacheReady) &&
+		frame.flags.Load()&pageCacheFrameWritePinned != 0 &&
 		frame.key.offset == uint64(write.Offset) &&
 		frame.key.length == write.Length && frame.key.kind == write.kind &&
 		frame.key.generation == generation {
-		frame.flags &^= pageCacheFrameWritePinned
+		frame.flags.And(^uint32(pageCacheFrameWritePinned))
 		available = true
-		if frame.pins == 0 && frame.flags&pageCacheFrameDoomed != 0 {
-			c.resetExtentLocked(index)
-			reset = true
+		// Drain transients first: skipping the reset on an aborting
+		// announcement strands the doomed frame with no retry source.
+		drainFramePins(frame)
+		if frame.pins.Load() == 0 && frame.flags.Load()&pageCacheFrameDoomed != 0 {
+			reset = c.resetExtentLocked(index)
 		}
 	}
 	frame.lock.Unlock()
@@ -740,12 +765,12 @@ func (c *PageCache) admitDirtyValidated(
 		frame := &c.frames[index]
 		frame.lock.Lock()
 		defer frame.lock.Unlock()
-		if frame.state != pageCacheReady || frame.dirty != dirtyGeneration ||
+		if frame.state.Load() != uint32(pageCacheReady) || frame.dirty != dirtyGeneration ||
 			!bytes.Equal(c.extentBytes(index, ref.Length), src) {
 			return fmt.Errorf("%w: conflicting dirty page", ErrPageCacheReference)
 		}
 		if bufferedOwned {
-			frame.flags |= pageCacheFrameBufferedOwned
+			frame.flags.Or(pageCacheFrameBufferedOwned)
 		}
 		return nil
 	}
@@ -777,11 +802,11 @@ func (c *PageCache) admitDirtyValidated(
 	c.dirtyReservedBytes += uint64(frame.reservationSpan) * uint64(c.options.PageSize)
 	frame.dirty = dirtyGeneration
 	if bufferedOwned {
-		frame.flags |= pageCacheFrameBufferedOwned
+		frame.flags.Or(pageCacheFrameBufferedOwned)
 	}
 	c.recordDirtyFrameLocked(index, dirtyGeneration)
-	frame.state = pageCacheReady
-	frame.referenced = true
+	frame.state.Store(pageCacheReady)
+	frame.referenced.Store(true)
 	return nil
 }
 
@@ -844,15 +869,17 @@ func (c *PageCache) MarkUnreachable(refs []PageRef) {
 		}
 		frame := &c.frames[index]
 		frame.lock.Lock()
-		if frame.state != pageCacheReady {
+		if frame.state.Load() != uint32(pageCacheReady) {
 			frame.lock.Unlock()
 			continue
 		}
-		if frame.flags&pageCacheFrameWritePinned != 0 {
-			frame.flags |= pageCacheFrameDoomed
-			frame.referenced = false
-		} else if frame.pins == 0 {
-			c.resetExtentLocked(index)
+		// Same transient discipline as releaseDoomed: dooming on an
+		// un-drained count strands the frame when the transient aborts.
+		drainFramePins(frame)
+		if frame.flags.Load()&pageCacheFrameWritePinned != 0 {
+			frame.flags.Or(pageCacheFrameDoomed)
+			frame.referenced.Store(false)
+		} else if frame.pins.Load() == 0 && c.resetExtentLocked(index) {
 			released = true
 		} else {
 			if frame.dirty != 0 {
@@ -861,8 +888,17 @@ func (c *PageCache) MarkUnreachable(refs []PageRef) {
 					uint64(frame.reservationSpan) * uint64(c.options.PageSize)
 				frame.dirty = 0
 			}
-			frame.flags |= pageCacheFrameDoomed
-			frame.referenced = false
+			frame.flags.Or(pageCacheFrameDoomed)
+			frame.referenced.Store(false)
+			// Takeover: a lock-free last unpin can slip between the check
+			// above and this doom-set, leaving no outstanding pins and no
+			// retry source. If pins settled to zero, reset here instead of
+			// stranding the frame for a release that already returned.
+			// A racing repin just fails the recheck inside and retries on
+			// its own release, exactly like the historical busy path.
+			if frame.pins.Load() == 0 && c.resetExtentLocked(index) {
+				released = true
+			}
 		}
 		frame.lock.Unlock()
 	}
@@ -888,7 +924,10 @@ func (c *PageCache) DiscardDirty(generation uint64) error {
 		}
 		frame := &c.frames[dirty.frame]
 		frame.lock.Lock()
-		pinned := frame.dirty == dirty.generation && frame.pins != 0
+		// Absorb transient lock-free validations before reporting pinned:
+		// they always abort and balance within nanoseconds.
+		drainFramePins(frame)
+		pinned := frame.dirty == dirty.generation && frame.pins.Load() != 0
 		frame.lock.Unlock()
 		if pinned {
 			return ErrPageCachePinned
@@ -901,8 +940,13 @@ func (c *PageCache) DiscardDirty(generation uint64) error {
 		frame := &c.frames[dirty.frame]
 		frame.lock.Lock()
 		if frame.dirty == dirty.generation {
-			c.resetExtentLocked(int(dirty.frame))
-			released = true
+			// A racing reader validated against this key just before the
+			// drain above; its abort is in flight. Skip the release the same
+			// way the historical code skipped busy frames: the next discard
+			// or eviction pass reclaims it.
+			if c.resetExtentLocked(int(dirty.frame)) {
+				released = true
+			}
 		}
 		frame.lock.Unlock()
 	}
@@ -979,7 +1023,7 @@ func (c *PageCache) load(ref PageRef, pin, prefetch bool) (PageLease, error) {
 		if index, ok := c.lookupLocked(hash, key); ok {
 			frame := &c.frames[index]
 			frame.lock.Lock()
-			switch frame.state {
+			switch frame.state.Load() {
 			case pageCacheLoading:
 				frame.lock.Unlock()
 				if !pin {
@@ -995,22 +1039,22 @@ func (c *PageCache) load(ref PageRef, pin, prefetch bool) (PageLease, error) {
 					c.mu.Unlock()
 					return PageLease{}, nil
 				}
-				if frame.pins == ^uint32(0) {
+				if frame.pins.Load() == ^uint32(0) {
 					frame.lock.Unlock()
 					c.mu.Unlock()
 					return PageLease{}, ErrPageCachePinned
 				}
-				frame.pins++
-				frame.referenced = true
+				frame.pins.Add(1)
+				frame.referenced.Store(true)
 				c.recordFrameHit(frame)
-				if frame.flags&pageCacheFramePrefetched != 0 {
-					frame.flags &^= pageCacheFramePrefetched
+				if frame.flags.Load()&pageCacheFramePrefetched != 0 {
+					frame.flags.And(^uint32(pageCacheFramePrefetched))
 					c.prefetchHits.Add(1)
 				}
 				page := c.extentBytes(index, key.length)
 				payloadLength := frame.payloadLength
 				lease := PageLease{cache: c, frame: index, key: key, payloadLength: payloadLength,
-					page: page}
+					page: page, epoch: frame.epoch.Load()}
 				frame.lock.Unlock()
 				c.mu.Unlock()
 				return lease, nil
@@ -1037,9 +1081,9 @@ func (c *PageCache) load(ref PageRef, pin, prefetch bool) (PageLease, error) {
 		frame := &c.frames[index]
 		frame.lock.Lock()
 		c.beginExtentLocked(index, reservedSpan, key, hash)
-		frame.referenced = pin
+		frame.referenced.Store(pin)
 		if prefetch {
-			frame.flags |= pageCacheFramePrefetched
+			frame.flags.Or(pageCacheFramePrefetched)
 		}
 		c.activeLoads++
 		data := c.extentBytes(index, ref.Length)
@@ -1062,9 +1106,13 @@ func (c *PageCache) load(ref PageRef, pin, prefetch bool) (PageLease, error) {
 			frame.lock.Lock()
 			if readErr == nil {
 				frame.payloadLength = header.PayloadLength
-				frame.state = pageCacheReady
+				frame.state.Store(pageCacheReady)
 				if pin {
-					frame.pins = 1
+					// Add, not Store: a transient fast pin can be
+					// validating concurrently (it aborts on the loading
+					// state, but its announcement is balanced only if
+					// every increment here merges with it).
+					frame.pins.Add(1)
 				}
 				c.cond.Broadcast()
 				if !pin {
@@ -1073,13 +1121,17 @@ func (c *PageCache) load(ref PageRef, pin, prefetch bool) (PageLease, error) {
 					return PageLease{}, nil
 				}
 				lease := PageLease{cache: c, frame: index, key: key, payloadLength: header.PayloadLength,
-					page: data}
+					page: data, epoch: frame.epoch.Load()}
 				frame.lock.Unlock()
 				c.mu.Unlock()
 				return lease, nil
 			}
 			c.readErrors++
-			c.resetExtentLocked(index)
+			// Loading frames are invisible to the slow path and writers, so
+			// only transient lock-free validations can race here; each retry
+			// re-bumps the epoch and their aborts balance within nanoseconds.
+			for !c.resetExtentLocked(index) {
+			}
 			frame.lock.Unlock()
 			c.cond.Broadcast()
 			c.mu.Unlock()
@@ -1093,7 +1145,8 @@ func (c *PageCache) load(ref PageRef, pin, prefetch bool) (PageLease, error) {
 		frame = &c.frames[index]
 		c.readErrors++
 		frame.lock.Lock()
-		c.resetExtentLocked(index)
+		for !c.resetExtentLocked(index) {
+		}
 		frame.lock.Unlock()
 		c.cond.Broadcast()
 		c.mu.Unlock()
@@ -1220,15 +1273,15 @@ func (c *PageCache) scoreWindowLocked(start, span int) (pageCacheWindowScore, bo
 	score := pageCacheWindowScore{}
 	for index := start; index < end; {
 		frame := &c.frames[index]
-		switch frame.state {
+		switch frame.state.Load() {
 		case pageCacheEmpty:
 			score.empty++
 			index++
 		case pageCacheReady:
 			frame.lock.Lock()
-			if frame.state != pageCacheReady || frame.dirty != 0 ||
-				frame.pins != 0 ||
-				frame.flags&pageCacheFrameWritePinned != 0 {
+			if frame.state.Load() != uint32(pageCacheReady) || frame.dirty != 0 ||
+				frame.pins.Load() != 0 ||
+				frame.flags.Load()&pageCacheFrameWritePinned != 0 {
 				frame.lock.Unlock()
 				return pageCacheWindowScore{}, false
 			}
@@ -1237,14 +1290,14 @@ func (c *PageCache) scoreWindowLocked(start, span int) (pageCacheWindowScore, bo
 				frame.lock.Unlock()
 				return pageCacheWindowScore{}, false
 			}
-			if frame.referenced {
+			if frame.referenced.Load() {
 				score.referenced++
-				frame.referenced = false
+				frame.referenced.Store(false)
 			}
-			if ^uint64(0)-score.hits < uint64(frame.hits) {
+			if ^uint64(0)-score.hits < uint64(frame.hits.Load()) {
 				score.hits = ^uint64(0)
 			} else {
-				score.hits += uint64(frame.hits)
+				score.hits += uint64(frame.hits.Load())
 			}
 			frame.lock.Unlock()
 			index += extentSpan
@@ -1262,7 +1315,7 @@ func (c *PageCache) evictWindowLocked(start, span int) bool {
 	count := 0
 	for index := start; index < end; {
 		frame := &c.frames[index]
-		switch frame.state {
+		switch frame.state.Load() {
 		case pageCacheEmpty:
 			index++
 		case pageCacheReady:
@@ -1285,9 +1338,9 @@ func (c *PageCache) evictWindowLocked(start, span int) bool {
 		index := int(c.evictionScratch[checked])
 		frame := &c.frames[index]
 		extentSpan := int(frame.reservationSpan)
-		if frame.state != pageCacheReady || frame.dirty != 0 ||
-			frame.pins != 0 ||
-			frame.flags&pageCacheFrameWritePinned != 0 ||
+		if frame.state.Load() != uint32(pageCacheReady) || frame.dirty != 0 ||
+			frame.pins.Load() != 0 ||
+			frame.flags.Load()&pageCacheFrameWritePinned != 0 ||
 			index < start || extentSpan > end-index {
 			for locked := count - 1; locked >= 0; locked-- {
 				c.frames[c.evictionScratch[locked]].lock.Unlock()
@@ -1296,8 +1349,16 @@ func (c *PageCache) evictWindowLocked(start, span int) bool {
 		}
 	}
 	for evicted := 0; evicted < count; evicted++ {
-		c.resetExtentLocked(int(c.evictionScratch[evicted]))
-		c.evictions++
+		// Only transient lock-free validations can race here (all batch
+		// frame locks are held, and c.mu pins writers/dirty): they abort
+		// without locks, so doom-and-continue stays on the historical path.
+		if c.resetExtentLocked(int(c.evictionScratch[evicted])) {
+			c.evictions++
+			continue
+		}
+		doomed := &c.frames[c.evictionScratch[evicted]]
+		doomed.flags.Or(pageCacheFrameDoomed)
+		doomed.referenced.Store(false)
 	}
 	for locked := count - 1; locked >= 0; locked-- {
 		c.frames[c.evictionScratch[locked]].lock.Unlock()
@@ -1313,22 +1374,28 @@ func (c *PageCache) reserveClockLocked(span int) (int, bool) {
 			c.hand = 0
 		}
 		frame := &c.frames[index]
-		if frame.state != pageCacheReady {
+		if frame.state.Load() != uint32(pageCacheReady) {
 			continue
 		}
 		frame.lock.Lock()
-		if frame.state != pageCacheReady || frame.dirty != 0 ||
-			frame.pins != 0 ||
-			frame.flags&pageCacheFrameWritePinned != 0 {
+		if frame.state.Load() != uint32(pageCacheReady) || frame.dirty != 0 ||
+			frame.pins.Load() != 0 ||
+			frame.flags.Load()&pageCacheFrameWritePinned != 0 {
 			frame.lock.Unlock()
 			continue
 		}
-		if frame.referenced {
-			frame.referenced = false
+		if frame.referenced.Load() {
+			frame.referenced.Store(false)
 			frame.lock.Unlock()
 			continue
 		}
-		c.resetExtentLocked(index)
+		// A racing reader validated just before this lock arrived; its
+		// abort is in flight, so skip like the historical busy path and let
+		// the next pass (or the release slow path) reclaim the frame.
+		if !c.resetExtentLocked(index) {
+			frame.lock.Unlock()
+			continue
+		}
 		frame.lock.Unlock()
 		c.evictions++
 		if start, ok := c.blocks.take(span); ok {
@@ -1351,34 +1418,58 @@ func (c *PageCache) beginExtentLocked(index, reservedSpan int, key pageCacheKey,
 		c.dirtyBytes -= uint64(frame.key.length)
 		c.dirtyReservedBytes -= uint64(frame.reservationSpan) * uint64(c.options.PageSize)
 	}
+	// Drain transient fast pins from stale hints. Only validations that
+	// already aborted can be here: slow pins refuse non-ready frames without
+	// counting, writers require ready, and the frame is unpublished, so the
+	// spin absorbs nanoseconds and always terminates (aborts take no locks).
+	for !drainFramePins(frame) {
+	}
 	frame.key = key
+	storeFrameKey(frame, key)
 	frame.dirty = 0
-	frame.hits = 0
+	frame.hits.Store(0)
 	frame.payloadLength = 0
 	frame.reservationSpan = uint8(reservedSpan)
-	frame.pins = 0
-	frame.state = pageCacheLoading
-	frame.referenced = false
-	frame.flags = 0
+	// No pins.Store(0): the drain proved zero, and racing announcements are
+	// balanced Add/undo pairs that return the count to zero by themselves;
+	// storing would clobber one side of a pair and corrupt the count.
+	frame.state.Store(pageCacheLoading)
+	frame.referenced.Store(false)
+	frame.flags.Store(0)
 	for slot := 1; slot < reservedSpan; slot++ {
 		tail := &c.frames[index+slot]
 		tail.key = pageCacheKey{}
 		tail.dirty = 0
-		tail.hits = 0
+		tail.hits.Store(0)
 		tail.payloadLength = 0
 		tail.reservationSpan = 0
-		tail.pins = 0
-		tail.state = pageCacheTail
-		tail.referenced = false
-		tail.flags = 0
+		tail.state.Store(pageCacheTail)
+		tail.referenced.Store(false)
+		tail.flags.Store(0)
 	}
 	c.insertLocked(hash, index)
 }
 
 // resetExtentLocked removes one complete extent. The caller holds c.mu and
 // the head frame lock; tail slots are never published in the lookup table.
-func (c *PageCache) resetExtentLocked(index int) {
+//
+// The epoch bump retires the frame's identity first, then the shadow is
+// zeroed so validators that announce after this point abort on the key
+// mismatch instead of validating against bytes about to be recycled. The
+// bounded drain then absorbs only aborting announcements (they always
+// complete without locks); a timeout means genuinely held pins and the
+// caller defers exactly as it does today when it finds pins != 0. On
+// deferral the shadow is restored, so a failed reset leaves no trace.
+// Callers must treat false like the historical busy path (doom/defer),
+// never reset.
+func (c *PageCache) resetExtentLocked(index int) bool {
 	frame := &c.frames[index]
+	frame.epoch.Add(1)
+	storeFrameKey(frame, pageCacheKey{})
+	if !drainFramePins(frame) || frame.pins.Load() != 0 {
+		storeFrameKey(frame, frame.key)
+		return false
+	}
 	c.removeLocked(cacheKeyHash(frame.key), frame.key)
 	reservedSpan := int(frame.reservationSpan)
 	if frame.dirty != 0 {
@@ -1387,30 +1478,31 @@ func (c *PageCache) resetExtentLocked(index int) {
 	}
 	frame.key = pageCacheKey{}
 	frame.dirty = 0
-	c.cacheHitsBase.Add(uint64(frame.hits))
-	frame.hits = 0
+	c.cacheHitsBase.Add(uint64(frame.hits.Load()))
+	frame.hits.Store(0)
 	frame.payloadLength = 0
 	frame.reservationSpan = 0
-	frame.pins = 0
-	frame.state = pageCacheEmpty
-	frame.referenced = false
-	frame.flags = 0
+	// No pins.Store(0): the drain proved zero and racing announcements are
+	// balanced pairs (see beginExtentLocked).
+	frame.state.Store(pageCacheEmpty)
+	frame.referenced.Store(false)
+	frame.flags.Store(0)
 	for slot := 1; slot < reservedSpan; slot++ {
 		tail := &c.frames[index+slot]
 		tail.key = pageCacheKey{}
 		tail.dirty = 0
-		tail.hits = 0
+		tail.hits.Store(0)
 		tail.payloadLength = 0
 		tail.reservationSpan = 0
-		tail.pins = 0
-		tail.state = pageCacheEmpty
-		tail.referenced = false
-		tail.flags = 0
+		tail.state.Store(pageCacheEmpty)
+		tail.referenced.Store(false)
+		tail.flags.Store(0)
 	}
 	c.blocks.put(index, reservedSpan)
 	if c.hand > index && c.hand < index+reservedSpan {
 		c.hand = index
 	}
+	return true
 }
 
 func (c *PageCache) extentBytes(index int, length uint32) []byte {
@@ -1447,6 +1539,51 @@ func (c *PageCache) tryPinReady(hash uint64, key pageCacheKey, lease *PageLease)
 // tryPinFrameReady mirrors tryPinReady's frame discipline without consulting
 // the lookup table. The full immutable identity check is what makes stale,
 // collided, and frame-reuse hints fail closed.
+// pinDrainSpins bounds the reset-path wait for transient fast pins: a fast
+// pin that is still validating always completes without taking locks, so the
+// spin only ever absorbs nanoseconds. Long-held pins (readers actually
+// reading, writers holding exclusive windows) are never waited out here;
+// the bounded wait gives up and the caller defers exactly as it does today
+// when it finds pins != 0.
+const pinDrainSpins = 1 << 12
+
+// drainFramePins spins until no counted pins remain, without taking any
+// lock. Aborting fast validations always balance their announcement without
+// locks, and the lock-free release path decrements before taking locks, so
+// the spin absorbs both within nanoseconds. A holder that needs the frame
+// lock to release (the slow path) cannot drain while a destroyer holds that
+// lock; the bounded spin then times out and the caller defers. Returns false
+// on timeout.
+func drainFramePins(frame *pageCacheFrame) bool {
+	for spin := 0; spin < pinDrainSpins; spin++ {
+		if frame.pins.Load() == 0 {
+			return true
+		}
+	}
+	return frame.pins.Load() == 0
+}
+
+// storeFrameKey publishes key into the frame's atomic shadow. Mutators call
+// it under lock with every key install and clear, before the frame becomes
+// (or after it stops being) validatable: the shadow and epoch together let
+// the lock-free path prove both stability and identity.
+func storeFrameKey(frame *pageCacheFrame, key pageCacheKey) {
+	frame.keyShadow[0].Store(key.offset)
+	frame.keyShadow[1].Store(key.logicalID)
+	frame.keyShadow[2].Store(key.generation)
+	frame.keyShadow[3].Store(uint64(key.length)<<8 | uint64(key.kind))
+}
+
+// matchFrameKey reports whether the frame's shadow names key. All loads are
+// atomic; callers validate the epoch around the compare so a torn read can
+// only fail closed (mismatch) or be discarded by the epoch check.
+func matchFrameKey(frame *pageCacheFrame, key *pageCacheKey) bool {
+	return frame.keyShadow[0].Load() == key.offset &&
+		frame.keyShadow[1].Load() == key.logicalID &&
+		frame.keyShadow[2].Load() == key.generation &&
+		frame.keyShadow[3].Load() == uint64(key.length)<<8|uint64(key.kind)
+}
+
 func (c *PageCache) tryPinFrameReady(
 	index int,
 	key pageCacheKey,
@@ -1456,29 +1593,53 @@ func (c *PageCache) tryPinFrameReady(
 		return false
 	}
 	frame := &c.frames[index]
-	frame.lock.Lock()
-	// Spell out the immutable identity to avoid generic padded-struct
-	// equality while still rejecting corrupt references, hint collisions,
-	// and safely reused offsets.
-	if c.closing.Load() || frame.state != pageCacheReady ||
-		frame.key.offset != key.offset || frame.key.generation != key.generation ||
-		frame.key.logicalID != key.logicalID || frame.key.length != key.length ||
-		frame.key.kind != key.kind || frame.pins == ^uint32(0) {
-		frame.lock.Unlock()
+	// Fast path: announce first (Add), then validate. Every identity
+	// destroyer bumps epoch before checking pins, and every check-then-act
+	// on pins observes either our announcement (and defers) or our
+	// validation observes their bump (and we abort): the pair cannot both
+	// miss (Dekker exclusion on multi-copy-atomic hardware, which is also
+	// what the race detector models). A validated pin therefore guarantees
+	// no mutation overlaps the byte window below, and aborting only ever
+	// undoes our own announcement, keeping the count exact.
+	epoch := frame.epoch.Load()
+	if c.closing.Load() {
 		return false
 	}
-	frame.pins++
-	frame.referenced = true
-	c.recordFrameHit(frame)
-	if frame.flags&pageCacheFramePrefetched != 0 {
-		frame.flags &^= pageCacheFramePrefetched
-		c.prefetchHits.Add(1)
+	if frame.pins.Add(1) == 0 {
+		// Wrapped past saturation: undo and let the slow path report it.
+		frame.pins.Add(^uint32(0))
+		return false
 	}
-	page := c.extentBytes(index, key.length)
-	payloadLength := frame.payloadLength
-	*lease = PageLease{cache: c, frame: index, key: key, payloadLength: payloadLength,
-		page: page}
-	frame.lock.Unlock()
+	if c.closing.Load() || frame.epoch.Load() != epoch ||
+		frame.state.Load() != uint32(pageCacheReady) || !matchFrameKey(frame, &key) {
+		frame.pins.Add(^uint32(0))
+		return false
+	}
+	// Pinned and stable. The install path publishes payloadLength and page
+	// bytes before the state store that admitted us (release/acquire pair),
+	// and resets cannot proceed while counted, so plain reads below are
+	// ordered and never overlap a mutation.
+	//
+	// Accounting is single-RMW per hit: a CAS retry loop here is a
+	// contention storm under parallel acquires (the profile showed it at
+	// ~70% of CPU). The conditional store keeps the line shared when the
+	// clock bit is already set; the wrapping add folds exactly into the
+	// lifetime base once per 4G hits, matching the slow path's saturation
+	// fold without ever retrying.
+	if !frame.referenced.Load() {
+		frame.referenced.Store(true)
+	}
+	if hits := frame.hits.Add(1); hits == 0 {
+		c.cacheHitsBase.Add(1 << 32)
+	}
+	if flags := frame.flags.Load(); flags&pageCacheFramePrefetched != 0 {
+		if frame.flags.CompareAndSwap(flags, flags&^pageCacheFramePrefetched) {
+			c.prefetchHits.Add(1)
+		}
+	}
+	*lease = PageLease{cache: c, frame: index, key: key,
+		payloadLength: frame.payloadLength, page: c.extentBytes(index, key.length),
+		epoch: epoch}
 	return true
 }
 
@@ -1486,12 +1647,12 @@ func (c *PageCache) tryPinFrameReady(
 // it already owns. The practically unreachable overflow path folds into an
 // atomic lifetime total without making every hit contend on one cache line.
 func (c *PageCache) recordFrameHit(frame *pageCacheFrame) {
-	if frame.hits != ^uint32(0) {
-		frame.hits++
+	if frame.hits.Load() != ^uint32(0) {
+		frame.hits.Add(1)
 		return
 	}
-	c.cacheHitsBase.Add(uint64(frame.hits))
-	frame.hits = 1
+	c.cacheHitsBase.Add(uint64(frame.hits.Load()))
+	frame.hits.Store(1)
 }
 
 func (c *PageCache) lookupLocked(hash uint64, key pageCacheKey) (int, bool) {
@@ -1563,7 +1724,7 @@ func (c *PageCache) rebuildTableLocked() {
 	}
 	c.tombs = 0
 	for index := range c.frames {
-		state := c.frames[index].state
+		state := c.frames[index].state.Load()
 		if state == pageCacheLoading || state == pageCacheReady {
 			c.insertLocked(cacheKeyHash(c.frames[index].key), index)
 		}
@@ -1611,18 +1772,43 @@ func (c *PageCache) validateRef(ref PageRef) (pageCacheKey, error) {
 	}, nil
 }
 
-func (c *PageCache) release(index int, key pageCacheKey) {
+func (c *PageCache) release(index int, key pageCacheKey, epoch uint64) {
 	if index < 0 || index >= len(c.frames) {
 		return
 	}
 	frame := &c.frames[index]
+	// Fast path: the lease's pin was counted by our own Add, so undoing it
+	// needs no lock. The epoch guard keeps a stale lease (one that
+	// outlived its incarnation, which the pin protocol otherwise excludes)
+	// from corrupting a recycled frame's count; on mismatch the slow path
+	// rechecks under the lock and skips, exactly like the stale-key case.
+	if frame.epoch.Load() == epoch {
+		if pins := frame.pins.Add(^uint32(0)); pins != 0 {
+			return
+		}
+		// Last unpin stays lock-free: a plain doom-flag read suffices
+		// because MarkUnreachable takes over the reset below whenever pins
+		// settle to zero after it dooms. No transition ever strands.
+		if frame.flags.Load()&pageCacheFrameDoomed == 0 {
+			return
+		}
+		// The counted pin is already undone above, so hand directly to
+		// the resetting slow path without decrementing again. Its
+		// recheck tolerates a racing repin.
+		c.releaseDoomed(index, key)
+		return
+	}
 	releaseDoomed := false
 	frame.lock.Lock()
 	// Offset plus generation uniquely names a physical immutable extent. The
 	// stale-copy check remains cheap and cannot decrement a reused frame.
-	if frame.key.offset == key.offset && frame.key.generation == key.generation && frame.pins != 0 {
-		frame.pins--
-		releaseDoomed = frame.pins == 0 && frame.flags&pageCacheFrameDoomed != 0
+	if frame.key.offset == key.offset && frame.key.generation == key.generation && frame.pins.Load() != 0 {
+		frame.pins.Add(^uint32(0))
+		// Drain racing transients before the doom decision: deciding on an
+		// un-drained count strands a doomed frame when the transient aborts
+		// instead of releasing.
+		drainFramePins(frame)
+		releaseDoomed = frame.pins.Load() == 0 && frame.flags.Load()&pageCacheFrameDoomed != 0
 	}
 	frame.lock.Unlock()
 	if releaseDoomed {
@@ -1640,12 +1826,21 @@ func (c *PageCache) releaseDoomed(index int, key pageCacheKey) {
 	c.mu.Lock()
 	frame := &c.frames[index]
 	frame.lock.Lock()
-	if frame.state == pageCacheReady && frame.key == key &&
-		frame.pins == 0 &&
-		frame.flags&pageCacheFrameWritePinned == 0 &&
-		frame.flags&pageCacheFrameDoomed != 0 {
-		c.resetExtentLocked(index)
-		c.cond.Broadcast()
+	// Absorb transient lock-free announcements before deciding: a deferred
+	// reset is only sound when pins imply a genuine holder, because only a
+	// genuine holder's release retries. Transients abort without retrying,
+	// so deciding on an un-drained count strands doomed frames.
+	drainFramePins(frame)
+	if frame.state.Load() == uint32(pageCacheReady) && frame.key == key &&
+		frame.pins.Load() == 0 &&
+		frame.flags.Load()&pageCacheFrameWritePinned == 0 &&
+		frame.flags.Load()&pageCacheFrameDoomed != 0 {
+		// A racing reader can validate between the recheck and the reset;
+		// its abort is already guaranteed. On a transient report, keep the
+		// doomed frame: the next release retries on the same path.
+		if c.resetExtentLocked(index) {
+			c.cond.Broadcast()
+		}
 	}
 	frame.lock.Unlock()
 	c.mu.Unlock()
@@ -1838,7 +2033,7 @@ func (c *PageCache) beginPrefetch(ref PageRef) (pageCacheRingLoad, bool) {
 	frame := &c.frames[index]
 	frame.lock.Lock()
 	c.beginExtentLocked(index, reservedSpan, key, hash)
-	frame.flags |= pageCacheFramePrefetched
+	frame.flags.Or(pageCacheFramePrefetched)
 	c.activeLoads++
 	frame.lock.Unlock()
 	return pageCacheRingLoad{ref: ref, key: key, frame: index}, true
@@ -1888,7 +2083,7 @@ func (c *PageCache) completePrefetch(load pageCacheRingLoad, n int, readErr erro
 	c.activeLoads--
 	frame := &c.frames[load.frame]
 	frame.lock.Lock()
-	if frame.state != pageCacheLoading || frame.key != load.key {
+	if frame.state.Load() != uint32(pageCacheLoading) || frame.key != load.key {
 		c.readErrors++
 		frame.lock.Unlock()
 		c.cond.Broadcast()
@@ -1897,10 +2092,11 @@ func (c *PageCache) completePrefetch(load pageCacheRingLoad, n int, readErr erro
 	}
 	if readErr == nil {
 		frame.payloadLength = header.PayloadLength
-		frame.state = pageCacheReady
+		frame.state.Store(pageCacheReady)
 	} else {
 		c.readErrors++
-		c.resetExtentLocked(load.frame)
+		for !c.resetExtentLocked(load.frame) {
+		}
 	}
 	frame.lock.Unlock()
 	c.cond.Broadcast()
@@ -1953,12 +2149,12 @@ func (c *PageCache) Stats() PageCacheStats {
 	}
 	for i := range c.frames {
 		frame := &c.frames[i]
-		state := frame.state
+		state := frame.state.Load()
 		if state == pageCacheTail {
 			continue
 		}
 		frame.lock.Lock()
-		state = frame.state
+		state = frame.state.Load()
 		if state == pageCacheTail {
 			frame.lock.Unlock()
 			continue
@@ -1973,12 +2169,12 @@ func (c *PageCache) Stats() PageCacheStats {
 			stats.ResidentBytes += uint64(frame.key.length)
 			stats.ReservedBytes += uint64(frame.reservationSpan) * uint64(c.options.PageSize)
 		}
-		if frame.pins != 0 {
+		if frame.pins.Load() != 0 {
 			stats.PinnedPages++
 			stats.PinnedFrames++
-			stats.Pins += uint64(frame.pins)
+			stats.Pins += uint64(frame.pins.Load())
 		}
-		hits += uint64(frame.hits)
+		hits += uint64(frame.hits.Load())
 		frame.lock.Unlock()
 	}
 	stats.DirtyBytes = c.dirtyBytes
@@ -2033,11 +2229,14 @@ func (c *PageCache) Close() error {
 	}
 	for i := range c.frames {
 		frame := &c.frames[i]
-		if frame.state == pageCacheTail {
+		if frame.state.Load() == uint32(pageCacheTail) {
 			continue
 		}
 		frame.lock.Lock()
-		pinned := frame.pins != 0
+		// Absorb transient lock-free validations before reporting pinned:
+		// they always abort and balance within nanoseconds.
+		drainFramePins(frame)
+		pinned := frame.pins.Load() != 0
 		frame.lock.Unlock()
 		if pinned {
 			c.mu.Unlock()
@@ -2049,16 +2248,16 @@ func (c *PageCache) Close() error {
 	for i := range c.frames {
 		frame := &c.frames[i]
 		frame.lock.Lock()
-		c.cacheHitsBase.Add(uint64(frame.hits))
+		c.cacheHitsBase.Add(uint64(frame.hits.Load()))
 		frame.key = pageCacheKey{}
 		frame.dirty = 0
-		frame.hits = 0
+		frame.hits.Store(0)
 		frame.payloadLength = 0
 		frame.reservationSpan = 0
-		frame.pins = 0
-		frame.state = pageCacheEmpty
-		frame.referenced = false
-		frame.flags = 0
+		frame.pins.Store(0)
+		frame.state.Store(pageCacheEmpty)
+		frame.referenced.Store(false)
+		frame.flags.Store(0)
 		frame.lock.Unlock()
 	}
 	for i := range c.table {

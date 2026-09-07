@@ -14,7 +14,9 @@ import (
 	"github.com/thesyncim/vibedb/internal/distributedagg"
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/exchange"
+	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	vibejson "github.com/thesyncim/vibejson"
 )
@@ -1513,9 +1515,147 @@ func TestFrameEncoderArenaReused(t *testing.T) {
 	}
 }
 
+// TestEncodeRequestBytesMatchesStreamingEncoder pins the single-alloc
+// variant byte-identical to the streaming encoder across every request
+// field group. The replicated envelope carries these bytes, so any drift
+// is a wire-compat break, not just a size miss.
+func TestEncodeRequestBytesMatchesStreamingEncoder(t *testing.T) {
+	base := func() ShardRequest {
+		return ShardRequest{
+			SQL: "SELECT id FROM t WHERE id = ?", Distribution: "data", Shard: "all",
+			AllocationGeneration: 1, RoutingVersion: 2, OwnershipEpoch: 3,
+			ReadPolicy: 1, ExecutionMode: ExecutionReadOnly,
+			Deadline: 1000, MaxResultBytes: 4096, MaxRows: 16,
+			Params: []Param{StringParam("a"), NumberParam("7"), BoolParam(true), NullParam()},
+			ParamTypes: []sqldriver.ParamType{
+				sqldriver.ParamTypeText,
+				sqldriver.ParamTypeText,
+				sqldriver.ParamTypeBool,
+				sqldriver.ParamTypeUnspecified,
+			},
+		}
+	}
+	cases := map[string]func(*ShardRequest){
+		"minimal": func(request *ShardRequest) {},
+		"position": func(request *ShardRequest) {
+			request.HasMinPosition = true
+			request.MinPosition = Position{Distribution: "data", Shard: "all", LogID: [16]byte{9}, Index: 4}
+		},
+		"scopes": func(request *ShardRequest) {
+			request.BucketBits = 8
+			request.AccessScopes = []distributedtxn.IntentScope{{Start: 1, End: 3}}
+		},
+		"fence": func(request *ShardRequest) {
+			request.ReadFenceID = testTransactionID(5)
+		},
+		"lookup": func(request *ShardRequest) {
+			request.SQL = ""
+			request.Params = nil
+			request.ParamTypes = nil
+			request.GlobalIndexLookup = GlobalIndexLookupRequest{
+				Relation: []byte("idx"), IndexID: 1, Incarnation: 1,
+				KeyTuples: [][]byte{{1, 2}}, LocatorCount: 1, Unique: true,
+			}
+		},
+		"pkread": func(request *ShardRequest) {
+			request.PrimaryKeyRead = PrimaryKeyReadRequest{
+				PrimaryPath: []byte("id"), Keys: [][]byte{{1}, {2}},
+			}
+		},
+		"pkread-extended": func(request *ShardRequest) {
+			request.PrimaryKeyRead = PrimaryKeyReadRequest{
+				Relation: 2, MaxDocumentBytes: 512,
+				PrimaryPath: []byte("id"), Keys: [][]byte{{1}},
+			}
+		},
+		"capture": func(request *ShardRequest) {
+			request.MutationCapture = true
+		},
+		"image-capture": func(request *ShardRequest) {
+			request.MutationImageCapture = true
+		},
+		"scan": func(request *ShardRequest) {
+			request.SQL = ""
+			request.Params = nil
+			request.ParamTypes = nil
+			request.DocumentScan = DocumentScanRequest{Relation: []byte("docs"), After: []byte{1}}
+		},
+		"aggregate": func(request *ShardRequest) {
+			request.PartialAggregate = true
+		},
+		"batch": func(request *ShardRequest) {
+			request.RowBatch = RowBatchRequest{BatchRows: 2, BatchBytes: 128}
+		},
+		"transaction": func(request *ShardRequest) {
+			request.ParamTypes = nil
+			request.Transaction = TransactionRequest{Operation: TransactionLookupCoordinator, ID: testTransactionID(4)}
+		},
+		"authority": func(request *ShardRequest) {
+			request.Authority = serviceauthz.Authority{Node: rafttransport.NodeID{1}, Generation: 1}
+		},
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			request := base()
+			mutate(&request)
+			streamed := encodeRequest(t, &request)
+			single, err := EncodeRequestBytes(&request)
+			if err != nil {
+				t.Fatalf("EncodeRequestBytes: %v", err)
+			}
+			if !bytes.Equal(single, streamed) {
+				t.Fatalf("single-alloc encoding differs: %d bytes vs %d streamed", len(single), len(streamed))
+			}
+			if got, err := RequestFrameBytes(&request); err != nil || got != len(single) {
+				t.Fatalf("RequestFrameBytes = %d, %v; encoded %d", got, err, len(single))
+			}
+			if cap(single) != len(single) {
+				t.Fatalf("single-alloc capacity %d != length %d", cap(single), len(single))
+			}
+			if _, err := DecodeRequest(bytes.NewReader(single)); err != nil {
+				t.Fatalf("DecodeRequest(single-alloc): %v", err)
+			}
+		})
+	}
+}
+
 // BenchmarkFrameEncoderOwned measures a point-read-shaped response encoded
 // through one reused FrameEncoder: the steady-state cost of the owned-arena
 // path every connection now uses.
+// BenchmarkEncodeRequestOneShot compares the legacy buffer-growth one-shot
+// encode against the single-alloc bytes variant on a point-read-shaped
+// request: the per-attempt cost semanticCallToWire used to pay.
+func BenchmarkEncodeRequestOneShot(b *testing.B) {
+	req := ShardRequest{
+		SQL: "SELECT id FROM messages WHERE id = ?", Distribution: "data", Shard: "all",
+		AllocationGeneration: 1, RoutingVersion: 2, OwnershipEpoch: 1,
+		Params:  []Param{StringParam("a")},
+		MaxRows: 16, MaxResultBytes: 4096,
+	}
+	b.Run("buffer-growth", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			var body bytes.Buffer
+			if err := EncodeRequest(&body, &req); err != nil {
+				b.Fatal(err)
+			}
+			sinkBytes = body.Bytes()
+		}
+	})
+	b.Run("single-alloc", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			out, err := EncodeRequestBytes(&req)
+			if err != nil {
+				b.Fatal(err)
+			}
+			sinkBytes = out
+		}
+	})
+}
+
+var sinkBytes []byte
+
 func BenchmarkFrameEncoderOwned(b *testing.B) {
 	resp := RowsResponse(
 		[]Column{{Name: "id", TypeOID: 23}, {Name: "score", TypeOID: 701}},
