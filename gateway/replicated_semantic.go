@@ -220,6 +220,10 @@ func semanticCallToWire(call *shardservice.ReplicatedCall) (*shardservice.Replic
 	if err := shardservice.ValidateReplicatedCall(call); err != nil {
 		return nil, err
 	}
+	// The copy is load-bearing: callers retain (and the fused path lends)
+	// the envelope, and a pinned test rejects any mutation of it, so the
+	// encoded query stamps a private copy even though attempts are
+	// sequential.
 	request := call.Request
 	if call.SQL == nil {
 		return &request, nil

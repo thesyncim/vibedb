@@ -130,6 +130,18 @@ func (executor *ReplicatedExecutor) QuerySQL(ctx context.Context, route Replicat
 	} else if size > shardservice.MaxReplicatedSQLRequestBytes {
 		return nil, ErrResultLimit
 	}
+	// The call shell is built once: attempts are sequential and restamp only
+	// the per-attempt fence in place, saving a ~750 B struct alloc per
+	// retry. (The envelope copy in semanticCallToWire stays: callers retain
+	// the envelope by pinned contract.)
+	call := &shardservice.ReplicatedCall{
+		Request: shardservice.ReplicatedRequest{
+			Operation: shardservice.ReplicatedQueryLeader, Authority: req.Authority,
+			Capability: serviceauthz.CapabilityDataRead,
+			MaxValueBytes: shardservice.MaxReplicatedSQLResultBytes,
+		},
+		SQL: req,
+	}
 	preferred := route.Replicas[0].Member
 	var joined error
 	for attempt := 0; attempt < executor.maxAttempts; attempt++ {
@@ -142,14 +154,7 @@ func (executor *ReplicatedExecutor) QuerySQL(ctx context.Context, route Replicat
 			preferred = 0
 			continue
 		}
-		call := &shardservice.ReplicatedCall{
-			Request: shardservice.ReplicatedRequest{
-				Operation: shardservice.ReplicatedQueryLeader, Authority: req.Authority,
-				Capability: serviceauthz.CapabilityDataRead, Fence: state.Fence,
-				MaxValueBytes: shardservice.MaxReplicatedSQLResultBytes,
-			},
-			SQL: req,
-		}
+		call.Request.Fence = state.Fence
 		reply, err := executor.doReplicatedCall(ctx, endpoint, call)
 		if err != nil {
 			executor.leaderHints.invalidate(route, endpoint, state)
