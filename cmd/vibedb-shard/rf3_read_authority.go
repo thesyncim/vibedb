@@ -766,17 +766,17 @@ func configureRF3ReadAuthorities(
 	profile *rafttransport.PeerTLS,
 	authPolicy *serviceauthz.Policy,
 	localNode rafttransport.NodeID,
-) (*rf3ReadAuthorityIncarnationCache, error) {
+) (*rf3ReadAuthorityIncarnationCache, []raftmember.ReadAuthorityEvidence, error) {
 	if len(prepared) != len(runtimes) {
-		return nil, errRF3ReadAuthority
+		return nil, nil, errRF3ReadAuthority
 	}
 	if manifest.ReadAuthority == nil {
 		for _, item := range prepared {
 			if err := ensureRF3ReadAuthorityDisabled(item.manifest.Route.MemberRoot); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 		}
-		return nil, nil
+		return nil, nil, nil
 	}
 	policy, err := manifest.ReadAuthority.rf3Policy()
 	if err != nil || manifest.DevelopmentOnly || profile == nil || authPolicy == nil ||
@@ -785,14 +785,14 @@ func configureRF3ReadAuthorities(
 		// The bounded refresh uses the already authenticated embedded gateway
 		// principal. Standalone storage-only serving has no delegated probe
 		// identity and therefore keeps ReadIndex as its only read path.
-		return nil, errRF3ReadAuthority
+		return nil, nil, errRF3ReadAuthority
 	}
 	if err := validateRF3ReadAuthority(manifest.ReadAuthority, manifest.groupBundles(), manifest.DevelopmentOnly); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	cache, err := newRF3ReadAuthorityCache(profile, authPolicy, prepared, runtimes, localNode)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	// Qualify every clock before mutating any durable policy marker. On an
 	// unsupported platform an explicitly requested feature must fail before a
@@ -803,7 +803,7 @@ func configureRF3ReadAuthorities(
 		source, err = raftauthority.NewQualifiedElapsedClock()
 		if err != nil {
 			_ = cache.Close()
-			return nil, err
+			return nil, nil, err
 		}
 		// Linux construction is intentionally cheap and the CLOCK_BOOTTIME
 		// syscall occurs on Now. Exercise every source before the first marker
@@ -811,14 +811,14 @@ func configureRF3ReadAuthorities(
 		clocks[index] = raftauthority.NewCheckedClock(source)
 		if _, err = clocks[index].Now(); err != nil {
 			_ = cache.Close()
-			return nil, err
+			return nil, nil, err
 		}
 	}
 	for index, runtime := range runtimes {
 		item := &prepared[index]
 		if err := ensureRF3ReadAuthorityState(item.manifest.Route.MemberRoot, policy); err != nil {
 			_ = cache.Close()
-			return nil, err
+			return nil, nil, err
 		}
 		group := runtime.Identity().Group
 		if err := runtime.ConfigureReadAuthority(raftmember.ReadAuthorityOptions{
@@ -828,8 +828,12 @@ func configureRF3ReadAuthorities(
 			},
 		}); err != nil {
 			_ = cache.Close()
-			return nil, err
+			return nil, nil, err
 		}
 	}
-	return cache, nil
+	startup := make([]raftmember.ReadAuthorityEvidence, 0, len(runtimes))
+	for _, runtime := range runtimes {
+		startup = append(startup, runtime.ReadAuthorityEvidence())
+	}
+	return cache, startup, nil
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -8,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/thesyncim/vibedb/internal/raftauthority"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/raftstore"
@@ -17,11 +19,346 @@ import (
 	"github.com/thesyncim/vibedb/store/durable"
 )
 
+type rf3DiagnosticAuthorityGroupIdentity struct {
+	ClusterID             string `json:"cluster_id"`
+	ClusterIncarnation    string `json:"cluster_incarnation"`
+	TopologyRecoveryEpoch uint64 `json:"topology_recovery_epoch"`
+	ShardIncarnation      string `json:"shard_incarnation"`
+	GroupID               string `json:"group_id"`
+}
+
+type rf3DiagnosticAuthorityRuntimeIdentity struct {
+	Group                  rf3DiagnosticAuthorityGroupIdentity `json:"group"`
+	Distribution           string                              `json:"distribution"`
+	Shard                  string                              `json:"shard"`
+	AllocationGeneration   uint64                              `json:"allocation_generation"`
+	MemberID               uint64                              `json:"member_id"`
+	StoreID                string                              `json:"store_id"`
+	NodeIncarnation        uint64                              `json:"node_incarnation"`
+	RelationManifestDigest string                              `json:"relation_manifest_digest"`
+}
+
+type rf3DiagnosticAuthorityConfig struct {
+	AppliedVersion uint64 `json:"applied_version"`
+	Digest         string `json:"digest"`
+	Joint          bool   `json:"joint"`
+	Pending        bool   `json:"pending"`
+}
+
+type rf3DiagnosticAuthorityRequest struct {
+	Group             rf3DiagnosticAuthorityGroupIdentity `json:"group"`
+	Term              uint64                              `json:"term"`
+	Holder            uint64                              `json:"holder"`
+	HolderIncarnation uint64                              `json:"holder_incarnation"`
+	Config            rf3DiagnosticAuthorityConfig        `json:"config"`
+	PolicyVersion     uint32                              `json:"policy_version"`
+	PolicyDigest      string                              `json:"policy_digest"`
+	Nonce             uint64                              `json:"nonce"`
+	StartAtNs         int64                               `json:"start_at_ns"`
+}
+
+type rf3DiagnosticAuthorityClock struct {
+	SampleNs    int64 `json:"sample_ns"`
+	Initialized bool  `json:"initialized"`
+	Faulted     bool  `json:"faulted"`
+}
+
+type rf3DiagnosticAuthorityPromise struct {
+	HasRecord            bool                          `json:"has_record"`
+	Request              rf3DiagnosticAuthorityRequest `json:"request"`
+	GrantedAtNs          int64                         `json:"granted_at_ns"`
+	PromiseUntilNs       int64                         `json:"promise_until_ns"`
+	ActiveKnown          bool                          `json:"active_known"`
+	Active               bool                          `json:"active"`
+	QuarantineConfigured bool                          `json:"quarantine_configured"`
+	QuarantineAtNs       int64                         `json:"quarantine_at_ns"`
+	QuarantineUntilNs    int64                         `json:"quarantine_until_ns"`
+	QuarantineKnown      bool                          `json:"quarantine_known"`
+	QuarantineActive     bool                          `json:"quarantine_active"`
+	QuarantineError      bool                          `json:"quarantine_error"`
+}
+
+type rf3DiagnosticAuthorityObservation struct {
+	Group                rf3DiagnosticAuthorityGroupIdentity `json:"group"`
+	Term                 uint64                              `json:"term"`
+	Leader               uint64                              `json:"leader"`
+	LeaderIncarnation    uint64                              `json:"leader_incarnation"`
+	Config               rf3DiagnosticAuthorityConfig        `json:"config"`
+	CurrentTermCommitted bool                                `json:"current_term_committed"`
+	Stable               bool                                `json:"stable"`
+}
+
+type rf3DiagnosticAuthorityHolder struct {
+	Available      bool                          `json:"available"`
+	Request        rf3DiagnosticAuthorityRequest `json:"request"`
+	ExpiresAtNs    int64                         `json:"expires_at_ns"`
+	AcceptedVoters []uint64                      `json:"accepted_voter_ids,omitempty"`
+}
+
+type rf3DiagnosticAuthorityGateInput struct {
+	Input                   string                          `json:"input"`
+	BlockedByQuarantine     uint64                          `json:"blocked_by_quarantine"`
+	BlockedByLivePromise    uint64                          `json:"blocked_by_live_promise"`
+	BlockedByClockFault     uint64                          `json:"blocked_by_clock_fault"`
+	Allowed                 uint64                          `json:"allowed"`
+	AllowedWhileLivePromise uint64                          `json:"allowed_while_live_promise"`
+	QuarantineBlockedTime   rf3DiagnosticAuthorityBlockTime `json:"quarantine_blocked_time"`
+	LivePromiseBlockedTime  rf3DiagnosticAuthorityBlockTime `json:"live_promise_blocked_time"`
+	ClockFaultBlockedTime   rf3DiagnosticAuthorityBlockTime `json:"clock_fault_blocked_time"`
+}
+
+type rf3DiagnosticAuthorityBlockTime struct {
+	FirstNs   int64 `json:"first_ns"`
+	LastNs    int64 `json:"last_ns"`
+	Available bool  `json:"available"`
+}
+
+type rf3DiagnosticAuthorityGate struct {
+	Inputs                              []rf3DiagnosticAuthorityGateInput `json:"inputs"`
+	FirstQuarantineExpiredObservationNs int64                             `json:"first_quarantine_expired_observation_ns"`
+	QuarantineExpiredAvailable          bool                              `json:"quarantine_expired_available"`
+}
+
+type rf3DiagnosticAuthorityGroup struct {
+	RuntimeIdentity      rf3DiagnosticAuthorityRuntimeIdentity `json:"runtime_identity"`
+	Status               string                                `json:"status"`
+	PolicyVersion        uint32                                `json:"policy_version"`
+	PolicyDigest         string                                `json:"policy_digest"`
+	Clock                rf3DiagnosticAuthorityClock           `json:"clock"`
+	Observation          rf3DiagnosticAuthorityObservation     `json:"observation"`
+	ObservationAvailable bool                                  `json:"observation_available"`
+	ObservationError     string                                `json:"observation_error"`
+	Promise              rf3DiagnosticAuthorityPromise         `json:"promise"`
+	Holder               rf3DiagnosticAuthorityHolder          `json:"holder"`
+	Gate                 rf3DiagnosticAuthorityGate            `json:"gate"`
+}
+
+// rf3AuthorityDiagnostics groups the bounded authority cuts passed into one
+// SIGUSR1 snapshot. Keeping the two detached cuts together avoids positional
+// call-site mistakes as the surrounding resource inputs evolve.
+type rf3AuthorityDiagnostics struct {
+	RoundMetrics func() raftmember.ReadAuthorityRoundMetrics
+	Evidence     func() []raftmember.ReadAuthorityEvidence
+}
+
+func rf3DiagnosticAuthorityGroupIdentityJSON(identity raftauthority.GroupIdentity) rf3DiagnosticAuthorityGroupIdentity {
+	return rf3DiagnosticAuthorityGroupIdentity{
+		ClusterID:             hex.EncodeToString(identity.ClusterID[:]),
+		ClusterIncarnation:    hex.EncodeToString(identity.ClusterIncarnation[:]),
+		TopologyRecoveryEpoch: identity.TopologyRecoveryEpoch,
+		ShardIncarnation:      hex.EncodeToString(identity.ShardIncarnation[:]),
+		GroupID:               hex.EncodeToString(identity.GroupID[:]),
+	}
+}
+
+func rf3DiagnosticAuthorityRuntimeIdentityJSON(identity raftmember.RuntimeIdentity) rf3DiagnosticAuthorityRuntimeIdentity {
+	return rf3DiagnosticAuthorityRuntimeIdentity{
+		Group:                  rf3DiagnosticAuthorityGroupIdentityJSON(authorityGroupIdentity(identity.Group)),
+		Distribution:           identity.Distribution,
+		Shard:                  identity.Shard,
+		AllocationGeneration:   identity.AllocationGeneration,
+		MemberID:               identity.MemberID,
+		StoreID:                hex.EncodeToString(identity.StoreID[:]),
+		NodeIncarnation:        identity.NodeIncarnation,
+		RelationManifestDigest: hex.EncodeToString(identity.RelationManifestDigest[:]),
+	}
+}
+
+func authorityGroupIdentity(group raftmember.GroupKey) raftauthority.GroupIdentity {
+	return raftauthority.GroupIdentity{
+		ClusterID:             group.ClusterID,
+		ClusterIncarnation:    group.ClusterIncarnation,
+		TopologyRecoveryEpoch: group.TopologyRecoveryEpoch,
+		ShardIncarnation:      group.ShardIncarnation,
+		GroupID:               group.GroupID,
+	}
+}
+
+func rf3DiagnosticAuthorityConfigJSON(config raftauthority.ConfigIdentity) rf3DiagnosticAuthorityConfig {
+	return rf3DiagnosticAuthorityConfig{
+		AppliedVersion: config.AppliedVersion,
+		Digest:         hex.EncodeToString(config.Digest[:]),
+		Joint:          config.Joint,
+		Pending:        config.Pending,
+	}
+}
+
+func rf3DiagnosticAuthorityRequestJSON(request raftauthority.AuthorityRequest) rf3DiagnosticAuthorityRequest {
+	return rf3DiagnosticAuthorityRequest{
+		Group:             rf3DiagnosticAuthorityGroupIdentityJSON(request.Group),
+		Term:              request.Term,
+		Holder:            request.Holder,
+		HolderIncarnation: request.HolderIncarnation,
+		Config:            rf3DiagnosticAuthorityConfigJSON(request.Config),
+		PolicyVersion:     request.PolicyVersion,
+		PolicyDigest:      hex.EncodeToString(request.PolicyDigest[:]),
+		Nonce:             request.Nonce,
+		StartAtNs:         int64(request.StartAt),
+	}
+}
+
+func rf3DiagnosticAuthorityObservationJSON(observation raftauthority.AuthorityObservation) rf3DiagnosticAuthorityObservation {
+	return rf3DiagnosticAuthorityObservation{
+		Group:                rf3DiagnosticAuthorityGroupIdentityJSON(observation.Group),
+		Term:                 observation.Term,
+		Leader:               observation.Leader,
+		LeaderIncarnation:    observation.LeaderIncarnation,
+		Config:               rf3DiagnosticAuthorityConfigJSON(observation.Config),
+		CurrentTermCommitted: observation.CurrentTermCommitted,
+		Stable:               observation.Stable,
+	}
+}
+
+func rf3DiagnosticAuthorityBlockTimeJSON(value raftmember.ReadAuthorityGateBlockTime) rf3DiagnosticAuthorityBlockTime {
+	return rf3DiagnosticAuthorityBlockTime{
+		FirstNs: int64(value.First), LastNs: int64(value.Last), Available: value.Available,
+	}
+}
+
+func rf3DiagnosticAuthorityStatus(status raftmember.ReadAuthorityEvidenceStatus) string {
+	switch status {
+	case raftmember.ReadAuthorityEvidenceConfigured:
+		return "configured"
+	case raftmember.ReadAuthorityEvidenceDisabled:
+		return "disabled"
+	default:
+		return "unavailable"
+	}
+}
+
+func rf3DiagnosticAuthorityObservationError(err raftmember.ReadAuthorityEvidenceError) string {
+	switch err {
+	case raftmember.ReadAuthorityEvidenceErrorLeaderIncarnation:
+		return "leader_incarnation"
+	case raftmember.ReadAuthorityEvidenceErrorConfiguration:
+		return "configuration"
+	case raftmember.ReadAuthorityEvidenceErrorClockFault:
+		return "clock_fault"
+	case raftmember.ReadAuthorityEvidenceErrorUnavailable:
+		return "unavailable"
+	default:
+		return ""
+	}
+}
+
+func rf3DiagnosticAuthorityGateInputName(index int) string {
+	switch index {
+	case raftmember.ReadAuthorityGateMessage:
+		return "message"
+	case raftmember.ReadAuthorityGateTick:
+		return "tick"
+	case raftmember.ReadAuthorityGateCampaign:
+		return "campaign"
+	case raftmember.ReadAuthorityGateTransfer:
+		return "transfer"
+	default:
+		return "unknown"
+	}
+}
+
+func rf3DiagnosticAuthorityGateJSON(metrics raftmember.ReadAuthorityGateMetrics) rf3DiagnosticAuthorityGate {
+	inputs := make([]rf3DiagnosticAuthorityGateInput, raftmember.ReadAuthorityGateInputCount)
+	for index := range inputs {
+		blocked := metrics.BlockedByReason[index]
+		times := metrics.BlockedTime[index]
+		inputs[index] = rf3DiagnosticAuthorityGateInput{
+			Input:                   rf3DiagnosticAuthorityGateInputName(index),
+			BlockedByQuarantine:     blocked[raftmember.ReadAuthorityGateQuarantine],
+			BlockedByLivePromise:    blocked[raftmember.ReadAuthorityGateLivePromise],
+			BlockedByClockFault:     blocked[raftmember.ReadAuthorityGateClockFault],
+			Allowed:                 metrics.Allowed[index],
+			AllowedWhileLivePromise: metrics.AllowedWhileLivePromise[index],
+			QuarantineBlockedTime:   rf3DiagnosticAuthorityBlockTimeJSON(times[raftmember.ReadAuthorityGateQuarantine]),
+			LivePromiseBlockedTime:  rf3DiagnosticAuthorityBlockTimeJSON(times[raftmember.ReadAuthorityGateLivePromise]),
+			ClockFaultBlockedTime:   rf3DiagnosticAuthorityBlockTimeJSON(times[raftmember.ReadAuthorityGateClockFault]),
+		}
+	}
+	return rf3DiagnosticAuthorityGate{
+		Inputs:                              inputs,
+		FirstQuarantineExpiredObservationNs: int64(metrics.FirstQuarantineExpiredAt),
+		QuarantineExpiredAvailable:          metrics.QuarantineExpiredAvailable,
+	}
+}
+
+func rf3DiagnosticAuthorityEvidenceCovers(
+	evidence []raftmember.ReadAuthorityEvidence,
+	expected map[raftmember.GroupKey]struct{},
+) bool {
+	if len(expected) == 0 || len(evidence) != len(expected) {
+		return false
+	}
+	seen := make(map[raftmember.GroupKey]struct{}, len(evidence))
+	for _, group := range evidence {
+		key := group.Identity.Group
+		if _, ok := expected[key]; !ok {
+			return false
+		}
+		if _, duplicate := seen[key]; duplicate {
+			return false
+		}
+		seen[key] = struct{}{}
+	}
+	return len(seen) == len(expected)
+}
+
+func rf3DiagnosticAuthorityExpectedKeys(keys []raftmember.GroupKey) map[raftmember.GroupKey]struct{} {
+	if len(keys) == 0 {
+		return nil
+	}
+	expected := make(map[raftmember.GroupKey]struct{}, len(keys))
+	for _, key := range keys {
+		expected[key] = struct{}{}
+	}
+	if len(expected) != len(keys) {
+		return nil
+	}
+	return expected
+}
+
+func rf3DiagnosticAuthorityGroupEvidence(evidence raftmember.ReadAuthorityEvidence) rf3DiagnosticAuthorityGroup {
+	return rf3DiagnosticAuthorityGroup{
+		RuntimeIdentity: rf3DiagnosticAuthorityRuntimeIdentityJSON(evidence.Identity),
+		Status:          rf3DiagnosticAuthorityStatus(evidence.Status),
+		PolicyVersion:   evidence.PolicyVersion,
+		PolicyDigest:    hex.EncodeToString(evidence.PolicyDigest[:]),
+		Clock: rf3DiagnosticAuthorityClock{
+			SampleNs:    int64(evidence.Clock.Sample),
+			Initialized: evidence.Clock.Initialized,
+			Faulted:     evidence.Clock.Faulted,
+		},
+		Observation:          rf3DiagnosticAuthorityObservationJSON(evidence.Observation),
+		ObservationAvailable: evidence.ObservationAvailable,
+		ObservationError:     rf3DiagnosticAuthorityObservationError(evidence.ObservationError),
+		Promise: rf3DiagnosticAuthorityPromise{
+			HasRecord:            evidence.Promise.HasRecord,
+			Request:              rf3DiagnosticAuthorityRequestJSON(evidence.Promise.Request),
+			GrantedAtNs:          int64(evidence.Promise.GrantedAt),
+			PromiseUntilNs:       int64(evidence.Promise.PromiseUntil),
+			ActiveKnown:          evidence.PromiseKnown,
+			Active:               evidence.PromiseActive,
+			QuarantineConfigured: evidence.Promise.QuarantineConfigured,
+			QuarantineAtNs:       int64(evidence.Promise.QuarantineAt),
+			QuarantineUntilNs:    int64(evidence.Promise.QuarantineUntil),
+			QuarantineKnown:      evidence.QuarantineKnown,
+			QuarantineActive:     evidence.QuarantineActive,
+			QuarantineError:      evidence.Promise.QuarantineError,
+		},
+		Holder: rf3DiagnosticAuthorityHolder{
+			Available:      evidence.Holder.Available,
+			Request:        rf3DiagnosticAuthorityRequestJSON(evidence.Holder.Request),
+			ExpiresAtNs:    int64(evidence.Holder.ExpiresAt),
+			AcceptedVoters: append([]uint64(nil), evidence.Holder.AcceptedVoters...),
+		},
+		Gate: rf3DiagnosticAuthorityGateJSON(evidence.Gate),
+	}
+}
+
 // rf3DiagnosticSnapshot is a fixed, bounded process-local evidence record.
-// It is emitted only in response to SIGUSR1 and contains detached counters;
-// no request, catalog, path, or error text is retained. The histogram has the
-// fixed MaxPersistGroupBatches bound and lets a trial prove real multi-group
-// append waves from the process that owns the shared node log.
+// It is emitted only in response to SIGUSR1 and contains detached counters plus
+// the current bounded authority metadata; no history, catalog, path, or error
+// text is retained. The histogram has the fixed MaxPersistGroupBatches bound
+// and lets a trial prove real multi-group append waves from the process that
+// owns the shared node log.
 type rf3DiagnosticSnapshot struct {
 	UTC    string `json:"utc"`
 	Event  string `json:"event"`
@@ -115,9 +452,11 @@ type rf3DiagnosticSnapshot struct {
 	// per-read Ensure offer counter. RequestsCreated counts requests appended to
 	// the bounded outbound queue. GrantsAccepted includes the local self-grant
 	// and excludes duplicate or replayed grants.
-	ReadAuthorityRoundsStarted   uint64 `json:"read_authority_rounds_started"`
-	ReadAuthorityRequestsCreated uint64 `json:"read_authority_requests_created"`
-	ReadAuthorityGrantsAccepted  uint64 `json:"read_authority_grants_accepted"`
+	ReadAuthorityRoundsStarted     uint64                        `json:"read_authority_rounds_started"`
+	ReadAuthorityRequestsCreated   uint64                        `json:"read_authority_requests_created"`
+	ReadAuthorityGrantsAccepted    uint64                        `json:"read_authority_grants_accepted"`
+	ReadAuthorityEvidenceAvailable bool                          `json:"read_authority_evidence_available"`
+	ReadAuthorityEvidence          []rf3DiagnosticAuthorityGroup `json:"read_authority_evidence,omitempty"`
 
 	// Resource counters sum the currently open collection generations. Schema
 	// replacement or group retirement can reset them within one process, so
@@ -443,7 +782,7 @@ func emitRF3DiagnosticSnapshot(
 	serial *atomic.Uint64,
 	inventory *rf3AdoptedGroupInventory,
 ) {
-	emitRF3DiagnosticSnapshotWithResources(manifest, profile, nodeOwner, server, embedded, serial, inventory, nil, nil, nil)
+	emitRF3DiagnosticSnapshotWithResources(manifest, profile, nodeOwner, server, embedded, serial, inventory, nil, nil, nil, rf3AuthorityDiagnostics{})
 }
 
 func emitRF3DiagnosticSnapshotWithResources(
@@ -457,7 +796,7 @@ func emitRF3DiagnosticSnapshotWithResources(
 	prepared []preparedRF3Group,
 	schemas *rf3SchemaActivator,
 	progressMetrics *raftservice.ProgressMetrics,
-	authorityRoundMetrics ...func() raftmember.ReadAuthorityRoundMetrics,
+	authorityDiagnostics rf3AuthorityDiagnostics,
 ) {
 	snapshot := rf3DiagnosticSnapshot{
 		UTC: time.Now().UTC().Format(time.RFC3339Nano), Event: "snapshot", PID: os.Getpid(),
@@ -509,11 +848,21 @@ func emitRF3DiagnosticSnapshotWithResources(
 	if progressMetrics != nil {
 		applyRF3DiagnosticProgress(&snapshot, progressMetrics.Snapshot())
 	}
-	if len(authorityRoundMetrics) != 0 && authorityRoundMetrics[0] != nil {
-		metrics := authorityRoundMetrics[0]()
+	if authorityDiagnostics.RoundMetrics != nil {
+		metrics := authorityDiagnostics.RoundMetrics()
 		snapshot.ReadAuthorityRoundsStarted = metrics.RoundsStarted
 		snapshot.ReadAuthorityRequestsCreated = metrics.RequestsCreated
 		snapshot.ReadAuthorityGrantsAccepted = metrics.GrantsAccepted
+	}
+	if authorityDiagnostics.Evidence != nil {
+		evidence := authorityDiagnostics.Evidence()
+		snapshot.ReadAuthorityEvidence = make([]rf3DiagnosticAuthorityGroup, 0, len(evidence))
+		for _, group := range evidence {
+			snapshot.ReadAuthorityEvidence = append(snapshot.ReadAuthorityEvidence, rf3DiagnosticAuthorityGroupEvidence(group))
+		}
+		// An omitted optional runtime must remain an incomplete cut rather than
+		// being mistaken for a disabled or authority-free group.
+		snapshot.ReadAuthorityEvidenceAvailable = rf3DiagnosticAuthorityEvidenceCovers(evidence, resources.expected)
 	}
 	if server != nil {
 		stats := server.Stats()
@@ -552,6 +901,46 @@ func emitRF3DiagnosticSnapshotWithResources(
 	if err != nil {
 		return
 	}
+	writeRF3DiagnosticRecord(manifest, raw)
+}
+
+func emitRF3AuthorityStartupEvidence(
+	manifest rf3Manifest,
+	serial *atomic.Uint64,
+	evidence []raftmember.ReadAuthorityEvidence,
+	expected []raftmember.GroupKey,
+) {
+	if len(evidence) == 0 {
+		return
+	}
+	record := struct {
+		UTC                    string                        `json:"utc"`
+		Event                  string                        `json:"event"`
+		Serial                 uint64                        `json:"serial"`
+		PID                    int                           `json:"pid"`
+		Groups                 int                           `json:"groups"`
+		ReadAuthorityAvailable bool                          `json:"read_authority_evidence_available"`
+		ReadAuthority          []rf3DiagnosticAuthorityGroup `json:"read_authority_startup_evidence"`
+	}{
+		UTC: time.Now().UTC().Format(time.RFC3339Nano), Event: "read_authority_startup",
+		PID: os.Getpid(), Groups: len(evidence),
+		ReadAuthorityAvailable: rf3DiagnosticAuthorityEvidenceCovers(evidence, rf3DiagnosticAuthorityExpectedKeys(expected)),
+		ReadAuthority:          make([]rf3DiagnosticAuthorityGroup, 0, len(evidence)),
+	}
+	if serial != nil {
+		record.Serial = serial.Add(1)
+	}
+	for _, group := range evidence {
+		record.ReadAuthority = append(record.ReadAuthority, rf3DiagnosticAuthorityGroupEvidence(group))
+	}
+	raw, err := json.Marshal(record)
+	if err != nil {
+		return
+	}
+	writeRF3DiagnosticRecord(manifest, raw)
+}
+
+func writeRF3DiagnosticRecord(manifest rf3Manifest, raw []byte) {
 	fmt.Fprintf(os.Stderr, "VIBEDB_RF3_DIAGNOSTIC %s\n", raw)
 	if manifest.NodeLog != nil {
 		// Replace through a same-directory temporary so readers never observe a

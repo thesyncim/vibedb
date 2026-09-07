@@ -298,6 +298,10 @@ type authorityRoundMetricsRuntime interface {
 	ReadAuthorityRoundMetrics() raftmember.ReadAuthorityRoundMetrics
 }
 
+type authorityEvidenceRuntime interface {
+	ReadAuthorityEvidence() raftmember.ReadAuthorityEvidence
+}
+
 func raftauthorityGroup(group raftmember.GroupKey) raftauthority.GroupIdentity {
 	return raftauthority.GroupIdentity{
 		ClusterID: group.ClusterID, ClusterIncarnation: group.ClusterIncarnation,
@@ -1067,6 +1071,26 @@ func (host *Host) ReadAuthorityRoundMetrics() raftmember.ReadAuthorityRoundMetri
 		}
 	}
 	return total
+}
+
+// ReadAuthorityEvidence returns one detached per-group authority record in
+// this Host's deterministic insertion order. The caller must already hold the
+// lane owner; ExecutionLanes provides that serialization for concurrent
+// diagnostic snapshots.
+func (host *Host) ReadAuthorityEvidence() []raftmember.ReadAuthorityEvidence {
+	if host == nil || len(host.order) == 0 {
+		return nil
+	}
+	result := make([]raftmember.ReadAuthorityEvidence, 0, len(host.order))
+	for _, group := range host.order {
+		if group == nil || group.runtime == nil {
+			continue
+		}
+		if runtime, ok := group.runtime.(authorityEvidenceRuntime); ok {
+			result = append(result, runtime.ReadAuthorityEvidence())
+		}
+	}
+	return result
 }
 
 // ReadAuthorityToken returns the current holder capability from the exact
