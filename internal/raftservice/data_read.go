@@ -54,16 +54,17 @@ type LinearizablePointReadRequest struct {
 // authority. It owns no durable snapshot. The cut is single-consumer and must
 // be closed after the point result has been copied into the SQL source.
 type LinearizablePointReadCut struct {
-	source         ReadSource
-	fence          ServingFence
-	minimumApplied uint64
-	state          ServingState
-	generation     *ownerGeneration
-	owner          *Owner
-	request        LinearizablePointReadRequest
-	authorityToken raftauthority.AuthorityToken
-	authorityFast  bool
-	released       atomic.Bool
+	source          ReadSource
+	fence           ServingFence
+	minimumApplied  uint64
+	state           ServingState
+	generation      *ownerGeneration
+	owner           *Owner
+	request         LinearizablePointReadRequest
+	authorityToken  raftauthority.AuthorityToken
+	authorityFast   bool
+	authorityPermit *servingFencePermit
+	released        atomic.Bool
 }
 
 // Source exposes the authenticated point source only while the cut is open.
@@ -145,7 +146,7 @@ func (cut *LinearizablePointReadCut) PointReadInto(
 		}
 		if cut.authorityFast {
 			if validationErr := cut.owner.validateReadAuthority(
-				ctx, cut.request.Fence, cut.generation, cut.authorityToken,
+				ctx, cut.request.Fence, cut.generation, cut.authorityPermit, cut.authorityToken,
 			); validationErr != nil {
 				retry := attempt == 0 && readAuthorityFallback(validationErr)
 				cut.owner.recordAuthorityValidation(cut.request.Fence.Group, validationErr, retry)
@@ -193,6 +194,7 @@ func (cut *LinearizablePointReadCut) Close() error {
 	cut.request = LinearizablePointReadRequest{}
 	cut.authorityToken = raftauthority.AuthorityToken{}
 	cut.authorityFast = false
+	cut.authorityPermit = nil
 	if generation != nil {
 		generation.release()
 	}
@@ -361,6 +363,7 @@ func (owner *Owner) readLinearizablePointInto(
 	dst.request = request
 	dst.authorityToken = reply.read.authorityToken
 	dst.authorityFast = reply.read.authorityFast
+	dst.authorityPermit = reply.read.authorityPermit
 	dst.released.Store(false)
 	admitted = true
 	return nil

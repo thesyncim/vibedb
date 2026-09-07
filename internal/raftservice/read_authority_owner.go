@@ -28,6 +28,18 @@ type readAuthorityEnsureHost interface {
 	EnsureReadAuthorityRound(raftmember.GroupKey) error
 }
 
+// concurrentReadAuthorityHost is an optional capability implemented only by
+// a production execution lane. It attempts the same exact token validation
+// while holding that lane's owner lock. A false attempted result means the
+// lane was busy; the caller must then use the ordinary serialized Owner
+// validation with the unchanged token rather than retrying or falling back to
+// ReadIndex merely because the lock was contended.
+type concurrentReadAuthorityHost interface {
+	TryValidateReadAuthorityToken(
+		raftmember.GroupKey, uint64, uint64, uint64, raftauthority.AuthorityToken,
+	) (attempted bool, err error)
+}
+
 // tryReadAuthority captures the token and commit floor in the same serialized
 // owner turn. Failure to obtain a usable token is an expected availability
 // result: ensure one bounded round and let the caller use ReadIndex.
@@ -64,13 +76,18 @@ func (owner *Owner) tryReadAuthority(
 	if !member.generation.acquire() {
 		return readAuthorization{}, true, ErrServingFence, true
 	}
+	permit := owner.ensureServingFencePermit(serving)
+	if permit == nil {
+		member.generation.release()
+		return readAuthorization{}, true, ErrServingFence, true
+	}
 	if status.Commit > minimumApplied {
 		minimumApplied = status.Commit
 	}
 	return readAuthorization{
 		source: member.read, minimumApplied: minimumApplied,
 		generation: member.generation, authorityToken: token,
-		authorityFast: true, state: serving,
+		authorityFast: true, authorityPermit: permit, state: serving,
 	}, true, nil, true
 }
 
@@ -82,7 +99,7 @@ func (owner *Owner) tryReadAuthority(
 // caller-visible.
 func (owner *Owner) validateReadAuthority(
 	ctx context.Context, fence ServingFence, generation *ownerGeneration,
-	token raftauthority.AuthorityToken,
+	permit *servingFencePermit, token raftauthority.AuthorityToken,
 ) error {
 	if owner == nil || ctx == nil || generation == nil {
 		return ErrInvalidOwner
@@ -90,10 +107,33 @@ func (owner *Owner) validateReadAuthority(
 	if cause := context.Cause(ctx); cause != nil {
 		return cause
 	}
+	if !permit.valid(fence, generation) {
+		return ErrServingFence
+	}
+	if concurrent, ok := owner.host.(concurrentReadAuthorityHost); ok {
+		attempted, err := concurrent.TryValidateReadAuthorityToken(
+			fence.Group, fence.MemberID, fence.NodeIncarnation, fence.Term, token,
+		)
+		if attempted {
+			if !permit.valid(fence, generation) {
+				return ErrServingFence
+			}
+			if cause := context.Cause(ctx); cause != nil {
+				return cause
+			}
+			return err
+		}
+		if err != nil {
+			return err
+		}
+		// A busy lane is not a failed authority observation. Fall through to
+		// the exact same-token Owner request, which preserves normal queue
+		// ordering and lets the lane make progress before it retries.
+	}
 	request := ownerRequest{
 		kind: requestReadAuthorityValidate, group: fence.Group, fence: fence,
 		reply: make(chan ownerReply, 1), authorityToken: token,
-		authorityGeneration: generation,
+		authorityGeneration: generation, authorityPermit: permit,
 	}
 	_, err := owner.enqueue(ctx, request)
 	return err

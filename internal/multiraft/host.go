@@ -1138,6 +1138,48 @@ func (host *Host) ValidateReadAuthorityToken(
 	return provider.ValidateReadAuthorityToken(token)
 }
 
+// tryValidateReadAuthorityToken is called only while an ExecutionLane owns
+// its Host lock. Host itself deliberately does not expose this concurrent
+// capability: plain Host callers retain the ordinary queued Owner path.
+// Validate the local serving identity and leader term under the same lock as
+// the Runtime token check so a read cannot cross a role or incarnation edge.
+func (host *Host) tryValidateReadAuthorityToken(
+	key raftmember.GroupKey,
+	memberID, nodeIncarnation, term uint64,
+	token raftauthority.AuthorityToken,
+) error {
+	group, err := host.lookup(key)
+	if err != nil {
+		return err
+	}
+	if group.memberID != memberID || group.runtime == nil {
+		return raftmodel.ErrNotLeader
+	}
+	identity := group.sourceOwner
+	if identity.Group != key || identity.MemberID != memberID ||
+		identity.NodeIncarnation != nodeIncarnation {
+		return raftmodel.ErrNotLeader
+	}
+	status, err := group.runtime.Status()
+	if err != nil {
+		return err
+	}
+	if status.MemberID != memberID || status.LeaderID != memberID || status.Term != term {
+		return raftmodel.ErrNotLeader
+	}
+	if token.Group != raftauthorityGroup(key) || token.Term != term ||
+		token.Holder != memberID || token.HolderIncarnation != nodeIncarnation {
+		return raftauthority.ErrObservationStale
+	}
+	provider, ok := group.runtime.(interface {
+		ValidateReadAuthorityToken(raftauthority.AuthorityToken) error
+	})
+	if !ok {
+		return raftauthority.ErrPolicyDisabled
+	}
+	return provider.ValidateReadAuthorityToken(token)
+}
+
 // ProposeControl synchronously admits one bounded, caller-authorized control
 // command to the local core. Unlike EnqueueProposal, success means admission
 // has occurred, so a caller can suppress in-flight retries without retaining
