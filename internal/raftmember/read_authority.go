@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"sync/atomic"
 	"time"
 
@@ -243,8 +244,61 @@ func (runtime *Runtime) ConfigureReadAuthority(options ReadAuthorityOptions) err
 		runtime.authority.disabled = false
 		return nil
 	}
-	if err := runtime.node.CheckElectionGateActivation(); err != nil {
+	return runtime.installReadAuthority(options, false)
+}
+
+// RestoreReadAuthority reinstalls an already qualified authority policy during
+// startup when the durable publication has moved to a different, stable voter
+// set. Fresh ConfigureReadAuthority remains exact-roster-only; this narrow
+// restore path preserves the original PromiseBook and quarantine while making
+// the changed configuration fail closed for every authority round. Ordinary
+// Raft input remains available after quarantine expires.
+//
+// The caller must have authenticated and resynced the exact pre-existing
+// durable policy marker before calling RestoreReadAuthority. Runtime therefore
+// does not inspect marker files here and never treats a newly-created marker as
+// permission to restore an authority policy.
+func (runtime *Runtime) RestoreReadAuthority(options ReadAuthorityOptions) error {
+	if err := runtime.checkUsable(); err != nil {
 		return err
+	}
+	if !options.Policy.Enabled {
+		return ErrAuthorityConfigurationMismatch
+	}
+	if options.Clock == nil {
+		return raftauthority.ErrClockUnavailable
+	}
+	if err := options.Policy.Validate(); err != nil {
+		return err
+	}
+	if runtime.authority != nil {
+		return ErrAuthorityReconfiguration
+	}
+	publication := runtime.node.Published()
+	confState := publication.ConfState
+	if publication.ReplicaSetVersion == 0 || confState == nil ||
+		len(confState.GetVoters()) == 0 || len(confState.GetVotersOutgoing()) != 0 ||
+		len(confState.GetLearnersNext()) != 0 || confState.GetAutoLeave() {
+		return ErrAuthorityConfigurationMismatch
+	}
+	// A restore is meaningful only for a changed stable membership cut. Keep
+	// the fresh exact-roster path and its stricter deployment contract intact.
+	if slices.Equal(confState.GetVoters(), options.Policy.Voters) ||
+		!slices.Contains(options.Policy.Voters, runtime.identity.MemberID) {
+		return ErrAuthorityConfigurationMismatch
+	}
+	return runtime.installReadAuthority(options, true)
+}
+
+func (runtime *Runtime) installReadAuthority(options ReadAuthorityOptions, pristine bool) error {
+	var gateErr error
+	if pristine {
+		gateErr = runtime.node.CheckElectionGatePristineActivation()
+	} else {
+		gateErr = runtime.node.CheckElectionGateActivation()
+	}
+	if gateErr != nil {
+		return gateErr
 	}
 	book, err := raftauthority.NewPromiseBook(
 		options.Clock, authorityGroupKey(runtime.identity.Group), runtime.identity.MemberID,

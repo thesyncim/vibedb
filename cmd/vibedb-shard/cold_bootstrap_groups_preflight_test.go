@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/raftmember"
@@ -75,5 +76,44 @@ func TestColdTargetBootstrapGroupManifestPreflight(t *testing.T) {
 	combined, err := combineColdRF3MemberManifests(members)
 	if err != nil || len(combined.Groups) != 2 {
 		t.Fatalf("shipped cold member composition: %v", err)
+	}
+}
+
+func TestColdTargetReadAuthorityPreflightRejectsPolicyOrMarker(t *testing.T) {
+	root := t.TempDir()
+	member := rf3Manifest{Route: rf3ManifestGroupRoute{MemberRoot: root}}
+	if err := validateColdRF3ReadAuthority(member); err != nil {
+		t.Fatalf("cold target without authority marker rejected: %v", err)
+	}
+	member.ReadAuthority = &rf3ManifestReadAuthority{}
+	if err := validateColdRF3ReadAuthority(member); err == nil {
+		t.Fatal("cold target accepted an enabled read-authority section")
+	}
+	member.ReadAuthority = nil
+	state := rf3ReadAuthorityState{
+		Enabled: true, FeatureVersion: rf3ReadAuthorityFeatureVersion,
+		PolicyVersion: 1, PolicyDigest: strings.Repeat("0", 64), Voters: []uint64{1, 2, 3},
+	}
+	if err := writeRF3ReadAuthorityState(rf3ReadAuthorityMarkerPath(root), state); err != nil {
+		t.Fatalf("write stale marker: %v", err)
+	}
+	if err := validateColdRF3ReadAuthority(member); err == nil {
+		t.Fatal("cold target accepted a pre-existing authority marker")
+	}
+}
+
+func TestCombineColdRF3MemberManifestsRejectsAuthorityErasure(t *testing.T) {
+	base := rf3Manifest{
+		Listeners:           rf3ManifestListeners{Peer: "peer", Native: "native"},
+		AuthorizationPolicy: "policy",
+		Groups:              []rf3ManifestGroup{{}},
+	}
+	withAuthority := base
+	withAuthority.ReadAuthority = &rf3ManifestReadAuthority{Enabled: true, FeatureVersion: 1, PolicyVersion: 1}
+	if _, err := combineColdRF3MemberManifests([]rf3Manifest{base, withAuthority}); err == nil {
+		t.Fatal("multi-group cold composition erased a later authority policy")
+	}
+	if _, err := combineColdRF3MemberManifests([]rf3Manifest{withAuthority, base}); err == nil {
+		t.Fatal("multi-group cold composition accepted a missing later authority policy")
 	}
 }
