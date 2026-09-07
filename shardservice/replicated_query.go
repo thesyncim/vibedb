@@ -66,6 +66,17 @@ func (server *ReplicatedServer) executeReplicatedQueryCall(
 	semantic *ShardRequest,
 	authorize raftservice.ProposalAuthorization,
 ) *ReplicatedResponse {
+	return server.executeReplicatedQueryCallValidated(ctx, request, state, semantic, authorize, false)
+}
+
+func (server *ReplicatedServer) executeReplicatedQueryCallValidated(
+	ctx context.Context,
+	request *ReplicatedRequest,
+	state raftservice.ServingState,
+	semantic *ShardRequest,
+	authorize raftservice.ProposalAuthorization,
+	semanticValidated bool,
+) *ReplicatedResponse {
 	wireState := replicatedWireState(state)
 	refuse := func(code ReplicatedRefusalCode) *ReplicatedResponse {
 		return &ReplicatedResponse{Kind: ReplicatedRefusal, Refusal: code, HasState: true, State: wireState}
@@ -80,8 +91,11 @@ func (server *ReplicatedServer) executeReplicatedQueryCall(
 		if err != nil {
 			return refuse(ReplicatedRefusalStaleFence)
 		}
-	} else if err = ValidateRequest(inner); err != nil {
-		return refuse(ReplicatedRefusalStaleFence)
+	} else if !semanticValidated {
+		err = ValidateRequest(inner)
+		if err != nil {
+			return refuse(ReplicatedRefusalStaleFence)
+		}
 	}
 	if inner.Authority != request.Authority ||
 		string(inner.Distribution) != state.Identity.Distribution || string(inner.Shard) != state.Identity.Shard ||

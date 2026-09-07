@@ -37,6 +37,10 @@ const (
 	// the client reject a hostile frame header before allocating its body.
 	replicatedResponseFixedBodyBytes     = 297
 	replicatedReadResponseFixedBodyBytes = replicatedResponseFixedBodyBytes + 12
+	// Small native requests are common on persistent authenticated streams.
+	// Coalesce only complete frames up to this bound; larger borrowed payloads
+	// retain the zero-copy scatter path.
+	replicatedBorrowedCoalesceBytes = 4 << 10
 )
 
 // Membership is fixed-width: the original 279-byte control body plus the
@@ -434,17 +438,20 @@ func ValidateReplicatedResponse(response *ReplicatedResponse) error {
 	return nil
 }
 
-// EncodeReplicatedRequestBorrowed emits the fixed request prefix and borrows
-// the immutable command or point key as a second buffer, avoiding a payload-sized
-// userspace copy on every retry. A TLS stream may encode the two writes as
-// separate record sequences; this function does not claim writev.
+// EncodeReplicatedRequestBorrowed emits a small complete frame from a fresh
+// arena in one Write. Larger requests borrow the immutable command or point
+// key as a second scatter buffer, avoiding a payload-sized userspace copy on
+// every retry. Persistent streams should use a FrameEncoder to reuse its
+// arena; this convenience function remains one-shot.
 func EncodeReplicatedRequestBorrowed(w io.Writer, request *ReplicatedRequest) error {
 	return (&FrameEncoder{}).EncodeReplicatedRequestBorrowed(w, request)
 }
 
 // EncodeReplicatedRequestBorrowed emits the fixed request prefix into the
-// encoder's owned arena and borrows the immutable payload as a second write
-// buffer, retaining the arena for the next call.
+// encoder's owned arena. Complete frames up to replicatedBorrowedCoalesceBytes
+// copy their payload into that arena for one Write; larger frames borrow the
+// immutable payload as a second write buffer, retaining only the cleared arena
+// for the next call.
 func (f *FrameEncoder) EncodeReplicatedRequestBorrowed(w io.Writer, request *ReplicatedRequest) error {
 	if w == nil || !validReplicatedRequest(request) {
 		return ErrReplicatedWire
@@ -454,7 +461,10 @@ func (f *FrameEncoder) EncodeReplicatedRequestBorrowed(w io.Writer, request *Rep
 		payloadHint = 65
 	}
 	e := newFrameEncoder(f.arena, payloadHint)
-	defer func() { f.arena = keepFrameArena(e.b) }()
+	defer func() {
+		clear(e.b)
+		f.arena = keepFrameArena(e.b)
+	}()
 	e.u8(replicatedWireVersion)
 	e.u8(uint8(request.Operation))
 	e.b = append(e.b, request.Authority.Node[:]...)
@@ -500,17 +510,26 @@ func (f *FrameEncoder) EncodeReplicatedRequestBorrowed(w io.Writer, request *Rep
 		encodeReplicatedExecutionPinRead(&e, request.ExecutionPinRead)
 		tag = tagReplicatedExecutionPinRead
 	}
-	if e.err != nil || len(e.b)+len(payload)-5 > maxFrameBody {
+	total := len(e.b) + len(payload)
+	if e.err != nil || total-5 > maxFrameBody {
 		return errFrameTooLarge
 	}
 	e.b[0] = tag
-	binary.BigEndian.PutUint32(e.b[1:5], uint32(len(e.b)+len(payload)-1))
+	binary.BigEndian.PutUint32(e.b[1:5], uint32(total-1))
+	if total <= replicatedBorrowedCoalesceBytes {
+		e.b = append(e.b, payload...)
+		written, err := w.Write(e.b)
+		if err == nil && written != len(e.b) {
+			return io.ErrShortWrite
+		}
+		return err
+	}
 	buffers := net.Buffers{e.b}
 	if len(payload) != 0 {
 		buffers = append(buffers, payload)
 	}
 	written, err := buffers.WriteTo(w)
-	if err == nil && written != int64(len(e.b)+len(payload)) {
+	if err == nil && written != int64(total) {
 		return io.ErrShortWrite
 	}
 	return err

@@ -48,7 +48,7 @@ func (client *AuthenticatedReplicatedClient) probeReplicatedBound(
 	if err != nil {
 		return nil, err
 	}
-	response, err := shardservice.RoundTripReplicated(ctx, connection.conn, &shardservice.ReplicatedRequest{
+	response, err := connection.encoder.RoundTripReplicated(ctx, connection.conn, &shardservice.ReplicatedRequest{
 		Operation: shardservice.ReplicatedProbe, Authority: authority, Capability: capability,
 		Fence: shardservice.ReplicatedFence{Group: route.Group, AllocationGeneration: route.AllocationGeneration},
 	})

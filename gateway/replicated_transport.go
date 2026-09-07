@@ -62,6 +62,7 @@ type AuthenticatedReplicatedClientOptions struct {
 
 type pooledReplicatedConn struct {
 	conn                         rafttransport.PeerConnection
+	encoder                      shardservice.FrameEncoder
 	endpoint                     replicatedTransportEndpoint
 	created                      time.Time
 	lastUsed                     time.Time
@@ -494,7 +495,7 @@ func (client *AuthenticatedReplicatedClient) DoReplicated(ctx context.Context, e
 	if err != nil {
 		return nil, err
 	}
-	response, err := shardservice.RoundTripReplicated(ctx, connection.conn, request)
+	response, err := connection.encoder.RoundTripReplicated(ctx, connection.conn, request)
 	identityMismatch := err == nil && response != nil && response.HasState &&
 		(response.State.Fence.MemberID != endpoint.Member || response.State.Fence.StoreID != endpoint.StoreID ||
 			response.State.Fence.NodeIncarnation != endpoint.NodeIncarnation)
