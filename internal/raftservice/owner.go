@@ -33,6 +33,10 @@ const (
 	proposalIngressBatchEntries = raftmodel.MaxProposalBatchEntries
 	// Bound protocol work before servicing already-admitted client work.
 	ownerProgressQuantum = 16
+	// Visit one retained transfer per Owner turn. A round-robin cursor keeps a
+	// large set of groups from turning every transfer retry into an unbounded
+	// metadata scan or starving reads, ticks, and peer traffic.
+	pendingTransferVisitQuantum = 1
 )
 
 var (
@@ -149,9 +153,24 @@ const (
 	proposalDeliveryReady
 )
 
+const (
+	transferDeliveryPending uint32 = iota
+	transferDeliveryCanceled
+	transferDeliveryDispatching
+	transferDeliveryCompleted
+)
+
 // proposalDelivery closes the cancellation race between a request goroutine
 // and the serialized Owner. Exactly one side wins waiter ownership.
 type proposalDelivery struct {
+	state atomic.Uint32
+}
+
+// transferDelivery is the owner/request side of one retained leader
+// transfer. Pending may be canceled before final admission; Dispatching is a
+// one-way handoff immediately before the synchronous Host call and therefore
+// never returns to Pending.
+type transferDelivery struct {
 	state atomic.Uint32
 }
 
@@ -165,6 +184,7 @@ type ownerRequest struct {
 	bytes               int64
 	async               bool
 	delivery            *proposalDelivery
+	transferDelivery    *transferDelivery
 	authorize           ProposalAuthorization
 	authorityToken      raftauthority.AuthorityToken
 	authorityGeneration *ownerGeneration
@@ -716,9 +736,10 @@ type Owner struct {
 	authority MembershipAuthority
 	metrics   *ProgressMetrics
 
-	ingress chan ownerRequest
-	ready   chan struct{}
-	done    chan struct{}
+	ingress        chan ownerRequest
+	ready          chan struct{}
+	done           chan struct{}
+	transferNotify chan struct{}
 
 	mu                    sync.Mutex
 	ingressItems          int
@@ -739,9 +760,18 @@ type Owner struct {
 	sharedBarrierWaiters  map[[16]byte][]*readDelivery
 	sharedReadWaiterCount int // includes abandoned deliveries until their barrier settles
 	inflightBarrier       map[raftmember.GroupKey]sharedReadBarrier
-	started               bool
-	closed                bool
-	failure               error
+	pendingTransfers      map[raftmember.GroupKey]*pendingLeaderTransfer
+	pendingTransferOrder  []raftmember.GroupKey
+	pendingTransferCursor int
+	// transferCancelWake is set by a caller that wins Pending->Canceled.
+	// The Owner consumes it and budgets a complete bounded pass over the
+	// retained collection. No caller-side bookkeeping mirrors Owner removal;
+	// a cancellation racing settlement can therefore only cause an extra pass.
+	transferCancelWake   atomic.Uint32
+	pendingTransferSweep int
+	started              bool
+	closed               bool
+	failure              error
 }
 
 // ownerHost is the complete narrow capability used by one serialized owner.
@@ -753,7 +783,10 @@ type ownerHost interface {
 	EnqueueTrackedProposal(raftmember.GroupKey, []byte, multiraft.ProposalToken) error
 	ProposeConfChange(raftmember.GroupKey, pb.ConfChangeI) error
 	ReadIndex(raftmember.GroupKey, []byte) error
-	TransferLeader(raftmember.GroupKey, uint64) error
+	PrepareLeaderTransfer(raftmember.GroupKey, uint64) (raftmember.LeaderTransferGuard, error)
+	CheckLeaderTransferReady(raftmember.GroupKey, raftmember.LeaderTransferGuard) error
+	TransferLeader(raftmember.GroupKey, raftmember.LeaderTransferGuard) error
+	CancelLeaderTransfer(raftmember.GroupKey, raftmember.LeaderTransferGuard) error
 	RequestTick(raftmember.GroupKey) error
 	RequestCampaign(raftmember.GroupKey) error
 	Publication(raftmember.GroupKey) (raftmodel.Publication, error)
@@ -808,6 +841,12 @@ type ownerMember struct {
 	retiring          bool
 	generation        *ownerGeneration
 	ownershipProposal *ownershipProposal
+}
+
+type pendingLeaderTransfer struct {
+	request  ownerRequest
+	guard    raftmember.LeaderTransferGuard
+	prepared bool
 }
 
 // One accepted ownership proposal per command fence and leadership term is
@@ -942,12 +981,14 @@ func newOwner(options Options, host ownerHost, allowEmpty bool) (*Owner, error) 
 	return &Owner{
 		registry: options.Registry, host: host, groups: groups, members: members,
 		outbound: options.Outbound, pulse: options.Pulse, limits: limits,
-		authority:    options.MembershipAuthority,
-		metrics:      options.ProgressMetrics,
-		ingress:      make(chan ownerRequest, limits.MaxIngressItems),
-		ready:        make(chan struct{}),
-		done:         make(chan struct{}),
-		pendingReads: make(map[[16]byte]*readDelivery, limits.MaxPendingReadItems),
+		authority:        options.MembershipAuthority,
+		metrics:          options.ProgressMetrics,
+		ingress:          make(chan ownerRequest, limits.MaxIngressItems),
+		ready:            make(chan struct{}),
+		done:             make(chan struct{}),
+		transferNotify:   make(chan struct{}, 1),
+		pendingReads:     make(map[[16]byte]*readDelivery, limits.MaxPendingReadItems),
+		pendingTransfers: make(map[raftmember.GroupKey]*pendingLeaderTransfer),
 	}, nil
 }
 
@@ -989,6 +1030,14 @@ func readIngressCandidate(request ownerRequest) bool {
 	default:
 		return false
 	}
+}
+
+func leaderTransferRequest(request ownerRequest) bool {
+	if request.kind == requestMembership {
+		return request.membership.Kind == MembershipTransferLeader
+	}
+	return request.kind == requestSplitSourceLeadership ||
+		request.kind == requestSchemaLeadershipTransfer
 }
 
 func (collector *proposalIngressCollector) accepts(request ownerRequest) bool {
@@ -1055,6 +1104,8 @@ func (collector *proposalIngressCollector) reset() {
 }
 
 var errOwnerReadDeferred = errors.New("raftservice: read deferred behind Ready")
+var errOwnerTransferDeferred = errors.New("raftservice: leader transfer retained before admission")
+var errOwnerTransferCanceled = errors.New("raftservice: leader transfer canceled before admission")
 
 // Run becomes the sole Host owner until ctx is canceled or a terminal lane
 // failure occurs. It may be called exactly once.
@@ -1068,6 +1119,9 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 		return ErrOwnerClosed
 	}
 	owner.started = true
+	if owner.transferNotify == nil {
+		owner.transferNotify = make(chan struct{}, 1)
+	}
 	close(owner.ready)
 	owner.mu.Unlock()
 	if err := owner.syncMembershipAuthorities(); err != nil {
@@ -1094,6 +1148,11 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 			// Ready boundary. Keep the exact request, delivery, and ingress charge
 			// alive; the event loop retries it after draining the Host.
 			return err
+		}
+		if errors.Is(err, errOwnerTransferDeferred) {
+			// The retained request, delivery, and ingress charge are owned by
+			// pendingTransfers until cancellation or the one-way dispatch CAS.
+			return nil
 		}
 		owner.release(request.bytes)
 		if request.async && err != nil {
@@ -1143,6 +1202,12 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 				}
 				return nil
 			}
+			if leaderTransferRequest(request) {
+				// Transfer preparation is retained in its own bounded collection.
+				// Holding it outside ingressBarrier keeps ticks and peer messages
+				// flowing while the election promise or Ready boundary drains.
+				return handleRequest(request)
+			}
 			if request.kind != requestProposal {
 				// Retain the first control request as an exact ordering barrier
 				// until Host has drained Ready;
@@ -1181,6 +1246,10 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 					if err := handleRequest(barrier); err != nil {
 						return err
 					}
+				} else if leaderTransferRequest(barrier) {
+					if err := handleRequest(barrier); err != nil {
+						return err
+					}
 				} else {
 					ingressBarrier, ingressBarrierPending = barrier, true
 				}
@@ -1206,6 +1275,7 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 		if collector.active() {
 			failCollected(errors.Join(ErrOwnerClosed, runErr))
 		}
+		owner.finishPendingLeaderTransfers(errors.Join(ErrOwnerClosed, runErr))
 		for _, request := range deferredReads.requests {
 			owner.settleReadDelivery(request.read.delivery,
 				ownerReply{err: errors.Join(ErrOwnerClosed, runErr)})
@@ -1227,6 +1297,9 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 	for {
 		if cause := context.Cause(ctx); cause != nil {
 			return owner.stop(cause)
+		}
+		if err := owner.advancePendingLeaderTransfers(); err != nil {
+			return owner.stop(err)
 		}
 		// A continuously runnable Host or outbound queue must not starve SQL
 		// admission, authority validation, deferred reads, ticks, or async
@@ -1378,6 +1451,17 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 		select {
 		case <-ctx.Done():
 			return owner.stop(context.Cause(ctx))
+		case <-owner.transferNotify:
+			// A retained transfer needs another bounded visit. Give any already
+			// queued ingress the same turn before returning to Host: the wake is
+			// advisory, and selecting it ahead of ingress must not turn the finite
+			// transfer sweep into an ingress starvation point.
+			readyBlocked = false
+			retryDeferredReads = true
+			if err := admitIngressTurn(); err != nil {
+				return owner.stop(err)
+			}
+			continue
 		case _, ok := <-asyncNotify:
 			if !ok {
 				asyncNotify = nil
@@ -1581,6 +1665,19 @@ func (owner *Owner) handle(request ownerRequest) error {
 			}
 		}
 	case requestMembership:
+		if request.membership.Kind == MembershipTransferLeader {
+			err := owner.beginLeaderTransfer(request)
+			if errors.Is(err, errOwnerTransferDeferred) {
+				return err
+			}
+			if err == nil {
+				// beginLeaderTransfer already replied to a request whose
+				// cancellation won before owner admission.
+				return nil
+			}
+			reply.err = err
+			break
+		}
 		reply.err = owner.applyMembership(request.membership)
 	case requestReplicaObservation:
 		if member, found := owner.members[request.group]; found {
@@ -1656,9 +1753,23 @@ func (owner *Owner) handle(request ownerRequest) error {
 	case requestOwnershipTransition:
 		reply.err = owner.applyOwnershipTransition(request.fence, request.data)
 	case requestSplitSourceLeadership:
-		reply.err = owner.transferSplitSourceLeadership(request.fence, request.targetMember)
+		err := owner.beginLeaderTransfer(request)
+		if errors.Is(err, errOwnerTransferDeferred) {
+			return err
+		}
+		if err == nil {
+			return nil
+		}
+		reply.err = err
 	case requestSchemaLeadershipTransfer:
-		reply.err = owner.transferSchemaLeadership(request.fence)
+		err := owner.beginLeaderTransfer(request)
+		if errors.Is(err, errOwnerTransferDeferred) {
+			return err
+		}
+		if err == nil {
+			return nil
+		}
+		reply.err = err
 	case requestFenceCommittedSchemaGeneration:
 		reply.err = owner.fenceCommittedSchemaGeneration(request)
 	case requestSchemaTransition:
@@ -2073,6 +2184,9 @@ func (owner *Owner) removeExecutionGroupNow(
 	if member.identity != expected {
 		return ErrServingFence
 	}
+	if pending := owner.pendingTransfers[group]; pending != nil {
+		return multiraft.ErrGroupBusy
+	}
 	if err := owner.host.Remove(group); err != nil {
 		return err
 	}
@@ -2428,6 +2542,9 @@ func (owner *Owner) retireReplica(request ownerRequest) error {
 	if status.LeaderID == request.sourceMember || status.Term != request.fence.Term {
 		return &NotLeaderError{Status: status}
 	}
+	if pending := owner.pendingTransfers[request.group]; pending != nil {
+		return multiraft.ErrGroupBusy
+	}
 	member.retiring = true
 	owner.members[request.group] = member
 	if err = owner.host.Remove(request.group); err != nil {
@@ -2488,35 +2605,46 @@ func commandMatchesFence(command replication.CommandView, fence ServingFence) bo
 		command.RouteGeneration == fence.Command.RouteGeneration
 }
 
-func (owner *Owner) applyMembership(request MembershipRequest) error {
+type membershipAdmission struct {
+	member    ownerMember
+	authority membershipgrant.Grant
+}
+
+// validateMembershipAdmission rereads the exact authorization, publication,
+// local leader status, and target progress cut used by a membership control.
+// It performs no Raft input. Transfer retries call it for the final metadata
+// admission after the local guard/readiness check, so a retained request cannot
+// outlive its serving or topology fence.
+func (owner *Owner) validateMembershipAdmission(
+	request MembershipRequest,
+) (membershipAdmission, error) {
 	member, found := owner.members[request.Fence.Group]
 	if !found || owner.authority == nil {
-		return ErrMembershipUnauthorized
+		return membershipAdmission{}, ErrMembershipUnauthorized
 	}
 	authority, authorityFound, err := owner.authority.CurrentTransitionGrant(request.Fence.Group)
 	if err != nil || !authorityFound {
-		return errors.Join(err, ErrMembershipUnauthorized)
+		return membershipAdmission{}, errors.Join(err, ErrMembershipUnauthorized)
 	}
 	if err := validateMembershipIdentity(request, authority); err != nil {
-		return err
+		return membershipAdmission{}, err
 	}
 	publication, err := owner.host.Publication(request.Fence.Group)
 	if err != nil {
-		return err
+		return membershipAdmission{}, err
 	}
 	member.command.ReplicaSetVersion = publication.ReplicaSetVersion
-	owner.members[request.Fence.Group] = member
 	if !servingFenceMatchesIdentity(request.Fence, member) ||
 		request.ExpectedReplicaSetVersion != publication.ReplicaSetVersion {
-		return ErrMembershipStale
+		return membershipAdmission{}, ErrMembershipStale
 	}
 	status, err := owner.host.Status(request.Fence.Group)
 	if err != nil {
-		return err
+		return membershipAdmission{}, err
 	}
 	if status.MemberID != member.identity.MemberID || status.LeaderID != member.identity.MemberID ||
 		status.Term != request.Fence.Term {
-		return &NotLeaderError{Status: status}
+		return membershipAdmission{}, &NotLeaderError{Status: status}
 	}
 	var progress raftmodel.MemberProgress
 	var progressFound bool
@@ -2524,13 +2652,44 @@ func (owner *Owner) applyMembership(request MembershipRequest) error {
 		request.Kind == MembershipRemoveVoter {
 		progress, progressFound, err = owner.host.Progress(request.Fence.Group, request.TargetMember)
 		if err != nil {
-			return err
+			return membershipAdmission{}, err
 		}
 	}
 	if err := validateMembershipTransition(request, authority, publication, status,
 		progress, progressFound); err != nil {
+		return membershipAdmission{}, err
+	}
+	return membershipAdmission{member: member, authority: authority}, nil
+}
+
+func (owner *Owner) prepareMembershipLeaderTransfer(
+	request MembershipRequest,
+) (raftmember.LeaderTransferGuard, error) {
+	if request.Kind != MembershipTransferLeader {
+		return raftmember.LeaderTransferGuard{}, ErrMembershipMalformed
+	}
+	if _, err := owner.validateMembershipAdmission(request); err != nil {
+		return raftmember.LeaderTransferGuard{}, err
+	}
+	return owner.host.PrepareLeaderTransfer(request.Fence.Group, request.TargetMember)
+}
+
+func (owner *Owner) applyMembership(request MembershipRequest) error {
+	admission, err := owner.validateMembershipAdmission(request)
+	if err != nil {
 		return err
 	}
+	if request.Kind == MembershipTransferLeader {
+		// Leader transfers are retained by handle in the bounded lifecycle
+		// collection. An unowned direct invocation must never recreate the old
+		// prepare/check/admit shortcut or mutate the owner membership cache.
+		return ErrInvalidOwner
+	}
+	// Publication metadata is the next serving fence after a successful
+	// serialized control read. Keep this existing owner cut in sync without
+	// making transfer target validation mutate authority state.
+	owner.members[request.Fence.Group] = admission.member
+	authority := admission.authority
 	authorizationDigest := authority.Digest()
 	context := append([]byte(nil), authorizationDigest[:]...)
 	switch request.Kind {
@@ -2542,8 +2701,6 @@ func (owner *Owner) applyMembership(request MembershipRequest) error {
 		return owner.host.ProposeConfChange(request.Fence.Group, &pb.ConfChange{
 			Type: pb.ConfChangeAddNode.Enum(), NodeId: &request.TargetMember, Context: context,
 		})
-	case MembershipTransferLeader:
-		return owner.host.TransferLeader(request.Fence.Group, request.TargetMember)
 	case MembershipRemoveVoter:
 		// The serialized owner is necessarily the live leader. Validation proves
 		// it is not the retiring source and that the replacement is a caught-up
@@ -2553,6 +2710,318 @@ func (owner *Owner) applyMembership(request MembershipRequest) error {
 		})
 	default:
 		return ErrMembershipMalformed
+	}
+}
+
+// beginLeaderTransfer gives every owner transfer source the same bounded
+// lifecycle. Authorization and target selection happen before Host preparation;
+// a transient settlement/Ready refusal retains the exact request without
+// mutating Runtime authority. A zero guard means preparation has not yet
+// crossed that Runtime fence and is retried by advancePendingLeaderTransfers.
+func (owner *Owner) beginLeaderTransfer(request ownerRequest) error {
+	if request.transferDelivery == nil {
+		return ErrInvalidOwner
+	}
+	if request.transferDelivery.state.Load() != transferDeliveryPending {
+		// The caller won the pre-admission cancellation CAS while this request
+		// was still in ingress. No Runtime mutation is allowed.
+		request.reply <- ownerReply{err: errors.Join(errOwnerTransferCanceled, context.Canceled)}
+		return nil
+	}
+	if owner.pendingTransfers == nil {
+		owner.pendingTransfers = make(map[raftmember.GroupKey]*pendingLeaderTransfer)
+	}
+	if pending, exists := owner.pendingTransfers[request.group]; exists {
+		if delivery := pending.request.transferDelivery; delivery == nil ||
+			delivery.state.Load() != transferDeliveryCanceled {
+			return raftmember.ErrLeaderTransferAlreadyPrepared
+		}
+		// A canceled caller may retry immediately after its CAS returns, before
+		// the Owner's coalesced wake gets a turn. Reap only that canceled entry
+		// here, preserving the exact successor guard and never releasing a
+		// successor's lifecycle state.
+		if pending.prepared {
+			cancelErr := owner.host.CancelLeaderTransfer(request.group, pending.guard)
+			if cancelErr != nil && !errors.Is(cancelErr, raftmember.ErrLeaderTransferGuard) {
+				owner.settlePendingLeaderTransfer(request.group, pending, cancelErr)
+				return cancelErr
+			}
+		}
+		owner.settlePendingLeaderTransfer(request.group, pending, context.Canceled)
+	}
+	if request.transferDelivery.state.Load() != transferDeliveryPending {
+		// Cancellation can race the cleanup above. Recheck before the first
+		// operation that may revoke Runtime authority for this request.
+		request.reply <- ownerReply{err: errors.Join(errOwnerTransferCanceled, context.Canceled)}
+		return nil
+	}
+	preparedRequest, guard, prepareErr := owner.prepareLeaderTransferRequest(request)
+	if prepareErr != nil {
+		if !leaderTransferRetryable(prepareErr) {
+			return prepareErr
+		}
+		// Keep any target selected by the initial serialized authorization cut
+		// with the retained request. In particular, schema leadership must not
+		// silently retarget on every transient readiness/settlement retry.
+		owner.retainPendingLeaderTransfer(request.group, &pendingLeaderTransfer{request: preparedRequest})
+		return errOwnerTransferDeferred
+	}
+	owner.retainPendingLeaderTransfer(request.group, &pendingLeaderTransfer{
+		request: preparedRequest, guard: guard, prepared: true,
+	})
+	return errOwnerTransferDeferred
+}
+
+func (owner *Owner) retainPendingLeaderTransfer(
+	key raftmember.GroupKey, pending *pendingLeaderTransfer,
+) {
+	owner.pendingTransfers[key] = pending
+	owner.pendingTransferOrder = append(owner.pendingTransferOrder, key)
+	if owner.pendingTransferSweep > 0 {
+		// The active cancellation sweep must also visit a request appended
+		// after its snapshot. One additional visit keeps the budget bounded by
+		// the live collection and preserves a full pass from the current cursor.
+		owner.pendingTransferSweep++
+	} else {
+		// A newly retained request starts a bounded pass from the current cursor
+		// even when the prior pass has completed. A one-visit budget could leave
+		// an older entry ahead of a newly appended request unvisited after a
+		// burst; the full live length preserves round-robin eventual service.
+		owner.pendingTransferSweep = len(owner.pendingTransferOrder)
+	}
+}
+
+func (owner *Owner) untrackPendingLeaderTransfer(key raftmember.GroupKey) {
+	for index, candidate := range owner.pendingTransferOrder {
+		if candidate != key {
+			continue
+		}
+		copy(owner.pendingTransferOrder[index:], owner.pendingTransferOrder[index+1:])
+		owner.pendingTransferOrder = owner.pendingTransferOrder[:len(owner.pendingTransferOrder)-1]
+		if index < owner.pendingTransferCursor {
+			owner.pendingTransferCursor--
+		}
+		if owner.pendingTransferCursor >= len(owner.pendingTransferOrder) {
+			owner.pendingTransferCursor = 0
+		}
+		if owner.pendingTransferSweep > len(owner.pendingTransferOrder) {
+			// A canceled predecessor can be reaped by beginLeaderTransfer,
+			// outside the normal sweep.  Clamp the remaining dirty pass to the
+			// live collection so removal plus a successor cannot accumulate
+			// duplicate work.
+			owner.pendingTransferSweep = len(owner.pendingTransferOrder)
+		}
+		return
+	}
+}
+
+func (owner *Owner) prepareLeaderTransferRequest(
+	request ownerRequest,
+) (ownerRequest, raftmember.LeaderTransferGuard, error) {
+	var (
+		guard raftmember.LeaderTransferGuard
+		err   error
+	)
+	switch request.kind {
+	case requestMembership:
+		guard, err = owner.prepareMembershipLeaderTransfer(request.membership)
+	case requestSplitSourceLeadership:
+		guard, err = owner.prepareLeaderTransferAdmission(request.fence, request.targetMember)
+	case requestSchemaLeadershipTransfer:
+		if request.targetMember == 0 {
+			request.targetMember, err = owner.schemaLeadershipTarget(request.fence)
+		}
+		if err == nil {
+			guard, err = owner.prepareLeaderTransferAdmission(request.fence, request.targetMember)
+		}
+	default:
+		err = ErrInvalidOwner
+	}
+	return request, guard, err
+}
+
+func leaderTransferRetryable(err error) bool {
+	return errors.Is(err, raftmodel.ErrReadyPending) ||
+		errors.Is(err, raftmember.ErrAuthorityElectionBlocked) ||
+		errors.Is(err, ErrMembershipNotCaughtUp) ||
+		errors.Is(err, raftmember.ErrResultSettlementPending)
+}
+
+func (owner *Owner) settlePendingLeaderTransfer(
+	key raftmember.GroupKey, pending *pendingLeaderTransfer, err error,
+) {
+	if pending == nil {
+		return
+	}
+	if delivery := pending.request.transferDelivery; delivery != nil &&
+		delivery.state.Load() == transferDeliveryCanceled &&
+		!errors.Is(err, errOwnerTransferCanceled) {
+		err = errors.Join(errOwnerTransferCanceled, err)
+	}
+	if pending.request.transferDelivery != nil {
+		pending.request.transferDelivery.state.Store(transferDeliveryCompleted)
+	}
+	if current, exists := owner.pendingTransfers[key]; exists && current == pending {
+		delete(owner.pendingTransfers, key)
+		owner.untrackPendingLeaderTransfer(key)
+	}
+	pending.request.reply <- ownerReply{err: err}
+	owner.release(pending.request.bytes)
+}
+
+// advancePendingLeaderTransfers services the separate bounded transfer
+// collection. It runs on every owner turn, so a multi-second authority or
+// Ready wait never occupies ingressBarrier and never prevents ticks, peer
+// traffic, or ReadIndex work. Only the final Pending->Dispatching CAS permits
+// the synchronous Host admission.
+func (owner *Owner) advancePendingLeaderTransfers() error {
+	if owner.transferCancelWake.Swap(0) != 0 {
+		// A dirty wake requests a complete pass over the collection as it
+		// exists now. Reset the remaining budget from the current cursor so a
+		// cancellation of an entry visited earlier in an older pass is revisited
+		// without accumulating unbounded work during a cancellation burst.
+		owner.pendingTransferSweep = len(owner.pendingTransferOrder)
+	}
+	if len(owner.pendingTransferOrder) == 0 {
+		owner.pendingTransferSweep = 0
+		return nil
+	}
+	for visits := 0; visits < pendingTransferVisitQuantum &&
+		len(owner.pendingTransferOrder) != 0; visits++ {
+		if owner.pendingTransferSweep > 0 {
+			owner.pendingTransferSweep--
+		}
+		if owner.pendingTransferCursor >= len(owner.pendingTransferOrder) {
+			owner.pendingTransferCursor = 0
+		}
+		key := owner.pendingTransferOrder[owner.pendingTransferCursor]
+		owner.pendingTransferCursor++
+		pending := owner.pendingTransfers[key]
+		if pending == nil {
+			delete(owner.pendingTransfers, key)
+			owner.untrackPendingLeaderTransfer(key)
+			continue
+		}
+		delivery := pending.request.transferDelivery
+		if delivery != nil && delivery.state.Load() == transferDeliveryCanceled {
+			if pending.prepared {
+				cancelErr := owner.host.CancelLeaderTransfer(key, pending.guard)
+				if cancelErr != nil && !errors.Is(cancelErr, raftmember.ErrLeaderTransferGuard) {
+					// A consumed guard cannot be canceled, but it should never be
+					// present in this branch because Dispatching is one-way. Preserve
+					// the exact cleanup error without touching a successor guard.
+					owner.settlePendingLeaderTransfer(key, pending, cancelErr)
+					continue
+				}
+			}
+			owner.settlePendingLeaderTransfer(key, pending, context.Canceled)
+			continue
+		}
+		if delivery != nil && delivery.state.Load() != transferDeliveryPending {
+			continue
+		}
+		if !pending.prepared {
+			preparedRequest, guard, prepareErr := owner.prepareLeaderTransferRequest(pending.request)
+			if prepareErr != nil {
+				if leaderTransferRetryable(prepareErr) {
+					continue
+				}
+				owner.settlePendingLeaderTransfer(key, pending, prepareErr)
+				continue
+			}
+			pending.request, pending.guard, pending.prepared = preparedRequest, guard, true
+		}
+		// Readiness is the cheap local gate and usually remains blocked while a
+		// Ready boundary or election promise drains. Avoid rereading durable
+		// authorization metadata on every blocked retry; once it succeeds, the
+		// metadata validation below is the final check immediately before CAS.
+		if err := owner.host.CheckLeaderTransferReady(key, pending.guard); err != nil {
+			if leaderTransferRetryable(err) {
+				continue
+			}
+			if pending.prepared {
+				_ = owner.host.CancelLeaderTransfer(key, pending.guard)
+			}
+			owner.settlePendingLeaderTransfer(key, pending, err)
+			continue
+		}
+		var validationErr error
+		switch pending.request.kind {
+		case requestMembership:
+			_, validationErr = owner.validateMembershipAdmission(pending.request.membership)
+		case requestSplitSourceLeadership:
+			validationErr = owner.validateLeaderTransferAdmission(
+				pending.request.fence, pending.request.targetMember,
+			)
+		case requestSchemaLeadershipTransfer:
+			validationErr = owner.validateLeaderTransferAdmission(
+				pending.request.fence, pending.request.targetMember,
+			)
+		default:
+			validationErr = ErrInvalidOwner
+		}
+		if validationErr != nil {
+			if leaderTransferRetryable(validationErr) {
+				continue
+			}
+			if pending.prepared {
+				_ = owner.host.CancelLeaderTransfer(key, pending.guard)
+			}
+			owner.settlePendingLeaderTransfer(key, pending, validationErr)
+			continue
+		}
+		if delivery != nil && !delivery.state.CompareAndSwap(
+			transferDeliveryPending, transferDeliveryDispatching,
+		) {
+			continue
+		}
+		err := owner.host.TransferLeader(key, pending.guard)
+		if err != nil {
+			_ = owner.host.CancelLeaderTransfer(key, pending.guard)
+		}
+		if delivery != nil {
+			delivery.state.Store(transferDeliveryCompleted)
+		}
+		owner.settlePendingLeaderTransfer(key, pending, err)
+	}
+	if owner.pendingTransferSweep > 0 || owner.transferCancelWake.Load() != 0 {
+		// Continue the finite admission or cancellation pass without making
+		// ordinary promise-blocked retries spin. A newly retained request and a
+		// caller that sets the dirty flag both carry only bounded work across
+		// Owner turns.
+		owner.notifyTransfer()
+	}
+	return nil
+}
+
+func (owner *Owner) finishPendingLeaderTransfers(cause error) {
+	for key, pending := range owner.pendingTransfers {
+		if pending == nil {
+			delete(owner.pendingTransfers, key)
+			owner.untrackPendingLeaderTransfer(key)
+			continue
+		}
+		wasCanceled := false
+		if delivery := pending.request.transferDelivery; delivery != nil {
+			state := delivery.state.Load()
+			wasCanceled = state == transferDeliveryCanceled
+			if pending.prepared && (state == transferDeliveryPending || state == transferDeliveryCanceled) && owner.host != nil {
+				_ = owner.host.CancelLeaderTransfer(key, pending.guard)
+			}
+			delivery.state.Store(transferDeliveryCompleted)
+		}
+		if current, exists := owner.pendingTransfers[key]; exists && current == pending {
+			delete(owner.pendingTransfers, key)
+			owner.untrackPendingLeaderTransfer(key)
+		}
+		if pending.request.reply != nil {
+			replyErr := cause
+			if wasCanceled {
+				replyErr = errors.Join(errOwnerTransferCanceled, cause)
+			}
+			pending.request.reply <- ownerReply{err: replyErr}
+		}
+		owner.release(pending.request.bytes)
 	}
 }
 
@@ -2650,6 +3119,10 @@ func (owner *Owner) stop(cause error) error {
 	if cause == nil {
 		cause = ErrOwnerClosed
 	}
+	// Resolve retained pre-admission transfers while the Host is still live so
+	// their exact guards can be canceled. A dispatched transfer is already
+	// synchronous and therefore cannot remain in this collection.
+	owner.finishPendingLeaderTransfers(errors.Join(ErrOwnerClosed, cause))
 	// Close is serialized with every earlier Host call. Its serving lifecycle
 	// callbacks resolve queued proposals and terminate admitted attempts that
 	// can no longer apply locally before Done becomes observable.
@@ -3217,6 +3690,16 @@ func (owner *Owner) release(bytes int64) {
 	owner.mu.Unlock()
 }
 
+func (owner *Owner) notifyTransfer() {
+	if owner == nil || owner.transferNotify == nil {
+		return
+	}
+	select {
+	case owner.transferNotify <- struct{}{}:
+	default:
+	}
+}
+
 func (owner *Owner) enqueue(ctx context.Context, request ownerRequest) (ownerReply, error) {
 	if ctx == nil {
 		return ownerReply{}, ErrInvalidOwner
@@ -3228,6 +3711,25 @@ func (owner *Owner) enqueue(ctx context.Context, request ownerRequest) (ownerRep
 		return ownerReply{}, err
 	}
 	if request.delivery == nil {
+		if request.transferDelivery != nil {
+			select {
+			case reply := <-request.reply:
+				return reply, reply.err
+			case <-ctx.Done():
+				if request.transferDelivery.state.CompareAndSwap(
+					transferDeliveryPending, transferDeliveryCanceled,
+				) {
+					owner.transferCancelWake.Store(1)
+					owner.notifyTransfer()
+					cause := context.Cause(ctx)
+					return ownerReply{}, errors.Join(errOwnerTransferCanceled, cause)
+				}
+				// Dispatching is one-way. The owner completes the synchronous
+				// Host admission before publishing this buffered result.
+				reply := <-request.reply
+				return reply, reply.err
+			}
+		}
 		select {
 		case reply := <-request.reply:
 			return reply, reply.err
@@ -3469,12 +3971,19 @@ func (owner *Owner) ApplyMembership(ctx context.Context, request MembershipReque
 	if cause := context.Cause(ctx); cause != nil {
 		return cause
 	}
+	var delivery *transferDelivery
+	if request.Kind == MembershipTransferLeader {
+		delivery = &transferDelivery{}
+	}
 	_, err := owner.enqueue(ctx, ownerRequest{
 		kind: requestMembership, group: request.Fence.Group,
-		membership: request, reply: make(chan ownerReply, 1),
+		membership: request, reply: make(chan ownerReply, 1), transferDelivery: delivery,
 	})
-	if err != nil && context.Cause(ctx) != nil {
+	if err != nil && context.Cause(ctx) != nil && !errors.Is(err, errOwnerTransferCanceled) {
 		return errors.Join(ErrOutcomeUnknown, err)
+	}
+	if errors.Is(err, errOwnerTransferCanceled) {
+		return context.Cause(ctx)
 	}
 	return err
 }

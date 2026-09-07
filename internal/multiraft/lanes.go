@@ -183,11 +183,37 @@ func (lane *ExecutionLane) ReadIndex(key raftmember.GroupKey, context []byte) er
 	}
 	return lane.set.ReadIndex(key, context)
 }
-func (lane *ExecutionLane) TransferLeader(key raftmember.GroupKey, transferee uint64) error {
+func (lane *ExecutionLane) PrepareLeaderTransfer(
+	key raftmember.GroupKey, transferee uint64,
+) (raftmember.LeaderTransferGuard, error) {
+	if err := lane.accepts(key); err != nil {
+		return raftmember.LeaderTransferGuard{}, err
+	}
+	return lane.set.PrepareLeaderTransfer(key, transferee)
+}
+func (lane *ExecutionLane) CheckLeaderTransferReady(
+	key raftmember.GroupKey, guard raftmember.LeaderTransferGuard,
+) error {
 	if err := lane.accepts(key); err != nil {
 		return err
 	}
-	return lane.set.TransferLeader(key, transferee)
+	return lane.set.CheckLeaderTransferReady(key, guard)
+}
+func (lane *ExecutionLane) TransferLeader(
+	key raftmember.GroupKey, guard raftmember.LeaderTransferGuard,
+) error {
+	if err := lane.accepts(key); err != nil {
+		return err
+	}
+	return lane.set.TransferLeader(key, guard)
+}
+func (lane *ExecutionLane) CancelLeaderTransfer(
+	key raftmember.GroupKey, guard raftmember.LeaderTransferGuard,
+) error {
+	if err := lane.accepts(key); err != nil {
+		return err
+	}
+	return lane.set.CancelLeaderTransfer(key, guard)
 }
 func (lane *ExecutionLane) RequestTick(key raftmember.GroupKey) error {
 	if err := lane.accepts(key); err != nil {
@@ -675,8 +701,33 @@ func (set *ExecutionLanes) ReadIndex(key raftmember.GroupKey, context []byte) er
 	return set.withGroup(key, func(host *Host) error { return host.ReadIndex(key, context) })
 }
 
-func (set *ExecutionLanes) TransferLeader(key raftmember.GroupKey, transferee uint64) error {
-	return set.withGroup(key, func(host *Host) error { return host.TransferLeader(key, transferee) })
+func (set *ExecutionLanes) PrepareLeaderTransfer(
+	key raftmember.GroupKey, transferee uint64,
+) (raftmember.LeaderTransferGuard, error) {
+	var guard raftmember.LeaderTransferGuard
+	err := set.withGroup(key, func(host *Host) error {
+		var err error
+		guard, err = host.PrepareLeaderTransfer(key, transferee)
+		return err
+	})
+	return guard, err
+}
+func (set *ExecutionLanes) CheckLeaderTransferReady(
+	key raftmember.GroupKey, guard raftmember.LeaderTransferGuard,
+) error {
+	return set.withGroup(key, func(host *Host) error {
+		return host.CheckLeaderTransferReady(key, guard)
+	})
+}
+func (set *ExecutionLanes) TransferLeader(
+	key raftmember.GroupKey, guard raftmember.LeaderTransferGuard,
+) error {
+	return set.withGroup(key, func(host *Host) error { return host.TransferLeader(key, guard) })
+}
+func (set *ExecutionLanes) CancelLeaderTransfer(
+	key raftmember.GroupKey, guard raftmember.LeaderTransferGuard,
+) error {
+	return set.withGroup(key, func(host *Host) error { return host.CancelLeaderTransfer(key, guard) })
 }
 
 func (set *ExecutionLanes) RequestTick(key raftmember.GroupKey) error {

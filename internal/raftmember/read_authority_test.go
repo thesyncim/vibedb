@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/internal/raftauthority"
+	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"go.etcd.io/raft/v3"
 	pb "go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
@@ -254,14 +255,123 @@ func TestRuntimeReadAuthorityLeaderPromiseAllowsTickButBlocksTransfer(t *testing
 		t.Fatalf("leader Tick while promise held = %v", err)
 	}
 	drainRuntime(t, runtime, nil)
-	if err := runtime.TransferLeader(fixture.peer); !errors.Is(err, ErrAuthorityElectionBlocked) {
-		t.Fatalf("leader TransferLeader while promise held = %v, want ErrAuthorityElectionBlocked", err)
+	guard, err := runtime.PrepareLeaderTransfer(fixture.peer)
+	if err != nil {
+		t.Fatalf("PrepareLeaderTransfer = %v", err)
+	}
+	if err := runtime.StartReadAuthorityRound(); !errors.Is(err, ErrAuthorityTransferPending) {
+		t.Fatalf("StartReadAuthorityRound while transfer drains = %v", err)
+	}
+	if err := runtime.CheckLeaderTransferReady(guard); !errors.Is(err, ErrAuthorityElectionBlocked) {
+		t.Fatalf("CheckLeaderTransferReady while promise held = %v, want ErrAuthorityElectionBlocked", err)
 	}
 	fixture.clock.now = until
-	if err := runtime.TransferLeader(fixture.peer); err != nil {
+	if err := runtime.CheckLeaderTransferReady(guard); err != nil {
+		t.Fatalf("CheckLeaderTransferReady at promise expiry = %v", err)
+	}
+	if err := runtime.TransferLeader(guard); err != nil {
 		t.Fatalf("leader TransferLeader at promise expiry = %v", err)
 	}
 	drainRuntime(t, runtime, nil)
+}
+
+func TestRuntimePreparedLeaderTransferRevokesAuthorityUntilAdmission(t *testing.T) {
+	fixture := newReadAuthorityLeaderFixture(t, 173)
+	runtime := fixture.fixture.runtime
+	oldToken := startReadAuthorityRoundWithQuorum(t, fixture)
+	fixture.clock.now = oldToken.ExpiresAt - time.Nanosecond
+	if err := runtime.EnsureReadAuthorityRound(); err != nil {
+		t.Fatalf("EnsureReadAuthorityRound renewal: %v", err)
+	}
+	if runtime.authority.renewal == nil {
+		t.Fatal("renewal was not retained before preparation")
+	}
+	if _, ok := runtime.DrainAuthorityOutbound(); !ok {
+		t.Fatal("renewal request was not queued")
+	}
+	promiseUntil, held, err := runtime.authority.promise.PromiseUntil()
+	if err != nil || !held {
+		t.Fatalf("promise before transfer = %v held=%t err=%v", promiseUntil, held, err)
+	}
+	beforeNonce := runtime.authority.nonce
+	guard, err := runtime.PrepareLeaderTransfer(fixture.peer)
+	if err != nil {
+		t.Fatalf("PrepareLeaderTransfer: %v", err)
+	}
+	if runtime.authority.round != nil || runtime.authority.renewal != nil || runtime.AuthorityOutboundPending() {
+		t.Fatal("preparation retained local authority state")
+	}
+	if runtime.authority.nonce != beforeNonce {
+		t.Fatalf("preparation changed authority nonce from %d to %d", beforeNonce, runtime.authority.nonce)
+	}
+	if got, gotHeld, err := runtime.authority.promise.PromiseUntil(); err != nil || !gotHeld || got != promiseUntil {
+		t.Fatalf("promise after preparation = %v held=%t err=%v, want %v", got, gotHeld, err, promiseUntil)
+	}
+	if _, err := runtime.ReadAuthorityToken(); !errors.Is(err, ErrAuthorityTransferPending) {
+		t.Fatalf("ReadAuthorityToken during preparation = %v", err)
+	}
+	if err := runtime.ValidateReadAuthorityToken(oldToken); !errors.Is(err, ErrAuthorityTransferPending) {
+		t.Fatalf("ValidateReadAuthorityToken during preparation = %v", err)
+	}
+	for attempt := 0; attempt < 8; attempt++ {
+		if err := runtime.EnsureReadAuthorityRound(); !errors.Is(err, ErrAuthorityTransferPending) {
+			t.Fatalf("EnsureReadAuthorityRound attempt %d = %v", attempt, err)
+		}
+	}
+	if err := runtime.CancelLeaderTransfer(guard); err != nil {
+		t.Fatalf("CancelLeaderTransfer: %v", err)
+	}
+}
+
+func TestRuntimeLeaderTransferGuardIsInstanceScoped(t *testing.T) {
+	first := newReadAuthorityLeaderFixture(t, 174)
+	second := newReadAuthorityLeaderFixture(t, 174)
+	firstGuard, err := first.fixture.runtime.PrepareLeaderTransfer(first.peer)
+	if err != nil {
+		t.Fatalf("first PrepareLeaderTransfer: %v", err)
+	}
+	secondGuard, err := second.fixture.runtime.PrepareLeaderTransfer(second.peer)
+	if err != nil {
+		t.Fatalf("second PrepareLeaderTransfer: %v", err)
+	}
+	if err := second.fixture.runtime.CancelLeaderTransfer(firstGuard); !errors.Is(err, ErrLeaderTransferGuard) {
+		t.Fatalf("foreign CancelLeaderTransfer = %v", err)
+	}
+	if err := second.fixture.runtime.CheckLeaderTransferReady(secondGuard); err != nil {
+		t.Fatalf("successor guard after foreign cancellation = %v", err)
+	}
+	if err := first.fixture.runtime.CancelLeaderTransfer(firstGuard); err != nil {
+		t.Fatalf("first CancelLeaderTransfer: %v", err)
+	}
+	if err := second.fixture.runtime.CancelLeaderTransfer(secondGuard); err != nil {
+		t.Fatalf("second CancelLeaderTransfer: %v", err)
+	}
+}
+
+func TestRuntimeInvalidLeaderTransferTargetLeavesAuthorityUntouched(t *testing.T) {
+	fixture := newReadAuthorityLeaderFixture(t, 175)
+	runtime := fixture.fixture.runtime
+	token := startReadAuthorityRoundWithQuorum(t, fixture)
+	promiseUntil, held, err := runtime.authority.promise.PromiseUntil()
+	if err != nil || !held {
+		t.Fatalf("promise before invalid target = %v held=%t err=%v", promiseUntil, held, err)
+	}
+	nonce := runtime.authority.nonce
+	for _, target := range []uint64{0, runtime.identity.MemberID, fixture.peer + 1} {
+		if _, err := runtime.PrepareLeaderTransfer(target); !errors.Is(err, raftmodel.ErrInvalidTransferee) {
+			t.Fatalf("PrepareLeaderTransfer(%d) = %v", target, err)
+		}
+		if err := runtime.ValidateReadAuthorityToken(token); err != nil {
+			t.Fatalf("token after invalid target %d: %v", target, err)
+		}
+	}
+	if runtime.authority.nonce != nonce || runtime.authority.round == nil || runtime.authority.renewal != nil {
+		t.Fatalf("authority changed after invalid targets: nonce=%d round=%v renewal=%v", runtime.authority.nonce, runtime.authority.round != nil, runtime.authority.renewal != nil)
+	}
+	got, gotHeld, err := runtime.authority.promise.PromiseUntil()
+	if err != nil || !gotHeld || got != promiseUntil {
+		t.Fatalf("promise after invalid target = %v held=%t err=%v, want %v", got, gotHeld, err, promiseUntil)
+	}
 }
 
 func TestRuntimeReadAuthorityClockFaultFailsClosedAfterGrant(t *testing.T) {

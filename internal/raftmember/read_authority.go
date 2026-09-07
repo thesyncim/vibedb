@@ -34,6 +34,11 @@ var (
 	// published stable voter set. A stale/shrunk policy can never form a
 	// self-only quorum after membership changes.
 	ErrAuthorityConfigurationMismatch = errors.New("raftmember: authority voter set differs from applied configuration")
+	// ErrAuthorityTransferPending reports that an explicit leader-transfer
+	// preparation currently owns the local authority optimization. ReadIndex
+	// remains available while the finite transfer guard drains readiness and
+	// election promises.
+	ErrAuthorityTransferPending = errors.New("raftmember: leader transfer is pending")
 )
 
 // ReadAuthorityOptions is the explicit per-member feature contract. An
@@ -283,12 +288,27 @@ func (runtime *Runtime) authorityVotersMatch(expected []uint64) bool {
 // request is retained in a bounded Runtime outbound list until Host transfers
 // ownership to the authenticated transport.
 func (runtime *Runtime) StartReadAuthorityRound() error {
-	if err := runtime.requireEmptyInputWindow(); err != nil {
-		return err
+	if runtime == nil {
+		return ErrRuntimeClosed
 	}
 	state := runtime.authority
 	if state == nil || state.disabled {
+		// Preserve the disabled-policy ordering: ordinary callers still observe
+		// the existing Ready/settlement error before the opt-in feature reports
+		// that it is disabled.
+		if err := runtime.requireEmptyInputWindow(); err != nil {
+			return err
+		}
 		return raftauthority.ErrPolicyDisabled
+	}
+	if err := runtime.checkUsable(); err != nil {
+		return err
+	}
+	if runtime.transferPending() {
+		return ErrAuthorityTransferPending
+	}
+	if err := runtime.requireEmptyInputWindow(); err != nil {
+		return err
 	}
 	status := runtime.node.Status()
 	if status.RaftState != raft.StateLeader || status.Lead != runtime.identity.MemberID {
@@ -392,12 +412,26 @@ func (runtime *Runtime) StartReadAuthorityRound() error {
 // most one newer candidate, so a slow or partitioned quorum cannot create an
 // unbounded stream of rounds.
 func (runtime *Runtime) EnsureReadAuthorityRound() error {
-	if err := runtime.requireEmptyInputWindow(); err != nil {
-		return err
+	if runtime == nil {
+		return ErrRuntimeClosed
 	}
 	state := runtime.authority
 	if state == nil || state.disabled {
+		// Keep the existing disabled-policy path unchanged while enabled
+		// transfers can be checked before any Ready-window retry.
+		if err := runtime.requireEmptyInputWindow(); err != nil {
+			return err
+		}
 		return raftauthority.ErrPolicyDisabled
+	}
+	if err := runtime.checkUsable(); err != nil {
+		return err
+	}
+	if runtime.transferPending() {
+		return ErrAuthorityTransferPending
+	}
+	if err := runtime.requireEmptyInputWindow(); err != nil {
+		return err
 	}
 	token, err := runtime.ReadAuthorityToken()
 	if err == nil {
@@ -462,6 +496,9 @@ func (runtime *Runtime) ReadAuthorityToken() (raftauthority.AuthorityToken, erro
 	if state == nil || state.disabled {
 		return raftauthority.AuthorityToken{}, raftauthority.ErrPolicyDisabled
 	}
+	if runtime.transferPending() {
+		return raftauthority.AuthorityToken{}, ErrAuthorityTransferPending
+	}
 	observation, err := runtime.ReadAuthorityObservation()
 	if err != nil {
 		return raftauthority.AuthorityToken{}, err
@@ -506,6 +543,9 @@ func (runtime *Runtime) ValidateReadAuthorityToken(token raftauthority.Authority
 	state := runtime.authority
 	if state == nil || state.disabled {
 		return raftauthority.ErrPolicyDisabled
+	}
+	if runtime.transferPending() {
+		return ErrAuthorityTransferPending
 	}
 	observation, err := runtime.ReadAuthorityObservation()
 	if err != nil {
@@ -647,6 +687,7 @@ func cloneAuthorityPolicy(policy raftauthority.ReadAuthorityPolicy) raftauthorit
 }
 
 func (runtime *Runtime) refreshAuthority() {
+	runtime.refreshLeaderTransfer()
 	state := runtime.authority
 	if state == nil || (state.round == nil && state.renewal == nil) {
 		return
@@ -672,6 +713,14 @@ func (runtime *Runtime) refreshAuthority() {
 		}
 		state.outbound = state.outbound[:0]
 	}
+}
+
+func (runtime *Runtime) transferPending() bool {
+	if runtime == nil {
+		return false
+	}
+	runtime.refreshLeaderTransfer()
+	return runtime.leaderTransfer != nil
 }
 
 // invalidateAuthority is called before topology-changing operations and after
