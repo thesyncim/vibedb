@@ -371,15 +371,28 @@ func waitRF3DiagnosticSerial(t *testing.T, path string, wanted uint64) {
 	t.Fatalf("diagnostic snapshot %q did not reach serial %d", path, wanted)
 }
 
-func appendRF3LiveNodeTestGroup(t *testing.T, input prepareRF3NodeManifest, current rf3Manifest) rf3Manifest {
+func appendRF3LiveNodeTestGroup(t *testing.T, input prepareRF3NodeManifest, current rf3Manifest, table ...string) rf3Manifest {
 	t.Helper()
 	member := input.Groups[0]
 	member.Root = filepath.Join(input.Root, "group-2")
 	member.Shard = "2"
+	if len(table) > 1 {
+		t.Fatal("at most one appended RF3 table name is supported")
+	}
+	if len(table) == 1 && table[0] != "" {
+		member.Table = table[0]
+		member.CreateTable = fmt.Sprintf("CREATE TABLE %s (PRIMARY KEY (id))", table[0])
+	}
 	id := rf3CommandStoreIdentity(member.MemberID)
 	id.GroupID[15] += 2
 	id.StoreID[15] += 2
 	member.GroupID, member.StoreID = idString(id.GroupID[:]), idString(id.StoreID[:])
+	member.Members = append([]prepareRF3Member(nil), member.Members...)
+	for ordinal := range member.Members {
+		memberIdentity := rf3CommandStoreIdentity(uint64(ordinal + 1))
+		memberIdentity.StoreID[15] += 2
+		member.Members[ordinal].StoreID = idString(memberIdentity.StoreID[:])
+	}
 	raw, err := vibejson.Marshal(&member)
 	if err != nil {
 		t.Fatal(err)

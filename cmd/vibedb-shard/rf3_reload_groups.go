@@ -23,8 +23,11 @@ func validateRF3GroupAppend(current, next rf3Manifest) error {
 	if len(old) == 0 || len(all) < len(old) || len(all) > maxRF3ManifestGroups || current.DevelopmentOnly || next.DevelopmentOnly {
 		return errInvalidRF3Manifest
 	}
-	if current.ReadAuthority != nil && len(all) > len(old) {
-		return fmt.Errorf("%w: read-authority groups require a restart before append", errInvalidRF3Manifest)
+	if !rf3ReadAuthorityManifestEqual(current.ReadAuthority, next.ReadAuthority) {
+		return fmt.Errorf("%w: reload changes read-authority policy", errInvalidRF3Manifest)
+	}
+	if err := validateRF3ReadAuthority(next.ReadAuthority, all, next.DevelopmentOnly); err != nil {
+		return err
 	}
 	if err := validateRF3GroupRosterUnion(all); err != nil {
 		return err
@@ -64,8 +67,11 @@ func validateRF3GroupTransition(current, next rf3Manifest) error {
 		current.DevelopmentOnly || next.DevelopmentOnly {
 		return errInvalidRF3Manifest
 	}
-	if current.ReadAuthority != nil && len(all) > len(old) {
-		return fmt.Errorf("%w: read-authority groups require a restart before append", errInvalidRF3Manifest)
+	if !rf3ReadAuthorityManifestEqual(current.ReadAuthority, next.ReadAuthority) {
+		return fmt.Errorf("%w: reload changes read-authority policy", errInvalidRF3Manifest)
+	}
+	if err := validateRF3ReadAuthority(next.ReadAuthority, all, next.DevelopmentOnly); err != nil {
+		return err
 	}
 	if err := validateRF3GroupRosterUnion(all); err != nil {
 		return err
@@ -190,9 +196,13 @@ func validateRF3ReloadTransportRoster(current, next rf3Manifest) error {
 }
 
 func reloadPreparedRF3Groups(ctx context.Context, current *rf3Manifest, profile *rafttransport.PeerTLS,
-	peer *raftservice.AuthenticatedExecutionPeerRuntime, inventory *rf3AdoptedGroupInventory, schemas *rf3SchemaActivator, nodeOwners ...*rf3NodeOwner,
+	peer *raftservice.AuthenticatedExecutionPeerRuntime, inventory *rf3AdoptedGroupInventory, schemas *rf3SchemaActivator,
+	readAuthorityCache *rf3ReadAuthorityIncarnationCache, nodeOwners ...*rf3NodeOwner,
 ) error {
 	if current == nil || current.reloadPath == "" || inventory == nil || schemas == nil {
+		return errInvalidRF3Manifest
+	}
+	if (current.ReadAuthority != nil) != (readAuthorityCache != nil) {
 		return errInvalidRF3Manifest
 	}
 	var nodeOwner *rf3NodeOwner
@@ -247,8 +257,23 @@ func reloadPreparedRF3Groups(ctx context.Context, current *rf3Manifest, profile 
 			if generation == nil || generation.identity.Group != bundle.Route.Group {
 				return errInvalidRF3Manifest
 			}
+			var registration rf3ReadAuthorityRegistration
+			if readAuthorityCache != nil {
+				var registered bool
+				registration, registered = readAuthorityCache.RegistrationFor(
+					generation.identity.Group, generation.identity.AllocationGeneration,
+				)
+				if !registered {
+					return errInvalidRF3Manifest
+				}
+			}
 			if err := peer.UnregisterExecutionGroup(generation.identity); err != nil {
 				return err
+			}
+			if readAuthorityCache != nil {
+				if err := readAuthorityCache.UnregisterGroups([]rf3ReadAuthorityRegistration{registration}); err != nil {
+					return err
+				}
 			}
 			schemas.mu.Lock()
 			delete(schemas.groups, bundle.Route.Group)
@@ -279,6 +304,14 @@ func reloadPreparedRF3Groups(ctx context.Context, current *rf3Manifest, profile 
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		if current.ReadAuthority == nil {
+			// A disabled process still honors every retained root's durable
+			// downgrade fence. Check the appended root before preparing or
+			// publishing its Runtime, matching the startup path's admission.
+			if err := ensureRF3ReadAuthorityDisabled(bundle.Route.MemberRoot); err != nil {
+				return err
+			}
+		}
 		set, err := prepareRF3GroupSetOnNode(next.withGroup(bundle), profile, sqldriver.ReplicatedOpenOptions{
 			WriterLockContext: ctx, WriterLockDeadline: time.Now().Add(rf3StartupWriterLockWait),
 		}, nodeOwner)
@@ -298,17 +331,36 @@ func reloadPreparedRF3Groups(ctx context.Context, current *rf3Manifest, profile 
 		}
 		identity := runtime.Identity()
 		command := commandFenceFromPublication(item.base.Binding.Authority, identity, item.publication.ReplicaSetVersion)
+		if err := ctx.Err(); err != nil {
+			return errors.Join(err, runtime.Close())
+		}
+		var registration rf3ReadAuthorityRegistration
+		if current.ReadAuthority != nil {
+			registration, err = configureRF3ReadAuthorityGroup(next, *item, runtime, readAuthorityCache)
+			if err != nil {
+				return errors.Join(err, runtime.Close())
+			}
+		}
+		closeRuntime := func(cause error) error {
+			if readAuthorityCache != nil && registration.generation != 0 {
+				cause = errors.Join(cause, readAuthorityCache.UnregisterGroups([]rf3ReadAuthorityRegistration{registration}))
+			}
+			return errors.Join(cause, runtime.Close())
+		}
+		if err := ctx.Err(); err != nil {
+			return closeRuntime(err)
+		}
 		inventory.mu.Lock()
 		if !inventory.nativeChildCapacity(identity) {
 			inventory.mu.Unlock()
-			return errors.Join(errRF3SplitChildRegistryBound, runtime.Close())
+			return closeRuntime(errRF3SplitChildRegistryBound)
 		}
 		err = peer.RegisterExecutionGroup(set.members, raftservice.ExecutionGroup{
 			Runtime: runtime, Identity: identity, Command: command, Read: item.apply, Recovery: item.apply,
 		})
 		if err != nil {
 			inventory.mu.Unlock()
-			return errors.Join(err, runtime.Close())
+			return closeRuntime(err)
 		}
 		// Recovery comes from the fsynced manifest, not a fabricated split
 		// receipt. Reuse the existing dynamic native-authority snapshot.

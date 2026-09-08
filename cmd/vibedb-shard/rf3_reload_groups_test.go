@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -119,6 +121,47 @@ func TestRF3ReloadOnlyAppendsIndependentPreparedGroups(t *testing.T) {
 		if err := validateRF3GroupAppend(next, bad); err == nil {
 			t.Fatal("reload accepted mutation/removal of retained configuration")
 		}
+	}
+}
+
+func TestRF3ReloadDefaultOffMarkerRejectedBeforePreparation(t *testing.T) {
+	root := t.TempDir()
+	currentRaw := []byte(strings.ReplaceAll(canonicalRF3Manifest, "/srv/vibedb", root))
+	current, err := parseRF3Manifest(currentRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nextRaw := []byte(strings.ReplaceAll(multiGroupRF3Manifest(t), "/srv/vibedb", root))
+	next, err := parseRF3Manifest(nextRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateRF3GroupTransition(current, next); err != nil {
+		t.Fatalf("valid append fixture rejected: %v", err)
+	}
+	reloadPath := filepath.Join(root, "serve-rf3.vibejson")
+	if err := os.WriteFile(reloadPath, nextRaw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	markerRoot := next.Groups[1].Route.MemberRoot
+	if err := os.MkdirAll(markerRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(rf3ReadAuthorityMarkerPath(markerRoot), []byte("retained"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	current.reloadPath = reloadPath
+	if err := reloadPreparedRF3Groups(
+		context.Background(), &current, nil, nil,
+		&rf3AdoptedGroupInventory{}, &rf3SchemaActivator{}, nil,
+	); !errors.Is(err, errRF3ReadAuthorityDowngrade) {
+		t.Fatalf("default-off appended marker error = %v, want downgrade", err)
+	}
+	if len(current.groupBundles()) != 1 {
+		t.Fatalf("rejected reload changed retained groups: %d", len(current.groupBundles()))
+	}
+	if _, err := os.Stat(next.Groups[1].SQL.Path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("rejected reload prepared appended SQL path: %v", err)
 	}
 }
 

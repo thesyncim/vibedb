@@ -1253,12 +1253,25 @@ func waitRF3CommandLeader(
 	profiles []*rafttransport.PeerTLS,
 	group raftmember.GroupKey,
 	allocation, generation uint64,
+	startupErrors ...<-chan error,
 ) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	var startupError <-chan error
+	if len(startupErrors) > 0 {
+		startupError = startupErrors[0]
+	}
 	var observed [rf3CommandMembers]string
 	for ctx.Err() == nil {
+		select {
+		case err := <-startupError:
+			if err == nil {
+				t.Fatal("RF3 server exited before leader election")
+			}
+			t.Fatalf("RF3 server failed before leader election: %v", err)
+		default:
+		}
 		leader := uint64(0)
 		consistent := true
 		for index := 0; index < rf3CommandMembers; index++ {

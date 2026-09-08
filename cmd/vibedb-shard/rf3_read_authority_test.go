@@ -153,12 +153,12 @@ func TestRF3ReadAuthorityIncarnationCacheIsMonotonicBoundedAndExpiring(t *testin
 		connections: make(map[rafttransport.NodeID]*rf3ReadAuthorityProbeConnection),
 		ttl:         time.Minute,
 	}
-	cache.Put(group, 2, 9)
-	cache.Put(group, 2, 8)
+	cache.putProbe(target, 9)
+	cache.putProbe(target, 8)
 	if incarnation, ok, err := cache.Lookup(group, 2); err != nil || !ok || incarnation != 9 {
 		t.Fatalf("lower incarnation replaced cache value: incarnation=%d ok=%v err=%v", incarnation, ok, err)
 	}
-	cache.Put(group, 2, 10)
+	cache.putProbe(target, 10)
 	if incarnation, ok, _ := cache.Lookup(group, 2); !ok || incarnation != 10 {
 		t.Fatalf("new incarnation not published: %d %v", incarnation, ok)
 	}
@@ -201,7 +201,7 @@ func TestRF3ReadAuthorityRefreshKeepsHealthyPeerProgress(t *testing.T) {
 			return false
 		}
 		goodProbes.Add(1)
-		cache.Put(target.key.group, target.key.member, 42)
+		cache.putProbe(target, 42)
 		return true
 	}
 	cache.refresh(context.Background())
@@ -238,7 +238,7 @@ func TestRF3ReadAuthorityRefreshSkipsPermanentlyRefusedGroup(t *testing.T) {
 			return rf3ReadAuthorityProbeGroupRefused
 		}
 		healthyProbes.Add(1)
-		cache.Put(target.key.group, target.key.member, 43)
+		cache.putProbe(target, 43)
 		return rf3ReadAuthorityProbeSuccess
 	}
 	cache.refresh(context.Background())
@@ -277,7 +277,7 @@ func TestRF3ReadAuthorityRefreshRotatesPastDeadlineLimitedPrefix(t *testing.T) {
 			return rf3ReadAuthorityProbeTransportFailure
 		}
 		healthyProbes.Add(1)
-		cache.Put(target.key.group, target.key.member, 44)
+		cache.putProbe(target, 44)
 		return rf3ReadAuthorityProbeSuccess
 	}
 	cache.refresh(context.Background())
