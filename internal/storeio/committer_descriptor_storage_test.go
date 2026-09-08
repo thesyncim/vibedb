@@ -350,7 +350,8 @@ func TestCommitterDescriptorStorageWriteTransactionDurabilityAndReuse(t *testing
 		t.Fatalf("sequential transactions touched %d slots, want 1", len(touched))
 	}
 	var pageCapacity, indexCapacity int
-	for index, batch := range committer.batches {
+	for index := range committer.batches {
+		batch := &committer.batches[index]
 		pageCapacity += cap(batch.pages)
 		indexCapacity += cap(batch.bufferIndexes)
 		if index == int(firstSlot) {
