@@ -473,6 +473,46 @@ type devHotReadAttempt struct {
 	Elapsed time.Duration
 }
 
+const (
+	devHotReadAttemptRecordLimit = 8
+	devHotReadDiagnosticBudget   = time.Second
+	devHotDiagnosticTextLimit    = 512
+	devHotDiagnosticTailLimit    = 4096
+)
+
+type devHotReadAttempts struct {
+	first   []devHotReadAttempt
+	last    []devHotReadAttempt
+	total   uint64
+	omitted uint64
+}
+
+func (attempts *devHotReadAttempts) add(attempt devHotReadAttempt) {
+	if attempts == nil {
+		return
+	}
+	attempt.Code = devHotDiagnosticText(attempt.Code)
+	attempts.total++
+	if len(attempts.first) < devHotReadAttemptRecordLimit {
+		attempts.first = append(attempts.first, attempt)
+		return
+	}
+	if len(attempts.last) < devHotReadAttemptRecordLimit {
+		attempts.last = append(attempts.last, attempt)
+		return
+	}
+	copy(attempts.last, attempts.last[1:])
+	attempts.last[len(attempts.last)-1] = attempt
+	attempts.omitted++
+}
+
+func devHotDiagnosticText(text string) string {
+	if len(text) <= devHotDiagnosticTextLimit {
+		return text
+	}
+	return text[:devHotDiagnosticTextLimit-3] + "..."
+}
+
 type devHotReadDiagnostic struct {
 	profile   *rafttransport.PeerTLS
 	source    gateway.ReplicatedRoute
@@ -481,20 +521,18 @@ type devHotReadDiagnostic struct {
 	process   *rf3testfixture.ExternalProcess
 }
 
-const devHotReadDiagnosticBudget = time.Second
-
 func (diagnostic *devHotReadDiagnostic) capture(
 	t *testing.T,
 	client *hotMutationWireClient,
 	readOrdinal uint64,
-	started time.Time,
-	attempts []devHotReadAttempt,
+	elapsed time.Duration,
+	attempts devHotReadAttempts,
 	failure string,
 ) {
 	t.Helper()
 	if diagnostic == nil {
 		t.Logf("custom read failure: ordinal=%d elapsed=%s failure=%s diagnostic=unknown",
-			readOrdinal, time.Since(started), failure)
+			readOrdinal, elapsed, devHotDiagnosticText(failure))
 		return
 	}
 	probeCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), devHotReadDiagnosticBudget)
@@ -504,7 +542,7 @@ func (diagnostic *devHotReadDiagnostic) capture(
 	if diagnostic.authority != nil {
 		current, err := diagnostic.authority.Read(probeCtx)
 		if err != nil {
-			currentGeneration = fmt.Sprintf("unknown(err=%v)", err)
+			currentGeneration = fmt.Sprintf("unknown(err=%s)", devHotDiagnosticText(err.Error()))
 		} else if current == nil {
 			currentGeneration = "unknown(nil_catalog)"
 		} else {
@@ -525,34 +563,56 @@ func (diagnostic *devHotReadDiagnostic) capture(
 	if diagnostic.authority != nil {
 		ids, err := diagnostic.authority.ReadOperationIDs(probeCtx)
 		if err != nil {
-			operationEvidence = fmt.Sprintf("unknown(read_ids=%v)", err)
+			operationEvidence = fmt.Sprintf("unknown(read_ids=%s)", devHotDiagnosticText(err.Error()))
 		} else {
-			operationEvidence = "none"
+			evidence := make([]string, 0, 16)
+			evidenceOmitted := 0
+			addEvidence := func(entry string) {
+				entry = devHotDiagnosticText(entry)
+				if len(evidence) < 16 {
+					evidence = append(evidence, entry)
+				} else {
+					evidenceOmitted++
+				}
+			}
 			for _, id := range ids {
 				record, readErr := diagnostic.authority.ReadOperation(probeCtx, id)
 				if errors.Is(readErr, gateway.ErrReplicatedOperationMissing) {
 					continue
 				}
 				if readErr != nil {
-					operationEvidence = fmt.Sprintf("unknown(read_operation=%v)", readErr)
+					addEvidence(fmt.Sprintf("id=%x read_error=%s", id, devHotDiagnosticText(readErr.Error())))
 					continue
 				}
 				if record.Kind != gateway.ReplicatedOperationSplit {
 					continue
 				}
+				summary := fmt.Sprintf("id=%x kind=%d state=%d revision=%d catalog_generation=%d cursor=%v",
+					id, record.Kind, record.State, record.Revision, record.CatalogGeneration, record.Cursor)
 				if currentCatalog != nil {
 					plan, openErr := splitcontroller.OpenPlanIntent(record.Intent, currentCatalog)
-					if openErr == nil {
+					if openErr != nil {
+						addEvidence(fmt.Sprintf("%s open_error=%s", summary, devHotDiagnosticText(openErr.Error())))
+					} else {
 						distributionName, shard, allocation := plan.SourceAllocation()
 						if distributionName == diagnostic.source.Distribution &&
 							shard == diagnostic.source.Shard &&
 							uint64(allocation) == diagnostic.source.AllocationGeneration {
-							matchingSplits = append(matchingSplits, fmt.Sprintf(
-								"id=%x kind=%d state=%d revision=%d catalog_generation=%d cursor=%v",
-								id, record.Kind, record.State, record.Revision, record.CatalogGeneration, record.Cursor))
+							matching := summary + " match=true"
+							addEvidence(matching)
+							matchingSplits = append(matchingSplits, devHotDiagnosticText(matching))
+						} else {
+							addEvidence(summary + " match=false")
 						}
 					}
+				} else {
+					addEvidence(summary + " open=unknown(no_catalog)")
 				}
+			}
+			if len(evidence) == 0 {
+				operationEvidence = "none"
+			} else {
+				operationEvidence = fmt.Sprintf("records=%v omitted=%d", evidence, evidenceOmitted)
 			}
 		}
 	}
@@ -560,13 +620,17 @@ func (diagnostic *devHotReadDiagnostic) capture(
 	processTail := "unknown(process_unavailable)"
 	if diagnostic.process != nil {
 		processTail = diagnostic.process.Diagnostics()
-		if len(processTail) > 4096 {
-			processTail = processTail[len(processTail)-4096:]
+		if len(processTail) > devHotDiagnosticTailLimit {
+			processTail = processTail[len(processTail)-devHotDiagnosticTailLimit:]
 		}
 	}
 	group := diagnostic.source.Group
-	t.Logf("custom read failure: ordinal=%d elapsed=%s failure=%s attempts=%v total_requests=%d total_bytes=%d source_group={cluster_id=%x cluster_incarnation=%x topology_recovery_epoch=%d shard_incarnation=%x group_id=%x} source_route=%s/%s allocation=%d source_catalog_generation=%s current_catalog_generation=%s operation_evidence=%s matching_split=%v source_member_states=%v process_tail=%q",
-		readOrdinal, time.Since(started), failure, attempts, client.requests, client.bytes,
+	totalRequests, totalBytes := uint64(0), uint64(0)
+	if client != nil {
+		totalRequests, totalBytes = client.requests, client.bytes
+	}
+	t.Logf("custom read failure: ordinal=%d elapsed=%s failure=%s attempts=%+v total_requests=%d total_bytes=%d source_group={cluster_id=%x cluster_incarnation=%x topology_recovery_epoch=%d shard_incarnation=%x group_id=%x} source_route=%s/%s allocation=%d source_catalog_generation=%s current_catalog_generation=%s operation_evidence=%s matching_split=%v source_member_states=%v process_tail=%q",
+		readOrdinal, elapsed, devHotDiagnosticText(failure), attempts, totalRequests, totalBytes,
 		group.ClusterID, group.ClusterIncarnation, group.TopologyRecoveryEpoch, group.ShardIncarnation, group.GroupID,
 		diagnostic.source.Distribution, diagnostic.source.Shard, diagnostic.source.AllocationGeneration,
 		sourceCatalogGeneration, currentGeneration, operationEvidence, matchingSplits, memberStates, processTail)
@@ -583,33 +647,39 @@ func devHotProbeSourceMembers(
 	client, err := gateway.NewAuthenticatedReplicatedClient(gateway.AuthenticatedReplicatedClientOptions{
 		TLS: profile, Dial: func(ctx context.Context, address string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "tcp", address)
-		}, HandshakeDeadline: func() time.Time { return time.Now().Add(2 * time.Second) },
+		}, HandshakeDeadline: func() time.Time {
+			deadline := time.Now().Add(2 * time.Second)
+			if diagnosticDeadline, ok := ctx.Deadline(); ok && diagnosticDeadline.Before(deadline) {
+				return diagnosticDeadline
+			}
+			return deadline
+		},
 		MaxConnections: 4, MaxPerEndpoint: 2, MaxIdlePerEndpoint: 1, MaxHandshakes: 2,
 		MaxWaiters: 8, MaxIdleAge: time.Minute, MaxLifetime: time.Minute,
 	})
 	if err != nil {
-		return []string{fmt.Sprintf("unknown(client=%v)", err)}
+		return []string{devHotDiagnosticText(fmt.Sprintf("unknown(client=%s)", err.Error()))}
 	}
 	defer client.Close()
 	identity := serviceauthz.Authority{Node: profile.LocalIdentity().Node,
 		Generation: route.Command.ActivePolicyGeneration}
 	probeCtx, err := serviceauthz.WithAuthority(ctx, identity)
 	if err != nil {
-		return []string{fmt.Sprintf("unknown(authority=%v)", err)}
+		return []string{devHotDiagnosticText(fmt.Sprintf("unknown(authority=%s)", err.Error()))}
 	}
 	states := make([]string, 0, len(route.Replicas))
 	for _, endpoint := range route.Replicas {
 		response, probeErr := client.ProbeReplicated(probeCtx, route, endpoint, serviceauthz.CapabilityDataRead)
 		if probeErr != nil {
-			states = append(states, fmt.Sprintf("member=%d node=%x error=%v", endpoint.Member, endpoint.Node, probeErr))
+			states = append(states, devHotDiagnosticText(fmt.Sprintf("member=%d node=%x error=%s", endpoint.Member, endpoint.Node, probeErr.Error())))
 			continue
 		}
 		if response == nil {
 			states = append(states, fmt.Sprintf("member=%d node=%x unknown(nil_response)", endpoint.Member, endpoint.Node))
 			continue
 		}
-		states = append(states, fmt.Sprintf("member=%d node=%x kind=%d refusal=%d has_state=%t state=%+v",
-			endpoint.Member, endpoint.Node, response.Kind, response.Refusal, response.HasState, response.State))
+		states = append(states, devHotDiagnosticText(fmt.Sprintf("member=%d node=%x kind=%d refusal=%d has_state=%t state=%+v",
+			endpoint.Member, endpoint.Node, response.Kind, response.Refusal, response.HasState, response.State)))
 	}
 	return states
 }
@@ -621,22 +691,58 @@ func devHotReadDocuments(
 	keys []string,
 	readOrdinal uint64,
 	diagnostic *devHotReadDiagnostic,
-) time.Duration {
+) (elapsed time.Duration) {
 	t.Helper()
 	started := time.Now()
 	deadline := started.Add(durableRF3ExternalForegroundObjective + durableRF3ExternalForegroundGrace)
-	attempts := make([]devHotReadAttempt, 0, 8)
+	attempts := devHotReadAttempts{}
+	completed := false
+	failure := ""
+	var frozenElapsed time.Duration
+	var elapsedFrozen bool
+	markFailure := func(reason string) {
+		failure = devHotDiagnosticText(reason)
+		if !elapsedFrozen {
+			frozenElapsed = time.Since(started)
+			elapsedFrozen = true
+		}
+	}
+	defer func() {
+		if completed {
+			return
+		}
+		if !elapsedFrozen {
+			frozenElapsed = time.Since(started)
+		}
+		if failure == "" {
+			failure = "fatal_without_classification"
+		}
+		diagnostic.capture(t, client, readOrdinal, frozenElapsed, attempts, failure)
+	}()
 	for attempt := 1; ; attempt++ {
+		attemptStarted := time.Now()
 		if cause := context.Cause(t.Context()); cause != nil {
-			diagnostic.capture(t, client, readOrdinal, started, attempts, fmt.Sprintf("canceled=%v", cause))
+			attempts.add(devHotReadAttempt{Number: attempt, Code: "context_canceled", Elapsed: time.Since(attemptStarted)})
+			markFailure(fmt.Sprintf("canceled=%v", cause))
 			t.Fatalf("development native SQL read canceled after %d attempts: %v", attempt-1, cause)
 		}
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			diagnostic.capture(t, client, readOrdinal, started, attempts, "absolute_deadline_exhausted")
+			attempts.add(devHotReadAttempt{Number: attempt, Code: "absolute_deadline", Elapsed: time.Since(attemptStarted)})
+			markFailure("absolute_deadline_exhausted")
 			t.Fatalf("development native SQL read did not settle within %s after %d attempts", deadline.Sub(started), attempt-1)
 		}
-		response, _ := client.roundTripUntil(t, request, deadline)
+		response, latency, roundTripErr := client.roundTripUntilObserved(t, request, deadline)
+		if roundTripErr != nil {
+			code := "transport_error"
+			var networkErr net.Error
+			if errors.As(roundTripErr, &networkErr) && networkErr.Timeout() {
+				code = "transport_timeout"
+			}
+			attempts.add(devHotReadAttempt{Number: attempt, Code: code, Elapsed: latency})
+			markFailure(fmt.Sprintf("%s=%v", code, roundTripErr))
+			t.Fatalf("development native SQL read transport failure after %d attempts: %v", attempt, roundTripErr)
+		}
 		var envelope struct {
 			OK        *bool  `json:"ok"`
 			Found     []bool `json:"found"`
@@ -648,9 +754,12 @@ func devHotReadDocuments(
 			Retryable *bool  `json:"retryable"`
 		}
 		if err := json.Unmarshal(response, &envelope); err != nil || envelope.OK == nil {
-			attempts = append(attempts, devHotReadAttempt{Number: attempt, Code: "malformed", Elapsed: time.Since(started)})
-			diagnostic.capture(t, client, readOrdinal, started, attempts,
-				fmt.Sprintf("malformed_response=%v", err))
+			attempts.add(devHotReadAttempt{Number: attempt, Code: "malformed", Elapsed: latency})
+			if err != nil {
+				markFailure(fmt.Sprintf("malformed_response=%v", err))
+			} else {
+				markFailure("malformed_response=missing_ok")
+			}
 			t.Fatalf("development native SQL read response=%s err=%v", response, err)
 		}
 		if !*envelope.OK {
@@ -658,15 +767,14 @@ func devHotReadDocuments(
 			if code == "" {
 				code = "missing_code"
 			}
-			attempts = append(attempts, devHotReadAttempt{Number: attempt, Code: code, Elapsed: time.Since(started)})
+			attempts.add(devHotReadAttempt{Number: attempt, Code: code, Elapsed: latency})
 			if !durableRF3ExternalRetryableResponse(response) {
-				diagnostic.capture(t, client, readOrdinal, started, attempts,
-					fmt.Sprintf("nonretryable_response=%s retryable=%v", code, envelope.Retryable))
+				markFailure(fmt.Sprintf("nonretryable_response=%s retryable=%v", code, envelope.Retryable))
 				t.Fatalf("development native SQL read response=%s", response)
 			}
 			remaining = time.Until(deadline)
 			if remaining <= 0 {
-				diagnostic.capture(t, client, readOrdinal, started, attempts, "retry_deadline_exhausted")
+				markFailure("retry_deadline_exhausted")
 				t.Fatalf("development native SQL read retry deadline exhausted after %d attempts", attempt)
 			}
 			backoff := min(durableRF3ExternalRetryBackoff, remaining)
@@ -679,34 +787,37 @@ func devHotReadDocuments(
 					default:
 					}
 				}
-				diagnostic.capture(t, client, readOrdinal, started, attempts,
-					fmt.Sprintf("canceled=%v", context.Cause(t.Context())))
+				markFailure(fmt.Sprintf("canceled=%v", context.Cause(t.Context())))
 				t.Fatalf("development native SQL read canceled after %d attempts: %v", attempt, context.Cause(t.Context()))
 			case <-timer.C:
 			}
 			continue
 		}
 		if len(envelope.Found) != len(keys) || len(envelope.Documents) != len(keys) {
-			diagnostic.capture(t, client, readOrdinal, started, attempts, "successful_response_shape_mismatch")
+			attempts.add(devHotReadAttempt{Number: attempt, Code: "shape_mismatch", Elapsed: latency})
+			markFailure("successful_response_shape_mismatch")
 			t.Fatalf("development native SQL read response=%s", response)
 		}
 		for index, key := range keys {
 			if !envelope.Found[index] || envelope.Documents[index].ID != key || envelope.Documents[index].Value != uint64(index+1) {
-				diagnostic.capture(t, client, readOrdinal, started, attempts,
-					fmt.Sprintf("successful_row_mismatch index=%d key=%q", index, key))
+				attempts.add(devHotReadAttempt{Number: attempt, Code: "row_mismatch", Elapsed: latency})
+				markFailure(fmt.Sprintf("successful_row_mismatch index=%d key=%q", index, key))
 				t.Fatalf("development native SQL read position=%d key=%q found=%t document=%+v",
 					index, key, envelope.Found[index], envelope.Documents[index])
 			}
 		}
+		attempts.add(devHotReadAttempt{Number: attempt, Code: "ok", Elapsed: latency})
 		if cause := context.Cause(t.Context()); cause != nil {
-			diagnostic.capture(t, client, readOrdinal, started, attempts, fmt.Sprintf("canceled=%v", cause))
+			markFailure(fmt.Sprintf("canceled=%v", cause))
 			t.Fatalf("development native SQL read canceled after %d attempts: %v", attempt, cause)
 		}
 		if remaining := time.Until(deadline); remaining <= 0 {
-			diagnostic.capture(t, client, readOrdinal, started, attempts, "successful_response_after_deadline")
+			markFailure("successful_response_after_deadline")
 			t.Fatalf("development native SQL read exceeded its %s deadline after %d attempts", deadline.Sub(started), attempt)
 		}
-		return time.Since(started)
+		elapsed = time.Since(started)
+		completed = true
+		return elapsed
 	}
 }
 
