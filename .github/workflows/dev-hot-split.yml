@@ -39,3 +39,22 @@ jobs:
           if grep -q -- "^--- SKIP: ${test_name}" "$output"; then
             exit 1
           fi
+      - name: Require three unskipped custom-table split and restart qualifications
+        env:
+          VIBEDB_DEV_HOT_SPLIT_CUSTOM_TABLE_E2E: "1"
+        shell: bash
+        run: |
+          set -euo pipefail
+          output="$(mktemp)"
+          trap 'rm -f "$output"' EXIT
+          test_name='TestGatewayCustomTableDevPressureCompletesReplicatedSplitAndRestart'
+          test_list="$(go test -list "^${test_name}$" ./internal/gatewayruntime)"
+          grep -Fqx "${test_name}" <<<"${test_list}"
+          go test ./internal/gatewayruntime \
+            -run "^${test_name}$" \
+            -count=3 -timeout=15m -v | tee "$output"
+          count="$(grep -c -- "^--- PASS: ${test_name}" "$output")"
+          test "$count" -eq 3
+          if grep -q -- "^--- SKIP: ${test_name}" "$output"; then
+            exit 1
+          fi
