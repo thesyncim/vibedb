@@ -18,6 +18,7 @@ import (
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/orderedkey"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replication"
@@ -779,6 +780,13 @@ func rf3ReadAuthoritySQLRequest(
 		!bytes.Equal(decoded.PrimaryKeyRead.Keys[0], primaryKeyRead.Keys[0]) {
 		t.Fatalf("live authority SQL point metadata changed across wire round trip: got=%+v want=%+v", decoded.PrimaryKeyRead, primaryKeyRead)
 	}
+	component, payload, next, err := orderedkey.DecodeComponent(nil, decoded.PrimaryKeyRead.Keys[0], 0)
+	if err != nil || component.Kind != orderedkey.KindString || component.Descending ||
+		component.PayloadStart != 0 || component.PayloadEnd != len(payload) ||
+		next != len(decoded.PrimaryKeyRead.Keys[0]) ||
+		!bytes.Equal(payload[component.PayloadStart:component.PayloadEnd], []byte("authority-live-append")) {
+		t.Fatalf("live authority SQL key is not one ascending string component: component=%+v payload=%q next=%d err=%v", component, payload, next, err)
+	}
 	return &shardservice.ReplicatedRequest{
 		Operation:     shardservice.ReplicatedQueryLeader,
 		Authority:     authority,
@@ -816,14 +824,19 @@ func rf3ReadAuthorityPrimaryKeyRead(
 	}
 	if relation == nil || relation.Relation == 0 ||
 		identity.UserPrimaryKey == "" || relation.Limits.MaxDocumentBytes <= 0 ||
-		relation.Limits.MaxDocumentBytes > replication.MaxMutationValueBytes {
+		relation.Limits.MaxDocumentBytes > replication.MaxMutationValueBytes ||
+		relation.Limits.MaxKeyBytes <= 0 {
 		t.Fatalf("live authority SQL identity has no valid docs_live base relation: user=%+v relations=%+v", identity, identity.Relations)
+	}
+	key, ok := orderedkey.AppendString(nil, []byte("authority-live-append"), orderedkey.Ascending)
+	if !ok || len(key) > relation.Limits.MaxKeyBytes {
+		t.Fatalf("live authority SQL key does not fit prepared MaxKeyBytes=%d: encoded=%d", relation.Limits.MaxKeyBytes, len(key))
 	}
 	return shardservice.PrimaryKeyReadRequest{
 		Relation:         replication.RelationID(relation.Relation),
 		MaxDocumentBytes: uint32(relation.Limits.MaxDocumentBytes),
 		PrimaryPath:      []byte(identity.UserPrimaryKey),
-		Keys:             [][]byte{[]byte("authority-live-append")},
+		Keys:             [][]byte{key},
 	}
 }
 
