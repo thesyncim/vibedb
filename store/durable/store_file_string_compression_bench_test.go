@@ -464,6 +464,7 @@ func BenchmarkStringCompressionBatchInsert(b *testing.B) {
 					b.Fatal(err)
 				}
 			}
+			b.StartTimer()
 			if err := collection.Flush(); err != nil {
 				b.Fatal(err)
 			}
@@ -506,6 +507,7 @@ func BenchmarkStringCompressionExistingValueUpdate(b *testing.B) {
 					b.Fatal(err)
 				}
 			}
+			b.StartTimer()
 			if err := collection.Flush(); err != nil {
 				b.Fatal(err)
 			}

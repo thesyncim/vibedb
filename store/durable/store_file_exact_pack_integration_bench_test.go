@@ -3,9 +3,11 @@ package durable
 import (
 	"bytes"
 	"fmt"
+	"os"
 	"path/filepath"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store"
@@ -116,6 +118,21 @@ func exactPackMutationDocument(
 	return document
 }
 
+func exactPackMutationVariants(
+	tb testing.TB, rows, cardinality int, shared []string, kind string,
+) [2][][]byte {
+	tb.Helper()
+	variants := [2][][]byte{make([][]byte, rows), make([][]byte, rows)}
+	for row := range rows {
+		variants[0][row] = exactPackMutationDocument(tb, row, cardinality, shared, kind, 0)
+		variants[1][row] = exactPackMutationDocument(tb, row, cardinality, shared, kind, 1)
+		if bytes.Equal(variants[0][row], variants[1][row]) {
+			tb.Fatalf("%s row %d mutation variants are identical", kind, row)
+		}
+	}
+	return variants
+}
+
 func TestExactPackIntegrationMutationCorrectness(t *testing.T) {
 	const rows = 1_024
 	for _, cardinality := range []int{8, 1024} {
@@ -167,20 +184,25 @@ func BenchmarkExactPackExistingUpdate(b *testing.B) {
 					keyBytes[i] = []byte(keys[i])
 				}
 				shared := exactOverlapSharedValues(cardinality, 256)
+				variants := exactPackMutationVariants(
+					b, exactOverlapBenchRows, cardinality, shared, kind,
+				)
+				versions := make([]uint8, exactOverlapBenchRows)
 				base := collection.Stats()
 				updated := 0
+				lastRow, lastVersion := 0, uint8(0)
 				b.ResetTimer()
 				for generation := 0; b.Loop(); generation++ {
 					start := generation * exactPackIntegrationBatch
 					if err := collection.Update(func(batch *WriteBatch) error {
 						for offset := range exactPackIntegrationBatch {
 							row := (start + offset*8191) % exactOverlapBenchRows
-							document := exactPackMutationDocument(
-								b, row, cardinality, shared, kind, generation,
-							)
+							versions[row] ^= 1
+							document := variants[versions[row]][row]
 							if err := batch.Put(keyBytes[row], document); err != nil {
 								return err
 							}
+							lastRow, lastVersion = row, versions[row]
 						}
 						return nil
 					}); err != nil {
@@ -188,18 +210,22 @@ func BenchmarkExactPackExistingUpdate(b *testing.B) {
 					}
 					updated += exactPackIntegrationBatch
 				}
+				b.StartTimer()
+				flushStart := time.Now()
 				if err := collection.Flush(); err != nil {
 					b.Fatal(err)
 				}
+				flushElapsed := time.Since(flushStart)
 				b.StopTimer()
 				after := collection.Stats()
 				b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(updated), "e2e-ns/doc")
 				b.ReportMetric(float64(after.DeviceBytes-base.DeviceBytes)/float64(updated), "devB/doc")
+				b.ReportMetric(float64(flushElapsed.Nanoseconds()), "flush-ns")
 
 				// Verify the final acknowledged generation independently through a
 				// full document read and both exact indexes.
-				probeRow := ((b.N-1)*exactPackIntegrationBatch + 8191) % exactOverlapBenchRows
-				want := exactPackMutationDocument(b, probeRow, cardinality, shared, kind, b.N-1)
+				probeRow := lastRow
+				want := variants[lastVersion][probeRow]
 				got, found, err := collection.AppendRaw(nil, keyBytes[probeRow])
 				if err != nil || !found || !bytes.Equal(got, want) {
 					b.Fatalf("acknowledged row=%d found=%v err=%v", probeRow, found, err)
@@ -228,5 +254,92 @@ func BenchmarkExactPackExistingUpdate(b *testing.B) {
 				}
 			})
 		}
+	}
+}
+
+func BenchmarkExactPackBatchInsert(b *testing.B) {
+	for _, cardinality := range []int{8, 1024} {
+		b.Run(fmt.Sprintf("long/card=%d", cardinality), func(b *testing.B) {
+			indexes := exactPackIntegrationIndexes()
+			seedKeys, seedDocuments := exactOverlapCorpus(b, 1, cardinality, 256)
+			path := filepath.Join(b.TempDir(), "exact-pack-insert.vibe")
+			exactOverlapBuild(b, path, seedKeys, seedDocuments, indexes)
+			collection, file := exactOverlapOpen(b, path, indexes)
+			defer func() { _ = collection.Close(); _ = file.Close() }()
+			total := b.N * exactPackIntegrationBatch
+			keys, documents := exactOverlapCorpus(b, total+1, cardinality, 256)
+			keyBytes := make([][]byte, total)
+			for i := range total {
+				keyBytes[i] = []byte(keys[i+1])
+			}
+			base := collection.Stats()
+			b.ResetTimer()
+			for iteration := 0; iteration < b.N; iteration++ {
+				start := iteration * exactPackIntegrationBatch
+				if err := collection.Update(func(batch *WriteBatch) error {
+					for offset := range exactPackIntegrationBatch {
+						at := start + offset
+						if err := batch.Put(keyBytes[at], documents[at+1]); err != nil {
+							return err
+						}
+					}
+					return nil
+				}); err != nil {
+					b.Fatal(err)
+				}
+			}
+			flushStart := time.Now()
+			if err := collection.Flush(); err != nil {
+				b.Fatal(err)
+			}
+			flushElapsed := time.Since(flushStart)
+			b.StopTimer()
+			after := collection.Stats()
+			b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(total), "e2e-ns/doc")
+			b.ReportMetric(float64(after.DeviceBytes-base.DeviceBytes)/float64(total), "devB/doc")
+			b.ReportMetric(float64(flushElapsed.Nanoseconds()), "flush-ns")
+			got, found, err := collection.AppendRaw(nil, keyBytes[total-1])
+			if err != nil || !found || !bytes.Equal(got, documents[total]) {
+				b.Fatalf("last inserted row found=%v err=%v", found, err)
+			}
+		})
+	}
+}
+
+func BenchmarkExactPackOpen(b *testing.B) {
+	for _, cardinality := range []int{8, 1024} {
+		b.Run(fmt.Sprintf("long/card=%d", cardinality), func(b *testing.B) {
+			keys, documents := exactOverlapCorpus(b, exactOverlapBenchRows, cardinality, 256)
+			indexes := exactPackIntegrationIndexes()
+			path := filepath.Join(b.TempDir(), "exact-pack-open.vibe")
+			exactOverlapBuild(b, path, keys, documents, indexes)
+			files := make([]*os.File, b.N)
+			for i := range files {
+				var err error
+				files[i], err = os.OpenFile(path, os.O_RDWR, 0o600)
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+			options := exactOverlapOptions(indexes)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := range b.N {
+				collection, err := Open(files[i], options)
+				if err != nil {
+					b.Fatal(err)
+				}
+				b.StopTimer()
+				if err := collection.Close(); err != nil {
+					b.Fatal(err)
+				}
+				if err := files[i].Close(); err != nil {
+					b.Fatal(err)
+				}
+				if i+1 < b.N {
+					b.StartTimer()
+				}
+			}
+		})
 	}
 }

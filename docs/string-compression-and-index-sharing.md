@@ -17,10 +17,10 @@ only after dictionary encoding wins. Packed row IDs remain directly readable;
 a point read decompresses its selected value into caller-owned output.
 
 Keys are excluded. Decoded entries are bounded to 4 KiB before allocation or
-decompression. Incompressible entries retain raw bytes. A compressed stream
-must currently save at least 64 bytes and 12.5 percent including its directory
-and row IDs. This admission rule is still being qualified against physical
-page rounding. Scratch memory is reused; preparation can allocate, while warm
+decompression. Incompressible entries retained raw bytes. A compressed stream
+had to save at least 64 bytes and 12.5 percent including its directory
+and row IDs. That admission rule did not reliably reduce physical page
+allocation. Scratch memory was reused; preparation could allocate, while warm
 codec encode, decode and validation have allocation tests.
 
 The experiment used LZ4 v4.1.28. Codec experiments favored its decode cost
@@ -45,9 +45,11 @@ qualified performance results.
 
 Resident reads and full scans reported zero allocations in both builds.
 The eight-value case demonstrates why stream-byte savings alone are
-insufficient. Scan preparation and physical-space admission remain open.
-Write benchmarks include final Flush in their timing; their first short
-screen is insufficient to claim a write improvement or regression.
+insufficient. The production per-string codec was removed in `7bb512749`.
+Historical write timings excluded final Flush because `testing.B.Loop`
+stops its timer when it returns false. Those timings must not be used as
+end-to-end durable write results. The corrected harness explicitly restarts
+the timer for final Flush before reporting the combined cost.
 
 The original 10M varied-v1 payload uses deterministic pseudo-random ASCII
 already handled well by the alphabet codec. Sample probes did not justify
