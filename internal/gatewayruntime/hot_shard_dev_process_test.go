@@ -265,7 +265,7 @@ func devHotReadDocuments(t *testing.T, client *hotMutationWireClient, request []
 		if remaining <= 0 {
 			t.Fatalf("development native SQL read did not settle within %s after %d attempts", deadline.Sub(started), attempt)
 		}
-		response, _ := client.roundTripWithin(t, request, remaining)
+		response, _ := client.roundTripUntil(t, request, deadline)
 		var envelope struct {
 			OK        *bool  `json:"ok"`
 			Found     []bool `json:"found"`
@@ -310,6 +310,12 @@ func devHotReadDocuments(t *testing.T, client *hotMutationWireClient, request []
 				t.Fatalf("development native SQL read position=%d key=%q found=%t document=%+v",
 					index, key, envelope.Found[index], envelope.Documents[index])
 			}
+		}
+		if cause := context.Cause(t.Context()); cause != nil {
+			t.Fatalf("development native SQL read canceled after %d attempts: %v", attempt+1, cause)
+		}
+		if remaining := time.Until(deadline); remaining <= 0 {
+			t.Fatalf("development native SQL read exceeded its %s deadline after %d attempts", deadline.Sub(started), attempt+1)
 		}
 		return time.Since(started)
 	}
