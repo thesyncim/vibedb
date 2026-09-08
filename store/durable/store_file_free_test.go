@@ -1267,11 +1267,7 @@ func TestFileStoreLongHeldSnapshotCostsBoundedBackpressure(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer file.Close()
-	options := testFileStoreOptions()
-	// Keep the metadata-pressure fixture below the page-cache limit. The
-	// default test cache can exhaust first (with a held snapshot) before the
-	// configured retirement bound is reached, which is a different contract.
-	options.MaxRetiredExtents = 128
+	options := retirementPressureTestOptions(t)
 	fs, err := Create(file, options)
 	if err != nil {
 		t.Fatal(err)
@@ -1369,6 +1365,21 @@ func TestFileStoreLongHeldSnapshotCostsBoundedBackpressure(t *testing.T) {
 	assertFreeSetMirror(t, fs, "after the pinned snapshot was released")
 }
 
+// retirementPressureTestOptions keeps enough resident cache for the metadata
+// retirement bound to be the first pressure source. The explicit bound is
+// above this fixture's validated one-transaction minimum; Options.normalized
+// remains the source of truth for rejecting an unsafe test configuration.
+func retirementPressureTestOptions(t *testing.T) Options {
+	t.Helper()
+	options := testFileStoreOptions()
+	options.ResidentBytes = 32 << 20
+	options.MaxRetiredExtents = 256
+	if _, err := options.normalized(); err != nil {
+		t.Fatalf("retirement-pressure options: %v", err)
+	}
+	return options
+}
+
 // This is the companion to TestFileStoreLongHeldSnapshotCostsBoundedBackpressure:
 // keep the retirement bound above the observed cache working set so the held
 // snapshot reaches the independent page-cache limit first. The rejected Put
@@ -1410,7 +1421,61 @@ func TestFileStoreLongHeldSnapshotCachePressureIsFailureAtomic(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer pinned.Close()
-	snapshotValues := slices.Clone(current)
+	var heldPaths [keys]filePrimaryMutationPath
+	releasePaths := func() {
+		for index := range heldPaths {
+			heldPaths[index].Release()
+		}
+	}
+	defer releasePaths()
+	closePinned := func() error {
+		releasePaths()
+		return pinned.Close()
+	}
+	if pinned.state == nil || pinned.primaryRouter == nil {
+		t.Fatal("snapshot did not retain its primary state and router")
+	}
+	for index := range keys {
+		key := []byte(fmt.Sprintf("k%02d", index))
+		resident, ok := pinned.primaryRouter.Route(key)
+		if !ok {
+			t.Fatalf("snapshot route missing row=%d", index)
+		}
+		if err := fs.acquirePrimaryRoutingPath(
+			&heldPaths[index], pinned.state, key, resident,
+		); err != nil {
+			t.Fatalf("hold snapshot routing path row=%d: %v", index, err)
+		}
+	}
+	// Capture the exact bytes before deliberately exhausting the cache. The
+	// resolved paths above keep every root/branch/catalog/tablet/anchor/leaf
+	// frame needed by these inline rows resident, so the post-failure snapshot
+	// reads below must succeed without allocating a new cache frame.
+	snapshotValues := make([][]byte, keys)
+	for index := range keys {
+		key := []byte(fmt.Sprintf("k%02d", index))
+		got, found, readErr := pinned.AppendRaw(nil, key)
+		if readErr != nil || !found {
+			t.Fatalf("snapshot seed row=%d got=%q found=%v err=%v", index, got, found, readErr)
+		}
+		snapshotValues[index] = slices.Clone(got)
+	}
+	for index, want := range snapshotValues {
+		if !bytes.Equal(want, current[index]) {
+			t.Fatalf("snapshot seed row=%d = %q, want current %q", index, want, current[index])
+		}
+	}
+	verify := func(label string, reader interface {
+		AppendRaw([]byte, []byte) ([]byte, bool, error)
+	}, expected [][]byte) {
+		t.Helper()
+		for index, want := range expected {
+			got, found, readErr := reader.AppendRaw(nil, []byte(fmt.Sprintf("k%02d", index)))
+			if readErr != nil || !found || !bytes.Equal(got, want) {
+				t.Fatalf("%s row=%d got=%q found=%v err=%v want=%q", label, index, got, found, readErr, want)
+			}
+		}
+	}
 	var failure error
 	failedRound, failedIndex := -1, -1
 	var failedCandidate []byte
@@ -1444,39 +1509,42 @@ func TestFileStoreLongHeldSnapshotCachePressureIsFailureAtomic(t *testing.T) {
 		}
 	}
 	if failure == nil {
-		_ = pinned.Close()
+		if closeErr := closePinned(); closeErr != nil {
+			t.Fatalf("close snapshot after missing cache pressure: %v", closeErr)
+		}
 		t.Fatalf("a snapshot pinned for %d writes never reached page-cache pressure", writes)
 	}
 	if !errors.Is(failure, storeio.ErrPageCachePinned) {
 		cache := fs.cache.Stats()
-		t.Fatalf("cache-pressure fixture failed after %d writes with %v; state retired=%d/%d max=%d dirty=%d/%d resident=%d/%d", writes, failure, len(fs.primaryVolatileRetired), cap(fs.primaryVolatileRetired), options.MaxRetiredExtents, cache.DirtyBytes, cache.CapacityBytes, cache.ResidentBytes, cache.CapacityBytes)
+		closeErr := closePinned()
+		t.Fatalf("cache-pressure fixture failed after %d writes with %v; state retired=%d/%d max=%d dirty=%d/%d resident=%d/%d snapshot-close=%v", writes, failure, len(fs.primaryVolatileRetired), cap(fs.primaryVolatileRetired), options.MaxRetiredExtents, cache.DirtyBytes, cache.CapacityBytes, cache.ResidentBytes, cache.CapacityBytes, closeErr)
 	}
 	if len(fs.primaryVolatileRetired) >= options.MaxRetiredExtents {
-		t.Fatalf("cache-pressure fixture reached retirement policy first: retained=%d max=%d", len(fs.primaryVolatileRetired), options.MaxRetiredExtents)
+		closeErr := closePinned()
+		t.Fatalf("cache-pressure fixture reached retirement policy first: retained=%d max=%d snapshot-close=%v", len(fs.primaryVolatileRetired), options.MaxRetiredExtents, closeErr)
 	}
 	if afterFailureState.PublishedGeneration != beforeFailureState.PublishedGeneration ||
 		afterFailure.JournalAcks != beforeFailure.JournalAcks ||
 		afterFailure.ChainAcks != beforeFailure.ChainAcks ||
 		afterFailure.JournalStrictSyncs != beforeFailure.JournalStrictSyncs ||
 		afterFailure.JournalStrictRecords != beforeFailure.JournalStrictRecords {
-		_ = pinned.Close()
-		t.Fatalf("cache-pressure failure published or acknowledged a candidate: before=%+v after=%+v", beforeFailure, afterFailure)
+		closeErr := closePinned()
+		t.Fatalf("cache-pressure failure published or acknowledged a candidate: before=%+v after=%+v snapshot-close=%v", beforeFailure, afterFailure, closeErr)
 	}
-	verify := func(label string, reader interface {
-		AppendRaw([]byte, []byte) ([]byte, bool, error)
-	}, expected [][]byte) {
-		t.Helper()
-		for index, want := range expected {
-			got, found, readErr := reader.AppendRaw(nil, []byte(fmt.Sprintf("k%02d", index)))
-			if readErr != nil || !found || !bytes.Equal(got, want) {
-				t.Fatalf("%s row=%d got=%q found=%v err=%v want=%q", label, index, got, found, readErr, want)
-			}
+	verify("live at cache pressure", fs, current)
+	// The paths above keep the snapshot's actual root/leaf frames pinned. Every
+	// post-failure read must therefore succeed and match the exact pre-pressure
+	// bytes; a cache-capacity error means this resident-path fixture failed to
+	// establish its contract.
+	for index, want := range snapshotValues {
+		key := []byte(fmt.Sprintf("k%02d", index))
+		got, found, readErr := pinned.AppendRaw(nil, key)
+		if readErr != nil || !found || !bytes.Equal(got, want) {
+			closeErr := closePinned()
+			t.Fatalf("snapshot at cache pressure row=%d got=%q found=%v err=%v want=%q snapshot-close=%v", index, got, found, readErr, want, closeErr)
 		}
 	}
-	verify("live before release", fs, current)
-	verify("snapshot before release", pinned, snapshotValues)
-
-	if err := pinned.Close(); err != nil {
+	if err := closePinned(); err != nil {
 		t.Fatal(err)
 	}
 	failedKey := []byte(fmt.Sprintf("k%02d", failedIndex))
