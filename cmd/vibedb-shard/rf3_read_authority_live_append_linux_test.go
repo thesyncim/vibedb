@@ -749,8 +749,8 @@ func rf3ReadAuthoritySQLRequest(
 	authority serviceauthz.Authority,
 ) *shardservice.ReplicatedRequest {
 	t.Helper()
-	var query bytes.Buffer
-	if err := shardservice.EncodeRequest(&query, &shardservice.ShardRequest{
+	primaryKeyRead := rf3ReadAuthorityPrimaryKeyRead(t, bundle)
+	request := &shardservice.ShardRequest{
 		Authority:            authority,
 		SQL:                  `SELECT id FROM docs_live WHERE id = 'authority-live-append'`,
 		Distribution:         distribution.DistributionName(bundle.Route.Distribution),
@@ -762,8 +762,22 @@ func rf3ReadAuthoritySQLRequest(
 		ExecutionMode:        shardservice.ExecutionReadOnly,
 		MaxRows:              1,
 		MaxResultBytes:       4096,
-	}); err != nil {
+		PrimaryKeyRead:       primaryKeyRead,
+	}
+	var query bytes.Buffer
+	if err := shardservice.EncodeRequest(&query, request); err != nil {
 		t.Fatalf("encode live authority SQL query: %v", err)
+	}
+	decoded, err := shardservice.DecodeRequest(bytes.NewReader(query.Bytes()))
+	if err != nil {
+		t.Fatalf("decode live authority SQL query: %v", err)
+	}
+	if decoded.PrimaryKeyRead.Relation != primaryKeyRead.Relation ||
+		decoded.PrimaryKeyRead.MaxDocumentBytes != primaryKeyRead.MaxDocumentBytes ||
+		!bytes.Equal(decoded.PrimaryKeyRead.PrimaryPath, primaryKeyRead.PrimaryPath) ||
+		len(decoded.PrimaryKeyRead.Keys) != 1 ||
+		!bytes.Equal(decoded.PrimaryKeyRead.Keys[0], primaryKeyRead.Keys[0]) {
+		t.Fatalf("live authority SQL point metadata changed across wire round trip: got=%+v want=%+v", decoded.PrimaryKeyRead, primaryKeyRead)
 	}
 	return &shardservice.ReplicatedRequest{
 		Operation:     shardservice.ReplicatedQueryLeader,
@@ -772,6 +786,44 @@ func rf3ReadAuthoritySQLRequest(
 		Fence:         state.Fence,
 		Query:         query.Bytes(),
 		MaxValueBytes: 4096,
+	}
+}
+
+func rf3ReadAuthorityPrimaryKeyRead(
+	t testing.TB, bundle rf3ManifestGroup,
+) shardservice.PrimaryKeyReadRequest {
+	t.Helper()
+	var identity sqldriver.ReplicatedShardStoreIdentity
+	if err := loadRF3IdentityFile(bundle.SQL.IdentityPath, &identity); err != nil {
+		t.Fatalf("load live authority SQL identity: %v", err)
+	}
+	if _, err := sqldriver.ReplicatedRelationManifestDigest(identity); err != nil {
+		t.Fatalf("validate live authority SQL identity: %v", err)
+	}
+	if identity.UserTable != "docs_live" || !rf3RouteMatchesBinding(bundle.Route, identity.Binding) {
+		t.Fatalf("live authority SQL identity does not match docs_live route: table=%q binding=%+v route=%+v", identity.UserTable, identity.Binding, bundle.Route)
+	}
+	var relation *sqldriver.ReplicatedShardRelationIdentity
+	for index := range identity.Relations {
+		candidate := &identity.Relations[index]
+		if candidate.Table != "docs_live" {
+			continue
+		}
+		if relation != nil || candidate.Kind != sqldriver.ReplicatedShardRelationJSON {
+			t.Fatalf("live authority SQL identity has invalid docs_live base relation: %+v", identity.Relations)
+		}
+		relation = candidate
+	}
+	if relation == nil || relation.Relation == 0 ||
+		identity.UserPrimaryKey == "" || relation.Limits.MaxDocumentBytes <= 0 ||
+		relation.Limits.MaxDocumentBytes > replication.MaxMutationValueBytes {
+		t.Fatalf("live authority SQL identity has no valid docs_live base relation: user=%+v relations=%+v", identity, identity.Relations)
+	}
+	return shardservice.PrimaryKeyReadRequest{
+		Relation:         replication.RelationID(relation.Relation),
+		MaxDocumentBytes: uint32(relation.Limits.MaxDocumentBytes),
+		PrimaryPath:      []byte(identity.UserPrimaryKey),
+		Keys:             [][]byte{[]byte("authority-live-append")},
 	}
 }
 
