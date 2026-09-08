@@ -846,6 +846,7 @@ func (c *Collection) preparePrimaryBatchExact(
 	if epoch == nil {
 		return primaryExactPrepared{}, nil
 	}
+	certifiedReplay := c.journalReplaying && c.primaryUniqueReplayValidated
 	prepared := primaryExactPrepared{
 		active:         true,
 		gen:            generation,
@@ -861,6 +862,7 @@ func (c *Collection) preparePrimaryBatchExact(
 	}
 	pressure := false
 	stablePressure := false
+	stableChangedTerms := false
 	for i := range c.batchPrimaryLeaves {
 		leaf := &c.batchPrimaryLeaves[i]
 		if leaf.skip {
@@ -884,6 +886,8 @@ func (c *Collection) preparePrimaryBatchExact(
 					return primaryExactPrepared{}, storeio.ErrPrimaryExactIndexCorrupt
 				}
 				c.overflowValueScratch = oldRaw
+				termRecordsBefore := prepared.termRecordsAdded
+				tileRecordsBefore := prepared.tileRecordsAdded
 				ok, deltaErr := c.preparePrimaryExactDeltaRaw(
 					epoch, &prepared, mutation.resident,
 					oldRaw, mutation.value, mutation.remove, true,
@@ -898,6 +902,9 @@ func (c *Collection) preparePrimaryBatchExact(
 					stablePressure = true
 					break
 				}
+				stableChangedTerms = stableChangedTerms ||
+					prepared.termRecordsAdded != termRecordsBefore ||
+					prepared.tileRecordsAdded != tileRecordsBefore
 			}
 			if pressure {
 				break
@@ -918,12 +925,17 @@ func (c *Collection) preparePrimaryBatchExact(
 			break
 		}
 	}
-	if !pressure {
+	// Retain the ordinary row-sized overlay only when every exact projection is
+	// unchanged. Certified replay keeps its established absolute-delta behavior.
+	// Changed terms accumulate resident delta records that repeated buffered
+	// batches must fold at capacity, multiplying checkpoint bytes. The established
+	// structural rebase below keeps those writes at the prior checkpoint shape.
+	if !pressure && (!stableChangedTerms || certifiedReplay) {
 		return prepared, nil
 	}
 
 	c.unwindPrimaryExactPrepared(&prepared)
-	if stablePressure {
+	if stablePressure && (certifiedReplay || !epoch.overlayEmpty()) {
 		return primaryExactPrepared{}, errPrimaryBatchExactCheckpointRequired
 	}
 	c.resetStructuralExactLocked()
@@ -1312,8 +1324,9 @@ func (c *Collection) buildPrimaryBatchLeaf(
 	state *fileStoreState, baseGen uint64, li int,
 ) ([]byte, error) {
 	leaf := &c.batchPrimaryLeaves[li]
-	leaf.stableSlots = c.journalReplaying && c.primaryUniqueReplayValidated &&
+	replayStableSlots := c.journalReplaying && c.primaryUniqueReplayValidated &&
 		state.root.IndexCount != 0
+	leaf.stableSlots = replayStableSlots
 	inputBounds := c.primaryLeafBounds(state)
 	var (
 		path  filePrimaryMutationPath
@@ -1371,9 +1384,21 @@ func (c *Collection) buildPrimaryBatchLeaf(
 		leaf.skip = true
 		return nil, nil
 	}
-	if leaf.stableSlots {
+	if replayStableSlots {
 		for mutationAt := leaf.mutationAt; mutationAt < leaf.mutationEnd; mutationAt++ {
 			if !c.batchPrimaryMutations[mutationAt].found {
+				leaf.stableSlots = false
+				break
+			}
+		}
+	} else if state.root.IndexCount != 0 && len(final) == len(baseRows) {
+		// An ordinary all-existing PUT batch can retain every row's posting
+		// slot. Inserts, deletes, and mixed topology keep the established
+		// placement and exact-rebase path below.
+		leaf.stableSlots = true
+		for mutationAt := leaf.mutationAt; mutationAt < leaf.mutationEnd; mutationAt++ {
+			mutation := &c.batchPrimaryMutations[mutationAt]
+			if !mutation.found || mutation.remove {
 				leaf.stableSlots = false
 				break
 			}

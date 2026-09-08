@@ -93,6 +93,111 @@ func BenchmarkExactPackResidentEquality(b *testing.B) {
 	}
 }
 
+type exactPackPreparedProbe struct {
+	index    int
+	needles  []vibejson.Index
+	expected int
+}
+
+func exactPackTupleRaw(
+	tb testing.TB, document []byte, definition store.IndexDefinition,
+) ([]string, string) {
+	tb.Helper()
+	values := make([]string, len(definition.Paths))
+	var signature []byte
+	for i, path := range definition.Paths {
+		var resolver storeio.UnifiedHoleResolver
+		if err := resolver.SetPath([]byte(path)); err != nil {
+			tb.Fatal(err)
+		}
+		start, end, found, err := resolver.PathSpanOf(document)
+		if err != nil || !found {
+			tb.Fatalf("resolve %s: found=%v err=%v", path, found, err)
+		}
+		values[i] = string(document[start:end])
+		signature = append(signature, document[start:end]...)
+		signature = append(signature, 0)
+	}
+	return values, string(signature)
+}
+
+func BenchmarkExactPackResidentEqualityRotating(b *testing.B) {
+	const probesPerIndex = 256
+	for _, cardinality := range []int{8, 1024} {
+		b.Run(fmt.Sprintf("long/card=%d", cardinality), func(b *testing.B) {
+			keys, documents := exactOverlapCorpus(b, exactOverlapBenchRows, cardinality, 256)
+			indexes := exactPackIntegrationIndexes()
+			path := filepath.Join(b.TempDir(), "exact-pack-rotating-probe.vibe")
+			exactOverlapBuild(b, path, keys, documents, indexes)
+			collection, file := exactOverlapOpen(b, path, indexes)
+			defer func() { _ = collection.Close(); _ = file.Close() }()
+			snapshot, err := collection.Snapshot()
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer snapshot.Close()
+
+			counts := make([]map[string]int, len(indexes))
+			for index, definition := range indexes {
+				counts[index] = make(map[string]int, len(documents))
+				for _, document := range documents {
+					_, signature := exactPackTupleRaw(b, document, definition)
+					counts[index][signature]++
+				}
+			}
+			prepared := make([]exactPackPreparedProbe, 0, probesPerIndex*len(indexes))
+			for probe := range probesPerIndex {
+				for index, definition := range indexes {
+					row := (probe*7919 + index*3571) % len(documents)
+					raw, signature := exactPackTupleRaw(b, documents[row], definition)
+					expected := counts[index][signature]
+					if probe&1 != 0 {
+						raw[0] = fmt.Sprintf(`"absent-tenant-%03d"`, probe)
+						expected = 0
+					}
+					needles := make([]vibejson.Index, len(raw))
+					for i := range raw {
+						needles[i] = primaryExactTestNeedle(b, raw[i])
+					}
+					prepared = append(prepared, exactPackPreparedProbe{
+						index: index, needles: needles, expected: expected,
+					})
+				}
+			}
+			workspaces := make([]IndexWorkspace, len(indexes))
+			defer func() {
+				for i := range workspaces {
+					workspaces[i].Release()
+				}
+			}()
+			masks := make([]store.Mask, 0, 256)
+			for _, probe := range prepared {
+				masks, err = snapshot.AppendIndexMasksInto(
+					masks[:0], &workspaces[probe.index], indexes[probe.index].Name,
+					probe.needles...,
+				)
+				if err != nil || primaryExactMaskRows(masks) != probe.expected {
+					b.Fatalf("warm index=%s rows=%d want=%d err=%v",
+						indexes[probe.index].Name, primaryExactMaskRows(masks), probe.expected, err)
+				}
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; b.Loop(); i++ {
+				probe := &prepared[i%len(prepared)]
+				masks, err = snapshot.AppendIndexMasksInto(
+					masks[:0], &workspaces[probe.index], indexes[probe.index].Name,
+					probe.needles...,
+				)
+				if err != nil || primaryExactMaskRows(masks) != probe.expected {
+					b.Fatalf("index=%s rows=%d want=%d err=%v",
+						indexes[probe.index].Name, primaryExactMaskRows(masks), probe.expected, err)
+				}
+			}
+		})
+	}
+}
+
 func exactPackMutationDocument(
 	tb testing.TB, row, cardinality int, shared []string, kind string, generation int,
 ) []byte {
@@ -218,21 +323,34 @@ func BenchmarkExactPackExistingUpdate(b *testing.B) {
 				flushElapsed := time.Since(flushStart)
 				b.StopTimer()
 				after := collection.Stats()
-				b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(updated), "e2e-ns/doc")
+				durableElapsed := b.Elapsed()
+				b.ReportMetric(float64(durableElapsed.Nanoseconds())/float64(updated), "e2e-ns/doc")
 				b.ReportMetric(float64(after.DeviceBytes-base.DeviceBytes)/float64(updated), "devB/doc")
 				b.ReportMetric(float64(flushElapsed.Nanoseconds()), "flush-ns")
 
 				// Verify the final acknowledged generation independently through a
-				// full document read and both exact indexes.
+				// fully materialized snapshot, a full document read, and both exact
+				// indexes. Keep this checkpoint separate from the Flush acknowledgement
+				// metrics above.
+				checkpointStart := time.Now()
+				snapshot, err := collection.Snapshot()
+				if err != nil {
+					b.Fatal(err)
+				}
+				if err := collection.Flush(); err != nil {
+					b.Fatal(err)
+				}
+				checkpointElapsed := time.Since(checkpointStart)
+				afterPhysical := collection.Stats()
+				b.ReportMetric(float64((durableElapsed+checkpointElapsed).Nanoseconds())/float64(updated), "physical-e2e-ns/doc")
+				b.ReportMetric(float64(afterPhysical.DeviceBytes-base.DeviceBytes)/float64(updated), "physical-devB/doc")
+				b.ReportMetric(float64(checkpointElapsed.Nanoseconds()), "checkpoint-ns")
+
 				probeRow := lastRow
 				want := variants[lastVersion][probeRow]
 				got, found, err := collection.AppendRaw(nil, keyBytes[probeRow])
 				if err != nil || !found || !bytes.Equal(got, want) {
 					b.Fatalf("acknowledged row=%d found=%v err=%v", probeRow, found, err)
-				}
-				snapshot, err := collection.Snapshot()
-				if err != nil {
-					b.Fatal(err)
 				}
 				defer snapshot.Close()
 				for _, definition := range indexes {

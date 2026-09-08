@@ -8,6 +8,8 @@ measurements are retained below. The chosen next implementation is bounded
 physical packs of canonical exact-index leaves, compressed once on disk and
 decoded at Open. See [the implementation plan](exact-index-packed-storage-plan.md).
 Durable pack integration and its performance qualification are still pending.
+The completed [batch slot-preservation round](batch-slot-preservation-results.md)
+measures the separate write optimization, read controls, and remaining limits.
 
 ## Primary dictionary strings
 

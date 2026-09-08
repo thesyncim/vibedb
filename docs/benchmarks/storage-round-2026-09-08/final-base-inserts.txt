@@ -1,0 +1,9 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/store/durable
+cpu: Apple M4 Max
+BenchmarkExactPackBatchInsert/long/card=8-16         	      20	  10963321 ns/op	      6474 devB/doc	    171302 e2e-ns/doc	  17911500 flush-ns	 2004266 B/op	    7185 allocs/op
+BenchmarkExactPackBatchInsert/long/card=8-16         	      20	  10699531 ns/op	      6474 devB/doc	    167180 e2e-ns/doc	  17519125 flush-ns	 2001248 B/op	    7184 allocs/op
+BenchmarkExactPackBatchInsert/long/card=1024-16      	      20	  10953067 ns/op	      6848 devB/doc	    171142 e2e-ns/doc	  17641667 flush-ns	 1537192 B/op	    5566 allocs/op
+BenchmarkExactPackBatchInsert/long/card=1024-16      	      20	  10753742 ns/op	      6848 devB/doc	    168027 e2e-ns/doc	  23756667 flush-ns	 1537181 B/op	    5566 allocs/op
+PASS
