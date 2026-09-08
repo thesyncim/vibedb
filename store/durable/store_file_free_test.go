@@ -1311,8 +1311,21 @@ func TestFileStoreLongHeldSnapshotCostsBoundedBackpressure(t *testing.T) {
 			"measures nothing")
 	}
 	if !errors.Is(failure, storeio.ErrRetiredExtentCapacity) {
-		pinned.Close()
-		t.Fatalf("long-held snapshot failed with %v, want bounded retirement backpressure", failure)
+		cache := fs.cache.Stats()
+		retired := fs.reclaimer.Stats()
+		dirtyAvailable := fs.cache.DirtyCapacityAvailable()
+		buffered, syncJournal := fs.buffered(), fs.syncJournalLane()
+		closeErr := pinned.Close()
+		t.Fatalf("long-held snapshot failed with %v, want bounded retirement backpressure; "+
+			"writes=%d primary-retired=%d/%d max=%d pending-parents=%d "+
+			"retired=%d/%d dirty-available=%d dirty=%d/%d "+
+			"cache-reserved=%d cache-resident=%d buffered=%t sync-journal=%t "+
+			"snapshot-close=%v", failure, writes,
+			len(fs.primaryVolatileRetired), cap(fs.primaryVolatileRetired),
+			fs.options.MaxRetiredExtents, len(fs.primaryPendingParents),
+			retired.Pending, retired.Capacity, dirtyAvailable, cache.DirtyBytes,
+			cache.CapacityBytes, cache.ReservedBytes, cache.ResidentBytes,
+			buffered, syncJournal, closeErr)
 	}
 	// The error has to say which snapshot is responsible. "Retired extent
 	// capacity exhausted" on its own reads like corruption, and an operator
