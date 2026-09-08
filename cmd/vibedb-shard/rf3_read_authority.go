@@ -512,7 +512,7 @@ func newRF3ReadAuthorityCache(
 	}
 	registrations := make([]rf3ReadAuthorityGroupTargets, 0, len(groups))
 	for index := range groups {
-		if runtimes[index] == nil {
+		if groups[index].adoptedChild || runtimes[index] == nil {
 			return nil, errRF3ReadAuthority
 		}
 		identity := runtimes[index].Identity()
@@ -1151,7 +1151,7 @@ func configureRF3ReadAuthorityGroup(
 	manifest rf3Manifest, item preparedRF3Group, runtime *raftmember.Runtime,
 	cache *rf3ReadAuthorityIncarnationCache,
 ) (rf3ReadAuthorityRegistration, error) {
-	if cache == nil || manifest.ReadAuthority == nil || runtime == nil {
+	if cache == nil || manifest.ReadAuthority == nil || runtime == nil || item.adoptedChild {
 		return rf3ReadAuthorityRegistration{}, errRF3ReadAuthority
 	}
 	policy, err := manifest.ReadAuthority.rf3Policy()
@@ -1199,6 +1199,19 @@ func configureRF3ReadAuthorities(
 	if len(prepared) != len(runtimes) {
 		return nil, nil, errRF3ReadAuthority
 	}
+	// An adopted child is reconstructed from a receipt for this local child
+	// replica while its recovered bundle still carries the parent split
+	// template. That template cannot authenticate the child's complete native
+	// roster. Keep this restart path on ReadIndex and reject any durable marker
+	// that would claim the child was enrolled; do this before cache enrollment
+	// or creation of a marker for an ordinary group.
+	for _, item := range prepared {
+		if item.adoptedChild {
+			if err := ensureRF3ReadAuthorityDisabled(item.manifest.Route.MemberRoot); err != nil {
+				return nil, nil, err
+			}
+		}
+	}
 	if manifest.ReadAuthority == nil {
 		for _, item := range prepared {
 			if err := ensureRF3ReadAuthorityDisabled(item.manifest.Route.MemberRoot); err != nil {
@@ -1219,14 +1232,26 @@ func configureRF3ReadAuthorities(
 	if err := validateRF3ReadAuthority(manifest.ReadAuthority, manifest.groupBundles(), manifest.DevelopmentOnly); err != nil {
 		return nil, nil, err
 	}
-	cache, err := newRF3ReadAuthorityCache(profile, authPolicy, prepared, runtimes, localNode)
+	configuredPrepared := make([]preparedRF3Group, 0, len(prepared))
+	configuredRuntimes := make([]*raftmember.Runtime, 0, len(runtimes))
+	for index, item := range prepared {
+		if item.adoptedChild {
+			continue
+		}
+		configuredPrepared = append(configuredPrepared, item)
+		configuredRuntimes = append(configuredRuntimes, runtimes[index])
+	}
+	if len(configuredPrepared) == 0 {
+		return nil, nil, errRF3ReadAuthority
+	}
+	cache, err := newRF3ReadAuthorityCache(profile, authPolicy, configuredPrepared, configuredRuntimes, localNode)
 	if err != nil {
 		return nil, nil, err
 	}
 	// Qualify every clock before mutating any durable policy marker. On an
 	// unsupported platform an explicitly requested feature must fail before a
 	// partial enrollment can be mistaken for a completed voter rollout.
-	clocks := make([]*raftauthority.CheckedClock, len(runtimes))
+	clocks := make([]*raftauthority.CheckedClock, len(configuredRuntimes))
 	for index := range clocks {
 		// Linux construction is intentionally cheap and the CLOCK_BOOTTIME
 		// syscall occurs on Now. Exercise every source before the first marker
@@ -1242,17 +1267,17 @@ func configureRF3ReadAuthorities(
 	// exact policy marker was already durable before this startup. This keeps a
 	// failed cold/mismatched configuration from laundering a newly-created
 	// marker into a later restore.
-	preexisting := make([]bool, len(runtimes))
-	exactRoster := make([]bool, len(runtimes))
-	for index, runtime := range runtimes {
+	preexisting := make([]bool, len(configuredRuntimes))
+	exactRoster := make([]bool, len(configuredRuntimes))
+	for index, runtime := range configuredRuntimes {
 		exactRoster[index], err = preflightRF3ReadAuthorityRoster(runtime, policy)
 		if err != nil {
 			_ = cache.Close()
 			return nil, nil, err
 		}
 	}
-	for index := range runtimes {
-		item := &prepared[index]
+	for index := range configuredRuntimes {
+		item := &configuredPrepared[index]
 		preexisting[index], err = inspectRF3ReadAuthorityState(item.manifest.Route.MemberRoot, policy)
 		if err != nil {
 			_ = cache.Close()
@@ -1263,7 +1288,7 @@ func configureRF3ReadAuthorities(
 			return nil, nil, errRF3ReadAuthority
 		}
 	}
-	for index, item := range prepared {
+	for index, item := range configuredPrepared {
 		if preexisting[index] {
 			continue
 		}
@@ -1272,7 +1297,7 @@ func configureRF3ReadAuthorities(
 			return nil, nil, err
 		}
 	}
-	for index, runtime := range runtimes {
+	for index, runtime := range configuredRuntimes {
 		group := runtime.Identity().Group
 		options := raftmember.ReadAuthorityOptions{
 			Policy: policy, Clock: clocks[index],
@@ -1291,6 +1316,8 @@ func configureRF3ReadAuthorities(
 			return nil, nil, configureErr
 		}
 	}
+	// Include every runtime in startup evidence, including adopted children.
+	// Their explicit Disabled status documents the deliberate ReadIndex path.
 	startup := make([]raftmember.ReadAuthorityEvidence, 0, len(runtimes))
 	for _, runtime := range runtimes {
 		startup = append(startup, runtime.ReadAuthorityEvidence())
