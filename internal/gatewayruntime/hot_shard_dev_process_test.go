@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -25,6 +26,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/rf3testfixture"
 	"github.com/thesyncim/vibedb/internal/servicetls"
+	"github.com/thesyncim/vibedb/internal/splitcontroller"
 	vibejson "github.com/thesyncim/vibejson"
 )
 
@@ -291,6 +293,7 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 	// value is checked, including again after the split publishes its children.
 	readRequest := devHotReadRequestForTable(t, tableName, keys)
 	var operation [32]byte
+	var operationDirectory string
 	pressureDeadline := time.Now().Add(25 * time.Second)
 	// Five 16-point batches per second exceed the 64-operation source window
 	// while each balanced child stays below its unchanged 85% capacity limit.
@@ -307,18 +310,49 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 			continue
 		}
 		ids, readErr := authority.ReadOperationIDs(ctx)
-		if readErr == nil && len(ids) == 1 {
-			operation = ids[0]
-			break
+		if readErr != nil {
+			continue
 		}
-		if len(ids) > 1 {
-			t.Fatalf("hot pressure amplified topology operations=%d", len(ids))
+		entries := make([]string, 0, len(ids))
+		var splitCount int
+		var matchingSplit [32]byte
+		for _, id := range ids {
+			record, recordErr := authority.ReadOperation(ctx, id)
+			if errors.Is(recordErr, gateway.ErrReplicatedOperationMissing) {
+				continue
+			}
+			if recordErr != nil || record.ID != id || !record.Valid() {
+				t.Fatalf("invalid pressure operation id=%x record=%+v err=%v", id, record, recordErr)
+			}
+			entries = append(entries, fmt.Sprintf("%x(kind=%d,state=%d,revision=%d)", id, record.Kind, record.State, record.Revision))
+			if record.Kind != gateway.ReplicatedOperationSplit {
+				continue
+			}
+			splitCount++
+			if splitCount > 1 {
+				t.Fatalf("hot pressure admitted multiple split operations: %s", strings.Join(entries, ","))
+			}
+			plan, openErr := splitcontroller.OpenPlanIntent(record.Intent, snapshot)
+			if openErr != nil {
+				t.Fatalf("pressure split operation id=%x could not reopen its plan: %v", id, openErr)
+			}
+			distributionName, shard, allocation := plan.SourceAllocation()
+			if distributionName != source.Distribution || shard != source.Shard || uint64(allocation) != source.AllocationGeneration {
+				continue
+			}
+			matchingSplit = id
+		}
+		operationDirectory = strings.Join(entries, ",")
+		if splitCount == 1 && matchingSplit != ([32]byte{}) {
+			operation = matchingSplit
+			t.Logf("selected split operation id=%x source=%s/%s allocation=%d directory=%s", operation, source.Distribution, source.Shard, source.AllocationGeneration, operationDirectory)
+			break
 		}
 	}
 	if operation == ([32]byte{}) {
 		record, pressureErr := authority.ReadPressureRecord(ctx)
-		t.Fatalf("zero-config pressure admitted no split after %d requests; pressure=%s err=%v\n%s",
-			client.requests, record.Payload, pressureErr, process.Diagnostics())
+		t.Fatalf("zero-config pressure admitted no matching split after %d requests; operations=%s pressure=%s err=%v\n%s",
+			client.requests, operationDirectory, record.Payload, pressureErr, process.Diagnostics())
 	}
 	final := hotMutationWaitSplitComplete(t, ctx, authority,
 		snapshot.Generation()+1, operation, source, process)
