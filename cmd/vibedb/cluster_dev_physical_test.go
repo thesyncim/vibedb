@@ -296,6 +296,9 @@ func TestDevPhysicalRealPreparationRecoversExactPlans(t *testing.T) {
 			if err := vibejson.Unmarshal(planned, &inventory); err != nil || len(inventory.Tables) != 1 {
 				t.Fatalf("durable planned inventory: %+v %v", inventory, err)
 			}
+			if inventory.Tables[0].ProvisionBundleFormat != gateway.ReplicatedTableProvisionBundleFormat {
+				t.Fatalf("new plan did not persist mandatory bundle marker: %d", inventory.Tables[0].ProvisionBundleFormat)
+			}
 			if _, err := os.Stat(filepath.Join(inventory.Tables[0].GroupRoots[0], "sql-identity.vibejson")); err != nil {
 				t.Fatal("first member not durably prepared", err)
 			}
@@ -354,6 +357,9 @@ func TestDevPhysicalRealPreparationRecoversExactPlans(t *testing.T) {
 				{"apply_identity", filepath.Join(alpha.GroupRoots[0], "apply-identity.vibejson"), func([]byte) []byte {
 					return []byte("{}")
 				}},
+				{"bundle_template", filepath.Join(root, alpha.artifactStem()+devTableProvisionBundleSuffix), func(raw []byte) []byte {
+					return bytes.Replace(raw, []byte(`\"max_sessions\":128`), []byte(`\"max_sessions\":129`), 1)
+				}},
 			} {
 				t.Run(mismatch.name, func(t *testing.T) {
 					original, err := os.ReadFile(mismatch.path)
@@ -407,10 +413,17 @@ func TestDevPhysicalRealPreparationRecoversExactPlans(t *testing.T) {
 					seen[member.Node] = true
 				}
 				path, err := devTableCatalogPath(root, table.Table)
-				if err != nil || path != filepath.Join(root, table.artifactStem()+"-catalog.vibejson") {
-					t.Fatalf("DDL fragment=%q %v", path, err)
+				if err != nil || path != filepath.Join(root, table.artifactStem()+devTableProvisionBundleSuffix) {
+					t.Fatalf("DDL bundle=%q %v", path, err)
 				}
-				fragment, _ := os.ReadFile(path)
+				bundle, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				fragment, _, err := gateway.OpenReplicatedTableProvisionBundle(bundle)
+				if err != nil {
+					t.Fatalf("open table bundle: %v", err)
+				}
 				addition, err := gateway.OpenReplicatedTableProvision(fragment)
 				if err != nil || addition.ReplicatedShardDescriptors()[0].Group != group {
 					t.Fatalf("fragment group differs: %v", err)

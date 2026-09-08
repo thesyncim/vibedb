@@ -2,6 +2,7 @@ package gatewayruntime
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -21,6 +22,7 @@ import (
 
 func newGatewayDevDDL(socket string, authority *gateway.ReplicatedCatalogAuthority,
 	schema *gatewaySchemaDDLRuntime,
+	registerSource func(*gateway.Snapshot, gatewaySplitSource) error,
 	loggers ...func(string, ...any),
 ) func(context.Context, serviceauthz.Authority, string) error {
 	var mu sync.Mutex
@@ -109,7 +111,7 @@ func newGatewayDevDDL(socket string, authority *gateway.ReplicatedCatalogAuthori
 		if response.StatusCode != http.StatusOK {
 			return fmt.Errorf("DDL provisioning failed: %s", strings.TrimSpace(string(raw)))
 		}
-		addition, err := gateway.OpenReplicatedTableProvision(raw)
+		addition, source, err := openGatewayDDLProvision(raw)
 		if err != nil {
 			return err
 		}
@@ -117,10 +119,47 @@ func newGatewayDevDDL(socket string, authority *gateway.ReplicatedCatalogAuthori
 		if len(declarations) != 1 || declarations[0].Table != tree.CreateTable.Table {
 			return gateway.ErrInvalidCatalog
 		}
+		if source != nil {
+			if registerSource == nil {
+				return errGatewayHotSplitSourceRegistration
+			}
+			if err := registerSource(addition, *source); err != nil {
+				return err
+			}
+		}
 		return registerGatewayDevTable(ctx, func(ctx context.Context) error {
 			return authority.RegisterProvisionedTable(ctx, addition)
 		}, loggers...)
 	}
+}
+
+// openGatewayDDLProvision selects the explicit bundle grammar when the
+// supervisor returned one. A response carrying bundle marker fields is never
+// retried through the legacy fragment decoder after a bundle validation error.
+func openGatewayDDLProvision(raw []byte) (*gateway.Snapshot, *gatewaySplitSource, error) {
+	catalogRaw, sourceRaw, bundleErr := gateway.OpenReplicatedTableProvisionBundle(raw)
+	if bundleErr == nil {
+		addition, err := gateway.OpenReplicatedTableProvision(catalogRaw)
+		if err != nil {
+			return nil, nil, err
+		}
+		source, err := openGatewayProvisionedSplitSource(sourceRaw)
+		if err != nil {
+			return nil, nil, err
+		}
+		return addition, &source, nil
+	}
+	var marker struct {
+		Format      *uint16 `json:"format"`
+		Catalog     *string `json:"catalog"`
+		SplitSource *string `json:"split_source"`
+	}
+	if json.Unmarshal(raw, &marker) == nil &&
+		(marker.Format != nil || marker.Catalog != nil || marker.SplitSource != nil) {
+		return nil, nil, bundleErr
+	}
+	addition, err := gateway.OpenReplicatedTableProvision(raw)
+	return addition, nil, err
 }
 
 // Both online CREATE and restart wait for an authenticated serving fence.

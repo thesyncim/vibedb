@@ -162,6 +162,8 @@ type Runtime struct {
 	ddlForwardOwner  *gatewayDDLForwardOwner
 
 	replicaControlManifest        *gatewayReplicaControlManifest
+	provisionedSplitSources       []gatewayProvisionedSplitSource
+	hotSplitFactory               *gatewayHotSplitFactory
 	controlListener               net.Listener
 	controlTLS                    *servicetls.Server
 	controlService                *gateway.ClusterCatalogDrainControlService

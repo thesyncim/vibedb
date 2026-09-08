@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -24,9 +25,9 @@ func TestGatewayHotSplitFactoryFreezesPortableAndReplicaLocalIdentity(t *testing
 	catalog, source, profile, work := gatewayHotSplitFactoryFixture(t)
 	manifest := gatewayReplicaControlManifest{
 		Shards: []gateway.ReplicatedEndpoint{
-			{Node: source.Replicas[0].Node},
-			{Node: source.Replicas[1].Node},
-			{Node: source.Replicas[2].Node},
+			{Node: source.Replicas[0].Node, ControlAddress: "127.0.0.1:21"},
+			{Node: source.Replicas[1].Node, ControlAddress: "127.0.0.1:22"},
+			{Node: source.Replicas[2].Node, ControlAddress: "127.0.0.1:23"},
 		},
 		SplitSnapshots: []string{"127.0.0.1:9301", "127.0.0.1:9302", "127.0.0.1:9303"},
 		SplitSources:   []gatewaySplitSource{gatewaySplitSourceFixture(t, source, profile)},
@@ -35,7 +36,7 @@ func TestGatewayHotSplitFactoryFreezesPortableAndReplicaLocalIdentity(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	factory := &gatewayHotSplitFactory{sources: sources}
+	factory := gatewayHotSplitFactoryForSources(sources)
 	admission := [32]byte{0xa7, 0x42}
 	split, err := factory.allocateSplit(catalog, admission, work, source)
 	if err != nil {
@@ -119,6 +120,73 @@ func TestGatewayHotSplitFactoryFreezesPortableAndReplicaLocalIdentity(t *testing
 	if len(localDigests) != gateway.ServingReplicaCount {
 		t.Fatalf("replica-local relation identities collapsed: %x", localDigests)
 	}
+}
+
+func TestGatewayHotSplitFactoryRegistersProvisionedSourceByVersion(t *testing.T) {
+	catalog, descriptor, profile, _ := gatewayHotSplitFactoryFixture(t)
+	entry := gatewaySplitSourceFixture(t, descriptor, profile)
+	manifest := gatewayReplicaControlManifest{}
+	for index, replica := range descriptor.Replicas {
+		manifest.Shards = append(manifest.Shards, gateway.ReplicatedEndpoint{Node: replica.Node,
+			ControlAddress: "127.0.0.1:" + strconv.Itoa(21+index)})
+		manifest.SplitSnapshots = append(manifest.SplitSnapshots, "127.0.0.1:"+strconv.Itoa(9401+index))
+	}
+	factory, err := newGatewayHotSplitFactory(manifest, catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := factory.RegisterProvisionedSource(catalog, entry); err != nil {
+		t.Fatal(err)
+	}
+	if err := factory.RegisterProvisionedSource(catalog, entry); err != nil {
+		t.Fatalf("identical registration is not idempotent: %v", err)
+	}
+	selected, ok := factory.sourceForDescriptor(descriptor)
+	if !ok {
+		t.Fatal("registered source is not selectable")
+	}
+	originalTable := selected.SQL.Relations[0].Table
+	entry.SQL.Relations[0].Table = "caller-mutated"
+	if selected.SQL.Relations[0].Table != originalTable {
+		t.Fatal("registration retained caller-owned SQL relation storage")
+	}
+	entry.Template.MaxSessions++
+	if err := factory.RegisterProvisionedSource(catalog, entry); err == nil {
+		t.Fatal("conflicting same-version source registration was accepted")
+	}
+	if len(factory.sourceVersions) != 1 {
+		t.Fatalf("conflicting registration changed source count: %d", len(factory.sourceVersions))
+	}
+	invalid := manifest
+	invalid.Shards = append([]gateway.ReplicatedEndpoint(nil), manifest.Shards...)
+	invalid.SplitSnapshots = append([]string(nil), manifest.SplitSnapshots...)
+	invalid.Shards[0].ControlAddress = "not-an-address"
+	invalidFactory, err := newGatewayHotSplitFactory(invalid, catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := invalidFactory.RegisterProvisionedSource(catalog, gatewaySplitSourceFixture(t, descriptor, profile)); err == nil {
+		t.Fatal("source registration accepted an invalid enrolled control address")
+	}
+	mismatched := manifest
+	mismatched.Shards = append([]gateway.ReplicatedEndpoint(nil), manifest.Shards...)
+	mismatched.SplitSnapshots = append([]string(nil), manifest.SplitSnapshots...)
+	mismatched.Shards[0].ControlAddress = "127.0.0.1:9999"
+	mismatchedFactory, err := newGatewayHotSplitFactory(mismatched, catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mismatchedFactory.RegisterProvisionedSource(catalog, gatewaySplitSourceFixture(t, descriptor, profile)); err == nil {
+		t.Fatal("source registration accepted a catalog control endpoint outside the enrolled roster")
+	}
+}
+
+func gatewayHotSplitFactoryForSources(sources map[raftmember.GroupKey]gatewaySplitSource) *gatewayHotSplitFactory {
+	versions := make(map[gatewayHotSplitSourceKey]gatewaySplitSource, len(sources))
+	for _, source := range sources {
+		versions[gatewayHotSplitSourceVersionKey(source)] = source
+	}
+	return &gatewayHotSplitFactory{sourceVersions: versions}
 }
 
 func gatewaySplitSourceFixture(t testing.TB, source gateway.ReplicatedShardDescriptor, profile gateway.ReplicatedTableProfile) gatewaySplitSource {

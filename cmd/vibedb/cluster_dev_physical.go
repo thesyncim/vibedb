@@ -688,6 +688,9 @@ func devTableCatalogPath(root, table string) (string, error) {
 	}
 	for _, entry := range inventory.Tables {
 		if entry.Table == table {
+			if entry.ProvisionBundleFormat == gateway.ReplicatedTableProvisionBundleFormat {
+				return filepath.Join(root, entry.artifactStem()+devTableProvisionBundleSuffix), nil
+			}
 			return filepath.Join(root, entry.artifactStem()+"-catalog.vibejson"), nil
 		}
 	}

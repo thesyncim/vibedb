@@ -110,7 +110,7 @@ func TestGatewayHotSplitComposedLocalGlobalBundle(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			factory := gatewayHotSplitFactory{sources: sources}
+			factory := *gatewayHotSplitFactoryForSources(sources)
 			split, err := factory.allocateSplit(catalog, [32]byte{7}, work, source)
 			if err != nil {
 				t.Fatal(err)
