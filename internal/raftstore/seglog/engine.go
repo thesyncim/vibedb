@@ -213,9 +213,19 @@ func (arena *segmentBuildArena) clear() {
 }
 
 type Engine struct {
-	writeMu             sync.Mutex
+	writeMu sync.Mutex
+	// metadataMu serializes the cleanup worker's latest-slot publication with
+	// the sealer's generation/tail prediction. The worker never holds it while
+	// authenticating or unlinking files, so physical cleanup remains detached
+	// from the foreground path.
+	metadataMu          sync.Mutex
 	sealRequests        chan sealRequest
-	reclaimRequests     chan chan error
+	reclaimRequests     chan reclaimRequest
+	cleanupRequests     chan *reclaimTicket
+	cleanupStop         chan struct{}
+	cleanupDone         chan struct{}
+	cleanupTicket       *reclaimTicket
+	cleanupErr          error
 	sealResults         chan error
 	sealStop            chan struct{}
 	sealerDone          chan struct{}
@@ -395,10 +405,14 @@ func CreateEngineAuthenticated(dir string, logID [16]byte, authKey [32]byte, seg
 
 func (e *Engine) startSealer() {
 	e.sealRequests = make(chan sealRequest, 1)
-	e.reclaimRequests = make(chan chan error, 1)
+	e.reclaimRequests = make(chan reclaimRequest, 1)
+	e.cleanupRequests = make(chan *reclaimTicket, 1)
+	e.cleanupStop = make(chan struct{})
+	e.cleanupDone = make(chan struct{})
 	e.sealResults = make(chan error, 1)
 	e.sealStop = make(chan struct{})
 	e.sealerDone = make(chan struct{})
+	go e.runCleanupWorker()
 	go func() {
 		defer close(e.sealerDone)
 		ticker := time.NewTicker(time.Second)
@@ -413,8 +427,19 @@ func (e *Engine) startSealer() {
 					e.writeMu.Unlock()
 				}
 				e.sealResults <- err
-			case result := <-e.reclaimRequests:
-				result <- e.reclaimDeadPrefix()
+			case request := <-e.reclaimRequests:
+				ticket, err := e.beginReclaim(request.recycle)
+				if err != nil || ticket == nil {
+					if request.result != nil {
+						request.result <- err
+					}
+					continue
+				}
+				if request.result != nil {
+					go func(result chan error, ticket *reclaimTicket) {
+						result <- <-ticket.done
+					}(request.result, ticket)
+				}
 			case <-ticker.C:
 				e.runMetadataMaintenance()
 			case <-e.sealStop:
@@ -460,6 +485,11 @@ func (e *Engine) Close() error {
 		close(e.sealStop)
 		<-e.sealerDone
 		e.sealStop = nil
+	}
+	if e.cleanupStop != nil {
+		close(e.cleanupStop)
+		<-e.cleanupDone
+		e.cleanupStop = nil
 	}
 	// Stop new reader acquisitions before waiting for the existing leases. Do
 	// not hold writeMu while waiting: a reader release only needs readerMu.
@@ -2214,7 +2244,7 @@ func (e *Engine) rotateLocked(hook func(RotationPhase) error) error {
 		}
 	}
 	l := e.log
-	if e.maintenanceBusy || l.metadata.needsHealing || l.metadata.slot.ReclaimPhase != reclaimNone || l.metadata.slot.RetiredCheckpointCount != 0 || len(l.state.Segments) == cap(l.state.Segments) || catalogSuffixRecords(l.metadata.slot) >= catalogCheckpointHardRecords || !l.state.Reserves[0].Ready || !l.state.Reserves[1].Ready || l.reserveFiles[0] == nil || l.reserveFiles[1] == nil {
+	if e.maintenanceBusy || e.cleanupErr != nil || l.metadata.needsHealing || l.metadata.slot.ReclaimPhase == reclaimPrepared || len(l.state.Segments) == cap(l.state.Segments) || catalogSuffixRecords(l.metadata.slot) >= catalogCheckpointHardRecords || !l.state.Reserves[0].Ready || !l.state.Reserves[1].Ready || l.reserveFiles[0] == nil || l.reserveFiles[1] == nil {
 		return ErrBackpressure
 	}
 	if cap(l.eventSpare) < cap(l.events) || e.activeBuild == nil || e.spareBuild == nil {
@@ -2279,6 +2309,8 @@ func (e *Engine) rotateLocked(hook func(RotationPhase) error) error {
 }
 
 func (e *Engine) finishFrozenSeal(base metadataState, pending SegmentMeta, events []segmentEvent, build *segmentBuildArena, hook func(RotationPhase) error, deferMaintenance bool) (result error) {
+	e.metadataMu.Lock()
+	defer e.metadataMu.Unlock()
 	if build == nil {
 		return ErrBounds
 	}
@@ -2545,20 +2577,34 @@ func (e *Engine) finishFrozenSeal(base metadataState, pending SegmentMeta, event
 func (e *Engine) runMetadataMaintenance() {
 	e.writeMu.Lock()
 	if e.log != nil && e.log.metadata != nil && (e.log.metadata.slot.ReclaimPhase != reclaimNone || e.log.metadata.slot.RetiredCheckpointCount != 0) {
-		if e.maintenanceBusy || e.sealPending || e.log.usable() != nil || e.log.metadata.slot.HasPending {
+		if e.cleanupTicket != nil || e.maintenanceBusy || e.sealPending || e.log.usable() != nil || e.log.metadata.slot.HasPending {
 			e.writeMu.Unlock()
 			return
 		}
-		e.maintenanceBusy = true
 		e.writeMu.Unlock()
-		_ = e.resumeReclaim()
-		e.writeMu.Lock()
-		e.maintenanceBusy = false
-		e.writeMu.Unlock()
+		_, _ = e.beginReclaim(false)
 		return
 	}
 	if e.maintenanceBusy || e.log == nil || e.log.usable() != nil || e.log.metadata == nil || e.log.metadata.slot.HasPending {
 		e.writeMu.Unlock()
+		return
+	}
+	limit := min(reclaimMaxSegments, maxRetiredSegments)
+	cut, reclaimedBytes := 0, uint64(0)
+	for cut < len(e.log.state.Segments) && cut < limit {
+		segment := e.log.state.Segments[cut]
+		if segment.State != SegmentSealed || cut >= len(e.reclaimAfter) || e.liveSealed[segment.ID] != 0 || e.reclaimAfter[cut] == 0 || e.reclaimAfter[cut] > e.sealedSequence {
+			break
+		}
+		if reclaimedBytes > ^uint64(0)-segment.Bytes {
+			break
+		}
+		reclaimedBytes += segment.Bytes
+		cut++
+	}
+	if reclaimThresholdReached(cut, limit, reclaimedBytes, e.log.state.SegmentCapacity) {
+		e.writeMu.Unlock()
+		_, _ = e.beginReclaim(false)
 		return
 	}
 	missing := [2]bool{}

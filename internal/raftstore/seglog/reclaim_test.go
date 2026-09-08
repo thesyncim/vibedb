@@ -11,6 +11,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 )
 
 func newReclaimableEngine(t *testing.T, dir string) (*Engine, []SegmentMeta, Checkpoint) {
@@ -206,8 +207,32 @@ func TestReclaimDeleteFailuresRetainDurableQueue(t *testing.T) {
 			}
 			reclaimRemove, reclaimSyncDir = oldRemove, oldSync
 			engine.runMetadataMaintenance()
-			if engine.log.metadata.slot.ReclaimPhase != reclaimNone {
-				t.Fatalf("ticker maintenance did not resume queue: %+v", engine.log.metadata.slot)
+			deadline := time.NewTimer(5 * time.Second)
+			defer deadline.Stop()
+			for {
+				engine.writeMu.Lock()
+				phase := engine.log.metadata.slot.ReclaimPhase
+				ticket := engine.cleanupTicket
+				engine.writeMu.Unlock()
+				if phase == reclaimNone {
+					break
+				}
+				if ticket != nil {
+					select {
+					case cleanupErr := <-ticket.done:
+						if cleanupErr != nil {
+							t.Fatalf("ticker cleanup: %v", cleanupErr)
+						}
+					case <-deadline.C:
+						t.Fatalf("ticker maintenance did not resume queue: %+v", engine.log.metadata.slot)
+					}
+				} else {
+					select {
+					case <-time.After(time.Millisecond):
+					case <-deadline.C:
+						t.Fatalf("ticker maintenance did not resume queue: %+v", engine.log.metadata.slot)
+					}
+				}
 			}
 			if err := engine.Close(); err != nil {
 				t.Fatal(err)

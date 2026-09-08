@@ -14,6 +14,22 @@ var reclaimSyncDir = syncDir
 var reclaimBeforeRemove func(string)
 var reclaimBeforeCheckpointRemove func(string)
 
+type reclaimRequest struct {
+	result  chan error
+	recycle bool
+}
+
+// reclaimTicket is the immutable hand-off between the short authenticated
+// logical cut and the physical cleaner. The cleaner never derives retired
+// identities from mutable segment state after this hand-off.
+type reclaimTicket struct {
+	slot           metadataSlot
+	retired        []retiredDescriptor
+	done           chan error
+	recycle        bool
+	checkpointOnly bool
+}
+
 type reclaimPublishPhase uint8
 
 const (
@@ -53,7 +69,7 @@ func (e *Engine) ReclaimDeadPrefix() error {
 	}
 	result := make(chan error, 1)
 	select {
-	case e.reclaimRequests <- result:
+	case e.reclaimRequests <- reclaimRequest{result: result, recycle: true}:
 	case <-e.sealStop:
 		return os.ErrClosed
 	}
@@ -70,25 +86,51 @@ func (e *Engine) ReclaimDeadPrefix() error {
 	}
 }
 
-func (e *Engine) reclaimDeadPrefix() error {
+func (e *Engine) beginReclaim(recycle bool) (*reclaimTicket, error) {
 	e.writeMu.Lock()
-	if e.log != nil && e.log.metadata != nil && (e.log.metadata.slot.ReclaimPhase != reclaimNone || e.log.metadata.slot.RetiredCheckpointCount != 0) {
-		if e.maintenanceBusy || e.sealPending || e.log.usable() != nil || e.log.metadata.slot.HasPending {
-			e.writeMu.Unlock()
-			return ErrBounds
-		}
-		e.maintenanceBusy = true
+	if e.closing {
 		e.writeMu.Unlock()
-		defer func() {
-			e.writeMu.Lock()
-			e.maintenanceBusy = false
+		return nil, os.ErrClosed
+	}
+	if e.log != nil && e.log.metadata != nil && (e.log.metadata.slot.ReclaimPhase != reclaimNone || e.log.metadata.slot.RetiredCheckpointCount != 0) {
+		if e.cleanupTicket != nil || e.maintenanceBusy || e.sealPending || e.log.usable() != nil || e.log.metadata.slot.HasPending {
 			e.writeMu.Unlock()
-		}()
-		return e.resumeReclaim()
+			return nil, ErrBounds
+		}
+		slot := e.log.metadata.slot
+		if slot.ReclaimPhase == reclaimPrepared {
+			e.writeMu.Unlock()
+			if err := e.resumeReclaim(); err != nil {
+				return nil, err
+			}
+			// resumeReclaim completes the interrupted cut, including its
+			// physical cleanup, on this serial lane. Do not start a fresh
+			// threshold scan after the recovered prefix has already been
+			// removed; the caller's request is complete.
+			e.writeMu.Lock()
+			completed := e.log.metadata.slot.ReclaimPhase == reclaimNone && e.log.metadata.slot.RetiredCheckpointCount == 0
+			e.writeMu.Unlock()
+			if completed {
+				return nil, nil
+			}
+			return e.beginReclaim(recycle)
+		}
+		ticket := &reclaimTicket{slot: slot, retired: append([]retiredDescriptor(nil), slot.Retired[:slot.RetiredCount]...), done: make(chan error, 1), recycle: recycle || slot.RetiredReserveMask != 0, checkpointOnly: slot.ReclaimPhase == reclaimNone}
+		e.cleanupTicket = ticket
+		e.writeMu.Unlock()
+		if err := e.enqueueCleanupTicket(ticket); err != nil {
+			e.writeMu.Lock()
+			if e.cleanupTicket == ticket {
+				e.cleanupTicket = nil
+			}
+			e.writeMu.Unlock()
+			return nil, err
+		}
+		return ticket, nil
 	}
 	if e.maintenanceBusy || e.sealPending || e.log == nil || e.log.usable() != nil || e.log.metadata == nil || e.log.metadata.needsHealing || e.log.metadata.slot.HasPending || e.log.metadata.slot.ReclaimPhase != reclaimNone {
 		e.writeMu.Unlock()
-		return ErrBounds
+		return nil, ErrBounds
 	}
 	limit := min(reclaimMaxSegments, maxRetiredSegments)
 	cut := 0
@@ -100,20 +142,19 @@ func (e *Engine) reclaimDeadPrefix() error {
 		}
 		if usedBytes > ^uint64(0)-segment.Bytes {
 			e.writeMu.Unlock()
-			return ErrBounds
+			return nil, ErrBounds
 		}
 		usedBytes += segment.Bytes
 		cut++
 	}
 	if !reclaimThresholdReached(cut, limit, usedBytes, e.log.state.SegmentCapacity) {
 		e.writeMu.Unlock()
-		return ErrBounds
+		return nil, ErrBounds
 	}
 	e.maintenanceBusy = true
 	baseSlot := e.log.metadata.slot
 	removed := e.log.state.Segments[:cut]
 	retained := e.log.state.Segments[cut:]
-	oldBanks := e.log.metadata.bankSlots
 	e.writeMu.Unlock()
 	var compacted []SegmentMeta
 	var compactedFences []uint64
@@ -133,16 +174,16 @@ func (e *Engine) reclaimDeadPrefix() error {
 	record := catalogRecord{Kind: catalogAnchor, AnchorID: anchor.ID, AnchorGeneration: anchor.Generation, AnchorHash: anchor.Hash}
 	tail, catalogHash, err := e.log.metadata.previewRecord(record, baseSlot.Generation+1)
 	if err != nil {
-		return fmt.Errorf("reclaim preview anchor: %w", err)
+		return nil, fmt.Errorf("reclaim preview anchor: %w", err)
 	}
 	checkpointAID := derivedCheckpointID(e.authKey, baseSlot.LogID, baseSlot.Generation+1, tail, catalogHash, anchor.ID, anchor.Generation, anchor.Hash, checkpointRoleReclaimA)
 	checkpointA := catalogCheckpoint{ID: checkpointAID, LogID: baseSlot.LogID, Generation: baseSlot.Generation + 1, Tail: tail, CatalogHash: catalogHash, AnchorID: anchor.ID, AnchorGeneration: anchor.Generation, AnchorHash: anchor.Hash, Segments: retained, BaseSequence: e.sealedSequence, GroupIDs: e.sealedSummaryOrder, GroupSummaries: e.sealedSummaries}
 	checkpointAHash, err := catalogCheckpointWriter(e.log.dir, checkpointA, e.authKey)
 	if err != nil {
-		return fmt.Errorf("reclaim checkpoint A: %w", err)
+		return nil, fmt.Errorf("reclaim checkpoint A: %w", err)
 	}
 	if err = runReclaimHook(reclaimCheckpointAPublished); err != nil {
-		return err
+		return nil, err
 	}
 	cutA := baseSlot
 	cutA.Generation++
@@ -155,10 +196,10 @@ func (e *Engine) reclaimDeadPrefix() error {
 	}
 	if err = e.log.metadata.publish(cutA, &record); err != nil {
 		cleanupUnpublishedCheckpoint(e.log.dir, checkpointA, checkpointAHash, e.authKey)
-		return fmt.Errorf("reclaim cut A: %w", err)
+		return nil, fmt.Errorf("reclaim cut A: %w", err)
 	}
 	if err = runReclaimHook(reclaimPreparedPublished); err != nil {
-		return err
+		return nil, err
 	}
 	cutA = e.log.metadata.slot
 	checkpointBID := derivedCheckpointID(e.authKey, baseSlot.LogID, cutA.Generation+1, tail, catalogHash, anchor.ID, anchor.Generation, anchor.Hash, checkpointRoleReclaimB)
@@ -166,10 +207,10 @@ func (e *Engine) reclaimDeadPrefix() error {
 	checkpointB.ID, checkpointB.Generation = checkpointBID, cutA.Generation+1
 	checkpointBHash, err := catalogCheckpointWriter(e.log.dir, checkpointB, e.authKey)
 	if err != nil {
-		return fmt.Errorf("reclaim checkpoint B: %w", err)
+		return nil, fmt.Errorf("reclaim checkpoint B: %w", err)
 	}
 	if err = runReclaimHook(reclaimCheckpointBPublished); err != nil {
-		return err
+		return nil, err
 	}
 	cutB := cutA
 	cutB.Generation++
@@ -178,23 +219,37 @@ func (e *Engine) reclaimDeadPrefix() error {
 	cutB.CheckpointID, cutB.CheckpointTail, cutB.CheckpointHash = [16]byte(checkpointBID), tail, checkpointBHash
 	if validateErr := validateMetadataSlot(cutB); validateErr != nil {
 		cleanupUnpublishedCheckpoint(e.log.dir, checkpointB, checkpointBHash, e.authKey)
-		return fmt.Errorf("reclaim cut B slot: %w", validateErr)
+		return nil, fmt.Errorf("reclaim cut B slot: %w", validateErr)
 	}
 	if err = e.log.metadata.publish(cutB, nil); err != nil {
 		cleanupUnpublishedCheckpoint(e.log.dir, checkpointB, checkpointBHash, e.authKey)
-		return fmt.Errorf("reclaim cut B: %w", err)
+		return nil, fmt.Errorf("reclaim cut B: %w", err)
 	}
 	if err = runReclaimHook(reclaimDurablePublished); err != nil {
-		return err
+		return nil, err
 	}
 	nextSegments := retained
 	if compacted != nil {
 		nextSegments = compacted
 	}
-	if err = e.finishDurableReclaim(oldBanks, nextSegments, cut, compactedFences); err != nil {
-		return fmt.Errorf("finish durable reclaim: %w", err)
+	if err = e.installDurableReclaimState(nextSegments, cut, compactedFences); err != nil {
+		return nil, fmt.Errorf("install durable reclaim: %w", err)
 	}
-	return nil
+	e.writeMu.Lock()
+	slot := e.log.metadata.slot
+	ticket := &reclaimTicket{slot: slot, retired: append([]retiredDescriptor(nil), slot.Retired[:slot.RetiredCount]...), done: make(chan error, 1), recycle: recycle}
+	e.maintenanceBusy = false
+	e.cleanupTicket = ticket
+	e.writeMu.Unlock()
+	if err := e.enqueueCleanupTicket(ticket); err != nil {
+		e.writeMu.Lock()
+		if e.cleanupTicket == ticket {
+			e.cleanupTicket = nil
+		}
+		e.writeMu.Unlock()
+		return nil, err
+	}
+	return ticket, nil
 }
 
 // resumeReclaim completes an authenticated interrupted reclaim before the
@@ -246,15 +301,30 @@ func (e *Engine) resumeReclaim() error {
 	if slot.ReclaimPhase != reclaimDurable {
 		return ErrCorrupt
 	}
+	legacyReserveConversion := slot.RetiredReserveMask != 0 || !slot.Reserves[0].Ready || !slot.Reserves[1].Ready || e.log.reserveFiles[0] == nil || e.log.reserveFiles[1] == nil
+	if !legacyReserveConversion {
+		if err := e.installDurableReclaimState(nil, 0, nil); err != nil {
+			return err
+		}
+		ticket := &reclaimTicket{slot: slot, retired: append([]retiredDescriptor(nil), slot.Retired[:slot.RetiredCount]...), done: make(chan error, 1)}
+		return e.finishRetiredFiles(ticket)
+	}
 	return e.finishDurableReclaim(oldBanks, nil, 0, nil)
 }
 
-func (e *Engine) finishDurableReclaim(oldBanks [2]metadataSlot, replacement []SegmentMeta, removedCount int, compactedFences []uint64) error {
+// installDurableReclaimState publishes the in-memory consequence of an
+// authenticated durable cut. It deliberately does not recycle or unlink any
+// retired file; those operations belong to the cleaner ticket.
+func (e *Engine) installDurableReclaimState(replacement []SegmentMeta, removedCount int, compactedFences []uint64) error {
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+	if e.log == nil || e.log.metadata == nil {
+		return ErrCorrupt
+	}
 	slot := e.log.metadata.slot
 	if slot.ReclaimPhase != reclaimDurable || slot.RetiredCount == 0 {
 		return ErrCorrupt
 	}
-	e.writeMu.Lock()
 	if replacement == nil {
 		cut := 0
 		for cut < len(e.log.state.Segments) && e.log.state.Segments[cut].ID <= slot.AnchorID {
@@ -264,12 +334,10 @@ func (e *Engine) finishDurableReclaim(oldBanks [2]metadataSlot, replacement []Se
 			e.log.state.Segments = e.log.state.Segments[cut:]
 			e.reclaimAfter = e.reclaimAfter[cut:]
 		}
-	}
-	e.log.state.AnchorID, e.log.state.AnchorGeneration, e.log.state.AnchorHash = slot.AnchorID, slot.AnchorGeneration, slot.AnchorHash
-	e.log.state.Generation = slot.Generation
-	// A newly initiated reclaim already prepared a compact replacement. Resume
-	// on Open starts from the checkpoint's compact descriptor allocation.
-	if replacement != nil {
+	} else {
+		if removedCount < 0 || removedCount > len(e.reclaimAfter) {
+			return ErrCorrupt
+		}
 		retainedFences := e.reclaimAfter[removedCount:]
 		if compactedFences != nil {
 			copy(compactedFences, retainedFences)
@@ -278,21 +346,35 @@ func (e *Engine) finishDurableReclaim(oldBanks [2]metadataSlot, replacement []Se
 		e.log.state.Segments = replacement
 		e.reclaimAfter = retainedFences
 	}
+	e.log.state.AnchorID, e.log.state.AnchorGeneration, e.log.state.AnchorHash = slot.AnchorID, slot.AnchorGeneration, slot.AnchorHash
+	e.log.state.Generation = slot.Generation
+
 	e.readerMu.Lock()
 	e.ensureReaderCondLocked()
 	for i, reader := range e.readers {
 		if reader == nil || reader.file == nil || reader.id > slot.AnchorID {
 			continue
 		}
-		if closeErr := e.detachReaderLocked(reader); closeErr != nil {
+		if err := e.detachReaderLocked(reader); err != nil {
 			e.readerMu.Unlock()
-			e.writeMu.Unlock()
-			return closeErr
+			return err
 		}
+		// Keep the fixed reader-slot shape for existing callers; a pinned old
+		// record remains in detachedReaders until its final lease closes.
 		e.readers[i] = &segmentReader{}
 	}
 	e.readerMu.Unlock()
-	e.writeMu.Unlock()
+	return nil
+}
+
+func (e *Engine) finishDurableReclaim(oldBanks [2]metadataSlot, replacement []SegmentMeta, removedCount int, compactedFences []uint64) error {
+	slot := e.log.metadata.slot
+	if slot.ReclaimPhase != reclaimDurable || slot.RetiredCount == 0 {
+		return ErrCorrupt
+	}
+	if err := e.installDurableReclaimState(replacement, removedCount, compactedFences); err != nil {
+		return err
+	}
 
 	// Fill empty reserve ownership from the dead prefix before unlinking. The
 	// lifecycle certificate remains authenticated while the identity area is
@@ -437,6 +519,222 @@ func (e *Engine) finishDurableReclaim(oldBanks [2]metadataSlot, replacement []Se
 	return e.finishCheckpointRetirements()
 }
 
+func (e *Engine) enqueueCleanupTicket(ticket *reclaimTicket) error {
+	if ticket == nil || e.cleanupRequests == nil || e.cleanupStop == nil {
+		return ErrRaftState
+	}
+	select {
+	case e.cleanupRequests <- ticket:
+		return nil
+	case <-e.cleanupStop:
+		return os.ErrClosed
+	}
+}
+
+func (e *Engine) runCleanupWorker() {
+	defer close(e.cleanupDone)
+	for {
+		select {
+		case ticket := <-e.cleanupRequests:
+			e.processCleanupTicket(ticket)
+		case <-e.cleanupStop:
+			for {
+				select {
+				case ticket := <-e.cleanupRequests:
+					e.processCleanupTicket(ticket)
+				default:
+					return
+				}
+			}
+		}
+	}
+}
+
+func (e *Engine) processCleanupTicket(ticket *reclaimTicket) {
+	if ticket == nil {
+		return
+	}
+	var err error
+	if ticket.checkpointOnly {
+		err = e.finishCheckpointRetirements()
+	} else if ticket.recycle {
+		// Explicit ReclaimDeadPrefix retains the historical synchronous reserve
+		// conversion contract. Autonomous cleanup never sets recycle, so it
+		// cannot claim a retired file while the durable intent is live.
+		err = e.finishDurableReclaim([2]metadataSlot{}, nil, 0, nil)
+	} else {
+		err = e.finishRetiredFiles(ticket)
+	}
+	e.writeMu.Lock()
+	if e.cleanupTicket == ticket {
+		e.cleanupTicket = nil
+		e.cleanupErr = err
+	}
+	if err != nil && errors.Is(err, ErrCorrupt) && !ticket.recycle && e.log != nil {
+		e.log.poison(err)
+	}
+	e.writeMu.Unlock()
+	ticket.done <- err
+}
+
+func (e *Engine) waitRetiredReaders(anchor uint64) {
+	e.readerMu.Lock()
+	e.ensureReaderCondLocked()
+	for {
+		pending := false
+		for _, reader := range e.detachedReaders {
+			if reader != nil && reader.id <= anchor && reader.leases.Load() != 0 {
+				pending = true
+				break
+			}
+		}
+		if !pending {
+			break
+		}
+		e.readerCond.Wait()
+	}
+	e.readerMu.Unlock()
+}
+
+// removeExactPublishedPathNoSync verifies and removes one authenticated path
+// without syncing the directory. A caller batches the final directory sync
+// after all paths in one ticket have been removed.
+func removeExactPublishedPathNoSync(opened os.FileInfo, path string) error {
+	check, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if opened == nil || !os.SameFile(opened, check) {
+		return ErrCorrupt
+	}
+	if err = reclaimRemove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if _, err = os.Lstat(path); err == nil {
+		return ErrCorrupt
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+func (e *Engine) finishRetiredFiles(ticket *reclaimTicket) error {
+	if ticket == nil || e.log == nil || e.log.metadata == nil {
+		return ErrCorrupt
+	}
+	e.waitRetiredReaders(ticket.slot.AnchorID)
+
+	e.metadataMu.Lock()
+	e.writeMu.Lock()
+	if err := e.log.usable(); err != nil {
+		e.writeMu.Unlock()
+		e.metadataMu.Unlock()
+		return err
+	}
+	slot := e.log.metadata.slot
+	if slot.ReclaimPhase != reclaimDurable || slot.RetiredCount == 0 || int(slot.RetiredCount) != len(ticket.retired) {
+		e.writeMu.Unlock()
+		e.metadataMu.Unlock()
+		return ErrCorrupt
+	}
+	for i, retired := range ticket.retired {
+		if slot.Retired[i] != retired {
+			e.writeMu.Unlock()
+			e.metadataMu.Unlock()
+			return ErrCorrupt
+		}
+	}
+	dir, logID, capacity := e.log.dir, slot.LogID, e.log.state.SegmentCapacity
+	e.writeMu.Unlock()
+	e.metadataMu.Unlock()
+
+	for _, retired := range ticket.retired {
+		path := segmentPath(dir, retired.FileID)
+		file, openErr := os.Open(path)
+		if errors.Is(openErr, os.ErrNotExist) {
+			continue
+		}
+		if openErr != nil {
+			return openErr
+		}
+		opened, statErr := file.Stat()
+		if statErr == nil {
+			var derived SegmentMeta
+			derived, _, statErr = readUnpublishedSealedFile(file, retired.FileID, capacity, logID, retired.ID-1, retired.PreviousHash, e.authKey)
+			if statErr == nil && (derived.ID != retired.ID || derived.Generation != retired.Generation || derived.Hash != retired.Hash) {
+				statErr = ErrCorrupt
+			}
+		}
+		closeErr := file.Close()
+		if statErr != nil || closeErr != nil {
+			return errors.Join(statErr, closeErr)
+		}
+		if reclaimBeforeRemove != nil {
+			reclaimBeforeRemove(path)
+		}
+		if err := removeExactPublishedPathNoSync(opened, path); err != nil {
+			return err
+		}
+		if err := runReclaimHook(reclaimFileRemoved); err != nil {
+			return err
+		}
+	}
+	if err := reclaimSyncDir(dir); err != nil {
+		return err
+	}
+
+	// The ticket owns only the segment retirement. Start the paired clear from
+	// the latest slot so rotations and checkpoint-queue additions survive.
+	e.metadataMu.Lock()
+	e.writeMu.Lock()
+	latest := e.log.metadata.slot
+	if latest.ReclaimPhase != reclaimDurable || latest.RetiredCount != uint8(len(ticket.retired)) {
+		e.writeMu.Unlock()
+		e.metadataMu.Unlock()
+		return ErrCorrupt
+	}
+	for i, retired := range ticket.retired {
+		if latest.Retired[i] != retired {
+			e.writeMu.Unlock()
+			e.metadataMu.Unlock()
+			return ErrCorrupt
+		}
+	}
+	clearA := latest
+	clearA.Generation++
+	clearA.ReclaimPhase, clearA.RetiredCount, clearA.RetiredReserveMask = reclaimNone, 0, 0
+	clear(clearA.Retired[:])
+	if err := e.log.metadata.publish(clearA, nil); err != nil {
+		e.writeMu.Unlock()
+		e.metadataMu.Unlock()
+		return err
+	}
+	if err := runReclaimHook(reclaimQueueClearFirst); err != nil {
+		e.writeMu.Unlock()
+		e.metadataMu.Unlock()
+		return err
+	}
+	clearB := e.log.metadata.slot
+	clearB.Generation++
+	if err := e.log.metadata.publish(clearB, nil); err != nil {
+		e.writeMu.Unlock()
+		e.metadataMu.Unlock()
+		return err
+	}
+	if err := runReclaimHook(reclaimQueueClearSecond); err != nil {
+		e.writeMu.Unlock()
+		e.metadataMu.Unlock()
+		return err
+	}
+	e.log.state.Generation = clearB.Generation
+	e.writeMu.Unlock()
+	e.metadataMu.Unlock()
+	return e.finishCheckpointRetirements()
+}
+
 func addCheckpointRetirements(next *metadataSlot, old [2]metadataSlot) error {
 	kept := [2][16]byte{next.CheckpointID, next.PreviousCheckpointID}
 	for i := range old {
@@ -518,14 +816,17 @@ func (e *Engine) finishCheckpointRetirements() error {
 	// an older slot. Publish at most two authenticated clones to converge both
 	// banks before any unlink is attempted.
 	for attempt := 0; attempt < len(e.log.metadata.bankSlots); attempt++ {
+		e.metadataMu.Lock()
 		e.writeMu.Lock()
 		if err := e.log.usable(); err != nil {
 			e.writeMu.Unlock()
+			e.metadataMu.Unlock()
 			return err
 		}
 		slot := e.log.metadata.slot
 		if slot.RetiredCheckpointCount == 0 {
 			e.writeMu.Unlock()
+			e.metadataMu.Unlock()
 			return nil
 		}
 		needsClone := false
@@ -533,6 +834,7 @@ func (e *Engine) finishCheckpointRetirements() error {
 			referenced, needsHealing, err := checkpointRetirementBankState(e.log.metadata, slot.RetiredCheckpoints[i])
 			if err != nil {
 				e.writeMu.Unlock()
+				e.metadataMu.Unlock()
 				return err
 			}
 			needsClone = needsClone || referenced || needsHealing
@@ -541,16 +843,19 @@ func (e *Engine) finishCheckpointRetirements() error {
 			ticket := make([]retiredCheckpointDescriptor, slot.RetiredCheckpointCount)
 			copy(ticket, slot.RetiredCheckpoints[:slot.RetiredCheckpointCount])
 			e.writeMu.Unlock()
+			e.metadataMu.Unlock()
 			return e.removeCheckpointRetirementTicket(ticket)
 		}
 		next := slot
 		next.Generation++
 		if err := e.log.metadata.publish(next, nil); err != nil {
 			e.writeMu.Unlock()
+			e.metadataMu.Unlock()
 			return err
 		}
 		e.log.state.Generation = next.Generation
 		e.writeMu.Unlock()
+		e.metadataMu.Unlock()
 	}
 	return ErrBounds
 }
@@ -564,10 +869,12 @@ func (e *Engine) removeCheckpointRetirementTicket(ticket []retiredCheckpointDesc
 		// Metadata publication is the serialization boundary for the namespace
 		// claim. Recheck it immediately before authentication/unlink in case an
 		// ordinary checkpoint advanced while this ticket was doing I/O.
+		e.metadataMu.Lock()
 		e.writeMu.Lock()
 		current := e.log.metadata.slot
 		referenced, needsHealing, err := checkpointRetirementBankState(e.log.metadata, retired)
 		e.writeMu.Unlock()
+		e.metadataMu.Unlock()
 		if err != nil {
 			return err
 		}
@@ -598,8 +905,12 @@ func (e *Engine) removeCheckpointRetirementTicket(ticket []retiredCheckpointDesc
 	// Merge the exact completed set into the latest slot. New queue entries
 	// appended by an intervening rotation remain in place and are carried by
 	// both paired publications.
+	e.metadataMu.Lock()
 	e.writeMu.Lock()
-	defer e.writeMu.Unlock()
+	defer func() {
+		e.writeMu.Unlock()
+		e.metadataMu.Unlock()
+	}()
 	latest := e.log.metadata.slot
 	if latest.RetiredCheckpointCount == 0 {
 		return ErrCorrupt
