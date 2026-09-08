@@ -84,6 +84,15 @@ var (
 	ErrCheckpointGroupPressure = errors.New(
 		"vibedb: checkpoint group must advance before this mutation can be admitted",
 	)
+	// errCheckpointGroupCertificationRequired is emitted only when a primary
+	// structural split reaches the collection's physical fence with a visible
+	// group suffix that is not yet certified. The group handles this exact
+	// sentinel after the inner commit attempt has unwound, certifies the existing
+	// cut, and retries the unchanged transition. Other pressure errors retain
+	// their full-checkpoint path.
+	errCheckpointGroupCertificationRequired = fmt.Errorf(
+		"%w: structural split requires certification", ErrCheckpointGroupPressure,
+	)
 	// ErrCheckpointGroupCorrupt reports a missing, torn, mismatched, or
 	// non-contiguous format-0 certificate/decision prefix.
 	ErrCheckpointGroupCorrupt = errors.New(
@@ -123,6 +132,13 @@ var (
 		"vibedb: checkpoint retention witness is not current",
 	)
 )
+
+// isExactCheckpointGroupCertificationRequired deliberately uses identity,
+// rather than errors.Is: a wrapped or joined sentinel also carries the
+// unwinding/storage failure and must remain terminal.
+func isExactCheckpointGroupCertificationRequired(err error) bool {
+	return err == errCheckpointGroupCertificationRequired
+}
 
 // CheckpointGroupOptions fixes the periodic certificate cadence in physical
 // group transactions. Zero selects 128 transactions. Since one consecutive
@@ -192,11 +208,15 @@ func checkpointGroupSeedProfile(seed CheckpointGroupSeed) (
 	return seed.Applied, state, member, nil
 }
 
-// CheckpointGroupStats is a detached counter snapshot. BarrierSyncs counts the
-// K target-journal Syncs plus the one certificate Sync used by ordinary
-// checkpoints. MarkerSyncs counts only exceptional marker recycling; the
-// marker is not commit authority and is never synced by the normal barrier.
-// A normal transition leaves every Sync counter unchanged.
+// CheckpointGroupStats is a detached counter snapshot. Checkpoints counts
+// authenticated certificate advancements, while PhysicalCheckpoints counts
+// the successful per-member physical folds attempted by a full checkpoint. A
+// structural admission certificate can therefore advance Checkpoints without
+// advancing PhysicalCheckpoints. BarrierSyncs counts the K target-journal
+// Syncs plus the one certificate Sync used by ordinary checkpoints. MarkerSyncs
+// counts only exceptional marker recycling; the marker is not commit authority
+// and is never synced by the normal barrier. A normal transition leaves every
+// Sync counter unchanged.
 type CheckpointGroupStats struct {
 	AppliedIndex           uint64
 	CheckpointAppliedIndex uint64
@@ -1730,11 +1750,11 @@ func (g *CheckpointGroup) updateLocked(
 	// a terminal checkpoint error after its requested publication is visible.
 	checkpointDue := g.txn-g.certTxn.Load() >= g.opts.CheckpointEvery
 	if checkpointDue {
-		before := g.checkpoints.Load()
+		before := g.physicalCheckpoints.Load()
 		if err := g.checkpointLocked(); err != nil {
 			return err
 		}
-		if g.checkpoints.Load() != before {
+		if g.physicalCheckpoints.Load() != before {
 			g.periodicCheckpoints.Add(1)
 		}
 	}
@@ -1779,7 +1799,9 @@ func (g *CheckpointGroup) updateLocked(
 		}
 	}
 
-	for attempt := 0; attempt < 2; attempt++ {
+	certificationRetry := false
+	pressureRetry := false
+	for attempt := 0; attempt < 3; attempt++ {
 		if !actualMarkerRoom {
 			requiredSequences := uint64(2) // marker successor + future update certificate
 			if g.certTxn.Load() != g.txn {
@@ -1788,11 +1810,11 @@ func (g *CheckpointGroup) updateLocked(
 			if err := g.requireCertificateSequenceBudgetLocked(requiredSequences); err != nil {
 				return err
 			}
-			before := g.checkpoints.Load()
+			before := g.physicalCheckpoints.Load()
 			if err := g.checkpointLocked(); err != nil {
 				return err
 			}
-			if g.checkpoints.Load() != before {
+			if g.physicalCheckpoints.Load() != before {
 				g.markerCheckpoints.Add(1)
 			}
 			if err := g.recycleMarkerLocked(); err != nil {
@@ -1807,6 +1829,26 @@ func (g *CheckpointGroup) updateLocked(
 			}
 		}
 		err = g.commitTransitionLocked(g.txn+1, update.lastApplied, dirty, batch.byName, limits)
+		if isExactCheckpointGroupCertificationRequired(err) {
+			if certificationRetry {
+				return err
+			}
+			certificationRetry = true
+			// commitTransitionLocked has unwound all staged members and released
+			// commitMu/writers before returning. Certification therefore keeps the
+			// established group lock order and does not deadlock on a dirty member.
+			if err := g.certifyLocked(); err != nil {
+				return err
+			}
+			continue
+		}
+		// Only the exact sentinel above authorizes certification and a retry. A
+		// wrapped or joined sentinel also carries an inner failure from the
+		// unwinding path; keep that terminal error intact rather than allowing the
+		// generic public-pressure retry to consume it.
+		if errors.Is(err, errCheckpointGroupCertificationRequired) {
+			return err
+		}
 		if !errors.Is(err, ErrCheckpointGroupPressure) {
 			if err == nil {
 				if update.consecutive {
@@ -1826,6 +1868,10 @@ func (g *CheckpointGroup) updateLocked(
 			}
 			return err
 		}
+		if pressureRetry {
+			return err
+		}
+		pressureRetry = true
 		requiredSequences := uint64(1) // future certificate for this update
 		if g.certTxn.Load() != g.txn {
 			requiredSequences++
@@ -1833,11 +1879,11 @@ func (g *CheckpointGroup) updateLocked(
 		if err := g.requireCertificateSequenceBudgetLocked(requiredSequences); err != nil {
 			return err
 		}
-		before := g.checkpoints.Load()
+		before := g.physicalCheckpoints.Load()
 		if err := g.checkpointLocked(); err != nil {
 			return err
 		}
-		if g.checkpoints.Load() != before {
+		if g.physicalCheckpoints.Load() != before {
 			g.pressureCheckpoints.Add(1)
 		}
 	}
@@ -2167,7 +2213,8 @@ func (g *CheckpointGroup) markerRoomLocked(targetCount int) (bool, error) {
 	return room, nil
 }
 
-// MaybeCheckpoint applies the configured physical-transaction cadence.
+// MaybeCheckpoint applies the configured physical-transaction cadence with a
+// full physical checkpoint when the cadence is due.
 func (g *CheckpointGroup) MaybeCheckpoint() error {
 	if g == nil {
 		return ErrCheckpointGroupOwned
@@ -2197,9 +2244,11 @@ func (g *CheckpointGroup) Checkpoint() error {
 	if err := g.checkUsableLocked(); err != nil {
 		return err
 	}
-	before := g.checkpoints.Load()
+	beforeCertificate := g.checkpoints.Load()
+	beforePhysical := g.physicalCheckpoints.Load()
 	err := g.checkpointLocked()
-	if err == nil && g.checkpoints.Load() != before {
+	if err == nil && (g.checkpoints.Load() != beforeCertificate ||
+		g.physicalCheckpoints.Load() != beforePhysical) {
 		g.explicitCheckpoints.Add(1)
 	}
 	return err
@@ -2392,57 +2441,8 @@ func (g *CheckpointGroup) checkpointLocked() error {
 	if g.foldedTxn == g.txn && g.certTxn.Load() == g.txn {
 		return nil
 	}
-	// Every physical completion recycles every fixed member journal. Qualify all
-	// independent journal counters before the first journal Sync, certificate
-	// successor, or collection-root fold so a later member cannot expose a partial
-	// terminal checkpoint.
-	for _, member := range g.members {
-		if err := checkpointGroupMemberCheckpointRecycleTerminal(member.collection); err != nil {
-			return err
-		}
-	}
-	if g.certTxn.Load() != g.txn {
-		// Refuse before journal Sync or any owner mutation. Sequence zero is not a
-		// certificate encoding, so wrapping here would convert typed exhaustion
-		// into an in-memory/disk divergence and a generic corruption error.
-		if g.sequence == math.MaxUint64 {
-			return ErrCheckpointGroupSequence
-		}
-		g.log.commitMu.Lock()
-		for _, member := range g.members {
-			c := member.collection
-			c.writer.Lock()
-			if failure := c.PersistenceError(); failure != nil {
-				c.writer.Unlock()
-				g.log.commitMu.Unlock()
-				return failure
-			}
-			err := c.journal.Sync(c.journalPowerSafe)
-			c.writer.Unlock()
-			if err != nil {
-				g.log.commitMu.Unlock()
-				return g.poisonLocked(journalCommitOutcomeUnknown(err))
-			}
-			g.journalSyncs.Add(1)
-			if checkpointGroupFaultHook != nil {
-				if err := checkpointGroupFaultHook(checkpointGroupAfterJournalSync); err != nil {
-					g.log.commitMu.Unlock()
-					return g.poisonLocked(err)
-				}
-			}
-		}
-		g.sequence++
-		certificate := g.certificateLocked()
-		if err := g.writeCertificateLocked(certificate); err != nil {
-			g.log.commitMu.Unlock()
-			return g.poisonLocked(err)
-		}
-		g.certTxn.Store(g.txn)
-		g.certApplied.Store(g.applied)
-		g.recordCertifiedSpanLocked(certificate)
-		g.barrierSyncs.Add(uint64(len(g.members) + 1))
-		g.checkpoints.Add(1)
-		g.log.commitMu.Unlock()
+	if err := g.certifyLocked(); err != nil {
+		return err
 	}
 
 	// Certificate durability is already sufficient for recovery. Physical folds
@@ -2472,6 +2472,68 @@ func (g *CheckpointGroup) checkpointLocked() error {
 	}
 	g.foldedTxn = g.txn
 	g.log.undischarged = 0
+	g.log.commitMu.Unlock()
+	return nil
+}
+
+// certifyLocked durably advances the authenticated certificate to the current
+// contiguous group cut without folding any member roots. Structural admission
+// uses this boundary before its collection-local topology fold; full checkpoint
+// callers then fold every member under the existing lifecycle gates.
+func (g *CheckpointGroup) certifyLocked() error {
+	// Qualify all independent journal counters before the first journal Sync or
+	// certificate successor. A later member must not discover terminal recycle
+	// exhaustion after an earlier member has already been synced. This preflight
+	// also remains necessary when the certificate is current but a full caller
+	// still has an unfurled physical suffix to fold.
+	for _, member := range g.members {
+		if err := checkpointGroupMemberCheckpointRecycleTerminal(member.collection); err != nil {
+			return err
+		}
+	}
+	if g.certTxn.Load() == g.txn {
+		return nil
+	}
+	// Refuse before journal Sync or any owner mutation. Sequence zero is not a
+	// certificate encoding, so wrapping here would convert typed exhaustion
+	// into an in-memory/disk divergence and a generic corruption error.
+	if g.sequence == math.MaxUint64 {
+		return ErrCheckpointGroupSequence
+	}
+	g.log.commitMu.Lock()
+	for _, member := range g.members {
+		c := member.collection
+		c.writer.Lock()
+		if failure := c.PersistenceError(); failure != nil {
+			c.writer.Unlock()
+			g.log.commitMu.Unlock()
+			return failure
+		}
+		err := c.journal.Sync(c.journalPowerSafe)
+		c.writer.Unlock()
+		if err != nil {
+			g.log.commitMu.Unlock()
+			return g.poisonLocked(journalCommitOutcomeUnknown(err))
+		}
+		g.journalSyncs.Add(1)
+		if checkpointGroupFaultHook != nil {
+			if err := checkpointGroupFaultHook(checkpointGroupAfterJournalSync); err != nil {
+				g.log.commitMu.Unlock()
+				return g.poisonLocked(err)
+			}
+		}
+	}
+	g.sequence++
+	certificate := g.certificateLocked()
+	if err := g.writeCertificateLocked(certificate); err != nil {
+		g.log.commitMu.Unlock()
+		return g.poisonLocked(err)
+	}
+	g.certTxn.Store(g.txn)
+	g.certApplied.Store(g.applied)
+	g.recordCertifiedSpanLocked(certificate)
+	g.barrierSyncs.Add(uint64(len(g.members) + 1))
+	g.checkpoints.Add(1)
 	g.log.commitMu.Unlock()
 	return nil
 }
