@@ -382,7 +382,7 @@ func primarySplitCrashKey(i int) string { return fmt.Sprintf("key-%04d", i) }
 
 func primarySplitCrashValue(i int) []byte {
 	value := fmt.Appendf(nil, `{"i":%d,"pad":"`, i)
-	value = appendWideJSONSafePattern(value, 1700, i*37)
+	value = appendCompressionResistantJSONSafePattern(value, 1700, i*37)
 	return append(value, `"}`...)
 }
 

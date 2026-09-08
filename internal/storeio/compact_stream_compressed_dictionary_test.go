@@ -206,6 +206,226 @@ func TestCompactCompressedDictionaryWarmEncodeAllocations(t *testing.T) {
 	}
 }
 
+func TestCompactCompressedDictionaryPreparedScanFragments(t *testing.T) {
+	values := compressedDictionaryTestValues(8, 64)
+	records := make([]CommonPrimaryLeafRecord, len(values))
+	for row := range records {
+		records[row] = CommonPrimaryLeafRecord{
+			Key:   []byte(fmt.Sprintf("row-%04d", row)),
+			Value: CommonPrimaryLeafValue{Inline: append(append([]byte(`{"value":`), values[row]...), '}')},
+		}
+	}
+	view := compactProjectionTestView(t, records)
+	var decoder CompactPrimaryScanDecoder
+	decoder.prepare(&view, 0)
+	if !decoder.supported {
+		t.Fatal("scan decoder declined ordinary compressed dictionary leaf")
+	}
+	streamAt := -1
+	for at := range decoder.streamView {
+		if decoder.streamView[at].kind == compactStreamCompressedDictionary {
+			streamAt = at
+			break
+		}
+	}
+	if streamAt < 0 || decoder.streamPlan[streamAt].dictionaryCount == 0 {
+		t.Fatal("compressed dictionary was not prepared into fragment pool")
+	}
+	for row := range records {
+		got, ok := decoder.appendDictionaryFragment(nil, streamAt, row)
+		if !ok || !bytes.Contains(got, values[row]) {
+			t.Fatalf("row %d prepared fragment = %q, %v", row, got, ok)
+		}
+	}
+}
+
+func TestCompactCompressedDictionaryProjectionLifetimeAndBound(t *testing.T) {
+	values := compressedDictionaryTestValues(8, 64)
+	records := make([]CommonPrimaryLeafRecord, len(values))
+	for row := range records {
+		document := append([]byte(`{"first":`), values[row]...)
+		document = append(document, `,"second":"tail"}`...)
+		records[row] = CommonPrimaryLeafRecord{
+			Key:   []byte(fmt.Sprintf("row-%04d", row)),
+			Value: CommonPrimaryLeafValue{Inline: document},
+		}
+	}
+	view := compactProjectionTestView(t, records)
+	filter, err := NewUnifiedProjectionFilter([][]byte{[]byte("/first"), []byte("/second")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := make([]int, 1)
+	shapes := make([]UnifiedProjectionShapeWorkspace, 1)
+	streams := make([]UnifiedProjectionStreamWorkspace, 2)
+	fields := make([]UnifiedProjectionField, 2)
+	callbacks := 0
+	supported, stopped, scratch, err := view.VisitResolvedProjection(
+		filter.resolvers, seen, shapes, streams, fields,
+		make([]byte, 0, len(values[0])+32), -1,
+		func(row int, fields []UnifiedProjectionField) error {
+			callbacks++
+			if !bytes.Equal(fields[0].JSON, values[row]) || !bytes.Equal(fields[1].JSON, []byte(`"tail"`)) {
+				t.Fatalf("row %d projection changed prior field: %q / %q", row, fields[0].JSON, fields[1].JSON)
+			}
+			return nil
+		},
+	)
+	if err != nil || !supported || stopped || callbacks != len(records) {
+		t.Fatalf("projection supported=%v stopped=%v callbacks=%d err=%v", supported, stopped, callbacks, err)
+	}
+	tooSmall := make([]byte, 0, len(values[0])-1)
+	supported, stopped, tooSmall, err = view.VisitResolvedProjection(
+		filter.resolvers, seen, shapes, streams, fields, tooSmall, -1,
+		func(int, []UnifiedProjectionField) error {
+			t.Fatal("insufficient scratch published a row")
+			return nil
+		},
+	)
+	if err != nil || supported || stopped || len(tooSmall) != 0 || cap(tooSmall) != len(values[0])-1 {
+		t.Fatalf("small scratch supported=%v stopped=%v len/cap=%d/%d err=%v", supported, stopped, len(tooSmall), cap(tooSmall), err)
+	}
+	_ = scratch
+}
+
+func TestCompactCompressedDictionaryAlternatingWarmWorkspaceAllocations(t *testing.T) {
+	cardinalities := []int{2, 8, 16, 64}
+	accepted := make([][][]byte, len(cardinalities))
+	for at, cardinality := range cardinalities {
+		accepted[at] = compressedDictionaryTestValues(cardinality, 64)
+	}
+	rejected := make([][]byte, 64)
+	for row := range rejected {
+		value := make([]byte, 202)
+		value[0], value[len(value)-1] = '"', '"'
+		for at := 1; at < len(value)-1; at++ {
+			value[at] = byte(33 + (row*79+at*43+row*at*17)%90)
+			if value[at] == '"' || value[at] == '\\' {
+				value[at] = '~'
+			}
+		}
+		rejected[row] = value
+	}
+	var scratch compactStreamScratch
+	wire := make([]byte, 0, CommonPrimaryLeafMaxExtentBytes)
+	// Warm the largest cardinality and both admission outcomes before measuring.
+	for _, set := range accepted {
+		encoded := scratch.encode(set)
+		var err error
+		wire, err = encoded.appendBinary(wire[:0])
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	encoded := scratch.encode(rejected)
+	var err error
+	wire, err = encoded.appendBinary(wire[:0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if allocs := testing.AllocsPerRun(100, func() {
+		for _, set := range accepted {
+			encoded := scratch.encode(set)
+			var err error
+			wire, err = encoded.appendBinary(wire[:0])
+			if err != nil {
+				panic(err)
+			}
+		}
+		encoded := scratch.encode(rejected)
+		var err error
+		wire, err = encoded.appendBinary(wire[:0])
+		if err != nil {
+			panic(err)
+		}
+	}); allocs != 0 {
+		t.Fatalf("alternating warm encode+framing allocations = %.2f", allocs)
+	}
+}
+
+func compressedDictionaryScanFixture(t testing.TB, distinct, fields int) (CompactPrimaryStripeView, [][]byte) {
+	t.Helper()
+	values := compressedDictionaryTestValues(distinct, 64)
+	records := make([]CommonPrimaryLeafRecord, len(values))
+	documents := make([][]byte, len(values))
+	for row := range records {
+		document := []byte{'{'}
+		for field := range fields {
+			if field != 0 {
+				document = append(document, ',')
+			}
+			document = fmt.Appendf(document, `"value%d":`, field)
+			document = append(document, values[row]...)
+		}
+		document = append(document, '}')
+		documents[row] = document
+		records[row] = CommonPrimaryLeafRecord{
+			Key: []byte(fmt.Sprintf("row-%04d", row)), Value: CommonPrimaryLeafValue{Inline: document},
+		}
+	}
+	return compactProjectionTestView(t, records), documents
+}
+
+func TestCompactCompressedDictionaryScanPoolFallbackAndReuse(t *testing.T) {
+	fit, fitDocuments := compressedDictionaryScanFixture(t, 8, 1)
+	var decoder CompactPrimaryScanDecoder
+	decoder.prepare(&fit, 0)
+	if !decoder.supported || decoder.streamPlan[0].dictionaryCount == 0 {
+		t.Fatal("fit fixture did not prepare compressed fragments")
+	}
+	dst := make([]byte, 0, 1024)
+	for row := range fitDocuments {
+		got, ok := decoder.appendValue(dst[:0], &fit, 0, row, 0, row)
+		if !ok || !bytes.Equal(got, fitDocuments[row]) {
+			t.Fatalf("fit row %d = %q, %v", row, got, ok)
+		}
+	}
+	if allocs := testing.AllocsPerRun(100, func() {
+		var ok bool
+		dst, ok = decoder.appendValue(dst[:0], &fit, 0, 0, 0, 0)
+		if !ok {
+			panic("scan")
+		}
+	}); allocs != 0 {
+		t.Fatalf("warm prepared scan allocations = %.2f", allocs)
+	}
+
+	exhausted, exhaustedDocuments := compressedDictionaryScanFixture(t, 16, 2)
+	decoder = CompactPrimaryScanDecoder{}
+	decoder.prepare(&exhausted, 0)
+	if !decoder.supported {
+		t.Fatal("pool exhaustion disabled bounded scan fallback")
+	}
+	prepared, fallback := 0, 0
+	for at := 0; at < 2; at++ {
+		if decoder.streamPlan[at].dictionaryCount == 0 {
+			fallback++
+		} else {
+			prepared++
+		}
+	}
+	if prepared != 1 || fallback != 1 {
+		t.Fatalf("two-hole pool plans prepared/fallback = %d/%d, want 1/1", prepared, fallback)
+	}
+	for row := range exhaustedDocuments {
+		got, ok := decoder.appendValue(dst[:0], &exhausted, 0, row, 0, row)
+		if !ok || !bytes.Equal(got, exhaustedDocuments[row]) {
+			t.Fatalf("fallback row %d = %q, %v", row, got, ok)
+		}
+	}
+
+	other, otherDocuments := compressedDictionaryScanFixture(t, 4, 1)
+	other.header.Generation = fit.header.Generation + 1
+	got, ok := decoder.appendValue(dst[:0], &fit, 7, 0, 0, 0)
+	if !ok || !bytes.Equal(got, fitDocuments[0]) {
+		t.Fatalf("bucket reset = %q, %v", got, ok)
+	}
+	got, ok = decoder.appendValue(dst[:0], &other, 7, 0, 0, 0)
+	if !ok || !bytes.Equal(got, otherDocuments[0]) {
+		t.Fatalf("generation reset reused stale plan = %q, %v", got, ok)
+	}
+}
+
 func TestCompactCompressedDictionaryAdmissionLeavesOrdinaryValuesAlone(t *testing.T) {
 	values := make([][]byte, 64)
 	for row := range values {

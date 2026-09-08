@@ -67,10 +67,37 @@ length and number of indexes. Summing raw JSON field lengths overstates the
 opportunity.
 
 A global dictionary is not a free extension: current leaves are ordered by
-canonical tuple bytes. Arbitrary IDs require value lookups for ordering;
-ordered IDs are difficult to keep stable through insertion. Reassigning IDs
-at checkpoints would rewrite otherwise unchanged leaves. Durable shared IDs
-also require snapshot ownership, recovery and reclamation rules.
+canonical tuple bytes. Replacing the resident key representation with
+arbitrary IDs would require lookups for ordering; ordered IDs are difficult
+to keep stable through insertion. However, exact leaves already have
+GC-owned canonical resident bytes populated at Open. Sharing confined to the
+durable representation can resolve references during admission and preserve
+the existing resident comparator and query path. Ownership, recovery and
+reclamation still need explicit rules.
+
+### Physical overlap census
+
+The candidate's 20,000-row census uses independently assigned tenants and
+shared values. Two different indexes contain the same field; the field is
+either before or after another varying component. Values are deterministic
+high-entropy strings, so this measures existing term prefix compression and
+layout, rather than the primary LZ4 candidate's repeated-token fixture.
+
+| Shared field | Position | Total file B/row | Encoded index key B/row | Index leaf extent B/row |
+| --- | --- | ---: | ---: | ---: |
+| 256 bytes, 8 values | Leading after tenant | 257.0 | 87.88 | 231.4 |
+| 256 bytes, 8 values | After varying component | 789.7 | 490.4 | 764.1 |
+| 256 bytes, 1,024 values | Leading after tenant | 1,014 | 491.8 | 794.4 |
+| 256 bytes, 1,024 values | After varying component | 1,063 | 529.0 | 843.6 |
+| 16 bytes, 64 values | Leading after tenant | 206.6 | 26.57 | 181.0 |
+| 16 bytes, 64 values | After varying component | 229.0 | 48.82 | 203.4 |
+
+These are baseline representation costs, not savings from an implemented
+shared dictionary. Both repeated non-leading components and physical extent
+slack are material. For the short leading-field case, keys, metadata and
+postings together occupy about 68.3 B/row, while their leaf extents occupy
+181.0 B/row. Packing immutable logical leaves could address that slack
+without increasing the logical dirty-run rewrite unit.
 
 Long strings repeated across several indexes are the initial measurement
 target. A production design needs a demonstrated net file-size benefit and

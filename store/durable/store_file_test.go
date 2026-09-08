@@ -57,6 +57,30 @@ func appendWideJSONSafePattern(dst []byte, length, seed int) []byte {
 	return dst
 }
 
+// appendCompressionResistantJSONSafePattern keeps physical-boundary fixtures
+// stable when production adds a general-purpose byte compressor. It emits the
+// same JSON-safe 93-byte alphabet as appendWideJSONSafePattern, but advances a
+// deterministic SplitMix64 state so repeated substrings do not accidentally
+// remove the page pressure the test is intended to exercise.
+func appendCompressionResistantJSONSafePattern(dst []byte, length, seed int) []byte {
+	state := uint64(seed) + 0x9e3779b97f4a7c15
+	for range length {
+		state = (state ^ state>>30) * 0xbf58476d1ce4e5b9
+		state = (state ^ state>>27) * 0x94d049bb133111eb
+		state ^= state >> 31
+		value := byte(' ' + state%93)
+		if value >= '"' {
+			value++
+		}
+		if value >= '\\' {
+			value++
+		}
+		dst = append(dst, value)
+		state += 0x9e3779b97f4a7c15
+	}
+	return dst
+}
+
 func TestFileStoreDirtyBudgetUsesExtentSizes(t *testing.T) {
 	options := testFileStoreOptions()
 	normalized, err := options.normalized()
