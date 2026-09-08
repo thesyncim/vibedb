@@ -32,7 +32,8 @@ func TestGatewayHotSplitCompetingAdmissionCreatesNoChildFiles(t *testing.T) {
 	entry := gatewaySplitSourceFixture(t, source, profile)
 	manifest := gatewayReplicaControlManifest{SplitSources: []gatewaySplitSource{entry}}
 	for i, replica := range source.Replicas {
-		manifest.Shards = append(manifest.Shards, gateway.ReplicatedEndpoint{Node: replica.Node})
+		manifest.Shards = append(manifest.Shards, gateway.ReplicatedEndpoint{Node: replica.Node,
+			ControlAddress: "127.0.0.1:" + strconv.Itoa(21+i)})
 		manifest.SplitSnapshots = append(manifest.SplitSnapshots, "127.0.0.1:"+strconv.Itoa(9301+i))
 	}
 	factory, err := newGatewayHotSplitFactory(manifest, catalog)
@@ -74,7 +75,8 @@ func TestGatewayCommittedPreparationSettlesExactRetriedReceipts(t *testing.T) {
 	entry := gatewaySplitSourceFixture(t, source, profile)
 	manifest := gatewayReplicaControlManifest{SplitSources: []gatewaySplitSource{entry}}
 	for i, replica := range source.Replicas {
-		manifest.Shards = append(manifest.Shards, gateway.ReplicatedEndpoint{Node: replica.Node})
+		manifest.Shards = append(manifest.Shards, gateway.ReplicatedEndpoint{Node: replica.Node,
+			ControlAddress: "127.0.0.1:" + strconv.Itoa(21+i)})
 		manifest.SplitSnapshots = append(manifest.SplitSnapshots, "127.0.0.1:"+strconv.Itoa(9301+i))
 	}
 	factory, err := newGatewayHotSplitFactory(manifest, catalog)

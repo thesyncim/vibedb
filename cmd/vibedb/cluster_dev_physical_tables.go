@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 
 	"github.com/thesyncim/vibedb/distribution"
@@ -20,6 +21,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/rf3qualification"
 	"github.com/thesyncim/vibedb/query"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
+	"github.com/thesyncim/vibedb/store/durable"
 	"github.com/thesyncim/vibejson"
 )
 
@@ -81,37 +83,119 @@ func ensureDevPhysicalTables(root, binary string, cluster *devClusterManifest, s
 	if err := persistDevPhysicalClusterManifest(root, *cluster); err != nil {
 		return err
 	}
-	for _, table := range inventory.Tables {
+	for tableIndex, table := range inventory.Tables {
+		if !validDevProvisionBundleFormat(table.ProvisionBundleFormat) {
+			return errDevCluster
+		}
 		path := filepath.Join(root, table.artifactStem()+"-catalog.vibejson")
-		_, fragmentErr := readDevFile(path, 4<<20)
+		bundlePath := filepath.Join(root, table.artifactStem()+devTableProvisionBundleSuffix)
+		fragment, fragmentErr := readDevFile(path, 4<<20)
 		if fragmentErr != nil && !errors.Is(fragmentErr, os.ErrNotExist) {
 			return fragmentErr
+		}
+		bundle, bundleErr := readDevFile(bundlePath, 4<<20)
+		if bundleErr != nil && !errors.Is(bundleErr, os.ErrNotExist) {
+			return bundleErr
+		}
+		var bundleCatalog []byte
+		if bundleErr == nil {
+			catalogRaw, _, openErr := gateway.OpenReplicatedTableProvisionBundle(bundle)
+			if openErr != nil {
+				return openErr
+			}
+			bundleCatalog = catalogRaw
+			if fragmentErr == nil && !bytes.Equal(fragment, catalogRaw) {
+				return fmt.Errorf("%w: table %q bundle does not match its immutable catalog fragment", errDevCluster, table.Table)
+			}
 		}
 		// The immutable fragment is published only after all three stores pass
 		// cold validation. A completed table may already have live writers or a
 		// newer schema generation; validate its original proof without reopening
 		// or freezing those live SQL/apply identities.
-		completed := fragmentErr == nil
+		completed := fragmentErr == nil || bundleErr == nil
 		members, group, err := prepareDevPhysicalTable(root, binary, *cluster, table, completed)
 		if err != nil {
 			return err
 		}
-		provision, err := buildDevPhysicalTableProvision(table, members, group, completed)
-		if err != nil {
-			return err
+		if bundleErr == nil {
+			expected, expectedErr := buildDevPhysicalTableProvision(table, members, group, true)
+			if expectedErr != nil || !bytes.Equal(expected, bundleCatalog) {
+				return errors.Join(errDevCluster, expectedErr)
+			}
+			if err := validateDevPhysicalTableSplitSource(root, bundle, table, members, group); err != nil {
+				return err
+			}
+			if fragmentErr != nil {
+				if err := writeDevFileOnce(path, expected); err != nil {
+					return err
+				}
+				fragment, fragmentErr = expected, nil
+			}
+			if table.ProvisionBundleFormat != gateway.ReplicatedTableProvisionBundleFormat {
+				table.ProvisionBundleFormat = gateway.ReplicatedTableProvisionBundleFormat
+				inventory.Tables[tableIndex] = table
+				raw, marshalErr := vibejson.Marshal(&inventory)
+				if marshalErr != nil {
+					return marshalErr
+				}
+				if err := replaceDevFile(inventoryPath, raw); err != nil {
+					return err
+				}
+			}
+		} else {
+			provision, err := buildDevPhysicalTableProvision(table, members, group, completed)
+			if err != nil {
+				return err
+			}
+			if fragmentErr == nil && !bytes.Equal(fragment, provision) {
+				return fmt.Errorf("%w: retained table fragment differs from prepared identity", errDevCluster)
+			}
+			if err := writeDevFileOnce(path, provision); err != nil {
+				return err
+			}
+			fragment = provision
+			// New plans require a complete bundle. Legacy plans may be upgraded
+			// only when the exact prepared identities produce a valid proof.
+			candidate := table
+			candidate.ProvisionBundleFormat = gateway.ReplicatedTableProvisionBundleFormat
+			sourceRaw, sourceErr := buildDevPhysicalTableSplitSource(root, candidate, members, group, completed)
+			if sourceErr == nil {
+				bundle, sourceErr = gateway.AppendReplicatedTableProvisionBundle(nil, fragment, sourceRaw)
+				if sourceErr != nil {
+					return sourceErr
+				}
+				if err := writeDevFileOnce(bundlePath, bundle); err != nil {
+					return err
+				}
+				if table.ProvisionBundleFormat != gateway.ReplicatedTableProvisionBundleFormat {
+					table.ProvisionBundleFormat = gateway.ReplicatedTableProvisionBundleFormat
+					inventory.Tables[tableIndex] = table
+					raw, marshalErr := vibejson.Marshal(&inventory)
+					if marshalErr != nil {
+						return marshalErr
+					}
+					if err := replaceDevFile(inventoryPath, raw); err != nil {
+						return err
+					}
+				}
+				bundleErr = nil
+			}
+			if sourceErr != nil && table.ProvisionBundleFormat == gateway.ReplicatedTableProvisionBundleFormat {
+				return sourceErr
+			}
 		}
-		// The bytes include the complete endpoint/store/route/schema witness.
-		// A stale or substituted fragment must not be accepted on recovery.
-		if err := writeDevFileOnce(path, provision); err != nil {
-			return err
+		if table.ProvisionBundleFormat == gateway.ReplicatedTableProvisionBundleFormat || bundleErr == nil {
+			cluster.additionalCatalogs = append(cluster.additionalCatalogs, bundlePath)
+		} else {
+			cluster.additionalCatalogs = append(cluster.additionalCatalogs, path)
 		}
-		cluster.additionalCatalogs = append(cluster.additionalCatalogs, path)
 	}
 	return updateDevPhysicalGatewayCatalogs(*cluster, cluster.additionalCatalogs)
 }
 
 func planDevPhysicalTable(cluster devClusterManifest, name, primary, ddl string, ordinal uint64) (devTableProvision, error) {
-	table := devTableProvision{Table: name, PrimaryKey: primary, CreateTable: ddl, PlacementOrdinal: ordinal}
+	table := devTableProvision{Table: name, PrimaryKey: primary, CreateTable: ddl, PlacementOrdinal: ordinal,
+		ProvisionBundleFormat: gateway.ReplicatedTableProvisionBundleFormat}
 	if ordinal >= uint64(cluster.PhysicalNodes)*devPhysicalMaxGroups/devClusterRF3 {
 		return table, fmt.Errorf("%w: physical group limit", errDevCluster)
 	}
@@ -404,6 +488,267 @@ func buildDevPhysicalTableProvision(table devTableProvision, members []devCluste
 		return nil, err
 	}
 	return gateway.AppendReplicatedTableProvision(nil, addition)
+}
+
+// buildDevPhysicalTableSplitSource retains the exact prepared SQL identity of
+// one independently provisioned table. It deliberately reads the durable
+// preparation records and every member-local identity instead of rebuilding a
+// source from the mutable live route.
+func buildDevPhysicalTableSplitSource(root string, table devTableProvision, members []devClusterMember, group raftmember.GroupKey, completed bool) ([]byte, error) {
+	if len(members) != devClusterRF3 || group == (raftmember.GroupKey{}) || table.ProvisionBundleFormat != gateway.ReplicatedTableProvisionBundleFormat {
+		return nil, errDevCluster
+	}
+	endpoints := make(map[distribution.EndpointID]string)
+	var route devPreparedRoute
+	var err error
+	physical := members[0].GroupRoot != ""
+	if completed && physical {
+		route, err = plannedDevPhysicalTableRoute(endpoints, table, members, group)
+	} else {
+		role := "data"
+		if physical {
+			role = table.artifactStem()
+		}
+		route, err = inspectDevPreparedRoute(endpoints, role, distribution.DistributionName(table.distribution()), "all", table.Table, table.PrimaryKey, group, replication.Digest{}, true, members)
+	}
+	if err != nil {
+		return nil, err
+	}
+	placement := sqldriver.ReplicatedPlacementProfile{
+		Format: sqldriver.ReplicatedPlacementProfileFormat, ShardKey: table.PrimaryKey,
+		TupleVersion: distribution.CurrentTupleVersion, MapperVersion: distribution.NativeMapperVersion,
+		Range: distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
+	}
+	var source devReplicaSplitSource
+	var logical replication.Digest
+	var machine [sha256.Size]byte
+	var apply devPrepareApply
+	for index, member := range members {
+		preparePath := filepath.Join(root, fmt.Sprintf("prepare-%s-member-%d.vibejson", table.artifactStem(), index+1))
+		raw, readErr := readDevFile(preparePath, 1<<20)
+		if readErr != nil {
+			return nil, readErr
+		}
+		var prepare devPrepareManifest
+		if err := vibejson.Unmarshal(raw, &prepare); err != nil ||
+			prepare.Root != devMemberRoot(member) || prepare.MemberID != member.Member || prepare.StoreID != member.Store ||
+			prepare.Table != table.Table || prepare.CreateTable != table.CreateTable ||
+			prepare.Distribution != table.distribution() || prepare.Shard != "all" || prepare.AllocationGeneration != 1 ||
+			prepare.GroupID != table.GroupID || prepare.ShardIncarnation != table.ShardIncarnation ||
+			prepare.Apply.ShardKey != table.PrimaryKey || len(prepare.Members) != devClusterRF3 {
+			return nil, errors.Join(errDevCluster, err)
+		}
+		clusterID, clusterErr := decodeDev16(prepare.ClusterID)
+		clusterIncarnation, incarnationErr := decodeDev16(prepare.ClusterIncarnation)
+		shardIncarnation, shardErr := decodeDev16(prepare.ShardIncarnation)
+		groupID, groupErr := decodeDev16(prepare.GroupID)
+		storeID, storeErr := decodeDev16(prepare.StoreID)
+		if clusterErr != nil || incarnationErr != nil || shardErr != nil || groupErr != nil || storeErr != nil ||
+			clusterID != group.ClusterID || clusterIncarnation != group.ClusterIncarnation ||
+			shardIncarnation != group.ShardIncarnation || groupID != group.GroupID ||
+			prepare.TopologyRecoveryEpoch != group.TopologyRecoveryEpoch {
+			return nil, errors.Join(errDevCluster, clusterErr, incarnationErr, shardErr, groupErr, storeErr)
+		}
+		if index != 0 && prepare.Apply != apply {
+			return nil, errDevCluster
+		}
+		if index == 0 {
+			apply = prepare.Apply
+		}
+		for peerIndex, peer := range members {
+			preparedPeer := prepare.Members[peerIndex]
+			if preparedPeer.MemberID != peer.Member || preparedPeer.NodeID != peer.Node || preparedPeer.PeerAddress != peer.Peer {
+				return nil, errDevCluster
+			}
+		}
+		identityRaw, err := readDevFile(filepath.Join(devMemberRoot(member), "sql-identity.vibejson"), 1<<20)
+		if err != nil {
+			return nil, err
+		}
+		var identity sqldriver.ReplicatedShardStoreIdentity
+		if err := identity.UnmarshalJSON(identityRaw); err != nil || identity.Binding != (sqldriver.ReplicatedShardStoreBinding{
+			ClusterID: clusterID, ClusterIncarnation: clusterIncarnation, TopologyRecoveryEpoch: group.TopologyRecoveryEpoch,
+			Distribution: table.distribution(), Shard: "all", AllocationGeneration: 1,
+			ShardIncarnation: shardIncarnation, GroupID: groupID, MemberID: member.Member, StoreID: storeID,
+			Authority: sqldriver.ReplicatedAuthorityProfile{ActivePolicyGeneration: prepare.Authority.ActivePolicyGeneration,
+				ProtectionEpoch: prepare.Authority.ProtectionEpoch, OwnershipEpoch: prepare.Authority.OwnershipEpoch,
+				SchemaGeneration: prepare.Authority.SchemaGeneration, RoutingVersion: prepare.Authority.RoutingVersion,
+				RouteGeneration: prepare.Authority.RouteGeneration},
+		}) || identity.UserTable != table.Table || identity.UserPrimaryKey != table.PrimaryKey || identity.RelationCount != 1 {
+			return nil, errors.Join(errDevCluster, err)
+		}
+		if err := sqldriver.ValidateReplicatedChildSchema(identity, table.CreateTable, nil, nil); err != nil {
+			return nil, err
+		}
+		portable, err := sqldriver.ReplicatedRelationManifestDigest(identity)
+		if err != nil {
+			return nil, err
+		}
+		if identity.Relations[0].LocalIndexDigest != ([sha256.Size]byte{}) {
+			// The initial dev-table grammar has no retained index statement list.
+			// Refuse to manufacture an index proof from a digest alone.
+			return nil, errDevCluster
+		}
+		actualMachine, err := sqldriver.ReplicatedSchemaManifest(identity, placement, nil)
+		if err != nil || actualMachine != route.digest {
+			return nil, errors.Join(errDevCluster, err)
+		}
+		if index == 0 {
+			logical, machine = replication.Digest(portable), actualMachine
+			source.ClusterID, source.ClusterIncarnation, source.TopologyRecoveryEpoch = group.ClusterID, group.ClusterIncarnation, group.TopologyRecoveryEpoch
+			source.ShardIncarnation, source.GroupID = group.ShardIncarnation, group.GroupID
+			source.SchemaGeneration, source.Table, source.SQL = identity.Binding.Authority.SchemaGeneration, table.Table, identity.Clone()
+		} else if replication.Digest(portable) != logical || actualMachine != machine || identity.UserLimits != source.SQL.UserLimits {
+			return nil, errDevCluster
+		}
+	}
+	if logical != route.table.LogicalSchemaDigest || machine != route.digest || source.SQL.Binding.Authority.SchemaGeneration == 0 {
+		return nil, errDevCluster
+	}
+	source.RelationManifestDigest = machine
+	source.Placement = devReplicaSplitPlacement{Format: placement.Format, ShardKey: placement.ShardKey,
+		TupleVersion: uint16(placement.TupleVersion), MapperVersion: uint16(placement.MapperVersion),
+		RangeStart: placement.Range.Start, RangeEnd: placement.Range.End.Point, RangeEndMax: placement.Range.End.Max}
+	source.Template = devReplicaSplitTemplate{MaxSessions: apply.MaxSessions, RetryWindow: apply.RetryWindow,
+		TxnLimits: durable.TxnLimits{MaxCollections: apply.MaxCollections, MaxDocuments: apply.MaxDocuments, MaxBytes: apply.MaxBytes},
+		Format:    placement.Format, ShardKey: placement.ShardKey, TupleVersion: uint16(placement.TupleVersion), MapperVersion: uint16(placement.MapperVersion),
+		MaxBatchDocuments: source.SQL.UserLimits.MaxBatchDocuments, MaxBatchBytes: source.SQL.UserLimits.MaxBatchBytes}
+	for _, member := range members {
+		source.Replicas = append(source.Replicas, devReplicaSplitSourceReplica{Node: member.Node,
+			ChildRoot: filepath.Join(devMemberRoot(member), "split-children")})
+	}
+	sort.Slice(source.Replicas, func(left, right int) bool { return source.Replicas[left].Node < source.Replicas[right].Node })
+	return vibejson.Marshal(&source)
+}
+
+func validateDevPhysicalTableSplitSource(root string, bundleRaw []byte, table devTableProvision, members []devClusterMember, group raftmember.GroupKey) error {
+	catalogRaw, sourceRaw, err := gateway.OpenReplicatedTableProvisionBundle(bundleRaw)
+	if err != nil {
+		return err
+	}
+	addition, err := gateway.OpenReplicatedTableProvision(catalogRaw)
+	if err != nil {
+		return err
+	}
+	var source devReplicaSplitSource
+	if err := vibejson.Unmarshal(sourceRaw, &source); err != nil {
+		return errors.Join(errDevCluster, err)
+	}
+	canonical, err := vibejson.Marshal(&source)
+	if err != nil || !bytes.Equal(canonical, sourceRaw) || len(source.Replicas) != devClusterRF3 ||
+		source.ClusterID != group.ClusterID || source.ClusterIncarnation != group.ClusterIncarnation ||
+		source.TopologyRecoveryEpoch != group.TopologyRecoveryEpoch || source.ShardIncarnation != group.ShardIncarnation ||
+		source.GroupID != group.GroupID || source.SchemaGeneration == 0 || source.Table != table.Table ||
+		source.SQL.Binding.ClusterID != group.ClusterID || source.SQL.Binding.ClusterIncarnation != group.ClusterIncarnation ||
+		source.SQL.Binding.TopologyRecoveryEpoch != group.TopologyRecoveryEpoch || source.SQL.Binding.Distribution != table.distribution() ||
+		source.SQL.Binding.Shard != "all" || source.SQL.Binding.AllocationGeneration != 1 || source.SQL.Binding.ShardIncarnation != group.ShardIncarnation ||
+		source.SQL.Binding.GroupID != group.GroupID || source.SQL.UserTable != table.Table || source.SQL.UserPrimaryKey != table.PrimaryKey ||
+		source.SQL.RelationCount != 1 || source.SQL.RelationSchemaGeneration != source.SchemaGeneration ||
+		source.SQL.Binding.Authority.SchemaGeneration != source.SchemaGeneration || len(source.LocalIndexes) != 0 {
+		return errDevCluster
+	}
+	placement := sqldriver.ReplicatedPlacementProfile{Format: source.Placement.Format, ShardKey: source.Placement.ShardKey,
+		TupleVersion: distribution.TupleVersion(source.Placement.TupleVersion), MapperVersion: distribution.MapperVersion(source.Placement.MapperVersion),
+		Range: distribution.KeyRange{Start: source.Placement.RangeStart, End: distribution.KeyspaceEnd{Point: source.Placement.RangeEnd, Max: source.Placement.RangeEndMax}}}
+	if placement.Format != sqldriver.ReplicatedPlacementProfileFormat ||
+		placement.TupleVersion != distribution.CurrentTupleVersion || placement.MapperVersion != distribution.NativeMapperVersion ||
+		placement.ShardKey != table.PrimaryKey || placement.Range.Start != ([8]byte{}) || !placement.Range.End.Max {
+		return errDevCluster
+	}
+	var apply devPrepareApply
+	var preparedAuthority devPrepareAuthority
+	for index, member := range members {
+		preparePath := filepath.Join(root, fmt.Sprintf("prepare-%s-member-%d.vibejson", table.artifactStem(), index+1))
+		prepareRaw, readErr := readDevFile(preparePath, 1<<20)
+		if readErr != nil {
+			return readErr
+		}
+		var prepare devPrepareManifest
+		if err := vibejson.Unmarshal(prepareRaw, &prepare); err != nil {
+			return errors.Join(errDevCluster, err)
+		}
+		canonicalPrepare, marshalErr := vibejson.Marshal(&prepare)
+		if marshalErr != nil || !bytes.Equal(canonicalPrepare, prepareRaw) ||
+			prepare.Root != devMemberRoot(member) || prepare.MemberID != member.Member || prepare.StoreID != member.Store ||
+			prepare.Table != table.Table || prepare.CreateTable != table.CreateTable || prepare.Distribution != table.distribution() ||
+			prepare.Shard != "all" || prepare.AllocationGeneration != 1 || prepare.GroupID != table.GroupID ||
+			prepare.ShardIncarnation != table.ShardIncarnation || prepare.Apply.ShardKey != table.PrimaryKey ||
+			len(prepare.Members) != devClusterRF3 {
+			return errors.Join(errDevCluster, marshalErr)
+		}
+		if index == 0 {
+			apply = prepare.Apply
+			preparedAuthority = prepare.Authority
+		} else if prepare.Apply != apply {
+			return errDevCluster
+		}
+	}
+	if source.Template.MaxSessions != apply.MaxSessions || source.Template.RetryWindow != apply.RetryWindow ||
+		source.Template.TxnLimits.MaxCollections != apply.MaxCollections || source.Template.TxnLimits.MaxDocuments != apply.MaxDocuments ||
+		source.Template.TxnLimits.MaxBytes != apply.MaxBytes || source.Template.ShardKey != apply.ShardKey ||
+		source.Template.Format != source.Placement.Format || source.Template.TupleVersion != source.Placement.TupleVersion ||
+		source.Template.MapperVersion != source.Placement.MapperVersion ||
+		source.Template.MaxBatchDocuments != source.SQL.UserLimits.MaxBatchDocuments ||
+		source.Template.MaxBatchBytes != source.SQL.UserLimits.MaxBatchBytes ||
+		source.SQL.Binding.Authority != (sqldriver.ReplicatedAuthorityProfile{
+			ActivePolicyGeneration: preparedAuthority.ActivePolicyGeneration,
+			ProtectionEpoch:        preparedAuthority.ProtectionEpoch,
+			OwnershipEpoch:         preparedAuthority.OwnershipEpoch,
+			SchemaGeneration:       preparedAuthority.SchemaGeneration,
+			RoutingVersion:         preparedAuthority.RoutingVersion,
+			RouteGeneration:        preparedAuthority.RouteGeneration,
+		}) {
+		return errDevCluster
+	}
+	logical, err := sqldriver.ReplicatedRelationManifestDigest(source.SQL)
+	if err != nil {
+		return err
+	}
+	machine, err := sqldriver.ReplicatedSchemaManifest(source.SQL, placement, nil)
+	if err != nil || machine != source.RelationManifestDigest || logical == ([sha256.Size]byte{}) {
+		return errors.Join(errDevCluster, err)
+	}
+	descriptors, profiles := addition.ReplicatedShardDescriptors(), addition.ReplicatedTableProfiles()
+	if len(descriptors) != 1 || len(profiles) != 1 || descriptors[0].Group != group ||
+		descriptors[0].Distribution != distribution.DistributionName(table.distribution()) || descriptors[0].Shard != "all" ||
+		descriptors[0].AllocationGeneration != 1 ||
+		descriptors[0].Command.RelationManifestDigest != machine || descriptors[0].LogicalSchemaDigest != replication.Digest(logical) ||
+		descriptors[0].Command.ActivePolicyGeneration != source.SQL.Binding.Authority.ActivePolicyGeneration ||
+		descriptors[0].Command.ProtectionEpoch != source.SQL.Binding.Authority.ProtectionEpoch ||
+		descriptors[0].Command.OwnershipEpoch != source.SQL.Binding.Authority.OwnershipEpoch ||
+		descriptors[0].Command.SchemaGeneration != source.SQL.Binding.Authority.SchemaGeneration ||
+		descriptors[0].Command.RoutingVersion != source.SQL.Binding.Authority.RoutingVersion ||
+		descriptors[0].Command.RouteGeneration != source.SQL.Binding.Authority.RouteGeneration ||
+		profiles[0].Table != table.Table || profiles[0].PrimaryKey != table.PrimaryKey || profiles[0].SchemaGeneration != source.SchemaGeneration ||
+		profiles[0].LogicalSchemaDigest != replication.Digest(logical) {
+		return errDevCluster
+	}
+	byNode := make(map[string]string, len(members))
+	boundMember := false
+	for _, member := range members {
+		byNode[member.Node] = filepath.Join(devMemberRoot(member), "split-children")
+		storeID, decodeErr := decodeDev16(member.Store)
+		if decodeErr != nil {
+			return decodeErr
+		}
+		if source.SQL.Binding.MemberID == member.Member && source.SQL.Binding.StoreID == storeID {
+			boundMember = true
+		}
+	}
+	if !boundMember {
+		return errDevCluster
+	}
+	for _, replica := range source.Replicas {
+		root, found := byNode[replica.Node]
+		if !found || replica.ChildRoot != root {
+			return errDevCluster
+		}
+		delete(byNode, replica.Node)
+	}
+	if len(byNode) != 0 {
+		return errDevCluster
+	}
+	return nil
 }
 
 // A completed fragment preserves the initial schema proof even after an

@@ -290,6 +290,62 @@ type ddlWireResult struct {
 	rows               [][]string
 }
 
+const (
+	postRestartDDLNoReachableLeader     = "gateway: replicated shard has no reachable leader"
+	postRestartDDLNoAuthenticatedLeader = "gateway: no authenticated replica reported itself as leader"
+)
+
+func retryablePostRestartDDLLeaderResult(result ddlWireResult) bool {
+	if result.code != "XX000" || result.tag != "" || len(result.rows) != 0 {
+		return false
+	}
+	var noReachableLeader, noAuthenticatedLeader bool
+	for _, line := range strings.Split(result.message, "\n") {
+		switch line {
+		case postRestartDDLNoReachableLeader:
+			noReachableLeader = true
+		case postRestartDDLNoAuthenticatedLeader:
+			noAuthenticatedLeader = true
+		default:
+			return false
+		}
+	}
+	return noReachableLeader && noAuthenticatedLeader
+}
+
+func TestRetryablePostRestartDDLLeaderResult(t *testing.T) {
+	validMessage := strings.Join([]string{
+		postRestartDDLNoReachableLeader,
+		postRestartDDLNoAuthenticatedLeader,
+		postRestartDDLNoReachableLeader,
+	}, "\n")
+	tests := []struct {
+		name   string
+		result ddlWireResult
+		want   bool
+	}{
+		{name: "repeated_valid_lines", result: ddlWireResult{code: "XX000", message: validMessage}, want: true},
+		{name: "mixed_terminal_line", result: ddlWireResult{code: "XX000", message: strings.Join([]string{
+			postRestartDDLNoReachableLeader, "gateway: stale serving fence", postRestartDDLNoAuthenticatedLeader,
+		}, "\n")}},
+		{name: "wrong_code", result: ddlWireResult{code: "42P01", message: validMessage}},
+		{name: "nonempty_tag", result: ddlWireResult{code: "XX000", tag: "SELECT 1", message: validMessage}},
+		{name: "returned_rows", result: ddlWireResult{code: "XX000", rows: [][]string{{"row"}}, message: validMessage}},
+		{name: "missing_authenticated_line", result: ddlWireResult{code: "XX000", message: postRestartDDLNoReachableLeader}},
+		{name: "prefix_text", result: ddlWireResult{code: "XX000", message: "prefix " + validMessage}},
+		{name: "suffix_text", result: ddlWireResult{code: "XX000", message: validMessage + " suffix"}},
+		{name: "empty_line", result: ddlWireResult{code: "XX000", message: validMessage + "\n"}},
+		{name: "empty_message", result: ddlWireResult{code: "XX000"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := retryablePostRestartDDLLeaderResult(test.result); got != test.want {
+				t.Fatalf("retryablePostRestartDDLLeaderResult(%+v)=%t, want %t", test.result, got, test.want)
+			}
+		})
+	}
+}
+
 func openDDLWire(t *testing.T, ctx context.Context, address string) net.Conn {
 	t.Helper()
 	connection, err := (&net.Dialer{}).DialContext(ctx, "tcp", address)

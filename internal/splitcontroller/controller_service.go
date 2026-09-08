@@ -94,6 +94,9 @@ func (service *ControllerService) ExecuteReplicatedOperation(
 	if err != nil {
 		return Action{}, errors.Join(err, ErrControllerTrigger)
 	}
+	if record.ID != operation || !record.Valid() || record.Kind != gateway.ReplicatedOperationSplit {
+		return Action{}, ErrControllerTrigger
+	}
 	catalog, err := service.catalog.Read(ctx)
 	if err != nil {
 		return Action{}, err
