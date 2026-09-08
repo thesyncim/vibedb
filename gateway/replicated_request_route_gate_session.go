@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"math"
 
 	"github.com/thesyncim/vibedb/internal/raftserve"
@@ -13,6 +14,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/requestledger"
 	"github.com/thesyncim/vibedb/internal/routegate"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
+	"github.com/thesyncim/vibedb/shardservice"
 )
 
 type durableRequestRouteGateSessions interface {
@@ -28,6 +30,61 @@ type durableRequestRouteGateSessions interface {
 // is required to recover on a different gateway.
 type nativeDurableRequestRouteGateSessions struct {
 	executor *ReplicatedExecutor
+}
+
+// durableRequestRetiredOpenError is deliberately narrower than a generic
+// retryable session error. It is emitted only for the deterministic Open that
+// must happen before the route-pin intent exists. The detached Open envelope
+// is retained because NativeSession.executePending clears a definite refusal;
+// recovery must authenticate the persisted acquire against the exact identity
+// that was refused, rather than reconstructing it from mutable session state.
+type durableRequestRetiredOpenError struct {
+	cause       error
+	openCommand []byte
+}
+
+func (err *durableRequestRetiredOpenError) Error() string {
+	if err == nil || err.cause == nil {
+		return "gateway: route-session SessionOpen was retired before acquire intent"
+	}
+	return fmt.Sprintf("gateway: route-session SessionOpen was retired before acquire intent: %v", err.cause)
+}
+
+func (err *durableRequestRetiredOpenError) Unwrap() error {
+	if err == nil {
+		return nil
+	}
+	return err.cause
+}
+
+func durableRequestSessionOpenHeader(session *NativeSession) replication.Command {
+	if session == nil {
+		return replication.Command{}
+	}
+	command := session.commandHeader(replication.CommandSessionOpen, 0, 1, 0)
+	command.NextDeadlineUnixNano = math.MaxInt64
+	return command
+}
+
+func durableRequestSessionOpenCommand(command replication.Command, maxCommand int) ([]byte, error) {
+	if command.Kind != replication.CommandSessionOpen || maxCommand <= 0 {
+		return nil, ErrNativeSession
+	}
+	command.Fingerprint = nativeCommandFingerprint(command)
+	size, err := replication.CommandSize(command)
+	if err != nil {
+		return nil, err
+	}
+	if size > maxCommand {
+		return nil, ErrNativeBundleBound
+	}
+	return replication.AppendCommand(nil, command)
+}
+
+func durableRequestRetiredOpenRefusal(err error) bool {
+	refusal, ok := err.(*ReplicatedRefusalError)
+	return ok && refusal.Code == shardservice.ReplicatedRefusalRetryRetired &&
+		refusal.Outcome == (raftserve.Outcome{Code: raftserve.OutcomeRetryRetired})
 }
 
 func durableRouteSessionIdentity(identity requestledger.Digest, route ReplicatedRoute, tenant []byte) (replication.ID128, error) {
@@ -85,7 +142,17 @@ func (driver *nativeDurableRequestRouteGateSessions) prepareAcquire(ctx context.
 	if err != nil {
 		return nil, requestledger.Digest{}, err
 	}
+	openHeader := durableRequestSessionOpenHeader(session)
 	if _, err = session.Open(ctx, math.MaxInt64); err != nil {
+		if durableRequestRetiredOpenRefusal(err) {
+			openCommand, encodeErr := durableRequestSessionOpenCommand(openHeader, session.maxCommand)
+			if encodeErr != nil {
+				return nil, requestledger.Digest{}, errors.Join(err, encodeErr)
+			}
+			return nil, requestledger.Digest{}, &durableRequestRetiredOpenError{
+				cause: err, openCommand: openCommand,
+			}
+		}
 		return nil, requestledger.Digest{}, err
 	}
 	return appendDurableRequestRouteGateCommand(nil, route, wave, head.KeyDigest, head.RequestDigest,
