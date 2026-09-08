@@ -678,8 +678,17 @@ func devHotProbeSourceMembers(
 			states = append(states, fmt.Sprintf("member=%d node=%x unknown(nil_response)", endpoint.Member, endpoint.Node))
 			continue
 		}
-		states = append(states, devHotDiagnosticText(fmt.Sprintf("member=%d node=%x kind=%d refusal=%d has_state=%t state=%+v",
-			endpoint.Member, endpoint.Node, response.Kind, response.Refusal, response.HasState, response.State)))
+		state := response.State
+		fence := state.Fence
+		command := fence.Command
+		states = append(states, devHotDiagnosticText(fmt.Sprintf(
+			"member=%d node=%x kind=%d refusal=%d has_state=%t leader=%d term=%d commit=%d applied=%d checkpoint_applied=%d state_member=%d state_store=%x state_node_incarnation=%d state_group_id=%x state_allocation=%d command={replica_set=%d policy=%d protection=%d ownership=%d schema=%d routing=%d route_generation=%d manifest=%x}",
+			endpoint.Member, endpoint.Node, response.Kind, response.Refusal, response.HasState,
+			state.LeaderID, fence.Term, state.Commit, state.Applied, state.CheckpointApplied,
+			fence.MemberID, fence.StoreID, fence.NodeIncarnation, fence.Group.GroupID,
+			fence.AllocationGeneration, command.ReplicaSetVersion, command.ActivePolicyGeneration,
+			command.ProtectionEpoch, command.OwnershipEpoch, command.SchemaGeneration,
+			command.RoutingVersion, command.RouteGeneration, command.RelationManifestDigest)))
 	}
 	return states
 }
@@ -811,11 +820,13 @@ func devHotReadDocuments(
 			markFailure(fmt.Sprintf("canceled=%v", cause))
 			t.Fatalf("development native SQL read canceled after %d attempts: %v", attempt, cause)
 		}
-		if remaining := time.Until(deadline); remaining <= 0 {
-			markFailure("successful_response_after_deadline")
+		elapsed = time.Since(started)
+		if elapsed > deadline.Sub(started) {
+			failure = "successful_response_after_deadline"
+			frozenElapsed = elapsed
+			elapsedFrozen = true
 			t.Fatalf("development native SQL read exceeded its %s deadline after %d attempts", deadline.Sub(started), attempt)
 		}
-		elapsed = time.Since(started)
 		completed = true
 		return elapsed
 	}
