@@ -412,14 +412,19 @@ func TestRF3FaultLinkCutsOneDirectionAndHeals(t *testing.T) {
 // fault hooks and host-global firewall mutations while still closing every
 // established stream at an exact external cut.
 type rf3FaultLink struct {
-	listener *net.TCPListener
-	target   string
-	enabled  atomic.Bool
-	rejected atomic.Uint64
-	mu       sync.Mutex
-	active   map[net.Conn]net.Conn
-	closed   chan struct{}
-	wg       sync.WaitGroup
+	listener       *net.TCPListener
+	target         string
+	enabled        atomic.Bool
+	rejected       atomic.Uint64
+	accepted       atomic.Uint64
+	dialFail       atomic.Uint64
+	completedBytes atomic.Uint64
+	copyFail       atomic.Uint64
+	closeFail      atomic.Uint64
+	mu             sync.Mutex
+	active         map[net.Conn]net.Conn
+	closed         chan struct{}
+	wg             sync.WaitGroup
 }
 
 func newRF3FaultLink(t testing.TB, target string) *rf3FaultLink {
@@ -449,22 +454,24 @@ func (link *rf3FaultLink) accept() {
 				continue
 			}
 		}
+		link.accepted.Add(1)
 		if !link.enabled.Load() {
 			link.rejected.Add(1)
-			_ = incoming.Close()
+			link.closeConn(incoming)
 			continue
 		}
 		outgoing, err := net.DialTimeout("tcp", link.target, 3*time.Second)
 		if err != nil {
-			_ = incoming.Close()
+			link.dialFail.Add(1)
+			link.closeConn(incoming)
 			continue
 		}
 		link.mu.Lock()
 		if !link.enabled.Load() {
 			link.rejected.Add(1)
 			link.mu.Unlock()
-			_ = incoming.Close()
-			_ = outgoing.Close()
+			link.closeConn(incoming)
+			link.closeConn(outgoing)
 			continue
 		}
 		link.active[incoming] = outgoing
@@ -478,14 +485,20 @@ func (link *rf3FaultLink) relay(incoming, outgoing net.Conn) {
 	defer link.wg.Done()
 	done := make(chan struct{}, 2)
 	copyOne := func(destination, source net.Conn) {
-		_, _ = io.Copy(destination, source)
+		copied, err := io.Copy(destination, source)
+		if copied > 0 {
+			link.completedBytes.Add(uint64(copied))
+		}
+		if err != nil {
+			link.copyFail.Add(1)
+		}
 		done <- struct{}{}
 	}
 	go copyOne(outgoing, incoming)
 	go copyOne(incoming, outgoing)
 	<-done
-	_ = incoming.Close()
-	_ = outgoing.Close()
+	link.closeConn(incoming)
+	link.closeConn(outgoing)
 	<-done
 	link.mu.Lock()
 	delete(link.active, incoming)
@@ -497,8 +510,8 @@ func (link *rf3FaultLink) partition() uint64 {
 	link.mu.Lock()
 	interrupted := uint64(len(link.active))
 	for incoming, outgoing := range link.active {
-		_ = incoming.Close()
-		_ = outgoing.Close()
+		link.closeConn(incoming)
+		link.closeConn(outgoing)
 	}
 	link.mu.Unlock()
 	link.rejected.Add(interrupted)
@@ -508,6 +521,52 @@ func (link *rf3FaultLink) partition() uint64 {
 func (link *rf3FaultLink) heal() { link.enabled.Store(true) }
 
 func (link *rf3FaultLink) rejectedConnections() uint64 { return link.rejected.Load() }
+
+func (link *rf3FaultLink) closeConn(connection net.Conn) {
+	if connection != nil {
+		if err := connection.Close(); err != nil {
+			link.closeFail.Add(1)
+		}
+	}
+}
+
+type rf3FaultLinkCounters struct {
+	accepted       uint64
+	rejected       uint64
+	dialFail       uint64
+	completedBytes uint64
+	copyFail       uint64
+	closeFail      uint64
+	activeStreams  uint64
+}
+
+func (link *rf3FaultLink) counters() rf3FaultLinkCounters {
+	link.mu.Lock()
+	activeStreams := uint64(len(link.active))
+	link.mu.Unlock()
+	return rf3FaultLinkCounters{
+		accepted:       link.accepted.Load(),
+		rejected:       link.rejected.Load(),
+		dialFail:       link.dialFail.Load(),
+		completedBytes: link.completedBytes.Load(),
+		copyFail:       link.copyFail.Load(),
+		closeFail:      link.closeFail.Load(),
+		activeStreams:  activeStreams,
+	}
+}
+
+type rf3FaultLeaderObservation struct {
+	states  [rf3CommandMembers]shardservice.ReplicatedMemberState
+	leader  int
+	elapsed time.Duration
+	valid   bool
+}
+
+const (
+	rf3FaultFailureDiagnosticTimeout    = 2 * time.Second
+	rf3FaultFailureDiagnosticMaxBytes   = 16 << 10
+	rf3FaultFailureDiagnosticErrorBytes = 256
+)
 
 func (link *rf3FaultLink) waitRejectedAfter(t testing.TB, before uint64, timeout time.Duration) {
 	t.Helper()
@@ -534,26 +593,28 @@ func (link *rf3FaultLink) close() {
 }
 
 type rf3FaultFixture struct {
-	root                 string
-	group                raftmember.GroupKey
-	nodes                [rf3CommandMembers]rafttransport.NodeID
-	peerAddresses        [rf3CommandMembers]string
-	peerRoutes           [rf3CommandMembers][rf3CommandMembers]string
-	links                [rf3CommandMembers][rf3CommandMembers]*rf3FaultLink
-	nativeAddresses      [rf3CommandMembers]string
-	snapshotAddresses    [rf3CommandMembers]string
-	controlAddresses     [rf3CommandMembers]string
-	credentials          []rf3testfixture.Credential
-	roots                string
-	profiles             []*rafttransport.PeerTLS
-	authority            sqldriver.ReplicatedAuthorityProfile
-	manifestPaths        [rf3CommandMembers]string
-	walPaths             [rf3CommandMembers]string
-	nodeLog              bool
-	children             [rf3CommandMembers]*rf3CommandChild
-	listeners            [rf3CommandMembers][4]*net.TCPListener
-	walAllocatedBaseline int64
-	maxReadValueBytes    uint32
+	root                      string
+	group                     raftmember.GroupKey
+	nodes                     [rf3CommandMembers]rafttransport.NodeID
+	peerAddresses             [rf3CommandMembers]string
+	peerRoutes                [rf3CommandMembers][rf3CommandMembers]string
+	links                     [rf3CommandMembers][rf3CommandMembers]*rf3FaultLink
+	nativeAddresses           [rf3CommandMembers]string
+	snapshotAddresses         [rf3CommandMembers]string
+	controlAddresses          [rf3CommandMembers]string
+	credentials               []rf3testfixture.Credential
+	roots                     string
+	profiles                  []*rafttransport.PeerTLS
+	authority                 sqldriver.ReplicatedAuthorityProfile
+	manifestPaths             [rf3CommandMembers]string
+	walPaths                  [rf3CommandMembers]string
+	nodeLog                   bool
+	children                  [rf3CommandMembers]*rf3CommandChild
+	listeners                 [rf3CommandMembers][4]*net.TCPListener
+	walAllocatedBaseline      int64
+	maxReadValueBytes         uint32
+	lastFullLeaderObservation rf3FaultLeaderObservation
+	failureDiagnosticOnce     sync.Once
 }
 
 func newRF3FaultFixture(t testing.TB) *rf3FaultFixture {
@@ -782,6 +843,7 @@ func (fixture *rf3FaultFixture) close(t testing.TB) {
 
 func (fixture *rf3FaultFixture) waitLeader(t testing.TB, members []int, timeout time.Duration) (int, map[int]shardservice.ReplicatedMemberState) {
 	t.Helper()
+	started := time.Now()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		states := make(map[int]shardservice.ReplicatedMemberState, len(members))
@@ -795,6 +857,13 @@ func (fixture *rf3FaultFixture) waitLeader(t testing.TB, members []int, timeout 
 			states[member] = state
 		}
 		if leader, ok := rf3FaultObservedLeader(members, states); consistent && ok {
+			if len(members) == rf3CommandMembers {
+				observation := rf3FaultLeaderObservation{leader: leader, elapsed: time.Since(started), valid: true}
+				for member, state := range states {
+					observation.states[member] = state
+				}
+				fixture.lastFullLeaderObservation = observation
+			}
 			return leader, states
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -883,9 +952,155 @@ func (fixture *rf3FaultFixture) probe(t testing.TB, member int) shardservice.Rep
 func (fixture *rf3FaultFixture) tryProbe(member int, timeout time.Duration) (shardservice.ReplicatedMemberState, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
+	return fixture.tryProbeContext(ctx, member)
+}
+
+func (fixture *rf3FaultFixture) tryProbeContext(ctx context.Context, member int) (shardservice.ReplicatedMemberState, error) {
 	client := (member + 1) % rf3CommandMembers
 	return probeRF3CommandMember(ctx, fixture.nativeAddresses[member], fixture.nodes[member], fixture.profiles[client], fixture.nodes[client],
 		fixture.group, rf3CommandStoreIdentity(1).AllocationGeneration, fixture.authority.ActivePolicyGeneration)
+}
+
+func (fixture *rf3FaultFixture) tryProbeContextAtDeadline(ctx context.Context, member int) (shardservice.ReplicatedMemberState, error) {
+	client := (member + 1) % rf3CommandMembers
+	return probeRF3CommandMemberAtContextDeadline(ctx, fixture.nativeAddresses[member], fixture.nodes[member], fixture.profiles[client], fixture.nodes[client],
+		fixture.group, rf3CommandStoreIdentity(1).AllocationGeneration, fixture.authority.ActivePolicyGeneration)
+}
+
+// captureRF3FaultFailureDiagnostic records one bounded cut after an unexpected
+// native response and before fixture cleanup. It deliberately uses the same
+// shared deadline for all authenticated probes, and emits only fixed-width
+// state and relay counters; request payloads and retry behavior stay outside
+// this diagnostic path.
+func (fixture *rf3FaultFixture) captureRF3FaultFailureDiagnostic(
+	t testing.TB, phase string, requestElapsed time.Duration, response *shardservice.ReplicatedResponse,
+) {
+	t.Helper()
+	fixture.failureDiagnosticOnce.Do(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), rf3FaultFailureDiagnosticTimeout)
+		defer cancel()
+		var childPIDs [rf3CommandMembers]int
+		var childExited [rf3CommandMembers]bool
+		var childWaitErr [rf3CommandMembers]error
+		for member, child := range fixture.children {
+			if child == nil || child.command == nil || child.command.Process == nil {
+				continue
+			}
+			childPIDs[member] = child.command.Process.Pid
+			select {
+			case <-child.exited:
+				childExited[member] = true
+			default:
+			}
+			child.mu.Lock()
+			childWaitErr[member] = child.waitErr
+			child.mu.Unlock()
+		}
+		type probeResult struct {
+			state shardservice.ReplicatedMemberState
+			err   error
+		}
+		var results [rf3CommandMembers]probeResult
+		var probes sync.WaitGroup
+		statusStarted := time.Now()
+		for member := 0; member < rf3CommandMembers; member++ {
+			probes.Add(1)
+			go func(member int) {
+				defer probes.Done()
+				results[member].state, results[member].err = fixture.tryProbeContextAtDeadline(ctx, member)
+			}(member)
+		}
+		probes.Wait()
+		statusElapsed := time.Since(statusStarted)
+
+		var log strings.Builder
+		fmt.Fprintf(&log, "rf3_fault_failure_diagnostic phase=%s request_elapsed=%s status_elapsed=%s status_budget=%s\n",
+			phase, requestElapsed, statusElapsed, rf3FaultFailureDiagnosticTimeout)
+		fmt.Fprintf(&log, "response=%s\n", rf3FaultResponseSummary(response))
+		observation := fixture.lastFullLeaderObservation
+		if !observation.valid {
+			log.WriteString("preceding_leader_observation=unavailable\n")
+		} else {
+			fmt.Fprintf(&log, "preceding_leader_observation leader=%d elapsed=%s members=[1 2 3]\n",
+				observation.leader+1, observation.elapsed)
+			for member := 0; member < rf3CommandMembers; member++ {
+				state := observation.states[member]
+				writeRF3FaultState(&log, "preceding_state", member, state)
+			}
+		}
+		for member := 0; member < rf3CommandMembers; member++ {
+			result := results[member]
+			if result.err != nil {
+				fmt.Fprintf(&log, "status member=%d error=%s\n", member+1, boundedRF3FaultDiagnosticError(result.err))
+				continue
+			}
+			writeRF3FaultState(&log, "status", member, result.state)
+		}
+		for member, child := range fixture.children {
+			if child == nil || childPIDs[member] == 0 {
+				fmt.Fprintf(&log, "child member=%d unavailable\n", member+1)
+				continue
+			}
+			fmt.Fprintf(&log, "child member=%d pid=%d exited=%t wait_error=%s\n",
+				member+1, childPIDs[member], childExited[member], boundedRF3FaultDiagnosticError(childWaitErr[member]))
+		}
+		for source := 0; source < rf3CommandMembers; source++ {
+			for target := 0; target < rf3CommandMembers; target++ {
+				if source == target || fixture.links[source][target] == nil {
+					continue
+				}
+				counters := fixture.links[source][target].counters()
+				fmt.Fprintf(&log, "link source=%d target=%d accepted=%d rejected=%d dial_fail=%d active_streams=%d completed_relay_bytes=%d relay_errors=%d close_errors=%d\n",
+					source+1, target+1, counters.accepted, counters.rejected, counters.dialFail,
+					counters.activeStreams, counters.completedBytes, counters.copyFail, counters.closeFail)
+			}
+		}
+		text := log.String()
+		if len(text) > rf3FaultFailureDiagnosticMaxBytes {
+			const marker = "\n[diagnostic truncated]\n"
+			text = text[:rf3FaultFailureDiagnosticMaxBytes-len(marker)] + marker
+		}
+		t.Logf("%s", text)
+	})
+}
+
+func writeRF3FaultState(log *strings.Builder, label string, member int, state shardservice.ReplicatedMemberState) {
+	fmt.Fprintf(log, "%s member=%d member_id=%d node_incarnation=%d term=%d leader=%d commit=%d applied=%d checkpoint_applied=%d fence=%s\n",
+		label, member+1, state.Fence.MemberID, state.Fence.NodeIncarnation, state.Fence.Term,
+		state.LeaderID, state.Commit, state.Applied, state.CheckpointApplied, rf3FaultFenceSummary(state.Fence))
+}
+
+func boundedRF3FaultDiagnosticError(err error) string {
+	if err == nil {
+		return ""
+	}
+	text := strings.ReplaceAll(err.Error(), "\n", "\\n")
+	if len(text) > rf3FaultFailureDiagnosticErrorBytes {
+		text = text[:rf3FaultFailureDiagnosticErrorBytes] + "...(truncated)"
+	}
+	return text
+}
+
+func rf3FaultResponseSummary(response *shardservice.ReplicatedResponse) string {
+	if response == nil {
+		return "nil"
+	}
+	return fmt.Sprintf("kind=%d refusal=%d has_state=%t state_member=%d state_term=%d state_leader=%d state_commit=%d state_applied=%d outcome=%d outcome_applied=%d completion_sequence=%d completion_bytes=%d request_digest=%x fence=%s",
+		response.Kind, response.Refusal, response.HasState, response.State.Fence.MemberID,
+		response.State.Fence.Term, response.State.LeaderID, response.State.Commit, response.State.Applied,
+		response.Outcome.Code, response.Outcome.AppliedIndex, response.Outcome.CompletionAppliedSequence,
+		response.Outcome.CompletionBytes, response.RequestDigest, rf3FaultFenceSummary(response.State.Fence))
+}
+
+func rf3FaultFenceSummary(fence shardservice.ReplicatedFence) string {
+	command := fence.Command
+	return fmt.Sprintf("group=%x/%x/%d/%x/%x allocation=%d member=%d store=%x node_incarnation=%d term=%d command=%d/%d/%d/%d/%d/%d/%d manifest=%x",
+		fence.Group.ClusterID, fence.Group.ClusterIncarnation, fence.Group.TopologyRecoveryEpoch,
+		fence.Group.ShardIncarnation, fence.Group.GroupID, fence.AllocationGeneration,
+		fence.MemberID, fence.StoreID, fence.NodeIncarnation, fence.Term,
+		command.ReplicaSetVersion, command.ActivePolicyGeneration, command.ProtectionEpoch,
+		command.OwnershipEpoch, command.SchemaGeneration, command.RoutingVersion,
+		command.RouteGeneration, command.RelationManifestDigest)
 }
 
 func (fixture *rf3FaultFixture) openSession(t testing.TB, leader int, state shardservice.ReplicatedMemberState) (uint64, uint64) {

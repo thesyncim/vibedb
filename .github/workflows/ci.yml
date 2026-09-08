@@ -237,7 +237,7 @@ jobs:
           path: ${{ steps.go.outputs.cache-path }}
           key: ${{ steps.go.outputs.cache-key }}
   rf3-read-authority-lab:
-    name: RF3 read-authority standard gate and laboratory protocol
+    name: RF3 read-authority default and protocol
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -245,25 +245,59 @@ jobs:
         id: go
         with:
           scope: rf3-read-authority-lab
-      - name: Standard build denial and resume checks
+      - name: Default selection and retained-policy checks
         run: |
           set -euo pipefail
           go test -count=1 -timeout=5m \
-            -run '^(TestStandardClusterDevRejectsReadAuthorityBeforeCreatingRoot|TestDefaultResumeAcceptsOpaqueArtifactButRejectsEnabledSection|TestStandardPhysicalManifestRejectsEnabledSectionBeforeRewrite|TestDevClusterManifestResumeIsCanonicalAndDoesNotReprovision)$' \
+            -run '^(TestDevReadAuthority.*|TestDefaultResumeAcceptsOpaqueArtifactButRejectsEnabledSection|TestPhysicalManifestRejectsMalformedEnabledSectionBeforeRewrite|TestDevClusterManifestResumeIsCanonicalAndDoesNotReprovision)$' \
             ./cmd/vibedb
           go test -count=1 -timeout=5m \
-            -run '^(TestStandardShardRejectsEnabledReadAuthorityBeforeRuntime|TestStandardOmittedPolicyStillRefusesEnrolledMarker|TestRF3ReloadDefaultOffMarkerRejectedBeforePreparation)$' \
+            -run '^(TestShardValidatesEnabledReadAuthorityBeforeRuntime|TestRetainedPolicyRefusesDowngradeAfterEnrollment|TestRF3ReloadDefaultOffMarkerRejectedBeforePreparation)$' \
             ./cmd/vibedb-shard
-      - name: Explicit laboratory protocol and reconciliation checks
+      - name: Normal physical RF3 preparation and restart checks
+        shell: bash
         run: |
           set -euo pipefail
-          go test -tags=vibedb_rf3_read_authority_lab -count=1 -timeout=10m \
+          evidence="${RUNNER_TEMP}/rf3-physical-preparation"
+          mkdir -p "${evidence}"
+          test_name='TestDevPhysicalRealPreparationRecoversExactPlans'
+          shard_binary="${RUNNER_TEMP}/vibedb-shard-physical"
+          {
+            printf 'revision=%s\n' "$(git rev-parse HEAD)"
+            go version
+            printf 'go build -trimpath -o %q ./cmd/vibedb-shard\n' "${shard_binary}"
+            printf 'VIBEDB_PHYSICAL_TEST_SHARD_BINARY=%q go test -json -count=1 -timeout=10m -run %q ./cmd/vibedb\n' \
+              "${shard_binary}" "^${test_name}$"
+          } > "${evidence}/command.txt"
+          go build -trimpath -o "${shard_binary}" ./cmd/vibedb-shard
+          test -x "${shard_binary}"
+          go test -list "^${test_name}$" ./cmd/vibedb | tee "${evidence}/test-list.txt"
+          grep -Fqx "${test_name}" "${evidence}/test-list.txt"
+          VIBEDB_PHYSICAL_TEST_SHARD_BINARY="${shard_binary}" \
+            go test -json -count=1 -timeout=10m -run "^${test_name}$" ./cmd/vibedb \
+            | tee "${evidence}/go-test.jsonl"
+          test "$(jq -r --arg test_name "${test_name}" \
+            'select(.Action == "pass" and .Test == $test_name) | .Test' \
+            "${evidence}/go-test.jsonl" | wc -l)" -eq 1
+          if jq -e 'select(.Action == "skip")' "${evidence}/go-test.jsonl" >/dev/null; then
+            echo "${test_name} emitted a skip" >&2
+            exit 1
+          fi
+          for physical in 3 6; do
+            test "$(jq -r --arg test_name "${test_name}" --arg physical "${physical}" \
+              'select(.Action == "pass" and .Test == ($test_name + "/" + $physical)) | .Test' \
+              "${evidence}/go-test.jsonl" | wc -l)" -eq 1
+          done
+      - name: Protocol and reconciliation checks
+        run: |
+          set -euo pipefail
+          go test -count=1 -timeout=10m \
             -run '^TestRF3ReadAuthority|^TestDev(ReadAuthority|PhysicalReadAuthority)' \
             ./cmd/vibedb ./cmd/vibedb-shard
-      - name: Explicit laboratory live group enrollment and retained restart
+      - name: Live group enrollment and retained restart
         run: |
           set -euo pipefail
-          go test -tags=vibedb_rf3_read_authority_lab -count=1 -timeout=3m \
+          go test -count=1 -timeout=3m \
             -run '^TestServeRF3ReadAuthorityLiveAppendAndRetainedRestart$' \
             ./cmd/vibedb-shard
       - name: Save Go build cache

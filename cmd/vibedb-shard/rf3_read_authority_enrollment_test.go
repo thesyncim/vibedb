@@ -1,5 +1,3 @@
-//go:build vibedb_rf3_read_authority_lab
-
 package main
 
 import (

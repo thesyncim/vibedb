@@ -86,21 +86,21 @@ To choose every SQL endpoint explicitly, replace `--pg-listen` with:
 The list must contain one distinct literal-loopback endpoint per physical
 node. The two listener flags are mutually exclusive.
 
-### Optional read-authority qualification
+### Read-authority policy
 
-The standard binaries cannot enable read authority. To exercise the explicit
-quorum protocol, build a separately labelled laboratory variant with the
-required compile-time tag, keeping the launcher, shard, and gateway variants
-together:
+Fresh RF3 physical clusters with three or six serving nodes enable the fixed
+read-authority policy when the qualified elapsed clock is available. Build the
+normal binaries together:
 
 ```sh
-GOEXPERIMENT=simd go build -tags=vibedb_rf3_read_authority_lab -o ./bin/vibedb ./cmd/vibedb
-GOEXPERIMENT=simd go build -tags=vibedb_rf3_read_authority_lab -o ./bin/vibedb-shard ./cmd/vibedb-shard
-GOEXPERIMENT=simd go build -tags=vibedb_rf3_read_authority_lab -o ./bin/vibedb-gateway ./cmd/vibedb-gateway
+GOEXPERIMENT=simd go build -o ./bin/vibedb ./cmd/vibedb
+GOEXPERIMENT=simd go build -o ./bin/vibedb-shard ./cmd/vibedb-shard
+GOEXPERIMENT=simd go build -o ./bin/vibedb-gateway ./cmd/vibedb-gateway
 ```
 
-Run the laboratory binary with `--read-authority` on the first start and
-every restart:
+Omit the flag on first start and restart to use the retained policy. Use
+`--read-authority=false` to opt out for a fresh cluster, or
+`--read-authority=true` to require the policy explicitly:
 
 ```sh
 ./bin/vibedb cluster dev \
@@ -111,23 +111,20 @@ every restart:
   --pg-listen 127.0.0.1:7432
 ```
 
-This is a laboratory qualification variant; a normal build rejects the switch
-before creating a cluster, and a standard shard binary rejects an enabled
-manifest before preparing, serving, reloading, or adopting any artifact. The
-switch is disabled by default and requires Linux `CLOCK_BOOTTIME`. The
-deployment assumption is that every participant's elapsed clock rate stays
-within ±10% of real elapsed time, including across VM or container suspension
-and resume. `CLOCK_BOOTTIME` availability and one successful `Now` call at
-startup cannot prove that rate assumption or future suspend behavior; qualify
-the host and virtualization environment separately. Every RF3 voter receives
-the same persisted v1 contract: a 5 s elapsed-clock maximum grant, 100000 ppm
-clock-rate bound, 1 ms rounding margin, and the complete voter set. The
-drift-adjusted usable grant is about 4.09 s of elapsed-clock time. A promise
-can delay a follower's election edge by the configured 5 s elapsed-clock grant
-window; this is not a hard wall-clock upper bound under the ±10% deployment
-assumption (a slow clock can make 5 s about 5.56 s of real time). A restarted
-voter enters about 6.11 s of configured elapsed-clock quarantine, including
-the margin, before it may vote.
+The policy requires Linux `CLOCK_BOOTTIME`. The deployment assumption is that
+every participant's elapsed clock rate stays within ±10% of real elapsed time,
+including across VM or container suspension and resume. `CLOCK_BOOTTIME`
+availability and one successful `Now` call at startup cannot prove that rate
+assumption or future suspend behavior; qualify the host and virtualization
+environment separately. Every RF3 voter receives the same persisted v1
+contract: a 5 s elapsed-clock maximum grant, 100000 ppm clock-rate bound, 1 ms
+rounding margin, and the complete voter set. The drift-adjusted usable grant
+is about 4.09 s of elapsed-clock time. A promise can delay a follower's
+election edge by the configured 5 s elapsed-clock grant window; this is not a
+hard wall-clock upper bound under the ±10% deployment assumption (a slow clock
+can make 5 s about 5.56 s of real time). A restarted voter enters about 6.11 s
+of configured elapsed-clock quarantine, including the margin, before it may
+vote.
 
 Incarnation observations come from bounded, authenticated native probes run by
 the serving process outside the SQL owner. A missing or expired observation,
@@ -139,14 +136,15 @@ eligible SQL point and batch data reads; this option does not change follower,
 recovery, backup, topology, or control reads.
 
 The policy and restart marker are part of the strict manifests and each local
-member root. Reusing a root with the flag omitted or changing the policy is
-refused. New binaries also refuse an old manifest when an enabled marker is
-present. A deployment must keep all voters on the feature-aware binary and
-must not restore a pre-enrollment manifest with an old binary while the marker
-is live; an old binary cannot interpret a marker it does not know. Use a fresh
-root for a different qualification contract until an explicit drain procedure
-is available. Online group additions are refused while the authority is
-enabled; prepare any additional table groups before the initial start.
+member root. Reusing a root with the flag omitted preserves the recorded
+policy; changing it explicitly is refused. A deployment must keep all voters
+on a binary that supports the feature and must not restore a pre-enrollment
+manifest with an old binary while the marker is live. Use a fresh root for a
+different qualification contract until an explicit drain procedure is
+available. Additional physical table groups inherit the exact persisted
+authority policy. A changed voter roster remains outside the authority fast
+path and uses the existing ReadIndex fallback until the policy is explicitly
+reconciled.
 
 ## 3. Write and read a row
 
