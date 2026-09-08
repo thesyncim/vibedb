@@ -9,9 +9,149 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
+	"time"
 )
+
+// A completed seal clears the authenticated metadata pending bit before its
+// asynchronous completion notice is consumed by WaitSeal. Reclamation must
+// use that durable bit, rather than the caller-facing notice state.
+func TestReclaimCompletedSealNoticeUsesHasPending(t *testing.T) {
+	oldMin, oldMax := reclaimMinSegments, reclaimMaxSegments
+	reclaimMinSegments, reclaimMaxSegments = 2, 2
+	t.Cleanup(func() { reclaimMinSegments, reclaimMaxSegments = oldMin, oldMax })
+	e, removed, _ := newReclaimableEngine(t, t.TempDir())
+	defer e.Close()
+	if err := e.PersistWave(Wave{ID: waveID(4), Batches: []ReadyBatch{
+		{GroupID: 1, Entries: []Entry{{Index: 3, Term: 1, Data: []byte("retained")}}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	sealed := make(chan struct{})
+	if err := e.Rotate(func(phase RotationPhase) error {
+		if phase == RotationSealedMetadataPublished {
+			close(sealed)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-sealed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("seal did not publish metadata")
+	}
+	e.writeMu.Lock()
+	hasPending, sealPending := e.log.metadata.slot.HasPending, e.sealPending
+	e.writeMu.Unlock()
+	if hasPending || !sealPending {
+		t.Fatalf("completed seal state hasPending=%v sealPending=%v", hasPending, sealPending)
+	}
+	if err := e.ReclaimDeadPrefix(); err != nil {
+		t.Fatalf("reclaim with unread completed notice: %v", err)
+	}
+	for _, segment := range removed {
+		if _, err := os.Stat(segmentPath(e.log.dir, segment.FileID)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("retired segment %d remains: %v", segment.ID, err)
+		}
+	}
+	if err := e.WaitSeal(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReclaimPendingSealStillWaitsForHasPending(t *testing.T) {
+	oldMin, oldMax := reclaimMinSegments, reclaimMaxSegments
+	reclaimMinSegments, reclaimMaxSegments = 2, 2
+	t.Cleanup(func() { reclaimMinSegments, reclaimMaxSegments = oldMin, oldMax })
+	e, _, _ := newReclaimableEngine(t, t.TempDir())
+	defer e.Close()
+	entered, release := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(closeReleaseChannel(release))
+	e.sealBuildHookTest = func() {
+		close(entered)
+		<-release
+	}
+	if err := e.Rotate(nil); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("seal did not enter build")
+	}
+	e.writeMu.Lock()
+	hasPending := e.log.metadata.slot.HasPending
+	e.writeMu.Unlock()
+	if !hasPending {
+		t.Fatal("unfinished seal lost its authenticated pending bit")
+	}
+	if err := e.reclaimDeadPrefix(); !errors.Is(err, ErrBounds) {
+		t.Fatalf("reclaim crossed unfinished seal: %v", err)
+	}
+	releaseOnce.Do(closeReleaseChannel(release))
+	e.sealBuildHookTest = nil
+	if err := e.WaitSeal(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReclaimMaintenanceBusyBackpressuresRotate(t *testing.T) {
+	oldMin, oldMax, oldHook := reclaimMinSegments, reclaimMaxSegments, reclaimPublishHook
+	reclaimMinSegments, reclaimMaxSegments = 2, 2
+	t.Cleanup(func() { reclaimMinSegments, reclaimMaxSegments, reclaimPublishHook = oldMin, oldMax, oldHook })
+	e, _, _ := newReclaimableEngine(t, t.TempDir())
+	defer e.Close()
+	entered, release := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(closeReleaseChannel(release))
+	reclaimPublishHook = func(phase reclaimPublishPhase) error {
+		if phase == reclaimCheckpointAPublished {
+			close(entered)
+			<-release
+		}
+		return nil
+	}
+	done := make(chan error, 1)
+	started := time.Now()
+	go func() { done <- e.ReclaimDeadPrefix() }()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("reclaim did not enter checkpoint I/O")
+	}
+	backpressured := 0
+	const attempts = 4
+	for i := 0; i < attempts; i++ {
+		if err := e.Rotate(nil); errors.Is(err, ErrBackpressure) {
+			backpressured++
+		} else {
+			t.Fatalf("Rotate during maintenance attempt %d = %v", i, err)
+		}
+	}
+	blockedFor := time.Since(started)
+	if backpressured != attempts {
+		t.Fatalf("maintenance-busy Rotate backpressure=%d/%d", backpressured, attempts)
+	}
+	releaseOnce.Do(closeReleaseChannel(release))
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("maintenance-busy Rotate backpressure=%d/%d blocked_for=%s", backpressured, attempts, blockedFor)
+	e.writeMu.Lock()
+	busy := e.maintenanceBusy
+	e.writeMu.Unlock()
+	if busy {
+		t.Fatal("maintenanceBusy remained set after reclaim")
+	}
+}
+
+func closeReleaseChannel(channel chan struct{}) func() {
+	return func() { close(channel) }
+}
 
 func newReclaimableEngine(t *testing.T, dir string) (*Engine, []SegmentMeta, Checkpoint) {
 	t.Helper()

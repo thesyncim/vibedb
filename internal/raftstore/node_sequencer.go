@@ -420,6 +420,10 @@ type NodeSubmissionSequencerStats struct {
 	CheckpointQueueRejected       uint64
 	CheckpointQueueWaitNanos      uint64
 	CheckpointServiceNanos        uint64
+	NodeMaintenanceAttempts       uint64
+	NodeMaintenanceDeferred       uint64
+	NodeMaintenanceFailures       uint64
+	NodeMaintenanceServiceNanos   uint64
 }
 
 // nodeSequencerCounters is kept separate from the public snapshot so no
@@ -469,6 +473,10 @@ type nodeSequencerCounters struct {
 	checkpointQueueRejected         atomic.Uint64
 	checkpointQueueWaitNanos        atomic.Uint64
 	checkpointServiceNanos          atomic.Uint64
+	nodeMaintenanceAttempts         atomic.Uint64
+	nodeMaintenanceDeferred         atomic.Uint64
+	nodeMaintenanceFailures         atomic.Uint64
+	nodeMaintenanceServiceNanos     atomic.Uint64
 }
 
 // Stats returns a detached diagnostics snapshot without acquiring the node
@@ -536,6 +544,10 @@ func (q *NodeSubmissionSequencer) Stats() NodeSubmissionSequencerStats {
 	result.CheckpointQueueRejected = c.checkpointQueueRejected.Load()
 	result.CheckpointQueueWaitNanos = c.checkpointQueueWaitNanos.Load()
 	result.CheckpointServiceNanos = c.checkpointServiceNanos.Load()
+	result.NodeMaintenanceAttempts = c.nodeMaintenanceAttempts.Load()
+	result.NodeMaintenanceDeferred = c.nodeMaintenanceDeferred.Load()
+	result.NodeMaintenanceFailures = c.nodeMaintenanceFailures.Load()
+	result.NodeMaintenanceServiceNanos = c.nodeMaintenanceServiceNanos.Load()
 	return result
 }
 
@@ -582,6 +594,7 @@ type NodeSubmissionSequencer struct {
 	tail submissionRingIndex
 
 	wake             chan struct{}
+	maintenanceWake  chan struct{}
 	drained          chan struct{}
 	done             chan struct{}
 	closed           atomic.Bool
@@ -727,7 +740,8 @@ func NewNodeSubmissionSequencer(store *NodeStore, capacity int) (*NodeSubmission
 	}
 	q := &NodeSubmissionSequencer{
 		store: store, ring: make([]submissionRingSlot, capacity), mask: uint64(capacity - 1),
-		wake: make(chan struct{}, 1), drained: make(chan struct{}), done: make(chan struct{}),
+		wake: make(chan struct{}, 1), maintenanceWake: make(chan struct{}, 1),
+		drained: make(chan struct{}), done: make(chan struct{}),
 	}
 	q.persist = store.persistSequencedWave
 	for i := range q.ring {
@@ -744,8 +758,53 @@ func NewNodeSubmissionSequencer(store *NodeStore, capacity int) (*NodeSubmission
 	}
 	store.sequencer = q
 	store.mu.Unlock()
+	if store.engine != nil {
+		store.engine.SetMaintenanceWake(q.SignalNodeMaintenance)
+	}
 	go q.run()
 	return q, nil
+}
+
+// NodeMaintenanceWake returns the coalesced notification channel consumed by
+// the node-wide checkpoint coordinator. Producers never close this channel;
+// the coordinator is closed before the sequencer so no receiver outlives it.
+func (q *NodeSubmissionSequencer) NodeMaintenanceWake() <-chan struct{} {
+	if q == nil {
+		return nil
+	}
+	return q.maintenanceWake
+}
+
+// SignalNodeMaintenance requests one metadata-only node-log maintenance pass.
+// A buffered edge coalesces registrations and durable group checkpoints while
+// keeping the normal sequencer completion path allocation-free.
+func (q *NodeSubmissionSequencer) SignalNodeMaintenance() {
+	if q == nil || q.closed.Load() {
+		return
+	}
+	select {
+	case q.maintenanceWake <- struct{}{}:
+	default:
+	}
+}
+
+// ObserveNodeMaintenance records one coordinator-owned maintenance pass. A
+// deferred pass means the sealer or descriptor catalog was busy; a nonnil
+// error is retained by the coordinator separately for its caller to inspect.
+func (q *NodeSubmissionSequencer) ObserveNodeMaintenance(duration time.Duration, deferred bool, err error) {
+	if q == nil {
+		return
+	}
+	q.stats.nodeMaintenanceAttempts.Add(1)
+	if deferred {
+		q.stats.nodeMaintenanceDeferred.Add(1)
+	}
+	if err != nil && !deferred {
+		q.stats.nodeMaintenanceFailures.Add(1)
+	}
+	if duration > 0 {
+		q.stats.nodeMaintenanceServiceNanos.Add(uint64(duration))
+	}
 }
 
 // Owns reports whether this sequencer is the sole submission owner installed
@@ -927,12 +986,17 @@ func (q *NodeSubmissionSequencer) observeControlPersist(s *Submission) (err erro
 				return ErrCorrupt
 			}
 			s.descriptor = d
+			q.SignalNodeMaintenance()
 		}
 		return registerErr
 	case submissionDescriptorCatalog:
 		return q.store.publishDescriptorCatalogReferenceLocked(s.catalog, true)
 	case submissionCheckpoint:
-		return q.store.publishGroupCheckpointSequenced(s.groups[0], s.snapshot)
+		err = q.store.publishGroupCheckpointSequenced(s.groups[0], s.snapshot)
+		if err == nil {
+			q.SignalNodeMaintenance()
+		}
+		return err
 	default:
 		return ErrInvalid
 	}
@@ -1367,6 +1431,9 @@ func (q *NodeSubmissionSequencer) Close() error {
 		q.signal()
 	})
 	<-q.done
+	if q.store != nil && q.store.engine != nil {
+		q.store.engine.SetMaintenanceWake(nil)
+	}
 	if failure := q.fatal.Load(); failure != nil {
 		return errors.Join(ErrPersistenceUnknown, failure.err)
 	}

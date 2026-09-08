@@ -13,6 +13,7 @@ import (
 	"slices"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	pb "go.etcd.io/raft/v3/raftpb"
@@ -234,10 +235,13 @@ type Engine struct {
 	sealedSummaryOrder  []uint64
 	sealedSequence      uint64
 	applySequence       uint64
+	maintenanceWake     atomic.Pointer[engineMaintenanceWake]
 	entryArenas         [2][]EntryLocation
 	entryArenaActive    uint8
 	entryArenaReady     bool
 }
+
+type engineMaintenanceWake struct{ fn func() }
 
 type waveState struct {
 	digest   [32]byte
@@ -285,9 +289,22 @@ func (e *Engine) startSealer() {
 					e.writeMu.Lock()
 					e.log.poison(err)
 					e.writeMu.Unlock()
+				} else {
+					e.signalMaintenance()
 				}
 				e.sealResults <- err
 			case result := <-e.reclaimRequests:
+				// Reserve/heal/checkpoint work has priority over a fresh reclaim
+				// attempt. Both operations are serial here, so call the internal
+				// reclaim implementation directly; the public wrapper would send a
+				// second request to this same worker and deadlock.
+				// An interrupted reclaim already owns that priority work and
+				// reclaimDeadPrefix must resume it exactly once; running the
+				// maintenance prepass first would complete it and make this request
+				// look like a second, below-threshold reclaim.
+				if !e.reclaimResumePending() && !e.reclaimThresholdReady() {
+					e.runMetadataMaintenance()
+				}
 				result <- e.reclaimDeadPrefix()
 			case <-ticker.C:
 				e.runMetadataMaintenance()
@@ -296,6 +313,74 @@ func (e *Engine) startSealer() {
 			}
 		}
 	}()
+}
+
+func (e *Engine) reclaimResumePending() bool {
+	if e == nil {
+		return false
+	}
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+	if e.log == nil || e.log.metadata == nil {
+		return false
+	}
+	slot := e.log.metadata.slot
+	return slot.ReclaimPhase != reclaimNone || slot.RetiredCheckpointCount != 0
+}
+
+// reclaimThresholdReady reports whether an explicit reclaim request already
+// has an authenticated dead prefix large enough for reclaimDeadPrefix to own
+// the reserve-recycling transaction. Letting that transaction run first keeps
+// its two-bank recycle protocol and avoids replacing a dead segment with a
+// fresh reserve in the metadata prepass. Requests below threshold still run
+// the metadata prepass before reclaim is attempted.
+func (e *Engine) reclaimThresholdReady() bool {
+	if e == nil {
+		return false
+	}
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+	if e.maintenanceBusy || e.log == nil || e.log.usable() != nil || e.log.metadata == nil || e.log.metadata.needsHealing || e.log.metadata.slot.HasPending || e.log.metadata.slot.ReclaimPhase != reclaimNone {
+		return false
+	}
+	limit := min(reclaimMaxSegments, maxRetiredSegments)
+	cut := 0
+	usedBytes := uint64(0)
+	for cut < len(e.log.state.Segments) && cut < limit {
+		segment := e.log.state.Segments[cut]
+		if segment.State != SegmentSealed || cut >= len(e.reclaimAfter) || e.liveSealed[segment.ID] != 0 || e.reclaimAfter[cut] == 0 || e.reclaimAfter[cut] > e.sealedSequence {
+			break
+		}
+		if usedBytes > ^uint64(0)-segment.Bytes {
+			return false
+		}
+		usedBytes += segment.Bytes
+		cut++
+	}
+	return reclaimThresholdReached(cut, limit, usedBytes, e.log.state.SegmentCapacity)
+}
+
+// SetMaintenanceWake installs the node-level coalesced wake used after a
+// successful seal. It is a cold lifecycle binding; the atomic pointer lets the
+// sealer publish the event without taking writeMu or reaching into raftstore.
+func (e *Engine) SetMaintenanceWake(fn func()) {
+	if e == nil {
+		return
+	}
+	if fn == nil {
+		e.maintenanceWake.Store(nil)
+		return
+	}
+	e.maintenanceWake.Store(&engineMaintenanceWake{fn: fn})
+}
+
+func (e *Engine) signalMaintenance() {
+	if e == nil {
+		return
+	}
+	if wake := e.maintenanceWake.Load(); wake != nil && wake.fn != nil {
+		wake.fn()
+	}
 }
 
 func (e *Engine) waveDigest(payload []byte, sequence uint64, id WaveID) [32]byte {
@@ -355,6 +440,23 @@ func (e *Engine) WaitSeal() error {
 	}
 	e.writeMu.Unlock()
 	return err
+}
+
+// MaintenanceRetryNeeded reports whether a deferred node-log maintenance pass
+// should be retried after the serial sealer reaches its next idle boundary.
+// A completed seal notice is deliberately excluded: its authenticated slot
+// is already publishable, so reclaim can proceed without consuming WaitSeal.
+func (e *Engine) MaintenanceRetryNeeded() bool {
+	if e == nil {
+		return false
+	}
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+	if e.log == nil || e.log.metadata == nil {
+		return false
+	}
+	slot := e.log.metadata.slot
+	return e.maintenanceBusy || slot.HasPending || slot.ReclaimPhase != reclaimNone || slot.RetiredCheckpointCount != 0
 }
 
 // ReserveReaders fixes the maximum number of retained sealed descriptors.
@@ -2221,7 +2323,7 @@ func (e *Engine) finishFrozenSeal(base metadataState, pending SegmentMeta, event
 func (e *Engine) runMetadataMaintenance() {
 	e.writeMu.Lock()
 	if e.log != nil && e.log.metadata != nil && (e.log.metadata.slot.ReclaimPhase != reclaimNone || e.log.metadata.slot.RetiredCheckpointCount != 0) {
-		if e.maintenanceBusy || e.sealPending || e.log.usable() != nil || e.log.metadata.slot.HasPending {
+		if e.maintenanceBusy || e.log.usable() != nil || e.log.metadata.slot.HasPending {
 			e.writeMu.Unlock()
 			return
 		}

@@ -310,6 +310,75 @@ func (s *NodeStore) ReclaimDeadNodeLogPrefix() error {
 	return engine.ReclaimDeadPrefix()
 }
 
+// MaintainNodeLog performs one bounded metadata-only maintenance pass. It is
+// called by the node checkpoint coordinator, never by the submission worker:
+// descriptor catalog publication submits its own ordered control wave and
+// would deadlock if the sequencer worker tried to wait for itself.
+//
+// The descriptor prefix is checkpointed only when registration advanced it.
+// Reclamation then keeps the engine's authenticated live-group, sealed-sequence,
+// threshold, and reserve fences unchanged. Callers may defer ErrBounds and
+// backpressure, but this method returns them so asynchronous callers can retain
+// an observable failure/defer classification rather than silently discarding it.
+func (q *NodeSubmissionSequencer) MaintainNodeLog() error {
+	if q == nil || q.store == nil || q.closed.Load() {
+		return ErrClosed
+	}
+	s := q.store
+	s.mu.Lock()
+	if err := s.usable(); err != nil {
+		s.mu.Unlock()
+		return err
+	}
+	if s.engine == nil {
+		s.mu.Unlock()
+		return ErrInvalid
+	}
+	metadata, exists := s.engine.Metadata(nodeDescriptorGroup)
+	through := uint64(len(s.descriptors))
+	s.mu.Unlock()
+	if !exists || through == 0 || metadata.Checkpoint.Index > through {
+		if failure := s.coordinateReadError(); failure != nil {
+			return failure
+		}
+		return ErrCorrupt
+	}
+	if metadata.Checkpoint.Index < through {
+		if err := s.CheckpointDescriptorCatalog(); err != nil {
+			return err
+		}
+	}
+	err := s.ReclaimDeadNodeLogPrefix()
+	if errors.Is(err, seglog.ErrBounds) {
+		if failure := s.coordinateReadError(); failure != nil {
+			return failure
+		}
+	}
+	return err
+}
+
+// NodeMaintenanceRetryNeeded retains a dirty descriptor prefix or a durable
+// engine maintenance phase which was busy when the coordinator last tried.
+// It avoids turning an ordinary below-threshold/live-group result into a
+// periodic reclaim loop while still retrying after a seal or I/O reservation
+// boundary makes the same work admissible.
+func (q *NodeSubmissionSequencer) NodeMaintenanceRetryNeeded() bool {
+	if q == nil || q.store == nil || q.closed.Load() {
+		return false
+	}
+	s := q.store
+	s.mu.Lock()
+	if s.usable() != nil || s.engine == nil {
+		s.mu.Unlock()
+		return false
+	}
+	metadata, exists := s.engine.Metadata(nodeDescriptorGroup)
+	dirty := exists && metadata.Checkpoint.Index < uint64(len(s.descriptors))
+	engine := s.engine
+	s.mu.Unlock()
+	return dirty || engine.MaintenanceRetryNeeded()
+}
+
 func (s *NodeStore) publishDescriptorCatalogReference(candidate descriptorCatalogCandidate) error {
 	s.mu.Lock()
 	sequencer := s.sequencer
