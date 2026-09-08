@@ -481,7 +481,7 @@ func (s *NodeStore) readDescriptorCatalog(checkpoint seglog.Checkpoint, limit in
 	_, _ = mac.Write(header[:])
 	workspace := newObjectCryptoWorkspace(s.crypto.dataKey, s.crypto.nonceKey)
 	headerDigest := sha256.Sum256(header[:])
-	descriptors := make([]GroupDescriptor, 0, min(int(count), limit))
+	descriptors := make([]GroupDescriptor, 0, limit)
 	ciphertext := make([]byte, nodeDescriptorFixed+2*MaxIdentityComponentBytes+s.crypto.aead.Overhead())
 	plain := make([]byte, 0, nodeDescriptorFixed+2*MaxIdentityComponentBytes)
 	var record [descriptorCatalogRecordBytes]byte

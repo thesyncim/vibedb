@@ -265,6 +265,20 @@ func TestPersistWaveOneWriteOneSyncAndNoMetadataPublication(t *testing.T) {
 	}
 }
 
+func TestLookupAndReadActiveSegment(t *testing.T) {
+	e := newReservedEngine(t, 1)
+	e.SetDataSyncForTesting(func(*os.File) error { return nil })
+	if err := e.PersistWave(Wave{ID: waveID(1), Batches: []ReadyBatch{{
+		GroupID: 1, Entries: []Entry{{Index: 1, Term: 1, Data: []byte("active")}},
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+	location, data, term, compacted, found, err := e.LookupAndRead(1, 1, make([]byte, 64))
+	if err != nil || compacted || !found || term != 1 || location.SegmentID != e.log.state.ActiveID || string(data) != "active" {
+		t.Fatalf("active lookup location=%+v data=%q term=%d compacted=%t found=%t err=%v", location, data, term, compacted, found, err)
+	}
+}
+
 func TestPersistWaveRequiresCanonicalGroupOrderBeforeIO(t *testing.T) {
 	e := newReservedEngine(t, 1, 2)
 	writes, syncs := 0, 0

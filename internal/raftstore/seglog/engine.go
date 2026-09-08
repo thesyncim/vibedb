@@ -1158,7 +1158,7 @@ func (e *Engine) LookupExactLease(group, index uint64) (location EntryLocation, 
 			return location, term, compacted, ok, ReadLease{}, err
 		}
 		lease, err = e.AcquireLocation(location)
-		if err == nil && lease.state != nil {
+		if err == nil {
 			return location, term, compacted, ok, lease, nil
 		}
 		if err != nil && !errors.Is(err, ErrBounds) {
