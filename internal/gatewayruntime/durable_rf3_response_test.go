@@ -44,6 +44,26 @@ func durableRF3ExternalExecResponse(t testing.TB, raw []byte) durableRF3External
 	return response
 }
 
+// durableRF3ExternalLogResponse records only fields already present in the
+// public response. It is used around the intentional first-byte loss so a
+// failed external run preserves the existing stage/error/outcome evidence
+// without issuing another replay or changing the retry policy.
+func durableRF3ExternalLogResponse(t testing.TB, stage string, raw []byte) {
+	t.Helper()
+	var response durableRF3ExternalWireResponse
+	if err := vibejson.Unmarshal(raw, &response); err != nil {
+		t.Logf("external response stage=%s decode_error=%v bytes=%d", stage, err, len(raw))
+		return
+	}
+	errorText := response.Error
+	if len(errorText) > 512 {
+		errorText = errorText[:512] + "...(truncated)"
+	}
+	t.Logf("external response stage=%s kind=%s ok=%t op=%s committed=%t outcome_unknown=%t error=%q applied=%d collection_rounds=%d",
+		stage, response.Kind, response.OK, response.Op, response.Committed,
+		response.OutcomeUnknown, errorText, response.Applied, response.CollectionRounds)
+}
+
 func (response durableRF3ExternalWireResponse) committed(rows int64, shards int) bool {
 	return response.Kind == "Completion" && response.Committed && !response.OutcomeUnknown && response.Error == "" &&
 		response.RowsAffected == rows && response.ShardsFanned == shards

@@ -144,6 +144,13 @@ func TestGatewayDurableRF3ExternalProcessRecovery(t *testing.T) {
 			_ = syscall.Kill(fixture.shards[partitioned].PID(), syscall.SIGCONT)
 		}
 	}()
+	var failureDiagnosticRequest []byte
+	var failureDiagnosticStage string
+	defer func() {
+		if t.Failed() {
+			durableRF3ExternalLogLedgerCut(t, fixture, failureDiagnosticStage, failureDiagnosticRequest)
+		}
+	}()
 	fixture.waitAllRoleLeaders(t, partitioned, 30*time.Second)
 	partitionFailover := time.Since(partitionStarted)
 	if partitionFailover > 15*time.Second {
@@ -160,7 +167,8 @@ func TestGatewayDurableRF3ExternalProcessRecovery(t *testing.T) {
 		{SQL: `INSERT INTO orders_a VALUES (?)`, Params: []serveParam{{Kind: "document", Text: `{"id":"terminal-a","kind":"terminal","email":"terminal-a@example.test","value":101}`}}},
 		{SQL: `INSERT INTO orders_b VALUES (?)`, Params: []serveParam{{Kind: "document", Text: `{"id":"terminal-b","kind":"terminal","email":"terminal-b@example.test","value":202}`}}},
 	})
-	terminalLossLatency := clientA.loseResponseAfterFirstByte(t, terminalRequest)
+	failureDiagnosticRequest, failureDiagnosticStage = terminalRequest, "terminal_exec"
+	terminalLossLatency := clientA.loseResponseAfterFirstByte(t, terminalRequest, "terminal_exec")
 	latencies = append(latencies, terminalLossLatency)
 	// The byte proves the server emitted a response, while these independent
 	// linearizable reads prove the mutation applied despite its deliberately
@@ -200,12 +208,14 @@ func TestGatewayDurableRF3ExternalProcessRecovery(t *testing.T) {
 		t.Fatalf("gateway replacement recovery=%s exceeds 15s", gatewayReplacement)
 	}
 	recovered := durableRF3ExternalExecResponse(t, recoveredRaw)
+	durableRF3ExternalLogResponse(t, "terminal_recovery", recoveredRaw)
 	if !recovered.Committed || recovered.RowsAffected != 2 || recovered.ShardsFanned != 2 ||
 		recovered.Error != "" {
 		t.Fatalf("replacement terminal response=%s", recoveredRaw)
 	}
 	replayedRaw, replayLatency := clientB.roundTrip(t, terminalRequest)
 	latencies = append(latencies, replayLatency)
+	durableRF3ExternalLogResponse(t, "terminal_replay", replayedRaw)
 	if !bytes.Equal(recoveredRaw, replayedRaw) {
 		t.Fatalf("exact terminal replay drifted\nfirst=%s\nsecond=%s", recoveredRaw, replayedRaw)
 	}
@@ -228,7 +238,8 @@ func TestGatewayDurableRF3ExternalProcessRecovery(t *testing.T) {
 	// one response byte makes the ACK unusable to the caller while proving the
 	// shipped gateway emitted it after collection.
 	ackWire := sessionProtocolAckRequest(t, ackRequest)
-	ackLossLatency := clientB.loseResponseAfterFirstByte(t, ackWire)
+	failureDiagnosticRequest, failureDiagnosticStage = ackWire, "ack_exec"
+	ackLossLatency := clientB.loseResponseAfterFirstByte(t, ackWire, "ack_exec")
 	latencies = append(latencies, ackLossLatency)
 	ackBeforeKill := fixture.waitAckComplete(t, home, requestKey, 30*time.Second)
 	durableRF3ExternalAssertAckRecord(t, ackBeforeKill, requestKey, ackRequest)
@@ -246,6 +257,7 @@ func TestGatewayDurableRF3ExternalProcessRecovery(t *testing.T) {
 	clientB = fixture.dialGateway(t, fixture.gatewayBNode, fixture.gatewayBAddress)
 	ackRetryRaw, ackRetryLatency := clientB.roundTrip(t, ackWire)
 	latencies = append(latencies, ackRetryLatency)
+	durableRF3ExternalLogResponse(t, "ack_retry_after_kill", ackRetryRaw)
 	durableRF3ExternalAssertAckResponse(t, ackRetryRaw, ackRequest)
 	fixture.restartShard(t, ackKilled)
 	fixture.waitMemberCaughtUpAllRoles(t, ackKilled, 45*time.Second)
@@ -265,6 +277,7 @@ func TestGatewayDurableRF3ExternalProcessRecovery(t *testing.T) {
 	clientA = fixture.dialGateway(t, fixture.gatewayANode, fixture.gatewayAAddress)
 	ackARaw, ackALatency := clientA.roundTrip(t, ackWire)
 	latencies = append(latencies, ackALatency)
+	durableRF3ExternalLogResponse(t, "ack_replay_gateway_a", ackARaw)
 	durableRF3ExternalAssertAckResponse(t, ackARaw, ackRequest)
 	if !durableRF3ExternalSameCompletedAck(ackRetryRaw, ackARaw) {
 		t.Fatalf("exact ACK replay drifted across gateways\nB=%s\nA=%s", ackRetryRaw, ackARaw)
@@ -273,6 +286,7 @@ func TestGatewayDurableRF3ExternalProcessRecovery(t *testing.T) {
 	fixture.assertPinJournalRetired(t, fixture.gatewayBJournal)
 	acknowledgedRaw, acknowledgedLatency := clientA.roundTrip(t, terminalRequest)
 	latencies = append(latencies, acknowledgedLatency)
+	durableRF3ExternalLogResponse(t, "terminal_acknowledged_replay", acknowledgedRaw)
 	acknowledged := durableRF3ExternalExecResponse(t, acknowledgedRaw)
 	if acknowledged.Error == "" || !strings.Contains(acknowledged.Error, gateway.ErrDurableRequestAcknowledged.Error()) ||
 		acknowledged.Committed || strings.Contains(string(acknowledgedRaw), `"ack_token"`) {
@@ -298,6 +312,7 @@ func TestGatewayDurableRF3ExternalProcessRecovery(t *testing.T) {
 	fixture.waitAllRoleLeaders(t, -1, 30*time.Second)
 	postRestartAck, postRestartLatency := clientA.roundTrip(t, ackWire)
 	latencies = append(latencies, postRestartLatency)
+	durableRF3ExternalLogResponse(t, "ack_replay_after_all_restart", postRestartAck)
 	durableRF3ExternalAssertAckResponse(t, postRestartAck, ackRequest)
 	if !durableRF3ExternalSameCompletedAck(ackARaw, postRestartAck) {
 		t.Fatalf("exact ACK replay drifted after every voter restart\nwant=%s\ngot=%s",
@@ -1162,6 +1177,104 @@ func (fixture *durableRF3ExternalFixture) requestHome(
 	return home
 }
 
+// durableRF3ExternalLogLedgerCut is failure-only evidence for the exact
+// request that was in flight at the last external boundary. It reads only the
+// bounded lifecycle metadata needed to distinguish a pending wave from a
+// terminal/route transition; it never logs SQL, ACK tokens, or row payloads.
+func durableRF3ExternalLogLedgerCut(
+	t testing.TB,
+	fixture *durableRF3ExternalFixture,
+	stage string,
+	rawRequest []byte,
+) {
+	t.Helper()
+	if fixture == nil || fixture.ledger == nil || fixture.topology == nil ||
+		fixture.catalogAuthority == nil || len(rawRequest) == 0 {
+		t.Logf("external ledger cut stage=%s unavailable=request_identity", stage)
+		return
+	}
+	identity, err := durableRF3ExternalDiagnosticIdentity(rawRequest)
+	if err != nil {
+		t.Logf("external ledger cut stage=%s unavailable=request_identity err=%v", stage, err)
+		return
+	}
+	readCtx, cancel := context.WithTimeout(fixture.ctx, 2*time.Second)
+	defer cancel()
+	key, err := fixture.catalogAuthority.ValidateIssuerRequestKey(
+		readCtx,
+		serviceauthz.Authority{Node: fixture.nodes[fixture.userNode], Generation: 5},
+		authenticatedIssuerTenantResolver{}, identity.Reference,
+		requestledger.RequestID(identity.RequestID), identity.IssuerSequence,
+	)
+	if err != nil {
+		t.Logf("external ledger cut stage=%s unavailable=request_key err=%v", stage, err)
+		return
+	}
+	point, err := requestledger.Home(key)
+	if err != nil {
+		t.Logf("external ledger cut stage=%s unavailable=home err=%v", stage, err)
+		return
+	}
+	home, _, found := fixture.topology.Lookup(point)
+	if !found {
+		t.Logf("external ledger cut stage=%s unavailable=home_lookup", stage)
+		return
+	}
+	head, headErr := fixture.ledger.ReadRow(readCtx, home, gateway.DurableRequestLifecycleRead{
+		Key: key, Kind: replicatedstate.RequestLedgerReadHead, MinimumApplied: 1,
+	})
+	if headErr != nil || !head.Found || head.Kind != replicatedstate.RequestLedgerReadHead {
+		t.Logf("external ledger cut stage=%s head_found=%t head_kind=%d head_applied=%d head_err=%v issuer_epoch=%d issuer_sequence=%d",
+			stage, head.Found, head.Kind, head.Applied, headErr, key.IssuerEpoch, key.IssuerSequence)
+		return
+	}
+	t.Logf("external ledger cut stage=%s head_applied=%d phase=%d revision=%d next_step=%d continuation_revision=%d plan_build_generation=%d outstanding_route_pin=%x issuer_epoch=%d issuer_sequence=%d",
+		stage, head.Applied, head.Head.Phase, head.Head.Revision, head.Head.NextStepOrdinal,
+		head.Head.ContinuationRevision, head.Head.PlanBuildGeneration,
+		head.Head.OutstandingRoutePinDigest, key.IssuerEpoch, key.IssuerSequence)
+	route, routeErr := fixture.ledger.ReadRow(readCtx, home, gateway.DurableRequestLifecycleRead{
+		Key: key, Kind: replicatedstate.RequestLedgerReadRoutePin, MinimumApplied: head.Applied,
+	})
+	if routeErr != nil || !route.Found || route.Kind != replicatedstate.RequestLedgerReadRoutePin {
+		t.Logf("external ledger cut stage=%s route_found=%t route_kind=%d route_applied=%d route_err=%v",
+			stage, route.Found, route.Kind, route.Applied, routeErr)
+	} else {
+		t.Logf("external ledger cut stage=%s route_applied=%d route_phase=%d route_revision=%d route_wave=%d route_command_digest=%x route_completion_digest=%x route_acquired_digest=%x",
+			stage, route.Applied, route.RoutePin.Phase, route.RoutePin.Revision,
+			route.RoutePin.WaveOrdinal, route.RoutePin.CommandDigest,
+			route.RoutePin.CompletionDigest, route.RoutePin.AcquiredEvidenceDigest)
+	}
+	pending := make([]requestledger.StepRef, requestledger.MaxPendingWaveSteps)
+	wave, waveErr := fixture.ledger.ReadRow(readCtx, home, gateway.DurableRequestLifecycleRead{
+		Key: key, Kind: replicatedstate.RequestLedgerReadPending, MinimumApplied: head.Applied,
+		PendingSteps: pending,
+	})
+	if waveErr != nil || !wave.Found || wave.Kind != replicatedstate.RequestLedgerReadPending {
+		t.Logf("external ledger cut stage=%s pending_found=%t pending_kind=%d pending_applied=%d pending_err=%v",
+			stage, wave.Found, wave.Kind, wave.Applied, waveErr)
+		return
+	}
+	t.Logf("external ledger cut stage=%s pending_applied=%d pending_revision=%d pending_wave=%d pending_steps=%d pending_route_pin=%x pending_forwarding_witness=%x",
+		stage, wave.Applied, wave.Pending.Revision, wave.Pending.WaveOrdinal,
+		len(wave.Pending.Steps), wave.Pending.RoutePinDigest, wave.Pending.ForwardingWitnessDigest)
+}
+
+func durableRF3ExternalDiagnosticIdentity(raw []byte) (durableExecBatchIdentity, error) {
+	var request serveRequest
+	var scratch serveRequestDecodeScratch
+	if err := decodeDurableExecBatchRequest(raw, &request, &scratch); err == nil {
+		return request.wireIdentity, nil
+	}
+	var ack durableExecBatchAckWireRequest
+	if err := decodeDurableExecBatchAckRequest(raw, &ack); err != nil {
+		return durableExecBatchIdentity{}, err
+	}
+	return durableExecBatchIdentity{
+		RequestID: ack.Identity.RequestID, Reference: ack.Identity.Reference,
+		IssuerSequence: ack.Identity.IssuerSequence,
+	}, nil
+}
+
 func (fixture *durableRF3ExternalFixture) waitAckComplete(
 	t testing.TB,
 	home gateway.DurableRequestLedgerHome,
@@ -1384,6 +1497,7 @@ func (client *durableRF3ExternalWireClient) roundTripWithin(
 func (client *durableRF3ExternalWireClient) loseResponseAfterFirstByte(
 	t testing.TB,
 	request []byte,
+	stage string,
 ) time.Duration {
 	t.Helper()
 	if err := client.connection.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
@@ -1403,6 +1517,8 @@ func (client *durableRF3ExternalWireClient) loseResponseAfterFirstByte(
 	}
 	client.recordBytes(uint64(written + read))
 	client.close()
+	t.Logf("external first-byte loss stage=%s request_bytes=%d first_byte=%q latency=%s response_state=unknown",
+		stage, written, first[0], latency)
 	return latency
 }
 

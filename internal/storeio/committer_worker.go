@@ -632,6 +632,7 @@ func (c *Committer) release(batch *Batch) {
 	}
 	c.freeBuffers.pushN(released)
 	batch.pages = batch.pages[:0]
+	batch.bufferIndexes = batch.bufferIndexes[:0]
 	batch.root = Write{}
 	batch.rootGeneration = 0
 	batch.journal = Write{}
