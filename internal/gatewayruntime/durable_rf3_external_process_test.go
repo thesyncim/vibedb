@@ -452,9 +452,10 @@ type durableRF3ExternalFixture struct {
 	walPaths         [durableRF3ExternalGroups][durableRF3ExternalVoters]string
 	catalogClose     func()
 
-	measurements *durableRF3ExternalMeasurements
-	seeded       bool
-	peerLinks    [durableRF3ExternalVoters][durableRF3ExternalVoters]*rf3PeerProxy
+	measurements   *durableRF3ExternalMeasurements
+	seeded         bool
+	diagnosticCuts bool
+	peerLinks      [durableRF3ExternalVoters][durableRF3ExternalVoters]*rf3PeerProxy
 }
 
 type durableRF3ExternalMeasurements struct {
@@ -1045,10 +1046,19 @@ func (fixture *durableRF3ExternalFixture) tryProbe(
 }
 
 func (fixture *durableRF3ExternalFixture) probeMember(group, member int, requireLeader bool) (shardservice.ReplicatedMemberState, error) {
+	return fixture.probeMemberWithin(group, member, requireLeader, time.Second)
+}
+
+func (fixture *durableRF3ExternalFixture) probeMemberWithin(
+	group, member int, requireLeader bool, timeout time.Duration,
+) (shardservice.ReplicatedMemberState, error) {
 	if group < 0 || group >= durableRF3ExternalGroups || member < 0 || member >= durableRF3ExternalVoters {
 		return shardservice.ReplicatedMemberState{}, errors.New("external RF3: invalid probe")
 	}
-	ctx, cancel := context.WithTimeout(fixture.ctx, time.Second)
+	if timeout <= 0 {
+		return shardservice.ReplicatedMemberState{}, errors.New("external RF3: invalid probe timeout")
+	}
+	ctx, cancel := context.WithTimeout(fixture.ctx, timeout)
 	defer cancel()
 	route := fixture.routes[group]
 	ctx, err := serviceauthz.WithAuthority(ctx, serviceauthz.Authority{
@@ -1102,14 +1112,19 @@ func (fixture *durableRF3ExternalFixture) waitRouteLeader(
 			observed++
 		}
 		if consistent && observed >= 2 && leader != 0 {
+			fixture.logRouteLeaderCut(t, group, "route-leader", lastStates, lastErrors, excluded)
 			return leader, applied
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 	for member, state := range lastStates {
 		if member != excluded {
-			t.Logf("role %s probe member=%d leader=%d applied=%d error=%v",
-				durableRF3ExternalRoleNames[group], member+1, state.LeaderID, state.Applied, lastErrors[member])
+			if fixture.diagnosticCuts {
+				fixture.logRouteLeaderObservation(t, group, member, "route-leader-timeout", state, lastErrors[member])
+			} else {
+				t.Logf("role %s probe member=%d leader=%d applied=%d error=%v",
+					durableRF3ExternalRoleNames[group], member+1, state.LeaderID, state.Applied, lastErrors[member])
+			}
 		}
 	}
 	t.Fatalf("role %s has no consistent RF3 leader excluding member %d",
@@ -1143,6 +1158,7 @@ func (fixture *durableRF3ExternalFixture) waitMemberCaughtUpAllRoles(
 			t.Fatalf("member %d role %s did not catch up through %d: state=%+v err=%v",
 				member+1, durableRF3ExternalRoleNames[group], required, state, err)
 		}
+		fixture.logRouteLeaderObservation(t, group, member, "member-caught-up", state, nil)
 	}
 }
 

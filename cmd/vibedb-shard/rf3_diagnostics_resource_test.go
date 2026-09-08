@@ -31,6 +31,9 @@ func rf3DiagnosticTestGroup(id byte) raftmember.GroupKey {
 
 func rf3DiagnosticTestStats(seed uint64) durable.Stats {
 	return durable.Stats{
+		AutomaticCheckpoints:                  seed + 14,
+		RetirementPressureCheckpoints:         seed + 15,
+		DirtyBytes:                            seed + 13,
 		PrimaryOverlayFolds:                   seed,
 		PrimaryOverlayMaterializationAttempts: seed + 1,
 		PrimaryOverlayMaterializations:        seed + 2,
@@ -81,6 +84,11 @@ func TestRF3DiagnosticResourceAggregationIncludesAllParticipants(t *testing.T) {
 		t.Fatalf("overlay counters=%d/%d/%d/%d", totals.primaryOverlayFolds,
 			totals.primaryOverlayMaterializationAttempts, totals.primaryOverlayMaterializations,
 			totals.primaryOverlayMaterializationFailures)
+	}
+	if totals.automaticCheckpoints != 148 || totals.retirementPressureCheckpoints != 156 ||
+		totals.dirtyBytes != 140 {
+		t.Fatalf("checkpoint/dirty counters=%d/%d/%d", totals.automaticCheckpoints,
+			totals.retirementPressureCheckpoints, totals.dirtyBytes)
 	}
 	if totals.primaryOverlayFoldNS.Count != 68 || totals.primaryOverlayFoldNS.Sum != 680 ||
 		totals.primaryOverlayFoldNS.Max != 800 || totals.primaryOverlayFoldNS.Buckets[0] != 36 ||

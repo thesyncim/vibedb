@@ -1299,11 +1299,12 @@ func hotMutationGatewayProcess(binary, catalog, listen, control, capacity string
 }
 
 type hotMutationWireClient struct {
-	connection net.Conn
-	reader     *bufio.Reader
-	requests   uint64
-	bytes      uint64
-	verifier   *hotMutationVerifier
+	connection        net.Conn
+	reader            *bufio.Reader
+	requests          uint64
+	bytes             uint64
+	verifier          *hotMutationVerifier
+	executeDiagnostic func(attempt int, elapsed time.Duration, response []byte)
 }
 
 func hotMutationDialGateway(t *testing.T, profile *rafttransport.PeerTLS,
@@ -1404,11 +1405,18 @@ func (client *hotMutationWireClient) execute(t *testing.T, request []byte) time.
 	t.Helper()
 	started := time.Now()
 	response, latency := client.roundTrip(t, request)
+	if client.executeDiagnostic != nil {
+		client.executeDiagnostic(1, latency, response)
+	}
 	// A leader handoff may explicitly leave this durable request unresolved.
 	// Resolve it with one exact public retry; include both attempts in the
 	// existing latency, request-count, and byte bounds.
 	if strings.Contains(string(response), gateway.ErrDurableRequestUnresolved.Error()) {
-		response, _ = client.roundTrip(t, request)
+		var retryLatency time.Duration
+		response, retryLatency = client.roundTrip(t, request)
+		if client.executeDiagnostic != nil {
+			client.executeDiagnostic(2, retryLatency, response)
+		}
 		latency = time.Since(started)
 	}
 	if !strings.Contains(string(response), `"committed":true`) ||

@@ -163,7 +163,40 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 			Kind: "document", Text: fmt.Sprintf(`{"id":%q,"value":%d}`, key, index+1),
 		}}}
 	}
-	latencies = append(latencies, client.execute(t, hotMutationRequest(t, reference, 1, seed)))
+	seedRequest := hotMutationRequest(t, reference, 1, seed)
+	seedStarted := time.Now()
+	seedLatency := time.Duration(0)
+	var seedObservations [2]struct {
+		elapsed  time.Duration
+		response []byte
+	}
+	seedObservationCount := 0
+	func() {
+		defer func() {
+			totalElapsed := time.Since(seedStarted)
+			client.executeDiagnostic = nil
+			for index := 0; index < seedObservationCount; index++ {
+				t.Logf("dev-hot seed execute attempt=%d elapsed=%s result=%s",
+					index+1, seedObservations[index].elapsed,
+					hotMutationExecuteResultClass(seedObservations[index].response))
+			}
+			t.Logf("dev-hot seed execute total_elapsed=%s attempts=%d returned_elapsed=%s",
+				totalElapsed, seedObservationCount, seedLatency)
+		}()
+		client.executeDiagnostic = func(attempt int, elapsed time.Duration, response []byte) {
+			if attempt >= 1 && attempt <= len(seedObservations) {
+				seedObservations[attempt-1] = struct {
+					elapsed  time.Duration
+					response []byte
+				}{elapsed: elapsed, response: response}
+				if attempt > seedObservationCount {
+					seedObservationCount = attempt
+				}
+			}
+		}
+		seedLatency = client.execute(t, seedRequest)
+	}()
+	latencies = append(latencies, seedLatency)
 	// The shipped window measures operations, not the number of unique rows.
 	// Serial durable INSERTs include the full request-ledger protocol and cannot
 	// reliably produce 64 operations in one second. Drive real, ReadIndex-fenced
@@ -236,6 +269,29 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 	t.Logf("zero-config hot split: children=%d key_setup=%s p99=%s requests=%d wire=%d rss_growth=%d storage_growth=%d wal_growth=%d network_growth=%d",
 		children, keySetup, p99, client.requests, client.bytes, positiveDifference(finalRSS, baselineRSS),
 		storageGrowth, walGrowth, networkGrowth)
+}
+
+func hotMutationExecuteResultClass(response []byte) string {
+	var envelope struct {
+		Committed      bool   `json:"committed"`
+		OutcomeUnknown bool   `json:"outcome_unknown"`
+		Error          string `json:"error"`
+	}
+	if err := json.Unmarshal(response, &envelope); err != nil {
+		return "invalid-json"
+	}
+	switch {
+	case strings.Contains(envelope.Error, gateway.ErrDurableRequestUnresolved.Error()):
+		return "unresolved"
+	case envelope.Committed && !envelope.OutcomeUnknown && envelope.Error == "":
+		return "committed"
+	case envelope.OutcomeUnknown:
+		return "outcome-unknown"
+	case envelope.Error != "":
+		return "error"
+	default:
+		return "other"
+	}
 }
 
 func devHotReadRequest(t *testing.T, keys []string) []byte {

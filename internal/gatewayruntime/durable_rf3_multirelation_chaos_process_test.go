@@ -36,6 +36,16 @@ func TestGatewayDurableRF3MultiRelationChaosProcess(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Minute)
 	defer cancel()
 	fixture := newDurableRF3ExternalFixtureWithPeerFaults(t, ctx, true)
+	fixture.diagnosticCuts = true
+	trace := &durableRF3MultiRelationTrace{ctx: ctx, stage: "startup", request: "none", started: time.Now()}
+	unexpectedCaptured := false
+	captureUnexpected := func() {
+		if unexpectedCaptured || !t.Failed() {
+			return
+		}
+		unexpectedCaptured = true
+		fixture.captureUnexpectedMultiRelationFailure(t, trace)
+	}
 	defer fixture.close(t)
 	defer func() {
 		if t.Failed() {
@@ -45,6 +55,9 @@ func TestGatewayDurableRF3MultiRelationChaosProcess(t *testing.T) {
 			t.Logf("multi-relation gateway A diagnostics:\n%s", fixture.gatewayA.Diagnostics())
 			t.Logf("multi-relation gateway B diagnostics:\n%s", fixture.gatewayB.Diagnostics())
 		}
+	}()
+	defer func() {
+		captureUnexpected()
 	}()
 	fixture.startShards(t)
 	fixture.startGateway(t, fixture.gatewayA)
@@ -97,29 +110,39 @@ func TestGatewayDurableRF3MultiRelationChaosProcess(t *testing.T) {
 	setPartition(true)
 	partitionActive := true
 	defer func() {
+		// Capture before healing the peer links so a timeout during the
+		// partition retains the election/transport state that caused it.
+		captureUnexpected()
 		if partitionActive {
 			setPartition(false)
 		}
 	}()
 	partitionStarted := time.Now()
+	trace.set(ctx, "partition failover", fmt.Sprintf("all RF3 groups excluding member=%d", partitioned+1))
 	fixture.waitAllRoleLeaders(t, partitioned, 30*time.Second)
 	partitionFailover := time.Since(partitionStarted)
+	trace.set(ctx, "insert response loss", "exec_batch sequence=1 tables=orders_a,orders_b data-groups=data-a,data-b")
 	insertLoss := client.loseResponseAfterFirstByte(t, insertRequest)
 	t.Logf("insert response lost after %s", insertLoss)
 	latencies = append(latencies, insertLoss)
+	trace.set(ctx, "gateway replacement", "kill gateway A after insert response loss")
 	if err := fixture.gatewayA.Kill(ctx); err != nil {
 		t.Fatal(err)
 	}
 	replacementStarted := time.Now()
+	trace.set(ctx, "gateway replacement", "start gateway B and reconnect client")
 	fixture.startGateway(t, fixture.gatewayB)
 	client = fixture.dialGateway(t, fixture.gatewayBNode, fixture.gatewayBAddress)
+	trace.set(ctx, "insert terminal replay", "exec_batch sequence=1 tables=orders_a,orders_b data-groups=data-a,data-b")
 	insertRaw, insertLatency := client.roundTrip(t, insertRequest)
 	latencies = append(latencies, insertLatency)
 	durableRF3ExternalAssertCommitted(t, insertRaw, 24, 2)
+	trace.set(ctx, "insert terminal acknowledgment", "ack_exec_batch sequence=1")
 	latencies = append(latencies, client.ackTerminal(t, insertRaw))
 	replacementRecovery := time.Since(replacementStarted)
 	setPartition(false)
 	partitionActive = false
+	trace.set(ctx, "partition catch-up", fmt.Sprintf("member=%d all RF3 groups", partitioned+1))
 	fixture.waitMemberCaughtUpAllRoles(t, partitioned, 45*time.Second)
 
 	updateStatements := make([]serveStatement, 0, 24)
@@ -131,25 +154,36 @@ func TestGatewayDurableRF3MultiRelationChaosProcess(t *testing.T) {
 	updateRequest := hotMutationRequest(t, reference, 2, updateStatements)
 	updateLeader, _ := fixture.waitRouteLeader(t, durableRF3DataAGroup, -1, 30*time.Second)
 	updateKilled := durableRF3ExternalLeaderMember(t, updateLeader)
+	trace.set(ctx, "leader kill", fmt.Sprintf("data-a leader member=%d", updateKilled+1))
 	fixture.killShard(t, updateKilled)
 	killStarted := time.Now()
+	trace.set(ctx, "leader-kill failover", fmt.Sprintf("all RF3 groups excluding member=%d", updateKilled+1))
 	fixture.waitAllRoleLeaders(t, updateKilled, 30*time.Second)
 	killFailover := time.Since(killStarted)
+	trace.set(ctx, "update response loss", "exec_batch sequence=2 tables=orders_a,orders_b data-groups=data-a,data-b")
 	updateLoss := client.loseResponseAfterFirstByte(t, updateRequest)
 	t.Logf("update response lost after %s", updateLoss)
 	latencies = append(latencies, updateLoss)
+	trace.set(ctx, "gateway reconnect", "reconnect replacement gateway for update replay")
 	client = fixture.dialGateway(t, fixture.gatewayBNode, fixture.gatewayBAddress)
+	trace.set(ctx, "update terminal replay", "exec_batch sequence=2 tables=orders_a,orders_b data-groups=data-a,data-b")
 	updateRaw, updateLatency := client.roundTrip(t, updateRequest)
 	latencies = append(latencies, updateLatency)
 	durableRF3ExternalAssertCommitted(t, updateRaw, 24, 2)
+	trace.set(ctx, "update exact terminal replay", "exec_batch sequence=2 identical request digest")
 	replayedRaw, replayLatency := client.roundTrip(t, updateRequest)
 	latencies = append(latencies, replayLatency)
 	if !bytes.Equal(updateRaw, replayedRaw) {
 		t.Fatalf("multi-relation terminal replay drifted\nfirst=%s\nsecond=%s", updateRaw, replayedRaw)
 	}
+	trace.set(ctx, "update terminal acknowledgment", "ack_exec_batch sequence=2")
 	latencies = append(latencies, client.ackTerminal(t, updateRaw))
+	fixture.preserveCurrentBootDiagnostics(t, updateKilled, "before-update-member-restart")
+	trace.set(ctx, "update member restart", fmt.Sprintf("member=%d all RF3 groups", updateKilled+1))
 	fixture.restartShard(t, updateKilled)
+	trace.set(ctx, "update member catch-up", fmt.Sprintf("member=%d all RF3 groups", updateKilled+1))
 	fixture.waitMemberCaughtUpAllRoles(t, updateKilled, 45*time.Second)
+	trace.set(ctx, "post-update leader convergence", "all RF3 groups")
 	fixture.waitAllRoleLeaders(t, -1, 30*time.Second)
 
 	deleteStatements := make([]serveStatement, 0, 12)
@@ -159,20 +193,28 @@ func TestGatewayDurableRF3MultiRelationChaosProcess(t *testing.T) {
 			durableRF3ExternalChurnDelete("orders_b", "b", ordinal))
 	}
 	deleteRequest := hotMutationRequest(t, reference, 3, deleteStatements)
+	trace.set(ctx, "delete terminal execution", "exec_batch sequence=3 tables=orders_a,orders_b data-groups=data-a,data-b")
 	deleteRaw, deleteLatency := client.roundTrip(t, deleteRequest)
 	latencies = append(latencies, deleteLatency)
 	durableRF3ExternalAssertCommitted(t, deleteRaw, 12, 2)
+	trace.set(ctx, "delete terminal acknowledgment", "ack_exec_batch sequence=3")
 	latencies = append(latencies, client.ackTerminal(t, deleteRaw))
 
+	trace.set(ctx, "native multi-relation verification", "native point and global-index probes data-groups=data-a,data-b")
 	latencies = append(latencies, fixture.verifyNativeMultiRelation(t, client)...)
 
 	// Reopen every persisted voter and re-prove both index paths after catch-up.
 	for member := 0; member < durableRF3ExternalVoters; member++ {
+		fixture.preserveCurrentBootDiagnostics(t, member, fmt.Sprintf("before-all-voter-restart-member-%d", member+1))
+		trace.set(ctx, "all-voter restart", fmt.Sprintf("restart member=%d after native verification", member+1))
 		fixture.killShard(t, member)
+		trace.set(ctx, "all-voter failover", fmt.Sprintf("all RF3 groups excluding member=%d", member+1))
 		fixture.waitAllRoleLeaders(t, member, 30*time.Second)
 		fixture.restartShard(t, member)
+		trace.set(ctx, "all-voter catch-up", fmt.Sprintf("member=%d all RF3 groups", member+1))
 		fixture.waitMemberCaughtUpAllRoles(t, member, 45*time.Second)
 	}
+	trace.set(ctx, "native post-restart verification", "native point and global-index probes data-groups=data-a,data-b")
 	latencies = append(latencies, fixture.verifyNativeMultiRelation(t, client)...)
 	client.close()
 	close(measurementStop)

@@ -464,6 +464,9 @@ type rf3DiagnosticSnapshot struct {
 	ResourceStatsAvailable                bool                                  `json:"resource_stats_available"`
 	ResourceStatsCoveredGroups            uint64                                `json:"resource_stats_covered_groups"`
 	ResourceStatsFailures                 uint64                                `json:"resource_stats_failures"`
+	AutomaticCheckpoints                  uint64                                `json:"automatic_checkpoints"`
+	RetirementPressureCheckpoints         uint64                                `json:"retirement_pressure_checkpoints"`
+	DirtyBytes                            uint64                                `json:"dirty_bytes"`
 	PrimaryOverlayFolds                   uint64                                `json:"primary_overlay_folds"`
 	PrimaryOverlayMaterializationAttempts uint64                                `json:"primary_overlay_materialization_attempts"`
 	PrimaryOverlayMaterializations        uint64                                `json:"primary_overlay_materializations"`
@@ -492,6 +495,9 @@ type rf3DiagnosticResourceTotals struct {
 	groups                                map[raftmember.GroupKey]rf3DiagnosticApply
 	expected                              map[raftmember.GroupKey]struct{}
 	overflow                              bool
+	automaticCheckpoints                  uint64
+	retirementPressureCheckpoints         uint64
+	dirtyBytes                            uint64
 	primaryOverlayFolds                   uint64
 	primaryOverlayMaterializationAttempts uint64
 	primaryOverlayMaterializations        uint64
@@ -549,6 +555,9 @@ func (totals *rf3DiagnosticResourceTotals) failure() {
 }
 
 func (totals *rf3DiagnosticResourceTotals) add(stats durable.Stats) {
+	totals.addUint64(&totals.automaticCheckpoints, stats.AutomaticCheckpoints)
+	totals.addUint64(&totals.retirementPressureCheckpoints, stats.RetirementPressureCheckpoints)
+	totals.addUint64(&totals.dirtyBytes, stats.DirtyBytes)
 	totals.addUint64(&totals.primaryOverlayFolds, stats.PrimaryOverlayFolds)
 	totals.addUint64(&totals.primaryOverlayMaterializationAttempts, stats.PrimaryOverlayMaterializationAttempts)
 	totals.addUint64(&totals.primaryOverlayMaterializations, stats.PrimaryOverlayMaterializations)
@@ -819,6 +828,9 @@ func emitRF3DiagnosticSnapshotWithResources(
 	snapshot.ResourceStatsAvailable = resources.available
 	snapshot.ResourceStatsCoveredGroups = resources.covered
 	snapshot.ResourceStatsFailures = resources.failures
+	snapshot.AutomaticCheckpoints = resources.automaticCheckpoints
+	snapshot.RetirementPressureCheckpoints = resources.retirementPressureCheckpoints
+	snapshot.DirtyBytes = resources.dirtyBytes
 	snapshot.PrimaryOverlayFolds = resources.primaryOverlayFolds
 	snapshot.PrimaryOverlayMaterializationAttempts = resources.primaryOverlayMaterializationAttempts
 	snapshot.PrimaryOverlayMaterializations = resources.primaryOverlayMaterializations
