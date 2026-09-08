@@ -70,6 +70,11 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 4*time.Minute)
 	defer cancel()
 	root := t.TempDir()
+	tableName := "documents"
+	customTable := os.Getenv("VIBEDB_DEV_HOT_SPLIT_CUSTOM_TABLE") == "1"
+	if customTable {
+		tableName = "dev_hot_messages"
+	}
 	bin := filepath.Join(root, "bin")
 	if err := os.Mkdir(bin, 0o700); err != nil {
 		t.Fatal(err)
@@ -81,11 +86,19 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 	replicaProcessBuild(t, ctx, shardBinary, "./cmd/vibedb-shard")
 	replicaProcessBuild(t, ctx, gatewayBinary, "./cmd/vibedb-gateway")
 	state := filepath.Join(root, "state")
-	process := &rf3testfixture.ExternalProcess{Binary: vibedbBinary, Args: []string{
+	processArgs := []string{
 		"cluster", "dev", "--replicas", "3", "--root", state,
 		"--diagnostics-on-exit",
 		"--shard-binary", shardBinary, "--gateway-binary", gatewayBinary,
-	}}
+	}
+	if customTable {
+		schemaPath := filepath.Join(root, "dev-hot-messages.sql")
+		if err := os.WriteFile(schemaPath, []byte("CREATE TABLE dev_hot_messages (id TEXT PRIMARY KEY, value INTEGER NOT NULL)"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		processArgs = append(processArgs, "--table-schema", schemaPath)
+	}
+	process := &rf3testfixture.ExternalProcess{Binary: vibedbBinary, Args: processArgs}
 	if err := process.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -136,10 +149,23 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 	authority, closeAuthority := hotMutationCatalogAuthority(t, profile, snapshot,
 		filepath.Join(root, "catalog-observer-session"), 1)
 	defer closeAuthority()
+	if customTable {
+		// The base genesis file intentionally excludes independently registered
+		// table bundles. Read the live catalog after gateway startup so route
+		// selection proves the source was published before serving.
+		snapshot, err = authority.Read(ctx)
+		if err != nil {
+			t.Fatalf("read live custom-table catalog: %v", err)
+		}
+	}
+	placement, found := snapshot.Placement(tableName)
+	if !found || len(placement.Columns) != 1 {
+		t.Fatalf("%s placement missing: %+v", tableName, placement)
+	}
 	var replicas [gateway.ServingReplicaCount]gateway.ReplicatedEndpoint
-	source, found := snapshot.ResolveReplicatedRoute("data", "all", replicas[:0])
+	source, found := snapshot.ResolveReplicatedRoute(placement.Distribution, "all", replicas[:0])
 	if !found {
-		t.Fatal("zero-config data route missing")
+		t.Fatalf("%s route missing: distribution=%q", tableName, placement.Distribution)
 	}
 
 	baselineRSS := devHotProcessTreeRSS(t, process.PID())
@@ -159,9 +185,15 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 	latencies := make([]time.Duration, 0, 2_048)
 	seed := make([]serveStatement, len(keys))
 	for index, key := range keys {
-		seed[index] = serveStatement{SQL: `INSERT INTO documents VALUES (?)`, Params: []serveParam{{
-			Kind: "document", Text: fmt.Sprintf(`{"id":%q,"value":%d}`, key, index+1),
-		}}}
+		if customTable {
+			seed[index] = serveStatement{SQL: `INSERT INTO dev_hot_messages VALUES (?, ?)`, Params: []serveParam{
+				{Kind: "string", Text: key}, {Kind: "number", Text: strconv.Itoa(index + 1)},
+			}}
+		} else {
+			seed[index] = serveStatement{SQL: `INSERT INTO documents VALUES (?)`, Params: []serveParam{{
+				Kind: "document", Text: fmt.Sprintf(`{"id":%q,"value":%d}`, key, index+1),
+			}}}
+		}
 	}
 	latencies = append(latencies, client.execute(t, hotMutationRequest(t, reference, 1, seed)))
 	// The shipped window measures operations, not the number of unique rows.
@@ -169,7 +201,7 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 	// reliably produce 64 operations in one second. Drive real, ReadIndex-fenced
 	// SQL point batches across both populated ranges instead. Every returned
 	// value is checked, including again after the split publishes its children.
-	readRequest := devHotReadRequest(t, keys)
+	readRequest := devHotReadRequestForTable(t, tableName, keys)
 	var operation [32]byte
 	pressureDeadline := time.Now().Add(25 * time.Second)
 	// Five 16-point batches per second exceed the 64-operation source window
@@ -204,7 +236,7 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 		snapshot.Generation()+1, operation, source, process)
 	children := 0
 	for _, descriptor := range final.ReplicatedShardDescriptors() {
-		if descriptor.Distribution != distribution.DistributionName("data") ||
+		if descriptor.Distribution != source.Distribution ||
 			descriptor.Shard == distribution.ShardID("all") {
 			continue
 		}
@@ -220,6 +252,29 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 		t.Fatal("terminal operation published no serving data child")
 	}
 	latencies = append(latencies, devHotReadDocuments(t, client, readRequest, keys))
+	if customTable {
+		// Restart the same supervisor with the same durable root and table-schema
+		// input. The retained split-source bundle must register the custom table
+		// before the catalog is advertised; the post-restart reads are the exact
+		// row oracle for every seeded key.
+		if err := connection.Close(); err != nil {
+			t.Logf("close pre-restart gateway connection: %v", err)
+		}
+		if err := process.Stop(ctx); err != nil {
+			t.Fatalf("custom-table clean restart stop: %v\n%s", err, process.Diagnostics())
+		}
+		if err := process.Start(); err != nil {
+			t.Fatalf("custom-table restart start: %v", err)
+		}
+		if err := process.WaitReady(ctx, "VibeDB development RF3 physical cluster ready:"); err != nil {
+			t.Fatalf("custom-table restart readiness: %v\n%s", err, process.Diagnostics())
+		}
+		restartedConnection := hotMutationDialGateway(t, clientProfile, gatewayNode, manifest.ClientEndpoint)
+		defer restartedConnection.Close()
+		restartedClient := &hotMutationWireClient{connection: restartedConnection, reader: bufio.NewReader(restartedConnection)}
+		devHotReadDocuments(t, restartedClient, readRequest, keys)
+		t.Logf("custom-table split/restart exact row oracle: table=%s rows=%d children=%d", tableName, len(keys), children)
+	}
 	sort.Slice(latencies, func(left, right int) bool { return latencies[left] < latencies[right] })
 	p99 := latencies[(len(latencies)*99+99)/100-1]
 	finalRSS := devHotProcessTreeRSS(t, process.PID())
@@ -239,10 +294,14 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 }
 
 func devHotReadRequest(t *testing.T, keys []string) []byte {
+	return devHotReadRequestForTable(t, "documents", keys)
+}
+
+func devHotReadRequestForTable(t *testing.T, table string, keys []string) []byte {
 	t.Helper()
 	statements := make([]serveStatement, len(keys))
 	for index, key := range keys {
-		statements[index] = serveStatement{SQL: "SELECT * FROM documents WHERE id = ?",
+		statements[index] = serveStatement{SQL: "SELECT * FROM " + table + " WHERE id = ?",
 			Params: []serveParam{{Kind: "string", Text: key}}}
 	}
 	raw, err := vibejson.Marshal(&serveRequest{Op: "read_batch", Class: "interactive",
@@ -251,6 +310,14 @@ func devHotReadRequest(t *testing.T, keys []string) []byte {
 		t.Fatal(err)
 	}
 	return raw
+}
+
+func TestGatewayCustomTableDevPressureCompletesReplicatedSplitAndRestart(t *testing.T) {
+	if os.Getenv("VIBEDB_DEV_HOT_SPLIT_CUSTOM_TABLE_E2E") != "1" {
+		t.Skip("set VIBEDB_DEV_HOT_SPLIT_CUSTOM_TABLE_E2E=1 for custom-table split/restart qualification")
+	}
+	t.Setenv("VIBEDB_DEV_HOT_SPLIT_CUSTOM_TABLE", "1")
+	TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t)
 }
 
 func devHotReadDocuments(t *testing.T, client *hotMutationWireClient, request []byte, keys []string) time.Duration {

@@ -314,6 +314,52 @@ func TestDevPhysicalRealPreparationRecoversExactPlans(t *testing.T) {
 				t.Fatalf("restart replaced the planned identities: %v", err)
 			}
 			alpha := inventory.Tables[0]
+			alphaFragmentPath := filepath.Join(root, alpha.artifactStem()+"-catalog.vibejson")
+			alphaBundlePath := filepath.Join(root, alpha.artifactStem()+devTableProvisionBundleSuffix)
+			alphaFragment, err := os.ReadFile(alphaFragmentPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			alphaBundle, err := os.ReadFile(alphaBundlePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The mandatory marker prevents an interrupted new plan from being
+			// treated as a legacy fragment-only table. A present fragment with a
+			// missing bundle may recover only by rebuilding the exact source from
+			// its durable preparation witnesses; the retained bytes must remain
+			// unchanged.
+			if err := os.Remove(alphaBundlePath); err != nil {
+				t.Fatal(err)
+			}
+			if err := ensureDevTables(root, binary, &cluster, ""); err != nil {
+				t.Fatalf("exact bundle recovery from durable witnesses: %v", err)
+			}
+			retainedFragment, readErr := os.ReadFile(alphaFragmentPath)
+			if readErr != nil || !bytes.Equal(retainedFragment, alphaFragment) {
+				t.Fatalf("missing-bundle recovery changed the retained fragment: %v", readErr)
+			}
+			rebuiltBundle, readErr := os.ReadFile(alphaBundlePath)
+			if readErr != nil || !bytes.Equal(rebuiltBundle, alphaBundle) {
+				t.Fatalf("missing-bundle recovery changed the exact bundle: %v", readErr)
+			}
+			// Conversely, a complete immutable bundle can reconstruct only its
+			// exact native fragment. This exercises the restart path after the
+			// fragment write but before bundle publication was completed.
+			if err := os.Remove(alphaFragmentPath); err != nil {
+				t.Fatal(err)
+			}
+			if err := ensureDevTables(root, binary, &cluster, ""); err != nil {
+				t.Fatalf("bundle-backed fragment recovery: %v", err)
+			}
+			restoredFragment, err := os.ReadFile(alphaFragmentPath)
+			if err != nil || !bytes.Equal(restoredFragment, alphaFragment) {
+				t.Fatalf("bundle-backed fragment recovery changed bytes: %v", err)
+			}
+			retainedBundle, err := os.ReadFile(alphaBundlePath)
+			if err != nil || !bytes.Equal(retainedBundle, alphaBundle) {
+				t.Fatalf("bundle-backed fragment recovery changed bundle: %v", err)
+			}
 			alphaMembers, alphaGroup, err := devPhysicalTableMembers(cluster, alpha)
 			if err != nil {
 				t.Fatal(err)
@@ -395,7 +441,44 @@ func TestDevPhysicalRealPreparationRecoversExactPlans(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			raw, _ := os.ReadFile(inventoryPath)
+			raw, err := os.ReadFile(inventoryPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := vibejson.Unmarshal(raw, &inventory); err != nil || len(inventory.Tables) < 3 {
+				t.Fatalf("prepared additional tables: %+v %v", inventory, err)
+			}
+			// A self-consistent bundle from another table must be rejected before
+			// repairing a missing fragment or replacing the aggregate catalog.
+			beta := inventory.Tables[1]
+			betaBundlePath := filepath.Join(root, beta.artifactStem()+devTableProvisionBundleSuffix)
+			betaBundle, err := os.ReadFile(betaBundlePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Remove(alphaFragmentPath); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(alphaBundlePath, betaBundle, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := ensureDevTables(root, binary, &cluster, ""); err == nil {
+				t.Fatal("accepted a foreign bundle for a marker-1 table")
+			}
+			if _, err := os.Stat(alphaFragmentPath); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("foreign bundle rejection repaired fragment: %v", err)
+			}
+			retainedForeignBundle, err := os.ReadFile(alphaBundlePath)
+			if err != nil || !bytes.Equal(retainedForeignBundle, betaBundle) {
+				t.Fatalf("foreign bundle rejection changed bundle: %v", err)
+			}
+			if err := os.WriteFile(alphaBundlePath, alphaBundle, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := ensureDevTables(root, binary, &cluster, ""); err != nil {
+				t.Fatalf("restoring alpha bundle after substitution: %v", err)
+			}
+			raw, _ = os.ReadFile(inventoryPath)
 			if err := vibejson.Unmarshal(raw, &inventory); err != nil {
 				t.Fatal(err)
 			}
