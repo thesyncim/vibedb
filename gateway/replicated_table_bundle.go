@@ -2,7 +2,6 @@ package gateway
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 
 	"github.com/thesyncim/vibejson"
@@ -35,7 +34,7 @@ type replicatedTableProvisionBundleDocument struct {
 // validation against the enrolled roster and provision fragment.
 func AppendReplicatedTableProvisionBundle(dst, catalogRaw, splitSourceRaw []byte) ([]byte, error) {
 	if len(catalogRaw) == 0 || len(splitSourceRaw) == 0 || len(catalogRaw) > 4<<20 ||
-		len(splitSourceRaw) > 4<<20 || !json.Valid(catalogRaw) || !json.Valid(splitSourceRaw) {
+		len(splitSourceRaw) > 4<<20 || !vibejson.Valid(catalogRaw) || !vibejson.Valid(splitSourceRaw) {
 		return nil, ErrInvalidTableProvisionBundle
 	}
 	if _, err := OpenReplicatedTableProvision(catalogRaw); err != nil {
@@ -69,7 +68,7 @@ func OpenReplicatedTableProvisionBundle(raw []byte) (catalogRaw, splitSourceRaw 
 	canonical, err := vibejson.Marshal(&document)
 	if err != nil || !bytes.Equal(canonical, raw) || document.Format != ReplicatedTableProvisionBundleFormat ||
 		document.Catalog == "" || document.SplitSource == "" ||
-		!json.Valid([]byte(document.Catalog)) || !json.Valid([]byte(document.SplitSource)) {
+		!vibejson.Valid([]byte(document.Catalog)) || !vibejson.Valid([]byte(document.SplitSource)) {
 		return nil, nil, ErrInvalidTableProvisionBundle
 	}
 	if _, err := OpenReplicatedTableProvision([]byte(document.Catalog)); err != nil {
