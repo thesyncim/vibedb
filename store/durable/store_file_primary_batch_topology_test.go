@@ -392,6 +392,138 @@ func primaryBatchTopologyLocalizedTwoWaySplit(
 	}
 }
 
+// TestPrimaryBatchTopologyLocalizesKWayBatch64 exercises the exact 64-row,
+// 256-byte workload used by the structural benchmark. The canonical planner
+// produces more than two output leaves for these batches; a selected anchor is
+// therefore replaced in one COW publication while the old snapshot remains
+// empty. Fixed routing bytes and zero full-tablet rebuilds prove that the
+// localized K-way path was selected, while exact primary and posting checks
+// cover the current, durable, and reopened images.
+func TestPrimaryBatchTopologyLocalizesKWayBatch64(t *testing.T) {
+	const (
+		batches = 16
+		rows    = batches * batch64Rows
+	)
+	options := benchBatchOptions(batch64Rows)
+	options.Indexes = []store.IndexDefinition{
+		{Name: "id", Paths: []string{"/id"}},
+	}
+	collection, file := openBatchCollection(t, options)
+	before, err := collection.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer before.Close()
+
+	keys := make([][]byte, rows)
+	values := make([][]byte, rows)
+	for row := range rows {
+		key := make([]byte, len("row-"), len("row-")+batch64KeyDigits)
+		copy(key, "row-")
+		keys[row] = appendBatch64FixedUint(key, uint64(row))
+		value := fmt.Appendf(nil, `{"id":%d,"value":"`, row)
+		value = appendBatch64VariedPayload(value, uint64(row))
+		values[row] = append(value, `"}`...)
+	}
+
+	start := collection.Stats()
+	for batchStart := 0; batchStart < rows; batchStart += batch64Rows {
+		if err := collection.Update(func(batch *WriteBatch) error {
+			for row := batchStart; row < batchStart+batch64Rows; row++ {
+				if err := batch.Put(keys[row], values[row]); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("batch %d Update: %v", batchStart/batch64Rows, err)
+		}
+	}
+
+	if got := collection.Len(); got != rows {
+		t.Fatalf("live rows = %d, want %d", got, rows)
+	}
+	stats := collection.Stats()
+	splits := stats.PrimaryLeafSplits - start.PrimaryLeafSplits
+	if splits == 0 || splits >= batches {
+		t.Fatalf("localized structural splits = %d, want between 1 and %d", splits, batches)
+	}
+	if got := stats.PrimaryTabletRoutingRebuilds -
+		start.PrimaryTabletRoutingRebuilds; got != 0 {
+		t.Fatalf("K-way tablet routing rebuilds = %d, want 0", got)
+	}
+	const routingBase = uint64(
+		storeio.SegmentedTabletRouterAnchorPageBytes +
+			storeio.GlobalTabletCatalogLocatorBytes +
+			storeio.GlobalTabletCatalogTabletBytes,
+	)
+	if got, want := stats.PrimaryStructuralRoutingStagedBytes-
+		start.PrimaryStructuralRoutingStagedBytes, splits*routingBase; got != want {
+		t.Fatalf("K-way routing staged bytes = %d, want %d", got, want)
+	}
+	if got, want := stats.PrimaryStructuralRoutingRetiredBytes-
+		start.PrimaryStructuralRoutingRetiredBytes, splits*routingBase; got != want {
+		t.Fatalf("K-way routing retired bytes = %d, want %d", got, want)
+	}
+	router := collection.primaryRouter.Load()
+	if router == nil || router.Len() <= int(splits)+1 {
+		t.Fatalf("resident K-way leaves = %v, want more than %d", router, splits+1)
+	}
+
+	if before.Len() != 0 {
+		t.Fatalf("held snapshot rows = %d, want 0", before.Len())
+	}
+	for row, key := range keys {
+		if _, found, readErr := before.AppendRaw(nil, key); readErr != nil || found {
+			t.Fatalf("held snapshot row %d = found:%v err:%v, want absent", row, found, readErr)
+		}
+		needle := primaryExactTestNeedle(t, fmt.Sprintf("%d", row))
+		if got := primaryExactSnapshotKeys(t, before, "id", needle); len(got) != 0 {
+			t.Fatalf("held snapshot posting %d = %v, want empty", row, got)
+		}
+	}
+	for row, key := range keys {
+		got, found, readErr := collection.AppendRaw(nil, key)
+		if readErr != nil || !found || !bytes.Equal(got, values[row]) {
+			t.Fatalf("live row %d = %q,%v,%v", row, got, found, readErr)
+		}
+		needle := primaryExactTestNeedle(t, fmt.Sprintf("%d", row))
+		if got := primaryExactTestKeys(t, collection, "id", needle); !slices.Equal(got, []string{string(key)}) {
+			t.Fatalf("live posting %d = %v, want %q", row, got, key)
+		}
+	}
+	if err := collection.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := before.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := collection.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(file, options)
+	if err != nil {
+		t.Fatalf("reopen K-way batch: %v", err)
+	}
+	defer reopened.Close()
+	if got := reopened.Len(); got != rows {
+		t.Fatalf("reopened rows = %d, want %d", got, rows)
+	}
+	if router := reopened.primaryRouter.Load(); router == nil || router.Len() <= int(splits)+1 {
+		t.Fatalf("reopened K-way leaves = %v, want more than %d", router, splits+1)
+	}
+	for row, key := range keys {
+		got, found, readErr := reopened.AppendRaw(nil, key)
+		if readErr != nil || !found || !bytes.Equal(got, values[row]) {
+			t.Fatalf("reopened row %d = %q,%v,%v", row, got, found, readErr)
+		}
+		needle := primaryExactTestNeedle(t, fmt.Sprintf("%d", row))
+		if got := primaryExactTestKeys(t, reopened, "id", needle); !slices.Equal(got, []string{string(key)}) {
+			t.Fatalf("reopened posting %d = %v, want %q", row, got, key)
+		}
+	}
+}
+
 // Long fences must use additional anchor pages rather than refuse a logical
 // batch that fits the tablet's byte and identity budgets.
 func TestPrimaryBatchTopologyPacksLongFencesAcrossAnchors(t *testing.T) {

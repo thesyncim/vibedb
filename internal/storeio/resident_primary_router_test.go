@@ -181,6 +181,95 @@ func TestResidentPrimaryRouterSplitLeafSplicesWithoutGraphWalk(t *testing.T) {
 	}
 }
 
+func TestResidentPrimaryRouterSplitLeafPartitionSplicesKWayRoutes(t *testing.T) {
+	router := residentPrimaryRouterGenerationTestFixture(t)
+	for _, test := range []struct {
+		name   string
+		source int
+		fences []string
+	}{
+		{name: "first", source: 0, fences: []string{"", "a", "b", "c", "d", "e"}},
+		{name: "middle", source: 1, fences: []string{"m", "n", "o", "p", "q", "r"}},
+		{name: "last", source: 2, fences: []string{"t", "u", "v", "w", "x", "y"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			source, ok := router.RouteAtRank(test.source)
+			if !ok {
+				t.Fatalf("source rank %d", test.source)
+			}
+			const generation = uint64(101)
+			replacements := make([]SegmentedTabletRouterLeaf, len(test.fences))
+			for rank, rawFence := range test.fences {
+				localID := uint16(200 + rank)
+				if rank == 0 {
+					_, local, localOK := SplitTabletLocalIdentityBucket(uint32(source.Bucket))
+					if !localOK {
+						t.Fatal("source local identity")
+					}
+					localID = uint16(local)
+				}
+				bucket, bucketOK := MakeTabletLocalIdentityBucket(0, uint32(localID))
+				if !bucketOK {
+					t.Fatalf("replacement bucket %d", localID)
+				}
+				logicalID, logicalOK := CommonPrimaryLeafLogicalID(BucketID(bucket))
+				if !logicalOK {
+					t.Fatalf("replacement logical ID %d", localID)
+				}
+				replacements[rank] = SegmentedTabletRouterLeaf{
+					LocalID: localID, Fence: []byte(rawFence),
+					Ref: PageRef{Offset: uint64(1+rank) * 64 << 10,
+						LogicalID: logicalID, Generation: generation,
+						Length: 4096, Kind: PagePrimaryLeaf},
+				}
+			}
+			next, err := router.SplitLeafPartition(source, replacements, generation)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, want := next.Len(), router.Len()-1+len(replacements); got != want {
+				t.Fatalf("partition route count = %d, want %d", got, want)
+			}
+			if got := next.Generation(); got != generation {
+				t.Fatalf("partition generation = %d, want %d", got, generation)
+			}
+			for rank, replacement := range replacements {
+				got, routeOK := next.Route([]byte(test.fences[rank]))
+				wantBucket, _ := MakeTabletLocalIdentityBucket(0, uint32(replacement.LocalID))
+				if !routeOK || got.Ref != replacement.Ref ||
+					got.Bucket != BucketID(wantBucket) {
+					t.Fatalf("replacement rank %d route = %+v,%v", rank, got, routeOK)
+				}
+			}
+			for rank := range router.Len() {
+				if rank == test.source {
+					continue
+				}
+				old, oldOK := router.RouteAtRank(rank)
+				newRank := rank
+				if rank > test.source {
+					newRank += len(replacements) - 1
+				}
+				got, newOK := next.RouteAtRank(newRank)
+				if !oldOK || !newOK || got.Ref != old.Ref || got.Bucket != old.Bucket {
+					t.Fatalf("unaffected rank %d = %+v,%v, want %+v", rank, got, newOK, old)
+				}
+			}
+
+			duplicate := slices.Clone(replacements)
+			duplicate[2].LocalID = duplicate[1].LocalID
+			if _, err := router.SplitLeafPartition(source, duplicate, generation); !errors.Is(err, ErrInvalidWrite) {
+				t.Fatalf("duplicate replacement error = %v, want %v", err, ErrInvalidWrite)
+			}
+			duplicate = slices.Clone(replacements)
+			duplicate[1].LocalID = duplicate[0].LocalID
+			if _, err := router.SplitLeafPartition(source, duplicate, generation); !errors.Is(err, ErrInvalidWrite) {
+				t.Fatalf("source duplicate error = %v, want %v", err, ErrInvalidWrite)
+			}
+		})
+	}
+}
+
 func TestResidentPrimaryRouterRemoveLeafSplicesWithoutGraphWalk(t *testing.T) {
 	router := residentPrimaryRouterGenerationTestFixture(t)
 	middle, ok := router.Route([]byte("mango"))

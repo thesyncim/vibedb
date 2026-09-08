@@ -145,12 +145,14 @@ func (c *Collection) preparePrimaryBatchTopology(
 		// the batch's journal and content-atomicity contract.
 		return c.structuralSplitPrimaryMacroTablet(state, &path, currentLeaves)
 	}
-	// A two-way batch cut has the same geometry as the scalar leaf split. Qualify
-	// that exact localized representation before any transaction pages are
-	// allocated; larger batches and byte-full roots keep the complete-tablet
-	// fallback below.
+	// A two-way batch cut uses the scalar localized representation. Larger cuts
+	// can use the bounded one-anchor partition representation when its exact
+	// compressed fence geometry admits every output leaf; all other geometry
+	// keeps the complete-tablet fallback below.
 	var localizedPlan storeio.GlobalTabletCatalogLeafSplitPlan
+	var localizedPartitionPlan storeio.GlobalTabletCatalogLeafPartitionPlan
 	isLocalized := false
+	isPartitionLocalized := false
 	if len(floors) == 2 {
 		localizedPlan, err = path.tablet.PlanLeafSplit(
 			&path.anchor, path.leafRoute, floors[1],
@@ -159,6 +161,15 @@ func (c *Collection) preparePrimaryBatchTopology(
 			return err
 		}
 		isLocalized = !localizedPlan.RequiresTabletRebuild()
+	} else if len(floors) > 2 {
+		localizedPartitionPlan, err = path.tablet.PlanLeafPartition(
+			&path.anchor, path.leafRoute, floors[1:],
+		)
+		if err != nil {
+			return err
+		}
+		isPartitionLocalized = !localizedPartitionPlan.RequiresTabletRebuild()
+		isLocalized = isPartitionLocalized
 	}
 	finalLeafCount := len(currentLeaves) - 1 + len(floors)
 	if finalLeafCount > storeio.TabletLocalIdentityLocalCount ||
@@ -176,10 +187,10 @@ func (c *Collection) preparePrimaryBatchTopology(
 	retiredAnchors := path.tablet.AnchorCount()
 	if isLocalized {
 		// The localized stager COWs the selected anchor and allocates one more only
-		// when PlanLeafSplit says the new row needs it. All other anchors remain
+		// when the scalar PlanLeafSplit says the new row needs it. All other anchors remain
 		// reachable and are neither staged nor retired.
 		anchorPages = 1
-		if localizedPlan.NeedsNewAnchor() {
+		if !isPartitionLocalized && localizedPlan.NeedsNewAnchor() {
 			anchorPages++
 		}
 		retiredAnchors = 1
@@ -261,6 +272,28 @@ func (c *Collection) preparePrimaryBatchTopology(
 			}
 			if baseAt != len(baseRows) {
 				return nil, nil, nil, storeio.ErrInvalidWrite
+			}
+			if isPartitionLocalized {
+				replacements := make(
+					[]storeio.SegmentedTabletRouterLeaf, len(floors),
+				)
+				for rank := range floors {
+					zone := storeio.BucketZone{}
+					if rank == 0 {
+						zone = currentLeaves[sourceIndex].zone
+					}
+					replacements[rank] = storeio.SegmentedTabletRouterLeaf{
+						LocalID: localIDs[rank], Fence: floors[rank],
+						Ref: encoded[rank], Zone: zone,
+					}
+				}
+				return nil, []storeio.PageRef{currentLeaves[sourceIndex].ref},
+					&primaryLocalizedLeafSplit{
+						partition: &primaryLocalizedLeafPartition{
+							plan: localizedPartitionPlan, leaves: replacements,
+						},
+						resident: route, route: path.leafRoute,
+					}, nil
 			}
 			if isLocalized {
 				rightBucketU, bucketOK := storeio.MakeTabletLocalIdentityBucket(

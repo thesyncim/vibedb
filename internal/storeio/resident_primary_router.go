@@ -602,6 +602,145 @@ func (r *ResidentPrimaryRouter) SplitLeaf(
 	return next, nil
 }
 
+// SplitLeafPartition builds the next immutable resident routing image by
+// replacing one leaf with several already validated lexical leaves. The old
+// router remains valid for readers that loaded it before the collection's
+// atomic pointer swap; this method performs no page-cache acquisition or graph
+// walk.
+func (r *ResidentPrimaryRouter) SplitLeafPartition(
+	route ResidentPrimaryRoute,
+	replacements []SegmentedTabletRouterLeaf,
+	generation uint64,
+) (*ResidentPrimaryRouter, error) {
+	started := time.Now()
+	if r == nil || int(route.rank) >= r.Len() || len(replacements) < 2 ||
+		generation <= r.Generation() || generation >= uint64(1)<<48 {
+		return nil, fmt.Errorf("%w: resident partition identity", ErrInvalidWrite)
+	}
+	sourceRank := int(route.rank)
+	current, ok := r.RouteAtRank(sourceRank)
+	if !ok || current.Ref != route.Ref || current.Bucket != route.Bucket ||
+		!bytes.Equal(replacements[0].Fence, r.fence(sourceRank)) {
+		return nil, fmt.Errorf("%w: resident partition route", ErrInvalidWrite)
+	}
+	tabletID, sourceLocalID, ok := SplitTabletLocalIdentityBucket(
+		uint32(route.Bucket),
+	)
+	if !ok || replacements[0].LocalID != uint16(sourceLocalID) {
+		return nil, fmt.Errorf("%w: resident partition source", ErrInvalidWrite)
+	}
+	// Build one tablet-local identity set for the existing router. Checking the
+	// whole resident slice once keeps the K-way validation bounded by O(N+K),
+	// rather than rescanning every resident leaf for each replacement.
+	var used [TabletLocalIdentityLocalCount / 64]uint64
+	for oldRank := 0; oldRank < r.Len(); oldRank++ {
+		if oldRank == sourceRank {
+			continue
+		}
+		old, oldOK := r.RouteAtRank(oldRank)
+		if !oldOK {
+			return nil, fmt.Errorf("%w: resident partition source", ErrInvalidWrite)
+		}
+		oldTabletID, oldLocalID, oldIdentityOK :=
+			SplitTabletLocalIdentityBucket(uint32(old.Bucket))
+		if !oldIdentityOK || oldTabletID != tabletID {
+			return nil, fmt.Errorf("%w: resident partition identity", ErrInvalidWrite)
+		}
+		word, bit := oldLocalID>>6, uint64(1)<<(oldLocalID&63)
+		if used[word]&bit != 0 {
+			return nil, fmt.Errorf("%w: resident partition LocalID", ErrInvalidWrite)
+		}
+		used[word] |= bit
+	}
+	previous := replacements[0].Fence
+	for rank, replacement := range replacements {
+		if replacement.LocalID >= TabletLocalIdentityLocalCount ||
+			replacement.Ref.Generation != generation {
+			return nil, fmt.Errorf("%w: resident partition leaf", ErrInvalidWrite)
+		}
+		bucket, bucketOK := MakeTabletLocalIdentityBucket(
+			tabletID, uint32(replacement.LocalID),
+		)
+		if !bucketOK ||
+			segmentedTabletRouterValidateLeafRef(
+				replacement.Ref, BucketID(bucket), PagePrimaryLeaf, generation,
+			) != nil {
+			return nil, fmt.Errorf("%w: resident partition leaf", ErrInvalidWrite)
+		}
+		if rank > 0 {
+			if len(replacement.Fence) == 0 ||
+				bytes.Compare(previous, replacement.Fence) >= 0 {
+				return nil, fmt.Errorf("%w: resident partition fence", ErrInvalidWrite)
+			}
+		}
+		if rank == 0 && replacement.LocalID != uint16(sourceLocalID) {
+			return nil, fmt.Errorf("%w: resident partition source", ErrInvalidWrite)
+		}
+		word, bit := replacement.LocalID>>6, uint64(1)<<(replacement.LocalID&63)
+		if rank > 0 && (replacement.LocalID == uint16(sourceLocalID) ||
+			used[word]&bit != 0) {
+			return nil, fmt.Errorf("%w: resident partition LocalID", ErrInvalidWrite)
+		}
+		if rank > 0 {
+			used[word] |= bit
+		}
+		previous = replacement.Fence
+	}
+	if sourceRank+1 < r.Len() &&
+		bytes.Compare(previous, r.fence(sourceRank+1)) >= 0 {
+		return nil, fmt.Errorf("%w: resident partition fence", ErrInvalidWrite)
+	}
+	newLen := r.Len() - 1 + len(replacements)
+	if newLen <= 0 || newLen > maxIntValue/residentPrimaryRouterWords {
+		return nil, fmt.Errorf("%w: resident partition capacity", ErrInvalidWrite)
+	}
+	newFenceBytes := len(r.fences) - len(r.fence(sourceRank))
+	for _, replacement := range replacements {
+		if uint64(newFenceBytes) > uint64(maxIntValue-len(replacement.Fence)) {
+			return nil, fmt.Errorf("%w: resident partition capacity", ErrInvalidWrite)
+		}
+		newFenceBytes += len(replacement.Fence)
+	}
+	if uint64(newFenceBytes) > uint64(^uint32(0)) {
+		return nil, fmt.Errorf("%w: resident partition capacity", ErrInvalidWrite)
+	}
+	next := &ResidentPrimaryRouter{storeID: r.storeID}
+	next.fences = make([]byte, 0, newFenceBytes)
+	next.rows = make([]uint64, 0, newLen*residentPrimaryRouterWords)
+	next.empty = make([]atomic.Uint32, newLen)
+	appendRow := func(fence []byte, ref PageRef, bucket BucketID, empty uint32) {
+		start := len(next.fences)
+		next.fences = append(next.fences, fence...)
+		next.rows = append(next.rows,
+			uint64(uint32(start))|uint64(uint32(len(next.fences)))<<32,
+			ref.Offset, ref.Generation,
+			uint64(ref.Length)|uint64(uint32(bucket))<<32,
+		)
+		next.empty[next.Len()-1].Store(empty)
+	}
+	for rank := 0; rank < r.Len(); rank++ {
+		if rank == sourceRank {
+			for _, replacement := range replacements {
+				bucket, _ := MakeTabletLocalIdentityBucket(
+					tabletID, uint32(replacement.LocalID),
+				)
+				appendRow(replacement.Fence, replacement.Ref, BucketID(bucket), 0)
+			}
+			continue
+		}
+		old, routeOK := r.RouteAtRank(rank)
+		if !routeOK {
+			return nil, fmt.Errorf("%w: resident partition source", ErrInvalidWrite)
+		}
+		appendRow(r.fence(rank), old.Ref, old.Bucket, r.empty[rank].Load())
+	}
+	next.hints = make([]pageCacheFrameHint, next.Len())
+	next.buildSearchKeys()
+	next.generation.Store(generation)
+	next.buildNS = time.Since(started).Nanoseconds()
+	return next, nil
+}
+
 // RemoveLeaf builds the next immutable routing image by splicing one already
 // published structural leaf removal into this router. The selected leaf's
 // interval falls through to its lexical predecessor. Removing the global
