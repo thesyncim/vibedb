@@ -89,6 +89,10 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 	replicaProcessBuild(t, ctx, gatewayBinary, "./cmd/vibedb-gateway")
 	state := filepath.Join(root, "state")
 	var pgListen string
+	var customBundlePath string
+	var customBundleBefore []byte
+	var onlineBundlePath string
+	var onlineBundleBefore []byte
 	processArgs := []string{
 		"cluster", "dev", "--replicas", "3", "--root", state,
 		"--diagnostics-on-exit",
@@ -172,8 +176,8 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 		if globErr != nil || len(bundlePaths) != 1 {
 			t.Fatalf("custom-table retained bundle paths=%v err=%v", bundlePaths, globErr)
 		}
-		customBundlePath := bundlePaths[0]
-		customBundleBefore, err := os.ReadFile(customBundlePath)
+		customBundlePath = bundlePaths[0]
+		customBundleBefore, err = os.ReadFile(customBundlePath)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -184,6 +188,17 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 		if result := ddlWireQuery(t, ddlConnection, "CREATE TABLE dev_hot_online (id TEXT PRIMARY KEY, value INTEGER NOT NULL)", true); result.code != "" || result.tag != "CREATE TABLE" {
 			ddlConnection.Close()
 			t.Fatalf("live custom CREATE: %+v", result)
+		}
+		onlineBundlePaths, globErr := filepath.Glob(filepath.Join(state, "table-dev_hot_online-*-split-source.vibejson"))
+		if globErr != nil || len(onlineBundlePaths) != 1 {
+			ddlConnection.Close()
+			t.Fatalf("live DDL table bundle paths=%v err=%v", onlineBundlePaths, globErr)
+		}
+		onlineBundlePath = onlineBundlePaths[0]
+		onlineBundleBefore, err = os.ReadFile(onlineBundlePath)
+		if err != nil {
+			ddlConnection.Close()
+			t.Fatal(err)
 		}
 		if result := ddlWireQuery(t, ddlConnection, "INSERT INTO dev_hot_online (id,value) VALUES ('online-1',7)", false); result.code != "" || result.tag != "INSERT 0 1" {
 			ddlConnection.Close()
@@ -207,6 +222,10 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 		customBundleAfterDDL, err := os.ReadFile(customBundlePath)
 		if err != nil || !bytes.Equal(customBundleAfterDDL, customBundleBefore) {
 			t.Fatalf("live DDL changed original custom bundle: %v", err)
+		}
+		onlineBundleAfterDDL, err := os.ReadFile(onlineBundlePath)
+		if err != nil || !bytes.Equal(onlineBundleAfterDDL, onlineBundleBefore) {
+			t.Fatalf("live ALTER changed its provision bundle: %v", err)
 		}
 		// The DDL registration advances the catalog generation; route selection
 		// must use the fresh live cut for the split source.
@@ -341,6 +360,10 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 		customBundleAfterRestart, err := os.ReadFile(customBundlePath)
 		if err != nil || !bytes.Equal(customBundleAfterRestart, customBundleBefore) {
 			t.Fatalf("restart changed original custom bundle: %v", err)
+		}
+		onlineBundleAfterRestart, err := os.ReadFile(onlineBundlePath)
+		if err != nil || !bytes.Equal(onlineBundleAfterRestart, onlineBundleBefore) {
+			t.Fatalf("restart changed live DDL provision bundle: %v", err)
 		}
 		t.Logf("custom-table split/restart exact row oracle: table=%s rows=%d children=%d", tableName, len(keys), children)
 	}

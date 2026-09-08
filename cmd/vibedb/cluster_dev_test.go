@@ -909,6 +909,16 @@ func TestDevNonphysicalBundleValidationPrecedesFragmentRestore(t *testing.T) {
 	if err != nil || !bytes.Equal(retained, mutatedBundle) {
 		t.Fatalf("invalid bundle was rewritten: %v", err)
 	}
+	if err := os.WriteFile(bundlePath, bundle, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureDevTables(root, "/usr/bin/true", &cluster, ""); err != nil {
+		t.Fatalf("valid bundle-only recovery: %v", err)
+	}
+	restored, err := os.ReadFile(fragmentPath)
+	if err != nil || !bytes.Equal(restored, fragment) {
+		t.Fatalf("valid bundle-only recovery changed the original fragment: %v", err)
+	}
 }
 
 func writeDevTestProcessManifest(
