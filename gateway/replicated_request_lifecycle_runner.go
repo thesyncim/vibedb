@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"math"
 
 	"github.com/thesyncim/vibedb/internal/executionpin"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
@@ -247,66 +248,84 @@ func (runner *DurableRequestLifecycleRunner) runAdmittedWave(ctx context.Context
 	if err != nil {
 		return DurableRequestWaveResult{}, err
 	}
-	if head.PinID != wave.PinID || head.RequestDigest == (requestledger.Digest{}) ||
-		head.PlanRoot == (requestledger.Digest{}) {
-		return DurableRequestWaveResult{}, ErrDurableRequestConflict
-	}
-	completed := routePin.Phase == requestledger.RoutePinReleased &&
-		routePin.WaveOrdinal == wave.Ordinal && head.NextStepOrdinal == wave.Ordinal+1 &&
-		head.OutstandingRoutePinDigest == (requestledger.Digest{}) && pending.Revision == 0
-	if completed {
-		stage = "completed session cleanup"
-		if err := runner.cleanupRouteGateSession(ctx, wave, routePin); err != nil {
-			return DurableRequestWaveResult{}, err
-		}
-		observation, readErr := runner.readWaveObservation(ctx, wave, routePin, readApplied)
-		return DurableRequestWaveResult{Observation: observation, Revision: head.Revision}, readErr
-	}
-	beforeAdvance := head.NextStepOrdinal == wave.Ordinal
-	afterAdvance := wave.Ordinal != ^uint64(0) && head.NextStepOrdinal == wave.Ordinal+1 &&
-		head.OutstandingRoutePinDigest != (requestledger.Digest{})
-	if !beforeAdvance && !afterAdvance {
-		return DurableRequestWaveResult{}, ErrDurableRequestConflict
-	}
-
-	// A released record from the preceding wave is intentionally replaceable.
-	if routePin.Phase == requestledger.RoutePinReleased &&
-		routePin.WaveOrdinal+1 == wave.Ordinal && head.NextStepOrdinal == wave.Ordinal &&
-		head.OutstandingRoutePinDigest == (requestledger.Digest{}) {
-		stage = "prior session cleanup"
-		// The released row remains the exact session-cleanup witness. Never
-		// replace it until a replayable retirement/release has settled.
-		if err := runner.cleanupRouteGateSession(ctx, wave, routePin); err != nil {
-			return DurableRequestWaveResult{}, err
-		}
-		routePin = requestledger.RoutePinRecord{}
-	}
-	if routePin.Phase != requestledger.RoutePinInvalid && routePin.WaveOrdinal != wave.Ordinal {
-		return DurableRequestWaveResult{}, ErrDurableRequestConflict
-	}
-
 	var route ReplicatedRoute
-	if routePin.Phase == requestledger.RoutePinInvalid {
-		stage = "acquire intent"
-		route, err = runner.resolveWave(ctx, wave)
-		if err != nil {
-			return DurableRequestWaveResult{}, err
+	var beforeAdvance, afterAdvance bool
+	retiredOpenRecoveryUsed := false
+	for {
+		if head.PinID != wave.PinID || head.RequestDigest == (requestledger.Digest{}) ||
+			head.PlanRoot == (requestledger.Digest{}) {
+			return DurableRequestWaveResult{}, ErrDurableRequestConflict
 		}
-		acquire, physical, buildErr := runner.gateSessions.prepareAcquire(ctx, route, wave, head)
-		if buildErr != nil {
-			return DurableRequestWaveResult{}, buildErr
+		completed := routePin.Phase == requestledger.RoutePinReleased &&
+			routePin.WaveOrdinal == wave.Ordinal && head.NextStepOrdinal == wave.Ordinal+1 &&
+			head.OutstandingRoutePinDigest == (requestledger.Digest{}) && pending.Revision == 0
+		if completed {
+			stage = "completed session cleanup"
+			if err := runner.cleanupRouteGateSession(ctx, wave, routePin); err != nil {
+				return DurableRequestWaveResult{}, err
+			}
+			observation, readErr := runner.readWaveObservation(ctx, wave, routePin, readApplied)
+			return DurableRequestWaveResult{Observation: observation, Revision: head.Revision}, readErr
 		}
-		routePin, err = requestledger.NewRoutePinAcquiring(
-			head, wave.PinID, wave.Binding, physical, acquire,
-		)
-		if err != nil {
-			return DurableRequestWaveResult{}, errors.Join(err, ErrDurableRequestConflict)
+		beforeAdvance = head.NextStepOrdinal == wave.Ordinal
+		afterAdvance = wave.Ordinal != ^uint64(0) && head.NextStepOrdinal == wave.Ordinal+1 &&
+			head.OutstandingRoutePinDigest != (requestledger.Digest{})
+		if !beforeAdvance && !afterAdvance {
+			return DurableRequestWaveResult{}, ErrDurableRequestConflict
 		}
-		head, err = runner.applyRoutePin(ctx, wave, head, requestledger.RoutePinRecord{}, routePin,
-			requestledger.OperationBeginRoutePinAcquire)
-		if err != nil {
-			return DurableRequestWaveResult{}, err
+
+		// A released record from the preceding wave is intentionally replaceable.
+		if routePin.Phase == requestledger.RoutePinReleased &&
+			routePin.WaveOrdinal+1 == wave.Ordinal && head.NextStepOrdinal == wave.Ordinal &&
+			head.OutstandingRoutePinDigest == (requestledger.Digest{}) {
+			stage = "prior session cleanup"
+			// The released row remains the exact session-cleanup witness. Never
+			// replace it until a replayable retirement/release has settled.
+			if err := runner.cleanupRouteGateSession(ctx, wave, routePin); err != nil {
+				return DurableRequestWaveResult{}, err
+			}
+			routePin = requestledger.RoutePinRecord{}
 		}
+		if routePin.Phase != requestledger.RoutePinInvalid && routePin.WaveOrdinal != wave.Ordinal {
+			return DurableRequestWaveResult{}, ErrDurableRequestConflict
+		}
+
+		if routePin.Phase == requestledger.RoutePinInvalid {
+			stage = "acquire intent"
+			route, err = runner.resolveWave(ctx, wave)
+			if err != nil {
+				return DurableRequestWaveResult{}, err
+			}
+			priorHead := head
+			acquire, physical, buildErr := runner.gateSessions.prepareAcquire(ctx, route, wave, head)
+			if buildErr != nil {
+				retired, isRetiredOpen := buildErr.(*durableRequestRetiredOpenError)
+				if retiredOpenRecoveryUsed || !isRetiredOpen {
+					return DurableRequestWaveResult{}, buildErr
+				}
+				retiredOpenRecoveryUsed = true
+				refreshed, refreshErr := runner.refreshRetiredOpenCut(
+					ctx, wave, keyDigest, priorHead, route, retired,
+				)
+				if refreshErr != nil {
+					return DurableRequestWaveResult{}, errors.Join(buildErr, refreshErr)
+				}
+				head, routePin, pending, readApplied = refreshed.head, refreshed.route, refreshed.pending, refreshed.applied
+				continue
+			}
+			routePin, err = requestledger.NewRoutePinAcquiring(
+				head, wave.PinID, wave.Binding, physical, acquire,
+			)
+			if err != nil {
+				return DurableRequestWaveResult{}, errors.Join(err, ErrDurableRequestConflict)
+			}
+			head, err = runner.applyRoutePin(ctx, wave, head, requestledger.RoutePinRecord{}, routePin,
+				requestledger.OperationBeginRoutePinAcquire)
+			if err != nil {
+				return DurableRequestWaveResult{}, err
+			}
+		}
+		break
 	}
 
 	if routePin.Phase == requestledger.RoutePinAcquiring {
@@ -598,6 +617,198 @@ func (runner *DurableRequestLifecycleRunner) openWaveRows(
 		pending.Steps = append([]requestledger.StepRef(nil), pending.Steps...)
 	}
 	return headRow.Head, route, pending, headRow.Applied, nil
+}
+
+// durableRequestRetiredOpenCut is the one coherent lifecycle read permitted
+// after a deterministic SessionOpen retires before its acquire intent is
+// stored. The caller must dispatch the returned phase through the ordinary
+// state machine; it must never call Open again.
+type durableRequestRetiredOpenCut struct {
+	head    requestledger.HeadRecord
+	route   requestledger.RoutePinRecord
+	pending requestledger.PendingWaveRecord
+	applied uint64
+}
+
+func (runner *DurableRequestLifecycleRunner) refreshRetiredOpenCut(
+	ctx context.Context,
+	wave DurableRequestWave,
+	keyDigest requestledger.Digest,
+	priorHead requestledger.HeadRecord,
+	route ReplicatedRoute,
+	retired *durableRequestRetiredOpenError,
+) (durableRequestRetiredOpenCut, error) {
+	if ctx == nil || retired == nil || len(retired.openCommand) == 0 {
+		return durableRequestRetiredOpenCut{}, ErrDurableRequestConflict
+	}
+	if err := ctx.Err(); err != nil {
+		return durableRequestRetiredOpenCut{}, errors.Join(err, ErrDurableRequestConflict)
+	}
+	// The compatibility ReadRow path cannot establish the atomic evidence
+	// needed here. A retired Open is recoverable only through the production
+	// coherent wave-cut reader.
+	if _, ok := runner.ledger.(durableRequestWaveCutReader); !ok {
+		return durableRequestRetiredOpenCut{}, ErrDurableRequestConflict
+	}
+	head, routePin, pending, applied, err := runner.openWaveRows(ctx, wave, keyDigest)
+	if err != nil || ctx.Err() != nil {
+		return durableRequestRetiredOpenCut{}, errors.Join(err, ctx.Err(), ErrDurableRequestConflict)
+	}
+	cut := durableRequestRetiredOpenCut{head: head, route: routePin, pending: pending, applied: applied}
+	if head.Revision <= priorHead.Revision {
+		return durableRequestRetiredOpenCut{}, ErrDurableRequestConflict
+	}
+	if err := validateRetiredOpenCut(wave, priorHead, route, cut, retired); err != nil {
+		return durableRequestRetiredOpenCut{}, err
+	}
+	return cut, nil
+}
+
+func validateRetiredOpenCut(
+	wave DurableRequestWave,
+	priorHead requestledger.HeadRecord,
+	route ReplicatedRoute,
+	cut durableRequestRetiredOpenCut,
+	retired *durableRequestRetiredOpenError,
+) error {
+	if retired == nil || len(retired.openCommand) == 0 ||
+		priorHead.NextStepOrdinal != wave.Ordinal || cut.head.Revision <= priorHead.Revision ||
+		priorHead.Phase != requestledger.PhaseSealed || cut.head.Phase != requestledger.PhaseSealed ||
+		cut.head.Key != wave.Key || cut.head.KeyDigest != priorHead.KeyDigest ||
+		cut.head.RequestDigest != priorHead.RequestDigest || cut.head.PlanRoot != priorHead.PlanRoot ||
+		cut.head.PinID != wave.PinID || cut.route.Revision == 0 || cut.route.WaveOrdinal != wave.Ordinal ||
+		cut.route.KeyDigest != cut.head.KeyDigest || cut.route.RequestDigest != cut.head.RequestDigest ||
+		cut.route.PlanRoot != cut.head.PlanRoot || cut.route.PriorContinuationDigest != priorHead.ContinuationDigest ||
+		cut.route.PinID != wave.PinID || cut.route.BindingDigest != wave.Binding {
+		return ErrDurableRequestConflict
+	}
+	if _, err := requestledger.AppendHead(nil, cut.head); err != nil {
+		return ErrDurableRequestConflict
+	}
+	if _, err := requestledger.AppendRoutePin(nil, cut.route); err != nil {
+		return ErrDurableRequestConflict
+	}
+	if cut.pending.Revision != 0 {
+		if cut.route.Phase != requestledger.RoutePinAcquired ||
+			cut.pending.WaveOrdinal != wave.Ordinal || cut.pending.KeyDigest != cut.head.KeyDigest ||
+			cut.pending.RequestDigest != cut.head.RequestDigest || cut.pending.PlanRoot != cut.head.PlanRoot ||
+			cut.pending.PriorContinuationDigest != priorHead.ContinuationDigest ||
+			cut.pending.RoutePinDigest != cut.route.AcquiredEvidenceDigest ||
+			cut.pending.ForwardingWitnessDigest != cut.route.PhysicalWitnessDigest ||
+			cut.pending.PayloadBuildDigest != wave.Build.BuildDigest ||
+			len(cut.pending.Steps) != 1 || cut.pending.Steps[0] != wave.Step {
+			return ErrDurableRequestConflict
+		}
+		if _, err := requestledger.AppendPendingWave(nil, cut.pending); err != nil {
+			return ErrDurableRequestConflict
+		}
+	}
+
+	open, err := replication.OpenCommand(retired.openCommand)
+	if err != nil || open.Kind() != replication.CommandSessionOpen ||
+		open.AuthorityClass != replication.CommandAuthorityMembershipStableRouteSession ||
+		open.ClientEpoch != 0 || open.ClientSequence != 1 || open.AckThrough != 0 ||
+		open.NextDeadlineUnixNano != math.MaxInt64 || open.ExpectedDeadlineUnixNano != 0 ||
+		!bytes.Equal(open.Tenant, wave.Tenant) || open.RetryHome != wave.Identity.RetryHome ||
+		!commandViewMatchesRoute(open, route) {
+		return ErrDurableRequestConflict
+	}
+	identity, err := requestledger.DeriveRouteGateIdentity(
+		cut.head.KeyDigest, cut.head.RequestDigest, cut.head.PlanRoot,
+		cut.route.PriorContinuationDigest, cut.route.PinID, cut.route.WaveOrdinal,
+	)
+	if err != nil {
+		return ErrDurableRequestConflict
+	}
+	expectedClientID, err := durableRouteSessionIdentity(identity, route, wave.Tenant)
+	if err != nil || open.ClientID != expectedClientID {
+		return ErrDurableRequestConflict
+	}
+	retained, err := replication.OpenCommand(cut.route.Command)
+	if err != nil || retained.Kind() != replication.CommandRouteGate ||
+		retained.AuthorityClass != open.AuthorityClass ||
+		!sameDurableRequestSessionEnvelope(open, retained) ||
+		!commandViewMatchesRoute(retained, route) || retained.ClientEpoch == 0 ||
+		retained.ClientID != open.ClientID || retained.RetryHome != wave.Identity.RetryHome ||
+		!bytes.Equal(retained.Tenant, wave.Tenant) {
+		return ErrDurableRequestConflict
+	}
+	gate, err := retained.OpenRouteGate()
+	if err != nil || gate.Identity != routegate.Identity(identity) || gate.Epoch == 0 {
+		return ErrDurableRequestConflict
+	}
+	physical, ok := replication.RouteGatePhysicalWitness(retained)
+	if !ok || requestledger.Digest(physical) != cut.route.PhysicalWitnessDigest {
+		return ErrDurableRequestConflict
+	}
+	binding, err := requestledger.DeriveRouteGateBinding(
+		identity, wave.Binding, requestledger.Digest(physical), gate.Epoch,
+	)
+	if err != nil || gate.Binding != routegate.Binding(binding) {
+		return ErrDurableRequestConflict
+	}
+	wantOperation, wantSequence, wantAck := routegate.OperationAcquireShared, uint64(2), uint64(1)
+	if cut.route.Phase == requestledger.RoutePinReleasing || cut.route.Phase == requestledger.RoutePinReleased {
+		wantOperation, wantSequence, wantAck = routegate.OperationReleaseShared, 3, 2
+	}
+	if gate.Operation != wantOperation || retained.ClientSequence != wantSequence || retained.AckThrough != wantAck {
+		return ErrDurableRequestConflict
+	}
+	if cut.route.Phase == requestledger.RoutePinAcquiring || cut.route.Phase == requestledger.RoutePinAcquired {
+		if cut.head.NextStepOrdinal != wave.Ordinal || cut.head.OutstandingRoutePinDigest != (requestledger.Digest{}) {
+			return ErrDurableRequestConflict
+		}
+	} else if cut.route.Phase == requestledger.RoutePinReleasing {
+		if cut.head.NextStepOrdinal != wave.Ordinal+1 ||
+			cut.head.OutstandingRoutePinDigest != cut.route.AcquiredEvidenceDigest || cut.pending.Revision != 0 {
+			return ErrDurableRequestConflict
+		}
+	} else if cut.route.Phase == requestledger.RoutePinReleased {
+		if cut.head.NextStepOrdinal != wave.Ordinal+1 ||
+			cut.head.OutstandingRoutePinDigest != (requestledger.Digest{}) || cut.pending.Revision != 0 {
+			return ErrDurableRequestConflict
+		}
+	} else {
+		return ErrDurableRequestConflict
+	}
+	if cut.route.Phase == requestledger.RoutePinAcquiring && cut.pending.Revision != 0 {
+		return ErrDurableRequestConflict
+	}
+	if (cut.route.Phase == requestledger.RoutePinReleasing || cut.route.Phase == requestledger.RoutePinReleased) &&
+		wave.Ordinal == ^uint64(0) {
+		return ErrDurableRequestConflict
+	}
+	if (cut.route.Phase == requestledger.RoutePinAcquiring || cut.route.Phase == requestledger.RoutePinAcquired) &&
+		cut.head.ContinuationDigest != priorHead.ContinuationDigest {
+		return ErrDurableRequestConflict
+	}
+	if cut.route.Phase == requestledger.RoutePinAcquired || cut.route.Phase == requestledger.RoutePinReleased {
+		var result ReplicatedResult
+		result.Completion = cut.route.Completion
+		completion, completionErr := replication.OpenCompletion(cut.route.Completion)
+		if completionErr != nil {
+			return ErrDurableRequestConflict
+		}
+		result.Outcome.AppliedIndex = completion.AppliedSequence
+		if !validDurableRequestSettlement(cut.route.Command, result) {
+			return ErrDurableRequestConflict
+		}
+	}
+	return nil
+}
+
+func sameDurableRequestSessionEnvelope(open, retained replication.CommandView) bool {
+	return open.ClusterID == retained.ClusterID &&
+		open.ClusterIncarnation == retained.ClusterIncarnation &&
+		open.TopologyRecoveryEpoch == retained.TopologyRecoveryEpoch &&
+		bytes.Equal(open.Distribution, retained.Distribution) && bytes.Equal(open.Shard, retained.Shard) &&
+		open.AllocationGeneration == retained.AllocationGeneration && open.ShardIncarnation == retained.ShardIncarnation &&
+		open.GroupID == retained.GroupID && open.ReplicaSetVersion == retained.ReplicaSetVersion &&
+		open.ActivePolicyGeneration == retained.ActivePolicyGeneration && open.ProtectionEpoch == retained.ProtectionEpoch &&
+		open.OwnershipEpoch == retained.OwnershipEpoch && open.SchemaGeneration == retained.SchemaGeneration &&
+		open.RoutingVersion == retained.RoutingVersion && open.RouteGeneration == retained.RouteGeneration &&
+		bytes.Equal(open.Tenant, retained.Tenant) && open.ClientID == retained.ClientID &&
+		open.RetryHome == retained.RetryHome
 }
 
 func (runner *DurableRequestLifecycleRunner) readWaveObservation(
