@@ -776,6 +776,9 @@ func TestDevNonphysicalBundleValidationPrecedesFragmentRestore(t *testing.T) {
 		}
 	}
 	for _, member := range cluster.DataMembers {
+		if err := os.MkdirAll(filepath.Dir(member.ServeManifest), 0o700); err != nil {
+			t.Fatal(err)
+		}
 		prepareDevTestReplica(t, member, group, devDataDistribution, devDataShard,
 			devDataTable, devDataPrimaryKey, replication.Digest{})
 		prepareRaw, err := os.ReadFile(filepath.Join(root,
@@ -824,6 +827,9 @@ func TestDevNonphysicalBundleValidationPrecedesFragmentRestore(t *testing.T) {
 		prepared.Store = table.Stores[index]
 		prepared.ServeManifest = filepath.Join(root,
 			table.artifactStem()+"-member-"+itoa(index+1), "serve-rf3.vibejson")
+		if err := os.MkdirAll(filepath.Dir(prepared.ServeManifest), 0o700); err != nil {
+			t.Fatal(err)
+		}
 		prepareDevTestReplica(t, prepared, customGroup, distribution.DistributionName(table.distribution()),
 			distribution.ShardID("all"), table.Table, table.PrimaryKey, replication.Digest{})
 		basePrepareRaw, err := os.ReadFile(filepath.Join(root,
