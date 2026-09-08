@@ -185,6 +185,24 @@ func settleRF3SchemaCommit(ctx context.Context, owners rf3SchemaOwner, group raf
 	return settleRF3SchemaCommitWithAlias(ctx, owners, group, command, nil)
 }
 
+// settleRF3SchemaCommitAlias settles the one source-fenced error for which a
+// replica-local activation command may differ from the committed RF3-wide
+// command: its catalog CAS. The alias callback is an authenticated WAL proof;
+// it is intentionally not consulted for ordinary uncommitted proposals.
+func settleRF3SchemaCommitAlias(alias func() (bool, error), pending error) error {
+	if alias == nil {
+		return pending
+	}
+	committed, err := alias()
+	if err != nil {
+		return errors.Join(pending, err)
+	}
+	if !committed {
+		return pending
+	}
+	return nil
+}
+
 func settleRF3SchemaCommitWithAlias(ctx context.Context, owners rf3SchemaOwner,
 	group raftmember.GroupKey, command []byte, alias func() (bool, error),
 ) error {
@@ -197,11 +215,18 @@ func settleRF3SchemaCommitWithAlias(ctx context.Context, owners rf3SchemaOwner,
 	}
 	serving, err := owners.Probe(ctx, group)
 	if err != nil {
+		if err == replicatedstate.ErrSchemaTransitionPending {
+			return settleRF3SchemaCommitAlias(alias, err)
+		}
 		return err
 	}
-	if err = owners.ProposeSchemaTransition(ctx, serving.Fence(), command); err != nil &&
-		!errors.Is(err, raftservice.ErrOutcomeUnknown) && !errors.Is(err, raftmodel.ErrNotLeader) {
-		return err
+	if err = owners.ProposeSchemaTransition(ctx, serving.Fence(), command); err != nil {
+		if err == replicatedstate.ErrSchemaTransitionPending {
+			return settleRF3SchemaCommitAlias(alias, err)
+		}
+		if !errors.Is(err, raftservice.ErrOutcomeUnknown) && !errors.Is(err, raftmodel.ErrNotLeader) {
+			return err
+		}
 	}
 	return waitRF3SchemaCommit(ctx, owners, group, command, alias)
 }
