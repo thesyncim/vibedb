@@ -330,6 +330,162 @@ func TestCompactAlphabetSequentialReservoirWidthsRestartsAndAllocations(t *testi
 	}
 }
 
+const variedV1Alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_"
+
+func compactVariedV1Values(rows int) [][]byte {
+	values := make([][]byte, rows)
+	for row := range values {
+		var payload [256]byte
+		x := compactVariedV1Mix(uint64(row) + 0x1d2b79f5aa33cc77)
+		for at := range payload {
+			x ^= x >> 12
+			x ^= x << 25
+			x ^= x >> 27
+			x *= 0x2545f4914f6cdd1d
+			payload[at] = variedV1Alphabet[(x>>58)&63]
+		}
+		values[row] = make([]byte, 0, len(payload)+2)
+		values[row] = append(values[row], '"')
+		values[row] = append(values[row], payload[:]...)
+		values[row] = append(values[row], '"')
+	}
+	return values
+}
+
+func compactVariedV1Mix(value uint64) uint64 {
+	value += 0x9e3779b97f4a7c15
+	value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9
+	value = (value ^ (value >> 27)) * 0x94d049bb133111eb
+	return value ^ (value >> 31)
+}
+
+func TestCompactAlphabetPowerOfTwoDomainRoundTripsAcrossRestarts(t *testing.T) {
+	for _, cardinality := range []int{1, 2, 4, 8, 16, 32, 64} {
+		values := make([][]byte, 2*compactStreamRestart+2)
+		// The 64-symbol case is the exact alphabet used by the varied-v1
+		// workload. The smaller cases exercise every power-of-two domain.
+		values[0] = []byte(variedV1Alphabet[:cardinality])
+		for row := 1; row < len(values); row++ {
+			length := 1 + row*17%97
+			values[row] = make([]byte, length)
+			for char := range values[row] {
+				values[row][char] = variedV1Alphabet[(row+char*5)%cardinality]
+			}
+		}
+
+		var scratch compactStreamScratch
+		encoded, ok := scratch.encodeAlphabet(0, values, 0)
+		if !ok || encoded.width != uint8(bits.Len(uint(cardinality-1))) {
+			t.Fatalf("cardinality=%d width=%d ok=%v", cardinality, encoded.width, ok)
+		}
+		view := compactCodecRoundTrip(t, encoded, values)
+		checkCompactSequentialSeeks(t, view)
+	}
+}
+
+func TestCompactAlphabetVariedV1NormalSelection(t *testing.T) {
+	values := compactVariedV1Values(2*compactStreamRestart + 2)
+	var seen [256]bool
+	for _, value := range values {
+		for _, char := range value[1 : len(value)-1] {
+			seen[char] = true
+		}
+	}
+	for _, char := range []byte(variedV1Alphabet) {
+		if !seen[char] {
+			t.Fatalf("varied-v1 fixture never emitted alphabet byte %q", char)
+		}
+	}
+
+	encoded := encodeCompactScalarStream(values)
+	alphabetLen := 0
+	if len(encoded.dict) != 0 {
+		alphabetLen = len(encoded.dict[0])
+	}
+	if encoded.kind != compactStreamAlphabet || encoded.width != 6 ||
+		alphabetLen != len(variedV1Alphabet) {
+		t.Fatalf("varied-v1 selection kind=%d width=%d alphabet=%d",
+			encoded.kind, encoded.width, alphabetLen)
+	}
+	view := compactCodecRoundTrip(t, encoded, values)
+	checkCompactSequentialSeeks(t, view)
+}
+
+func TestCompactAlphabetFullDomainStillChecksFraming(t *testing.T) {
+	values := compactVariedV1Values(2*compactStreamRestart + 2)
+	var scratch compactStreamScratch
+	encoded, ok := scratch.encodeAlphabet(0, values, 0)
+	if !ok || encoded.width != 6 || len(encoded.dict) == 0 ||
+		len(encoded.dict[0]) != len(variedV1Alphabet) {
+		t.Fatal("full-domain alphabet fixture rejected")
+	}
+	binaryStream, err := encoded.appendBinary(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := openCompactStream(binaryStream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataStart := len(binaryStream) - len(view.data)
+	corruptions := []struct {
+		name string
+		edit func([]byte) []byte
+	}{
+		{
+			name: "truncated",
+			edit: func(data []byte) []byte { return data[:len(data)-1] },
+		},
+		{
+			name: "offset",
+			edit: func(data []byte) []byte {
+				binary.LittleEndian.PutUint32(data[dataStart:], 0)
+				return data
+			},
+		},
+		{
+			name: "length",
+			edit: func(data []byte) []byte {
+				binary.LittleEndian.PutUint16(data[10:], uint16(len(view.data)-1))
+				return data
+			},
+		},
+	}
+	for _, corruption := range corruptions {
+		bad := corruption.edit(append([]byte(nil), binaryStream...))
+		if _, err := openCompactStream(bad); err == nil {
+			t.Fatalf("%s corruption admitted", corruption.name)
+		}
+	}
+}
+
+func TestCompactAlphabetNonPowerOfTwoCodesRemainRejected(t *testing.T) {
+	for _, cardinality := range []int{3, 63} {
+		values := [][]byte{[]byte(variedV1Alphabet)[:cardinality]}
+		var scratch compactStreamScratch
+		encoded, ok := scratch.encodeAlphabet(0, values, 0)
+		if !ok || int(encoded.width) != bits.Len(uint(cardinality-1)) {
+			t.Fatalf("cardinality=%d width=%d ok=%v", cardinality, encoded.width, ok)
+		}
+		binaryStream, err := encoded.appendBinary(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		view, err := openCompactStream(binaryStream)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _, packedBit, _, _ := view.alphabetBlock(0)
+		dataStart := len(binaryStream) - len(view.data)
+		// The first value starts with an in-domain code, so OR-ing the
+		// out-of-domain code below produces the intended malformed symbol.
+		compactPutBits(binaryStream[dataStart:], packedBit, int(view.width), uint64(cardinality))
+		if _, err := openCompactStream(binaryStream); err == nil {
+			t.Fatalf("cardinality=%d invalid code admitted", cardinality)
+		}
+	}
+}
+
 func TestCountCompactPackedEqualMatchesRandomAccess(t *testing.T) {
 	for width := 0; width <= 64; width++ {
 		for _, count := range []int{0, 1, 7, 8, 9, 63, 64, 65, 257, 4096} {

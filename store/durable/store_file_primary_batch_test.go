@@ -333,8 +333,8 @@ func TestFilePrimaryBatchSnapshotIsolation(t *testing.T) {
 	for _, lane := range primaryBatchLanes() {
 		t.Run(lane.name, func(t *testing.T) {
 			coll, file, _ := openPrimaryBatchStore(t, lane.options)
-			defer coll.Close()
 			defer file.Close()
+			defer coll.Close()
 			for i := 0; i < 24; i++ {
 				if _, err := coll.Put([]byte(fmt.Sprintf("base%02d", i)), journalValue(i)); err != nil {
 					t.Fatalf("seed put: %v", err)
@@ -346,6 +346,12 @@ func TestFilePrimaryBatchSnapshotIsolation(t *testing.T) {
 			if err != nil {
 				t.Fatalf("snapshot: %v", err)
 			}
+			snapClosed := false
+			defer func() {
+				if !snapClosed {
+					_ = snap.Close()
+				}
+			}()
 
 			if err := coll.Update(func(b *WriteBatch) error {
 				if err := b.Put([]byte("fresh"), []byte(`{"new":1}`)); err != nil {
@@ -381,8 +387,10 @@ func TestFilePrimaryBatchSnapshotIsolation(t *testing.T) {
 			if _, ok, _ := coll.AppendRaw(nil, []byte("base01")); ok {
 				t.Fatal("live base01 still present after batch delete")
 			}
-			if err := snap.Close(); err != nil {
-				t.Fatalf("snapshot close: %v", err)
+			closeErr := snap.Close()
+			snapClosed = true
+			if closeErr != nil {
+				t.Fatalf("snapshot close: %v", closeErr)
 			}
 
 			// After the lease closes, a second batch commits and reads back.

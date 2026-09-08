@@ -1513,6 +1513,11 @@ func validateCompactAlphabet(data []byte, count, width, alphabet int) bool {
 	if cursor > len(data) {
 		return false
 	}
+	// A full 2^width alphabet admits every packed code by construction. Keep
+	// validating each block's offsets, lengths, and packed-byte bounds, but
+	// avoid the per-character range scan in that case. Non-power-of-two
+	// alphabets still require the complete code check below.
+	fullDomain := width >= 0 && width < 64 && uint64(alphabet) == uint64(1)<<uint(width)
 	for block := 0; block < blocks; block++ {
 		if int(binary.LittleEndian.Uint32(data[block*4:])) != cursor {
 			return false
@@ -1547,9 +1552,11 @@ func validateCompactAlphabet(data []byte, count, width, alphabet int) bool {
 		if packed > len(data)-cursor {
 			return false
 		}
-		for at := 0; at < characters; at++ {
-			if compactReadBits(data[cursor:cursor+packed], at*width, width) >= uint64(alphabet) {
-				return false
+		if !fullDomain {
+			for at := 0; at < characters; at++ {
+				if compactReadBits(data[cursor:cursor+packed], at*width, width) >= uint64(alphabet) {
+					return false
+				}
 			}
 		}
 		cursor += packed
