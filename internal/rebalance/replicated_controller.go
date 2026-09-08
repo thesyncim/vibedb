@@ -83,9 +83,9 @@ func OpenReplicatedMoveExecution(record gateway.ReplicatedOperationRecord, plan 
 	if plan == nil || !validReplicaMoveRecord(record, plan.OperationID()) || record.State != gateway.ReplicatedOperationRunning || record.Cursor[3] != replicaMoveCursorExecuting {
 		return ReplicatedMoveExecution{}, false
 	}
-	base := [32]byte{}
-	if plan.baseBound {
-		base = plan.baseDigest
+	base, ok := replicaMoveRecordBaseDigest(record, plan)
+	if !ok {
+		return ReplicatedMoveExecution{}, false
 	}
 	if record.Proof != replicaMoveActionProof(plan.OperationID(), record.IntentDigest, base, record.Cursor) {
 		return ReplicatedMoveExecution{}, false
@@ -173,6 +173,17 @@ func ExecuteReplicatedMoveStep(
 		}
 		return action, nil
 	}
+	recordBaseDigest, recordBaseOK := replicaMoveRecordBaseDigest(record, plan)
+	if !recordBaseOK || record.Proof != replicaMoveActionProof(
+		operation, record.IntentDigest, recordBaseDigest, record.Cursor,
+	) {
+		return Action{}, fmt.Errorf("%w: action witness digest differs at cursor %v", ErrReplicatedMove, record.Cursor)
+	}
+	if record.State == gateway.ReplicatedOperationRunning &&
+		record.Cursor[3] == replicaMoveCursorExecuting &&
+		(record.Cursor[5] > cut.Publication.Applied || record.Cursor[6] > cut.LeaderStatus.Term) {
+		return Action{}, fmt.Errorf("%w: executing evidence regressed at cursor %v publication=%d term=%d", ErrReplicatedMove, record.Cursor, cut.Publication.Applied, cut.LeaderStatus.Term)
+	}
 	// A prepared snapshot export and its target bootstrap share one exact Step.
 	// In particular, a catalog self-move advances Publication.Applied just by
 	// journaling this action. Keep its admitted witness across retries; making a
@@ -186,7 +197,7 @@ func ExecuteReplicatedMoveStep(
 		if record.CatalogGeneration != cut.Catalog.Generation() ||
 			record.Cursor[4] != cut.Publication.ReplicaSetVersion ||
 			record.Cursor[5] > cut.Publication.Applied || record.Cursor[6] > cut.LeaderStatus.Term ||
-			record.Proof != replicaMoveActionProof(operation, record.IntentDigest, plan.baseDigest, record.Cursor) {
+			record.Proof != replicaMoveActionProof(operation, record.IntentDigest, recordBaseDigest, record.Cursor) {
 			return Action{}, fmt.Errorf("%w: snapshot witness cursor=%v catalog=%d/%d publication=%d/%d term=%d", ErrReplicatedMove, record.Cursor, record.CatalogGeneration, cut.Catalog.Generation(), cut.Publication.ReplicaSetVersion, cut.Publication.Applied, cut.LeaderStatus.Term)
 		}
 		cut.Publication.Applied = record.Cursor[5]
@@ -198,12 +209,31 @@ func ExecuteReplicatedMoveStep(
 	currentCursor := wanted
 	currentCursor[3] = record.Cursor[3]
 	currentProof := replicaMoveActionProof(
-		operation, record.IntentDigest, plan.baseDigest, currentCursor,
+		operation, record.IntentDigest, recordBaseDigest, currentCursor,
 	)
 	if record.Cursor == currentCursor && record.Proof != currentProof {
 		return Action{}, fmt.Errorf("%w: action witness digest differs at cursor %v", ErrReplicatedMove, record.Cursor)
 	}
-	if record.Cursor != currentCursor || record.Proof != currentProof {
+	executingEvidenceOK := record.State == gateway.ReplicatedOperationRunning &&
+		record.Cursor[3] == replicaMoveCursorExecuting &&
+		record.Cursor[5] <= cut.Publication.Applied &&
+		record.Cursor[6] <= cut.LeaderStatus.Term &&
+		record.CatalogGeneration == cut.Catalog.Generation() &&
+		record.Cursor[4] == cut.Publication.ReplicaSetVersion &&
+		recordBaseOK && recordBaseDigest == replicaMovePlanBaseDigest(plan)
+	sameAction := sameReplicaMoveAction(record.Cursor, wanted)
+	if record.State == gateway.ReplicatedOperationRunning &&
+		record.Cursor[3] == replicaMoveCursorExecuting && sameAction && !executingEvidenceOK {
+		return Action{}, fmt.Errorf("%w: executing action evidence regressed at cursor %v", ErrReplicatedMove, record.Cursor)
+	}
+	if record.State == gateway.ReplicatedOperationRunning &&
+		record.Cursor[3] == replicaMoveCursorExecuting && action.Kind == ActionAwaitLeader && !executingEvidenceOK {
+		return Action{}, fmt.Errorf("%w: cannot replace executing action while leader is unavailable", ErrReplicatedMove)
+	}
+	if executingEvidenceOK && action.Kind == ActionAwaitLeader && !sameAction {
+		return action, nil
+	}
+	if (record.Cursor != currentCursor || record.Proof != currentProof) && !(executingEvidenceOK && sameAction) {
 		if record.State == gateway.ReplicatedOperationRunning &&
 			record.Cursor[3] == replicaMoveCursorApplied &&
 			sameReplicaMoveAction(record.Cursor, wanted) {
@@ -222,7 +252,7 @@ func ExecuteReplicatedMoveStep(
 			record.CatalogGeneration == cut.Catalog.Generation() &&
 			record.Cursor[4] == cut.Publication.ReplicaSetVersion &&
 			record.Cursor[5] <= cut.Publication.Applied && record.Cursor[6] <= cut.LeaderStatus.Term &&
-			record.Proof == replicaMoveActionProof(operation, record.IntentDigest, plan.baseDigest, record.Cursor)
+			record.Proof == replicaMoveActionProof(operation, record.IntentDigest, recordBaseDigest, record.Cursor)
 		if record.State != gateway.ReplicatedOperationRunning && !refreshPlanned {
 			return Action{}, fmt.Errorf("%w: cannot refresh planned action: state=%d cursor=%v wanted=%v catalog=%d/%d", ErrReplicatedMove, record.State, record.Cursor, wanted, record.CatalogGeneration, cut.Catalog.Generation())
 		}
@@ -278,14 +308,25 @@ func ExecuteReplicatedMoveStep(
 	} else {
 		return Action{}, ErrReplicatedMove
 	}
-	execution := replicaMoveExecution(operation, record.IntentDigest, plan, cut, action)
+	var execution ReplicatedMoveExecution
+	if record.State == gateway.ReplicatedOperationRunning &&
+		record.Cursor[3] == replicaMoveCursorExecuting {
+		var ok bool
+		execution, ok = OpenReplicatedMoveExecution(record, plan)
+		if !ok || execution.Action != action {
+			return Action{}, fmt.Errorf("%w: executing action witness does not match current action", ErrReplicatedMove)
+		}
+	} else {
+		execution = replicaMoveExecution(operation, record.IntentDigest, plan, cut, action)
+	}
 	if err = executor.ExecuteReplicaMove(ctx, operation, plan, execution); err != nil {
 		return action, err
 	}
 	next := record
 	next.Revision++
-	next.Cursor, next.Proof = replicaMoveActionWitness(
-		operation, next.IntentDigest, plan, cut, action, replicaMoveCursorApplied,
+	next.Cursor[3] = replicaMoveCursorApplied
+	next.Proof = replicaMoveActionProof(
+		operation, next.IntentDigest, execution.SnapshotBaseDigest, next.Cursor,
 	)
 	if err = settleReplicaMovePublish(ctx, journal, record.Revision, next); err != nil {
 		return action, err
@@ -367,6 +408,37 @@ func replicaMoveRecordMatches(
 		operation, record.IntentDigest, plan, cut, action, phase,
 	)
 	return record.Cursor == cursor && record.Proof == proof
+}
+
+func replicaMoveRecordBaseDigest(
+	record gateway.ReplicatedOperationRecord, plan *Plan,
+) ([32]byte, bool) {
+	if plan == nil {
+		return [32]byte{}, false
+	}
+	// Cursor[7] is only a compact hint. The proof authenticates the complete
+	// digest, so use it to distinguish an historical unbound witness from a
+	// currently bound digest whose low word happens to be zero.
+	zero := [32]byte{}
+	if plan.baseBound && record.Cursor[7] == binary.LittleEndian.Uint64(plan.baseDigest[:8]) &&
+		record.Proof == replicaMoveActionProof(
+			plan.OperationID(), record.IntentDigest, plan.baseDigest, record.Cursor,
+		) {
+		return plan.baseDigest, true
+	}
+	if record.Cursor[7] == 0 && record.Proof == replicaMoveActionProof(
+		plan.OperationID(), record.IntentDigest, zero, record.Cursor,
+	) {
+		return zero, true
+	}
+	return zero, false
+}
+
+func replicaMovePlanBaseDigest(plan *Plan) [32]byte {
+	if plan != nil && plan.baseBound {
+		return plan.baseDigest
+	}
+	return [32]byte{}
 }
 
 func replicaMoveActionCursor(
