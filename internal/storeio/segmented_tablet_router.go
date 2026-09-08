@@ -199,6 +199,17 @@ type SegmentedTabletRouterLeafSplitResult struct {
 	Bytes       int
 }
 
+// SegmentedTabletRouterLeafPartitionResult reports a localized replacement of
+// one anchor row by several rows. The locator, selected anchor, and tablet root
+// are one immutable publication unit.
+type SegmentedTabletRouterLeafPartitionResult struct {
+	Root    []byte
+	Locator []byte
+	Page    []byte
+	PageID  uint8
+	Bytes   int
+}
+
 // SegmentedTabletRouterLeafRemoveResult reports the localized persistent
 // rewrite set for removing one leaf from a non-singleton anchor. The stable
 // anchor page remains allocated; only that anchor, its dense locator, and the

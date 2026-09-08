@@ -457,6 +457,7 @@ type primaryLocalizedLeafSplit struct {
 	remove       bool
 	macro        *primaryMacroTabletSplit
 	plan         storeio.GlobalTabletCatalogLeafSplitPlan
+	partition    *primaryLocalizedLeafPartition
 	resident     storeio.ResidentPrimaryRoute
 	route        storeio.SegmentedTabletRouterRoute
 	leftRef      storeio.PageRef
@@ -464,6 +465,11 @@ type primaryLocalizedLeafSplit struct {
 	rightBucket  storeio.BucketID
 	rightLocalID uint16
 	rightFence   []byte
+}
+
+type primaryLocalizedLeafPartition struct {
+	plan   storeio.GlobalTabletCatalogLeafPartitionPlan
+	leaves []storeio.SegmentedTabletRouterLeaf
 }
 
 type primaryMacroTabletSplit struct {
@@ -842,9 +848,8 @@ func (c *Collection) commitPrimaryStructural(
 	}
 	// Whole-tablet rebuilds remain the fallback for batch topology and removing
 	// the only row in an anchor. Localized edits rewrite exactly the selected
-	// anchor (plus one new anchor only when the inserted fence exceeds its exact
-	// encoded-byte capacity), locator,
-	// and segmented root.
+	// anchor (plus one new anchor only for the scalar split path when its exact
+	// encoded-byte capacity requires it), locator, and segmented root.
 	var oldAnchorRefs []storeio.PageRef
 	var rawRoot []byte
 	var nextRouter *storeio.ResidentPrimaryRouter
@@ -866,8 +871,9 @@ func (c *Collection) commitPrimaryStructural(
 			return allocErr
 		}
 		var rightAnchor storeio.TransactionPage
+		var rightPage []byte
 		needsNewAnchor := false
-		if !localized.remove {
+		if localized.partition == nil && !localized.remove {
 			if localized.plan.RequiresTabletRebuild() {
 				return storeio.ErrSegmentedTabletRouterNoSpace
 			}
@@ -907,8 +913,13 @@ func (c *Collection) commitPrimaryStructural(
 			return openErr
 		}
 		rawRoot = make([]byte, storeio.SegmentedTabletRouterRootBytes)
-		var rightPage []byte
-		if localized.remove {
+		if localized.partition != nil {
+			_, err = path.tablet.InsertLeafPartition(
+				rawRoot, locatorPage.Bytes(), leftAnchor.Bytes(), generation,
+				localized.route, localized.partition.leaves, leftAnchor.Ref(),
+				&locatorView, &path.anchor,
+			)
+		} else if localized.remove {
 			_, err = path.tablet.RemoveLeaf(
 				rawRoot, locatorPage.Bytes(), leftAnchor.Bytes(), generation,
 				localized.route, leftAnchor.Ref(), &locatorView, &path.anchor,
@@ -952,6 +963,10 @@ func (c *Collection) commitPrimaryStructural(
 		if localized.remove {
 			nextRouter, err = c.primaryRouter.Load().RemoveLeaf(
 				localized.resident, generation,
+			)
+		} else if localized.partition != nil {
+			nextRouter, err = c.primaryRouter.Load().SplitLeafPartition(
+				localized.resident, localized.partition.leaves, generation,
 			)
 		} else {
 			nextRouter, err = c.primaryRouter.Load().SplitLeaf(
