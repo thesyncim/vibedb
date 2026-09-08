@@ -28,14 +28,25 @@ type devTableInventory struct {
 	NextPlacement uint64              `json:"next_placement,omitempty"`
 	Tables        []devTableProvision `json:"tables"`
 }
+
+const devTableProvisionBundleSuffix = "-split-source.vibejson"
+
+func validDevProvisionBundleFormat(format uint16) bool {
+	return format == 0 || format == gateway.ReplicatedTableProvisionBundleFormat
+}
+
 type devTableProvision struct {
-	Table            string    `json:"table"`
-	Distribution     string    `json:"distribution,omitempty"`
-	PrimaryKey       string    `json:"primary_key"`
-	CreateTable      string    `json:"create_table"`
-	GroupID          string    `json:"group_id"`
-	ShardIncarnation string    `json:"shard_incarnation"`
-	Stores           [3]string `json:"stores"`
+	Table        string `json:"table"`
+	Distribution string `json:"distribution,omitempty"`
+	PrimaryKey   string `json:"primary_key"`
+	CreateTable  string `json:"create_table"`
+	// Zero is the original fragment-only grammar. New plans persist the
+	// bundle format before preparation so an interrupted fragment write cannot
+	// be silently downgraded to legacy startup.
+	ProvisionBundleFormat uint16    `json:"provision_bundle_format,omitempty"`
+	GroupID               string    `json:"group_id"`
+	ShardIncarnation      string    `json:"shard_incarnation"`
+	Stores                [3]string `json:"stores"`
 	// Physical RF3 tables retain the exact node and group roots selected for
 	// each voter. This lets restart reconcile the same live node manifests
 	// without deriving a replacement placement from mutable directory order.
@@ -136,7 +147,8 @@ func ensureDevTables(root, shardBinary string, cluster *devClusterManifest, sche
 			if len(inventory.Tables) >= 63 {
 				return fmt.Errorf("%w: data-node group limit", errDevCluster)
 			}
-			table := devTableProvision{Table: name, PrimaryKey: primary, CreateTable: string(ddl)}
+			table := devTableProvision{Table: name, PrimaryKey: primary, CreateTable: string(ddl),
+				ProvisionBundleFormat: gateway.ReplicatedTableProvisionBundleFormat}
 			table.GroupID, err = devRandomIdentity()
 			if err != nil {
 				return err
@@ -187,22 +199,50 @@ func ensureDevTables(root, shardBinary string, cluster *devClusterManifest, sche
 		groups[i] = []string{member.ServeManifest}
 	}
 	seen := make(map[string]bool, len(inventory.Tables))
-	for _, table := range inventory.Tables {
+	for tableIndex, table := range inventory.Tables {
 		name, primary, err := parseDevTableDDL(table.CreateTable)
-		if err != nil || name != table.Table || primary != table.PrimaryKey || seen[name] ||
+		if err != nil || !validDevProvisionBundleFormat(table.ProvisionBundleFormat) || name != table.Table || primary != table.PrimaryKey || seen[name] ||
 			table.Distribution != "" && table.Distribution != "table-"+table.Table+"-"+table.GroupID[:min(12, len(table.GroupID))] {
 			return errors.Join(errDevCluster, err)
 		}
 		seen[name] = true
-		members, group, err := prepareDevTable(root, shardBinary, *cluster, table)
+		path := filepath.Join(root, table.artifactStem()+"-catalog.vibejson")
+		bundlePath := filepath.Join(root, table.artifactStem()+devTableProvisionBundleSuffix)
+		raw, fragmentErr := readDevFile(path, 4<<20)
+		if fragmentErr != nil && !errors.Is(fragmentErr, os.ErrNotExist) {
+			return fragmentErr
+		}
+		bundle, bundleErr := readDevFile(bundlePath, 4<<20)
+		if bundleErr != nil && !errors.Is(bundleErr, os.ErrNotExist) {
+			return bundleErr
+		}
+		completed := fragmentErr == nil || bundleErr == nil
+		restoreFragment := false
+		// A completed bundle is the immutable schema/route proof. Reconcile its
+		// prepared manifests without validating against the mutable live SQL
+		// image; an ALTER may have advanced that image after publication.
+		members, group, err := prepareDevTable(root, shardBinary, *cluster, table, completed)
 		if err != nil {
 			return err
 		}
 		for i, member := range members {
 			groups[i] = append(groups[i], member.ServeManifest)
 		}
-		path := filepath.Join(root, table.artifactStem()+"-catalog.vibejson")
-		if raw, err := readDevFile(path, 4<<20); err == nil {
+		if bundleErr == nil {
+			catalogRaw, _, openErr := gateway.OpenReplicatedTableProvisionBundle(bundle)
+			if openErr != nil {
+				return openErr
+			}
+			if fragmentErr == nil && !bytes.Equal(catalogRaw, raw) {
+				return fmt.Errorf("%w: table %q bundle does not match its immutable catalog fragment", errDevCluster, table.Table)
+			}
+			if fragmentErr != nil {
+				raw = catalogRaw
+				fragmentErr = nil
+				restoreFragment = true
+			}
+		}
+		if raw != nil && fragmentErr == nil {
 			addition, err := gateway.OpenReplicatedTableProvision(raw)
 			if err != nil {
 				return err
@@ -211,13 +251,72 @@ func ensureDevTables(root, shardBinary string, cluster *devClusterManifest, sche
 			if len(declarations) != 1 || declarations[0].CreateTable != table.CreateTable || len(descriptors) != 1 || descriptors[0].Group != group {
 				return errDevCluster
 			}
+			// Validate the complete immutable bundle before restoring a missing
+			// fragment or replacing the aggregate catalog. A substituted bundle
+			// must not poison either durable file on a failed restart.
+			if bundleErr == nil {
+				if err := validateDevPhysicalTableSplitSource(root, bundle, table, members, group); err != nil {
+					return err
+				}
+			}
+			if restoreFragment {
+				if err := writeDevFileOnce(path, raw); err != nil {
+					return err
+				}
+			}
 			if err := replaceDevFile(filepath.Join(root, "table-"+name+"-catalog.vibejson"), raw); err != nil {
 				return err
 			}
-			cluster.additionalCatalogs = append(cluster.additionalCatalogs, path)
+			if bundleErr == nil {
+				if table.ProvisionBundleFormat != gateway.ReplicatedTableProvisionBundleFormat {
+					table.ProvisionBundleFormat = gateway.ReplicatedTableProvisionBundleFormat
+					inventory.Tables[tableIndex] = table
+					inventoryRaw, marshalErr := vibejson.Marshal(&inventory)
+					if marshalErr != nil {
+						return marshalErr
+					}
+					if err := replaceDevFile(inventoryPath, inventoryRaw); err != nil {
+						return err
+					}
+				}
+				cluster.additionalCatalogs = append(cluster.additionalCatalogs, bundlePath)
+				continue
+			}
+			if table.ProvisionBundleFormat == gateway.ReplicatedTableProvisionBundleFormat && bundleErr != nil {
+				return fmt.Errorf("%w: table %q requires its split-source bundle", errDevCluster, table.Table)
+			}
+			candidate := table
+			candidate.ProvisionBundleFormat = gateway.ReplicatedTableProvisionBundleFormat
+			sourceRaw, sourceErr := buildDevPhysicalTableSplitSource(root, candidate, members, group, true)
+			if sourceErr == nil {
+				bundle, bundleErr := gateway.AppendReplicatedTableProvisionBundle(nil, raw, sourceRaw)
+				if bundleErr != nil {
+					return bundleErr
+				}
+				if err := writeDevFileOnce(bundlePath, bundle); err != nil {
+					return err
+				}
+				if table.ProvisionBundleFormat != gateway.ReplicatedTableProvisionBundleFormat {
+					table.ProvisionBundleFormat = gateway.ReplicatedTableProvisionBundleFormat
+					inventory.Tables[tableIndex] = table
+					inventoryRaw, marshalErr := vibejson.Marshal(&inventory)
+					if marshalErr != nil {
+						return marshalErr
+					}
+					if err := replaceDevFile(inventoryPath, inventoryRaw); err != nil {
+						return err
+					}
+				}
+				cluster.additionalCatalogs = append(cluster.additionalCatalogs, bundlePath)
+			} else if table.ProvisionBundleFormat == gateway.ReplicatedTableProvisionBundleFormat {
+				return sourceErr
+			} else {
+				cluster.additionalCatalogs = append(cluster.additionalCatalogs, path)
+			}
 			continue
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return err
+		}
+		if table.ProvisionBundleFormat == gateway.ReplicatedTableProvisionBundleFormat && fragmentErr == nil && bundleErr != nil {
+			return errDevCluster
 		}
 		endpoints := make(map[distribution.EndpointID]string)
 		dist := distribution.DistributionName(table.distribution())
@@ -253,7 +352,35 @@ func ensureDevTables(root, shardBinary string, cluster *devClusterManifest, sche
 		if err := replaceDevFile(filepath.Join(root, "table-"+name+"-catalog.vibejson"), provision); err != nil {
 			return err
 		}
-		cluster.additionalCatalogs = append(cluster.additionalCatalogs, path)
+		candidate := table
+		candidate.ProvisionBundleFormat = gateway.ReplicatedTableProvisionBundleFormat
+		sourceRaw, sourceErr := buildDevPhysicalTableSplitSource(root, candidate, members, group, false)
+		if sourceErr != nil {
+			if table.ProvisionBundleFormat == gateway.ReplicatedTableProvisionBundleFormat {
+				return sourceErr
+			}
+			cluster.additionalCatalogs = append(cluster.additionalCatalogs, path)
+			continue
+		}
+		bundle, err = gateway.AppendReplicatedTableProvisionBundle(nil, provision, sourceRaw)
+		if err != nil {
+			return err
+		}
+		if err := writeDevFileOnce(bundlePath, bundle); err != nil {
+			return err
+		}
+		if table.ProvisionBundleFormat != gateway.ReplicatedTableProvisionBundleFormat {
+			table.ProvisionBundleFormat = gateway.ReplicatedTableProvisionBundleFormat
+			inventory.Tables[tableIndex] = table
+			inventoryRaw, marshalErr := vibejson.Marshal(&inventory)
+			if marshalErr != nil {
+				return marshalErr
+			}
+			if err := replaceDevFile(inventoryPath, inventoryRaw); err != nil {
+				return err
+			}
+		}
+		cluster.additionalCatalogs = append(cluster.additionalCatalogs, bundlePath)
 	}
 	for i, paths := range groups {
 		raw, err := composeDevGroupManifest(paths)
@@ -370,7 +497,7 @@ func retainDevGroupInventoryManifest(root string, paths []string) error {
 	return fmt.Errorf("%w: cannot prove retained group inventory manifest", errDevCluster)
 }
 
-func prepareDevTable(root, binary string, cluster devClusterManifest, table devTableProvision) ([]devClusterMember, raftmember.GroupKey, error) {
+func prepareDevTable(root, binary string, cluster devClusterManifest, table devTableProvision, completed bool) ([]devClusterMember, raftmember.GroupKey, error) {
 	var group raftmember.GroupKey
 	groupID, err := decodeDev16(table.GroupID)
 	if err != nil {
@@ -434,8 +561,10 @@ func prepareDevTable(root, binary string, cluster devClusterManifest, table devT
 		if err := identity.UnmarshalJSON(identityRaw); err != nil {
 			return nil, group, err
 		}
-		if err := sqldriver.ValidateReplicatedChildSchema(identity, table.CreateTable, nil, nil); err != nil {
-			return nil, group, err
+		if !completed {
+			if err := sqldriver.ValidateReplicatedChildSchema(identity, table.CreateTable, nil, nil); err != nil {
+				return nil, group, err
+			}
 		}
 		members[i] = member
 	}

@@ -1,12 +1,16 @@
 package gatewayruntime
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/thesyncim/vibedb/autosplit"
@@ -24,18 +28,165 @@ import (
 const gatewayHotSplitPrepareAttempts = 3
 
 type gatewayHotSplitFactory struct {
-	sources map[raftmember.GroupKey]gatewaySplitSource
+	// Source versions are retained for the process lifetime. A later certified
+	// schema/allocation version cannot replace an entry needed by an older
+	// pending admission.
+	sourceVersions map[gatewayHotSplitSourceKey]gatewaySplitSource
+	shards         []gateway.ReplicatedEndpoint
+	splitSnapshots []string
+	mu             sync.RWMutex
+}
+
+type gatewayHotSplitSourceKey struct {
+	Group                  raftmember.GroupKey
+	AllocationGeneration   uint64
+	SchemaGeneration       uint64
+	RelationManifestDigest [32]byte
+}
+
+type gatewayProvisionedSplitSource struct {
+	Fragment *gateway.Snapshot
+	Source   gatewaySplitSource
 }
 
 func newGatewayHotSplitFactory(
 	manifest gatewayReplicaControlManifest,
 	catalog *gateway.Snapshot,
+	provisioned ...gatewayProvisionedSplitSource,
 ) (*gatewayHotSplitFactory, error) {
 	sources, err := gatewayHotSplitSources(manifest, catalog)
 	if err != nil {
 		return nil, err
 	}
-	return &gatewayHotSplitFactory{sources: sources}, nil
+	factory := &gatewayHotSplitFactory{
+		sourceVersions: make(map[gatewayHotSplitSourceKey]gatewaySplitSource, len(sources)+len(provisioned)),
+		shards:         slices.Clone(manifest.Shards),
+		splitSnapshots: slices.Clone(manifest.SplitSnapshots),
+	}
+	for _, source := range sources {
+		if err := factory.registerSource(catalog, source); err != nil {
+			return nil, err
+		}
+	}
+	for _, source := range provisioned {
+		if err := factory.registerSource(source.Fragment, source.Source); err != nil {
+			return nil, err
+		}
+	}
+	return factory, nil
+}
+
+// RegisterProvisionedSource installs one source proved by a durable table
+// provision fragment. Validation is performed against the exact fragment and
+// the immutable enrolled roster captured at startup; it does not refresh the
+// serving catalog. Registration is idempotent for identical bytes and keeps
+// distinct source versions alive for pending admissions.
+func (factory *gatewayHotSplitFactory) RegisterProvisionedSource(fragment *gateway.Snapshot, source gatewaySplitSource) error {
+	if factory == nil || fragment == nil {
+		return errGatewayHotSplitSourceRegistration
+	}
+	return factory.registerSource(fragment, source)
+}
+
+func (factory *gatewayHotSplitFactory) registerSource(fragment *gateway.Snapshot, source gatewaySplitSource) error {
+	if factory == nil || fragment == nil {
+		return errGatewayHotSplitSourceRegistration
+	}
+	if len(factory.shards) == 0 || len(factory.shards) != len(factory.splitSnapshots) {
+		return errGatewayHotSplitSourceRegistration
+	}
+	for index, shard := range factory.shards {
+		if shard.Node == (rafttransport.NodeID{}) ||
+			shard.ControlAddress == "" || !validGatewayReplicaAddress(shard.ControlAddress) ||
+			!validGatewayReplicaAddress(factory.splitSnapshots[index]) {
+			return errGatewayHotSplitSourceRegistration
+		}
+		if index > 0 && bytes.Compare(factory.shards[index-1].Node[:], shard.Node[:]) >= 0 {
+			return errGatewayHotSplitSourceRegistration
+		}
+	}
+	manifest := gatewayReplicaControlManifest{
+		Shards:         slices.Clone(factory.shards),
+		SplitSnapshots: slices.Clone(factory.splitSnapshots),
+		SplitSources:   []gatewaySplitSource{source},
+	}
+	// The source fragment is immutable evidence for this table. Bind every
+	// catalog control endpoint to the exact enrolled roster before validating
+	// or publishing the source; syntax and node membership alone are not enough.
+	if err := manifest.ValidateCatalog(fragment); err != nil {
+		return errors.Join(errGatewayHotSplitSourceRegistration, err)
+	}
+	validated, err := gatewayHotSplitSources(manifest, fragment)
+	if err != nil {
+		return errors.Join(errGatewayHotSplitSourceRegistration, err)
+	}
+	validatedSource, found := validated[source.Group]
+	if !found {
+		return errGatewayHotSplitSourceRegistration
+	}
+	key := gatewayHotSplitSourceVersionKey(validatedSource)
+	factory.mu.Lock()
+	defer factory.mu.Unlock()
+	if factory.sourceVersions == nil {
+		factory.sourceVersions = make(map[gatewayHotSplitSourceKey]gatewaySplitSource)
+	}
+	if existing, exists := factory.sourceVersions[key]; exists {
+		if !reflect.DeepEqual(existing, validatedSource) {
+			return errGatewayHotSplitSourceRegistration
+		}
+		return nil
+	}
+	if len(factory.sourceVersions) >= maxGatewaySplitSources {
+		return errGatewayHotSplitSourceRegistration
+	}
+	for existingKey, existing := range factory.sourceVersions {
+		if existingKey.Group == key.Group {
+			continue
+		}
+		for _, left := range existing.Replicas {
+			for _, right := range validatedSource.Replicas {
+				if left.Node == right.Node && left.Root == right.Root {
+					return errGatewayHotSplitSourceRegistration
+				}
+			}
+		}
+	}
+	owned := cloneGatewayHotSplitSource(validatedSource)
+	factory.sourceVersions[key] = owned
+	return nil
+}
+
+var errGatewayHotSplitSourceRegistration = errors.New("gatewayruntime: invalid provisioned hot split source registration")
+
+func gatewayHotSplitSourceVersionKey(source gatewaySplitSource) gatewayHotSplitSourceKey {
+	return gatewayHotSplitSourceKey{
+		Group: source.Group, AllocationGeneration: source.SQL.Binding.AllocationGeneration,
+		SchemaGeneration: source.SchemaGeneration, RelationManifestDigest: source.RelationManifestDigest,
+	}
+}
+
+func cloneGatewayHotSplitSource(source gatewaySplitSource) gatewaySplitSource {
+	source.Table = strings.Clone(source.Table)
+	source.SQL = source.SQL.Clone()
+	source.LocalIndexes = cloneGatewaySplitIndexes(source.LocalIndexes)
+	source.Template.ShardKey = strings.Clone(source.Template.ShardKey)
+	for index := range source.Replicas {
+		source.Replicas[index].Root = strings.Clone(source.Replicas[index].Root)
+		source.Replicas[index].Snapshot = strings.Clone(source.Replicas[index].Snapshot)
+	}
+	return source
+}
+
+func (factory *gatewayHotSplitFactory) sourceForDescriptor(source gateway.ReplicatedShardDescriptor) (gatewaySplitSource, bool) {
+	if factory == nil {
+		return gatewaySplitSource{}, false
+	}
+	key := gatewayHotSplitSourceKey{Group: source.Group, AllocationGeneration: uint64(source.AllocationGeneration),
+		SchemaGeneration: source.Command.SchemaGeneration, RelationManifestDigest: source.Command.RelationManifestDigest}
+	factory.mu.RLock()
+	defer factory.mu.RUnlock()
+	configuration, found := factory.sourceVersions[key]
+	return configuration, found
 }
 
 func (factory *gatewayHotSplitFactory) BuildHotSplitPlan(
@@ -81,7 +232,10 @@ func (factory *gatewayHotSplitFactory) BuildHotSplitPlan(
 		}
 		targets = append(targets, target)
 	}
-	configuration := factory.sources[source.Group]
+	configuration, found := factory.sourceForDescriptor(source)
+	if !found {
+		return nil, hotshard.ErrInvalidPressureCut
+	}
 	plan, err := splitcontroller.NewPlan(catalog, split, partitioner, targets, splitcontroller.PlanSourceSchema{
 		SQL: configuration.SQL, Placement: configuration.Placement, LocalIndexes: configuration.LocalIndexes,
 	})
@@ -166,7 +320,7 @@ func (factory *gatewayHotSplitFactory) buildChildTarget(
 	source gateway.ReplicatedShardDescriptor,
 	profile gateway.ReplicatedTableProfile,
 ) (splitcontroller.ChildTarget, error) {
-	configuration, found := factory.sources[source.Group]
+	configuration, found := factory.sourceForDescriptor(source)
 	if !found || !gatewaySplitSourceMatches(configuration, source, profile) {
 		return splitcontroller.ChildTarget{}, hotshard.ErrInvalidPressureCut
 	}

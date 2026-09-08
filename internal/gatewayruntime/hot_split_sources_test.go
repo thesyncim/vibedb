@@ -343,7 +343,7 @@ func TestGatewaySplitSourcesSelectSeparateRootsOnSharedHosts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	factory := gatewayHotSplitFactory{sources: sources}
+	factory := *gatewayHotSplitFactoryForSources(sources)
 	admission := [32]byte{7}
 	split, err := factory.allocateSplit(catalog, admission, work, source)
 	if err != nil {
