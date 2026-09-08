@@ -255,26 +255,72 @@ func devHotReadRequest(t *testing.T, keys []string) []byte {
 
 func devHotReadDocuments(t *testing.T, client *hotMutationWireClient, request []byte, keys []string) time.Duration {
 	t.Helper()
-	response, latency := client.roundTrip(t, request)
-	var decoded struct {
-		OK        bool   `json:"ok"`
-		Found     []bool `json:"found"`
-		Documents []struct {
-			ID    string `json:"id"`
-			Value uint64 `json:"value"`
-		} `json:"documents"`
-	}
-	if err := json.Unmarshal(response, &decoded); err != nil || !decoded.OK ||
-		len(decoded.Found) != len(keys) || len(decoded.Documents) != len(keys) {
-		t.Fatalf("development native SQL read response=%s err=%v", response, err)
-	}
-	for index, key := range keys {
-		if !decoded.Found[index] || decoded.Documents[index].ID != key || decoded.Documents[index].Value != uint64(index+1) {
-			t.Fatalf("development native SQL read position=%d key=%q found=%t document=%+v",
-				index, key, decoded.Found[index], decoded.Documents[index])
+	started := time.Now()
+	deadline := started.Add(durableRF3ExternalForegroundObjective + durableRF3ExternalForegroundGrace)
+	for attempt := 0; ; attempt++ {
+		if cause := context.Cause(t.Context()); cause != nil {
+			t.Fatalf("development native SQL read canceled after %d attempts: %v", attempt, cause)
 		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			t.Fatalf("development native SQL read did not settle within %s after %d attempts", deadline.Sub(started), attempt)
+		}
+		response, _ := client.roundTripUntil(t, request, deadline)
+		var envelope struct {
+			OK        *bool  `json:"ok"`
+			Found     []bool `json:"found"`
+			Documents []struct {
+				ID    string `json:"id"`
+				Value uint64 `json:"value"`
+			} `json:"documents"`
+			Code      string `json:"code"`
+			Retryable *bool  `json:"retryable"`
+		}
+		if err := json.Unmarshal(response, &envelope); err != nil || envelope.OK == nil {
+			t.Fatalf("development native SQL read response=%s err=%v", response, err)
+		}
+		if !*envelope.OK {
+			if attempt == 0 && envelope.Code == "stale_catalog" && envelope.Retryable != nil && *envelope.Retryable {
+				remaining = time.Until(deadline)
+				if remaining <= 0 {
+					break
+				}
+				backoff := min(durableRF3ExternalRetryBackoff, remaining)
+				timer := time.NewTimer(backoff)
+				select {
+				case <-t.Context().Done():
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
+					}
+					t.Fatalf("development native SQL read canceled after %d attempts: %v", attempt+1, context.Cause(t.Context()))
+				case <-timer.C:
+				}
+				continue
+			}
+			t.Fatalf("development native SQL read response=%s", response)
+		}
+		if len(envelope.Found) != len(keys) || len(envelope.Documents) != len(keys) {
+			t.Fatalf("development native SQL read response=%s", response)
+		}
+		for index, key := range keys {
+			if !envelope.Found[index] || envelope.Documents[index].ID != key || envelope.Documents[index].Value != uint64(index+1) {
+				t.Fatalf("development native SQL read position=%d key=%q found=%t document=%+v",
+					index, key, envelope.Found[index], envelope.Documents[index])
+			}
+		}
+		if cause := context.Cause(t.Context()); cause != nil {
+			t.Fatalf("development native SQL read canceled after %d attempts: %v", attempt+1, cause)
+		}
+		if remaining := time.Until(deadline); remaining <= 0 {
+			t.Fatalf("development native SQL read exceeded its %s deadline after %d attempts", deadline.Sub(started), attempt+1)
+		}
+		return time.Since(started)
 	}
-	return latency
+	t.Fatalf("development native SQL read stale catalog did not settle within %s", deadline.Sub(started))
+	return 0
 }
 
 func devHotProcessTreeRSS(t testing.TB, root int) uint64 {

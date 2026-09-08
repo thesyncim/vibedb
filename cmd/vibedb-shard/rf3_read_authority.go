@@ -389,6 +389,31 @@ type rf3ReadAuthorityProbeTarget struct {
 	key        rf3ReadAuthorityCacheKey
 	allocation uint64
 	address    string
+	// generation is an in-process registration generation. It is deliberately
+	// separate from the durable allocation so a late probe from a removed
+	// group cannot publish into a same-key group recreated in this process.
+	generation uint64
+}
+
+// rf3ReadAuthorityGroupTargets is the complete, already manifest-validated
+// native roster for one newly serving group. RegisterGroups validates the
+// whole batch before publishing any target or local incarnation.
+type rf3ReadAuthorityGroupTargets struct {
+	group            raftmember.GroupKey
+	allocation       uint64
+	members          []rf3ReadAuthorityProbeTarget
+	localMember      uint64
+	localStore       [16]byte
+	localIncarnation uint64
+}
+
+// rf3ReadAuthorityRegistration is an opaque cache capability. The group and
+// allocation fields are diagnostic identity only; removal requires the exact
+// in-process generation returned by RegisterGroups.
+type rf3ReadAuthorityRegistration struct {
+	group      raftmember.GroupKey
+	allocation uint64
+	generation uint64
 }
 
 type rf3ReadAuthorityGroupMember struct {
@@ -416,18 +441,26 @@ const (
 	rf3ReadAuthorityProbeGroupRefused
 )
 
-// rf3ReadAuthorityIncarnationCache is populated only by authenticated native
-// ReplicatedProbe responses. Runtime callbacks are read-only and never dial or
-// call an Owner; a miss simply keeps ReadIndex as the safe path.
+// rf3ReadAuthorityIncarnationCache retains exact serving targets for the
+// process lifetime. Local values are seeded from the durable Runtime identity;
+// remote values are populated only by authenticated native ReplicatedProbe
+// responses. Runtime callbacks are read-only and never dial or call an Owner;
+// a miss simply keeps ReadIndex as the safe path.
 type rf3ReadAuthorityIncarnationCache struct {
-	mu          sync.RWMutex
-	values      map[rf3ReadAuthorityCacheKey]rf3ReadAuthorityCacheValue
-	targets     map[rf3ReadAuthorityGroupMember]rf3ReadAuthorityProbeTarget
-	connections map[rafttransport.NodeID]*rf3ReadAuthorityProbeConnection
-	profile     *rafttransport.PeerTLS
-	authority   serviceauthz.Authority
-	ttl         time.Duration
-	cursors     map[rafttransport.NodeID]uint32
+	mu             sync.RWMutex
+	values         map[rf3ReadAuthorityCacheKey]rf3ReadAuthorityCacheValue
+	targets        map[rf3ReadAuthorityGroupMember]rf3ReadAuthorityProbeTarget
+	registrations  map[uint64]rf3ReadAuthorityRegistration
+	groups         map[raftmember.GroupKey]uint64
+	nodeAddresses  map[rafttransport.NodeID]string
+	localNode      rafttransport.NodeID
+	nextGeneration uint64
+	closed         bool
+	connections    map[rafttransport.NodeID]*rf3ReadAuthorityProbeConnection
+	profile        *rafttransport.PeerTLS
+	authority      serviceauthz.Authority
+	ttl            time.Duration
+	cursors        map[rafttransport.NodeID]uint32
 	// probeOverride is test-only dependency injection. Production leaves it
 	// nil, which selects the authenticated ReplicatedProbe implementation.
 	probeOverride func(context.Context, rf3ReadAuthorityProbeTarget) bool
@@ -471,18 +504,24 @@ func newRF3ReadAuthorityCache(
 	runtimes []*raftmember.Runtime,
 	localNode rafttransport.NodeID,
 ) (*rf3ReadAuthorityIncarnationCache, error) {
-	if profile == nil || authPolicy == nil || localNode == (rafttransport.NodeID{}) || len(groups) == 0 || len(groups) != len(runtimes) {
+	if profile == nil || authPolicy == nil || localNode == (rafttransport.NodeID{}) ||
+		len(groups) == 0 || len(groups) != len(runtimes) {
 		return nil, errRF3ReadAuthority
 	}
 	cache := &rf3ReadAuthorityIncarnationCache{
-		values:      make(map[rf3ReadAuthorityCacheKey]rf3ReadAuthorityCacheValue),
-		targets:     make(map[rf3ReadAuthorityGroupMember]rf3ReadAuthorityProbeTarget),
-		connections: make(map[rafttransport.NodeID]*rf3ReadAuthorityProbeConnection),
-		cursors:     make(map[rafttransport.NodeID]uint32),
-		profile:     profile, authority: serviceauthz.Authority{Node: profile.LocalIdentity().Node, Generation: authPolicy.Generation()},
-		ttl: rf3ReadAuthorityCacheTTL,
+		values:        make(map[rf3ReadAuthorityCacheKey]rf3ReadAuthorityCacheValue),
+		targets:       make(map[rf3ReadAuthorityGroupMember]rf3ReadAuthorityProbeTarget),
+		registrations: make(map[uint64]rf3ReadAuthorityRegistration),
+		groups:        make(map[raftmember.GroupKey]uint64),
+		nodeAddresses: make(map[rafttransport.NodeID]string, rf3ReadAuthorityCacheEntries),
+		connections:   make(map[rafttransport.NodeID]*rf3ReadAuthorityProbeConnection),
+		cursors:       make(map[rafttransport.NodeID]uint32),
+		localNode:     localNode,
+		profile:       profile,
+		authority:     serviceauthz.Authority{Node: profile.LocalIdentity().Node, Generation: authPolicy.Generation()},
+		ttl:           rf3ReadAuthorityCacheTTL,
 	}
-	nodeAddresses := make(map[rafttransport.NodeID]string, rf3ReadAuthorityCacheEntries)
+	registrations := make([]rf3ReadAuthorityGroupTargets, 0, len(groups))
 	for index := range groups {
 		if runtimes[index] == nil {
 			return nil, errRF3ReadAuthority
@@ -495,53 +534,322 @@ func newRF3ReadAuthorityCache(
 			identity.AllocationGeneration == 0 || identity.NodeIncarnation == 0 {
 			return nil, errRF3ReadAuthority
 		}
-		for _, member := range groups[index].manifest.memberRoster() {
-			if member.MemberID == 0 || member.NodeID == (rafttransport.NodeID{}) || member.StoreID == ([16]byte{}) || member.NativeAddress == "" {
-				return nil, errRF3ReadAuthority
-			}
-			if prior, found := nodeAddresses[member.NodeID]; found && prior != member.NativeAddress {
-				return nil, errRF3ReadAuthority
-			}
-			nodeAddresses[member.NodeID] = member.NativeAddress
-			target := rf3ReadAuthorityProbeTarget{
-				key:        rf3ReadAuthorityCacheKey{group: group, member: member.MemberID, node: member.NodeID, store: member.StoreID, allocation: identity.AllocationGeneration},
-				allocation: identity.AllocationGeneration, address: member.NativeAddress,
-			}
-			lookupKey := rf3ReadAuthorityGroupMember{group: group, member: member.MemberID}
-			if prior, found := cache.targets[lookupKey]; found && prior != target {
-				return nil, errRF3ReadAuthority
-			}
-			if _, found := cache.targets[lookupKey]; !found && len(cache.targets) >= rf3ReadAuthorityCacheEntries {
-				return nil, errRF3ReadAuthority
-			}
-			cache.targets[lookupKey] = target
+		groupTargets, err := rf3ReadAuthorityGroupTargetsForPrepared(groups[index], identity)
+		if err != nil {
+			return nil, err
 		}
-		localKey := rf3ReadAuthorityGroupMember{group: group, member: identity.MemberID}
-		localTarget, found := cache.targets[localKey]
-		if !found || localTarget.key.node != localNode || localTarget.key.store != identity.StoreID {
-			return nil, errRF3ReadAuthority
-		}
-		cache.Put(identity.Group, identity.MemberID, identity.NodeIncarnation)
+		registrations = append(registrations, groupTargets)
+	}
+	if _, err := cache.RegisterGroups(registrations); err != nil {
+		return nil, err
 	}
 	return cache, nil
 }
 
-func (cache *rf3ReadAuthorityIncarnationCache) Put(group raftmember.GroupKey, member, incarnation uint64) {
-	if cache == nil || member == 0 || incarnation == 0 {
-		return
+func rf3ReadAuthorityGroupTargetsForPrepared(
+	item preparedRF3Group, identity raftmember.RuntimeIdentity,
+) (rf3ReadAuthorityGroupTargets, error) {
+	group := identity.Group
+	if item.manifest.Route.Group != group ||
+		item.manifest.Route.AllocationGeneration != identity.AllocationGeneration ||
+		identity.MemberID == 0 || identity.StoreID == ([16]byte{}) ||
+		identity.AllocationGeneration == 0 || identity.NodeIncarnation == 0 {
+		return rf3ReadAuthorityGroupTargets{}, errRF3ReadAuthority
+	}
+	members := item.manifest.memberRoster()
+	if len(members) != rf3ManifestMembers {
+		return rf3ReadAuthorityGroupTargets{}, errRF3ReadAuthority
+	}
+	targets := make([]rf3ReadAuthorityProbeTarget, 0, len(members))
+	for _, member := range members {
+		if member.MemberID == 0 || member.NodeID == (rafttransport.NodeID{}) ||
+			member.StoreID == ([16]byte{}) || member.NativeAddress == "" {
+			return rf3ReadAuthorityGroupTargets{}, errRF3ReadAuthority
+		}
+		targets = append(targets, rf3ReadAuthorityProbeTarget{
+			key: rf3ReadAuthorityCacheKey{
+				group: group, member: member.MemberID, node: member.NodeID,
+				store: member.StoreID, allocation: identity.AllocationGeneration,
+			},
+			allocation: identity.AllocationGeneration,
+			address:    member.NativeAddress,
+		})
+	}
+	return rf3ReadAuthorityGroupTargets{
+		group: group, allocation: identity.AllocationGeneration, members: targets,
+		localMember: identity.MemberID, localStore: identity.StoreID,
+		localIncarnation: identity.NodeIncarnation,
+	}, nil
+}
+
+func (cache *rf3ReadAuthorityIncarnationCache) RegisterGroups(
+	groups []rf3ReadAuthorityGroupTargets,
+) ([]rf3ReadAuthorityRegistration, error) {
+	if cache == nil || len(groups) == 0 ||
+		len(groups) > rf3ReadAuthorityCacheEntries/rf3ManifestMembers {
+		return nil, errRF3ReadAuthority
 	}
 	cache.mu.Lock()
 	defer cache.mu.Unlock()
-	lookupKey := rf3ReadAuthorityGroupMember{group: group, member: member}
-	target, ok := cache.targets[lookupKey]
-	if !ok {
+	if cache.closed {
+		return nil, errRF3ReadAuthority
+	}
+
+	// Work from detached maps until every group has passed validation. This is
+	// what makes a suffix enrollment all-or-nothing even when one target has a
+	// bad store, native endpoint, or local incarnation.
+	nodeAddresses := make(map[rafttransport.NodeID]string, len(cache.nodeAddresses)+len(groups)*rf3ManifestMembers)
+	for node, address := range cache.nodeAddresses {
+		nodeAddresses[node] = address
+	}
+	for _, target := range cache.targets {
+		if prior, found := nodeAddresses[target.key.node]; found && prior != target.address {
+			return nil, errRF3ReadAuthority
+		}
+		nodeAddresses[target.key.node] = target.address
+	}
+	for node, connection := range cache.connections {
+		if connection != nil {
+			if prior, found := nodeAddresses[node]; found && prior != connection.address {
+				return nil, errRF3ReadAuthority
+			}
+			nodeAddresses[node] = connection.address
+		}
+	}
+
+	seenGroups := make(map[raftmember.GroupKey]struct{}, len(groups))
+	seenTargets := 0
+	requestAddresses := make(map[rafttransport.NodeID]string, len(groups)*rf3ManifestMembers)
+	for _, group := range groups {
+		if group.group == (raftmember.GroupKey{}) || group.allocation == 0 ||
+			group.localMember == 0 || group.localStore == ([16]byte{}) ||
+			group.localIncarnation == 0 || len(group.members) != rf3ManifestMembers {
+			return nil, errRF3ReadAuthority
+		}
+		if _, duplicate := seenGroups[group.group]; duplicate {
+			return nil, errRF3ReadAuthority
+		}
+		seenGroups[group.group] = struct{}{}
+		if _, registered := cache.groups[group.group]; registered || cache.hasTargetsForGroupLocked(group.group) {
+			// A registration is immutable. Retrying the exact group after a
+			// failed append must first remove its unpublished registration.
+			return nil, errRF3ReadAuthority
+		}
+		memberIDs := make(map[uint64]struct{}, len(group.members))
+		nodes := make(map[rafttransport.NodeID]struct{}, len(group.members))
+		localFound := false
+		for _, target := range group.members {
+			if target.key.group != group.group || target.key.allocation != group.allocation ||
+				target.allocation != group.allocation || target.key.member == 0 ||
+				target.key.node == (rafttransport.NodeID{}) || target.key.store == ([16]byte{}) ||
+				target.address == "" {
+				return nil, errRF3ReadAuthority
+			}
+			if _, duplicate := memberIDs[target.key.member]; duplicate {
+				return nil, errRF3ReadAuthority
+			}
+			if _, duplicate := nodes[target.key.node]; duplicate {
+				return nil, errRF3ReadAuthority
+			}
+			memberIDs[target.key.member] = struct{}{}
+			nodes[target.key.node] = struct{}{}
+			if target.key.member == group.localMember {
+				if target.key.node != cache.localNode || target.key.store != group.localStore {
+					return nil, errRF3ReadAuthority
+				}
+				localFound = true
+			}
+			if prior, found := nodeAddresses[target.key.node]; found && prior != target.address {
+				return nil, errRF3ReadAuthority
+			}
+			if prior, found := requestAddresses[target.key.node]; found && prior != target.address {
+				return nil, errRF3ReadAuthority
+			}
+			nodeAddresses[target.key.node] = target.address
+			requestAddresses[target.key.node] = target.address
+			seenTargets++
+		}
+		if !localFound || len(memberIDs) != rf3ManifestMembers {
+			return nil, errRF3ReadAuthority
+		}
+	}
+	if len(cache.targets)+seenTargets > rf3ReadAuthorityCacheEntries || len(nodeAddresses) > rf3ReadAuthorityCacheEntries {
+		return nil, errRF3ReadAuthority
+	}
+
+	registrations := make([]rf3ReadAuthorityRegistration, len(groups))
+	// Registration generations are process-local ABA protection. Never wrap
+	// them: reusing an old generation could make a delayed probe or stale
+	// teardown capability match a later registration.
+	if cache.nextGeneration > ^uint64(0)-uint64(len(groups)) {
+		return nil, errRF3ReadAuthority
+	}
+	nextGeneration := cache.nextGeneration
+	for index, group := range groups {
+		for {
+			nextGeneration++
+			if nextGeneration == 0 {
+				continue
+			}
+			if _, used := cache.registrations[nextGeneration]; !used {
+				break
+			}
+		}
+		registrations[index] = rf3ReadAuthorityRegistration{
+			group: group.group, allocation: group.allocation, generation: nextGeneration,
+		}
+	}
+
+	if cache.values == nil {
+		cache.values = make(map[rf3ReadAuthorityCacheKey]rf3ReadAuthorityCacheValue)
+	}
+	if cache.targets == nil {
+		cache.targets = make(map[rf3ReadAuthorityGroupMember]rf3ReadAuthorityProbeTarget)
+	}
+	if cache.registrations == nil {
+		cache.registrations = make(map[uint64]rf3ReadAuthorityRegistration)
+	}
+	if cache.groups == nil {
+		cache.groups = make(map[raftmember.GroupKey]uint64)
+	}
+	cache.nodeAddresses = nodeAddresses
+	now := time.Now()
+	for index, group := range groups {
+		registration := registrations[index]
+		cache.registrations[registration.generation] = registration
+		cache.groups[group.group] = registration.generation
+		for _, original := range group.members {
+			target := original
+			target.generation = registration.generation
+			lookup := rf3ReadAuthorityGroupMember{group: group.group, member: target.key.member}
+			cache.targets[lookup] = target
+			cache.nodeAddresses[target.key.node] = target.address
+			if target.key.member == group.localMember {
+				cache.values[target.key] = rf3ReadAuthorityCacheValue{incarnation: group.localIncarnation, seen: now}
+			}
+		}
+	}
+	cache.nextGeneration = nextGeneration
+	return registrations, nil
+}
+
+func (cache *rf3ReadAuthorityIncarnationCache) hasTargetsForGroupLocked(group raftmember.GroupKey) bool {
+	for lookup := range cache.targets {
+		if lookup.group == group {
+			return true
+		}
+	}
+	return false
+}
+
+func (cache *rf3ReadAuthorityIncarnationCache) RegistrationFor(
+	group raftmember.GroupKey, allocation uint64,
+) (rf3ReadAuthorityRegistration, bool) {
+	if cache == nil {
+		return rf3ReadAuthorityRegistration{}, false
+	}
+	cache.mu.RLock()
+	if cache.closed {
+		cache.mu.RUnlock()
+		return rf3ReadAuthorityRegistration{}, false
+	}
+	generation, found := cache.groups[group]
+	registration, registered := cache.registrations[generation]
+	cache.mu.RUnlock()
+	return registration, found && registered && registration.allocation == allocation
+}
+
+func (cache *rf3ReadAuthorityIncarnationCache) UnregisterGroups(
+	registrations []rf3ReadAuthorityRegistration,
+) error {
+	if cache == nil || len(registrations) == 0 {
+		return errRF3ReadAuthority
+	}
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	if cache.closed {
+		return errRF3ReadAuthority
+	}
+	seen := make(map[uint64]struct{}, len(registrations))
+	for _, registration := range registrations {
+		if registration.group == (raftmember.GroupKey{}) || registration.allocation == 0 ||
+			registration.generation == 0 {
+			return errRF3ReadAuthority
+		}
+		if _, duplicate := seen[registration.generation]; duplicate {
+			return errRF3ReadAuthority
+		}
+		seen[registration.generation] = struct{}{}
+		generation, found := cache.groups[registration.group]
+		current, registered := cache.registrations[registration.generation]
+		if !found || generation != registration.generation || !registered || current != registration {
+			return errRF3ReadAuthority
+		}
+		targetCount := 0
+		for lookup, target := range cache.targets {
+			if lookup.group != registration.group {
+				continue
+			}
+			if target.generation != registration.generation {
+				return errRF3ReadAuthority
+			}
+			targetCount++
+		}
+		if targetCount != rf3ManifestMembers {
+			return errRF3ReadAuthority
+		}
+	}
+	for _, registration := range registrations {
+		for lookup, target := range cache.targets {
+			if lookup.group == registration.group {
+				if target.generation != registration.generation {
+					return errRF3ReadAuthority
+				}
+				delete(cache.values, target.key)
+				delete(cache.targets, lookup)
+			}
+		}
+		delete(cache.groups, registration.group)
+		delete(cache.registrations, registration.generation)
+	}
+	return nil
+}
+
+func (cache *rf3ReadAuthorityIncarnationCache) putValueLocked(
+	key rf3ReadAuthorityCacheKey, incarnation uint64, seen time.Time,
+) {
+	if incarnation == 0 {
 		return
 	}
-	prior, exists := cache.values[target.key]
+	if cache.values == nil {
+		cache.values = make(map[rf3ReadAuthorityCacheKey]rf3ReadAuthorityCacheValue)
+	}
+	prior, exists := cache.values[key]
 	if exists && incarnation < prior.incarnation {
 		return
 	}
-	cache.values[target.key] = rf3ReadAuthorityCacheValue{incarnation: incarnation, seen: time.Now()}
+	cache.values[key] = rf3ReadAuthorityCacheValue{incarnation: incarnation, seen: seen}
+}
+
+// putProbe is the only production path that publishes a remote incarnation.
+// The target must still be the exact registration captured before dialing.
+func (cache *rf3ReadAuthorityIncarnationCache) putProbe(
+	target rf3ReadAuthorityProbeTarget, incarnation uint64,
+) bool {
+	if cache == nil || incarnation == 0 {
+		return false
+	}
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	if cache.closed {
+		return false
+	}
+	current, ok := cache.targets[rf3ReadAuthorityGroupMember{group: target.key.group, member: target.key.member}]
+	if !ok || current != target {
+		return false
+	}
+	cache.putValueLocked(target.key, incarnation, time.Now())
+	return true
 }
 
 func (cache *rf3ReadAuthorityIncarnationCache) Lookup(group raftmember.GroupKey, member uint64) (uint64, bool, error) {
@@ -549,6 +857,10 @@ func (cache *rf3ReadAuthorityIncarnationCache) Lookup(group raftmember.GroupKey,
 		return 0, false, nil
 	}
 	cache.mu.RLock()
+	if cache.closed {
+		cache.mu.RUnlock()
+		return 0, false, nil
+	}
 	lookupKey := rf3ReadAuthorityGroupMember{group: group, member: member}
 	target, ok := cache.targets[lookupKey]
 	value := cache.values[target.key]
@@ -566,6 +878,16 @@ func (cache *rf3ReadAuthorityIncarnationCache) Lookup(group raftmember.GroupKey,
 func (cache *rf3ReadAuthorityIncarnationCache) connection(target rf3ReadAuthorityProbeTarget) *rf3ReadAuthorityProbeConnection {
 	cache.mu.Lock()
 	defer cache.mu.Unlock()
+	if cache.closed {
+		return nil
+	}
+	current, found := cache.targets[rf3ReadAuthorityGroupMember{group: target.key.group, member: target.key.member}]
+	if !found || current != target {
+		return nil
+	}
+	if cache.connections == nil {
+		cache.connections = make(map[rafttransport.NodeID]*rf3ReadAuthorityProbeConnection)
+	}
 	entry := cache.connections[target.key.node]
 	if entry != nil && entry.address != target.address {
 		// One authenticated connection is shared per physical peer. A manifest
@@ -637,7 +959,14 @@ func (cache *rf3ReadAuthorityIncarnationCache) probeResult(
 		entry.conn = nil
 		return rf3ReadAuthorityProbeTransportFailure
 	}
-	cache.Put(target.key.group, target.key.member, response.State.Fence.NodeIncarnation)
+	// A response may race retirement and same-key recreation. Never publish
+	// through the mutable group/member lookup in that case.
+	if !cache.putProbe(target, response.State.Fence.NodeIncarnation) {
+		// The authenticated exchange itself succeeded. Treat the now-stale
+		// target as completed work so one retired group cannot stop refresh for
+		// other groups sharing this physical peer.
+		return rf3ReadAuthorityProbeSuccess
+	}
 	return rf3ReadAuthorityProbeSuccess
 }
 
@@ -786,11 +1115,19 @@ func (cache *rf3ReadAuthorityIncarnationCache) Close() error {
 	if cache == nil {
 		return nil
 	}
-	if cache.cancel != nil {
-		cache.cancel()
+	cache.mu.Lock()
+	if cache.closed {
+		cache.mu.Unlock()
+		return nil
 	}
-	if cache.done != nil {
-		<-cache.done
+	cache.closed = true
+	cancel, done := cache.cancel, cache.done
+	cache.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		<-done
 	}
 	cache.mu.Lock()
 	connections := make([]*rf3ReadAuthorityProbeConnection, 0, len(cache.connections))
@@ -807,6 +1144,59 @@ func (cache *rf3ReadAuthorityIncarnationCache) Close() error {
 		entry.mu.Unlock()
 	}
 	return nil
+}
+
+func newRF3ReadAuthorityClock() (*raftauthority.CheckedClock, error) {
+	source, err := raftauthority.NewQualifiedElapsedClock()
+	if err != nil {
+		return nil, err
+	}
+	clock := raftauthority.NewCheckedClock(source)
+	if _, err := clock.Now(); err != nil {
+		return nil, err
+	}
+	return clock, nil
+}
+
+func configureRF3ReadAuthorityGroup(
+	manifest rf3Manifest, item preparedRF3Group, runtime *raftmember.Runtime,
+	cache *rf3ReadAuthorityIncarnationCache,
+) (rf3ReadAuthorityRegistration, error) {
+	if cache == nil || manifest.ReadAuthority == nil || runtime == nil {
+		return rf3ReadAuthorityRegistration{}, errRF3ReadAuthority
+	}
+	policy, err := manifest.ReadAuthority.rf3Policy()
+	if err != nil {
+		return rf3ReadAuthorityRegistration{}, err
+	}
+	clock, err := newRF3ReadAuthorityClock()
+	if err != nil {
+		return rf3ReadAuthorityRegistration{}, err
+	}
+	if err := ensureRF3ReadAuthorityState(item.manifest.Route.MemberRoot, policy); err != nil {
+		return rf3ReadAuthorityRegistration{}, err
+	}
+	identity := runtime.Identity()
+	targets, err := rf3ReadAuthorityGroupTargetsForPrepared(item, identity)
+	if err != nil {
+		return rf3ReadAuthorityRegistration{}, err
+	}
+	registrations, err := cache.RegisterGroups([]rf3ReadAuthorityGroupTargets{targets})
+	if err != nil {
+		return rf3ReadAuthorityRegistration{}, err
+	}
+	registration := registrations[0]
+	if err := runtime.ConfigureReadAuthority(raftmember.ReadAuthorityOptions{
+		Policy: policy, Clock: clock,
+		LeaderIncarnation: func(memberID uint64) (uint64, bool, error) {
+			return cache.Lookup(identity.Group, memberID)
+		},
+	}); err != nil {
+		return rf3ReadAuthorityRegistration{}, errors.Join(
+			err, cache.UnregisterGroups([]rf3ReadAuthorityRegistration{registration}),
+		)
+	}
+	return registration, nil
 }
 
 func configureRF3ReadAuthorities(
@@ -849,17 +1239,11 @@ func configureRF3ReadAuthorities(
 	// partial enrollment can be mistaken for a completed voter rollout.
 	clocks := make([]*raftauthority.CheckedClock, len(runtimes))
 	for index := range clocks {
-		var source raftauthority.ElapsedClock
-		source, err = raftauthority.NewQualifiedElapsedClock()
-		if err != nil {
-			_ = cache.Close()
-			return nil, nil, err
-		}
 		// Linux construction is intentionally cheap and the CLOCK_BOOTTIME
 		// syscall occurs on Now. Exercise every source before the first marker
 		// write, then reuse the initialized checked clock for Runtime startup.
-		clocks[index] = raftauthority.NewCheckedClock(source)
-		if _, err = clocks[index].Now(); err != nil {
+		clocks[index], err = newRF3ReadAuthorityClock()
+		if err != nil {
 			_ = cache.Close()
 			return nil, nil, err
 		}

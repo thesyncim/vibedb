@@ -1291,7 +1291,7 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 				})
 				continue
 			case <-manifest.reloadSignals:
-				if err := reloadPreparedRF3Groups(parent, &manifest, profile, peer, adoptedInventory, schemaActivator, nodeOwner); err != nil {
+				if err := reloadPreparedRF3Groups(parent, &manifest, profile, peer, adoptedInventory, schemaActivator, readAuthorityCache, nodeOwner); err != nil {
 					fmt.Fprintf(os.Stderr, "RF3 prepared group reload refused: %v\n", err)
 				}
 				continue

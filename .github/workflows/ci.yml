@@ -252,7 +252,7 @@ jobs:
             -run '^(TestStandardClusterDevRejectsReadAuthorityBeforeCreatingRoot|TestDefaultResumeAcceptsOpaqueArtifactButRejectsEnabledSection|TestStandardPhysicalManifestRejectsEnabledSectionBeforeRewrite|TestDevClusterManifestResumeIsCanonicalAndDoesNotReprovision)$' \
             ./cmd/vibedb
           go test -count=1 -timeout=5m \
-            -run '^(TestStandardShardRejectsEnabledReadAuthorityBeforeRuntime|TestStandardOmittedPolicyStillRefusesEnrolledMarker)$' \
+            -run '^(TestStandardShardRejectsEnabledReadAuthorityBeforeRuntime|TestStandardOmittedPolicyStillRefusesEnrolledMarker|TestRF3ReloadDefaultOffMarkerRejectedBeforePreparation)$' \
             ./cmd/vibedb-shard
       - name: Explicit laboratory protocol and reconciliation checks
         run: |
@@ -260,6 +260,12 @@ jobs:
           go test -tags=vibedb_rf3_read_authority_lab -count=1 -timeout=10m \
             -run '^TestRF3ReadAuthority|^TestDev(ReadAuthority|PhysicalReadAuthority)' \
             ./cmd/vibedb ./cmd/vibedb-shard
+      - name: Explicit laboratory live group enrollment and retained restart
+        run: |
+          set -euo pipefail
+          go test -tags=vibedb_rf3_read_authority_lab -count=1 -timeout=3m \
+            -run '^TestServeRF3ReadAuthorityLiveAppendAndRetainedRestart$' \
+            ./cmd/vibedb-shard
       - name: Save Go build cache
         if: ${{ always() && steps.go.outputs.cache-key != '' && steps.go.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4

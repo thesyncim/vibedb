@@ -1362,8 +1362,23 @@ func hotMutationDialGateway(t *testing.T, profile *rafttransport.PeerTLS,
 }
 
 func (client *hotMutationWireClient) roundTrip(t *testing.T, request []byte) ([]byte, time.Duration) {
+	return client.roundTripWithin(t, request, 8*time.Second)
+}
+
+func (client *hotMutationWireClient) roundTripWithin(
+	t testing.TB, request []byte, timeout time.Duration,
+) ([]byte, time.Duration) {
+	return client.roundTripUntil(t, request, time.Now().Add(timeout))
+}
+
+func (client *hotMutationWireClient) roundTripUntil(
+	t testing.TB, request []byte, deadline time.Time,
+) ([]byte, time.Duration) {
 	t.Helper()
-	if err := client.connection.SetDeadline(time.Now().Add(8 * time.Second)); err != nil {
+	if client == nil || client.connection == nil || len(request) == 0 || !deadline.After(time.Now()) {
+		t.Fatal("invalid hot shard round trip")
+	}
+	if err := client.connection.SetDeadline(deadline); err != nil {
 		t.Fatal(err)
 	}
 	started := time.Now()
