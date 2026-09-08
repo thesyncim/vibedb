@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"sync/atomic"
 	"time"
 
@@ -131,6 +134,36 @@ type rf3DiagnosticAuthorityGroup struct {
 	Promise              rf3DiagnosticAuthorityPromise         `json:"promise"`
 	Holder               rf3DiagnosticAuthorityHolder          `json:"holder"`
 	Gate                 rf3DiagnosticAuthorityGate            `json:"gate"`
+}
+
+// rf3DiagnosticResourceCollection is one detached durable collection cut. The
+// aggregate counters below remain the compatibility summary; this bounded list
+// keeps collection boundaries visible when a terminal memory cut needs to
+// distinguish live durable resources from process heap memory.
+type rf3DiagnosticResourceCollection struct {
+	Group           rf3DiagnosticAuthorityGroupIdentity `json:"group"`
+	Collection      string                              `json:"collection"`
+	RelationOrdinal int                                 `json:"relation_ordinal"`
+
+	// ResidentBytes is the durable store's logical live-resource accounting; it
+	// is not an operating-system resident-memory measurement.
+	ResidentBytes                uint64 `json:"resident_bytes"`
+	CommitCapacityBytes          uint64 `json:"commit_capacity_bytes"`
+	SnapshotCapacity             uint64 `json:"snapshot_capacity"`
+	ActiveSnapshots              uint64 `json:"active_snapshots"`
+	OldestSnapshotGeneration     uint64 `json:"oldest_snapshot_generation"`
+	OldestSnapshotAgeGenerations uint64 `json:"oldest_snapshot_age_generations"`
+	FreeScratchCapacityBytes     uint64 `json:"free_scratch_capacity_bytes"`
+	FreeScratchExternalBytes     uint64 `json:"free_scratch_external_bytes"`
+	FreeScratchLiveBytes         uint64 `json:"free_scratch_live_bytes"`
+}
+
+type rf3DiagnosticRuntimeMemStats struct {
+	HeapAlloc    uint64 `json:"heap_alloc"`
+	HeapInuse    uint64 `json:"heap_inuse"`
+	HeapIdle     uint64 `json:"heap_idle"`
+	HeapReleased uint64 `json:"heap_released"`
+	Sys          uint64 `json:"sys"`
 }
 
 // rf3AuthorityDiagnostics groups the bounded authority cuts passed into one
@@ -464,6 +497,9 @@ type rf3DiagnosticSnapshot struct {
 	ResourceStatsAvailable                bool                                  `json:"resource_stats_available"`
 	ResourceStatsCoveredGroups            uint64                                `json:"resource_stats_covered_groups"`
 	ResourceStatsFailures                 uint64                                `json:"resource_stats_failures"`
+	ResourceCollectionsAvailable          bool                                  `json:"resource_collections_available"`
+	ResourceCollectionsTruncated          bool                                  `json:"resource_collections_truncated"`
+	ResourceCollections                   []rf3DiagnosticResourceCollection     `json:"resource_collections,omitempty"`
 	AutomaticCheckpoints                  uint64                                `json:"automatic_checkpoints"`
 	RetirementPressureCheckpoints         uint64                                `json:"retirement_pressure_checkpoints"`
 	DirtyBytes                            uint64                                `json:"dirty_bytes"`
@@ -483,6 +519,9 @@ type rf3DiagnosticSnapshot struct {
 	PrimaryOverlayRetainedRecords         uint64                                `json:"primary_overlay_retained_records"`
 	PrimaryOverlayDirtyBuckets            uint64                                `json:"primary_overlay_dirty_buckets"`
 	PrimaryOverlayReservedFoldBytes       uint64                                `json:"primary_overlay_reserved_fold_bytes"`
+
+	RuntimeMemStatsAvailable bool                         `json:"runtime_memstats_available"`
+	RuntimeMemStats          rf3DiagnosticRuntimeMemStats `json:"runtime_memstats"`
 }
 
 type rf3DiagnosticApply interface {
@@ -495,6 +534,8 @@ type rf3DiagnosticResourceTotals struct {
 	groups                                map[raftmember.GroupKey]rf3DiagnosticApply
 	expected                              map[raftmember.GroupKey]struct{}
 	overflow                              bool
+	collections                           []rf3DiagnosticResourceCollection
+	collectionsTruncated                  bool
 	automaticCheckpoints                  uint64
 	retirementPressureCheckpoints         uint64
 	dirtyBytes                            uint64
@@ -512,6 +553,8 @@ type rf3DiagnosticResourceTotals struct {
 	primaryOverlayDirtyBuckets            uint64
 	primaryOverlayReservedFoldBytes       uint64
 }
+
+const rf3DiagnosticMaxResourceCollections = 64
 
 func addRF3DiagnosticResourceGroup(expected map[raftmember.GroupKey]struct{}, group raftmember.GroupKey) {
 	if group != (raftmember.GroupKey{}) {
@@ -548,6 +591,33 @@ func (totals *rf3DiagnosticResourceTotals) addUint64(target *uint64, value uint6
 		return
 	}
 	*target += value
+}
+
+func (totals *rf3DiagnosticResourceTotals) addCollection(
+	group raftmember.GroupKey,
+	kind string,
+	relationOrdinal int,
+	stats durable.Stats,
+) {
+	if len(totals.collections) < rf3DiagnosticMaxResourceCollections {
+		totals.collections = append(totals.collections, rf3DiagnosticResourceCollection{
+			Group:                        rf3DiagnosticAuthorityGroupIdentityJSON(authorityGroupIdentity(group)),
+			Collection:                   kind,
+			RelationOrdinal:              relationOrdinal,
+			ResidentBytes:                stats.ResidentBytes,
+			CommitCapacityBytes:          stats.CommitCapacityBytes,
+			SnapshotCapacity:             stats.SnapshotCapacity,
+			ActiveSnapshots:              stats.ActiveSnapshots,
+			OldestSnapshotGeneration:     stats.OldestSnapshotGeneration,
+			OldestSnapshotAgeGenerations: stats.OldestSnapshotAgeGenerations,
+			FreeScratchCapacityBytes:     stats.FreeScratchCapacityBytes,
+			FreeScratchExternalBytes:     stats.FreeScratchExternalBytes,
+			FreeScratchLiveBytes:         stats.FreeScratchLiveBytes,
+		})
+	} else {
+		totals.collectionsTruncated = true
+	}
+	totals.add(stats)
 }
 
 func (totals *rf3DiagnosticResourceTotals) failure() {
@@ -589,7 +659,14 @@ func aggregateRF3DiagnosticResources(
 	if inventoryUnavailable {
 		totals.failure()
 	}
+	groups := make([]raftmember.GroupKey, 0, len(expected))
 	for group := range expected {
+		groups = append(groups, group)
+	}
+	sort.Slice(groups, func(left, right int) bool {
+		return rf3DiagnosticGroupLess(groups[left], groups[right])
+	})
+	for _, group := range groups {
 		apply, present := providers[group]
 		if !present || apply == nil {
 			totals.failure()
@@ -602,10 +679,10 @@ func aggregateRF3DiagnosticResources(
 			continue
 		}
 		totals.addUint64(&totals.covered, 1)
-		totals.add(resources.System)
-		totals.add(resources.Capture)
+		totals.addCollection(group, "system", -1, resources.System)
+		totals.addCollection(group, "capture", -1, resources.Capture)
 		for relation := uint16(0); relation < resources.RelationCount; relation++ {
-			totals.add(resources.Relations[relation])
+			totals.addCollection(group, "relation", int(relation), resources.Relations[relation])
 		}
 	}
 	if totals.overflow {
@@ -614,6 +691,53 @@ func aggregateRF3DiagnosticResources(
 	totals.available = len(expected) != 0 && totals.covered == uint64(len(expected)) &&
 		totals.failures == 0 && !totals.overflow
 	return totals
+}
+
+func rf3DiagnosticGroupLess(left, right raftmember.GroupKey) bool {
+	if compared := bytes.Compare(left.ClusterID[:], right.ClusterID[:]); compared != 0 {
+		return compared < 0
+	}
+	if compared := bytes.Compare(left.ClusterIncarnation[:], right.ClusterIncarnation[:]); compared != 0 {
+		return compared < 0
+	}
+	if left.TopologyRecoveryEpoch != right.TopologyRecoveryEpoch {
+		return left.TopologyRecoveryEpoch < right.TopologyRecoveryEpoch
+	}
+	if compared := bytes.Compare(left.ShardIncarnation[:], right.ShardIncarnation[:]); compared != 0 {
+		return compared < 0
+	}
+	return bytes.Compare(left.GroupID[:], right.GroupID[:]) < 0
+}
+
+func applyRF3DiagnosticResourceTotals(snapshot *rf3DiagnosticSnapshot, resources rf3DiagnosticResourceTotals) {
+	if snapshot == nil {
+		return
+	}
+	snapshot.ResourceStatsAvailable = resources.available
+	snapshot.ResourceStatsCoveredGroups = resources.covered
+	snapshot.ResourceStatsFailures = resources.failures
+	snapshot.ResourceCollectionsAvailable = resources.available && !resources.collectionsTruncated && len(resources.collections) != 0
+	snapshot.ResourceCollectionsTruncated = resources.collectionsTruncated
+	snapshot.ResourceCollections = resources.collections
+	snapshot.AutomaticCheckpoints = resources.automaticCheckpoints
+	snapshot.RetirementPressureCheckpoints = resources.retirementPressureCheckpoints
+	snapshot.DirtyBytes = resources.dirtyBytes
+	snapshot.PrimaryOverlayFolds = resources.primaryOverlayFolds
+	snapshot.PrimaryOverlayMaterializationAttempts = resources.primaryOverlayMaterializationAttempts
+	snapshot.PrimaryOverlayMaterializations = resources.primaryOverlayMaterializations
+	snapshot.PrimaryOverlayMaterializationFailures = resources.primaryOverlayMaterializationFailures
+	snapshot.PrimaryOverlayFoldNSCount = resources.primaryOverlayFoldNS.Count
+	snapshot.PrimaryOverlayFoldNSSum = resources.primaryOverlayFoldNS.Sum
+	snapshot.PrimaryOverlayFoldNSMax = resources.primaryOverlayFoldNS.Max
+	snapshot.PrimaryOverlayFoldNSBuckets = resources.primaryOverlayFoldNS.Buckets
+	snapshot.PrimaryOverlayPressureFolds = resources.primaryOverlayPressureFolds
+	snapshot.PrimaryOverlaySnapshotFolds = resources.primaryOverlaySnapshotFolds
+	snapshot.PrimaryOverlayBarrierFolds = resources.primaryOverlayBarrierFolds
+	snapshot.PrimaryOverlayCheckpointFolds = resources.primaryOverlayCheckpointFolds
+	snapshot.PrimaryOverlayArenaBytes = resources.primaryOverlayArenaBytes
+	snapshot.PrimaryOverlayRetainedRecords = resources.primaryOverlayRetainedRecords
+	snapshot.PrimaryOverlayDirtyBuckets = resources.primaryOverlayDirtyBuckets
+	snapshot.PrimaryOverlayReservedFoldBytes = resources.primaryOverlayReservedFoldBytes
 }
 
 type rf3DiagnosticInventorySnapshot struct {
@@ -817,6 +941,13 @@ func emitRF3DiagnosticSnapshotWithResources(
 		RaftProposalEntriesPerReady:     make([]uint64, raftservice.ProposalEntryHistogramBuckets),
 		RaftProposalBytesPerReady:       make([]uint64, raftservice.ProposalBytesHistogramBuckets),
 	}
+	var memory runtime.MemStats
+	runtime.ReadMemStats(&memory)
+	snapshot.RuntimeMemStatsAvailable = true
+	snapshot.RuntimeMemStats = rf3DiagnosticRuntimeMemStats{
+		HeapAlloc: memory.HeapAlloc, HeapInuse: memory.HeapInuse,
+		HeapIdle: memory.HeapIdle, HeapReleased: memory.HeapReleased, Sys: memory.Sys,
+	}
 	resources := collectRF3DiagnosticResources(manifest, prepared, inventory, schemas)
 	// Production manifests always carry nonzero group identities. Preserve the
 	// old declared count for in-memory legacy fixtures that intentionally omit
@@ -825,28 +956,7 @@ func emitRF3DiagnosticSnapshotWithResources(
 	if snapshot.Groups == 0 {
 		snapshot.Groups = len(manifest.groupBundles())
 	}
-	snapshot.ResourceStatsAvailable = resources.available
-	snapshot.ResourceStatsCoveredGroups = resources.covered
-	snapshot.ResourceStatsFailures = resources.failures
-	snapshot.AutomaticCheckpoints = resources.automaticCheckpoints
-	snapshot.RetirementPressureCheckpoints = resources.retirementPressureCheckpoints
-	snapshot.DirtyBytes = resources.dirtyBytes
-	snapshot.PrimaryOverlayFolds = resources.primaryOverlayFolds
-	snapshot.PrimaryOverlayMaterializationAttempts = resources.primaryOverlayMaterializationAttempts
-	snapshot.PrimaryOverlayMaterializations = resources.primaryOverlayMaterializations
-	snapshot.PrimaryOverlayMaterializationFailures = resources.primaryOverlayMaterializationFailures
-	snapshot.PrimaryOverlayFoldNSCount = resources.primaryOverlayFoldNS.Count
-	snapshot.PrimaryOverlayFoldNSSum = resources.primaryOverlayFoldNS.Sum
-	snapshot.PrimaryOverlayFoldNSMax = resources.primaryOverlayFoldNS.Max
-	snapshot.PrimaryOverlayFoldNSBuckets = resources.primaryOverlayFoldNS.Buckets
-	snapshot.PrimaryOverlayPressureFolds = resources.primaryOverlayPressureFolds
-	snapshot.PrimaryOverlaySnapshotFolds = resources.primaryOverlaySnapshotFolds
-	snapshot.PrimaryOverlayBarrierFolds = resources.primaryOverlayBarrierFolds
-	snapshot.PrimaryOverlayCheckpointFolds = resources.primaryOverlayCheckpointFolds
-	snapshot.PrimaryOverlayArenaBytes = resources.primaryOverlayArenaBytes
-	snapshot.PrimaryOverlayRetainedRecords = resources.primaryOverlayRetainedRecords
-	snapshot.PrimaryOverlayDirtyBuckets = resources.primaryOverlayDirtyBuckets
-	snapshot.PrimaryOverlayReservedFoldBytes = resources.primaryOverlayReservedFoldBytes
+	applyRF3DiagnosticResourceTotals(&snapshot, resources)
 	if serial != nil {
 		snapshot.Serial = serial.Add(1)
 	}

@@ -272,9 +272,14 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 	boundsFailed := p99 > 5*time.Second || client.requests > 4_096 || client.bytes > 32<<20 ||
 		rssGrowth > 768<<20 || storageGrowth > 2<<30 ||
 		walGrowth > 1<<30 || networkGrowth > 2<<30
+	// Freeze every original qualification measurement and its bounds decision
+	// before taking the one diagnostic cut. The signal path is deliberately
+	// post-measurement so its synchronous resource and MemStats sampling cannot
+	// affect the measured workload or any bound.
+	captureDevHotPostMeasurement(t, manifest, baselineProcessTree, finalProcessTree,
+		baselineRSS, finalRSS, rssGrowth, p99, client.requests, client.bytes,
+		storageGrowth, walGrowth, networkGrowth, boundsFailed)
 	if boundsFailed {
-		captureDevHotBoundFailure(t, manifest, baselineProcessTree, finalProcessTree,
-			baselineRSS, finalRSS, rssGrowth)
 		t.Fatalf("dev hot split bounds p99=%s requests=%d wire=%d rss_growth=%d storage_growth=%d wal_growth=%d network_growth=%d",
 			p99, client.requests, client.bytes, rssGrowth,
 			storageGrowth, walGrowth, networkGrowth)
@@ -483,17 +488,24 @@ type devHotShardDiagnosticTarget struct {
 	snapshotPath  string
 }
 
-func captureDevHotBoundFailure(
+func captureDevHotPostMeasurement(
 	t testing.TB,
 	manifest devHotProcessManifest,
 	baseline, final devHotProcessTreeRSSSample,
 	baselineRSS, finalRSS, rssGrowth uint64,
+	p99 time.Duration, requests, wireBytes uint64,
+	storageGrowth, walGrowth, networkGrowth uint64,
+	boundsFailed bool,
 ) {
 	t.Helper()
-	// The caller invokes this immediately before the existing fatal bounds
-	// report, while the supervisor and serving children are still running.
-	t.Logf("dev hot bound diagnostic root_pid=%d baseline_rss_bytes=%d final_rss_bytes=%d rss_growth_bytes=%d baseline_owned_processes=%d final_owned_processes=%d",
-		final.rootPID, baselineRSS, finalRSS, rssGrowth, len(baseline.processes), len(final.processes))
+	// The caller invokes this after every original qualification measurement and
+	// its bounds decision have been frozen, while the supervisor and serving
+	// children are still running. This post-measurement cut must never feed back
+	// into the measured workload or its assertions.
+	t.Logf("dev hot post-measurement diagnostic phase=post_measurement bounds_failed=%t root_pid=%d p99=%s requests=%d wire_bytes=%d storage_growth_bytes=%d wal_growth_bytes=%d network_growth_bytes=%d baseline_rss_bytes=%d final_rss_bytes=%d rss_growth_bytes=%d baseline_owned_processes=%d final_owned_processes=%d",
+		boundsFailed, final.rootPID, p99, requests, wireBytes, storageGrowth,
+		walGrowth, networkGrowth, baselineRSS, finalRSS, rssGrowth,
+		len(baseline.processes), len(final.processes))
 	for _, sample := range []struct {
 		name string
 		data devHotProcessTreeRSSSample
@@ -502,7 +514,7 @@ func captureDevHotBoundFailure(
 		{name: "final", data: final},
 	} {
 		for _, process := range sample.data.processes {
-			t.Logf("dev hot bound diagnostic ps_sample=%s pid=%d ppid=%d rss_bytes=%d",
+			t.Logf("dev hot post-measurement diagnostic phase=post_measurement ps_sample=%s pid=%d ppid=%d rss_bytes=%d",
 				sample.name, process.pid, process.parent, process.rssBytes)
 		}
 	}
@@ -516,7 +528,7 @@ func captureDevHotBoundFailure(
 			"Shared_Dirty", "Private_Clean", "Private_Dirty", "Referenced",
 			"Anonymous", "AnonHugePages", "Swap",
 		})
-		t.Logf("dev hot bound diagnostic pid=%d ppid=%d ps_rss_bytes=%d proc_status=%s proc_smaps_rollup=%s",
+		t.Logf("dev hot post-measurement diagnostic phase=post_measurement pid=%d ppid=%d ps_rss_bytes=%d proc_status=%s proc_smaps_rollup=%s",
 			process.pid, process.parent, process.rssBytes, status, smaps)
 	}
 	targets := discoverDevHotShardDiagnostics(t, manifest, final.processes)
@@ -533,17 +545,17 @@ func captureDevHotBoundFailure(
 			)
 			if beforeTruncated || !baseline.headerDecoded {
 				baseline.freshAllowed = false
-				t.Logf("dev hot bound diagnostic shard pid=%d serve_manifest=%q node_log=%q snapshot=%q pre_snapshot_unverified=true pre_snapshot_truncated=%t fresh_allowed=false",
+				t.Logf("dev hot post-measurement diagnostic phase=post_measurement shard pid=%d serve_manifest=%q node_log=%q snapshot=%q pre_snapshot_unverified=true pre_snapshot_truncated=%t fresh_allowed=false",
 					target.pid, target.serveManifest, target.nodeLogPath, target.snapshotPath, beforeTruncated)
 			}
 		}
 		if beforeErr != nil && !baseline.missing {
-			t.Logf("dev hot bound diagnostic shard pid=%d serve_manifest=%q node_log=%q snapshot=%q pre_snapshot_error=%v fresh_allowed=false",
+			t.Logf("dev hot post-measurement diagnostic phase=post_measurement shard pid=%d serve_manifest=%q node_log=%q snapshot=%q pre_snapshot_error=%v fresh_allowed=false",
 				target.pid, target.serveManifest, target.nodeLogPath, target.snapshotPath, beforeErr)
 		}
 		signalErr := syscall.Kill(target.pid, syscall.SIGUSR1)
 		if signalErr != nil {
-			t.Logf("dev hot bound diagnostic shard pid=%d serve_manifest=%q node_log=%q snapshot=%q signal=SIGUSR1 signal_error=%v",
+			t.Logf("dev hot post-measurement diagnostic phase=post_measurement shard pid=%d serve_manifest=%q node_log=%q snapshot=%q signal=SIGUSR1 signal_error=%v",
 				target.pid, target.serveManifest, target.nodeLogPath, target.snapshotPath, signalErr)
 			continue
 		}
@@ -551,11 +563,11 @@ func captureDevHotBoundFailure(
 			target.snapshotPath, baseline, target.pid,
 		)
 		if readErr != nil {
-			t.Logf("dev hot bound diagnostic shard pid=%d serve_manifest=%q node_log=%q snapshot=%q signal=SIGUSR1 fresh=%t verified=%t snapshot_error=%v",
+			t.Logf("dev hot post-measurement diagnostic phase=post_measurement shard pid=%d serve_manifest=%q node_log=%q snapshot=%q signal=SIGUSR1 fresh=%t verified=%t snapshot_error=%v",
 				target.pid, target.serveManifest, target.nodeLogPath, target.snapshotPath, fresh, verified, readErr)
 			continue
 		}
-		t.Logf("dev hot bound diagnostic shard pid=%d serve_manifest=%q node_log=%q snapshot=%q signal=SIGUSR1 fresh=%t verified=%t snapshot_truncated=%t snapshot=%s",
+		t.Logf("dev hot post-measurement diagnostic phase=post_measurement shard pid=%d serve_manifest=%q node_log=%q snapshot=%q signal=SIGUSR1 fresh=%t verified=%t snapshot_truncated=%t snapshot=%s",
 			target.pid, target.serveManifest, target.nodeLogPath, target.snapshotPath, fresh, verified, truncated, strings.TrimSpace(string(snapshot)))
 	}
 }
@@ -624,16 +636,16 @@ func discoverDevHotShardDiagnostics(
 		path := filepath.Join("/proc", strconv.Itoa(process.pid), "cmdline")
 		raw, truncated, err := devHotReadBoundedFile(path, devHotProcReadLimit)
 		if err != nil {
-			t.Logf("dev hot bound diagnostic pid=%d cmdline unavailable: %v", process.pid, err)
+			t.Logf("dev hot post-measurement diagnostic phase=post_measurement pid=%d cmdline unavailable: %v", process.pid, err)
 			continue
 		}
 		if truncated {
-			t.Logf("dev hot bound diagnostic pid=%d cmdline truncated=true", process.pid)
+			t.Logf("dev hot post-measurement diagnostic phase=post_measurement pid=%d cmdline truncated=true", process.pid)
 			continue
 		}
 		argv := devHotProcessArgv(raw)
 		if len(argv) == 0 {
-			t.Logf("dev hot bound diagnostic pid=%d cmdline empty", process.pid)
+			t.Logf("dev hot post-measurement diagnostic phase=post_measurement pid=%d cmdline empty", process.pid)
 			continue
 		}
 		processArgv[process.pid] = argv
@@ -646,32 +658,32 @@ func discoverDevHotShardDiagnostics(
 	}
 	invalid := invalidExpectedManifest || expectedPhysical <= 0 || len(serveManifests) != expectedPhysical
 	if invalidExpectedManifest {
-		t.Logf("dev hot bound diagnostic expected physical serve_manifest missing")
+		t.Logf("dev hot post-measurement diagnostic phase=post_measurement expected physical serve_manifest missing")
 	}
 	if expectedPhysical <= 0 || len(serveManifests) != expectedPhysical {
-		t.Logf("dev hot bound diagnostic expected_physical_manifests=%d discovered=%d",
+		t.Logf("dev hot post-measurement diagnostic phase=post_measurement expected_physical_manifests=%d discovered=%d",
 			expectedPhysical, len(serveManifests))
 	}
 	for _, serveManifest := range serveManifests {
 		raw, truncated, err := devHotReadBoundedFile(serveManifest, devHotServeManifestLimit)
 		if err != nil {
-			t.Logf("dev hot bound diagnostic serve_manifest=%q unavailable: %v", serveManifest, err)
+			t.Logf("dev hot post-measurement diagnostic phase=post_measurement serve_manifest=%q unavailable: %v", serveManifest, err)
 			invalid = true
 			continue
 		}
 		if truncated {
-			t.Logf("dev hot bound diagnostic serve_manifest=%q truncated=true", serveManifest)
+			t.Logf("dev hot post-measurement diagnostic phase=post_measurement serve_manifest=%q truncated=true", serveManifest)
 			invalid = true
 			continue
 		}
 		var encoded devHotServeManifest
 		if err := vibejson.Unmarshal(raw, &encoded); err != nil {
-			t.Logf("dev hot bound diagnostic serve_manifest=%q decode_error=%v", serveManifest, err)
+			t.Logf("dev hot post-measurement diagnostic phase=post_measurement serve_manifest=%q decode_error=%v", serveManifest, err)
 			invalid = true
 			continue
 		}
 		if encoded.NodeLog == nil || encoded.NodeLog.Path == "" {
-			t.Logf("dev hot bound diagnostic serve_manifest=%q node_log unavailable", serveManifest)
+			t.Logf("dev hot post-measurement diagnostic phase=post_measurement serve_manifest=%q node_log unavailable", serveManifest)
 			invalid = true
 			continue
 		}
@@ -683,13 +695,13 @@ func discoverDevHotShardDiagnostics(
 			}
 		}
 		if len(matches) != 1 {
-			t.Logf("dev hot bound diagnostic serve_manifest=%q exact_serve_node_matches=%v want=1", serveManifest, matches)
+			t.Logf("dev hot post-measurement diagnostic phase=post_measurement serve_manifest=%q exact_serve_node_matches=%v want=1", serveManifest, matches)
 			invalid = true
 			continue
 		}
 		pid := matches[0]
 		if prior, duplicate := usedPIDs[pid]; duplicate {
-			t.Logf("dev hot bound diagnostic serve_manifest=%q pid=%d already matched serve_manifest=%q", serveManifest, pid, prior)
+			t.Logf("dev hot post-measurement diagnostic phase=post_measurement serve_manifest=%q pid=%d already matched serve_manifest=%q", serveManifest, pid, prior)
 			invalid = true
 			continue
 		}
@@ -700,7 +712,7 @@ func discoverDevHotShardDiagnostics(
 		})
 	}
 	if invalid || len(targets) != len(serveManifests) {
-		t.Logf("dev hot bound diagnostic shard snapshot collection suppressed expected_manifests=%d matched_targets=%d",
+		t.Logf("dev hot post-measurement diagnostic phase=post_measurement shard snapshot collection suppressed expected_manifests=%d matched_targets=%d",
 			len(serveManifests), len(targets))
 		return nil
 	}

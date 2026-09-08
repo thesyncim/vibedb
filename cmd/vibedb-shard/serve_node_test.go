@@ -203,14 +203,23 @@ func TestRF3DiagnosticSnapshotWritesDurableNodeRootRecord(t *testing.T) {
 	}
 	line := strings.TrimSpace(string(raw))
 	var decoded struct {
-		Event  string `json:"event"`
-		Serial uint64 `json:"serial"`
-		Groups int    `json:"groups"`
+		Event                string `json:"event"`
+		Serial               uint64 `json:"serial"`
+		Groups               int    `json:"groups"`
+		RuntimeMemStatsReady bool   `json:"runtime_memstats_available"`
+		RuntimeMemStats      struct {
+			HeapAlloc    uint64 `json:"heap_alloc"`
+			HeapInuse    uint64 `json:"heap_inuse"`
+			HeapIdle     uint64 `json:"heap_idle"`
+			HeapReleased uint64 `json:"heap_released"`
+			Sys          uint64 `json:"sys"`
+		} `json:"runtime_memstats"`
 	}
 	if err := json.Unmarshal([]byte(line), &decoded); err != nil {
 		t.Fatalf("diagnostic JSON: %v (%q)", err, line)
 	}
-	if decoded.Event != "snapshot" || decoded.Serial != 1 || decoded.Groups != 2 {
+	if decoded.Event != "snapshot" || decoded.Serial != 1 || decoded.Groups != 2 ||
+		!decoded.RuntimeMemStatsReady || decoded.RuntimeMemStats.Sys == 0 {
 		t.Fatalf("diagnostic record = %+v", decoded)
 	}
 	firstSize := len(raw)

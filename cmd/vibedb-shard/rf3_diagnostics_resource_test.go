@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -9,6 +10,8 @@ import (
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/raftservice"
+	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/replication"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibedb/store/durable"
@@ -31,9 +34,18 @@ func rf3DiagnosticTestGroup(id byte) raftmember.GroupKey {
 
 func rf3DiagnosticTestStats(seed uint64) durable.Stats {
 	return durable.Stats{
+		ResidentBytes:                         seed + 101,
+		CommitCapacityBytes:                   seed + 102,
 		AutomaticCheckpoints:                  seed + 14,
 		RetirementPressureCheckpoints:         seed + 15,
 		DirtyBytes:                            seed + 13,
+		SnapshotCapacity:                      seed + 103,
+		ActiveSnapshots:                       seed + 104,
+		OldestSnapshotGeneration:              seed + 105,
+		OldestSnapshotAgeGenerations:          seed + 106,
+		FreeScratchCapacityBytes:              seed + 107,
+		FreeScratchExternalBytes:              seed + 108,
+		FreeScratchLiveBytes:                  seed + 109,
 		PrimaryOverlayFolds:                   seed,
 		PrimaryOverlayMaterializationAttempts: seed + 1,
 		PrimaryOverlayMaterializations:        seed + 2,
@@ -50,6 +62,126 @@ func rf3DiagnosticTestStats(seed uint64) durable.Stats {
 		PrimaryOverlayRetainedRecords:   seed + 10,
 		PrimaryOverlayDirtyBuckets:      seed + 11,
 		PrimaryOverlayReservedFoldBytes: seed + 12,
+	}
+}
+
+func TestRF3DiagnosticResourceCollectionsPreserveMemoryBoundaries(t *testing.T) {
+	first, second := &rf3DiagnosticResourceApply{resources: rf3DiagnosticTestResources(1)},
+		&rf3DiagnosticResourceApply{resources: rf3DiagnosticTestResources(5)}
+	groupOne, groupTwo := rf3DiagnosticTestGroup(1), rf3DiagnosticTestGroup(2)
+	totals := aggregateRF3DiagnosticResources(
+		map[raftmember.GroupKey]struct{}{groupTwo: {}, groupOne: {}},
+		map[raftmember.GroupKey]rf3DiagnosticApply{groupTwo: second, groupOne: first}, false)
+	if !totals.available || totals.collectionsTruncated || len(totals.collections) != 8 {
+		t.Fatalf("collection cut availability=%t truncated=%t count=%d", totals.available,
+			totals.collectionsTruncated, len(totals.collections))
+	}
+	want := []struct {
+		group           raftmember.GroupKey
+		kind            string
+		relationOrdinal int
+		seed            uint64
+	}{
+		{group: groupOne, kind: "system", relationOrdinal: -1, seed: 1},
+		{group: groupOne, kind: "capture", relationOrdinal: -1, seed: 2},
+		{group: groupOne, kind: "relation", relationOrdinal: 0, seed: 3},
+		{group: groupOne, kind: "relation", relationOrdinal: 1, seed: 4},
+		{group: groupTwo, kind: "system", relationOrdinal: -1, seed: 5},
+		{group: groupTwo, kind: "capture", relationOrdinal: -1, seed: 6},
+		{group: groupTwo, kind: "relation", relationOrdinal: 0, seed: 7},
+		{group: groupTwo, kind: "relation", relationOrdinal: 1, seed: 8},
+	}
+	for index, expected := range want {
+		got := totals.collections[index]
+		if got.Group.GroupID != fmt.Sprintf("%032x", expected.group.GroupID) ||
+			got.Collection != expected.kind || got.RelationOrdinal != expected.relationOrdinal ||
+			got.ResidentBytes != expected.seed+101 || got.CommitCapacityBytes != expected.seed+102 ||
+			got.SnapshotCapacity != expected.seed+103 || got.ActiveSnapshots != expected.seed+104 ||
+			got.OldestSnapshotGeneration != expected.seed+105 ||
+			got.OldestSnapshotAgeGenerations != expected.seed+106 ||
+			got.FreeScratchCapacityBytes != expected.seed+107 ||
+			got.FreeScratchExternalBytes != expected.seed+108 ||
+			got.FreeScratchLiveBytes != expected.seed+109 {
+			t.Fatalf("collection[%d]=%+v want group=%+v kind=%q ordinal=%d seed=%d", index, got,
+				expected.group, expected.kind, expected.relationOrdinal, expected.seed)
+		}
+	}
+}
+
+func TestRF3DiagnosticSnapshotIncludesBoundedResourceMemoryCuts(t *testing.T) {
+	group := rf3DiagnosticTestGroup(1)
+	apply := &rf3DiagnosticResourceApply{resources: rf3DiagnosticTestResources(1)}
+	totals := aggregateRF3DiagnosticResources(
+		map[raftmember.GroupKey]struct{}{group: {}},
+		map[raftmember.GroupKey]rf3DiagnosticApply{group: apply}, false)
+	var snapshot rf3DiagnosticSnapshot
+	applyRF3DiagnosticResourceTotals(&snapshot, totals)
+	if !snapshot.ResourceStatsAvailable || !snapshot.ResourceCollectionsAvailable ||
+		snapshot.ResourceCollectionsTruncated || len(snapshot.ResourceCollections) != 4 {
+		t.Fatalf("resource memory cut availability=%t/%t truncated=%t count=%d",
+			snapshot.ResourceStatsAvailable, snapshot.ResourceCollectionsAvailable,
+			snapshot.ResourceCollectionsTruncated, len(snapshot.ResourceCollections))
+	}
+	collection := snapshot.ResourceCollections[2]
+	if collection.Collection != "relation" || collection.RelationOrdinal != 0 ||
+		collection.ResidentBytes != 104 || collection.CommitCapacityBytes != 105 ||
+		collection.SnapshotCapacity != 106 || collection.ActiveSnapshots != 107 ||
+		collection.OldestSnapshotGeneration != 108 ||
+		collection.OldestSnapshotAgeGenerations != 109 ||
+		collection.FreeScratchCapacityBytes != 110 ||
+		collection.FreeScratchExternalBytes != 111 || collection.FreeScratchLiveBytes != 112 {
+		t.Fatalf("relation collection cut=%+v", collection)
+	}
+}
+
+func TestRF3DiagnosticFourGroupSnapshotFitsReaderBound(t *testing.T) {
+	expected := make(map[raftmember.GroupKey]struct{}, 4)
+	providers := make(map[raftmember.GroupKey]rf3DiagnosticApply, 4)
+	for index := range [4]struct{}{} {
+		group := rf3DiagnosticTestGroup(byte(index + 1))
+		expected[group] = struct{}{}
+		providers[group] = &rf3DiagnosticResourceApply{resources: rf3DiagnosticTestResources(uint64(index + 1))}
+	}
+	resources := aggregateRF3DiagnosticResources(expected, providers, false)
+	snapshot := rf3DiagnosticSnapshot{
+		ReadyWaveHistogram:              make([]uint64, raftstore.MaxPersistGroupBatches+1),
+		ReadySeriesHistogram:            make([]uint64, raftstore.MaxReadySeries+1),
+		ReadyDurableHistogram:           make([]uint64, raftstore.MaxReadySeries+1),
+		RaftProposalQueueDepthHistogram: make([]uint64, raftservice.ProposalEntryHistogramBuckets),
+		RaftProposalEntriesPerReady:     make([]uint64, raftservice.ProposalEntryHistogramBuckets),
+		RaftProposalBytesPerReady:       make([]uint64, raftservice.ProposalBytesHistogramBuckets),
+		RuntimeMemStatsAvailable:        true,
+		RuntimeMemStats: rf3DiagnosticRuntimeMemStats{
+			HeapAlloc: ^uint64(0), HeapInuse: ^uint64(0), HeapIdle: ^uint64(0),
+			HeapReleased: ^uint64(0), Sys: ^uint64(0),
+		},
+	}
+	applyRF3DiagnosticResourceTotals(&snapshot, resources)
+	raw, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatalf("encode diagnostic snapshot: %v", err)
+	}
+	if len(raw) > 64<<10 || !snapshot.ResourceStatsAvailable ||
+		!snapshot.ResourceCollectionsAvailable || snapshot.ResourceCollectionsTruncated ||
+		len(snapshot.ResourceCollections) != 16 {
+		t.Fatalf("four-group diagnostic size=%d resource=%t/%t truncated=%t collections=%d",
+			len(raw), snapshot.ResourceStatsAvailable, snapshot.ResourceCollectionsAvailable,
+			snapshot.ResourceCollectionsTruncated, len(snapshot.ResourceCollections))
+	}
+}
+
+func TestRF3DiagnosticResourceCollectionCutIsBounded(t *testing.T) {
+	expected := make(map[raftmember.GroupKey]struct{}, rf3DiagnosticMaxResourceCollections)
+	providers := make(map[raftmember.GroupKey]rf3DiagnosticApply, rf3DiagnosticMaxResourceCollections)
+	for index := 1; index <= rf3DiagnosticMaxResourceCollections; index++ {
+		group := rf3DiagnosticTestGroup(byte(index))
+		expected[group] = struct{}{}
+		providers[group] = &rf3DiagnosticResourceApply{resources: rf3DiagnosticTestResources(uint64(index))}
+	}
+	totals := aggregateRF3DiagnosticResources(expected, providers, false)
+	if !totals.available || !totals.collectionsTruncated || len(totals.collections) != rf3DiagnosticMaxResourceCollections {
+		t.Fatalf("bounded collection cut available=%t truncated=%t count=%d", totals.available,
+			totals.collectionsTruncated, len(totals.collections))
 	}
 }
 
