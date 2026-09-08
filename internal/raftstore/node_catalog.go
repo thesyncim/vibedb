@@ -310,9 +310,29 @@ func (s *NodeStore) ReclaimDeadNodeLogPrefix() error {
 	return engine.ReclaimDeadPrefix()
 }
 
-// MaintainNodeLog checkpoints a changed descriptor catalog, then starts one
+// StartReclaimDeadNodeLogPrefix queues a bounded reclaim pass without waiting
+// for checkpoint publication or physical cleanup. The node checkpoint
+// coordinator uses this form so application snapshot captures can continue.
+func (s *NodeStore) StartReclaimDeadNodeLogPrefix() error {
+	if s == nil {
+		return ErrInvalid
+	}
+	s.mu.Lock()
+	if err := s.usable(); err != nil {
+		s.mu.Unlock()
+		return err
+	}
+	s.maintenance.Add(1)
+	engine := s.engine
+	s.mu.Unlock()
+	defer s.maintenance.Done()
+	return engine.StartReclaimDeadPrefix()
+}
+
+// MaintainNodeLog checkpoints a changed descriptor catalog, then queues one
 // bounded node-log reclamation pass. The checkpoint coordinator owns this
-// call; the submission worker cannot wait for a catalog wave it submits.
+// call; the submission worker cannot wait for a catalog wave it submits, and
+// the coordinator must remain available for application snapshot captures.
 func (q *NodeSubmissionSequencer) MaintainNodeLog() error {
 	if q == nil || q.store == nil || q.closed.Load() {
 		return ErrClosed
@@ -341,7 +361,7 @@ func (q *NodeSubmissionSequencer) MaintainNodeLog() error {
 			return err
 		}
 	}
-	err := s.ReclaimDeadNodeLogPrefix()
+	err := s.StartReclaimDeadNodeLogPrefix()
 	if errors.Is(err, seglog.ErrBounds) {
 		if failure := s.coordinateReadError(); failure != nil {
 			return failure

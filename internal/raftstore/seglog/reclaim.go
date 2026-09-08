@@ -86,6 +86,26 @@ func (e *Engine) ReclaimDeadPrefix() error {
 	}
 }
 
+// StartReclaimDeadPrefix schedules one bounded reclamation pass and returns as
+// soon as the serial maintenance worker accepts it. Physical cleanup and its
+// durable completion remain owned by the engine workers.
+func (e *Engine) StartReclaimDeadPrefix() error {
+	if e == nil || e.reclaimRequests == nil || e.sealStop == nil {
+		return ErrRaftState
+	}
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+	if e.closing {
+		return os.ErrClosed
+	}
+	select {
+	case e.reclaimRequests <- reclaimRequest{}:
+		return nil
+	default:
+		return ErrBackpressure
+	}
+}
+
 func (e *Engine) beginReclaim() (*reclaimTicket, error) {
 	e.writeMu.Lock()
 	if e.sealPending {

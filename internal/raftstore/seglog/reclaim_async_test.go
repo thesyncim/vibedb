@@ -28,6 +28,55 @@ func waitReclaimTicket(t *testing.T, ticket *reclaimTicket) error {
 	}
 }
 
+func TestStartReclaimDeadPrefixReturnsBeforePhysicalCleanup(t *testing.T) {
+	oldMin, oldMax, oldBeforeRemove := reclaimMinSegments, reclaimMaxSegments, reclaimBeforeRemove
+	t.Cleanup(func() { reclaimMinSegments, reclaimMaxSegments, reclaimBeforeRemove = oldMin, oldMax, oldBeforeRemove })
+	reclaimMinSegments, reclaimMaxSegments = 2, 2
+	dir := t.TempDir()
+	e, removed, _ := newReclaimableEngine(t, dir)
+	defer e.Close()
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	target := segmentPath(dir, removed[0].FileID)
+	reclaimBeforeRemove = func(path string) {
+		if path == target {
+			close(entered)
+			<-release
+		}
+	}
+	result := make(chan error, 1)
+	go func() { result <- e.StartReclaimDeadPrefix() }()
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		close(release)
+		t.Fatal("reclaim scheduling waited for physical cleanup")
+	}
+	waitReclaimSignal(t, entered, "physical cleanup")
+	close(release)
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		e.writeMu.Lock()
+		done, cleanupErr := e.cleanupTicket == nil && e.log.metadata.slot.ReclaimPhase == reclaimNone, e.cleanupErr
+		e.writeMu.Unlock()
+		if cleanupErr != nil {
+			t.Fatal(cleanupErr)
+		}
+		if done {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for scheduled reclaim")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func TestAsyncReclaimDetachesReadersAndAllowsRotation(t *testing.T) {
 	oldMin, oldMax, oldBeforeRemove := reclaimMinSegments, reclaimMaxSegments, reclaimBeforeRemove
 	t.Cleanup(func() { reclaimMinSegments, reclaimMaxSegments, reclaimBeforeRemove = oldMin, oldMax, oldBeforeRemove })

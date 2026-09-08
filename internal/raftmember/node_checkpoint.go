@@ -88,6 +88,21 @@ func (c *NodeCheckpointCoordinator) run() {
 	}()
 	wake := c.sequencer.NodeMaintenanceWake()
 	for {
+		// Snapshot capture is the coordinator's latency-sensitive responsibility.
+		// Drain an already queued capture before selecting another coalesced
+		// maintenance edge or retry.
+		select {
+		case task, ok := <-c.queue:
+			if !ok {
+				for task := range c.queue {
+					c.process(task)
+				}
+				return
+			}
+			c.process(task)
+			continue
+		default:
+		}
 		select {
 		case task, ok := <-c.queue:
 			if !ok {
