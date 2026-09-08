@@ -1348,14 +1348,17 @@ func (c *PageCache) evictWindowLocked(start, span int) bool {
 			return false
 		}
 	}
+	complete := true
 	for evicted := 0; evicted < count; evicted++ {
-		// Only transient lock-free validations can race here (all batch
-		// frame locks are held, and c.mu pins writers/dirty): they abort
-		// without locks, so doom-and-continue stays on the historical path.
 		if c.resetExtentLocked(int(c.evictionScratch[evicted])) {
 			c.evictions++
 			continue
 		}
+		// A fast reader can announce a pin after the preflight and before
+		// resetExtentLocked bumps the epoch. Keep the extent doomed for that
+		// reader's eventual release, but report that this window was only
+		// partially evicted so reserveLocked takes its bounded fallback.
+		complete = false
 		doomed := &c.frames[c.evictionScratch[evicted]]
 		doomed.flags.Or(pageCacheFrameDoomed)
 		doomed.referenced.Store(false)
@@ -1363,7 +1366,7 @@ func (c *PageCache) evictWindowLocked(start, span int) bool {
 	for locked := count - 1; locked >= 0; locked-- {
 		c.frames[c.evictionScratch[locked]].lock.Unlock()
 	}
-	return true
+	return complete
 }
 
 func (c *PageCache) reserveClockLocked(span int) (int, bool) {
