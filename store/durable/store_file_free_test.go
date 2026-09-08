@@ -1268,7 +1268,10 @@ func TestFileStoreLongHeldSnapshotCostsBoundedBackpressure(t *testing.T) {
 	}
 	defer file.Close()
 	options := testFileStoreOptions()
-	options.MaxRetiredExtents = 1024
+	// Keep the metadata-pressure fixture below the page-cache limit. The
+	// default test cache can exhaust first (with a held snapshot) before the
+	// configured retirement bound is reached, which is a different contract.
+	options.MaxRetiredExtents = 128
 	fs, err := Create(file, options)
 	if err != nil {
 		t.Fatal(err)
@@ -1364,6 +1367,144 @@ func TestFileStoreLongHeldSnapshotCostsBoundedBackpressure(t *testing.T) {
 		}
 	}
 	assertFreeSetMirror(t, fs, "after the pinned snapshot was released")
+}
+
+// This is the companion to TestFileStoreLongHeldSnapshotCostsBoundedBackpressure:
+// keep the retirement bound above the observed cache working set so the held
+// snapshot reaches the independent page-cache limit first. The rejected Put
+// must not publish or acknowledge its candidate, and releasing the snapshot
+// must make that exact candidate retryable without reopening or reseeding.
+func TestFileStoreLongHeldSnapshotCachePressureIsFailureAtomic(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "free-cache-pressure-snapshot-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	options := testFileStoreOptions()
+	options.MaxRetiredExtents = 1024
+	fs, err := Create(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fs.Close()
+
+	const keys = 16
+	body := strings.Repeat("x", 300)
+	value := func(round int) []byte {
+		return fmt.Appendf(nil, `{"round":%d,"v":%q}`, round, body)
+	}
+	current := make([][]byte, keys)
+	for round := range 40 {
+		for index := range keys {
+			candidate := value(round)
+			created, putErr := fs.Put([]byte(fmt.Sprintf("k%02d", index)), candidate)
+			if putErr != nil || created != (round == 0) {
+				t.Fatalf("warm-up Put round=%d index=%d created=%v err=%v", round, index, created, putErr)
+			}
+			current[index] = candidate
+		}
+	}
+
+	pinned, err := fs.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pinned.Close()
+	snapshotValues := slices.Clone(current)
+	var failure error
+	failedRound, failedIndex := -1, -1
+	var failedCandidate []byte
+	var beforeFailure, afterFailure Stats
+	var beforeFailureState, afterFailureState StateMetrics
+	writes := 0
+	for round := 40; round < 4000 && failure == nil; round++ {
+		for index := range keys {
+			candidate := value(round)
+			before := fs.Stats()
+			beforeState := fs.StateMetrics()
+			created, putErr := fs.Put([]byte(fmt.Sprintf("k%02d", index)), candidate)
+			if putErr != nil {
+				if created {
+					t.Fatalf("cache-pressure failure reported created row at round=%d index=%d", round, index)
+				}
+				failure = putErr
+				failedRound, failedIndex = round, index
+				failedCandidate = candidate
+				beforeFailure = before
+				afterFailure = fs.Stats()
+				beforeFailureState = beforeState
+				afterFailureState = fs.StateMetrics()
+				break
+			}
+			if created {
+				t.Fatalf("replacement unexpectedly created row at round=%d index=%d", round, index)
+			}
+			current[index] = candidate
+			writes++
+		}
+	}
+	if failure == nil {
+		_ = pinned.Close()
+		t.Fatalf("a snapshot pinned for %d writes never reached page-cache pressure", writes)
+	}
+	if !errors.Is(failure, storeio.ErrPageCachePinned) {
+		cache := fs.cache.Stats()
+		t.Fatalf("cache-pressure fixture failed after %d writes with %v; state retired=%d/%d max=%d dirty=%d/%d resident=%d/%d", writes, failure, len(fs.primaryVolatileRetired), cap(fs.primaryVolatileRetired), options.MaxRetiredExtents, cache.DirtyBytes, cache.CapacityBytes, cache.ResidentBytes, cache.CapacityBytes)
+	}
+	if len(fs.primaryVolatileRetired) >= options.MaxRetiredExtents {
+		t.Fatalf("cache-pressure fixture reached retirement policy first: retained=%d max=%d", len(fs.primaryVolatileRetired), options.MaxRetiredExtents)
+	}
+	if afterFailureState.PublishedGeneration != beforeFailureState.PublishedGeneration ||
+		afterFailure.JournalAcks != beforeFailure.JournalAcks ||
+		afterFailure.ChainAcks != beforeFailure.ChainAcks ||
+		afterFailure.JournalStrictSyncs != beforeFailure.JournalStrictSyncs ||
+		afterFailure.JournalStrictRecords != beforeFailure.JournalStrictRecords {
+		_ = pinned.Close()
+		t.Fatalf("cache-pressure failure published or acknowledged a candidate: before=%+v after=%+v", beforeFailure, afterFailure)
+	}
+	verify := func(label string, reader interface {
+		AppendRaw([]byte, []byte) ([]byte, bool, error)
+	}, expected [][]byte) {
+		t.Helper()
+		for index, want := range expected {
+			got, found, readErr := reader.AppendRaw(nil, []byte(fmt.Sprintf("k%02d", index)))
+			if readErr != nil || !found || !bytes.Equal(got, want) {
+				t.Fatalf("%s row=%d got=%q found=%v err=%v want=%q", label, index, got, found, readErr, want)
+			}
+		}
+	}
+	verify("live before release", fs, current)
+	verify("snapshot before release", pinned, snapshotValues)
+
+	if err := pinned.Close(); err != nil {
+		t.Fatal(err)
+	}
+	failedKey := []byte(fmt.Sprintf("k%02d", failedIndex))
+	created, err := fs.Put(failedKey, failedCandidate)
+	if err != nil || created {
+		t.Fatalf("identical retry after snapshot release round=%d index=%d created=%v err=%v", failedRound, failedIndex, created, err)
+	}
+	current[failedIndex] = failedCandidate
+	verify("live after release", fs, current)
+	if err := fs.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	path := file.Name()
+	if err := fs.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopenFile, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopenFile.Close()
+	reopened, err := Open(reopenFile, options)
+	if err != nil {
+		reopenFile.Close()
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	verify("reopen after cache-pressure retry", reopened, current)
 }
 
 func TestFileStoreRetirementOverflowNeverAbandonsSpace(t *testing.T) {
