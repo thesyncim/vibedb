@@ -531,6 +531,7 @@ func TestPrimaryBatchTopologyPacksLongFencesAcrossAnchors(t *testing.T) {
 	options := primaryLargeTopologyOptions(rows)
 	options.MaxKeyBytes = storeio.CommonPrimaryLeafMaxKeyBytes
 	collection, file := openBatchCollection(t, options)
+	beforeStats := collection.Stats()
 	prefix := bytes.Repeat([]byte("p"), 254)
 	err := collection.Update(func(batch *WriteBatch) error {
 		for i := range rows {
@@ -549,6 +550,10 @@ func TestPrimaryBatchTopologyPacksLongFencesAcrossAnchors(t *testing.T) {
 	}
 	if got := collection.Len(); got != rows {
 		t.Fatalf("rows=%d want=%d", got, rows)
+	}
+	if got := collection.Stats().PrimaryTabletRoutingRebuilds -
+		beforeStats.PrimaryTabletRoutingRebuilds; got == 0 {
+		t.Fatal("long-fence batch did not exercise full-tablet routing fallback")
 	}
 	if err := collection.Close(); err != nil {
 		t.Fatal(err)
@@ -572,10 +577,10 @@ func TestPrimaryBatchTopologyPacksLongFencesAcrossAnchors(t *testing.T) {
 // TestPrimaryBatchTopologyShapeSurvivesRejectedLogicalBatch injects a journal
 // failure after the content-equivalent K-way shape has committed but before the
 // logical batch can publish. Advancing the structural generation is legal;
-// exposing even one user row or posting is not. Reopen must recover the empty
-// shaped graph without replaying the rejected batch.
+// exposing even one rejected row or posting is not. Reopen must recover the
+// content-equivalent shaped graph without replaying the rejected batch.
 func TestPrimaryBatchTopologyShapeSurvivesRejectedLogicalBatch(t *testing.T) {
-	const rows = 300
+	const rows = 1024
 	getFault, restore := installJournalFaultSeam(t)
 	defer restore()
 	options := primaryLargeTopologyOptions(rows)
@@ -583,6 +588,11 @@ func TestPrimaryBatchTopologyShapeSurvivesRejectedLogicalBatch(t *testing.T) {
 		{Name: "group", Paths: []string{"/group"}},
 	}
 	collection, file := openBatchCollection(t, options)
+	seedKey := []byte("seed-before-rejected-batch")
+	seedValue := []byte(`{"group":"seed","n":-1}`)
+	if _, err := collection.Put(seedKey, seedValue); err != nil {
+		t.Fatalf("seed before rejected batch: %v", err)
+	}
 	before, err := collection.Snapshot()
 	if err != nil {
 		t.Fatal(err)
@@ -600,9 +610,12 @@ func TestPrimaryBatchTopologyShapeSurvivesRejectedLogicalBatch(t *testing.T) {
 	})
 	err = collection.Update(func(batch *WriteBatch) error {
 		for i := range rows {
+			value := fmt.Appendf(nil, `{"group":"rejected","n":%d,"payload":"`, i)
+			value = appendWideJSONSafePattern(value, 256, i*17+3)
+			value = append(value, `"}`...)
 			if err := batch.Put(
 				[]byte(fmt.Sprintf("reject-%04d", i)),
-				[]byte(fmt.Sprintf(`{"group":"rejected","n":%d}`, i)),
+				value,
 			); err != nil {
 				return err
 			}
@@ -635,8 +648,15 @@ func TestPrimaryBatchTopologyShapeSurvivesRejectedLogicalBatch(t *testing.T) {
 		startStats.PrimaryStructuralRoutingRetiredBytes; got != routingBase {
 		t.Fatalf("rejected batch shape routing retired = %d, want %d", got, routingBase)
 	}
-	if got := collection.Len(); got != 0 {
-		t.Fatalf("rejected logical batch exposed %d rows", got)
+	if got := collection.Len(); got != 1 {
+		t.Fatalf("rejected logical batch changed row count to %d, want seed only", got)
+	}
+	if got, found, readErr := collection.AppendRaw(nil, seedKey); readErr != nil ||
+		!found || !bytes.Equal(got, seedValue) {
+		t.Fatalf("seed after rejected batch = %q,%v,%v", got, found, readErr)
+	}
+	if router := collection.primaryRouter.Load(); router == nil || router.Len() <= 2 {
+		t.Fatalf("rejected batch shape leaves = %v, want K-way shape", router)
 	}
 	oldRows := 0
 	if err := before.RangeRaw(func(_, _ []byte) error {
@@ -645,8 +665,16 @@ func TestPrimaryBatchTopologyShapeSurvivesRejectedLogicalBatch(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if oldRows != 0 {
-		t.Fatalf("old snapshot scanned %d rows, want 0", oldRows)
+	if oldRows != 1 {
+		t.Fatalf("old snapshot scanned %d rows, want seed only", oldRows)
+	}
+	if got, found, readErr := before.AppendRaw(nil, seedKey); readErr != nil ||
+		!found || !bytes.Equal(got, seedValue) {
+		t.Fatalf("old snapshot seed = %q,%v,%v", got, found, readErr)
+	}
+	seedNeedle := primaryExactTestNeedle(t, `"seed"`)
+	if got := primaryExactSnapshotKeys(t, before, "group", seedNeedle); !slices.Equal(got, []string{string(seedKey)}) {
+		t.Fatalf("old snapshot seed postings = %v", got)
 	}
 	needle := primaryExactTestNeedle(t, `"rejected"`)
 	if got := primaryExactSnapshotKeys(t, before, "group", needle); len(got) != 0 {
@@ -668,14 +696,21 @@ func TestPrimaryBatchTopologyShapeSurvivesRejectedLogicalBatch(t *testing.T) {
 	}
 
 	// The one-shot seam is exhausted. Opening the same physical image must select
-	// the durable shape generation and an empty exact index.
+	// the durable shape generation and preserve only the seed exact index entry.
 	reopened, openErr := Open(file, options)
 	if openErr != nil {
 		t.Fatalf("reopen content-equivalent shape: %v", openErr)
 	}
 	defer reopened.Close()
-	if got := reopened.Len(); got != 0 {
-		t.Fatalf("reopened rejected batch rows = %d", got)
+	if got := reopened.Len(); got != 1 {
+		t.Fatalf("reopened rejected batch rows = %d, want seed only", got)
+	}
+	if got, found, readErr := reopened.AppendRaw(nil, seedKey); readErr != nil ||
+		!found || !bytes.Equal(got, seedValue) {
+		t.Fatalf("reopened seed = %q,%v,%v", got, found, readErr)
+	}
+	if got := primaryExactTestKeys(t, reopened, "group", seedNeedle); !slices.Equal(got, []string{string(seedKey)}) {
+		t.Fatalf("reopened seed postings = %v", got)
 	}
 	if got := primaryExactTestKeys(t, reopened, "group", needle); len(got) != 0 {
 		t.Fatalf("reopened rejected postings = %v", got)

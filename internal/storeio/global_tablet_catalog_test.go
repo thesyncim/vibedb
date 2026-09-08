@@ -1424,6 +1424,17 @@ func TestGlobalTabletCatalogLeafPartitionReplacesOneAnchorRow(t *testing.T) {
 
 	duplicate := slices.Clone(replacements)
 	duplicate[2].LocalID = duplicate[1].LocalID
+	duplicateBucket, duplicateOK := MakeTabletLocalIdentityBucket(
+		header.TabletID, uint32(duplicate[2].LocalID),
+	)
+	if !duplicateOK {
+		t.Fatal("duplicate partition bucket")
+	}
+	duplicate[2].Ref.LogicalID, duplicateOK =
+		SegmentedTabletRouterLeafLogicalID(BucketID(duplicateBucket))
+	if !duplicateOK {
+		t.Fatal("duplicate partition logical ID")
+	}
 	destination := bytes.Repeat([]byte{0xa5}, SegmentedTabletRouterAnchorPageBytes)
 	before := bytes.Clone(destination)
 	if _, err := fixture.tablet.InsertLeafPartition(
