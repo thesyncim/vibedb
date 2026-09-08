@@ -404,11 +404,57 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 		restartedClient := &hotMutationWireClient{connection: restartedConnection, reader: bufio.NewReader(restartedConnection)}
 		readOrdinal++
 		devHotReadDocuments(t, restartedClient, readRequest, keys, readOrdinal, readDiagnostic)
-		checkConnection := openDDLWire(t, ctx, pgListen)
-		if result := ddlWireQuery(t, checkConnection, "SELECT id,value,marker FROM dev_hot_online WHERE id='online-1'", true); result.code != "" || len(result.rows) != 1 || strings.Join(result.rows[0], "|") != `"online-1"|7|"after-alter"` {
-			checkConnection.Close()
-			t.Fatalf("post-restart live DDL row oracle: %+v", result)
+		ddlDeadline := time.Now().Add(15 * time.Second)
+		if parentDeadline, ok := ctx.Deadline(); ok && parentDeadline.Before(ddlDeadline) {
+			ddlDeadline = parentDeadline
 		}
+		ddlCtx, cancelDDL := context.WithDeadline(ctx, ddlDeadline)
+		defer cancelDDL()
+		checkConnection := openDDLWire(t, ddlCtx, pgListen)
+		readStarted := time.Now()
+		const liveDDLRead = "SELECT id,value,marker FROM dev_hot_online WHERE id='online-1'"
+		var result ddlWireResult
+		attempts := 0
+		for {
+			if attempts > 0 && !time.Now().Before(ddlDeadline) {
+				_ = checkConnection.Close()
+				t.Fatalf("post-restart live DDL leader readiness deadline exhausted after %d attempts", attempts)
+			}
+			attempts++
+			result = ddlWireQuery(t, checkConnection, liveDDLRead, true)
+			if result.code == "" {
+				if len(result.rows) != 1 || strings.Join(result.rows[0], "|") != `"online-1"|7|"after-alter"` {
+					_ = checkConnection.Close()
+					t.Fatalf("post-restart live DDL row oracle: %+v", result)
+				}
+				break
+			}
+			if result.code != "XX000" || len(result.rows) != 0 ||
+				!strings.Contains(result.message, "no reachable leader") ||
+				!strings.Contains(result.message, "no authenticated replica reported itself as leader") {
+				_ = checkConnection.Close()
+				t.Fatalf("post-restart live DDL row oracle: %+v", result)
+			}
+			remaining := time.Until(ddlDeadline)
+			if remaining <= 0 {
+				_ = checkConnection.Close()
+				t.Fatalf("post-restart live DDL leader readiness deadline exhausted after %d attempts: %+v", attempts, result)
+			}
+			timer := time.NewTimer(min(25*time.Millisecond, remaining))
+			select {
+			case <-ddlCtx.Done():
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				_ = checkConnection.Close()
+				t.Fatalf("post-restart live DDL leader readiness canceled after %d attempts: %v", attempts, context.Cause(ddlCtx))
+			case <-timer.C:
+			}
+		}
+		t.Logf("post-restart live DDL leader readiness: attempts=%d elapsed=%s", attempts, time.Since(readStarted))
 		if err := checkConnection.Close(); err != nil {
 			t.Fatal(err)
 		}
