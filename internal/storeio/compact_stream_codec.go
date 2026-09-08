@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strconv"
 
+	"github.com/pierrec/lz4/v4"
 	"github.com/thesyncim/vibejson"
 )
 
@@ -30,6 +31,7 @@ const (
 	compactStreamDeltaPack
 	compactStreamAlphabet
 	compactStreamRankAffine
+	compactStreamCompressedDictionary
 	compactStreamKindLimit
 	compactDictionaryHashThreshold = 16
 	compactDictionaryScanPreferred = 128
@@ -83,19 +85,25 @@ type compactAlphabetPlan struct {
 // before reusing this workspace for the next column, so one fixed candidate
 // set serves every stream without per-column allocation churn.
 type compactStreamScratch struct {
-	candidates      [8]compactStreamEncoding
-	data            [8][]byte
-	dict            [8][][]byte
-	alphabet        [8][]byte
-	integers        []int64
-	dates           []int32
-	parsed          []uint64
-	dictionaryTable []uint32
-	dictionaryStamp []uint32
-	dictionaryEpoch uint32
-	dictionarySeed  maphash.Seed
-	dictionaryReady bool
+	candidates           [8]compactStreamEncoding
+	data                 [8][]byte
+	dict                 [8][][]byte
+	alphabet             [8][]byte
+	integers             []int64
+	dates                []int32
+	parsed               []uint64
+	dictionaryTable      []uint32
+	dictionaryStamp      []uint32
+	dictionaryEpoch      uint32
+	dictionarySeed       maphash.Seed
+	dictionaryReady      bool
+	compressedDictionary []byte
+	compressedEntries    [][]byte
+	compressor           *lz4.Compressor
+	compressionDisabled  bool
 }
+
+const compactCompressedDictionaryMaxValueBytes = 4 << 10
 
 func (e compactStreamEncoding) encodedBytes() int {
 	n := compactStreamHeader + 2*len(e.dict) + len(e.data)
@@ -147,6 +155,13 @@ func encodeCompactScalarStream(values [][]byte) compactStreamEncoding {
 
 func (s *compactStreamScratch) encode(values [][]byte) compactStreamEncoding {
 	return s.encodeShape(values, nil, 0)
+}
+
+func (s *compactStreamScratch) encodeKeys(values [][]byte) compactStreamEncoding {
+	s.compressionDisabled = true
+	encoded := s.encode(values)
+	s.compressionDisabled = false
+	return encoded
 }
 
 func (s *compactStreamScratch) encodeShape(values [][]byte, ranks []uint16, leafRows int) compactStreamEncoding {
@@ -322,10 +337,70 @@ func (s *compactStreamScratch) finishDictionary(values [][]byte) compactStreamEn
 		}
 	}
 	s.data[0] = data
-	return compactStreamEncoding{
+	raw := compactStreamEncoding{
 		kind: compactStreamDictionary, width: uint8(width), count: len(values),
 		data: data, dict: dictionary,
 	}
+	// Compress only canonical JSON strings and only when the complete stream,
+	// including its unchanged packed IDs and dictionary directory, shrinks by
+	// both 64 bytes and 12.5%. Ordinary short dictionaries retain their exact
+	// historical representation and read cost.
+	for _, value := range dictionary {
+		if s.compressionDisabled || len(value) < 2 ||
+			len(value) > compactCompressedDictionaryMaxValueBytes ||
+			value[0] != '"' || value[len(value)-1] != '"' {
+			return raw
+		}
+	}
+	if len(dictionary) == 0 {
+		return raw
+	}
+	dictionaryBytes := raw.encodedBytes() - compactStreamHeader - 2*len(dictionary) - len(data)
+	if dictionaryBytes < 256 || dictionaryBytes/len(dictionary) < 96 {
+		return raw
+	}
+	maximum := 0
+	for _, value := range dictionary {
+		n := lz4.CompressBlockBound(len(value)) + 11
+		if maximum > int(^uint(0)>>1)-n {
+			return raw
+		}
+		maximum += n
+	}
+	s.compressedDictionary = slices.Grow(s.compressedDictionary[:0], maximum)
+	s.compressedEntries = slices.Grow(s.compressedEntries[:0], len(dictionary))[:0]
+	if s.compressor == nil {
+		s.compressor = new(lz4.Compressor)
+	}
+	for _, value := range dictionary {
+		start := len(s.compressedDictionary)
+		bound := lz4.CompressBlockBound(len(value))
+		tmp := slices.Grow(s.data[1][:0], bound)[:bound]
+		n, err := s.compressor.CompressBlock(value, tmp)
+		if err != nil {
+			return raw
+		}
+		s.data[1] = tmp
+		compressedHeader := 1 + compactUvarintLen(uint64(len(value)))
+		if n == 0 || compressedHeader+n >= 1+len(value) {
+			s.compressedDictionary = append(s.compressedDictionary, 0)
+			s.compressedDictionary = append(s.compressedDictionary, value...)
+		} else {
+			s.compressedDictionary = append(s.compressedDictionary, 1)
+			s.compressedDictionary = binary.AppendUvarint(s.compressedDictionary, uint64(len(value)))
+			s.compressedDictionary = append(s.compressedDictionary, tmp[:n]...)
+		}
+		s.compressedEntries = append(s.compressedEntries, s.compressedDictionary[start:len(s.compressedDictionary)])
+	}
+	compressed := compactStreamEncoding{
+		kind: compactStreamCompressedDictionary, width: uint8(width), count: len(values),
+		data: data, dict: s.compressedEntries,
+	}
+	compressedBytes, rawBytes := compressed.encodedBytes(), raw.encodedBytes()
+	if compressedBytes+64 > rawBytes || compressedBytes > rawBytes-rawBytes/8 {
+		return raw
+	}
+	return compressed
 }
 
 func (s *compactStreamScratch) resetDictionaryTable(entries int) {
@@ -1331,7 +1406,7 @@ func (v compactStreamView) validate() error {
 		return int(n), n <= uint64(^uint(0)>>1)
 	}
 	switch v.kind {
-	case compactStreamDictionary:
+	case compactStreamDictionary, compactStreamCompressedDictionary:
 		if v.dictCount == 0 && v.count != 0 ||
 			v.width != uint8(bits.Len(uint(max(0, v.dictCount-1)))) {
 			return corrupt("dictionary geometry")
@@ -1343,6 +1418,11 @@ func (v compactStreamView) validate() error {
 		for row := 0; row < v.count; row++ {
 			if compactReadBits(v.data, row*int(v.width), int(v.width)) >= uint64(v.dictCount) {
 				return corrupt("dictionary id")
+			}
+		}
+		if v.kind == compactStreamCompressedDictionary {
+			if !v.validateCompressedDictionary() {
+				return corrupt("compressed dictionary entry")
 			}
 		}
 	case compactStreamFront:
@@ -1624,6 +1704,26 @@ func (v compactStreamView) appendValue(dst []byte, row int) ([]byte, bool) {
 			return dst, false
 		}
 		return append(dst, value...), true
+	case compactStreamCompressedDictionary:
+		id := int(compactReadBits(v.data, row*int(v.width), int(v.width)))
+		value, ok := v.dictionaryEntry(id)
+		if !ok {
+			return dst, false
+		}
+		length, compressed, body, valid := compactCompressedDictionaryEntry(value)
+		if !valid || length > compactCompressedDictionaryMaxValueBytes {
+			return dst, false
+		}
+		if !compressed {
+			return append(dst, body...), true
+		}
+		dst = slices.Grow(dst, length)
+		dst = dst[:start+length]
+		n, err := lz4.UncompressBlock(body, dst[start:])
+		if err != nil || n != length {
+			return dst[:start], false
+		}
+		return dst, true
 	case compactStreamFront:
 		block := row / compactStreamRestart
 		cursor := int(binary.LittleEndian.Uint32(v.data[block*4:]))
@@ -2269,6 +2369,32 @@ func (v compactStreamView) countSpellingEqual(
 	case compactStreamDictionary:
 		matched, supported = v.countDictionaryEqual(needle)
 		return matched, scratch, supported
+	case compactStreamCompressedDictionary:
+		id := -1
+		for at := 0; at < v.dictCount; at++ {
+			entry, _ := v.dictionaryEntry(at)
+			length, compressed, body, ok := compactCompressedDictionaryEntry(entry)
+			if !ok || length > compactCompressedDictionaryMaxValueBytes {
+				return 0, scratch, false
+			}
+			if compressed {
+				scratch = slices.Grow(scratch[:0], length)[:length]
+				n, err := lz4.UncompressBlock(body, scratch)
+				if err != nil || n != length {
+					return 0, scratch, false
+				}
+			} else {
+				scratch = append(scratch[:0], body...)
+			}
+			if bytes.Equal(scratch, needle) {
+				id = at
+				break
+			}
+		}
+		if id < 0 {
+			return 0, scratch, true
+		}
+		return countCompactPackedEqual(v.data, v.count, int(v.width), uint64(id)), scratch, true
 	case compactStreamFront:
 		matched, scratch = v.countFrontEqual(needle, scratch, false)
 		return matched, scratch, true
@@ -2302,6 +2428,49 @@ func (v compactStreamView) countSpellingEqual(
 	default:
 		return 0, scratch, false
 	}
+}
+
+func compactCompressedDictionaryEntry(entry []byte) (length int, compressed bool, body []byte, ok bool) {
+	if len(entry) < 1 {
+		return 0, false, nil, false
+	}
+	if entry[0] == 0 {
+		return len(entry) - 1, false, entry[1:], true
+	}
+	if entry[0] != 1 {
+		return 0, false, nil, false
+	}
+	n, consumed, valid := readCompactUvarint(entry[1:])
+	if !valid || n > uint64(^uint(0)>>1) || 1+consumed >= len(entry) {
+		return 0, false, nil, false
+	}
+	return int(n), true, entry[1+consumed:], true
+}
+
+func (v compactStreamView) validateCompressedDictionary() bool {
+	var scratch [compactCompressedDictionaryMaxValueBytes]byte
+	for id := 0; id < v.dictCount; id++ {
+		entry, ok := v.dictionaryEntry(id)
+		if !ok {
+			return false
+		}
+		length, compressed, body, ok := compactCompressedDictionaryEntry(entry)
+		if !ok || length > len(scratch) {
+			return false
+		}
+		decoded := body
+		if compressed {
+			n, err := lz4.UncompressBlock(body, scratch[:length])
+			if err != nil || n != length {
+				return false
+			}
+			decoded = scratch[:length]
+		}
+		if len(decoded) < 2 || decoded[0] != '"' || decoded[len(decoded)-1] != '"' {
+			return false
+		}
+	}
+	return true
 }
 
 // countNumberEqual scans one complete scalar stream with exact JSON decimal

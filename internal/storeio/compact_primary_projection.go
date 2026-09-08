@@ -153,6 +153,17 @@ func compactProjectionValueLen(v compactStreamView, row int) (length, peak int, 
 			return 0, 0, false
 		}
 		return len(value), len(value), true
+	case compactStreamCompressedDictionary:
+		id := int(compactReadBits(v.data, row*int(v.width), int(v.width)))
+		value, ok := v.dictionaryEntry(id)
+		if !ok {
+			return 0, 0, false
+		}
+		length, _, _, valid := compactCompressedDictionaryEntry(value)
+		if !valid || length > compactCompressedDictionaryMaxValueBytes {
+			return 0, 0, false
+		}
+		return length, length, true
 	case compactStreamFront:
 		block := row / compactStreamRestart
 		if block < 0 || block*4+4 > len(v.data) {
