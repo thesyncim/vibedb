@@ -4,16 +4,20 @@ package gatewayruntime
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -43,6 +47,7 @@ type devHotProcessManifest struct {
 	GatewayControl      string                `json:"gateway_control"`
 	Format              uint16                `json:"format"`
 	Nodes               uint8                 `json:"nodes"`
+	PhysicalNodes       uint8                 `json:"physical_nodes,omitempty"`
 	Members             []devHotProcessMember `json:"members"`
 	LedgerMembers       []devHotProcessMember `json:"ledger_members"`
 	DataMembers         []devHotProcessMember `json:"data_members"`
@@ -142,7 +147,10 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 		t.Fatal("zero-config data route missing")
 	}
 
-	baselineRSS := devHotProcessTreeRSS(t, process.PID())
+	// Retain rows from the same two existing ps samples used by the RSS bound;
+	// failure diagnostics must not add a happy-path process probe.
+	baselineProcessTree := devHotProcessTreeSample(t, process.PID())
+	baselineRSS := baselineProcessTree.totalRSS
 	baselineStorage := replicaProcessAllocatedBytes(state, "")
 	baselineWAL := replicaProcessAllocatedBytes(state, ".wal")
 	baselineNetwork := replicaProcessSnapshotPayloadBytes(state)
@@ -255,19 +263,24 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 	latencies = append(latencies, devHotReadDocuments(t, client, readRequest, keys))
 	sort.Slice(latencies, func(left, right int) bool { return latencies[left] < latencies[right] })
 	p99 := latencies[(len(latencies)*99+99)/100-1]
-	finalRSS := devHotProcessTreeRSS(t, process.PID())
+	finalProcessTree := devHotProcessTreeSample(t, process.PID())
+	finalRSS := finalProcessTree.totalRSS
 	storageGrowth := positiveDifference(replicaProcessAllocatedBytes(state, ""), baselineStorage)
 	walGrowth := positiveDifference(replicaProcessAllocatedBytes(state, ".wal"), baselineWAL)
 	networkGrowth := positiveDifference(replicaProcessSnapshotPayloadBytes(state), baselineNetwork)
-	if p99 > 5*time.Second || client.requests > 4_096 || client.bytes > 32<<20 ||
-		positiveDifference(finalRSS, baselineRSS) > 768<<20 || storageGrowth > 2<<30 ||
-		walGrowth > 1<<30 || networkGrowth > 2<<30 {
+	rssGrowth := positiveDifference(finalRSS, baselineRSS)
+	boundsFailed := p99 > 5*time.Second || client.requests > 4_096 || client.bytes > 32<<20 ||
+		rssGrowth > 768<<20 || storageGrowth > 2<<30 ||
+		walGrowth > 1<<30 || networkGrowth > 2<<30
+	if boundsFailed {
+		captureDevHotBoundFailure(t, manifest, baselineProcessTree, finalProcessTree,
+			baselineRSS, finalRSS, rssGrowth)
 		t.Fatalf("dev hot split bounds p99=%s requests=%d wire=%d rss_growth=%d storage_growth=%d wal_growth=%d network_growth=%d",
-			p99, client.requests, client.bytes, positiveDifference(finalRSS, baselineRSS),
+			p99, client.requests, client.bytes, rssGrowth,
 			storageGrowth, walGrowth, networkGrowth)
 	}
 	t.Logf("zero-config hot split: children=%d key_setup=%s p99=%s requests=%d wire=%d rss_growth=%d storage_growth=%d wal_growth=%d network_growth=%d",
-		children, keySetup, p99, client.requests, client.bytes, positiveDifference(finalRSS, baselineRSS),
+		children, keySetup, p99, client.requests, client.bytes, rssGrowth,
 		storageGrowth, walGrowth, networkGrowth)
 }
 
@@ -379,17 +392,24 @@ func devHotReadDocuments(t *testing.T, client *hotMutationWireClient, request []
 	return 0
 }
 
-func devHotProcessTreeRSS(t testing.TB, root int) uint64 {
+type devHotProcessTreeRow struct {
+	pid, parent int
+	rssBytes    uint64
+}
+
+type devHotProcessTreeRSSSample struct {
+	rootPID   int
+	totalRSS  uint64
+	processes []devHotProcessTreeRow
+}
+
+func devHotProcessTreeSample(t testing.TB, root int) devHotProcessTreeRSSSample {
 	t.Helper()
 	raw, err := exec.Command("ps", "-eo", "pid=,ppid=,rss=").Output()
 	if err != nil {
 		t.Fatal(err)
 	}
-	type process struct {
-		pid, parent int
-		rss         uint64
-	}
-	processes := make([]process, 0, 64)
+	processes := make([]devHotProcessTreeRow, 0, 64)
 	for _, line := range strings.Split(string(raw), "\n") {
 		fields := strings.Fields(line)
 		if len(fields) != 3 {
@@ -399,7 +419,7 @@ func devHotProcessTreeRSS(t testing.TB, root int) uint64 {
 		parent, parentErr := strconv.Atoi(fields[1])
 		rss, rssErr := strconv.ParseUint(fields[2], 10, 64)
 		if pidErr == nil && parentErr == nil && rssErr == nil {
-			processes = append(processes, process{pid: pid, parent: parent, rss: rss << 10})
+			processes = append(processes, devHotProcessTreeRow{pid: pid, parent: parent, rssBytes: rss << 10})
 		}
 	}
 	descendants := map[int]struct{}{root: {}}
@@ -415,13 +435,384 @@ func devHotProcessTreeRSS(t testing.TB, root int) uint64 {
 			}
 		}
 	}
+	owned := make([]devHotProcessTreeRow, 0, len(descendants))
 	var total uint64
 	for _, candidate := range processes {
 		if _, found := descendants[candidate.pid]; found {
-			total += candidate.rss
+			total += candidate.rssBytes
+			owned = append(owned, candidate)
 		}
 	}
-	return total
+	sort.Slice(owned, func(left, right int) bool { return owned[left].pid < owned[right].pid })
+	return devHotProcessTreeRSSSample{rootPID: root, totalRSS: total, processes: owned}
+}
+
+const (
+	devHotProcReadLimit       = 64 << 10
+	devHotServeManifestLimit  = 1 << 20
+	devHotSnapshotReadLimit   = 64 << 10
+	devHotSnapshotWaitTimeout = 750 * time.Millisecond
+)
+
+type devHotServeManifest struct {
+	NodeLog *struct {
+		Path string `json:"path"`
+	} `json:"node_log"`
+}
+
+type devHotDiagnosticSnapshotHeader struct {
+	Event  string `json:"event"`
+	Serial uint64 `json:"serial"`
+	PID    int    `json:"pid"`
+}
+
+type devHotDiagnosticSnapshotBaseline struct {
+	raw            []byte
+	available      bool
+	missing        bool
+	freshAllowed   bool
+	header         devHotDiagnosticSnapshotHeader
+	headerDecoded  bool
+	headerVerified bool
+}
+
+type devHotShardDiagnosticTarget struct {
+	pid           int
+	serveManifest string
+	nodeLogPath   string
+	snapshotPath  string
+}
+
+func captureDevHotBoundFailure(
+	t testing.TB,
+	manifest devHotProcessManifest,
+	baseline, final devHotProcessTreeRSSSample,
+	baselineRSS, finalRSS, rssGrowth uint64,
+) {
+	t.Helper()
+	// The caller invokes this immediately before the existing fatal bounds
+	// report, while the supervisor and serving children are still running.
+	t.Logf("dev hot bound diagnostic root_pid=%d baseline_rss_bytes=%d final_rss_bytes=%d rss_growth_bytes=%d baseline_owned_processes=%d final_owned_processes=%d",
+		final.rootPID, baselineRSS, finalRSS, rssGrowth, len(baseline.processes), len(final.processes))
+	for _, sample := range []struct {
+		name string
+		data devHotProcessTreeRSSSample
+	}{
+		{name: "baseline", data: baseline},
+		{name: "final", data: final},
+	} {
+		for _, process := range sample.data.processes {
+			t.Logf("dev hot bound diagnostic ps_sample=%s pid=%d ppid=%d rss_bytes=%d",
+				sample.name, process.pid, process.parent, process.rssBytes)
+		}
+	}
+	for _, process := range final.processes {
+		status := devHotProcFields(process.pid, "status", []string{
+			"Name", "Pid", "PPid", "State", "VmPeak", "VmSize", "VmRSS",
+			"RssAnon", "RssFile", "RssShmem", "Threads",
+		})
+		smaps := devHotProcFields(process.pid, "smaps_rollup", []string{
+			"Rss", "Pss", "Pss_Anon", "Pss_File", "Pss_Shmem", "Shared_Clean",
+			"Shared_Dirty", "Private_Clean", "Private_Dirty", "Referenced",
+			"Anonymous", "AnonHugePages", "Swap",
+		})
+		t.Logf("dev hot bound diagnostic pid=%d ppid=%d ps_rss_bytes=%d proc_status=%s proc_smaps_rollup=%s",
+			process.pid, process.parent, process.rssBytes, status, smaps)
+	}
+	targets := discoverDevHotShardDiagnostics(t, manifest, final.processes)
+	for _, target := range targets {
+		before, beforeTruncated, beforeErr := devHotReadBoundedFile(target.snapshotPath, devHotSnapshotReadLimit)
+		baseline := devHotDiagnosticSnapshotBaseline{
+			raw: before, available: beforeErr == nil,
+			missing:      errors.Is(beforeErr, os.ErrNotExist),
+			freshAllowed: beforeErr == nil || errors.Is(beforeErr, os.ErrNotExist),
+		}
+		if baseline.available {
+			baseline.header, baseline.headerDecoded, baseline.headerVerified = devHotDecodeDiagnosticSnapshotHeader(
+				before, beforeTruncated, target.pid,
+			)
+			if beforeTruncated || !baseline.headerDecoded {
+				baseline.freshAllowed = false
+				t.Logf("dev hot bound diagnostic shard pid=%d serve_manifest=%q node_log=%q snapshot=%q pre_snapshot_unverified=true pre_snapshot_truncated=%t fresh_allowed=false",
+					target.pid, target.serveManifest, target.nodeLogPath, target.snapshotPath, beforeTruncated)
+			}
+		}
+		if beforeErr != nil && !baseline.missing {
+			t.Logf("dev hot bound diagnostic shard pid=%d serve_manifest=%q node_log=%q snapshot=%q pre_snapshot_error=%v fresh_allowed=false",
+				target.pid, target.serveManifest, target.nodeLogPath, target.snapshotPath, beforeErr)
+		}
+		signalErr := syscall.Kill(target.pid, syscall.SIGUSR1)
+		if signalErr != nil {
+			t.Logf("dev hot bound diagnostic shard pid=%d serve_manifest=%q node_log=%q snapshot=%q signal=SIGUSR1 signal_error=%v",
+				target.pid, target.serveManifest, target.nodeLogPath, target.snapshotPath, signalErr)
+			continue
+		}
+		snapshot, fresh, verified, truncated, readErr := devHotWaitForDiagnosticSnapshot(
+			target.snapshotPath, baseline, target.pid,
+		)
+		if readErr != nil {
+			t.Logf("dev hot bound diagnostic shard pid=%d serve_manifest=%q node_log=%q snapshot=%q signal=SIGUSR1 fresh=%t verified=%t snapshot_error=%v",
+				target.pid, target.serveManifest, target.nodeLogPath, target.snapshotPath, fresh, verified, readErr)
+			continue
+		}
+		t.Logf("dev hot bound diagnostic shard pid=%d serve_manifest=%q node_log=%q snapshot=%q signal=SIGUSR1 fresh=%t verified=%t snapshot_truncated=%t snapshot=%s",
+			target.pid, target.serveManifest, target.nodeLogPath, target.snapshotPath, fresh, verified, truncated, strings.TrimSpace(string(snapshot)))
+	}
+}
+
+func devHotProcFields(pid int, name string, fields []string) string {
+	path := filepath.Join("/proc", strconv.Itoa(pid), name)
+	raw, truncated, err := devHotReadBoundedFile(path, devHotProcReadLimit)
+	if err != nil {
+		return fmt.Sprintf("unavailable(%v)", err)
+	}
+	result := devHotSelectProcFields(raw, fields)
+	if result == "" {
+		result = "none"
+	}
+	if truncated {
+		result += ";truncated=true"
+	}
+	return result
+}
+
+func devHotSelectProcFields(raw []byte, fields []string) string {
+	wanted := make(map[string]struct{}, len(fields))
+	for _, field := range fields {
+		wanted[field] = struct{}{}
+	}
+	selected := make([]string, 0, len(fields))
+	for _, line := range strings.Split(string(raw), "\n") {
+		key, _, found := strings.Cut(line, ":")
+		if !found {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		if _, wanted := wanted[key]; wanted {
+			selected = append(selected, strings.TrimSpace(line))
+		}
+	}
+	return strings.Join(selected, ";")
+}
+
+func discoverDevHotShardDiagnostics(
+	t testing.TB,
+	manifest devHotProcessManifest,
+	processes []devHotProcessTreeRow,
+) []devHotShardDiagnosticTarget {
+	t.Helper()
+	// Role members share one serve manifest per physical node. Keep discovery
+	// strict so a diagnostic signal can never be sent to an ambiguous process.
+	serveManifestSet := make(map[string]struct{}, len(manifest.Members)+len(manifest.LedgerMembers)+len(manifest.DataMembers))
+	invalidExpectedManifest := false
+	for _, members := range [][]devHotProcessMember{manifest.Members, manifest.LedgerMembers, manifest.DataMembers} {
+		for _, member := range members {
+			if member.ServeManifest == "" {
+				invalidExpectedManifest = true
+				continue
+			}
+			serveManifestSet[member.ServeManifest] = struct{}{}
+		}
+	}
+	serveManifests := make([]string, 0, len(serveManifestSet))
+	for path := range serveManifestSet {
+		serveManifests = append(serveManifests, path)
+	}
+	sort.Strings(serveManifests)
+	processArgv := make(map[int][]string, len(processes))
+	for _, process := range processes {
+		path := filepath.Join("/proc", strconv.Itoa(process.pid), "cmdline")
+		raw, truncated, err := devHotReadBoundedFile(path, devHotProcReadLimit)
+		if err != nil {
+			t.Logf("dev hot bound diagnostic pid=%d cmdline unavailable: %v", process.pid, err)
+			continue
+		}
+		if truncated {
+			t.Logf("dev hot bound diagnostic pid=%d cmdline truncated=true", process.pid)
+			continue
+		}
+		argv := devHotProcessArgv(raw)
+		if len(argv) == 0 {
+			t.Logf("dev hot bound diagnostic pid=%d cmdline empty", process.pid)
+			continue
+		}
+		processArgv[process.pid] = argv
+	}
+	targets := make([]devHotShardDiagnosticTarget, 0, len(serveManifests))
+	usedPIDs := make(map[int]string, len(serveManifests))
+	expectedPhysical := int(manifest.PhysicalNodes)
+	if expectedPhysical == 0 {
+		expectedPhysical = int(manifest.Nodes)
+	}
+	invalid := invalidExpectedManifest || expectedPhysical <= 0 || len(serveManifests) != expectedPhysical
+	if invalidExpectedManifest {
+		t.Logf("dev hot bound diagnostic expected physical serve_manifest missing")
+	}
+	if expectedPhysical <= 0 || len(serveManifests) != expectedPhysical {
+		t.Logf("dev hot bound diagnostic expected_physical_manifests=%d discovered=%d",
+			expectedPhysical, len(serveManifests))
+	}
+	for _, serveManifest := range serveManifests {
+		raw, truncated, err := devHotReadBoundedFile(serveManifest, devHotServeManifestLimit)
+		if err != nil {
+			t.Logf("dev hot bound diagnostic serve_manifest=%q unavailable: %v", serveManifest, err)
+			invalid = true
+			continue
+		}
+		if truncated {
+			t.Logf("dev hot bound diagnostic serve_manifest=%q truncated=true", serveManifest)
+			invalid = true
+			continue
+		}
+		var encoded devHotServeManifest
+		if err := vibejson.Unmarshal(raw, &encoded); err != nil {
+			t.Logf("dev hot bound diagnostic serve_manifest=%q decode_error=%v", serveManifest, err)
+			invalid = true
+			continue
+		}
+		if encoded.NodeLog == nil || encoded.NodeLog.Path == "" {
+			t.Logf("dev hot bound diagnostic serve_manifest=%q node_log unavailable", serveManifest)
+			invalid = true
+			continue
+		}
+		matches := make([]int, 0, 1)
+		for _, process := range processes {
+			argv, found := processArgv[process.pid]
+			if found && devHotProcessMatchesServeManifest(argv, serveManifest) {
+				matches = append(matches, process.pid)
+			}
+		}
+		if len(matches) != 1 {
+			t.Logf("dev hot bound diagnostic serve_manifest=%q exact_serve_node_matches=%v want=1", serveManifest, matches)
+			invalid = true
+			continue
+		}
+		pid := matches[0]
+		if prior, duplicate := usedPIDs[pid]; duplicate {
+			t.Logf("dev hot bound diagnostic serve_manifest=%q pid=%d already matched serve_manifest=%q", serveManifest, pid, prior)
+			invalid = true
+			continue
+		}
+		usedPIDs[pid] = serveManifest
+		targets = append(targets, devHotShardDiagnosticTarget{
+			pid: pid, serveManifest: serveManifest, nodeLogPath: encoded.NodeLog.Path,
+			snapshotPath: filepath.Join(filepath.Dir(encoded.NodeLog.Path), "rf3-diagnostics.json"),
+		})
+	}
+	if invalid || len(targets) != len(serveManifests) {
+		t.Logf("dev hot bound diagnostic shard snapshot collection suppressed expected_manifests=%d matched_targets=%d",
+			len(serveManifests), len(targets))
+		return nil
+	}
+	return targets
+}
+
+func devHotProcessArgv(raw []byte) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+	parts := bytes.Split(raw, []byte{0})
+	if len(parts) != 0 && len(parts[len(parts)-1]) == 0 {
+		parts = parts[:len(parts)-1]
+	}
+	argv := make([]string, len(parts))
+	for index, part := range parts {
+		argv[index] = string(part)
+	}
+	return argv
+}
+
+func devHotProcessMatchesServeManifest(argv []string, expectedManifest string) bool {
+	if len(argv) < 4 || argv[1] != "serve-node" {
+		return false
+	}
+	found := false
+	for index := 2; index < len(argv); index++ {
+		if argv[index] != "-manifest" {
+			continue
+		}
+		if found || index+1 >= len(argv) || argv[index+1] != expectedManifest {
+			return false
+		}
+		found = true
+		index++
+	}
+	return found
+}
+
+func devHotReadBoundedFile(path string, limit int) ([]byte, bool, error) {
+	if limit <= 0 {
+		return nil, false, fmt.Errorf("invalid read limit=%d", limit)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, false, err
+	}
+	defer file.Close()
+	raw, err := io.ReadAll(io.LimitReader(file, int64(limit)+1))
+	if err != nil {
+		return raw, false, err
+	}
+	if len(raw) > limit {
+		return raw[:limit], true, nil
+	}
+	return raw, false, nil
+}
+
+func devHotDecodeDiagnosticSnapshotHeader(
+	raw []byte, truncated bool, expectedPID int,
+) (devHotDiagnosticSnapshotHeader, bool, bool) {
+	if truncated {
+		return devHotDiagnosticSnapshotHeader{}, false, false
+	}
+	var header devHotDiagnosticSnapshotHeader
+	if json.Unmarshal(raw, &header) != nil {
+		return devHotDiagnosticSnapshotHeader{}, false, false
+	}
+	return header, true, header.Event == "snapshot" && header.PID == expectedPID
+}
+
+func devHotWaitForDiagnosticSnapshot(
+	path string,
+	baseline devHotDiagnosticSnapshotBaseline,
+	expectedPID int,
+) ([]byte, bool, bool, bool, error) {
+	deadline := time.Now().Add(devHotSnapshotWaitTimeout)
+	var latest []byte
+	var latestVerified, latestTruncated, haveLatest bool
+	for {
+		raw, truncated, err := devHotReadBoundedFile(path, devHotSnapshotReadLimit)
+		if err == nil {
+			latest, latestTruncated, haveLatest = raw, truncated, true
+			header, _, verified := devHotDecodeDiagnosticSnapshotHeader(raw, truncated, expectedPID)
+			latestVerified = verified
+			fresh := false
+			if baseline.freshAllowed && verified {
+				switch {
+				case baseline.headerVerified:
+					fresh = header.Serial > baseline.header.Serial
+				case baseline.missing:
+					fresh = true
+				case baseline.available:
+					fresh = !bytes.Equal(raw, baseline.raw)
+				}
+			}
+			if fresh {
+				return raw, true, verified, truncated, nil
+			}
+		}
+		if !time.Now().Before(deadline) {
+			if haveLatest {
+				return latest, false, latestVerified, latestTruncated, nil
+			}
+			if err != nil {
+				return nil, false, false, false, err
+			}
+			return nil, false, false, false, nil
+		}
+		timer := time.NewTimer(10 * time.Millisecond)
+		<-timer.C
+	}
 }
 
 // devHotStableSplitKeys selects two well-separated SABLE bins, then
