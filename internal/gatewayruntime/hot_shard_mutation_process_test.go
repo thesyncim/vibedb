@@ -1341,11 +1341,17 @@ func (client *hotMutationWireClient) roundTrip(t *testing.T, request []byte) ([]
 func (client *hotMutationWireClient) roundTripWithin(
 	t testing.TB, request []byte, timeout time.Duration,
 ) ([]byte, time.Duration) {
+	return client.roundTripUntil(t, request, time.Now().Add(timeout))
+}
+
+func (client *hotMutationWireClient) roundTripUntil(
+	t testing.TB, request []byte, deadline time.Time,
+) ([]byte, time.Duration) {
 	t.Helper()
-	if client == nil || client.connection == nil || len(request) == 0 || timeout <= 0 {
+	if client == nil || client.connection == nil || len(request) == 0 || !deadline.After(time.Now()) {
 		t.Fatal("invalid hot shard round trip")
 	}
-	if err := client.connection.SetDeadline(time.Now().Add(timeout)); err != nil {
+	if err := client.connection.SetDeadline(deadline); err != nil {
 		t.Fatal(err)
 	}
 	started := time.Now()
