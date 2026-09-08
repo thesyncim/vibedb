@@ -582,6 +582,7 @@ type NodeSubmissionSequencer struct {
 	tail submissionRingIndex
 
 	wake             chan struct{}
+	maintenanceWake  chan struct{}
 	drained          chan struct{}
 	done             chan struct{}
 	closed           atomic.Bool
@@ -592,6 +593,7 @@ type NodeSubmissionSequencer struct {
 	wakeMu           sync.Mutex
 	ownerWakes       atomic.Pointer[nodeSequencerWakeSet]
 	maintenanceOwner atomic.Bool
+	maintenanceRetry atomic.Bool
 	capacityWaiters  atomic.Bool
 	stats            nodeSequencerCounters
 
@@ -727,7 +729,7 @@ func NewNodeSubmissionSequencer(store *NodeStore, capacity int) (*NodeSubmission
 	}
 	q := &NodeSubmissionSequencer{
 		store: store, ring: make([]submissionRingSlot, capacity), mask: uint64(capacity - 1),
-		wake: make(chan struct{}, 1), drained: make(chan struct{}), done: make(chan struct{}),
+		wake: make(chan struct{}, 1), maintenanceWake: make(chan struct{}, 1), drained: make(chan struct{}), done: make(chan struct{}),
 	}
 	q.persist = store.persistSequencedWave
 	for i := range q.ring {
@@ -746,6 +748,23 @@ func NewNodeSubmissionSequencer(store *NodeStore, capacity int) (*NodeSubmission
 	store.mu.Unlock()
 	go q.run()
 	return q, nil
+}
+
+func (q *NodeSubmissionSequencer) NodeMaintenanceWake() <-chan struct{} {
+	if q == nil {
+		return nil
+	}
+	return q.maintenanceWake
+}
+
+func (q *NodeSubmissionSequencer) SignalNodeMaintenance() {
+	if q == nil || q.closed.Load() {
+		return
+	}
+	select {
+	case q.maintenanceWake <- struct{}{}:
+	default:
+	}
 }
 
 // Owns reports whether this sequencer is the sole submission owner installed
@@ -927,12 +946,17 @@ func (q *NodeSubmissionSequencer) observeControlPersist(s *Submission) (err erro
 				return ErrCorrupt
 			}
 			s.descriptor = d
+			q.SignalNodeMaintenance()
 		}
 		return registerErr
 	case submissionDescriptorCatalog:
 		return q.store.publishDescriptorCatalogReferenceLocked(s.catalog, true)
 	case submissionCheckpoint:
-		return q.store.publishGroupCheckpointSequenced(s.groups[0], s.snapshot)
+		err = q.store.publishGroupCheckpointSequenced(s.groups[0], s.snapshot)
+		if err == nil {
+			q.SignalNodeMaintenance()
+		}
+		return err
 	default:
 		return ErrInvalid
 	}

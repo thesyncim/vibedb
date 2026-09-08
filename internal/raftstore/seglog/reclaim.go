@@ -84,12 +84,25 @@ func (e *Engine) ReclaimDeadPrefix() error {
 
 func (e *Engine) beginReclaim() (*reclaimTicket, error) {
 	e.writeMu.Lock()
+	if e.sealPending {
+		select {
+		case sealErr := <-e.sealResults:
+			e.sealPending = false
+			if sealErr != nil {
+				e.writeMu.Unlock()
+				return nil, sealErr
+			}
+		default:
+			e.writeMu.Unlock()
+			return nil, ErrBounds
+		}
+	}
 	if e.closing {
 		e.writeMu.Unlock()
 		return nil, os.ErrClosed
 	}
 	if e.log != nil && e.log.metadata != nil && (e.log.metadata.slot.ReclaimPhase != reclaimNone || e.log.metadata.slot.RetiredCheckpointCount != 0) {
-		if e.cleanupTicket != nil || e.maintenanceBusy || e.sealPending || e.log.usable() != nil || e.log.metadata.slot.HasPending {
+		if e.cleanupTicket != nil || e.maintenanceBusy || e.log.usable() != nil || e.log.metadata.slot.HasPending {
 			e.writeMu.Unlock()
 			return nil, ErrBounds
 		}
@@ -158,7 +171,7 @@ func (e *Engine) beginReclaim() (*reclaimTicket, error) {
 		}
 		return ticket, nil
 	}
-	if e.maintenanceBusy || e.sealPending || e.log == nil || e.log.usable() != nil || e.log.metadata == nil || e.log.metadata.needsHealing || e.log.metadata.slot.HasPending || e.log.metadata.slot.ReclaimPhase != reclaimNone {
+	if e.maintenanceBusy || e.log == nil || e.log.usable() != nil || e.log.metadata == nil || e.log.metadata.needsHealing || e.log.metadata.slot.HasPending || e.log.metadata.slot.ReclaimPhase != reclaimNone {
 		e.writeMu.Unlock()
 		return nil, ErrBounds
 	}

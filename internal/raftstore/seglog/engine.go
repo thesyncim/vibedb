@@ -561,6 +561,21 @@ func (e *Engine) WaitSeal() error {
 	return err
 }
 
+// MaintenanceRetryNeeded reports durable metadata work that a node-level
+// coordinator should retry after the serial maintenance lane becomes idle.
+func (e *Engine) MaintenanceRetryNeeded() bool {
+	if e == nil {
+		return false
+	}
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+	if e.log == nil || e.log.metadata == nil {
+		return false
+	}
+	slot := e.log.metadata.slot
+	return e.maintenanceBusy || slot.HasPending || slot.ReclaimPhase != reclaimNone || slot.RetiredCheckpointCount != 0
+}
+
 // ReserveReaders fixes the maximum number of retained sealed descriptors.
 // Cache misses are explicit control-plane operations through PrepareSegment.
 func (e *Engine) ReserveReaders(count int) error {
