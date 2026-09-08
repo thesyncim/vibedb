@@ -26,6 +26,38 @@ func (c *Collection) preparePrimaryBatchTopology(
 	batch *WriteBatch,
 	offendingKey []byte,
 ) error {
+	return c.preparePrimaryBatchTopologyMode(
+		batch, offendingKey, false, nil,
+	)
+}
+
+// preparePrimaryBatchTopologyDeferred stages the complete final split image
+// (including the logical batch rows) in one structural generation. A nil result
+// means that the ordinary content-equivalent macro spill handled the geometry
+// and the caller should re-plan.
+func (c *Collection) preparePrimaryBatchTopologyDeferred(
+	_ *fileStoreState,
+	batch *WriteBatch,
+	offendingKey []byte,
+) (*preparedPrimaryStructural, error) {
+	var prepared preparedPrimaryStructural
+	if err := c.preparePrimaryBatchTopologyMode(
+		batch, offendingKey, true, &prepared,
+	); err != nil {
+		return nil, err
+	}
+	if !prepared.active {
+		return nil, nil
+	}
+	return &prepared, nil
+}
+
+func (c *Collection) preparePrimaryBatchTopologyMode(
+	batch *WriteBatch,
+	offendingKey []byte,
+	deferred bool,
+	prepared *preparedPrimaryStructural,
+) error {
 	if batch == nil || len(offendingKey) == 0 {
 		return storeio.ErrInvalidWrite
 	}
@@ -235,109 +267,128 @@ func (c *Collection) preparePrimaryBatchTopology(
 
 	tabletID := path.tablet.TabletID()
 	generation := state.root.Generation + 1
-	return c.commitPrimaryStructural(
-		state, &path, structuralSplit,
-		func(tx *storeio.WriteTransaction) (
-			[]storeio.SegmentedTabletRouterLeaf, []storeio.PageRef,
-			*primaryLocalizedLeafSplit, error,
-		) {
-			// Fences partition keyspace, not merely the prospective rows. This is
-			// load-bearing for deletes: a row removed by the logical batch still
-			// exists in this content-equivalent generation and must land in the
-			// range its key routes to.
-			encoded := make([]storeio.PageRef, len(floors))
-			baseAt := 0
-			for rank := range floors {
-				baseEnd := len(baseRows)
-				if rank+1 < len(floors) {
-					baseEnd = primaryBatchTopologyLowerBound(
-						baseRows, baseAt, floors[rank+1],
-					)
-				}
-				bucketU, bucketOK := storeio.MakeTabletLocalIdentityBucket(
-					tabletID, uint32(localIDs[rank]),
+	stage := func(tx *storeio.WriteTransaction) (
+		[]storeio.SegmentedTabletRouterLeaf, []storeio.PageRef,
+		*primaryLocalizedLeafSplit, error,
+	) {
+		// Fences partition keyspace, not merely the prospective rows. This is
+		// load-bearing for deletes: a row removed by the logical batch still
+		// exists in this content-equivalent generation and must land in the
+		// range its key routes to.
+		encoded := make([]storeio.PageRef, len(floors))
+		rows := baseRows
+		if deferred {
+			rows = prospective
+		}
+		baseAt := 0
+		for rank := range floors {
+			baseEnd := len(rows)
+			if rank+1 < len(floors) {
+				baseEnd = primaryBatchTopologyLowerBound(
+					rows, baseAt, floors[rank+1],
 				)
-				if !bucketOK {
-					return nil, nil, nil, storeio.ErrSegmentedTabletRouterCorrupt
-				}
-				ref, encodeErr := c.encodeStructuralLeaf(
-					tx, generation, storeio.BucketID(bucketU),
-					baseRows[baseAt:baseEnd],
-				)
-				if encodeErr != nil {
-					return nil, nil, nil, encodeErr
-				}
-				encoded[rank] = ref
-				baseAt = baseEnd
 			}
-			if baseAt != len(baseRows) {
-				return nil, nil, nil, storeio.ErrInvalidWrite
-			}
-			if isPartitionLocalized {
-				replacements := make(
-					[]storeio.SegmentedTabletRouterLeaf, len(floors),
-				)
-				for rank := range floors {
-					zone := storeio.BucketZone{}
-					if rank == 0 {
-						zone = currentLeaves[sourceIndex].zone
-					}
-					replacements[rank] = storeio.SegmentedTabletRouterLeaf{
-						LocalID: localIDs[rank], Fence: floors[rank],
-						Ref: encoded[rank], Zone: zone,
-					}
-				}
-				return nil, []storeio.PageRef{currentLeaves[sourceIndex].ref},
-					&primaryLocalizedLeafSplit{
-						partition: &primaryLocalizedLeafPartition{
-							plan: localizedPartitionPlan, leaves: replacements,
-						},
-						resident: route, route: path.leafRoute,
-					}, nil
-			}
-			if isLocalized {
-				rightBucketU, bucketOK := storeio.MakeTabletLocalIdentityBucket(
-					tabletID, uint32(localIDs[1]),
-				)
-				if !bucketOK {
-					return nil, nil, nil, storeio.ErrSegmentedTabletRouterCorrupt
-				}
-				return nil, []storeio.PageRef{currentLeaves[sourceIndex].ref},
-					&primaryLocalizedLeafSplit{
-						plan: localizedPlan, resident: route, route: path.leafRoute,
-						leftRef: encoded[0], rightRef: encoded[1],
-						rightBucket:  storeio.BucketID(rightBucketU),
-						rightLocalID: localIDs[1], rightFence: floors[1],
-					}, nil
-			}
-
-			final := make(
-				[]storeio.SegmentedTabletRouterLeaf, 0, finalLeafCount,
+			bucketU, bucketOK := storeio.MakeTabletLocalIdentityBucket(
+				tabletID, uint32(localIDs[rank]),
 			)
-			for at := range currentLeaves {
-				if at != sourceIndex {
-					final = append(final, storeio.SegmentedTabletRouterLeaf{
-						LocalID: currentLeaves[at].localID,
-						Fence:   currentLeaves[at].fence,
-						Ref:     currentLeaves[at].ref,
-						Zone:    currentLeaves[at].zone,
-					})
-					continue
+			if !bucketOK {
+				return nil, nil, nil, storeio.ErrSegmentedTabletRouterCorrupt
+			}
+			ref, encodeErr := c.encodeStructuralLeaf(
+				tx, generation, storeio.BucketID(bucketU),
+				rows[baseAt:baseEnd],
+			)
+			if encodeErr != nil {
+				return nil, nil, nil, encodeErr
+			}
+			encoded[rank] = ref
+			baseAt = baseEnd
+		}
+		if baseAt != len(rows) {
+			return nil, nil, nil, storeio.ErrInvalidWrite
+		}
+		if isPartitionLocalized {
+			replacements := make(
+				[]storeio.SegmentedTabletRouterLeaf, len(floors),
+			)
+			for rank := range floors {
+				zone := storeio.BucketZone{}
+				if rank == 0 {
+					zone = currentLeaves[sourceIndex].zone
 				}
-				for rank := range floors {
-					zone := storeio.BucketZone{}
-					if rank == 0 {
-						zone = currentLeaves[at].zone
-					}
-					final = append(final, storeio.SegmentedTabletRouterLeaf{
-						LocalID: localIDs[rank], Fence: floors[rank],
-						Ref: encoded[rank], Zone: zone,
-					})
+				replacements[rank] = storeio.SegmentedTabletRouterLeaf{
+					LocalID: localIDs[rank], Fence: floors[rank],
+					Ref: encoded[rank], Zone: zone,
 				}
 			}
-			return final, []storeio.PageRef{currentLeaves[sourceIndex].ref}, nil, nil
-		},
-	)
+			return nil, []storeio.PageRef{currentLeaves[sourceIndex].ref},
+				&primaryLocalizedLeafSplit{
+					partition: &primaryLocalizedLeafPartition{
+						plan: localizedPartitionPlan, leaves: replacements,
+					},
+					resident: route, route: path.leafRoute,
+				}, nil
+		}
+		if isLocalized {
+			rightBucketU, bucketOK := storeio.MakeTabletLocalIdentityBucket(
+				tabletID, uint32(localIDs[1]),
+			)
+			if !bucketOK {
+				return nil, nil, nil, storeio.ErrSegmentedTabletRouterCorrupt
+			}
+			return nil, []storeio.PageRef{currentLeaves[sourceIndex].ref},
+				&primaryLocalizedLeafSplit{
+					plan: localizedPlan, resident: route, route: path.leafRoute,
+					leftRef: encoded[0], rightRef: encoded[1],
+					rightBucket:  storeio.BucketID(rightBucketU),
+					rightLocalID: localIDs[1], rightFence: floors[1],
+				}, nil
+		}
+
+		final := make(
+			[]storeio.SegmentedTabletRouterLeaf, 0, finalLeafCount,
+		)
+		for at := range currentLeaves {
+			if at != sourceIndex {
+				final = append(final, storeio.SegmentedTabletRouterLeaf{
+					LocalID: currentLeaves[at].localID,
+					Fence:   currentLeaves[at].fence,
+					Ref:     currentLeaves[at].ref,
+					Zone:    currentLeaves[at].zone,
+				})
+				continue
+			}
+			for rank := range floors {
+				zone := storeio.BucketZone{}
+				if rank == 0 {
+					zone = currentLeaves[at].zone
+				}
+				final = append(final, storeio.SegmentedTabletRouterLeaf{
+					LocalID: localIDs[rank], Fence: floors[rank],
+					Ref: encoded[rank], Zone: zone,
+				})
+			}
+		}
+		return final, []storeio.PageRef{currentLeaves[sourceIndex].ref}, nil, nil
+	}
+	if deferred {
+		if prepared == nil {
+			return storeio.ErrInvalidWrite
+		}
+		result, commitErr := c.commitPrimaryStructuralDeferred(
+			state, &path, structuralSplit, stage,
+			len(prospective)-len(baseRows),
+		)
+		if commitErr != nil {
+			return commitErr
+		}
+		if result == nil {
+			return nil
+		}
+		*prepared = *result
+		return nil
+	}
+	return c.commitPrimaryStructural(state, &path, structuralSplit, stage)
 }
 
 // planPrimaryBatchTopologyCuts refines a shared cut set until every resulting

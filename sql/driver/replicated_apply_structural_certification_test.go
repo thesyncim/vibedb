@@ -15,9 +15,11 @@ import (
 // the production one-entry batch-completion path. Four 64-row entries fill the
 // user leaf; the fifth entry crosses its structural boundary while the real
 // system, user, and transition-capture members remain group-owned. The held
-// user snapshot is captured before any uncertified batch, and only the user
-// member's physical root may advance for the fifth admission because the
-// preceding cut is certified separately from the local structural fold.
+// user snapshot is captured after the first committed batch, before any
+// uncertified batch, and keeps nonempty old leaf bytes across the split. The
+// complete prospective graph publishes at one logical generation after the
+// preceding cut is certified; its physical root may remain at the prior
+// durable cut until the explicit final checkpoint.
 func TestReplicatedApplyBatch64StructuralCertification(t *testing.T) {
 	database, claim, identity, group := newReplicatedApplyBatch64Fixture(t)
 	core := database.connector.db
@@ -42,24 +44,16 @@ func TestReplicatedApplyBatch64StructuralCertification(t *testing.T) {
 	if !group.Owns(members) {
 		t.Fatal("replicated checkpoint group does not own all three members")
 	}
-	beforeSnapshot := group.Stats()
-	snapshot, err := user.Snapshot()
-	if err != nil {
-		t.Fatalf("pre-seed user snapshot: %v", err)
-	}
+	var snapshot *durable.Snapshot
+	var err error
 	snapshotClosed := false
 	defer func() {
 		if !snapshotClosed {
-			_ = snapshot.Close()
+			if snapshot != nil {
+				_ = snapshot.Close()
+			}
 		}
 	}()
-	if snapshot.Len() != 0 {
-		t.Fatalf("pre-seed snapshot rows = %d, want 0", snapshot.Len())
-	}
-	if afterSnapshot := group.Stats(); afterSnapshot != beforeSnapshot {
-		t.Fatalf("pre-seed snapshot changed group state: before=%+v after=%+v",
-			beforeSnapshot, afterSnapshot)
-	}
 
 	keys := make([][]byte, batch64Rows*5)
 	values := make([][]byte, batch64Rows*5)
@@ -124,7 +118,35 @@ func TestReplicatedApplyBatch64StructuralCertification(t *testing.T) {
 		}
 	}
 
-	for batch := 0; batch < 4; batch++ {
+	applyBatch(0)
+	if err := group.Checkpoint(); err != nil {
+		t.Fatalf("checkpoint first batch before snapshot: %v", err)
+	}
+	beforeSnapshot := group.Stats()
+	snapshot, err = user.Snapshot()
+	if err != nil {
+		t.Fatalf("post-first-batch user snapshot: %v", err)
+	}
+	if snapshot.Len() != batch64Rows {
+		t.Fatalf("held snapshot rows = %d, want %d", snapshot.Len(), batch64Rows)
+	}
+	if afterSnapshot := group.Stats(); afterSnapshot != beforeSnapshot {
+		t.Fatalf("snapshot changed group state: before=%+v after=%+v",
+			beforeSnapshot, afterSnapshot)
+	}
+	for row := 0; row < batch64Rows; row++ {
+		got, found, readErr := snapshot.AppendRaw(nil, keys[row])
+		if readErr != nil || !found || !bytes.Equal(got, values[row]) {
+			t.Fatalf("held snapshot row %d = %q/%v/%v", row, got, found, readErr)
+		}
+	}
+	for row := batch64Rows; row < batch64Rows*5; row++ {
+		got, found, readErr := snapshot.AppendRaw(nil, keys[row])
+		if readErr != nil || found {
+			t.Fatalf("held snapshot future row %d = %q/%v/%v, want absent", row, got, found, readErr)
+		}
+	}
+	for batch := 1; batch < 4; batch++ {
 		applyBatch(batch)
 	}
 	beforeSplit := group.Stats()
@@ -135,6 +157,8 @@ func TestReplicatedApplyBatch64StructuralCertification(t *testing.T) {
 	physicalBefore := [3]uint64{
 		system.DurableGeneration(), user.DurableGeneration(), capture.DurableGeneration(),
 	}
+	logicalUserBefore := user.Generation()
+	userSplitsBefore := user.Stats().PrimaryLeafSplits
 
 	applyBatch(4)
 	afterSplit := group.Stats()
@@ -152,19 +176,31 @@ func TestReplicatedApplyBatch64StructuralCertification(t *testing.T) {
 		physicalAfter[1] <= physicalBefore[1] {
 		t.Fatalf("structural split member roots before=%v after=%v", physicalBefore, physicalAfter)
 	}
+	if got := user.Generation(); got != logicalUserBefore+1 {
+		t.Fatalf("structural split logical generation=%d, want %d", got, logicalUserBefore+1)
+	}
+	if got := user.Stats().PrimaryLeafSplits; got != userSplitsBefore+1 {
+		t.Fatalf("structural split count=%d, want %d", got, userSplitsBefore+1)
+	}
 	for row := range keys {
 		got, found, readErr := user.AppendRaw(nil, keys[row])
 		if readErr != nil || !found || !bytes.Equal(got, values[row]) {
 			t.Fatalf("current row %d = %q/%v/%v", row, got, found, readErr)
 		}
 	}
-	if snapshot.Len() != 0 {
-		t.Fatalf("held pre-seed snapshot rows after split = %d, want 0", snapshot.Len())
+	if snapshot.Len() != batch64Rows {
+		t.Fatalf("held snapshot rows after split = %d, want %d", snapshot.Len(), batch64Rows)
 	}
-	for row := range keys {
+	for row := 0; row < batch64Rows; row++ {
+		got, found, readErr := snapshot.AppendRaw(nil, keys[row])
+		if readErr != nil || !found || !bytes.Equal(got, values[row]) {
+			t.Fatalf("held snapshot row %d = %q/%v/%v", row, got, found, readErr)
+		}
+	}
+	for row := batch64Rows; row < len(keys); row++ {
 		got, found, readErr := snapshot.AppendRaw(nil, keys[row])
 		if readErr != nil || found {
-			t.Fatalf("held pre-seed snapshot row %d = %q/%v/%v, want absent", row, got, found, readErr)
+			t.Fatalf("held snapshot future row %d = %q/%v/%v, want absent", row, got, found, readErr)
 		}
 	}
 	if err := snapshot.Close(); err != nil {

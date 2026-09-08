@@ -39,6 +39,32 @@ const (
 	structuralMacroSplit
 )
 
+// preparedPrimaryStructural is the private half of a structural publication.
+// The transaction owns every newly encoded graph page and the collection owns
+// the retirement reservation until the enclosing logical journal record has
+// crossed its point of no return. No reader-visible state is changed while this
+// value is live.
+type preparedPrimaryStructural struct {
+	state             *fileStoreState
+	tx                *storeio.WriteTransaction
+	publication       *storeio.PreparedInlinePublication
+	next              *fileStoreState
+	free              freeLogCommit
+	inline            storeio.InlineFreeDelta
+	exact             primaryExactPrepared
+	router            *storeio.ResidentPrimaryRouter
+	macro             *primaryMacroTabletSplit
+	kind              primaryStructuralKind
+	start             time.Time
+	generation        uint64
+	staged            uint64
+	retired           uint64
+	allocatedLeaves   uint32
+	allocatedBranches uint32
+	rebuildRouter     bool
+	active            bool
+}
+
 // structuralLeaf is one enumerated current leaf of a tablet: its stable
 // identity plus the physical handle, anchor page, and lexical fence needed to
 // re-encode the tablet. fence is an owned copy because the source anchor page is
@@ -753,6 +779,42 @@ func (c *Collection) commitPrimaryStructural(
 	kind primaryStructuralKind,
 	stage structuralLeafStager,
 ) (err error) {
+	return c.commitPrimaryStructuralMode(
+		state, path, kind, stage, 0, nil,
+	)
+}
+
+// commitPrimaryStructuralDeferred prepares the same complete graph transaction
+// as commitPrimaryStructural but leaves its inline publication private until the
+// enclosing logical batch has appended its journal record. The caller holds the
+// collection writer for the whole lifetime of the returned value.
+func (c *Collection) commitPrimaryStructuralDeferred(
+	state *fileStoreState,
+	path *filePrimaryMutationPath,
+	kind primaryStructuralKind,
+	stage structuralLeafStager,
+	documentDelta int,
+) (*preparedPrimaryStructural, error) {
+	prepared := &preparedPrimaryStructural{}
+	if err := c.commitPrimaryStructuralMode(
+		state, path, kind, stage, documentDelta, prepared,
+	); err != nil {
+		return nil, err
+	}
+	if !prepared.active {
+		return nil, nil
+	}
+	return prepared, nil
+}
+
+func (c *Collection) commitPrimaryStructuralMode(
+	state *fileStoreState,
+	path *filePrimaryMutationPath,
+	kind primaryStructuralKind,
+	stage structuralLeafStager,
+	documentDelta int,
+	deferred *preparedPrimaryStructural,
+) (err error) {
 	if err := c.checkpointGroupPhysicalFence(); err != nil {
 		return err
 	}
@@ -1152,10 +1214,22 @@ func (c *Collection) commitPrimaryStructural(
 			"vibedb: persist structural reusable extents: %w", err,
 		)
 	}
+	documentCount := state.root.DocumentCount
+	if documentDelta < 0 {
+		removed := uint64(-documentDelta)
+		if removed > documentCount {
+			return storeio.ErrInvalidWrite
+		}
+		documentCount -= removed
+	} else if uint64(documentDelta) > ^uint64(0)-documentCount {
+		return storeio.ErrInvalidWrite
+	} else {
+		documentCount += uint64(documentDelta)
+	}
 	nextState, nextInline, err := c.stagePrimaryState(
 		tx, state, generation, catalogResult.root,
 		freeLog.head, freeLog.inline,
-		state.root.DocumentCount,
+		documentCount,
 	)
 	if err != nil {
 		return err
@@ -1169,6 +1243,48 @@ func (c *Collection) commitPrimaryStructural(
 		)
 	}
 	retirementReserved = true
+	if deferred != nil {
+		if nextRouter == nil {
+			// Build this reader-side index before the enclosing journal decision.
+			// The post-decision publication path must only perform the already
+			// admitted root swap and its bounded retirement bookkeeping.
+			nextRouter, err = storeio.BuildResidentPrimaryRouter(
+				c.cache, nextState.root.PrimaryRoot,
+				storeio.GlobalTabletCatalogBounds{
+					StoreID: c.storeID, SelectedRootGeneration: generation,
+					FileEnd:       nextState.fileEnd,
+					NextLogicalID: nextState.root.NextLogicalID,
+				},
+			)
+			if err != nil {
+				return err
+			}
+		}
+		publication, prepareErr := tx.PrepareInlinePublication(
+			nextState.root, nextInline,
+		)
+		if prepareErr != nil {
+			return prepareErr
+		}
+		*deferred = preparedPrimaryStructural{
+			state: state, tx: tx, publication: publication, next: nextState,
+			free: freeLog, inline: nextInline,
+			exact: preparedExact, router: nextRouter,
+			macro: macro, kind: kind, start: start,
+			generation:        generation,
+			staged:            structuralRoutingStaged,
+			retired:           structuralRoutingRetired,
+			allocatedLeaves:   catalogResult.allocatedLeaves,
+			allocatedBranches: catalogResult.allocatedBranches,
+			rebuildRouter:     kind == structuralSplit && !isLocalized,
+			active:            true,
+		}
+		// Ownership of tx, the retirement reservation, and the structural
+		// scratch transfers to prepared. The enclosing journal/group owner
+		// will abort it on any later prepare/decision error.
+		abort = false
+		return nil
+	}
 
 	c.snapshotGate.Lock()
 	c.beginReaderFence()
@@ -1269,6 +1385,109 @@ func (c *Collection) commitPrimaryStructural(
 		return c.flushPublishedPhysicalLocked()
 	}
 	return nil
+}
+
+// publishPreparedPrimaryStructuralGateHeld makes a deferred structural graph
+// visible after its logical batch record has crossed the journal fence. All
+// allocation, encoding, exact-index preparation, router construction, and
+// retirement reservation happened before the enclosing decision; this method
+// only performs the existing inline publication and reader-gated state swap.
+func (c *Collection) publishPreparedPrimaryStructuralGateHeld(
+	prepared *preparedPrimaryStructural,
+) error {
+	if prepared == nil || !prepared.active || prepared.tx == nil ||
+		prepared.publication == nil ||
+		prepared.next == nil || prepared.router == nil {
+		return storeio.ErrInvalidWrite
+	}
+	absorbedStart := len(c.retirementAbsorbed)
+	c.beginReaderFence()
+	retiring := !c.anyActiveReaders()
+	var err error
+	if retiring {
+		absorbed := c.retirementAbsorbed
+		var extracted []storeio.FreeExtent
+		extracted, err = prepared.publication.PublishInlineRetiring(
+			c.retireRefScratch, c.retireScratch,
+			c.neverDurableRetirementOutput(),
+		)
+		c.retirementAbsorbed = absorbed[:len(extracted)]
+	} else {
+		err = prepared.publication.PublishInline()
+	}
+	if err != nil {
+		clear(c.retirementAbsorbed[absorbedStart:])
+		c.retirementAbsorbed = c.retirementAbsorbed[:absorbedStart]
+		c.endReaderFence()
+		return err
+	}
+	c.installPrimaryExactResidentLocked(prepared.exact)
+	c.pageValidator.update(prepared.next)
+	c.primaryRouter.Store(prepared.router)
+	c.publishFileState(prepared.next)
+	if retiring {
+		c.cache.MarkUnreachable(c.retireRefScratch)
+		c.extractNeverDurableRetirements(absorbedStart)
+	}
+	c.endReaderFence()
+	c.finalizeReusable()
+	c.commitFreeLog(prepared.free)
+	c.inlineFree = prepared.inline
+	// The complete graph is now the in-memory checkpoint base: its conditional
+	// logical record covers both the prospective rows and topology, so replay can
+	// reconstruct this same generation without a shape-only intermediate root.
+	// The physical root remains intentionally unflushed until an ordinary full
+	// checkpoint; that later fold still owns device durability and retirement
+	// recycling, while this base prevents re-planning against the retired graph.
+	if c.deferredCanonicalLane() {
+		c.primaryCheckpointBase = prepared.next
+	}
+	c.primaryStructuralRoutingStaged.Add(prepared.staged)
+	c.primaryStructuralRoutingRetired.Add(prepared.retired)
+	if prepared.macro != nil {
+		c.primaryNextTabletID = prepared.macro.tabletID + 1
+	}
+	// The catalog counters are intentionally applied only after publication,
+	// matching the ordinary structural path's namespace ownership boundary.
+	// The result is recomputed from the next graph when a macro or full-tablet
+	// path supplied fresh identities.
+	if prepared.allocatedLeaves != 0 {
+		c.primaryNextCatalogLeafID += prepared.allocatedLeaves
+		c.primaryCatalogLeafSplits.Add(uint64(prepared.allocatedLeaves))
+	}
+	if prepared.allocatedBranches != 0 {
+		c.primaryNextCatalogBranchID += prepared.allocatedBranches
+		c.primaryCatalogBranchSplits.Add(uint64(prepared.allocatedBranches))
+	}
+	if prepared.rebuildRouter {
+		c.primaryTabletRoutingRebuilds.Add(1)
+	}
+	c.recordStructuralLatency(prepared.kind, prepared.start)
+	prepared.active = false
+	return nil
+}
+
+func (c *Collection) unwindPreparedPrimaryStructural(
+	prepared *preparedPrimaryStructural,
+) error {
+	if prepared == nil || !prepared.active {
+		return nil
+	}
+	if prepared.publication != nil {
+		_ = prepared.publication.Cancel()
+	}
+	var unwindErr error
+	if prepared.state != nil {
+		unwindErr = c.reclaimer.CancelRetiredGeneration(
+			prepared.state.root.Generation,
+		)
+	}
+	if prepared.tx != nil {
+		unwindErr = errors.Join(unwindErr, prepared.tx.Abort())
+	}
+	c.unwindPrimaryExactPrepared(&prepared.exact)
+	prepared.active = false
+	return unwindErr
 }
 
 // structuralSplitPrimaryLeaf splits the leaf routed by keyBytes at its lexical

@@ -39,6 +39,14 @@ var (
 	// before retrying. No rejected batch has been accepted or made visible.
 	ErrCheckpointRequired  = errors.New("vibedb: Store buffered checkpoint required")
 	ErrPublicationConflict = errors.New("vibedb: Store conditional publication conflict")
+	// ErrPublicationObserverActive reports a publication observer that cannot
+	// participate in a two-phase group publication. Observers are owned by the
+	// online migration lane, which is mutually exclusive with checkpoint-group
+	// ownership; invoking one before a group decision would expose an uncommitted
+	// root to that observer.
+	ErrPublicationObserverActive = errors.New(
+		"vibedb: publication observer blocks prepared group publication",
+	)
 )
 
 // CommitterOptions fixes automatic persistence queue memory. Descriptor
@@ -359,6 +367,10 @@ type Committer struct {
 	closeOnce   sync.Once
 	closing     atomic.Bool
 	publishers  atomic.Uint32
+	// publishMu serializes publication admission with worker failure/close. A
+	// prepared publication holds it from its pre-decision validation through
+	// the post-decision queue install, so the latter has no new failure window.
+	publishMu sync.Mutex
 
 	published atomic.Uint64
 	durable   atomic.Uint64
@@ -708,53 +720,21 @@ func (c *Committer) publishRetiring(
 	retirements []FreeExtent,
 	superseded []FreeExtent,
 ) ([]FreeExtent, error) {
-	if failure := c.currentFailure(); failure != nil {
-		return superseded, failure
-	}
 	if !c.enterPublish() {
 		if failure := c.currentFailure(); failure != nil {
 			return superseded, failure
 		}
 		return superseded, ErrClosed
 	}
-	defer c.publishers.Add(^uint32(0))
-	if failure := c.currentFailure(); failure != nil {
-		return superseded, failure
-	}
-	if generation == 0 || generation <= c.published.Load() {
-		return superseded, ErrGenerationOrder
-	}
-	if batch.conditionalPublication && c.published.Load() != batch.expectedPreviousGeneration {
-		return superseded, ErrPublicationConflict
-	}
-	if batch.rootGeneration != 0 && batch.rootGeneration != generation {
-		return superseded, ErrGenerationOrder
-	}
-	if batch.materialized {
-		sequence, err := c.validateMaterializedBatch(batch, generation)
-		if err != nil {
-			return superseded, err
-		}
-		batch.journalSequence = sequence
-	} else if err := validateCommit(
-		c.bufferCount, c.bufferSize, c.producerSeen, batch.pages, batch.root,
-	); err != nil {
+	defer c.leavePublish()
+	if err := c.validatePublicationLocked(batch, generation); err != nil {
 		return superseded, err
-	}
-	if c.closing.Load() {
-		return superseded, ErrClosed
 	}
 	if c.options.ManualCheckpoint {
 		c.manualMu.Lock()
 		defer c.manualMu.Unlock()
 	}
 	tail := c.tail.Load()
-	if tail-c.head.Load() >= uint64(len(c.pending)) {
-		if c.options.ManualCheckpoint {
-			return superseded, ErrCheckpointRequired
-		}
-		return superseded, ErrQueueFull
-	}
 	c.observerMu.RLock()
 	observer := c.observer
 	requiresDescriptor := c.observerRequiresDescriptor
@@ -769,10 +749,99 @@ func (c *Committer) publishRetiring(
 		}
 	}
 	c.observerMu.RUnlock()
+	return c.publishPreparedLocked(
+		batch, generation, tail, retired, retirements, superseded,
+	)
+}
+
+// validatePublicationLocked performs every fallible committer-side check that
+// precedes queue publication. The caller owns publishMu; the worker cannot
+// report a new failure or a close while this validation is being carried into a
+// prepared publication.
+func (c *Committer) validatePublicationLocked(
+	batch *Batch, generation uint64,
+) error {
+	if failure := c.currentFailure(); failure != nil {
+		return failure
+	}
+	if batch == nil || batch.state.Load() != batchOwned {
+		return ErrBatchState
+	}
+	if generation == 0 || generation <= c.published.Load() {
+		return ErrGenerationOrder
+	}
+	if batch.conditionalPublication &&
+		c.published.Load() != batch.expectedPreviousGeneration {
+		return ErrPublicationConflict
+	}
+	if batch.rootGeneration != 0 && batch.rootGeneration != generation {
+		return ErrGenerationOrder
+	}
+	if batch.materialized {
+		sequence, err := c.validateMaterializedBatch(batch, generation)
+		if err != nil {
+			return err
+		}
+		batch.journalSequence = sequence
+	} else if err := validateCommit(
+		c.bufferCount, c.bufferSize, c.producerSeen, batch.pages, batch.root,
+	); err != nil {
+		return err
+	}
+	if c.closing.Load() {
+		return ErrClosed
+	}
+	tail := c.tail.Load()
+	if tail-c.head.Load() >= uint64(len(c.pending)) {
+		if c.options.ManualCheckpoint {
+			return ErrCheckpointRequired
+		}
+		return ErrQueueFull
+	}
+	c.observerMu.RLock()
+	requiresDescriptor := c.observerRequiresDescriptor
+	if requiresDescriptor && len(batch.publicationDescriptor) == 0 {
+		c.observerMu.RUnlock()
+		return fmt.Errorf("%w: publication descriptor required", ErrInvalidWrite)
+	}
+	c.observerMu.RUnlock()
+	return nil
+}
+
+// publishPreparedLocked is the no-new-failure half of an ordinary publication.
+// All validation, root encoding, and queue-capacity checks happened while the
+// caller held publishMu. An observer, when present, is deliberately handled by
+// publishRetiring before this method; prepared group publications reject one
+// before reserving the batch so the group decision cannot race an observer side
+// effect.
+func (c *Committer) publishPreparedLocked(
+	batch *Batch,
+	generation, tail uint64,
+	retired []PageRef,
+	retirements []FreeExtent,
+	superseded []FreeExtent,
+) ([]FreeExtent, error) {
 	if batch.conditionalPublication &&
 		!c.published.CompareAndSwap(batch.expectedPreviousGeneration, generation) {
 		return superseded, ErrPublicationConflict
 	}
+	return c.publishPreparedUnconditionalLocked(
+		batch, generation, tail, retired, retirements, superseded,
+	), nil
+}
+
+// publishPreparedUnconditionalLocked installs a publication whose committer
+// admission was reserved by prepareInlinePublication. The caller holds
+// publishMu, and PrepareInlinePublication rejects conditional batches, so this
+// body has no remaining validation or fallible compare-and-swap step after the
+// enclosing logical decision.
+func (c *Committer) publishPreparedUnconditionalLocked(
+	batch *Batch,
+	generation, tail uint64,
+	retired []PageRef,
+	retirements []FreeExtent,
+	superseded []FreeExtent,
+) []FreeExtent {
 	if batch.materialized {
 		batch.journalSlot = c.materializationNextSlot.Load()
 		c.materializationNextSequence.Store(batch.journalSequence + 1)
@@ -804,7 +873,7 @@ func (c *Committer) publishRetiring(
 		default:
 		}
 	}
-	return superseded, nil
+	return superseded
 }
 
 // requestCurrentCheckpoint captures and authorizes one exact publication cut.
@@ -832,15 +901,54 @@ func (c *Committer) requestCurrentCheckpoint() uint64 {
 }
 
 func (c *Committer) enterPublish() bool {
+	c.publishMu.Lock()
+	if failure := c.currentFailure(); failure != nil {
+		c.publishMu.Unlock()
+		return false
+	}
 	if c.closing.Load() {
+		c.publishMu.Unlock()
 		return false
 	}
 	c.publishers.Add(1)
-	if c.closing.Load() {
-		c.publishers.Add(^uint32(0))
-		return false
-	}
 	return true
+}
+
+// leavePublish releases the publication reservation acquired by
+// enterPublish. The caller still holds publishMu when this is invoked.
+func (c *Committer) leavePublish() {
+	c.publishers.Add(^uint32(0))
+	c.publishMu.Unlock()
+}
+
+// prepareInlinePublication validates an inline-root publication and reserves
+// its committer admission slot without making the batch visible to the worker.
+// The returned token holds publishMu until PublishInline or Cancel; this keeps
+// worker failure and Close from creating a new post-decision error window.
+func (c *Committer) prepareInlinePublication(
+	batch *Batch, generation uint64,
+) (*PreparedInlinePublication, error) {
+	c.publishMu.Lock()
+	if err := c.validatePublicationLocked(batch, generation); err != nil {
+		c.publishMu.Unlock()
+		return nil, err
+	}
+	if batch.conditionalPublication {
+		c.publishMu.Unlock()
+		return nil, ErrPublicationConflict
+	}
+	c.observerMu.RLock()
+	observerActive := c.observer != nil || c.observerRequiresDescriptor
+	c.observerMu.RUnlock()
+	if observerActive {
+		c.publishMu.Unlock()
+		return nil, ErrPublicationObserverActive
+	}
+	c.publishers.Add(1)
+	return &PreparedInlinePublication{
+		committer: c, batch: batch, generation: generation,
+		tail: c.tail.Load(), active: true,
+	}, nil
 }
 
 // PublishedGeneration returns the newest generation accepted by Publish.

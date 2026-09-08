@@ -94,7 +94,12 @@ type stagedPrimaryBatch struct {
 	generation      uint64
 	preparedExact   primaryExactPrepared
 	preparedOverlay *primaryUnifiedOverlayBatchPrepared
-	live            bool
+	// preparedStructural owns a full graph transaction whose topology and final
+	// logical leaf image were staged at generation together. It remains private
+	// until the kind-3/kind-4 journal fence has accepted the batch, then the
+	// caller publishes it under the same snapshot gate as ordinary batches.
+	preparedStructural *preparedPrimaryStructural
+	live               bool
 }
 
 // updatePrimaryBatch applies one WriteBatch to the ordered primary graph as one
@@ -180,7 +185,9 @@ func (c *Collection) applyPrimaryBatch(batch *WriteBatch) (bool, uint64, error) 
 	if err := c.journalBatchBeforePublishLocked(
 		staged.generation, c.batchJournalEntries,
 	); err != nil {
-		c.unwindStagedPrimaryBatch(&staged)
+		if unwindErr := c.unwindStagedPrimaryBatch(&staged); unwindErr != nil {
+			err = errors.Join(err, unwindErr)
+		}
 		return false, 0, err
 	}
 	// Point of no return passed: these frames are about to become reachable
@@ -189,9 +196,23 @@ func (c *Collection) applyPrimaryBatch(batch *WriteBatch) (bool, uint64, error) 
 	// this slice populated also falsely makes every later buffered journal-
 	// delta checkpoint ineligible.
 	c.batchPrimaryAdmitted = c.batchPrimaryAdmitted[:0]
-	c.publishPrimaryBatch(
-		staged.state, staged.generation, staged.preparedExact,
-	)
+	if staged.preparedStructural != nil {
+		c.snapshotGate.Lock()
+		publishErr := c.publishPreparedPrimaryStructuralGateHeld(
+			staged.preparedStructural,
+		)
+		c.snapshotGate.Unlock()
+		if publishErr != nil {
+			if unwindErr := c.unwindStagedPrimaryBatch(&staged); unwindErr != nil {
+				publishErr = errors.Join(publishErr, unwindErr)
+			}
+			return false, 0, publishErr
+		}
+	} else {
+		c.publishPrimaryBatch(
+			staged.state, staged.generation, staged.preparedExact,
+		)
+	}
 	if c.buffered() {
 		// Buffered-visible deposits its already-published batch's redo record
 		// for the shared group sync after the writer is released.
@@ -227,6 +248,30 @@ func (c *Collection) stagePrimaryBatchConditionalLocked(
 	batch *WriteBatch,
 ) (stagedPrimaryBatch, error) {
 	return c.stagePrimaryBatchForJournalLocked(batch, true)
+}
+
+// primaryBatchDeferredTopologyEligible keeps the first deferred structural
+// slice deliberately narrow: one compact leaf and inline values. The complete
+// graph transaction can then carry the leaf split and every logical row in that
+// same generation without inventing a second overflow-chain staging protocol.
+// Dispersed or overflow batches retain the established shape-then-replan path.
+func (c *Collection) primaryBatchDeferredTopologyEligible() bool {
+	if len(c.batchPrimaryLeaves) != 1 {
+		return false
+	}
+	// The narrow deferred graph path does not carry the overflow-chain retirement
+	// proof. Decline any replacement or delete that collected an old chain and
+	// let the established shape-then-replan path account for it.
+	if len(c.batchPrimaryOverflowVolatile) != 0 ||
+		len(c.batchPrimaryOverflowDurable) != 0 {
+		return false
+	}
+	for i := range c.batchPrimaryMutations {
+		if c.batchPrimaryMutations[i].stored.IsOverflow() {
+			return false
+		}
+	}
+	return true
 }
 
 // stagePrimaryBatchUnifiedOverlayLocked stages the narrow checkpoint-group
@@ -693,6 +738,38 @@ func (c *Collection) stagePrimaryBatchForJournalLocked(
 				// remain terminal and cannot be mistaken for this bounded retry.
 				return stagedPrimaryBatch{}, errCheckpointGroupCertificationRequired
 			}
+			if (conditional || c.journalReplayingConditional) &&
+				c.primaryBatchDeferredTopologyEligible() {
+				// The kind-4 record is part of the same pre-decision contract as
+				// the graph transaction. If the room check folds an older cut,
+				// discard this plan and restart against the new state.
+				if journalErr := c.ensurePrimaryBatchConditionalJournalRoom(
+					c.batchJournalEntries,
+				); journalErr != nil {
+					return stagedPrimaryBatch{}, journalErr
+				}
+				if c.state.Load() != state {
+					continue
+				}
+				prepared, splitErr := c.preparePrimaryBatchTopologyDeferred(
+					state, batch, splitKey,
+				)
+				if splitErr != nil {
+					return stagedPrimaryBatch{}, errors.Join(buildErr, splitErr)
+				}
+				if prepared != nil {
+					return stagedPrimaryBatch{
+						state:              prepared.state,
+						generation:         prepared.generation,
+						preparedStructural: prepared,
+						live:               true,
+					}, nil
+				}
+				// A namespace or router geometry spill may have published a
+				// content-equivalent fallback. Re-enter the ordinary planner
+				// against that fresh state.
+				continue
+			}
 			if splitErr := c.preparePrimaryBatchTopology(
 				state, batch, splitKey,
 			); splitErr != nil {
@@ -765,17 +842,25 @@ func primaryBatchStageAttemptBudget(documents int) (int, bool) {
 
 // unwindStagedPrimaryBatch discards every dirty frame and exact-index record
 // staged for a batch that will not publish. It is idempotent.
-func (c *Collection) unwindStagedPrimaryBatch(staged *stagedPrimaryBatch) {
+func (c *Collection) unwindStagedPrimaryBatch(
+	staged *stagedPrimaryBatch,
+) error {
 	if staged == nil || !staged.live {
-		return
+		return nil
 	}
 	if staged.preparedOverlay != nil {
 		c.primaryUnifiedOverlay.abortBatch(staged.preparedOverlay)
 		staged.preparedOverlay = nil
 	}
+	var unwindErr error
+	if staged.preparedStructural != nil {
+		unwindErr = c.unwindPreparedPrimaryStructural(staged.preparedStructural)
+		staged.preparedStructural = nil
+	}
 	c.unwindPrimaryExactPrepared(&staged.preparedExact)
 	c.unadmitPrimaryBatchLeaves()
 	staged.live = false
+	return unwindErr
 }
 
 // preparePrimaryBatchConditionalLocked appends one kind-4 conditional batch

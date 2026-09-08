@@ -5,6 +5,85 @@ import (
 	"slices"
 )
 
+// PreparedInlinePublication is a two-phase committer publication. Prepare
+// validates and encodes the root while retaining the committer publication
+// lock; PublishInline only installs the already-admitted batch after an
+// enclosing logical decision. Cancel releases the reservation without
+// publishing. The token is single-use.
+type PreparedInlinePublication struct {
+	committer   *Committer
+	transaction *WriteTransaction
+	batch       *Batch
+	generation  uint64
+	tail        uint64
+	active      bool
+}
+
+// PublishInline completes a prepared non-retiring publication. All ordinary
+// validation, root encoding, and queue admission checks ran in PrepareInline;
+// a returned error here indicates an internal invariant failure after the
+// caller's decision and must be treated as an unknown outcome by that caller.
+func (p *PreparedInlinePublication) PublishInline() error {
+	_, err := p.publish(false, nil, nil, nil)
+	return err
+}
+
+// PublishInlineRetiring completes a prepared publication while supplying the
+// exact PageRefs and allocator extents that became unreachable. The caller
+// must hold its reader gate across the active-reader proof and this call.
+func (p *PreparedInlinePublication) PublishInlineRetiring(
+	retired []PageRef, retirements []FreeExtent, superseded []FreeExtent,
+) ([]FreeExtent, error) {
+	return p.publish(true, retired, retirements, superseded)
+}
+
+func (p *PreparedInlinePublication) publish(
+	retiring bool, retired []PageRef, retirements []FreeExtent,
+	superseded []FreeExtent,
+) ([]FreeExtent, error) {
+	if p == nil || !p.active || p.committer == nil || p.batch == nil {
+		return superseded, ErrBatchState
+	}
+	c := p.committer
+	if c.options.ManualCheckpoint {
+		c.manualMu.Lock()
+	}
+	result := superseded
+	if retiring {
+		result = c.publishPreparedUnconditionalLocked(
+			p.batch, p.generation, p.tail, retired, retirements, superseded,
+		)
+	} else {
+		result = c.publishPreparedUnconditionalLocked(
+			p.batch, p.generation, p.tail, nil, nil, superseded,
+		)
+	}
+	if c.options.ManualCheckpoint {
+		c.manualMu.Unlock()
+	}
+	if p.transaction != nil {
+		p.transaction.active = false
+		p.transaction.batch = nil
+	}
+	p.active = false
+	c.publishers.Add(^uint32(0))
+	c.publishMu.Unlock()
+	return result, nil
+}
+
+// Cancel abandons a prepared publication reservation. The owning
+// WriteTransaction remains active so its caller can run the normal Abort
+// cleanup, including allocator rollback and dirty-frame discard.
+func (p *PreparedInlinePublication) Cancel() error {
+	if p == nil || !p.active {
+		return nil
+	}
+	p.active = false
+	p.committer.publishers.Add(^uint32(0))
+	p.committer.publishMu.Unlock()
+	return nil
+}
+
 // SetInlineSuperblock encodes a checksummed StateRoot and cumulative free delta
 // directly into the alternate fixed-root page, with no separately allocated
 // state or routine free-delta page.
@@ -29,6 +108,52 @@ func (b *Batch) SetInlineSuperblock(root InlineSuperblock) error {
 	b.root.Length = root.PageSize
 	b.rootGeneration = root.Generation
 	return nil
+}
+
+// PrepareInlinePublication performs the fallible portion of an inline-root
+// publication while retaining the committer reservation. The caller may then
+// append its enclosing logical decision and complete the publication with the
+// returned token. On error the transaction remains owned and must be aborted.
+func (t *WriteTransaction) PrepareInlinePublication(
+	state StateRoot, free InlineFreeDelta,
+) (*PreparedInlinePublication, error) {
+	if t == nil || !t.active || t.batch == nil ||
+		state.StoreID != t.options.StoreID ||
+		state.Generation != t.options.Generation ||
+		state.PageSize != t.options.PageSize ||
+		state.NextLogicalID != t.nextID {
+		return nil, ErrBatchState
+	}
+	if err := t.resizePages(t.allocated); err != nil {
+		return nil, err
+	}
+	if !t.batch.materialized {
+		slices.SortFunc(t.fullWrites(), func(a, b Write) int {
+			if a.Offset < b.Offset {
+				return -1
+			}
+			if a.Offset > b.Offset {
+				return 1
+			}
+			return 0
+		})
+	}
+	root := InlineSuperblock{
+		StoreID: t.options.StoreID, Generation: t.options.Generation,
+		FileEnd: t.fileEnd, PageSize: t.options.PageSize, State: state,
+		FreeDelta: free,
+	}
+	if err := t.batch.SetInlineSuperblock(root); err != nil {
+		return nil, err
+	}
+	prepared, err := t.committer.prepareInlinePublication(
+		t.batch, t.options.Generation,
+	)
+	if err != nil {
+		return nil, err
+	}
+	prepared.transaction = t
+	return prepared, nil
 }
 
 // PublishInline selects state through an inline alternate superblock. It

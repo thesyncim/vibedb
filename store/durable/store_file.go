@@ -264,6 +264,12 @@ type Collection struct {
 	// records through the ordinary mutation path: those records are already
 	// durable, and the recycle that follows replay discards them regardless.
 	journalReplaying bool
+	// journalReplayingConditional marks the one kind-4 record currently being
+	// re-applied. A committed conditional batch may contain a leaf split and its
+	// logical rows in one generation; replay must therefore use the same complete
+	// graph staging path as the group prepare, while journalReplaying itself keeps
+	// the already-consumed record from being appended again.
+	journalReplayingConditional bool
 	// primaryUniqueReplayValidated is a record-local Open-only certificate: the
 	// complete final image of one oversized atomic journal batch has already
 	// passed unique validation. Its sequential point applications still maintain

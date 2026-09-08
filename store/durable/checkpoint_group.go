@@ -1944,12 +1944,20 @@ func (g *CheckpointGroup) commitTransitionLocked(
 	}
 	staged := make([]stagedPrimaryBatch, len(order))
 	stagedLive := 0
+	gatesHeld := false
 	defer func() {
+		if gatesHeld {
+			for i := len(order) - 1; i >= 0; i-- {
+				order[i].snapshotGate.Unlock()
+			}
+		}
 		if err == nil {
 			return
 		}
 		for i := stagedLive - 1; i >= 0; i-- {
-			order[i].unwindStagedPrimaryBatch(&staged[i])
+			if unwindErr := order[i].unwindStagedPrimaryBatch(&staged[i]); unwindErr != nil {
+				err = errors.Join(err, unwindErr)
+			}
 		}
 	}()
 	for i, c := range order {
@@ -2010,9 +2018,26 @@ func (g *CheckpointGroup) commitTransitionLocked(
 	for _, c := range order {
 		c.snapshotGate.Lock()
 	}
+	gatesHeld = true
 	for i, c := range order {
 		c.batchPrimaryAdmitted = c.batchPrimaryAdmitted[:0]
-		c.publishPrimaryBatchGateHeld(staged[i])
+		if staged[i].preparedStructural != nil {
+			if publishErr := c.publishPreparedPrimaryStructuralGateHeld(
+				staged[i].preparedStructural,
+			); publishErr != nil {
+				// The decision is already appended, though its device sync may still
+				// be pending. A failed structural root publication therefore has the
+				// same committed-but-unknown
+				// semantics as an ordinary post-decision persistence failure;
+				// recovery replays the conditional record against the prior root.
+				poisoned := journalCommitOutcomeUnknown(publishErr)
+				log.poison = poisoned
+				g.poison = poisoned
+				return poisoned
+			}
+		} else {
+			c.publishPrimaryBatchGateHeld(staged[i])
+		}
 		staged[i].live = false
 	}
 	// Publish the physical-durability fence before releasing any snapshot gate.
@@ -2023,6 +2048,7 @@ func (g *CheckpointGroup) commitTransitionLocked(
 	for i := len(order) - 1; i >= 0; i-- {
 		order[i].snapshotGate.Unlock()
 	}
+	gatesHeld = false
 	stagedLive = 0
 	return nil
 }

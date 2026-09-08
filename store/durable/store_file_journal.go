@@ -964,6 +964,10 @@ func (c *Collection) replayRecoveryJournalResolvedPolicyLocked(
 	// batches; kind-4 callers pass false because they already counted the
 	// record as consumed-on-decode before resolving.
 	applyAtomicBatch := func(rec storeio.RecoveryRecord, countAtomic bool) error {
+		previousConditional := c.journalReplayingConditional
+		c.journalReplayingConditional =
+			rec.Kind == storeio.RecoveryRecordKindConditionalBatch
+		defer func() { c.journalReplayingConditional = previousConditional }()
 		// MaxBatchDocuments/MaxBatchBytes are reopen-time admission policy,
 		// not persisted journal semantics. When the current process sized its
 		// batch arenas below this acknowledged record, replay the entries

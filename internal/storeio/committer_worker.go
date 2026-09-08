@@ -11,7 +11,9 @@ import (
 const opportunisticPrewriteLimit = 16
 
 func (c *Committer) stopAccepting() {
+	c.publishMu.Lock()
 	c.closing.Store(true)
+	c.publishMu.Unlock()
 	for c.publishers.Load() != 0 {
 		runtime.Gosched()
 	}
@@ -594,12 +596,17 @@ func (c *Committer) setFailure(err error) {
 		return
 	}
 	c.failOnce.Do(func() {
+		c.publishMu.Lock()
 		c.failure.Store(&commitFailure{err: err})
-		if callbacks := c.callbacks.Load(); callbacks != nil &&
-			callbacks.failed != nil {
+		// Publish reservations are held through their post-decision queue
+		// install. Closing under the same lock prevents a worker failure from
+		// racing that final, otherwise infallible step.
+		c.closing.Store(true)
+		callbacks := c.callbacks.Load()
+		c.publishMu.Unlock()
+		if callbacks != nil && callbacks.failed != nil {
 			callbacks.failed(err)
 		}
-		c.stopAccepting()
 		close(c.failed)
 		c.broadcast()
 	})

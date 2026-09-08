@@ -195,10 +195,10 @@ func openStructuralCertificationCopy(
 // TestCheckpointGroupStructuralSplitCertifiesOnlyPrecedingCut exercises the
 // real five-batch boundary: four 64-row publications fill one compact leaf and
 // the fifth publication requires a structural split. Certification advances
-// only the preceding group cut; the split collection performs its own durable
-// structural flush while the idle member remains at its prior physical root.
-// The failed-prepare image contains only the newly certified preceding cut and
-// no decision; it must reopen at that exact prefix and accept the next-index
+// only the preceding group cut; the split collection keeps its complete
+// content-equivalent graph private until the decision is accepted. The
+// failed-prepare image contains only the newly certified preceding cut and no
+// decision; it must reopen at that exact prefix and accept the next-index
 // retry. A later successful copy contains mixed member roots plus an
 // uncertified decision and exercises the same recovery rule.
 func TestCheckpointGroupStructuralSplitCertifiesOnlyPrecedingCut(t *testing.T) {
@@ -283,12 +283,13 @@ func TestCheckpointGroupStructuralSplitCertifiesOnlyPrecedingCut(t *testing.T) {
 		faulted.PhysicalCheckpoints != before.PhysicalCheckpoints {
 		t.Fatalf("faulted split state before=%+v after=%+v", before, faulted)
 	}
-	if got := members[0].Collection.Generation(); got <= targetGenerationBefore {
-		t.Fatalf("faulted split did not publish its content-equivalent shape: generation=%d before=%d",
+	if got := members[0].Collection.Generation(); got != targetGenerationBefore {
+		t.Fatalf("faulted split published private content-equivalent shape: generation=%d before=%d",
 			got, targetGenerationBefore)
 	}
-	if got := members[0].Collection.Stats().PrimaryLeafSplits; got != targetSplitsBefore+1 {
-		t.Fatalf("faulted split count=%d, want %d", got, targetSplitsBefore+1)
+	if got := members[0].Collection.Stats().PrimaryLeafSplits; got != targetSplitsBefore {
+		t.Fatalf("faulted split installed private shape count=%d, want %d",
+			got, targetSplitsBefore)
 	}
 	if got := members[1].Collection.DurableGeneration(); got != idleDurableBefore {
 		t.Fatalf("faulted split advanced idle generation to %d from %d", got, idleDurableBefore)
@@ -441,11 +442,12 @@ func TestCheckpointGroupStructuralSplitCertificatePreflightRejectsTerminalMember
 }
 
 // TestCheckpointGroupStructuralSplitMixedMemberRoots exercises the mixed-root
-// state after structural certification. The narrow member performs the local
-// physical fold for the split while the wider member has only a certified
-// journal suffix and stays at its previous physical root. Recovery discards the
-// uncertified split and accepts the exact next-index replay under the same
-// asymmetric public options.
+// state after structural certification. The narrow member publishes the local
+// split graph while the wider member has only a certified journal suffix and
+// stays at its previous physical root. The split graph is visible at one
+// logical generation while its physical root remains at the prior durable cut.
+// Recovery discards the uncertified suffix and accepts the exact next-index
+// replay under the same asymmetric public options.
 func TestCheckpointGroupStructuralSplitMixedMemberRoots(t *testing.T) {
 	smallOptions := syncPrimaryJournalTestOptions()
 	smallOptions.MaxBatchDocuments = 1
@@ -508,7 +510,7 @@ func TestCheckpointGroupStructuralSplitMixedMemberRoots(t *testing.T) {
 	}
 	// Keep the small sealed journal from becoming the reason for a group
 	// pressure retry during setup. The split below is the only update whose
-	// local fold is observed in the mixed physical state.
+	// logical graph is published while the physical roots remain mixed.
 	if err := group.Checkpoint(); err != nil {
 		t.Fatalf("seed checkpoint: %v", err)
 	}
@@ -523,6 +525,8 @@ func TestCheckpointGroupStructuralSplitMixedMemberRoots(t *testing.T) {
 	}
 	small := members[0].Collection
 	wide := members[1].Collection
+	smallGenerationBefore := small.Generation()
+	wideGenerationBefore := wide.Generation()
 	smallBefore := small.DurableGeneration()
 	wideBefore := wide.DurableGeneration()
 	physicalBefore := beforeSplit.PhysicalCheckpoints
@@ -537,9 +541,11 @@ func TestCheckpointGroupStructuralSplitMixedMemberRoots(t *testing.T) {
 		afterSplit.PressureCheckpoints != beforeSplit.PressureCheckpoints {
 		t.Fatalf("mixed structural state before=%+v after=%+v", beforeSplit, afterSplit)
 	}
-	if small.DurableGeneration() <= smallBefore || wide.DurableGeneration() != wideBefore {
-		t.Fatalf("mixed structural roots small=%d/%d wide=%d/%d",
-			small.DurableGeneration(), smallBefore, wide.DurableGeneration(), wideBefore)
+	if small.DurableGeneration() != smallBefore || wide.DurableGeneration() != wideBefore ||
+		small.Generation() != smallGenerationBefore+1 || wide.Generation() != wideGenerationBefore {
+		t.Fatalf("mixed structural roots flushed small=%d/%d wide=%d/%d logical=%d/%d before=%+v after=%+v",
+			small.DurableGeneration(), smallBefore, wide.DurableGeneration(), wideBefore,
+			small.Generation(), smallGenerationBefore+1, beforeSplit, afterSplit)
 	}
 	if callbackCount != 258 {
 		t.Fatalf("structural callbacks = %d, want one callback per update", callbackCount)
@@ -619,7 +625,9 @@ func TestCheckpointGroupStructuralSplitMixedMemberRoots(t *testing.T) {
 // leaf split with no pending overlay, so it emits the private certification
 // sentinel. The second dirty member then crosses its supported public overlay
 // bucket window, forcing the ordinary full-group pressure checkpoint. The
-// callback and logical transaction remain single-shot throughout both retries.
+// prospective split remains private during those physical checkpoints and is
+// published once with the accepted logical decision. The callback and logical
+// transaction remain single-shot throughout both retries.
 func TestCheckpointGroupStructuralSplitCertifiesBeforeOverlayPressure(t *testing.T) {
 	options := syncPrimaryJournalTestOptions()
 	options.MaxBatchDocuments = structuralCertificationBatchRows
@@ -793,8 +801,9 @@ func TestCheckpointGroupStructuralSplitCertifiesBeforeOverlayPressure(t *testing
 	system := members[0].Collection
 	systemGenerationBefore := system.Generation()
 	systemSplitsBefore := system.Stats().PrimaryLeafSplits
+	systemDurableBefore := system.DurableGeneration()
 	physicalHooks := 0
-	splitObservedDuringPhysicalFold := false
+	privateSplitObservedDuringPhysicalFold := false
 	previousHook := checkpointGroupFaultHook
 	checkpointGroupFaultHook = func(point checkpointGroupFaultPoint) error {
 		if point == checkpointGroupAfterPhysicalCheckpoint {
@@ -802,7 +811,7 @@ func TestCheckpointGroupStructuralSplitCertifiesBeforeOverlayPressure(t *testing
 			if group.certTxn.Load() == group.txn &&
 				system.Generation() > systemGenerationBefore &&
 				system.Stats().PrimaryLeafSplits > systemSplitsBefore {
-				splitObservedDuringPhysicalFold = true
+				privateSplitObservedDuringPhysicalFold = true
 			}
 		}
 		return nil
@@ -835,9 +844,19 @@ func TestCheckpointGroupStructuralSplitCertifiesBeforeOverlayPressure(t *testing
 	if callbackCount != 1 {
 		t.Fatalf("overlay pressure callbacks = %d, want one", callbackCount)
 	}
-	if physicalHooks < 2 || !splitObservedDuringPhysicalFold {
-		t.Fatalf("retry order physicalHooks=%d splitObservedDuringPhysicalFold=%v before=%+v after=%+v",
-			physicalHooks, splitObservedDuringPhysicalFold, before, group.Stats())
+	if physicalHooks < 2 || privateSplitObservedDuringPhysicalFold {
+		t.Fatalf("retry order physicalHooks=%d privateSplitObserved=%v before=%+v after=%+v",
+			physicalHooks, privateSplitObservedDuringPhysicalFold, before, group.Stats())
+	}
+	if got := system.Generation(); got != systemGenerationBefore+1 {
+		t.Fatalf("structural graph generation=%d, want %d", got, systemGenerationBefore+1)
+	}
+	if got := system.Stats().PrimaryLeafSplits; got != systemSplitsBefore+1 {
+		t.Fatalf("structural split count=%d, want %d", got, systemSplitsBefore+1)
+	}
+	if got := system.DurableGeneration(); got != systemDurableBefore {
+		t.Fatalf("structural postflush advanced durable generation=%d from %d",
+			got, systemDurableBefore)
 	}
 	after := group.Stats()
 	if after.AppliedIndex != before.AppliedIndex+1 ||
