@@ -43,10 +43,14 @@ const (
 var reclaimPublishHook func(reclaimPublishPhase) error
 
 func reclaimThresholdReached(count, limit int, bytes, capacity uint64) bool {
+	return reclaimThresholdReachedWithMinimum(count, limit, bytes, capacity, reclaimMinSegments)
+}
+
+func reclaimThresholdReachedWithMinimum(count, limit int, bytes, capacity uint64, minimum int) bool {
 	if count == 0 {
 		return false
 	}
-	return count >= reclaimMinSegments || bytes >= capacity*2 || count >= limit
+	return count >= minimum || bytes >= capacity*2 || count >= limit
 }
 
 func runReclaimHook(phase reclaimPublishPhase) error {
@@ -175,7 +179,7 @@ func (e *Engine) beginReclaim() (*reclaimTicket, error) {
 		e.writeMu.Unlock()
 		return nil, ErrBounds
 	}
-	limit := min(reclaimMaxSegments, maxRetiredSegments)
+	limit := min(e.reclaimMaxSegments, maxRetiredSegments)
 	cut := 0
 	usedBytes := uint64(0)
 	for cut < len(e.log.state.Segments) && cut < limit {
@@ -190,7 +194,7 @@ func (e *Engine) beginReclaim() (*reclaimTicket, error) {
 		usedBytes += segment.Bytes
 		cut++
 	}
-	if !reclaimThresholdReached(cut, limit, usedBytes, e.log.state.SegmentCapacity) {
+	if !reclaimThresholdReachedWithMinimum(cut, limit, usedBytes, e.log.state.SegmentCapacity, e.reclaimMinSegments) {
 		e.writeMu.Unlock()
 		return nil, ErrBounds
 	}

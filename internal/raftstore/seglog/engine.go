@@ -226,6 +226,8 @@ type Engine struct {
 	cleanupDone         chan struct{}
 	cleanupTicket       *reclaimTicket
 	cleanupErr          error
+	reclaimMinSegments  int
+	reclaimMaxSegments  int
 	sealResults         chan error
 	sealStop            chan struct{}
 	sealerDone          chan struct{}
@@ -397,7 +399,7 @@ func CreateEngineAuthenticated(dir string, logID [16]byte, authKey [32]byte, seg
 	if err != nil {
 		return nil, err
 	}
-	e := &Engine{log: l, groups: make(map[uint64]*engineGroup), waves: make(map[WaveID]waveState), liveSealed: make(map[uint64]uint32), reclaimAfter: make([]uint64, len(l.state.Segments), cap(l.state.Segments)), sealedSummaries: make(map[uint64]sealedRunSummary), syncData: syncActiveData, writeAt: func(f *os.File, b []byte, off int64) (int, error) { return f.WriteAt(b, off) }, authMAC: hmac.New(sha256.New, authKey[:]), authKey: authKey}
+	e := &Engine{log: l, groups: make(map[uint64]*engineGroup), waves: make(map[WaveID]waveState), liveSealed: make(map[uint64]uint32), reclaimAfter: make([]uint64, len(l.state.Segments), cap(l.state.Segments)), sealedSummaries: make(map[uint64]sealedRunSummary), reclaimMinSegments: reclaimMinSegments, reclaimMaxSegments: reclaimMaxSegments, syncData: syncActiveData, writeAt: func(f *os.File, b []byte, off int64) (int, error) { return f.WriteAt(b, off) }, authMAC: hmac.New(sha256.New, authKey[:]), authKey: authKey}
 	e.readerCond = sync.NewCond(&e.readerMu)
 	e.startSealer()
 	return e, nil
@@ -2604,7 +2606,7 @@ func (e *Engine) runMetadataMaintenance() {
 		e.writeMu.Unlock()
 		return
 	}
-	limit := min(reclaimMaxSegments, maxRetiredSegments)
+	limit := min(e.reclaimMaxSegments, maxRetiredSegments)
 	cut, reclaimedBytes := 0, uint64(0)
 	for cut < len(e.log.state.Segments) && cut < limit {
 		segment := e.log.state.Segments[cut]
@@ -2617,7 +2619,7 @@ func (e *Engine) runMetadataMaintenance() {
 		reclaimedBytes += segment.Bytes
 		cut++
 	}
-	if reclaimThresholdReached(cut, limit, reclaimedBytes, e.log.state.SegmentCapacity) {
+	if reclaimThresholdReachedWithMinimum(cut, limit, reclaimedBytes, e.log.state.SegmentCapacity, e.reclaimMinSegments) {
 		e.writeMu.Unlock()
 		_, _ = e.beginReclaim()
 		return
@@ -2788,7 +2790,7 @@ func openEngineAuthenticatedObserved(dir string, startupSync func(*os.File) erro
 		}
 		l.reserveFiles[i] = file
 	}
-	e := &Engine{log: l, groups: make(map[uint64]*engineGroup), waves: make(map[WaveID]waveState), liveSealed: make(map[uint64]uint32), reclaimAfter: make([]uint64, len(l.state.Segments), cap(l.state.Segments)), sealedSummaries: make(map[uint64]sealedRunSummary), syncData: startupSync, writeAt: func(f *os.File, b []byte, off int64) (int, error) { return f.WriteAt(b, off) }, recoveryIO: recoveryIO}
+	e := &Engine{log: l, groups: make(map[uint64]*engineGroup), waves: make(map[WaveID]waveState), liveSealed: make(map[uint64]uint32), reclaimAfter: make([]uint64, len(l.state.Segments), cap(l.state.Segments)), sealedSummaries: make(map[uint64]sealedRunSummary), reclaimMinSegments: reclaimMinSegments, reclaimMaxSegments: reclaimMaxSegments, syncData: startupSync, writeAt: func(f *os.File, b []byte, off int64) (int, error) { return f.WriteAt(b, off) }, recoveryIO: recoveryIO}
 	e.readerCond = sync.NewCond(&e.readerMu)
 	e.authMAC = hmac.New(sha256.New, key[:])
 	e.authKey = key

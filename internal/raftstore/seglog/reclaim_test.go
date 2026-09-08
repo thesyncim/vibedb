@@ -703,6 +703,7 @@ func TestCheckpointRetireIntentSurvivesUnlinkFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	reclaimMinSegments = 1
+	e.reclaimMinSegments = 1
 	injected := syscall.EIO
 	reclaimRemove = func(path string) error {
 		if strings.Contains(path, "catalog-checkpoint-") {
@@ -747,6 +748,7 @@ func TestCheckpointRetirementRejectsNamespaceSubstitution(t *testing.T) {
 		t.Fatal(err)
 	}
 	reclaimMinSegments = 1
+	e.reclaimMinSegments = 1
 	injected := syscall.EIO
 	reclaimRemove = func(path string) error {
 		if strings.Contains(path, "catalog-checkpoint-") {
@@ -824,6 +826,7 @@ func TestDurableCrashCarriesPreAnchorCheckpointRetirements(t *testing.T) {
 		t.Fatal(err)
 	}
 	reclaimMinSegments = 1
+	e.reclaimMinSegments = 1
 	injected := errors.New("crash after durable reclaim")
 	reclaimPublishHook = func(phase reclaimPublishPhase) error {
 		if phase == reclaimDurablePublished {
