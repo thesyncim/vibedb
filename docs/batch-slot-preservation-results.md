@@ -79,6 +79,10 @@ There is no new 10M-row, RF3, cold-cache, p99, long-running churn, or
 CockroachDB comparison in this round. Two repetitions are a small engineering
 screen, not a statistical performance qualification.
 
+A subsequent [attempted 10M run](ten-million-row-run-2026-09-09.md) was cancelled
+during loading at 4.87M acknowledged rows. It exposed insertion slowdown and
+produced no completed CRDB or read comparison.
+
 ## Reproduction and evidence
 
 Validation: the new slot/projection/uniqueness/fallback tests and selected
