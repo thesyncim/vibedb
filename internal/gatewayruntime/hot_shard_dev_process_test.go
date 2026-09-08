@@ -410,34 +410,33 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 		}
 		ddlCtx, cancelDDL := context.WithDeadline(ctx, ddlDeadline)
 		defer cancelDDL()
-		checkConnection := openDDLWire(t, ddlCtx, pgListen)
 		readStarted := time.Now()
+		checkConnection := openDDLWire(t, ddlCtx, pgListen)
+		defer func() {
+			if err := checkConnection.Close(); err != nil {
+				t.Logf("post-restart live DDL connection close: %v", err)
+			}
+		}()
 		const liveDDLRead = "SELECT id,value,marker FROM dev_hot_online WHERE id='online-1'"
 		var result ddlWireResult
 		attempts := 0
 		for {
 			if attempts > 0 && !time.Now().Before(ddlDeadline) {
-				_ = checkConnection.Close()
 				t.Fatalf("post-restart live DDL leader readiness deadline exhausted after %d attempts", attempts)
 			}
 			attempts++
 			result = ddlWireQuery(t, checkConnection, liveDDLRead, true)
 			if result.code == "" {
 				if len(result.rows) != 1 || strings.Join(result.rows[0], "|") != `"online-1"|7|"after-alter"` {
-					_ = checkConnection.Close()
 					t.Fatalf("post-restart live DDL row oracle: %+v", result)
 				}
 				break
 			}
-			if result.code != "XX000" || len(result.rows) != 0 ||
-				!strings.Contains(result.message, "no reachable leader") ||
-				!strings.Contains(result.message, "no authenticated replica reported itself as leader") {
-				_ = checkConnection.Close()
+			if !retryablePostRestartDDLLeaderResult(result) {
 				t.Fatalf("post-restart live DDL row oracle: %+v", result)
 			}
 			remaining := time.Until(ddlDeadline)
 			if remaining <= 0 {
-				_ = checkConnection.Close()
 				t.Fatalf("post-restart live DDL leader readiness deadline exhausted after %d attempts: %+v", attempts, result)
 			}
 			timer := time.NewTimer(min(25*time.Millisecond, remaining))
@@ -449,15 +448,11 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 					default:
 					}
 				}
-				_ = checkConnection.Close()
 				t.Fatalf("post-restart live DDL leader readiness canceled after %d attempts: %v", attempts, context.Cause(ddlCtx))
 			case <-timer.C:
 			}
 		}
 		t.Logf("post-restart live DDL leader readiness: attempts=%d elapsed=%s", attempts, time.Since(readStarted))
-		if err := checkConnection.Close(); err != nil {
-			t.Fatal(err)
-		}
 		customBundleAfterRestart, err := os.ReadFile(customBundlePath)
 		if err != nil || !bytes.Equal(customBundleAfterRestart, customBundleBefore) {
 			t.Fatalf("restart changed original custom bundle: %v", err)
