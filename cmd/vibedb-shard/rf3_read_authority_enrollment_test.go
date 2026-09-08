@@ -193,7 +193,8 @@ func TestRF3ReadAuthorityRetirementRemovesExactRegistration(t *testing.T) {
 	if err != nil || len(registrations) != 1 {
 		t.Fatalf("registration = %#v, %v", registrations, err)
 	}
-	if !cache.putProbe(group.members[1], 42) {
+	registeredTarget := cache.targets[rf3ReadAuthorityGroupMember{group: group.group, member: 2}]
+	if registeredTarget.generation == 0 || !cache.putProbe(registeredTarget, 42) {
 		t.Fatal("remote probe did not publish for registered target")
 	}
 	if err := cache.UnregisterGroups(registrations); err != nil {
