@@ -152,9 +152,6 @@ func (e *Engine) reclaimDeadPrefix() error {
 	for i := range removed {
 		cutA.Retired[i] = retiredDescriptor{ID: removed[i].ID, Generation: removed[i].Generation, FileID: removed[i].FileID, Bytes: removed[i].Bytes, PreviousHash: removed[i].PreviousHash, Hash: removed[i].Hash}
 	}
-	if err = addCheckpointRetirements(&cutA, oldBanks); err != nil {
-		return fmt.Errorf("reclaim checkpoint retirement intent: %w", err)
-	}
 	if err = e.log.metadata.publish(cutA, &record); err != nil {
 		return fmt.Errorf("reclaim cut A: %w", err)
 	}
