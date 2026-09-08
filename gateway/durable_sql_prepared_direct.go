@@ -56,7 +56,11 @@ func (executor *DurableSQLRequestExecutor) PrepareDirect(ctx context.Context, ke
 	var targets []ReplicatedTransactionTarget
 	var handled bool
 	refreshedMiss := false
+	refreshState := newDurableSQLCatalogRefreshState(executor.data)
 	for {
+		if contextErr := context.Cause(opctx); contextErr != nil {
+			return nil, contextErr
+		}
 		lease = executor.planner.catalog.pinCurrent()
 		if lease.snapshot == nil || lease.generation == 0 {
 			lease.release()
@@ -71,13 +75,24 @@ func (executor *DurableSQLRequestExecutor) PrepareDirect(ctx context.Context, ke
 				opctx, lease.snapshot, queries, profile, executor.data,
 			)
 		}
+		if isReplicatedMembershipTransitionPlanningError(err) {
+			transitionErr := err
+			staleGeneration := lease.generation
+			// This plan is still private and has no ledger record. Release the
+			// stale planning lease before waiting for checked catalog progress.
+			lease.release()
+			if refreshErr := refreshState.refreshMembership(opctx, executor.planner, staleGeneration); refreshErr != nil {
+				return nil, errors.Join(transitionErr, refreshErr)
+			}
+			continue
+		}
 		if !errors.Is(err, ErrTableNotPlaced) || refreshedMiss {
 			break
 		}
 		refreshedMiss = true
 		staleGeneration := lease.generation
 		lease.release()
-		if refreshErr := executor.planner.refreshAfterCatalogMiss(opctx, staleGeneration); refreshErr != nil {
+		if refreshErr := refreshState.refreshMissing(opctx, executor.planner, staleGeneration); refreshErr != nil {
 			return nil, preserveCatalogMiss(err, refreshErr)
 		}
 	}
@@ -87,6 +102,9 @@ func (executor *DurableSQLRequestExecutor) PrepareDirect(ctx context.Context, ke
 	}
 	if !handled || !preparedDirectEligible(queries, targets) {
 		return nil, ErrDurableSQLDirectIneligible
+	}
+	if contextErr := context.Cause(opctx); contextErr != nil {
+		return nil, contextErr
 	}
 	return &DurableSQLDirectPlan{Key: key, RequestDigest: replicatedSQLTransactionRequestDigest(queries), CatalogGeneration: lease.generation, Target: targets[0]}, nil
 }

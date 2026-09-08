@@ -1,5 +1,3 @@
-//go:build !vibedb_rf3_read_authority_lab
-
 package main
 
 import (
@@ -10,18 +8,6 @@ import (
 	"path/filepath"
 	"testing"
 )
-
-func TestStandardClusterDevRejectsReadAuthorityBeforeCreatingRoot(t *testing.T) {
-	root := t.TempDir() + "/cluster"
-	if status := runClusterDev([]string{
-		"--root", root, "--replicas", "3", "--physical-nodes", "3", "--read-authority",
-	}); status != 2 {
-		t.Fatalf("standard read-authority status = %d, want 2", status)
-	}
-	if _, err := os.Stat(root); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("standard read-authority created root: stat err=%v", err)
-	}
-}
 
 func TestDefaultResumeAcceptsOpaqueArtifactButRejectsEnabledSection(t *testing.T) {
 	if err := validateDevReadAuthorityRaw([]byte("retained"), nil); err != nil {
@@ -41,7 +27,7 @@ func TestDefaultResumeAcceptsOpaqueArtifactButRejectsEnabledSection(t *testing.T
 	}
 }
 
-func TestStandardPhysicalManifestRejectsEnabledSectionBeforeRewrite(t *testing.T) {
+func TestPhysicalManifestRejectsMalformedEnabledSectionBeforeRewrite(t *testing.T) {
 	root := t.TempDir()
 	nodeRoot := filepath.Join(root, "node-1")
 	groupRoot := filepath.Join(nodeRoot, "group-1")
@@ -58,7 +44,7 @@ func TestStandardPhysicalManifestRejectsEnabledSectionBeforeRewrite(t *testing.T
 		t.Fatal(err)
 	}
 	member := devClusterMember{GroupRoot: groupRoot, ServeManifest: nodePath}
-	if err := reconcileDevPhysicalNodeGroup(member, true); !errors.Is(err, errDevCluster) {
+	if err := reconcileDevPhysicalNodeGroup(member, true, nil); !errors.Is(err, errDevCluster) {
 		t.Fatalf("standard enabled physical manifest error = %v", err)
 	}
 	updated, err := os.ReadFile(nodePath)

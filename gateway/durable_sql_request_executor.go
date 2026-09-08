@@ -150,7 +150,12 @@ func (executor *DurableSQLRequestExecutor) ExecuteMode(
 	var targets []ReplicatedTransactionTarget
 	var handled bool
 	refreshedMiss := false
+	refreshState := newDurableSQLCatalogRefreshState(executor.data)
+	membershipReplayDone := false
 	for {
+		if contextErr := context.Cause(opctx); contextErr != nil {
+			return DurableSQLRequestResult{}, contextErr
+		}
 		lease = executor.planner.catalog.pinCurrent()
 		if lease.snapshot == nil || lease.generation == 0 {
 			lease.release()
@@ -169,13 +174,42 @@ func (executor *DurableSQLRequestExecutor) ExecuteMode(
 		targets, handled, err = executor.planner.planReplicatedSQLTransactionWithData(
 			opctx, lease.snapshot, queries, profile, executor.data,
 		)
+		if isReplicatedMembershipTransitionPlanningError(err) {
+			transitionErr := err
+			staleGeneration := lease.generation
+			// A pre-admission planning lease must not remain pinned while the
+			// exact request replay or the catalog authority waits for a newer
+			// membership publication.
+			lease.release()
+			if contextErr := context.Cause(opctx); contextErr != nil {
+				err = errors.Join(transitionErr, contextErr)
+				membershipReplayDone = true
+				break
+			}
+			result, found, replayErr := executor.Replay(opctx, key)
+			if found {
+				admitted = true
+				return result, replayErr
+			}
+			if replayErr != nil {
+				err = errors.Join(transitionErr, replayErr)
+				membershipReplayDone = true
+				break
+			}
+			if refreshErr := refreshState.refreshMembership(opctx, executor.planner, staleGeneration); refreshErr != nil {
+				err = errors.Join(transitionErr, refreshErr)
+				membershipReplayDone = true
+				break
+			}
+			continue
+		}
 		if !errors.Is(err, ErrTableNotPlaced) || refreshedMiss {
 			break
 		}
 		refreshedMiss = true
 		staleGeneration := lease.generation
 		lease.release()
-		if refreshErr := executor.planner.refreshAfterCatalogMiss(opctx, staleGeneration); refreshErr != nil {
+		if refreshErr := refreshState.refreshMissing(opctx, executor.planner, staleGeneration); refreshErr != nil {
 			// Keep the existing lowering-failure replay path intact. The
 			// request may already have a retained terminal recipe even when
 			// this process still has stale table metadata; refresh failure
@@ -186,7 +220,7 @@ func (executor *DurableSQLRequestExecutor) ExecuteMode(
 	}
 	defer lease.release()
 	if err != nil || !handled || len(targets) == 0 {
-		if err != nil {
+		if err != nil && !membershipReplayDone {
 			// Planning happens before the fused ledger Create. An exact retry can
 			// therefore observe its own prepared intent or a committed row whose
 			// computed UPDATE now evaluates differently. Recover the authenticated
@@ -200,6 +234,9 @@ func (executor *DurableSQLRequestExecutor) ExecuteMode(
 			err = errors.Join(err, replayErr)
 		}
 		return DurableSQLRequestResult{}, fmt.Errorf("gateway: durable SQL lowering: %w", errors.Join(err, ErrDurableSQLRequest))
+	}
+	if contextErr := context.Cause(opctx); contextErr != nil {
+		return DurableSQLRequestResult{}, contextErr
 	}
 	if mode != DurableSQLCoordinated && executor.singleFast && key.IssuerSequence != 0 &&
 		directSQLMutationEligible(queries, targets) {
@@ -223,6 +260,9 @@ func (executor *DurableSQLRequestExecutor) ExecuteMode(
 	if mode == DurableSQLDirectOnly {
 		return DurableSQLRequestResult{}, ErrDurableSQLDirectIneligible
 	}
+	if contextErr := context.Cause(opctx); contextErr != nil {
+		return DurableSQLRequestResult{}, contextErr
+	}
 	program, err := BuildDurableRequestLogicalProgram(DurableRequestLogicalProgramBuild{
 		Home: home, Key: key, Tenant: tenant, CatalogGeneration: lease.generation,
 		RecoveryDeadline:        int64(executor.recoveryPulses),
@@ -233,6 +273,9 @@ func (executor *DurableSQLRequestExecutor) ExecuteMode(
 	})
 	if err != nil {
 		return DurableSQLRequestResult{}, fmt.Errorf("gateway: durable SQL program construction: %w", err)
+	}
+	if contextErr := context.Cause(opctx); contextErr != nil {
+		return DurableSQLRequestResult{}, contextErr
 	}
 	request := DurableRequest{Key: key, Program: program}
 	admitted = true // Even an unsuccessful Begin can have an unknown outcome.

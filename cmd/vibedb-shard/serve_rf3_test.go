@@ -282,6 +282,9 @@ func TestBuildRF3RosterReconstructsEnrolledTransitionCuts(t *testing.T) {
 
 func TestRF3NativeServingAuthorityActivatesTargetOnlyAtFinalOwnedRF3(t *testing.T) {
 	manifest := serveRF3TestManifest()
+	for index := range manifest.Members {
+		manifest.Members[index].StoreID = [16]byte{byte(index + 1)}
+	}
 	manifest.EnrolledTarget = serveRF3TestEnrolledTarget()
 	group := serveRF3TestGroup()
 	grant := rf3MembershipGrantFixture(manifest, group, 9)
@@ -338,6 +341,24 @@ func TestRF3NativeServingAuthorityActivatesTargetOnlyAtFinalOwnedRF3(t *testing.
 		t.Fatal(err)
 	}
 	state.Command.ReplicaSetVersion = 11
+	// The committed RF4 cut must keep every original voter on the ordinary
+	// serving path while the promoted replacement remains limited to its move
+	// authority. Exercise the exact original identities rather than checking
+	// only the target's transitional predicate below.
+	for _, member := range manifest.Members {
+		originalBase := base
+		originalBase.Binding.MemberID = member.MemberID
+		originalBase.Binding.StoreID = member.StoreID
+		if originalBase.Binding.StoreID == ([16]byte{}) {
+			t.Fatalf("original voter %d has zero store identity", member.MemberID)
+		}
+		originalState := state
+		originalState.Identity.MemberID = member.MemberID
+		originalState.Identity.StoreID = member.StoreID
+		if !rf3NativeServingAuthority(registry, manifest, group, originalBase)(originalState) {
+			t.Fatalf("original voter %d lost ordinary serving authority during RF4", member.MemberID)
+		}
+	}
 	request := shardservice.ReplicatedRequest{Operation: shardservice.ReplicatedMembership,
 		Capability: serviceauthz.CapabilityMembership,
 		Fence: shardservice.ReplicatedFence{Group: group,

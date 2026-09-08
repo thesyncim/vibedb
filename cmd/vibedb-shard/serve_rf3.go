@@ -193,6 +193,12 @@ type preparedRF3Group struct {
 	publication        raftmodel.Publication
 	restoreOperation   [32]byte
 	splitRuntimeDigest [32]byte
+	// adoptedChild is set only for a group reconstructed from the validated
+	// durable adopted-group inventory. Such a child was prepared with the
+	// parent split template, whose member StoreIDs are not the child's exact
+	// receipt-bound identities. It therefore retains its pre-restart
+	// ReadIndex-only status.
+	adoptedChild bool
 }
 
 type preparedRF3Set struct {
@@ -260,6 +266,7 @@ func prepareRF3GroupSetOnNode(manifest rf3Manifest, profile *rafttransport.PeerT
 	addresses := make(map[rafttransport.NodeID]string, rf3ManifestMembers)
 	for index, bundle := range bundles {
 		single := manifest.withGroup(bundle)
+		adoptedChild := index >= initialCount
 		var base sqldriver.ReplicatedShardStoreIdentity
 		var applyIdentity sqldriver.ReplicatedApplyIdentity
 		var err error
@@ -357,9 +364,10 @@ func prepareRF3GroupSetOnNode(manifest rf3Manifest, profile *rafttransport.PeerT
 		if err != nil {
 			return result, closePreparedRF3Groups(append(result.groups, preparedRF3Group{
 				manifest: single, base: base, applyIdentity: applyIdentity, key: key,
-				wal: wal, nodeLog: nodeLog, nodeOwner: selectedOwner, database: database, apply: apply}), err)
+				wal: wal, nodeLog: nodeLog, nodeOwner: selectedOwner, database: database, apply: apply,
+				adoptedChild: adoptedChild}), err)
 		}
-		item := preparedRF3Group{manifest: single, base: base, applyIdentity: applyIdentity, key: key, wal: wal, nodeLog: nodeLog, nodeOwner: selectedOwner, database: database, apply: apply, publication: apply.Published(), splitRuntimeDigest: runtimeDigest}
+		item := preparedRF3Group{manifest: single, base: base, applyIdentity: applyIdentity, key: key, wal: wal, nodeLog: nodeLog, nodeOwner: selectedOwner, database: database, apply: apply, publication: apply.Published(), splitRuntimeDigest: runtimeDigest, adoptedChild: adoptedChild}
 		if !rf3SplitChildTemplateMatchesRetained(single.SplitControl.ChildRegistry, base, applyIdentity) ||
 			!rf3SplitChildSchemaMatchesRetained(single.SplitControl.ChildRegistry, base) {
 			return result, closePreparedRF3Groups(append(result.groups, item),

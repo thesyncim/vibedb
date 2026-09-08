@@ -97,7 +97,8 @@ func TestServeRF3WALRetentionCrashQualification(t *testing.T) {
 			response := fixture.propose(t, leader, states[leader], command)
 			elapsed := time.Since(started)
 			if response.Kind != shardservice.ReplicatedCompletion {
-				t.Fatalf("cycle %d key %d completion = %+v", cycle+1, key+1, response)
+				fixture.captureRF3FaultFailureDiagnostic(t, fmt.Sprintf("cycle=%d key=%d", cycle+1, key+1), elapsed, response)
+				t.Fatalf("cycle %d key %d completion = %s", cycle+1, key+1, rf3FaultResponseSummary(response))
 			}
 			if elapsed > walRetentionMaxBound {
 				t.Fatalf("cycle %d key %d latency %s exceeds %s", cycle+1, key+1, elapsed, walRetentionMaxBound)
@@ -130,11 +131,13 @@ func TestServeRF3WALRetentionCrashQualification(t *testing.T) {
 				fmt.Sprintf("reuse-%d", cycle+1), walRetentionDocument(fmt.Sprintf("reuse-%d", cycle+1), cycle, 4096)))
 		sequence++
 		states[leader] = fixture.probe(t, leader)
+		freshStarted := time.Now()
 		freshID := fmt.Sprintf("capacity-%d", cycle+1)
 		fresh := fixture.propose(t, leader, states[leader], walRetentionMutationCommand(
 			t, fixture, states[leader], epoch, sequence, freshID, walRetentionDocument(freshID, cycle, 4096)))
 		if fresh.Kind != shardservice.ReplicatedCompletion {
-			t.Fatalf("cycle %d did not return waiter capacity: %+v", cycle+1, fresh)
+			fixture.captureRF3FaultFailureDiagnostic(t, fmt.Sprintf("cycle=%d fresh-capacity", cycle+1), time.Since(freshStarted), fresh)
+			t.Fatalf("cycle %d did not return waiter capacity: %s", cycle+1, rf3FaultResponseSummary(fresh))
 		}
 		lastApplied = fresh.Outcome.AppliedIndex
 		sequence++
@@ -151,12 +154,14 @@ func TestServeRF3WALRetentionCrashQualification(t *testing.T) {
 	// All three process lifetimes have changed. The first acknowledged command
 	// must remain retired, never re-execute or regress to outcome-unknown.
 	leader, states = fixture.waitLeader(t, []int{0, 1, 2}, 30*time.Second)
+	retiredStarted := time.Now()
 	retired := fixture.propose(t, leader, states[leader], firstCommand)
 	if retired.Kind != shardservice.ReplicatedRefusal ||
 		retired.Refusal != shardservice.ReplicatedRefusalRetryRetired ||
 		retired.Outcome != (raftserve.Outcome{Code: raftserve.OutcomeRetryRetired}) ||
 		retired.RequestDigest != sha256.Sum256(firstCommand) || retired.State.Fence != states[leader].Fence {
-		t.Fatalf("acknowledged command was not durably retired after crash loops: %+v", retired)
+		fixture.captureRF3FaultFailureDiagnostic(t, "retired-command", time.Since(retiredStarted), retired)
+		t.Fatalf("acknowledged command was not durably retired after crash loops: %s", rf3FaultResponseSummary(retired))
 	}
 
 	// The last generation replacement above precedes the duplicate wave and
@@ -284,7 +289,8 @@ func walRetentionDuplicateWave(t testing.TB, fixture *rf3FaultFixture, member in
 		}
 		if result.response.Kind != shardservice.ReplicatedRefusal ||
 			result.response.Refusal != shardservice.ReplicatedRefusalAdmissionBound {
-			t.Fatalf("duplicate waiter result = %+v", result.response)
+			fixture.captureRF3FaultFailureDiagnostic(t, "duplicate-waiter", 0, result.response)
+			t.Fatalf("duplicate waiter result = %s", rf3FaultResponseSummary(result.response))
 		}
 	}
 	if completed == 0 {
