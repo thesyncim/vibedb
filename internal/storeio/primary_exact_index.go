@@ -483,7 +483,7 @@ func validPrimaryExactRef(
 	ref PageRef, kind PageKind, bounds PrimaryExactIndexBounds,
 ) bool {
 	if !bounds.valid() || ref.Kind != kind ||
-		!validPhysicalPageSize(ref.Length) ||
+		!validPageExtentSize(kind, ref.Length) ||
 		ref.Length < bounds.AllocationQuantum ||
 		ref.Length > bounds.MaxPageSize ||
 		ref.Length%bounds.AllocationQuantum != 0 ||

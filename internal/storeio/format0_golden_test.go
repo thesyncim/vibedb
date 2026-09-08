@@ -425,9 +425,11 @@ func TestFormat0LayoutConstantsAndKinds(t *testing.T) {
 		PageTabletRoute: 9, PagePrimaryAnchor: 10, PagePrimaryLeaf: 11,
 		PagePrimaryExactRoot: 12, PagePrimaryExactLeaf: 13,
 		PagePrimaryExactCatalog:   14,
-		PageMigrationExactRun:     15,
-		PageMigrationStagingChain: 16,
-		PageMigrationPadding:      17,
+		PagePrimaryExactPack:      15,
+		PagePrimaryExactInventory: 16,
+		PageMigrationExactRun:     17,
+		PageMigrationStagingChain: 18,
+		PageMigrationPadding:      19,
 	} {
 		if int(kind) != want {
 			t.Fatalf("PageKind %d has value %d, want %d",

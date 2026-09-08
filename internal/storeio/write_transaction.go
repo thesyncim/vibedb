@@ -443,7 +443,7 @@ func (t *WriteTransaction) AllocateNear(kind PageKind, length uint32, logicalID,
 
 func (t *WriteTransaction) allocate(kind PageKind, length uint32, logicalID, hint uint64) (TransactionPage, error) {
 	validLength := validPhysicalPageSize(length)
-	if kind == PageOverflow || kind == PagePrimaryLeaf {
+	if kind == PageOverflow || kind == PagePrimaryLeaf || kind == PagePrimaryExactPack || kind == PagePrimaryExactInventory {
 		validLength = validPageExtentSize(kind, length)
 	}
 	if t == nil || !t.active || t.batch == nil || !validPageKind(kind) ||
@@ -534,6 +534,7 @@ func variableTransactionExtent(kind PageKind) bool {
 	case PageOverflow, PagePrimaryCatalog, PagePrimaryLocator, PageTabletRoute,
 		PagePrimaryAnchor, PagePrimaryLeaf,
 		PagePrimaryExactRoot, PagePrimaryExactLeaf, PagePrimaryExactCatalog,
+		PagePrimaryExactPack, PagePrimaryExactInventory,
 		PageMigrationExactRun, PageMigrationStagingChain, PageMigrationPadding:
 		return true
 	default:

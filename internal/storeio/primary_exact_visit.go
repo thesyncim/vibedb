@@ -2,6 +2,87 @@ package storeio
 
 import "fmt"
 
+// VisitPrimaryExactPackInventory validates and streams an authoritative pack
+// inventory with bounded memory. Exact page and pack counts turn cycles,
+// premature tails, and trailing links into corruption. Pack refs must remain
+// globally sorted and nonoverlapping across inventory-page boundaries.
+func VisitPrimaryExactPackInventory(cache *PageCache, head PageRef, packCount, pageCount uint32, bounds PrimaryExactIndexBounds, visit func(PageRef) error) error {
+	if cache == nil || visit == nil || packCount == 0 != (head == (PageRef{})) || pageCount == 0 != (head == (PageRef{})) {
+		return fmt.Errorf("%w: exact pack inventory", ErrInvalidWrite)
+	}
+	if head == (PageRef{}) {
+		return nil
+	}
+	var decoder PrimaryExactPackDecoder
+	if err := decoder.Prepare(PrimaryExactPackMaxPayloadBytes - PrimaryExactPackHeaderBytes); err != nil {
+		return err
+	}
+	current := head
+	var seenPacks uint32
+	var previousEnd uint64
+	for seenPages := uint32(0); seenPages < pageCount; seenPages++ {
+		lease, err := cache.Acquire(current)
+		if err != nil {
+			return err
+		}
+		view, err := OpenPrimaryExactInventoryPage(lease.Page(), current, bounds)
+		if err != nil {
+			lease.Release()
+			return err
+		}
+		remainingPages := pageCount - seenPages
+		remainingPacks := packCount - seenPacks
+		if uint32(view.Len()) > remainingPacks || remainingPages == 1 != (view.Next() == (PageRef{})) {
+			lease.Release()
+			return primaryExactCorrupt("inventory aggregate count")
+		}
+		if view.Len() != 0 {
+			first, ok := view.Entry(0)
+			if !ok || seenPacks != 0 && first.Offset < previousEnd {
+				lease.Release()
+				return primaryExactCorrupt("inventory aggregate order")
+			}
+		}
+		if err = visit(current); err != nil {
+			lease.Release()
+			return err
+		}
+		for i := uint32(0); i < uint32(view.Len()); i++ {
+			ref, ok := view.Entry(i)
+			if !ok || seenPacks == packCount || seenPacks != 0 && ref.Offset < previousEnd {
+				lease.Release()
+				return primaryExactCorrupt("inventory aggregate order")
+			}
+			packLease, acquireErr := cache.Acquire(ref)
+			if acquireErr != nil {
+				lease.Release()
+				return acquireErr
+			}
+			openErr := OpenPrimaryExactPackPage(packLease.Page(), ref, bounds, &decoder)
+			packLease.Release()
+			if openErr != nil {
+				lease.Release()
+				return openErr
+			}
+			if err := visit(ref); err != nil {
+				lease.Release()
+				return err
+			}
+			previousEnd = ref.Offset + uint64(ref.Length)
+			seenPacks++
+		}
+		current = view.Next()
+		lease.Release()
+		if seenPages+1 < pageCount && current == (PageRef{}) {
+			return primaryExactCorrupt("inventory premature tail")
+		}
+	}
+	if current != (PageRef{}) || seenPacks != packCount {
+		return primaryExactCorrupt("inventory aggregate count")
+	}
+	return nil
+}
+
 // VisitPrimaryExactIndexRefs authenticates and streams every page reachable
 // from one exact-index root. The walk keeps at most the root and catalog depth
 // leased, allowing a post-publication retirement driver to enqueue extents

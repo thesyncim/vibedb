@@ -89,6 +89,17 @@ func (e *PrimaryExactPackEncoder) AppendMember(m PrimaryExactPackMember) error {
 // durable caller with a configured maximum below 64 KiB must impose that lower
 // append budget before Encode.
 func (e *PrimaryExactPackEncoder) Encode(dst []byte, physicalQuantum int) ([]byte, error) {
+	return e.encode(dst, physicalQuantum, true)
+}
+
+// EncodeRaw appends the canonical raw representation without running LZ4.
+// It is the first durable integration stage and shares all framing and bounds
+// with Encode.
+func (e *PrimaryExactPackEncoder) EncodeRaw(dst []byte, physicalQuantum int) ([]byte, error) {
+	return e.encode(dst, physicalQuantum, false)
+}
+
+func (e *PrimaryExactPackEncoder) encode(dst []byte, physicalQuantum int, allowLZ4 bool) ([]byte, error) {
 	if e == nil || len(e.members) == 0 || physicalQuantum < 1 || physicalQuantum > PrimaryExactPackMaxDecodedBytes || physicalQuantum&(physicalQuantum-1) != 0 {
 		return dst, ErrPrimaryExactPackBounds
 	}
@@ -106,25 +117,27 @@ func (e *PrimaryExactPackEncoder) Encode(dst []byte, physicalQuantum int) ([]byt
 		binary.LittleEndian.PutUint32(x[8:], m.length)
 	}
 	copy(e.frame[dirBytes:], e.leaves)
-	bound := lz4.CompressBlockBound(decodedBytes)
-	if cap(e.compressed) < bound {
-		return dst, ErrPrimaryExactPackBounds
-	}
-	e.compressed = e.compressed[:bound]
-	n, err := e.compressor.CompressBlock(e.frame, e.compressed)
-	if err != nil {
-		return dst, ErrPrimaryExactPackBounds
-	}
 	codec := byte(primaryExactPackRaw)
 	body := e.frame
-	if n > 0 {
-		raw, rawOK := primaryExactPackRoundUp(PrimaryExactPackEnvelopeBytes+PrimaryExactPackHeaderBytes+decodedBytes, physicalQuantum)
-		compressed, compressedOK := primaryExactPackRoundUp(PrimaryExactPackEnvelopeBytes+PrimaryExactPackHeaderBytes+n, physicalQuantum)
-		if !rawOK || !compressedOK {
+	if allowLZ4 {
+		bound := lz4.CompressBlockBound(decodedBytes)
+		if cap(e.compressed) < bound {
 			return dst, ErrPrimaryExactPackBounds
 		}
-		if compressed < raw {
-			codec, body = primaryExactPackLZ4, e.compressed[:n]
+		e.compressed = e.compressed[:bound]
+		n, err := e.compressor.CompressBlock(e.frame, e.compressed)
+		if err != nil {
+			return dst, ErrPrimaryExactPackBounds
+		}
+		if n > 0 {
+			raw, rawOK := primaryExactPackRoundUp(PrimaryExactPackEnvelopeBytes+PrimaryExactPackHeaderBytes+decodedBytes, physicalQuantum)
+			compressed, compressedOK := primaryExactPackRoundUp(PrimaryExactPackEnvelopeBytes+PrimaryExactPackHeaderBytes+n, physicalQuantum)
+			if !rawOK || !compressedOK {
+				return dst, ErrPrimaryExactPackBounds
+			}
+			if compressed < raw {
+				codec, body = primaryExactPackLZ4, e.compressed[:n]
+			}
 		}
 	}
 	total := PrimaryExactPackHeaderBytes + len(body)

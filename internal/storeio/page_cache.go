@@ -1781,7 +1781,9 @@ func (c *PageCache) validateRef(ref PageRef) (pageCacheKey, error) {
 			ref.Kind != PagePrimaryLocator &&
 			ref.Kind != PageTabletRoute && ref.Kind != PagePrimaryAnchor &&
 			ref.Kind != PagePrimaryLeaf && ref.Kind != PagePrimaryExactLeaf &&
-			ref.Kind != PagePrimaryExactCatalog ||
+			ref.Kind != PagePrimaryExactCatalog &&
+			ref.Kind != PagePrimaryExactPack &&
+			ref.Kind != PagePrimaryExactInventory ||
 		!validPageKind(ref.Kind) ||
 		ref.LogicalID == 0 ||
 		ref.Generation == 0 ||

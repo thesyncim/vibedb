@@ -85,6 +85,11 @@ const (
 	PagePrimaryExactRoot
 	PagePrimaryExactLeaf
 	PagePrimaryExactCatalog
+	// PagePrimaryExactPack stores one or more canonical exact-index leaves.
+	// PagePrimaryExactInventory is the authoritative sorted enumeration of
+	// unique physical packs reachable from an exact-index root.
+	PagePrimaryExactPack
+	PagePrimaryExactInventory
 	// PageMigrationExactRun is an unreachable, authenticated external-sort run
 	// used only while constructing a replacement exact-index generation.
 	PageMigrationExactRun
@@ -236,7 +241,7 @@ func validPageExtentSize(kind PageKind, size uint32) bool {
 		return true
 	}
 	switch kind {
-	case PageOverflow, PagePrimaryLeaf:
+	case PageOverflow, PagePrimaryLeaf, PagePrimaryExactPack, PagePrimaryExactInventory:
 		return size >= physicalPageQuantum && size%physicalPageQuantum == 0
 	default:
 		return false
