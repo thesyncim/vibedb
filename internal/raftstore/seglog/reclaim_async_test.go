@@ -67,7 +67,7 @@ func TestAsyncReclaimDetachesReadersAndAllowsRotation(t *testing.T) {
 		close(entered)
 		<-release
 	}
-	ticket, err := e.beginReclaim(false)
+	ticket, err := e.beginReclaim()
 	if err != nil {
 		held.Close()
 		t.Fatal(err)
@@ -123,7 +123,7 @@ func TestAsyncReclaimFailureReopensAndRetriesWithoutReuse(t *testing.T) {
 	dir := t.TempDir()
 	e, removed, _ := newReclaimableEngine(t, dir)
 	reclaimRemove = func(string) error { return syscall.EIO }
-	ticket, err := e.beginReclaim(false)
+	ticket, err := e.beginReclaim()
 	if err != nil {
 		e.Close()
 		t.Fatal(err)
@@ -157,5 +157,103 @@ func TestAsyncReclaimFailureReopensAndRetriesWithoutReuse(t *testing.T) {
 				t.Fatalf("retired file %d was reused as reserve", segment.ID)
 			}
 		}
+	}
+}
+
+func TestReclaimEntryPointsShareUnifiedCleanupPath(t *testing.T) {
+	oldMin, oldMax, oldSync, oldHook := reclaimMinSegments, reclaimMaxSegments, reclaimSyncDir, reclaimPublishHook
+	reclaimMinSegments, reclaimMaxSegments = 2, 2
+	t.Cleanup(func() {
+		reclaimMinSegments, reclaimMaxSegments, reclaimSyncDir, reclaimPublishHook = oldMin, oldMax, oldSync, oldHook
+	})
+
+	var reference []reclaimPublishPhase
+	for _, entryPoint := range []struct {
+		name   string
+		public bool
+	}{
+		{name: "public-maintenance-request", public: true},
+		{name: "internal-maintenance-event", public: false},
+	} {
+		t.Run(entryPoint.name, func(t *testing.T) {
+			reclaimPublishHook = nil
+			reclaimSyncDir = oldSync
+			dir := t.TempDir()
+			e, removed, _ := newReclaimableEngine(t, dir)
+			defer e.Close()
+
+			var phases []reclaimPublishPhase
+			reclaimPublishHook = func(phase reclaimPublishPhase) error {
+				phases = append(phases, phase)
+				return nil
+			}
+			syncs := 0
+			reclaimSyncDir = func(path string) error {
+				syncs++
+				return oldSync(path)
+			}
+
+			if entryPoint.public {
+				if err := e.ReclaimDeadPrefix(); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				ticket, err := e.beginReclaim()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if ticket == nil {
+					t.Fatal("maintenance event did not create a reclaim ticket")
+				}
+				if err := waitReclaimTicket(t, ticket); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			if syncs == 0 {
+				t.Fatal("unified cleaner did not perform a directory sync")
+			}
+			wantPhases := []reclaimPublishPhase{
+				reclaimCheckpointAPublished,
+				reclaimPreparedPublished,
+				reclaimCheckpointBPublished,
+				reclaimDurablePublished,
+				reclaimFileRemoved,
+				reclaimFileRemoved,
+				reclaimQueueClearFirst,
+				reclaimQueueClearSecond,
+			}
+			if len(phases) != len(wantPhases) {
+				t.Fatalf("cleanup phases=%v, want=%v", phases, wantPhases)
+			}
+			for i := range wantPhases {
+				if phases[i] != wantPhases[i] {
+					t.Fatalf("cleanup phase %d=%v, want %v (all=%v)", i, phases[i], wantPhases[i], phases)
+				}
+			}
+			if len(reference) == 0 {
+				reference = append([]reclaimPublishPhase(nil), phases...)
+			} else {
+				if len(reference) != len(phases) {
+					t.Fatalf("entry point phase count=%d, reference=%d", len(phases), len(reference))
+				}
+				for i := range reference {
+					if phases[i] != reference[i] {
+						t.Fatalf("entry point phase %d=%v, reference=%v", i, phases[i], reference[i])
+					}
+				}
+			}
+			e.writeMu.Lock()
+			slot, state := e.log.metadata.slot, e.log.state
+			e.writeMu.Unlock()
+			if slot.ReclaimPhase != reclaimNone || slot.RetiredCount != 0 || state.AnchorID != removed[1].ID {
+				t.Fatalf("cleanup outcome=%+v state=%+v", slot, state)
+			}
+			for _, segment := range removed {
+				if _, err := os.Stat(segmentPath(dir, segment.FileID)); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("retired segment %d remains: %v", segment.ID, err)
+				}
+			}
+		})
 	}
 }

@@ -142,7 +142,7 @@ type catalogRecord struct {
 //	264..376 optional pending descriptor
 //	376..440 two 32-byte reserve descriptors
 //	440..496 previous checkpoint descriptor
-//	496..504 reclaim phase/count/recycled-reserve mask
+//	496..504 reclaim phase/count/retired-reserve mask
 //	504..3832 thirty-two 104-byte retired segment descriptors
 //	3832..3868 retired-checkpoint count and canonical zero padding
 //	3868..4060 four 48-byte retired checkpoint ID/hash descriptors

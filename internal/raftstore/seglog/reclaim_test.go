@@ -279,7 +279,6 @@ func TestReclaimRejectsNamespaceSubstitutionAfterExactFileValidation(t *testing.
 	t.Cleanup(func() { reclaimMinSegments, reclaimMaxSegments, reclaimBeforeRemove = oldMin, oldMax, oldHook })
 	dir := t.TempDir()
 	engine, removed, _ := newReclaimableEngine(t, dir)
-	defer engine.Close()
 	target := segmentPath(dir, removed[0].FileID)
 	backup := target + ".validated"
 	replaced := false
@@ -298,8 +297,14 @@ func TestReclaimRejectsNamespaceSubstitutionAfterExactFileValidation(t *testing.
 	if err := engine.ReclaimDeadPrefix(); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("namespace substitution accepted: %v", err)
 	}
-	if engine.log.metadata.slot.ReclaimPhase != reclaimDurable || engine.log.metadata.slot.RetiredCount == 0 {
-		t.Fatalf("durable retirement intent cleared: %+v", engine.log.metadata.slot)
+	if !errors.Is(engine.FatalError(), ErrCorrupt) {
+		t.Fatalf("namespace substitution did not poison handle: %v", engine.FatalError())
+	}
+	engine.writeMu.Lock()
+	slot := engine.log.metadata.slot
+	engine.writeMu.Unlock()
+	if slot.ReclaimPhase != reclaimDurable || slot.RetiredCount == 0 {
+		t.Fatalf("durable retirement intent cleared: %+v", slot)
 	}
 	if got, err := os.ReadFile(target); err != nil || string(got) != "substitute" {
 		t.Fatalf("substitute removed or changed: %q %v", got, err)
@@ -311,150 +316,21 @@ func TestReclaimRejectsNamespaceSubstitutionAfterExactFileValidation(t *testing.
 	if err := os.Rename(backup, target); err != nil {
 		t.Fatal(err)
 	}
-	if err := engine.ReclaimDeadPrefix(); err != nil {
+	if err := engine.Close(); err != nil {
 		t.Fatal(err)
 	}
-}
-
-func dropReserveForRecycle(t *testing.T, engine *Engine, slot int) {
-	t.Helper()
-	descriptor := engine.log.state.Reserves[slot]
-	file := engine.log.reserveFiles[slot]
-	if file == nil || !descriptor.Ready {
-		t.Fatal("test reserve missing")
-	}
-	opened, err := file.Stat()
+	reopened, err := openTestEngine(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = file.Close(); err != nil {
-		t.Fatal(err)
+	defer reopened.Close()
+	if reopened.log.metadata.slot.ReclaimPhase != reclaimNone {
+		t.Fatalf("reopened retirement not completed: %+v", reopened.log.metadata.slot)
 	}
-	engine.log.reserveFiles[slot] = nil
-	if err = removeExactPublishedPath(opened, segmentPath(engine.log.dir, descriptor.FileID), engine.log.dir); err != nil {
-		t.Fatal(err)
-	}
-	next := engine.log.metadata.slot
-	next.Generation++
-	next.Reserves[slot] = reserveDescriptor{}
-	if err = engine.log.metadata.publish(next, nil); err != nil {
-		t.Fatal(err)
-	}
-	engine.log.state.Generation = next.Generation
-	engine.log.state.Reserves[slot] = reserveDescriptor{}
-}
-
-func TestReclaimRecyclesDeadSegmentIntoMissingReserve(t *testing.T) {
-	oldMin, oldMax := reclaimMinSegments, reclaimMaxSegments
-	reclaimMinSegments, reclaimMaxSegments = 2, 2
-	t.Cleanup(func() { reclaimMinSegments, reclaimMaxSegments = oldMin, oldMax })
-	engine, removed, _ := newReclaimableEngine(t, t.TempDir())
-	defer engine.Close()
-	dropReserveForRecycle(t, engine, 0)
-	if err := engine.ReclaimDeadPrefix(); err != nil {
-		t.Fatal(err)
-	}
-	if !engine.log.state.Reserves[0].Ready || engine.log.state.Reserves[0].FileID != removed[0].FileID {
-		t.Fatalf("reserve=%+v removed=%+v", engine.log.state.Reserves[0], removed[0])
-	}
-	if err := verifyPhysicalReserve(engine.log.reserveFiles[0], engine.log.state.Reserves[0], engine.log.state.LogID, engine.authKey); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestReclaimRecycleCrashCutsResumeAuthenticatedLifecycle(t *testing.T) {
-	oldMin, oldMax := reclaimMinSegments, reclaimMaxSegments
-	reclaimMinSegments, reclaimMaxSegments = 2, 2
-	t.Cleanup(func() { reclaimMinSegments, reclaimMaxSegments = oldMin, oldMax })
-	tests := []struct {
-		name   string
-		inject func(error)
-	}{
-		{name: "identity-partial", inject: func(injected error) {
-			recycleIdentityWrite = func(file *os.File, bytes []byte, offset int64) error {
-				_, _ = file.WriteAt(bytes[:len(bytes)/2], offset)
-				return injected
-			}
-		}},
-		{name: "truncate", inject: func(injected error) {
-			recycleTruncate = func(file *os.File, size int64) error {
-				if err := file.Truncate(size); err != nil {
-					return err
-				}
-				return injected
-			}
-		}},
-		{name: "preallocate", inject: func(injected error) {
-			physical := reservePhysicalFile
-			reservePhysicalFile = func(file *os.File, capacity uint64) error {
-				if err := physical(file, capacity); err != nil {
-					return err
-				}
-				return injected
-			}
-		}},
-		{name: "first-sync", inject: func(injected error) {
-			calls := 0
-			recycleFileSync = func(file *os.File) error {
-				calls++
-				if err := file.Sync(); err != nil {
-					return err
-				}
-				if calls == 1 {
-					return injected
-				}
-				return nil
-			}
-		}},
-		{name: "final-sync", inject: func(injected error) {
-			calls := 0
-			recycleFileSync = func(file *os.File) error {
-				calls++
-				if err := file.Sync(); err != nil {
-					return err
-				}
-				if calls == 2 {
-					return injected
-				}
-				return nil
-			}
-		}},
-		{name: "reserve-publication", inject: func(injected error) {
-			reclaimPublishHook = func(phase reclaimPublishPhase) error {
-				if phase == reclaimReservePublished {
-					return injected
-				}
-				return nil
-			}
-		}},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			savedWrite, savedTruncate, savedPhysical, savedSync, savedHook := recycleIdentityWrite, recycleTruncate, reservePhysicalFile, recycleFileSync, reclaimPublishHook
-			defer func() {
-				recycleIdentityWrite, recycleTruncate, reservePhysicalFile, recycleFileSync, reclaimPublishHook = savedWrite, savedTruncate, savedPhysical, savedSync, savedHook
-			}()
-			dir := t.TempDir()
-			engine, _, _ := newReclaimableEngine(t, dir)
-			dropReserveForRecycle(t, engine, 0)
-			injected := syscall.EIO
-			test.inject(injected)
-			if err := engine.ReclaimDeadPrefix(); !errors.Is(err, injected) {
-				t.Fatalf("got %v", err)
-			}
-			recycleIdentityWrite, recycleTruncate, reservePhysicalFile, recycleFileSync, reclaimPublishHook = savedWrite, savedTruncate, savedPhysical, savedSync, savedHook
-			if err := engine.Close(); err != nil {
-				t.Fatal(err)
-			}
-			reopened, err := openTestEngine(dir)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer reopened.Close()
-			if reopened.log.metadata.slot.ReclaimPhase != reclaimNone || !reopened.log.state.Reserves[0].Ready {
-				t.Fatalf("slot=%+v reserve=%+v", reopened.log.metadata.slot, reopened.log.state.Reserves[0])
-			}
-		})
+	for _, segment := range removed {
+		if _, err := os.Stat(segmentPath(dir, segment.FileID)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("retired segment %d remains after recovery: %v", segment.ID, err)
+		}
 	}
 }
 
@@ -570,87 +446,6 @@ func TestReclaimPreservesControlOnlySummaryAndRetainedOverwrite(t *testing.T) {
 	location, term, _, ok, err := e.LookupExact(1, 2)
 	if err != nil || !ok || term != 2 || location.Term != 2 {
 		t.Fatalf("replacement=%+v term=%d ok=%v err=%v", location, term, ok, err)
-	}
-}
-
-func TestRecycledReserveIsActivatedAndWrittenBeforeSecondReclaim(t *testing.T) {
-	oldMin, oldMax := reclaimMinSegments, reclaimMaxSegments
-	reclaimMinSegments, reclaimMaxSegments = 1, 32
-	t.Cleanup(func() { reclaimMinSegments, reclaimMaxSegments = oldMin, oldMax })
-	dir := t.TempDir()
-	e, removed, _ := newReclaimableEngine(t, dir)
-	dropReserveForRecycle(t, e, 0)
-	if err := e.ReclaimDeadPrefix(); err != nil {
-		t.Fatal(err)
-	}
-	recycledID := removed[0].FileID
-	if err := e.PersistWave(Wave{ID: waveID(4), Batches: []ReadyBatch{{GroupID: 1, Entries: []Entry{{Index: 3, Term: 1}}}}}); err != nil {
-		t.Fatal(err)
-	}
-	if err := e.Rotate(nil); err != nil {
-		t.Fatal(err)
-	}
-	if err := e.WaitSeal(); err != nil {
-		t.Fatal(err)
-	}
-	if e.log.state.ActiveFileID != recycledID {
-		t.Fatalf("active=%x recycled=%x", e.log.state.ActiveFileID, recycledID)
-	}
-	cp := Checkpoint{ID: [16]byte{12}, Index: 3, Term: 1}
-	hard := HardState{Term: 1, Vote: 1, Commit: 3}
-	if err := e.PersistWave(Wave{ID: waveID(5), Batches: []ReadyBatch{{GroupID: 1, Checkpoint: &cp, Hard: &hard}}}); err != nil {
-		t.Fatal(err)
-	}
-	if err := e.Rotate(nil); err != nil {
-		t.Fatal(err)
-	}
-	if err := e.WaitSeal(); err != nil {
-		t.Fatal(err)
-	}
-	if err := e.ReclaimDeadPrefix(); err != nil {
-		t.Fatal(err)
-	}
-	if err := e.Close(); err != nil {
-		t.Fatal(err)
-	}
-	e, err := openTestEngine(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer e.Close()
-	meta, ok := e.Metadata(1)
-	if !ok || meta.Checkpoint != cp || meta.LastIndex != 3 {
-		t.Fatalf("metadata=%+v", meta)
-	}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	segmentFiles, checkpointFiles := 0, 0
-	allocated := uint64(0)
-	for _, entry := range entries {
-		info, statErr := entry.Info()
-		if statErr != nil {
-			t.Fatal(statErr)
-		}
-		if bytes, ok := allocatedFileBytes(info); ok {
-			allocated += bytes
-		}
-		if strings.HasPrefix(entry.Name(), "segment-") {
-			segmentFiles++
-		}
-		if strings.HasPrefix(entry.Name(), "catalog-checkpoint-") {
-			checkpointFiles++
-		}
-	}
-	wantSegments := 1 + len(e.log.state.Segments)
-	for _, reserve := range e.log.state.Reserves {
-		if reserve.Ready {
-			wantSegments++
-		}
-	}
-	if segmentFiles != wantSegments || checkpointFiles > 2 || allocated > uint64(segmentFiles)*e.log.state.SegmentCapacity+metadataCatalogEnd+(2<<20) {
-		t.Fatalf("segment files=%d want=%d checkpoints=%d allocated=%d", segmentFiles, wantSegments, checkpointFiles, allocated)
 	}
 }
 
@@ -948,7 +743,6 @@ func TestCheckpointRetirementRejectsNamespaceSubstitution(t *testing.T) {
 	})
 	dir := t.TempDir()
 	e, _, _ := newReclaimableEngine(t, dir)
-	defer e.Close()
 	if err := e.ReclaimDeadPrefix(); err != nil {
 		t.Fatal(err)
 	}
@@ -985,7 +779,13 @@ func TestCheckpointRetirementRejectsNamespaceSubstitution(t *testing.T) {
 	if err := e.ReclaimDeadPrefix(); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("checkpoint substitution accepted: %v", err)
 	}
-	if e.log.metadata.slot.RetiredCheckpointCount == 0 {
+	if !errors.Is(e.FatalError(), ErrCorrupt) {
+		t.Fatalf("checkpoint substitution did not poison handle: %v", e.FatalError())
+	}
+	e.writeMu.Lock()
+	slot := e.log.metadata.slot
+	e.writeMu.Unlock()
+	if slot.RetiredCheckpointCount == 0 {
 		t.Fatal("checkpoint retirement intent cleared")
 	}
 	if got, err := os.ReadFile(target); err != nil || string(got) != "substitute" {
@@ -998,8 +798,19 @@ func TestCheckpointRetirementRejectsNamespaceSubstitution(t *testing.T) {
 	if err := os.Rename(backup, target); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.ReclaimDeadPrefix(); err != nil {
+	if err := e.Close(); err != nil {
 		t.Fatal(err)
+	}
+	reopened, err := openTestEngine(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	reopened.writeMu.Lock()
+	reopenedSlot := reopened.log.metadata.slot
+	reopened.writeMu.Unlock()
+	if reopenedSlot.RetiredCheckpointCount != 0 {
+		t.Fatalf("reopened checkpoint retirement not completed: %+v", reopenedSlot)
 	}
 }
 

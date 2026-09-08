@@ -15,8 +15,7 @@ var reclaimBeforeRemove func(string)
 var reclaimBeforeCheckpointRemove func(string)
 
 type reclaimRequest struct {
-	result  chan error
-	recycle bool
+	result chan error
 }
 
 // reclaimTicket is the immutable hand-off between the short authenticated
@@ -26,7 +25,6 @@ type reclaimTicket struct {
 	slot           metadataSlot
 	retired        []retiredDescriptor
 	done           chan error
-	recycle        bool
 	checkpointOnly bool
 }
 
@@ -37,8 +35,6 @@ const (
 	reclaimPreparedPublished
 	reclaimCheckpointBPublished
 	reclaimDurablePublished
-	reclaimReservePrepared
-	reclaimReservePublished
 	reclaimFileRemoved
 	reclaimQueueClearFirst
 	reclaimQueueClearSecond
@@ -69,7 +65,7 @@ func (e *Engine) ReclaimDeadPrefix() error {
 	}
 	result := make(chan error, 1)
 	select {
-	case e.reclaimRequests <- reclaimRequest{result: result, recycle: true}:
+	case e.reclaimRequests <- reclaimRequest{result: result}:
 	case <-e.sealStop:
 		return os.ErrClosed
 	}
@@ -86,7 +82,7 @@ func (e *Engine) ReclaimDeadPrefix() error {
 	}
 }
 
-func (e *Engine) beginReclaim(recycle bool) (*reclaimTicket, error) {
+func (e *Engine) beginReclaim() (*reclaimTicket, error) {
 	e.writeMu.Lock()
 	if e.closing {
 		e.writeMu.Unlock()
@@ -113,9 +109,43 @@ func (e *Engine) beginReclaim(recycle bool) (*reclaimTicket, error) {
 			if completed {
 				return nil, nil
 			}
-			return e.beginReclaim(recycle)
+			return e.beginReclaim()
 		}
-		ticket := &reclaimTicket{slot: slot, retired: append([]retiredDescriptor(nil), slot.Retired[:slot.RetiredCount]...), done: make(chan error, 1), recycle: recycle || slot.RetiredReserveMask != 0, checkpointOnly: slot.ReclaimPhase == reclaimNone}
+		if slot.ReclaimPhase == reclaimNone {
+			// Checkpoint-file retirement is already an authenticated maintenance
+			// ticket. It shares the cleaner with segment retirement and must not
+			// be interpreted as a segment cut.
+			ticket := &reclaimTicket{
+				slot:           slot,
+				done:           make(chan error, 1),
+				checkpointOnly: true,
+			}
+			e.cleanupTicket = ticket
+			e.writeMu.Unlock()
+			if err := e.enqueueCleanupTicket(ticket); err != nil {
+				e.writeMu.Lock()
+				if e.cleanupTicket == ticket {
+					e.cleanupTicket = nil
+				}
+				e.writeMu.Unlock()
+				return nil, err
+			}
+			return ticket, nil
+		}
+		if slot.RetiredReserveMask != 0 {
+			e.writeMu.Unlock()
+			return nil, fmt.Errorf("%w: retired reserve conversion", ErrCorrupt)
+		}
+		// A crash can leave the authenticated DURABLE slot published before
+		// its in-memory cut was installed. Reconstruct that cut once before
+		// handing the same immutable ticket to the cleaner.
+		e.writeMu.Unlock()
+		if err := e.installDurableReclaimState(nil, 0, nil); err != nil {
+			return nil, err
+		}
+		e.writeMu.Lock()
+		slot = e.log.metadata.slot
+		ticket := &reclaimTicket{slot: slot, retired: append([]retiredDescriptor(nil), slot.Retired[:slot.RetiredCount]...), done: make(chan error, 1), checkpointOnly: slot.ReclaimPhase == reclaimNone}
 		e.cleanupTicket = ticket
 		e.writeMu.Unlock()
 		if err := e.enqueueCleanupTicket(ticket); err != nil {
@@ -237,7 +267,7 @@ func (e *Engine) beginReclaim(recycle bool) (*reclaimTicket, error) {
 	}
 	e.writeMu.Lock()
 	slot := e.log.metadata.slot
-	ticket := &reclaimTicket{slot: slot, retired: append([]retiredDescriptor(nil), slot.Retired[:slot.RetiredCount]...), done: make(chan error, 1), recycle: recycle}
+	ticket := &reclaimTicket{slot: slot, retired: append([]retiredDescriptor(nil), slot.Retired[:slot.RetiredCount]...), done: make(chan error, 1)}
 	e.maintenanceBusy = false
 	e.cleanupTicket = ticket
 	e.writeMu.Unlock()
@@ -268,7 +298,6 @@ func (e *Engine) resumeReclaim() error {
 		}
 		return nil
 	}
-	oldBanks := e.log.metadata.bankSlots
 	if slot.ReclaimPhase == reclaimPrepared {
 		retained := e.log.state.Segments
 		for len(retained) != 0 && retained[0].ID <= slot.AnchorID {
@@ -301,19 +330,21 @@ func (e *Engine) resumeReclaim() error {
 	if slot.ReclaimPhase != reclaimDurable {
 		return ErrCorrupt
 	}
-	legacyReserveConversion := slot.RetiredReserveMask != 0 || !slot.Reserves[0].Ready || !slot.Reserves[1].Ready || e.log.reserveFiles[0] == nil || e.log.reserveFiles[1] == nil
-	if !legacyReserveConversion {
-		if err := e.installDurableReclaimState(nil, 0, nil); err != nil {
-			return err
-		}
-		ticket := &reclaimTicket{slot: slot, retired: append([]retiredDescriptor(nil), slot.Retired[:slot.RetiredCount]...), done: make(chan error, 1)}
-		return e.finishRetiredFiles(ticket)
+	if slot.RetiredReserveMask != 0 {
+		// The current cleaner never reuses a retired identity. A persisted
+		// conversion marker belongs to the retired implementation and cannot
+		// be safely completed by this format-preserving path.
+		return fmt.Errorf("%w: retired reserve conversion", ErrCorrupt)
 	}
-	return e.finishDurableReclaim(oldBanks, nil, 0, nil)
+	if err := e.installDurableReclaimState(nil, 0, nil); err != nil {
+		return err
+	}
+	ticket := &reclaimTicket{slot: slot, retired: append([]retiredDescriptor(nil), slot.Retired[:slot.RetiredCount]...), done: make(chan error, 1)}
+	return e.finishRetiredFiles(ticket)
 }
 
 // installDurableReclaimState publishes the in-memory consequence of an
-// authenticated durable cut. It deliberately does not recycle or unlink any
+// authenticated durable cut. It deliberately does not reuse or unlink any
 // retired file; those operations belong to the cleaner ticket.
 func (e *Engine) installDurableReclaimState(replacement []SegmentMeta, removedCount int, compactedFences []uint64) error {
 	e.writeMu.Lock()
@@ -367,158 +398,6 @@ func (e *Engine) installDurableReclaimState(replacement []SegmentMeta, removedCo
 	return nil
 }
 
-func (e *Engine) finishDurableReclaim(oldBanks [2]metadataSlot, replacement []SegmentMeta, removedCount int, compactedFences []uint64) error {
-	slot := e.log.metadata.slot
-	if slot.ReclaimPhase != reclaimDurable || slot.RetiredCount == 0 {
-		return ErrCorrupt
-	}
-	if err := e.installDurableReclaimState(replacement, removedCount, compactedFences); err != nil {
-		return err
-	}
-
-	// Fill empty reserve ownership from the dead prefix before unlinking. The
-	// lifecycle certificate remains authenticated while the identity area is
-	// zeroed, so an interrupted conversion resumes from the same retired intent.
-	next := slot
-	var recycledFiles [2]*os.File
-	for reserveSlot := range next.Reserves {
-		if next.Reserves[reserveSlot].Ready {
-			continue
-		}
-		retiredIndex := -1
-		for i := 0; i < int(next.RetiredCount); i++ {
-			if next.RetiredReserveMask&(uint32(1)<<i) == 0 {
-				retiredIndex = i
-				break
-			}
-		}
-		if retiredIndex < 0 {
-			break
-		}
-		retired := next.Retired[retiredIndex]
-		descriptor := reserveDescriptor{FileID: retired.FileID, Capacity: e.log.state.SegmentCapacity, Ready: true}
-		file, openErr := os.OpenFile(segmentPath(e.log.dir, retired.FileID), os.O_RDWR, 0)
-		if openErr != nil {
-			for _, opened := range recycledFiles {
-				if opened != nil {
-					_ = opened.Close()
-				}
-			}
-			return openErr
-		}
-		if recycleErr := recycleRetiredSegment(file, descriptor, e.log.state.LogID, e.authKey); recycleErr != nil {
-			_ = file.Close()
-			for _, opened := range recycledFiles {
-				if opened != nil {
-					_ = opened.Close()
-				}
-			}
-			return recycleErr
-		}
-		recycledFiles[reserveSlot] = file
-		next.Reserves[reserveSlot] = descriptor
-		next.RetiredReserveMask |= uint32(1) << retiredIndex
-	}
-	if next.RetiredReserveMask != slot.RetiredReserveMask {
-		if err := runReclaimHook(reclaimReservePrepared); err != nil {
-			for _, file := range recycledFiles {
-				if file != nil {
-					_ = file.Close()
-				}
-			}
-			return err
-		}
-		next.Generation++
-		if err := e.log.metadata.publish(next, nil); err != nil {
-			for _, file := range recycledFiles {
-				if file != nil {
-					_ = file.Close()
-				}
-			}
-			return err
-		}
-		if err := runReclaimHook(reclaimReservePublished); err != nil {
-			for _, file := range recycledFiles {
-				if file != nil {
-					_ = file.Close()
-				}
-			}
-			return err
-		}
-		e.writeMu.Lock()
-		for i := range recycledFiles {
-			if recycledFiles[i] != nil {
-				e.log.reserveFiles[i] = recycledFiles[i]
-				e.log.state.Reserves[i] = next.Reserves[i]
-			}
-		}
-		e.log.state.Generation = next.Generation
-		e.writeMu.Unlock()
-		slot = e.log.metadata.slot
-	}
-
-	for i := 0; i < int(slot.RetiredCount); i++ {
-		if slot.RetiredReserveMask&(uint32(1)<<i) != 0 {
-			continue
-		}
-		retired := slot.Retired[i]
-		path := segmentPath(e.log.dir, retired.FileID)
-		file, openErr := os.Open(path)
-		if errors.Is(openErr, os.ErrNotExist) {
-			if err := reclaimSyncDir(e.log.dir); err != nil {
-				return err
-			}
-			continue
-		}
-		if openErr != nil {
-			return openErr
-		}
-		opened, statErr := file.Stat()
-		if statErr == nil {
-			var derived SegmentMeta
-			derived, _, statErr = readUnpublishedSealedFile(file, retired.FileID, e.log.state.SegmentCapacity, e.log.state.LogID, retired.ID-1, retired.PreviousHash, e.authKey)
-			if statErr == nil && (derived.ID != retired.ID || derived.Generation != retired.Generation || derived.Hash != retired.Hash) {
-				statErr = ErrCorrupt
-			}
-		}
-		closeErr := file.Close()
-		if statErr != nil || closeErr != nil {
-			return errors.Join(statErr, closeErr)
-		}
-		if reclaimBeforeRemove != nil {
-			reclaimBeforeRemove(path)
-		}
-		if err := removeExactPublishedPath(opened, path, e.log.dir); err != nil {
-			return err
-		}
-		if err := runReclaimHook(reclaimFileRemoved); err != nil {
-			return err
-		}
-	}
-	clearA := slot
-	clearA.Generation++
-	clearA.ReclaimPhase, clearA.RetiredCount, clearA.RetiredReserveMask = reclaimNone, 0, 0
-	clear(clearA.Retired[:])
-	if err := e.log.metadata.publish(clearA, nil); err != nil {
-		return err
-	}
-	if err := runReclaimHook(reclaimQueueClearFirst); err != nil {
-		return err
-	}
-	clearB := clearA
-	clearB.Generation++
-	if err := e.log.metadata.publish(clearB, nil); err != nil {
-		return err
-	}
-	if err := runReclaimHook(reclaimQueueClearSecond); err != nil {
-		return err
-	}
-	e.writeMu.Lock()
-	e.log.state.Generation = clearB.Generation
-	e.writeMu.Unlock()
-	return e.finishCheckpointRetirements()
-}
-
 func (e *Engine) enqueueCleanupTicket(ticket *reclaimTicket) error {
 	if ticket == nil || e.cleanupRequests == nil || e.cleanupStop == nil {
 		return ErrRaftState
@@ -557,11 +436,6 @@ func (e *Engine) processCleanupTicket(ticket *reclaimTicket) {
 	var err error
 	if ticket.checkpointOnly {
 		err = e.finishCheckpointRetirements()
-	} else if ticket.recycle {
-		// Explicit ReclaimDeadPrefix retains the historical synchronous reserve
-		// conversion contract. Autonomous cleanup never sets recycle, so it
-		// cannot claim a retired file while the durable intent is live.
-		err = e.finishDurableReclaim([2]metadataSlot{}, nil, 0, nil)
 	} else {
 		err = e.finishRetiredFiles(ticket)
 	}
@@ -570,7 +444,7 @@ func (e *Engine) processCleanupTicket(ticket *reclaimTicket) {
 		e.cleanupTicket = nil
 		e.cleanupErr = err
 	}
-	if err != nil && errors.Is(err, ErrCorrupt) && !ticket.recycle && e.log != nil {
+	if err != nil && errors.Is(err, ErrCorrupt) && e.log != nil {
 		e.log.poison(err)
 	}
 	e.writeMu.Unlock()

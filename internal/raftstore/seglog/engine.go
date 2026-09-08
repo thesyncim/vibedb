@@ -428,7 +428,7 @@ func (e *Engine) startSealer() {
 				}
 				e.sealResults <- err
 			case request := <-e.reclaimRequests:
-				ticket, err := e.beginReclaim(request.recycle)
+				ticket, err := e.beginReclaim()
 				if err != nil || ticket == nil {
 					if request.result != nil {
 						request.result <- err
@@ -2582,7 +2582,7 @@ func (e *Engine) runMetadataMaintenance() {
 			return
 		}
 		e.writeMu.Unlock()
-		_, _ = e.beginReclaim(false)
+		_, _ = e.beginReclaim()
 		return
 	}
 	if e.maintenanceBusy || e.log == nil || e.log.usable() != nil || e.log.metadata == nil || e.log.metadata.slot.HasPending {
@@ -2604,7 +2604,7 @@ func (e *Engine) runMetadataMaintenance() {
 	}
 	if reclaimThresholdReached(cut, limit, reclaimedBytes, e.log.state.SegmentCapacity) {
 		e.writeMu.Unlock()
-		_, _ = e.beginReclaim(false)
+		_, _ = e.beginReclaim()
 		return
 	}
 	missing := [2]bool{}
