@@ -149,6 +149,13 @@ func TestServeRF3ReadAuthorityLiveAppendAndRetainedRestart(t *testing.T) {
 			t.Fatalf("member %d authority policy delegate decision = %v", member+1, got)
 		}
 	}
+	gatewayProfile, err := servicetls.LoadProfile(
+		credentials[3].Certificate, credentials[3].Key, roots,
+		rf3CommandIdentityOID.String(), time.Now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var base sqldriver.ReplicatedShardStoreIdentity
 	if err := loadRF3IdentityFile(manifests[0].Groups[0].SQL.IdentityPath, &base); err != nil {
 		t.Fatal(err)
@@ -307,7 +314,7 @@ func TestServeRF3ReadAuthorityLiveAppendAndRetainedRestart(t *testing.T) {
 	newGroup := manifests[0].Groups[1].Route.Group
 	newAllocation := manifests[0].Groups[1].Route.AllocationGeneration
 	waitRF3CommandLeader(t, [rf3CommandMembers]string{addresses[0][1], addresses[1][1], addresses[2][1]}, nodes, profiles[:], newGroup, newAllocation, authorityGeneration, startupErrors)
-	leader, state := rf3CommandFindLeader(t, []string{addresses[0][1], addresses[1][1], addresses[2][1]}, nodes[:], profiles[0], nodes[0], newGroup, newAllocation, authorityGeneration)
+	leader, state := rf3CommandFindLeader(t, []string{addresses[0][1], addresses[1][1], addresses[2][1]}, nodes[:], gatewayProfile, gatewayNode, newGroup, newAllocation, authorityGeneration)
 	newBundle := manifests[leader].Groups[1]
 	readAuthority := serviceauthz.Authority{Node: nodes[(leader+1)%rf3CommandMembers], Generation: authorityGeneration}
 	state, beforeRead, err := rf3WaitForReadAuthoritySQLReady(t, addresses[leader][1], nodes[leader], profiles[(leader+1)%rf3CommandMembers], newBundle, state, readAuthority, diagnostics[leader], inputs[leader].Root, newGroup)
@@ -393,7 +400,7 @@ func TestServeRF3ReadAuthorityLiveAppendAndRetainedRestart(t *testing.T) {
 	for _, bundle := range manifests[0].Groups {
 		waitRF3CommandLeader(t, [rf3CommandMembers]string{addresses[0][1], addresses[1][1], addresses[2][1]}, nodes, profiles[:], bundle.Route.Group, bundle.Route.AllocationGeneration, authorityGeneration, startupErrors)
 	}
-	restartLeader, restartState := rf3CommandFindLeader(t, []string{addresses[0][1], addresses[1][1], addresses[2][1]}, nodes[:], profiles[0], nodes[0], newGroup, newAllocation, authorityGeneration)
+	restartLeader, restartState := rf3CommandFindLeader(t, []string{addresses[0][1], addresses[1][1], addresses[2][1]}, nodes[:], gatewayProfile, gatewayNode, newGroup, newAllocation, authorityGeneration)
 	restartBundle := manifests[restartLeader].Groups[1]
 	restartAuthority := serviceauthz.Authority{Node: nodes[(restartLeader+1)%rf3CommandMembers], Generation: authorityGeneration}
 	restartState, beforeRestartRead, err := rf3WaitForReadAuthoritySQLReady(t, addresses[restartLeader][1], nodes[restartLeader], profiles[(restartLeader+1)%rf3CommandMembers], restartBundle, restartState, restartAuthority, diagnostics[restartLeader], inputs[restartLeader].Root, newGroup)
