@@ -1,5 +1,3 @@
-//go:build !vibedb_rf3_read_authority_lab
-
 package main
 
 import (
@@ -13,7 +11,7 @@ import (
 	"github.com/thesyncim/vibejson"
 )
 
-func TestStandardShardRejectsEnabledReadAuthorityBeforeRuntime(t *testing.T) {
+func TestShardValidatesEnabledReadAuthorityBeforeRuntime(t *testing.T) {
 	config := &rf3ManifestReadAuthority{
 		Enabled: true, FeatureVersion: rf3ReadAuthorityFeatureVersion,
 		PolicyVersion:        rf3ReadAuthorityPolicyVersion,
@@ -35,12 +33,12 @@ func TestStandardShardRejectsEnabledReadAuthorityBeforeRuntime(t *testing.T) {
 		},
 		MemberCount: rf3ManifestMembers,
 	}
-	if err := validateRF3ReadAuthority(config, []rf3ManifestGroup{group}, false); !errors.Is(err, errRF3ReadAuthority) {
-		t.Fatalf("standard enabled policy error = %v", err)
+	if err := validateRF3ReadAuthority(config, []rf3ManifestGroup{group}, false); err != nil {
+		t.Fatalf("valid enabled policy error = %v", err)
 	}
 }
 
-func TestStandardOmittedPolicyStillRefusesEnrolledMarker(t *testing.T) {
+func TestRetainedPolicyRefusesDowngradeAfterEnrollment(t *testing.T) {
 	policy := raftauthority.ReadAuthorityPolicy{
 		Enabled: true, PolicyVersion: rf3ReadAuthorityPolicyVersion,
 		MaxGrant: rf3ReadAuthorityMaxGrant, ClockRatePPM: rf3ReadAuthorityClockRatePPM,
@@ -52,15 +50,8 @@ func TestStandardOmittedPolicyStillRefusesEnrolledMarker(t *testing.T) {
 		},
 	}
 	root := t.TempDir()
-	if err := ensureRF3ReadAuthorityState(root, policy); !errors.Is(err, errRF3ReadAuthority) {
-		t.Fatalf("standard marker enrollment error = %v", err)
-	}
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(entries) != 0 {
-		t.Fatalf("standard marker enrollment wrote %d entries", len(entries))
+	if err := ensureRF3ReadAuthorityState(root, policy); err != nil {
+		t.Fatalf("marker enrollment error = %v", err)
 	}
 	state := rf3ReadAuthorityStateFor(policy)
 	stateRaw, err := vibejson.Marshal(&state)
@@ -71,6 +62,6 @@ func TestStandardOmittedPolicyStillRefusesEnrolledMarker(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := ensureRF3ReadAuthorityDisabled(root); !errors.Is(err, errRF3ReadAuthorityDowngrade) {
-		t.Fatalf("omitted policy marker error = %v", err)
+		t.Fatalf("downgrade marker error = %v", err)
 	}
 }

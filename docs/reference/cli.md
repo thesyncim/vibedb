@@ -37,7 +37,7 @@ Creates or reopens one durable local development topology and supervises its chi
 | `--diagnostics-on-exit` | `false` | Print bounded child log tails after shutdown. |
 | `--pg-listen` | disabled | RF3-only PostgreSQL endpoint on the first physical node. Requires a literal loopback IP and port `1..65535`. |
 | `--pg-listens` | disabled | Comma-separated distinct loopback endpoints, one per physical node. Mutually exclusive with `--pg-listen`. |
-| `--read-authority` | `false` | Laboratory-only experimental RF3 read-authority protocol. Standard binaries reject this flag before cluster creation; the retained cluster must use the same setting. |
+| `--read-authority` | omitted | Explicitly enable or disable quorum read authority on RF3 physical-node voters. When omitted, a fresh supported Linux RF3 physical cluster enables the fixed policy automatically; a retained cluster reuses its recorded policy exactly. |
 | `--table-schema` | none | Repeatable RF3-only file, each containing one `CREATE TABLE` with one primary key; retained on restart. |
 
 RF1 starts three independent single-member Raft groups and no gateway. RF3
@@ -47,21 +47,22 @@ catalog, request-ledger, and data group still has three replicas. The current
 launcher persists format-2 topology and rejects obsolete layouts. See the
 [local cluster tutorial](../operations/local-cluster.md).
 
-`--read-authority` is an explicit experimental qualification switch available
-only in a binary built with the laboratory tag below. A normal `go build`
-cannot enable it, and `vibedb-shard` also rejects an enabled read-authority
-section in a standard manifest before preparing, serving, reloading, or
-adopting any artifact. Build and label the qualification binaries explicitly:
+Fresh RF3 physical clusters with three or six serving nodes use the fixed
+read-authority policy automatically when the qualified elapsed clock is
+available. Use `--read-authority=false` to keep a fresh cluster on ReadIndex,
+or `--read-authority=true` to require the policy explicitly. On restart, an
+omitted flag reuses the manifest's exact policy; an explicit value that differs
+from the retained policy is refused before reconciliation. Unsupported
+platforms keep fresh deployments on ReadIndex, while a retained enabled policy
+fails closed rather than being removed.
 
 ```sh
-go build -tags=vibedb_rf3_read_authority_lab -o ./bin/vibedb ./cmd/vibedb
-go build -tags=vibedb_rf3_read_authority_lab -o ./bin/vibedb-shard ./cmd/vibedb-shard
-go build -tags=vibedb_rf3_read_authority_lab -o ./bin/vibedb-gateway ./cmd/vibedb-gateway
+go build -o ./bin/vibedb ./cmd/vibedb
+go build -o ./bin/vibedb-shard ./cmd/vibedb-shard
+go build -o ./bin/vibedb-gateway ./cmd/vibedb-gateway
 ```
 
-Use those tagged binaries only for a separately labelled laboratory
-qualification. The tag is not part of the standard development build. The
-switch uses
+The switch uses
 Linux `CLOCK_BOOTTIME`, a fixed v1 policy (5 s maximum grant, 100000 ppm rate
 bound, and 1 ms margin), and an authenticated asynchronous incarnation cache.
 Deployment assumes every participant's elapsed clock rate stays within ±10% of

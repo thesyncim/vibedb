@@ -1,4 +1,4 @@
-//go:build linux && vibedb_rf3_read_authority_lab
+//go:build linux
 
 package main
 

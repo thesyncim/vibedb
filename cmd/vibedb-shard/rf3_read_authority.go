@@ -16,7 +16,6 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftauthority"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
-	"github.com/thesyncim/vibedb/internal/rf3qualification"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/shardservice"
 	"github.com/thesyncim/vibejson"
@@ -109,13 +108,6 @@ func validateRF3ReadAuthority(
 ) error {
 	if config == nil {
 		return nil
-	}
-	// The enabled section is admitted only by an explicitly tagged laboratory
-	// binary. Keep this check in the shared manifest validator so every
-	// prepare, serve, reload, and adoption path refuses the policy before it
-	// can write a marker or configure a runtime.
-	if !rf3qualification.ReadAuthorityEnabled {
-		return errRF3ReadAuthority
 	}
 	policy, err := config.rf3Policy()
 	if err != nil || developmentOnly || len(groups) == 0 || len(policy.Voters) != rf3ManifestMembers {
@@ -282,9 +274,6 @@ func syncRF3ReadAuthorityState(path string) error {
 // distinguish a previously qualified policy from a marker that this startup
 // may create after its publication/roster preflight.
 func inspectRF3ReadAuthorityState(memberRoot string, policy raftauthority.ReadAuthorityPolicy) (bool, error) {
-	if !rf3qualification.ReadAuthorityEnabled {
-		return false, errors.Join(errRF3ReadAuthorityState, errRF3ReadAuthority)
-	}
 	if !policy.Enabled {
 		return false, errors.Join(errRF3ReadAuthorityState, errRF3ReadAuthority)
 	}

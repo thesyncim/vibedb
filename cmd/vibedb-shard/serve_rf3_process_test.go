@@ -1312,13 +1312,50 @@ func probeRF3CommandMember(
 	group raftmember.GroupKey,
 	allocation, generation uint64,
 ) (shardservice.ReplicatedMemberState, error) {
+	return probeRF3CommandMemberWithDeadline(ctx, address, serverNode, profile, authorityNode,
+		group, allocation, generation, func() time.Time { return time.Now().Add(3 * time.Second) })
+}
+
+// probeRF3CommandMemberAtContextDeadline is used only by failure diagnostics.
+// The ordinary probe above intentionally keeps its historical rolling socket
+// deadline; this variant makes the diagnostic's shared context deadline cover
+// dialing, TLS/preface I/O, and the authenticated probe exchange alike.
+func probeRF3CommandMemberAtContextDeadline(
+	ctx context.Context,
+	address string,
+	serverNode rafttransport.NodeID,
+	profile *rafttransport.PeerTLS,
+	authorityNode rafttransport.NodeID,
+	group raftmember.GroupKey,
+	allocation, generation uint64,
+) (shardservice.ReplicatedMemberState, error) {
+	deadline, hasDeadline := ctx.Deadline()
+	deadlineFunc := func() time.Time {
+		if hasDeadline {
+			return deadline
+		}
+		return time.Now().Add(3 * time.Second)
+	}
+	return probeRF3CommandMemberWithDeadline(ctx, address, serverNode, profile, authorityNode,
+		group, allocation, generation, deadlineFunc)
+}
+
+func probeRF3CommandMemberWithDeadline(
+	ctx context.Context,
+	address string,
+	serverNode rafttransport.NodeID,
+	profile *rafttransport.PeerTLS,
+	authorityNode rafttransport.NodeID,
+	group raftmember.GroupKey,
+	allocation, generation uint64,
+	deadline func() time.Time,
+) (shardservice.ReplicatedMemberState, error) {
 	probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	raw, err := (&net.Dialer{}).DialContext(probeCtx, "tcp", address)
 	if err != nil {
 		return shardservice.ReplicatedMemberState{}, err
 	}
-	deadline := func() time.Time { return time.Now().Add(3 * time.Second) }
 	connection, err := profile.Client(
 		probeCtx, raw, serverNode, rafttransport.TrafficShardNative, deadline,
 	)
