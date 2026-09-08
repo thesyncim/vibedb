@@ -310,6 +310,86 @@ func (s *NodeStore) ReclaimDeadNodeLogPrefix() error {
 	return engine.ReclaimDeadPrefix()
 }
 
+// StartReclaimDeadNodeLogPrefix queues a bounded reclaim pass without waiting
+// for checkpoint publication or physical cleanup. The node checkpoint
+// coordinator uses this form so application snapshot captures can continue.
+func (s *NodeStore) StartReclaimDeadNodeLogPrefix() error {
+	if s == nil {
+		return ErrInvalid
+	}
+	s.mu.Lock()
+	if err := s.usable(); err != nil {
+		s.mu.Unlock()
+		return err
+	}
+	s.maintenance.Add(1)
+	engine := s.engine
+	s.mu.Unlock()
+	defer s.maintenance.Done()
+	return engine.StartReclaimDeadPrefix()
+}
+
+// MaintainNodeLog checkpoints a changed descriptor catalog, then queues one
+// bounded node-log reclamation pass. The checkpoint coordinator owns this
+// call; the submission worker cannot wait for a catalog wave it submits, and
+// the coordinator must remain available for application snapshot captures.
+func (q *NodeSubmissionSequencer) MaintainNodeLog() error {
+	if q == nil || q.store == nil || q.closed.Load() {
+		return ErrClosed
+	}
+	s := q.store
+	s.mu.Lock()
+	if err := s.usable(); err != nil {
+		s.mu.Unlock()
+		return err
+	}
+	if s.engine == nil {
+		s.mu.Unlock()
+		return ErrInvalid
+	}
+	metadata, exists := s.engine.Metadata(nodeDescriptorGroup)
+	through := uint64(len(s.descriptors))
+	s.mu.Unlock()
+	if !exists || through == 0 || metadata.Checkpoint.Index > through {
+		if failure := s.coordinateReadError(); failure != nil {
+			return failure
+		}
+		return ErrCorrupt
+	}
+	if metadata.Checkpoint.Index < through {
+		if err := s.CheckpointDescriptorCatalog(); err != nil {
+			return err
+		}
+	}
+	err := s.StartReclaimDeadNodeLogPrefix()
+	if errors.Is(err, seglog.ErrBounds) {
+		if failure := s.coordinateReadError(); failure != nil {
+			return failure
+		}
+		q.maintenanceRetry.Store(true)
+	} else {
+		q.maintenanceRetry.Store(false)
+	}
+	return err
+}
+
+func (q *NodeSubmissionSequencer) NodeMaintenanceRetryNeeded() bool {
+	if q == nil || q.store == nil || q.closed.Load() {
+		return false
+	}
+	s := q.store
+	s.mu.Lock()
+	if s.usable() != nil || s.engine == nil {
+		s.mu.Unlock()
+		return false
+	}
+	metadata, exists := s.engine.Metadata(nodeDescriptorGroup)
+	dirty := exists && metadata.Checkpoint.Index < uint64(len(s.descriptors))
+	engine := s.engine
+	s.mu.Unlock()
+	return dirty || q.maintenanceRetry.Load() || engine.MaintenanceRetryNeeded()
+}
+
 func (s *NodeStore) publishDescriptorCatalogReference(candidate descriptorCatalogCandidate) error {
 	s.mu.Lock()
 	sequencer := s.sequencer
@@ -401,7 +481,7 @@ func (s *NodeStore) readDescriptorCatalog(checkpoint seglog.Checkpoint, limit in
 	_, _ = mac.Write(header[:])
 	workspace := newObjectCryptoWorkspace(s.crypto.dataKey, s.crypto.nonceKey)
 	headerDigest := sha256.Sum256(header[:])
-	descriptors := make([]GroupDescriptor, 0, min(int(count), limit))
+	descriptors := make([]GroupDescriptor, 0, limit)
 	ciphertext := make([]byte, nodeDescriptorFixed+2*MaxIdentityComponentBytes+s.crypto.aead.Overhead())
 	plain := make([]byte, 0, nodeDescriptorFixed+2*MaxIdentityComponentBytes)
 	var record [descriptorCatalogRecordBytes]byte

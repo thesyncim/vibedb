@@ -13,6 +13,7 @@ import (
 	"slices"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	pb "go.etcd.io/raft/v3/raftpb"
@@ -136,9 +137,24 @@ type engineGroup struct {
 	latestWaveSequence  uint64
 }
 type segmentReader struct {
-	id     uint64
-	file   *os.File
-	routes *LazyRouteReader
+	id         uint64
+	generation uint64
+	file       *os.File
+	routes     *LazyRouteReader
+	leases     atomic.Uint32
+	accepting  bool
+	detached   bool
+}
+
+// ReadLease pins one cached segment reader across a Lookup/Read gap. It is a
+// small copyable handle: all copies share the pointer-backed release state and
+// Close is idempotent.
+type ReadLease struct{ state *readLeaseState }
+
+type readLeaseState struct {
+	reader   *segmentReader
+	engine   *Engine
+	released atomic.Bool
 }
 
 type sealRequest struct {
@@ -197,14 +213,27 @@ func (arena *segmentBuildArena) clear() {
 }
 
 type Engine struct {
-	writeMu             sync.Mutex
+	writeMu sync.Mutex
+	// metadataMu serializes the cleanup worker's latest-slot publication with
+	// the sealer's generation/tail prediction. The worker never holds it while
+	// authenticating or unlinking files, so physical cleanup remains detached
+	// from the foreground path.
+	metadataMu          sync.Mutex
 	sealRequests        chan sealRequest
-	reclaimRequests     chan chan error
+	reclaimRequests     chan reclaimRequest
+	cleanupRequests     chan *reclaimTicket
+	cleanupStop         chan struct{}
+	cleanupDone         chan struct{}
+	cleanupTicket       *reclaimTicket
+	cleanupErr          error
+	reclaimMinSegments  int
+	reclaimMaxSegments  int
 	sealResults         chan error
 	sealStop            chan struct{}
 	sealerDone          chan struct{}
 	sealPending         bool
 	maintenanceBusy     bool
+	closing             bool
 	activeBuild         *segmentBuildArena
 	spareBuild          *segmentBuildArena
 	sealBuildHookTest   func()
@@ -220,7 +249,10 @@ type Engine struct {
 	eventScratch        []segmentEvent
 	syncData            func(*os.File) error
 	writeAt             func(*os.File, []byte, int64) (int, error)
-	readers             []segmentReader
+	readerMu            sync.Mutex
+	readerCond          *sync.Cond
+	readers             []*segmentReader
+	detachedReaders     []*segmentReader
 	readerNext          int
 	authMAC             hash.Hash
 	authKey             [32]byte
@@ -254,6 +286,111 @@ type recoveryIOCounters struct {
 	maintenanceReserveAttempts, maintenanceCheckpointAttempts uint64
 }
 
+func newReaderSlots(count int) []*segmentReader {
+	if count <= 0 {
+		return nil
+	}
+	readers := make([]*segmentReader, count)
+	for i := range readers {
+		readers[i] = &segmentReader{}
+	}
+	return readers
+}
+
+func (e *Engine) ensureReaderCondLocked() {
+	if e.readerCond == nil {
+		e.readerCond = sync.NewCond(&e.readerMu)
+	}
+}
+
+func (e *Engine) closeReaderLocked(reader *segmentReader) error {
+	if reader == nil {
+		return nil
+	}
+	reader.accepting = false
+	if reader.file == nil {
+		reader.routes = nil
+		return nil
+	}
+	err := reader.file.Close()
+	reader.file = nil
+	reader.routes = nil
+	reader.detached = false
+	return err
+}
+
+func (e *Engine) releaseReaderLease(reader *segmentReader) {
+	if reader == nil {
+		return
+	}
+	if reader.leases.Add(^uint32(0)) == 0 {
+		e.readerMu.Lock()
+		e.ensureReaderCondLocked()
+		if reader.detached {
+			_ = e.closeReaderLocked(reader)
+		}
+		e.readerCond.Broadcast()
+		e.readerMu.Unlock()
+	}
+}
+
+// Close releases the pinned reader generation. A zero or copied lease is safe
+// to close repeatedly.
+func (lease ReadLease) Close() {
+	if lease.state == nil || lease.state.released.Swap(true) {
+		return
+	}
+	lease.state.engine.releaseReaderLease(lease.state.reader)
+}
+
+// Read reads one entry through the pinned reader generation. The caller must
+// keep the lease alive until this operation returns.
+func (lease ReadLease) Read(location EntryLocation, dst []byte) ([]byte, error) {
+	if lease.state == nil || lease.state.released.Load() || lease.state.reader == nil {
+		return nil, ErrBounds
+	}
+	if location.SegmentID != lease.state.reader.id || location.Bytes > uint64(len(dst)) {
+		return nil, ErrBounds
+	}
+	result := dst[:location.Bytes]
+	if _, err := lease.state.reader.file.ReadAt(result, int64(location.Offset)); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (e *Engine) acquireReaderLocked(segmentID uint64) (*segmentReader, ReadLease, bool) {
+	reader, ok := e.acquireReaderRefLocked(segmentID)
+	if !ok {
+		return nil, ReadLease{}, false
+	}
+	return reader, ReadLease{state: &readLeaseState{reader: reader, engine: e}}, true
+}
+
+func (e *Engine) acquireReaderRefLocked(segmentID uint64) (*segmentReader, bool) {
+	for _, reader := range e.readers {
+		if reader == nil || reader.id != segmentID || reader.file == nil || !reader.accepting {
+			continue
+		}
+		reader.leases.Add(1)
+		return reader, true
+	}
+	return nil, false
+}
+
+func (e *Engine) detachReaderLocked(reader *segmentReader) error {
+	if reader == nil || reader.file == nil {
+		return nil
+	}
+	reader.accepting = false
+	if reader.leases.Load() != 0 {
+		reader.detached = true
+		e.detachedReaders = append(e.detachedReaders, reader)
+		return nil
+	}
+	return e.closeReaderLocked(reader)
+}
+
 func CreateEngineAuthenticated(dir string, logID [16]byte, authKey [32]byte, segmentCapacity uint64) (*Engine, error) {
 	if logID == ([16]byte{}) || authKey == ([32]byte{}) || segmentCapacity < segmentHeaderBytes || segmentCapacity >= 1<<32 {
 		return nil, ErrBounds
@@ -262,17 +399,22 @@ func CreateEngineAuthenticated(dir string, logID [16]byte, authKey [32]byte, seg
 	if err != nil {
 		return nil, err
 	}
-	e := &Engine{log: l, groups: make(map[uint64]*engineGroup), waves: make(map[WaveID]waveState), liveSealed: make(map[uint64]uint32), reclaimAfter: make([]uint64, len(l.state.Segments), cap(l.state.Segments)), sealedSummaries: make(map[uint64]sealedRunSummary), syncData: syncActiveData, writeAt: func(f *os.File, b []byte, off int64) (int, error) { return f.WriteAt(b, off) }, authMAC: hmac.New(sha256.New, authKey[:]), authKey: authKey}
+	e := &Engine{log: l, groups: make(map[uint64]*engineGroup), waves: make(map[WaveID]waveState), liveSealed: make(map[uint64]uint32), reclaimAfter: make([]uint64, len(l.state.Segments), cap(l.state.Segments)), sealedSummaries: make(map[uint64]sealedRunSummary), reclaimMinSegments: reclaimMinSegments, reclaimMaxSegments: reclaimMaxSegments, syncData: syncActiveData, writeAt: func(f *os.File, b []byte, off int64) (int, error) { return f.WriteAt(b, off) }, authMAC: hmac.New(sha256.New, authKey[:]), authKey: authKey}
+	e.readerCond = sync.NewCond(&e.readerMu)
 	e.startSealer()
 	return e, nil
 }
 
 func (e *Engine) startSealer() {
 	e.sealRequests = make(chan sealRequest, 1)
-	e.reclaimRequests = make(chan chan error, 1)
+	e.reclaimRequests = make(chan reclaimRequest, 1)
+	e.cleanupRequests = make(chan *reclaimTicket, 1)
+	e.cleanupStop = make(chan struct{})
+	e.cleanupDone = make(chan struct{})
 	e.sealResults = make(chan error, 1)
 	e.sealStop = make(chan struct{})
 	e.sealerDone = make(chan struct{})
+	go e.runCleanupWorker()
 	go func() {
 		defer close(e.sealerDone)
 		ticker := time.NewTicker(time.Second)
@@ -287,8 +429,19 @@ func (e *Engine) startSealer() {
 					e.writeMu.Unlock()
 				}
 				e.sealResults <- err
-			case result := <-e.reclaimRequests:
-				result <- e.reclaimDeadPrefix()
+			case request := <-e.reclaimRequests:
+				ticket, err := e.beginReclaim()
+				if err != nil || ticket == nil {
+					if request.result != nil {
+						request.result <- err
+					}
+					continue
+				}
+				if request.result != nil {
+					go func(result chan error, ticket *reclaimTicket) {
+						result <- <-ticket.done
+					}(request.result, ticket)
+				}
 			case <-ticker.C:
 				e.runMetadataMaintenance()
 			case <-e.sealStop:
@@ -316,24 +469,77 @@ func (e *Engine) waveDigest(payload []byte, sequence uint64, id WaveID) [32]byte
 
 func (e *Engine) Close() error {
 	var err error
-	if e.sealPending {
+	e.writeMu.Lock()
+	if e.closing {
+		e.writeMu.Unlock()
+		return nil
+	}
+	e.closing = true
+	sealPending := e.sealPending
+	e.writeMu.Unlock()
+	if sealPending {
 		err = <-e.sealResults
+		e.writeMu.Lock()
 		e.sealPending = false
+		e.writeMu.Unlock()
 	}
 	if e.sealStop != nil {
 		close(e.sealStop)
 		<-e.sealerDone
 		e.sealStop = nil
 	}
-	e.writeMu.Lock()
-	defer e.writeMu.Unlock()
-	for i := range e.readers {
-		if e.readers[i].file != nil {
-			err = errors.Join(err, e.readers[i].file.Close())
-			e.readers[i] = segmentReader{}
+	if e.cleanupStop != nil {
+		close(e.cleanupStop)
+		<-e.cleanupDone
+		e.cleanupStop = nil
+	}
+	// Stop new reader acquisitions before waiting for the existing leases. Do
+	// not hold writeMu while waiting: a reader release only needs readerMu.
+	e.readerMu.Lock()
+	e.ensureReaderCondLocked()
+	for _, reader := range e.readers {
+		if reader != nil {
+			reader.accepting = false
 		}
 	}
+	for _, reader := range e.detachedReaders {
+		if reader != nil {
+			reader.accepting = false
+		}
+	}
+	for e.readersHaveLeasesLocked() {
+		e.readerCond.Wait()
+	}
+	for _, reader := range e.readers {
+		err = errors.Join(err, e.closeReaderLocked(reader))
+	}
+	for _, reader := range e.detachedReaders {
+		err = errors.Join(err, e.closeReaderLocked(reader))
+	}
+	e.readers = nil
+	e.detachedReaders = nil
+	e.readerMu.Unlock()
+
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+	if e.log == nil {
+		return err
+	}
 	return errors.Join(err, e.log.Close())
+}
+
+func (e *Engine) readersHaveLeasesLocked() bool {
+	for _, reader := range e.readers {
+		if reader != nil && reader.leases.Load() != 0 {
+			return true
+		}
+	}
+	for _, reader := range e.detachedReaders {
+		if reader != nil && reader.leases.Load() != 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // WaitSeal is a control-plane fence for rotation tests, shutdown, and callers
@@ -357,68 +563,125 @@ func (e *Engine) WaitSeal() error {
 	return err
 }
 
+// MaintenanceRetryNeeded reports durable metadata work that a node-level
+// coordinator should retry after the serial maintenance lane becomes idle.
+func (e *Engine) MaintenanceRetryNeeded() bool {
+	if e == nil {
+		return false
+	}
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+	if e.log == nil || e.log.metadata == nil {
+		return false
+	}
+	slot := e.log.metadata.slot
+	return e.maintenanceBusy || slot.HasPending || slot.ReclaimPhase != reclaimNone || slot.RetiredCheckpointCount != 0
+}
+
 // ReserveReaders fixes the maximum number of retained sealed descriptors.
 // Cache misses are explicit control-plane operations through PrepareSegment.
 func (e *Engine) ReserveReaders(count int) error {
-	if err := e.log.usable(); err != nil {
-		return err
-	}
 	if count < 0 {
 		return ErrBounds
 	}
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+	if e.log == nil {
+		return ErrRaftState
+	}
+	if err := e.log.usable(); err != nil {
+		return err
+	}
+	if e.closing {
+		return os.ErrClosed
+	}
+	e.readerMu.Lock()
+	defer e.readerMu.Unlock()
+	e.ensureReaderCondLocked()
 	for i := count; i < len(e.readers); i++ {
-		if e.readers[i].file != nil {
-			_ = e.readers[i].file.Close()
+		reader := e.readers[i]
+		if reader != nil && reader.file != nil && reader.leases.Load() != 0 {
+			return ErrBackpressure
 		}
 	}
-	if count != len(e.readers) {
-		e.readers = make([]segmentReader, count)
-		e.readerNext = 0
+	var err error
+	for i := count; i < len(e.readers); i++ {
+		err = errors.Join(err, e.closeReaderLocked(e.readers[i]))
 	}
-	return nil
+	if count != len(e.readers) {
+		updated := newReaderSlots(count)
+		copy(updated, e.readers[:min(count, len(e.readers))])
+		e.readers = updated
+		if count == 0 {
+			e.readerNext = 0
+		} else {
+			e.readerNext %= count
+		}
+	}
+	return err
 }
 
 func (e *Engine) PrepareSegment(segmentID uint64) error {
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+	return e.prepareSegmentLocked(segmentID)
+}
+
+// prepareSegmentLocked is used by append validation, which already owns
+// writeMu. Keeping one explicit locked variant avoids recursive mutex locking
+// while preserving the public control-plane method's serialization.
+func (e *Engine) prepareSegmentLocked(segmentID uint64) error {
+	if e.log == nil {
+		return ErrRaftState
+	}
 	if err := e.log.usable(); err != nil {
 		return err
+	}
+	if e.closing {
+		return os.ErrClosed
 	}
 	if segmentID == e.log.state.ActiveID {
 		return nil
 	}
-	for i := range e.readers {
-		if e.readers[i].id == segmentID && e.readers[i].file != nil {
-			return nil
-		}
-	}
-	found := false
-	for _, meta := range e.log.state.Segments {
-		if meta.ID == segmentID {
-			found = true
-			break
-		}
-	}
-	if !found || len(e.readers) == 0 {
-		return ErrBounds
-	}
 	fileID, ok := e.fileIDForSegment(segmentID)
+	logID := e.log.state.LogID
+	dir := e.log.dir
 	if !ok {
 		return ErrBounds
 	}
-	f, err := os.Open(segmentPath(e.log.dir, fileID))
-	if err != nil {
-		return err
+
+	e.readerMu.Lock()
+	defer e.readerMu.Unlock()
+	e.ensureReaderCondLocked()
+	if e.closing || len(e.readers) == 0 {
+		return ErrBounds
+	}
+	for _, reader := range e.readers {
+		if reader != nil && reader.id == segmentID && reader.file != nil && reader.accepting {
+			return nil
+		}
 	}
 	slot := e.readerNext % len(e.readers)
 	e.readerNext++
-	if e.readers[slot].file != nil {
-		_ = e.readers[slot].file.Close()
+	old := e.readers[slot]
+	if old != nil && old.file != nil {
+		if old.leases.Load() != 0 {
+			return ErrBackpressure
+		}
+		if err := e.closeReaderLocked(old); err != nil {
+			return err
+		}
 	}
-	routes, err := newLazyRouteReader(f, e.authKey, e.log.state.LogID, segmentID, 4, true)
+	f, err := os.Open(segmentPath(dir, fileID))
+	if err != nil {
+		return err
+	}
+	routes, err := newLazyRouteReader(f, e.authKey, logID, segmentID, 4, true)
 	if err != nil {
 		_ = f.Close()
 		return err
 	}
-	e.readers[slot] = segmentReader{id: segmentID, file: f, routes: routes}
+	e.readers[slot] = &segmentReader{id: segmentID, generation: segmentID, file: f, routes: routes, accepting: true}
 	return nil
 }
 
@@ -440,28 +703,46 @@ func (e *Engine) fileIDForSegment(segmentID uint64) (fileID, bool) {
 // ReadLocation reads exactly one entry value without decoding its containing
 // wave. Returned bytes alias dst and remain valid until the caller reuses dst.
 func (e *Engine) ReadLocation(location EntryLocation, dst []byte) ([]byte, error) {
-	if err := e.log.usable(); err != nil {
-		return nil, err
-	}
 	if location.Bytes > uint64(len(dst)) {
 		return nil, ErrBounds
 	}
-	var file *os.File
-	if location.SegmentID == e.log.state.ActiveID {
-		file = e.log.active
-	} else {
-		for i := range e.readers {
-			if e.readers[i].id == location.SegmentID {
-				file = e.readers[i].file
-				break
-			}
-		}
+	e.writeMu.Lock()
+	if e.log == nil {
+		e.writeMu.Unlock()
+		return nil, ErrRaftState
 	}
-	if file == nil {
+	if err := e.log.usable(); err != nil {
+		e.writeMu.Unlock()
+		return nil, err
+	}
+	if e.closing {
+		e.writeMu.Unlock()
+		return nil, os.ErrClosed
+	}
+	if location.SegmentID == e.log.state.ActiveID {
+		result := dst[:location.Bytes]
+		_, err := e.log.active.ReadAt(result, int64(location.Offset))
+		e.writeMu.Unlock()
+		if err != nil {
+			return nil, err
+		}
+		return result, nil
+	}
+	closing := e.closing
+	e.writeMu.Unlock()
+	if closing {
+		return nil, os.ErrClosed
+	}
+	e.readerMu.Lock()
+	reader, ok := e.acquireReaderRefLocked(location.SegmentID)
+	e.readerMu.Unlock()
+	if !ok {
 		return nil, ErrBounds
 	}
 	result := dst[:location.Bytes]
-	if _, err := file.ReadAt(result, int64(location.Offset)); err != nil {
+	_, err := reader.file.ReadAt(result, int64(location.Offset))
+	e.releaseReaderLease(reader)
+	if err != nil {
 		return nil, err
 	}
 	return result, nil
@@ -817,19 +1098,94 @@ func (e *Engine) LookupExact(group, index uint64) (location EntryLocation, term 
 		if err := e.PrepareSegment(run.SegmentID); err != nil {
 			return EntryLocation{}, 0, false, false, err
 		}
-		for slot := range e.readers {
-			reader := &e.readers[slot]
-			if reader.id != run.SegmentID || reader.routes == nil {
-				continue
-			}
-			route, err := reader.routes.Point(run, index)
-			if err != nil {
-				return EntryLocation{}, 0, false, false, err
-			}
-			return EntryLocation{SegmentID: run.SegmentID, Offset: route.ExtentOffset, Bytes: route.ExtentBytes, Index: index, Term: route.Term, Type: pb.EntryType(route.Type), DataOffset: route.DataOffset, DataBytes: route.DataBytes, BatchID: route.BatchID, ExtentID: route.ExtentID}, route.Term, false, true, nil
+		e.readerMu.Lock()
+		reader, acquired := e.acquireReaderRefLocked(run.SegmentID)
+		e.readerMu.Unlock()
+		if !acquired {
+			continue
 		}
+		route, err := reader.routes.Point(run, index)
+		e.releaseReaderLease(reader)
+		if err != nil {
+			return EntryLocation{}, 0, false, false, err
+		}
+		return EntryLocation{SegmentID: run.SegmentID, Offset: route.ExtentOffset, Bytes: route.ExtentBytes, Index: index, Term: route.Term, Type: pb.EntryType(route.Type), DataOffset: route.DataOffset, DataBytes: route.DataBytes, BatchID: route.BatchID, ExtentID: route.ExtentID}, route.Term, false, true, nil
 	}
 	return EntryLocation{}, 0, false, false, nil
+}
+
+// AcquireLocation pins the cached reader for a previously returned sealed
+// location. Locations in the active segment are read through ReadLocation's
+// writeMu-protected path and therefore return a zero lease.
+func (e *Engine) AcquireLocation(location EntryLocation) (ReadLease, error) {
+	if e == nil {
+		return ReadLease{}, ErrRaftState
+	}
+	e.writeMu.Lock()
+	if e.log == nil {
+		e.writeMu.Unlock()
+		return ReadLease{}, ErrRaftState
+	}
+	if err := e.log.usable(); err != nil {
+		e.writeMu.Unlock()
+		return ReadLease{}, err
+	}
+	if location.SegmentID == e.log.state.ActiveID {
+		e.writeMu.Unlock()
+		return ReadLease{}, nil
+	}
+	if e.closing {
+		e.writeMu.Unlock()
+		return ReadLease{}, os.ErrClosed
+	}
+	e.writeMu.Unlock()
+	e.readerMu.Lock()
+	reader, ok := e.acquireReaderRefLocked(location.SegmentID)
+	e.readerMu.Unlock()
+	if !ok {
+		return ReadLease{}, ErrBounds
+	}
+	return ReadLease{state: &readLeaseState{reader: reader, engine: e}}, nil
+}
+
+// LookupExactLease resolves a sealed location and pins its reader atomically
+// with respect to reader eviction. The returned EntryLocation remains a plain
+// copy; callers own the lease until Close.
+func (e *Engine) LookupExactLease(group, index uint64) (location EntryLocation, term uint64, compacted, ok bool, lease ReadLease, err error) {
+	for attempt := 0; attempt < 2; attempt++ {
+		location, term, compacted, ok, err = e.LookupExact(group, index)
+		if err != nil || !ok || compacted || location.Bytes == 0 {
+			return location, term, compacted, ok, ReadLease{}, err
+		}
+		lease, err = e.AcquireLocation(location)
+		if err == nil {
+			return location, term, compacted, ok, lease, nil
+		}
+		if err != nil && !errors.Is(err, ErrBounds) {
+			return EntryLocation{}, 0, false, false, ReadLease{}, err
+		}
+		if err := e.PrepareSegment(location.SegmentID); err != nil {
+			return EntryLocation{}, 0, false, false, ReadLease{}, err
+		}
+	}
+	return EntryLocation{}, 0, false, false, ReadLease{}, ErrBounds
+}
+
+// LookupAndRead fuses location resolution with reader acquisition for the
+// normal sealed read path. It returns the same plain location and flags as
+// LookupExact together with the requested bytes.
+func (e *Engine) LookupAndRead(group, index uint64, dst []byte) (location EntryLocation, data []byte, term uint64, compacted, ok bool, err error) {
+	location, term, compacted, ok, lease, err := e.LookupExactLease(group, index)
+	if err != nil || !ok || compacted || location.Bytes == 0 {
+		return location, nil, term, compacted, ok, err
+	}
+	if lease.state != nil {
+		defer lease.Close()
+		data, err = lease.Read(location, dst)
+		return location, data, term, compacted, ok, err
+	}
+	data, err = e.ReadLocation(location, dst)
+	return location, data, term, compacted, ok, err
 }
 
 func (e *Engine) Sequence() uint64 {
@@ -1641,20 +1997,21 @@ func (g *engineGroup) sealedTerm(index uint64) (uint64, bool, error) {
 		if g.owner == nil {
 			return 0, false, ErrBounds
 		}
-		if err := g.owner.PrepareSegment(run.SegmentID); err != nil {
+		if err := g.owner.prepareSegmentLocked(run.SegmentID); err != nil {
 			return 0, false, err
 		}
-		for slot := range g.owner.readers {
-			reader := &g.owner.readers[slot]
-			if reader.id != run.SegmentID || reader.routes == nil {
-				continue
-			}
-			route, err := reader.routes.Point(run, index)
-			if err != nil {
-				return 0, false, err
-			}
-			return route.Term, true, nil
+		g.owner.readerMu.Lock()
+		reader, acquired := g.owner.acquireReaderRefLocked(run.SegmentID)
+		g.owner.readerMu.Unlock()
+		if !acquired {
+			continue
 		}
+		route, err := reader.routes.Point(run, index)
+		g.owner.releaseReaderLease(reader)
+		if err != nil {
+			return 0, false, err
+		}
+		return route.Term, true, nil
 	}
 	return 0, false, nil
 }
@@ -1904,7 +2261,7 @@ func (e *Engine) rotateLocked(hook func(RotationPhase) error) error {
 		}
 	}
 	l := e.log
-	if e.maintenanceBusy || l.metadata.needsHealing || l.metadata.slot.ReclaimPhase != reclaimNone || l.metadata.slot.RetiredCheckpointCount != 0 || len(l.state.Segments) == cap(l.state.Segments) || catalogSuffixRecords(l.metadata.slot) >= catalogCheckpointHardRecords || !l.state.Reserves[0].Ready || !l.state.Reserves[1].Ready || l.reserveFiles[0] == nil || l.reserveFiles[1] == nil {
+	if e.maintenanceBusy || e.cleanupErr != nil || l.metadata.needsHealing || l.metadata.slot.ReclaimPhase == reclaimPrepared || len(l.state.Segments) == cap(l.state.Segments) || catalogSuffixRecords(l.metadata.slot) >= catalogCheckpointHardRecords || !l.state.Reserves[0].Ready || !l.state.Reserves[1].Ready || l.reserveFiles[0] == nil || l.reserveFiles[1] == nil {
 		return ErrBackpressure
 	}
 	if cap(l.eventSpare) < cap(l.events) || e.activeBuild == nil || e.spareBuild == nil {
@@ -1969,6 +2326,8 @@ func (e *Engine) rotateLocked(hook func(RotationPhase) error) error {
 }
 
 func (e *Engine) finishFrozenSeal(base metadataState, pending SegmentMeta, events []segmentEvent, build *segmentBuildArena, hook func(RotationPhase) error, deferMaintenance bool) (result error) {
+	e.metadataMu.Lock()
+	defer e.metadataMu.Unlock()
 	if build == nil {
 		return ErrBounds
 	}
@@ -2133,6 +2492,7 @@ func (e *Engine) finishFrozenSeal(base metadataState, pending SegmentMeta, event
 	nextSlot.Generation++
 	nextSlot.HasPending = false
 	nextSlot.Pending = pendingDescriptor{}
+	withoutCheckpoint := nextSlot
 	reserveIndex := -1
 	if reserveErr == nil {
 		for i := range nextSlot.Reserves {
@@ -2150,9 +2510,22 @@ func (e *Engine) finishFrozenSeal(base metadataState, pending SegmentMeta, event
 		nextSlot.CheckpointTail = predictedTail
 		nextSlot.CheckpointHash = checkpointHash
 	}
-	if err = e.log.metadata.publish(nextSlot, &record); err != nil {
+	if err = e.log.metadata.publish(nextSlot, &record); err != nil && errors.Is(err, errCheckpointRetirementCapacity) && checkpointID != (fileID{}) {
+		// A full checkpoint-retirement queue must not strand the sealed segment:
+		// publish the catalog record without advancing the optional checkpoint
+		// when the normal suffix/ring admission still permits it. The helper runs
+		// before catalog writes, so this retry cannot duplicate the record.
+		cleanupUnpublishedCheckpoint(e.log.dir, checkpointCandidate, checkpointHash, e.authKey)
+		checkpointID, checkpointHash = fileID{}, [32]byte{}
+		nextSlot = withoutCheckpoint
+		err = e.log.metadata.publish(nextSlot, &record)
+	}
+	if err != nil {
 		if reserveFile != nil {
-			_ = reserveFile.Close()
+			cleanupUnpublishedFile(reserveFile, segmentPath(e.log.dir, reserve.FileID), e.log.dir)
+		}
+		if checkpointHash != ([32]byte{}) {
+			cleanupUnpublishedCheckpoint(e.log.dir, checkpointCandidate, checkpointHash, e.authKey)
 		}
 		return err
 	}
@@ -2221,20 +2594,34 @@ func (e *Engine) finishFrozenSeal(base metadataState, pending SegmentMeta, event
 func (e *Engine) runMetadataMaintenance() {
 	e.writeMu.Lock()
 	if e.log != nil && e.log.metadata != nil && (e.log.metadata.slot.ReclaimPhase != reclaimNone || e.log.metadata.slot.RetiredCheckpointCount != 0) {
-		if e.maintenanceBusy || e.sealPending || e.log.usable() != nil || e.log.metadata.slot.HasPending {
+		if e.cleanupTicket != nil || e.maintenanceBusy || e.sealPending || e.log.usable() != nil || e.log.metadata.slot.HasPending {
 			e.writeMu.Unlock()
 			return
 		}
-		e.maintenanceBusy = true
 		e.writeMu.Unlock()
-		_ = e.resumeReclaim()
-		e.writeMu.Lock()
-		e.maintenanceBusy = false
-		e.writeMu.Unlock()
+		_, _ = e.beginReclaim()
 		return
 	}
 	if e.maintenanceBusy || e.log == nil || e.log.usable() != nil || e.log.metadata == nil || e.log.metadata.slot.HasPending {
 		e.writeMu.Unlock()
+		return
+	}
+	limit := min(e.reclaimMaxSegments, maxRetiredSegments)
+	cut, reclaimedBytes := 0, uint64(0)
+	for cut < len(e.log.state.Segments) && cut < limit {
+		segment := e.log.state.Segments[cut]
+		if segment.State != SegmentSealed || cut >= len(e.reclaimAfter) || e.liveSealed[segment.ID] != 0 || e.reclaimAfter[cut] == 0 || e.reclaimAfter[cut] > e.sealedSequence {
+			break
+		}
+		if reclaimedBytes > ^uint64(0)-segment.Bytes {
+			break
+		}
+		reclaimedBytes += segment.Bytes
+		cut++
+	}
+	if reclaimThresholdReachedWithMinimum(cut, limit, reclaimedBytes, e.log.state.SegmentCapacity, e.reclaimMinSegments) {
+		e.writeMu.Unlock()
+		_, _ = e.beginReclaim()
 		return
 	}
 	missing := [2]bool{}
@@ -2301,6 +2688,7 @@ func (e *Engine) runMetadataMaintenance() {
 			changed = true
 		}
 	}
+	withoutCheckpoint := next
 	if checkpointID != (fileID{}) {
 		next.PreviousCheckpointID, next.PreviousCheckpointTail, next.PreviousCheckpointHash = next.CheckpointID, next.CheckpointTail, next.CheckpointHash
 		next.CheckpointID, next.CheckpointTail, next.CheckpointHash = [16]byte(checkpointID), next.CatalogTail, checkpointHash
@@ -2315,11 +2703,25 @@ func (e *Engine) runMetadataMaintenance() {
 		return
 	}
 	next.Generation++
-	if err := e.log.metadata.publish(next, nil); err != nil {
+	err := e.log.metadata.publish(next, nil)
+	if err != nil && errors.Is(err, errCheckpointRetirementCapacity) && checkpointID != (fileID{}) {
+		// Keep reserve maintenance progressing when only the optional checkpoint
+		// retirement queue is full. The unchanged catalog suffix remains bounded;
+		// a later maintenance turn can retry the checkpoint after queue cleanup.
+		cleanupUnpublishedCheckpoint(dir, checkpointCandidate, checkpointHash, e.authKey)
+		checkpointID, checkpointHash = fileID{}, [32]byte{}
+		next = withoutCheckpoint
+		next.Generation++
+		err = e.log.metadata.publish(next, nil)
+	}
+	if err != nil {
 		for i := range reserveFiles {
 			if reserveFiles[i] != nil {
-				_ = reserveFiles[i].Close()
+				cleanupUnpublishedFile(reserveFiles[i], segmentPath(dir, reserves[i].FileID), dir)
 			}
+		}
+		if checkpointHash != ([32]byte{}) {
+			cleanupUnpublishedCheckpoint(dir, checkpointCandidate, checkpointHash, e.authKey)
 		}
 		e.log.poison(err)
 		return
@@ -2388,7 +2790,8 @@ func openEngineAuthenticatedObserved(dir string, startupSync func(*os.File) erro
 		}
 		l.reserveFiles[i] = file
 	}
-	e := &Engine{log: l, groups: make(map[uint64]*engineGroup), waves: make(map[WaveID]waveState), liveSealed: make(map[uint64]uint32), reclaimAfter: make([]uint64, len(l.state.Segments), cap(l.state.Segments)), sealedSummaries: make(map[uint64]sealedRunSummary), syncData: startupSync, writeAt: func(f *os.File, b []byte, off int64) (int, error) { return f.WriteAt(b, off) }, recoveryIO: recoveryIO}
+	e := &Engine{log: l, groups: make(map[uint64]*engineGroup), waves: make(map[WaveID]waveState), liveSealed: make(map[uint64]uint32), reclaimAfter: make([]uint64, len(l.state.Segments), cap(l.state.Segments)), sealedSummaries: make(map[uint64]sealedRunSummary), reclaimMinSegments: reclaimMinSegments, reclaimMaxSegments: reclaimMaxSegments, syncData: startupSync, writeAt: func(f *os.File, b []byte, off int64) (int, error) { return f.WriteAt(b, off) }, recoveryIO: recoveryIO}
+	e.readerCond = sync.NewCond(&e.readerMu)
 	e.authMAC = hmac.New(sha256.New, key[:])
 	e.authKey = key
 	if err = e.rebuild(); err != nil {
@@ -2621,7 +3024,7 @@ func (e *Engine) rebuild() error {
 		return err
 	}
 	if len(e.log.state.Segments) != 0 && len(e.readers) == 0 {
-		e.readers = make([]segmentReader, 1)
+		e.readers = newReaderSlots(1)
 	}
 	headerBytes := make([]byte, segmentHeaderBytes)
 	if _, err := e.log.active.ReadAt(headerBytes, 0); err != nil {

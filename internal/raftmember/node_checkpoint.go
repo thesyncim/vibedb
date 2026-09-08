@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/internal/raftstore"
+	"github.com/thesyncim/vibedb/internal/raftstore/seglog"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	pb "go.etcd.io/raft/v3/raftpb"
@@ -25,17 +26,19 @@ type NodeCheckpointOptions struct {
 	OnError       func(error)
 }
 
-// NodeCheckpointCoordinator owns exactly one bounded state-checkpoint worker
-// for a node durability sequencer. It deliberately does not own the sequencer
-// or any Runtime. Close drains accepted capture tasks before stopping.
+// NodeCheckpointCoordinator owns exactly one bounded state-checkpoint and
+// metadata-maintenance worker for a node durability sequencer. It deliberately
+// does not own the sequencer or any Runtime. Close drains accepted capture
+// tasks before stopping and releases the maintenance lane last.
 type NodeCheckpointCoordinator struct {
-	sequencer *raftstore.NodeSubmissionSequencer
-	queue     chan *nodeCheckpointTask
-	done      chan struct{}
-	workspace []byte
-	mu        sync.Mutex
-	closing   bool
-	release   sync.Once
+	sequencer      *raftstore.NodeSubmissionSequencer
+	queue          chan *nodeCheckpointTask
+	done           chan struct{}
+	workspace      []byte
+	mu             sync.Mutex
+	closing        bool
+	release        sync.Once
+	maintenanceErr error
 }
 
 type nodeCheckpointTask struct {
@@ -67,21 +70,138 @@ func NewNodeCheckpointCoordinator(sequencer *raftstore.NodeSubmissionSequencer, 
 		workspace: make([]byte, 0, replicatedstate.DefaultSnapshotArtifactChunkBytes),
 	}
 	go c.run()
+	// Existing descriptors may have been loaded before this coordinator was
+	// attached. The same coalesced edge handles that initial cold check and all
+	// later durable registrations/checkpoints.
+	sequencer.SignalNodeMaintenance()
 	return c, nil
 }
 
 func (c *NodeCheckpointCoordinator) run() {
-	defer close(c.done)
-	for task := range c.queue {
-		dequeuedAt := time.Now()
-		if !task.queuedAt.IsZero() {
-			c.sequencer.ObserveCheckpointQueueWait(dequeuedAt.Sub(task.queuedAt))
+	var retryTimer *time.Timer
+	var retry <-chan time.Time
+	defer func() {
+		if retryTimer != nil {
+			retryTimer.Stop()
 		}
-		serviceStarted := time.Now()
-		result := c.capture(task.apply)
-		c.sequencer.ObserveCheckpointService(time.Since(serviceStarted))
-		task.result <- result
+		close(c.done)
+	}()
+	wake := c.sequencer.NodeMaintenanceWake()
+	for {
+		// Snapshot capture is the coordinator's latency-sensitive responsibility.
+		// Drain an already queued capture before selecting another coalesced
+		// maintenance edge or retry.
+		select {
+		case task, ok := <-c.queue:
+			if !ok {
+				for task := range c.queue {
+					c.process(task)
+				}
+				return
+			}
+			c.process(task)
+			continue
+		default:
+		}
+		select {
+		case task, ok := <-c.queue:
+			if !ok {
+				// submit serializes with Close, so this drains every accepted
+				// task without allowing a producer to race a closed channel.
+				for task := range c.queue {
+					c.process(task)
+				}
+				return
+			}
+			c.process(task)
+		case <-wake:
+			if c.isClosing() {
+				continue
+			}
+			c.maintain(&retryTimer, &retry)
+		case <-retry:
+			retryTimer = nil
+			retry = nil
+			if c.isClosing() {
+				continue
+			}
+			c.maintain(&retryTimer, &retry)
+		}
 	}
+}
+
+func (c *NodeCheckpointCoordinator) process(task *nodeCheckpointTask) {
+	dequeuedAt := time.Now()
+	if !task.queuedAt.IsZero() {
+		c.sequencer.ObserveCheckpointQueueWait(dequeuedAt.Sub(task.queuedAt))
+	}
+	serviceStarted := time.Now()
+	result := c.capture(task.apply)
+	c.sequencer.ObserveCheckpointService(time.Since(serviceStarted))
+	task.result <- result
+}
+
+func (c *NodeCheckpointCoordinator) isClosing() bool {
+	c.mu.Lock()
+	closing := c.closing
+	c.mu.Unlock()
+	return closing
+}
+
+func nodeMaintenanceDeferred(err error) bool {
+	if err == nil || errors.Is(err, raftstore.ErrPersistenceUnknown) ||
+		errors.Is(err, raftstore.ErrCorrupt) || errors.Is(err, seglog.ErrCorrupt) {
+		return false
+	}
+	return errors.Is(err, raftstore.ErrSubmissionBackpressure) ||
+		errors.Is(err, raftstore.ErrDurabilityBackpressure) ||
+		errors.Is(err, seglog.ErrBackpressure) ||
+		errors.Is(err, seglog.ErrBounds)
+}
+
+func (c *NodeCheckpointCoordinator) maintain(retryTimer **time.Timer, retry *<-chan time.Time) {
+	err := c.sequencer.MaintainNodeLog()
+	deferred := nodeMaintenanceDeferred(err)
+	if err == nil {
+		if *retryTimer != nil {
+			(*retryTimer).Stop()
+			*retryTimer = nil
+			*retry = nil
+		}
+		return
+	}
+	if deferred {
+		if c.sequencer.NodeMaintenanceRetryNeeded() && *retryTimer == nil {
+			*retryTimer = time.NewTimer(time.Second)
+			*retry = (*retryTimer).C
+		}
+		return
+	}
+	if *retryTimer != nil {
+		(*retryTimer).Stop()
+		*retryTimer = nil
+		*retry = nil
+	}
+	c.mu.Lock()
+	if c.maintenanceErr == nil {
+		c.maintenanceErr = err
+	}
+	c.mu.Unlock()
+}
+
+// MaintenanceError returns the first non-deferred error observed by the
+// coordinator's metadata worker. Descriptor and reclaim backpressure are
+// expected bounded deferrals and are not retained. The returned error keeps
+// its original wrapping and sentinel identity for callers that need to report
+// corruption or an unknown persistence outcome.
+func (c *NodeCheckpointCoordinator) MaintenanceError() error {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	err := c.maintenanceErr
+	c.mu.Unlock()
+	return err
 }
 
 func (c *NodeCheckpointCoordinator) capture(apply *sqldriver.ReplicatedApply) (result nodeCheckpointBuildResult) {
@@ -133,7 +253,7 @@ func (c *NodeCheckpointCoordinator) Close() error {
 	c.mu.Unlock()
 	<-c.done
 	c.release.Do(c.sequencer.ReleaseMaintenanceLane)
-	return nil
+	return c.MaintenanceError()
 }
 
 type nodeCheckpointDriver struct {
@@ -246,6 +366,10 @@ func (runtime *Runtime) driveNodeCheckpoint(advanceClock bool) error {
 		return nil
 	}
 	driver.ticks = 0
+	// The shared node log may become reclaimable only after additional seals.
+	// Reuse the configured checkpoint cadence as a coalesced maintenance edge,
+	// even when this group's application state needs no new snapshot.
+	driver.coordinator.sequencer.SignalNodeMaintenance()
 	if !runtime.walGenerationQuiescent() {
 		return nil
 	}

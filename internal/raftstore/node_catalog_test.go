@@ -82,6 +82,26 @@ func TestDescriptorCatalogCheckpointSeedsOpenAndReplaysConcurrentTail(t *testing
 	requireDescriptorKey(t, store, third, 3)
 }
 
+func TestDescriptorCatalogCheckpointPreservesRegistrationCapacityOnOpen(t *testing.T) {
+	dir, store, options := createDescriptorCatalogTestStore(t, 8)
+	if err := store.CheckpointDescriptorCatalog(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenNodeStore(dir, testNodeIdentity(), testKey(), options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	second := testGroupDescriptor(200)
+	if got, registerErr := store.RegisterGroup(second); registerErr != nil || got.GroupID != 2 {
+		t.Fatalf("register after catalog checkpoint open=%+v err=%v", got, registerErr)
+	}
+	requireDescriptorKey(t, store, second, 2)
+}
+
 func TestDescriptorCatalogCheckpointCrashCutsBeforeReferenceKeepLogAuthority(t *testing.T) {
 	injected := errors.New("descriptor checkpoint crash")
 	phases := []DescriptorCheckpointPhase{

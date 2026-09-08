@@ -25,6 +25,113 @@ type metadataStore struct {
 	base              checkpointBase
 }
 
+var errCheckpointRetirementCapacity = errors.New("seglog: checkpoint retirement queue capacity")
+
+type checkpointRef struct {
+	id   fileID
+	hash [32]byte
+}
+
+func checkpointRefs(slot metadataSlot) [2]checkpointRef {
+	return [2]checkpointRef{
+		{id: fileID(slot.CheckpointID), hash: slot.CheckpointHash},
+		{id: fileID(slot.PreviousCheckpointID), hash: slot.PreviousCheckpointHash},
+	}
+}
+
+// carryCheckpointRetirements records only checkpoint files that disappear from
+// both banks after this publication. The opposite bank is still on disk after
+// publish, so checking only the candidate slot would delete a file needed by
+// fallback recovery.
+func (store *metadataStore) carryCheckpointRetirements(next *metadataSlot) error {
+	if store == nil || next == nil || store.slotIndex >= uint8(len(store.bankSlots)) || !store.bankUsable[store.slotIndex] || next.RetiredCheckpointCount > maxRetiredCheckpoints {
+		return ErrCorrupt
+	}
+	working := *next
+	protected := make(map[fileID]struct{}, 4)
+	for _, ref := range checkpointRefs(working) {
+		if ref.id == (fileID{}) {
+			if ref.hash != ([32]byte{}) {
+				return ErrCorrupt
+			}
+			continue
+		}
+		if ref.hash == ([32]byte{}) {
+			return ErrCorrupt
+		}
+		protected[ref.id] = struct{}{}
+	}
+	// publish overwrites the bank opposite slotIndex. The selected bank is the
+	// post-publication fallback bank and must remain protected as a whole.
+	for _, ref := range checkpointRefs(store.bankSlots[store.slotIndex]) {
+		if ref.id == (fileID{}) {
+			if ref.hash != ([32]byte{}) {
+				return ErrCorrupt
+			}
+			continue
+		}
+		if ref.hash == ([32]byte{}) {
+			return ErrCorrupt
+		}
+		protected[ref.id] = struct{}{}
+	}
+
+	queued := make(map[fileID][32]byte, maxRetiredCheckpoints)
+	for i := 0; i < int(working.RetiredCheckpointCount); i++ {
+		ref := working.RetiredCheckpoints[i]
+		if ref.ID == (fileID{}) || ref.Hash == ([32]byte{}) {
+			return ErrCorrupt
+		}
+		if _, survives := protected[ref.ID]; survives {
+			return ErrCorrupt
+		}
+		if previous, exists := queued[ref.ID]; exists {
+			if previous != ref.Hash {
+				return ErrCorrupt
+			}
+			return ErrCorrupt
+		}
+		queued[ref.ID] = ref.Hash
+	}
+
+	// A bank that is not currently valid is healed by a later authenticated
+	// clone before checkpoint files are eligible for deletion. Its untrusted
+	// bytes must not become a deletion claim here.
+	for bank, slot := range store.bankSlots {
+		if !store.bankUsable[bank] {
+			continue
+		}
+		for _, ref := range checkpointRefs(slot) {
+			if ref.id == (fileID{}) {
+				if ref.hash != ([32]byte{}) {
+					return ErrCorrupt
+				}
+				continue
+			}
+			if ref.hash == ([32]byte{}) {
+				return ErrCorrupt
+			}
+			if _, survives := protected[ref.id]; survives {
+				continue
+			}
+			if previous, exists := queued[ref.id]; exists {
+				if previous != ref.hash {
+					return ErrCorrupt
+				}
+				continue
+			}
+			if working.RetiredCheckpointCount >= maxRetiredCheckpoints {
+				return errors.Join(ErrBounds, errCheckpointRetirementCapacity)
+			}
+			working.RetiredCheckpoints[working.RetiredCheckpointCount] = retiredCheckpointDescriptor{ID: ref.id, Hash: ref.hash}
+			working.RetiredCheckpointCount++
+			queued[ref.id] = ref.hash
+		}
+	}
+	*next = working
+	return nil
+}
+
 var metadataPhysicalFile = metadataAllocateThrough
 
 func preallocateMetadataRing(file *os.File) error {
@@ -315,6 +422,12 @@ func (store *metadataStore) previewRecord(record catalogRecord, generation uint6
 func (store *metadataStore) publish(next metadataSlot, record *catalogRecord) error {
 	if store == nil || store.file == nil || next.Generation != store.slot.Generation+1 {
 		return ErrCorrupt
+	}
+	// Calculate checkpoint ownership before touching the catalog or metadata
+	// file. The local next value is intentionally mutated only in this call, so
+	// a queue-capacity or validation failure cannot partially publish an intent.
+	if err := store.carryCheckpointRetirements(&next); err != nil {
+		return err
 	}
 	if record != nil {
 		ringBytes := catalogRingRecords * catalogRecordBytes

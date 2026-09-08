@@ -14,9 +14,6 @@ import (
 )
 
 var reservePhysicalFile = reservePhysical
-var recycleIdentityWrite = writeFullAt
-var recycleTruncate = func(file *os.File, size int64) error { return file.Truncate(size) }
-var recycleFileSync = func(file *os.File) error { return file.Sync() }
 
 const (
 	reserveHeaderBytes     = 128
@@ -218,53 +215,6 @@ func verifyPhysicalReserve(file *os.File, descriptor reserveDescriptor, logID [1
 		return ErrCorrupt
 	}
 	return nil
-}
-
-func verifyLifecycleCertificate(file *os.File, descriptor reserveDescriptor, logID [16]byte, key [32]byte) error {
-	var raw [reserveHeaderBytes]byte
-	if err := readFullAt(file, raw[:], segmentIdentityBytes); err != nil {
-		return err
-	}
-	if !validReserveCertificate(raw[:], descriptor, logID, key) {
-		return ErrCorrupt
-	}
-	return nil
-}
-
-// recycleRetiredSegment preserves the keyed lifecycle certificate while
-// destroying only the retired segment identity. Every crash cut therefore has
-// an authenticated owner even if the identity write tears. The caller may
-// publish the returned READY descriptor only after this function succeeds.
-func recycleRetiredSegment(file *os.File, descriptor reserveDescriptor, logID [16]byte, key [32]byte) error {
-	if err := verifyLifecycleCertificate(file, descriptor, logID, key); err != nil {
-		return err
-	}
-	if err := verifyPhysicalReserve(file, descriptor, logID, key); err == nil {
-		if err = recycleFileSync(file); err != nil {
-			return err
-		}
-		return verifyPhysicalReserve(file, descriptor, logID, key)
-	}
-	var zeroIdentity [segmentIdentityBytes]byte
-	if err := recycleIdentityWrite(file, zeroIdentity[:], 0); err != nil {
-		return err
-	}
-	if err := recycleFileSync(file); err != nil {
-		return err
-	}
-	if err := recycleTruncate(file, segmentHeaderBytes); err != nil {
-		return err
-	}
-	if err := reservePhysicalFile(file, descriptor.Capacity); err != nil {
-		return err
-	}
-	if err := verifyPhysicalReserve(file, descriptor, logID, key); err != nil {
-		return err
-	}
-	if err := recycleFileSync(file); err != nil {
-		return err
-	}
-	return verifyPhysicalReserve(file, descriptor, logID, key)
 }
 
 func reconcileTentativeReserve(file *os.File, descriptor reserveDescriptor, slot metadataSlot, key [32]byte) error {
