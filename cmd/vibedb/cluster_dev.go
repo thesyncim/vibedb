@@ -42,7 +42,6 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replication"
-	"github.com/thesyncim/vibedb/internal/rf3qualification"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibedb/store/durable"
 	"github.com/thesyncim/vibejson"
@@ -527,6 +526,7 @@ type devClusterOptions struct {
 	pgListen                         string
 	pgListens                        []string
 	readAuthority                    bool
+	readAuthoritySet                 bool
 }
 
 func runClusterDev(args []string) int {
@@ -541,7 +541,7 @@ func runClusterDev(args []string) int {
 	diagnosticsOnExit := fs.Bool("diagnostics-on-exit", false, "print bounded shard and gateway log tails when the development cluster stops")
 	pgListen := fs.String("pg-listen", "", "optional loopback PostgreSQL endpoint with durable auto-commit writes (RF3 only)")
 	pgListens := fs.String("pg-listens", "", "comma-separated PostgreSQL loopback endpoints, one per physical node (RF3 only)")
-	readAuthority := fs.Bool("read-authority", false, "explicitly enable quorum read authority on every RF3 physical-node voter")
+	readAuthority := fs.Bool("read-authority", false, "enable quorum read authority on every supported RF3 physical-node voter; omit to use the retained or platform default")
 	var tableSchemas []string
 	fs.Func("table-schema", "CREATE TABLE file to provision as an additional RF3 group; repeatable and retained on restart", func(path string) error {
 		tableSchemas = append(tableSchemas, path)
@@ -551,15 +551,11 @@ func runClusterDev(args []string) int {
 		usage()
 		return 2
 	}
-	if *readAuthority && !rf3qualification.ReadAuthorityEnabled {
-		fmt.Fprintf(os.Stderr, "cluster dev: --read-authority requires the explicitly tagged laboratory build %q\n",
-			rf3qualification.ReadAuthorityLabBuildTag)
-		return 2
-	}
-	replicasSet, nodesSet := false, false
+	replicasSet, nodesSet, readAuthoritySet := false, false, false
 	fs.Visit(func(f *flag.Flag) {
 		replicasSet = replicasSet || f.Name == "replicas"
 		nodesSet = nodesSet || f.Name == "nodes"
+		readAuthoritySet = readAuthoritySet || f.Name == "read-authority"
 	})
 	if nodesSet {
 		if (*nodes != devClusterRF1 && *nodes != devClusterRF3) ||
@@ -624,7 +620,7 @@ func runClusterDev(args []string) int {
 		return 1
 	}
 	defer unlock()
-	manifest, err := ensureDevCluster(devClusterOptions{root: abs, replicas: *replicas, shardBinary: shard, gatewayBinary: gw, nodeLog: *nodeLog, physicalNodes: *physicalNodes, pgListen: *pgListen, pgListens: listeners, readAuthority: *readAuthority})
+	manifest, err := ensureDevCluster(devClusterOptions{root: abs, replicas: *replicas, shardBinary: shard, gatewayBinary: gw, nodeLog: *nodeLog, physicalNodes: *physicalNodes, pgListen: *pgListen, pgListens: listeners, readAuthority: *readAuthority, readAuthoritySet: readAuthoritySet})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cluster dev: %v\n", err)
 		return 1
@@ -674,8 +670,8 @@ func resolveDevBinary(explicit, name string) (string, error) {
 }
 
 func ensureDevCluster(options devClusterOptions) (devClusterManifest, error) {
-	if options.readAuthority && !rf3qualification.ReadAuthorityEnabled {
-		return devClusterManifest{}, fmt.Errorf("%w: read authority requires the explicitly tagged laboratory build %q", errDevCluster, rf3qualification.ReadAuthorityLabBuildTag)
+	if options.readAuthority {
+		options.readAuthoritySet = true
 	}
 	if options.replicas != devClusterRF1 && options.replicas != devClusterRF3 {
 		return devClusterManifest{}, errDevCluster
@@ -704,9 +700,11 @@ func ensureDevCluster(options devClusterOptions) (devClusterManifest, error) {
 			options.physicalNodes != 0 && m.PhysicalNodes != uint8(options.physicalNodes) {
 			return m, errDevCluster
 		}
-		if (m.ReadAuthority != nil) != options.readAuthority || options.readAuthority && !validDevReadAuthority(*m.ReadAuthority) {
-			return m, errDevCluster
+		resolved, resolveErr := resolveDevReadAuthority(options, &m)
+		if resolveErr != nil {
+			return m, resolveErr
 		}
+		options = resolved
 		if m.PhysicalNodes != 0 {
 			if err := validateDevPhysicalPGOptions(m, options); err != nil {
 				return m, err
@@ -726,16 +724,17 @@ func ensureDevCluster(options devClusterOptions) (devClusterManifest, error) {
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return devClusterManifest{}, err
 	}
+	resolved, err := resolveDevReadAuthority(options, nil)
+	if err != nil {
+		return devClusterManifest{}, err
+	}
 	if err := os.MkdirAll(options.root, 0o700); err != nil {
 		return devClusterManifest{}, err
 	}
-	return initializeDevCluster(options, manifestPath)
+	return initializeDevCluster(resolved, manifestPath)
 }
 
 func initializeDevCluster(options devClusterOptions, manifestPath string) (devClusterManifest, error) {
-	if options.readAuthority && !rf3qualification.ReadAuthorityEnabled {
-		return devClusterManifest{}, fmt.Errorf("%w: read authority requires the explicitly tagged laboratory build %q", errDevCluster, rf3qualification.ReadAuthorityLabBuildTag)
-	}
 	if options.replicas == devClusterRF3 && options.physicalNodes != 0 {
 		return initializeDevPhysicalCluster(options, manifestPath)
 	}

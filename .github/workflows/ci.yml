@@ -237,7 +237,7 @@ jobs:
           path: ${{ steps.go.outputs.cache-path }}
           key: ${{ steps.go.outputs.cache-key }}
   rf3-read-authority-lab:
-    name: RF3 read-authority standard gate and laboratory protocol
+    name: RF3 read-authority default and protocol
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -245,25 +245,25 @@ jobs:
         id: go
         with:
           scope: rf3-read-authority-lab
-      - name: Standard build denial and resume checks
+      - name: Default selection and retained-policy checks
         run: |
           set -euo pipefail
           go test -count=1 -timeout=5m \
-            -run '^(TestStandardClusterDevRejectsReadAuthorityBeforeCreatingRoot|TestDefaultResumeAcceptsOpaqueArtifactButRejectsEnabledSection|TestStandardPhysicalManifestRejectsEnabledSectionBeforeRewrite|TestDevClusterManifestResumeIsCanonicalAndDoesNotReprovision)$' \
+            -run '^(TestDevReadAuthority.*|TestDefaultResumeAcceptsOpaqueArtifactButRejectsEnabledSection|TestPhysicalManifestRejectsMalformedEnabledSectionBeforeRewrite|TestDevClusterManifestResumeIsCanonicalAndDoesNotReprovision)$' \
             ./cmd/vibedb
           go test -count=1 -timeout=5m \
-            -run '^(TestStandardShardRejectsEnabledReadAuthorityBeforeRuntime|TestStandardOmittedPolicyStillRefusesEnrolledMarker|TestRF3ReloadDefaultOffMarkerRejectedBeforePreparation)$' \
+            -run '^(TestShardValidatesEnabledReadAuthorityBeforeRuntime|TestRetainedPolicyRefusesDowngradeAfterEnrollment|TestRF3ReloadDefaultOffMarkerRejectedBeforePreparation)$' \
             ./cmd/vibedb-shard
-      - name: Explicit laboratory protocol and reconciliation checks
+      - name: Protocol and reconciliation checks
         run: |
           set -euo pipefail
-          go test -tags=vibedb_rf3_read_authority_lab -count=1 -timeout=10m \
+          go test -count=1 -timeout=10m \
             -run '^TestRF3ReadAuthority|^TestDev(ReadAuthority|PhysicalReadAuthority)' \
             ./cmd/vibedb ./cmd/vibedb-shard
-      - name: Explicit laboratory live group enrollment and retained restart
+      - name: Live group enrollment and retained restart
         run: |
           set -euo pipefail
-          go test -tags=vibedb_rf3_read_authority_lab -count=1 -timeout=3m \
+          go test -count=1 -timeout=3m \
             -run '^TestServeRF3ReadAuthorityLiveAppendAndRetainedRestart$' \
             ./cmd/vibedb-shard
       - name: Save Go build cache
