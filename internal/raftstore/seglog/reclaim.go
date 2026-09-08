@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 )
 
 var reclaimMinSegments = 8
@@ -153,6 +154,7 @@ func (e *Engine) reclaimDeadPrefix() error {
 		cutA.Retired[i] = retiredDescriptor{ID: removed[i].ID, Generation: removed[i].Generation, FileID: removed[i].FileID, Bytes: removed[i].Bytes, PreviousHash: removed[i].PreviousHash, Hash: removed[i].Hash}
 	}
 	if err = e.log.metadata.publish(cutA, &record); err != nil {
+		cleanupUnpublishedCheckpoint(e.log.dir, checkpointA, checkpointAHash, e.authKey)
 		return fmt.Errorf("reclaim cut A: %w", err)
 	}
 	if err = runReclaimHook(reclaimPreparedPublished); err != nil {
@@ -175,9 +177,11 @@ func (e *Engine) reclaimDeadPrefix() error {
 	cutB.PreviousCheckpointID, cutB.PreviousCheckpointTail, cutB.PreviousCheckpointHash = cutB.CheckpointID, cutB.CheckpointTail, cutB.CheckpointHash
 	cutB.CheckpointID, cutB.CheckpointTail, cutB.CheckpointHash = [16]byte(checkpointBID), tail, checkpointBHash
 	if validateErr := validateMetadataSlot(cutB); validateErr != nil {
+		cleanupUnpublishedCheckpoint(e.log.dir, checkpointB, checkpointBHash, e.authKey)
 		return fmt.Errorf("reclaim cut B slot: %w", validateErr)
 	}
 	if err = e.log.metadata.publish(cutB, nil); err != nil {
+		cleanupUnpublishedCheckpoint(e.log.dir, checkpointB, checkpointBHash, e.authKey)
 		return fmt.Errorf("reclaim cut B: %w", err)
 	}
 	if err = runReclaimHook(reclaimDurablePublished); err != nil {
@@ -230,6 +234,7 @@ func (e *Engine) resumeReclaim() error {
 		next.PreviousCheckpointID, next.PreviousCheckpointTail, next.PreviousCheckpointHash = next.CheckpointID, next.CheckpointTail, next.CheckpointHash
 		next.CheckpointID, next.CheckpointTail, next.CheckpointHash = [16]byte(checkpointID), next.CatalogTail, checkpointHash
 		if err = e.log.metadata.publish(next, nil); err != nil {
+			cleanupUnpublishedCheckpoint(e.log.dir, checkpoint, checkpointHash, e.authKey)
 			return err
 		}
 		if err = runReclaimHook(reclaimDurablePublished); err != nil {
@@ -273,15 +278,20 @@ func (e *Engine) finishDurableReclaim(oldBanks [2]metadataSlot, replacement []Se
 		e.log.state.Segments = replacement
 		e.reclaimAfter = retainedFences
 	}
-	for i := range e.readers {
-		if e.readers[i].file != nil && e.readers[i].id <= slot.AnchorID {
-			if closeErr := e.readers[i].file.Close(); closeErr != nil {
-				e.writeMu.Unlock()
-				return closeErr
-			}
-			e.readers[i] = segmentReader{}
+	e.readerMu.Lock()
+	e.ensureReaderCondLocked()
+	for i, reader := range e.readers {
+		if reader == nil || reader.file == nil || reader.id > slot.AnchorID {
+			continue
 		}
+		if closeErr := e.detachReaderLocked(reader); closeErr != nil {
+			e.readerMu.Unlock()
+			e.writeMu.Unlock()
+			return closeErr
+		}
+		e.readers[i] = &segmentReader{}
 	}
+	e.readerMu.Unlock()
 	e.writeMu.Unlock()
 
 	// Fill empty reserve ownership from the dead prefix before unlinking. The
@@ -460,16 +470,117 @@ func addCheckpointRetirements(next *metadataSlot, old [2]metadataSlot) error {
 	return nil
 }
 
-func (e *Engine) finishCheckpointRetirements() error {
-	slot := e.log.metadata.slot
+// checkpointRetirementBankState reports whether a queued checkpoint is still
+// named by either metadata bank. An invalid bank is a healing obligation: its
+// bytes are not trusted for deletion, but the queued file must remain until an
+// authenticated clone replaces that bank.
+func checkpointRetirementBankState(store *metadataStore, retired retiredCheckpointDescriptor) (referenced, needsHealing bool, err error) {
+	if store == nil || store.slotIndex >= uint8(len(store.bankSlots)) || !store.bankUsable[store.slotIndex] {
+		return false, false, ErrCorrupt
+	}
+	for bank, slot := range store.bankSlots {
+		if !store.bankUsable[bank] {
+			needsHealing = true
+			continue
+		}
+		for _, ref := range checkpointRefs(slot) {
+			if ref.id != retired.ID {
+				continue
+			}
+			if ref.hash != retired.Hash {
+				return false, false, ErrCorrupt
+			}
+			referenced = true
+		}
+	}
+	return referenced, needsHealing, nil
+}
+
+func checkpointRetirementInSlot(slot metadataSlot, id fileID) (retiredCheckpointDescriptor, bool) {
 	for i := 0; i < int(slot.RetiredCheckpointCount); i++ {
-		retired := slot.RetiredCheckpoints[i]
-		path := e.log.dir + string(os.PathSeparator) + checkpointFileName(retired.ID)
-		opened, err := authenticateCheckpointPath(path, retired.ID, slot.LogID, retired.Hash, e.authKey)
+		if slot.RetiredCheckpoints[i].ID == id {
+			return slot.RetiredCheckpoints[i], true
+		}
+	}
+	return retiredCheckpointDescriptor{}, false
+}
+
+// finishCheckpointRetirements authenticates and removes only the exact queue
+// captured from a serialized slot. It first heals/converges both metadata
+// banks, then subtracts the completed IDs from the latest slot so intervening
+// checkpoint publications cannot be lost.
+func (e *Engine) finishCheckpointRetirements() error {
+	if e == nil || e.log == nil || e.log.metadata == nil {
+		return ErrCorrupt
+	}
+
+	// A queued ID may still be present in the other fallback bank when opening
+	// an older slot. Publish at most two authenticated clones to converge both
+	// banks before any unlink is attempted.
+	for attempt := 0; attempt < len(e.log.metadata.bankSlots); attempt++ {
+		e.writeMu.Lock()
+		if err := e.log.usable(); err != nil {
+			e.writeMu.Unlock()
+			return err
+		}
+		slot := e.log.metadata.slot
+		if slot.RetiredCheckpointCount == 0 {
+			e.writeMu.Unlock()
+			return nil
+		}
+		needsClone := false
+		for i := 0; i < int(slot.RetiredCheckpointCount); i++ {
+			referenced, needsHealing, err := checkpointRetirementBankState(e.log.metadata, slot.RetiredCheckpoints[i])
+			if err != nil {
+				e.writeMu.Unlock()
+				return err
+			}
+			needsClone = needsClone || referenced || needsHealing
+		}
+		if !needsClone {
+			ticket := make([]retiredCheckpointDescriptor, slot.RetiredCheckpointCount)
+			copy(ticket, slot.RetiredCheckpoints[:slot.RetiredCheckpointCount])
+			e.writeMu.Unlock()
+			return e.removeCheckpointRetirementTicket(ticket)
+		}
+		next := slot
+		next.Generation++
+		if err := e.log.metadata.publish(next, nil); err != nil {
+			e.writeMu.Unlock()
+			return err
+		}
+		e.log.state.Generation = next.Generation
+		e.writeMu.Unlock()
+	}
+	return ErrBounds
+}
+
+func (e *Engine) removeCheckpointRetirementTicket(ticket []retiredCheckpointDescriptor) error {
+	completed := make(map[fileID][32]byte, len(ticket))
+	for _, retired := range ticket {
+		if retired.ID == (fileID{}) || retired.Hash == ([32]byte{}) {
+			return ErrCorrupt
+		}
+		// Metadata publication is the serialization boundary for the namespace
+		// claim. Recheck it immediately before authentication/unlink in case an
+		// ordinary checkpoint advanced while this ticket was doing I/O.
+		e.writeMu.Lock()
+		current := e.log.metadata.slot
+		referenced, needsHealing, err := checkpointRetirementBankState(e.log.metadata, retired)
+		e.writeMu.Unlock()
+		if err != nil {
+			return err
+		}
+		if referenced || needsHealing {
+			return ErrBounds
+		}
+		path := filepath.Join(e.log.dir, checkpointFileName(retired.ID))
+		opened, err := authenticateCheckpointPath(path, retired.ID, current.LogID, retired.Hash, e.authKey)
 		if errors.Is(err, os.ErrNotExist) {
 			if err = reclaimSyncDir(e.log.dir); err != nil {
 				return err
 			}
+			completed[retired.ID] = retired.Hash
 			continue
 		}
 		if err != nil {
@@ -481,18 +592,45 @@ func (e *Engine) finishCheckpointRetirements() error {
 		if err = removeExactPublishedPath(opened, path, e.log.dir); err != nil {
 			return err
 		}
+		completed[retired.ID] = retired.Hash
 	}
-	if slot.RetiredCheckpointCount == 0 {
-		return nil
+
+	// Merge the exact completed set into the latest slot. New queue entries
+	// appended by an intervening rotation remain in place and are carried by
+	// both paired publications.
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+	latest := e.log.metadata.slot
+	if latest.RetiredCheckpointCount == 0 {
+		return ErrCorrupt
 	}
-	clearA := slot
+	var remaining [maxRetiredCheckpoints]retiredCheckpointDescriptor
+	remainingCount := uint8(0)
+	for i := 0; i < int(latest.RetiredCheckpointCount); i++ {
+		retired := latest.RetiredCheckpoints[i]
+		if doneHash, done := completed[retired.ID]; done {
+			if doneHash != retired.Hash {
+				return ErrCorrupt
+			}
+			continue
+		}
+		remaining[remainingCount] = retired
+		remainingCount++
+	}
+	for id := range completed {
+		if _, found := checkpointRetirementInSlot(latest, id); !found {
+			return ErrCorrupt
+		}
+	}
+	clearA := latest
 	clearA.Generation++
-	clearA.RetiredCheckpointCount = 0
+	clearA.RetiredCheckpointCount = remainingCount
 	clear(clearA.RetiredCheckpoints[:])
+	copy(clearA.RetiredCheckpoints[:], remaining[:remainingCount])
 	if err := e.log.metadata.publish(clearA, nil); err != nil {
 		return err
 	}
-	clearB := clearA
+	clearB := e.log.metadata.slot
 	clearB.Generation++
 	if err := e.log.metadata.publish(clearB, nil); err != nil {
 		return err
