@@ -684,6 +684,15 @@ func (c *Collection) stagePrimaryBatchForJournalLocked(
 		splitKey, generation, buildErr := c.buildPrimaryBatchLeaves(state)
 		if errors.Is(buildErr, ErrPrimaryLeafSplitRequired) {
 			lastErr = buildErr
+			if group := c.checkpointGroup.Load(); group != nil &&
+				group.visibleTxn.Load() > group.certTxn.Load() {
+				// The failed leaf build has not admitted frames or prepared a
+				// conditional record. Let the owning group certify the preceding
+				// visible cut before this collection mutates its topology. Return the
+				// exact private sentinel so arbitrary structural or storage errors
+				// remain terminal and cannot be mistaken for this bounded retry.
+				return stagedPrimaryBatch{}, errCheckpointGroupCertificationRequired
+			}
 			if splitErr := c.preparePrimaryBatchTopology(
 				state, batch, splitKey,
 			); splitErr != nil {
