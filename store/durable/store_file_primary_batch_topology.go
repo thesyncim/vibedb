@@ -145,6 +145,32 @@ func (c *Collection) preparePrimaryBatchTopology(
 		// the batch's journal and content-atomicity contract.
 		return c.structuralSplitPrimaryMacroTablet(state, &path, currentLeaves)
 	}
+	// A two-way batch cut uses the scalar localized representation. Larger cuts
+	// can use the bounded one-anchor partition representation when its exact
+	// compressed fence geometry admits every output leaf; all other geometry
+	// keeps the complete-tablet fallback below.
+	var localizedPlan storeio.GlobalTabletCatalogLeafSplitPlan
+	var localizedPartitionPlan storeio.GlobalTabletCatalogLeafPartitionPlan
+	isLocalized := false
+	isPartitionLocalized := false
+	if len(floors) == 2 {
+		localizedPlan, err = path.tablet.PlanLeafSplit(
+			&path.anchor, path.leafRoute, floors[1],
+		)
+		if err != nil {
+			return err
+		}
+		isLocalized = !localizedPlan.RequiresTabletRebuild()
+	} else if len(floors) > 2 {
+		localizedPartitionPlan, err = path.tablet.PlanLeafPartition(
+			&path.anchor, path.leafRoute, floors[1:],
+		)
+		if err != nil {
+			return err
+		}
+		isPartitionLocalized = !localizedPartitionPlan.RequiresTabletRebuild()
+		isLocalized = isPartitionLocalized
+	}
 	finalLeafCount := len(currentLeaves) - 1 + len(floors)
 	if finalLeafCount > storeio.TabletLocalIdentityLocalCount ||
 		(finalLeafCount+storeio.SegmentedTabletRouterRowsPerPage-1)/
@@ -157,38 +183,53 @@ func (c *Collection) preparePrimaryBatchTopology(
 		return c.structuralSplitPrimaryMacroTablet(state, &path, currentLeaves)
 	}
 
-	// Build the identity/fence-only final tablet now. This validates every
-	// anchor and root fence arena before commitPrimaryStructural allocates its
-	// first page. Physical refs for the K replacement leaves are filled by the
-	// transaction stager below.
-	geometry := make(
-		[]storeio.SegmentedTabletRouterLeaf, 0, finalLeafCount,
-	)
-	for at := range currentLeaves {
-		if at != sourceIndex {
-			geometry = append(geometry, storeio.SegmentedTabletRouterLeaf{
-				LocalID: currentLeaves[at].localID,
-				Fence:   currentLeaves[at].fence,
-			})
-			continue
+	anchorPages := 0
+	retiredAnchors := path.tablet.AnchorCount()
+	if isLocalized {
+		// The localized stager COWs the selected anchor and allocates one more only
+		// when the scalar PlanLeafSplit says the new row needs it. All other anchors remain
+		// reachable and are neither staged nor retired.
+		anchorPages = 1
+		if !isPartitionLocalized && localizedPlan.NeedsNewAnchor() {
+			anchorPages++
 		}
-		for rank := range floors {
-			geometry = append(geometry, storeio.SegmentedTabletRouterLeaf{
-				LocalID: localIDs[rank], Fence: floors[rank],
-			})
+		retiredAnchors = 1
+	} else {
+		// Build the identity/fence-only final tablet now. This validates every
+		// anchor and root fence arena before commitPrimaryStructural allocates its
+		// first page. Physical refs for the K replacement leaves are filled by the
+		// transaction stager below.
+		geometry := make(
+			[]storeio.SegmentedTabletRouterLeaf, 0, finalLeafCount,
+		)
+		for at := range currentLeaves {
+			if at != sourceIndex {
+				geometry = append(geometry, storeio.SegmentedTabletRouterLeaf{
+					LocalID: currentLeaves[at].localID,
+					Fence:   currentLeaves[at].fence,
+				})
+				continue
+			}
+			for rank := range floors {
+				geometry = append(geometry, storeio.SegmentedTabletRouterLeaf{
+					LocalID: localIDs[rank], Fence: floors[rank],
+				})
+			}
+		}
+		_, anchorPages, err = storeio.PlanSegmentedTabletRouterAnchors(geometry)
+		if errors.Is(err, storeio.ErrSegmentedTabletRouterNoSpace) {
+			// Byte-packed fences can exhaust the anchor geometry before the simple
+			// leaf-count bound. The macro spill frees bounded routing space without
+			// touching the pending logical batch; the outer stage loop then re-plans.
+			return c.structuralSplitPrimaryMacroTablet(state, &path, currentLeaves)
+		}
+		if err != nil {
+			return err
 		}
 	}
-	_, anchorPages, err := storeio.PlanSegmentedTabletRouterAnchors(geometry)
-	if errors.Is(err, storeio.ErrSegmentedTabletRouterNoSpace) {
-		// Byte-packed fences can exhaust the anchor geometry before the simple
-		// leaf-count bound. The macro spill frees bounded routing space without
-		// touching the pending logical batch; the outer stage loop then re-plans.
-		return c.structuralSplitPrimaryMacroTablet(state, &path, currentLeaves)
-	}
-	if err != nil {
-		return err
-	}
-	if err := c.preflightPrimaryBatchTopologyCapacity(&path, len(floors), anchorPages); err != nil {
+	if err := c.preflightPrimaryBatchTopologyCapacity(
+		&path, len(floors), anchorPages, retiredAnchors,
+	); err != nil {
 		return err
 	}
 
@@ -231,6 +272,43 @@ func (c *Collection) preparePrimaryBatchTopology(
 			}
 			if baseAt != len(baseRows) {
 				return nil, nil, nil, storeio.ErrInvalidWrite
+			}
+			if isPartitionLocalized {
+				replacements := make(
+					[]storeio.SegmentedTabletRouterLeaf, len(floors),
+				)
+				for rank := range floors {
+					zone := storeio.BucketZone{}
+					if rank == 0 {
+						zone = currentLeaves[sourceIndex].zone
+					}
+					replacements[rank] = storeio.SegmentedTabletRouterLeaf{
+						LocalID: localIDs[rank], Fence: floors[rank],
+						Ref: encoded[rank], Zone: zone,
+					}
+				}
+				return nil, []storeio.PageRef{currentLeaves[sourceIndex].ref},
+					&primaryLocalizedLeafSplit{
+						partition: &primaryLocalizedLeafPartition{
+							plan: localizedPartitionPlan, leaves: replacements,
+						},
+						resident: route, route: path.leafRoute,
+					}, nil
+			}
+			if isLocalized {
+				rightBucketU, bucketOK := storeio.MakeTabletLocalIdentityBucket(
+					tabletID, uint32(localIDs[1]),
+				)
+				if !bucketOK {
+					return nil, nil, nil, storeio.ErrSegmentedTabletRouterCorrupt
+				}
+				return nil, []storeio.PageRef{currentLeaves[sourceIndex].ref},
+					&primaryLocalizedLeafSplit{
+						plan: localizedPlan, resident: route, route: path.leafRoute,
+						leftRef: encoded[0], rightRef: encoded[1],
+						rightBucket:  storeio.BucketID(rightBucketU),
+						rightLocalID: localIDs[1], rightFence: floors[1],
+					}, nil
 			}
 
 			final := make(
@@ -426,12 +504,14 @@ func primaryBatchTopologyLocalIDs(
 // same transaction reservation.
 func (c *Collection) preflightPrimaryBatchTopologyCapacity(
 	path *filePrimaryMutationPath,
-	newLeaves, anchorPages int,
+	newLeaves, stagedAnchors, retiredAnchors int,
 ) error {
-	// K leaves, every rebuilt anchor, locator, tablet root, catalog leaf, optional
-	// branch, and the global primary root.
-	pages := newLeaves + anchorPages + 4
-	retirements := 1 + path.tablet.AnchorCount() + 4
+	// K leaves, the staged anchor COW set, locator, tablet root, catalog leaf,
+	// optional branch, and the global primary root. The retirement set mirrors
+	// the actual localized or full-tablet replacement rather than charging the
+	// whole live anchor set to a localized split.
+	pages := newLeaves + stagedAnchors + 4
+	retirements := 1 + retiredAnchors + 4
 	if path.hasBranch {
 		pages++
 		retirements++
