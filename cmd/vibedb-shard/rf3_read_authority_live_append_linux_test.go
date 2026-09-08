@@ -280,6 +280,9 @@ func TestServeRF3ReadAuthorityLiveAppendAndRetainedRestart(t *testing.T) {
 			ctx, cancel = nil, nil
 		}
 	}()
+	rf3WaitForGatewayAvailable(t, diagnostics, [rf3CommandMembers]string{
+		inputs[0].Root, inputs[1].Root, inputs[2].Root,
+	}, startupErrors)
 	for _, bundle := range manifests[0].Groups {
 		waitRF3CommandLeader(t, [rf3CommandMembers]string{addresses[0][1], addresses[1][1], addresses[2][1]}, nodes, profiles[:], bundle.Route.Group, bundle.Route.AllocationGeneration, authorityGeneration, startupErrors)
 	}
@@ -398,6 +401,9 @@ func TestServeRF3ReadAuthorityLiveAppendAndRetainedRestart(t *testing.T) {
 		}
 	}
 	reloads, diagnostics, done, startupErrors = startNodes(ctx)
+	rf3WaitForGatewayAvailable(t, diagnostics, [rf3CommandMembers]string{
+		inputs[0].Root, inputs[1].Root, inputs[2].Root,
+	}, startupErrors)
 	for _, bundle := range manifests[0].Groups {
 		waitRF3CommandLeader(t, [rf3CommandMembers]string{addresses[0][1], addresses[1][1], addresses[2][1]}, nodes, profiles[:], bundle.Route.Group, bundle.Route.AllocationGeneration, authorityGeneration, startupErrors)
 	}
@@ -740,9 +746,117 @@ func waitRF3AuthorityGroupPresent(
 	t.Fatalf("RF3 live appended group %x was not published", group.GroupID)
 }
 
+func rf3WaitForGatewayAvailable(
+	t testing.TB,
+	diagnostics [rf3CommandMembers]chan os.Signal,
+	roots [rf3CommandMembers]string,
+	startupErrors <-chan error,
+) {
+	t.Helper()
+	// Use the existing startup/readiness bound for the whole three-node wait,
+	// rather than giving each member an independent timeout.
+	ctx, cancel := context.WithTimeout(t.Context(), rf3AuthoritySQLReadinessTimeout)
+	defer cancel()
+
+	var snapshots [rf3CommandMembers]rf3DiagnosticSnapshot
+	var wantedSerial [rf3CommandMembers]uint64
+	var signalPending [rf3CommandMembers]bool
+	var ready [rf3CommandMembers]bool
+	var nextSignal [rf3CommandMembers]time.Time
+	for member := range rf3CommandMembers {
+		path := filepath.Join(roots[member], "rf3-diagnostics.json")
+		if raw, err := os.ReadFile(path); err == nil {
+			if err := json.Unmarshal(raw, &snapshots[member]); err != nil {
+				t.Fatalf("decode RF3 gateway readiness diagnostic for member %d: %v", member+1, err)
+			}
+			wantedSerial[member] = snapshots[member].Serial + 1
+		} else if errors.Is(err, os.ErrNotExist) {
+			wantedSerial[member] = 1
+		} else {
+			t.Fatalf("read RF3 gateway readiness diagnostic for member %d: %v", member+1, err)
+		}
+		signalPending[member] = true
+	}
+
+	checkStartupError := func() {
+		select {
+		case err := <-startupErrors:
+			if err == nil {
+				t.Fatalf("RF3 server exited before embedded gateway readiness")
+			}
+			t.Fatalf("RF3 server failed before embedded gateway readiness: %v", err)
+		default:
+		}
+	}
+
+	for {
+		checkStartupError()
+		allReady := true
+		for member := range rf3CommandMembers {
+			if ready[member] {
+				continue
+			}
+			allReady = false
+			if signalPending[member] && !time.Now().Before(nextSignal[member]) {
+				select {
+				case diagnostics[member] <- syscall.SIGUSR1:
+					signalPending[member] = false
+					nextSignal[member] = time.Now().Add(rf3GatewayDiagnosticInterval)
+				case err := <-startupErrors:
+					if err == nil {
+						t.Fatalf("RF3 server exited before embedded gateway readiness")
+					}
+					t.Fatalf("RF3 server failed before embedded gateway readiness: %v", err)
+				case <-ctx.Done():
+					t.Fatalf("RF3 embedded gateway readiness timeout: %v", ctx.Err())
+				default:
+				}
+			}
+
+			path := filepath.Join(roots[member], "rf3-diagnostics.json")
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				if !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("read RF3 gateway readiness diagnostic for member %d: %v", member+1, err)
+				}
+				continue
+			}
+			var snapshot rf3DiagnosticSnapshot
+			if err := json.Unmarshal(raw, &snapshot); err != nil {
+				t.Fatalf("decode RF3 gateway readiness diagnostic for member %d: %v", member+1, err)
+			}
+			if snapshot.Serial < wantedSerial[member] {
+				continue
+			}
+			snapshots[member] = snapshot
+			signalPending[member] = false
+			if snapshot.GatewayAvailable {
+				ready[member] = true
+			} else {
+				wantedSerial[member] = snapshot.Serial + 1
+				signalPending[member] = true
+				nextSignal[member] = time.Now().Add(rf3GatewayDiagnosticInterval)
+			}
+		}
+		if allReady {
+			if err := ctx.Err(); err != nil {
+				t.Fatalf("RF3 embedded gateway readiness timeout: %v; snapshots=%+v", err, snapshots)
+			}
+			checkStartupError()
+			return
+		}
+		select {
+		case <-time.After(10 * time.Millisecond):
+		case <-ctx.Done():
+			t.Fatalf("RF3 embedded gateway readiness timeout: %v; snapshots=%+v", ctx.Err(), snapshots)
+		}
+	}
+}
+
 const (
 	rf3AuthoritySQLReadinessTimeout  = 15 * time.Second
 	rf3AuthoritySQLReadinessAttempts = 64
+	rf3GatewayDiagnosticInterval     = 250 * time.Millisecond
 )
 
 func rf3ReadAuthoritySQLRequest(
