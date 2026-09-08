@@ -1494,6 +1494,39 @@ func (client *hotMutationWireClient) logObservedAttempts(t *testing.T) {
 	}
 }
 
+func hotMutationRequestSequence(request []byte) (uint64, bool) {
+	var envelope struct {
+		IssuerSequence uint64 `json:"issuer_sequence"`
+	}
+	if len(request) == 0 || json.Unmarshal(request, &envelope) != nil || envelope.IssuerSequence == 0 {
+		return 0, false
+	}
+	return envelope.IssuerSequence, true
+}
+
+// logFailedAttempts reports only the public attempts that already happened
+// before the final assertion failed. It must never issue a probe or retry.
+func (client *hotMutationWireClient) logFailedAttempts(
+	t testing.TB, request []byte, sequence uint64, firstResponse []byte, firstLatency time.Duration,
+	attempts uint8, retryResponse []byte, retryLatency time.Duration,
+) {
+	t.Helper()
+	known := sequence != 0
+	if !known {
+		sequence, known = hotMutationRequestSequence(request)
+	}
+	sequenceLabel := "unknown"
+	if known {
+		sequenceLabel = fmt.Sprintf("%d", sequence)
+	}
+	t.Logf("hot mutation failure seq=%s attempt=1 latency=%s response_class=%s response_bytes=%d response=%s",
+		sequenceLabel, firstLatency, hotMutationResponseClass(firstResponse), len(firstResponse), firstResponse)
+	if attempts == 2 {
+		t.Logf("hot mutation failure seq=%s attempt=2 latency=%s response_class=%s response_bytes=%d response=%s",
+			sequenceLabel, retryLatency, hotMutationResponseClass(retryResponse), len(retryResponse), retryResponse)
+	}
+}
+
 func (client *hotMutationWireClient) execute(t *testing.T, request []byte) time.Duration {
 	return client.executeWithObservation(t, request, 0, false)
 }
@@ -1533,6 +1566,8 @@ func (client *hotMutationWireClient) executeWithObservation(
 	}
 	if !strings.Contains(string(response), `"committed":true`) ||
 		strings.Contains(string(response), `"error"`) {
+		client.logFailedAttempts(t, request, sequence, firstResponse, firstLatency,
+			attempts, retryResponse, retryLatency)
 		t.Fatalf("exec_batch response=%s", response)
 	}
 	return latency

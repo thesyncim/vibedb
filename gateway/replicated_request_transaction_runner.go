@@ -839,9 +839,10 @@ func (progress *durableDistributedProgress) command(
 	final bool,
 ) (_ bool, failure error) {
 	ordinal := progress.ordinal
+	stage := "admission"
 	defer func() {
 		if failure != nil {
-			failure = fmt.Errorf("gateway: transaction wave %d role %d operation %d: %w", ordinal, control.Role, control.Operation, failure)
+			failure = fmt.Errorf("gateway: transaction wave %d role %d operation %d (%s): %w", ordinal, control.Role, control.Operation, stage, failure)
 		}
 	}()
 	progress.ordinal++
@@ -855,6 +856,7 @@ func (progress *durableDistributedProgress) command(
 		return false, ErrDurableRequestConflict
 	}
 	var err error
+	stage = "execution-pin refresh"
 	progress.execution, err = progress.runner.refreshExecutionPin(ctx, progress.execution)
 	if err != nil {
 		return false, err
@@ -872,6 +874,7 @@ func (progress *durableDistributedProgress) command(
 	if store, ok := progress.runner.payloads.(interface {
 		ExistingCommandEpoch(context.Context, DurableRequestLedgerHome, requestledger.RequestKey, uint64) (uint64, error)
 	}); ok {
+		stage = "existing-command-epoch read"
 		retained, readErr := store.ExistingCommandEpoch(ctx, progress.execution.Home, progress.execution.Key.RequestKey, ordinal)
 		if readErr != nil || retained > commandEpoch {
 			return false, errors.Join(readErr, ErrDurableRequestConflict)
@@ -882,6 +885,7 @@ func (progress *durableDistributedProgress) command(
 	}
 	control.ControllerEpoch = commandEpoch
 	control.ExecutionPinDigest = distributedtxn.Digest(progress.execution.Recipe.Contract.PinDigest)
+	stage = "command encoding"
 	exact, err := progress.encoder.appendExact(
 		nil, progress.execution.Recipe.Identity.RetryHome, route, control, batches,
 	)
@@ -921,6 +925,7 @@ func (progress *durableDistributedProgress) command(
 		return progress.execution.Recipe.Contract.CommitTransitionTag, cursor, nil
 	}
 	for attempt := 0; ; attempt++ {
+		stage = "staged wave"
 		_, err = progress.runner.waves.RunStagedWave(ctx, wave)
 		var advanced *durableExecutionPinAdvancedError
 		if !errors.As(err, &advanced) || attempt == 3 || ctx.Err() != nil {
@@ -932,6 +937,7 @@ func (progress *durableDistributedProgress) command(
 		// A one-successor pin may expire while another catalog command is
 		// applying. No wave side effect ran: reacquire the exact execution pin
 		// and repeat admission with the unchanged participant command bytes.
+		stage = "execution-pin refresh"
 		progress.execution, err = progress.runner.refreshExecutionPin(ctx, progress.execution)
 		if err != nil {
 			return false, err
@@ -939,6 +945,7 @@ func (progress *durableDistributedProgress) command(
 		wave.ExecutionPinRoute, wave.ExecutionPinLease = progress.execution.ExecutionPinRoute, progress.execution.ExecutionPinLease
 		wave.GateEpoch = wave.ExecutionPinLease.ControllerEpoch
 	}
+	stage = "payload cleanup"
 	if _, err = progress.runner.payloads.Cleanup(ctx, progress.execution.Home, progress.execution.Key.RequestKey); err != nil {
 		return false, err
 	}
