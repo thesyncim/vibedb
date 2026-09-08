@@ -979,12 +979,20 @@ func (l *TxnLog) commitMulti(
 
 	staged := make([]stagedPrimaryBatch, len(order))
 	stagedLive := 0
+	gatesHeld := false
 	defer func() {
+		if gatesHeld {
+			for i := len(order) - 1; i >= 0; i-- {
+				order[i].snapshotGate.Unlock()
+			}
+		}
 		if err == nil {
 			return
 		}
 		for i := stagedLive - 1; i >= 0; i-- {
-			order[i].unwindStagedPrimaryBatch(&staged[i])
+			if unwindErr := order[i].unwindStagedPrimaryBatch(&staged[i]); unwindErr != nil {
+				err = errors.Join(err, unwindErr)
+			}
 		}
 	}()
 
@@ -1078,19 +1086,40 @@ func (l *TxnLog) commitMulti(
 	}
 	l.undischarged++
 
-	// Publish is infallible by construction: every fallible prepare completed
-	// and the decision is durable. Acquire every gate in snapshot order, flip,
-	// then release gates and writers LIFO.
+	// Publication is expected to be infallible after every fallible prepare has
+	// completed and the decision is durable. The dispatcher still validates a
+	// prepared structural token and fails closed if that invariant is violated.
+	// Acquire every gate in snapshot order, flip, then release gates and writers
+	// LIFO.
 	for _, c := range order {
 		c.snapshotGate.Lock()
 	}
+	gatesHeld = true
+	var publishErr error
 	for i, c := range order {
 		c.batchPrimaryAdmitted = c.batchPrimaryAdmitted[:0]
-		c.publishPrimaryBatchGateHeld(staged[i])
+		if publishErr = c.publishStagedPrimaryBatchGateHeld(staged[i]); publishErr != nil {
+			break
+		}
 		staged[i].live = false
 	}
 	for i := len(order) - 1; i >= 0; i-- {
 		order[i].snapshotGate.Unlock()
+	}
+	gatesHeld = false
+	if publishErr != nil {
+		// The decision is already durable, so a violation of a prepared
+		// structural publication contract has an unknown catalog-wide outcome.
+		// Release every snapshot gate before poisoning the registered journals:
+		// poisonPersistence takes those same gates while rolling each reader view
+		// back to its last admitted state. Recovery must reconcile the durable
+		// decision before another catalog transaction is admitted.
+		poisoned := journalCommitOutcomeUnknown(publishErr)
+		l.poison = poisoned
+		for _, collection := range l.registeredCollections() {
+			_ = joinCatalogCommitOutcomeUnknown(collection, publishErr)
+		}
+		return poisoned
 	}
 	stagedLive = 0
 	return nil

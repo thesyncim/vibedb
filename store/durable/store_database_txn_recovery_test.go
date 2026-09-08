@@ -416,7 +416,11 @@ func prepareMaybePublish(
 		return gen
 	}
 	coll.snapshotGate.Lock()
-	coll.publishPrimaryBatchGateHeld(staged)
+	if publishErr := coll.publishStagedPrimaryBatchGateHeld(staged); publishErr != nil {
+		coll.snapshotGate.Unlock()
+		coll.unwindStagedPrimaryBatch(&staged)
+		t.Fatalf("publish: %v", publishErr)
+	}
 	coll.snapshotGate.Unlock()
 	staged.live = false
 	if err := coll.checkpointPastConditionalsLocked(

@@ -2021,22 +2021,16 @@ func (g *CheckpointGroup) commitTransitionLocked(
 	gatesHeld = true
 	for i, c := range order {
 		c.batchPrimaryAdmitted = c.batchPrimaryAdmitted[:0]
-		if staged[i].preparedStructural != nil {
-			if publishErr := c.publishPreparedPrimaryStructuralGateHeld(
-				staged[i].preparedStructural,
-			); publishErr != nil {
-				// The decision is already appended, though its device sync may still
-				// be pending. A failed structural root publication therefore has the
-				// same committed-but-unknown
-				// semantics as an ordinary post-decision persistence failure;
-				// recovery replays the conditional record against the prior root.
-				poisoned := journalCommitOutcomeUnknown(publishErr)
-				log.poison = poisoned
-				g.poison = poisoned
-				return poisoned
-			}
-		} else {
-			c.publishPrimaryBatchGateHeld(staged[i])
+		if publishErr := c.publishStagedPrimaryBatchGateHeld(staged[i]); publishErr != nil {
+			// The decision is already appended, though its device sync may still
+			// be pending. A failed structural root publication therefore has the
+			// same committed-but-unknown
+			// semantics as an ordinary post-decision persistence failure;
+			// recovery replays the conditional record against the prior root.
+			poisoned := journalCommitOutcomeUnknown(publishErr)
+			log.poison = poisoned
+			g.poison = poisoned
+			return poisoned
 		}
 		staged[i].live = false
 	}

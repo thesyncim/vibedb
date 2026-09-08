@@ -198,9 +198,7 @@ func (c *Collection) applyPrimaryBatch(batch *WriteBatch) (bool, uint64, error) 
 	c.batchPrimaryAdmitted = c.batchPrimaryAdmitted[:0]
 	if staged.preparedStructural != nil {
 		c.snapshotGate.Lock()
-		publishErr := c.publishPreparedPrimaryStructuralGateHeld(
-			staged.preparedStructural,
-		)
+		publishErr := c.publishStagedPrimaryBatchGateHeld(staged)
 		c.snapshotGate.Unlock()
 		if publishErr != nil {
 			if unwindErr := c.unwindStagedPrimaryBatch(&staged); unwindErr != nil {
@@ -1813,4 +1811,24 @@ func (c *Collection) publishPrimaryBatchGateHeld(staged stagedPrimaryBatch) {
 			c.removePrimaryEmptyLeaf()
 		}
 	}
+}
+
+// publishStagedPrimaryBatchGateHeld dispatches every staged batch shape through
+// its matching publication protocol. A deferred structural batch owns the
+// complete prospective graph and must use its prepared publication token;
+// treating it as an ordinary batch would publish the generic scratch state
+// before its file end and resident graph have been installed. The caller holds
+// snapshotGate and the collection writer. Ordinary publication remains
+// infallible; the structural token reports an error only when its precomputed
+// publication contract was violated.
+func (c *Collection) publishStagedPrimaryBatchGateHeld(
+	staged stagedPrimaryBatch,
+) error {
+	if staged.preparedStructural != nil {
+		return c.publishPreparedPrimaryStructuralGateHeld(
+			staged.preparedStructural,
+		)
+	}
+	c.publishPrimaryBatchGateHeld(staged)
+	return nil
 }
