@@ -24,7 +24,13 @@ func (c *Collection) ensureDirtyCapacityFor(
 		return err
 	}
 	var err error
-	if c.buffered() {
+	// Both buffered-visible and journal-backed synchronous collections publish
+	// canonical primary frames ahead of their physical root. A committer flush
+	// advances only the root fence and cannot materialize those deferred frames;
+	// use the full checkpoint path for either deferred lane. The remaining
+	// synchronous configuration owns its dirty pages through the committer and
+	// retains the existing flush path.
+	if c.deferredCanonicalLane() {
 		err = c.checkpointBufferedLocked()
 	} else {
 		err = c.committer.Flush()
@@ -33,7 +39,7 @@ func (c *Collection) ensureDirtyCapacityFor(
 		return err
 	}
 	c.automaticCheckpoints.Add(1)
-	if !c.buffered() {
+	if !c.deferredCanonicalLane() {
 		c.cache.MarkDurable(c.committer.DurableGeneration())
 	}
 	return nil
