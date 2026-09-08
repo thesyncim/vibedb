@@ -227,6 +227,17 @@ func primaryBatchTopologyLocalizedTwoWaySplit(
 	}); err != nil {
 		t.Fatalf("localized two-way Update: %v", err)
 	}
+	if _, found, readErr := before.AppendRaw(nil, batchKeys[0]); readErr != nil || found {
+		t.Fatalf("held snapshot gained batch row after update: found=%v err=%v", found, readErr)
+	}
+	for _, key := range batchKeys[1:] {
+		if _, found, readErr := before.AppendRaw(nil, key); readErr != nil || found {
+			t.Fatalf("held snapshot gained batch row %q after update: found=%v err=%v", key, found, readErr)
+		}
+	}
+	if got := primaryExactSnapshotKeys(t, before, "group", batchNeedle); len(got) != 0 {
+		t.Fatalf("held batch postings after update = %d, want 0", len(got))
+	}
 	afterStats := collection.Stats()
 	if got := afterStats.PrimaryLeafSplits - beforeStats.PrimaryLeafSplits; got != 1 {
 		t.Fatalf("localized structural splits = %d, want 1", got)
