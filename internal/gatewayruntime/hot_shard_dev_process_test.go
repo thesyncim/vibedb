@@ -4,10 +4,12 @@ package gatewayruntime
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -86,17 +88,26 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 	replicaProcessBuild(t, ctx, shardBinary, "./cmd/vibedb-shard")
 	replicaProcessBuild(t, ctx, gatewayBinary, "./cmd/vibedb-gateway")
 	state := filepath.Join(root, "state")
+	var pgListen string
 	processArgs := []string{
 		"cluster", "dev", "--replicas", "3", "--root", state,
 		"--diagnostics-on-exit",
 		"--shard-binary", shardBinary, "--gateway-binary", gatewayBinary,
 	}
 	if customTable {
+		pgListener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		pgListen = pgListener.Addr().String()
+		if err := pgListener.Close(); err != nil {
+			t.Fatal(err)
+		}
 		schemaPath := filepath.Join(root, "dev-hot-messages.sql")
 		if err := os.WriteFile(schemaPath, []byte("CREATE TABLE dev_hot_messages (id TEXT PRIMARY KEY, value INTEGER NOT NULL)"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		processArgs = append(processArgs, "--table-schema", schemaPath)
+		processArgs = append(processArgs, "--table-schema", schemaPath, "--pg-listen", pgListen)
 	}
 	process := &rf3testfixture.ExternalProcess{Binary: vibedbBinary, Args: processArgs}
 	if err := process.Start(); err != nil {
@@ -156,6 +167,52 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 		snapshot, err = authority.Read(ctx)
 		if err != nil {
 			t.Fatalf("read live custom-table catalog: %v", err)
+		}
+		bundlePaths, globErr := filepath.Glob(filepath.Join(state, "table-dev_hot_messages-*-split-source.vibejson"))
+		if globErr != nil || len(bundlePaths) != 1 {
+			t.Fatalf("custom-table retained bundle paths=%v err=%v", bundlePaths, globErr)
+		}
+		customBundlePath := bundlePaths[0]
+		customBundleBefore, err := os.ReadFile(customBundlePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Exercise the authenticated live DDL forwarding path on a quiet
+		// independently provisioned table. Its ALTER must not rederive or
+		// rewrite the original --table-schema bundle.
+		ddlConnection := openDDLWire(t, ctx, pgListen)
+		if result := ddlWireQuery(t, ddlConnection, "CREATE TABLE dev_hot_online (id TEXT PRIMARY KEY, value INTEGER NOT NULL)", true); result.code != "" || result.tag != "CREATE TABLE" {
+			ddlConnection.Close()
+			t.Fatalf("live custom CREATE: %+v", result)
+		}
+		if result := ddlWireQuery(t, ddlConnection, "INSERT INTO dev_hot_online (id,value) VALUES ('online-1',7)", false); result.code != "" || result.tag != "INSERT 0 1" {
+			ddlConnection.Close()
+			t.Fatalf("live custom INSERT: %+v", result)
+		}
+		if result := ddlWireQuery(t, ddlConnection, "ALTER TABLE dev_hot_online ADD COLUMN marker TEXT", true); result.code != "" || result.tag != "ALTER TABLE" {
+			ddlConnection.Close()
+			t.Fatalf("live custom ALTER: %+v", result)
+		}
+		if result := ddlWireQuery(t, ddlConnection, "UPDATE dev_hot_online SET marker='after-alter' WHERE id='online-1'", true); result.code != "" || result.tag != "UPDATE 1" {
+			ddlConnection.Close()
+			t.Fatalf("live custom UPDATE: %+v", result)
+		}
+		if result := ddlWireQuery(t, ddlConnection, "SELECT id,value,marker FROM dev_hot_online WHERE id='online-1'", true); result.code != "" || len(result.rows) != 1 || strings.Join(result.rows[0], "|") != `"online-1"|7|"after-alter"` {
+			ddlConnection.Close()
+			t.Fatalf("live custom row oracle: %+v", result)
+		}
+		if err := ddlConnection.Close(); err != nil {
+			t.Fatal(err)
+		}
+		customBundleAfterDDL, err := os.ReadFile(customBundlePath)
+		if err != nil || !bytes.Equal(customBundleAfterDDL, customBundleBefore) {
+			t.Fatalf("live DDL changed original custom bundle: %v", err)
+		}
+		// The DDL registration advances the catalog generation; route selection
+		// must use the fresh live cut for the split source.
+		snapshot, err = authority.Read(ctx)
+		if err != nil {
+			t.Fatalf("read catalog after live custom DDL: %v", err)
 		}
 	}
 	placement, found := snapshot.Placement(tableName)
@@ -273,6 +330,18 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 		defer restartedConnection.Close()
 		restartedClient := &hotMutationWireClient{connection: restartedConnection, reader: bufio.NewReader(restartedConnection)}
 		devHotReadDocuments(t, restartedClient, readRequest, keys)
+		checkConnection := openDDLWire(t, ctx, pgListen)
+		if result := ddlWireQuery(t, checkConnection, "SELECT id,value,marker FROM dev_hot_online WHERE id='online-1'", true); result.code != "" || len(result.rows) != 1 || strings.Join(result.rows[0], "|") != `"online-1"|7|"after-alter"` {
+			checkConnection.Close()
+			t.Fatalf("post-restart live DDL row oracle: %+v", result)
+		}
+		if err := checkConnection.Close(); err != nil {
+			t.Fatal(err)
+		}
+		customBundleAfterRestart, err := os.ReadFile(customBundlePath)
+		if err != nil || !bytes.Equal(customBundleAfterRestart, customBundleBefore) {
+			t.Fatalf("restart changed original custom bundle: %v", err)
+		}
 		t.Logf("custom-table split/restart exact row oracle: table=%s rows=%d children=%d", tableName, len(keys), children)
 	}
 	sort.Slice(latencies, func(left, right int) bool { return latencies[left] < latencies[right] })

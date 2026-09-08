@@ -747,6 +747,238 @@ func prepareDevTestReplica(
 	}
 }
 
+func TestDevNonphysicalBundleValidationPrecedesFragmentRestore(t *testing.T) {
+	root := t.TempDir()
+	cluster, err := initializeDevCluster(
+		devClusterOptions{root: root, replicas: devClusterRF3, shardBinary: "/usr/bin/true"},
+		filepath.Join(root, "cluster.vibejson"),
+	)
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected unmaterialized base cluster: %v", err)
+	}
+	prepareRaw, err := os.ReadFile(filepath.Join(root, "prepare-data-member-1.vibejson"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var prepare devPrepareManifest
+	if err := vibejson.Unmarshal(prepareRaw, &prepare); err != nil {
+		t.Fatal(err)
+	}
+	group := raftmember.GroupKey{TopologyRecoveryEpoch: prepare.TopologyRecoveryEpoch}
+	for _, field := range []struct {
+		raw    string
+		target *[16]byte
+	}{{prepare.ClusterID, &group.ClusterID}, {prepare.ClusterIncarnation, &group.ClusterIncarnation},
+		{prepare.ShardIncarnation, &group.ShardIncarnation}, {prepare.GroupID, &group.GroupID}} {
+		*field.target, err = decodeDev16(field.raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, member := range cluster.DataMembers {
+		prepareDevTestReplica(t, member, group, devDataDistribution, devDataShard,
+			devDataTable, devDataPrimaryKey, replication.Digest{})
+		prepareRaw, err := os.ReadFile(filepath.Join(root,
+			"prepare-data-member-"+itoa(int(member.Member))+".vibejson"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var dataPrepare devPrepareManifest
+		if err := vibejson.Unmarshal(prepareRaw, &dataPrepare); err != nil {
+			t.Fatal(err)
+		}
+		writeDevTestProcessManifest(t, root, cluster, member, dataPrepare)
+	}
+	schemaPath := filepath.Join(root, "custom-table.sql")
+	if err := os.WriteFile(schemaPath, []byte("CREATE TABLE custom_messages (PRIMARY KEY (id))"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The first call durably allocates the table plan before the intentionally
+	// unusable command can materialize its first member. This gives the test a
+	// real retained inventory and lets the prepared roots be filled with the
+	// existing strict fixture helper below.
+	if err := ensureDevTables(root, "/usr/bin/true", &cluster, schemaPath); err == nil {
+		t.Fatal("unmaterialized nonphysical preparation unexpectedly succeeded")
+	}
+	inventoryRaw, err := os.ReadFile(filepath.Join(root, "tables.vibejson"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var inventory devTableInventory
+	if err := vibejson.Unmarshal(inventoryRaw, &inventory); err != nil || len(inventory.Tables) != 1 {
+		t.Fatalf("retained table plan=%+v err=%v", inventory, err)
+	}
+	table := inventory.Tables[0]
+	customShard, err := decodeDev16(table.ShardIncarnation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	customGroupID, err := decodeDev16(table.GroupID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	customGroup := group
+	customGroup.ShardIncarnation, customGroup.GroupID = customShard, customGroupID
+	for index, member := range cluster.DataMembers {
+		prepared := member
+		prepared.Store = table.Stores[index]
+		prepared.ServeManifest = filepath.Join(root,
+			table.artifactStem()+"-member-"+itoa(index+1), "serve-rf3.vibejson")
+		prepareDevTestReplica(t, prepared, customGroup, distribution.DistributionName(table.distribution()),
+			distribution.ShardID("all"), table.Table, table.PrimaryKey, replication.Digest{})
+		basePrepareRaw, err := os.ReadFile(filepath.Join(root,
+			"prepare-data-member-"+itoa(index+1)+".vibejson"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var customPrepare devPrepareManifest
+		if err := vibejson.Unmarshal(basePrepareRaw, &customPrepare); err != nil {
+			t.Fatal(err)
+		}
+		customPrepare.Root = filepath.Dir(prepared.ServeManifest)
+		customPrepare.Distribution = table.distribution()
+		customPrepare.Shard = "all"
+		customPrepare.ShardIncarnation = table.ShardIncarnation
+		customPrepare.GroupID = table.GroupID
+		customPrepare.StoreID = table.Stores[index]
+		customPrepare.Table = table.Table
+		customPrepare.CreateTable = table.CreateTable
+		customPrepare.Apply.ShardKey = table.PrimaryKey
+		customPrepareRaw, err := vibejson.Marshal(&customPrepare)
+		if err != nil {
+			t.Fatal(err)
+		}
+		customPreparePath := filepath.Join(root, "prepare-"+table.artifactStem()+"-member-"+itoa(index+1)+".vibejson")
+		if err := writeDevFileOnce(customPreparePath, customPrepareRaw); err != nil {
+			t.Fatal(err)
+		}
+		writeDevTestProcessManifest(t, root, cluster, prepared, customPrepare)
+	}
+	if err := ensureDevTables(root, "/usr/bin/true", &cluster, ""); err != nil {
+		t.Fatalf("prepared nonphysical table: %v", err)
+	}
+	inventoryRaw, err = os.ReadFile(filepath.Join(root, "tables.vibejson"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := vibejson.Unmarshal(inventoryRaw, &inventory); err != nil || len(inventory.Tables) != 1 {
+		t.Fatalf("prepared inventory=%+v err=%v", inventory, err)
+	}
+	table = inventory.Tables[0]
+	fragmentPath := filepath.Join(root, table.artifactStem()+"-catalog.vibejson")
+	bundlePath := filepath.Join(root, table.artifactStem()+devTableProvisionBundleSuffix)
+	fragment, err := os.ReadFile(fragmentPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fragment) == 0 {
+		t.Fatal("empty source fragment fixture")
+	}
+	bundle, err := os.ReadFile(bundlePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalogRaw, sourceRaw, err := gateway.OpenReplicatedTableProvisionBundle(bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutatedSource := bytes.Replace(sourceRaw, []byte(`"max_sessions":128`), []byte(`"max_sessions":129`), 1)
+	if bytes.Equal(mutatedSource, sourceRaw) {
+		mutatedSource = bytes.Replace(sourceRaw, []byte(`\"max_sessions\":128`), []byte(`\"max_sessions\":129`), 1)
+	}
+	if bytes.Equal(mutatedSource, sourceRaw) {
+		t.Fatal("source fixture did not contain a bounded max_sessions proof")
+	}
+	mutatedBundle, err := gateway.AppendReplicatedTableProvisionBundle(nil, catalogRaw, mutatedSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(fragmentPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bundlePath, mutatedBundle, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureDevTables(root, "/usr/bin/true", &cluster, ""); err == nil {
+		t.Fatal("invalid nonphysical bundle was accepted")
+	}
+	if _, err := os.Stat(fragmentPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("invalid bundle restored the fragment before validation: %v", err)
+	}
+	retained, err := os.ReadFile(bundlePath)
+	if err != nil || !bytes.Equal(retained, mutatedBundle) {
+		t.Fatalf("invalid bundle was rewritten: %v", err)
+	}
+}
+
+func writeDevTestProcessManifest(
+	t testing.TB, root string, cluster devClusterManifest, member devClusterMember, prepare devPrepareManifest,
+) {
+	t.Helper()
+	storeID, err := decodeDev16(prepare.StoreID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clusterID, err := decodeDev16(prepare.ClusterID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clusterIncarnation, err := decodeDev16(prepare.ClusterIncarnation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shardIncarnation, err := decodeDev16(prepare.ShardIncarnation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	groupID, err := decodeDev16(prepare.GroupID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var nodes [3]rafttransport.NodeID
+	var peers [3]string
+	for index, dataMember := range cluster.DataMembers {
+		node, nodeErr := decodeDev16(dataMember.Node)
+		if nodeErr != nil {
+			t.Fatal(nodeErr)
+		}
+		nodes[index] = rafttransport.NodeID(node)
+		peers[index] = dataMember.Peer
+	}
+	identity := raftstore.Identity{ClusterID: clusterID, ClusterIncarnation: clusterIncarnation,
+		Distribution: prepare.Distribution, Shard: prepare.Shard,
+		AllocationGeneration: prepare.AllocationGeneration, ShardIncarnation: shardIncarnation,
+		GroupID: groupID, MemberID: prepare.MemberID, StoreID: storeID}
+	apply := sqldriver.ReplicatedApplyOptions{MaxSessions: prepare.Apply.MaxSessions, RetryWindow: prepare.Apply.RetryWindow,
+		TxnLimits: durable.TxnLimits{MaxCollections: prepare.Apply.MaxCollections, MaxDocuments: prepare.Apply.MaxDocuments, MaxBytes: prepare.Apply.MaxBytes},
+		Placement: sqldriver.ReplicatedPlacementProfile{Format: sqldriver.ReplicatedPlacementProfileFormat,
+			ShardKey: prepare.Apply.ShardKey, TupleVersion: distribution.CurrentTupleVersion,
+			MapperVersion: distribution.NativeMapperVersion,
+			Range:         distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}}}}
+	bootstrap := rf3testfixture.InitialBootstrap([]uint64{1, 2, 3})
+	bootstrap.TopologyRecoveryEpoch = prepare.TopologyRecoveryEpoch
+	raw := rf3testfixture.ProcessMemberManifest(rf3testfixture.ProcessMemberOptions{
+		Root: filepath.Dir(member.ServeManifest), Table: prepare.Table, CreateTable: prepare.CreateTable,
+		Identity: identity, Key: raftstore.Key{ID: "dev-restart-profile-key", Wrapped: []byte("opaque")},
+		WAL: minimumDevTestWALOptions(), Bootstrap: bootstrap,
+		Authority: sqldriver.ReplicatedAuthorityProfile{ActivePolicyGeneration: prepare.Authority.ActivePolicyGeneration,
+			ProtectionEpoch: prepare.Authority.ProtectionEpoch, OwnershipEpoch: prepare.Authority.OwnershipEpoch,
+			SchemaGeneration: prepare.Authority.SchemaGeneration, RoutingVersion: prepare.Authority.RoutingVersion,
+			RouteGeneration: prepare.Authority.RouteGeneration},
+		Apply: apply, Listeners: rf3testfixture.ProcessListeners{Peer: member.Peer, Native: member.Native,
+			Snapshot: member.Snapshot, Control: member.Control},
+		Credential: rf3testfixture.Credential{Certificate: prepare.TLS.Certificate, Key: prepare.TLS.Key},
+		Roots:      cluster.Roots, AuthorizationPolicy: cluster.AuthorizationPolicy,
+		Nodes: nodes, PeerAddresses: peers, ControlRoot: filepath.Join(root, "shared-data-control"),
+	})
+	if err := os.MkdirAll(filepath.Dir(member.ServeManifest), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(member.ServeManifest, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestDevReplicatedTableProfileUsesPortableSchemaAcrossReplicaLocalStores(t *testing.T) {
 	group := raftmember.GroupKey{
 		ClusterID: [16]byte{1}, ClusterIncarnation: [16]byte{2},
