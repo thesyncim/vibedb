@@ -71,7 +71,19 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 4*time.Minute)
 	defer cancel()
-	root := t.TempDir()
+	// The persisted DDL Unix socket lives below the cluster root. Go's
+	// testing.TempDir path is long enough on macOS and containerized runs to
+	// exceed the platform Unix-socket pathname limit, so keep this fixture root
+	// short and remove it through the test cleanup hook.
+	root, err := os.MkdirTemp("/tmp", "vdb-hot-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(root); err != nil {
+			t.Errorf("remove development cluster fixture root: %v", err)
+		}
+	})
 	tableName := "documents"
 	customTable := os.Getenv("VIBEDB_DEV_HOT_SPLIT_CUSTOM_TABLE") == "1"
 	if customTable {
@@ -262,7 +274,7 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 	seed := make([]serveStatement, len(keys))
 	for index, key := range keys {
 		if customTable {
-			seed[index] = serveStatement{SQL: `INSERT INTO dev_hot_messages VALUES (?, ?)`, Params: []serveParam{
+			seed[index] = serveStatement{SQL: `INSERT INTO dev_hot_messages (id, value) VALUES (?, ?)`, Params: []serveParam{
 				{Kind: "string", Text: key}, {Kind: "number", Text: strconv.Itoa(index + 1)},
 			}}
 		} else {
