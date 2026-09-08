@@ -275,6 +275,8 @@ func (p *postgresDirectPool) prepare(ctx context.Context, id durableExecBatchIde
 	for attempt := 0; ; attempt++ {
 		plan, err := p.prepared.PrepareDirectBatch(ctx, p.record.Authority, id, queries)
 		if err == nil || attempt == 7 || ctx.Err() != nil ||
+			errors.Is(err, gateway.ErrReplicatedMembershipTransition) ||
+			errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
 			!(errors.Is(err, raftmodel.ErrAdmissionBound) || errors.Is(err, gateway.ErrReplicatedLeader) || errors.Is(err, gateway.ErrReplicatedReadBehind)) {
 			return plan, err
 		}

@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/thesyncim/vibedb/internal/raftservice"
@@ -81,7 +82,13 @@ func bindReplicatedObservation(route ReplicatedRoute, endpoint ReplicatedEndpoin
 			observation := *response
 			observation.Kind, observation.Refusal = shardservice.ReplicatedHandshake, 0
 			if _, err := bindReplicatedObservation(route, endpoint, &observation); err != nil {
-				return ReplicatedEndpoint{}, err
+				// Retain the original refusal beside any authenticated
+				// observation hint. A refusal is a terminal sibling for the
+				// SQL transition classifier; it must not be hidden by the
+				// compatibility handshake conversion.
+				return ReplicatedEndpoint{}, errors.Join(
+					&ReplicatedRefusalError{Code: response.Refusal}, err,
+				)
 			}
 		}
 		return ReplicatedEndpoint{}, &ReplicatedRefusalError{Code: response.Refusal}
@@ -94,15 +101,30 @@ func bindReplicatedObservation(route ReplicatedRoute, endpoint ReplicatedEndpoin
 	if fence.Group != route.Group || fence.AllocationGeneration != route.AllocationGeneration {
 		return ReplicatedEndpoint{}, fmt.Errorf("%w: observed group or allocation differs", ErrReplicatedRoute)
 	}
-	if !replicatedObservedCommandMatches(route, fence.Command) {
-		return ReplicatedEndpoint{}, fmt.Errorf("%w: observed command differs: catalog=%+v replica=%+v", ErrReplicatedRoute, route.Command, fence.Command)
-	}
 	if fence.MemberID != endpoint.Member || fence.StoreID != endpoint.StoreID ||
 		endpoint.NodeIncarnation == 0 || fence.NodeIncarnation < endpoint.NodeIncarnation {
 		return ReplicatedEndpoint{}, ErrReplicatedRoute
 	}
+	if !replicatedObservedCommandMatches(route, fence.Command) {
+		if !route.membershipStable &&
+			fence.Command.ReplicaSetVersion > route.Command.ReplicaSetVersion &&
+			replicatedMembershipTransitionCommandsMatch(route.Command, fence.Command) {
+			return ReplicatedEndpoint{}, &ReplicatedMembershipTransitionError{
+				CatalogCommand: route.Command, ObservedCommand: fence.Command,
+			}
+		}
+		return ReplicatedEndpoint{}, fmt.Errorf("%w: observed command differs: catalog=%+v replica=%+v", ErrReplicatedRoute, route.Command, fence.Command)
+	}
 	endpoint.NodeIncarnation = fence.NodeIncarnation
 	return endpoint, nil
+}
+
+func replicatedMembershipTransitionCommandsMatch(
+	catalog, observed raftservice.CommandFence,
+) bool {
+	catalog.ReplicaSetVersion = 0
+	observed.ReplicaSetVersion = 0
+	return catalog == observed
 }
 
 func replicatedObservedCommandMatches(route ReplicatedRoute, observed raftservice.CommandFence) bool {
