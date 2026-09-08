@@ -18,6 +18,7 @@ import (
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/orderedkey"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replication"
@@ -279,6 +280,9 @@ func TestServeRF3ReadAuthorityLiveAppendAndRetainedRestart(t *testing.T) {
 			ctx, cancel = nil, nil
 		}
 	}()
+	rf3WaitForGatewayAvailable(t, diagnostics, [rf3CommandMembers]string{
+		inputs[0].Root, inputs[1].Root, inputs[2].Root,
+	}, startupErrors)
 	for _, bundle := range manifests[0].Groups {
 		waitRF3CommandLeader(t, [rf3CommandMembers]string{addresses[0][1], addresses[1][1], addresses[2][1]}, nodes, profiles[:], bundle.Route.Group, bundle.Route.AllocationGeneration, authorityGeneration, startupErrors)
 	}
@@ -397,6 +401,9 @@ func TestServeRF3ReadAuthorityLiveAppendAndRetainedRestart(t *testing.T) {
 		}
 	}
 	reloads, diagnostics, done, startupErrors = startNodes(ctx)
+	rf3WaitForGatewayAvailable(t, diagnostics, [rf3CommandMembers]string{
+		inputs[0].Root, inputs[1].Root, inputs[2].Root,
+	}, startupErrors)
 	for _, bundle := range manifests[0].Groups {
 		waitRF3CommandLeader(t, [rf3CommandMembers]string{addresses[0][1], addresses[1][1], addresses[2][1]}, nodes, profiles[:], bundle.Route.Group, bundle.Route.AllocationGeneration, authorityGeneration, startupErrors)
 	}
@@ -739,9 +746,117 @@ func waitRF3AuthorityGroupPresent(
 	t.Fatalf("RF3 live appended group %x was not published", group.GroupID)
 }
 
+func rf3WaitForGatewayAvailable(
+	t testing.TB,
+	diagnostics [rf3CommandMembers]chan os.Signal,
+	roots [rf3CommandMembers]string,
+	startupErrors <-chan error,
+) {
+	t.Helper()
+	// Use the existing startup/readiness bound for the whole three-node wait,
+	// rather than giving each member an independent timeout.
+	ctx, cancel := context.WithTimeout(t.Context(), rf3AuthoritySQLReadinessTimeout)
+	defer cancel()
+
+	var snapshots [rf3CommandMembers]rf3DiagnosticSnapshot
+	var wantedSerial [rf3CommandMembers]uint64
+	var signalPending [rf3CommandMembers]bool
+	var ready [rf3CommandMembers]bool
+	var nextSignal [rf3CommandMembers]time.Time
+	for member := range rf3CommandMembers {
+		path := filepath.Join(roots[member], "rf3-diagnostics.json")
+		if raw, err := os.ReadFile(path); err == nil {
+			if err := json.Unmarshal(raw, &snapshots[member]); err != nil {
+				t.Fatalf("decode RF3 gateway readiness diagnostic for member %d: %v", member+1, err)
+			}
+			wantedSerial[member] = snapshots[member].Serial + 1
+		} else if errors.Is(err, os.ErrNotExist) {
+			wantedSerial[member] = 1
+		} else {
+			t.Fatalf("read RF3 gateway readiness diagnostic for member %d: %v", member+1, err)
+		}
+		signalPending[member] = true
+	}
+
+	checkStartupError := func() {
+		select {
+		case err := <-startupErrors:
+			if err == nil {
+				t.Fatalf("RF3 server exited before embedded gateway readiness")
+			}
+			t.Fatalf("RF3 server failed before embedded gateway readiness: %v", err)
+		default:
+		}
+	}
+
+	for {
+		checkStartupError()
+		allReady := true
+		for member := range rf3CommandMembers {
+			if ready[member] {
+				continue
+			}
+			allReady = false
+			if signalPending[member] && !time.Now().Before(nextSignal[member]) {
+				select {
+				case diagnostics[member] <- syscall.SIGUSR1:
+					signalPending[member] = false
+					nextSignal[member] = time.Now().Add(rf3GatewayDiagnosticInterval)
+				case err := <-startupErrors:
+					if err == nil {
+						t.Fatalf("RF3 server exited before embedded gateway readiness")
+					}
+					t.Fatalf("RF3 server failed before embedded gateway readiness: %v", err)
+				case <-ctx.Done():
+					t.Fatalf("RF3 embedded gateway readiness timeout: %v", ctx.Err())
+				default:
+				}
+			}
+
+			path := filepath.Join(roots[member], "rf3-diagnostics.json")
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				if !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("read RF3 gateway readiness diagnostic for member %d: %v", member+1, err)
+				}
+				continue
+			}
+			var snapshot rf3DiagnosticSnapshot
+			if err := json.Unmarshal(raw, &snapshot); err != nil {
+				t.Fatalf("decode RF3 gateway readiness diagnostic for member %d: %v", member+1, err)
+			}
+			if snapshot.Serial < wantedSerial[member] {
+				continue
+			}
+			snapshots[member] = snapshot
+			signalPending[member] = false
+			if snapshot.GatewayAvailable {
+				ready[member] = true
+			} else {
+				wantedSerial[member] = snapshot.Serial + 1
+				signalPending[member] = true
+				nextSignal[member] = time.Now().Add(rf3GatewayDiagnosticInterval)
+			}
+		}
+		if allReady {
+			if err := ctx.Err(); err != nil {
+				t.Fatalf("RF3 embedded gateway readiness timeout: %v; snapshots=%+v", err, snapshots)
+			}
+			checkStartupError()
+			return
+		}
+		select {
+		case <-time.After(10 * time.Millisecond):
+		case <-ctx.Done():
+			t.Fatalf("RF3 embedded gateway readiness timeout: %v; snapshots=%+v", ctx.Err(), snapshots)
+		}
+	}
+}
+
 const (
 	rf3AuthoritySQLReadinessTimeout  = 15 * time.Second
 	rf3AuthoritySQLReadinessAttempts = 64
+	rf3GatewayDiagnosticInterval     = 250 * time.Millisecond
 )
 
 func rf3ReadAuthoritySQLRequest(
@@ -749,8 +864,8 @@ func rf3ReadAuthoritySQLRequest(
 	authority serviceauthz.Authority,
 ) *shardservice.ReplicatedRequest {
 	t.Helper()
-	var query bytes.Buffer
-	if err := shardservice.EncodeRequest(&query, &shardservice.ShardRequest{
+	primaryKeyRead := rf3ReadAuthorityPrimaryKeyRead(t, bundle)
+	request := &shardservice.ShardRequest{
 		Authority:            authority,
 		SQL:                  `SELECT id FROM docs_live WHERE id = 'authority-live-append'`,
 		Distribution:         distribution.DistributionName(bundle.Route.Distribution),
@@ -762,8 +877,29 @@ func rf3ReadAuthoritySQLRequest(
 		ExecutionMode:        shardservice.ExecutionReadOnly,
 		MaxRows:              1,
 		MaxResultBytes:       4096,
-	}); err != nil {
+		PrimaryKeyRead:       primaryKeyRead,
+	}
+	var query bytes.Buffer
+	if err := shardservice.EncodeRequest(&query, request); err != nil {
 		t.Fatalf("encode live authority SQL query: %v", err)
+	}
+	decoded, err := shardservice.DecodeRequest(bytes.NewReader(query.Bytes()))
+	if err != nil {
+		t.Fatalf("decode live authority SQL query: %v", err)
+	}
+	if decoded.PrimaryKeyRead.Relation != primaryKeyRead.Relation ||
+		decoded.PrimaryKeyRead.MaxDocumentBytes != primaryKeyRead.MaxDocumentBytes ||
+		!bytes.Equal(decoded.PrimaryKeyRead.PrimaryPath, primaryKeyRead.PrimaryPath) ||
+		len(decoded.PrimaryKeyRead.Keys) != 1 ||
+		!bytes.Equal(decoded.PrimaryKeyRead.Keys[0], primaryKeyRead.Keys[0]) {
+		t.Fatalf("live authority SQL point metadata changed across wire round trip: got=%+v want=%+v", decoded.PrimaryKeyRead, primaryKeyRead)
+	}
+	component, payload, next, err := orderedkey.DecodeComponent(nil, decoded.PrimaryKeyRead.Keys[0], 0)
+	if err != nil || component.Kind != orderedkey.KindString || component.Descending ||
+		component.PayloadStart != 0 || component.PayloadEnd != len(payload) ||
+		next != len(decoded.PrimaryKeyRead.Keys[0]) ||
+		!bytes.Equal(payload[component.PayloadStart:component.PayloadEnd], []byte("authority-live-append")) {
+		t.Fatalf("live authority SQL key is not one ascending string component: component=%+v payload=%q next=%d err=%v", component, payload, next, err)
 	}
 	return &shardservice.ReplicatedRequest{
 		Operation:     shardservice.ReplicatedQueryLeader,
@@ -772,6 +908,49 @@ func rf3ReadAuthoritySQLRequest(
 		Fence:         state.Fence,
 		Query:         query.Bytes(),
 		MaxValueBytes: 4096,
+	}
+}
+
+func rf3ReadAuthorityPrimaryKeyRead(
+	t testing.TB, bundle rf3ManifestGroup,
+) shardservice.PrimaryKeyReadRequest {
+	t.Helper()
+	var identity sqldriver.ReplicatedShardStoreIdentity
+	if err := loadRF3IdentityFile(bundle.SQL.IdentityPath, &identity); err != nil {
+		t.Fatalf("load live authority SQL identity: %v", err)
+	}
+	if _, err := sqldriver.ReplicatedRelationManifestDigest(identity); err != nil {
+		t.Fatalf("validate live authority SQL identity: %v", err)
+	}
+	if identity.UserTable != "docs_live" || !rf3RouteMatchesBinding(bundle.Route, identity.Binding) {
+		t.Fatalf("live authority SQL identity does not match docs_live route: table=%q binding=%+v route=%+v", identity.UserTable, identity.Binding, bundle.Route)
+	}
+	var relation *sqldriver.ReplicatedShardRelationIdentity
+	for index := range identity.Relations {
+		candidate := &identity.Relations[index]
+		if candidate.Table != "docs_live" {
+			continue
+		}
+		if relation != nil || candidate.Kind != sqldriver.ReplicatedShardRelationJSON {
+			t.Fatalf("live authority SQL identity has invalid docs_live base relation: %+v", identity.Relations)
+		}
+		relation = candidate
+	}
+	if relation == nil || relation.Relation == 0 ||
+		identity.UserPrimaryKey == "" || relation.Limits.MaxDocumentBytes <= 0 ||
+		relation.Limits.MaxDocumentBytes > replication.MaxMutationValueBytes ||
+		relation.Limits.MaxKeyBytes <= 0 {
+		t.Fatalf("live authority SQL identity has no valid docs_live base relation: user=%+v relations=%+v", identity, identity.Relations)
+	}
+	key, ok := orderedkey.AppendString(nil, []byte("authority-live-append"), orderedkey.Ascending)
+	if !ok || len(key) > relation.Limits.MaxKeyBytes {
+		t.Fatalf("live authority SQL key does not fit prepared MaxKeyBytes=%d: encoded=%d", relation.Limits.MaxKeyBytes, len(key))
+	}
+	return shardservice.PrimaryKeyReadRequest{
+		Relation:         replication.RelationID(relation.Relation),
+		MaxDocumentBytes: uint32(relation.Limits.MaxDocumentBytes),
+		PrimaryPath:      []byte(identity.UserPrimaryKey),
+		Keys:             [][]byte{key},
 	}
 }
 
