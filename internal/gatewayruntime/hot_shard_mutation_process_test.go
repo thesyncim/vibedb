@@ -1375,26 +1375,37 @@ func (client *hotMutationWireClient) roundTripUntil(
 	t testing.TB, request []byte, deadline time.Time,
 ) ([]byte, time.Duration) {
 	t.Helper()
+	response, latency, err := client.roundTripUntilObserved(t, request, deadline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return response, latency
+}
+
+func (client *hotMutationWireClient) roundTripUntilObserved(
+	t testing.TB, request []byte, deadline time.Time,
+) ([]byte, time.Duration, error) {
+	t.Helper()
 	if client == nil || client.connection == nil || len(request) == 0 || !deadline.After(time.Now()) {
-		t.Fatal("invalid hot shard round trip")
+		return nil, 0, errors.New("invalid hot shard round trip")
 	}
 	if err := client.connection.SetDeadline(deadline); err != nil {
-		t.Fatal(err)
+		return nil, 0, fmt.Errorf("set hot shard round-trip deadline: %w", err)
 	}
 	started := time.Now()
 	request = append(request, '\n')
 	written, err := client.connection.Write(request)
 	if err != nil {
-		t.Fatal(err)
+		return nil, time.Since(started), fmt.Errorf("write hot shard round trip: %w", err)
 	}
 	response, err := client.reader.ReadBytes('\n')
 	latency := time.Since(started)
 	if err != nil {
-		t.Fatal(err)
+		return response, latency, fmt.Errorf("read hot shard round trip: %w", err)
 	}
 	client.requests++
 	client.bytes += uint64(written + len(response))
-	return response, latency
+	return response, latency, nil
 }
 
 func (client *hotMutationWireClient) openIssuer(t *testing.T) gateway.ReplicatedIssuerReference {

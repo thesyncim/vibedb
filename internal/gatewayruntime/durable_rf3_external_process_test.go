@@ -170,11 +170,17 @@ func TestGatewayDurableRF3ExternalProcessRecovery(t *testing.T) {
 	failureDiagnosticRequest, failureDiagnosticStage = terminalRequest, "terminal_exec"
 	terminalLossLatency := clientA.loseResponseAfterFirstByte(t, terminalRequest, "terminal_exec")
 	latencies = append(latencies, terminalLossLatency)
-	// The byte proves the server emitted a response, while these independent
-	// linearizable reads prove the mutation applied despite its deliberately
-	// unknown transport outcome. Replacement recovery below proves the exact
-	// terminal; the ACK replay then retires this gateway's retained journal.
-	proofA := fixture.dialGateway(t, fixture.gatewayANode, fixture.gatewayAAddress)
+	// The first byte deliberately leaves the transport outcome unknown. Reopen
+	// gateway A and resend the byte-identical request while the same two-voter
+	// quorum is active. Only the complete committed response settles the
+	// mutation; a partial JSON response or found=false read is never a commit
+	// oracle. The later replacement replay remains an independent proof.
+	settlementA := fixture.dialGateway(t, fixture.gatewayANode, fixture.gatewayAAddress)
+	settledRaw, settledLatency := settlementA.roundTrip(t, terminalRequest)
+	latencies = append(latencies, settledLatency)
+	durableRF3ExternalLogResponse(t, "terminal_settlement", settledRaw)
+	durableRF3ExternalAssertCommitted(t, settledRaw, 2, 2)
+	proofA := settlementA
 	latencies = append(latencies, proofA.assertPoint(t, "orders_a", "terminal-a"))
 	latencies = append(latencies, proofA.assertPoint(t, "orders_b", "terminal-b"))
 	proofA.close()
@@ -212,6 +218,9 @@ func TestGatewayDurableRF3ExternalProcessRecovery(t *testing.T) {
 	if !recovered.Committed || recovered.RowsAffected != 2 || recovered.ShardsFanned != 2 ||
 		recovered.Error != "" {
 		t.Fatalf("replacement terminal response=%s", recoveredRaw)
+	}
+	if !bytes.Equal(settledRaw, recoveredRaw) {
+		t.Fatalf("terminal response drifted across gateway replacement\nA=%s\nB=%s", settledRaw, recoveredRaw)
 	}
 	replayedRaw, replayLatency := clientB.roundTrip(t, terminalRequest)
 	latencies = append(latencies, replayLatency)

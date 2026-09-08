@@ -203,6 +203,16 @@ type preparedRF3Set struct {
 	nativeConfigured bool
 }
 
+// Only groups present in the immutable serving manifest use the shared node
+// log. Entries appended from the adopted inventory retain their own child WAL;
+// their provenance must remain explicit through runtime adoption.
+func rf3SelectedNodeOwner(nodeOwner *rf3NodeOwner, index, initialCount int) *rf3NodeOwner {
+	if nodeOwner == nil || index < 0 || index >= initialCount {
+		return nil
+	}
+	return nodeOwner
+}
+
 func (group *preparedRF3Group) close(cause error) error {
 	if group == nil {
 		return cause
@@ -302,11 +312,27 @@ func prepareRF3GroupSetOnNode(manifest rf3Manifest, profile *rafttransport.PeerT
 		var key raftstore.Key
 		var wal *raftstore.Store
 		var nodeLog *raftstore.GroupView
+		var selectedOwner *rf3NodeOwner
 		var log rf3RecoveryLog
-		if nodeOwner != nil {
-			nodeLog, err = nodeOwner.ensurePreparedGroup(single, base, applyIdentity, opening)
+		// Manifest groups are retained in the shared node log. Adopted split
+		// children are separately certified file-backed groups: their child.wal
+		// is the durable authority and the shared node store must never be asked
+		// to manufacture the original node-bootstrap.pb for them.
+		selectedOwner = rf3SelectedNodeOwner(nodeOwner, index, initialCount)
+		if selectedOwner != nil {
+			nodeLog, err = selectedOwner.ensurePreparedGroup(single, base, applyIdentity, opening)
 			log = nodeLog
 		} else {
+			if nodeOwner != nil {
+				if nodeOwner.store == nil {
+					return result, closePreparedRF3Groups(result.groups,
+						fmt.Errorf("%w: adopted child has no shared node store to check", errRF3Serving))
+				}
+				if _, found := nodeOwner.store.GroupByID(base.Binding.GroupID); found {
+					return result, closePreparedRF3Groups(result.groups,
+						fmt.Errorf("%w: adopted child group is already present in shared node log", errRF3Serving))
+				}
+			}
 			key, err = loadRF3WALKey(bundle.WAL.KeyID, bundle.WAL.KeyMaterialPath)
 			if err == nil {
 				wal, err = raftstore.Open(bundle.WAL.Path, walIdentityFromBinding(base.Binding), base.Binding.TopologyRecoveryEpoch, key, bundle.WAL.Options)
@@ -331,9 +357,9 @@ func prepareRF3GroupSetOnNode(manifest rf3Manifest, profile *rafttransport.PeerT
 		if err != nil {
 			return result, closePreparedRF3Groups(append(result.groups, preparedRF3Group{
 				manifest: single, base: base, applyIdentity: applyIdentity, key: key,
-				wal: wal, nodeLog: nodeLog, nodeOwner: nodeOwner, database: database, apply: apply}), err)
+				wal: wal, nodeLog: nodeLog, nodeOwner: selectedOwner, database: database, apply: apply}), err)
 		}
-		item := preparedRF3Group{manifest: single, base: base, applyIdentity: applyIdentity, key: key, wal: wal, nodeLog: nodeLog, nodeOwner: nodeOwner, database: database, apply: apply, publication: apply.Published(), splitRuntimeDigest: runtimeDigest}
+		item := preparedRF3Group{manifest: single, base: base, applyIdentity: applyIdentity, key: key, wal: wal, nodeLog: nodeLog, nodeOwner: selectedOwner, database: database, apply: apply, publication: apply.Published(), splitRuntimeDigest: runtimeDigest}
 		if !rf3SplitChildTemplateMatchesRetained(single.SplitControl.ChildRegistry, base, applyIdentity) ||
 			!rf3SplitChildSchemaMatchesRetained(single.SplitControl.ChildRegistry, base) {
 			return result, closePreparedRF3Groups(append(result.groups, item),

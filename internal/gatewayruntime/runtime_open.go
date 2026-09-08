@@ -4,9 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net"
-	"os"
 	"time"
 
 	"github.com/thesyncim/vibedb/gateway"
@@ -156,20 +154,51 @@ func (runtime *Runtime) open() error {
 		}
 		tableCatalogs = append(append([]string(nil), tableCatalogs...), listed...)
 	}
-	for _, path := range tableCatalogs {
+	registrations := make([]gatewayTableCatalogRegistration, len(tableCatalogs))
+	var startupManifest *gatewayReplicaControlManifest
+	if len(tableCatalogs) != 0 && config.ReplicaControlManifestPath != "" {
+		loaded, manifestErr := loadGatewayReplicaControlManifest(config.ReplicaControlManifestPath, profile.LocalIdentity().Node)
+		if manifestErr != nil {
+			return fmt.Errorf("load replica control manifest for table proofs: %w", manifestErr)
+		}
+		startupManifest = &loaded
+	}
+	for index, path := range tableCatalogs {
 		if runtime.authority == nil {
 			return fmt.Errorf("%w: table registration requires replicated catalog authority", ErrInvalidConfig)
 		}
-		addition, registerErr := openGatewayTableCatalog(path)
-		if registerErr == nil {
+		registration, registerErr := openGatewayTableCatalog(path)
+		if registerErr != nil {
+			return fmt.Errorf("open table catalog %q: %w", path, registerErr)
+		}
+		registrations[index] = registration
+		if registration.Source != nil {
+			if startupManifest == nil {
+				return fmt.Errorf("%w: bundled table catalog %q requires an enrolled replica-control roster", ErrInvalidConfig, path)
+			}
+			runtime.provisionedSplitSources = append(runtime.provisionedSplitSources, gatewayProvisionedSplitSource{
+				Fragment: registration.Addition, Source: *registration.Source,
+			})
+		}
+	}
+	if startupManifest != nil && len(runtime.provisionedSplitSources) != 0 {
+		// Validate every paired fragment/source, including aggregate root and
+		// capacity constraints, before any catalog CAS can publish one table.
+		if _, preflightErr := newGatewayHotSplitFactory(*startupManifest, runtime.holder.Current(), runtime.provisionedSplitSources...); preflightErr != nil {
+			return fmt.Errorf("validate table provision bundles: %w", preflightErr)
+		}
+	}
+	for index, registration := range registrations {
+		registerErr := error(nil)
+		if registration.Addition != nil {
 			registerCtx, cancel := context.WithTimeout(runtime.ctx, time.Minute)
 			registerErr = registerGatewayDevTable(registerCtx, func(ctx context.Context) error {
-				return runtime.authority.RegisterProvisionedTable(ctx, addition)
+				return runtime.authority.RegisterProvisionedTable(ctx, registration.Addition)
 			}, runtime.config.Logf)
 			cancel()
 		}
 		if registerErr != nil {
-			return fmt.Errorf("register table catalog %q: %w", path, registerErr)
+			return fmt.Errorf("register table catalog %q: %w", tableCatalogs[index], registerErr)
 		}
 	}
 	if runtime.replicated != nil {
@@ -225,17 +254,4 @@ func (runtime *Runtime) open() error {
 		}
 	}
 	return nil
-}
-
-func openGatewayTableCatalog(path string) (*gateway.Snapshot, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	raw, readErr := io.ReadAll(io.LimitReader(file, (4<<20)+1))
-	closeErr := file.Close()
-	if err = errors.Join(readErr, closeErr); err != nil {
-		return nil, err
-	}
-	return gateway.OpenReplicatedTableProvision(raw)
 }

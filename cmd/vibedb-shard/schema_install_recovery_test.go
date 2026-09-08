@@ -267,10 +267,10 @@ func TestRF3SchemaActivationRecognizesExactRetiredPredecessor(t *testing.T) {
 
 type schemaRecoveryOwner struct {
 	rf3SchemaOwner
-	command                         []byte
-	committed                       bool
-	observations, proposals, probes int
-	observeErr, proposeErr          error
+	command                          []byte
+	committed                        bool
+	observations, proposals, probes  int
+	observeErr, probeErr, proposeErr error
 }
 
 func (o *schemaRecoveryOwner) ObserveSchemaTransition(_ context.Context, _ raftmember.GroupKey, command []byte) (bool, error) {
@@ -283,7 +283,7 @@ func (o *schemaRecoveryOwner) ObserveSchemaTransition(_ context.Context, _ raftm
 
 func (o *schemaRecoveryOwner) Probe(context.Context, raftmember.GroupKey) (raftservice.ServingState, error) {
 	o.probes++
-	return raftservice.ServingState{}, nil
+	return raftservice.ServingState{}, o.probeErr
 }
 
 func (o *schemaRecoveryOwner) ProposeSchemaTransition(_ context.Context, _ raftservice.ServingFence, command []byte) error {
@@ -309,5 +309,141 @@ func TestRF3SchemaActivationRecoverySettlesOriginalUncertainProposal(t *testing.
 	owner = &schemaRecoveryOwner{command: command, observeErr: schemainstall.ErrConflict}
 	if err := settleRF3SchemaCommit(context.Background(), owner, request.Group, command); !errors.Is(err, schemainstall.ErrConflict) || owner.proposals != 0 || owner.probes != 0 {
 		t.Fatalf("failed observation caused reproposal: %+v err=%v", owner, err)
+	}
+}
+
+func TestRF3SchemaActivationResolvesCASAliasOnlyForPendingFence(t *testing.T) {
+	request, authorization, transition := testRF3SchemaRecoveryCommand(t)
+	command, err := rf3SchemaActivationCommand(request, authorization, transition, true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name         string
+		probeErr     error
+		proposeErr   error
+		alias        func() (bool, error)
+		wantErr      error
+		wantProofErr error
+		probes       int
+		proposals    int
+	}{
+		{
+			name:     "probe pending authenticated alias",
+			probeErr: replicatedstate.ErrSchemaTransitionPending,
+			alias: func() (bool, error) {
+				return true, nil
+			},
+			probes: 1,
+		},
+		{
+			name:     "probe pending missing proof",
+			probeErr: replicatedstate.ErrSchemaTransitionPending,
+			alias: func() (bool, error) {
+				return false, nil
+			},
+			wantErr: replicatedstate.ErrSchemaTransitionPending,
+			probes:  1,
+		},
+		{
+			name:     "probe pending proof error",
+			probeErr: replicatedstate.ErrSchemaTransitionPending,
+			alias: func() (bool, error) {
+				return true, schemainstall.ErrConflict
+			},
+			wantErr:      replicatedstate.ErrSchemaTransitionPending,
+			wantProofErr: schemainstall.ErrConflict,
+			probes:       1,
+		},
+		{
+			name:       "proposal pending authenticated alias",
+			proposeErr: replicatedstate.ErrSchemaTransitionPending,
+			alias: func() (bool, error) {
+				return true, nil
+			},
+			probes:    1,
+			proposals: 1,
+		},
+		{
+			name:       "proposal pending foreign proof",
+			proposeErr: replicatedstate.ErrSchemaTransitionPending,
+			alias: func() (bool, error) {
+				return false, schemainstall.ErrConflict
+			},
+			wantErr:      replicatedstate.ErrSchemaTransitionPending,
+			wantProofErr: schemainstall.ErrConflict,
+			probes:       1,
+			proposals:    1,
+		},
+		{
+			name:       "proposal pending proof error",
+			proposeErr: replicatedstate.ErrSchemaTransitionPending,
+			alias: func() (bool, error) {
+				return true, schemainstall.ErrConflict
+			},
+			wantErr:      replicatedstate.ErrSchemaTransitionPending,
+			wantProofErr: schemainstall.ErrConflict,
+			probes:       1,
+			proposals:    1,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			aliasCalls := 0
+			owner := &schemaRecoveryOwner{command: command, probeErr: test.probeErr, proposeErr: test.proposeErr}
+			alias := test.alias
+			if alias != nil {
+				alias = func() (bool, error) {
+					aliasCalls++
+					return test.alias()
+				}
+			}
+			got := settleRF3SchemaCommitWithAlias(context.Background(), owner, request.Group, command, alias)
+			if test.wantErr == nil {
+				if got != nil {
+					t.Fatalf("pending alias was not accepted: %v", got)
+				}
+			} else if !errors.Is(got, test.wantErr) {
+				t.Fatalf("error=%v want=%v", got, test.wantErr)
+			}
+			if test.wantProofErr != nil && !errors.Is(got, test.wantProofErr) {
+				t.Fatalf("proof error=%v want=%v", got, test.wantProofErr)
+			}
+			if owner.probes != test.probes || owner.proposals != test.proposals || aliasCalls != 1 {
+				t.Fatalf("owner=%+v alias_calls=%d", owner, aliasCalls)
+			}
+		})
+	}
+
+	owner := &schemaRecoveryOwner{command: command, probeErr: replicatedstate.ErrSchemaTransitionPending}
+	if err := settleRF3SchemaCommitWithAlias(context.Background(), owner, request.Group, command, nil); !errors.Is(err, replicatedstate.ErrSchemaTransitionPending) || owner.proposals != 0 {
+		t.Fatalf("nil alias changed pending fence: owner=%+v err=%v", owner, err)
+	}
+	aliasCalls := 0
+	owner = &schemaRecoveryOwner{command: command, probeErr: raftservice.ErrServingFence}
+	if err := settleRF3SchemaCommitWithAlias(context.Background(), owner, request.Group, command, func() (bool, error) {
+		aliasCalls++
+		return true, nil
+	}); !errors.Is(err, raftservice.ErrServingFence) || aliasCalls != 0 || owner.proposals != 0 {
+		t.Fatalf("non-pending probe consulted alias or reproposed: owner=%+v alias_calls=%d err=%v", owner, aliasCalls, err)
+	}
+	for _, test := range []struct {
+		name       string
+		probeErr   error
+		proposeErr error
+	}{
+		{name: "probe pending with terminal error", probeErr: errors.Join(replicatedstate.ErrSchemaTransitionPending, schemainstall.ErrConflict)},
+		{name: "proposal pending with terminal error", proposeErr: errors.Join(replicatedstate.ErrSchemaTransitionPending, schemainstall.ErrConflict)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			aliasCalls := 0
+			owner := &schemaRecoveryOwner{command: command, probeErr: test.probeErr, proposeErr: test.proposeErr}
+			err := settleRF3SchemaCommitWithAlias(context.Background(), owner, request.Group, command, func() (bool, error) {
+				aliasCalls++
+				return true, nil
+			})
+			if !errors.Is(err, schemainstall.ErrConflict) || !errors.Is(err, replicatedstate.ErrSchemaTransitionPending) || aliasCalls != 0 {
+				t.Fatalf("joined terminal error was softened: owner=%+v alias_calls=%d err=%v", owner, aliasCalls, err)
+			}
+		})
 	}
 }

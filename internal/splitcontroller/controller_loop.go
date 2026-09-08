@@ -47,8 +47,15 @@ func RunDirectControllerPass(
 		if errors.Is(readErr, gateway.ErrReplicatedOperationMissing) {
 			continue
 		}
-		if readErr != nil || record.ID != id || record.Kind != gateway.ReplicatedOperationSplit {
+		if readErr != nil || record.ID != id || !record.Valid() {
 			return pass, errors.Join(readErr, ErrControllerTrigger)
+		}
+		// The shared directory also carries schema, move, and backup witnesses.
+		// Direct split execution is intentionally limited to split records; the
+		// other valid kinds are owned by their respective controllers and must
+		// not poison this pass.
+		if record.Kind != gateway.ReplicatedOperationSplit {
+			continue
 		}
 		action, executeErr := controller.ExecuteReplicatedOperation(ctx, id)
 		if executeErr != nil {
@@ -89,6 +96,15 @@ func RunControllerPass(
 		}
 		if readErr != nil {
 			return pass, readErr
+		}
+		if record.ID != ids[index] || !record.Valid() {
+			return pass, ErrControllerTrigger
+		}
+		// Schema, move, and backup witnesses share the bounded directory but
+		// are dispatched by their own controllers. A split trigger must never
+		// try to decode their intent as a split plan.
+		if record.Kind != gateway.ReplicatedOperationSplit {
+			continue
 		}
 		plan, openErr := OpenPlanIntent(record.Intent, catalog)
 		if openErr != nil || [32]byte(plan.OperationID()) != record.ID {
