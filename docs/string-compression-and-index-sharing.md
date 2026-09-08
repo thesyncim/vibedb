@@ -2,13 +2,17 @@
 
 This work evaluates two sources of storage cost: long strings in primary
 dictionary streams, and fields repeated across different secondary indexes.
-The compression implementation is a candidate under qualification. Shared
-storage across distinct indexes is not implemented.
+The per-string compression experiment was rejected for production because
+its physical savings were inconsistent and it slowed resident reads. Its
+measurements are retained below. The chosen next implementation is bounded
+physical packs of canonical exact-index leaves, compressed once on disk and
+decoded at Open. See [the implementation plan](exact-index-packed-storage-plan.md).
+Durable pack integration and its performance qualification are still pending.
 
 ## Primary dictionary strings
 
 Primary stripes already select dictionary, prefix, numeric and alphabet
-encodings. The candidate applies LZ4 to individual unique JSON string spellings
+encodings. The rejected candidate applied LZ4 to individual unique JSON string spellings
 only after dictionary encoding wins. Packed row IDs remain directly readable;
 a point read decompresses its selected value into caller-owned output.
 
@@ -19,7 +23,7 @@ and row IDs. This admission rule is still being qualified against physical
 page rounding. Scratch memory is reused; preparation can allocate, while warm
 codec encode, decode and validation have allocation tests.
 
-The implementation uses LZ4 v4.1.28. Codec experiments favored its decode cost
+The experiment used LZ4 v4.1.28. Codec experiments favored its decode cost
 over Snappy and S2 for this representation. Whole-page compression would need
 separate physical and decoded page sizes in the cache and write path; it is a
 different storage change.

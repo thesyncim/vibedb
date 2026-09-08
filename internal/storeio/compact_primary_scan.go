@@ -3,8 +3,6 @@ package storeio
 import (
 	"encoding/binary"
 	"strconv"
-
-	"github.com/pierrec/lz4/v4"
 )
 
 const (
@@ -128,51 +126,26 @@ func (d *CompactPrimaryScanDecoder) prepare(
 			prefixEnd := meta.ends[hole]
 			prefixBytes := int(prefixEnd - prefixStart)
 			fragmentBytes := prefixBytes*stream.dictCount + len(stream.dictData)
-			if stream.kind == compactStreamCompressedDictionary {
-				fragmentBytes = prefixBytes * stream.dictCount
-				for id := 0; id < stream.dictCount; id++ {
-					entry, ok := stream.dictionaryEntry(id)
-					length, _, _, valid := compactCompressedDictionaryEntry(entry)
-					if !ok || !valid || length > len(d.fragments)-fragmentBytes {
-						fragmentBytes = len(d.fragments) + 1
-						break
-					}
-					fragmentBytes += length
-				}
-			}
-			if (stream.kind == compactStreamDictionary ||
-				stream.kind == compactStreamCompressedDictionary) &&
+			if stream.kind == compactStreamDictionary &&
 				stream.dictCount > 0 &&
 				stream.dictCount+1 <= len(d.dictionary)-dictionaryCount &&
 				fragmentBytes <= len(d.fragments)-fragmentCount {
-				candidateFragmentCount := fragmentCount
-				d.dictionary[dictionaryCount] = uint16(fragmentCount)
-				for id := 0; id < stream.dictCount; id++ {
-					candidateFragmentCount += copy(
-						d.fragments[candidateFragmentCount:], meta.static[prefixStart:prefixEnd],
-					)
-					entry, _ := stream.dictionaryEntry(id)
-					if stream.kind == compactStreamDictionary {
-						candidateFragmentCount += copy(d.fragments[candidateFragmentCount:], entry)
-					} else {
-						length, compressed, body, _ := compactCompressedDictionaryEntry(entry)
-						if compressed {
-							target := d.fragments[candidateFragmentCount : candidateFragmentCount+length]
-							n, err := lz4.UncompressBlock(body, target)
-							if err != nil || n != length {
-								return
-							}
-							candidateFragmentCount += length
-						} else {
-							candidateFragmentCount += copy(d.fragments[candidateFragmentCount:], body)
-						}
-					}
-					d.dictionary[dictionaryCount+id+1] = uint16(candidateFragmentCount)
-				}
 				plan := &d.streamPlan[streamCount+hole]
 				plan.dictionaryFirst = uint16(dictionaryCount)
 				plan.dictionaryCount = uint16(stream.dictCount)
-				fragmentCount = candidateFragmentCount
+				d.dictionary[dictionaryCount] = uint16(fragmentCount)
+				dictionaryStart := 0
+				for id := 0; id < stream.dictCount; id++ {
+					dictionaryEnd := int(binary.LittleEndian.Uint16(stream.dictDir[id*2:]))
+					fragmentCount += copy(
+						d.fragments[fragmentCount:], meta.static[prefixStart:prefixEnd],
+					)
+					fragmentCount += copy(
+						d.fragments[fragmentCount:], stream.dictData[dictionaryStart:dictionaryEnd],
+					)
+					d.dictionary[dictionaryCount+id+1] = uint16(fragmentCount)
+					dictionaryStart = dictionaryEnd
+				}
 				dictionaryCount += stream.dictCount + 1
 			}
 			streamRaw = streamRaw[stream.encoded:]

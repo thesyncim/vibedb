@@ -1080,7 +1080,7 @@ func checkpointGroupTerminalTopologyBatch(batch *DatabaseBatch) error {
 	for i := 0; i < write.collection.options.MaxBatchDocuments; i++ {
 		key := fmt.Appendf(nil, "topology-%04d", i)
 		value := fmt.Appendf(nil, `{"n":%d,"pad":"`, i)
-		value = appendCompressionResistantJSONSafePattern(value, 1_850, i*37)
+		value = appendWideJSONSafePattern(value, 1_850, i*37)
 		value = append(value, '"', '}')
 		if err := write.Put(key, value); err != nil {
 			return err

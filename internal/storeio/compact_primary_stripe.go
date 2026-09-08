@@ -223,7 +223,7 @@ func buildPreparedCompactPrimaryStripePayloadRows(
 		payload[11] = compactPrimaryHasOverflow
 	}
 	keyStart := len(payload)
-	keyEncoding := scratch.stream.encodeKeys(keys)
+	keyEncoding := scratch.stream.encode(keys)
 	var err error
 	payload, err = keyEncoding.appendBinary(payload)
 	if err != nil {
