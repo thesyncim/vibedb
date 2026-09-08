@@ -9,6 +9,7 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	pb "go.etcd.io/raft/v3/raftpb"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestRF3RecoveredChildReopensItsWALWithoutNodeBootstrap(t *testing.T) {
@@ -24,7 +25,7 @@ func TestRF3RecoveredChildReopensItsWALWithoutNodeBootstrap(t *testing.T) {
 		ShardIncarnation: [16]byte{4}, GroupID: [16]byte{5}, MemberID: 2,
 		StoreID: [16]byte{6},
 	}
-	index, term := uint64(1), uint64(1)
+	index, term := uint64(47), uint64(19)
 	bootstrap := &pb.Snapshot{Data: []byte("retained-child"), Metadata: &pb.SnapshotMetadata{
 		Index: &index, Term: &term, ConfState: &pb.ConfState{Voters: []uint64{1, 2, 3}},
 	}}
@@ -77,7 +78,7 @@ func TestRF3RecoveredChildReopensItsWALWithoutNodeBootstrap(t *testing.T) {
 	}
 	clear(childKey.Material[:])
 	snapshot, err := source.recoveryLog().Snapshot()
-	if err != nil || !bytes.Equal(snapshot.GetData(), bootstrap.GetData()) {
-		t.Fatalf("reopened child WAL snapshot = %q, %v", snapshot.GetData(), err)
+	if err != nil || !proto.Equal(snapshot, bootstrap) {
+		t.Fatalf("reopened child WAL snapshot = %+v, %v", snapshot, err)
 	}
 }
