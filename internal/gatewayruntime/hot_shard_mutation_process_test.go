@@ -586,13 +586,19 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 	t.Log("split admitted on the reopened replacement roster")
 	hotMutationWaitSplitRevision(t, ctx, catalogAuthority, [32]byte(splitPlan.OperationID()), 4)
 	t.Log("split capture/artifact execution started")
+	// Emit the bounded observation only after the original split assertions and
+	// bounds run. It records existing wire attempts for seq8..11 without adding
+	// a probe, retry, or timer to the workload.
+	defer client.logObservedAttempts(t)
 	var splitLatencies []time.Duration
 	for sequence := uint64(8); sequence <= 9; sequence++ {
-		splitLatencies = append(splitLatencies, client.execute(t, hotMutationRequest(t, reference, sequence,
-			[]serveStatement{{SQL: `UPDATE messages SET "$doc" = ? WHERE id = ?`, Params: []serveParam{
+		request := hotMutationRequest(t, reference, sequence, []serveStatement{{
+			SQL: `UPDATE messages SET "$doc" = ? WHERE id = ?`, Params: []serveParam{
 				{Kind: "document", Text: fmt.Sprintf(`{"id":"m-0","kind":"splitting","email":"split@example.com","value":%d}`, sequence)},
 				{Kind: "string", Text: "m-0"},
-			}}})))
+			},
+		}})
+		splitLatencies = append(splitLatencies, client.executeObserved(t, request, sequence))
 	}
 	servingRoute, found := final.ResolveReplicatedRoute(
 		routes[0].Distribution, routes[0].Shard, make([]gateway.ReplicatedEndpoint, 0, gateway.ServingReplicaCount),
@@ -644,11 +650,13 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 		t.Fatalf("restarted split source leader %d: %v\n%s", splitLeader, err, splitLeaderProcess.Diagnostics())
 	}
 	for sequence := uint64(10); sequence <= 11; sequence++ {
-		splitLatencies = append(splitLatencies, client.execute(t, hotMutationRequest(t, reference, sequence,
-			[]serveStatement{{SQL: `UPDATE messages SET "$doc" = ? WHERE id = ?`, Params: []serveParam{
+		request := hotMutationRequest(t, reference, sequence, []serveStatement{{
+			SQL: `UPDATE messages SET "$doc" = ? WHERE id = ?`, Params: []serveParam{
 				{Kind: "document", Text: fmt.Sprintf(`{"id":"m-0","kind":"splitting","email":"split@example.com","value":%d}`, sequence)},
 				{Kind: "string", Text: "m-0"},
-			}}})))
+			},
+		}})
+		splitLatencies = append(splitLatencies, client.executeObserved(t, request, sequence))
 	}
 	splitCatalog := hotMutationWaitSplitComplete(
 		t, ctx, catalogAuthority, final.Generation()+1, [32]byte(splitPlan.OperationID()), routes[0], gatewayProcess,
@@ -1298,12 +1306,31 @@ func hotMutationGatewayProcess(binary, catalog, listen, control, capacity string
 	return &rf3testfixture.ExternalProcess{Binary: binary, Args: args}
 }
 
+type hotMutationAttemptObservation struct {
+	sequence      uint64
+	attempt       uint8
+	latency       time.Duration
+	response      []byte
+	responseBytes int
+}
+
+type hotMutationLogicalObservation struct {
+	sequence uint64
+	attempts uint8
+	latency  time.Duration
+	response []byte
+}
+
 type hotMutationWireClient struct {
-	connection net.Conn
-	reader     *bufio.Reader
-	requests   uint64
-	bytes      uint64
-	verifier   *hotMutationVerifier
+	connection              net.Conn
+	reader                  *bufio.Reader
+	requests                uint64
+	bytes                   uint64
+	verifier                *hotMutationVerifier
+	attemptObservations     [8]hotMutationAttemptObservation
+	attemptObservationCount uint8
+	logicalObservations     [4]hotMutationLogicalObservation
+	logicalObservationCount uint8
 }
 
 func hotMutationDialGateway(t *testing.T, profile *rafttransport.PeerTLS,
@@ -1385,16 +1412,98 @@ func (client *hotMutationWireClient) openIssuer(t *testing.T) gateway.Replicated
 	return reference
 }
 
+func hotMutationResponseClass(response []byte) string {
+	text := string(response)
+	if strings.Contains(text, gateway.ErrDurableRequestUnresolved.Error()) {
+		return "unresolved"
+	}
+	if strings.Contains(text, `"committed":true`) {
+		return "committed"
+	}
+	if strings.Contains(text, `"error"`) {
+		return "error"
+	}
+	return "other"
+}
+
+func (client *hotMutationWireClient) recordAttemptObservation(
+	sequence uint64, attempt uint8, response []byte, latency time.Duration,
+) {
+	if client.attemptObservationCount >= uint8(len(client.attemptObservations)) {
+		return
+	}
+	client.attemptObservations[client.attemptObservationCount] = hotMutationAttemptObservation{
+		sequence: sequence, attempt: attempt, latency: latency,
+		response: response, responseBytes: len(response),
+	}
+	client.attemptObservationCount++
+}
+
+func (client *hotMutationWireClient) recordLogicalObservation(
+	sequence uint64, attempts uint8, latency time.Duration, response []byte,
+) {
+	if client.logicalObservationCount >= uint8(len(client.logicalObservations)) {
+		return
+	}
+	client.logicalObservations[client.logicalObservationCount] = hotMutationLogicalObservation{
+		sequence: sequence, attempts: attempts, latency: latency,
+		response: response,
+	}
+	client.logicalObservationCount++
+}
+
+func (client *hotMutationWireClient) logObservedAttempts(t *testing.T) {
+	t.Helper()
+	for index := uint8(0); index < client.attemptObservationCount; index++ {
+		observation := client.attemptObservations[index]
+		t.Logf("hot split seq=%d attempt=%d latency=%s response=%s bytes=%d",
+			observation.sequence, observation.attempt, observation.latency,
+			hotMutationResponseClass(observation.response), observation.responseBytes)
+	}
+	for index := uint8(0); index < client.logicalObservationCount; index++ {
+		observation := client.logicalObservations[index]
+		t.Logf("hot split seq=%d logical_latency=%s attempts=%d final_response=%s",
+			observation.sequence, observation.latency, observation.attempts,
+			hotMutationResponseClass(observation.response))
+	}
+}
+
 func (client *hotMutationWireClient) execute(t *testing.T, request []byte) time.Duration {
+	return client.executeWithObservation(t, request, 0, false)
+}
+
+func (client *hotMutationWireClient) executeObserved(t *testing.T, request []byte, sequence uint64) time.Duration {
+	return client.executeWithObservation(t, request, sequence, true)
+}
+
+func (client *hotMutationWireClient) executeWithObservation(
+	t *testing.T, request []byte, sequence uint64, observe bool,
+) time.Duration {
 	t.Helper()
 	started := time.Now()
 	response, latency := client.roundTrip(t, request)
+	firstResponse, firstLatency := response, latency
+	attempts := uint8(1)
+	var retryResponse []byte
+	var retryLatency time.Duration
 	// A leader handoff may explicitly leave this durable request unresolved.
 	// Resolve it with one exact public retry; include both attempts in the
 	// existing latency, request-count, and byte bounds.
 	if strings.Contains(string(response), gateway.ErrDurableRequestUnresolved.Error()) {
-		response, _ = client.roundTrip(t, request)
+		attempts++
+		retryResponse, retryLatency = client.roundTrip(t, request)
+		response = retryResponse
 		latency = time.Since(started)
+	}
+	if observe {
+		// Store only fixed-size metadata and the already-owned response slices
+		// after the exact retry, if any, has completed. Classification and
+		// formatting are deferred until the original phase is over.
+		client.recordAttemptObservation(sequence, 1, firstResponse, firstLatency)
+		if attempts == 2 {
+			client.recordAttemptObservation(sequence, attempts, retryResponse, retryLatency)
+		}
+		client.recordLogicalObservation(sequence, attempts, latency, response)
 	}
 	if !strings.Contains(string(response), `"committed":true`) ||
 		strings.Contains(string(response), `"error"`) {

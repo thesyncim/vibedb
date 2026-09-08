@@ -1311,8 +1311,19 @@ func (c *PageCache) scoreWindowLocked(start, span int) (pageCacheWindowScore, bo
 }
 
 func (c *PageCache) evictWindowLocked(start, span int) bool {
+	count, ok := c.prepareEvictWindowLocked(start, span)
+	if !ok {
+		return false
+	}
+	return c.finishEvictWindowLocked(count)
+}
+
+// prepareEvictWindowLocked selects and locks the heads of one exact-span
+// victim window. The caller holds c.mu. On success every head listed in
+// evictionScratch[:count] remains locked for finishEvictWindowLocked; on
+// failure this method releases every lock it acquired.
+func (c *PageCache) prepareEvictWindowLocked(start, span int) (count int, ok bool) {
 	end := start + span
-	count := 0
 	for index := start; index < end; {
 		frame := &c.frames[index]
 		switch frame.state.Load() {
@@ -1321,13 +1332,13 @@ func (c *PageCache) evictWindowLocked(start, span int) bool {
 		case pageCacheReady:
 			extentSpan := int(frame.reservationSpan)
 			if extentSpan > end-index || count == len(c.evictionScratch) {
-				return false
+				return 0, false
 			}
 			c.evictionScratch[count] = uint32(index)
 			count++
 			index += extentSpan
 		default:
-			return false
+			return 0, false
 		}
 	}
 
@@ -1345,17 +1356,29 @@ func (c *PageCache) evictWindowLocked(start, span int) bool {
 			for locked := count - 1; locked >= 0; locked-- {
 				c.frames[c.evictionScratch[locked]].lock.Unlock()
 			}
-			return false
+			return 0, false
 		}
 	}
+	return count, true
+}
+
+// finishEvictWindowLocked removes the prepared victim heads. The caller holds
+// c.mu and every head-frame lock listed in evictionScratch[:count]. A
+// lock-free reader may announce a pin after prepareEvictWindowLocked's
+// eligibility check; resetExtentLocked then defers that extent, and the
+// reverse unlock below leaves its pin holder a retryable doomed frame.
+func (c *PageCache) finishEvictWindowLocked(count int) bool {
+	complete := true
 	for evicted := 0; evicted < count; evicted++ {
-		// Only transient lock-free validations can race here (all batch
-		// frame locks are held, and c.mu pins writers/dirty): they abort
-		// without locks, so doom-and-continue stays on the historical path.
 		if c.resetExtentLocked(int(c.evictionScratch[evicted])) {
 			c.evictions++
 			continue
 		}
+		// A fast reader can announce a pin after the preflight and before
+		// resetExtentLocked bumps the epoch. Keep the extent doomed for that
+		// reader's eventual release, but report that this window was only
+		// partially evicted so reserveLocked takes its bounded fallback.
+		complete = false
 		doomed := &c.frames[c.evictionScratch[evicted]]
 		doomed.flags.Or(pageCacheFrameDoomed)
 		doomed.referenced.Store(false)
@@ -1363,7 +1386,7 @@ func (c *PageCache) evictWindowLocked(start, span int) bool {
 	for locked := count - 1; locked >= 0; locked-- {
 		c.frames[c.evictionScratch[locked]].lock.Unlock()
 	}
-	return true
+	return complete
 }
 
 func (c *PageCache) reserveClockLocked(span int) (int, bool) {

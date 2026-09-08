@@ -108,7 +108,10 @@ func TestRestoredRF3ExternalProcessServingAndFailover(t *testing.T) {
 		t.Fatalf("restored write: %+v %v", completion, err)
 	}
 	data.waitAllApplied(t, settled.Outcome.AppliedIndex, 10*time.Second)
-	data.waitDocument(t, leader, states[leader], "acknowledged-after-restore", 5*time.Second)
+	leader, states = restoreRF3WaitDocumentCurrentLeader(
+		t, data, leader, states, "acknowledged-after-restore",
+		settled.Outcome.AppliedIndex, 5*time.Second,
+	)
 	restoreRF3ReadRelation(t, data, leader, states[leader], 2, newIndexKey, newLocator, true)
 	rssBaseline, walBaseline := restoreRF3Resources(t, fixtures)
 	storageBaseline := restoreRF3AllocatedBytes(t, options.Installer.(*restoreRF3Installer).root)
@@ -824,6 +827,113 @@ func restoreRF3ProposeCommand(t *testing.T, fixture *rf3FaultFixture, leader int
 	}
 	return response
 }
+
+// restoreRF3WaitDocumentCurrentLeader keeps the original bounded read window
+// while refreshing the leader and its serving fence. A restored member may
+// have acknowledged the write before the first post-restore election, so a
+// fixed member/fence pair is not a valid read authority for this assertion.
+// The applied index from the completion remains a floor for every retry and
+// for the state carried to the subsequent index read and leader kill.
+func restoreRF3WaitDocumentCurrentLeader(
+	t *testing.T,
+	fixture *rf3FaultFixture,
+	leader int,
+	states map[int]shardservice.ReplicatedMemberState,
+	id string,
+	minimumApplied uint64,
+	timeout time.Duration,
+) (int, map[int]shardservice.ReplicatedMemberState) {
+	t.Helper()
+	if states == nil {
+		states = make(map[int]shardservice.ReplicatedMemberState, rf3CommandMembers)
+	}
+	deadline := time.Now().Add(timeout)
+	key := rf3FaultKey(t, id)
+	want := []byte(fmt.Sprintf(`{"id":%q}`, id))
+	for time.Now().Before(deadline) {
+		if state, ok := states[leader]; ok {
+			request := restoreRF3PointReadRequest(state,
+				serviceauthz.Authority{Node: fixture.nodes[(leader+1)%rf3CommandMembers], Generation: 5},
+				1, key)
+			if request.MinimumApplied < minimumApplied {
+				request.MinimumApplied = minimumApplied
+			}
+			ctx, cancel := context.WithDeadline(t.Context(), deadline)
+			response, err := fixture.roundTripContext(ctx, leader, request)
+			if err == nil && response != nil && response.HasState &&
+				response.Kind == shardservice.ReplicatedReadFound &&
+				response.State.LeaderID == uint64(leader+1) &&
+				response.State.Applied >= minimumApplied &&
+				response.ReadApplied >= minimumApplied &&
+				bytes.Equal(response.Value, want) {
+				if t.Context().Err() == nil && ctx.Err() == nil && time.Now().Before(deadline) {
+					refreshed := make(map[int]shardservice.ReplicatedMemberState, len(states))
+					for member, known := range states {
+						refreshed[member] = known
+					}
+					refreshed[leader] = response.State
+					cancel()
+					return leader, refreshed
+				}
+			}
+			cancel()
+		}
+
+		// Probe all members under the same absolute deadline. Keep each existing
+		// probe bounded to one second; only the all-member consistent observation
+		// changes the endpoint used by the next read.
+		observed := make(map[int]shardservice.ReplicatedMemberState, rf3CommandMembers)
+		for member := 0; member < rf3CommandMembers; member++ {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				break
+			}
+			probeTimeout := remaining
+			if probeTimeout > time.Second {
+				probeTimeout = time.Second
+			}
+			probeParent, parentCancel := context.WithDeadline(t.Context(), deadline)
+			probeContext, probeCancel := context.WithTimeout(probeParent, probeTimeout)
+			state, probeErr := restoreRF3ProbeContext(probeContext, fixture, member)
+			probeCancel()
+			parentCancel()
+			if probeErr == nil {
+				observed[member] = state
+			}
+		}
+		if refreshedLeader, ok := rf3FaultObservedLeader(
+			[]int{0, 1, 2}, observed,
+		); ok {
+			leader, states = refreshedLeader, observed
+		} else {
+			for member, state := range observed {
+				states[member] = state
+			}
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		if remaining > 10*time.Millisecond {
+			remaining = 10 * time.Millisecond
+		}
+		time.Sleep(remaining)
+	}
+	t.Fatalf("member %d did not make document %q visible at a current leader with applied floor %d", leader+1, id, minimumApplied)
+	return leader, states
+}
+
+func restoreRF3ProbeContext(
+	ctx context.Context,
+	fixture *rf3FaultFixture,
+	member int,
+) (shardservice.ReplicatedMemberState, error) {
+	client := (member + 1) % rf3CommandMembers
+	return probeRF3CommandMember(ctx, fixture.nativeAddresses[member], fixture.nodes[member],
+		fixture.profiles[client], fixture.nodes[client], fixture.group,
+		rf3CommandStoreIdentity(1).AllocationGeneration, fixture.authority.ActivePolicyGeneration)
+}
+
 func restoreRF3ReadRelation(t *testing.T, fixture *rf3FaultFixture, leader int, state shardservice.ReplicatedMemberState, relation replication.RelationID, key, want []byte, found bool) {
 	t.Helper()
 	request := restoreRF3PointReadRequest(state,

@@ -97,6 +97,11 @@ func (c *Committer) beginHybridMaterializedFrames(
 		_ = batch.Abort()
 		return nil, err
 	}
+	// begin reserved bufferedPageCount+2 index scratch: data buffers,
+	// alternate root, and this journal. Keep the journal's index on the batch
+	// so Abort, ResizePages, and worker release can recycle it without a
+	// temporary allocation.
+	batch.bufferIndexes[int(batch.dataBufferCount)+1] = buffer
 	batch.journal = Write{Buffer: uint16(buffer)}
 	batch.materializationPatchCount = uint16(patchWriteCount)
 	batch.materialized = true

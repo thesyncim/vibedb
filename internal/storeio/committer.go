@@ -42,8 +42,10 @@ var (
 )
 
 // CommitterOptions fixes automatic persistence queue memory. Descriptor
-// backing is allocated on the first Begin and reused until Close, so a
-// read-only opener does not materialize a write queue it never uses.
+// backing is allocated for each claimed batch slot on its first Begin and
+// reused at that slot's bounded high-water mark, so a read-only opener does
+// not materialize a write queue it never uses and small batches do not pay for
+// the configured maximum.
 type CommitterOptions struct {
 	// FrameNativeStaging declares that WriteTransaction data pages are backed
 	// by PageCache frames. It lets NewCommitter cap the Device arena to
@@ -169,9 +171,11 @@ const (
 	batchPublished
 )
 
-// Batch is one preallocated persistence generation owned by the Committer's
-// single producer. After publication or Abort, it is invalid until Begin
-// returns that slot again.
+// Batch is one reusable persistence generation owned by the Committer's
+// single producer. Its descriptor and buffer-index storage grows only while
+// this slot is exclusively owned by Begin and remains at that slot's bounded
+// high-water mark after publication or Abort. After publication or Abort, it
+// is invalid until Begin returns that slot again.
 type Batch struct {
 	committer                     *Committer
 	pages                         []Write
@@ -193,6 +197,26 @@ type Batch struct {
 	publicationDescriptor         []byte
 	expectedPreviousGeneration    uint64
 	conditionalPublication        bool
+}
+
+// ensureDescriptorStorage grows one exclusively claimed batch slot to the
+// requested descriptor and buffer-index reservation. The caller must hold the
+// slot returned by freeBatches and must not call this for a published batch.
+// Keeping the slices on the slot, rather than in one QueueSlots-wide arena,
+// avoids making every queue slot pay for MaxPagesPerBatch. The extra two index
+// entries are the root and the optional materialization journal.
+func (b *Batch) ensureDescriptorStorage(pageCount, bufferedPageCount int) {
+	if cap(b.pages) < pageCount {
+		b.pages = make([]Write, pageCount)
+	} else {
+		b.pages = b.pages[:pageCount]
+	}
+	indexCount := bufferedPageCount + 2
+	if cap(b.bufferIndexes) < indexCount {
+		b.bufferIndexes = make([]uint32, indexCount)
+	} else {
+		b.bufferIndexes = b.bufferIndexes[:indexCount]
+	}
 }
 
 // SetPublicationDescriptor attaches a canonical logical mutation batch to the
@@ -314,9 +338,6 @@ type Committer struct {
 	freeBuffers                *indexPool
 	freeBatches                *indexPool
 	batches                    []Batch
-	writeStorage               []Write
-	indexStorage               []uint32
-	descriptorOnce             sync.Once
 	observerMu                 sync.RWMutex
 	observer                   func(uint64, []byte) error
 	observerRequiresDescriptor bool
@@ -485,21 +506,6 @@ func newCommitter(file *os.File, deviceOptions DeviceOptions, options CommitterO
 	return c, nil
 }
 
-func (c *Committer) ensureDescriptorStorage() {
-	c.descriptorOnce.Do(func() {
-		pages := c.options.MaxPagesPerBatch
-		c.writeStorage = make([]Write, c.options.QueueSlots*pages)
-		c.indexStorage = make([]uint32, c.options.QueueSlots*(pages+2))
-		for i := range c.batches {
-			start := i * pages
-			indexStart := i * (pages + 2)
-			batch := &c.batches[i]
-			batch.pages = c.writeStorage[start : start : start+pages]
-			batch.bufferIndexes = c.indexStorage[indexStart : indexStart : indexStart+pages+2]
-		}
-	})
-}
-
 // Begin acquires one reusable descriptor and pageCount+1 staging buffers. It
 // applies bounded backpressure when the persistence worker owns all capacity.
 func (c *Committer) Begin(pageCount int) (*Batch, error) {
@@ -548,13 +554,16 @@ func (c *Committer) begin(
 		bufferedPageCount+1 > c.bufferCount {
 		return nil, ErrTooManyPages
 	}
-	c.ensureDescriptorStorage()
 	batchIndex, err := c.acquire(c.freeBatches)
 	if err != nil {
 		return nil, err
 	}
 	batch := &c.batches[batchIndex]
-	batch.pages = batch.pages[:pageCount]
+	// Descriptor storage belongs to the claimed slot. Grow it before any
+	// buffers are acquired and before the slot can become visible to the
+	// worker; failed acquisition retains only bounded private high-water
+	// capacity on this free slot.
+	batch.ensureDescriptorStorage(pageCount, bufferedPageCount)
 	clear(batch.pages)
 	batch.dataBufferCount = uint16(bufferedPageCount)
 	indexes := batch.bufferIndexes[:bufferedPageCount+1]
