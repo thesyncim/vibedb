@@ -112,6 +112,63 @@ func TestPrimaryExactRootByteIdenticalRebuild(t *testing.T) {
 	}
 }
 
+// TestPrimaryExactRootViewOwnsPayload pins that Open copies the root payload,
+// so a recycled cache page cannot rewrite catalog refs under a live view.
+func TestPrimaryExactRootViewOwnsPayload(t *testing.T) {
+	const pageSize = uint32(4096)
+	layout, err := MutableStoreLayout(pageSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := []PrimaryExactRootEntry{
+		{
+			Catalog: PageRef{
+				Offset: layout.DataStart, LogicalID: 2, Generation: 1,
+				Length: pageSize, Kind: PagePrimaryExactCatalog,
+			},
+			LeafCount: 7,
+		},
+		{
+			Catalog: PageRef{
+				Offset: layout.DataStart + uint64(pageSize), LogicalID: 3,
+				Generation: 1, Length: pageSize, Kind: PagePrimaryExactCatalog,
+			},
+			LeafCount: 1,
+		},
+	}
+	page := make([]byte, pageSize)
+	if _, err := EncodePrimaryExactRootPage(
+		page, testStoreID, 1, 4, entries,
+	); err != nil {
+		t.Fatal(err)
+	}
+	bounds := PrimaryExactIndexBounds{
+		StoreID: testStoreID, Generation: 1,
+		FileEnd:       layout.DataStart + 4*uint64(pageSize),
+		NextLogicalID: 5, AllocationQuantum: pageSize,
+		MaxPageSize: pageSize, IndexCount: 2,
+	}
+	rootRef := PageRef{
+		Offset:    layout.DataStart + 3*uint64(pageSize),
+		LogicalID: 4, Generation: 1, Length: pageSize,
+		Kind: PagePrimaryExactRoot,
+	}
+	view, err := OpenPrimaryExactRootPage(page, rootRef, bounds)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range page {
+		page[i] = 0xff
+	}
+	for i, want := range entries {
+		got, ok := view.Entry(uint32(i))
+		if !ok || got != want {
+			t.Fatalf("entry %d after page recycle = %+v ok=%v, want %+v",
+				i, got, ok, want)
+		}
+	}
+}
+
 // TestPrimaryExactCatalogPageRoundTrip pins both catalog page levels: a
 // level-0 page's ordered term-leaf entries (refs, first tiles, flags,
 // prefixes) and a level-1 page's ordered children survive an encode/open

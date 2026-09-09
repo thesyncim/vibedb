@@ -213,6 +213,9 @@ func OpenPrimaryExactRootPage(
 			}
 		}
 	}
+	// Detach from src: callers release the page lease before walking
+	// catalogs, and a tiny cache can recycle the root buffer under the view.
+	view.payload = append([]byte(nil), payload...)
 	return view, nil
 }
 

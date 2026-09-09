@@ -255,8 +255,14 @@ func (c *Collection) stagePrimaryBatchOrdinaryOverlayLocked(
 		return stagedPrimaryBatch{}, false, nil
 	}
 	for attempt := 0; attempt < primaryOrdinaryOverlayPressureRetries; attempt++ {
+		// A pending packed logical cut is a writer-exclusive barrier: the
+		// concurrent lane left state at the physical fold base, and this
+		// batch must publish against a physical generation. Classify it as
+		// a barrier fold, not overlay-window pressure.
 		if c.packedLogicalCutPending() {
-			if err := c.materializePrimaryOverlayPressureLocked(); err != nil {
+			if err := c.materializePrimaryParentsLocked(
+				primaryMaterializationBarrier,
+			); err != nil {
 				return stagedPrimaryBatch{}, true, err
 			}
 		}
