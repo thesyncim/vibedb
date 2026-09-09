@@ -10,11 +10,12 @@ const (
 	primaryExactInventoryEntryBytes  = PageRefSize
 )
 
-// EncodePrimaryExactPackPage seals one raw pack payload in the common page
-// envelope. LZ4 emission is deliberately excluded from this integration stage.
+// EncodePrimaryExactPackPage seals one raw or LZ4 pack payload in the common
+// page envelope. The encoder already chose the cheaper physical extent and
+// checksummed the decoded frame; this only checks framing so the write path
+// does not allocate a decoder workspace or decompress the pack it just built.
 func EncodePrimaryExactPackPage(dst []byte, storeID [16]byte, generation, logicalID uint64, pack []byte) ([]byte, error) {
-	var decoded PrimaryExactPackDecoder
-	if err := decoded.Open(pack); err != nil || decoded.Codec() != "raw" {
+	if !validPrimaryExactPackFraming(pack) {
 		return nil, fmt.Errorf("%w: exact pack payload", ErrInvalidWrite)
 	}
 	if len(dst) > PrimaryExactPackMaxDecodedBytes || len(pack) > len(dst)-PageHeaderSize-PageTrailerSize {

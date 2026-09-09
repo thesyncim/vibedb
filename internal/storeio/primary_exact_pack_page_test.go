@@ -60,6 +60,56 @@ func TestPrimaryExactPackPageRoundTripRaw(t *testing.T) {
 	}
 }
 
+func TestPrimaryExactPackPageRoundTripLZ4(t *testing.T) {
+	layout, bounds := primaryExactPackTestBounds(t, 4)
+	leaves := [][]byte{
+		bytes.Repeat([]byte("canonical-leaf-a/"), 700),
+		bytes.Repeat([]byte("canonical-leaf-b/"), 700),
+	}
+	decoded := 0
+	for _, leaf := range leaves {
+		decoded += len(leaf)
+	}
+	var encoder PrimaryExactPackEncoder
+	if err := encoder.Prepare(len(leaves), decoded); err != nil {
+		t.Fatal(err)
+	}
+	for i, leaf := range leaves {
+		if err := encoder.Append(uint32(i), leaf); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pack, err := encoder.Encode(make([]byte, 0, PrimaryExactPackMaxDecodedBytes), 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var probe PrimaryExactPackDecoder
+	if err := probe.Prepare(decoded + PrimaryExactPackMemberBytes*len(leaves)); err != nil {
+		t.Fatal(err)
+	}
+	if err := probe.Open(pack); err != nil || probe.Codec() != "lz4" {
+		t.Fatalf("codec=%s err=%v", probe.Codec(), err)
+	}
+	ref := PageRef{Offset: layout.DataStart, LogicalID: 12, Generation: 3, Length: 8192, Kind: PagePrimaryExactPack}
+	page := make([]byte, 8192)
+	if _, err := EncodePrimaryExactPackPage(page, testStoreID, 3, ref.LogicalID, pack); err != nil {
+		t.Fatal(err)
+	}
+	var decoder PrimaryExactPackDecoder
+	if err := decoder.Prepare(decoded + PrimaryExactPackMemberBytes*len(leaves)); err != nil {
+		t.Fatal(err)
+	}
+	if err := OpenPrimaryExactPackPage(page, ref, bounds, &decoder); err != nil {
+		t.Fatal(err)
+	}
+	for i, want := range leaves {
+		got, err := decoder.Member(i, uint32(i))
+		if err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("member %d: %v", i, err)
+		}
+	}
+}
+
 func TestPrimaryExactInventoryPageRoundTripAndRejectsOrder(t *testing.T) {
 	layout, bounds := primaryExactPackTestBounds(t, 8)
 	refs := []PageRef{

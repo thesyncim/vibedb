@@ -130,13 +130,13 @@ func TestPrimaryExactCatalogPageRoundTrip(t *testing.T) {
 		}
 	}
 	entries := []PrimaryExactCatalogEntry{
-		{Leaf: leafAt(0), FirstTile: 0, Flags: PrimaryExactCatalogRunCut,
+		{Leaf: leafAt(0), Member: 0, FirstTile: 0, Flags: PrimaryExactCatalogRunCut,
 			Prefix: []byte("alpha")},
-		{Leaf: leafAt(1), FirstTile: 0, Flags: PrimaryExactCatalogPiece,
+		{Leaf: leafAt(1), Member: 0, FirstTile: 0, Flags: PrimaryExactCatalogPiece,
 			Prefix: []byte("beta")},
-		{Leaf: leafAt(2), FirstTile: 4096, Flags: PrimaryExactCatalogPiece,
+		{Leaf: leafAt(2), Member: 0, FirstTile: 4096, Flags: PrimaryExactCatalogPiece,
 			Prefix: []byte("beta")},
-		{Leaf: leafAt(3), FirstTile: 0, Prefix: []byte("gamma")},
+		{Leaf: leafAt(3), Member: 0, FirstTile: 0, Prefix: []byte("gamma")},
 	}
 	bounds := PrimaryExactIndexBounds{
 		StoreID: testStoreID, Generation: 1,
@@ -165,12 +165,39 @@ func TestPrimaryExactCatalogPageRoundTrip(t *testing.T) {
 	at := 0
 	if err := view.ForEachEntry(func(entry PrimaryExactCatalogEntry) error {
 		want := entries[at]
-		if entry.Leaf != want.Leaf || entry.FirstTile != want.FirstTile ||
+		if entry.Leaf != want.Leaf || entry.Member != want.Member ||
+			entry.FirstTile != want.FirstTile ||
 			entry.Flags != want.Flags ||
 			string(entry.Prefix) != string(want.Prefix) {
 			t.Fatalf("entry %d = %+v, want %+v", at, entry, want)
 		}
 		at++
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	pack := PageRef{
+		Offset: layout.DataStart + 4*uint64(pageSize), LogicalID: 6,
+		Generation: 1, Length: pageSize, Kind: PagePrimaryExactPack,
+	}
+	packed := []PrimaryExactCatalogEntry{{
+		Leaf: pack, Member: 3, FirstTile: 7, Prefix: []byte("packed"),
+	}}
+	if _, err := EncodePrimaryExactCatalogLeafPage(
+		page, testStoreID, 1, catalogRef.LogicalID, packed,
+	); err != nil {
+		t.Fatal(err)
+	}
+	view, err = OpenPrimaryExactCatalogPage(page, catalogRef, bounds)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := view.ForEachEntry(func(entry PrimaryExactCatalogEntry) error {
+		if entry.Leaf != pack || entry.Member != 3 || entry.FirstTile != 7 ||
+			string(entry.Prefix) != "packed" {
+			t.Fatalf("pack catalog entry = %+v", entry)
+		}
 		return nil
 	}); err != nil {
 		t.Fatal(err)

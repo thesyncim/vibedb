@@ -179,17 +179,21 @@ func exactOverlapExactCensus(tb testing.TB, collection *Collection) exactOverlap
 	tb.Helper()
 	var census exactOverlapCensus
 	if collection.primaryEpoch == nil {
-		tb.Fatal("missing primary exact epoch")
+		return census
 	}
 	physicalOffsets := make(map[uint64]string)
-	countRef := func(ref storeio.PageRef, label string) {
+	countRef := func(ref storeio.PageRef, label string) bool {
 		if ref.Length == 0 {
 			tb.Fatalf("%s has empty physical ref", label)
 		}
 		if previous, exists := physicalOffsets[ref.Offset]; exists {
+			if ref.Kind == storeio.PagePrimaryExactPack {
+				return false
+			}
 			tb.Fatalf("%s duplicates physical offset %d already counted by %s", label, ref.Offset, previous)
 		}
 		physicalOffsets[ref.Offset] = label
+		return true
 	}
 	for i := range collection.primaryEpoch.exact {
 		for j, ref := range collection.primaryEpoch.exact[i].catalog {
@@ -198,8 +202,9 @@ func exactOverlapExactCensus(tb testing.TB, collection *Collection) exactOverlap
 		}
 		for j := range collection.primaryEpoch.exact[i].leaves {
 			leaf := &collection.primaryEpoch.exact[i].leaves[j]
-			countRef(leaf.ref, fmt.Sprintf("index %d leaf %d", i, j))
-			census.extent += int64(leaf.ref.Length)
+			if countRef(leaf.ref, fmt.Sprintf("index %d leaf %d", i, j)) {
+				census.extent += int64(leaf.ref.Length)
+			}
 			if len(leaf.encoded) < 28 {
 				tb.Fatalf("index %d leaf %d encoded bytes=%d want at least 28", i, j, len(leaf.encoded))
 			}
@@ -246,6 +251,24 @@ func TestExactOverlapSpaceFixtureReopens(t *testing.T) {
 				got, found, err := collection.AppendRaw(nil, []byte(keys[row]))
 				if err != nil || !found || !bytes.Equal(got, documents[row]) {
 					t.Fatalf("row=%d found=%v err=%v", row, found, err)
+				}
+			}
+			if len(test.indexes) == 0 {
+				if collection.primaryEpoch != nil {
+					t.Fatal("indexes=0 opened an exact epoch")
+				}
+			} else {
+				packs := 0
+				for i := range collection.primaryEpoch.exact {
+					for _, leaf := range collection.primaryEpoch.exact[i].leaves {
+						if leaf.ref.Kind != storeio.PagePrimaryExactPack {
+							t.Fatalf("index %d leaf kind=%d want pack", i, leaf.ref.Kind)
+						}
+						packs++
+					}
+				}
+				if packs == 0 {
+					t.Fatal("indexed overlap fixture staged no exact packs")
 				}
 			}
 			for _, definition := range test.indexes {

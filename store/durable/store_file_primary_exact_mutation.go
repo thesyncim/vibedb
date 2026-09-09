@@ -779,19 +779,18 @@ func (c *Collection) prepareStructuralExactLocked(
 }
 
 // stagePrimaryExactPagesLocked persists the exact indexes inside tx and
-// returns the new PagePrimaryExactRoot ref: it writes a durable page for
-// every staged leaf that does not already have one (carried leaves keep the
-// page their ref names — the O(dirty leaves) half of the fold), rebuilds
-// each index's ordered catalog and root (both small), and retires
-// exactly the superseded pages: the old root, the old catalog pages, and
-// the old pages of leaves the fold replaced or dropped. It stages nothing
-// and returns a zero ref for a collection without exact indexes.
+// returns the new PagePrimaryExactRoot ref: it writes packs for consecutive
+// dirty leaves (carried leaves keep the pack their ref names — the O(dirty
+// leaves) half of the fold), rebuilds each index's ordered catalog and root
+// (both small), and retires exactly the superseded pages: the old root, the
+// old catalog pages, and unique packs that no live member still names. It
+// stages nothing and returns a zero ref for a collection without exact indexes.
 //
 // exact is the resident term-leaf set to persist: a freshly folded epoch's
 // base for a per-mutation transaction, structural transaction, or dirty
 // checkpoint, or the current epoch's base for a quiet checkpoint (whose
 // leaves all carry refs, so only root+catalog pages are written). Encoded
-// bytes are already canonical; this only wraps them in page envelopes.
+// bytes are already canonical; this only wraps dirty leaves in packs.
 // Fresh page refs are recorded on the staged leaves, so the epoch installed
 // at publish carries the durable identity of every leaf.
 func (c *Collection) stagePrimaryExactPagesLocked(
@@ -806,33 +805,34 @@ func (c *Collection) stagePrimaryExactPagesLocked(
 	pageSize := uint32(c.options.PageSize)
 	maxPageSize := uint32(c.options.MaxPageSize)
 
-	// Retire superseded pages against the currently installed epoch (the
-	// fold's input). Carried leaves preserve their relative order, so one
-	// forward scan of the staged refs decides which old pages survive.
+	// Retire superseded packs against the currently installed epoch (the
+	// fold's input). A pack survives while any staged leaf still names it;
+	// dirty leaves still carry a zero ref, so they do not keep a pack alive.
 	if state.root.ExactIndexRoot != (storeio.PageRef{}) {
 		old := c.primaryEpoch.exact
 		for indexID := range old {
-			var staged []primaryExactLeaf
+			live := make(map[storeio.PageRef]struct{})
 			if indexID < len(exact) {
-				staged = exact[indexID].leaves
+				for at := range exact[indexID].leaves {
+					ref := exact[indexID].leaves[at].ref
+					if ref != (storeio.PageRef{}) {
+						live[ref] = struct{}{}
+					}
+				}
 			}
-			// At this point fresh leaves still carry zero refs (their pages
-			// are staged below), so a staged leaf with a ref IS a carried
-			// leaf, and carried leaves preserve the old relative order: the
-			// carried refs form an in-order subsequence of the old refs.
-			si := 0
+			seen := make(map[storeio.PageRef]struct{})
 			for at := range old[indexID].leaves {
 				ref := old[indexID].leaves[at].ref
 				if ref == (storeio.PageRef{}) {
 					continue
 				}
-				for si < len(staged) && staged[si].ref == (storeio.PageRef{}) {
-					si++
+				if _, kept := live[ref]; kept {
+					continue
 				}
-				if si < len(staged) && staged[si].ref == ref {
-					si++
-					continue // carried: the page survives
+				if _, retired := seen[ref]; retired {
+					continue
 				}
+				seen[ref] = struct{}{}
 				if err := c.appendPrimaryRetirement(state, ref); err != nil {
 					return storeio.PageRef{}, err
 				}
@@ -858,25 +858,13 @@ func (c *Collection) stagePrimaryExactPagesLocked(
 			resident.catalog = resident.catalog[:0]
 			continue
 		}
-		staged := stagedScratch[:0]
-		for at := range resident.leaves {
-			leaf := &resident.leaves[at]
-			if leaf.ref == (storeio.PageRef{}) {
-				ref, err := stagePrimaryExactLeafPage(
-					tx, leaf.encoded, pageSize, maxPageSize,
-				)
-				if err != nil {
-					return storeio.PageRef{}, err
-				}
-				leaf.ref = ref
-			}
-			staged = append(staged, primaryExactStagedLeaf{
-				ref:       leaf.ref,
-				firstKey:  leaf.firstKey,
-				firstTile: leaf.firstTile,
-				piece:     leaf.piece,
-				runCut:    leaf.runCut,
-			})
+		staged, err := stagePackedExactLeaves(
+			tx, pageSize, maxPageSize, uint32(indexID),
+			resident.leaves, stagedScratch[:0], &c.exactPackEncoder,
+			&c.exactPackWire,
+		)
+		if err != nil {
+			return storeio.PageRef{}, err
 		}
 		stagedScratch = staged[:0]
 		catalogRef, pages, err := stagePrimaryExactCatalog(
@@ -942,6 +930,8 @@ func installPrimaryExactDurableMetadata(
 		for leafAt := range src[indexID].leaves {
 			dst[indexID].leaves[leafAt].ref =
 				src[indexID].leaves[leafAt].ref
+			dst[indexID].leaves[leafAt].member =
+				src[indexID].leaves[leafAt].member
 		}
 		dst[indexID].catalog = append(
 			dst[indexID].catalog[:0], src[indexID].catalog...,

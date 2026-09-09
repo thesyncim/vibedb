@@ -32,6 +32,10 @@ type config struct {
 	physicalNodes                                int
 	requireExistingTables, verifyEveryTrial      bool
 	urls                                         string
+	indexes                                      string
+	payloadMode                                  string
+	timeout                                      time.Duration
+	sharedBytes, sharedCardinality               int
 }
 type sample struct {
 	Client        int    `json:"client"`
@@ -93,6 +97,10 @@ type configRecord struct {
 	PhysicalNodes                                                       int
 	EndpointCount                                                       int
 	EndpointRouting                                                     string
+	Indexes                                                             string
+	PayloadMode                                                         string
+	Timeout                                                             string
+	SharedBytes, SharedCardinality                                      int
 }
 
 const defaultTable = "rf3_sql_bench"
@@ -112,6 +120,11 @@ func main() {
 	flag.IntVar(&c.warmup, "warmup", 100, "unmeasured operations before each trial")
 	flag.IntVar(&c.repetitions, "repetitions", 3, "repetitions per workload and concurrency")
 	flag.IntVar(&c.seedBatch, "seed-batch", 64, "rows per untimed INSERT (1..1024; subject to engine admission limits)")
+	flag.DurationVar(&c.timeout, "timeout", 45*time.Minute, "overall PostgreSQL operation timeout")
+	flag.StringVar(&c.payloadMode, "payload-mode", defaultPayloadMode, "payload generator: constant or varied-v1 (deterministic 256-byte ASCII per row)")
+	flag.StringVar(&c.indexes, "indexes", indexModeNone, "none, pack-leading, or pack-nonleading; pack-* adds a shared field plus two compound exact indexes")
+	flag.IntVar(&c.sharedBytes, "shared-bytes", 256, "indexed shared-field width for pack-* indexes")
+	flag.IntVar(&c.sharedCardinality, "shared-cardinality", 8, "distinct shared values for pack-* indexes")
 	flag.StringVar(&c.clients, "clients", "1,8", "closed-loop concurrency list (maximum 15)")
 	flag.StringVar(&c.tables, "tables", defaultTable, "comma-separated lowercase logical table names; group placement requires runtime inventory")
 	flag.StringVar(&c.workloads, "workloads", strings.Join(defaultWorkloads, ","), "comma-separated workloads; default is the five-workload C1/C8 matrix")
@@ -130,11 +143,21 @@ func main() {
 	}
 }
 func run(c config) (runErr error) {
+	if c.timeout == 0 {
+		c.timeout = 45 * time.Minute
+	}
+	if c.payloadMode == "" {
+		c.payloadMode = defaultPayloadMode
+	}
+	c.indexes = normalizeIndexMode(c.indexes)
 	if c.seedBatch < 1 || c.seedBatch > 1024 {
 		return fmt.Errorf("invalid seed batch")
 	}
-	if (c.engine != "vibedb" && c.engine != "cockroachdb") || c.url == "" || c.rows < 64 || c.rows > 1000000 || c.operations < 1 || c.operations > 1000000 || c.scans < 1 || c.scans > 100000 || c.warmup < 0 || c.warmup > 100000 || c.repetitions < 1 || c.repetitions > 20 || (c.phase != "all" && c.phase != "setup" && c.phase != "run" && c.phase != "recovery") {
+	if (c.engine != "vibedb" && c.engine != "cockroachdb") || c.url == "" || c.rows < 64 || c.rows > maxRows || c.operations < 1 || c.operations > 1000000 || c.scans < 1 || c.scans > 100000 || c.warmup < 0 || c.warmup > 100000 || c.repetitions < 1 || c.repetitions > 20 || c.timeout <= 0 || (c.payloadMode != "constant" && c.payloadMode != "varied-v1") || (c.indexes != indexModeNone && c.indexes != indexModePackLeading && c.indexes != indexModePackNonleading) || (c.phase != "all" && c.phase != "setup" && c.phase != "run" && c.phase != "recovery") {
 		return fmt.Errorf("invalid benchmark configuration")
+	}
+	if packIndexesEnabled(c) && (c.sharedBytes < 8 || c.sharedBytes > 256 || c.sharedCardinality < 2 || c.sharedCardinality > 1024) {
+		return fmt.Errorf("invalid pack-index shared field")
 	}
 	tables, err := parseTables(c.tables)
 	if err != nil {
@@ -169,7 +192,7 @@ func run(c config) (runErr error) {
 			}
 		}
 	}
-	r := report{SchemaVersion: 2, Status: "incomplete", Results: []result{}, VerificationError: "benchmark did not finish", Config: configRecord{SeedBatch: c.seedBatch, VerifyEveryTrial: c.verifyEveryTrial, Engine: c.engine, Rows: c.rows, PayloadBytes: len(payload), Operations: c.operations, ScanOperations: c.scans, Warmup: c.warmup, Repetitions: c.repetitions, Clients: c.clients, Protocol: "extended unnamed parse/bind/execute; text parameters/results; one autocommit statement per operation", Tables: tables, Workloads: workloads, GroupDistribution: c.groupDistribution, SkewPercent: c.skewPercent, PhysicalNodes: c.physicalNodes, EndpointCount: len(endpointLabels), EndpointRouting: "round-robin-per-client"}, Started: time.Now().UTC().Format(time.RFC3339Nano)}
+	r := report{SchemaVersion: 2, Status: "incomplete", Results: []result{}, VerificationError: "benchmark did not finish", Config: configRecord{SeedBatch: c.seedBatch, VerifyEveryTrial: c.verifyEveryTrial, Engine: c.engine, Rows: c.rows, PayloadBytes: len(payload), PayloadMode: c.payloadMode, Operations: c.operations, ScanOperations: c.scans, Warmup: c.warmup, Repetitions: c.repetitions, Clients: c.clients, Protocol: "extended unnamed parse/bind/execute; text parameters/results; one autocommit statement per operation", Tables: tables, Workloads: workloads, GroupDistribution: c.groupDistribution, SkewPercent: c.skewPercent, PhysicalNodes: c.physicalNodes, EndpointCount: len(endpointLabels), EndpointRouting: "round-robin-per-client", Indexes: c.indexes, Timeout: c.timeout.String(), SharedBytes: c.sharedBytes, SharedCardinality: c.sharedCardinality}, Started: time.Now().UTC().Format(time.RFC3339Nano)}
 	r.Config.DiagnosticMode = "none"
 	r.Config.KeySelection = "splitmix64-independent-with-replacement-v1"
 	if c.diagnosticTargets != "" {
@@ -217,7 +240,7 @@ func run(c config) (runErr error) {
 			return err
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 	admin, err := pgconn.Connect(ctx, endpoints[0])
 	if err != nil {
@@ -557,21 +580,26 @@ func setup(ctx context.Context, conn *pgconn.PgConn, c config, tables []string) 
 				return fmt.Errorf("required table %s is not provisioned: %w", table, probe.Err)
 			}
 		}
-		ddl := "CREATE TABLE IF NOT EXISTS " + table + " (id TEXT PRIMARY KEY, bucket INTEGER NOT NULL, score INTEGER NOT NULL, payload TEXT NOT NULL)"
+		ddl := tableDDL(c, table)
 		if e := conn.ExecParams(ctx, ddl, nil, nil, nil, nil).Read().Err; e != nil {
 			return fmt.Errorf("create %s: %w", table, e)
+		}
+		for _, indexSQL := range indexDDLs(c, table) {
+			if e := conn.ExecParams(ctx, indexSQL, nil, nil, nil, nil).Read().Err; e != nil {
+				return fmt.Errorf("index %s: %w", table, e)
+			}
 		}
 		for first := 0; first < c.rows; first += c.seedBatch {
 			if first%65536 == 0 {
 				fmt.Fprintf(os.Stderr, "seeding %s %d/%d rows\n", table, first, c.rows)
 			}
 			var sql strings.Builder
-			sql.WriteString("INSERT INTO " + table + " (id,bucket,score,payload) VALUES ")
+			sql.WriteString("INSERT INTO " + table + " " + insertColumns(c) + " VALUES ")
 			for i := first; i < min(first+c.seedBatch, c.rows); i++ {
 				if i != first {
 					sql.WriteByte(',')
 				}
-				fmt.Fprintf(&sql, "('%s',%d,%d,'%s')", key(i), i%16, i%100, payload)
+				appendInsertRow(&sql, c, i)
 			}
 			res := conn.ExecParams(ctx, sql.String(), nil, nil, nil, nil).Read()
 			if res.Err != nil {
@@ -627,7 +655,7 @@ func verify(ctx context.Context, conn *pgconn.PgConn, c config, tables []string,
 			return fmt.Errorf("verification row count mismatch for %s", table)
 		}
 		for first := 0; first < c.rows; first += 512 {
-			res := conn.ExecParams(ctx, "SELECT id,bucket,score,payload FROM "+table+" WHERE id >= $1 ORDER BY id LIMIT 512", [][]byte{[]byte(key(first))}, []uint32{25}, nil, nil).Read()
+			res := conn.ExecParams(ctx, verifySelectSQL(c, table), [][]byte{[]byte(key(first))}, []uint32{25}, nil, nil).Read()
 			if res.Err != nil {
 				return fmt.Errorf("verify %s: %w", table, res.Err)
 			}
@@ -636,7 +664,7 @@ func verify(ctx context.Context, conn *pgconn.PgConn, c config, tables []string,
 			}
 			for j, row := range res.Rows {
 				i := first + j
-				if len(row) != 4 || textCell(c, row[0]) != key(i) || string(row[1]) != strconv.Itoa(i%16) || string(row[2]) != strconv.Itoa(scores[group][i]) || textCell(c, row[3]) != payload {
+				if len(row) != verifyColumnCount(c) || !primaryRowMatches(c, row, group, i, scores) {
 					return fmt.Errorf("row %d in %s differs from oracle", i, table)
 				}
 			}
@@ -734,7 +762,7 @@ func trial(ctx context.Context, c config, workload string, clients, rep, count i
 				return fmt.Errorf("point result shape")
 			}
 			row := res.Rows[0]
-			if textCell(c, row[0]) != key(id) || string(row[1]) != strconv.Itoa(id%16) || string(row[2]) != strconv.Itoa(scores[group][id]) || textCell(c, row[3]) != payload {
+			if textCell(c, row[0]) != key(id) || string(row[1]) != strconv.Itoa(id%16) || string(row[2]) != strconv.Itoa(scores[group][id]) || textCell(c, row[3]) != payloadFor(c, id) {
 				return fmt.Errorf("point mismatch")
 			}
 		case "point_miss":
@@ -780,7 +808,7 @@ func trial(ctx context.Context, c config, workload string, clients, rep, count i
 					return fmt.Errorf("mixed read result shape")
 				}
 				row := res.Rows[0]
-				if textCell(c, row[0]) != key(id) || string(row[1]) != strconv.Itoa(id%16) || string(row[2]) != strconv.Itoa(scores[group][id]) || textCell(c, row[3]) != payload {
+				if textCell(c, row[0]) != key(id) || string(row[1]) != strconv.Itoa(id%16) || string(row[2]) != strconv.Itoa(scores[group][id]) || textCell(c, row[3]) != payloadFor(c, id) {
 					return fmt.Errorf("mixed read mismatch")
 				}
 			} else {
@@ -795,7 +823,7 @@ func trial(ctx context.Context, c config, workload string, clients, rep, count i
 					return fmt.Errorf("uniform mixed read result shape")
 				}
 				row := res.Rows[0]
-				if textCell(c, row[0]) != key(id) || string(row[1]) != strconv.Itoa(id%16) || string(row[2]) != strconv.Itoa(scores[group][id]) || textCell(c, row[3]) != payload {
+				if textCell(c, row[0]) != key(id) || string(row[1]) != strconv.Itoa(id%16) || string(row[2]) != strconv.Itoa(scores[group][id]) || textCell(c, row[3]) != payloadFor(c, id) {
 					return fmt.Errorf("uniform mixed read mismatch")
 				}
 			} else {

@@ -109,7 +109,10 @@ func VisitPrimaryExactIndexRefs(
 		lease.Release()
 		return err
 	}
-	walker := primaryExactRefWalker{cache: cache, bounds: bounds, visit: visit}
+	walker := primaryExactRefWalker{
+		cache: cache, bounds: bounds, visit: visit,
+		seenPacks: make(map[PageRef]struct{}),
+	}
 	for index := uint32(0); index < uint32(view.Len()); index++ {
 		entry, ok := view.Entry(index)
 		if !ok {
@@ -119,7 +122,7 @@ func VisitPrimaryExactIndexRefs(
 		if entry.Catalog == (PageRef{}) {
 			continue
 		}
-		seen, err := walker.catalog(entry.Catalog)
+		seen, err := walker.catalog(entry.Catalog, index)
 		if err != nil {
 			lease.Release()
 			return err
@@ -134,12 +137,13 @@ func VisitPrimaryExactIndexRefs(
 }
 
 type primaryExactRefWalker struct {
-	cache  *PageCache
-	bounds PrimaryExactIndexBounds
-	visit  func(PageRef) error
+	cache     *PageCache
+	bounds    PrimaryExactIndexBounds
+	visit     func(PageRef) error
+	seenPacks map[PageRef]struct{}
 }
 
-func (w *primaryExactRefWalker) catalog(ref PageRef) (uint64, error) {
+func (w *primaryExactRefWalker) catalog(ref PageRef, indexID uint32) (uint64, error) {
 	lease, err := w.cache.Acquire(ref)
 	if err != nil {
 		return 0, err
@@ -161,7 +165,7 @@ func (w *primaryExactRefWalker) catalog(ref PageRef) (uint64, error) {
 				lease.Release()
 				return 0, ErrPrimaryExactIndexCorrupt
 			}
-			childCount, err := w.catalog(child)
+			childCount, err := w.catalog(child, indexID)
 			if err != nil || count > ^uint64(0)-childCount {
 				lease.Release()
 				if err != nil {
@@ -179,13 +183,34 @@ func (w *primaryExactRefWalker) catalog(ref PageRef) (uint64, error) {
 		if err != nil {
 			return err
 		}
-		_, err = OpenPrimaryExactLeafPage(leafLease.Page(), entry.Leaf, w.bounds)
-		leafLease.Release()
-		if err != nil {
-			return err
+		switch entry.Leaf.Kind {
+		case PagePrimaryExactPack:
+			var decoder PrimaryExactPackDecoder
+			if err := decoder.Prepare(PrimaryExactPackMaxPayloadBytes - PrimaryExactPackHeaderBytes); err != nil {
+				leafLease.Release()
+				return err
+			}
+			if err := OpenPrimaryExactPackPage(leafLease.Page(), entry.Leaf, w.bounds, &decoder); err != nil {
+				leafLease.Release()
+				return err
+			}
+			if _, err := decoder.Member(int(entry.Member), indexID); err != nil {
+				leafLease.Release()
+				return err
+			}
+		default:
+			_, err = OpenPrimaryExactLeafPage(leafLease.Page(), entry.Leaf, w.bounds)
+			if err != nil {
+				leafLease.Release()
+				return err
+			}
 		}
-		if err := w.visit(entry.Leaf); err != nil {
-			return err
+		leafLease.Release()
+		if _, seen := w.seenPacks[entry.Leaf]; !seen {
+			w.seenPacks[entry.Leaf] = struct{}{}
+			if err := w.visit(entry.Leaf); err != nil {
+				return err
+			}
 		}
 		count++
 		return nil

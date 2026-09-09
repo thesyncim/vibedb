@@ -79,9 +79,9 @@ const (
 	// the common page envelope; a physical index spans an ordered set of such
 	// leaves produced by the deterministic content-defined cutter.
 	// PagePrimaryExactCatalog is one catalog page of that set: a level-0 page
-	// carries ordered (leaf ref, first tile, flags, first-term prefix)
-	// entries, and a level-1 page carries ordered level-0 child references,
-	// bounding the catalog tree at depth two.
+	// carries ordered (pack or leaf ref, member ordinal, first tile, flags,
+	// first-term prefix) entries, and a level-1 page carries ordered level-0
+	// child references, bounding the catalog tree at depth two.
 	PagePrimaryExactRoot
 	PagePrimaryExactLeaf
 	PagePrimaryExactCatalog

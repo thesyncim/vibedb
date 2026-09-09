@@ -778,7 +778,7 @@ func TestOnlineCreateIndexMatchesCanonicalAggregation(t *testing.T) {
 	var wantLeaves [][]byte
 	err = storeio.CutIndexTermLeaves(
 		ordered,
-		storeio.IndexTermLeafCutBudget(uint32(online.options.MaxPageSize)),
+		storeio.IndexTermLeafPackCutBudget(uint32(online.options.MaxPageSize)),
 		func(leafTerms []storeio.IndexTermLeafTerm, _ bool) error {
 			encoded, encodeErr := storeio.AppendIndexTermLeaf(
 				nil, online.storeID, leafTerms,

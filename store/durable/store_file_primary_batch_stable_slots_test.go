@@ -121,8 +121,8 @@ func TestPrimaryBatchAllExistingPreservesSlotsAndChangedExact(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if !collection.primaryEpoch.overlayEmpty() {
-		t.Fatal("changed exact terms accumulated overlay deltas")
+	if collection.primaryEpoch.overlayEmpty() {
+		t.Fatal("changed exact terms did not publish overlay deltas")
 	}
 	for i := range keys {
 		if got := stableBatchSlot(t, collection, keys[i]); got != beforeSlots[i] {
@@ -143,6 +143,9 @@ func TestPrimaryBatchAllExistingPreservesSlotsAndChangedExact(t *testing.T) {
 	}
 	if err := collection.Flush(); err != nil {
 		t.Fatal(err)
+	}
+	if !collection.primaryEpoch.overlayEmpty() {
+		t.Fatal("checkpoint left overlay records")
 	}
 	path := collection.file.Name()
 	if err := collection.Close(); err != nil {

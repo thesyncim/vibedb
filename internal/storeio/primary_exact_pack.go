@@ -99,6 +99,34 @@ func (e *PrimaryExactPackEncoder) EncodeRaw(dst []byte, physicalQuantum int) ([]
 	return e.encode(dst, physicalQuantum, false)
 }
 
+func validPrimaryExactPackFraming(pack []byte) bool {
+	if len(pack) < PrimaryExactPackHeaderBytes || string(pack[:4]) != primaryExactPackMagic ||
+		pack[5] != primaryExactPackVersion || pack[4] > primaryExactPackLZ4 {
+		return false
+	}
+	for _, v := range pack[28:32] {
+		if v != 0 {
+			return false
+		}
+	}
+	count := int(binary.LittleEndian.Uint16(pack[6:]))
+	decoded := int(binary.LittleEndian.Uint32(pack[8:]))
+	stored := int(binary.LittleEndian.Uint32(pack[12:]))
+	dirBytes := int(binary.LittleEndian.Uint32(pack[16:]))
+	total := int(binary.LittleEndian.Uint32(pack[20:]))
+	if count < 1 || count > PrimaryExactPackMaxMembers ||
+		dirBytes != count*PrimaryExactPackMemberBytes || dirBytes >= decoded ||
+		PrimaryExactPackEnvelopeBytes+PrimaryExactPackHeaderBytes+decoded > PrimaryExactPackMaxDecodedBytes ||
+		stored < 1 || total != len(pack) ||
+		uint64(PrimaryExactPackHeaderBytes)+uint64(stored) != uint64(total) {
+		return false
+	}
+	if pack[4] == primaryExactPackRaw {
+		return stored == decoded
+	}
+	return stored < decoded
+}
+
 func (e *PrimaryExactPackEncoder) encode(dst []byte, physicalQuantum int, allowLZ4 bool) ([]byte, error) {
 	if e == nil || len(e.members) == 0 || physicalQuantum < 1 || physicalQuantum > PrimaryExactPackMaxDecodedBytes || physicalQuantum&(physicalQuantum-1) != 0 {
 		return dst, ErrPrimaryExactPackBounds

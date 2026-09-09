@@ -57,13 +57,20 @@ func buildPrimaryExactIndexesFromMergedRun(
 		return storeio.PageRef{}, storeio.ErrInvalidWrite
 	}
 	rootEntries := make([]storeio.PrimaryExactRootEntry, indexCount)
-	encodedScratch := make([]byte, 0, storeio.IndexTermLeafCutBudget(maxPageSize))
+	encodedScratch := make([]byte, 0, storeio.IndexTermLeafPackCutBudget(maxPageSize))
 	var catalog *primaryExactCatalogStream
+	var pack *primaryExactPackBuilder
 	var currentIndex uint32
 	haveIndex := false
 	finishIndex := func() error {
 		if !haveIndex {
 			return nil
+		}
+		if err := pack.Finish(); err != nil {
+			return err
+		}
+		if err := drainExactPackStaged(pack, catalog); err != nil {
+			return err
 		}
 		ref, leaves, err := catalog.Finish()
 		if err != nil {
@@ -74,7 +81,7 @@ func buildPrimaryExactIndexesFromMergedRun(
 	}
 	err := storeio.StreamGenerationMigrationExactLeaves(
 		read, region, sink.StoreIdentity(), sink.BuildGeneration(),
-		storeio.IndexTermLeafCutBudget(maxPageSize), live,
+		storeio.IndexTermLeafPackCutBudget(maxPageSize), live,
 		func(indexID uint32, leaf []storeio.IndexTermLeafTerm, piece bool) error {
 			if indexID >= indexCount || haveIndex && indexID < currentIndex {
 				return storeio.ErrPrimaryExactIndexCorrupt
@@ -88,6 +95,10 @@ func buildPrimaryExactIndexesFromMergedRun(
 				if err != nil {
 					return err
 				}
+				pack, err = newPrimaryExactPackBuilder(sink, pageSize, maxPageSize, indexID, nil, nil)
+				if err != nil {
+					return err
+				}
 				currentIndex, haveIndex = indexID, true
 			}
 			encodedScratch = encodedScratch[:0]
@@ -95,13 +106,15 @@ func buildPrimaryExactIndexesFromMergedRun(
 			if err != nil {
 				return err
 			}
-			ref, err := stagePrimaryExactLeafPage(sink, encoded, pageSize, maxPageSize)
-			if err != nil {
-				return err
-			}
 			first := leaf[0]
 			firstTile := first.Postings[0].Posting.TileID
-			return catalog.Add(ref, first.Key.Canonical, firstTile, piece, storeio.IndexTermLeafRunCut(first.Key.RouteHash))
+			if err := pack.AddEncoded(
+				encoded, first.Key.Canonical, firstTile, piece,
+				storeio.IndexTermLeafRunCut(first.Key.RouteHash),
+			); err != nil {
+				return err
+			}
+			return drainExactPackStaged(pack, catalog)
 		},
 	)
 	if err != nil {
@@ -143,8 +156,20 @@ func newPrimaryExactCatalogStream(sink storeio.PrimaryGraphBuildSink, pageSize, 
 	return &primaryExactCatalogStream{sink: sink, pageSize: pageSize, maxPageSize: maxPageSize, entries: make([]storeio.PrimaryExactCatalogEntry, 0, entryCapacity), prefixArena: make([]byte, 0, entryCapacity*storeio.PrimaryExactCatalogPrefixBytes), children: make([]storeio.PageRef, 0, childCapacity)}, nil
 }
 
-func (s *primaryExactCatalogStream) Add(ref storeio.PageRef, firstKey []byte, firstTile uint32, piece, runCut bool) error {
-	if s == nil || s.finished || ref.Kind != storeio.PagePrimaryExactLeaf || len(firstKey) == 0 || s.leaves == ^uint32(0) {
+func (s *primaryExactCatalogStream) Add(ref storeio.PageRef, member uint16, firstKey []byte, firstTile uint32, piece, runCut bool) error {
+	if s == nil || s.finished || len(firstKey) == 0 || s.leaves == ^uint32(0) {
+		return storeio.ErrInvalidWrite
+	}
+	switch ref.Kind {
+	case storeio.PagePrimaryExactPack:
+		if int(member) >= storeio.PrimaryExactPackMaxMembers {
+			return storeio.ErrInvalidWrite
+		}
+	case storeio.PagePrimaryExactLeaf:
+		if member != 0 {
+			return storeio.ErrInvalidWrite
+		}
+	default:
 		return storeio.ErrInvalidWrite
 	}
 	prefix := firstKey
@@ -170,7 +195,10 @@ func (s *primaryExactCatalogStream) Add(ref storeio.PageRef, firstKey []byte, fi
 	if runCut {
 		flags |= storeio.PrimaryExactCatalogRunCut
 	}
-	s.entries = append(s.entries, storeio.PrimaryExactCatalogEntry{Leaf: ref, FirstTile: firstTile, Flags: flags, Prefix: s.prefixArena[at:len(s.prefixArena):len(s.prefixArena)]})
+	s.entries = append(s.entries, storeio.PrimaryExactCatalogEntry{
+		Leaf: ref, Member: member, FirstTile: firstTile, Flags: flags,
+		Prefix: s.prefixArena[at:len(s.prefixArena):len(s.prefixArena)],
+	})
 	s.entryBytes += entryBytes
 	s.leaves++
 	return nil

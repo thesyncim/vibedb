@@ -32,6 +32,13 @@ def main():
     parser.add_argument("--node-log", action="store_true", help="use fresh VibeDB shared-node log preparation and live group registration")
     parser.add_argument("--profile", action="store_true", help="instrument VibeDB with local CPU/trace profiles; diagnostic timings only")
     parser.add_argument("--rows", type=int, default=8192)
+    parser.add_argument("--indexes", choices=("none", "pack-leading", "pack-nonleading"), default="none",
+                        help="pack-* adds a low-cardinality shared TEXT field and two compound indexes so exact-index packing is in the comparison")
+    parser.add_argument("--shared-bytes", type=int, default=256)
+    parser.add_argument("--shared-cardinality", type=int, default=8)
+    parser.add_argument("--payload-mode", choices=("constant", "varied-v1"), default="constant")
+    parser.add_argument("--timeout", default="45m")
+    parser.add_argument("--verify-every-trial", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--operations", type=int, default=20000)
     parser.add_argument("--scans", type=int, default=2000)
     parser.add_argument("--warmup", type=int, default=1000)
@@ -142,6 +149,10 @@ def main():
                 completed = inside("/bench/rf3-sqlbench", "-engine", engine, "-url", url,
                     "-rows", str(args.rows), "-operations", str(args.operations), "-scans", str(args.scans),
                     "-warmup", str(args.warmup), "-repetitions", str(args.repetitions), "-clients", args.clients,
+                    "-indexes", args.indexes, "-shared-bytes", str(args.shared_bytes),
+                    "-shared-cardinality", str(args.shared_cardinality),
+                    "-payload-mode", args.payload_mode, "-timeout", args.timeout,
+                    f"-verify-every-trial={'true' if args.verify_every_trial else 'false'}",
                     "-output", f"/evidence/{engine}.json", stdout=log, stderr=subprocess.STDOUT, check=False)
                 failures[engine] = completed.returncode
             shell(f"du -sk /data/* > /evidence/{engine}-storage.txt")
