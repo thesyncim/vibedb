@@ -1215,6 +1215,10 @@ func (c *Collection) commitPrimaryStructural(
 	}
 	abort = false
 	c.installPrimaryExactResidentLocked(preparedExact)
+	if c.absorbOverlayOnStructural {
+		c.primaryUnifiedOverlay.markFolded(generation, retiring)
+		c.absorbOverlayOnStructural = false
+	}
 	c.pageValidator.update(nextState)
 	if nextRouter != nil {
 		c.primaryRouter.Store(nextRouter)
