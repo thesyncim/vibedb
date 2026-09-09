@@ -63,7 +63,26 @@ func (s *session) extended(tag byte) error {
 		return nil
 	}
 	if tag == msgFlush {
+		if len(s.directPending) > 0 {
+			if err := s.drainDirectPending(); err != nil {
+				return err
+			}
+			return nil
+		}
 		return s.flush()
+	}
+	// Close answers with an unconditional CloseComplete that, like the
+	// statement-target branch of Describe, has no queued-item representation
+	// — draining first keeps it correctly ordered relative to any deferred
+	// write still pending. Parse, Bind, Execute, and Describe(Portal) need no
+	// such handling: each answers through directPending itself when its
+	// statement is pipeline-deferred (see deferOrWriteParseComplete,
+	// handleBind, describeRows, executeRuntimeExecAsync), so nothing here has
+	// to decide in advance whether a given message can be answered early.
+	if tag == msgClose && len(s.directPending) > 0 {
+		if err := s.drainDirectPending(); err != nil {
+			return err
+		}
 	}
 
 	var err error
@@ -94,6 +113,15 @@ func (s *session) rejectExtended(err error) error {
 	pg, ok := classifiedProtocolError(err)
 	if !ok {
 		return err
+	}
+	// Every Parse/Bind/Describe/Execute/Close failure reaches an ErrorResponse
+	// through here. Whatever this failing message's own statement did or
+	// didn't queue, an earlier statement's still-pending direct-pipeline
+	// answer is earlier in submission order and must be written first.
+	if len(s.directPending) > 0 {
+		if drainErr := s.drainDirectPending(); drainErr != nil {
+			return drainErr
+		}
 	}
 	s.markTransactionFailed()
 	s.failed = true
@@ -162,8 +190,39 @@ func (s *session) finishExtendedBatch() error {
 	s.extendedDDL = false
 	s.extendedSQL = false
 	s.extendedSessionChange = false
-	s.w.readyForQuery(s.transactionStatus())
-	return s.flush()
+	// This backend requires exactly one autocommit write per Sync-delimited
+	// unit (the DDL-conflict check above), so a pipelining client's Nth
+	// statement carries its own Sync too — draining here unconditionally
+	// would answer statement N before ever reading statement N+1's Parse,
+	// which is no different from the fully synchronous path this feature
+	// exists to avoid. What actually distinguishes the two client shapes is
+	// whether statement N+1 has already been written to the wire: a client
+	// that pipelined ahead has its next request sitting in this connection's
+	// read buffer already (pgconn flushes a batch together once its own
+	// GetResults calls need an answer); a client sending one statement at a
+	// time, as ordinary synchronous clients (and this backend's own tests)
+	// do, has not. Checking that costs nothing and blocks on nothing — it is
+	// exactly the buffered-byte count bufio.Reader already tracks — and lets
+	// this Sync's answer wait only when there is something to overlap it
+	// with, so the fallback for the single-connection case stays exactly the
+	// immediate answer it always was.
+	if len(s.directPending) == 0 {
+		s.w.readyForQuery(s.transactionStatus())
+		return s.flush()
+	}
+	if s.r.buffered() == 0 {
+		if err := s.drainDirectPending(); err != nil {
+			return err
+		}
+		s.w.readyForQuery(s.transactionStatus())
+		return s.flush()
+	}
+	// More is already buffered: let the read loop reach it instead of
+	// draining now, and queue this Sync's own ReadyForQuery in the same
+	// submission-ordered queue as everything already pending, so it still
+	// answers in the right place once something does drain.
+	s.directPending = append(s.directPending, &pendingDirectExec{kind: pendingDirectReadyForQuery, txStatus: s.transactionStatus()})
+	return nil
 }
 
 func (s *session) handleParse() error {
@@ -183,8 +242,7 @@ func (s *session) handleParse() error {
 		}
 	}
 	if old != nil && s.reuseUnnamedParse(old, m) {
-		s.w.parseComplete()
-		return nil
+		return s.answerOrDefer(old.pipelineDeferred, pendingDirectParseComplete, s.w.parseComplete)
 	}
 	charge := preparedInputCharge(m.name, m.query, len(m.paramOIDs))
 	retained := s.statementBytes + charge
@@ -243,7 +301,29 @@ func (s *session) handleParse() error {
 	}
 	s.statements[ownedName] = stmt
 	s.statementBytes = retained
-	s.w.parseComplete()
+	stmt.pipelineDeferred = directPipelineEligible(s.sql, stmt)
+	return s.answerOrDefer(stmt.pipelineDeferred, pendingDirectParseComplete, s.w.parseComplete)
+}
+
+// answerOrDefer queues one static handshake response (ParseComplete,
+// BindComplete, or NoData) instead of writing it immediately when its
+// statement was marked pipeline-deferred, so it lands in the same
+// submission-ordered queue as that statement's eventual CommandComplete. A
+// non-deferred statement's response is written immediately, as it always was
+// — but only after draining anything already queued, since that queue holds
+// an earlier statement's not-yet-answered responses, which must be answered
+// first regardless of what this later, non-deferred statement does.
+func (s *session) answerOrDefer(deferred bool, kind pendingDirectKind, write func()) error {
+	if deferred {
+		s.directPending = append(s.directPending, &pendingDirectExec{kind: kind})
+		return nil
+	}
+	if len(s.directPending) > 0 {
+		if err := s.drainDirectPending(); err != nil {
+			return err
+		}
+	}
+	write()
 	return nil
 }
 
@@ -445,8 +525,7 @@ func (s *session) handleBind() error {
 	s.portalBytes += p.retainedBytes
 	s.statementBindBytes += bindBytes - stmt.bindBytes
 	stmt.bindBytes = bindBytes
-	s.w.bindComplete()
-	return nil
+	return s.answerOrDefer(stmt.pipelineDeferred, pendingDirectBindComplete, s.w.bindComplete)
 }
 
 // ownPreparedText copies a Parse message's name and SQL into one allocation.
@@ -706,6 +785,16 @@ func (s *session) handleDescribe() error {
 		if err := checkRowDescription(stmt.cols); err != nil {
 			return err
 		}
+		if stmt.pipelineDeferred && len(s.directPending) > 0 {
+			// Describe(Statement) — unlike this backend's own pipelined
+			// clients, which only ever Describe(Portal) — needs
+			// parameterDesc's bytes right now, and that has no queued-item
+			// representation. Draining first keeps ordering correct at the
+			// cost of the overlap this rare combination would have had.
+			if err := s.drainDirectPending(); err != nil {
+				return err
+			}
+		}
 		s.w.parameterDesc(stmt)
 		return s.describeRows(stmt, nil)
 	}
@@ -721,8 +810,7 @@ func (s *session) handleDescribe() error {
 // returns no rows.
 func (s *session) describeRows(stmt *prepared, formats []int16) error {
 	if len(stmt.cols) == 0 {
-		s.w.noData()
-		return nil
+		return s.answerOrDefer(stmt.pipelineDeferred, pendingDirectNoData, s.w.noData)
 	}
 	return s.w.rowDescription(stmt.cols, formats)
 }
@@ -738,6 +826,13 @@ func (s *session) handleExecute() error {
 			fmt.Sprintf("portal %q does not exist", m.portal))
 	}
 	if err := s.beforeExtendedExecute(p.stmt); err != nil {
+		return err
+	}
+	// Only the extended-protocol path answers through finishExtendedBatch, so
+	// only here can an eligible write's response be safely deferred; the
+	// simple-query path (runSimple) calls execute directly and writes its
+	// response itself, with no queue to drain it later.
+	if handled, err := s.executeRuntimeExecAsync(p); handled {
 		return err
 	}
 	return s.execute(p, m.maxRows)
