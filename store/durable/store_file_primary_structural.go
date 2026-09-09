@@ -746,7 +746,7 @@ func (c *Collection) stagePrimaryStructuralCatalog(
 // commitPrimaryStructural runs one bounded structural transaction: it stages the
 // caller's new leaves, rebuilds the tablet's anchor pages/locator/root from
 // finalLeaves, rewrites the catalog path and state root, retires predecessors,
-// publishes one generation, and rebuilds the resident router.
+// publishes one generation, and installs a bounded resident-router path copy.
 func (c *Collection) commitPrimaryStructural(
 	state *fileStoreState,
 	path *filePrimaryMutationPath,
@@ -809,6 +809,7 @@ func (c *Collection) commitPrimaryStructural(
 		macro = localized.macro
 	}
 	isLocalized := localized != nil && macro == nil
+	var nextRouter *storeio.ResidentPrimaryRouter
 	if !isLocalized && (len(finalLeaves) == 0 || len(finalLeaves[0].Fence) != 0) {
 		return storeio.ErrSegmentedTabletRouterCorrupt
 	}
@@ -822,6 +823,25 @@ func (c *Collection) commitPrimaryStructural(
 	if !isLocalized && (pageCount == 0 || pageCount > storeio.SegmentedTabletRouterMaxPages) {
 		c.primaryMacroSplitRequired.Add(1)
 		return ErrPrimaryMacroSplitRequired
+	}
+	if !isLocalized {
+		tablets := []storeio.ResidentPrimaryTabletReplacement{{
+			TabletID: tabletID,
+			Leaves:   finalLeaves,
+		}}
+		if macro != nil {
+			tablets = append(tablets, storeio.ResidentPrimaryTabletReplacement{
+				TabletID: macro.tabletID,
+				Floor:    macro.floor,
+				Leaves:   macro.leaves,
+			})
+		}
+		nextRouter, err = c.primaryRouter.Load().ReplaceTablets(
+			tabletID, tablets, generation,
+		)
+		if err != nil {
+			return err
+		}
 	}
 
 	oldLocator, ok := path.tablet.LocatorRef()
@@ -852,7 +872,6 @@ func (c *Collection) commitPrimaryStructural(
 	// encoded-byte capacity requires it), locator, and segmented root.
 	var oldAnchorRefs []storeio.PageRef
 	var rawRoot []byte
-	var nextRouter *storeio.ResidentPrimaryRouter
 	var structuralRoutingStaged, structuralRoutingRetired uint64
 	if isLocalized {
 		oldAnchorRefs = []storeio.PageRef{path.anchorRoute.Ref}
@@ -1213,22 +1232,6 @@ func (c *Collection) commitPrimaryStructural(
 	c.primaryStructuralRoutingStaged.Add(structuralRoutingStaged)
 	c.primaryStructuralRoutingRetired.Add(structuralRoutingRetired)
 
-	if nextRouter == nil {
-		// Non-localized structural edits still rebuild from the freshly published
-		// graph. A generation mismatch routes concurrent readers through the rooted
-		// page-walk oracle until this swap lands.
-		builtRouter, buildErr := storeio.BuildResidentPrimaryRouter(
-			c.cache, nextState.root.PrimaryRoot,
-			storeio.GlobalTabletCatalogBounds{
-				StoreID: c.storeID, SelectedRootGeneration: generation,
-				FileEnd: nextState.fileEnd, NextLogicalID: nextState.root.NextLogicalID,
-			},
-		)
-		if buildErr != nil {
-			return buildErr
-		}
-		c.primaryRouter.Store(builtRouter)
-	}
 	if macro != nil {
 		c.primaryNextTabletID = macro.tabletID + 1
 	}

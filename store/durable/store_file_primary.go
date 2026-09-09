@@ -99,7 +99,7 @@ func (c *Collection) resolvePrimaryGraphRouted(
 	}
 	// Close the race in which the serialized writer advances the router after
 	// the generation check but while this reader is selecting its handle.
-	if router.Generation() != generation {
+	if router.Generation() != generation || route.Ref.Generation > generation {
 		return dst, false, true, nil
 	}
 	if value, disposition, _ := c.primaryUnifiedOverlay.lookup(
@@ -139,7 +139,7 @@ func (c *Collection) containsPrimaryGraphRouted(
 			storeio.ErrSegmentedTabletRouterCorrupt,
 		)
 	}
-	if router.Generation() != generation {
+	if router.Generation() != generation || route.Ref.Generation > generation {
 		return false, true, nil
 	}
 	if _, disposition, _ := c.primaryUnifiedOverlay.lookup(

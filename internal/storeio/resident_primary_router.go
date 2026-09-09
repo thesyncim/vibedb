@@ -3,6 +3,7 @@ package storeio
 import (
 	"bytes"
 	"fmt"
+	"math/bits"
 	"sync/atomic"
 	"time"
 )
@@ -10,44 +11,37 @@ import (
 const residentPrimaryRouterWords = 4
 
 // ResidentPrimaryRouter is an allocation-free point router built from one
-// published primary graph. Fences and bucket identities are immutable. The
-// serialized collection writer may replace one leaf handle after publishing a
-// non-structural COW generation; version makes the three atomic handle words
-// one coherent reader sample. Each leaf occupies four packed words: fence
-// bounds, physical offset, generation, and length/bucket identity. Fences share
-// one byte arena. Logical IDs and page kind are derived rather than repeated.
+// published primary graph. Its persistent tree shares untouched routing blocks
+// and coherent leaf-handle cells across structural images; its bucket index
+// provides bounded stable-identity lookup without scanning the tree.
 //
 // generation is the state-root generation reflected by the mutable handles.
 // A snapshot selecting an older generation must use the rooted page-walk
 // resolver instead of this newest-generation acceleration.
 type ResidentPrimaryRouter struct {
 	storeID [16]byte
-	fences  []byte
-	rows    []uint64
-	hints   []pageCacheFrameHint
-	empty   []atomic.Uint32
-	// searchKeys accelerates the fence binary search: one big-endian packed
-	// word per rank holding the first eight fence bytes past searchSkip, the
-	// prefix every routed fence shares. A probe is then one integer compare
-	// instead of a bytes.Compare against a cold fence-arena line; only packed
-	// equality falls back to the exact bytes. Zero-padding is order-safe
-	// because zero is the minimum byte: strict packed inequality always
-	// matches strict lexical order, and ties defer to the full compare.
-	// Immutable after build, like the fences it summarizes: UpdateLeaf swaps
-	// handles, never fences. Costs 8 bytes per leaf; the point-read benchmark
-	// owns the machine-specific justification.
-	searchKeys []uint64
-	// searchTops holds every searchTopGroup'th packed window (rank 1, 1+g,
-	// 1+2g, ...). A point lookup binary-searches this small dense array first
-	// — it stays L1-resident under random probing where the full searchKeys
-	// span does not — and finishes inside one eight-word group, cutting the
-	// search's cache-missing probes from log2(leaves) to three.
-	searchTops []uint64
-	searchSkip int
-	buildNS    int64
-	generation atomic.Uint64
-	version    atomic.Uint64
+	// fences, rows, and empty are temporary graph-walk staging owned only while
+	// BuildResidentPrimaryRouter constructs the persistent representation.
+	fences          []byte
+	rows            []uint64
+	empty           []atomic.Uint32
+	hints           []pageCacheFrameHint
+	searchKeys      []uint64
+	searchTops      []uint64
+	version         atomic.Uint64
+	buildNS         int64
+	generation      atomic.Uint64
+	tree            *residentRouteNode
+	buckets         *residentBucketIndex
+	treeBytes       int
+	floorEntry      residentRouteEntry
+	firstRealFence  []byte
+	firstRealPacked uint64
 }
+
+// buildSearchKeys remains a staging-fixture compatibility hook. The
+// persistent tree builds its packed routing summaries in buildPersistentTree.
+func (r *ResidentPrimaryRouter) buildSearchKeys() {}
 
 // pageCacheFrameHint is mutable cache-local acceleration beside the router's
 // immutable routing payload. packed holds a one-based frame index in its low
@@ -63,6 +57,16 @@ type ResidentPrimaryRoute struct {
 	Bucket BucketID
 	Hash   uint64
 	rank   uint32
+	cell   *residentRouteCell
+}
+
+// ResidentPrimaryTabletReplacement describes one complete tablet image for
+// ReplaceTablets. Leaves use tablet-local floors; Floor is the tablet's global
+// catalog floor and replaces the empty floor of Leaves[0].
+type ResidentPrimaryTabletReplacement struct {
+	TabletID uint32
+	Floor    []byte
+	Leaves   []SegmentedTabletRouterLeaf
 }
 
 // BuildResidentPrimaryRouter walks a fully validated published primary graph
@@ -85,45 +89,18 @@ func BuildResidentPrimaryRouter(
 		return nil, fmt.Errorf("%w: empty resident primary router",
 			ErrGlobalTabletCatalogCorrupt)
 	}
-	router.hints = make([]pageCacheFrameHint, router.Len())
-	router.empty = make([]atomic.Uint32, router.Len())
-	router.buildSearchKeys()
+	router.empty = make([]atomic.Uint32, len(router.rows)/residentPrimaryRouterWords)
+	router.buildPersistentTree()
+	if router.buckets == nil {
+		return nil, fmt.Errorf("%w: resident bucket index", ErrGlobalTabletCatalogCorrupt)
+	}
+	router.fences = nil
+	router.rows = nil
+	router.empty = nil
 	router.generation.Store(bounds.SelectedRootGeneration)
 	router.buildNS = time.Since(started).Nanoseconds()
 	return router, nil
 }
-
-// buildSearchKeys derives the shared fence prefix and packs each fence's next
-// eight bytes. Rank zero's fence is the empty floor and is never probed, so
-// the prefix is the common prefix of the first and last real fences; lexical
-// ordering guarantees every fence between them shares it and is at least that
-// long (a shorter fence would be a proper prefix and sort before rank one).
-func (r *ResidentPrimaryRouter) buildSearchKeys() {
-	count := r.Len()
-	r.searchKeys = make([]uint64, count)
-	if count < 2 {
-		return
-	}
-	first := r.fence(1)
-	last := r.fence(count - 1)
-	skip := 0
-	for skip < len(first) && skip < len(last) && first[skip] == last[skip] {
-		skip++
-	}
-	r.searchSkip = skip
-	for rank := 1; rank < count; rank++ {
-		r.searchKeys[rank] = packLexicalWindow(r.fence(rank)[skip:])
-	}
-	groups := (count - 2 + searchTopGroup) / searchTopGroup
-	r.searchTops = make([]uint64, groups)
-	for group := range groups {
-		r.searchTops[group] = r.searchKeys[1+group*searchTopGroup]
-	}
-}
-
-// searchTopGroup is eight packed windows — exactly one cache line — so the
-// second-level search after the top-index narrowing touches one line.
-const searchTopGroup = 8
 
 // packLexicalWindow packs up to eight bytes big-endian with zero padding, so
 // unsigned comparison of two windows matches bytes.Compare whenever the
@@ -268,8 +245,9 @@ func (r *ResidentPrimaryRouter) walkTablet(
 				r.fences = append(r.fences, fence.b...)
 				r.fences = append(r.fences, fence.c...)
 			}
-			if r.Len() != 0 &&
-				bytes.Compare(r.fence(r.Len()-1), r.fences[start:]) >= 0 {
+			staged := len(r.rows) / residentPrimaryRouterWords
+			if staged != 0 &&
+				bytes.Compare(r.flatFence(staged-1), r.fences[start:]) >= 0 {
 				anchorLease.Release()
 				tabletLease.Release()
 				return fmt.Errorf("%w: resident fence order",
@@ -296,119 +274,19 @@ func (r *ResidentPrimaryRouter) walkTablet(
 // Route hashes key once, confirms its exact lexical interval, and returns the
 // current leaf handle. It allocates no memory.
 func (r *ResidentPrimaryRouter) Route(key []byte) (ResidentPrimaryRoute, bool) {
-	if r == nil || len(r.rows) == 0 {
+	if r == nil || r.tree == nil || r.Len() == 0 {
 		return ResidentPrimaryRoute{}, false
 	}
 	hash := KeyHashBytes(r.storeID, key)
-	rank := r.searchRank(key)
-	if rank < 0 || bytes.Compare(r.fence(rank), key) > 0 ||
-		rank+1 < r.Len() && bytes.Compare(key, r.fence(rank+1)) >= 0 {
+	packed := packLexicalWindow(key)
+	if packed < r.firstRealPacked || packed == r.firstRealPacked && bytes.Compare(key, r.firstRealFence) < 0 {
+		return residentCellRoute(r.floorEntry, 0, hash)
+	}
+	entry, rank, ok := r.tree.floor(key)
+	if !ok {
 		return ResidentPrimaryRoute{}, false
 	}
-	at := rank * residentPrimaryRouterWords
-	return r.routeAtRankHashed(at, rank, hash)
-}
-
-// searchRank finds the last fence at or below key. The exact full-byte
-// interval check in Route re-verifies the answer, so a packed-search defect
-// can only surface as a routing miss, never a wrong leaf.
-func (r *ResidentPrimaryRouter) searchRank(key []byte) int {
-	count := r.Len()
-	if count < 2 {
-		return 0
-	}
-	skip := r.searchSkip
-	if skip != 0 {
-		prefix := r.fence(1)[:skip]
-		head := key
-		if len(head) > skip {
-			head = head[:skip]
-		}
-		if c := bytes.Compare(head, prefix); c != 0 {
-			if c < 0 {
-				// Below every real fence; the empty rank-zero floor holds it.
-				return 0
-			}
-			return count - 1
-		}
-		if len(key) < skip {
-			// key is a proper prefix of the shared fence prefix: below rank 1.
-			return 0
-		}
-	}
-	window := packLexicalWindow(key[skip:])
-	// Level one: the predicate fence(rank) <= key is monotone in rank, so a
-	// binary search over the group heads and one in-group finish computes the
-	// same rank the flat search did; only the memory it touches changes.
-	lowGroup, highGroup := 0, len(r.searchTops)
-	for lowGroup < highGroup {
-		middle := int(uint(lowGroup+highGroup) >> 1)
-		if r.fenceBelowOrEqual(1+middle*searchTopGroup, window, key) {
-			lowGroup = middle + 1
-		} else {
-			highGroup = middle
-		}
-	}
-	if lowGroup == 0 {
-		// key sits below the first real fence; the empty floor routes it.
-		return 0
-	}
-	low := 1 + (lowGroup-1)*searchTopGroup
-	high := min(low+searchTopGroup, count)
-	for low < high {
-		middle := int(uint(low+high) >> 1)
-		if r.fenceBelowOrEqual(middle, window, key) {
-			low = middle + 1
-		} else {
-			high = middle
-		}
-	}
-	return low - 1
-}
-
-// fenceBelowOrEqual reports fence(rank) <= key using the packed window and
-// falling back to exact bytes only on packed equality, where zero-padded
-// big-endian packing cannot order the pair.
-func (r *ResidentPrimaryRouter) fenceBelowOrEqual(
-	rank int, window uint64, key []byte,
-) bool {
-	packed := r.searchKeys[rank]
-	if packed != window {
-		return packed < window
-	}
-	return bytes.Compare(r.fence(rank), key) <= 0
-}
-
-func (r *ResidentPrimaryRouter) routeAtRankHashed(
-	at, rank int, hash uint64,
-) (ResidentPrimaryRoute, bool) {
-	for {
-		before := r.version.Load()
-		if before&1 != 0 {
-			continue
-		}
-		offset := atomic.LoadUint64(&r.rows[at+1])
-		generation := atomic.LoadUint64(&r.rows[at+2])
-		meta := atomic.LoadUint64(&r.rows[at+3])
-		if before != r.version.Load() {
-			continue
-		}
-		bucket := BucketID(uint32(meta >> 32))
-		logicalID, ok := CommonPrimaryLeafLogicalID(bucket)
-		if !ok {
-			return ResidentPrimaryRoute{}, false
-		}
-		return ResidentPrimaryRoute{
-			Ref: PageRef{
-				Offset: offset, LogicalID: logicalID,
-				Generation: generation, Length: uint32(meta),
-				Kind: PagePrimaryLeaf,
-			},
-			Bucket: bucket,
-			Hash:   hash,
-			rank:   uint32(rank),
-		}, true
-	}
+	return residentCellRoute(entry, rank, hash)
 }
 
 // RouteAtRank returns the leaf route stored at one router row, reading its
@@ -417,57 +295,38 @@ func (r *ResidentPrimaryRouter) routeAtRankHashed(
 // contiguity. It is the ordered-enumeration entry the exact-index build and
 // live-slot derivation walk every leaf through.
 func (r *ResidentPrimaryRouter) RouteAtRank(rank int) (ResidentPrimaryRoute, bool) {
-	if r == nil || rank < 0 || rank >= r.Len() {
+	if r == nil || r.tree == nil || rank < 0 || rank >= r.Len() {
 		return ResidentPrimaryRoute{}, false
 	}
-	at := rank * residentPrimaryRouterWords
-	for {
-		before := r.version.Load()
-		if before&1 != 0 {
-			continue
-		}
-		offset := atomic.LoadUint64(&r.rows[at+1])
-		generation := atomic.LoadUint64(&r.rows[at+2])
-		meta := atomic.LoadUint64(&r.rows[at+3])
-		if before != r.version.Load() {
-			continue
-		}
-		bucket := BucketID(uint32(meta >> 32))
-		logicalID, ok := CommonPrimaryLeafLogicalID(bucket)
-		if !ok {
-			return ResidentPrimaryRoute{}, false
-		}
-		return ResidentPrimaryRoute{
-			Ref: PageRef{
-				Offset: offset, LogicalID: logicalID,
-				Generation: generation, Length: uint32(meta),
-				Kind: PagePrimaryLeaf,
-			},
-			Bucket: bucket, rank: uint32(rank),
-		}, true
+	entry, ok := r.tree.at(rank)
+	if !ok {
+		return ResidentPrimaryRoute{}, false
 	}
+	return residentCellRoute(entry, rank, 0)
 }
 
-// ResolveBucketID returns the leaf route for one stable BucketID. A bottom-up
-// bulk build assigns bucket == row ordinal, so the packed row is found in O(1);
-// a graph reshaped by splits/merges may hold non-contiguous local IDs, so a
-// mismatch falls back to a lexical scan for the matching identity. It is the
-// posting-driven route the exact-index read path selects a tile's leaf by.
+// ResolveBucketID returns the leaf route for one stable BucketID through the
+// immutable radix index, then derives its current lexical rank from the tree.
 func (r *ResidentPrimaryRouter) ResolveBucketID(
 	bucket BucketID,
 ) (ResidentPrimaryRoute, bool) {
 	if r == nil {
 		return ResidentPrimaryRoute{}, false
 	}
-	if int(bucket) < r.Len() {
-		if route, ok := r.RouteAtRank(int(bucket)); ok && route.Bucket == bucket {
-			return route, true
+	if r.buckets != nil {
+		entry, ok := r.buckets.lookup(bucket)
+		if !ok {
+			return ResidentPrimaryRoute{}, false
 		}
-	}
-	for rank := 0; rank < r.Len(); rank++ {
-		if route, ok := r.RouteAtRank(rank); ok && route.Bucket == bucket {
-			return route, true
+		_, rank, ok := r.tree.floor(entry.fence)
+		if !ok {
+			return ResidentPrimaryRoute{}, false
 		}
+		current, ok := r.tree.at(rank)
+		if !ok || current.cell != entry.cell {
+			return ResidentPrimaryRoute{}, false
+		}
+		return residentCellRoute(entry, rank, 0)
 	}
 	return ResidentPrimaryRoute{}, false
 }
@@ -502,11 +361,19 @@ func (r *ResidentPrimaryRouter) CanUpdateLeaf(
 	next PageRef,
 	generation uint64,
 ) bool {
-	if r == nil || int(route.rank) >= r.Len() ||
+	if r == nil || route.cell == nil || int(route.rank) >= r.Len() ||
 		generation <= r.Generation() ||
 		next == (PageRef{}) || next.Kind != PagePrimaryLeaf ||
 		next.Generation > generation {
 		return false
+	}
+	if route.cell != nil {
+		entry, member := r.tree.at(int(route.rank))
+		if !member || entry.cell != route.cell {
+			return false
+		}
+		current, ok := residentCellRoute(entry, int(route.rank), route.Hash)
+		return ok && current.Ref == route.Ref && current.Bucket == route.Bucket && next.LogicalID == route.Ref.LogicalID
 	}
 	at := int(route.rank) * residentPrimaryRouterWords
 	meta := atomic.LoadUint64(&r.rows[at+3])
@@ -525,6 +392,20 @@ func (r *ResidentPrimaryRouter) UpdateLeaf(
 	next PageRef,
 	generation uint64,
 ) {
+	if r == nil || route.cell == nil {
+		return
+	}
+	if route.cell != nil {
+		meta := uint64(next.Length) | uint64(uint32(route.Bucket))<<32
+		route.cell.seq.Add(1)
+		route.cell.offset.Store(next.Offset)
+		route.cell.generation.Store(next.Generation)
+		route.cell.meta.Store(meta)
+		route.cell.seq.Add(1)
+		route.cell.hint.packed.Store(0)
+		r.generation.Store(generation)
+		return
+	}
 	at := int(route.rank) * residentPrimaryRouterWords
 	meta := uint64(next.Length) | uint64(uint32(route.Bucket))<<32
 	r.version.Add(1)
@@ -536,11 +417,8 @@ func (r *ResidentPrimaryRouter) UpdateLeaf(
 	r.hints[route.rank].packed.Store(0)
 }
 
-// SplitLeaf builds the next immutable routing image by splicing one already
-// published structural leaf split into this router. It copies the compact
-// resident arrays but performs no page-cache acquisition or graph walk; the
-// old router remains valid for readers that loaded it before the collection's
-// atomic pointer swap.
+// SplitLeaf path-copies the affected routing block and its ancestors. It does
+// no page-cache acquisition or graph walk, and the old image remains valid.
 func (r *ResidentPrimaryRouter) SplitLeaf(
 	route ResidentPrimaryRoute,
 	leftRef PageRef,
@@ -562,42 +440,16 @@ func (r *ResidentPrimaryRouter) SplitLeaf(
 		int(route.rank)+1 < r.Len() && bytes.Compare(rightFence, r.fence(int(route.rank)+1)) >= 0 {
 		return nil, fmt.Errorf("%w: resident split route", ErrInvalidWrite)
 	}
+	if _, exists := r.buckets.lookup(rightBucket); exists {
+		return nil, fmt.Errorf("%w: resident split bucket", ErrInvalidWrite)
+	}
 	if uint64(len(r.fences)) > uint64(maxIntValue-len(rightFence)) ||
 		r.Len() == maxIntValue/residentPrimaryRouterWords {
 		return nil, fmt.Errorf("%w: resident split capacity", ErrInvalidWrite)
 	}
-	next := &ResidentPrimaryRouter{storeID: r.storeID}
-	next.fences = make([]byte, 0, len(r.fences)+len(rightFence))
-	next.rows = make([]uint64, 0, len(r.rows)+residentPrimaryRouterWords)
-	next.empty = make([]atomic.Uint32, r.Len()+1)
-	appendRow := func(fence []byte, ref PageRef, bucket BucketID, empty uint32) {
-		start := len(next.fences)
-		next.fences = append(next.fences, fence...)
-		next.rows = append(next.rows,
-			uint64(uint32(start))|uint64(uint32(len(next.fences)))<<32,
-			ref.Offset, ref.Generation,
-			uint64(ref.Length)|uint64(uint32(bucket))<<32,
-		)
-		next.empty[next.Len()-1].Store(empty)
-	}
-	for rank := 0; rank < r.Len(); rank++ {
-		old, routeOK := r.RouteAtRank(rank)
-		if !routeOK {
-			return nil, fmt.Errorf("%w: resident split source", ErrInvalidWrite)
-		}
-		ref, bucket := old.Ref, old.Bucket
-		empty := r.empty[rank].Load()
-		if rank == int(route.rank) {
-			ref, empty = leftRef, 0
-		}
-		appendRow(r.fence(rank), ref, bucket, empty)
-		if rank == int(route.rank) {
-			appendRow(rightFence, rightRef, rightBucket, 0)
-		}
-	}
-	next.hints = make([]pageCacheFrameHint, next.Len())
-	next.buildSearchKeys()
-	next.generation.Store(generation)
+	left := newResidentRouteEntry(r.fence(int(route.rank)), leftRef, route.Bucket)
+	right := newResidentRouteEntry(rightFence, rightRef, rightBucket)
+	next := r.replacePersistent(int(route.rank), []residentRouteEntry{left, right}, generation)
 	next.buildNS = time.Since(started).Nanoseconds()
 	return next, nil
 }
@@ -634,30 +486,17 @@ func (r *ResidentPrimaryRouter) SplitLeafPartition(
 	// rather than rescanning every resident leaf for each replacement.
 	var used [TabletLocalIdentityLocalCount / 64]uint64
 	selectedTabletHasPriorLeaf := false
-	for oldRank := 0; oldRank < r.Len(); oldRank++ {
-		if oldRank == sourceRank {
-			continue
+	if locals, found := r.buckets.tabletLocals(tabletID); found {
+		used = locals.words
+		used[sourceLocalID>>6] &^= uint64(1) << (sourceLocalID & 63)
+		for rank := sourceRank - 1; rank >= 0; rank-- {
+			old, _ := r.RouteAtRank(rank)
+			oldTablet, _, valid := SplitTabletLocalIdentityBucket(uint32(old.Bucket))
+			if valid && oldTablet == tabletID {
+				selectedTabletHasPriorLeaf = true
+			}
+			break
 		}
-		old, oldOK := r.RouteAtRank(oldRank)
-		if !oldOK {
-			return nil, fmt.Errorf("%w: resident partition source", ErrInvalidWrite)
-		}
-		oldTabletID, oldLocalID, oldIdentityOK :=
-			SplitTabletLocalIdentityBucket(uint32(old.Bucket))
-		if !oldIdentityOK {
-			return nil, fmt.Errorf("%w: resident partition identity", ErrInvalidWrite)
-		}
-		if oldTabletID != tabletID {
-			continue
-		}
-		if oldRank < sourceRank {
-			selectedTabletHasPriorLeaf = true
-		}
-		word, bit := oldLocalID>>6, uint64(1)<<(oldLocalID&63)
-		if used[word]&bit != 0 {
-			return nil, fmt.Errorf("%w: resident partition LocalID", ErrInvalidWrite)
-		}
-		used[word] |= bit
 	}
 	// A tablet's first persistent leaf has an empty local floor, while the
 	// resident router stores the catalog's global tablet floor. Preserve the
@@ -714,57 +553,16 @@ func (r *ResidentPrimaryRouter) SplitLeafPartition(
 	if newLen <= 0 || newLen > maxIntValue/residentPrimaryRouterWords {
 		return nil, fmt.Errorf("%w: resident partition capacity", ErrInvalidWrite)
 	}
-	newFenceBytes := len(r.fences) - len(residentSourceFence)
-	for rank, replacement := range replacements {
-		fence := replacement.Fence
-		if rank == 0 {
-			fence = residentSourceFence
+	repl := make([]residentRouteEntry, len(replacements))
+	for i, x := range replacements {
+		bucket, _ := MakeTabletLocalIdentityBucket(tabletID, uint32(x.LocalID))
+		f := x.Fence
+		if i == 0 {
+			f = residentSourceFence
 		}
-		if uint64(newFenceBytes) > uint64(maxIntValue-len(fence)) {
-			return nil, fmt.Errorf("%w: resident partition capacity", ErrInvalidWrite)
-		}
-		newFenceBytes += len(fence)
+		repl[i] = newResidentRouteEntry(f, x.Ref, BucketID(bucket))
 	}
-	if uint64(newFenceBytes) > uint64(^uint32(0)) {
-		return nil, fmt.Errorf("%w: resident partition capacity", ErrInvalidWrite)
-	}
-	next := &ResidentPrimaryRouter{storeID: r.storeID}
-	next.fences = make([]byte, 0, newFenceBytes)
-	next.rows = make([]uint64, 0, newLen*residentPrimaryRouterWords)
-	next.empty = make([]atomic.Uint32, newLen)
-	appendRow := func(fence []byte, ref PageRef, bucket BucketID, empty uint32) {
-		start := len(next.fences)
-		next.fences = append(next.fences, fence...)
-		next.rows = append(next.rows,
-			uint64(uint32(start))|uint64(uint32(len(next.fences)))<<32,
-			ref.Offset, ref.Generation,
-			uint64(ref.Length)|uint64(uint32(bucket))<<32,
-		)
-		next.empty[next.Len()-1].Store(empty)
-	}
-	for rank := 0; rank < r.Len(); rank++ {
-		if rank == sourceRank {
-			for replacementRank, replacement := range replacements {
-				bucket, _ := MakeTabletLocalIdentityBucket(
-					tabletID, uint32(replacement.LocalID),
-				)
-				fence := replacement.Fence
-				if replacementRank == 0 {
-					fence = residentSourceFence
-				}
-				appendRow(fence, replacement.Ref, BucketID(bucket), 0)
-			}
-			continue
-		}
-		old, routeOK := r.RouteAtRank(rank)
-		if !routeOK {
-			return nil, fmt.Errorf("%w: resident partition source", ErrInvalidWrite)
-		}
-		appendRow(r.fence(rank), old.Ref, old.Bucket, r.empty[rank].Load())
-	}
-	next.hints = make([]pageCacheFrameHint, next.Len())
-	next.buildSearchKeys()
-	next.generation.Store(generation)
+	next := r.replacePersistent(sourceRank, repl, generation)
 	next.buildNS = time.Since(started).Nanoseconds()
 	return next, nil
 }
@@ -787,41 +585,110 @@ func (r *ResidentPrimaryRouter) RemoveLeaf(
 	if !ok || current.Ref != route.Ref || current.Bucket != route.Bucket {
 		return nil, fmt.Errorf("%w: resident remove route", ErrInvalidWrite)
 	}
-
-	next := &ResidentPrimaryRouter{storeID: r.storeID}
-	removedFenceBytes := len(r.fence(int(route.rank)))
-	next.fences = make([]byte, 0, len(r.fences)-removedFenceBytes)
-	next.rows = make([]uint64, 0, len(r.rows)-residentPrimaryRouterWords)
-	next.empty = make([]atomic.Uint32, r.Len()-1)
-	appendRow := func(fence []byte, old ResidentPrimaryRoute, empty uint32) {
-		start := len(next.fences)
-		next.fences = append(next.fences, fence...)
-		next.rows = append(next.rows,
-			uint64(uint32(start))|uint64(uint32(len(next.fences)))<<32,
-			old.Ref.Offset, old.Ref.Generation,
-			uint64(old.Ref.Length)|uint64(uint32(old.Bucket))<<32,
-		)
-		next.empty[next.Len()-1].Store(empty)
+	if route.rank == 0 {
+		successor, _ := r.tree.at(1)
+		replacement := residentRouteEntry{fence: nil, cell: successor.cell}
+		next := r.replacePersistentRange(0, 2, []residentRouteEntry{replacement}, generation)
+		next.buildNS = time.Since(started).Nanoseconds()
+		return next, nil
 	}
-	for rank := 0; rank < r.Len(); rank++ {
-		if rank == int(route.rank) {
-			continue
-		}
-		old, routeOK := r.RouteAtRank(rank)
-		if !routeOK {
-			return nil, fmt.Errorf("%w: resident remove source", ErrInvalidWrite)
-		}
-		fence := r.fence(rank)
-		if route.rank == 0 && rank == 1 {
-			fence = nil
-		}
-		appendRow(fence, old, r.empty[rank].Load())
-	}
-	next.hints = make([]pageCacheFrameHint, next.Len())
-	next.buildSearchKeys()
-	next.generation.Store(generation)
+	next := r.replacePersistent(int(route.rank), nil, generation)
 	next.buildNS = time.Since(started).Nanoseconds()
 	return next, nil
+}
+
+// ReplaceTablets atomically constructs a new routing image by replacing every
+// route belonging to oldTabletID with one or more complete tablet images. Its
+// work is bounded by the tablet identity space and the replacement leaves;
+// routes outside that lexical range are structurally shared.
+func (r *ResidentPrimaryRouter) ReplaceTablets(oldTabletID uint32, tablets []ResidentPrimaryTabletReplacement, generation uint64) (*ResidentPrimaryRouter, error) {
+	started := time.Now()
+	if r == nil || r.tree == nil || len(tablets) == 0 || generation <= r.Generation() || generation >= uint64(1)<<48 {
+		return nil, fmt.Errorf("%w: resident tablet replacement", ErrInvalidWrite)
+	}
+	locals, ok := r.buckets.tabletLocals(oldTabletID)
+	if !ok {
+		return nil, fmt.Errorf("%w: resident tablet missing", ErrInvalidWrite)
+	}
+	start, end := r.Len(), -1
+	for local := uint32(0); local < TabletLocalIdentityLocalCount; local++ {
+		if !locals.contains(local) {
+			continue
+		}
+		bucket, _ := MakeTabletLocalIdentityBucket(oldTabletID, local)
+		entry, found := r.buckets.lookup(BucketID(bucket))
+		if !found {
+			return nil, fmt.Errorf("%w: resident tablet index", ErrInvalidWrite)
+		}
+		_, rank, found := r.tree.floor(entry.fence)
+		if !found {
+			return nil, fmt.Errorf("%w: resident tablet rank", ErrInvalidWrite)
+		}
+		start, end = min(start, rank), max(end, rank)
+	}
+	if end < start || end-start+1 != residentTabletLocalCount(locals) {
+		return nil, fmt.Errorf("%w: resident tablet range", ErrInvalidWrite)
+	}
+	repl := make([]residentRouteEntry, 0)
+	seenTablets := make(map[uint32]struct{}, len(tablets))
+	seenBuckets := make(map[BucketID]struct{})
+	for _, tablet := range tablets {
+		if _, exists := seenTablets[tablet.TabletID]; exists || len(tablet.Leaves) == 0 {
+			return nil, fmt.Errorf("%w: resident replacement tablet", ErrInvalidWrite)
+		}
+		seenTablets[tablet.TabletID] = struct{}{}
+		if tablet.TabletID != oldTabletID {
+			if _, exists := r.buckets.tabletLocals(tablet.TabletID); exists {
+				return nil, fmt.Errorf("%w: resident replacement tablet exists", ErrInvalidWrite)
+			}
+		}
+		floor := tablet.Floor
+		if tablet.TabletID == oldTabletID && floor == nil {
+			floor = r.fence(start)
+		}
+		for i, leaf := range tablet.Leaves {
+			if i == 0 && len(leaf.Fence) != 0 {
+				return nil, fmt.Errorf("%w: resident replacement floor", ErrInvalidWrite)
+			}
+			bucket, made := MakeTabletLocalIdentityBucket(tablet.TabletID, uint32(leaf.LocalID))
+			if !made || segmentedTabletRouterValidateLeafRef(leaf.Ref, BucketID(bucket), PagePrimaryLeaf, generation) != nil {
+				return nil, fmt.Errorf("%w: resident replacement leaf", ErrInvalidWrite)
+			}
+			bucketID := BucketID(bucket)
+			if _, duplicate := seenBuckets[bucketID]; duplicate {
+				return nil, fmt.Errorf("%w: resident replacement bucket", ErrInvalidWrite)
+			}
+			seenBuckets[bucketID] = struct{}{}
+			if _, exists := r.buckets.lookup(bucketID); exists && tablet.TabletID != oldTabletID {
+				return nil, fmt.Errorf("%w: resident replacement bucket", ErrInvalidWrite)
+			}
+			fence := leaf.Fence
+			if i == 0 {
+				fence = floor
+			}
+			if len(repl) != 0 && bytes.Compare(repl[len(repl)-1].fence, fence) >= 0 {
+				return nil, fmt.Errorf("%w: resident replacement order", ErrInvalidWrite)
+			}
+			repl = append(repl, newResidentRouteEntry(fence, leaf.Ref, bucketID))
+		}
+	}
+	if !bytes.Equal(repl[0].fence, r.fence(start)) {
+		return nil, fmt.Errorf("%w: resident replacement first floor", ErrInvalidWrite)
+	}
+	if start > 0 && bytes.Compare(r.fence(start-1), repl[0].fence) >= 0 || end+1 < r.Len() && bytes.Compare(repl[len(repl)-1].fence, r.fence(end+1)) >= 0 {
+		return nil, fmt.Errorf("%w: resident replacement bounds", ErrInvalidWrite)
+	}
+	next := r.replacePersistentRange(start, end-start+1, repl, generation)
+	next.buildNS = time.Since(started).Nanoseconds()
+	return next, nil
+}
+
+func residentTabletLocalCount(set *residentTabletLocalSet) int {
+	count := 0
+	for _, word := range set.words {
+		count += bits.OnesCount64(word)
+	}
+	return count
 }
 
 // NextTabletID returns the first never-issued monotonic tablet identity above
@@ -833,19 +700,13 @@ func (r *ResidentPrimaryRouter) NextTabletID() (uint32, bool) {
 	if r == nil || r.Len() == 0 {
 		return 0, false
 	}
-	var high uint32
-	for rank := 0; rank < r.Len(); rank++ {
-		route, ok := r.RouteAtRank(rank)
-		if !ok {
-			return 0, false
-		}
-		tabletID, _, ok := SplitTabletLocalIdentityBucket(uint32(route.Bucket))
-		if !ok {
-			return 0, false
-		}
-		if rank == 0 || tabletID > high {
-			high = tabletID
-		}
+	maximum, ok := r.buckets.max()
+	if !ok {
+		return 0, false
+	}
+	high, _, ok := SplitTabletLocalIdentityBucket(uint32(maximum))
+	if !ok {
+		return 0, false
 	}
 	if high+1 >= TabletLocalIdentityTabletCount {
 		return 0, false
@@ -867,6 +728,13 @@ func (r *ResidentPrimaryRouter) AdvanceGeneration(generation uint64) {
 func (r *ResidentPrimaryRouter) MarkEmpty(
 	route ResidentPrimaryRoute,
 ) bool {
+	if r != nil && route.cell != nil {
+		entry, ok := r.tree.at(int(route.rank))
+		if !ok || entry.cell != route.cell {
+			return false
+		}
+		return route.cell.empty.CompareAndSwap(0, 1)
+	}
 	return r != nil && int(route.rank) < len(r.empty) &&
 		r.empty[route.rank].CompareAndSwap(0, 1)
 }
@@ -876,6 +744,13 @@ func (r *ResidentPrimaryRouter) MarkEmpty(
 func (r *ResidentPrimaryRouter) ClearEmpty(
 	route ResidentPrimaryRoute,
 ) bool {
+	if r != nil && route.cell != nil {
+		entry, ok := r.tree.at(int(route.rank))
+		if !ok || entry.cell != route.cell {
+			return false
+		}
+		return route.cell.empty.CompareAndSwap(1, 0)
+	}
 	return r != nil && int(route.rank) < len(r.empty) &&
 		r.empty[route.rank].CompareAndSwap(1, 0)
 }
@@ -887,16 +762,26 @@ func (r *ResidentPrimaryRouter) AcquireLeaf(
 	cache *PageCache,
 	route ResidentPrimaryRoute,
 ) (PageLease, error) {
-	if r == nil || cache == nil || int(route.rank) >= len(r.hints) {
-		if cache == nil {
-			return PageLease{}, ErrPageCacheReference
-		}
+	if cache == nil {
+		return PageLease{}, ErrPageCacheReference
+	}
+	if route.cell != nil {
+		return cache.acquireFrameHinted(route.Ref, &route.cell.hint)
+	}
+	if r == nil || int(route.rank) >= len(r.hints) {
 		return cache.Acquire(route.Ref)
 	}
 	return cache.acquireFrameHinted(route.Ref, &r.hints[route.rank])
 }
 
 func (r *ResidentPrimaryRouter) fence(rank int) []byte {
+	if r.tree != nil {
+		e, ok := r.tree.at(rank)
+		if ok {
+			return e.fence
+		}
+		return nil
+	}
 	word := r.rows[rank*residentPrimaryRouterWords]
 	return r.fences[uint32(word):uint32(word>>32)]
 }
@@ -905,13 +790,21 @@ func (r *ResidentPrimaryRouter) Len() int {
 	if r == nil {
 		return 0
 	}
+	if r.tree != nil {
+		return r.tree.total
+	}
 	return len(r.rows) / residentPrimaryRouterWords
 }
 
-// ResidentBytes is the exact packed payload capacity retained by the router.
+// ResidentBytes estimates this image's logical footprint, including reachable
+// tree and bucket-index nodes plus cell and fence payloads. It excludes unused
+// capacity retained by shared arenas and images held separately by snapshots.
 func (r *ResidentPrimaryRouter) ResidentBytes() int {
 	if r == nil {
 		return 0
+	}
+	if r.tree != nil {
+		return r.treeBytes + r.buckets.retainedBytes()
 	}
 	limit := uint64(maxIntValue)
 	total := uint64(cap(r.fences))
