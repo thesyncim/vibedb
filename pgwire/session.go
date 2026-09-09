@@ -124,6 +124,59 @@ type session struct {
 	failed bool
 	// terminated marks a clean client Terminate, which is not an error.
 	terminated bool
+
+	// directPool lends independent backend sessions to pipelined single-shard
+	// autocommit writes (see executeRuntimeExecAsync). Each borrowed session is
+	// unrelated to s.sql, so several such writes can have their durable commit
+	// in flight at once on one connection instead of serializing one at a time
+	// behind the read loop. directCreated bounds total pool membership;
+	// directPending is the ordered, not-yet-answered queue for this connection.
+	directPool    chan BackendSession
+	directCreated int
+	directPending []*pendingDirectExec
+}
+
+// directPipelineDepth bounds concurrent in-flight direct writes per
+// connection. It matches gatewayruntime's postgresDirectPool lane count so
+// this pipeline can never present more concurrent direct writes than the
+// backend already provisions capacity for.
+const directPipelineDepth = 16
+
+// pendingDirectExec is one deferred single-shard autocommit write: submitted
+// without blocking the read loop, and answered in submission order once its
+// durable commit resolves.
+// pendingDirectKind distinguishes the queue items directPending can hold.
+// The three handshake kinds carry no data and are never waited on — they
+// exist so a deferred statement's ParseComplete/BindComplete/NoData are
+// answered in the same submission-ordered queue as its eventual
+// CommandComplete, instead of being written immediately and landing ahead of
+// an earlier statement's still-pending result.
+type pendingDirectKind uint8
+
+const (
+	pendingDirectParseComplete pendingDirectKind = iota
+	pendingDirectBindComplete
+	pendingDirectNoData
+	pendingDirectExecResult
+	// pendingDirectReadyForQuery is a Sync's own ReadyForQuery, queued
+	// instead of written immediately when finishExtendedBatch finds more
+	// already buffered to read — see its comment for why.
+	pendingDirectReadyForQuery
+)
+
+// pendingDirectExec is one queued, not-yet-written response for a
+// direct-pipeline-deferred statement, answered in submission order by
+// drainDirectPending.
+type pendingDirectExec struct {
+	kind pendingDirectKind
+	// done, sess, text, tag, and err apply only to pendingDirectExecResult.
+	done chan struct{}
+	sess BackendSession
+	text string
+	tag  string
+	err  error
+	// txStatus applies only to pendingDirectReadyForQuery.
+	txStatus byte
 }
 
 // A prepared is one prepared statement.
@@ -135,7 +188,19 @@ type prepared struct {
 	showIsolation bool
 	name          string
 	sql           string
-	kind          statementKind
+	// lowered is sql after numbered-parameter and schema-qualification
+	// rewriting — the exact text this statement's runtime was compiled
+	// against. Empty unless kind reached that rewrite (see prepare).
+	lowered string
+	kind    statementKind
+	// pipelineDeferred marks a statement whose Parse/Bind/Describe/Execute
+	// responses all go through s.directPending instead of being written
+	// immediately (see executeRuntimeExecAsync). It is decided once, from
+	// stmt.kind alone, right after Parse succeeds — Bind and Describe cannot
+	// change eligibility, only fail it, and a failure drains the queue before
+	// reporting the error, so the deferred and immediate paths always answer
+	// every message in the order it arrived.
+	pipelineDeferred bool
 	// retainedBytes is this statement's charge against the session-wide
 	// prepared-input bound: its statement name, SQL text, parameter OIDs,
 	// PostgreSQL placeholder mappings/roles/types, and conservative retained
@@ -406,6 +471,22 @@ func (s *session) serve() error {
 
 // release drops everything the session owns. It runs once, on every exit path.
 func (s *session) release() {
+	// Every pending direct write already ran, or is running, against its own
+	// borrowed session and its own committed-or-not raft proposal: closing this
+	// connection does not cancel it (matching this backend's documented "server
+	// retains the request for automatic recovery" outcome-unknown contract).
+	// Wait so every borrowed BackendSession can be closed below, not leaked.
+	for _, pending := range s.directPending {
+		<-pending.done
+	}
+	s.directPending = nil
+	if s.directPool != nil {
+		close(s.directPool)
+		for pooled := range s.directPool {
+			_ = pooled.Close()
+		}
+		s.directPool = nil
+	}
 	for _, p := range s.portals {
 		p.release()
 	}
@@ -802,9 +883,22 @@ func (s *session) dispatch(tag byte, body []byte) error {
 	}
 	switch tag {
 	case msgTerminate:
+		if len(s.directPending) > 0 {
+			if err := s.drainDirectPending(); err != nil {
+				return err
+			}
+		}
 		s.terminated = true
 		return nil
 	case msgQuery:
+		if len(s.directPending) > 0 {
+			// A simple Query answers its own ReadyForQuery immediately; every
+			// direct write submitted before it must be answered first so
+			// responses stay in the order the client sent the requests.
+			if err := s.drainDirectPending(); err != nil {
+				return err
+			}
+		}
 		if s.failed {
 			// The extended protocol's error state discards every message up to
 			// the next Sync, and a simple Query is one of them. Running it would
@@ -1258,6 +1352,7 @@ func (s *session) prepare(
 			lowered = publicSQL
 		}
 	}
+	p.lowered = lowered
 	parameterTypes := declaredOccurrenceTypes(declaredOIDs, order)
 	var runtime BackendStatement
 	if typed, ok := s.sql.(BackendSessionParameterPreparer); ok &&
@@ -1739,6 +1834,171 @@ func (s *session) executeRuntimeExec(p *portal) error {
 	p.exhausted = true
 	s.w.commandComplete(runtimeCommandTag(kind, result.RowsAffected))
 	return nil
+}
+
+// directPipelineEligible reports whether stmt is a plain autocommit mutation
+// this backend can run on a borrowed, independent BackendSession instead of
+// s.sql. It must return no rows (the caller already restricts to that case)
+// and must not be schema DDL, which this backend commits directly against
+// the catalog rather than through the per-statement direct-write pool.
+func directPipelineEligible(sqlSession BackendSession, stmt *prepared) bool {
+	return stmt != nil && stmt.runtime != nil && !stmt.runtime.ReturnsRows() &&
+		autocommitWrites(sqlSession) && !runtimeKindIsDDL(stmt.runtime.Kind())
+}
+
+// acquireDirectSession returns a spare backend session for a pipelined write,
+// reusing one released by an earlier completed write when available and
+// otherwise creating a new one up to directPipelineDepth. A nil, nil result
+// means the pool is at capacity; the caller falls back to the ordinary
+// synchronous path rather than wait, so a single connection never queues more
+// concurrent direct writes than the backend provisioned lanes for.
+func (s *session) acquireDirectSession() (BackendSession, error) {
+	if s.directPool == nil {
+		s.directPool = make(chan BackendSession, directPipelineDepth)
+	}
+	select {
+	case sess := <-s.directPool:
+		return sess, nil
+	default:
+	}
+	if s.directCreated >= directPipelineDepth {
+		return nil, nil
+	}
+	sess, err := s.server.backend.NewSession(context.Background(), SessionIdentity{User: s.user, Database: s.database})
+	if err != nil {
+		return nil, err
+	}
+	s.directCreated++
+	return sess, nil
+}
+
+// executeRuntimeExecAsync submits an eligible autocommit mutation on a
+// borrowed session and returns immediately without waiting for its durable
+// commit, so the read loop can go on to parse, bind, and submit the next
+// pipelined statement. Responses are held until drainDirectPending or
+// finishExtendedBatch answers them, strictly in submission order.
+//
+// It returns handled=false when the statement is ineligible or the pipeline
+// is momentarily at capacity; the caller then runs the ordinary synchronous
+// path, which itself provides backpressure.
+func (s *session) executeRuntimeExecAsync(p *portal) (handled bool, err error) {
+	stmt := p.stmt
+	if !stmt.pipelineDeferred {
+		return false, nil
+	}
+	// stmt.pipelineDeferred means Parse (and Bind, and Describe, via
+	// answerOrDefer) already queued this statement's handshake instead of
+	// answering it directly. A path below that returns an error is safe
+	// unchanged: every error reaches rejectExtended, which drains first (see
+	// its comment) before reporting it. A path that falls through to the
+	// ordinary synchronous executeRuntimeExec, though, is about to write a
+	// CommandComplete directly — exactly the write answerOrDefer would drain
+	// for, so it must drain here for the same reason.
+	if p.exhausted {
+		if err := s.drainDirectPendingIfAny(); err != nil {
+			return true, err
+		}
+		return false, nil
+	}
+	if s.takeCancel() {
+		return true, queryCanceled()
+	}
+	sess, err := s.acquireDirectSession()
+	if err != nil {
+		return true, err
+	}
+	if sess == nil {
+		if err := s.drainDirectPendingIfAny(); err != nil {
+			return true, err
+		}
+		return false, nil
+	}
+	s.invalidateRuntimePortals(p)
+	args := slices.Clone(p.args)
+	// lowered is what stmt.runtime was itself compiled from (numbered
+	// parameters and schema-qualification already rewritten, see prepare);
+	// stmt.sql is the original client text, kept only for error messages.
+	text, kind := stmt.lowered, stmt.runtime.Kind()
+	pending := &pendingDirectExec{kind: pendingDirectExecResult, done: make(chan struct{}), sess: sess, text: stmt.sql}
+	go func() {
+		defer close(pending.done)
+		// A concurrent direct write can lose an optimistic-concurrency race
+		// against another lane committing to the same shard between this
+		// statement's planning and its proposal — SQLSTATE 40001,
+		// serialization_failure, guarantees nothing was applied. The
+		// single-lane synchronous path never had a concurrent lane to lose
+		// that race against, so it never needed to retry; concurrent lanes
+		// do. Re-preparing (not just re-executing) gets a fresh plan against
+		// current catalog state for each attempt.
+		const maxSerializationRetries = 8
+		for attempt := 0; ; attempt++ {
+			prepared, prepErr := sess.Prepare(context.Background(), text)
+			if prepErr != nil {
+				pending.err = prepErr
+				return
+			}
+			result, execErr := prepared.Exec(context.Background(), args)
+			_ = prepared.Close()
+			if execErr == nil {
+				pending.tag = runtimeCommandTag(kind, result.RowsAffected)
+				return
+			}
+			if pg, ok := classifiedProtocolError(asPGErrorIn(execErr, text)); ok &&
+				pg.code == sqlstateSerializationFailure && attempt < maxSerializationRetries {
+				continue
+			}
+			pending.err = execErr
+			return
+		}
+	}()
+	p.started = true
+	p.exhausted = true
+	s.directPending = append(s.directPending, pending)
+	return true, nil
+}
+
+
+// drainDirectPendingIfAny is drainDirectPending guarded by a length check,
+// for call sites on a path that doesn't already know the queue is non-empty.
+func (s *session) drainDirectPendingIfAny() error {
+	if len(s.directPending) == 0 {
+		return nil
+	}
+	return s.drainDirectPending()
+}
+
+// drainDirectPending waits for every currently queued direct write, in
+// submission order, and writes its deferred response. Because a single raft
+// group commits log entries strictly in submission order, entries already
+// resolve in the order they must be answered in — this never reorders.
+func (s *session) drainDirectPending() error {
+	for len(s.directPending) > 0 {
+		item := s.directPending[0]
+		s.directPending = s.directPending[1:]
+		switch item.kind {
+		case pendingDirectParseComplete:
+			s.w.parseComplete()
+		case pendingDirectBindComplete:
+			s.w.bindComplete()
+		case pendingDirectNoData:
+			s.w.noData()
+		case pendingDirectExecResult:
+			<-item.done
+			s.directPool <- item.sess
+			if item.err != nil {
+				pg, ok := classifiedProtocolError(asPGErrorIn(item.err, item.text))
+				if !ok {
+					return item.err
+				}
+				s.w.errorResponse(pg)
+			} else {
+				s.w.commandComplete(item.tag)
+			}
+		case pendingDirectReadyForQuery:
+			s.w.readyForQuery(item.txStatus)
+		}
+	}
+	return s.flush()
 }
 
 func runtimeCommandTag(kind sqlast.Kind, rows int64) string {

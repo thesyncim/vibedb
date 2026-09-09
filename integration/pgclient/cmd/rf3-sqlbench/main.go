@@ -589,25 +589,8 @@ func setup(ctx context.Context, conn *pgconn.PgConn, c config, tables []string) 
 				return fmt.Errorf("index %s: %w", table, e)
 			}
 		}
-		for first := 0; first < c.rows; first += c.seedBatch {
-			if first%65536 == 0 {
-				fmt.Fprintf(os.Stderr, "seeding %s %d/%d rows\n", table, first, c.rows)
-			}
-			var sql strings.Builder
-			sql.WriteString("INSERT INTO " + table + " " + insertColumns(c) + " VALUES ")
-			for i := first; i < min(first+c.seedBatch, c.rows); i++ {
-				if i != first {
-					sql.WriteByte(',')
-				}
-				appendInsertRow(&sql, c, i)
-			}
-			res := conn.ExecParams(ctx, sql.String(), nil, nil, nil, nil).Read()
-			if res.Err != nil {
-				return fmt.Errorf("seed %s row %d: %w", table, first, res.Err)
-			}
-			if res.CommandTag.RowsAffected() != int64(min(c.seedBatch, c.rows-first)) {
-				return fmt.Errorf("seed %s affected rows", table)
-			}
+		if err := seedPipelined(ctx, conn, c, table); err != nil {
+			return err
 		}
 		if c.engine == "cockroachdb" {
 			for _, sql := range []string{"ALTER TABLE " + table + " CONFIGURE ZONE USING num_replicas = 3", "ANALYZE " + table} {
@@ -634,6 +617,90 @@ func setup(ctx context.Context, conn *pgconn.PgConn, c config, tables []string) 
 	}
 	return nil
 }
+
+// seedPipelineDepth bounds how many autocommit INSERT batches this client
+// keeps outstanding on one connection before reading their results. It
+// matches the server's own per-connection concurrent-direct-write bound
+// (pgwire's directPipelineDepth): queuing further ahead than the server can
+// hold concurrently in flight would only grow client-side memory, not
+// throughput. This applies uniformly to every engine this client drives —
+// it removes this client's own round-trip serialization, the same way any
+// PostgreSQL-wire client pipelining requests would, rather than changing
+// what either engine does with them.
+const seedPipelineDepth = 16
+
+// seedPipelined seeds table using PostgreSQL's pipeline mode: it queues up
+// to seedPipelineDepth autocommit INSERT statements on the wire before
+// waiting for any of their results, instead of the
+// one-round-trip-per-statement pattern committing each batch and then
+// waiting serializes into. Every statement still gets its own Sync — this
+// backend requires exactly one autocommit write per Sync-delimited unit —
+// but a Sync only has to be answered in order, not answered before the next
+// statement can be sent, so depth statements' Sync points can all be
+// outstanding at once. The seeding phase itself is still the single
+// connection, single client stream the benchmark measures — this only
+// removes the artificial wait between requests that stream never needed.
+func seedPipelined(ctx context.Context, conn *pgconn.PgConn, c config, table string) error {
+	pipeline := conn.StartPipeline(ctx)
+	defer pipeline.Close()
+	type queuedInsert struct {
+		first    int
+		expected int64
+	}
+	queued := make([]queuedInsert, 0, seedPipelineDepth)
+	drain := func() error {
+		for _, q := range queued {
+			results, err := pipeline.GetResults()
+			if err != nil {
+				return fmt.Errorf("seed %s row %d: %w", table, q.first, err)
+			}
+			reader, ok := results.(*pgconn.ResultReader)
+			if !ok {
+				return fmt.Errorf("seed %s row %d: unexpected pipeline result %T", table, q.first, results)
+			}
+			res := reader.Read()
+			if res.Err != nil {
+				return fmt.Errorf("seed %s row %d: %w", table, q.first, res.Err)
+			}
+			if res.CommandTag.RowsAffected() != q.expected {
+				return fmt.Errorf("seed %s affected rows", table)
+			}
+			if _, err := pipeline.GetResults(); err != nil { // this statement's own Sync
+				return fmt.Errorf("seed %s row %d: pipeline sync: %w", table, q.first, err)
+			}
+		}
+		queued = queued[:0]
+		return nil
+	}
+	for first := 0; first < c.rows; first += c.seedBatch {
+		if first%65536 == 0 {
+			fmt.Fprintf(os.Stderr, "seeding %s %d/%d rows\n", table, first, c.rows)
+		}
+		var sql strings.Builder
+		sql.WriteString("INSERT INTO " + table + " " + insertColumns(c) + " VALUES ")
+		for i := first; i < min(first+c.seedBatch, c.rows); i++ {
+			if i != first {
+				sql.WriteByte(',')
+			}
+			appendInsertRow(&sql, c, i)
+		}
+		pipeline.SendQueryParams(sql.String(), nil, nil, nil, nil)
+		if err := pipeline.Sync(); err != nil {
+			return fmt.Errorf("seed %s row %d: pipeline sync: %w", table, first, err)
+		}
+		queued = append(queued, queuedInsert{first: first, expected: int64(min(c.seedBatch, c.rows-first))})
+		if len(queued) >= seedPipelineDepth {
+			if err := drain(); err != nil {
+				return err
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+	return drain()
+}
+
 func key(i int) string { return fmt.Sprintf("key-%08d", i) }
 func textCell(c config, b []byte) string {
 	if c.engine == "vibedb" {
