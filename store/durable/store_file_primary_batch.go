@@ -102,6 +102,7 @@ type stagedPrimaryBatch struct {
 	generation      uint64
 	preparedExact   primaryExactPrepared
 	preparedOverlay primaryUnifiedOverlayBatchPrepared
+	overlayDocDelta int
 	live            bool
 }
 
@@ -235,13 +236,15 @@ func (c *Collection) stagePrimaryBatchConditionalLocked(
 	return c.stagePrimaryBatchForJournalLocked(batch, true)
 }
 
-// stagePrimaryBatchOrdinaryOverlayLocked publishes one existing-key inline
-// replacement batch through the same unified row overlay as point Put, plus
-// exact-index overlay deltas. Primary leaves stay clean until Flush. Mixed
-// inserts, deletes, overflow, and geometry that cannot fit decline to the
-// compact COW path without mutating overlay state. Overlay record or intern
-// pressure folds the live window and retries so a long indexed burst does
-// not fall back to rewriting compact leaves.
+// stagePrimaryBatchOrdinaryOverlayLocked publishes one inline Put batch
+// through the same unified row overlay as point Put, plus exact-index overlay
+// deltas. Replacements keep posting slots; inserts claim hashed free slots.
+// Primary leaves stay clean until Flush. Deletes, overflow, overlay tombstones,
+// and geometry that cannot fit decline to the compact COW path without mutating
+// overlay state. A declined overlay window is absorbed into that dirty COW
+// image (or into a later topology split) instead of barrier-folding first.
+// Overlay record or intern pressure folds the live window and retries so a
+// long indexed burst does not fall back to rewriting compact leaves.
 func (c *Collection) stagePrimaryBatchOrdinaryOverlayLocked(
 	batch *WriteBatch,
 ) (staged stagedPrimaryBatch, handled bool, err error) {
@@ -288,6 +291,59 @@ func (c *Collection) stagePrimaryBatchOrdinaryOverlayLocked(
 	return stagedPrimaryBatch{}, false, nil
 }
 
+func (c *Collection) primaryBatchShouldSkipInsertOverlay(
+	state *fileStoreState, batch *WriteBatch,
+) (bool, error) {
+	if c == nil || batch == nil || state == nil {
+		return false, nil
+	}
+	router := c.primaryRouter.Load()
+	overlay := c.primaryUnifiedOverlay
+	if router == nil || overlay == nil {
+		return false, nil
+	}
+	for ei := range batch.entries {
+		entry := batch.entries[ei]
+		if entry.remove {
+			return false, nil
+		}
+		key := batch.key(entry)
+		resident, err := c.currentPrimaryResidentRoute(state, key)
+		if err != nil {
+			return false, err
+		}
+		lease, err := router.AcquireLeaf(c.cache, resident)
+		if err != nil {
+			return false, err
+		}
+		stripe, ok := storeio.AdmittedCompactPrimaryStripe(
+			lease.Page(), c.storeID, resident.Bucket,
+		)
+		lease.Release()
+		if !ok {
+			return false, nil
+		}
+		_, baseFound := stripe.FindKey(key)
+		_, disposition, _ := overlay.lookup(
+			resident.Bucket, resident.Hash, key, state.root.Generation,
+		)
+		switch disposition {
+		case primaryUnifiedOverlayValue:
+			return false, nil
+		case primaryUnifiedOverlayDeleted:
+			return false, nil
+		case primaryUnifiedOverlayMissing:
+			if baseFound {
+				return false, nil
+			}
+			return true, nil
+		default:
+			return false, nil
+		}
+	}
+	return false, nil
+}
+
 func (c *Collection) tryStagePrimaryBatchOrdinaryOverlayLocked(
 	batch *WriteBatch,
 ) (staged stagedPrimaryBatch, handled bool, pressure bool, err error) {
@@ -301,9 +357,21 @@ func (c *Collection) tryStagePrimaryBatchOrdinaryOverlayLocked(
 	}
 	c.primaryUnifiedSeen = true
 	c.recyclePrimaryUnifiedOverlayIfSafe()
+	c.batchOverlayFilledEmpty = c.batchOverlayFilledEmpty[:0]
+	c.batchOverlayPlanned = false
+	if len(batch.entries) > 32 {
+		skip, skipErr := c.primaryBatchShouldSkipInsertOverlay(state, batch)
+		if skipErr != nil {
+			return stagedPrimaryBatch{}, true, false, skipErr
+		}
+		if skip {
+			return stagedPrimaryBatch{}, false, false, nil
+		}
+	}
 	if err := c.planPrimaryBatch(state, batch); err != nil {
 		return stagedPrimaryBatch{}, true, false, err
 	}
+	c.batchOverlayPlanned = true
 	if len(c.batchPrimaryLeaves) == 0 || len(c.batchPrimaryMutations) == 0 {
 		return stagedPrimaryBatch{}, false, false, nil
 	}
@@ -322,6 +390,7 @@ func (c *Collection) tryStagePrimaryBatchOrdinaryOverlayLocked(
 		storeio.PageHeaderSize - storeio.PageTrailerSize
 	c.batchOverlayMutations = c.batchOverlayMutations[:0]
 	c.batchOldRawArena = c.batchOldRawArena[:0]
+	overlayDocDelta := 0
 	router := c.primaryRouter.Load()
 	if router == nil {
 		return stagedPrimaryBatch{}, false, false, nil
@@ -355,6 +424,10 @@ func (c *Collection) tryStagePrimaryBatchOrdinaryOverlayLocked(
 			lease.Release()
 			return stagedPrimaryBatch{}, false, false, nil
 		}
+		occupied := overlay.pendingInsertSlots(leaf.resident.Bucket)
+		leafWasEmpty := stripe.Len()+pendingRows == 0
+		filledEmpty := false
+		leafInserts := 0
 		rawDelta := 0
 		for mutationAt := leaf.mutationAt; mutationAt < leaf.mutationEnd; mutationAt++ {
 			mutation := &c.batchPrimaryMutations[mutationAt]
@@ -371,6 +444,7 @@ func (c *Collection) tryStagePrimaryBatchOrdinaryOverlayLocked(
 			found := baseFound
 			stableSlot := uint8(0)
 			oldLen := 0
+			countDelta := 0
 			var oldRaw []byte
 			switch disposition {
 			case primaryUnifiedOverlayValue:
@@ -383,8 +457,34 @@ func (c *Collection) tryStagePrimaryBatchOrdinaryOverlayLocked(
 				return stagedPrimaryBatch{}, false, false, nil
 			case primaryUnifiedOverlayMissing:
 				if !baseFound {
-					lease.Release()
-					return stagedPrimaryBatch{}, false, false, nil
+					if leaf.resident.Ref.Length ==
+						storeio.CommonPrimaryLeafMaxExtentBytes {
+						// A packed max-extent leaf still needs the COW builder
+						// to prove the prospective image before splitting.
+						lease.Release()
+						return stagedPrimaryBatch{}, false, false, nil
+					}
+					leafInserts++
+					if state.root.IndexCount != 0 &&
+						stripe.Len()+pendingRows+leafInserts >
+							storeio.CommonPrimaryLeafWideSlots {
+						lease.Release()
+						return stagedPrimaryBatch{}, false, false, nil
+					}
+					var slotOK bool
+					stableSlot, slotOK = stripe.ChooseInsertSlotHashed(
+						mutation.resident.Hash, occupied,
+					)
+					if !slotOK {
+						lease.Release()
+						return stagedPrimaryBatch{}, false, false, nil
+					}
+					occupied[stableSlot>>6] |= uint64(1) << uint(stableSlot&63)
+					countDelta = 1
+					if leafWasEmpty {
+						filledEmpty = true
+					}
+					break
 				}
 				if _, overflow := stripe.OverflowRef(rank); overflow {
 					lease.Release()
@@ -412,31 +512,44 @@ func (c *Collection) tryStagePrimaryBatchOrdinaryOverlayLocked(
 				return stagedPrimaryBatch{}, true, false,
 					storeio.ErrCommonPrimaryLeafCorrupt
 			}
-			if !found || oldLen <= 0 {
+			if found && oldLen <= 0 {
 				lease.Release()
 				return stagedPrimaryBatch{}, false, false, nil
 			}
 			value := mutation.stored.Inline
-			if leaf.resident.Ref.Length == storeio.CommonPrimaryLeafMaxExtentBytes &&
+			if found &&
+				leaf.resident.Ref.Length == storeio.CommonPrimaryLeafMaxExtentBytes &&
 				!bytes.Equal(value, oldRaw) {
 				lease.Release()
 				return stagedPrimaryBatch{}, false, false, nil
 			}
-			off := len(c.batchOldRawArena)
-			c.batchOldRawArena = append(c.batchOldRawArena, oldRaw...)
-			mutation.found = true
+			mutation.found = found
 			mutation.oldSlot = stableSlot
-			mutation.oldRawOff = off
-			mutation.oldRawLen = len(oldRaw)
-			mutation.capturedOldRaw = true
-			rawDelta += len(value) - oldLen
+			mutationDelta := len(value) - oldLen
+			if !found {
+				mutationDelta = storeio.CommonPrimaryUnifiedInsertedTrivialBytes(
+					mutation.key, len(value),
+				)
+				if mutationDelta == 0 {
+					lease.Release()
+					return stagedPrimaryBatch{}, true, false, storeio.ErrInvalidWrite
+				}
+			} else {
+				off := len(c.batchOldRawArena)
+				c.batchOldRawArena = append(c.batchOldRawArena, oldRaw...)
+				mutation.oldRawOff = off
+				mutation.oldRawLen = len(oldRaw)
+				mutation.capturedOldRaw = true
+			}
+			rawDelta += mutationDelta
+			overlayDocDelta += countDelta
 			c.batchOverlayMutations = append(c.batchOverlayMutations, primaryUnifiedOverlayBatchMutation{
 				bucket:          leaf.resident.Bucket,
 				hash:            mutation.resident.Hash,
 				key:             mutation.key,
 				value:           value,
-				rawDelta:        len(value) - oldLen,
-				countDelta:      0,
+				rawDelta:        mutationDelta,
+				countDelta:      countDelta,
 				kind:            primaryUnifiedOverlayPut,
 				stableSlot:      stableSlot,
 				fixedLeafBytes:  overlay.maxLeafBytes,
@@ -444,8 +557,16 @@ func (c *Collection) tryStagePrimaryBatchOrdinaryOverlayLocked(
 			})
 		}
 		if stripe.EncodedPayloadBytes()+pendingRaw+rawDelta > maxPayload {
+			// Uncompressed overlay reservation is not a topology signal.
+			// Decline to copy-on-write so compression can absorb the pending
+			// rows into the same leaf; split only if that image cannot encode.
 			lease.Release()
 			return stagedPrimaryBatch{}, false, false, nil
+		}
+		if filledEmpty {
+			c.batchOverlayFilledEmpty = append(
+				c.batchOverlayFilledEmpty, leaf.resident,
+			)
 		}
 		lease.Release()
 	}
@@ -454,6 +575,13 @@ func (c *Collection) tryStagePrimaryBatchOrdinaryOverlayLocked(
 	}
 	if err := c.validatePrimaryUniqueBatch(); err != nil {
 		return stagedPrimaryBatch{}, true, false, err
+	}
+	if overlayDocDelta != 0 {
+		if _, ok := fileLogicalDocumentCount(
+			state.root.DocumentCount, overlayDocDelta,
+		); !ok {
+			return stagedPrimaryBatch{}, true, false, storeio.ErrInvalidWrite
+		}
 	}
 	if c.state.Load() != state {
 		return stagedPrimaryBatch{}, false, false, nil
@@ -481,6 +609,7 @@ func (c *Collection) tryStagePrimaryBatchOrdinaryOverlayLocked(
 		generation:      generation,
 		preparedExact:   preparedExact,
 		preparedOverlay: prepared,
+		overlayDocDelta: overlayDocDelta,
 		live:            true,
 	}, true, false, nil
 }
@@ -884,8 +1013,15 @@ func (c *Collection) stagePrimaryBatchForJournalLocked(
 	} else if staged, handled, err := c.stagePrimaryBatchOrdinaryOverlayLocked(batch); handled {
 		return staged, err
 	}
+	c.absorbOverlayOnCOW = false
 	if c.primaryUnifiedOverlay.hasPending() {
-		if err := c.materializePrimaryParentsLocked(primaryMaterializationBarrier); err != nil {
+		absorb := c.batchOverlayPlanned && len(c.batchPrimaryLeaves) == 1 &&
+			c.canAbsorbOverlayIntoBatchCOW(c.batchPrimaryLeaves[0].resident.Bucket)
+		if absorb {
+			c.absorbOverlayOnCOW = true
+		} else if err := c.materializePrimaryParentsLocked(
+			primaryMaterializationBarrier,
+		); err != nil {
 			return stagedPrimaryBatch{}, err
 		}
 	}
@@ -942,6 +1078,7 @@ func (c *Collection) stagePrimaryBatchForJournalLocked(
 		splitKey, generation, buildErr := c.buildPrimaryBatchLeaves(state)
 		if errors.Is(buildErr, ErrPrimaryLeafSplitRequired) {
 			lastErr = buildErr
+			c.absorbOverlayOnCOW = false
 			if group := c.checkpointGroup.Load(); group != nil &&
 				group.visibleTxn.Load() > group.certTxn.Load() {
 				// The failed leaf build has not admitted frames or prepared a
@@ -1231,14 +1368,17 @@ func (c *Collection) preparePrimaryBatchExactOverlayDeltas(
 	}
 	for i := range c.batchPrimaryMutations {
 		mutation := &c.batchPrimaryMutations[i]
-		if !mutation.found || !mutation.capturedOldRaw {
+		if mutation.remove {
 			c.unwindPrimaryExactPrepared(&prepared)
 			return primaryExactPrepared{}, true, nil
 		}
-		oldRaw := c.batchOldRawArena[mutation.oldRawOff : mutation.oldRawOff+mutation.oldRawLen]
+		var oldRaw []byte
+		if mutation.capturedOldRaw {
+			oldRaw = c.batchOldRawArena[mutation.oldRawOff : mutation.oldRawOff+mutation.oldRawLen]
+		}
 		ok, deltaErr := c.preparePrimaryExactDeltaRaw(
 			epoch, &prepared, mutation.resident,
-			oldRaw, mutation.value, mutation.remove, true,
+			oldRaw, mutation.value, false, mutation.found,
 			mutation.oldSlot, mutation.oldSlot, generation,
 		)
 		if deltaErr != nil {
@@ -1670,6 +1810,24 @@ func (c *Collection) buildPrimaryBatchLeaf(
 	); err != nil {
 		return nil, err
 	}
+	if c.absorbOverlayOnCOW {
+		baseRows = slices.Grow(baseRows, storeio.CommonPrimaryLeafWideSlots)
+		appliedRows, applyErr := c.primaryUnifiedOverlay.applyBucket(
+			baseRows, leaf.resident.Bucket, state.root.Generation,
+		)
+		if applyErr != nil {
+			if errors.Is(applyErr, storeio.ErrCommonPrimaryLeafFull) {
+				c.primaryLeafSplitRequired.Add(1)
+				c.absorbOverlayOnCOW = false
+				return c.primaryBatchProspectiveSplitKey(appliedRows), errors.Join(
+					ErrPrimaryLeafSplitRequired, applyErr,
+				)
+			}
+			c.absorbOverlayOnCOW = false
+			return nil, applyErr
+		}
+		baseRows = appliedRows
+	}
 	leaf.initialLen = len(baseRows)
 	leaf.docDelta = 0
 	final, applied, err := c.mergePrimaryBatchLeafRows(
@@ -1993,6 +2151,13 @@ func (c *Collection) publishPrimaryBatchGateHeld(staged stagedPrimaryBatch) {
 	if staged.preparedOverlay.live {
 		nextRoot := state.root
 		nextRoot.Generation = generation
+		if staged.overlayDocDelta != 0 {
+			if nextCount, ok := fileLogicalDocumentCount(
+				state.root.DocumentCount, staged.overlayDocDelta,
+			); ok {
+				nextRoot.DocumentCount = nextCount
+			}
+		}
 		nextState := &fileStoreState{
 			root: nextRoot, fileEnd: state.fileEnd,
 			freeHead: state.freeHead,
@@ -2000,7 +2165,14 @@ func (c *Collection) publishPrimaryBatchGateHeld(staged stagedPrimaryBatch) {
 		c.beginReaderFence()
 		c.primaryUnifiedOverlay.publishBatch(&staged.preparedOverlay)
 		c.installPrimaryExactResidentLocked(staged.preparedExact)
-		c.primaryRouter.Load().AdvanceGeneration(generation)
+		router := c.primaryRouter.Load()
+		router.AdvanceGeneration(generation)
+		for _, route := range c.batchOverlayFilledEmpty {
+			if router.ClearEmpty(route) {
+				c.removePrimaryEmptyLeaf()
+			}
+		}
+		c.batchOverlayFilledEmpty = c.batchOverlayFilledEmpty[:0]
 		c.pageValidator.update(nextState)
 		c.publishFileState(nextState)
 		c.endReaderFence()
@@ -2051,6 +2223,10 @@ func (c *Collection) publishPrimaryBatchGateHeld(staged stagedPrimaryBatch) {
 	c.installPrimaryExactResidentLocked(preparedExact)
 	c.pageValidator.update(nextState)
 	c.publishFileState(nextState)
+	if c.absorbOverlayOnCOW {
+		c.primaryUnifiedOverlay.markFolded(generation, false)
+		c.absorbOverlayOnCOW = false
+	}
 	for _, prev := range c.batchPrimaryPrevVolatile {
 		c.retirePrimaryVolatileRefLocked(prev)
 	}

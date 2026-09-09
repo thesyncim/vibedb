@@ -740,11 +740,10 @@ func TestFilePrimaryOverlayFoldStatsExcludeDeviceCheckpoints(t *testing.T) {
 		}
 		before := collection.Stats()
 		if err := collection.Update(func(batch *WriteBatch) error {
-			// Existing-key Updates stay on the ordinary overlay. An insert
-			// declines to COW, which must still barrier-fold the pending Put.
-			return batch.Put(
-				[]byte("fold-insert"), []byte(`{"fold":"inside-batch"}`),
-			)
+			// Existing-key Updates stay on the ordinary overlay. A batch
+			// delete declines to COW, which must still barrier-fold the
+			// pending Put.
+			return batch.Delete([]byte(keys[1]))
 		}); err != nil {
 			t.Fatal(err)
 		}

@@ -461,3 +461,50 @@ func BenchmarkExactPackOpen(b *testing.B) {
 		})
 	}
 }
+
+func TestExactPackBatchInsertOverlays(t *testing.T) {
+	indexes := exactPackIntegrationIndexes()
+	seedKeys, seedDocuments := exactOverlapCorpus(t, 1, 8, 256)
+	path := filepath.Join(t.TempDir(), "exact-pack-insert-overlay.vibe")
+	exactOverlapBuild(t, path, seedKeys, seedDocuments, indexes)
+	collection, file := exactOverlapOpen(t, path, indexes)
+	defer func() { _ = collection.Close(); _ = file.Close() }()
+	router := collection.primaryRouter.Load()
+	if router == nil || router.Len() == 0 {
+		t.Fatal("missing seed leaf")
+	}
+	route, ok := router.RouteAtRank(0)
+	if !ok {
+		t.Fatal("missing seed route")
+	}
+	t.Logf("seed leaves=%d ref.len=%d max=%d",
+		router.Len(), route.Ref.Length, storeio.CommonPrimaryLeafMaxExtentBytes)
+	const insertCount = 8
+	keys, documents := exactOverlapCorpus(t, insertCount+1, 8, 256)
+	if err := collection.Update(func(batch *WriteBatch) error {
+		for i := range insertCount {
+			if err := batch.Put([]byte(keys[i+1]), documents[i+1]); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("after pending=%v parents=%d splits=%d len=%d",
+		collection.primaryUnifiedOverlay.hasPending(),
+		len(collection.primaryPendingParents),
+		collection.Stats().PrimaryLeafSplits,
+		collection.Len(),
+	)
+	if !collection.primaryUnifiedOverlay.hasPending() {
+		t.Fatal("small pack insert did not stay on row overlay")
+	}
+	if len(collection.primaryPendingParents) != 0 {
+		t.Fatal("small pack insert dirtied compact leaves")
+	}
+	got, found, err := collection.AppendRaw(nil, []byte(keys[insertCount]))
+	if err != nil || !found || !bytes.Equal(got, documents[insertCount]) {
+		t.Fatalf("last inserted row found=%v err=%v", found, err)
+	}
+}

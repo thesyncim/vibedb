@@ -171,6 +171,12 @@ func TestDurableUniqueIndexBatchUsesFinalImages(t *testing.T) {
 			err, store.ErrUniqueIndexViolation)
 	}
 	if err := collection.Update(func(batch *WriteBatch) error {
+		return batch.Put([]byte("d"), []byte(`{"u":"x"}`))
+	}); !errors.Is(err, store.ErrUniqueIndexViolation) {
+		t.Fatalf("insert overlay unique conflict = %v, want %v",
+			err, store.ErrUniqueIndexViolation)
+	}
+	if err := collection.Update(func(batch *WriteBatch) error {
 		return batch.Put([]byte("c"), []byte(`{"u":{}}`))
 	}); !errors.Is(err, store.ErrIndexScalar) {
 		t.Fatalf("batch container = %v, want %v", err, store.ErrIndexScalar)

@@ -598,6 +598,17 @@ type Collection struct {
 	batchPrimaryReplacements     []storeio.CommonPrimaryUnifiedReplacement
 	batchOverlayMutations        []primaryUnifiedOverlayBatchMutation
 	batchPrimarySplitKey         []byte
+	batchOverlayFilledEmpty      []storeio.ResidentPrimaryRoute
+	batchOverlayPlanned          bool
+	// absorbOverlayOnStructural is set by batch topology when the only pending
+	// overlay belongs to the leaf being split. The structural commit applies
+	// those rows into the replacement leaves and marks the overlay folded
+	// instead of checkpoint-folding an intermediate leaf first.
+	absorbOverlayOnStructural bool
+	// absorbOverlayOnCOW folds one pending overlay bucket into the copy-on-write
+	// leaf image so a full overlay window does not checkpoint before the
+	// compressed leaf is published dirty.
+	absorbOverlayOnCOW bool
 	// The overflow pre-plan lays every new chain below the rewritten leaves and
 	// records the exact visible high-water marks. These are published only after
 	// all chains, leaves, exact-index records, and the WAL fence have succeeded.
