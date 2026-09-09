@@ -23,15 +23,18 @@ type residentRouteEntry struct {
 	cell  *residentRouteCell
 }
 type residentRouteNode struct {
-	leaves      []residentRouteEntry
-	children    []*residentRouteNode
-	counts      []int
-	first       []byte
-	total       int
-	bytes       int
-	firstPacked uint64
-	cellArena   []residentRouteCell
-	fenceArena  []byte
+	leaves       []residentRouteEntry
+	children     []*residentRouteNode
+	counts       []int
+	first        []byte
+	total        int
+	bytes        int
+	firstPacked  uint64
+	searchKeys   []uint64
+	searchPrefix []byte
+	searchSkip   int
+	cellArena    []residentRouteCell
+	fenceArena   []byte
 }
 
 func newResidentRouteLeaf(entries []residentRouteEntry) *residentRouteNode {
@@ -41,7 +44,8 @@ func newResidentRouteLeaf(entries []residentRouteEntry) *residentRouteNode {
 		n.first = entries[0].fence
 		n.firstPacked = packLexicalWindow(n.first)
 	}
-	n.bytes = int(unsafe.Sizeof(*n)) + cap(n.leaves)*int(unsafe.Sizeof(residentRouteEntry{}))
+	n.initSearch(len(owned), func(i int) []byte { return owned[i].fence })
+	n.bytes = int(unsafe.Sizeof(*n)) + cap(n.leaves)*int(unsafe.Sizeof(residentRouteEntry{})) + cap(n.searchKeys)*8
 	// Structural images may share these immutable fences and coherent cells.
 	// Count their logical reachable size per image, which is conservative when
 	// multiple live snapshots share the same allocation.
@@ -58,13 +62,66 @@ func newResidentRouteBranch(children []*residentRouteNode) *residentRouteNode {
 		n.first = children[0].first
 		n.firstPacked = children[0].firstPacked
 	}
+	n.initSearch(len(owned), func(i int) []byte { return owned[i].first })
 	for i, c := range children {
 		n.total += c.total
 		n.counts[i] = n.total
 		n.bytes += c.bytes
 	}
-	n.bytes += int(unsafe.Sizeof(*n)) + cap(n.children)*int(unsafe.Sizeof((*residentRouteNode)(nil))) + cap(n.counts)*int(unsafe.Sizeof(int(0)))
+	n.bytes += int(unsafe.Sizeof(*n)) + cap(n.children)*int(unsafe.Sizeof((*residentRouteNode)(nil))) + cap(n.counts)*int(unsafe.Sizeof(int(0))) + cap(n.searchKeys)*8
 	return n
+}
+
+func (n *residentRouteNode) initSearch(count int, fence func(int) []byte) {
+	n.searchKeys = make([]uint64, count)
+	first := 0
+	for first < count && len(fence(first)) == 0 {
+		first++
+	}
+	if first == count {
+		return
+	}
+	a, b := fence(first), fence(count-1)
+	for n.searchSkip < len(a) && n.searchSkip < len(b) && a[n.searchSkip] == b[n.searchSkip] {
+		n.searchSkip++
+	}
+	n.searchPrefix = a[:n.searchSkip]
+	for i := range count {
+		f := fence(i)
+		if len(f) >= n.searchSkip {
+			n.searchKeys[i] = packLexicalWindow(f[n.searchSkip:])
+		}
+	}
+}
+
+func (n *residentRouteNode) searchFloor(key []byte, count int, fence func(int) []byte) int {
+	if n.searchSkip != 0 {
+		head := key
+		if len(head) > n.searchSkip {
+			head = head[:n.searchSkip]
+		}
+		if c := bytes.Compare(head, n.searchPrefix); c != 0 {
+			if c < 0 {
+				return 0
+			}
+			return count - 1
+		}
+		if len(key) < n.searchSkip {
+			return 0
+		}
+	}
+	window := packLexicalWindow(key[n.searchSkip:])
+	lo, hi := 0, count
+	for lo < hi {
+		m := int(uint(lo+hi) >> 1)
+		packed := n.searchKeys[m]
+		if packed < window || packed == window && bytes.Compare(fence(m), key) <= 0 {
+			lo = m + 1
+		} else {
+			hi = m
+		}
+	}
+	return max(0, lo-1)
 }
 
 func buildResidentRouteTree(entries []residentRouteEntry) *residentRouteNode {
@@ -115,34 +172,14 @@ func (n *residentRouteNode) floor(key []byte) (residentRouteEntry, int, bool) {
 		return residentRouteEntry{}, 0, false
 	}
 	base := 0
-	packed := packLexicalWindow(key)
 	for len(n.children) != 0 {
-		lo, hi := 0, len(n.children)
-		for lo < hi {
-			m := (lo + hi) / 2
-			if n.children[m].firstPacked < packed || n.children[m].firstPacked == packed && bytes.Compare(n.children[m].first, key) <= 0 {
-				lo = m + 1
-			} else {
-				hi = m
-			}
-		}
-		i := max(0, lo-1)
+		i := n.searchFloor(key, len(n.children), func(i int) []byte { return n.children[i].first })
 		if i > 0 {
 			base += n.counts[i-1]
 		}
 		n = n.children[i]
 	}
-	lo, hi := 0, len(n.leaves)
-	for lo < hi {
-		m := (lo + hi) / 2
-		mp := packLexicalWindow(n.leaves[m].fence)
-		if mp < packed || mp == packed && bytes.Compare(n.leaves[m].fence, key) <= 0 {
-			lo = m + 1
-		} else {
-			hi = m
-		}
-	}
-	i := max(0, lo-1)
+	i := n.searchFloor(key, len(n.leaves), func(i int) []byte { return n.leaves[i].fence })
 	return n.leaves[i], base + i, true
 }
 
@@ -194,7 +231,8 @@ func (r *ResidentPrimaryRouter) buildPersistentTree() {
 		}
 		n.first = n.leaves[0].fence
 		n.firstPacked = packLexicalWindow(n.first)
-		n.bytes = int(unsafe.Sizeof(*n)) + cap(n.leaves)*int(unsafe.Sizeof(residentRouteEntry{})) + cap(n.cellArena)*int(unsafe.Sizeof(residentRouteCell{})) + cap(n.fenceArena)
+		n.initSearch(len(n.leaves), func(i int) []byte { return n.leaves[i].fence })
+		n.bytes = int(unsafe.Sizeof(*n)) + cap(n.leaves)*int(unsafe.Sizeof(residentRouteEntry{})) + cap(n.cellArena)*int(unsafe.Sizeof(residentRouteCell{})) + cap(n.fenceArena) + cap(n.searchKeys)*8
 		leaves = append(leaves, n)
 	}
 	r.tree = residentTreeRoot(leaves)

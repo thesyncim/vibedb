@@ -134,6 +134,7 @@ func BenchmarkFilePrimaryBatch64AppendTailScaling(b *testing.B) {
 			b.ReportMetric(float64(b.Elapsed().Nanoseconds())/rows, "final-flush-ns/row")
 			b.ReportMetric(float64(flushElapsed.Nanoseconds()), "flush-ns")
 			b.ReportMetric(float64(after.PrimaryLeafSplits-base.PrimaryLeafSplits), "splits")
+			b.ReportMetric(float64(after.DeviceBytes-base.DeviceBytes), "device-B-total")
 			b.ReportMetric(float64(after.DeviceBytes-base.DeviceBytes)/rows, "device-B/row")
 		})
 	}
