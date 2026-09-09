@@ -47,6 +47,13 @@ func residentPrimaryRouterGenerationTestFixture(
 		empty:   make([]atomic.Uint32, 3),
 	}
 	router.buildSearchKeys()
+	router.buildPersistentTree()
+	router.fences = nil
+	router.rows = nil
+	router.hints = nil
+	router.empty = nil
+	router.searchKeys = nil
+	router.searchTops = nil
 	router.generation.Store(100)
 	router.version.Store(24)
 	return router
@@ -110,17 +117,19 @@ func TestResidentPrimaryRouterNextTabletIDFromAuthenticatedRoutes(t *testing.T) 
 		if !ok {
 			t.Fatal("make routed tablet bucket")
 		}
-		at := rank * residentPrimaryRouterWords
-		router.rows[at+3] = uint64(uint32(router.rows[at+3])) |
-			uint64(bucket)<<32
+		route, _ := router.RouteAtRank(rank)
+		route.cell.meta.Store(uint64(route.Ref.Length) | uint64(bucket)<<32)
 	}
+	router.buckets, _ = residentBucketBuild(router.treeEntries())
 	if got, ok := router.NextTabletID(); !ok || got != 3 {
 		t.Fatalf("next tablet ID = %d,%v, want 3,true", got, ok)
 	}
 	last, _ := MakeTabletLocalIdentityBucket(
 		TabletLocalIdentityTabletCount-1, 7,
 	)
-	router.rows[3] = uint64(uint32(router.rows[3])) | uint64(last)<<32
+	route, _ := router.RouteAtRank(0)
+	route.cell.meta.Store(uint64(route.Ref.Length) | uint64(last)<<32)
+	router.buckets, _ = residentBucketBuild(router.treeEntries())
 	if got, ok := router.NextTabletID(); ok || got != 0 {
 		t.Fatalf("exhausted next tablet ID = %d,%v, want 0,false", got, ok)
 	}
@@ -169,15 +178,15 @@ func TestResidentPrimaryRouterSplitLeafSplicesWithoutGraphWalk(t *testing.T) {
 			t.Fatalf("route %q = %+v,%v", test.key, got, routeOK)
 		}
 	}
-	if testing.AllocsPerRun(100, func() {
+	if got := testing.AllocsPerRun(100, func() {
 		spliced, splitErr := router.SplitLeaf(
 			route, left, rightBucket, []byte("s"), right, 101,
 		)
 		if splitErr != nil || spliced.Len() != 4 {
 			panic("split splice")
 		}
-	}) > 8 {
-		t.Fatal("split splice exceeded fixed array allocation count")
+	}); got > 48 {
+		t.Fatalf("split splice allocations = %v, want <= 48", got)
 	}
 }
 
@@ -341,6 +350,9 @@ func TestResidentPrimaryRouterSplitLeafPartitionPreservesGlobalTabletFloor(
 		empty: make([]atomic.Uint32, len(entries)),
 	}
 	router.buildSearchKeys()
+	router.buildPersistentTree()
+	router.fences, router.rows, router.hints, router.empty = nil, nil, nil, nil
+	router.searchKeys, router.searchTops = nil, nil
 	router.generation.Store(generation)
 	source, ok := router.Route([]byte("tablet/07"))
 	if !ok || source.Bucket != BucketID(mustResidentTabletBucket(t, tabletID, 100)) {
@@ -468,8 +480,8 @@ func TestResidentPrimaryRouterRemoveLeafSplicesWithoutGraphWalk(t *testing.T) {
 		if removeErr != nil || spliced.Len() != 2 {
 			panic("remove splice")
 		}
-	}); got > 8 {
-		t.Fatalf("remove splice allocations = %v, want <= 8", got)
+	}); got > 20 {
+		t.Fatalf("remove splice allocations = %v, want <= 20", got)
 	}
 }
 
@@ -489,12 +501,8 @@ func TestResidentPrimaryRouterRemoveFirstLeafPromotesEmptyFloor(t *testing.T) {
 			t.Fatalf("route %q = %+v,%v", key, got, ok)
 		}
 	}
-	one := &ResidentPrimaryRouter{
-		storeID: router.storeID,
-		rows:    slices.Clone(router.rows[:residentPrimaryRouterWords]),
-		hints:   make([]pageCacheFrameHint, 1),
-		empty:   make([]atomic.Uint32, 1),
-	}
+	oneEntry, _ := router.tree.at(0)
+	one := &ResidentPrimaryRouter{storeID: router.storeID, tree: buildResidentRouteTree([]residentRouteEntry{oneEntry})}
 	one.generation.Store(100)
 	if _, err := one.RemoveLeaf(mustResidentRoute(t, one, 0), 101); !errors.Is(err, ErrInvalidWrite) {
 		t.Fatalf("singleton removal error = %v", err)

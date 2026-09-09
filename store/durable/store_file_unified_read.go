@@ -451,7 +451,7 @@ func (s *Snapshot) AppendField(
 			"%w: resident primary route", storeio.ErrSegmentedTabletRouterCorrupt,
 		)
 	}
-	if router.Generation() != state.root.Generation {
+	if router.Generation() != state.root.Generation || route.Ref.Generation > state.root.Generation {
 		return s.appendFieldFallback(dst, p, key)
 	}
 	leafLease, err := router.AcquireLeaf(s.collection.cache, route)

@@ -486,7 +486,7 @@ func (s *Snapshot) PrefetchKeys(keys [][]byte) (int, error) {
 	}
 	for _, key := range keys {
 		route, ok := router.Route(key)
-		if !ok || route.Ref == (storeio.PageRef{}) {
+		if !ok || route.Ref == (storeio.PageRef{}) || route.Ref.Generation > s.state.root.Generation {
 			continue
 		}
 		refs[count] = route.Ref

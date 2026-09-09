@@ -105,6 +105,14 @@ func newReader(r io.Reader, bufSize int) *reader {
 	return &reader{br: bufio.NewReaderSize(r, bufSize)}
 }
 
+// buffered reports how many bytes are already sitting in this reader's
+// buffer, with no I/O. It costs nothing and never blocks — unlike a byte
+// count on the underlying kernel socket, which needs a syscall this reader
+// otherwise never makes.
+func (r *reader) buffered() int {
+	return r.br.Buffered()
+}
+
 // body returns storage of exactly size bytes to read a message into.
 //
 // The split at retainedBuffer is the whole point: an ordinary message reuses
