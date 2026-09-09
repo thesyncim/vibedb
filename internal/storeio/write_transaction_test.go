@@ -294,17 +294,17 @@ func TestWriteTransactionAllowsPackedPrimaryExtents(t *testing.T) {
 	// leaf allocation failed with ErrTooManyPages even though MaxPagesPerBatch
 	// still had room.
 	committer, err := NewCommitter(file, DeviceOptions{
-		Backend: BackendPortable, BufferCount: 12,
+		Backend: BackendPortable, BufferCount: 16,
 		BufferSize: max(os.Getpagesize(), 3*int(testSuperblockPageSize)),
 	}, CommitterOptions{
-		QueueSlots: 4, MaxPagesPerBatch: 8, GroupLimit: 2,
+		QueueSlots: 4, MaxPagesPerBatch: 12, GroupLimit: 2,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer committer.Close()
 	tx, err := BeginWriteTransaction(
-		committer, nil, 8, WriteTransactionOptions{
+		committer, nil, 12, WriteTransactionOptions{
 			StoreID: testStoreID, Generation: 1,
 			PageSize:      testSuperblockPageSize,
 			FileEnd:       testMutableStoreDataStart(testSuperblockPageSize),
@@ -317,6 +317,7 @@ func TestWriteTransactionAllowsPackedPrimaryExtents(t *testing.T) {
 	for _, kind := range []PageKind{
 		PageOverflow, PagePrimaryCatalog, PagePrimaryLocator,
 		PageTabletRoute, PagePrimaryAnchor, PagePrimaryLeaf, PagePrimaryExactLeaf,
+		PagePrimaryExactPack, PagePrimaryExactInventory,
 	} {
 		if _, err := tx.Allocate(
 			kind, 2*testSuperblockPageSize, 0,
@@ -333,6 +334,9 @@ func TestWriteTransactionAllowsPackedPrimaryExtents(t *testing.T) {
 		PagePrimaryLeaf, 3*testSuperblockPageSize, 0,
 	); err != nil {
 		t.Fatalf("exact compact primary extent rejected: %v", err)
+	}
+	if _, err := tx.Allocate(PagePrimaryExactPack, 3*testSuperblockPageSize, 0); err != nil {
+		t.Fatalf("12 KiB exact pack extent rejected: %v", err)
 	}
 	if err := tx.Abort(); err != nil {
 		t.Fatal(err)

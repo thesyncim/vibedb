@@ -72,6 +72,19 @@ func IndexTermLeafCutBudget(maxPageSize uint32) int {
 	return budget
 }
 
+// IndexTermLeafPackCutBudget is the leaf budget that still fits one
+// uncompressed singleton exact pack, including pack header and member
+// directory overhead. Production exact indexes cut to this so every leaf
+// can be packed without a PagePrimaryExactLeaf fallback.
+func IndexTermLeafPackCutBudget(maxPageSize uint32) int {
+	budget := IndexTermLeafCutBudget(maxPageSize)
+	packLeaf := PrimaryExactPackMaxPayloadBytes - PrimaryExactPackHeaderBytes - PrimaryExactPackMemberBytes
+	if budget > packLeaf {
+		budget = packLeaf
+	}
+	return budget
+}
+
 // IndexTermLeafRunCut is rule 1: does this term's route hash start a new run?
 // The hash is the StoreID-keyed SipHash the term key record already carries,
 // so run boundaries differ per store but are stable per (store, term).

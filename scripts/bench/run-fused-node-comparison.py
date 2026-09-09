@@ -308,13 +308,16 @@ def render_arg(value, substitutions):
     return rendered
 
 
-def schema_files(destination, tables):
+def schema_files(destination, tables, indexes="none"):
     schema = destination / "schema"
     schema.mkdir(mode=0o700, parents=True)
+    extra = ""
+    if indexes in ("pack-leading", "pack-nonleading"):
+        extra = ", shared TEXT NOT NULL, a TEXT NOT NULL, b TEXT NOT NULL"
     for table in tables:
         (schema / f"{table}.sql").write_text(
             f"CREATE TABLE {table} (id TEXT PRIMARY KEY, bucket INTEGER NOT NULL, "
-            "score INTEGER NOT NULL, payload TEXT NOT NULL)\n")
+            f"score INTEGER NOT NULL, payload TEXT NOT NULL{extra})\n")
     return schema
 
 
@@ -879,7 +882,9 @@ def run_engine(args, cell, engine, order, binaries, destination, schema, arch):
                   "-repetitions", str(args.repetitions), "-clients", cell["clients"],
                   "-tables", ",".join(cell["tables"]), "-workloads", cell["workloads"],
                   "-group-distribution", cell["group_distribution"], "-skew-percent", str(args.skew_percent),
-                  "-physical-nodes", str(9 if engine == "parent" else cell["physical_nodes"]), "-output", "/evidence/report.json"]
+                  "-physical-nodes", str(9 if engine == "parent" else cell["physical_nodes"]), "-output", "/evidence/report.json",
+                  "-indexes", args.indexes, "-shared-bytes", str(args.shared_bytes),
+                  "-shared-cardinality", str(args.shared_cardinality)]
         if engine == "candidate" and cell["groups"] > 1:
             client.extend(["-require-existing-tables"])
         result["setup"] = {"client_binary": "/bench/rf3-sqlbench", "phase": "setup",
@@ -1192,6 +1197,10 @@ def parser():
     value.add_argument("--clients", default="1,8")
     value.add_argument("--multigroup-clients", default="8")
     value.add_argument("--rows", type=int, default=8192)
+    value.add_argument("--indexes", choices=("none", "pack-leading", "pack-nonleading"), default="none",
+                       help="pack-* adds a low-cardinality shared TEXT field and two compound indexes")
+    value.add_argument("--shared-bytes", type=int, default=256)
+    value.add_argument("--shared-cardinality", type=int, default=8)
     value.add_argument("--operations", type=int, default=20000)
     value.add_argument("--scans", type=int, default=2000)
     value.add_argument("--warmup", type=int, default=1000)
@@ -1217,9 +1226,12 @@ def main(argv=None):
     args = parser().parse_args(argv)
     destination = require_new_directory(args.output)
     COMMAND_LOG = destination / "control-commands.jsonl"
-    if not (64 <= args.rows <= 1000000 and 1 <= args.operations <= 1000000 and 1 <= args.scans <= 100000 and
+    if not (64 <= args.rows <= 10000000 and 1 <= args.operations <= 1000000 and 1 <= args.scans <= 100000 and
             0 <= args.warmup <= 100000 and 1 <= args.repetitions <= 20 and args.ready_timeout >= 1):
         raise RunnerError("rows/operations/scans/repetitions are invalid")
+    if args.indexes in ("pack-leading", "pack-nonleading") and not (
+            8 <= args.shared_bytes <= 256 and 2 <= args.shared_cardinality <= 1024):
+        raise RunnerError("pack-index shared field is invalid")
     if args.groups < 1 or args.groups > 63 or not 51 <= args.skew_percent <= 99:
         raise RunnerError("groups or skew-percent are invalid")
     repo = args.repo.resolve()
@@ -1320,7 +1332,7 @@ def main(argv=None):
                     for cell in cells:
                         for engine in engine_sequences[order]:
                             run_dir = destination / cell["id"] / order / engine
-                            schema = schema_files(run_dir, cell["tables"])
+                            schema = schema_files(run_dir, cell["tables"], args.indexes)
                             result = run_engine(args, cell, engine, order, bins, run_dir, schema, arch)
                             result["dataset"] = {
                                 "rows_per_table": args.rows,

@@ -4,6 +4,8 @@ Run from the checkout being measured:
 
 ```sh
 python3 scripts/bench/run-crdb-sql-comparison.py /absolute/new/evidence-directory
+python3 scripts/bench/run-crdb-sql-comparison.py /absolute/new/indexed-evidence \
+  --indexes pack-leading --rows 10000000 --timeout 4h --no-verify-every-trial --seed-batch 64
 ```
 
 Go 1.27, Docker, and Python 3 are required. The runner builds VibeDB with
@@ -36,14 +38,23 @@ SQL memory allowance; VibeDB uses its shipped bounded working sets. The shared
 are not claimed equivalent. Neither engine has disabled fsync or replication.
 
 The shared client creates the same table with a text primary key, an integer
-bucket, an integer score, and the same repeated, compressible 256-byte ASCII
-text payload in every row. There are 8,192 initial
-rows and no secondary indexes. VibeDB's table occupies one data group. CockroachDB retains its default range
+bucket, an integer score, and a 256-byte ASCII text payload. The default 8,192-row
+comparison has no secondary indexes. Pass `--indexes pack-leading` (or
+`pack-nonleading`) to add a deterministic low-cardinality `shared` TEXT field plus
+`a`/`b` and two compound indexes `(bucket, shared, a)` and `(bucket, shared, b)`
+(or the non-leading order). That is the overlap-census shape used to measure
+VibeDB exact-index packing against CockroachDB secondary indexes. Use
+`--shared-cardinality 8` and `--shared-bytes 256` for the strong packing arm, or
+`--indexes none` for the original PK-only schema. `--rows` accepts up to
+10,000,000; 10M runs should also pass `--timeout 4h --no-verify-every-trial`.
+VibeDB's table occupies one data group. CockroachDB retains its default range
 boundaries; its setup verifies all voting replica counts equal three.
 CockroachDB gets an explicit `ANALYZE` after loading. VibeDB currently has no
 shipped distributed ANALYZE command; it uses the available optimizer metadata.
-This schema does not establish anything about secondary-index update locality,
-skewed multi-partition joins, correlated predicates, or planner search quality.
+The PK-only schema does not establish anything about secondary-index update
+locality. The pack-index variant does compare compound exact-index space and
+seed write cost, still without claiming planner quality, skewed multi-partition
+joins, or correlated predicates.
 
 Each operation uses the same unnamed PostgreSQL extended parse/bind/execute
 protocol, text parameters, and text results. VibeDB exposes strings as JSON
@@ -56,8 +67,10 @@ replication proof, and whole-table verification are outside trial timing.
 Workloads: deterministic primary-key hits and misses, 64 consecutive rows from
 a lower key bound, 16 grouped count/sum aggregates, and computed updates of one
 existing key per client. Updates use disjoint client keys, so they do not measure
-contention. Every result is checked; after each trial all four fields of every
-row are verified in bounded pages and the total row count is checked separately.
+contention. Every result is checked; after each trial every stored field of every
+row is verified in bounded pages and the total row count is checked separately.
+The PK-only schema has four fields; pack-index runs also verify `shared`, `a`,
+and `b`.
 Unknown write outcomes are not blindly retried. A failed warmup invalidates the
 workload and is recorded in `verification_error` and the client log.
 

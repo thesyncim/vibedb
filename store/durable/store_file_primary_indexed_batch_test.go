@@ -136,6 +136,129 @@ func TestFilePrimaryIndexedBatchAtomicPublication(t *testing.T) {
 	}
 }
 
+// TestFilePrimaryIndexedBatchStableSlotTermChangeKeepsOverlay pins the
+// Update hot path: existing-key replacements that keep posting slots publish
+// overlay records instead of folding a fresh exact epoch.
+func TestFilePrimaryIndexedBatchStableSlotTermChangeKeepsOverlay(t *testing.T) {
+	for _, lane := range primaryIndexedBatchLanes() {
+		t.Run(lane.name, func(t *testing.T) {
+			coll, file, _ := openPrimaryBatchStore(t, lane.options)
+			defer coll.Close()
+			defer file.Close()
+			for i, country := range []string{"old", "stay", "keep"} {
+				key := fmt.Sprintf("indexed-%d", i)
+				doc := []byte(fmt.Sprintf(`{"country":%q,"i":%d}`, country, i))
+				if _, err := coll.Put([]byte(key), doc); err != nil {
+					t.Fatalf("seed %s: %v", key, err)
+				}
+			}
+			if err := coll.Flush(); err != nil {
+				t.Fatal(err)
+			}
+			if coll.primaryEpoch == nil || !coll.primaryEpoch.overlayEmpty() {
+				t.Fatal("seed fold left an overlay window")
+			}
+			epoch := coll.primaryEpoch
+			if err := coll.Update(func(batch *WriteBatch) error {
+				if err := batch.Put(
+					[]byte("indexed-0"), []byte(`{"country":"new","i":0}`),
+				); err != nil {
+					return err
+				}
+				return batch.Put(
+					[]byte("indexed-1"), []byte(`{"country":"new","i":1}`),
+				)
+			}); err != nil {
+				t.Fatalf("indexed Update: %v", err)
+			}
+			if coll.primaryEpoch != epoch {
+				t.Fatal("stable-slot term change swapped a folded exact epoch")
+			}
+			if coll.primaryEpoch.overlayEmpty() {
+				t.Fatal("stable-slot term change emitted no overlay records")
+			}
+			if !coll.primaryUnifiedOverlay.hasPending() {
+				t.Fatal("existing indexed Update did not publish row overlay")
+			}
+			if len(coll.primaryPendingParents) != 0 {
+				t.Fatal("existing indexed Update dirtied primary leaves")
+			}
+			newCountry := primaryExactTestNeedle(t, `"new"`)
+			got := primaryExactTestKeys(t, coll, "country", newCountry)
+			slices.Sort(got)
+			if !slices.Equal(got, []string{"indexed-0", "indexed-1"}) {
+				t.Fatalf("live new postings = %v", got)
+			}
+			if got := primaryExactTestKeys(t, coll, "country", primaryExactTestNeedle(t, `"old"`)); len(got) != 0 {
+				t.Fatalf("live retained old postings = %v", got)
+			}
+			if err := coll.Flush(); err != nil {
+				t.Fatal(err)
+			}
+			if !coll.primaryEpoch.overlayEmpty() {
+				t.Fatal("checkpoint left overlay records")
+			}
+			if coll.primaryUnifiedOverlay.hasPending() {
+				t.Fatal("checkpoint left row overlay")
+			}
+			got = primaryExactTestKeys(t, coll, "country", newCountry)
+			slices.Sort(got)
+			if !slices.Equal(got, []string{"indexed-0", "indexed-1"}) {
+				t.Fatalf("post-checkpoint new postings = %v", got)
+			}
+		})
+	}
+}
+
+// TestFilePrimaryIndexedBatchExactOverlayPressureKeepsRowOverlay fills the
+// exact overlay past its record cap with slot-stable term changes. The batch
+// path must fold and keep using row overlay instead of dirtying compact
+// primary leaves.
+func TestFilePrimaryIndexedBatchExactOverlayPressureKeepsRowOverlay(t *testing.T) {
+	lane := primaryIndexedBatchLanes()[0]
+	coll, file, _ := openPrimaryBatchStore(t, lane.options)
+	defer coll.Close()
+	defer file.Close()
+	key := []byte("pressure-0")
+	if _, err := coll.Put(key, []byte(`{"country":"c0","i":0}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := coll.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if len(coll.primaryPendingParents) != 0 {
+		t.Fatal("seed flush left dirty primary leaves")
+	}
+	updates := primaryExactOverlayTermRecordCap/2 + 32
+	for i := 1; i <= updates; i++ {
+		doc := []byte(fmt.Sprintf(`{"country":"c%d","i":0}`, i))
+		if err := coll.Update(func(batch *WriteBatch) error {
+			return batch.Put(key, doc)
+		}); err != nil {
+			t.Fatalf("update %d: %v", i, err)
+		}
+		if len(coll.primaryPendingParents) != 0 {
+			t.Fatalf("update %d dirtied primary leaves", i)
+		}
+	}
+	if coll.primaryOverlayPressureFolds.Load() == 0 &&
+		coll.automaticCheckpoints.Load() == 0 {
+		t.Fatal("exact overlay pressure did not fold and retry overlay")
+	}
+	want := fmt.Sprintf(`{"country":"c%d","i":0}`, updates)
+	got, found, err := coll.AppendRaw(nil, key)
+	if err != nil || !found || string(got) != want {
+		t.Fatalf("final value found=%v err=%v got=%s want=%s", found, err, got, want)
+	}
+	gotKeys := primaryExactTestKeys(
+		t, coll, "country",
+		primaryExactTestNeedle(t, fmt.Sprintf(`"c%d"`, updates)),
+	)
+	if len(gotKeys) != 1 || gotKeys[0] != "pressure-0" {
+		t.Fatalf("final posting = %v", gotKeys)
+	}
+}
+
 // TestFilePrimaryIndexedBatchPrepareFailureRollsBackPostings proves that index
 // derivation remains on the prepare side of the publication point. A malformed
 // sibling rejects both primary and posting changes and does not poison the file.

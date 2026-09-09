@@ -88,3 +88,92 @@ func TestVisitPrimaryExactIndexRefsStreamsAuthenticatedGraph(t *testing.T) {
 		t.Fatalf("visited %d pages, want 7", len(seen))
 	}
 }
+
+func TestVisitPrimaryExactIndexRefsVisitsSharedPackOnce(t *testing.T) {
+	const pageSize = uint32(4096)
+	layout, err := MutableStoreLayout(pageSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.CreateTemp(t.TempDir(), "exact-visit-pack-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	nextOffset := layout.DataStart
+	nextID := uint64(2)
+	ref := func(kind PageKind) PageRef {
+		result := PageRef{Offset: nextOffset, LogicalID: nextID, Generation: 1, Length: pageSize, Kind: kind}
+		nextOffset += uint64(pageSize)
+		nextID++
+		return result
+	}
+	packRef := ref(PagePrimaryExactPack)
+	catalog := ref(PagePrimaryExactCatalog)
+	root := ref(PagePrimaryExactRoot)
+	write := func(ref PageRef, page []byte) {
+		t.Helper()
+		if _, err := file.WriteAt(page, int64(ref.Offset)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	members := [][]byte{
+		make([]byte, indexTermLeafHeaderBytes),
+		append([]byte{1}, make([]byte, indexTermLeafHeaderBytes-1)...),
+	}
+	var encoder PrimaryExactPackEncoder
+	if err := encoder.Prepare(2, indexTermLeafHeaderBytes*2); err != nil {
+		t.Fatal(err)
+	}
+	for _, member := range members {
+		if err := encoder.Append(0, member); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pack, err := encoder.EncodeRaw(make([]byte, 0, 1024), 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := make([]byte, pageSize)
+	if _, err := EncodePrimaryExactPackPage(page, testStoreID, 1, packRef.LogicalID, pack); err != nil {
+		t.Fatal(err)
+	}
+	write(packRef, page)
+	entries := []PrimaryExactCatalogEntry{
+		{Leaf: packRef, Member: 0, Prefix: []byte("a")},
+		{Leaf: packRef, Member: 1, Prefix: []byte("b")},
+	}
+	if _, err := EncodePrimaryExactCatalogLeafPage(page, testStoreID, 1, catalog.LogicalID, entries); err != nil {
+		t.Fatal(err)
+	}
+	write(catalog, page)
+	if _, err := EncodePrimaryExactRootPage(page, testStoreID, 1, root.LogicalID, []PrimaryExactRootEntry{{Catalog: catalog, LeafCount: 2}}); err != nil {
+		t.Fatal(err)
+	}
+	write(root, page)
+	if err := file.Truncate(int64(nextOffset)); err != nil {
+		t.Fatal(err)
+	}
+	bounds := PrimaryExactIndexBounds{StoreID: testStoreID, Generation: 1, FileEnd: nextOffset, NextLogicalID: nextID, AllocationQuantum: pageSize, MaxPageSize: pageSize, IndexCount: 1}
+	cache, err := NewPageCache(file, PageCacheOptions{PageSize: int(pageSize), MaxPageSize: int(pageSize), ResidentBytes: 8 * int64(pageSize), StoreID: testStoreID, ReadConcurrency: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cache.Close()
+	seen := make(map[PageRef]struct{}, 3)
+	if err := VisitPrimaryExactIndexRefs(cache, root, bounds, func(ref PageRef) error {
+		if _, duplicate := seen[ref]; duplicate {
+			t.Fatalf("duplicate ref %+v", ref)
+		}
+		seen[ref] = struct{}{}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(seen) != 3 {
+		t.Fatalf("visited %d pages, want 3", len(seen))
+	}
+	if _, ok := seen[packRef]; !ok {
+		t.Fatal("shared pack was not visited")
+	}
+}

@@ -4,6 +4,7 @@ go 1.27
 
 require (
 	github.com/cespare/xxhash/v2 v2.3.0
+	github.com/pierrec/lz4/v4 v4.1.28
 	github.com/thesyncim/vibejson v0.1.0
 	go.etcd.io/raft/v3 v3.7.0
 	golang.org/x/sys v0.47.0

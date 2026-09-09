@@ -1,0 +1,17 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/store/durable
+cpu: Apple M4 Max
+BenchmarkExactPackExistingUpdate/long/card=8/shared-16         	      20	 194452610 ns/op	      5458 checkpoint-ns	     12205 devB/doc	   3038322 e2e-ns/doc	  37317584 flush-ns	     12205 physical-devB/doc	   3038326 physical-e2e-ns/doc	61872216 B/op	  252806 allocs/op
+BenchmarkExactPackExistingUpdate/long/card=8/shared-16         	      20	 194853233 ns/op	      4208 checkpoint-ns	     12205 devB/doc	   3044582 e2e-ns/doc	  36810875 flush-ns	     12205 physical-devB/doc	   3044585 physical-e2e-ns/doc	61864304 B/op	  252805 allocs/op
+BenchmarkExactPackExistingUpdate/long/card=8/indexed-a-16      	      20	 196955827 ns/op	      8084 checkpoint-ns	     12387 devB/doc	   3077435 e2e-ns/doc	  37616417 flush-ns	     12387 physical-devB/doc	   3077441 physical-e2e-ns/doc	61953955 B/op	  253260 allocs/op
+BenchmarkExactPackExistingUpdate/long/card=8/indexed-a-16      	      20	 196845783 ns/op	      5667 checkpoint-ns	     12387 devB/doc	   3075715 e2e-ns/doc	  44706834 flush-ns	     12387 physical-devB/doc	   3075720 physical-e2e-ns/doc	61930426 B/op	  253258 allocs/op
+BenchmarkExactPackExistingUpdate/long/card=8/unrelated-16      	      20	 197333175 ns/op	      9167 checkpoint-ns	     12320 devB/doc	   3083331 e2e-ns/doc	  37487458 flush-ns	     12320 physical-devB/doc	   3083338 physical-e2e-ns/doc	61840812 B/op	  252881 allocs/op
+BenchmarkExactPackExistingUpdate/long/card=8/unrelated-16      	      20	 196470135 ns/op	      4500 checkpoint-ns	     12320 devB/doc	   3069846 e2e-ns/doc	  36519083 flush-ns	     12320 physical-devB/doc	   3069849 physical-e2e-ns/doc	61869818 B/op	  252885 allocs/op
+BenchmarkExactPackExistingUpdate/long/card=1024/shared-16      	      20	 215154696 ns/op	      6417 checkpoint-ns	     16669 devB/doc	   3361792 e2e-ns/doc	  58741583 flush-ns	     16669 physical-devB/doc	   3361797 physical-e2e-ns/doc	65307456 B/op	  265157 allocs/op
+BenchmarkExactPackExistingUpdate/long/card=1024/shared-16      	      20	 214791362 ns/op	      4875 checkpoint-ns	     16669 devB/doc	   3356115 e2e-ns/doc	  51699667 flush-ns	     16669 physical-devB/doc	   3356119 physical-e2e-ns/doc	65293193 B/op	  265155 allocs/op
+BenchmarkExactPackExistingUpdate/long/card=1024/indexed-a-16   	      20	 215822412 ns/op	      8583 checkpoint-ns	     16477 devB/doc	   3372225 e2e-ns/doc	  50960208 flush-ns	     16477 physical-devB/doc	   3372232 physical-e2e-ns/doc	65324072 B/op	  265173 allocs/op
+BenchmarkExactPackExistingUpdate/long/card=1024/indexed-a-16   	      20	 215772452 ns/op	      9083 checkpoint-ns	     16477 devB/doc	   3371445 e2e-ns/doc	  51528250 flush-ns	     16477 physical-devB/doc	   3371452 physical-e2e-ns/doc	65325749 B/op	  265173 allocs/op
+BenchmarkExactPackExistingUpdate/long/card=1024/unrelated-16   	      20	 215295854 ns/op	      5584 checkpoint-ns	     16586 devB/doc	   3363998 e2e-ns/doc	  51818042 flush-ns	     16586 physical-devB/doc	   3364002 physical-e2e-ns/doc	65294149 B/op	  265169 allocs/op
+BenchmarkExactPackExistingUpdate/long/card=1024/unrelated-16   	      20	 215297942 ns/op	      5250 checkpoint-ns	     16586 devB/doc	   3364030 e2e-ns/doc	  50473416 flush-ns	     16586 physical-devB/doc	   3364034 physical-e2e-ns/doc	65299642 B/op	  265170 allocs/op
+PASS

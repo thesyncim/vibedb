@@ -200,6 +200,12 @@ type Collection struct {
 	// infallible link at publish).
 	exactTermLinkScratch []primaryExactTermLink
 	exactTileLinkScratch []primaryExactTileLink
+	// exactPackEncoder is the writer-owned pack workspace reused across
+	// checkpoints and bulk-equivalent folds so Prepare does not grow a fresh
+	// 64 KiB LZ4 frame on every index. exactPackWire is the matching sealed
+	// pack payload buffer.
+	exactPackEncoder storeio.PrimaryExactPackEncoder
+	exactPackWire    []byte
 	// fold* slices are the streamed checkpoint fold's writer-owned scratch:
 	// the resolved changed-tile set, per-index entry ordering, per-term
 	// overlay tiles, the flat term/posting builder inputs, and the base-key
@@ -572,6 +578,8 @@ type Collection struct {
 	// steady-state cost is the frames it publishes, not the slices it plans with.
 	// batchPrimaryLeafArena holds the finalized image of every touched leaf at
 	// once (they must coexist until the single admit-all step).
+	// batchOldRawArena holds decoded old documents captured during the leaf
+	// merge so exact overlay prep does not re-read them through the graph.
 	batchPrimaryLeaves       []primaryBatchLeaf
 	batchPrimaryMutations    []primaryBatchMutation
 	batchJournalEntries      []storeio.RecoveryBatchEntry
@@ -586,6 +594,9 @@ type Collection struct {
 	batchPrimaryOverflowVolatile []storeio.PageRef
 	batchPrimaryOverflowDurable  []storeio.PageRef
 	batchPrimaryLeafArena        []byte
+	batchOldRawArena             []byte
+	batchPrimaryReplacements     []storeio.CommonPrimaryUnifiedReplacement
+	batchOverlayMutations        []primaryUnifiedOverlayBatchMutation
 	batchPrimarySplitKey         []byte
 	// The overflow pre-plan lays every new chain below the rewritten leaves and
 	// records the exact visible high-water marks. These are published only after
