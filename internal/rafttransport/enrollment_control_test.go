@@ -348,6 +348,115 @@ func TestEnrollmentControlRetriesStaleDirectoryRevision(t *testing.T) {
 	}
 }
 
+// TestEnrollmentControlCertifiesStaticMemberZeroDigest exercises the older
+// topology model where every member of a group - including one not yet
+// active - is declared statically in the manifest at construction, rather
+// than discovered later through EnrollMember (the newer, dynamic physical-
+// node scale-out model). A static member's enrollmentDigest starts zero: it
+// was never dynamically certified, so an AddLearner fanout for it has no
+// prior enrollment to conflict with, and the first EnrollMember must
+// succeed rather than being rejected as if it disagreed with an earlier one.
+// A later attempt with a genuinely different digest must still be rejected.
+func TestEnrollmentControlCertifiesStaticMemberZeroDigest(t *testing.T) {
+	group := testGroup(227)
+	domain := TrustDomain{ClusterID: group.ClusterID, ClusterIncarnation: group.ClusterIncarnation}
+	members := append(enrollmentTestMembers(group),
+		Member{Group: group, ReplicaSetVersion: 1, MemberID: 4, Node: testNode(4), Role: MemberVoter})
+	limits := Limits{MaxGroups: 1, MaxMembers: 4, MaxPeers: 4}
+	peers := enrollmentTestPeers(domain, testNode(1), testNode(2), testNode(3), testNode(4))
+	source, err := NewStaticRegistryWithDirectory(testNode(1), members, peers, 1, limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := NewStaticRegistryWithDirectory(testNode(2), members, peers, 1, limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if node, nodeErr := target.Node(group, 4); nodeErr != nil || node != testNode(4) {
+		t.Fatalf("static member 4 not bound at construction: node=%v err=%v", node, nodeErr)
+	}
+
+	clientKey, _ := source.PhysicalPeer(testNode(2))
+	serverKey, _ := target.PhysicalPeer(testNode(1))
+	service, err := NewEnrollmentControlService(EnrollmentControlServiceOptions{
+		Registry: target, Verifier: EnrollmentVerifierFunc(allowEnrollment),
+		Authorize: func(_ context.Context, connection PeerConnection, _ EnrollmentIntent) error {
+			if connection.PeerIdentity().Node != testNode(1) {
+				return ErrEnrollmentControlUnauthorized
+			}
+			return target.VerifyPeerConnectionBinding(connection)
+		},
+		ReadDeadline: enrollmentDeadline, WriteDeadline: enrollmentDeadline,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &enrollmentTestConnection{
+		identity: PeerIdentity{TrustDomain: domain, Node: testNode(2)},
+		key:      clientKey.ServiceKeyDigest, class: TrafficShardControl,
+	}
+	server := &enrollmentTestConnection{
+		identity: PeerIdentity{TrustDomain: domain, Node: testNode(1)},
+		key:      serverKey.ServiceKeyDigest, class: TrafficShardControl,
+	}
+	clientControl, err := NewEnrollmentControlClient(EnrollmentControlClientOptions{
+		Opener: enrollmentTestOpener{open: func(context.Context, NodeID) (PeerConnection, error) {
+			return client, nil
+		}},
+		Registry: source, ReadDeadline: enrollmentDeadline, WriteDeadline: enrollmentDeadline,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	roster, ok := target.RosterDigest(group)
+	if !ok {
+		t.Fatal("target roster digest missing")
+	}
+	node4 := testNode(4)
+	enrollmentTestStaticMemberKey := sha256.Sum256(append([]byte("enrollment-test-key/"), node4[:]...))
+	serve := func(intent EnrollmentIntent) (EnrollmentAck, error, error) {
+		clientConn, serverConn := net.Pipe()
+		client.Conn, server.Conn = clientConn, serverConn
+		serverDone := make(chan error, 1)
+		go func() { serverDone <- service.Serve(context.Background(), server) }()
+		ack, clientErr := clientControl.EnrollMember(context.Background(), testNode(2), intent)
+		return ack, clientErr, <-serverDone
+	}
+
+	// The physical peer identity for testNode(4) is also already statically
+	// known (its manifest peer-key pin), the same way an already-registered
+	// cold-bootstrap target's certificate is: the intent must certify that
+	// exact identity, not a different one.
+	first := dynamicPeerIntent(target, testNode(4), 227, group, 4, roster)
+	first.Peer.ServiceKeyDigest = enrollmentTestStaticMemberKey
+	firstAck, clientErr, serveErr := serve(first)
+	if clientErr != nil || serveErr != nil {
+		t.Fatalf("first certification of a static member failed: client=%v serve=%v", clientErr, serveErr)
+	}
+	if firstAck.Group != group || firstAck.MemberID != 4 || firstAck.Node != testNode(4) {
+		t.Fatalf("unexpected first ACK: %+v", firstAck)
+	}
+
+	// A replay of the exact same intent is idempotent.
+	replayAck, clientErr, serveErr := serve(first)
+	if clientErr != nil || serveErr != nil {
+		t.Fatalf("replay of the certified intent failed: client=%v serve=%v", clientErr, serveErr)
+	}
+	if replayAck.DirectoryRevision != firstAck.DirectoryRevision {
+		t.Fatalf("replay ACK changed the certified revision: first=%d replay=%d",
+			firstAck.DirectoryRevision, replayAck.DirectoryRevision)
+	}
+
+	// A different digest for the same, now-certified static member must
+	// still be rejected - the zero-digest exception only ever applies once.
+	second := dynamicPeerIntent(target, testNode(4), 228, group, 4, roster)
+	second.Peer.ServiceKeyDigest = enrollmentTestStaticMemberKey
+	second.DirectoryRevision = firstAck.DirectoryRevision
+	if _, _, serveErr = serve(second); !errors.Is(serveErr, ErrEnrollmentConflict) {
+		t.Fatalf("conflicting digest after certification = %v, want ErrEnrollmentConflict", serveErr)
+	}
+}
+
 func TestEnrollmentRequestCanonicalRoundTrip(t *testing.T) {
 	group := testGroup(222)
 	domain := TrustDomain{ClusterID: group.ClusterID, ClusterIncarnation: group.ClusterIncarnation}

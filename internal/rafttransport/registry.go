@@ -1042,7 +1042,34 @@ func (registry *StaticRegistry) enrollMemberWithCommitContext(
 			}
 			return nil
 		}
-		return ErrEnrollmentConflict
+		if existing.enrollmentDigest != ([sha256.Size]byte{}) {
+			return ErrEnrollmentConflict
+		}
+		// A static member's node binding was declared at construction, before
+		// any dynamic enrollment protocol ever ran for it - its digest has
+		// never been certified, so this intent has no prior enrollment to
+		// conflict with. Certify it as the first digest instead of rejecting
+		// a target whose physical identity and node were already known.
+		peer, peerOK := registry.physicalPeerFrom(current, intent.Peer.NodeID)
+		if !peerOK || !samePhysicalIdentity(peer, intent.Peer) {
+			return ErrPeerConflict
+		}
+		if intent.DirectoryRevision != registry.currentDirectoryRevision(current) {
+			return ErrPeerConflict
+		}
+		next := cloneDynamicEnrollment(current)
+		next.nodes[memberKey] = memberRecord{
+			node: intent.Peer.NodeID, enrollmentDigest: intent.Digest,
+			revision: intent.DirectoryRevision,
+		}
+		next.directoryRevision = registry.currentDirectoryRevision(current) + 1
+		if commit != nil {
+			if err := commit(); err != nil {
+				return err
+			}
+		}
+		registry.dynamic.Store(next)
+		return nil
 	}
 	if existing, ok := current.nodes[memberKey]; ok {
 		if existing.node == intent.Peer.NodeID &&
