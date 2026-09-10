@@ -528,6 +528,18 @@ func (session *NativeSession) Status() NativeSessionStatus {
 	}
 }
 
+// CatalogRoute returns a detached copy of the session's current bootstrap
+// route. It is used only to prove a live rollover is settling the authority's
+// exact predecessor session.
+func (session *NativeSession) CatalogRoute() (ReplicatedRoute, bool) {
+	if session == nil || !session.catalogControl {
+		return ReplicatedRoute{}, false
+	}
+	route := session.route
+	route.Replicas = append([]ReplicatedEndpoint(nil), route.Replicas...)
+	return route, true
+}
+
 // PendingCommand returns a detached copy of the exact outcome-unknown command.
 // Callers may mutate or retain it without changing the session's owned retry
 // bytes. The session keeps its private command until deterministic settlement.
@@ -913,6 +925,81 @@ func (session *NativeSession) RetireReleaseAndDestroy(ctx context.Context) error
 		return ErrNativeSessionState
 	}
 	return session.journal.destroyReleased()
+}
+
+// SettleCatalogRouteHandoff replays an outcome-unknown catalog command using
+// a newly certified operational route while keeping this session's original
+// journal binding and bootstrap route. It restores the old in-memory route
+// before returning so RetireReleaseAndDestroy settles the predecessor under
+// its exact binding. Callers must persist their handoff phase before invoking
+// this method and must open a separate exact-next journal afterward.
+func (session *NativeSession) SettleCatalogRouteHandoff(
+	ctx context.Context, nextRoute ReplicatedRoute, nextSnapshot *Snapshot,
+) error {
+	if session == nil || ctx == nil || !session.catalogControl ||
+		session.journal == nil || nextSnapshot == nil ||
+		!catalogBootstrapRoute(nextRoute) ||
+		(session.phase != nativeSessionActive && session.phase != nativeSessionRetired) {
+		return ErrNativeSession
+	}
+	var scratch [ServingReplicaCount]ReplicatedEndpoint
+	resolved, ok := nextSnapshot.ResolveReplicatedRoute(
+		ReplicatedCatalogDistribution, ReplicatedCatalogShard, scratch[:0],
+	)
+	if !ok || !sameReplicatedCatalogRoute(resolved, nextRoute) ||
+		!catalogRouteRolloverCompatible(session.route, nextRoute) ||
+		!catalogCommandProgression(session.route.Command, nextRoute.Command) {
+		return ErrReplicatedCatalogConflict
+	}
+	if !session.pending {
+		return nil
+	}
+	oldRoute := session.route
+	oldBootstrap := session.catalogBootstrap
+	nextRoute.Replicas = append([]ReplicatedEndpoint(nil), nextRoute.Replicas...)
+	session.route = nextRoute
+	session.catalogBootstrap = nextSnapshot
+	_, err := session.RetryPending(ctx)
+	// The predecessor remains the exact durable owner until the caller has
+	// persisted OldSettled. Restore it even when retry is outcome-unknown so a
+	// crash/retry never derives the old journal identity from a promoted seed.
+	oldRoute.Replicas = append([]ReplicatedEndpoint(nil), oldRoute.Replicas...)
+	session.route = oldRoute
+	session.catalogBootstrap = oldBootstrap
+	return err
+}
+
+// RetireReleaseAndDestroyViaCatalogRoute keeps the predecessor journal
+// binding while routing its lifecycle commands through the newly certified
+// catalog placement. The old route is restored if any lifecycle step remains
+// outcome-unknown so the durable handoff can be retried from its prepared
+// phase without inferring an old route from the active seed.
+func (session *NativeSession) RetireReleaseAndDestroyViaCatalogRoute(
+	ctx context.Context, nextRoute ReplicatedRoute, nextSnapshot *Snapshot,
+) error {
+	if session == nil || ctx == nil || !session.catalogControl ||
+		session.journal == nil || nextSnapshot == nil ||
+		(session.phase != nativeSessionActive && session.phase != nativeSessionRetired &&
+			session.phase != nativeSessionReleased) {
+		return ErrNativeSession
+	}
+	var scratch [ServingReplicaCount]ReplicatedEndpoint
+	resolved, ok := nextSnapshot.ResolveReplicatedRoute(
+		ReplicatedCatalogDistribution, ReplicatedCatalogShard, scratch[:0],
+	)
+	if !ok || !sameReplicatedCatalogRoute(resolved, nextRoute) ||
+		!catalogRouteRolloverCompatible(session.route, nextRoute) ||
+		!catalogCommandProgression(session.route.Command, nextRoute.Command) {
+		return ErrReplicatedCatalogConflict
+	}
+	oldRoute, oldBootstrap := session.route, session.catalogBootstrap
+	nextRoute.Replicas = append([]ReplicatedEndpoint(nil), nextRoute.Replicas...)
+	session.route, session.catalogBootstrap = nextRoute, nextSnapshot
+	if err := session.RetireReleaseAndDestroy(ctx); err != nil {
+		session.route, session.catalogBootstrap = oldRoute, oldBootstrap
+		return err
+	}
+	return nil
 }
 
 // RetryPending resubmits only the retained byte-identical command. It never

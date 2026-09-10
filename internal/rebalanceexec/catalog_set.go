@@ -21,6 +21,11 @@ type catalogSetAuthority interface {
 // a process-local batch. All targets keep their ordinary per-group Raft
 // and action proofs; only the shared catalog publication is combined.
 func (executor *Executor) executeCatalogSet(ctx context.Context, operation rebalance.OperationID, plan *rebalance.Plan, postRemove bool) (bool, error) {
+	// Owned moves publish their own exact receipt. The legacy combined head
+	// publication does not carry those receipts and must not bypass that path.
+	if _, owned := plan.TransitionKey(); owned {
+		return false, nil
+	}
 	if executor.options.Directory == nil || executor.options.Observer == nil {
 		return false, nil
 	}

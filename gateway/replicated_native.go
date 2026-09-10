@@ -1635,6 +1635,9 @@ func (executor *ReplicatedExecutor) doReplicated(
 		copy.Authority = authority
 		forwarded = &copy
 	}
+	if err := attachFrontendContinuation(attemptCtx, forwarded); err != nil {
+		return nil, err
+	}
 	response, err := executor.client.DoReplicated(attemptCtx, endpoint, forwarded)
 	if err == nil && response != nil && response.HasState &&
 		(response.State.Fence.MemberID != endpoint.Member ||

@@ -775,6 +775,11 @@ func sameReplicatedCatalogRoster(
 	for ordinal := 0; ordinal < int(old.replicaCount); ordinal++ {
 		oldReplica := oldSnapshot.replicatedReplicas[int(old.replicaBase)+ordinal]
 		nextReplica := nextSnapshot.replicatedReplicas[int(next.replicaBase)+ordinal]
+		// Reachability may change without replacing the member identity.
+		// Endpoint IDs remain fenced; their resolved addresses are not roster fields.
+		oldReplica.DataAddress, nextReplica.DataAddress = "", ""
+		oldReplica.Address, nextReplica.Address = "", ""
+		oldReplica.ControlAddress, nextReplica.ControlAddress = "", ""
 		if oldReplica != nextReplica {
 			return false
 		}

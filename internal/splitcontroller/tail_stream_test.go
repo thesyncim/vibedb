@@ -49,6 +49,7 @@ type tailStreamPeerConn struct {
 func (connection *tailStreamPeerConn) PeerIdentity() rafttransport.PeerIdentity {
 	return connection.identity
 }
+func (*tailStreamPeerConn) PeerKeyDigest() [32]byte { return [32]byte{} }
 
 func (connection *tailStreamPeerConn) TrafficClass() rafttransport.TrafficClass {
 	return connection.class

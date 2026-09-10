@@ -28,6 +28,8 @@ a reconciliation controller.
 | Copy an embedded database | [Embedded backup](embedded-backup.md) | Complete directory after a successful close. |
 | Check or rebuild a local store | [Verify, salvage, and repack](verification.md) | Quiescent source or complete quiescent copy. |
 | Export a running RF3 cluster | [Backup and restore](backup-restore.md) | Authenticated catalog and replica controls; configured backup repository. |
+| Move replicas during scale changes | [Online replica migration](migration.md) | One node-scoped migration budget and retained operation journals. |
+| Add, rebalance, or retire a physical node | [Online replica migration](migration.md) and [CLI](../reference/cli.md) | Authenticated operation ID, revision-fenced status, zero blockers, and `safe_to_stop=true` before a stop. |
 | Install a schema successor | [Schema rollouts](schema-rollouts.md) | Sealed successor catalog and replica-local bundles. |
 
 For distributed operations, retain the operation ID, canonical request, plan,

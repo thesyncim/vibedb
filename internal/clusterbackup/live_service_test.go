@@ -18,6 +18,7 @@ type liveTestConnection struct{ net.Conn }
 func (liveTestConnection) PeerIdentity() rafttransport.PeerIdentity {
 	return rafttransport.PeerIdentity{}
 }
+func (liveTestConnection) PeerKeyDigest() [32]byte { return [32]byte{} }
 func (liveTestConnection) TrafficClass() rafttransport.TrafficClass {
 	return rafttransport.TrafficShardControl
 }

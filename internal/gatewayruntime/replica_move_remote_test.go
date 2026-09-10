@@ -45,18 +45,42 @@ func (source gatewayTestGrantSource) ReadMembershipGrant(
 }
 
 type gatewayTestGrantInstaller struct {
-	nodes  []rafttransport.NodeID
-	failAt int
+	nodes    []rafttransport.NodeID
+	failAt   int
+	failFrom int
 }
 
 func (installer *gatewayTestGrantInstaller) InstallMembershipGrant(
 	_ context.Context, node rafttransport.NodeID, _ membershipgrant.Grant,
 ) error {
 	installer.nodes = append(installer.nodes, node)
-	if installer.failAt != 0 && len(installer.nodes) == installer.failAt {
+	position := len(installer.nodes)
+	if installer.failAt != 0 && position == installer.failAt ||
+		installer.failFrom != 0 && position >= installer.failFrom {
 		return errors.New("injected install failure")
 	}
 	return nil
+}
+
+type gatewayTestNodeRecordReader struct{ records []gateway.NodeRecord }
+
+func (reader gatewayTestNodeRecordReader) ListNodes(context.Context) ([]gateway.NodeRecord, error) {
+	return reader.records, nil
+}
+
+type gatewayTestEnrollmentInstaller struct {
+	nodes  []rafttransport.NodeID
+	failAt int
+}
+
+func (installer *gatewayTestEnrollmentInstaller) EnrollMember(
+	_ context.Context, node rafttransport.NodeID, _ rafttransport.EnrollmentIntent,
+) (rafttransport.EnrollmentAck, error) {
+	installer.nodes = append(installer.nodes, node)
+	if installer.failAt != 0 && len(installer.nodes) == installer.failAt {
+		return rafttransport.EnrollmentAck{}, errors.New("injected enrollment failure")
+	}
+	return rafttransport.EnrollmentAck{}, nil
 }
 
 type gatewayTestMembershipApplier struct{ calls int }
@@ -72,14 +96,27 @@ func TestGatewayGrantedMembershipInstallsEveryPeerBeforeProposal(t *testing.T) {
 	grant, route, request := gatewayMembershipFixture()
 	installer := new(gatewayTestGrantInstaller)
 	applier := new(gatewayTestMembershipApplier)
+	nodes := gatewayTestNodeRecordReader{records: []gateway.NodeRecord{
+		{NodeID: rafttransport.NodeID(grant.TargetNode), Incarnation: 1, Revision: 1,
+			DataAddress: "127.0.0.1:1", Lifecycle: gateway.NodeActive},
+	}}
+	enroller := new(gatewayTestEnrollmentInstaller)
 	client := gatewayGrantedMembershipClient{grants: gatewayTestGrantSource{grant},
-		installer: installer, applier: applier}
+		installer: installer, applier: applier, nodes: nodes, enroller: enroller}
 	if _, err := client.ApplyMembership(t.Context(), route, request); err != nil {
 		t.Fatal(err)
 	}
-	want := []rafttransport.NodeID{{1}, {2}, {3}, {4}}
+	// AddLearner is voters-only: the enrolled target cannot yet run a
+	// membership-grant-control listener, so its install is never attempted
+	// (see installGatewayMembershipGrant). The target still becomes a known
+	// peer via the enrollment fanout checked separately below.
+	want := []rafttransport.NodeID{{1}, {2}, {3}}
 	if !slices.Equal(installer.nodes, want) || applier.calls != 1 {
 		t.Fatalf("installed=%v apply=%d", installer.nodes, applier.calls)
+	}
+	wantEnrolled := []rafttransport.NodeID{{1}, {2}, {3}}
+	if !slices.Equal(enroller.nodes, wantEnrolled) {
+		t.Fatalf("enrolled=%v", enroller.nodes)
 	}
 	installer.nodes = nil
 	installer.failAt = 3
@@ -87,9 +124,10 @@ func TestGatewayGrantedMembershipInstallsEveryPeerBeforeProposal(t *testing.T) {
 		t.Fatalf("one failed voter err=%v apply=%d", err, applier.calls)
 	}
 	installer.nodes = nil
-	installer.failAt = 4
+	installer.failAt = 0
+	installer.failFrom = 2
 	if _, err := client.ApplyMembership(t.Context(), route, request); err == nil || applier.calls != 2 {
-		t.Fatalf("missing target grant err=%v apply=%d", err, applier.calls)
+		t.Fatalf("quorum not reached but proposal still applied err=%v apply=%d", err, applier.calls)
 	}
 }
 

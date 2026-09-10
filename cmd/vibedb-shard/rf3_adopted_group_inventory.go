@@ -49,7 +49,7 @@ type rf3AdoptedRuntime struct {
 }
 
 func openRF3AdoptedGroupInventory(manifest rf3Manifest) (*rf3AdoptedGroupInventory, error) {
-	if manifest.Digest == ([32]byte{}) || len(manifest.groupBundles()) == 0 || len(manifest.groupBundles()) > maxRF3ManifestGroups {
+	if manifest.Digest == ([32]byte{}) || len(manifest.groupBundles()) > maxRF3ManifestGroups {
 		return nil, errRF3Serving
 	}
 	path := manifest.ReplicaControl.SourceDataRoot

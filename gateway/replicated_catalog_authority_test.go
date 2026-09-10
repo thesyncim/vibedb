@@ -57,7 +57,7 @@ func TestReplicatedCatalogAttestedRouteSeedReceiptStagesAndPromotes(t *testing.T
 	}
 	state, err := LoadReplicatedCatalogRouteSeed(path)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("open rollover journal: %v", err)
 	}
 	if _, found := state.Active(); found {
 		t.Fatal("pending candidate became active before promotion")
@@ -71,7 +71,7 @@ func TestReplicatedCatalogAttestedRouteSeedReceiptStagesAndPromotes(t *testing.T
 	}
 	state, err = LoadReplicatedCatalogRouteSeed(path)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("construct rollover session: %v", err)
 	}
 	active, found := state.Active()
 	if !found {
@@ -329,8 +329,8 @@ func TestReplicatedCatalogRouteSeedTrackerPersistsSameRouteBeforeHolderPublish(t
 	}
 }
 
-func TestReplicatedCatalogRouteSeedTrackerStagesAndSignalsBeforeChangedHolder(t *testing.T) {
-	authority, _, genesis, current, descriptor := newRouteSeedCatalogAuthorityFixture(t)
+func TestReplicatedCatalogRouteSeedTrackerCompletesLiveBindingHandoff(t *testing.T) {
+	authority, client, genesis, current, descriptor := newRouteSeedCatalogAuthorityFixture(t)
 	path := filepath.Join(t.TempDir(), "catalog-route.vibejson")
 	if err := SaveSnapshot(path, current); err != nil {
 		t.Fatal(err)
@@ -340,6 +340,22 @@ func TestReplicatedCatalogRouteSeedTrackerStagesAndSignalsBeforeChangedHolder(t 
 	)
 	if err != nil {
 		t.Fatal(err)
+	}
+	var rolloverCalls, completeCalls int
+	var rolloverOld, rolloverNext ReplicatedRoute
+	authority.rollover = func(
+		_ context.Context, oldRoute, nextRoute ReplicatedRoute, nextSnapshot *Snapshot,
+	) (ReplicatedCatalogSessionRolloverResult, error) {
+		rolloverCalls++
+		rolloverOld, rolloverNext = oldRoute, nextRoute
+		nextSession := newLiveCatalogRolloverSession(t, authority, nextRoute, nextSnapshot)
+		return ReplicatedCatalogSessionRolloverResult{
+			Session: nextSession,
+			Complete: func() error {
+				completeCalls++
+				return nil
+			},
+		}, nil
 	}
 	grant, manifest, target, command := testCertifiedReplicaReplacement(t, current, descriptor)
 	if err = authority.PublishMembershipGrant(context.Background(), grant); err != nil {
@@ -354,33 +370,224 @@ func TestReplicatedCatalogRouteSeedTrackerStagesAndSignalsBeforeChangedHolder(t 
 	err = authority.PublishReplicaReplacement(
 		context.Background(), current.Generation(), next, grant,
 	)
-	if !errors.Is(err, ErrReplicatedCatalogRouteRestartRequired) {
-		t.Fatalf("binding-changing publication=%v", err)
+	if err != nil {
+		t.Fatalf("binding-changing live publication=%v", err)
 	}
 	select {
 	case <-control.ShutdownRequired():
+		t.Fatalf("live binding handoff sealed authority: %v", control.TerminalError())
 	default:
-		t.Fatal("changed route did not synchronously signal shutdown")
 	}
-	if authority.holder.Current().Generation() != current.Generation() {
-		t.Fatalf("changed head became visible before quiescence: generation=%d",
-			authority.holder.Current().Generation())
+	if rolloverCalls != 1 || completeCalls != 1 ||
+		!sameReplicatedCatalogRoute(rolloverOld, authority.route) ||
+		!sameReplicatedCatalogRoute(rolloverNext, catalogRouteFromSnapshot(t, next)) {
+		t.Fatalf("handoff callbacks=%d/%d old=%+v next=%+v", rolloverCalls, completeCalls, rolloverOld, rolloverNext)
 	}
 	state, err := LoadReplicatedCatalogRouteSeed(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	active, activeFound := state.Active()
-	pending, pendingFound := state.Pending()
-	activeEqual, activeErr := equalCatalogSnapshots(active, current)
-	pendingEqual, pendingErr := equalCatalogSnapshots(pending, next)
-	if !activeFound || !pendingFound || activeErr != nil || pendingErr != nil ||
-		!activeEqual || !pendingEqual {
-		t.Fatalf("staged handoff active=%v pending=%v equal=%v/%v errors=%v/%v",
-			activeFound, pendingFound, activeEqual, pendingEqual, activeErr, pendingErr)
+	_, pendingFound := state.Pending()
+	activeEqual, activeErr := equalCatalogSnapshots(active, next)
+	if !activeFound || pendingFound || activeErr != nil || !activeEqual {
+		t.Fatalf("completed handoff active=%v pending=%v equal=%v error=%v",
+			activeFound, pendingFound, activeEqual, activeErr)
 	}
-	if _, err = authority.Read(context.Background()); !errors.Is(err, ErrReplicatedCatalogRouteRestartRequired) {
-		t.Fatalf("sealed authority read=%v", err)
+	if authority.holder.Current().Generation() != next.Generation() {
+		t.Fatalf("live binding handoff holder generation=%d want=%d",
+			authority.holder.Current().Generation(), next.Generation())
+	}
+	if !sameReplicatedCatalogRoute(authority.session.route, catalogRouteFromSnapshot(t, next)) {
+		t.Fatal("authority retained predecessor session after live handoff")
+	}
+
+	// Complete the first replacement's post-remove proof and revoke its one-use
+	// grant before the next move. The route remains live throughout this extra
+	// catalog generation.
+	nextRoute := catalogRouteFromSnapshot(t, next)
+	client.mu.Lock()
+	client.state.Fence.MemberID = nextRoute.Replicas[0].Member
+	client.state.Fence.StoreID = nextRoute.Replicas[0].StoreID
+	client.state.Fence.NodeIncarnation = nextRoute.Replicas[0].NodeIncarnation
+	client.state.Fence.Command = nextRoute.Command
+	client.state.LeaderID = nextRoute.Replicas[0].Member
+	client.state.Fence.Term++
+	client.mu.Unlock()
+	version, ok := replicaSetVersionForGroup(next, grant.Group)
+	if !ok {
+		t.Fatal("first replacement fence missing")
+	}
+	postRemove, err := BuildReplicaReplacementPostRemoveTransition(
+		next, next.Generation()+1, grant, version+1,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = authority.PublishReplicaReplacementPostRemove(
+		context.Background(), next.Generation(), postRemove, grant, version+1,
+	); err != nil {
+		t.Fatalf("first post-remove proof=%v", err)
+	}
+	// The in-memory shard mock does not apply the catalog command's fence to
+	// its probe state automatically. PublishPostRemove first runs against the
+	// predecessor fence and then exposes the successor cut; update the probe
+	// state before the next linearizable read so Finalize observes that exact
+	// post-remove authority.
+	postRemoveRoute := catalogRouteFromSnapshot(t, postRemove)
+	client.mu.Lock()
+	client.state.Fence.MemberID = postRemoveRoute.Replicas[0].Member
+	client.state.Fence.StoreID = postRemoveRoute.Replicas[0].StoreID
+	client.state.Fence.NodeIncarnation = postRemoveRoute.Replicas[0].NodeIncarnation
+	client.state.Fence.Command = postRemoveRoute.Command
+	client.state.LeaderID = postRemoveRoute.Replicas[0].Member
+	client.state.Fence.Term++
+	client.mu.Unlock()
+	if err = authority.FinalizeReplicaReplacement(context.Background(), grant); err != nil {
+		t.Fatalf("first grant finalization=%v", err)
+	}
+
+	// A second certified membership move must use the new exact session and
+	// journal. The predecessor completion record is not a one-shot restart bit.
+	base := postRemove
+	nextDescriptor := base.ReplicatedShardDescriptors()[0]
+	secondGrant := testReplicatedMembershipGrant(nextDescriptor.Group)
+	secondGrant.TransitionID[0]++
+	secondGrant.MetadataEpoch++
+	secondGrant.CatalogGeneration = base.Generation()
+	secondGrant.InitialReplicaSetVersion = nextDescriptor.Command.ReplicaSetVersion
+	secondGrant.InitialVoters = [3]uint64{2, 3, 4}
+	secondGrant.InitialRosterDigest = replicatedCatalogInitialRosterDigest(base, 0)
+	secondGrant.InitialDescriptorDigest = replicatedCatalogInitialDescriptorDigest(base, 0)
+	secondGrant.SourceMember = 2
+	secondGrant.TargetMember = 5
+	secondGrant.TargetNode = [16]byte{5}
+	currentManifest, ok := base.Manifest(nextDescriptor.Distribution)
+	if !ok {
+		t.Fatal("second replacement manifest missing")
+	}
+	ordinal, metadata := manifestShardOrdinal(currentManifest, nextDescriptor.Shard)
+	if ordinal < 0 {
+		t.Fatal("second replacement shard missing")
+	}
+	secondManifest, err := currentManifest.ReplaceShardLeader(
+		ordinal, currentManifest.Version()+1, 1, "ep-a", metadata.Epoch+1,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondTarget := ReplicatedReplicaDescriptor{
+		Member: 5, Node: [16]byte{5}, StoreID: [16]byte{15}, NodeIncarnation: 25,
+		Endpoint: "ep-a", NativeEndpoint: "ep-a-native", ControlEndpoint: "ep-a-control",
+	}
+	secondCommand := nextDescriptor.Command
+	secondCommand.ReplicaSetVersion += 3
+	secondCommand.OwnershipEpoch++
+	secondCommand.RoutingVersion++
+	secondCommand.RouteGeneration++
+	secondNext, err := BuildReplicaReplacementTransition(
+		base, secondManifest, base.Generation()+1, secondGrant, secondTarget, secondCommand,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondRoute := catalogRouteFromSnapshot(t, secondNext)
+	if !replicatedCatalogCertifiesInitialGrant(base, secondGrant) {
+		t.Fatalf("second grant is not certified by base snapshot: grant=%+v descriptor=%+v", secondGrant, nextDescriptor)
+	}
+	if err = authority.PublishMembershipGrant(context.Background(), secondGrant); err != nil {
+		t.Fatal(err)
+	}
+	if err = authority.PublishReplicaReplacement(
+		context.Background(), base.Generation(), secondNext, secondGrant,
+	); err != nil {
+		t.Fatalf("second live binding handoff=%v", err)
+	}
+	// The first move, its post-remove fence cut, and the second move each
+	// advance the command-bound session. All three require their own exact
+	// journal handoff.
+	if rolloverCalls != 3 || completeCalls != 3 {
+		t.Fatalf("repeated handoff callbacks=%d/%d", rolloverCalls, completeCalls)
+	}
+	client.mu.Lock()
+	client.state.Fence.MemberID = secondRoute.Replicas[0].Member
+	client.state.Fence.StoreID = secondRoute.Replicas[0].StoreID
+	client.state.Fence.NodeIncarnation = secondRoute.Replicas[0].NodeIncarnation
+	client.state.Fence.Command = secondRoute.Command
+	client.state.LeaderID = secondRoute.Replicas[0].Member
+	client.state.Fence.Term++
+	client.mu.Unlock()
+	active, activeFound = mustLoadReplicatedCatalogRouteSeedActive(t, path)
+	activeEqual, activeErr = equalCatalogSnapshots(active, secondNext)
+	if !activeFound || activeErr != nil || !activeEqual ||
+		authority.holder.Current().Generation() != secondNext.Generation() {
+		t.Fatalf("second handoff active=%v found=%v equal=%v err=%v holder=%d",
+			active, activeFound, activeEqual, activeErr, authority.holder.Current().Generation())
+	}
+}
+
+func TestReplicatedCatalogRouteSeedAddressOnlyAdvancePrecedesLiveHandoff(t *testing.T) {
+	authority, _, genesis, current, descriptor := newRouteSeedCatalogAuthorityFixture(t)
+	path := filepath.Join(t.TempDir(), "catalog-route.vibejson")
+	if err := SaveSnapshot(path, current); err != nil {
+		t.Fatal(err)
+	}
+	control, err := authority.InstallReplicatedCatalogRouteSeed(t.Context(), path, genesis)
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoints := make(map[distribution.EndpointID]string, len(current.endpoints))
+	for endpoint, address := range current.endpoints {
+		endpoints[endpoint] = address
+	}
+	endpoints["ep-a-native"] = "127.0.0.1:7199"
+	next, err := NewSnapshotWithReplicatedMetadata(
+		current.config, endpoints, current.Generation()+1, nil, nil,
+		[]ReplicatedShardDescriptor{descriptor},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = authority.Publish(t.Context(), current.Generation(), next); err != nil {
+		t.Fatalf("address-only route advance=%v", err)
+	}
+	nextRoute := catalogRouteFromSnapshot(t, next)
+	if !sameReplicatedCatalogRoute(authority.session.route, nextRoute) {
+		t.Fatal("active session retained predecessor reachability after address-only advance")
+	}
+	if sameReplicatedCatalogRoute(authority.route, nextRoute) {
+		t.Fatal("immutable authority bootstrap unexpectedly changed")
+	}
+	select {
+	case <-control.ShutdownRequired():
+		t.Fatalf("address-only advance sealed authority: %v", control.TerminalError())
+	default:
+	}
+
+	var rolloverCalls int
+	authority.rollover = func(
+		_ context.Context, oldRoute, nextRoute ReplicatedRoute, nextSnapshot *Snapshot,
+	) (ReplicatedCatalogSessionRolloverResult, error) {
+		rolloverCalls++
+		return ReplicatedCatalogSessionRolloverResult{
+			Session: newLiveCatalogRolloverSession(t, authority, nextRoute, nextSnapshot),
+		}, nil
+	}
+	grant, manifest, target, command := testCertifiedReplicaReplacement(t, next, next.ReplicatedShardDescriptors()[0])
+	if err = authority.PublishMembershipGrant(t.Context(), grant); err != nil {
+		t.Fatal(err)
+	}
+	nextBinding, err := BuildReplicaReplacementTransition(
+		next, manifest, next.Generation()+1, grant, target, command,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = authority.PublishReplicaReplacement(t.Context(), next.Generation(), nextBinding, grant); err != nil {
+		t.Fatalf("handoff after address-only advance=%v", err)
+	}
+	if rolloverCalls != 1 || authority.holder.Current().Generation() != nextBinding.Generation() {
+		t.Fatalf("handoff after address-only callbacks=%d holder=%d", rolloverCalls, authority.holder.Current().Generation())
 	}
 }
 
@@ -1583,11 +1790,87 @@ func newRouteSeedCatalogAuthorityFixture(t *testing.T) (
 	return authority, client, genesis, current, descriptor
 }
 
+func catalogRouteFromSnapshot(t testing.TB, snapshot *Snapshot) ReplicatedRoute {
+	t.Helper()
+	if snapshot == nil {
+		t.Fatal("nil catalog snapshot")
+	}
+	var replicas [ServingReplicaCount]ReplicatedEndpoint
+	route, ok := snapshot.ResolveReplicatedRoute(
+		ReplicatedCatalogDistribution, ReplicatedCatalogShard, replicas[:0],
+	)
+	if !ok {
+		t.Fatal("catalog snapshot has no self-route")
+	}
+	return route
+}
+
+func newLiveCatalogRolloverSession(
+	t testing.TB, authority *ReplicatedCatalogAuthority, route ReplicatedRoute,
+	bootstrap *Snapshot,
+) *NativeSession {
+	t.Helper()
+	if authority == nil || authority.session == nil || bootstrap == nil {
+		t.Fatal("invalid live rollover session fixture")
+	}
+	old := authority.session
+	binding, err := NativeSessionJournalBinding(
+		route, old.distribution, old.shard, old.tenant,
+		nativeSessionBaseRelation(old), old.proposalCapability,
+	)
+	if err != nil {
+		t.Fatalf("compute rollover binding: %v", err)
+	}
+	journal, err := OpenNativeSessionJournal(NativeSessionJournalOptions{
+		Path:     filepath.Join(t.TempDir(), "catalog-session-next"),
+		ClientID: old.clientID, RetryHome: old.retryHome,
+		MaxCommandBytes: old.maxCommand, Binding: binding,
+	})
+	if err != nil {
+		t.Fatalf("open rollover journal: %v", err)
+	}
+	session, err := NewNativeSession(NativeSessionOptions{
+		Executor: authority.executor, Route: route,
+		Distribution: old.distribution, Shard: old.shard, Tenant: old.tenant,
+		ClientID: old.clientID, RetryHome: old.retryHome,
+		Resolver: old.resolver, Journal: journal, CatalogBootstrap: bootstrap,
+		ProposalCapability: old.proposalCapability,
+		MaxRelationBatches: old.bundle.maxRelations, MaxMutations: old.bundle.maxMutations,
+		InitialCommandBytes: min(old.maxCommand, 4<<10), MaxCommandBytes: old.maxCommand,
+	})
+	if err != nil {
+		t.Fatalf("construct rollover session: %v", err)
+	}
+	// The callback is entered after the old session has been retired and the
+	// next journal has been opened. Its proof is checked by the authority before
+	// the route seed can be promoted; this fixture supplies that postcondition
+	// without replaying a second catalog lifecycle in the route-seed unit test.
+	session.phase = nativeSessionActive
+	session.epoch = old.epoch
+	session.nextSequence = old.nextSequence
+	session.ackThrough = old.ackThrough
+	session.leaseDeadline = old.leaseDeadline
+	journal.mu.Lock()
+	if err = journal.storeLocked(session.durableState()); err != nil {
+		journal.mu.Unlock()
+		t.Fatalf("persist rollover session: %v", err)
+	}
+	journal.mu.Unlock()
+	return session
+}
+
 func newCatalogAuthorityFixture(t *testing.T) (
 	*ReplicatedCatalogAuthority, *catalogAuthorityClient, *Snapshot,
 ) {
+	return newCatalogAuthorityFixtureWithDescriptor(t, nil)
+}
+
+func newCatalogAuthorityFixtureWithDescriptor(t *testing.T, prepare func(*ReplicatedShardDescriptor)) (*ReplicatedCatalogAuthority, *catalogAuthorityClient, *Snapshot) {
 	t.Helper()
 	config, endpoints, descriptor := testReplicatedCatalogInput(t)
+	if prepare != nil {
+		prepare(&descriptor)
+	}
 	genesis, err := NewSnapshotWithReplicatedMetadata(
 		config, endpoints, 1, nil, nil, []ReplicatedShardDescriptor{descriptor},
 	)
@@ -1666,7 +1949,7 @@ func newCatalogAuthorityFixture(t *testing.T) (
 		Shard: string(ReplicatedCatalogShard), Tenant: []byte("control-plane"),
 		ClientID: replication.ID128{0x71}, Resolver: BaseRelationResolver{Relation: 1},
 		ProposalCapability: serviceauthz.CapabilityTopology,
-		MaxRelationBatches: 1, MaxMutations: 4,
+		MaxRelationBatches: 1, MaxMutations: MaxReplicatedCatalogBatchMutations,
 		InitialCommandBytes: 4 << 10, MaxCommandBytes: replication.MaxCommandBytes,
 	})
 	if err != nil {
@@ -2540,7 +2823,7 @@ func TestRouteSeedRejectsDelayedReceiptWithoutSealingAuthority(t *testing.T) {
 	}
 	// A concurrent reader may finish attesting the old head after publication.
 	authority.mu.Lock()
-	err = authority.routeSeed.Load().observe(old)
+	err = authority.observeCatalogReceiptLocked(t.Context(), old)
 	authority.mu.Unlock()
 	if !errors.Is(err, ErrStaleGeneration) {
 		t.Fatalf("old receipt accepted: %v", err)

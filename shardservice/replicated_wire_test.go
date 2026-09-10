@@ -36,6 +36,102 @@ func (meter *replicatedTLSWriteMeter) Write(p []byte) (int, error) {
 	return meter.Conn.Write(p)
 }
 
+type replicatedBorrowedWriteRecorder struct {
+	bytes    []byte
+	retained []byte
+	retain   bool
+	writes   int
+	maxWrite int
+	err      error
+}
+
+func (recorder *replicatedBorrowedWriteRecorder) Write(p []byte) (int, error) {
+	recorder.writes++
+	if recorder.retain {
+		recorder.retained = p
+		recorder.bytes = append(recorder.bytes, p...)
+	} else {
+		recorder.bytes = append(recorder.bytes, p...)
+	}
+	n := len(p)
+	if recorder.maxWrite >= 0 && recorder.maxWrite < n {
+		n = recorder.maxWrite
+	}
+	return n, recorder.err
+}
+
+func TestEncodeReplicatedRequestBorrowedCoalescesAndClearsSmallFrame(t *testing.T) {
+	request := &ReplicatedRequest{Operation: ReplicatedReadLeader, Fence: testReplicatedFence(),
+		Relation: 1, Key: []byte("key"), MinimumApplied: 1, MaxValueBytes: 1024}
+	var canonical bytes.Buffer
+	if err := EncodeReplicatedRequest(&canonical, request); err != nil {
+		t.Fatal(err)
+	}
+	recorder := &replicatedBorrowedWriteRecorder{maxWrite: -1, retain: true}
+	if err := EncodeReplicatedRequestBorrowed(recorder, request); err != nil {
+		t.Fatal(err)
+	}
+	if recorder.writes != 1 {
+		t.Fatalf("small frame writes=%d, want 1", recorder.writes)
+	}
+	if recorder.retained == nil {
+		t.Fatal("small frame did not use the retained writer")
+	}
+	if !bytes.Equal(recorder.bytes, canonical.Bytes()) {
+		t.Fatal("coalesced frame differs from canonical frame")
+	}
+	for _, value := range recorder.retained[:cap(recorder.retained)] {
+		if value != 0 {
+			t.Fatal("borrowed scratch retained frame bytes")
+		}
+	}
+}
+
+func TestEncodeReplicatedRequestBorrowedKeepsLargeScatter(t *testing.T) {
+	request := &ReplicatedRequest{Operation: ReplicatedQueryLeader, Authority: serviceauthz.Authority{Node: rafttransport.NodeID{1}, Generation: 1}, Capability: serviceauthz.CapabilityDataRead,
+		Fence: testReplicatedFence(), MaxValueBytes: 1024,
+		Query: bytes.Repeat([]byte{'q'}, replicatedBorrowedCoalesceBytes)}
+	var canonical bytes.Buffer
+	if err := EncodeReplicatedRequest(&canonical, request); err != nil {
+		t.Fatal(err)
+	}
+	recorder := &replicatedBorrowedWriteRecorder{maxWrite: -1}
+	if err := EncodeReplicatedRequestBorrowed(recorder, request); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(recorder.bytes, canonical.Bytes()) {
+		t.Fatal("scatter frame differs from canonical frame")
+	}
+	if recorder.writes != 2 {
+		t.Fatalf("large frame writes=%d, want 2", recorder.writes)
+	}
+	if got := bytes.Count(recorder.bytes, []byte{'q'}); got != len(request.Query) {
+		t.Fatalf("scatter payload bytes=%d, want %d", got, len(request.Query))
+	}
+}
+
+func TestEncodeReplicatedRequestBorrowedPreservesWriteErrors(t *testing.T) {
+	request := &ReplicatedRequest{Operation: ReplicatedReadLeader, Fence: testReplicatedFence(),
+		Relation: 1, Key: []byte("key"), MinimumApplied: 1, MaxValueBytes: 1024}
+	wantErr := errors.New("write failed")
+	for _, test := range []struct {
+		name     string
+		maxWrite int
+		err      error
+		wantErr  error
+	}{
+		{name: "writer error", maxWrite: -1, err: wantErr, wantErr: wantErr},
+		{name: "short write", maxWrite: 1, wantErr: io.ErrShortWrite},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := &replicatedBorrowedWriteRecorder{maxWrite: test.maxWrite, err: test.err}
+			if err := EncodeReplicatedRequestBorrowed(recorder, request); !errors.Is(err, test.wantErr) {
+				t.Fatalf("error=%v, want %v", err, test.wantErr)
+			}
+		})
+	}
+}
+
 func BenchmarkReplicatedRequestTLSOneMiB(b *testing.B) {
 	fence := testReplicatedFence()
 	request := &ReplicatedRequest{Operation: ReplicatedPropose, Fence: fence,

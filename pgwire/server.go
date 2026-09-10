@@ -171,8 +171,15 @@ type Server struct {
 	conns     map[net.Conn]struct{}
 	listeners map[net.Listener]struct{}
 	closed    bool
-	nextPID   int32
-	live      int
+	// draining closes only listener admission. Existing sockets and sessions
+	// remain owned by the server until their peers disconnect or Close is
+	// called. This is deliberately separate from closed: a retiring frontend
+	// must keep an idle SQL session (and the runtime that owns it) alive.
+	draining         bool
+	admissionDrained bool
+	drainRevision    uint64
+	nextPID          int32
+	live             int
 
 	// wg tracks in-flight sessions so Close can wait for them. Waiting is what
 	// makes Close a usable shutdown: a caller that closes the server and then
@@ -277,9 +284,13 @@ func NewServerWithBackend(backend Backend, opts Options) (*Server, error) {
 
 var (
 	// ErrServerClosed is returned by [Server.Serve] after [Server.Close].
-	ErrServerClosed  = errors.New("pgwire: server closed")
-	errNilListener   = errors.New("pgwire: Serve requires a non-nil listener")
-	errNilConnection = errors.New(
+	ErrServerClosed = errors.New("pgwire: server closed")
+	// ErrServerDraining is returned by [Server.Serve] after BeginDrain closes
+	// listener admission. It is an expected lifecycle result, not a runtime
+	// failure and must not cancel the owning frontend.
+	ErrServerDraining = errors.New("pgwire: server admission drained")
+	errNilListener    = errors.New("pgwire: Serve requires a non-nil listener")
+	errNilConnection  = errors.New(
 		"pgwire: ServeConn requires a non-nil connection",
 	)
 )
@@ -292,6 +303,9 @@ func (s *Server) Serve(l net.Listener) error {
 	}
 	if !s.addListener(l) {
 		_ = l.Close()
+		if s.isDraining() {
+			return ErrServerDraining
+		}
 		return ErrServerClosed
 	}
 	defer s.removeListener(l)
@@ -301,6 +315,9 @@ func (s *Server) Serve(l net.Listener) error {
 			if s.isClosed() {
 				return ErrServerClosed
 			}
+			if s.isDraining() {
+				return ErrServerDraining
+			}
 			return err
 		}
 		if !s.admitConnection(conn) {
@@ -308,6 +325,87 @@ func (s *Server) Serve(l net.Listener) error {
 			continue
 		}
 		go s.serveAdmittedConnection(conn)
+	}
+}
+
+// AdmissionDrainState is an exact point-in-time view of frontend admission.
+// ActiveConnections includes authenticated, authenticating, and startup
+// sockets; ActiveSessions counts sessions that completed startup and received
+// a backend PID. A drain acknowledgement is therefore conservative while a
+// handshake is still in flight and becomes safe only after both counts reach
+// zero.
+type AdmissionDrainState struct {
+	Draining          bool
+	AdmissionDrained  bool
+	ActiveConnections uint32
+	ActiveSessions    uint32
+	Revision          uint64
+}
+
+// SafeToStop reports whether this PostgreSQL listener has acknowledged the
+// admission fence and no accepted socket or SQL session remains. It never
+// closes a connection and therefore remains false for a held idle or active
+// transaction session.
+func (state AdmissionDrainState) SafeToStop() bool {
+	return state.AdmissionDrained && state.ActiveConnections == 0 && state.ActiveSessions == 0
+}
+
+// AdmissionState returns a mutex-consistent admission and live-session cut.
+// It does not close anything and is safe to call from a decommission status
+// reader while sessions are running.
+func (s *Server) AdmissionState() AdmissionDrainState {
+	if s == nil {
+		return AdmissionDrainState{}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.admissionStateLocked()
+}
+
+// BeginDrain closes every listener currently owned by the server while
+// preserving every already-admitted connection and SQL session. It is
+// idempotent: retries return the same monotonic revision and current counts.
+// Listener close errors are intentionally not returned here because net.Listener
+// implementations commonly report an already-closed handle while still
+// providing the required admission fence. Callers that need a cleanup error
+// should use Close after the frontend is safe to stop.
+func (s *Server) BeginDrain() AdmissionDrainState {
+	if s == nil {
+		return AdmissionDrainState{}
+	}
+	s.mu.Lock()
+	if !s.closed && !s.draining {
+		s.draining = true
+		s.drainRevision++
+	}
+	listeners := make([]net.Listener, 0, len(s.listeners))
+	for listener := range s.listeners {
+		listeners = append(listeners, listener)
+	}
+	state := s.admissionStateLocked()
+	s.mu.Unlock()
+	for _, listener := range listeners {
+		_ = listener.Close()
+	}
+	// Publish the acknowledgement only after every listener close has been
+	// issued. The accept loops observe draining and return ErrServerDraining;
+	// no new connection can pass admitConnection after the first locked cut.
+	s.mu.Lock()
+	if s.draining {
+		s.admissionDrained = true
+	}
+	state = s.admissionStateLocked()
+	s.mu.Unlock()
+	return state
+}
+
+func (s *Server) admissionStateLocked() AdmissionDrainState {
+	return AdmissionDrainState{
+		Draining:          s.draining,
+		AdmissionDrained:  s.admissionDrained,
+		ActiveConnections: uint32(len(s.conns)),
+		ActiveSessions:    uint32(len(s.sessions)),
+		Revision:          s.drainRevision,
 	}
 }
 
@@ -370,6 +468,8 @@ func (s *Server) Close() error {
 		return nil
 	}
 	s.closed = true
+	s.draining = true
+	s.admissionDrained = true
 	listeners := make([]net.Listener, 0, len(s.listeners))
 	for l := range s.listeners {
 		listeners = append(listeners, l)
@@ -408,7 +508,7 @@ func (s *Server) Close() error {
 func (s *Server) admitConnection(conn net.Conn) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
+	if s.closed || s.draining {
 		return false
 	}
 	if s.opts.MaxConnections != UnlimitedConnections &&
@@ -435,10 +535,16 @@ func (s *Server) isClosed() bool {
 	return s.closed
 }
 
+func (s *Server) isDraining() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.draining
+}
+
 func (s *Server) addListener(l net.Listener) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
+	if s.closed || s.draining {
 		return false
 	}
 	s.listeners[l] = struct{}{}

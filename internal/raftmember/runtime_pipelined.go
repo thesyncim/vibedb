@@ -711,6 +711,9 @@ func (p *pipelinedRuntime) deliverResponse(
 		}
 		return nil
 	}
+	if response.GetType() == pb.MsgSnap {
+		return p.sendSnapshotBaseProbe(response, send)
+	}
 	if _, err := validateOrdinaryMessage(response); err != nil {
 		return p.runtime.fail(err)
 	}
@@ -856,6 +859,13 @@ func (runtime *Runtime) drivePipelinedReady(
 
 driveDirect:
 	if message, ok := p.directQueue.front(); ok {
+		if message.GetType() == pb.MsgSnap {
+			if err := p.sendSnapshotBaseProbe(message, send); err != nil {
+				return DriveResult{}, err
+			}
+			p.directQueue.pop()
+			return DriveResult{Kind: DriveMessage}, nil
+		}
 		if _, err := validateOrdinaryMessage(message); err != nil {
 			return DriveResult{}, runtime.fail(err)
 		}
@@ -947,4 +957,16 @@ func (p *pipelinedRuntime) String() string {
 	return fmt.Sprintf("append=%d/%d done=%d apply=%d completed=%d direct=%d",
 		p.appendWork.len(), p.appendOutstanding, p.appendDone.len(), p.applyQueue.len(),
 		p.appendCompleted.len(), p.directQueue.len())
+}
+
+func (p *pipelinedRuntime) sendSnapshotBaseProbe(message *pb.Message, send func(OutboundMessage) error) error {
+	var sendErr error
+	err := p.runtime.node.SendPipelinedSnapshotBaseProbe(message, func(probe *pb.Message) error {
+		sendErr = p.deliverResponse(probe, send)
+		return sendErr
+	})
+	if err != nil && sendErr == nil {
+		return p.runtime.fail(err)
+	}
+	return err
 }

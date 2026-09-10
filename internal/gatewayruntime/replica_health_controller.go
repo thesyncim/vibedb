@@ -12,6 +12,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/membershipgrant"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
+	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rebalance"
 )
 
@@ -89,6 +90,8 @@ type gatewayFailedReplicaMoveSink struct {
 	controller gatewayFailedReplicaMoveSubmitter
 	grants     gatewayFailedReplicaGrantAuthority
 	installer  gatewayMembershipGrantInstaller
+	nodes      gatewayNodeRecordReader
+	enroller   gatewayMembershipEnrollmentInstaller
 }
 
 func (sink gatewayFailedReplicaMoveSink) SubmitFailedReplicaMove(
@@ -158,7 +161,11 @@ func (sink gatewayFailedReplicaMoveSink) SubmitFailedReplicaMove(
 	if !found || route.Serving.Group != grant.Group {
 		return errGatewayReplicaHealth
 	}
-	if err = installGatewayMembershipGrant(ctx, route, grant, sink.installer); err != nil {
+	// This grant precedes the AddLearner that enrolls the replacement target:
+	// like any AddLearner, the target cannot yet accept an install.
+	if err = installGatewayMembershipGrant(
+		ctx, route, grant, sink.installer, raftservice.MembershipAddLearner, sink.nodes, sink.enroller,
+	); err != nil {
 		return fmt.Errorf("install failed-replica grant for %s/%s: %w", identity.Request.Distribution, identity.Request.Shard, err)
 	}
 	_, err = sink.controller.Submit(ctx, intent.Plan)
@@ -277,13 +284,17 @@ func newGatewayReplicaHealthRuntime(
 	moves gatewayFailedReplicaMoveSubmitter,
 	grants gatewayFailedReplicaGrantAuthority,
 	installer gatewayMembershipGrantInstaller,
+	nodes gatewayNodeRecordReader,
+	enroller gatewayMembershipEnrollmentInstaller,
 ) (*gatewayReplicaHealthController, error) {
 	if observations == nil || moves == nil || grants == nil || installer == nil {
 		return nil, errGatewayReplicaHealth
 	}
 	return newGatewayReplicaHealthController(
 		catalog, failures, gatewayAuthenticatedHealthObserver{client: observations}, inventory,
-		gatewayFailedReplicaMoveSink{controller: moves, grants: grants, installer: installer},
+		gatewayFailedReplicaMoveSink{
+			controller: moves, grants: grants, installer: installer, nodes: nodes, enroller: enroller,
+		},
 	)
 }
 

@@ -237,6 +237,7 @@ func (*rf3SnapshotBufferConnection) Close() error                               
 func (*rf3SnapshotBufferConnection) SetReadDeadline(time.Time) error            { return nil }
 func (*rf3SnapshotBufferConnection) SetWriteDeadline(time.Time) error           { return nil }
 func (c *rf3SnapshotBufferConnection) PeerIdentity() rafttransport.PeerIdentity { return c.peer }
+func (*rf3SnapshotBufferConnection) PeerKeyDigest() [32]byte                    { return [32]byte{} }
 func (*rf3SnapshotBufferConnection) TrafficClass() rafttransport.TrafficClass {
 	return rafttransport.TrafficSnapshot
 }

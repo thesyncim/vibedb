@@ -30,6 +30,10 @@ func TestAuthorizedClientTLSNetworkChaosAndThroughputGate(t *testing.T) {
 	harness := newAuthorizedTransportQualification(t)
 	defer harness.close(t)
 
+	// Admit the stream before saturating the bounded handshake pool. The
+	// qualification exercises established authorized traffic under malformed
+	// handshakes; overload admission itself is tested by the TLS server gates.
+	first := harness.dial(t)
 	chaosDone := make(chan error, 1)
 	go func() {
 		for range 64 {
@@ -45,9 +49,12 @@ func TestAuthorizedClientTLSNetworkChaosAndThroughputGate(t *testing.T) {
 		chaosDone <- nil
 	}()
 
-	first := harness.dial(t)
 	firstElapsed, firstMaximum := runAuthorizedTransportPhase(t, first,
 		authorizedTransportQualificationOperations)
+
+	if err := <-chaosDone; err != nil {
+		t.Fatal(err)
+	}
 
 	next, err := serviceauthz.NewPolicy(2, []serviceauthz.Entry{{
 		Node: harness.clientIdentity.Node, Capabilities: serviceauthz.CapabilityDataRead,
@@ -74,9 +81,6 @@ func TestAuthorizedClientTLSNetworkChaosAndThroughputGate(t *testing.T) {
 	secondElapsed, secondMaximum := runAuthorizedTransportPhase(t, second,
 		authorizedTransportQualificationOperations)
 	_ = second.Close()
-	if err = <-chaosDone; err != nil {
-		t.Fatal(err)
-	}
 
 	want := uint64(2 * authorizedTransportQualificationOperations)
 	if got := harness.allowed.Load(); got != want {

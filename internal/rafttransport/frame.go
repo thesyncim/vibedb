@@ -135,6 +135,7 @@ func (registry *StaticRegistry) preflightOutbound(
 		return outboundFramePlan{}, fmt.Errorf("%w: missing group roster", ErrUnauthorized)
 	}
 	if outbound.Authority != nil {
+		roster = registry.outboundRosterDigest(outbound.Group, outbound.From, outbound.To, roster)
 		return registry.preflightAuthorityOutbound(outbound, view, destination, roster)
 	}
 	size, err := raftmember.MeasureOrdinaryMessage(outbound.Message)
@@ -180,6 +181,7 @@ func (registry *StaticRegistry) preflightOutbound(
 	if size > raftmodel.MaxInboundMessageBytes {
 		return outboundFramePlan{}, fmt.Errorf("%w: payload bytes %d", ErrFrameTooLarge, size)
 	}
+	roster = registry.outboundRosterDigest(outbound.Group, outbound.From, outbound.To, roster)
 	return outboundFramePlan{
 		kind:        frameKindOrdinary,
 		destination: destination,
@@ -324,7 +326,7 @@ func (registry *StaticRegistry) DecodeInbound(authenticated PeerIdentity, frame 
 		return Inbound{}, fmt.Errorf("%w: target member is not local", ErrUnauthorized)
 	}
 	roster, ok := registry.rosterDigest(header.group)
-	if !ok || roster != header.roster {
+	if !ok || !registry.acceptsRosterDigest(header.group, header.roster, header.from, header.to, authenticated.Node, registry.LocalNode(), roster) {
 		return Inbound{}, fmt.Errorf("%w: stable enrollment digest differs", ErrUnauthorized)
 	}
 	if header.kind == frameKindAuthority {

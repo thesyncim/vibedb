@@ -28,7 +28,7 @@ func runServeThroughRuntime(
 	hotShardCapacity string, hotShardInterval time.Duration, replicaControl,
 	backupRepository string, backupMaxBackups, backupMaxArtifacts int,
 	backupMaxArtifactBytes, backupMaxDiskBytes uint64, controllerInterval time.Duration,
-	schemaPlan string, schemaOnce bool,
+	schemaPlan string, schemaOnce bool, initialDirectory string,
 ) (code int, handled bool) {
 	if catalog == "" {
 		return 0, false
@@ -54,8 +54,14 @@ func runServeThroughRuntime(
 		}
 		peers[index] = servicetls.Endpoint{Address: encoded[:separator], Node: node}
 	}
+	initialNodes, err := loadInitialNodeDirectory(initialDirectory)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "gateway: initial node directory: %v\n", err)
+		return 2, true
+	}
 	config := Config{
-		CatalogPath: catalog, CatalogRouteSeedPath: routeSeed,
+		InitialNodeDirectory: initialNodes,
+		CatalogPath:          catalog, CatalogRouteSeedPath: routeSeed,
 		DevStaticCatalog: static, DevPlaintext: plaintext,
 		CatalogBootstrapIfMissing: bootstrap,
 		CatalogRelation:           replication.RelationID(relation), CatalogAttempts: attempts,
