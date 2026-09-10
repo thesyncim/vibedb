@@ -6,6 +6,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"os"
 
 	"github.com/thesyncim/vibedb/internal/membershipgrant"
 	"github.com/thesyncim/vibedb/internal/raftservice"
@@ -237,6 +239,8 @@ func (authority *ReplicatedCatalogAuthority) PublishGroupTransition(ctx context.
 	if authority == nil || ctx == nil || !lease.Valid() || !intent.Valid() || next == nil ||
 		lease.Distribution != intent.Key.Distribution || lease.OperationID != intent.Key.OperationID ||
 		(phase != TransitionPhasePreRemove && phase != TransitionPhasePostRemove) {
+		fmt.Fprintf(os.Stderr, "DIAGTRANS entry-guard leaseValid=%v intentValid=%v nextNil=%v phase=%v key=%+v\n",
+			lease.Valid(), intent.Valid(), next == nil, phase, intent.Key)
 		return GroupPublicationReceipt{}, ErrGroupTransition
 	}
 	if receipt, found, err := authority.ReadGroupPublicationReceipt(ctx, intent.Key); err != nil {
@@ -244,12 +248,16 @@ func (authority *ReplicatedCatalogAuthority) PublishGroupTransition(ctx context.
 	} else if found && receipt.Phase == phase {
 		digest, err := CatalogSnapshotDigest(next)
 		if err != nil || receipt.PredecessorReceiptDigest != predecessor || receipt.CommittedHeadDigest != digest {
+			fmt.Fprintf(os.Stderr, "DIAGTRANS receipt-replay-mismatch err=%v predecessor=%x receiptPred=%x digest=%x receiptHead=%x phase=%v key=%+v\n",
+				err, predecessor, receipt.PredecessorReceiptDigest, digest, receipt.CommittedHeadDigest, phase, intent.Key)
 			return GroupPublicationReceipt{}, errors.Join(err, ErrGroupTransition)
 		}
 		return receipt, nil
 	}
 	grant, found, err := authority.ReadMembershipGrant(ctx, intent.Key.Group)
 	if err != nil || !found || !transitionMatchesGrant(intent, grant) {
+		fmt.Fprintf(os.Stderr, "DIAGTRANS grant-mismatch err=%v found=%v matches=%v phase=%v key=%+v grant=%+v intent=%+v\n",
+			err, found, transitionMatchesGrant(intent, grant), phase, intent.Key, grant, intent)
 		return GroupPublicationReceipt{}, errors.Join(err, ErrGroupTransition)
 	}
 	publication := &groupTransitionPublication{lease: lease, intent: intent, phase: phase, predecessor: predecessor}
@@ -304,6 +312,8 @@ func (authority *ReplicatedCatalogAuthority) groupTransitionMutations(ctx contex
 	}
 	nextDigest, err := CatalogSnapshotDigest(next)
 	if err != nil || nextDigest != expectedDigest {
+		fmt.Fprintf(os.Stderr, "DIAGTRANS digest-mismatch err=%v nextDigest=%x expectedDigest=%x phase=%v key=%+v\n",
+			err, nextDigest, expectedDigest, publication.phase, intent.Key)
 		return nil, errors.Join(err, ErrGroupTransition)
 	}
 	currentDigest, err := CatalogSnapshotDigest(current)
@@ -319,12 +329,15 @@ func (authority *ReplicatedCatalogAuthority) groupTransitionMutations(ctx contex
 		encoded, _ := AppendGroupTransitionIntent(nil, intent)
 		priorEncoded, _ := AppendGroupTransitionIntent(nil, prior.Intent)
 		if !bytes.Equal(encoded, priorEncoded) {
+			fmt.Fprintf(os.Stderr, "DIAGTRANS intent-mismatch phase=%v key=%+v newIntent=%+v priorIntent=%+v\n",
+				publication.phase, intent.Key, intent, prior.Intent)
 			return nil, ErrGroupTransition
 		}
 		priorReceipt = &prior.Receipt
 	}
 	manifest, found := next.Manifest(intent.Key.Distribution)
 	if !found {
+		fmt.Fprintf(os.Stderr, "DIAGTRANS manifest-absent phase=%v key=%+v\n", publication.phase, intent.Key)
 		return nil, ErrGroupTransition
 	}
 	receipt := GroupPublicationReceipt{Key: intent.Key, Phase: publication.phase, PredecessorReceiptDigest: publication.predecessor,
