@@ -972,13 +972,13 @@ func installGatewayMembershipGrant(
 	return nil
 }
 
-// gatewayEnrollmentDirectoryRevision is the peer-directory fencing revision
-// every current voter starts at: StaticRegistry initializes it to 1 and only
-// this enrollment fanout ever advances it, so the exact first physical-peer
-// enrollment (the only one a 3-to-4-to-3 scale performs) fences against it
-// deterministically without a remote read. A cluster that dynamically
-// enrolls more than one physical node across its lifetime needs the caller
-// to track subsequent revisions; that is a follow-up, not required here.
+// gatewayEnrollmentDirectoryRevision is only a starting guess: StaticRegistry
+// initializes a voter's peer-directory fencing revision to 1, so this is
+// correct without a remote read for a voter's first enrollment ever (e.g. a
+// 3-to-4-to-3 scale). A voter that has already committed a later enrollment -
+// the ordinary case once a cluster has more than one group - rejects this
+// guess, and rafttransport.EnrollmentControlClient.EnrollMember retries once
+// using the current revision the rejection itself reports back.
 const gatewayEnrollmentDirectoryRevision = 1
 
 // buildGatewayEnrollmentIntent derives the one certified physical-peer

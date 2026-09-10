@@ -28,6 +28,18 @@ var (
 const (
 	enrollmentControlVersion byte = 1
 
+	// enrollmentResponseKindAck is a committed receipt (the historical, only
+	// response shape). enrollmentResponseKindConflict is a best-effort hint
+	// written when Serve rejects an intent for a stale DirectoryRevision: it
+	// carries the registry's actual current revision instead of a receipt, so
+	// EnrollMember can retry once with a corrected value. DirectoryRevision is
+	// a single monotonic counter per registry instance shared by every group
+	// and peer it enrolls, so any voter that has committed more than one
+	// enrollment in its lifetime - the ordinary case once a cluster has more
+	// than one group - needs this to enroll a second time.
+	enrollmentResponseKindAck      byte = 0
+	enrollmentResponseKindConflict byte = 1
+
 	// The discriminator is consumed by shardcontrol.Mux and replayed to the
 	// handler.  It is separate from nodecontrol, membership grants, and
 	// snapshot bootstrap so a listener never guesses a request grammar.
@@ -165,6 +177,16 @@ func (service *EnrollmentControlService) Serve(
 		err = service.registry.EnrollMemberContext(ctx, intent, service.verifier)
 	}
 	if err != nil {
+		if errors.Is(err, ErrPeerConflict) {
+			// Best-effort: a corrected retry is only possible if this frame
+			// makes it out before the deadline. Either way the original
+			// commit error below is what the caller ultimately observes.
+			if deadline := enrollmentControlDeadline(ctx, service.writeDeadline()); !deadline.IsZero() {
+				if setErr := connection.SetWriteDeadline(deadline); setErr == nil {
+					_ = writeEnrollmentConflict(connection, service.registry.PeerDirectoryRevision())
+				}
+			}
+		}
 		return err
 	}
 	ack, err := service.registry.EnrollmentAck(intent)
@@ -190,8 +212,14 @@ type EnrollmentControlStreamOpener interface {
 }
 
 // EnrollmentControlClient sends one intent to one voter and validates the
-// exact ACK. It performs no retries internally; callers use the idempotent
-// fanout replay path so retry policy remains tied to the durable intent.
+// exact ACK. It performs no retries for a failed or lost attempt - callers
+// use the idempotent fanout replay path so that retry policy stays tied to
+// the durable intent. The one exception is transparent to callers: a target
+// voter that rejects the caller's DirectoryRevision guess reports its actual
+// current value on that same rejection, and EnrollMember retries once with
+// the corrected value before giving up. That correction changes nothing
+// about which intent is being enrolled, so it stays internal rather than
+// becoming another case callers must handle.
 type EnrollmentControlClient struct {
 	opener        EnrollmentControlStreamOpener
 	registry      *StaticRegistry
@@ -220,59 +248,86 @@ func NewEnrollmentControlClient(
 
 // EnrollMember sends one exact committed intent to target. The target's
 // handler performs the local verifier read and queue-before-directory commit.
+//
+// DirectoryRevision fences every enrollment a registry ever commits behind
+// one monotonic counter shared across all its groups and peers, not just the
+// caller's own group. A caller only ever knows the right value for the very
+// first enrollment a registry commits; any later one - the ordinary case
+// once a cluster has more than one group - needs the registry's own current
+// value. Rather than requiring every caller to discover that value out of
+// band, a rejected attempt gets one corrected retry using the current
+// revision the target reports back on that same rejection.
 func (client *EnrollmentControlClient) EnrollMember(
 	ctx context.Context,
 	target NodeID,
 	intent EnrollmentIntent,
 ) (EnrollmentAck, error) {
+	ack, conflictRevision, err := client.enrollMemberOnce(ctx, target, intent)
+	if err == nil || conflictRevision == 0 || conflictRevision == intent.DirectoryRevision {
+		return ack, err
+	}
+	retryIntent := intent
+	retryIntent.DirectoryRevision = conflictRevision
+	ack, _, err = client.enrollMemberOnce(ctx, target, retryIntent)
+	return ack, err
+}
+
+func (client *EnrollmentControlClient) enrollMemberOnce(
+	ctx context.Context,
+	target NodeID,
+	intent EnrollmentIntent,
+) (EnrollmentAck, uint64, error) {
 	if client == nil || ctx == nil || target == (NodeID{}) ||
 		!validEnrollmentWireIntent(intent) {
-		return EnrollmentAck{}, ErrEnrollmentControl
+		return EnrollmentAck{}, 0, ErrEnrollmentControl
 	}
 	connection, err := client.opener.OpenShardControl(ctx, target)
 	if err != nil {
 		if connection != nil {
 			_ = connection.Close()
 		}
-		return EnrollmentAck{}, err
+		return EnrollmentAck{}, 0, err
 	}
 	if connection == nil {
-		return EnrollmentAck{}, ErrEnrollmentControl
+		return EnrollmentAck{}, 0, ErrEnrollmentControl
 	}
 	defer connection.Close()
 	identity := connection.PeerIdentity()
 	if connection.TrafficClass() != TrafficShardControl || identity.Node != target ||
 		identity.TrustDomain != intent.Domain {
-		return EnrollmentAck{}, ErrEnrollmentControlUnauthorized
+		return EnrollmentAck{}, 0, ErrEnrollmentControlUnauthorized
 	}
 	if client.registry != nil {
 		if err := client.registry.VerifyPeerConnectionBinding(connection); err != nil {
-			return EnrollmentAck{}, errors.Join(ErrEnrollmentControlUnauthorized, err)
+			return EnrollmentAck{}, 0, errors.Join(ErrEnrollmentControlUnauthorized, err)
 		}
 	}
 	if deadline := enrollmentControlDeadline(ctx, client.writeDeadline()); deadline.IsZero() {
-		return EnrollmentAck{}, ErrEnrollmentControl
+		return EnrollmentAck{}, 0, ErrEnrollmentControl
 	} else if err = connection.SetWriteDeadline(deadline); err != nil {
-		return EnrollmentAck{}, err
+		return EnrollmentAck{}, 0, err
 	}
 	if err = WriteEnrollmentRequest(connection, intent); err != nil {
-		return EnrollmentAck{}, errors.Join(ErrEnrollmentControlOutcome, err)
+		return EnrollmentAck{}, 0, errors.Join(ErrEnrollmentControlOutcome, err)
 	}
 	if deadline := enrollmentControlDeadline(ctx, client.readDeadline()); deadline.IsZero() {
-		return EnrollmentAck{}, ErrEnrollmentControlOutcome
+		return EnrollmentAck{}, 0, ErrEnrollmentControlOutcome
 	} else if err = connection.SetReadDeadline(deadline); err != nil {
-		return EnrollmentAck{}, errors.Join(ErrEnrollmentControlOutcome, err)
+		return EnrollmentAck{}, 0, errors.Join(ErrEnrollmentControlOutcome, err)
 	}
-	ack, err := OpenEnrollmentAck(connection)
+	ack, conflictRevision, err := openEnrollmentConflict(connection)
 	if err != nil {
-		return EnrollmentAck{}, errors.Join(ErrEnrollmentControlOutcome, err)
+		return EnrollmentAck{}, 0, errors.Join(ErrEnrollmentControlOutcome, err)
+	}
+	if conflictRevision != 0 {
+		return EnrollmentAck{}, conflictRevision, ErrPeerConflict
 	}
 	if !ack.valid() || ack.IntentDigest != intent.Digest || ack.Group != intent.Group ||
 		ack.MemberID != intent.Member.MemberID || ack.Node != intent.Peer.NodeID ||
 		ack.DirectoryRevision < intent.DirectoryRevision {
-		return EnrollmentAck{}, ErrEnrollmentControl
+		return EnrollmentAck{}, 0, ErrEnrollmentControl
 	}
-	return ack, nil
+	return ack, 0, nil
 }
 
 // ReplayEnrollment is an explicit restart spelling. StaticRegistry accepts an
@@ -569,13 +624,32 @@ func OpenEnrollmentRequest(reader io.Reader) (EnrollmentIntent, error) {
 
 // WriteEnrollmentAck writes a complete fixed receipt.
 func WriteEnrollmentAck(writer io.Writer, ack EnrollmentAck) error {
-	if writer == nil || !ack.valid() {
+	if !ack.valid() {
+		return ErrEnrollmentControl
+	}
+	return writeEnrollmentResponseFrame(writer, enrollmentResponseKindAck, ack)
+}
+
+// writeEnrollmentConflict writes the current-revision hint in place of a
+// receipt. currentRevision is the registry's own PeerDirectoryRevision after
+// the rejection, i.e. the value a corrected retry must supply.
+func writeEnrollmentConflict(writer io.Writer, currentRevision uint64) error {
+	if currentRevision == 0 {
+		return ErrEnrollmentControl
+	}
+	return writeEnrollmentResponseFrame(writer, enrollmentResponseKindConflict,
+		EnrollmentAck{DirectoryRevision: currentRevision})
+}
+
+func writeEnrollmentResponseFrame(writer io.Writer, kind byte, ack EnrollmentAck) error {
+	if writer == nil {
 		return ErrEnrollmentControl
 	}
 	raw := make([]byte, enrollmentAckBytes)
 	copy(raw[:8], enrollmentAckMagic[:])
 	raw[8] = enrollmentControlVersion
-	// raw[9:12] remain zero.
+	raw[9] = kind
+	// raw[10:12] remain zero.
 	offset := 12
 	copy(raw[offset:offset+32], ack.IntentDigest[:])
 	offset += 32
@@ -593,18 +667,58 @@ func WriteEnrollmentAck(writer io.Writer, ack EnrollmentAck) error {
 	return writeFull(writer, raw)
 }
 
+// OpenEnrollmentAck reads a committed receipt. A conflict hint (see
+// writeEnrollmentConflict) is rejected here; only EnrollMember's internal
+// retry path is expected to see one, via openEnrollmentConflict.
 func OpenEnrollmentAck(reader io.Reader) (EnrollmentAck, error) {
-	if reader == nil {
+	ack, kind, err := openEnrollmentResponseFrame(reader)
+	if err != nil {
+		return EnrollmentAck{}, err
+	}
+	if kind != enrollmentResponseKindAck || !ack.valid() {
 		return EnrollmentAck{}, ErrEnrollmentControl
+	}
+	return ack, nil
+}
+
+// openEnrollmentConflict reads either a committed receipt or a current-
+// revision hint. Exactly one of the two results is meaningful: a nonzero
+// conflictRevision means the target rejected the intent and ack is zero;
+// otherwise ack is the valid, committed receipt.
+func openEnrollmentConflict(reader io.Reader) (ack EnrollmentAck, conflictRevision uint64, err error) {
+	ack, kind, err := openEnrollmentResponseFrame(reader)
+	if err != nil {
+		return EnrollmentAck{}, 0, err
+	}
+	switch kind {
+	case enrollmentResponseKindAck:
+		if !ack.valid() {
+			return EnrollmentAck{}, 0, ErrEnrollmentControl
+		}
+		return ack, 0, nil
+	case enrollmentResponseKindConflict:
+		if ack.DirectoryRevision == 0 {
+			return EnrollmentAck{}, 0, ErrEnrollmentControl
+		}
+		return EnrollmentAck{}, ack.DirectoryRevision, nil
+	default:
+		return EnrollmentAck{}, 0, ErrEnrollmentControl
+	}
+}
+
+func openEnrollmentResponseFrame(reader io.Reader) (EnrollmentAck, byte, error) {
+	if reader == nil {
+		return EnrollmentAck{}, 0, ErrEnrollmentControl
 	}
 	raw := make([]byte, enrollmentAckBytes)
 	if _, err := io.ReadFull(reader, raw); err != nil {
-		return EnrollmentAck{}, errors.Join(ErrEnrollmentControl, err)
+		return EnrollmentAck{}, 0, errors.Join(ErrEnrollmentControl, err)
 	}
 	if !equalBytes(raw[:8], enrollmentAckMagic[:]) || raw[8] != enrollmentControlVersion ||
-		raw[9] != 0 || raw[10] != 0 || raw[11] != 0 {
-		return EnrollmentAck{}, ErrEnrollmentControl
+		raw[10] != 0 || raw[11] != 0 {
+		return EnrollmentAck{}, 0, ErrEnrollmentControl
 	}
+	kind := raw[9]
 	var ack EnrollmentAck
 	offset := 12
 	copy(ack.IntentDigest[:], raw[offset:offset+32])
@@ -620,10 +734,7 @@ func OpenEnrollmentAck(reader io.Reader) (EnrollmentAck, error) {
 	copy(ack.PeerDirectoryDigest[:], raw[offset:offset+32])
 	offset += 32
 	copy(ack.RosterDigest[:], raw[offset:offset+32])
-	if !ack.valid() {
-		return EnrollmentAck{}, ErrEnrollmentControl
-	}
-	return ack, nil
+	return ack, kind, nil
 }
 
 func validEnrollmentWireIntent(intent EnrollmentIntent) bool {

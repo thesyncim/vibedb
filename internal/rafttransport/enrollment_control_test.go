@@ -185,6 +185,158 @@ func TestEnrollmentControlRoundTripAndRestartReplay(t *testing.T) {
 	}
 }
 
+// TestEnrollmentControlRetriesStaleDirectoryRevision exercises a voter that
+// has already committed one enrollment (for group1) before a second,
+// unrelated group's AddLearner enrolls the same already-known physical peer
+// (group2). The caller's guess - DirectoryRevision 1, the only value it can
+// derive without a remote read - is stale by the time this second enrollment
+// runs. EnrollMember must recover using the current-revision hint the
+// rejection reports, not fail the way an ordinary hot-shard replica move
+// (any cluster with more than one raft group) would otherwise fail every
+// time past its target's first-ever enrollment.
+func TestEnrollmentControlRetriesStaleDirectoryRevision(t *testing.T) {
+	group1 := testGroup(224)
+	group2 := group1
+	group2.GroupID = [16]byte{224, 9}
+	domain := TrustDomain{ClusterID: group1.ClusterID, ClusterIncarnation: group1.ClusterIncarnation}
+	members := append(enrollmentTestMembers(group1), enrollmentTestMembers(group2)...)
+	limits := Limits{MaxGroups: 2, MaxMembers: 8, MaxPeers: 4}
+	source, err := NewStaticRegistryWithDirectory(
+		testNode(1), members, enrollmentTestPeers(domain, testNode(1), testNode(2), testNode(3), testNode(4)),
+		1, limits,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := NewStaticRegistryWithDirectory(
+		testNode(2), members, enrollmentTestPeers(domain, testNode(1), testNode(2), testNode(3)),
+		1, limits,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetTransport, err := NewOrdinaryTransport(OrdinaryTransportOptions{
+		Registry: target, Dialer: ordinaryDialFunc(func(context.Context, NodeID) (PeerConnection, error) {
+			return nil, ErrTransportClosed
+		}),
+		Queue: QueueLimits{
+			PerPeerFrames: 4, PerPeerBytes: 1 << 16,
+			GlobalFrames: 8, GlobalBytes: 1 << 17,
+		},
+		Coalesce: CoalesceLimits{
+			MaxFrames: 2, MaxBytes: 1 << 16, RetainedBytes: DefaultRetainedFrameBytes,
+		},
+		Wait: WaitWithTimer, Backoff: func(uint32) time.Duration { return time.Millisecond },
+		MaxReconnectDelay: time.Second, WriteDeadline: enrollmentDeadline,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer targetTransport.Close()
+
+	clientKey, _ := source.PhysicalPeer(testNode(2))
+	serverKey, _ := target.PhysicalPeer(testNode(1))
+	service, err := NewEnrollmentControlService(EnrollmentControlServiceOptions{
+		Registry: target, Transport: targetTransport, Verifier: EnrollmentVerifierFunc(allowEnrollment),
+		Authorize: func(_ context.Context, connection PeerConnection, _ EnrollmentIntent) error {
+			if connection.PeerIdentity().Node != testNode(1) {
+				return ErrEnrollmentControlUnauthorized
+			}
+			return target.VerifyPeerConnectionBinding(connection)
+		},
+		ReadDeadline: enrollmentDeadline, WriteDeadline: enrollmentDeadline,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// EnrollMember opens one connection per attempt (its own retry included),
+	// serving each on a fresh net.Pipe so it looks exactly like a fresh
+	// dial. serveErrs collects every Serve outcome in call order.
+	var serveWG sync.WaitGroup
+	var serveMu sync.Mutex
+	var serveErrs []error
+	clientControl, err := NewEnrollmentControlClient(EnrollmentControlClientOptions{
+		Opener: enrollmentTestOpener{open: func(context.Context, NodeID) (PeerConnection, error) {
+			clientConn, serverConn := net.Pipe()
+			client := &enrollmentTestConnection{
+				Conn: clientConn, identity: PeerIdentity{TrustDomain: domain, Node: testNode(2)},
+				key: clientKey.ServiceKeyDigest, class: TrafficShardControl,
+			}
+			server := &enrollmentTestConnection{
+				Conn: serverConn, identity: PeerIdentity{TrustDomain: domain, Node: testNode(1)},
+				key: serverKey.ServiceKeyDigest, class: TrafficShardControl,
+			}
+			serveWG.Add(1)
+			go func() {
+				defer serveWG.Done()
+				err := service.Serve(context.Background(), server)
+				serveMu.Lock()
+				serveErrs = append(serveErrs, err)
+				serveMu.Unlock()
+			}()
+			return client, nil
+		}},
+		Registry: source, ReadDeadline: enrollmentDeadline, WriteDeadline: enrollmentDeadline,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	roster1, ok := target.RosterDigest(group1)
+	if !ok {
+		t.Fatal("target roster digest missing for group1")
+	}
+	first := dynamicPeerIntent(target, testNode(4), 224, group1, 4, roster1)
+	first.Peer.Endpoint, first.Peer.Address, first.Peer.Node = "127.0.0.1:25004", "127.0.0.1:25004", testNode(4)
+	firstAck, err := clientControl.EnrollMember(context.Background(), testNode(2), first)
+	if err != nil {
+		t.Fatalf("first enrollment (group1) failed: %v", err)
+	}
+	if firstAck.DirectoryRevision != 2 {
+		t.Fatalf("first enrollment revision = %d, want 2 (the registry's post-commit value)", firstAck.DirectoryRevision)
+	}
+
+	// A second, unrelated group's AddLearner enrolls the same already-known
+	// physical peer. The caller has no remote read of the voter's directory
+	// and guesses DirectoryRevision 1 again - the same guess that was
+	// correct the first time - which is now stale.
+	roster2, ok := target.RosterDigest(group2)
+	if !ok {
+		t.Fatal("target roster digest missing for group2")
+	}
+	second := dynamicPeerIntent(target, testNode(4), 225, group2, 4, roster2)
+	second.Peer.Endpoint, second.Peer.Address, second.Peer.Node = "127.0.0.1:25004", "127.0.0.1:25004", testNode(4)
+	second.DirectoryRevision = 1 // stale: target's current revision already advanced to 2 above
+
+	secondAck, err := clientControl.EnrollMember(context.Background(), testNode(2), second)
+	if err != nil {
+		t.Fatalf("EnrollMember did not recover from a stale DirectoryRevision guess: %v", err)
+	}
+	if secondAck.DirectoryRevision != 3 || secondAck.Group != group2 || secondAck.MemberID != 4 {
+		t.Fatalf("unexpected corrected enrollment ACK: %+v", secondAck)
+	}
+	if role, err := target.Role(group2, 4); !errors.Is(err, ErrMemberNotFound) || role != 0 {
+		t.Fatalf("enrollment unexpectedly granted authority: role=%v err=%v", role, err)
+	}
+
+	serveWG.Wait()
+	serveMu.Lock()
+	defer serveMu.Unlock()
+	if len(serveErrs) != 3 {
+		t.Fatalf("Serve call count = %d, want 3 (first enroll, stale second attempt, corrected retry): %v",
+			len(serveErrs), serveErrs)
+	}
+	if serveErrs[0] != nil {
+		t.Fatalf("first enrollment Serve error = %v, want nil", serveErrs[0])
+	}
+	if !errors.Is(serveErrs[1], ErrPeerConflict) {
+		t.Fatalf("stale second-enrollment attempt Serve error = %v, want ErrPeerConflict", serveErrs[1])
+	}
+	if serveErrs[2] != nil {
+		t.Fatalf("corrected retry Serve error = %v, want nil", serveErrs[2])
+	}
+}
+
 func TestEnrollmentRequestCanonicalRoundTrip(t *testing.T) {
 	group := testGroup(222)
 	domain := TrustDomain{ClusterID: group.ClusterID, ClusterIncarnation: group.ClusterIncarnation}
