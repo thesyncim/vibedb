@@ -15,7 +15,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"os"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -1025,14 +1024,6 @@ func (registry *StaticRegistry) enrollMemberWithCommitContext(
 	}
 	memberKey := memberKey{group: intent.Group, memberID: intent.Member.MemberID}
 	nodeKey := nodeKey{group: intent.Group, node: intent.Peer.NodeID}
-	{
-		staticExisting, staticOK := registry.nodes[memberKey]
-		dynExisting, dynOK := current.nodes[memberKey]
-		fmt.Fprintf(os.Stderr, "DIAGENR local=%x group=%x member=%d intentNode=%x intentDigest=%x staticOK=%v staticNode=%x staticDigest=%x dynOK=%v dynNode=%x dynDigest=%x\n",
-			registry.local, intent.Group.GroupID, intent.Member.MemberID, intent.Peer.NodeID, intent.Digest,
-			staticOK, staticExisting.node, staticExisting.enrollmentDigest,
-			dynOK, dynExisting.node, dynExisting.enrollmentDigest)
-	}
 	if existing, ok := registry.nodes[memberKey]; ok {
 		if existing.node != intent.Peer.NodeID {
 			return ErrEnrollmentConflict
