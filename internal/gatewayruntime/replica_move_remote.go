@@ -5,9 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"net"
-	"os"
 	"sync"
 
 	"github.com/thesyncim/vibedb/gateway"
@@ -145,8 +143,6 @@ func (observer gatewayReplicaMoveObserver) ObserveReplicaMove(
 		TargetStatus: target.Status, TargetState: target.State,
 		TargetProgress: leader.Progress, ProgressFound: leader.ProgressFound,
 	}}
-	fmt.Fprintf(os.Stderr, "DIAGRESOLVE op=%x initialNil=%v transitionKeyValid=%v group=%x\n",
-		operation, initial == nil, transitionKey.Valid(), request.Group.GroupID)
 	if transitionKey.Valid() {
 		reader, ok := observer.authority.(gateway.GroupTransitionReceiptReader)
 		if !ok {

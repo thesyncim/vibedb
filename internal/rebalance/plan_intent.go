@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"os"
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
@@ -148,8 +147,6 @@ func AppendReplicaMoveIntent(dst []byte, catalog *gateway.Snapshot, plan *Plan) 
 	if err != nil {
 		return dst, err
 	}
-	fmt.Fprintf(os.Stderr, "DIAGPERSIST op=%x group=%x transitionReady=%v transitionBytes=%d catalogGen=%d\n",
-		plan.operation, plan.request.Group.GroupID, plan.transitionReady, len(transition), catalog.Generation())
 	return appendPersistedPlanIntent(dst, persistedPlanIntent{
 		Operation: [32]byte(plan.operation), SourceGeneration: plan.catalogGeneration,
 		Request: persistMoveRequest(plan.request), FailureAuthority: bytes.Clone(plan.failureAuthorization),
