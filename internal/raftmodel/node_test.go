@@ -1303,6 +1303,162 @@ func TestReadIndexRejectsLeadershipChangeBeforeRelease(t *testing.T) {
 	}
 }
 
+// walkToApplied drives one Ready to the applied phase without recording
+// read states, so the caller can stage core-delayed responses first.
+func walkToApplied(t *testing.T, node *Node) {
+	t.Helper()
+	if captured, err := node.CaptureReady(); err != nil || !captured {
+		t.Fatalf("CaptureReady() = %v, %v", captured, err)
+	}
+	if err := node.PersistReady(); err != nil {
+		t.Fatalf("PersistReady() error = %v", err)
+	}
+	if err := node.DrainMessages(func(*pb.Message) error { return nil }); err != nil {
+		t.Fatalf("DrainMessages() error = %v", err)
+	}
+	if err := node.InstallSnapshot(); err != nil {
+		t.Fatalf("InstallSnapshot() error = %v", err)
+	}
+	if err := applyCommittedForTest(node); err != nil {
+		t.Fatalf("ApplyCommitted() error = %v", err)
+	}
+}
+
+func finishCycle(t *testing.T, node *Node) {
+	t.Helper()
+	if _, err := node.FinishReadStates(); err != nil {
+		t.Fatalf("FinishReadStates() error = %v", err)
+	}
+	if err := node.AdvanceReady(); err != nil {
+		t.Fatalf("AdvanceReady() error = %v", err)
+	}
+}
+
+func stepHigherTerm(t *testing.T, node *Node, peer uint64) {
+	t.Helper()
+	status := node.Status()
+	nextTerm := status.GetTerm() + 1
+	if err := node.Step(&pb.Message{
+		Type:   pb.MsgHeartbeat.Enum(),
+		From:   uint64Ptr(peer),
+		To:     uint64Ptr(node.Status().ID),
+		Term:   &nextTerm,
+		Commit: uint64Ptr(status.GetCommit()),
+	}); err != nil {
+		t.Fatalf("Step(higher-term heartbeat) error = %v", err)
+	}
+}
+
+func TestStaleReadStateAfterLeadershipLossIsDropped(t *testing.T) {
+	node, _, _ := newTestNode(t, 1, []uint64{1, 2})
+	driveCampaignWithPeer(t, node, 2)
+	context := []byte("stale-read-response")
+	if err := node.ReadIndex(context); err != nil {
+		t.Fatalf("ReadIndex() error = %v", err)
+	}
+	stepHigherTerm(t, node, 2)
+	walkToApplied(t, node)
+	outcomes, err := node.FinishReadStates()
+	if err != nil {
+		t.Fatalf("FinishReadStates() error = %v", err)
+	}
+	if len(outcomes) != 1 || !errors.Is(outcomes[0].Err, ErrReadLeadershipLost) {
+		t.Fatalf("read outcomes = %+v, want leadership-lost outcome", outcomes)
+	}
+	if err := node.AdvanceReady(); err != nil {
+		t.Fatalf("AdvanceReady() error = %v", err)
+	}
+	// The withdrawn read's late response arrives in a later Ready: the
+	// core preserves confirmed ReadStates across reset and buffers late
+	// responses even as follower.
+	stepHigherTerm(t, node, 2)
+	walkToApplied(t, node)
+	commit := node.Status().GetCommit()
+	node.ready.ReadStates = append(node.ready.ReadStates, raft.ReadState{Index: commit, RequestCtx: slices.Clone(context)})
+	recorded, err := node.RecordNextReadState()
+	if err != nil || !recorded {
+		t.Fatalf("RecordNextReadState() = %v, %v, want dropped stale response", recorded, err)
+	}
+	if recorded, err := node.RecordNextReadState(); err != nil || recorded {
+		t.Fatalf("RecordNextReadState() = %v, %v, want no more states", recorded, err)
+	}
+	if node.DroppedStaleReadStates() != 1 {
+		t.Fatalf("dropped stale responses = %d, want 1", node.DroppedStaleReadStates())
+	}
+	if len(node.cancelledReads) != 0 {
+		t.Fatalf("tombstones retained = %d, want one-shot consumption", len(node.cancelledReads))
+	}
+	finishCycle(t, node)
+	if node.Failure() != nil {
+		t.Fatalf("node failure = %v, want surviving node", node.Failure())
+	}
+	if node.Phase() != PhaseIdle {
+		t.Fatalf("node phase = %s, want idle", node.Phase())
+	}
+}
+
+func TestDuplicateReadStateIsDroppedOnce(t *testing.T) {
+	node, _, _ := newTestNode(t, 1, []uint64{1, 2})
+	driveCampaignWithPeer(t, node, 2)
+	context := []byte("twice-delivered-response")
+	if err := node.ReadIndex(context); err != nil {
+		t.Fatalf("ReadIndex() error = %v", err)
+	}
+	// A proposal makes outbound traffic capturable; the read itself stays
+	// postponed in the core without a same-term commit.
+	if err := node.Propose([]byte("vehicle")); err != nil {
+		t.Fatalf("Propose() error = %v", err)
+	}
+	walkToApplied(t, node)
+	// One Ready observed twice before storage completions advance past
+	// it delivers the identical barrier twice.
+	commit := node.Status().GetCommit()
+	node.ready.ReadStates = append(node.ready.ReadStates,
+		raft.ReadState{Index: commit, RequestCtx: slices.Clone(context)},
+		raft.ReadState{Index: commit, RequestCtx: slices.Clone(context)})
+	for i := 0; i < 2; i++ {
+		if recorded, err := node.RecordNextReadState(); err != nil || !recorded {
+			t.Fatalf("RecordNextReadState() %d = %v, %v", i, recorded, err)
+		}
+	}
+	if recorded, err := node.RecordNextReadState(); err != nil || recorded {
+		t.Fatalf("RecordNextReadState() = %v, %v, want no more states", recorded, err)
+	}
+	if node.DroppedDuplicateReadStates() != 1 {
+		t.Fatalf("dropped duplicate responses = %d, want 1", node.DroppedDuplicateReadStates())
+	}
+	if got := len(node.pendingReads); got != 1 {
+		t.Fatalf("pending barriers = %d, want exactly one", got)
+	}
+	finishCycle(t, node)
+	if node.Failure() != nil {
+		t.Fatalf("node failure = %v, want surviving node", node.Failure())
+	}
+}
+
+func TestUnknownReadStateStillFailsNode(t *testing.T) {
+	node, _, _ := newTestNode(t, 1, []uint64{1, 2})
+	driveCampaignWithPeer(t, node, 2)
+	if err := node.ReadIndex([]byte("genuine-issue")); err != nil {
+		t.Fatalf("ReadIndex() error = %v", err)
+	}
+	// A proposal makes outbound traffic capturable; the read itself stays
+	// postponed in the core without a same-term commit.
+	if err := node.Propose([]byte("vehicle")); err != nil {
+		t.Fatalf("Propose() error = %v", err)
+	}
+	walkToApplied(t, node)
+	commit := node.Status().GetCommit()
+	node.ready.ReadStates = append(node.ready.ReadStates,
+		raft.ReadState{Index: commit, RequestCtx: []byte("never-issued")})
+	if _, err := node.RecordNextReadState(); err == nil {
+		t.Fatal("RecordNextReadState() succeeded on unknown context, want fail-closed")
+	}
+	if node.Phase() != PhaseFailed || node.Failure() == nil {
+		t.Fatalf("node phase=%s failure=%v, want failed node", node.Phase(), node.Failure())
+	}
+}
+
 func TestStepAdmitsOnlyCurrentLeaderTimeoutNow(t *testing.T) {
 	newFollower := func(t *testing.T) (*Node, uint64) {
 		t.Helper()
