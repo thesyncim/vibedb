@@ -5,7 +5,9 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
+	"os"
 	"sync"
 
 	"github.com/thesyncim/vibedb/gateway"
@@ -152,6 +154,8 @@ func (observer gatewayReplicaMoveObserver) ObserveReplicaMove(
 		if err != nil {
 			return rebalance.ReplicatedMoveCut{}, err
 		}
+		fmt.Fprintf(os.Stderr, "DIAGREAD op=%x found=%v receiptValid=%v receiptPhase=%v receiptKeyOp=%x queryKeyOp=%x keysEqual=%v\n",
+			operation, found, receipt.Valid(), receipt.Phase, receipt.Key.OperationID, transitionKey.OperationID, receipt.Key == transitionKey)
 		cut.TransitionReceipt, cut.TransitionReceiptFound = receipt, found
 	}
 	if target.SnapshotBase != nil {

@@ -12,7 +12,9 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"hash"
+	"os"
 	"slices"
 
 	"github.com/thesyncim/vibedb/distribution"
@@ -307,6 +309,9 @@ func (receipt GroupPublicationReceipt) ValidateSuccessor(intent GroupTransitionI
 		return nil
 	}
 	if !prior.Valid() || prior.Key != receipt.Key || receipt.PredecessorReceiptDigest == ([32]byte{}) {
+		fmt.Fprintf(os.Stderr, "DIAGPRIOR priorValid=%v keysEqual=%v predDigestZero=%v priorPhase=%v receiptPhase=%v priorKeyOp=%x receiptKeyOp=%x\n",
+			prior.Valid(), prior.Key == receipt.Key, receipt.PredecessorReceiptDigest == ([32]byte{}),
+			prior.Phase, receipt.Phase, prior.Key.OperationID, receipt.Key.OperationID)
 		return ErrGroupTransition
 	}
 	digest, err := prior.ReceiptDigest()
