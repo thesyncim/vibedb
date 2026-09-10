@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"slices"
 
 	"github.com/thesyncim/vibedb/distribution"
@@ -245,6 +246,8 @@ func (p *Plan) installTransitionIntent(current *gateway.Snapshot) {
 		// Some callers carry the target identity in the cold endpoint directory
 		// before enrollment. Keep the intent unavailable until the authority has
 		// supplied a complete authenticated target rather than fabricating it.
+		fmt.Fprintf(os.Stderr, "DIAGINTENT no-enrolled-target op=%x group=%x distribution=%s shard=%s catalogGen=%d\n",
+			p.operation, p.request.Group.GroupID, p.request.Distribution, p.request.Shard, current.Generation())
 		return
 	}
 	headDigest, err := gateway.CatalogSnapshotDigest(current)
@@ -274,10 +277,12 @@ func (p *Plan) installTransitionIntent(current *gateway.Snapshot) {
 		TargetDistributionVersion: p.targetManifest.Version(),
 	}
 	if !intent.Valid() {
+		fmt.Fprintf(os.Stderr, "DIAGINTENT intent-invalid op=%x group=%x\n", p.operation, p.request.Group.GroupID)
 		return
 	}
 	p.transition = intent
 	p.transitionReady = true
+	fmt.Fprintf(os.Stderr, "DIAGINTENT ready op=%x group=%x key=%x\n", p.operation, p.request.Group.GroupID, intent.Key.OperationID)
 }
 
 // BindSnapshotBase returns a new plan bound to one strictly verified learner
