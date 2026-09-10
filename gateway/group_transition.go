@@ -12,9 +12,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"hash"
-	"os"
 	"slices"
 
 	"github.com/thesyncim/vibedb/distribution"
@@ -340,30 +338,21 @@ func BuildGroupOwnedShardTransition(
 	replacement ReplicatedReplicaDescriptor,
 	command raftservice.CommandFence,
 ) (*Snapshot, error) {
-	diag := func(label string) (*Snapshot, error) {
-		fmt.Fprintf(os.Stderr, "DIAGBUILD %s phase=%v key=%+v sourceMember=%d targetMember=%d replacement=%+v\n",
-			label, phase, intent.Key, intent.SourceMember, intent.TargetMember, replacement)
-		return nil, ErrGroupTransition
-	}
-	diagErr := func(label string, err error) (*Snapshot, error) {
-		fmt.Fprintf(os.Stderr, "DIAGBUILD %s err=%v phase=%v key=%+v\n", label, err, phase, intent.Key)
-		return nil, errors.Join(err, ErrGroupTransition)
-	}
 	if replacement == (ReplicatedReplicaDescriptor{}) {
 		replacement = intent.Replacement
 	}
 	if current == nil || !intent.Valid() || !phase.Valid() ||
 		replacement != intent.Replacement || !validTransitionReplica(replacement) ||
 		replacement.Member != intent.TargetMember || !command.Valid() || current.Generation() == ^uint64(0) {
-		return diag("entry-guard")
+		return nil, ErrGroupTransition
 	}
 	manifest, ok := current.Manifest(intent.Key.Distribution)
 	if !ok || manifest == nil {
-		return diag("manifest-absent")
+		return nil, ErrGroupTransition
 	}
 	if phase == TransitionPhasePreRemove && manifest.Version() != intent.SourceDistributionVersion ||
 		phase == TransitionPhasePostRemove && manifest.Version() != intent.TargetDistributionVersion {
-		return diag("manifest-version-mismatch")
+		return nil, ErrGroupTransition
 	}
 	descriptors := current.replicatedDescriptors()
 	changed := false
@@ -373,12 +362,12 @@ func BuildGroupOwnedShardTransition(
 			continue
 		}
 		if changed || descriptor.Distribution != intent.Key.Distribution || descriptor.Shard != intent.Key.Shard {
-			return diag("descriptor-route-mismatch")
+			return nil, ErrGroupTransition
 		}
 		if phase == TransitionPhasePreRemove {
 			if DigestReplicatedShardDescriptor(*descriptor) != intent.Key.SourceDescriptorDigest ||
 				descriptor.Command != intent.SourceDescriptor.Command || len(descriptor.Replicas) != ServingReplicaCount {
-				return diag("pre-remove-descriptor-digest-mismatch")
+				return nil, ErrGroupTransition
 			}
 			changedOrdinal := -1
 			for replicaOrdinal := range descriptor.Replicas {
@@ -388,7 +377,7 @@ func BuildGroupOwnedShardTransition(
 				}
 			}
 			if changedOrdinal < 0 || !validTransitionReplica(descriptor.Replicas[changedOrdinal]) {
-				return diag("pre-remove-source-absent")
+				return nil, ErrGroupTransition
 			}
 			source := descriptor.Replicas[changedOrdinal]
 			descriptor.Replicas[changedOrdinal] = replacement
@@ -400,13 +389,13 @@ func BuildGroupOwnedShardTransition(
 			} else if source.NativeEndpoint == intent.SourceRoute[0] {
 				replacementEndpoint := replacement.NativeEndpoint
 				if replacementEndpoint == "" {
-					return diag("pre-remove-missing-native-endpoint")
+					return nil, ErrGroupTransition
 				}
 				descriptor.Replicas[changedOrdinal].Endpoint = replacementEndpoint
 			} else if source.ControlEndpoint == intent.SourceRoute[0] {
 				descriptor.Replicas[changedOrdinal].Endpoint = replacement.ControlEndpoint
 			} else {
-				return diag("pre-remove-source-route-mismatch")
+				return nil, ErrGroupTransition
 			}
 			descriptor.Command = command
 			changed = true
@@ -421,29 +410,29 @@ func BuildGroupOwnedShardTransition(
 				}
 			}
 			if !foundTarget {
-				return diag("post-remove-target-absent")
+				return nil, ErrGroupTransition
 			}
 			descriptor.Command = command
 			changed = true
 		}
 	}
 	if !changed {
-		return diag("no-matching-group")
+		return nil, ErrGroupTransition
 	}
 	var nextManifest *distribution.Manifest = manifest
 	if phase == TransitionPhasePreRemove {
 		ordinal, metadata := manifestShardOrdinal(manifest, intent.Key.Shard)
 		if ordinal < 0 {
-			return diag("pre-remove-shard-ordinal-absent")
+			return nil, ErrGroupTransition
 		}
 		var found bool
 		metadata, found = manifest.ShardMetadataAt(ordinal)
 		if !found || len(intent.SourceRoute) != metadata.LeaderCount || metadata.Epoch == ^distribution.OwnershipEpoch(0) {
-			return diag("pre-remove-shard-metadata-mismatch")
+			return nil, ErrGroupTransition
 		}
 		leader, found := manifest.ShardLeaderAt(ordinal, 0)
 		if !found || leader != intent.SourceRoute[0] {
-			return diag("pre-remove-leader-mismatch")
+			return nil, ErrGroupTransition
 		}
 		targetEndpoint := replacement.Endpoint
 		if len(intent.SourceRoute) > 0 {
@@ -458,7 +447,7 @@ func BuildGroupOwnedShardTransition(
 		var err error
 		nextManifest, err = manifest.ReplaceShardLeader(ordinal, intent.TargetDistributionVersion, 0, targetEndpoint, metadata.Epoch+1)
 		if err != nil {
-			return diagErr("pre-remove-replace-shard-leader", err)
+			return nil, errors.Join(err, ErrGroupTransition)
 		}
 	}
 	config := cloneConfig(current.config)
@@ -471,7 +460,7 @@ func BuildGroupOwnedShardTransition(
 		}
 	}
 	if !replacedManifest {
-		return diag("manifest-not-replaced")
+		return nil, ErrGroupTransition
 	}
 	next, err := NewSnapshotWithReplicatedTableMetadata(
 		config, current.endpoints, current.Generation()+1, current.indexDescriptors(),
@@ -479,15 +468,15 @@ func BuildGroupOwnedShardTransition(
 		current.ReplicatedTableDeclarations(),
 	)
 	if err != nil {
-		return diagErr("new-snapshot", err)
+		return nil, errors.Join(err, ErrGroupTransition)
 	}
 	indexHighWater, err := advanceIndexIDHighWater(current, next)
 	if err != nil {
-		return diagErr("index-high-water", err)
+		return nil, errors.Join(err, ErrGroupTransition)
 	}
 	shardHighWaters, err := advanceShardGenerationHighWaters(current, next)
 	if err != nil {
-		return diagErr("shard-high-waters", err)
+		return nil, errors.Join(err, ErrGroupTransition)
 	}
 	return snapshotWithCatalogLineage(next, indexHighWater, shardHighWaters), nil
 }
