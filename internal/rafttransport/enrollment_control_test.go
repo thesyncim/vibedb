@@ -250,11 +250,17 @@ func TestEnrollmentControlRetriesStaleDirectoryRevision(t *testing.T) {
 		t.Fatal(err)
 	}
 	// EnrollMember opens one connection per attempt (its own retry included),
-	// serving each on a fresh net.Pipe so it looks exactly like a fresh
-	// dial. serveErrs collects every Serve outcome in call order.
+	// serving each on a fresh net.Pipe so it looks exactly like a fresh dial.
+	// serveErrs[i] holds attempt i's Serve outcome, indexed by the order
+	// attempts were opened rather than the order their Serve goroutines
+	// happen to finish: EnrollMember only waits for the wire bytes it needs
+	// before starting its next attempt, not for the prior attempt's Serve
+	// call to fully return and record its own result, so a slower earlier
+	// attempt can finish recording after a faster later one.
 	var serveWG sync.WaitGroup
 	var serveMu sync.Mutex
 	var serveErrs []error
+	openCount := 0
 	clientControl, err := NewEnrollmentControlClient(EnrollmentControlClientOptions{
 		Opener: enrollmentTestOpener{open: func(context.Context, NodeID) (PeerConnection, error) {
 			clientConn, serverConn := net.Pipe()
@@ -266,12 +272,17 @@ func TestEnrollmentControlRetriesStaleDirectoryRevision(t *testing.T) {
 				Conn: serverConn, identity: PeerIdentity{TrustDomain: domain, Node: testNode(1)},
 				key: serverKey.ServiceKeyDigest, class: TrafficShardControl,
 			}
+			serveMu.Lock()
+			index := openCount
+			openCount++
+			serveErrs = append(serveErrs, nil)
+			serveMu.Unlock()
 			serveWG.Add(1)
 			go func() {
 				defer serveWG.Done()
 				err := service.Serve(context.Background(), server)
 				serveMu.Lock()
-				serveErrs = append(serveErrs, err)
+				serveErrs[index] = err
 				serveMu.Unlock()
 			}()
 			return client, nil
