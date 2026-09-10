@@ -454,23 +454,23 @@ func TestOpenReplicatedMoveExecutionRequiresJournaledProof(t *testing.T) {
 		LeaderStatus: leaderStatus(1, 5)}}
 	action := Action{Kind: ActionAddLearner, Member: plan.TargetMember()}
 	record := newReplicaMoveRecord(plan.OperationID(), catalog.Generation(), intent, plan, cut, action)
-	if _, ok := OpenReplicatedMoveExecution(record, plan); ok {
+	if _, ok := OpenReplicatedMoveExecution(record, plan, cut); ok {
 		t.Fatal("planned action accepted")
 	}
 	record.State = gateway.ReplicatedOperationRunning
 	record.Cursor, record.Proof = replicaMoveActionWitness(plan.OperationID(), record.IntentDigest, plan, cut, action, replicaMoveCursorExecuting)
-	if execution, ok := OpenReplicatedMoveExecution(record, plan); !ok || execution.Action != action || execution.PublicationApplied != 5 {
+	if execution, ok := OpenReplicatedMoveExecution(record, plan, cut); !ok || execution.Action != action || execution.PublicationApplied != 5 {
 		t.Fatalf("journaled execution=%+v accepted=%t", execution, ok)
 	}
 	for index := range record.Cursor {
 		changed := record
 		changed.Cursor[index]++
-		if _, ok := OpenReplicatedMoveExecution(changed, plan); ok {
+		if _, ok := OpenReplicatedMoveExecution(changed, plan, cut); ok {
 			t.Fatalf("changed cursor %d accepted", index)
 		}
 	}
 	record.Proof[0]++
-	if _, ok := OpenReplicatedMoveExecution(record, plan); ok {
+	if _, ok := OpenReplicatedMoveExecution(record, plan, cut); ok {
 		t.Fatal("forged proof accepted")
 	}
 }

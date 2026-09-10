@@ -90,7 +90,7 @@ func (executor *Executor) executeCatalogSet(ctx context.Context, operation rebal
 		if action.Kind != want {
 			return true, fmt.Errorf("%w: group=%x action=%s expected=%s", ErrAwaitMoveSet, sibling.Group().GroupID, action.Kind, want)
 		}
-		execution, ok := rebalance.OpenReplicatedMoveExecution(record, sibling)
+		execution, ok := rebalance.OpenReplicatedMoveExecution(record, sibling, cut)
 		if !ok || execution.Action != action || cut.Publication.ReplicaSetVersion != execution.PublicationReplicaSet || cut.Publication.Applied < execution.PublicationApplied {
 			return true, fmt.Errorf("%w: group=%x execution_valid=%t action=%v observed_action=%v replica_set=%d/%d applied=%d/%d", ErrAwaitMoveSet, sibling.Group().GroupID, ok, execution.Action, action, execution.PublicationReplicaSet, cut.Publication.ReplicaSetVersion, execution.PublicationApplied, cut.Publication.Applied)
 		}

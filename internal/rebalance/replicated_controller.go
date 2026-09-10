@@ -83,7 +83,18 @@ type ReplicatedMoveExecution struct {
 // OpenReplicatedMoveExecution verifies the already-journaled execution cut.
 // A move-set publisher may combine siblings only after each one has frozen
 // its own exact publication action; a fresh observation alone is not enough.
-func OpenReplicatedMoveExecution(record gateway.ReplicatedOperationRecord, plan *Plan) (ReplicatedMoveExecution, bool) {
+//
+// TransitionReceiptDigest is deliberately excluded from that frozen witness:
+// unlike Proof, it is not part of this action's idempotency identity - it is
+// only a pass-through of the already-durable predecessor receipt a
+// receipt-aware publication chains against. The caller's current cut
+// supplies it fresh on every call (including every retry), the same way a
+// first-time execution derives it, so a receipt published after this
+// action's cursor first entered the executing state is never permanently
+// invisible to it.
+func OpenReplicatedMoveExecution(
+	record gateway.ReplicatedOperationRecord, plan *Plan, cut ReplicatedMoveCut,
+) (ReplicatedMoveExecution, bool) {
 	if plan == nil || !validReplicaMoveRecord(record, plan.OperationID()) || record.State != gateway.ReplicatedOperationRunning || record.Cursor[3] != replicaMoveCursorExecuting {
 		return ReplicatedMoveExecution{}, false
 	}
@@ -98,7 +109,14 @@ func OpenReplicatedMoveExecution(record gateway.ReplicatedOperationRecord, plan 
 	if action.Kind == ActionRefreshCatalogFence {
 		action.ReplicaSetVersion = record.Cursor[4]
 	}
-	return ReplicatedMoveExecution{Action: action, PublicationApplied: record.Cursor[5], PublicationReplicaSet: record.Cursor[4], LeaderTerm: record.Cursor[6], SnapshotBaseDigest: base, Proof: record.Proof}, true
+	execution := ReplicatedMoveExecution{Action: action, PublicationApplied: record.Cursor[5],
+		PublicationReplicaSet: record.Cursor[4], LeaderTerm: record.Cursor[6], SnapshotBaseDigest: base, Proof: record.Proof}
+	if cut.TransitionReceiptFound {
+		if digest, err := cut.TransitionReceipt.ReceiptDigest(); err == nil {
+			execution.TransitionReceiptDigest = digest
+		}
+	}
+	return execution, true
 }
 
 // ExecuteReplicatedMoveStep recovers one immutable move intent, derives exactly
@@ -333,7 +351,7 @@ func ExecuteReplicatedMoveStep(
 	if record.State == gateway.ReplicatedOperationRunning &&
 		record.Cursor[3] == replicaMoveCursorExecuting {
 		var ok bool
-		execution, ok = OpenReplicatedMoveExecution(record, plan)
+		execution, ok = OpenReplicatedMoveExecution(record, plan, cut)
 		if !ok || execution.Action != action {
 			return Action{}, fmt.Errorf("%w: executing action witness does not match current action", ErrReplicatedMove)
 		}
