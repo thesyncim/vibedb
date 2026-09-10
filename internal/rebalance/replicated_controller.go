@@ -255,8 +255,22 @@ func ExecuteReplicatedMoveStep(
 	refreshFenceAdvanced := action.Kind == ActionRefreshCatalogFence &&
 		ActionKind(record.Cursor[0]) == ActionRefreshCatalogFence &&
 		cut.Publication.ReplicaSetVersion > record.Cursor[4]
+	// ActionAwaitCatchUp and ActionAwaitSnapshotInstall are passive progress
+	// polls, not membership commands: neither proposes a raft config change,
+	// so the group's replica-set version is not part of their idempotency
+	// witness the way it is for ActionAddLearner/PromoteVoter/RemoveSource.
+	// An unrelated or already-in-flight config change on the same group can
+	// legitimately advance the live version past the frozen witness while
+	// this same await is outstanding; that advance alone must not read as
+	// "evidence regressed" and permanently strand it, since the live version
+	// can never regress back to match. Mirrors refreshFenceAdvanced above for
+	// the identical reason.
+	passiveAwaitAdvanced := (action.Kind == ActionAwaitCatchUp || action.Kind == ActionAwaitSnapshotInstall) &&
+		ActionKind(record.Cursor[0]) == action.Kind &&
+		cut.Publication.ReplicaSetVersion > record.Cursor[4]
 	if record.State == gateway.ReplicatedOperationRunning &&
-		record.Cursor[3] == replicaMoveCursorExecuting && sameAction && !executingEvidenceOK && !refreshFenceAdvanced {
+		record.Cursor[3] == replicaMoveCursorExecuting && sameAction && !executingEvidenceOK &&
+		!refreshFenceAdvanced && !passiveAwaitAdvanced {
 		return Action{}, fmt.Errorf("%w: executing action evidence regressed at cursor %v", ErrReplicatedMove, record.Cursor)
 	}
 	if record.State == gateway.ReplicatedOperationRunning &&
