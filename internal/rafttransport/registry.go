@@ -1051,13 +1051,33 @@ func (registry *StaticRegistry) enrollMemberWithCommitContext(
 		// conflict with. Certify it as the first digest instead of rejecting
 		// a target whose physical identity and node were already known.
 		peer, peerOK := registry.physicalPeerFrom(current, intent.Peer.NodeID)
-		if !peerOK || !samePhysicalIdentity(peer, intent.Peer) {
+		if !peerOK {
 			return ErrPeerConflict
+		}
+		if !samePhysicalIdentity(peer, intent.Peer) {
+			// A static physical peer record was declared at construction too,
+			// before its own process ever started: its endpoint (and any
+			// other certified detail) is unknown until enrollment observes it
+			// for real. This is the same "bind the first certified endpoint"
+			// case the genuinely-new-member path below already handles for a
+			// brand-new physical peer.
+			if peer.EnrollmentDigest != ([sha256.Size]byte{}) || !samePhysicalPrincipal(peer, intent.Peer) ||
+				peer.State != PeerEnrolled {
+				return ErrPeerConflict
+			}
 		}
 		if intent.DirectoryRevision != registry.currentDirectoryRevision(current) {
 			return ErrPeerConflict
 		}
 		next := cloneDynamicEnrollment(current)
+		if next.physical == nil {
+			next.physical = make(map[NodeID]PhysicalPeer)
+		}
+		certifiedPeer := intent.Peer
+		if samePhysicalIdentity(peer, intent.Peer) && peer.State == PeerEnrolled {
+			certifiedPeer = peer
+		}
+		next.physical[intent.Peer.NodeID] = certifiedPeer
 		next.nodes[memberKey] = memberRecord{
 			node: intent.Peer.NodeID, enrollmentDigest: intent.Digest,
 			revision: intent.DirectoryRevision,
