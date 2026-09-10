@@ -1019,7 +1019,17 @@ func (registry *StaticRegistry) enrollMemberWithCommitContext(
 		return ErrGroupNotFound
 	}
 	view := slot.view.Load()
-	if view == nil || intent.Member.ReplicaSetVersion != view.version {
+	// > rather than !=: intent.Member.ReplicaSetVersion is the config
+	// generation this enrollment was computed against, a floor the live
+	// authority view must have already reached - not a value it must still
+	// match exactly. This registry-level bookkeeping does not itself propose
+	// the raft config change, so an unrelated or already-in-flight config
+	// change on the same group advancing view.version past that floor is not
+	// a conflict; only an intent that claims a NEWER generation than the
+	// live view has actually reached is inconsistent. An exact match would
+	// reject every retry of an outcome-unknown enrollment once view.version
+	// advances even once, since it can never regress back to match.
+	if view == nil || intent.Member.ReplicaSetVersion > view.version {
 		return ErrPeerConflict
 	}
 	memberKey := memberKey{group: intent.Group, memberID: intent.Member.MemberID}
