@@ -106,11 +106,14 @@ func TestGatewayGrantedMembershipInstallsEveryPeerBeforeProposal(t *testing.T) {
 	if _, err := client.ApplyMembership(t.Context(), route, request); err != nil {
 		t.Fatal(err)
 	}
-	// AddLearner is voters-only: the enrolled target cannot yet run a
-	// membership-grant-control listener, so its install is never attempted
-	// (see installGatewayMembershipGrant). The target still becomes a known
-	// peer via the enrollment fanout checked separately below.
-	want := []rafttransport.NodeID{{1}, {2}, {3}}
+	// AddLearner still attempts the enrolled target's install too, best
+	// effort (see installGatewayMembershipGrant): a cold-bootstrapped target
+	// already runs a membership-grant-control listener, and without the
+	// grant installed locally before its own log replication resumes, it can
+	// never authorize the ConfChange entry that added it as a learner. The
+	// target also becomes a known peer via the enrollment fanout checked
+	// separately below.
+	want := []rafttransport.NodeID{{1}, {2}, {3}, {4}}
 	if !slices.Equal(installer.nodes, want) || applier.calls != 1 {
 		t.Fatalf("installed=%v apply=%d", installer.nodes, applier.calls)
 	}

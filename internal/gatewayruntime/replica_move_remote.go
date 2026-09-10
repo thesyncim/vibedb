@@ -958,11 +958,23 @@ func installGatewayMembershipGrant(
 			installErrors = errors.Join(installErrors, installErr)
 		}
 	}
-	if route.HasEnrolledTarget && kind != raftservice.MembershipAddLearner {
+	if route.HasEnrolledTarget {
+		// AddLearner still attempts this, best-effort: a cold-bootstrapped
+		// target (unlike an in-process empty node still lacking an authority
+		// slot) already runs a membership-grant-control listener and can
+		// accept it before ConfChange is even proposed. Without the grant
+		// installed locally before its own log replication resumes, the
+		// target can never authorize the very ConfChange entry that added it
+		// as a learner (validateAuthorizedConfiguration requires a matching
+		// grant digest), so it would reject every AppEntries batch carrying
+		// that entry forever - a permanent catch-up deadlock. A target that
+		// genuinely cannot accept it yet (the empty-node case) is unaffected:
+		// targetInstalled already defaults true for AddLearner, so a failure
+		// here does not block the action.
 		installErr := installer.InstallMembershipGrant(ctx, target.Node, grant)
 		if installErr == nil {
 			targetInstalled = true
-		} else {
+		} else if kind != raftservice.MembershipAddLearner {
 			installErrors = errors.Join(installErrors, installErr)
 		}
 	}

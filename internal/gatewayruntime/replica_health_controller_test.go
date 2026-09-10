@@ -242,12 +242,14 @@ func TestReplicaHealthRevisionsScheduleExactDurableReplacement(t *testing.T) {
 	if err = durableSink.SubmitFailedReplicaMove(t.Context(), intent); err != nil {
 		t.Fatalf("durable failed-replica submission: %v", err)
 	}
-	// AddLearner is voters-only: the enrolling target cannot yet run a
-	// membership-grant-control listener, so only the 3 current voters are
-	// attempted (see installGatewayMembershipGrant).
+	// AddLearner still attempts the enrolling target's install too, best
+	// effort (see installGatewayMembershipGrant): a cold-bootstrapped target
+	// already runs a membership-grant-control listener, and without the
+	// grant installed locally before its own log replication resumes, it can
+	// never authorize the ConfChange entry that added it as a learner.
 	wantEvents := []string{"publish-grant", "settle-grant", "read-grant",
-		"install-grant", "install-grant", "install-grant", "submit-move"}
-	if !slices.Equal(grantAuthority.events, wantEvents) || len(installer.nodes) != 3 {
+		"install-grant", "install-grant", "install-grant", "install-grant", "submit-move"}
+	if !slices.Equal(grantAuthority.events, wantEvents) || len(installer.nodes) != 4 {
 		t.Fatalf("events=%v nodes=%x", grantAuthority.events, installer.nodes)
 	}
 	firstGrant := grantAuthority.grant
@@ -257,9 +259,9 @@ func TestReplicaHealthRevisionsScheduleExactDurableReplacement(t *testing.T) {
 		t.Fatalf("restart replay of durable failed-replica submission: %v", err)
 	}
 	wantReplayEvents := []string{"publish-grant", "read-grant",
-		"install-grant", "install-grant", "install-grant", "submit-move"}
+		"install-grant", "install-grant", "install-grant", "install-grant", "submit-move"}
 	if grantAuthority.grant != firstGrant ||
-		!slices.Equal(grantAuthority.events, wantReplayEvents) || len(installer.nodes) != 3 {
+		!slices.Equal(grantAuthority.events, wantReplayEvents) || len(installer.nodes) != 4 {
 		t.Fatalf("replay grant=%+v events=%v nodes=%x",
 			grantAuthority.grant, grantAuthority.events, installer.nodes)
 	}
@@ -272,7 +274,7 @@ func TestReplicaHealthRevisionsScheduleExactDurableReplacement(t *testing.T) {
 	}
 	grantAuthority.grant = retained
 	grantAuthority.events, installer.nodes = nil, nil
-	if err := durableSink.SubmitFailedReplicaMove(t.Context(), intent); err != nil || grantAuthority.grant != retained || len(installer.nodes) != 3 {
+	if err := durableSink.SubmitFailedReplicaMove(t.Context(), intent); err != nil || grantAuthority.grant != retained || len(installer.nodes) != 4 {
 		t.Fatalf("retained pre-admission grant did not resume: %v events=%v", err, grantAuthority.events)
 	}
 	// A grant for another descriptor must never be reused just because its
