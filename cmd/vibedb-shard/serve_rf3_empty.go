@@ -321,11 +321,29 @@ func servePreparedRF3EmptyNode(
 	if err != nil {
 		return errors.Join(err, lanes.Close(), servingRegistry.Close())
 	}
+	// transportRegistry implements TransitionGrantInstaller directly: it
+	// starts with zero group bundles (this constructor requires an empty
+	// manifest), so an install for a group RegisterExecutionGroup hasn't
+	// adopted yet correctly fails with ErrGroupNotFound rather than silently
+	// succeeding. AddLearner's own fanout already excludes this not-yet-a-
+	// member target (see MembershipGrantClient's doc comment), so the first
+	// grant this node ever needs to accept arrives for a later action
+	// (PromoteVoter, TransferLeader, RemoveSource), by which point snapshot
+	// bootstrap has already called RegisterExecutionGroup. Without this route
+	// wired at all, every install for this node fails closed with a bare EOF
+	// instead of a routable request.
+	membershipControl, err := shardservice.NewMembershipGrantControlService(
+		transportRegistry, policy, deadline, deadline,
+	)
+	if err != nil {
+		return errors.Join(err, lanes.Close(), servingRegistry.Close())
+	}
 	controlMux, err := shardcontrol.New(
 		shardcontrol.Route{Discriminator: nodecontrol.NodeInfoRequestDiscriminator(), Handler: nodeInfo},
 		shardcontrol.Route{Discriminator: nodecontrol.RequestDiscriminator(), Handler: controlService},
 		shardcontrol.Route{Discriminator: snapshottransfer.BootstrapRequestDiscriminator(), Handler: receivers},
 		shardcontrol.Route{Discriminator: replicacontrol.CapacityRequestDiscriminator(), Handler: capacityControl},
+		shardcontrol.Route{Discriminator: shardservice.MembershipGrantRequestDiscriminator(), Handler: membershipControl},
 	)
 	if err != nil {
 		return errors.Join(err, lanes.Close(), servingRegistry.Close())
