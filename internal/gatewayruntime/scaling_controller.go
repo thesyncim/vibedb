@@ -14,6 +14,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -583,6 +584,9 @@ func (controller *ScalingController) submitEnrollmentMove(ctx context.Context, r
 	if err != nil {
 		return false, err
 	}
+	fmt.Fprintf(os.Stderr, "DIAGMOVE intentID=%x opID=%x group=%x targetMember=%d targetNode=%x sourceMember=%d sourceNode=%x rowState=%d rowMoveOp=%x\n",
+		row.IntentID, plan.OperationID(), row.Group.GroupID, row.Target.Member, row.Target.Node,
+		row.Source.Member, row.Source.Node, row.State, row.MoveOperationID)
 	if _, err = controller.moves.Submit(ctx, plan); err != nil {
 		return false, err
 	}
