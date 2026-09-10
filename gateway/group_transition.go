@@ -12,7 +12,9 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"hash"
+	"os"
 	"slices"
 
 	"github.com/thesyncim/vibedb/distribution"
@@ -286,15 +288,20 @@ func OpenGroupPublicationReceipt(raw []byte) (GroupPublicationReceipt, error) {
 // ValidateSuccessor checks the receipt chain and the exact phase progression.
 // It does not compare the live catalog; the authority does that in its CAS.
 func (receipt GroupPublicationReceipt) ValidateSuccessor(intent GroupTransitionIntent, prior *GroupPublicationReceipt) error {
+	diag := func(label string) error {
+		fmt.Fprintf(os.Stderr, "DIAGSUCC %s key=%+v phase=%v priorNil=%v receipt=%+v intent=%+v prior=%+v\n",
+			label, receipt.Key, receipt.Phase, prior == nil, receipt, intent, prior)
+		return ErrGroupTransition
+	}
 	if !intent.Valid() || !receipt.Valid() || receipt.Key != intent.Key ||
 		receipt.PredecessorHeadGeneration == ^uint64(0) || receipt.CommittedHeadGeneration != receipt.PredecessorHeadGeneration+1 || receipt.CommittedGroupGeneration != receipt.CommittedHeadGeneration ||
 		receipt.SourceRouteDigest != intent.SourceRouteDigest ||
 		receipt.SourceRosterDigest != intent.SourceRosterDigest {
-		return ErrGroupTransition
+		return diag("entry-guard")
 	}
 	if prior == nil {
 		if receipt.PredecessorReceiptDigest != ([32]byte{}) || receipt.Phase != TransitionPhasePreRemove {
-			return ErrGroupTransition
+			return diag("no-prior-guard")
 		}
 		if receipt.PredecessorHeadGeneration < intent.SourceHeadGeneration ||
 			(receipt.PredecessorHeadGeneration == intent.SourceHeadGeneration && receipt.PredecessorHeadDigest != intent.SourceHeadDigest) ||
@@ -302,12 +309,12 @@ func (receipt GroupPublicationReceipt) ValidateSuccessor(intent GroupTransitionI
 			receipt.PredecessorGroupDigest != intent.SourceGroupDigest ||
 			receipt.PredecessorRosterDigest != intent.SourceRosterDigest ||
 			receipt.PredecessorRouteDigest != intent.SourceRouteDigest {
-			return ErrGroupTransition
+			return diag("no-prior-source-mismatch")
 		}
 		return nil
 	}
 	if !prior.Valid() || prior.Key != receipt.Key || receipt.PredecessorReceiptDigest == ([32]byte{}) {
-		return ErrGroupTransition
+		return diag("prior-invalid")
 	}
 	digest, err := prior.ReceiptDigest()
 	if err != nil || digest != receipt.PredecessorReceiptDigest ||
@@ -319,7 +326,7 @@ func (receipt GroupPublicationReceipt) ValidateSuccessor(intent GroupTransitionI
 		receipt.PredecessorRosterDigest != prior.CommittedRosterDigest ||
 		receipt.PredecessorRouteDigest != prior.CommittedRouteDigest ||
 		!validPhaseSuccessor(prior.Phase, receipt.Phase) {
-		return ErrGroupTransition
+		return diag("prior-successor-mismatch")
 	}
 	return nil
 }
