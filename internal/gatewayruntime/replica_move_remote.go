@@ -1076,9 +1076,17 @@ func (remote gatewayReplicaRemoteActions) AwaitReplicaMove(
 	if err != nil {
 		return err
 	}
+	// No ExpectedReplicaSetVersion here: every case below is a passive status
+	// or progress poll, not a membership command, and none of them read the
+	// server's staleness comparison back. An unrelated concurrent action on
+	// this same group can legitimately advance its replica-set version many
+	// times while this await is outstanding; fencing on the version this
+	// action was originally journaled against would reject every poll with
+	// ErrStale forever once that happens, since the live version can never
+	// regress back to match. Mirrors ObserveReplicaMove's own status poll,
+	// which already leaves this field zero for the same reason.
 	request := replicacontrol.Request{Operation: [32]byte(operation), Step: execution.Proof,
-		Group: plan.Group(), TargetMember: plan.TargetMember(),
-		ExpectedReplicaSetVersion: execution.PublicationReplicaSet}
+		Group: plan.Group(), TargetMember: plan.TargetMember()}
 	switch execution.Action.Kind {
 	case rebalance.ActionAwaitLeader:
 		for _, endpoint := range gatewayReplicaMoveObservationCandidates(cut.Membership) {
